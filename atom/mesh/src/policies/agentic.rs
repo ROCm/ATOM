@@ -8,8 +8,28 @@
 
 use rand::{seq::IteratorRandom, Rng};
 
-/// ATOM's default `ATOM_DP_LB_REQ_EQUIV`, expressed in tokens per request.
-const REQUEST_TOKEN_EQUIVALENT: u128 = 512;
+/// The agentic cost's weight:
+///
+/// ```text
+/// cost = inflight_prefill_tokens + uncached_tokens
+///      + request_token_equivalent * inflight_requests
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgenticCost {
+    /// Cost of one in-flight request, in tokens. The engine's `least_tokens`
+    /// DP balancer weighs requests by `ATOM_DP_LB_REQ_EQUIV`; keep the two
+    /// equal so the router and the engine rank a rank's load the same way.
+    /// Default: 512.
+    pub request_token_equivalent: u64,
+}
+
+impl Default for AgenticCost {
+    fn default() -> Self {
+        Self {
+            request_token_equivalent: 512,
+        }
+    }
+}
 
 /// One eligible worker's inputs for this request, at `url@rank` granularity.
 #[derive(Debug, Clone, Copy)]
@@ -37,38 +57,45 @@ pub struct Selection {
     pub cost: u128,
 }
 
-/// Score one candidate using the default agentic cost function.
-pub fn score(prompt_tokens: usize, candidate: &Candidate) -> Selection {
-    let uncached_tokens = prompt_tokens.saturating_sub(candidate.cached_tokens.unwrap_or(0));
-    Selection {
-        worker_index: candidate.worker_index,
-        uncached_tokens,
-        cost: candidate.inflight_prefill_tokens as u128
-            + uncached_tokens as u128
-            + REQUEST_TOKEN_EQUIVALENT * candidate.inflight_requests as u128,
+impl AgenticCost {
+    /// Score one candidate.
+    pub fn score(&self, prompt_tokens: usize, candidate: &Candidate) -> Selection {
+        let uncached_tokens = prompt_tokens.saturating_sub(candidate.cached_tokens.unwrap_or(0));
+        Selection {
+            worker_index: candidate.worker_index,
+            uncached_tokens,
+            cost: candidate.inflight_prefill_tokens as u128
+                + uncached_tokens as u128
+                + u128::from(self.request_token_equivalent) * candidate.inflight_requests as u128,
+        }
     }
-}
 
-/// Select the lowest-cost eligible worker, breaking ties uniformly at random.
-///
-/// An empty candidate list returns `None`. The caller remains responsible for
-/// worker health, session affinity, rank mapping and charging the final placement.
-pub fn select_worker(prompt_tokens: usize, candidates: &[Candidate]) -> Option<Selection> {
-    select_with_rng(prompt_tokens, candidates, &mut rand::rng())
-}
+    /// Select the lowest-cost eligible worker, breaking ties uniformly at random.
+    ///
+    /// An empty candidate list returns `None`. The caller remains responsible for
+    /// worker health, session affinity, rank mapping and charging the final placement.
+    pub fn select_worker(
+        &self,
+        prompt_tokens: usize,
+        candidates: &[Candidate],
+    ) -> Option<Selection> {
+        self.select_with_rng(prompt_tokens, candidates, &mut rand::rng())
+    }
 
-fn select_with_rng(
-    prompt_tokens: usize,
-    candidates: &[Candidate],
-    rng: &mut impl Rng,
-) -> Option<Selection> {
-    let scored = candidates
-        .iter()
-        .map(|candidate| score(prompt_tokens, candidate));
-    let best = scored.clone().map(|selection| selection.cost).min()?;
-    scored
-        .filter(|selection| selection.cost == best)
-        .choose(rng)
+    fn select_with_rng(
+        &self,
+        prompt_tokens: usize,
+        candidates: &[Candidate],
+        rng: &mut impl Rng,
+    ) -> Option<Selection> {
+        let scored = candidates
+            .iter()
+            .map(|candidate| self.score(prompt_tokens, candidate));
+        let best = scored.clone().map(|selection| selection.cost).min()?;
+        scored
+            .filter(|selection| selection.cost == best)
+            .choose(rng)
+    }
 }
 
 #[cfg(test)]
@@ -84,6 +111,14 @@ mod tests {
             inflight_prefill_tokens: queued,
             inflight_requests: requests,
         }
+    }
+
+    fn score(prompt_tokens: usize, candidate: &Candidate) -> Selection {
+        AgenticCost::default().score(prompt_tokens, candidate)
+    }
+
+    fn select_worker(prompt_tokens: usize, candidates: &[Candidate]) -> Option<Selection> {
+        AgenticCost::default().select_worker(prompt_tokens, candidates)
     }
 
     #[test]
@@ -109,6 +144,12 @@ mod tests {
         let workers = [candidate(0, Some(512), 0, 2), candidate(1, Some(0), 0, 0)];
         let selected = select_worker(1_024, &workers).unwrap();
         assert_eq!((selected.worker_index, selected.cost), (1, 1_024));
+
+        let requests_free = AgenticCost {
+            request_token_equivalent: 0,
+        };
+        let selected = requests_free.select_worker(1_024, &workers).unwrap();
+        assert_eq!((selected.worker_index, selected.cost), (0, 512));
     }
 
     #[test]
@@ -151,10 +192,11 @@ mod tests {
             candidate(8, Some(0), 0, 0),
             candidate(11, Some(0), 1, 0),
         ];
+        let cost = AgenticCost::default();
         let mut rng = StdRng::seed_from_u64(17);
         let mut counts = [0; 3];
         for _ in 0..3_000 {
-            let selected = select_with_rng(1_024, &workers, &mut rng).unwrap();
+            let selected = cost.select_with_rng(1_024, &workers, &mut rng).unwrap();
             assert_eq!(selected.cost, 1_024);
             match selected.worker_index {
                 2 => counts[0] += 1,
