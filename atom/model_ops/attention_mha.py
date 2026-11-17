@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
 from functools import cache
 
 import aiter
@@ -104,7 +105,11 @@ class PagedAttentionImpl(nn.Module):
         self.layer_num = layer_num
         # A8K4V8 (--kv_cache_dtype fp8_k4v8): NVFP4 K + fp8 V, read only by
         # unified_attention with fp8 Q; V keeps the fp8 cache's per-tensor scale
-        self.k4v8 = self.kv_cache_dtype == "fp8_k4v8"
+        # A8K4V4PT (--kv_cache_dtype fp8_k4v4pt): A8K4V8's NVFP4 K, Q and attention path, with an fp4pt V
+        # (e2m1 + one fp32 scale per token and head): k4v8 stays true, k4v4pt says how V is written
+        self.k4v4pt = self.kv_cache_dtype == "fp8_k4v4pt"
+        self.k4v8 = self.kv_cache_dtype in ("fp8_k4v8", "fp8_k4v4pt")
+        self._k4v4pt_logged = False
         if self.k4v8 and not envs.ATOM_USE_UNIFIED_ATTN:
             raise ValueError(
                 "--kv_cache_dtype fp8_k4v8 is read only by aiter's unified "
@@ -112,7 +117,7 @@ class PagedAttentionImpl(nn.Module):
             )
         self.kv_scale_float = (
             torch.finfo(torch.float8_e4m3fn).max / torch.finfo(aiter.dtypes.fp8).max
-            if self.kv_cache_dtype in ("fp8", "fp8_k4v8")
+            if self.kv_cache_dtype in ("fp8", "fp8_k4v8", "fp8_k4v4pt")
             else 1.0
         )
         self.kv_scale = torch.tensor(
@@ -668,6 +673,11 @@ class PagedAttentionImpl(nn.Module):
 
         from atom.model_ops.layernorm import GemmaRMSNorm
 
+        if self.k4v4pt:
+            return self._k4v4pt_rope_cache(
+                q, k, v, qkv, position, k_cache, v_cache, fwd_ctx
+            )
+
         if (
             self.rotary_emb is not None
             and self.q_norm is not None
@@ -745,6 +755,72 @@ class PagedAttentionImpl(nn.Module):
         self._cache_format = "SHUFFLE"
         return q, k, v, k_cache, v_cache, None, None
 
+    def _k4v4pt_rope_cache(self, q, k, v, qkv, position, k_cache, v_cache, fwd_ctx):
+        """`rope_cache` for an A8K4V4PT cache: aiter's fused gfx1250 Q/K norm + MRoPE + cache kernel writes Q out
+        in fp8, the NVFP4 K (byte-identical to fp8_k4v8's) and the fp4pt V. There is no unfused A8K4V4PT writer: a
+        model or platform the fused kernel does not cover is rejected."""
+        from atom.model_ops.layernorm import GemmaRMSNorm
+        from atom.model_ops.triton_mrope import try_fused_qk_norm_mrope_cache_k4v4pt
+
+        slot_mapping = fwd_ctx.attn_metadata.slot_mapping
+        if not self._k4v4pt_logged:
+            self._k4v4pt_logged = True
+            if os.environ.get("ATOM_K4V4PT_LOG", "0") == "1":
+                print(
+                    f"[ATOM k4v4pt] layer {self.layer_num}: k_cache {tuple(k_cache.shape)} {k_cache.dtype}, "
+                    f"v_cache {tuple(v_cache.shape)} {v_cache.dtype}, PV mode "
+                    f"{os.environ.get('AITER_UA_FP4PT_PV_MODE', 'fp8 (default)')}",
+                    flush=True,
+                )
+        assert v_cache.dtype == torch.float4_e2m1fn_x2 and v_cache.dim() == 4, (
+            f"fp8_k4v4pt V cache must be float4_e2m1fn_x2 [blocks, heads, block, D // 2 + 4], "
+            f"got {v_cache.dtype} {tuple(v_cache.shape)}"
+        )
+        if not (
+            self.rotary_emb is not None
+            and isinstance(self.q_norm, GemmaRMSNorm)
+            and self.k_norm is not None
+        ):
+            raise NotImplementedError(
+                "--kv_cache_dtype fp8_k4v4pt needs the fused Gemma Q/K norm + MRoPE + cache write (Qwen3.5), "
+                f"got rotary_emb={type(self.rotary_emb).__name__} q_norm={type(self.q_norm).__name__}"
+            )
+        q_size = self.num_heads * self.head_dim
+        kv_size = self.num_kv_heads * self.head_dim
+        q_raw, k_raw, v_raw = torch.split(qkv, [q_size, kv_size, kv_size], dim=-1)
+        fused = try_fused_qk_norm_mrope_cache_k4v4pt(
+            self.q_norm,
+            self.k_norm,
+            self.rotary_emb,
+            position,
+            q_raw,
+            k_raw,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            k_cache,
+            slot_mapping,
+            kv_scale=self.kv_scale_float,
+            v=v_raw,
+            v_cache=v_cache,
+        )
+        if fused is None:
+            raise NotImplementedError(
+                "--kv_cache_dtype fp8_k4v4pt: aiter's gfx1250 fused Q/K norm + MRoPE + cache kernel does not apply "
+                f"here (heads {self.num_heads}/{self.num_kv_heads}, head_dim {self.head_dim}, "
+                f"k_cache {tuple(k_cache.shape)})"
+            )
+        self.per_token_quant = False
+        self._cache_format = "SHUFFLE"
+        return (
+            fused[0].view(-1, self.num_heads, self.head_dim),
+            fused[1].view(-1, self.num_kv_heads, self.head_dim),
+            v_raw.view(-1, self.num_kv_heads, self.head_dim),
+            k_cache,
+            v_cache,
+            None,
+            None,
+        )
     def _gemma_norm_rope_then_cache(
         self, q, k, v, position, k_cache, v_cache, k_scale, v_scale, attn_metadata
     ):

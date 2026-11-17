@@ -24,7 +24,12 @@ from atom.utils.forward_context import AttentionMetaData, Context, get_forward_c
 from atom.utils.tbo import TokenSplitPrefillState, decode_ubatch_request_ranges
 
 from .backends import AttentionBackend, CommonAttentionBuilder
-from .mha_kv_pool import KV_CACHE_DTYPE_K4V8, MhaKvPool, mha_kv_dtypes
+from .mha_kv_pool import (
+    KV_CACHE_DTYPE_K4V4PT,
+    KV_CACHE_DTYPE_K4V8,
+    MhaKvPool,
+    mha_kv_dtypes,
+)
 from .pool_layout.entry_arena import EntryField, carve
 from .pool_layout.pool_rows import KvGeometry
 from .pool_layout.sub_pool_spec import SubPoolSpec, page_pool
@@ -236,7 +241,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # The two coincide there, and only one scheduler block reads well:
             # fp8 packs x=16 -> 128, bf16 x=8 -> 64, both a 128 B physical page.
             expected = 128 if model_runner.kv_cache_dtype in ("fp8",) else 64
-            if model_runner.kv_cache_dtype == KV_CACHE_DTYPE_K4V8:
+            if model_runner.kv_cache_dtype == KV_CACHE_DTYPE_K4V4PT:
+                expected = 128
+            elif model_runner.kv_cache_dtype == KV_CACHE_DTYPE_K4V8:
                 # A8K4V8's tuned configs run 64- and 128-token pages
                 expected = (
                     model_runner.block_size

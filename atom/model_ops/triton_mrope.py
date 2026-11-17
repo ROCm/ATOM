@@ -337,7 +337,7 @@ def gfx1250_fused_qk_norm_mrope_cache_applies(
     )
     # A8K4V8 (NVFP4 K, fp8 V): the kernel's K_NVFP4 mode
     k4v8_ok = (
-        kv_cache_dtype == "fp8_k4v8"
+        kv_cache_dtype in ("fp8_k4v8", "fp8_k4v4pt")
         and envs.ATOM_USE_UNIFIED_ATTN
         and _gfx1250_fused_qk_norm_mrope_cache_k4v8()
     )
@@ -418,6 +418,60 @@ def try_fused_qk_norm_mrope_cache(
         v_cache,
         slot_mapping,
         **({"kv_scale": kv_scale} if fp8 else {}),
+    )
+
+
+def try_fused_qk_norm_mrope_cache_k4v4pt(
+    q_norm: nn.Module,
+    k_norm: nn.Module,
+    rotary_emb: nn.Module,
+    positions: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    num_q_heads: int,
+    num_k_heads: int,
+    head_size: int,
+    k_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    kv_scale: float,
+    v: torch.Tensor,
+    v_cache: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """A8K4V4PT cache write by aiter's fused kernel: Q out in fp8, the NVFP4 K (byte-identical to fp8_k4v8's)
+    and the fp4pt V. None where it does not apply."""
+    if torch.compiler.is_compiling():
+        return None
+    try:
+        from aiter.ops.triton.fusions.fused_qk_norm_mrope import (
+            fused_qk_norm_mrope_cache_k4v4pt,
+        )
+    except ImportError:
+        return None
+    if not (
+        k_cache.dtype == torch.uint8
+        and k_cache.dim() == 4
+        and _gfx1250_fused_qk_norm_mrope_cache_k4v8()
+        and _mrope_qk_supported(
+            rotary_emb, positions, q, k, num_q_heads, num_k_heads, head_size
+        )
+    ):
+        return None
+    half = rotary_emb.rotary_dim // 2
+    return fused_qk_norm_mrope_cache_k4v4pt(
+        q,
+        k,
+        q_norm.weight,
+        k_norm.weight,
+        q_norm.variance_epsilon,
+        positions,
+        rotary_emb.cos_cache.view(-1, half),
+        rotary_emb.sin_cache.view(-1, half),
+        rotary_emb.mrope_section,
+        k_cache,
+        slot_mapping,
+        kv_scale=kv_scale,
+        v=v,
+        v_cache=v_cache,
     )
 
 

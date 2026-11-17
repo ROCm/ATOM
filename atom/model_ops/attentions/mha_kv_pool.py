@@ -42,6 +42,10 @@ def shuffle_pack(kv_dtype: torch.dtype) -> int:
 
 # A8K4V8: NVFP4 K, fp8 V (aiter unified attention on gfx1250).
 KV_CACHE_DTYPE_K4V8 = "fp8_k4v8"
+# A8K4V4PT: NVFP4 K (as A8K4V8), fp4pt V -- e2m1 + one fp32 scale per (token, head) at the page row's
+# tail -- read by aiter's unified attention (gfx1250 Gluon, 128-token pages) when V is float4_e2m1fn_x2.
+KV_CACHE_DTYPE_K4V4PT = "fp8_k4v4pt"
+FP4PT_V_DTYPE = torch.float4_e2m1fn_x2
 
 
 def mha_kv_dtypes(kv_cache_dtype: str) -> tuple[torch.dtype, bool]:
@@ -54,7 +58,15 @@ def mha_kv_dtypes(kv_cache_dtype: str) -> tuple[torch.dtype, bool]:
 
     if kv_cache_dtype == KV_CACHE_DTYPE_K4V8:
         return dtypes.fp8, True
+    if kv_cache_dtype == KV_CACHE_DTYPE_K4V4PT:
+        # the V dtype names the format: the pool sizes and views V as fp4pt rows
+        return FP4PT_V_DTYPE, True
     return dtypes.d_dtypes[kv_cache_dtype], False
+
+
+def fp4pt_v_row_bytes(head_dim: int) -> int:
+    """One token's fp4pt V row of one head: e2m1 pairs, then one fp32 scale."""
+    return head_dim // 2 + 4
 
 
 def nvfp4_k_row_bytes(head_dim: int) -> int:
@@ -78,6 +90,9 @@ def mha_kv_fields(
     (A8K4V8) costs `nvfp4_k_row_bytes` a token and head, V stays `kv_dtype`.
     """
     per_entry = num_kv_heads * head_dim * entry_tokens * kv_dtype.itemsize
+    if k_nvfp4 and kv_dtype == FP4PT_V_DTYPE:
+        # A8K4V4PT V
+        per_entry = num_kv_heads * fp4pt_v_row_bytes(head_dim) * entry_tokens
     per_entry_k = (
         num_kv_heads * nvfp4_k_row_bytes(head_dim) * entry_tokens
         if k_nvfp4
@@ -172,6 +187,10 @@ class MhaKvPool:
         self.kv_dtype = kv_dtype
         # A8K4V8: K in NVFP4, V in `kv_dtype` (fp8)
         self.k_nvfp4 = k_nvfp4
+        # A8K4V4PT: K in NVFP4, V fp4pt (the kernels need 128-token pages)
+        self.v_fp4pt = k_nvfp4 and kv_dtype == FP4PT_V_DTYPE
+        if self.v_fp4pt and block_size != 128:
+            raise ValueError(f"an fp4pt V cache (A8K4V4PT) needs block_size 128, got {block_size}")
         # Every field is priced per entry, and an entry is `blocks_per_entry`
         # blocks. Charging per block instead would multiply `entry_bytes_for`'s
         # 256 B field alignment by the same factor -- 9% of the pool at 8
@@ -319,6 +338,11 @@ class MhaKvPool:
             )
         else:
             k = self.field_view("k", layer, self.kv_dtype, (-1, nh, hd // x, bs, x))
+        if self.v_fp4pt:
+            # A8K4V4PT: a (block, head) V row is [bs * hd // 2 B e2m1 | bs fp32 scales]
+            return k, self.field_view(
+                "v", layer, FP4PT_V_DTYPE, (-1, nh, bs, fp4pt_v_row_bytes(hd))
+            )
         return (
             k,
             self.field_view("v", layer, self.kv_dtype, (-1, nh, bs // x, hd, x)),
