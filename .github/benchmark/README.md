@@ -169,6 +169,10 @@ The flat accuracy catalogs — `models_accuracy.json`, `oot_models_accuracy.json
   eval budget. If omitted, the eval budget is 30 minutes. The native ATOM step
   also launches the server, so its timeout is the larger of this value and 60
   minutes; the atomesh step times out at this value alone.
+- **Weekly night**: every `nightly` entry of `oot_models_accuracy.json` needs
+  `nightly_weekday` (`Mon` … `Sun`). The vLLM nightly accuracy run that starts
+  at 00:00 Beijing time on that weekday validates the case, so each case runs
+  once a week; the workflow refuses a nightly entry without one.
 - **Known drift (tolerated for now)**: `extraArgs` vs `extra_args` and
   `accuracy_threshold` vs `accuracy_test_threshold` are both accepted; the schema
   documents the current reality. Normalizing these (and their consumers) is a

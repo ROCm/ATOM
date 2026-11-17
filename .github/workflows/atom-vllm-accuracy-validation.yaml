@@ -2,7 +2,9 @@ name: ATOM vLLM Nightly
 
 on:
   schedule:
-    # Nightly at 00:00 Beijing time (16:00 UTC on the previous day)
+    # Nightly at 00:00 Beijing time (16:00 UTC on the previous day). Each
+    # nightly case runs once a week, on the Beijing weekday its catalog entry
+    # names in `nightly_weekday`.
     - cron: '0 16 * * *'
   workflow_dispatch:
     # Manual runs use GitHub Actions' built-in branch dropdown ("Use workflow
@@ -537,6 +539,8 @@ jobs:
           if not isinstance(raw_models, list):
               raise SystemExit("OOT accuracy model catalog must be a JSON list.")
 
+          WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
           required_fields = {
               "model_name",
               "model_path",
@@ -580,6 +584,11 @@ jobs:
                   raise SystemExit(
                       f"OOT accuracy model {model['model_name']!r} has invalid priority "
                       f"{model['priority']!r}; expected P0, P1, or P2."
+                  )
+              if model["test_level"] == "nightly" and model.get("nightly_weekday") not in WEEKDAYS:
+                  raise SystemExit(
+                      f"OOT accuracy model {model['model_name']!r} needs nightly_weekday, "
+                      f"one of {', '.join(WEEKDAYS)}: the Beijing weekday it runs on."
                   )
               if "lm_eval_num_fewshot" in model:
                   model["lm_eval_num_fewshot"] = int(model["lm_eval_num_fewshot"])
@@ -679,6 +688,14 @@ jobs:
 
           if event == "schedule":
               run_date = beijing_now.date().isoformat()
+              # Each nightly case runs once a week, on its nightly_weekday.
+              run_weekday = WEEKDAYS[beijing_now.weekday()]
+              selected = [m for m in selected if m["nightly_weekday"] == run_weekday]
+              print(
+                  f"{run_weekday} nightly cases: "
+                  + ", ".join(m["model_name"] for m in selected),
+                  file=sys.stderr,
+              )
           else:
               run_date = ""
 
