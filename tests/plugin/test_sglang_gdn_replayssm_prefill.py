@@ -3,9 +3,8 @@
 A prefill rewrites the GDN checkpoint of every request in the batch, so the
 ring cursor of each slot is parked at 0 (``note_full_state_write``). The cursor
 is one per slot, shared by every GDN layer, so the reset belongs to the
-forward's GDN metadata (Native: ``GDNAttentionMetadataBuilder._attach_replayssm``)
-rather than to each layer, and it must not read the live-slot count back to
-the host.
+forward's GDN metadata rather than to each layer, and it must not read the
+live-slot count back to the host.
 """
 
 from types import SimpleNamespace
@@ -187,15 +186,18 @@ def test_extend_parks_the_cursor_once_per_forward(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "mode, enabled",
+    "mode, enabled, parked",
     [
-        ("DECODE", True),
-        ("TARGET_VERIFY", True),
-        ("EXTEND", False),
+        ("MIXED", True, [[6, 2]]),
+        ("DECODE", True, []),
+        ("TARGET_VERIFY", True, []),
+        # Kept out by SGLang's is_extend() alone.
+        ("DRAFT_EXTEND_V2", True, []),
+        ("EXTEND", False, []),
     ],
-    ids=["decode", "target-verify", "replayssm-off"],
+    ids=["mixed", "decode", "target-verify", "draft-extend-v2", "replayssm-off"],
 )
-def test_cursor_is_left_alone_outside_a_replayssm_extend(monkeypatch, mode, enabled):
+def test_only_a_replayssm_extend_parks_the_cursor(monkeypatch, mode, enabled, parked):
     calls = []
     monkeypatch.setattr(attention_gdn, "replayssm_enabled", lambda: enabled)
     monkeypatch.setattr(attention_gdn, "note_full_state_write", calls.append)
@@ -204,7 +206,7 @@ def test_cursor_is_left_alone_outside_a_replayssm_extend(monkeypatch, mode, enab
         _batch(mode), _linear(torch.tensor([6, 2], dtype=torch.int32))
     )
 
-    assert calls == []
+    assert [slots.tolist() for slots in calls] == parked
 
 
 def test_extend_metadata_parks_only_the_batch_slots(monkeypatch):
