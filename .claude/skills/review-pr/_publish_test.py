@@ -54,6 +54,7 @@ CARD = """## ATOM PR #9999 — a card
 **One-sentence summary that the review body does not need.**
 
 Review: ⚠️ NEEDS WORK
+Coverage: 2 files / 66 added lines -- within one review pass
 Validation (advisory): nothing ran here.
 
 ⚠️ atom/model_ops/moe.py:23 imports `_FLYDSL_USE_HERD` — **Author must** pin it.
@@ -401,6 +402,26 @@ def test_summary_carries_the_verdict_and_validation_lines(report, monkeypatch):
     assert "Review: ⚠️ NEEDS WORK" in body
     assert "Validation (advisory): nothing ran here." in body
     assert f"{_publish.BOT} review pr=9999 head=deadbeef" in body
+
+
+def test_summary_carries_the_coverage_verdict(report, monkeypatch):
+    """The coverage line must reach the posted review, not just card.md.
+
+    triage.py measures it, SKILL.md requires it on the card and _check_coverage_line
+    gates that the card carries it -- but that gate reads card.md while build_review
+    assembles the body that is posted, and build_review's prefix list did not name it.
+    Twenty-one published reviews carried no coverage line, including one on a
+    10179-line, 54-file diff where "these findings are a sample, not a sweep" is the
+    whole point. Every gate was green throughout: they were watching the other copy.
+    """
+    monkeypatch.setattr(_publish, "_api_raw", lambda *a, **k: DIFF)
+    body = _publish.review_payload("9999")["body"]
+    assert (
+        "Coverage: 2 files / 66 added lines" in body
+    ), "the coverage verdict is computed and gated but never published"
+    # Above the findings: a reader who stops at the index must already know whether it
+    # is the whole diff or a sample of it.
+    assert body.index("Coverage:") < body.index("finding(s) posted inline")
 
 
 def test_card_md_is_not_rewritten(report, monkeypatch):

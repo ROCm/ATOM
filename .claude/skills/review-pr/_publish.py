@@ -477,7 +477,13 @@ def build_review(pr, card, diff_text, flagged, sha):
     what = _line_starting(card, "**")
     if what:
         parts.append(what)
-    for pref in ("Review:", "Validation"):
+    # Coverage sits with the verdict, above the findings, because it says whether the
+    # findings below are all of them. It was computed (triage.py), required (SKILL.md)
+    # and gated (_check_coverage_line) from the start -- but the gate reads card.md and
+    # this builds the body that is posted, so twenty-one reviews carried the verdict in
+    # a file nobody reads and dropped it on the way out. A measurement that is gated and
+    # then discarded is worse than one never taken: the gate reports success either way.
+    for pref in ("Review:", "Coverage:", "Validation"):
         l = _line_starting(card, pref)
         if l:
             parts.append(l)
