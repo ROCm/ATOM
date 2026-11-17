@@ -564,8 +564,8 @@ class BlockManager:
         self.chunks_cut_for_demand: int = 0
         self.demands_declined_no_room: int = 0
         # Dropped because the demand's chunk floor is a nonzero hit: the shape a
-        # floored anchor leaves the next turn, and also a real fork that close
-        # above a grid rung (`_record_checkpoint_demand`).
+        # floored anchor leaves the next turn, and also a real fork under one
+        # chunk above a grid rung (`_record_checkpoint_demand`).
         self.demands_dropped_at_grid_hit: int = 0
         # The anchor's own cut counter, kept separate from the demand's: the
         # anchor fires on nearly every prompt and would drown the convergence
@@ -3687,7 +3687,7 @@ class BlockManager:
         seq.replays_hit = seq.replay_kv_load = False
         # Likewise the demand: it describes one admission against one cache
         # state, and a re-admitted seq gets a fresh answer from `can_allocate`
-        # — including a fresh place in both funnel counters.
+        # — including a fresh place in each funnel counter.
         seq.checkpoint_demand_pos = 0
         seq.checkpoint_demand_counted = False
         seq.checkpoint_demand_declined = False

@@ -3406,6 +3406,16 @@ class TestPromptEndAnchorTemplateMargin:
         assert (anchor, resumed, self._demand_cuts(bm)) == (self.CHUNK, self.CHUNK, 0)
         assert self._dropped(bm) == 1
 
+    def test_a_deferred_next_turn_is_dropped_once_however_often_it_asks(self):
+        """Counted once per seq, as the other two demand counters are."""
+        bm = self._grid_bm()
+        t1 = self._prompt([], 7 * self.BLOCK + 5)
+        self._run_turn(bm, t1)
+        nxt = Sequence(t1 + self._fresh(80), self.BLOCK, has_per_req_cache=True)
+        for _ in range(5):
+            assert bm.can_allocate(nxt) >= 0
+        assert self._dropped(bm) == 1, "counted per attempt"
+
     def _conversation(self, bm, turns=6):
         """`turns` turns, each resending the last verbatim and going on."""
         prompt = self._prompt([], 7 * self.BLOCK + 5)
@@ -3513,26 +3523,26 @@ class TestPromptEndAnchorTemplateMargin:
         return [p3[: 5 * self.BLOCK] + self._fresh(self.BLOCK + 5) for _ in range(2)]
 
     @pytest.mark.parametrize(
-        "forks, resumed",
+        "forks, resumed, dropped",
         [
-            (_forks_one_chunk_up, [CHUNK, 2 * CHUNK]),
-            (_forks_above_an_offgrid_hit, [3 * BLOCK, CHUNK]),
+            (_forks_one_chunk_up, [CHUNK, 2 * CHUNK], 0),
+            (_forks_above_an_offgrid_hit, [3 * BLOCK, CHUNK], 1),
         ],
         ids=["one_chunk_up", "offgrid_hit"],
     )
-    def test_a_demand_outside_the_dropped_shape_keeps_its_rung(self, forks, resumed):
+    def test_a_demand_outside_the_dropped_shape_keeps_its_rung(
+        self, forks, resumed, dropped
+    ):
         """Only a demand under one chunk above a nonzero hit on the chunk grid
-        is dropped. One a whole chunk up, or above a hit off the grid, is not
-        counted as dropped and still cuts its rung, and the second fork resumes
-        there. (Above that new rung on the grid, the second fork's own demand
-        in `offgrid_hit` is the dropped shape.)"""
+        is dropped. One a whole chunk up, or above a hit off the grid, still
+        cuts its rung, and the second fork resumes there; in `offgrid_hit` that
+        new rung is on the grid, so the second fork's own demand is dropped."""
         bm = self._grid_bm()
         prompts = forks(self, bm)
-        cuts, dropped = self._demand_cuts(bm), self._dropped(bm)
-        first = self._run_turn(bm, prompts[0])[0]
-        assert self._dropped(bm) == dropped
-        assert [first, self._run_turn(bm, prompts[1])[0]] == resumed
+        cuts, before = self._demand_cuts(bm), self._dropped(bm)
+        assert [self._run_turn(bm, p)[0] for p in prompts] == resumed
         assert self._demand_cuts(bm) - cuts == 1
+        assert self._dropped(bm) - before == dropped
 
     # ── The margin's range (review of #2589) ────────────────────────────────
 
