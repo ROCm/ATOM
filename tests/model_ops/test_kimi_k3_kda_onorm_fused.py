@@ -15,6 +15,7 @@ if not torch.cuda.is_available():
 from aiter import QuantType, dtypes
 
 from atom.model_ops.fla_ops.fused_sigmoid_gating import (
+    ONormE8M0,
     fused_sigmoid_gating_delta_rule_update,
 )
 from atom.model_ops.kimi_k3 import rmsnorm_gated, rmsnorm_gated_e8m0_col_major
@@ -93,7 +94,9 @@ def _recurrence(s, o=None, onorm=None):
 
 
 def _fused(s, col_major):
-    return _recurrence(s, onorm=(s["weight"], s["gate"], 1e-6, dtypes.fp8, col_major))
+    return _recurrence(
+        s, onorm=ONormE8M0(s["weight"], s["gate"], 1e-6, dtypes.fp8, col_major)
+    )
 
 
 def _unfused(s, col_major, monkeypatch):
@@ -190,8 +193,8 @@ def test_the_model_fuses_only_where_it_pays_and_o_norm_takes_the_gluon_kernel():
         return KimiKDAAttention._decode_onorm(layer, out_gate, state, num_seqs)
 
     fused = onorm()
-    assert fused is not None and fused[1].shape == (4, HEADS, DIM)
-    assert fused[1].stride() == (FUSED_N, DIM, 1)
+    assert fused is not None and fused.gate.shape == (4, HEADS, DIM)
+    assert fused.gate.stride() == (FUSED_N, DIM, 1)
     assert onorm(state=fp32_state.to(torch.bfloat16)) is None
     # one workgroup per (request, head); past a few per CU the unfused pair wins
     assert onorm(num_seqs=64) is not None  # 768 workgroups, 256 CUs on MI455X
