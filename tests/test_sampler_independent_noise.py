@@ -35,6 +35,21 @@ def sampler():
         yield load("atom.model_ops.sampler")
 
 
+def _fused_mixed_sample_reference(
+    input, exponentials, temperatures, *, eps, greedy_eps
+):
+    """CPU stand-in with the documented semantics of aiter's fused_mixed_sample.
+
+    A row at or below ``greedy_eps`` takes the lowest-id argmax of ``input``.
+    Any other row takes the race
+    ``argmax softmax(input / max(T, 1e-5)) / (E + eps)``.
+    """
+    scaled = input.float() / temperatures.clamp_min(1e-5).unsqueeze(-1)
+    race = (torch.softmax(scaled, dim=-1) / (exponentials + eps)).argmax(-1)
+    greedy = temperatures <= greedy_eps
+    return torch.where(greedy, input.float().argmax(-1), race).to(torch.int32)
+
+
 @pytest.fixture
 def noise(sampler, monkeypatch):
     """Record the noise the sampler passes to the AITER kernels, and score it.
@@ -61,9 +76,9 @@ def noise(sampler, monkeypatch):
     def fused_mixed_sample(input, exponentials, temperatures, *, eps, greedy_eps):
         received.append(exponentials)
         ops.append("fused")
-        raced = race(input, exponentials, temperatures, eps)
-        greedy = temperatures <= greedy_eps
-        return torch.where(greedy, input.argmax(-1), raced).to(torch.int32)
+        return _fused_mixed_sample_reference(
+            input, exponentials, temperatures, eps=eps, greedy_eps=greedy_eps
+        )
 
     def topk_select(probs, k, *, tie):
         assert k == 1 and tie == "low"
@@ -192,21 +207,6 @@ def test_independent_noise_calls_fused_mixed_sample(sampler, monkeypatch):
     assert kwargs == {"eps": instance.eps, "greedy_eps": sampler.SAMPLER_EPS}
     race.assert_not_called()
     select.assert_not_called()
-
-
-def _fused_mixed_sample_reference(
-    input, exponentials, temperatures, *, eps, greedy_eps
-):
-    """CPU stand-in with the documented semantics of aiter's fused_mixed_sample.
-
-    A row at or below ``greedy_eps`` takes the lowest-id argmax of ``input``.
-    Any other row takes the race
-    ``argmax softmax(input / max(T, 1e-5)) / (E + eps)``.
-    """
-    scaled = input.float() / temperatures.clamp_min(1e-5).unsqueeze(-1)
-    race = (torch.softmax(scaled, dim=-1) / (exponentials + eps)).argmax(-1)
-    greedy = temperatures <= greedy_eps
-    return torch.where(greedy, input.float().argmax(-1), race).to(torch.int32)
 
 
 def test_independent_noise_batch_greedy_rows_take_the_low_tie(sampler, monkeypatch):

@@ -250,7 +250,7 @@ class Sampler(nn.Module):
         (``SamplingParams.n > 1``), which would otherwise collapse onto one
         token when they share logits, the speculative bonus token and
         verification rows of a non-greedy batch, and every batch under
-        ``always_independent_noise``.
+        ``always_independent_noise`` that is not all greedy.
 
         The noise is one ``(num_tokens, vocab_size)`` ``exponential_`` draw.
         AITER's ``fused_mixed_sample`` runs the race of
