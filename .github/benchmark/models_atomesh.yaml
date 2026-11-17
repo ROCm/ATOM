@@ -2460,7 +2460,6 @@ models:
       decode: {}
     server:
       common_args:
-        served_model_name: MiniMaxAI/MiniMax-M3.1-Flash
         trust_remote_code: true
         kv_cache_dtype: nvfp4
         block_size: 128
