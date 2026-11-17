@@ -429,9 +429,18 @@ def first_clause(finding, cite=""):
 
 
 def _line_starting(card, prefix):
+    """The first card line beginning with `prefix`, indented or not, any case.
+
+    The gate (`triage._check_coverage_line`) matches on `strip().lower()`, and SKILL.md
+    asks the card to carry rules.txt's `  coverage: ...` line verbatim -- lower case,
+    two spaces in. Matching the exact prefix at column 0 here meant a card that did what
+    it was told passed the gate and still lost the line on the way out.
+    """
+    want = prefix.lower()
     for ln in card.split("\n"):
-        if ln.startswith(prefix):
-            return ln
+        st = ln.strip()
+        if st.lower().startswith(want):
+            return st
     return ""
 
 

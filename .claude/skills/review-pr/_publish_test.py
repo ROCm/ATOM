@@ -424,6 +424,28 @@ def test_summary_carries_the_coverage_verdict(report, monkeypatch):
     assert body.index("Coverage:") < body.index("finding(s) posted inline")
 
 
+def test_the_coverage_line_publishes_as_the_card_writes_it(report, monkeypatch):
+    """The publisher must match the line the gate accepts, not a stricter form.
+
+    `_check_coverage_line` accepts any line whose strip().lower() starts `coverage:`;
+    `_line_starting` required the exact prefix `Coverage:` at column 0. So a card that
+    copies rules.txt's `  coverage: ...` verbatim -- which SKILL.md asks for -- passed
+    the gate and was dropped on the way out: this PR's own bug, one case over.
+    """
+    monkeypatch.setattr(_publish, "_api_raw", lambda *a, **k: DIFF)
+    for written in (
+        "  coverage: 2 files / 66 added lines -- within one review pass",
+        "coverage: 2 files / 66 added lines -- within one review pass",
+        "   Coverage: 2 files / 66 added lines -- within one review pass",
+    ):
+        card = CARD.replace(
+            "Coverage: 2 files / 66 added lines -- within one review pass", written
+        )
+        (report / "card.md").write_text(card, encoding="utf-8")
+        body = _publish.review_payload("9999")["body"]
+        assert "2 files / 66 added lines" in body, f"dropped: {written!r}"
+
+
 def test_a_review_that_anchors_nothing_says_so(report, monkeypatch):
     """0 of N anchored must be stated, not inferred from an absent block.
 

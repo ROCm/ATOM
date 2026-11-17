@@ -2892,16 +2892,9 @@ def _check_coverage_line(card_text, work_dir=None):
     Compared against rules.txt rather than re-derived here: Step 1 owns the measurement,
     this only enforces that it reached the reader.
     """
-    # Every way this could read nothing and still return green used to be silent, which
-    # is the failure this whole gate exists to prevent one level up: a card that omitted
-    # the coverage verdict was caught, but a gate that never got to compare was not. The
-    # expensive one is `[diff-too-large]` -- GitHub refusing to serve a diff over 20000
-    # lines -- because that is the largest PR the bot can ever see, the exact case where
-    # "a sample, not a sweep" has to reach the reader, and it read as a pass.
-    #
-    # Only two markers entitle silence: `[underivable]` and `[derivation-failed]`. There
-    # Step 1 genuinely measured nothing, so there is no verdict the card could be
-    # dropping. Anything else that yields no `coverage:` line means this gate did not run.
+    # rules.txt is readable and non-empty by the time this runs: the ledger gate (Step
+    # 1b, SKILL.md:380) opens it without a guard and exits 1 on LEDGER UNUSABLE, both
+    # before the card gate. So an unreadable file is already a red, and this returns [].
     want = ""
     text = None
     if work_dir:
@@ -2909,57 +2902,36 @@ def _check_coverage_line(card_text, work_dir=None):
             text = (pathlib.Path(work_dir) / "rules.txt").read_text(
                 encoding="utf-8", errors="replace"
             )
-        except OSError as exc:
-            return [("UNCHECKED-COVERAGE", f"rules.txt: {exc.__class__.__name__}",
-                     "the coverage gate could not read Step 1's rules.txt, so it compared "
-                     "nothing -- re-run Step 1 into this work dir before the card gate")]
+        except OSError:
+            return []
         for ln in text.splitlines():
             if ln.strip().startswith("coverage:"):
                 want = ln.strip()
                 break
-    if not want:
-        if text is None:
-            return []          # no work dir: the caller is not asking for the comparison
-        if "[underivable" in text or "[derivation-failed" in text:
-            return []          # Step 1 measured nothing; no verdict exists to drop
-        if "[diff-too-large" in text:
-            # GitHub refusing the diff IS the measurement, and it is the strongest one:
-            # over 20000 lines is an order of magnitude past BIG_ADDED, so this diff is
-            # BEYOND ONE PASS by definition and the card has to say the words. Checking
-            # only that SOME coverage line was present let the softening the measured
-            # path exists to refuse walk through on the largest diff of all.
-            want = ("  coverage: BEYOND ONE PASS -- GitHub would not serve this diff "
-                    "(over 20000 lines). Findings below are a sample, not a sweep.")
-            for line in (card_text or "").splitlines():
-                st = line.strip()
-                if st.lower().startswith("coverage:"):
-                    if "BEYOND ONE PASS" in st:
-                        return []
-                    return [("SOFTENED-COVERAGE", st[:70],
-                             "GitHub would not serve this diff, and the card reports it as "
-                             "an ordinary one -- the findings read as complete when they "
-                             f"are a sample. Write: `{want.strip()}`")]
-            return [("MISSING-COVERAGE", "[diff-too-large]",
-                     "GitHub would not serve this diff (over 20000 lines), which makes it "
-                     "the largest PR this bot reviews. rules.txt has no line to copy here, "
-                     f"so write: `{want.strip()}`")]
-        return [("UNCHECKED-COVERAGE", "rules.txt has no `coverage:` line",
-                 "this is not Step 1's output, so the card's coverage claim was compared "
-                 "against nothing -- re-run `triage.py rules` into this work dir")]
+    # `[diff-too-large]` writes no coverage line, but GitHub refusing a diff over 20000
+    # lines is itself the measurement, and the strongest one -- an order of magnitude
+    # past BIG_ADDED, so BEYOND ONE PASS by definition. `[underivable]` and
+    # `[derivation-failed]` measured nothing, so no verdict exists for the card to drop.
+    too_large = text is not None and not want and "[diff-too-large" in text
+    if not want and not too_large:
+        return []
+    spell = ("Coverage: BEYOND ONE PASS -- GitHub would not serve this diff (over 20000 "
+             "lines). Findings below are a sample, not a sweep.")
+    strict = too_large or "BEYOND ONE PASS" in want
     for line in (card_text or "").splitlines():
         st = line.strip()
         if st.lower().startswith("coverage:"):
-            body = st.split(":", 1)[1].strip()
-            if not body:
+            if not st.split(":", 1)[1].strip():
                 return [("EMPTY-COVERAGE", st[:70],
                          "no verdict after the colon -- copy rules.txt's coverage line")]
-            if "BEYOND ONE PASS" in want and "BEYOND ONE PASS" not in st:
+            if strict and "BEYOND ONE PASS" not in st:
                 return [("SOFTENED-COVERAGE", st[:70],
                          "Step 1 measured this diff as BEYOND ONE PASS and the card does "
-                         "not say so -- the findings below read as complete when they are "
-                         "a sample")]
+                         "not say so -- the findings below read as complete when they "
+                         "are a sample" + (f". Write: `{spell}`" if too_large else ""))]
             return []
-    return [("MISSING-COVERAGE", want[:70],
+    return [("MISSING-COVERAGE", (want or "[diff-too-large]")[:70],
+             f"rules.txt has no line to copy here, so write: `{spell}`" if too_large else
              "Step 1 measured the diff's reviewability and the card drops it; copy the "
              "`coverage:` line from rules.txt above the findings")]
 

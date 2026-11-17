@@ -438,6 +438,10 @@ t "a card that softens BEYOND ONE PASS is refused" \
   "$(_cov_gate "$_BIG" 'Coverage: 47 files / 16647 added lines')" "SOFTENED-COVERAGE"
 t "a card carrying the measured coverage passes" \
   "$(_cov_gate "$_SMALL" 'Coverage: 5 files / 49 added lines -- within one review pass')" "ok"
+# EMPTY-COVERAGE had no case: removing the branch left every test green, so the label
+# could have reached a reader with nothing after it and no gate would have noticed.
+t "a coverage label with nothing after it is refused" \
+  "$(_cov_gate "$_SMALL" 'Coverage:')" "EMPTY-COVERAGE"
 
 # The gate read rules.txt and compared. The three ways it could READ NOTHING and still
 # return green were invisible: no rules.txt at all, a rules.txt that is not Step 1's
@@ -456,10 +460,23 @@ card = "## T\n\nReview: OK\n" + ("" if sys.argv[3] == "-" else sys.argv[3] + "\n
 p = triage._check_coverage_line(card, d)
 print(p[0][0] if p else "ok")' "$S" "$1" "$2"
 }
-t "no rules.txt at all is not a pass" \
-  "$(_cov_raw MISSING -)" "UNCHECKED-COVERAGE"
-t "a rules.txt that is not Step 1 output is not a pass" \
-  "$(_cov_raw 'some other file entirely' -)" "UNCHECKED-COVERAGE"
+# An unreadable or ruleless rules.txt is NOT this gate's job: the ledger gate (Step 1b,
+# SKILL.md:380) runs first and exits non-zero on both, so the review never reaches the
+# card gate. Asserted here rather than assumed -- deleting a check is only safe while the
+# check that replaces it is the one being measured.
+_ledger_rc() {  # <rules.txt content, or MISSING> -> exit code of the ledger gate
+  d=$(mktemp -d)
+  [ "$1" = MISSING ] || printf '%s\n' "$1" > "$d/rules.txt"
+  : > "$d/verdicts.txt"
+  python3 "$S/triage.py" ledger "$d/rules.txt" "$d/verdicts.txt" >/dev/null 2>&1
+  echo $?
+}
+t "a missing rules.txt is refused by the ledger gate, before this one" \
+  "$(_ledger_rc MISSING)" "1"
+t "a rules.txt that is not Step 1 output is refused by the ledger gate" \
+  "$(_ledger_rc 'some other file entirely')" "1"
+t "and the card gate stays out of it" \
+  "$(_cov_raw MISSING -)" "ok"
 t "a diff GitHub refused to serve still owes the reader a coverage line" \
   "$(_cov_raw '    [diff-too-large        ] A1 A2' -)" "MISSING-COVERAGE"
 t "a diff GitHub refused to serve passes once the card says it is partial" \
