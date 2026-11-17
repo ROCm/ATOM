@@ -51,7 +51,6 @@ from atom.mono.device.queue import word
 from atom.mono.device.select import INT_MIN, f32_key, u32_gt
 from atom.mono.device.sync import preg, publish, sleep_ticks
 from atom.mono.dsa_indexer import fp4
-from atom.mono.dsa_indexer import selection_plan as isel_plan
 from atom.mono.dsa_indexer.plan import (
     SCORE_KEYS,
     TILE,
@@ -73,12 +72,6 @@ from atom.mono.dsa_indexer.selection_plan import (
 )
 from atom.mono.plan.arith import pick
 from atom.mono.plan.execution import BLOCKS, THREADS, WAVES
-
-# Preserve the original module API for runners and callers.
-SHORT_WIDE_RADIX = isel_plan.SHORT_WIDE_RADIX
-SPLIT_MIN = isel_plan.SPLIT_MIN
-WIDE_RADIX = isel_plan.WIDE_RADIX
-Radix = isel_plan.Radix
 
 BINS = DEFAULT_RADIX.bins
 

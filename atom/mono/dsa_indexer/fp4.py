@@ -9,10 +9,10 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import range_constexpr
 from flydsl.expr.typing import T
 
+from atom.model_ops.indexer.layout import fp4_cache_byte, fp4_scale_byte
 from atom.mono.device.mx import FP4, mfma_scaled
 from atom.mono.device.ops import CM_DEV, butterfly, rsrc, traced, xshfl
 from atom.mono.dsa_indexer.fp4_plan import e2m1_magnitude
-from atom.mono.dsa_indexer.plan import fp4_cache_byte, fp4_scale_byte
 
 MIN_AMAX = 6.0 * 2.0**-126
 

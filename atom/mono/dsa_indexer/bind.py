@@ -34,6 +34,7 @@ from atom.mono.dsa_indexer.plan import (
     IndexerShape,
     unsupported,
 )
+from atom.mono.dsa_indexer.selection_plan import SPLIT_MIN
 from atom.mono.plan.execution import BLOCKS
 from atom.mono.runtime.deployment import _takes_weight_updates
 from atom.utils.custom_register import direct_register_custom_op
@@ -253,7 +254,7 @@ def bind_indexers(inner, tp: int, rank: int) -> IndexerBinding | None:
     short_gemm = (
         replicated
         and tp > 1
-        and cfg.max_model_len <= kix.isel.SPLIT_MIN
+        and cfg.max_model_len <= SPLIT_MIN
         and shape.heads == 32
         and shape.head_dim == 128
         and shape.q_lora in (1024, 1536, 2048)

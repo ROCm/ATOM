@@ -13,9 +13,18 @@ from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 from flydsl.expr import gpu, rocdl
 from flydsl.expr.typing import Int32, Int64, T
 
-from atom.mono.device.ops import CM_DEV, CM_SYS, ballot, load_ptr64, rsrc
+from atom.mono.device.ops import (
+    CM_DEV,
+    CM_SYS,
+    ballot,
+    kernel_symbol,
+    launcher,
+    load_ptr64,
+    rsrc,
+)
 from atom.mono.dsa_indexer.kernel import scratch_layout
 from atom.mono.dsa_indexer.selection_plan import SHORT_VERIFY_CTX, short_flag_count
+from atom.mono.plan.build_key import source_digest
 from atom.mono.plan.execution import BLOCKS, THREADS
 from atom.mono.runtime.step_begin import (
     ARRIVED,
@@ -31,11 +40,24 @@ _STREAM = fx.Stream(None)
 
 
 @cache
-def build(rows, qlen, world, debug=False, compact=()):
+def build(rows, qlen, world, compact, debug=False):
     assert rows <= (256 if qlen == 6 else 64) and rows % qlen == 0 and qlen in (6, 8)
+    prefix, flag_stride, suffix, total = compact
+    name = kernel_symbol(
+        "mono_local_step",
+        s=rows,
+        q=qlen,
+        w=world,
+        debug=int(debug),
+        prefix=prefix,
+        flag_stride=flag_stride,
+        suffix=suffix,
+        total=total,
+    )
+    keyed = (name, source_digest("mono"))
 
     @flyc.kernel(
-        name=f"mono_local_step_s{rows}_q{qlen}_w{world}",
+        name=name,
         known_block_size=[THREADS, 1, 1],
     )
     def kernel(
@@ -76,7 +98,6 @@ def build(rows, qlen, world, debug=False, compact=()):
                 _wait_arrived(state, epoch)
                 _fence(peers, peer_size, rank, state, epoch, world, debug)
         if local:
-            prefix, flag_stride, suffix, total = compact
             _zero(scratch, fx.Int64(prefix), first, stride)
             _zero(scratch + fx.Int64(suffix), fx.Int64(total - suffix), first, stride)
             # Only score units in the runtime short-context window are polled.
@@ -93,7 +114,7 @@ def build(rows, qlen, world, debug=False, compact=()):
         else:
             _zero(scratch, size, first, stride)
 
-    @flyc.jit
+    @launcher(name)
     def launch(
         scratch: Int64,
         size: Int64,
@@ -105,11 +126,24 @@ def build(rows, qlen, world, debug=False, compact=()):
         bids: Int64,
         stream: fx.Stream = _STREAM,
     ):
+        _ = keyed
         kernel(scratch, size, peers, peer_size, rank, state, ctx, bids).launch(
             grid=(BLOCKS,), block=(THREADS,), stream=stream
         )
 
     return launch
+
+
+@cache
+def _compact_layout(key):
+    layout = scratch_layout(key)
+    start, size = layout["sflag"]
+    return (
+        start,
+        size // key.tokens,
+        start + size,
+        max(o + n for o, n in layout.values()),
+    )
 
 
 def begin(runner, rows, qlen):
@@ -118,16 +152,8 @@ def begin(runner, rows, qlen):
         runner.mailboxes.begin_step()
         return
     md = get_forward_context().attn_metadata
-    layout = scratch_layout(key)
-    start, size = layout["sflag"]
-    compact = (
-        start,
-        size // rows,
-        start + size,
-        max(o + n for o, n in layout.values()),
-    )
     _run_compiled(
-        build(rows, qlen, key.world, runner.mailboxes._debug, compact),
+        build(rows, qlen, key.world, _compact_layout(key), runner.mailboxes._debug),
         runner.scratch.data_ptr(),
         runner.scratch.nbytes,
         runner.peers.addresses.data_ptr(),

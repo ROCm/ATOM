@@ -78,6 +78,23 @@ _SHAPE = bind.IndexerShape(
 )  # fmt: skip
 
 
+@pytest.mark.parametrize("changed", ["rows", "qlen", "world", "debug", 0, 1, 2, 3])
+def test_local_step_codegen_settings_have_distinct_launcher_caches(changed):
+    from atom.mono.dsa_indexer.local_step import build
+
+    args = {"rows": 48, "qlen": 6, "world": 8, "compact": (512, 1024, 49664, 53760)}
+    baseline = build(**args)
+    if isinstance(changed, int):
+        compact = list(args["compact"])
+        compact[changed] += 16
+        args["compact"] = tuple(compact)
+    else:
+        args[changed] = {"rows": 54, "qlen": 8, "world": 4, "debug": True}[changed]
+    other = build(**args)
+    assert baseline.func.__name__ != other.func.__name__
+    assert build(**args) is other
+
+
 def _indexer(**fields):
     """An Indexer as the refusal reads it: its own flags, wq_b, index cache."""
     return SimpleNamespace(

@@ -16,14 +16,9 @@ by 128-key runs (``REPLICA_INTERLEAVE``: a score unit's keys stay one run).
 
 from dataclasses import dataclass
 
-from atom.model_ops.indexer import layout as index_layout
 from atom.model_ops.indexer.layout import MFMA, PRESHUFFLE
 from atom.mono.plan.arith import sel
 from atom.mono.plan.execution import BLOCKS, WAVES
-
-# Preserve the original module API for runners and callers.
-fp4_cache_byte = index_layout.fp4_cache_byte
-fp4_scale_byte = index_layout.fp4_scale_byte
 
 TILE = 16  # the preshuffled layout's and the MFMA's 16 x 16 tile
 SCALE_BYTES = 4  # a key's fp32 scale
