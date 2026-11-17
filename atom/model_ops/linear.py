@@ -1714,8 +1714,7 @@ class LinearBase(nn.Module):
         with a nonzero ``key`` read a caller's x_scale as group ``key`` lays it
         out. A scale this Linear quantizes itself stays column-major."""
         if not (
-            envs.ATOM_KIMI_K3_ROW_MAJOR_X_SCALE
-            and envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
+            envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
             and self.blockscale_e8m0_scale
             and self.native_a8_group_rows is None
             and _aiter_takes_row_major_x_scale()
