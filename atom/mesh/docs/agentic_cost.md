@@ -5,13 +5,16 @@ and load snapshots:
 
 ```text
 uncached_tokens = max(prompt_tokens - cached_tokens, 0)
-cost = inflight_prefill_tokens + uncached_tokens + 512 * inflight_requests
+cost = inflight_prefill_tokens + uncached_tokens
+     + request_token_equivalent * inflight_requests
 ```
 
 The minimum cost wins, with uniform random tie-breaking. The result includes the
 original worker index and `uncached_tokens`, the charge for the eventual placement.
 Cache hits save their corresponding prefill cost; there is no extra hit bonus.
-The request weight is ATOM's default `ATOM_DP_LB_REQ_EQUIV` of 512.
+`AgenticCost::request_token_equivalent` (default 512) is the request weight; keep it
+equal to the engine's `ATOM_DP_LB_REQ_EQUIV`, which its `least_tokens` DP balancer
+uses for the same weight.
 
 ## Integration boundary
 
