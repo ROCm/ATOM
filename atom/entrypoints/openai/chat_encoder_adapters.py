@@ -94,6 +94,13 @@ class MessageEncoderAdapter:
         cannot take is worth seeing when a template control appears not to
         work.
         """
+        return self.encode(messages, **self.render_kwargs(kwargs))
+
+    def render_kwargs(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        """The kwargs `__call__` passes the encoder for ``kwargs``: this
+        loader's defaults under them, the model's `prepare_kwargs`, then only
+        those the encoder takes."""
+        kwargs = dict(kwargs)
         for name, value in self.defaults.items():
             kwargs.setdefault(name, value)
         kwargs = self.prepare_kwargs(kwargs)
@@ -104,7 +111,18 @@ class MessageEncoderAdapter:
                     "chat encoder %s does not take %r; ignoring it", self.name, name
                 )
                 kwargs.pop(name)
-        return self.encode(messages, **kwargs)
+        return kwargs
+
+    def rendering(self) -> dict[str, Any]:
+        """What `render_kwargs` does, as /v1/models reports it: a router
+        mirrors `prepare_kwargs` by this adapter's name, so it says whether
+        there is one."""
+        return {
+            "name": self.name,
+            "defaults": dict(self.defaults),
+            "accepts": None if self.accepts is None else sorted(self.accepts),
+            "prepares_kwargs": self.prepare_kwargs is not _identity_kwargs,
+        }
 
 
 @dataclass(frozen=True)
