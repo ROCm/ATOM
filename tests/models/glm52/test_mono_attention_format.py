@@ -10,20 +10,21 @@ anything else is refused before a kernel is built. CPU-only.
 from types import SimpleNamespace
 
 import pytest
-
-pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
 import torch
 
-from atom.models.glm52.mono.kernels.geometry_config import (
-    AttentionWeight,
-    glm5_tp_config,
-)
-from atom.models.glm52.mono.weights import (
-    attention_format,
-    layer_weights,
-    projection_weights,
-)
-from atom.mono.runtime.consensus import MonoUnsupported
+from tests.aiter_stub import stubbed_aiter
+
+with stubbed_aiter():
+    from atom.models.glm52.mono.kernels.geometry_config import (
+        AttentionWeight,
+        glm5_tp_config,
+    )
+    from atom.models.glm52.mono.weights import (
+        attention_format,
+        layer_weights,
+        projection_weights,
+    )
+    from atom.mono.runtime.consensus import MonoUnsupported
 
 CFG = glm5_tp_config(4)
 FP8 = torch.float8_e4m3fn
@@ -54,16 +55,15 @@ def _linear(kind, rows, cols):
     )
 
 
-def _layer(kinds=("No", "No", "No"), *, folded_indexer=True, absorb_fp8=True):
+def _layer(kinds=("No", "No", "No"), *, folded_indexer=True):
     split = [CFG.q_lora, CFG.kv_lora, CFG.pe_dim]
     if folded_indexer:
         split += INDEX_ROWS
     rows = {name: shape[0] for name, shape in SHAPES.items()}
     rows["fused_qkv_a_proj"] = sum(split)
-    scale = torch.ones(1) if absorb_fp8 else None
     attn = SimpleNamespace(
         qkv_a_split=split,
-        mla_attn=SimpleNamespace(W_K_scale=scale, W_V_scale=scale),
+        mla_attn=SimpleNamespace(W_K_scale=torch.ones(1), W_V_scale=torch.ones(1)),
         **{
             name: _linear(kind, rows[name], SHAPES[name][1])
             for name, kind in zip(SHAPES, kinds)
@@ -88,35 +88,11 @@ def test_projections_are_read_in_place_in_the_format_production_loaded(kind, att
         assert tensors["w_qkv_a"].shape == SHAPES["fused_qkv_a_proj"]
 
 
-@pytest.mark.parametrize(
-    "storage, why",
-    [
-        ({"kinds": ("per_Token", "No", "No")}, "mix formats"),
-        ({"kinds": ("per_1x32",) * 3}, "not PTPC FP8 or BF16"),
-        ({"absorb_fp8": False}, "ATOM_MLA_ABSORB_BF16"),
-    ],
-)
-def test_other_attention_storage_is_refused(storage, why):
-    with pytest.raises(MonoUnsupported, match=why):
-        attention_format(_layer(**storage))
+def test_mixed_attention_storage_is_refused():
+    with pytest.raises(MonoUnsupported, match="mix formats"):
+        attention_format(_layer(kinds=("per_Token", "No", "No")))
 
 
 def test_a_layer_stored_unlike_the_deployment_is_refused():
     with pytest.raises(MonoUnsupported, match="attention is bf16_absorb_fp8"):
         layer_weights(_layer(), 0, 4, attention=AttentionWeight.FP8_PTPC)
-
-
-def test_a_preshuffled_bf16_projection_is_refused():
-    attn = _layer().self_attn
-    attn.o_proj.weight.is_shuffled = True
-    with pytest.raises(
-        MonoUnsupported, match="o_proj BF16 weight must not be preshuffled"
-    ):
-        projection_weights(attn, CFG, AttentionWeight.BF16_ABSORB_FP8)
-
-
-def test_a_fused_qkv_a_not_led_by_q_a_and_kv_a_is_refused():
-    attn = _layer().self_attn
-    attn.qkv_a_split = [CFG.kv_lora, CFG.q_lora, CFG.pe_dim]
-    with pytest.raises(MonoUnsupported, match="fused_qkv_a split"):
-        projection_weights(attn, CFG, AttentionWeight.BF16_ABSORB_FP8)

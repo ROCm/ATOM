@@ -3093,8 +3093,9 @@ def build_glm5_monokernel(
         UV_R = UV_TILE // 16
         UV_WPR = WAVES // UV_R
         UV_UNITS = UV_NKC // (absorb_k_chunks_per_unit * UV_WPR)
-        # From four rows a task takes a (sample, head) and 16 * WAVES of its rows, so
-        # a head's split partials are merged once rather than once per UV_TILE.
+        # From four rows a task takes a (sample, head) and 16 * WAVES output rows,
+        # so split partials merge once per part (twice per head at V_DIM=256),
+        # rather than once per UV_TILE.
         def uv_split_weights(ml_got):
             """wave 0: a head's per-split weights exp(m - M) / L -> misc[split], then
             M and L, from each split's polled (m, l)."""
