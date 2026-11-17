@@ -243,29 +243,21 @@ def test_fused_seam_writes_the_fp8_pools_query_and_rows():
     )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
-@pytest.mark.parametrize("fp8_heads", [2, 4, 16, 64])
-def test_fp8_query_heads_a_program_is_bit_exact(monkeypatch, fp8_heads):
-    """Any power-of-two group of MXFP8 query heads a program gives a program a
-    head's query and KV bytes; the KV keeps the slot after the query ones."""
+def _run_fp8_query(n, query, normed, rope, positions, rope_dim):
+    """`rope_quant_window` with `_FP8_HEADS` at `n` (None: the arch's list),
+    an MXFP8 query sink and the FP8 KV packed as rows: (KV rows, query
+    values, query scales). `query` is not modified."""
     from atom.model_ops.blockscale import quantize_fp8
     from atom.model_ops.deepseek_v41 import rope_window
 
-    torch.manual_seed(729)
-    device, tokens, heads, dim, rope_dim = "cuda", 64, 64, 512, 64
-    rope = RotaryEmbedding(rope_dim, 1024, base=10000).to(device)
-    positions = torch.randint(0, 1024, (tokens,), device=device, dtype=torch.int32)
-    normed = torch.randn(tokens, dim, device=device, dtype=torch.bfloat16)
-    query = torch.randn(tokens, heads, dim, device=device, dtype=torch.bfloat16) * 3
+    tokens, heads, dim = query.shape
     fp8, e8m0 = (t.dtype for t in quantize_fp8(normed))
-
-    monkeypatch.setattr(rope_window, "_FP8_HEADS_MIN_PROGRAMS_PER_CU", 0)
-
-    def run(n):
-        monkeypatch.setattr(rope_window, "_FP8_HEADS", n)
-        rows = torch.empty(tokens, dim + dim // 32, device=device, dtype=torch.uint8)
-        qv = torch.empty(tokens, heads, dim, device=device, dtype=fp8)
-        qs = torch.empty(tokens, heads, dim // 32, device=device, dtype=e8m0)
+    rows = torch.empty(tokens, dim + dim // 32, device=query.device, dtype=torch.uint8)
+    qv = torch.empty(tokens, heads, dim, device=query.device, dtype=fp8)
+    qs = torch.empty(tokens, heads, dim // 32, device=query.device, dtype=e8m0)
+    saved = rope_window._FP8_HEADS
+    rope_window._FP8_HEADS = n
+    try:
         rope_window.rope_quant_window(
             query.clone(),
             normed,
@@ -277,6 +269,28 @@ def test_fp8_query_heads_a_program_is_bit_exact(monkeypatch, fp8_heads):
             scales=rows[:, dim:].view(e8m0),
             query_fp8=(qv, qs),
         )
+    finally:
+        rope_window._FP8_HEADS = saved
+    return rows, qv, qs
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize("fp8_heads", [2, 4, 16, 64])
+def test_fp8_query_heads_a_program_is_bit_exact(monkeypatch, fp8_heads):
+    """Any power-of-two group of MXFP8 query heads a program gives a program a
+    head's query and KV bytes; the KV keeps the slot after the query ones."""
+    from atom.model_ops.deepseek_v41 import rope_window
+
+    torch.manual_seed(729)
+    device, tokens, heads, dim, rope_dim = "cuda", 64, 64, 512, 64
+    rope = RotaryEmbedding(rope_dim, 1024, base=10000).to(device)
+    positions = torch.randint(0, 1024, (tokens,), device=device, dtype=torch.int32)
+    normed = torch.randn(tokens, dim, device=device, dtype=torch.bfloat16)
+    query = torch.randn(tokens, heads, dim, device=device, dtype=torch.bfloat16) * 3
+    monkeypatch.setattr(rope_window, "_FP8_HEADS_MIN_PROGRAMS_PER_CU", 0)
+
+    def run(n):
+        rows, qv, qs = _run_fp8_query(n, query, normed, rope, positions, rope_dim)
         return rows, qv.view(torch.uint8), qs.view(torch.uint8)
 
     for expected, actual in zip(run(1), run(fp8_heads)):
@@ -301,7 +315,6 @@ def test_fp8_query_rope_tail_only_is_bit_exact(monkeypatch, rope_dim, tokens):
     Same bytes as a program a head but for the sign of a zero, on rows of
     zeros, -0.0 lanes beside either sign, saturating, tiny and ordinary
     values; scales and KV bytes exact."""
-    from atom.model_ops.blockscale import quantize_fp8
     from atom.model_ops.deepseek_v41 import rope_window
 
     torch.manual_seed(tokens + rope_dim)
@@ -316,25 +329,10 @@ def test_fp8_query_rope_tail_only_is_bit_exact(monkeypatch, rope_dim, tokens):
     if tokens > 1:
         query[1, :, ::3] = 3e4
         query[-1, heads // 2 :] = 1e-30
-    fp8, e8m0 = (t.dtype for t in quantize_fp8(normed))
     monkeypatch.setattr(rope_window, "_FP8_HEADS_MIN_PROGRAMS_PER_CU", 0)
 
     def run(n):
-        monkeypatch.setattr(rope_window, "_FP8_HEADS", n)
-        rows = torch.empty(tokens, dim + dim // 32, device=device, dtype=torch.uint8)
-        qv = torch.empty(tokens, heads, dim, device=device, dtype=fp8)
-        qs = torch.empty(tokens, heads, dim // 32, device=device, dtype=e8m0)
-        rope_window.rope_quant_window(
-            query.clone(),
-            normed,
-            rope.cos_cache,
-            rope.sin_cache,
-            positions,
-            rope_dim=rope_dim,
-            values=rows[:, :dim].view(fp8),
-            scales=rows[:, dim:].view(e8m0),
-            query_fp8=(qv, qs),
-        )
+        rows, qv, qs = _run_fp8_query(n, query, normed, rope, positions, rope_dim)
         return rows, _zero_sign_cleared(qv), qs.view(torch.uint8)
 
     reference = run(1)
@@ -353,23 +351,27 @@ def test_fp8_query_heads_a_program_follow_the_arch(monkeypatch):
     from atom.model_ops.deepseek_v41 import rope_window
 
     monkeypatch.setattr(rope_window, "_cu_count", lambda device: 256)
-    for arch, tokens, heads, expected in (
-        ("gfx1250", 1344, 64, 16),
-        ("gfx1250", 1344, 8, 8),
-        ("gfx1250", 64, 64, 8),
-        ("gfx1250", 32, 64, 1),
-        ("gfx1250", 1344, 6, 1),
-        ("gfx950", 1344, 64, 8),
-        ("gfx950", 1344, 8, 8),
-        ("gfx942", 1344, 64, 8),
-    ):
-        monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda arch=arch: arch)
+    # The arch is faked under a cache: clear it whatever the asserts do, so
+    # later tests read the real arch.
+    try:
+        for arch, tokens, heads, expected in (
+            ("gfx1250", 1344, 64, 16),
+            ("gfx1250", 1344, 8, 8),
+            ("gfx1250", 64, 64, 8),
+            ("gfx1250", 32, 64, 1),
+            ("gfx1250", 1344, 6, 1),
+            ("gfx950", 1344, 64, 8),
+            ("gfx950", 1344, 8, 8),
+            ("gfx942", 1344, 64, 8),
+        ):
+            monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda arch=arch: arch)
+            rope_window._arch_fp8_heads.cache_clear()
+            assert rope_window._fp8_heads(tokens, heads, "cuda") == expected
+        monkeypatch.setattr(rope_window, "_FP8_HEADS", 4)
+        assert rope_window._fp8_heads(1344, 64, "cuda") == 4
+        assert rope_window._fp8_heads(1344, 6, "cuda") == 1
+    finally:
         rope_window._arch_fp8_heads.cache_clear()
-        assert rope_window._fp8_heads(tokens, heads, "cuda") == expected
-    monkeypatch.setattr(rope_window, "_FP8_HEADS", 4)
-    assert rope_window._fp8_heads(1344, 64, "cuda") == 4
-    assert rope_window._fp8_heads(1344, 6, "cuda") == 1
-    rope_window._arch_fp8_heads.cache_clear()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
@@ -383,7 +385,6 @@ def test_fp8_query_heads_fall_back_along_the_list(
     """With gfx1250's (16, 8), a rank's 8 heads (TP8) still quantize 8 a
     program rather than 1, and so do 64 heads where 16 a program would leave
     too few programs; the bytes match a program a head's."""
-    from atom.model_ops.blockscale import quantize_fp8
     from atom.model_ops.deepseek_v41 import rope_window
 
     torch.manual_seed(heads + tokens)
@@ -394,26 +395,11 @@ def test_fp8_query_heads_fall_back_along_the_list(
     positions = torch.randint(0, 1024, (tokens,), device=device, dtype=torch.int32)
     normed = torch.randn(tokens, dim, device=device, dtype=torch.bfloat16)
     query = torch.randn(tokens, heads, dim, device=device, dtype=torch.bfloat16)
-    fp8, e8m0 = (t.dtype for t in quantize_fp8(normed))
 
     def run(n):
-        monkeypatch.setattr(rope_window, "_FP8_HEADS", n)
         spy = _GridSpy(rope_window._rope_window_kernel)
         monkeypatch.setattr(rope_window, "_rope_window_kernel", spy)
-        rows = torch.empty(tokens, dim + dim // 32, device=device, dtype=torch.uint8)
-        qv = torch.empty(tokens, heads, dim, device=device, dtype=fp8)
-        qs = torch.empty(tokens, heads, dim // 32, device=device, dtype=e8m0)
-        rope_window.rope_quant_window(
-            query.clone(),
-            normed,
-            rope.cos_cache,
-            rope.sin_cache,
-            positions,
-            rope_dim=rope_dim,
-            values=rows[:, :dim].view(fp8),
-            scales=rows[:, dim:].view(e8m0),
-            query_fp8=(qv, qs),
-        )
+        rows, qv, qs = _run_fp8_query(n, query, normed, rope, positions, rope_dim)
         monkeypatch.setattr(rope_window, "_rope_window_kernel", spy.kernel)
         return (rows, _zero_sign_cleared(qv), qs.view(torch.uint8)), spy.launches
 
