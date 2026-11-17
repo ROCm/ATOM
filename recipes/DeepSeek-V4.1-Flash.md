@@ -231,7 +231,10 @@ It replaces the target forward, the sampler, the rejection sampler and the
 DSpark proposer of a served step
 (`atom/models/deepseek_v41/mono/gfx1250/`).
 
-- **Deployment.** TP4, DSpark with 5 speculative tokens, BF16 KV cache, FP8
+- **Deployment.** TP4, DSpark with 5 speculative tokens, BF16 KV cache (FP4
+  KV is served too, but use BF16: at c1 FP4 measured no faster — E13 TPOT 1.03
+  vs 1.01 ms, a step reads ~640 keys a layer — and its ~300K-token prefills hit
+  MES queue-eviction hangs on the current MI455X driver, not root-caused), FP8
   or FP4 index cache (FP4: the gfx1250 natural layout, `--index-cache-dtype
   fp4`; the step's long-context scoring reads half the bytes), one request a step (6 verify rows; `runner.MAX_STEP_ROWS`, wider steps take the production path), no DSpark confidence
   schedule or ragged verify. Anything else is refused at load
