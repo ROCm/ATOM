@@ -1,17 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-"""`--enable-mixed-prefill-decode` must refuse unsupported configs at LAUNCH.
+"""Unsupported mixed configurations are rejected before model loading.
 
-The refusals used to be seven `assert`s and two `raise`s spread over five
-files, all of them fired only once a mixed batch had been built. Two problems
-followed. A user learned the combination was unsupported some way into serving
-rather than at startup; and `python -O` strips asserts, so under it the
-combinations did not refuse at all -- they ran with whatever wrong numerics the
-assert was standing in front of.
-
-The table lives in `Config._validate_mixed_prefill_decode`. The runtime sites
-stay as backstops, but every one of them is now a `raise`.
+Config._validate_mixed_prefill_decode owns the capability table. Its refusals
+must remain effective under python -O, without duplicate per-layer checks.
 """
 
 import ast
