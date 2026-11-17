@@ -645,6 +645,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KIMI_MONO_TDM_ROLLED": lambda: int(
         os.getenv("ATOM_KIMI_MONO_TDM_ROLLED", "1")
     ),
+    # Kimi-K3 gfx1250 mono: TDM GEMVs whose CUs are bound by their token bytes
+    # split K over the TDM cluster instead (each CTA a quarter of the tokens
+    # and of eight tasks' weights, then one cluster exchange of f32 partials):
+    # a comma list of sites (front, k1), 1 for all of them; 0 keeps every CTA
+    # streaming every token.
+    "ATOM_KIMI_MONO_SPLITK": lambda: frozenset(
+        ("front", "k1")
+        if os.getenv("ATOM_KIMI_MONO_SPLITK", "0") == "1"
+        else (
+            site
+            for site in os.getenv("ATOM_KIMI_MONO_SPLITK", "0").split(",")
+            if site not in ("", "0")
+        )
+    ),
     # Kimi-K3 gfx1250 mono: the fused MoE's gate/up K tiles, its M tiles'
     # epilogues and down tiles, and its staging loops as runtime loops, so a
     # cold launch fetches one body's code each (the same bits); 0 unrolls them

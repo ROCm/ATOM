@@ -50,7 +50,15 @@ from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import (
     TDM_FP8_SCALE_WORDS,
     TDM_ROW_STRIDE,
     TDM_SLAB,
+    TDM_SPLIT_FP4_PITCH,
+    TDM_SPLIT_GROUP,
+    TDM_SPLIT_MAX_TASKS,
+    TDM_SPLIT_ROW_STRIDE,
+    TDM_SPLIT_SLAB,
+    TDM_SPLIT_TILE_WORDS,
     tdm_lds_words,
+    tdm_split_slabs,
+    tdm_split_task_words,
     tdm_task_words,
 )
 from atom.mono.device.ops import mma_bf16, rsrc, traced
@@ -99,19 +107,21 @@ def load_rows(
     width: int = SLAB,
     pad_every: int = 0,
     uniform: bool = False,
+    slab: int = SLAB,
 ):
     """Issue this wave's TDM copy of ``rows_per_wave`` of a [rows, width] BF16
     tile starting at ``address`` into ``lds``; rows past ``rows`` are skipped.
     ``mask`` is the cluster multicast mask of identical loads to merge.
-    ``padded``: LDS rows ``ROW_STRIDE`` apart, else packed ``width`` apart.
+    ``padded``: LDS rows ``slab + LDS_PAD`` apart, ``width`` being ``slab``,
+    else packed ``width`` apart.
     ``pad_every``: with ``padded`` off, one pad dword after every ``pad_every``
     dwords the copy writes (a power of two up to 256), across rows alike.
     ``whole``: the first ``rows_per_wave`` rows in one copy, by the caller's
     one wave. Widths and strides are in BF16 units, whatever the bytes hold.
     ``uniform``: read the row count into an SGPR here, so a loop issuing the
     copy keeps its descriptor in SGPRs, not VGPRs read back every copy."""
-    if padded and width != SLAB:
-        raise ValueError("only a SLAB-wide copy pads its LDS rows")
+    if padded and (width != slab or slab not in (SLAB, SLAB // 2)):
+        raise ValueError("only a SLAB- or half-SLAB-wide copy pads its LDS rows")
     if pad_every and (
         padded or pad_every & (pad_every - 1) or not 2 <= pad_every <= 256
     ):
@@ -122,7 +132,7 @@ def load_rows(
     wave = fx.Int32(rocdl.wave_id())
     row0 = fx.Int32(0) if whole else wave * rows_per_wave
     source = address + fx.Int64(row0) * fx.Int64(row_stride * 2)
-    pitch = ROW_STRIDE if padded else width
+    pitch = slab + LDS_PAD if padded else width
     destination = fx.Int32(fx.ptrtoint(lds)) + row0 * (pitch * 2)
     live = fx.max(fx.min(fx.Int32(rows) - row0, rows_per_wave), 0)
     if uniform:
@@ -139,7 +149,7 @@ def load_rows(
             )
         ],
     )
-    pad_interval = int(math.log2(SLAB * 2 // 4)) - 1
+    pad_interval = int(math.log2(slab * 2 // 4)) - 1
     pad_amount = LDS_PAD * 2 // 4 - 1
     config = (1 << 16) | mask
     if padded:
@@ -182,13 +192,13 @@ def _on_wave(wave, issuer, emit):
         emit()
 
 
-def _operand(lds, row, wave, lane):
+def _operand(lds, row, wave, lane, row_stride=ROW_STRIDE, wave_columns=WAVE_COLUMNS):
     """One lane's v16 BF16 operands of row ``row`` for this wave's columns."""
 
     lane_group = lane // ROWS
-    column = wave * WAVE_COLUMNS
+    column = wave * wave_columns
     steps = []
-    for step in range_constexpr(WAVE_STEPS):
+    for step in range_constexpr(wave_columns // K_PER_MMA):
         words = []
         for pack in range_constexpr(GFX1250_GEMV.operand_packs_per_lane):
             element = (
@@ -199,7 +209,7 @@ def _operand(lds, row, wave, lane):
             )
             raw = fx.Vector(
                 fx.ptr_load(
-                    lds + (row * ROW_STRIDE + element) // 2,
+                    lds + (row * row_stride + element) // 2,
                     result_type=fx.Vector.make_type(PACK_ELEMENTS // 2, fx.Int32),
                 )
             )
@@ -208,7 +218,7 @@ def _operand(lds, row, wave, lane):
     return steps
 
 
-def _fp8_operand(lds, wave, lane, exponent):
+def _fp8_operand(lds, wave, lane, exponent, wave_steps=WAVE_STEPS):
     """``_operand`` of a 16-row FP8 slab in AITER's gfx1250 preshuffle
     (``[K/32][2][16 rows][16 B]``), each value times the E8M0 ``exponent``'s
     power of two, so the BF16 operands are exact."""
@@ -216,8 +226,8 @@ def _fp8_operand(lds, wave, lane, exponent):
     row = lane % ROWS
     lane_group = lane // ROWS
     steps = []
-    for step in range_constexpr(WAVE_STEPS):
-        chunk = wave * WAVE_STEPS + step
+    for step in range_constexpr(wave_steps):
+        chunk = wave * wave_steps + step
         elements = []
         for half in range_constexpr(2):
             byte = ((chunk * 2 + half) * ROWS + row) * 16 + lane_group * PACK_ELEMENTS
@@ -701,3 +711,451 @@ def _project_rolled(
         accs = updated
     accs = _rolled_last_tile(accs, pend, tasks, tiles)
     return [[accs[tk * tiles + tl] for tl in range(tiles)] for tk in range(tasks)]
+
+
+SPLIT_SLAB = TDM_SPLIT_SLAB
+SPLIT_WAVE_COLUMNS = SPLIT_SLAB // WAVES
+# Waves 0-5 copy the token slabs (wave w slabs w, w + 6 ..), waves 6 and 7 the
+# two task groups' weight slabs.
+SPLIT_TOKEN_WAVES = WAVES - 2
+# gfx12 CPol SCOPE (bits [4:3]) SE: a cluster's CTAs share their SE's caches.
+SCOPE_SE = 8
+THREADS = WAVES * GFX1250.wave_size
+_STAGE_WORDS = WAVES * TDM_SPLIT_TILE_WORDS
+assert TDM_CLUSTER == 4
+
+
+def fp4x8_to_bf16(word, exponent, scale_sel=0):
+    """Eight E2M1 values (one dword) times the E8M0 ``exponent``'s power of
+    two, as BF16."""
+
+    return fx.Vector(
+        rocdl.cvt_scale_pk8_bf16_fp4(
+            T.vec(PACK_ELEMENTS, T.bf16),
+            as_ir_value(fx.Int32(word)),
+            as_ir_value(fx.Int32(exponent)),
+            scale_sel,
+        )
+    )
+
+
+def _fp4_operand(lds, wave, lane, exponent):
+    """``_operand`` of a 16-row MXFP4 slab (E2M1 pairs, low nibble first, rows
+    ``TDM_SPLIT_FP4_PITCH`` dwords apart) times its E8M0 ``exponent``: exact."""
+
+    base = lds + (lane % ROWS) * TDM_SPLIT_FP4_PITCH + wave * 4 + lane // ROWS
+    elements = []
+    for pack in range_constexpr(2):
+        converted = fp4x8_to_bf16(fx.ptr_load(base + 2 * pack), exponent)
+        elements.extend(converted[i] for i in range_constexpr(PACK_ELEMENTS))
+    return fx.Vector.from_elements(elements, fx.BFloat16)
+
+
+def _load8(ptr):
+    return fx.Vector(
+        fx.ptr_load(ptr, result_type=fx.Vector.make_type(8, fx.Int32))
+    ).bitcast(fx.Float32)
+
+
+def _add8(a, b):
+    return fx.Vector.from_elements(
+        [a[i] + b[i] for i in range_constexpr(8)], fx.Float32
+    )
+
+
+@traced
+def _split_token_wait(role, s, slabs):
+    """A token wave's wait for slab ``s``, its copies slabs ``role``,
+    ``role + 6`` ..: every later one of them may stay in flight."""
+    later = (slabs - 1) // SPLIT_TOKEN_WAVES
+    if role == s % SPLIT_TOKEN_WAVES:
+        rocdl.s_wait_tensorcnt(later)
+        for count in range_constexpr(later - 1, -1, -1):
+            if s + SPLIT_TOKEN_WAVES * (count + 1) >= slabs:
+                rocdl.s_wait_tensorcnt(count)
+
+
+@traced
+def _split_weight_wait(role, s, slabs, stages):
+    """A weight wave's wait for slab ``s``, its later slabs up to
+    ``s + stages - 1`` in flight."""
+    if role >= SPLIT_TOKEN_WAVES:
+        rocdl.s_wait_tensorcnt(stages - 1)
+        for count in range_constexpr(stages - 2, -1, -1):
+            if s + count + 1 >= slabs:
+                rocdl.s_wait_tensorcnt(count)
+
+
+@traced
+def _split_weight_issue(role, s, slabs, stages, groups, issue):
+    if (role >= SPLIT_TOKEN_WAVES) & (role < SPLIT_TOKEN_WAVES + groups):
+        if s + stages < slabs:
+            issue(s + stages)
+
+
+@traced
+def _split_resident_wait(role, slabs):
+    """Every wave's resident weight copies, issued before its token slabs."""
+    for issuer in range_constexpr(WAVES):
+        if role == issuer:
+            rocdl.s_wait_tensorcnt(
+                len(range(issuer, slabs, SPLIT_TOKEN_WAVES))
+                if issuer < SPLIT_TOKEN_WAVES
+                else 0
+            )
+
+
+@traced
+def project_split(
+    lds,
+    x,
+    x_stride,
+    rows,
+    w,
+    w_rows,
+    k,
+    groups,
+    owners,
+    lane,
+    wave,
+    scratch,
+    out,
+    fmt="bf16",
+    w_scale=None,
+    stages=2,
+    resident=False,
+    prologue=None,
+    x_cache_policy=0,
+):
+    """``project`` with K split over the TDM cluster. The cluster's tasks are
+    ``len(groups)`` groups of four consecutive 16-row tasks, task ``4 g + i``
+    rows ``groups[g] + 16 i`` of ``w``. CTA r (``cluster_workgroup_id_x``)
+    multiplies every task over its quarter of K, its tokens copied at once
+    and kept, its weights streamed through ``stages`` slab buffers by waves 6
+    and 7. The f32 partials of the tasks other CTAs own go to ``scratch``
+    (``tdm_split_scratch_bytes``) at SE scope and, past one cluster barrier,
+    CTA r sums the tasks ``owners[j](r)`` over the cluster, in CTA order, into
+    LDS at ``out + (j * tiles + tile) * TDM_SPLIT_TILE_WORDS`` as a v8 a lane
+    in wave 0's accumulator layout (``gemv_gfx1250.accumulator_offset``).
+
+    ``fmt``: ``SPLIT_FORMATS``; FP8 groups each lie in one 128-row scale block.
+    ``resident``: the CTA's whole weight share is copied up front, before
+    ``prologue`` (which may wait for ``x``), so only the tokens follow it.
+    Every CTA of a cluster calls this alike: it runs one cluster barrier."""
+
+    slabs = tdm_split_slabs(k)
+    group_count = len(groups)
+    if len(owners) != group_count or not 1 <= group_count <= 2:
+        raise ValueError("split-K: one or two task groups, one owned task each")
+    if fmt in ("fp8", "fp4") and w_scale is None:
+        raise ValueError(f"split-K {fmt} weights need their scales")
+    if fmt == "fp8" and k // 512 > GFX1250.wave_size:
+        raise ValueError(f"split-K FP8 holds a group's scales a lane, K={k}")
+    tasks = group_count * TDM_SPLIT_GROUP
+    tiles = (rows + ROWS - 1) // ROWS
+    if resident:
+        stages = slabs
+    token_words = rows * TDM_SPLIT_ROW_STRIDE // 2
+    task_words = tdm_split_task_words(fmt)
+    weights = lds + slabs * token_words
+    scales = weights + stages * tasks * task_words
+    rank = _uniform(rocdl.cluster_workgroup_id_x())
+    column0 = rank * (slabs * SPLIT_SLAB)
+    role = _uniform(wave)
+    tid = wave * GFX1250.wave_size + lane
+    group_rows = [_uniform(row) for row in groups]
+    group = fx.min(fx.max(role - SPLIT_TOKEN_WAVES, 0), group_count - 1)
+    group_row = group_rows[0]
+    if const_expr(group_count == 2):
+        group_row = _uniform((group == 1).select(group_rows[1], group_rows[0]))
+
+    if const_expr(fmt == "fp8"):
+        if wave < group_count:
+            word = bo.buffer_load(
+                rsrc(w_scale),
+                (wave == 1).select(group_rows[-1], group_rows[0]) // 128 * (k // 512)
+                + fx.min(lane, k // 512 - 1),
+                vec_width=1,
+                dtype=T.i32,
+            )
+            fx.ptr_store(fx.Int32(word), scales + wave * GFX1250.wave_size + lane)
+    if const_expr(fmt == "fp4"):
+        row_words = 2 * slabs
+        share = tasks * ROWS * row_words
+        for round_index in range_constexpr((share + THREADS - 1) // THREADS):
+            item = tid + THREADS * round_index
+            if item < share:
+                row = item // row_words
+                row_group = row // (TDM_SPLIT_GROUP * ROWS)
+                source = (
+                    (row_group == 1).select(group_rows[-1], group_rows[0])
+                    + row % (TDM_SPLIT_GROUP * ROWS)
+                )
+                word = bo.buffer_load(
+                    rsrc(w_scale),
+                    (source * (k // 32) + rank * (8 * slabs)) // 4 + item % row_words,
+                    vec_width=1,
+                    dtype=T.i32,
+                )
+                fx.ptr_store(fx.Int32(word), scales + item)
+
+    def issue_tokens(slab):
+        load_rows(
+            x + fx.Int64(column0 + slab * SPLIT_SLAB) * fx.Int64(2),
+            x_stride,
+            lds + slab * token_words,
+            rows,
+            rows,
+            cache_policy=x_cache_policy,
+            whole=True,
+            width=SPLIT_SLAB,
+            slab=SPLIT_SLAB,
+        )
+
+    def issue_weight(slab, row, index):
+        destination = (
+            weights + ((slab % stages) * tasks + index * TDM_SPLIT_GROUP) * task_words
+        )
+        global_slab = fx.Int64(rank * slabs + slab)
+        if const_expr(fmt == "bf16"):
+            load_rows(
+                w + fx.Int64(row) * fx.Int64(k * 2) + global_slab * fx.Int64(SPLIT_SLAB * 2),
+                k,
+                destination,
+                fx.Int32(w_rows) - row,
+                TDM_SPLIT_GROUP * ROWS,
+                cache_policy=_WEIGHT_CACHE_POLICY,
+                whole=True,
+                uniform=True,
+                width=SPLIT_SLAB,
+                slab=SPLIT_SLAB,
+            )
+        elif const_expr(fmt == "fp8"):
+            # A task's slab is one contiguous 16 x 256 B block, the group's
+            # four of them 16 rows of K apart.
+            load_rows(
+                w + fx.Int64(row) * fx.Int64(k) + global_slab * fx.Int64(SPLIT_SLAB * ROWS),
+                ROWS * k // 2,
+                destination,
+                TDM_SPLIT_GROUP,
+                TDM_SPLIT_GROUP,
+                padded=False,
+                cache_policy=_WEIGHT_CACHE_POLICY,
+                whole=True,
+                uniform=True,
+                width=SPLIT_SLAB * ROWS // 2,
+            )
+        else:
+            load_rows(
+                w + fx.Int64(row) * fx.Int64(k // 2) + global_slab * fx.Int64(SPLIT_SLAB // 2),
+                k // 4,
+                destination,
+                fx.Int32(w_rows) - row,
+                TDM_SPLIT_GROUP * ROWS,
+                padded=False,
+                pad_every=0,
+                cache_policy=_WEIGHT_CACHE_POLICY,
+                whole=True,
+                uniform=True,
+                width=SPLIT_SLAB // 4,
+            )
+
+    if const_expr(resident):
+        for slab in range_constexpr(slabs):
+            for index in range_constexpr(group_count):
+                _on_wave(
+                    role,
+                    (slab * group_count + index) % WAVES,
+                    lambda slab=slab, index=index: issue_weight(
+                        fx.Int32(slab), group_rows[index], index
+                    ),
+                )
+    else:
+        for slab in range_constexpr(min(stages, slabs)):
+            for index in range_constexpr(group_count):
+                _on_wave(
+                    role,
+                    SPLIT_TOKEN_WAVES + index,
+                    lambda slab=slab, index=index: issue_weight(
+                        fx.Int32(slab), group_rows[index], index
+                    ),
+                )
+    if const_expr(prologue is not None):
+        prologue()
+    for slab in range_constexpr(slabs):
+        _on_wave(
+            role,
+            slab % SPLIT_TOKEN_WAVES,
+            lambda slab=slab: issue_tokens(fx.Int32(slab)),
+        )
+    if const_expr(resident):
+        _split_resident_wait(role, slabs)
+
+    accs = [
+        fx.Vector.filled(ACCUMULATOR_ELEMENTS, 0.0, fx.Float32)
+        for _ in range(tasks * tiles)
+    ]
+    for s in range(fx.Int32(0), fx.Int32(slabs)):
+        _split_token_wait(role, s, slabs)
+        if const_expr(not resident):
+            _split_weight_wait(role, s, slabs, stages)
+        gpu.barrier()
+        stage = weights + (s % stages) * (tasks * task_words)
+        block = rank * (2 * slabs) + 2 * s + wave // 4
+        if const_expr(fmt == "fp8"):
+            exponents = [
+                (fx.ptr_load(scales + g * GFX1250.wave_size + block // 4) >> (block % 4 * 8))
+                & 0xFF
+                for g in range(group_count)
+            ]
+        slab_weights = []
+        for t in range_constexpr(tasks):
+            task_lds = stage + t * task_words
+            if const_expr(fmt == "bf16"):
+                operand = _operand(
+                    task_lds,
+                    lane % ROWS,
+                    wave,
+                    lane,
+                    TDM_SPLIT_ROW_STRIDE,
+                    SPLIT_WAVE_COLUMNS,
+                )[0]
+            elif const_expr(fmt == "fp8"):
+                operand = _fp8_operand(
+                    task_lds, wave, lane, exponents[t // TDM_SPLIT_GROUP], 1
+                )[0]
+            else:
+                scale_word = fx.ptr_load(
+                    scales + (t * ROWS + lane % ROWS) * (2 * slabs) + 2 * s + wave // 4
+                )
+                operand = _fp4_operand(
+                    task_lds, wave, lane, (scale_word >> (wave % 4 * 8)) & 0xFF
+                )
+            slab_weights.append(operand)
+        slab_tokens = lds + s * token_words
+        activations = [
+            _operand(
+                slab_tokens,
+                tl * ROWS + fx.min(lane % ROWS, min(ROWS, rows - tl * ROWS) - 1),
+                wave,
+                lane,
+                TDM_SPLIT_ROW_STRIDE,
+                SPLIT_WAVE_COLUMNS,
+            )[0]
+            for tl in range(tiles)
+        ]
+        updated = [
+            mma_bf16(slab_weights[t], activations[tl], accs[t * tiles + tl], GFX1250)
+            for t in range(tasks)
+            for tl in range(tiles)
+        ]
+        accs = updated
+        if const_expr(not resident):
+            gpu.barrier()
+            _split_weight_issue(
+                role,
+                s,
+                slabs,
+                stages,
+                group_count,
+                lambda slab: issue_weight(slab, group_row, group),
+            )
+
+    # Every wave's accumulators over the slab buffers, then a lane of a wave
+    # sums one task's tile over the waves.
+    gpu.barrier()
+    for t in range_constexpr(tasks):
+        for tl in range_constexpr(tiles):
+            fx.ptr_store(
+                accs[t * tiles + tl].bitcast(fx.Int32),
+                lds
+                + (t * tiles + tl) * _STAGE_WORDS
+                + (wave * GFX1250.wave_size + lane) * ACCUMULATOR_ELEMENTS,
+            )
+    gpu.barrier()
+    own = lds + tasks * tiles * _STAGE_WORDS
+    owned = [owner(rank) for owner in owners]
+    cta = fx.Int32(fx.block_idx.x)
+    partials = rsrc(scratch)
+    items = tasks * tiles * GFX1250.wave_size
+    for round_index in range_constexpr((items + THREADS - 1) // THREADS):
+        item = tid + THREADS * round_index
+        t = item // (tiles * GFX1250.wave_size)
+        tl = item // GFX1250.wave_size % tiles
+        valid = (item < items) & (tl * ROWS + lane % ROWS < rows)
+        mine = t == owned[0]
+        slot = fx.Int32(0)
+        if const_expr(group_count == 2):
+            slot = (t == owned[1]).select(fx.Int32(1), fx.Int32(0))
+            mine = mine | (t == owned[1])
+        if valid:
+            slab_sums = lds + (t * tiles + tl) * _STAGE_WORDS + lane * ACCUMULATOR_ELEMENTS
+            total = _load8(slab_sums)
+            for source_wave in range_constexpr(1, WAVES):
+                total = _add8(
+                    total,
+                    _load8(slab_sums + source_wave * TDM_SPLIT_TILE_WORDS),
+                )
+            if mine:
+                fx.ptr_store(
+                    total.bitcast(fx.Int32),
+                    own + (slot * tiles + tl) * TDM_SPLIT_TILE_WORDS
+                    + lane * ACCUMULATOR_ELEMENTS,
+                )
+            else:
+                at = ((cta * TDM_SPLIT_MAX_TASKS + t) * tiles + tl) * TDM_SPLIT_TILE_WORDS
+                for half in range_constexpr(2):
+                    bo.buffer_store(
+                        fx.Vector.from_elements(
+                            [total[half * 4 + i] for i in range_constexpr(4)],
+                            fx.Float32,
+                        ),
+                        partials,
+                        at + lane * ACCUMULATOR_ELEMENTS + half * 4,
+                        cache_modifier=SCOPE_SE,
+                    )
+    rocdl.s_wait_storecnt(0)
+    cluster.cluster_barrier()
+
+    items = group_count * tiles * GFX1250.wave_size
+    for round_index in range_constexpr((items + THREADS - 1) // THREADS):
+        item = tid + THREADS * round_index
+        j = item // (tiles * GFX1250.wave_size)
+        tl = item // GFX1250.wave_size % tiles
+        if (item < items) & (tl * ROWS + lane % ROWS < rows):
+            task_id = owned[0]
+            if const_expr(group_count == 2):
+                task_id = (j == 1).select(owned[1], owned[0])
+            own_sum = _load8(
+                own + (j * tiles + tl) * TDM_SPLIT_TILE_WORDS + lane * ACCUMULATOR_ELEMENTS
+            )
+            summed = None
+            for source in range_constexpr(TDM_CLUSTER):
+                peer_at = (
+                    ((cta - rank + source) * TDM_SPLIT_MAX_TASKS + task_id) * tiles + tl
+                ) * TDM_SPLIT_TILE_WORDS + lane * ACCUMULATOR_ELEMENTS
+                halves = [
+                    fx.Vector(
+                        bo.buffer_load(
+                            partials,
+                            peer_at + half * 4,
+                            vec_width=4,
+                            dtype=T.f32,
+                            cache_modifier=SCOPE_SE,
+                        )
+                    )
+                    for half in range(2)
+                ]
+                term = fx.Vector.from_elements(
+                    [
+                        (rank == source).select(own_sum[i], halves[i // 4][i % 4])
+                        for i in range(8)
+                    ],
+                    fx.Float32,
+                )
+                summed = term if summed is None else _add8(summed, term)
+            fx.ptr_store(
+                summed.bitcast(fx.Int32),
+                out + (j * tiles + tl) * TDM_SPLIT_TILE_WORDS + lane * ACCUMULATOR_ELEMENTS,
+            )
+    gpu.barrier()

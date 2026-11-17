@@ -74,6 +74,117 @@ def tdm_lds_bytes(
     return 4 * sum(tdm_lds_words(rows, tasks, fp8, depth))
 
 
+# Cluster split-K (``gemv_tdm_gfx1250.project_split``): a TDM cluster owns one
+# or two groups of four consecutive 16-row tasks and splits K, CTA r streaming
+# a contiguous quarter of it in 256-column slabs, its tokens all resident. CTA
+# r then sums one task a group over the cluster.
+TDM_SPLIT_SLAB = 256
+TDM_SPLIT_ROW_STRIDE = TDM_SPLIT_SLAB + LDS_PAD
+TDM_SPLIT_GROUP = 4
+TDM_SPLIT_MAX_TASKS = 2 * TDM_SPLIT_GROUP
+# One task's tile of f32 sums: 32 lanes of v8 accumulators.
+TDM_SPLIT_TILE_WORDS = 32 * 8
+_SPLIT_STAGE_WORDS = 8 * TDM_SPLIT_TILE_WORDS
+# Weight formats: BF16, ATOM's per_1x128 FP8 (AITER preshuffle, [rows / 128,
+# k / 128] E8M0), and MXFP4 ([rows, k / 2] E2M1 pairs, [rows, k / 32] E8M0).
+SPLIT_FORMATS = ("bf16", "fp8", "fp4")
+# An FP4 row's 128-byte slab lands 33 dwords apart in LDS.
+TDM_SPLIT_FP4_PITCH = TDM_SPLIT_SLAB // 8
+
+
+def tdm_split_slabs(k: int) -> int:
+    """256-column slabs one CTA of a split-K cluster owns."""
+
+    if k % (TDM_CLUSTER * TDM_SPLIT_SLAB):
+        raise ValueError(
+            f"split-K TDM GEMV needs K divisible by {TDM_CLUSTER * TDM_SPLIT_SLAB}"
+        )
+    return k // (TDM_CLUSTER * TDM_SPLIT_SLAB)
+
+
+def tdm_split_task_words(fmt: str) -> int:
+    """i32 LDS words of one task's 256-column weight slab."""
+
+    return {
+        "bf16": ROWS * TDM_SPLIT_ROW_STRIDE // 2,
+        "fp8": ROWS * TDM_SPLIT_SLAB // 4,
+        "fp4": ROWS * TDM_SPLIT_FP4_PITCH,
+    }[fmt]
+
+
+def tdm_split_scale_words(k: int, fmt: str, groups: int) -> int:
+    """FP8: each group's scale row; FP4: every task row's E8M0 bytes of the
+    CTA's K quarter."""
+
+    if fmt == "fp8":
+        return 64
+    if fmt == "fp4":
+        return groups * TDM_SPLIT_GROUP * ROWS * tdm_split_slabs(k) * 2
+    return 0
+
+
+def tdm_split_loop_words(
+    rows: int, k: int, fmt: str, stages: int, groups: int = 2
+) -> int:
+    """i32 LDS words of the split-K slab loop: resident tokens, ``stages`` of
+    every cluster task's weight slabs (``tdm_split_slabs``: all of them, the
+    resident mode) and the scales."""
+
+    return (
+        tdm_split_slabs(k) * rows * TDM_SPLIT_ROW_STRIDE // 2
+        + stages * groups * TDM_SPLIT_GROUP * tdm_split_task_words(fmt)
+        + tdm_split_scale_words(k, fmt, groups)
+    )
+
+
+def tdm_split_post_words(rows: int, groups: int = 2) -> int:
+    """i32 LDS words of the split-K reduction past the loop (over the loop's):
+    every wave's accumulators, then the CTA's own partials and its sums."""
+
+    tiles = (rows + ROWS - 1) // ROWS
+    return tiles * (
+        groups * TDM_SPLIT_GROUP * _SPLIT_STAGE_WORDS + 4 * TDM_SPLIT_TILE_WORDS
+    )
+
+
+def tdm_split_lds_words(
+    rows: int, k: int, fmt: str, stages: int, groups: int = 2
+) -> int:
+    return max(
+        tdm_split_loop_words(rows, k, fmt, stages, groups),
+        tdm_split_post_words(rows, groups),
+    )
+
+
+def tdm_split_stages(
+    rows: int, k: int, fmt: str, budget_words: int, groups: int = 2
+) -> int:
+    """The most weight stages (at most 3: a wave's tensor copies in flight)
+    whose loop fits ``budget_words``; 0 if not even two do."""
+
+    for stages in (3, 2):
+        if tdm_split_lds_words(rows, k, fmt, stages, groups) <= budget_words:
+            return stages
+    return 0
+
+
+def tdm_split_resident_fits(
+    rows: int, k: int, fmt: str, budget_words: int, groups: int = 2
+) -> bool:
+    """Whether the CTA's whole weight share fits LDS with its tokens."""
+
+    return (
+        tdm_split_lds_words(rows, k, fmt, tdm_split_slabs(k), groups) <= budget_words
+    )
+
+
+def tdm_split_scratch_bytes(ctas: int, rows: int) -> int:
+    """Global f32 partials of a split-K launch of ``ctas`` CTAs."""
+
+    tiles = (rows + ROWS - 1) // ROWS
+    return ctas * TDM_SPLIT_MAX_TASKS * tiles * TDM_SPLIT_TILE_WORDS * 4
+
+
 @dataclass(frozen=True)
 class GemvLayout:
     """One architecture's wave-distributed 16-row GEMV fragments."""
