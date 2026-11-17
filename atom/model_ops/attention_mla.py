@@ -2971,14 +2971,19 @@ class MLAAttention(nn.Module):
 
     def _write_kv(self, kv_cache, k_nope, k_rope, slot_mapping):
         """Write an already-roped k (kv_lora + rope) into the k-cache at
-        ``slot_mapping``, in this layer's cache layout.
+        ``slot_mapping``, in this layer's cache layout (shuffled, segmented or
+        plain), with the per-op kernels. `k_rope` must already be
+        rotary-embedded.
 
-        The one door every writer of whole k rows goes through, so the physical
-        layout matches exactly: the dense (`not use_prefill_mla`) prefill
-        (`_write_prefill_kv`), the PCP prefill materialising the full
+        The per-op writer of whole k rows: the dense (`not use_prefill_mla`)
+        prefill (`_write_prefill_kv`), the PCP prefill materialising the full
         sequence's KV after the fused MLA kernel produced q_out on 1/pcp
-        queries, and a drafter's context rows (`write_context_kv_latent`).
-        `k_rope` must already be rotary-embedded.
+        queries, and the per-op path of a drafter's context rows
+        (`write_context_kv_latent`). The fused kernels write their own rows,
+        in the same layouts: the absorbed path's RoPE + cache write
+        (`fused_qk_rope_concat_and_cache_mla[_seg]`,
+        `triton_fused_qk_rope_cat_and_cache_mla`) and the fused context write
+        (`fused_mla_ctx_norm_rope_cache`).
         """
         if self.kv_shuffled:
             shuffled_cache = self._shuffled_kv_view(kv_cache)
@@ -3036,8 +3041,10 @@ class MLAAttention(nn.Module):
         cache (Kimi-K3 DSpark's ``write_context_kv``) has no query and no
         attn_metadata for those rows, so it cannot reach the cache through
         ``forward_impl``; it holds the raw ``kv_lora`` and the slots itself.
-        This lives here rather than in the model so that every cache layout
-        stays behind one door, as ``_write_kv`` already is.
+        This lives here rather than in the model so that the cache layouts stay
+        with this class: the fused path writes the rows itself
+        (``fused_mla_ctx_norm_rope_cache``), the per-op path through
+        ``_write_kv``.
 
         ``kv_lora`` is ``[N, kv_lora_rank + qk_rope_head_dim]`` straight off the
         projection -- normally the strided ``[..., q_lora_rank:]`` half of a
