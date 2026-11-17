@@ -292,6 +292,59 @@ async fn each_rank_of_a_dp_aware_worker_is_followed_until_the_worker_is_removed(
     worker.stop().await;
 }
 
+/// Registered again at its address, as a DP-aware service that restarted is, a worker
+/// reads only the store its ranks report now: none when they leave it out, or report no
+/// sources at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_worker_registered_again_reads_only_the_store_it_reports_now() {
+    let admin_port = mooncake_admin(Arc::new(AtomicBool::new(false))).await;
+    let mut worker = MockWorker::new(MockWorkerConfig {
+        port: 0,
+        worker_type: WorkerType::Regular,
+        health_status: HealthStatus::Healthy,
+        response_delay_ms: 0,
+        fail_rate: 0.0,
+    });
+    let url = worker.start().await.unwrap();
+    worker.set_dp_size(2).await;
+    let offload = json!({"backend": "mooncake_store", "masters": ["127.0.0.1:50051"],
+        "namespace": "atomkv1-0123456789abcdef01234567", "chunk_tokens": 64, "world": 1,
+        "min_load_tokens": 512, "chain_check": "a1aef9c4be290e35c90734297b3e6c8a"});
+    let ranks = |offload: Option<&Value>| {
+        let mut source = json!({"endpoint": "tcp://127.0.0.1:1", "topic": "", "block_size": 4});
+        if let Some(offload) = offload {
+            source["offload"] = offload.clone();
+        }
+        json!({"0": source, "1": source})
+    };
+    let mut config = TestRouterConfig::random(3991);
+    config.kv_events = true;
+    config.dp_aware = true;
+    config.mooncake_admin_port = admin_port;
+    let ctx = AppTestContext::new_with_config(config, vec![]).await;
+    let app = ctx.create_app().await;
+
+    let read_by = |readers: usize| {
+        move |stores: &Value| match readers {
+            0 => stores == &json!([]),
+            n => stores[0]["readers"].as_array().map(Vec::len) == Some(n),
+        }
+    };
+    for (sources, readers) in [
+        (ranks(Some(&offload)), 2),
+        (ranks(None), 0),
+        (ranks(Some(&offload)), 2),
+        (json!({}), 0),
+    ] {
+        worker.set_kv_event_sources(sources).await;
+        let (status, _) = call(&app, "POST", "/workers", Some(json!({"url": url}))).await;
+        assert!(status.is_success(), "{status}");
+        storage_once(&app, read_by(readers)).await;
+    }
+    ctx.shutdown().await;
+    worker.stop().await;
+}
+
 /// The worker that served a request.
 async fn served_by(app: &Router, uri: &str, body: &Value) -> String {
     let request = Request::builder()

@@ -57,6 +57,12 @@ impl StepExecutor<LocalWorkerWorkflowData> for FollowKvEventsStep {
                     message,
                 }
             })?;
+        // The answer is all the ranks read now: a store it leaves out is no longer theirs.
+        if let Some(storage) = &app_context.kv_storage {
+            for worker in workers {
+                storage.remove(worker.url());
+            }
+        }
         if sources.is_empty() {
             warn!(
                 worker = first.base_url(),
