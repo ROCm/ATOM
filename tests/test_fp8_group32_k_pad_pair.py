@@ -10,7 +10,9 @@ to 320 the way an MXFP4 pair pads (test_mxfp4_k_pad_pair.py):
 MergedColumnParallelLinear(output_pad_align=) gives each per-rank output shard
 zero rows, RowParallelLinear(input_pad_align=) zero columns, zero scale codes
 under them. gate_up's padded rows give silu(0) * 0 = 0, so down's padded K
-multiplies exact zeros: no activation pad on a call, one weight.
+multiplies exact zeros: no activation pad on a call, one weight. Only a native
+32x32 weight the load holds preshuffled is padded: a row-major one
+(ATOM_GROUP32_WEIGHT_PRESHUFFLE=0) runs K = 288 as it is.
 """
 
 from types import SimpleNamespace
@@ -36,6 +38,7 @@ from atom.model_ops.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
     fp8_group32_k_pad_align,
+    weight_is_stored_preshuffled,
 )
 from atom.quant_spec import LayerQuantConfig
 
@@ -45,10 +48,10 @@ REAL, PADDED = INTER // TP, 320  # 288 -> 320 per rank
 HIDDEN = 256  # small: K of gate_up, N of down
 
 
-def _qc(quant_type=QuantType.per_1x32, quant_dtype=dtypes.fp8):
+def _qc(quant_type=QuantType.per_1x32, quant_dtype=dtypes.fp8, block=(32, 32)):
     qc = QuantizationConfig()
     qc.global_spec = LayerQuantConfig(
-        quant_type=quant_type, quant_dtype=quant_dtype, weight_block_size=(32, 32)
+        quant_type=quant_type, quant_dtype=quant_dtype, weight_block_size=block
     )
     return qc
 
@@ -67,8 +70,8 @@ def tp_rank(monkeypatch, request):
     return rank
 
 
-def _pair():
-    qc = _qc()
+def _pair(qc=None):
+    qc = qc or _qc()
     align = fp8_group32_k_pad_align(qc, "shared_experts.w2")
     gate_up = MergedColumnParallelLinear(
         HIDDEN, [INTER, INTER], quant_config=qc, prefix="shared_experts.gate_up_proj",
@@ -122,6 +125,31 @@ def test_the_pair_is_padded_at_tp8_only(gfx950, tp_rank):
         HIDDEN,
         576,
     )
+
+
+@pytest.mark.parametrize("block", [(32, 32), (1, 32)])
+@pytest.mark.parametrize("preshuffle", ["1", "0"])
+def test_the_pad_follows_the_loads_preshuffle_decision(
+    monkeypatch, gfx950, tp_rank, preshuffle, block
+):
+    """The pair is padded exactly where the load holds a native 32x32 down weight preshuffled
+    (``weight_is_stored_preshuffled``, ATOM_GROUP32_WEIGHT_PRESHUFFLE on): the weight the preshuffled group32 GEMM
+    reads. A row-major weight keeps its K = 288; so does a native 1x32 one (its MXFP8 backend's K rule is not the
+    32x32 GEMM's step)."""
+    monkeypatch.setenv("ATOM_GROUP32_WEIGHT_PRESHUFFLE", preshuffle)
+    qc = _qc(block=block)
+    gate_up, down = _pair(qc)
+    assert down.native_a8_group_rows == block[0]
+    shuffled = weight_is_stored_preshuffled(
+        down.quant_type, down.params_dtype, native_group_rows=down.native_a8_group_rows
+    )
+    assert shuffled == (preshuffle == "1")
+    pad = shuffled and block == (32, 32)
+    assert fp8_group32_k_pad_align(qc, "shared_experts.w2") == (
+        GROUP32_FP8_K_ALIGN if pad else None
+    )
+    k = PADDED if pad else REAL
+    assert gate_up.weight.shape == (2 * k, HIDDEN) and down.weight.shape == (HIDDEN, k)
 
 
 def _load(gate_up, down, gu, gu_s, d, d_s):
@@ -207,11 +235,15 @@ def test_an_all_zero_group_quantizes_to_zero_codes_under_a_finite_scale():
     assert (tail != 0xFF).all() and torch.isfinite(s.float()).all()
 
 
+@pytest.mark.parametrize("preshuffle", ["1", "0"])
 @pytest.mark.parametrize("tp_rank", [0, 7], indirect=True)
-def test_the_padded_pair_runs_the_real_math(gfx950, tp_rank):
-    """gate_up -> silu(gate) * up -> down through the padded pair on gfx950's group32 GEMM at TP8, against the same
-    FP8 weights at the real K = 288 in float: the GEMM steps K = 320, and the padded columns contribute nothing.
+def test_the_pair_runs_the_real_math(monkeypatch, gfx950, tp_rank, preshuffle):
+    """gate_up -> silu(gate) * up -> down through the pair on gfx950's group32 GEMM at TP8, against the same FP8
+    weights at the real K = 288 in float: preshuffled, the GEMM steps K = 320 and the padded columns contribute
+    nothing; row-major (ATOM_GROUP32_WEIGHT_PRESHUFFLE=0), the pair is not padded and runs K = 288.
     """
+    monkeypatch.setenv("ATOM_GROUP32_WEIGHT_PRESHUFFLE", preshuffle)
+    k = PADDED if preshuffle == "1" else REAL
     torch.manual_seed(0)
     with torch.device("cuda"):
         gate_up, down = _pair()
@@ -219,6 +251,7 @@ def test_the_padded_pair_runs_the_real_math(gfx950, tp_rank):
     _load(gate_up, down, gu.cuda(), gu_s.cuda(), d.cuda(), d_s.cuda())
     for layer in (gate_up, down):
         layer.process_weights_after_loading()
+        assert getattr(layer.weight, "is_shuffled", False) == (preshuffle == "1")
 
     x = torch.randn(6, HIDDEN, dtype=torch.bfloat16, device="cuda")
     h = gate_up(x).float()
@@ -240,7 +273,7 @@ def test_the_padded_pair_runs_the_real_math(gfx950, tp_rank):
     def cos(a, b):
         return torch.nn.functional.cosine_similarity(a.flatten(), b.flatten(), 0)
 
-    assert gate.shape[-1] == PADDED
+    assert gate.shape[-1] == k
     assert (gate[:, REAL:] == 0).all() and (up[:, REAL:] == 0).all()
     assert (act[:, REAL:] == 0).all()
     assert cos(gate[:, :REAL], x.float() @ g_ref.T) > 0.99

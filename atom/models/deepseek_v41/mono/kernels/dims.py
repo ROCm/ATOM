@@ -32,7 +32,9 @@ MOE_PAD = 128
 # this, zero rows of gate_up and columns of w2 (``linear.fp8_group32_k_pad_align``,
 # gfx950's group32 FP8 GEMM: TP8's 288 -> 320). Must equal
 # ``linear.GROUP32_FP8_K_ALIGN`` (this module stays free of AITER;
-# tests/test_fp8_group32_k_pad_pair.py holds the two equal)
+# tests/test_fp8_group32_k_pad_pair.py holds the two equal).
+# TODO(ROCm/aiter#7967): temporary, as that constant; it goes once the GEMM takes
+# a 32-wide K tail
 SHARED_PAD = 64
 ROWS = 16  # GEMV rows a task
 WOA_ROWS = 32  # a wo_a task's rows: one FP8 group of y

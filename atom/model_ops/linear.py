@@ -181,8 +181,13 @@ def mxfp4_k_pad_align(quant_config, prefix: str) -> int | None:
     return MXFP4_N32K4_K_ALIGN if _mxfp4_n32k4_backend() else MXFP4_PRESHUFFLE_K_ALIGN
 
 
-# AITER's gfx950 group32 FP8 GEMM (bmm_a8w8_mxscale_gfx950) steps K in 64s and
-# zero-fills no 32-wide tail; gfx1250's runs a ragged K (a 32x32 w_scale).
+# AITER's gfx950 group32 FP8 GEMM on a preshuffled weight (bmm_a8w8_mxscale_gfx950)
+# steps K in 64s and zero-fills no 32-wide tail; gfx1250's runs a ragged K (a 32x32
+# w_scale), and a row-major group32 weight runs any K the 32-groups divide.
+# TODO(ROCm/aiter#7967): a temporary stand-in for that kernel's K step, restated
+# here only until the kernel takes a 32-wide K tail; then this constant, the align
+# below and V4.1 mono's SHARED_PAD (kernels/dims.py) go. Not a pattern for other
+# shapes.
 GROUP32_FP8_K_ALIGN = 64
 
 
@@ -192,20 +197,40 @@ def _is_fp8_group32(quant_type, quant_dtype) -> bool:
 
 def fp8_group32_k_pad_align(quant_config, prefix: str) -> int | None:
     """K step an MLP pair pads its intermediate to where its down projection
-    (``prefix``) is a native group32 FP8 linear on gfx950; None elsewhere. Pass
-    it as gate_up's output_pad_align and down's input_pad_align, as
-    ``mxfp4_k_pad_align``'s (DeepSeek-V4.1's shared expert at TP8: 288 -> 320).
+    (``prefix``) is a native 32x32 group32 FP8 linear that the load holds
+    preshuffled on gfx950 (``weight_is_stored_preshuffled``, the load's own
+    decision): the weight AITER's preshuffled group32 GEMM reads. None elsewhere:
+    a row-major weight (ATOM_GROUP32_WEIGHT_PRESHUFFLE=0) runs its K as it is,
+    and a native 1x32 weight goes to the MXFP8 backend, whose K rule this step
+    does not meet. Pass it as gate_up's output_pad_align and down's
+    input_pad_align, as ``mxfp4_k_pad_align``'s (DeepSeek-V4.1's shared expert at
+    TP8: 288 -> 320). A padded pair's down projection sets no
+    ``needs_preshuffled_weight`` override.
 
     TODO(ROCm/aiter#7967): drop the align once bmm_a8w8_mxscale_gfx950 takes a
     32-wide K tail.
     """
     if quant_config is None:
         return None
-    if not _is_fp8_group32(*effective_layer_quant(quant_config, prefix)):
+    quant_type, quant_dtype = effective_layer_quant(quant_config, prefix)
+    if not _is_fp8_group32(quant_type, quant_dtype):
         return None
     from aiter.jit.utils.chip_info import get_gfx
 
-    return GROUP32_FP8_K_ALIGN if get_gfx() == "gfx950" else None
+    if get_gfx() != "gfx950":
+        return None
+    # a native 32x32 source, as LinearBase reads one (native_a8_group_rows 32)
+    cfg = quant_config.get_layer_quant_config(prefix)
+    if (
+        cfg.quant_dtype != torch.float8_e4m3fn
+        or cfg.weight_block_size != (32, 32)
+        or will_online_requant(quant_config, prefix, cfg.quant_type, cfg.quant_dtype)
+    ):
+        return None
+    preshuffled = weight_is_stored_preshuffled(
+        cfg.quant_type, cfg.quant_dtype, native_group_rows=32
+    )
+    return GROUP32_FP8_K_ALIGN if preshuffled else None
 
 
 def _zero_pad_tail(param, dim: int, start: int, length: int) -> None:
