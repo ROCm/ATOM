@@ -4,6 +4,7 @@
 import itertools
 import logging
 from collections.abc import Callable
+from functools import cache as functools_cache
 from functools import partial as functools_partial
 from typing import ClassVar
 
@@ -466,6 +467,52 @@ def gemm_a4w4_quant(
     return y[:m, ...]
 
 
+@functools_cache
+def _aiter_row_major_x_scale_query():
+    """aiter's per-shape "row-major x_scale is not slower" query on gfx1250,
+    else None (other archs, or an aiter without it)."""
+    from aiter.jit.utils.chip_info import get_gfx
+
+    if not get_gfx().startswith("gfx1250"):
+        return None
+    try:
+        from aiter.ops.gemm_op_a8w8 import (
+            gemm_a8w8_blockscale_bpreshuffle_prefers_row_major_x_scale as query,
+        )
+    except ImportError:
+        return None
+    return query
+
+
+def _aiter_takes_row_major_x_scale() -> bool:
+    return _aiter_row_major_x_scale_query() is not None
+
+
+# Row-major x_scale groups: one producer (a norm's fused E8M0 quant) and the
+# (N, K) of every GEMM reading its scale. Key 0 is "always column-major". The
+# key travels into the custom ops as an int so the per-M choice is made on
+# concrete shapes, outside torch.compile tracing.
+_ROW_MAJOR_X_SCALE_GROUPS: list[tuple[tuple[int, int], ...]] = [()]
+
+
+def register_row_major_x_scale_group(shapes: list[tuple[int, int]]) -> int:
+    _ROW_MAJOR_X_SCALE_GROUPS.append(tuple(shapes))
+    return len(_ROW_MAJOR_X_SCALE_GROUPS) - 1
+
+
+@functools_cache
+def row_major_x_scale_for(key: int, m: int) -> bool:
+    """Whether group ``key`` hands its E8M0 per-1x128 scale row-major at M rows:
+    only when every GEMM of the group reads row-major at least as fast. Producer
+    and consumers ask with the same (key, M), so they always agree."""
+    if not key or m <= 0:
+        return False
+    query = _aiter_row_major_x_scale_query()
+    return query is not None and all(
+        query(m, n, k) for n, k in _ROW_MAJOR_X_SCALE_GROUPS[key]
+    )
+
+
 def gemm_a8w8_blockscale_preshuffle_fake(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -473,6 +520,7 @@ def gemm_a8w8_blockscale_preshuffle_fake(
     w_scale: torch.Tensor,
     dtype: torch.dtype = torch.bfloat16,
     prefix: str = "",
+    row_major_key: int = 0,
 ) -> torch.Tensor:
     return torch.empty((*x.shape[:-1], weight.shape[0]), dtype=dtype, device=x.device)
 
@@ -485,7 +533,12 @@ def gemm_a8w8_blockscale_preshuffle_impl(
     w_scale: torch.Tensor,
     dtype: torch.dtype = torch.bfloat16,
     prefix: str = "",
+    row_major_key: int = 0,
 ) -> torch.Tensor:
+    if row_major_x_scale_for(row_major_key, x_scale.shape[0]):
+        return gemm_a8w8_blockscale_bpreshuffle(
+            x, weight, x_scale, w_scale, dtype, x_scale_transposed=False
+        )
     return gemm_a8w8_blockscale_bpreshuffle(x, weight, x_scale, w_scale, dtype)
 
 
@@ -497,6 +550,7 @@ def gemm_a8w8_blockscale_preshuffle_into_output_fake(
     out: torch.Tensor,
     dtype: torch.dtype = torch.bfloat16,
     prefix: str = "",
+    row_major_key: int = 0,
 ) -> None:
     return None
 
@@ -512,6 +566,7 @@ def gemm_a8w8_blockscale_preshuffle_into_output(
     out: torch.Tensor,
     dtype: torch.dtype = torch.bfloat16,
     prefix: str = "",
+    row_major_key: int = 0,
 ) -> None:
     # Same GEMM, but the result lands in the CALLER-owned `out` buffer (a fixed
     # address) and the op returns None — a mutates_args op must NOT also return
@@ -519,6 +574,11 @@ def gemm_a8w8_blockscale_preshuffle_into_output(
     # cannot lower). Lets the downstream attention cudagraph read this output at
     # a stable address with no per-step input copy. Mirrors 035db69's
     # unified_attention_into_output.
+    if row_major_x_scale_for(row_major_key, x_scale.shape[0]):
+        gemm_a8w8_blockscale_bpreshuffle(
+            x, weight, x_scale, w_scale, dtype, out=out, x_scale_transposed=False
+        )
+        return
     gemm_a8w8_blockscale_bpreshuffle(x, weight, x_scale, w_scale, dtype, out=out)
 
 
@@ -1582,6 +1642,31 @@ class LinearBase(nn.Module):
             envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
         )
 
+    # Set by use_row_major_x_scale(): the row-major x_scale group a caller's
+    # E8M0 per-1x128 x_scale belongs to (0: always column-major).
+    x_scale_row_major_key: int = 0
+
+    def use_row_major_x_scale(self, key: int = 0) -> bool:
+        """Whether this Linear's GEMM can take a row-major E8M0 per-1x128
+        x_scale (gfx1250, where the aiter GEMM reads that layout natively), and
+        with a nonzero ``key`` read a caller's x_scale as group ``key`` lays it
+        out. A scale this Linear quantizes itself stays column-major."""
+        if not (
+            envs.ATOM_KIMI_K3_ROW_MAJOR_X_SCALE
+            and envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
+            and self.blockscale_e8m0_scale
+            and self.native_a8_group_rows is None
+            and _aiter_takes_row_major_x_scale()
+        ):
+            return False
+        if key:
+            self.x_scale_row_major_key = key
+        return True
+
+    def row_major_x_scale_shape(self) -> tuple[int, int]:
+        """(N, K) of this Linear's GEMM, as the row-major x_scale query takes."""
+        return int(self.weight.shape[0]), int(self.weight.shape[1])
+
     def quantize_input(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """The activation quant ``forward`` applies when given no ``x_scale``.
         Not for unquantized, per_1x32 or native-A8 Linears."""
@@ -1644,6 +1729,7 @@ class LinearBase(nn.Module):
             else:
                 y = tgemm.mm(x, self.weight, self.bias, otype=otype, out=out)
         else:
+            row_major_key = self.x_scale_row_major_key if x_scale is not None else 0
             if x_scale is None and self.quant_type.value != QuantType.per_1x32.value:
                 x, x_scale = self.quantize_input(x)
             if self.quant_type.value == QuantType.per_Tensor.value:
@@ -1709,6 +1795,7 @@ class LinearBase(nn.Module):
                             out,
                             dtype=otype,
                             prefix=self.prefix,
+                            row_major_key=row_major_key,
                         )
                         y = out
                     else:
@@ -1719,6 +1806,7 @@ class LinearBase(nn.Module):
                             self.weight_scale,
                             dtype=otype,
                             prefix=self.prefix,
+                            row_major_key=row_major_key,
                         )
                 else:
                     assert out is None, (

@@ -240,6 +240,7 @@ def attn_res_tdm_supported(block_residual: torch.Tensor) -> bool:
 
 
 _XCD_REMAP_MIN_T = 512
+_XCD_REMAP_MIN_T_ROW = 160
 
 
 @functools.cache
@@ -253,11 +254,14 @@ def launch_attn_res_tdm(
     br, ps, sw, y, y_scale, hs, hs2, pref, ow, eps, out_eps, fp8_max, flags
 ):
     T, B, H = br.shape
-    # Only column-major E8M0 scales (stride_ys_t == 1) share lines across tokens;
-    # below _XCD_REMAP_MIN_T tokens the round-robin order is faster. The remap only
-    # picks which program computes a token, so the bytes do not depend on T.
-    col_scales = flags.get("E8M0_SCALE", False) and flags.get("stride_ys_t") == 1
-    remap = col_scales and T >= _XCD_REMAP_MIN_T
+    # E8M0 scale lines hold neighbouring tokens (column-major), or a token's
+    # 56 codes straddle two lines (row-major); written from every XCD's L2 they
+    # cost more than the remap from these T. The remap only picks which program
+    # computes a token, so the bytes do not depend on T.
+    remap = False
+    if flags.get("E8M0_SCALE", False):
+        col_scales = flags.get("stride_ys_t") == 1
+        remap = T >= (_XCD_REMAP_MIN_T if col_scales else _XCD_REMAP_MIN_T_ROW)
     _attn_res_tdm_kernel[(T,)](
         br,
         ps,

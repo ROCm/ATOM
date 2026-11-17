@@ -306,6 +306,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KIMI_K3_ATTN_RES_GLUON_TDM": lambda: (
         os.getenv("ATOM_KIMI_K3_ATTN_RES_GLUON_TDM", "1") == "1"
     ),
+    # Kimi-K3 on gfx1250: hand the E8M0 per-1x128 activation scale of the attn_res
+    # / input-norm sites to their GEMMs row-major [T, K/128] instead of
+    # column-major. Needs an aiter whose gemm_a8w8_blockscale_bpreshuffle takes
+    # x_scale_transposed; without one the column-major layout stays.
+    "ATOM_KIMI_K3_ROW_MAJOR_X_SCALE": lambda: (
+        os.getenv("ATOM_KIMI_K3_ROW_MAJOR_X_SCALE", "1") == "1"
+    ),
     # Deprecated: use ATOM_MLA_KV_SHUFFLED. Only effective together with
     # ATOM_USE_TRITON_MLA=1.
     "ATOM_USE_TRITON_MLA_SHUFFLE_KV": lambda: (

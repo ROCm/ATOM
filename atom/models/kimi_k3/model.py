@@ -45,6 +45,7 @@ from atom.model_ops.linear import (
     ReplicatedLinear,
     RowParallelLinear,
     mxfp4_k_pad_align,
+    register_row_major_x_scale_group,
     use_fp4_non_shuffle_triton_gemm,
     use_mxfp4_preshuffle_triton_gemm,
     uses_mxfp4_n32k4_scale,
@@ -189,6 +190,31 @@ def _is_e8m0_blockscale(
         and quant_type.value == QuantType.per_1x128.value
         and quant_config.blockscale_e8m0_scale
     )
+
+
+def _row_major_x_scale(norm: RMSNorm, consumers: list[nn.Module | None]) -> bool:
+    """Put ``norm``'s fused E8M0 per-1x128 quant and every GEMM reading its scale
+    in one row-major x_scale group (gfx1250), so that per T the scale goes out
+    row-major exactly when all of those GEMMs read that layout at least as fast
+    (``linear.row_major_x_scale_for``), and column-major otherwise.
+
+    The attn_res kernel folding this norm follows the norm's group, and a
+    consumer quantizing for itself stays column-major, so the GEMMs always get
+    the layout they are told."""
+    if not consumers or not all(
+        getattr(c, "use_row_major_x_scale", None) is not None
+        and c.use_row_major_x_scale()
+        for c in consumers
+    ):
+        return False
+    key = register_row_major_x_scale_group(
+        [c.row_major_x_scale_shape() for c in consumers]
+    )
+    if not norm.use_row_major_scale(key):
+        return False
+    for c in consumers:
+        c.use_row_major_x_scale(key)
+    return True
 
 
 class SituAndMul(nn.Module):
@@ -992,6 +1018,10 @@ class KimiFullAttention(nn.Module):
         )
         return attn_out, attn_scale
 
+    def input_scale_consumers(self) -> list[nn.Module]:
+        """The GEMMs that read input_layernorm's quantized output and scale."""
+        return [self.fused_qkv_a_proj, self.g_proj]
+
     def forward(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
@@ -1362,6 +1392,10 @@ class KimiKDAAttention(nn.Module):
             # K-first and decode reads it transposed.
             state_v_first=True,
         )
+
+    def input_scale_consumers(self) -> list[nn.Module]:
+        """The GEMMs that read input_layernorm's quantized output and scale."""
+        return [self.in_proj]
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # hidden_states is a (fp8, scale) tuple when input_layernorm fused the
@@ -1901,6 +1935,11 @@ class KimiDecoderLayer(nn.Module):
             out_norm=self.post_attention_layernorm,
             enabled=self.use_attn_residuals,
         )
+        _row_major_x_scale(self.input_layernorm, self.self_attn.input_scale_consumers())
+        if hasattr(self, "mlp"):
+            _row_major_x_scale(
+                self.post_attention_layernorm, [getattr(self.mlp, "gate_up_proj", None)]
+            )
 
     def _ffn(
         self, hidden_states: torch.Tensor
