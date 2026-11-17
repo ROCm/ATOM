@@ -992,6 +992,11 @@ class KimiFullAttention(nn.Module):
         )
         return attn_out, attn_scale
 
+    def input_scale_consumers(self) -> list[nn.Module]:
+        """The GEMMs that read input_layernorm's quantized output and scale:
+        every Linear that ``forward`` hands ``hidden_states_scale`` to."""
+        return [self.fused_qkv_a_proj, self.g_proj]
+
     def forward(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
@@ -1362,6 +1367,11 @@ class KimiKDAAttention(nn.Module):
             # K-first and decode reads it transposed.
             state_v_first=True,
         )
+
+    def input_scale_consumers(self) -> list[nn.Module]:
+        """The GEMMs that read input_layernorm's quantized output and scale:
+        every Linear that ``forward`` hands ``hidden_states_scale`` to."""
+        return [self.in_proj]
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # hidden_states is a (fp8, scale) tuple when input_layernorm fused the
@@ -1901,6 +1911,13 @@ class KimiDecoderLayer(nn.Module):
             out_norm=self.post_attention_layernorm,
             enabled=self.use_attn_residuals,
         )
+        from atom.model_ops.kimi_k3.x_scale_layout import share_x_scale_layout
+
+        share_x_scale_layout(
+            self.input_layernorm, self.self_attn.input_scale_consumers()
+        )
+        if self.fuse_ffn_norm_quant:
+            share_x_scale_layout(self.post_attention_layernorm, [self.mlp.gate_up_proj])
 
     def _ffn(
         self, hidden_states: torch.Tensor
