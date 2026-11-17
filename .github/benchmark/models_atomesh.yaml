@@ -2641,6 +2641,131 @@ models:
               num_speculative_tokens: 4
               spec_decode_acceptance_length: 3.19
 
+      # Aggregated TP4 on GPUs 0-3 (one server, tok/s/GPU over 4), against InferenceX's
+      # MI355X vLLM point. Dispatch-only: schedule and push run `nightly`.
+      weekly:
+        - &m31b_agg_agentx
+          name: m31b-nvfp4-agg-tp4-dspark7-lmcache-agentx-c48
+          topology: agg
+          display_topology: AGG-TP4-DSPARK7-NVFP4-LMCACHE
+          # Placement only: `topology: agg` is what makes this one server.
+          pd_worker_layout: single_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [1048576]
+          osl: 1024
+          concurrency: [48]
+          # The server reads the decode block; tp here only keeps the summary's
+          # TP column at 4 (the backend default 8 prints "P8/D4").
+          prefill:
+            tp: 4
+          decode: &m31b_agg_decode
+            workers: 1
+            tp: 4
+            cudagraph: "[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96]"
+            # AgentX reaches this server directly (no router): outlast its idle gaps.
+            extra_args: "--timeout-keep-alive 900"
+          server:
+            common_args: &m31b_agg_args
+              max_num_seqs: 96
+              # ATOM's default, pinned: the one server's prefill chunk.
+              max_num_batched_tokens: 16384
+              spec_decode_acceptance_length: 4.04
+          env:
+            common: *m31b_common_env
+            # The P/D decode's features on GPUs 0-3, plus LMCache on their NUMA0 (the launcher
+            # starts a Store only for a P/D prefill); 4 x 256 GiB, the pin the rocm7 THP fix validated.
+            decode:
+              <<: *m31b_decode_env
+              HIP_VISIBLE_DEVICES: "0,1,2,3"
+              LMCACHE_LOCAL_CPU: "True"
+              LMCACHE_NUMA_MODE: auto
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "256"
+              LMCACHE_CHUNK_SIZE: "256"
+              # Every rank looks up its own shard (LRU touch, pins); the shortest hit loads.
+              LMCACHE_LOOKUP_SERVER_WORKER_IDS: "0,1,2,3"
+              OFFLOAD_PROFILE: "1"
+              OFFLOAD_MIN_LOAD_TOKENS: "0"
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"lmcache_offload","kv_role":"offload"}
+          benchmark:
+            <<: *agentic_1m_aiperf
+            wait_server_timeout: 7200
+          run_eval: false
+
+        # Boots this exact server (LMCache pin, NVFP4 + fp8-draft regions) and runs
+        # GSM8K 20-shot chat at real acceptance (a gsm8k eval drops the forced AL).
+        # At C4 the eval outlasts a side check that evicts HBM and restores from the CPU tier.
+        - <<: *m31b_agg_agentx
+          name: m31b-nvfp4-agg-tp4-dspark7-lmcache-gsm8k20-c4
+          isl: [4096]
+          concurrency: [4]
+          benchmark:
+            wait_server_timeout: 7200
+            wait_router_timeout: 600
+          run_eval: true
+          eval_only: true
+          eval_concurrency: [4]
+
+        - <<: *m31b_agg_agentx
+          name: m31b-nvfp4-agg-tp4-dspark7-lmcache-agentx-c64
+          concurrency: [64]
+          decode: &m31b_agg_decode_c64
+            <<: *m31b_agg_decode
+            cudagraph: "[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128]"
+          server:
+            common_args:
+              <<: *m31b_agg_args
+              max_num_seqs: 128
+
+        - <<: *m31b_agg_agentx
+          name: m31b-nvfp4-agg-tp4-dspark7-lmcache-agentx-c80
+          concurrency: [80]
+          decode:
+            <<: *m31b_agg_decode
+            cudagraph: "[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160]"
+          server:
+            common_args:
+              <<: *m31b_agg_args
+              max_num_seqs: 160
+
+        - <<: *m31b_agg_agentx
+          name: m31b-nvfp4-agg-tp4-dspark7-lmcache-agentx-c96
+          concurrency: [96]
+          decode:
+            <<: *m31b_agg_decode
+            cudagraph: "[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160,176,192]"
+          server:
+            common_args:
+              <<: *m31b_agg_args
+              max_num_seqs: 192
+
+        # DSpark4 (InferenceX golden AL 3.19) against DSpark7 at C64.
+        - <<: *m31b_agg_agentx
+          name: m31b-nvfp4-agg-tp4-dspark4-lmcache-agentx-c64
+          display_topology: AGG-TP4-DSPARK4-NVFP4-LMCACHE
+          concurrency: [64]
+          decode: *m31b_agg_decode_c64
+          server:
+            common_args:
+              <<: *m31b_agg_args
+              max_num_seqs: 128
+              num_speculative_tokens: 4
+              spec_decode_acceptance_length: 3.19
+
+        # DSpark3 (golden AL 2.88), the draft depth vLLM's C64 point ran.
+        - <<: *m31b_agg_agentx
+          name: m31b-nvfp4-agg-tp4-dspark3-lmcache-agentx-c64
+          display_topology: AGG-TP4-DSPARK3-NVFP4-LMCACHE
+          concurrency: [64]
+          decode: *m31b_agg_decode_c64
+          server:
+            common_args:
+              <<: *m31b_agg_args
+              max_num_seqs: 128
+              num_speculative_tokens: 3
+              spec_decode_acceptance_length: 2.88
+
+
     accuracy:
       task: gsm8k
       fewshot: 20
