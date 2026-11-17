@@ -13,6 +13,10 @@ on:
       base_sha:
         type: string
         required: true
+      execution:
+        type: choice
+        options: ['native', 'slurm']
+        default: native
 permissions:
   contents: read
 concurrency:
@@ -20,6 +24,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   validate:
+    if: ${{ inputs.execution != 'slurm' }}
     runs-on: linux-atom-pitt-mi350x-8
     timeout-minutes: 240
     env:
@@ -83,6 +88,48 @@ jobs:
           mkdir -p review-evidence
           docker ps -a --filter "name=^${CONTAINER_NAME}$" --format '{{.Names}} {{.Status}}' > review-evidence/containers-after.txt
           test ! -s review-evidence/containers-after.txt
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: pr-${{ inputs.pr }}-prefill-evidence
+          path: review-evidence/
+          retention-days: 14
+  slurm:
+    if: ${{ inputs.execution == 'slurm' }}
+    runs-on: atomesh-cicd
+    timeout-minutes: 360
+    env:
+      PR: ${{ inputs.pr }}
+      HEAD_SHA: ${{ inputs.head_sha }}
+      BASE_SHA: ${{ inputs.base_sha }}
+      AITER_GIT_REF: 0d894387bbbf43df30bdfcba928f483b94a906e2
+      IMAGE: rocm/atom-dev@sha256:ad256a94209d2f58bfa6b0a69c555e0f8aab4fd8b76673c3532258803599099c
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          path: _review_harness
+          persist-credentials: false
+      - name: Submit and monitor native prefill validation on Slurm
+        env:
+          HF_TOKEN: ${{ secrets.AMD_HF_TOKEN }}
+        run: bash _review_harness/.github/scripts/pr_prefill_slurm_submit.sh
+      - name: Collect this Slurm job's evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ -s review-evidence/shared-root.txt ]]; then
+            shared=$(cat review-evidence/shared-root.txt)
+            cp -a "$shared/logs/." review-evidence/ || true
+            if [[ -d "$shared/source/review-evidence" ]]; then
+              cp -a "$shared/source/review-evidence/." review-evidence/
+            fi
+          fi
       - uses: actions/upload-artifact@v7
         if: always()
         with:

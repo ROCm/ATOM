@@ -340,10 +340,15 @@ if __name__ == "__main__":
         Path(importlib.util.find_spec("atom").origin).resolve()
         == ROOT / "atom/__init__.py"
     )
+    aiter_source = Path(os.environ.get("AITER_SOURCE_PATH", "/app/aiter-test"))
     aiter_sha = subprocess.check_output(
-        ["git", "-C", "/app/aiter-test", "rev-parse", "HEAD"], text=True
+        ["git", "-C", str(aiter_source), "rev-parse", "HEAD"], text=True
     ).strip()
     assert aiter_sha == os.environ["AITER_GIT_REF"]
+    assert (
+        Path(importlib.util.find_spec("aiter").origin).resolve()
+        == aiter_source / "aiter/__init__.py"
+    )
     manifest = {
         "pr": PR,
         "head": HEAD,
@@ -353,7 +358,8 @@ if __name__ == "__main__":
         "aiter_ref": os.environ["AITER_GIT_REF"],
         "gpu": [torch.cuda.get_device_name(i) for i in range(8)],
         "packages": {
-            p: importlib.metadata.version(p) for p in ("amd-aiter", "lm_eval", "triton")
+            **{p: importlib.metadata.version(p) for p in ("amd-aiter", "lm_eval")},
+            "triton": __import__("triton").__version__,
         },
     }
     save(OUT / "manifest.json", manifest)
