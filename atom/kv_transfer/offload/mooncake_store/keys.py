@@ -190,13 +190,14 @@ def chunk_hash_chain(
 
     ``h_i = blake2b(h_{i-1} || int32-LE(tokens[i*C:(i+1)*C]))`` with a 16-byte
     digest, starting from ``seed`` (``chain_seed()`` by default). Any partial
-    chunk at the end is left out. An ``array("i")`` is read in place, without
-    a copy.
+    chunk at the end is left out.
     """
     chunk_tokens = int(chunk_tokens)
-    # The view must not outlive the call: an array exporting its buffer
-    # cannot grow, and the scheduler appends to `Sequence.token_ids`.
-    tokens = np.asarray(token_ids, dtype="<i4")[:num_tokens]
+    # Hashed from a copy, never a view of `token_ids`: an `array("i")` that
+    # exports its buffer cannot grow, and the scheduler thread appends to
+    # `Sequence.token_ids` while the asynchronous Store lookup hashes it on its
+    # worker (`AsyncStoreLookup`). Slicing copies under the GIL, in one step.
+    tokens = np.asarray(token_ids[:num_tokens], dtype="<i4")
     total = len(tokens) // chunk_tokens
     raw = memoryview(tokens[: total * chunk_tokens].tobytes())
     stride = chunk_tokens * 4

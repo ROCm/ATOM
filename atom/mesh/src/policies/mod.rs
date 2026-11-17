@@ -38,6 +38,11 @@ pub struct RouteDecision {
     pub branch: &'static str,
     /// Prefix match ratio of the best candidate, for policies that estimate one.
     pub match_ratio: Option<f64>,
+    /// Expected prefix cache hit ratio on the selected worker, reconciled with the
+    /// cached tokens its response reports. `cache_aware`'s tree branches set it only
+    /// when the selected worker is the best candidate, its KV event branches always;
+    /// other policies leave it None.
+    pub estimated_hit_ratio: Option<f64>,
 }
 
 impl RouteDecision {
@@ -45,6 +50,7 @@ impl RouteDecision {
         Self {
             branch,
             match_ratio: None,
+            estimated_hit_ratio: None,
         }
     }
 }
