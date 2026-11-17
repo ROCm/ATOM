@@ -196,3 +196,96 @@ def test_nvfp4_index_cache_is_one_9216_byte_uint8_page():
     )
     with pytest.raises(ValueError, match="NVFP4 index cache is 128-wide"):
         b._index_cache_spec(256)
+
+
+NV_RUNS = (4, 8192, 1024, 8192, 1024)
+
+
+@pytest.mark.parametrize("heads", [1, 4])
+def test_transfer_pages_declare_the_four_runs_of_a_page(heads):
+    p = pool(layers=2, heads=heads)
+    p.allocate(3, "cpu")
+    pages = p.transfer_pages("mha", "mha.x", [10, 11], [16, 16])
+    assert [pg.head_major_runs for pg in pages] == [
+        (NV_RUNS[0], heads, *NV_RUNS[1:])
+    ] * 2
+    assert pages[0].region.unit_bytes == kv_page_bytes(heads)
+
+
+@pytest.mark.parametrize("rank", range(4))
+def test_a_tp1_page_cuts_into_each_ranks_one_head_page(rank):
+    from atom.kv_transfer.disaggregation.sharded_transfer import consumer_head_slices
+
+    src = (torch.arange(kv_page_bytes(4)) % 253).to(torch.uint8)
+    cuts = consumer_head_slices(
+        kv_page_bytes(4),
+        kv_page_bytes(1),
+        (4, 4, *NV_RUNS[1:]),
+        (4, 1, *NV_RUNS[1:]),
+        rank,
+        4,
+        "kv",
+    )
+    dst = torch.zeros(kv_page_bytes(1), dtype=torch.uint8)
+    for s, d, n in cuts.tolist():
+        dst[d : d + n] = src[s : s + n]
+    for side in (0, 1):
+        sd, ss = head_regions(side, rank, 4)
+        dd, ds = head_regions(side, 0, 1)
+        assert torch.equal(dst[dd : dd + 8192], src[sd : sd + 8192])
+        assert torch.equal(dst[ds : ds + 1024], src[ss : ss + 1024])
+
+
+def _connector(name, role):
+    return {"kv_connector": name, "kv_role": role}
+
+
+@pytest.mark.parametrize(
+    "kvt",
+    [
+        _connector("mooncake", "kv_producer"),
+        _connector("mooncake", "kv_consumer"),
+        {
+            "kv_connector": "multi",
+            "connectors": [
+                _connector("mooncake", "kv_producer"),
+                _connector("mooncake_store", "offload"),
+            ],
+        },
+    ],
+)
+def test_nvfp4_pages_run_under_mooncake_pd_and_store(kvt):
+    check(kv_transfer_config=kvt, **NV)
+
+
+@pytest.mark.parametrize(
+    "kw",
+    [
+        {"kv_transfer_config": _connector("lmcache_mp", "offload"), **NV},
+        {"kv_transfer_config": _connector("moriio", "kv_producer"), **NV},
+        {
+            "kv_transfer_config": _connector("mooncake", "kv_producer"),
+            "kv_cache_dtype": "fp4",
+            "index_cache_dtype": "fp4",
+        },
+    ],
+)
+def test_other_fp4_transports_still_refuse(kw):
+    with pytest.raises(ValueError, match="KV offload"):
+        check(**kw)
+
+
+def test_an_fp8_dspark_draft_rides_an_nvfp4_mooncake_transfer(monkeypatch):
+    from tests.test_minimax_m3_mxfp4_cache import _dspark_spec
+
+    spec = _dspark_spec()
+    spec.kv_cache_dtype = "fp8"
+    config = _m3(
+        monkeypatch,
+        kv_cache_dtype="nvfp4",
+        index_cache_dtype="nvfp4",
+        hf=sparse_hf(),
+        kv_transfer_config=_connector("mooncake", "kv_producer"),
+        speculative_config=spec,
+    )
+    assert config.speculative_config.draft_kv_dtype == "fp8"

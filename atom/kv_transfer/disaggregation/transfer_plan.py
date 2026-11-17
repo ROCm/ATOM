@@ -50,8 +50,8 @@ class RegionLayout:
     target_page_bytes: int
     # Declared physical capability, not inferred from a byte width alone.
     token_contiguous: bool = False
-    source_head_runs: tuple[int, int] | None = None
-    target_head_runs: tuple[int, int] | None = None
+    source_head_runs: tuple[int, ...] | None = None
+    target_head_runs: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -145,15 +145,9 @@ def _page_gather(layout: RegionLayout, t: TransferTopology) -> GatherLayout:
         if src != dst or layout.source_head_runs != layout.target_head_runs:
             raise ValueError("Equal TP requires matching physical layouts")
         cuts = np.array([[0, 0, src]], dtype=np.int64)
-    first, width = int(cuts[0, 0]), int(cuts[0, 2])
-    stride = int(cuts[1, 0]) - first if len(cuts) > 1 else src
-    if dst != width * len(cuts) or any(
-        (int(cuts[i, 0]), int(cuts[i, 1]), int(cuts[i, 2]))
-        != (first + i * stride, i * width, width)
-        for i in range(len(cuts))
-    ):
-        raise ValueError("Nonuniform head runs need a physical layout adapter")
-    return GatherLayout(src, dst, first, stride, width)
+    if dst != int(cuts[:, 2].sum()):
+        raise ValueError("Head runs do not fill the target PAGE")
+    return GatherLayout.from_slices(src, dst, cuts)
 
 
 def build_transfer_plan(

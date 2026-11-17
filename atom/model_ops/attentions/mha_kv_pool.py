@@ -411,9 +411,13 @@ class MhaKvPool:
                 runs = None
                 if name in per_head:
                     page = self.block_size if page_tokens is None else page_tokens[row]
-                    if self.entry_tokens % page:
+                    own_runs = getattr(self.layout, "head_runs", None)
+                    if own_runs is not None and not self.flash_layout:
+                        runs = own_runs(name, self.num_kv_heads)
+                    elif self.entry_tokens % page:
                         raise ValueError(f"{page}-token pages do not tile {name}")
-                    runs = (self.entry_tokens // page, self.num_kv_heads)
+                    else:
+                        runs = (self.entry_tokens // page, self.num_kv_heads)
                     layer = layers[row]
                     dim, dtype = (
                         (self.head_dim, self.kv_dtype)

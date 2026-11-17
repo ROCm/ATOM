@@ -2010,6 +2010,18 @@ def _check_fp4_kv(kv_cache_dtype: str, *, is_m3: bool, is_v41: bool) -> None:
         raise ValueError("--kv-cache-dtype nvfp4 is supported by MiniMax-M3 only")
 
 
+# Transports whose units carry their own dtype (Mooncake P/D pairs PageUnitSpecs)
+# or whose PAGE namespace hashes the speculative config (the offload tiers).
+DRAFT_DTYPE_TRANSPORTS = frozenset({"mooncake", "mooncake_store", "lmcache_offload"})
+
+
+def _transports_key_draft_dtype(config) -> bool:
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    leaves = KVConnectorFactory.leaf_connectors(config)
+    return bool(leaves) and all(name in DRAFT_DTYPE_TRANSPORTS for name, _ in leaves)
+
+
 def resolve_draft_kv_dtype(
     target_dtype: str, *, own_pool: bool, requested: str | None = None
 ) -> str:
@@ -3251,11 +3263,9 @@ class Config:
             # with its dtype in its PageUnitSpec), and the lmcache_offload PAGE
             # namespace hashes the whole speculative_config, draft KV dtype
             # included, so its pages never share a key with the target's.
-            draft_dtype_offload_ok = (
-                draft_owns_kv_pool(self)
-                and isinstance(self.kv_transfer_config, dict)
-                and self.kv_transfer_config.get("kv_connector") == "lmcache_offload"
-            )
+            draft_dtype_offload_ok = draft_owns_kv_pool(
+                self
+            ) and _transports_key_draft_dtype(self)
             if (
                 spec.draft_kv_dtype != self.kv_cache_dtype
                 and self.kv_transfer_config

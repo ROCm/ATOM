@@ -95,6 +95,45 @@ def test_tp_rank_owns_its_heads_of_each_page(rank, heads):
     assert plan.regions[0].target_region == 7  # explicit PP region mapping
 
 
+@pytest.mark.parametrize("rank", range(4))
+def test_named_run_widths_gather_into_one_target_page(rank):
+    # NVFP4-like page: runs of 8 B and 4 B per head (data, scales) for K then V.
+    widths = (8, 4, 8, 4)
+    heads = 4
+    source = (
+        torch.arange(5 * 24 * heads, dtype=torch.int64)
+        .remainder(251)
+        .to(torch.uint8)
+        .view(5, 24 * heads)
+    )
+    ids = [3, 0, 2]
+    destination = torch.zeros(5, 24, dtype=torch.uint8)
+    dst_ids = [4, 1, 3]
+    layout = RegionLayout(
+        0,
+        7,
+        destination.data_ptr(),
+        24 * heads,
+        24,
+        False,
+        (4, heads, *widths),
+        (4, 1, *widths),
+    )
+    plan = build_transfer_plan(
+        TransferTopology(target_tp=4, target_tp_rank=rank), [layout], ids, dst_ids, 8
+    )
+    assert len(plan.regions[0].gather.segments) == 4
+    execute_plan(plan, source, destination)
+    want = []
+    before = 0
+    for w in widths:
+        want.append(
+            source[ids, before * heads + rank * w : before * heads + (rank + 1) * w]
+        )
+        before += w
+    assert torch.equal(destination[dst_ids], torch.cat(want, dim=1))
+
+
 @pytest.mark.parametrize("source_tp", [1, 2, 4])
 @pytest.mark.parametrize("rank", range(4))
 def test_tp_replicated_units_can_also_be_partitioned_by_dcp(source_tp, rank):

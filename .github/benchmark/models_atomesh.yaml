@@ -2434,3 +2434,157 @@ models:
       # V3 is not a reasoning model, so gsm8k answers are short.
       max_gen_toks: 512
       apply_chat_template: true
+
+  # MiniMax-M3.1-Flash on ganyi/best-atom-1116 + aiter ganyi/best-aiter-1116,
+  # with #3306/#2846 (KV staging + landing) and #3165 (decode admission).
+  # One node: PP4 x TP1 prefill (GPUs 0-3) -> TP4 decode (GPUs 4-7), NVFP4 KV and
+  # index caches, fp8 DSpark7 draft KV, no ptpc and no INT4 all-reduce. The prefix
+  # tier is a Mooncake Store over both NUMA nodes' DRAM. Dispatch-only.
+  MiniMax-M3.1-Flash-Best-NVFP4:
+    backend: atom
+    image: rocm/atom-dev:m31-best-pd-20261117
+    model_path: amd/MiniMax-M3.1-Flash-Quark-MXFP4
+    precision: MXFP4
+    env:
+      common: &m31b_common_env
+        AITER_LOG_LEVEL: WARNING
+        PYTHONNOUSERSITE: "1"
+        PYTHONHASHSEED: "0"
+        MC_DISABLE_HIP: "1"
+        MC_NUM_QP_PER_EP: "1"
+        ATOM_PD_MHA_LANDING: "1"
+        HF_HUB_CACHE: "${ATOMESH_MODEL_ROOT}/.huggingface/hub"
+        HF_HUB_DOWNLOAD_TIMEOUT: "120"
+        ATOMESH_TORCH_PROFILE_DURATION: "0"
+      prefill: {}
+      decode: {}
+    server:
+      common_args:
+        served_model_name: MiniMaxAI/MiniMax-M3.1-Flash
+        trust_remote_code: true
+        kv_cache_dtype: nvfp4
+        block_size: 128
+        enable_prefix_caching: true
+        gpu_memory_utilization: 0.9
+        max_model_len: 1048576
+        max_num_seqs: 64
+        method: dspark
+        draft_model: amd/MiniMax-M3.1-Flash-Quark-MXFP4/dspark
+        num_speculative_tokens: 7
+        extra_args: "--index-cache-dtype nvfp4 --spec-decode-kv-cache-dtype fp8"
+    service:
+      prefill:
+        cudagraph: "[1]"
+      decode:
+        cudagraph: "[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64]"
+    suites:
+      accuracy:
+        # GSM8K 20-shot chat on the P/D path, real DSpark acceptance.
+        - &m31b_gsm8k
+          name: m31b-nvfp4-1p1d-pp4-tp4-dspark7-gsm8k20-c32
+          topology: 1p1d
+          display_topology: 1P1D-PP4-TP4-DSPARK7-NVFP4
+          pd_worker_layout: single_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [4096]
+          osl: 1024
+          concurrency: [32]
+          prefill: &m31b_pp4_prefill
+            workers: 1
+            tp: 1
+            extra_args: "--pipeline-parallel-size 4 --enforce-eager --max-num-batched-tokens 8192"
+          decode:
+            workers: 1
+            tp: 4
+          env:
+            common: *m31b_common_env
+            prefill: &m31b_prefill_env
+              HIP_VISIBLE_DEVICES: "0,1,2,3"
+              VLLM_PP_LAYER_PARTITION: "16,16,16,12"
+              ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4: "1"
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":true}
+            decode: &m31b_decode_env
+              HIP_VISIBLE_DEVICES: "4,5,6,7"
+              ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4: "0"
+              ATOM_M3_FHMOE: "1"
+              ATOM_M3_INDEXER_CP: "1"
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_enable_alternate_hca":true,"ib_hca_count":8,"pd_admission":{"enabled":true,"max_pending_kv_fraction":0.15,"num_reserved_decode_tokens":512}}
+          benchmark:
+            wait_server_timeout: 7200
+            wait_router_timeout: 600
+          run_eval: true
+          eval_only: true
+          eval_concurrency: [32]
+          accuracy:
+            task: gsm8k
+            fewshot: 20
+            limit: null
+            model_type: local-chat-completions
+            endpoint: chat/completions
+            max_gen_toks: 16384
+            apply_chat_template: true
+            fewshot_as_multiturn: true
+            threshold: 0.94
+
+      mooncake_store:
+        # AgentX, InferenceX golden AL for DSpark7 (4.04, performance only).
+        - &m31b_agentx
+          name: m31b-nvfp4-1p1d-pp4-tp4-dspark7-mcstore-agentx-c120
+          topology: 1p1d
+          display_topology: 1P1D-PP4-TP4-DSPARK7-NVFP4-MCSTORE
+          pd_worker_layout: single_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [1048576]
+          osl: 1024
+          concurrency: [120]
+          prefill: *m31b_pp4_prefill
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: "[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160,176,192,208,224,240]"
+          server:
+            common_args:
+              max_num_seqs: 240
+              spec_decode_acceptance_length: 4.04
+          env:
+            common: *m31b_common_env
+            prefill: &m31b_mcstore_prefill_env
+              <<: *m31b_prefill_env
+              MOONCAKE_STORE: "1"
+              # Both NUMA nodes' DRAM, one single-NIC owner per NUMA1 NIC
+              # (an ionic NIC registers at most 832 GiB).
+              MOONCAKE_STORE_OWNERS: "0:576:rdma4;0:576:rdma5;1:576:rdma6;1:576:rdma7"
+              MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: "${ATOMESH_MODEL_ROOT}/.huggingface/hub/models--amd--MiniMax-M3.1-Flash-Quark-MXFP4"
+              MOONCAKE_STORE_COMPACT_TIMEOUT: "1800"
+              OFFLOAD_PROFILE: "1"
+              OFFLOAD_MIN_LOAD_TOKENS: "0"
+            decode: *m31b_decode_env
+          benchmark:
+            <<: *agentic_1m_aiperf
+            wait_server_timeout: 7200
+          run_eval: false
+
+        - <<: *m31b_agentx
+          name: m31b-nvfp4-1p1d-pp4-tp4-dspark7-mcstore-agentx-c140
+          concurrency: [140]
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: "[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160,176,192,208,224,240,256,280]"
+          server:
+            common_args:
+              max_num_seqs: 280
+              spec_decode_acceptance_length: 4.04
+
+    accuracy:
+      task: gsm8k
+      fewshot: 20
+      limit: null
+      model_type: local-chat-completions
+      endpoint: chat/completions
+      max_gen_toks: 16384
+      apply_chat_template: true
+      fewshot_as_multiturn: true
+      threshold: 0.94
