@@ -1256,7 +1256,7 @@ class TestExplicitPlan:
         assert [kw.get("workgroup_budget") for kw in built] == [256, None], built
 
     def test_a_caller_budget_is_the_plans(self, monkeypatch):
-        """The sparse PA writing FP8 asks for a larger budget than aiter's."""
+        """A caller's budget replaces aiter's (the sparse PA writing FP8 passes one)."""
         ba, built = self._setup(monkeypatch)
         self._call(ba, cap=8, budget=128, head_dim=256)
         assert built[-1] == {

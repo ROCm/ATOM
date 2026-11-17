@@ -79,7 +79,7 @@ def test_the_sparse_attention_runs_only_the_rows_the_metadata_covers(
     """One row rule for decode and prefill. With the MXFP4 index the scorer, selector
     and attention get the rows the metadata covers; the pad rows past them are never
     read and the output is zero there. Another index cache keeps every row. An FP8
-    output (`unified_attention_fp8`) goes to the PA whole, which writes its pad
+    output passed to `_sparse_prefill` / `_sparse_decode` goes to the PA whole, which writes its pad
     rows, and is what the impl returns."""
     pytest.importorskip("aiter")
     from atom.model_ops import attention_mha
