@@ -141,7 +141,7 @@ stat('aiter::moe_forward', cats=('cpu_op', 'user_annotation'))
 "
 ```
 
-Host-side MoE time per `FusedMoE` layer call is `aiter::moe_forward`, counted over **both** categories. Ops registered with `direct_register_custom_op` that call it through the returned caller (`moe_forward`, `rocm_aiter_fused_moe`) skip the `torch.ops` dispatch in eager mode. So eager prefill records them as a `user_annotation` of the same name (only while the profiler runs), and dispatched calls (torch.compile, FakeTensorMode/make_fx) record a `cpu_op`. Filtering on `cpu_op` alone silently drops eager prefill. Leave out `gpu_user_annotation`: it is the GPU-side copy of the same annotation and would double-count. CUDAGraph replays record neither, as before.
+Host-side MoE time per `FusedMoE` layer call is `aiter::moe_forward`, counted over **both** categories. `FusedMoE.forward` records `aiter::moe_forward`, and `rocm_aiter_fused_moe` (called by the FP8 MoE methods) runs nested inside it as its own `aiter::rocm_aiter_fused_moe` event. Both are called through the caller `direct_register_custom_op` returns, which skips the `torch.ops` dispatch in eager mode: an eager call records a `user_annotation` of the op's name (only while the profiler runs), a dispatched call (torch.compile, FakeTensorMode/make_fx) a `cpu_op`. Filtering on `cpu_op` alone silently drops eager prefill. Leave out `gpu_user_annotation`: it is the GPU-side copy of the same annotation and would double-count.
 
 For a UI view, drop the `.gz` (decompressed `.json`) into <https://ui.perfetto.dev> or `chrome://tracing`.
 

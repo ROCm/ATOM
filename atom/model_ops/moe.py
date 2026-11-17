@@ -1256,7 +1256,7 @@ def rocm_aiter_fused_moe_fake(
     return torch.empty_like(hidden_states)
 
 
-rocm_aiter_fused_moe = direct_register_custom_op(
+rocm_aiter_fused_moe_op = direct_register_custom_op(
     op_name="rocm_aiter_fused_moe",
     op_func=rocm_aiter_fused_moe_impl,
     mutates_args=[],
@@ -3108,7 +3108,7 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
                 x_scale=x_scale,
             )
         else:
-            return rocm_aiter_fused_moe(
+            return rocm_aiter_fused_moe_op(
                 x,
                 layer.w13_weight,
                 layer.w2_weight,
@@ -3516,7 +3516,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             "swiglu_limit": getattr(layer, "swiglu_limit", 0.0),
         }
         if self.quant_type == QuantType.per_Tensor or self.fused_experts is None:
-            return rocm_aiter_fused_moe(
+            return rocm_aiter_fused_moe_op(
                 x,
                 layer.w13_weight,
                 layer.w2_weight,
