@@ -318,6 +318,8 @@ def scenario(sha, name, model, *, mono="0", payload="0"):
                 bench, folder / "benchmark.log", env=env, timeout=1800
             )
             evaluate = [
+                PY,
+                "-m",
                 "lm_eval",
                 "--model",
                 "local-completions",
