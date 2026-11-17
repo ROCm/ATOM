@@ -25,6 +25,7 @@ from functools import cache
 import torch
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.mega_mhc import mega_mhc, mega_mhc_shuffle_fn
 from aiter.ops.mhc import mhc_fused_post_pre_delayed_asm_supported
 from aiter.ops.triton.fusions.mhc_fused_post_pre_delayed_rmsnorm import (
     mhc_fused_post_pre_delayed_rmsnorm,
@@ -37,26 +38,16 @@ _HIP_ARCHS = ("gfx950", "gfx1250")
 
 
 @cache
-def _hip_ops():
-    try:
-        from aiter.ops.mega_mhc import mega_mhc, mega_mhc_shuffle_fn
-    except ImportError:
-        return None
-    return mega_mhc, mega_mhc_shuffle_fn
-
-
-@cache
 def _row_major_scale_options():
     """The mega_mhc options that give fused MXFP8 row-major (T, H/32) scales,
     or None when this arch/AITER cannot: gfx950 always writes them, gfx1250
     only through `scale_row_major` (m32k4 otherwise)."""
-    arch, ops = get_gfx_runtime(), _hip_ops()
+    arch = get_gfx_runtime()
     if arch == "gfx950":
         return {}
     if (
         arch == "gfx1250"
-        and ops is not None
-        and "scale_row_major" in inspect.signature(ops[0]).parameters
+        and "scale_row_major" in inspect.signature(mega_mhc).parameters
     ):
         return {"scale_row_major": True}
     return None
@@ -99,12 +90,7 @@ def pack_mhc_fn(fn):
                 "hc_mult=4 and H in {4096, 5120, 6144, 7168}"
             )
         return None
-    ops = _hip_ops()
-    if ops is None:
-        if backend == "hip":
-            raise RuntimeError("HIP Mega-MHC requires AITER mega_mhc_shuffle_fn")
-        return None
-    return ops[1](fn)
+    return mega_mhc_shuffle_fn(fn)
 
 
 def pre_delayed(
@@ -228,16 +214,16 @@ def v41_mhc_pre_delayed(
             "Fused mHC quantization requires row-major scales: gfx950, or "
             "gfx1250 with AITER mega_mhc(scale_row_major=)"
         )
-    if w_preshuffle_bf16:
-        kernel = _hip_ops()[0]
-        options["w_preshuffle_bf16"] = True
+    # mega_mhc for a packed BF16 fn (HIP, gfx950/gfx1250), or for a raw FP32 fn
+    # on gfx942 where it runs AITER's ASM seam and RMSNorm. fuse_quant implies
+    # w_preshuffle_bf16, so the ASM branch always resolves to BF16.
+    if w_preshuffle_bf16 or (with_post and use_asm_seam(hc_mult, hidden)):
+        kernel = mega_mhc
         options["out_dtype"] = "mxfp8" if fuse_quant else "bf16"
-        if fuse_quant:
-            options.update(_row_major_scale_options())
-    elif with_post and use_asm_seam(hc_mult, hidden):
-        # FP32 fn: mega_mhc runs AITER's ASM seam, then RMSNorm.
-        kernel = _hip_ops()[0]
-        options["out_dtype"] = "bf16"
+        if w_preshuffle_bf16:
+            options["w_preshuffle_bf16"] = True
+            if fuse_quant:
+                options.update(_row_major_scale_options())
     new_residual, post, comb, normed, pre = kernel(
         residual.view(rows, hc_mult, hidden),
         hc_fn,
