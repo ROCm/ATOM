@@ -1094,6 +1094,31 @@ def test_a_join_that_leaves_a_group_as_it_was_keeps_its_committed_version(
     assert "must rise" in reply["error"] and worker.model.w.item() == 5.0
 
 
+@pytest.mark.parametrize(
+    ("method", "args"),
+    [
+        ("init_rdma_weight_group", ["127.0.0.1", 29500, 1, 2, "h"]),
+        ("destroy_rdma_weight_group", ["g"]),
+    ],
+    ids=["init", "destroy"],
+)
+def test_a_weight_group_named_by_position_is_refused_before_any_runner_runs(
+    monkeypatch, method, args
+):
+    """Named by position, the group was found through a copy of the runners'
+    signatures in the engine, which a new leading parameter would have made
+    forget another group's committed version."""
+    from tests.test_weight_sync_coverage import _engine_with
+
+    worker = _joined_worker(monkeypatch, _Trainer([]))
+    _, send = _engine_with(worker)
+
+    reply = send("collective_rpc", method=method, request_id="r", args=args)
+
+    assert "takes group_name as a keyword" in reply["error"]
+    assert set(worker._rdma_groups) == {"g"}
+
+
 @pytest.mark.parametrize("left_by", ["collective_rpc", "the stream"])
 def test_a_group_joined_anew_forgets_what_the_old_one_committed(monkeypatch, left_by):
     """The runners count a new group's versions from nothing, however the old

@@ -150,16 +150,8 @@ def _weights_discarded(reply) -> bool:
     return not (isinstance(result, dict) and result.get("weights_discarded") is False)
 
 
-# Where the runners' weight-group methods take the group's name, after self.
-_GROUP_NAME_POSITION = {"init_rdma_weight_group": 4, "destroy_rdma_weight_group": 0}
-
-
-def _named_group(method: str, payload) -> str | None:
-    """The weight group a collective_rpc of *method* names."""
-    if "group_name" in payload.kwargs:
-        return payload.kwargs["group_name"]
-    position = _GROUP_NAME_POSITION[method]
-    return payload.args[position] if len(payload.args) > position else None
+# The runners' weight-group methods, which the engine keeps a record for.
+_WEIGHT_GROUP_METHODS = ("init_rdma_weight_group", "destroy_rdma_weight_group")
 
 
 class _ReplyQueue:
@@ -615,6 +607,9 @@ class EngineUtilityHandler:
                 kwargs=dict(args.get("kwargs") or {}),
                 barrier=bool(args.get("barrier", False)),
             )
+            if method in _WEIGHT_GROUP_METHODS and "group_name" not in payload.kwargs:
+                # The engine reads the name to keep its record of the group.
+                raise TypeError(f"{method} takes group_name as a keyword")
             replies = self.runner_mgr.collective_rpc(
                 method, payload, timeout=_remaining_timeout(args, 300.0)
             )
@@ -643,7 +638,7 @@ class EngineUtilityHandler:
             method == "init_rdma_weight_group"
             and any(r.ok and r.value is True for r in replies)
         ):
-            self._committed_stream_versions.pop(_named_group(method, payload), None)
+            self._committed_stream_versions.pop(payload.kwargs["group_name"], None)
         logger.info(
             f"{self.label}: collective_rpc {method} ranks={len(replies)} "
             f"failed={len(failures)}"

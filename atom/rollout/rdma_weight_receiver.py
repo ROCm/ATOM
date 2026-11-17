@@ -551,8 +551,9 @@ class RDMAWeightReceiverMixin:
         the engine before any joins: one that cannot -- refused, its rank out
         of range, its earlier join a different one -- or that has joined where
         the others have not would leave them in the rendezvous waiting for it.
-        Idempotent for the same join, as the orchestrator may retry: whether
-        this call joined the group, False when it was joined already.
+        Idempotent for the same join, as the orchestrator may retry. Returns
+        True if this call joined the group, False if it was already joined (a
+        retry).
         """
         rank = int(base_rank) + int(self.rank)
         join = {

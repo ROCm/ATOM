@@ -436,7 +436,9 @@ def test_a_failed_sync_recovers_through_sleep_wake_up_and_a_new_sync():
     _process_one(h, out, engine, "update_weights_shm", _bucket("u1", False))
     assert engine._weight_sync_fenced and engine._rl_weights_inconsistent
 
-    mgr._replies = _counts(True, True)
+    mgr._replies = [
+        RpcResult("u", rank, value={"weights_discarded": True}) for rank in (0, 1)
+    ]
     _process_one(h, out, engine, "release_memory", {"tags": ["weights"]})
     assert engine._is_rl_weights_offloaded
     (resume,) = _process_one(h, out, engine, "resume_memory", {"tags": ["weights"]})
@@ -827,7 +829,7 @@ def test_every_answered_utility_command_stamps_the_callers_request_id():
 def test_a_partial_weight_release_stops_serving_until_all_rank_resume():
     h, mgr, out = _handler(
         replies=[
-            RpcResult("m", 0, value=True),
+            RpcResult("m", 0, value={"weights_discarded": True}),
             RpcResult("m", 1, error="RuntimeError: cannot release weights"),
         ]
     )
