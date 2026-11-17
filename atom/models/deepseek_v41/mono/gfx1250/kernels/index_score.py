@@ -343,4 +343,10 @@ def stage_score_grouped(c):
                 m = (bk == nblk - 1).select(F32(float("inf")), m)
                 if (cx > I32(TOPK)) & (l < 16) & (l % 8 == 0) & (bk < nblk):
                     c["stx"](c["ibmax"] + i64(r * (c["ilw"] // 8) + bk) * 4, m)
+        if fx.const_expr("segcnt" in c):   # (segsel) the candidate layer: this task's 8192-column segment, one more
+            if iprod:
+                hx.wait_storecnt0()
+                gpu.barrier()
+                if t == 0:
+                    hx.atomic_add(c["segcnt"] + i64(task * CHUNK // IP.SEG) * 4, 1)
     gpu.barrier()

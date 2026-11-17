@@ -547,16 +547,26 @@ def target_layer(E, Ly):
             isrx = (lfl3 & fx.Int64(64)) != fx.Int64(0)
             cs_ = cwith(cs_, ibmax=ltab(fp, Ly, "ibmax")(), icand=ltab(fp, Ly, "icand")(), lvl=fptr(fp, "ilvl"),
                         iprod=(lfl3 & fx.Int64(32)) != fx.Int64(0), ts=None)
+            # (segsel) the candidate layer on the grouped scorer: every score task counts its 8192-column segment (the
+            # layer's select_mc histogram slot, zeroed a step: layer 20 runs no select_mc), the tree's level-0 tasks wait
+            # for their own segments' counts -- no SCORE handoff: a segment's selection starts as its scores land
+            grp = fx.Int32(0) != fx.Int32(0)
+            nchk = fx.Int32(0)
+            cs_ = cwith(cs_, segcnt=fptr(fp, "mchist") + i64(Ly) * TK.MC_LAYER)
             if fx.const_expr(TR <= 6):   # (c1: one request) long FULL contexts score each key tile once for every row
                 lg = hx.opaque_v(fx.thread_idx.x) % 32   # (short contexts keep the per-row tasks: more CTAs in parallel)
                 bmx = TK.wave_max((lg < TR).select(hx.gload(cs_["ibound"] + i64(fx.min(lg, fx.Int32(TR - 1))) * 4, fx.Int32), fx.Int32(0)))
+                grp = (isrx == (fx.Int32(0) != fx.Int32(0))) & (bmx > fx.Int32(SC.GROUPED_MIN_BOUND))
+                nchk = SC.IP.score_tasks(fx.max(bmx, fx.Int32(0)), fx.Int32(SC.CHUNK))
                 if isrx | (bmx <= fx.Int32(SC.GROUPED_MIN_BOUND)):
                     SC.stage_score_any(cs_, isrx)
                 else:
                     SC.stage_score_grouped(cs_)
             else:
                 SC.stage_score_any(cs_, isrx)
-            handoff(lc + i64(LY.SCORE), t, True)
+            segw = cs_["iprod"] & grp
+            if segw == (fx.Int32(0) != fx.Int32(0)):
+                handoff(lc + i64(LY.SCORE), t, True)
             # (the selection tree's levels past the first only when a row has more than one level-0 list: every row's
             # input count n <= SEG -> level 0 already writes the final picks; its empty level-1 pass + handoff skipped)
             lnr = hx.opaque_v(fx.thread_idx.x) % 32
@@ -579,7 +589,8 @@ def target_layer(E, Ly):
                         isb = q == fx.Int32(1)
                         nl = isb.select(blk_levels, sel_levels)
                         if pi < nl:
-                            TK.stage_select_any(cwith(cs_, ts=None, lvl=cs_["lvl"] + isb.select(boff, i64(0)), rev=isb), pi, nl,
+                            TK.stage_select_any(cwith(cs_, ts=None, lvl=cs_["lvl"] + isb.select(boff, i64(0)), rev=isb, segw=segw,
+                                                      segn=nchk), pi, nl,
                                                 isb.select(fx.Int32(TK.MODE_BLK), fx.Int32(TK.MODE_SEL)))
                         gpu.barrier()   # (both share the CTA's LDS task counts)
                     handoff(lc + i64(LY.SELECT0) + i64(pi) * 4, t, True)

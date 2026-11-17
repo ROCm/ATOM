@@ -313,6 +313,16 @@ def blk_lvl_off(c):
 
 
 @ASTRewriter.transform
+def seg_wait(cnt, nchunk, s0, ns, t):
+    """(segsel) Segments s0 .. s0 + ns - 1 of 8192 columns: each one's score tasks (64, the last ones fewer) counted."""
+    if t == 0:
+        for s in range(ns):
+            sg = s0 + s
+            hx.wait_count(cnt + i64(sg) * 4, fx.min(fx.max(nchunk - sg * (SEG // 128), I32(0)), I32(SEG // 128)), 4)
+    gpu.barrier()
+
+
+@ASTRewriter.transform
 def stage_select_any(c, lev, nlev, mode):
     """Level lev (traced, < nlev) of a selection tree, mode (MODE_*, traced): MODE_SEL the top-512 of a FULL layer's
     scores (ilog, n = bound) -> isel / irow; MODE_RX the same over a REINDEX layer's compacted columns (n = rx_context),
@@ -378,6 +388,9 @@ def stage_select_any(c, lev, nlev, mode):
         def emit(pos, bits, ii):
             _emit_any(c, mode, lev, final, tok, j, q, k, lstride, cur, pbase, pos, bits, ii)
 
+        if fx.const_expr("segw" in c):   # (segsel) level 0: its segment's score tasks counted (no SCORE handoff)
+            if c["segw"] & l0:
+                seg_wait(c["segcnt"], c["segn"], isblk.select(j * 8, j), isblk.select(I32(8), I32(1)), t)
         lds_topk(n, k, load, emit, c["sm"], t)
 
 
