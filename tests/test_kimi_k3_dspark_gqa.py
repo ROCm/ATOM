@@ -651,6 +651,45 @@ def test_gqa_draft_owns_a_capture_spec_that_feeds_the_aggregate(monkeypatch):
     assert out is call["result"]
 
 
+@pytest.mark.parametrize("compiled", [False, True])
+def test_gqa_aggregate_leaves_folded_zeros_readable_by_the_next_layer(compiled):
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("the attention-residual kernel needs a GPU")
+    from atom.model_ops.kimi_k3.attention_residual import (
+        apply_attn_res,
+        folded_zero_like,
+    )
+
+    hidden, rows = 16, 13
+    target = _k3_target_stub(hidden=hidden)
+    layer, next_layer = target.layers[6:8]
+    res = next_layer.self_attention_attn_res
+    res.score_weight = res.score_weight.cuda()
+    prefix = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16)
+    bank = torch.randn(rows, 2, hidden, device="cuda", dtype=torch.bfloat16)
+
+    def read_twice(prefix, add, add2, bank):
+        aux = layer.aggregate_hidden_state((prefix, add, add2, bank), next_layer)
+        mixed, next_prefix = apply_attn_res(
+            prefix, bank, res.score_weight, res.eps, add, add_hidden2=add2
+        )
+        return aux, mixed, next_prefix
+
+    expected = read_twice(
+        prefix, torch.zeros_like(prefix), torch.zeros_like(prefix), bank
+    )
+    if compiled:
+        read_twice = torch.compile(read_twice, fullgraph=True)
+    for _ in range(2):
+        add, add2 = [folded_zero_like(prefix).fill_(float("nan")) for _ in range(2)]
+        actual = read_twice(prefix, add, add2, bank)
+        assert torch.isfinite(add).all() and torch.isfinite(add2).all()
+        for got, want in zip(actual, expected):
+            torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
 def test_gqa_draft_aggregate_refuses_a_short_bank(monkeypatch):
     """Fewer closed blocks than the tap implies is a target layout change, not
     a reason to drop silently back to the prefix feature."""

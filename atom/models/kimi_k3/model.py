@@ -2013,7 +2013,11 @@ class KimiDecoderLayer(nn.Module):
                 f"{None if block_residual is None else tuple(block_residual.shape)}"
             )
         from atom.model_ops.kimi_k3 import apply_attn_res
+        from atom.model_ops.kimi_k3.attention_residual import materialize_folded_zeros
 
+        # This aux reader consumes the markers before the next target layer
+        # reads the same addends, so leave real zeros behind for that reader.
+        materialize_folded_zeros(pending_add, pending_add2)
         mixed, _ = apply_attn_res(
             prefix_sum,
             block_residual[:, :num_blocks],
