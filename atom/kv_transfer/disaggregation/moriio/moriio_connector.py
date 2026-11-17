@@ -2686,14 +2686,19 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
     def get_num_new_matched_tokens(self, seq: Sequence) -> tuple[int, bool]:
         """Check if this sequence needs remote KV prefill.
 
+        The scheduler asks on every pass that considers the sequence and can
+        hold it back after a yes (a full running set), so the answer stays the
+        same until the receive is queued: `update_state_after_alloc` clears
+        ``do_remote_prefill`` then. Answering yes only once sent every request
+        that waited for a slot to a local prefill of its suffix instead.
+
         Returns:
             ``(num_tokens, needs_async_load)`` where ``needs_async_load``
             is True if the scheduler should defer until KV transfer completes.
         """
         params = seq.kv_transfer_params or {}
 
-        if params.get("do_remote_prefill") and not hasattr(seq, "kv_async_tagged"):
-            seq.kv_async_tagged = True
+        if params.get("do_remote_prefill"):
             return len(seq.prompt_token_ids), True
 
         return 0, False
