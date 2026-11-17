@@ -185,6 +185,9 @@ class K2TailKernel:
     eps: float
     abi: KernelAbi = TAIL_ABI
     launch_count: int = 1
+    # its LDS union and kernel body, for a launch that runs it as a part
+    lds: object = None
+    body: object = None
 
 
 def _rcp(value):
@@ -349,6 +352,11 @@ def _shared_finish(c, line):
     _store_seven_dev(c["local"], line * LINE7_ELEMENTS, _reduced(got, 0, tp))
 
 
+def _load_cm(c):
+    """Inputs stored in this launch (a fused one's) load at device scope."""
+    return CM_DEV if c["fused"] else 0
+
+
 @traced
 def _ar_push(c):
     """This CTA's all-reduce lines (routed ones gathered from ``grouped``)
@@ -378,7 +386,17 @@ def _ar_push(c):
     if routed:
         column = (bid % 2) * HALF + tid * LINE7_ELEMENTS
         source = rsrc(c["grouped"])
-        if const_expr(c["identity"]):
+        if const_expr(c["identity"] and c["fused"]):
+            # Stored in this launch: at device scope, not through the
+            # scalar cache.
+            rows_of = [token * TOPK + k for k in range(TOPK)]
+            weights = []
+            for quad in range_constexpr(TOPK // 4):
+                loaded = fx.Vector(ld_dev(c["route_weights"], token * TOPK + 4 * quad, 4))
+                weights.extend(
+                    fx.Int32(loaded[k]).bitcast(fx.Float32) for k in range(4)
+                )
+        elif const_expr(c["identity"]):
             rows_of = [token * TOPK + k for k in range(TOPK)]
             loaded = fx.Vector(
                 bo.buffer_load(
@@ -395,7 +413,7 @@ def _ar_push(c):
                 fx.ptr_load(routes + 2 * k).bitcast(fx.Int32) for k in range(TOPK)
             ]
             weights = [fx.ptr_load(routes + 2 * k + 1) for k in range(TOPK)]
-        picks = [_seven(source, row * LATENT + column) for row in rows_of]
+        picks = [_seven(source, row * LATENT + column, _load_cm(c)) for row in rows_of]
         g0, g1, g2, g3, g4, g5, g6 = _seven(rsrc(c["norm_weight"]), column)
         sums = []
         for j in range_constexpr(LINE7_ELEMENTS):
@@ -406,7 +424,7 @@ def _ar_push(c):
         v0, v1, v2, v3, v4, v5, v6 = sums
     else:
         v0, v1, v2, v3, v4, v5, v6 = _seven(
-            c["local"], fx.min(line, c["lines"] - 1) * LINE7_ELEMENTS
+            c["local"], fx.min(line, c["lines"] - 1) * LINE7_ELEMENTS, _load_cm(c)
         )
     # every thread has its words before any pushes: a CU with remote stores
     # in flight holds back the gathers' loads behind them
@@ -500,26 +518,30 @@ def build_k2_tail(
         words: fx.Array[fx.Int32, layout.words, 16]
         floats: fx.Array[fx.Float32, layout.words, 16]
 
-    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
-    def kernel(
-        data: Int64,
-        grouped: Int64,
-        route_rows: Int64,
-        route_weights: Int64,
-        norm_weight: Int64,
-        up_weight: Int64,
-        output: Int64,
-        flags: Int64,
-        peers: Int64,
-        epochs: Int64,
-        rank: Int32,
+    @traced
+    def body(
+        storage,
+        data,
+        grouped,
+        route_rows,
+        route_weights,
+        norm_weight,
+        up_weight,
+        output,
+        flags,
+        peers,
+        epochs,
+        rank,
+        fused=None,
     ):
-        _ = sources
+        """The kernel on ``storage`` (an ``Lds``). ``fused``: the launch's
+        last part (``k2_fused_gfx1250``): ``wait_inputs()`` before the
+        all-reduce reads ``data``, ``grouped`` and ``route_weights``, then
+        at device scope."""
         tid = fx.Int32(fx.thread_idx.x)
         bid = fx.Int32(fx.block_idx.x)
         lane = tid % GFX1250.wave_size
         wave = tid // GFX1250.wave_size
-        storage = fx.SharedAllocator().allocate(Lds)
         words = storage.words.peek().ptr
         floats = storage.floats.peek().ptr
         if const_expr(profile):
@@ -571,10 +593,13 @@ def build_k2_tail(
             "row": floats,
             "squares": floats + LATENT,
             "routes": floats + LATENT + WAVES,
+            "fused": fused is not None,
         }
         bases = []
 
         def prologue():
+            if const_expr(fused is not None):
+                fused["wait_inputs"]()
             _ar_finish(c, _ar_push(c))
             _store_epochs(epochs, bid, tid, grid, epoch)
             if const_expr(profile):
@@ -637,6 +662,36 @@ def build_k2_tail(
         if const_expr(profile):
             _stamp(flags, bid, tid, 4)
 
+    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
+    def kernel(
+        data: Int64,
+        grouped: Int64,
+        route_rows: Int64,
+        route_weights: Int64,
+        norm_weight: Int64,
+        up_weight: Int64,
+        output: Int64,
+        flags: Int64,
+        peers: Int64,
+        epochs: Int64,
+        rank: Int32,
+    ):
+        _ = sources
+        body(
+            fx.SharedAllocator().allocate(Lds),
+            data,
+            grouped,
+            route_rows,
+            route_weights,
+            norm_weight,
+            up_weight,
+            output,
+            flags,
+            peers,
+            epochs,
+            rank,
+        )
+
     @flyc.jit
     def launch(
         data: Int64,
@@ -674,4 +729,4 @@ def build_k2_tail(
         )
 
     TAIL_ABI.check(kernel, launch)
-    return K2TailKernel(name, launch, (grid,), (THREADS,), ar_ctas, eps)
+    return K2TailKernel(name, launch, (grid,), (THREADS,), ar_ctas, eps, lds=Lds, body=body)

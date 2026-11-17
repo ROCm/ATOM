@@ -101,8 +101,13 @@ class ExpertUpKernel:
     grid: tuple[int]
 
 
+def _out_cm(fused):
+    """A fused launch's outputs' cache policy: device scope, read in it."""
+    return 0 if fused is None else CM_DEV
+
+
 @traced
-def _union(ids, rows, tid, lane, wave, lds, threads=THREADS):
+def _union(ids, rows, tid, lane, wave, lds, threads=THREADS, cache_modifier=0):
     """The step's ascending expert union and its picks, in LDS: ``slot[e]``
     an expert's union index, ``expert[u]``, ``start[u]``/``count[u]`` its run
     in ``picks`` (token * TOPK + k). Returns the union size."""
@@ -116,6 +121,7 @@ def _union(ids, rows, tid, lane, wave, lds, threads=THREADS):
                 fx.min(tid + index * threads, routes - 1),
                 vec_width=1,
                 dtype=T.i32,
+                cache_modifier=cache_modifier,
             )
         )
         for index in range((routes + threads - 1) // threads)
@@ -765,6 +771,9 @@ class MoeKernel:
     name: str
     launcher: object
     grid: tuple[int]
+    # its LDS struct and kernel body, for a launch that runs it as a part
+    lds: object = None
+    body: object = None
 
 
 def _realtime():
@@ -933,26 +942,19 @@ def build_moe(
     )
     sources = SOURCES
 
-    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
-    def kernel(
-        ids: Int64,
-        latent: Int64,
-        scales: Int64,
-        w13: Int64,
-        w13s: Int64,
-        w2: Int64,
-        w2s: Int64,
-        inter: Int64,
-        grouped: Int64,
-        flags: Int64,
-        state: Int64,
+    @traced
+    def body(
+        smem, ids, latent, scales, w13, w13s, w2, w2s, inter, grouped, flags, state,
+        fused=None,
     ):
-        _ = sources
+        """The kernel on ``smem`` (an ``Lds``). ``fused``: the launch's part
+        after the lite finish (``k2_fused_gfx1250``): ``epoch`` its tag's,
+        ``wait_routes()`` until ``ids`` are in, ``down_done(tag)`` once the
+        CTA's ``grouped`` rows are stored at device scope and drained."""
         tid = fx.Int32(fx.thread_idx.x)
         bid = fx.Int32(fx.block_idx.x)
         lane = tid % GFX1250.wave_size
         wave = tid // GFX1250.wave_size
-        smem = fx.SharedAllocator().allocate(Lds).peek()
         lds = {
             name: getattr(smem, name).ptr
             for name in (
@@ -980,7 +982,38 @@ def build_moe(
         def publish(word):
             st_dev(tag, flags, word)
 
-        union = uniform(_union(ids, rows, tid, lane, wave, lds))
+        def issue_latent():
+            if wave == WEIGHT_ISSUER:
+                gemv_tdm.load_rows(
+                    latent,
+                    LATENT // 4,
+                    lds["latq"],
+                    rows,
+                    rows,
+                    padded=False,
+                    whole=True,
+                    width=LATENT // 4,
+                    pad_every=LATENT_PAD_EVERY,
+                )
+            if wave == SCALE_ISSUER:
+                gemv_tdm.load_rows(
+                    scales,
+                    LATENT_SCALES // 2,
+                    lds["latsc"],
+                    rows,
+                    rows,
+                    padded=False,
+                    whole=True,
+                    width=LATENT_SCALES // 2,
+                )
+
+        if const_expr(fused is not None):
+            # The latent is the front's: in flight while the routes come in.
+            issue_latent()
+            fused["wait_routes"]()
+        union = uniform(
+            _union(ids, rows, tid, lane, wave, lds, cache_modifier=_out_cm(fused))
+        )
         tasks = union * blocks
         ups = tasks // 256
         mine = (tasks - bid + 255) // 256
@@ -1096,30 +1129,13 @@ def build_moe(
         # weights: a TDM counter drains in order, so the first item's wait
         # covers them. A CTA with no gate/up task (whose down tiles reuse
         # this LDS) loads none.
-        if mine > 0:
-            if wave == WEIGHT_ISSUER:
-                gemv_tdm.load_rows(
-                    latent,
-                    LATENT // 4,
-                    lds["latq"],
-                    rows,
-                    rows,
-                    padded=False,
-                    whole=True,
-                    width=LATENT // 4,
-                    pad_every=LATENT_PAD_EVERY,
-                )
-            if wave == SCALE_ISSUER:
-                gemv_tdm.load_rows(
-                    scales,
-                    LATENT_SCALES // 2,
-                    lds["latsc"],
-                    rows,
-                    rows,
-                    padded=False,
-                    whole=True,
-                    width=LATENT_SCALES // 2,
-                )
+        if const_expr(fused is None):
+            if mine > 0:
+                issue_latent()
+        if const_expr(fused is not None):
+            if mine == 0:
+                # Its down rows land where the latent does.
+                rocdl.s_wait_tensorcnt(0)
         if const_expr(rolled):
             for first_item in range(fx.Int32(0), fx.Int32(ring - 1), unroll=1):
                 if first_item < flat:
@@ -1130,7 +1146,10 @@ def build_moe(
                     issue(fx.Int32(ahead), ahead)
         # Read only now: a wave waits on this load where it reads it, and the
         # flags' tag is not needed before the first task's flag.
-        epoch = uniform(fx.Int32(ld_dev(state, 2)))
+        if const_expr(fused is None):
+            epoch = uniform(fx.Int32(ld_dev(state, 2)))
+        else:
+            epoch = fused["epoch"]
         tag = epoch + 1
         # A task's flag goes out a K tile into the next, its stores drained.
         pending = fx.Int32(-1)
@@ -1451,6 +1470,7 @@ def build_moe(
                                 down_packed,
                                 rsrc(grouped),
                                 (down_pick * LATENT + out + half * 16) // 2,
+                                cache_modifier=_out_cm(fused),
                             )
             for m in range_constexpr(0 if rolled else tiles):
                 if m == 0 or m * 16 < count:
@@ -1488,6 +1508,7 @@ def build_moe(
                                 packed,
                                 rsrc(grouped),
                                 (pick * LATENT + out + half * 16) // 2,
+                                cache_modifier=_out_cm(fused),
                             )
             i = i + 1
         stamp(3)
@@ -1500,10 +1521,34 @@ def build_moe(
                 st_dev(up_epilogue, state, MOE_STATE_WORDS + 256 * 7 + bid * 3 + 1)
                 st_dev(down_wait, state, MOE_STATE_WORDS + 256 * 7 + bid * 3 + 2)
                 st_dev(up_cycles, state, MOE_STATE_WORDS + 256 * 10 + bid)
+        if const_expr(fused is not None):
+            rocdl.s_wait_storecnt(0)
+            _lds_barrier()
+            fused["down_done"](tag)
         if tid == 0:  # noqa: SIM102
             if task_queue.take(task_queue.word(state + 4)) == 255:
                 st_dev(fx.Int32(0), state, 1)
                 st_dev(epoch + 1, state, 2)
+
+    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
+    def kernel(
+        ids: Int64,
+        latent: Int64,
+        scales: Int64,
+        w13: Int64,
+        w13s: Int64,
+        w2: Int64,
+        w2s: Int64,
+        inter: Int64,
+        grouped: Int64,
+        flags: Int64,
+        state: Int64,
+    ):
+        _ = sources
+        body(
+            fx.SharedAllocator().allocate(Lds).peek(),
+            ids, latent, scales, w13, w13s, w2, w2s, inter, grouped, flags, state,
+        )
 
     @flyc.jit
     def launch(
@@ -1525,4 +1570,4 @@ def build_moe(
             ids, latent, scales, w13, w13s, w2, w2s, inter, grouped, flags, state
         ).launch(grid=(256,), block=(THREADS,), stream=stream)
 
-    return MoeKernel(name, launch, (256,))
+    return MoeKernel(name, launch, (256,), Lds, body)

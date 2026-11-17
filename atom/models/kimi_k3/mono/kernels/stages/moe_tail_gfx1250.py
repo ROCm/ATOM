@@ -36,13 +36,13 @@ def _pair(pointer, pair_index):
     )
 
 
-def _store_pair(pointer, pair_index, low, high):
+def _store_pair(pointer, pair_index, low, high, cache_modifier=0):
     word = (
         fx.Vector.from_elements([low, high], fx.Float32)
         .to(fx.BFloat16)
         .bitcast(fx.Int32)[0]
     )
-    bo.buffer_store(word, rsrc(pointer), pair_index)
+    bo.buffer_store(word, rsrc(pointer), pair_index, cache_modifier=cache_modifier)
 
 
 @traced
@@ -134,6 +134,8 @@ def sdown_tasks(c, tasks, operands, waves, rows, rolled=False):
     as runtime loops."""
 
     tokens, tid, threads = c["S"], c["tid"], c["threads"]
+    # read here: a method called in a branch makes ``c`` its traced state
+    store_cm = c.get("store_cm", 0)
     tiles = (tokens + GEMV_ROWS - 1) // GEMV_ROWS
     accumulators = c["tail"]["gemv_accumulator"]
     rolled_tiles = rolled and tiles > 1
@@ -206,6 +208,7 @@ def sdown_tasks(c, tasks, operands, waves, rows, rolled=False):
                     (job_token * HIDDEN + job_task * GEMV_ROWS + 2 * job_pair) // 2,
                     job_sums[0],
                     job_sums[1],
+                    store_cm,
                 )
     for index in range_constexpr(0 if rolled else len(tasks)):
         if tasks[index] < HIDDEN // GEMV_ROWS:
@@ -229,6 +232,7 @@ def sdown_tasks(c, tasks, operands, waves, rows, rolled=False):
                         (token * HIDDEN + tasks[index] * GEMV_ROWS + 2 * pair) // 2,
                         sums[0],
                         sums[1],
+                        store_cm,
                     )
     gpu.barrier()
 

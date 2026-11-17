@@ -464,12 +464,18 @@ def allreduce7_lines(rows: int) -> int:
     return rows * REDUCE_WIDTH // LINE7_ELEMENTS
 
 
-def _seven(pointer, element):
+def _seven(pointer, element, cache_modifier=0):
     """BF16 ``element .. element + 7`` of ``pointer`` as fp32: one 16 B load
     from the BF16 pair at or before ``element``, shifted down one where the
     line starts on an odd element. It never reads past the line's last pair."""
     loaded = fx.Vector(
-        bo.buffer_load(pointer, element // 2, vec_width=LINE_WORDS, dtype=T.i32)
+        bo.buffer_load(
+            pointer,
+            element // 2,
+            vec_width=LINE_WORDS,
+            dtype=T.i32,
+            cache_modifier=cache_modifier,
+        )
     )
     values = []
     for w in range(LINE_WORDS):

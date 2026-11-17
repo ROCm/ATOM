@@ -39,7 +39,7 @@ from atom.models.kimi_k3.mono.kernels.stages import (
 from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import LDS_PAD
 from atom.models.kimi_k3.mono.kernels.token_tiling import WMMA_TOKEN_ROWS
 from atom.models.kimi_k3.mono.sources import SOURCES
-from atom.mono.device.ops import bf_hi, bf_lo, rsrc, traced
+from atom.mono.device.ops import CM_DEV, bf_hi, bf_lo, rsrc, traced
 from atom.mono.plan.architecture import GFX1250
 from atom.mono.runtime.abi import KernelAbi
 from atom.utils import envs
@@ -117,6 +117,9 @@ class K2FinishKernel:
     scratch_bytes: int
     abi: KernelAbi = FINISH_PACKED_FRONT_ABI
     launch_count: int = 1
+    # its LDS union and kernel body, for a launch that runs it as a part
+    lds: object = None
+    body: object = None
 
 
 def _direct_poll(requests):
@@ -125,6 +128,11 @@ def _direct_poll(requests):
         word = fx.Int32(bo.buffer_load(rsrc(pointer), index, vec_width=1, dtype=T.i32))
         values.append((word, fx.Int32(1)))
     return values
+
+
+def _out_cm(fused):
+    """A fused launch's outputs' cache policy: device scope, read in it."""
+    return 0 if fused is None else CM_DEV
 
 
 def _direct_put(pointer, index, value):
@@ -376,38 +384,43 @@ def build_packed_finish(
             f"no CTA takes the HERD CTA's shared-down task at {rows} rows"
         )
 
-    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
-    def kernel(
-        front_gathered: Int64,
-        router_bias: Int64,
-        shared_gate_up: Int64,
-        shared_down_weight: Int64,
-        shared_down_scale: Int64,
-        w13: Int64,
-        w13s: Int64,
-        w2: Int64,
-        w2s: Int64,
-        shared_hidden: Int64,
-        route: Int64,
-        tile_route: Int64,
-        flags: Int64,
-        experts: Int64,
-        kof: Int64,
-        union_sizes: Int64,
-        latent_fp4: Int64,
-        latent_scales: Int64,
-        routed_intermediate_fp4: Int64,
-        routed_intermediate_scales: Int64,
-        routed_partial: Int64,
-        shared_partial: Int64,
-        scratch: Int64,
+    @traced
+    def body(
+        role,
+        front_gathered,
+        router_bias,
+        shared_gate_up,
+        shared_down_weight,
+        shared_down_scale,
+        w13,
+        w13s,
+        w2,
+        w2s,
+        shared_hidden,
+        route,
+        tile_route,
+        flags,
+        experts,
+        kof,
+        union_sizes,
+        latent_fp4,
+        latent_scales,
+        routed_intermediate_fp4,
+        routed_intermediate_scales,
+        routed_partial,
+        shared_partial,
+        scratch,
+        fused=None,
     ):
-        _ = sources
+        """The kernel on ``role`` (a ``RoleLds``). ``fused``: the launch's
+        first part (``k2_fused_gfx1250``), its outputs at device scope:
+        ``put`` a route's store, ``route_done(token)`` once a token's routes
+        are stored, ``herd_done()`` once HERD's are, ``shared_done()`` once
+        the CTA's shared down is (each its stores drained first)."""
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
         lane = tid % GFX1250.wave_size
         wave = tid // GFX1250.wave_size
-        role = fx.SharedAllocator().allocate(RoleLds)
         route_role = role.route.peek()
         prep = role.prep.peek()
         shared_down = role.shared_down.peek()
@@ -499,7 +512,7 @@ def build_packed_finish(
                 "wave": wave,
                 "red": route_role.red.ptr,
                 "poll": _direct_poll,
-                "put": _direct_put,
+                "put": _direct_put if fused is None else fused["put"],
                 "peer": {"rlog_own": front_gathered},
                 "args": {"bias": router_bias},
                 "contiguous_logits": replicated_front,
@@ -527,6 +540,8 @@ def build_packed_finish(
                     route_token,
                     payload.local_bytes // 4,
                 )
+            if const_expr(fused is not None):
+                fused["route_done"](route_token)
         if const_expr(precompute_herd):
             # The CTA before the routing ones has no shared-down task: it polls
             # every token's tagged candidates and finishes HERD while the other
@@ -570,11 +585,14 @@ def build_packed_finish(
                         "herd_lds": {
                             name: getattr(herd_lds, name).ptr for name in herd_words
                         },
+                        "store_cm": _out_cm(fused),
                     },
                     rows,
                 )
                 if tid == 0:
                     bo.buffer_store(launch + 1, rsrc(scratch), launch_word)
+                if const_expr(fused is not None):
+                    fused["herd_done"]()
 
         if include_shared and include_routed:
             pairs = rows * SHARED_INTERMEDIATE // 2
@@ -706,6 +724,7 @@ def build_packed_finish(
                         "wave": wave,
                         "tail": {"gemv_accumulator": shared_down.accumulator.ptr},
                         "shared_partial": shared_partial,
+                        "store_cm": _out_cm(fused),
                     },
                     tasks,
                     operands,
@@ -713,6 +732,8 @@ def build_packed_finish(
                     shared_down.rows.ptr,
                     rolled,
                 )
+            if const_expr(fused is not None):
+                fused["shared_done"]()
 
         # Shared-down and routed gate/up are independent and share a static
         # resident work queue.  Runtime union masks never change barriers.
@@ -989,6 +1010,60 @@ def build_packed_finish(
                     moe_expert_gfx1250.stage_down(context, down_task, union_size, WAVES)
         rocdl.s_wait_storecnt(0)
 
+    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
+    def kernel(
+        front_gathered: Int64,
+        router_bias: Int64,
+        shared_gate_up: Int64,
+        shared_down_weight: Int64,
+        shared_down_scale: Int64,
+        w13: Int64,
+        w13s: Int64,
+        w2: Int64,
+        w2s: Int64,
+        shared_hidden: Int64,
+        route: Int64,
+        tile_route: Int64,
+        flags: Int64,
+        experts: Int64,
+        kof: Int64,
+        union_sizes: Int64,
+        latent_fp4: Int64,
+        latent_scales: Int64,
+        routed_intermediate_fp4: Int64,
+        routed_intermediate_scales: Int64,
+        routed_partial: Int64,
+        shared_partial: Int64,
+        scratch: Int64,
+    ):
+        _ = sources
+        body(
+            fx.SharedAllocator().allocate(RoleLds),
+            front_gathered,
+            router_bias,
+            shared_gate_up,
+            shared_down_weight,
+            shared_down_scale,
+            w13,
+            w13s,
+            w2,
+            w2s,
+            shared_hidden,
+            route,
+            tile_route,
+            flags,
+            experts,
+            kof,
+            union_sizes,
+            latent_fp4,
+            latent_scales,
+            routed_intermediate_fp4,
+            routed_intermediate_scales,
+            routed_partial,
+            shared_partial,
+            scratch,
+        )
+
     @flyc.jit
     def launch(
         front_gathered: Int64,
@@ -1055,4 +1130,6 @@ def build_packed_finish(
             if precompute_herd
             else 8
         ),
+        lds=RoleLds,
+        body=body,
     )

@@ -723,11 +723,23 @@ def stage_herd_finalize(c, rows):
             fx.ptr_store(taken[p], slots + at)
     gpu.barrier()
 
+    # read here: a method called in a branch makes ``c`` its traced state
+    store_cm = c.get("store_cm", 0)
     for index in range_constexpr((routes + threads - 1) // threads):
         at = tid + index * threads
         if at < routes:
-            bo.buffer_store(fx.ptr_load(kept_ids + at), rsrc(c["topk_ids"]), at)
-            bo.buffer_store(fx.ptr_load(kept_weights + at), rsrc(c["topk_weights"]), at)
+            bo.buffer_store(
+                fx.ptr_load(kept_ids + at),
+                rsrc(c["topk_ids"]),
+                at,
+                cache_modifier=store_cm,
+            )
+            bo.buffer_store(
+                fx.ptr_load(kept_weights + at),
+                rsrc(c["topk_weights"]),
+                at,
+                cache_modifier=store_cm,
+            )
     # Tile-aligned exclusive scan of the experts' route counts, a run of
     # experts a thread.
     per = (EXPERTS + threads - 1) // threads
