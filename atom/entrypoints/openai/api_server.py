@@ -2040,12 +2040,12 @@ def _model_reasoning_rules(default=CHAT_REASONING_RULES):
 
 
 def _effective_thinking_enabled(kwargs):
-    # Validate against the same defaults and normalization used by the encoder,
-    # on a copy so a predicate cannot change the prompt configuration.
-    effective = dict(getattr(custom_message_encoder, "defaults", {}))
-    effective.update(kwargs)
-    if custom_message_encoder is not None:
-        effective = custom_message_encoder.prepare_kwargs(effective)
+    # Validate against the kwargs the encoder renders with, on a copy so a
+    # predicate cannot change the prompt configuration.
+    if custom_message_encoder is None:
+        effective = dict(kwargs)
+    else:
+        effective = custom_message_encoder.render_kwargs(kwargs)
     if reasoning_toggle is None:
         return True
     name, off_value, on_value = reasoning_toggle
