@@ -376,7 +376,7 @@ if __name__ == "__main__":
             "tests/models/test_kimi_k3_attn_res_rows.py",
             "tests/models/test_kimi_k3_moe_row_tail.py",
             "tests/models/test_kimi_k3_kda_in_proj_split.py",
-            "tests/models/test_kimi_k3_mono_folded_zeros.py",
+            "tests/models/test_kimi_k3_mono_zero_addends.py",
             "tests/model_ops/test_kimi_k3_attn_res_bank.py",
         ]
     )
