@@ -1525,18 +1525,16 @@ class MLAAttention(nn.Module):
         # passes the raw decode output, which is not guaranteed contiguous the
         # way the post-ReduceScatter tensor is.
         x = x.reshape(-1, num_heads, self.kv_lora_rank).transpose(0, 1)
-        # Multiply (N, B, L) x (N, L, V) -> (N, B, V), Convert from (N, B, V) to (B, N, V)
-        # x = torch.bmm(x, self.W_UV).transpose(0, 1)
-        # Convert from (B, N, L) to (N, B, L)
+        # All V-up GEMMs write into the same contiguous (B, N, V) output.
+        output = torch.empty(
+            x.shape[1],
+            x.shape[0],
+            W_V.shape[1],
+            device=x.device,
+            dtype=torch.bfloat16,
+        )
         if is_rocm_aiter_fp4bmm_enabled():
-            output = torch.empty(
-                x.shape[1],
-                x.shape[0],
-                W_V.shape[1],
-                device=x.device,
-                dtype=torch.bfloat16,
-            )
-            output = batched_gemm_a16wfp4(
+            batched_gemm_a16wfp4(
                 x,
                 W_V,
                 W_V_scale,
@@ -1545,19 +1543,18 @@ class MLAAttention(nn.Module):
                 prequant=True,
                 y_scale=None,
             )
-            # x = x.transpose(0, 1).flatten(1, 2)
-            x = output
         elif W_V_scale is None:
             # BF16 absorb via Triton batched GEMM (gfx1250-safe; torch.bmm's
             # hipBLASLt bf16 batched path memory-faults). batched_gemm_bf16 does
-            # X @ W^T with W (B,N,K): x (N,B,L) @ W_V (N,V,L)^T -> (N,B,V), then
-            # -> (B,N,V) to match the fp8/fp4 output layout.
-            x = _aiter_triton_bf16_bmm(x, W_V).transpose(0, 1)
+            # X @ W^T with W (B,N,K): x (N,B,L) @ W_V (N,V,L)^T -> (N,B,V),
+            # stored through output strides into a contiguous (B,N,V) buffer so
+            # the (B, N*V) view o_proj takes needs no transpose copy.
+            _aiter_triton_bf16_bmm(x, W_V, YQ=output.transpose(0, 1))
         else:
-            x = _aiter_triton_fp8_bmm(
-                x, W_V, W_V_scale, group_size=128, transpose_bm=True
+            _aiter_triton_fp8_bmm(
+                x, W_V, W_V_scale, group_size=128, YQ=output, transpose_bm=True
             )
-        return x.reshape(-1, num_heads, self.v_head_dim)
+        return output
 
     @mark_trace(prefix="v_up_proj_and_o_proj", torch_compile=False)
     def _v_up_proj_and_o_proj(self, x):
