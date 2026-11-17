@@ -8,6 +8,7 @@ ATOM (AiTer Optimized Model) uses a prefill-first scheduler with paged KV cache 
 |---|---|---|
 | `Scheduler` | `atom/model_engine/scheduler.py` | Orchestrates prefill/decode scheduling, preemption, and postprocessing |
 | `profile_mixed_memory` | `atom/model_engine/mixed_profile.py` | Mixed attention workspace profiling before KV sizing |
+| `capture_aux` | `atom/spec_decode/aux_capture.py` | Runtime aux capture for compiled target forwards |
 | `EngineStats` | `atom/model_engine/engine_stats.py` | MTP acceptance, prefix-cache hit, and throughput statistics |
 | `ScheduledBatch` | `atom/model_engine/scheduler.py` | Immutable snapshot of a scheduled batch sent to the model runner |
 | `ScheduledBatchOutput` | `atom/model_engine/scheduler.py` | Holds sampled token IDs and draft token IDs returned from forward pass |
@@ -818,6 +819,7 @@ def num_tokens(self, value):
 | `atom/model_engine/scheduler.py` | `Scheduler`, `ScheduledBatch`, `ScheduledBatchOutput` — scheduling algorithm, postprocessing |
 | `atom/model_engine/engine_stats.py` | `EngineStats` — speculative-decode acceptance, prefix-cache hit, and throughput statistics |
 | `atom/model_engine/mixed_profile.py` | Real mixed attention workspace profiling before KV sizing |
+| `atom/spec_decode/aux_capture.py` | Runtime aux capture for compiled target forwards |
 | `atom/model_engine/block_manager.py` | `Block`, `BlockManager` — paged KV cache block pool, allocation/deallocation, prefix caching with xxhash64 |
 | `atom/model_engine/sequence.py` | `Sequence`, `SequenceStatus`, `SequenceType` — request lifecycle, token management, timing |
 | `atom/model_engine/request.py` | `RequestOutput` — streaming output dataclass with `request_id`, `output_tokens`, `finished`, `finish_reason` |
@@ -827,8 +829,8 @@ def num_tokens(self, value):
 ## Mixed prefill and decode on DeepSeek V4
 
 `--enable-mixed-prefill-decode` packs a batch as `[prefill | decode]`.
-The feature requires chunked prefill and supports DSpark.
-TBO, PCP, DCP, EPLB, TR_HYBRID graph modes, other speculative methods, and
+The feature requires chunked prefill. DSpark and TBO are supported;
+PCP, DCP, EPLB, TR_HYBRID graph modes, other speculative methods, and
 speculative decoding with pipeline parallelism are rejected at startup.
 Expert parallelism alone does not enable EPLB.
 
@@ -875,6 +877,18 @@ They are allocated before memory profiling and follow forward-slot reuse.
 The common attention builder retains whole-batch query-span semantics;
 only V4 publishes decode-local spans for its mixed dispatch.
 
+TBO splits mixed batches only when the cut lies inside prefill. Its first
+microbatch is pure prefill and the second holds the remaining prefill tokens
+and every decode token. Both use the same carrier construction and SWA-mask
+rules as an unsplit mixed batch. Segment state is checked when that carrier
+is built, rather than repeatedly in every model layer.
+The builder stages, publishes, and finishes both segments before launching
+the TBO workers. Prefill microbatch metadata lives in the private prefill
+bank; the last mixed microbatch reuses the already-built decode metadata.
+With either setting of the mixed flag, DSpark aux hooks read the live
+microbatch offset or decode token permutation through an opaque operation
+so compiled target regions do not retain a stale write destination.
+
 ### Startup memory profiling
 
 Dummy warmup does not exercise V4 attention because KV has not been bound.
@@ -886,8 +900,13 @@ maximum valid context. The remaining histories stay short, bounding logical
 KV work instead of multiplying the context limit by maximum concurrency.
 Both sweeps retain the full scheduled token and sequence shapes; the persistent
 decode logits workspace is already included in the memory baseline.
-DSpark covers both full-width verification and q=1, retaining the full draft
-width in both cases. Allocator caches are retained across the sampled shapes.
+DSpark covers both full-width verification
+and q=1, retaining the full draft width in both cases. With TBO enabled, it
+profiles both the configured path and unsplit forwards: a decode-only DP
+rank can veto splitting for the whole group, increasing the per-forward
+workspace without changing the scheduled token budget. Allocator caches
+are retained across both sweeps, and the original TBO settings are restored
+before serving.
 
 Old history can share a read-only zero page during this allocation profile;
 current writes use private pages and state slots. Temporary KV bindings are

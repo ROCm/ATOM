@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import dataclasses
 from dataclasses import dataclass
 
 import numpy as np
@@ -24,6 +25,9 @@ class UBatchSlice:
     # The requests its per-request metadata spans: its share of the step's
     # `running_bs` (`cut_decode_ubatches`), or `request_slice`'s.
     running_bs: int | None = None
+
+    num_prefill_tokens: int | None = None
+    num_prefill_seqs: int | None = None
 
     def __post_init__(self):
         if self.scheduled_token_slice is None:
@@ -179,3 +183,37 @@ def cut_prefill_ubatches(
         )
         tok_start = tok_end
     return slices
+
+
+def split_mixed_token_midpoint(
+    num_reqs: int,
+    num_prefill_seqs: int,
+    num_prefill_tokens: int,
+    num_scheduled_tokens,
+) -> list[UBatchSlice] | None:
+    """Use the ordinary prefill cut over all scheduled tokens, including decode.
+
+    The midpoint must stay inside prefill, so only the last micro-batch has
+    decode rows. The vote uses the same `prefill_token_halves` boundary.
+    Each child records its own prefill rows and tokens for metadata assembly.
+    """
+    toks = np.asarray(num_scheduled_tokens[:num_reqs], dtype=np.int64)
+    halves = prefill_token_halves(int(toks.sum()))
+    if halves is None or halves[0] >= num_prefill_tokens:
+        return None
+    slices = cut_prefill_ubatches(num_reqs, toks, int(toks.sum()))
+    if slices is None:
+        return None
+    return [
+        dataclasses.replace(
+            s,
+            # `max(0, ...)` covers a slice that starts past the boundary.
+            num_prefill_tokens=max(
+                0, min(s.token_slice.stop, num_prefill_tokens) - s.token_slice.start
+            ),
+            num_prefill_seqs=max(
+                0, min(s.request_slice.stop, num_prefill_seqs) - s.request_slice.start
+            ),
+        )
+        for s in slices
+    ]

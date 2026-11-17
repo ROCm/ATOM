@@ -138,11 +138,16 @@ def test_long_context_work_is_bounded_without_reducing_query_shapes(
         assert all(context == 8192 for context in long.context_lens[2:])
 
 
+@pytest.mark.parametrize("tbo_flags", [(False, False), (True, False), (True, True)])
 @pytest.mark.parametrize("fail_unsplit", [False, True])
-def test_profile_budgets_reserved_peak_and_releases_scratch(monkeypatch, fail_unsplit):
+def test_profile_budgets_unsplit_fallback_and_restores_config(
+    monkeypatch, tbo_flags, fail_unsplit
+):
     from atom.model_engine import mixed_profile
 
     config = SimpleNamespace(
+        enable_tbo=tbo_flags[0],
+        enable_tbo_decode=tbo_flags[1],
         max_num_seqs=4,
         max_model_len=128,
         speculative_config=None,
@@ -163,10 +168,12 @@ def test_profile_budgets_reserved_peak_and_releases_scratch(monkeypatch, fail_un
             memory["allocated"] = 80
 
     def forward(batch):
-        observed.append(memory["reserved"])
-        if fail_unsplit:
+        flags = (config.enable_tbo, config.enable_tbo_decode)
+        observed.append((flags, memory["reserved"]))
+        if not config.enable_tbo and fail_unsplit:
             raise RuntimeError("unsplit forward failed")
-        allocated, reserved = 128, 140
+        # An unsplit forward needs a larger workspace at the SAME token budget.
+        allocated, reserved = (112, 116) if config.enable_tbo else (128, 140)
         memory.update(peak=allocated, reserved_peak=reserved, reserved=reserved)
 
     runner = SimpleNamespace(
@@ -204,4 +211,9 @@ def test_profile_budgets_reserved_peak_and_releases_scratch(monkeypatch, fail_un
         # Include the unsplit reserved peak, excluding the temporary pool.
         assert mixed_profile.profile_mixed_memory(runner) == (80 + (140 - 100), 7)
     assert not pool_open
-    assert observed
+    assert (config.enable_tbo, config.enable_tbo_decode) == tbo_flags
+    assert {flags for flags, _ in observed} == {tbo_flags, (False, False)}
+    if any(tbo_flags):
+        # Transitioning out of TBO must retain the preceding allocator cache.
+        first_unsplit = next(reserved for flags, reserved in observed if not flags[0])
+        assert first_unsplit == 116

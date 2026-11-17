@@ -1,0 +1,274 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""Token-midpoint splitting of a mixed ``[prefill | decode]`` batch.
+
+Three properties, none of them obvious from either function alone:
+
+1. `mixed_tbo_vote` and `split_mixed_token_midpoint` must agree
+   on the ub0/ub1 token counts. The former's numbers are MAX-reduced across DP
+   to size the per-ubatch buffers; if the slices the latter builds are a
+   different size, the all_gather mismatches and the group hangs.
+
+2. A batch is only splittable when the cut lands strictly inside the prefill
+   region. One contiguous cut of a `[prefill | decode]` layout can never leave
+   both halves mixed -- whichever side the cut falls on, the other is pure --
+   and a pure-DECODE ubatch under a parent context that says is_prefill=True
+   is something TBO cannot express. So the cut is required to fall in the
+   prefill region, making ubatch 0 pure prefill and ubatch 1 the only mixed
+   one. Decode-heavy batches are refused outright.
+
+3. The straddling ubatch must carry its own prefill boundary; nothing
+   downstream can rederive it.
+
+Everything here is pure arithmetic -- no GPU, no model.
+"""
+
+import ast
+import itertools
+from dataclasses import dataclass, replace
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+
+from atom.utils.tbo.ubatch_splitting import (
+    cut_prefill_ubatches,
+    split_mixed_token_midpoint,
+)
+from atom.utils.tbo.ubatching import mixed_tbo_vote
+
+
+def _mixed(n_pref_seqs, pref_len, n_dec_seqs, dec_len=1):
+    """Build (num_scheduled_tokens, num_reqs, n_pref_seqs, n_pref_tokens)."""
+    toks = [pref_len] * n_pref_seqs + [dec_len] * n_dec_seqs
+    return (
+        np.asarray(toks, dtype=np.int64),
+        n_pref_seqs + n_dec_seqs,
+        n_pref_seqs,
+        pref_len * n_pref_seqs,
+    )
+
+
+# Prefill-dominated shapes -- the cut lands inside the prefill region, so these
+# split. This is what real mixed batches look like: measured 15831 prefill
+# against 379 decode tokens.
+_SPLITTABLE = [
+    (4, 4096, 8),  # cut deep inside the prefill region
+    (1, 8192, 400),  # one long prefill, many decode rows
+    (3, 777, 5),  # odd token counts
+    (16, 870, 64),  # the gsm8k-like shape: many short prefills
+    (2, 100, 99),  # only just prefill-dominated (cut at 99 < 200)
+]
+
+# Decode at or over half the batch -- the cut would land on or past the
+# boundary, leaving a pure-decode ubatch. Refused.
+_REFUSED = [
+    (2, 100, 200),  # 200 prefill, 200 decode: cut exactly on the boundary
+    (1, 200, 200),  # same, single prefill request
+    (1, 100, 10000),  # decode dwarfs prefill
+]
+
+
+@pytest.mark.parametrize("n_pref_seqs,pref_len,n_dec_seqs", _SPLITTABLE)
+def test_precompute_and_slices_agree(n_pref_seqs, pref_len, n_dec_seqs):
+    """Property 1: the reported ub0/ub1 are the sizes actually produced."""
+    toks, n_reqs, n_ps, n_pt = _mixed(n_pref_seqs, pref_len, n_dec_seqs)
+    _, can_split, ub0, ub1 = mixed_tbo_vote(toks, n_reqs, n_pt, 0)
+    assert can_split
+
+    slices = split_mixed_token_midpoint(n_reqs, n_ps, n_pt, toks)
+    assert slices is not None and len(slices) == 2
+    got = [s.token_slice.stop - s.token_slice.start for s in slices]
+    assert got == [ub0, ub1], f"precompute said {[ub0, ub1]}, slices are {got}"
+
+
+@pytest.mark.parametrize("n_pref_seqs,pref_len,n_dec_seqs", _REFUSED)
+def test_decode_heavy_is_refused_by_both(n_pref_seqs, pref_len, n_dec_seqs):
+    """Property 2, and both sides must refuse in step.
+
+    If only the splitter refused, `can_split` would still be True, the cross-DP
+    AND-reduce would keep TBO on, and this rank would run one ubatch against
+    its peers' two.
+    """
+    toks, n_reqs, n_ps, n_pt = _mixed(n_pref_seqs, pref_len, n_dec_seqs)
+    _, can_split, ub0, ub1 = mixed_tbo_vote(toks, n_reqs, n_pt, 0)
+    assert can_split is False
+    assert (ub0, ub1) == (0, 0)
+    assert split_mixed_token_midpoint(n_reqs, n_ps, n_pt, toks) is None
+
+
+@pytest.mark.parametrize("n_pref_seqs,pref_len,n_dec_seqs", _SPLITTABLE)
+def test_slices_tile_the_batch(n_pref_seqs, pref_len, n_dec_seqs):
+    """No token may be dropped or forwarded twice."""
+    toks, n_reqs, n_ps, n_pt = _mixed(n_pref_seqs, pref_len, n_dec_seqs)
+    slices = split_mixed_token_midpoint(n_reqs, n_ps, n_pt, toks)
+    total = int(toks.sum())
+
+    assert slices[0].token_slice.start == 0
+    assert slices[-1].token_slice.stop == total
+    for a, b in itertools.pairwise(slices):
+        assert a.token_slice.stop == b.token_slice.start
+    for s in slices:
+        assert s.token_slice.stop > s.token_slice.start, "empty ubatch"
+
+
+@pytest.mark.parametrize("n_pref_seqs,pref_len,n_dec_seqs", _SPLITTABLE)
+def test_ubatch0_pure_prefill_ubatch1_mixed(n_pref_seqs, pref_len, n_dec_seqs):
+    """Properties 2 and 3: the shape the rest of the design relies on.
+
+    ubatch 0 holds nothing but prefill (so it takes the ordinary prefill path),
+    ubatch 1 holds the prefill tail plus every decode row, and its recorded
+    boundary matches the definition -- its intersection with the batch's
+    leading prefill range.
+    """
+    toks, n_reqs, n_ps, n_pt = _mixed(n_pref_seqs, pref_len, n_dec_seqs)
+    ub0, ub1 = split_mixed_token_midpoint(n_reqs, n_ps, n_pt, toks)
+
+    ub0_len = ub0.token_slice.stop - ub0.token_slice.start
+    ub1_len = ub1.token_slice.stop - ub1.token_slice.start
+
+    # ubatch 0: pure prefill.
+    assert ub0.num_prefill_tokens == ub0_len
+
+    # ubatch 1: straddles, so strictly between empty and full.
+    assert 0 < ub1.num_prefill_tokens < ub1_len
+
+    # Both against the definition, not the implementation.
+    for s in (ub0, ub1):
+        ts, rs = s.token_slice, s.request_slice
+        assert s.num_prefill_tokens == max(0, min(ts.stop, n_pt) - ts.start)
+        assert s.num_prefill_seqs == max(0, min(rs.stop, n_ps) - rs.start)
+
+    # Every prefill token lands in exactly one ubatch.
+    assert ub0.num_prefill_tokens + ub1.num_prefill_tokens == n_pt
+
+
+def test_too_small_to_split():
+    toks = np.asarray([1], dtype=np.int64)
+    assert split_mixed_token_midpoint(1, 0, 0, toks) is None
+    _, can_split, _, _ = mixed_tbo_vote(toks, 1, 0, 0)
+    assert can_split is False
+
+
+def test_min_token_bar_keys_off_prefill_only():
+    """A decode tail must not talk a small prefill past the min-token bar.
+
+    Prefill-dominated (so the batch IS splittable) but far below the 8192 bar:
+    can_split says yes, meets_min_tokens says not worth it.
+    """
+    toks, n_reqs, _, n_pt = _mixed(1, 100, 50)  # 100 prefill, 50 decode
+    meets_min, can_split, _, _ = mixed_tbo_vote(toks, n_reqs, n_pt, 8192)
+    assert can_split is True
+    assert meets_min is False
+
+
+@pytest.fixture
+def runner_cut():
+    path = Path(__file__).resolve().parents[1] / "atom/model_engine/model_runner.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    method = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "_cut_ubatches"
+    )
+    scope = {
+        "ForwardMode": SimpleNamespace,
+        "ScheduledBatch": SimpleNamespace,
+        "replace": replace,
+        "split_mixed_token_midpoint": split_mixed_token_midpoint,
+        "cut_prefill_ubatches": cut_prefill_ubatches,
+    }
+    exec(  # noqa: S102 - execute the repository's CPU method without GPU imports
+        compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"), scope
+    )
+    return scope["_cut_ubatches"]
+
+
+@dataclass
+class _Mode:
+    running_tokens: int
+    tbo_collective_active: bool = True
+    is_prefill: bool = True
+    ubatch_slices: object = None
+    pcp_groups: object = None
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_runner_routes_the_collective_cut(runner_cut, mixed):
+    tokens = [605] * 27 + ([1] if mixed else [])
+    batch = SimpleNamespace(
+        is_mixed=mixed,
+        is_dummy_run=False,
+        total_seqs_num=len(tokens),
+        total_seqs_num_prefill=27,
+        total_tokens_num_prefill=27 * 605,
+        num_scheduled_tokens=np.asarray(tokens),
+    )
+    runner = SimpleNamespace(config=SimpleNamespace(prefill_context_parallel_size=1))
+    result = runner_cut(runner, _Mode(sum(tokens)), batch)
+    assert len(result.ubatch_slices) == 2
+    assert result.ubatch_slices[0].token_slice.start == 0
+    assert result.ubatch_slices[-1].token_slice.stop == sum(tokens)
+    assert all(
+        (s.num_prefill_tokens is not None) == mixed for s in result.ubatch_slices
+    )
+
+
+def test_runner_rejects_invalid_mixed_collective_cut(runner_cut):
+    batch = SimpleNamespace(
+        is_mixed=True,
+        total_seqs_num=3,
+        total_seqs_num_prefill=1,
+        total_tokens_num_prefill=1,
+        num_scheduled_tokens=np.asarray([1, 8, 8]),
+    )
+    with pytest.raises(RuntimeError, match="invalid mixed split"):
+        runner_cut(SimpleNamespace(), _Mode(17), batch)
+
+
+def test_precompute_and_split_agree_on_random_batches():
+    """What each rank reports to the DP sync (the precomputes) and what it then
+    cuts (the splits) agree on every batch, pure prefill and mixed, including
+    whether a split happens at all. A disagreement sizes the per-ubatch
+    all_gathers differently across ranks: a hang, not an error."""
+    from atom.utils.tbo.ubatch_splitting import (
+        cut_prefill_ubatches,
+        split_mixed_token_midpoint,
+    )
+    from atom.utils.tbo.ubatching import (
+        mixed_tbo_vote,
+        prefill_tbo_vote,
+    )
+
+    rng = np.random.default_rng(0)
+    for _ in range(2000):
+        n_pref = int(rng.integers(0, 6))
+        n_dec = int(rng.integers(0, 6))
+        n = n_pref + n_dec
+        if n == 0:
+            continue
+        toks = np.concatenate(
+            [rng.integers(1, 300, n_pref), rng.integers(1, 9, n_dec)]
+        ).astype(np.int64)
+        n_pref_tokens = int(toks[:n_pref].sum())
+
+        _, can, ub0, ub1 = prefill_tbo_vote(n_pref_tokens)
+        slices = cut_prefill_ubatches(n_pref, toks, n_pref_tokens) if n_pref else None
+        assert can == (slices is not None)
+        if can:
+            assert [s.token_slice.stop - s.token_slice.start for s in slices] == [
+                ub0,
+                ub1,
+            ]
+
+        _, can, ub0, ub1 = mixed_tbo_vote(toks, n, n_pref_tokens, 0)
+        slices = split_mixed_token_midpoint(n, n_pref, n_pref_tokens, toks)
+        assert can == (slices is not None)
+        if can:
+            assert [s.token_slice.stop - s.token_slice.start for s in slices] == [
+                ub0,
+                ub1,
+            ]
+            assert slices[0].num_prefill_tokens == ub0  # ubatch 0 is pure prefill

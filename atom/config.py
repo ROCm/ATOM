@@ -3552,11 +3552,6 @@ class Config:
         rope_parameters = getattr(hf, "rope_parameters", None) or {}
         # (is this config affected, what it is, why it cannot run mixed)
         refusals = [
-            (
-                self.enable_tbo or self.enable_tbo_decode,
-                "TBO",
-                "mixed microbatch splitting is not enabled; disable both TBO modes",
-            ),
             # Only the V4 builder implements `prepare_mixed`. Compared by
             # family, not `is_mla`: V4 is its own family despite its latent
             # rank, and dense MLA (DeepSeek-V2/V3/R1, Kimi) is not supported.
