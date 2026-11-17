@@ -171,11 +171,10 @@ def test_validator_allows_v4_dspark():
 
 
 @pytest.mark.parametrize("tbo,tbo_decode", [(True, False), (False, True), (True, True)])
-def test_validator_refuses_mixed_with_either_tbo_mode(tbo, tbo_decode):
+def test_validator_allows_mixed_with_either_tbo_mode(tbo, tbo_decode):
     _bind()
     cfg = _FakeConfig(tbo=tbo, tbo_decode=tbo_decode)
-    with pytest.raises(ValueError, match="TBO"):
-        cfg._validate_mixed_prefill_decode()
+    cfg._validate_mixed_prefill_decode()
     cfg.enable_mixed_prefill_decode = False
     cfg._validate_mixed_prefill_decode()
 

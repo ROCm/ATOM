@@ -42,7 +42,7 @@ import math
 import os
 from collections.abc import Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, cast
 
 import numpy as np
@@ -425,7 +425,7 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     kv_indptr_extend: torch.Tensor | None = None
     """[total_tokens + 1] int32 GPU — packed cumsum of `extend_count`."""
 
-    # Mixed target layout, with independent prefill and decode metadata.
+    # Mixed target layout; TBO carriers use their own local token coordinates.
     prefill_attn_metadata: "AttentionMetaData_DSV4 | None" = None
     decode_attn_metadata: "AttentionMetaData_DSV4 | None" = None
     num_prefill_tokens: int = 0
@@ -496,7 +496,12 @@ def _mixed_carrier(
     n_d_tokens: int,
     running_bs: int,
 ) -> "AttentionMetaData_DSV4":
-    """Assemble whole-batch spans, sample rows and segment metadata."""
+    """The top-level metadata of a mixed batch, or of a TBO ubatch of one.
+
+    The one place it is assembled: `prepare_mixed` builds it for the whole
+    batch and its straddling micro-batch, and a
+    field added to one and not the other is what a second copy invites.
+    """
     if (
         prefill_meta.state is AttnState.DECODE
         or decode_meta.state is not AttnState.DECODE
@@ -536,7 +541,7 @@ def _mixed_carrier(
     )
     # One QK-norm/RoPE launch for the whole batch. Negative row IDs mask
     # prefill's SWA stores: its prefix must survive until prefill attention
-    # finishes. Decode stores remain fused.
+    # finishes. Decode stores remain fused, including in the mixed TBO tail.
     if decode_meta.swa_dest_rows is not None:
         merged.batch_id_per_q_token = torch.cat(
             [
@@ -589,8 +594,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     # instead of waiting for the compute queue to drain.
     tbo_comm_stream_priority = -1
 
-    # The prefill builder also publishes compressor/indexer metadata. Its
-    # bank needs input, state, indexer and plan groups, but never
+    # The prefill builder also publishes compressor/indexer metadata. TBO
+    # rebuilds need their own input, state, indexer and plan groups, but never
     # the decode-only destination/attention buffers or sampling/input-id groups.
     mixed_prefill_groups = frozenset(
         (
@@ -601,6 +606,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             "v4_indexer",
             "v4_prefill",
             "v4_plans",
+            "ub0_metadata",
+            "ub1_metadata",
         )
     )
 
@@ -2810,16 +2817,43 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 owner.finish()
 
     def prepare_mixed(self, batch, running_bs, running_tokens, ubatch_slices=None):
-        """Build each segment once with independent metadata publication."""
+        """Build each segment once using the ordinary stage/publish/finish path.
+
+        Mixed TBO cuts inside prefill, leaving decode entirely in the last
+        micro-batch. Build the prefill children in their private bank and
+        attach that same decode metadata to the last child.
+        """
         n_p = batch.total_seqs_num_prefill
         n_d = batch.total_seqs_num_decode
         t_p = batch.total_tokens_num_prefill
         t_d = batch.total_tokens_num_decode
         prefill_batch = batch.slice_rows(0, n_p)
         decode_batch = batch.slice_rows(n_p, batch.total_seqs_num)
+        prefill_slices = None
+        if ubatch_slices:
+            if any(ub.token_slice.stop >= t_p for ub in ubatch_slices[:-1]):
+                raise ValueError("mixed TBO must keep decode in its final micro-batch")
+            prefill_slices = tuple(
+                replace(
+                    ub,
+                    request_slice=slice(
+                        ub.request_slice.start, min(ub.request_slice.stop, n_p)
+                    ),
+                    token_slice=slice(
+                        ub.token_slice.start, min(ub.token_slice.stop, t_p)
+                    ),
+                    scheduled_token_slice=slice(
+                        ub.token_slice.start, min(ub.token_slice.stop, t_p)
+                    ),
+                    running_bs=ub.num_prefill_seqs,
+                    num_prefill_tokens=None,
+                    num_prefill_seqs=None,
+                )
+                for ub in ubatch_slices
+            )
         with self.mixed_prefill_bank_active(prefill_batch):
             prefill_meta, prefill_positions = self.prepare_prefill(
-                prefill_batch, n_p, t_p, None, None
+                prefill_batch, n_p, t_p, prefill_slices, None
             )
 
         if decode_batch.block_table_rows != list(
@@ -2849,6 +2883,19 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         merged = _mixed_carrier(
             prefill_meta, decode_meta, n_p, n_d, t_p, t_d, running_bs
         )
+        if ubatch_slices:
+            children = list(prefill_meta.ubatches)
+            last = ubatch_slices[-1]
+            children[-1] = _mixed_carrier(
+                children[-1],
+                decode_meta,
+                last.num_prefill_seqs,
+                n_d,
+                last.num_prefill_tokens,
+                t_d,
+                last.running_bs,
+            )
+            merged.ubatches = children
         positions = torch.cat((prefill_positions[:t_p], decode_positions[:t_d]))
         return merged, positions
 

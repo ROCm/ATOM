@@ -8,11 +8,13 @@ from .ubatch_splitting import (
     cut_prefill_ubatches,
     decode_bucket_splits,
     decode_ubatch_token_order,
+    split_mixed_token_midpoint,
 )
 from .ubatching import (
     DPSyncResult,
     TBOContext,
     make_tbo_contexts,
+    mixed_tbo_vote,
     prefill_tbo_vote,
     sync_dp_metadata,
     tbo_active,
@@ -41,7 +43,9 @@ __all__ = [
     "decode_bucket_splits",
     "decode_ubatch_token_order",
     "make_tbo_contexts",
+    "mixed_tbo_vote",
     "prefill_tbo_vote",
+    "split_mixed_token_midpoint",
     "sync_dp_metadata",
     "tbo_active",
     "tbo_current_ubatch_id",

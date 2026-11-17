@@ -162,7 +162,9 @@ from atom.utils.tbo import (
     cut_decode_ubatches,
     cut_prefill_ubatches,
     decode_bucket_splits,
+    mixed_tbo_vote,
     prefill_tbo_vote,
+    split_mixed_token_midpoint,
 )
 from atom.utils.tbo.ubatch_wrapper import UBatchWrapper
 
@@ -2588,6 +2590,13 @@ class ModelRunner:
                 and batch.total_tokens_num_prefill // pcp_size >= 2
             )
             return (eligible, eligible, 0, 0)
+        if batch.is_mixed:
+            return mixed_tbo_vote(
+                batch.num_scheduled_tokens,
+                batch.total_seqs_num,
+                batch.total_tokens_num_prefill,
+                envs.ATOM_TBO_PREFILL_MIN_TOKENS,
+            )
         return prefill_tbo_vote(batch.total_tokens_num_prefill)
 
     def _cut_ubatches(
@@ -2606,6 +2615,18 @@ class ModelRunner:
                 forward_mode.running_tokens,
                 np.asarray(batch.num_scheduled_tokens[:scheduled_bs]),
             )
+        elif batch.is_mixed:
+            ubatch_slices = split_mixed_token_midpoint(
+                batch.total_seqs_num,
+                batch.total_seqs_num_prefill,
+                batch.total_tokens_num_prefill,
+                batch.num_scheduled_tokens,
+            )
+            if ubatch_slices is None:
+                raise RuntimeError(
+                    "collective TBO decision admitted an invalid mixed split"
+                )
+            ubatch_slices = tuple(ubatch_slices)
         elif self.config.prefill_context_parallel_size > 1 and not batch.is_dummy_run:
             ubatch_slices, pcp_groups = cut_pcp_prefill_ubatches(
                 batch.num_scheduled_tokens,

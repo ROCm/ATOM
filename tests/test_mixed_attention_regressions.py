@@ -146,3 +146,60 @@ def test_attention_output_reuse_keeps_decode_input_intact(monkeypatch, bf16):
     assert (out.data_ptr() == query.data_ptr()) == bf16
     torch.testing.assert_close(out, (original + 10).reshape(6, 4))
     assert fc.attn_metadata is metadata and ctx.is_prefill
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("mixed", [False, True])
+def test_aux_capture_uses_live_offsets(monkeypatch, compiled, mixed):
+    from atom.spec_decode.drafter import Drafter
+    from atom.utils import forward_context as fc
+
+    context = SimpleNamespace(
+        is_draft=False, ubatch_token_offset=0, ubatch_token_order=None
+    )
+    monkeypatch.setattr(
+        fc._forward_context_local,
+        "ctx",
+        SimpleNamespace(context=context),
+        raising=False,
+    )
+    buffer = torch.full((6, 2), -1.0, device="cuda")
+    drafter = SimpleNamespace(
+        config=SimpleNamespace(enable_mixed_prefill_decode=mixed),
+        _aux_buffers=[buffer],
+    )
+    hook = Drafter._make_aux_hook(drafter, 0, lambda output, module: output)
+
+    def run(x):
+        hook(None, (), x)
+        return x + 1
+
+    first = torch.ones(2, 2, device="cuda")
+    if compiled:
+        captured = []
+
+        def backend(graph, args):
+            captured.append((graph, args))
+            return graph.forward
+
+        torch.compile(run, fullgraph=True, backend=backend)(first)
+        graph, args = captured[-1]
+
+        def run(x):
+            # The level >= 2 dispatcher reuses captured code without guards.
+            return graph.forward(
+                *[
+                    x if isinstance(arg, torch.Tensor) and arg is first else arg
+                    for arg in args
+                ]
+            )
+
+    else:
+        run(first)
+    context.ubatch_token_offset = 3
+    run(torch.full((2, 2), 2.0, device="cuda"))
+    context.ubatch_token_order = torch.tensor([5, 2], device="cuda")
+    run(torch.full((2, 2), 3.0, device="cuda"))
+    context.is_draft = True
+    run(torch.full((2, 2), 99.0, device="cuda"))
+    assert buffer[:, 0].tolist() == [1, 1, 3, 2, 2, 3]

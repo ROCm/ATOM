@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Mixed metadata uses independent publication banks across steps and slots."""
+"""Mixed metadata uses independent publication banks and prebuilt TBO children."""
 
 from types import SimpleNamespace
 
@@ -16,6 +16,7 @@ from atom.model_ops.attentions import backends
 from atom.model_ops.attentions import deepseek_v4_attn as v4
 from atom.spec_decode.dspark_scheduler import resize_decode_tokens
 from atom.utils import CpuGpuBuffer
+from atom.utils.tbo.ubatch_splitting import split_mixed_token_midpoint
 from tests.test_mixed_decode_view import make_batch
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU H2D")
@@ -32,8 +33,8 @@ def _runner(monkeypatch, slots):
     runner.use_mrope = False
     runner.config = SimpleNamespace(
         pipeline_parallel_size=slots,
-        enable_tbo=False,
-        enable_tbo_decode=False,
+        enable_tbo=True,
+        enable_tbo_decode=True,
         prefill_context_parallel_size=1,
         max_num_seqs=8,
         max_model_len=512,
@@ -74,7 +75,7 @@ def _runner(monkeypatch, slots):
     builder._indexer_qsplit_world = 1
     builder.pool_geometry = SimpleNamespace(slot_positions=64)
     # Only attention-index kernel generation is outside this publication test.
-    # All row slicing, staging, uploads and plans run unmodified.
+    # All row slicing, staging, uploads, plans and TBO assembly run unmodified.
     builder._attach_v4_paged_decode_meta = lambda **kw: None
     builder._attach_v4_index_rows = lambda *a, **kw: None
     builder._build_paged_prefill_meta = lambda *a, **kw: None
@@ -113,9 +114,10 @@ def test_idle_v4_decode_publishes_padding_with_previous_spec_status(
 
 
 @pytest.mark.parametrize("slots", [1, 2])
+@pytest.mark.parametrize("tbo", [False, True])
 @pytest.mark.parametrize("spec,query_width", [(0, 1), (1, 1), (1, 2)])
 def test_mixed_stage_publish_finish_preserves_both_segments(
-    monkeypatch, slots, spec, query_width
+    monkeypatch, slots, tbo, spec, query_width
 ):
     runner, builder = _runner(monkeypatch, slots)
     for step in range(3):
@@ -130,8 +132,15 @@ def test_mixed_stage_publish_finish_preserves_both_segments(
         )
         lengths = batch.num_scheduled_tokens[2:]
         builder.publish_query_metadata(lengths, 3, int(lengths.sum()))
+        parts = (
+            split_mixed_token_midpoint(5, 2, 16, batch.num_scheduled_tokens)
+            if tbo
+            else None
+        )
         torch.cuda._sleep(2_000_000)
-        metadata, positions = builder.prepare_mixed(batch, 8, batch.total_tokens_num)
+        metadata, positions = builder.prepare_mixed(
+            batch, 8, batch.total_tokens_num, parts
+        )
         prefill, decode = metadata.prefill_attn_metadata, metadata.decode_attn_metadata
         snapshots = [
             positions.clone(),
@@ -152,6 +161,13 @@ def test_mixed_stage_publish_finish_preserves_both_segments(
             assert bank[name].gpu.data_ptr() != live[name].gpu.data_ptr()
         assert decode.cu_seqlens_q.data_ptr() == live["cu_seqlens_q"].gpu.data_ptr()
         assert prefill.cu_seqlens_q.data_ptr() == bank["cu_seqlens_q"].gpu.data_ptr()
+        if tbo:
+            assert len(metadata.ubatches) == 2
+            assert not metadata.ubatches[0].is_mixed
+            tail = metadata.ubatches[-1]
+            assert tail.decode_attn_metadata is decode
+            assert tail.num_prefill_tokens == 16 - parts[0].running_tokens
+            assert tail.cu_seqlens_q[-1].item() == parts[-1].running_tokens
         runner._mark_staging_h2d_enqueued()
         runner._record_forward_vars_event()
         actual_pos, pcu, dcu, pctx, dctx, state = [t.cpu().tolist() for t in snapshots]

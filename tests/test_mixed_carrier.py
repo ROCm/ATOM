@@ -341,6 +341,8 @@ def test_prefill_bank_clones_only_its_writers_and_preserves_live_bindings(
         "v4_state": "v4_state",
         "plans": "v4_plans",
         "indexer": "v4_indexer",
+        "ub_inputs": "ub0_metadata",
+        "ub_plans": "ub1_metadata",
         "batch_id_per_q_token": None,
         "input_ids": "input_ids",
         "sampling": "sampling",

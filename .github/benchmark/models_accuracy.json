@@ -478,5 +478,31 @@
     "accuracy_baseline": 0.95,
     "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4-Pro",
     "_baseline_note": "DSpark mixed prefill/decode without TBO. Local full GSM8K, 1319 examples, 3-shot, concurrency 1000 at 9eacf99647f9 on MI355X: mixed on 1255/1319 (0.9515), mixed off 1261/1319 (0.9560). Mixed scheduler steps were observed. Threshold follows the existing V4 target baseline; this is a nightly accuracy entry."
+  },
+  {
+    "model_name": "DeepSeek-V4-Pro TBO+DPA+mixed conc1000",
+    "model_path": "deepseek-ai/DeepSeek-V4-Pro",
+    "extraArgs": "--kv_cache_dtype fp8 --index_cache_dtype fp4 -tp 8 --enable-dp-attention --enable-tbo --enable-mixed-prefill-decode --max-num-batched-tokens 2048 --trust-remote-code --gpu-memory-utilization 0.85 --no-enable_prefix_caching --max-model-len 9472",
+    "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1",
+    "client_command": "lm_eval --model local-completions --model_args model=${MODEL_PATH},base_url=http://localhost:8000/v1/completions,num_concurrent=1000,max_retries=3,tokenized_requests=False,trust_remote_code=True --tasks gsm8k --num_fewshot 3 --output_path ${OUTPUT_PATH}",
+    "runner": "linux-atom-do-mi350x-8",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.93,
+    "accuracy_baseline": 0.95,
+    "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4-Pro",
+    "_baseline_note": "Mixed prefill/decode with TBO. Full GSM8K, 1319 examples, 3-shot. Verify mixed TBO exposure on the current head; thresholds follow the existing V4 target baseline."
+  },
+  {
+    "model_name": "DeepSeek-V4-Pro DSpark TBO+DPA+mixed conc1000",
+    "model_path": "deepseek-ai/DeepSeek-V4-Pro-DSpark",
+    "extraArgs": "--kv_cache_dtype fp8 --index_cache_dtype fp4 -tp 8 --method dspark --num-speculative-tokens 7 --enable-dp-attention --enable-tbo --enable-mixed-prefill-decode --dspark-config '{\"confidence_schedule\": true, \"ragged\": true, \"ragged_graph_sizes\": \"8\"}' --max-num-batched-tokens 16384 --trust-remote-code --gpu-memory-utilization 0.85 --no-enable_prefix_caching --max-model-len 9472",
+    "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1",
+    "client_command": "lm_eval --model local-completions --model_args model=${MODEL_PATH},base_url=http://localhost:8000/v1/completions,num_concurrent=1000,max_retries=3,tokenized_requests=False,trust_remote_code=True --tasks gsm8k --num_fewshot 3 --output_path ${OUTPUT_PATH}",
+    "runner": "linux-atom-do-mi350x-8",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.93,
+    "accuracy_baseline": 0.95,
+    "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4-Pro",
+    "_baseline_note": "Mixed prefill/decode with TBO. Full GSM8K, 1319 examples, 3-shot. Verify mixed TBO exposure on the current head; thresholds follow the existing V4 target baseline."
   }
 ]
