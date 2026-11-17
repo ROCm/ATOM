@@ -1,5 +1,5 @@
 //! The Mooncake Stores the workers offload to, one source per store a model's
-//! workers report, read by every worker that reports it.
+//! workers report alike, read by every worker that reports it so.
 
 use std::{collections::BTreeSet, time::Duration};
 
@@ -109,11 +109,9 @@ impl StorageSources {
         let mut report = offload.clone();
         report.masters.sort();
         report.masters.dedup();
-        let same = |source: &&mut StorageSource| {
-            (source.model_id == model_id)
-                && (source.report.namespace == report.namespace)
-                && (source.report.masters == report.masters)
-        };
+        // The whole report: a reader's load policy and self-check are its own.
+        let same =
+            |source: &&mut StorageSource| source.model_id == model_id && source.report == report;
         if let Some(source) = sources.iter_mut().find(same) {
             source.readers.insert(worker.into());
             return;
@@ -296,6 +294,40 @@ mod tests {
         sources.remove("http://a:8000@0");
         sources.remove("http://a:8000@1");
         assert!(listed(&sources).is_empty());
+    }
+
+    #[test]
+    fn readers_share_a_source_only_with_the_same_load_policy_and_self_check() {
+        let good = store("atomkv1-0123456789abcdef01234567", &["10.0.0.1:50051"]);
+        let eager = OffloadReport {
+            min_load_tokens: 512,
+            ..good.clone()
+        };
+        let sources = StorageSources::new(9003);
+        sources.add("http://a:8000", "m", &eager);
+        sources.add("http://b:8000", "m", &good);
+        sources.remove("http://a:8000");
+        let left = sources.sources.lock().clone();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].report.min_load_tokens, 8192);
+        assert_eq!(left[0].readers, BTreeSet::from(["http://b:8000".into()]));
+
+        let altered = OffloadReport {
+            chain_check: keys::chain_check(16),
+            ..good.clone()
+        };
+        for (first, second) in [(&good, &altered), (&altered, &good)] {
+            let sources = StorageSources::new(9003);
+            sources.add("http://a:8000", "m", first);
+            sources.add("http://b:8000", "m", second);
+            let passed = |worker: &str| {
+                let listed = listed(&sources);
+                let read = listed.iter().find(|(_, _, readers)| readers == &[worker]);
+                read.map(|(_, passed, _)| *passed)
+            };
+            assert_eq!(passed("http://a:8000"), Some(first == &good));
+            assert_eq!(passed("http://b:8000"), Some(second == &good));
+        }
     }
 
     #[test]
