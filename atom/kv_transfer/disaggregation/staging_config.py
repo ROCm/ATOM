@@ -21,6 +21,7 @@ from atom.kv_transfer.disaggregation.pd_producer import (
 )
 from atom.kv_transfer.disaggregation.transfer_plan import TOKEN_UNITS
 from atom.utils import envs, get_hf_text_config
+from atom.utils.selector import Family, attn_family
 
 
 def plain_mla_model(config) -> bool:
@@ -36,10 +37,6 @@ def plain_mla_model(config) -> bool:
     hf_config = getattr(config, "hf_config", None)
     if hf_config is None:
         return False
-    # Local import: config-time callers must not import transformers early.
-    from atom.utils import get_hf_text_config
-    from atom.utils.selector import Family, attn_family
-
     return attn_family(get_hf_text_config(hf_config)) == Family.MLA
 
 

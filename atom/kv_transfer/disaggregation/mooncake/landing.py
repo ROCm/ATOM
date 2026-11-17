@@ -5,8 +5,10 @@
 
 A decode rank that owns only part of each prefill block cannot take its KV as
 whole blocks. The staged path (``MooncakeConnector._execute_staged_transfer``
-without a landing offer) sends one RDMA descriptor per destination page, which
-caps a NIC at about 10 GB/s with fragmented decode block tables. Landing sends
+without a landing offer) writes the staging slot straight to the destination
+pages, one RDMA descriptor per run of adjacent pages within a memory region
+(``TransferPlan.direct_descriptors``). A fragmented decode block table leaves
+few adjacent pages, which caps a NIC at about 10 GB/s. Landing sends
 a rank's units packed in rank order instead: one descriptor per slot of a
 decode-side GPU landing pool, which the decode rank then scatters into its
 paged KV cache. A unit is what ``transfer_plan`` packs; unit ``j`` of a request
