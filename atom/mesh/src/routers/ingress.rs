@@ -25,6 +25,7 @@ use crate::{
             registry_adapters::{PolicyRegistryAdapter, WorkerRegistryAdapter},
         },
         prepare_pool::{JobContext, PrepareHandle},
+        worker::DEFAULT_CHAT_TEMPLATE_KWARGS_LABEL,
         ConnectionMode, Worker, WorkerRegistry, WorkerType,
     },
     policies::{LoadBalancingPolicy, PolicyRegistry},
@@ -74,6 +75,10 @@ fn untokenized(model: Option<&str>, error: &IngressError) {
         );
     }
 }
+
+/// Models whose workers report different `--default-chat-template-kwargs`, each
+/// warned of once, as many as `UNTOKENIZED_MODELS` keeps.
+static DISAGREEING_MODELS: LazyLock<DashSet<String>> = LazyLock::new(DashSet::new);
 
 const MAX_RESPONSE_ID_BYTES: usize = 256;
 /// Worker label listing the inference paths a backend serves.
@@ -841,9 +846,57 @@ impl IngressRouting {
         Ok(())
     }
 
+    /// The `--default-chat-template-kwargs` that the workers a chat can be placed
+    /// on report, which ATOM renders it with first. A worker that reports none
+    /// has none. Workers that differ share no one render, and get none.
+    fn chat_template_defaults(
+        &self,
+        metadata: &InferenceMetadata,
+    ) -> HashMap<String, serde_json::Value> {
+        fn reported(worker: &Arc<dyn Worker>) -> Option<&String> {
+            worker
+                .metadata()
+                .labels
+                .get(DEFAULT_CHAT_TEMPLATE_KWARGS_LABEL)
+        }
+        fn parse(label: Option<&String>) -> HashMap<String, serde_json::Value> {
+            label
+                .and_then(|json| serde_json::from_str(json).ok())
+                .unwrap_or_default()
+        }
+        let (Some(model), Ok(workers)) =
+            (metadata.model.as_deref(), self.candidates(metadata, false))
+        else {
+            return HashMap::new();
+        };
+        let mut labels = workers.iter().map(reported);
+        let first = labels.next().flatten();
+        if labels.all(|label| label == first) {
+            return parse(first);
+        }
+        let defaults = parse(first);
+        if workers
+            .iter()
+            .all(|worker| parse(reported(worker)) == defaults)
+        {
+            return defaults;
+        }
+        let models = &DISAGREEING_MODELS;
+        if models.len() < MAX_UNTOKENIZED_MODELS
+            && !models.contains(model)
+            && models.insert(model.to_string())
+        {
+            warn!(
+                model,
+                "The model's workers report different --default-chat-template-kwargs: HTTP routing renders its chats without them"
+            );
+        }
+        HashMap::new()
+    }
+
     /// The request's `input_ids`, or its prompt encoded, with the tokenizer's special tokens
     /// when `add_special_tokens`. A chat renders with the template kwargs ATOM's chat
-    /// endpoint takes from `body`.
+    /// endpoint takes from `body`, over its model's workers' defaults.
     fn tokens(
         &self,
         parsed: &ParsedInference,
@@ -893,8 +946,9 @@ impl IngressRouting {
                 .get(&entry.id)
                 .cloned()
                 .unwrap_or_default();
+            let defaults = self.chat_template_defaults(metadata);
             let template_kwargs = super::prepare::reasoning_controls::atom_chat_template_kwargs(
-                chat, body, &controls,
+                chat, body, defaults, &controls,
             )
             .map_err(IngressError::invalid)?;
             super::prepare::chat_template::render_chat_messages(

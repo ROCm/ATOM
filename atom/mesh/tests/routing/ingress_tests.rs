@@ -161,10 +161,9 @@ async fn chats_rendered_without_their_template_are_not_tokenized() {
     }
 }
 
-/// A chat is tokenized as ATOM renders it, its reasoning controls setting the
-/// tokenizer's toggle; `thinking` too, though the typed request has no such field.
-#[tokio::test]
-async fn chats_are_tokenized_with_atoms_reasoning_controls() {
+/// An app whose model `m` has a tokenizer with a word per id, and a template
+/// that adds `off` when reasoning is off; its toggle recorded at registration.
+async fn app_with_switched_chats() -> (AppContext, PreparePoolRuntime) {
     use crate::tokenizer::traits::Tokenizer;
     let config = crate::config::RouterConfig {
         policy: crate::config::PolicyConfig::PrefixHash {
@@ -173,11 +172,10 @@ async fn chats_are_tokenized_with_atoms_reasoning_controls() {
         },
         ..Default::default()
     };
-    let _pool = PreparePoolRuntime::new(default_pool()).unwrap();
-    let app = AppContext::from_config(config, 5, _pool.handle())
+    let pool = PreparePoolRuntime::new(default_pool()).unwrap();
+    let app = AppContext::from_config(config, 5, pool.handle())
         .await
         .unwrap();
-    // A word per id, and a template that adds `off` when reasoning is off.
     let dir = tempfile::tempdir().unwrap();
     let tokenizer = json!({"version": "1.0", "truncation": null, "padding": null,
         "added_tokens": [], "normalizer": null,
@@ -206,33 +204,91 @@ async fn chats_are_tokenized_with_atoms_reasoning_controls() {
         .load(&id, "m", "hf-test", || async { Ok(tokenizer) })
         .await
         .unwrap();
+    (app, pool)
+}
+
+/// The tokens HTTP routing prepares for a chat to `m` with `fields`.
+async fn chat_tokens(app: &AppContext, fields: &serde_json::Value) -> Option<Vec<u32>> {
+    let mut request = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+    request
+        .as_object_mut()
+        .unwrap()
+        .extend(fields.as_object().unwrap().clone());
+    let body = serde_json::to_vec(&request).unwrap();
+    let parsed = ParsedInference::parse("/v1/chat/completions", &body).unwrap();
+    let routing = IngressRouting::new(app);
+    let (_, tokens) = app
+        .prepare_pool
+        .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
+            routing.prepare(&parsed, &body, ctx)
+        })
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap()
+        .unwrap();
+    tokens
+}
+
+/// A chat is tokenized as ATOM renders it, its reasoning controls setting the
+/// tokenizer's toggle; `thinking` too, though the typed request has no such field.
+#[tokio::test]
+async fn chats_are_tokenized_with_atoms_reasoning_controls() {
+    let (app, _pool) = app_with_switched_chats().await;
     for (controls, want) in [
         (json!({}), vec![1]),
         (json!({"reasoning_effort": "none"}), vec![1, 2]),
         (json!({"thinking": {"type": "disabled"}}), vec![1, 2]),
     ] {
-        let mut request = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
-        request
-            .as_object_mut()
-            .unwrap()
-            .extend(controls.as_object().unwrap().clone());
-        let body = serde_json::to_vec(&request).unwrap();
-        let parsed = ParsedInference::parse("/v1/chat/completions", &body).unwrap();
-        let routing = IngressRouting::new(&app);
-        let (_, tokens) = app
-            .prepare_pool
-            .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
-                routing.prepare(&parsed, &body, ctx)
-            })
-            .await
-            .unwrap()
-            .wait()
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(tokens, Some(want), "{controls}");
+        assert_eq!(chat_tokens(&app, &controls).await, Some(want), "{controls}");
     }
 }
+
+/// A chat is tokenized with the `--default-chat-template-kwargs` its model's
+/// workers report, under the request's own; with none once they differ.
+#[tokio::test]
+async fn chats_are_tokenized_with_the_workers_default_kwargs() {
+    let (app, _pool) = app_with_switched_chats().await;
+    let worker = |port: u16, defaults: Option<&str>| {
+        let labels = defaults.map(|json| {
+            (
+                DEFAULT_CHAT_TEMPLATE_KWARGS_LABEL.to_string(),
+                json.to_string(),
+            )
+        });
+        Arc::new(
+            BasicWorkerBuilder::new(format!("http://127.0.0.1:{port}"))
+                .model_id("m")
+                .labels(labels.into_iter().collect())
+                .build(),
+        )
+    };
+    app.worker_registry
+        .register(worker(1, Some(r#"{"enable_thinking":false}"#)));
+    app.worker_registry
+        .register(worker(2, Some(r#"{ "enable_thinking": false }"#)));
+    for (fields, want) in [
+        (json!({}), vec![1, 2]),
+        (
+            json!({"chat_template_kwargs": {"enable_thinking": true}}),
+            vec![1],
+        ),
+        (json!({"thinking": {"type": "enabled"}}), vec![1]),
+    ] {
+        assert_eq!(chat_tokens(&app, &fields).await, Some(want), "{fields}");
+    }
+    app.worker_registry.register(Arc::new(
+        BasicWorkerBuilder::new("grpc://127.0.0.1:3")
+            .model_id("m")
+            .connection_mode(ConnectionMode::Grpc { port: None })
+            .build(),
+    ));
+    assert_eq!(chat_tokens(&app, &json!({})).await, Some(vec![1, 2]));
+    app.worker_registry.register(worker(4, None));
+    assert_eq!(chat_tokens(&app, &json!({})).await, Some(vec![1]));
+}
+
 fn json_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(

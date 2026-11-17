@@ -130,18 +130,20 @@ struct SentControls {
     response_format: Option<Value>,
 }
 
-/// The template kwargs ATOM's chat endpoint renders `request` with, but for the
-/// server's `--default-chat-template-kwargs`, which the router does not see:
-/// the request's `chat_template_kwargs`, then its `response_format` and a
-/// string `tool_choice`, then the reasoning controls as `controls` applies
-/// them. `body` is the request as sent.
+/// The template kwargs ATOM's chat endpoint renders `request` with: the
+/// server's `--default-chat-template-kwargs` (`defaults`), the request's
+/// `chat_template_kwargs` over them, then its `response_format` and a string
+/// `tool_choice`, then the reasoning controls as `controls` applies them.
+/// `body` is the request as sent.
 pub(crate) fn atom_chat_template_kwargs(
     request: &ChatCompletionRequest,
     body: &[u8],
+    defaults: HashMap<String, Value>,
     controls: &ReasoningControls,
 ) -> Result<HashMap<String, Value>, String> {
     let sent: SentControls = serde_json::from_slice(body).map_err(|e| e.to_string())?;
-    let mut kwargs = request.chat_template_kwargs.clone().unwrap_or_default();
+    let mut kwargs = defaults;
+    kwargs.extend(request.chat_template_kwargs.clone().unwrap_or_default());
     if let Some(format) = sent.response_format {
         kwargs.insert("response_format".to_string(), format);
     }

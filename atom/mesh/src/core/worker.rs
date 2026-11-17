@@ -449,6 +449,10 @@ impl Default for HealthConfig {
     }
 }
 
+/// The label holding the `--default-chat-template-kwargs` an ATOM worker's
+/// `/v1/models` card reports, as a JSON object.
+pub const DEFAULT_CHAT_TEMPLATE_KWARGS_LABEL: &str = "default_chat_template_kwargs";
+
 /// Metadata associated with a worker
 #[derive(Debug, Clone)]
 pub struct WorkerMetadata {

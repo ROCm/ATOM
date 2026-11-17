@@ -13,7 +13,10 @@ use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowRe
 use super::strip_protocol;
 use crate::{
     config::BackendType,
-    core::{steps::workflow_data::LocalWorkerWorkflowData, ConnectionMode},
+    core::{
+        steps::workflow_data::LocalWorkerWorkflowData, worker::DEFAULT_CHAT_TEMPLATE_KWARGS_LABEL,
+        ConnectionMode,
+    },
     routers::grpc::engine::worker_client_cache::GrpcClient,
 };
 
@@ -136,6 +139,12 @@ pub async fn get_server_info(url: &str, api_key: Option<&str>) -> Result<ServerI
 
 /// Get model id from OpenAI-compatible /v1/models endpoint.
 pub async fn get_openai_model_id(url: &str, api_key: Option<&str>) -> Result<String, String> {
+    let card = get_openai_model_card(url, api_key).await?;
+    Ok(card["id"].as_str().unwrap_or_default().to_string())
+}
+
+/// The first model card with an id from OpenAI-compatible /v1/models endpoint.
+async fn get_openai_model_card(url: &str, api_key: Option<&str>) -> Result<Value, String> {
     let base_url = url.trim_end_matches('/');
     let endpoint = format!("{}/v1/models", base_url);
 
@@ -165,13 +174,13 @@ pub async fn get_openai_model_id(url: &str, api_key: Option<&str>) -> Result<Str
     json.get("data")
         .and_then(|d| d.as_array())
         .and_then(|arr| {
-            arr.iter().find_map(|m| {
+            arr.iter().find(|m| {
                 m.get("id")
                     .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string())
+                    .is_some_and(|s| !s.is_empty())
             })
         })
+        .cloned()
         .ok_or_else(|| format!("No model id in /v1/models response from {}", endpoint))
 }
 
@@ -298,15 +307,28 @@ async fn discover_http_sglang(url: &str, api_key: Option<&str>) -> HashMap<Strin
     labels
 }
 
-/// Discover HTTP metadata from an OpenAI-compatible backend (vLLM) via /v1/models.
+/// Discover HTTP metadata from an OpenAI-compatible backend (vLLM, ATOM) via
+/// /v1/models: the model id, and the `--default-chat-template-kwargs` an ATOM
+/// card reports, unless it has none.
 async fn discover_http_openai(url: &str, api_key: Option<&str>) -> HashMap<String, String> {
     let mut labels = HashMap::new();
 
-    match get_openai_model_id(url, api_key).await {
-        Ok(id) if !id.is_empty() => {
-            labels.insert("model_path".to_string(), id);
+    match get_openai_model_card(url, api_key).await {
+        Ok(card) => {
+            if let Some(id) = card["id"].as_str() {
+                labels.insert("model_path".to_string(), id.to_string());
+            }
+            let defaults = &card["default_chat_template_kwargs"];
+            if defaults
+                .as_object()
+                .is_some_and(|kwargs| !kwargs.is_empty())
+            {
+                labels.insert(
+                    DEFAULT_CHAT_TEMPLATE_KWARGS_LABEL.to_string(),
+                    defaults.to_string(),
+                );
+            }
         }
-        Ok(_) => {}
         Err(e) => {
             warn!("/v1/models failed for {}: {}", url, e);
         }
@@ -386,5 +408,40 @@ impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
 
     fn is_retryable(&self, _error: &WorkflowError) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    /// An ATOM card's `--default-chat-template-kwargs` become a label, unless
+    /// there are none.
+    #[tokio::test]
+    async fn test_openai_discovery_records_the_default_chat_template_kwargs() {
+        for (card, want) in [
+            (
+                json!({"id": "m", "default_chat_template_kwargs": {"enable_thinking": false}}),
+                Some(r#"{"enable_thinking":false}"#),
+            ),
+            (json!({"id": "m", "default_chat_template_kwargs": {}}), None),
+            (json!({"id": "m"}), None),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let models = json!({"object": "list", "data": [card]});
+            let app = axum::Router::new().route(
+                "/v1/models",
+                axum::routing::get(move || async move { axum::Json(models) }),
+            );
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+            let labels = discover_http_openai(&url, None).await;
+            assert_eq!(labels.get("model_path").map(String::as_str), Some("m"));
+            let defaults = labels.get(DEFAULT_CHAT_TEMPLATE_KWARGS_LABEL);
+            assert_eq!(defaults.map(String::as_str), want);
+        }
     }
 }

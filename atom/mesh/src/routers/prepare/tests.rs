@@ -1218,8 +1218,19 @@ mod g_reasoning_controls {
     }
 
     fn kwargs(fields: Value, controls: &ReasoningControls) -> Result<Value, String> {
+        kwargs_over(json!({}), fields, controls)
+    }
+
+    /// The kwargs for a chat with `fields` on a server whose
+    /// `--default-chat-template-kwargs` are `defaults`.
+    fn kwargs_over(
+        defaults: Value,
+        fields: Value,
+        controls: &ReasoningControls,
+    ) -> Result<Value, String> {
         let (body, parsed) = chat(fields);
-        atom_chat_template_kwargs(parsed.chat().unwrap(), body.as_bytes(), controls)
+        let defaults = serde_json::from_value(defaults).unwrap();
+        atom_chat_template_kwargs(parsed.chat().unwrap(), body.as_bytes(), defaults, controls)
             .map(|kwargs| Value::Object(kwargs.into_iter().collect()))
     }
 
@@ -1329,6 +1340,89 @@ mod g_reasoning_controls {
             let fields = json!({"thinking": {"effort": effort}});
             let controls = ReasoningControls::Template(None);
             assert!(kwargs(fields, &controls).is_err(), "{effort}");
+        }
+    }
+
+    /// The server's `--default-chat-template-kwargs` come first, as ATOM merges
+    /// them: the request's kwargs and reasoning controls apply over them, under
+    /// the template's rules and V4.1's.
+    #[test]
+    fn test_server_defaults_come_before_the_request() {
+        let template = ReasoningControls::Template(Some(ReasoningToggle {
+            name: "enable_thinking",
+            off: json!(false),
+            on: json!(true),
+        }));
+        let v41 = ReasoningControls::DeepseekV41;
+        let off = json!({"enable_thinking": false});
+        let low = json!({"thinking_effort": "low"});
+        let chat_mode = json!({"thinking_mode": "chat", "reasoning_effort": 20});
+        let none = json!({"reasoning_effort": "none"});
+        for (controls, defaults, fields, want) in [
+            (
+                &template,
+                &off,
+                json!({}),
+                json!({"enable_thinking": false}),
+            ),
+            (
+                &template,
+                &off,
+                json!({"chat_template_kwargs": {"enable_thinking": true}}),
+                json!({"enable_thinking": true}),
+            ),
+            (
+                &template,
+                &off,
+                json!({"thinking": {"type": "enabled"}}),
+                json!({"enable_thinking": true}),
+            ),
+            (
+                &template,
+                &off,
+                json!({"reasoning_effort": "high"}),
+                json!({"enable_thinking": false, "thinking_effort": "high"}),
+            ),
+            (
+                &template,
+                &off,
+                json!({"reasoning_effort": "none"}),
+                json!({"enable_thinking": false}),
+            ),
+            (
+                &template,
+                &low,
+                json!({"reasoning_effort": "high"}),
+                json!({"thinking_effort": "high"}),
+            ),
+            (
+                &v41,
+                &chat_mode,
+                json!({}),
+                json!({"thinking_mode": "chat", "reasoning_effort": 20}),
+            ),
+            (
+                &v41,
+                &chat_mode,
+                json!({"reasoning_effort": "high"}),
+                json!({"thinking_mode": "thinking", "reasoning_effort": "high"}),
+            ),
+            (
+                &v41,
+                &chat_mode,
+                json!({"reasoning_effort": "none"}),
+                json!({"thinking_mode": "chat"}),
+            ),
+            (&v41, &none, json!({}), json!({"thinking_mode": "chat"})),
+            (
+                &v41,
+                &none,
+                json!({"reasoning_effort": "low"}),
+                json!({"thinking_mode": "thinking", "reasoning_effort": "low"}),
+            ),
+        ] {
+            let got = kwargs_over(defaults.clone(), fields.clone(), controls);
+            assert_eq!(got, Ok(want), "{defaults} + {fields}");
         }
     }
 
@@ -1495,7 +1589,9 @@ mod g_reasoning_controls {
             let (body, parsed) = chat(fields);
             let request = parsed.chat().unwrap();
             let controls = ReasoningControls::Template(toggle.clone());
-            let kwargs = atom_chat_template_kwargs(request, body.as_bytes(), &controls).unwrap();
+            let kwargs =
+                atom_chat_template_kwargs(request, body.as_bytes(), Default::default(), &controls)
+                    .unwrap();
             let rendered = render_chat_messages(request, &tokenizer, &kwargs).unwrap();
             assert_eq!(&rendered.text, want, "{body}");
         }

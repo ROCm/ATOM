@@ -272,16 +272,23 @@ chat template, such as DeepSeek V3.2 and V4
 need tokens, such as `cache_aware` or `round_robin`, for these models and APIs.
 
 Chats are tokenized as ATOM's `/v1/chat/completions` renders them. The template
-kwargs are the request's `chat_template_kwargs`, its `response_format` and a
-string `tool_choice`, then its `reasoning_effort` and `thinking` as ATOM applies
-them: to `thinking_effort`, and to the kwarg that switches the template's
-reasoning, which the router finds as each tokenizer registers, as ATOM does at
-startup. A local DeepSeek V4.1 checkpoint that ships `encoding/encoding.py`,
-which ATOM renders with that encoder, gets the kwargs ATOM passes it, under
-V4.1's effort aliases and rules. The router does not see the workers'
-`--default-chat-template-kwargs`, so with `--kv-events` a chat's blocks match
-only as far as those defaults leave its render unchanged; GLM-5.2's
-`{"enable_thinking": false}` changes its first block.
+kwargs are the workers' `--default-chat-template-kwargs`, the request's
+`chat_template_kwargs` over them, its `response_format` and a string
+`tool_choice`, then its `reasoning_effort` and `thinking` as ATOM applies them:
+to `thinking_effort`, and to the kwarg that switches the template's reasoning,
+which the router finds as each tokenizer registers, as ATOM does at startup. A
+local DeepSeek V4.1 checkpoint that ships `encoding/encoding.py`, which ATOM
+renders with that encoder, gets the kwargs ATOM passes it, under V4.1's effort
+aliases and rules.
+
+An ATOM worker reports its `--default-chat-template-kwargs` in its `/v1/models`
+card, which the router reads when the worker registers and keeps as the
+worker's `default_chat_template_kwargs` label; a worker's configured labels can
+set it too. A worker that reports none has none. When the HTTP workers serving
+a model's chats report different ones, the router warns once and renders the
+model's chats without any, as no one render is every worker's; with
+`--kv-events`, a chat's blocks then match only on the workers those defaults
+leave its render unchanged for.
 
 ## Reliability
 
