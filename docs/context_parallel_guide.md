@@ -440,9 +440,12 @@ LSE through two 16-bit halves of a bf16 buffer).
 Byte counts are about the same; what `a2a` saves is one collective's launch and
 sync.
 
-`mailbox` needs aiter with `aiter.ops.flydsl.dcp_mailbox` (aiter PR #6972 and
-#7943, in main from `78a14ae5d`) and FlyDSL >= 0.5.0; without them startup
-fails (set `comm_backend` to `a2a`). When the peer memory cannot be allocated
+`mailbox` needs aiter `78a14ae5d` or later (aiter PR #6972 and #7943) and
+FlyDSL >= 0.5.0. That is required, not detected: an aiter without
+`aiter.ops.flydsl.dcp_mailbox` or a FlyDSL older than 0.5.0 fails at startup
+(set `comm_backend` to `a2a`), and an aiter from `d223b16cf` up to `78a14ae5d`
+runs the earlier tagged mailbox, without the agreed allocation fallback. When
+the peer memory cannot be allocated
 or mapped (e.g. a DCP group spanning nodes), it logs a warning once and merges
 with `a2a` on every rank. Plugin mode takes `a2a` at startup, for `auto` and an
 explicit `mailbox` alike. Only graph-captured decode steps take it: an eager
