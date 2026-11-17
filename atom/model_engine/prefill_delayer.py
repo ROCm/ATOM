@@ -806,8 +806,9 @@ class PrefillDelayer:
 
         # Initial ramp, ahead of every admit policy: every rank fills target_fill
         # of a chunk from its free seq slots, so any wait (decode interval,
-        # coalescer, rent-or-buy) would only leave those slots empty. The decode interval
-        # armed by these prefills applies from the first decision after the ramp.
+        # coalescer, rent-or-buy) would only leave those slots empty. The decode
+        # interval armed by these prefills applies from the first decision after
+        # the ramp.
         if self.ramp_active and n_full == self.dp_size:
             return self._fire("ramp", g_pending)
 
