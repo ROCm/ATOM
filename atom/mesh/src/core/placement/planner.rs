@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tracing::debug;
 
-use super::policy_apply::apply_policy;
+use super::policy_apply::{apply_policy, PlacedWorker};
 use super::traits::{PdPlanner, PolicySource, WorkerSource};
 use super::types::{PlacementError, PlacementPlan, Protocol, RequestDescriptor};
 use crate::core::{ConnectionMode, HashRing, Worker, WorkerType};
@@ -46,9 +46,12 @@ fn on_decode_rank(prefill: Vec<Arc<dyn Worker>>, decode: &dyn Worker) -> Vec<Arc
     }
 }
 
-/// Prompt tokens charged to the worker that prefills `req`.
-fn prompt_tokens(req: &RequestDescriptor<'_>) -> usize {
-    req.tokens.map_or(0, <[u32]>::len)
+/// Prompt tokens charged to `placed`, which prefills `req`: the policy's estimate, or
+/// the whole prompt.
+fn prefill_tokens(placed: &PlacedWorker, req: &RequestDescriptor<'_>) -> usize {
+    placed
+        .prefill_tokens
+        .unwrap_or_else(|| req.tokens.map_or(0, <[u32]>::len))
 }
 
 pub struct DefaultPlanner {
@@ -101,11 +104,15 @@ impl DefaultPlanner {
         let chosen = apply_policy(&candidates, policy.as_ref(), req, hash_ring).await?;
 
         Ok(PlacementPlan::Single {
-            worker: chosen,
             policy_name: policy.name(),
             // The router releases the charge at the response's first frame, which a
             // non-streaming response sends only after decoding.
-            prefill_tokens: if req.stream { prompt_tokens(req) } else { 0 },
+            prefill_tokens: if req.stream {
+                prefill_tokens(&chosen, req)
+            } else {
+                0
+            },
+            worker: chosen.worker,
         })
     }
 
@@ -138,7 +145,7 @@ impl DefaultPlanner {
                 hash_ring.clone(),
             )
             .await?;
-            let prefill_candidates = on_decode_rank(prefill_candidates, decode.as_ref());
+            let prefill_candidates = on_decode_rank(prefill_candidates, decode.worker.as_ref());
             let prefill =
                 apply_policy(&prefill_candidates, prefill_policy.as_ref(), req, hash_ring).await?;
             (prefill, decode)
@@ -157,19 +164,19 @@ impl DefaultPlanner {
         debug!(
             stage = "placement.pair.selected",
             model_id = req.model_id.unwrap_or(""),
-            prefill_url = prefill.url(),
-            decode_url = decode.url(),
+            prefill_url = prefill.worker.url(),
+            decode_url = decode.worker.url(),
             prefill_policy = prefill_policy.name(),
             decode_policy = decode_policy.name(),
             "prefill and decode workers selected"
         );
 
         Ok(PlacementPlan::Pair {
-            prefill,
-            decode,
+            prefill_tokens: prefill_tokens(&prefill, req),
+            prefill: prefill.worker,
+            decode: decode.worker,
             prefill_policy: prefill_policy.name(),
             decode_policy: decode_policy.name(),
-            prefill_tokens: prompt_tokens(req),
         })
     }
 }

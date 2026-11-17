@@ -9,7 +9,7 @@ use tracing::{debug, info, warn};
 /// When the first worker of a new model is added, it determines the policy for that model.
 /// All subsequent workers of the same model use the established policy.
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
-use super::{CacheAwarePolicy, LoadBalancingPolicy, PolicyFactory};
+use super::{AgenticPolicy, CacheAwarePolicy, LoadBalancingPolicy, PolicyFactory};
 use crate::{config::types::PolicyConfig, core::Worker, kv_index::PrefixMatchProvider};
 
 /// Registry for managing model-to-policy mappings
@@ -64,9 +64,14 @@ impl PolicyRegistry {
     }
 
     fn hand_kv_events(&self, policy: &Arc<dyn LoadBalancingPolicy>) {
-        let cache_aware = policy.as_any().downcast_ref::<CacheAwarePolicy>();
-        if let (Some(provider), Some(cache_aware)) = (self.kv_events.get(), cache_aware) {
+        let Some(provider) = self.kv_events.get() else {
+            return;
+        };
+        let policy = policy.as_any();
+        if let Some(cache_aware) = policy.downcast_ref::<CacheAwarePolicy>() {
             cache_aware.set_kv_events(provider.clone());
+        } else if let Some(agentic) = policy.downcast_ref::<AgenticPolicy>() {
+            agentic.set_kv_events(provider.clone());
         }
     }
 
@@ -642,5 +647,43 @@ mod tests {
         assert!(!registry
             .on_worker_added("n", Some("round_robin"))
             .wants_tokens());
+    }
+
+    /// Every worker holds the whole prompt.
+    #[derive(Debug)]
+    struct AllHit;
+
+    impl PrefixMatchProvider for AllHit {
+        fn match_workers(&self, tokens: &[u32], workers: &[Arc<dyn Worker>]) -> Vec<Option<u32>> {
+            vec![Some(tokens.len() as u32); workers.len()]
+        }
+    }
+
+    #[tokio::test]
+    async fn kv_events_reach_every_agentic_policy() {
+        let registry = PolicyRegistry::new(PolicyConfig::Agentic {
+            request_token_equivalent: 512,
+            eviction_interval_secs: 60,
+            max_tree_size: 500,
+        });
+        registry.set_prefill_policy(Arc::new(AgenticPolicy::default()));
+        registry.set_kv_events(Arc::new(AllHit));
+        let model = registry.on_worker_added("m", Some("agentic"));
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(
+            crate::core::BasicWorkerBuilder::new("http://w:8000").build(),
+        )];
+        let tokens = [1, 2, 3];
+        let info = super::super::SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        for policy in [
+            registry.get_default_policy(),
+            registry.get_prefill_policy(),
+            model,
+        ] {
+            let (_, decision) = policy.select_with_decision(&workers, &info).await;
+            assert_eq!(decision.branch, "hit", "{}", policy.name());
+        }
     }
 }
