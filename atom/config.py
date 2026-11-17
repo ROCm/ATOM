@@ -2018,7 +2018,10 @@ DRAFT_DTYPE_TRANSPORTS = frozenset({"mooncake", "mooncake_store", "lmcache_offlo
 def _transports_key_draft_dtype(config) -> bool:
     from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 
-    leaves = KVConnectorFactory.leaf_connectors(config)
+    try:
+        leaves = KVConnectorFactory.leaf_connectors(config)
+    except ValueError:  # an unknown connector: refused when it is built
+        return False
     return bool(leaves) and all(name in DRAFT_DTYPE_TRANSPORTS for name, _ in leaves)
 
 

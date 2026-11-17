@@ -2555,8 +2555,8 @@ models:
               MOONCAKE_STORE: "1"
               # Both NUMA nodes' DRAM, one single-NIC owner per NUMA1 NIC
               # (an ionic NIC registers at most 832 GiB).
-              MOONCAKE_STORE_OWNERS: "0:576:rdma4;0:576:rdma5;1:576:rdma6;1:576:rdma7"
-              MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: "${ATOMESH_MODEL_ROOT}/.huggingface/hub/models--amd--MiniMax-M3.1-Flash-Quark-MXFP4"
+              MOONCAKE_STORE_OWNERS: "0:560:rdma4;0:560:rdma5;1:560:rdma6;1:560:rdma7"
+              MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: "${ATOMESH_MODEL_ROOT}"
               MOONCAKE_STORE_COMPACT_TIMEOUT: "1800"
               OFFLOAD_PROFILE: "1"
               OFFLOAD_MIN_LOAD_TOKENS: "0"

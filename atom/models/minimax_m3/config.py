@@ -13,7 +13,10 @@ def _connectors_move_nvfp4_pages(config) -> bool:
     """Whether every configured transport can move NVFP4 pages."""
     from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 
-    leaves = KVConnectorFactory.leaf_connectors(config)
+    try:
+        leaves = KVConnectorFactory.leaf_connectors(config)
+    except ValueError:  # an unknown connector: refused by the caller
+        return False
     return bool(leaves) and all(name in NVFP4_PAGE_CONNECTORS for name, _ in leaves)
 
 

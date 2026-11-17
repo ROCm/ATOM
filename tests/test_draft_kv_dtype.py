@@ -163,20 +163,18 @@ def test_an_mtp_draft_shares_the_targets_pool(monkeypatch):
         _llama(monkeypatch, kv_cache_dtype="fp8", speculative_config=spec)
 
 
-def test_a_draft_dtype_beside_the_targets_cannot_share_the_offload_namespace(
-    monkeypatch,
-):
-    # the offload namespace keys the target's KV dtype alone
+def test_an_own_pool_draft_dtype_rides_transports_that_key_it(monkeypatch):
+    # the offload namespaces hash the speculative config; Mooncake P/D pairs unit specs
+    for kvt in (OFFLOAD, {"kv_connector": "mooncake", "kv_role": "kv_producer"}):
+        spec = _dspark_spec(kv_cache_dtype="fp8")
+        _llama(monkeypatch, kv_transfer_config=kvt, speculative_config=spec)
+        assert spec.draft_kv_dtype == "fp8"
     with pytest.raises(
         ValueError,
         match="draft KV dtype fp8 differs.*--spec-decode-kv-cache-dtype bf16",
     ):
         _llama(
             monkeypatch,
-            kv_transfer_config=OFFLOAD,
+            kv_transfer_config={"kv_connector": "moriio", "kv_role": "kv_producer"},
             speculative_config=_dspark_spec(kv_cache_dtype="fp8"),
         )
-    # the remedy it names works
-    spec = _dspark_spec(kv_cache_dtype="bf16")
-    _llama(monkeypatch, kv_transfer_config=OFFLOAD, speculative_config=spec)
-    assert spec.draft_kv_dtype == "bf16"

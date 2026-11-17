@@ -276,6 +276,7 @@ def test_other_fp4_transports_still_refuse(kw):
 
 
 def test_an_fp8_dspark_draft_rides_an_nvfp4_mooncake_transfer(monkeypatch):
+    pytest.importorskip("triton")  # SpeculativeConfig resolves the rejection sampler
     from tests.test_minimax_m3_mxfp4_cache import _dspark_spec
 
     spec = _dspark_spec()
