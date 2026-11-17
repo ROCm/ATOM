@@ -1726,6 +1726,7 @@ class ModelRunner:
                 int(self.drafter.model.vocab_size),
                 config.torch_dtype,
                 self.device,
+                block=lossless.block_verify,
             )
         elif envs.ATOM_SPEC_LOSSLESS_SAMPLING:
             # Without a drafter there is no draft to sample, and a DSpark

@@ -204,6 +204,9 @@ class DSparkLossless:
                 "draft_verify_q_row_base": self.verify_q_row_base,
             }
         )
+        # Verify a sampled request's drafts as one block, where the flavor
+        # says so (`DSparkDraftModel.lossless_block_verify`).
+        self.block_verify = bool(drafter.model.lossless_block_verify)
         self.staging = DraftQStaging(
             DraftQSlots(q_slots, t),
             seed=self.seed.np,
@@ -275,6 +278,7 @@ class DSparkLossless:
             temperatures,
             top_ks,
             top_ps,
+            block=self.block_verify,
         )
 
     def clear_destinations(self) -> None:

@@ -502,6 +502,12 @@ class DSparkDraftModel(nn.Module):
     #: ``DSparkProposer`` binds sampling buffers only where it is set.
     supports_lossless_draft = False
 
+    #: Once lossless sampling arms, verify a sampled request's drafts as one
+    #: block (Sun et al. 2024; `ratio_verify`) rather than token by token: the
+    #: same output law, never fewer accepted drafts in expectation. A class
+    #: flag beside ``supports_lossless_draft``, set where it has been run.
+    lossless_block_verify: ClassVar[bool] = False
+
     #: The buffers the block sampler draws into, set once lossless speculative
     #: sampling arms (`DSparkLossless.bind_target`), before any warmup or
     #: capture; None keeps the greedy block sampler, as does
