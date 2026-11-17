@@ -662,21 +662,24 @@ class TestPPLoopPublication:
     REMOVED = BlockRemoved(block_hashes=[1], medium=MEDIUM_GPU)
 
     @staticmethod
-    def _run(loop, steps, *, forward=True, publish=None):
+    def _run(loop, steps, *, work="forward", publish=None, calls=None):
         """Run a PP stage's `loop` for one iteration per entry of `steps`: the
         events the iteration's work logs, ending, if the work fails, with the
-        exception it raises. The head's work is a forward, or idle KV-transfer
-        progress without `forward`. Returns what reached the publisher, with the
-        phase it reached it in, and the events left in the log."""
+        exception it raises. The head's `work` is a forward, idle KV-transfer
+        progress (`"kv"`), or none. Returns what reached the publisher, with the
+        phase it reached it in, and the events left in the log; `calls` gets the
+        phase of every `publish_kv_events` call."""
         from aiter_stub import stubbed_aiter
 
         with stubbed_aiter():
+            from atom.model_engine.engine_core import EngineCore
             from atom.model_engine.pp_engine_core import PPEngineCoreProc
 
         log, published, phase = [], [], ["serving"]
+        calls = [] if calls is None else calls
         pending, left = iter(steps), iter(range(len(steps), -1, -1))
 
-        def work():
+        def do_work():
             for item in next(pending):
                 if isinstance(item, Exception):
                     raise item
@@ -693,20 +696,27 @@ class TestPPLoopPublication:
             return phase[0] == "shutdown"
 
         def recv_metadata(**_):
-            work()
+            do_work()
 
         def record(events):
             published.append((phase[0], events))
+
+        def publish_kv_events():
+            calls.append(phase[0])
+            Scheduler.publish_kv_events(scheduler)
+
+        def run_then_publish(step):
+            return EngineCore._run_then_publish_kv_events(proc, step)
 
         scheduler = SimpleNamespace(
             block_manager=SimpleNamespace(take_events=take_events),
             kv_event_publisher=SimpleNamespace(publish=publish or record),
             heartbeat_throughput=lambda _: None,
-            is_finished=lambda: not forward,
+            is_finished=lambda: work != "forward",
             shutdown_kv_events=lambda: None,
             close_kv_connector=lambda: None,
+            publish_kv_events=publish_kv_events,
         )
-        scheduler.publish_kv_events = lambda: Scheduler.publish_kv_events(scheduler)
         proc = SimpleNamespace(
             utility_queue=None,
             utility_handler=SimpleNamespace(
@@ -715,9 +725,10 @@ class TestPPLoopPublication:
             pull_and_process_input_queue=shutdown_requested,
             _is_engine_held=lambda: False,
             _in_flight=(),
-            _pp_head_step=work,
-            has_pending_kv_work=lambda: not forward,
-            _advance_idle_kv_transfer=work,
+            _pp_head_step=do_work,
+            _run_then_publish_kv_events=run_then_publish,
+            has_pending_kv_work=lambda: work == "kv",
+            _advance_idle_kv_transfer=do_work,
             _drain_kv_work_at_exit=lambda: None,
             kv_transfer_enabled=False,
             pp_transport=SimpleNamespace(recv_metadata=recv_metadata),
@@ -739,15 +750,20 @@ class TestPPLoopPublication:
 
     def test_head_publishes_after_idle_kv_transfer_progress(self):
         removed = self.REMOVED
-        published, left = self._run("_head_busy_loop", [[removed]], forward=False)
+        published, left = self._run("_head_busy_loop", [[removed]], work="kv")
         assert published == [("serving", [removed])]
         assert left == []
+
+    def test_head_publishes_nothing_on_an_idle_spin(self):
+        calls = []
+        self._run("_head_busy_loop", [[]] * 1000, work=None, calls=calls)
+        assert calls == ["shutdown"]
 
     def test_a_publisher_error_is_logged_and_masks_no_step_error(self, caplog):
         def fail(events):
             raise RuntimeError("publisher down")
 
-        failed = "KV event publish in PP head loop failed"
+        failed = "KV event publish after engine step failed"
         self._run("_head_busy_loop", [[self.STORED], [self.STORED]], publish=fail)
         assert caplog.text.count(failed) == 2
         with pytest.raises(ValueError, match="step failed"):

@@ -94,18 +94,10 @@ class PPEngineCoreProc(EngineCore):
                     self._report_held_kv_work()
                     time.sleep(HELD_POLL_S)
                     continue
-                try:
-                    if self._in_flight or not self.scheduler.is_finished():
-                        self._pp_head_step()
-                    elif self.has_pending_kv_work():
-                        self._advance_idle_kv_transfer()
-                finally:
-                    # Swallow publisher errors so they cannot mask an exception
-                    # from the step itself.
-                    try:
-                        self.scheduler.publish_kv_events()
-                    except Exception:
-                        logger.exception("KV event publish in PP head loop failed")
+                if self._in_flight or not self.scheduler.is_finished():
+                    self._run_then_publish_kv_events(self._pp_head_step)
+                elif self.has_pending_kv_work():
+                    self._run_then_publish_kv_events(self._advance_idle_kv_transfer)
         finally:
             self._drain_kv_work_at_exit()
             try:
