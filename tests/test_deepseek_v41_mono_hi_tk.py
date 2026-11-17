@@ -485,3 +485,42 @@ def test_device_build_kernargs_name_the_plans_buffers():
         addr["param:{S+0}.window_kv.kv_norm"],
         b.kv.data_ptr(),
     )
+
+
+def test_device_build_buffers_ignore_the_process_defaults():
+    """A ModelRunner process defaults to bf16 (and its GPU): the build's buffers keep their own dtypes (a bf16 rope
+    read as f32 made every q row wrong there), and ``load_toktab`` restores the caller's defaults.
+    """
+    from atom.models.deepseek_v41.mono.hi.pd import tkworker as TW
+    from atom.models.deepseek_v41.mono.hi.tk import toktab_device as TD
+
+    before = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        b = object.__new__(TD.Builder)
+        b.device = torch.device("cpu")
+        b._alloc()
+        assert b.rope.dtype == torch.float32 and b.rope.shape == (16, 64)
+        assert bool((b.rope[:, :32] == 1).all() and (b.rope[:, 32:] == 0).all())
+        assert (b.P.dtype, b.hcA.dtype, b.pos.dtype) == (
+            torch.float32,
+            torch.float32,
+            torch.int32,
+        )
+        assert (
+            b.P[:, 0].tolist() == [1.0] * TD.ROWS and float(b.P[:, 1:].abs().sum()) == 0
+        )
+        seen = []
+
+        def fake(*a):
+            seen.append(torch.get_default_dtype())
+
+        orig = TW._load_toktab
+        TW._load_toktab = fake
+        try:
+            TW.load_toktab(None, 0)
+        finally:
+            TW._load_toktab = orig
+        assert seen == [torch.float32] and torch.get_default_dtype() == torch.bfloat16
+    finally:
+        torch.set_default_dtype(before)

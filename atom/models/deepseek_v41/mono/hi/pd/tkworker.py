@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import os
 import time
+from contextlib import contextmanager
 from datetime import timedelta
 
 
@@ -141,6 +142,26 @@ def load_toktab(
     """
     if build not in TOKTAB_BUILDS:
         raise ValueError(f"toktab build: one of {TOKTAB_BUILDS}, not {build!r}")
+    with _plain_defaults():
+        _load_toktab(tk, rank, toktab_dir, ckpt, group, log, build, table)
+
+
+@contextmanager
+def _plain_defaults():
+    """torch's own defaults (f32, CPU) for the table build: a ModelRunner sets bf16 on its GPU, and every tensor the
+    build makes without naming them must not change with the process."""
+    import torch
+
+    dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float32)
+    try:
+        with torch.device("cpu"):
+            yield
+    finally:
+        torch.set_default_dtype(dtype)
+
+
+def _load_toktab(tk, rank, toktab_dir, ckpt, group, log, build, table) -> None:
     path = os.path.join(toktab_dir, f"rank{rank}.pt") if toktab_dir else None
     tabs = None
     if build == "gpu":

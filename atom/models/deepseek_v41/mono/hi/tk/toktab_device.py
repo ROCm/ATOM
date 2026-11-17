@@ -59,6 +59,11 @@ class Builder:
         self.device = torch.device(device)
         with torch.cuda.device(self.device):
             self.launcher = codeobj.Launcher(table, [MHC, QKV, KVX])
+        self._alloc()
+
+    def _alloc(self) -> None:
+        """The buffers and workspaces on ``self.device``, every dtype explicit (a ModelRunner process's defaults are
+        bf16 on its GPU: a bf16 rope read as f32 broke the q table there)."""
 
         def z(*shape, dtype):
             return torch.zeros(shape, dtype=dtype, device=self.device)
@@ -75,9 +80,9 @@ class Builder:
         )
         self.ws_m = z(alloc.WS_BYTES["ws_mhc"], dtype=u8)
         self.ws_q = z(alloc.WS_BYTES["ws_qkv"], dtype=u8)
-        self.rope = torch.cat([torch.ones(16, 32), torch.zeros(16, 32)], 1).to(
-            self.device
-        )
+        # TileRT's rope_id: 16 positions of 32 cos (1) | 32 sin (0), f32
+        self.rope = torch.ones(16, 64, dtype=torch.float32, device=self.device)
+        self.rope[:, 32:] = 0.0
         self.pos = z(S, dtype=torch.int32)
         self.qr, self.q = z(S, alloc.Q_LORA, dtype=bf16), z(
             S, alloc.HEADS_LOCAL, alloc.HEAD_DIM, dtype=bf16
@@ -166,16 +171,17 @@ class Builder:
         the scope's ``SLOTS`` -> device tensor, ``embed`` the device embedding [129280, 5120] bf16.
         """
         dev = self.device
-        tokens = torch.arange(alloc.VOCAB) if tokens is None else tokens
+        tokens = (
+            torch.arange(alloc.VOCAB, device="cpu") if tokens is None else tokens.cpu()
+        )
         n = tokens.numel()
         if out is None:
             out = [torch.empty(n, alloc.HEADS_LOCAL * alloc.HEAD_DIM, dtype=torch.bfloat16, device=dev),
                    torch.empty(n, alloc.HEAD_DIM, dtype=torch.bfloat16, device=dev),
                    torch.empty(n, 24, dtype=torch.float32, device=dev)]  # fmt: skip
         tq, tkv, thc = out
-        ids = torch.zeros(
-            -(-n // ROWS) * ROWS, dtype=torch.long
-        )  # the last chunk padded with token 0
+        # the last chunk padded with token 0
+        ids = torch.zeros(-(-n // ROWS) * ROWS, dtype=torch.long, device="cpu")
         ids[:n] = tokens
         ids = ids.to(dev)
         launches = self._launches({k: v for k, v in p.items()})
