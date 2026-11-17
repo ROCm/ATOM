@@ -525,5 +525,5 @@ class ParallelLMHead(VocabParallelEmbedding):
         return self._dp_sharded_logits(x, "argmax")
 
     def local_logits(self, x: torch.Tensor) -> torch.Tensor:
-        """Full-vocab logits off this TP-1 rank's own weight, no collective."""
+        """Full-vocab logits from the replicated TP-1 weight, no collective."""
         return tgemm.mm(x, self.weight, self.bias)

@@ -102,6 +102,7 @@ def test_postprocess_submits_prefill_or_final_broadcast_counts(
         forward_done_event=mock.Mock(),
         _served=None,
         structured_output=None,
+        dp_argmax_head=None,
     )
     with pytest.raises(StatusSubmitted):
         runner_module.ModelRunner.postprocess(
@@ -176,6 +177,7 @@ def test_a_filtered_batch_reaches_one_law_for_every_draw(
         drafter=drafter,
         _served=None,
         structured_output=None,
+        dp_argmax_head=None,
     )
     runner.sampler.sample_verification_tokens = mock.Mock(
         return_value=torch.zeros(bs, dtype=torch.int32)

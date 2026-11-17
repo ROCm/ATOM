@@ -15,12 +15,16 @@ from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from functools import partial, wraps
-from typing import Any, ClassVar, NamedTuple
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 import numpy as np
 import torch
 import torch.profiler as torch_profiler
 import tqdm
+
+if TYPE_CHECKING:
+    from atom.model_ops.embed_head import ParallelLMHead
+
 from aiter import destroy_dist_env, init_dist_env
 from aiter.dist.parallel_state import (
     get_dp_group,
@@ -809,7 +813,7 @@ class ModelRunner:
     # the target's launch (`prepare_model`).
     compute_head: Callable | None = None
     # The LM head whose greedy ids a decode step takes (`_head_output`).
-    dp_argmax_head = None
+    dp_argmax_head: "ParallelLMHead | None" = None
     spec_status_deferred = False
 
     def __init__(self, rank: int, config: Config):
@@ -1039,20 +1043,7 @@ class ModelRunner:
         # The installed model's own head output, where it has one: its
         # forward's logits, or a verify's token ids and verdict (`_head_output`).
         self.compute_head = getattr(self.model, "compute_head", None)
-        if envs.ATOM_DP_MAIN_ARGMAX:
-            from atom.model_ops.embed_head import ParallelLMHead
-
-            heads = [m for m in self.model.modules() if isinstance(m, ParallelLMHead)]
-            if (
-                self.compute_head is None
-                and getattr(self, "drafter", None) is None
-                and len(heads) == 1
-            ):
-                self.dp_argmax_head = heads[0]
-            logger.info(
-                "ATOM_DP_MAIN_ARGMAX: on=%s (needs one LM head, no drafter)",
-                self.dp_argmax_head is not None,
-            )
+        self._init_dp_argmax_head()
         # A model that can run a whole decode step itself (sampling and
         # verification included); see run_model.
         self._step_override = (
@@ -1096,6 +1087,28 @@ class ModelRunner:
                     else "default"
                 ),
             )
+
+    def _init_dp_argmax_head(self):
+        self.dp_argmax_head = None
+        if not envs.ATOM_DP_MAIN_ARGMAX:
+            return
+
+        from atom.model_ops.embed_head import ParallelLMHead
+
+        heads = [m for m in self.model.modules() if isinstance(m, ParallelLMHead)]
+        if (
+            self.compute_head is None
+            and getattr(self, "drafter", None) is None
+            and len(heads) == 1
+            # Subclasses such as V4's ParallelHead need the preprocessing in
+            # model.compute_logits before projecting the residual to logits.
+            and type(heads[0]) is ParallelLMHead
+        ):
+            self.dp_argmax_head = heads[0]
+        logger.info(
+            "ATOM_DP_MAIN_ARGMAX: on=%s (needs one base ParallelLMHead, no drafter)",
+            self.dp_argmax_head is not None,
+        )
 
     def poll_forward_metrics(self):
         if self.gpu_forward_metrics is not None:
