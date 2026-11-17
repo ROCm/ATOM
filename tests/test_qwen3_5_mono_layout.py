@@ -271,6 +271,64 @@ def test_bf16_gemm_rules_match_aiters_tuned_picks(weights):
     assert bf16_gemm_refusal(Q35Config(weights=weights)) is None
 
 
+@pytest.mark.parametrize("weights", ["fp8", "mxfp4", "mxfp4_attnfp8"])
+def test_every_per_token_fp8_gemm_the_kernel_follows_is_listed(weights):
+    """The per-token FP8 checkpoint's projections at their TP 4 shard shape (N as ATOM pads it) and the
+    epilogue order the kernel follows; the other checkpoints have none."""
+    got = {
+        name: (n, k, order)
+        for name, n, k, order in layout.ptpc_gemms(Q35Config(weights=weights))
+    }
+    want = {}
+    if weights == "mxfp4_attnfp8":
+        want = {
+            "in_proj_qkvzba": (5248, 4096, "w_x"),
+            "qkv_proj": (4608, 4096, "w_x"),
+            "out_proj": (4096, 2048, "x_w"),
+            "o_proj": (4096, 2048, "x_w"),
+        }
+    assert got == want
+
+
+@pytest.mark.parametrize(
+    "pick, order",
+    [
+        (None, "w_x"),
+        ({"libtype": "ck", "splitK": 0, "kernelName": "a8w8_bpreshuffle_x"}, "w_x"),
+        (
+            {
+                "libtype": "flydsl",
+                "splitK": 0,
+                "kernelName": "flydsl_bpreshuflle_16x32x1024_F8_F8_B16_0x1x0x1_default",
+            },
+            "x_w",
+        ),
+    ],
+)
+def test_an_aiter_bpreshuffle_pick_reads_as_its_epilogue_order(pick, order):
+    assert layout.aiter_ptpc_order(pick) == order
+
+
+def test_an_unknown_bpreshuffle_pick_is_not_followed():
+    pick = {
+        "libtype": "flydsl",
+        "splitK": 2,
+        "kernelName": "flydsl_bpreshuflle_16x32x1024_x",
+    }
+    assert layout.aiter_ptpc_order(pick)[0] == "unknown"
+
+
+def test_per_token_fp8_gemm_orders_match_aiters_tuned_picks():
+    """The installed aiter's bpreshuffle picks for the per-token checkpoint's projections run the
+    epilogue orders the kernel follows (needs its gfx950 tuned configs, so a GPU)."""
+    pytest.importorskip("aiter.ops.gemm_op_a8w8")
+    if not torch.cuda.is_available():
+        pytest.skip("aiter's tuned config lookup reads the GPU's CU count")
+    from atom.models.qwen3_5.mono.runner import ptpc_gemm_refusal
+
+    assert ptpc_gemm_refusal(Q35Config(weights="mxfp4_attnfp8")) is None
+
+
 def test_every_launch_width_has_its_bf16_gemm_rule():
     """A launch's rows are the M baseline ATOM's GEMMs run at (ATOM pads the step before the model sees
     it): every width the kernel launches has its rounding rule."""

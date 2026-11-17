@@ -109,7 +109,8 @@ def mixer_defs(ctx):
         matrix runs W8A8 (aiter's blockscale GEMM): the input FP8 per 1x128, each 128-K block's partial
         times ``a_scale * w_scale``. An FP8 matrix of the MXFP4 checkpoint (``MX``) is BF16 there,
         row-major as ATOM holds it. A per-token checkpoint's (``PTPC``) is FP8 per channel: the input FP8
-        per token, one f32 sum over K, then ``(sum * w_scale[row]) * x_scale`` (aiter's CK bpreshuffle
+        per token, f32 sums over K (128-K MFMA blocks, the waves' partials in order), then ``(sum * w_scale[row])
+        * x_scale`` (aiter's CK bpreshuffle
         epilogue), ``sc`` the per-row scales; its rows start at ``row0`` of ``w`` (a merged projection).
         ``prefetch(s, row)`` (every thread, s clamped) issues the epilogue's loads before the GEMM; its
         result is the epilogue's fourth argument.

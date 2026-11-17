@@ -177,9 +177,9 @@ class Qwen35MonoDraftRunner(Qwen35MonoDecodeRunner):
         return t is not None and self.by_t[t].prepare(rows)
 
     def prebuild(self) -> None:
-        """Every width a draft step can take, built now (collective, at install): ATOM runs the draft
-        eagerly, so a width first met on a serving step would stall it for its compile and peer
-        handshake."""
+        """Every width a draft step can take, built now (collective, at install): ATOM runs draft step 0
+        eagerly (and captures steps 1.. at warm-up), so a width first met on a serving step would stall it
+        for its compile and peer handshake."""
         for bs in range(1, MAX_TOKENS // self.T + 1):
             self.by_t[self.T].prepare(bs * self.T)
             self.by_t[1].prepare(bs)

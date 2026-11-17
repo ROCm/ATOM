@@ -130,6 +130,53 @@ def bf16_gemms(cfg) -> list[tuple[str, int, int, str | None]]:
     return gemms
 
 
+def ptpc_gemms(cfg) -> list[tuple[str, int, int, str]]:
+    """Baseline ATOM's per-token FP8 GEMMs (aiter's ``gemm_a8w8_bpreshuffle``, the MXFP4-AttnFP8
+    checkpoint's projections), as (name, N as ATOM pads it to 128, K, the epilogue order the kernel follows:
+    "w_x" ``(acc * w_scale) * x_scale``, "x_w" ``(acc * x_scale) * w_scale``) for a ``Q35Config`` rank.
+    """
+    if cfg.proj_kind != "ptpc":
+        return []
+
+    def r128(n):
+        return -(-n // 128) * 128
+
+    return [
+        (
+            "in_proj_qkvzba",
+            r128(cfg.conv_dim + cfg.value_dim + 2 * cfg.hv),
+            cfg.hidden,
+            "w_x",
+        ),
+        (
+            "qkv_proj",
+            r128(cfg.local_heads * 2 * cfg.head_dim + 2 * cfg.head_dim),
+            cfg.hidden,
+            "w_x",
+        ),
+        ("out_proj", cfg.hidden, cfg.value_dim, "x_w"),
+        ("o_proj", cfg.hidden, cfg.local_heads * cfg.head_dim, "x_w"),
+    ]
+
+
+def aiter_ptpc_order(pick: dict | None) -> str | tuple:
+    """The epilogue order of an aiter a8w8 bpreshuffle config ``pick`` (None: untuned, its default CK
+    kernel): "w_x" (CK), "x_w" (FlyDSL's 16x32x1024 without split-K), else ``("unknown", pick)``.
+    """
+    if not pick:
+        return "w_x"
+    name = str(pick.get("kernelName") or "")
+    if pick.get("libtype") == "ck" and int(pick.get("splitK") or 0) == 0:
+        return "w_x"
+    if (
+        pick.get("libtype") == "flydsl"
+        and name.startswith("flydsl_bpreshuflle_16x32x1024_")
+        and int(pick.get("splitK") or 0) == 0
+    ):
+        return "x_w"
+    return ("unknown", pick.get("libtype"), name, pick.get("splitK"))
+
+
 def aiter_bf16_rule(pick: dict | None) -> tuple:
     """The partial-sum rounding (a ``BF16_GEMM_RULES`` value) of an aiter tuned_gemm config ``pick``
     (``get_GEMM_A16W16_config``; None: untuned, torch). A FlyDSL pick whose name does not read as one

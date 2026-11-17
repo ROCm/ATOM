@@ -33,9 +33,11 @@ from atom.models.qwen3_5.mono.layout import (
     FLYDSL_MAX_PARTS,
     TL_POINTS,
     aiter_bf16_rule,
+    aiter_ptpc_order,
     bf16_gemms,
     layout,
     pa_splits,
+    ptpc_gemms,
     router_rows,
     shape_dims,
 )
@@ -145,6 +147,37 @@ def bf16_gemm_refusal(cfg, rows: int = MAX_TOKENS) -> str | None:
                 return (
                     f"the original path's {name} GEMM ({m} x {n} x {k}) rounds as {got}, the kernel"
                     f" as {want}"
+                )
+    return None
+
+
+def ptpc_gemm_refusal(cfg, rows: int = MAX_TOKENS) -> str | None:
+    """Why one of the original path's per-token FP8 GEMMs (``layout.ptpc_gemms``) takes an aiter kernel
+    whose epilogue order is not the kernel's at some decode M up to ``rows``, or None. Asked of the
+    installed aiter's tuned bpreshuffle picks, as ``gemm_a8w8_bpreshuffle`` looks them up.
+    """
+    if cfg.proj_kind != "ptpc":
+        return None
+    try:
+        from aiter import dtypes
+        from aiter.jit.core import AITER_CONFIGS
+        from aiter.ops.gemm_op_a8w8 import get_GEMM_config_with_quant_type
+    except ImportError as e:
+        return f"cannot tell the original path's per-token FP8 GEMMs: {e}"
+    for name, n, k, order in ptpc_gemms(cfg):
+        for m in range(1, rows + 1):
+            pick = get_GEMM_config_with_quant_type(
+                m,
+                n,
+                k,
+                dtypes.fp8,
+                AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE,
+            )
+            got = aiter_ptpc_order(pick)
+            if got != order:
+                return (
+                    f"the original path's {name} GEMM ({m} x {n} x {k}) takes {got}, the kernel"
+                    f" follows {order}"
                 )
     return None
 
@@ -291,8 +324,16 @@ class Qwen35MonoDecodeRunner:
             raise MonoUnsupported(
                 "the original path's all-reduce + RMSNorm fusion is off; the kernel reproduces it"
             )
-        why = bf16_gemm_refusal(self.cfg) or (
-            flydsl_refusal(self.cfg) if self.cfg.pa_flydsl else None
+        # a per-token checkpoint's input norm quantizes in one fused kernel under this switch
+        if self.cfg.proj_kind == "ptpc" and envs.ATOM_FUSED_NORM_PER_TOKEN_QUANT:
+            raise MonoUnsupported(
+                "ATOM_FUSED_NORM_PER_TOKEN_QUANT=1: the original input norm quantizes per token in its"
+                " fused kernel; the kernel follows the unfused one"
+            )
+        why = (
+            bf16_gemm_refusal(self.cfg)
+            or ptpc_gemm_refusal(self.cfg)
+            or (flydsl_refusal(self.cfg) if self.cfg.pa_flydsl else None)
         )
         if why is not None:
             raise MonoUnsupported(why)

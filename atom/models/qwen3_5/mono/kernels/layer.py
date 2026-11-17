@@ -17,7 +17,9 @@ Full attention replaces the mixer: q | gate, k, v GEMV -> Gemma q / k norm + par
 ATOM's paged FP8 cache -> split attention (one wave per query head) -> merge x sigmoid(gate) -> out_proj.
 
 ``weights`` is the checkpoint's format: "fp8" (FP8 128 x 128 matrices, W8A8 experts, the shared expert
-a slot of the bank) or "mxfp4" (BF16 projections, A4W4 MXFP4 experts, a BF16 shared expert).
+a slot of the bank), "mxfp4" (BF16 projections, A4W4 MXFP4 experts, a BF16 shared expert) or
+"mxfp4_attnfp8" (per-channel FP8 projections on per-token FP8 activations, A4W4 MXFP4 experts, the shared
+expert a slot of the bank).
 
 Task ``t`` of a stage runs on CTA ``(stage_base + t) % 256``; every CTA walks the stages in order;
 hand-offs are tagged ``(value, tag)`` pairs (atom.mono.device.sync), polled until the tag is this launch's
