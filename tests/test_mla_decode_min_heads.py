@@ -66,7 +66,7 @@ class _AiterShapeSupport:
             reduce_supported=True,
             backend=aiter_attention.MlaBackend.ASM,
             asm_status=aiter_attention.MlaAsmStatus.OK,
-            asm_kernel="mla_a8w8_qh32_qseqlen4_gqaratio32_ps",
+            asm_kernel="fake",
             supported=self.supported,
             reasons=(),
         )
@@ -107,7 +107,7 @@ def native(monkeypatch, aiter_shape):
     )
     monkeypatch.setattr(attention_mla, "dcp_persistent_supported", lambda: True)
     monkeypatch.setattr(attention_mla, "dcp_prefill_merge_bf16_ok", lambda: True)
-    # A CPU runner's aiter cannot name the arch's fp8; gfx950's is e4m3fn.
+    # A CPU runner's aiter cannot name the arch's fp8; pin e4m3fn.
     monkeypatch.setitem(dtypes.d_dtypes, "fp8", FP8)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: "cpu")
     for name in ("ATOM_USE_TRITON_MLA", "ATOM_MLA_KV_SHUFFLED", "ATOM_MLA_PAGE_SIZE"):
@@ -211,19 +211,18 @@ def _set(monkeypatch, cfg, change, aiter_shape=None):
     "change, expected",
     [
         ("none", 12),
-        # e.g. any arch but gfx950
         ("aiter folds 12", 16),
         ("aiter has no kernel", 16),
         ("aiter cannot tell", 16),
-        # aiter serves 12 heads on bf16 too; ATOM measured fp8 only.
+        # ATOM measured fp8 only.
         ("bf16 kv", 16),
-        # aiter serves 12 heads there too; ATOM's decode is not persistent.
+        # ATOM's decode is not persistent there.
         ("page size 64", 16),
         ("triton mla", 16),
         ("dp2", 12),
         ("dp2, no dpa persistent", 16),
         ("indexer", 16),
-        # aiter serves 12 up to qlen 10; ATOM measured it faster at qlen 8 only.
+        # ATOM measured 12 heads faster at qlen 8 only.
         ("qlen 1", 16),
         ("qlen 4", 16),
         ("qlen 5", 16),
@@ -256,6 +255,34 @@ def test_kv_shuffled_keeps_sixteen(native, monkeypatch):
     assert attention_mla.mla_dense_min_query_heads(native, 12, 1) == 12
     monkeypatch.setenv("ATOM_MLA_KV_SHUFFLED", "1")
     assert attention_mla.mla_dense_min_query_heads(native, 12, 1) == 16
+
+
+@pytest.mark.parametrize(
+    "change", ["none", "page size 64", "dp2", "dp2, no dpa persistent"]
+)
+def test_floor_is_twelve_where_the_layer_decodes_persistent(
+    native, aiter_shape, monkeypatch, change
+):
+    """The floor asks the layer's own persistence predicate."""
+    _set(monkeypatch, native, change, aiter_shape)
+    layer = _layer(native)
+
+    assert (layer.min_query_heads == 12) is layer.decode_is_persistent()
+
+
+def test_floor_and_layer_share_one_persistence_predicate(native, monkeypatch):
+    asked = []
+
+    def not_persistent(**kwargs):
+        asked.append(kwargs)
+        return False
+
+    monkeypatch.setattr(attention_mla, "mla_decode_is_persistent", not_persistent)
+    layer = _layer(native)
+
+    assert layer.min_query_heads == 16
+    assert not layer.decode_is_persistent()
+    assert [kwargs["dcp_world_size"] for kwargs in asked] == [1, 1]
 
 
 def test_dcp_keeps_sixteen(native):

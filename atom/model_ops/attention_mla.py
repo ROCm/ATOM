@@ -233,7 +233,7 @@ triton_fused_qk_rope_cat_and_cache_mla = mark_trace(
 
 logger = logging.getLogger("atom")
 
-_MLA_MIN_HEADS = 16  # AITER MLA kernels require at least 16 attention heads
+_MLA_MIN_HEADS = 16  # MLA decode query-head floor; see mla_dense_min_query_heads
 # The one verify width at which ATOM decodes Kimi-K3's 12 heads a rank unpadded
 # (mla_dense_min_query_heads). A measured choice, not a kernel rule: aiter
 # mla_decode_fwd on MI355X (aiter 0dd2716), fp8 KV, 12- vs 16-head time,
@@ -250,14 +250,12 @@ def mla_dense_min_query_heads(atom_config, num_heads: int, dcp_world_size: int) 
     The one model-level value MLAAttention pads its query to and
     AiterMLAMetadataBuilder plans the step's single ``work_*`` plan for, so
     the two cannot disagree. ``num_heads`` (Kimi-K3's 12 at tp8, which then
-    decodes unpadded) where ATOM's measured choice and aiter's answer agree:
+    decodes unpadded) when both hold:
 
-    - 12 heads a rank is the faster width only on an fp8 KV cache at an
-      8-token verify (``_MLA_NARROW_QLEN``, the Kimi-K3 interactive band's
-      DSpark 7);
-    - aiter's ``get_mla_decode_shape_support``, from the same C++ rules its
-      planner and asm dispatch use, reports that decode native at 12 heads
-      (not folded) with a kernel for it.
+    - ATOM measured 12 heads a rank faster: an fp8 KV cache at an 8-token
+      verify (``_MLA_NARROW_QLEN``, the Kimi-K3 interactive band's DSpark 7);
+    - ATOM asks aiter's ``get_mla_decode_shape_support`` about the decode it
+      runs, and it answers native and supported at 12 heads.
 
     16 otherwise, including:
 
@@ -268,10 +266,9 @@ def mla_dense_min_query_heads(atom_config, num_heads: int, dcp_world_size: int) 
     - DCP: its decode dispatches the gathered width;
     - a decode that is not aiter's persistent asm over the builder's plan.
     """
-    spec = getattr(atom_config, "speculative_config", None)
+    spec = atom_config.speculative_config
     max_seqlen_q = 1 + (spec.num_speculative_tokens if spec else 0)
-    # ATOM's measured choice (see _MLA_NARROW_QLEN). Measured on fp8 only, so a
-    # bf16 KV cache keeps 16 even at shapes where aiter serves 12 heads.
+    # ATOM's measured choice (see _MLA_NARROW_QLEN), on fp8 only.
     narrow_is_faster = (
         num_heads == 12
         and atom_config.kv_cache_dtype == "fp8"
@@ -284,24 +281,21 @@ def mla_dense_min_query_heads(atom_config, num_heads: int, dcp_world_size: int) 
         or has_mla_indexer(get_hf_text_config(atom_config.hf_config))
     ):
         return _MLA_MIN_HEADS
-    # The decode runs aiter's persistent kernel over the builder's plan only on
-    # the plain page_size=1 asm path (see MLAAttention.decode_is_persistent).
-    # The builder has no MLAModules; the DPA gate reads none today.
+    # The decode the builder plans for: _forward_decode's asm branch (not the
+    # Triton or shuffled-KV one), persistent by the layer's own predicate.
     persistent = (
         not envs.ATOM_USE_TRITON_MLA
         and not envs.ATOM_MLA_KV_SHUFFLED
-        and should_use_persistent_mode(
-            dp_size=get_dp_group().world_size,
+        and mla_decode_is_persistent(
             dpa_persistent_supported=supports_dpa_persistent_mode(
                 atom_config,
-                None,
                 kv_cache_dtype=atom_config.kv_cache_dtype,
                 num_heads=num_heads,
                 num_kv_heads=1,
             ),
-            page_size=envs.ATOM_MLA_PAGE_SIZE,
             dcp_world_size=1,
-            dcp_persistent_supported=True,
+            # Unread at dcp1; DCP returned 16 above.
+            dcp_persistent_supported=False,
         )
     )
     if not persistent:
@@ -376,15 +370,13 @@ def mla_min_query_heads(kv_cache_dtype: str, block_width: int) -> int:
 
 
 def mla_kernel_num_heads(num_heads: int, min_heads: int = _MLA_MIN_HEADS) -> int:
-    """Round a query-head count up to a width ``mla_decode_fwd`` will dispatch.
+    """Round a query-head count up to the width ATOM dispatches
+    ``mla_decode_fwd`` at.
 
-    aiter accepts nhead 16, and above that only multiples of 16 up to 128 (it
-    folds those onto the 16-head kernel); any other value aborts the dispatch.
-    The narrower width ATOM uses is 12, where aiter reports it native and ATOM
-    measured it faster (``mla_dense_min_query_heads``): pass it as
-    ``min_heads`` and up to 12 heads pad to 12, 13 to 16 heads pad to 16.
-    ``min_heads`` is the layer's floor (``MLAAttention.min_query_heads``); a
-    count at or below it pads to it.
+    ``min_heads`` is the layer's floor (``MLAAttention.min_query_heads``, from
+    ``mla_dense_min_query_heads``): a count at or below it pads to it. Past it,
+    the count pads to 16 and above 16 rounds up to a multiple of 16. With the
+    12-head floor, 12 heads stay 12 and 13 to 16 pad to 16.
     """
     if num_heads <= min_heads:
         return min_heads
@@ -695,7 +687,6 @@ def _mla_output_width(impl: _MLAOutputShape, hidden_size: int) -> int:
 
 def supports_dpa_persistent_mode(
     atom_config,
-    mla_modules: MLAModules,
     *,
     kv_cache_dtype: str,
     num_heads: int,
@@ -706,6 +697,10 @@ def supports_dpa_persistent_mode(
     AITER's FP8 Q/FP8 KV GQA64 kernel is available only in persistent mode.
     Keep this gate exact so other DPA models retain the existing non-persistent
     policy and all MLA variants continue to use the common 576-wide KV layout.
+
+    Decided from the model's config and the layer's head shape only, never a
+    layer's MLAModules: ``mla_dense_min_query_heads`` asks it from the metadata
+    builder, which has no layer.
     """
     # Force-enabled for now: persistent mode is turned on for all MLA models
     # under DPA. Re-introduce the per-model gate here if a model regresses.
@@ -725,6 +720,28 @@ def should_use_persistent_mode(
         (dp_size <= 1 or dpa_persistent_supported)
         and page_size <= 1
         and (dcp_world_size <= 1 or dcp_persistent_supported)
+    )
+
+
+def mla_decode_is_persistent(
+    *,
+    dpa_persistent_supported: bool,
+    dcp_world_size: int,
+    dcp_persistent_supported: bool,
+) -> bool:
+    """Whether an MLA layer's asm decode runs aiter's persistent kernel over
+    the metadata builder's work plan, at this DP size and ATOM_MLA_PAGE_SIZE.
+
+    The one predicate ``MLAAttention.decode_is_persistent`` and
+    ``mla_dense_min_query_heads`` share. It does not look at the Triton or
+    shuffled-KV decode: ``_forward_decode`` branches to those before it asks.
+    """
+    return should_use_persistent_mode(
+        dp_size=get_dp_group().world_size,
+        dpa_persistent_supported=dpa_persistent_supported,
+        page_size=envs.ATOM_MLA_PAGE_SIZE,
+        dcp_world_size=dcp_world_size,
+        dcp_persistent_supported=dcp_persistent_supported,
     )
 
 
@@ -762,9 +779,8 @@ class MLAAttention(nn.Module):
             self.min_query_heads = mla_dense_min_query_heads(
                 get_current_atom_config(), num_heads, get_dcp_world_size()
             )
-        # aiter MLA serves multiples of 16 heads (and 12 where the floor is 12);
-        # round up so a per-rank count like 24 (K3 at tp4) does not abort in
-        # get_mla_metadata.
+        # Pad to the floor, and past it to a multiple of 16, so a per-rank
+        # count like 24 (K3 at tp4) does not abort in get_mla_metadata.
         self.padded_num_heads = mla_kernel_num_heads(num_heads, self.min_query_heads)
         # Heads past num_heads are dead lanes: the MLA kernels compute them and
         # `_restore_query_heads` throws them away. They are zeros rather than
@@ -810,7 +826,6 @@ class MLAAttention(nn.Module):
         atom_config = get_current_atom_config()
         self._dpa_persistent_supported = supports_dpa_persistent_mode(
             atom_config,
-            mla_modules,
             kv_cache_dtype=self.kv_cache_dtype,
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
@@ -2798,11 +2813,9 @@ class MLAAttention(nn.Module):
 
     def decode_is_persistent(self) -> bool:
         """Whether this layer's aiter decode runs the persistent kernel over the
-        step's work plan (`should_use_persistent_mode`)."""
-        return should_use_persistent_mode(
-            dp_size=get_dp_group().world_size,
+        step's work plan (`mla_decode_is_persistent`)."""
+        return mla_decode_is_persistent(
             dpa_persistent_supported=self._dpa_persistent_supported,
-            page_size=envs.ATOM_MLA_PAGE_SIZE,
             dcp_world_size=self.dcp_world_size,
             dcp_persistent_supported=self.dcp_persistent_supported,
         )
