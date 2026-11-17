@@ -2579,6 +2579,18 @@ models:
               spec_decode_acceptance_length: 4.04
 
         - <<: *m31b_agentx
+          name: m31b-nvfp4-1p1d-pp4-tp4-dspark7-mcstore-agentx-c150
+          concurrency: [150]
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: "[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160,176,192,208,224,240,256,280,300]"
+          server:
+            common_args:
+              max_num_seqs: 300
+              spec_decode_acceptance_length: 4.04
+
+        - <<: *m31b_agentx
           name: m31b-nvfp4-1p1d-pp4-tp4-dspark7-mcstore-agentx-c160
           concurrency: [160]
           decode:
