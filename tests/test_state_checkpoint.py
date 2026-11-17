@@ -3223,8 +3223,8 @@ class TestPromptEndAnchorTemplateMargin:
     The setting mirrors Qwen3.5 AgentX: block 16, PAGE copy checkpoints, no
     ladder (`interval -1`) and no demand rung, so the anchor is the only
     checkpoint a prompt leaves. The exception is the LMCache chunk grid
-    section, which turns the demand rung on: what it pins is the demand a
-    floored anchor makes the next turn cut.
+    section, which turns the demand rung on: what it pins is which demands
+    survive once the anchor is floored.
     """
 
     BLOCK = 16
@@ -3250,9 +3250,7 @@ class TestPromptEndAnchorTemplateMargin:
         self._monkeypatch = monkeypatch
         self.forwards = 0
 
-    def _bm(
-        self, margin=None, block=None, runtime=PAGED_COPY_RUNTIME, pp=1, interval=-1
-    ):
+    def _bm(self, margin=None, block=None, runtime=PAGED_COPY_RUNTIME, interval=-1):
         if margin is not None:
             self._monkeypatch.setenv("ATOM_STATE_CHECKPOINT_END_MARGIN", str(margin))
         return make_block_manager(
@@ -3264,7 +3262,6 @@ class TestPromptEndAnchorTemplateMargin:
                 pool_entries={"state": 8},
                 state_checkpoint_interval_tokens=interval,
                 state_checkpoint_demand=False,
-                pipeline_parallel_size=pp,
             ),
             state_runtime=runtime,
         )
@@ -3384,9 +3381,9 @@ class TestPromptEndAnchorTemplateMargin:
 
     CHUNK = 4 * BLOCK
 
-    def _grid_bm(self, pp=1, interval=-1):
+    def _grid_bm(self, interval=-1):
         self._monkeypatch.setenv("ATOM_STATE_CHECKPOINT_DEMAND", "1")
-        bm = self._bm(pp=pp, interval=interval)
+        bm = self._bm(interval=interval)
         # As in `_joint_bm`: the LMCache config is not importable here.
         bm._joint_chunk_tokens = self.CHUNK
         return bm
@@ -3394,13 +3391,12 @@ class TestPromptEndAnchorTemplateMargin:
     def _demand_cuts(self, bm):
         return bm.checkpoint_funnel()["chunks_cut_for_demand"]
 
-    @pytest.mark.parametrize("pp", [1, 2], ids=["pp1", "pp2"])
-    def test_the_next_turn_cuts_no_demand_above_the_floored_anchor(self, pp):
+    def test_the_next_turn_cuts_no_demand_above_the_floored_anchor(self):
         """The anchor is floored so the joint load, which needs the whole chunk
         covering it, can restore it from the CPU tier. The next turn resumes
-        there, a chunk below the prompt end, and does not cut a demand at the
-        unfloored position its KV reaches."""
-        bm = self._grid_bm(pp=pp)
+        there, under one chunk below the prompt end, and does not cut a demand
+        at the unfloored position its KV reaches."""
+        bm = self._grid_bm()
         t1 = self._prompt([], 7 * self.BLOCK + 5)
         _, anchor = self._run_turn(bm, t1)
         resumed, _ = self._run_turn(bm, t1 + self._fresh(80))
@@ -3418,8 +3414,8 @@ class TestPromptEndAnchorTemplateMargin:
     @pytest.mark.parametrize("interval", [-1, CHUNK], ids=["no_ladder", "ladder_chunk"])
     def test_a_conversation_takes_two_forwards_a_turn(self, interval):
         """One cut at the floored anchor and the rest of the prompt: 12 forwards
-        over six turns, with or without a ladder on the chunk grid. Keeping the
-        demand above each floored anchor took 16."""
+        over six turns, with or without a ladder on the chunk grid. Main cuts a
+        demand every turn."""
         bm = self._grid_bm(interval=interval)
         self._conversation(bm)
         assert (self.forwards, self._demand_cuts(bm)) == (12, 0)
@@ -3495,6 +3491,40 @@ class TestPromptEndAnchorTemplateMargin:
         resumed = [self._run_turn(bm, f)[0] for f in forks[1:]]
         assert resumed == [0, 3 * self.BLOCK]
         assert self._demand_cuts(bm) == 1
+
+    def _forks_one_chunk_up(self, bm):
+        """Forks a whole chunk above the floored anchor (8 blocks, anchor 4)."""
+        first = self._fresh(8 * self.BLOCK)
+        self._run_turn(bm, first)
+        return [first + self._fresh(self.BLOCK + 5) for _ in range(2)]
+
+    def _forks_above_an_offgrid_hit(self, bm):
+        """Forks under one chunk above a hit off the chunk grid: a short
+        header's rung at 3 blocks, and the fork's own floor at 4."""
+        header = self._fresh(3 * self.BLOCK)
+        for _ in range(2):
+            self._run_turn(bm, header + self._fresh(4 * self.BLOCK + 5))
+        p3 = header + self._fresh(5 * self.BLOCK + 5)
+        self._run_turn(bm, p3)
+        return [p3[: 5 * self.BLOCK] + self._fresh(self.BLOCK + 5) for _ in range(2)]
+
+    @pytest.mark.parametrize(
+        "forks, resumed",
+        [
+            (_forks_one_chunk_up, [CHUNK, 2 * CHUNK]),
+            (_forks_above_an_offgrid_hit, [3 * BLOCK, CHUNK]),
+        ],
+        ids=["one_chunk_up", "offgrid_hit"],
+    )
+    def test_a_demand_outside_the_dropped_shape_keeps_its_rung(self, forks, resumed):
+        """Only a demand under one chunk above a nonzero hit on the chunk grid
+        is dropped. One a whole chunk up, or above a hit off the grid, still
+        cuts its rung, and the second fork resumes there."""
+        bm = self._grid_bm()
+        prompts = forks(self, bm)
+        cuts = self._demand_cuts(bm)
+        assert [self._run_turn(bm, p)[0] for p in prompts] == resumed
+        assert self._demand_cuts(bm) - cuts == 1
 
     # ── The margin's range (review of #2589) ────────────────────────────────
 

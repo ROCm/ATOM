@@ -2777,40 +2777,31 @@ class BlockManager:
         # lookup, so an off-grid demand is never reached and the fork recomputes
         # from its HBM hit (`no_rung_above_hbm`). An unaligned HBM hit is not
         # the problem; the joint load reloads its partial chunk. Flooring costs
-        # each fork under one chunk while the prefix is still in HBM. A floor
-        # at or below the hit would be no rung at all, so the demand then stays
-        # where it was and serves HBM alone.
+        # each fork under one chunk while the prefix is still in HBM.
+        #
+        # A floor below an unaligned hit would be no rung at all, so the demand
+        # stays where it was and serves HBM alone. A floor right at a nonzero
+        # hit is what a floored prompt-end anchor leaves the next turn: the hit
+        # stops at the anchor while the KV runs on to the unfloored end. The
+        # demand is dropped there and this forward recomputes the gap, instead
+        # of cutting a second chunk and storing a second image every turn. A
+        # real fork that close above a grid rung is dropped too: later requests
+        # through it recompute at least that gap while the prefix is in HBM,
+        # and past HBM its off-grid demand is out of reach anyway. A hit at 0 is
+        # no floored anchor (one under a chunk never is), so a short shared
+        # header keeps its rung.
         chunk = self._joint_chunk_tokens
-        if (
-            demand
-            and chunk > self.hash_block_size
-            and chunk % self.hash_block_size == 0
-            and demand - demand % chunk > hit * self.hash_block_size
-        ):
-            demand -= demand % chunk
-        # Dropped when the hit is a nonzero chunk-grid position and the demand
-        # sits under one chunk above it. That is what a floored prompt-end
-        # anchor leaves the next turn: the hit stops at the anchor while the KV
-        # runs on to the unfloored end. Kept, the demand would cut a second
-        # chunk and store a second image on every turn, for a rung that serves
-        # little past this turn: the next one resumes from its own, newer
-        # anchor. Dropped, this forward recomputes the gap and cuts nothing.
-        # The test cannot tell that shape from a real fork that close above a
-        # grid rung; such a fork recomputes the same gap on every later request
-        # while the prefix is in HBM, and past HBM its off-grid demand would be
-        # out of reach anyway (above). An anchor under one chunk is never
-        # floored, so a hit at 0 is no floored anchor and a short shared header
-        # keeps its rung.
         hit_tokens = hit * self.hash_block_size
         if (
             demand
             and chunk > self.hash_block_size
             and chunk % self.hash_block_size == 0
-            and hit_tokens > 0
-            and hit_tokens % chunk == 0
-            and demand - hit_tokens < chunk
         ):
-            demand = 0
+            floor = demand - demand % chunk
+            if floor > hit_tokens:
+                demand = floor
+            elif floor == hit_tokens > 0:
+                demand = 0
         # A replayed hit (`_replay_hit`) reaches `wanted` already, and the
         # replay bounds what the missing checkpoint costs. A demand would cut
         # every replay admission's forward at the hit and write a checkpoint
