@@ -184,22 +184,26 @@ def iter_dp_rank_assignments(config) -> list[tuple[int, int]]:
 def kv_event_sources(config) -> dict[str, dict[str, Any]]:
     """Where each engine on this node publishes KV events (`/kv_event_sources`),
     keyed by the global DP rank its publisher binds for: the endpoint after the
-    per-rank offset (a wildcard host stays a wildcard), the topic, and the
-    tokens per hashed block. Empty with events off or the null publisher."""
+    per-rank offset (a wildcard host stays a wildcard), the topic, the tokens
+    per hashed block, and the replay endpoint, offset alike, when replay is on.
+    Empty with events off or the null publisher."""
     events = config.kv_events_config
     if not events.enable or events.publisher == "null":
         return {}
     block_size = hash_block_size_for(
         config.kv_cache_block_size, config.decode_context_parallel_size
     )
-    return {
-        str(rank): {
+    sources = {}
+    for rank, _ in iter_dp_rank_assignments(config):
+        source = {
             "endpoint": offset_endpoint(events.endpoint, rank),
             "topic": events.topic,
             "block_size": block_size,
         }
-        for rank, _ in iter_dp_rank_assignments(config)
-    }
+        if events.replay_endpoint:
+            source["replay_endpoint"] = offset_endpoint(events.replay_endpoint, rank)
+        sources[str(rank)] = source
+    return sources
 
 
 def _resolve_dp_engine_count(config: Config, logical: int) -> int:
@@ -491,8 +495,8 @@ class CoreManager:
         pc.server_instance_id = uuid.uuid4().hex[:12]
         if multinode and pc.data_parallel_base_port == 0:
             raise ValueError(
-                "Multi-node DP requires the same nonzero --data-parallel-base-port "
-                "(or ATOM_DP_BASE_PORT) on every node."
+                "Multi-node DP or TP requires the same nonzero "
+                "--data-parallel-base-port (or ATOM_DP_BASE_PORT) on every node."
             )
         if not multinode or pc.data_parallel_rank == 0:
             store = TCPStore(
@@ -591,7 +595,9 @@ class CoreManager:
         local_dp_ranks = []
 
         try:
-            self._start_distributed_store(config, multinode=multinode)
+            self._start_distributed_store(
+                config, multinode=multinode or config.is_multinode_tp
+            )
             for engine_index in range(self.local_engine_count):
                 assignment_index = engine_index // self.pp_size
                 dp_rank, local_dp_rank = rank_assignments[assignment_index]

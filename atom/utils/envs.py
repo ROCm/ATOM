@@ -201,8 +201,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_MASTER_PORT": lambda: int(os.getenv("ATOM_DP_MASTER_PORT", "29500")),
     # Rendezvous base port; set per role when prefill/decode share a node.
     "ATOM_DP_BASE_PORT": lambda: int(os.getenv("ATOM_DP_BASE_PORT", "0")),
-    # Floor for the timeout of groups a multi-node DP rank creates without one
-    # (aiter's gloo groups; torch's own default is 30 minutes), in seconds.
+    # Floor for the gloo and NCCL timeouts of groups a rank creates without one
+    # (aiter's groups; torch's own defaults are 30 and 10 minutes) when its DP
+    # or TP group spans nodes, in seconds.
     "ATOM_MULTINODE_PG_TIMEOUT_S": lambda: int(
         os.getenv("ATOM_MULTINODE_PG_TIMEOUT_S", "7200")
     ),
@@ -543,9 +544,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 0 to disable this soft budget; chunking still enforces aiter's hard 2 GiB
     # buffer-descriptor cap, above which the kernel fails to compile and aborts
     # the process (see atom/model_ops/sparse_indexer_chunk.py).
-    # It also sizes the decode logits workspace (`max_model_len` wide, held for
-    # the server's life and counted in the KV budget) and so its band count:
-    # lowering it saves memory but splits decode into more launches.
+    # It also sizes the logits workspace (counted in the KV budget) to the larger
+    # of the decode and packed FP8 prefill planes; a lower budget adds launches.
     "ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB": lambda: int(
         os.getenv("ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB", "2048")
     ),
@@ -645,6 +645,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # of the step (mono/runner.py finish_step) instead of the GPU hanging. Use
     # with --enforce-eager.
     "ATOM_MONO_DEBUG": lambda: os.getenv("ATOM_MONO_DEBUG", "0") == "1",
+    # gfx950 mono mailbox retry spacing in s_sleep units (1..127, unset: 16).
+    # Read and checked by atom/mono/polling.py at import, which needs no ATOM
+    # import; 1 restores the pre-backoff polling (ROCm/ATOM#3369).
+    "ATOM_MONO_POLL_SLEEP_UNITS": lambda: os.getenv("ATOM_MONO_POLL_SLEEP_UNITS"),
     # DeepSeek-V4.1: how many of an attention layer's branches leave the main
     # stream. 0 none; 1 the compressor, on the MoE's `alt_stream`, waited at
     # the scorer that first reads it; 2 the indexer as well, on one of its own.
@@ -661,10 +665,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # serves, every decoder layer, the verify head, the DSpark draft and the
     # round's glue run the hi programs (atom/models/deepseek_v41/mono/hi_*.py).
     # "auto" (default): on for the deployment they serve (MI355X, TP2 / TP4 /
-    # TP8, BF16 KV, DSpark, ...: `mono/hi_gate.py`; TP8 also needs ATOM's own
-    # V4.1 path to start at TP8, ROCm/aiter#7967), any other keeps ATOM's mono
-    # path; "1":
-    # on, or an error naming why not; "0": off.
+    # TP8, BF16 KV, DSpark, ...: `mono/hi_gate.py`; at TP8 ATOM's own path
+    # starts on gfx950 through the shared expert's in-place K pad, 288 -> 320,
+    # until ROCm/aiter#7967), any other keeps ATOM's mono path; "1": on, or an
+    # error naming why not; "0": off.
     "ATOM_DSV41_MONO_HI": lambda: os.getenv("ATOM_DSV41_MONO_HI", "auto"),
     # Token-bucket TR graphs for prefill (`atom/utils/region_graph.py`): the
     # comma-separated token counts to record. A prefill longer than the largest
@@ -821,6 +825,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ModelRunner workers) to exit before it terminates them.
     "ATOM_SHUTDOWN_TIMEOUT_S": lambda: _positive_float_env(
         "ATOM_SHUTDOWN_TIMEOUT_S", "5"
+    ),
+    # How long the nodes of a TP group that spans nodes wait for each other at
+    # startup: a remote node for the engine's endpoints, the engine for every
+    # remote rank to subscribe to its broadcast queue, a rank on the
+    # model-runner store. Process groups take ATOM_MULTINODE_PG_TIMEOUT_S.
+    "ATOM_MULTINODE_TP_TIMEOUT_S": lambda: _positive_float_env(
+        "ATOM_MULTINODE_TP_TIMEOUT_S", "1800"
     ),
     # --- Profiling & Logging ---
     "ATOM_METRICS_UPDATE_INTERVAL_S": lambda: _positive_float_env(

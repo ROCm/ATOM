@@ -1,5 +1,6 @@
 //! Shared HTTP proxy contract. The routing view never replaces the original payload.
 use std::{
+    collections::HashSet,
     sync::{Arc, LazyLock},
     time::Instant,
 };
@@ -13,6 +14,7 @@ use axum::{
 use bytes::Bytes;
 use dashmap::DashSet;
 use http::{HeaderMap, Uri};
+use parking_lot::RwLock;
 use tracing::warn;
 
 use crate::{
@@ -629,6 +631,7 @@ pub struct IngressRouting {
     policy_registry: Arc<PolicyRegistry>,
     worker_registry: Arc<WorkerRegistry>,
     tokenizer_registry: Arc<TokenizerRegistry>,
+    chats_without_template: Arc<RwLock<HashSet<String>>>,
     pd: bool,
     max_tokenize_bytes: usize,
 }
@@ -639,6 +642,7 @@ impl IngressRouting {
             policy_registry: app.policy_registry.clone(),
             worker_registry: app.worker_registry.clone(),
             tokenizer_registry: app.tokenizer_registry.clone(),
+            chats_without_template: app.chats_without_template.clone(),
             pd: app.router_config.mode.is_pd_mode(),
             max_tokenize_bytes: app.router_config.resolved_max_tokenize_bytes(),
         }
@@ -870,6 +874,9 @@ impl IngressRouting {
         ctx.check()?;
         let template_started = Instant::now();
         let prompt = if let Some(chat) = parsed.chat() {
+            if self.chats_without_template.read().contains(&entry.id) {
+                return Err(IngressError::new(http::StatusCode::NOT_IMPLEMENTED, "token_routing_unsupported", "this model's chats render with a built-in encoder whose defaults are not the engine's; use a policy that does not require exact tokens"));
+            }
             super::prepare::chat_template::process_chat_messages(chat, &*entry.tokenizer)
                 .map_err(IngressError::invalid)?
                 .text

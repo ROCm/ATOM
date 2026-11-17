@@ -7,8 +7,9 @@ from atom.models.deepseek_v41.mono.kernels.dims import Dims
 from atom.mono.runtime.deployment import common_refusals, first_refusal
 from atom.utils import envs
 
-# the TP sizes the kernels are built for (``kernels.dims``): TP2 and TP4 run on
-# GPU; TP8's builds compile and fit, but the original path does not start there
+# the TP sizes the kernels are built for (``kernels.dims``); at TP8 on gfx950 the
+# shared expert's share is padded in place, 288 -> 320 (``Dims.sh_inter``,
+# ``linear.fp8_group32_k_pad_align``, until ROCm/aiter#7967)
 SUPPORTED_TP = (2, 4, 8)
 # DP attention ranks (attention TP 1, the MoE expert parallel over them,
 # ``kernels.dims``): the builds measured

@@ -1013,6 +1013,7 @@ def _mxfp4_method_with_recording_experts(atom_modules):
         "use_triton": False,
         "use_triton_decode": False,
         "use_triton_ep": False,
+        "use_flydsl_herd": False,
         "is_guinterleave": False,
         "fp8_activations": False,
         "quant_type": object(),

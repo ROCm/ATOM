@@ -38,7 +38,7 @@ fixed acceptance length 3.51. For MI455X, see [gfx1250 (MI455X)](#gfx1250-mi455x
 | P/D disaggregation (Mooncake) | 1P1D TP2+TP2 validated with DSpark (gsm8k and AgentX c32); MoRI-IO not yet admitted. See [the PD guide](pd_disaggregation_guide.md#deepseek-v41-flash) |
 | TP4 with routed experts sharded across TP instead of whole-expert EP | Supported; relative throughput is workload-dependent |
 | TP2 no EP | GPU benchmark completed at level 3 FULL; see the [AgentX recipe](DeepSeek-V4.1-Flash-Agentic.md) for commands and measured points |
-| Other TP sizes | Configuration tests cover TP1/2/4/8 and dimension divisibility; this does not establish GPU or quality validation for TP1/8. TP8 does not start: AITER's FP8 blockscale GEMM runs no K = 288 (the shared expert's down projection) |
+| Other TP sizes | Configuration tests cover TP1/2/4/8 and dimension divisibility; this does not establish GPU or quality validation for TP1. TP8 starts on gfx950 through the shared expert's in-place K pad, 288 -> 320 (`fp8_group32_k_pad_align`; the pad goes away with ROCm/aiter#7967). GSM8K at TP8 (MI355X, 1,319 questions, 64 in flight, real acceptance): 0.9727 strict / 0.9719 flexible on ATOM's path |
 
 The full-layer path remains the numerical and performance baseline. CED and
 bounded replay are approximate modes with separate quality gates and cache
@@ -256,9 +256,13 @@ The kernels are built for the TP size of the deployment (TP2, TP4 or TP8;
 instruction for instruction. At TP2 (2026-09-30, MI355X, `--level 0`,
 concurrency 2) the check mode holds as at TP4, and GSM8K 3-shot on the first
 200 questions is 0.940 / 0.945 (mono / original) with acceptance 49.5% /
-49.2%. At TP8 the kernels compile and fit, but the server does not start on
-the original path: the shared expert's down projection has K = 288 there, and
-AITER's gfx950 FP8 blockscale GEMM needs K to be a multiple of its K tile.
+49.2%. At TP8 the shared expert's down projection has K = 288, which AITER's
+gfx950 group-32 FP8 GEMM cannot step (it needs a multiple of 64): the loader
+pads the shared expert's pair in place to 320 (`fp8_group32_k_pad_align`,
+`kernels/dims.py`'s `SHARED_PAD`) until ROCm/aiter#7967. On MI355X at TP8 the
+mono decode runs with it (forced acceptance 3.51: 3.88 ms a decode step, TPOT
+p50 1.52 ms at c1 and c8), and GSM8K on all 1,319 questions at 64 in flight is
+0.9727 / 0.9719 (strict / flexible).
 
 ## gfx1250 single-launch decode step
 
