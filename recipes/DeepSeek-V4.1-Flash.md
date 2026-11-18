@@ -231,10 +231,25 @@ It replaces the target forward, the sampler, the rejection sampler and the
 DSpark proposer of a served step
 (`atom/models/deepseek_v41/mono/gfx1250/`).
 
-- **Deployment.** TP4, DSpark with 5 speculative tokens, BF16 KV cache, FP8
-  index cache, up to 8 requests (6 verify rows each), no DSpark confidence
+- **Deployment.** TP4, DSpark with 5 speculative tokens, BF16 KV cache (FP4
+  KV is served too, but measured no faster at c1 — E13 TPOT 1.03 vs 1.01 ms; a
+  step reads ~640 keys a layer), FP8
+  or FP4 index cache (FP4: the gfx1250 natural layout, `--index-cache-dtype
+  fp4`; the step's long-context scoring reads half the bytes), one request a step (6 verify rows; `runner.MAX_STEP_ROWS`, wider steps take the production path), no DSpark confidence
   schedule or ragged verify. Anything else is refused at load
-  (`V4.1 single-launch step off: <why>`).
+  (`V4.1 single-launch step off: <why>`). On the current MI455X driver,
+  back-to-back ~300K-token prefills (production path; BF16 and FP4 KV alike)
+  have hung the GPUs in MES `REMOVE_QUEUE`; not root-caused.
+- **NUMA balancing.** With `kernel.numa_balancing=1`, the kernel's scan makes
+  KFD evict a rank's GPU queues for ~4-5 ms a few times a second, and the whole
+  step waits (c1 ITL p99 2.3 ms vs 1.3 ms). ATOM opts its serving processes out
+  (`ATOM_NUMA_BALANCING_OPT_OUT`, on by default); in a container this needs
+  `--cap-add SYS_NICE`, otherwise set `kernel.numa_balancing=0` on the host.
+- **Draft temperature.** `ATOM_DSPARK_PROB_DRAFT_TSCALE` scales the
+  probabilistic drafter's temperature (`T_d = T * scale`, default 1). The
+  verify uses the same draft distribution, so any value keeps the output
+  distribution. On E13 c1 (3 interleaved pairs), `0.85` raised tokens per
+  forward 3.99 -> 4.06 and TPS ~5% with TPOT unchanged; set it for c1.
 - **Memory.** The kernel reads the routed experts in place, as the
   production MoE keeps them (no second copy). Its own buffers a rank: ~77 MB
   scratch, ~28 MB peer receive and the shared experts' FP8 planes (~0.4 GB).
@@ -243,7 +258,7 @@ DSpark proposer of a served step
   - prefill;
   - steps with structured output, logprobs or top-k;
   - a block table or index bound past the kernel's (`tables.BCOLS`, `ILW`).
-- **Build.** Every width (6..48 rows) is built at startup, ~2.5 min cold.
+- **Build.** The 6-row width is built at startup, ~2.5 min cold.
   The builds go to the FlyDSL disk cache; clear it after editing a kernel.
 - **Debug switches** (the mono ones, `atom/utils/envs.py`):
   - `ATOM_MONO_TIMELINE=<prefix>`: per-step time split, averaged over 64
