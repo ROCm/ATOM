@@ -880,6 +880,18 @@ def _down_share(union, bid, ups, up_units=UP_UNITS):
     return first, last - first, late_first, late_last - late_first
 
 
+def moe_lds_bytes(rows: int, ring: int = RING) -> int:
+    """The fused MoE's LDS at ``rows`` with a ``ring``-item weight ring."""
+    return 4 * (
+        ring * (SLOT_BYTES // 4 + SCALE_WORDS)
+        + rows * (LATENT_TDM_WORDS + LATENT_SCALES // 4)
+        + UP_WAVES * GFX1250.wave_size * 8
+        + 2 * EXPERTS
+        + 4 * rows * TOPK
+        + WAVES
+    )
+
+
 def build_moe(
     rows: int,
     profile: bool = False,
@@ -912,20 +924,27 @@ def build_moe(
     if rolled is None:
         rolled = envs.ATOM_KIMI_MONO_ROLLED_MOE
     routes = rows * TOPK
-    lds_bytes = 4 * (
-        RING * (SLOT_BYTES // 4 + SCALE_WORDS)
-        + rows * (LATENT_TDM_WORDS + LATENT_SCALES // 4)
-        + UP_WAVES * GFX1250.wave_size * 8
-        + 2 * EXPERTS
-        + 4 * routes
-        + WAVES
+    # Past 48 rows every token's latent and a ring of four do not fit: the
+    # ring is three.
+    ring = next(
+        (
+            r
+            for r in (RING, RING - 1)
+            if moe_lds_bytes(rows, r) <= GFX1250.max_workgroup_lds_bytes
+        ),
+        None,
     )
-    if rows < 1 or lds_bytes > GFX1250.max_workgroup_lds_bytes:
-        raise ValueError(f"the fused MoE's {rows}-row LDS ({lds_bytes} B) does not fit")
+    if rows < 1 or ring is None:
+        raise ValueError(
+            f"the fused MoE's {rows}-row LDS ({moe_lds_bytes(rows, RING - 1)} B)"
+            " does not fit"
+        )
     tiles = (rows + 15) // 16
     blocks = UP_BLOCKS
     k_tiles = LATENT // K_TILE
-    ring = RING
+    # A CTA's gate/up tasks at most: 8 to 32 rows (a 512-expert union), 14 at
+    # the whole 896.
+    task_lanes = (min(routes, EXPERTS) * blocks + 255) // 256
     ring_words = ring * SLOT_BYTES // 4
 
     @fx.struct
@@ -1050,6 +1069,18 @@ def build_moe(
                 union - 1,
             )
         )
+        if const_expr(task_lanes > 8):
+            # lane n < task_lanes - 8: its (8 + n)-th gate/up task's
+            more_experts = fx.ptr_load(
+                lds["expert"] + fx.min((bid + (lane + 8) * 256) // blocks, union - 1)
+            )
+
+        def task_expert(n):
+            if const_expr(task_lanes > 8):
+                return (n < 8).select(
+                    readlane(experts, n), readlane(more_experts, fx.max(n - 8, 0))
+                )
+            return readlane(experts, n)
 
         def expert_lane(i, slot):
             return (i < early).select(8 + slot - first_slot, 24 + slot - late_slot)
@@ -1060,7 +1091,7 @@ def build_moe(
             if item < up_items:
                 n = item // k_tiles
                 task = bid + n * 256
-                expert = readlane(experts, n)
+                expert = task_expert(n)
                 group0 = expert * (2 * 384 // 16) + task % blocks * UP_GROUPS
                 if wave == WEIGHT_ISSUER:
                     gemv_tdm.load_rows(
