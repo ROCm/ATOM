@@ -62,6 +62,13 @@ label_is_allowed() {
   return 1
 }
 
+# The payload's PR labels. The label a labeled event added counts as on the PR
+# even when the payload's list lacks it, as the workflows' concurrency and gate
+# name expressions assume.
+payload_labels() {
+  jq -r '.pull_request.labels[]?.name // empty, (select(.action == "labeled") | .label.name // empty)' "${EVENT_PATH}"
+}
+
 load_pr_labels() {
   if [ -n "${CURRENT_PR:-}" ]; then
     PR_LABELS="$(jq -r '.labels[]?.name // empty' <<< "${CURRENT_PR}")"
@@ -70,7 +77,7 @@ load_pr_labels() {
 
   # A rerun replays the original event payload, whose labels may be stale.
   if [ "${GITHUB_RUN_ATTEMPT:-1}" -le 1 ]; then
-    PR_LABELS="$(jq -r '.pull_request.labels[]?.name // empty' "${EVENT_PATH}")"
+    PR_LABELS="$(payload_labels)"
     [ -z "${PR_LABELS}" ] || return 0
   fi
 
@@ -294,10 +301,16 @@ detect_replaced_pr_run() {
       echo "Could not read jobs of run ${candidate}; assuming no PR run was replaced."
       return 0
     fi
-    if [ "${noop}" != "true" ]; then
-      run_id="${candidate}"
-      break
+    [ "${noop}" = "true" ] && continue
+    # A run with no jobs that GitHub has not cancelled is still queued. The PR
+    # run an approval replaced is cancelled by then, so a queued run can only
+    # be a no-op label run whose first job does not exist yet: look past it.
+    conclusion="$(jq -r --argjson id "${candidate}" '.[] | select(.id == $id) | .conclusion // empty' <<< "${PREVIOUS_RUNS}")"
+    if [ "$(jq -r '[.[].jobs[]] | length' <<< "${jobs}")" = "0" ] && [ "${conclusion}" != "cancelled" ]; then
+      continue
     fi
+    run_id="${candidate}"
+    break
   done <<< "${pr_run_ids}"
   [ -n "${run_id}" ] || return 0
   conclusion="$(jq -r --argjson id "${run_id}" '.[] | select(.id == $id) | .conclusion // empty' <<< "${PREVIOUS_RUNS}")"
@@ -400,14 +413,13 @@ check_label_event() {
   # A current approval is deliberately not checked here. The concurrency group
   # cannot see it, so a gate-opening run may have cancelled the approval's
   # heavy CI and must take that work over rather than leave the sha without it.
-  local added_label payload_labels opening_label
+  local added_label opening_label
   added_label="$(jq -r '.label.name // ""' "${EVENT_PATH}")"
   if ! label_is_allowed "${added_label}"; then
     emit_decision "false" "label-not-gating"
     exit 0
   fi
-  payload_labels="$(jq -r '.pull_request.labels[]?.name // empty' "${EVENT_PATH}")"
-  opening_label="$(find_allowed_pr_label "${payload_labels}" || true)"
+  opening_label="$(find_allowed_pr_label "$(payload_labels)" || true)"
   if [ "${added_label}" != "${opening_label}" ]; then
     emit_decision "false" "gate-already-open" "${opening_label}"
     exit 0

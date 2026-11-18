@@ -516,9 +516,10 @@ def test_gate_labels_added_one_after_another(tmp_path):
             ("ci:atom", "ci:full"),
             "gate-already-open",
         ),
-        # Self-review probe test_p1: ci:atom was removed after ci:full was added
-        # beside it. The live labels would open the gate, but the replayed
-        # payload keeps this run in its -noop- group under "not requested".
+        # ci:atom was removed after ci:full was added beside it. The live labels
+        # would open the gate, but the replayed payload keeps this run in its
+        # -noop- group under "not requested". (The label query is made to fail
+        # below, so a rerun that read the live labels would turn undecidable.)
         ("ci:full", ("ci:atom", "ci:full"), ("ci:full",), "gate-already-open"),
     ],
 )
@@ -676,9 +677,9 @@ def test_approval_that_replaced_pending_pr_run_takes_over_its_checks(tmp_path, l
 
 
 def test_noop_label_run_does_not_hide_the_pr_run_an_approval_replaced(tmp_path):
-    # Self-review probe test_p3: a no-op label run (its own concurrency group)
-    # started between the pending synchronize run and the approval that
-    # replaced it. It is not the PR group's latest run, so the takeover stands.
+    # A no-op label run (its own concurrency group) started between the pending
+    # synchronize run and the approval that replaced it. It is not the PR
+    # group's latest run, so the takeover stands.
     noop_jobs = [{"jobs": [{"name": NOOP_JOB, "conclusion": "success"}]}]
     runs = [
         _previous_run(conclusion="cancelled"),
@@ -690,6 +691,21 @@ def test_noop_label_run_does_not_hide_the_pr_run_an_approval_replaced(tmp_path):
     assert result["pr_check_takeover"] == "true"
     assert result["replaced_run_id"] == "100"
     assert result["smoke_requested"] == "true"
+
+
+def test_queued_noop_label_run_without_jobs_does_not_hide_the_replaced_pr_run(
+    tmp_path,
+):
+    # The same no-op run, still queued: its first job does not exist yet.
+    runs = [
+        _previous_run(conclusion="cancelled"),
+        _previous_run(id=101, conclusion=None, status="queued"),
+    ]
+    result = _approve(
+        tmp_path, runs=runs, jobs={100: [], 101: []}, changed_files="docs/a.md"
+    )
+    assert result["pr_check_takeover"] == "true"
+    assert result["replaced_run_id"] == "100"
 
 
 def test_pr_check_takeover_is_reported_even_when_approval_is_not_sufficient(tmp_path):
@@ -1080,6 +1096,11 @@ def test_only_gate_opening_label_events_share_the_cancelling_group(tmp_path, fil
         # Both gate labels on the PR: added at once, or one after the other.
         ("labeled", "ci:full", (own_label, "ci:full")),
         ("labeled", own_label, (own_label, "ci:full")),
+        # A payload whose label list lacks the label it reports as added.
+        ("labeled", own_label, ()),
+        ("labeled", own_label, ("LGTM",)),
+        ("labeled", "ci:full", ()),
+        ("labeled", "ci:full", (own_label,)),
     ]
     for index, (action, added_label, labels) in enumerate(cases):
         event = ("pull_request", action, added_label, labels)

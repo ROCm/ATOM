@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Run atomesh-benchmark.yaml's own steps and expressions without GitHub."""
+"""Evaluate workflow expressions and run atomesh-benchmark.yaml's steps offline."""
 
 import json
 import os
