@@ -1171,7 +1171,7 @@ def test_stateful_transfer_without_final_source_slot_fails_closed(caplog, invali
 
 
 @pytest.mark.parametrize("pp_rank", [0, 1])
-def test_pp_stage_drops_its_producer_entry_once_its_consumers_are_served(pp_rank):
+def test_only_a_pp_stage_past_0_drops_its_producer_entry_once_served(pp_rank):
     captured = []
     conn = _make_transfer_connector({}, captured)
     conn.pp_size = 2
@@ -1566,13 +1566,14 @@ def _pp_engine_core_cls():
     return PPEngineCoreProc
 
 
-def _fake_head(batch):
+def _fake_head(batch, *, launches=1, pp_size=4, pp_max_inflight=4):
     PPEngineCoreProc = _pp_engine_core_cls()
 
     head = SimpleNamespace(
         _in_flight=deque(),
         _defer_prefix_hash=False,
-        pp_size=4,
+        pp_size=pp_size,
+        pp_max_inflight=pp_max_inflight,
         kv_transfer_enabled=True,
         output_queue=MagicMock(),
         runner_mgr=MagicMock(),
@@ -1585,7 +1586,7 @@ def _fake_head(batch):
         # never sleeps, so it must go through `_advance_idle_kv_transfer`.
         _next_idle_kv_drain=0.0,
     )
-    head.scheduler.schedule.side_effect = [(batch, {}), None]
+    head.scheduler.schedule.side_effect = [(batch, {})] * launches + [None]
     head.scheduler.take_rejected.return_value = None
     head.scheduler.dynamic_chunking_active = False
     head.pp_transport.recv_completion.return_value = None
@@ -1611,6 +1612,28 @@ def _dispatched_metas(head):
         for c in head.runner_mgr.call_func.call_args_list
         if c.args and c.args[0] == "process_kvconnector_output"
     ]
+
+
+def test_the_head_fills_its_inflight_cap_past_the_stage_count():
+    """Middle chunks count against the cap as output batches do, and a cap
+    above the stage count keeps the head issuing until it is reached."""
+    chunk = SimpleNamespace(
+        req_ids=["r1"], connector_meta_output=None, produces_output=lambda: False
+    )
+    head = _fake_head(chunk, launches=8, pp_size=2, pp_max_inflight=4)
+    assert len(head._in_flight) == 4
+    assert head.scheduler.schedule.call_count == 4
+
+
+@pytest.mark.parametrize("env, cap", [("0", 2), ("16", 16), ("-1", None)])
+def test_pp_max_inflight_defaults_to_the_stage_count(monkeypatch, env, cap):
+    pp_engine_core = sys.modules[_pp_engine_core_cls().__module__]
+    monkeypatch.setenv("ATOM_PP_MAX_INFLIGHT", env)
+    if cap is None:
+        with pytest.raises(ValueError, match="must be >= 0"):
+            pp_engine_core.pp_max_inflight(2)
+    else:
+        assert pp_engine_core.pp_max_inflight(2) == cap
 
 
 def test_pp_head_dispatches_meta_of_request_less_batch():
@@ -1795,6 +1818,7 @@ def _head_for_batch(batch, *, dynamic_chunking_active=False):
         _in_flight=deque(),
         _defer_prefix_hash=False,
         pp_size=2,
+        pp_max_inflight=2,
         kv_transfer_enabled=False,
         output_queue=MagicMock(),
         runner_mgr=MagicMock(),

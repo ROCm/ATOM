@@ -3242,7 +3242,12 @@ class MooncakeConnector(KVConnectorBase):
         return bpb // self.block_size
 
     def _dcp_token_descriptors(
-        self, region_idx: int, src_base: int, dst_base: int, bpb: int, token_runs
+        self,
+        region_idx: int,
+        src_base: int,
+        dst_base: int,
+        bpb: int,
+        token_runs: tuple[np.ndarray, np.ndarray, np.ndarray],
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """One PAGE region's share of a DCP token relayout, as RDMA descriptors."""
         unit = self._dcp_token_unit(region_idx, bpb)
