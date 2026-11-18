@@ -435,24 +435,26 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             } else {
                 result.matched_char_count as f32 / result.input_char_count as f32
             };
-            let affinity = match_rate > self.config.cache_threshold;
             let tenant_url: &str = &result.tenant;
+            // A match whose tenant is not a healthy candidate is relocated like a low match.
+            // The tenant may be alive outside the candidates (another DP rank under idx2idx,
+            // or an ext-proc subset), so it stays in the tree; removed workers leave it
+            // through `remove_worker_by_url`.
+            let tenant_idx = workers
+                .iter()
+                .position(|w| w.url() == tenant_url)
+                .filter(|&idx| {
+                    match_rate > self.config.cache_threshold && workers[idx].is_healthy()
+                });
             let decision = RouteDecision {
                 match_ratio: Some(match_rate as f64),
-                ..RouteDecision::branch(if affinity { "affinity" } else { "relocate" })
+                ..RouteDecision::branch(if tenant_idx.is_some() {
+                    "affinity"
+                } else {
+                    "relocate"
+                })
             };
-
-            // Select worker without String allocation
-            let selected_idx = if affinity {
-                // Cache hit path: find worker by URL (compare &str directly, no allocation)
-                workers
-                    .iter()
-                    .position(|w| w.url() == tenant_url)
-                    .filter(|&idx| workers[idx].is_healthy())
-            } else {
-                // Low cache match: use the least loaded worker.
-                least_loaded(workers, &healthy_indices)
-            };
+            let selected_idx = tenant_idx.or_else(|| least_loaded(workers, &healthy_indices));
 
             if let Some(idx) = selected_idx {
                 // Update the tree with this request (use worker URL directly, no allocation)
@@ -470,17 +472,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 return (Some(idx), decision);
             }
 
-            // Selected worker no longer exists or unhealthy, remove stale tenant from tree
-            if affinity {
-                tree.remove_tenant(tenant_url);
-                debug!("Removed stale worker {} from cache tree", tenant_url);
-            }
-
-            // Fallback to first healthy worker
-            (
-                healthy_indices.first().copied(),
-                RouteDecision::branch("stale_tenant"),
-            )
+            (None, RouteDecision::branch(NO_HEALTHY_WORKERS))
         } else {
             // No tree for this key: cache affinity is dead and every request is
             // placed at random, which is indistinguishable from "cache_aware is
@@ -763,10 +755,11 @@ mod tests {
             select("hello, friend").await,
             (first, "relocate", (ratio(5.0, 13.0), ratio(5.0, 13.0)))
         );
+        // An unhealthy tenant is relocated from and stays in the tree.
         workers[first].set_healthy(false);
         assert_eq!(
             select("hello world").await,
-            (1 - first, "stale_tenant", (None, None))
+            (1 - first, "relocate", (Some(1.0), None))
         );
         workers[first].set_healthy(true);
         for _ in 0..20 {

@@ -795,6 +795,54 @@ mod d_pd_planning {
         assert_eq!(prefill_url(plan), "http://p@0");
     }
 
+    /// `cache_aware` keeps a tenant on another rank: turn 2 returns to the prefill that
+    /// holds its prefix although the decode moved in between and the holder has load.
+    #[tokio::test]
+    async fn test_idx2idx_cache_aware_keeps_other_rank_tenants() {
+        let text = "a session's growing conversation ".repeat(64);
+        let descriptor = make_descriptor(Some("m"), Some(&text), None, None);
+        let prefills = [
+            dp_worker("http://p1", 0, prefill()),
+            dp_worker("http://p1", 1, prefill()),
+            dp_worker("http://p2", 0, prefill()),
+            dp_worker("http://p2", 1, prefill()),
+        ];
+        let decodes = [
+            dp_worker("http://d", 0, WorkerType::Decode),
+            dp_worker("http://d", 1, WorkerType::Decode),
+        ];
+        let source = prefills
+            .iter()
+            .chain(&decodes)
+            .fold(MockWorkerSource::new(), |source, worker| {
+                source.add_worker(worker.clone())
+            });
+        let cache_aware = Arc::new(crate::policies::CacheAwarePolicy::new());
+        cache_aware.init_workers(&prefills);
+        let policies = MockPolicySource::new().with_prefill(cache_aware);
+        let planner = make_planner(source, policies).with_prefill_on_decode_rank(true);
+        let decode_on = |rank: usize| {
+            decodes[0].set_healthy(rank == 0);
+            decodes[1].set_healthy(rank == 1);
+        };
+
+        decode_on(0);
+        for idx in [0, 1, 3] {
+            prefills[idx].set_healthy(false);
+        }
+        let turn1 = prefill_url(planner.plan(&descriptor).await.unwrap());
+        assert_eq!(turn1, "http://p2@0");
+        for worker in &prefills {
+            worker.set_healthy(true);
+        }
+        prefills[2].increment_load();
+        decode_on(1);
+        planner.plan(&descriptor).await.unwrap();
+        decode_on(0);
+        let turn2 = prefill_url(planner.plan(&descriptor).await.unwrap());
+        assert_eq!(turn2, "http://p2@0");
+    }
+
     #[tokio::test]
     async fn test_http_1p1d_pair() {
         let planner = make_planner(one_p_one_d_http("m"), MockPolicySource::new());
