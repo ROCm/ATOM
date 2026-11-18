@@ -25,19 +25,32 @@ cost attention on every run.
 ## Asking for a run
 
 SKILL.md: "when the action is `run something`, ask for ONE run." The record behind it,
-from ATOM reviews labelled by whether the author acted -- five judged asks, three carried
-out and two not:
+from ATOM reviews labelled by whether the author acted -- nine judged asks, five carried
+out and four not:
 
 | | ask | outcome |
 |---|---|---|
 | ✅ | ATOM#3165 "rebase onto current main and re-run the CPU suite and the `ci:atom` heavy jobs" | done |
+| ✅ | ATOM#3165 "the retarget to main plus the `ci:atom` label once #3173 lands" | done |
 | ✅ | ATOM#3275 "one GPU A/B ... once a GPU host is available" | posted 17 h later |
 | ✅ | ATOM#3323 "re-run at least one 512c arm on the final head" | came back with the table |
+| ✅ | ATOM#3323 "replace the call with `lookup_pending(head)` and delete the test stub" | done |
+| ❌ | ATOM#3165 "rebase, re-home `running=self.running` in the refactored `_schedule`, and re-run" | three things, none done |
 | ❌ | ATOM#3165 "admission off vs W only vs W + 512 ... post req/s, errors and preemptions" | merged with the box still empty, after 12 commits |
-| ❌ | ATOM#3306 "GSM8K plus staged/landed throughput" | still open after 14 commits |
+| ❌ | ATOM#3306 "GSM8K plus staged/landed throughput on this exact head" | merged unmet, after 14 commits |
+| ❌ | ATOM#3306 "attach **one** P/D throughput run on this head, **or name the existing run**" | merged unmet |
 
-Small N, and the cleanest comparison is the ATOM#3165 pair: one author, one PR, one week.
-What separates them is how much the ask costs, not how it was worded.
+**The last row is the counterexample, and it is the useful one.** It names a single run and
+offers the cheaper out, which is exactly what this rule asks for, and it still died. The
+difference is not the shape of the ask: ATOM#3306's body says its control run's "node failed
+the GPU-idle preflight, and was not rerun", while ATOM#3323 ran "both arms at the same time on
+one node" and ATOM#3275 had "one MI355X". The authors who complied had a working setup; the
+one who did not, did not.
 
-An ask the author cannot fit into their day looks, in the record, exactly like one they
-disagreed with.
+So minimising the ask is a lever, not a guarantee. A matrix is reliably out of reach. A single
+run is out of reach too when the machine is. What the rule buys is that when an author *can*
+act, the ask is small enough to be worth acting on -- and the cleanest evidence is still the
+ATOM#3165 pair: one author, one PR, one week, cheap ask done and three-arm ask not.
+
+An ask the author cannot fit into their day -- or cannot run at all -- looks, in the record,
+exactly like one they disagreed with.
