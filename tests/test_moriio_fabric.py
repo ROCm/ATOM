@@ -122,7 +122,9 @@ class PageDigestTest(unittest.TestCase):
         src, dst = self.views(0), self.views(1)
         for s, d in zip(src, dst):
             d[[5, 6]] = s[[1, 2]]
-        self.assertEqual(fabric.page_digest(src, [1, 2]), fabric.page_digest(dst, [5, 6]))
+        self.assertEqual(
+            fabric.page_digest(src, [1, 2]), fabric.page_digest(dst, [5, 6])
+        )
 
     def test_one_stale_region_changes_the_digest(self):
         src, dst = self.views(0), self.views(1)
@@ -134,12 +136,16 @@ class PageDigestTest(unittest.TestCase):
         src_terms = fabric.page_region_digests(src, [1, 2])
         dst_terms = fabric.page_region_digests(dst, [5, 6])
         self.assertEqual(sum(src_terms), fabric.page_digest(src, [1, 2]))
-        self.assertEqual([s == d for s, d in zip(src_terms, dst_terms)], [True, True, False])
+        self.assertEqual(
+            [s == d for s, d in zip(src_terms, dst_terms)], [True, True, False]
+        )
 
     def test_swapped_regions_change_the_digest(self):
         a = torch.arange(32, dtype=torch.uint8).view(2, 1, 16)
         b = (torch.arange(32, dtype=torch.uint8) + 1).view(2, 1, 16)
-        self.assertNotEqual(fabric.page_digest([a, b], [0]), fabric.page_digest([b, a], [0]))
+        self.assertNotEqual(
+            fabric.page_digest([a, b], [0]), fabric.page_digest([b, a], [0])
+        )
 
 
 class MetadataTest(unittest.TestCase):
@@ -155,7 +161,9 @@ class MetadataTest(unittest.TestCase):
         self.assertEqual(decoded.page_regions, meta.page_regions)
 
     def test_an_rdma_peer_decodes_without_a_page_layout(self):
-        decoded = msgspec_roundtrip(MoRIIOAgentMetadata(engine_id="e", agent_metadata=b"a"))
+        decoded = msgspec_roundtrip(
+            MoRIIOAgentMetadata(engine_id="e", agent_metadata=b"a")
+        )
         self.assertIsNone(decoded.page_desc)
         self.assertIsNone(decoded.page_regions)
 
