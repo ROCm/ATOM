@@ -222,6 +222,51 @@ BST = 16 * BRS         # one B stage of a wave
 NSLOT = 2              # Engram layers (rows before them: the layer table's rows with lflags ENG_ENTRY)
 
 
+ENGA_CTAS = NSLOT * 16 * EG // 256   # stage_enga's CTAs: a (slot, row, 32-group) a thread (MT 1: 16 rows a slot)
+
+
+@ASTRewriter.transform
+def stage_enga(c, e0, S):
+    """The Engram rows' A for stage_engkv_ent, once (it quantized it in each of its 100 CTAs): thread (CTA b - e0) x 256 + t
+    = (slot, row, 32-group) of NSLOT x 16 x EG -- its 32 codes + scale from its column owner's pushes (stage_englook),
+    dequantized as ATOM's UVA lookup does (code x 2^(s - 127) -> bf16), quantized to MXFP8 (e8m0_of / q8words; rows
+    >= TR: zeros) -> eng8 [slot][row][EK] / engs [slot][row][EG]; the CTA's count (enga_cnt) past its stores."""
+    t, b = c["t"], c["b"]
+    TR = c["TR"]
+    RA = 16
+    bb = b - e0
+    if (bb >= 0) & (bb < ENGA_CTAS):
+        e = bb * 256 + t
+        sl = e // (RA * EG)
+        r_ = e % (RA * EG)
+        row = r_ // EG
+        g = r_ % EG
+        live = row < TR
+        Sd = S(sl)
+        col = g // 8
+        gq = g % 8
+        wb = (col // HPR) * look_words(TR) + ((sl * TR + fx.min(row, TR - 1)) * HPR + col % HPR) * LKW
+        lps = [Sd["lmine"] + i64(wb + gq * 4 + k) * 16 for k in range(4)] + [Sd["lmine"] + i64(wb + 32) * 16]
+        got = _poll_ll(lps, Sd["ltag"], live)
+        sw = (gq < 4).select(got[4][0], got[4][2])
+        scl = (((sw >> ((gq % 4) * 8)) & 255) << 23).bitcast(F32)
+        fv = [hx.fp8x8_f32([got[k][0], got[k][2]]) for k in range(4)]
+        vals = [live.select((fv[k][e_] * scl).to(BF16).to(F32), F32(0.0)) for k in range(4) for e_ in range(8)]
+        am = F32(0.0)
+        for e_ in range_constexpr(32):
+            am = fx.max(am, abs(vals[e_]))
+        code = e8m0_of(am)
+        words = q8words(vals, inv_pow2(code))
+        dst = c["eng8"] + i64((sl * RA + row) * EK + g * 32)
+        hx.stx_dev(dst, fx.Vector.from_elements(words[:4], I32))
+        hx.stx_dev(dst + i64(16), fx.Vector.from_elements(words[4:], I32))
+        hx.stx_dev(c["engs"] + i64((sl * RA + row) * EG + g), code.to(fx.Int8))
+        hx.wait_storecnt0()
+        gpu.barrier()
+        if t == 0:
+            hx.atomic_add(c["enga_cnt"], 1)
+
+
 @ASTRewriter.transform
 def stage_engkv_ent(c, e0, ncta, EDL, S):
     """The sharded kv (rank k's 400 16-column N tiles a layer: ENT) of NSLOT Engram layers on the CTAs e0 ..
@@ -265,32 +310,50 @@ def stage_engkv_ent(c, e0, ncta, EDL, S):
         for i in range_constexpr(EDL):   # the first EDL steps' B rows in flight while A is quantized
             fbl(i, i)
         sring = [fsc(i) for i in range(EDL)]
-        for it in range((RA * EG + 255) // 256):   # A: RA rows x EG 32-groups, quantized here (rows >= TR: zeros, code 0)
-            e = t + it * 256
-            if e < RA * EG:
-                row = e // EG
-                g = e % EG
-                live = row < TR
-                # the group's 32 codes + scale from its column owner's pushes (stage_englook), dequantized as ATOM's UVA
-                # lookup does (code x 2^(s - 127) -> bf16): the staged row's exact values
-                col = g // 8
-                gq = g % 8
-                wb = (col // HPR) * look_words(TR) + ((sl * TR + fx.min(row, TR - 1)) * HPR + col % HPR) * LKW
-                lps = [Sd["lmine"] + i64(wb + gq * 4 + k) * 16 for k in range(4)] + [Sd["lmine"] + i64(wb + 32) * 16]
-                got = _poll_ll(lps, Sd["ltag"], live)
-                sw = (gq < 4).select(got[4][0], got[4][2])
-                scl = (((sw >> ((gq % 4) * 8)) & 255) << 23).bitcast(F32)
-                fv = [hx.fp8x8_f32([got[k][0], got[k][2]]) for k in range(4)]
-                vals = [live.select((fv[k][e_] * scl).to(BF16).to(F32), F32(0.0)) for k in range(4) for e_ in range(8)]
-                am = F32(0.0)
-                for e_ in range_constexpr(32):
-                    am = fx.max(am, abs(vals[e_]))
-                code = e8m0_of(am)
-                words = q8words(vals, inv_pow2(code))
-                hx.lstore(oa + row * RSF + g * 32, fx.Vector.from_elements(words[:4], I32))
-                hx.lstore(oa + row * RSF + g * 32 + 16, fx.Vector.from_elements(words[4:], I32))
-                hx.lstore(osc + row * EG + g, code.to(fx.Int8))
-        gpu.barrier()
+        if fx.const_expr(MT == 1):
+            # A (the slot's RA x EK MXFP8 rows + their e8m0 codes, stage_enga's, quantized once for every CTA) -> LDS, past
+            # the producers' count (one waiter a CTA, then acquire)
+            if t == 0:
+                hx.wait_count(c["enga_cnt"], I32(ENGA_CTAS), 4)
+                hx.fence_acquire("agent")
+            gpu.barrier()
+            a8 = c["eng8"] + i64(sl * RA * EK)
+            as_ = c["engs"] + i64(sl * RA * EG)
+            for it in range_constexpr((RA * EK // 16 + 255) // 256):   # the codes: 16 B chunks, each row padded to RSF in LDS
+                u = t + it * 256
+                if u < RA * EK // 16:
+                    hx.async_to_lds_b128(a8 + i64(u) * 16, oa + (u // (EK // 16)) * RSF + (u % (EK // 16)) * 16)
+            if t < RA * EG // 16:
+                hx.async_to_lds_b128(as_ + i64(t) * 16, osc + t * 16)
+            hx.wait_asynccnt0()   # (the first EDL B steps' copies as well: the K loop's counts start from zero)
+            gpu.barrier()
+        else:   # (MT > 1: the rows quantized in each CTA, as before)
+            for it in range((RA * EG + 255) // 256):   # A: RA rows x EG 32-groups, quantized here (rows >= TR: zeros, code 0)
+                e = t + it * 256
+                if e < RA * EG:
+                    row = e // EG
+                    g = e % EG
+                    live = row < TR
+                    # the group's 32 codes + scale from its column owner's pushes (stage_englook), dequantized as ATOM's UVA
+                    # lookup does (code x 2^(s - 127) -> bf16): the staged row's exact values
+                    col = g // 8
+                    gq = g % 8
+                    wb = (col // HPR) * look_words(TR) + ((sl * TR + fx.min(row, TR - 1)) * HPR + col % HPR) * LKW
+                    lps = [Sd["lmine"] + i64(wb + gq * 4 + k) * 16 for k in range(4)] + [Sd["lmine"] + i64(wb + 32) * 16]
+                    got = _poll_ll(lps, Sd["ltag"], live)
+                    sw = (gq < 4).select(got[4][0], got[4][2])
+                    scl = (((sw >> ((gq % 4) * 8)) & 255) << 23).bitcast(F32)
+                    fv = [hx.fp8x8_f32([got[k][0], got[k][2]]) for k in range(4)]
+                    vals = [live.select((fv[k][e_] * scl).to(BF16).to(F32), F32(0.0)) for k in range(4) for e_ in range(8)]
+                    am = F32(0.0)
+                    for e_ in range_constexpr(32):
+                        am = fx.max(am, abs(vals[e_]))
+                    code = e8m0_of(am)
+                    words = q8words(vals, inv_pow2(code))
+                    hx.lstore(oa + row * RSF + g * 32, fx.Vector.from_elements(words[:4], I32))
+                    hx.lstore(oa + row * RSF + g * 32 + 16, fx.Vector.from_elements(words[4:], I32))
+                    hx.lstore(osc + row * EG + g, code.to(fx.Int8))
+            gpu.barrier()
         acc = [fx.Vector.filled(8, 0.0, F32) for _ in range(MT)]
         for ks in range(0, NK, EDL):
             for i in range_constexpr(EDL):

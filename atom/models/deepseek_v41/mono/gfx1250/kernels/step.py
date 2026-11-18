@@ -298,10 +298,13 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
                                         etag=hx.epoch32(tep, Lk, 3), lrecv=lb, lmine=lb[rank], ltag=hx.epoch32(tep, Lk, 4),
                                         englook=fptr(fp, "englook") + i64(sl * (ES.LW * 8)))
                         ckv = dict(t=te, b=b, w=te // 32, l=te % 32, sm=sm, MT=(TR + 15) // 16, TR=TR, rank=rank, stx=hx.stx_dev,
-                                   engkv=fptr(fp, "engkv"))
+                                   engkv=fptr(fp, "engkv"), eng8=fptr(fp, "eng8"), engs=fptr(fp, "engs"),
+                                   enga_cnt=TCNT + i64(LY.ENG_A))
                         # (englook) the rows' hash + host lookup on the wave tasks past the kv's CTA-tasks
                         ES.stage_englook(ckv, FS.FRONT_CTAS + ES.NSLOT * (ES.ENT // 8),
                                          CTAS - FS.FRONT_CTAS - ES.NSLOT * (ES.ENT // 8), SL)
+                        if fx.const_expr(TR <= 16):   # (enga) the rows' A quantized once, on the englook CTAs past their lookups
+                            ES.stage_enga(ckv, FS.FRONT_CTAS + ES.NSLOT * (ES.ENT // 8), SL)
                         ES.stage_engkv_ent(ckv, FS.FRONT_CTAS, CTAS - FS.FRONT_CTAS, ES.ED_ENT, SL)
                         hx.wait_storecnt0()
                     handoff(TCNT + i64(LY.TARGET_FRONT), t, False)

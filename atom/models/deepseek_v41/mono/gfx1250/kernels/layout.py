@@ -47,6 +47,7 @@ DRAFT_STATE = 400  # draft entry: block state done
 DRAFT_FRONT = 416  # draft entry: attention front done
 TARGET_STATE = 432  # target entry: block state done
 TARGET_FRONT = 448  # target entry: attention front done
+ENG_A = 464  # target entry: the Engram rows' A (quantized once, engram.stage_enga) out, a producer CTA each
 
 # --- fixed LDS regions --------------------------------------------------------------------------------------------
 TP_PAYLOAD = 0  # [TR][20] f32 TP reduction payload, kept across the FFN front
