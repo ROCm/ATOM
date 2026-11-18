@@ -2,10 +2,15 @@ ARG SGLANG_BASE_IMAGE="rocm/atom-dev:latest"
 ARG GPU_ARCH="gfx942;gfx950"
 
 # SGLang image extends an ATOM base image and layers on an sglang checkout.
-FROM ${SGLANG_BASE_IMAGE} AS atom_sglang
+# sglang_base also serves as the read-only source of the base image's Triton
+# for the restore step below.
+FROM ${SGLANG_BASE_IMAGE} AS sglang_base
+FROM sglang_base AS atom_sglang
 
 ARG GPU_ARCH
 ARG VENV_PYTHON="/opt/venv/bin/python"
+# Build-time only: keep downloaded wheels out of the layers.
+ARG PIP_NO_CACHE_DIR=1
 ARG SGLANG_REPO="https://github.com/sgl-project/sglang.git"
 ARG SGLANG_REF="v0.5.22"
 LABEL com.rocm.atom.sglang_ref="${SGLANG_REF}"
@@ -14,18 +19,7 @@ ENV PATH="/opt/venv/bin:${PATH}"
 ENV PYTHONPATH="/app/sglang/python:/app/ATOM:${PYTHONPATH}"
 
 RUN echo "========== [SGLANG-ATOM 0/6] Check Aiter/FlyDSL/Triton versions before SGLang build ==========" && \
-    "${VENV_PYTHON}" -m pip show atom amd-mori-nightly amd-aiter flydsl triton || true && \
-    echo "========== [SGLANG-ATOM 0/6] Back up base image Triton ==========" && \
-    SITE_PACKAGES=$("${VENV_PYTHON}" -c "import sysconfig; print(sysconfig.get_path('purelib'))") && \
-    BASE_TRITON_VERSION="$("${VENV_PYTHON}" -c "import triton; print(triton.__version__)")" && \
-    mkdir -p /tmp/triton-base-backup && \
-    cp -a "${SITE_PACKAGES}/triton" /tmp/triton-base-backup/ && \
-    for f in "${SITE_PACKAGES}"/triton-*.dist-info; do \
-      [ -d "$f" ] || continue; \
-      cp -a "$f" /tmp/triton-base-backup/; \
-    done && \
-    echo "Base image Triton backed up: import_version=${BASE_TRITON_VERSION}" && \
-    ls /tmp/triton-base-backup/
+    "${VENV_PYTHON}" -m pip show atom amd-mori-nightly amd-aiter flydsl triton || true
 
 RUN echo "========== [SGLANG-ATOM 1/6] Clone SGLang ==========" && \
     rm -rf /app/sglang && \
@@ -105,17 +99,38 @@ RUN echo "========== [SGLANG-ATOM 3/6] Install SGLang dependencies ==========" &
 # runtime installs can perturb Triton; restore the base package before final
 # validation so ATOM, AITER, triton_kernels, and SGLang run with one coherent
 # runtime stack, matching the vLLM/OOT image policy above.
-RUN echo "========== [SGLANG-ATOM 4/6] Restore base image Triton ==========" && \
+# The base image's Triton is read through a bind mount of sglang_base instead
+# of a /tmp backup: a backup taken in an earlier RUN stays in that layer even
+# after it is deleted, and copying back an unchanged tree writes the same
+# ~1.6 GB again. Restore only when the installed tree differs from the base.
+RUN --mount=type=bind,from=sglang_base,source=/opt/venv,target=/tmp/base-venv \
+    echo "========== [SGLANG-ATOM 4/6] Restore base image Triton ==========" && \
     SITE_PACKAGES=$("${VENV_PYTHON}" -c "import sysconfig; print(sysconfig.get_path('purelib'))") && \
-    "${VENV_PYTHON}" -m pip uninstall -y triton 2>/dev/null || true && \
-    rm -rf "${SITE_PACKAGES}/triton" \
-           "${SITE_PACKAGES}"/triton-*.dist-info && \
-    cp -a /tmp/triton-base-backup/triton "${SITE_PACKAGES}/" && \
-    for f in /tmp/triton-base-backup/triton-*.dist-info; do \
-      [ -d "$f" ] || continue; \
-      cp -a "$f" "${SITE_PACKAGES}/"; \
-    done && \
-    rm -rf /tmp/triton-base-backup && \
+    BASE_SITE_PACKAGES="/tmp/base-venv${SITE_PACKAGES#/opt/venv}" && \
+    test -d "${BASE_SITE_PACKAGES}/triton" && \
+    BASE_DIST_INFO="$(cd "${BASE_SITE_PACKAGES}" && ls -d triton-*.dist-info 2>/dev/null | sort | tr '\n' ' ')" && \
+    CUR_DIST_INFO="$(cd "${SITE_PACKAGES}" && ls -d triton-*.dist-info 2>/dev/null | sort | tr '\n' ' ')" && \
+    TRITON_CHANGED=0 && \
+    if [ "${BASE_DIST_INFO}" != "${CUR_DIST_INFO}" ]; then TRITON_CHANGED=1; fi && \
+    if [ "${TRITON_CHANGED}" = "0" ]; then \
+      for p in triton ${BASE_DIST_INFO}; do \
+        diff -rq -x __pycache__ "${BASE_SITE_PACKAGES}/${p}" "${SITE_PACKAGES}/${p}" >/dev/null \
+          || { TRITON_CHANGED=1; break; }; \
+      done; \
+    fi && \
+    if [ "${TRITON_CHANGED}" = "0" ]; then \
+      echo "Triton unchanged since the base image (${BASE_DIST_INFO}); nothing to restore"; \
+    else \
+      echo "Triton changed (${CUR_DIST_INFO:-none} vs base ${BASE_DIST_INFO}); restoring the base image copy" && \
+      { "${VENV_PYTHON}" -m pip uninstall -y triton 2>/dev/null || true; } && \
+      rm -rf "${SITE_PACKAGES}/triton" \
+             "${SITE_PACKAGES}"/triton-*.dist-info && \
+      cp -a "${BASE_SITE_PACKAGES}/triton" "${SITE_PACKAGES}/" && \
+      for f in "${BASE_SITE_PACKAGES}"/triton-*.dist-info; do \
+        [ -d "$f" ] || continue; \
+        cp -a "$f" "${SITE_PACKAGES}/"; \
+      done; \
+    fi && \
     "${VENV_PYTHON}" -c "import triton; print(f'triton.__version__ = {triton.__version__}')" && \
     "${VENV_PYTHON}" -m pip show triton
 
