@@ -80,12 +80,22 @@ def test_unsharded_execution_paths_are_rejected(overrides, reason):
 
 
 @pytest.mark.parametrize(
-    "sp,ep,error", [(4, False, None), (1, False, "expert"), (1, True, None)]
+    "sp,ep,all2all,error",
+    [
+        (4, False, "mori", None),
+        # Pure TP selects TP MegaMoE, which checks the model at start-up.
+        (1, False, "mori", None),
+        (1, True, "mori", None),
+        (1, True, "rccl", "MoRI transport"),
+    ],
 )
-def test_mega_moe_backend_needs_expert_parallelism_only_without_sp(sp, ep, error):
+def test_mega_moe_backend_config(sp, ep, all2all, error):
     # Under SP it selects SP MegaMoE; _init_sequence_parallel refuses EP there.
     config = atom_config_double(
-        moe_backend="mega", sequence_parallel_size=sp, enable_expert_parallel=ep
+        moe_backend="mega",
+        sequence_parallel_size=sp,
+        enable_expert_parallel=ep,
+        moe_all2all_backend=all2all,
     )
     with pytest.raises(ValueError, match=error) if error else nullcontext():
         Config._init_moe_backend(config)

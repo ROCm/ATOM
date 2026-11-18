@@ -2691,14 +2691,15 @@ class Config:
                 "moe_backend must be one of {'standard', 'mega'}, "
                 f"got {self.moe_backend!r}"
             )
-        # Under Ulysses SP, `mega` selects SP MegaMoE (sp_mega_moe.py) instead.
-        if self.moe_backend != "mega" or self.sequence_parallel_size > 1:
+        # Under Ulysses SP, `mega` selects SP MegaMoE (sp_mega_moe.py) instead,
+        # and without expert parallelism TP MegaMoE (tp_mega_moe.py), which
+        # `initialize_tp_mega_moe` checks against the model.
+        if (
+            self.moe_backend != "mega"
+            or self.sequence_parallel_size > 1
+            or not self.enable_expert_parallel
+        ):
             return
-        if not self.enable_expert_parallel:
-            raise ValueError(
-                "moe_backend='mega' requires expert parallelism; pass "
-                "--enable-expert-parallel, or --sequence-parallel-size for SP MegaMoE."
-            )
         if self.moe_all2all_backend == "rccl":
             raise ValueError(
                 "moe_backend='mega' owns its MoRI transport and cannot use the "

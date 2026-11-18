@@ -17,12 +17,13 @@ def test_mega_method_is_mxfp4_specialization():
     assert issubclass(moe_mod.MegaMxfp4MoEMethod, moe_mod.Mxfp4MoEMethod)
 
 
+@pytest.mark.parametrize("ep", [False, True])
 @pytest.mark.parametrize("sp", [False, True])
 @pytest.mark.parametrize("backend_name", ["standard", "mega"])
-def test_mxfp4_method_selection(monkeypatch, backend_name, sp):
+def test_mxfp4_method_selection(monkeypatch, backend_name, sp, ep):
     standard_method = object()
     mega_method = object()
-    config = SimpleNamespace(moe_backend=backend_name)
+    config = SimpleNamespace(moe_backend=backend_name, enable_expert_parallel=ep)
     monkeypatch.setattr(moe_mod, "get_current_atom_config", lambda: config)
     monkeypatch.setattr(moe_mod, "sp_is_enabled", lambda: sp)
     monkeypatch.setattr(moe_mod, "Mxfp4MoEMethod", lambda *_args: standard_method)
@@ -30,10 +31,11 @@ def test_mxfp4_method_selection(monkeypatch, backend_name, sp):
 
     selected = moe_mod._make_mxfp4_moe_method(object(), object())
 
-    # Under SP, `mega` is SP MegaMoE over the standard method's weights.
-    use_mega = backend_name == "mega" and not sp
+    # Under SP, `mega` is SP MegaMoE over the standard method's weights, and
+    # without EP, TP MegaMoE.
+    use_mega = backend_name == "mega" and ep and not sp
     assert selected is (mega_method if use_mega else standard_method)
-    if sp:
+    if backend_name == "mega" and not use_mega:
         # Nor does it hold the layer to the EP backend's requirements.
         moe_mod.FusedMoE._validate_moe_backend(SimpleNamespace(quant_method=selected))
 
@@ -239,7 +241,9 @@ def test_mega_eplb_views_include_shared_expert():
 
 def test_mega_rejects_the_legacy_shared_expert_fusion(monkeypatch):
     monkeypatch.setattr(
-        moe_mod, "get_current_atom_config", lambda: SimpleNamespace(moe_backend="mega")
+        moe_mod,
+        "get_current_atom_config",
+        lambda: SimpleNamespace(moe_backend="mega", enable_expert_parallel=True),
     )
     layer = SimpleNamespace(
         quant_method=object.__new__(moe_mod.MegaMxfp4MoEMethod),

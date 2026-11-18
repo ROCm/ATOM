@@ -2754,8 +2754,14 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
 def _make_mxfp4_moe_method(
     quant_config: LayerQuantConfig, moe: FusedMoEConfig
 ) -> Mxfp4MoEMethod:
-    # Under SP, `mega` runs SP MegaMoE over the native weights instead.
-    if get_current_atom_config().moe_backend == "mega" and not sp_is_enabled():
+    # Under SP, `mega` runs SP MegaMoE over the native weights instead, and
+    # without EP, TP MegaMoE (tp_mega_moe.py).
+    config = get_current_atom_config()
+    if (
+        config.moe_backend == "mega"
+        and config.enable_expert_parallel
+        and not sp_is_enabled()
+    ):
         return MegaMxfp4MoEMethod(quant_config, moe)
     return Mxfp4MoEMethod(quant_config, moe)
 
@@ -3672,6 +3678,12 @@ class FusedMoE(torch.nn.Module):
         )
         # Attached by `initialize_sp_mega_moe` under -sp --moe-backend mega.
         self.sp_mega_moe = None
+        # A model asks for TP MegaMoE (`--moe-backend mega` without EP / SP; the
+        # layer's output is then all-reduced on every step) by setting
+        # `tp_mega_moe_requested`; `initialize_tp_mega_moe` attaches the shared
+        # backend. Both stay unset on the production path.
+        self.tp_mega_moe_requested = False
+        self.tp_mega_moe = None
         self._comm_fused_moe = None
         if enable_comm_fused:
             from atom.model_ops.fused_moe.comm_fused_moe import (
@@ -4034,7 +4046,12 @@ class FusedMoE(torch.nn.Module):
         self._validate_moe_backend()
 
     def _validate_moe_backend(self) -> None:
-        if get_current_atom_config().moe_backend != "mega" or sp_is_enabled():
+        config = get_current_atom_config()
+        if (
+            config.moe_backend != "mega"
+            or not config.enable_expert_parallel
+            or sp_is_enabled()
+        ):
             return
         if not isinstance(self.quant_method, MegaMxfp4MoEMethod):
             raise TypeError(
@@ -5733,6 +5750,13 @@ class FusedMoE(torch.nn.Module):
             hidden_states.shape[0]
         ):
             return self.sp_mega_moe.forward(self, hidden_states, router_logits)
+
+        # TP MegaMoE (pure TP): the kernel all-reduces; the steps it does not
+        # take fall through to the production path, whose `reduce_results` the
+        # model set so that the layer's output is all-reduced either way.
+        tp_mega_moe = getattr(self, "tp_mega_moe", None)
+        if tp_mega_moe is not None and tp_mega_moe.runs(hidden_states.shape[0]):
+            return tp_mega_moe.forward(self, hidden_states, router_logits)
 
         if get_dp_group().world_size > 1:
             return self.forward_impl_graph(
