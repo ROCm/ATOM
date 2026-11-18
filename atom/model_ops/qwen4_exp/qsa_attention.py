@@ -38,6 +38,10 @@ from types import SimpleNamespace
 
 import aiter
 import torch
+from aiter.ops.qsa import (
+    qsa_sparse_prefill_supports_selection,
+    qsa_sparse_prefill_widths,
+)
 from aiter.rotary_embedding import get_rope
 from torch import nn
 
@@ -71,24 +75,9 @@ from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger(__name__)
 
-# Selection widths the aiter FlyDSL kernel accepts: 4T + 3 for T complete
-# four-token groups (T = 256, 512, 768, 1024), then the 0..3 causal tail.
-# Mirrors aiter; remove once ROCm/aiter#8083 lands
-# (`aiter.ops.qsa.qsa_sparse_prefill_widths()`).
-_FLYDSL_WIDTHS = (1027, 2051, 3075, 4099)
-
-
-@functools.cache
-def _flydsl_arch_supported() -> bool:
-    # aiter's entry raises on anything but gfx942 instead of falling back.
-    from aiter.jit.utils.chip_info import get_gfx_runtime
-
-    return get_gfx_runtime() == "gfx942"
-
 
 @functools.cache
 def _flydsl_attention_op():
-    # Imported on first use so the flag-off path needs no FlyDSL QSA in aiter.
     # aiter.ops.qsa is aiter's entry for consumers (ROCm/aiter#6576).
     from aiter.ops.qsa import qsa_sparse_prefill
 
@@ -130,16 +119,16 @@ def flydsl_fallback_reason(
     the layer. `ATOM_QSA_FLYDSL_ATTN` is checked by the callers."""
     if not kv_bf16:
         return "the KV cache is not BF16"
-    # `_FLYDSL_WIDTHS` mirrors aiter; remove once ROCm/aiter#8083 lands.
-    if compress_ratio != 4 or token_topk + 3 not in _FLYDSL_WIDTHS:
+    widths = qsa_sparse_prefill_widths()
+    if not widths:
+        return "aiter's FlyDSL QSA prefill does not run on this GPU"
+    if compress_ratio != 4 or token_topk + 3 not in widths:
         return f"indexer compress ratio {compress_ratio} / budget {token_topk}"
     if num_kv_heads != 1 or num_heads not in (12, 6, 3) or head_dim != 256:
         return (
             f"per-rank head shape {num_heads} q / {num_kv_heads} kv heads "
             f"x {head_dim} (needs 12, 6 or 3 q / 1 kv x 256)"
         )
-    if not _flydsl_arch_supported():
-        return "the GPU is not gfx942"
     return None
 
 
@@ -162,12 +151,9 @@ def _log_flydsl_active() -> None:
 def _flydsl_call_fallback_reason(query, width, qsa) -> str | None:
     """Why this one laid-out prefill call cannot take the FlyDSL attention, or None."""
     if width is None:
-        return f"selection wider than {_FLYDSL_WIDTHS[-1]} columns"
-    # aiter rejects a padded selection spanning 2**31 bytes or more (int32).
-    # Mirrors aiter; remove once ROCm/aiter#8083 lands
-    # (`aiter.ops.qsa.qsa_sparse_prefill_supports_selection(rows, width)`).
-    if query.shape[0] * width * 4 >= 2**31:
-        return "padded selection spans 2**31 bytes or more"
+        return f"selection wider than {qsa_sparse_prefill_widths()[-1]} columns"
+    if not qsa_sparse_prefill_supports_selection(query.shape[0], width):
+        return f"aiter does not take a {query.shape[0]} x {width} selection"
     if torch.cuda.is_current_stream_capturing():
         return "graph capture"
     if query.dtype != torch.bfloat16:
@@ -230,8 +216,7 @@ class _FlyDSLPrefill:
                 ratio,
                 qsa.max_seq_len,
             )[2]
-            # `_FLYDSL_WIDTHS` mirrors aiter; remove once ROCm/aiter#8083 lands.
-            width = next((w for w in _FLYDSL_WIDTHS if w >= columns), None)
+            width = next((w for w in qsa_sparse_prefill_widths() if w >= columns), None)
             reason = _flydsl_call_fallback_reason(query, width, qsa)
         self.reason = reason
         if reason is None:

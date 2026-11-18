@@ -11,6 +11,12 @@ import torch
 from aiter_stub import atom_without_aiter
 
 TOKENS = 8
+# aiter's answers on gfx942 (ROCm/aiter#8083), where the CPU job has no aiter.
+WIDTHS = (1027, 2051, 3075, 4099)
+
+
+def _supports_selection(rows, width):
+    return width in WIDTHS and rows * width * 4 < 2**31
 
 
 @pytest.fixture(scope="module")
@@ -86,7 +92,10 @@ def flydsl(modules, monkeypatch):
     monkeypatch.setenv("ATOM_QSA_FLYDSL_ATTN", "1")
     qa.log_flydsl_fallback.cache_clear()
     qa._log_flydsl_active.cache_clear()
-    monkeypatch.setattr(qa, "_flydsl_arch_supported", lambda: True)
+    monkeypatch.setattr(qa, "qsa_sparse_prefill_widths", lambda: WIDTHS)
+    monkeypatch.setattr(
+        qa, "qsa_sparse_prefill_supports_selection", _supports_selection
+    )
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(
         qa,
@@ -145,10 +154,12 @@ def test_selection_over_aiter_byte_limit_falls_back(modules, flydsl):
     assert flydsl == []
 
 
-def test_unsupported_arch_falls_back(modules, flydsl, monkeypatch):
-    monkeypatch.setattr(modules.qsa_attention, "_flydsl_arch_supported", lambda: False)
-    assert _attend(modules, _layer(), _qsa(modules)) is None
+def test_aiter_unavailable_falls_back(modules, flydsl, monkeypatch, caplog):
+    monkeypatch.setattr(modules.qsa_attention, "qsa_sparse_prefill_widths", tuple)
+    with caplog.at_level("WARNING"):
+        assert _attend(modules, _layer(), _qsa(modules)) is None
     assert flydsl == []
+    assert "does not run on this GPU" in _warnings(caplog)[0]
 
 
 def test_flag_off_falls_back(modules, flydsl, monkeypatch):

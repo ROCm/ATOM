@@ -78,7 +78,13 @@ def test_mixed_prefix_batch_reads_full_contexts_through_the_slot_table(monkeypat
     k_cache = rows.view(pages, block, 1, 1).expand(-1, -1, 1, 256).contiguous()
     calls = []
     monkeypatch.setenv("ATOM_QSA_FLYDSL_ATTN", "1")
-    monkeypatch.setattr(qsa_attention, "_flydsl_arch_supported", lambda: True)
+    # Any GPU: the kernel is replaced, only the layout is checked.
+    monkeypatch.setattr(
+        qsa_attention, "qsa_sparse_prefill_widths", lambda: (1027, 2051, 3075, 4099)
+    )
+    monkeypatch.setattr(
+        qsa_attention, "qsa_sparse_prefill_supports_selection", lambda r, w: True
+    )
     monkeypatch.setattr(
         qsa_attention,
         "_flydsl_attention_op",
@@ -133,12 +139,8 @@ def test_short_context_matches_native_kernel(monkeypatch, prefixes, extends):
     )
     from atom.plugin.sglang.qwen4_exp_bridge import _flydsl_prefill_layout
 
-    if not qsa_attention._flydsl_arch_supported():
-        pytest.skip("FlyDSL QSA attention needs gfx942")
-    try:
-        qsa_attention._flydsl_attention_op()
-    except ImportError:
-        pytest.skip("aiter without FlyDSL QSA attention (ROCm/aiter#6576)")
+    if not qsa_attention.qsa_sparse_prefill_widths():
+        pytest.skip("aiter's FlyDSL QSA prefill does not run on this GPU")
     monkeypatch.setenv("ATOM_QSA_FLYDSL_ATTN", "1")
 
     device, block, ratio, budget, heads, dim = "cuda", 64, 4, 2048, 6, 256
@@ -244,12 +246,8 @@ def test_in_place_reads_match_gathered_rows_bit_for_bit(monkeypatch, prefixes, e
     from atom.model_ops.qwen4_exp.ops.qsa import qsa_select_paged_tokens
     from atom.plugin.sglang.qwen4_exp_bridge import _flydsl_prefill_layout
 
-    if not qsa_attention._flydsl_arch_supported():
-        pytest.skip("FlyDSL QSA attention needs gfx942")
-    try:
-        qsa_attention._flydsl_attention_op()
-    except ImportError:
-        pytest.skip("aiter without FlyDSL QSA attention (ROCm/aiter#6576)")
+    if not qsa_attention.qsa_sparse_prefill_widths():
+        pytest.skip("aiter's FlyDSL QSA prefill does not run on this GPU")
     monkeypatch.setenv("ATOM_QSA_FLYDSL_ATTN", "1")
 
     device, block, ratio, budget, heads, dim, pages = "cuda", 64, 4, 2048, 12, 256, 512
@@ -392,7 +390,9 @@ def test_sharded_selection_written_in_place_matches_a_fresh_one(prefixes, extend
     )
     args = (groups, positions, seq_lens, token_to_req, ratio, budget)
     fresh = qsa_expand_block_indices(*args, output_width=columns)
-    kernel_width = next(w for w in qsa_attention._FLYDSL_WIDTHS if w >= columns)
+    kernel_width = next(
+        w for w in qsa_attention.qsa_sparse_prefill_widths() if w >= columns
+    )
     buffer = torch.full(
         (positions.numel(), kernel_width), -1, dtype=torch.int32, device=device
     )
