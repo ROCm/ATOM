@@ -433,30 +433,23 @@ def kda_head_norm(c, request, head):
     """Finish a whole head from CTA-local partial norms."""
 
     L, tid, threads = c["L"], c["tid"], c["matrix_threads"]
-    outputs = L * HEAD_DIM
+    width = c.get("head_width", HEAD_DIM)
+    outputs = L * width
     rounds = (outputs + threads - 1) // threads
     items = [
         fx.min(tid + threads * round_index, outputs - 1)
         for round_index in range_constexpr(rounds)
     ]
-    gates = mailbox_poll_many_device(
-        [
-            (
-                _scratch_region(c, "proj"),
-                (request * L + item // HEAD_DIM) * NPROJ
-                + G2_0
-                + head * HEAD_DIM
-                + item % HEAD_DIM,
-            )
-            for item in items
-        ],
-        c["tag"],
+    gates = (
+        c["head_gates"]
+        if const_expr("head_gates" in c)
+        else mailbox_poll_many_device(_head_gate_pairs(c, request, head), c["tag"])
     )
     tdm_timeline.stamp(tdm_timeline.HEAD_GATE_POLLED)
     for round_index in range_constexpr(rounds):
         item = items[round_index]
-        token = item // HEAD_DIM
-        row = item % HEAD_DIM
+        token = item // width
+        row = _head_norm_row(c, item)
         square_sum = fx.Float32(0.0)
         for chunk in range_constexpr(STATE_CHUNKS):
             square_sum = square_sum + fx.ptr_load(
@@ -507,10 +500,11 @@ def kda_recur_head(c, k, request, head):
     args = c["args"]
     live = k["slot0"] >= 0
     column = lane * 4
-    row0 = wave * ROWS
+    rows = c.get("head_rows", ROWS)
+    row0 = c["head_row0"] if const_expr("head_row0" in c) else wave * ROWS
     state = [
         live.select(k["state"][row][element], fx.Float32(0.0))
-        for row in range(ROWS)
+        for row in range(rows)
         for element in range(4)
     ]
     token = fx.Int32(0)
@@ -533,7 +527,7 @@ def kda_recur_head(c, k, request, head):
         slot = uniform(fx.ptr_load(c["slots"] + token))
         decayed = [
             [state[4 * row + element] * decay[element] for element in range(4)]
-            for row in range(ROWS)
+            for row in range(rows)
         ]
         projection, _ = lane_reduce_scatter(
             [
@@ -545,11 +539,11 @@ def kda_recur_head(c, k, request, head):
             architecture=GFX1250,
         )
         projections = lane_all_gather(
-            projection, ROWS, LANE_OFFSETS, lane, architecture=GFX1250
+            projection, rows, LANE_OFFSETS, lane, architecture=GFX1250
         )
         updated = []
         outputs = []
-        for row in range_constexpr(ROWS):
+        for row in range_constexpr(rows):
             value = (
                 fx.ptr_load(c["vloc"] + token * HEAD_DIM + row0 + row)
                 - projections[row]
@@ -573,21 +567,23 @@ def kda_recur_head(c, k, request, head):
             destination = rsrc(
                 args["rstate"] + fx.Int64(slot) * fx.Int64(args["rs_seq"]) * 4
             )
-            for row in range_constexpr(ROWS):
+            for row in range_constexpr(rows):
                 bo.buffer_store(
                     fx.Vector.from_elements(state[4 * row : 4 * row + 4], fx.Float32),
                     destination,
                     (head * GATE_K + row0 + row) * GATE_K + column,
                 )
-        # Lanes 2r and 2r + 1 hold row r's output.
-        if lane % 2 == 0:
+        # Lanes 2r and 2r + 1 hold row r's output (lanes 32/R r.. of R rows).
+        if lane % (GFX1250.wave_size // rows) == 0:
             fx.ptr_store(output, c["ol"] + token * HEAD_DIM + row0 + output_row)
-        if lane == 0:
-            square_sum = fx.Float32(0.0)
-            for row in range_constexpr(ROWS):
-                written = fx.ptr_load(c["ol"] + token * HEAD_DIM + row0 + row)
-                square_sum = square_sum + written * written
-            fx.ptr_store(square_sum, c["head_onrm"] + token * STATE_CHUNKS + wave)
+        # A split head's chunks span waves: their norms follow the loop.
+        if const_expr(rows == ROWS):
+            if lane == 0:
+                square_sum = fx.Float32(0.0)
+                for row in range_constexpr(ROWS):
+                    written = fx.ptr_load(c["ol"] + token * HEAD_DIM + row0 + row)
+                    square_sum = square_sum + written * written
+                fx.ptr_store(square_sum, c["head_onrm"] + token * STATE_CHUNKS + wave)
         token = token + fx.Int32(1)
     gpu.barrier()
 
@@ -597,7 +593,7 @@ def _head_state_loads(c, slot, head):
     lane: issued before the head waits on its projection, their latency hides
     under it."""
     column = c["lane"] * 4
-    row0 = c["wave"] * ROWS
+    row0 = c["head_row0"] if const_expr("head_row0" in c) else c["wave"] * ROWS
     source = rsrc(
         c["args"]["rstate"]
         + fx.Int64(fx.max(slot, 0)) * fx.Int64(c["args"]["rs_seq"]) * 4
@@ -611,14 +607,15 @@ def _head_state_loads(c, slot, head):
                 dtype=T.f32,
             )
         )
-        for row in range(ROWS)
+        for row in range(c.get("head_rows", ROWS))
     ]
 
 
 @traced
-def prefetch_head_state(args, request, head, tid, threads):
-    """``head``'s recurrent state of ``request`` into this XCD's L2, a 128 B
-    line a thread, so ``_head_state_loads`` after the projection hits L2."""
+def prefetch_head_state(args, request, head, tid, threads, part=0, split=1):
+    """``head``'s recurrent state of ``request`` (part ``part`` of ``split``
+    row slices) into this XCD's L2, a 128 B line a thread, so
+    ``_head_state_loads`` after the projection hits L2."""
     acc_idx = uniform(ld_i32(args["num_acc"], request)) - 1
     slot0 = uniform(ld_i32(args["st_idx"], request * args["st_stride"] + acc_idx))
     base = (
@@ -626,7 +623,9 @@ def prefetch_head_state(args, request, head, tid, threads):
         + fx.Int64(fx.max(slot0, 0)) * fx.Int64(args["rs_seq"]) * 4
         + fx.Int64(head * GATE_K * GATE_K * 4)
     )
-    lines = GATE_K * GATE_K * 4 // 128
+    if const_expr(split > 1):
+        base = base + fx.Int64(part * (GATE_K // split) * GATE_K * 4)
+    lines = GATE_K * GATE_K * 4 // 128 // split
     for step in range_constexpr((lines + threads - 1) // threads):
         line = tid + step * threads
         if line < lines:
@@ -693,12 +692,13 @@ def _head_gate_loads(c, head):
 def _head_norm_weight_loads(c):
     """``kda_head_norm``'s ``on_w`` values, one a round."""
     L, tid, threads = c["L"], c["tid"], c["matrix_threads"]
-    outputs = L * HEAD_DIM
+    width = c.get("head_width", HEAD_DIM)
+    outputs = L * width
     return [
         fx.Float32(
             bo.buffer_load(
                 rsrc(c["args"]["on_w"]),
-                fx.min(tid + threads * round_index, outputs - 1) % HEAD_DIM,
+                _head_norm_row(c, fx.min(tid + threads * round_index, outputs - 1)),
                 vec_width=1,
                 dtype=T.f32,
             )
@@ -707,12 +707,104 @@ def _head_norm_weight_loads(c):
     ]
 
 
+def _head_gate_pairs(c, request, head):
+    """The ``(pointer, index)`` pairs of ``kda_head_norm``'s output gates."""
+    L, tid, threads = c["L"], c["tid"], c["matrix_threads"]
+    width = c.get("head_width", HEAD_DIM)
+    outputs = L * width
+    return [
+        (
+            _scratch_region(c, "proj"),
+            (request * L + item // width) * NPROJ
+            + G2_0
+            + head * HEAD_DIM
+            + _head_norm_row(c, item),
+        )
+        for item in (
+            fx.min(tid + threads * round_index, outputs - 1)
+            for round_index in range_constexpr((outputs + threads - 1) // threads)
+        )
+    ]
+
+
+def _head_norm_row(c, item):
+    """Output item ``item``'s head row: a split head's share finishes its own
+    ``head_width`` rows from ``head_row_base``."""
+    if const_expr("head_width" not in c):
+        return item % HEAD_DIM
+    return c["head_row_base"] + item % c["head_width"]
+
+
+def _head_conv_store(c, conv, new_values):
+    """A split head's conv state channel: the kept old values, then the new."""
+    L, SL, cs_tok = c["L"], c["SL"], c["args"]["cs_tok"]
+    resource = rsrc(conv["state"])
+    for token in range_constexpr(SL):
+        value = conv["old"][token] if token < SL - L else new_values[token - (SL - L)]
+        bo.buffer_store(
+            value.to(fx.BFloat16),
+            resource,
+            conv["state_offset"] + token * cs_tok,
+        )
+
+
 @traced
-def kda_head(c, request, head):
-    """One plain-decode request/head without cross-CTA QK/ONRM handoffs."""
+def _head_norm_exchange(c, request, head, share):
+    """A split head's 16-row chunk square sums, each in the whole head's row
+    order: this part's from its outputs, published, the others' polled."""
+
+    L, tid = c["L"], c["tid"]
+    split = c["head_split"]
+    own = STATE_CHUNKS // split
+    onrm = _scratch_region(c, "onrm")
+    base = (request * HEADS + head) * L * STATE_CHUNKS
+    if tid < L * own:
+        token = tid // own
+        chunk = share * own + tid % own
+        square_sum = fx.Float32(0.0)
+        for row in range_constexpr(ROWS):
+            written = fx.ptr_load(c["ol"] + token * HEAD_DIM + chunk * ROWS + row)
+            square_sum = square_sum + written * written
+        fx.ptr_store(square_sum, c["head_onrm"] + token * STATE_CHUNKS + chunk)
+        mailbox_store_device(
+            onrm, base + token * STATE_CHUNKS + chunk, square_sum, c["tag"]
+        )
+    others = STATE_CHUNKS - own
+    item = fx.min(tid, L * others - 1)
+    token = item // others
+    index = item % others
+    chunk = (index < share * own).select(index, index + own)
+    (square_sum,) = mailbox_poll_many_device(
+        [(onrm, base + token * STATE_CHUNKS + chunk)], c["tag"]
+    )
+    if tid < L * others:
+        fx.ptr_store(
+            _f32_of(square_sum), c["head_onrm"] + token * STATE_CHUNKS + chunk
+        )
+    gpu.barrier()
+
+
+@traced
+def kda_head(c, request, head, share=None):
+    """One plain-decode request/head without cross-CTA QK/ONRM handoffs.
+
+    ``head_split`` CTAs share a head: each runs the whole prologue, then
+    advances (and stores) share ``share``'s ``HEAD_DIM / head_split`` state
+    rows, ``head_rows`` a wave, and finishes their outputs; the output norm's
+    16-row chunk sums cross between the shares as tagged pairs. A share's conv
+    state channels are stored only past that exchange, once every share has
+    read the windows they overwrite (each share is past its conv once it has
+    published its norm sums), each share a contiguous run of channels."""
 
     L, tid = c["L"], c["tid"]
     args = c["args"]
+    split = c.get("head_split", 1)
+    if const_expr(split > 1):
+        width = HEAD_DIM // split
+        c["head_rows"] = ROWS // split
+        c["head_row0"] = share * width + c["wave"] * (ROWS // split)
+        c["head_width"] = width
+        c["head_row_base"] = share * width
     tdm_timeline.stamp(tdm_timeline.HEAD_START)
     acc_idx = uniform(ld_i32(args["num_acc"], request)) - 1
     slot_c = uniform(ld_i32(args["st_idx"], request * args["st_stride"]))
@@ -727,7 +819,9 @@ def kda_head(c, request, head):
             ld_i32(args["st_idx"], request * args["st_stride"] + tid),
             c["slots"] + tid,
         )
-    head_state = _head_state_loads(c, slot0, head)
+    # A split head's state rows (prefetched to L2 at the entry) follow its
+    # poll, so its wait on the projection is not queued behind them.
+    head_state = None if split > 1 else _head_state_loads(c, slot0, head)
 
     projected = _scratch_region(c, "proj")
     threads = c["matrix_threads"]
@@ -756,6 +850,8 @@ def kda_head(c, request, head):
     gate_loaded = _head_gate_loads(c, head) if preload else None
     if const_expr(preload):
         c["on_w_loaded"] = _head_norm_weight_loads(c)
+    # A split head's output gates land with the rest, not after its exchange.
+    gate_pairs = _head_gate_pairs(c, request, head) if split > 1 else []
     # Clamped indices keep every polled pair a published one; each value is
     # stored below only by the thread that owns it.
     polled = mailbox_poll_many_device(
@@ -771,9 +867,14 @@ def kda_head(c, request, head):
             (projected, (request * L + token) * NPROJ + channel)
             for channel in channel_of
             for token in range_constexpr(L)
-        ],
+        ]
+        + gate_pairs,
         c["tag"],
     )
+    if const_expr(split > 1):
+        c["head_gates"] = polled[len(polled) - len(gate_pairs) :]
+    if const_expr(split > 1):
+        head_state = _head_state_loads(c, slot0, head)
     tdm_timeline.stamp(tdm_timeline.HEAD_POLLED)
     for iteration in range_constexpr(fa_rounds):
         if fa_raw[iteration] < n_fa:
@@ -785,9 +886,12 @@ def kda_head(c, request, head):
             c["beta"] + tid,
         )
 
+    deferred = []
     for round_index in range_constexpr(channel_rounds):
         raw = channel_raw[round_index]
-        conv = conv_loaded[round_index] or _head_conv_loads(c, head, slot_c, acc_idx, raw)
+        conv = conv_loaded[round_index] or _head_conv_loads(
+            c, head, slot_c, acc_idx, raw, split > 1
+        )
         part, column = conv["part"], conv["column"]
         state, state_offset = conv["state"], conv["state_offset"]
         weights, window = conv["weights"], conv["window"]
@@ -795,7 +899,12 @@ def kda_head(c, request, head):
             _f32_of(polled[fa_rounds + 1 + round_index * L + token])
             for token in range(L)
         ]
-        if (raw < channels) & (slot_c >= 0):
+        stores_conv = (raw < channels) & (slot_c >= 0)
+        if const_expr(split > 1):
+            deferred.append(
+                (stores_conv & (raw * split // channels == share), conv, new_values)
+            )
+        elif stores_conv:
             resource = rsrc(state)
             for token in range_constexpr(c["SL"]):
                 value = (
@@ -852,6 +961,12 @@ def kda_head(c, request, head):
     c["head_onrm"] = c["head_onrm_lds"]
     kda_recur_head(c, metadata, request, head)
     tdm_timeline.stamp(tdm_timeline.HEAD_RECUR)
+    if const_expr(split > 1):
+        _head_norm_exchange(c, request, head, share)
+        tdm_timeline.stamp(tdm_timeline.HEAD_EXCHANGED)
+        for stores_conv, conv, new_values in deferred:
+            if stores_conv:
+                _head_conv_store(c, conv, new_values)
     kda_head_norm(c, request, head)
     tdm_timeline.stamp(tdm_timeline.HEAD_DONE)
 
@@ -1618,8 +1733,8 @@ class StageBackend:
         kda_conv_compute(c, k, request, head, chunk)
 
     @staticmethod
-    def kda_head(c, request, head):
-        kda_head(c, request, head)
+    def kda_head(c, request, head, share=None):
+        kda_head(c, request, head, share)
 
     @staticmethod
     def kda_gates(c, k, request, head):

@@ -190,3 +190,39 @@ def test_local_build_accepts_the_production_conv_window():
     _spec(qlen=16).validate(plan)
     with pytest.raises(ValueError, match="two retained history"):
         replace(_spec(qlen=16), state_len=17).validate(plan)
+
+
+@pytest.mark.parametrize(
+    ("switch", "heads", "split"),
+    [
+        ("", 48, 1),
+        ("1", 48, 1),
+        ("2", 48, 2),
+        ("4", 96, 1),
+        ("auto", 48, 4),
+        ("auto", 96, 2),
+        ("auto", 192, 1),
+    ],
+)
+def test_head_split_counts_only_parts_the_grid_holds_at_once(
+    monkeypatch, switch, heads, split
+):
+    from atom.models.kimi_k3.mono.kernels.attention import kda_resident_gfx1250
+
+    monkeypatch.setenv("ATOM_KIMI_MONO_K1_HEAD_SPLIT", switch)
+    assert kda_resident_gfx1250._head_split(heads, 256) == split
+
+
+def test_head_split_defaults_to_auto(monkeypatch):
+    from atom.utils import envs
+
+    monkeypatch.delenv("ATOM_KIMI_MONO_K1_HEAD_SPLIT", raising=False)
+    assert envs.ATOM_KIMI_MONO_K1_HEAD_SPLIT == "auto"
+
+
+def test_head_split_refuses_other_counts(monkeypatch):
+    from atom.models.kimi_k3.mono.kernels.attention import kda_resident_gfx1250
+
+    monkeypatch.setenv("ATOM_KIMI_MONO_K1_HEAD_SPLIT", "3")
+    with pytest.raises(ValueError):
+        kda_resident_gfx1250._head_split(48, 256)

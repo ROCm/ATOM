@@ -185,6 +185,24 @@ def _state_prefetch() -> bool:
     return envs.ATOM_KIMI_MONO_K1_STATE_PREFETCH
 
 
+def _auto_head_split(heads: int, blocks: int) -> int:
+    """The most of 4, 2 CTAs a head whose parts all fit the grid at once."""
+    return next((count for count in (4, 2) if heads * count <= blocks), 1)
+
+
+def _head_split(heads: int, blocks: int) -> int:
+    """CTAs a whole head's recurrence splits over: ``auto`` (the default)
+    ``_auto_head_split``, else the switch's count, 1 when its parts would not
+    fit the grid."""
+    split = envs.ATOM_KIMI_MONO_K1_HEAD_SPLIT
+    if split == "auto":
+        return _auto_head_split(heads, blocks)
+    split = int(split or 1)
+    if split not in (1, 2, 4, 8):
+        raise ValueError(f"ATOM_KIMI_MONO_K1_HEAD_SPLIT={split}: not 1, 2, 4 or 8")
+    return split if heads * split <= blocks else 1
+
+
 def build_resident_k1(
     plan: Gfx1250KimiBuildPlan,
     declaration: K1KernelDeclaration,
@@ -205,6 +223,7 @@ def build_resident_k1(
         tdm_timeline.key(),
         _head_preload(),
         _state_prefetch(),
+        envs.ATOM_KIMI_MONO_K1_HEAD_SPLIT,
     )
     cached = _BUILDS.get(cache_key)
     if cached is not None:
@@ -232,6 +251,13 @@ def build_resident_k1(
     qlen = declaration.qlen
     sources = declaration.nblocks + 1
     task_count = (s // qlen) * HEADS * STATE_CHUNKS
+    whole_heads = qlen == 1 or task_count > declaration.blocks
+    head_split = (
+        _head_split((s // qlen) * HEADS, declaration.blocks) if whole_heads else 1
+    )
+    auto_split = (
+        _auto_head_split((s // qlen) * HEADS, declaration.blocks) if whole_heads else 1
+    )
     keyed = key_tuple(
         ResidentBuildKey(
             s,
@@ -257,7 +283,13 @@ def build_resident_k1(
             declaration.lds.split_stages,
         ),
         SOURCES,
-    ), (gemv_tdm.cold_suffix(), tdm_timeline.key(), _head_preload(), _state_prefetch())
+    ), (
+        gemv_tdm.cold_suffix(),
+        tdm_timeline.key(),
+        _head_preload(),
+        _state_prefetch(),
+        head_split,
+    )
     timeline = tdm_timeline.key()
     name = (
         f"k3_k1_gfx1250_resident_s{s}_l{qlen}_nb{declaration.nblocks}"
@@ -266,6 +298,7 @@ def build_resident_k1(
         f"{'_f8' if spec.fp8_projection else ''}"
         f"{f'_sk{split_stages}' if split_stages else ''}{gemv_tdm.cold_suffix()}"
         f"{'' if _head_preload() else '_nohp'}{'' if _state_prefetch() else '_nosp'}"
+        f"{f'_hs{head_split}' if head_split != auto_split else ''}"
         f"{tdm_timeline.suffix()}"
     )
 
@@ -493,10 +526,16 @@ def build_resident_k1(
         if const_expr(
             _state_prefetch() and (qlen == 1 or task_count > declaration.blocks)
         ):
-            # Only a CTA that projects first; the others' state loads already
-            # hide under their wait on the projection.
+            # Only a CTA that projects first, the others' state loads hiding
+            # under their wait on the projection -- unless the head is split,
+            # its state loads then following that wait.
             head_task = _task_start(bid, spec.kda0, declaration.blocks)
-            if (bid >= ATTENTION_CTAS) & (head_task < (s // qlen) * HEADS):
+            if const_expr(head_split == 1):
+                prefetches = (bid >= ATTENTION_CTAS) & (head_task < (s // qlen) * HEADS)
+            else:
+                prefetches = head_task < (s // qlen) * HEADS * head_split
+            if prefetches:
+                unit = head_task // head_split
                 gfx_backend.prefetch_head_state(
                     {
                         "num_acc": num_acc,
@@ -505,10 +544,12 @@ def build_resident_k1(
                         "rstate": rstate,
                         "rs_seq": rs_seq,
                     },
-                    head_task // HEADS,
-                    head_task % HEADS,
+                    unit // HEADS,
+                    unit % HEADS,
                     tid,
                     declaration.threads,
+                    head_task % head_split,
+                    head_split,
                 )
         allocator = fx.SharedAllocator()
         tdm_timeline.open_cta(bid, wave, timeline, allocator)
@@ -885,6 +926,7 @@ def build_resident_k1(
             "matrix_waves": declaration.waves,
             "matrix_threads": declaration.threads,
             "head_preload": _head_preload(),
+            "head_split": head_split,
             "red": smem.red.ptr,
             "tls": smem.tls.ptr,
             "fa": recurrence.fa.ptr,
@@ -926,21 +968,31 @@ def build_resident_k1(
         # A chunk task spreads one request/head over eight CTAs; once those
         # tasks need more than one pass of the grid, a whole head per CTA is
         # faster.
-        if const_expr(qlen == 1 or task_count > declaration.blocks):
-            head_tasks = (s // qlen) * HEADS
+        if const_expr(whole_heads):
+            # A split head's parts are adjacent tasks, so adjacent CTAs: one
+            # cluster, one XCD.
+            head_tasks = (s // qlen) * HEADS * head_split
             for task in range(first, head_tasks, declaration.blocks):
-                request = task // HEADS
-                head = task % HEADS
+                unit = task // head_split if const_expr(head_split > 1) else task
+                request = unit // HEADS
+                head = unit % HEADS
                 compute["kda_head"](
                     recurrence_context,
                     request,
                     head,
+                    task % head_split if const_expr(head_split > 1) else None,
                 )
                 if const_expr(spec.quant_core):
                     device["wait_vector_stores"]()
                     gpu.barrier()
                     if tid == 0:
-                        for chunk in range_constexpr(STATE_CHUNKS):
+                        for own in range_constexpr(STATE_CHUNKS // head_split):
+                            chunk = (
+                                (task % head_split) * (STATE_CHUNKS // head_split)
+                                + own
+                                if const_expr(head_split > 1)
+                                else own
+                            )
                             gfx_backend.mailbox_store_device(
                                 core_ready,
                                 (request * HEADS + head) * STATE_CHUNKS + chunk,

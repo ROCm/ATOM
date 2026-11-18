@@ -37,9 +37,9 @@ PROJECT_DONE, STAGED, STORES_ISSUED, STORES_DONE, RECURRENCE, END = range(88, 94
 CYCLES_ENTRY, CYCLES_END = 94, 95
 # K1's whole-head recurrence task (``kda_gfx1250.kda_head``, the CTA's first):
 # entered, its projected rows polled, conv done, gates done, recurrence done,
-# its output gates polled, core_out stored.
+# its output gates polled, core_out stored; a split head's norm exchange done.
 HEAD_START, HEAD_POLLED, HEAD_CONV, HEAD_GATES = 96, 97, 98, 99
-HEAD_RECUR, HEAD_GATE_POLLED, HEAD_DONE = 100, 101, 102
+HEAD_RECUR, HEAD_GATE_POLLED, HEAD_DONE, HEAD_EXCHANGED = 100, 101, 102, 103
 POINTS = {
     "hw_id": HW_ID,
     "entry": ENTRY,
@@ -58,6 +58,7 @@ POINTS = {
     "head_recur": HEAD_RECUR,
     "head_gate_polled": HEAD_GATE_POLLED,
     "head_done": HEAD_DONE,
+    "head_exchanged": HEAD_EXCHANGED,
 }
 
 _config: tuple[int, int] | None = None

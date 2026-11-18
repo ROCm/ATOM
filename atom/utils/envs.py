@@ -707,6 +707,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_KIMI_MONO_K1_STATE_PREFETCH", "1"
     )
     == "1",
+    # Kimi-K3 gfx1250 mono: K1's whole-head recurrence over this many CTAs a
+    # head (2, 4, 8, or "auto": the most of 4, 2 that fit the grid), each
+    # advancing its share of the state rows after the whole prologue, the
+    # output norm's chunk sums crossing between them (the same bits); "auto"
+    # by default, 1 keeps one CTA a head.
+    "ATOM_KIMI_MONO_K1_HEAD_SPLIT": lambda: os.getenv(
+        "ATOM_KIMI_MONO_K1_HEAD_SPLIT", "auto"
+    ),
     # Kimi-K3 gfx1250 mono: the fused MoE's gate/up K tiles, its M tiles'
     # epilogues and down tiles, and its staging loops as runtime loops, so a
     # cold launch fetches one body's code each (the same bits); 0 unrolls them
