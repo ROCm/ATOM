@@ -127,7 +127,8 @@ SEAMS = MappingProxyType(
                 ("x",),
                 "opaque_op",
                 _V41 + "model.py",
-                doc="the FFN sublayer, Block.ffn(normed): bf16 [T,H] -> bf16 [T,H]",
+                doc="the FFN sublayer, Block.ffn(normed): bf16 [T,H] -> bf16 [T,H]"
+                "; flags: layer_id, module",
             ),
             _seam(
                 "v41.attn.out",

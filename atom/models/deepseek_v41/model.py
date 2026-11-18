@@ -71,7 +71,7 @@ class Block(nn.Module):
         self._ffn = plugin_host.bind(
             "v41.block.ffn",
             self.ffn.__call__,
-            capability={"flags": {"layer_id": spec.layer_id}},
+            capability={"flags": {"layer_id": spec.layer_id, "module": self.ffn}},
             layer=self.layer_name,
             fake=torch.empty_like,
         )
