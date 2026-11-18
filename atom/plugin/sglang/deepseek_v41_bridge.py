@@ -3505,6 +3505,135 @@ def record_deepseek_v41_prefill_token_graphs(model_runner) -> tuple[int, ...]:
     return recorded
 
 
+V41_PREFILL_WARMUP_ENV = "ATOM_SGLANG_V41_PREFILL_WARMUP"
+
+
+def v41_prefill_warmup_enabled() -> bool:
+    raw = os.getenv(V41_PREFILL_WARMUP_ENV, "1").strip().lower()
+    return bool(raw) and raw not in ("0", "false", "no", "off")
+
+
+def warm_deepseek_v41_eager_prefill(model_runner) -> int:
+    """One eager prefill at the server's chunk budget before the first
+    request, every rank at once, as native's ``ModelRunner.warmup_model``
+    (``max_num_batched_tokens`` rows split over two sequences under DSpark,
+    else one). Returns the rows run, 0 when skipped.
+
+    SGLang's own start-up runs no prefill wider than the token-graph
+    buckets, so without this the first real chunk-sized EXTEND pays every
+    first-use cost of the eager path at that width (kernel module loads,
+    caching-allocator growth for its activations): measured ~0.4 s on the
+    first c64 GSM8K burst of a fresh TP4 server, the gap to native's first
+    burst. The rows are the token-graph capture layout
+    (`build_for_sglang_token_graph_capture`'s core): reserved capture STATE
+    slots, every row on SGLang's padding PAGE 0, ``metadata.dummy`` (no
+    slot reset, Engram lookup or cursor advance), so no live state is
+    touched. Off with ``ATOM_SGLANG_V41_PREFILL_WARMUP=0``."""
+    from atom.plugin.sglang.runtime.context import plugin_runtime_scope
+    from atom.utils.forward_context import (
+        Context,
+        DPMetadata,
+        get_forward_context,
+        reset_forward_context,
+        set_forward_context,
+    )
+
+    if not v41_prefill_warmup_enabled():
+        return 0
+    builder = _V41_BUILDER
+    if builder is None or builder.cache is None:
+        return 0
+    wrapper = model_runner.model
+    atom_config = wrapper.atom_config
+    if getattr(atom_config, "enable_dp_attention", False) or getattr(
+        atom_config, "enable_tbo", False
+    ):
+        # Every DP rank would have to agree on the rows (`DPMetadata`), and a
+        # TBO prefill splits into micro-batches: neither is wired here.
+        return 0
+    pool = model_runner.token_to_kv_pool
+    tokens = min(
+        int(builder.max_num_batched_tokens),
+        int(getattr(model_runner.server_args, "chunked_prefill_size", 0) or 0)
+        or int(builder.max_num_batched_tokens),
+    )
+    surface = getattr(wrapper, "_v41_dspark", None)
+    count = 2 if surface is not None else 1
+    if tokens < count or count > len(pool.capture_slots):
+        return 0
+    lengths = (tokens // count,) * (count - 1) + (
+        tokens - (tokens // count) * (count - 1),
+    )
+    slots = tuple(int(s) for s in pool.capture_slots[:count])
+    device = builder.cache.backing.device
+    ids = torch.zeros(tokens, dtype=torch.int64, device=device)
+    start = time.perf_counter()
+    with plugin_runtime_scope(framework="sglang", atom_config=atom_config):
+        try:
+            pages = -(-max(lengths) // builder.block_size)
+            batch = SimpleNamespace(
+                is_dummy_run=False,
+                req_ids=slots,
+                num_scheduled_tokens=lengths,
+                context_lens=lengths,
+                state_slots_committed=slots,
+                block_tables=((0,) * pages,) * count,
+                total_seqs_num=count,
+                total_tokens_num=tokens,
+                is_final_chunk=None,
+                replaying={},
+            )
+            metadata, positions = builder._prepare(
+                batch, count, tokens, is_prefill=True, engram_live=False
+            )
+            metadata.dummy = True
+            builder.prepare_model_inputs(ids, metadata)
+            context = Context(
+                positions=positions[:tokens],
+                is_prefill=True,
+                is_dummy_run=False,
+                scheduled_bs=count,
+                scheduled_tokens=tokens,
+                running_bs=count,
+                running_tokens=tokens,
+            )
+            set_forward_context(
+                attn_metadata=metadata,
+                atom_config=atom_config,
+                context=context,
+                running_tokens_per_dp_rank=DPMetadata.gather_running_tokens(
+                    atom_config.parallel_config, tokens
+                ),
+            )
+            get_forward_context().tr_graph = None
+            if surface is not None:
+                surface._rows.clear()
+            wrapper.model(
+                **wrapper._filter_model_forward_kwargs(
+                    {
+                        "input_ids": ids,
+                        "positions": context.positions,
+                        "intermediate_tensors": None,
+                        "inputs_embeds": None,
+                    }
+                )
+            )
+            if surface is not None:
+                surface._rows.clear()
+            torch.cuda.synchronize()
+        finally:
+            reset_forward_context()
+    logger.info(
+        "ATOM DeepSeek-V4.1: eager prefill warm-up of %d rows (%s) in %.2f s "
+        "(%s=0 to disable)",
+        tokens,
+        "+".join(str(n) for n in lengths),
+        time.perf_counter() - start,
+        V41_PREFILL_WARMUP_ENV,
+    )
+    return tokens
+
+
 # ---------------------------------------------------------------------------
 # Decode CUDA graphs
 # ---------------------------------------------------------------------------

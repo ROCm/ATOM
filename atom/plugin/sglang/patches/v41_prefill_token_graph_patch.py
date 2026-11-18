@@ -103,6 +103,10 @@ def install_v41_prefill_token_graph_patch() -> bool:
         if runner is not None:
             with torch.no_grad():
                 bridge.record_deepseek_v41_prefill_token_graphs(runner)
+                # Then one eager prefill at the chunk budget, as native's
+                # `warmup_model`: the first served chunk-sized EXTEND would
+                # otherwise pay the eager path's first-use costs.
+                bridge.warm_deepseek_v41_eager_prefill(runner)
 
     init_all_cuda_graphs._atom_v41_prefill_token_graphs = True
     cls.init_all_cuda_graphs = init_all_cuda_graphs

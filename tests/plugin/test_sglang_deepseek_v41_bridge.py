@@ -1413,15 +1413,22 @@ class TestPrefillTokenGraphPatch:
             "record_deepseek_v41_prefill_token_graphs",
             lambda runner: calls.append(("record", runner)),
         )
+        monkeypatch.setattr(
+            bridge,
+            "warm_deepseek_v41_eager_prefill",
+            lambda runner: calls.append(("warm", runner)),
+        )
         assert patch.install_v41_prefill_token_graph_patch()
         wrapped = cls.init_all_cuda_graphs
         assert patch.install_v41_prefill_token_graph_patch()
         assert cls.init_all_cuda_graphs is wrapped
         scheduler = self._scheduler()
         wrapped(scheduler)
+        # The eager prefill warm-up runs after the token graphs are recorded.
         assert calls == [
             "sglang graphs",
             ("record", scheduler.tp_worker.model_runner),
+            ("warm", scheduler.tp_worker.model_runner),
         ]
         # A draft runner, graphs off, or another pool: SGLang's graphs only.
         for other in (
