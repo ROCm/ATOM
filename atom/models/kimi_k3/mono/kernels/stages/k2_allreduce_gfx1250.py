@@ -32,6 +32,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T, as_ir_value
 
 from atom.models.kimi_k3.mono.config import HIDDEN, LATENT, TOPK
+from atom.models.kimi_k3.mono.kernels.stages import fresh_prefetch_gfx1250 as fresh
 from atom.mono.device.ops import (
     bf2_f32,
     bf16_round,
@@ -588,6 +589,52 @@ def _push_reduce7(local, mine, bases, rank, tp, lines, bank, tag, line, values, 
     _store_seven(local, line * LINE7_ELEMENTS, [bf16_round(v) for v in reduced])
 
 
+@traced
+def _prefetch_gather7(data, grouped, route_rows, route_weights, rows, lines, bid, tid):
+    """``ATOM_KIMI_MONO_XPF=gather``: the lines this CTA gathers, ahead of its
+    routes: a routed CTA's TOPK half rows of ``grouped`` at the fused MoE's
+    identity routes (row ``token * TOPK + k``; other routes only miss) and its
+    token's routes, a shared CTA's lines of ``data``."""
+    half = LINE7_ROUTED // 2 * LINE7_ELEMENTS
+    per_row = half * 2 // 128
+    if bid * THREADS < rows * LINE7_ROUTED:
+        token = bid * THREADS // LINE7_ROUTED
+        column = (bid * THREADS % LINE7_ROUTED) * LINE7_ELEMENTS
+        fresh.prefetch_own(
+            "gather",
+            lambda i: grouped
+            + fx.Int64((token * TOPK + i // per_row) * LATENT + column) * 2
+            + fx.Int64(i % per_row * 128),
+            TOPK * per_row,
+            tid,
+            THREADS,
+        )
+        fresh.prefetch_own(
+            "gather",
+            lambda i: route_rows + fx.Int64(token * TOPK * 4),
+            1,
+            tid,
+            THREADS,
+        )
+        fresh.prefetch_own(
+            "gather",
+            lambda i: route_weights + fx.Int64(token * TOPK * 4),
+            1,
+            tid,
+            THREADS,
+        )
+    else:
+        end = lines * LINE7_ELEMENTS * 2 - 1
+        fresh.prefetch_own(
+            "gather",
+            lambda i: data
+            + fx.Int64(fx.min(bid * THREADS * LINE7_ELEMENTS * 2 + i * 128, end)),
+            THREADS * LINE7_ELEMENTS * 2 // 128,
+            tid,
+            THREADS,
+        )
+
+
 def build_gather_allreduce(
     tp: int, rows: int, profile: bool = False, prepush_barrier: bool | None = None
 ) -> K2AllReduceKernel:
@@ -613,6 +660,7 @@ def build_gather_allreduce(
     name = (
         f"k3_k2_gfx1250_gather_allreduce7_tp{tp}_s{rows}"
         f"{'' if prepush_barrier else '_nb'}{'_profile' if profile else ''}"
+        f"{fresh.suffix('gather')}"
     )
 
     @fx.struct
@@ -633,6 +681,10 @@ def build_gather_allreduce(
         tid = fx.Int32(fx.thread_idx.x)
         bid = fx.Int32(fx.block_idx.x)
         lds = fx.SharedAllocator().allocate(Lds).peek()
+        if const_expr(fresh.on("gather")):
+            _prefetch_gather7(
+                data, grouped, route_rows, route_weights, rows, lines, bid, tid
+            )
 
         def stamp(index):
             if const_expr(profile):

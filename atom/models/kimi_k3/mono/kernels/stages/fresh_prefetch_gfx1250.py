@@ -28,7 +28,7 @@ def on(site: str) -> bool:
 
 def suffix(site: str) -> str:
     """Kernel-name suffix of ``site``'s prefetch, empty when it is off."""
-    return "_xpf" if on(site) else ""
+    return f"_xpf{site}" if on(site) else ""
 
 
 def prefetch(

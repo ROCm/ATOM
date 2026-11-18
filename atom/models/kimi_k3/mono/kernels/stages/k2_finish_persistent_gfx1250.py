@@ -419,10 +419,11 @@ def build_packed_finish(
         f"{'_ph' if parallel_herd else ''}"
         f"{f'_pl{herd_poll_limit}' if herd_poll_limit is not None else ''}"
         f"{'_profile' if profile else ''}"
-        f"{fresh.suffix('finish') if replicated_front else ''}"
     )
     # After a replicated front there is no gathered latent to unpack.
     unpack = not (rolled and replicated_front)
+    if replicated_front:
+        name += fresh.suffix("finish") + ("" if unpack else fresh.suffix("moe"))
 
     sources = SOURCES
     # It is the CTA before the routing ones, and its one shared-down task goes
@@ -488,6 +489,20 @@ def build_packed_finish(
                 "finish",
                 shared_hidden,
                 rows * SHARED_INTERMEDIATE * 2,
+                bid,
+                tid,
+                plan.blocks,
+                THREADS,
+            )
+        if const_expr(fused is None and replicated_front and not unpack):
+            # The front's latent for the fused MoE after this launch.
+            fresh.prefetch(
+                "moe", latent_fp4, rows * LATENT // 2, bid, tid, plan.blocks, THREADS
+            )
+            fresh.prefetch(
+                "moe",
+                latent_scales,
+                rows * LATENT // 32,
                 bid,
                 tid,
                 plan.blocks,

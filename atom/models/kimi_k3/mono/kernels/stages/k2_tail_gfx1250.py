@@ -393,9 +393,7 @@ def _ar_push(c):
             rows_of = [token * TOPK + k for k in range(TOPK)]
             weights = []
             for quad in range_constexpr(TOPK // 4):
-                loaded = fx.Vector(
-                    ld_dev(c["route_weights"], token * TOPK + 4 * quad, 4)
-                )
+                loaded = fx.Vector(ld_dev(c["route_weights"], token * TOPK + 4 * quad, 4))
                 weights.extend(
                     fx.Int32(loaded[k]).bitcast(fx.Float32) for k in range(4)
                 )

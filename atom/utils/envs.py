@@ -682,9 +682,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Kimi-K3 gfx1250 mono: the other kernels' freshly written inputs
     # prefetched into every XCD's L2 (the same bits), a comma list of the
     # kernels that do it, each at its entry: "oproj" (K1's core rows),
-    # "finish" (the front's router logits and shared rows), "tail" (each
+    # "finish" (the front's router logits and shared rows), "moe" (the lite
+    # finish, the front's latent for the fused MoE after it), "tail" (each
     # all-reduce CTA its share of the fused MoE's rows, their route weights
-    # and the shared rows). 0, the default, leaves all of them out.
+    # and the shared rows), "gather" (the gathering all-reduce's CTAs alike).
+    # 0, the default, leaves all of them out.
     "ATOM_KIMI_MONO_XPF": lambda: frozenset(
         site
         for site in os.getenv("ATOM_KIMI_MONO_XPF", "0").split(",")
