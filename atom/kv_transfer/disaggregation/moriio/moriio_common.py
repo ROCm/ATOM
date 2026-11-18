@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import threading
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 
 import msgspec
 
@@ -71,6 +71,11 @@ class MoRIIOAgentMetadata(
     # Region-mode layout (JSON list of [name, kind, unit_bytes, total_bytes,
     # reverse_indexed, chunk_bytes]), or None for per-layer registration.
     region_layout: str | None = None
+    # PAGE layout (``moriio_backend`` ``fabric``): the packed descriptor of the
+    # one buffer holding every PAGE region, and per region, in publication
+    # order, ``[offset in that buffer, bytes per block, semantic role]``.
+    page_desc: bytes | None = None
+    page_regions: list[list[Any]] | None = None
 
 
 # ---------------------------------------------------------------------------
