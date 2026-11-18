@@ -233,12 +233,19 @@ def _gathered_words(local, grouped, routes, rows, first_token, line):
     word = line * PAYLOAD_WORDS
     token = fx.min(word // ROUTED_WORDS, first_token + 1)
     column = word % ROUTED_WORDS
+    # ROUTED_WORDS is no multiple of PAYLOAD_WORDS: a line at a row's end
+    # loads from that end back, never past it (past the last route row's end
+    # lies whatever the allocator placed there, or an unmapped page), and its
+    # words shift back into place; the words past the row are re-gathered
+    # below or are the shared rows'
+    start = fx.min(column, ROUTED_WORDS - PAYLOAD_WORDS)
+    shift = column - start
     route_rows, weights = _routes_of(routes, first_token, token)
     loaded = [
         fx.Vector(
             bo.buffer_load(
                 grouped,
-                row * ROUTED_WORDS + column,
+                row * ROUTED_WORDS + start,
                 vec_width=PAYLOAD_WORDS,
                 dtype=T.i32,
             )
@@ -246,10 +253,16 @@ def _gathered_words(local, grouped, routes, rows, first_token, line):
         for row in route_rows
     ]
     plain = _local_words(local, line)
-    words = [
+    sums = [
         _gather_sum([fx.Int32(v[w]) for v in loaded], weights)
         for w in range(PAYLOAD_WORDS)
     ]
+    words = []
+    for w in range_constexpr(PAYLOAD_WORDS):
+        value = sums[w]
+        for k in range_constexpr(1, PAYLOAD_WORDS):
+            value = (shift == k).select(sums[min(w + k, PAYLOAD_WORDS - 1)], value)
+        words.append(value)
     second = word + PAYLOAD_WORDS - 1
     if (second // ROUTED_WORDS != word // ROUTED_WORDS) & (
         second < rows * ROUTED_WORDS
