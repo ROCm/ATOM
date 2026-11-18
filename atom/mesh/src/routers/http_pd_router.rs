@@ -34,7 +34,7 @@ use crate::{
                 vllm::{VllmAdapter, VllmPrefillInfo},
                 BackendAdapter, PairCtx,
             },
-            planner::DefaultPlanner,
+            planner::{idx2idx_rank, DefaultPlanner},
             registry_adapters::{PolicyRegistryAdapter, WorkerRegistryAdapter},
             traits::PdPlanner,
             types::{PlacementPlan, Protocol, RequestDescriptor},
@@ -499,10 +499,9 @@ impl PDRouter {
         prefill: Arc<dyn Worker>,
         decode: &Arc<dyn Worker>,
     ) -> Arc<dyn Worker> {
-        let (Some(prefill_dp_size), Some(decode_dp_rank)) = (prefill.dp_size(), decode.dp_rank())
-        else {
+        let Some(decode_dp_rank) = idx2idx_rank(prefill.as_ref(), decode.as_ref()) else {
             debug!(
-                "ATOM PD rank mapping policy=idx2idx skipped: prefill={} prefill_dp_size={:?} decode={} decode_dp_rank={:?}",
+                "ATOM PD rank mapping policy=idx2idx keeps prefill={} prefill_dp_size={:?} decode={} decode_dp_rank={:?}",
                 prefill.url(),
                 prefill.dp_size(),
                 decode.url(),
@@ -510,21 +509,6 @@ impl PDRouter {
             );
             return prefill;
         };
-
-        if decode_dp_rank >= prefill_dp_size {
-            warn!(
-                "ATOM PD rank mapping policy=idx2idx skipped: decode rank {} is outside prefill dp_size {} (prefill={}, decode={})",
-                decode_dp_rank,
-                prefill_dp_size,
-                prefill.url(),
-                decode.url()
-            );
-            return prefill;
-        }
-
-        if prefill.dp_rank() == Some(decode_dp_rank) {
-            return prefill;
-        }
 
         let mapped_url = format!("{}@{}", prefill.base_url(), decode_dp_rank);
         match self.worker_registry.get_by_url(&mapped_url) {

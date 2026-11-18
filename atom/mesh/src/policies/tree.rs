@@ -618,6 +618,58 @@ impl Tree {
         }
     }
 
+    /// [`Self::prefix_match_with_counts`] restricted to `tenants`: the longest prefix any
+    /// of them holds, credited to the one that accessed it last ("empty" if none holds the
+    /// root). A node's cached tenant may be outside `tenants` while one of them shares it.
+    pub fn prefix_match_among(&self, text: &str, tenants: &[&str]) -> PrefixMatchResult {
+        let holds = |node: &Node| {
+            tenants
+                .iter()
+                .any(|tenant| node.tenant_last_access_time.contains_key(*tenant))
+        };
+        let mut remaining = text;
+        let mut matched_chars = 0;
+        let mut curr = Arc::clone(&self.root);
+        while let Some(first_char) = remaining.chars().next() {
+            let Some(child) = curr.children.get(&first_char).map(|e| e.value().clone()) else {
+                break;
+            };
+            if !holds(&child) {
+                break;
+            }
+            let child_text = child.text.read().unwrap();
+            let child_chars = child_text.char_count();
+            let shared = shared_prefix_count(remaining, child_text.as_str());
+            drop(child_text);
+            matched_chars += shared;
+            curr = child;
+            if shared < child_chars {
+                break;
+            }
+            remaining = advance_by_chars(remaining, shared);
+        }
+
+        let tenant = tenants
+            .iter()
+            .filter_map(|tenant| {
+                let entry = curr.tenant_last_access_time.get(*tenant)?;
+                Some((*entry.value(), Arc::clone(entry.key())))
+            })
+            .max_by_key(|(accessed, _)| *accessed)
+            .map(|(_, tenant)| tenant);
+        let epoch = get_epoch();
+        if let Some(tenant) = tenant.as_ref().filter(|_| epoch & 0x7 == 0) {
+            curr.tenant_last_access_time
+                .insert(Arc::clone(tenant), epoch);
+        }
+
+        PrefixMatchResult {
+            tenant: tenant.unwrap_or_else(|| Arc::from("empty")),
+            matched_char_count: matched_chars,
+            input_char_count: text.chars().count(),
+        }
+    }
+
     /// Legacy prefix_match API for backward compatibility.
     /// Note: This computes matched_text which has allocation overhead.
     pub fn prefix_match(&self, text: &str) -> (String, String) {
@@ -1094,6 +1146,27 @@ mod tests {
 
         assert_eq!(matched_text, "");
         assert_eq!(tenant, "empty");
+    }
+
+    #[test]
+    fn test_prefix_match_among_ignores_other_tenants() {
+        let tree = Tree::new();
+        tree.insert("hello world", "a");
+        tree.insert("hello there", "b");
+        let matched = |text: &str, tenants: &[&str]| {
+            let result = tree.prefix_match_among(text, tenants);
+            (result.matched_char_count, result.tenant.to_string())
+        };
+
+        // The shared node was created by "a", yet "b" is credited what it holds.
+        assert_eq!(
+            tree.prefix_match_with_counts("hello you").tenant.as_ref(),
+            "a"
+        );
+        assert_eq!(matched("hello you", &["b"]), (6, "b".into()));
+        assert_eq!(matched("hello world", &["b"]), (6, "b".into()));
+        assert_eq!(matched("hello world", &["a", "b"]), (11, "a".into()));
+        assert_eq!(matched("hello world", &["c"]), (0, "empty".into()));
     }
 
     #[test]

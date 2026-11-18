@@ -590,6 +590,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_atom_with_idx2idx_plans_prefill_on_the_decode_rank() {
+        for backend in [BackendType::Sglang, BackendType::Vllm, BackendType::Atom] {
+            for mapping in [
+                AtomPdRankMappingPolicy::None,
+                AtomPdRankMappingPolicy::Idx2Idx,
+            ] {
+                let config = RouterConfig {
+                    backend,
+                    atom_pd_rank_mapping_policy: mapping,
+                    ..Default::default()
+                };
+                assert_eq!(
+                    config.prefill_on_decode_rank(),
+                    matches!(
+                        (backend, mapping),
+                        (BackendType::Atom, AtomPdRankMappingPolicy::Idx2Idx)
+                    ),
+                    "{backend:?} {mapping}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn prepare_pool_defaults_overrides_and_legacy_config_deserialization() {
         let config = RouterConfig::default();
         let workers = default_prepare_workers();
