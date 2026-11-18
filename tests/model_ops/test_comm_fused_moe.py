@@ -1081,9 +1081,9 @@ def test_dsv4_dual_stream_decode_token_threshold(
     else:
         monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", env)
     v4 = atom_modules.deepseek_v4
-    assert v4.v4_dual_stream_decode_token_threshold(use_ep=True) == expected
+    assert v4.v4_dual_stream_decode_token_threshold(True) == expected
     generic = 1024 if env is None else int(env)
-    assert v4.v4_dual_stream_decode_token_threshold(use_ep=False) == generic
+    assert v4.v4_dual_stream_decode_token_threshold(False) == generic
 
 
 @pytest.mark.parametrize("phase", ["decode", "prefill", None])
@@ -1115,8 +1115,61 @@ def test_dual_stream_gate_widens_only_decode(monkeypatch, atom_modules, rows, ph
     assert dispatch._dual_stream_is_active(other, rows) == (rows <= 1024)
 
 
-def _v4_moe_built(monkeypatch, atom_modules, *, use_ep):
-    """A V4 `MoE` through its real `__init__`, GEMM/expert modules stubbed."""
+def _moe_parallel(monkeypatch, atom_modules, *, tp, dp, ep, dp_logical=0):
+    """A real `FusedMoEParallelConfig.make` for this deployment shape (rank
+    0, DP attention on, no PCP)."""
+    moe = atom_modules.moe
+    group = SimpleNamespace(rank_in_group=0)
+    monkeypatch.setattr(moe, "get_tp_group", lambda: group)
+    monkeypatch.setattr(moe, "get_dp_group", lambda: group)
+    state = sys.modules["aiter.dist.parallel_state"]
+    monkeypatch.setattr(
+        state, "get_prefill_context_model_parallel_world_size", lambda: 1, raising=False
+    )
+    monkeypatch.setattr(
+        state, "get_prefill_context_model_parallel_rank", lambda: 0, raising=False
+    )
+    monkeypatch.setattr(
+        moe,
+        "get_current_atom_config",
+        lambda: SimpleNamespace(
+            parallel_config=SimpleNamespace(data_parallel_size_local=dp)
+        ),
+    )
+    config = SimpleNamespace(
+        enable_dp_attention=dp > 1 or dp_logical > 1,
+        moe_ep_flatten_tp_across_dp=False,
+        enable_expert_parallel=ep,
+        dp_logical_size=dp_logical,
+    )
+    return moe.FusedMoEParallelConfig.make(tp, dp, config)
+
+
+@pytest.mark.parametrize(
+    ("tp", "dp", "ep", "dp_logical", "exchanges"),
+    [
+        (1, 4, True, 0, True),  # DEP4
+        (2, 4, True, 0, True),  # DP4 x TP2 with EP
+        (8, 1, True, 0, False),  # -tp 8 --enable-expert-parallel: no exchange
+        (1, 4, False, 0, False),  # DP attention without EP
+        (8, 1, False, 0, False),  # plain TP
+        (1, 2, True, 4, False),  # simulated DP: finer expert map, no real peers
+    ],
+)
+def test_moe_parallel_config_exchanges_tokens(
+    monkeypatch, atom_modules, tp, dp, ep, dp_logical, exchanges
+):
+    parallel = _moe_parallel(
+        monkeypatch, atom_modules, tp=tp, dp=dp, ep=ep, dp_logical=dp_logical
+    )
+    assert parallel.exchanges_tokens is exchanges
+    if not exchanges:
+        assert parallel.selected_all2all_backend is None
+
+
+def _v4_moe_built(monkeypatch, atom_modules, *, parallel):
+    """A V4 `MoE` through its real `__init__`, GEMM/expert modules stubbed;
+    ``parallel`` is the experts' real `FusedMoEParallelConfig`."""
     v4 = atom_modules.deepseek_v4
     forward_context = {}
     config = SimpleNamespace(
@@ -1130,7 +1183,7 @@ def _v4_moe_built(monkeypatch, atom_modules, *, use_ep):
         experts = torch.nn.Module()
         experts.num_fused_shared_experts = 0
         experts._comm_fused_moe = None
-        experts.moe_parallel_config = SimpleNamespace(use_ep=use_ep)
+        experts.moe_parallel_config = parallel
         return experts
 
     monkeypatch.setattr(v4, "FusedMoE", fused_moe)
@@ -1153,23 +1206,28 @@ def _v4_moe_built(monkeypatch, atom_modules, *, use_ep):
     return moe, forward_context
 
 
+_DEP4 = {"tp": 1, "dp": 4, "ep": True}
+
+
 @pytest.mark.parametrize(
-    ("use_ep", "phase", "forks_at_1536"),
+    ("shape", "phase", "forks_at_1536"),
     [
-        (True, "decode", True),
-        (True, "prefill", False),
-        (False, "decode", False),
-        (True, None, False),
+        (_DEP4, "decode", True),
+        (_DEP4, "prefill", False),
+        ({"tp": 8, "dp": 1, "ep": True}, "decode", False),  # TP-only EP
+        ({"tp": 8, "dp": 1, "ep": False}, "decode", False),  # plain TP
+        (_DEP4, None, False),
     ],
 )
 def test_dsv4_widens_only_expert_parallel_decode(
-    monkeypatch, atom_modules, use_ep, phase, forks_at_1536
+    monkeypatch, atom_modules, shape, phase, forks_at_1536
 ):
-    """A real V4 module forks 1025-1536-row steps only on EP decode steps;
-    EP prefill, non-EP decode and calls without a step context keep the
-    generic bound."""
+    """A real V4 module forks 1025-1536-row steps only on decode steps of a
+    deployment whose experts exchange tokens; prefill, TP-only EP, plain TP
+    and calls without a step context keep the generic bound."""
     monkeypatch.delenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", raising=False)
-    moe, _ = _v4_moe_built(monkeypatch, atom_modules, use_ep=use_ep)
+    parallel = _moe_parallel(monkeypatch, atom_modules, **shape)
+    moe, _ = _v4_moe_built(monkeypatch, atom_modules, parallel=parallel)
     dispatch = sys.modules["atom.model_ops.module_dispatch_ops"]
     monkeypatch.setattr(dispatch, "plugin_graph_is_piecewise", lambda: False)
     monkeypatch.setattr(
@@ -1197,7 +1255,8 @@ def test_dsv4_moe_init_sets_its_dual_stream_threshold(
         monkeypatch.delenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", raising=False)
     else:
         monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", env)
-    moe, forward_context = _v4_moe_built(monkeypatch, atom_modules, use_ep=True)
+    parallel = _moe_parallel(monkeypatch, atom_modules, **_DEP4)
+    moe, forward_context = _v4_moe_built(monkeypatch, atom_modules, parallel=parallel)
 
     assert moe._dual_stream_decode_token_threshold == expected
     assert moe._dual_stream_token_threshold == generic
