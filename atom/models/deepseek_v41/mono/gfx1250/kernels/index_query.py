@@ -109,12 +109,19 @@ def stage_iw(c):
             c["stx"](c["iwp"] + i64((s * T + tok) * HEADS + ni * 16 + l % 16) * 4, acc[i])
 
 
+def iq_waves(MT):
+    """iquant's waves a CTA (Python int): 6 at c1 (one M tile), else 8."""
+    return 6 if MT == 1 else 8
+
+
 @ASTRewriter.transform
 def stage_iquant(c):
-    """(token, head) row q = b * 8 + w (S x 32 rows over the grid's waves), 4 dims a lane."""
+    """(token, head) row q = b * IQ_WAVES + w (S x 32 rows over the grid's waves), 4 dims a lane; c1 (one M tile): waves
+    0..5 only (waves 6 / 7 run the REINDEX scorer's page prefill meanwhile), 32 CTAs."""
     t, b, w, l, TR = c["t"], c["b"], c["w"], c["l"], c["TR"]
-    q = b * 8 + w
-    if q < TR * HEADS:
+    nw = iq_waves(c["MT"])
+    q = b * nw + w
+    if (q < TR * HEADS) & (w < nw):
         tok = q // HEADS
         h = q % HEADS
         ws = F32(0.0)

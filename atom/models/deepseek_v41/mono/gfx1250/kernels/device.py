@@ -109,14 +109,23 @@ def gstore(addr, val, nt=False, scope=None, align=None):
     llvm.StoreOp(v, gptr(addr), **kw)
 
 
-def lload(off, kind=fx.Int32, n=1, align=None):
+def lload(off, kind=fx.Int32, n=1, align=None, scope=None):
+    """scope='workgroup' -> a relaxed atomic LDS load (re-read in a poll loop, not hoisted)."""
     ty = kind.ir_type if n == 1 else vty(n, kind.ir_type)
-    return _wrap(llvm.LoadOp(ty, lptr(off), alignment=align or (kind.width // 8) * n).result, kind, n)
+    kw = dict(alignment=align or (kind.width // 8) * n)
+    if scope:
+        kw["ordering"] = llvm.AtomicOrdering.monotonic
+        kw["syncscope"] = scope
+    return _wrap(llvm.LoadOp(ty, lptr(off), **kw).result, kind, n)
 
 
-def lstore(off, val, align=None):
+def lstore(off, val, align=None, scope=None):
     v = _v(val)
-    llvm.StoreOp(v, lptr(off), alignment=align or tbytes(v.type))
+    kw = {"alignment": align or tbytes(v.type)}
+    if scope:
+        kw["ordering"] = llvm.AtomicOrdering.monotonic
+        kw["syncscope"] = scope
+    llvm.StoreOp(v, lptr(off), **kw)
 
 
 # ---------------------------------------------------------------- atomics / fences / sync
@@ -399,6 +408,12 @@ def latomic_add_i32(off, val):
                      syncscope="workgroup", alignment=4)
 
 
+def latomic_add_i32_rtn(off, val):
+    """LDS atomic add (workgroup scope), returning the old value."""
+    return fx.Int32(llvm.AtomicRMWOp(llvm.AtomicBinOp.add, lptr(off), _v(fx.Int32(val)), llvm.AtomicOrdering.monotonic,
+                                     syncscope="workgroup", alignment=4).result)
+
+
 def lane_gather(v, src_lane):
     """Lane src_lane's value of v (ds_bpermute)."""
     return fx.Int32(rocdl.ds_bpermute(T.i32, _v(fx.Int32(src_lane) * 4), _v(fx.Int32(v))))
@@ -506,6 +521,16 @@ def _stop_mark(failed):
         if unlikely(failed):   # (a timeout: off the hot path)
             for a in fc[1]:
                 gstore(a, fc[2], scope="system")
+
+
+@_ASTR.transform
+def wait_lds_tag(off, tag):
+    """Spin (this wave) until the LDS word at off holds tag: a CTA-local signal from one wave that polled a device
+    counter for its CTA (one global poller a CTA, not one a wave: many pollers starve the producers' memory requests)."""
+    rn = I32(0)
+    while (lload(off, fx.Int32, scope="workgroup") != tag) & (rn < I32(1 << 30)):
+        s_sleep(1)
+        rn = rn + 1
 
 
 @_ASTR.transform

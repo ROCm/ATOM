@@ -566,7 +566,9 @@ def target_layer(E, Ly):
         # (the iquant CTAs, the compressor rows' CTAs); the Engram-next layers keep the KV_C handoff for the engkv their A
         # stage writes (stage_engkv, or engentry's slot-1 copy) -- except the first engentry row (ENG_ROWS[0]): its kv is
         # the entry's slot 0, written before the TARGET_FRONT handoff, and its A stage writes no engkv
-        NIQC = (TR * IS.HEADS + 7) // 8   # the iquant CTAs (a (token, head) row a wave)
+        IQW = IS.iq_waves(Lx["MT"])       # iquant's waves a CTA (6 at c1: waves 6 / 7 prefill the REINDEX scorer's pages)
+        NIQC = (TR * IS.HEADS + IQW - 1) // IQW   # the iquant CTAs (a (token, head) row a wave)
+        IQ_LCNT = 504                     # (c1 REINDEX) LDS: the CTA's iquant waves done (see below)
         engent0 = (Ly == fx.Int32(S.ENG_ROWS[0])) & ((ltab(fp, Ly, "lflags")() & fx.Int64(S.ENG_ENTRY)) != fx.Int64(0))
         if hx.unlikely(keepA & (isidx == (fx.Int32(0) != fx.Int32(0))) & (engent0 == (fx.Int32(0) != fx.Int32(0)))):
             handoff(lc + i64(LY.KV_C), t, True)
@@ -589,11 +591,32 @@ def target_layer(E, Ly):
                     gpu.barrier()
                     if t == 0:
                         hx.atomic_add(lc + i64(LY.KV_C), 1)
-                if b < NIQC:
-                    if t == 0:
-                        hx.wait_count(lc + i64(LY.KV_C), isrxk.select(fx.Int32(KVC_WAVES), fx.Int32(CTAS)), 4)
-                        hx.fence_acquire("agent")   # (the producers' stores are device-scope; acquire before iquant reads them)
-                    gpu.barrier()
+                # c1 REINDEX: no CTA barrier around iquant (it waited for waves 6 / 7's page prefill, ktrace L24). Wave 3 (idle
+                # through iq / iw) polls KV_C for the CTA, acquires (the CTA's one acquire, as before its barrier), zeroes the
+                # CTA's iquant count (LDS IQ_LCNT) and posts the layer's tag (LDS IQ_LFLAG; both in the scorer's unused first
+                # 512 B, past the TP payload); each iquant wave waits for the tag, and past its stores counts itself in LDS:
+                # the CTA's last one counts the CTA (IQ_DONE). One device poller and one IQ_DONE atomic a CTA: a KV_C poller a
+                # wave (192) starved the iq / iw waves' memory requests (~0.8 s, ktrace L24); 192 IQ_DONE atomics and an
+                # acquire a wave were +0.8 / +0.7 us at the scorer (ktrace L24-36). FULL: as before
+                if isrxk:
+                    if b < NIQC:
+                        IQ_LFLAG = 508
+                        assert TR * 20 * 4 <= IQ_LCNT
+                        iqtag = hx.epoch32(tep, Ly, 2)
+                        if (w == 3) & (l == 0):
+                            hx.wait_count(lc + i64(LY.KV_C), fx.Int32(KVC_WAVES), 4)
+                            hx.fence_acquire("agent")   # (as the CTA's one acquire before its barrier did: the CTA's waves read past it)
+                            hx.lstore(sm + IQ_LCNT, fx.Int32(0), scope="workgroup")
+                            hx.lstore(sm + IQ_LFLAG, iqtag, scope="workgroup")
+                        if (w < IQW) & (b * IQW + w < TR * IS.HEADS):
+                            if l == 0:
+                                hx.wait_lds_tag(sm + IQ_LFLAG, iqtag)
+                else:
+                    if b < NIQC:
+                        if t == 0:
+                            hx.wait_count(lc + i64(LY.KV_C), fx.Int32(CTAS), 4)
+                            hx.fence_acquire("agent")   # (the producers' stores are device-scope; acquire before iquant reads them)
+                        gpu.barrier()
             else:
                 hx.wait_storecnt0()
                 gpu.barrier()
@@ -605,11 +628,25 @@ def target_layer(E, Ly):
                     gpu.barrier()
             IS.stage_iquant(cwith(c, iq=fptr(fp, "iq"), iwp=fptr(fp, "iwp"), iq_out=fptr(fp, "iq_out"),
                                   iqs_out=fptr(fp, "iqs_out"), iw_out=fptr(fp, "iw_out")))
-            if b < NIQC:   # (R4) this CTA's query rows out: counted (IQ_DONE)
-                hx.wait_storecnt0()
-                gpu.barrier()
-                if t == 0:
-                    hx.atomic_add(lc + i64(LY.IQ_DONE), 1)
+            if fx.const_expr(Lx["MT"] == 1 and not DRS):
+                if isrxk:   # (c1 REINDEX) the CTA's last iquant wave counts the CTA
+                    if (w < IQW) & (b * IQW + w < TR * IS.HEADS):
+                        hx.wait_storecnt0()
+                        if l == 0:
+                            if hx.latomic_add_i32_rtn(sm + IQ_LCNT, 1) == fx.min(fx.Int32(IQW), fx.Int32(TR * IS.HEADS) - b * IQW) - 1:
+                                hx.atomic_add(lc + i64(LY.IQ_DONE), 1)
+                else:
+                    if b < NIQC:
+                        hx.wait_storecnt0()
+                        gpu.barrier()
+                        if t == 0:
+                            hx.atomic_add(lc + i64(LY.IQ_DONE), 1)
+            else:
+                if b < NIQC:   # (R4) this CTA's query rows out: counted (IQ_DONE)
+                    hx.wait_storecnt0()
+                    gpu.barrier()
+                    if t == 0:
+                        hx.atomic_add(lc + i64(LY.IQ_DONE), 1)
             lfl2 = ltab(fp, Ly, "lflags")()
             # (B) a c1 compressor layer whose scorer takes the grouped path: the INDEX_QUANT handoff right after iquant (the
             # query), not after the compressor rows; the rows' CTAs (stage_crow) skip the scorer and flag their new keys
