@@ -99,8 +99,8 @@ def flydsl(modules, monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(
         qa,
-        "_flydsl_attention_op",
-        lambda: lambda q, k, v, indices, **kw: calls.append((k, v, indices, kw)) or q,
+        "qsa_sparse_prefill",
+        lambda q, k, v, indices, **kw: calls.append((k, v, indices, kw)) or q,
     )
     return calls
 

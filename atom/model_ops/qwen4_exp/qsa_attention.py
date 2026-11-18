@@ -39,6 +39,7 @@ from types import SimpleNamespace
 import aiter
 import torch
 from aiter.ops.qsa import (
+    qsa_sparse_prefill,
     qsa_sparse_prefill_supports_selection,
     qsa_sparse_prefill_widths,
 )
@@ -74,14 +75,6 @@ from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger(__name__)
-
-
-@functools.cache
-def _flydsl_attention_op():
-    # aiter.ops.qsa is aiter's entry for consumers (ROCm/aiter#6576).
-    from aiter.ops.qsa import qsa_sparse_prefill
-
-    return qsa_sparse_prefill
 
 
 def qsa_rank_heads(
@@ -744,7 +737,7 @@ class Qwen4ExpAttention(nn.Module):
             # With a prefix the kernel reads the context rows in place through
             # the bridge's slot table.
             k, v = self.k_cache.flatten(0, 1), self.v_cache.flatten(0, 1)
-        return _flydsl_attention_op()(
+        return qsa_sparse_prefill(
             query.contiguous(),
             k,
             v,

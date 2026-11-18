@@ -87,8 +87,8 @@ def test_mixed_prefix_batch_reads_full_contexts_through_the_slot_table(monkeypat
     )
     monkeypatch.setattr(
         qsa_attention,
-        "_flydsl_attention_op",
-        lambda: lambda q, k, v, indices, **kw: calls.append((k, v, kw)) or q,
+        "qsa_sparse_prefill",
+        lambda q, k, v, indices, **kw: calls.append((k, v, kw)) or q,
     )
     compressed = torch.zeros(pages, block // 4, 1, 128, device=device)
     layer = _layer(compressed, k_cache=k_cache, v_cache=-k_cache)
@@ -320,7 +320,7 @@ def test_in_place_reads_match_gathered_rows_bit_for_bit(monkeypatch, prefixes, e
         plan = qsa_attention._FlyDSLPrefill.of(layer, query, qsa)
         assert plan.ready
         fresh = select()
-        reference = qsa_attention._flydsl_attention_op()(
+        reference = qsa_attention.qsa_sparse_prefill(
             query,
             key,
             value,
