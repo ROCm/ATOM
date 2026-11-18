@@ -65,6 +65,7 @@ from atom.distributed.pcp_utils import (
     pcp_allgather_rerange_many,
     pcp_is_enabled,
 )
+from atom.model_ops.attentions.nvfp4_mla import publish_prefill_kv, try_nvfp4_decode
 from atom.model_ops.attentions.sparse_mla_head_groups import (
     PERSISTENT_WORK_BUFFERS,
 )
@@ -642,6 +643,8 @@ class MLAAttention(nn.Module):
         super().__init__()
         self.use_flydsl_fp8_prefill_attn = bool(envs.ATOM_USE_FLYDSL_FP8_PREFILL_ATTN)
         self._flydsl_fp8_mha_ok: bool | None = None
+        self.nvfp4 = None
+        self.nvfp4_layer = 0
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.scale = float(scale)
@@ -3122,8 +3125,17 @@ class MLAAttention(nn.Module):
             )
             prefill_q_pe = prefill_q[..., self.qk_nope_head_dim :]
             self.rotary_emb(positions, prefill_q_pe, k_rope)
+            # k_rope is post-RoPE from here. Under NVFP4 the FP4 pages are the
+            # only cache and get this latent; prefill attention runs on the
+            # forward's own K/V below, so nothing reads an FP8 copy.
+            publish_prefill_kv(self, k_nope, k_rope, positions, attn_metadata)
+            if self.nvfp4 is not None and attn_metadata.has_cached:
+                raise RuntimeError(
+                    "NVFP4 MLA prefill cannot read cached context; the history "
+                    "is only in FP4 pages."
+                )
 
-            if kv_cache.numel() > 0:
+            if self.nvfp4 is None and kv_cache.numel() > 0:
                 if self.kv_shuffled:
                     shuffled_cache = self._shuffled_kv_view(kv_cache)
                     triton_cat_and_cache_mla(
@@ -3193,6 +3205,11 @@ class MLAAttention(nn.Module):
             q_nope, q_rope = self._q_proj_and_k_up_proj(
                 q, x_scale=q_scale, group=use_qrep
             )
+            nvfp4_out = try_nvfp4_decode(
+                self, q_nope, q_rope, k_nope, k_rope, positions, attn_metadata
+            )
+            if nvfp4_out is not None:
+                return nvfp4_out
 
             # ---- Prefill Context Parallel --------------------------------
             # q is this rank's 1/pcp queries, so q_out is naturally 1/pcp. But

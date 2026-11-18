@@ -410,6 +410,32 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Rows per rank of that small instance: 128, 256, 512 or 1024 (see docs).
     "ATOM_MEGA_DECODE_MTPR": lambda: _int_env("ATOM_MEGA_DECODE_MTPR", 128),
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
+    # Beside the paged MLA cache, keep the open 16-token tile in BF16 so an
+    # NVFP4 scale can be recomputed from the original values. Off by default;
+    # the FP8 cache does not allocate it. One ring per request per layer.
+    "ATOM_MLA_NVFP4_HP_RING": lambda: os.getenv("ATOM_MLA_NVFP4_HP_RING", "0") == "1",
+    # Decode with the gfx1250 NVFP4 MLA shader (AITER PR 7987). The FP4 pages
+    # replace the FP8 KV cache in the paged pool. Requires 128 query heads per
+    # rank, block size 64, and no prefix caching, chunked prefill or MTP. Off
+    # by default, so the FP8 path is unchanged. Implies the BF16 tail ring above.
+    "ATOM_MLA_NVFP4": lambda: os.getenv("ATOM_MLA_NVFP4", "0") == "1",
+    # NVFP4 decode split-K: the shader walks a request's whole context in one
+    # workgroup, so a request's pages are cut into up to MAX_SPLITS ranges, as
+    # many as keep batch x splits within SPLIT_ROWS, and merged by LSE.
+    "ATOM_MLA_NVFP4_SPLIT_ROWS": lambda: _int_env("ATOM_MLA_NVFP4_SPLIT_ROWS", 2048),
+    "ATOM_MLA_NVFP4_MAX_SPLITS": lambda: _int_env("ATOM_MLA_NVFP4_MAX_SPLITS", 16),
+    # NVFP4 decode cache write. 2: one Triton launch appends to the BF16 tail
+    # and quantizes the open tile into the FP4 pages. 1: Triton append/gather,
+    # then mla_nvfp4_update_cache. 0: torch ops, then mla_nvfp4_update_cache.
+    # 0 until the Triton kernels pass tests/test_nvfp4_ring_triton.py on gfx1250.
+    "ATOM_MLA_NVFP4_TRITON_RING": lambda: _int_env("ATOM_MLA_NVFP4_TRITON_RING", 0),
+    # Accuracy experiment only: after each tile write, replace the tail's BF16
+    # with the FP4 round trip of what was written, so the next token requantizes
+    # dequantized FP4 (as a cache with no BF16 tail would) instead of originals.
+    "ATOM_MLA_NVFP4_EMULATE_NO_RING": lambda: os.getenv(
+        "ATOM_MLA_NVFP4_EMULATE_NO_RING", "0"
+    )
+    == "1",
     # Match SGLang's gfx950 prefill fast path, with or without a cached prefix:
     # cast Q/K/V to FP8 and use AITER's head-dim-256 per-tensor FMHA kernel.
     # Set to 0 for the BF16 flash_attn_varlen_func fallback.
