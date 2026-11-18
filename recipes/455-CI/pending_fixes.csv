@@ -1,3 +1,2 @@
 model,prs,note,since
 kimi-k3,https://github.com/ROCm/ATOM/pull/2760 https://github.com/ROCm/aiter/pull/7912 https://github.com/ROCm/aiter/pull/7913,"Open as of 2026-11-18 (merged so far: ATOM#2647 cross-node TP on 2026-11-16, aiter#7963 on 2026-11-17). ATOM#2760 allows DSpark + DCP on gfx1250's PS1 MLA kernel and needs aiter#7913 (get_mla_decode_num_heads, 32/64-head PS1 tiles; still a draft) and aiter#7912 (MLA reduce LDS race).",2026-11-14
-deepseek-v4-pro,https://github.com/ROCm/aiter/pull/7921,"Open as of 2026-11-17, not yet reviewed. With aiter#7973 (merged 2026-11-16) it fixes the MegaMoE S1F GEMM1 assert (slot_width <= 128) that ROCm/aiter#5899 brought to V4-Pro; needed per the S1F owner.",2026-11-17
