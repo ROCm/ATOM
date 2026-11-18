@@ -673,10 +673,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # weight 0, the original layers' shared expert dropped), on the real activations.
     "ATOM_MONO_CHECK_ROUTED_ONLY": lambda: os.getenv("ATOM_MONO_CHECK_ROUTED_ONLY", "0")
     == "1",
-    # Debug, with ATOM_MONO_CHECK: also run the original layer's MoE module alone on the xn
-    # the mono kernel published (the routed experts' MXFP4 xn, dequantized), so the MoE is compared on
-    # identical inputs (no attention difference, no routing flips).
-    "ATOM_MONO_CHECK_MOE": lambda: os.getenv("ATOM_MONO_CHECK_MOE", "0") == "1",
     # DeepSeek-V4.1: how many of an attention layer's branches leave the main
     # stream. 0 none; 1 the compressor, on the MoE's `alt_stream`, waited at
     # the scorer that first reads it; 2 the indexer as well, on one of its own.

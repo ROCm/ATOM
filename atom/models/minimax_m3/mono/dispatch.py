@@ -124,7 +124,7 @@ class MonoDecode:
         intermediate_tensors,
         inputs_embeds,
     ) -> bool:
-        if input_ids is None:
+        if input_ids is None or not self._mono.enabled:
             return False
         ok = self._supports(input_ids, positions, intermediate_tensors, inputs_embeds)
         # a captured graph's forward runs once, at capture: its replays are

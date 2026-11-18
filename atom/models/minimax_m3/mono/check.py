@@ -23,7 +23,6 @@ from aiter import topk_select
 
 from atom.model_ops.communication_op import tensor_model_parallel_all_reduce
 from atom.models.minimax_m3.mono.config import HIDDEN
-from atom.models.minimax_m3.mono.layout import SCRATCH, wide_moe
 from atom.models.minimax_m3.mono.runner import N_DENSE, token_rows
 from atom.mono.runtime.compare import compare
 from atom.utils import envs
@@ -75,29 +74,6 @@ def forward_checked(
             # the routed experts alone: the module is put back after the reference ran (a
             # changed module under the compiled original path recompiles and fails)
             moe.shared_experts = None
-        if envs.ATOM_MONO_CHECK_MOE:
-            # the xn the kernel's router published for the routed experts (MXFP4,
-            # dequantized): the original MoE module on exactly that input, all-reduced,
-            # against the kernel's reduced output
-            xn = mono_xn(runner, n)
-            moe_ar = tensor_model_parallel_all_reduce(layer.block_sparse_moe(xn)).view(
-                n, HIDDEN
-            )
-            # the floor: the same module on the same rows one token at a time (another batch, so another
-            # tile / split-K configuration of its kernels: only the accumulation order differs)
-            one_ar = tensor_model_parallel_all_reduce(
-                torch.cat([layer.block_sparse_moe(xn[k : k + 1]) for k in range(n)])
-            ).view(n, HIDDEN)
-            if runner.rank == 0:
-                for k in range(n):
-                    logger.info(
-                        "mono check moe layer %d token %d/%d: reduced out %s | floor %s",
-                        lw.layer_id,
-                        k,
-                        n,
-                        compare(ars[(i + 1) % 2][k], moe_ar[k]),
-                        compare(one_ar[k], moe_ar[k]),
-                    )
         ref_partial, ref_res = layer(positions, h_in, res_in)
         if envs.ATOM_MONO_CHECK_ROUTED_ONLY:
             moe.shared_experts = shared
@@ -116,32 +92,6 @@ def forward_checked(
                     compare(ars[(i + 1) % 2][k], ref_ar[k]),
                 )
     return runner.finish_step(res)
-
-
-def mono_xn(runner, n: int) -> torch.Tensor:
-    """The MXFP4 xn rows of the layer kernel's last launch (``xn4p`` / ``xs4p`` plain words,
-    or the narrow build's tagged ``xn4`` / ``xs4``) dequantized to bf16: the input the routed
-    experts saw (so the xn quantization error is not in a comparison made on it)."""
-    sc = runner.scratch4
-    if wide_moe(n):
-        o, c = SCRATCH["xn4p"], SCRATCH["xs4p"]
-        words = sc[o : o + n * HIDDEN // 8 * 4].view(torch.int32)
-        codes = sc[c : c + n * HIDDEN // 32 * 4].view(torch.int32)
-    else:
-        o, c = SCRATCH["xn4"], SCRATCH["xs4"]
-        words = sc[o : o + n * HIDDEN // 8 * 8].view(torch.int32)[0::2]
-        codes = sc[c : c + n * HIDDEN // 32 * 8].view(torch.int32)[0::2]
-    b = words.contiguous().view(torch.uint8).view(n, HIDDEN // 2)
-    lut = torch.tensor(
-        [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
-        device=sc.device,
-    )
-    v = torch.stack([lut[(b & 15).long()], lut[(b >> 4).long()]], -1).view(
-        n, HIDDEN // 32, 32
-    )
-    codes = codes.view(n, -1)
-    scale = torch.ldexp(torch.ones_like(codes, dtype=torch.float32), codes - 127)
-    return (v * scale[..., None]).view(n, HIDDEN).to(torch.bfloat16)
 
 
 def _fingerprint(t: torch.Tensor) -> list[int]:

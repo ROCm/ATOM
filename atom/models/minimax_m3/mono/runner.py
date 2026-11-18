@@ -270,7 +270,8 @@ class MonoDecodeRunner:
         )
         # the shared expert is added to the routed sum as it is (a check of the routed
         # experts alone: not at all)
-        shared_weight = 0.0 if envs.ATOM_MONO_CHECK_ROUTED_ONLY else 1.0
+        routed_only = envs.ATOM_MONO_CHECK and envs.ATOM_MONO_CHECK_ROUTED_ONLY
+        shared_weight = 0.0 if routed_only else 1.0
         self.sm_scale = impl.scale
         if abs(self.sm_scale - HEAD_DIM**-0.5) > 1e-12:
             raise MonoUnsupported(f"softmax scale {self.sm_scale}")
