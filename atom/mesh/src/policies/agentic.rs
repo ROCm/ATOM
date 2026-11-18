@@ -141,7 +141,7 @@ enum Hits {
 /// A request the KV event index can match takes its hits from the index. Others
 /// (without tokens, with media, or with no candidate's events indexed) take them
 /// from a text tree of the requests this policy placed, which only credits the
-/// worker holding the longest text match.
+/// healthy candidate holding the longest text match.
 #[derive(Debug)]
 pub struct AgenticPolicy {
     cost: AgenticCost,
@@ -208,10 +208,16 @@ fn estimated_tokens(bytes: usize) -> usize {
     bytes.div_ceil(TEXT_BYTES_PER_TOKEN)
 }
 
-/// Each worker's hit in `tree`: the longest text match's worker holds its tokens,
-/// estimated from its bytes, and every other worker none.
-fn text_hits(tree: &Tree, text: &str, workers: &[Arc<dyn Worker>]) -> Vec<Option<usize>> {
-    let matched = tree.prefix_match_with_counts(text);
+/// Each worker's hit in `tree`: the healthy candidate holding the longest text match
+/// holds its tokens, estimated from its bytes, and every other worker none.
+fn text_hits(
+    tree: &Tree,
+    text: &str,
+    workers: &[Arc<dyn Worker>],
+    healthy: &[usize],
+) -> Vec<Option<usize>> {
+    let candidates: Vec<&str> = healthy.iter().map(|&idx| workers[idx].url()).collect();
+    let matched = tree.prefix_match_among(text, &candidates);
     let bytes = text
         .char_indices()
         .nth(matched.matched_char_count)
@@ -258,7 +264,7 @@ impl LoadBalancingPolicy for AgenticPolicy {
                     .map(|hit| hit.map(|tokens| tokens as usize))
                     .collect(),
             ),
-            (None, Some((text, tree))) => (Hits::Text, text_hits(tree, text, workers)),
+            (None, Some((text, tree))) => (Hits::Text, text_hits(tree, text, workers, &healthy)),
             (None, None) => (Hits::Unmatched, vec![None; workers.len()]),
         };
 
@@ -569,6 +575,14 @@ mod tests {
         assert_eq!(decide(&policy, &workers, &no_tokens(&text)).await, first);
         let next = (Some(1), "text_hit", Some(0.5), Some(100));
         assert_eq!(decide(&policy, &workers, &no_tokens(&longer)).await, next);
+        // Worker 1 placed the shared prefix first; worker 0, sharing it, is credited it.
+        workers[1].set_healthy(false);
+        let [joins, asks] = ["z", "w"].map(|tail| format!("{text}{}", tail.repeat(400)));
+        let joined = (Some(0), "text_miss", None, Some(200));
+        assert_eq!(decide(&policy, &workers, &no_tokens(&joins)).await, joined);
+        let shared = (Some(0), "text_hit", Some(0.5), Some(100));
+        assert_eq!(decide(&policy, &workers, &no_tokens(&asks)).await, shared);
+        workers[1].set_healthy(true);
 
         // Media, and tokens without indexed events, use the tree too, with the tokens
         // as the prompt; only the request without media predicts its blocks.
