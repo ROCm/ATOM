@@ -316,7 +316,7 @@ def test_the_scheduler_hands_preempted_and_resumed_requests_to_the_runner():
     )
     sched.add(seq)
     batch, active = sched.schedule()
-    assert batch.presence_resumed == {} and batch.presence_preempted == []
+    assert not batch.presence_resumed and not batch.presence_preempted
     out = ScheduledBatchOutput([seq.id], [(20,)], None, None, None, False)
     sched.postprocess(list(active.values()), out, batch=batch)
     sched.running.remove(seq)
@@ -325,3 +325,36 @@ def test_the_scheduler_hands_preempted_and_resumed_requests_to_the_runner():
     assert batch.presence_preempted == [seq.id]
     assert batch.presence_resumed[seq.id].tolist() == list(seq.output_tokens)
     assert list(seq.output_tokens)
+
+
+def test_a_batch_without_a_penalty_pickles_no_presence_fields(seq_factory):
+    """Every batch is pickled to the TP workers each step: the default path
+    carries nothing new."""
+    import pickle
+
+    from atom.model_engine.scheduler import ScheduledBatch
+    from atom.model_engine.sequence import SequenceType
+
+    def batch(penalty):
+        seq = seq_factory(
+            [3, 4], sampling_params=SamplingParams(presence_penalty=penalty)
+        )
+        seq.type = SequenceType.DECODE
+        return ScheduledBatch(
+            seqs={seq.id: seq},
+            num_scheduled_tokens=[1],
+            total_tokens_num=1,
+            total_seqs_num=1,
+        )
+
+    plain = batch(0.0)
+    assert not [name for name in vars(plain) if name.startswith("presence")]
+    assert plain.presence_penalties is None
+    assert not plain.presence_resumed and not plain.presence_preempted
+    restored = pickle.loads(pickle.dumps(plain))
+    assert restored.presence_penalties is None and not restored.presence_preempted
+    penalized = batch(1.5)
+    assert penalized.presence_penalties.tolist() == [1.5]
+    assert [n for n in vars(penalized) if n.startswith("presence")] == [
+        "presence_penalties"
+    ]

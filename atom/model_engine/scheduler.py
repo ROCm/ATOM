@@ -27,7 +27,8 @@ import struct
 import threading
 import time
 from collections import Counter, deque
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -212,6 +213,18 @@ class ScheduledBatch:
         state_maintenance_ops: State moves that must execute before this batch.
     """
 
+    # The presence penalty's inputs (`presence_penalty.py`). Set on a batch only
+    # when they are not empty: every batch is pickled to the TP workers, and a
+    # batch without a penalty must cost nothing there.
+    # Each request's penalty, or None when no request has one.
+    presence_penalties: np.ndarray | None = None
+    # A resumed request's earlier output, on the step that samples its
+    # recomputed prefill: its table row went back when it was preempted.
+    presence_resumed: Mapping[int, np.ndarray] = MappingProxyType({})
+    # Requests with a penalty preempted since the last batch: their rows go
+    # back before this batch claims any (`Scheduler.schedule` sets it).
+    presence_preempted: tuple[int, ...] | list[int] = ()
+
     def __init__(
         self,
         seqs: dict[int, Sequence],
@@ -325,29 +338,21 @@ class ScheduledBatch:
         )
         self.top_ks = np.asarray([seq.top_k for seq in seqs.values()], dtype=np.int32)
         self.top_ps = np.asarray([seq.top_p for seq in seqs.values()], dtype=np.float32)
-        # Each request's presence_penalty, or None when no request has one: a
-        # rule of the token-constraint boundary (`presence_penalty.py`).
         presence = np.asarray(
             [seq.presence_penalty for seq in seqs.values()], dtype=np.float32
         )
-        self.presence_penalties = presence if presence.any() else None
-        # A resumed request's earlier output, on the step that samples its
-        # recomputed prefill: its table row went back when it was preempted.
-        self.presence_resumed = {}
-        if self.presence_penalties is not None:
-            for i, seq in enumerate(seqs.values()):
-                if (
-                    seq.presence_penalty
-                    and seq.output_tokens
-                    and seq.type == SequenceType.PREFILL
-                    and (is_final_chunk is None or is_final_chunk[i])
-                ):
-                    self.presence_resumed[seq.id] = np.asarray(
-                        seq.output_tokens, dtype=np.int32
-                    )
-        # Requests with a penalty preempted since the last batch: their rows go
-        # back before this batch claims any (`Scheduler.schedule` fills it).
-        self.presence_preempted: list[int] = []
+        if presence.any():
+            self.presence_penalties = presence
+            resumed = {
+                seq.id: np.asarray(seq.output_tokens, dtype=np.int32)
+                for i, seq in enumerate(seqs.values())
+                if seq.presence_penalty
+                and seq.output_tokens
+                and seq.type == SequenceType.PREFILL
+                and (is_final_chunk is None or is_final_chunk[i])
+            }
+            if resumed:
+                self.presence_resumed = resumed
         # True if any seq in the batch is a fan-out child (SamplingParams.n>1)
         # and therefore requires fresh per-row random noise at the sampler
         # rather than the cached shared exponential tensor.
