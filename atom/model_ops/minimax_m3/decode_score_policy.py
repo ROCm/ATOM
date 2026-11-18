@@ -2,9 +2,21 @@
 
 
 def decode_score_num_warps(
-    arch: str, batch: int, max_block: int, max_query_len: int
+    arch: str,
+    batch: int,
+    max_block: int,
+    max_query_len: int,
+    num_idx_heads: int = 1,
 ) -> int:
-    if arch == "gfx1250" and max_query_len in (1, 4) and batch >= 4 and max_block > 512:
+    if (
+        arch == "gfx1250"
+        and batch >= 4
+        and max_block > 512
+        and (
+            max_query_len in (1, 4)
+            or (max_query_len == 8 and num_idx_heads == 1 and 8 <= batch <= 16)
+        )
+    ):
         return 2
     return 4
 

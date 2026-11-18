@@ -40,3 +40,21 @@ def test_decode_score_num_warps(arch, batch, max_block, max_q, want):
 )
 def test_transposed_decode_score_policy(arch, batch, max_block, max_q, want):
     assert use_transposed_decode_score(arch, batch, max_block, max_q) is want
+
+
+@pytest.mark.parametrize(
+    "batch,max_block,heads,want",
+    [
+        (3, 513, 1, 4),
+        (4, 512, 1, 4),
+        (4, 513, 1, 4),
+        (8, 513, 1, 2),
+        (16, 8192, 1, 2),
+        (32, 8192, 1, 4),
+        (128, 8192, 1, 4),
+        (4, 513, 2, 4),
+        (128, 8192, 4, 4),
+    ],
+)
+def test_tp4_q8_decode_score_num_warps(batch, max_block, heads, want):
+    assert decode_score_num_warps("gfx1250", batch, max_block, 8, heads) == want

@@ -1445,7 +1445,9 @@ def minimax_m3_index_topk_decode(
         NUM_IDX_HEADS=num_idx_heads,
         MAX_Q=max_query_len,
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
-        num_warps=decode_score_num_warps(arch, batch, max_block, max_query_len),
+        num_warps=decode_score_num_warps(
+            arch, batch, max_block, max_query_len, num_idx_heads
+        ),
         num_stages=DECODE_SCORE_NUM_STAGES,
     )
 

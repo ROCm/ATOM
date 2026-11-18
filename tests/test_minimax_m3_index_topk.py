@@ -1046,4 +1046,88 @@ def test_cp_actual_launch_grid_and_replay_unchanged(monkeypatch, batch, pages):
                 expected = call()
             assert torch.equal(replayed, expected)
     torch.cuda.current_stream().wait_stream(stream)
+
+
+@gpu
+@pytest.mark.parametrize("batch,pages", [(8, 513), (8, 1500), (16, 2048)])
+def test_tp4_q8_two_warp_score_outputs_and_replay(monkeypatch, batch, pages):
+    import triton
+
+    if m.get_gfx_runtime() != "gfx1250":
+        pytest.skip("gfx1250 TP4 q8 decode score policy")
+    max_q, heads, device = 8, 1, "cuda"
+    context = pages * SPARSE_BLOCK_SIZE - 3
+    q = torch.randn(
+        batch * max_q, heads, HEAD_DIM, device=device, dtype=torch.bfloat16
+    )
+    cache = torch.randn(
+        pages, SPARSE_BLOCK_SIZE, HEAD_DIM, device=device, dtype=torch.bfloat16
+    ).to(torch.float8_e4m3fn)
+    table = torch.stack(
+        [torch.randperm(pages, device=device, dtype=torch.int32) for _ in range(batch)]
+    )
+    lengths = torch.tensor(
+        [context - i * 7 for i in range(batch)], device=device, dtype=torch.int32
+    )
+    chunks = m._native_decode_score_chunks(batch, pages)
+
+    def score(warps):
+        out = torch.empty((heads, batch * max_q, pages), device=device)
+        m._decode_index_score_tiled_kernel[(batch, chunks)](
+            q,
+            cache,
+            out,
+            table,
+            lengths,
+            HEAD_DIM,
+            HEAD_DIM**-0.5,
+            triton.cdiv(pages, chunks),
+            *q.stride(),
+            *cache.stride(),
+            *out.stride(),
+            table.stride(0),
+            NUM_IDX_HEADS=heads,
+            MAX_Q=max_q,
+            BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+            num_warps=warps,
+            num_stages=m.DECODE_SCORE_NUM_STAGES,
+        )
+        return out
+
+    assert torch.equal(score(4), score(2))
+
+    def run(warps):
+        with monkeypatch.context() as patch:
+            patch.setattr(m, "decode_score_num_warps", lambda *args: warps)
+            return m.minimax_m3_index_topk_decode(
+                q,
+                cache,
+                table,
+                lengths,
+                context,
+                TOPK,
+                INIT,
+                LOCAL,
+                heads,
+                HEAD_DIM**-0.5,
+                emit_sparse_block_table=True,
+                max_query_len=max_q,
+            )
+
+    expected, actual = run(4), run(2)
+    assert all(torch.equal(a, b) for a, b in zip(actual, expected))
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run(2)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            replayed = run(2)
+        q.neg_()
+        lengths.sub_(1)
+        graph.replay()
+        expected = run(4)
+        assert all(torch.equal(a, b) for a, b in zip(replayed, expected))
+    torch.cuda.current_stream().wait_stream(stream)
     assert all(grid == expected_grid for grid in grids)
