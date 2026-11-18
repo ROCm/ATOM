@@ -8,15 +8,18 @@ NUMA node. The GPU->node mapping is auto-detected (``amdsmi`` -- the ROCm analog
 of NVML -- with a sysfs fallback) so the operator needs no per-machine config;
 an explicit per-rank node list can override it.
 
-Public entry point: :func:`numa_bind_to_node`, called once at worker start.
-Knobs live in :mod:`atom.utils.envs` (``ATOM_NUMA_BIND``, ``ATOM_AUTO_NUMA_BIND``,
-``ATOM_NUMA_NODE``, ``ATOM_CRASH_ON_NUMA_BIND_FAILURE``).
+Public entry points: :func:`numa_bind_to_node`, called once at worker start,
+and :func:`opt_out_of_numa_balancing`, called first thing in every serving
+process. Knobs live in :mod:`atom.utils.envs` (``ATOM_NUMA_BIND``,
+``ATOM_AUTO_NUMA_BIND``, ``ATOM_NUMA_NODE``, ``ATOM_CRASH_ON_NUMA_BIND_FAILURE``,
+``ATOM_NUMA_BALANCING_OPT_OUT``).
 """
 
 import ctypes
 import glob
 import logging
 import os
+import platform
 
 from atom.utils import envs
 
@@ -139,6 +142,100 @@ def _set_preferred_memory(node: int) -> None:
         libnuma.numa_set_preferred(ctypes.c_int(node))
     except Exception as e:
         logger.debug(f"numa_set_preferred({node}) skipped: {e}")
+
+
+# Memory-policy syscalls (glibc exports neither; libnuma's `numa_set_localalloc`
+# sets MPOL_DEFAULT, which is the policy that NUMA balancing scans).
+_SYS_MEMPOLICY = {"x86_64": (238, 239), "aarch64": (237, 236)}  # (set, get)
+_MPOL_DEFAULT = 0
+_MPOL_LOCAL = 4
+
+
+def opt_out_of_numa_balancing(label: str = "") -> bool:
+    """Keep the kernel's automatic NUMA balancing off this process's memory.
+
+    The GPU-mapped host memory of a serving process (``hipHostMalloc``,
+    torch's pinned memory, Engram's UVA tables, ``hipHostRegister``) is
+    tracked by KFD through MMU notifiers (its SVM ranges -- with XNACK off as
+    well -- and userptr BOs). NUMA balancing's scan (``task_numa_work``, 256 MB
+    of the address space at a time, in the context of whichever thread of the
+    process it lands on) marks those PTEs PROT_NONE; the notifier
+    (``svm_range_cpu_invalidate_pagetables``, 293 of 298 measured; the userptr
+    one the rest) quiesces the process: KFD removes every GPU queue of it
+    through MES until its restore worker revalidates the range -- measured on
+    MI455X TP4 c1 decode at ~4-5 ms per eviction, 13 evictions in 2.3 s of
+    decode, each one stretching that rank's single-launch step -- and every
+    peer, which spins on it -- from 3.5 to 7-9 ms: the ITL p99 tail. Nothing
+    is migrated (the pages are pinned), so the scan buys nothing here.
+
+    The scan skips a VMA whose policy -- its own, else the scanning thread's --
+    lacks MPOL_F_MOF. The default task policy carries it; an explicit
+    MPOL_LOCAL does not, and places pages exactly as the default does (the
+    faulting CPU's node, falling back elsewhere). So this sets MPOL_LOCAL as
+    the task policy, and only over MPOL_DEFAULT: a policy the operator chose
+    (``numactl``) is kept, and ``numa_bind_to_node`` may still replace it with
+    its own (also scan-free) preferred node.
+
+    Per thread, inherited by threads and children created after it, so it runs
+    before a process starts any. In a container the default seccomp profile
+    refuses the mempolicy calls without CAP_SYS_NICE (``--cap-add SYS_NICE``):
+    then it only warns, and the host's ``kernel.numa_balancing=0`` is the way. No-op where NUMA balancing is off, on another
+    architecture, or with ``ATOM_NUMA_BALANCING_OPT_OUT=0``. Returns whether it
+    set the policy.
+    """
+    if not envs.ATOM_NUMA_BALANCING_OPT_OUT:
+        return False
+    nrs = _SYS_MEMPOLICY.get(platform.machine())
+    if nrs is None:
+        return False
+    try:
+        with open("/proc/sys/kernel/numa_balancing") as f:
+            if f.read().strip() in ("", "0"):
+                return False
+    except OSError:
+        return False
+    tag = f" ({label})" if label else ""
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.syscall.restype = ctypes.c_long
+        mode = ctypes.c_int(-1)
+        if (
+            libc.syscall(
+                ctypes.c_long(nrs[1]),
+                ctypes.byref(mode),
+                None,
+                ctypes.c_ulong(0),
+                None,
+                ctypes.c_ulong(0),
+            )
+            != 0
+        ):
+            raise OSError(ctypes.get_errno(), "get_mempolicy")
+        if mode.value != _MPOL_DEFAULT:
+            return False
+        if (
+            libc.syscall(
+                ctypes.c_long(nrs[0]),
+                ctypes.c_int(_MPOL_LOCAL),
+                None,
+                ctypes.c_ulong(0),
+            )
+            != 0
+        ):
+            raise OSError(ctypes.get_errno(), "set_mempolicy")
+    except Exception as e:  # noqa: BLE001 - a latency optimization, never fatal
+        # EPERM: a container's default seccomp profile allows the mempolicy
+        # calls only with CAP_SYS_NICE (docker run --cap-add SYS_NICE)
+        hint = (
+            " (needs CAP_SYS_NICE in a container: --cap-add SYS_NICE; or set "
+            "kernel.numa_balancing=0 on the host)"
+            if getattr(e, "errno", None) == 1
+            else ""
+        )
+        logger.warning(f"NUMA balancing opt-out{tag} skipped: {e}{hint}")
+        return False
+    logger.debug(f"NUMA balancing opt-out{tag}: task memory policy MPOL_LOCAL")
+    return True
 
 
 def numa_bind_to_node(gpu_id: int, label: str = "") -> None:

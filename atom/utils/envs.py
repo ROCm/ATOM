@@ -1315,6 +1315,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_CRASH_ON_NUMA_BIND_FAILURE": lambda: (
         os.getenv("ATOM_CRASH_ON_NUMA_BIND_FAILURE", "0") == "1"
     ),
+    # Keep automatic NUMA balancing off the serving processes' memory (task
+    # policy MPOL_LOCAL where it is MPOL_DEFAULT): its scan invalidates the
+    # GPU-mapped host memory (KFD SVM ranges / userptr), and KFD then stops the
+    # process's GPU queues for ~4-5 ms. See opt_out_of_numa_balancing in atom/utils/numa_utils.py.
+    "ATOM_NUMA_BALANCING_OPT_OUT": lambda: (
+        os.getenv("ATOM_NUMA_BALANCING_OPT_OUT", "1") == "1"
+    ),
     # PP-boundary hidden_states/residual are TP-replicated; when on, each rank
     # sends only its 1/tp_size slice and the receiver all-gathers, cutting PP
     # link traffic by tp_size. Default on; set "0" for full-tensor sends.

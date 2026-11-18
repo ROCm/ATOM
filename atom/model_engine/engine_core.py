@@ -305,10 +305,12 @@ class EngineCore:
         `python` in `ps`, an unattached callback leaves ATOM_GC_DEBUG inert.
         """
         from atom.utils import enable_orphan_reaping
+        from atom.utils.numa_utils import opt_out_of_numa_balancing
 
         EngineCore._process_name = name
         set_process_title(name)
         enable_orphan_reaping()  # orphans pin VRAM + IPC handles; see its docs
+        opt_out_of_numa_balancing(name)  # also covers the workers it starts
         tune_gc()
         maybe_attach_gc_debug_callback(name)
 
