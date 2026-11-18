@@ -146,6 +146,7 @@ if use_triton_gemm():
 
 ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
 ENABLE_DS_QKNORM_FUSION = envs.ATOM_ENABLE_DS_QKNORM_FUSION
+ENABLE_DS_QKV_A_NORM_FP4 = envs.ATOM_DS_QKV_A_NORM_FP4
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
 ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION
 ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION = (
@@ -606,6 +607,59 @@ def _fused_rms_fp8_quant(
         transpose_scale=transpose_scale,
     )
     return out1_quantized, out1_bs, out1_unquantized, out2, out_res1
+
+
+def _qkv_a_rmsnorm_fp4_fake(
+    q_c: torch.Tensor,
+    q_weight: torch.Tensor,
+    q_eps: float,
+    kv_c: torch.Tensor,
+    kv_weight: torch.Tensor,
+    kv_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    m, qn = q_c.shape
+    dev = q_c.device
+    return (
+        torch.empty((m, qn // 2), dtype=torch.uint8, device=dev),
+        torch.empty(((m + 31) // 32, qn // 128, 32, 4), dtype=torch.uint8, device=dev),
+        torch.empty((m, kv_c.shape[-1]), dtype=kv_c.dtype, device=dev),
+    )
+
+
+@torch_compile_guard(gen_fake=_qkv_a_rmsnorm_fp4_fake, mutates_args=[])
+def _qkv_a_rmsnorm_fp4(
+    q_c: torch.Tensor,
+    q_weight: torch.Tensor,
+    q_eps: float,
+    kv_c: torch.Tensor,
+    kv_weight: torch.Tensor,
+    kv_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """q_a RMSNorm + MXFP4 quant (32x4 scale tiles for gemm_a4w4) and kv_a RMSNorm."""
+    from aiter.ops.rmsnorm import qkv_a_rmsnorm_fp4
+
+    q, q_scale, kv = _qkv_a_rmsnorm_fp4_fake(
+        q_c, q_weight, q_eps, kv_c, kv_weight, kv_eps
+    )
+    qkv_a_rmsnorm_fp4(q, q_scale, kv, q_c, kv_c, q_weight, kv_weight, q_eps, kv_eps)
+    return q, q_scale, kv
+
+
+def _qkv_a_norm_fp4_supported(attn: nn.Module) -> bool:
+    try:
+        from aiter.ops.rmsnorm import qkv_a_rmsnorm_fp4  # noqa: F401
+    except ImportError:
+        return False
+    return (
+        attn.q_lora_rank is not None
+        and 1024 < attn.q_lora_rank <= 1536
+        and attn.q_lora_rank % 128 == 0
+        and attn.kv_lora_rank <= 512
+        and attn.kv_lora_rank % 8 == 0
+        and attn.indexer is None
+        and attn.q_a_layernorm.x_pad_to_multiple == 0
+        and attn.kv_a_layernorm.x_pad_to_multiple == 0
+    )
 
 
 @mark_trace(prefix="rmsnorm_quant", torch_compile=True)
@@ -2167,6 +2221,12 @@ class DeepseekV2MLAAttention(nn.Module):
             and eff_dtype in (dtypes.fp8, dtypes.fp4x2)
         ):
             self.fuse_qknorm_quant = True
+        self.qkv_a_norm_fp4 = (
+            ENABLE_DS_QKV_A_NORM_FP4
+            and not self.fuse_qknorm_quant
+            and not self.fuse_qknorm
+            and _qkv_a_norm_fp4_supported(self)
+        )
         if self.indexer is not None:
             # the fused q norm quantizes q for q_b_proj (``_fuse_rmsnorm_quant``)
             self.indexer.quantized_q = (
@@ -2185,6 +2245,7 @@ class DeepseekV2MLAAttention(nn.Module):
         # a 2-tuple (fp8, scale) is the plain fused-quant output.
         indexer_hidden = None
         projected_k_weights = None  # the indexer's k and head weights, when folded
+        qkv_a_normed = False
         if isinstance(hidden_states, tuple):
             if len(hidden_states) == 3:
                 hidden_states, hidden_states_scale, indexer_hidden = hidden_states
@@ -2264,6 +2325,25 @@ class DeepseekV2MLAAttention(nn.Module):
                         output_unquantized_inp1=False,
                         transpose_scale=True,
                     )
+                elif (
+                    self.qkv_a_norm_fp4
+                    and q_c.dtype == torch.bfloat16
+                    and uses_mxfp4_n32k4_scale(self.q_b_proj)
+                ):
+                    # q leaves as q_b_proj's MXFP4 input, its scale in 32x4 tiles
+                    (
+                        hidden_states_or_q_c,
+                        hidden_states_or_q_c_scale,
+                        kv_c_normed,
+                    ) = _qkv_a_rmsnorm_fp4(
+                        q_c,
+                        self.q_a_layernorm.weight,
+                        self.q_a_layernorm.eps,
+                        kv_c,
+                        self.kv_a_layernorm.weight,
+                        self.kv_a_layernorm.eps,
+                    )
+                    qkv_a_normed = True
                 else:
                     hidden_states_or_q_c = self.q_a_layernorm(q_c)
         else:
@@ -2273,7 +2353,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 [self.kv_lora_rank, self.qk_rope_head_dim],
                 dim=-1,
             )
-        if not self.fuse_qknorm_quant and not self.fuse_qknorm:
+        if not self.fuse_qknorm_quant and not self.fuse_qknorm and not qkv_a_normed:
             kv_c_normed = self.kv_a_layernorm(kv_c)
             hidden_states_or_q_c_scale = None
         if self.is_v32 and self.indexer is not None and not self.skip_topk:
