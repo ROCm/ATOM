@@ -87,43 +87,24 @@ def ship_prompt_hash_chain(seq, hash_block_size: int, *, block_hashes=None) -> N
     """
     if not envs.ATOM_FRONTEND_PREFIX_HASH or hash_block_size <= 0:
         return
+    # An `IngressRequest` leaves a text prompt's seed None; its `Sequence`'s is -1.
+    seed = -1 if seq.cache_seed is None else seq.cache_seed
     n = full_prompt_blocks(seq, hash_block_size)
     if (
         block_hashes is not None
-        and (block_hashes.block_size, block_hashes.seed)
-        == (hash_block_size, seq.cache_seed)
+        and (block_hashes.block_size, block_hashes.seed) == (hash_block_size, seed)
         and block_hashes.num_tokens == seq.num_prompt_tokens
         and block_hashes.num_blocks == n
     ):
         hashes = block_hashes.as_array()
     else:
         hashes = array.array(
-            "Q",
-            chained_block_hashes(seq.token_ids, hash_block_size, 0, n, seq.cache_seed),
+            "Q", chained_block_hashes(seq.token_ids, hash_block_size, 0, n, seed)
         )
     seq.prompt_hash_chain = ShippedChain(
         hash_block_size,
-        seq.cache_seed,
+        seed,
         seq.num_prompt_tokens,
         prompt_fingerprint(seq),
         hashes,
     )
-
-
-def take_shipped_chains(seqs) -> list | None:
-    """`seqs`' shipped chains, detached for the ADD frame that carries them
-    beside the seqs (a pickled `Sequence` drops its chain); None if none has
-    one. The frontend keeps no copy."""
-    chains = [getattr(seq, "prompt_hash_chain", None) for seq in seqs]
-    if not any(chains):
-        return None
-    for seq in seqs:
-        seq.prompt_hash_chain = None
-    return chains
-
-
-def attach_shipped_chains(seqs, chains=None) -> None:
-    """Hand an ADD frame's chains (`take_shipped_chains`) back to its seqs."""
-    if chains:
-        for seq, chain in zip(seqs, chains, strict=True):
-            seq.prompt_hash_chain = chain

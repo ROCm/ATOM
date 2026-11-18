@@ -413,8 +413,8 @@ class Sequence:
         self.block_hashes: list[int] = []
         # `prefix_hash.ShippedChain`, consumed by
         # `BlockManager._adopt_shipped_chain`; None = the engine hashes it. It
-        # rides beside the seq in the ADD frame (`take_shipped_chains`), never
-        # inside a pickled seq (`__getstate__`).
+        # reaches the engine as the request's `PromptHashChain` on the wire
+        # and is left out wherever a seq is pickled (`__getstate__`).
         self.prompt_hash_chain: tuple | None = None
         # Slots taken for midstep checkpoints of the forward now in flight,
         # as `(slot, position, hash)` — one slot each, since a checkpoint never
@@ -665,7 +665,8 @@ class Sequence:
         self.num_tokens += 1
 
     def __getstate__(self):
-        # The shipped prompt chain rides beside the seq (`prompt_hash_chain`).
+        # Wherever a seq is still pickled (runner and PP / disagg channels),
+        # its shipped prompt chain stays behind: only the BlockManager reads it.
         state = self.__dict__.copy()
         state["prompt_hash_chain"] = None
         return state
