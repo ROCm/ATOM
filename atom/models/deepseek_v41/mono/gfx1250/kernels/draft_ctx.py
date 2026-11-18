@@ -386,14 +386,50 @@ def ctptr(tab, name):
     return (fx.Int64(rf(v[1])) << 32) | (fx.Int64(rf(v[0])) & fx.Int64(0xFFFFFFFF))
 
 
-def ctx_parts(tab, t, b, T, smoff, kv_fp4=False):
-    """ctx_tail's 4 stages as callables (no handoffs: the caller separates them by grid-wide barriers -- the target
-    sampling's handoffs, which use the same agent-scope fences), LDS at lds_base + smoff."""
+@ASTRewriter.transform
+def stage_proj_nc(c, T, nc):
+    """main_proj -> hpref on nc CTAs (virtual ids c["b"] 0..nc-1): the 320 N tiles whole, tile vb + k nc, the 8 waves
+    splitting K (LDS sum, plain f32 stores)."""
+    b, w = c["b"], c["w"]
+    MT = (T + 15) // 16
+    KS = KA // 128 // WAVES   # 15
+    NTL = H // 16
+    for kk in range_constexpr((NTL + nc - 1) // nc):
+        tile = b + kk * nc
+        if tile < NTL:
+            accs = _gemv_part_m(c, c["aux8"], c["auxs"], KA, c["mpw"], c["mps"], tile * 16, T, w * KS, KS, MT)
+            _lds_sum_out(c, accs, MT, WAVES, T, tile * 16, False)
+
+
+@ASTRewriter.transform
+def stage_wkv_nc(c, T, nc):
+    """stage_wkv_skb's tasks strided by nc (virtual ids c["b"])."""
+    b = c["b"]
+    NT = NDL * (KVD // 16)
+    for kk in range_constexpr((NT + nc - 1) // nc):
+        task = b + kk * nc
+        if task < NT:
+            d = task // (KVD // 16)
+            wk = (d == 0).select(c["wkv0"], (d == 1).select(c["wkv1"], c["wkv2"]))
+            wks = (d == 0).select(c["wks0"], (d == 1).select(c["wks1"], c["wks2"]))
+            _ntile_splitk(c, c["h8"], c["hs"], H, wk, wks, (task % (KVD // 16)) * 16, T, c["kvp"], KVD, d * T)
+
+
+def ctx_split(tab, t, b, T, cnt, e0, nc, kv_fp4=False):
+    """The draft context KV on CTAs e0 .. e0 + nc - 1 alone (while the others sample: tail.target): main_proj -> main_norm
+    -> 3 x wkv -> kv_norm / RoPE / QAT -> ring, the stages separated by nc-CTA handoffs on cnt, cnt + 4, cnt + 8 (zeroed
+    a step). The CTAs' virtual ids b - e0 take ctx_tail's roles (hnorm: a row a CTA; kvrow: a wave a (layer, row))."""
     c = {k: ctptr(tab, k) for k in CTPTRS if k != 'roff'}
     ro = ctptr(tab, 'roff')
-    c.update(t=t, b=b, w=t // 32, l=t % 32, sm=hx.lds_base() + smoff, roff0=hx.gload(ro, I32), roff1=hx.gload(ro + i64(4), I32),
+    c.update(t=t, b=b - e0, w=t // 32, l=t % 32, sm=hx.lds_base(), roff0=hx.gload(ro, I32), roff1=hx.gload(ro + i64(4), I32),
              roff2=hx.gload(ro + i64(8), I32), kvfp4=kv_fp4)
-    return [lambda: stage_proj_skb(c, T), lambda: stage_hnorm(c, T), lambda: stage_wkv_skb(c, T), lambda: stage_kvrow(c, T)]
+    stage_proj_nc(c, T, nc)
+    hx.handoff(cnt, t, False, nc)
+    stage_hnorm(c, T)
+    hx.handoff(cnt + i64(4), t, False, nc)
+    stage_wkv_nc(c, T, nc)
+    hx.handoff(cnt + i64(8), t, False, nc)
+    stage_kvrow(c, T)
 
 
 def ctx_tail(tab, t, b, T, cnt, handoff, hdev=False, kv_fp4=False):

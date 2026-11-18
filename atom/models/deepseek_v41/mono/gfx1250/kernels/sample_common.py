@@ -36,7 +36,7 @@ from atom.models.deepseek_v41.mono.gfx1250.kernels.device import _v, gptr, lptr
 
 # (c1: steps of 6 rows only -- runner.MAX_STEP_ROWS) 6 rows x 40 CTAs a row, not 48 x 5: every CTA scans 808 vocab
 # columns, not 6464 (ROWS * CPR = 240 as before: the record buffers and exchange slots keep their sizes)
-ROWS, CPR, NB = 6, 40, 256
+ROWS, CPR, NB = 6, 32, 256   # (ctx split) 6 rows x 32 CTAs = 192: CTAs 192..255 run the draft context meanwhile (tail.target)
 R = 16.0
 F32, I32, I64 = fx.Float32, fx.Int32, fx.Int64
 LN2 = 0.6931471805599453

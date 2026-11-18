@@ -57,10 +57,6 @@ def tptr(tp, name):
     return (fx.Int64(_ufl(v[1])) << 32) | (fx.Int64(_ufl(v[0])) & fx.Int64(0xFFFFFFFF))
 
 
-def _ctxp(ctx, t, b, T, kv_fp4=False):   # (plain python) the draft context KV's 4 stages, run inside the sampling's exchanges
-    return None if ctx is None else CX.ctx_parts(ctx, t, b, T, 65536, kv_fp4)
-
-
 # the target tail's code (head, sampling + verification, the draft context stages) -> L2 at its start (device.
 # code_prefetch_near, bounded by the launch's recorded end; one CTA in 16: a cluster shares the L2): it runs once a step,
 # after the layer loop's weight stream (ktrace gapS, 133K: the sampling passes' computation before each exchange 7-14 us)
@@ -78,11 +74,16 @@ def target(tp, t, b, sm, tc, recv, rank, head_d=4, ctx=None, T=None, kv_fp4=Fals
     handoff(tc, t, False)   # LY.HEAD (offset 0)
     HF.head_once_r(P['xh'], P['hw'], P['logits'], t, t % 32, t // 32, sm, b, head_d, 2, 4)
     handoff(tc + i64(LY.HEAD_DONE), t, False)
-    # sampling + verification in one (outtok / verdict / anc written by CTA 0 after its last handoff)
-    SPF.sample_once_p(P['logits'], P['s0'], P['s1'], P['s2'], P['s3'], P['sids'], tc + i64(LY.SAMPLE), t, b, sm, HF.VR,
-                      [r + i64(SOFF) for r in recv], rank, 1, tptr(tp, 'sparam'), tptr(tp, 'qlog'), P['dids'],
-                      tptr(tp, 'prow'), P['outtok'], P['verdict'], P['anc'], tptr(tp, 'qids'),
-                      ctxp=_ctxp(ctx, t, b, T, kv_fp4))
+    # sampling + verification (outtok / verdict / anc written by CTA 0 after its last handoff) on the ROWS x CPR sampling
+    # CTAs; the draft context KV on the others meanwhile (it sat inside the sampling's exchanges, on its critical path:
+    # ctx0 12.1 + wkv 4.6 us, ktrace gapS; on 64 CTAs it takes ~29-36 us, fixture ctx64.py)
+    if b < SF.ROWS * SF.CPR:
+        SPF.sample_once_p(P['logits'], P['s0'], P['s1'], P['s2'], P['s3'], P['sids'], tc + i64(LY.SAMPLE), t, b, sm, HF.VR,
+                          [r + i64(SOFF) for r in recv], rank, 1, tptr(tp, 'sparam'), tptr(tp, 'qlog'), P['dids'],
+                          tptr(tp, 'prow'), P['outtok'], P['verdict'], P['anc'], tptr(tp, 'qids'))
+    else:
+        if fx.const_expr(ctx is not None):
+            CX.ctx_split(ctx, t, b, T, tc + i64(LY.CTX_SPLIT), SF.ROWS * SF.CPR, CX.CTAS - SF.ROWS * SF.CPR, kv_fp4)
     handoff(tc + i64(LY.VERIFY_DONE), t, False)
 
 

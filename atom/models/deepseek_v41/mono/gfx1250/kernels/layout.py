@@ -48,6 +48,7 @@ DRAFT_FRONT = 416  # draft entry: attention front done
 TARGET_STATE = 432  # target entry: block state done
 TARGET_FRONT = 448  # target entry: attention front done
 ENG_A = 464  # target entry: the Engram rows' A (quantized once, engram.stage_enga) out, a producer CTA each
+CTX_SPLIT = 468  # target tail: the draft context's 3 stage handoffs on its own CTAs (468, 472, 476; draft_ctx.ctx_split)
 
 # --- fixed LDS regions --------------------------------------------------------------------------------------------
 TP_PAYLOAD = 0  # [TR][20] f32 TP reduction payload, kept across the FFN front

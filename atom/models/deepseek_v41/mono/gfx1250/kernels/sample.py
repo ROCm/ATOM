@@ -150,7 +150,7 @@ def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank,
     base = lg + i64(row) * (V * 4)
     qbase = qlog + i64((qsrc * ND + fx.min(k, I32(ND - 1))) * V) * 4
     xl = xk - rank * V                             # x_k's local column (outside [0, V): another rank's)
-    NCT = 256
+    NCT = ROWS * CPR   # (the sampling CTAs alone: tail.target runs the draft context on the others meanwhile)
     # P0: (max, sum exp) of z = l / T, and of the q row's d * invTd; d(x_k)
     m = F32(-1e30)
     s = F32(0.0)
