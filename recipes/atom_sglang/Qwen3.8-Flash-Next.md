@@ -3,8 +3,10 @@
 Flash uses `qwen4_exp` / `Qwen4ExpForConditionalGeneration`. Target and MTP
 compute run through Native ATOM `Qwen4Exp` and `Qwen4ExpMTP`; the plugin
 adapts SGLang scheduling, QSA KV pools, PLE state and HC hidden storage.
-It requires the Native Flash implementation in this tree and SGLang 0.5.17.
-The recognition patch supplies Flash config registration for that version.
+It requires the Native Flash implementation in this tree. The original
+TP2/EP2 example uses SGLang 0.5.17, with Flash config registration supplied
+by the recognition patch. The gfx942 pure-TP MTP configuration below uses
+SGLang 0.5.22.
 
 `Qwen4ExpForConditionalGeneration` is 48 layers: 36 Gated-DeltaNet and 12 QSA
 (query-sparse, 2048-token budget) attention layers, 4-stream
@@ -57,6 +59,70 @@ curl http://127.0.0.1:8000/generate \
   -H 'Content-Type: application/json' \
   -d '{"text":"The result of 17 + 25 is", "sampling_params":{"temperature":0,"top_k":1,"top_p":1,"max_new_tokens":64}}'
 ```
+
+## MI308X pure TP2 / TP4 with BF16 MTP
+
+For the `Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16` checkpoint on gfx942, use
+`--ep-size 1`. ATOM keeps the logical expert shard at 320 (TP2) or 160
+(TP4), and stores it at 320 or 192 respectively. Both the FP8 target and
+BF16 MTP fuse the shared expert into slot 512, so AITER sees 513 experts
+and top-k 11. The target and draft retain their checkpoint dtypes.
+
+The following settings use SGLang 0.5.22. Set `AITER_MODEL_CONFIGS` to the
+`aiter/configs/model_configs` directory in the AITER installation:
+
+```bash
+export MODEL_PATH=/models/Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16
+export CUDA_VISIBLE_DEVICES=0,1
+export HIP_VISIBLE_DEVICES=0,1
+export GPU_ARCHS=gfx942
+export SGLANG_PLUGINS=atom_sglang
+export SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
+export SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=atom.plugin.sglang.models
+export SGLANG_USE_AITER=1
+export AITER_CONFIG_FMOE="${AITER_MODEL_CONFIGS}/qwen38_flash_next_fp8_ptpc_tuned_fmoe.csv:${AITER_MODEL_CONFIGS}/qwen38_flash_next_bf16_tuned_fmoe.csv"
+export AITER_BYPASS_TUNE_CONFIG=0
+export AITER_ONLINE_TUNE=0
+
+python -m sglang.launch_server \
+  --model-path "$MODEL_PATH" --trust-remote-code \
+  --host 127.0.0.1 --port 8000 --tp-size 2 --ep-size 1 \
+  --attention-backend aiter --kv-cache-dtype bf16 --page-size 64 \
+  --context-length 32768 --max-running-requests 8 \
+  --mem-fraction-static 0.95 --disable-radix-cache \
+  --cuda-graph-backend-decode full --cuda-graph-max-bs-decode 8 \
+  --mamba-radix-cache-strategy extra_buffer --max-mamba-cache-size 80 \
+  --mamba-ssm-dtype float32 \
+  --speculative-algorithm EAGLE --speculative-num-steps 2 \
+  --speculative-num-draft-tokens 3 --speculative-eagle-topk 1 \
+  --speculative-use-rejection-sampling
+```
+
+For TP4, expose four GPUs in both visibility variables and use
+`--tp-size 4 --ep-size 1`. TP4 expert padding adds about 5.64 GiB per rank
+for the 48 FP8 target layers, plus about 240 MiB for the BF16 draft layer;
+include that storage in the memory budget.
+
+Load both MoE tables before importing AITER. They contain FlyDSL, ASM and
+CK entries, so a successful dispatch means the selected row's actual
+kernel runs. Check that the logs show `gfx942`, 80 CU, physical intermediate
+320/192, 513 experts and top-k 11, with FP8/per-token for target and BF16/no
+quantization for draft. A `ck kernel not found` warning is a failed tuned
+dispatch even if inference continues with a fallback.
+
+CK instances must also have been **generated for gfx942**. A mixed-arch
+prebuild can embed gfx942 code objects while its Python code generator chose
+the gfx950 instance list. In that case, setting `GPU_ARCHS` at runtime does
+not replace the installed module: rebuild the affected BF16 and FP8 CK MoE
+modules with `GPU_ARCHS=gfx942` and use a separate `AITER_JIT_DIR` to keep
+the original installation intact. Do not change the CSV kernel names to
+match the incorrect prebuild.
+
+ATOM applies this weight alignment in its model/method layer;
+`AITER_MOE_PADDING_SIZE` alone does not enable it. Graph token padding is
+handled separately from the expert intermediate padding. For correctness
+comparisons, keep the speculative horizon, sampling parameters, SSM dtype,
+cache settings and prompt template the same across runs.
 
 ## Long-context high-throughput serving (no MTP)
 
@@ -115,12 +181,14 @@ gated behind environment variables:
   combine into the next mix.
 * shared expert: routed through the fused MoE as expert 512 (top-k + 1),
   scoring with sigmoid.
-* batch-1 MoE: routing and experts in two Triton kernels.
+* batch-1 MoE: gfx942 PTPC uses the AITER tuned table; other supported
+  layouts retain the routing/expert Triton specialization.
 * QSA indexer scoring: matrix cores for prefill, CUDA cores for decode-sized
   batches.
 
-The MTP drafter's single layer runs unfused (separate `mix`/`combine`) and
-keeps a standalone shared expert.
+The MTP drafter's single layer keeps separate HC `mix`/`combine` operations.
+On gfx942 its BF16 shared expert is fused into the MoE; other MTP layouts
+retain the standalone shared expert.
 
 ## Optional: quantized prefill all-reduce (lossy)
 
@@ -142,10 +210,9 @@ python -m sglang.bench_serving --backend sglang --host 127.0.0.1 --port 30080 \
 
 ## Boundaries
 
-- Use BF16 KV and page size 64. TP greater than 1 without EP is validated only
-  for the PTPC checkpoint without MTP (the long-context configuration above,
-  TP2/EP1); otherwise use EP, as the MTP configuration does, because the
-  expert intermediate width is 640.
+- Use BF16 KV and page size 64. Pure TP2/TP4 with BF16 MTP uses the gfx942
+  configuration above. Other platforms, expert quantization formats and TP
+  sizes are outside that configuration's validation scope.
 - Leave PLE embeddings in Native ATOM; do not enable PLE embedding offload.
   The memory fraction above leaves room for plugin-owned QSA indexer caches.
 - Validation covers text requests, concurrent mixed lengths, long prompts,
