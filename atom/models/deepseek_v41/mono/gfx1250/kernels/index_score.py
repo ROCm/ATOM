@@ -337,6 +337,13 @@ def _grouped_key(c, flat, l):
     return fx.Vector.from_elements([kp[cc][e] for cc in range(4) for e in range(4)], I32), hx.gload(kbase + 1024 + tt * 4, F32)
 
 
+# the grouped scorer's code -> L2 just before it waits for its query (device.code_prefetch_near, bounded by the launch's
+# recorded end; one CTA in 16 issues it: a cluster shares the L2): the entry's L2 code prefetch no longer holds by then
+# (the weight stream evicts it), and its first score task paid ~3 us for its code (step probe, layer 2, 133K, 11-18:
+# 7.31 -> 4.11 us every CTA, 4.04 one in 16; the I-cache prefetch alone: no change); 24 KB covers its loop. The per-row
+# scorer (stage_score_any: the readers) showed no change on layer 24, so it has none
+SCORE_L2_KB = 24
+SCORE_L2_ONE_IN = 16
 SCORE_PREFETCH = True     # the grouped scorer prefetches the next task's page row (False: the old loop)
 GROUPED_MIN_BOUND = 8192   # index rows past which a c1 FULL layer scores its key tiles once for every row
 
@@ -398,6 +405,10 @@ def stage_score_grouped(c):
         return i64(page) * i64(c["irpp"]) + i64(krow % c["irpp"])
 
     flat0 = page_row(fx.min(vb, fx.max(nt - 1, I32(0))))   # (the first task's page chain before the wait for the query)
+    if fx.const_expr("codeend" in c):   # the score loop's code -> L2 while the CTA waits (see SCORE_L2_KB)
+        pc0 = hx.getpc()   # (here: the prefetch sits in a branch the compiler may move)
+        if b % SCORE_L2_ONE_IN == 0:
+            hx.code_prefetch_near(t, b, c["codeend"], SCORE_L2_KB, pc=pc0)
     if fx.const_expr("prewait" in c):
         c["prewait"]()
     stage_q_slots(c, sm, t, list(range(TR)))   # every row's query and head weights -> LDS slots 0..TR-1

@@ -690,7 +690,7 @@ def target_layer(E, Ly):
                             iq_out=fptr(fp, "iq_out"), iqs_out=fptr(fp, "iqs_out"), iw_out=fptr(fp, "iw_out"),
                             iscale=ltab(fp, Ly, "iscale")(),
                             prewait=lambda: SC.iq_wait(lc + i64(LY.IQ_DONE), lc + i64(LY.INDEX_QUANT), hx.opaque_v(fx.thread_idx.x), iqonly, NIQC),
-                            early=early, crflag=crf, crtag=crtag)
+                            early=early, crflag=crf, crtag=crtag, codeend=fptr(fp, "cyc") + i64(CODE_END_OFF))
                 lfl3 = ltab(fp, Ly, "lflags")()
                 isrx = (lfl3 & fx.Int64(64)) != fx.Int64(0)
                 cs_ = cwith(cs_, ibmax=ltab(fp, Ly, "ibmax")(), icand=ltab(fp, Ly, "icand")(), lvl=fptr(fp, "ilvl"),
