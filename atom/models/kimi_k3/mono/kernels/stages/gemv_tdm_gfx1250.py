@@ -734,11 +734,13 @@ def fp4x8_to_bf16(word, exponent, scale_sel=0):
     """Eight E2M1 values (one dword) times the E8M0 ``exponent``'s power of
     two, as BF16."""
 
+    # gfx1250 reads the scale byte ``scale_sel`` in lanes 0-15 but byte
+    # ``scale_sel + 1`` in lanes 16-31, so every byte carries the exponent.
     return fx.Vector(
         rocdl.cvt_scale_pk8_bf16_fp4(
             T.vec(PACK_ELEMENTS, T.bf16),
             as_ir_value(fx.Int32(word)),
-            as_ir_value(fx.Int32(exponent)),
+            as_ir_value(fx.Int32(exponent) * 0x01010101),
             scale_sel,
         )
     )
