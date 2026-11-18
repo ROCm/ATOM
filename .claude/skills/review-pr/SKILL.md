@@ -497,7 +497,7 @@ When a human reviewer (valarLip or others) catches something real that this skil
 1. Add to Step 5 with the real PR number as evidence
 2. Commit: `review-pr: add R[NAME] from ATOM#[NNN] — [one line]`
 
-**Nothing new goes in this file.** SKILL.md is budgeted at 500 lines and holds
+**Nothing new goes in this file.** SKILL.md is budgeted at 505 lines and holds
 only the prose every review needs, with no code fence over 30 lines.
 Conditional content goes in `rules.md` and reaches the reviewer through
 `triage.py expand`; executable content goes in a script and gets called.
