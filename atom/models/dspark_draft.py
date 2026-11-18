@@ -321,17 +321,18 @@ class DSparkConfidenceHead(nn.Module):
         # probabilities). The checkpoint head is BF16 [1, hidden + rank]: the
         # GEMV takes it as is and accumulates and writes FP32, which is what
         # casting both operands to FP32 first would compute, minus the casts.
-        # aiter is imported here, not at module load: this module imports
-        # without it.
         weight, bias = self.proj.weight, self.proj.bias
         if hidden_states.is_cuda:
+            # Triton is imported here, not at module load: this module imports
+            # without it.
             from atom.model_ops.dspark_confidence import (
                 can_fuse_confidence,
                 fused_confidence,
             )
 
             if can_fuse_confidence(hidden_states, markov_embeds, weight, bias):
-                # Same FP32 accumulation, without the concatenated copy.
+                # FP32 accumulation in one launch, without the concatenated
+                # copy (its reduction order differs from the GEMM's).
                 return fused_confidence(hidden_states, markov_embeds, weight)
         x = torch.cat([hidden_states, markov_embeds], dim=-1)
         if not x.is_cuda:
@@ -340,6 +341,8 @@ class DSparkConfidenceHead(nn.Module):
             )
             return torch.sigmoid(logit).squeeze(-1)
 
+        # aiter is imported here, not at module load: this module imports
+        # without it.
         import aiter
         from aiter.tuned_gemm import tgemm
 

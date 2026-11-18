@@ -2,7 +2,7 @@
 """The one-launch DSpark confidence head (`atom.model_ops.dspark_confidence`).
 
 The kernel is plain Triton, so its numerics are checked on any GPU by calling
-it directly; only `can_fuse_confidence` limits it to gfx1250 in serving.
+it directly; `can_fuse_confidence` takes it on any GPU arch.
 """
 
 import pytest
@@ -10,7 +10,6 @@ import torch
 
 triton = pytest.importorskip("triton")
 
-from atom.model_ops import dspark_confidence
 from atom.model_ops.dspark_confidence import (
     can_fuse_confidence,
     fused_confidence,
@@ -68,19 +67,32 @@ def test_fused_confidence_empty_batch():
 
 
 @needs_gpu
-def test_gate_rejects_what_the_kernel_does_not_tile(monkeypatch):
-    monkeypatch.setattr(dspark_confidence, "_is_gfx1250", lambda device: True)
+def test_gate_rejects_what_the_kernel_does_not_tile():
     h = torch.zeros(4, 512, device="cuda", dtype=torch.bfloat16)
     m = torch.zeros(4, 64, device="cuda", dtype=torch.bfloat16)
     w = torch.zeros(1, 576, device="cuda", dtype=torch.bfloat16)
-    assert can_fuse_confidence(h, m, w, None)
+    assert can_fuse_confidence(h, m, w, None)  # on any GPU arch
     assert not can_fuse_confidence(h, m, w, torch.zeros(1, device="cuda"))
     assert not can_fuse_confidence(h.float(), m, w, None)
     assert not can_fuse_confidence(h[:, :500], m, w[:, :564], None)
     assert not can_fuse_confidence(h, m[:, :48], w[:, :560], None)
     assert not can_fuse_confidence(h.t().contiguous().t(), m, w, None)
-    monkeypatch.setattr(dspark_confidence, "_is_gfx1250", lambda device: False)
-    assert not can_fuse_confidence(h, m, w, None)
+
+
+@pytest.mark.parametrize(
+    "hidden_size, rank, weight_cols",
+    [(500, 64, 564), (512, 48, 560), (512, 64, 600)],
+)
+def test_fused_confidence_refuses_shapes_it_would_read_past(
+    hidden_size, rank, weight_cols
+):
+    """The kernel loads without masks: a direct call with a shape it does not
+    tile raises instead of reading out of bounds."""
+    h = torch.zeros(4, hidden_size, dtype=torch.bfloat16)
+    m = torch.zeros(4, rank, dtype=torch.bfloat16)
+    w = torch.zeros(1, weight_cols, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="fused_confidence needs"):
+        fused_confidence(h, m, w)
 
 
 def test_gate_rejects_cpu_tensors():

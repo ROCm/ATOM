@@ -8,13 +8,15 @@ every 128 output lanes are padding; the concatenated copy costs as much again.
 This reads both operands where they are and reduces each row in FP32.
 """
 
-from functools import cache
-
 import torch
 import triton
 import triton.language as tl
 
+# Rows a program reduces: each weight chunk it loads serves four rows, and a
+# draft batch still spreads over enough programs to fill the GPU.
 _BLOCK_ROWS = 4
+# Hidden columns a loop step reads: the DSpark heads' hidden widths are
+# multiples of it (the gate requires that, so the loop needs no mask).
 _BLOCK_K = 512
 
 
@@ -55,31 +57,51 @@ def _confidence_kernel(
     tl.store(out_ptr + row, tl.sigmoid(acc), mask=live)
 
 
-@cache
-def _is_gfx1250(device):
-    arch = getattr(torch.cuda.get_device_properties(device), "gcnArchName", "")
-    return arch.split(":")[0] == "gfx1250"
+def _fits_kernel(hidden, embed, weight) -> bool:
+    """What `_confidence_kernel` reads without masks: ``hidden`` in whole
+    `_BLOCK_K` chunks, the rank as one power-of-two `tl.arange`, unit-stride
+    rows of matching lead shape and a contiguous ``[1, hidden + rank]`` head."""
+    hidden_size, rank = hidden.shape[-1], embed.shape[-1]
+    return (
+        hidden.shape[:-1] == embed.shape[:-1]
+        and hidden.stride(-1) == embed.stride(-1) == 1
+        and weight.shape == (1, hidden_size + rank)
+        and weight.is_contiguous()
+        and hidden_size % _BLOCK_K == 0
+        and rank > 0
+        and rank & (rank - 1) == 0
+    )
 
 
 def can_fuse_confidence(hidden, embed, weight, bias) -> bool:
-    """Static gate: bias-free BF16 head whose widths tile exactly."""
-    hidden_size, rank = hidden.shape[-1], embed.shape[-1]
+    """Static gate: a bias-free BF16 head on the GPU that the kernel tiles.
+
+    No arch gate: the kernel is plain Triton, and both gfx1250 and gfx950
+    measured it faster than cat + N=1 GEMM + sigmoid at every draft batch
+    tried, the widest as well as a single request.
+    """
     return (
         bias is None
         and hidden.is_cuda
         and hidden.dtype == embed.dtype == weight.dtype == torch.bfloat16
-        and weight.shape == (1, hidden_size + rank)
-        and weight.is_contiguous()
-        and hidden.shape[:-1] == embed.shape[:-1]
-        and hidden.stride(-1) == embed.stride(-1) == 1
-        and hidden_size % _BLOCK_K == 0
-        and rank == triton.next_power_of_2(rank)
-        and _is_gfx1250(hidden.device)
+        and _fits_kernel(hidden, embed, weight)
     )
 
 
 def fused_confidence(hidden, embed, weight):
-    """sigmoid([hidden, embed] @ weight.T) in FP32, shaped like ``hidden[..., 0]``."""
+    """sigmoid([hidden, embed] @ weight.T) in FP32, shaped like ``hidden[..., 0]``.
+
+    The kernel loads without masks, so a shape it does not tile
+    (`_fits_kernel`) raises here rather than reading out of bounds.
+    """
+    if not _fits_kernel(hidden, embed, weight):
+        raise ValueError(
+            "fused_confidence needs hidden a multiple of "
+            f"{_BLOCK_K}, a power-of-two rank, unit-stride rows and a "
+            "contiguous [1, hidden + rank] weight; got hidden "
+            f"{tuple(hidden.shape)}, embed {tuple(embed.shape)}, weight "
+            f"{tuple(weight.shape)}"
+        )
     lead = hidden.shape[:-1]
     hidden = hidden.reshape(-1, hidden.shape[-1])
     embed = embed.reshape(-1, embed.shape[-1])
