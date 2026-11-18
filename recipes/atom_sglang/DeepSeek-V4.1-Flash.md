@@ -81,6 +81,28 @@ or SGLang cuts the next chunk below 128 rows), that prompt's decoder window star
 reading rows the skipped chunk never wrote. A request that asks input logprobs of its own prompt runs the decoder on every
 chunk's last 128 rows. Kill switch: `ATOM_SGLANG_V41_CHUNK_FINALS=0` (every chunk runs the decoder on its last 128 rows).
 
+## Scheduler main thread
+
+Every scheduler loop iteration, TP rank 0 broadcasts the requests it pulled to the other ranks over the TP group's
+gloo CPU group. SGLang's broadcast sleeps in the collective's wait (a futex), so an idle or lightly loaded scheduler
+main thread sleeps and wakes a few thousand times a second. On hosts whose cores clock down on such a load
+(intel_pstate/HWP with C1E, e.g. the 4xMI308X Xeon 8480C hosts), its core then sits near its minimum clock (0.8 GHz
+measured) and the first steps of a request run their host Python up to ~3x slower: a radix-hit prefill step's host
+time was 119-125 ms against native ATOM's 81 ms, whose model runner busy-polls and keeps its core at full clock. The
+plugin therefore makes this broadcast poll the collective (`Work.is_completed()`) instead of sleeping, for
+DeepSeek-V4.1 only: the same bytes and protocol as SGLang's, and each scheduler main thread uses a full core while the
+server runs, as native's runners do (plus about 0.45 core per rank of gloo helper wakeups at idle). Between polls it
+calls `os.sched_yield()`, which releases the GIL without idling the core, so other Python threads of the scheduler
+process (e.g. HiCache's cache controller) are not held off by the wait. Kill switch:
+`ATOM_SGLANG_V41_SPIN_BROADCAST=0`.
+
+Measured on MI308X TP4, DSpark K=5 + radix, a fresh server per session (4 sessions each way): radix-hit TTFT (a
+4105-token prompt with 3840 tokens cached) 150 ms -> 112 ms on average (native ATOM 114 ms); decode rounds and GSM8K
+c32 wall time unchanged. Without speculation and radix: GSM8K 1319 c32 wall 189-193 s -> 174-184 s (native 173-180 s).
+Hit TTFT still has a slower tier (~130 ms) while one rank's scheduler core runs at its base clock instead of turbo;
+native ATOM shows the same tier on the same host. Pinning the scheduler threads to dedicated cores instead of polling
+does not help (the core still idles between iterations; measured slower).
+
 ## Prefill admission (`--min-free-slots-delay`, optional)
 
 On the two GSM8K workloads at concurrency 32 below, the default launch is within 4% of native ATOM's default scheduling
