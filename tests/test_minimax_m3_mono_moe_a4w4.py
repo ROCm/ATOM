@@ -6,7 +6,8 @@
 (E8M0 RoundUp, ``code_ceil(amax * f32(1/6))``, the forward scale, RNE e2m1: aiter's
 ``_e8m0_roundup`` + ``emit_f32_to_e2m1``); it is held bit for bit to aiter's
 ``per_1x32_f4_quant`` (production's CPU reference of the same convention). ``ref_moe``
-is the whole routed MoE for one rank at the M3.1 TP4 shapes for a16w4 / a8w4 / a4w4 activations.
+is the whole routed MoE for one rank at the M3.1 TP4 shapes on a4w4 activations (or on
+bf16 ones, the unquantized reference of the numerics budget).
 """
 
 import pytest
@@ -88,16 +89,6 @@ def dq_fp4(x):
     return (_grid(nib).view(x.shape[0], -1, 32) * sc[..., None]).view(x.shape)
 
 
-def dq_fp8(x):
-    """MXFP8 as mono does today: ceil_pow2(amax / 448), RNE e4m3 saturating."""
-    r = x.float().view(x.shape[0], -1, 32)
-    code = _code_ceil(r.abs().amax(-1) * torch.tensor(1.0 / 448.0, dtype=torch.float32))
-    sc = (code << 23).view(torch.float32)[..., None]
-    return ((r / sc).clamp(-448, 448).to(torch.float8_e4m3fn).float() * sc).view(
-        x.shape
-    )
-
-
 def _bf16(x):
     return x.to(torch.bfloat16).float()
 
@@ -108,11 +99,11 @@ def swiglu(g, u, limit=SWIGLU_LIMIT):
     return g * torch.sigmoid(1.702 * g) * (u + 1.0)
 
 
-def ref_moe(x, w13, w2, route, rw, act="a4w4"):
+def ref_moe(x, w13, w2, route, rw, q=dq_fp4):
     """x [T, HIDDEN] (bf16 values), w13[e] [2 INTER, HIDDEN] / w2[e] [HIDDEN, INTER] dequantized MXFP4
     (gate rows then up rows), route [T, TOP_K], rw [T, TOP_K] -> [T, HIDDEN] f32 (f32 accumulation).
+    ``q``: the activation quantization of xn and the mid (a4w4: ``dq_fp4``; identity: bf16 activations).
     """
-    q = {"a16w4": lambda v: v, "a8w4": dq_fp8, "a4w4": dq_fp4}[act]
     xq = q(_bf16(x))
     out = torch.zeros(x.shape[0], HIDDEN)
     for k in range(x.shape[0]):
@@ -159,8 +150,8 @@ def test_zero_block_quantizes_to_zero():
     assert not (_grid(nib) != 0).any()
 
 
-def test_fp4_error_is_about_five_times_fp8():
-    """The numerics budget of the switch: one routed-MoE call vs a16w4."""
+def test_fp4_activation_error_budget():
+    """The numerics budget of a4w4: one routed-MoE call vs bf16 activations."""
     g = torch.Generator().manual_seed(1)
     E = 4
     deq = lambda w: _dq_weight(w)
@@ -169,10 +160,9 @@ def test_fp4_error_is_about_five_times_fp8():
     x = torch.randn(2, HIDDEN, generator=g)
     route = torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0]])
     rw = torch.full((2, TOP_K), 0.25)
-    o16 = ref_moe(x, w13, w2, route, rw, "a16w4")
-    e8 = ((ref_moe(x, w13, w2, route, rw, "a8w4") - o16).norm() / o16.norm()).item()
-    e4 = ((ref_moe(x, w13, w2, route, rw, "a4w4") - o16).norm() / o16.norm()).item()
-    assert 0.03 < e8 < 0.07 and 0.15 < e4 < 0.30, (e8, e4)
+    o16 = ref_moe(x, w13, w2, route, rw, q=lambda v: v)
+    e4 = ((ref_moe(x, w13, w2, route, rw) - o16).norm() / o16.norm()).item()
+    assert 0.15 < e4 < 0.30, e4
 
 
 def _dq_weight(w):

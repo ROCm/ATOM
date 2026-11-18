@@ -38,10 +38,7 @@ def traces():
 
 
 def test_the_layer_kernel_holds(traces):
-    check(
-        traces["layer"],
-        mailbox_regions(TOKENS, INDEX_HEADS, True, True, moe_a16w4=False),
-    )
+    check(traces["layer"], mailbox_regions(TOKENS, INDEX_HEADS, True, True))
 
 
 def test_the_dense_layer_kernel_holds(traces):
@@ -51,7 +48,7 @@ def test_the_dense_layer_kernel_holds(traces):
 def test_a_wrong_declaration_is_caught(traces):
     """The positive control: the same build against a table that names the wrong
     writer for the MoE mid rows."""
-    decls = mailbox_regions(TOKENS, INDEX_HEADS, True, True, moe_a16w4=False)
+    decls = mailbox_regions(TOKENS, INDEX_HEADS, True, True)
     assert any(d.name == "mid" for d in decls)
     wrong = [
         dataclasses.replace(d, writer="down") if d.name == "mid" else d for d in decls

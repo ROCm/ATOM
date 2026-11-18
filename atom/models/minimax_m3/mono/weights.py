@@ -155,13 +155,12 @@ class SparseMoeLayer:
     s13: torch.Tensor
     w2: torch.Tensor
     s2: torch.Tensor
-    # an unfused shared expert (``shared_mxfp8``): its own MXFP8 MLP, gate | up
-    # rows in one weight; ``w13`` / ``w2`` then hold the 128 routed experts only
-    shared_mxfp8: bool = False
-    w13s: torch.Tensor | None = None
-    s13s: torch.Tensor | None = None
-    w2s: torch.Tensor | None = None
-    s2s: torch.Tensor | None = None
+    # the shared expert, an MXFP8 MLP of its own, gate | up rows in one weight;
+    # ``w13`` / ``w2`` hold the 128 routed experts only
+    w13s: torch.Tensor
+    s13s: torch.Tensor
+    w2s: torch.Tensor
+    s2s: torch.Tensor
     # qkv_proj / o_proj are the checkpoint's MXFP8 1x32 (``s_qkv`` / ``s_o``: E8M0
     # ``[rows, K / 32]``), not the ptpc-FP8 requantization (f32 ``[rows]``)
     attn_mxfp8: bool = False
@@ -226,29 +225,18 @@ class SparseMoeLayer:
         moe = layer.block_sparse_moe
         experts = moe.experts
         qm = experts.quant_method
-        shared8 = not moe.fuse_shared_experts
-        # the shared expert is the 129th expert of the MXFP4 tables, or an MXFP8 MLP
-        # of its own next to the 128 routed ones
-        E = N_ROUTED + (0 if shared8 else 1)
-        if shared8:
-            _need(
-                experts.num_fused_shared_experts == 0
-                and moe.shared_experts is not None,
-                f"layer {layer_id}: shared expert",
-            )
-            sh = moe.shared_experts
-            w13s, s13s = _mxfp8(
-                sh.gate_up_proj, 2 * INTER, HIDDEN, f"layer {layer_id} shared gate_up"
-            )
-            w2s, s2s = _mxfp8(
-                sh.down_proj, HIDDEN, INTER, f"layer {layer_id} shared down_proj"
-            )
-        else:
-            _need(
-                experts.num_fused_shared_experts == 1,
-                f"layer {layer_id}: shared expert",
-            )
-            w13s = s13s = w2s = s2s = None
+        # the shared expert is an MXFP8 MLP of its own next to the 128 routed experts
+        _need(
+            experts.num_fused_shared_experts == 0 and moe.shared_experts is not None,
+            f"layer {layer_id}: shared expert",
+        )
+        sh = moe.shared_experts
+        w13s, s13s = _mxfp8(
+            sh.gate_up_proj, 2 * INTER, HIDDEN, f"layer {layer_id} shared gate_up"
+        )
+        w2s, s2s = _mxfp8(
+            sh.down_proj, HIDDEN, INTER, f"layer {layer_id} shared down_proj"
+        )
         _need(
             experts.top_k == TOP_K and not getattr(qm, "is_guinterleave", True),
             f"layer {layer_id}: moe layout",
@@ -264,14 +252,14 @@ class SparseMoeLayer:
             f"layer {layer_id}: shuffle",
         )
         _need(
-            w13.numel() * w13.element_size() == E * 2 * INTER * HIDDEN // 2
-            and w2.numel() * w2.element_size() == E * HIDDEN * INTER // 2,
+            w13.numel() * w13.element_size() == N_ROUTED * 2 * INTER * HIDDEN // 2
+            and w2.numel() * w2.element_size() == N_ROUTED * HIDDEN * INTER // 2,
             f"layer {layer_id}: expert weight bytes",
         )
         s13, s2 = experts.w13_weight_scale, experts.w2_weight_scale
         _need(
-            s13.numel() == E * 2 * INTER * HIDDEN // 32
-            and s2.numel() == E * HIDDEN * INTER // 32,
+            s13.numel() == N_ROUTED * 2 * INTER * HIDDEN // 32
+            and s2.numel() == N_ROUTED * HIDDEN * INTER // 32,
             f"layer {layer_id}: expert scale bytes",
         )
         gate = moe.gate.weight
@@ -311,7 +299,6 @@ class SparseMoeLayer:
             s13=s13.data,
             w2=w2.data,
             s2=s2.data,
-            shared_mxfp8=shared8,
             w13s=w13s,
             s13s=s13s,
             w2s=w2s,

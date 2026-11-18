@@ -35,19 +35,12 @@ OTHER = {
     "npes": 2, "tokens": 2, "init_blocks": 2, "local_blocks": 2, "index_heads": 4,
     "index_own": 1, "timeline": True, "index_topk": False, "fuse_k1": False,
     "sm_scale": 0.09, "eps": 1e-5, "route_scale": 2.0, "shared_weight": 0.5,
-    "swiglu_limit": 8.0, "debug": True, "xn_flag": 1,
-    "shared_mxfp8": True, "mid_flag": 1, "kv_nvfp4": True, "index_nvfp4": True,
-    "sh_first": 2, "attn_mxfp8": True, "moe_a16w4": False,
-    "sp_f32": False, "prod_round": False, "moe_a4w4": True,
+    "swiglu_limit": 8.0, "debug": True, "kv_nvfp4": True, "index_nvfp4": True,
+    "attn_mxfp8": True,
 }  # fmt: skip
 # a field whose other value is a valid build only beside other settings: both builds take them
 BESIDE = {
-    "moe_a4w4": {
-        "shared_mxfp8": True
-    },  # the a4w4 experts need the unfused MXFP8 shared expert
     "index_own": {"index_heads": 4},
-    "moe_a16w4": {"shared_mxfp8": True},  # compiled out beside the fused shared expert
-    "sh_first": {"shared_mxfp8": True, "tokens": 8},  # the wide MoE's (S >= 5) option
 }
 
 
@@ -63,11 +56,8 @@ def _compile(key: K4Build) -> None:
         key.npes, key.sm_scale, key.eps, key.route_scale, key.shared_weight,
         key.swiglu_limit, key.init_blocks, key.local_blocks, key.tokens,
         timeline=key.timeline, fuse_k1=key.fuse_k1, heads=heads, debug=key.debug,
-        index_topk=key.index_topk, xn_flag=key.xn_flag, shared_mxfp8=key.shared_mxfp8,
-        mid_flag=key.mid_flag, kv_nvfp4=key.kv_nvfp4, index_nvfp4=key.index_nvfp4,
-        sh_first=key.sh_first, attn_mxfp8=key.attn_mxfp8,
-        moe_a16w4=key.moe_a16w4, sp_f32=key.sp_f32, prod_round=key.prod_round,
-        moe_a4w4=key.moe_a4w4,
+        index_topk=key.index_topk, kv_nvfp4=key.kv_nvfp4, index_nvfp4=key.index_nvfp4,
+        attn_mxfp8=key.attn_mxfp8,
     )  # fmt: skip
     with compile_only():
         launch(*K4_ABI.zeros())

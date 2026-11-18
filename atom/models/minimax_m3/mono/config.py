@@ -74,7 +74,11 @@ O_K = LOCAL_Q_HEADS * HEAD_DIM
 
 N_ROUTED = 128
 TOP_K = 4
-SHARED_EXPERT = N_ROUTED  # the fused shared expert's id
+# the MoE's slots: the TOP_K routed ones, then the shared expert's (its mid row and
+# routing weight). The shared expert is an MXFP8 MLP of its own, not a row of the
+# routed tables: ``SHARED_EXPERT`` is the id its slot carries in the routing record,
+# one past the routed ones
+SHARED_EXPERT = N_ROUTED
 MOE_SLOTS = TOP_K + 1
 INTER = Dims(TP).inter  # expert intermediate per rank
 DENSE_INTER = Dims(TP).dense_inter  # dense MLP intermediate per rank

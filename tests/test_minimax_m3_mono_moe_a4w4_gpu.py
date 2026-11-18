@@ -1,16 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Mono K4's MoE with a4w4 routed experts (``moe_a4w4``) against a torch oracle (gfx950; single-rank layer kernel, 1 card).
-Same harness and oracle structure as tests/test_minimax_m3_mono_moe_a16w4.py (zero attention, the kernel's own routing, f64 / f32 from the
-logical weights); the routed experts' xn and mid are quantized MXFP4 (per 1x32, E8M0 RoundUp = aiter's a4w4 convention, RNE e2m1, the CPU
-rule ``fp4_quant_kernel_rule`` of test_minimax_m3_mono_moe_a4w4.py) before the GEMVs; slots rounded to bf16 per (expert, token) as the
-a16w4 path does (``prod_round``); the shared expert stays MXFP8. ``run_case(S, act, prod_round, seed)`` -> (got, oracle, details), ``act`` in
-a4w4 / a16w4 / a8w4; ``python tests/test_minimax_m3_mono_moe_a4w4_gpu.py [--S 1,4,16] [--acts a4w4,a16w4,a8w4]`` prints a table with the
-rel L2 of the kernel against the oracle of every act (which semantics it implements) and against a16w4 (the production path).
+"""Mono K4's MoE (a4w4 routed experts, the unfused MXFP8 shared expert) against a torch oracle (gfx950; single-rank layer
+kernel, 1 card). Zero attention, the kernel's own routing (the ``sel`` record it leaves in scratch), f64 / f32 from the
+logical weights; the routed experts' xn and mid are quantized MXFP4 (per 1x32, E8M0 RoundUp = aiter's a4w4 convention, RNE e2m1,
+the CPU rule ``fp4_quant_kernel_rule`` of test_minimax_m3_mono_moe_a4w4.py) before the GEMVs; slots rounded to bf16 per
+(expert, token) as production's gemm2 epilogue does; the shared expert is MXFP8 and its swiglu reads bf16 gate / up.
+``run_case(S, seed)`` -> (got, oracle, details); ``python tests/test_minimax_m3_mono_moe_a4w4_gpu.py [--S 1,4,16]`` prints a
+table with the rel L2 of the kernel against the oracle.
 """
 
 import argparse
-import inspect
 import os
 import sys
 
@@ -186,47 +185,33 @@ def norm(h_in, g_post, eps=1e-6):
     return bf((v * rstd) * (g_post.float() + 1.0))
 
 
-def moe_oracle(
-    h_in, gate, bias, g_post, experts, shared, routing, *, act, prod_round, S
-):
-    """The MoE's ``ar_out`` [S, HIDDEN] f32 (bf16 values). ``act``: the routed experts' activation, a4w4 / a16w4 / a8w4."""
-    del gate, bias, shared
+def moe_oracle(h_in, g_post, experts, routing, *, S):
+    """The MoE's ``ar_out`` [S, HIDDEN] f32 (bf16 values)."""
     ids, w = routing
     xn = norm(h_in, g_post)
-    q = {
-        "a16w4": lambda v: v.double(),
-        "a8w4": lambda v: mx8(v),
-        "a4w4": lambda v: Q4.dq_fp4(v.float().contiguous()).double(),
-    }[act]
+    q = lambda v: Q4.dq_fp4(v.float().contiguous()).double()
     xr = q(xn)
     mid = torch.zeros(S, TOP_K, INTER, device=DEV)
     for e in ids.unique().tolist():
         t, s = (ids == e).nonzero(as_tuple=True)
         o = (xr[t] @ experts.dq13(e).T).float()
         mid[t, s] = bf(swiglu(o[:, :INTER], o[:, INTER:]))
-    midq = (
-        q(mid.view(-1, INTER)).view(S, TOP_K, INTER) if act != "a16w4" else mid.double()
-    )
+    midq = q(mid.view(-1, INTER)).view(S, TOP_K, INTER)
     acc = torch.zeros(S, TOP_K, HIDDEN, device=DEV)
     for e in ids.unique().tolist():
         t, s = (ids == e).nonzero(as_tuple=True)
         acc[t, s] = (midq[t, s] @ experts.dq2(e).T).float()
-    slot = acc * w[..., None]
-    if prod_round and act != "a8w4":  # gemm2's epilogue per (expert, token)
-        slot = bf(slot)
+    # gemm2's epilogue per (expert, token), then the routed sum and the shared expert's
+    # output rounded to bf16 each
+    slot = bf(acc * w[..., None])
     routed = slot[:, 0]
     for j in range(1, TOP_K):
         routed = routed + slot[:, j]
-    if prod_round:
-        routed = bf(routed)
+    routed = bf(routed)
     xs = mx8(xn)
-    o = (xs @ experts.d13s.T).float()
-    if prod_round:
-        o = bf(o)
+    o = bf((xs @ experts.d13s.T).float())
     y = bf(swiglu(o[:, :INTER], o[:, INTER:]))
-    sh = (mx8(y) @ experts.d2s.T).float() * SHARED_WEIGHT
-    if prod_round:
-        sh = bf(sh)
+    sh = bf((mx8(y) @ experts.d2s.T).float() * SHARED_WEIGHT)
     return bf(routed + sh)
 
 
@@ -241,11 +226,10 @@ def _route_check(h_in, gate, bias, g_post, ids, w):
     return same_set, (w - wref).abs().max().item()
 
 
-def run_case(S, act="a4w4", prod_round=True, seed=0, **build_kw):
+def run_case(S, seed=0):
     """One launch of the single-rank layer kernel on random data. Returns (got, oracle, details): ``got`` the kernel's ``ar_out``
-    and ``oracle`` the oracle of (moe_a16w4, prod_round) as f32 [S, HIDDEN] cpu tensors; ``details``: rel L2 per token, identical
-    fraction, whether the torch router picked the kernel's experts, and ``rel_vs[(a16w4, prod_round)]`` the max rel L2 of
-    ``got`` against each of the four oracles (which semantics the kernel implements)."""
+    and ``oracle`` the oracle's as f32 [S, HIDDEN] cpu tensors; ``details``: rel L2 per token, identical fraction, whether the
+    torch router picked the kernel's experts."""
     ex = experts_of(seed)
     g = torch.Generator(device=DEV).manual_seed(seed * 7 + S)
     h_in = (torch.randn(S, HIDDEN, device=DEV, generator=g) * 3).to(BF)
@@ -265,17 +249,9 @@ def run_case(S, act="a4w4", prod_round=True, seed=0, **build_kw):
     peers = torch.tensor([sym.data_ptr()], dtype=torch.int64, device=DEV)
     k1 = torch.zeros(12, dtype=torch.int64, device=DEV)
     ids_t = torch.arange(S, dtype=torch.int32, device=DEV)
-    flags = {
-        "moe_a16w4": act == "a16w4",
-        "moe_a4w4": act == "a4w4",
-        "prod_round": prod_round,
-        "sp_f32": False,
-        **build_kw,
-    }
-    ps = inspect.signature(build_post_attn_kernel).parameters
     launch = build_post_attn_kernel(
-        1, 0.088, 1e-6, ROUTE_SCALE, SHARED_WEIGHT, SWIGLU_LIMIT, 1, 1, S, shared_mxfp8=True, attn_mxfp8=True,
-        **{k: v for k, v in flags.items() if k in ps},
+        1, 0.088, 1e-6, ROUTE_SCALE, SHARED_WEIGHT, SWIGLU_LIMIT, 1, 1, S,
+        attn_mxfp8=True,
     )  # fmt: skip
     p = lambda t: t.data_ptr()
     args = K4_ABI.pack(
@@ -301,22 +277,7 @@ def run_case(S, act="a4w4", prod_round=True, seed=0, **build_kw):
     w = sel[:, 1, :TOP_K].contiguous().view(torch.float32)
     assert (ids >= 0).all() and (ids < N_ROUTED).all(), ids
     got = ar_out.float()
-    oracles = {
-        a: moe_oracle(
-            h_in,
-            gate,
-            bias,
-            g_post,
-            ex,
-            None,
-            (ids, w),
-            act=a,
-            prod_round=prod_round,
-            S=S,
-        )
-        for a in ("a4w4", "a16w4", "a8w4")
-    }
-    want = oracles[act]
+    want = moe_oracle(h_in, g_post, ex, (ids, w), S=S)
     rel = lambda a, b: ((a - b).norm(dim=-1) / b.norm(dim=-1))
     same_set, wdiff = _route_check(h_in, gate, bias, g_post, ids, w)
     details = {
@@ -324,40 +285,30 @@ def run_case(S, act="a4w4", prod_round=True, seed=0, **build_kw):
         "identical": (got == want).float().mean().item(),
         "route_match": bool(same_set.all()),
         "route_weight_maxdiff": wdiff,
-        "rel_vs": {k: rel(got, v).max().item() for k, v in oracles.items()},
-        "rel_vs_a16w4_mean": rel(got, oracles["a16w4"]).mean().item(),
         "ids": ids.cpu(),
     }
     return got.cpu(), want.cpu(), details
 
 
-@pytest.mark.parametrize("act", ["a4w4", "a16w4", "a8w4"])
 @pytest.mark.parametrize("tokens", [1, 2, 3, 4, 5, 8, 12, 16])
-def test_moe_matches_the_oracle(tokens, act):
-    got, _want, d = run_case(tokens, act)
+def test_moe_matches_the_oracle(tokens):
+    got, _want, d = run_case(tokens)
     assert torch.isfinite(got).all() and got.abs().max() > 0
-    # a4w4 has more rounding flips (a fp4 grid step is 4-8 % of a value): rel L2 vs its own oracle
-    med = 2e-3 if act == "a4w4" else 1e-3
-    assert d["rel"].median() <= med and d["rel"].max() <= 1e-2, (d["rel"], d["rel_vs"])
+    # a4w4 has more rounding flips (a fp4 grid step is 4-8 % of a value): rel L2 vs the oracle
+    assert d["rel"].median() <= 2e-3 and d["rel"].max() <= 1e-2, d["rel"]
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--S", default="1,2,3,4,5,8,12,16")
-    ap.add_argument("--acts", default="a4w4")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--mid-flag", type=int, default=0)
     a = ap.parse_args()
-    print(
-        "S act | rel L2 vs own oracle median / max | identical | router match | max rel vs oracle a4w4 a16w4 a8w4 | mean rel vs a16w4"
-    )
+    print("S | rel L2 vs the oracle median / max | identical | router match")
     for s in [int(x) for x in a.S.split(",")]:
-        for act in a.acts.split(","):
-            got, want, d = run_case(s, act, seed=a.seed, mid_flag=a.mid_flag)
-            r = d["rel"]
-            rv = d["rel_vs"]
-            print(
-                f"S={s:2d} {act} | {r.median():.2e} / {r.max():.2e} | {d['identical']:.4f} | {d['route_match']} (w {d['route_weight_maxdiff']:.1e}) | "
-                f"{rv['a4w4']:.2e} {rv['a16w4']:.2e} {rv['a8w4']:.2e} | {d['rel_vs_a16w4_mean']:.3f}",
-                flush=True,
-            )
+        got, want, d = run_case(s, seed=a.seed)
+        r = d["rel"]
+        print(
+            f"S={s:2d} | {r.median():.2e} / {r.max():.2e} | {d['identical']:.4f} | "
+            f"{d['route_match']} (w {d['route_weight_maxdiff']:.1e})",
+            flush=True,
+        )

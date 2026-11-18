@@ -76,8 +76,9 @@ def forward_checked(
             # changed module under the compiled original path recompiles and fails)
             moe.shared_experts = None
         if envs.ATOM_MONO_CHECK_MOE:
-            # the bf16 xn the kernel's router published (a16w4 builds): the original MoE module on
-            # exactly that input, all-reduced, against the kernel's reduced output
+            # the xn the kernel's router published for the routed experts (MXFP4,
+            # dequantized): the original MoE module on exactly that input, all-reduced,
+            # against the kernel's reduced output
             xn = mono_xn(runner, n)
             moe_ar = tensor_model_parallel_all_reduce(layer.block_sparse_moe(xn)).view(
                 n, HIDDEN
@@ -117,10 +118,11 @@ def forward_checked(
     return runner.finish_step(res)
 
 
-def _mono_xn4(sc: torch.Tensor, n: int) -> torch.Tensor:
-    """a4w4 builds: the MXFP4 xn rows (``xn4p`` / ``xs4p`` plain words, or the narrow build's tagged
-    ``xn4`` / ``xs4``) dequantized to bf16: the input the routed experts saw (so the xn
-    quantization error is not in a comparison made on it)."""
+def mono_xn(runner, n: int) -> torch.Tensor:
+    """The MXFP4 xn rows of the layer kernel's last launch (``xn4p`` / ``xs4p`` plain words,
+    or the narrow build's tagged ``xn4`` / ``xs4``) dequantized to bf16: the input the routed
+    experts saw (so the xn quantization error is not in a comparison made on it)."""
+    sc = runner.scratch4
     if wide_moe(n):
         o, c = SCRATCH["xn4p"], SCRATCH["xs4p"]
         words = sc[o : o + n * HIDDEN // 8 * 4].view(torch.int32)
@@ -141,21 +143,6 @@ def _mono_xn4(sc: torch.Tensor, n: int) -> torch.Tensor:
         torch.ones_like(codes, dtype=torch.float32), codes.view(n, -1) - 127
     )
     return (v * scale[..., None]).view(n, HIDDEN).to(torch.bfloat16)
-
-
-def mono_xn(runner, n: int) -> torch.Tensor:
-    """The bf16 xn rows of the layer kernel's last launch, from its scratch: the narrow
-    build's tagged words (``xnb``) or the wide one's plain words (``xnbp``)."""
-    sc = runner.scratch4
-    if runner.moe_a4w4:
-        return _mono_xn4(sc, n)
-    if wide_moe(n):
-        off = SCRATCH["xnbp"]
-        words = sc[off : off + n * HIDDEN // 2 * 4].view(torch.int32)
-    else:
-        off = SCRATCH["xnb"]
-        words = sc[off : off + n * HIDDEN // 2 * 8].view(torch.int32)[0::2]
-    return words.contiguous().view(torch.bfloat16).view(n, HIDDEN).clone()
 
 
 def _fingerprint(t: torch.Tensor) -> list[int]:

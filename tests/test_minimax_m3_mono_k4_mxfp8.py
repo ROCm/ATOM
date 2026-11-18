@@ -129,8 +129,7 @@ def _run(tokens, real=None):
     k1 = torch.zeros(12, dtype=torch.int64, device=dev)
     ids = torch.arange(tokens, dtype=torch.int32, device=dev)
     launch = build_post_attn_kernel(
-        1, 0.088, 1e-6, 1.0, 1.0, 7.0, 1, 1, tokens, shared_mxfp8=True,
-        attn_mxfp8=True,
+        1, 0.088, 1e-6, 1.0, 1.0, 7.0, 1, 1, tokens, attn_mxfp8=True,
     )  # fmt: skip
     p = lambda t: t.data_ptr()
     args = K4_ABI.pack(

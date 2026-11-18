@@ -29,13 +29,13 @@ W13_BYTES = W13_ROWS * HIDDEN // 2  # one expert, fp4
 W2_BYTES = HIDDEN * INTER // 2
 W13_SCALE_COLS = HIDDEN // 32
 W2_SCALE_COLS = INTER // 32
-# an MXFP8 shared expert (``shared_mxfp8``): (16, 16)-preshuffled fp8 [rows, K] and row-major e8m0 [rows, K / 32]
+# the MXFP8 shared expert: (16, 16)-preshuffled fp8 [rows, K] and row-major e8m0 [rows, K / 32]
 W13S_BYTES = W13_ROWS * HIDDEN
 S13S_BYTES = W13_ROWS * W13_SCALE_COLS
 W2S_BYTES = HIDDEN * INTER
 S2S_BYTES = HIDDEN * W2_SCALE_COLS
-S2_BYTES = (N_ROUTED + 1) * HIDDEN * W2_SCALE_COLS  # e8m0, every expert
-S13_BYTES = (N_ROUTED + 1) * W13_ROWS * W13_SCALE_COLS
+S2_BYTES = N_ROUTED * HIDDEN * W2_SCALE_COLS  # e8m0, every routed expert
+S13_BYTES = N_ROUTED * W13_ROWS * W13_SCALE_COLS
 
 
 def _f32(x: float) -> float:
