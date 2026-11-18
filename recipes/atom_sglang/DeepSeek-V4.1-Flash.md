@@ -9,9 +9,15 @@ which needs an aiter with ROCm/aiter#7820: without it the per-token FP8 MoE take
 the experts' SwiGLU clamp. Native ATOM has the same requirement. ATOM's V4.1 code also imports aiter's
 `get_mla_sparse_prefill_v41_backend` (ROCm/aiter#7407) and, to build the DSpark draft's block-32 FP8 linears,
 `gemm_a8w8_blockscale_group32_supported` (ROCm/aiter#8086); without #8086 the draft fails to build with an
-ImportError. All three are merged, so an aiter main at ff2f0ce27 (#8086) or later has them. The validated aiter is
-the #7820 head 7bec3c672 (aiter main 13b6e87ce plus #7820) with #8086's `gemm_a8w8_blockscale_group32_supported`
-added to `aiter/ops/gemm_op_a8w8.py` (on gfx942 it returns False and those linears take the BF16 fallback).
+ImportError. All three are merged, but aiter main does not run this model yet (checked at ca7cfa1c3, 2026-11-18):
+ROCm/aiter#7361, merged before #7820, makes `fused_moe` raise `NotImplementedError: fused_moe cannot apply
+swiglu_limit=10.0 for QuantType.per_Token SiLU at inter_dim=576; the runtime-limit CK stage1 needs a multiple of 128`
+(TP4 gives the routed experts inter_dim 576) before it reaches #7820's gfx942 FlyDSL path, so the plugin and native
+ATOM both fail at the first MoE call (CUDA graph capture or warm-up). Until aiter main raises that error only when the
+FlyDSL path is not taken, use the validated aiter: the #7820 head 7bec3c672 (aiter main 13b6e87ce plus #7820) with
+#8086's `gemm_a8w8_blockscale_group32_supported` added to `aiter/ops/gemm_op_a8w8.py` (on gfx942 it returns False and
+those linears take the BF16 fallback). aiter main ca7cfa1c3 with only that check deferred selects the same MoE kernels
+and gives the same acceptance, accuracy and speed (see Measured).
 
 ## Launching Server
 
