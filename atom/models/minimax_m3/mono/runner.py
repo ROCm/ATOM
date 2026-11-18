@@ -249,6 +249,10 @@ class MonoDecodeRunner:
         route_scale = float(layers[N_DENSE].block_sparse_moe.routed_scaling_factor)
         # NVFP4 K/V + index pages (single-buffer): every layer alike, both caches together
         self.nvfp4 = impl.kv_cache_dtype == "nvfp4"
+        kv = get_forward_context().kv_cache_data[f"layer_{self.sparse[0].layer_id}"]
+        pools = [t for t in (kv.k_cache, kv.v_cache) if t is not None]
+        if max(t.numel() * t.element_size() for t in pools) > 1 << 32:
+            raise MonoUnsupported("KV cache over 4 GiB a layer (32-bit buffer offsets)")
         if any(
             lw.attn_impl.kv_cache_dtype != impl.kv_cache_dtype for lw in self.sparse
         ):

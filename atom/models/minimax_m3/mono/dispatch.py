@@ -15,7 +15,6 @@ that disagreed would wait on each other forever (a per-rank flag such as
 
 import json
 import logging
-import os
 
 import torch
 
@@ -157,9 +156,7 @@ class MonoDecode:
         }
         if rank == 0:
             logger.info("MiniMax-M3 mono steps by token count: %s", stats)
-        path = os.environ.get(
-            "ATOM_MONO_STATS_FILE"
-        )  # a bench's proof, one file a rank
+        path = envs.ATOM_MONO_STATS_FILE  # a bench's proof, one file a rank
         if path:
             with open(f"{path}.rank{rank}.json", "w") as f:
                 json.dump(stats, f)

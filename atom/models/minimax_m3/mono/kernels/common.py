@@ -246,7 +246,9 @@ def nvfp4_v_store(r_page, cache_addr, slot, vals, l32, gs, cm=0):
         d = l32 * 4 + i
         dw = fx.inttoptr(
             fx.PointerType.get(T.i32, fx.AddressSpace.Global, 4),
-            cache_addr + fx.Int64(base + KV_V_DATA_AT + ((t // 8) * 128 + d) * 4),
+            cache_addr
+            + fx.Int64(page) * KV_PAGE_BYTES
+            + fx.Int64(KV_V_DATA_AT + ((t // 8) * 128 + d) * 4),
         )
         nib = (packed >> (4 * i)) & 0xF
         fx.llvm.atomic_and(

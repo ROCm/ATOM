@@ -139,9 +139,8 @@ def mono_xn(runner, n: int) -> torch.Tensor:
     v = torch.stack([lut[(b & 15).long()], lut[(b >> 4).long()]], -1).view(
         n, HIDDEN // 32, 32
     )
-    scale = torch.ldexp(
-        torch.ones_like(codes, dtype=torch.float32), codes.view(n, -1) - 127
-    )
+    codes = codes.view(n, -1)
+    scale = torch.ldexp(torch.ones_like(codes, dtype=torch.float32), codes - 127)
     return (v * scale[..., None]).view(n, HIDDEN).to(torch.bfloat16)
 
 
