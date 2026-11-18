@@ -221,6 +221,14 @@ impl ConfigValidator {
             });
         }
 
+        if !(0.0..=1.0).contains(&config.kv_storage_sample_rate) {
+            return Err(ConfigError::InvalidValue {
+                field: "kv_storage_sample_rate".to_string(),
+                value: config.kv_storage_sample_rate.to_string(),
+                reason: "Must be between 0 and 1".to_string(),
+            });
+        }
+
         Ok(())
     }
 
@@ -448,6 +456,21 @@ mod tests {
             error.to_string().contains("kv_storage_deadline_ms"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn kv_storage_sample_rate_must_be_a_fraction() {
+        for rate in [-0.1, 1.5, f64::NAN] {
+            let config = RouterConfig {
+                kv_storage_sample_rate: rate,
+                ..Default::default()
+            };
+            let error = config.validate().unwrap_err();
+            assert!(
+                error.to_string().contains("kv_storage_sample_rate"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

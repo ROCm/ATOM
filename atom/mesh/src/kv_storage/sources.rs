@@ -86,6 +86,8 @@ pub struct StorageSources {
     admin_port: u16,
     /// How long a lookup waits, from its first request to its last answer.
     deadline: Duration,
+    /// The fraction of the prompts a store could add to that are looked up.
+    sample_rate: f64,
     client: reqwest::Client,
     sources: Mutex<Vec<StorageSource>>,
 }
@@ -95,9 +97,16 @@ impl StorageSources {
         Self {
             admin_port,
             deadline,
+            sample_rate: 1.0,
             client,
             sources: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Looks up `rate` of the prompts a store could add to; the others get no estimate.
+    pub fn sampled(mut self, rate: f64) -> Self {
+        self.sample_rate = rate;
+        self
     }
 
     /// Makes `worker` a reader of the store `offload` reports, and of no other.
@@ -151,7 +160,7 @@ impl StorageSources {
 
     /// The tokens of `tokens` `worker`'s engine reports cached when its device cache holds
     /// `device` of them, after it loads what it will from the store it reads, if any; None
-    /// when that store does not answer.
+    /// when the prompt is not sampled or that store does not answer.
     pub async fn cached_tokens(&self, worker: &str, tokens: &[u32], device: u32) -> Option<u32> {
         let read = self
             .sources
@@ -167,6 +176,7 @@ impl StorageSources {
                 readable: s.chain_check_passed,
                 lookups: s.lookups.clone(),
                 deadline: self.deadline,
+                sample_rate: self.sample_rate,
             });
         match read {
             Some(read) => read.cached_tokens(&self.client, tokens, device).await,

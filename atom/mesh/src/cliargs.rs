@@ -284,6 +284,11 @@ pub struct CliArgs {
     #[arg(long, default_value_t = 3, help_heading = "Routing Policy")]
     pub kv_storage_deadline_ms: u64,
 
+    /// With --kv-events, the fraction of requests (0 to 1) whose worker's store is asked,
+    /// of those it could add cached tokens to; the others neither wait nor get an estimate
+    #[arg(long, default_value_t = 0.1, value_parser = parse_fraction, help_heading = "Routing Policy")]
+    pub kv_storage_sample_rate: f64,
+
     // ==================== PD Disaggregation ====================
     /// Enable PD (Prefill-Decode) disaggregated mode
     #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
@@ -699,6 +704,7 @@ impl CliArgs {
             .kv_events(self.kv_events)
             .mooncake_admin_port(self.mooncake_admin_port)
             .kv_storage_deadline_ms(self.kv_storage_deadline_ms)
+            .kv_storage_sample_rate(self.kv_storage_sample_rate)
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
             .build()
@@ -905,6 +911,7 @@ impl Default for CliArgs {
             kv_events: false,
             mooncake_admin_port: 9003,
             kv_storage_deadline_ms: 3,
+            kv_storage_sample_rate: 0.1,
             pd_disaggregation: false,
             decode: Vec::new(),
             prefill_policy: None,

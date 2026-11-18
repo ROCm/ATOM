@@ -87,6 +87,9 @@ pub struct RouterConfig {
     /// How long a request waits for the store its worker loads from to answer.
     #[serde(default = "default_kv_storage_deadline_ms")]
     pub kv_storage_deadline_ms: u64,
+    /// The fraction of the requests a store could add to whose store is asked.
+    #[serde(default = "default_kv_storage_sample_rate")]
+    pub kv_storage_sample_rate: f64,
     pub api_key: Option<String>,
     pub metrics: Option<MetricsConfig>,
     pub log_dir: Option<String>,
@@ -458,6 +461,10 @@ fn default_kv_storage_deadline_ms() -> u64 {
     3
 }
 
+fn default_kv_storage_sample_rate() -> f64 {
+    0.1
+}
+
 impl Default for RouterConfig {
     fn default() -> Self {
         Self {
@@ -479,6 +486,7 @@ impl Default for RouterConfig {
             kv_events: false,
             mooncake_admin_port: default_mooncake_admin_port(),
             kv_storage_deadline_ms: default_kv_storage_deadline_ms(),
+            kv_storage_sample_rate: default_kv_storage_sample_rate(),
             api_key: None,
             metrics: None,
             log_dir: None,

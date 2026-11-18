@@ -875,7 +875,7 @@ class Scheduler:
 
         self._num_parked_remote_kv: int = 0
 
-        # Under PP the head keeps pp_size batches in flight, so schedule() must
+        # Under PP the head keeps several batches in flight, so schedule() must
         # advance chunked-prefill progress itself rather than defer it to
         # postprocess, else back-to-back schedules re-issue the same chunk.
         self.advance_on_schedule: bool = (
@@ -895,8 +895,17 @@ class Scheduler:
         from atom.utils.forward_context import get_kvconnector
 
         self.kv_connector = get_kvconnector("scheduler", config)
+        # What a P/D receive's first decode takes past its prompt: T0 and the
+        # `mtp_k` verify slots its handoff appends, then the reach past them
+        # that `can_append` checks before the step runs, as decode does below.
+        decode_reach = max(
+            1 + (self.mtp_k if self.use_spec else 0), self.draft_lookahead
+        )
         self.pd_admission = PdAdmissionController.from_config(
-            config, self.kv_connector, self.block_manager
+            config,
+            self.kv_connector,
+            self.block_manager,
+            first_decode_tokens=1 + self.mtp_k + decode_reach,
         )
         bind_block_manager = getattr(self.kv_connector, "bind_block_manager", None)
         if callable(bind_block_manager):
@@ -2685,7 +2694,9 @@ class Scheduler:
             # request deferred here must leave nothing committed.
             pd_plan = None
             if self.pd_admission is not None and needs_remote_load:
-                admitted, pd_plan = self.pd_admission.check(seq, hbm_probe)
+                admitted, pd_plan = self.pd_admission.check(
+                    seq, hbm_probe, running=self.running
+                )
                 if not admitted:
                     self.waiting.appendleft(seq)
                     break
