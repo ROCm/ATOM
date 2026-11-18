@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import torch
 import triton
 import triton.language as tl
-from aiter import mhc_post
+from aiter import mhc_post, mhc_post_reduce
 
 from atom.model_ops.deepseek_v41.projections import hc_projection
 from atom.model_ops.sparse_attn_v4 import hc_split_sinkhorn
@@ -252,102 +252,6 @@ def embed_state(
     return residual, pre_mix
 
 
-@triton.jit
-def _post_collapse_kernel(
-    x_ptr,
-    res_ptr,
-    post_ptr,
-    comb_ptr,
-    pre_ptr,
-    out_ptr,
-    hidden_size: tl.constexpr,
-    MEAN: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-):
-    # hc_mult = 4. Each output stream is aiter.mhc_post's expression as its
-    # compiler contracts it, fma(x, post[j], r0 * comb[0][j]) and then an FMA
-    # per further input stream, rounded to BF16; the streams
-    # then reduce as collapse_streams (FP32 pre[j] * y[j] summed in order) or,
-    # with MEAN, as torch's BF16 mean ((y0 + y1) + y2) + y3 times 1/4.
-    token = tl.program_id(0).to(tl.int64)
-    offsets = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
-    mask = offsets < hidden_size
-    x = tl.load(x_ptr + token * hidden_size + offsets, mask=mask, other=0.0).to(
-        tl.float32
-    )
-    base = res_ptr + token * 4 * hidden_size + offsets
-    r0 = tl.load(base, mask=mask, other=0.0).to(tl.float32)
-    r1 = tl.load(base + hidden_size, mask=mask, other=0.0).to(tl.float32)
-    r2 = tl.load(base + 2 * hidden_size, mask=mask, other=0.0).to(tl.float32)
-    r3 = tl.load(base + 3 * hidden_size, mask=mask, other=0.0).to(tl.float32)
-    acc = tl.zeros((BLOCK_H,), dtype=tl.float32)
-    for j in tl.static_range(0, 4):
-        v = tl.fma(
-            x,
-            tl.load(post_ptr + token * 4 + j),
-            r0 * tl.load(comb_ptr + token * 16 + j),
-        )
-        v = tl.fma(r1, tl.load(comb_ptr + token * 16 + 4 + j), v)
-        v = tl.fma(r2, tl.load(comb_ptr + token * 16 + 8 + j), v)
-        v = tl.fma(r3, tl.load(comb_ptr + token * 16 + 12 + j), v)
-        y = v.to(tl.bfloat16).to(tl.float32)
-        if MEAN:
-            acc = acc + y
-        else:
-            acc = acc + tl.load(pre_ptr + token * 4 + j) * y
-    if MEAN:
-        acc = acc * 0.25
-    tl.store(
-        out_ptr + token * hidden_size + offsets,
-        acc.to(out_ptr.dtype.element_ty),
-        mask=mask,
-    )
-
-
-def post_collapse_supported(residual, pending):
-    """Shapes where settle() uses aiter.mhc_post, which this fusion matches."""
-    return (
-        residual.is_cuda
-        and residual.shape[-2] == 4
-        and residual.shape[-1] % 256 == 0
-        and residual.is_contiguous()
-        and pending.is_contiguous()
-    )
-
-
-def post_collapse_streams(pending, residual, post_mix, combination, pre_mix=None):
-    """`settle()` then `collapse_streams` (or, with pre_mix=None, the BF16
-    mean over the streams) in one launch, without writing the settled
-    residual. Bit-exact with mhc_post followed by either reduction."""
-    hidden_size = residual.shape[-1]
-    flat = residual.view(-1, 4, hidden_size)
-    num_tokens = flat.shape[0]
-    out = torch.empty(
-        num_tokens, hidden_size, dtype=residual.dtype, device=residual.device
-    )
-    if num_tokens == 0:
-        return out
-    post = post_mix.reshape(num_tokens, 4).contiguous()
-    comb = combination.reshape(num_tokens, 16).contiguous()
-    pre = post if pre_mix is None else pre_mix.reshape(num_tokens, 4).contiguous()
-    block_h = 1024
-    _post_collapse_kernel[(num_tokens, triton.cdiv(hidden_size, block_h))](
-        pending.view(num_tokens, hidden_size),
-        flat,
-        post,
-        comb,
-        pre,
-        out,
-        hidden_size,
-        MEAN=pre_mix is None,
-        BLOCK_H=block_h,
-        num_warps=4,
-        # Explicit FMAs only, as mhc_post and collapse_streams round them.
-        enable_fp_fusion=False,
-    )
-    return out
-
-
 @dataclass(frozen=True)
 class SinglePassHCState:
     """The residual between two sublayers, and the post step one of them owes.
@@ -405,14 +309,14 @@ class SinglePassHCState:
 
         The Triton body is the same expression in one launch instead of four,
         and keeps its multiply and sum apart so the two agree to the bit. The
-        torch one stays for callers off the GPU. An owed post fuses into the
-        same launch.
+        torch one stays for callers off the GPU. An owed post and the collapse
+        run as one aiter launch where it covers the shape.
         """
-        if self.pending is not None and post_collapse_supported(
-            self.residual, self.pending
+        if self.pending is not None and post_reduce_supported(
+            self.pending, self.residual
         ):
             *outer, _, hidden = self.residual.shape
-            return post_collapse_streams(
+            return post_reduce_streams(
                 self.pending,
                 self.residual,
                 self.post_mix,
@@ -434,6 +338,21 @@ class SinglePassHCState:
             residual.view(-1, hc_mult, hidden),
             self.pre_mix.view(-1, hc_mult),
         ).view(*outer, hidden)
+
+    def stream_mean(self):
+        """The mean over the streams, settling an owed post: what a DSpark
+        draft reads at a target layer's input (V4.1's taps and the vLLM
+        plugin's aux hidden states). An owed post and the mean run as one
+        aiter launch where it covers the shape, without writing the settled
+        residual; elsewhere `settle()` and torch's mean."""
+        if self.pending is not None and post_reduce_supported(
+            self.pending, self.residual
+        ):
+            *outer, _, hidden = self.residual.shape
+            return post_reduce_streams(
+                self.pending, self.residual, self.post_mix, self.combination
+            ).view(*outer, hidden)
+        return self.settle().residual.mean(dim=-2)
 
 
 def predict_mixes(
@@ -466,13 +385,14 @@ def expand_residual(sublayer_output, residual, post_mix, combination):
 
     The torch body materializes a [tokens, hc, hc, dim] product before reducing
     it. `aiter.mhc_post` is the same expression as one ROCm op, and it is the
-    one V4 and vLLM's ROCm V4.1 both call here. The shape test is the kernel's
-    own coverage, which it traps on rather than reports; vLLM gates it the same
-    way. It is also what keeps the small-hidden reference tests, which demand
-    bit-exactness against the pinned model, on the body below.
+    one V4 and vLLM's ROCm V4.1 both call here. The test (`mhc_post_covers`) is
+    the kernel's own coverage, which it traps on rather than reports; vLLM
+    gates the shape the same way. It is also what keeps the small-hidden
+    reference tests, which demand bit-exactness against the pinned model, on
+    the body below.
     """
     hc_mult, hidden = residual.shape[-2], residual.shape[-1]
-    if hidden % 256 == 0 and hc_mult == 4:
+    if mhc_post_covers(residual):
         flat = residual.view(-1, hc_mult, hidden)
         rows = flat.shape[0]
         out = torch.empty_like(flat)
@@ -488,6 +408,57 @@ def expand_residual(sublayer_output, residual, post_mix, combination):
     return (mixed + post_mix.unsqueeze(-1) * sublayer_output.float().unsqueeze(-2)).to(
         sublayer_output.dtype
     )
+
+
+def mhc_post_covers(residual) -> bool:
+    """The shapes `aiter.mhc_post` serves, which it traps on rather than
+    reports: 4 streams, the 16-bit float dtypes its dispatch takes (and rounds
+    every stream to), and a hidden size its tiles cover -- a multiple of 256
+    holding at least two of the widest tile (1024, 512 or 256 columns) that
+    divides it, because the kernel prefetches one tile ahead."""
+    hidden = residual.shape[-1]
+    tile = next((t for t in (1024, 512, 256) if hidden % t == 0), None)
+    return (
+        residual.shape[-2] == 4
+        and tile is not None
+        and hidden >= 2 * tile
+        and residual.dtype in (torch.bfloat16, torch.float16)
+    )
+
+
+def post_reduce_supported(pending, residual) -> bool:
+    """Where an owed post and the stream reduction after it run as one
+    `aiter.mhc_post_reduce`: `mhc_post`'s coverage with hidden a multiple of
+    512, both operands contiguous, on the GPU."""
+    return (
+        residual.is_cuda
+        and mhc_post_covers(residual)
+        and residual.shape[-1] % 512 == 0
+        and residual.is_contiguous()
+        and pending.is_contiguous()
+    )
+
+
+def post_reduce_streams(pending, residual, post_mix, combination, pre_mix=None):
+    """`settle()` and then `collapse_streams` -- or, with ``pre_mix=None``,
+    the mean over the streams -- as one `aiter.mhc_post_reduce`, which never
+    writes the settled residual. aiter computes each stream with `mhc_post`'s
+    own body and reduces it as those two do (FP32, streams in order, products
+    and sums rounded apart), so the result is the two-kernel path's to the
+    bit. Callers check `post_reduce_supported` first."""
+    hidden = residual.shape[-1]
+    flat = residual.view(-1, 4, hidden)
+    rows = flat.shape[0]
+    out = torch.empty(rows, hidden, dtype=residual.dtype, device=residual.device)
+    mhc_post_reduce(
+        out,
+        pending.view(rows, hidden),
+        flat,
+        post_mix.reshape(rows, 4, 1).contiguous(),
+        combination.reshape(rows, 4, 4).contiguous(),
+        None if pre_mix is None else pre_mix.reshape(rows, 4).contiguous(),
+    )
+    return out
 
 
 def apply_sublayer(
