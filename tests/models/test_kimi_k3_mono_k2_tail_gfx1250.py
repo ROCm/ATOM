@@ -127,6 +127,15 @@ def test_split_and_bounded_builds_are_named_apart(monkeypatch):
     assert tail.tail_ar_ctas(tail.tail_max_rows()) <= tail.GAVE_UP_WORD
 
 
+def test_tail_defaults_on(monkeypatch):
+    from atom.utils import envs
+
+    monkeypatch.delenv("ATOM_KIMI_MONO_TAIL", raising=False)
+    assert envs.ATOM_KIMI_MONO_TAIL is True
+    monkeypatch.setenv("ATOM_KIMI_MONO_TAIL", "0")
+    assert envs.ATOM_KIMI_MONO_TAIL is False
+
+
 def test_split_switch_defaults_off(monkeypatch):
     from atom.utils import envs
 
