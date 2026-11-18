@@ -744,10 +744,12 @@ async fn cancelling_dispatch_releases_pending_load() {
         let task = dispatch(kind, &p, &d, true);
         p.wait_entered().await;
         assert_eq!(p.worker.load(), 1);
+        assert_eq!(p.worker.prefill_tokens(), 7);
         assert_eq!(d.worker.load(), 1);
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         assert_eq!(p.worker.load(), 0);
+        assert_eq!(p.worker.prefill_tokens(), 0);
         assert_eq!(d.worker.load(), 0);
     }
 }
@@ -836,6 +838,7 @@ async fn check_stalled_dual_dispatch_error(fail_prefill: bool) {
         let task = dispatch(DispatchKind::Sglang, &p, &d, streaming);
         p.wait_entered().await;
         d.wait_entered().await;
+        assert_eq!(p.worker.prefill_tokens(), 7);
         let (failed, peer) = if fail_prefill {
             (&mut p, &d)
         } else {
@@ -858,6 +861,7 @@ async fn check_stalled_dual_dispatch_error(fail_prefill: bool) {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         assert!(String::from_utf8_lossy(&bytes).contains("upstream unavailable"));
         assert_eq!(p.worker.load(), 0);
+        assert_eq!(p.worker.prefill_tokens(), 0);
         assert_eq!(d.worker.load(), 0);
     }
 }
