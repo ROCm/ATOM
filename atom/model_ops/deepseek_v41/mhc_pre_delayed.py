@@ -15,8 +15,8 @@ The norm is the sublayer's own. Attention can request HIP's fused MXFP8
 output alongside BF16 for its other readers; FFN keeps the BF16 interface.
 Its consumers (wqkv_a's group32 GEMM, the bounded-replay row gather) read
 row-major (T, H/32) E8M0 scales. gfx950 writes those; gfx1250 writes its
-m32k4 GEMM A-scale layout unless asked for `scale_row_major`, so there the
-fused output needs an AITER with that option, else the GEMM quantizes.
+m32k4 GEMM A-scale layout unless asked for `scale_row_major`, which ATOM
+always requests there (a plain `mega_mhc` parameter on aiter main).
 """
 
 from functools import cache
@@ -39,8 +39,8 @@ _HIP_ARCHS = ("gfx950", "gfx1250")
 @cache
 def _row_major_scale_options():
     """The mega_mhc options that give fused MXFP8 row-major (T, H/32) scales,
-    or None when this arch/AITER cannot: gfx950 always writes them, gfx1250
-    only through `scale_row_major` (m32k4 otherwise)."""
+    or None on other archs: gfx950 always writes them, gfx1250 through
+    `scale_row_major` (m32k4 otherwise)."""
     arch = get_gfx_runtime()
     if arch == "gfx950":
         return {}
@@ -209,8 +209,7 @@ def v41_mhc_pre_delayed(
         raise ValueError("Fused mHC quantization requires the HIP backend")
     if fuse_quant and not fuse_quant_supported():
         raise ValueError(
-            "Fused mHC quantization requires row-major scales: gfx950, or "
-            "gfx1250 with AITER mega_mhc(scale_row_major=)"
+            "Fused mHC quantization requires row-major scales: gfx950 or gfx1250"
         )
     # mega_mhc for a packed BF16 fn (HIP, gfx950/gfx1250), or for a raw FP32 fn
     # on gfx942 where it runs AITER's ASM seam and RMSNorm. fuse_quant implies
