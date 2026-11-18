@@ -109,9 +109,40 @@ process (e.g. HiCache's cache controller) are not held off by the wait. Kill swi
 Measured on MI308X TP4, DSpark K=5 + radix, a fresh server per session (4 sessions each way): radix-hit TTFT (a
 4105-token prompt with 3840 tokens cached) 150 ms -> 112 ms on average (native ATOM 114 ms); decode rounds and GSM8K
 c32 wall time unchanged. Without speculation and radix: GSM8K 1319 c32 wall 189-193 s -> 174-184 s (native 173-180 s).
-Hit TTFT still has a slower tier (~130 ms) while one rank's scheduler core runs at its base clock instead of turbo;
-native ATOM shows the same tier on the same host. Pinning the scheduler threads to dedicated cores instead of polling
-does not help (the core still idles between iterations; measured slower).
+
+### Optional: pin the scheduler main threads (radix-hit-latency-sensitive deployments)
+
+With the busy-polling broadcast, the remaining radix-hit TTFT spread comes from the kernel migrating the busy scheduler
+main threads between cores: a freshly picked core can stay at base clock (2.0 GHz on the Xeon 8480C hosts) for seconds,
+and a TP step waits for the slowest rank (hit TTFT ~135-140 ms instead of ~98 ms; native ATOM 105-112 ms). Where that
+latency matters, pin each rank's scheduler main thread to its own physical core on the GPUs' NUMA node after the
+server is up and warmed up. This is optional and deployment-only (no code change, the plugin does not pin threads): it
+needs `taskset` and CAP_SYS_NICE (e.g. root) in the container, and `NODE` / `MAIN_CORES` must be adapted to the machine
+(one physical core per TP rank, not shared with other heavy work). Threads created later inherit the mask of their
+creator, so run it after the warm-up requests:
+
+```bash
+SERVER_PID=$!                  # PID of "python3 -m sglang.launch_server ..." started in the background
+NODE=0                         # NUMA node of the GPUs: cat /sys/class/drm/card*/device/numa_node
+MAIN_CORES=(48 49 50 51)       # one physical core per TP rank (TP0..TP3) on that node; adapt per machine
+# ... wait for /health_generate and send the warm-up requests ...
+expand() { local p; for p in ${1//,/ }; do seq "${p%-*}" "${p#*-}"; done; }
+NODE_CPUS=$(expand "$(cat /sys/devices/system/node/node$NODE/cpulist)")
+EXCL=$(for c in "${MAIN_CORES[@]}"; do expand "$(cat /sys/devices/system/cpu/cpu$c/topology/thread_siblings_list)"; done)
+REST=$(comm -23 <(sort <<< "$NODE_CPUS") <(sort <<< "$EXCL") | sort -n | paste -sd,)
+# every thread of the server and its child processes -> the node minus the main cores and their SMT siblings
+for pid in $SERVER_PID $(pgrep -P "$SERVER_PID"); do taskset -a -p -c "$REST" "$pid" > /dev/null; done
+# each TP rank's scheduler main thread (TID == PID of sglang::scheduler_TP<i>) alone on its core
+for pid in $(pgrep -P "$SERVER_PID"); do
+  i=$(tr '\0' ' ' < /proc/$pid/cmdline | sed -n 's/^sglang::scheduler_TP\([0-9]*\).*/\1/p')
+  if [ -n "$i" ]; then taskset -p -c "${MAIN_CORES[$i]}" "$pid" > /dev/null; fi
+done
+```
+
+Measured (TP4 MI308X, DSpark block 5 + radix, recipe launch, 2026-11-18): radix-hit TTFT (3840 cached tokens) median
+98.0 ms over 6 sessions (144 hits, none above 104 ms) vs 104.3 ms unpinned (7 sessions, 77 of 168 hits above 120 ms) and
+109.7 ms native ATOM; GSM8K 1319 prompts at concurrency 32 wall time 155.1 s pinned vs 153.9 s unpinned (-0.6%
+throughput) and 160.2 s native.
 
 ## Prefill admission (`--min-free-slots-delay`, optional)
 
