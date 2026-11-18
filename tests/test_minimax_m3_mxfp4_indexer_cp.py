@@ -194,15 +194,17 @@ def test_the_cp_scorer_refuses_what_it_cannot_score(monkeypatch):
         call(LogitsWorkspace(WORLD * batch * S * local - 1, "cpu"))
 
 
+@pytest.mark.parametrize("mailbox", [False, True])
 @pytest.mark.parametrize(
     "index_dtype,kv_dtype", [("fp4", "fp4"), ("fp4", "fp8"), ("fp8", "fp8")]
 )
 def test_the_cp_decode_runs_the_index_caches_scorer_and_the_kvs_geometry(
-    monkeypatch, index_dtype, kv_dtype
+    monkeypatch, index_dtype, kv_dtype, mailbox
 ):
     """The MXFP4 index scores with the step's record, any other index cache with the
     Triton scorer; the merge emits the KV's page geometry, as the TP selector does
-    (one page-128 page a block for the MXFP4 KV, the page-16 defaults otherwise)."""
+    (one page-128 page a block for the MXFP4 KV, the page-16 defaults otherwise),
+    and so does the fused mailbox kernel when a mailbox is open."""
     from atom.distributed import indexer_cp
     from atom.model_ops import attention_mha
     from atom.model_ops.minimax_m3 import indexer_candidate_exchange as exchange
@@ -217,11 +219,16 @@ def test_the_cp_decode_runs_the_index_caches_scorer_and_the_kvs_geometry(
 
         return fn
 
-    monkeypatch.setattr(icp, "indexer_context_scores", double("triton", "scores"))
-    monkeypatch.setattr(icp, "indexer_context_scores_mxfp4", double("mxfp4", "scores"))
+    scores = types.SimpleNamespace(shape=(WORLD, 2, 3))
+    monkeypatch.setattr(icp, "indexer_context_scores", double("triton", scores))
+    monkeypatch.setattr(icp, "indexer_context_scores_mxfp4", double("mxfp4", scores))
     monkeypatch.setattr(exchange, "local_candidate_keys", double("local", "keys"))
     monkeypatch.setattr(indexer_cp, "exchange_candidates", double("exchange", "all"))
     monkeypatch.setattr(exchange, "merge_candidate_keys", double("merge", (1, 2, 3)))
+    box = types.SimpleNamespace(fits=lambda *shape: True) if mailbox else None
+    monkeypatch.setattr(indexer_cp, "candidate_mailbox", lambda: box)
+    fused = double("fused", (1, 2, 3))
+    monkeypatch.setattr(exchange, "select_exchanged_candidates", fused)
 
     impl = object.__new__(attention_mha.SparseMHAPagedAttentionImpl)
     impl.index_cache_dtype, impl.kv_cache_dtype = index_dtype, kv_dtype
@@ -241,6 +248,10 @@ def test_the_cp_decode_runs_the_index_caches_scorer_and_the_kvs_geometry(
     )
     assert got == (1, 2, 3)
     scorer = "mxfp4" if index_dtype == "fp4" else "triton"
+    if mailbox:
+        assert [c[0] for c in calls] == [scorer, "fused"]
+        assert calls[1][1][9] is box and calls[1][2] == page_kw
+        return
     assert [c[0] for c in calls] == [scorer, "local", "exchange", "merge"]
     args = calls[0][1]
     if scorer == "mxfp4":
@@ -250,7 +261,7 @@ def test_the_cp_decode_runs_the_index_caches_scorer_and_the_kvs_geometry(
         assert args[3:] == ("seq", 1000, 1, WORLD, 2, 0.5)
     # the merge reads the exchanged keys with the KV's page geometry; the local
     # top-k knows the global block count, off the table
-    assert calls[1][1] == ("scores", "seq", TOPK, 1, WORLD, 2, 9, 0, 1)
+    assert calls[1][1] == (scores, "seq", TOPK, 1, WORLD, 2, 9, 0, 1)
     assert calls[3][1][0] == "all" and calls[3][2] == page_kw
 
 

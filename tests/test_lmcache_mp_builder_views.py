@@ -20,6 +20,7 @@ from atom.kv_transfer.offload.mp.page_views import _build_cache_views
 from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
 from atom.model_ops.attentions.mla_kv_pool import MlaKvPool
 from atom.model_ops.attentions.pool_layout.entry_arena import EntryField
+from atom.utils.tbo import NUM_TBO_UBATCHES, UBatchSlice
 
 _MISSING = object()
 _REPO_ROOT = Path(__file__).parents[1]
@@ -185,6 +186,9 @@ def mla_builder_cls():
         ),
         "atom.utils.block_tables": _module(
             "atom.utils.block_tables", block_table_state=noop
+        ),
+        "atom.utils.tbo": _module(
+            "atom.utils.tbo", NUM_TBO_UBATCHES=NUM_TBO_UBATCHES, UBatchSlice=UBatchSlice
         ),
         "atom.utils.forward_context": _module(
             "atom.utils.forward_context",
@@ -353,7 +357,11 @@ def test_mla_builder_publishes_latent_and_index_views(
     assert torch.all(pool.layer("kv", 0)[1].view(torch.uint8) == 7)
 
 
-def test_mla_builder_publishes_fp4_index_scale_plane_to_lmcache_mp(mla_builder_cls):
+@pytest.mark.parametrize("opus", [False, True])
+@pytest.mark.parametrize("dcp", [1, 8])
+def test_mla_builder_publishes_fp4_index_scale_plane_to_lmcache_mp(
+    mla_builder_cls, opus, dcp
+):
     # The FP4 sparse indexer keeps packed E2M1 and its e8m0 exponents as two
     # planes. `lmcache_mp` groups regions by per-block shape and copies whole
     # blocks, so the scale plane is published as one more region per layer and
@@ -361,6 +369,7 @@ def test_mla_builder_publishes_fp4_index_scale_plane_to_lmcache_mp(mla_builder_c
     runner = SimpleNamespace(
         config=SimpleNamespace(
             tensor_parallel_size=8,
+            decode_context_parallel_size=dcp,
             kv_transfer_config={"kv_connector": "lmcache_mp"},
         ),
     )
@@ -373,6 +382,7 @@ def test_mla_builder_publishes_fp4_index_scale_plane_to_lmcache_mp(mla_builder_c
         index_rows_per_block=64,
         index_head_dim=128,
         index_fp4=True,
+        index_layout="mfma" if opus else "preshuffle",
     )
     pool.allocate(2, "cpu")
     builder = mla_builder_cls.__new__(mla_builder_cls)
@@ -402,7 +412,7 @@ def test_mla_builder_publishes_fp4_index_scale_plane_to_lmcache_mp(mla_builder_c
         "mla.index_scale.layer_0",
         "mla.index_scale.layer_1",
     ]
-    assert transfer.tp_replication_factor == 8
+    assert transfer.tp_replication_factor == (8 if dcp == 1 else 1)
     _assert_region_view_geometry(transfer)
     cache_views = _build_cache_views(transfer, num_blocks=2)
     assert cache_views.bytes_per_block == 2 * kv_bytes + 2 * 4096 + 2 * 256
@@ -410,3 +420,13 @@ def test_mla_builder_publishes_fp4_index_scale_plane_to_lmcache_mp(mla_builder_c
     transfer.block_tensor_views[5][1].fill_(3)
     assert torch.all(pool.layer("index_scale", 1)[1] == 3)
     assert torch.all(pool.layer("index_scale", 1)[0] == 0)
+    # Whole-block save/restore preserves the physical permutation, including
+    # scales, and can relocate a prefix to different PAGE ids.
+    regions = pool.region_tensors()
+    for i, view in enumerate(cache_views.tensors.values()):
+        pattern = (torch.arange(view[0].numel()) + 17 * i).to(torch.uint8)
+        view[0].copy_(pattern.view_as(view[0]))
+        saved = view[0].clone()
+        view[1].copy_(saved)
+        physical = regions[i][1][1].view(torch.uint8).flatten()
+        torch.testing.assert_close(physical, saved.flatten(), rtol=0, atol=0)

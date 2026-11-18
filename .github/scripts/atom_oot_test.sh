@@ -55,6 +55,10 @@ VLLM_PID_FILE=${VLLM_PID_FILE:-/tmp/vllm_oot.pid}
 VLLM_LOG_FILE=${VLLM_LOG_FILE:-/tmp/vllm_oot.log}
 RESULT_DIR=${RESULT_DIR:-/tmp/oot_accuracy_results}
 ACCURACY_LOG_FILE=${ACCURACY_LOG_FILE:-/tmp/oot_accuracy_output.txt}
+# Ceiling for the supervised accuracy client; below the workflow step's 120 min.
+ACCURACY_MAX_MINUTES=${ACCURACY_MAX_MINUTES:-110}
+# launch_one_model cd's to /tmp, so helpers are found from here.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 STREAM_VLLM_LOGS=${STREAM_VLLM_LOGS:-1}
 KEEP_SERVER_ALIVE_ON_EXIT=${KEEP_SERVER_ALIVE_ON_EXIT:-0}
 EXPLICIT_MODEL_NAME=${OOT_MODEL_NAME:-}
@@ -300,6 +304,16 @@ PY
   fi
 }
 
+# Run the accuracy client under supervise_client.sh: it is stopped as soon as
+# the vLLM server hangs or faults (exit 1 / 2) instead of retrying until the
+# step times out. Output is appended to ACCURACY_LOG_FILE as before.
+run_supervised_client() {
+  WAIT_SERVER_PID="$(cat "${VLLM_PID_FILE}")" \
+  FATAL_LOG_PATTERNS="${FATAL_LOG_PATTERNS}" \
+    bash "${SCRIPT_DIR}/supervise_client.sh" vllm \
+      "${ACCURACY_LOG_FILE}" "${ACCURACY_MAX_MINUTES}" -- "$@"
+}
+
 accuracy_one_model() {
   local model_name="$1"
   local model_path="$2"
@@ -378,18 +392,18 @@ PY
     done
 
     echo "Using custom lm-eval command from client_command: ${client_command}"
-    "${client_command_args[@]}" 2>&1 | tee -a "${ACCURACY_LOG_FILE}"
+    run_supervised_client "${client_command_args[@]}"
   else
     echo "Using default lm-eval command."
     local lm_args=(
       --model_args
       model="${resolved_model_path}",base_url="http://127.0.0.1:${VLLM_PORT}/v1/completions",num_concurrent=65,max_retries=1,tokenized_requests=False,trust_remote_code=True
     )
-    lm_eval --model local-completions \
+    run_supervised_client lm_eval --model local-completions \
       "${lm_args[@]}" \
       --tasks gsm8k \
       --num_fewshot "${LM_EVAL_NUM_FEWSHOT}" \
-      --output_path "${output_path}" 2>&1 | tee -a "${ACCURACY_LOG_FILE}"
+      --output_path "${output_path}"
   fi
 
   # lm-eval output layout differs across versions: output_path may be a file

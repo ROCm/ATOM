@@ -20,7 +20,7 @@ REPO = Path(__file__).resolve().parent.parent
 WORKFLOWS = REPO / ".github" / "workflows"
 BENCHMARK = WORKFLOWS / "atom-sglang-benchmark.yaml"
 ACCURACY = WORKFLOWS / "atom-sglang-accuracy-validation.yaml"
-DEADLINE = WORKFLOWS / "atom-sglang-nightly-deadline.yaml"
+DEADLINE = WORKFLOWS / "atom-nightly-deadline.yaml"
 
 BENCHMARK_MI308_CRON = "0 15 * * 1-6"
 ACCURACY_MI308_CRON = "0 16 * * *"
