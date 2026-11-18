@@ -2798,6 +2798,10 @@ models:
               <<: *m31b_mcstore_prefill_env
               # Node 1 here is half a node (GPUs 4-7): its owners stay on NUMA1 and rdma6/7.
               MOONCAKE_STORE_DECODE_OWNERS: "1:192:rdma6;1:192:rdma7"
+              # Warmup sends ~2x what one PP4 prefills in 300 s; a 300 s admission deadline
+              # then livelocks against the decodes' FIFO admission. Unadmitted holds no KV.
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":true,"chunked_admission_timeout_s":1500}
             decode: *m31b_decode_env
 
         # DSpark4 (InferenceX golden AL 3.19) against DSpark7 at the same concurrency.
