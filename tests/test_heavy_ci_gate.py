@@ -525,23 +525,40 @@ def test_rerun_of_noop_label_run_does_not_start_heavy_ci(
     assert result["smoke_requested"] == "false"
 
 
+def test_rerun_judges_labels_by_their_live_state(tmp_path):
+    # ci:atom was removed since the event, so ci:full now opens the gate.
+    result = _label(
+        tmp_path,
+        "ci:full",
+        ("ci:atom", "ci:full"),
+        run_attempt=2,
+        live_labels=("ci:full",),
+    )
+    assert result["should_run"] == "true"
+    assert result["reason"] == "label-present"
+
+
 @pytest.mark.parametrize(
-    "added_label, labels, live_labels, should_run, reason",
+    "added_label, labels, live_labels",
     [
-        # ci:atom was removed since the event, so ci:full now opens the gate.
-        ("ci:full", ("ci:atom", "ci:full"), ("ci:full",), "true", "label-present"),
         # The gate-opening run's own label was removed since.
-        ("ci:atom", ("ci:atom",), (), "false", "label-removed"),
+        ("ci:atom", ("ci:atom",), ()),
+        # ci:full opened the gate, then ci:atom took over as the opening label.
+        ("ci:full", ("ci:full",), ("ci:full", "ci:atom")),
     ],
 )
-def test_rerun_judges_labels_by_their_live_state(
-    tmp_path, added_label, labels, live_labels, should_run, reason
+def test_rerun_of_superseded_gate_opening_run_fails_its_gate(
+    tmp_path, added_label, labels, live_labels
 ):
+    # The replayed payload still gives this run the PR group and the real gate
+    # name, so a clean "not requested" would pass the required check with no
+    # heavy CI behind it. It must be undecidable, which fails the gate.
     result = _label(
         tmp_path, added_label, labels, run_attempt=2, live_labels=live_labels
     )
-    assert result["should_run"] == should_run
-    assert result["reason"] == reason
+    assert result["should_run"] == "false"
+    assert result["decidable"] == "false"
+    assert result["reason"] == "superseded-gate-opening-run"
 
 
 def test_rerun_of_code_change_reads_live_labels(tmp_path):

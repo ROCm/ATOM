@@ -368,6 +368,18 @@ allow_heavy_ci() {
   emit_decision "true" "$@"
 }
 
+# Whether the event's own payload made this label the gate-opening one, i.e.
+# whether the workflow put this run in the PR's group under the real gate name.
+payload_opened_gate() {
+  local live_labels="${PR_LABELS}" opened=1
+  PR_LABELS="$(jq -r '.pull_request.labels[]?.name // empty' "${EVENT_PATH}")"
+  if [ "$(find_allowed_pr_label || true)" = "$1" ]; then
+    opened=0
+  fi
+  PR_LABELS="${live_labels}"
+  return "${opened}"
+}
+
 check_label_event() {
   # A label is not a code change: it can only open a closed gate. The event
   # opens it only if the label it adds is the PR's gate-opening label, a rule
@@ -380,7 +392,7 @@ check_label_event() {
   # in its own concurrency group, so heavy CI started there would run beside
   # the PR's. To retry heavy CI, rerun the run that holds the PR's group (the
   # code-change or gate-opening run).
-  local added_label opening_label
+  local added_label opening_label declined=""
   added_label="$(jq -r '.label.name // ""' "${EVENT_PATH}")"
   if ! label_is_allowed "${added_label}"; then
     emit_decision "false" "label-not-gating"
@@ -388,13 +400,24 @@ check_label_event() {
   fi
   # Only a rerun reads live labels, which may no longer include the label.
   if ! opening_label="$(find_allowed_pr_label)"; then
-    emit_decision "false" "label-removed"
+    declined="label-removed"
+  elif [ "${added_label}" != "${opening_label}" ]; then
+    declined="gate-already-open"
+  fi
+  [ -n "${declined}" ] || return 0
+  # A rerun replays the original payload, so the workflow still gives a run
+  # that opened the gate the real gate check name and the PR's group. A clean
+  # "not requested" there would publish that required check as passed with no
+  # heavy CI behind it; fail it instead and point at the run to retry.
+  if [ "${GITHUB_RUN_ATTEMPT:-1}" -gt 1 ] && payload_opened_gate "${added_label}"; then
+    echo "This rerun replays a gate-opening label event that live labels no" \
+      "longer back (${declined}); rerun the current code-change or" \
+      "gate-opening run instead."
+    emit_undecidable "superseded-gate-opening-run"
     exit 0
   fi
-  if [ "${added_label}" != "${opening_label}" ]; then
-    emit_decision "false" "gate-already-open" "${opening_label}"
-    exit 0
-  fi
+  emit_decision "false" "${declined}" "${opening_label}"
+  exit 0
   # A current approval is deliberately not checked here. The concurrency group
   # cannot see it, so this run may have cancelled the approval's heavy CI and
   # must take that work over rather than leave the sha without it.
