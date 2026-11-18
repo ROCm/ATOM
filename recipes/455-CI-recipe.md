@@ -126,14 +126,16 @@ python3 -m atom.benchmarks.benchmark_serving \
 
 - 场景：MLPerf Endpoint；GPU：8（2 node, 2 tray x 1P4G），两台在同一个 UALink vpod 里
 - 并行：注意力 TP8 + DCP8，MoE TP8；一个 TP 组跨两台，node0 跑 TP rank 0–3 并对外服务，node1 跑 rank 4–7
-- MODEL_PATH：`/models/Kimi-K3`（[`moonshotai/Kimi-K3`](https://huggingface.co/moonshotai/Kimi-K3) @ `f831ab66814297da540d832a5235f8e904f29d06`）；DSpark 草稿：`/models/Kimi-K3-DSpark`（[`Inferact/Kimi-K3-DSpark`](https://huggingface.co/Inferact/Kimi-K3-DSpark) @ `cf6b8244620e7ea4b0651d214f28e89eac75bed6`）。两台都要有，路径相同
+- MODEL_PATH：`/models/Kimi-K3`（[`moonshotai/Kimi-K3`](https://huggingface.co/moonshotai/Kimi-K3) @ `f831ab66814297da540d832a5235f8e904f29d06`）；DSpark 草稿：`/models/Kimi-K3-DSpark`（[`Inferact/Kimi-K3-DSpark`](https://huggingface.co/Inferact/Kimi-K3-DSpark) @ `cf6b8244620e7ea4b0651d214f28e89eac75bed6`，目前不用，见下）。两台都要有，路径相同
 - 对外模型名：`moonshotai/Kimi-K3`；PORT：`8000`（node0）
 
-**当前 main 上跑不起来，预期记 N/A**：
-- 一个 TP 组跨节点要 [ROCm/ATOM#2647](https://github.com/ROCm/ATOM/pull/2647)。合入前 main 的 argparse 不认识 `--tensor-parallel-size-local` 和 `--tensor-parallel-rank`，报 `unrecognized arguments`。
-- gfx1250 上 DSpark 和 DCP 同时开要 [ROCm/ATOM#2760](https://github.com/ROCm/ATOM/pull/2760)（叠在 #2647 上）。合入前 `atom/config.py` 会断言 `Speculative decode + DCP is only supported on gfx950`。
+**main 上暂时不开 DSpark**：
+- 一个 TP 组跨节点的 [ROCm/ATOM#2647](https://github.com/ROCm/ATOM/pull/2647) 已于 2026-11-16 合入，main 认识 `--tensor-parallel-size-local` 和 `--tensor-parallel-rank`。
+- gfx1250 上 DSpark 和 DCP 同时开还要 [ROCm/ATOM#2760](https://github.com/ROCm/ATOM/pull/2760) + [ROCm/aiter#7912](https://github.com/ROCm/aiter/pull/7912) + [ROCm/aiter#7913](https://github.com/ROCm/aiter/pull/7913)（见 `455-CI/pending_fixes.csv`），都还没合入。开 DSpark 时 `atom/config.py` 会断言 `Speculative decode + DCP is only supported on gfx950`。
+- 所以下面的 server 不开 DSpark，其他参数不变，先测 GSM8K 精度。参照：#2760 描述里同一配置（TP8 + DCP8，MoE TP8）不开 DSpark 的 GSM8K strict-match 是 0.9621 ± 0.0053（2026-10-19，`gyu/k3-455-tp8` 分支，不是 main）。
+- 不开 DSpark 的性能不是 MLPerf 的点，记录时注明"无 DSpark"，不和开 DSpark 的历史数据比。上面三个 PR 合入后恢复 `--method dspark --draft-model /models/Kimi-K3-DSpark --num-speculative-tokens 4`。
 
-命令取自 `rocm/fw-bringup:gfx1250-atom-k3-20261110` 镜像里的 K3 MLPerf 复现手册（`/opt/k3/k3-mlperf-repro/recipe.md`），去掉了只在 DP > 1 时生效的 `ATOM_MEGA_*`、`MORI_*`、`ATOM_DP_*` 和采 profile 用的变量。c4 和 c64 用同一个 server，按 c64 的点配置：max-num-seqs 64，DSpark 4 个草稿 token。手册的点是 c8 到 c512，c4 不在其中，用这个配置跑 c4 还没有验证过。
+命令取自 `rocm/fw-bringup:gfx1250-atom-k3-20261110` 镜像里的 K3 MLPerf 复现手册（`/opt/k3/k3-mlperf-repro/recipe.md`），去掉了只在 DP > 1 时生效的 `ATOM_MEGA_*`、`MORI_*`、`ATOM_DP_*` 和采 profile 用的变量，以及 DSpark（见上）。c4 和 c64 用同一个 server，按 c64 的点配置：max-num-seqs 64。手册的点是 c8 到 c512，c4 不在其中，用这个配置跑 c4 还没有验证过。
 
 ### server
 
@@ -171,7 +173,6 @@ python3 -m atom.entrypoints.openai_server \
   --kv_cache_dtype fp8 --block-size 128 --cudagraph-mode FULL --gpu-memory-utilization 0.90 \
   --max-num-seqs $M --cudagraph-capture-sizes "[$(seq -s, 1 $M)]" \
   --max-num-batched-tokens 16384 --enable_prefix_caching --state-checkpoint-interval-tokens -1 \
-  --method dspark --draft-model /models/Kimi-K3-DSpark --num-speculative-tokens 4 \
   --online_quant_config '{"global_quant_config": "per_block_fp8", "layer_quant_config": {"*self_attn.kv_b_proj": "ptpc_fp8"}, "exclude_layer": ["*self_attn.[qkv]_conv1d*", "*block_sparse_moe.experts*", "*block_sparse_moe.routed_expert_*"]}' \
   --disable_uvicorn_access_log
 ```
