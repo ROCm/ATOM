@@ -350,6 +350,7 @@ class SingleStepRunner(StepInputs):
             self._englook(self._eng_staged)
 
         def first():  # the step's device preparation (the Engram stage first) and its first launch
+            self._eng_prep = None
             if er is not None:
                 # the launch reads the staged rows: a step the builder's round served stages in full anyway (the builder
                 # marks a served step's staging cursor-only, for models that look their rows up themselves)
@@ -361,7 +362,11 @@ class SingleStepRunner(StepInputs):
                 # as for a step the model's own round serves
                 st = er.staging
                 st._served = True
-                st._snapshot(er.width)
+                # a verify step on the one-launch preparation (kernels/prep.py): its compress and snapshot run in that
+                # launch (no cursor advance in between: a verify step's _advance_cursor launches nothing)
+                self._eng_prep = er if self._prep_takes_engram(er) else None
+                if self._eng_prep is None:
+                    st._snapshot(er.width)
                 st._advance_cursor(er.width)
                 # join Engram's side stream BEFORE the launch: the step kernel occupies every WGP and spins on its peers,
                 # so a side-stream collective (the embedding all-gather) queued behind it on one GPU while its peers' step

@@ -13,6 +13,9 @@ and ``step_prep.prep_step`` wrote as four launches, the same values.
     CTA 2   the visible counts and compress / write plans of the two ratios (fill_step_plans: -1 first, then the rows in
             order by one thread)
     CTA 3   the sampling parameters (sparam) from the page-locked host rows (UVA)
+    CTA 4   (eng) Engram's compressed ids (engram_compress: lookup[id], -1 on a dead row; the live leading rows)
+    CTA 5   (eng) Engram's lookback snapshot and each verify prefix's cursor candidate (engram_snapshot: the
+            compressed ids it reads recomputed from the ids, as CTA 4's: no ordering between the two)
     all     the zeroed counters (cnt, ss), mbest = INT64_MIN, the page tables (bcols columns of each request)
 
 Integer widths (``w``: 4 or 8 bytes) are those of the tensors (``build``'s key)."""
@@ -45,12 +48,16 @@ def _st(p, i, v, w):
         hx.gstore(p + I64(i) * 4, I64(v).to(I32))
 
 
-def build(widths, rows_per_request, bcols, ratios, extra_write, cap):
-    """The launcher for the given integer widths (dict name -> 4 / 8) and the step's constants."""
+def build(widths, rows_per_request, bcols, ratios, extra_write, cap, eng=None):
+    """The launcher for the given integer widths (dict name -> 4 / 8) and the step's constants. eng: None, or (ngram,
+    has a dead mask, stages cursor candidates): the Engram stage's compress and snapshot kernels
+    (model_ops/engram/device/hashing.py: _compress_kernel, _engram_snapshot_kernel with COUNTED) in this launch."""
     W = dict(widths)
     ROWS = rows_per_request
     RA, RB = ratios
-    keyed = (tuple(sorted(W.items())), ROWS, bcols, RA, RB, extra_write, cap)
+    keyed = (tuple(sorted(W.items())), ROWS, bcols, RA, RB, extra_write, cap, eng)
+    ENG = eng is not None
+    NGR, HAS_MASK, STAGE = eng if ENG else (1, False, False)
 
     @flyc.kernel(known_block_size=[THREADS, 1, 1])
     def body(pos: Int64, ids: Int64, bids: Int64, slots: Int64, cos: Int64, sin: Int64, bt: Int64, kvw: Int64,
@@ -58,7 +65,9 @@ def build(widths, rows_per_request, bcols, ratios, extra_write, cap):
              spdst: Int64, rpos: Int64, firstp: Int64, tids: Int64, dids: Int64, dgeom: Int64, ctxkvw: Int64,
              ctxcos: Int64, ctxsin: Int64, ibat: Int64, btab: Int64, slotsd: Int64, cnt: Int64, ss: Int64, mbest: Int64,
              n: fx.Int32, req: fx.Int32, nbt: fx.Int32, cc: fx.Int32, btstride: fx.Int32, slot_rows: fx.Int32,
-             ring_slots: fx.Int32, wsize: fx.Int32, ncnt: fx.Int32, nss: fx.Int32, nmbest: fx.Int32, nsp: fx.Int32):
+             ring_slots: fx.Int32, wsize: fx.Int32, ncnt: fx.Int32, nss: fx.Int32, nmbest: fx.Int32, nsp: fx.Int32,
+             lookup: Int64, eids: Int64, elive: Int64, edead: Int64, ecomp: Int64, ecu: Int64, ehist: Int64,
+             ehidx: Int64, esnap: Int64, ecand: Int64, hstride: fx.Int32, nsnap: fx.Int32, cs0: fx.Int32, cs1: fx.Int32):
         _ = keyed
         t = hx.opaque_v(fx.thread_idx.x)
         b = hx.opaque_s(fx.block_idx.x)
@@ -137,6 +146,41 @@ def build(widths, rows_per_request, bcols, ratios, extra_write, cap):
                 k = t + k0
                 if k < nsp:
                     hx.gstore(spdst + I64(k) * 4, hx.gload(spsrc + I64(k) * 4, fx.Float32))
+        if fx.const_expr(ENG):
+            if b == 4:   # engram_compress (COUNTED): the live leading rows' compressed ids
+                tokens = _ld(elive, 0, W["elive"])
+                if I64(t) < tokens:
+                    v = hx.gload(lookup + _ld(eids, t, W["eids"]) * 4, I32)
+                    if fx.const_expr(HAS_MASK):
+                        v = (_ld(edead, t, W["edead"]) != I64(0)).select(I32(-1), v)
+                    hx.gstore(ecomp + I64(t) * 4, v)
+            if b == 5:   # engram_snapshot (COUNTED): rows < nsnap; -2 past the live rows; a verify's cursor candidates
+                tokens = _ld(elive, 0, W["elive"])
+                for k0 in range(0, nsnap, THREADS):
+                    tk = I64(t + k0)
+                    if tk < I64(nsnap):
+                        live = tk < tokens
+                        batch = live.select(_ld(bids, live.select(tk, I64(0)), W["bids"]), I64(0))
+                        local = tk - _ld(ecu, batch, W["ecu"])
+                        row = _ld(ehidx, batch, W["ehidx"])
+                        for shift in range_constexpr(NGR):
+                            back = local - I64(shift)
+                            fromc = live & (back >= I64(0))
+                            x = fromc.select(tk - I64(shift), I64(0))
+                            cv = hx.gload(lookup + _ld(eids, x, W["eids"]) * 4, I32).to(I64)
+                            if fx.const_expr(HAS_MASK):
+                                cv = (_ld(edead, x, W["edead"]) != I64(0)).select(I64(-1), cv)
+                            fromh = live & (back < I64(0))
+                            hv = _ld(ehist, fromh.select(row * I64(hstride) + I64(NGR - 1) + back, I64(0)), W["ehist"])
+                            src = fromc.select(cv, fromh.select(hv, I64(-1)))
+                            hx.gstore(esnap + (tk * I64(NGR) + I64(shift)) * 8, live.select(src, I64(-2)))
+                            if fx.const_expr(STAGE and shift < NGR - 1):
+                                if live:
+                                    _st(ecand, batch * I64(cs0) + local * I64(cs1) + I64(NGR - 1 - shift), src, W["ecand"])
+                        if fx.const_expr(STAGE):
+                            if live:
+                                position = _ld(pos, tk - local, W["pos"])
+                                _st(ecand, batch * I64(cs0) + local * I64(cs1), position + local + I64(1), W["ecand"])
         g = b * THREADS + t
         for s in range(0, ncnt, NCTA * THREADS):
             if s + g < ncnt:
@@ -161,10 +205,13 @@ def build(widths, rows_per_request, bcols, ratios, extra_write, cap):
                ctxcos: Int64, ctxsin: Int64, ibat: Int64, btab: Int64, slotsd: Int64, cnt: Int64, ss: Int64, mbest: Int64,
                n: fx.Int32, req: fx.Int32, nbt: fx.Int32, cc: fx.Int32, btstride: fx.Int32, slot_rows: fx.Int32,
                ring_slots: fx.Int32, wsize: fx.Int32, ncnt: fx.Int32, nss: fx.Int32, nmbest: fx.Int32, nsp: fx.Int32,
+               lookup: Int64, eids: Int64, elive: Int64, edead: Int64, ecomp: Int64, ecu: Int64, ehist: Int64,
+               ehidx: Int64, esnap: Int64, ecand: Int64, hstride: fx.Int32, nsnap: fx.Int32, cs0: fx.Int32, cs1: fx.Int32,
                stream: fx.Stream = fx.Stream(None)):
         _ = keyed
         body(pos, ids, bids, slots, cos, sin, bt, kvw, kmeta, vis1, vis2, cp1, wp1, cp2, wp2, spsrc, spdst, rpos, firstp,
              tids, dids, dgeom, ctxkvw, ctxcos, ctxsin, ibat, btab, slotsd, cnt, ss, mbest, n, req, nbt, cc, btstride,
-             slot_rows, ring_slots, wsize, ncnt, nss, nmbest, nsp).launch(grid=(NCTA,), block=(THREADS,), smem=0,
+             slot_rows, ring_slots, wsize, ncnt, nss, nmbest, nsp, lookup, eids, elive, edead, ecomp, ecu, ehist,
+             ehidx, esnap, ecand, hstride, nsnap, cs0, cs1).launch(grid=(NCTA,), block=(THREADS,), smem=0,
                                                                         stream=stream)
     return launch

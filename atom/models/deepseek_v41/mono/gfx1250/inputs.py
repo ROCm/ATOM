@@ -269,6 +269,17 @@ class StepInputs:
             mbest=self.scratch["mbest"].view(torch.int64),
         )
 
+    def _prep_takes_engram(self, er) -> bool:
+        """Whether kernels/prep.py's launch runs the Engram stage's compress and snapshot (``EngramStaging._snapshot``):
+        a verify step (cursor candidates staged) on the one-launch preparation, integer rows of 4 / 8 bytes."""
+        st = er.staging.step
+        if not (self.tables.idx and self.tables.comp) or st is None or st.candidates is None or st.dead is None:
+            return False
+        ts = (st.input_ids, st.live, st.dead, st.batch_ids, st.cu_seqlens, st.positions, st.cursor, st.history_index,
+              st.candidates)
+        return all(t.element_size() in (4, 8) and not t.dtype.is_floating_point for t in ts) and (
+            er.staging.compressed.dtype == torch.int32 and er.staging.snapshot.dtype == torch.int64)
+
     def _prep_one(self, input_ids, step, geom, window, rows, req) -> None:
         """kernels/prep.py's launch (idx and comp tables): its build keyed by the integer widths of its buffers."""
         S = self.tables.step
@@ -278,6 +289,23 @@ class StepInputs:
         bufs = dict(pos=step.positions, ids=ids, bids=step.batch_ids, slots=step.slots, bt=bt, rpos=S["rpos"],
                     firstp=self.first_positions, tids=S["tids"], dids=S["dids"], ctxkvw=S["ctx_kvw"], ibat=S["ibat"],
                     btab=S["btab"], slotsd=S["slots"], vis=S["ibound1"])
+        er = getattr(self, "_eng_prep", None)
+        eng, ex = None, (0,) * 10 + (0, 0, 0, 0)
+        if er is not None:
+            # the Engram stage (EngramStaging._snapshot: engram_compress + engram_snapshot) in this launch
+            est, stg = er.staging.step, er.staging
+            w_ = er.width
+            tabs = stg.uva.hash_tables
+            hist = est.cursor[:, 1:]
+            bufs.update(eids=est.input_ids, elive=est.live, edead=est.dead, ecu=est.cu_seqlens, ehist=hist,
+                        ehidx=est.history_index, ecand=est.candidates)
+            if est.batch_ids.data_ptr() != step.batch_ids.data_ptr() or est.positions.data_ptr() != step.positions.data_ptr():
+                raise MonoUnsupported("engram: the staging's batch ids / positions are not the step's")
+            eng = (int(tabs.ngram), True, True)
+            ex = (tabs.lookup.data_ptr(), est.input_ids.data_ptr(), est.live.data_ptr(), est.dead.data_ptr(),
+                  stg.compressed.data_ptr(), est.cu_seqlens.data_ptr(), hist.data_ptr(), est.history_index.data_ptr(),
+                  stg.snapshot.data_ptr(), est.candidates.data_ptr(), hist.stride(0), w_,
+                  est.candidates.stride(0), est.candidates.stride(1))
         widths = tuple(sorted((k, v.element_size()) for k, v in bufs.items()))
         for k, v in bufs.items():
             if v.element_size() not in (4, 8) or v.dtype.is_floating_point:
@@ -285,11 +313,11 @@ class StepInputs:
         assert S["kvw"].element_size() == 4 and S["kmeta"].element_size() == 4 and S["dgeom"].element_size() == 4
         assert all(S[f"{p}{r}"].dtype == torch.int32 for p in ("cplan", "wplan") for r in (1, 2))
         assert S["ibound2"].dtype == S["ibound1"].dtype and self._sp_pin.is_pinned()
-        launch = self._prep_builds.get(widths) if hasattr(self, "_prep_builds") else None
+        launch = self._prep_builds.get((widths, eng)) if hasattr(self, "_prep_builds") else None
         if launch is None:
             self._prep_builds = getattr(self, "_prep_builds", {})
-            launch = self._prep_builds[widths] = self.K["prep"].build(
-                widths, ROWS_PER_REQ, BCOLS, (1, 2), geom.speculative_tokens, T_MAX
+            launch = self._prep_builds[(widths, eng)] = self.K["prep"].build(
+                widths, ROWS_PER_REQ, BCOLS, (1, 2), geom.speculative_tokens, T_MAX, eng
             )
         cnt = self.scratch["cnt"].view(torch.int32)
         ss = self.scratch["ss"].view(torch.int32)
@@ -303,7 +331,7 @@ class StepInputs:
             P(S["dids"]), P(S["dgeom"]), P(S["ctx_kvw"]), P(S["ctx_rcos"]), P(S["ctx_rsin"]), P(S["ibat"]),
             P(S["btab"]), P(S["slots"]), P(cnt), P(ss), P(mbest),
             rows, req, nbt, cc, bt.stride(0), int(window.slot_rows), int(window.ring_slots), int(geom.window_size),
-            cnt.numel(), ss.numel(), mbest.numel(), self._sp_pin.numel(),
+            cnt.numel(), ss.numel(), mbest.numel(), self._sp_pin.numel(), *ex,
             torch.cuda.current_stream(),
         )
 
