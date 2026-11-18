@@ -84,6 +84,7 @@ class TestPageUnitAddressesAreArithmetic:
         for name in (
             "_page_unit_kv_cache",
             "_page_unit_index_cache",
+            "_page_unit_region_tensors",
             "_page_unit_regions",
             "_page_unit_bases",
             "_page_unit_stream_sizes",
@@ -182,7 +183,7 @@ class TestPageUnitViewsNameTheSameBytes:
         sizes = stub._page_unit_stream_sizes(1)
         assert [v.numel() * v.element_size() for v in views] == sizes.tolist()
 
-    def test_the_order_is_unit_major_row_minor(self):
+    def test_the_order_is_unit_major_region_minor(self):
         """The packer indexes segments positionally, so this order IS the blob
         layout -- and `_checkpoint_copy_plan` built the HBM stream the same
         way. A build that ordered it differently must not read another's blob,
@@ -366,6 +367,7 @@ class TestLmcacheMpNativeLayoutReadsThePageUnitImage:
         for name in (
             "_page_unit_kv_cache",
             "_page_unit_index_cache",
+            "_page_unit_region_tensors",
             "_page_unit_regions",
             "page_unit_views",
         ):
@@ -466,3 +468,47 @@ class TestPageUnitViewsCarryTheIndexLayers:
         # unit's MLA rows; the addresses must be the region stream's, in order.
         addrs = stub._page_unit_bases([units])[0]
         assert [v.data_ptr() for v in views] == addrs[: len(views)].tolist()
+
+
+def test_views_and_addresses_agree_on_a_real_pool_with_index_layers():
+    """The real `MlaKvPool` arena with index layers, read through K3's index
+    override, not a stub tensor: every view is the region its address names."""
+    from atom.model_ops.attentions.mla_kv_pool import MlaKvPool
+
+    pool = MlaKvPool(
+        layers=2,
+        block_size=4,
+        entry_dim=8,
+        kv_dtype=torch.uint8,
+        index_layers=2,
+        index_rows_per_block=4,
+        index_dim=6,
+        index_dtype=torch.uint8,
+    )
+    pool.allocate(6, "cpu")
+    stub = SimpleNamespace(
+        model_runner=SimpleNamespace(block_size=4, state_runtime=None),
+        kv_pool=pool,
+        _page_unit_region_cache=None,
+    )
+    for name in (
+        "_page_unit_kv_cache",
+        "_page_unit_region_tensors",
+        "_page_unit_regions",
+        "_page_unit_bases",
+        "_page_unit_stream_sizes",
+        "page_unit_views",
+    ):
+        method = getattr(PageUnitGeometryMixin, name)
+        setattr(stub, name, method.__get__(stub, type(stub)))
+    # `KimiAiterMLAGDNMetadataBuilder._page_unit_index_cache`'s body.
+    stub._page_unit_index_cache = lambda: pool.index.view("index")
+
+    units = [3, 0, 5]
+    views = stub.page_unit_views(units)
+    sizes = stub._page_unit_stream_sizes(len(units))
+    assert [v.data_ptr() for v in views] == stub._page_unit_bases([units])[0].tolist()
+    assert [v.numel() * v.element_size() for v in views] == sizes.tolist()
+    # Every field's bytes, not `entry_bytes`: that one adds the arena's alignment.
+    data = sum(f.bytes_per_entry for group in pool.field_groups for f in group)
+    assert sum(sizes) == data * len(units)

@@ -48,6 +48,21 @@ class PageUnitGeometryMixin:
         """
         return self.kv_pool.cache.view("kv")
 
+    def _page_unit_region_tensors(self) -> list[torch.Tensor]:
+        """Every region a PAGE unit owns, each indexed by logical unit id: the MLA
+        rows, then the index layers. Addresses and views are both taken from it."""
+        cache = self._page_unit_kv_cache()
+        block, entry = self.model_runner.block_size, cache.shape[3]
+        logical = (cache.shape[1] * cache.shape[2]) // block
+        regions = [
+            row.view(-1, entry)[: logical * block].view(logical, block, entry)
+            for row in cache.unbind(0)
+        ]
+        index_cache = self._page_unit_index_cache()
+        if index_cache is not None:
+            regions += index_cache.unbind(0)
+        return regions
+
     def _page_unit_regions(self) -> tuple[np.ndarray, np.ndarray]:
         """Base address and per-unit stride of every region a PAGE id owns.
 
@@ -70,11 +85,11 @@ class PageUnitGeometryMixin:
         # `_resume_kv_cache` -> `allocate_kv_cache` with a possibly *reduced*
         # block count). Address
         # equality does not imply geometry equality: a same-start-address
-        # reallocation keeps `data_ptr()` but changes `stride(0)`, so `row_stride`
+        # reallocation keeps `data_ptr()` but changes `stride(0)`, so the row stride
         # (and thus every base for row > 0) goes stale while `rows`/`region`
         # survive -- and the granularity assertion below could not catch it even
         # if the early return did not skip it, since it never involves
-        # `row_stride`. Keying on `(data_ptr, shape, stride, element_size)` makes
+        # the row stride. Keying on `(data_ptr, shape, stride, element_size)` makes
         # any of those changing a cache miss that rebuilds. Mirrors the DSV4
         # sibling (`deepseek_v4_attn.py`), which keys on the same evidence.
         #
@@ -105,31 +120,16 @@ class PageUnitGeometryMixin:
 
         if not cache.is_contiguous():
             raise RuntimeError("the MLA pool must be contiguous to be copied")
-        item = cache.element_size()
-        entry = cache.shape[3]
+        if index_cache is not None and not index_cache.is_contiguous():
+            raise RuntimeError("the index cache must be contiguous to be copied")
+        tensors = self._page_unit_region_tensors()
+        bases = [t.data_ptr() for t in tensors]
+        # Unit-major and contiguous: a unit's bytes in a region are its stride.
+        sizes = [t.stride(0) * t.element_size() for t in tensors]
         rows = cache.shape[0]
-        # One logical block's bytes inside one row.
-        region = runner.block_size * entry * item
-        row_stride = cache.stride(0) * item
-
-        base_addr = cache.data_ptr()
-        bases = [base_addr + row * row_stride for row in range(rows)]
-        sizes = [region] * rows
-
-        index_layers = 0
-        index_region = 0
-        if index_cache is not None:
-            if not index_cache.is_contiguous():
-                raise RuntimeError("the index cache must be contiguous to be copied")
-            index_item = index_cache.element_size()
-            index_layers = index_cache.shape[0]
-            layer_stride = index_cache.stride(0) * index_item
-            index_region = index_cache.stride(1) * index_item
-            bases += [
-                index_cache.data_ptr() + layer * layer_stride
-                for layer in range(index_layers)
-            ]
-            sizes += [index_region] * index_layers
+        region = sizes[0]
+        index_layers = len(tensors) - rows
+        index_region = sizes[rows] if index_layers else 0
 
         runtime = getattr(runner, "state_runtime", None)
         spec = None if runtime is None else runtime.checkpoint_spec
@@ -177,32 +177,19 @@ class PageUnitGeometryMixin:
         as `_page_unit_bases` (cross-build safety is `layout_id` in
         `StateByteCodec.key`, not this order).
 
-        `unit_ids` carries *logical* block ids while `kv_cache` is shaped in
-        *physical* ones (K3's ratio is 128); indexing by `unit * block_size` is
-        that conversion, range-checked against the logical count.
+        Each region is indexed by the logical unit id: `_page_unit_region_tensors`
+        shapes the MLA rows in logical blocks, and is the same list
+        `_page_unit_regions` takes its addresses from. Ids are range-checked
+        against the logical count.
 
         `_page_unit_regions` runs first only for its side effect (the contiguity
         and granularity checks). Its return is for the Triton descriptor, not
         this view path -- called bare, not unpacked.
         """
         self._page_unit_regions()
-        cache = self._page_unit_kv_cache()
-        rows, entry = cache.shape[0], cache.shape[3]
-        block = self.model_runner.block_size
-        # Logical blocks the pool holds, which is what a unit id indexes.
-        # Range-checked against THIS count, not the physical one: the physical
-        # count is `block_ratio` times smaller, so checking it would pass ids
-        # that address past the end of the tensor.
-        logical_blocks = (cache.shape[1] * cache.shape[2]) // block
-        planes = [cache[row].view(-1, entry) for row in range(rows)]
-        # A sparse-indexer model's index layers follow the MLA rows in each unit
-        # (`_page_unit_regions`), and the HBM copy writes image bytes there too.
-        index_cache = self._page_unit_index_cache()
-        index_layers = (
-            []
-            if index_cache is None
-            else [index_cache[layer] for layer in range(index_cache.shape[0])]
-        )
+        regions = self._page_unit_region_tensors()
+        # A unit id names a logical block in every region.
+        logical_blocks = min(region.shape[0] for region in regions)
         views: list[torch.Tensor] = []
         for unit in unit_ids:
             unit = int(unit)
@@ -211,9 +198,7 @@ class PageUnitGeometryMixin:
                     f"PAGE unit {unit} outside the pool's {logical_blocks} "
                     "logical blocks"
                 )
-            lo = unit * block
-            views.extend(plane[lo : lo + block] for plane in planes)
-            views.extend(layer[unit] for layer in index_layers)
+            views.extend(region[unit] for region in regions)
 
         # ---- cut the padding tail off the final unit ----
         #

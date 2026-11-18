@@ -341,6 +341,7 @@ class TestAStoreRestoreRoundTripMovesExactlyTheImage:
         for name in (
             "_page_unit_kv_cache",
             "_page_unit_index_cache",
+            "_page_unit_region_tensors",
             "_page_unit_regions",
             "_page_unit_bases",
             "_page_unit_stream_sizes",
@@ -500,6 +501,7 @@ class TestAnIndexerSharesThePageUnit:
         for name in (
             "_page_unit_kv_cache",
             "_page_unit_index_cache",
+            "_page_unit_region_tensors",
             "_page_unit_regions",
             "_page_unit_bases",
             "_page_unit_stream_sizes",
