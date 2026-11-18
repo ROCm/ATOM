@@ -724,6 +724,14 @@ MLA and MiniMax share the staging pool lifecycle, landing receiver and failure
 handling described above; the peer topology selects ownership and the region
 layout selects bytes.
 
+## Mooncake PD over the scale-up fabric
+
+Set `"protocol": "ualoe"` (or `"hip"`) in `--kv-transfer-config` on both sides of a plain `mooncake` P/D pair to move KV over the GPU scale-up fabric instead of RDMA. This needs a Mooncake build with HIP fabric support (`USE_HIP` with `USE_HIP_FABRIC`, on by default) that ships `nvlink_allocator.so` next to the `mooncake` package. The Transfer Engine then starts with `EXTERNAL` metadata and selects no HCA, so `ib_device` and the RDMA rail settings are ignored. Each worker carves its paged KV pool from one fabric-exportable allocation and registers it as a single buffer. The decode sends its exported segment in every write request, and the prefill imports and binds it once per segment before writing. Writes coalesce runs of blocks that are adjacent on both sides into one descriptor. `"fabric_allocator"` overrides the path of the allocator library. `"fabric_kv_pool": false`, or an allocator that reports no fabric, keeps the torch KV pool; Mooncake cannot fabric-export it and shares it with a HIP IPC handle instead, which reaches only GPUs on the same node.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_MOONCAKE_TRANSFER_STATS** | bool | 0 | Prefill (`kv_producer`, plain `mooncake` connector). Log one `Mooncake transfer stats` line per request: protocol, outcome, blocks, bytes, how long the write request waited before the transfer started, the write time, and its bandwidth. Works with any protocol. |
+
 ## MoRIIO PD
 
 | Variable | Type | Default | Description |
