@@ -1998,23 +1998,22 @@ def test_dcp_decode_query_len_is_the_verify_pass():
 
 
 def _ask_aiter(monkeypatch, answer):
-    """Route gfx1250's multi-token width through a stand-in for aiter's helper."""
-    import aiter.ops.attention as aiter_attention
-
+    """Route the multi-token width through a stand-in for aiter's helper."""
     calls = []
 
     def get_mla_decode_num_heads(*args, **kwargs):
         calls.append((args, kwargs))
         return answer
 
-    monkeypatch.setattr(attention_mla_module, "get_gfx", lambda: "gfx1250")
     monkeypatch.setattr(
-        aiter_attention,
-        "get_mla_decode_num_heads",
-        get_mla_decode_num_heads,
-        raising=False,
+        attention_mla_module, "get_mla_decode_num_heads", get_mla_decode_num_heads
     )
     return calls
+
+
+def _no_shape(arch="gfx950", reasons=("no lse_cprr_ps kernel for this shape",)):
+    """A stand-in for aiter's answer about a shape it does not serve."""
+    return lambda *_args, **_kwargs: SimpleNamespace(arch=arch, reasons=list(reasons))
 
 
 @needs_dcp_ops
@@ -2022,13 +2021,13 @@ def _ask_aiter(monkeypatch, answer):
 @pytest.mark.parametrize(
     "causal,cp_world_size", [(True, 2), (False, 1)], ids=["verify", "draft_block"]
 )
-def test_gfx1250_multi_token_decode_takes_aiters_width(
+def test_multi_token_decode_takes_aiters_width(
     monkeypatch, dtype, causal, cp_world_size
 ):
-    """A gfx1250 persistent decode of more than one row pads to the head count
-    aiter names for the call it makes: a causal verify masks through round-robin
-    KV shards over the DCP group, the DSpark draft's non-causal block does not.
-    A single-row decode keeps the persistent table."""
+    """A persistent decode of more than one row pads to the head count aiter
+    names for the call it makes (there is no arch branch): a causal verify masks through
+    round-robin KV shards over the DCP group, the DSpark draft's non-causal
+    block does not. A single-row decode keeps the persistent table."""
     monkeypatch.setenv("ATOM_MLA_PAGE_SIZE", "1")
     calls = _ask_aiter(monkeypatch, 32)
 
@@ -2063,9 +2062,17 @@ def test_gfx1250_multi_token_decode_takes_aiters_width(
 
 
 @needs_dcp_ops
-def test_gfx1250_multi_token_decode_without_a_kernel_refuses(monkeypatch):
+def test_multi_token_decode_without_a_kernel_refuses(monkeypatch):
+    """The error quotes aiter's reasons, not an arch list."""
     _ask_aiter(monkeypatch, None)
-    with pytest.raises(ValueError, match="16 gathered query heads x 9 rows"):
+    monkeypatch.setattr(
+        attention_mla_module,
+        "mla_dcp_decode_shape_support",
+        _no_shape("gfx1250", ["planner rejects 9 rows"]),
+    )
+    with pytest.raises(
+        ValueError, match=r"16 gathered query heads x 9 rows .*planner rejects 9 rows"
+    ):
         mla_dcp_kernel_num_heads(
             8, 2, 16, kv_cache_dtype="fp8", persistent=True, max_seqlen_q=9
         )
@@ -2080,27 +2087,75 @@ def test_speculative_dcp_decode_refuses_without_a_persistent_kernel(monkeypatch)
         "get_current_atom_config",
         lambda: SimpleNamespace(speculative_config=spec),
     )
-    monkeypatch.setattr(attention_mla_module, "get_gfx", lambda: "gfx950")
+    _ask_aiter(monkeypatch, 16)
     monkeypatch.setattr(
         attention_mla_module, "dcp_persistent_supported", lambda *_: False
     )
+    monkeypatch.setattr(
+        attention_mla_module, "mla_dcp_decode_shape_support", _no_shape()
+    )
     layer = object.__new__(attention_mla_module.MLAAttention)
     layer.num_heads, layer.min_query_heads, layer.kv_cache_dtype = 8, 16, "fp8"
-    layer.causal_decode = True
-    with pytest.raises(ValueError, match="persistent round-robin MLA decode"):
+    layer.causal_decode, layer.is_sparse_mla, layer.decode_query_len = True, False, 0
+    with pytest.raises(
+        ValueError, match="persistent round-robin MLA decode.*no lse_cprr_ps kernel"
+    ):
         layer._configure_dcp_decode_head_padding(2)
 
 
-@needs_dcp_ops
-def test_gfx1250_multi_token_decode_needs_aiters_helper(monkeypatch):
-    import aiter.ops.attention as aiter_attention
+def _spec_dcp_layer(monkeypatch, *, causal=True, sparse=False, decode_query_len=0):
+    """A bare MLAAttention under speculative decode with k = 4 (verify q = 5)."""
+    spec = SimpleNamespace(num_speculative_tokens=4)
+    monkeypatch.setattr(
+        attention_mla_module,
+        "get_current_atom_config",
+        lambda: SimpleNamespace(speculative_config=spec, max_num_batched_tokens=16384),
+    )
+    monkeypatch.setattr(
+        attention_mla_module, "mla_dcp_decode_shape_support", _no_shape()
+    )
+    layer = object.__new__(attention_mla_module.MLAAttention)
+    layer.num_heads, layer.min_query_heads, layer.kv_cache_dtype = 8, 16, "fp8"
+    layer.causal_decode, layer.is_sparse_mla = causal, sparse
+    layer.decode_query_len = decode_query_len
+    return layer
 
-    monkeypatch.setattr(attention_mla_module, "get_gfx", lambda: "gfx1250")
-    monkeypatch.delattr(aiter_attention, "get_mla_decode_num_heads", raising=False)
-    with pytest.raises(RuntimeError, match="ROCm/aiter#8181"):
-        mla_dcp_kernel_num_heads(
-            8, 2, 16, kv_cache_dtype="fp8", persistent=True, max_seqlen_q=5
-        )
+
+@needs_dcp_ops
+def test_dspark_draft_block_sizes_for_its_block_width(monkeypatch):
+    """The draft's non-causal block asks aiter at its block width T, not the
+    verify's k + 1, and is never refused (it has no round-robin mask)."""
+    calls = _ask_aiter(monkeypatch, 64)
+    monkeypatch.setattr(
+        attention_mla_module, "dcp_persistent_supported", lambda *_: True
+    )
+    monkeypatch.setenv("ATOM_MLA_PAGE_SIZE", "1")
+    layer = _spec_dcp_layer(monkeypatch, causal=False, decode_query_len=4)
+    layer._configure_dcp_decode_head_padding(8)
+    assert {args[1] for args, _ in calls} == {4}
+    assert layer.dcp_kernel_num_heads == 64
+
+
+@needs_dcp_ops
+@pytest.mark.parametrize(
+    "causal,sparse,dcp",
+    [(False, False, 2), (True, False, 1), (True, True, 2)],
+    ids=["draft_block", "dcp1", "sparse"],
+)
+def test_speculative_dcp_refusal_skips(monkeypatch, causal, sparse, dcp):
+    """No refusal for the draft's non-causal block, for dcp = 1 (no DCP
+    decode) or for sparse / DSA layers, which decode and verify as per-token
+    q_len=1 rows: a sparse layer does not even ask for a multi-token width."""
+    calls = _ask_aiter(monkeypatch, 16)
+    monkeypatch.setattr(
+        attention_mla_module, "dcp_persistent_supported", lambda *_: False
+    )
+    layer = _spec_dcp_layer(
+        monkeypatch, causal=causal, sparse=sparse, decode_query_len=4
+    )
+    layer._configure_dcp_decode_head_padding(dcp)
+    if sparse:
+        assert calls == [], "a sparse layer sizes its q_len=1 call"
 
 
 @needs_dcp_ops

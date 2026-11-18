@@ -269,6 +269,8 @@ class K3DSparkMLAAttention(nn.Module):
                 atom_config.kv_cache_dtype, _dspark_block_width(config, atom_config)
             ),
             causal_decode=False,
+            # ...at the block width T it runs (not the verify's k + 1).
+            decode_query_len=_dspark_block_width(config, atom_config),
             layer_num=layer_num,
             use_mla=True,
             mla_modules=mla_modules,

@@ -590,8 +590,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # persistent kernel and stays non-persistent, where this metadata is
         # unused) does it scale by dcp; elsewhere it keeps the per-rank sizing.
         # Target layers only: min_query_heads is the DSpark draft's, and the
-        # draft plans its own descriptors (DSparkProposer).
-        max_seqlen_q = mla_dcp_decode_query_len(config)
+        # draft plans its own descriptors (DSparkProposer). Sparse / DSA layers
+        # decode and run MTP verify as per-token q_len=1 rows (no round-robin
+        # KV), so they plan that call, as their layers size it.
+        max_seqlen_q = 1 if self.is_sparse else mla_dcp_decode_query_len(config)
         dcp_persistent = (
             mla_dcp_persistent_width(
                 self.num_attention_heads,

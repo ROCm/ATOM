@@ -1773,8 +1773,8 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
             # wrong output, no error. Refuse the batch rather than serve it.
             assert use_persistent_metadata and dcp_tot_seq_lens_device is not None, (
                 f"causal decode of query length {max_qo_len} under DCP"
-                f"{self.dcp_world_size} needs the persistent round-robin kernel: "
-                "gfx950, or gfx1250 with AITER_MLA_DECODE_PS1_FLYDSL=1, and "
+                f"{self.dcp_world_size} needs the persistent round-robin kernel "
+                "(a width aiter serves persistent for this query length), "
                 "ATOM_MLA_PAGE_SIZE <= 1 and DP == 1"
             )
             g_kv_indptr = self._g_kv_indptr_buf[: num_reqs + 1]

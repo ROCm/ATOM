@@ -74,6 +74,36 @@ def mla_dcp_decode_call(
     }
 
 
+def mla_kv_dtype(kv_cache_dtype: str):
+    """The dtype aiter's MLA decode queries take for Q and KV under
+    ``kv_cache_dtype`` (fp8 KV -> aiter's fp8, anything else -> bf16)."""
+    import torch
+    from aiter import dtypes
+
+    return dtypes.fp8 if kv_cache_dtype.startswith("fp8") else torch.bfloat16
+
+
+def mla_dcp_decode_shape_support(
+    num_heads: int,
+    kv_cache_dtype: str,
+    dcp_world_size: int,
+    max_seqlen_q: int = 1,
+    causal: bool = True,
+):
+    """aiter's ``get_mla_decode_shape_support`` for the persistent DCP decode
+    ``mla_dcp_decode_call`` describes, at ``num_heads`` gathered query heads."""
+    from aiter.ops.attention import get_mla_decode_shape_support
+
+    dtype = mla_kv_dtype(kv_cache_dtype)
+    return get_mla_decode_shape_support(
+        num_heads,
+        max_seqlen_q,
+        dtype,
+        dtype,
+        **mla_dcp_decode_call(dcp_world_size, max_seqlen_q, causal),
+    )
+
+
 def dcp_persistent_supported(
     num_heads: int,
     kv_cache_dtype: str,
@@ -90,17 +120,10 @@ def dcp_persistent_supported(
     and falls back to the triton stage2 reduce. Cache the result once per
     ``__init__``; it is not for the forward pass.
     """
-    import torch
-    from aiter import dtypes
-    from aiter.ops.attention import MlaBackend, get_mla_decode_shape_support
+    from aiter.ops.attention import MlaBackend
 
-    dtype = dtypes.fp8 if kv_cache_dtype.startswith("fp8") else torch.bfloat16
-    support = get_mla_decode_shape_support(
-        num_heads,
-        max_seqlen_q,
-        dtype,
-        dtype,
-        **mla_dcp_decode_call(dcp_world_size, max_seqlen_q, causal),
+    support = mla_dcp_decode_shape_support(
+        num_heads, kv_cache_dtype, dcp_world_size, max_seqlen_q, causal
     )
     # aiter has no table for the FlyDSL PS1 route and answers None there; a
     # None from any other route is a failed query, not a yes.

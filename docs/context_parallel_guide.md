@@ -694,7 +694,7 @@ pass instead of `k` serial passes. Two properties decide how it meets DCP:
 | | Supported |
 |---|---|
 | Target model | **Kimi-K3** (`--draft-model Inferact/Kimi-K3-DSpark` or `RadixArk/Kimi-K3-DSpark`) |
-| GPU arch | gfx950 |
+| GPU arch | gfx950; gfx1250 with `AITER_MLA_DECODE_PS1_FLYDSL=1` (needs ROCm/aiter#8181; with ROCm/aiter#7913 the 64-head draft runs unpadded) |
 | DCP size | dcp8 validated (`tp8`) |
 | KV cache dtype | fp8 (per-tensor scale) |
 
@@ -723,8 +723,8 @@ MLA rows; see the [recipe](../recipes/DSpark.md)).
 | Kimi-K3 KDA layers | Not sharded — the KDA recurrent state is per-request, not paged, so DCP frees only the MLA share of attention memory |
 | Kimi-K3 gathered head width | Padded to a natively dispatched MLA width (16 / 32 / 64 / 128); past 128 it falls back to the folded kernel with a warning — lower `-dcp` or raise `-tp` |
 | gathered head width 64 | Native sparse / DSA prefill (bf16 or fp8 KV) and q_len=1 decode (fp8 KV) rebuild persistent metadata, where aiter runs DCP decode persistent (validated on gfx950), per full IndexShare layer and run gqa64 directly; unsupported non-persistent paths still pad to 128 — see [Sparse DCP persistent attention and gqa=64](#sparse-dcp-persistent-attention-and-gqa64) |
-| speculative decode (MTP), dense MLA | Supported on gfx950 and gfx1250 with `AITER_MLA_DECODE_PS1_FLYDSL=1` (bf16/fp8, `num_speculative_tokens` 1–3); raises at model construction on gfx942 |
-| speculative decode (DSpark), Kimi-K3 | Supported on gfx950, and on gfx1250 with `AITER_MLA_DECODE_PS1_FLYDSL=1` (TP8 + DCP8 on two MI455X nodes, needs ROCm/aiter#8181; with ROCm/aiter#7913 the 64-head draft runs unpadded); validated at `tp8 -dcp 8` with `num_speculative_tokens 2` (Inferact MLA draft) and 5 (RadixArk DSpark GQA draft, which runs outside the DCP group) |
+| speculative decode (MTP), dense MLA | Supported on gfx950 (bf16/fp8, `num_speculative_tokens` 1–3); gfx1250 takes the same persistent PS1 path with `AITER_MLA_DECODE_PS1_FLYDSL=1` but is not validated; raises at model construction where aiter has no persistent kernel for the call (gfx942) |
+| speculative decode (DSpark), Kimi-K3 | Supported on gfx950, and on gfx1250 with `AITER_MLA_DECODE_PS1_FLYDSL=1` (TP8 + DCP8 on two MI455X nodes, needs ROCm/aiter#8181; with ROCm/aiter#7913 the 64-head draft runs unpadded); validated at `tp8 -dcp 8` with `num_speculative_tokens 2` (Inferact MLA draft) and 5 (RadixArk DSpark GQA draft, which runs outside the DCP group); on gfx1250 validated at `tp8 -dcp 8` with `num_speculative_tokens 4` |
 | speculative decode (MTP), sparse / DSA | Supported on gfx950 (gfx1250 not validated); validated on GLM-5.2-FP8 at fp8 KV, `num_speculative_tokens=3`, dcp8 |
 | vllm-atom plugin | Validated for dense MLA only; the sparse / DSA and Kimi-K3 plugin paths are not yet verified |
 | DCP + PCP | Independent dimensions (different phases); combined use not validated here |
