@@ -49,8 +49,14 @@ CHATS = {
 
 
 def tokenize(text: str) -> list[int]:
-    """The engine's tokenizer here: one ID per character."""
+    """The tokenizer here: one ID per character."""
     return [ord(c) for c in text]
+
+
+def encode_prompt(text: str, **kwargs) -> list[int]:
+    """The engine's prompt encoding. It ends in a 0 the tokenizer does not
+    write, so a render that used the tokenizer would not match it."""
+    return tokenize(text) + [0]
 
 
 def render(messages, **kwargs) -> str:
@@ -60,7 +66,7 @@ def render(messages, **kwargs) -> str:
 
 def run_ids(prompt) -> list[int]:
     """The IDs the engine runs for a prompt an inference route submitted."""
-    return tokenize(prompt) if isinstance(prompt, str) else list(prompt)
+    return encode_prompt(prompt) if isinstance(prompt, str) else list(prompt)
 
 
 @pytest.fixture
@@ -87,14 +93,18 @@ def submitted(monkeypatch):
             config=SimpleNamespace(
                 generation_config=SimpleNamespace(), max_model_len=8192
             ),
-            io_processor=SimpleNamespace(
-                encode_prompt=lambda text, **kw: tokenize(text)
-            ),
+            io_processor=SimpleNamespace(encode_prompt=encode_prompt),
         ),
     }.items():
         monkeypatch.setattr(api_server, name, value)
 
-    async def generate(prompt_or_tokens, *args, **kwargs):
+    async def generate(prompt_or_tokens, sampling_params, *args, **kwargs):
+        # As `generate_async` checks a prompt once the engine has encoded it.
+        seq = SimpleNamespace(
+            num_prompt_tokens=len(run_ids(prompt_or_tokens)),
+            max_tokens=sampling_params.max_tokens,
+        )
+        api_server._validate_sequence_context_length(seq, sampling_params)
         prompts.append(prompt_or_tokens)
         yield {
             "text": "answer",
@@ -162,13 +172,43 @@ REFUSED_CHATS = {
         "tool_choice": "required",
         "reasoning_effort": "high",
     },
+    "unnamed_json_schema": {
+        "model": MODEL,
+        "messages": [ASK],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"schema": {"type": "object"}},
+        },
+    },
+    "top_logprobs_without_logprobs": {
+        "model": MODEL,
+        "messages": [ASK],
+        "top_logprobs": 2,
+    },
+    "stream_options_without_stream": {
+        "model": MODEL,
+        "messages": [ASK],
+        "stream_options": {"include_usage": True},
+    },
+    "too_long_for_its_max_tokens": {
+        "model": MODEL,
+        "messages": [ASK],
+        "max_tokens": 8192,
+    },
+    "too_long_for_any_output": {
+        "model": MODEL,
+        "messages": [{"role": "user", "content": "x" * 8192}],
+    },
 }
 
 
 @pytest.mark.parametrize("body", REFUSED_CHATS.values(), ids=REFUSED_CHATS.keys())
 def test_chat_render_refuses_what_the_chat_endpoint_refuses(submitted, body):
-    assert post("/v1/chat/completions", body).status_code == 400
-    assert post("/v1/chat/completions/render", body).status_code == 400
+    refused = post("/v1/chat/completions", body)
+    assert refused.status_code == 400
+    rendered = post("/v1/chat/completions/render", body)
+    assert rendered.json() == refused.json()
+    assert rendered.status_code == 400
     assert submitted == []
 
 
@@ -177,7 +217,16 @@ def test_chat_render_refuses_image_input(submitted):
     body = {"model": MODEL, "messages": [{"role": "user", "content": [image]}]}
     response = post("/v1/chat/completions/render", body)
     assert response.status_code == 400
-    assert response.json()["detail"] == "render does not take image input"
+    assert response.json()["error"]["message"] == "render does not take image input"
+
+
+def test_render_answers_a_malformed_body_as_its_inference_route_does(submitted):
+    body = {"model": MODEL, "messages": "Look up ATOM."}
+    refused = post("/v1/chat/completions", body)
+    assert refused.status_code == 422
+    rendered = post("/v1/chat/completions/render", body)
+    assert rendered.status_code == 422
+    assert rendered.json() == refused.json()
 
 
 PROMPTS = {
@@ -201,14 +250,44 @@ def test_completions_render_is_the_prompt_the_completions_endpoint_runs(
     assert item["request_id"].startswith("cmpl-")
 
 
-@pytest.mark.parametrize(
-    "body", [{"model": MODEL}, {"model": "another-model", "prompt": "Hi"}]
-)
+REFUSED_PROMPTS = {
+    "no_prompt": {"model": MODEL},
+    "another_model": {"model": "another-model", "prompt": "Hi"},
+    "too_long_for_its_max_tokens": {"model": MODEL, "prompt": "Hi", "max_tokens": 8192},
+    "too_long_for_any_output": {"model": MODEL, "prompt": "x" * 8192},
+}
+
+
+@pytest.mark.parametrize("body", REFUSED_PROMPTS.values(), ids=REFUSED_PROMPTS.keys())
 def test_completions_render_refuses_what_the_completions_endpoint_refuses(
     submitted, body
 ):
-    assert post("/v1/completions", body).status_code == 400
-    assert post("/v1/completions/render", body).status_code == 400
+    refused = post("/v1/completions", body)
+    assert refused.status_code == 400
+    rendered = post("/v1/completions/render", body)
+    assert rendered.json() == refused.json()
+    assert rendered.status_code == 400
+    assert submitted == []
+
+
+@pytest.mark.parametrize(
+    "path, body",
+    [
+        ("/v1/chat/completions", {"model": MODEL, "messages": [ASK]}),
+        ("/v1/completions", {"model": MODEL, "prompt": "Once upon a time"}),
+    ],
+)
+def test_render_refuses_a_prompt_the_kv_pool_cannot_hold(
+    submitted, monkeypatch, path, body
+):
+    monkeypatch.setattr(
+        api_server.engine, "core_mgr", SimpleNamespace(max_pool_tokens=8), raising=False
+    )
+    refused = post(path, body)
+    assert refused.status_code == 400
+    assert "KV cache holds at most 8 tokens" in refused.json()["error"]["message"]
+    rendered = post(f"{path}/render", body)
+    assert rendered.json() == refused.json()
     assert submitted == []
 
 

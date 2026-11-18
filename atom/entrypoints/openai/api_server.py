@@ -596,6 +596,14 @@ async def _client_stream(
 # ============================================================================
 
 
+def _max_tokens_is_default(request: ChatCompletionRequest | CompletionRequest) -> bool:
+    """Whether a chat or completion request leaves its output cap to the server."""
+    return not any(
+        name in request.model_fields_set and getattr(request, name) is not None
+        for name in ("max_tokens", "max_completion_tokens")
+    )
+
+
 def _build_sampling_params(
     temperature: float,
     max_tokens: int,
@@ -726,19 +734,29 @@ def _validate_pool_capacity(
     )
 
 
-def _validate_sequence_context_length(seq, sampling_params=None) -> None:
+def _validate_prompt_fits(
+    num_prompt_tokens: int, max_tokens: int, max_tokens_is_default: bool
+) -> int:
+    """The ``max_tokens`` a prompt of ``num_prompt_tokens`` runs with; a default
+    one shrinks to the context the prompt leaves. Raises ValueError when the
+    prompt does not fit the context with them, or does not fit the KV pool."""
     limit = _get_engine_max_model_len()
-    if getattr(sampling_params, "max_tokens_is_default", False) and limit is not None:
-        remaining = limit - seq.num_prompt_tokens
+    if max_tokens_is_default and limit is not None:
+        remaining = limit - num_prompt_tokens
         if remaining <= 0:
             raise ValueError("The prompt leaves no context space for output tokens")
-        seq.max_tokens = min(seq.max_tokens, remaining)
-    _validate_context_length(
+        max_tokens = min(max_tokens, remaining)
+    _validate_context_length(num_prompt_tokens, max_tokens, limit)
+    _validate_pool_capacity(num_prompt_tokens, _get_engine_max_pool_tokens())
+    return max_tokens
+
+
+def _validate_sequence_context_length(seq, sampling_params=None) -> None:
+    seq.max_tokens = _validate_prompt_fits(
         seq.num_prompt_tokens,
         seq.max_tokens,
-        _get_engine_max_model_len(),
+        getattr(sampling_params, "max_tokens_is_default", False),
     )
-    _validate_pool_capacity(seq.num_prompt_tokens, _get_engine_max_pool_tokens())
 
 
 def _has_multimodal_content(messages: list[Any]) -> bool:
@@ -1951,7 +1969,9 @@ async def _relay_to_hub(request: Request) -> Response:
 _OPENAI_ERROR_ROUTES = frozenset(
     {
         "/v1/chat/completions",
+        "/v1/chat/completions/render",
         "/v1/completions",
+        "/v1/completions/render",
         "/v1/responses",
         "/beta/chat/completions",
         "/beta/completions",
@@ -2197,10 +2217,7 @@ async def _chat_completions(
         sampling_params = _build_sampling_params(
             temperature=request.temperature,
             max_tokens=request.get_max_tokens(),
-            max_tokens_is_default=not any(
-                name in request.model_fields_set and getattr(request, name) is not None
-                for name in ("max_tokens", "max_completion_tokens")
-            ),
+            max_tokens_is_default=_max_tokens_is_default(request),
             stop_strings=request.stop,
             ignore_eos=request.ignore_eos,
             top_k=request.top_k,
@@ -2534,10 +2551,16 @@ async def chat_completions_render(request: ChatCompletionRequest):
         messages, _, template_kwargs, _ = _check_chat(request, beta=False)
         if _has_multimodal_content(messages):
             raise ValueError("render does not take image input")
+        # Only to refuse what the chat route refuses: a malformed or unsafe
+        # response format.
+        schema_from_format(request.response_format)
         prompt = request.get_prompt_token_ids()
         if prompt is None:
             prompt = await _render_chat_template(request, messages, template_kwargs)
         token_ids = await _engine_prompt_ids(prompt)
+        _validate_prompt_fits(
+            len(token_ids), request.get_max_tokens(), _max_tokens_is_default(request)
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return JSONResponse(
@@ -2673,10 +2696,7 @@ async def _completions(
             # 0 (only /beta takes it) is answered without the engine, below;
             # the other parameters are checked all the same.
             max_tokens=max(max_tokens, 1),
-            max_tokens_is_default=not any(
-                name in request.model_fields_set and getattr(request, name) is not None
-                for name in ("max_tokens", "max_completion_tokens")
-            ),
+            max_tokens_is_default=_max_tokens_is_default(request),
             stop_strings=request.stop,
             ignore_eos=request.ignore_eos,
             top_k=request.top_k,
@@ -2841,6 +2861,9 @@ async def completions_render(request: CompletionRequest):
     validate_model(request.model)
     try:
         token_ids = await _engine_prompt_ids(request.get_prompt_or_tokens())
+        _validate_prompt_fits(
+            len(token_ids), request.get_max_tokens(), _max_tokens_is_default(request)
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return JSONResponse(

@@ -98,11 +98,21 @@ with a subset of its response's fields:
 Chat render checks the request's prompt, resolves its template kwargs and
 renders it with the chat route's own code, then tokenizes the prompt as the
 engine does (`encode_prompt`). A request's `prompt_token_ids` come back as
-sent. A prompt the inference route refuses, such as one for another model, one
-with no messages, an untyped tool, or a tool choice its reasoning mode does not
-allow, gets the same 400; fields that only shape the reply, such as `n` or
-`logprobs`, are not checked. Image input is not rendered yet and gets a 400;
-the `/beta` routes have no render endpoint.
+sent. Each endpoint refuses, with its inference route's 400 and in the same
+`{"error": ...}` form, a request that route refuses for its prompt:
+
+- one for another model;
+- a chat with no messages, an untyped tool, a tool choice its reasoning mode
+  does not allow, or a malformed or unsafe `response_format`, and one pairing
+  fields the chat route checks first, such as `top_logprobs` without `logprobs`
+  or `stream_options` without `stream`;
+- a prompt that does not fit `max_model_len` with the request's `max_tokens`,
+  or leaves no room for any output when `max_tokens` is left to the server, and
+  one larger than the KV cache can hold.
+
+Other fields that only shape the reply, such as `n`, `temperature`, or a
+`max_tokens` above the deployment's output cap, are not checked. Image input is
+not rendered yet and gets a 400; the `/beta` routes have no render endpoint.
 
 ## Validation
 
