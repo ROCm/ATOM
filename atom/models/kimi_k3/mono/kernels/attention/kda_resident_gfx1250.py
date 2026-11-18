@@ -200,6 +200,9 @@ def _auto_head_split(heads: int, blocks: int) -> int:
     return next((count for count in (4, 2) if heads * count <= blocks), 1)
 
 
+REPLAY_MAX_SPLIT = 2
+
+
 def _head_split(heads: int, blocks: int) -> int:
     """CTAs a whole head's recurrence splits over: ``auto`` (the default)
     ``_auto_head_split``, else the switch's count, 1 when its parts would not
@@ -271,6 +274,10 @@ def build_resident_k1(
     auto_split = (
         _auto_head_split((s // qlen) * HEADS, declaration.blocks) if whole_heads else 1
     )
+    if spec.replay_cap:
+        # a ReplaySSM head split four or eight ways spills SGPRs
+        head_split = min(head_split, REPLAY_MAX_SPLIT)
+        auto_split = min(auto_split, REPLAY_MAX_SPLIT)
     keyed = key_tuple(
         ResidentBuildKey(
             s,

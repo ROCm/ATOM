@@ -536,9 +536,7 @@ def kda_recur_head(c, k, request, head):
         state = replay_rows(c, state, k["replay"]["h_rec"], (row0, rows))
         if k["replay"]["flush"] & live:
             # the records folded: the checkpoint moves to here
-            replay_checkpoint_store(
-                c, k, head, state, [row0 + row for row in range(rows)]
-            )
+            replay_checkpoint_store(c, k, head, state, row0, rows)
     token = fx.Int32(0)
     while token < L:
         q = [
@@ -946,41 +944,53 @@ def replay_u_store(c, k, token, values, row0):
 @traced
 def replay_kg_store(c, k):
     """The step's k (l2-normed, bf16) and log-gate (f32) records of every
-    column from LDS ``qkl`` / ``glog``, a thread four columns of a token: by
-    the head's one writer, once its other tasks have staged theirs."""
+    column from LDS ``qkl`` / ``glog``, a lane four columns of every token:
+    by the head's one writer, once its other tasks have staged theirs. The
+    first wave's lanes walk the tokens: constant offsets, nothing a wave's
+    index would hoist out of the resident loop."""
     L, tid = c["L"], c["tid"]
-    if (tid < L * 32) & (k["slot0"] >= 0):
-        token = tid // 32
-        column = (tid % 32) * 4
-        key = [
-            fx.ptr_load(c["qkl"] + (2 * token + 1) * HEAD_DIM + column + e)
-            for e in range(4)
-        ]
-        gate = [fx.ptr_load(c["glog"] + token * HEAD_DIM + column + e) for e in range(4)]
-        at = k["replay"]["rbase"] + token
-        bo.buffer_store(
-            fx.Vector.from_elements(key, fx.Float32).to(fx.BFloat16).bitcast(fx.Int32),
-            rsrc(k["rec"]["k"]),
-            at * REC_WORDS + column // 2,
-        )
-        bo.buffer_store(
-            fx.Vector.from_elements(gate, fx.Float32),
-            rsrc(k["rec"]["g"]),
-            at * HEAD_DIM + column,
-        )
+    if (tid < 32) & (k["slot0"] >= 0):
+        column = tid * 4
+        records = k["rec"]
+        base = k["replay"]["rbase"]
+        for token in range_constexpr(L):
+            key = [
+                fx.ptr_load(c["qkl"] + (2 * token + 1) * HEAD_DIM + column + e)
+                for e in range(4)
+            ]
+            gate = [
+                fx.ptr_load(c["glog"] + token * HEAD_DIM + column + e)
+                for e in range(4)
+            ]
+            at = base + token
+            bo.buffer_store(
+                fx.Vector.from_elements(key, fx.Float32)
+                .to(fx.BFloat16)
+                .bitcast(fx.Int32),
+                rsrc(records["k"]),
+                at * REC_WORDS + column // 2,
+            )
+            bo.buffer_store(
+                fx.Vector.from_elements(gate, fx.Float32),
+                rsrc(records["g"]),
+                at * HEAD_DIM + column,
+            )
 
 
-def replay_checkpoint_store(c, k, head, state, rows):
-    """A flush: the task's replayed state rows ``rows`` (absolute) into the
-    checkpoint, columns 4 lane .."""
+def replay_checkpoint_store(c, k, head, state, row0, rows):
+    """A flush: the task's replayed state rows ``row0 ..`` (``rows`` of them,
+    absolute) into the checkpoint, columns 4 lane .. One task-varying offset
+    and constant row strides: an offset a row of the task-invariant ``row0``
+    alone would be hoisted out of the resident loop, an SGPR each."""
     destination = rsrc(
         c["args"]["rstate"] + fx.Int64(k["slot0"]) * fx.Int64(c["args"]["rs_seq"]) * 4
     )
-    for index, row in enumerate(rows):
+    at = (head * GATE_K + row0) * GATE_K + c["lane"] * 4
+    for index in range_constexpr(rows):
         bo.buffer_store(
             fx.Vector.from_elements(state[4 * index : 4 * index + 4], fx.Float32),
             destination,
-            (head * GATE_K + row) * GATE_K + c["lane"] * 4,
+            at + index * GATE_K,
         )
 
 
@@ -1181,9 +1191,6 @@ def kda_head(c, request, head, share=None):
     # poll, so its wait on the projection is not queued behind them; so do
     # its records.
     head_state = None if split > 1 else _head_state_loads(c, slot0, head)
-    if const_expr(replayed):
-        # written by the previous step, on another XCD: cold, so issued first
-        staged = replay_stage_loads(c, replay, records, row_base, width)
 
     projected = _scratch_region(c, "proj")
     threads = c["matrix_threads"]
@@ -1238,6 +1245,10 @@ def kda_head(c, request, head, share=None):
     if const_expr(split > 1):
         head_state = _head_state_loads(c, slot0, head)
     tdm_timeline.stamp(tdm_timeline.HEAD_POLLED)
+    if const_expr(replayed):
+        # past the poll: descriptors held across it spill SGPRs; the entry's
+        # L2 prefetch and the conv and gates still cover the loads
+        staged = replay_stage_loads(c, replay, records, row_base, width)
     for iteration in range_constexpr(fa_rounds):
         if fa_raw[iteration] < n_fa:
             fx.ptr_store(_f32_of(polled[iteration]), c["fa"] + fa_index[iteration])
