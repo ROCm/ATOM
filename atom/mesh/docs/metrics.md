@@ -112,7 +112,7 @@ Defaults are the CLI defaults.
 | `agentic` | `hit` | The lowest [prefill cost](agentic_cost.md); the KV event index says it holds the longest prefix. | ratio, estimate |
 | | `relocate` | The lowest cost, though the index says another worker holds a longer prefix: that worker's queue outweighs the reuse. | ratio, estimate when the index knows the worker |
 | | `miss` | The lowest cost; by the index, no candidate holds any of the prompt. | ratio, estimate when the index knows the worker |
-| | `text_hit` | The request cannot match the index (no tokens, media, or no candidate's events indexed): the lowest cost, crediting the worker holding the longest match in the text tree. | ratio, estimate |
+| | `text_hit` | The request cannot match the index (no tokens, media, or no candidate's events indexed): the lowest cost, crediting the healthy candidate holding the longest match in the text tree. | ratio, estimate |
 | | `text_relocate` | The same, but another worker holds the longest text match. | ratio |
 | | `text_miss` | The same; nothing in the text tree matches. | ratio |
 | | `unmatched` | Neither tokens nor text: the lowest cost by load. | |

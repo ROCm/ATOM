@@ -16,7 +16,7 @@ with no extra bonus, as in the engine's `least_tokens` DP balancer.
 | Input | Source |
 | --- | --- |
 | `prompt_tokens` | The request's tokens (`--model-path` or `--tokenizer-path`, prompts up to `--prepare-max-tokenize-bytes`); without them, its text bytes / 4. |
-| `cached_tokens` | The KV event index (`--kv-events`): the leading prompt tokens each worker's GPU cache holds. A request the index cannot match (no tokens, media, or no candidate's events indexed) uses a text tree of past placements: the worker with the longest text match is credited its bytes / 4. The tree shares `--eviction-interval` and `--max-tree-size` (a per-worker cap) with `cache_aware`. |
+| `cached_tokens` | The KV event index (`--kv-events`): the leading prompt tokens each worker's GPU cache holds. A request the index cannot match (no tokens, media, or no candidate's events indexed) uses a text tree of past placements: the healthy candidate with the longest text match is credited its bytes / 4. The tree shares `--eviction-interval` and `--max-tree-size` (a per-worker cap) with `cache_aware`. |
 | `inflight_prefill_tokens` | Tokens charged to the worker whose prefill has not finished, `mesh_worker_prefill_tokens{worker}`. |
 | `inflight_requests` | `mesh_worker_requests_active{worker}`. |
 | `request_token_equivalent` | `--agentic-request-token-equivalent` (512). Keep it equal to the engine's `ATOM_DP_LB_REQ_EQUIV`. |
