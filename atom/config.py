@@ -2519,8 +2519,9 @@ class Config:
         `busy_loop` outright (`pp_engine_core.py`), so `bump_step` is never
         reached and the line would go silent after announcing a logging mode.
         RapidServe and P/D are a scope choice: `PrefillEngineCore` and
-        `DecodeEngineCore` inherit the base loop and override only
-        `_process_engine_step`, so the counter would in fact advance there --
+        `DecodeEngineCore` inherit the base loop and override only a step
+        method, `_process_engine_step` and `_process_engine_step_inner`
+        respectively, so the counter would in fact advance there --
         it is simply untested, and a step number nobody has lined up across a
         disaggregated pair is worth less than the clock. Degrade rather than
         raise: a stale flag in a shared launch script must not stop a server
