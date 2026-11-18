@@ -34,6 +34,16 @@ pub struct PolicyRegistry {
     kv_events: Arc<OnceLock<Arc<dyn PrefixMatchProvider>>>,
 }
 
+/// Drops `worker_url` from the trees of a policy that keeps them.
+fn forget_worker(policy: &Arc<dyn LoadBalancingPolicy>, worker_url: &str) {
+    let policy = policy.as_any();
+    if let Some(cache_aware) = policy.downcast_ref::<CacheAwarePolicy>() {
+        cache_aware.remove_worker_by_url(worker_url);
+    } else if let Some(agentic) = policy.downcast_ref::<AgenticPolicy>() {
+        agentic.remove_worker_by_url(worker_url);
+    }
+}
+
 impl PolicyRegistry {
     /// Create a new PolicyRegistry with a default policy
     pub fn new(default_policy_config: PolicyConfig) -> Self {
@@ -313,20 +323,11 @@ impl PolicyRegistry {
         }
     }
 
-    /// Remove a worker from cache-aware policy if applicable
+    /// Remove a worker from the trees of cache-aware and agentic policies.
     /// This should be called when a worker is being removed
     pub fn remove_worker_from_cache_aware(&self, model_id: &str, worker_url: &str) {
-        // Get the policy for this model
         if let Some(policy) = self.get_policy(model_id) {
-            if policy.name() == "cache_aware" {
-                if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
-                    cache_aware.remove_worker_by_url(worker_url);
-                    debug!(
-                        "Removed worker {} from cache-aware policy for model {}",
-                        worker_url, model_id
-                    );
-                }
-            }
+            forget_worker(&policy, worker_url);
         }
         // PD mode keeps separate prefill/decode policy instances with their own
         // trees. Skipping them leaves a removed worker as a live tenant, so the
@@ -335,11 +336,7 @@ impl PolicyRegistry {
             .into_iter()
             .flatten()
         {
-            if policy.name() == "cache_aware" {
-                if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
-                    cache_aware.remove_worker_by_url(worker_url);
-                }
-            }
+            forget_worker(policy, worker_url);
         }
     }
 
@@ -685,5 +682,24 @@ mod tests {
             let (_, decision) = policy.select_with_decision(&workers, &info).await;
             assert_eq!(decision.branch, "hit", "{}", policy.name());
         }
+    }
+
+    #[tokio::test]
+    async fn removed_workers_leave_agentic_text_trees() {
+        let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        registry.set_prefill_policy(Arc::new(AgenticPolicy::default()));
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(
+            crate::core::BasicWorkerBuilder::new("http://w:8000").build(),
+        )];
+        let info = super::super::SelectWorkerInfo {
+            request_text: Some("an agent's growing prompt"),
+            ..Default::default()
+        };
+        let policy = registry.get_prefill_policy();
+        let branch = || async { policy.select_with_decision(&workers, &info).await.1.branch };
+        assert_eq!(branch().await, "text_miss");
+        assert_eq!(branch().await, "text_hit");
+        registry.remove_worker_from_cache_aware("m", "http://w:8000");
+        assert_eq!(branch().await, "text_miss");
     }
 }
