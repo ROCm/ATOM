@@ -1,28 +1,52 @@
 # Packed metadata publication
 
-By default (`ATOM_H2D_BACKEND=packed`) the runner combines small metadata
-uploads. Set `ATOM_H2D_BACKEND=direct` before starting it to copy each member
-separately.
+The runner combines small metadata uploads: each consumer group goes up as one
+H2D of a packed arena and one GPU scatter. There is no per-member mode.
 Packing is selected once for eligible groups; noncontiguous bindings use direct
 copies. A single active member also uses a direct copy to avoid an extra kernel.
 It neither borrows the packed arena nor releases an earlier packed read.
-A producer group fully covered by an eligible larger group keeps checked
-direct copies for standalone callers, without a duplicate packed arena.
-Producers fill the final group's counts directly; compression plans use
-`set_count(buffer, count)` without accessing buffer binding internals.
+The consumer boundaries (`token_inputs` and every group the runner composes
+from a builder's `h2d_group_members`) each get an arena, even when one covers
+another. A producer group fully covered by a packed group keeps checked direct
+copies for standalone callers, without a duplicate packed arena.
+Producers record counts by member name (`set_counts`) or by buffer
+(`set_count`); a successful `publish()` clears them, so the next publication
+uploads only the members its producers count.
 
 ## Consumer boundaries
 
 | Group | Data | First GPU consumer |
 | --- | --- | --- |
-| `token_inputs` | Sampling parameters, padded query prefix, input IDs, deferred source indices and speculative verification indices | Token assembly, then draft ID gather |
-| `prefill_inputs` | Prefill attention mirrors and ordinary positions | Attention preparation |
-| `mha_decode` | Slots, context lengths, block tables, KV prefix and positions | KV-index generation |
-| `v41_metadata` | Compression/write plans, state slots, positions, token batch IDs, visibility and changed block tables | State-slot preparation, then the forward (index pointers are filled by their first reader) |
+| `token_inputs` | Sampling parameters, padded query prefix and token -> request map (`prepare_query_metadata`), input IDs, deferred source indices and speculative verification indices | Token assembly, then draft ID gather |
+| `prefill_metadata` | The buffers tagged `seq_metadata` (a request's attention metadata, which a decode writes too and declares into its own group) and ordinary positions, plus the builder's own: a GDN hybrid's state slots; V4's state slots, compression/write plans, indexer keys and paged-prefill indptrs | Attention preparation |
+| `decode_metadata` | MHA/MLA decode: slots, context lengths, block tables, KV prefix and positions; MLA adds last-page lengths and, where the step uses them, the DCP global prefix and local lengths, sparse prefix and index row bounds; a GDN hybrid adds its state slots (graph padding included). V4 decode and its graph capture: positions, context lengths, block tables, state slots, plans and, with an FP8 cache, the per-token query prefix | KV-index generation |
+| `step_metadata` | V4.1's step, a prefill's and a decode's alike: plans, state slots, step rows and changed block tables | V4.1 `begin_step` |
+| `ub{i}_metadata` | One TBO micro-batch's own copy of its phase's metadata, with its query prefix and token map: every buffer tagged `ub{i}_metadata`, either phase | That micro-batch's first kernel |
+| `ub{i}_prefill_metadata` | A V4.1 prefill micro-batch's step and plans | That micro-batch's first kernel |
 
-V4.1 ordinary DSpark decode uses two H2Ds and two scatters: token inputs and
-V4.1 metadata. All graph padding is included. Other attention builders, MRoPE
-and TBO can require additional groups at their own consumer boundaries.
+Every step uses two H2Ds and two scatters: token inputs and its phase's
+metadata, out to the running rows; a TBO micro-batch adds its own. MRoPE
+counts its positions plane into the phase group (`_stage_mrope`). A builder
+declares its members where it allocates them (`h2d_group_members`), joining
+the group of that name. The attention preparation runs in three parts:
+`stage_prefill` / `stage_decode` write the host sources and count them into
+the phase group (a TBO step adds `stage_ubatch_prefill` /
+`stage_ubatch_decode`), the groups are published once, and `finish_prefill` /
+`finish_decode` (`finish_ubatch_prefill` / `finish_ubatch_decode`) run the GPU
+work that reads them, hanging each micro-batch's metadata on
+`AttentionMetaData.ubatches` for the TBO wrapper. A builder extends each part
+after `super()`; a GDN hybrid stages its state slots there. V4.1 stages a step,
+and a TBO prefill's micro-batch steps, in `_prepare` and publishes their
+groups itself. GDN speculative decode still copies its
+accepted-token counts on their own: that destination is one tensor every PP
+slot shares.
+Every builder reads the step's `batch_id_per_q_token` from the token inputs;
+`build()` hands it to the metadata unless the builder set its own. The map
+numbers only requests that own tokens: zero-token rows get none, and an idle
+DP rank's dummy decode step is all `-1`; its prefill runs its padding as one
+request, all `0`. TBO micro-batches stage their own maps with
+their own group; a capture, or the vLLM plugin, publishes its query prefix and
+map through `publish_query_metadata`.
 The shared table state records publication only after the upload succeeds.
 
 Engram tentative preparation writes cursor candidates together with its

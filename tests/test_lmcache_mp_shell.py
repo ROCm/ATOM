@@ -5,7 +5,10 @@
 
 from types import SimpleNamespace
 
+from conftest import with_min_load
+
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+from atom.kv_transfer.disaggregation.types import KVTransferTensors
 from atom.kv_transfer.offload.mp import (
     native_state_scheduler,
     native_state_worker,
@@ -19,11 +22,15 @@ from atom.kv_transfer.offload.mp.connector import (
 
 
 def _config():
-    return SimpleNamespace(
-        kv_transfer_config={
-            "kv_connector": "lmcache_mp",
-            "kv_role": "offload",
-        }
+    return with_min_load(
+        SimpleNamespace(
+            decode_context_parallel_size=1,
+            dcp_config=SimpleNamespace(interleave_size=1),
+            kv_transfer_config={
+                "kv_connector": "lmcache_mp",
+                "kv_role": "offload",
+            },
+        )
     )
 
 
@@ -280,6 +287,6 @@ def test_worker_takes_page_only_path_for_replayed_state(monkeypatch):
     )
     state = SimpleNamespace(per_request_state=True)
     LMCacheMPConnector(_config()).register_kv_caches(
-        {"state": state}, SimpleNamespace(state_backend=builder), 7
+        {"state": state}, KVTransferTensors(state_backend=builder), 7
     )
     assert selected == ["page"]

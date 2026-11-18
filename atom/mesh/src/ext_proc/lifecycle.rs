@@ -69,6 +69,22 @@ impl RequestLifecycle {
         }
     }
 
+    /// Match HTTP ingress: the response content type decides, and without one a
+    /// successful response keeps the request's `stream` flag.
+    pub fn resolve_streaming(&mut self, event_stream: Option<bool>) {
+        let success = self
+            .status
+            .is_some_and(|status| (200..300).contains(&status));
+        self.streaming = match event_stream {
+            Some(event_stream) => event_stream,
+            None if success => self
+                .observation
+                .as_ref()
+                .is_some_and(|observation| observation.streaming),
+            None => false,
+        };
+    }
+
     pub fn finish(&mut self, outcome: Outcome) {
         self.outcome = outcome;
     }
@@ -152,7 +168,7 @@ mod tests {
         let mut lifecycle = RequestLifecycle::new();
         lifecycle.bind(RoutingDecision {
             address: "127.0.0.1:80".parse().unwrap(),
-            authorization: None,
+            api_key: None,
             target: ExecutionTarget::Single {
                 _load: WorkerLoadGuard::new(worker.clone(), None),
                 worker: worker.clone(),
@@ -207,6 +223,32 @@ mod tests {
                 worker.circuit_breaker().total_failures(),
                 failures,
                 "{detail}"
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_without_content_type_matches_http_ingress() {
+        for (status, event_stream, requested, expected) in [
+            (200, Some(true), false, true),
+            (200, Some(false), true, false),
+            (200, None, true, true),
+            (200, None, false, false),
+            (500, None, true, false),
+        ] {
+            let mut lifecycle = RequestLifecycle::new();
+            lifecycle.status = Some(status);
+            lifecycle.observation = Some(RequestMetrics::new(
+                "ext_proc",
+                "regular",
+                "test",
+                "/v1/chat/completions",
+                requested,
+            ));
+            lifecycle.resolve_streaming(event_stream);
+            assert_eq!(
+                lifecycle.streaming, expected,
+                "{status} {event_stream:?} {requested}"
             );
         }
     }

@@ -438,12 +438,111 @@ impl MeshMetrics {
     }
 
     /// Record prefix hash policy execution branch for routing decisions.
+    #[deprecated(
+        note = "Use record_route_branch: mesh_route_branch_total{policy=\"prefix_hash\"} counts the same branches by pool."
+    )]
     pub fn record_worker_prefix_hash_policy_branch(branch: &'static str) {
         counter!(
             names::PREFIX_HASH_POLICY_BRANCH_TOTAL,
             "branch" => branch
         )
         .increment(1);
+    }
+
+    /// Record the branch a routing policy took for one selection.
+    pub fn record_route_branch(pool: &'static str, policy: &'static str, branch: &'static str) {
+        counter!(
+            names::ROUTE_BRANCH_TOTAL,
+            "pool" => pool,
+            "policy" => policy,
+            "branch" => branch
+        )
+        .increment(1);
+    }
+
+    /// Record the prefix match ratio a policy found for its best candidate.
+    pub fn record_route_prefix_match_ratio(pool: &'static str, policy: &'static str, ratio: f64) {
+        histogram!(
+            names::ROUTE_PREFIX_MATCH_RATIO,
+            "pool" => pool,
+            "policy" => policy
+        )
+        .record(ratio);
+    }
+
+    /// Record the router-tracked active requests on the selected worker, read
+    /// before the request is added.
+    pub fn record_route_selected_worker_active_requests(
+        pool: &'static str,
+        policy: &'static str,
+        branch: &'static str,
+        active_requests: usize,
+    ) {
+        histogram!(
+            names::ROUTE_SELECTED_WORKER_ACTIVE_REQUESTS,
+            "pool" => pool,
+            "policy" => policy,
+            "branch" => branch
+        )
+        .record(active_requests as f64);
+    }
+
+    /// Record a session request dispatched to a different worker than the
+    /// previous one: rebind, expired or rank_mapping.
+    pub fn record_session_worker_change(pool: &'static str, reason: &'static str) {
+        counter!(
+            names::SESSION_WORKER_CHANGE_TOTAL,
+            "pool" => pool,
+            "reason" => reason
+        )
+        .increment(1);
+    }
+
+    /// Record the worker and DP rank a request was finally dispatched to.
+    pub fn record_selected_dp_rank(pool: &'static str, base_url: &str, dp_rank: Option<usize>) {
+        let dp_rank: metrics::SharedString = match dp_rank {
+            Some(rank) => intern_string(&rank.to_string()).into(),
+            None => metrics_labels::DP_RANK_NONE.into(),
+        };
+        counter!(
+            names::SELECTED_DP_RANK_TOTAL,
+            "pool" => pool,
+            "worker" => intern_string(base_url),
+            "dp_rank" => dp_rank
+        )
+        .increment(1);
+    }
+
+    /// Record the prompt and engine-reported cached tokens of a routed request.
+    pub fn record_route_cache_tokens(pool: &'static str, prompt: u64, cached: u64) {
+        for (kind, count) in [
+            (metrics_labels::CACHE_PROMPT, prompt),
+            (metrics_labels::CACHE_CACHED, cached),
+        ] {
+            counter!(names::ROUTE_CACHE_TOKENS_TOTAL, "pool" => pool, "kind" => kind)
+                .increment(count);
+        }
+    }
+
+    /// Reconcile the router's cached-token estimate with the engine's report.
+    pub fn record_route_cache_estimate(
+        pool: &'static str,
+        prompt: u64,
+        estimated: u64,
+        actual: u64,
+    ) {
+        for (kind, count) in [
+            (metrics_labels::CACHE_PROMPT, prompt),
+            (metrics_labels::CACHE_ESTIMATED, estimated),
+            (metrics_labels::CACHE_ACTUAL, actual),
+        ] {
+            counter!(names::ROUTE_CACHE_ESTIMATE_TOKENS_TOTAL, "pool" => pool, "kind" => kind)
+                .increment(count);
+        }
+        if prompt > 0 {
+            histogram!(names::ROUTE_CACHE_ESTIMATE_ERROR_RATIO, "pool" => pool)
+                .record((estimated as f64 - actual as f64) / prompt as f64);
+        }
     }
 
     /// Set running requests per worker.

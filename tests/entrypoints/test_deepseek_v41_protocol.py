@@ -292,7 +292,8 @@ def test_typed_call_matches_reference_and_all_stream_boundaries(encoder):
     )
     expected = parse_reference(reference_text, thinking_mode="thinking")
     reasoning, content = ReasoningChannel(starts_open=True).split(
-        reference_text.removesuffix("<｜end▁of▁sentence｜>")
+        reference_text.removesuffix("<｜end▁of▁sentence｜>"),
+        stopped=True,
     )
     assert reasoning == expected["reasoning_content"]
     text, calls = parse_tool_calls(content, TOOLS, DsmlV41Parser)

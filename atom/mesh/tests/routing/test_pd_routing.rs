@@ -207,6 +207,7 @@ mod pd_routing_unit_tests {
 
                 Arc::new(
                     AppContext::builder()
+                        .prepare_pool(mesh::core::prepare_pool::PrepareHandle::closed())
                         .router_config(config)
                         .client(client)
                         .rate_limiter(rate_limiter)

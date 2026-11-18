@@ -31,6 +31,7 @@ def _metadata(requests: int, qlen: int):
         spec_state_indices_tensor=torch.zeros(requests, qlen, dtype=torch.int32),
         num_accepted_tokens=torch.ones(requests, dtype=torch.int32),
         replayssm=False,
+        has_state_fork=False,
     )
 
 

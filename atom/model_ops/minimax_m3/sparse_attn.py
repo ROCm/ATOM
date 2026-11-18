@@ -11,7 +11,7 @@ and split-K decode with a separate merge step.
 """
 
 import functools
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import aiter
 import torch
@@ -22,10 +22,13 @@ import triton
 import triton.language as tl
 from aiter.ops.attention import pa_fwd_asm_supports_arch
 
-from atom.model_ops.minimax_m3.index_topk import build_n_valid_column_per_row
-
-# One sparse block == one KV page.
-SPARSE_BLOCK_SIZE = 128
+from atom.model_ops.minimax_m3.geometry import SPARSE_BLOCK_SIZE
+from atom.model_ops.minimax_m3.index_buffers import IndexScoreBuffers
+from atom.model_ops.minimax_m3.index_topk import (
+    build_n_valid_column_per_row,
+    flydsl_ops,
+)
+from atom.model_ops.minimax_m3.sparse_attn_nvfp4 import prefill_row_positions
 
 # Page-16 SHUFFLE layout for the AITER paged-attention path. The KV
 # cache is allocated with physical page size 16 (the ASM kernel page), and each
@@ -69,6 +72,10 @@ class MiniMaxM3SparsePrefillMetadata:
     block_table: torch.Tensor
     max_query_len: int
     max_seq_len: int
+    nvfp4_row_info: tuple[torch.Tensor, torch.Tensor] | None = None
+    """``(row_req_id, row_kv_lens)`` of every prefill row, int32: what the NVFP4 sparse
+    PA takes per row. Built once with the step's metadata and read by every sparse layer;
+    None unless the KV cache is NVFP4 (``make_sparse_prefill_metadata(nvfp4_kv=True)``)."""
 
 
 @dataclass
@@ -97,6 +104,9 @@ class MiniMaxM3SparseMetadata:
     `deepseek_v4_attn.csa_n_committed_per_token` hoists out for the sibling
     indexer. `index_topk` consumes it and never derives its own.
     """
+    index_scorer: IndexScoreBuffers | None = None
+    """The FP4 (MXFP4 or NVFP4) index scorer's record for this step; None for any other
+    index cache and on an empty batch (the scorer then refuses)."""
 
 
 def make_sparse_prefill_metadata(
@@ -111,7 +121,14 @@ def make_sparse_prefill_metadata(
     num_prefill_tokens: int,
     num_idx_heads: int,
     n_valid_column_per_row_out: torch.Tensor | None = None,
+    index_scorer: IndexScoreBuffers | None = None,
+    nvfp4_kv: bool = False,
 ) -> MiniMaxM3SparseMetadata:
+    """``index_scorer`` is the builder's FP4 (MXFP4 or NVFP4) index scorer record (None
+    for any other index cache); a prefill step uses only its score workspace, so the map
+    is dropped. ``nvfp4_kv`` (an NVFP4 KV cache) also builds the per-row request id and
+    key count the NVFP4 sparse PA reads, once here for every layer of the step.
+    """
     query_lens = cu_seqlens_q[1 : num_prefills + 1] - cu_seqlens_q[:num_prefills]
     prefix_lens = seq_lens - query_lens
     qo_indptr = torch.arange(num_prefill_tokens, dtype=torch.int32, device="cuda")
@@ -123,6 +140,11 @@ def make_sparse_prefill_metadata(
         block_table=block_table,
         max_query_len=max_query_len,
         max_seq_len=max_seq_len,
+        nvfp4_row_info=(
+            prefill_row_positions(cu_seqlens_q, prefix_lens, num_prefill_tokens)
+            if nvfp4_kv
+            else None
+        ),
     )
     return MiniMaxM3SparseMetadata(
         seq_lens=seq_lens,
@@ -141,6 +163,11 @@ def make_sparse_prefill_metadata(
             decode_max_q=0,
             out=n_valid_column_per_row_out,
         ),
+        index_scorer=(
+            None
+            if index_scorer is None
+            else replace(index_scorer, work_map=None, max_block=0)
+        ),
     )
 
 
@@ -153,11 +180,34 @@ def make_sparse_decode_metadata(
     num_idx_heads: int,
     max_query_len: int = 1,
     n_valid_column_per_row_out: torch.Tensor | None = None,
+    index_scorer: IndexScoreBuffers | None = None,
 ) -> MiniMaxM3SparseMetadata:
+    """``index_scorer`` is the builder's FP4 (MXFP4 or NVFP4) index scorer record (None
+    for any other index cache): the step's work map is built into its capacity buffer here, once, at
+    its ``max_block``, and the metadata carries the record with that map; an empty batch
+    builds none. Under indexer CP the map is the record's shard over every index head
+    (``num_idx_heads``, this rank's, times the world). ``seq_lens`` and
+    ``block_table`` must be the requests whose rows the scorer, selector and attention
+    run (pad requests: length 0): the map and ``n_valid_column_per_row`` both follow
+    that batch.
+    """
     decode = MiniMaxM3SparseDecodeMetadata(
         seq_lens=seq_lens, block_table=block_table, max_query_len=max_query_len
     )
     batch = seq_lens.shape[0]
+    step_scorer = None
+    if index_scorer is not None and batch > 0:
+        step_scorer = replace(
+            index_scorer,
+            work_map=flydsl_ops().minimax_m3_index_score_work_map(
+                seq_lens,
+                index_scorer.max_block,
+                max_query_len,
+                num_idx_heads * index_scorer.cp_world,
+                out=index_scorer.work_map,
+                **index_scorer.shard,
+            ),
+        )
     return MiniMaxM3SparseMetadata(
         seq_lens=seq_lens,
         max_seq_len=max_seq_len,
@@ -176,6 +226,7 @@ def make_sparse_decode_metadata(
             decode_max_q=max_query_len,
             out=n_valid_column_per_row_out,
         ),
+        index_scorer=step_scorer,
     )
 
 

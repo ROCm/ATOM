@@ -15,6 +15,8 @@ from atom.kv_transfer.disaggregation import (
 from atom.kv_transfer.disaggregation.types import (
     LoadOperationId,
     SaveOperationId,
+    StateStoreOperationId,
+    StateTouchId,
 )
 from atom.kv_transfer.offload.hybrid.dsv4.connector import (
     DSV4_CHECKPOINT_SAVE_CHANNEL,
@@ -412,6 +414,25 @@ class TestAggregateBasic:
 
         agg.reset()
         assert agg.terminal_tombstone_count == (0, 0)
+
+    def test_state_touches_do_not_evict_store_and_source_tombstones(self):
+        agg = KVOutputAggregator(world_size=2, terminal_tombstone_limit=4)
+        store = _completion("k3_state_index", StateStoreOperationId(9, 0))
+        source = _completion("k3_state_source", StateStoreOperationId(9, 0))
+        both = KVConnectorOutput(connector_completions={store, source})
+        assert agg.aggregate([both, both]).connector_completions == {store, source}
+
+        for round_ in range(100):
+            touch = KVConnectorOutput(
+                connector_completions={
+                    _completion("k3_state_touch", StateTouchId(9, round_))
+                }
+            )
+            assert agg.aggregate([touch, touch]).connector_completions
+        assert agg.terminal_tombstone_count == (0, 2)
+
+        late = agg.aggregate([both, both])
+        assert late.connector_completions == set(), "late duplicates still dropped"
 
     def test_legacy_raw_save_ids_are_not_tombstoned_for_reuse(self):
         agg = KVOutputAggregator(world_size=2)

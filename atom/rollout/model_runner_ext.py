@@ -16,6 +16,7 @@ from atom.model_engine.model_runner import ModelRunner
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.rollout.capabilities import CapabilityProviderMixin
 from atom.rollout.memory_manager import MemoryManagerMixin
+from atom.rollout.rdma_weight_receiver import RDMAWeightReceiverMixin
 from atom.rollout.weight_updater import WeightUpdaterMixin
 from atom.utils.forward_context import get_forward_context
 
@@ -23,7 +24,11 @@ logger = logging.getLogger("atom")
 
 
 class RLHFModelRunner(
-    ModelRunner, WeightUpdaterMixin, MemoryManagerMixin, CapabilityProviderMixin
+    ModelRunner,
+    WeightUpdaterMixin,
+    RDMAWeightReceiverMixin,
+    MemoryManagerMixin,
+    CapabilityProviderMixin,
 ):
     """ModelRunner with RLHF extensions (weight sync + memory lifecycle + DP isolation).
 
@@ -45,10 +50,15 @@ class RLHFModelRunner(
     DP_DEVICE_MAP_ENV = "VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER"
 
     def __init__(self, rank: int, config):
+        if config.sequence_parallel_size > 1:
+            raise ValueError("RLHF rollout does not support Ulysses SP (-sp).")
         # 0 -- the default -- means "this checkpoint's vocabulary is not
         # padded", which is the right answer for almost every model and costs
         # one comparison per step.
         self._true_vocab_size = config.true_vocab_size
+        self._init_weight_updater()
+        self._init_rdma_receiver(config)
+        self._init_memory_manager()
         super().__init__(rank, config)
         self._check_true_vocab_size(config)
 

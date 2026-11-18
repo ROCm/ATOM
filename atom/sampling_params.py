@@ -147,8 +147,19 @@ class SamplingParams:
     # Set by the server for `tool_choice="required"` when the tool-call format
     # defines one (Kimi-K3 only); None leaves the output unconstrained.
     required_channel: RequiredChannel | None = None
+    top_logprobs: int = 0
+    json_schema: str | None = None
+    structured_tool_format: str | None = None
+    # Generated reasoning tokens are unconstrained until this marker closes.
+    structured_reasoning_end: str = ""
+    # Frontend default may shrink after tokenization; explicit client caps may not.
+    max_tokens_is_default: bool = False
 
     def __post_init__(self):
+        if type(self.top_logprobs) is not int or not 0 <= self.top_logprobs <= 20:
+            raise ValueError("top_logprobs must be an integer between 0 and 20")
+        if self.top_logprobs and not self.logprobs:
+            raise ValueError("top_logprobs requires logprobs")
         # 0 also means disabled, as in vLLM/SGLang; MLPerf Endpoints workloads send it
         if self.top_k == 0:
             self.top_k = -1
@@ -158,3 +169,19 @@ class SamplingParams:
             raise ValueError("top_p must be in range (0.0, 1.0]")
         if self.n < 1:
             raise ValueError("n must be >= 1")
+
+    def validate_logprob_options(
+        self, config, *, kv_transfer=None, multimodal=False, synthetic=False
+    ):
+        """Execution admission shared by HTTP and direct engine callers."""
+        if not self.logprobs:
+            return
+        if getattr(config, "enable_rapidserve", False):
+            raise ValueError("logprobs is unavailable with RapidServe")
+        if kv_transfer or getattr(config, "kv_transfer_config", None):
+            raise ValueError("logprobs is unavailable with P/D transfer")
+        if multimodal:
+            raise ValueError("Chat logprobs currently supports text input only")
+        spec = getattr(config, "speculative_config", None)
+        if synthetic or getattr(spec, "synthetic_acceptance_rates", None) is not None:
+            raise ValueError("logprobs is unavailable with synthetic forced acceptance")

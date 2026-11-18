@@ -117,6 +117,23 @@ def should_skip_online_quant(cur_type, cur_dtype, online_cfg) -> bool:
     )
 
 
+def effective_layer_quant(quant_config, prefix: str):
+    """The ``(quant_type, quant_dtype)`` a Linear runs with at runtime: the
+    checkpoint scheme, overridden by the online-quant target where that
+    override applies (``should_skip_online_quant``), as
+    ``LinearBase.online_quantize_weight`` resolves it. A producer that fuses
+    its consumer's activation quant, or packs another layer's weight into its
+    own, asks this rather than hard-coding a layout."""
+    if quant_config is None:
+        return QuantType.No, None
+    cfg = quant_config.get_layer_quant_config(prefix)
+    if quant_config.online_quant:
+        online_cfg = quant_config.get_layer_quant_config(prefix, use_online_quant=True)
+        if not should_skip_online_quant(cfg.quant_type, cfg.quant_dtype, online_cfg):
+            cfg = online_cfg
+    return cfg.quant_type, cfg.quant_dtype
+
+
 def will_online_requant(
     quant_config,
     prefix: str,

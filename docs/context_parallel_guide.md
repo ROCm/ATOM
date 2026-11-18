@@ -128,9 +128,7 @@ Tips:
   long-sequence / high-concurrency workloads (not yet supported). Give all GPUs to
   PCP instead, e.g. `-tp 1 -pcp 8`.
 - Under PCP, TBO uses a **request-boundary split** (each micro-batch is a whole
-  subset of requests) — the non-default TBO split mode — instead of the
-  token-midpoint split used without PCP. `ATOM_TBO_PREFILL_TOKEN_SPLIT`
-  therefore has no effect when PCP is enabled.
+  subset of requests) instead of the token-midpoint split used without PCP.
 - `--torch-profiler-dir ./log` can be added to collect traces for performance
   analysis.
 
@@ -198,6 +196,7 @@ PCP baseline (not the `-tp 4 -pcp 2` numbers above).
 | PCP + TBO decode (`--enable-tbo all`) | Not supported (raises at startup); use `--enable-tbo` prefill-only |
 | `ATOM_PCP_MOE_MERGE=0` + `--enable-tbo` | TBO auto-disabled (warning logged) |
 | PCP + TBO with `tp > 1` | **Not supported.** May hang under long-sequence / high-concurrency workloads. TBO requires `-tp 1` (all GPUs in PCP, e.g. `-tp 1 -pcp 8`) |
+| PCP + Ulysses SP (`-sp`) | `-sp N` runs on the PCP rank dimension, so it does not combine with `-pcp` (refused at startup). Its MoE is TP-sharded across the SP ranks, and `ATOM_PCP_MOE_MERGE` is ignored. See `docs/distributed_guide.md` |
 
 PCP + TBO **prefill** is supported only with `ATOM_PCP_MOE_MERGE=1` **and
 `-tp 1`**. Decode is unchanged by PCP in all configurations.
@@ -329,7 +328,7 @@ nothing.
 | `interleave_size` | int | `1` | KV-cache interleave granularity `S`: token `i` lives on DCP rank `(i // S) % W`. `1` = token-level round-robin |
 | `enable_query_replication` | bool | `true` | Replicate the MLA query projection across the DCP group at load time, so each rank produces the whole group's head set locally and the per-step decode AllGather Q disappears |
 | `enable_project_before_merge` | bool | `true` | Apply the V up-projection *before* the DCP output merge, so the merge exchanges `v_head_dim` per head instead of `kv_lora_rank` |
-| `comm_backend` | str | `"a2a"` | Which collective pattern merges the per-rank partial attention: `"a2a"` or `"ag_rs"` |
+| `comm_backend` | str | `"auto"` | Which collective pattern merges the per-rank partial attention: `"auto"`, `"a2a"`, `"ag_rs"` or `"mailbox"` |
 
 > **Three of the four default to the new behaviour.** A control run that wants
 > the old path must say so **explicitly** — passing nothing re-runs the new
@@ -427,17 +426,47 @@ Covers both decode and sparse prefill. Costs a DCP-group-wide copy of `W_V`
 
 ### `comm_backend`
 
-Both backends compute the same thing and are **mathematically equivalent but not
+All backends compute the same thing and are **mathematically equivalent but not
 bitwise identical** (different summation order, and `a2a` round-trips the fp32
 LSE through two 16-bit halves of a bf16 buffer).
 
 | Value | Pattern | Collectives |
 |-------|---------|-------------|
-| `a2a` (default) | one all-to-all with the LSE packed alongside the output, combine done locally | **1** |
+| `auto` (default) | `mailbox` on gfx950 with DCP > 1 when decode TBO and plugin mode are off, `a2a` otherwise; the choice is logged at startup | |
+| `a2a` | one all-to-all with the LSE packed alongside the output, combine done locally | **1** |
 | `ag_rs` | AllGather LSE + local correct + ReduceScatter output | 2 |
+| `mailbox` | decode only: aiter's FlyDSL `dcp_lse_combine`, one launch that stores each owner's rows and LSEs into its IPC-mapped mailbox and combines them there | **0** (no collective launch) |
 
 Byte counts are about the same; what `a2a` saves is one collective's launch and
 sync.
+
+`mailbox` needs aiter `78a14ae5d` or later (aiter PR #6972 and #7943) and
+FlyDSL >= 0.5.0. That is required, not detected: an aiter without
+`aiter.ops.flydsl.dcp_mailbox` or a FlyDSL older than 0.5.0 fails at startup
+(set `comm_backend` to `a2a`), and an aiter from `d223b16cf` up to `78a14ae5d`
+runs the earlier tagged mailbox, without the agreed allocation fallback. When
+the peer memory cannot be allocated
+or mapped (e.g. a DCP group spanning nodes), it logs a warning once and merges
+with `a2a` on every rank. Plugin mode takes `a2a` at startup, for `auto` and an
+explicit `mailbox` alike. Only graph-captured decode steps take it: an eager
+call re-traces the FlyDSL kernel on the host every time (about 77 ms a call on
+Kimi-K3 at DCP8), which a capture pays once, so eager steps and prefill merge
+with `a2a`. An explicit `mailbox` is refused together with decode TBO
+(`--enable-tbo all`); `auto` takes `a2a` there. After graph capture the ranks
+check that they captured the same number of mailbox merges and refuse to serve
+otherwise, since a rank one launch ahead would pair every later merge with the
+wrong peer call. The first startup builds a few kernels (one per token tile and
+row-mask variant); set `comm_backend` to `a2a` to opt out.
+A merge larger than `2^21` elements (tokens x all heads x head dim: 128 tokens
+on GLM-5.2 at DCP4, 170 on Kimi-K3 at DCP8) takes `a2a`. Measured on MI355X in
+a CUDA graph, the mailbox leads RCCL on GLM-5.2 up to 512 tokens and on
+Kimi-K3 through 160 tokens; at 192 tokens, where the combine's token tile
+steps from 4 to 8, Kimi-K3 falls behind. Its peer buffer, `2 x ranks x tokens
+x local heads x (2 x head dim + 4)` bytes with `tokens = min(max_num_seqs x (1
++ num_speculative_tokens), 2^21 / (ranks x local heads x head dim))`, at most
+about 8 MiB on both models, is mapped at model build, so it comes out of the
+KV budget. The combine does not quantize: with a per-token FP8 `o_proj` its
+output is quantized by `o_proj` itself.
 
 ## Launching server
 
@@ -576,15 +605,16 @@ With an **fp8 Q and an fp8 KV cache**, aiter serves gqa=64 only from the
 **persistent** decode kernel and aborts the process otherwise (`asm_mla.cu`:
 *"fp8/fp8 with gqa_ratio=64 only supports persistent mode"*).
 
-Native sparse MLA / DSA attention under DCP handles this on gfx950 by rebuilding
+Native sparse MLA / DSA attention under DCP handles this, where aiter runs DCP
+decode persistent (`dcp_persistent_supported`; validated on gfx950), by rebuilding
 the persistent work/reduce metadata after every **full IndexShare layer**
 compacts its rank-local top-k. The rebuild consumes that layer's
 `dcp_sparse_kv_indptr`; following shared layers reuse the same indices, compact
 indptr, and work plan. This makes the persistent descriptors and the actual
 sparse regions agree without rebuilding metadata on shared layers.
 
-The implementation is scoped to native, non-speculative serving on gfx950 with
-page size 1: decode is q_len=1, while sparse prefill is represented as per-token
+The implementation is scoped to native, non-speculative serving with page size
+1: decode is q_len=1, while sparse prefill is represented as per-token
 virtual q_len=1 rows. Unsupported paths (including gfx942 and plugin or
 speculative sparse DCP paths without the per-layer rebuild) remain
 non-persistent and round a gathered 64 up to **128**.
@@ -689,7 +719,7 @@ pass instead of `k` serial passes. Two properties decide how it meets DCP:
 
 | | Supported |
 |---|---|
-| Target model | **Kimi-K3** (`--draft-model Inferact/Kimi-K3-DSpark`) |
+| Target model | **Kimi-K3** (`--draft-model Inferact/Kimi-K3-DSpark` or `RadixArk/Kimi-K3-DSpark`) |
 | GPU arch | gfx950 |
 | DCP size | dcp8 validated (`tp8`) |
 | KV cache dtype | fp8 (per-tensor scale) |
@@ -701,6 +731,13 @@ per-step accepted-count distribution is `{0: 6.1%, 1: 13.7%, 2: 80.3%}` — 80% 
 steps take the whole draft and only 6% take none, so the draft is genuinely
 contributing under DCP rather than collapsing back to single-token decode.
 
+**The RadixArk DSpark GQA draft** (`--draft-model RadixArk/Kimi-K3-DSpark`, a
+SpecForge DFlash checkpoint) is the exception to the first point. It owns its
+pool and stays out of the DCP group, as SGLang runs it, so every rank caches the
+draft KV of every token in entries of `block_size × dcp` tokens. At `tp8 -dcp 8` with fp8 KV the draft
+entry is 43% of each paged block, draft included (74% on top of the target's
+MLA rows; see the [recipe](../recipes/DSpark.md)).
+
 ## Constraints & Compatibility
 
 | Constraint | Notes |
@@ -711,9 +748,9 @@ contributing under DCP rather than collapsing back to single-token decode.
 | prefix caching / chunked prefill | Supported (dense and sparse / DSA). On **Kimi-K3** the validated configuration has prefix caching **off**, per its recipe |
 | Kimi-K3 KDA layers | Not sharded — the KDA recurrent state is per-request, not paged, so DCP frees only the MLA share of attention memory |
 | Kimi-K3 gathered head width | Padded to a natively dispatched MLA width (16 / 32 / 64 / 128); past 128 it falls back to the folded kernel with a warning — lower `-dcp` or raise `-tp` |
-| gathered head width 64 | Native sparse / DSA prefill (bf16 or fp8 KV) and q_len=1 decode (fp8 KV) on gfx950 rebuild persistent metadata per full IndexShare layer and run gqa64 directly; unsupported non-persistent paths still pad to 128 — see [Sparse DCP persistent attention and gqa=64](#sparse-dcp-persistent-attention-and-gqa64) |
+| gathered head width 64 | Native sparse / DSA prefill (bf16 or fp8 KV) and q_len=1 decode (fp8 KV) rebuild persistent metadata, where aiter runs DCP decode persistent (validated on gfx950), per full IndexShare layer and run gqa64 directly; unsupported non-persistent paths still pad to 128 — see [Sparse DCP persistent attention and gqa=64](#sparse-dcp-persistent-attention-and-gqa64) |
 | speculative decode (MTP), dense MLA | Supported on **gfx950 only** (bf16/fp8, `num_speculative_tokens` 1–3); raises at startup on gfx942 |
-| speculative decode (DSpark), Kimi-K3 | Supported on gfx950; validated at `tp8 -dcp 8` with `num_speculative_tokens 2` |
+| speculative decode (DSpark), Kimi-K3 | Supported on gfx950; validated at `tp8 -dcp 8` with `num_speculative_tokens 2` (Inferact MLA draft) and 5 (RadixArk DSpark GQA draft, which runs outside the DCP group) |
 | speculative decode (MTP), sparse / DSA | Supported on **gfx950 only**; validated on GLM-5.2-FP8 at fp8 KV, `num_speculative_tokens=3`, dcp8 |
 | vllm-atom plugin | Validated for dense MLA only; the sparse / DSA and Kimi-K3 plugin paths are not yet verified |
 | DCP + PCP | Independent dimensions (different phases); combined use not validated here |
@@ -725,7 +762,7 @@ contributing under DCP rather than collapsing back to single-token decode.
 | `atom/model_engine/arg_utils.py` | `--decode-context-parallel-size` / `-dcp` CLI |
 | `atom/config.py` | `DCPConfig` (the four `--dcp-config` knobs) + their validation; `qrep_unsupported_reason` auto-gating; DCP validation (`tp % dcp == 0`); spec-decode + DCP arch gate (gfx950); per-layer QREP eligibility -- `q_proj_is_qrep_widened`, `q_proj_has_row_sliceable_scale`, `qrep_enabled_for_layer` |
 | `atom/model_engine/block_manager.py` | Interleaved block allocation; prefix-cache virtual-block accounting |
-| `atom/distributed/dcp_utils.py` | DCP distributed-access layer: `get_dcp_world_size` / `dcp_is_enabled` / `get_dcp_group` / `get_dcp_rank`; platform-capability queries `dcp_persistent_supported` / `dcp_prefill_merge_bf16_ok`; `mla_dcp_decode_is_persistent` / `mla_dcp_sparse_prefill_is_persistent` |
+| `atom/distributed/dcp_utils.py` | DCP distributed-access layer: `get_dcp_world_size` / `dcp_is_enabled` / `get_dcp_group` / `get_dcp_rank`; `dcp_persistent_supported` (asks aiter whether a persistent decode runs at a head width) / `dcp_prefill_merge_bf16_ok`; `mla_dcp_decode_is_persistent` / `mla_dcp_sparse_prefill_is_persistent` |
 | `atom/model_ops/dcp_ops.py` | Both merge backends -- `cp_lse_ag_out_rs` (AG+RS LSE-combine) and `cp_lse_a2a` (all-to-all pack / unpack-combine kernels); `reorg_kvcache`, local compressed-KV gather, `dcp_all_gather` / `dcp_all_gather_query_heads` (custom-collective AllGather) |
 | `atom/model_ops/attention_mla.py` | Server-mode DCP decode + prefix-cache / chunked-prefill context; `mla_dcp_kernel_num_heads` gathered-head-width padding; `qrep_tp_override`; the per-layer QREP decision at `MLAAttention.__init__` |
 | `atom/model_ops/attentions/aiter_mla.py`, `attentions/backends.py` | DCP decode / prefill metadata (interleaved slot_mapping, local seq lens) |

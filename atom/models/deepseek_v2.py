@@ -53,6 +53,7 @@ from atom.config import Config, QuantizationConfig, get_current_atom_config
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
     pcp_allgather_rerange,
+    pcp_allgather_rerange_many,
     pcp_is_enabled,
     pcp_pad_dense,
     pcp_pad_len,
@@ -79,6 +80,7 @@ from atom.model_ops.embed_head import (
 # Side-effect import: registers `torch.ops.aiter.sparse_attn_indexer`, the op
 # `Indexer.forward_impl` runs.
 from atom.model_ops.indexer import indexer_forward as _indexer_forward  # noqa: F401
+from atom.model_ops.indexer.layout import MFMA, PRESHUFFLE
 from atom.model_ops.indexer.schedule import skips_index_topk
 from atom.model_ops.layernorm import LayerNorm, RMSNorm
 from atom.model_ops.linear import (
@@ -111,7 +113,7 @@ from atom.plugin.vllm.attention.layer_sparse_mla import (
     DeepseekV32IndexerCacheDecoratorForPluginMode,
     IndexerDecoratorForPluginMode,
 )
-from atom.quant_spec import should_skip_online_quant
+from atom.quant_spec import effective_layer_quant, should_skip_online_quant
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace, support_torch_compile
@@ -363,6 +365,30 @@ def _can_fuse_indexer_wk_weights_proj(
         ):
             return False
     return True
+
+
+def _fold_indexer_projection(
+    config: PretrainedConfig,
+    quant_config: QuantizationConfig | None,
+    model_prefix: str,
+) -> bool:
+    """Whether every layer's own indexer packs its wk / weights_proj into the
+    layer's fused_qkv_a_proj (``FusedIndexerProjection``). One answer for the
+    model: the checkpoint names map once (``packed_modules_mapping``)."""
+    if getattr(config, "q_lora_rank", None) is None or not hasattr(
+        config, "index_topk"
+    ):
+        return False
+    if pcp_is_enabled():
+        return False
+    attns = (
+        f"{model_prefix}.layers.{i}.self_attn" for i in range(config.num_hidden_layers)
+    )
+    return all(
+        indexer_projection_fusable(quant_config, attn)
+        for attn in attns
+        if not _indexer_weights_shared(config, attn)
+    )
 
 
 def _extract_layer_index_from_prefix(prefix: str) -> int:
@@ -1243,6 +1269,10 @@ class DeepseekV32IndexerCache(nn.Module):
     ):
         super().__init__()
         self.kv_cache = [torch.tensor([])]
+        # Warmup compiles the OPUS custom op before the KV pool is bound.
+        # Keep a tensor input so rebinding the real scale plane after warmup
+        # cannot freeze a constant None into the level-3 compiled graph.
+        self.kv_cache_scale: torch.Tensor | None = torch.empty(0, dtype=torch.uint8)
         self.head_dim = head_dim
         self.prefix = prefix
         self.cache_config = cache_config
@@ -1289,6 +1319,46 @@ def _dequant_fp8_block_to_bf16(
         .float()
     )
     return (weight * scale[:, None, :, None]).flatten(2, 3).flatten(0, 1).bfloat16()
+
+
+class FusedIndexerProjection(MergedReplicatedLinear):
+    """q_a, kv_a, the indexer's wk and weights_proj in one BF16 GEMM, every
+    checkpoint slice required (``indexer_projection_fusable``)."""
+
+    def __init__(self, *args, require_checkpoint_shards: bool = True, **kwargs):
+        self._checkpoint_shards: set[int] = set()
+        self._require_checkpoint_shards = require_checkpoint_shards
+        super().__init__(*args, **kwargs)
+        if len(self.output_sizes) != 4:
+            raise ValueError(
+                "Fused indexer projection requires q_a, kv_a, wk and weights_proj"
+            )
+
+    def weight_loader(self, param, loaded_weight, loaded_shard_id=None):
+        if param is not self.weight or loaded_shard_id not in (0, 1, 2, 3):
+            raise ValueError("Unexpected fused indexer projection checkpoint slice")
+        if loaded_weight.dtype != torch.bfloat16 or param.dtype != torch.bfloat16:
+            raise ValueError("Fused indexer projection requires original BF16 weights")
+        super().weight_loader(param, loaded_weight, loaded_shard_id)
+        self._checkpoint_shards.add(loaded_shard_id)
+
+    def process_weights_after_loading(self):
+        if self._require_checkpoint_shards and self._checkpoint_shards != {0, 1, 2, 3}:
+            raise RuntimeError(
+                "Incomplete fused indexer projection: missing checkpoint slices "
+                f"{sorted({0, 1, 2, 3} - self._checkpoint_shards)}"
+            )
+        super().process_weights_after_loading()
+
+
+def indexer_projection_fusable(quant_config, attn_prefix: str) -> bool:
+    """Whether an MLA layer's indexer wk / weights_proj can ride in its
+    fused_qkv_a_proj (``FusedIndexerProjection``): all three run unquantized
+    BF16, so packing changes no layer's format."""
+    return all(
+        effective_layer_quant(quant_config, f"{attn_prefix}.{name}")[0] == QuantType.No
+        for name in ("fused_qkv_a_proj", "indexer.wk", "indexer.weights_proj")
+    )
 
 
 class IndexerWkWeightsProjLinear(MergedReplicatedLinear):
@@ -1460,11 +1530,32 @@ class Indexer(nn.Module):
         self._indexer_fp4 = sparse_indexer_fp4_enabled(
             atom_config.index_cache_dtype, config
         )
+        self._index_cache_layout = (
+            (atom_config.index_cache_layout or PRESHUFFLE)
+            if self._indexer_fp4
+            else PRESHUFFLE
+        )
+        self._indexer_opus = self._indexer_fp4 and self._index_cache_layout == MFMA
         # self.indexer_cfg = config.attn_module_list_cfg[0]["attn_index"]
         self.topk_tokens = config.index_topk
         self.n_head = config.index_n_heads  # 64
         self.head_dim = config.index_head_dim  # 128
         self.rope_dim = getattr(config, "index_rope_dim", config.qk_rope_head_dim)
+        if self._indexer_opus:
+            if self.n_head not in (32, 64) or self.rope_dim not in (0, 64):
+                raise ValueError("OPUS DSA FP4 requires 32/64 heads and RoPE 0/64")
+            from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+            connector = KVConnectorFactory.connector_name(
+                atom_config.kv_transfer_config
+            )
+            if atom_config.plugin_config or (
+                atom_config.kv_transfer_config and connector != "lmcache_mp"
+            ):
+                raise ValueError(
+                    "OPUS DSA FP4 supports only standalone lmcache_mp cache transfer; "
+                    "other connectors and plugin routes are not yet supported"
+                )
         # A NoPE FP8 cache has its own writer: the RoPE writer requires 64
         # rotary lanes and uses a different Q scale policy. Under DCP every
         # rank still projects all Q rows; the writer skips negative K slots.
@@ -1475,9 +1566,13 @@ class Indexer(nn.Module):
             and not pcp_is_enabled()
         )
         self.external_k_weights = external_k_weights
-        if external_k_weights and not self.use_nope_cache_fusion:
+        # the q latent it is handed comes quantized with a scale (the owner's
+        # fused q norm + quant for q_b_proj); set by the owning attention
+        self.quantized_q = False
+        if external_k_weights and pcp_is_enabled():
             raise ValueError(
-                "External indexer projections require the FP8 NoPE writer and PCP1"
+                "External indexer projections require PCP1: the PCP op "
+                "(sparse_attn_indexer_pcp) projects k from the hidden states"
             )
         self.q_lora_rank = q_lora_rank  # 1536
         # no tensor parallel, just replicated
@@ -1533,9 +1628,8 @@ class Indexer(nn.Module):
         self._weights_scale = self.softmax_scale * self.n_head**-0.5
         if self._indexer_fp4:
             assert_fp4_indexer_supported(
-                fused_writer=self.use_qk_rope_cache_fusion,
+                packed_writer=self.use_qk_rope_cache_fusion or self._indexer_opus,
                 prefill_context_parallel=pcp_is_enabled(),
-                prefill_ubatching=get_current_atom_config().enable_tbo,
             )
 
         # TODO (zyongye) change dim to fp8 later to (self.head_dim + 4)
@@ -1653,7 +1747,7 @@ class Indexer(nn.Module):
         # for padded rows, and only the owner rank writes K cache.
         unfused_qk_rope = (not self.use_qk_rope_cache_fusion) or pcp
         positions_op = positions
-        if self.use_nope_cache_fusion:
+        if self.use_nope_cache_fusion or self._indexer_opus:
             # The custom op publishes the normalized K and folds Q scales into
             # head weights in one launch. Pass the unnormalized BF16 projections.
             q_input = q
@@ -1661,8 +1755,7 @@ class Indexer(nn.Module):
             if pcp:
                 pcp_ws = get_pcp_world_size()
                 # k is 1/pcp (from 1/pcp hidden); gather to full padded [S_pad].
-                k = pcp_allgather_rerange(k, pcp_ws)
-                positions_op = pcp_allgather_rerange(positions, pcp_ws)
+                k, positions_op = pcp_allgather_rerange_many([k, positions], pcp_ws)
             k = self.k_norm(k)
             if self.rope_dim:
                 q_pe, _ = torch.split(
@@ -1728,6 +1821,11 @@ class Indexer(nn.Module):
             rotary_emb.is_neox_style if self.rope_dim else False,
             not unfused_qk_rope,
             self.stable_topk,
+            **(
+                {"kv_cache_scale": self.k_cache.kv_cache_scale}
+                if self._indexer_opus
+                else {}
+            ),
         )
 
 
@@ -1755,6 +1853,7 @@ class DeepseekV2MLAAttention(nn.Module):
         prefix: str = "",
         layer_num: int = 0,
         use_indexer_wk_weights_proj_fusion: bool | None = None,
+        fold_indexer_projection: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -1825,14 +1924,36 @@ class DeepseekV2MLAAttention(nn.Module):
             #                                  bias=False,
             #                                  quant_config=quant_config,
             #                                  prefix=f"{prefix}.q_a_proj")
-            self.fused_qkv_a_proj = MergedReplicatedLinear(
-                self.hidden_size,
-                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-                bias=False,
-                quant_config=quant_config,
-                source_quant_dtype=source_quant_dtype,
-                prefix=f"{prefix}.fused_qkv_a_proj",
+            # a layer with its own indexer (``_fold_indexer_projection``)
+            fold_indexer = fold_indexer_projection and not _indexer_weights_shared(
+                config, prefix
             )
+            projection_sizes = [
+                self.q_lora_rank,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+            ]
+            self.qkv_a_split = [self.q_lora_rank, self.kv_lora_rank, qk_rope_head_dim]
+            if fold_indexer:
+                # the indexer's k and head weights ride in the same GEMM
+                index_sizes = [config.index_head_dim, config.index_n_heads]
+                self.qkv_a_split += index_sizes
+                self.fused_qkv_a_proj = FusedIndexerProjection(
+                    self.hidden_size,
+                    projection_sizes + index_sizes,
+                    bias=False,
+                    quant_config=None,
+                    prefix=f"{prefix}.fused_qkv_a_proj",
+                    require_checkpoint_shards=not get_current_atom_config().load_dummy,
+                )
+            else:
+                self.fused_qkv_a_proj = MergedReplicatedLinear(
+                    self.hidden_size,
+                    projection_sizes,
+                    bias=False,
+                    quant_config=quant_config,
+                    source_quant_dtype=source_quant_dtype,
+                    prefix=f"{prefix}.fused_qkv_a_proj",
+                )
             # The fused qkv_a_proj forward calls *preshuffle* blockscale GEMMs, so
             # its weight must be 16x16-shuffled even when the global non-preshuffle
             # path (ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0) is selected. The loader
@@ -1973,6 +2094,7 @@ class DeepseekV2MLAAttention(nn.Module):
                         else use_indexer_wk_weights_proj_fusion
                     ),
                     f"{prefix}.indexer",
+                    external_k_weights=fold_indexer_projection,
                 )
                 # Bind the indexer's rope so forward_impl (and the opaque
                 # sparse_attn_indexer_pcp op) can rope without receiving a
@@ -2045,6 +2167,11 @@ class DeepseekV2MLAAttention(nn.Module):
             and eff_dtype in (dtypes.fp8, dtypes.fp4x2)
         ):
             self.fuse_qknorm_quant = True
+        if self.indexer is not None:
+            # the fused q norm quantizes q for q_b_proj (``_fuse_rmsnorm_quant``)
+            self.indexer.quantized_q = (
+                self.fuse_qknorm_quant or self.fuse_qknorm
+            ) and eff_dtype in (dtypes.fp8, dtypes.fp4x2)
 
     def forward(
         self,
@@ -2057,6 +2184,7 @@ class DeepseekV2MLAAttention(nn.Module):
         # normed activation for the v32 indexer (see RMSNorm.fused_quant_emit_bf16);
         # a 2-tuple (fp8, scale) is the plain fused-quant output.
         indexer_hidden = None
+        projected_k_weights = None  # the indexer's k and head weights, when folded
         if isinstance(hidden_states, tuple):
             if len(hidden_states) == 3:
                 hidden_states, hidden_states_scale, indexer_hidden = hidden_states
@@ -2101,11 +2229,10 @@ class DeepseekV2MLAAttention(nn.Module):
             else:
                 qkv_lora = self.fused_qkv_a_proj(hidden_states, hidden_states_scale)
                 # ckq = self.q_a_proj(hidden_states)
-                q_c, kv_c, k_pe = torch.split(
-                    qkv_lora,
-                    [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim],
-                    dim=-1,
+                q_c, kv_c, k_pe, *index_kw = torch.split(
+                    qkv_lora, self.qkv_a_split, dim=-1
                 )
+                projected_k_weights = tuple(index_kw) or None
                 # fuse q_c norm + kv_c norm + quant of hidden_states_or_q_c
                 if self.fuse_qknorm_quant or self.fuse_qknorm:
                     q_shuffle = False
@@ -2159,6 +2286,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 hidden_states_or_q_c_scale,
                 positions,
                 self.indexer_rope_emb,
+                projected_k_weights=projected_k_weights,
             )
 
         return self.mla_attn(
@@ -2181,6 +2309,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         is_mtp_block: bool = False,
         alt_stream: torch.cuda.Stream | None = None,
         use_indexer_wk_weights_proj_fusion: bool | None = None,
+        fold_indexer_projection: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -2207,6 +2336,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             prefix=f"{prefix}.self_attn",
             layer_num=layer_num,
             use_indexer_wk_weights_proj_fusion=use_indexer_wk_weights_proj_fusion,
+            fold_indexer_projection=fold_indexer_projection,
         )
 
         # Keep input RMSNorm quant fusion narrow: non-Triton FP8 activation quant is only supported for per-token layouts.
@@ -2504,6 +2634,7 @@ class DeepseekV2Model(nn.Module):
         prefix: str = "",
         layer_type: type[nn.Module] = DeepseekV2DecoderLayer,
         use_indexer_wk_weights_proj_fusion: bool | None = None,
+        fold_indexer_projection: bool = False,
     ):
         super().__init__()
 
@@ -2550,6 +2681,7 @@ class DeepseekV2Model(nn.Module):
                 layer_num=layer_num,
                 alt_stream=_alt_stream,
                 use_indexer_wk_weights_proj_fusion=use_indexer_wk_weights_proj_fusion,
+                fold_indexer_projection=fold_indexer_projection,
             ),
             prefix=f"{prefix}.layers",
             layer_num_offset=0,
@@ -2665,7 +2797,17 @@ class DeepseekV2ForCausalLM(nn.Module):
                 "gate_proj": ("gate_up_proj", 0),
                 "up_proj": ("gate_up_proj", 1),
             }
-        if use_indexer_wk_weights_proj_fusion:
+        fold_indexer_projection = _fold_indexer_projection(
+            config, quant_config, model_prefix
+        )
+        if fold_indexer_projection:
+            self.packed_modules_mapping.update(
+                {
+                    "indexer.wk": ("fused_qkv_a_proj", 2),
+                    "indexer.weights_proj": ("fused_qkv_a_proj", 3),
+                }
+            )
+        elif use_indexer_wk_weights_proj_fusion:
             self.packed_modules_mapping.update(
                 {
                     "indexer.wk": ("indexer.wk_weights_proj", 0),
@@ -2678,6 +2820,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             prefix=model_prefix,
             layer_type=layer_type,
             use_indexer_wk_weights_proj_fusion=use_indexer_wk_weights_proj_fusion,
+            fold_indexer_projection=fold_indexer_projection,
         )
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
@@ -2740,9 +2883,12 @@ class DeepseekV2ForCausalLM(nn.Module):
         # forward IntermediateTensors (already 1/pcp) unchanged.
         if pcp and get_pp_group().is_last_rank:
             if isinstance(hidden_states, tuple):
-                hs, aux = hidden_states
-                hs = pcp_allgather_rerange(hs, pcp_ws)[:n_global]
-                aux = [pcp_allgather_rerange(a, pcp_ws)[:n_global] for a in aux]
+                hs, *aux = (
+                    g[:n_global]
+                    for g in pcp_allgather_rerange_many(
+                        [hidden_states[0], *hidden_states[1]], pcp_ws
+                    )
+                )
                 hidden_states = (hs, aux)
             elif isinstance(hidden_states, torch.Tensor):
                 hidden_states = pcp_allgather_rerange(hidden_states, pcp_ws)[:n_global]

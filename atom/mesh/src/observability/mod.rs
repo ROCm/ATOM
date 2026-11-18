@@ -9,4 +9,5 @@ pub mod request_id;
 pub mod ttft;
 
 pub(crate) mod request;
+pub(crate) mod route_trace;
 pub(crate) mod usage;

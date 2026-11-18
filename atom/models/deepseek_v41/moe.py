@@ -118,6 +118,7 @@ class MoE(V4MoE):
         before_stage2_for_rows=None,
         before_shared_add=None,
         stage2_stream: torch.cuda.Stream | None = None,
+        shared_ready: torch.cuda.Event | None = None,
     ) -> tuple[torch.Tensor, bool]:
         routed, is_complete = self.experts.forward_maybe_comm_fused(
             x,
@@ -126,6 +127,7 @@ class MoE(V4MoE):
             before_stage2_for_rows=before_stage2_for_rows,
             before_shared_add=before_shared_add,
             stage2_stream=stage2_stream,
+            shared_ready=shared_ready,
         )
         # create_comm_fused_moe_backend excludes TBO (and DP > 1), so TBO
         # returns the fallback routed output before shared combine/mHC.

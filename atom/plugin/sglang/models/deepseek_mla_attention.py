@@ -74,10 +74,10 @@ class SGLangDeepseekMLAAttention(nn.Module):
     ):
         if tensor is None or not input_scattered:
             return tensor
-        from sglang.srt.distributed import get_tp_group
+        from sglang.srt.runtime_context import get_parallel
 
         output = tensor.new_empty((total_tokens, *tensor.shape[1:]))
-        get_tp_group().all_gather_into_tensor(output, tensor)
+        get_parallel().tp_group.all_gather_into_tensor(output, tensor)
         return output
 
     def _gather_runtime_inputs(
@@ -222,12 +222,16 @@ class SGLangDeepseekMLAAttention(nn.Module):
         if atom_pcp_on:
             from atom.distributed.pcp_utils import (
                 get_pcp_world_size,
-                pcp_allgather_rerange,
+                pcp_allgather_rerange_many,
             )
 
             pcp_ws = get_pcp_world_size()
-            k_nope = pcp_allgather_rerange(k_nope.squeeze(1), pcp_ws).unsqueeze(1)
-            k_pe = pcp_allgather_rerange(k_pe.squeeze(1), pcp_ws).unsqueeze(1)
+            k_nope, k_pe = (
+                g.unsqueeze(1)
+                for g in pcp_allgather_rerange_many(
+                    [k_nope.squeeze(1), k_pe.squeeze(1)], pcp_ws
+                )
+            )
         elif dsa_use_prefill_cp(forward_batch):
             latent_cache = torch.cat([k_nope.squeeze(1), k_pe.squeeze(1)], dim=-1)
             k_nope, k_pe = attn.rebuild_cp_kv_cache(
@@ -387,7 +391,9 @@ class SGLangDeepseekMLAAttention(nn.Module):
         attn = self.owner_attn
         forward_batch = self._get_forward_batch(kwargs)
 
-        from sglang.srt.layers.communicator import get_attn_tp_context
+        from sglang.srt.layers.layer_boundary.adapters.attention import (
+            get_attn_tp_context,
+        )
 
         from atom.plugin.sglang.models.deepseek_mla_forward import (
             _can_run_non_absorbed_mla_now,

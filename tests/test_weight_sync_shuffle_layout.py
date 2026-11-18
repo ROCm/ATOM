@@ -29,6 +29,7 @@ if not torch.cuda.is_available():
     )
 
 from aiter import QuantType, dtypes
+from conftest import atom_config_double
 
 from atom.model_ops import linear as linear_mod
 from atom.model_ops.linear import (
@@ -37,6 +38,7 @@ from atom.model_ops.linear import (
     weight_is_stored_preshuffled,
 )
 from atom.rollout.weight_updater import WeightUpdaterMixin
+from atom.utils.selector import Family
 
 PRESHUFFLE_ENV = "ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE"
 
@@ -152,7 +154,9 @@ def _linear_double(quant_type, params_dtype, needs_preshuffled_weight, *, dim=2)
     quant config and a device allocation per row; the method under test is the
     real one.
     """
-    shape = (32, 64) if dim == 2 else (2, 32, 64)
+    # 128 bytes = K 256 for fp4x2: a smaller K is now refused at load
+    # (MXFP4_PRESHUFFLE_K_ALIGN), which is not what these tests are about.
+    shape = (32, 128) if dim == 2 else (2, 32, 128)
     return SimpleNamespace(
         weight=nn.Parameter(torch.zeros(shape, dtype=torch.uint8), requires_grad=False),
         weight_scale=nn.Parameter(torch.ones(32, 1), requires_grad=False),
@@ -178,8 +182,12 @@ def _updater_double():
         device = torch.device("cpu")
         rank = 0
         world_size = 1
+        config = atom_config_double()
+        attn_family = Family.MHA
 
-    return _Updater()
+    updater = _Updater()
+    updater._init_weight_updater()
+    return updater
 
 
 def _loader_shuffles(monkeypatch, case, *, dim=2):
@@ -200,7 +208,9 @@ def _sync_shuffles(monkeypatch, case, *, dim=2):
     calls = []
     monkeypatch.setattr(utils_mod, "shuffle_weights", lambda *a, **k: calls.append(a))
     quant_type, params_dtype, needs_preshuffled_weight = case
-    shape = (32, 64) if dim == 2 else (2, 32, 64)
+    # 128 bytes = K 256 for fp4x2: a smaller K is now refused at load
+    # (MXFP4_PRESHUFFLE_K_ALIGN), which is not what these tests are about.
+    shape = (32, 128) if dim == 2 else (2, 32, 128)
     param = nn.Parameter(torch.zeros(shape, dtype=torch.uint8), requires_grad=False)
     module = SimpleNamespace(
         quant_type=quant_type,

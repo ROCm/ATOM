@@ -9,7 +9,7 @@ ATOM's common controls and attach top-level tool schemas to the system turn.
 
 from typing import Any
 
-from .reasoning_controls import ReasoningRules
+from .reasoning_controls import SUPPORTED_EFFORT_LEVELS, ReasoningRules
 
 
 def normalize_effort(effort: Any) -> str | int | None:
@@ -20,7 +20,7 @@ def normalize_effort(effort: Any) -> str | int | None:
         effort = {"minimal": "low", "medium": "high", "xhigh": "high"}.get(
             effort, effort
         )
-        if effort in ("none", "low", "high", "max"):
+        if effort == "none" or effort in SUPPORTED_EFFORT_LEVELS:
             return effort
     elif type(effort) is int and 1 <= effort <= 100:
         return effort

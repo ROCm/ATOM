@@ -21,6 +21,16 @@ from dataclasses import dataclass
 COLLECTIVE_RPC_CMD = "collective_rpc"
 DISCARD_WEIGHT_SYNC_CMD = "discard_failed_weight_sync"
 FINISH_WEIGHT_SYNC_CMD = "finish_weight_sync"
+RECEIVE_WEIGHTS_RDMA_CMD = "receive_weights_rdma"
+INIT_RDMA_WEIGHT_GROUP_CMD = "init_rdma_weight_group"
+DESTROY_RDMA_WEIGHT_GROUP_CMD = "destroy_rdma_weight_group"
+
+
+class WeightReloadRefused(RuntimeError):
+    """A rank refused a sync before writing any of it: a reload cannot
+    rewrite this model's weights in place, or the update failed before its
+    first write. Its reply says so in ``RpcResult.refused_before_writing``."""
+
 
 # The runner methods the public collective_rpc runs, and so the ones a
 # capability report advertises. An allowlist: the rest of a runner -- its
@@ -33,6 +43,13 @@ COLLECTIVE_RPC_METHODS = frozenset(
         "configure_hidden_states",
         # capability discovery itself
         "get_worker_capabilities",
+        # Request admission; compilation only, no GPU work or collectives.
+        "prepare_structured_output",
+        "release_constraints",
+        # Joining and leaving the trainer's RDMA weight group; the stream it
+        # carries is the receive_weights_rdma utility command.
+        INIT_RDMA_WEIGHT_GROUP_CMD,
+        DESTROY_RDMA_WEIGHT_GROUP_CMD,
     }
 )
 
@@ -44,6 +61,7 @@ UTILITY_MANAGED_RUNNER_METHODS = frozenset(
         "update_weights",
         "update_weights_from_shm",
         "update_weights_from_ipc",
+        RECEIVE_WEIGHTS_RDMA_CMD,
         DISCARD_WEIGHT_SYNC_CMD,
         "release_memory",
         "resume_memory",
@@ -151,6 +169,10 @@ class RpcResult:
     tp_rank: int
     value: object = None
     error: str | None = None
+    # Nothing of the call was written on this rank: it raised
+    # WeightReloadRefused, or was never sent. Carried apart from *error*,
+    # whose text is free.
+    refused_before_writing: bool = False
 
     @property
     def ok(self) -> bool:
