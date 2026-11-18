@@ -227,8 +227,8 @@ checkpoint with its dense linears stored as per-channel FP8.
   config, the comm-fused MoE backend is off.
 - **BF16 fallback.** AITER has no group32 FP8 GEMM on gfx942, so the linears
   the checkpoint keeps native 32x32 (`wo_a` and DSpark's draft) are
-  dequantized to BF16 at load. They are 1.8 GiB as FP8 (`wo_a` 1.25 GiB, the
-  draft 0.53 GiB) and take twice that as BF16.
+  dequantized to BF16 at load. At TP4 that costs 0.31 GiB more per GPU for
+  `wo_a`, and with DSpark another 0.21 GiB for the draft.
 - **AITER.** Needs [#8086](https://github.com/ROCm/aiter/pull/8086) (the
   group32 GEMM query) and [#8178](https://github.com/ROCm/aiter/pull/8178)
   (the clamped per-channel FP8 MoE at this checkpoint's 576-wide TP4
