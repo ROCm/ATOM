@@ -18,6 +18,7 @@ on either side of it are device-to-device. A backend subclasses
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import threading
 from collections import deque
@@ -25,6 +26,33 @@ from itertools import pairwise
 from typing import Any
 
 import torch
+
+
+def _hsa_alloc_base(data_ptr: int) -> tuple[int, int]:
+    """Return (base_ptr, alloc_size) of the hipMalloc block containing data_ptr.
+
+    hipIpcGetMemHandle requires the start of a hipMalloc allocation, not an
+    interior pointer. PyTorch's caching allocator may sub-allocate from a larger
+    block; hipMemGetAddressRange returns the true allocation base and size.
+    """
+    for name in ("libamdhip64.so.0", "libamdhip64.so"):
+        try:
+            _lib = ctypes.CDLL(name, use_errno=False)
+            break
+        except OSError:
+            continue
+    else:
+        raise RuntimeError("libamdhip64 not found; cannot call hipMemGetAddressRange")
+    base = ctypes.c_void_p()
+    size = ctypes.c_size_t()
+    err = _lib.hipMemGetAddressRange(
+        ctypes.byref(base), ctypes.byref(size), ctypes.c_void_p(data_ptr)
+    )
+    if err != 0:
+        raise RuntimeError(
+            f"hipMemGetAddressRange(ptr={data_ptr:#x}) returned error {err}"
+        )
+    return int(base.value), int(size.value)
 
 logger = logging.getLogger("atom")
 
@@ -140,15 +168,13 @@ class TransferSlotPool:
         # Register before any slot is handed out: a put from an unregistered
         # address fails every time.
         #
-        # hipIpcGetMemHandle requires the START of a hipMalloc allocation, not
-        # an interior pointer. Register the entire backing (from backing.data_ptr())
-        # so the IPC handle covers a valid allocation start. With
-        # PYTORCH_NO_CUDA_MEMORY_CACHING=1, torch.empty() calls hipMalloc
-        # directly, making backing.data_ptr() the start of a hipMalloc. Slot
-        # pointers (self.base_ptr + k*stride) all lie within this registered
-        # range, so the server can access them via offset arithmetic.
-        self._reg_base_ptr = int(self._backing.data_ptr())
-        client.register(self._reg_base_ptr, len(self._backing))
+        # hipIpcGetMemHandle requires the start of a hipMalloc allocation, not
+        # an interior pointer. PyTorch's caching allocator may sub-allocate from
+        # a larger block; hipMemGetAddressRange returns the true allocation base.
+        # Slots lie within [base, base+alloc_size), so the server can access
+        # any slot via offset arithmetic from the mapped IPC pointer.
+        self._reg_base_ptr, _reg_size = _hsa_alloc_base(int(self._backing.data_ptr()))
+        client.register(self._reg_base_ptr, _reg_size)
         self._client = client
         self._slots: dict[str, list[Slot]] = {}
         position = 0
