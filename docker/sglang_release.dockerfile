@@ -2,10 +2,7 @@ ARG SGLANG_BASE_IMAGE="rocm/atom-dev:latest"
 ARG GPU_ARCH="gfx942;gfx950"
 
 # SGLang image extends an ATOM base image and layers on an sglang checkout.
-# sglang_base also serves as the read-only source of the base image's Triton
-# for the restore step below.
-FROM ${SGLANG_BASE_IMAGE} AS sglang_base
-FROM sglang_base AS atom_sglang
+FROM ${SGLANG_BASE_IMAGE} AS atom_sglang
 
 ARG GPU_ARCH
 ARG VENV_PYTHON="/opt/venv/bin/python"
@@ -30,8 +27,29 @@ RUN echo "========== [SGLANG-ATOM 1/6] Clone SGLang ==========" && \
     echo "sglang ref:" && \
     git rev-parse HEAD
 
-RUN echo "========== [SGLANG-ATOM 2/6] Build sglang kernel ==========" && \
-    "${VENV_PYTHON}" -m pip uninstall -y sgl-kernel sglang-kernel sglang || true && \
+# Keep SGLang aligned with the Triton that the ATOM base image ships.  SGLang
+# runtime installs can perturb Triton; restore the base package before final
+# validation so ATOM, AITER, triton_kernels, and SGLang run with one coherent
+# runtime stack, matching the vLLM/OOT image policy.
+# The backup, every install that can perturb Triton, and the restore share one
+# RUN so the ~1.6 GB backup is never stored in a layer; the copy-back only
+# happens when the installed tree differs from the backup.
+# The editable sglang install compiles its Rust extension and copies it into
+# python/sglang/srt/rust_extensions/; only the linked .so files in
+# rust/target/release are kept, and the crates cargo downloaded are dropped.
+RUN echo "========== [SGLANG-ATOM 2/6] Back up base image Triton ==========" && \
+    SITE_PACKAGES=$("${VENV_PYTHON}" -c "import sysconfig; print(sysconfig.get_path('purelib'))") && \
+    BASE_TRITON_VERSION="$("${VENV_PYTHON}" -c "import triton; print(triton.__version__)")" && \
+    mkdir -p /tmp/triton-base-backup && \
+    cp -a "${SITE_PACKAGES}/triton" /tmp/triton-base-backup/ && \
+    for f in "${SITE_PACKAGES}"/triton-*.dist-info; do \
+      [ -d "$f" ] || continue; \
+      cp -a "$f" /tmp/triton-base-backup/; \
+    done && \
+    echo "Base image Triton backed up: import_version=${BASE_TRITON_VERSION}" && \
+    ls /tmp/triton-base-backup/ && \
+    echo "========== [SGLANG-ATOM 2/6] Build sglang kernel ==========" && \
+    { "${VENV_PYTHON}" -m pip uninstall -y sgl-kernel sglang-kernel sglang || true; } && \
     "${VENV_PYTHON}" -m pip install --upgrade pip setuptools wheel && \
     DETECTED_AMDGPU_TARGET="$("${VENV_PYTHON}" -c "import torch; print(torch.cuda.get_device_properties(0).gcnArchName.split(':')[0] if torch.cuda.is_available() else '')" 2>/dev/null || true)" && \
     if [ -n "${DETECTED_AMDGPU_TARGET}" ]; then \
@@ -44,12 +62,8 @@ RUN echo "========== [SGLANG-ATOM 2/6] Build sglang kernel ==========" && \
     fi && \
     cd /app/sglang/python/sglang/kernels/aot && \
     AMDGPU_TARGET="${FINAL_AMDGPU_TARGET}" "${VENV_PYTHON}" setup_rocm.py install && \
-    "${VENV_PYTHON}" -m pip show sglang-kernel || true
-
-# The editable sglang install compiles its Rust extension and copies it into
-# python/sglang/srt/rust_extensions/; only the linked .so files in
-# rust/target/release are kept, and the crates cargo downloaded are dropped.
-RUN echo "========== [SGLANG-ATOM 3/6] Install SGLang dependencies ==========" && \
+    { "${VENV_PYTHON}" -m pip show sglang-kernel || true; } && \
+    echo "========== [SGLANG-ATOM 3/6] Install SGLang dependencies ==========" && \
     cd /app/sglang/python && \
     rm -f pyproject.toml && \
     cp pyproject_other.toml pyproject.toml && \
@@ -102,28 +116,15 @@ RUN echo "========== [SGLANG-ATOM 3/6] Install SGLang dependencies ==========" &
       find release -mindepth 1 -maxdepth 1 ! -name '*.so' -exec rm -rf {} +; \
     fi && \
     rm -rf /root/.cargo/registry /root/.cargo/git && \
-    "${VENV_PYTHON}" -m pip show sglang torch triton transformers IPython orjson pybase64 petit-kernel wave-lang xgrammar outlines apache-tvm-ffi || true
-
-# Keep SGLang aligned with the Triton that the ATOM base image ships.  SGLang
-# runtime installs can perturb Triton; restore the base package before final
-# validation so ATOM, AITER, triton_kernels, and SGLang run with one coherent
-# runtime stack, matching the vLLM/OOT image policy above.
-# The base image's Triton is read through a bind mount of sglang_base instead
-# of a /tmp backup: a backup taken in an earlier RUN stays in that layer even
-# after it is deleted, and copying back an unchanged tree writes the same
-# ~1.6 GB again. Restore only when the installed tree differs from the base.
-RUN --mount=type=bind,from=sglang_base,source=/opt/venv,target=/tmp/base-venv \
+    { "${VENV_PYTHON}" -m pip show sglang torch triton transformers IPython orjson pybase64 petit-kernel wave-lang xgrammar outlines apache-tvm-ffi || true; } && \
     echo "========== [SGLANG-ATOM 4/6] Restore base image Triton ==========" && \
-    SITE_PACKAGES=$("${VENV_PYTHON}" -c "import sysconfig; print(sysconfig.get_path('purelib'))") && \
-    BASE_SITE_PACKAGES="/tmp/base-venv${SITE_PACKAGES#/opt/venv}" && \
-    test -d "${BASE_SITE_PACKAGES}/triton" && \
-    BASE_DIST_INFO="$(cd "${BASE_SITE_PACKAGES}" && ls -d triton-*.dist-info 2>/dev/null | sort | tr '\n' ' ')" && \
+    BASE_DIST_INFO="$(cd /tmp/triton-base-backup && ls -d triton-*.dist-info 2>/dev/null | sort | tr '\n' ' ')" && \
     CUR_DIST_INFO="$(cd "${SITE_PACKAGES}" && ls -d triton-*.dist-info 2>/dev/null | sort | tr '\n' ' ')" && \
     TRITON_CHANGED=0 && \
     if [ "${BASE_DIST_INFO}" != "${CUR_DIST_INFO}" ]; then TRITON_CHANGED=1; fi && \
     if [ "${TRITON_CHANGED}" = "0" ]; then \
       for p in triton ${BASE_DIST_INFO}; do \
-        diff -rq -x __pycache__ "${BASE_SITE_PACKAGES}/${p}" "${SITE_PACKAGES}/${p}" >/dev/null \
+        diff -rq -x __pycache__ "/tmp/triton-base-backup/${p}" "${SITE_PACKAGES}/${p}" >/dev/null \
           || { TRITON_CHANGED=1; break; }; \
       done; \
     fi && \
@@ -134,12 +135,13 @@ RUN --mount=type=bind,from=sglang_base,source=/opt/venv,target=/tmp/base-venv \
       { "${VENV_PYTHON}" -m pip uninstall -y triton 2>/dev/null || true; } && \
       rm -rf "${SITE_PACKAGES}/triton" \
              "${SITE_PACKAGES}"/triton-*.dist-info && \
-      cp -a "${BASE_SITE_PACKAGES}/triton" "${SITE_PACKAGES}/" && \
-      for f in "${BASE_SITE_PACKAGES}"/triton-*.dist-info; do \
+      cp -a /tmp/triton-base-backup/triton "${SITE_PACKAGES}/" && \
+      for f in /tmp/triton-base-backup/triton-*.dist-info; do \
         [ -d "$f" ] || continue; \
         cp -a "$f" "${SITE_PACKAGES}/"; \
       done; \
     fi && \
+    rm -rf /tmp/triton-base-backup && \
     "${VENV_PYTHON}" -c "import triton; print(f'triton.__version__ = {triton.__version__}')" && \
     "${VENV_PYTHON}" -m pip show triton
 

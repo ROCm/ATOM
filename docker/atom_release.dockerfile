@@ -446,12 +446,16 @@ PY
 # incremental. Generated sources and JIT metadata (compiled_kids_opus.json)
 # stay. Only byte-identical copies are removed.
 RUN cd /app/aiter-test/aiter/jit && \
-    echo "aiter/jit/build before cleanup: $(du -sh build | cut -f1)" && \
-    find build -name '*.o' -type f -delete && \
-    find build -path '*/build/*.so' -type f | while read -r so; do \
-        if cmp -s "${so}" "$(basename "${so}")"; then rm -f "${so}"; fi; \
-    done && \
-    echo "aiter/jit/build after cleanup: $(du -sh build | cut -f1)"
+    if [ ! -d build ]; then \
+        echo "aiter/jit/build does not exist (PREBUILD_KERNELS=${PREBUILD_KERNELS}); nothing to clean up"; \
+    else \
+        echo "aiter/jit/build before cleanup: $(du -sh build | cut -f1)" && \
+        find build -name '*.o' -type f -delete && \
+        find build -path '*/build/*.so' -type f | while read -r so; do \
+            if cmp -s "${so}" "$(basename "${so}")"; then rm -f "${so}"; fi; \
+        done && \
+        echo "aiter/jit/build after cleanup: $(du -sh build | cut -f1)"; \
+    fi
 
 # The LMCache wheel, published by .github/workflows/lmcache-rocm-wheel.yaml.
 FROM ${LMCACHE_WHEEL_IMAGE} AS lmcache_wheel
