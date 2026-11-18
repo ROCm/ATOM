@@ -1074,13 +1074,16 @@ def test_mxfp4_apply_hands_the_shared_output_to_fused_experts(
 def test_dsv4_dual_stream_decode_token_threshold(
     monkeypatch, atom_modules, env, expected
 ):
-    """The V4 MoE's decode bound: 1536 unless the variable is set, which wins."""
+    """The V4 MoE's decode bound: 1536 with EP unless the variable is set,
+    which wins; without EP the variable's value (1024 by default)."""
     if env is None:
         monkeypatch.delenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", raising=False)
     else:
         monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", env)
     v4 = atom_modules.deepseek_v4
-    assert v4.v4_dual_stream_decode_token_threshold() == expected
+    assert v4.v4_dual_stream_decode_token_threshold(use_ep=True) == expected
+    generic = 1024 if env is None else int(env)
+    assert v4.v4_dual_stream_decode_token_threshold(use_ep=False) == generic
 
 
 @pytest.mark.parametrize("phase", ["decode", "prefill", None])
@@ -1112,18 +1115,8 @@ def test_dual_stream_gate_widens_only_decode(monkeypatch, atom_modules, rows, ph
     assert dispatch._dual_stream_is_active(other, rows) == (rows <= 1024)
 
 
-@pytest.mark.parametrize(
-    ("env", "expected", "generic"),
-    [(None, 1536, 1024), ("2048", 2048, 2048), ("0", 0, 0)],
-)
-def test_dsv4_moe_init_sets_its_dual_stream_threshold(
-    monkeypatch, atom_modules, env, expected, generic
-):
-    """`MoE.__init__` itself stores the V4 bounds the dispatch gate reads."""
-    if env is None:
-        monkeypatch.delenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", raising=False)
-    else:
-        monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", env)
+def _v4_moe_built(monkeypatch, atom_modules, *, use_ep):
+    """A V4 `MoE` through its real `__init__`, GEMM/expert modules stubbed."""
     v4 = atom_modules.deepseek_v4
     forward_context = {}
     config = SimpleNamespace(
@@ -1137,6 +1130,7 @@ def test_dsv4_moe_init_sets_its_dual_stream_threshold(
         experts = torch.nn.Module()
         experts.num_fused_shared_experts = 0
         experts._comm_fused_moe = None
+        experts.moe_parallel_config = SimpleNamespace(use_ep=use_ep)
         return experts
 
     monkeypatch.setattr(v4, "FusedMoE", fused_moe)
@@ -1155,8 +1149,55 @@ def test_dsv4_moe_init_sets_its_dual_stream_threshold(
         moe_fp8_activations=False,
         vocab_size=32,
     )
-
     moe = v4.MoE(3, args, prefix="model.layers.3.ffn", alt_stream=object())
+    return moe, forward_context
+
+
+@pytest.mark.parametrize(
+    ("use_ep", "phase", "forks_at_1536"),
+    [
+        (True, "decode", True),
+        (True, "prefill", False),
+        (False, "decode", False),
+        (True, None, False),
+    ],
+)
+def test_dsv4_widens_only_expert_parallel_decode(
+    monkeypatch, atom_modules, use_ep, phase, forks_at_1536
+):
+    """A real V4 module forks 1025-1536-row steps only on EP decode steps;
+    EP prefill, non-EP decode and calls without a step context keep the
+    generic bound."""
+    monkeypatch.delenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", raising=False)
+    moe, _ = _v4_moe_built(monkeypatch, atom_modules, use_ep=use_ep)
+    dispatch = sys.modules["atom.model_ops.module_dispatch_ops"]
+    monkeypatch.setattr(dispatch, "plugin_graph_is_piecewise", lambda: False)
+    monkeypatch.setattr(
+        sys.modules["atom.utils.tbo.ubatching"], "tbo_active", lambda: False
+    )
+    context = None if phase is None else SimpleNamespace(is_prefill=phase == "prefill")
+    monkeypatch.setattr(
+        dispatch, "get_forward_context", lambda: SimpleNamespace(context=context)
+    )
+    assert dispatch._dual_stream_is_active(moe, 1024)
+    for rows in (1025, 1344, 1536):
+        assert dispatch._dual_stream_is_active(moe, rows) == forks_at_1536
+    assert not dispatch._dual_stream_is_active(moe, 1537)
+
+
+@pytest.mark.parametrize(
+    ("env", "expected", "generic"),
+    [(None, 1536, 1024), ("2048", 2048, 2048), ("0", 0, 0)],
+)
+def test_dsv4_moe_init_sets_its_dual_stream_threshold(
+    monkeypatch, atom_modules, env, expected, generic
+):
+    """`MoE.__init__` itself stores the V4 bounds the dispatch gate reads."""
+    if env is None:
+        monkeypatch.delenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", raising=False)
+    else:
+        monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", env)
+    moe, forward_context = _v4_moe_built(monkeypatch, atom_modules, use_ep=True)
 
     assert moe._dual_stream_decode_token_threshold == expected
     assert moe._dual_stream_token_threshold == generic
