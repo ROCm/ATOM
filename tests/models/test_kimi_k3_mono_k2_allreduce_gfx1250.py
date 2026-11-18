@@ -36,6 +36,21 @@ def test_lines_cover_the_routed_and_shared_partials(rows):
     assert ctas * ar.allreduce_threads(rows) >= ar.MAX_CTAS
 
 
+@pytest.mark.parametrize("rows", range(1, 81))
+def test_six_element_gathers_never_load_past_a_routed_row(rows):
+    # _gathered_words' load window: from min(column, ROUTED_WORDS - 3), the
+    # words shifted back; past the last route row's end may be unmapped
+    words = ar.PAYLOAD_WORDS
+    for line in range(-(-rows * LATENT // ar.LINE_ELEMENTS)):
+        column = line * words % ar.ROUTED_WORDS
+        start = min(column, ar.ROUTED_WORDS - words)
+        shift = column - start
+        assert 0 <= start and start + words <= ar.ROUTED_WORDS
+        for w in range(min(words, ar.ROUTED_WORDS - column)):
+            index = min(w + shift, words - 1)
+            assert index == w + shift and start + index == column + w
+
+
 def test_peer_banks_hold_two_epochs_of_every_source():
     assert ar.allreduce_peer_bytes(8, 40) == 2 * 8 * ar.allreduce_lines(40) * 16
     assert ar.allreduce_peer_bytes(8, 48) > ar.allreduce_peer_bytes(8, 40)
