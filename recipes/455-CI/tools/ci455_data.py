@@ -1,7 +1,8 @@
 """Pick and compare the 455-CI results in perf.csv and accuracy.csv.
 
-A session is one day's run (Saturday: MLPerf Endpoint, Wednesday: 8K/1K), on an
-image built that day from ATOM main and aiter main. Sessions are keyed by their
+A session is one day's run on an image built that day from ATOM main and aiter
+main: Saturday tests all eight models (GSM8K and performance), Wednesday GSM8K
+only. Sessions are keyed by their
 test date (ISO, so string order is date order); the image_date column only
 records which image a session used.
 

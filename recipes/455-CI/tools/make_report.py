@@ -3,8 +3,9 @@
 
     python3 make_report.py --date 2026-11-18 [--scenario endpoint|8k1k] [--data-dir recipes/455-CI] [--out FILE] [--mock]
 
-A session is one day's run (Saturday: MLPerf Endpoint, Wednesday: 8K/1K), each on
-the image built for it that day from ATOM main and aiter main. Writes one file,
+A session is one day's run on the image built for it that day from ATOM main
+and aiter main: Saturday tests all eight models (GSM8K and performance),
+Wednesday GSM8K only, so its result shows accuracy only. Writes one file,
 recipes/result/<YYYYMMDD>-result.md (the result dir next to the data dir, or
 --out), titled "<date> MI455 Workload Weekly Status Report": the lowlights and
 highlights (each left out when empty), the results table, the environment, the findings from

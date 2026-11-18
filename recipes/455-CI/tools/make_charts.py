@@ -74,7 +74,10 @@ def main(argv=None):
             for slug, name in MODELS[scenario]
             for conc in CONCURRENCIES
         ]
-        if any(trend for _, trend in panels):
+        if not any(r["scenario"] == scenario and r["test_date"] == day for r in perf):
+            # A GSM8K-only session (Wednesday): no throughput to add.
+            print(f"skip perf-{scenario}.png: no performance on {day}")
+        elif any(trend for _, trend in panels):
             os.makedirs(out, exist_ok=True)
             render_perf_trends(
                 panels,

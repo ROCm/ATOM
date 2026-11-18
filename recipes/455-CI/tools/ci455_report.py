@@ -138,7 +138,11 @@ def _news(results):
         who, top = short_name(r.name), headline(r)
         parts = _failed_parts(r)
         if parts:
-            everything = all(c.status != "ok" for c in r.perf) and r.acc.status != "ok"
+            # "all runs" counts only what ran: a GSM8K-only session (Wednesday)
+            # that fails says "GSM8K failed".
+            tried = [c for c in r.perf if c.status != "missing"]
+            tried += [r.acc] if r.acc.status != "missing" else []
+            everything = len(tried) > 1 and all(x.status == "fail" for x in tried)
             errors = [c.error for c in r.perf if c.error] + (
                 [r.acc.error] if r.acc.error else []
             )
@@ -342,6 +346,36 @@ def summary_row(r, date, ref):
     return [r.name, LABEL[r.scenario], prev, now, delta, acc]
 
 
+def perf_ran(results):
+    """Whether the session measured performance at all: Wednesdays only run
+    GSM8K, so their results table and details show accuracy only."""
+    return any(c.status != "missing" for r in results for c in r.perf)
+
+
+def accuracy_row(r, ref):
+    """Model, scenario, previous and current GSM8K (flexible-extract; the
+    previous one dated only when it is not from the `ref` session the column is
+    headed with), the change in points. N/A: GSM8K failed."""
+    a = r.acc
+    prev = (
+        "—"
+        if a.prev is None
+        else score(a.prev) + (f" ({a.prev_date})" if a.prev_date != ref else "")
+    )
+    if a.status == "fail":
+        now, delta = "N/A", "N/A"
+    elif a.value is None:
+        now, delta = "—", "—"
+    else:
+        now = score(a.value)
+        delta = (
+            "first"
+            if a.delta is None
+            else f"{acc_flag(a.delta)} {pts(a.delta)}".strip()
+        )
+    return [r.name, LABEL[r.scenario], prev, now, delta]
+
+
 def _perf_value(c):
     return {"ok": num(c.value) if c.value is not None else "—", "fail": "N/A"}.get(
         c.status, "—"
@@ -396,12 +430,23 @@ def _lights_and_results(date, env, results, followups):
     ):
         if table:
             out += [f"## {title}", "", *table, ""]
+    if perf_ran(results):
+        table = [
+            f"| Model | Scenario | {ref or '—'} (tok/s/GPU) | {date} (tok/s/GPU) | Delta | GSM8K delta |",
+            "|---|---|---|---|---|---|",
+            *["| " + " | ".join(summary_row(r, date, ref)) + " |" for r in results],
+        ]
+    else:
+        aref = max((r.acc.prev_date for r in results if r.acc.prev_date), default=None)
+        table = [
+            f"| Model | Scenario | {aref or '—'} (GSM8K) | {date} (GSM8K) | Delta |",
+            "|---|---|---|---|---|",
+            *["| " + " | ".join(accuracy_row(r, aref)) + " |" for r in results],
+        ]
     return out + [
         "## Results",
         "",
-        f"| Model | Scenario | {ref or '—'} (tok/s/GPU) | {date} (tok/s/GPU) | Delta | GSM8K delta |",
-        "|---|---|---|---|---|---|",
-        *["| " + " | ".join(summary_row(r, date, ref)) + " |" for r in results],
+        *table,
         "",
         "## Environment",
         "",
@@ -461,30 +506,32 @@ def _details(date, env, results, charts_dir, runs_dir, followups=None):
             (c.prev_date for r in mine for c in r.perf if c.prev_date), default=None
         )
         vs = f"vs {ref}" if ref else "vs —"
-        out += [
-            "",
-            f"### Performance · {label}",
-            "",
-            f"| Model | Parallelism | Concurrency | tok/s/GPU | {vs} | {SECOND_HEADER[scenario]} | {vs} |",
-            "|---|---|---|---|---|---|---|",
-        ]
-        for r in mine:
-            for c in r.perf:
-                sv = (
-                    num(c.second)
-                    if c.second is not None
-                    else ("N/A" if c.status == "fail" else "—")
-                )
-                sd = (
-                    pct(c.delta_second)
-                    if c.delta_second is not None
-                    else ("first" if c.second is not None else "—")
-                )
-                out.append(
-                    f"| {r.name} | {c.parallel or '—'} | {c.concurrency} | {_perf_value(c)} | "
-                    f"{_vs(c, _perf_delta(c, c.delta), ref, c.delta)} | {sv} | "
-                    f"{_vs(c, sd, ref, c.delta_second)} |"
-                )
+        measured = perf_ran(mine)  # a GSM8K-only session (Wednesday) has none
+        if measured:
+            out += [
+                "",
+                f"### Performance · {label}",
+                "",
+                f"| Model | Parallelism | Concurrency | tok/s/GPU | {vs} | {SECOND_HEADER[scenario]} | {vs} |",
+                "|---|---|---|---|---|---|---|",
+            ]
+            for r in mine:
+                for c in r.perf:
+                    sv = (
+                        num(c.second)
+                        if c.second is not None
+                        else ("N/A" if c.status == "fail" else "—")
+                    )
+                    sd = (
+                        pct(c.delta_second)
+                        if c.delta_second is not None
+                        else ("first" if c.second is not None else "—")
+                    )
+                    out.append(
+                        f"| {r.name} | {c.parallel or '—'} | {c.concurrency} | {_perf_value(c)} | "
+                        f"{_vs(c, _perf_delta(c, c.delta), ref, c.delta)} | {sv} | "
+                        f"{_vs(c, sd, ref, c.delta_second)} |"
+                    )
         aref = max((r.acc.prev_date for r in mine if r.acc.prev_date), default=None)
         avs = f"vs {aref}" if aref else "vs —"
         out += [
@@ -510,8 +557,11 @@ def _details(date, env, results, charts_dir, runs_dir, followups=None):
             "",
             f"### Trends · {label}",
             "",
-            f"![{label} throughput per GPU]({charts_dir}/perf-{scenario}.png)",
-            "",
+            *(
+                [f"![{label} throughput per GPU]({charts_dir}/perf-{scenario}.png)", ""]
+                if measured
+                else []
+            ),
             f"![{label} GSM8K]({charts_dir}/accuracy-{scenario}.png)",
         ]
     problems = {slug for category, slug, *_ in _news(results) if category in PROBLEM}

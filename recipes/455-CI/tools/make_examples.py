@@ -3,14 +3,15 @@
 the example result, recipes/result/example.md.
 
 Made-up numbers in the real layout (perf.csv, accuracy.csv, followups.csv,
-runs/) to show what a session's result looks like. Each week has two sessions,
-each on its own image: Saturday runs MLPerf Endpoint, Wednesday runs 8K/1K. The example
-result is the newest Saturday session (11-14), which has one of everything:
-Qwen-35B-A3B fails at c64 (a repro), DeepSeek R1 c64 drops 5% (our verified
-PR), DeepSeek-V4.1-Flash gains 6% but loses 5 GSM8K points (someone else's open
-PR), and Kimi-K3 recovers from a failed 11-07. The Wednesday session after it
-(11-18) only feeds the 8K/1K charts: GLM-5.2 c64 drops 4% and MiniMax-M3 loses
-4.7 GSM8K points. The charts and the result say EXAMPLE.
+runs/) to show what a session's result looks like. Each week has two
+sessions, each on its own image: Saturday tests all eight models (GSM8K and
+performance), Wednesday tests GSM8K only. The example result is the newest
+Saturday session (11-14), which has one of everything: Qwen-35B-A3B fails at
+c64 (a repro), DeepSeek R1 c64 drops 5% (our verified PR), DeepSeek-V4.1-Flash
+gains 6% but loses 5 GSM8K points (someone else's open PR), and Kimi-K3
+recovers from a failed 11-07. The Wednesday session after it (11-18) only
+feeds the accuracy charts: MiniMax-M3 loses 4.7 GSM8K points. The charts and
+the result say EXAMPLE.
 """
 
 import csv
@@ -188,71 +189,70 @@ def scale(model, conc, image):
         m *= 1.06
     if model == "deepseek-r1" and conc == 64 and image == NEWEST:
         m *= 0.95
-    if model == "glm-5.2" and conc == 64 and image == NEWEST:
-        m *= 0.96
     return m
 
 
 def mock_rows():
+    """Each week: Saturday tests all eight models (GSM8K and performance),
+    Wednesday tests GSM8K only; each session runs on its own image."""
     rng = random.Random(455)
     perf, acc = [], []
     for image in IMAGES:
-        for scenario, table in (("endpoint", ENDPOINT), ("8k1k", EIGHT_K)):
-            # 8K/1K runs midweek, on its own image built that day.
-            shift = 0 if scenario == "endpoint" else 4
-            day = str(
-                datetime.date.fromisoformat(image) + datetime.timedelta(days=shift)
-            )
+        wednesday = str(datetime.date.fromisoformat(image) + datetime.timedelta(days=4))
+        for day, with_perf in ((image, True), (wednesday, False)):
             tag = f"rocm/fw-bringup-mlperf:gfx1250-atom-ci455-{day.replace('-', '')}"
-            common = {
-                "image_date": day,
-                "scenario": scenario,
-                "image": tag,
-                "test_date": day,
-                "atom_branch": "main",
-                "aiter_branch": "main",
-            }
-            for model, (gpus, base) in table.items():
-                failed = FAILED.get((model, image), set())
-                for conc, (x, y) in base.items():
-                    row = {
-                        **common,
-                        "model": model,
-                        "gpus": str(gpus),
-                        "parallel": PARALLEL[model],
-                        "concurrency": str(conc),
-                    }
-                    if conc in failed:
+            for scenario, table in (("endpoint", ENDPOINT), ("8k1k", EIGHT_K)):
+                common = {
+                    "image_date": day,
+                    "scenario": scenario,
+                    "image": tag,
+                    "test_date": day,
+                    "atom_branch": "main",
+                    "aiter_branch": "main",
+                }
+                for model, (gpus, base) in table.items():
+                    failed = FAILED.get((model, day), set())
+                    for conc, (x, y) in base.items() if with_perf else []:
+                        row = {
+                            **common,
+                            "model": model,
+                            "gpus": str(gpus),
+                            "parallel": PARALLEL[model],
+                            "concurrency": str(conc),
+                        }
+                        if conc in failed:
+                            row.update(status="fail", error=ERROR)
+                        else:
+                            tput = (
+                                y
+                                * scale(model, conc, image)
+                                * (1 + rng.uniform(-0.004, 0.004))
+                            )
+                            speed = 1 + rng.uniform(-0.01, 0.01)
+                            row.update(status="ok", tok_s_per_gpu=f"{tput:.2f}")
+                            if scenario == "endpoint":
+                                row["interactivity"] = f"{x * speed:.2f}"
+                            else:
+                                row.update(
+                                    tpot_mean_ms=f"{x / speed:.3f}",
+                                    itl_p50_ms=f"{x / speed * 0.97:.3f}",
+                                )
+                        perf.append(row)
+                    row = {**common, "model": model, "num_fewshot": "3"}
+                    if "gsm8k" in failed:
                         row.update(status="fail", error=ERROR)
                     else:
-                        tput = (
-                            y
-                            * scale(model, conc, image)
-                            * (1 + rng.uniform(-0.004, 0.004))
+                        s = GSM8K[model] + rng.uniform(-0.004, 0.004)
+                        if (model, day) == ("minimax-m3", WEDNESDAY):
+                            s -= 0.047
+                        if (model, day) == ("deepseek-v4.1-flash", NEWEST):
+                            s -= 0.05
+                        row.update(
+                            status="ok",
+                            gsm8k=f"{s:.4f}",
+                            gsm8k_strict=f"{s - 0.008:.4f}",
                         )
-                        speed = 1 + rng.uniform(-0.01, 0.01)
-                        row.update(status="ok", tok_s_per_gpu=f"{tput:.2f}")
-                        if scenario == "endpoint":
-                            row["interactivity"] = f"{x * speed:.2f}"
-                        else:
-                            row.update(
-                                tpot_mean_ms=f"{x / speed:.3f}",
-                                itl_p50_ms=f"{x / speed * 0.97:.3f}",
-                            )
-                    perf.append(row)
-                row = {**common, "model": model, "num_fewshot": "3"}
-                if "gsm8k" in failed:
-                    row.update(status="fail", error=ERROR)
-                else:
-                    s = GSM8K[model] + rng.uniform(-0.004, 0.004)
-                    if (model, image) == ("minimax-m3", NEWEST):
-                        s -= 0.047
-                    if (model, image) == ("deepseek-v4.1-flash", NEWEST):
-                        s -= 0.05
-                    row.update(
-                        status="ok", gsm8k=f"{s:.4f}", gsm8k_strict=f"{s - 0.008:.4f}"
-                    )
-                acc.append(row)
+                    acc.append(row)
     return perf, acc
 
 

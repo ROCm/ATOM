@@ -1,6 +1,6 @@
 # 455-CI 图和报告的生成脚本
 
-按 [`455-CI-guide.md`](../../455-CI-guide.md) §5，从 `perf.csv` 和 `accuracy.csv` 生成一场测试的趋势图和结果。结果是一个英文 md，`recipes/result/<YYYYMMDD>-result.md`，标题是 `<YYYY-MM-DD> MI455 Workload Weekly Status Report`：Lowlights、Highlights（没有就不写）、总表、测试环境、发现、Details。每周两场：周六测 MLPerf Endpoint（当天构建的镜像），周三测 8K/1K，每场都用当天构建的镜像；一场一份报告，以场次日期命名。
+按 [`455-CI-guide.md`](../../455-CI-guide.md) §5，从 `perf.csv` 和 `accuracy.csv` 生成一场测试的趋势图和结果。结果是一个英文 md，`recipes/result/<YYYYMMDD>-result.md`，标题是 `<YYYY-MM-DD> MI455 Workload Weekly Status Report`：Lowlights、Highlights（没有就不写）、总表、测试环境、发现、Details。每周两场：周六 8 个模型测精度和性能，周三 8 个模型只测精度（结果里只有 GSM8K），每场都用当天构建的镜像；一场一份报告，以场次日期命名。
 
 | 文件 | 作用 |
 |---|---|
@@ -32,7 +32,7 @@ python3 -m pytest -q                         # 改了脚本先跑测试
 
 ## 样例
 
-`examples/` 是 **EXAMPLE（示例）**：一份编出来的数据目录，结构和 `recipes/455-CI/` 一样，数字都不是真实测试数据，结果和图上都标了 EXAMPLE。用它生成的样例结果是 [`recipes/result/example.md`](../../result/example.md)：周六 11-14 那场 MLPerf Endpoint，各种情况都有一个。Qwen-35B-A3B 的 c64 跑挂（说法是复现文档）；DeepSeek R1 回退 5%（说法是我们修好并验证的 PR）；DeepSeek-V4.1-Flash 快了 6%、GSM8K 掉了 5 个点（说法是别人正在修的 PR）；Kimi-K3 上一场跑挂、这场恢复。PR 链接是编的，指不到真实的 PR。周三 11-18 那场只用来画 8K/1K 的图。
+`examples/` 是 **EXAMPLE（示例）**：一份编出来的数据目录，结构和 `recipes/455-CI/` 一样，数字都不是真实测试数据，结果和图上都标了 EXAMPLE。用它生成的样例结果是 [`recipes/result/example.md`](../../result/example.md)：周六 11-14 那场，8 个模型都测了精度和性能，各种情况都有一个。Qwen-35B-A3B 的 c64 跑挂（说法是复现文档）；DeepSeek R1 回退 5%（说法是我们修好并验证的 PR）；DeepSeek-V4.1-Flash 快了 6%、GSM8K 掉了 5 个点（说法是别人正在修的 PR）；Kimi-K3 上一场跑挂、这场恢复。PR 链接是编的，指不到真实的 PR。周三 11-18 那场只测精度，只用来画精度图（MiniMax-M3 掉了 4.7 个点）。
 
 ![MLPerf Endpoint 每卡吞吐趋势（EXAMPLE）](examples/runs/20261114/charts/perf-endpoint.png)
 

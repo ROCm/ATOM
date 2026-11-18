@@ -726,3 +726,44 @@ def test_gsm8k_within_4_points_of_the_known_good_value_is_fine():
 def test_a_gsm8k_drop_already_flagged_against_the_last_session_is_not_repeated():
     rows = lowlights([m3(ac(0.88, 0.95), baseline=0.95)])
     assert [r[1] for r in rows] == ["GSM8K down 7.0 points to 88.0%"]
+
+
+def acc_only(name, acc, scenario="endpoint"):
+    """A Wednesday model: GSM8K ran, performance did not (no perf rows)."""
+    return model(
+        name,
+        pc(4, None, 100.0, status="missing"),
+        pc(64, None, 1000.0, status="missing"),
+        acc,
+        scenario=scenario,
+    )
+
+
+def test_a_gsm8k_only_run_that_fails_says_gsm8k_failed():
+    (row,) = lowlights(
+        [acc_only("Bravo", ac(None, 0.95, status="fail", error="RuntimeError: y"))]
+    )
+    assert row[:2] == ["❌ Bravo", "GSM8K failed"]
+
+
+def test_an_accuracy_only_session_reports_gsm8k_and_no_performance():
+    text = report_md(
+        "2026-11-18",
+        {},
+        [
+            acc_only("Alpha", ac(0.952, 0.95, prev_date="2026-11-14")),
+            acc_only("Bravo", ac(0.88, 0.95, prev_date="2026-11-14"), scenario="8k1k"),
+        ],
+        "c",
+        "r",
+    )
+    results = text.split("\n## Results\n\n")[1].split("\n\n")[0].splitlines()
+    assert results == [
+        "| Model | Scenario | 2026-11-14 (GSM8K) | 2026-11-18 (GSM8K) | Delta |",
+        "|---|---|---|---|---|",
+        "| Alpha | MLPerf Endpoint | 95.0% | 95.2% | +0.2 pts |",
+        "| Bravo | 8K/1K | 95.0% | 88.0% | 🔴 −7.0 pts |",
+    ]
+    assert "| 🔴 Bravo | GSM8K down 7.0 points to 88.0% |" in text
+    assert "### Performance" not in text and "tok/s/GPU" not in text
+    assert "perf-" not in text and "c/accuracy-8k1k.png" in text

@@ -371,3 +371,19 @@ def test_a_known_good_gsm8k_from_the_baseline_file_flags_a_low_first_result(ci, 
         "| 🔴 MiniMax-M3 | GSM8K 87.3%, 7.4 points below the known-good 94.7% |" in text
     )
     assert "MiniMax-M3 (428B) is a problem in the lowlights" in capsys.readouterr().out
+
+
+def test_a_wednesday_gsm8k_session_reports_accuracy_only(ci):
+    write_csv(ci / "perf.csv", PERF_COLUMNS, [perf("2026-11-14", 64, "1000")])
+    write_csv(
+        ci / "accuracy.csv",
+        ACCURACY_COLUMNS,
+        [acc("2026-11-14", "0.95"), acc("2026-11-18", "0.88")],
+    )
+    main(["--date", "2026-11-18", "--data-dir", str(ci)])
+    text = result(ci, "20261118").read_text()
+    assert (
+        "| Model | Scenario | 2026-11-14 (GSM8K) | 2026-11-18 (GSM8K) | Delta |" in text
+    )
+    assert "| Kimi-K3 (2.8T) | MLPerf Endpoint | 95.0% | 88.0% | 🔴 −7.0 pts |" in text
+    assert "### Performance" not in text and "tok/s/GPU" not in text

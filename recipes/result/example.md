@@ -7,24 +7,28 @@
 | Model | What happened | Cause | Fix | Owner |
 |---|---|---|---|---|
 | ❌ Qwen-35B-A3B | c64 failed | (mock) out of memory capturing CUDA graphs | No fix yet; [reproducer](../455-CI/tools/examples/runs/20261114/qwen-35b-a3b/repro.md) |  |
-| ⚠️ DeepSeek R1 | throughput down 4.5% | (mock) a new MoE dispatch default | Passes with [ROCm/ATOM#99901](https://github.com/ROCm/ATOM/pull/99901) (verified) |  |
-| ⚠️ DeepSeek-V4.1-Flash | GSM8K down 5.2 points to 88.9% | (mock) MoE scale rounding | Needs [ROCm/aiter#99902](https://github.com/ROCm/aiter/pull/99902) (open) |  |
+| ⚠️ DeepSeek R1 | throughput down 4.6% | (mock) a new MoE dispatch default | Passes with [ROCm/ATOM#99901](https://github.com/ROCm/ATOM/pull/99901) (verified) |  |
+| ⚠️ DeepSeek-V4.1-Flash | GSM8K down 5.1 points to 89.1% | (mock) MoE scale rounding | Needs [ROCm/aiter#99902](https://github.com/ROCm/aiter/pull/99902) (open) |  |
 
 ## Highlights
 
 | Model | What happened | Owner |
 |---|---|---|
-| 🟢 DeepSeek-V4.1-Flash | throughput up 6.9% |  |
+| 🟢 DeepSeek-V4.1-Flash | throughput up 6.8% |  |
 | ✅ Kimi-K3 | recovered from the previous failure |  |
 
 ## Results
 
 | Model | Scenario | 2026-11-07 (tok/s/GPU) | 2026-11-14 (tok/s/GPU) | Delta | GSM8K delta |
 |---|---|---|---|---|---|
-| DeepSeek R1 | MLPerf Endpoint | 1,482 | 1,416 | ⚠️ −4.5% | −0.6 pts (now 95.0%) |
-| DeepSeek-V4.1-Flash | MLPerf Endpoint | 2,655 | 2,838 | 🟢 +6.9% | ⚠️ −5.2 pts (now 88.9%) |
-| Kimi-K3 (2.8T) | MLPerf Endpoint | 336 (2026-10-31) | 340 | +1.0% | −0.1 pts (now 96.1%) (vs 2026-10-31) |
-| Qwen-35B-A3B | MLPerf Endpoint | 6,345 | N/A | N/A | −0.1 pts (now 90.1%) |
+| DeepSeek R1 | MLPerf Endpoint | 1,481 | 1,414 | ⚠️ −4.6% | −0.7 pts (now 94.8%) (vs 2026-11-11) |
+| DeepSeek-V4.1-Flash | MLPerf Endpoint | 2,658 | 2,838 | 🟢 +6.8% | ⚠️ −5.1 pts (now 89.1%) (vs 2026-11-11) |
+| Kimi-K3 (2.8T) | MLPerf Endpoint | 336 (2026-10-31) | 340 | +1.2% | 0.0 pts (now 95.6%) (vs 2026-11-11) |
+| Qwen-35B-A3B | MLPerf Endpoint | 6,332 | N/A | N/A | 0.0 pts (now 90.1%) (vs 2026-11-11) |
+| DeepSeek-V4-Pro | 8K/1K | 10,063 | 10,090 | +0.3% | 0.0 pts (now 95.5%) (vs 2026-11-11) |
+| GLM-5.2 | 8K/1K | 12,765 | 12,833 | +0.5% | +0.5 pts (now 95.2%) (vs 2026-11-11) |
+| MiniMax-M3 (428B) | 8K/1K | 16,120 | 16,255 | +0.8% | +0.4 pts (now 93.5%) (vs 2026-11-11) |
+| Qwen-3.8 Flash | 8K/1K | 26,603 | 26,746 | +0.5% | 0.0 pts (now 89.2%) (vs 2026-11-11) |
 
 ## Environment
 
@@ -56,29 +60,57 @@
 
 | Model | Parallelism | Concurrency | tok/s/GPU | vs 2026-11-07 | E2E avg interactivity (tok/s/user) | vs 2026-11-07 |
 |---|---|---|---|---|---|---|
-| DeepSeek R1 | tp4 | 4 | 164 | +0.2% | 149 | −0.6% |
-| DeepSeek R1 | tp4 | 64 | 1,416 | ⚠️ −4.5% | 57.8 | −0.9% |
-| DeepSeek-V4.1-Flash | dp4ep4 | 4 | 250 | 🟢 +6.6% | 209 | −0.5% |
-| DeepSeek-V4.1-Flash | dp4ep4 | 64 | 2,838 | 🟢 +6.9% | 94.5 | +0.4% |
-| Kimi-K3 (2.8T) | tp8dcp8 | 4 | 56.5 | +0.7% (vs 2026-10-31) | 105 | −0.7% (vs 2026-10-31) |
-| Kimi-K3 (2.8T) | tp8dcp8 | 64 | 340 | +1.0% (vs 2026-10-31) | 45.2 | −0.5% (vs 2026-10-31) |
-| Qwen-35B-A3B | tp1 | 4 | 1,005 | −0.1% | 262 | +0.5% |
+| DeepSeek R1 | tp4 | 4 | 165 | +0.6% | 150 | −0.4% |
+| DeepSeek R1 | tp4 | 64 | 1,414 | ⚠️ −4.6% | 58.3 | −0.3% |
+| DeepSeek-V4.1-Flash | dp4ep4 | 4 | 251 | 🟢 +6.6% | 212 | +0.7% |
+| DeepSeek-V4.1-Flash | dp4ep4 | 64 | 2,838 | 🟢 +6.8% | 95.7 | +1.2% |
+| Kimi-K3 (2.8T) | tp8dcp8 | 4 | 56.7 | +0.8% (vs 2026-10-31) | 104 | −0.9% (vs 2026-10-31) |
+| Kimi-K3 (2.8T) | tp8dcp8 | 64 | 340 | +1.2% (vs 2026-10-31) | 45.3 | +1.0% (vs 2026-10-31) |
+| Qwen-35B-A3B | tp1 | 4 | 1,010 | +0.3% | 258 | −0.7% |
 | Qwen-35B-A3B | tp1 | 64 | N/A | N/A | N/A | — |
 
 ### Accuracy (GSM8K, 3-shot) · MLPerf Endpoint
 
-| Model | flexible-extract | strict-match | 2026-11-07 | vs 2026-11-07 |
+| Model | flexible-extract | strict-match | 2026-11-11 | vs 2026-11-11 |
 |---|---|---|---|---|
-| DeepSeek R1 | 95.0% | 94.2% | 95.6% | −0.6 pts |
-| DeepSeek-V4.1-Flash | 88.9% | 88.1% | 94.1% | ⚠️ −5.2 pts |
-| Kimi-K3 (2.8T) | 96.1% | 95.3% | 96.2% (2026-10-31) | −0.1 pts (vs 2026-10-31) |
-| Qwen-35B-A3B | 90.1% | 89.3% | 90.2% | −0.1 pts |
+| DeepSeek R1 | 94.8% | 94.0% | 95.5% | −0.7 pts |
+| DeepSeek-V4.1-Flash | 89.1% | 88.3% | 94.2% | ⚠️ −5.1 pts |
+| Kimi-K3 (2.8T) | 95.6% | 94.8% | 95.7% | 0.0 pts |
+| Qwen-35B-A3B | 90.1% | 89.3% | 90.1% | 0.0 pts |
 
 ### Trends · MLPerf Endpoint
 
 ![MLPerf Endpoint throughput per GPU](../455-CI/tools/examples/runs/20261114/charts/perf-endpoint.png)
 
 ![MLPerf Endpoint GSM8K](../455-CI/tools/examples/runs/20261114/charts/accuracy-endpoint.png)
+
+### Performance · 8K/1K
+
+| Model | Parallelism | Concurrency | tok/s/GPU | vs 2026-11-07 | ITL P50 (ms, lower is better) | vs 2026-11-07 |
+|---|---|---|---|---|---|---|
+| DeepSeek-V4-Pro | dp4ep4 | 4 | 2,159 | +0.1% | 13.6 | +0.5% |
+| DeepSeek-V4-Pro | dp4ep4 | 64 | 10,090 | +0.3% | 37.1 | +0.8% |
+| GLM-5.2 | tp4 | 4 | 2,679 | +0.4% | 10.6 | +0.7% |
+| GLM-5.2 | tp4 | 64 | 12,833 | +0.5% | 29.2 | +0.2% |
+| MiniMax-M3 (428B) | tp4 | 4 | 3,185 | −0.0% | 8.7 | −1.2% |
+| MiniMax-M3 (428B) | tp4 | 64 | 16,255 | +0.8% | 23.3 | +0.8% |
+| Qwen-3.8 Flash | tp1 | 4 | 4,929 | +0.2% | 5.8 | −1.2% |
+| Qwen-3.8 Flash | tp1 | 64 | 26,746 | +0.5% | 15.6 | −0.5% |
+
+### Accuracy (GSM8K, 3-shot) · 8K/1K
+
+| Model | flexible-extract | strict-match | 2026-11-11 | vs 2026-11-11 |
+|---|---|---|---|---|
+| DeepSeek-V4-Pro | 95.5% | 94.7% | 95.5% | 0.0 pts |
+| GLM-5.2 | 95.2% | 94.4% | 94.6% | +0.5 pts |
+| MiniMax-M3 (428B) | 93.5% | 92.7% | 93.1% | +0.4 pts |
+| Qwen-3.8 Flash | 89.2% | 88.4% | 89.2% | 0.0 pts |
+
+### Trends · 8K/1K
+
+![8K/1K throughput per GPU](../455-CI/tools/examples/runs/20261114/charts/perf-8k1k.png)
+
+![8K/1K GSM8K](../455-CI/tools/examples/runs/20261114/charts/accuracy-8k1k.png)
 
 ### Follow-ups
 

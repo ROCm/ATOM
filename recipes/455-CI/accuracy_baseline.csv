@@ -1,2 +1,2 @@
 model,baseline,source
-minimax-m3,0.9469,"recipes/MiniMax-M3.md on ATOM main: MXFP4 + EAGLE3 TP4 (fp4_eagle_tp4); GSM8K 5-shot local-chat-completions, multi-turn few-shot"
+minimax-m3,0.8726,"455-CI 2026-11-14, this CI's GSM8K (3-shot local-completions). On the same image and server the recipe-style 5-shot chat scores 0.9492, in line with the known-good 0.9469 of recipes/MiniMax-M3.md on ATOM main, so 0.8726 is the model's normal score under this CI's method."

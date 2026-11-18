@@ -68,3 +68,30 @@ def test_writes_nothing_for_a_day_without_a_session(tmp_path):
     main(["--date", "2026-11-18", "--data-dir", str(tmp_path)])
     out = tmp_path / "runs" / "20261118" / "charts"
     assert not out.exists() or list(out.iterdir()) == []
+
+
+def test_an_accuracy_only_day_draws_only_the_accuracy_chart(tmp_path):
+    write_csv(
+        tmp_path / "perf.csv",
+        PERF_COLUMNS,
+        [perf("2026-11-14", 4), perf("2026-11-14", 64)],
+    )
+    write_csv(
+        tmp_path / "accuracy.csv",
+        ACCURACY_COLUMNS,
+        [
+            {
+                "image_date": day,
+                "test_date": day,
+                "scenario": "endpoint",
+                "model": "kimi-k3",
+                "status": "ok",
+                "gsm8k": "0.95",
+                "gsm8k_strict": "0.94",
+            }
+            for day in ("2026-11-14", "2026-11-18")
+        ],
+    )
+    main(["--date", "2026-11-18", "--data-dir", str(tmp_path)])
+    out = tmp_path / "runs" / "20261118" / "charts"
+    assert sorted(p.name for p in out.iterdir()) == ["accuracy-endpoint.png"]
