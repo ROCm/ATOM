@@ -261,7 +261,7 @@ mod b_policy_apply {
     use super::super::types::PlacementError;
     use crate::core::{HashRing, Worker};
     use crate::policies::{
-        CacheAwarePolicy, LoadBalancingPolicy, PowerOfTwoPolicy, PrefixHashConfig,
+        AgenticPolicy, CacheAwarePolicy, LoadBalancingPolicy, PowerOfTwoPolicy, PrefixHashConfig,
         PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
     };
 
@@ -272,46 +272,16 @@ mod b_policy_apply {
         ]
     }
 
-    /// Picks the first worker and reports one token left to prefill.
-    #[derive(Debug)]
-    struct OneTokenLeft;
-
-    #[async_trait::async_trait]
-    impl LoadBalancingPolicy for OneTokenLeft {
-        async fn select_with_decision(
-            &self,
-            _workers: &[Arc<dyn Worker>],
-            _info: &crate::policies::SelectWorkerInfo<'_>,
-        ) -> (Option<usize>, crate::policies::RouteDecision) {
-            let decision = crate::policies::RouteDecision {
-                prefill_tokens: Some(1),
-                ..crate::policies::RouteDecision::branch("cached")
-            };
-            (Some(0), decision)
-        }
-
-        fn name(&self) -> &'static str {
-            "one_token_left"
-        }
-
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-    }
-
     #[tokio::test]
     async fn test_policy_reports_its_prefill_estimate() {
         let candidates = two_workers();
         let tokens = [1u32, 2, 3];
         let descriptor = make_descriptor(Some("m"), None, Some(&tokens), None);
-        let placed = apply_policy(&candidates, &RoundRobinPolicy::new(), &descriptor, None)
-            .await
-            .unwrap();
-        assert_eq!(placed.prefill_tokens, None);
-        let placed = apply_policy(&candidates, &OneTokenLeft, &descriptor, None)
-            .await
-            .unwrap();
-        assert_eq!(placed.prefill_tokens, Some(1));
+        let (round_robin, agentic) = (RoundRobinPolicy::new(), AgenticPolicy::default());
+        let placed = apply_policy(&candidates, &round_robin, &descriptor, None).await;
+        assert_eq!(placed.unwrap().prefill_tokens, None);
+        let placed = apply_policy(&candidates, &agentic, &descriptor, None).await;
+        assert_eq!(placed.unwrap().prefill_tokens, Some(3));
     }
 
     #[tokio::test]
