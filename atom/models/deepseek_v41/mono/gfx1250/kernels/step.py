@@ -221,6 +221,7 @@ L20_ORD = True        # (l20) the candidate layer's selections: one pass of topk
 L20_SEL_ORDERED = False   # (l20) its top-512 in arrival order (as select_mc's FULL layers; the blocks stay ascending)
 L20_BLK_SLOT, L20_OC_SLOT = D.LAYERS + 1, D.LAYERS + 2   # (l20) mchist slots: the block selection's radix bins, the ordered counts
 CODE_END_OFF = 131024   # cyc scratch: the target / draft launches' end PCs (hx.code_end)
+CODE_PF_KB = 160   # the target entry's L2 code prefetch: the layer loop's hot code (layout checked: inside .text)
 
 
 def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sources="", moe_ids="ids", split=False,
@@ -264,6 +265,9 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
                     b = hx.opaque_s(fx.block_idx.x)
                     sm = hx.lds_base()
                     TCNT = cnt + i64((NL + NDR) * LCB)
+                    # the hot code -> every XCD's L2 before layer 0 (its first pass otherwise fetched it from HBM: layer 0
+                    # ran ~25 us longer, in its stages' cold code)
+                    hx.code_prefetch_all(t, fptr(fp, "cyc") + i64(CODE_END_OFF), CODE_PF_KB)
                     mz = fptr(fp, "mchist")   # the multi-CTA selection's histograms / position counters: zeroed a step
                     for zz in range_constexpr((MC_BYTES // 16 + 65535) // 65536):
                         u = b * 256 + t + zz * 65536

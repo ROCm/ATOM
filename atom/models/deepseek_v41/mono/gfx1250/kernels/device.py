@@ -194,6 +194,24 @@ def code_prefetch(t, b, endp, kb):
 
 
 @_ASTR.transform
+def code_prefetch_all(t, endp, kb):
+    """Every CTA warms L2 with this kernel's code from here for `kb` KB (one 128-byte global_prefetch a line, the CTA's
+    threads striding over all of it), up to the end PC the previous run recorded at endp (code_end): code is fetched
+    through the L2 of the XCD a CU sits on, and every CTA covering the whole range warms every XCD whatever the CTA
+    placement (a CTA-split range, as code_prefetch, leaves each XCD a part). Bounded twice: by the recorded end (inside
+    .text; 0 on the first run: nothing) and by `kb` (the build's layout keeps here + kb inside .text). An implausible end
+    (not 0 < end - here < 512 KB) prefetches nothing."""
+    pc = getpc()
+    end = gload(endp, fx.Int64)
+    ok = (end > pc) & (end - pc < fx.Int64(512 * 1024))
+    nl = ok.select(fx.min((end - pc) // 128, fx.Int64(kb * 8)), fx.Int64(0))
+    for j in range_constexpr((kb * 8 + 255) // 256):
+        i = fx.Int64(t) + fx.Int64(j * 256)
+        if i < nl:
+            prefetch(pc + i * 128)
+
+
+@_ASTR.transform
 def code_end(t, b, endp):
     """Record this kernel's PC near its end for the next run's code_prefetch."""
     if (b == 0) & (t == 0):
