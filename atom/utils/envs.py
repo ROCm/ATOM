@@ -774,10 +774,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Kimi-K3 gfx1250 mono: the o_proj all-reduce in one fabric hop, every
     # rank's partials pushed to every rank and summed there in rank order (the
-    # same bits as the owner's sums, k2_oproj_ar_gfx1250); its banks take tp/2
-    # times more.
+    # same bits as the owner's sums, k2_oproj_ar_gfx1250), the default; its
+    # banks take tp/2 times more. 0 keeps the reduce-scatter then gather.
     "ATOM_KIMI_MONO_OPROJ_AR_ONESHOT": lambda: (
-        os.getenv("ATOM_KIMI_MONO_OPROJ_AR_ONESHOT", "0") == "1"
+        os.getenv("ATOM_KIMI_MONO_OPROJ_AR_ONESHOT", "1") == "1"
     ),
     # The gathering all-reduce's CTA barrier between its gathers and its
     # pushes (k2_allreduce_gfx1250); "0" drops it.

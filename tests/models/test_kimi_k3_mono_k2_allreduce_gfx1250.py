@@ -37,7 +37,12 @@ def test_o_proj_all_reduce_gives_each_rank_whole_ctas_of_columns():
     # line a column pair of three tokens (40 rows: 14 triples, the last padded)
     assert oar.triples(40) == 14
     assert oar.bank_words(8, 40) == 4 * 14 * (8 * oar.own_pairs(8) + HIDDEN // 2)
-    assert oar.oproj_peer_bytes(8, 48) == 2 * oar.bank_words(8, 48) * 4
+    assert oar.oproj_peer_bytes(8, 48, oneshot=False) == 2 * oar.bank_words(8, 48) * 4
+    # one hop: every rank's partials for every column
+    assert oar.oneshot_bank_words(8, 48) == 4 * 16 * 8 * (HIDDEN // 2)
+    assert oar.oproj_peer_bytes(8, 48, oneshot=True) == (
+        2 * oar.oneshot_bank_words(8, 48) * 4
+    )
 
 
 @pytest.mark.parametrize("rows", (1, 5, 16, 40, 48))
