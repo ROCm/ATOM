@@ -3068,6 +3068,28 @@ class MoE(nn.Module):
             routed = tensor_model_parallel_all_reduce(routed)
         return routed
 
+    def _routed_with_shared_in_combine(
+        self,
+        x: torch.Tensor,  # [num_tokens, dim]
+        shared: torch.Tensor,  # [num_tokens, dim]
+        shared_ready: torch.cuda.Event,
+    ) -> torch.Tensor:  # [num_tokens, dim]
+        """Routed pass whose combine adds `shared` once `shared_ready` fires.
+
+        Shared by the single- and dual-stream paths; only the stream the
+        caller recorded `shared_ready` on differs. Comm-fused steps never take
+        this path (`combine_accepts_shared` excludes them), so a complete
+        result here is an error.
+        """
+        routed, is_complete = self.routed_expert_forward(
+            x, shared_partial=shared, shared_ready=shared_ready
+        )
+        if is_complete:
+            raise RuntimeError("a comm-fused step reached the shared-in-combine path")
+        return self.combine_outputs(
+            routed, None, prefix=f"{self.prefix}.combine_outputs"
+        )
+
     def single_stream_moe_forward(
         self,
         x: torch.Tensor,  # [num_tokens, dim]
@@ -3075,9 +3097,11 @@ class MoE(nn.Module):
         """Sequential: shared_experts → routed_experts → combine.
 
         Where the routed combine adds the shared output
-        (`FusedMoE.combine_accepts_shared`), it is handed down as the
-        dual-stream path hands it, with the event recorded on this same
-        stream, and there is no separate add.
+        (`FusedMoE.combine_accepts_shared`), it is handed down through
+        `_routed_with_shared_in_combine` with the event recorded on this same
+        stream, and there is no separate add. That branch is skipped while
+        `torch.compile` traces this method (the CUDA event is not traceable);
+        the traced graph keeps the separate add in `combine_outputs`.
         """
         shared = self.shared_experts(x) if self.shared_experts is not None else None
         if (
@@ -3087,16 +3111,7 @@ class MoE(nn.Module):
         ):
             shared_ready = torch.cuda.Event()
             shared_ready.record()
-            routed, is_complete = self.routed_expert_forward(
-                x, shared_partial=shared, shared_ready=shared_ready
-            )
-            if is_complete:
-                raise RuntimeError(
-                    "a comm-fused step reached the shared-in-combine path"
-                )
-            return self.combine_outputs(
-                routed, None, prefix=f"{self.prefix}.combine_outputs"
-            )
+            return self._routed_with_shared_in_combine(x, shared, shared_ready)
         routed, is_complete = self.routed_expert_forward(x, shared_partial=shared)
         if is_complete:
             return routed
@@ -3124,16 +3139,7 @@ class MoE(nn.Module):
                 shared_ready = torch.cuda.Event()
                 shared_ready.record(self.alt_stream)
             shared.record_stream(routed_stream)
-            routed, is_complete = self.routed_expert_forward(
-                x, shared_partial=shared, shared_ready=shared_ready
-            )
-            if is_complete:
-                raise RuntimeError(
-                    "a comm-fused step reached the shared-in-combine path"
-                )
-            return self.combine_outputs(
-                routed, None, prefix=f"{self.prefix}.combine_outputs"
-            )
+            return self._routed_with_shared_in_combine(x, shared, shared_ready)
         shared_produced = False
         shared_waited = False
 
