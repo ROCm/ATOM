@@ -1050,12 +1050,11 @@ purge_lmcache_disk() {
 #  - MOONCAKE_STORE_POOLS=per_nic (default shared), for owners that must share
 #    the stages' NICs: one master per owner NIC, every owner on exactly one
 #    NIC, and each stage reads its own NIC's pool (mooncake_store.pools).
-#  - MOONCAKE_STORE_DECODE_OWNERS, in the same format: owners the decode node
-#    starts on its own memory, joining the prefill node's masters
-#    (pd_worker_layout multi_node, one prefill node and one decode node; or
-#    packed_nodes, one prefill worker and one node besides its own, where the
-#    first decode worker there starts them). The prefill workers start once
-#    every pool counts the owners of both nodes.
+#  - MOONCAKE_STORE_DECODE_OWNERS, in the same format: owners each decode node
+#    starts on its own memory, joining the masters of the one prefill worker's
+#    node (pd_worker_layout multi_node: every decode node; packed_nodes: each
+#    node with decode workers only, at its first one). The prefill workers
+#    start once every pool counts the owners of all nodes.
 #  - MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS (colon-separated, default the model):
 #    the owners pin huge pages under MPOL_BIND, so the clean page cache of
 #    these goes first; each node must then fit its pins with 128 GiB to spare,
@@ -1203,6 +1202,23 @@ plan_mooncake_store_owners() {
     mooncake_owner_plan_numa mooncake_owner_plan_gib mooncake_owner_plan_devices
 }
 
+# The nodes that start MOONCAKE_STORE_DECODE_OWNERS, each once: every decode
+# node under multi_node, each node with decode workers only under packed_nodes.
+mooncake_decode_owner_nodes() {
+  local node
+  local -A decode_only=()
+  case "${ATOMESH_PD_WORKER_LAYOUT:-multi_node}" in
+    multi_node) echo $(( ${yD:-1} * ${DECODE_NODES_PER_WORKER:-1} )) ;;
+    packed_nodes)
+      for node in ${decode_nodes[@]+"${decode_nodes[@]}"}; do
+        [[ "${node}" == "${prefill_nodes[0]:-0}" ]] || decode_only[${node}]=1
+      done
+      echo "${#decode_only[@]}"
+      ;;
+    *) echo 0 ;;
+  esac
+}
+
 # Fills mooncake_pool_devices and mooncake_pool_capacity from the owners of
 # every node, numbering the pools alike on each; exits 2 on an invalid setting.
 plan_mooncake_store_pools() {
@@ -1211,7 +1227,11 @@ plan_mooncake_store_pools() {
   local -a numa=() gib=() devices=()
   parse_mooncake_owner_spec MOONCAKE_STORE_OWNERS numa gib devices
   if [[ -n "$(mooncake_setting MOONCAKE_STORE_DECODE_OWNERS)" ]]; then
-    parse_mooncake_owner_spec MOONCAKE_STORE_DECODE_OWNERS numa gib devices
+    local node nodes
+    nodes="$(mooncake_decode_owner_nodes)"
+    for ((node = 0; node < nodes; node++)); do
+      parse_mooncake_owner_spec MOONCAKE_STORE_DECODE_OWNERS numa gib devices
+    done
   fi
   mooncake_pool_devices=()
   mooncake_pool_capacity=()
@@ -1368,21 +1388,12 @@ check_mooncake_store_settings() {
   fi
   require_mooncake_qp_per_endpoint
   refuse_mooncake_nic_auto_discovery
-  local layout="${ATOMESH_PD_WORKER_LAYOUT:-multi_node}" num_prefill="${xP:-1}" num_decode="${yD:-1}"
-  local decode_owner_nodes=0 node
-  local -A decode_only_nodes=()
-  case "${layout}" in
-    multi_node) decode_owner_nodes="${num_decode}" ;;
-    packed_nodes)
-      for node in ${decode_nodes[@]+"${decode_nodes[@]}"}; do
-        [[ "${node}" == "${prefill_nodes[0]:-0}" ]] || decode_only_nodes[${node}]=1
-      done
-      decode_owner_nodes="${#decode_only_nodes[@]}"
-      ;;
-  esac
+  local layout="${ATOMESH_PD_WORKER_LAYOUT:-multi_node}" num_prefill="${xP:-1}"
+  local decode_owner_nodes
+  decode_owner_nodes="$(mooncake_decode_owner_nodes)"
   if [[ -n "$(mooncake_setting MOONCAKE_STORE_DECODE_OWNERS)" ]] \
-    && [[ "${num_prefill}" != "1" || "${decode_owner_nodes}" != "1" ]]; then
-    echo "[mooncake-store][FAIL] MOONCAKE_STORE_DECODE_OWNERS needs the decode on nodes of its own (pd_worker_layout multi_node or packed_nodes, here ${layout}), one prefill worker (here ${num_prefill}), whose node's masters they join, and one node with decode workers only (here ${decode_owner_nodes}): the pools count the decode owners once" >&2
+    && [[ "${num_prefill}" != "1" || "${decode_owner_nodes}" == "0" ]]; then
+    echo "[mooncake-store][FAIL] MOONCAKE_STORE_DECODE_OWNERS needs the decode on nodes of its own (pd_worker_layout multi_node or packed_nodes, here ${layout}, with ${decode_owner_nodes} such node(s)) and one prefill worker (here ${num_prefill}), whose node's masters they join" >&2
     exit 2
   fi
   # This shell starts one Store, planned for its first prefill worker's GPUs;
@@ -1920,16 +1931,16 @@ start_mooncake_store() {
   echo "[wait][OK] mooncake-store masters=${host_ip}:${ATOMESH_MOONCAKE_MASTER_PORT}+100/pool pools=${mooncake_pool_devices[*]:-shared} metrics=http://${host_ip}:${ATOMESH_MOONCAKE_METRICS_PORT}/metrics"
 }
 
-# On a decode node: starts MOONCAKE_STORE_DECODE_OWNERS on this node's memory,
-# joining the prefill node's masters, before the decode workers load. Waits
-# until every pool counts the owners of all nodes, as the prefill node does
-# before its workers start.
+# On a decode node (mooncake_decode_owner_nodes): starts
+# MOONCAKE_STORE_DECODE_OWNERS on this node's memory, joining the prefill
+# node's masters, before the decode workers load. Waits until every pool counts
+# the owners of all nodes, as the prefill node does before its workers start.
 start_mooncake_store_decode_owners() {
   mooncake_store_requested || return 0
   [[ -n "$(mooncake_setting MOONCAKE_STORE_DECODE_OWNERS)" ]] || return 0
   # Packed nodes start decode workers on the prefill's node too, and several
-  # on the other: that node's first one starts the owners.
-  if [[ "${PACKED_NODES_PD:-0}" == "1" ]]; then
+  # on the others: each such node's first one starts the owners.
+  if [[ "${ATOMESH_PD_WORKER_LAYOUT:-multi_node}" == "packed_nodes" ]]; then
     [[ "${NODE_RANK}" != "${prefill_nodes[0]:-0}" ]] || return 0
     [[ -z "${mooncake_store_decode_owners_started:-}" ]] || return 0
     mooncake_store_decode_owners_started=1
