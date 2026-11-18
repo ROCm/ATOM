@@ -1,122 +1,12 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+"""Exercise chunk settlement, batch snapshots and advancement through schedule()."""
 
-"""Every batch carrying prefill rows owes the same per-chunk bookkeeping.
-
-The prefill-only fast path used to own four things outright: `is_final_chunk`
-(the repo's only assignment), `plan_midstep` (the repo's only call),
-`next_token_ids`, and `_advance_prefill_on_schedule` (also the only call). Its
-gate asked whether mixed batching was ENABLED rather than whether THIS BATCH
-had decode rows -- so turning the flag on skipped all four, on pure-prefill
-batches as much as mixed ones.
-
-None of it is loud. `is_final_chunk` left None reads as True in
-`produces_output`, a missing midstep checkpoint only matters once something
-preempts, and short prompts never chunk at all -- so a GSM8K run whose prompts
-each fit one chunk scores exactly the same either way.
-
-These are source-level checks: they need no aiter or GPU and so run in CI.
-"""
-
-import ast
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
 from atom.model_engine.scheduler import Scheduler
 from tests.test_scheduler import MockConfig
-
-_ROOT = Path(__file__).resolve().parents[1]
-_SCHED = _ROOT / "atom/model_engine/scheduler.py"
-
-
-def _schedule_src() -> str:
-    src = _SCHED.read_text(encoding="utf-8")
-    for node in ast.walk(ast.parse(src)):
-        if isinstance(node, ast.FunctionDef) and node.name == "_schedule":
-            return "\n".join(src.splitlines()[node.lineno - 1 : node.end_lineno])
-    pytest.fail("scheduler.py has no _schedule")
-
-
-def _fallthrough_src() -> str:
-    """The common decode-admission and batch-emission part of `_schedule`."""
-    body = _schedule_src()
-    marker = "# --- Decode scheduling (also fall-through for mixed batches) ---"
-    assert marker in body, "the fall-through marker moved; re-anchor this test"
-    return body[body.index(marker) :]
-
-
-def test_the_fallthrough_settles_prefill_chunks():
-    """A mixed / flag-on-pure-prefill batch must do the same bookkeeping."""
-    tail = _fallthrough_src()
-    assert "_settle_prefill_chunks(" in tail, (
-        "the fall-through path builds a batch with prefill rows without "
-        "settling their chunks: no plan_midstep, no is_final_chunk"
-    )
-    assert (
-        "_advance_prefill_on_schedule(" in tail
-    ), "the fall-through path never advances chunked-prefill progress"
-
-
-def test_settle_is_called_before_the_batch_is_built():
-    """`plan_midstep` leaves state the batch snapshots."""
-    tail = _fallthrough_src()
-    assert tail.index("_settle_prefill_chunks(") < tail.index(
-        "batch = ScheduledBatch("
-    ), "prefill chunks must be settled before the batch snapshots them"
-
-
-def test_advance_runs_after_the_batch_is_built():
-    """The batch must keep pre-advance offsets."""
-    tail = _fallthrough_src()
-    assert tail.index("batch = ScheduledBatch(") < tail.index(
-        "_advance_prefill_on_schedule("
-    ), "advancing before the build would hand the batch post-advance offsets"
-
-
-def test_row_aligned_lists_are_padded_for_decode_rows():
-    """`is_final_chunk` is zipped against req_ids with strict=True.
-
-    A mixed batch has more rows than prefill seqs, so a prefill-length list is
-    a crash there -- and a trap anywhere else, since every other per-row list
-    on a ScheduledBatch has one entry per row.
-    """
-    tail = _fallthrough_src()
-    assert "[False] * num_seqs_decode" in tail, (
-        "is_final_chunk is not padded out to one entry per row; "
-        "_record_kv_cache_ready zips it against req_ids with strict=True"
-    )
-    assert (
-        "[-1] * num_seqs_decode" in tail
-    ), "next_token_ids is not padded out to one entry per row"
-
-
-def test_the_batch_carries_both_lists():
-    tail = _fallthrough_src()
-    assert "is_final_chunk=is_final_chunk" in tail
-    assert "next_token_ids=next_token_ids" in tail
-
-
-def test_bookkeeping_helpers_take_prefill_rows_only():
-    """Handing the whole batch in would advance decode rows' prompt cursors."""
-    src = _SCHED.read_text(encoding="utf-8")
-    tree = ast.parse(src)
-    for name in ("_settle_prefill_chunks", "_advance_prefill_on_schedule"):
-        for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef) and node.name == name:
-                args = [a.arg for a in node.args.args]
-                assert "prefill_seqs" in args, (
-                    f"{name} takes {args}; it must take the prefill rows "
-                    "explicitly, not a whole mixed batch's seq dict"
-                )
-                break
-        else:
-            pytest.fail(f"scheduler.py has no {name}")
-
-
-# ── behavioural: the checks above are source-level and a clever edit can keep
-# the substring while removing the call. These build a real mixed batch. ──────
 
 
 class TestMixedBatchBookkeeping:
@@ -219,3 +109,32 @@ class TestMixedBatchBookkeeping:
             "plan_midstep; gating it on the flag skipped it"
         )
         assert batch.is_final_chunk == [True]
+
+    def test_batch_snapshots_midstep_destinations_before_advancing(
+        self, monkeypatch, seq_factory
+    ):
+        sched = self._mixed_sched()
+        p, d = self._arm_mixed(sched, seq_factory)
+        sched.advance_on_schedule = True
+        sched.drafter_needs_next_token = True
+        decode_cached = d.num_cached_tokens
+        planned = []
+
+        def plan(seq, start, end):
+            planned.append((seq.id, start, end))
+            seq.has_per_req_cache = True
+            seq.state_slots = [41]
+            seq.midstep_reservations = [(42, end, 0)]
+
+        monkeypatch.setattr(sched.block_manager, "plan_midstep", plan)
+        batch, _ = sched.schedule()
+        assert batch.is_mixed
+        assert batch.req_ids == [p.id, d.id]
+        assert planned == [(p.id, 0, 7)]
+        assert batch.state_save_all == [[(42, 7)]]
+        assert batch.num_cached_tokens == [0, decode_cached]
+        assert batch.scheduled_tokens[:7].tolist() == list(range(10, 17))
+        assert batch.is_final_chunk == [False, False]
+        assert batch.next_token_ids == [17, -1]
+        assert p.num_cached_tokens == 7 and p.is_partial_prefill
+        assert d.num_cached_tokens == decode_cached and not d.is_partial_prefill

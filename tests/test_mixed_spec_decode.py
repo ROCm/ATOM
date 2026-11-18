@@ -39,6 +39,91 @@ N_P_TOKENS = sum(PREFILL_LENS)
 NUM_SCHEDULED = np.array(PREFILL_LENS + [K + 1] * N_D, dtype=np.int32)
 
 
+@pytest.mark.parametrize("prefill_rows", [0, 1, 4])
+@pytest.mark.parametrize("draft_width", [3, 7])
+@pytest.mark.parametrize("with_draft", [False, True])
+def test_prefill_confidence_cannot_change_decode_budget_or_request_mapping(
+    monkeypatch, prefill_rows, draft_width, with_draft
+):
+    from test_dspark_scheduler import _stepping_scheduler
+
+    from atom.model_engine import model_runner as mr
+    from atom.spec_decode import dspark_proposer as proposer
+
+    DSparkProposer = proposer.DSparkProposer
+
+    verify = _stepping_scheduler(monkeypatch)
+    decode_confidence = torch.full((4, draft_width), 0.8)
+    expected = verify.compute_ell(decode_confidence)
+    confidence = torch.cat(
+        (
+            torch.full((prefill_rows, draft_width), 0.999),
+            decode_confidence,
+            torch.ones(2, draft_width),
+        ),  # graph padding must also be excluded
+    )
+    scheduled_bs = prefill_rows + 4
+    metadata = SimpleNamespace(
+        is_mixed=bool(prefill_rows), num_prefill_seqs=prefill_rows, max_seqlen_k=64
+    )
+    fc = SimpleNamespace(
+        context=SimpleNamespace(
+            positions=torch.arange(scheduled_bs), running_bs=scheduled_bs + 2
+        ),
+        attn_metadata=metadata,
+    )
+    monkeypatch.setattr(mr, "get_forward_context", lambda: fc)
+    monkeypatch.setattr(proposer, "get_forward_context", lambda: fc)
+    monkeypatch.setattr(mr, "get_pcp_world_size", lambda: 1)
+    drafter = DSparkProposer.__new__(DSparkProposer)
+    drafter._verify_scheduler = verify
+    drafter.mtp_k = draft_width
+    drafter._captures_aux = True
+    drafter.speculative_config = SimpleNamespace(
+        use_dspark_with_draft=lambda: with_draft
+    )
+    drafter.model = SimpleNamespace(prepare_block=lambda *args: None)
+    drafter.runner = SimpleNamespace(
+        attn_metadata_builder=None,
+        forward_vars={"batch_info": SimpleNamespace(gpu=torch.zeros(3))},
+    )
+    drafter._block_pass = lambda: SimpleNamespace(
+        run=lambda *a, **kw: (torch.zeros(scheduled_bs + 2, draft_width), confidence),
+        label=lambda *args: "test",
+    )
+    drafter._stage_anchors = lambda *args: {"anchor_positions": fc.context.positions}
+    drafter._publish_draft_shape = lambda *args, **kwargs: None
+    drafter._build_paged_block_metadata = lambda *args, **kwargs: None
+    # Exercise both production proposal paths through the runner's recording
+    # path; only the GPU block execution and its input staging are replaced.
+    drafter.propose = drafter._propose
+    ids = [f"prefill-{i}" for i in range(prefill_rows)] + ["A", "B", "C", "D"]
+    batch = SimpleNamespace(
+        is_mixed=bool(prefill_rows),
+        total_seqs_num_prefill=prefill_rows,
+        total_seqs_num=scheduled_bs,
+        req_ids=ids,
+        next_token_ids=None,
+    )
+    published = []
+    runner = SimpleNamespace(
+        drafter=drafter,
+        _commit_target_step=lambda *a: torch.arange(scheduled_bs),
+        attn_metadata_builder=SimpleNamespace(publish_draft_state=published.append),
+        tokenID_processor=SimpleNamespace(
+            prepare_draft_ids=lambda batch, drafts: drafts
+        ),
+    )
+    result = mr.ModelRunner.propose_draft_token_ids(
+        runner, batch, None, None, torch.zeros(scheduled_bs), None, None
+    )
+    torch.testing.assert_close(verify._last_ell[-4:], expected, rtol=0, atol=0)
+    torch.testing.assert_close(verify._last_ell, expected, rtol=0, atol=0)
+    assert verify._ell_pending[-1][2] == ["A", "B", "C", "D"]
+    assert result.shape == (scheduled_bs, draft_width)
+    assert published == ([metadata] if prefill_rows else [])
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="stages through the GPU")
 def test_pipeline_mixed_drafts_leave_prefill_tokens_untouched(monkeypatch):
     from atom.model_ops.attentions.deepseek_v4_attn import (

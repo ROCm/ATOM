@@ -87,6 +87,8 @@ def test_pure_batches_do_not_serialize_mixed_block_table_rows(prefill):
     )
     assert batch.block_tables == [[7]] and not batch.is_mixed
     assert "block_table_rows" not in vars(batch)
+    with pytest.raises(ValueError, match="requires mixed-batch row metadata"):
+        batch.slice_rows(0, 1)
 
 
 def test_filtered_state_rows_are_gathered_by_their_batch_index():
