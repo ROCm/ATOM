@@ -149,7 +149,8 @@ def stage_crow(c, r1):
     lb = c["sm"]                     # bf16 [16][LAT]: row 0 the latent, rows 1..15 zero (the WMMA's M padding)
     kb = c["sm"] + 16 * LAT * 2      # f32 [KEYS]
     red = kb + KEYS * 4              # f32 [8] the waves' sums of squares
-    if act:   # (CTA-uniform; a dead row (pos < 0) computes on clamped addresses, stores nothing)
+    if live:   # (CTA-uniform) a dead plan row (pos < 0) skips the row: it stored nothing, but its loads and math ran ~11 us
+        # on each of the ~60 dead rows' CTAs (L2 / L8 / L14 at c1, 3 live rows of ccap = T), ahead of their score tasks
         posc = fx.max(pos, I32(0))
         slot = hx.gload(c["slots"] + i64(fx.max(bat, I32(0))) * 4, I32)
         cpos = (posc // ratio) * ratio
