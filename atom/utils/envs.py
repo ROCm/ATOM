@@ -648,14 +648,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Kimi-K3 gfx1250 mono: TDM GEMVs whose CUs are bound by their token bytes
     # split K over the TDM cluster instead (each CTA a quarter of the tokens
     # and of eight tasks' weights, then one cluster exchange of f32 partials):
-    # a comma list of sites (front, k1), 1 for all of them, k1 by default; 0
+    # a comma list of sites (front, k1), 1 for all of them; 0, the default,
     # keeps every CTA streaming every token.
     "ATOM_KIMI_MONO_SPLITK": lambda: frozenset(
         ("front", "k1")
-        if os.getenv("ATOM_KIMI_MONO_SPLITK", "k1") == "1"
+        if os.getenv("ATOM_KIMI_MONO_SPLITK", "0") == "1"
         else (
             site
-            for site in os.getenv("ATOM_KIMI_MONO_SPLITK", "k1").split(",")
+            for site in os.getenv("ATOM_KIMI_MONO_SPLITK", "0").split(",")
             if site not in ("", "0")
         )
     ),
