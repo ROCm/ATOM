@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 """Common scheduler lookup contract, including non-driving clients."""
 
-
 from enum import Enum
 
 

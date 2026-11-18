@@ -31,7 +31,7 @@ from atom.kv_transfer.offload.kv_store.keys import (
     chunk_hash_chain,
     rank_key_prefix,
 )
-from atom.kv_transfer.offload.lookup_client import LookupClient
+from atom.kv_transfer.offload.lookup_client import LookupClient, LookupPinStatus
 from atom.kv_transfer.offload.metadata import LMCacheReqMeta, LoadSpec, SaveSpec
 from atom.utils import envs
 
@@ -265,7 +265,9 @@ class KVStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
     def _lookup_starting(self, sid: str) -> None:
         """Called right before the store is asked about request ``sid``."""
 
-    def _ensure_lookup_pin(self, seq: Any, sid: str, spec: LoadSpec) -> bool:
+    def _ensure_lookup_pin(
+        self, seq: Any, sid: str, spec: LoadSpec
+    ) -> bool | LookupPinStatus:
         """Always dispatch the load: a store lookup pins nothing to re-take.
 
         The engine parked the request when it admitted it, before this

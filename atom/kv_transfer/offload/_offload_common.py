@@ -37,6 +37,7 @@ from atom.kv_transfer.offload.load_math import (
     loadable_hit,
     tier_load_tokens,
 )
+from atom.kv_transfer.offload.lookup_client import LookupPinStatus
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -893,7 +894,7 @@ class OffloadSchedulerMixin(ABC):
         if self._tier_hit_memo:
             self._tier_hit_memo.pop(sid, None)
 
-    def _ensure_lookup_pin(self, seq, sid: str, spec) -> bool | None:
+    def _ensure_lookup_pin(self, seq, sid: str, spec) -> bool | LookupPinStatus | None:
         """Re-take the worker-side lookup pin before a load is committed.
 
         An answer served from the remembered hit carries no pin: the metadata

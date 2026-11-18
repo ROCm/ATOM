@@ -446,7 +446,9 @@ class MooncakeStoreOffloadScheduler(KVStoreOffloadScheduler):
             self._looked_up_at[sid] = started
         return hit
 
-    def _ensure_lookup_pin(self, seq: Any, sid: str, spec: LoadSpec) -> bool:
+    def _ensure_lookup_pin(
+        self, seq: Any, sid: str, spec: LoadSpec
+    ) -> bool | LookupPinStatus:
         """Renew the read leases of what a load reads; the load always goes ahead.
 
         The base trusts a hit it still holds from this request's lookup, a
