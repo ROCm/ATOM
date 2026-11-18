@@ -32,12 +32,16 @@ ARG BASE_IMAGE_ROCM10="ubuntu:24.04"
 # wheels, installed into site-packages rather than /opt/rocm). Ported from
 # sglang's docker/rocm.Dockerfile rocm1000-base stage.
 #
-# Version policy (ticket: ATOM v0.1.7 for ROCm 10.1, GA 2026-10-05):
-#   - Main line: stable channel 10.0.0 (the combination sglang validated).
-#   - 10.1 tracking line: nightly channel with 10.1.0a<date> versions
-#     (rc.repo.amd.com has no 10.1 artifacts yet). NOT a release artifact;
-#     it exists to surface 10.1 breaks early. Once 10.1 RC/GA lands on the
-#     stable channel, flip these ARGs and re-run the golden test.
+# Version policy:
+#   - Pinned line: stable channel, an exact ROCM_SDK_VERSION (10.0.0 is the
+#     combination sglang validated). Reproducible; what a release is cut from.
+#   - Nightly tracking line (10.3): set ROCM_SDK_SERIES and let the stage
+#     resolve the newest dated build at or above ROCM_SDK_MIN_VERSION. ROCm 10.2
+#     GA does not carry the device-memory queue signal work (rocm-systems
+#     #12988/#13424/#13507), and the queue-signal default only flipped on in
+#     10.3.0a20261115, which is why that date is the floor. NOT a release
+#     artifact: it exists to surface breaks early. Once the work lands in a GA
+#     release, pin that version here and drop ROCM_SDK_SERIES.
 #
 # Python 3.12 (Ubuntu 24.04 default): the wheel channel publishes cp312 for
 # the whole stack; torch 2.11+rocm10.0.0 is the version sglang validated.
@@ -64,6 +68,16 @@ ENV ROCM_INDEX_URL=${ROCM_INDEX_URL}
 # is a set of --build-arg values -- a base version, an index URL -- and not a
 # new stage. The nightly channel prunes old date-stamped builds, so such a
 # line has to resolve its versions at build time rather than pin them.
+#
+# So a nightly line floats exactly one thing: the date. ROCM_SDK_SERIES turns
+# resolution on, ROCM_SDK_MIN_VERSION is the floor below which the line must not
+# land, and the torch trio above stays pinned -- one nightly date publishes
+# several torch lines side by side, so "newest of each" would quietly carry the
+# image onto a torch alpha. Leave ROCM_SDK_SERIES empty and the stage behaves
+# exactly as before, honouring the ROCM_SDK_VERSION pin.
+ARG ROCM_SDK_SERIES=""
+ARG ROCM_SDK_MIN_VERSION=""
+ARG ROCM_PYTHON_TAG="cp312"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
@@ -85,11 +99,39 @@ RUN python3 -m venv "$VIRTUAL_ENV"
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 RUN python3 -m pip install --no-cache-dir -U pip setuptools setuptools_scm wheel
 
+# Resolve the nightly date, if this is a tracking line. This stage carries no
+# CACHEBUST on purpose -- that one lives in atom_image so the parallel builder
+# stages stay cached -- but a line whose whole point is "today's nightly" must
+# not be served yesterday's layer. ROCM_SDK_CACHEBUST is the caller's knob: a
+# date stamp on a daily line, empty on a pinned one, which leaves the stable
+# line's cache untouched.
+ARG ROCM_SDK_CACHEBUST=""
+COPY docker/resolve_rocm_versions.py /tmp/resolve_rocm_versions.py
+RUN set -eux; \
+    if [ -n "${ROCM_SDK_SERIES}" ]; then \
+        python3 /tmp/resolve_rocm_versions.py \
+            --index-url "${ROCM_INDEX_URL}" \
+            --series "${ROCM_SDK_SERIES}" \
+            --min-version "${ROCM_SDK_MIN_VERSION}" \
+            --arches "${GPU_ARCH}" \
+            --python-tag "${ROCM_PYTHON_TAG}" \
+            --torch "${ROCM_TORCH_VERSION}" \
+            --torchvision "${ROCM_TORCHVISION_VERSION}" \
+            --torchaudio "${ROCM_TORCHAUDIO_VERSION}" \
+            > /tmp/rocm-versions.env; \
+    else \
+        echo "ROCM_SDK_VERSION=${ROCM_SDK_VERSION}" > /tmp/rocm-versions.env; \
+    fi; \
+    cat /tmp/rocm-versions.env
+
 # Unlike the sglang rocm1000 flavors (one device payload per image), the ATOM
 # release image is a single multi-arch image: GPU_ARCH="gfx942;gfx950" gets a
 # device payload for every listed arch. Loop over GPU_ARCH_LIST so adding an
 # arch stays a GPU_ARCH change, not a new package list.
 RUN set -eux; \
+    # Pinned line: the ROCM_SDK_VERSION already in the environment. Tracking
+    # line: the date the resolve step landed on, which overrides it here.
+    . /tmp/rocm-versions.env; \
     for arch in $(printf '%s' "${GPU_ARCH}" | tr ';' ' '); do \
         python3 -m pip install --no-cache-dir \
             --index-url ${ROCM_INDEX_URL} \
@@ -160,6 +202,19 @@ RUN mkdir -p /usr/lib64 && ln -sf /lib/x86_64-linux-gnu/libc.so /usr/lib64/libc.
 # install.sh and Mooncake's cmake both expect /opt/rocm, and the amdsmi pip
 # install below refers to /opt/rocm/share/amd_smi.
 RUN ln -s ${ROCM_HOME} /opt/rocm
+
+# Device-memory queue signals are gated on no profiler tool being attached: the
+# host writes those signals through the BAR, and a tool's host atomics on them
+# are not atomic over PCIe. rocprofiler-register attaches on import of torch, so
+# a torch stack silently loses the optimisation even where DEBUG_CLR_DEV_SIGNALS
+# defaults on -- measured on 10.3.0a20261118: queue signals 0 (profiler tool: 1)
+# by default, 1 once this is 0. The tracking line passes 0 to actually exercise
+# the fix; anything that needs rocprof/kineto overrides it back to 1 at runtime.
+#
+# "1" and unset behave identically. Never pass an empty value: an empty
+# ROCPROFILER_REGISTER_ENABLED makes device init fail with hipErrorInvalidDevice.
+ARG ROCPROFILER_REGISTER_ENABLED="1"
+ENV ROCPROFILER_REGISTER_ENABLED=${ROCPROFILER_REGISTER_ENABLED}
 
 # amdsmi: the pip SDK (unlike the rocm/pytorch apt images) does not preinstall
 # the AMD SMI python package; ATOM's numa_utils imports it. The SDK's
