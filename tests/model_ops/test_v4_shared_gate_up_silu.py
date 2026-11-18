@@ -99,6 +99,23 @@ def test_fused_gate_up_feeds_w2_the_quantized_activation(
     assert args[0] is act and kwargs["x_scale"] is act_scale
 
 
+def test_gated_forward_keeps_the_unfused_path(monkeypatch, atom_modules, flydsl):
+    """`forward(x, weights=...)` (a gated expert) never takes the fused path:
+    the epilogue has no per-row gate."""
+    expert = _expert(monkeypatch, atom_modules)
+    assert expert._gate_up_silu
+    expert.gate_up_proj = MagicMock(return_value=torch.zeros(3, 128))
+    monkeypatch.setattr(
+        atom_modules.deepseek_v4, "aiter_silu_and_mul", lambda out, x, limit: None
+    )
+    expert.w2.return_value = "out"
+    x = torch.zeros(3, 256, dtype=torch.bfloat16)
+    weights = torch.ones(3, 1, dtype=torch.bfloat16)
+    assert expert.forward(x, weights=weights) == "out"
+    assert "run" not in flydsl and "shape" not in flydsl
+    expert.gate_up_proj.assert_called_once_with(x)
+
+
 @pytest.mark.parametrize(
     "change",
     [

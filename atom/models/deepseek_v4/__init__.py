@@ -2816,9 +2816,10 @@ class Expert(nn.Module):
         """Whether gate_up can run with the SwiGLU and the MXFP8 quant for w2
         in its epilogue: gfx1250, native MX (group 32) FP8 weights that the
         load shuffles for the FlyDSL GEMM (`weight_is_stored_preshuffled`, the
-        load's own predicate), a clamped SwiGLU, no fused activation of
-        ATOM_V4_USE_TRITON_FUSION, and a native MX w2 that takes the quantized
-        activation as it is. Everything it reads is fixed at construction."""
+        load's own predicate, which also requires the FP8 weight dtype), a
+        clamped SwiGLU, no fused activation of ATOM_V4_USE_TRITON_FUSION, and a
+        native MX w2 that takes the quantized activation as it is. Everything
+        it reads is fixed at construction."""
         gate_up = self.gate_up_proj
         return bool(
             get_gfx_runtime() == "gfx1250"
@@ -2826,7 +2827,6 @@ class Expert(nn.Module):
             and self.swiglu_limit > 0
             and gate_up.native_a8_group_rows == 32
             and self.w2.native_a8_group_rows is not None
-            and gate_up.weight.dtype == torch.float8_e4m3fn
             and gate_up.weight_scale.dtype == torch.float8_e8m0fnu
             and weight_is_stored_preshuffled(
                 gate_up.quant_type, gate_up.weight.dtype, native_group_rows=32
