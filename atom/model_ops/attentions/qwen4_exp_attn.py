@@ -428,12 +428,13 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         planes = self._ple_planes
         if not planes:
             return None
-        # GDN's class: the same slots, decode-image scratch included.
+        # GDN's class: `merge_specs` needs its multiplicity, scratch included.
+        gdn = self.state_spec()
         return state_pool(
             PLE_STATE_SLOT_CLASS,
             sum(plane.slot_bytes for plane in planes),
-            entries_per_req=self.slots_per_req(),
-            extra_entries=self.state_spec().extra_entries,
+            entries_per_req=gdn.entries_per_req,
+            extra_entries=gdn.extra_entries,
         )
 
     def sub_pool_specs(self) -> list[SubPoolSpec]:
