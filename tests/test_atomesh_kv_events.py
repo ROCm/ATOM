@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Verify the kv_events cells through the router and prefill command builders."""
+"""Verify the kv_events cells through pd_submit.sh's exports and the router and
+prefill command builders."""
 
 import json
 import os
@@ -134,8 +135,11 @@ start_prefill prefill-rank-0 "${SERVER_PORT}"
             },
             {
                 (f"1P1D-CPP4-DCP4-TP1-TP4-{tier}-KVEV", (concurrency,))
-                for tier in ("MCSTORE", "LMCACHE")
-                for concurrency in (56, 72, 96)
+                for tier, concurrencies in (
+                    ("MCSTORE", (56, 72, 96)),
+                    ("LMCACHE", (56, 72)),
+                )
+                for concurrency in concurrencies
             },
         )
         for cell in self.cells:
@@ -150,6 +154,26 @@ start_prefill prefill-rank-0 "${SERVER_PORT}"
                 )
                 self.assertEqual(
                     args[args.index("--prepare-prefix-cache-mb") + 1], "4096"
+                )
+
+    def test_submit_exports_the_switch(self):
+        source = (SCRIPTS / "pd_submit.sh").read_text()
+        start = source.index("python3 - <<'PY'\n") + len("python3 - <<'PY'\n")
+        exports = source[start : source.index("\nPY\n", start)]
+        plain = json.loads(json.dumps(self.cells[0]))
+        del plain["service"]["router"]["kv_events"]
+        for cell, switch in ((self.cells[0], "true"), (plain, "false")):
+            with self.subTest(switch=switch):
+                result = subprocess.run(
+                    [sys.executable, "-c", exports],
+                    env=dict(self.env, CELL_JSON=json.dumps(cell)),
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertIn(
+                    f"export ROUTER_KV_EVENTS={switch}", result.stdout.splitlines()
                 )
 
     def test_router_follows_no_events_without_the_switch(self):
