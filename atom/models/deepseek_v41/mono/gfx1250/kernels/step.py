@@ -563,9 +563,12 @@ def target_layer(E, Ly):
             if hascomp:
                 CS.stage_cgemm(cwith(c, cwkv=ltab(fp, Ly, "cwkv")(), axn=fptr(fp, "axn"), cpart=fptr(fp, "cpart")), r1)
         # (R4) indexer layers: iq / iw / the compressor GEMM's partials are counted (KV_C), waited for only by their readers
-        # (the iquant CTAs, the compressor rows' CTAs); the Engram-next layers keep the KV_C handoff
+        # (the iquant CTAs, the compressor rows' CTAs); the Engram-next layers keep the KV_C handoff for the engkv their A
+        # stage writes (stage_engkv, or engentry's slot-1 copy) -- except the first engentry row (ENG_ROWS[0]): its kv is
+        # the entry's slot 0, written before the TARGET_FRONT handoff, and its A stage writes no engkv
         NIQC = (TR * IS.HEADS + 7) // 8   # the iquant CTAs (a (token, head) row a wave)
-        if hx.unlikely(keepA & (isidx == (fx.Int32(0) != fx.Int32(0)))):
+        engent0 = (Ly == fx.Int32(S.ENG_ROWS[0])) & ((ltab(fp, Ly, "lflags")() & fx.Int64(S.ENG_ENTRY)) != fx.Int64(0))
+        if hx.unlikely(keepA & (isidx == (fx.Int32(0) != fx.Int32(0))) & (engent0 == (fx.Int32(0) != fx.Int32(0)))):
             handoff(lc + i64(LY.KV_C), t, True)
         if hx.unlikely(isidx):
             if fx.const_expr(Lx["MT"] == 1 and not DRS):   # (the draft launch: no index layers -- the CTA count, as before)
