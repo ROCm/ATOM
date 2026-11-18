@@ -1044,36 +1044,6 @@ class GDNStateMixin(PoolRowsMixin):
             at = end
         launch_copy_descriptor(staging.upload(descriptor_slot, total), plan)
 
-    def warmup_per_req_cache(self) -> None:
-        """Run one checkpoint copy now, so the first real one is only a copy.
-
-        `execute_paged_state_copies` is reachable only from `build()`, so
-        everything it builds lazily -- the copy plan, the slot base table, the
-        tiling's upload, the pinned descriptor, and the Triton JIT of
-        `_copy_tiles_kernel` -- otherwise lands inside the batch of whichever
-        request first crosses a rung.
-
-        Each planned span is copied onto itself. This warms the real source
-        addresses and copy kernel without changing PAGE bytes, including the
-        reserved padding page on eager startup where no capture reset follows.
-        """
-        runtime = getattr(self.model_runner, "state_runtime", None)
-        spec = None if runtime is None else runtime.checkpoint_spec
-        if spec is None:
-            return
-        plan = self._checkpoint_copy_plan()
-        if not plan.num_spans:
-            return
-        staging = self._checkpoint_staging()
-        rows = staging.rows(0)[: plan.num_spans]
-        destinations = np.zeros(
-            (1, len(self._page_unit_stream_sizes(spec.units_per_checkpoint))),
-            dtype=np.int64,
-        )
-        plan.write_descriptor(rows, self._checkpoint_slot_bases()[:1], destinations)
-        rows[:, 1] = rows[:, 0]
-        launch_copy_descriptor(staging.upload(0, plan.num_spans), plan)
-
     def state_entry_views(self, slot: int) -> list[torch.Tensor]:
         """One contiguous slice per (cache, layer) — the slot's whole state.
 

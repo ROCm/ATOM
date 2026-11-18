@@ -757,7 +757,7 @@ class BlockManager:
         Under DCP a rank stores only its interleaved shard, so this is a factor
         of `dcp_world_size` below the global `ceil(seq_len / block_size)`. The
         pool is sized in these same per-rank units, so this is the only count
-        that may be compared against `kv.num_blocks` — whether to draw from the
+        that may be compared against `kv.num_usable_blocks` — whether to draw from the
         pool (`can_allocate`/`allocate`) or to reject a prompt as too large for
         it (`Scheduler._unschedulable_reason`).
         """

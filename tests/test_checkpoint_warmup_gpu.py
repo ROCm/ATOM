@@ -25,6 +25,7 @@ pytestmark = pytest.mark.skipif(
 def test_v4_warmup_preserves_padding_and_state_without_capture(monkeypatch):
     from test_v4_checkpoint_slot_copy import TestTheBuilderDeclaresWhatItDrops
 
+    import atom.model_ops.attentions.backends as base_mod
     import atom.model_ops.attentions.deepseek_v4_attn as mod
 
     b = TestTheBuilderDeclaresWhatItDrops.builder_stub()
@@ -95,8 +96,8 @@ def test_v4_warmup_preserves_padding_and_state_without_capture(monkeypatch):
     assert torch.isneginf(plane.view(torch.float32)).any()
     before_plane, before_index = plane.clone(), index.clone()
 
-    launch = Mock(wraps=mod.launch_copy_descriptor)
-    monkeypatch.setattr(mod, "launch_copy_descriptor", launch)
+    launch = Mock(wraps=base_mod.launch_copy_descriptor)
+    monkeypatch.setattr(base_mod, "launch_copy_descriptor", launch)
     b.warmup_per_req_cache()
     torch.cuda.synchronize()
 
@@ -109,13 +110,17 @@ def test_v4_warmup_preserves_padding_and_state_without_capture(monkeypatch):
 def test_gdn_warmup_preserves_padding_and_state_without_capture(monkeypatch):
     from test_kda_checkpoint_slot_copy import Mixin, builder
 
-    import atom.model_ops.attentions.gdn_attn as mod
-    from atom.model_ops.attentions.backends import AttentionMetadataBuilder
+    import atom.model_ops.attentions.backends as base_mod
+    from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadataBuilder
     from atom.model_ops.attentions.pool_layout.page_unit_geometry import (
         PageUnitGeometryMixin,
     )
 
-    b = builder(num_slots=2)
+    data = builder(num_slots=2)
+    b = object.__new__(GDNAttentionMetadataBuilder)
+    b.model_runner = data.model_runner
+    for name in ("num_state_layers", "_state_shape_for_runner", "_state_dtypes"):
+        setattr(b, name, getattr(data, name))
     b.model_runner.mamba_k_cache = b.model_runner.mamba_k_cache.cuda().fill_(1.25)
     b.model_runner.mamba_v_cache = b.model_runner.mamba_v_cache.cuda().fill_(-0.5)
     pool = torch.zeros(8, 128, dtype=torch.uint8, device="cuda")
@@ -130,17 +135,14 @@ def test_gdn_warmup_preserves_padding_and_state_without_capture(monkeypatch):
     )
     for name in ("_page_unit_bases", "_page_unit_stream_sizes"):
         setattr(b, name, getattr(PageUnitGeometryMixin, name).__get__(b))
-    for name in ("_checkpoint_copy_plan", "_checkpoint_slot_bases"):
-        setattr(b, name, getattr(Mixin, name).__get__(b))
-    b._checkpoint_staging = AttentionMetadataBuilder._checkpoint_staging.__get__(b)
     plan = b._checkpoint_copy_plan()
     b._checkpoint_staging_cache = DescriptorStaging(plan.num_spans, "cuda")
     before_k = b.model_runner.mamba_k_cache.clone()
     before_v = b.model_runner.mamba_v_cache.clone()
 
-    launch = Mock(wraps=mod.launch_copy_descriptor)
-    monkeypatch.setattr(mod, "launch_copy_descriptor", launch)
-    Mixin.warmup_per_req_cache(b)
+    launch = Mock(wraps=base_mod.launch_copy_descriptor)
+    monkeypatch.setattr(base_mod, "launch_copy_descriptor", launch)
+    b.warmup_per_req_cache()
     torch.cuda.synchronize()
 
     assert launch.call_count == 1
