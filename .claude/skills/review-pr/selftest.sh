@@ -443,11 +443,11 @@ t "a coverage label with nothing after it is refused" \
   "$(_cov_gate "$_SMALL" 'Coverage:')" "EMPTY-COVERAGE"
 # SKILL.md forbids rule codes in output; the gate parsed a leading one as a claim, so
 # the instruction and the gate disagreed and ATOM#3481 shipped a finding opening `A5:`.
-_card_kinds() {  # <card text> -> the problem kinds the card gate raises
+_card_kinds() {  # <card text> [verdicts] [diff] -> the problem kinds the card gate raises
   python3 -c '
 import sys; sys.path.insert(0, sys.argv[1]); import triage
-_, probs = triage.audit_card(sys.argv[2], "", "", "", "", "")
-print(" ".join(sorted({k for k, _, _ in probs})))' "$S" "$1"
+_, probs = triage.audit_card(sys.argv[2], sys.argv[3], "", "", sys.argv[4], "")
+print(" ".join(sorted({k for k, _, _ in probs})))' "$S" "$1" "${2:-}" "${3:-}"
 }
 t "a finding opening with a rule code is refused" \
   "$(_card_kinds '## T
@@ -455,6 +455,7 @@ t "a finding opening with a rule code is refused" \
 **what**
 
 Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
 
 ⚠️ A5: planner.rs:108 charges the prompt only when req.stream. **Author must** say so.' | grep -c RULE-CODE-IN-CARD)" "1"
 t "the same finding without the rule code is not" \
@@ -463,6 +464,7 @@ t "the same finding without the rule code is not" \
 **what**
 
 Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
 
 ⚠️ planner.rs:108 charges the prompt only when req.stream. **Author must** say so.' | grep -c RULE-CODE-IN-CARD)" "0"
 # `FP8:`, `TP8:`, `MI300:` and `V4:` share the rule-id shape and are ordinary ways to open
@@ -485,6 +487,121 @@ Review: OK
 ⚠️ FP8: minimax_m3/config.py:39 still refuses the connector. **Author must** fix the text.' | grep -c RULE-CODE-IN-CARD)" "0"
 # triage's CITATION did not cover .rs/.toml while _publish anchors them, so a Rust finding
 # had no path-based way to claim its FIRE and the rule id was the only one left.
+# The three cases above pass no verdicts, so they never exercised what happens when a
+# FIRE is on the ledger. These do.
+_V_PATH="A5 FIRE -- planner.rs:108 charges only on req.stream"
+_V_NOPATH="A5 FIRE -- the prefill charge is skipped for non-streaming placements"
+_DIFF="diff --git a/atom/mesh/src/routers/planner.rs b/atom/mesh/src/routers/planner.rs"
+_CARD_ID='## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ A5: planner.rs:108 charges the prompt only when req.stream. **Author must** say so.'
+_CARD_PATH='## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ planner.rs:108 charges the prompt only when req.stream. **Author must** say so.'
+_CARD_TOKENS='## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ The prefill charge is skipped for non-streaming placements. **Author must** say so.'
+t "an A5: card against an A5 FIRE is refused for the id, not for tracing" \
+  "$(_card_kinds "$_CARD_ID" "$_V_PATH" "$_DIFF")" "RULE-CODE-IN-CARD"
+t "the same card without the id traces by path" \
+  "$(_card_kinds "$_CARD_PATH" "$_V_PATH" "$_DIFF")" ""
+# A verdict reason may name only a symbol or a condition. Before this, such a FIRE had no
+# legal card at all: name the id and the no-rule-codes gate refuses it, drop the id and
+# UNREPORTED-FIRE fires, and both are fatal -- the only way out was an untrue
+# `-- not reported:`.
+t "a path-less FIRE can be claimed by the words of its reason" \
+  "$(_card_kinds "$_CARD_TOKENS" "$_V_NOPATH" "$_DIFF")" ""
+t "and naming its id instead is still refused, not silently accepted" \
+  "$(_card_kinds "$_CARD_ID" "$_V_NOPATH" "$_DIFF")" "RULE-CODE-IN-CARD"
+t "a backticked rule id is a rule id" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ `A5`: planner.rs:108 charges only on req.stream. **Author must** say so.' "$_V_PATH" "$_DIFF")" "RULE-CODE-IN-CARD"
+
+# The in-card scan kept its own extension list; a Rust-only finding read as citing
+# nothing and skipped UNANCHORED and UNBACKED both. Drive it through audit_card, not
+# just the regex.
+# The guard runs before both readers, so a non-rule id cannot claim a FIRE either. A
+# ledger line like `FP8 FIRE` is malformed; letting `FP8:` on the card answer it would
+# hide that instead of reporting it. The reason cites no path and shares no words with
+# the card, so the id is the only claim the guard could let through.
+# RULE-CODE-IN-CARD is about how a finding is written, not whether it traces; the
+# summary counted it under "findings cannot be traced", which misnames it. The sentence
+# only exists on the CLI path, so drive that.
+_card_summary() {  # -> the CARD NOT NAILED DOWN sentence
+  d=$(mktemp -d)
+  printf '%s\n' "$1" > "$d/card.md"
+  printf '%s\n' "$2" > "$d/verdicts.txt"
+  : > "$d/empty.txt"
+  printf 'diff --git a/p/planner.rs b/p/planner.rs\n' > "$d/pr.diff"
+  python3 "$S/triage.py" card "$d/card.md" "$d/verdicts.txt" "$d/empty.txt" \
+          "$d/empty.txt" "$d/pr.diff" "$d/empty.txt" 2>&1 | grep "NAILED DOWN" || true
+}
+t "the summary does not call a rule code an untraceable finding" \
+  "$(_card_summary '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ A5: planner.rs:108 charges only on req.stream. **Author must** say so.' \
+    'A5 FIRE -- planner.rs:108 charges only on req.stream' | grep -c 'cannot be traced')" "0"
+t "a non-rule id cannot claim a FIRE" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ FP8: planner.rs:108 charges only on req.stream. **Author must** say so.' \
+     "FP8 FIRE -- quantised buffers lose their alignment guarantee" \
+     "diff --git a/atom/mesh/src/routers/planner.rs b/atom/mesh/src/routers/planner.rs" \
+   | grep -c UNREPORTED-FIRE)" "1"
+t "a Rust-only finding is checked against the diff like any other" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ worker.rs:1007 charges before releasing. **Author must** assert instead.' \
+     "A5 FIRE -- worker.rs:1007 charges before releasing" \
+     "diff --git a/atom/mesh/src/core/other.rs b/atom/mesh/src/core/other.rs")" \
+  "UNANCHORED-FINDING"
+t "and passes once the diff touches it" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ worker.rs:1007 charges before releasing. **Author must** assert instead.' \
+     "A5 FIRE -- worker.rs:1007 charges before releasing" \
+     "diff --git a/atom/mesh/src/core/worker.rs b/atom/mesh/src/core/worker.rs")" ""
 t "a Rust citation is a citation" \
   "$(python3 -c '
 import sys; sys.path.insert(0, sys.argv[1]); import triage

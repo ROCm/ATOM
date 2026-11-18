@@ -2822,6 +2822,21 @@ def audit_core_files(text, diff_text, root=None):
 
 # ----------------------------------------------------------------- card gate
 FINDING = re.compile(r"^\s*(\U0001F534|\u26A0\uFE0F?|\U0001F4DD)\s*(.+)$")
+# A rule id at the head of a finding, through the emphasis SKILL.md's own examples use:
+# `**A5:**` is the shape reached for once a plain `A5:` is refused. Compiled once and
+# shared by both readers -- one registers the claim, the other refuses to ship the id.
+RULE_ID_HEAD = re.compile(r"[*`_ ]*([A-Z]+\d+[a-z]?)[*`_]*:")
+RULE_SET = frozenset(ALL_RULES.split())
+# The in-card scan kept its own copy of CITATION's extension list and drifted from it:
+# no `rs|toml`, so a Rust-only finding read as citing nothing and skipped both the
+# UNANCHORED and the UNBACKED check. Derived from CITATION so they cannot diverge again.
+CITATION_BARE = CITATION.pattern.split("(?::(")[0]
+_FIRE_STOPWORDS = frozenset(
+    "this that with from into when which where there their then than only also "
+    "every each both same other another still never always would could should "
+    "under over past here more most less least line lines code file files "
+    "path paths rule fire fired because since while after before".split()
+)
 VALUE = re.compile(r"\b\d+\b|fp8|fp16|bf16|fp4|int8|int32|int64|e4m3|e5m2|gfx\d+|"
                    r"nullptr|None\b|2\^\d+", re.I)
 IDENT = re.compile(r"\b[a-z]+_[a-z_0-9]{2,}\b|\b[A-Z][A-Z0-9_]{3,}\b")
@@ -3074,7 +3089,7 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
     # them, and pass. FIRE means it goes in the card; if it is not going in, the verdict
     # is not FIRE, and saying so is a one-word edit to the ledger. The escape is
     # deliberate and must be written down: `-- not reported: <reason>` on the verdict.
-    fired, fire_paths, claims = {}, {}, {}
+    fired, fire_paths, fire_tokens, claims = {}, {}, {}, {}
     for ln in (verdicts_text or "").splitlines():
         m = re.match(r"\s*([A-Z]+\d+[a-z]?)\s+FIRE\b\s*(?:--|—|:)\s*(.*)$", ln)
         if m and "not reported:" not in m.group(2).lower():
@@ -3082,6 +3097,13 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
             # The files this verdict cited, so a card that obeys the no-rule-codes rule
             # can still be matched to the FIRE it is reporting.
             fire_paths[m.group(1)] = [pp for pp, _ in CITATION.findall(m.group(2))]
+            # For a reason that cites no file: the words a card would have to reuse to be
+            # talking about the same thing. Stopwords out, and only tokens long enough to
+            # be distinctive.
+            fire_tokens[m.group(1)] = {
+                w for w in re.findall(r"\b\w{4,}\b", _fold_punct(m.group(2)))
+                if w not in _FIRE_STOPWORDS
+            }
     backing = _fold_punct((verdicts_text or "") + "\n" + (diagnostic_text or "")
                           + "\n" + (answers_text or ""))
     problems = []
@@ -3092,10 +3114,12 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
             findings.append((m.group(1), m.group(2).strip()))
     reported = set()
     for _, text in findings:
-        rid = re.match(r"[*`_ ]*([A-Z]+\d+[a-z]?)[*`_]*:", text)  # emphasis too: SKILL.md's
-        # own examples lean on `**`, so `**A5:**` is the shape reached for next, and a
-        # match pinned to offset 0 would miss it here (claim lost -> false
-        # UNREPORTED-FIRE) and below (the id ships).
+        rid = RULE_ID_HEAD.match(text)
+        if rid and rid.group(1) not in RULE_SET:
+            # `FP8:`, `TP8:`, `MI300:` and `GPU0:` share the shape and are ordinary ways
+            # to open a finding here. One guard, before either reader, so the refusal and
+            # the claim can never disagree about what counts as a rule id.
+            rid = None
         if rid:
             reported.add(rid.group(1))
         # SKILL.md's output rules say, in as many words, "Do NOT use rule codes (B1, D4,
@@ -3103,9 +3127,18 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
         # id was therefore something the card was forbidden to do, and every correctly
         # written card reported every fired rule as UNREPORTED-FIRE. A finding that names
         # a file the verdict cited is the same claim without the label.
+        folded = _fold_punct(text)
         for rule, paths in fire_paths.items():
             if paths and any(pp in text for pp in paths):
                 claims.setdefault(rule, []).append(text[:40])
+            elif not paths and fire_tokens.get(rule):
+                # A verdict reason may name only a symbol or a condition (SKILL.md's
+                # format allows it), and then there is no path to match on. Without this
+                # the card had no legal move left: name the id and the no-rule-codes gate
+                # refuses it, drop the id and UNREPORTED-FIRE fires, and both are fatal --
+                # so the only way through was a `-- not reported:` that is untrue.
+                if fire_tokens[rule] & set(re.findall(r"\b\w+\b", folded)):
+                    claims.setdefault(rule, []).append(text[:40])
     # A finding may report more than one rule, and often should: aiter#3165 fired B4 and
     # E5 on the same changed file and one accurate bullet covered both. Requiring N
     # distinct bullets for N rules sharing a path -- which is what this did -- forced the
@@ -3129,8 +3162,7 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
             # `torch.cu` and `x.contiguous.cuda()` as `x.contiguous.cu`. Those are the
             # two most ordinary words in a HIP review, so the gate produced a citation
             # complaint about a path nobody wrote.
-            r"([\w./=-]+\.(?:cuh|hpp|yaml|yml|json|csv|cpp|hip|py|cu|cc|co|h|md|sh)(?![\w]))",
-            text)]
+            CITATION_BARE, text)]
         def _is_touched(c):
             # NOT lstrip("./"): it strips every leading dot and slash, so
             # `.github/workflows/perf-parity.yaml` became `github/workflows/...` and a
@@ -3150,10 +3182,12 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
                              f"cites only {cited[0]} and nothing this PR changes"))
         # Does anything already adjudicated mention this? Match on the rule id if the
         # finding carries one, else on a distinctive token from the text.
-        rid = re.match(r"[*`_ ]*([A-Z]+\d+[a-z]?)[*`_]*:", text)  # emphasis too: SKILL.md's
-        # own examples lean on `**`, so `**A5:**` is the shape reached for next, and a
-        # match pinned to offset 0 would miss it here (claim lost -> false
-        # UNREPORTED-FIRE) and below (the id ships).
+        rid = RULE_ID_HEAD.match(text)
+        if rid and rid.group(1) not in RULE_SET:
+            # `FP8:`, `TP8:`, `MI300:` and `GPU0:` share the shape and are ordinary ways
+            # to open a finding here. One guard, before either reader, so the refusal and
+            # the claim can never disagree about what counts as a rule id.
+            rid = None
         if rid:
             # SKILL.md: "Do NOT use rule codes (B1, D4, A1...) in output -- they are
             # internal labels only." Parsing one here as a claim made the gate accept
@@ -3162,14 +3196,10 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
             # with `A5:`, which tells its reader nothing. The id still counts as the
             # claim below -- withdrawing that would turn such cards into UNREPORTED-FIRE,
             # which is worse -- but the card does not ship with it.
-            # Only a real rule id. `FP8:`, `TP8:`, `MI300:` and `V4:` all match the same
-            # shape and are ordinary ways to open a finding in this repo; refusing those
-            # would be a false positive with a message that makes no sense.
-            if rid.group(1) in ALL_RULES.split():
-                problems.append(("RULE-CODE-IN-CARD", text[:70],
-                                 f"opens with the internal rule id `{rid.group(1)}`, which "
-                                 "means nothing to a reviewer -- say the thing the rule is "
-                                 "about instead"))
+            problems.append(("RULE-CODE-IN-CARD", text[:70],
+                             f"opens with the internal rule id `{rid.group(1)}`, which "
+                             "means nothing to a reviewer -- say the thing the rule is "
+                             "about instead"))
             # `-- late finding:` is the exit for what no rule covers, so it cannot excuse a
             # finding that names a rule: claiming G1 the ledger adjudicated CLEAR is a
             # contradiction of the ledger, not a discovery arriving late.
@@ -3351,7 +3381,10 @@ if __name__ == "__main__":
             print(f"  {why}")
         if problems:
             unreported = sum(1 for k, _, _ in problems if k == "UNREPORTED-FIRE")
-            about_findings = len({t for k, t, _ in problems if k != "UNREPORTED-FIRE"})
+            # RULE-CODE-IN-CARD is about how a finding is written, not whether it
+            # traces -- counting it under "cannot be traced" misnames it.
+            about_findings = len({t for k, t, _ in problems
+                                  if k not in ("UNREPORTED-FIRE", "RULE-CODE-IN-CARD")})
             parts = []
             if about_findings:
                 parts.append(f"{about_findings} of {len(findings)} findings cannot be "
