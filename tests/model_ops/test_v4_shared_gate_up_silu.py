@@ -1,8 +1,16 @@
 # SPDX-License-Identifier: MIT
 """The V4 shared expert's gate_up GEMM with the SwiGLU and the MXFP8 quant
-for w2 in its epilogue (`Expert._fused_gate_up_silu`): when it is taken, what
-it hands AITER and w2, and that everything else keeps the unfused path. The
-decision is made once at construction, never in forward."""
+for w2 in its epilogue.
+
+Whether an expert may take it (`Expert._gate_up_silu`) is decided once at
+construction, from the configuration and the gate_up weight shape. Forward
+then branches on nothing that depends on the row count: it calls the
+functional op `torch.ops.aiter.v4_shared_gate_up_silu_quant`, whose eager body
+(`Expert.gate_up_silu_quant`) picks the fused kernel or the unfused chain from
+the real row count. The tests check what the body hands AITER and w2, that
+everything else keeps the unfused path, and that a fullgraph compile of
+`Expert.forward` traced once still makes the right choice for every later row
+count."""
 
 import importlib
 import sys
@@ -11,6 +19,42 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+
+# Imported before any test swaps in the AITER / Triton stand-ins: torch.compile
+# loads it lazily, and it inspects Triton types at import.
+import torch.utils.flop_counter
+
+INTER, DIM = 64, 256
+
+
+class _W2:
+    """A traceable stand-in for w2 that records nothing and returns a value
+    depending on both of its inputs."""
+
+    native_a8_group_rows = 32
+
+    def __call__(self, act, x_scale=None):
+        codes = act.view(torch.uint8).to(torch.float32).sum(-1, keepdim=True)
+        scales = x_scale.view(torch.uint8).to(torch.float32).sum(-1, keepdim=True)
+        return codes + scales
+
+
+class _GateUp(SimpleNamespace):
+    """gate_up_proj: the weight attributes, called through `fn` (set by a
+    test that runs the unfused chain)."""
+
+    def __call__(self, x):
+        return self.fn(x)
+
+
+@pytest.fixture
+def atom_config(atom_modules):
+    config = importlib.import_module("atom.config")
+    custom = SimpleNamespace(
+        compilation_config=SimpleNamespace(static_forward_context={})
+    )
+    with config.use_custom_atom_config(custom):
+        yield custom
 
 
 def _expert(
@@ -22,97 +66,192 @@ def _expert(
     group=32,
     fused_act=False,
     w2_group=32,
+    prefix="layers.0.ffn.shared_experts",
 ):
     v4 = atom_modules.deepseek_v4
     expert = v4.Expert.__new__(v4.Expert)
     torch.nn.Module.__init__(expert)
-    weight = torch.zeros(2 * 64, 256, dtype=torch.float8_e4m3fn)
-    expert.gate_up_proj = SimpleNamespace(
+    weight = torch.zeros(2 * INTER, DIM, dtype=torch.float8_e4m3fn)
+    expert.gate_up_proj = _GateUp(
         weight=weight,
         weight_scale=torch.zeros(4, 8, dtype=torch.float8_e8m0fnu),
         native_a8_group_rows=group,
         quant_type="per_1x32",
     )
-    expert.w2 = MagicMock(name="w2", native_a8_group_rows=w2_group)
+    expert.w2 = _W2() if w2_group == 32 else MagicMock(native_a8_group_rows=None)
     expert.swiglu_limit = limit
     expert.use_fused_clamp_act_mul = fused_act
+    expert.prefix = prefix
     monkeypatch.setattr(
         v4, "weight_is_stored_preshuffled", lambda *a, **k: stored_preshuffled
     )
     expert._gate_up_silu = expert._gate_up_silu_applies()
+    if expert._gate_up_silu:  # as Expert.__init__ registers it
+        config = importlib.import_module("atom.config").get_current_atom_config()
+        config.compilation_config.static_forward_context[prefix] = expert
     return expert
 
 
 @pytest.fixture
 def flydsl(monkeypatch, atom_modules):
-    calls = {}
+    """AITER's gate_up module as the expert sees it: tiles up to 4096 rows,
+    the launch records its arguments and fills the outputs."""
+    calls = {"supported": True, "runs": [], "shapes": []}
     module = ModuleType("aiter.ops.flydsl.batched_gemm_a8w8_gfx1250")
 
+    def supported(n2, k):
+        calls["supported_shape"] = (n2, k)
+        return calls["supported"]
+
     def kernel_for(m, n2, k):
-        calls["shape"] = (m, n2, k)
-        return None if m > 4096 else "kernel"
+        calls["shapes"].append((m, n2, k))
+        return None if m > 4096 else f"tile{min(m, 4096)}"
 
     def run(xq, wq, xs, ws, out, out_scale, limit, kernel_name=None):
-        calls["run"] = (xq, wq, xs, ws, out, out_scale, limit, kernel_name)
+        calls["runs"].append((xq, wq, xs, ws, out, out_scale, limit, kernel_name))
+        out.view(torch.uint8).fill_(1)
+        out_scale.view(torch.uint8).fill_(2)
         return out
 
+    module.gate_up_silu_supported = supported
     module.gate_up_silu_kernel_for = kernel_for
     module.run_gate_up_silu_mxfp8_32_gfx1250 = run
     monkeypatch.setitem(sys.modules, module.__name__, module)
     v4 = atom_modules.deepseek_v4
     monkeypatch.setattr(v4, "get_gfx_runtime", lambda: "gfx1250")
     blockscale = importlib.import_module("atom.model_ops.blockscale")
-    quantized = (
-        torch.zeros(3, 256, dtype=torch.float8_e4m3fn),
-        torch.zeros(3, 8, dtype=torch.float8_e8m0fnu),
-    )
-    monkeypatch.setattr(blockscale, "quantize_fp8", lambda x: quantized)
-    calls["quantized"] = quantized
+
+    def quantize_fp8(x):
+        calls.setdefault("quantized", []).append(x)
+        return (
+            torch.full(x.shape, 3, dtype=torch.uint8).view(torch.float8_e4m3fn),
+            torch.full((*x.shape[:-1], x.shape[-1] // 32), 4, dtype=torch.uint8).view(
+                torch.float8_e8m0fnu
+            ),
+        )
+
+    monkeypatch.setattr(blockscale, "quantize_fp8", quantize_fp8)
     return calls
 
 
-def _no_arch_query(monkeypatch, atom_modules):
-    def refuse():
-        raise AssertionError("forward queried the GPU architecture")
+@pytest.fixture
+def unfused(monkeypatch, atom_modules):
+    """The unfused chain's gate_up and silu_and_mul, recorded."""
+    calls = {"gate_up": [], "silu": []}
 
-    monkeypatch.setattr(atom_modules.deepseek_v4, "get_gfx_runtime", refuse)
+    def gate_up(x):
+        calls["gate_up"].append(x.shape[0])
+        return torch.zeros(x.shape[0], 2 * INTER, dtype=torch.bfloat16)
+
+    def silu_and_mul(out, x, limit):
+        calls["silu"].append((x.shape[0], limit))
+
+    monkeypatch.setattr(atom_modules.deepseek_v4, "aiter_silu_and_mul", silu_and_mul)
+    calls["gate_up_fn"] = gate_up
+    return calls
 
 
-def test_fused_gate_up_feeds_w2_the_quantized_activation(
-    monkeypatch, atom_modules, flydsl
+@pytest.fixture
+def cpu_op(atom_modules):
+    """A CPU kernel for the op (production registers CUDA only), dispatching
+    to this window's module so it reads this window's forward context."""
+    ops = importlib.import_module("atom.model_ops.module_dispatch_ops")
+    lib = torch.library.Library("aiter", "IMPL")
+    lib.impl(
+        "v4_shared_gate_up_silu_quant",
+        lambda x, w, name: ops.v4_shared_gate_up_silu_quant(x, w, name),
+        "CPU",
+    )
+    yield
+    lib._destroy()
+
+
+def test_fused_rows_feed_w2_the_epilogue_quant(
+    monkeypatch, atom_modules, flydsl, atom_config
 ):
     expert = _expert(monkeypatch, atom_modules)
-    assert expert._gate_up_silu
-    _no_arch_query(monkeypatch, atom_modules)
-    x = torch.zeros(3, 256, dtype=torch.bfloat16)
-    expert.w2.return_value = "out"
-    assert expert.forward(x) == "out"
-    xq, wq, xs, ws, act, act_scale, limit, name = flydsl["run"]
-    assert (xq, xs) == flydsl["quantized"]
+    assert expert._gate_up_silu and flydsl["supported_shape"] == (2 * INTER, DIM)
+    x = torch.zeros(3, DIM, dtype=torch.bfloat16)
+    act, act_scale = expert.gate_up_silu_quant(x)
+    _xq, wq, _xs, ws, out, out_scale, limit, name = flydsl["runs"][-1]
+    assert flydsl["quantized"] == [x]
     assert wq is expert.gate_up_proj.weight
     assert ws is expert.gate_up_proj.weight_scale
-    assert act.shape == (3, 64) and act.dtype == torch.float8_e4m3fn
-    assert act_scale.shape == (3, 2) and act_scale.dtype == torch.float8_e8m0fnu
-    assert limit == 10.0 and name == "kernel"
-    assert flydsl["shape"] == (3, 128, 256)
-    args, kwargs = expert.w2.call_args
-    assert args[0] is act and kwargs["x_scale"] is act_scale
+    assert act is out and act_scale is out_scale
+    assert act.shape == (3, INTER) and act.dtype == torch.float8_e4m3fn
+    assert act_scale.shape == (3, INTER // 32)
+    assert act_scale.dtype == torch.float8_e8m0fnu
+    assert limit == 10.0 and name == "tile3"
+    assert flydsl["shapes"][-1] == (3, 2 * INTER, DIM)
 
 
-def test_gated_forward_keeps_the_unfused_path(monkeypatch, atom_modules, flydsl):
+def test_other_rows_run_the_unfused_chain(
+    monkeypatch, atom_modules, flydsl, unfused, atom_config
+):
+    expert = _expert(monkeypatch, atom_modules)
+    expert.gate_up_proj.fn = unfused["gate_up_fn"]
+    x = torch.zeros(5000, DIM, dtype=torch.bfloat16)
+    act, act_scale = expert.gate_up_silu_quant(x)
+    assert not flydsl["runs"]
+    assert unfused["gate_up"] == [5000] and unfused["silu"] == [(5000, 10.0)]
+    # quantize_fp8 of the bf16 activation: what w2 would compute itself.
+    (activation,) = flydsl["quantized"]
+    assert activation.shape == (5000, INTER) and activation.dtype == torch.bfloat16
+    assert act.shape == (5000, INTER) and act_scale.shape == (5000, INTER // 32)
+
+
+def test_traced_forward_picks_per_runtime_rows(
+    monkeypatch, atom_modules, flydsl, unfused, atom_config, cpu_op
+):
+    """`Expert.forward` compiled once with fullgraph and dynamic shapes, then
+    replayed: the first (warmup-sized) row count runs the unfused chain and
+    later ones still get their own kernel, all through one graph."""
+    expert = _expert(monkeypatch, atom_modules)
+    expert.gate_up_proj.fn = unfused["gate_up_fn"]
+    assert atom_config.compilation_config.static_forward_context[expert.prefix] is (
+        expert
+    )
+    graphs = []
+
+    def backend(gm, example_inputs):
+        graphs.append(gm)
+        return gm.forward
+
+    torch._dynamo.reset()
+    compiled = torch.compile(
+        expert.forward, fullgraph=True, dynamic=True, backend=backend
+    )
+    for m in (5000, 3, 1345, 4096):
+        y = compiled(torch.zeros(m, DIM, dtype=torch.bfloat16))
+        assert y.shape == (m, 1)
+        if m > 4096:
+            assert unfused["gate_up"][-1] == m and flydsl["runs"] == []
+            # The quantize_fp8 stand-in: codes 3, scale bytes 4.
+            assert torch.all(y == 3 * INTER + 4 * (INTER // 32))
+        else:
+            assert flydsl["runs"][-1][-1] == f"tile{m}"
+            # The launch stand-in: codes 1, scale bytes 2.
+            assert torch.all(y == INTER + 2 * (INTER // 32))
+    assert len(graphs) == 1
+    torch._dynamo.reset()
+
+
+def test_gated_forward_keeps_the_unfused_path(
+    monkeypatch, atom_modules, flydsl, atom_config
+):
     """`forward(x, weights=...)` (a gated expert) never takes the fused path:
     the epilogue has no per-row gate."""
     expert = _expert(monkeypatch, atom_modules)
     assert expert._gate_up_silu
-    expert.gate_up_proj = MagicMock(return_value=torch.zeros(3, 128))
+    expert.gate_up_proj = MagicMock(return_value=torch.zeros(3, 2 * INTER))
     monkeypatch.setattr(
         atom_modules.deepseek_v4, "aiter_silu_and_mul", lambda out, x, limit: None
     )
-    expert.w2.return_value = "out"
-    x = torch.zeros(3, 256, dtype=torch.bfloat16)
+    expert.w2 = MagicMock(return_value="out", native_a8_group_rows=32)
+    x = torch.zeros(3, DIM, dtype=torch.bfloat16)
     weights = torch.ones(3, 1, dtype=torch.bfloat16)
     assert expert.forward(x, weights=weights) == "out"
-    assert "run" not in flydsl and "shape" not in flydsl
+    assert not flydsl["runs"] and not flydsl["shapes"]
     expert.gate_up_proj.assert_called_once_with(x)
 
 
@@ -124,38 +263,41 @@ def test_gated_forward_keeps_the_unfused_path(monkeypatch, atom_modules, flydsl)
         {"group": None},
         {"fused_act": True},
         {"w2_group": None},
+        {"unsupported_shape": True},
     ],
 )
 def test_ineligible_experts_keep_the_unfused_path(
-    monkeypatch, atom_modules, flydsl, change
+    monkeypatch, atom_modules, flydsl, atom_config, change
 ):
+    if change.pop("unsupported_shape", False):
+        flydsl["supported"] = False  # e.g. a sharded TP4 shared expert
     expert = _expert(monkeypatch, atom_modules, **change)
     assert not expert._gate_up_silu
-    assert expert._fused_gate_up_silu(torch.zeros(3, 256, dtype=torch.bfloat16)) is None
-    assert "run" not in flydsl
+    assert expert.prefix not in atom_config.compilation_config.static_forward_context
 
 
-def test_other_arch_and_inputs_keep_the_unfused_path(monkeypatch, atom_modules, flydsl):
+def test_other_inputs_keep_the_unfused_path(
+    monkeypatch, atom_modules, flydsl, atom_config
+):
+    v4 = atom_modules.deepseek_v4
     expert = _expert(monkeypatch, atom_modules)
-    assert expert._fused_gate_up_silu(torch.zeros(3, 256)) is None  # fp32 rows
-    assert (
-        expert._fused_gate_up_silu(torch.zeros(5000, 256, dtype=torch.bfloat16)) is None
-    )
-    assert flydsl["shape"] == (5000, 128, 256)  # the kernel table said no
-    monkeypatch.setattr(atom_modules.deepseek_v4, "get_gfx_runtime", lambda: "gfx950")
-    other = _expert(monkeypatch, atom_modules)
-    assert not other._gate_up_silu
-    assert other._fused_gate_up_silu(torch.zeros(3, 256, dtype=torch.bfloat16)) is None
-    assert "run" not in flydsl
+    assert expert._gate_up_silu
+    expert.gate_up_proj = MagicMock(return_value=torch.zeros(3, 2 * INTER))
+    monkeypatch.setattr(v4, "aiter_silu_and_mul", lambda out, x, limit: None)
+    expert.w2 = MagicMock(return_value="out", native_a8_group_rows=32)
+    assert expert.forward(torch.zeros(3, DIM)) == "out"  # fp32 rows
+    assert not flydsl["runs"] and not flydsl["shapes"]
+    monkeypatch.setattr(v4, "get_gfx_runtime", lambda: "gfx950")
+    assert not _expert(monkeypatch, atom_modules)._gate_up_silu
 
 
 @pytest.mark.parametrize("arch", ["gfx950", "gfx1250"])
-def test_init_decides_and_forward_never_queries_the_arch(
-    monkeypatch, atom_modules, arch
+def test_init_decides_and_registers(
+    monkeypatch, atom_modules, flydsl, atom_config, arch
 ):
-    """The decision is made in `Expert.__init__`; forward, which runs inside
-    torch.compile regions, never calls `get_gfx_runtime` (its file lookup
-    cannot be traced)."""
+    """`Expert.__init__` queries the architecture and AITER's shape support
+    once and registers a fused expert for the op; forward queries neither
+    (the op body, not forward, asks the kernel table about the row count)."""
     v4 = atom_modules.deepseek_v4
     queries = []
 
@@ -165,11 +307,11 @@ def test_init_decides_and_forward_never_queries_the_arch(
 
     def linear(*args, **kwargs):
         return SimpleNamespace(
-            weight=torch.zeros(128, 256, dtype=torch.float8_e4m3fn),
+            weight=torch.zeros(2 * INTER, DIM, dtype=torch.float8_e4m3fn),
             weight_scale=torch.zeros(4, 8, dtype=torch.float8_e8m0fnu),
             native_a8_group_rows=32,
             quant_type="per_1x32",
-            input_size=64,
+            input_size=INTER,
         )
 
     monkeypatch.setattr(v4, "get_gfx_runtime", gfx)
@@ -177,13 +319,14 @@ def test_init_decides_and_forward_never_queries_the_arch(
     monkeypatch.setattr(v4, "RowParallelLinear", linear)
     monkeypatch.setattr(v4, "shared_expert_fused_act_enabled", lambda width: False)
     monkeypatch.setattr(v4, "weight_is_stored_preshuffled", lambda *a, **k: True)
-    expert = v4.Expert(256, 64, swiglu_limit=10.0)
+    expert = v4.Expert(DIM, INTER, swiglu_limit=10.0, prefix="m.shared_experts")
     assert queries == [arch]
-    assert expert._gate_up_silu == (arch == "gfx1250")
+    fused = arch == "gfx1250"
+    assert expert._gate_up_silu == fused
+    registry = atom_config.compilation_config.static_forward_context
+    assert (registry.get("m.shared_experts") is expert) == fused
+    assert ("supported_shape" in flydsl) == fused
 
-    _no_arch_query(monkeypatch, atom_modules)
-    expert._gate_up_silu = False  # the unfused path below is stubbed out
-    expert.gate_up_proj = MagicMock(return_value=torch.zeros(3, 128))
-    expert.w2 = MagicMock(return_value="out", native_a8_group_rows=32)
-    monkeypatch.setattr(v4, "aiter_silu_and_mul", lambda out, x, limit: None)
-    assert expert.forward(torch.zeros(3, 256, dtype=torch.bfloat16)) == "out"
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

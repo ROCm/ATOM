@@ -2807,21 +2807,34 @@ class Expert(nn.Module):
         self.use_fused_clamp_act_mul = shared_expert_fused_act_enabled(
             self.w2.input_size
         )
-        # Decided once here, from the configuration alone: forward runs
-        # inside torch.compile regions, which cannot trace the architecture
-        # query (`_gate_up_silu_applies`).
+        # Decided once here, from the configuration and the weight shape
+        # alone: forward runs inside torch.compile regions, which cannot trace
+        # the architecture query, and a compiled forward may be replayed for
+        # other row counts without re-checking guards, so forward never
+        # branches on the row count either (the op below does, at run time).
+        self.prefix = prefix
         self._gate_up_silu = self._gate_up_silu_applies()
+        if self._gate_up_silu:
+            # torch.ops.aiter.v4_shared_gate_up_silu_quant looks the expert
+            # up by `prefix`.
+            get_current_atom_config().compilation_config.static_forward_context[
+                prefix
+            ] = self
 
     def _gate_up_silu_applies(self) -> bool:
         """Whether gate_up can run with the SwiGLU and the MXFP8 quant for w2
         in its epilogue: gfx1250, native MX (group 32) FP8 weights that the
         load shuffles for the FlyDSL GEMM (`weight_is_stored_preshuffled`, the
         load's own predicate, which also requires the FP8 weight dtype), a
-        clamped SwiGLU, no fused activation of ATOM_V4_USE_TRITON_FUSION, and a
-        native MX w2 that takes the quantized activation as it is. Everything
-        it reads is fixed at construction."""
+        clamped SwiGLU, no fused activation of ATOM_V4_USE_TRITON_FUSION, a
+        native MX w2 that takes the quantized activation as it is, and a
+        gate_up weight AITER has fused tiles for on this device
+        (`gate_up_silu_supported`: its measured CU count and per-rank
+        [2 * inter, dim]; for V4.1-Flash that is an unsharded shared expert,
+        TP1 or DEP4, not TP4 and not V4 / V4-Pro). Everything it reads is
+        fixed at construction."""
         gate_up = self.gate_up_proj
-        return bool(
+        if not (
             get_gfx_runtime() == "gfx1250"
             and not self.use_fused_clamp_act_mul
             and self.swiglu_limit > 0
@@ -2830,17 +2843,21 @@ class Expert(nn.Module):
             and weight_is_stored_preshuffled(
                 gate_up.quant_type, gate_up.weight.dtype, native_group_rows=32
             )
-        )
-
-    def _fused_gate_up_silu(self, x: torch.Tensor) -> torch.Tensor | None:
-        """gate_up GEMM with silu(min(g, L)) * clamp(u, -L, L) and its group-32
-        MXFP8 quant in the epilogue, feeding w2 directly: the codes and scales
-        of GEMM -> silu_and_mul -> quantize_fp8. None where it does not apply:
-        an ineligible expert (`_gate_up_silu`), rows that are not 2-D BF16, or
-        a row count the AITER kernel table leaves to the unfused path."""
-        if not self._gate_up_silu or x.dim() != 2 or x.dtype != torch.bfloat16:
-            return None
+        ):
+            return False
         # gfx1250 only, so imported here.
+        from aiter.ops.flydsl.batched_gemm_a8w8_gfx1250 import gate_up_silu_supported
+
+        return bool(gate_up_silu_supported(*gate_up.weight.shape))
+
+    def gate_up_silu_quant(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Body of `torch.ops.aiter.v4_shared_gate_up_silu_quant` (eager, so
+        it sees the real row count): w2's quantized input, `(act [m, inter]
+        e4m3, act_scale [m, inter / 32] E8M0)`, i.e. `quantize_fp8` of
+        `silu_and_mul(gate_up(x), L)`. Row counts AITER's kernel table covers
+        run the gate_up GEMM with the SwiGLU and the quant in its epilogue;
+        the others run gate_up, silu_and_mul and quantize_fp8, the values w2
+        would compute from the bf16 activation itself."""
         from aiter.ops.flydsl.batched_gemm_a8w8_gfx1250 import (
             gate_up_silu_kernel_for,
             run_gate_up_silu_mxfp8_32_gfx1250,
@@ -2853,7 +2870,12 @@ class Expert(nn.Module):
         n2, k = weight.shape
         name = gate_up_silu_kernel_for(m, n2, k)
         if name is None:
-            return None
+            combined = self.gate_up_proj(x)
+            out = torch.empty(
+                (m, combined.shape[-1] // 2), dtype=x.dtype, device=x.device
+            )
+            aiter_silu_and_mul(out, combined, self.swiglu_limit)
+            return quantize_fp8(out)
         x_fp8, x_scale = quantize_fp8(x)
         act = torch.empty((m, n2 // 2), dtype=torch.float8_e4m3fn, device=x.device)
         act_scale = torch.empty(
@@ -2869,7 +2891,7 @@ class Expert(nn.Module):
             self.swiglu_limit,
             kernel_name=name,
         )
-        return self.w2(act, x_scale=act_scale)
+        return act, act_scale
 
     def forward(
         self,
@@ -2878,10 +2900,20 @@ class Expert(nn.Module):
     ) -> torch.Tensor:  # [num_tokens, dim]
 
         dtype = x.dtype
-        if weights is None:
-            fused = self._fused_gate_up_silu(x)
-            if fused is not None:
-                return fused
+        # The fused gate_up (`_gate_up_silu`, fixed at construction) goes
+        # through a functional custom op that picks fused or unfused from the
+        # runtime row count. A gated expert (`weights`) and rows that are not
+        # 2-D BF16 keep the path below.
+        if (
+            weights is None
+            and self._gate_up_silu
+            and x.dim() == 2
+            and x.dtype == torch.bfloat16
+        ):
+            act, act_scale = torch.ops.aiter.v4_shared_gate_up_silu_quant(
+                x, self.gate_up_proj.weight, self.prefix
+            )
+            return self.w2(act, x_scale=act_scale)
         # Single fused GEMM. Layout is [gate | up] concat on last dim — matches
         # aiter silu_and_mul's split([d, d], dim=-1) contract. The kernel does
         # silu/clamp/mul in fp32 internally regardless of input dtype, so we
