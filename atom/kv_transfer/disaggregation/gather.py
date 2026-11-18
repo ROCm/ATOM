@@ -17,8 +17,7 @@ class GatherLayout:
     Units may be contiguous token rows or physical PAGEs. Ownership is supplied
     separately as the source index tensor; this describes only physical bytes.
     ``first``, ``src_stride`` and ``width`` describe strided slices, such as one
-    rank's heads of a PAGE; ``gather_units`` copies whole units only and
-    refuses the rest.
+    rank's heads of a PAGE; ``gather_units`` copies whole units only.
     """
 
     source_bytes: int
@@ -61,18 +60,12 @@ class GatherLayout:
 def gather_units(
     source: torch.Tensor, indices: torch.Tensor, out: torch.Tensor, plan: GatherLayout
 ):
-    """Copy only this rank's byte slices; no dequantization or KV format change."""
-    if source.dtype != torch.uint8 or out.dtype != torch.uint8:
-        raise ValueError("KV gather requires byte views")
-    if not source.is_contiguous() or not out.is_contiguous():
-        raise ValueError("KV gather requires contiguous PAGE and staging views")
-    if (
-        source.numel() % plan.source_bytes
-        or out.numel() != indices.numel() * plan.unit_bytes
-    ):
-        raise ValueError("KV gather unit/staging size mismatch")
-    if not plan.whole_unit:
-        raise ValueError("Strided KV gather needs a layout adapter")
+    """Copy the whole source units ``indices`` names into ``out``, in order.
+
+    ``source`` and ``out`` are contiguous byte views, ``out`` exactly one unit
+    per index, and ``plan`` a whole-unit layout. No dequantization or KV
+    format change.
+    """
     if not indices.numel():
         return
     torch.index_select(

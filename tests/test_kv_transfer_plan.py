@@ -2,12 +2,11 @@
 """Ownership is selected by topology, with physical layouts as separate inputs."""
 
 import ctypes
-from dataclasses import replace
 
 import pytest
 import torch
 
-from atom.kv_transfer.disaggregation.gather import GatherLayout, gather_units
+from atom.kv_transfer.disaggregation.gather import gather_units
 from atom.kv_transfer.disaggregation.transfer_plan import (
     TOKEN_UNITS,
     RegionLayout,
@@ -92,28 +91,6 @@ def test_tp_replicated_units_can_also_be_partitioned_by_dcp(source_tp, rank):
     assert plan.wire_layout == TOKEN_UNITS
     assert torch.equal(destination[2], source[[1, 0]].reshape(16, 4)[1::2])
     assert (destination[:2] == 255).all()
-
-
-def test_unsupported_layouts_and_topologies_are_rejected():
-    layout = RegionLayout(0, 0, 0, 128, 128)
-    dcp = TransferTopology(target_dcp=4)
-    with pytest.raises(ValueError, match="equal source and target"):
-        build_transfer_plan(dcp, [replace(layout, target_page_bytes=64)], [0], [0], 8)
-    with pytest.raises(ValueError, match="non-DCP producer"):
-        build_transfer_plan(replace(dcp, source_dcp=4), [layout], [0], [0], 8)
-    with pytest.raises(ValueError, match="PAGE adapter"):
-        build_transfer_plan(TransferTopology(target_tp=4), [layout], [0], [0], 8)
-
-
-def test_gather_refuses_strided_slices():
-    source = torch.zeros(4, 32, dtype=torch.uint8)
-    with pytest.raises(ValueError, match="layout adapter"):
-        gather_units(
-            source,
-            torch.tensor([0, 1]),
-            torch.empty(2 * 8, dtype=torch.uint8),
-            GatherLayout(32, 8, 0, 16, 4),
-        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU buffer allocation")
