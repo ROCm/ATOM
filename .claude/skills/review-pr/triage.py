@@ -2931,14 +2931,13 @@ def _check_coverage_line(card_text, work_dir=None):
                 # Two different reasons, and the message has to name the right one: the
                 # measured path has a rules.txt verdict behind it, the refused one does
                 # not and rests on the policy above.
-                why = (f"GitHub would not serve this diff, so it counts as BEYOND ONE "
-                       f"PASS, and the card does not say so. Write: `{spell}`"
-                       if too_large else
+                why = ("GitHub would not serve this diff, so it counts as BEYOND ONE "
+                       "PASS, and the card does not say so" if too_large else
                        "Step 1 measured this diff as BEYOND ONE PASS and the card does "
                        "not say so")
                 return [("SOFTENED-COVERAGE", st[:70],
                          why + " -- the findings below read as complete when they are "
-                         "a sample")]
+                         "a sample" + (f". Write: `{spell}`" if too_large else ""))]
             return []
     return [("MISSING-COVERAGE", (want or "[diff-too-large]")[:70],
              f"rules.txt has no line to copy here, so write: `{spell}`" if too_large else
