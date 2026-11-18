@@ -238,6 +238,7 @@ def build_resident_k1(
         _state_prefetch(),
         envs.ATOM_KIMI_MONO_K1_HEAD_SPLIT,
         _gate_ilp(),
+        envs.ATOM_KIMI_MONO_K1_WHOLE_HEADS,
     )
     cached = _BUILDS.get(cache_key)
     if cached is not None:
@@ -268,6 +269,8 @@ def build_resident_k1(
     # ReplaySSM rebuilds a state's rows in the CTAs that advance them: whole
     # heads (or their parts) alone
     whole_heads = qlen == 1 or task_count > declaration.blocks or spec.replay_cap > 0
+    forced_heads = not whole_heads and envs.ATOM_KIMI_MONO_K1_WHOLE_HEADS
+    whole_heads = whole_heads or forced_heads
     head_split = (
         _head_split((s // qlen) * HEADS, declaration.blocks) if whole_heads else 1
     )
@@ -312,6 +315,7 @@ def build_resident_k1(
         _state_prefetch(),
         head_split,
         _gate_ilp(),
+        *(("whole_heads",) if forced_heads else ()),
     )
     timeline = tdm_timeline.key()
     name = (
@@ -324,6 +328,7 @@ def build_resident_k1(
         f"{'' if _head_preload() else '_nohp'}{'' if _state_prefetch() else '_nosp'}"
         f"{f'_hs{head_split}' if head_split != auto_split else ''}"
         f"{'' if _gate_ilp() else '_nogi'}"
+        f"{'_wh' if forced_heads else ''}"
         f"{tdm_timeline.suffix()}"
     )
 
@@ -1045,6 +1050,7 @@ def build_resident_k1(
                 request = task // (HEADS * STATE_CHUNKS)
                 head = (task // STATE_CHUNKS) % HEADS
                 chunk = task % STATE_CHUNKS
+                tdm_timeline.stamp(tdm_timeline.HEAD_START)
                 conv_values = conv_metadata(
                     recurrence_context,
                     request,
@@ -1064,6 +1070,7 @@ def build_resident_k1(
                     head,
                     chunk,
                 )
+                tdm_timeline.stamp(tdm_timeline.HEAD_CONV)
                 recurrent_values = load_state_metadata(
                     recurrence_context,
                     gate_metadata(recurrence_context, head),
@@ -1071,12 +1078,14 @@ def build_resident_k1(
                     head,
                     chunk,
                 )
+                tdm_timeline.stamp(tdm_timeline.HEAD_POLLED)
                 compute["kda_gates"](
                     recurrence_context,
                     recurrent_values,
                     request,
                     head,
                 )
+                tdm_timeline.stamp(tdm_timeline.HEAD_GATES)
                 compute["kda_recur"](
                     recurrence_context,
                     recurrent_values,
@@ -1084,12 +1093,14 @@ def build_resident_k1(
                     head,
                     chunk,
                 )
+                tdm_timeline.stamp(tdm_timeline.HEAD_RECUR)
                 compute["kda_norm"](
                     recurrence_context,
                     request,
                     head,
                     chunk,
                 )
+                tdm_timeline.stamp(tdm_timeline.HEAD_DONE)
                 if const_expr(spec.quant_core):
                     device["wait_vector_stores"]()
                     gpu.barrier()

@@ -737,6 +737,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_KIMI_MONO_K1_GATE_ILP", "1"
     )
     == "1",
+    # Kimi-K3 gfx1250 mono: K1 runs whole heads (split as HEAD_SPLIT) at every
+    # width, not 16-row chunk tasks where those fit one pass of the grid; the
+    # output norm then sums in the whole head's order (an ulp off the chunk
+    # tasks' at most). 0, the default, keeps the chunk tasks.
+    "ATOM_KIMI_MONO_K1_WHOLE_HEADS": lambda: os.getenv(
+        "ATOM_KIMI_MONO_K1_WHOLE_HEADS", "0"
+    )
+    == "1",
     # Kimi-K3 gfx1250 mono: the fused MoE's gate/up K tiles, its M tiles'
     # epilogues and down tiles, and its staging loops as runtime loops, so a
     # cold launch fetches one body's code each (the same bits); 0 unrolls them
