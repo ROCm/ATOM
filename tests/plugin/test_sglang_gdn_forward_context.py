@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from atom.plugin.sglang.attention_backend import attention_gdn
 from atom.plugin.sglang.attention_backend.attention_gdn import (
@@ -263,6 +264,59 @@ def test_extend_metadata_carries_per_step_prefill_indices():
     assert torch.equal(metadata.no_initial_state, torch.tensor([True, False]))
 
 
+class _ScalarReadSpy(TorchDispatchMode):
+    def __init__(self):
+        super().__init__()
+        self.reads = 0
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        if func is torch.ops.aten._local_scalar_dense.default:
+            self.reads += 1
+        return func(*args, **(kwargs or {}))
+
+
+@pytest.mark.parametrize(
+    "from_sglang, expected_tokens, expected_reads",
+    [(True, 5, 0), (False, 99, 1)],
+    ids=["sglang-host-count", "reconstructed"],
+)
+def test_extend_token_count_comes_from_sglang_host_count(
+    from_sglang, expected_tokens, expected_reads
+):
+    """``logical_num_tokens`` is SGLang's host sum of extend_seq_lens.
+
+    Reading ``query_start_loc[-1]`` instead syncs the stream once per prefill;
+    only metadata rebuilt from the mamba pool, which has no host count, does.
+    """
+    forward_metadata = SimpleNamespace(
+        # The device offsets disagree with the host count, to show which is read.
+        query_start_loc=torch.tensor([0, 3, 99], dtype=torch.int32),
+        mamba_cache_indices=torch.tensor([4, 7], dtype=torch.int32),
+        logical_num_tokens=5,
+    )
+    forward_batch = SimpleNamespace(
+        forward_mode=_ExtendMode(),
+        batch_size=2,
+        req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
+        # The rebuild takes the same device offsets from these.
+        extend_start_loc=torch.tensor([0, 3], dtype=torch.int32),
+        extend_seq_lens=torch.tensor([3, 96], dtype=torch.int32),
+        extend_prefix_lens=torch.tensor([0, 2], dtype=torch.int32),
+        extend_seq_lens_cpu=[3, 2],
+    )
+    linear = SimpleNamespace(
+        forward_metadata=forward_metadata if from_sglang else None,
+        req_to_token_pool=_MambaPool(),
+    )
+
+    with _ScalarReadSpy() as spy:
+        metadata = SGLangGDNForwardContext._build_gdn_metadata(forward_batch, linear)
+
+    assert spy.reads == expected_reads
+    assert metadata.num_prefill_tokens == expected_tokens
+    assert metadata.num_actual_tokens == expected_tokens
+
+
 def test_build_context_falls_back_to_local_decode_mode(monkeypatch):
     monkeypatch.setattr(
         attention_gdn,
@@ -466,6 +520,7 @@ def test_flydsl_prefill_schedule_reuses_host_lengths(monkeypatch):
         forward_metadata=SimpleNamespace(
             query_start_loc=query_start_loc,
             mamba_cache_indices=indices,
+            logical_num_tokens=8,
         ),
         req_to_token_pool=_MambaPool(),
     )

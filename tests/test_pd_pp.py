@@ -1188,7 +1188,7 @@ def test_stateful_transfer_without_final_source_slot_fails_closed(caplog, invali
 
 
 @pytest.mark.parametrize("pp_rank", [0, 1])
-def test_pp_stage_drops_its_producer_entry_once_its_consumers_are_served(pp_rank):
+def test_only_a_pp_stage_past_0_drops_its_producer_entry_once_served(pp_rank):
     captured = []
     conn = _make_transfer_connector({}, captured)
     conn.pp_size = 2
@@ -1392,7 +1392,7 @@ def test_silent_producer_ranks_fail_the_receive_after_their_window():
     conn = _make_connector(
         _release_targets={"old": ("stage0", "t1", 1)},
         _send_on_socket=lambda addr, parts, repeat=1: sent.append((addr, parts[0])),
-        _mla_landing=None,
+        _landing=None,
     )
     for req_id in ("old", "new"):
         conn._pending_recv_expected[req_id] = 2
@@ -1419,7 +1419,7 @@ def test_silent_producer_ranks_fail_the_receive_after_their_window():
 def test_a_rank_that_never_acknowledged_keeps_the_receive_open():
     """It may still get the request and write, however long that takes."""
     pytest.importorskip("atom.kv_transfer.disaggregation.mooncake.mooncake_connector")
-    conn = _make_connector(_mla_landing=None)
+    conn = _make_connector(_landing=None)
     conn._pending_recv_expected["r1"] = 2
     conn._pending_recv.add("r1")
     assert not conn._record_write_done("r1", 1, 0, 0, success=False)
@@ -1434,7 +1434,7 @@ def test_a_rank_that_never_acknowledged_keeps_the_receive_open():
 @pytest.mark.parametrize("window", [None, -1, 0, float("inf"), True, "60"])
 def test_an_ack_without_a_usable_window_starts_no_deadline(window):
     pytest.importorskip("atom.kv_transfer.disaggregation.mooncake.mooncake_connector")
-    conn = _make_connector(_mla_landing=None)
+    conn = _make_connector(_landing=None)
     conn._pending_recv_expected["r1"] = 1
     conn._record_write_ack(
         {"request_id": "r1", "pp_rank": 0, "tp_rank": 0, "write_window_s": window}
@@ -1501,7 +1501,7 @@ def test_a_failed_receive_is_reported_only_after_its_hold(monkeypatch):
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
     )
     monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
-    conn = _make_connector(_staging_slots=mc.SlotPool(), _mla_landing=None)
+    conn = _make_connector(_staging_slots=mc.SlotPool(), _landing=None)
     conn._pending_recv_expected["r1"] = 1
     conn._pending_recv.add("r1")
     conn._pending_recv_slots["r1"] = (7, 3)
@@ -1524,7 +1524,7 @@ def test_a_stalled_receive_is_logged_once(monkeypatch, caplog, acked):
     mc = pytest.importorskip(
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
     )
-    conn = _make_connector(_mla_landing=None)
+    conn = _make_connector(_landing=None)
     conn._pending_recv_expected["r1"] = 2
     conn._pending_recv_stall_watch["r1"] = time.monotonic()
     assert not conn._record_write_done("r1", 0, 0, 0, success=False)
@@ -1629,13 +1629,14 @@ def _pp_engine_core_cls():
     return PPEngineCoreProc
 
 
-def _fake_head(batch):
+def _fake_head(batch, *, launches=1, pp_size=4, pp_max_inflight=4):
     PPEngineCoreProc = _pp_engine_core_cls()
 
     head = SimpleNamespace(
         _in_flight=deque(),
         _defer_prefix_hash=False,
-        pp_size=4,
+        pp_size=pp_size,
+        pp_max_inflight=pp_max_inflight,
         kv_transfer_enabled=True,
         output_queue=MagicMock(),
         runner_mgr=MagicMock(),
@@ -1648,7 +1649,7 @@ def _fake_head(batch):
         # never sleeps, so it must go through `_advance_idle_kv_transfer`.
         _next_idle_kv_drain=0.0,
     )
-    head.scheduler.schedule.side_effect = [(batch, {}), None]
+    head.scheduler.schedule.side_effect = [(batch, {})] * launches + [None]
     head.scheduler.take_rejected.return_value = None
     head.scheduler.dynamic_chunking_active = False
     head.pp_transport.recv_completion.return_value = None
@@ -1674,6 +1675,28 @@ def _dispatched_metas(head):
         for c in head.runner_mgr.call_func.call_args_list
         if c.args and c.args[0] == "process_kvconnector_output"
     ]
+
+
+def test_the_head_fills_its_inflight_cap_past_the_stage_count():
+    """Middle chunks count against the cap as output batches do, and a cap
+    above the stage count keeps the head issuing until it is reached."""
+    chunk = SimpleNamespace(
+        req_ids=["r1"], connector_meta_output=None, produces_output=lambda: False
+    )
+    head = _fake_head(chunk, launches=8, pp_size=2, pp_max_inflight=4)
+    assert len(head._in_flight) == 4
+    assert head.scheduler.schedule.call_count == 4
+
+
+@pytest.mark.parametrize("env, cap", [("0", 2), ("16", 16), ("-1", None)])
+def test_pp_max_inflight_defaults_to_the_stage_count(monkeypatch, env, cap):
+    pp_engine_core = sys.modules[_pp_engine_core_cls().__module__]
+    monkeypatch.setenv("ATOM_PP_MAX_INFLIGHT", env)
+    if cap is None:
+        with pytest.raises(ValueError, match="must be >= 0"):
+            pp_engine_core.pp_max_inflight(2)
+    else:
+        assert pp_engine_core.pp_max_inflight(2) == cap
 
 
 def test_pp_head_dispatches_meta_of_request_less_batch():
@@ -1858,6 +1881,7 @@ def _head_for_batch(batch, *, dynamic_chunking_active=False):
         _in_flight=deque(),
         _defer_prefix_hash=False,
         pp_size=2,
+        pp_max_inflight=2,
         kv_transfer_enabled=False,
         output_queue=MagicMock(),
         runner_mgr=MagicMock(),
@@ -2310,7 +2334,7 @@ def test_mooncake_records_one_ready_event_for_a_prefill_batch(monkeypatch):
     "staging,recorded",
     [
         ({"_staging_slot_bytes": 4}, True),
-        ({"_mla_staging": object()}, True),
+        ({"_kv_staging": object()}, True),
         ({}, False),
     ],
 )
@@ -2328,7 +2352,7 @@ def test_mooncake_records_a_ready_event_for_any_staged_path(
     connector = object.__new__(mc.MooncakeConnector)
     connector.is_producer = True
     connector._index_staging_pool_size = 0
-    connector._mla_staging = None
+    connector._kv_staging = None
     connector._staging_slot_bytes = 0
     connector._cuda_device = 3
     connector._kv_cache_ready_events = {}
