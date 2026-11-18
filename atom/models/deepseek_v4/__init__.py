@@ -2827,7 +2827,6 @@ class Expert(nn.Module):
             and self.swiglu_limit > 0
             and gate_up.native_a8_group_rows == 32
             and self.w2.native_a8_group_rows is not None
-            and gate_up.weight_scale.dtype == torch.float8_e8m0fnu
             and weight_is_stored_preshuffled(
                 gate_up.quant_type, gate_up.weight.dtype, native_group_rows=32
             )
@@ -2836,9 +2835,9 @@ class Expert(nn.Module):
     def _fused_gate_up_silu(self, x: torch.Tensor) -> torch.Tensor | None:
         """gate_up GEMM with silu(min(g, L)) * clamp(u, -L, L) and its group-32
         MXFP8 quant in the epilogue, feeding w2 directly: the codes and scales
-        of GEMM -> silu_and_mul -> quantize_fp8. None where it does not apply
-        (`_gate_up_silu`, or a row count the AITER kernel table leaves to the
-        unfused path)."""
+        of GEMM -> silu_and_mul -> quantize_fp8. None where it does not apply:
+        an ineligible expert (`_gate_up_silu`), rows that are not 2-D BF16, or
+        a row count the AITER kernel table leaves to the unfused path."""
         if not self._gate_up_silu or x.dim() != 2 or x.dtype != torch.bfloat16:
             return None
         # gfx1250 only, so imported here.
