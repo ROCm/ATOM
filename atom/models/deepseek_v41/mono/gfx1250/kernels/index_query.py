@@ -82,12 +82,20 @@ def stage_iq(c):
 
 @ASTRewriter.transform
 def stage_iw(c):
-    """Slice s = b - IW0 of K: waves 0..5 = (M tile w % 3, N tile w // 3) of [tokens][32 heads]."""
+    """Slice s = b - IW0 of K: waves 0..5 = (M tile w % 3, N tile w // 3) of [tokens][32 heads]. One M tile (MT 1, c1):
+    waves 1 / 2 (N tiles 0 / 1), idle through stage_iq (wave 0 alone): iq and iw run side by side, not one after the
+    other on wave 0 (iw was +1.0 us on the iw CTAs, the KV_C count's last arrivals)."""
     t, b, w, l, MT = c["t"], c["b"], c["w"], c["l"], c["MT"]
     s = b - IW0
-    if (s >= 0) & (s < IW_SLICES) & (w < 6) & (w % 3 < MT):
+    if fx.const_expr(MT == 1):
+        wq = (w == 1) | (w == 2)
+        mi = 0
+        ni = w - 1
+    else:
+        wq = (w < 6) & (w % 3 < MT)
         mi = w % 3
         ni = w // 3
+    if (s >= 0) & (s < IW_SLICES) & wq:
         k0 = s * IW_K
         acc = fx.Vector.filled(8, 0.0, F32)
         av = [hx.gload(c["axn"] + i64((mi * 16 + l % 16) * HID + k0 + ks * 32 + (l // 16) * 16) * 2, BF16, 16)
