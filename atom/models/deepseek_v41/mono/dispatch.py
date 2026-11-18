@@ -29,6 +29,7 @@ from atom.models.deepseek_v41.mono.config import (
     MAX_REQUESTS,
     MAX_ROWS,
     config_refusal,
+    indexer_enabled,
 )
 from atom.models.deepseek_v41.mono.draft_runner import DraftMonoRunner
 from atom.models.deepseek_v41.mono.runner import V41MonoDecodeRunner
@@ -92,13 +93,16 @@ class MonoDecodeModel(nn.Module):
         )
 
     def forward(self, input_ids, positions, inputs_embeds=None):
-        if step_supported(
-            input_ids, inputs_embeds, self._dp_ranks
-        ) and self._mono.ready(input_ids.numel()):
+        if self.uses_layer_mono(input_ids, inputs_embeds):
             return self._mono.runner.forward(input_ids, positions)
         if inputs_embeds is None:
             return self.model(input_ids, positions)
         return self.model(input_ids, positions, inputs_embeds=inputs_embeds)
+
+    def uses_layer_mono(self, input_ids, inputs_embeds=None):
+        return step_supported(
+            input_ids, inputs_embeds, self._dp_ranks
+        ) and self._mono.ready(input_ids.numel())
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.model.compute_logits(hidden_states)
@@ -153,6 +157,26 @@ class MonoDraftModel(nn.Module):
 
 
 def install_mono_decode(
+    model: nn.Module, atom_config, drafter, *, metadata_builder=None
+) -> nn.Module:
+    from atom.models.deepseek_v41.mono.indexer import MonoIndexerModel
+
+    wrapped = _install_layer_decode(
+        model, atom_config, drafter, metadata_builder=metadata_builder
+    )
+    # Same gfx950 deployment checks as the layer path; the standalone kernel
+    # does not exchange across DP attention ranks.
+    if (
+        indexer_enabled(atom_config.index_cache_dtype == "fp4")
+        and config_refusal(atom_config) is None
+        and not dp_attention_ranks(atom_config)
+        and (wrapped is model or isinstance(wrapped, MonoDecodeModel))
+    ):
+        return MonoIndexerModel(wrapped, model, atom_config)
+    return wrapped
+
+
+def _install_layer_decode(
     model: nn.Module, atom_config, drafter, *, metadata_builder=None
 ) -> nn.Module:
     """``model`` wrapped for mono decode (and ``drafter``'s DSpark draft model

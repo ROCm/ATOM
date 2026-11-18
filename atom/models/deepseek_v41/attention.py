@@ -483,6 +483,12 @@ class Attention(nn.Module):
         """The indexer as a TR-graph break: its bands follow the context."""
         if not step.requests:  # a dummy prefill on a token graph
             return
+        mono = getattr(self.indexer, "_mono", None)
+        if mono is not None and mono.runner is not None and mono.runner.active:
+            if compressed:
+                torch.cuda.current_stream().wait_stream(self.compress_stream)
+            if mono.runner.run(self.indexer, hidden, qr, qr_scale, cache, step, rope):
+                return
         projected = self.indexer.project(hidden, qr, qr_scale, cache, step, rope)
         if compressed:
             torch.cuda.current_stream().wait_stream(self.compress_stream)

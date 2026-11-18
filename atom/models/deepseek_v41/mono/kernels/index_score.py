@@ -296,7 +296,7 @@ def stage_ilist(c, t, j, raw, kind, level, bound_max, max_chunks):
             else:
                 ident = ident_of(d, i)
                 bits = key_bits(fx.ptr_load(keys + i))
-                picked = rows[d] if kind == "sel" else None
+                picked = _picked_rows(c, kind, t, ident, rows, d)
             if to_final:
                 _final(c, kind, t, pos, ident, picked)
             else:
@@ -306,7 +306,7 @@ def stage_ilist(c, t, j, raw, kind, level, bound_max, max_chunks):
 
         lds_topk(
             n, k, load, emit, c["sel_lds"], tid, PER_THREAD,
-            selected_rows if kind == "sel" else None,
+            _prefetch_rows(c, kind, selected_rows),
         )  # fmt: skip
         # a selection's flag for the attention; the candidate blocks' only in a
         # token-parallel launch, which waits for every rank's (``await_candidates``)
@@ -314,6 +314,18 @@ def stage_ilist(c, t, j, raw, kind, level, bound_max, max_chunks):
         if const_expr(region is not None):  # noqa: SIM102
             if final:
                 _publish_all(c, region, t)
+
+
+def _prefetch_rows(c, kind, fn):
+    return fn if kind == "sel" and not c.get("defer_selected_rows", False) else None
+
+
+def _picked_rows(c, kind, t, ident, rows, d):
+    if kind != "sel":
+        return None
+    if c.get("defer_selected_rows", False):
+        return _selected_rows(c, t, ident)
+    return rows[d]
 
 
 def _selected_rows(c, t, ident):

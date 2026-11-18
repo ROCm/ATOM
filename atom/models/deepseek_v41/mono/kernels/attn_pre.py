@@ -164,6 +164,8 @@ class AttnPreBuild:
     # the compressor: the bf16 ``normed`` row out (and NB), the q latent's MXFP8
     # pair out, and the indexer's q / weights projections
     feeds_index: bool = False
+    # Export the indexer's inputs, with its projections in a separate launch.
+    indexer_apart: bool = False
     # the index plane is FP4: the indexer query quantized as its scorer reads
     # it (``stage_iquant_fp4``)
     index_fp4: bool = False
@@ -1042,6 +1044,19 @@ def _ring_row_fp8(c, t, tt, mine, rel, row, scaled, code):
 
 
 @traced
+def query_row_from(c, t, n):
+    """Gather another rank's MXFP8 latent for the separate indexer."""
+    tid, a = c["tid"], c["args"]
+    if t // n != c["rank"]:
+        if tid < QX8_WORDS:
+            (v,) = c["poll"]([(c["qx8"], t * QX8_WORDS + tid, 1)])
+            bo.buffer_store(v[0], rsrc(a["qr_out"]), t * QX8_WORDS + tid)
+        if tid < Q_RANK // 32:
+            (v,) = c["poll"]([(c["qx8s"], t * (Q_RANK // 32) + tid, 1)])
+            bo.buffer_store(fx.Int8(v[0]), rsrc(a["qrs_out"]), t * (Q_RANK // 32) + tid)
+
+
+@traced
 def normed_row_from(c, nbg, t, n):
     """Token t, when another rank owns it: its normed row from NBG -> ``normed``
     (``stage_norm``'s store)."""
@@ -1225,6 +1240,7 @@ def build_attn_pre(key: AttnPreBuild):
         s=s,
         f=int(key.fold),
         ix=int(key.feeds_index),
+        ixa=int(key.indexer_apart),
         i4=int(key.index_fp4),
         a=int(key.aux),
         tl=int(key.timeline),
@@ -1358,7 +1374,7 @@ def build_attn_pre(key: AttnPreBuild):
             for i in range(min(2, wqb_per_cta))
         ]
         iq_task = first_task(bid, IQ0)
-        if const_expr(key.feeds_index):
+        if const_expr(key.feeds_index and not key.indexer_apart):
             iq_ops = gemv_fp8_loads(c, iq_w, iq_ws, Q_RANK, iq_task)
         wqb_all = list(wqb_ops)
         for t0, n in tiles:
@@ -1366,7 +1382,7 @@ def build_attn_pre(key: AttnPreBuild):
             ropes = [
                 wqb_rope(c, nth_task(wqb_task, b), t0, n) for b in range(wqb_per_cta)
             ]
-            if const_expr(key.feeds_index):
+            if const_expr(key.feeds_index and not key.indexer_apart):
                 iq_ropes = iq_rope(c, iq_task, t0, n)
             load_x8(
                 c, c["qx8"], c["qx8s"], QX8_WORDS, Q_RANK // 32, c["qxl"], c["qxsl"],
@@ -1389,10 +1405,10 @@ def build_attn_pre(key: AttnPreBuild):
                         c, nth_task(wqb_task, b + i), wqb_all[b + i], t0, n,
                         ropes[b + i],
                     )  # fmt: skip
-            if const_expr(key.feeds_index):
+            if const_expr(key.feeds_index and not key.indexer_apart):
                 stage_iq(c, iq_task, iq_ops, t0, n, iq_ropes)
         stamp(timeline, tls, tid, 6)
-        if const_expr(key.feeds_index):
+        if const_expr(key.feeds_index and not key.indexer_apart):
             enter_stage("k1.index_w")
 
             def load_group(g, n):
@@ -1425,6 +1441,9 @@ def build_attn_pre(key: AttnPreBuild):
                 nbg = preg(sym, pl["nbg"], "nbg")
                 for t in range(first_task(bid, NORM0), s, BLOCKS):
                     normed_row_from(c, nbg, t, own_n)
+                if const_expr(key.indexer_apart):
+                    for t in range(first_task(bid, QKV0), s, BLOCKS):
+                        query_row_from(c, t, own_n)
         stamp_flush(timeline, tls, tl, tid, bid, TL_POINTS)
         _ = keyed
 

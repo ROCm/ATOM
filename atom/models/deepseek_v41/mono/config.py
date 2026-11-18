@@ -2,6 +2,8 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """The deployments V4.1 mono serves, and why any other is refused."""
 
+import os
+
 from atom.models.deepseek_v41.mono import index_plan as ip
 from atom.models.deepseek_v41.mono.kernels.dims import Dims
 from atom.mono.runtime.deployment import common_refusals, first_refusal
@@ -30,6 +32,11 @@ MAX_REQUESTS = 8
 ATTENTION_KEYS_MAX = 64 * 16
 # (top-k, candidate blocks, rows a block, index heads, index head dim)
 INDEXER_SHAPE = (ip.TOPK, ip.TOPK_BLOCKS, ip.BLOCK_ROWS, ip.HEADS, ip.DIM)
+
+
+def indexer_enabled(index_fp4):
+    """FP4 standalone indexer, including the low-concurrency layer path."""
+    return index_fp4 and os.getenv("ATOM_DSV41_MONO_INDEXER", "1") == "1"
 
 
 def config_refusal(atom_config) -> str | None:
