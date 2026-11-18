@@ -36,6 +36,9 @@ def _reset_sequence_counter():
 def _make_processor() -> InputOutputProcessor:
     proc = InputOutputProcessor.__new__(InputOutputProcessor)
     proc.config = MagicMock()
+    proc.config.enable_rapidserve = False
+    proc.config.kv_transfer_config = None
+    proc.config.speculative_config = None
     tokenizer = MagicMock()
     tokenizer.encode = MagicMock(side_effect=lambda s, **_: list(range(len(s))))
     proc.tokenizer = tokenizer
@@ -128,3 +131,33 @@ class TestPreprocessFanout:
             stream_callback=cb,
         )
         assert all(s.stream_callback is cb for s in seqs)
+
+
+@pytest.mark.parametrize("n", [1, 2])
+@pytest.mark.parametrize("rapidserve", [False, True])
+@pytest.mark.parametrize("logprobs", [False, True])
+def test_rapidserve_logprob_admission(n, rapidserve, logprobs):
+    proc = _make_processor()
+    proc.config.enable_rapidserve = rapidserve
+    params = SamplingParams(n=n, logprobs=logprobs)
+    if rapidserve and logprobs:
+        with pytest.raises(ValueError, match="RapidServe"):
+            proc.preprocess_fanout("hello", params)
+        proc.tokenizer.encode.assert_not_called()
+        assert not proc.requests
+    else:
+        seqs = proc.preprocess_fanout("hello", params)
+        assert len(seqs) == n
+        assert all(s.return_logprobs == logprobs for s in seqs)
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_pd_logprobs_rejected_before_tokenization(configured):
+    proc = _make_processor()
+    if configured:
+        proc.config.kv_transfer_config = object()
+    kwargs = {} if configured else {"kv_transfer_params": {"remote": True}}
+    with pytest.raises(ValueError, match="P/D"):
+        proc.preprocess_fanout("hello", SamplingParams(logprobs=True), **kwargs)
+    proc.tokenizer.encode.assert_not_called()
+    assert not proc.requests

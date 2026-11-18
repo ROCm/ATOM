@@ -28,6 +28,14 @@ SHARED_INTER = 2304  # the shared expert's
 # the loader pads a routed expert's rank share to a multiple of this (``FusedMoE``
 # ``pad_align``) with zero weights
 MOE_PAD = 128
+# the loader pads the shared expert's rank share (split over TP) to a multiple of
+# this, zero rows of gate_up and columns of w2 (``linear.fp8_group32_k_pad_align``,
+# gfx950's group32 FP8 GEMM: TP8's 288 -> 320). Must equal
+# ``linear.GROUP32_FP8_K_ALIGN`` (this module stays free of AITER;
+# tests/test_fp8_group32_k_pad_pair.py holds the two equal).
+# TODO(ROCm/aiter#7967): temporary, as that constant; it goes once the GEMM takes
+# a 32-wide K tail
+SHARED_PAD = 64
 ROWS = 16  # GEMV rows a task
 WOA_ROWS = 32  # a wo_a task's rows: one FP8 group of y
 UG_PART = 32  # intermediate columns an ug task part: one FP4 group
@@ -131,8 +139,11 @@ class Dims:
 
     @property
     def sh_inter(self) -> int:
-        """The shared expert's intermediate width on this rank."""
-        return SHARED_INTER // self.ranks
+        """The shared expert's intermediate width on this rank: under TP its
+        share padded as the loader pads it (the rest zero weights); under
+        expert parallel its part of the replicated weight."""
+        share = SHARED_INTER // self.ranks
+        return padded(share, SHARED_PAD) if self.ep == 1 else share
 
     @property
     def shared_tasks(self) -> int:

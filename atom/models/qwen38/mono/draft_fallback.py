@@ -23,6 +23,7 @@ from atom.model_ops.qwen4_exp.ops.qsa import (
 from atom.models.qwen38.mono.draft_experts import NativeExperts
 from atom.models.qwen38.mono.kernels import qsa_index
 from atom.models.qwen38.mono.kernels.qsa_epilogue import qsa_norm_rope_cache
+from atom.models.qwen38.mono.step_meta import draft_attention_fused
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
@@ -31,7 +32,7 @@ logger = logging.getLogger("atom")
 def forward(model, runner, experts, positions, hidden, selected_rows):
     """(state, head input) of predictor ``model``'s draft step: ``runner``'s program (``DraftRunner.serve``) when it
     serves the step, else ``native`` (``experts``: ``prepare_experts``'s)."""
-    got = runner.serve(model, hidden, selected_rows)
+    got = runner.serve(model, positions, hidden, selected_rows)
     if got is not None:
         return got
     return native(model, experts, positions, hidden, selected_rows)
@@ -112,16 +113,15 @@ def attention(module, positions, mixed):
     cache, including its +1); anything else ATOM's module."""
     fc = get_forward_context()
     meta = fc.attn_metadata.qsa_metadata
-    if meta is None or fc.context.is_prefill:
+    rows = mixed.shape[0]
+    if not draft_attention_fused(
+        meta, fc.context.is_prefill, rows, module.rope_position_cache
+    ):
         return module(positions, mixed)
     requests = meta.block_tables.shape[0]
-    rows = mixed.shape[0]
-    if rows not in (requests, 4 * requests):
-        return module(positions, mixed)
     assert fc.context.is_draft
     # (BF16 draft caches)
     assert module.compressed_key_scale is None and module.k_scale_cache is None
-    assert module.rope_position_cache is not None
     assert module.indexer.compress_ratio == 4 and module.indexer.index_head_dim == 128
     qkv = module.qkv_proj(mixed)
     gate, q, k, v = qkv.split(

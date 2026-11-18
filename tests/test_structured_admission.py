@@ -321,15 +321,42 @@ def test_cached_schema_bypasses_unrelated_slow_compile():
         preflight.close()
 
 
-def test_engine_boundary_checks_structured_requests_before_tokenization():
+# A JSON Schema answer, or strict tool arguments alone: both are structured.
+STRUCTURED = [
+    pytest.param({"json_schema": "{}"}, id="json_schema"),
+    pytest.param(
+        {"json_schema": None, "structured_tool_format": "{}"}, id="strict_tools"
+    ),
+]
+
+
+@pytest.mark.parametrize("fields", STRUCTURED)
+def test_engine_boundary_checks_structured_requests_before_tokenization(fields):
     from atom.model_engine.llm_engine import InputOutputProcessor
     from atom.sampling_params import SamplingParams
 
     processor = InputOutputProcessor.__new__(InputOutputProcessor)
+    processor.config = NS()
     processor.structured_admission = Mock(side_effect=ValueError("admission rejected"))
     with pytest.raises(ValueError, match="admission rejected"):
-        processor.preprocess_fanout("prompt", SamplingParams(json_schema="{}"))
+        processor.preprocess_fanout("prompt", SamplingParams(**fields))
     processor.structured_admission.assert_called_once()
+
+
+@pytest.mark.parametrize("fields", STRUCTURED)
+def test_engine_boundary_rejects_a_grammar_with_a_required_channel(fields):
+    from atom.model_engine.llm_engine import InputOutputProcessor
+    from atom.sampling_params import RequiredChannel, SamplingParams
+
+    processor = InputOutputProcessor.__new__(InputOutputProcessor)
+    processor.config = NS()
+    processor.structured_admission = Mock()
+    channel = RequiredChannel(after=(1,), opening=(2,), opens_at=1, end_ids=(3,))
+    with pytest.raises(ValueError, match="both a structured-output grammar"):
+        processor.preprocess_fanout(
+            "prompt", SamplingParams(required_channel=channel, **fields)
+        )
+    processor.structured_admission.assert_not_called()
 
 
 def test_speculative_schema_logprobs_refused_instead_of_wrong_distribution():
@@ -340,7 +367,9 @@ def test_speculative_schema_logprobs_refused_instead_of_wrong_distribution():
     config = NS(
         speculative_config=NS(num_speculative_tokens=5, synthetic_acceptance_rates=None)
     )
-    with pytest.raises(ValueError, match="token-level logprob"):
+    with pytest.raises(
+        ValueError, match="JSON Schema, speculative decoding and logprobs"
+    ):
         validate_execution_options(config, params)
     params.logprobs = False
     validate_execution_options(config, params)
@@ -393,7 +422,7 @@ assert all(name not in sys.modules for name in ("torch", "llguidance", "jsonsche
 def test_cleanup_method_is_allowed_by_collective_rpc():
     from atom.model_engine.collective_rpc import COLLECTIVE_RPC_METHODS
 
-    assert "release_structured_requests" in COLLECTIVE_RPC_METHODS
+    assert "release_constraints" in COLLECTIVE_RPC_METHODS
 
 
 def test_cold_compile_cache_hit_prunes_completed_futures_without_losing_active_work():
@@ -415,14 +444,15 @@ def test_cold_compile_cache_hit_prunes_completed_futures_without_losing_active_w
         assert records[0] is active
 
 
+@pytest.mark.parametrize("fields", STRUCTURED)
 @pytest.mark.parametrize("failure", [False, True])
-def test_submission_owns_matchers_and_releases_all_replicas(failure):
+def test_submission_owns_matchers_and_releases_all_replicas(failure, fields):
     from atom.model_engine.engine_core_mgr import CoreManager
 
     mgr = CoreManager.__new__(CoreManager)
     replicas = [{}, {}]
     events = []
-    seq = NS(id=77, json_schema="{}", leave_reason="stop")
+    seq = NS(id=77, leave_reason="stop", **fields)
 
     def prepare(seqs):
         events.append("prepare")
@@ -435,7 +465,7 @@ def test_submission_owns_matchers_and_releases_all_replicas(failure):
     mgr._add_prepared_requests = lambda seqs: events.append("enqueue")
 
     def broadcast(cmd, **kw):
-        assert cmd == "release_structured_requests"
+        assert cmd == "release_constraints"
         for replica in replicas:
             for i in kw["request_ids"]:
                 replica.pop(i, None)
@@ -455,14 +485,15 @@ def test_submission_owns_matchers_and_releases_all_replicas(failure):
     assert all(not replica for replica in replicas)
 
 
-def test_api_cancel_waits_for_submission_before_aborting(monkeypatch):
+@pytest.mark.parametrize("fields", STRUCTURED)
+def test_api_cancel_waits_for_submission_before_aborting(monkeypatch, fields):
     import threading
 
     from atom.entrypoints.openai import api_server
 
     entered, release = threading.Event(), threading.Event()
     events = []
-    seq = NS(id=77, json_schema="{}")
+    seq = NS(id=77, **fields)
 
     def submit(seqs):
         entered.set()
@@ -493,8 +524,9 @@ def test_api_cancel_waits_for_submission_before_aborting(monkeypatch):
     assert not engine.io_processor.requests
 
 
+@pytest.mark.parametrize("fields", STRUCTURED)
 @pytest.mark.parametrize("pp_size", [2, 4])
-def test_pipeline_schema_rejected_before_engine_preflight(pp_size):
+def test_pipeline_schema_rejected_before_engine_preflight(pp_size, fields):
     from atom.model_engine.llm_engine import LLMEngine
     from atom.sampling_params import SamplingParams
 
@@ -502,7 +534,7 @@ def test_pipeline_schema_rejected_before_engine_preflight(pp_size):
     engine.config = NS(pipeline_parallel_size=pp_size)
     engine.core_mgr = NS(collective_rpc=Mock())
     with pytest.raises(ValueError, match="pipeline parallelism"):
-        engine.prepare_structured_request(SamplingParams(json_schema="{}"))
+        engine.prepare_structured_request(SamplingParams(**fields))
     engine.prepare_structured_request(SamplingParams())
     engine.core_mgr.collective_rpc.assert_not_called()
 
@@ -553,7 +585,7 @@ def test_cleanup_send_failure_does_not_stop_terminal_deliveries(with_callback):
     assert first.call_count == int(with_callback)
     second.assert_called_once()
     assert second.call_args.args[0].finished
-    mgr._release_structured_requests([NS(id=77, json_schema="{}")])
+    mgr._release_constraints([NS(id=77, json_schema="{}")])
     assert not mgr._seq_id_to_callback
 
 
@@ -590,17 +622,19 @@ def test_bind_groups_matching_grammars_without_merging_request_states():
     ]
 
 
-@pytest.mark.parametrize("schema", [None, "{}"])
+@pytest.mark.parametrize(
+    "fields", [pytest.param({"json_schema": None}, id="plain"), *STRUCTURED]
+)
 @pytest.mark.parametrize("pending", [False, True])
-def test_cancellation_cleanup_follows_terminal_sequence(schema, pending):
+def test_cancellation_cleanup_follows_terminal_sequence(fields, pending):
     from atom.model_engine.engine_core_mgr import CoreManager
 
     mgr = CoreManager.__new__(CoreManager)
     mgr.label = "test"
-    seq = NS(id=19, json_schema=schema, leave_reason="aborted")
+    seq = NS(id=19, leave_reason="aborted", **fields)
     callback = Mock()
     mgr._seq_id_to_callback = {19: callback}
-    mgr._release_seq_load = Mock()
+    mgr._release_load = Mock()
     mgr._bp_take_pending = Mock(return_value=seq if pending else None)
     mgr.broadcast_utility_command = Mock()
     mgr.abort_request(19)
@@ -614,9 +648,9 @@ def test_cancellation_cleanup_follows_terminal_sequence(schema, pending):
     releases = [
         c
         for c in mgr.broadcast_utility_command.call_args_list
-        if c.args[0] == "release_structured_requests"
+        if c.args[0] == "release_constraints"
     ]
-    assert len(releases) == int(schema is not None)
+    assert len(releases) == int(fields != {"json_schema": None})
     if releases:
         assert releases[0].kwargs == {"request_ids": [19]}
 
@@ -633,7 +667,7 @@ def test_cleanup_failure_preserves_original_admission_error():
         mgr.add_request([NS(id=19, json_schema="{}")])
     mgr._add_prepared_requests.assert_not_called()
     mgr.broadcast_utility_command.assert_called_once_with(
-        "release_structured_requests", request_ids=[19]
+        "release_constraints", request_ids=[19]
     )
 
 
@@ -702,3 +736,37 @@ def test_failed_identity_initialization_can_retry(monkeypatch):
         rpc.assert_called_once()
     finally:
         preflight.close()
+
+
+@pytest.mark.parametrize("fields", STRUCTURED)
+def test_a_scheduled_batch_carries_every_structured_request(
+    scheduler, seq_factory, fields
+):
+    """The worker masks what the batch hands it: a request constrained by
+    strict tool arguments alone must be in it, or it decodes unconstrained."""
+    from atom.sampling_params import SamplingParams
+
+    seq = seq_factory([1, 2, 3, 4], sampling_params=SamplingParams(**fields))
+    scheduler.add(seq)
+    batch, _ = scheduler.schedule()
+    [request] = batch.structured_requests.values()
+    assert request.schema[:2] == (
+        fields["json_schema"],
+        fields.get("structured_tool_format"),
+    )
+
+
+@pytest.mark.parametrize("fields", STRUCTURED)
+def test_a_finished_structured_request_releases_its_grammar(seq_factory, fields):
+    from aiter_stub import atom_without_aiter
+
+    from atom.sampling_params import SamplingParams
+
+    seq = seq_factory([1, 2, 3, 4], sampling_params=SamplingParams(**fields))
+    calls = []
+    core = NS(runner_mgr=NS(call_func=lambda *args: calls.append(args)))
+    with atom_without_aiter() as load:
+        load("atom.model_engine.engine_core").EngineCore._release_request_resources(
+            core, [seq]
+        )
+    assert ("release_constraints", [seq.id]) in calls

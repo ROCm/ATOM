@@ -68,7 +68,7 @@ def _run(
         attn_metadata=SimpleNamespace(step=step),
     )
     plan = SimpleNamespace(
-        tail=SimpleNamespace(width=256, requests=requests),
+        tail=SimpleNamespace(running_tokens=256, requests=requests),
         tail_rows=None,
         last=torch.zeros(2),
     )
@@ -134,7 +134,7 @@ def test_a_fused_quant_tail_gathers_its_three_planes_together(monkeypatch):
         attn_metadata=SimpleNamespace(step=None),
     )
     plan = SimpleNamespace(
-        tail=SimpleNamespace(width=4, requests=_FINISHING),
+        tail=SimpleNamespace(running_tokens=4, requests=_FINISHING),
         tail_rows=None,
         last=torch.zeros(1),
     )

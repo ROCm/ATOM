@@ -9,7 +9,9 @@ Kinds (label prefix — groups in Perfetto UI, greppable):
   - ``eager_decode``       real decode forced eager
   - ``dummy_decode``       DP-sync dummy (CUDAGraph path)
   - ``dummy_eager_decode`` DP-sync dummy forced eager
-  - ``dummy_prefill``      warmup dummy prefill
+  - ``dummy_prefill``      DP-sync dummy in a prefilling group
+
+A DP-sync dummy is a step with no request, an idle DP rank's.
 
 Fields (``key=value`` inside brackets):
   - ``bs``   the scheduled (real) batch size; on the CUDAGraph path shown as

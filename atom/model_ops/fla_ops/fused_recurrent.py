@@ -111,13 +111,19 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
                 i_t = tl.load(num_accepted_tokens + i_n).to(tl.int64) - 1
             else:
                 i_t = 0
-            p_h0 = (
-                h0
-                + tl.load(ssm_state_indices_in + i_n * stride_indices_seq + i_t).to(
-                    tl.int64
-                )
-                * stride_init_state_token
-            )
+            state_idx_in = tl.load(
+                ssm_state_indices_in + i_n * stride_indices_seq + i_t
+            ).to(tl.int64)
+            # A row past the scheduled ones (PAD_SLOT_ID) owns no state; its
+            # outputs are zeros, as the consumers read the whole `o`.
+            if state_idx_in < 0:
+                for _ in range(T):
+                    tl.store(
+                        p_o, tl.zeros([BV], dtype=p_o.dtype.element_ty), mask=mask_v
+                    )
+                    p_o += HV * V
+                return
+            p_h0 = h0 + state_idx_in * stride_init_state_token
         else:
             p_h0 = h0 + bos * HV * K * V
         if INIT_STATE_VK:
@@ -156,21 +162,20 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
         # keep the states for multi-query tokens
+        mask_ht = mask_h
         if INPLACE_FINAL_STATE:
-            p_ht = (
-                ht
-                + tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t).to(
-                    tl.int64
-                )
-                * stride_final_state_token
+            state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t).to(
+                tl.int64
             )
+            mask_ht = mask_h & (state_idx >= 0)
+            p_ht = ht + state_idx * stride_final_state_token
         else:
             p_ht = ht + (bos + i_t) * stride_final_state_token
         if FINAL_STATE_VK:
             p_ht = p_ht + i_hv * K * V + o_k[:, None] + o_v[None, :] * K
         else:
             p_ht = p_ht + i_hv * K * V + o_k[:, None] * V + o_v[None, :]
-        tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
+        tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_ht)
 
         p_q += H * K
         p_k += H * K

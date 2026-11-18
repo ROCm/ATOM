@@ -88,6 +88,7 @@ class LayerPostBuild:
     index_bound_max: int = 0
     # the index plane is FP4 (``AttnPostBuild.index_fp4``)
     index_fp4: bool = False
+    index_mfma: bool = False
     experts: int = EXPERTS
     topk: int = TOPK
     # the TP size: every width a rank holds (``Dims``)
@@ -126,6 +127,7 @@ class LayerPostBuild:
             tokens=self.tokens,
             index_bound_max=self.index_bound_max,
             index_fp4=self.index_fp4,
+            index_mfma=self.index_mfma,
             tp=self.tp,
             timeline=self.timeline,
             diag_off=self.diag_off,
@@ -271,7 +273,8 @@ def build_layer_post(key: LayerPostBuild):
 
     name = kernel_symbol(
         "v41_layer_post", s=s, e=rs.experts, k=rs.topk, tl=int(timeline),
-        ix=int(key.index_bound_max > 0), i4=int(key.index_fp4), tpar=int(key.tok_par),
+        ix=int(key.index_bound_max > 0), i4=int(key.index_fp4),
+        im=int(key.index_mfma), tpar=int(key.tok_par),
         **({"ep": key.ep} if key.ep > 1 else {}),
         **({"mtp": key.moe_tp} if key.moe_tp > 1 else {}),
     )  # fmt: skip
@@ -284,7 +287,7 @@ def build_layer_post(key: LayerPostBuild):
         ibound: Int64, ilog: Int64,
         lstride: Int32, isel: Int64, icand: Int64, ilift: Int32, iprod: Int32,
         ibmax: Int64, bstride: Int32, icout: Int64, irow: Int64, sbound: Int64,
-        q: Int64, pool: Int64, sel: Int64, topk: Int32, kmeta: Int64, table: Int64,
+        q: Int64, pool: Int64, pool_scale: Int64, window: Int64, window_scale: Int64, sel: Int64, topk: Int32, kmeta: Int64, table: Int64,
         rows_per_page: Int32, page_rows: Int32, main_off: Int32, ring_off: Int32,
         ring_slots: Int32, sink: Int64,
         qk_scale: Int32, pos: Int64, cos: Int64, sin: Int64, woa: Int64, woa_s: Int64,
@@ -318,7 +321,7 @@ def build_layer_post(key: LayerPostBuild):
             iact, iq, iw, plane, iqs, pscale, iplan, itab, itab_stride, itab_len,
             ibatch, ishift, ibound, ilog, lstride,
             isel, icand, ilift, iprod, ibmax, bstride, icout, irow, sbound,
-            q, pool, sel, topk, kmeta, table, rows_per_page, page_rows, main_off,
+            q, pool, pool_scale, window, window_scale, sel, topk, kmeta, table, rows_per_page, page_rows, main_off,
             ring_off, ring_slots, sink, qk_scale, pos, cos, sin, woa, woa_s, wob,
             wob_s, res_in, post_in, comb_in, pre_in, hc_fn, hc_scale, hc_base, ffn_w,
             res_out, post_out, comb_out, pre_out, normed_a,
@@ -373,7 +376,7 @@ def build_layer_post(key: LayerPostBuild):
         ibound: Int64, ilog: Int64,
         lstride: Int32, isel: Int64, icand: Int64, ilift: Int32, iprod: Int32,
         ibmax: Int64, bstride: Int32, icout: Int64, irow: Int64, sbound: Int64,
-        q: Int64, pool: Int64, sel: Int64, topk: Int32, kmeta: Int64, table: Int64,
+        q: Int64, pool: Int64, pool_scale: Int64, window: Int64, window_scale: Int64, sel: Int64, topk: Int32, kmeta: Int64, table: Int64,
         rows_per_page: Int32, page_rows: Int32, main_off: Int32, ring_off: Int32,
         ring_slots: Int32, sink: Int64,
         qk_scale: Int32, pos: Int64, cos: Int64, sin: Int64, woa: Int64, woa_s: Int64,
@@ -392,7 +395,7 @@ def build_layer_post(key: LayerPostBuild):
             iact, iq, iw, plane, iqs, pscale, iplan, itab, itab_stride, itab_len,
             ibatch, ishift, ibound, ilog, lstride,
             isel, icand, ilift, iprod, ibmax, bstride, icout, irow, sbound,
-            q, pool, sel, topk, kmeta, table, rows_per_page, page_rows, main_off,
+            q, pool, pool_scale, window, window_scale, sel, topk, kmeta, table, rows_per_page, page_rows, main_off,
             ring_off, ring_slots, sink, qk_scale, pos, cos, sin, woa, woa_s, wob,
             wob_s, res_in, post_in, comb_in, pre_in, hc_fn, hc_scale, hc_base, ffn_w,
             res_out, post_out, comb_out, pre_out, normed,

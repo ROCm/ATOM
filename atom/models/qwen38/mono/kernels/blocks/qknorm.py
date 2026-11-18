@@ -23,9 +23,10 @@ One stage ``<prefix>.qk``: task = (row, group of 8 heads), wave ``w`` = head ``8
 of the ``q_heads + kv_heads`` (q heads first): it polls its head's ``head_dim`` values
 (``head_dim / 64`` a lane), normalizes, rotates and publishes; a K wave also polls V,
 publishes both and appends them at position ``seq_lens[b] + s`` (64-bit addresses; a negative
-block-table entry, e.g. a padded request's, is no page: nothing is stored).
+block-table entry, e.g. a padded request's, is no page: nothing is stored). RoPE rotates at
+``seq_lens[b] + s + rope_off[b]``: ATOM's position of the row (an image request's MRoPE offset; 0 for text).
 
-Args: ``seq_lens`` int32 [batch], ``block_table`` int32 [batch, width], ``k_cache`` /
+Args: ``seq_lens`` int32 [batch], ``rope_off`` int32 [batch], ``block_table`` int32 [batch, width], ``k_cache`` /
 ``v_cache`` (+ ``k_scale`` / ``v_scale``), ``<prefix>_w`` (``pack``: bf16 q_norm | k_norm) and ``rope``
 ([positions, rotary_dim] bf16: cos then sin of the rotary_dim / 2 frequencies,
 ``rope_table``; shareable by every block and layer with the same RoPE).
@@ -126,11 +127,11 @@ def _ld_words(r, word, n):
 
 
 def rope_pos(pos, max_positions: int):
-    """The RoPE table row of position ``pos`` (traced): ``pos``, clamped to the table's last row (``max_positions``
+    """The RoPE table row of position ``pos`` (traced): ``pos``, clamped to the table's rows (``max_positions``
     rows). In range it is ``pos`` (every output keeps its bits); past the table, the rows of a step nobody reads (an
     engine's graph-capture steps at the cache's end) read the last row instead of past the table's end (a fault when
     the table ends where the allocation does)."""
-    return fx.min(pos, fx.Int32(max_positions - 1))
+    return fx.max(fx.min(pos, fx.Int32(max_positions - 1)), fx.Int32(0))
 
 
 def ld_rope(table, pos, lane, rot: int, dpl: int):
@@ -194,6 +195,8 @@ class QKCfg:
     fp8: bool = False
     k_scale: str = ""
     v_scale: str = ""
+    # int32 [batch]: the request's RoPE position minus its cache row (ATOM's MRoPE offset, 0 for text)
+    rope_off: str = "rope_off"
 
     @property
     def page(self) -> int:
@@ -254,6 +257,7 @@ def _qk_head(k, c: QKCfg, r, hd):
     dpl = c.dpl
     b = r // c.spec
     n_raw = ld_i32(k.args[c.seq_lens], b)
+    off = ld_i32(k.args[c.rope_off], b)
     is_q = hd < c.qh
     kh = fx.max(hd - c.qh, 0)
     base = r * c.proj_w + c.col + dpl * lane
@@ -268,7 +272,8 @@ def _qk_head(k, c: QKCfg, r, hd):
         dpl // 2,
     )
     pos = uniform(n_raw) + r % c.spec
-    cs, sn = ld_rope(k.args[c.rope], rope_pos(pos, c.width * c.page), lane, c.rot, dpl)
+    rp = rope_pos(pos + uniform(off), c.width * c.page)
+    cs, sn = ld_rope(k.args[c.rope], rp, lane, c.rot, dpl)
     page = ld_i32(
         k.args[c.block_table], b * c.width + fx.min(pos // c.page, c.width - 1)
     )
@@ -393,6 +398,7 @@ class QKNormRope(Block):
         seq_lens: str = "seq_lens",
         weights: str | None = None,
         rope: str = "rope",
+        rope_off: str = "rope_off",
         q_norm: str = "self_attn.q_norm",
         k_norm: str = "self_attn.k_norm",
         fp8: bool = False,
@@ -422,6 +428,7 @@ class QKNormRope(Block):
             "seq_lens": seq_lens,
             "weights": weights or f"{prefix}_w",
             "rope": rope,
+            "rope_off": rope_off,
         }
         self.in_ch = Channel(proj, self.proj_width, Fmt.BF16)
         self.qn_ch = Channel(qn, geo.q_width, Fmt.BF16)
@@ -464,6 +471,7 @@ class QKNormRope(Block):
                     *caches,
                     n["weights"],
                     n["rope"],
+                    n["rope_off"],
                 ),
                 key=(c,),
             )

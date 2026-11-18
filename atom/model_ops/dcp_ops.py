@@ -3,11 +3,14 @@
 
 """DCP (Decode Context Parallel) communication ops for ATOM.
 
-Two backends combine the per-rank partial attention outputs into the global
+Three backends combine the per-rank partial attention outputs into the global
 softmax, selected by ``DCPConfig.comm_backend``:
 
-  * ``ag_rs`` -- AllGather LSE -> correct local output -> ReduceScatter (2 calls)
-  * ``a2a``   -- one all-to-all carrying output+LSE, combine locally (1 call)
+  * ``ag_rs``   -- AllGather LSE -> correct local output -> ReduceScatter (2 calls)
+  * ``a2a``     -- one all-to-all carrying output+LSE, combine locally (1 call)
+  * ``mailbox`` -- small decode merges in aiter's FlyDSL mailbox combine, which
+    stores straight into the owners' IPC-mapped memory (no collective call);
+    everything else as ``a2a``
 
 They are mathematically equivalent but not bitwise identical; see the A2A
 section below for why one collective can replace two.
@@ -15,6 +18,8 @@ section below for why one collective can replace two.
 Also here: the sparse indexer's DCP support -- the decode candidate exchange
 (fused into one aiter op) and the sparse-prefill owned-slot filter.
 """
+
+import logging
 
 import numpy as np
 import torch
@@ -27,7 +32,10 @@ from atom.distributed.dcp_layout import (  # noqa: F401
     dcp_owner_rank,
 )
 from atom.distributed.dcp_utils import get_dcp_group, get_dcp_world_size
+from atom.model_ops.indexer.layout import MFMA, PRESHUFFLE
 from atom.utils.forward_context import get_published_dcp_local_context_lens
+
+logger = logging.getLogger("atom")
 
 # Token-ownership arithmetic lives in ``dcp_layout`` so P/D relayout can share
 # it without importing Triton. Re-exported here for existing attention callers.
@@ -452,29 +460,38 @@ def _dcp_a2a_pack_kernel(
     send_stride_b,
     send_stride_h,
     H_LOCAL: tl.constexpr,
+    H_ROUNDED: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     LSE_PACK: tl.constexpr,
     HAS_OWNED_COUNTS: tl.constexpr,
 ):
     """Scatter (output, lse) into the per-destination send buffer.
 
-    One program per (token, GLOBAL head). Head ``h`` belongs to destination rank
-    ``h // H_LOCAL`` -- the same contiguous split the ReduceScatter path uses, so
-    a rank ends up owning exactly the heads it owned before.
+    One program per (token, DESTINATION RANK), handling that destination's whole
+    H_LOCAL-head slice: one program per (token, head) leaves the kernel
+    launch-bound. Head ``h`` belongs to destination ``h // H_LOCAL`` -- the same
+    contiguous split the ReduceScatter path uses, so a rank ends up owning
+    exactly the heads it owned before. H_ROUNDED rounds H_LOCAL up to the power of
+    two ``tl.arange`` needs; the extra lanes alias lane 0 and are masked on
+    store.
     """
     b = tl.program_id(axis=0).to(tl.int64)
-    h = tl.program_id(axis=1).to(tl.int64)
+    dst = tl.program_id(axis=1).to(tl.int64)
 
-    dst = h // H_LOCAL
-    h_local = h % H_LOCAL
+    hb = tl.arange(0, H_ROUNDED)
+    h_valid = hb < H_LOCAL
+    # Padding lanes alias lane 0, so their loads read lane 0's (valid) data and
+    # no pointer is formed past this destination's slice; only stores are masked.
+    hb_safe = tl.where(h_valid, hb, 0).to(tl.int64)
+    h = dst * H_LOCAL + hb_safe
 
     d = tl.arange(0, HEAD_DIM)
-    src = tl.load(out_ptr + b * out_stride_b + h * out_stride_h + d)
+    src = tl.load(out_ptr + b * out_stride_b + h[:, None] * out_stride_h + d[None, :])
 
     dst_base = (
-        send_ptr + dst * send_stride_n + b * send_stride_b + h_local * send_stride_h
+        send_ptr + dst * send_stride_n + b * send_stride_b + hb_safe * send_stride_h
     )
-    tl.store(dst_base + d, src)
+    tl.store(dst_base[:, None] + d[None, :], src, mask=h_valid[:, None])
 
     lse = tl.load(lse_ptr + b * lse_stride_b + h * lse_stride_h)
     if HAS_OWNED_COUNTS:
@@ -483,7 +500,7 @@ def _dcp_a2a_pack_kernel(
         # payload; this adds no kernel launch to the decode path.
         lse = tl.where(tl.load(owned_counts_ptr + b) == 0, float("-inf"), lse)
     if LSE_PACK == 1:
-        tl.store(dst_base + HEAD_DIM, lse)
+        tl.store(dst_base + HEAD_DIM, lse, mask=h_valid)
     else:
         # Split the fp32 into two raw 16-bit halves. Nothing does arithmetic on
         # these slots -- the collective copies bits and the combine kernel puts
@@ -491,8 +508,8 @@ def _dcp_a2a_pack_kernel(
         bits = lse.to(tl.uint32, bitcast=True)
         hi = (bits >> 16).to(tl.uint16).to(dst_base.dtype.element_ty, bitcast=True)
         lo = (bits & 0xFFFF).to(tl.uint16).to(dst_base.dtype.element_ty, bitcast=True)
-        tl.store(dst_base + HEAD_DIM, hi)
-        tl.store(dst_base + HEAD_DIM + 1, lo)
+        tl.store(dst_base + HEAD_DIM, hi, mask=h_valid)
+        tl.store(dst_base + HEAD_DIM + 1, lo, mask=h_valid)
 
 
 @triton.jit
@@ -601,6 +618,7 @@ def _dcp_a2a_unpack_combine_quant_kernel(
     N_RANKS,
     HEAD_DIM: tl.constexpr,
     H_LOCAL: tl.constexpr,
+    H_ROUNDED: tl.constexpr,
     LSE_PACK: tl.constexpr,
     N_ROUNDED: tl.constexpr,
     FP8_MAX: tl.constexpr,
@@ -624,21 +642,27 @@ def _dcp_a2a_unpack_combine_quant_kernel(
     b = tl.program_id(axis=0).to(tl.int64)
 
     n = tl.arange(0, N_ROUNDED)
-    h = tl.arange(0, H_LOCAL)
+    h = tl.arange(0, H_ROUNDED)
     d = tl.arange(0, HEAD_DIM)
     valid = n < N_RANKS
-    # The padding lanes are masked at every load, which is the documented Triton
+    # The N padding lanes are masked at every load, which is the documented Triton
     # contract. They are also folded onto lane 0 here so no pointer is ever
     # FORMED outside `recv` -- belt and braces, asked for in review, and free:
     # the select folds into the address arithmetic.
     n_safe = tl.where(valid, n, 0)
+    # H_LOCAL need not be a power of two (K3: 96/8 = 12). Padding heads alias
+    # head 0 instead: they compute head 0's values, which cannot change the row
+    # max, and are dropped by the store mask. The N axis cannot do the same,
+    # since an aliased rank would be summed twice.
+    h_valid = h < H_LOCAL
+    h_safe = tl.where(h_valid, h, 0)
 
     # [N, H] base of each (shard, head) record for this token.
     hbase = (
         recv_ptr
         + n_safe[:, None].to(tl.int64) * recv_stride_n
         + b * recv_stride_b
-        + h[None, :].to(tl.int64) * recv_stride_h
+        + h_safe[None, :].to(tl.int64) * recv_stride_h
     )
 
     if LSE_PACK == 1:
@@ -669,7 +693,7 @@ def _dcp_a2a_unpack_combine_quant_kernel(
     factor_is_nan = factor != factor  # noqa: PLR0124
     factor = tl.where(factor_is_nan | (~valid[:, None]), 0.0, factor)
 
-    # [N, H, D]. Mask the padding lanes: N_ROUNDED rounds up to a power of two,
+    # [N, H, D]. Mask the N padding lanes: N_ROUNDED rounds up to a power of two,
     # so for a non-power-of-two group the high lanes address memory past `recv`.
     # Their factor is already 0, so this changes no result -- it stops the read.
     vals = tl.load(
@@ -701,8 +725,9 @@ def _dcp_a2a_unpack_combine_quant_kernel(
 
     q = tl.minimum(tl.maximum(acc * inv, -FP8_MAX), FP8_MAX)
     tl.store(
-        out_ptr + b * out_stride_b + h[:, None] * out_stride_h + d[None, :],
+        out_ptr + b * out_stride_b + h_safe[:, None] * out_stride_h + d[None, :],
         q.to(out_ptr.dtype.element_ty),
+        mask=h_valid[:, None],
     )
 
 
@@ -754,6 +779,7 @@ def cp_lse_a2a(
         f"got H={h_total}, N={n_ranks}"
     )
     h_local = h_total // n_ranks
+    h_rounded = triton.next_power_of_2(h_local)
 
     dtype = cp_attn_out.dtype
     pack = _lse_pack_slots(dtype)
@@ -771,7 +797,7 @@ def cp_lse_a2a(
         owned_counts = cp_attn_lse
 
     send = torch.empty((n_ranks, b, h_local, head_dim + pack), dtype=dtype, device=dev)
-    _dcp_a2a_pack_kernel[(b, h_total)](
+    _dcp_a2a_pack_kernel[(b, n_ranks)](
         cp_attn_out,
         cp_attn_lse,
         owned_counts,
@@ -784,6 +810,7 @@ def cp_lse_a2a(
         send.stride(1),
         send.stride(2),
         H_LOCAL=h_local,
+        H_ROUNDED=h_rounded,
         HEAD_DIM=head_dim,
         LSE_PACK=pack,
         HAS_OWNED_COUNTS=has_owned_counts,
@@ -810,6 +837,7 @@ def cp_lse_a2a(
             n_ranks,
             HEAD_DIM=head_dim,
             H_LOCAL=h_local,
+            H_ROUNDED=h_rounded,
             LSE_PACK=pack,
             N_ROUNDED=triton.next_power_of_2(n_ranks),
             FP8_MAX=float(torch.finfo(quant_dtype).max),
@@ -849,6 +877,156 @@ def mask_empty_dcp_lse(
     return cp_attn_lse.masked_fill(owned_counts[:, None] == 0, float("-inf"))
 
 
+# ─────────────────────────────────────────── mailbox merge backend ──
+#
+# aiter's ``dcp_lse_combine`` (FlyDSL, aiter #6972 / #7943, in main from
+# 78a14ae5d): one launch in which every rank stores each owner's head rows and
+# LSEs straight into the owner's IPC-mapped, sentinel-filled mailbox, then
+# polls its own heads and combines them. It replaces pack -> all_to_all_single
+# -> combine. Decode only: its peer buffer is sized for the widest decode step,
+# capped at the widest merge under _MAILBOX_MAX_ELEMS, and its launch epoch
+# lives on each rank, so every rank must launch it the same number of times in
+# the same order -- which a DCP group's lock-step decode does, since every
+# condition below reads only shapes, dtype and capture state. Only
+# graph-captured steps take it: an eager call re-traces the FlyDSL kernel on
+# the host every time (~77 ms a call on Kimi-K3 DCP8), which a capture pays
+# once. Sparse MLA's empty rows (owned_counts == 0) are masked inside the
+# combine through its ``row_counts``.
+
+_MAILBOX_WORKSPACES: dict = {}
+# Mailbox merges taken, per workspace. A merge can only take the mailbox inside
+# a graph capture, so after capture this is every launch a replay makes.
+_MAILBOX_LAUNCHES: dict = {}
+# Largest merge (tokens x all heads x head dim) the mailbox takes. Measured on
+# MI355X in a CUDA graph against pack -> RCCL all-to-all -> combine: GLM-5.2
+# DCP4 (16 x 256) leads at every width up to 512 tokens (8.4e6); Kimi-K3 DCP8
+# (12 x 128) leads through 160 tokens (2.0e6), loses at 192, where the
+# combine's token tile steps from 4 to 8, and leads again from 384. 2^21 is
+# 128 tokens on GLM-5.2 and 170 on Kimi-K3.
+_MAILBOX_MAX_ELEMS = 1 << 21
+
+
+def _mailbox_key(cp_group, heads, dim):
+    return (id(cp_group), heads, dim)
+
+
+def dcp_mailbox_max_tokens(atom_config) -> int:
+    """The widest decode step: every sequence verifying all its draft tokens."""
+    spec = atom_config.speculative_config
+    drafts = (spec.num_speculative_tokens or 0) if spec is not None else 0
+    return atom_config.max_num_seqs * (1 + drafts)
+
+
+def prepare_dcp_mailbox(cp_group, heads, dim, max_tokens) -> bool:
+    """Create the shared mailbox workspace of (group, heads a rank, head dim).
+
+    Collective (it maps every rank's peer buffer): call it on every rank of
+    ``cp_group`` in the same order, before any CUDA graph is captured. Its
+    memory sits outside torch's allocator, so it must exist before the KV
+    cache is sized. Returns False on every rank, and the merge stays on
+    all-to-all, when the peer memory cannot be allocated or mapped. ``max_tokens`` is
+    capped at the widest merge under ``_MAILBOX_MAX_ELEMS``: wider ones take
+    all-to-all, so room for them would never be used.
+    """
+    key = _mailbox_key(cp_group, heads, dim)
+    if key in _MAILBOX_WORKSPACES:  # None: tried, and it fell back
+        return _MAILBOX_WORKSPACES[key] is not None
+    _MAILBOX_WORKSPACES[key] = None
+    # Same shapes on every rank, so every rank returns here alike.
+    max_tokens = min(
+        max_tokens, _MAILBOX_MAX_ELEMS // (cp_group.world_size * heads * dim)
+    )
+    if max_tokens < 1:
+        logger.warning(
+            "DCP mailbox: one token of %d heads x %d already exceeds %d elements; "
+            "merging with 'a2a'",
+            cp_group.world_size * heads,
+            dim,
+            _MAILBOX_MAX_ELEMS,
+        )
+        return False
+    try:
+        from aiter.ops.flydsl.dcp_mailbox import CombineWorkspace
+    except ImportError as error:
+        raise ImportError(
+            "DCP comm_backend 'mailbox' needs aiter with the FlyDSL mailbox "
+            "combine (78a14ae5d or later) and FlyDSL >= 0.5.0. Set --dcp-config "
+            '\'{"comm_backend": "a2a"}\' to run without it.'
+        ) from error
+    device = torch.device("cuda", torch.cuda.current_device())
+    try:
+        # aiter agrees on the allocation and on the IPC mapping across the
+        # group before raising, so every rank falls back alike.
+        ws = CombineWorkspace(cp_group, device, heads, dim, max_tokens)
+    except RuntimeError as error:
+        logger.warning("DCP mailbox peer memory: %s; merging with 'a2a'", error)
+        return False
+    _MAILBOX_WORKSPACES[key] = ws
+    logger.info(
+        "DCP mailbox merge ready: %d heads a rank x %d, up to %d decode tokens, "
+        "%.1f MiB of peer memory",
+        heads,
+        dim,
+        max_tokens,
+        ws.peers.bytes.numel() / (1 << 20),
+    )
+    return True
+
+
+def _dcp_mailbox_merge(cp_attn_out, cp_attn_lse, cp_group, owned_counts, quant_dtype):
+    """The mailbox merge, or None when this call cannot take it."""
+    if cp_group.world_size == 1 or not torch.cuda.is_current_stream_capturing():
+        return None
+    tokens, heads, dim = cp_attn_out.shape
+    key = _mailbox_key(cp_group, heads // cp_group.world_size, dim)
+    ws = _MAILBOX_WORKSPACES.get(key)
+    if (
+        ws is None
+        or tokens == 0
+        or tokens > ws.max_tokens  # capped at _MAILBOX_MAX_ELEMS
+        or cp_attn_out.dtype != torch.bfloat16
+    ):
+        return None
+    from aiter.ops.flydsl.dcp_mailbox import dcp_lse_combine
+
+    _MAILBOX_LAUNCHES[key] = _MAILBOX_LAUNCHES.get(key, 0) + 1
+    # The combine takes exactly one int32 count per row, where the a2a path
+    # accepts any buffer at least `tokens` long.
+    out = dcp_lse_combine(
+        ws,
+        cp_attn_out,
+        cp_attn_lse.to(torch.float32).contiguous(),
+        base_e=True,
+        row_counts=None if owned_counts is None else owned_counts[:tokens],
+    )
+    # No quantizing combine here: hand back the bf16 rows unquantized, which
+    # the caller then quantizes as it would without the fused path.
+    return out if quant_dtype is None else (out, None)
+
+
+def check_dcp_mailbox_launches() -> None:
+    """Raise unless every rank of each mailbox group captured the same number
+    of mailbox merges. A launch pairs with the same launch on every peer, so a
+    rank that took one more would pair each later merge with the wrong call and
+    hang at the last one. Collective: call on every rank after graph capture."""
+    for key, ws in _MAILBOX_WORKSPACES.items():
+        if ws is None:
+            continue
+        n = _MAILBOX_LAUNCHES.get(key, 0)
+        t = torch.tensor([n, -n], dtype=torch.int64, device="cpu")
+        # aiter's workspace keeps the DCP group's CPU (gloo) group
+        torch.distributed.all_reduce(
+            t, op=torch.distributed.ReduceOp.MIN, group=ws.group
+        )
+        lo, hi = t[0].item(), -t[1].item()
+        if lo != hi:
+            raise RuntimeError(
+                f"DCP mailbox: ranks captured between {lo} and {hi} mailbox "
+                f"merges (this rank {n}); replay would pair them wrongly. Set "
+                '--dcp-config \'{"comm_backend": "a2a"}\' and report this.'
+            )
+
+
 def dcp_lse_merge(
     cp_attn_out,
     cp_attn_lse,
@@ -860,7 +1038,7 @@ def dcp_lse_merge(
 ):
     """Reconstruct the global softmax from the per-rank partials.
 
-    Dispatches to one of the two backends above. Both compute the same weighted
+    Dispatches to one of the backends above. All compute the same weighted
     sum over KV shards and leave this rank owning the same head slice; they
     differ only in how many collectives it takes (see the A2A section above for
     why one all-to-all can replace AllGather-LSE + ReduceScatter). Equivalent
@@ -873,7 +1051,19 @@ def dcp_lse_merge(
 
     ``ctx`` is the Triton context the AG+RS backend caches its launches in; the
     a2a backend does not use one.
+
+    ``backend="mailbox"`` takes aiter's mailbox combine in a graph capture
+    when its workspace was prepared (``prepare_dcp_mailbox``) and the call
+    fits it, else all-to-all. Every input to that choice is the same on every
+    rank of the group.
     """
+    if backend == "mailbox":
+        merged = _dcp_mailbox_merge(
+            cp_attn_out, cp_attn_lse, cp_group, owned_counts, quant_dtype
+        )
+        if merged is not None:
+            return merged
+        backend = "a2a"
     if backend == "a2a":
         return cp_lse_a2a(
             cp_attn_out,
@@ -1071,21 +1261,19 @@ def get_dcp_local_seq_lens(seq_lens, dcp_size, dcp_rank, cp_kv_cache_interleave_
 
 
 def get_dcp_local_window_lens(
-    seq_lens, max_seqlen_q, dcp_size, dcp_rank, cp_kv_cache_interleave_size=1
+    positions, dcp_size, dcp_rank, cp_kv_cache_interleave_size=1
 ):
     """Per-DCP-rank local KV length of each query token's causal window.
 
-    Draft position ``j`` attends to global positions ``[0, seq_len -
-    max_seqlen_q + j]``; that extra position belongs to a single rank, so the
-    ranks' local lengths do not all advance with j. Returns a flat
-    ``[len(seq_lens) * max_seqlen_q]`` array in (sequence, draft position)
-    order. ``max_seqlen_q == 1`` reproduces ``get_dcp_local_seq_lens``.
+    The token at global position ``p`` attends to ``[0, p]``; a draft
+    position's extra key belongs to a single rank, so the ranks' local lengths
+    do not all advance with it. One entry per token of ``positions``; a step of
+    one token a sequence reproduces ``get_dcp_local_seq_lens``.
     """
-    windows = seq_lens[:, None] - max_seqlen_q + 1 + np.arange(max_seqlen_q)
     return get_dcp_local_seq_lens(
-        # Row 0 is the committed token count, which a scheduled decode row
-        # always has at least one of; the clip is for callers that do not.
-        windows.clip(min=0).ravel(),
+        # A scheduled decode token always sees itself; the clip is for callers
+        # that do not.
+        (positions + 1).clip(min=0),
         dcp_size,
         dcp_rank,
         cp_kv_cache_interleave_size,
@@ -1261,6 +1449,7 @@ def dcp_decode_candidate_exchange_fused(
     q_scale: torch.Tensor | None = None,
     kv_scale: torch.Tensor | None = None,
     weights_scale: float = 1.0,
+    cache_layout: str = PRESHUFFLE,
 ) -> None:
     """Score the local shard, exchange scores, emit this rank's owned KV slots.
 
@@ -1328,6 +1517,24 @@ def dcp_decode_candidate_exchange_fused(
             l_max,
             KVBlockSize=runner_block_size,
             Preshuffle=True,
+        )
+    elif cache_layout == MFMA:
+        from atom.model_ops.dsa_fp4 import opus_logits
+
+        opus_logits(
+            q_rows.squeeze(1),
+            q_scale[:num_decode_tokens],
+            kv_cache,
+            kv_scale,
+            weights[:num_decode_tokens],
+            block_tables,
+            attn_metadata.sparse_cu_seqlens_q[: num_decode_tokens + 1],
+            local_ctx,
+            max_qlen=1,
+            max_seq_len=l_max,
+            block_size=runner_block_size,
+            weight_scale=weights_scale,
+            out=local_logits,
         )
     else:
         from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4

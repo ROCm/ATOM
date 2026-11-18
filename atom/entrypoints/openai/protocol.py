@@ -9,6 +9,7 @@ from typing import Annotated, Any
 
 from pydantic import (
     BaseModel,
+    BeforeValidator,
     ConfigDict,
     Field,
     NonNegativeInt,
@@ -180,7 +181,9 @@ def _normalize_tool_call_arguments(tool_calls: Any) -> Any:
     OpenAI clients send tool-call arguments as a JSON *string*, but chat
     templates (Qwen3 qwen3_coder/qwen3_xml, Hermes, etc.) iterate
     ``tool_call.arguments.items()`` and require a mapping. Mirrors how vLLM and
-    SGLang deserialize arguments before applying the chat template.
+    SGLang deserialize arguments before applying the chat template. Skipped for
+    templates that take the string (Kimi-K3, DeepSeek-R1/V3); see
+    ``preserve_tool_call_arguments`` in ``api_server``.
     """
     if not isinstance(tool_calls, list):
         return tool_calls
@@ -234,7 +237,8 @@ class ChatMessage(BaseModel):
         Returns a dict with role, content, and any extra fields (tool_calls,
         tool_call_id, name, reasoning_content, tools) that the chat template needs.
         ``preserve_tool_call_arguments`` keeps ``function.arguments`` strings
-        as sent, for templates that render them verbatim (Kimi-K3).
+        as sent, for templates that take them as strings (Kimi-K3 renders them
+        verbatim, DeepSeek-R1/V3 concatenate them).
         """
         d: dict[str, Any] = {
             "role": self.role,
@@ -271,6 +275,8 @@ class ChatCompletionRequest(BaseModel):
     ignore_eos: bool | None = False
     stream: bool | None = False
     stream_options: dict[str, Any] | None = None
+    logprobs: Annotated[bool, Field(strict=True)] | None = False
+    top_logprobs: Annotated[int, Field(strict=True, ge=0, le=20)] | None = None
     seed: int | None = None
     chat_template_kwargs: dict[str, Any] | None = None
     # Tool calling
@@ -375,6 +381,55 @@ class CompletionRequest(BaseModel):
         if self.max_tokens is not None:
             return validate_max_tokens(self.max_tokens)
         return DEFAULT_MAX_TOKENS
+
+
+def _one_or_many(value: Any) -> Any:
+    """A single stop string as a list of one."""
+    return [value] if isinstance(value, str) else value
+
+
+# DeepSeek's API takes one stop string or a list of them.
+OneOrManyStops = Annotated[list[str] | None, BeforeValidator(_one_or_many)]
+
+
+class BetaChatCompletionRequest(ChatCompletionRequest):
+    """``/beta/chat/completions``: Chat with DeepSeek's beta contract.
+
+    A final assistant message may carry ``prefix: true`` to be continued
+    (see ``prefix_completion``), and ``stop`` may be a single string.
+    """
+
+    stop: OneOrManyStops = None
+
+
+class BetaCompletionRequest(CompletionRequest):
+    """``/beta/completions``: completions with DeepSeek's FIM parameters.
+
+    ``/v1/completions`` does not declare these, so it ignores them, as it
+    always has.
+    """
+
+    stop: OneOrManyStops = None
+    # Text after the gap that fill-in-the-middle asks the model to fill.
+    suffix: str | None = None
+    # Only with `stream`: `include_usage` puts `usage` on every chunk.
+    stream_options: dict[str, Any] | None = None
+    # Return the prompt ahead of the completion; not with `suffix`.
+    echo: bool | None = False
+    # DeepSeek's range. Completions return no token probabilities yet, so
+    # a value is refused rather than dropped.
+    logprobs: Annotated[int, Field(strict=True, ge=0, le=20)] | None = None
+
+    def get_max_tokens(self) -> int:
+        """As for /v1, except that 0 is allowed: DeepSeek's completions take
+        ``max_tokens >= 0``, and 0 generates nothing (the ``echo`` alone).
+        """
+        limit = (
+            self.max_completion_tokens
+            if self.max_completion_tokens is not None
+            else self.max_tokens
+        )
+        return 0 if limit == 0 else super().get_max_tokens()
 
 
 # ============================================================================
