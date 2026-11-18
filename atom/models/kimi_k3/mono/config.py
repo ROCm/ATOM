@@ -338,7 +338,8 @@ def config_refusal(atom_config) -> str | None:
 
 
 def _served_connectors(atom_config) -> tuple[str, ...]:
-    """The KV connectors served beside the kernels: Mooncake, when it is the
+    """The KV connectors served beside the kernels: bounded LMCache MP copies,
+    and Mooncake, when it is the
     P/D decode of a deployment without decode CP, whose receives are NIC
     writes into the pools this rank already holds.
 
@@ -355,5 +356,5 @@ def _served_connectors(atom_config) -> tuple[str, ...]:
         atom_config.decode_context_parallel_size == 1
         and disaggregated_kv_role(atom_config) == "kv_consumer"
     ):
-        return ("mooncake",)
-    return ()
+        return ("lmcache_mp", "mooncake")
+    return ("lmcache_mp",)

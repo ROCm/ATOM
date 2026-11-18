@@ -37,6 +37,7 @@ from atom.models.deepseek_v41.dspark import DeepseekV41DSpark
 from atom.models.deepseek_v41.mono import index_plan as ip
 from atom.models.deepseek_v41.mono.check import (
     check_front,
+    check_index_score,
     check_moe,
     check_post,
     check_selection,
@@ -572,9 +573,7 @@ class V41MonoDecodeRunner:
                 block.attn._compress_batch(self.normed, cache, step, rope)
                 if self.check:
                     # the original scorer, the reference the selection is held to
-                    block.attn.indexer.score_quantized(
-                        self.index_query(), self.iw, cache, step
-                    )
+                    check_index_score(self, block.attn.indexer, cache, step)
             post = (spec, block, weights, residual, gates, step, cache, rope)
             if self.split_k2:
                 self._attn_post(*post)
