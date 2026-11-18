@@ -875,7 +875,7 @@ def target_layer(E, Ly):
                                anw=ltab(fp, Ly, "anw")(), x8a=c["x8"], xsa=c["xs"],
                                engkv=fptr(fp, "engkv"), enggw=ltab(fp, Ly, "enggw")(), eng=lfl(128),
                                engp=plog(ENGP), engflag=engfl, engtag=engtg, **engtp(c["recv"], rank)), TR)
-        if lastL & (b < 16):
+        if hx.unlikely(lastL & (b < 16)):   # (c1 code size: the last layer only, off the hot path)
             FS.xh_out(dict(t=tq5, b=b, w=tq5 // 32, l=tq5 % 32, sm=sm + FLO, x1g=plog(X1A), part2=plog(P2A),
                            nw=ltab(fp, Ly, "anw")(), norm_eps=D.RMS_EPS, xh=XHP, pflag=apnfl, ptag=apntg), TR)
     # the next layer's stage-A weights (wqkv tile) and norm weight -> L2

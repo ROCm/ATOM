@@ -1234,9 +1234,10 @@ def stage_F3(c):
             for i in range_constexpr(8):
                 r = (l // 16) * 8 + i
                 s_ = (q[0][i] + q[1][i]) + (q[2][i] + q[3][i])
-                if r < TR:
-                    hx.lstore(sm + (r * OWC + nt * 16 + l % 16) * 4, s_)
-                    hx.gstore(c["out"] + i64(r * HID + n0 + l % 16) * 4, s_)
+                if fx.const_expr(i < TR):   # (c1 code size: rows i >= TR are never stored)
+                    if r < TR:
+                        hx.lstore(sm + (r * OWC + nt * 16 + l % 16) * 4, s_)
+                        hx.gstore(c["out"] + i64(r * HID + n0 + l % 16) * 4, s_)
         gpu.barrier()
 
 
@@ -1322,8 +1323,9 @@ def stage_E4(c):
             for i in range_constexpr(8):
                 r = (l // 16) * 8 + i
                 s_ = (q[0][i] + q[1][i]) + (q[2][i] + q[3][i])
-                if r < TR:
-                    hx.lstore(sm + 8192 + (r * 32 + nt * 16 + l % 16) * 4, s_.to(BF16).to(F32))
+                if fx.const_expr(i < TR):   # (c1 code size: rows i >= TR are never stored)
+                    if r < TR:
+                        hx.lstore(sm + 8192 + (r * 32 + nt * 16 + l % 16) * 4, s_.to(BF16).to(F32))
         gpu.barrier()
         if t < TR:
             vq = [hx.lload(sm + 8192 + (t * 32 + 4 * k) * 4, F32, 4) for k in range(8)]

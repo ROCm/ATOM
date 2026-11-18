@@ -391,7 +391,7 @@ def moe_union(c, counted=False):
         m2 = ballot(ok & (ce > 1))
         m9 = ballot(ok & (ce > 8))
         if ok & (m2 != 0):
-            if m9 != 0:
+            if hx.unlikely(m9 != 0):   # (c1 code size: no list longer than 8 with <= 8 rows, off the hot path)
                 vs = [hx.lload(sm + O_LST + (e * MAXTOK + 4 * q) * 4, I32, 4, align=16) for q in range(4)]
                 v = [vs[q][j] for q in range(4) for j in range(4)]
                 for (i0, i1) in SORT16:
@@ -1597,14 +1597,14 @@ def ug_union(c, i, TR):
         pk = hx.lload(sm + O_LST + (e * MAXTOK + (tl < n).select(tl, I32(0))) * 4, I32)
         ex = i64(pslot(e, sm))
         acc1 = fx.Vector.filled(8, 0.0, F32)
-        if live:
+        if (hx.unlikely(live) if rd == 1 else live):   # (c1 code size: a second round is rare, off the hot path)
             acc1 = ug_body1(c, pk, c["w13"] + ex * W13_E + i64(g) * (4 * W13_TS), c["s13"] + ex * S13_E + i64(g) * (2 * W13_KC), w % 4)
         gpu.barrier()
         ow = sm + O_RED8 + (w * 32 + l) * 32
         hx.lstore(ow, fx.Vector.from_elements([acc1[q] for q in range(4)], F32), align=16)
         hx.lstore(ow + 16, fx.Vector.from_elements([acc1[q] for q in range(4, 8)], F32), align=16)
         gpu.barrier()
-        if (w % 4 == 0) & live:
+        if (hx.unlikely((w % 4 == 0) & live) if rd == 1 else ((w % 4 == 0) & live)):
             acc = []
             for q in range_constexpr(4):
                 orr = sm + O_RED8 + ((w + q) * 32 + l) * 32
