@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import torch
 from aiter import init_dist_env
@@ -29,6 +30,10 @@ from atom.utils.distributed.utils import (
     raise_timeout_if_dp_spans_nodes,
     raise_timeout_if_tp_spans_nodes,
 )
+
+if TYPE_CHECKING:
+    from atom.model_engine.model_runner import ModelRunner
+    from atom.spec_decode.drafter import Drafter
 
 logger = logging.getLogger("atom")
 
@@ -175,7 +180,9 @@ def load_weights(model: nn.Module, config: Config) -> set[str]:
     )
 
 
-def construct_drafter(config: Config, device: torch.device, runner):
+def construct_drafter(
+    config: Config, device: torch.device, runner: ModelRunner
+) -> Drafter:
     """Construct the drafter for ``runner`` on ``device``, without its
     weights."""
     from atom.utils.backends import set_model_tag

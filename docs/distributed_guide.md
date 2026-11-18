@@ -37,7 +37,7 @@ ATOM provides parallel linear layer classes in `atom/model_ops/linear.py`:
 
 ### Process Group Initialization
 
-In `ModelRunner.__init__()`, the distributed environment is set up via AITER:
+In `init_model_env()` (`atom/model_engine/model_setup.py`, called from `ModelRunner.__init__()`), the distributed environment is set up via AITER:
 
 ```python
 from aiter import init_dist_env
@@ -141,7 +141,7 @@ When a DP rank has no real work but other ranks do, it executes dummy batches to
 
 ### Device assignment
 
-When DP is enabled on a single node, each DP rank uses a different set of GPUs. The device mapping in `ModelRunner.__init__()` is:
+When DP is enabled on a single node, each DP rank uses a different set of GPUs. The device mapping in `init_model_env()` (`atom/model_engine/model_setup.py`) is:
 
 ```python
 local_device_rank = dp_rank_local * config.tensor_parallel_size + rank
