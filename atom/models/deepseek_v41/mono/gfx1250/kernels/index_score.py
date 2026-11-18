@@ -318,6 +318,17 @@ GROUPED_MIN_BOUND = 8192   # index rows past which a c1 FULL layer scores its ke
 
 
 @ASTRewriter.transform
+def iq_wait(iqcnt, hcnt, t, iqonly, niq):
+    """(R4) The scorer's wait for its query: the niq iquant CTAs' count (iqonly), else the INDEX_QUANT handoff."""
+    if iqonly:
+        if t == 0:
+            hx.wait_count(iqcnt, niq, 4)
+        gpu.barrier()
+    else:
+        hx.handoff(hcnt, t, True)
+
+
+@ASTRewriter.transform
 def handoff_unless(cnt, t, done):
     """(B) The INDEX_QUANT handoff here unless the layer took it already, right after iquant (step.py `early`)."""
     if done == (I32(0) != I32(0)):

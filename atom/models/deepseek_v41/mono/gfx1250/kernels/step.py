@@ -508,11 +508,27 @@ def target_layer(E, Ly):
         r1 = (lfl1 & fx.Int64(4)) != fx.Int64(0)
         if hascomp:
             CS.stage_cgemm(cwith(c, cwkv=ltab(fp, Ly, "cwkv")(), axn=fptr(fp, "axn"), cpart=fptr(fp, "cpart")), r1)
-    if hx.unlikely(keepA):
+    # (R4) indexer layers: iq / iw / the compressor GEMM's partials are counted (KV_C), waited for only by their readers
+    # (the iquant CTAs, the compressor rows' CTAs); the Engram-next layers keep the KV_C handoff
+    NIQC = (TR * IS.HEADS + 7) // 8   # the iquant CTAs (a (token, head) row a wave)
+    if hx.unlikely(keepA & (isidx == (fx.Int32(0) != fx.Int32(0)))):
         handoff(lc + i64(LY.KV_C), t, True)
     if hx.unlikely(isidx):
+        hx.wait_storecnt0()
+        gpu.barrier()
+        if t == 0:
+            hx.atomic_add(lc + i64(LY.KV_C), 1)
+        if b < NIQC:
+            if t == 0:
+                hx.wait_count(lc + i64(LY.KV_C), CTAS, 4)
+            gpu.barrier()
         IS.stage_iquant(cwith(c, iq=fptr(fp, "iq"), iwp=fptr(fp, "iwp"), iq_out=fptr(fp, "iq_out"),
                               iqs_out=fptr(fp, "iqs_out"), iw_out=fptr(fp, "iw_out")))
+        if b < NIQC:   # (R4) this CTA's query rows out: counted (IQ_DONE)
+            hx.wait_storecnt0()
+            gpu.barrier()
+            if t == 0:
+                hx.atomic_add(lc + i64(LY.IQ_DONE), 1)
         lfl2 = ltab(fp, Ly, "lflags")()
         # (B) a c1 compressor layer whose scorer takes the grouped path: the INDEX_QUANT handoff right after iquant (the
         # query), not after the compressor rows; the rows' CTAs (stage_crow) skip the scorer and flag their new keys
@@ -525,8 +541,14 @@ def target_layer(E, Ly):
                      & (ltab(fp, Ly, "ibat")() != fx.Int64(0)) & (bme > fx.Int32(SC.GROUPED_MIN_BOUND)))
         crf = plog(CRF_OFF) + i64(par) * 512
         crtag = hx.epoch32(tep, Ly, 2)
-        if early:
-            handoff(lc + i64(LY.INDEX_QUANT), t, True)
+        # (R4) the scorer waits for the iquant CTAs alone (IQ_DONE) when no compressor row of this step is on its way to
+        # it: the grouped path (`early`, its last-column tasks wait for the rows' flags) or no compressor; else the
+        # INDEX_QUANT handoff after the compressor rows, as before
+        iqonly = early | ((lfl2 & fx.Int64(2)) == fx.Int64(0))
+        if ((lfl2 & fx.Int64(2)) != fx.Int64(0)) & (b >= CS.CROW0):   # (the compressor rows read the GEMM's partials)
+            if t == 0:
+                hx.wait_count(lc + i64(LY.KV_C), CTAS, 4)
+            gpu.barrier()
         if (lfl2 & fx.Int64(2)) != fx.Int64(0):
             r1b = (lfl2 & fx.Int64(4)) != fx.Int64(0)
             cc = cwith(c, cpart=fptr(fp, "cpart"), cnw=ltab(fp, Ly, "cnw")(), cape=ltab(fp, Ly, "cape")(),
@@ -548,7 +570,7 @@ def target_layer(E, Ly):
                         irow=ltab(fp, Ly, "irow")(), cprow=fx.Int32(ltab(fp, Ly, "cprow")()), imain=fx.Int32(ltab(fp, Ly, "imain")()),
                         iq_out=fptr(fp, "iq_out"), iqs_out=fptr(fp, "iqs_out"), iw_out=fptr(fp, "iw_out"),
                         iscale=ltab(fp, Ly, "iscale")(),
-                        prewait=lambda: SC.handoff_unless(lc + i64(LY.INDEX_QUANT), hx.opaque_v(fx.thread_idx.x), early),
+                        prewait=lambda: SC.iq_wait(lc + i64(LY.IQ_DONE), lc + i64(LY.INDEX_QUANT), hx.opaque_v(fx.thread_idx.x), iqonly, NIQC),
                         early=early, crflag=crf, crtag=crtag)
             lfl3 = ltab(fp, Ly, "lflags")()
             isrx = (lfl3 & fx.Int64(64)) != fx.Int64(0)
