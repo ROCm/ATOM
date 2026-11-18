@@ -597,6 +597,73 @@ def herd_finalize_words(rows: int) -> dict[str, int]:
 
 
 @traced
+def _herd_drop_scan(c, my_id, my_value, my_pop, lane, live, kp1):
+    """``stage_herd_token``'s drop, kept sum and places on wave 0, by scans."""
+    # Runtime loops, in candidate order: a cold launch fetches one body.
+    drop = fx.Int32(0)
+    drop_id = readlane(my_id, 0)
+    drop_value = readlane(my_value, 0)
+    drop_pop = readlane(my_pop, 0)
+    for j in range(fx.Int32(1), fx.Int32(kp1), unroll=1):
+        j_id, j_value, j_pop = readlane(my_id, j), readlane(my_value, j), readlane(my_pop, j)
+        take = (j_pop < drop_pop) | (
+            (j_pop == drop_pop)
+            & ((j_value < drop_value) | ((j_value == drop_value) & (j_id < drop_id)))
+        )
+        drop = take.select(j, drop)
+        drop_id = take.select(j_id, drop_id)
+        drop_value = take.select(j_value, drop_value)
+        drop_pop = take.select(j_pop, drop_pop)
+    kept_sum = fx.Float32(0.0)
+    place = fx.Int32(0)
+    for k in range(fx.Int32(0), fx.Int32(kp1), unroll=1):
+        kept = drop != k
+        kept_sum = kept_sum + kept.select(readlane(my_value, k), fx.Float32(0.0))
+        below = kept & (readlane(my_id, k) < my_id)
+        place = place + below.select(fx.Int32(1), fx.Int32(0))
+    kept = live & (lane != drop)
+    return kept_sum, place, kept
+
+
+def _herd_drop_wave(c, my_id, my_value, my_pop, lane, live, kp1):
+    """``stage_herd_token``'s drop, kept sum and places on wave 0, bit for bit,
+    without its serial scans: the drop the arg-min of (popularity, value, id)
+    over the live lanes by a butterfly (the ids are distinct, so the order is
+    total and any comparison order finds the scan's candidate); the kept sum
+    the scan's adds in candidate order; a kept candidate's place the kept ones
+    of lower id, ranked by ballots of the ids' bits, most significant first."""
+    key_pop = live.select(my_pop, fx.Int32(0x7FFFFFFF))
+    key_value = live.select(my_value, fx.Float32(math.inf))
+    key_id = live.select(my_id, fx.Int32(0x7FFFFFFF))
+    for offset in (1, 2, 4, 8, 16):
+        o_pop = xshfl(key_pop, offset, GFX1250)
+        o_value = xshfl(key_value, offset, GFX1250)
+        o_id = xshfl(key_id, offset, GFX1250)
+        take = (o_pop < key_pop) | (
+            (o_pop == key_pop)
+            & ((o_value < key_value) | ((o_value == key_value) & (o_id < key_id)))
+        )
+        key_pop = take.select(o_pop, key_pop)
+        key_value = take.select(o_value, key_value)
+        key_id = take.select(o_id, key_id)
+    drop_id = uniform(key_id)
+    kept_sum = fx.Float32(0.0)
+    for k in range(kp1):
+        kept_sum = kept_sum + (readlane(my_id, k) != drop_id).select(
+            readlane(my_value, k), fx.Float32(0.0)
+        )
+    kept = live & (my_id != drop_id)
+    same = _ballot32(kept)
+    place = fx.Int32(0)
+    for bit in range(_HERD_EXPERT_BITS - 1, -1, -1):
+        one = ((my_id >> bit) & 1) != 0
+        zeros = _ballot32(((my_id >> bit) & 1) == 0)
+        place = place + one.select(_popcount32(same & zeros), fx.Int32(0))
+        same = one.select(same & (zeros ^ fx.Uint32(0xFFFFFFFF)), same & zeros)
+    return kept_sum, place, kept
+
+
+@traced
 def stage_herd_token(c, rows, token):
     """``stage_herd_finalize``'s ``topk_ids`` and ``topk_weights`` of token
     ``token`` alone, bit for bit, by its routing CTA: it polls every token's
@@ -609,6 +676,7 @@ def stage_herd_token(c, rows, token):
     the stale candidates are taken as they are."""
 
     tid, threads = c["tid"], c["threads"]
+    wave_drop = c.get("wave_drop", False)
     lds = c["herd_lds"]
     popularity, ids_s, values_s = lds["popularity"], lds["ids"], lds["values"]
     kp1 = TOPK + 1
@@ -665,6 +733,7 @@ def stage_herd_token(c, rows, token):
             fx.atomic_add(popularity + expert, fx.Int32(1), syncscope="workgroup")
     gpu.barrier()
     store_cm = c.get("store_cm", 0)
+    drop_order = _herd_drop_wave if wave_drop else _herd_drop_scan
     if c["wave"] == 0:
         # Lane j holds candidate j; the drop, the kept sum and the scale are
         # ``stage_herd_finalize``'s scan on the wave-uniform copies, in its
@@ -676,30 +745,10 @@ def stage_herd_token(c, rows, token):
         my_id = fx.ptr_load(ids_s + base + mine)
         my_value = fx.ptr_load(values_s + base + mine)
         my_pop = fx.ptr_load(popularity + my_id)
-        # Runtime loops, in candidate order: a cold launch fetches one body.
-        drop = fx.Int32(0)
-        drop_id = readlane(my_id, 0)
-        drop_value = readlane(my_value, 0)
-        drop_pop = readlane(my_pop, 0)
-        for j in range(fx.Int32(1), fx.Int32(kp1), unroll=1):
-            j_id, j_value, j_pop = readlane(my_id, j), readlane(my_value, j), readlane(my_pop, j)
-            take = (j_pop < drop_pop) | (
-                (j_pop == drop_pop)
-                & ((j_value < drop_value) | ((j_value == drop_value) & (j_id < drop_id)))
-            )
-            drop = take.select(j, drop)
-            drop_id = take.select(j_id, drop_id)
-            drop_value = take.select(j_value, drop_value)
-            drop_pop = take.select(j_pop, drop_pop)
-        kept_sum = fx.Float32(0.0)
-        place = fx.Int32(0)
-        for k in range(fx.Int32(0), fx.Int32(kp1), unroll=1):
-            kept = drop != k
-            kept_sum = kept_sum + kept.select(readlane(my_value, k), fx.Float32(0.0))
-            below = kept & (readlane(my_id, k) < my_id)
-            place = place + below.select(fx.Int32(1), fx.Int32(0))
+        live = lane < kp1
+        kept_sum, place, kept = drop_order(c, my_id, my_value, my_pop, lane, live, kp1)
         scale = c["routed_scaling_factor"] / fx.max(kept_sum, fx.Float32(1e-20))
-        if (lane < kp1) & (lane != drop):
+        if kept:
             bo.buffer_store(
                 my_id, rsrc(c["topk_ids"]), token * TOPK + place, cache_modifier=store_cm
             )

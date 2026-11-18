@@ -409,6 +409,7 @@ def build_packed_finish(
         down: DownRole
         herd: HerdRole
 
+    wave_drop = parallel_herd and envs.ATOM_KIMI_MONO_HERD_WAVE_DROP
     name = (
         f"k3_k2_gfx1250_persistent_finish_s{rows}_b{plan.blocks}"
         f"{'_rl' if rolled else ''}"
@@ -417,6 +418,7 @@ def build_packed_finish(
         f"{'_rf' if replicated_front else ''}{'_herd' if herd else ''}"
         f"{'_f8' if fp8_shared_down else ''}{'_hp' if precompute_herd else ''}"
         f"{'_ph' if parallel_herd else ''}"
+        f"{'_nohwd' if parallel_herd and not wave_drop else ''}"
         f"{f'_pl{herd_poll_limit}' if herd_poll_limit is not None else ''}"
         f"{'_profile' if profile else ''}"
     )
@@ -694,6 +696,7 @@ def build_packed_finish(
                     {
                         **herd_context(moe_gfx1250.herd_tag(launch)),
                         "poll_limit": herd_poll_limit,
+                        "wave_drop": wave_drop,
                     },
                     rows,
                     route_token,

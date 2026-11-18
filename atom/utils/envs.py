@@ -741,6 +741,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KIMI_MONO_PARALLEL_HERD": lambda: (
         os.getenv("ATOM_KIMI_MONO_PARALLEL_HERD", "1") == "1"
     ),
+    # Kimi-K3 gfx1250 mono: a parallel-HERD routing CTA drops and orders its
+    # token's candidates without serial scans (the same bits): the drop a
+    # wave butterfly arg-min, the kept sum the scan's adds unrolled, the places
+    # ranked by ballots of the ids' bits, the default; 0 keeps the scans.
+    "ATOM_KIMI_MONO_HERD_WAVE_DROP": lambda: (
+        os.getenv("ATOM_KIMI_MONO_HERD_WAVE_DROP", "1") == "1"
+    ),
     # Kimi-K3 gfx1250 mono: the o_proj all-reduce in one fabric hop, every
     # rank's partials pushed to every rank and summed there in rank order (the
     # same bits as the owner's sums, k2_oproj_ar_gfx1250); its banks take tp/2
