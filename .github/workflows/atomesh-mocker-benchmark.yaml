@@ -109,7 +109,7 @@ jobs:
             --profile ci --lib routers::http_pd_router
 
       # KV events: following the engines' streams, the prefix index, and the routing code
-      # it feeds.
+      # it feeds, through placement to the logged routing decision.
       - name: Test KV events
         run: |
           set -euo pipefail
@@ -118,7 +118,7 @@ jobs:
             --target-dir atom/mesh/mocker/target/mesh \
             --profile ci --lib -- \
             kv_events:: kv_index:: policies::cache_aware policies::registry \
-            routers::prepare routers::ingress
+            routers::prepare routers::ingress core::placement observability::route_trace
           cargo test \
             --manifest-path atom/mesh/Cargo.toml \
             --target-dir atom/mesh/mocker/target/mesh \

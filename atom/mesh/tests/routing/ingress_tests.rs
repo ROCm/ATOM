@@ -1183,6 +1183,74 @@ async fn tokens_cache_aware_wants_carry_the_special_tokens_in_any_pair() {
     }
 }
 
+/// `prefix_hash` keys a chat by its templated tokens. Under Qwen2-VL's template, which
+/// renders every image as the same `<|image_pad|>`, two chats that differ only in an image
+/// URL still get different tokens, and the same chat gets the same tokens.
+#[tokio::test]
+async fn chat_tokens_differ_by_image_url_under_a_real_template() {
+    let template = "{% set image_count = namespace(value=0) %}{% set video_count = namespace(value=0) %}{% for message in messages %}{% if loop.first and message['role'] != 'system' %}<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n{% endif %}<|im_start|>{{ message['role'] }}\n{% if message['content'] is string %}{{ message['content'] }}<|im_end|>\n{% else %}{% for content in message['content'] %}{% if content['type'] == 'image' or 'image' in content or 'image_url' in content %}{% set image_count.value = image_count.value + 1 %}{% if add_vision_id %}Picture {{ image_count.value }}: {% endif %}<|vision_start|><|image_pad|><|vision_end|>{% elif content['type'] == 'video' or 'video' in content %}{% set video_count.value = video_count.value + 1 %}{% if add_vision_id %}Video {{ video_count.value }}: {% endif %}<|vision_start|><|video_pad|><|vision_end|>{% elif 'text' in content %}{{ content['text'] }}{% endif %}{% endfor %}<|im_end|>\n{% endif %}{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
+    // One token a character, the hex digits each their own, so texts that differ in a
+    // hex digit get different tokens.
+    let vocab: serde_json::Map<String, serde_json::Value> = std::iter::once("<unk>".to_string())
+        .chain("0123456789abcdef".chars().map(String::from))
+        .enumerate()
+        .map(|(id, word)| (word, json!(id)))
+        .collect();
+    let tokenizer = json!({"version": "1.0", "truncation": null, "padding": null,
+        "added_tokens": [], "normalizer": null,
+        "pre_tokenizer": {"type": "Split", "pattern": {"Regex": "[\\s\\S]"},
+            "behavior": "Isolated", "invert": false},
+        "post_processor": null, "decoder": null,
+        "model": {"type": "WordLevel", "unk_token": "<unk>", "vocab": vocab}});
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tokenizer.json");
+    std::fs::write(&path, tokenizer.to_string()).unwrap();
+    let config = json!({"chat_template": template});
+    std::fs::write(dir.path().join("tokenizer_config.json"), config.to_string()).unwrap();
+    let pool = PreparePoolRuntime::new(default_pool()).unwrap();
+    let config = crate::config::RouterConfig {
+        policy: crate::config::PolicyConfig::PrefixHash {
+            prefix_token_count: 4,
+            load_factor: 1.25,
+        },
+        ..Default::default()
+    };
+    let app = AppContext::from_config(config, 5, pool.handle())
+        .await
+        .unwrap();
+    let source = path.to_str().unwrap();
+    let tokenizer: Arc<dyn crate::tokenizer::traits::Tokenizer> =
+        Arc::new(crate::tokenizer::HuggingFaceTokenizer::from_file(source).unwrap());
+    // Preparation workers encode with copies they load from the source.
+    app.tokenizer_registry
+        .load("qwen2-vl-id", "m", source, || async { Ok(tokenizer) })
+        .await
+        .unwrap();
+    let mut tokens = Vec::new();
+    for url in ["https://x/a.png", "https://x/b.png", "https://x/a.png"] {
+        let body = json!({"model": "m", "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": url}},
+            {"type": "text", "text": "describe"}]}]});
+        let parsed =
+            ParsedInference::parse("/v1/chat/completions", body.to_string().as_bytes()).unwrap();
+        let routing = IngressRouting::new(&app);
+        let (_, prepared) = app
+            .prepare_pool
+            .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
+                routing.prepare(&parsed, ctx)
+            })
+            .await
+            .unwrap()
+            .wait()
+            .await
+            .unwrap()
+            .unwrap();
+        tokens.push(prepared.unwrap());
+    }
+    assert_ne!(tokens[0], tokens[1]);
+    assert_eq!(tokens[0], tokens[2]);
+}
+
 /// The template and encode stages `--kv-events` adds to a chat request `cache_aware`
 /// places, with the tokenizer.json at `MESH_BENCH_TOKENIZER`.
 #[test]
