@@ -121,7 +121,7 @@ from atom.models.kimi_k3.mono.symm_peers import SymmPeers, map_symm_peers
 from atom.models.kimi_k3.mono.weights import bind_external_moe, bind_fp8_o_proj
 from atom.mono.plan.architecture import GFX1250
 from atom.mono.runtime.abi import KernelAbi
-from atom.mono.runtime.compile import launcher_resources
+from atom.mono.runtime.compile import compile_kernels, launcher_resources
 from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
 from atom.mono.runtime.widths import WidthBuilds
 from atom.utils import envs
@@ -645,6 +645,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                             fp4_latent,
                         ),
                         "K2",
+                        lambda k2: Gfx1250WidthBuild({}, {0: k2}).kernels(),
                     )
                 if k2_cache[k2_key] is not None:
                     k2_by_layer[layer.layer_id] = k2_cache[k2_key]
@@ -656,20 +657,32 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                     self._plan(rows, 1), self.tp, self.dims.proj
                 ),
                 "o_proj all-reduce",
+                lambda kernel: Gfx1250WidthBuild({}, {}, kernel).kernels(),
             )
             if self.oproj_peers is not None
             else None
         )
         return Gfx1250WidthBuild(k1_by_layer, k2_by_layer, oproj)
 
-    def _k2_or_production(self, rows: int, build, what: str):
+    def _k2_or_production(self, rows: int, build, what: str, kernels=None):
         """``build()``, or None past ``k2_fallback_past`` rows where it
-        refuses the width: the production path then runs it."""
+        refuses the width -- building, or compiling ``kernels(built)`` with a
+        resident hazard (``_resident_hazards``) -- the production path then
+        running it."""
         if rows <= self.k2_fallback_past:
             return build()
         try:
-            return build()
-        except (MonoUnsupported, ValueError) as why:
+            built = build()
+            if kernels is not None:
+                hazards = [
+                    hazard
+                    for launcher in compile_kernels(kernels(built))
+                    for hazard in _resident_hazards(launcher)
+                ]
+                if hazards:
+                    raise MonoUnsupported(", ".join(hazards))
+            return built
+        except Exception as why:  # noqa: BLE001 -- any refusal, named
             logger.warning(
                 "Kimi-K3 gfx1250 mono: %d rows run the production %s (%s)",
                 rows,

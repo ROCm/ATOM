@@ -442,6 +442,21 @@ def test_k2_kernel_refusal_past_48_rows_falls_back_to_production(rows):
     assert runner._k2_or_production(rows, lambda: built, "K2") is built
 
 
+def test_k2_kernel_hazard_past_48_rows_falls_back_to_production(monkeypatch):
+    runner = object.__new__(K3Gfx1250MonoDecodeRunner)
+    launcher = object()
+    monkeypatch.setattr(runner_module, "compile_kernels", lambda pairs: [launcher])
+    monkeypatch.setattr(
+        runner_module,
+        "_resident_hazards",
+        lambda found: ("331776B LDS",) if found is launcher else (),
+    )
+    kernels = lambda _built: [(launcher, None)]  # noqa: E731
+    assert runner._k2_or_production(60, object, "K2", kernels) is None
+    built = object()
+    assert runner._k2_or_production(48, lambda: built, "K2", kernels) is built
+
+
 def test_layer_without_a_k2_build_runs_the_production_mlp():
     rows, hidden = 2, 4
     prefix = torch.zeros(rows, hidden)
