@@ -497,181 +497,184 @@ def target_layer(E, Ly):
     pub = dict(pubflag=plog(DNF) + i64(par) * 40960 + i64(36864), pubtag=hx.epoch32(tep, Ly, 15))
     # (seam) stage A's x8 comes from the TP2 owners (un-normalized, ffn_post_owner): the publishers run only on the
     # indexer layers, for the normed axn of iw / the compressor GEMM (their pubflag)
-    if hx.unlikely(newA & lfl(8)):
-        AS.stage_Apub(cwith(c, x1a=plog(X1A), part2=plog(P2A), anw=ltab(fp, Lp, "anw")(), apflag=apfl, aptag=aptg,
-                            axn=fptr(fp, "axn"), norm_eps=D.RMS_EPS, axn_only=True, **pub))
+    if fx.const_expr(not DRS):   # (c1 code size) no index publishers in the draft launch (lflags 0)
+        if hx.unlikely(newA & lfl(8)):
+            AS.stage_Apub(cwith(c, x1a=plog(X1A), part2=plog(P2A), anw=ltab(fp, Lp, "anw")(), apflag=apfl, aptag=aptg,
+                                axn=fptr(fp, "axn"), norm_eps=D.RMS_EPS, axn_only=True, **pub))
     stage_A(cwith(c, newA=newA, **pub, **v3a, apflag=apfl, aptag=aptg, attpost=lc + i64(ATT_POST), part2=plog(P2A),
                   x1a=plog(X1A), anw=ltab(fp, Lp, "anw")(), norm_eps=D.RMS_EPS, axn=fptr(fp, "axn")))
     pf_rows(c["wqb"] + i64(b) * (16 * QL), QL, 16, QL, t)
     pf_rows(c["wqb"] + i64(b + CTAS) * (16 * QL), QL, 16, QL, t)
-    if hx.unlikely(lfl(128)):   # the next layer's Engram kv
-        if (ltab(fp, Ly, "lflags")() & fx.Int64(S.ENG_ENTRY)) == fx.Int64(0):
-            # (engq-in-CTA) the kv quantizes its A rows from the bf16 embeddings itself: no stage_engq, no ATTN_A handoff
-            ES.stage_engkv(cwith(c, engemb=ltab(fp, Ly, "engemb")(), engw=ltab(fp, Ly, "engw")(),
-                                 engws=ltab(fp, Ly, "engws")(), engkv=fptr(fp, "engkv"), **engtp(c["recv"])))
-        else:
-            if Ly != fx.Int32(S.ENG_ROWS[0]):   # (engentry) slot 1's kv (the entry's) -> engkv, read by this row's gate
-                ekv = fptr(fp, "engkv")
-                for zz in range_constexpr((TR * ES.EN * 2 // 16 + CTAS * 256 - 1) // (CTAS * 256)):
-                    u = b * 256 + t + zz * (CTAS * 256)
-                    if u < TR * ES.EN * 2 // 16:
-                        hx.stx_dev(ekv + i64(u) * 16, hx.gload(ekv + i64(ES.T * ES.EN * 2) + i64(u) * 16, fx.Int32, 4))
+    if fx.const_expr(not DRS):   # (c1 code size) no Engram kv in the draft launch (lflags 0)
+        if hx.unlikely(lfl(128)):   # the next layer's Engram kv
+            if (ltab(fp, Ly, "lflags")() & fx.Int64(S.ENG_ENTRY)) == fx.Int64(0):
+                # (engq-in-CTA) the kv quantizes its A rows from the bf16 embeddings itself: no stage_engq, no ATTN_A handoff
+                ES.stage_engkv(cwith(c, engemb=ltab(fp, Ly, "engemb")(), engw=ltab(fp, Ly, "engw")(),
+                                     engws=ltab(fp, Ly, "engws")(), engkv=fptr(fp, "engkv"), **engtp(c["recv"])))
+            else:
+                if Ly != fx.Int32(S.ENG_ROWS[0]):   # (engentry) slot 1's kv (the entry's) -> engkv, read by this row's gate
+                    ekv = fptr(fp, "engkv")
+                    for zz in range_constexpr((TR * ES.EN * 2 // 16 + CTAS * 256 - 1) // (CTAS * 256)):
+                        u = b * 256 + t + zz * (CTAS * 256)
+                        if u < TR * ES.EN * 2 // 16:
+                            hx.stx_dev(ekv + i64(u) * 16, hx.gload(ekv + i64(ES.T * ES.EN * 2) + i64(u) * 16, fx.Int32, 4))
 
     # ---- kv, C (on A2 flags) -> kvflag / cflag
     stage_kv(cwith(c, **v3a))
     stage_C(cwith(c, **v3a))
 
     # ---- indexer layers: iq / iw / compressor GEMM, iquant / compressor rows, scorer + selection
-    isidx = lfl(8)
-    # (cold) the index chain and the Engram stages: unlikely, so block placement moves them past the layer loop's
-    # hot path (the plain layers' C runs straight into D instead of jumping over ~8.7K instructions)
-    if hx.unlikely(isidx):
-        # (contract 6.4) iq reads A2's q blocks + ss (the 40 q-block flags), iw / the compressor GEMM read axn (the 32
-        # publishers' flags; layer 0: the entry front's, before the loop): LL waits, not the ATTN_A handoff
-        ll_w = hx.opaque_v(fx.thread_idx.x) // 32
-        ll_l = hx.opaque_v(fx.thread_idx.x) % 32
-        hx.wait_flags(a2fl, AS.QL // 32, a2tg, ll_w, ll_l, 8)
-        if newA:
-            hx.wait_flags(pub["pubflag"], 32, pub["pubtag"], ll_w, ll_l, 9)
-        gpu.barrier()
-        ci = cwith(c, iqw=ltab(fp, Ly, "iqw")(), iqws=ltab(fp, Ly, "iqws")(), iww=ltab(fp, Ly, "iww")(),
-                   iq=fptr(fp, "iq"), iwp=fptr(fp, "iwp"), axn=fptr(fp, "axn"))
-        # (P2) a REINDEX layer: waves 6 / 7 (idle through iq / iw) put the scorer's first page batch in LDS now
-        if ((ltab(fp, Ly, "lflags")() & fx.Int64(64)) != fx.Int64(0)) & (w >= 6):
-            SC.rx_prefill(cwith(c, ibound=ltab(fp, Ly, "ibound")(), ibat=ltab(fp, Ly, "ibat")(), icand=ltab(fp, Ly, "icand")(),
-                                btab=ltab(fp, Ly, "btab")(), bstride=fx.Int32(ltab(fp, Ly, "bstride")()),
-                                irpp=fx.Int32(ltab(fp, Ly, "irpp")())))
-        IS.stage_iq(ci)
-        IS.stage_iw(ci)
-        lfl1 = ltab(fp, Ly, "lflags")()
-        hascomp = (lfl1 & fx.Int64(2)) != fx.Int64(0)
-        r1 = (lfl1 & fx.Int64(4)) != fx.Int64(0)
-        if hascomp:
-            CS.stage_cgemm(cwith(c, cwkv=ltab(fp, Ly, "cwkv")(), axn=fptr(fp, "axn"), cpart=fptr(fp, "cpart")), r1)
-    # (R4) indexer layers: iq / iw / the compressor GEMM's partials are counted (KV_C), waited for only by their readers
-    # (the iquant CTAs, the compressor rows' CTAs); the Engram-next layers keep the KV_C handoff
-    NIQC = (TR * IS.HEADS + 7) // 8   # the iquant CTAs (a (token, head) row a wave)
-    if hx.unlikely(keepA & (isidx == (fx.Int32(0) != fx.Int32(0)))):
-        handoff(lc + i64(LY.KV_C), t, True)
-    if hx.unlikely(isidx):
-        hx.wait_storecnt0()
-        gpu.barrier()
-        if t == 0:
-            hx.atomic_add(lc + i64(LY.KV_C), 1)
-        if b < NIQC:
-            if t == 0:
-                hx.wait_count(lc + i64(LY.KV_C), CTAS, 4)
+    if fx.const_expr(not DRS):   # (c1 code size) the draft rows' lflags are 0: no index chain / KV_C handoff in the draft launch
+        isidx = lfl(8)
+        # (cold) the index chain and the Engram stages: unlikely, so block placement moves them past the layer loop's
+        # hot path (the plain layers' C runs straight into D instead of jumping over ~8.7K instructions)
+        if hx.unlikely(isidx):
+            # (contract 6.4) iq reads A2's q blocks + ss (the 40 q-block flags), iw / the compressor GEMM read axn (the 32
+            # publishers' flags; layer 0: the entry front's, before the loop): LL waits, not the ATTN_A handoff
+            ll_w = hx.opaque_v(fx.thread_idx.x) // 32
+            ll_l = hx.opaque_v(fx.thread_idx.x) % 32
+            hx.wait_flags(a2fl, AS.QL // 32, a2tg, ll_w, ll_l, 8)
+            if newA:
+                hx.wait_flags(pub["pubflag"], 32, pub["pubtag"], ll_w, ll_l, 9)
             gpu.barrier()
-        IS.stage_iquant(cwith(c, iq=fptr(fp, "iq"), iwp=fptr(fp, "iwp"), iq_out=fptr(fp, "iq_out"),
-                              iqs_out=fptr(fp, "iqs_out"), iw_out=fptr(fp, "iw_out")))
-        if b < NIQC:   # (R4) this CTA's query rows out: counted (IQ_DONE)
+            ci = cwith(c, iqw=ltab(fp, Ly, "iqw")(), iqws=ltab(fp, Ly, "iqws")(), iww=ltab(fp, Ly, "iww")(),
+                       iq=fptr(fp, "iq"), iwp=fptr(fp, "iwp"), axn=fptr(fp, "axn"))
+            # (P2) a REINDEX layer: waves 6 / 7 (idle through iq / iw) put the scorer's first page batch in LDS now
+            if ((ltab(fp, Ly, "lflags")() & fx.Int64(64)) != fx.Int64(0)) & (w >= 6):
+                SC.rx_prefill(cwith(c, ibound=ltab(fp, Ly, "ibound")(), ibat=ltab(fp, Ly, "ibat")(), icand=ltab(fp, Ly, "icand")(),
+                                    btab=ltab(fp, Ly, "btab")(), bstride=fx.Int32(ltab(fp, Ly, "bstride")()),
+                                    irpp=fx.Int32(ltab(fp, Ly, "irpp")())))
+            IS.stage_iq(ci)
+            IS.stage_iw(ci)
+            lfl1 = ltab(fp, Ly, "lflags")()
+            hascomp = (lfl1 & fx.Int64(2)) != fx.Int64(0)
+            r1 = (lfl1 & fx.Int64(4)) != fx.Int64(0)
+            if hascomp:
+                CS.stage_cgemm(cwith(c, cwkv=ltab(fp, Ly, "cwkv")(), axn=fptr(fp, "axn"), cpart=fptr(fp, "cpart")), r1)
+        # (R4) indexer layers: iq / iw / the compressor GEMM's partials are counted (KV_C), waited for only by their readers
+        # (the iquant CTAs, the compressor rows' CTAs); the Engram-next layers keep the KV_C handoff
+        NIQC = (TR * IS.HEADS + 7) // 8   # the iquant CTAs (a (token, head) row a wave)
+        if hx.unlikely(keepA & (isidx == (fx.Int32(0) != fx.Int32(0)))):
+            handoff(lc + i64(LY.KV_C), t, True)
+        if hx.unlikely(isidx):
             hx.wait_storecnt0()
             gpu.barrier()
             if t == 0:
-                hx.atomic_add(lc + i64(LY.IQ_DONE), 1)
-        lfl2 = ltab(fp, Ly, "lflags")()
-        # (B) a c1 compressor layer whose scorer takes the grouped path: the INDEX_QUANT handoff right after iquant (the
-        # query), not after the compressor rows; the rows' CTAs (stage_crow) skip the scorer and flag their new keys
-        # (CRF_OFF), which only the score tasks covering the context's last columns wait for (SC.stage_score_grouped)
-        early = fx.Int32(0) != fx.Int32(0)
-        if fx.const_expr(TR <= 6):
-            lge = hx.opaque_v(fx.thread_idx.x) % 32
-            bme = TK.wave_max((lge < TR).select(hx.gload(ltab(fp, Ly, "ibound")() + i64(fx.min(lge, fx.Int32(TR - 1))) * 4, fx.Int32), fx.Int32(0)))
-            early = (((lfl2 & fx.Int64(2)) != fx.Int64(0)) & ((lfl2 & fx.Int64(64)) == fx.Int64(0))
-                     & (ltab(fp, Ly, "ibat")() != fx.Int64(0)) & (bme > fx.Int32(SC.GROUPED_MIN_BOUND)))
-        crf = plog(CRF_OFF) + i64(par) * 512
-        crtag = hx.epoch32(tep, Ly, 2)
-        # (R4) the scorer waits for the iquant CTAs alone (IQ_DONE) when no compressor row of this step is on its way to
-        # it: the grouped path (`early`, its last-column tasks wait for the rows' flags) or no compressor; else the
-        # INDEX_QUANT handoff after the compressor rows, as before
-        iqonly = early | ((lfl2 & fx.Int64(2)) == fx.Int64(0))
-        if ((lfl2 & fx.Int64(2)) != fx.Int64(0)) & (b >= CS.CROW0):   # (the compressor rows read the GEMM's partials)
-            if t == 0:
-                hx.wait_count(lc + i64(LY.KV_C), CTAS, 4)
-            gpu.barrier()
-        if (lfl2 & fx.Int64(2)) != fx.Int64(0):
-            r1b = (lfl2 & fx.Int64(4)) != fx.Int64(0)
-            cc = cwith(c, cpart=fptr(fp, "cpart"), cnw=ltab(fp, Ly, "cnw")(), cape=ltab(fp, Ly, "cape")(),
-                       cwk=ltab(fp, Ly, "cwk")(), cknw=ltab(fp, Ly, "cknw")(), cplan=ltab(fp, Ly, "cplan")(),
-                       wplan=ltab(fp, Ly, "wplan")(), ccap=fx.Int32(ltab(fp, Ly, "ccap")()), wcap=fx.Int32(ltab(fp, Ly, "wcap")()),
-                       cmain=fx.Int32(ltab(fp, Ly, "cmain")()), crpp=fx.Int32(ltab(fp, Ly, "crpp")()),
-                       cprow=fx.Int32(ltab(fp, Ly, "cprow")()), cplane=ltab(fp, Ly, "cplane")(), cscale=ltab(fp, Ly, "iscale")(), ckv=ltab(fp, Ly, "ckv")(),
-                       cscore=ltab(fp, Ly, "cscore")(), cstate=ltab(fp, Ly, "cstate")(), btab=ltab(fp, Ly, "btab")(),
-                       bstride=fx.Int32(ltab(fp, Ly, "bstride")()), slots=ltab(fp, Ly, "slots")(), crflag=crf, crtag=crtag)
-            CS.stage_crow(cc, r1b)
-            CS.crow_flag(cc)
-            CS.stage_cring(cc, r1b)
-        if ltab(fp, Ly, "ibat")() == fx.Int64(0):   # (no scorer: the INDEX_QUANT handoff here; else inside the scorer)
-            handoff(lc + i64(LY.INDEX_QUANT), t, True)
-        if ltab(fp, Ly, "ibat")() != fx.Int64(0):
-            cs_ = cwith(c, ibat=ltab(fp, Ly, "ibat")(), ibound=ltab(fp, Ly, "ibound")(), iplane=ltab(fp, Ly, "iplane")(),
-                        irpp=fx.Int32(ltab(fp, Ly, "irpp")()), btab=ltab(fp, Ly, "btab")(), bstride=fx.Int32(ltab(fp, Ly, "bstride")()),
-                        ilog=ltab(fp, Ly, "ilog")(), ilw=fx.Int32(ltab(fp, Ly, "ilw")()), isel=ltab(fp, Ly, "isel")(),
-                        irow=ltab(fp, Ly, "irow")(), cprow=fx.Int32(ltab(fp, Ly, "cprow")()), imain=fx.Int32(ltab(fp, Ly, "imain")()),
-                        iq_out=fptr(fp, "iq_out"), iqs_out=fptr(fp, "iqs_out"), iw_out=fptr(fp, "iw_out"),
-                        iscale=ltab(fp, Ly, "iscale")(),
-                        prewait=lambda: SC.iq_wait(lc + i64(LY.IQ_DONE), lc + i64(LY.INDEX_QUANT), hx.opaque_v(fx.thread_idx.x), iqonly, NIQC),
-                        early=early, crflag=crf, crtag=crtag)
-            lfl3 = ltab(fp, Ly, "lflags")()
-            isrx = (lfl3 & fx.Int64(64)) != fx.Int64(0)
-            cs_ = cwith(cs_, ibmax=ltab(fp, Ly, "ibmax")(), icand=ltab(fp, Ly, "icand")(), lvl=fptr(fp, "ilvl"),
-                        iprod=(lfl3 & fx.Int64(32)) != fx.Int64(0), ts=None, rxpre=isrx)   # (P2: rx_prefill ran on REINDEX)
-            # (segsel) the candidate layer on the grouped scorer: every score task counts its 8192-column segment (the
-            # layer's select_mc histogram slot, zeroed a step: layer 20 runs no select_mc), the tree's level-0 tasks wait
-            # for their own segments' counts -- no SCORE handoff: a segment's selection starts as its scores land
-            grp = fx.Int32(0) != fx.Int32(0)
-            nchk = fx.Int32(0)
-            cs_ = cwith(cs_, segcnt=fptr(fp, "mchist") + i64(Ly) * TK.MC_LAYER)
-            if fx.const_expr(TR <= 6):   # (c1: one request) long FULL contexts score each key tile once for every row
-                lg = hx.opaque_v(fx.thread_idx.x) % 32   # (short contexts keep the per-row tasks: more CTAs in parallel)
-                bmx = TK.wave_max((lg < TR).select(hx.gload(cs_["ibound"] + i64(fx.min(lg, fx.Int32(TR - 1))) * 4, fx.Int32), fx.Int32(0)))
-                grp = (isrx == (fx.Int32(0) != fx.Int32(0))) & (bmx > fx.Int32(SC.GROUPED_MIN_BOUND))
-                nchk = SC.IP.score_tasks(fx.max(bmx, fx.Int32(0)), fx.Int32(SC.CHUNK))
-                if isrx | (bmx <= fx.Int32(SC.GROUPED_MIN_BOUND)):
-                    SC.stage_score_any(cs_, isrx)
+                hx.atomic_add(lc + i64(LY.KV_C), 1)
+            if b < NIQC:
+                if t == 0:
+                    hx.wait_count(lc + i64(LY.KV_C), CTAS, 4)
+                gpu.barrier()
+            IS.stage_iquant(cwith(c, iq=fptr(fp, "iq"), iwp=fptr(fp, "iwp"), iq_out=fptr(fp, "iq_out"),
+                                  iqs_out=fptr(fp, "iqs_out"), iw_out=fptr(fp, "iw_out")))
+            if b < NIQC:   # (R4) this CTA's query rows out: counted (IQ_DONE)
+                hx.wait_storecnt0()
+                gpu.barrier()
+                if t == 0:
+                    hx.atomic_add(lc + i64(LY.IQ_DONE), 1)
+            lfl2 = ltab(fp, Ly, "lflags")()
+            # (B) a c1 compressor layer whose scorer takes the grouped path: the INDEX_QUANT handoff right after iquant (the
+            # query), not after the compressor rows; the rows' CTAs (stage_crow) skip the scorer and flag their new keys
+            # (CRF_OFF), which only the score tasks covering the context's last columns wait for (SC.stage_score_grouped)
+            early = fx.Int32(0) != fx.Int32(0)
+            if fx.const_expr(TR <= 6):
+                lge = hx.opaque_v(fx.thread_idx.x) % 32
+                bme = TK.wave_max((lge < TR).select(hx.gload(ltab(fp, Ly, "ibound")() + i64(fx.min(lge, fx.Int32(TR - 1))) * 4, fx.Int32), fx.Int32(0)))
+                early = (((lfl2 & fx.Int64(2)) != fx.Int64(0)) & ((lfl2 & fx.Int64(64)) == fx.Int64(0))
+                         & (ltab(fp, Ly, "ibat")() != fx.Int64(0)) & (bme > fx.Int32(SC.GROUPED_MIN_BOUND)))
+            crf = plog(CRF_OFF) + i64(par) * 512
+            crtag = hx.epoch32(tep, Ly, 2)
+            # (R4) the scorer waits for the iquant CTAs alone (IQ_DONE) when no compressor row of this step is on its way to
+            # it: the grouped path (`early`, its last-column tasks wait for the rows' flags) or no compressor; else the
+            # INDEX_QUANT handoff after the compressor rows, as before
+            iqonly = early | ((lfl2 & fx.Int64(2)) == fx.Int64(0))
+            if ((lfl2 & fx.Int64(2)) != fx.Int64(0)) & (b >= CS.CROW0):   # (the compressor rows read the GEMM's partials)
+                if t == 0:
+                    hx.wait_count(lc + i64(LY.KV_C), CTAS, 4)
+                gpu.barrier()
+            if (lfl2 & fx.Int64(2)) != fx.Int64(0):
+                r1b = (lfl2 & fx.Int64(4)) != fx.Int64(0)
+                cc = cwith(c, cpart=fptr(fp, "cpart"), cnw=ltab(fp, Ly, "cnw")(), cape=ltab(fp, Ly, "cape")(),
+                           cwk=ltab(fp, Ly, "cwk")(), cknw=ltab(fp, Ly, "cknw")(), cplan=ltab(fp, Ly, "cplan")(),
+                           wplan=ltab(fp, Ly, "wplan")(), ccap=fx.Int32(ltab(fp, Ly, "ccap")()), wcap=fx.Int32(ltab(fp, Ly, "wcap")()),
+                           cmain=fx.Int32(ltab(fp, Ly, "cmain")()), crpp=fx.Int32(ltab(fp, Ly, "crpp")()),
+                           cprow=fx.Int32(ltab(fp, Ly, "cprow")()), cplane=ltab(fp, Ly, "cplane")(), cscale=ltab(fp, Ly, "iscale")(), ckv=ltab(fp, Ly, "ckv")(),
+                           cscore=ltab(fp, Ly, "cscore")(), cstate=ltab(fp, Ly, "cstate")(), btab=ltab(fp, Ly, "btab")(),
+                           bstride=fx.Int32(ltab(fp, Ly, "bstride")()), slots=ltab(fp, Ly, "slots")(), crflag=crf, crtag=crtag)
+                CS.stage_crow(cc, r1b)
+                CS.crow_flag(cc)
+                CS.stage_cring(cc, r1b)
+            if ltab(fp, Ly, "ibat")() == fx.Int64(0):   # (no scorer: the INDEX_QUANT handoff here; else inside the scorer)
+                handoff(lc + i64(LY.INDEX_QUANT), t, True)
+            if ltab(fp, Ly, "ibat")() != fx.Int64(0):
+                cs_ = cwith(c, ibat=ltab(fp, Ly, "ibat")(), ibound=ltab(fp, Ly, "ibound")(), iplane=ltab(fp, Ly, "iplane")(),
+                            irpp=fx.Int32(ltab(fp, Ly, "irpp")()), btab=ltab(fp, Ly, "btab")(), bstride=fx.Int32(ltab(fp, Ly, "bstride")()),
+                            ilog=ltab(fp, Ly, "ilog")(), ilw=fx.Int32(ltab(fp, Ly, "ilw")()), isel=ltab(fp, Ly, "isel")(),
+                            irow=ltab(fp, Ly, "irow")(), cprow=fx.Int32(ltab(fp, Ly, "cprow")()), imain=fx.Int32(ltab(fp, Ly, "imain")()),
+                            iq_out=fptr(fp, "iq_out"), iqs_out=fptr(fp, "iqs_out"), iw_out=fptr(fp, "iw_out"),
+                            iscale=ltab(fp, Ly, "iscale")(),
+                            prewait=lambda: SC.iq_wait(lc + i64(LY.IQ_DONE), lc + i64(LY.INDEX_QUANT), hx.opaque_v(fx.thread_idx.x), iqonly, NIQC),
+                            early=early, crflag=crf, crtag=crtag)
+                lfl3 = ltab(fp, Ly, "lflags")()
+                isrx = (lfl3 & fx.Int64(64)) != fx.Int64(0)
+                cs_ = cwith(cs_, ibmax=ltab(fp, Ly, "ibmax")(), icand=ltab(fp, Ly, "icand")(), lvl=fptr(fp, "ilvl"),
+                            iprod=(lfl3 & fx.Int64(32)) != fx.Int64(0), ts=None, rxpre=isrx)   # (P2: rx_prefill ran on REINDEX)
+                # (segsel) the candidate layer on the grouped scorer: every score task counts its 8192-column segment (the
+                # layer's select_mc histogram slot, zeroed a step: layer 20 runs no select_mc), the tree's level-0 tasks wait
+                # for their own segments' counts -- no SCORE handoff: a segment's selection starts as its scores land
+                grp = fx.Int32(0) != fx.Int32(0)
+                nchk = fx.Int32(0)
+                cs_ = cwith(cs_, segcnt=fptr(fp, "mchist") + i64(Ly) * TK.MC_LAYER)
+                if fx.const_expr(TR <= 6):   # (c1: one request) long FULL contexts score each key tile once for every row
+                    lg = hx.opaque_v(fx.thread_idx.x) % 32   # (short contexts keep the per-row tasks: more CTAs in parallel)
+                    bmx = TK.wave_max((lg < TR).select(hx.gload(cs_["ibound"] + i64(fx.min(lg, fx.Int32(TR - 1))) * 4, fx.Int32), fx.Int32(0)))
+                    grp = (isrx == (fx.Int32(0) != fx.Int32(0))) & (bmx > fx.Int32(SC.GROUPED_MIN_BOUND))
+                    nchk = SC.IP.score_tasks(fx.max(bmx, fx.Int32(0)), fx.Int32(SC.CHUNK))
+                    if isrx | (bmx <= fx.Int32(SC.GROUPED_MIN_BOUND)):
+                        SC.stage_score_any(cs_, isrx)
+                    else:
+                        SC.stage_score_grouped(cs_)
                 else:
-                    SC.stage_score_grouped(cs_)
-            else:
-                SC.stage_score_any(cs_, isrx)
-            segw = cs_["iprod"] & grp
-            if segw == (fx.Int32(0) != fx.Int32(0)):
-                handoff(lc + i64(LY.SCORE), t, True)
-            # (the selection tree's levels past the first only when a row has more than one level-0 list: every row's
-            # input count n <= SEG -> level 0 already writes the final picks; its empty level-1 pass + handoff skipped)
-            lnr = hx.opaque_v(fx.thread_idx.x) % 32
-            bdr = hx.gload(cs_["ibound"] + i64(fx.min(lnr, fx.Int32(TR - 1))) * 4, fx.Int32)
-            nrow = fx.max(bdr, fx.Int32(0))
-            if isrx:
-                nrow = TK.rx_context(cs_, fx.min(lnr, fx.Int32(TR - 1)), bdr)
-            nmax = TK.wave_max((lnr < TR).select(nrow, fx.Int32(0)))
-            sel_levels, blk_levels = TK.selection_levels(cs_, isrx)   # (2, or 3 past 8192 x 16 index rows)
-            lsel = (nmax > fx.Int32(TK.SEG)).select(sel_levels, fx.Int32(1))
-            npass = isrx.select(lsel, cs_["iprod"].select(sel_levels + blk_levels, lsel))
-            if cs_["iprod"]:   # the candidate-block layer (its top-512 and top-2048 blocks): the selection tree
-                # The top-512 tree (ilog) and the top-2048 block tree (ibmax) are independent: pass pi runs level pi of
-                # both, the block tasks from the last CTA down and their lists in the second half of lvl (topk.BLK_LVL):
-                # max(sel, blk) passes and handoffs, not sel + blk (133K: 5 -> 3, <= 131072 keys: 4 -> 2)
-                # (one instance of the selection code, a runtime loop over the two trees: code size is the step's cost)
-                boff = TK.blk_lvl_off(cs_)
-                for pi in range(fx.max(sel_levels, blk_levels)):
-                    for q in range(hx.opaque_s(fx.Int32(2))):
-                        isb = q == fx.Int32(1)
-                        nl = isb.select(blk_levels, sel_levels)
-                        if pi < nl:
-                            TK.stage_select_any(cwith(cs_, ts=None, lvl=cs_["lvl"] + isb.select(boff, i64(0)), rev=isb, segw=segw,
-                                                      segn=nchk), pi, nl,
-                                                isb.select(fx.Int32(TK.MODE_BLK), fx.Int32(TK.MODE_SEL)))
-                        gpu.barrier()   # (both share the CTA's LDS task counts)
-                    handoff(lc + i64(LY.SELECT0) + i64(pi) * 4, t, True)
-            else:   # FULL / REINDEX: every row's top-512 by 8 or 32 CTAs a row (4 radix rounds, a group count each), one handoff
-                mh = fptr(fp, "mchist")
-                # (MC_G CTAs a row once some row's n > MC_G_MIN_N: a radix round's keys over 4x the CTAs -- 83K -68,
-                # 30K -45 us a step; short rows keep MC_G_SHORT, where the round's group count over 32 CTAs costs
-                # more than their keys -- 2K +56 us with 32 CTAs always)
-                TK.select_mc(cwith(cs_, ts=None), mh + i64(Ly) * TK.MC_LAYER,
-                             mh + i64(Ly) * TK.MC_LAYER + i64(TK.MC_HIST), isrx,
-                             (nmax > fx.Int32(TK.MC_G_MIN_N)).select(fx.Int32(TK.MC_G), fx.Int32(TK.MC_G_SHORT)))
-                handoff(lc + i64(LY.SELECT0), t, False)
+                    SC.stage_score_any(cs_, isrx)
+                segw = cs_["iprod"] & grp
+                if segw == (fx.Int32(0) != fx.Int32(0)):
+                    handoff(lc + i64(LY.SCORE), t, True)
+                # (the selection tree's levels past the first only when a row has more than one level-0 list: every row's
+                # input count n <= SEG -> level 0 already writes the final picks; its empty level-1 pass + handoff skipped)
+                lnr = hx.opaque_v(fx.thread_idx.x) % 32
+                bdr = hx.gload(cs_["ibound"] + i64(fx.min(lnr, fx.Int32(TR - 1))) * 4, fx.Int32)
+                nrow = fx.max(bdr, fx.Int32(0))
+                if isrx:
+                    nrow = TK.rx_context(cs_, fx.min(lnr, fx.Int32(TR - 1)), bdr)
+                nmax = TK.wave_max((lnr < TR).select(nrow, fx.Int32(0)))
+                sel_levels, blk_levels = TK.selection_levels(cs_, isrx)   # (2, or 3 past 8192 x 16 index rows)
+                lsel = (nmax > fx.Int32(TK.SEG)).select(sel_levels, fx.Int32(1))
+                npass = isrx.select(lsel, cs_["iprod"].select(sel_levels + blk_levels, lsel))
+                if cs_["iprod"]:   # the candidate-block layer (its top-512 and top-2048 blocks): the selection tree
+                    # The top-512 tree (ilog) and the top-2048 block tree (ibmax) are independent: pass pi runs level pi of
+                    # both, the block tasks from the last CTA down and their lists in the second half of lvl (topk.BLK_LVL):
+                    # max(sel, blk) passes and handoffs, not sel + blk (133K: 5 -> 3, <= 131072 keys: 4 -> 2)
+                    # (one instance of the selection code, a runtime loop over the two trees: code size is the step's cost)
+                    boff = TK.blk_lvl_off(cs_)
+                    for pi in range(fx.max(sel_levels, blk_levels)):
+                        for q in range(hx.opaque_s(fx.Int32(2))):
+                            isb = q == fx.Int32(1)
+                            nl = isb.select(blk_levels, sel_levels)
+                            if pi < nl:
+                                TK.stage_select_any(cwith(cs_, ts=None, lvl=cs_["lvl"] + isb.select(boff, i64(0)), rev=isb, segw=segw,
+                                                          segn=nchk), pi, nl,
+                                                    isb.select(fx.Int32(TK.MODE_BLK), fx.Int32(TK.MODE_SEL)))
+                            gpu.barrier()   # (both share the CTA's LDS task counts)
+                        handoff(lc + i64(LY.SELECT0) + i64(pi) * 4, t, True)
+                else:   # FULL / REINDEX: every row's top-512 by 8 or 32 CTAs a row (4 radix rounds, a group count each), one handoff
+                    mh = fptr(fp, "mchist")
+                    # (MC_G CTAs a row once some row's n > MC_G_MIN_N: a radix round's keys over 4x the CTAs -- 83K -68,
+                    # 30K -45 us a step; short rows keep MC_G_SHORT, where the round's group count over 32 CTAs costs
+                    # more than their keys -- 2K +56 us with 32 CTAs always)
+                    TK.select_mc(cwith(cs_, ts=None), mh + i64(Ly) * TK.MC_LAYER,
+                                 mh + i64(Ly) * TK.MC_LAYER + i64(TK.MC_HIST), isrx,
+                                 (nmax > fx.Int32(TK.MC_G_MIN_N)).select(fx.Int32(TK.MC_G), fx.Int32(TK.MC_G_SHORT)))
+                    handoff(lc + i64(LY.SELECT0), t, False)
 
     # ---- D (on cflag / kvflag) -> dflag;  D-idle CTAs: this layer's attention mix partials + Sinkhorn
     # (design 8 A/B, 11-12: TileRT's separate A2 merge CTAs +2.1 us; the merge stays in the hardware cluster)
@@ -813,6 +816,7 @@ def target_layer(E, Ly):
     # ---- end: a device handoff only before the head and around the tap layers
     if lastL | lfl(16):
         handoff(lc + i64(LY.LAYER_END), t, True)
-    if lfl(16):   # the draft context taps (before the next layer's post rewrites aRout)
-        CX.stage_tap1(dict(t=hx.opaque_v(fx.thread_idx.x), b=b, aux8=fptr(fp, "aux8"), auxs=fptr(fp, "auxs")),
-                      TR, Ly - (NL - 4), fptr(fp, "aRout"))
+    if fx.const_expr(not DRS):   # (c1 code size) the draft rows' lflags are 0: no taps in the draft launch
+        if lfl(16):   # the draft context taps (before the next layer's post rewrites aRout)
+            CX.stage_tap1(dict(t=hx.opaque_v(fx.thread_idx.x), b=b, aux8=fptr(fp, "aux8"), auxs=fptr(fp, "auxs")),
+                          TR, Ly - (NL - 4), fptr(fp, "aRout"))
