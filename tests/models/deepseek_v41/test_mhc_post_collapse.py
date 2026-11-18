@@ -91,11 +91,17 @@ def test_stream_mean_without_an_owed_post_is_the_plain_mean():
     assert torch.equal(state.stream_mean(), residual.mean(dim=-2))
 
 
+def _post_runs(residual):
+    from aiter import mhc_post_supported
+
+    return mhc_post_supported(residual.shape[-1], residual.shape[-2], residual.dtype)
+
+
 def test_unsupported_shapes_keep_the_settle_path():
     mhc = _mhc()
     # Hidden 768: mhc_post serves it (256-column tiles), the reduce does not.
     residual, pending, post, comb, pre = _data(4, 768, 1, False)
-    assert mhc.mhc_post_covers(residual)
+    assert _post_runs(residual)
     assert not mhc.post_reduce_supported(pending, residual)
     state = mhc.SinglePassHCState(residual, pre, pending, post, comb)
     settled = mhc.expand_residual(pending, residual, post, comb)
@@ -110,23 +116,21 @@ def test_unsupported_shapes_keep_the_settle_path():
     assert not mhc.post_reduce_supported(pending.cpu(), residual.cpu())
 
 
-def test_coverage_is_what_mhc_post_takes_without_trapping():
+def test_expand_residual_follows_aiters_query():
+    """`expand_residual` takes `mhc_post` exactly where aiter says it runs, and
+    the torch body elsewhere, without trapping on any of these shapes."""
     mhc = _mhc()
+    for hidden in (256, 512, 768, 1024, 2048):
+        residual, pending, post, comb, _ = _data(3, hidden, 3, False)
+        # The torch body takes the post mix as [tokens, 4]; mhc_post views it.
+        settled = mhc.expand_residual(pending, residual, post.squeeze(-1), comb)
+        assert settled.shape == residual.shape and settled.dtype == residual.dtype
+    # Hidden 256 cannot hold two tiles; FP32 streams are not mhc_post's.
+    residual, pending, post, comb, _ = _data(3, 256, 4, False)
+    assert not _post_runs(residual)
     residual, pending, post, comb, _ = _data(3, 2048, 2, False)
-    assert mhc.mhc_post_covers(residual)
-    assert mhc.mhc_post_covers(residual.half())
-    # Fewer than two tiles of the hidden size: mhc_post traps on these, so
-    # expand_residual keeps the torch body.
-    for hidden in (256, 512, 1024):
-        small, small_pending, small_post, small_comb, _ = _data(3, hidden, 3, False)
-        assert not mhc.mhc_post_covers(small)
-        # The torch body takes the post mix as [tokens, 4].
-        settled = mhc.expand_residual(
-            small_pending, small, small_post.squeeze(-1), small_comb
-        )
-        assert settled.shape == small.shape
-    # FP32 streams are not mhc_post's either.
-    assert not mhc.mhc_post_covers(residual.float())
+    assert _post_runs(residual) and _post_runs(residual.half())
+    assert not _post_runs(residual.float())
     assert not mhc.post_reduce_supported(pending.float(), residual.float())
     torch_body = mhc.expand_residual(
         pending.float(), residual.float(), post.squeeze(-1), comb
@@ -146,3 +150,24 @@ def test_post_reduce_matches_in_fp16():
         mhc.post_reduce_streams(pending, residual, post, comb),
         settled.mean(dim=-2),
     )
+
+
+def test_traced_forward_takes_the_same_paths():
+    """Under torch.compile the aiter support queries are taken as constants
+    (they read the live arch, which Dynamo must not trace): the compiled
+    collapse, tap mean and settle match eager."""
+    mhc = _mhc()
+    residual, pending, post, comb, pre = _data(16, 2048, 7, False)
+
+    def run(residual, pending, post, comb, pre):
+        state = mhc.SinglePassHCState(residual, pre, pending, post, comb)
+        return (
+            state.collapse(),
+            state.stream_mean(),
+            mhc.expand_residual(pending, residual, post, comb),
+        )
+
+    eager = run(residual, pending, post, comb, pre)
+    traced = torch.compile(run, fullgraph=True)(residual, pending, post, comb, pre)
+    for a, b in zip(eager, traced):
+        assert torch.equal(a, b)
