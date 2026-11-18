@@ -7,7 +7,6 @@ from typing import ClassVar
 
 import torch
 from aiter import ActivationType, QuantType, dtypes
-from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
@@ -33,6 +32,7 @@ from atom.model_ops.layernorm import (
     fused_allreduce_gemma_rms_norm,
     fused_allreduce_gemma_rms_norm_quant,
 )
+from atom.model_ops.communication_op import tensor_model_parallel_all_reduce
 from atom.model_ops.linear import (
     MergedColumnParallelLinear,
     MinimaxM3QKVParallelLinearWithIndexer,
