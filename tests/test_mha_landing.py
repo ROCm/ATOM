@@ -16,6 +16,7 @@ import pytest
 import test_pd_chunked_transfer as protocol
 import torch
 from aiter_stub import stubbed_aiter
+from test_kv_transfer_plan import reference_gather_units
 from test_page_unit_layout import BLOCK, LAYERS, MTP, stage_layers, stage_pages
 
 from atom.kv_transfer.disaggregation.mooncake.landing import (
@@ -60,6 +61,19 @@ def host_streams(monkeypatch):
         mc.torch.cuda,
         "stream",
         lambda s: cuda_stream(s) if isinstance(s, torch.cuda.Stream) else nullcontext(),
+    )
+
+
+@pytest.fixture(autouse=True)
+def host_gather(monkeypatch):
+    # The strided gather is a GPU kernel; a CPU harness copies the same slices.
+    gpu_gather = mc.gather_units
+    monkeypatch.setattr(
+        mc,
+        "gather_units",
+        lambda source, *args: (
+            gpu_gather if source.is_cuda else reference_gather_units
+        )(source, *args),
     )
 
 

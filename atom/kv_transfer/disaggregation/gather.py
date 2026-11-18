@@ -70,42 +70,14 @@ class GatherLayout:
         return self.first == 0 and self.width == self.source_bytes == self.unit_bytes
 
 
-try:
-    import triton
-    import triton.language as tl
-
-    @triton.jit
-    def _gather_strided_units(
-        src,
-        indices,
-        dst,
-        SRC_WORDS: tl.constexpr,
-        DST_WORDS: tl.constexpr,
-        FIRST: tl.constexpr,
-        STRIDE: tl.constexpr,
-        WIDTH: tl.constexpr,
-        BLOCK: tl.constexpr,
-    ):
-        unit = tl.program_id(0)
-        word = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-        block_id = tl.load(indices + unit).to(tl.int64)
-        src_offset = (
-            block_id * SRC_WORDS + FIRST + word // WIDTH * STRIDE + word % WIDTH
-        )
-        value = tl.load(src + src_offset, mask=word < DST_WORDS)
-        tl.store(dst + unit * DST_WORDS + word, value, mask=word < DST_WORDS)
-
-except ImportError:  # CPU layout/protocol tests do not require Triton.
-    _gather_strided_units = None
-
-
 def gather_units(
     source: torch.Tensor, indices: torch.Tensor, out: torch.Tensor, plan: GatherLayout
 ):
     """Copy this rank's byte slices of the units ``indices`` names into ``out``.
 
     ``source`` and ``out`` are contiguous byte views, ``out`` exactly one unit
-    per index. No dequantization or KV format change.
+    per index; a strided ``plan`` needs them on GPU. No dequantization or KV
+    format change.
     """
     if not indices.numel():
         return
@@ -116,27 +88,20 @@ def gather_units(
             indices,
             out=out.view(-1, plan.unit_bytes),
         )
-    elif source.is_cuda:
-        _gather_strided_units[
-            (indices.numel(), triton.cdiv(plan.unit_bytes // 4, 256))
-        ](
-            source.view(torch.int32),
-            indices,
-            out.view(torch.int32),
-            SRC_WORDS=plan.source_bytes // 4,
-            DST_WORDS=plan.unit_bytes // 4,
-            FIRST=plan.first // 4,
-            STRIDE=plan.src_stride // 4,
-            WIDTH=plan.width // 4,
-            BLOCK=256,
-            num_warps=1,
-        )
-    else:
-        # Same layout on CPU for byte-exact protocol tests with a synchronous NIC.
-        src = source.reshape(-1, plan.source_bytes)
-        dst = out.view(indices.numel(), plan.unit_bytes)
-        for offset in range(0, plan.unit_bytes, plan.width):
-            first = plan.first + offset // plan.width * plan.src_stride
-            dst[:, offset : offset + plan.width] = src[
-                indices, first : first + plan.width
-            ]
+        return
+    # Imported here, so the whole-unit path runs without Triton.
+    from atom.kv_transfer.disaggregation.gather_kernels import gather_strided_units
+
+    words = plan.unit_bytes // 4
+    gather_strided_units[(indices.numel(), -(-words // 256))](
+        source.view(torch.int32),
+        indices,
+        out.view(torch.int32),
+        SRC_WORDS=plan.source_bytes // 4,
+        DST_WORDS=words,
+        FIRST=plan.first // 4,
+        STRIDE=plan.src_stride // 4,
+        WIDTH=plan.width // 4,
+        BLOCK=256,
+        num_warps=1,
+    )

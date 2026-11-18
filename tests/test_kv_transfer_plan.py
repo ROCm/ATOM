@@ -19,13 +19,23 @@ from atom.kv_transfer.disaggregation.transfer_plan import (
 )
 
 
+def reference_gather_units(source, indices, out, plan):
+    """``gather_units`` on host tensors: the strided gather is a GPU kernel."""
+    src = source.reshape(-1, plan.source_bytes)
+    dst = out.view(indices.numel(), plan.unit_bytes)
+    for offset in range(0, plan.unit_bytes, plan.width):
+        first = plan.first + offset // plan.width * plan.src_stride
+        dst[:, offset : offset + plan.width] = src[indices, first : first + plan.width]
+
+
 def execute_plan(plan, source, destination):
     """Exercise both layout primitives and real descriptors against a byte oracle."""
     for items in plan.pack(512):
         staging = torch.empty(512, dtype=torch.uint8)
         for pos, start, stop, offset in items:
             layout = plan.regions[pos].gather
-            gather_units(
+            gather = gather_units if layout.whole_unit else reference_gather_units
+            gather(
                 source,
                 torch.from_numpy(plan.source_units[start:stop]),
                 staging[offset : offset + (stop - start) * layout.unit_bytes],
