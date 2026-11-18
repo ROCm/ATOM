@@ -11,7 +11,10 @@ its all-reduce share: CTA ``b < 6 rows`` pushes and reduces lines
 ``256 b ..``, a line a thread, as the gathering all-reduce does. A routed row
 is 512 lines, two CTAs'; each of the two polls its partner's lines from the
 receive bank as well and reduces them alike, so it holds the whole reduced
-row and normalizes its own half with no hand-off. The norm is AITER
+row and normalizes its own half with no hand-off. Past 42 rows the shares
+outnumber the grid's CTAs: CTA ``b`` also takes the shared rows' shares
+``b + k grid`` (``tail_rounds``), gathering all its shares' lines before
+pushing any, and publishes its flag once all are reduced. The norm is AITER
 ``rmsnorm2d_fwd``'s gfx1250 kernel's arithmetic: its 256-thread reduction
 order (a thread's two 8-element runs 256 apart, the waves' butterflies, then
 the eight wave sums pairwise), the mean as the sum times ``v_rcp`` of the
@@ -36,7 +39,7 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T
 
-from atom.models.kimi_k3.mono.config import HIDDEN, LATENT, TOPK
+from atom.models.kimi_k3.mono.config import HIDDEN, LATENT, MAX_ROWS, TOPK
 from atom.models.kimi_k3.mono.kernels.stages import fresh_prefetch_gfx1250 as fresh
 from atom.models.kimi_k3.mono.kernels.stages import gemv_gfx1250
 from atom.models.kimi_k3.mono.kernels.stages import gemv_tdm_gfx1250 as gemv_tdm
@@ -112,21 +115,33 @@ TAIL_ABI = KernelAbi(
 
 
 def tail_ar_ctas(rows: int) -> int:
+    """The all-reduce's shares, 256 lines each: a CTA's, or past
+    ``tail_line_rows()`` rows a CTA's in each of ``tail_rounds`` rounds."""
     return allreduce7_lines(rows) // THREADS
 
 
-def tail_max_rows() -> int:
+def tail_line_rows() -> int:
+    """The widest whose all-reduce takes a line a thread."""
     rows = 1
     while tail_ar_ctas(rows + 1) <= MAX_CTAS:
         rows += 1
     return rows
 
 
+def tail_max_rows() -> int:
+    return MAX_ROWS
+
+
 def tail_grid(rows: int) -> int:
-    """The finalize's PAIRS CTAs, or the all-reduce's where more, in whole
-    TDM clusters."""
-    ctas = max(PAIRS, tail_ar_ctas(rows))
+    """The finalize's PAIRS CTAs, or the all-reduce's where more (at most
+    MAX_CTAS), in whole TDM clusters."""
+    ctas = max(PAIRS, min(tail_ar_ctas(rows), MAX_CTAS))
     return -(-ctas // TDM_CLUSTER) * TDM_CLUSTER
+
+
+def tail_rounds(rows: int) -> int:
+    """All-reduce shares a CTA: share ``b + k grid`` its round ``k``'s."""
+    return -(-tail_ar_ctas(rows) // tail_grid(rows))
 
 
 def tail_flag_words(profile: bool = False) -> int:
@@ -364,9 +379,21 @@ def _ar_push(c):
     pushed to every rank; returns a routed line's norm weights. With
     ``identity`` routes, route ``k`` of token ``t`` is row ``t * TOPK + k``
     of ``grouped`` (the fused MoE's), its gathers issued at once."""
+    values, gains = _ar_gather(c)
+    # every thread has its words before any pushes: a CU with remote stores
+    # in flight holds back the gathers' loads behind them
+    gpu.barrier()
+    if const_expr(c["profile"]):
+        _stamp(c["flags"], c["bid"], c["tid"], 5)
+    _ar_send(c, values)
+    return gains
+
+
+@traced
+def _ar_gather(c):
+    """``_ar_push``'s line values and norm weights, ``c["bid"]`` the share."""
     tid, bid = c["tid"], c["bid"]
     routes = c["routes"]
-    live = bid < c["ar_ctas"]
     routed = bid < 2 * c["rows"]
     line = bid * THREADS + tid
     token = bid // 2
@@ -427,13 +454,16 @@ def _ar_push(c):
         v0, v1, v2, v3, v4, v5, v6 = _seven(
             c["local"], fx.min(line, c["lines"] - 1) * LINE7_ELEMENTS, _load_cm(c)
         )
-    # every thread has its words before any pushes: a CU with remote stores
-    # in flight holds back the gathers' loads behind them
-    gpu.barrier()
-    if const_expr(c["profile"]):
-        _stamp(c["flags"], bid, tid, 5)
+    return [v0, v1, v2, v3, v4, v5, v6], [g0, g1, g2, g3, g4, g5, g6]
+
+
+@traced
+def _ar_send(c, values):
+    """``_ar_push``'s line of share ``c["bid"]``, if one, to every rank."""
+    tid, bid = c["tid"], c["bid"]
+    live = bid < c["ar_ctas"]
+    line = bid * THREADS + tid
     if live:
-        values = [v0, v1, v2, v3, v4, v5, v6]
         words = [_pack(values[2 * w], values[2 * w + 1]) for w in range(3)]
         words.append(
             (_pack(values[6], fx.Float32(0.0)) & fx.Int32(0xFFFF)) | (c["tag"] << 16)
@@ -442,7 +472,6 @@ def _ar_push(c):
         at = fx.Int64(c["bank"] + (c["rank"] * c["lines"] + line) * LINE_WORDS) * 4
         for base in c["bases"]:
             _store_line_sys(base + at, out)
-    return [g0, g1, g2, g3, g4, g5, g6]
 
 
 @traced
@@ -459,6 +488,37 @@ def _ar_finish(c, gains):
         gpu.barrier()
         if tid == 0:
             st_dev(c["epoch"], c["flags"], bid)
+
+
+@traced
+def _ar_rounds(c, grid, rounds):
+    """``_ar_push`` then ``_ar_finish`` of shares ``bid + k grid``, ``k <
+    rounds``: every share's lines gathered, then all pushed, then each
+    reduced; the flag once all are. Past round 0 the shares are shared
+    rows'."""
+    tid, bid = c["tid"], c["bid"]
+    views = [c] + [{**c, "bid": bid + k * grid} for k in range(1, rounds)]
+    gathered = [_ar_gather(v) for v in views]
+    gpu.barrier()
+    for v, (values, _) in zip(views, gathered):
+        _ar_send(v, values)
+    if bid < 2 * c["rows"]:
+        _routed_finish(c, bid * THREADS + tid, gathered[0][1])
+    elif bid < c["ar_ctas"]:
+        _shared_finish(c, bid * THREADS + tid)
+    for k in range_constexpr(1, rounds):
+        _ar_share_finish(views[k])
+    if bid < c["ar_ctas"]:
+        rocdl.s_wait_storecnt(0)
+        gpu.barrier()
+        if tid == 0:
+            st_dev(c["epoch"], c["flags"], bid)
+
+
+@traced
+def _ar_share_finish(c):
+    if c["bid"] < c["ar_ctas"]:
+        _shared_finish(c, c["bid"] * THREADS + c["tid"])
 
 
 @traced
@@ -534,11 +594,14 @@ def build_k2_tail(
     STAMPS a CTA: start, all-reduce done, flags seen, GEMV done, end, lines
     gathered, routed lines polled, rstd."""
     ar_ctas = tail_ar_ctas(rows)
-    if rows < 1 or ar_ctas > MAX_CTAS:
-        raise ValueError(
-            f"the K2 tail takes a line a thread up to {tail_max_rows()} rows"
-        )
+    if not 1 <= rows <= tail_max_rows():
+        raise ValueError(f"the K2 tail takes 1..{tail_max_rows()} rows, got {rows}")
     grid = tail_grid(rows)
+    rounds = tail_rounds(rows)
+    # every routed share in round 0, its row's partner on a CTA of its own
+    assert 2 * rows <= grid
+    if profile and rounds > 1:
+        raise ValueError("a profile K2 tail takes a share a CTA")
     layout = tail_layout(rows, depth, tokens)
     lines = allreduce7_lines(rows)
     bank_words = tp * lines * LINE_WORDS
@@ -640,14 +703,17 @@ def build_k2_tail(
         def prologue():
             if const_expr(fused is not None):
                 fused["wait_inputs"]()
-            _ar_finish(c, _ar_push(c))
+            if const_expr(rounds == 1):
+                _ar_finish(c, _ar_push(c))
+            else:
+                _ar_rounds(c, grid, rounds)
             _store_epochs(epochs, bid, tid, grid, epoch)
             if const_expr(profile):
                 _stamp(flags, bid, tid, 1)
             # Every reader of what the flags publish reads at device scope:
             # no acquire fence (its SCOPE_DEV cache invalidate, one a CTA,
             # held the last CTAs' GEMVs back by microseconds).
-            _wait_flags(flags, tid, ar_ctas, epoch)
+            _wait_flags(flags, tid, min(ar_ctas, grid), epoch)
             gpu.barrier()
             if const_expr(profile):
                 _stamp(flags, bid, tid, 2)
