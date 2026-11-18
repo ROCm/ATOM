@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
-"""Eager native-collective transition, contract 1. No graph or collective ownership.
+"""Native-collective transition, contract 1, eager or whole request graph.
 
-A recipe registers both ends under one owner. The host agrees once before the
-forward and pins the callbacks for that forward. ATOM still executes the native
-combine and owns all mHC/cache state. No Python handle crosses the model ABI.
+One owner registers both phases. A capture transaction resolves and agrees on the
+route in the bucket warmup, before the current stream enters capture. Recording
+reuses that decision; replay executes only captured GPU work. The native combine,
+mHC, and cache ownership do not change. No Python handle crosses the model ABI.
 """
 
 from contextlib import contextmanager
@@ -31,9 +32,32 @@ class _Step:
     pending: dict
     completed: set
     identity: bool = False
+    bucket: int | None = None
+
+
+@dataclass
+class _Capture:
+    rows: int
+    prepared: bool = False
+    route: tuple | None = None
+    # Keep the table object alive; a new arm/plan always publishes a new dict.
+    table: object = None
 
 
 _step = ContextVar("atom_v41_transition_step", default=None)
+_capture = ContextVar("atom_v41_transition_capture", default=None)
+
+
+@contextmanager
+def capture_transaction(rows):
+    """Scope exactly one request bucket's warmup and graph record."""
+    if _capture.get() is not None:
+        raise RuntimeError("nested transition capture transaction")
+    prior = _capture.set(_Capture(rows))
+    try:
+        yield
+    finally:
+        _capture.reset(prior)
 
 
 def register_window(*, window, contract, owner, pairs, begin, end, graph="eager",
@@ -45,7 +69,7 @@ def register_window(*, window, contract, owner, pairs, begin, end, graph="eager"
 
     if window != WINDOW:
         refuse("unknown-window")
-    if (graph, collectives, tuple(owns_between)) != ("eager", "native", ()):
+    if graph not in host.GRAPHS or collectives != "native" or tuple(owns_between):
         refuse("window-ownership-refused")
     if not callable(begin) or not callable(end):
         refuse("not-callable")
@@ -57,13 +81,30 @@ def register_window(*, window, contract, owner, pairs, begin, end, graph="eager"
                          impl=Phases(tuple(sorted(pairs)), begin, end), requires_api=requires_api)
 
 
+def _agree_route(host, eligible, rows, agree, bucket):
+    routes = host._routes(SEAM, bucket is not None, bucket)
+    route = routes[0] if len(routes) == 1 else None
+    arm = host._arm
+    phases = route.impl if route is not None else None
+    token = None
+    if (isinstance(phases, Phases) and rows > 0
+            and (bucket is None or route.graph == "capture_safe") and eligible(phases.pairs)):
+        token = (host._requested, arm, route.owner, phases.pairs, int(rows))
+    strict = arm != "native" and bool(routes) and host._on_decline == "error"
+    vote = (token, strict)
+    votes = tuple(agree(vote))
+    if token is not None and votes and all(v == vote for v in votes):
+        return route.owner, phases, arm == "identity"
+    why = "rank-plan-mismatch" if any(v and v[0] is not None for v in votes) else "pair-declined"
+    host._record(host.Decision(SEAM, "native", why, captured=bucket is not None, bucket=bucket))
+    if any(v and v[1] for v in votes):
+        raise host.PluginDeclined(f"{WINDOW}: {why}")
+    return None
+
+
 @contextmanager
 def scope(*, eligible, rows, agree):
-    """Entry fence: `agree` returns one candidate tuple per member of the TP group.
-
-    `eligible` checks *all* pairs. If any rank cannot run, both phases stay native.
-    Do not catch execution errors: per-rank retries would duplicate native effects.
-    """
+    """Pin one phase pair (or a whole native fallback) before native work starts."""
     from atom import plugin_host as host
 
     if _step.get() is not None:
@@ -71,33 +112,33 @@ def scope(*, eligible, rows, agree):
     if torch.compiler.is_compiling():
         yield
         return
-    captured, _ = host._graph_state()
-    if captured or host._stream_capturing():
+    captured, bucket = host._graph_state()
+    recording = host._stream_capturing()
+    txn = _capture.get()
+    if captured or recording:
+        if txn is None:
+            host._record(host.Decision(SEAM, "native", "no-capture-transaction", captured=True, bucket=bucket))
+            yield
+            return
+        if rows != txn.rows or (bucket is not None and bucket != rows):
+            raise host.PluginContractError(f"{WINDOW}: capture bucket changed")
+        if not txn.prepared:
+            if recording:
+                raise host.PluginContractError(f"{WINDOW}: capture requires a warmup vote")
+            txn.route = _agree_route(host, eligible, rows, agree, rows)
+            txn.table = host._active
+            txn.prepared = True
+        if txn.table is not host._active:
+            raise host.PluginContractError(f"{WINDOW}: plan changed between warmup and record")
+        chosen, bucket = txn.route, rows
+    else:
+        chosen = _agree_route(host, eligible, rows, agree, None)
+        bucket = None
+    if chosen is None:
         yield
         return
-    routes = host._routes(SEAM, False, None)
-    route = routes[0] if len(routes) == 1 else None
-    arm = host._arm
-    plan_id = host._requested
-    phases = route.impl if route is not None else None
-    token = None
-    if isinstance(phases, Phases) and eligible(phases.pairs) and rows > 0:
-        token = (plan_id, arm, route.owner, phases.pairs, int(rows))
-    strict = arm != "native" and bool(routes) and host._on_decline == "error"
-    vote = (token, strict)
-    votes = tuple(agree(vote))
-    step = None
-    if token is not None and votes and all(v == vote for v in votes):
-        step = _Step(route.owner, phases, {}, set(), identity=arm == "identity")
-    if step is None:
-        why = "rank-plan-mismatch" if any(v and v[0] is not None for v in votes) else "pair-declined"
-        host._record(host.Decision(SEAM, "native", why))
-        # Strict is also a group decision. One rank having a strict recipe and
-        # a peer having none must not put only the latter inside native RCCL.
-        if any(v and v[1] for v in votes):
-            raise host.PluginDeclined(f"{WINDOW}: {why}")
-        yield
-        return
+    owner, phases, identity = chosen
+    step = _Step(owner, phases, {}, set(), identity, bucket)
     saved = _step.set(step)
     try:
         yield
@@ -132,7 +173,8 @@ def begin(layer, routed, shared):
             not _compatible(out[0], routed) or not _compatible(out[1], shared)):
         raise host.PluginContractError(f"{WINDOW}: begin changed native combine contract")
     step.pending[pair] = handle
-    host._record(host.Decision(SEAM + ".begin", "plugin", "identity" if step.identity else "selected", step.owner))
+    host._record(host.Decision(SEAM + ".begin", "plugin", "identity" if step.identity else "selected",
+                               step.owner, captured=step.bucket is not None, bucket=step.bucket))
     return out
 
 
@@ -160,5 +202,6 @@ def end(layer, project, hidden, scale, output_sizes):
             or t.shape != (*hidden.shape[:-1], size) for t, size in zip(out, sizes)):
         raise host.PluginContractError(f"{WINDOW}: end must return two projected tensors")
     step.completed.add(pair)
-    host._record(host.Decision(SEAM + ".end", "plugin", "identity" if step.identity else "selected", step.owner))
+    host._record(host.Decision(SEAM + ".end", "plugin", "identity" if step.identity else "selected",
+                               step.owner, captured=step.bucket is not None, bucket=step.bucket))
     return out

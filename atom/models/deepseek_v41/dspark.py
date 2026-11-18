@@ -11,7 +11,9 @@ from aiter.tuned_gemm import tgemm
 from torch import nn
 
 from atom import plugin_host
+from atom.config import get_current_atom_config
 from atom.model_loader.weight_names import WeightsMapper
+from atom.utils.region_graph import ReqGraph
 from atom.model_ops.blockscale import (
     native_quant_linear,
     quantize_fp8,
@@ -382,10 +384,50 @@ class DeepseekV41DSpark(DSparkDraftModel):
         if main_proj.runs_bf16:
             return main_proj(self.concat_taps(taps).unsqueeze(0))
         tokens = taps.shape[0] if isinstance(taps, torch.Tensor) else taps[0].shape[0]
-        x, x_scale = self._ctx_seam(taps, None, tokens)
+        if torch.compiler.is_compiling() or not plugin_host.has_capture_owner(
+            "v41.draft.ctx", tokens, explicit=True
+        ):
+            x, x_scale = self._ctx_seam(taps, None, tokens)
+        else:
+            x, x_scale = self._capture_context_input(taps, tokens)
         return main_proj(
             x.unsqueeze(0), x_scale=None if x_scale is None else x_scale.unsqueeze(0)
         )
+
+    def _capture_context_input(self, taps, rows):
+        """Record only tap packing; position-dependent cache writes stay native."""
+        if get_current_atom_config().enforce_eager or rows <= 0:
+            return self._ctx_seam(taps, None, rows)
+        if plugin_host._stream_capturing():
+            with plugin_host.capture_bucket(rows):
+                return self._ctx_seam(taps, None, rows)
+
+        # The runner consumes returned values immediately on its stream. This
+        # local graph has no collectives or cache side effects. Flatten the list
+        # so ReqGraph owns a fresh fixed-address staging tensor for each tap.
+        flat = (taps,) if isinstance(taps, torch.Tensor) else tuple(taps)
+        key = (rows, tuple((t.dtype, t.device, t.shape) for t in flat))
+        graph = getattr(self, "_ctx_graph", None)
+        if graph is None:
+            graph = self._ctx_graph = ReqGraph()
+        if graph.has(key):
+            return graph.replay(flat, key=key)
+
+        def prepare(*inputs):
+            values = inputs[0] if isinstance(taps, torch.Tensor) else list(inputs)
+            return self._ctx_seam(values, None, rows)
+
+        stream = getattr(self, "_ctx_record_stream", None)
+        if stream is None:
+            stream = self._ctx_record_stream = torch.cuda.Stream(device=flat[0].device)
+        main = torch.cuda.current_stream(flat[0].device)
+        stream.wait_stream(main)
+        with torch.cuda.stream(stream), plugin_host.capture_bucket(rows):
+            prepare(*flat)  # Pay JIT and prepare the capture route outside recording.
+            graph.record(prepare, flat, key=key)
+            result = graph.replay(flat, key=key)
+        main.wait_stream(stream)
+        return result
 
     @staticmethod
     def _concat_taps(taps, rows, running_tokens):

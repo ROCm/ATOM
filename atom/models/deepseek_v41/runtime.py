@@ -355,17 +355,16 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
         return SinglePassHCState(*_batched(self.late(*_rows_first(state.fields()))))
 
     def _transition_forward(self, input_ids, positions, inputs_embeds):
-        """Only the unsegmented, non-TBO, pure-TP4 eager decode fixture is enabled."""
+        """Non-TBO TP4, eager or full-forward graph with the Python backbone."""
         from aiter.dist.parallel_state import get_tp_group
 
         cfg = get_current_atom_config()
-        if (not cfg.enforce_eager or cfg.tensor_parallel_size != 4
+        if (cfg.compilation_config.level != 0 or cfg.tensor_parallel_size != 4
                 or cfg.parallel_config.data_parallel_size != 1
                 or cfg.enable_dp_attention or cfg.enable_expert_parallel or cfg.enable_tbo
                 or cfg.prefill_context_parallel_size != 1
                 or cfg.decode_context_parallel_size != 1
-                or cfg.pipeline_parallel_size != 1
-                or plugin_host._stream_capturing()):
+                or cfg.pipeline_parallel_size != 1):
             return self.backbone(input_ids, positions, inputs_embeds)
         forward = get_forward_context()
         group = get_tp_group()
@@ -374,8 +373,12 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
 
         def eligible(pairs):
             ctx = forward.context
-            if (ctx.is_prefill or ctx.scheduled_tokens != input_ids.numel()
-                    or plugin_host._routes("v41.block.ffn", False, None)):
+            captured, bucket = plugin_host._graph_state()
+            # Capture routes by padded capacity; it cannot specialize on
+            # the scheduled row count of a future replay. Native kernels
+            # retain their device-side valid-row handling.
+            if (ctx.is_prefill or (not captured and ctx.scheduled_tokens != input_ids.numel())
+                    or plugin_host._routes("v41.block.ffn", captured, bucket)):
                 return False
             for src, dst in pairs:
                 if dst >= len(self.layers) or self.layers[dst].engram is not None:

@@ -141,7 +141,7 @@ def test_real_graph_capture_is_per_arm_and_replay_does_not_redispatch(install, m
            replay_steps=4, replay_redispatch=0, hip=torch.version.hip, correct=True)
 
 
-def install_pair(install, *, decline="error", bad=False):
+def install_pair(install, *, decline="error", bad=False, mode="eager", graph="eager", marker=None):
     def provider(h):
         def begin(x, shared, *, handle):
             handle["shape"] = x.shape
@@ -149,12 +149,14 @@ def install_pair(install, *, decline="error", bad=False):
 
         def end(hidden, scale, *, project, output_sizes, handle):
             assert hidden.shape == handle["shape"]
+            if marker is not None:
+                marker.fill_(11)
             y, k = project(hidden, scale)
             return (y, k[:, :-1]) if bad else (y.clone(), k.clone())
 
         h.register_window(window=trans.WINDOW, contract=1, owner=OWNER,
-                          pairs=[(5, 6)], begin=begin, end=end)
-    p = plan(trans.SEAM, on_decline=decline)
+                          pairs=[(5, 6)], begin=begin, end=end, graph=graph)
+    p = plan(trans.SEAM, on_decline=decline, mode=mode)
     install(p, provider)
     return p.plan_id
 
@@ -200,9 +202,7 @@ def test_window_strict_peer_refusal_stops_even_rank_without_active_route(install
     assert trans._step.get() is None
 
 
-def test_window_rejects_capture_recipe_and_contract_failure_cleans_scope(install):
-    with pytest.raises(recipes.RecipeRefused, match="recipe-window-conflict"):
-        plan(trans.SEAM, mode="capture")
+def test_window_contract_failure_cleans_scope(install):
     install_pair(install, bad=True)
     x = torch.ones(4, 8)
     with pytest.raises(host.PluginContractError, match="two projected"):
@@ -210,6 +210,57 @@ def test_window_rejects_capture_recipe_and_contract_failure_cleans_scope(install
     assert trans._step.get() is None
     host.set_arm("native")
     pair_forward(x, None)
+
+
+def test_transition_capture_recipe_refuses_unsupported_runtime(monkeypatch):
+    p = plan(trans.SEAM, mode="capture")
+    monkeypatch.setenv("ATOM_V41_TRANSITION_AB", "1")
+    cfg = types.SimpleNamespace(tensor_parallel_size=4, compilation_config=types.SimpleNamespace(
+        level=0, cudagraph_mode="FULL"))
+    recipes.check_runtime(p, cfg)
+    cfg.compilation_config.cudagraph_mode = "TR_HYBRID"
+    with pytest.raises(recipes.RecipeRefused, match="recipe-window-topology"):
+        recipes.check_runtime(p, cfg)
+    cfg.compilation_config.cudagraph_mode = "FULL"
+    cfg.enable_dp_attention = True
+    with pytest.raises(recipes.RecipeRefused, match="recipe-window-topology"):
+        recipes.check_runtime(p, cfg)
+
+
+def test_capture_window_agrees_once_and_detects_stale_plan(install, monkeypatch):
+    install_pair(install, mode="capture", graph="capture_safe")
+    monkeypatch.setattr(host, "_graph_state", lambda: (True, 4))
+    monkeypatch.setattr(host, "_stream_capturing", lambda: False)
+    x = torch.ones(4, 8)
+    votes = []
+
+    def agree(vote):
+        votes.append(vote)
+        return [vote] * 4
+
+    with trans.capture_transaction(4):
+        warmup = pair_forward(x, None, agree=agree)
+        monkeypatch.setattr(host, "_stream_capturing", lambda: True)
+        captured = pair_forward(x, None, agree=agree)
+        assert all(torch.equal(a, b) for a, b in zip(warmup, captured))
+        assert host.last_decision().captured and host.last_decision().bucket == 4
+        assert len(votes) == 1
+        host.set_arm("native")
+        with pytest.raises(host.PluginContractError, match="plan changed"):
+            pair_forward(x, None, agree=agree)
+    assert len(votes) == 1
+    with trans.capture_transaction(4), pytest.raises(host.PluginContractError, match="requires a warmup vote"):
+        pair_forward(x, None, agree=agree)
+
+
+def test_capture_window_eager_only_provider_falls_back_as_pair(install, monkeypatch):
+    install_pair(install, mode="capture", graph="eager", decline="native")
+    monkeypatch.setattr(host, "_graph_state", lambda: (True, 4))
+    x = torch.ones(4, 8)
+    with trans.capture_transaction(4):
+        pair_forward(x, x)
+    decision = host.last_decision()
+    assert decision.seam == trans.SEAM and decision.route == "native" and decision.captured
 
 
 @pytest.mark.skipif(os.getenv("ATOM_TOGETHER_WORLD") != "4", reason="requires torchrun on four GPUs")
@@ -257,6 +308,81 @@ def test_real_tp4_window_same_outputs_and_one_collective(install):
     finally:
         if cpu_group is not None:
             dist.destroy_process_group(cpu_group)
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(os.getenv("ATOM_TOGETHER_WORLD") != "4", reason="requires torchrun on four GPUs")
+def test_real_tp4_window_capture(install, monkeypatch):
+    from datetime import timedelta
+    import torch.distributed as dist
+
+    rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(rank)
+    dist.init_process_group("nccl", timeout=timedelta(seconds=75))
+    cpu = dist.new_group(backend="gloo", timeout=timedelta(seconds=50))
+    graphs = []
+    try:
+        marker = torch.zeros(1, device="cuda", dtype=torch.int32)
+        pin = install_pair(install, mode="capture", graph="capture_safe", marker=marker)
+        monkeypatch.setattr(host, "_graph_state", lambda: (True, 4))
+        static = torch.ones(4, 8, device="cuda")
+        p = torch.arange(32, device="cuda", dtype=torch.float32).reshape(4, 8)
+        votes = 0
+
+        def agreement(vote):
+            nonlocal votes
+            assert not torch.cuda.is_current_stream_capturing()
+            seen = [None] * 4
+            dist.all_gather_object(seen, vote, group=cpu)
+            votes += 1
+            return seen
+
+        def collective(x):
+            out = x.clone()
+            dist.all_reduce(out)
+            return out
+
+        captures = {}
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for arm in ("native", "plugin"):
+                host.set_arm(arm)
+                g = torch.cuda.CUDAGraph()
+                graphs.append(g)
+                with trans.capture_transaction(4):
+                    pair_forward(static, None, agree=agreement, collective=collective)
+                    # Keep the watchdog on other threads from invalidating the graph.
+                    with torch.cuda.graph(g, stream=stream, capture_error_mode="thread_local"):
+                        out = pair_forward(static, None, agree=agreement, collective=collective)
+                captures[arm] = g, out
+        torch.cuda.current_stream().wait_stream(stream)
+        assert votes == 2
+        assert host.route_proof(trans.SEAM + ".begin", OWNER, 2) == 2
+        assert host.route_proof(trans.SEAM + ".end", OWNER, 2) == 2
+        hits = host.decision_counts()
+        host.set_arm("native")
+        for delta in (1, 7):
+            static.copy_(p + rank + delta)
+            expected = 4 * (p + delta) + 6 + 3
+            for arm, (g, (q, kv, state)) in captures.items():
+                marker.zero_()
+                g.replay()
+                assert torch.equal(state, expected)
+                assert torch.equal(q, expected[:, :3] * 2)
+                assert torch.equal(kv, expected[:, 3:] + 1)
+                assert marker.item() == (11 if arm == "plugin" else 0)
+        assert votes == 2 and host.decision_counts() == hits
+        record("real-tp4-window-capture", plan=pin, rank=rank, host_votes=votes,
+               recorded_arms=["native", "plugin"], both_phases_captured=True,
+               replay_steps=4, replay_redispatch=0, replay_device_marker=True)
+    finally:
+        # A graph owns references to its RCCL communicator. Release the graph
+        # first or ProcessGroupNCCL shutdown can wait for its own live graph.
+        torch.cuda.synchronize()
+        for graph in graphs:
+            graph.reset()
+        dist.destroy_process_group(cpu)
         dist.destroy_process_group()
 
 

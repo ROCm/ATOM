@@ -30,7 +30,7 @@ from aiter.dist.parallel_state import (
 )
 from torch.profiler import record_function
 
-from atom import plugin_host, structured_output
+from atom import plugin_host, plugin_transition, structured_output
 from atom.config import Config, set_current_atom_config
 from atom.distributed.group_agreement import agree_kv_budget, group_min
 from atom.distributed.pcp_utils import (
@@ -157,6 +157,7 @@ from atom.utils.forward_context import (
     set_kv_cache_data,
 )
 from atom.utils.gc_utils import freeze_gc_heap
+from atom.utils.graph_holders import release_registered_graphs
 from atom.utils.h2d import h2d_producer
 from atom.utils.region_graph import ReqGraph, TokenGraph
 from atom.utils.selector import attn_family, get_attn_backend, has_mla_indexer
@@ -4253,7 +4254,17 @@ class ModelRunner:
 
         return build_capture, supports_dynamic_q_len
 
-    def _capture_request_bucket(
+    def _capture_request_bucket(self, bs: int, max_q_len: int, **kwargs) -> bool:
+        # A segmented token graph cannot transport a transition handle across
+        # its eager regions. Only a single whole request capture has a ticket.
+        scope = (
+            nullcontext() if kwargs["tr_hybrid"]
+            else plugin_transition.capture_transaction(bs * max_q_len)
+        )
+        with scope:
+            return self._capture_request_bucket_impl(bs, max_q_len, **kwargs)
+
+    def _capture_request_bucket_impl(
         self,
         bs: int,
         max_q_len: int,
@@ -4700,7 +4711,8 @@ class ModelRunner:
         bs_list = rows_to_bs(rows, full_q_len)
         if not bs_list:
             raise RuntimeError("hot-plug recapture was asked for no rows")
-        ladder = [int(bs) for bs in self.capture_sizes]
+        ladder = getattr(self, "_plugin_graph_ladder", None) or self.capture_sizes
+        ladder = [int(bs) for bs in ladder]
         missing = [bs for bs in bs_list if bs not in ladder]
         if missing:
             raise RuntimeError(
@@ -4920,13 +4932,13 @@ class ModelRunner:
                 plan = source
             report["arm"] = payload.get("arm") or "plugin"
             rows = [int(row) for row in payload.get("rows") or ()]
+            ladder = tuple(bs for bs in (
+                getattr(self, "_plugin_graph_ladder", None) or self.capture_sizes
+            ) if bs > 0)
             if not rows:
-                # No rows named: a plan with capture tables targets those; a
-                # plan that only changes any/eager tables changes every
-                # recorded graph, so recapture the whole ladder.
-                rows = default_capture_rows(
-                    plan, self._hotplug_full_q_len(), self.capture_sizes
-                )
+                # No rows named: capture tables target their buckets; an
+                # any/eager-only plan re-records the original full ladder.
+                rows = default_capture_rows(plan, self._hotplug_full_q_len(), ladder)
             reload_requested = payload.get("reload", False)
             if not isinstance(reload_requested, bool):
                 raise TypeError(
@@ -4996,6 +5008,17 @@ class ModelRunner:
             return abort()
 
         capture = bool(payload.get("capture", True))
+        # Generation is paused. Every holder baked the old route, including
+        # draft and prefill holders outside self.req_graph. Never replay those
+        # after an install, even when the caller chooses eager (capture=false).
+        changes_graphs = not self.enforce_eager and not self.config.disagg_is_decode
+        if changes_graphs:
+            self._plugin_graph_ladder = tuple(ladder)
+            torch.cuda.synchronize()
+            report["graphs_invalidated"] = release_registered_graphs()
+            if not (capture and rows):
+                self.capture_sizes = []
+                self.capture_sizes_np = np.asarray([], dtype=np.int32)
         if capture and not rows:
             # Nothing is recorded (a previous capture failure left every
             # bucket eager), so there is no graph to patch -- the plan is in.
@@ -5008,6 +5031,8 @@ class ModelRunner:
                 report["capture_seconds"] = recaptured["seconds"]
                 report["captured"] = True
             except BaseException as exc:  # noqa: BLE001 - recapture agreed itself
+                self.capture_sizes = []
+                self.capture_sizes_np = np.asarray([], dtype=np.int32)
                 fail(exc)
         elif capture:
             # The plan is installed; there is no decode graph to patch.

@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, fields, replace
@@ -234,8 +235,8 @@ def _parse(document: Mapping[str, Any], *, model_arch: str | None) -> dict[str, 
             raise RecipeRefused("recipe-unknown-seam", seam)
         owners = _names(owners, f"plan.seams[{seam}]")
         if owners and plugin_host.SEAMS[seam].form == "window":
-            if mode != "eager" or len(owners) != 1 or seams.get("v41.block.ffn"):
-                raise RecipeRefused("recipe-window-conflict", "transition needs one eager owner and native FFN")
+            if len(owners) != 1 or seams.get("v41.block.ffn"):
+                raise RecipeRefused("recipe-window-conflict", "transition needs one owner and native FFN")
         if len(set(owners)) != len(owners):
             raise RecipeRefused("recipe-schema", f"{seam}: an owner twice")
         for owner in owners:
@@ -524,6 +525,21 @@ def from_payload(payload: Any) -> RecipeSource | None:
 
 def check_runtime(plan: Plan, config: Any) -> None:
     """``runtime.expect``: the server must be the one the recipe was made for."""
+    if any(isinstance(key, int) and table and table.get("v41.block.transition")
+           for key, table in plan.tables.items()):
+        compile_cfg = getattr(config, "compilation_config", None)
+        mode = str(getattr(compile_cfg, "cudagraph_mode", "")).rsplit(".", 1)[-1]
+        if (os.getenv("ATOM_V41_TRANSITION_AB") != "1" or mode != "FULL"
+                or getattr(compile_cfg, "level", None) != 0
+                or getattr(config, "tensor_parallel_size", None) != 4
+                or getattr(getattr(config, "parallel_config", None), "data_parallel_size", 1) != 1
+                or any(getattr(config, n, 1) != 1 for n in (
+                    "prefill_context_parallel_size", "decode_context_parallel_size", "pipeline_parallel_size"))
+                or any(getattr(config, n, False) for n in (
+                    "enable_dp_attention", "enable_expert_parallel", "enable_tbo",
+                    "enable_decoder_swa_bounded_replay", "enforce_eager"))):
+            raise RecipeRefused("recipe-window-topology",
+                                "capture transition needs opted-in FULL level-0 TP4 without DPA/EP/TBO/replay")
     actual = {
         "level": lambda c: getattr(
             getattr(c, "compilation_config", None), "level", None
