@@ -2,8 +2,8 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Build a rank's model, in the steps ModelRunner takes: the process state
 building needs (``init_model_env``), the model with its weights
-(``get_model``) and its drafter (``load_drafter_from_disk``). They need no
-ModelRunner, so a process that only loads can use them too."""
+(``get_model``) and its drafter (``load_drafter_from_disk``). The first two
+need no ModelRunner, so a process that only loads can use them too."""
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ from atom.distributed.simulated_tp import apply_simulated_tp, reject_simulated_t
 from atom.distributed.ulysses_sp import check_aiter_sp_api, sp_is_enabled
 from atom.model_engine.tp_multinode import managed_store_client
 from atom.model_loader.loader import load_model
+from atom.model_loader.loading_core import rank_tag
 from atom.models.registry import support_model_arch_dict
 from atom.spec_decode.factory import build_drafter
 from atom.utils import resolve_obj_by_qualname
@@ -32,7 +33,8 @@ from atom.utils.distributed.utils import (
 
 logger = logging.getLogger("atom")
 
-# How get_model gets the weights: (config, model class, device) -> model.
+# What get_model calls for the model, loaded or to be filled by its caller:
+# (config, model class, device) -> model.
 ModelLoader = Callable[[Config, type, torch.device], nn.Module]
 
 
@@ -40,6 +42,7 @@ def init_model_env(config: Config, rank: int) -> torch.device:
     """Set up this process for building its rank's model: the current
     config, its device and its parallel groups (their ranks decide what a
     rank loads). Returns the device."""
+    # Read just below (sp_is_enabled) and by model construction.
     set_current_atom_config(config)
     if sp_is_enabled():
         check_aiter_sp_api()
@@ -173,14 +176,14 @@ def load_weights(model: nn.Module, config: Config) -> None:
 
 
 def load_from_disk(
-    config: Config, model_class: type, device: torch.device, tag: str
+    config: Config, model_class: type, device: torch.device, tag: str | None = None
 ) -> nn.Module:
     """The default ModelLoader. ``tag``: how the log names this rank."""
     model = build_model(config, model_class, device)
     t0 = time.perf_counter()
     load_weights(model, config)
     logger.info(
-        f"[{tag}] Model load done: {config.model} "
+        f"[{tag or rank_tag()}] Model load done: {config.model} "
         f"(weights loaded in {time.perf_counter() - t0:.2f}s)"
     )
     return model

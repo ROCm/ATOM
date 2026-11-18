@@ -567,7 +567,8 @@ This means each GPU runs an independent attention computation (no TP AllReduce f
 | `atom/utils/envs.py` | `ATOM_DP_*` environment variables (lazy evaluation) |
 | `atom/model_engine/engine_core.py` | `EngineCore`, `DPEngineCoreProc` (DP busy loop, sync, dummy batches) |
 | `atom/model_engine/engine_core_mgr.py` | `CoreManager` (multi-process DP orchestration, ZMQ IPC) |
-| `atom/model_engine/model_runner.py` | `ModelRunner` (`init_dist_env`, device assignment, `DPMetadata` usage) |
+| `atom/model_engine/model_setup.py` | `init_model_env` (`init_dist_env`, device assignment) |
+| `atom/model_engine/model_runner.py` | `ModelRunner` (`DPMetadata` usage) |
 | `atom/model_engine/arg_utils.py` | `EngineArgs` CLI argument definitions |
 | `atom/utils/distributed/utils.py` | `stateless_init_torch_distributed_process_group()` (Gloo PG creation) |
 | `atom/utils/forward_context.py` | `DPMetadata`, `ForwardContext` (per-step DP token metadata) |

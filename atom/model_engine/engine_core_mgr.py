@@ -649,7 +649,7 @@ class CoreManager:
 
             try:
                 # No visible-device mask is published here. Device placement is
-                # owned by ModelRunner._setup_device_and_distributed, which
+                # owned by init_model_env (model_setup.py), which
                 # selects an ABSOLUTE cuda:{local_dp_rank*tp_size+rank}. Masking
                 # the child as well would renumber its devices and compound the
                 # two offsets -- see set_device_control_env_var's docstring.
