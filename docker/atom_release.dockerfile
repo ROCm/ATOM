@@ -525,7 +525,8 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
         echo "========== Skipped Mooncake (INSTALL_MOONCAKE=0) =========="; \
     fi
 
-# [MC 2/4] Install dependencies (system packages + RDMA + Go + submodules)
+# [MC 2/4] Install dependencies (system packages + RDMA + submodules; the Go
+# that dependencies.sh installs is replaced by the pinned Go in [MC 3/4])
 ENV PATH="/usr/local/go/bin:${PATH}"
 RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
         echo "========== [MC 2/4] Install Mooncake dependencies =========="; \
@@ -536,9 +537,6 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
             openssh-server openmpi-common && \
         cd /app/mooncake && bash dependencies.sh -y && \
         rm -rf /usr/local/go && \
-        wget -q https://go.dev/dl/go1.22.2.linux-amd64.tar.gz && \
-        tar -C /usr/local -xzf go1.22.2.linux-amd64.tar.gz && \
-        rm go1.22.2.linux-amd64.tar.gz && \
         rm -rf /var/lib/apt/lists/*; \
     fi
 
@@ -571,7 +569,12 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
 # HIP hipify copies tests/*.cpp into the build tree but not headers such as
 # rdma_test_peers.h, so BUILD_UNIT_TESTS=ON fails. Upstream ROCm CI also sets
 # BUILD_UNIT_TESTS=OFF; examples are unused in this image.
+# Go builds the etcd wrapper (USE_ETCD=ON). The toolchain stays installed for
+# in-container rebuilds; the module and build caches it fills here are removed
+# in this same RUN, so a rebuild only re-downloads modules.
 RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
+        { wget -q -O /tmp/go.tar.gz https://go.dev/dl/go1.22.2.linux-amd64.tar.gz \
+          && tar -C /usr/local -xzf /tmp/go.tar.gz && rm -f /tmp/go.tar.gz; } || exit 1; \
         MC_WITH_STORE=OFF; \
         if [ "${INSTALL_MOONCAKE_STORE}" = "1" ]; then MC_WITH_STORE=ON; fi; \
         echo "========== [MC 3/4] Build and install Mooncake (USE_HIP=ON USE_HIP_DMABUF=${USE_HIP_DMABUF} ENABLE_MULTI_PROTOCOL=ON WITH_STORE=${MC_WITH_STORE}) =========="; \
@@ -617,7 +620,8 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
                || { echo "ERROR: the mooncake.store Python module does not import"; exit 1; }; }; \
            fi \
         && echo "--- Clean up build artifacts ---" \
-        && rm -rf /app/mooncake/build /app/mooncake/.git; \
+        && rm -rf /app/mooncake/build /app/mooncake/.git \
+                  /root/go /root/.cache/go-build; \
     fi
 
 # Default to ibv_reg_mr; set MOONCAKE_DISABLE_HIP_DMABUF=0 at runtime to opt in
@@ -671,6 +675,11 @@ RUN pip install rocm-trace-lite && \
 # ulimit: the atomesh cargo build spawns one rustc per crate in parallel and
 # runs out of file descriptors on the docker default nofile limit (os error 24,
 # "could not execute process rustc (never executed)"); raise it for this step.
+# Of the cargo output only target/release/atomesh (default binary path of the
+# PD scripts) and target/release/libmesh.so (package data, loaded by
+# atom.entrypoints.atomesh) are used; the rest of target/ and the downloaded
+# crates in ~/.cargo/registry are build-only. The Rust toolchain stays, so a
+# rebuild in the container only re-downloads crates.
 ARG CACHEBUST=1
 # Optional Cargo features; ext-proc is excluded unless explicitly requested.
 ARG ATOM_MESH_FEATURES=""
@@ -678,7 +687,12 @@ RUN git clone $ATOM_REPO /app/ATOM && \
     cd /app/ATOM && \
     git checkout $ATOM_COMMIT && \
     ulimit -n 65536 && \
-    ATOM_MESH_BUILD=1 ATOM_MESH_FEATURES="${ATOM_MESH_FEATURES}" python -m pip install -e .
+    ATOM_MESH_BUILD=1 ATOM_MESH_FEATURES="${ATOM_MESH_FEATURES}" python -m pip install -e . && \
+    cd /app/ATOM/atom/mesh/target && \
+    find . -mindepth 1 -maxdepth 1 ! -name release -exec rm -rf {} + && \
+    find release -mindepth 1 -maxdepth 1 ! -name atomesh ! -name libmesh.so -exec rm -rf {} + && \
+    test -x release/atomesh && \
+    rm -rf /root/.cargo/registry /root/.cargo/git
 RUN pip show atom || true
 
 RUN pip install --no-cache-dir msgpack msgspec quart

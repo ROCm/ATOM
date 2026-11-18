@@ -46,6 +46,9 @@ RUN echo "========== [SGLANG-ATOM 2/6] Build sglang kernel ==========" && \
     AMDGPU_TARGET="${FINAL_AMDGPU_TARGET}" "${VENV_PYTHON}" setup_rocm.py install && \
     "${VENV_PYTHON}" -m pip show sglang-kernel || true
 
+# The editable sglang install compiles its Rust extension and copies it into
+# python/sglang/srt/rust_extensions/; only the linked .so files in
+# rust/target/release are kept, and the crates cargo downloaded are dropped.
 RUN echo "========== [SGLANG-ATOM 3/6] Install SGLang dependencies ==========" && \
     cd /app/sglang/python && \
     rm -f pyproject.toml && \
@@ -93,6 +96,12 @@ RUN echo "========== [SGLANG-ATOM 3/6] Install SGLang dependencies ==========" &
       "packaging>=20.0" \
       "pyyaml>=5.1" \
       "tqdm>=4.60" && \
+    if [ -d /app/sglang/rust/target ]; then \
+      cd /app/sglang/rust/target && \
+      find . -mindepth 1 -maxdepth 1 ! -name release -exec rm -rf {} + && \
+      find release -mindepth 1 -maxdepth 1 ! -name '*.so' -exec rm -rf {} +; \
+    fi && \
+    rm -rf /root/.cargo/registry /root/.cargo/git && \
     "${VENV_PYTHON}" -m pip show sglang torch triton transformers IPython orjson pybase64 petit-kernel wave-lang xgrammar outlines apache-tvm-ffi || true
 
 # Keep SGLang aligned with the Triton that the ATOM base image ships.  SGLang
