@@ -2821,6 +2821,31 @@ models:
               decode_max_num_seqs: 200
               spec_decode_acceptance_length: 4.04
 
+        # Checks the unwritten-failure release: the default 300 s admission deadline at
+        # C280, whose warmup livelocked while decodes held every such failure 60 s.
+        - <<: *m31b_1p2d_store2n_agentx
+          name: m31b-nvfp4-1p2d-pp4-tp4x2-dspark7-mcstore2n-agentx-c280-adm300
+          concurrency: [280]
+          decode:
+            workers: 2
+            tp: 4
+            cudagraph: "[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160,176,192,208,224,240,256,280]"
+          server:
+            common_args:
+              max_num_seqs: 560
+              decode_max_num_seqs: 280
+              spec_decode_acceptance_length: 4.04
+          env:
+            common:
+              <<: *m31b_common_env
+              ATOM_TOKENIZE_CACHE_MB: "2048"
+            prefill:
+              <<: *m31b_mcstore_prefill_env
+              MOONCAKE_STORE_DECODE_OWNERS: "1:400:rdma6;1:400:rdma7"
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":true}
+            decode: *m31b_decode_env
+
         # DSpark4 (InferenceX golden AL 3.19) against DSpark7 at the same concurrency.
         - <<: *m31b_agentx
           name: m31b-nvfp4-1p1d-pp4-tp4-dspark4-mcstore-agentx-c140
