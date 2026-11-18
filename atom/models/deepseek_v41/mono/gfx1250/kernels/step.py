@@ -568,14 +568,38 @@ def target_layer(E, Ly):
         if hx.unlikely(keepA & (isidx == (fx.Int32(0) != fx.Int32(0)))):
             handoff(lc + i64(LY.KV_C), t, True)
         if hx.unlikely(isidx):
-            hx.wait_storecnt0()
-            gpu.barrier()
-            if t == 0:
-                hx.atomic_add(lc + i64(LY.KV_C), 1)
-            if b < NIQC:
-                if t == 0:
-                    hx.wait_count(lc + i64(LY.KV_C), CTAS, 4)
+            if fx.const_expr(Lx["MT"] == 1 and not DRS):   # (the draft launch: no index layers -- the CTA count, as before)
+                # c1 REINDEX (no compressor GEMM): KV_C counts the waves that wrote iq / iw (wave 0 of every CTA, waves 1 / 2
+                # of the iw CTAs: CTAS + 2 x IW_SLICES), each past its own s_wait_storecnt 0 -- no CTA barrier, which waited
+                # for waves 6 / 7's rx_prefill (2.0-2.6 us past the stores' drain, ktrace L24); other layers as before
+                # (compile-time: c1's one M tile -> stage_iq on wave 0 of all CTAS CTAs, stage_iw on waves 1 / 2 of the IW_SLICES
+                # iw CTAs, whatever the context length)
+                KVC_WAVES = CTAS + 2 * IS.IW_SLICES
+                isrxk = (ltab(fp, Ly, "lflags")() & fx.Int64(64)) != fx.Int64(0)
+                if isrxk:
+                    if (w == 0) | ((b < IS.IW_SLICES) & ((w == 1) | (w == 2))):
+                        hx.wait_storecnt0()   # (this wave's iq / iw stores: device-scope exchange stores, complete before its count)
+                        if l == 0:
+                            hx.atomic_add(lc + i64(LY.KV_C), 1)
+                else:
+                    hx.wait_storecnt0()
+                    gpu.barrier()
+                    if t == 0:
+                        hx.atomic_add(lc + i64(LY.KV_C), 1)
+                if b < NIQC:
+                    if t == 0:
+                        hx.wait_count(lc + i64(LY.KV_C), isrxk.select(fx.Int32(KVC_WAVES), fx.Int32(CTAS)), 4)
+                        hx.fence_acquire("agent")   # (the producers' stores are device-scope; acquire before iquant reads them)
+                    gpu.barrier()
+            else:
+                hx.wait_storecnt0()
                 gpu.barrier()
+                if t == 0:
+                    hx.atomic_add(lc + i64(LY.KV_C), 1)
+                if b < NIQC:
+                    if t == 0:
+                        hx.wait_count(lc + i64(LY.KV_C), CTAS, 4)
+                    gpu.barrier()
             IS.stage_iquant(cwith(c, iq=fptr(fp, "iq"), iwp=fptr(fp, "iwp"), iq_out=fptr(fp, "iq_out"),
                                   iqs_out=fptr(fp, "iqs_out"), iw_out=fptr(fp, "iw_out")))
             if b < NIQC:   # (R4) this CTA's query rows out: counted (IQ_DONE)
