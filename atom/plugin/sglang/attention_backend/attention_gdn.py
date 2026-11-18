@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import logging
+from collections import OrderedDict
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -106,9 +107,8 @@ def _ensure_flydsl_policy(state: torch.Tensor):
         return policy
     from atom.model_ops.fla_ops.gdn_flydsl import GDNFlyDSLPolicy, select_policy
 
-    # ReplaySSM addresses the same contiguous checkpoint Triton prefill
-    # writes. FlyDSL's VK view is a different layout; Native keeps both
-    # stages off once the ring is on.
+    # Under ReplaySSM the ring addresses the raw contiguous checkpoint, so
+    # `select_policy` keeps decode (and its VK view) off; prefill still runs.
     policy = select_policy(
         allowed=True,
         replayssm=replayssm_enabled(),
@@ -123,11 +123,14 @@ def _ensure_flydsl_policy(state: torch.Tensor):
     return policy
 
 
-# (lengths, cu_seqlens data_ptr, tensor version) -> schedule.
+# (lengths, cu_seqlens data_ptr, tensor version) -> schedule, oldest first.
 # AITER binds the schedule to that exact offset tensor. Reuse only when the
 # same buffer is unchanged (CUDA-graph replay). A new eager batch rebuilds
 # from the host length list and does not read query_start_loc back to the host.
-_PREFILL_SCHEDULES: dict[tuple, object] = {}
+# Every schedule pins its offset tensor and a fresh eager batch never hits, so
+# keep only the most recent few, like FLA's `tensor_cache`.
+_PREFILL_SCHEDULES: OrderedDict[tuple, object] = OrderedDict()
+_PREFILL_SCHEDULES_MAX = 8
 
 
 def _host_prefill_lengths(forward_batch: Any, num_seqs: int) -> tuple[int, ...] | None:
@@ -181,6 +184,7 @@ def _flydsl_prefill_metadata(
     key = (lengths, int(query_start_loc.data_ptr()), int(query_start_loc._version))
     cached = _PREFILL_SCHEDULES.get(key)
     if cached is not None:
+        _PREFILL_SCHEDULES.move_to_end(key)
         return cached
     if capturing:
         # AITER refuses to build a schedule on the capturing stream. The eager
@@ -191,6 +195,8 @@ def _flydsl_prefill_metadata(
     metadata = build_prefill_metadata(lengths, query_start_loc)
     if metadata is not None:
         _PREFILL_SCHEDULES[key] = metadata
+        while len(_PREFILL_SCHEDULES) > _PREFILL_SCHEDULES_MAX:
+            _PREFILL_SCHEDULES.popitem(last=False)
     return metadata
 
 
@@ -364,22 +370,6 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
                 )
             out = super().forward(mixed_qkv, b, a, core_attn_out, layer_name)
             self._track_mamba_states(forward_batch, mixed_qkv)
-            # Chunked prefill rewrites the checkpoint in place. The ring
-            # cursor has to drop the previous tenant's records or the next
-            # verify folds them on top of that new state.
-            mode = None if forward_batch is None else forward_batch.forward_mode
-            draft_extend = bool(
-                mode is not None
-                and callable(getattr(mode, "is_draft_extend_v2", None))
-                and mode.is_draft_extend_v2()
-            )
-            if (
-                replayssm_enabled()
-                and mode is not None
-                and mode.is_extend()
-                and not draft_extend
-            ):
-                note_full_state_write(self._verify_cache_slots(forward_batch))
             return out
 
         attn_backend = SGLangGDNForwardContext._resolve_attn_backend(forward_batch)
@@ -529,17 +519,6 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
             )
         linear_backend._track_mamba_state_extend(forward_batch, h, ssm_states, metadata)
 
-    def _verify_cache_slots(self, forward_batch: Any) -> torch.Tensor | None:
-        attn_backend = SGLangGDNForwardContext._resolve_attn_backend(forward_batch)
-        if attn_backend is None:
-            return None
-        linear = SGLangGDNForwardContext._linear_attn_backend(attn_backend)
-        metadata = getattr(linear, "forward_metadata", None)
-        indices = getattr(metadata, "mamba_cache_indices", None)
-        if indices is None:
-            return None
-        return indices[: int(forward_batch.batch_size)]
-
     def _verify_replayssm(
         self,
         *,
@@ -557,7 +536,7 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
     ) -> None:
         """Verify the draft window through Native ReplaySSM.
 
-        The live checkpoint is the contiguous pool Triton prefill writes.
+        The live checkpoint is the contiguous pool the prefill writes.
         The kernel appends records and does not publish a per-step SSM
         snapshot; ``update_mamba_state_after_mtp_verify`` advances the cursor
         once the accept length is known, scatters the conv window, and
@@ -1044,11 +1023,17 @@ class SGLangGDNForwardContext:
         fm = getattr(linear_backend, "forward_metadata", None)
         query_start_loc = getattr(fm, "query_start_loc", None)
         idx = getattr(fm, "mamba_cache_indices", None)
+        live_slots = idx
+        # Extend only: SGLang's host sum of extend_seq_lens, i.e. the value of
+        # query_start_loc[-1].
+        num_query_tokens = getattr(fm, "logical_num_tokens", None)
         if query_start_loc is None or idx is None:
             reconstructed = reconstruct_linear_metadata(forward_batch, linear_backend)
             if reconstructed is None:
                 return None
             query_start_loc, idx = reconstructed
+            live_slots = idx
+            num_query_tokens = None
         device = query_start_loc.device
         # Decode cuda-graph: keep Hybrid's static buffers (already pad=-1 on
         # dead rows in ``_replay_metadata``). Cloning here bakes a throwaway
@@ -1104,9 +1089,17 @@ class SGLangGDNForwardContext:
             )
 
         if mode.is_extend():
+            if replayssm_enabled():
+                # Chunked prefill rewrites the checkpoint in place. The ring
+                # cursor, shared by every GDN layer, has to drop the previous
+                # tenant's records once per forward or the next verify folds
+                # them on top of that new state.
+                note_full_state_write(None if live_slots is None else live_slots[:bs])
             # SGLang's seq_lens_sum includes cached prefix tokens for some
             # hybrid batches; GDN only receives the active query tokens.
-            seq_sum = int(query_start_loc[-1].item())
+            if num_query_tokens is None:
+                num_query_tokens = query_start_loc[-1].item()
+            seq_sum = int(num_query_tokens)
             epl = forward_batch.extend_prefix_lens
             has_initial_state = None if epl is None else epl > 0
             nums_dict, batch_ptr, token_chunk_offset_ptr = (
@@ -1114,8 +1107,8 @@ class SGLangGDNForwardContext:
             )
             # GatedDeltaNet's prefill reads these once-per-step fields (#2534)
             # instead of casting per layer. The native builder fills them; a
-            # None here makes the non-FlyDSL prefill (e.g. ReplaySSM under MTP)
-            # and the state write-back fail. Read and write slots are the same.
+            # None here makes the Triton prefill and the state write-back
+            # fail. Read and write slots are the same.
             idx_i64 = idx.long()
             no_initial_state = None if has_initial_state is None else ~has_initial_state
             return GDNAttentionMetadata(

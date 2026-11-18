@@ -36,14 +36,30 @@ def decode_device_supported(device):
     )
 
 
+def replayssm_prefill_device_supported(device):
+    # FlyDSL prefill under ReplaySSM (MTP) has Native GSM8K and TTFT data on
+    # gfx942 only. Other arches keep Triton until they have that run too.
+    return (
+        torch.version.hip is not None
+        and device.type == "cuda"
+        and torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
+        == "gfx942"
+    )
+
+
 def select_policy(*, allowed, replayssm, lossy_decode, state, activation_dtype):
-    # ReplaySSM kernels address a contiguous KV pool. Do not reinterpret it as
-    # VK even when K == V makes the shape identical. Keep both stages original.
-    if not allowed or replayssm:
+    if not allowed:
         return GDNFlyDSLPolicy()
-    prefill_enabled = backend("prefill") != "triton"
+    # Prefill reads the initial state through the pool's strides and hands the
+    # final state back as a logical KV view, so it runs on any pool layout.
+    prefill_enabled = backend("prefill") != "triton" and (
+        not replayssm or replayssm_prefill_device_supported(state.device)
+    )
+    # ReplaySSM kernels address a contiguous KV pool. Do not reinterpret it as
+    # VK even when K == V makes the shape identical; keep decode original.
     decode_enabled = (
-        backend("decode") != "triton"
+        not replayssm
+        and backend("decode") != "triton"
         and not lossy_decode
         and state.ndim == 4
         and state.shape[-2:] == (128, 128)
@@ -219,8 +235,10 @@ def prefill(
 ):
     """Return token-major output, FP32 final KV state and optional BF16 h.
 
-    The default KV snapshot preserves the existing public contract. A caller
-    that writes native FlyDSL checkpoints may request its VK layout instead.
+    The default KV snapshot keeps the public contract -- ``[B, NT, H, K, V]``,
+    one row per chunk boundary -- as a view over the kernel's VK storage, like
+    the final state; consumers address it by its strides. A caller that writes
+    native FlyDSL checkpoints may request the VK tensor itself instead.
     """
     if snapshot_layout not in ("kv", "vk"):
         raise ValueError(f"Unsupported GDN snapshot layout: {snapshot_layout}")
@@ -262,7 +280,7 @@ def prefill(
     )
     snapshots = None
     if keep_intermediate_states:
-        snapshots = h if snapshot_layout == "vk" else h.transpose(-1, -2).contiguous()
+        snapshots = h if snapshot_layout == "vk" else h.transpose(-1, -2)
     return output, ht.transpose(-1, -2), snapshots
 
 

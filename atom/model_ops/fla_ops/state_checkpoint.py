@@ -30,7 +30,7 @@ import triton.language as tl
 
 @triton.jit
 def _copy_checkpoints_kernel(
-    h,  # [1, NT_total, H, K, V] per-chunk states, batch-concatenated
+    h,  # [1, NT_total, H, K, V] per-chunk states, batch-concatenated; KV or VK
     ssm_dst,  # [num_slots, H, K, V] the state pool
     x,  # [total_tokens, D] the conv input, batch-concatenated
     conv_dst,  # [num_slots, D, >= STATE_LEN] the conv state pool
@@ -54,6 +54,7 @@ def _copy_checkpoints_kernel(
     NBLK_SSM: tl.constexpr,  # blocks covering HKV; the grid split point
     K: tl.constexpr,
     V: tl.constexpr,
+    H_VK: tl.constexpr,
     STATE_VK: tl.constexpr = False,
     HAS_H_ROWS: tl.constexpr = False,
 ):
@@ -71,11 +72,20 @@ def _copy_checkpoints_kernel(
         # the end, and `chunk_offsets[row] + T // CHUNK` is the NEXT
         # sequence's first chunk. The final state exists only in the row's
         # runtime slot, which the chunk kernel just wrote.
+        #
+        # `idx` walks storage order. When `h` and the pool store the state
+        # the same way that is the same offset on both sides; otherwise it
+        # walks the KV side and the VK side takes the transposed offset.
         idx = i_blk * BLOCK + tl.arange(0, BLOCK)
         mask = idx < HKV
+        src_idx = idx
         dst_idx = idx
-        if STATE_VK:
-            dst_idx = idx // (K * V) * (K * V) + (idx % V) * K + (idx % (K * V)) // V
+        if STATE_VK != H_VK:
+            vk_idx = idx // (K * V) * (K * V) + (idx % V) * K + (idx % (K * V)) // V
+            if STATE_VK:
+                dst_idx = vk_idx
+            else:
+                src_idx = vk_idx
         # Both branches cast to the pool's dtype: `h` is bf16 (the chunk
         # kernel allocates it with `k.new_empty`) while the pool is fp32, so
         # the two loads have different types and Triton requires them to
@@ -90,7 +100,7 @@ def _copy_checkpoints_kernel(
                 src = tl.load(h_rows + i_t).to(tl.int64)
             else:
                 src = tl.load(chunk_offsets + row).to(tl.int64) + off // CHUNK
-            sv = tl.load(h + src * HKV + idx, mask=mask, other=0.0).to(
+            sv = tl.load(h + src * HKV + src_idx, mask=mask, other=0.0).to(
                 ssm_dst.dtype.element_ty
             )
         tl.store(ssm_dst + slot * HKV + dst_idx, sv, mask=mask)
@@ -162,11 +172,25 @@ def write_state_checkpoints(
     ``GatedDeltaNet``; pass that buffer as ``h`` with the planned ``h_rows``.
     Without it the row is the chunk boundary,
     ``chunk_offsets[row] + off // chunk``.
+
+    ``h`` is a logical ``[..., H, K, V]`` tensor whose states are stored
+    either KV (the Triton chunk kernel's ``h``, ``h_snap``) or VK (FlyDSL's
+    snapshot, handed over as its ``transpose(-1, -2)``); like the pool's, the
+    layout is read off its strides. Any other inner layout is rejected. Rows
+    are ``ssm_state.stride(0)`` apart in both.
     """
     n = rows.numel()
     if n == 0:
         return
     hkv = ssm_state.stride(0)
+    k, v = ssm_state.shape[-2:]
+    h_inner = h.stride()[-3:]
+    h_vk = h_inner == (k * v, 1, k)
+    if not h_vk and h_inner != (k * v, v, 1):
+        raise ValueError(
+            f"GDN checkpoint source strides {h.stride()} are neither a "
+            f"KV nor a VK layout of [{k}, {v}] states"
+        )
     d, state_len = conv_state.shape[1], conv_state_len
     assert 0 < state_len <= conv_state.shape[2], "conv window wider than the pool"
     assert x.stride(-1) == 1, "conv input must be contiguous along the feature dim"
@@ -196,8 +220,9 @@ def write_state_checkpoints(
         CHUNK=chunk_size,
         BLOCK=BLOCK,
         NBLK_SSM=nblk_ssm,
-        K=ssm_state.shape[-2],
-        V=ssm_state.shape[-1],
+        K=k,
+        V=v,
         STATE_VK=ssm_state.stride(-2) == 1,
         HAS_H_ROWS=h_rows is not None,
+        H_VK=h_vk,
     )

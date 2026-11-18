@@ -670,10 +670,8 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             return
         num_reqs = batch.total_seqs_num_prefill
         query_lens = np.asarray(batch.num_scheduled_tokens[:num_reqs], dtype=np.int64)
-        if (
-            attn_metadata.gdn_metadata is not None
-            and getattr(self, "_flydsl_prefill_enabled", False)
-            and not self.replayssm
+        if attn_metadata.gdn_metadata is not None and getattr(
+            self, "_flydsl_prefill_enabled", False
         ):
             from atom.model_ops.fla_ops.gdn_flydsl import build_prefill_metadata
 

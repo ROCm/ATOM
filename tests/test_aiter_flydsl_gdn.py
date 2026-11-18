@@ -231,6 +231,86 @@ def test_vk_checkpoint_layout():
     torch.testing.assert_close(conv_vk, conv, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("pool_vk", [False, True])
+@pytest.mark.parametrize("planned_rows", [False, True])
+@pytest.mark.parametrize("dims", [(128, 128), (64, 128)])
+def test_vk_snapshot_checkpoints_match_kv_snapshot(pool_vk, planned_rows, dims):
+    """FlyDSL's snapshot is a view over VK storage; it checkpoints the same
+    bytes as its contiguous KV copy, into either pool layout. Unequal K and V
+    catch an interchanged axis."""
+    from atom.model_ops.fla_ops.state_checkpoint import write_state_checkpoints
+
+    def index(values):
+        return torch.tensor(values, dtype=torch.int32, device="cuda")
+
+    k, v = dims
+    torch.manual_seed(3)
+    vk_storage = torch.randn(1, 9, 24, v, k, device="cuda", dtype=torch.bfloat16)
+    snapshot = vk_storage.transpose(-1, -2)
+    copied = snapshot.contiguous()
+    original = torch.randn(8, 24, k, v, device="cuda", dtype=torch.float32)
+    x = torch.randn(520, 4, device="cuda", dtype=torch.bfloat16)
+    # Two sequences (5 and 4 chunks): interior targets on each one's own chunk
+    # grid, and one end target that reads the runtime slot instead.
+    args = [
+        index(values)
+        for values in (
+            [0, 1, 1, 0],
+            [4, 5, 6, 7],
+            [64, 64, 192, 300],
+            [0, 0, 0, 1],
+            [1, 2, 2, 1],
+            [0, 5, 9],
+            [0, 300, 520],
+        )
+    ]
+    h_rows = index([1, 5, 8, 0]) if planned_rows else None
+    pools = []
+    for source in (copied, snapshot):
+        pool = original.clone()
+        if pool_vk:
+            pool = original.transpose(-1, -2).contiguous().transpose(-1, -2)
+        assert (pool.stride(-2) == 1) == pool_vk
+        conv = torch.zeros(8, 4, 3, device="cuda", dtype=torch.bfloat16)
+        write_state_checkpoints(source, pool, x, conv, *args, 64, 3, h_rows=h_rows)
+        pools.append((pool, conv))
+    assert torch.equal(pools[1][0], pools[0][0])
+    assert torch.equal(pools[1][1], pools[0][1])
+    sources = [1, 5, 8] if planned_rows else [1, 6, 8]
+    for slot, row in zip((4, 5, 6), sources):
+        assert torch.equal(pools[1][0][slot], snapshot[0, row].float())
+    assert torch.equal(pools[1][0][7], original[1])
+    untouched = [0, 1, 2, 3]
+    assert torch.equal(pools[1][0][untouched], original[untouched])
+
+
+def test_flydsl_kv_snapshot_is_a_view_of_the_vk_snapshot():
+    lengths = (1000, 129)
+    q, k, v, a, b, log, bias = inputs(sum(lengths))
+    g, beta = fused_gdn_gating(log, a, b, bias)
+    cu = torch.tensor([0, 1000, 1129], device="cuda", dtype=torch.int32)
+    state = torch.randn(2, 24, 128, 128, device="cuda", dtype=torch.float32) * 0.1
+    metadata = fly.build_prefill_metadata(lengths, cu)
+    args = (q, k, v, g, beta, state, cu, metadata, True)
+    peaks = {}
+    snapshots = {}
+    for layout in ("vk", "kv", "vk", "kv"):
+        torch.cuda.synchronize()
+        base = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+        out, final, snapshots[layout] = fly.prefill(*args, snapshot_layout=layout)
+        torch.cuda.synchronize()
+        peaks[layout] = torch.cuda.max_memory_allocated() - base
+        del out, final
+    kv, vk = snapshots["kv"], snapshots["vk"]
+    chunks = sum((n + 63) // 64 for n in lengths)
+    assert kv.shape == (1, chunks, 24, 128, 128) and vk.is_contiguous()
+    assert kv.transpose(-1, -2).is_contiguous()
+    assert torch.equal(kv, vk.transpose(-1, -2))
+    # No copy for the KV contract: the same allocations as the VK snapshot.
+    assert peaks["kv"] == peaks["vk"]
+
+
 def test_triton_decode_vk_fallback():
     q, k, v, a, b, log, bias = inputs(3)
     state = torch.randn(6, 24, 128, 128, device="cuda", dtype=torch.bfloat16) * 0.1
@@ -320,9 +400,15 @@ def test_qwen_backend_binds_zero_copy_vk_state(
     )
     assert attention.gdn_flydsl_policy.decode == expected
     assert result.v_cache.stride()[-2:] == ((1, 128) if expected else (128, 1))
+    # Prefill does not care about the pool layout; ReplaySSM keeps it on gfx942.
+    prefill = (
+        allowed
+        and decode_backend != "triton"
+        and (not replayssm or fly.replayssm_prefill_device_supported(raw.device))
+    )
+    assert attention.gdn_flydsl_policy.prefill == prefill
+    assert builder._flydsl_prefill_enabled == prefill
     if replayssm:
-        assert not attention.gdn_flydsl_policy.prefill
-        assert not builder._flydsl_prefill_enabled
         assert result.v_cache is raw
 
 
@@ -512,3 +598,237 @@ def test_cache_policy_forward_dispatch(monkeypatch, mode):
         assert cache.v_cache.is_contiguous()
     else:
         close(cache.v_cache, reference, "forward state")
+
+
+@pytest.mark.parametrize("lengths", [(64,), (129, 1000), (3808, 4352)])
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+def test_replayssm_checkpoint_from_flydsl_prefill_matches_triton(lengths, state_dtype):
+    """Under ReplaySSM a prefill writes the contiguous KV checkpoint the next
+    verify replays. Both prefill kernels must leave the same one."""
+    from atom.model_ops.fla_ops.replayssm import (
+        replayssm_buffer_shapes,
+        replayssm_gated_delta_rule,
+    )
+
+    n = len(lengths)
+    q, k, v, a, b, log, bias = inputs(sum(lengths))
+    g, beta = fused_gdn_gating(log, a, b, bias)
+    cu = torch.tensor(
+        [0, *torch.tensor(lengths).cumsum(0).tolist()], device="cuda", dtype=torch.int32
+    )
+    pool = torch.randn(2 * n + 1, 24, 128, 128, device="cuda", dtype=state_dtype) * 0.1
+    reads = torch.arange(1, n + 1, device="cuda", dtype=torch.int32)
+    writes = reads + n
+    live = torch.arange(n, device="cuda") % 2 == 0
+    metadata = fly.build_prefill_metadata(lengths, cu)
+    assert fly.prefill_supported(q, k, v, g, beta, metadata)
+
+    # The two prefill branches of `GatedDeltaNet.forward`.
+    baseline = pool.clone()
+    initial = baseline.index_select(0, reads.long())
+    initial.masked_fill_(~live.view(-1, 1, 1, 1), 0)
+    expected, expected_ht = chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=initial,
+        output_final_state=True,
+        cu_seqlens=cu,
+        use_qk_l2norm_in_kernel=True,
+    )
+    baseline.index_copy_(0, writes.long(), expected_ht.to(state_dtype))
+    flydsl = pool.clone()
+    result, result_ht, _ = fly.prefill(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        flydsl,
+        cu,
+        metadata,
+        state_indices=reads,
+        has_initial_state=live,
+    )
+    flydsl.index_copy_(0, writes.long(), result_ht.to(state_dtype))
+
+    close(result, expected, f"replayssm prefill {lengths} {state_dtype} output")
+    assert flydsl.is_contiguous()
+    close(flydsl[writes.long()], baseline[writes.long()], "checkpoint")
+    others = torch.ones(pool.shape[0], dtype=torch.bool, device="cuda")
+    others[writes.long()] = False
+    torch.testing.assert_close(flydsl[others], pool[others], rtol=0, atol=0)
+
+    # The next verify window replays each checkpoint, nothing committed yet.
+    window = 4
+    vq, vk, vv, va, vb, _, _ = inputs(n * window, seed=7)
+    vg, vbeta = fused_gdn_gating(log, va, vb, bias)
+    shape_k, shape_u, shape_g = replayssm_buffer_shapes(2 * window, 24, 128, 128, False)
+    slots = pool.shape[0]
+
+    def verify(ckpt):
+        buf_u = torch.zeros((slots, *shape_u), device="cuda", dtype=torch.bfloat16)
+        out = replayssm_gated_delta_rule(
+            q=vq,
+            k=vk,
+            v=vv,
+            g=vg,
+            beta=vbeta,
+            ckpt=ckpt,
+            buf_k=torch.zeros((slots, *shape_k), device="cuda", dtype=torch.bfloat16),
+            buf_u=buf_u,
+            buf_g=torch.zeros((slots, *shape_g), device="cuda", dtype=torch.float32),
+            write_pos=torch.zeros(slots, device="cuda", dtype=torch.int32),
+            slot_idx=writes,
+            cu_seqlens=torch.arange(
+                0, n * window + 1, window, device="cuda", dtype=torch.int32
+            ),
+            max_query_len=window,
+            use_qk_l2norm_in_kernel=True,
+        )
+        return out, buf_u
+
+    expected_out, expected_records = verify(baseline)
+    result_out, result_records = verify(flydsl)
+    close(result_out, expected_out, "replayssm verify output")
+    close(result_records, expected_records, "replayssm records")
+
+
+@pytest.mark.parametrize("keep", [False, True])
+def test_replayssm_prefill_layer_dispatch_matches_triton(monkeypatch, keep):
+    """The Native GDN layer under ReplaySSM prefill metadata, both backends."""
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from atom.model_ops import attention_gdn as gdn
+    from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadataBuilder
+    from atom.model_ops.attentions.qwen4_exp_attn import Qwen4ExpMetadataBuilder
+    from atom.model_ops.fla_ops.replayssm import replayssm_buffer_shapes
+    from atom.utils import envs
+
+    lengths = (129, 1000)
+    tokens = sum(lengths)
+    q, k, v, a, b, log, bias = inputs(tokens)
+    cu = torch.tensor([0, 129, tokens], device="cuda", dtype=torch.int32)
+    reads = torch.tensor([1, 2], device="cuda", dtype=torch.int32)
+    writes = torch.tensor([3, 4], device="cuda", dtype=torch.int32)
+    live = torch.tensor([True, False], device="cuda")
+    original = torch.randn(5, 24, 128, 128, device="cuda", dtype=torch.float32) * 0.1
+    shapes = replayssm_buffer_shapes(8, 24, 128, 128, False)
+    monkeypatch.setattr(envs, "ATOM_ENABLE_GDN_DECODE_LOSSY_FAST", False)
+    # Isolate GDN from the unrelated convolution, preserving real q/k/v values.
+    monkeypatch.setattr(
+        gdn, "causal_conv1d_fn", lambda *args, **kwargs: (q[0], k[0], v[0])
+    )
+    kernels = (fly.prefill, gdn.chunk_gated_delta_rule, gdn.replayssm_gated_delta_rule)
+
+    def run(prefill_backend):
+        pool = original.clone()
+        ring = [
+            torch.randn((5, *shape), device="cuda").to(dtype)
+            for shape, dtype in zip(
+                shapes, (torch.bfloat16, torch.bfloat16, torch.float32)
+            )
+        ]
+        write_pos = torch.full((5,), 2, device="cuda", dtype=torch.int32)
+        untouched = [t.clone() for t in (*ring, write_pos)]
+        cache = SimpleNamespace(
+            v_cache=pool,
+            k_cache=torch.zeros(5, 1, 1, device="cuda", dtype=torch.bfloat16),
+            replay_buf_k=ring[0],
+            replay_buf_u=ring[1],
+            replay_buf_g=ring[2],
+        )
+        attention = gdn.GatedDeltaNet.__new__(gdn.GatedDeltaNet)
+        torch.nn.Module.__init__(attention)
+        for name, value in {
+            "layer_num": 0,
+            "tp_size": 1,
+            "num_k_heads": 8,
+            "num_v_heads": 24,
+            "head_k_dim": 128,
+            "head_v_dim": 128,
+            "A_log": log,
+            "dt_bias": bias,
+            "allow_aiter_flydsl": True,
+            "activation": "silu",
+            "conv1d": SimpleNamespace(weight=torch.zeros(1, 1, 1), bias=None),
+        }.items():
+            setattr(attention, name, value)
+        monkeypatch.setattr(fly, "backend", lambda stage: prefill_backend)
+        monkeypatch.setattr(
+            GDNAttentionMetadataBuilder,
+            "build_kv_cache_tensor",
+            lambda self, module: cache,
+        )
+        builder = object.__new__(Qwen4ExpMetadataBuilder)
+        builder.replayssm = True
+        bound = builder.build_kv_cache_tensor(
+            SimpleNamespace(base_linear_attention=None, impl=attention)
+        )
+        assert bound.v_cache is pool
+        assert not attention.gdn_flydsl_policy.decode
+        metadata = SimpleNamespace(
+            replayssm=True,
+            write_pos=write_pos,
+            slot_idx=writes,
+            has_initial_state=live,
+            no_initial_state=~live,
+            spec_query_start_loc=None,
+            non_spec_query_start_loc=cu,
+            spec_sequence_masks=None,
+            spec_token_indx=None,
+            non_spec_token_indx=None,
+            spec_state_indices_tensor=None,
+            spec_state_indices_in_tensor=None,
+            non_spec_state_indices_tensor=writes,
+            non_spec_state_indices_in_tensor=reads,
+            non_spec_state_indices_i64=writes.long(),
+            non_spec_state_indices_in_i64=reads.long(),
+            num_actual_tokens=tokens,
+            num_accepted_tokens=None,
+            num_prefills=2,
+            num_decodes=0,
+            ssm_checkpoints=None,
+            keep_intermediate_states=keep,
+            flydsl_prefill_metadata=fly.build_prefill_metadata(lengths, cu),
+        )
+        context = SimpleNamespace(
+            attn_metadata=SimpleNamespace(gdn_metadata=metadata),
+            kv_cache_data={"layer_0": cache},
+        )
+        monkeypatch.setattr(gdn, "get_forward_context", lambda: context)
+        prefill, chunked, replay = (Mock(wraps=kernel) for kernel in kernels)
+        monkeypatch.setattr(fly, "prefill", prefill)
+        monkeypatch.setattr(gdn, "chunk_gated_delta_rule", chunked)
+        monkeypatch.setattr(gdn, "replayssm_gated_delta_rule", replay)
+        out = attention(
+            torch.empty(tokens, 1, device="cuda"),
+            b,
+            a,
+            torch.empty_like(v[0]),
+            "layer_0",
+        )
+        flydsl = prefill_backend != "triton" and fly.replayssm_prefill_device_supported(
+            pool.device
+        )
+        assert prefill.call_count == int(flydsl)
+        assert chunked.call_count == int(not flydsl)
+        replay.assert_not_called()
+        assert pool.is_contiguous()
+        for before, after in zip(untouched, (*ring, write_pos)):
+            torch.testing.assert_close(after, before, rtol=0, atol=0)
+        return out, pool, pop_last_intermediate_states()
+
+    expected, expected_pool, expected_h = run("triton")
+    actual, actual_pool, actual_h = run("auto")
+    close(actual, expected, "replayssm layer output")
+    close(actual_pool[writes.long()], expected_pool[writes.long()], "checkpoint")
+    others = [0, 1, 2]
+    torch.testing.assert_close(actual_pool[others], original[others], rtol=0, atol=0)
+    if keep:
+        close(actual_h, expected_h, "published snapshots")
+    else:
+        assert actual_h is None and expected_h is None
