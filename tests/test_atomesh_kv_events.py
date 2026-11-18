@@ -182,6 +182,43 @@ start_prefill prefill-rank-0 "${SERVER_PORT}"
         self.assertNotIn("--mooncake-admin-port", args)
         self.assertNotIn("--prepare-queue-timeout-ms", args)
 
+    def test_a_kv_events_router_saves_the_sources_it_follows(self):
+        script = shell_functions("save_router_kv_sources") + """
+curl() { [[ "${@: -1}" == */kv_events/* ]] || return 22; printf '[{"url":"%s"}]' "${@: -1}"; }
+save_router_kv_sources "${OUT}/router-after"
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            for switch in ("true", "false"):
+                with self.subTest(switch=switch):
+                    out = Path(directory) / switch
+                    out.mkdir()
+                    result = subprocess.run(
+                        ["bash", "-eu", "-c", script],
+                        env=dict(
+                            self.env,
+                            OUT=str(out),
+                            ROUTER_PORT="8000",
+                            ROUTER_KV_EVENTS=switch,
+                        ),
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    saved = {p.name: json.loads(p.read_text()) for p in out.iterdir()}
+                    if switch == "false":
+                        self.assertEqual(saved, {})
+                        continue
+                    self.assertEqual(
+                        saved,
+                        {
+                            "router-after-kv_events-sources.json": [
+                                {"url": "http://127.0.0.1:8000/kv_events/sources"}
+                            ]
+                        },
+                    )
+                    self.assertIn("/kv_storage/sources snapshot failed", result.stderr)
+
     def test_store_cells_keep_the_checkpoint_cached_while_workers_load(self):
         script = (
             shell_functions("mooncake_setting", "start_mooncake_page_cache_dropper")

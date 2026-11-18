@@ -2578,6 +2578,20 @@ save_router_metrics() {
   fi
 }
 
+# Saves the KV event and storage sources a router that routes by KV events
+# follows: trust, seq and block counts per rank. A failed request only warns.
+save_router_kv_sources() {
+  local prefix="$1" kind sources
+  [[ "${ROUTER_KV_EVENTS:-false}" == "true" ]] || return 0
+  for kind in kv_events kv_storage; do
+    if sources="$(curl -sSf --max-time 10 "http://127.0.0.1:${ROUTER_PORT}/${kind}/sources")"; then
+      printf '%s\n' "${sources}" > "${prefix}-${kind}-sources.json"
+    else
+      echo "[aiperf] WARNING: router /${kind}/sources snapshot failed" >&2
+    fi
+  done
+}
+
 run_aiperf_agentic_benchmark() {
   ensure_agentx_harness
 
@@ -2652,6 +2666,7 @@ run_aiperf_agentic_benchmark() {
     rm -f "${router_before}"
     if [[ "${AGGREGATED}" != "1" ]]; then
       save_router_metrics "${router_before}"
+      save_router_kv_sources "${out_dir}/router-before"
     fi
     AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT="${AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT}" \
     AIPERF_HTTP_TCP_USER_TIMEOUT="${AIPERF_HTTP_TCP_USER_TIMEOUT}" \
@@ -2701,9 +2716,11 @@ run_aiperf_agentic_benchmark() {
       local router_metrics="${out_dir}/metrics"
       mkdir -p "${router_metrics}"
       save_router_metrics "${router_metrics}/router-metrics.prom"
+      save_router_kv_sources "${router_metrics}/router-after"
       if [[ -f "${router_before}" ]]; then
         mv "${router_before}" "${router_metrics}/"
       fi
+      mv -f "${out_dir}"/router-before-*-sources.json "${router_metrics}/" 2>/dev/null || true
       python3 "${ATOMESH_SCRIPT_DIR}/observability/router_metrics_delta.py" \
         "${router_metrics}/router-metrics-before.prom" \
         "${router_metrics}/router-metrics.prom" \
