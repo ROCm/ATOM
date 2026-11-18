@@ -308,6 +308,7 @@ impl LoadBalancingPolicy for AgenticPolicy {
                 .flatten(),
             estimated_hit_ratio,
             prefill_tokens: Some(selection.uncached_tokens),
+            reservation_id: None,
         };
         (Some(selection.worker_index), decision)
     }

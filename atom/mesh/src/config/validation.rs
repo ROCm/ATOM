@@ -85,7 +85,10 @@ impl ConfigValidator {
 
     fn validate_policy(policy: &PolicyConfig) -> ConfigResult<()> {
         match policy {
-            PolicyConfig::Random | PolicyConfig::RoundRobin | PolicyConfig::DpSticky => {}
+            PolicyConfig::Random
+            | PolicyConfig::RoundRobin
+            | PolicyConfig::DpSticky
+            | PolicyConfig::LeastLoad { .. } => {}
             PolicyConfig::Agentic {
                 request_token_equivalent: _,
                 eviction_interval_secs,

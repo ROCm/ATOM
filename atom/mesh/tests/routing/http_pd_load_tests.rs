@@ -182,6 +182,8 @@ fn dispatch_with_policy(
                     prefill_policy: "round_robin",
                     decode_policy: "round_robin",
                     prefill_tokens: 7,
+                    prefill_load: None,
+                    decode_load: None,
                 },
                 headers.as_ref(),
             )
@@ -689,6 +691,8 @@ async fn dispatch_hooks_wait_until_the_new_decode_receives_a_request() {
             prefill_policy: "round_robin",
             decode_policy: "dp_sticky",
             prefill_tokens: 0,
+            prefill_load: None,
+            decode_load: None,
         },
         Some(&headers),
     );

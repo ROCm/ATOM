@@ -186,6 +186,26 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Release tokens taken by `charge_prefill_tokens`.
     fn release_prefill_tokens(&self, tokens: usize);
 
+    /// KV tokens reserved on this worker for requests whose decode has not finished.
+    fn decode_kv_tokens(&self) -> usize {
+        0
+    }
+
+    /// In-flight requests reserved here without a prompt length.
+    fn decode_untokenized(&self) -> usize {
+        0
+    }
+
+    /// Reserve one request and, when `tokens` is `Some`, that many KV tokens.
+    /// `None` counts the request as untokenized. Pair with [`Self::release_decode_load`].
+    fn charge_decode_load(&self, _tokens: Option<usize>) {}
+
+    /// Release one reservation taken by [`Self::charge_decode_load`].
+    fn release_decode_load(&self, _tokens: Option<usize>) {}
+
+    /// Add generated tokens to an existing token reservation.
+    fn add_decode_kv_tokens(&self, _tokens: usize) {}
+
     /// Get the worker routing key load tracker
     fn worker_routing_key_load(&self) -> &WorkerRoutingKeyLoad;
 
@@ -498,6 +518,8 @@ pub struct BasicWorker {
     pub metadata: WorkerMetadata,
     pub load_counter: Arc<AtomicUsize>,
     pub prefill_token_counter: Arc<AtomicUsize>,
+    pub decode_kv_counter: Arc<AtomicUsize>,
+    pub decode_untokenized_counter: Arc<AtomicUsize>,
     pub worker_routing_key_load: Arc<WorkerRoutingKeyLoad>,
     pub processed_counter: Arc<AtomicUsize>,
     pub healthy: Arc<AtomicBool>,
@@ -677,6 +699,75 @@ impl Worker for BasicWorker {
             );
         }
         MeshMetrics::set_worker_prefill_tokens(self.url(), previous.saturating_sub(tokens));
+    }
+
+    fn decode_kv_tokens(&self) -> usize {
+        self.decode_kv_counter.load(Ordering::Relaxed)
+    }
+
+    fn decode_untokenized(&self) -> usize {
+        self.decode_untokenized_counter.load(Ordering::Relaxed)
+    }
+
+    fn charge_decode_load(&self, tokens: Option<usize>) {
+        self.increment_load();
+        match tokens {
+            Some(tokens) => self.add_decode_kv_tokens(tokens),
+            None => {
+                let previous = self
+                    .decode_untokenized_counter
+                    .fetch_add(1, Ordering::Relaxed);
+                let _ = previous;
+            }
+        }
+    }
+
+    fn release_decode_load(&self, tokens: Option<usize>) {
+        self.decrement_load();
+        match tokens {
+            Some(tokens) => {
+                let previous = self
+                    .decode_kv_counter
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                        Some(current.saturating_sub(tokens))
+                    })
+                    .unwrap_or_else(|current| current);
+                if previous < tokens {
+                    tracing::warn!(
+                        worker_url = %self.metadata.url,
+                        tokens,
+                        previous,
+                        "Released more decode KV tokens than were charged"
+                    );
+                }
+                MeshMetrics::set_worker_decode_kv_tokens(
+                    self.url(),
+                    previous.saturating_sub(tokens),
+                );
+            }
+            None => {
+                let previous = self
+                    .decode_untokenized_counter
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                        Some(current.saturating_sub(1))
+                    })
+                    .unwrap_or_else(|current| current);
+                if previous == 0 {
+                    tracing::warn!(
+                        worker_url = %self.metadata.url,
+                        "Released an untokenized decode reservation that was not charged"
+                    );
+                }
+            }
+        }
+    }
+
+    fn add_decode_kv_tokens(&self, tokens: usize) {
+        if tokens == 0 {
+            return;
+        }
+        let previous = self.decode_kv_counter.fetch_add(tokens, Ordering::Relaxed);
+        MeshMetrics::set_worker_decode_kv_tokens(self.url(), previous + tokens);
     }
 
     fn reset_load(&self) {
@@ -910,6 +1001,26 @@ impl Worker for DPAwareWorker {
         self.base_worker.release_prefill_tokens(tokens);
     }
 
+    fn decode_kv_tokens(&self) -> usize {
+        self.base_worker.decode_kv_tokens()
+    }
+
+    fn decode_untokenized(&self) -> usize {
+        self.base_worker.decode_untokenized()
+    }
+
+    fn charge_decode_load(&self, tokens: Option<usize>) {
+        self.base_worker.charge_decode_load(tokens);
+    }
+
+    fn release_decode_load(&self, tokens: Option<usize>) {
+        self.base_worker.release_decode_load(tokens);
+    }
+
+    fn add_decode_kv_tokens(&self, tokens: usize) {
+        self.base_worker.add_decode_kv_tokens(tokens);
+    }
+
     fn worker_routing_key_load(&self) -> &WorkerRoutingKeyLoad {
         self.base_worker.worker_routing_key_load()
     }
@@ -981,6 +1092,57 @@ impl Worker for DPAwareWorker {
     }
 }
 
+/// One in-flight request reserved at selection time.
+///
+/// Drop releases it unless [`Self::defuse`] transferred it to a [`WorkerLoadGuard`].
+pub struct LoadReservation {
+    worker: Arc<dyn Worker>,
+    tokens: Option<usize>,
+    armed: bool,
+}
+
+impl fmt::Debug for LoadReservation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LoadReservation")
+            .field("worker", &self.worker.url())
+            .field("tokens", &self.tokens)
+            .field("armed", &self.armed)
+            .finish()
+    }
+}
+
+impl LoadReservation {
+    pub fn charge(worker: Arc<dyn Worker>, tokens: Option<usize>) -> Self {
+        worker.charge_decode_load(tokens);
+        Self {
+            worker,
+            tokens,
+            armed: true,
+        }
+    }
+
+    /// Keep the charge and hand the worker to the caller. Drop becomes a no-op.
+    pub fn defuse(mut self) -> (Arc<dyn Worker>, Option<usize>) {
+        self.armed = false;
+        (self.worker.clone(), self.tokens)
+    }
+}
+
+impl Drop for LoadReservation {
+    fn drop(&mut self) {
+        if self.armed {
+            self.worker.release_decode_load(self.tokens);
+            self.armed = false;
+        }
+    }
+}
+
+enum DecodeCharge {
+    None,
+    Tokens(usize),
+    Untokenized,
+}
+
 /// RAII guard for worker load management
 ///
 /// Automatically decrements worker load when dropped. Can be attached to
@@ -990,6 +1152,9 @@ impl Worker for DPAwareWorker {
 pub struct WorkerLoadGuard {
     worker: Arc<dyn Worker>,
     prefill_tokens: usize,
+    decode_charge: DecodeCharge,
+    generated_seen: usize,
+    owns_load: bool,
 }
 
 impl WorkerLoadGuard {
@@ -998,6 +1163,42 @@ impl WorkerLoadGuard {
         Self {
             worker,
             prefill_tokens: 0,
+            decode_charge: DecodeCharge::None,
+            generated_seen: 0,
+            owns_load: true,
+        }
+    }
+
+    /// Take over a reservation made at selection. Does not charge again.
+    pub fn adopt(reservation: LoadReservation) -> Self {
+        let (worker, tokens) = reservation.defuse();
+        Self {
+            worker,
+            prefill_tokens: 0,
+            decode_charge: match tokens {
+                Some(tokens) => DecodeCharge::Tokens(tokens),
+                None => DecodeCharge::Untokenized,
+            },
+            generated_seen: 0,
+            owns_load: false,
+        }
+    }
+
+    /// Add newly reported completion tokens to a token reservation.
+    ///
+    /// `completion_tokens` in a usage frame is cumulative. Repeated values add nothing.
+    pub fn observe_output_chunk(&mut self, chunk: &[u8]) {
+        let DecodeCharge::Tokens(charged) = &mut self.decode_charge else {
+            return;
+        };
+        let Some(latest) = max_completion_tokens(chunk) else {
+            return;
+        };
+        if latest > self.generated_seen {
+            let delta = latest - self.generated_seen;
+            self.generated_seen = latest;
+            self.worker.add_decode_kv_tokens(delta);
+            *charged = charged.saturating_add(delta);
         }
     }
 
@@ -1024,8 +1225,56 @@ impl WorkerLoadGuard {
 impl Drop for WorkerLoadGuard {
     fn drop(&mut self) {
         self.release_prefill();
-        self.worker.decrement_load();
+        match self.decode_charge {
+            DecodeCharge::None => {}
+            DecodeCharge::Tokens(tokens) => self.worker.release_decode_load(Some(tokens)),
+            DecodeCharge::Untokenized => self.worker.release_decode_load(None),
+        }
+        self.decode_charge = DecodeCharge::None;
+        if self.owns_load {
+            self.worker.decrement_load();
+            self.owns_load = false;
+        }
     }
+}
+
+/// Largest `"completion_tokens"` value in `chunk`. The key is cumulative in
+/// usage frames. `completion_tokens_details` does not match.
+fn max_completion_tokens(chunk: &[u8]) -> Option<usize> {
+    let key = b"\"completion_tokens\"";
+    let mut found = None;
+    let mut start = 0;
+    while start + key.len() <= chunk.len() {
+        let Some(rel) = chunk[start..]
+            .windows(key.len())
+            .position(|window| window == key)
+        else {
+            break;
+        };
+        let mut index = start + rel + key.len();
+        while index < chunk.len() && chunk[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index < chunk.len() && chunk[index] == b':' {
+            index += 1;
+            while index < chunk.len() && chunk[index].is_ascii_whitespace() {
+                index += 1;
+            }
+            let begin = index;
+            while index < chunk.len() && chunk[index].is_ascii_digit() {
+                index += 1;
+            }
+            if index > begin {
+                if let Ok(value) = std::str::from_utf8(&chunk[begin..index]) {
+                    if let Ok(value) = value.parse::<usize>() {
+                        found = Some(found.map_or(value, |previous: usize| previous.max(value)));
+                    }
+                }
+            }
+        }
+        start += rel + key.len();
+    }
+    found
 }
 
 /// Body wrapper that holds an attached value.
