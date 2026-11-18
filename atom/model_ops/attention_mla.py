@@ -72,6 +72,7 @@ from atom.model_ops.dcp_ops import dcp_all_gather_prefill_query_heads
 from atom.model_ops.indexer.schedule import skips_index_topk
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import use_triton_gemm
+from atom.model_ops.mla_fused import gfx_arch, kup_qpe_fusion_ok
 from atom.model_ops.triton_fused_mla_ctx_kv import fused_mla_ctx_norm_rope_cache
 from atom.model_ops.triton_fused_qkv_quant import (
     fused_kv_per_tensor_quant,
@@ -1611,6 +1612,43 @@ class MLAAttention(nn.Module):
         # Convert from (B, N, V) to (B, N * V)
         return self.o_proj(x.reshape(-1, self.num_heads * self.v_head_dim))
 
+    def _q_proj_heads(self, x, x_scale=None, group=False):
+        if self.qrep_enabled and not group:
+            # Row-view weight: computes only this rank's heads, so the redundant
+            # group-wide GEMM never happens (the old code projected all group
+            # heads and then dropped 7/8 of the result).
+            return self._local_q_proj()(x, x_scale).view(
+                -1, self.num_heads, self.qk_head_dim
+            )
+        n_heads_out = self.qrep_num_heads if self.qrep_enabled else self.num_heads
+        return self.q_proj(x, x_scale).view(-1, n_heads_out, self.qk_head_dim)
+
+    @mark_trace(prefix="q_proj_k_up_qpe_rope_cache", torch_compile=False)
+    def _q_proj_k_up_rope_and_cache(
+        self, x, x_scale, k_nope, k_rope, positions, kv_view, slot_mapping, q_out
+    ):
+        """q_proj, then one kernel for K-up into q_out[..., :L], q_pe RoPE into
+        q_out[..., L:] and the shuffled KV-cache write (ATOM_MLA_FUSED_KUP_QPE)."""
+        from atom.model_ops.mla_fused.fused_kup_qpe import kup_qpe_fused
+
+        q = self._q_proj_heads(x, x_scale, group=False)
+        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        kup_qpe_fused(
+            q_nope.transpose(0, 1),
+            self.W_K,
+            q_pe,
+            k_nope.view(-1, self.num_kv_heads, self.kv_lora_rank),
+            k_rope.view(-1, self.num_kv_heads, self.qk_rope_head_dim),
+            kv_view,
+            slot_mapping,
+            positions,
+            self.rotary_emb.cos_cache,
+            self.rotary_emb.sin_cache,
+            self._k_scale,
+            self.rotary_emb.is_neox_style,
+            q_out,
+        )
+
     @mark_trace(prefix="q_proj_and_k_up_proj", torch_compile=False)
     def _q_proj_and_k_up_proj(self, x, x_scale=None, group=False, q_nope_out=None):
         # q_nope_out: optional (B, N, L) destination (BF16-absorb path only),
@@ -1619,16 +1657,7 @@ class MLAAttention(nn.Module):
         # QREP: q_proj emits the full DCP-group head set. group=True (decode)
         # keeps them all and uses W_K_qrep, so the caller skips the AllGather Q;
         # group=False (prefill / non-QREP) takes only this rank's heads.
-        if self.qrep_enabled and not group:
-            # Row-view weight: computes only this rank's heads, so the redundant
-            # group-wide GEMM never happens (the old code projected all group
-            # heads and then dropped 7/8 of the result).
-            q = self._local_q_proj()(x, x_scale).view(
-                -1, self.num_heads, self.qk_head_dim
-            )
-        else:
-            n_heads_out = self.qrep_num_heads if self.qrep_enabled else self.num_heads
-            q = self.q_proj(x, x_scale).view(-1, n_heads_out, self.qk_head_dim)
+        q = self._q_proj_heads(x, x_scale, group)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
         # Convert from (B, N, P) to (N, B, P)
@@ -3237,16 +3266,51 @@ class MLAAttention(nn.Module):
                     dtype=attn_metadata.dtype_q,
                     device=q.device,
                 )
-            q_nope, q_rope = self._q_proj_and_k_up_proj(
-                q,
-                x_scale=q_scale,
-                group=use_qrep,
-                q_nope_out=(
-                    None
-                    if q_out_prestored is None
-                    else q_out_prestored[..., : self.kv_lora_rank]
-                ),
+            kv_view = (
+                self._shuffled_kv_view(kv_cache)
+                if q_out_prestored is not None
+                else None
             )
+            fused_kup_qpe = kup_qpe_fusion_ok(
+                enabled=envs.ATOM_MLA_FUSED_KUP_QPE,
+                arch=gfx_arch(),
+                is_prefill=context.is_prefill,
+                use_qrep=use_qrep,
+                dcp_world_size=self.dcp_world_size,
+                q_out=q_out_prestored,
+                num_tokens=q.shape[0],
+                slot_mapping=attn_metadata.slot_mapping,
+                w_k=self.W_K,
+                cos_cache=self.rotary_emb.cos_cache,
+                rope_dim=self.qk_rope_head_dim,
+                kv_cache=kv_view,
+                k_scale=self._k_scale,
+            )
+            if fused_kup_qpe:
+                # Writes all of q_out and the KV cache; the rope/cache call below
+                # is skipped.
+                self._q_proj_k_up_rope_and_cache(
+                    q,
+                    q_scale,
+                    k_nope,
+                    k_rope,
+                    positions,
+                    kv_view,
+                    attn_metadata.slot_mapping,
+                    q_out_prestored,
+                )
+                q_nope = q_rope = None
+            else:
+                q_nope, q_rope = self._q_proj_and_k_up_proj(
+                    q,
+                    x_scale=q_scale,
+                    group=use_qrep,
+                    q_nope_out=(
+                        None
+                        if q_out_prestored is None
+                        else q_out_prestored[..., : self.kv_lora_rank]
+                    ),
+                )
 
             # ---- Prefill Context Parallel --------------------------------
             # q is this rank's 1/pcp queries, so q_out is naturally 1/pcp. But
@@ -3321,7 +3385,7 @@ class MLAAttention(nn.Module):
             q_out_write = (
                 q_out[:, : self.num_heads] if self._fused_q_head_pad else q_out
             )
-            if kv_cache.numel() > 0:
+            if kv_cache.numel() > 0 and not fused_kup_qpe:
                 if self.kv_shuffled:
                     shuffled_cache = self._shuffled_kv_view(kv_cache)
                     triton_fused_qk_rope_cat_and_cache_mla(
