@@ -1469,6 +1469,9 @@ def _dispatch(seam, native, capability, inputs, kwargs):
     named = dict(zip(spec.inputs, inputs))
     key = (
         seam,
+        # A bound seam's capability is its call site's own (per layer: flags.module),
+        # so a decision and its Capability are cached per call site, never shared.
+        id(capability),
         captured,
         bucket,
         tuple(_key_of(named.get(k)) for k in spec.key),
