@@ -71,6 +71,7 @@ class MiniMaxM3SparsePrefillMetadata:
     block_table: torch.Tensor
     max_query_len: int
     max_seq_len: int
+    min_prefix_len: int = 0
 
 
 @dataclass
@@ -115,6 +116,7 @@ def make_sparse_prefill_metadata(
     num_prefills: int,
     num_prefill_tokens: int,
     num_idx_heads: int,
+    min_prefix_len: int = 0,
     n_valid_column_per_row_out: torch.Tensor | None = None,
     index_scorer: IndexScoreBuffers | None = None,
 ) -> MiniMaxM3SparseMetadata:
@@ -132,6 +134,7 @@ def make_sparse_prefill_metadata(
         block_table=block_table,
         max_query_len=max_query_len,
         max_seq_len=max_seq_len,
+        min_prefix_len=min_prefix_len,
     )
     return MiniMaxM3SparseMetadata(
         seq_lens=seq_lens,
@@ -1422,6 +1425,12 @@ def minimax_m3_sparse_attn_decode_asm(
     )
 
 
+@functools.cache
+def _default_plan_task_budget(device) -> int:
+    """Task slots in aiter's default plan, expressed per collapsed KV head."""
+    return 2 * torch.cuda.get_device_properties(device).multi_processor_count
+
+
 @torch.no_grad()
 def sparse_pa_per_row(
     q: torch.Tensor,  # [total_q, num_heads, head_dim==128]
@@ -1436,6 +1445,7 @@ def sparse_pa_per_row(
     v_scale: torch.Tensor | None,
     plan_step_owner=None,
     plan_cache_owner=None,
+    dynamic_partition_plan: bool = False,
 ) -> None:
     """Run one sparse selection per row, on ASM where it pays and PA decode else.
 
@@ -1482,6 +1492,11 @@ def sparse_pa_per_row(
     num_kv_heads_view = 1
     max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads_view)
     context_partition_size = 256
+    use_dynamic_partition_plan = (
+        dynamic_partition_plan
+        and sparse_bt.shape[-1] * ASM_PAGE_SIZE > context_partition_size
+        and num_seqs < _default_plan_task_budget(q.device)
+    )
     # compute_type / scales follow the actual KV-cache dtype (this helper serves
     # both bf16 and fp8); the scale tensor collapses like the cache.
     is_fp8 = _is_fp8_kv_cache_tensor(k_cache)
@@ -1513,8 +1528,13 @@ def sparse_pa_per_row(
         ps=True,
         plan_step_owner=plan_step_owner,
         plan_cache_owner=plan_cache_owner,
-        # Bounded topk window per row: keep the static split cap.
-        plan_partition_cap=max_context_partition_num,
+        # A cached prefill has a flat selected-length distribution instead of
+        # the cold prefill's causal ramp. Let the GPU planner spend its default
+        # capacity there; the host-resident prefix bit selects the graph-stable
+        # allocation without reading a device length.
+        plan_partition_cap=(
+            None if use_dynamic_partition_plan else max_context_partition_num
+        ),
     )
 
 
@@ -1544,6 +1564,7 @@ def minimax_m3_sparse_attn_prefill_asm(
     block_page_stride: int = PAGES_PER_SPARSE_BLOCK,
     plan_step_owner=None,
     plan_cache_owner=None,
+    min_prefix_len: int = 0,
 ) -> None:
     """Block-sparse PREFILL via AITER ASM pa_fwd_asm, per-token-as-decode.
 
@@ -1607,4 +1628,10 @@ def minimax_m3_sparse_attn_prefill_asm(
         v_scale,
         plan_step_owner=plan_step_owner,
         plan_cache_owner=plan_cache_owner,
+        # Once every row starts beyond a full selected window, its sparse
+        # context is flat instead of the cold prefill's causal ramp. Both the
+        # minimum prefix and selected capacity are host-known.
+        dynamic_partition_plan=(
+            min_prefix_len >= sparse_bt.shape[-1] * ASM_PAGE_SIZE
+        ),
     )
