@@ -21,6 +21,7 @@ def test_warmup_batch_is_a_prefill(monkeypatch, max_model_len, warmup_tokens):
     )
     runner.block_size = 16
     runner.label = "test"
+    runner.model = runner_module.torch.nn.Module()
     runner.tokenID_processor = SimpleNamespace(clean=lambda: None)
     runner.warmup_max_tokens = lambda: warmup_tokens
     seen = []
@@ -64,6 +65,7 @@ def test_every_stage_warms_up_on_the_rows_the_last_stage_does(monkeypatch):
         if drafter is not None:
             runner.drafter = drafter
         runner.block_size, runner.label = 16, "stage"
+        runner.model = runner_module.torch.nn.Module()
         runner.tokenID_processor = SimpleNamespace(clean=lambda: None)
         runner.forward = lambda batch: rows.append(
             (batch.total_seqs_num, batch.total_tokens_num)
