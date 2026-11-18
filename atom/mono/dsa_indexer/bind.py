@@ -79,6 +79,16 @@ class IndexerBinding:
             qlen=qlen,
             score_blocks=2 * BLOCKS if dual else BLOCKS,
             short_gemm=self.short_gemm,
+            short_decode=(
+                self.replicated
+                and self.world == 8
+                and qlen == 1
+                and rows <= kix.MAX_LEGACY_TOKENS
+                and self.max_ctx <= SPLIT_MIN
+                and self.shape.fp4
+                and self.shape.q_lora == 1536
+                and not self.shape.rope_dim
+            ),
         )
 
     def serves(self, rows: int, qlen: int, ilog) -> bool:

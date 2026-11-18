@@ -63,6 +63,8 @@ class IxBuild:
     score_blocks: int = field(default=BLOCKS, metadata={"sym": "sb"})
     # gfx950 short verify: BF16 prepacked Q projection and local MQA scheduling.
     short_gemm: bool = field(default=False, metadata={"sym": "sq"})
+    # Local experiment: keep <=8K K3 FP4 plain decode rank-local.
+    short_decode: bool = field(default=False, metadata={"sym": "d1"})
 
     @property
     def stream_scores(self) -> bool:
@@ -104,17 +106,17 @@ class IxBuild:
 
     @property
     def short_owned_verify(self) -> bool:
-        """Allow runtime short-verify ownership and rank-local Q projection."""
+        """Allow short verify or admitted plain decode to stay rank-local."""
         return (
             self.replicated
             and self.world > 1
-            and self.qlen in (6, 8)
+            and (self.qlen in (6, 8) or (self.qlen == 1 and self.short_decode))
             and 0 < self.max_ctx <= isel.SPLIT_MIN
             and 0
             < self.tokens
             <= (MAX_VERIFY_TOKENS if self.qlen == 6 else MAX_LEGACY_TOKENS)
             and self.tokens % self.qlen == 0
-            and (self.qlen == 6 or self.tokens // self.qlen <= self.world)
+            and (self.qlen in (1, 6) or self.tokens // self.qlen <= self.world)
         )
 
     @property

@@ -601,9 +601,16 @@ def build(key: IxBuild):
     )
 
     tuned_score = (
-        key.short_gemm and key.short_owned_verify and key.qlen == 6 and s >= 48
+        key.short_gemm
+        and key.short_owned_verify
+        and (
+            (key.qlen == 6 and s >= 48)
+            or (key.short_decode and key.qlen == 1 and s >= 8)
+        )
     )
-    tiled_q = tuned_score and s >= 96
+    tiled_q = tuned_score and (
+        s >= 96 or (key.short_decode and key.qlen == 1 and s >= 24)
+    )
 
     @fx.struct
     class Smem:
@@ -687,7 +694,9 @@ def build(key: IxBuild):
             "local_short": key.short_owned_verify,
             "fast_short": tuned_score
             or (key.short_gemm and key.qlen == 6 and s == key.qlen),
-            "short_score": key.short_owned_verify and s == key.qlen,
+            "short_score": key.short_owned_verify
+            and key.qlen in (6, 8)
+            and s == key.qlen,
             "max_ctx": key.max_ctx,
             "radix": radix,
             "shape": sh,
@@ -845,7 +854,9 @@ def build(key: IxBuild):
         if const_expr(key.stream_scores):
             isel.score_row_stream(c)
         else:
-            if const_expr(key.short_owned_verify and s == key.qlen):
+            if const_expr(
+                key.short_owned_verify and key.qlen in (6, 8) and s == key.qlen
+            ):
                 if isel.short_verify_step(c):
                     narrow = {
                         **c,
