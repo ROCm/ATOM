@@ -2817,24 +2817,26 @@ class Expert(nn.Module):
         return self.w2(out)  # [num_tokens, dim]
 
 
-# The V4 family's dual-stream MoE row bound when
+# The V4 family's dual-stream MoE row bound on decode steps when
 # ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD is not set. 1536 = 256 requests a rank
 # x 6 DSpark rows a request: the largest of the 1152/1344/1536-row decode
 # graphs of a 1024-request expert-parallel batch, the shapes the shared/routed
 # overlap was measured on (a multi-rank MegaMoE bench, shared on the side
 # stream against shared in series). Row counts above it were not measured, so
 # they keep the single-stream path. It is a fixed bound rather than the
-# configured graph size because larger decode graphs are untested.
-V4_DUAL_STREAM_MOE_TOKEN_THRESHOLD = 1536
+# configured graph size because larger decode graphs are untested. Prefill
+# steps keep the generic bound: prefill chunks of these sizes were not
+# measured.
+V4_DUAL_STREAM_DECODE_TOKEN_THRESHOLD = 1536
 
 
-def v4_dual_stream_token_threshold() -> int:
-    """The V4 MoE's dual-stream row bound: ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
-    where it is set (0 still turns the dual stream off), else
-    `V4_DUAL_STREAM_MOE_TOKEN_THRESHOLD`."""
+def v4_dual_stream_decode_token_threshold() -> int:
+    """The V4 MoE's dual-stream row bound on decode steps:
+    ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD where it is set (0 still turns the
+    dual stream off), else `V4_DUAL_STREAM_DECODE_TOKEN_THRESHOLD`."""
     if envs.is_set("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD"):
         return envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
-    return V4_DUAL_STREAM_MOE_TOKEN_THRESHOLD
+    return V4_DUAL_STREAM_DECODE_TOKEN_THRESHOLD
 
 
 class MoE(nn.Module):
@@ -2954,8 +2956,7 @@ class MoE(nn.Module):
         # active when shared_experts exist (not fused into routed) AND the
         # env threshold is positive AND we got an alt_stream from the model.
         # Per-call row gating happens inside the custom op dispatcher: a call
-        # with more rows than `_dual_stream_token_threshold` (set below) stays
-        # single-stream.
+        # with more rows than its step's bound (set below) stays single-stream.
         self._use_dual_stream = (
             self.shared_experts is not None
             and self.alt_stream is not None
@@ -2963,9 +2964,13 @@ class MoE(nn.Module):
         )
         # V4 family: the routed MoE waits on its EP exchange for a large part
         # of each layer, which the side-stream shared expert fills up to
-        # larger decode batches than the generic default. An explicitly set
-        # ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD still wins.
-        self._dual_stream_token_threshold = v4_dual_stream_token_threshold()
+        # larger decode batches than the generic default; prefill steps keep
+        # the generic bound. An explicitly set
+        # ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD applies to both.
+        self._dual_stream_token_threshold = envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
+        self._dual_stream_decode_token_threshold = (
+            v4_dual_stream_decode_token_threshold()
+        )
         # Keep comm-fused token-bucket dispatch dynamic under torch.compile.
         self._use_comm_fused_dispatch = self.experts._comm_fused_moe is not None
         # Register self in static_forward_context so the custom op dispatcher
