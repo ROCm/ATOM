@@ -860,6 +860,13 @@ def target_layer(E, Ly):
         pc0 = hx.getpc()   # (here, on the hot path: the prefetch itself sits in a cold block)
         if hx.unlikely(((Ly == fx.Int32(0)) | lfl(8)) & (b % L0_MID_ONE_IN == 0)):
             hx.code_prefetch_near(hx.opaque_v(fx.thread_idx.x), b, fptr(fp, "cyc") + i64(S.CODE_END_OFF), L0_MID_KB, pc=pc0)
+    else:
+        # the draft launch's first layer: the same, bounded by the draft launch's own recorded end (CODE_END_OFF + 8).
+        # Its first layer ran 78-89 us against 59-60 for the next two (the entry's CTA-split code_prefetch warms each
+        # XCD's L2 with a part only); this prefetch: 71-74 us, the draft launch -8 us, the target unchanged (CT1 probe, 11-18)
+        pc0 = hx.getpc()
+        if hx.unlikely((Ly == fx.Int32(L0)) & (b % L0_MID_ONE_IN == 0)):
+            hx.code_prefetch_near(hx.opaque_v(fx.thread_idx.x), b, fptr(fp, "cyc") + i64(S.CODE_END_OFF + 8), L0_MID_KB, pc=pc0)
     AS.stage_E4(cwith(c, **v3f, **v3e))   # (wo_a with the head sum in the CTA: no fold hop)
     AS.stage_F3(cwith(c, **v3f, NEF=64))
     AS.tp3(cwith(c, ytgt=fptr(fp, "y1")), par * 2, 2 * Ly + 1)
