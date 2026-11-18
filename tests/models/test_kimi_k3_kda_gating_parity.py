@@ -24,8 +24,9 @@ def _gfx1250() -> bool:
 pytestmark = pytest.mark.skipif(not _gfx1250(), reason="gfx1250 only")
 
 K = 128
-# A rank's share of Kimi-K3's 96 KDA heads at TP 8, 4 and 2.
-HEADS = [12, 24, 48]
+# A rank's share of GLM-5.3-Flash's 64 KDA heads at TP 8, and of Kimi-K3's 96
+# at TP 8, 4 and 2.
+HEADS = [8, 12, 24, 48]
 
 
 @pytest.fixture(scope="module")
@@ -41,6 +42,7 @@ def _padded(table):
 
 
 def _compare(gating_update, heads, write, read, accepted, tokens_per_seq):
+    torch.manual_seed(heads)
     t = write.size(0) * tokens_per_seq
     act = {"dtype": torch.bfloat16, "device": "cuda"}
     # beta is a column slice of the fused in-projection output in _forward_impl.

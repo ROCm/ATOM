@@ -20,9 +20,11 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.triton.attention.kda_atom import (
-    fused_sigmoid_gating_delta_rule_update as aiter_kda_gating_update,
+from aiter.ops.triton.attention.kda_gating import (
+    kda_gating_decode as aiter_kda_gating_decode,
+)
+from aiter.ops.triton.attention.kda_gating import (
+    supports as aiter_kda_gating_supports,
 )
 from einops import rearrange
 from torch import nn
@@ -86,25 +88,33 @@ logger = logging.getLogger("atom")
 
 
 @functools.cache
-def _use_aiter_kda_gating(lower_bound: float | None) -> bool:
+def _use_aiter_kda_gating(
+    lower_bound: float | None, head_dim: int, act_dtype: torch.dtype
+) -> bool:
     """Whether decode and spec verify run the KDA gating update on aiter's
     gfx1250 kernel instead of ATOM's Triton kernel.
 
-    Decided from what is fixed before the first call: the arch, the gate and
-    the state pool's dtype (aiter's kernel reads and writes an fp32 state).
-    aiter checks the rest of its limits on every call. One cached decision and
-    one log line serve every KDA layer.
+    aiter's ``supports`` decides from what is fixed before the first call: the
+    GPU, the gate, the state pool's dtype, the head size and the activation
+    dtype. aiter checks the rest of its limits on every call. One cached
+    decision and one log line serve every KDA layer.
     """
-    gfx = get_gfx()
-    state_dtype = envs.ATOM_GDN_SSM_DTYPE
-    on_aiter = gfx == "gfx1250" and lower_bound is not None and state_dtype == "fp32"
+    state_dtype = getattr(dtypes, envs.ATOM_GDN_SSM_DTYPE, None)
+    on_aiter = aiter_kda_gating_supports(
+        lower_bound=lower_bound,
+        state_dtype=state_dtype,
+        head_k_dim=head_dim,
+        head_v_dim=head_dim,
+        act_dtype=act_dtype,
+    )
     logger.info(
-        "KDA decode and spec verify gating on %s (arch %s, lower_bound %s, "
-        "ATOM_GDN_SSM_DTYPE=%s)",
+        "KDA decode and spec verify gating on %s (lower_bound %s, head_dim %d, "
+        "%s activations, ATOM_GDN_SSM_DTYPE=%s)",
         "aiter's gfx1250 kernel" if on_aiter else "ATOM's Triton kernel",
-        gfx,
         lower_bound,
-        state_dtype,
+        head_dim,
+        act_dtype,
+        envs.ATOM_GDN_SSM_DTYPE,
     )
     return on_aiter
 
@@ -134,32 +144,30 @@ def _kda_gating_update(
     without a launch, for inputs its kernel does not take, and a routed call
     that it declines raises.
     """
-    kernel = (
-        aiter_kda_gating_update if on_aiter else fused_sigmoid_gating_delta_rule_update
-    )
-    result = kernel(
-        A_log=A_log,
-        a=a,
-        b=b,
-        dt_bias=dt_bias,
-        q=q,
-        k=k,
-        v=v,
-        o=o,
-        initial_state=initial_state,
-        inplace_final_state=True,
-        cu_seqlens=cu_seqlens,
-        ssm_state_indices=ssm_state_indices,
-        ssm_state_indices_in=ssm_state_indices_in,
-        num_accepted_tokens=num_accepted_tokens,
-        use_qk_l2norm_in_kernel=True,
-        is_kda=True,
-        lower_bound=lower_bound,
-    )
-    if on_aiter and result is None:
+    args = {
+        "A_log": A_log,
+        "a": a,
+        "b": b,
+        "dt_bias": dt_bias,
+        "q": q,
+        "k": k,
+        "v": v,
+        "o": o,
+        "initial_state": initial_state,
+        "inplace_final_state": True,
+        "cu_seqlens": cu_seqlens,
+        "ssm_state_indices": ssm_state_indices,
+        "ssm_state_indices_in": ssm_state_indices_in,
+        "num_accepted_tokens": num_accepted_tokens,
+        "use_qk_l2norm_in_kernel": True,
+        "lower_bound": lower_bound,
+    }
+    if not on_aiter:
+        fused_sigmoid_gating_delta_rule_update(**args, is_kda=True)
+    elif aiter_kda_gating_decode(**args) is None:
         raise RuntimeError(
             "aiter's gfx1250 KDA gating kernel declined a call routed to it; "
-            "aiter's try_kda_gating lists the inputs it takes"
+            "AITER_TRITON_LOG_LEVEL=DEBUG logs the reason"
         )
 
 
@@ -1194,7 +1202,9 @@ class KimiKDAAttention(nn.Module):
         self._kda_gate_lower_bound = (
             getattr(config, "linear_attn_config", {}) or {}
         ).get("gate_lower_bound", None)
-        self._kda_gating_on_aiter = _use_aiter_kda_gating(self._kda_gate_lower_bound)
+        self._kda_gating_on_aiter = _use_aiter_kda_gating(
+            self._kda_gate_lower_bound, self.head_dim, atom_config.torch_dtype
+        )
         loader = _sharded_vector_loader(self.tp_rank, self.tp_size)
         self.A_log.weight_loader = loader
         self.dt_bias.weight_loader = loader
