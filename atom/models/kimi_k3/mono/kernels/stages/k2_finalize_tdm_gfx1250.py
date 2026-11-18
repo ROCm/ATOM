@@ -9,11 +9,12 @@ through ``gemv_tdm_gfx1250``, with no second all-reduce. CTA ``p`` owns the
 """
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import gpu, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int64, T
 
 from atom.models.kimi_k3.mono.config import HIDDEN, LATENT
@@ -57,11 +58,31 @@ def build_replicated_finalize(plan: Gfx1250KimiBuildPlan) -> K2ReplicatedFinaliz
     rows = plan.tokens
     tiles = (rows + ROWS - 1) // ROWS
 
+    # Where both do not fit (64 rows) the accumulators overlay the GEMV's LDS,
+    # written once every wave is past its last read of it.
+    overlay = (
+        4 * (sum(tdm_lds_words(rows, 2)) + 2 * tiles * ACCUMULATOR_WORDS)
+        > GFX1250.max_workgroup_lds_bytes
+    )
+
     @fx.struct
     class Lds:
         gemv: fx.Array[fx.Int32, sum(tdm_lds_words(rows, 2)), 16]
         # Both tasks' accumulators of every tile.
         red: fx.Array[fx.Float32, 2 * tiles * ACCUMULATOR_WORDS, 16]
+
+    @fx.struct
+    class GemvLds:
+        gemv: fx.Array[fx.Int32, sum(tdm_lds_words(rows, 2)), 16]
+
+    @fx.struct
+    class RedLds:
+        red: fx.Array[fx.Float32, 2 * tiles * ACCUMULATOR_WORDS, 16]
+
+    @fx.union
+    class OverlayLds:
+        gemv: GemvLds
+        red: RedLds
 
     name = f"k3_k2_gfx1250_replicated_finalize_s{rows}"
 
@@ -74,7 +95,13 @@ def build_replicated_finalize(plan: Gfx1250KimiBuildPlan) -> K2ReplicatedFinaliz
         row0 = fx.block_idx.x * (2 * ROWS)
         lane = tid % GFX1250.wave_size
         wave = tid // GFX1250.wave_size
-        lds = fx.SharedAllocator().allocate(Lds).peek()
+        if const_expr(overlay):
+            union = fx.SharedAllocator().allocate(OverlayLds)
+            lds = SimpleNamespace(
+                gemv=union.gemv.peek().gemv, red=union.red.peek().red
+            )
+        else:
+            lds = fx.SharedAllocator().allocate(Lds).peek()
         # Threads [0, 128) finish a tile's first task, the rest its second; the
         # shared rows they add are loaded before the projection.
         task = tid // (ROWS * 8)
@@ -102,6 +129,8 @@ def build_replicated_finalize(plan: Gfx1250KimiBuildPlan) -> K2ReplicatedFinaliz
             lane,
             wave,
         )
+        if const_expr(overlay):
+            gpu.barrier()
         for tile in range_constexpr(tiles):
             for index in range_constexpr(2):
                 gemv_gfx1250.store_accumulator(

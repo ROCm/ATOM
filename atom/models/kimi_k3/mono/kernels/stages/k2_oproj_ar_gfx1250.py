@@ -102,6 +102,11 @@ def triples(rows: int) -> int:
     return -(-rows // LINE_TOKENS)
 
 
+def line_rounds(rows: int) -> int:
+    """A CTA's ``[triple][pair]`` lines a thread: one up to 48 rows."""
+    return -(-triples(rows) * CTA_PAIRS // THREADS)
+
+
 def bank_words(tp: int, rows: int) -> int:
     """A bank: the partials ``[source rank][token triple][owned pair]``, then
     the sums ``[token triple][pair]``, a line each."""
@@ -242,11 +247,21 @@ def _reduce_share(mine, bases, rank, rows, tp, own, bank, epoch, bid, tid, stamp
 @traced
 def _oneshot_sums(mine, out, rows, tp, bank, epoch, bid, tid, stamp):
     """This CTA's columns from every rank's partials (``_reduce_owned``'s
-    sums), landed here: no sum leaves the rank."""
+    sums), landed here: no sum leaves the rank. Past 48 rows a thread takes
+    a line a round, the rounds in turn."""
+    for k in range_constexpr(line_rounds(rows)):
+        _oneshot_sum(
+            mine, out, rows, tp, bank, epoch, bid, tid if k == 0 else tid + k * THREADS,
+            stamp if k == 0 else (lambda *_: None),
+        )  # fmt: skip
+
+
+@traced
+def _oneshot_sum(mine, out, rows, tp, bank, epoch, bid, item, stamp):
     count = triples(rows)
-    if tid < count * CTA_PAIRS:
-        triple = tid // CTA_PAIRS
-        column_pair = bid * CTA_PAIRS + tid % CTA_PAIRS
+    if item < count * CTA_PAIRS:
+        triple = item // CTA_PAIRS
+        column_pair = bid * CTA_PAIRS + item % CTA_PAIRS
         partials = _poll_lines(
             mine,
             [
@@ -356,6 +371,57 @@ def _store_stage(live, address, word):
         fx.ptr_store(word, address)
 
 
+@traced
+def _push_oneshot(stage, bases, rank, rows, bank, epoch, bid, item):
+    """Staged line ``item`` (``[triple][pair]``) of this CTA to every rank."""
+    if item < triples(rows) * CTA_PAIRS:
+        triple = item // CTA_PAIRS
+        words = [
+            fx.ptr_load(
+                stage + (triple * LINE_TOKENS + j) * CTA_PAIRS + item % CTA_PAIRS
+            )
+            for j in range(LINE_TOKENS)
+        ]
+        line = fx.Vector.from_elements([*words, epoch], fx.Int32)
+        at = (
+            fx.Int64(
+                bank
+                + LINE_WORDS
+                * (
+                    (rank * triples(rows) + triple) * (HIDDEN // 2)
+                    + bid * CTA_PAIRS
+                    + item % CTA_PAIRS
+                )
+            )
+            * 4
+        )
+        for base in bases:
+            ar._store_line_sys(base + at, line)
+
+
+@traced
+def _push_owner(stage, owner_base, rank, rows, own, bank, epoch, row0, owner, item):
+    """Staged line ``item`` (``[triple][pair]``) of this CTA, its first column
+    ``row0``, to rank ``owner``, owning its columns."""
+    if item < triples(rows) * CTA_PAIRS:
+        triple = item // CTA_PAIRS
+        pair = item % CTA_PAIRS
+        words = [
+            fx.ptr_load(stage + (triple * LINE_TOKENS + j) * CTA_PAIRS + pair)
+            for j in range(LINE_TOKENS)
+        ]
+        owned = (row0 - owner * (2 * own)) // 2 + pair
+        at = (
+            fx.Int64(
+                bank + LINE_WORDS * ((rank * triples(rows) + triple) * own + owned)
+            )
+            * 4
+        )
+        ar._store_line_sys(
+            owner_base + at, fx.Vector.from_elements([*words, epoch], fx.Int32)
+        )
+
+
 def build_oproj_allreduce(
     plan: Gfx1250KimiBuildPlan,
     tp: int,
@@ -375,8 +441,6 @@ def build_oproj_allreduce(
     if HIDDEN % (tp * CTA_COLUMNS):
         raise ValueError(f"a rank's columns must be whole CTAs at TP{tp}")
     rows = plan.tokens
-    if triples(rows) * CTA_PAIRS > THREADS:
-        raise ValueError(f"the o_proj all-reduce cuts {rows} rows into a line a thread")
     tiles = (rows + ROWS - 1) // ROWS
     own = own_pairs(tp)
     oneshot = _oneshot(oneshot)
@@ -495,53 +559,22 @@ def build_oproj_allreduce(
                 fx.ptr_store(fx.Int32(0), lds.stage.ptr + rows * CTA_PAIRS + tid)
         gpu.barrier()
         stamp(STAMP_STAGED)
+        # past 48 rows a thread pushes a line a round, every round's before
+        # any poll
         if const_expr(oneshot):
-            if tid < triples(rows) * CTA_PAIRS:
-                triple = tid // CTA_PAIRS
-                words = [
-                    fx.ptr_load(
-                        lds.stage.ptr
-                        + (triple * LINE_TOKENS + j) * CTA_PAIRS
-                        + tid % CTA_PAIRS
-                    )
-                    for j in range(LINE_TOKENS)
-                ]
-                line = fx.Vector.from_elements([*words, epoch], fx.Int32)
-                at = (
-                    fx.Int64(
-                        bank
-                        + LINE_WORDS
-                        * (
-                            (rank * triples(rows) + triple) * (HIDDEN // 2)
-                            + bid * CTA_PAIRS
-                            + tid % CTA_PAIRS
-                        )
-                    )
-                    * 4
-                )
-                for base in bases:
-                    ar._store_line_sys(base + at, line)
+            for k in range_constexpr(line_rounds(rows)):
+                _push_oneshot(
+                    lds.stage.ptr, bases, rank, rows, bank, epoch, bid,
+                    tid if k == 0 else tid + k * THREADS,
+                )  # fmt: skip
             stamp(STAMP_PUSHED)
             _oneshot_sums(mine, out, rows, tp, bank, epoch, bid, tid, stamp)
-        elif tid < triples(rows) * CTA_PAIRS:
-            triple = tid // CTA_PAIRS
-            pair = tid % CTA_PAIRS
-            words = [
-                fx.ptr_load(
-                    lds.stage.ptr + (triple * LINE_TOKENS + j) * CTA_PAIRS + pair
-                )
-                for j in range(LINE_TOKENS)
-            ]
-            owned = (row0 - owner * (2 * own)) // 2 + pair
-            at = (
-                fx.Int64(
-                    bank + LINE_WORDS * ((rank * triples(rows) + triple) * own + owned)
-                )
-                * 4
-            )
-            ar._store_line_sys(
-                owner_base + at, fx.Vector.from_elements([*words, epoch], fx.Int32)
-            )
+        else:
+            for k in range_constexpr(line_rounds(rows)):
+                _push_owner(
+                    lds.stage.ptr, owner_base, rank, rows, own, bank, epoch,
+                    row0, owner, tid if k == 0 else tid + k * THREADS,
+                )  # fmt: skip
         if const_expr(not oneshot):
             stamp(STAMP_PUSHED)
             if const_expr(rows > SPREAD_ROWS):
