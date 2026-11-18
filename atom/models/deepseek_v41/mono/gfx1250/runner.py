@@ -90,6 +90,7 @@ def import_kernels() -> dict:
         "markov",
         "tail",
         "step",
+        "prep",
     )
     return {n: importlib.import_module(f"{KERNELS}.{n}") for n in names}
 

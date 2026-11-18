@@ -201,6 +201,11 @@ class StepInputs:
         S = self.tables.step
         geom = cache.geometry
         window = geom.window(0, cache.num_pages)
+        if self.tables.idx and self.tables.comp:
+            # the sampling parameters, the step metadata, the plans and the per-row copies / fills: one launch
+            # (kernels/prep.py; the values of the four below)
+            self._prep_one(input_ids, step, geom, window, rows, req)
+            return
         S["sparam"].copy_(self._sp_pin, non_blocking=True)
         write_step_meta(
             step,
@@ -262,6 +267,44 @@ class StepInputs:
             # Markov's per-(position, request) global argmax is an atomic max: it must restart from INT64_MIN every
             # step (as the fixture does), else the drafts keep earlier steps' winners
             mbest=self.scratch["mbest"].view(torch.int64),
+        )
+
+    def _prep_one(self, input_ids, step, geom, window, rows, req) -> None:
+        """kernels/prep.py's launch (idx and comp tables): its build keyed by the integer widths of its buffers."""
+        S = self.tables.step
+        ids = input_ids.view(-1)
+        bt = step.block_tables
+        nbt, cc = bt.shape[0], min(bt.shape[1], BCOLS)
+        bufs = dict(pos=step.positions, ids=ids, bids=step.batch_ids, slots=step.slots, bt=bt, rpos=S["rpos"],
+                    firstp=self.first_positions, tids=S["tids"], dids=S["dids"], ctxkvw=S["ctx_kvw"], ibat=S["ibat"],
+                    btab=S["btab"], slotsd=S["slots"], vis=S["ibound1"])
+        widths = tuple(sorted((k, v.element_size()) for k, v in bufs.items()))
+        for k, v in bufs.items():
+            if v.element_size() not in (4, 8) or v.dtype.is_floating_point:
+                raise MonoUnsupported(f"step preparation: {k} {v.dtype}")
+        assert S["kvw"].element_size() == 4 and S["kmeta"].element_size() == 4 and S["dgeom"].element_size() == 4
+        assert all(S[f"{p}{r}"].dtype == torch.int32 for p in ("cplan", "wplan") for r in (1, 2))
+        assert S["ibound2"].dtype == S["ibound1"].dtype and self._sp_pin.is_pinned()
+        launch = self._prep_builds.get(widths) if hasattr(self, "_prep_builds") else None
+        if launch is None:
+            self._prep_builds = getattr(self, "_prep_builds", {})
+            launch = self._prep_builds[widths] = self.K["prep"].build(
+                widths, ROWS_PER_REQ, BCOLS, (1, 2), geom.speculative_tokens, T_MAX
+            )
+        cnt = self.scratch["cnt"].view(torch.int32)
+        ss = self.scratch["ss"].view(torch.int32)
+        mbest = self.scratch["mbest"].view(torch.int64)
+        cos, sin = self._ctx_rope
+        P = lambda x: x.data_ptr()
+        launch(
+            P(step.positions), P(ids), P(step.batch_ids), P(step.slots), P(cos), P(sin), P(bt), P(S["kvw"]),
+            P(S["kmeta"]), P(S["ibound1"]), P(S["ibound2"]), P(S["cplan1"]), P(S["wplan1"]), P(S["cplan2"]),
+            P(S["wplan2"]), P(self._sp_pin), P(S["sparam"]), P(S["rpos"]), P(self.first_positions), P(S["tids"]),
+            P(S["dids"]), P(S["dgeom"]), P(S["ctx_kvw"]), P(S["ctx_rcos"]), P(S["ctx_rsin"]), P(S["ibat"]),
+            P(S["btab"]), P(S["slots"]), P(cnt), P(ss), P(mbest),
+            rows, req, nbt, cc, bt.stride(0), int(window.slot_rows), int(window.ring_slots), int(geom.window_size),
+            cnt.numel(), ss.numel(), mbest.numel(), self._sp_pin.numel(),
+            torch.cuda.current_stream(),
         )
 
     def _sampling(self, batch, req) -> None:
