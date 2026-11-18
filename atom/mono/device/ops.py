@@ -28,7 +28,6 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.dpp_utils import update_dpp_i32
-from aiter.ops.flydsl.kernels.kernels_common import kernel_signature
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.compiler.ast_rewriter import ASTRewriter
@@ -36,6 +35,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T, as_ir_value
 
+from atom.mono.plan.build_key import kernel_symbol  # noqa: F401
 from atom.mono.plan.execution import THREADS, WAVES
 from atom.mono.polling import SPIN_PAUSE_ASM
 
@@ -50,14 +50,6 @@ CM_SYS = 17
 # NT = 2: nontemporal. A weight a layer reads once streams past the caches it
 # would only evict the step's reused data from
 CM_NT = 2
-
-
-def kernel_symbol(stem, **params):
-    """Kernel symbol that profilers demangle to ``atom::<stem>_<params>``. The
-    amdhsa assembler rejects ``::`` in a symbol, so it is Itanium-mangled, as
-    aiter's ``_ZN5aiter...E`` kernels are."""
-    name = f"{stem}_{kernel_signature(**params)}"
-    return f"_ZN4atom{len(name)}{name}E"
 
 
 def launcher(symbol):

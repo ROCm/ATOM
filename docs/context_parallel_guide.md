@@ -328,7 +328,7 @@ nothing.
 | `interleave_size` | int | `1` | KV-cache interleave granularity `S`: token `i` lives on DCP rank `(i // S) % W`. `1` = token-level round-robin |
 | `enable_query_replication` | bool | `true` | Replicate the MLA query projection across the DCP group at load time, so each rank produces the whole group's head set locally and the per-step decode AllGather Q disappears |
 | `enable_project_before_merge` | bool | `true` | Apply the V up-projection *before* the DCP output merge, so the merge exchanges `v_head_dim` per head instead of `kv_lora_rank` |
-| `comm_backend` | str | `"a2a"` | Which collective pattern merges the per-rank partial attention: `"a2a"` or `"ag_rs"` |
+| `comm_backend` | str | `"auto"` | Which collective pattern merges the per-rank partial attention: `"auto"`, `"a2a"`, `"ag_rs"` or `"mailbox"` |
 
 > **Three of the four default to the new behaviour.** A control run that wants
 > the old path must say so **explicitly** — passing nothing re-runs the new
@@ -426,17 +426,47 @@ Covers both decode and sparse prefill. Costs a DCP-group-wide copy of `W_V`
 
 ### `comm_backend`
 
-Both backends compute the same thing and are **mathematically equivalent but not
+All backends compute the same thing and are **mathematically equivalent but not
 bitwise identical** (different summation order, and `a2a` round-trips the fp32
 LSE through two 16-bit halves of a bf16 buffer).
 
 | Value | Pattern | Collectives |
 |-------|---------|-------------|
-| `a2a` (default) | one all-to-all with the LSE packed alongside the output, combine done locally | **1** |
+| `auto` (default) | `mailbox` on gfx950 with DCP > 1 when decode TBO and plugin mode are off, `a2a` otherwise; the choice is logged at startup | |
+| `a2a` | one all-to-all with the LSE packed alongside the output, combine done locally | **1** |
 | `ag_rs` | AllGather LSE + local correct + ReduceScatter output | 2 |
+| `mailbox` | decode only: aiter's FlyDSL `dcp_lse_combine`, one launch that stores each owner's rows and LSEs into its IPC-mapped mailbox and combines them there | **0** (no collective launch) |
 
 Byte counts are about the same; what `a2a` saves is one collective's launch and
 sync.
+
+`mailbox` needs aiter `78a14ae5d` or later (aiter PR #6972 and #7943) and
+FlyDSL >= 0.5.0. That is required, not detected: an aiter without
+`aiter.ops.flydsl.dcp_mailbox` or a FlyDSL older than 0.5.0 fails at startup
+(set `comm_backend` to `a2a`), and an aiter from `d223b16cf` up to `78a14ae5d`
+runs the earlier tagged mailbox, without the agreed allocation fallback. When
+the peer memory cannot be allocated
+or mapped (e.g. a DCP group spanning nodes), it logs a warning once and merges
+with `a2a` on every rank. Plugin mode takes `a2a` at startup, for `auto` and an
+explicit `mailbox` alike. Only graph-captured decode steps take it: an eager
+call re-traces the FlyDSL kernel on the host every time (about 77 ms a call on
+Kimi-K3 at DCP8), which a capture pays once, so eager steps and prefill merge
+with `a2a`. An explicit `mailbox` is refused together with decode TBO
+(`--enable-tbo all`); `auto` takes `a2a` there. After graph capture the ranks
+check that they captured the same number of mailbox merges and refuse to serve
+otherwise, since a rank one launch ahead would pair every later merge with the
+wrong peer call. The first startup builds a few kernels (one per token tile and
+row-mask variant); set `comm_backend` to `a2a` to opt out.
+A merge larger than `2^21` elements (tokens x all heads x head dim: 128 tokens
+on GLM-5.2 at DCP4, 170 on Kimi-K3 at DCP8) takes `a2a`. Measured on MI355X in
+a CUDA graph, the mailbox leads RCCL on GLM-5.2 up to 512 tokens and on
+Kimi-K3 through 160 tokens; at 192 tokens, where the combine's token tile
+steps from 4 to 8, Kimi-K3 falls behind. Its peer buffer, `2 x ranks x tokens
+x local heads x (2 x head dim + 4)` bytes with `tokens = min(max_num_seqs x (1
++ num_speculative_tokens), 2^21 / (ranks x local heads x head dim))`, at most
+about 8 MiB on both models, is mapped at model build, so it comes out of the
+KV budget. The combine does not quantize: with a per-token FP8 `o_proj` its
+output is quantized by `o_proj` itself.
 
 ## Launching server
 

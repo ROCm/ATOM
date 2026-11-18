@@ -1,4 +1,6 @@
 pub mod app_context;
+#[cfg(feature = "atom-engine")]
+pub mod atom_engine;
 pub mod cliargs;
 pub mod config;
 pub mod core;

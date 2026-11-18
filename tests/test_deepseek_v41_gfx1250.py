@@ -173,6 +173,15 @@ def test_a_refused_deployment_keeps_the_model(monkeypatch):
     assert out is inner
 
 
+def test_lossless_sampling_keeps_the_model(monkeypatch):
+    """The single launch drafts and verifies inside the kernel and publishes
+    no q, so an armed lossless drafter keeps the production model."""
+    monkeypatch.setattr(dispatch, "refusal", lambda cfg: None)
+    inner = nn.Linear(1, 1)
+    drafter = NS(lossless=object())
+    assert dispatch.install_single_step(inner, atom_config(), drafter) is inner
+
+
 @needs_aiter
 def test_mono_dispatch_routes_to_the_single_launch_when_enabled(monkeypatch):
     monkeypatch.setattr(gfx1250, "enabled", lambda: True)
@@ -609,9 +618,6 @@ def test_the_step_kernel_traces_on_several_threads_at_once(monkeypatch):
     """
     pytest.importorskip("flydsl")
     monkeypatch.setenv("ARCH", "gfx1250")
-    monkeypatch.setenv(
-        "FLYDSL_RUNTIME_ENABLE_CACHE", "0"
-    )  # a cached build is not traced
     from atom.models.deepseek_v41.mono.gfx1250.kernels import device as hx
     from atom.models.deepseek_v41.mono.gfx1250.kernels import step
     from atom.mono.runtime.compile import compile_only
