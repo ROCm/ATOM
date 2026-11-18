@@ -642,6 +642,11 @@ def target_layer(E, Ly):
                 segw = cs_["iprod"] & grp
                 if fx.const_expr(L20_ORD and TR <= TK.MC_ROWS):   # (l20) the ordered multi-CTA selection reads whole rows: SCORE
                     segw = fx.Int32(0) != fx.Int32(0)
+                # the selecting CTAs (select_mc: b < TR x MC_G; layer 20's select_ord: up to TR x (GS + GB)): the selection's
+                # code -> the I-cache over the SCORE wait (it runs cold: once in 4+ layers); select_mc / select_ord follow
+                # in the cold index section, inside the 24 KB from here
+                if (b < TR * TK.MC_G) | cs_["iprod"]:
+                    iprefetch(24)
                 if segw == (fx.Int32(0) != fx.Int32(0)):
                     handoff(lc + i64(LY.SCORE), t, True)
                 # (the selection tree's levels past the first only when a row has more than one level-0 list: every row's
