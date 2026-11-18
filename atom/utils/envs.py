@@ -759,11 +759,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KIMI_MONO_FUSED_MOE_ROWS": lambda: int(
         os.getenv("ATOM_KIMI_MONO_FUSED_MOE_ROWS", "48")
     ),
-    # Kimi-K3 gfx1250 mono: K2's gathering all-reduce, routed RMSNorm and
-    # replicated finalize as one resident launch (k2_tail_gfx1250, the same
-    # bits) where the gathering all-reduce runs a line a thread; 0 keeps the
-    # three launches.
-    "ATOM_KIMI_MONO_TAIL": lambda: os.getenv("ATOM_KIMI_MONO_TAIL", "0") == "1",
+    # 1, the default: Kimi-K3 gfx1250 mono runs K2's gathering all-reduce,
+    # routed RMSNorm and replicated finalize as one resident launch
+    # (k2_tail_gfx1250, the same bits) where the gathering all-reduce runs a
+    # line a thread (up to 42 rows); 0 keeps the three launches.
+    "ATOM_KIMI_MONO_TAIL": lambda: os.getenv("ATOM_KIMI_MONO_TAIL", "1") == "1",
+    # The K2 tail's remote pushes on waves of their own, so the store drain
+    # before its flag waits for no fabric ack (k2_tail_gfx1250, the same
+    # bits); 0 keeps every wave pushing and reducing its own line.
+    "ATOM_KIMI_MONO_TAIL_SPLIT": lambda: (
+        os.getenv("ATOM_KIMI_MONO_TAIL_SPLIT", "0") == "1"
+    ),
     # 1, the default: under the fused MoE, each routing CTA of the gfx1250 lite
     # finish finishes its own token's HERD routes and runs no shared down
     # (build_packed_finish(parallel_herd=True), the same bits); 0 leaves HERD
