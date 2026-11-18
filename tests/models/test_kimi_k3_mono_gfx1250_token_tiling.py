@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""CPU proofs for gfx1250 Kimi M16 token tiling through S=48."""
+"""CPU proofs for gfx1250 Kimi M16 token tiling through S=64."""
 
 import pytest
 
@@ -21,6 +21,9 @@ from atom.models.kimi_k3.mono.kernels.token_tiling import (
 from atom.mono.plan.architecture import GFX1250
 
 BOUNDARIES = (16, 17, 32, 33, 48)
+# past three tiles: tiling, GEMV, routing and K1 ownership only (the K2 LDS
+# plans of the legacy substrate stop at 48)
+WIDE = (49, 64)
 
 
 def _plan(tokens):
@@ -33,7 +36,7 @@ def _plan(tokens):
     )
 
 
-@pytest.mark.parametrize("tokens", BOUNDARIES)
+@pytest.mark.parametrize("tokens", BOUNDARIES + WIDE)
 def test_token_tiles_cover_every_row_once(tokens):
     tiling = Gfx1250TokenTiling(tokens)
     rows = [row for tile in tiling.tiles for row in tile.row_range]
@@ -45,14 +48,14 @@ def test_token_tiles_cover_every_row_once(tokens):
         assert tiling.tile(tile).global_row(local) == row
 
 
-def test_token_tiling_rejects_row_49():
-    with pytest.raises(ValueError, match=r"\[1, 48\]"):
-        Gfx1250TokenTiling(49)
-    with pytest.raises(ValueError, match=r"\[1, 48\]"):
-        _plan(49)
+def test_token_tiling_rejects_row_65():
+    with pytest.raises(ValueError, match=r"\[1, 64\]"):
+        Gfx1250TokenTiling(65)
+    with pytest.raises(ValueError, match=r"\[1, 64\]"):
+        _plan(65)
 
 
-@pytest.mark.parametrize("tokens", BOUNDARIES)
+@pytest.mark.parametrize("tokens", BOUNDARIES + WIDE)
 def test_gemv_tiles_cover_all_output_coordinates(tokens):
     tiling = gemv_layout.GFX1250_GEMV.token_tiling(tokens)
     coordinates = []
@@ -81,7 +84,7 @@ def _routes(tokens):
     )
 
 
-@pytest.mark.parametrize("tokens", BOUNDARIES)
+@pytest.mark.parametrize("tokens", BOUNDARIES + WIDE)
 def test_route_kof_tiles_and_quant_groups_cover_all_tokens(tokens):
     route = moe_layout.RouteUnionContract(GFX1250, 256, tokens)
     union = route.build(_routes(tokens))
@@ -101,7 +104,7 @@ def test_route_kof_tiles_and_quant_groups_cover_all_tokens(tokens):
     assert sorted(blocks) == list(range(quant.blocks))
 
 
-@pytest.mark.parametrize("tokens", BOUNDARIES)
+@pytest.mark.parametrize("tokens", BOUNDARIES + WIDE)
 def test_attention_and_protocol_cover_all_rows(tokens):
     contract = attention.kda_contract_for(GFX1250, waves=8)
     mixed = [
@@ -157,3 +160,24 @@ def test_s48_lds_unions_are_tile_local_aligned_and_bounded(tokens):
         min(tokens, 16) * k1.xrow * 2,
         gemv_layout.tdm_lds_bytes(tokens, PROJECTION_TASKS_PER_CTA),
     )
+
+
+@pytest.mark.parametrize("tokens", (40, 48, 49, 58, 59, 60, 64))
+def test_k1_fp8_projection_fits_through_s64(tokens):
+    """The BF16-sized projection region where it fits (every width <= 58,
+    unchanged), the FP8 TDM slabs alone past it."""
+    plan = _plan(tokens)
+    k1 = declare_local(plan, qlen=1, fp8=True)
+    assert k1.lds.arena.used_bytes <= 320 * 1024
+    bf16 = gemv_layout.tdm_lds_bytes(tokens, PROJECTION_TASKS_PER_CTA)
+    fp8 = gemv_layout.tdm_lds_bytes(
+        tokens, PROJECTION_TASKS_PER_CTA, True, gemv_layout.TDM_FP8_DEPTH
+    )
+    projection = k1.lds.variant("projection").fields[0].bytes
+    xrows = min(tokens, 16) * k1.xrow * 2
+    assert projection == max(xrows, bf16 if tokens <= 58 else fp8)
+    if tokens <= 58:
+        assert declare_local(plan, qlen=1).lds == k1.lds
+    else:
+        with pytest.raises(ValueError, match="LDS bytes"):
+            declare_local(plan, qlen=1)

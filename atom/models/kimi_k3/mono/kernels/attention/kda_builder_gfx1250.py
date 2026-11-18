@@ -466,9 +466,12 @@ def role_lds_plan(
     qlen: int,
     gemv_unit: int = 2,
     split: str | None = None,
+    fp8: bool = False,
 ) -> K1RoleLdsPlan:
     """Construct K1's exact Smem + role-union LDS byte layout. ``split``: the
-    split-K in-projection's weight format (``K1LocalBuildSpec.split_format``)."""
+    split-K in-projection's weight format (``K1LocalBuildSpec.split_format``).
+    ``fp8``: the in-projection is FP8, whose TDM slabs alone the projection
+    region holds where the BF16 ones would not fit (past 58 rows)."""
 
     if plan.nblocks is None:
         raise ValueError("gfx1250 K1 LDS needs explicit nblocks")
@@ -511,6 +514,11 @@ def role_lds_plan(
     accumulator_bytes = (
         PROJECTION_TASKS_PER_CTA * plan.token_tiling.tile_count * red_elements * 4
     )
+    if fp8 and smem_bytes + projection_bytes + accumulator_bytes > plan.lds_bytes:
+        projection_bytes = max(
+            tile_rows * xrow * 2,
+            tdm_lds_bytes(plan.tokens, PROJECTION_TASKS_PER_CTA, True, TDM_FP8_DEPTH),
+        )
     split_stages = 0
     if split is not None:
         split_projection_ctas(plan.blocks)
@@ -642,10 +650,11 @@ def declare(
     qlen: int,
     gemv_unit: int = 2,
     split: str | None = None,
+    fp8: bool = False,
 ) -> K1KernelDeclaration:
     """Create the gfx1250 K1 declaration up to kernel-body emission."""
 
-    lds = role_lds_plan(plan, qlen=qlen, gemv_unit=gemv_unit, split=split)
+    lds = role_lds_plan(plan, qlen=qlen, gemv_unit=gemv_unit, split=split, fp8=fp8)
     GFX1250_MAILBOX.require(*K1_REQUIRED_CAPABILITIES)
     assert plan.nblocks is not None
     name = (
@@ -680,6 +689,7 @@ def declare_local(
     qlen: int,
     gemv_unit: int = 2,
     split: str | None = None,
+    fp8: bool = False,
 ) -> K1KernelDeclaration:
     """Declare K1 for the external-collective path.
 
@@ -689,7 +699,7 @@ def declare_local(
     """
 
     return replace(
-        declare(plan, qlen=qlen, gemv_unit=gemv_unit, split=split),
+        declare(plan, qlen=qlen, gemv_unit=gemv_unit, split=split, fp8=fp8),
         unsupported_device_protocol=(),
     )
 
@@ -728,6 +738,7 @@ def build_local(
         qlen=spec.qlen,
         gemv_unit=spec.gemv_unit,
         split=spec.split_format,
+        fp8=spec.fp8_projection,
     )
     declaration = replace(
         declaration,

@@ -3,7 +3,7 @@
 """gfx1250 token-row tiling shared by Kimi K1 and K2 substrates.
 
 gfx1250 WMMA owns sixteen M rows per instruction.  Kimi's gfx1250 substrate
-therefore treats S=17..48 as two or three independent row tiles; it never
+therefore treats S=17..64 as two to four independent row tiles; it never
 allocates an S-by-K activation slab in LDS.  This module is pure Python so
 builders and tests can prove complete ownership before device emission.
 """
@@ -13,7 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 WMMA_TOKEN_ROWS = 16
-GFX1250_MAX_TOKENS = 48
+GFX1250_MAX_TOKENS = 64
 
 
 @dataclass(frozen=True)

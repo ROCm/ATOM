@@ -406,7 +406,7 @@ def _mono_attn_res(site, prefix, blocks, add, add2):
 class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
     """One TP8 rank with resident K1 and production K2."""
 
-    max_rows = GFX1250_MAX_TOKENS
+    max_rows = 48
     bind_k2 = False
     fp8_in_proj = True
     k2_peers: SymmPeers | None = None
