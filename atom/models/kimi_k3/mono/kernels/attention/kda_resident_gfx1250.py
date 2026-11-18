@@ -21,9 +21,11 @@ from atom.models.kimi_k3.mono.kernels.attention.kda_builder_gfx1250 import (
     HIDDEN,
     K1_ABI_NAMES,
     PROJECTION_TASKS_PER_CTA,
+    REPLAY_TABLE,
     K1KernelDeclaration,
     K1LocalBuildSpec,
     local_scratch_layout,
+    replay_staged,
 )
 from atom.models.kimi_k3.mono.kernels.attention.protocol import (
     ATTENTION_CTAS,
@@ -64,6 +66,8 @@ SEAM_COLUMNS = 128
 VALUE_CHUNK = 16
 PROJ = HEADS * HEAD_DIM
 PTPC_FP8_MAX = 448.0
+# the runner's ReplaySSM table is gfx950's (``runner._replay_table``)
+assert REPLAY_TABLE == base.REPLAY_TABLE
 _STREAM = fx.Stream(None)
 _BUILDS: dict[tuple[object, ...], object] = {}
 LOCAL_ABI = KernelAbi(K1_ABI_NAMES)
@@ -92,6 +96,8 @@ class ResidentBuildKey:
     tdm_projection: bool
     fp8_projection: bool
     split_stages: int
+    replay_cap: int = 0
+    replay_window: int = 0
 
 
 @dataclass(frozen=True)
@@ -256,7 +262,9 @@ def build_resident_k1(
     qlen = declaration.qlen
     sources = declaration.nblocks + 1
     task_count = (s // qlen) * HEADS * STATE_CHUNKS
-    whole_heads = qlen == 1 or task_count > declaration.blocks
+    # ReplaySSM rebuilds a state's rows in the CTAs that advance them: whole
+    # heads (or their parts) alone
+    whole_heads = qlen == 1 or task_count > declaration.blocks or spec.replay_cap > 0
     head_split = (
         _head_split((s // qlen) * HEADS, declaration.blocks) if whole_heads else 1
     )
@@ -286,6 +294,8 @@ def build_resident_k1(
             spec.tdm_projection,
             spec.fp8_projection,
             declaration.lds.split_stages,
+            spec.replay_cap,
+            spec.replay_window,
         ),
         SOURCES,
     ), (
@@ -302,6 +312,7 @@ def build_resident_k1(
         f"_u{spec.gemv_unit}_q{int(spec.quant_core)}"
         f"{'_xs' if spec.external_seam else ''}{'_t' if spec.tdm_projection else ''}"
         f"{'_f8' if spec.fp8_projection else ''}"
+        f"{f'_rp{spec.replay_cap}w{spec.replay_window}' if spec.replay_cap else ''}"
         f"{f'_sk{split_stages}' if split_stages else ''}{gemv_tdm.cold_suffix()}"
         f"{'' if _head_preload() else '_nohp'}{'' if _state_prefetch() else '_nosp'}"
         f"{f'_hs{head_split}' if head_split != auto_split else ''}"
@@ -518,6 +529,7 @@ def build_resident_k1(
         num_acc: Int64,
         core_out: Int64,
         core_q: Int64,
+        replay: Int64,
         scratch: Int64,
     ):
         _ = keyed
@@ -530,9 +542,7 @@ def build_resident_k1(
             gemv_tdm.prefetch_tokens(
                 prefix, s, HIDDEN * 2, bid, tid, declaration.blocks
             )
-        if const_expr(
-            _state_prefetch() and (qlen == 1 or task_count > declaration.blocks)
-        ):
+        if const_expr(_state_prefetch() and whole_heads):
             # Only a CTA that projects first, the others' state loads hiding
             # under their wait on the projection -- unless the head is split,
             # its state loads then following that wait.
@@ -550,6 +560,11 @@ def build_resident_k1(
                         "st_stride": st_stride,
                         "rstate": rstate,
                         "rs_seq": rs_seq,
+                        "replay": replay,
+                        "cap": spec.replay_cap,
+                        "hmax": replay_staged(spec.replay_cap, spec.replay_window)
+                        if spec.replay_cap
+                        else 0,
                     },
                     unit // HEADS,
                     unit % HEADS,
@@ -557,6 +572,7 @@ def build_resident_k1(
                     declaration.threads,
                     head_task % head_split,
                     head_split,
+                    spec.replay_cap > 0,
                 )
         allocator = fx.SharedAllocator()
         tdm_timeline.open_cta(bid, wave, timeline, allocator)
@@ -970,8 +986,17 @@ def build_resident_k1(
                 "st_stride": st_stride,
                 "num_acc": num_acc,
                 "core_out": core_out,
+                "replay": replay,
             },
         }
+        if const_expr(spec.replay_cap):
+            recurrence_context.update(
+                cap=spec.replay_cap,
+                rwin=spec.replay_window,
+                hmax=replay_staged(spec.replay_cap, spec.replay_window),
+                glog=recurrence.glog.ptr,
+                rec=recurrence.rec.ptr,
+            )
         first = _task_start(bid, spec.kda0, declaration.blocks)
         # A chunk task spreads one request/head over eight CTAs; once those
         # tasks need more than one pass of the grid, a whole head per CTA is
@@ -1122,6 +1147,7 @@ def build_resident_k1(
         num_acc: Int64,
         core_out: Int64,
         core_q: Int64,
+        replay: Int64,
         scratch: Int64,
         stream: fx.Stream = _STREAM,
     ):
@@ -1154,6 +1180,7 @@ def build_resident_k1(
                 num_acc,
                 core_out,
                 core_q,
+                replay,
                 scratch,
                 **(
                     {"value_attrs": gemv_tdm.CLUSTER_LAUNCH["value_attrs"]}

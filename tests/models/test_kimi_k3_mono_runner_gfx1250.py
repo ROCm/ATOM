@@ -412,6 +412,7 @@ def test_k1_seam_is_bf16_where_out_norm_folds_fp8_quant(monkeypatch, candidates)
 
 def test_runner_admits_only_supported_rows_and_query_lengths():
     runner = object.__new__(K3Gfx1250MonoDecodeRunner)
+    runner.replay_cap = 0
     prepared = []
     runner.widths = SimpleNamespace(
         prepare=lambda width: prepared.append(width) or True
@@ -522,7 +523,8 @@ def test_layer_without_a_k2_build_runs_the_production_mlp():
     ("debug", "replay", "message"),
     (
         (True, False, "debug mode"),
-        (False, True, "ReplaySSM"),
+        # ReplaySSM binds: past it the CU count refuses (refused per width)
+        (False, 16, "CUs"),
     ),
 )
 def test_runner_refuses_unsupported_modes(monkeypatch, debug, replay, message):
@@ -530,10 +532,61 @@ def test_runner_refuses_unsupported_modes(monkeypatch, debug, replay, message):
         self.debug = debug
         self.replay_cap = replay
 
+        self.device = torch.device("cpu")
+
     monkeypatch.setattr(K3MonoDecodeRunner, "_bind", bind_base)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(multi_processor_count=255),
+    )
     runner = object.__new__(K3Gfx1250MonoDecodeRunner)
     with pytest.raises(MonoUnsupported, match=message):
         runner._bind(object())
+
+
+def _replay_plan(rows):
+    return runner_module.Gfx1250KimiBuildPlan(
+        threads=256,
+        blocks=256,
+        lds_bytes=GFX1250.max_workgroup_lds_bytes,
+        tokens=rows,
+        nblocks=1,
+    )
+
+
+@pytest.mark.parametrize("rows", (5, 10, 20, 40, 45))
+def test_replay_serves_the_verified_dspark_verify(rows):
+    assert runner_module.replay_refusal(_replay_plan(rows), 16, 5, 5) is None
+
+
+@pytest.mark.parametrize("rows", (1, 8, 48))
+def test_replay_serves_the_verified_plain_decode(rows):
+    assert runner_module.replay_refusal(_replay_plan(rows), 16, 1, 1) is None
+
+
+def test_replay_is_off_without_a_record_buffer():
+    assert runner_module.replay_refusal(_replay_plan(40), 0, 0, 5) is None
+
+
+@pytest.mark.parametrize(
+    ("cap", "window", "qlen"),
+    (
+        (16, 5, 1),  # plain decode: not yet checked against production
+        (32, 5, 5),
+        (16, 8, 8),
+    ),
+)
+def test_replay_refuses_unverified_configurations(cap, window, qlen):
+    rows = 40 if 40 % qlen == 0 else 8 * qlen
+    why = runner_module.replay_refusal(_replay_plan(rows), cap, window, qlen)
+    assert why is not None and "unverified" in why
+
+
+def test_replay_refuses_records_past_lds(monkeypatch):
+    monkeypatch.setattr(runner_module, "REPLAY_VERIFIED", frozenset({(8192, 5, 5)}))
+    why = runner_module.replay_refusal(_replay_plan(40), 8192, 5, 5)
+    assert why is not None and "LDS" in why
 
 
 def test_runner_refuses_wrong_cu_count_and_uses_architecture_lds(monkeypatch):

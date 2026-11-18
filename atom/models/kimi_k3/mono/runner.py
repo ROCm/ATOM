@@ -770,7 +770,7 @@ class K3MonoDecodeRunner:
                     f"layer {layer_id}: a ReplaySSM buffer moved under a graph "
                     "capture; K1's pointer table was written for the old one"
                 )
-            table = torch.tensor(ptrs, dtype=torch.int64, device=self.scratch.device)
+            table = torch.tensor(ptrs, dtype=torch.int64, device=self.device)
             self._replay_tables[layer_id] = (table, ptrs)
         return table.data_ptr()
 
