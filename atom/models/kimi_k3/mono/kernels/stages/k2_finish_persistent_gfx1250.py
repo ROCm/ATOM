@@ -410,6 +410,7 @@ def build_packed_finish(
         herd: HerdRole
 
     wave_drop = parallel_herd and envs.ATOM_KIMI_MONO_HERD_WAVE_DROP
+    split_bound = rolled and envs.ATOM_KIMI_MONO_ROUTE_SPLIT_BOUND
     name = (
         f"k3_k2_gfx1250_persistent_finish_s{rows}_b{plan.blocks}"
         f"{'_rl' if rolled else ''}"
@@ -419,6 +420,7 @@ def build_packed_finish(
         f"{'_f8' if fp8_shared_down else ''}{'_hp' if precompute_herd else ''}"
         f"{'_ph' if parallel_herd else ''}"
         f"{'_nohwd' if parallel_herd and not wave_drop else ''}"
+        f"{'_norsb' if rolled and not split_bound else ''}"
         f"{f'_pl{herd_poll_limit}' if herd_poll_limit is not None else ''}"
         f"{'_profile' if profile else ''}"
     )
@@ -673,6 +675,7 @@ def build_packed_finish(
                         "route_lds": {
                             name: getattr(route_role, name).ptr for name in route_lds_words
                         },
+                        "split_bound": split_bound,
                     },
                     route_token,
                     payload.local_bytes // 4,

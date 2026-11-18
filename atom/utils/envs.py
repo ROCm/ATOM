@@ -749,6 +749,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KIMI_MONO_PARALLEL_HERD": lambda: (
         os.getenv("ATOM_KIMI_MONO_PARALLEL_HERD", "1") == "1"
     ),
+    # Kimi-K3 gfx1250 mono: a rolled finish's routing CTA (stage_route_cta)
+    # takes its prefilter bound, the lane maxima's width-th largest, without
+    # the readlane loop (the same bits): its waves split the compares of every
+    # lane maximum with the others, LDS permutes and atomics, and the bound is
+    # the minimum of those with fewer than width above them, the default; 0
+    # keeps the loop.
+    "ATOM_KIMI_MONO_ROUTE_SPLIT_BOUND": lambda: (
+        os.getenv("ATOM_KIMI_MONO_ROUTE_SPLIT_BOUND", "1") == "1"
+    ),
     # Kimi-K3 gfx1250 mono: a parallel-HERD routing CTA drops and orders its
     # token's candidates without serial scans (the same bits): the drop a
     # wave butterfly arg-min, the kept sum the scan's adds unrolled, the places

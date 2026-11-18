@@ -393,6 +393,33 @@ def route_cta_words(threads: int) -> dict[str, int]:
 
 
 @traced
+def _cta_largest32(value, nth, lane, wave, waves, greater):
+    """The ``nth`` largest of a wave's 32 ``value`` (Uint32, every wave the
+    same), the CTA's waves splitting the compares: each counts, for every
+    lane, the lanes above its value among ``WAVE // waves`` of them (LDS
+    permutes) into ``greater`` (zeroed before), and after a barrier the lanes
+    with fewer than ``nth`` above are the ones at or above the nth largest,
+    so it is their minimum."""
+    assert WAVE % waves == 0, waves
+    above = fx.Int32(0)
+    for step in range_constexpr(WAVE // waves):
+        peer = fx.Uint32(
+            lane_gather(value, (lane + wave * (WAVE // waves) + step) % WAVE)
+        )
+        above = above + (peer > value).select(fx.Int32(1), fx.Int32(0))
+    if above > 0:
+        fx.atomic_add(greater + lane, above, syncscope="workgroup")
+    gpu.barrier()
+    top = fx.Int32(
+        (fx.ptr_load(greater + lane) < nth).select(value, fx.Uint32(0xFFFFFFFF))
+    )
+    for offset in (1, 2, 4, 8, 16):
+        other = xshfl(top, offset, GFX1250)
+        top = fx.Int32((fx.Uint32(other) < fx.Uint32(top)).select(other, top))
+    return fx.Uint32(uniform(top))
+
+
+@traced
 def stage_route_cta(c, token, front_payload_words=0):
     """``stage_route``'s routes, bit for bit, by the whole CTA in runtime loops:
     a cold launch fetches a few hundred instructions instead of its unrolled
@@ -409,6 +436,7 @@ def stage_route_cta(c, token, front_payload_words=0):
     threads = c["threads"]
     waves = threads // WAVE
     lds = c["route_lds"]
+    split_bound = c.get("split_bound", False)
     contiguous = "contiguous_logits" in c and c["contiguous_logits"]
     width = TOPK + 1 if "herd" in c and c["herd"] else TOPK
     per_thread = (EXPERTS + threads - 1) // threads
@@ -441,22 +469,31 @@ def stage_route_cta(c, token, front_payload_words=0):
     fx.ptr_store(fx.Int32(_umax_tree(scores)), lds["maxima"] + tid)
     if tid == 0:
         fx.ptr_store(fx.Int32(0), lds["count"])
+    if const_expr(split_bound):  # noqa: SIM102
+        # The bound's counts (``top_experts`` is first written by the ranks).
+        if tid < WAVE:
+            fx.ptr_store(fx.Int32(0), lds["top_experts"] + tid)
     gpu.barrier()
     # Every wave takes the bound itself: ``stage_route``'s lane maxima, sorted.
     lane_max = fx.Uint32(fx.ptr_load(lds["maxima"] + lane))
     for other_wave in range_constexpr(1, waves):
         wave_max = fx.Uint32(fx.ptr_load(lds["maxima"] + other_wave * WAVE + lane))
         lane_max = (wave_max > lane_max).select(wave_max, lane_max)
-    # The lane maxima's width-th largest: the one with width - 1 ahead of it
-    # by value, then lane.
-    max_rank = fx.Int32(0)
-    for peer_lane in range(fx.Int32(0), fx.Int32(WAVE), unroll=4):
-        peer_max = fx.Uint32(readlane(fx.Int32(lane_max), peer_lane))
-        max_before = (peer_max > lane_max) | ((peer_max == lane_max) & (peer_lane < lane))
-        max_rank = max_rank + max_before.select(fx.Int32(1), fx.Int32(0))
-    at_bound = _ballot32(max_rank == width - 1)
-    bound_lane = _popcount32((at_bound & (~at_bound + fx.Uint32(1))) - fx.Uint32(1))
-    bound = fx.Uint32(readlane(fx.Int32(lane_max), bound_lane))
+    if const_expr(split_bound):
+        bound = _cta_largest32(lane_max, width, lane, wave, waves, lds["top_experts"])
+    else:
+        # The lane maxima's width-th largest: the one with width - 1 ahead of it
+        # by value, then lane.
+        max_rank = fx.Int32(0)
+        for peer_lane in range(fx.Int32(0), fx.Int32(WAVE), unroll=4):
+            peer_max = fx.Uint32(readlane(fx.Int32(lane_max), peer_lane))
+            max_before = (peer_max > lane_max) | (
+                (peer_max == lane_max) & (peer_lane < lane)
+            )
+            max_rank = max_rank + max_before.select(fx.Int32(1), fx.Int32(0))
+        at_bound = _ballot32(max_rank == width - 1)
+        bound_lane = _popcount32((at_bound & (~at_bound + fx.Uint32(1))) - fx.Uint32(1))
+        bound = fx.Uint32(readlane(fx.Int32(lane_max), bound_lane))
     # A wave's survivors take consecutive slots from one LDS atomic.
     kept = _count_tree([score >= bound for score in scores])
     inclusive = _wave_inclusive_scan32(kept, lane)
