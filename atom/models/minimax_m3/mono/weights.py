@@ -65,8 +65,8 @@ def _ptpc_fp8(
 def _mxfp8(
     linear, rows: int, cols: int, name: str
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Weight + per-1x32 E8M0 scale of a native MXFP8 linear (the checkpoint's
-    bytes, row-major: neither preshuffled nor requantized)."""
+    """Weight + per-1x32 E8M0 scale of a native MXFP8 linear: the checkpoint's
+    bytes, never requantized; the weight 16x16-preshuffled, the scales row-major."""
     w, s = linear.weight, getattr(linear, "weight_scale", None)
     _need(
         linear.quant_type.value == QuantType.per_1x32.value,

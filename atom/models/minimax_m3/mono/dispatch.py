@@ -93,6 +93,7 @@ class MonoDecode:
         self.steps: dict[bool, dict[int, int]] = {False: {}, True: {}}
         self._graph_mono: set[int] = set()
         self._counted = 0
+        self._stats_every = envs.ATOM_MONO_STATS_EVERY
         # created on its first eligible step (``LazyRunner``)
         self._mono = LazyRunner(
             lambda: MonoDecodeRunner(
@@ -127,6 +128,8 @@ class MonoDecode:
         if input_ids is None or not self._mono.enabled:
             return False
         ok = self._supports(input_ids, positions, intermediate_tensors, inputs_embeds)
+        if not self._stats_every:
+            return ok
         # a captured graph's forward runs once, at capture: its replays are
         # counted by ``note_replay``; eager decode steps count here
         n = input_ids.numel()
@@ -143,13 +146,13 @@ class MonoDecode:
 
     def note_replay(self, n: int) -> None:
         """A decode step replayed an n-row graph: mono's if its capture took mono."""
-        self._count(n, n in self._graph_mono)
+        if self._stats_every:
+            self._count(n, n in self._graph_mono)
 
     def _count(self, n: int, mono: bool) -> None:
         self.steps[mono][n] = self.steps[mono].get(n, 0) + 1
-        every = envs.ATOM_MONO_STATS_EVERY
         self._counted += 1
-        if not every or self._counted % every:
+        if self._counted % self._stats_every:
             return
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         stats = {

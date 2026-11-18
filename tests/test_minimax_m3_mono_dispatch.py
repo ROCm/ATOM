@@ -195,6 +195,7 @@ def _mono(monkeypatch, fwd, builds=True):
     mono._mono = LazyRunner(None, "MiniMax-M3 mono decode")
     mono._mono.runner = SimpleNamespace(prepare=lambda n: builds)
     mono.steps, mono._graph_mono, mono._counted = {False: {}, True: {}}, set(), 0
+    mono._stats_every = 1 << 30  # counted, never dumped
     monkeypatch.setattr(dispatch, "get_forward_context", lambda: fwd)
     return mono
 
@@ -209,6 +210,15 @@ def test_steps_are_counted_by_token_count(monkeypatch):
     mono.note_replay(4)
     mono.note_replay(32)
     assert mono.steps == {True: {4: 2}, False: {4: 1, 17: 1, 32: 1}}
+
+
+def test_no_step_is_counted_with_stats_off(monkeypatch):
+    mono = _mono(monkeypatch, _forward_context(_decode_md(rows=4)))
+    mono._stats_every = 0
+    assert mono.supports(*_step(4), None, None)
+    assert not mono.supports(*_step(17), None, None)
+    mono.note_replay(4)
+    assert mono.steps == {True: {}, False: {}}
 
 
 def test_install_hands_the_runner_its_replay_counter(monkeypatch):
