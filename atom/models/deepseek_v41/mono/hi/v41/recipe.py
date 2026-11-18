@@ -4,9 +4,9 @@
 
 The contract is a hardware-arithmetic reference of the checkpoint's layer (its operations with the kernels'
 roundings): a layer's ``h_out`` within D10 of it, routing ids and the index sources' selections exact (the near-tie
-rule). Every kind is one program at TP4 (64 / 4 heads a rank; the KV path, q_a, the router and HC replicated; wo_b
-row-parallel; the routed and the shared experts sharded), a single-layer 16-row build two (``split``: the attention
-kernel, then the FFN kernel). Stages, in order (channels between them):
+rule). Every kind is one program at TP2, TP4 or TP8 (64 / TP heads a rank; the KV path, q_a, the router and HC
+replicated; wo_b row-parallel; the routed and the shared experts sharded), a single-layer 16-row build two (``split``:
+the attention kernel, then the FFN kernel). Stages, in order (channels between them):
 
     seam A        HCSeam: fold of the previous layer's MoE output into the 4 streams (layer 0: the embedding streams,
                   no fold) -> lin_a (BF16), gate_a (F32 24); Engram layers: R -> ra, Engram gate half -> re, then
@@ -367,7 +367,7 @@ def sgpr_spill_ok(sparse: int, source: Source | None, rows: int | None = None, e
             'sgpr_spill_ok: pass the program\'s tp (``RESIDUAL`` "auto" depends on it)'
         )
     kind = schedules.kind_of(sparse, source, engram, sparse_ratio)
-    kn = schedules.knobs(kind, rows)
+    kn = schedules.knobs(kind, rows, tp=tp)
     ok = kn["SPILL_OK"]
     if ok != "auto":
         return bool(ok)
@@ -444,7 +444,7 @@ def window_layer_blocks(first: bool, split: bool = False, tp: int = 1, replay: b
     experts = EXPERTS if experts is None else experts
     topk = TOPK if topk is None else topk
     kind = schedules.kind_of(sparse, source, engram, sparse_ratio, split)
-    kn = schedules.knobs(kind, rows, over=knobs, tokens=_tokens(source))
+    kn = schedules.knobs(kind, rows, over=knobs, tokens=_tokens(source), tp=tp)
     k = SimpleNamespace(**kn)
     fold_shared = _fold_shared(tp, k.SHARED)
     if head is not None and (split or push_moe):
@@ -834,12 +834,15 @@ def engram_kv_stages(sc: Scenario, names: dict[str, int] | None = None, hist_len
                   key=lambda st: next(i for i, n in enumerate(steps) if st.name.split(".")[1] == n))  # fmt: skip
 
 
-def moe_route_early(stages: list[Stage], knobs: dict | None = None) -> list[Stage]:
+def moe_route_early(
+    stages: list[Stage], knobs: dict | None = None, tp: int | None = None
+) -> list[Stage]:
     """``stages`` with MoEExperts' route moved up to right after the routing (router / replay stages). It depends only
     on the routing; placed after the shared expert's stages, its one CTA first runs a shared-expert task. Also every
     placement pass every V4.1 program takes (``idx_after_pool``, ``smerge_place``, ``cand_apart``, ``hcf_gate_place``,
     ``wo_a_hold``)
-    and the dual-copy mailboxes (``NUMA_DUAL``). ``knobs``: the build's (default: the live knobs).
+    and the dual-copy mailboxes (``NUMA_DUAL``). ``knobs``: the build's (default: the live knobs); ``tp``: the build's
+    TP size (``schedules.knobs(tp=)``).
     """
     kn = knobs or schedules.current()
     sharded = any(
@@ -848,7 +851,9 @@ def moe_route_early(stages: list[Stage], knobs: dict | None = None) -> list[Stag
     aside = [st for st in stages if sharded and st.name in SHARD_ASIDE]
     stages = [st for st in stages if st not in aside]
     stages = smerge_place(idx_after_pool(stages, knobs=kn), knobs=kn)
-    stages = wo_a_hold(hcf_gate_place(cand_apart(stages, knobs=kn), knobs=kn), kn)
+    stages = wo_a_hold(
+        hcf_gate_place(cand_apart(stages, knobs=kn, tp=tp), knobs=kn), kn
+    )
     names = [st.name for st in stages]
     dual = kn["NUMA_DUAL"]
     if (
@@ -1006,7 +1011,10 @@ _APART = ("wq_b", "attn.m", "ringw", "wo_a", "wo_b", "hcf.slice")
 
 
 def cand_apart(
-    stages: list[Stage], cus: int = 256, knobs: dict | None = None
+    stages: list[Stage],
+    cus: int = 256,
+    knobs: dict | None = None,
+    tp: int | None = None,
 ) -> list[Stage]:
     """``IDX_CAND_APART``: in the candidate source (stage ``idx.cmask``), every stage's base as ``plan`` would place it,
     then the attention path's stages (``_APART``: wq_b, the merge with its RingWrite, wo_a, wo_b, seam F's slices)
@@ -1015,7 +1023,8 @@ def cand_apart(
     merge's first CTAs (``SMERGE_PLACE``'s placement given up there). 2: also the selection's TopK above level 0 (its levels,
     the split merge) and ``sel_store`` on the first CTAs from their own that run none of the candidate chain's late
     stages nor ``_APART``'s. "auto" (a build without the kind's knobs: the live ones): the ratio-1 KV source's
-    schedule at the cmask stage's rows and bucket (``schedules.LONG_ROWS``)."""
+    schedule at the cmask stage's rows and bucket (``schedules.LONG_ROWS``) at ``tp``.
+    """
     on = (knobs or schedules.current())["IDX_CAND_APART"]
     names = [st.name for st in stages]
     if "idx.cmask" not in names or not set(_APART) <= set(names):
@@ -1023,7 +1032,7 @@ def cand_apart(
     cm = stages[names.index("idx.cmask")]
     if isinstance(on, str) and on == "auto":
         p = cm.emit.keywords["p"]
-        on = schedules.knobs(schedules.KV1, p.rows, tokens=p.n_max * p.ratio)[
+        on = schedules.knobs(schedules.KV1, p.rows, tokens=p.n_max * p.ratio, tp=tp)[
             "IDX_CAND_APART"
         ]
     if on not in (True, 1, 2):

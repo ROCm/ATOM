@@ -107,9 +107,9 @@ def indexer_qk_rope_quant_and_cache(
     slot_mapping: torch.Tensor,
     norm_weight: torch.Tensor,
     norm_bias: torch.Tensor,
-    positions: torch.Tensor,
-    cos_cache: torch.Tensor,
-    sin_cache: torch.Tensor,
+    positions: torch.Tensor | None,
+    cos_cache: torch.Tensor | None,
+    sin_cache: torch.Tensor | None,
     epsilon: float,
     quant_block_size: int,
     scale_fmt: str | None,
@@ -118,14 +118,16 @@ def indexer_qk_rope_quant_and_cache(
     is_neox: bool = True,
     q_scale_out: torch.Tensor | None = None,
     kv_cache_scale: torch.Tensor | None = None,
+    *,
+    scale_layout: str = "flydsl",
+    rope_dim: int = 64,
 ) -> None:
-    """Run the fused indexer cache op with ATOM's DCP query semantics.
+    """Run AITER's fused HIP indexer writer with ATOM's DCP query semantics.
 
-    The two scale buffers together switch the op to packed E2M1 + e8m0 outputs,
-    and are forwarded only when given so that an aiter predating them still
-    accepts the FP8 call -- the same version tolerance the seg-variant import
-    above keeps. One without the other would fall back to FP8 and write that
-    layout into FP4-shaped buffers, so it is refused here rather than passed on.
+    The two scale buffers together switch the op to packed E2M1 + e8m0 outputs.
+    Supplying only one is refused before it can write FP8 into FP4 buffers.
+    OPUS accepts NoPE and publishes all Q rows. The writer receives the
+    explicit layout and RoPE width on every call, including FP8/FlyDSL defaults.
     """
     if (q_scale_out is None) != (kv_cache_scale is None):
         raise ValueError(
@@ -137,6 +139,8 @@ def indexer_qk_rope_quant_and_cache(
         if q_scale_out is not None
         else {}
     )
+    if scale_layout != "flydsl" and q_scale_out is None:
+        raise ValueError("An explicit FP4 layout requires both scale buffers")
     _indexer_qk_rope_quant_and_cache(
         q,
         q_out,
@@ -156,7 +160,10 @@ def indexer_qk_rope_quant_and_cache(
         weights_scale,
         preshuffle=preshuffle,
         is_neox=is_neox,
-        compute_all_q_rope=get_dcp_world_size() > 1,
+        # OPUS has always published every Q row, including negative K slots.
+        compute_all_q_rope=scale_layout == "opus" or get_dcp_world_size() > 1,
+        scale_layout=scale_layout,
+        rope_dim=rope_dim,
         **fp4_out,
     )
 
@@ -356,6 +363,30 @@ def mla_dcp_kernel_num_heads(
             "mla_decode_fwd. Lower decode_context_parallel_size or raise tp."
         )
     return gathered
+
+
+def mla_dcp_persistent_width(
+    num_heads: int,
+    dcp_world_size: int,
+    min_kernel_heads: int = _MLA_MIN_HEADS,
+    *,
+    kv_cache_dtype: str,
+) -> int | None:
+    """Gathered width a persistent DCP decode runs at, or None when DCP is off
+    or aiter has no persistent kernel at that width (``dcp_persistent_supported``).
+    """
+    if dcp_world_size <= 1:
+        return None
+    width = mla_dcp_kernel_num_heads(
+        num_heads,
+        dcp_world_size,
+        min_kernel_heads,
+        kv_cache_dtype=kv_cache_dtype,
+        persistent=True,
+    )
+    if not dcp_persistent_supported(width, kv_cache_dtype, dcp_world_size):
+        return None
+    return width
 
 
 def mla_dcp_sparse_prefill_num_heads(
@@ -880,6 +911,11 @@ class MLAAttention(nn.Module):
         )
         # Which collective pattern the output merge uses; see _dcp_merge.
         self.dcp_comm_backend = get_current_atom_config().dcp_config.comm_backend
+        assert self.dcp_comm_backend != "auto", "Config resolves comm_backend"
+        # Collective, once per (DCP group, heads, head dim): every DCP rank
+        # builds the same MLA layers in the same order, as for the weights.
+        if self.dcp_world_size > 1 and self.dcp_comm_backend == "mailbox":
+            self._prepare_dcp_mailbox()
 
         # Row view of q_proj used by prefill; see _local_q_proj. Initialized here
         # rather than in process_weights_after_loading so it exists no matter
@@ -887,7 +923,6 @@ class MLAAttention(nn.Module):
         self._qrep_local_proj = None
         self._qrep_local_src = None
 
-        self.dcp_persistent_supported = dcp_persistent_supported()
         self.dcp_prefill_merge_bf16_ok = dcp_prefill_merge_bf16_ok()
         # Every sparse DCP shape is per-token q_len=1 rows -- one per sequence
         # in decode, one per query token in sparse prefill and MTP verify.
@@ -932,6 +967,17 @@ class MLAAttention(nn.Module):
         The vLLM plugin initializes its process groups independently from the
         native ATOM config, so it calls this again with vLLM's DCP size.
         """
+        # Whether aiter runs this layer's DCP decode persistent, at the width
+        # the persistent path gathers to.
+        self.dcp_persistent_supported = (
+            mla_dcp_persistent_width(
+                self.num_heads,
+                dcp_world_size,
+                self.min_query_heads,
+                kv_cache_dtype=self.kv_cache_dtype,
+            )
+            is not None
+        )
         # DCP decode all-gathers Q on the head dim, so the width reaching
         # mla_decode_fwd is the gathered num_heads * dcp rounded up to a
         # dispatchable one. The pad sits entirely inside _forward_decode: it goes
@@ -985,7 +1031,6 @@ class MLAAttention(nn.Module):
                 dcp_world_size,
                 self.num_heads * dcp_world_size,
                 self.kv_cache_dtype.startswith("fp8"),
-                self.dcp_persistent_supported,
                 get_current_atom_config().max_num_batched_tokens,
             )
             (
@@ -1334,32 +1379,54 @@ class MLAAttention(nn.Module):
             self._qrep_local_src = w
         return self._qrep_local_proj
 
-    def _dcp_merge(self, o, lse, ctx=None, owned_counts=None, quant_dtype=None):
-        """Bind this layer's DCP group and backend to ``dcp_ops.dcp_lse_merge``."""
+    def _prepare_dcp_mailbox(self):
+        """Map the mailbox merge's peer buffer while every rank builds the same
+        layer (collective, and before the KV cache is sized). Plugin mode never
+        gets here: Config resolves it to all-to-all."""
+        from atom.model_ops.dcp_ops import dcp_mailbox_max_tokens, prepare_dcp_mailbox
+
+        if not prepare_dcp_mailbox(
+            self.dcp_group,
+            self.num_heads,
+            self.v_head_dim if self.pbm_enabled else self.kv_lora_rank,
+            dcp_mailbox_max_tokens(get_current_atom_config()),
+        ):  # prepare_dcp_mailbox logged why, once
+            self.dcp_comm_backend = "a2a"
+
+    def _dcp_merge(
+        self, o, lse, ctx=None, owned_counts=None, quant_dtype=None, decode=False
+    ):
+        """Bind this layer's DCP group and backend to ``dcp_ops.dcp_lse_merge``.
+        The mailbox backend serves decode only; prefill merges with a2a."""
         from atom.model_ops.dcp_ops import dcp_lse_merge
 
+        backend = self.dcp_comm_backend
+        if backend == "mailbox" and not decode:
+            backend = "a2a"
         return dcp_lse_merge(
             o,
             lse,
             self.dcp_group,
-            self.dcp_comm_backend,
+            backend,
             ctx=ctx,
             owned_counts=owned_counts,
             quant_dtype=quant_dtype,
         )
 
     def _dcp_fused_quant_dtype(self):
-        """o_proj's activation dtype if the combine can emit it, else None.
+        """o_proj's activation dtype if the combine may emit it, else None.
 
         The combine can only absorb the quant when o_proj reads its output
-        directly (PBM) and wants exactly a per-token FP8 activation. A static
+        directly (PBM) and wants exactly a per-token FP8 activation. The
+        mailbox combine emits bf16 even then (``(rows, None)``); the a2a
+        combine it falls back to quantizes. A static
         input_scale is not a per-token scale, and the block schemes need a scale
         per channel GROUP with a layout choice; all of those keep the standalone
         quant kernel they have today.
         """
         if not self.pbm_enabled:
             return None
-        if self.dcp_comm_backend != "a2a":
+        if self.dcp_comm_backend not in ("a2a", "mailbox"):
             return None
         op = getattr(self, "o_proj", None)
         qt = getattr(op, "quant_type", None)
@@ -1381,7 +1448,7 @@ class MLAAttention(nn.Module):
 
     @mark_trace(prefix="dcp_project_merge_out", torch_compile=False)
     def _dcp_project_merge_out(
-        self, o, lse, ctx=None, merge_in_fp32=False, owned_counts=None
+        self, o, lse, ctx=None, merge_in_fp32=False, owned_counts=None, decode=False
     ):
         """Shared tail of both DCP paths: PBM projection, merge, o_proj.
 
@@ -1404,7 +1471,12 @@ class MLAAttention(nn.Module):
             )
         else:
             o = self._dcp_merge(
-                o, lse, ctx=ctx, owned_counts=owned_counts, quant_dtype=fused_quant
+                o,
+                lse,
+                ctx=ctx,
+                owned_counts=owned_counts,
+                quant_dtype=fused_quant,
+                decode=decode,
             )
         if fused_quant is not None:
             o, o_scale = o
@@ -1412,8 +1484,8 @@ class MLAAttention(nn.Module):
                 return self.o_proj(
                     o.reshape(-1, self.num_heads * self.v_head_dim), o_scale
                 )
-            # Single-rank DCP: there was no combine to fold into, so the tensor
-            # came back unquantized and o_proj quantizes it as it always has.
+            # Single-rank DCP, or the mailbox combine: the rows came back
+            # unquantized and o_proj quantizes them as it always has.
         if self.pbm_enabled:
             return self.o_proj(o.reshape(-1, self.num_heads * self.v_head_dim))
         return self._v_up_proj_and_o_proj(o)
@@ -1474,6 +1546,7 @@ class MLAAttention(nn.Module):
             lse,
             ctx=self._cp_triton_ctx,
             owned_counts=owned_counts,
+            decode=True,
         )
 
     def _v_up_proj(self, x, W_V=None, W_V_scale=None, num_heads=None):
@@ -1490,18 +1563,16 @@ class MLAAttention(nn.Module):
         # passes the raw decode output, which is not guaranteed contiguous the
         # way the post-ReduceScatter tensor is.
         x = x.reshape(-1, num_heads, self.kv_lora_rank).transpose(0, 1)
-        # Multiply (N, B, L) x (N, L, V) -> (N, B, V), Convert from (N, B, V) to (B, N, V)
-        # x = torch.bmm(x, self.W_UV).transpose(0, 1)
-        # Convert from (B, N, L) to (N, B, L)
+        # All V-up GEMMs write into the same contiguous (B, N, V) output.
+        output = torch.empty(
+            x.shape[1],
+            x.shape[0],
+            W_V.shape[1],
+            device=x.device,
+            dtype=torch.bfloat16,
+        )
         if is_rocm_aiter_fp4bmm_enabled():
-            output = torch.empty(
-                x.shape[1],
-                x.shape[0],
-                W_V.shape[1],
-                device=x.device,
-                dtype=torch.bfloat16,
-            )
-            output = batched_gemm_a16wfp4(
+            batched_gemm_a16wfp4(
                 x,
                 W_V,
                 W_V_scale,
@@ -1510,19 +1581,18 @@ class MLAAttention(nn.Module):
                 prequant=True,
                 y_scale=None,
             )
-            # x = x.transpose(0, 1).flatten(1, 2)
-            x = output
         elif W_V_scale is None:
             # BF16 absorb via Triton batched GEMM (gfx1250-safe; torch.bmm's
             # hipBLASLt bf16 batched path memory-faults). batched_gemm_bf16 does
-            # X @ W^T with W (B,N,K): x (N,B,L) @ W_V (N,V,L)^T -> (N,B,V), then
-            # -> (B,N,V) to match the fp8/fp4 output layout.
-            x = _aiter_triton_bf16_bmm(x, W_V).transpose(0, 1)
+            # X @ W^T with W (B,N,K): x (N,B,L) @ W_V (N,V,L)^T -> (N,B,V),
+            # stored through output strides into a contiguous (B,N,V) buffer so
+            # the (B, N*V) view o_proj takes needs no transpose copy.
+            _aiter_triton_bf16_bmm(x, W_V, YQ=output.transpose(0, 1))
         else:
-            x = _aiter_triton_fp8_bmm(
-                x, W_V, W_V_scale, group_size=128, transpose_bm=True
+            _aiter_triton_fp8_bmm(
+                x, W_V, W_V_scale, group_size=128, YQ=output, transpose_bm=True
             )
-        return x.reshape(-1, num_heads, self.v_head_dim)
+        return output
 
     @mark_trace(prefix="v_up_proj_and_o_proj", torch_compile=False)
     def _v_up_proj_and_o_proj(self, x):

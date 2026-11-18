@@ -971,6 +971,21 @@ def test_kv_event_sources_suffixes_ipc_endpoints_per_rank(monkeypatch):
     }
 
 
+def test_kv_event_sources_offsets_the_replay_endpoint_per_rank(monkeypatch):
+    _kv_events_engine(
+        monkeypatch,
+        enable=True,
+        endpoint="tcp://*:5557",
+        topic="kv",
+        replay_endpoint="tcp://*:5600",
+    )
+    sources = asyncio.run(api_server.kv_event_sources())
+    expected = _tcp_sources({0: 5557, 1: 5558})
+    expected["0"]["replay_endpoint"] = "tcp://*:5600"
+    expected["1"]["replay_endpoint"] = "tcp://*:5601"
+    assert sources == expected
+
+
 @pytest.mark.parametrize(
     "events", [{"enable": False}, {"enable": True, "publisher": "null"}]
 )
@@ -1246,7 +1261,14 @@ class TestDeploymentDefaultOutputCap:
         assert seq.max_tokens == 512
 
 
-def test_reasoning_and_tool_setup_publishes_every_module_global(monkeypatch):
+@pytest.mark.parametrize(
+    "keeps, needs_strings, preserve",
+    [(True, False, True), (False, True, True), (False, False, False)],
+    ids=["kimi-k3", "concatenating-template", "mapping-template"],
+)
+def test_reasoning_and_tool_setup_publishes_every_module_global(
+    monkeypatch, keeps, needs_strings, preserve
+):
     # Front-end workers run this split-out part of main(); an assignment
     # without its `global` would set a local and leave the module default.
     names = (
@@ -1267,7 +1289,8 @@ def test_reasoning_and_tool_setup_publishes_every_module_global(monkeypatch):
         "template_opens_reasoning_implicitly": lambda *_a: True,
         "resolve_reasoning_toggle": lambda *_a: ("thinking", False, True),
         "resolve_tool_call_parser": lambda *_a, **_kw: "parser",
-        "template_keeps_tool_call_arguments": lambda *_a: True,
+        "template_keeps_tool_call_arguments": lambda *_a: keeps,
+        "template_needs_tool_call_argument_strings": lambda *_a: needs_strings,
         "required_call_channel": lambda *_a: "channel",
     }
     for name, stub in stubs.items():
@@ -1283,5 +1306,5 @@ def test_reasoning_and_tool_setup_publishes_every_module_global(monkeypatch):
     assert api_server.model_starts_in_reasoning is True
     assert api_server.reasoning_toggle == ("thinking", False, True)
     assert api_server.tool_call_parser_cls == "parser"
-    assert api_server.preserve_tool_call_arguments is True
+    assert api_server.preserve_tool_call_arguments is preserve
     assert api_server.required_tool_channel == "channel"
