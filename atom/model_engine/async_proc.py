@@ -999,7 +999,14 @@ class AsyncIOProcManager:
         self._pending_kv_aggregation = pending
         return pending
 
-    def call_func_with_aggregation(self, func_name: str, *args, timeout: float = 10.0):
+    def call_func_with_aggregation(
+        self,
+        func_name: str,
+        *args,
+        timeout: float = 10.0,
+        rearm: bool = True,
+        arm_only: bool = False,
+    ):
         """RPC call with KV output aggregation across all workers.
 
         At most one aggregation is outstanding. The first call starts it;
@@ -1012,11 +1019,17 @@ class AsyncIOProcManager:
         Args:
             func_name: Method name to invoke on each worker's runner.
             timeout: Seconds an incomplete aggregation may age before logging.
+            rearm: Start/rearm an RPC; False only consumes an existing snapshot.
+            arm_only: A pre-consumed snapshot closed the previous query; start
+                its replacement without consuming an immediate new reply.
 
         Returns:
             Aggregated :class:`KVConnectorOutput`, or ``None`` while the
             current aggregation is still missing ranks.
         """
+        # A pre-schedule drain never submits a worker RPC.
+        if not rearm and self._pending_kv_aggregation is None:
+            return None
         if self.kv_output_aggregator is None:
             self.kv_output_aggregator = KVOutputAggregator(world_size=self.proc_num)
 
@@ -1024,6 +1037,8 @@ class AsyncIOProcManager:
         pending = self._pending_kv_aggregation
         if pending is None:
             pending = self._start_kv_aggregation(func_name, args)
+            if arm_only:
+                return None
 
         # Each rank has its own queue, so later ranks can be consumed while
         # an earlier rank is still missing. Replies are drain-once and carry
@@ -1059,7 +1074,8 @@ class AsyncIOProcManager:
         # Keep the completion query pipelined: workers can produce this next
         # snapshot while EngineCore processes the completed one and executes
         # the following forward. This still leaves exactly one outstanding RPC.
-        self._start_kv_aggregation(func_name, args)
+        if rearm:
+            self._start_kv_aggregation(func_name, args)
         logger.debug(f"Aggregated KV output: {kv_output}")
         return kv_output
 

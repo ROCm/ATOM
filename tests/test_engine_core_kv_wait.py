@@ -32,6 +32,8 @@ def engine_step(monkeypatch):
         prefill_delayer=None,
     )
     engine = SimpleNamespace(
+        _store_preconsume_ready=False,
+        _preconsume_closed_snapshot=False,
         scheduler=scheduler,
         kv_transfer_enabled=True,
         runner_mgr=SimpleNamespace(call_func=Mock(return_value="forward-result")),

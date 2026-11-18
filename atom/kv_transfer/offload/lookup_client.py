@@ -2,6 +2,14 @@
 """Common scheduler lookup contract, including non-driving clients."""
 
 
+from enum import Enum
+
+
+class LookupPinStatus(Enum):
+    PENDING = "pending"
+    FAILED_TERMINAL = "failed_terminal"
+
+
 class LookupClient:
     token_database = None
     driving = False

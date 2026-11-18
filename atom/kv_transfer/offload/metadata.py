@@ -98,6 +98,9 @@ class LoadSpec:
     # be recomputed), but chunk-oriented transports need to retrieve the whole
     # final chunk. ``None`` keeps the legacy boundary above.
     transfer_end_tokens: int | None = None
+    # Internal control-plane rejection. Worker emits the typed failure
+    # without GET/GPU work, waking an already parked request for prefill.
+    dispatch_failure: str | None = None
 
 
 @dataclass

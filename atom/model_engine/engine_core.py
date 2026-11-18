@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+import os
 import pickle
 import queue
 import threading
@@ -96,6 +97,10 @@ class EngineCore:
     _report_backlog = False
 
     def __init__(self, config: Config, input_address: str, output_address: str):
+        self._store_preconsume_ready = (
+            os.environ.get("ATOM_STORE_PRECONSUME_READY", "0") == "1"
+        )
+        self._preconsume_closed_snapshot = False
         self.label = "Engine Core"
         # Requests taken from the input queue, and the last (ingested, prefill
         # left) pair reported to the CoreManager (`_report_prefill_backlog`).
@@ -616,6 +621,12 @@ class EngineCore:
         # waiting. Arrivals during this step remain latched until the next step.
         if self.kv_transfer_enabled:
             self._kv_progress_event.clear()
+            if (
+                self._store_preconsume_ready
+                and self.scheduler._connector_flag("is_offload")
+                and self.scheduler._num_parked_remote_kv > 0
+            ):
+                self._poll_kv_transfer_progress(rearm=False)
         result = self.scheduler.schedule()
 
         # Surface admit-rejected seqs (those `_unschedulable_reason` flags in
@@ -783,10 +794,20 @@ class EngineCore:
         except Exception:
             logger.exception("KV transfer drain during shutdown failed")
 
-    def _poll_kv_transfer_progress(self) -> bool:
+    def _poll_kv_transfer_progress(self, *, rearm: bool = True) -> bool:
         if not self.kv_transfer_enabled:
             return False
-        kvoutput = self.runner_mgr.call_func_with_aggregation("async_proc_aggregation")
+        kvoutput = self.runner_mgr.call_func_with_aggregation(
+            "async_proc_aggregation",
+            rearm=rearm,
+            arm_only=rearm and self._preconsume_closed_snapshot,
+        )
+        if rearm:
+            self._preconsume_closed_snapshot = False
+        if not rearm and kvoutput is None:
+            return False
+        if not rearm:
+            self._preconsume_closed_snapshot = True
         self.scheduler._update_from_kv_xfer_finished(kvoutput)
         # Reclaim any offload save whose completion report never came (LMCache
         # force-unpinned it upstream). Self-throttled, so calling it on every

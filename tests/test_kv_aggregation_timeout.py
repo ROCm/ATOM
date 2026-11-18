@@ -54,6 +54,37 @@ def _poll(manager):
     return manager.call_func_with_aggregation(_POLL, timeout=0)
 
 
+def test_preconsume_only_drains_an_existing_complete_quorum():
+    manager = _manager()
+    assert manager.call_func_with_aggregation(_POLL, rearm=False) is None
+    manager.rpc_broadcast_mq.enqueue.assert_not_called()
+    assert _poll(manager) is None
+    operation = SaveOperationId(7, 1)
+    manager.kv_outputs_queues[0].put(_report(operation, _RETIRED))
+    assert manager.call_func_with_aggregation(_POLL, rearm=False) is None
+    assert manager.rpc_broadcast_mq.enqueue.call_count == 1
+    manager.kv_outputs_queues[1].put(_report(operation, _RETIRED))
+    result = manager.call_func_with_aggregation(_POLL, rearm=False)
+    assert result.finished_saving == {operation}
+    assert manager._pending_kv_aggregation is None
+    assert manager.rpc_broadcast_mq.enqueue.call_count == 1
+
+
+def test_replacing_a_preconsumed_quorum_does_not_poll_an_immediate_reply():
+    manager = _manager()
+    _poll(manager)
+    for q in manager.kv_outputs_queues:
+        q.put(KVConnectorOutput())
+    assert manager.call_func_with_aggregation(_POLL, rearm=False) is not None
+    # Even workers fast enough to have their reply queued must not cause this
+    # replacement call to consume and re-arm a second RPC in the same step.
+    for q in manager.kv_outputs_queues:
+        q.put(KVConnectorOutput())
+    assert manager.call_func_with_aggregation(_POLL, arm_only=True) is None
+    assert manager.rpc_broadcast_mq.enqueue.call_count == 2
+    assert all(not q.empty() for q in manager.kv_outputs_queues)
+
+
 @pytest.mark.parametrize("world_size", [2, 8])
 @pytest.mark.parametrize("req_id", [0, "0"])
 @pytest.mark.parametrize("generation", [0, 1])

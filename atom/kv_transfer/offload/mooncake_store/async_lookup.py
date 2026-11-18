@@ -127,7 +127,7 @@ class AsyncStoreLookup(LookupClient):
         # Renewals ride their own worker so a burst of arrival-time queries
         # cannot queue one behind it; the slot keeps the synchronous Store
         # client (and the pool state around it) to one call at a time.
-        self.renew_executor = DaemonExecutor("store-renew")
+        self.renew_executor = DaemonExecutor("store-renew", limit=capacity)
         self._renewing = False
         self.backend_slot = _BackendSlot()
         self.pending = {}
@@ -278,6 +278,9 @@ class AsyncStoreLookup(LookupClient):
             return 0
         self._renewing = True
         future = self.renew_executor.submit(self._renew, seq, start, end)
+        if future is None:
+            self._renewing = False
+            return 0
         future.add_done_callback(self._renewal_done)
         try:
             return future.result(timeout=RENEW_TIMEOUT_S)

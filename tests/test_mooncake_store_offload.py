@@ -1801,6 +1801,60 @@ def _arm_load(scheduler, seq, *, hbm, lmc, end=None):
         scheduler._looked_up_at[sid] = scheduler_mod.time.monotonic()
 
 
+@pytest.mark.parametrize("outcome", ["ready", "timeout"])
+def test_async_renewal_retains_load_until_ready_or_reports_typed_failure(
+    cluster, scheduler_clock, monkeypatch, make_worker, outcome
+):
+    from concurrent.futures import Future
+
+    from atom.kv_transfer.offload.mooncake_store.renewal_gate import RenewalGate
+
+    monkeypatch.setenv("ATOM_STORE_ASYNC_RENEW", "1")
+    scheduler = MooncakeStoreOffloadScheduler(_config("kv_consumer"))
+    seq = _seq(57, 50)
+    _arm_load(scheduler, seq, hbm=16, lmc=40)
+    scheduler_clock.now += 2.0
+    future = Future()
+    submitted = []
+    scheduler._lookup_client.renew_executor.shutdown()
+    scheduler._lookup_client.renew_executor = SimpleNamespace(
+        submit=lambda fn, keys: submitted.append(keys) or future,
+        shutdown=lambda: None,
+    )
+    scheduler._renew_gate = RenewalGate(
+        scheduler._lookup_client, clock=lambda: scheduler_clock.now
+    )
+    try:
+        spec = scheduler._load_specs[str(seq.id)]
+        assert scheduler.build_connector_meta().requests == []
+        assert scheduler.build_connector_meta().requests == []
+        assert len(submitted) == 1
+        assert scheduler._load_specs[str(seq.id)] is spec
+        assert scheduler._reqs_need_recv[str(seq.id)] is seq
+        if outcome == "ready":
+            # A zero-hit renewal still dispatches the GET, whose failure has
+            # the existing all-rank completion contract.
+            future.set_result((0, scheduler_clock.now, scheduler_clock.now))
+        else:
+            scheduler_clock.now += 1.01
+        [request] = scheduler.build_connector_meta().requests
+        assert request.load_operation == LoadOperationId(seq.id, 0)
+        assert not scheduler._reqs_need_recv
+        assert scheduler.build_connector_meta().requests == []
+        if outcome == "timeout":
+            assert request.load_spec.dispatch_failure == "renewal_unavailable"
+            worker, _ = make_worker(namespace=scheduler._namespace)
+            monkeypatch.setattr(
+                worker,
+                "_pin_in_place_stream",
+                lambda: pytest.fail("failed renewal must not touch GPU or GET"),
+            )
+            worker._do_load_req(request)
+            assert worker.get_finished().failed_loading == {request.load_operation}
+    finally:
+        scheduler.close()
+
+
 def test_save_requests_carry_digests_not_tokens(cluster, make_worker):
     scheduler = MooncakeStoreOffloadScheduler(_config("kv_producer"))
     seq = _seq(6, 30)

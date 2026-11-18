@@ -107,6 +107,16 @@ class MooncakeStoreOffloadConnector(KVStoreOffloadConnector):
     LABEL = "Mooncake Store offload"
     POOL_CLASS = TransferSlotPool
 
+    def _do_load_req(self, req: LMCacheReqMeta) -> None:
+        spec = req.load_spec
+        assert spec is not None
+        if spec.dispatch_failure is not None:
+            with self._lock:
+                self._failed_load.add(self._load_completion_id(req))
+                self._record_load_error_blocks(req)
+            return
+        super()._do_load_req(req)
+
     def __init__(self, config: Any) -> None:
         super().__init__(config)
         # Places the taint marker in this worker's Store; and when a load
