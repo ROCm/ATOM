@@ -766,6 +766,11 @@ MOE_STATE_WORDS = 4
 POLL_LIMIT = 1 << 16
 
 
+def profile_words() -> int:
+    """A ``profile`` MoE's ``state`` words."""
+    return MOE_STATE_WORDS + 256 * 12
+
+
 @dataclass(frozen=True)
 class MoeKernel:
     name: str
@@ -895,7 +900,10 @@ def build_moe(
     the epoch the flags are tagged with on, so a replay needs no reset.
     ``profile``: each CTA's phase stamps past it (5 words a CTA: start, plan,
     gate/up done, down done, down tiles) and its flag waits (2 words a CTA:
-    100 MHz ticks, expert switches) past those.
+    100 MHz ticks, expert switches) past those; then (3 words a CTA) its
+    core cycles in gate/up ring waits, epilogues and down ring waits, its
+    gate/up cycles (a word a CTA), and the stamp once its first weights are
+    issued (a word a CTA): ``profile_words()`` in all.
 
     ``rolled`` (default ``ATOM_KIMI_MONO_ROLLED_MOE``): a task's K tiles, its
     M tiles' epilogues, a down tile's M tiles and the ring's first copies run
@@ -1144,6 +1152,9 @@ def build_moe(
             for ahead in range_constexpr(ring - 1):
                 if ahead < flat:
                     issue(fx.Int32(ahead), ahead)
+        if const_expr(profile):  # noqa: SIM102
+            if tid == 0:
+                st_dev(fx.Int32(_realtime()), state, MOE_STATE_WORDS + 256 * 11 + bid)
         # Read only now: a wave waits on this load where it reads it, and the
         # flags' tag is not needed before the first task's flag.
         if const_expr(fused is None):

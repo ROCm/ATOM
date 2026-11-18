@@ -597,6 +597,121 @@ def herd_finalize_words(rows: int) -> dict[str, int]:
 
 
 @traced
+def stage_herd_token(c, rows, token):
+    """``stage_herd_finalize``'s ``topk_ids`` and ``topk_weights`` of token
+    ``token`` alone, bit for bit, by its routing CTA: it polls every token's
+    candidates as the HERD CTA does, counts the batch popularity in its own
+    LDS and drops and orders its own token's, a candidate a lane of wave 0.
+    ``masked_m``, ``psum`` and ``topids_to_rows`` are left alone (only
+    AITER's grouped MoE reads them).
+    ``c`` as ``stage_herd_finalize``'s, its LDS ``popularity``, ``ids`` and
+    ``values`` used; ``c["poll_limit"]`` (optional) bounds the polls, past it
+    the stale candidates are taken as they are."""
+
+    tid, threads = c["tid"], c["threads"]
+    lds = c["herd_lds"]
+    popularity, ids_s, values_s = lds["popularity"], lds["ids"], lds["values"]
+    kp1 = TOPK + 1
+    candidates = rows * kp1
+
+    for index in range_constexpr((EXPERTS + threads - 1) // threads):
+        expert = tid + index * threads
+        if expert < EXPERTS:
+            fx.ptr_store(fx.Int32(0), popularity + expert)
+    pairs, tag = c["candidates"]
+    rounds = (candidates + threads - 1) // threads
+
+    def load_pairs():
+        words = []
+        for index in range_constexpr(rounds):
+            at = fx.min(tid + index * threads, candidates - 1)
+            pair = fx.Vector(
+                bo.buffer_load(
+                    rsrc(pairs), at * 2, vec_width=2, dtype=T.i32, cache_modifier=CM_DEV
+                )
+            )
+            words += [pair[0], pair[1]]
+        return fx.Vector.from_elements(words, fx.Int32)
+
+    tag_bits = fx.Int32(-(1 << _HERD_EXPERT_BITS))
+
+    def stale(words):
+        late = (fx.Int32(words[1]) & tag_bits) != tag
+        for index in range_constexpr(1, rounds):
+            late = late | ((fx.Int32(words[2 * index + 1]) & tag_bits) != tag)
+        return late
+
+    limit = c.get("poll_limit")
+    words = load_pairs()
+    if const_expr(limit is None):
+        while stale(words):
+            rocdl.s_sleep(1)
+            words = load_pairs()
+    else:
+        polls = fx.Int32(0)
+        while stale(words) & (polls < limit):
+            rocdl.s_sleep(1)
+            polls = polls + 1
+            words = load_pairs()
+    if const_expr("stamp" in c):
+        c["stamp"]("herd_in")
+    gpu.barrier()
+    for index in range_constexpr(rounds):
+        at = tid + index * threads
+        if at < candidates:
+            expert = fx.Int32(words[2 * index + 1]) & ((1 << _HERD_EXPERT_BITS) - 1)
+            fx.ptr_store(expert, ids_s + at)
+            fx.ptr_store(fx.Int32(words[2 * index]).bitcast(fx.Float32), values_s + at)
+            fx.atomic_add(popularity + expert, fx.Int32(1), syncscope="workgroup")
+    gpu.barrier()
+    store_cm = c.get("store_cm", 0)
+    if c["wave"] == 0:
+        # Lane j holds candidate j; the drop, the kept sum and the scale are
+        # ``stage_herd_finalize``'s scan on the wave-uniform copies, in its
+        # order, and a kept candidate's place is the count of kept ones of
+        # lower id (the ids are distinct, so that is the sorted keys' order).
+        lane = c["lane"]
+        base = token * kp1
+        mine = fx.min(lane, kp1 - 1)
+        my_id = fx.ptr_load(ids_s + base + mine)
+        my_value = fx.ptr_load(values_s + base + mine)
+        my_pop = fx.ptr_load(popularity + my_id)
+        # Runtime loops, in candidate order: a cold launch fetches one body.
+        drop = fx.Int32(0)
+        drop_id = readlane(my_id, 0)
+        drop_value = readlane(my_value, 0)
+        drop_pop = readlane(my_pop, 0)
+        for j in range(fx.Int32(1), fx.Int32(kp1), unroll=1):
+            j_id, j_value, j_pop = readlane(my_id, j), readlane(my_value, j), readlane(my_pop, j)
+            take = (j_pop < drop_pop) | (
+                (j_pop == drop_pop)
+                & ((j_value < drop_value) | ((j_value == drop_value) & (j_id < drop_id)))
+            )
+            drop = take.select(j, drop)
+            drop_id = take.select(j_id, drop_id)
+            drop_value = take.select(j_value, drop_value)
+            drop_pop = take.select(j_pop, drop_pop)
+        kept_sum = fx.Float32(0.0)
+        place = fx.Int32(0)
+        for k in range(fx.Int32(0), fx.Int32(kp1), unroll=1):
+            kept = drop != k
+            kept_sum = kept_sum + kept.select(readlane(my_value, k), fx.Float32(0.0))
+            below = kept & (readlane(my_id, k) < my_id)
+            place = place + below.select(fx.Int32(1), fx.Int32(0))
+        scale = c["routed_scaling_factor"] / fx.max(kept_sum, fx.Float32(1e-20))
+        if (lane < kp1) & (lane != drop):
+            bo.buffer_store(
+                my_id, rsrc(c["topk_ids"]), token * TOPK + place, cache_modifier=store_cm
+            )
+            bo.buffer_store(
+                my_value * scale,
+                rsrc(c["topk_weights"]),
+                token * TOPK + place,
+                cache_modifier=store_cm,
+            )
+
+
+@traced
 def stage_herd_finalize(c, rows):
     """AITER's ``herd_route_psum`` for this launch's Top-(K+1) candidates, by
     one CTA polling the routing CTAs' tagged (sigmoid, tag | expert) pairs.
@@ -652,6 +767,8 @@ def stage_herd_finalize(c, rows):
     while stale(words):
         rocdl.s_sleep(1)
         words = load_pairs()
+    if const_expr("stamp" in c):
+        c["stamp"]("herd_in")
     loaded = [
         (
             fx.Int32(words[2 * index + 1]) & ((1 << _HERD_EXPERT_BITS) - 1),

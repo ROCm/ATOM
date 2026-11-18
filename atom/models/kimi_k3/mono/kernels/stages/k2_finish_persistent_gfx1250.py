@@ -130,6 +130,28 @@ def _direct_poll(requests):
     return values
 
 
+# A ``profile`` finish's stamps a CTA, in order: its start, its token's routes
+# stored (routing CTAs), every token's HERD candidates in and HERD's outputs
+# stored (the HERD CTA), its shared down's stores issued, its stores drained.
+PROFILE_STAMPS = ("start", "routed", "herd_in", "herd_done", "shared_done", "end")
+PROFILE_WORDS = 8
+
+
+def profile_offset(rows: int, precompute_herd: bool) -> int:
+    """A ``profile`` finish's stamps' byte offset in its scratch."""
+    if not precompute_herd:
+        return 64
+    end = max(at + 4 * words for at, words in herd_scratch_layout(rows).values())
+    return -(-end // 64) * 64
+
+
+def _realtime():
+    """The 100 MHz device clock's low word."""
+    from atom.models.kimi_k3.mono.kernels.stages.moe_tdm_gfx1250 import _realtime as clock
+
+    return clock()
+
+
 def _out_cm(fused):
     """A fused launch's outputs' cache policy: device scope, read in it."""
     return 0 if fused is None else CM_DEV
@@ -235,6 +257,9 @@ def build_packed_finish(
     fp8_shared_down: bool = False,
     precompute_herd: bool = False,
     rolled: bool | None = None,
+    profile: bool = False,
+    parallel_herd: bool = False,
+    herd_poll_limit: int | None = None,
 ) -> K2FinishKernel:
     """Without ``include_routed`` the routed experts are left to AITER's grouped
     MoE: ``route`` and ``tile_route`` then receive contiguous [rows, 16] expert
@@ -250,11 +275,24 @@ def build_packed_finish(
     into ``herd_scratch_layout``'s outputs in ``scratch``. ``rolled`` (default
     ``ATOM_KIMI_MONO_ROLLED_LITE``) routes a token by its whole CTA in runtime
     loops (``stage_route_cta``, the same routes) and the shared down's tiles
-    and reduction too: a cold launch fetches far less code."""
+    and reduction too: a cold launch fetches far less code. ``profile``: each
+    CTA's 100 MHz stamps (``PROFILE_STAMPS``) in ``scratch`` past
+    ``profile_offset(...)``, ``PROFILE_WORDS`` a CTA. ``parallel_herd`` (with
+    ``precompute_herd``): each routing CTA finishes its own token's HERD
+    ``topk_ids`` and ``topk_weights`` (``stage_herd_token``, the same bits)
+    and runs no shared down, the other CTAs taking every shared-down task;
+    HERD's grouped layout (``masked_m``, ``psum``, ``topids_to_rows``) is not
+    written, so only a MoE reading the ids and weights alone may follow.
+    ``herd_poll_limit``: its routing CTAs give up on the candidates past that
+    many polls (wrong routes, never a hung GPU)."""
     if rolled is None:
         rolled = envs.ATOM_KIMI_MONO_ROLLED_LITE
     if precompute_herd and not (herd and replicated_front):
         raise ValueError("only a HERD grouped-MoE finish precomputes the routes")
+    if parallel_herd and not precompute_herd:
+        raise ValueError("only a finish precomputing HERD finishes it in parallel")
+    if herd_poll_limit is not None and not parallel_herd:
+        raise ValueError("only a parallel-HERD finish bounds its candidate polls")
     if fp8_shared_down and (include_routed or not include_shared):
         raise ValueError("only the grouped-MoE finish reads an FP8 shared down")
     if replicated_front and include_routed:
@@ -301,10 +339,14 @@ def build_packed_finish(
 
     # Without routed experts every token's activated row stays staged.
     staged_rows = WMMA_TOKEN_ROWS * (1 if include_routed else tiles)
+    # With ``parallel_herd`` the CTAs ahead of the routing ones take every
+    # shared-down task, ``shared_slots`` at most a CTA.
+    shared_ctas = plan.blocks - rows if parallel_herd else plan.blocks
+    shared_slots = -(-SHARED_DOWN_TASKS // shared_ctas) if parallel_herd else 2
     shared_accumulator_words = (
         WAVES * GFX1250.wave_size * gemv_gfx1250.ACCUMULATOR_ELEMENTS
         if include_routed
-        else moe_tail_gfx1250.sdown_accumulator_words(2, rows, WAVES)
+        else moe_tail_gfx1250.sdown_accumulator_words(shared_slots, rows, WAVES)
     )
 
     @fx.struct
@@ -369,6 +411,9 @@ def build_packed_finish(
         f"_pq_u{int(local_union)}_r{int(include_routed)}"
         f"{'_rf' if replicated_front else ''}{'_herd' if herd else ''}"
         f"{'_f8' if fp8_shared_down else ''}{'_hp' if precompute_herd else ''}"
+        f"{'_ph' if parallel_herd else ''}"
+        f"{f'_pl{herd_poll_limit}' if herd_poll_limit is not None else ''}"
+        f"{'_profile' if profile else ''}"
     )
     # After a replicated front there is no gathered latent to unpack.
     unpack = not (rolled and replicated_front)
@@ -378,6 +423,7 @@ def build_packed_finish(
     # to the first CTA with a single one.
     herd_cta = plan.blocks - rows - 1
     herd_at = herd_scratch_layout(rows)
+    profile_at = profile_offset(rows, precompute_herd) // 4
     spare_cta = SHARED_DOWN_TASKS - plan.blocks
     if precompute_herd and not spare_cta < herd_cta:
         raise ValueError(
@@ -428,6 +474,18 @@ def build_packed_finish(
         down = role.down.peek()
         herd_lds = role.herd.peek()
         ticket = down.route.ptr
+
+        def stamp(name):
+            if const_expr(profile):  # noqa: SIM102
+                if tid == 0:
+                    bo.buffer_store(
+                        fx.Int32(_realtime()),
+                        rsrc(scratch),
+                        profile_at + bid * PROFILE_WORDS + PROFILE_STAMPS.index(name),
+                        cache_modifier=CM_DEV,
+                    )
+
+        stamp("start")
 
         stride = plan.blocks * THREADS
         # Rank-major compressed payload -> logical token-major FP4/scales.
@@ -499,6 +557,48 @@ def build_packed_finish(
         launch = fx.Int32(
             bo.buffer_load(rsrc(scratch), launch_word, vec_width=1, dtype=T.i32)
         )
+        def herd_context(tag):
+            """``stage_herd_finalize``'s context (``stage_herd_token``'s too)."""
+            return {
+                "tid": tid,
+                "lane": lane,
+                "wave": wave,
+                "threads": THREADS,
+                "waves": WAVES,
+                "candidates": (candidates, tag),
+                **{
+                    name: scratch + fx.Int64(herd_at[name][0])
+                    for name in (
+                        "topk_ids",
+                        "topk_weights",
+                        "topids_to_rows",
+                        "masked_m",
+                        "psum",
+                    )
+                },
+                "tile_m": fx.Int32(
+                    bo.buffer_load(
+                        rsrc(scratch),
+                        herd_at["tile_m"][0] // 4,
+                        vec_width=1,
+                        dtype=T.i32,
+                    )
+                ),
+                "routed_scaling_factor": fx.Float32(
+                    bo.buffer_load(
+                        rsrc(scratch),
+                        herd_at["routed_scaling_factor"][0] // 4,
+                        vec_width=1,
+                        dtype=T.f32,
+                    )
+                ),
+                "herd_lds": {
+                    name: getattr(herd_lds, name).ptr for name in herd_words
+                },
+                "store_cm": _out_cm(fused),
+                **({"stamp": stamp} if profile else {}),
+            }
+
         if (route_token >= 0) & (route_token < rows):
             herd_candidates = (
                 {"herd_candidates": (candidates, moe_gfx1250.herd_tag(launch))}
@@ -540,55 +640,34 @@ def build_packed_finish(
                     route_token,
                     payload.local_bytes // 4,
                 )
+            stamp("routed")
             if const_expr(fused is not None):
                 fused["route_done"](route_token)
-        if const_expr(precompute_herd):
+            if const_expr(parallel_herd):
+                if const_expr(fused is not None):
+                    raise ValueError("a fused launch takes HERD from one CTA")
+                # The token's own HERD, past every token's candidates; the
+                # first token's CTA moves the launch counter on (every routing
+                # CTA has read it: its candidates carry its tag).
+                moe_gfx1250.stage_herd_token(
+                    {
+                        **herd_context(moe_gfx1250.herd_tag(launch)),
+                        "poll_limit": herd_poll_limit,
+                    },
+                    rows,
+                    route_token,
+                )
+                stamp("herd_done")
+                if (route_token == 0) & (tid == 0):
+                    bo.buffer_store(launch + 1, rsrc(scratch), launch_word)
+        if const_expr(precompute_herd and not parallel_herd):
             # The CTA before the routing ones has no shared-down task: it polls
             # every token's tagged candidates and finishes HERD while the other
             # CTAs run their shared down, then moves the launch counter on.
             tag = moe_gfx1250.herd_tag(launch)
             if bid == herd_cta:
-                moe_gfx1250.stage_herd_finalize(
-                    {
-                        "tid": tid,
-                        "lane": lane,
-                        "wave": wave,
-                        "threads": THREADS,
-                        "waves": WAVES,
-                        "candidates": (candidates, tag),
-                        **{
-                            name: scratch + fx.Int64(herd_at[name][0])
-                            for name in (
-                                "topk_ids",
-                                "topk_weights",
-                                "topids_to_rows",
-                                "masked_m",
-                                "psum",
-                            )
-                        },
-                        "tile_m": fx.Int32(
-                            bo.buffer_load(
-                                rsrc(scratch),
-                                herd_at["tile_m"][0] // 4,
-                                vec_width=1,
-                                dtype=T.i32,
-                            )
-                        ),
-                        "routed_scaling_factor": fx.Float32(
-                            bo.buffer_load(
-                                rsrc(scratch),
-                                herd_at["routed_scaling_factor"][0] // 4,
-                                vec_width=1,
-                                dtype=T.f32,
-                            )
-                        ),
-                        "herd_lds": {
-                            name: getattr(herd_lds, name).ptr for name in herd_words
-                        },
-                        "store_cm": _out_cm(fused),
-                    },
-                    rows,
-                )
+                moe_gfx1250.stage_herd_finalize(herd_context(tag), rows)
+                stamp("herd_done")
                 if tid == 0:
                     bo.buffer_store(launch + 1, rsrc(scratch), launch_word)
                 if const_expr(fused is not None):
@@ -675,12 +754,15 @@ def build_packed_finish(
         if const_expr(include_shared and not include_routed):
             second_task = bid + plan.blocks
             does_shared = True
-            if const_expr(precompute_herd):
+            if const_expr(precompute_herd and not parallel_herd):
                 second_task = (bid == spare_cta).select(fx.Int32(herd_cta), second_task)
                 does_shared = bid != herd_cta
+            tasks = [bid, second_task]
+            if const_expr(parallel_herd):
+                does_shared = bid < shared_ctas
+                tasks = [bid + slot * shared_ctas for slot in range(shared_slots)]
             if does_shared:
-                # Both tasks' weights are in flight before the rows are staged.
-                tasks = [bid, second_task]
+                # Every task's weights are in flight before the rows are staged.
                 operands = [
                     (
                         gemv_gfx1250.fp8_loads(
@@ -732,6 +814,7 @@ def build_packed_finish(
                     shared_down.rows.ptr,
                     rolled,
                 )
+                stamp("shared_done")
             if const_expr(fused is not None):
                 fused["shared_done"]()
 
@@ -1009,6 +1092,7 @@ def build_packed_finish(
                     }
                     moe_expert_gfx1250.stage_down(context, down_task, union_size, WAVES)
         rocdl.s_wait_storecnt(0)
+        stamp("end")
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def kernel(
@@ -1126,7 +1210,9 @@ def build_packed_finish(
         block=(THREADS,),
         required_lds_bytes=FINISH_REQUIRED_LDS_BYTES,
         scratch_bytes=(
-            max(at + 4 * words for at, words in herd_at.values())
+            4 * (profile_at + plan.blocks * PROFILE_WORDS)
+            if profile
+            else max(at + 4 * words for at, words in herd_at.values())
             if precompute_herd
             else 8
         ),

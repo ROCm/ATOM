@@ -200,8 +200,12 @@ class _PrecomputedHerd:
     MoE asks for, and otherwise finalizes the candidates as AITER would and has
     the finish lay out for that tile from the next launch on."""
 
-    def __init__(self, scratch: torch.Tensor, candidates, values, rows: int) -> None:
+    def __init__(
+        self, scratch: torch.Tensor, candidates, values, rows: int, ids_only: bool = False
+    ) -> None:
         layout = herd_scratch_layout(rows)
+        # a ``parallel_herd`` finish's: its ids and weights, no grouped layout
+        self.ids_only = ids_only
 
         def view(name, dtype=torch.int32):
             at, words = layout[name]
@@ -229,7 +233,7 @@ class _PrecomputedHerd:
         return herd_finalize_candidates(self.values, self.candidates, EXPERTS)
 
     def route_psum(self, tile_m: int) -> tuple[torch.Tensor, ...]:
-        if tile_m == self.tile_m:
+        if tile_m == self.tile_m and not self.ids_only:
             return self.routes
         self.tile_m = tile_m
         self.tile_m_cell.fill_(tile_m)
@@ -686,6 +690,11 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             if grouped
             else build_role_lds_front(plan, include_attention=False, reset=reset)
         )
+        fused_moe = self._fused_moe_for(rows) if grouped else None
+        # the fused MoE reads HERD's ids and weights alone
+        parallel_herd = (
+            herd and fused_moe is not None and envs.ATOM_KIMI_MONO_PARALLEL_HERD
+        )
         finish = build_packed_finish(
             plan,
             gu_interleave=gu_interleave,
@@ -694,6 +703,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             herd=herd,
             fp8_shared_down=fp8_down,
             precompute_herd=herd,
+            parallel_herd=parallel_herd,
         )
         finalize = (
             build_replicated_finalize(plan)
@@ -745,7 +755,6 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             buffers["front_scratch"] = torch.zeros(
                 front.scratch_bytes, dtype=torch.uint8, device=self.device
             )
-        fused_moe = self._fused_moe_for(rows) if grouped else None
         if fused_moe is not None:
             routes = rows * TOPK
             buffers["fused_inter"] = empty((routes, INTER_ROW_WORDS), torch.int32)
@@ -796,6 +805,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                     buffers["route"],
                     buffers["tile_route"],
                     rows,
+                    ids_only=parallel_herd,
                 )
                 if herd
                 else None
