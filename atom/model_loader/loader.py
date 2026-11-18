@@ -272,6 +272,27 @@ def initialize_dummy_weights(model: nn.Module, mode: str) -> None:
             data.view(torch.uint8).fill_(_FP4_UNIT_BYTE)
 
 
+def run_module_post_load_hooks(
+    module: nn.Module, *, run_module_hook: bool = True
+) -> None:
+    """One module's post-load step, after its weights landed.
+
+    Shared by `load_model` and the SGLang R-Fork receiver
+    (`atom/plugin/sglang/patches/remote_instance_patch.py`).
+    """
+    if run_module_hook and hasattr(module, "process_weights_after_loading"):
+        module.process_weights_after_loading()
+    quant_method = getattr(module, "quant_method", None)
+
+    # Under the SGLang plugin, SGLang's DefaultModelLoader.postprocess_weights
+    # runs quant methods afterwards (after load_weights, or from the R-Fork
+    # receiver), so skip them here.
+    if isinstance(quant_method, QuantizeMethodBase) and not is_sglang():
+        quant_method.process_weights_after_loading(module)
+    if MOE_PREPARE_FINALIZE and isinstance(quant_method, FusedMoEMethodBase):
+        quant_method.init_prepare_finalize(module)
+
+
 def load_model(
     model: nn.Module,
     model_name_or_path: str,
@@ -398,19 +419,9 @@ def load_model(
     # online-quantizes the final fused weight.
     for module_name, module in model.named_modules():
         # Avoid repeating module post-processing already run by the streamer.
-        if (
-            hasattr(module, "process_weights_after_loading")
-            and id(module) not in streamed_done
-        ):
-            module.process_weights_after_loading()
-        quant_method = getattr(module, "quant_method", None)
-
-        # when running plugin mode for sglang, don't do the post process here
-        # since sglang will call this func automatically after finishing loading
-        if isinstance(quant_method, QuantizeMethodBase) and not is_sglang():
-            quant_method.process_weights_after_loading(module)
-        if MOE_PREPARE_FINALIZE and isinstance(quant_method, FusedMoEMethodBase):
-            quant_method.init_prepare_finalize(module)
+        run_module_post_load_hooks(
+            module, run_module_hook=id(module) not in streamed_done
+        )
 
         # Online quantization creates new params (e.g. weight_scale) that are
         # not present in the source checkpoint. Record them as "loaded" so the

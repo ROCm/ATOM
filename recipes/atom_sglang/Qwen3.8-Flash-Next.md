@@ -97,6 +97,47 @@ Notes:
 The configuration above is the one the MI308X-specific pieces below were
 validated with.
 
+## Scale out from a running instance (R-Fork)
+
+A new instance (the receiver) can copy its weights from a running instance (the
+seed) over RCCL instead of reading the checkpoint. Validated on MI308X with the
+PTPC-FP8 checkpoints, TP2/EP2 with MTP: the target weight load drops from about
+60 s to about 7 s.
+
+1. Seed: the command in [Text serving with MTP](#text-serving-with-mtp), with
+   `--host 0.0.0.0` so that receivers can reach it.
+2. Receiver: the same command (model, TP/EP size, flags) on other GPUs, plus the
+   flags below. On the same host, also give it its own `--port`.
+
+```bash
+  --load-format remote_instance \
+  --remote-instance-weight-loader-backend nccl \
+  --remote-instance-weight-loader-seed-instance-ip <seed ip> \
+  --remote-instance-weight-loader-seed-instance-service-port 8000 \
+  --remote-instance-weight-loader-send-weights-group-ports '[62100,62101]' \
+  --speculative-draft-load-format auto
+```
+
+- The service port is the seed's `--port`.
+- One group port per TP rank, free on the seed host and outside
+  `ip_local_port_range`. Receivers started at the same time need separate
+  group ports.
+- The seed sends target weights only; the draft (`mtp.*`) loads from disk, so
+  the checkpoint must still be readable. Drop the last flag without MTP.
+- Only the `nccl` backend and PTPC-FP8 checkpoints are supported; BF16, MXFP4
+  and other ATOM models are refused.
+
+**The seed stops serving while a receiver connects.** From the receiver's start
+until its weight-transfer group is built, the seed's scheduler is blocked. A
+receiver that ATOM refuses (an unsupported checkpoint, or MTP without
+`--speculative-draft-load-format auto`), or whose ATOM preparation fails (e.g.
+out of memory), joins and drops the group first, so the seed resumes at once;
+a corrected retry from the same receiver host can reuse the same group ports.
+A receiver that crashes outside that step leaves every seed TP rank blocked for
+up to 30 min, and a seed that is serving traffic may be killed by SGLang's
+scheduler watchdog (`--watchdog-timeout`, 300 s by default). Check the
+receiver's GPUs and flags before pointing it at a serving seed.
+
 ## MI308X-specific pieces in ATOM
 
 * AITER tuned GEMM tables for this model's FP8 (a8w8 bpreshuffle) and BF16
