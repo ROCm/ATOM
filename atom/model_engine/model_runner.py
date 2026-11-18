@@ -1795,6 +1795,7 @@ class ModelRunner:
                 int(self.drafter.model.vocab_size),
                 config.torch_dtype,
                 self.device,
+                block=lossless.block_verify,
             )
         elif envs.ATOM_SPEC_LOSSLESS_SAMPLING:
             # Without a drafter there is no draft to sample, and a DSpark
@@ -4815,6 +4816,11 @@ class ModelRunner:
         # The captures and the calibration ran the model for real; take back
         # what they wrote into the cache before the first request is admitted.
         self.attn_metadata_builder.reset_cache_after_capture()
+
+        if self.config.dcp_config.comm_backend == "mailbox":
+            from atom.model_ops.dcp_ops import check_dcp_mailbox_launches
+
+            check_dcp_mailbox_launches()
 
         # How much GPU memory the CUDA graph capture consumed (pool = reserved
         # delta; the allocated delta is what the graphs pin live).

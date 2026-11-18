@@ -173,6 +173,15 @@ def test_a_refused_deployment_keeps_the_model(monkeypatch):
     assert out is inner
 
 
+def test_lossless_sampling_keeps_the_model(monkeypatch):
+    """The single launch drafts and verifies inside the kernel and publishes
+    no q, so an armed lossless drafter keeps the production model."""
+    monkeypatch.setattr(dispatch, "refusal", lambda cfg: None)
+    inner = nn.Linear(1, 1)
+    drafter = NS(lossless=object())
+    assert dispatch.install_single_step(inner, atom_config(), drafter) is inner
+
+
 @needs_aiter
 def test_mono_dispatch_routes_to_the_single_launch_when_enabled(monkeypatch):
     monkeypatch.setattr(gfx1250, "enabled", lambda: True)

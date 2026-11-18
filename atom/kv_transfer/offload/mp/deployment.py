@@ -95,6 +95,8 @@ def _transfer_mode(config: Any) -> str:
 
 def _validate_mp_config(config: Any) -> tuple[int, int]:
     """Validate topology constraints shared by generic PAGE layouts."""
+    from atom.spec_decode.draft_kv import draft_owns_kv_pool
+
     tp_size = offcfg._strict_integer(
         "tensor_parallel_size",
         getattr(config, "tensor_parallel_size", 1) or 1,
@@ -107,7 +109,7 @@ def _validate_mp_config(config: Any) -> tuple[int, int]:
     )
     dcp_size = offcfg._strict_integer(
         "decode_context_parallel_size",
-        getattr(config, "decode_context_parallel_size", 1) or 1,
+        config.decode_context_parallel_size,
         minimum=1,
     )
     pcp_size = offcfg._strict_integer(
@@ -134,7 +136,27 @@ def _validate_mp_config(config: Any) -> tuple[int, int]:
     if pp_size != 1:
         raise NotImplementedError("lmcache_mp does not support PP yet")
     if dcp_size != 1:
-        raise NotImplementedError("lmcache_mp does not support DCP yet")
+        hf = getattr(config, "hf_config", None)
+        hf = getattr(hf, "text_config", hf)
+        if (
+            (tp_size, dcp_size) != (8, 8)
+            or getattr(hf, "model_type", None) not in ("glm_moe_dsa", "kimi_linear")
+            or getattr(config, "enable_dp_attention", False)
+            or dp_size != 1
+            or draft_owns_kv_pool(config)
+        ):
+            raise NotImplementedError(
+                "lmcache_mp does not support DCP outside GLM DSA / K3 "
+                "TP8+DCP8 with DP=1, no DP attention or separate draft pool"
+            )
+        block_size = offcfg._strict_integer(
+            "LMCache MP block size", config.kv_cache_block_size, minimum=1
+        )
+        interleave = _dcp_interleave(config)
+        if block_size % interleave:
+            raise ValueError(
+                "LMCache MP physical block size must be divisible by DCP interleave"
+            )
     if pcp_size != 1:
         raise NotImplementedError("lmcache_mp does not support PCP yet")
     # Single-host DP replicas deliberately share one (model_name, worker_id,
@@ -156,6 +178,29 @@ def _validate_mp_config(config: Any) -> tuple[int, int]:
     return tp_size, pp_size
 
 
+def _dcp_interleave(config: Any) -> int:
+    return offcfg._strict_integer(
+        "DCP interleave size",
+        config.dcp_config.interleave_size,
+        minimum=1,
+    )
+
+
+def _logical_block_size(config: Any) -> int:
+    """Global tokens covered by one block-table entry on each DCP rank.
+
+    The physical PAGE and its in-block permutation remain unchanged. MP keys
+    use global token IDs, but each worker copies only its local shard.
+    """
+    return offcfg._strict_integer(
+        "LMCache MP block size", config.kv_cache_block_size, minimum=1
+    ) * offcfg._strict_integer(
+        "decode_context_parallel_size",
+        config.decode_context_parallel_size,
+        minimum=1,
+    )
+
+
 def _config_has_fully_replicated_tp_pages(config: Any) -> bool:
     """Conservatively identify configs whose complete PAGE cache is TP-replicated.
 
@@ -170,6 +215,8 @@ def _config_has_fully_replicated_tp_pages(config: Any) -> bool:
 
     from atom.spec_decode.draft_kv import draft_owns_kv_pool
 
+    if int(config.decode_context_parallel_size) > 1:
+        return False
     if draft_owns_kv_pool(config):
         # A DSpark draft whose backend owns a KV pool appends per-rank-sharded
         # PAGE regions (`draft_kv.py` declares factor 1), so the complete PAGE
@@ -207,6 +254,8 @@ def _tp_replication_factor(config: Any) -> int:
         collapse = configured
     else:
         raise TypeError("lmcache.mp.tp_rank_collapse must be true, false, or 'auto'")
+    if collapse and int(config.decode_context_parallel_size) > 1:
+        raise ValueError("LMCache MP TP rank collapse cannot discard DCP shards")
     return tp_size if collapse else 1
 
 
@@ -289,6 +338,10 @@ def _model_namespace(
         world_size,
     )
     namespace = f"{page_namespace}::lmcache-mp-v{_MP_LAYOUT_VERSION}"
+    if int(config.decode_context_parallel_size) > 1:
+        # PAGE namespaces already include DCP size. Interleave also changes
+        # which global tokens each rank's otherwise equal-shaped bytes hold.
+        namespace += f"::dcp-interleave-{_dcp_interleave(config)}"
     if checkpoint_spec is not None:
         hf = getattr(config, "hf_config", None)
         hf = getattr(hf, "text_config", hf)
@@ -359,7 +412,7 @@ def _make_scheduler_adapter(
         model_name=_model_namespace(
             config, checkpoint_spec=checkpoint_spec, images=images
         ),
-        block_size=int(config.kv_cache_block_size),
+        block_size=_logical_block_size(config),
         parallel_config=_parallel_strategy(config, 0),
         mq_timeout=float(extra.get("lmcache.mp.mq_timeout", 300.0)),
     )
@@ -385,7 +438,7 @@ def _make_worker_adapter(
         model_name=_model_namespace(
             config, checkpoint_spec=checkpoint_spec, images=images
         ),
-        block_size=int(config.kv_cache_block_size),
+        block_size=_logical_block_size(config),
         parallel_config=_parallel_strategy(config, rank),
         mq_timeout=float(extra.get("lmcache.mp.mq_timeout", 300.0)),
         heartbeat_interval=float(extra.get("lmcache.mp.heartbeat_interval", 10.0)),
