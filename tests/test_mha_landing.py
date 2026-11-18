@@ -25,10 +25,10 @@ from atom.kv_transfer.disaggregation.mooncake.landing import (
     LandingReceiver,
 )
 from atom.kv_transfer.disaggregation.staging_config import (
-    MHA_SCATTER_SEGMENTS,
+    MINIMAX_SCATTER_SEGMENTS,
     LandingSpec,
     landing_reserve_bytes,
-    mha_staging_reserve_bytes,
+    minimax_staging_reserve_bytes,
 )
 from atom.kv_transfer.disaggregation.transfer_plan import PAGE_UNITS
 
@@ -322,7 +322,7 @@ def test_chunk_handoff_is_checked_before_landing_completion(bad):
     h = Harness(LAST, 0)
     c = h.c
     c._landing = h.recv
-    c._landing_spec = LandingSpec(1, MHA_SCATTER_SEGMENTS, PAGE_UNITS, True)
+    c._landing_spec = LandingSpec(1, MINIMAX_SCATTER_SEGMENTS, PAGE_UNITS, True)
     c._pending_handoffs = {21: mc._PendingHandoff(landing_nonce=3, expected=2)}
     h.recv.advertise("s1", 2)
     h.recv.begin(21, 3, [2, 0, 3], {0: "s0", 1: "s1"})
@@ -341,7 +341,7 @@ def test_chunk_handoff_is_checked_before_landing_completion(bad):
 def test_reserves_are_gated_and_bounded(monkeypatch, workers):
     from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 
-    monkeypatch.setenv("ATOM_PD_MHA_LANDING", "1")
+    monkeypatch.setenv("ATOM_PD_MINIMAX_LANDING", "1")
     cfg = SimpleNamespace(
         hf_config=SimpleNamespace(model_type="minimax_m3"),
         tensor_parallel_size=1,
@@ -352,18 +352,24 @@ def test_reserves_are_gated_and_bounded(monkeypatch, workers):
             "num_worker_threads": workers,
         },
     )
-    assert mha_staging_reserve_bytes(cfg) == min(workers, 32) * LANDING_SLOT_BYTES
+    reserve = min(workers, 32) * LANDING_SLOT_BYTES
+    assert minimax_staging_reserve_bytes(cfg) == reserve
     assert landing_reserve_bytes(cfg) == 0
+    # Mooncake's own rule: no role is a producer, kv_both a consumer.
+    del cfg.kv_transfer_config["kv_role"]
+    assert minimax_staging_reserve_bytes(cfg) == reserve
+    cfg.kv_transfer_config["kv_role"] = "kv_both"
+    assert minimax_staging_reserve_bytes(cfg) == 0
     cfg.tensor_parallel_size = 4
     cfg.kv_transfer_config["kv_role"] = "kv_consumer"
-    assert mha_staging_reserve_bytes(cfg) == 0
+    assert minimax_staging_reserve_bytes(cfg) == 0
     # The factory imports the connector module afresh, which binds aiter names.
     with stubbed_aiter():
         factory_reserve = KVConnectorFactory.kv_budget_reserve_bytes(cfg)
     assert (
         landing_reserve_bytes(cfg)
         == factory_reserve
-        == LANDING_POOL_SLOTS * LANDING_SLOT_BYTES + 3 * 8 * MHA_SCATTER_SEGMENTS
+        == LANDING_POOL_SLOTS * LANDING_SLOT_BYTES + 3 * 8 * MINIMAX_SCATTER_SEGMENTS
     )
     for key, val in [
         ("decode_context_parallel_size", 4),
@@ -371,10 +377,10 @@ def test_reserves_are_gated_and_bounded(monkeypatch, workers):
     ]:
         old = getattr(cfg, key)
         setattr(cfg, key, val)
-        assert mha_staging_reserve_bytes(cfg) == landing_reserve_bytes(cfg) == 0
+        assert minimax_staging_reserve_bytes(cfg) == landing_reserve_bytes(cfg) == 0
         setattr(cfg, key, old)
-    monkeypatch.setenv("ATOM_PD_MHA_LANDING", "0")
-    assert mha_staging_reserve_bytes(cfg) == landing_reserve_bytes(cfg) == 0
+    monkeypatch.setenv("ATOM_PD_MINIMAX_LANDING", "0")
+    assert minimax_staging_reserve_bytes(cfg) == landing_reserve_bytes(cfg) == 0
 
 
 def test_off_path_records_ready_event_with_only_kv_staging(monkeypatch):
@@ -405,7 +411,7 @@ def test_real_consumer_offers_page_landing_and_waits_for_scatter(monkeypatch, ch
         zip(h.req["consumer_base_addrs"], h.req["consumer_block_bpb"])
     )
     d.kv_caches_base_addr = h.req["consumer_base_addrs"]
-    d._landing_spec = LandingSpec(1, MHA_SCATTER_SEGMENTS, PAGE_UNITS, True)
+    d._landing_spec = LandingSpec(1, MINIMAX_SCATTER_SEGMENTS, PAGE_UNITS, True)
     d._landing = h.recv
     h.recv._finish = d._complete_recv
     h.recv._partitions.clear()

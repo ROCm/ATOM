@@ -77,7 +77,7 @@ from atom.kv_transfer.disaggregation.sharded_transfer import (
 from atom.kv_transfer.disaggregation.staging_config import (
     landing_reserve_bytes,
     landing_spec,
-    mha_staging_reserve_bytes,
+    minimax_page_staging,
     staging_reserve_bytes,
 )
 from atom.kv_transfer.disaggregation.transfer_plan import (
@@ -1271,7 +1271,7 @@ class MooncakeConnector(KVConnectorBase):
         self._kv_staging_slots = SlotPool()
         self._kv_source_views = {}
         self._kv_staging_reserve = staging_reserve_bytes(config)
-        self._page_staging_enabled = bool(mha_staging_reserve_bytes(config))
+        self._page_staging_enabled = minimax_page_staging(config)
         self._send_worker_streams = threading.local()
         self._landing: LandingReceiver | None = None
         self._landing_spec = landing_spec(config)
@@ -1759,7 +1759,7 @@ class MooncakeConnector(KVConnectorBase):
         self._kv_source_views = eligible
         hint = (
             "Only transfers to TP-sharded decode ranks use it; set "
-            "ATOM_PD_MHA_LANDING=0 if no decode is TP-sharded"
+            "ATOM_PD_MINIMAX_LANDING=0 if no decode is TP-sharded"
             if self._page_staging_enabled
             else "Only transfers to DCP decode ranks use it; set "
             "ATOM_PD_MLA_STAGING=0 if no decode runs DCP"
@@ -1805,7 +1805,8 @@ class MooncakeConnector(KVConnectorBase):
             table_segments=spec.table_segments,
         )
         hint = (
-            "Only TP1 MiniMax-M3 prefills land; set ATOM_PD_MHA_LANDING=0 if none does"
+            "Only TP1 MiniMax-M3 prefills land; set ATOM_PD_MINIMAX_LANDING=0 if "
+            "none does"
             if spec.wire_layout == PAGE_UNITS
             else "Only non-DCP MLA prefills with MLA staging on land; set "
             "ATOM_PD_MLA_LANDING=0 if none does"
