@@ -175,6 +175,7 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
         self._world = 1
         self._chunk_bytes = 0
         self._stats_lock = threading.Lock()
+        self._stats_stop = threading.Event()
         # Whether one-run windows are copied in place; see `register_kv_caches`.
         self._in_place = False
         # Per copy thread: the stream its in-place packs and unpacks run on.
@@ -338,6 +339,7 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
 
     def close(self) -> None:
         """Join the executors, then release the GPU connector, pool and client."""
+        self._stats_stop.set()
         super().close()
         # A backend's own call still inside the client keeps it open: closing
         # it would pull it from under the call.
@@ -433,6 +435,9 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
         # forward thread. The fused kernel exists only on the GPU.
         self._in_place = self._codec.has_fused_chunk_major_staging
         self._next_stats_log_at = time.monotonic() + _STATS_LOG_INTERVAL_S
+        self._stats_stop.clear()
+        t = threading.Thread(target=self._stats_log_loop, daemon=True, name="umbp-stats")
+        t.start()
         logger.info(
             "%s worker rank=%d world=%d: namespace=%s %s "
             "bytes_per_block=%d chunk=%d chunk_bytes=%d "
@@ -1006,6 +1011,11 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
             self._next_warning_at[kind] = now + _WARNING_INTERVAL_S
             suppressed = self._suppressed_warnings.pop(kind, 0)
         logger.warning(message + " (%d more since the last warning)", *args, suppressed)
+
+    def _stats_log_loop(self) -> None:
+        """Background thread: fire _maybe_log_store_stats on the interval timer."""
+        while not self._stats_stop.wait(timeout=_STATS_LOG_INTERVAL_S):
+            self._maybe_log_store_stats()
 
     def _maybe_log_store_stats(self) -> None:
         client, pool = self._client, self._pool
