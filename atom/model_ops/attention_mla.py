@@ -106,9 +106,9 @@ def indexer_qk_rope_quant_and_cache(
     slot_mapping: torch.Tensor,
     norm_weight: torch.Tensor,
     norm_bias: torch.Tensor,
-    positions: torch.Tensor,
-    cos_cache: torch.Tensor,
-    sin_cache: torch.Tensor,
+    positions: torch.Tensor | None,
+    cos_cache: torch.Tensor | None,
+    sin_cache: torch.Tensor | None,
     epsilon: float,
     quant_block_size: int,
     scale_fmt: str | None,
@@ -117,14 +117,16 @@ def indexer_qk_rope_quant_and_cache(
     is_neox: bool = True,
     q_scale_out: torch.Tensor | None = None,
     kv_cache_scale: torch.Tensor | None = None,
+    *,
+    scale_layout: str = "flydsl",
+    rope_dim: int = 64,
 ) -> None:
-    """Run the fused indexer cache op with ATOM's DCP query semantics.
+    """Run AITER's fused HIP indexer writer with ATOM's DCP query semantics.
 
-    The two scale buffers together switch the op to packed E2M1 + e8m0 outputs,
-    and are forwarded only when given so that an aiter predating them still
-    accepts the FP8 call -- the same version tolerance the seg-variant import
-    above keeps. One without the other would fall back to FP8 and write that
-    layout into FP4-shaped buffers, so it is refused here rather than passed on.
+    The two scale buffers together switch the op to packed E2M1 + e8m0 outputs.
+    Supplying only one is refused before it can write FP8 into FP4 buffers.
+    OPUS accepts NoPE and publishes all Q rows. The writer receives the
+    explicit layout and RoPE width on every call, including FP8/FlyDSL defaults.
     """
     if (q_scale_out is None) != (kv_cache_scale is None):
         raise ValueError(
@@ -136,6 +138,8 @@ def indexer_qk_rope_quant_and_cache(
         if q_scale_out is not None
         else {}
     )
+    if scale_layout != "flydsl" and q_scale_out is None:
+        raise ValueError("An explicit FP4 layout requires both scale buffers")
     _indexer_qk_rope_quant_and_cache(
         q,
         q_out,
@@ -155,7 +159,10 @@ def indexer_qk_rope_quant_and_cache(
         weights_scale,
         preshuffle=preshuffle,
         is_neox=is_neox,
-        compute_all_q_rope=get_dcp_world_size() > 1,
+        # OPUS has always published every Q row, including negative K slots.
+        compute_all_q_rope=scale_layout == "opus" or get_dcp_world_size() > 1,
+        scale_layout=scale_layout,
+        rope_dim=rope_dim,
         **fp4_out,
     )
 

@@ -29,6 +29,7 @@ from atom.model_loader.weight_utils import (
 from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
     MQA_LOGITS_PRESHUFFLE_ROWS,
 )
+from atom.model_ops.indexer.layout import MFMA, PRESHUFFLE
 from atom.plugin import is_plugin_mode, is_vllm
 from atom.plugin.config import PluginConfig
 from atom.quant_spec import (
@@ -2278,9 +2279,9 @@ class Config:
     num_kvcache_blocks: int = -1
     kv_cache_dtype: str = "bf16"
     index_cache_dtype: str | None = None
-    # V4/V4.1 FP4 physical layout, resolved before config is sent to scheduler
-    # and workers. Their PAGE namespace must describe the same stored bytes.
-    index_cache_layout: str | None = field(default=None, init=False)
+    # FP4 physical layout, resolved before config is sent to scheduler/workers.
+    # DSA permits an explicit OPUS opt-in; V4/V4.1 follow their scorer backend.
+    index_cache_layout: str | None = None
     enable_prefix_caching: bool = True
     enable_chunked_prefill: bool = True
     enable_log_stats: bool = True
@@ -3254,8 +3255,13 @@ class Config:
         )
 
     def _resolve_index_cache_layout(self) -> None:
+        requested = self.index_cache_layout
         self.index_cache_layout = None
         if self.index_cache_dtype != "fp4":
+            if requested is not None:
+                raise ValueError(
+                    "--index-cache-layout requires --index-cache-dtype fp4"
+                )
             return
         is_v41 = self.hf_config.model_type == "deepseek_v41_text"
         arches = getattr(self.hf_config, "architectures", None) or []
@@ -3264,12 +3270,23 @@ class Config:
             for a in arches
         )
         if not (is_v4 or is_v41):
+            hf = getattr(self.hf_config, "text_config", self.hf_config)
+            if getattr(hf, "index_topk", None):
+                # DSA OPUS and legacy FP4 have equal byte widths but different
+                # permutations. Keep their prefix/offload namespaces apart.
+                if requested not in (None, PRESHUFFLE, MFMA):
+                    raise ValueError("DSA FP4 index layout must be preshuffle or mfma")
+                self.index_cache_layout = requested or PRESHUFFLE
+            elif requested is not None:
+                raise ValueError("--index-cache-layout requires a supported indexer")
             return
         from aiter.jit.utils.chip_info import get_gfx_runtime
 
         arch = get_gfx_runtime()
         if is_v4 and arch == "gfx942":
             # The V4 runtime falls back to FP8 on gfx942, even for explicit FP4.
+            if requested is not None:
+                raise ValueError("V4 on gfx942 uses FP8 and has no FP4 index layout")
             return
         if is_v41:
             from atom.model_ops.deepseek_v41.index_plane import (
@@ -3282,6 +3299,11 @@ class Config:
         self.index_cache_layout = layout_for_arch(
             arch, backend=envs.ATOM_V4_UNIFIED_MQA
         )
+        if requested is not None and requested != self.index_cache_layout:
+            raise ValueError(
+                f"Index layout {requested} does not match the V4/V4.1 scorer "
+                f"layout {self.index_cache_layout}"
+            )
 
     def _resolve_tbo(self) -> None:
         """Turn TBO off where it cannot run (`_check_tbo_support` refuses what

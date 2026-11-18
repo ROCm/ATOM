@@ -27,6 +27,7 @@ from atom.distributed.dcp_layout import (  # noqa: F401
     dcp_owner_rank,
 )
 from atom.distributed.dcp_utils import get_dcp_group, get_dcp_world_size
+from atom.model_ops.indexer.layout import MFMA, PRESHUFFLE
 from atom.utils.forward_context import get_published_dcp_local_context_lens
 
 # Token-ownership arithmetic lives in ``dcp_layout`` so P/D relayout can share
@@ -1279,6 +1280,7 @@ def dcp_decode_candidate_exchange_fused(
     q_scale: torch.Tensor | None = None,
     kv_scale: torch.Tensor | None = None,
     weights_scale: float = 1.0,
+    cache_layout: str = PRESHUFFLE,
 ) -> None:
     """Score the local shard, exchange scores, emit this rank's owned KV slots.
 
@@ -1346,6 +1348,24 @@ def dcp_decode_candidate_exchange_fused(
             l_max,
             KVBlockSize=runner_block_size,
             Preshuffle=True,
+        )
+    elif cache_layout == MFMA:
+        from atom.model_ops.dsa_fp4 import opus_logits
+
+        opus_logits(
+            q_rows.squeeze(1),
+            q_scale[:num_decode_tokens],
+            kv_cache,
+            kv_scale,
+            weights[:num_decode_tokens],
+            block_tables,
+            attn_metadata.sparse_cu_seqlens_q[: num_decode_tokens + 1],
+            local_ctx,
+            max_qlen=1,
+            max_seq_len=l_max,
+            block_size=runner_block_size,
+            weight_scale=weights_scale,
+            out=local_logits,
         )
     else:
         from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4

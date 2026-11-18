@@ -23,6 +23,7 @@ def _config():
         kv_cache_block_size=256,
         tensor_parallel_size=4,
         decode_context_parallel_size=2,
+        dcp_config=SimpleNamespace(interleave_size=1),
         speculative_config=SimpleNamespace(
             method="mtp",
             num_speculative_tokens=3,
