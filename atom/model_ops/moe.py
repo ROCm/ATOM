@@ -922,12 +922,16 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
 _IQ2R_GLM53_WORKSPACES: dict[tuple[torch.device, int, int], object] = {}
 # The kernels' N tile; checkpoints record theirs as `iq2r_tN`.
 _IQ2R_GLM53_TILE_N = 128
+# Codebook entries of each packed GLM-5.3 IQ2R-v2 layout: v3 is the
+# 1,024-entry (10-bit index) variant of the same format.
+_IQ2R_GLM53_LAYOUTS = {"glm53-packed-v2": 512, "glm53-packed-v3": 1024}
 
 
 class Iq2rMoEMethod(FusedMoEMethodBase):
-    """AITER IQ2R-v2 experts in the ``glm53-packed-v2`` layout.
+    """AITER IQ2R-v2 experts in the ``glm53-packed-v2`` (512-entry codebooks)
+    or ``glm53-packed-v3`` (1,024-entry) layout.
 
-    The layout covers GLM-5.3's 256 routed experts at TP4/TP8; the shared
+    The layouts cover GLM-5.3's 256 routed experts at TP4/TP8; the shared
     expert stays block-FP8 and runs as an ordinary MLP outside the MoE. The
     checkpoint holds full layers; each rank slices its share of the
     intermediate dimension as it loads.
@@ -941,11 +945,13 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
     ):
         super().__init__(moe)
         self.quant_config = quant_config
-        if layout != "glm53-packed-v2":
+        if layout not in _IQ2R_GLM53_LAYOUTS:
             raise ValueError(
                 f"unsupported IQ2R layout {layout!r}; ATOM runs only "
-                "'glm53-packed-v2' checkpoints"
+                f"{sorted(_IQ2R_GLM53_LAYOUTS)} checkpoints"
             )
+        self.layout = layout
+        self.codebook_entries = _IQ2R_GLM53_LAYOUTS[layout]
 
     def create_weights(
         self,
@@ -967,7 +973,7 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
             or layer.num_fused_shared_experts != 0
         ):
             raise NotImplementedError(
-                "the glm53-packed-v2 IQ2R layout runs at TP4/TP8 without EP or DP, "
+                f"the {self.layout} IQ2R layout runs at TP4/TP8 without EP or DP, "
                 "with the shared expert outside the MoE"
             )
         self.tp_size = parallel.tp_size
@@ -983,18 +989,24 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size_per_partition
         gate_n = 2 * intermediate_size_per_partition
+        entries = self.codebook_entries
         down_metadata = IQ2RMetadata(
             logical_n=hidden_size,
             logical_k=intermediate_size_per_partition,
+            codebook_entries=entries,
         )
         shapes = {
-            "w13_weight": iq2r_glm53_gate_bytes(gate_n),
+            "w13_weight": iq2r_glm53_gate_bytes(gate_n, entries),
             "w13_weight_scale": iq2r_glm53_aux_bytes(
-                gate_n, hidden_size, self.classes, gate=True
+                gate_n, hidden_size, self.classes, gate=True, codebook_entries=entries
             ),
             "w2_weight": down_metadata.data_bytes,
             "w2_weight_scale": iq2r_glm53_aux_bytes(
-                hidden_size, intermediate_size_per_partition, self.classes, gate=False
+                hidden_size,
+                intermediate_size_per_partition,
+                self.classes,
+                gate=False,
+                codebook_entries=entries,
             ),
         }
         tensors = {
@@ -1020,7 +1032,7 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
             if loaded_weight.tolist() != [_IQ2R_GLM53_TILE_N]:
                 raise ValueError(
                     f"IQ2R {name} is {loaded_weight.tolist()}, but the "
-                    f"glm53-packed-v2 kernels need {_IQ2R_GLM53_TILE_N}"
+                    f"{self.layout} kernels need {_IQ2R_GLM53_TILE_N}"
                 )
         elif self.tp_size > 1:
             loaded_weight = self._glm53_tp_slice(name, loaded_weight)
@@ -1042,36 +1054,44 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
 
         shard = self.intermediate_size
         full = shard * self.tp_size
+        entries = self.codebook_entries
         if name == "w13_weight":
-            return iq2r_glm53_slice_gate(weight, 2 * shard * self.tp_rank, 2 * shard)
+            return iq2r_glm53_slice_gate(
+                weight, 2 * shard * self.tp_rank, 2 * shard, entries
+            )
         if name == "w13_weight_scale":
             return iq2r_glm53_slice_gate_aux(
-                weight, 2 * shard * self.tp_rank, 2 * shard, 2 * full, self.classes
+                weight,
+                2 * shard * self.tp_rank,
+                2 * shard,
+                2 * full,
+                self.classes,
+                entries,
             )
         if name == "w2_weight":
             return iq2r_slice_input_data(
                 weight,
-                IQ2RMetadata(logical_n=self.hidden_size, logical_k=full),
+                IQ2RMetadata(
+                    logical_n=self.hidden_size, logical_k=full, codebook_entries=entries
+                ),
                 shard * self.tp_rank,
                 shard,
             )
         # The d table runs along the down input, so it shards like the data.
         return iq2r_glm53_slice_down_aux(
-            weight, shard * self.tp_rank, shard, full, self.classes
+            weight, shard * self.tp_rank, shard, full, self.classes, entries
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        from aiter.ops.iq2r_format import IQ2R_CODEBOOK_BYTES
         from aiter.ops.iq2r_v2 import iq2r_v2_check_codebook
 
         # load_weight checked every shape. Most kernels form codebook copies
-        # 1-3 from copy 0, exact only for bytes 0x08..0x78; `--load_dummy`
-        # writes no codebooks.
+        # 1-3 from copy 0 (the first entries x 8 bytes), exact only for bytes
+        # 0x08..0x78; `--load_dummy` writes no codebooks.
         if not get_current_atom_config().load_dummy:
+            book_bytes = self.codebook_entries * 8
             for aux in (layer.w13_weight_scale, layer.w2_weight_scale):
-                iq2r_v2_check_codebook(
-                    aux[:, :IQ2R_CODEBOOK_BYTES].view(torch.float8_e4m3fn)
-                )
+                iq2r_v2_check_codebook(aux[:, :book_bytes].view(torch.float8_e4m3fn))
         self._glm53_workspace(layer.w13_weight.device)
 
     def _glm53_workspace(self, device: torch.device):

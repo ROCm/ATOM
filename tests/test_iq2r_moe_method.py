@@ -41,6 +41,7 @@ def test_iq2r_weight_loader_requires_exact_shapes():
 def test_iq2r_weight_loader_checks_the_tile_n():
     method = object.__new__(moe_mod.Iq2rMoEMethod)
     method.tp_size = 4
+    method.layout = "glm53-packed-v2"
     parameter = torch.nn.Parameter(
         torch.zeros(1, dtype=torch.int32), requires_grad=False
     )
@@ -53,11 +54,13 @@ def test_iq2r_weight_loader_checks_the_tile_n():
             method.load_weight(parameter, torch.tensor(loaded, dtype=torch.int32))
 
 
-def test_iq2r_accepts_the_v2_layout():
+@pytest.mark.parametrize(
+    "layout,entries", [("glm53-packed-v2", 512), ("glm53-packed-v3", 1024)]
+)
+def test_iq2r_accepts_the_v2_and_v3_layouts(layout, entries):
     method = object.__new__(moe_mod.Iq2rMoEMethod)
-    moe_mod.Iq2rMoEMethod.__init__(
-        method, None, SimpleNamespace(), layout="glm53-packed-v2"
-    )
+    moe_mod.Iq2rMoEMethod.__init__(method, None, SimpleNamespace(), layout=layout)
+    assert method.codebook_entries == entries
 
 
 @pytest.mark.parametrize("layout", [None, "bogus", "glm53-packed-v1"])
@@ -69,8 +72,12 @@ def test_iq2r_rejects_other_layouts(layout):
         )
 
 
-def _glm53_packed_method(tp_size: int, tp_rank: int, intermediate: int):
+def _glm53_packed_method(
+    tp_size: int, tp_rank: int, intermediate: int, entries: int = 512
+):
     method = object.__new__(moe_mod.Iq2rMoEMethod)
+    method.codebook_entries = entries
+    method.layout = {512: "glm53-packed-v2", 1024: "glm53-packed-v3"}[entries]
     method.moe = SimpleNamespace(
         moe_parallel_config=SimpleNamespace(
             tp_size=tp_size, tp_rank=tp_rank, ep_size=1, dp_size=1
@@ -101,23 +108,26 @@ def _glm53_packed_layer(method, device="meta", num_experts=256):
     return layer
 
 
-def test_iq2r_glm53_packed_create_weights_at_tp4(aiter_iq2r):
+@pytest.mark.parametrize("entries", [512, 1024])
+def test_iq2r_glm53_packed_create_weights_at_tp4(aiter_iq2r, entries):
     from aiter.iq2r_glm53 import iq2r_glm53_aux_bytes, iq2r_glm53_gate_bytes
     from aiter.ops.iq2r_format import IQ2RMetadata
 
-    method = _glm53_packed_method(tp_size=4, tp_rank=1, intermediate=512)
+    method = _glm53_packed_method(
+        tp_size=4, tp_rank=1, intermediate=512, entries=entries
+    )
     layer = _glm53_packed_layer(method)
 
-    down = IQ2RMetadata(logical_n=6144, logical_k=512)
-    assert tuple(layer.w13_weight.shape) == (256, iq2r_glm53_gate_bytes(1024))
+    down = IQ2RMetadata(logical_n=6144, logical_k=512, codebook_entries=entries)
+    assert tuple(layer.w13_weight.shape) == (256, iq2r_glm53_gate_bytes(1024, entries))
     assert tuple(layer.w13_weight_scale.shape) == (
         256,
-        iq2r_glm53_aux_bytes(1024, 6144, 4, gate=True),
+        iq2r_glm53_aux_bytes(1024, 6144, 4, gate=True, codebook_entries=entries),
     )
     assert tuple(layer.w2_weight.shape) == (256, down.data_bytes)
     assert tuple(layer.w2_weight_scale.shape) == (
         256,
-        iq2r_glm53_aux_bytes(6144, 512, 4, gate=False),
+        iq2r_glm53_aux_bytes(6144, 512, 4, gate=False, codebook_entries=entries),
     )
     for name in ("w13_iq2r_tile_n", "w2_iq2r_tile_n"):
         parameter = getattr(layer, name)
@@ -125,14 +135,17 @@ def test_iq2r_glm53_packed_create_weights_at_tp4(aiter_iq2r):
     assert (method.tp_size, method.tp_rank, method.classes) == (4, 1, 4)
 
 
+@pytest.mark.parametrize("entries", [512, 1024])
 @pytest.mark.parametrize("load_dummy", [None, "empty", "zero", "xavier"])
 def test_iq2r_glm53_packed_post_load_checks_codebook_range(
-    aiter_iq2r, monkeypatch, load_dummy
+    aiter_iq2r, monkeypatch, load_dummy, entries
 ):
-    method = _glm53_packed_method(tp_size=8, tp_rank=0, intermediate=256)
+    method = _glm53_packed_method(
+        tp_size=8, tp_rank=0, intermediate=256, entries=entries
+    )
     layer = _glm53_packed_layer(method, device="cpu", num_experts=2)
     for aux in (layer.w13_weight_scale, layer.w2_weight_scale):
-        aux.data[:, :4096] = 0x38  # E4M3 1.0, inside the kernels' range
+        aux.data[:, : entries * 8] = 0x38  # E4M3 1.0, inside the kernels' range
     monkeypatch.setattr(
         moe_mod,
         "get_current_atom_config",
@@ -141,7 +154,8 @@ def test_iq2r_glm53_packed_post_load_checks_codebook_range(
     monkeypatch.setattr(moe_mod, "_IQ2R_GLM53_WORKSPACES", {})
     method.process_weights_after_loading(layer)
 
-    layer.w2_weight_scale.data[0, 5] = 0x05  # subnormal: copies form wrongly
+    # subnormal: copies form wrongly (the last entry of copy 0 is checked too)
+    layer.w2_weight_scale.data[0, 5 if load_dummy else entries * 8 - 1] = 0x05
     if load_dummy:  # dummy weights carry no codebooks
         method.process_weights_after_loading(layer)
     else:
@@ -194,8 +208,11 @@ def test_iq2r_glm53_packed_rejects_unsupported_parallelism(
         )
 
 
+@pytest.mark.parametrize("entries", [512, 1024])
 @pytest.mark.parametrize("tp_size,tp_rank", [(4, 3), (8, 5)])
-def test_iq2r_glm53_packed_loader_slices_the_rank_shard(aiter_iq2r, tp_size, tp_rank):
+def test_iq2r_glm53_packed_loader_slices_the_rank_shard(
+    aiter_iq2r, tp_size, tp_rank, entries
+):
     from aiter.iq2r_glm53 import (
         iq2r_glm53_aux_bytes,
         iq2r_glm53_gate_bytes,
@@ -206,39 +223,41 @@ def test_iq2r_glm53_packed_loader_slices_the_rank_shard(aiter_iq2r, tp_size, tp_
     from aiter.ops.iq2r_format import IQ2RMetadata, iq2r_slice_input_data
 
     shard = 2048 // tp_size
-    method = _glm53_packed_method(tp_size, tp_rank, shard)
-    down = IQ2RMetadata(logical_n=6144, logical_k=2048)
+    method = _glm53_packed_method(tp_size, tp_rank, shard, entries)
+    down = IQ2RMetadata(logical_n=6144, logical_k=2048, codebook_entries=entries)
     generator = torch.Generator().manual_seed(tp_size)
 
     def full(columns):
         return torch.randint(0, 256, (1, columns), generator=generator).to(torch.uint8)
 
+    def aux_bytes(n, k, gate):
+        return iq2r_glm53_aux_bytes(n, k, 4, gate=gate, codebook_entries=entries)
+
     weights = {
-        "w13_weight": full(iq2r_glm53_gate_bytes(4096)),
-        "w13_weight_scale": full(iq2r_glm53_aux_bytes(4096, 6144, 4, gate=True)),
+        "w13_weight": full(iq2r_glm53_gate_bytes(4096, entries)),
+        "w13_weight_scale": full(aux_bytes(4096, 6144, True)),
         "w2_weight": full(down.data_bytes),
-        "w2_weight_scale": full(iq2r_glm53_aux_bytes(6144, 2048, 4, gate=False)),
+        "w2_weight_scale": full(aux_bytes(6144, 2048, False)),
     }
     start = 2 * shard * tp_rank
     expected = {
-        "w13_weight": iq2r_glm53_slice_gate(weights["w13_weight"], start, 2 * shard),
+        "w13_weight": iq2r_glm53_slice_gate(
+            weights["w13_weight"], start, 2 * shard, entries
+        ),
         "w13_weight_scale": iq2r_glm53_slice_gate_aux(
-            weights["w13_weight_scale"], start, 2 * shard, 4096, 4
+            weights["w13_weight_scale"], start, 2 * shard, 4096, 4, entries
         ),
         "w2_weight": iq2r_slice_input_data(
             weights["w2_weight"], down, shard * tp_rank, shard
         ),
         "w2_weight_scale": iq2r_glm53_slice_down_aux(
-            weights["w2_weight_scale"], shard * tp_rank, shard, 2048, 4
+            weights["w2_weight_scale"], shard * tp_rank, shard, 2048, 4, entries
         ),
     }
     # The rank's shard has the shape create_weights allocates.
-    assert expected["w13_weight_scale"].shape[1] == iq2r_glm53_aux_bytes(
-        2 * shard, 6144, 4, gate=True
-    )
-    assert expected["w2_weight_scale"].shape[1] == iq2r_glm53_aux_bytes(
-        6144, shard, 4, gate=False
-    )
+    assert expected["w13_weight_scale"].shape[1] == aux_bytes(2 * shard, 6144, True)
+    assert expected["w2_weight_scale"].shape[1] == aux_bytes(6144, shard, False)
+    assert expected["w13_weight"].shape[1] == iq2r_glm53_gate_bytes(2 * shard, entries)
     for name, value in expected.items():
         parameter = torch.nn.Parameter(torch.empty_like(value), requires_grad=False)
         parameter.iq2r_name = name
