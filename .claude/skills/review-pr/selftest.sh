@@ -465,6 +465,22 @@ t "the same finding without the rule code is not" \
 Review: OK
 
 ⚠️ planner.rs:108 charges the prompt only when req.stream. **Author must** say so.' | grep -c RULE-CODE-IN-CARD)" "0"
+# `FP8:`, `TP8:`, `MI300:` and `V4:` share the rule-id shape and are ordinary ways to open
+# a finding here. Refusing those would be a false positive carrying a nonsense message.
+t "an ordinary FP8: opening is not a rule code" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+
+⚠️ FP8: minimax_m3/config.py:39 still refuses the connector. **Author must** fix the text.' | grep -c RULE-CODE-IN-CARD)" "0"
+# triage's CITATION did not cover .rs/.toml while _publish anchors them, so a Rust finding
+# had no path-based way to claim its FIRE and the rule id was the only one left.
+t "a Rust citation is a citation" \
+  "$(python3 -c '
+import sys; sys.path.insert(0, sys.argv[1]); import triage
+print(bool(triage.CITATION.findall("lookup.rs:185")) and bool(triage.CITATION.findall("x.toml:3")))' "$S")" "True"
 
 # `[diff-too-large]` (GitHub refusing a diff over 20000 lines) writes no coverage line,
 # so the card has to supply one and it has to say BEYOND ONE PASS.

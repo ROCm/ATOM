@@ -1834,7 +1834,7 @@ def expected_rules(rules_text):
 # boundary, `gemm_a8w8_blockscale_cktile_common.cuh` matched as `...common.cu`, a file the
 # PR changes read as one it does not. `=` belongs in the class because tuned-config names
 # carry it -- `gfx1201-GEMM-A8W8_BLOCKSCALE-N=1024-K=1024.json` matched as `1024.json`.
-CITATION = re.compile(r"([\w./=-]+\.(?:cuh|hpp|yaml|yml|json|csv|cpp|hip|py|cu|cc|co|h|md|sh))"
+CITATION = re.compile(r"([\w./=-]+\.(?:cuh|hpp|yaml|yml|json|csv|cpp|hip|py|cu|cc|co|h|md|sh|rs|toml))"
                       r"(?![\w])(?::(\d+))?")
 
 
@@ -3156,10 +3156,14 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
             # with `A5:`, which tells its reader nothing. The id still counts as the
             # claim below -- withdrawing that would turn such cards into UNREPORTED-FIRE,
             # which is worse -- but the card does not ship with it.
-            problems.append(("RULE-CODE-IN-CARD", text[:70],
-                             f"opens with the internal rule id `{rid.group(1)}`, which "
-                             "means nothing to a reviewer -- say the thing the rule is "
-                             "about instead"))
+            # Only a real rule id. `FP8:`, `TP8:`, `MI300:` and `V4:` all match the same
+            # shape and are ordinary ways to open a finding in this repo; refusing those
+            # would be a false positive with a message that makes no sense.
+            if rid.group(1) in ALL_RULES.split():
+                problems.append(("RULE-CODE-IN-CARD", text[:70],
+                                 f"opens with the internal rule id `{rid.group(1)}`, which "
+                                 "means nothing to a reviewer -- say the thing the rule is "
+                                 "about instead"))
             # `-- late finding:` is the exit for what no rule covers, so it cannot excuse a
             # finding that names a rule: claiming G1 the ledger adjudicated CLEAR is a
             # contradiction of the ledger, not a discovery arriving late.
