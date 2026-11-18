@@ -1364,7 +1364,8 @@ check_mooncake_store_settings() {
   require_mooncake_qp_per_endpoint
   refuse_mooncake_nic_auto_discovery
   local layout="${ATOMESH_PD_WORKER_LAYOUT:-multi_node}" num_prefill="${xP:-1}" num_decode="${yD:-1}"
-  if [[ -n "$(mooncake_setting MOONCAKE_STORE_DECODE_OWNERS)" ]] \
+  # packed_nodes: only the decode-only node's launch sets it, so its owners count once.
+  if [[ -n "$(mooncake_setting MOONCAKE_STORE_DECODE_OWNERS)" ]] && [[ "${layout}" != "packed_nodes" ]] \
     && [[ "${layout}" != "multi_node" || "${num_prefill}" != "1" || "${num_decode}" != "1" ]]; then
     echo "[mooncake-store][FAIL] MOONCAKE_STORE_DECODE_OWNERS needs the decode on nodes of its own (pd_worker_layout multi_node, here ${layout}), one prefill node (here ${num_prefill}), whose masters they join, and one decode node (here ${num_decode}): the pools count the decode owners once" >&2
     exit 2
