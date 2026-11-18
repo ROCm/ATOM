@@ -427,8 +427,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # NVFP4 decode cache write. 2: one Triton launch appends to the BF16 tail
     # and quantizes the open tile into the FP4 pages. 1: Triton append/gather,
     # then mla_nvfp4_update_cache. 0: torch ops, then mla_nvfp4_update_cache.
-    # 0 until the Triton kernels pass tests/test_nvfp4_ring_triton.py on gfx1250.
-    "ATOM_MLA_NVFP4_TRITON_RING": lambda: _int_env("ATOM_MLA_NVFP4_TRITON_RING", 0),
+    "ATOM_MLA_NVFP4_TRITON_RING": lambda: _int_env("ATOM_MLA_NVFP4_TRITON_RING", 2),
     # Accuracy experiment only: after each tile write, replace the tail's BF16
     # with the FP4 round trip of what was written, so the next token requantizes
     # dequantized FP4 (as a cache with no BF16 tail would) instead of originals.
