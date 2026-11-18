@@ -125,7 +125,7 @@ def standalone(max_bytes, *, reserve_tokens=None, free_blocks=0):
     block_manager = SimpleNamespace(
         num_pool_blocks=lambda tokens: tokens,
         draft_lookahead_blocks=lambda tokens: 0,
-        has_page_units=lambda count: count <= free_blocks,
+        has_page_units=lambda count, protected_hash=None: count <= free_blocks,
         kv=SimpleNamespace(lookup=lambda h: -1, num_free=free_blocks),
     )
     return PdAdmissionController(
@@ -136,7 +136,10 @@ def standalone(max_bytes, *, reserve_tokens=None, free_blocks=0):
 def try_admit(policy, seq, *, running=()):
     # No local hit: every block of the request is new.
     probe = SimpleNamespace(
-        num_cached_blocks=0, block_hashes=[], num_new_blocks=len(seq)
+        num_cached_blocks=0,
+        block_hashes=[],
+        num_new_blocks=len(seq),
+        protected_hash=None,
     )
     admitted, plan = policy.check(seq, probe, held=running)
     if admitted:

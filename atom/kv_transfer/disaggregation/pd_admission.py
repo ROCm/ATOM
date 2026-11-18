@@ -75,7 +75,8 @@ class DecodeGrowthReserve:
         # decode, which the reserve below covers.
         demand = probe.num_new_blocks - block_manager.draft_lookahead_blocks(len(seq))
         reserve = self.blocks(seq, block_manager.num_pool_blocks(len(seq)), admitted)
-        return block_manager.has_page_units(demand + reserve)
+        # The hit's checkpoint is pinned by `allocate`, so it cannot fund either.
+        return block_manager.has_page_units(demand + reserve, probe.protected_hash)
 
     def blocks(self, seq, num_blocks, admitted) -> int:
         """Blocks `seq`, holding `num_blocks`, and each of `admitted` need to grow."""

@@ -20,6 +20,7 @@ import pytest
 from conftest import MockConfig
 from test_state_offload_index import STALE
 
+from atom.kv_transfer.disaggregation.pd_admission import DecodeGrowthReserve
 from atom.kv_transfer.disaggregation.types import KVConnectorOutput
 from atom.model_engine.block_manager import (
     AdmissionProbe,
@@ -2918,6 +2919,37 @@ class TestDemandDrivenCheckpoints:
         assert second.num_wanted_hit_blocks > hit, "and to want a further one"
         assert second.checkpoint_demand_pos == 0, "spent an image already spoken for"
         assert bm.checkpoint_funnel()["demands_declined_no_room"] == 1
+
+    def test_a_receive_reserve_cannot_spend_the_checkpoint_it_resumes_from(self):
+        """`allocate` pins the hit's checkpoint, so a P/D receive's decode
+        reserve must not count its units as reclaimable either."""
+        bm = make_block_manager(demand_config(), state_runtime=BIG_IMAGE_RUNTIME)
+        run_prompt_on_the_ladder(bm, stateful_seq(PROMPT))
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        store = bm.paged_state_checkpoints.store
+        for cid in list(store._lru)[:-1]:
+            store._evict(cid)
+        assert len(store.records) == 1, "rested on one image"
+
+        second = stateful_seq(CONTINUATION)
+        reserve = DecodeGrowthReserve(bm, tokens=1, first_decode_tokens=1)
+        probe = AdmissionProbe()
+        assert bm.can_allocate(second, record=False, probe=probe) > 0
+        assert store.contains(probe.protected_hash), "the probe names the hit's image"
+        need = (
+            probe.num_new_blocks
+            - bm.draft_lookahead_blocks(len(second))
+            + reserve.blocks(second, bm.num_pool_blocks(len(second)), [])
+        )
+        # One unit short of the receive and its reserve: only that image's
+        # units could make up the difference.
+        bm.kv.reserve_units(bm.kv.num_free - (need - 1), ("live-kv", 0))
+        probe = AdmissionProbe()
+        assert bm.can_allocate(second, record=False, probe=probe) > 0
+        assert bm.has_page_units(need), "reachable by spending the pinned image"
+
+        assert not reserve.leaves_room(second, probe, [])
 
     def test_a_demand_recorded_while_there_was_room_is_withdrawn_when_it_goes(self):
         """The gate is the store's question, so it has to be asked afresh.

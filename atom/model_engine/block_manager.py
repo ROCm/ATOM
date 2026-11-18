@@ -145,12 +145,14 @@ class AdmissionProbe:
     `block_hashes` the chain the probe walked. `num_new_blocks` is the
     free-pool demand the probe's fit check passed, `None` when the probe
     returned before that check. `_fit_joint` re-checks a joint against it and
-    skips the joint without it.
+    skips the joint without it. `protected_hash` is the hit's checkpoint that
+    `allocate` pins, which the fit did not count as reclaimable.
     """
 
     num_cached_blocks: int = -1
     block_hashes: list[int] = field(default_factory=list)
     num_new_blocks: int | None = None
+    protected_hash: int | None = None
 
 
 # Evicted or remapped hashes kept for `_CachedWalk` revalidation; a memo
@@ -747,9 +749,10 @@ class BlockManager:
             count, protected_hash=protected_checkpoint_hash
         )
 
-    def has_page_units(self, count: int) -> bool:
-        """Whether `count` page units are free, or freeable from state checkpoints."""
-        return self._has_page_units(count)
+    def has_page_units(self, count: int, protected_hash: int | None = None) -> bool:
+        """Whether `count` page units are free, or freeable from state checkpoints
+        other than `protected_hash`'s."""
+        return self._has_page_units(count, protected_hash)
 
     def _ensure_page_units(self, count: int) -> bool:
         if self.paged_state_checkpoints is None:
@@ -1328,6 +1331,7 @@ class BlockManager:
         # walking the hit again.
         if probe is not None:
             probe.num_new_blocks = num_new_blocks
+            probe.protected_hash = protected_hash
         # A direct admission commits its joint boundary here. The scheduler
         # probes first and calls record_allocation only after dependency and
         # budget checks; refused probes avoid the extra LMCache hash walk.
