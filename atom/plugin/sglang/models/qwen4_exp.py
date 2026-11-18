@@ -287,6 +287,22 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
             )
         )
 
+    @property
+    def remote_instance_load_supported(self) -> bool:
+        """R-Fork (patches/remote_instance_patch.py) is validated on PTPC-FP8 only.
+
+        Post-load state there is parameters or views of them (hyper-connection
+        fused_w_cat), so the copy fills it. BF16 and MXFP4 (fp4x2) are untested.
+        Checked before and after the post-load pass, so online MXFP4 is refused
+        too.
+        """
+        quant = self.atom_config.quant_config.global_quant_config
+        return (
+            quant.quant_type.name == "per_Token"
+            and quant.quant_dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+            and all(p.dtype != torch.float4_e2m1fn_x2 for p in self.parameters())
+        )
+
     def get_input_embeddings(self, input_ids: torch.Tensor | None = None):
         if input_ids is None:
             return self.model.embed_tokens
