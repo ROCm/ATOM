@@ -41,18 +41,40 @@ def fma(a, b, c):
 QS_OFF = 2048
 
 
+def _slot_row(rows, s):
+    """The row of LDS query slot s (traced): rows[s] (ints or traced rows)."""
+    r = I32(rows[0]) if isinstance(rows[0], int) else rows[0]
+    for k in range(1, len(rows)):
+        r = (s == I32(k)).select(I32(rows[k]) if isinstance(rows[k], int) else rows[k], r)
+    return r
+
+
 @ASTRewriter.transform
-def stage_q_rows(c, sm, t, k, r_):
-    """Row r_'s query (and head weights) -> LDS slot k."""
+def stage_q_slots(c, sm, t, rows):
+    """The rows' queries (FP4: their E8M0 scales too) and head weights -> LDS slots 0 .. len(rows) - 1 (slot k: row
+    rows[k]). Every load is issued first, then the LDS stores: one load round trip for all the slots, not one a slot and
+    kind behind its thread guard (6 FP4 rows: 12 serial load -> wait -> store trips, 2.3 us cold and hot on the block-4
+    fixture). A thread past the items re-stores the last one (clamped index: the same bytes)."""
+    NS = len(rows)
+    NCH = HEADS * DIM // 32 if c["ifp4"] else 256        # 16-B chunks a slot's values
+    RSB = HEADS * DIM // 2 if c["ifp4"] else HEADS * DIM   # a row's value bytes in iq_out
+    vs = []
+    for j in range_constexpr((NS * NCH + 255) // 256):
+        u = fx.min(t + I32(j * 256), I32(NS * NCH - 1))
+        sl = u // NCH
+        vs.append((sl, u % NCH, hx.gload(c["iq_out"] + i64(_slot_row(rows, sl)) * RSB + i64(u % NCH) * 16, I32, 4)))
+    us = fx.min(t, I32(NS * HEADS - 1))
+    su = us // HEADS
+    hu = us % HEADS
+    ru = _slot_row(rows, su)
+    wv = hx.gload(c["iw_out"] + i64(ru * HEADS + hu) * 4, F32)
     if fx.const_expr(c["ifp4"]):
-        if t < HEADS * DIM // 32:   # 128 threads x 16 B of values
-            hx.lstore(sm + O_Q + k * (HEADS * DIM) + t * 16, hx.gload(c["iq_out"] + i64(r_ * HEADS * DIM // 2) + i64(t) * 16, I32, 4))
-        if t < HEADS:
-            hx.lstore(sm + O_Q + k * (HEADS * DIM) + QS_OFF + t * 4, hx.gload(c["iqs_out"] + i64(r_ * HEADS + t) * 4, I32))
-    else:
-        hx.lstore(sm + O_Q + k * (HEADS * DIM) + t * 16, hx.gload(c["iq_out"] + i64(r_ * HEADS * DIM) + i64(t) * 16, I32, 4))
-    if t < HEADS:
-        hx.lstore(sm + O_W + k * (HEADS * 4) + t * 4, hx.gload(c["iw_out"] + i64(r_ * HEADS + t) * 4, F32))
+        sv = hx.gload(c["iqs_out"] + i64(ru * HEADS + hu) * 4, I32)
+    for (sl, p, v) in vs:
+        hx.lstore(sm + O_Q + sl * (HEADS * DIM) + p * 16, v)
+    if fx.const_expr(c["ifp4"]):
+        hx.lstore(sm + O_Q + su * (HEADS * DIM) + QS_OFF + hu * 4, sv)
+    hx.lstore(sm + O_W + su * (HEADS * 4) + hu * 4, wv)
 
 
 def fp4_key(c, flat, l):
@@ -237,9 +259,11 @@ def stage_score_any(c, isrx):
         c["prewait"]()
     for gb in range((nme + (RB - 1)) // RB):
         base_i = b + gb * (RB * CTAS)
+        qrows = []
         for k in range_constexpr(RB):
             r0_, ch0, cx0, bd0, q0 = tmap(fx.min(base_i + k * CTAS, nt - 1))
-            stage_q_rows(c, sm, t, k, r0_)
+            qrows.append(r0_)
+        stage_q_slots(c, sm, t, qrows)
         if fx.const_expr("prewait" in c):
             if gb > 0:
                 pages_to_lds(base_i)
@@ -376,8 +400,7 @@ def stage_score_grouped(c):
     flat0 = page_row(fx.min(vb, fx.max(nt - 1, I32(0))))   # (the first task's page chain before the wait for the query)
     if fx.const_expr("prewait" in c):
         c["prewait"]()
-    for k in range_constexpr(TR):   # every row's query and head weights -> LDS slots 0..TR-1
-        stage_q_rows(c, sm, t, k, k)
+    stage_q_slots(c, sm, t, list(range(TR)))   # every row's query and head weights -> LDS slots 0..TR-1
     gpu.barrier()
     key_of = lambda flat: _grouped_key(c, flat, l)
 
