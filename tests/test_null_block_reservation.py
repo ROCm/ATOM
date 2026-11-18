@@ -5,8 +5,6 @@ from array import array
 from types import SimpleNamespace
 
 import pytest
-
-from atom.model_engine.block_pool import BlockPool
 from test_state_checkpoint import (
     BLOCK,
     PAGED_COPY_RUNTIME,
@@ -15,6 +13,8 @@ from test_state_checkpoint import (
     make_scheduler,
     stateful_seq,
 )
+
+from atom.model_engine.block_pool import BlockPool
 
 
 def test_reserved_block_is_never_reissued_after_recycling_or_resize():
