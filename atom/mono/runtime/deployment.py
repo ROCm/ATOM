@@ -88,6 +88,7 @@ def common_refusals(
     *,
     refuse_tr_hybrid: bool = True,
     refuse_decode_cp: bool = True,
+    refuse_prefill_tbo: bool = True,
 ) -> list[tuple[bool, str]]:
     """``(holds, why not)`` of the conditions every mono model needs: ``dims``
     (the model's ``Dims``) shards at this TP, which is one of ``supported_tp``,
@@ -112,7 +113,9 @@ def common_refusals(
     (its attention layers stay on the production path, which handles the
     split) or are written for that split and refuse any other themselves
     (the shared DSA indexer, ``dsa_indexer.bind``) passes
-    ``refuse_decode_cp=False``."""
+    ``refuse_decode_cp=False``. A model that routes only decode steps to mono
+    passes ``refuse_prefill_tbo=False``: prefill-only TBO never splits a
+    decode step."""
     tp = atom_config.tensor_parallel_size
     dpa = dp_attention_ranks(atom_config)
     if dpa not in (0, *supported_dpa):
@@ -144,7 +147,11 @@ def common_refusals(
         # Mono's peer buffers are HIP IPC mappings, which cannot reach a GPU on
         # another node.
         (not atom_config.is_multinode_tp, "TP group spans nodes (HIP IPC peer memory)"),
-        (not (atom_config.enable_tbo or atom_config.enable_tbo_decode), "TBO"),
+        (
+            not atom_config.enable_tbo_decode
+            and not (refuse_prefill_tbo and atom_config.enable_tbo),
+            "TBO",
+        ),
         (not (is_vllm() or is_sglang()), "plugin mode"),
         (
             not _takes_weight_updates(atom_config),

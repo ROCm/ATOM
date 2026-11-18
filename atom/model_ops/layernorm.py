@@ -1032,12 +1032,73 @@ class GemmaRMSNorm(nn.Module):
         return self.forward_cuda(x, residual)
 
 
+def _tbo_tp_reduce() -> bool:
+    """Pure TP under TBO: the delayed all-reduce must be a micro-batch hand-off
+    (`m3_tbo_allreduce_gemma_rms_norm`), not the fused kernel on the compute
+    stream, which neither overlaps nor has a communicator per micro-batch."""
+    from atom.model_ops.communication_op import _tbo_aware_tp_reduce
+
+    return _tbo_aware_tp_reduce(get_tensor_model_parallel_world_size())
+
+
+def _m3_tbo_allreduce_gemma_rms_norm(
+    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm_group_quant
+
+    from atom.utils.tbo.ubatching import tbo_active
+
+    if not tbo_active():
+        return tensor_model_parallel_fused_allreduce_rmsnorm(
+            x, residual, weight, eps, gemma_norm=True
+        )
+    from atom.model_ops.module_dispatch_ops import tbo_all_reduce
+
+    x = tbo_all_reduce(x)
+    out = torch.empty_like(x)
+    res_out = torch.empty_like(x)
+    fused_qk_rmsnorm_group_quant(
+        q=x,
+        q_weight=weight,
+        q_epsilon=eps,
+        q_out_unquantized=out,
+        q_res_out=res_out,
+        q_residual=residual,
+        gemma_norm=True,
+    )
+    return out, res_out
+
+
+def _m3_tbo_allreduce_gemma_rms_norm_fake(
+    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(x), torch.empty_like(x)
+
+
+def _register_m3_tbo_op() -> None:
+    from atom.utils.custom_register import direct_register_custom_op
+
+    direct_register_custom_op(
+        op_name="m3_tbo_allreduce_gemma_rms_norm",
+        op_func=_m3_tbo_allreduce_gemma_rms_norm,
+        mutates_args=(),
+        fake_impl=_m3_tbo_allreduce_gemma_rms_norm_fake,
+    )
+
+
+_register_m3_tbo_op()
+
+
 def fused_allreduce_gemma_rms_norm(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     norm: GemmaRMSNorm,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """MiniMax-M3 helper for delayed TP all-reduce followed by Gemma RMSNorm."""
+    if _tbo_tp_reduce():
+        return torch.ops.aiter.m3_tbo_allreduce_gemma_rms_norm(
+            hidden_states.contiguous(), residual, norm.weight, norm.variance_epsilon
+        )
     if get_tensor_model_parallel_world_size() > 1:
         return tensor_model_parallel_fused_allreduce_rmsnorm(
             hidden_states.contiguous(),
@@ -1055,6 +1116,17 @@ def fused_allreduce_gemma_rms_norm_quant(
     norm: GemmaRMSNorm,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """MiniMax-M3 helper for AR + Gemma RMSNorm + per-token FP8 quant."""
+    if _tbo_tp_reduce():
+        normed, residual_out = torch.ops.aiter.m3_tbo_allreduce_gemma_rms_norm(
+            hidden_states.contiguous(), residual, norm.weight, norm.variance_epsilon
+        )
+        from aiter import get_hip_quant
+        from aiter.utility.dtypes import fp8
+
+        out_fp8, scale_out = get_hip_quant(QuantType.per_Token)(
+            normed, quant_dtype=fp8
+        )
+        return out_fp8, scale_out, residual_out
     if get_tensor_model_parallel_world_size() > 1:
         out_fp8, residual_out, scale_out = (
             tensor_model_parallel_fused_allreduce_rmsnorm_quant(
