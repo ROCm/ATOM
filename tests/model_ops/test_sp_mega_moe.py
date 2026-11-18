@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from atom.model_ops.fused_moe import sp_mega_moe as fusion
-from atom.model_ops.fused_moe.sp_mega_moe import SPMegaMoE, local_token_tile
+from atom.model_ops.fused_moe.sp_mega_moe import SPMegaMoE, TPMegaMoE, local_token_tile
 
 
 def _layer(moe):
@@ -174,7 +174,7 @@ def _servable_layer(moe):
 
 def _pcp_group(monkeypatch, group):
     parallel_state = ModuleType("aiter.dist.parallel_state")
-    parallel_state.get_pcp_group = lambda: group
+    parallel_state.get_pcp_group = parallel_state.get_tp_group = lambda: group
     monkeypatch.setitem(sys.modules, parallel_state.__name__, parallel_state)
 
 
@@ -182,9 +182,12 @@ def _model(layer):
     return SimpleNamespace(modules=lambda: [torch.nn.Identity(), layer])
 
 
-def _config(backend="mega", mnbt=1024):
+def _config(backend="mega", mnbt=1024, tp=False):
     return SimpleNamespace(
-        moe_backend=backend, sequence_parallel_size=4, max_num_batched_tokens=mnbt
+        moe_backend=backend,
+        sequence_parallel_size=1 if tp else 4,
+        enable_expert_parallel=False,
+        max_num_batched_tokens=mnbt,
     )
 
 
@@ -211,7 +214,7 @@ class MegaMoeSetupError(RuntimeError):
     pass
 
 
-def _initialize(monkeypatch, sp_modules, runtime, mnbt=1024):
+def _initialize(monkeypatch, sp_modules, runtime, mnbt=1024, tp=False):
     layer = _servable_layer(sp_modules.moe)
     mega = ModuleType("aiter.ops.flydsl.mega_moe_tp")
     mega.MegaMoeTPConfig = dict
@@ -223,7 +226,7 @@ def _initialize(monkeypatch, sp_modules, runtime, mnbt=1024):
     )
     monkeypatch.setattr(fusion, "_unsupported_config", lambda config: None)
     return layer, partial(
-        fusion.initialize_sp_mega_moe, _model(layer), _config(mnbt=mnbt)
+        fusion.initialize_sp_mega_moe, _model(layer), _config(mnbt=mnbt, tp=tp)
     )
 
 
@@ -343,3 +346,108 @@ def test_epoch_reset_first_fails_on_any_rank_timeout(
     with pytest.raises(RuntimeError, match="rank 2: a MegaMoeTP wait timed out"):
         backend.before_step(16)
     runtime.reset.assert_not_called()
+
+
+# -- pure TP (TPMegaMoE) --------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("override", "selected"),
+    [
+        ({}, True),
+        ({"moe_backend": "standard"}, False),
+        ({"enable_expert_parallel": True}, False),  # MoRI MegaMoE
+        ({"sequence_parallel_size": 4}, False),
+    ],
+)
+def test_mega_backend_selects_the_tp_mode_on_pure_tp_only(override, selected):
+    config = _config(tp=True)
+    vars(config).update(override)
+    assert fusion.tp_mega_moe_selected(config) is selected
+
+
+def test_tp_layers_are_all_reduced_where_sp_layers_are_partial_sums(sp_modules):
+    layer = _servable_layer(sp_modules.moe)
+    assert fusion._unsupported_layer(layer) is None
+    assert "needs reduced" in fusion._unsupported_layer(layer, reduced=True)
+    layer.reduce_results = True
+    assert fusion._unsupported_layer(layer, reduced=True) is None
+    assert "needs unreduced" in fusion._unsupported_layer(layer)
+
+
+def _tp_runtime(**attrs):
+    return SimpleNamespace(
+        max_local_tokens=16, cfg=SimpleNamespace(world_size=4, rank=0), **attrs
+    )
+
+
+@pytest.mark.parametrize("rows", [8, 1, 3, 13])
+def test_tp_rows_launch_as_a_multiple_of_tp_padded_with_rows_routed_nowhere(rows):
+    launches = []
+
+    def launch(hidden, weights, ids, *, out):
+        launches.append((hidden.clone(), weights.clone(), ids.clone()))
+        out.copy_(torch.where(ids[:, :1] >= 0, hidden * 2, torch.zeros_like(hidden)))
+
+    runtime = _tp_runtime(set_weights=Mock(), forward=launch)
+    backend = TPMegaMoE(runtime, None, 1, None)
+    backend._route = lambda layer, hidden, logits: (
+        torch.ones(hidden.shape[0], 5),
+        torch.arange(5, dtype=torch.int32).expand(hidden.shape[0], -1).contiguous(),
+    )
+    layer = SimpleNamespace(
+        w13_weight=1, w13_weight_scale=2, w2_weight=3, w2_weight_scale=4
+    )
+    x = (torch.arange(rows) + 1).bfloat16()[:, None].expand(rows, 8).contiguous()
+    before = x.clone()
+    out = backend.forward(layer, x, None)
+    torch.testing.assert_close(out, before * 2)
+    torch.testing.assert_close(x, before)
+    runtime.set_weights.assert_called_once_with(w1=1, w1_scale=2, w2=3, w2_scale=4)
+    ((hidden, weights, ids),) = launches
+    assert hidden.shape[0] == -(-rows // 4) * 4
+    assert not hidden[rows:].any() and not weights[rows:].any()
+    assert (ids[rows:] == -1).all()
+
+
+def test_tp_steps_up_to_the_capacity_are_one_launch_a_layer(monkeypatch, host_copies):
+    monkeypatch.setattr(fusion, "RESET_LAUNCHES", 8)
+    runtime = _tp_runtime(
+        reset=Mock(), error_flag=lambda: torch.zeros(1, dtype=torch.int32),
+        poll_errors=lambda: 0,
+    )  # fmt: skip
+    backend = TPMegaMoE(runtime, None, 3, None)
+    assert [backend.runs(rows) for rows in (0, 1, 64, 65)] == [False, True, True, False]
+    for rows in (1, 64, 65, 0):
+        backend.before_step(rows)
+    assert backend.launches == 6
+    backend.before_step(8)
+    runtime.reset.assert_called_once_with()
+    assert backend.launches == 0
+
+
+def test_tp_runtime_is_the_ar_kernel_prepared_for_every_local_row_count(
+    monkeypatch, sp_modules
+):
+    runtime = Mock(max_local_tokens=1024, **{"poll_errors.return_value": 0})
+    factory = Mock(return_value=runtime)
+    layer, initialize = _initialize(monkeypatch, sp_modules, factory, 16384, tp=True)
+    layer.reduce_results = True
+    backend = initialize()
+    cfg = factory.call_args.args[0]
+    assert (cfg["comm_mode"], cfg["comm_dtype"], cfg["act_dtype"]) == (
+        "ar",
+        "bf16",
+        "auto",
+    )
+    # The small engine alone, sized for 4096 rows (1024 local).
+    assert cfg["bigm_min_tokens"] == 0 and cfg["max_local_tokens"] == 1024
+    assert list(runtime.prepare.call_args.args[0]) == list(range(1, 1025))
+    assert isinstance(backend, TPMegaMoE) and layer.sp_mega_moe is backend
+
+
+def test_tp_refuses_a_model_whose_layers_are_not_all_reduced(monkeypatch, sp_modules):
+    # No silent fallback: its neighbours' outputs would not be all-reduced.
+    _, initialize = _initialize(monkeypatch, sp_modules, Mock(), tp=True)
+    with pytest.raises(RuntimeError, match="with TP: experts: needs reduced"):
+        initialize()

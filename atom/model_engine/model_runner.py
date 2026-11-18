@@ -942,10 +942,6 @@ class ModelRunner:
         from atom.model_ops.fused_moe.sp_mega_moe import initialize_sp_mega_moe
 
         self.sp_mega_moe = initialize_sp_mega_moe(self.model, config)
-        # Pure-TP MegaMoE (--moe-backend mega without EP / SP); None otherwise.
-        from atom.model_ops.fused_moe.tp_mega_moe import initialize_tp_mega_moe
-
-        self.tp_mega_moe = initialize_tp_mega_moe(self.model, config)
 
         # Optional debug instrumentation; no-op when env vars unset.
         # See atom/utils/debug_helper/.
@@ -1270,9 +1266,6 @@ class ModelRunner:
             sp_mega_moe = getattr(self, "sp_mega_moe", None)
             if sp_mega_moe is not None:
                 sp_mega_moe.close()
-            tp_mega_moe = getattr(self, "tp_mega_moe", None)
-            if tp_mega_moe is not None:
-                tp_mega_moe.close()
             if envs.ATOM_MORI_V2:
                 from atom.model_ops.fused_moe.mori_v2_prepare_finalize import (
                     close_mega_transports,
@@ -3252,9 +3245,6 @@ class ModelRunner:
 
         if self.sp_mega_moe is not None:
             self.sp_mega_moe.before_step(sp_local_len(forward_mode.running_tokens))
-        tp_mega_moe = getattr(self, "tp_mega_moe", None)
-        if tp_mega_moe is not None:
-            tp_mega_moe.before_step(forward_mode.running_tokens)
 
         if not forward_mode.use_cudagraph:
             # prefill, or a decode no request graph serves (enforce_eager / DP

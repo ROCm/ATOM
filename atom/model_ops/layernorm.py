@@ -1038,10 +1038,8 @@ def fused_allreduce_gemma_rms_norm(
     norm: GemmaRMSNorm,
     reduced: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """MiniMax-M3 helper for delayed TP all-reduce followed by Gemma RMSNorm.
-
-    ``reduced``: ``hidden_states`` was all-reduced already (TP MegaMoE), so only
-    the add + norm run."""
+    """MiniMax-M3 helper for delayed TP all-reduce followed by Gemma RMSNorm
+    (``reduced``: already all-reduced, so only add + norm)."""
     if get_tensor_model_parallel_world_size() > 1 and not reduced:
         return tensor_model_parallel_fused_allreduce_rmsnorm(
             hidden_states.contiguous(),
@@ -1059,10 +1057,8 @@ def fused_allreduce_gemma_rms_norm_quant(
     norm: GemmaRMSNorm,
     reduced: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """MiniMax-M3 helper for AR + Gemma RMSNorm + per-token FP8 quant.
-
-    ``reduced``: ``hidden_states`` was all-reduced already (TP MegaMoE), so only
-    the add + norm + quant run."""
+    """MiniMax-M3 helper for AR + Gemma RMSNorm + per-token FP8 quant
+    (``reduced``: already all-reduced, so only add + norm + quant)."""
     if get_tensor_model_parallel_world_size() > 1 and not reduced:
         out_fp8, residual_out, scale_out = (
             tensor_model_parallel_fused_allreduce_rmsnorm_quant(

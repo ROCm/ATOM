@@ -144,11 +144,17 @@ def _worker():
     import torch.distributed as dist
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
+    from aiter.ops.flydsl.mega_moe_tp import MegaMoeTP, MegaMoeTPConfig
     from aiter.ops.flydsl.moe_common import GateMode
     from aiter.ops.shuffle import shuffle_weight
     from aiter.utility import fp4_utils
 
-    from atom.model_ops.fused_moe.tp_mega_moe import build_tp_mega_moe
+    from atom.model_ops.fused_moe.sp_mega_moe import (
+        TP_CONFIG,
+        TPMegaMoE,
+        _weights,
+        tp_local_token_tile,
+    )
 
     rank, tp = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     local = int(os.environ.get("LOCAL_RANK", rank))
@@ -180,16 +186,27 @@ def _worker():
         w2_weight=shuffle_weight(w2, layout=(16, 16)),
         w2_weight_scale=fp4_utils.e8m0_shuffle(w2s),
     )
-    backend = build_tp_mega_moe(
-        [layer],
-        rank=rank,
-        tp=tp,
-        cpu_group=cpu_group,
-        comm="bf16",
-        act="auto",
-        max_rows_hint=max(ROWS),
+    runtime = MegaMoeTP(
+        MegaMoeTPConfig(
+            rank=rank,
+            world_size=tp,
+            model_dim=HIDDEN,
+            inter_dim=inter,
+            experts=experts,
+            topk=TOP_K + 1,
+            max_local_tokens=tp_local_token_tile(max(ROWS), tp),
+            activation=ActivationType.Swiglu,
+            swiglu_limit=LIMIT,
+            fit_max_local=True,
+            **TP_CONFIG,
+        ),
+        **_weights(layer),
+        group=cpu_group,
+        device=device,
     )
-    assert backend.max_rows >= max(ROWS)
+    runtime.prepare(range(1, runtime.max_local_tokens + 1))
+    backend = TPMegaMoE(runtime, layer, 1, cpu_group)
+    assert backend.runs(max(ROWS))
     routing = {}
     backend._route = lambda layer_, hidden, logits: routing["wi"]
     failures = []

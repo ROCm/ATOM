@@ -2691,14 +2691,21 @@ class Config:
                 "moe_backend must be one of {'standard', 'mega'}, "
                 f"got {self.moe_backend!r}"
             )
-        # Under Ulysses SP, `mega` selects SP MegaMoE (sp_mega_moe.py) instead,
-        # and without expert parallelism TP MegaMoE (tp_mega_moe.py), which
-        # `initialize_tp_mega_moe` checks against the model.
-        if (
-            self.moe_backend != "mega"
-            or self.sequence_parallel_size > 1
-            or not self.enable_expert_parallel
-        ):
+        # Under Ulysses SP, `mega` selects SP MegaMoE (sp_mega_moe.py) instead.
+        if self.moe_backend != "mega" or self.sequence_parallel_size > 1:
+            return
+        if not self.enable_expert_parallel:
+            # Pure TP runs the same kernel in its TP mode.
+            if (
+                self.tensor_parallel_size < 2
+                or self.pipeline_parallel_size > 1
+                or self.parallel_config.data_parallel_size > 1
+                or self.prefill_context_parallel_size > 1
+            ):
+                raise ValueError(
+                    "moe_backend='mega' without expert parallelism or "
+                    "--sequence-parallel-size needs TP >= 2 without PP, DP or PCP"
+                )
             return
         if self.moe_all2all_backend == "rccl":
             raise ValueError(
