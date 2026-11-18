@@ -25,7 +25,13 @@ def test_profiles_are_schedulable_and_cover_decode_heavy_shapes(
         assert prefill + decodes * q <= budget
         assert math.ceil(prefill / max_len) + decodes <= max_seqs
     assert shapes[0][1] == 1
-    assert shapes[-1][1] == min(max_seqs - 1, (budget - max(1, budget // 8)) // width)
+    assert shapes[-1][1] == min(max_seqs - 1, (budget - 1) // width)
+
+
+@pytest.mark.parametrize("width", [1, 8])
+def test_profile_covers_short_prefill_with_unused_token_budget(width):
+    shapes = mixed_profile_shapes(100 * width, 101, width, 8192)
+    assert (width, 99, width) in shapes
 
 
 def test_impossible_mixed_shape_is_not_profiled():

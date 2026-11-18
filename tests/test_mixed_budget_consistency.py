@@ -84,6 +84,71 @@ def test_admissions_share_one_decode_reservation(monkeypatch):
     assert candidates.call_count == 1  # reservation; decode checks popped rows
 
 
+def _crowded_decode_scheduler(width):
+    sched = Scheduler(
+        MockConfig(
+            kv_cache_block_size=16,
+            num_kvcache_blocks=200,
+            max_num_batched_tokens=100 * width,
+            max_num_seqs=101,
+            max_model_len=128,
+            long_prefill_token_threshold=1,
+            enable_mixed_prefill_decode=True,
+            speculative_config=(
+                SimpleNamespace(
+                    num_speculative_tokens=width - 1, use_dspark=lambda: True
+                )
+                if width > 1
+                else None
+            ),
+        )
+    )
+    for seed in range(100):
+        seq = Sequence([seed + 3] * 16, block_size=16)
+        assert sched.block_manager.allocate(seq, 0)
+        # Each decode needs exactly one more page, including DSpark lookahead.
+        boundary = len(seq.block_table) * 16
+        while len(seq) <= boundary:
+            seq.append_token(seed + 4)
+        seq.num_cached_tokens = len(seq) - width
+        seq.type = SequenceType.DECODE
+        seq.status = SequenceStatus.RUNNING
+        sched.running.append(seq)
+        assert (
+            sched.block_manager.append_blocks_needed(seq, width, sched.draft_lookahead)
+            == 1
+        )
+    assert sched.block_manager.kv.num_free == 100
+    return sched
+
+
+@pytest.mark.parametrize("width", [1, 8])
+def test_short_prefill_reserves_every_decode_that_can_join(width):
+    sched = _crowded_decode_scheduler(width)
+    new = Sequence([200], block_size=16)
+    sched.add(new)
+    limits = sched._prefill_limits()
+    batch, _ = sched.schedule()
+    assert batch.total_tokens_num_prefill == 1
+    assert batch.total_seqs_num_decode == 99
+    assert limits.reserved_decode_blocks == 99
+    assert sched.total_preemptions == 0
+
+
+@pytest.mark.parametrize("width", [1, 8])
+def test_short_chunk_cannot_spend_unreserved_tail_decode_pages(width):
+    sched = _crowded_decode_scheduler(width)
+    # Only one token would run, but admitting this prompt owns several pages.
+    # All 100 existing decodes fit without it; none should be preempted for it.
+    new = Sequence([200] * 80, block_size=16)
+    sched.add(new)
+    batch, _ = sched.schedule()
+    assert sched.total_preemptions == 0
+    assert batch.total_seqs_num_prefill == 0
+    assert batch.total_seqs_num_decode == 100
+    assert new in sched.waiting
+
+
 def test_mixed_decode_pass_preserves_partial_prefill_order():
     sched = Scheduler(
         MockConfig(
