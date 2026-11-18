@@ -64,9 +64,9 @@ from atom.model_engine.dynamic_chunking_worker import DynamicChunkingWorker
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.model_setup import (
     build_model,
+    construct_drafter,
     get_model,
     init_model_env,
-    load_drafter_from_disk,
     load_weights,
 )
 from atom.model_engine.output_transfer import D2HQueue
@@ -940,9 +940,7 @@ class ModelRunner:
         maybe_dump_weights_and_exit(self.model)
 
         if self.config.speculative_config and get_pp_group().is_last_rank:
-            self.drafter = load_drafter_from_disk(
-                self.config, self.device, self, self.model
-            )
+            self.drafter = self._build_and_load_drafter()
             self.rejection_sampler = RejectionSampler(
                 synthetic_acceptance_rates=(
                     self.config.speculative_config.synthetic_acceptance_rates
@@ -1084,6 +1082,21 @@ class ModelRunner:
             f"(weights loaded in {load_elapsed:.2f}s)"
         )
         return model
+
+    def _build_and_load_drafter(self) -> Drafter:
+        """Construct the drafter and load its weights, sharing with the loaded
+        model what the draft does not hold itself."""
+        drafter = construct_drafter(self.config, self.device, self)
+        logger.info("Loading drafter model...")
+        load_start = time.perf_counter()
+        drafter.load_model(self.model)
+        load_elapsed = time.perf_counter() - load_start
+        logger.info(
+            f"[{self.rank_name}] Drafter load done: "
+            f"{self.config.speculative_config.method} "
+            f"(weights loaded in {load_elapsed:.2f}s)"
+        )
+        return drafter
 
     def _maybe_warmup(self):
         """Run model warmup. Override point: the rapidserve decode process

@@ -1,15 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Build a rank's model, in the steps ModelRunner takes: the process state
-building needs (``init_model_env``), the model with its weights
-(``get_model``) and its drafter (``load_drafter_from_disk``). The first two
-need no ModelRunner, so a process that only loads can use them too."""
+building needs (``init_model_env``), the model (``get_model``, with
+``build_model`` and ``load_weights`` for its loader) and the drafter
+(``construct_drafter``). All but the last need no ModelRunner, so a process
+that only loads can use them too."""
 
 from __future__ import annotations
 
 import logging
 import os
-import time
 from collections.abc import Callable
 
 import torch
@@ -175,23 +175,14 @@ def load_weights(model: nn.Module, config: Config) -> set[str]:
     )
 
 
-def load_drafter_from_disk(config: Config, device: torch.device, runner, target):
-    """The drafter for ``runner``, built on ``device`` and loaded, sharing
-    with the loaded ``target`` model what the draft does not hold itself."""
+def construct_drafter(config: Config, device: torch.device, runner):
+    """Construct the drafter for ``runner`` on ``device``, without its
+    weights."""
     from atom.utils.backends import set_model_tag
 
     torch.set_default_device(device)
     try:
         with set_model_tag("drafter"):
-            drafter = build_drafter(config, device, runner)
+            return build_drafter(config, device, runner)
     finally:
         torch.set_default_device(None)
-    logger.info("Loading drafter model...")
-    load_start = time.perf_counter()
-    drafter.load_model(target)
-    load_elapsed = time.perf_counter() - load_start
-    logger.info(
-        f"[{runner.rank_name}] Drafter load done: {config.speculative_config.method} "
-        f"(weights loaded in {load_elapsed:.2f}s)"
-    )
-    return drafter
