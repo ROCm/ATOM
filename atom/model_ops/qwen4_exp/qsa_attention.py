@@ -209,14 +209,17 @@ class _FlyDSLPrefill:
             return
         self.laid_out = True
         if reason is None:
-            columns = qsa_selection_widths(
+            selection_width = qsa_selection_widths(
                 layer.compressed_key_cache,
                 qsa.block_tables,
                 topk,
                 ratio,
                 qsa.max_seq_len,
             )[2]
-            width = next((w for w in qsa_sparse_prefill_widths() if w >= columns), None)
+            width = next(
+                (w for w in qsa_sparse_prefill_widths() if w >= selection_width),
+                None,
+            )
             reason = _flydsl_call_fallback_reason(query, width, qsa)
         self.reason = reason
         if reason is None:

@@ -116,8 +116,9 @@ def test_supported_layer_takes_flydsl(modules, flydsl):
 
 @pytest.mark.parametrize("budget", [1024, 2048, 3072, 4096])
 def test_short_context_selects_into_the_narrowest_width(modules, flydsl, budget):
-    """A 40-token context reaches 16 groups, so the selection is 67 columns
-    and the kernel gets the narrowest width, -1 past the selection."""
+    """A 40-token context reaches 10 groups, rounded up to a power of two: 16,
+    so the selection is 67 columns and the kernel gets the narrowest width,
+    -1 past the selection."""
     layer = _layer(indexer=SimpleNamespace(compress_ratio=4, token_topk=budget))
     qsa = _qsa(modules, max_seq_len=40)
     assert _attend(modules, layer, qsa, columns=67) is not None
