@@ -51,6 +51,7 @@ U_IDX = 0x40000000
 # are argmax rows and D accepts draft p iff u_p < c_p, c_p = 1 (p < nf), fr (p = nf), 0 (p > nf)
 SIM_MAGIC = 0x53494D41
 NEG = -3e38
+PRB = 2048                   # LDS: P1's row records (CPR x (m, s), then CPR x (mq, sq, dx, -)), past P0's q statistics
 ZOFF = 8192                  # LDS: this CTA's z = l / T chunk [PT][256] f32, then the q row's d * invTd chunk (read once in P0)
 
 
@@ -208,21 +209,27 @@ def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank,
         hx.gstore(rec0 + i64(ROWS * CPR * 8) + i64(row * CPR + c) * 16 + i64(t) * 4, hx.lload(sm + 2048 + t * 4, F32))
     handoff(cnt, t, NCT)
     # P1: rank-row (m, s) and (mq, sq, dx) -> exchange -> global; histogram of z in [M - R, M)
+    # the row's CPR records read once (lane q < CPR: record q) into LDS PRB, then every thread folds them in q order (the
+    # same values / order as each thread's own global loads: ~200 loads a thread, 12.1 us, ktrace gapS)
+    qb = rec0 + i64(ROWS * CPR * 8) + i64(row * CPR) * 16
+    if t < CPR:
+        hx.lstore(sm + PRB + t * 8, hx.gload(rec0 + i64(row * CPR + t) * 8, F32, 2))
+        hx.lstore(sm + PRB + CPR * 8 + t * 16, hx.gload(qb + i64(t * 16), F32, 4))
+    gpu.barrier()
     mr = F32(-1e30)
     for q in range_constexpr(CPR):
-        mr = fx.max(mr, hx.gload(rec0 + i64(row * CPR + q) * 8, F32))
+        mr = fx.max(mr, hx.lload(sm + PRB + q * 8, F32))
     sr = F32(0.0)
     for q in range_constexpr(CPR):
-        sr = sr + hx.gload(rec0 + i64(row * CPR + q) * 8 + i64(4), F32) * expf(hx.gload(rec0 + i64(row * CPR + q) * 8, F32) - mr)
-    qb = rec0 + i64(ROWS * CPR * 8) + i64(row * CPR) * 16
+        sr = sr + hx.lload(sm + PRB + q * 8 + 4, F32) * expf(hx.lload(sm + PRB + q * 8, F32) - mr)
     mqr = F32(-1e30)
     dxr = F32(NEG)
     for q in range_constexpr(CPR):
-        mqr = fx.max(mqr, hx.gload(qb + i64(q * 16), F32))
-        dxr = fx.max(dxr, hx.gload(qb + i64(q * 16 + 8), F32))
+        mqr = fx.max(mqr, hx.lload(sm + PRB + CPR * 8 + q * 16, F32))
+        dxr = fx.max(dxr, hx.lload(sm + PRB + CPR * 8 + q * 16 + 8, F32))
     sqr = F32(0.0)
     for q in range_constexpr(CPR):
-        sqr = sqr + hx.gload(qb + i64(q * 16 + 4), F32) * expf(hx.gload(qb + i64(q * 16), F32) - mqr)
+        sqr = sqr + hx.lload(sm + PRB + CPR * 8 + q * 16 + 4, F32) * expf(hx.lload(sm + PRB + CPR * 8 + q * 16, F32) - mqr)
     xchg6(recv, rank, 0, row, c, t, sm, [mr.bitcast(I32), sr.bitcast(I32), mqr.bitcast(I32), sqr.bitcast(I32),
                                           dxr.bitcast(I32), I32(0)], tag0, mid=_ctxmid(ctxp, 0))
     M = F32(-1e30)
