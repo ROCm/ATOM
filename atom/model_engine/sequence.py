@@ -441,6 +441,9 @@ class Sequence:
         # because the slots are allocated one at a time and need not be
         # adjacent — see `StateSlotPool`.
         self.state_slots: list[int] = []
+        # Batches scheduled with this seq. A checkpoint filed before another
+        # one describes a slot that has moved on; see `take_checkpoint_ops`.
+        self.num_forwards: int = 0
         # Slot the NEXT forward reads its incoming state from, when that is not
         # the slot it writes (`state_slot`). Set by BlockManager on a state fork
         # — resuming from a checkpoint, or taking one — and cleared by the

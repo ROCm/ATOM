@@ -14,6 +14,7 @@ from aiter.dist.parallel_state import get_tp_group
 
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.scheduler import ScheduledBatch
+from atom.model_engine.state_cache import KEEP_NONE, KEEP_SETTLED, KEEP_SNAPSHOT
 from atom.model_engine.state_runtime import StateTransfer, midstep_checkpoint_targets
 from atom.model_ops.attention_gdn import GatedDeltaNet
 from atom.model_ops.fla_ops.chunk import CHUNK_SIZE
@@ -66,6 +67,9 @@ logger = logging.getLogger("atom")
 # whether GDN calls it that or K3 calls it KDA. Shared so a hybrid that binds
 # both kinds cannot number them into the same space.
 LINEAR_STATE_ROWS = "linear_state"
+
+# Spare state slots, so a full batch still has scratch to build decode images in.
+DECODE_SNAPSHOT_SCRATCH_SLOTS = 4
 
 _GDN_SSM_DTYPES = {
     "fp32": torch.float32,
@@ -665,6 +669,15 @@ class GDNStateMixin(PoolRowsMixin):
             midstep_min_offset=self._conv_state_len(),
         )
 
+    def _decode_keep(self) -> str:
+        """`StateTransfer.decode_keep` for a PAGE copy: under MTP or ReplaySSM
+        the slot is ahead of a decode boundary, so the step's image is built.
+        That rebuilds conv and SSM alone; an image with more planes keeps none
+        until its builder rebuilds them too."""
+        if not (self.replayssm or self.num_spec):
+            return KEEP_SETTLED
+        return KEEP_SNAPSHOT if len(self._checkpoint_plane_shapes()) == 2 else KEEP_NONE
+
     def num_state_layers(self) -> int:
         """Layers holding a recurrent state, one slot each.
 
@@ -693,17 +706,25 @@ class GDNStateMixin(PoolRowsMixin):
         prefix-reusing traffic. Decoupling the two is what the PAGE path does,
         by keeping the image in KV blocks instead of a slot; a flat cushion
         here would buy the same thing for `fork` at the cost of a knob nobody
-        can size without measuring, so it is not offered.
+        can size without measuring, so it is not offered for that.
         """
         shape_k, shape_v = self._state_shape_for_runner()
         dt_k, dt_v = self._state_dtypes()
         per_layer = (
             math.prod(shape_k) * dt_k.itemsize + math.prod(shape_v) * dt_v.itemsize
         )
+        cfg = self.model_runner.config
+        # Decode images are built in scratch, which a full batch leaves none of.
+        scratch = (
+            self.state_transfer().decode_keep == KEEP_SNAPSHOT
+            and cfg.enable_prefix_caching
+            and cfg.state_checkpoint_interval_tokens > 0
+        )
         return state_pool(
             STATE_SLOT_CLASS,
             self.num_state_layers() * per_layer + self._replayssm_bytes_per_slot(),
             entries_per_req=self.slots_per_req(),
+            extra_entries=DECODE_SNAPSHOT_SCRATCH_SLOTS if scratch else 0,
         )
 
     def slots_per_req(self) -> int:
@@ -1067,22 +1088,28 @@ class GDNStateMixin(PoolRowsMixin):
         """Build each op's image of its verify step `op.step` in its scratch slot.
 
         A decode leaves the slot ahead of that step in two ways: the conv window
-        sits `step` columns into the slot, and under ReplaySSM the SSM plane
-        lags the step by the records since the last flush.
+        sits `step` columns into the slot, and the step's SSM state is the plane
+        plus the records since the last flush under ReplaySSM, or else the slot
+        the verify left it in (`op.step_slot`).
         """
         runner = self.model_runner
-        planes = self._checkpoint_plane_tensors()
-        torch._foreach_copy_(
-            [p[:, op.scratch_slot] for op in ops for p in planes],
-            [p[:, op.src_slot] for op in ops for p in planes],
-        )
-        conv = runner.mamba_k_cache
-        width = conv.shape[2] - self.num_spec
+        conv, ssm = runner.mamba_k_cache, runner.mamba_v_cache
+        dsts, srcs = [], []
         for op in ops:
-            if op.step:
-                conv[:, op.scratch_slot, :width] = conv[
-                    :, op.src_slot, op.step : op.step + width
-                ]
+            for p in self._checkpoint_plane_tensors():
+                if p is conv and op.step:
+                    # The tail is never read; filled from the same slot so the
+                    # image holds this request's bytes alone.
+                    cut = p.shape[2] - op.step
+                    dsts += [p[:, op.scratch_slot, :cut], p[:, op.scratch_slot, cut:]]
+                    srcs += [p[:, op.src_slot, op.step :], p[:, op.src_slot, cut:]]
+                else:
+                    src = (
+                        op.step_slot if p is ssm and not self.replayssm else op.src_slot
+                    )
+                    dsts.append(p[:, op.scratch_slot])
+                    srcs.append(p[:, src])
+        torch._foreach_copy_(dsts, srcs)
         if not self.replayssm:
             return
         cols = torch.tensor(
@@ -1928,7 +1955,7 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             ":carry=all"
         )
         if not envs.ATOM_GDN_STATE_MIDSTEP:
-            return StateTransfer.copy(layout_id, decode_snapshot=self.replayssm)
+            return StateTransfer.copy(layout_id, decode_keep=self._decode_keep())
         from atom.model_ops.fla_ops.chunk import CHUNK_SIZE
 
         # Midstep: positions inside a forward are snapshotted from the chunk
@@ -1940,7 +1967,7 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             readable_midstep=True,
             midstep_grid=CHUNK_SIZE,
             midstep_min_offset=self._conv_state_len(),
-            decode_snapshot=self.replayssm,
+            decode_keep=self._decode_keep(),
         )
 
     def checkpoint_page_unit_bytes(self) -> int | None:

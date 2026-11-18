@@ -43,22 +43,26 @@ def builder(
     num_spec=0,
     pp=1,
     rapidserve=False,
+    replayssm=False,
+    kpool_tail=False,
 ):
     config = SimpleNamespace(
         pipeline_parallel_size=pp,
         enable_rapidserve=rapidserve,
     )
+    tail = (256, 3) if kpool_tail else None  # GLM-5.3's partial kpool keys
     stub = SimpleNamespace(
         model_runner=SimpleNamespace(config=config),
         num_state_layers=lambda: layers,
         num_spec=num_spec,
-        replayssm=False,
+        replayssm=replayssm,
         _state_shape_for_runner=lambda: (shape_k, shape_v),
         _state_dtypes=lambda: (dt_k, dt_v),
+        _kpool_tail_plane_shape=lambda: tail,
+        _checkpoint_plane_shapes=lambda: [(1, layers)] * 2 + [tail] * bool(tail),
     )
-    stub._uses_paged_checkpoints = Builder._uses_paged_checkpoints.__get__(
-        stub, type(stub)
-    )
+    for name in ("_uses_paged_checkpoints", "_decode_keep"):
+        setattr(stub, name, getattr(Builder, name).__get__(stub, type(stub)))
     return stub
 
 
@@ -161,3 +165,25 @@ class TestPagedCheckpointsAreRefusedWhereSizingWouldRaise:
         interior state to slice a checkpoint out of."""
         with tp_world(TP):
             assert not Builder.state_transfer(builder()).readable_midstep
+
+    @pytest.mark.parametrize(
+        "replayssm, num_spec, kpool_tail, keep",
+        [
+            (True, 2, False, "snapshot"),
+            (True, 0, False, "snapshot"),
+            (False, 2, False, "snapshot"),
+            (False, 0, False, "settled"),
+            (True, 2, True, "none"),
+            (False, 0, True, "settled"),
+        ],
+    )
+    def test_a_decode_boundary_keeps_what_the_slot_can_give(
+        self, replayssm, num_spec, kpool_tail, keep
+    ):
+        """Under MTP or ReplaySSM the slot is ahead of a decode boundary, and
+        the image is rebuilt only where it is conv and SSM alone."""
+        with tp_world(TP):
+            transfer = Builder.state_transfer(
+                builder(replayssm=replayssm, num_spec=num_spec, kpool_tail=kpool_tail)
+            )
+        assert transfer.decode_keep == keep

@@ -66,7 +66,7 @@ def _config(model_type, *, pp=1, rapidserve=False, wrapped=False):
     )
 
 
-def _layout(monkeypatch, **kwargs):
+def _transfer(monkeypatch, **kwargs):
     params = {
         "layers": 45,
         "shape_k": (3, 1536),
@@ -75,6 +75,8 @@ def _layout(monkeypatch, **kwargs):
         "dtype_v": torch.bfloat16,
         "tp": 8,
         "num_spec": 0,
+        "replayssm": False,
+        "midstep": False,
     }
     params.update(kwargs)
     builder_cls = _builder_cls()
@@ -82,15 +84,78 @@ def _layout(monkeypatch, **kwargs):
         "atom.model_ops.attentions.gdn_attn.get_tp_group",
         lambda: SimpleNamespace(world_size=params["tp"]),
     )
+    monkeypatch.setenv("ATOM_GDN_STATE_MIDSTEP", "1" if params["midstep"] else "0")
     builder = SimpleNamespace(
         num_spec=params["num_spec"],
-        replayssm=False,
+        replayssm=params["replayssm"],
+        _conv_state_len=lambda: params["shape_k"][0],
         _uses_paged_checkpoints=lambda: True,
         num_state_layers=lambda: params["layers"],
         _state_shape_for_runner=lambda: (params["shape_k"], params["shape_v"]),
         _state_dtypes=lambda: (params["dtype_k"], params["dtype_v"]),
     )
-    return builder_cls.state_transfer(builder).paged_layout_id
+    for name in ("_decode_keep", "_checkpoint_plane_shapes"):
+        setattr(builder, name, getattr(builder_cls, name).__get__(builder))
+    return builder_cls.state_transfer(builder)
+
+
+def _layout(monkeypatch, **kwargs):
+    return _transfer(monkeypatch, **kwargs).paged_layout_id
+
+
+@pytest.mark.parametrize("midstep", [False, True])
+@pytest.mark.parametrize(
+    "replayssm, num_spec, keep",
+    [
+        (True, 3, "snapshot"),
+        (True, 0, "snapshot"),
+        (False, 3, "snapshot"),
+        (False, 0, "settled"),
+    ],
+)
+def test_a_decode_boundary_keeps_what_the_slot_can_give(
+    monkeypatch, replayssm, num_spec, keep, midstep
+):
+    """Under MTP or ReplaySSM the slot is ahead of a decode boundary."""
+    transfer = _transfer(
+        monkeypatch, replayssm=replayssm, num_spec=num_spec, midstep=midstep
+    )
+    assert transfer.readable_midstep is midstep
+    assert transfer.decode_keep == keep
+
+
+@pytest.mark.parametrize(
+    ("replayssm", "prefix_caching", "interval", "spare"),
+    [
+        (True, True, 8192, True),
+        (False, True, 8192, False),
+        (True, False, 8192, False),
+        (True, True, 0, False),
+    ],
+)
+def test_decode_images_get_spare_slots_only_where_they_are_built(
+    monkeypatch, replayssm, prefix_caching, interval, spare
+):
+    """A full batch leaves no free slot to build a decode image in."""
+    from atom.model_ops.attentions.gdn_attn import DECODE_SNAPSHOT_SCRATCH_SLOTS
+
+    transfer = _transfer(monkeypatch, replayssm=replayssm)
+    builder = SimpleNamespace(
+        model_runner=SimpleNamespace(
+            config=SimpleNamespace(
+                enable_prefix_caching=prefix_caching,
+                state_checkpoint_interval_tokens=interval,
+            )
+        ),
+        state_transfer=lambda: transfer,
+        _state_shape_for_runner=lambda: ((3, 16), (2, 4, 4)),
+        _state_dtypes=lambda: (torch.bfloat16, torch.bfloat16),
+        num_state_layers=lambda: 2,
+        _replayssm_bytes_per_slot=lambda: 0,
+        slots_per_req=lambda: 1,
+    )
+    spec = _builder_cls().state_spec(builder)
+    assert spec.extra_entries == (DECODE_SNAPSHOT_SCRATCH_SLOTS if spare else 0)
 
 
 class TestWhoCopies:

@@ -62,6 +62,7 @@ class StateSlotPool:
         # reason `BlockManager` still cuts prefill chunks onto rungs; see
         # `StateTransfer.readable_midstep`.
         self.readable_midstep: bool = self.transfer.readable_midstep
+        self.decode_keep: str = self.transfer.decode_keep
         self.hash_block_size: int = hash_block_size
         if self.transfer.copies:
             raise ValueError("PAGE-copy checkpoints do not belong to StateSlotPool")
@@ -585,8 +586,7 @@ class StateSlotPool:
 
         `boundary_blocks` names the position, which is all this needs it for:
         whether the position is this prompt's own end decides where the
-        checkpoint sits in the LRU order — see `mark_speculative`. A fork hands
-        the slot itself on, so `step` is never needed: speculation never forks.
+        checkpoint sits in the LRU order — see `mark_speculative`.
         """
         del step
         if not self.applies(seq) or not self.transfer.forks:

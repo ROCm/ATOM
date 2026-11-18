@@ -10,6 +10,7 @@ from atom.model_engine.page_unit_checkpoint import (
     CheckpointStoreOp,
     PagedStateCheckpointSpec,
 )
+from atom.model_engine.state_cache import KEEP_NONE, KEEP_SETTLED, KEEP_SNAPSHOT
 
 FORK = "fork"
 COPY = "copy"
@@ -52,19 +53,18 @@ class StateTransfer:
     #: (`conv_kernel - 1`) is sliced out of the step's own conv input. 0 when
     #: not readable.
     midstep_min_offset: int = 0
-    #: A decode boundary's image is built from the slot at its verify step
-    #: (`CheckpointStoreOp.step`) rather than copied as the slot stands, so the
-    #: coordinator lends each such store a scratch slot to build it in.
-    decode_snapshot: bool = False
+    #: What a decode boundary keeps; see `StateCache.decode_keep`. A snapshot
+    #: is built in a scratch slot the coordinator lends the store.
+    decode_keep: str = KEEP_SETTLED
 
     def __post_init__(self) -> None:
         if not isinstance(self.fork_tokens, int) or isinstance(self.fork_tokens, bool):
             raise TypeError("fork_tokens must be an integer")
         if not isinstance(self.readable_midstep, bool):
             raise TypeError("readable_midstep must be a bool")
-        if not isinstance(self.decode_snapshot, bool):
-            raise TypeError("decode_snapshot must be a bool")
-        if self.decode_snapshot and self.kind != COPY:
+        if self.decode_keep not in (KEEP_SETTLED, KEEP_SNAPSHOT, KEEP_NONE):
+            raise ValueError(f"unknown decode keep {self.decode_keep!r}")
+        if self.decode_keep == KEEP_SNAPSHOT and self.kind != COPY:
             raise ValueError("only a copy transfer builds decode snapshots")
         if self.kind in (NONE, REPLAY) and self.readable_midstep:
             raise ValueError(f"{self.kind} transfer has no state to read midstep")
@@ -127,7 +127,7 @@ class StateTransfer:
         readable_midstep: bool = False,
         midstep_grid: int = 0,
         midstep_min_offset: int = 0,
-        decode_snapshot: bool = False,
+        decode_keep: str = KEEP_SETTLED,
     ) -> "StateTransfer":
         return cls(
             COPY,
@@ -135,7 +135,7 @@ class StateTransfer:
             readable_midstep=readable_midstep,
             midstep_grid=midstep_grid,
             midstep_min_offset=midstep_min_offset,
-            decode_snapshot=decode_snapshot,
+            decode_keep=decode_keep,
         )
 
     def to_wire(self) -> dict[str, str | int | bool | None]:
@@ -146,7 +146,7 @@ class StateTransfer:
             "readable_midstep": self.readable_midstep,
             "midstep_grid": self.midstep_grid,
             "midstep_min_offset": self.midstep_min_offset,
-            "decode_snapshot": self.decode_snapshot,
+            "decode_keep": self.decode_keep,
         }
 
     @classmethod
@@ -160,7 +160,7 @@ class StateTransfer:
             "readable_midstep",
             "midstep_grid",
             "midstep_min_offset",
-            "decode_snapshot",
+            "decode_keep",
         }
         if set(wire) != expected:
             raise ValueError(
@@ -174,7 +174,7 @@ class StateTransfer:
             readable_midstep=wire["readable_midstep"],  # type: ignore[arg-type]
             midstep_grid=wire["midstep_grid"],  # type: ignore[arg-type]
             midstep_min_offset=wire["midstep_min_offset"],  # type: ignore[arg-type]
-            decode_snapshot=wire["decode_snapshot"],  # type: ignore[arg-type]
+            decode_keep=wire["decode_keep"],  # type: ignore[arg-type]
         )
 
     @property

@@ -1,15 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""A decode-time PAGE checkpoint is the image of its verify step.
-
-A decode leaves the live slot ahead of the boundary it files: the conv window
-sits `step` columns in, and under ReplaySSM the SSM plane lags the records
-since the last flush. The image is resumed by prefill, which reads the SSM
-plane and the first `kernel - 1` conv columns alone, so the store builds the
-step's image in a scratch slot. Runs the shipped store/restore path over the
-real ReplaySSM, copy and chunk kernels.
-"""
+"""A decode-time PAGE checkpoint is the image of its verify step, as prefill
+resumes it. Runs the shipped store/restore path over the real kernels."""
 
 from types import SimpleNamespace
 
@@ -34,11 +27,16 @@ from atom.model_ops.attentions.pool_layout.page_unit_geometry import (
 )
 from atom.model_ops.attentions.qwen4_exp_attn import Qwen4ExpMetadataBuilder
 from atom.model_ops.fla_ops.chunk import chunk_gated_delta_rule
+from atom.model_ops.fla_ops.fused_recurrent import fused_recurrent_gated_delta_rule
 from atom.model_ops.fla_ops.replayssm import (
     replayssm_buffer_shapes,
     replayssm_commit,
     replayssm_gated_delta_rule,
     replayssm_materialize,
+)
+from atom.model_ops.mamba_ops.causal_conv1d import (
+    causal_conv1d_fn,
+    causal_conv1d_update,
 )
 from atom.model_ops.qwen4_exp.ops.ple import (
     advance_ngram_state,
@@ -46,56 +44,35 @@ from atom.model_ops.qwen4_exp.ops.ple import (
 )
 
 DEV = "cuda"
-LAYERS, SLOTS = 2, 7
-LIVE, PARKED, DST, DST2, REF, SCRATCH, SCRATCH2 = range(7)
+LAYERS, SLOTS = 2, 8
+LIVE, PARKED, DST, DST2, DST3, REF, SCRATCH, SCRATCH2 = range(8)
+# Without ReplaySSM a request holds a slot per verify step.
+SPEC_SLOTS = (LIVE, PARKED, DST2, DST3)
 H, K, V = 4, 128, 128
 T = 4  # verify window: anchor + 3 drafts
 CAP = 4 * T
 WIDTH = 3  # conv kernel - 1
-CONV = (WIDTH + T - 1, 64)
+CK, CV = 128, 256  # conv q/k and v widths, as the conv kernels tile them
+CONV = (WIDTH + T - 1, 2 * CK + CV)
 ROWS, BLOCK, ENTRY, UNITS = 2, 16, 1024, 32
 LAYOUT = "test-gdn-replayssm"
 
 
-class _Copier:
-    """What the store/restore path reads, with the shipped methods bound."""
+class _Copier(PageUnitGeometryMixin, GDNStateMixin):
+    """The shipped store/restore path, built without a model runner."""
+
+    _checkpoint_staging = AttentionMetadataBuilder._checkpoint_staging
 
 
-for _name in (
-    "execute_paged_state_copies",
-    "_build_decode_images",
-    "_materialize",
-    "_validate_paged_state_op",
-    "_checkpoint_copy_plan",
-    "_checkpoint_slot_bases",
-    "_checkpoint_plane_tensors",
-    "_checkpoint_plane_shapes",
-    "_checkpoint_layer_ranges",
-    "_checkpoint_segment_sizes",
-    "_checkpoint_num_slots",
-    "checkpoint_image_bytes",
-    "_checkpoint_descriptor_device",
-):
-    setattr(_Copier, _name, getattr(GDNStateMixin, _name))
-for _name in (
-    "_page_unit_index_cache",
-    "_page_unit_kv_cache",
-    "_page_unit_regions",
-    "_page_unit_bases",
-    "_page_unit_stream_sizes",
-):
-    setattr(_Copier, _name, getattr(PageUnitGeometryMixin, _name))
-_Copier._checkpoint_staging = AttentionMetadataBuilder._checkpoint_staging
-
-
-def _copier() -> _Copier:
-    sk, su, sg = replayssm_buffer_shapes(CAP, H, K, V, False)
+def _copier(kda=False) -> _Copier:
+    """GDN keeps the state `[HV, K, V]`; KDA transposed, with a per-K gate."""
+    sk, su, sg = replayssm_buffer_shapes(CAP, H, K, V, kda)
+    state = (H, V, K) if kda else (H, K, V)
     bf16 = torch.bfloat16
     runner = SimpleNamespace(
         mamba_k_cache=torch.randn((LAYERS, SLOTS) + CONV, dtype=bf16, device=DEV),
-        mamba_v_cache=(
-            torch.randn((LAYERS, SLOTS, H, K, V), dtype=bf16, device=DEV) * 0.01
-        ),
+        mamba_v_cache=torch.randn((LAYERS, SLOTS) + state, dtype=bf16, device=DEV)
+        * 0.01,
         replayssm_buf_k=torch.zeros((LAYERS, SLOTS) + sk, dtype=bf16, device=DEV),
         replayssm_buf_u=torch.zeros((LAYERS, SLOTS) + su, dtype=bf16, device=DEV),
         replayssm_buf_g=torch.zeros(
@@ -109,15 +86,16 @@ def _copier() -> _Copier:
         block_size=BLOCK,
         config=SimpleNamespace(num_kvcache_blocks=UNITS, max_num_seqs=4),
     )
-    c = _Copier()
+    c = _Copier.__new__(_Copier)
     c.model_runner = runner
     c.kv_pool = SimpleNamespace(cache=SimpleNamespace(view=lambda _n: runner.kv_cache))
     c.replayssm = True
     c.replayssm_max_query_len = T
     c.num_spec = T - 1
     c.num_state_layers = lambda: LAYERS
-    c._state_shape_for_runner = lambda: (CONV, (H, K, V))
+    c._state_shape_for_runner = lambda: (CONV, state)
     c._state_dtypes = lambda: (bf16, bf16)
+    c.conv_weight = torch.randn(CONV[1], WIDTH + 1, dtype=bf16, device=DEV) * 0.3
     image = c.checkpoint_image_bytes()
     runner.state_runtime = SimpleNamespace(
         checkpoint_spec=PagedStateCheckpointSpec(
@@ -125,6 +103,14 @@ def _copier() -> _Copier:
         )
     )
     return c
+
+
+def _ix(*vals):
+    return torch.tensor(vals, dtype=torch.int32, device=DEV)
+
+
+def _cu():
+    return _ix(0, T)
 
 
 def _window():
@@ -136,36 +122,96 @@ def _window():
     return q, k, v, g, beta
 
 
-def _cu():
-    return torch.tensor([0, T], dtype=torch.int32, device=DEV)
+def _conv_pool(c, layer):
+    # Allocated `[slots, window, dim]`, handed to the kernels `[slots, dim, window]`.
+    return c.model_runner.mamba_k_cache[layer].transpose(-1, -2)
 
 
-def _decode(c, slot, accepted, windows):
-    """One decode step as the runner takes it: commit, then every layer."""
+def _decode(c, slot, accepted, windows, xs):
+    """One decode step as the runner takes it: commit, then every layer's conv
+    update (rolled by the previous step's accepts) and recurrence."""
     r = c.model_runner
-    idx = torch.tensor([slot], dtype=torch.int32, device=DEV)
-    replayssm_commit(
-        r.replayssm_write_pos,
-        idx,
-        torch.tensor([accepted], dtype=torch.int32, device=DEV),
-        T,
-        CAP,
-    )
-    return [
-        replayssm_gated_delta_rule(
+    replayssm_commit(r.replayssm_write_pos, _ix(slot), _ix(accepted), T, CAP)
+    ssm, conv = [], []
+    for layer in range(LAYERS):
+        conv.append(
+            torch.cat(
+                causal_conv1d_update(
+                    xs[layer],
+                    _conv_pool(c, layer),
+                    c.conv_weight,
+                    CK,
+                    CV,
+                    activation="silu",
+                    conv_state_indices=_ix(slot),
+                    num_accepted_tokens=_ix(accepted),
+                    query_start_loc=_cu(),
+                    max_query_len=T,
+                ),
+                dim=-1,
+            )
+        )
+        ssm.append(
+            replayssm_gated_delta_rule(
+                *windows[layer],
+                ckpt=r.mamba_v_cache[layer],
+                buf_k=r.replayssm_buf_k[layer],
+                buf_u=r.replayssm_buf_u[layer],
+                buf_g=r.replayssm_buf_g[layer],
+                write_pos=r.replayssm_write_pos,
+                slot_idx=_ix(slot),
+                cu_seqlens=_cu(),
+                max_query_len=T,
+                use_qk_l2norm_in_kernel=True,
+            ).clone()
+        )
+    return ssm, conv
+
+
+def _decode_spec(c, accepted, windows, xs):
+    """The same step without ReplaySSM: each verify step's state goes to its
+    own slot, and the next verify resumes from the accepted one."""
+    r = c.model_runner
+    ssm, conv = [], []
+    for layer in range(LAYERS):
+        conv.append(
+            torch.cat(
+                causal_conv1d_update(
+                    xs[layer],
+                    _conv_pool(c, layer),
+                    c.conv_weight,
+                    CK,
+                    CV,
+                    activation="silu",
+                    conv_state_indices=_ix(LIVE),
+                    num_accepted_tokens=_ix(accepted),
+                    query_start_loc=_cu(),
+                    max_query_len=T,
+                ),
+                dim=-1,
+            )
+        )
+        o, _ = fused_recurrent_gated_delta_rule(
             *windows[layer],
-            ckpt=r.mamba_v_cache[layer],
-            buf_k=r.replayssm_buf_k[layer],
-            buf_u=r.replayssm_buf_u[layer],
-            buf_g=r.replayssm_buf_g[layer],
-            write_pos=r.replayssm_write_pos,
-            slot_idx=idx,
+            initial_state=r.mamba_v_cache[layer],
+            inplace_final_state=True,
             cu_seqlens=_cu(),
-            max_query_len=T,
+            ssm_state_indices=_ix(*SPEC_SLOTS)[None],
+            num_accepted_tokens=_ix(accepted),
             use_qk_l2norm_in_kernel=True,
-        ).clone()
-        for layer in range(LAYERS)
-    ]
+        )
+        ssm.append(o.clone())
+    return ssm, conv
+
+
+def _step_inputs():
+    return (
+        [_window() for _ in range(LAYERS)],
+        [
+            torch.randn(T, CONV[1], dtype=torch.bfloat16, device=DEV)
+            for _ in range(LAYERS)
+        ],
+    )
 
 
 def _planes(c):
@@ -186,14 +232,22 @@ def _slot(c, slot):
     ]
 
 
-def _round_trip(c, stores):
+def _round_trip(c, stores, step_slot=None):
     """Store each `(src, step, scratch, dst)` in one call, then restore."""
     spec = c.model_runner.state_runtime.checkpoint_spec
     n = spec.units_per_checkpoint
     units = [tuple(range(i * n, (i + 1) * n)) for i in range(len(stores))]
     c.execute_paged_state_copies(
         [
-            CheckpointStoreOp(src, u, spec.op_bytes, LAYOUT, step, scratch)
+            CheckpointStoreOp(
+                src,
+                u,
+                spec.op_bytes,
+                LAYOUT,
+                step,
+                scratch,
+                src if step_slot is None else step_slot,
+            )
             for (src, step, scratch, _), u in zip(stores, units)
         ],
         [],
@@ -212,6 +266,19 @@ def _rel_l2(a, b):
     return float((a.float() - b.float()).norm() / b.float().norm())
 
 
+def _fold(s0, buf_k, buf_u, buf_g, n, kda):
+    """The state after `n` records, the recurrence's closed form, `[HV, K, V]`."""
+    hv, k = s0.shape[0], buf_k.shape[-1]
+    g = buf_g[:, :n].float()  # [HV, n] or [HV, n, K]
+    if not kda:
+        g = g[..., None].expand(hv, n, k)
+    c = g.cumsum(1)
+    kw = buf_k[:, :n].float() * torch.exp(c[:, -1:] - c)
+    s = torch.einsum("hjk,hjv->hkv", kw, buf_u[:, :n].float())
+    s0 = s0.float().transpose(1, 2) if kda else s0.float()
+    return s0 * torch.exp(c[:, -1])[:, :, None] + s
+
+
 @pytest.mark.parametrize("decodes", [1, 3, 5])
 @pytest.mark.parametrize("step", [0, 1, 3])
 def test_a_decode_image_resumes_as_its_verify_step(decodes, step):
@@ -221,7 +288,7 @@ def test_a_decode_image_resumes_as_its_verify_step(decodes, step):
     r = c.model_runner
     accepted = 1
     for i in range(decodes):
-        _decode(c, LIVE, accepted, [_window() for _ in range(LAYERS)])
+        _decode(c, LIVE, accepted, *_step_inputs())
         accepted = 1 + i % T
     live = _slot(c, LIVE)
     # The reference: the live slot with that step's records committed.
@@ -233,18 +300,33 @@ def test_a_decode_image_resumes_as_its_verify_step(decodes, step):
         p[:, PARKED].normal_()
     parked = _slot(c, PARKED)
 
-    _round_trip(c, [(LIVE, step, SCRATCH, DST), (PARKED, 0, SCRATCH2, DST2)])
+    _round_trip(
+        c,
+        [
+            (LIVE, step, SCRATCH, DST),
+            (PARKED, 0, SCRATCH2, DST2),
+            (PARKED, -1, -1, DST3),  # a prefill boundary, copied as is
+        ],
+    )
 
     for before, after in zip(live, _slot(c, LIVE)):
         assert torch.equal(before, after), "the store changed the live slot"
+    cut = CONV[0] - step
     assert torch.equal(
-        r.mamba_k_cache[:, DST, :WIDTH], live[0][:, step : step + WIDTH]
-    ), "the conv window is not the step's"
-    assert torch.equal(r.mamba_v_cache[:, DST2], parked[1])
-    assert torch.equal(r.mamba_k_cache[:, DST2], parked[0])
+        r.mamba_k_cache[:, DST],
+        torch.cat([live[0][:, step:], live[0][:, cut:]], dim=1),
+    ), "the conv image is not the step's window over the slot's own tail"
+    for dst in (DST2, DST3):
+        assert torch.equal(r.mamba_v_cache[:, dst], parked[1])
+        assert torch.equal(r.mamba_k_cache[:, dst], parked[0])
 
-    windows = [_window() for _ in range(LAYERS)]
-    want = _decode(c, REF, step + 1, windows)
+    windows, xs = _step_inputs()
+    _assert_resumes(c, windows, xs, *_decode(c, REF, step + 1, windows, xs))
+
+
+def _assert_resumes(c, windows, xs, want_ssm, want_conv):
+    """A prefill over the next window from DST matches the live continuation."""
+    r = c.model_runner
     for layer in range(LAYERS):
         got, _ = chunk_gated_delta_rule(
             *windows[layer],
@@ -254,22 +336,96 @@ def test_a_decode_image_resumes_as_its_verify_step(decodes, step):
             head_first=False,
             use_qk_l2norm_in_kernel=True,
         )
-        err = _rel_l2(got, want[layer])
-        assert err < 2e-2, f"layer {layer} resumes elsewhere: rel L2 {err:.4f}"
+        err = _rel_l2(got, want_ssm[layer])
+        assert err < 2e-2, f"layer {layer} SSM resumes elsewhere: rel L2 {err:.4f}"
+        got_conv = torch.cat(
+            causal_conv1d_fn(
+                xs[layer].T,
+                c.conv_weight,
+                None,
+                conv_states=_conv_pool(c, layer),
+                query_start_loc=_cu(),
+                k_dim_size=CK,
+                v_dim_size=CV,
+                cache_indices=_ix(DST),
+                has_initial_state=torch.tensor([True], device=DEV),
+                activation="silu",
+            ),
+            dim=-1,
+        )
+        err = _rel_l2(got_conv, want_conv[layer])
+        assert err < 1e-2, f"layer {layer} conv resumes elsewhere: rel L2 {err:.4f}"
 
 
+@pytest.mark.parametrize("decodes", [1, 3])
+@pytest.mark.parametrize("step", [0, 1, 3])
+def test_without_replayssm_the_image_is_the_accepted_step_s_slot(decodes, step):
+    torch.manual_seed(100 + 10 * decodes + step)
+    c = _copier()
+    c.replayssm = False
+    r = c.model_runner
+    accepted = 1
+    for i in range(decodes):
+        _decode_spec(c, accepted, *_step_inputs())
+        accepted = 1 + i % T
+    conv, ssm = (p[:, list(SPEC_SLOTS)].clone() for p in _planes(c)[:2])
+
+    _round_trip(c, [(LIVE, step, SCRATCH, DST)], step_slot=SPEC_SLOTS[step])
+
+    assert torch.equal(r.mamba_k_cache[:, list(SPEC_SLOTS)], conv)
+    assert torch.equal(r.mamba_v_cache[:, list(SPEC_SLOTS)], ssm)
+    assert torch.equal(r.mamba_v_cache[:, DST], ssm[:, step])
+    cut = CONV[0] - step
+    assert torch.equal(
+        r.mamba_k_cache[:, DST],
+        torch.cat([conv[:, 0, step:], conv[:, 0, cut:]], dim=1),
+    )
+    windows, xs = _step_inputs()
+    _assert_resumes(c, windows, xs, *_decode_spec(c, step + 1, windows, xs))
+
+
+@pytest.mark.parametrize("h, step", [(5, 0), (5, 2), (10, 3)])
+def test_a_kda_decode_image_is_its_verify_step(h, step):
+    """The KDA layout through the same build; h = 10 is a flushing forward."""
+    torch.manual_seed(h + step)
+    c = _copier(kda=True)
+    r = c.model_runner
+    for p in _planes(c)[2:]:
+        p[:, LIVE].normal_(std=0.1)
+    r.replayssm_buf_g[:, LIVE] = -r.replayssm_buf_g[:, LIVE].abs()
+    r.replayssm_write_pos[LIVE] = h
+    live = _slot(c, LIVE)
+
+    _round_trip(c, [(LIVE, step, SCRATCH, DST)])
+
+    for before, after in zip(live, _slot(c, LIVE)):
+        assert torch.equal(before, after), "the store changed the live slot"
+    assert torch.equal(
+        r.mamba_k_cache[:, DST, :WIDTH], live[0][:, step : step + WIDTH]
+    ), "the conv window is not the step's"
+    n = (0 if h + 2 * T > CAP else h) + step + 1
+    for layer in range(LAYERS):
+        want = _fold(*(x[layer] for x in live[1:5]), n, kda=True)
+        got = r.mamba_v_cache[layer, DST].float().transpose(1, 2)
+        assert _rel_l2(got, want) < 1e-2
+
+
+@pytest.mark.parametrize(
+    "k, v, dtype",
+    [(K, V, torch.bfloat16), (64, 128, torch.bfloat16), (K, V, torch.float32)],
+)
 @pytest.mark.parametrize("kda", [False, True])
 @pytest.mark.parametrize("h, step", [(5, 0), (5, 2), (10, 0), (10, 3)])
-def test_materialize_folds_exactly_the_step_s_records(kda, h, step):
-    """Against the recurrence written out; h = 10 is a flushing forward."""
+def test_materialize_folds_exactly_the_step_s_records(kda, h, step, k, v, dtype):
+    """Against the closed form; h = 10 is a flushing forward."""
     torch.manual_seed(h + step)
     slots, hv = 3, 4
-    sk, su, sg = replayssm_buffer_shapes(CAP, hv, K, V, kda)
+    sk, su, sg = replayssm_buffer_shapes(CAP, hv, k, v, kda)
     buf_k = torch.randn((slots,) + sk, dtype=torch.bfloat16, device=DEV) * 0.1
     buf_u = torch.randn((slots,) + su, dtype=torch.bfloat16, device=DEV) * 0.1
     buf_g = -torch.rand((slots,) + sg, dtype=torch.float32, device=DEV) * 0.1
-    state = (hv, V, K) if kda else (hv, K, V)
-    ckpt = torch.randn((slots,) + state, dtype=torch.bfloat16, device=DEV) * 0.1
+    state = (hv, v, k) if kda else (hv, k, v)
+    ckpt = torch.randn((slots,) + state, dtype=dtype, device=DEV) * 0.1
     write_pos = torch.tensor([h, -1, -1], dtype=torch.int32, device=DEV)
     ix = torch.tensor([0], dtype=torch.int64, device=DEV)
     replayssm_materialize(
@@ -277,16 +433,7 @@ def test_materialize_folds_exactly_the_step_s_records(kda, h, step):
     )
 
     n = (0 if h + 2 * T > CAP else h) + step + 1
-    g = buf_g[0, :, :n].float()  # [HV, n] or [HV, n, K]
-    if not kda:
-        g = g[..., None].expand(hv, n, K)
-    c = g.cumsum(1)
-    w = torch.exp(c[:, -1:] - c)  # [HV, n, K]
-    kw = buf_k[0, :, :n].float() * w
-    s = torch.einsum("hjk,hjv->hkv", kw, buf_u[0, :, :n].float())
-    decay = torch.exp(c[:, -1])  # [HV, K]
-    s0 = ckpt[0].float().transpose(1, 2) if kda else ckpt[0].float()
-    want = s0 * decay[:, :, None] + s
+    want = _fold(ckpt[0], buf_k[0], buf_u[0], buf_g[0], n, kda)
     got = ckpt[2].float().transpose(1, 2) if kda else ckpt[2].float()
     assert _rel_l2(got, want) < 1e-2
 
@@ -327,7 +474,7 @@ def test_a_qwen38_decode_image_resumes_its_ple_windows_at_the_verify_step(step):
     torch.manual_seed(step)
     c = _qwen38_builder()
     r = c.model_runner
-    _decode(c, LIVE, 1, [_window() for _ in range(LAYERS)])
+    _decode(c, LIVE, 1, *_step_inputs())
     c._build_decode_images(
         [SimpleNamespace(src_slot=LIVE, scratch_slot=SCRATCH, step=step)]
     )

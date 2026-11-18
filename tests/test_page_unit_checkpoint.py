@@ -4,6 +4,7 @@
 
 import pickle
 from dataclasses import FrozenInstanceError
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,6 +19,8 @@ from atom.model_engine.page_unit_checkpoint import (
     PageUnitCheckpointStore,
     published_page_unit_bytes,
 )
+from atom.model_engine.state_cache import KEEP_SETTLED, KEEP_SNAPSHOT
+from atom.model_engine.state_pool import StateSlotPool
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
     page_pool,
     plan_pools,
@@ -755,61 +758,67 @@ def test_page_unit_needs_target_page_bytes():
         published_page_unit_bytes(_Builder([state_pool("s", 64, entries_per_req=1)]))
 
 
-class _ScratchSlots:
-    def __init__(self, *free):
-        self.free = list(free)
-
-    def has_free(self):
-        return bool(self.free)
-
-    def pop(self):
-        return self.free.pop()
-
-    def release(self, slot):
-        self.free.append(slot)
-
-
-def _snapshot_coordinator(*free, decode_snapshot=True):
-    from types import SimpleNamespace
-
+def _snapshot_coordinator(free_slots, decode_keep=KEEP_SNAPSHOT):
     c = PagedStateCheckpointCoordinator(
         BlockPool(20),
         PagedStateCheckpointSpec(10, 25, "layout-v1", image_bytes=25),
         enabled=True,
-        decode_snapshot=decode_snapshot,
+        decode_keep=decode_keep,
     )
-    slots = _ScratchSlots(*free)
-    c.attach_midstep_scratch(slots, 8)
-
-    def seq(slot):
-        return SimpleNamespace(has_per_req_cache=True, state_slot=slot)
-
-    return c, slots, seq
+    pool = StateSlotPool(free_slots)
+    c.attach_midstep_scratch(pool, 8)
+    return c, pool
 
 
-def test_a_decode_boundary_borrows_scratch_for_one_batch():
-    c, slots, seq = _snapshot_coordinator(9)
-    c.checkpoint(seq(1), 8, 101, step=2)
-    c.checkpoint(seq(2), 6, 102)  # a prefill wrote that slot whole
+def _seq(slot, spec_slots=()):
+    return SimpleNamespace(
+        has_per_req_cache=True,
+        state_slot=slot,
+        state_slots=[slot, *spec_slots],
+        num_forwards=0,
+    )
+
+
+@pytest.mark.parametrize(
+    "staged, forwards, kept", [(False, 0, 1), (False, 1, 0), (True, 1, 1), (True, 2, 0)]
+)
+def test_a_boundary_is_stored_only_while_the_slot_holds_it(staged, forwards, kept):
+    """One filed after its forward expects no other before the drain; one staged
+    with its forward in the batch being built expects that one."""
+    c, _ = _snapshot_coordinator(1, KEEP_SETTLED)
+    seq = _seq(5)
+    if staged:
+        c.checkpoint_when_scheduled(seq, 101)
+        assert c.take_checkpoint_ops()[0] == ()  # held back from its own batch
+    else:
+        c.checkpoint(seq, 8, 101)
+    seq.num_forwards += forwards
     stores, _ = c.take_checkpoint_ops()
-    got = {(op.src_slot, op.step, op.scratch_slot) for op in stores}
-    assert got == {(1, 2, 9), (2, -1, -1)}
-    assert slots.free == []
-    c.complete_previous_batch()
-    assert slots.free == [9]
+    assert (len(stores), c.checkpoints_dropped) == (kept, 1 - kept)
+
+
+@pytest.mark.parametrize("spec_slots, step_slot", [((), 5), ((6, 7, 8), 7)])
+def test_a_decode_image_names_the_slot_its_step_is_in(spec_slots, step_slot):
+    """A slot per verify step, or one for all of them (ReplaySSM)."""
+    c, _ = _snapshot_coordinator(1)
+    c.checkpoint(_seq(5, spec_slots), 8, 101, step=2)
+    (op,), _ = c.take_checkpoint_ops()
+    assert (op.src_slot, op.step, op.scratch_slot, op.step_slot) == (5, 2, 0, step_slot)
 
 
 def test_a_decode_boundary_with_no_scratch_free_is_dropped():
-    c, _, seq = _snapshot_coordinator()
-    c.checkpoint(seq(1), 8, 101, step=0)
+    c, _ = _snapshot_coordinator(0)
+    c.checkpoint(_seq(5), 8, 101, step=0)
     stores, _ = c.take_checkpoint_ops()
     assert stores == ()
     assert c.checkpoints_dropped == 1
 
 
-def test_a_backend_that_copies_its_slot_as_is_borrows_nothing():
-    c, slots, seq = _snapshot_coordinator(9, decode_snapshot=False)
-    c.checkpoint(seq(1), 8, 101, step=2)
+@pytest.mark.parametrize("decode_keep, step", [(KEEP_SETTLED, 2), (KEEP_SNAPSHOT, -1)])
+def test_a_slot_copied_as_is_borrows_nothing(decode_keep, step):
+    """A backend keeping its slot as it stands, or a slot a prefill wrote whole."""
+    c, pool = _snapshot_coordinator(1, decode_keep)
+    c.checkpoint(_seq(5), 8, 101, step=step)
     stores, _ = c.take_checkpoint_ops()
-    assert [(op.step, op.scratch_slot) for op in stores] == [(-1, -1)]
-    assert slots.free == [9]
+    assert [(op.src_slot, op.step, op.scratch_slot) for op in stores] == [(5, -1, -1)]
+    assert pool.has_free()
