@@ -286,6 +286,11 @@ for an encoder, what its adapter passes on. The rules and DeepSeek V4.1's
 kwargs hook are ATOM's code, which the router mirrors by the names the card
 gives them; `tests/entrypoints/fixtures/chat_rendering.json` holds the kwargs
 ATOM gives a set of chats, and both ATOM's and the router's tests check them.
+The router does not mirror the encoder itself: it renders with the model's
+Jinja template, for DeepSeek V4.1 the checkpoint's `chat_template.jinja`, so a
+chat tokenizes as on ATOM as far as that template renders as the encoder does.
+`scripts/atom_chat_parity.py` compares the two on a checkpoint, over chats with
+tool calls and their results, earlier turns' reasoning, and several turns.
 
 A chat renders with only its own `reasoning_effort` and `chat_template_kwargs`
 when the HTTP workers serving its model report no chat rendering, as backends

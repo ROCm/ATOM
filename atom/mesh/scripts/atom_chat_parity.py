@@ -63,6 +63,45 @@ MESSAGES = [
     {"role": "system", "content": "You are a coding agent."},
     {"role": "user", "content": "Read README.md."},
 ]
+
+
+def read(n: int, path: str) -> dict:
+    """The agent's `n`th call of `Read`, as a client sends it back."""
+    arguments = json.dumps({"path": path})
+    return {
+        "id": f"call_{n}",
+        "type": "function",
+        "function": {"name": "Read", "arguments": arguments},
+    }
+
+
+def called(*paths: str, reasoning: str | None = None) -> list[dict]:
+    """The agent's turn reading `paths`, and their contents."""
+    turn = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [read(n, p) for n, p in enumerate(paths)],
+    }
+    if reasoning is not None:
+        turn["reasoning_content"] = reasoning
+    results = [
+        {"role": "tool", "tool_call_id": f"call_{n}", "content": f"# {p}"}
+        for n, p in enumerate(paths)
+    ]
+    return [turn, *results]
+
+
+TOOL_HISTORY = [*MESSAGES, *called("README.md")]
+REASONED_TOOL_HISTORY = [
+    *MESSAGES,
+    *called("README.md", reasoning="The user wants README.md."),
+]
+ANSWERED = {
+    "role": "assistant",
+    "content": "It is ATOM's README.",
+    "reasoning_content": "It has a title.",
+}
+NEXT_QUESTION = {"role": "user", "content": "List the files."}
 CHATS = {
     "plain": {},
     "effort_low": {"reasoning_effort": "low"},
@@ -77,6 +116,22 @@ CHATS = {
     "thinking_enabled": {"thinking": {"type": "enabled"}},
     "thinking_effort_30": {"thinking": {"type": "enabled", "effort": 30}},
     "tools_effort_high": {"tools": [TOOL], "reasoning_effort": "high"},
+    "tool_history": {"tools": [TOOL], "messages": TOOL_HISTORY},
+    "tool_history_reasoning": {"tools": [TOOL], "messages": REASONED_TOOL_HISTORY},
+    "tool_history_effort_none": {
+        "tools": [TOOL],
+        "messages": REASONED_TOOL_HISTORY,
+        "reasoning_effort": "none",
+    },
+    "parallel_tool_calls": {
+        "tools": [TOOL],
+        "messages": [*MESSAGES, *called("README.md", "LICENSE")],
+    },
+    "multi_turn": {"messages": [*MESSAGES, ANSWERED, NEXT_QUESTION]},
+    "multi_turn_tool_history": {
+        "tools": [TOOL],
+        "messages": [*REASONED_TOOL_HISTORY, ANSWERED, NEXT_QUESTION],
+    },
 }
 
 
