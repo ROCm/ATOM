@@ -454,8 +454,7 @@ def test_engine_compatibility_takes_m3_and_refuses_the_rest():
     m3.hf_config.model_type = "minimax_m3"
     check_engine_compatibility(cfg, m3)
     check_engine_compatibility(cfg, _config())
-    # The stateful layouts and V4.1's replay PAGEs, which the Mooncake Store
-    # offload moves, are not UMBP's.
+    # V4.1 is accepted only with bounded PAGE replay; other state stays refused.
     hybrid = _config()
     hybrid.hf_config.compress_ratios = [4, 128]
     with pytest.raises(ValueError, match="resolves to 'hybrid'"):
@@ -463,7 +462,9 @@ def test_engine_compatibility_takes_m3_and_refuses_the_rest():
     v41 = _config(enable_encoder_swa_bounded_replay=True)
     v41.hf_config.model_type = "deepseek_v41"
     v41.hf_config.compress_ratios = [4, 128]
-    with pytest.raises(ValueError, match="resolves to 'dsv41'"):
+    check_engine_compatibility(cfg, v41)
+    v41.enable_encoder_swa_bounded_replay = False
+    with pytest.raises(ValueError, match="resolves to 'dsv4'"):
         check_engine_compatibility(cfg, v41)
     with pytest.raises(ValueError, match="decode context parallelism"):
         check_engine_compatibility(cfg, _config(decode_context_parallel_size=2))
@@ -957,12 +958,23 @@ def test_m3_registration_packs_every_page_plane(server, monkeypatch):
         worker.close()
 
 
+def _completed_lookup(lookup, seq):
+    """Wait only in this CPU test for the real asynchronous request answer."""
+    sid = str(seq.id)
+    lookup.submit(seq, sid)
+    deadline = time.monotonic() + 2.0
+    while not lookup.poll(sid):
+        assert time.monotonic() < deadline, "asynchronous lookup did not finish"
+        time.sleep(0.001)
+    return lookup.lookup(seq, lookup_id=sid)
+
+
 # --- the scheduler -----------------------------------------------------------
 
 
 def test_scheduler_lookups_ask_the_server(server):
     scheduler = UMBPStoreOffloadScheduler(_config(pp=2))
-    lookup = scheduler._lookup_client
+    lookup = scheduler._lookup_client.backend
     assert server.clients == []  # opened on the first lookup
     namespace = store_namespace(_config(pp=2), CHUNK)
     hashes = _hashes(48)
@@ -981,7 +993,7 @@ def test_scheduler_lookups_ask_the_server(server):
 
 def test_a_lookup_that_raises_answers_nothing_and_pauses(server):
     scheduler = UMBPStoreOffloadScheduler(_config())
-    lookup = scheduler._lookup_client
+    lookup = scheduler._lookup_client.backend
     server.raise_on = "exists"
     assert lookup.lookup(_seq(0, 16)) is None
     assert lookup.paused_until > 0
@@ -994,8 +1006,8 @@ def test_a_lookup_that_raises_answers_nothing_and_pauses(server):
 def test_an_unreachable_server_answers_nothing(server):
     scheduler = UMBPStoreOffloadScheduler(_config())
     server.connect_error = RuntimeError("no server")
-    assert scheduler._lookup_client.lookup(_seq(0, 16)) is None
-    assert scheduler._lookup_client.client is None
+    assert _completed_lookup(scheduler._lookup_client, _seq(0, 16)) is None
+    assert scheduler._lookup_client.backend.client is None
 
 
 def test_lookups_in_a_process_that_marked_the_server_hold_nothing(server):
@@ -1004,9 +1016,9 @@ def test_lookups_in_a_process_that_marked_the_server_hold_nothing(server):
     namespace = store_namespace(_config(), CHUNK)
     for index in range(2):
         server.at()[_key(hashes, index, namespace=namespace)] = b""
-    assert scheduler._lookup_client.lookup(_seq(0, 16)) == 2 * CHUNK
+    assert _completed_lookup(scheduler._lookup_client, _seq(0, 16)) == 2 * CHUNK
     taint.mark(ADDRESS, "a put raised")
-    assert scheduler._lookup_client.lookup(_seq(0, 16)) == 0
+    assert _completed_lookup(scheduler._lookup_client, _seq(0, 16)) == 0
 
 
 def test_a_load_is_dispatched_without_asking_again(server):

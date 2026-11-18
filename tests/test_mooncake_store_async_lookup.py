@@ -11,8 +11,8 @@ from atom.kv_transfer.disaggregation.multi.multi_connector import (
     MultiConnectorScheduler,
 )
 from atom.kv_transfer.offload import config as offcfg
+from atom.kv_transfer.offload.kv_store.async_lookup import AsyncStoreLookup
 from atom.kv_transfer.offload.lookup_client import LookupClient
-from atom.kv_transfer.offload.mooncake_store.async_lookup import AsyncStoreLookup
 from atom.kv_transfer.offload.mooncake_store.layouts import (
     REPLAY_PAGE_CODEC_ID,
     mooncake_codec_id,
@@ -212,8 +212,8 @@ def test_a_detached_lookup_is_reconciled_and_dropped_each_step():
 def test_renew_does_not_queue_behind_lookups_and_is_bounded(monkeypatch):
     import threading
 
-    from atom.kv_transfer.offload.mooncake_store import async_lookup
-    from atom.kv_transfer.offload.mooncake_store.async_lookup import AsyncStoreLookup
+    from atom.kv_transfer.offload.kv_store import async_lookup
+    from atom.kv_transfer.offload.kv_store.async_lookup import AsyncStoreLookup
 
     release = threading.Event()
 
@@ -268,7 +268,7 @@ def test_renewal_is_served_ahead_of_queued_lookups():
 def test_close_does_not_wait_for_a_hung_query():
     import threading
 
-    from atom.kv_transfer.offload.mooncake_store.async_lookup import AsyncStoreLookup
+    from atom.kv_transfer.offload.kv_store.async_lookup import AsyncStoreLookup
 
     release = threading.Event()
 
@@ -286,7 +286,7 @@ def test_close_does_not_wait_for_a_hung_query():
 
 
 def test_batch_renewal_skips_a_stalled_backend_without_per_request_wait(monkeypatch):
-    from atom.kv_transfer.offload.mooncake_store import async_lookup
+    from atom.kv_transfer.offload.kv_store import async_lookup
 
     entered, release = Event(), Event()
 
@@ -314,7 +314,7 @@ def test_batch_renewal_skips_a_stalled_backend_without_per_request_wait(monkeypa
 
 
 def test_batch_renewal_skips_an_earlier_stalled_renewal(monkeypatch):
-    from atom.kv_transfer.offload.mooncake_store import async_lookup
+    from atom.kv_transfer.offload.kv_store import async_lookup
 
     release = Event()
 
@@ -347,7 +347,7 @@ def test_a_hung_store_call_does_not_keep_the_process_alive():
         import threading, time
         from types import SimpleNamespace
         from atom.kv_transfer.offload.lookup_client import LookupClient
-        from atom.kv_transfer.offload.mooncake_store.async_lookup import AsyncStoreLookup
+        from atom.kv_transfer.offload.kv_store.async_lookup import AsyncStoreLookup
 
         class Backend(LookupClient):
             def lookup(self, seq, lookup_id=None):
@@ -386,7 +386,7 @@ def test_a_hung_store_master_does_not_keep_the_process_alive(pools):
         import threading
         from atom.kv_transfer.offload.mooncake_store import scheduler as S
         from atom.kv_transfer.offload.lookup_client import LookupClient
-        from atom.kv_transfer.offload.mooncake_store.async_lookup import AsyncStoreLookup
+        from atom.kv_transfer.offload.kv_store.async_lookup import AsyncStoreLookup
         from atom.kv_transfer.offload.mooncake_store.config import (
             parse_mooncake_store_config,
         )
@@ -436,7 +436,7 @@ def test_a_hung_store_master_does_not_keep_the_process_alive(pools):
 def test_cancelled_lookups_do_not_pile_up_behind_a_stalled_rpc():
     import threading
 
-    from atom.kv_transfer.offload.mooncake_store.async_lookup import AsyncStoreLookup
+    from atom.kv_transfer.offload.kv_store.async_lookup import AsyncStoreLookup
 
     gate = threading.Event()
 
