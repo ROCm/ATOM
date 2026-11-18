@@ -225,7 +225,8 @@ def test_sliced_mix_launches_the_mix_arguments_then_scratch(monkeypatch):
     (args,) = calls
     assert len(args) == 11
     assert args[0] == blocks.data_ptr() and args[8] == blocks.stride(0)
-    assert args[1] == prefix.data_ptr() and args[2] == args[3] == add.data_ptr()
+    # one addend: the unused second addend slot holds the prefix
+    assert args[1] == args[3] == prefix.data_ptr() and args[2] == add.data_ptr()
     assert args[6] == out.data_ptr() and args[7] == prefix_out.data_ptr()
     assert args[9] == tokens
     (scratch,) = runner._ATTN_RES_SCRATCH
