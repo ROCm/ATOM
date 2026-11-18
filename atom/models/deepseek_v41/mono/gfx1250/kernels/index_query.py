@@ -60,17 +60,22 @@ def stage_iq(c):
             kb = i * 128
             return ld_op(brow, kb, l), hx.gload(c["iqws"] + i64(((n0 + l % 16) // 32) * (QL // 32) + kb // 32), I32, align=4)
 
-        acc = mx_loop(QL // 128, fa, fb)
-        cv = [acc[i] * rsq(hx.gload(c["ss"] + i64(mi * 16 + (l // 16) * 8 + i) * 4, F32) / F32(QL) + F32(NORM_EPS)) for i in range(8)]
+        # the epilogue's row loads (ss -> rsq, rpos -> RoPE cos / sin: two dependent trips a row) issued before the GEMM,
+        # 8 rows together: inside the loop below they were ~16 serial round trips, ~3.9 of the stage's ~5.4 us (fixture)
         d = (n0 + l % 16) % DIM
         is_rope = d >= DIM - 64
         fi = fx.max((d - (DIM - 64)) // 2, I32(0))
         odd = (l & 1) == 1
+        rows = [mi * 16 + (l // 16) * 8 + i for i in range(8)]
+        rs = [rsq(hx.gload(c["ss"] + i64(r) * 4, F32) / F32(QL) + F32(NORM_EPS)) for r in rows]
+        csn = [rope_cs(c, r, fi) for r in rows]
+        acc = mx_loop(QL // 128, fa, fb)
         for i in range_constexpr(8):
-            r = mi * 16 + (l // 16) * 8 + i
-            x = cv[i].to(BF16).to(F32)
-            y = cv[i].shuffle_xor(1, 32).to(BF16).to(F32)
-            cs, sn = rope_cs(c, r, fi)
+            r = rows[i]
+            cvi = acc[i] * rs[i]
+            x = cvi.to(BF16).to(F32)
+            y = cvi.shuffle_xor(1, 32).to(BF16).to(F32)
+            cs, sn = csn[i]
             v = is_rope.select(odd.select(y * sn + x * cs, x * cs - y * sn), x)
             c["stx"](c["iq"] + i64(r * IQ_ROWS + n0 + l % 16) * 2, v.to(BF16))
 
