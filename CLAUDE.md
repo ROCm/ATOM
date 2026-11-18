@@ -58,6 +58,14 @@ Key entry points:
   `RoundService`) that the builder, its cache, Engram staging, the DSpark
   proposer and the model's forward all read
 - Ops: `atom/model_ops/` — AITER kernel wrappers (linear, attention, fused_moe)
+- Engine wire protocol (CoreManager <-> EngineCore): `atom/model_engine/zmq_protocol/` —
+  `engine_v1.proto` is the normative spec; regenerate `engine_v1_pb2.py` with
+  `generate.py`; cross-language fixtures in `tests/fixtures/engine_v1/`
+  (`ATOM_UPDATE_FIXTURES=1` rewrites them)
+- Atomesh standalone (`USE_ATOMESH_ENTRYPOINTS=1`): Python spawns the EngineCores
+  (`atom/entrypoints/atomesh/`), the Rust runtime is their only client —
+  `atom/mesh/src/atom_engine/` (client, DP placement) and
+  `atom/mesh/src/routers/atom_engine/` (frontend)
 - Structured output: `atom/structured_output/` — request validation, schema compilation, grammar state and asynchronous token/mask transfers
 - Config: `atom/config.py` (Config, KVCacheConfig, CompilationConfig)
 - Env vars: `atom/utils/envs.py` (all `ATOM_*` variable definitions)
