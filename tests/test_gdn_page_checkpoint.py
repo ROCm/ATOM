@@ -95,14 +95,14 @@ def _layout(monkeypatch, **kwargs):
     [
         (True, 3, "snapshot"),
         (True, 0, "snapshot"),
-        (False, 3, "none"),
+        (False, 3, "snapshot"),
         (False, 0, "settled"),
     ],
 )
 def test_a_decode_boundary_keeps_what_the_slot_can_give(
     monkeypatch, replayssm, num_spec, keep, midstep
 ):
-    """ReplaySSM rebuilds any verify step, MTP or not; without it MTP leaves none."""
+    """Under MTP or ReplaySSM the slot is ahead of a decode boundary."""
     transfer = _transfer(
         monkeypatch, replayssm=replayssm, num_spec=num_spec, midstep=midstep
     )

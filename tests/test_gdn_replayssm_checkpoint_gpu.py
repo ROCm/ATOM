@@ -26,6 +26,7 @@ from atom.model_ops.attentions.pool_layout.page_unit_geometry import (
     PageUnitGeometryMixin,
 )
 from atom.model_ops.fla_ops.chunk import chunk_gated_delta_rule
+from atom.model_ops.fla_ops.fused_recurrent import fused_recurrent_gated_delta_rule
 from atom.model_ops.fla_ops.replayssm import (
     replayssm_buffer_shapes,
     replayssm_commit,
@@ -40,6 +41,8 @@ from atom.model_ops.mamba_ops.causal_conv1d import (
 DEV = "cuda"
 LAYERS, SLOTS = 2, 8
 LIVE, PARKED, DST, DST2, DST3, REF, SCRATCH, SCRATCH2 = range(8)
+# Without ReplaySSM a request holds a slot per verify step.
+SPEC_SLOTS = (LIVE, PARKED, DST2, DST3)
 H, K, V = 4, 128, 128
 T = 4  # verify window: anchor + 3 drafts
 CAP = 4 * T
@@ -160,6 +163,42 @@ def _decode(c, slot, accepted, windows, xs):
     return ssm, conv
 
 
+def _decode_spec(c, accepted, windows, xs):
+    """The same step without ReplaySSM: each verify step's state goes to its
+    own slot, and the next verify resumes from the accepted one."""
+    r = c.model_runner
+    ssm, conv = [], []
+    for layer in range(LAYERS):
+        conv.append(
+            torch.cat(
+                causal_conv1d_update(
+                    xs[layer],
+                    _conv_pool(c, layer),
+                    c.conv_weight,
+                    CK,
+                    CV,
+                    activation="silu",
+                    conv_state_indices=_ix(LIVE),
+                    num_accepted_tokens=_ix(accepted),
+                    query_start_loc=_cu(),
+                    max_query_len=T,
+                ),
+                dim=-1,
+            )
+        )
+        o, _ = fused_recurrent_gated_delta_rule(
+            *windows[layer],
+            initial_state=r.mamba_v_cache[layer],
+            inplace_final_state=True,
+            cu_seqlens=_cu(),
+            ssm_state_indices=_ix(*SPEC_SLOTS)[None],
+            num_accepted_tokens=_ix(accepted),
+            use_qk_l2norm_in_kernel=True,
+        )
+        ssm.append(o.clone())
+    return ssm, conv
+
+
 def _step_inputs():
     return (
         [_window() for _ in range(LAYERS)],
@@ -188,14 +227,22 @@ def _slot(c, slot):
     ]
 
 
-def _round_trip(c, stores):
+def _round_trip(c, stores, step_slot=None):
     """Store each `(src, step, scratch, dst)` in one call, then restore."""
     spec = c.model_runner.state_runtime.checkpoint_spec
     n = spec.units_per_checkpoint
     units = [tuple(range(i * n, (i + 1) * n)) for i in range(len(stores))]
     c.execute_paged_state_copies(
         [
-            CheckpointStoreOp(src, u, spec.op_bytes, LAYOUT, step, scratch)
+            CheckpointStoreOp(
+                src,
+                u,
+                spec.op_bytes,
+                LAYOUT,
+                step,
+                scratch,
+                src if step_slot is None else step_slot,
+            )
             for (src, step, scratch, _), u in zip(stores, units)
         ],
         [],
@@ -269,7 +316,12 @@ def test_a_decode_image_resumes_as_its_verify_step(decodes, step):
         assert torch.equal(r.mamba_k_cache[:, dst], parked[0])
 
     windows, xs = _step_inputs()
-    want_ssm, want_conv = _decode(c, REF, step + 1, windows, xs)
+    _assert_resumes(c, windows, xs, *_decode(c, REF, step + 1, windows, xs))
+
+
+def _assert_resumes(c, windows, xs, want_ssm, want_conv):
+    """A prefill over the next window from DST matches the live continuation."""
+    r = c.model_runner
     for layer in range(LAYERS):
         got, _ = chunk_gated_delta_rule(
             *windows[layer],
@@ -298,6 +350,33 @@ def test_a_decode_image_resumes_as_its_verify_step(decodes, step):
         )
         err = _rel_l2(got_conv, want_conv[layer])
         assert err < 1e-2, f"layer {layer} conv resumes elsewhere: rel L2 {err:.4f}"
+
+
+@pytest.mark.parametrize("decodes", [1, 3])
+@pytest.mark.parametrize("step", [0, 1, 3])
+def test_without_replayssm_the_image_is_the_accepted_step_s_slot(decodes, step):
+    torch.manual_seed(100 + 10 * decodes + step)
+    c = _copier()
+    c.replayssm = False
+    r = c.model_runner
+    accepted = 1
+    for i in range(decodes):
+        _decode_spec(c, accepted, *_step_inputs())
+        accepted = 1 + i % T
+    conv, ssm = (p[:, list(SPEC_SLOTS)].clone() for p in _planes(c)[:2])
+
+    _round_trip(c, [(LIVE, step, SCRATCH, DST)], step_slot=SPEC_SLOTS[step])
+
+    assert torch.equal(r.mamba_k_cache[:, list(SPEC_SLOTS)], conv)
+    assert torch.equal(r.mamba_v_cache[:, list(SPEC_SLOTS)], ssm)
+    assert torch.equal(r.mamba_v_cache[:, DST], ssm[:, step])
+    cut = CONV[0] - step
+    assert torch.equal(
+        r.mamba_k_cache[:, DST],
+        torch.cat([conv[:, 0, step:], conv[:, 0, cut:]], dim=1),
+    )
+    windows, xs = _step_inputs()
+    _assert_resumes(c, windows, xs, *_decode_spec(c, step + 1, windows, xs))
 
 
 @pytest.mark.parametrize("h, step", [(5, 0), (5, 2), (10, 3)])

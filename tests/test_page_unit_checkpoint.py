@@ -770,8 +770,19 @@ def _snapshot_coordinator(free_slots, decode_keep=KEEP_SNAPSHOT):
     return c, pool
 
 
-def _seq(slot):
-    return SimpleNamespace(has_per_req_cache=True, state_slot=slot)
+def _seq(slot, spec_slots=()):
+    return SimpleNamespace(
+        has_per_req_cache=True, state_slot=slot, state_slots=[slot, *spec_slots]
+    )
+
+
+@pytest.mark.parametrize("spec_slots, step_slot", [((), 5), ((6, 7, 8), 7)])
+def test_a_decode_image_names_the_slot_its_step_is_in(spec_slots, step_slot):
+    """A slot per verify step, or one for all of them (ReplaySSM)."""
+    c, _ = _snapshot_coordinator(1)
+    c.checkpoint(_seq(5, spec_slots), 8, 101, step=2)
+    (op,), _ = c.take_checkpoint_ops()
+    assert (op.src_slot, op.step, op.scratch_slot, op.step_slot) == (5, 2, 0, step_slot)
 
 
 def test_a_decode_boundary_with_no_scratch_free_is_dropped():

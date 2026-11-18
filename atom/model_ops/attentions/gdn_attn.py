@@ -14,7 +14,7 @@ from aiter.dist.parallel_state import get_tp_group
 
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.scheduler import ScheduledBatch
-from atom.model_engine.state_cache import KEEP_NONE, KEEP_SETTLED, KEEP_SNAPSHOT
+from atom.model_engine.state_cache import KEEP_SETTLED, KEEP_SNAPSHOT
 from atom.model_engine.state_runtime import StateTransfer, midstep_checkpoint_targets
 from atom.model_ops.attention_gdn import GatedDeltaNet
 from atom.model_ops.fla_ops.chunk import CHUNK_SIZE
@@ -633,12 +633,9 @@ class GDNStateMixin(PoolRowsMixin):
         return StateTransfer.fork(1, readable_midstep=False)
 
     def _decode_keep(self) -> str:
-        """`StateTransfer.decode_keep` for a PAGE copy. ReplaySSM's records
-        rebuild any verify step; without them a verify leaves the accepted
-        step's state in its own spec slot and the conv window unrolled."""
-        if self.replayssm:
-            return KEEP_SNAPSHOT
-        return KEEP_NONE if self.num_spec else KEEP_SETTLED
+        """`StateTransfer.decode_keep` for a PAGE copy: under MTP or ReplaySSM
+        the slot is ahead of a decode boundary, so the step's image is built."""
+        return KEEP_SNAPSHOT if self.replayssm or self.num_spec else KEEP_SETTLED
 
     def num_state_layers(self) -> int:
         """Layers holding a recurrent state, one slot each.
@@ -1050,11 +1047,12 @@ class GDNStateMixin(PoolRowsMixin):
         """Build each op's image of its verify step `op.step` in its scratch slot.
 
         A decode leaves the slot ahead of that step in two ways: the conv window
-        sits `step` columns into the slot, and under ReplaySSM the SSM plane
-        lags the step by the records since the last flush.
+        sits `step` columns into the slot, and the step's SSM state is the plane
+        plus the records since the last flush under ReplaySSM, or else the slot
+        the verify left it in (`op.step_slot`).
         """
         runner = self.model_runner
-        conv = runner.mamba_k_cache
+        conv, ssm = runner.mamba_k_cache, runner.mamba_v_cache
         dsts, srcs = [], []
         for op in ops:
             for p in self._checkpoint_plane_tensors():
@@ -1065,9 +1063,14 @@ class GDNStateMixin(PoolRowsMixin):
                     dsts += [p[:, op.scratch_slot, :cut], p[:, op.scratch_slot, cut:]]
                     srcs += [p[:, op.src_slot, op.step :], p[:, op.src_slot, cut:]]
                 else:
+                    src = (
+                        op.step_slot if p is ssm and not self.replayssm else op.src_slot
+                    )
                     dsts.append(p[:, op.scratch_slot])
-                    srcs.append(p[:, op.src_slot])
+                    srcs.append(p[:, src])
         torch._foreach_copy_(dsts, srcs)
+        if not self.replayssm:
+            return
         cols = torch.tensor(
             [[op.src_slot, op.scratch_slot, op.step] for op in ops],
             dtype=torch.int64,

@@ -225,10 +225,12 @@ class CheckpointStoreOp:
     unit_ids: tuple[int, ...]
     total_bytes: int
     layout_id: str
-    # A decode boundary's verify step, and the scratch slot the backend builds
-    # the image of that step in; -1 for a slot that already holds it whole.
+    # A decode boundary's verify step, the scratch slot the backend builds the
+    # image of that step in, and the slot a verify left that step's state in
+    # when it leaves one per step; -1 for a slot that already holds it whole.
     step: int = -1
     scratch_slot: int = -1
+    step_slot: int = -1
 
 
 @dataclass(frozen=True)
@@ -1317,7 +1319,9 @@ class PagedStateCheckpointCoordinator:
             if build:
                 scratch = self._scratch.pop()
                 self._scratch_issued.append(scratch)
-                op = replace(op, step=step, scratch_slot=scratch)
+                slots = seq.state_slots
+                step_slot = slots[step] if step < len(slots) else src_slot
+                op = replace(op, step=step, scratch_slot=scratch, step_slot=step_slot)
             self._store_ops.append(op)
             self.checkpoints_kept += 1
         restores = self.store.take_restore_ops()

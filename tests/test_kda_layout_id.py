@@ -164,12 +164,17 @@ class TestPagedCheckpointsAreRefusedWhereSizingWouldRaise:
 
     @pytest.mark.parametrize(
         "replayssm, num_spec, keep",
-        [(True, 2, "snapshot"), (False, 2, "none"), (False, 0, "settled")],
+        [
+            (True, 2, "snapshot"),
+            (True, 0, "snapshot"),
+            (False, 2, "snapshot"),
+            (False, 0, "settled"),
+        ],
     )
     def test_a_decode_boundary_keeps_what_the_slot_can_give(
         self, replayssm, num_spec, keep
     ):
-        """ReplaySSM rebuilds any verify step; without it MTP leaves none."""
+        """Under MTP or ReplaySSM the slot is ahead of a decode boundary."""
         with tp_world(TP):
             transfer = Builder.state_transfer(
                 builder(replayssm=replayssm, num_spec=num_spec)
