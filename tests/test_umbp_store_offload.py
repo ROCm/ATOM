@@ -23,6 +23,7 @@ import array
 import ctypes
 import logging
 import sys
+import time
 import types
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -463,9 +464,8 @@ def test_engine_compatibility_takes_m3_and_refuses_the_rest():
     v41.hf_config.model_type = "deepseek_v41"
     v41.hf_config.compress_ratios = [4, 128]
     check_engine_compatibility(cfg, v41)
-    v41.enable_encoder_swa_bounded_replay = False
-    with pytest.raises(ValueError, match="resolves to 'dsv4'"):
-        check_engine_compatibility(cfg, v41)
+    # The bounded-replay requirement is enforced at V4.1 startup
+    # (`validate_runtime_config`, tests/attentions/deepseek_v41/test_runtime_contract.py).
     with pytest.raises(ValueError, match="decode context parallelism"):
         check_engine_compatibility(cfg, _config(decode_context_parallel_size=2))
     with pytest.raises(ValueError, match="multiple of the KV cache block size"):

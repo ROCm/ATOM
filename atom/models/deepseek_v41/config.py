@@ -387,12 +387,12 @@ def validate_runtime_config(config):
             # in-process offload read SLOT codecs this runtime does not publish.
             # P/D with CPU offload composes one Mooncake leg and one offload tier.
             (
-                "KV transfer other than lmcache_mp, mooncake_store or mooncake "
+                "KV transfer other than lmcache_mp, mooncake_store, umbp_store or mooncake "
                 "(multi: mooncake plus one offload tier)"
             ),
             names is None
             or any(
-                name not in ("lmcache_mp", "mooncake", "mooncake_store")
+                name not in ("lmcache_mp", "mooncake", "mooncake_store", "umbp_store")
                 for name in names
             )
             or (
@@ -415,11 +415,12 @@ def validate_runtime_config(config):
             ),
         ),
         (
-            # The Store moves V4.1's PAGEs and relies on replay to rebuild the
-            # state a hit does not carry; without bounded replay the backend
-            # copies state instead and the Store's PAGE-only load is unsound.
-            "Mooncake Store without encoder SWA bounded replay",
-            "mooncake_store" in (names or ())
+            # The Stores (Mooncake Store, UMBP) move V4.1's PAGEs and rely on
+            # replay to rebuild the state a hit does not carry; without bounded
+            # replay the backend copies state instead and the PAGE-only load is
+            # unsound.
+            "a KV Store (mooncake_store, umbp_store) without encoder SWA bounded replay",
+            any(name in ("mooncake_store", "umbp_store") for name in names or ())
             and not config.enable_encoder_swa_bounded_replay,
         ),
         ("RapidServe", config.enable_rapidserve),

@@ -136,8 +136,22 @@ def test_mp_store_and_mooncake_are_the_kv_transfers_admitted():
             kv_cache_block_size=256,
         )
     )
+    # UMBP shares the Store's PAGE-only load, so it needs the same replay.
+    validate_runtime_config(
+        runtime_config(
+            kv_transfer_config={"kv_connector": "umbp_store", "kv_role": "offload"},
+            enable_encoder_swa_bounded_replay=True,
+            kv_cache_block_size=256,
+        )
+    )
+    with pytest.raises(ValueError, match="KV Store .* without encoder SWA"):
+        validate_runtime_config(
+            runtime_config(
+                kv_transfer_config={"kv_connector": "umbp_store", "kv_role": "offload"}
+            )
+        )
     # The Store's PAGE-only load is sound only where a hit's state is replayed.
-    with pytest.raises(ValueError, match="Mooncake Store without encoder SWA"):
+    with pytest.raises(ValueError, match="KV Store .* without encoder SWA"):
         validate_runtime_config(
             runtime_config(kv_transfer_config={"kv_connector": "mooncake_store"})
         )
@@ -155,7 +169,7 @@ def test_mp_store_and_mooncake_are_the_kv_transfers_admitted():
     for connector in ("lmcache_offload", "moriio"):
         with pytest.raises(
             ValueError,
-            match="KV transfer other than lmcache_mp, mooncake_store or mooncake",
+            match="KV transfer other than lmcache_mp, mooncake_store, umbp_store or mooncake",
         ):
             validate_runtime_config(
                 runtime_config(kv_transfer_config={"kv_connector": connector})
@@ -787,7 +801,7 @@ def test_pd_store_requires_bounded_replay_for_the_offload_leaf():
             {"kv_connector": "mooncake_store", "kv_role": "offload"},
         ],
     }
-    with pytest.raises(ValueError, match="Mooncake Store without encoder SWA"):
+    with pytest.raises(ValueError, match="KV Store .* without encoder SWA"):
         validate_runtime_config(runtime_config(kv_transfer_config=transfer))
     validate_runtime_config(
         runtime_config(
