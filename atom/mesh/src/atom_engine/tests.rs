@@ -789,3 +789,42 @@ async fn python_core_messages_drive_the_client() {
         SeqEvent::Failed(SeqFailure::Invalid(reason)) if reason == "bad"
     ));
 }
+
+#[test]
+fn the_spec_python_writes_parses() {
+    // Written by tests/entrypoints/test_engine_spec.py (`build_engine_spec`).
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/engine_v1/engine_spec.json");
+    let json = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let spec = EngineSpec::from_json(&json).unwrap();
+    let model = &spec.model;
+    assert_eq!(model.served_name, "served");
+    assert_eq!(model.tokenizer_path, "/models/m");
+    assert_eq!(model.chat_template.as_deref(), Some("/t/chat.jinja"));
+    assert_eq!(model.default_chat_template_kwargs["k"], json!(1));
+    assert_eq!(
+        (model.max_model_len, model.max_output_tokens),
+        (Some(4096), Some(2048))
+    );
+    assert_eq!(model.model_card["context_window"], json!(2048));
+    assert!(!model.synthetic_acceptance);
+    let channel = model.required_channel.as_ref().unwrap();
+    assert_eq!(
+        (channel.after.as_slice(), channel.opening.as_slice()),
+        (&[1][..], &[2][..])
+    );
+    assert_eq!(
+        (channel.opens_at, channel.end_ids.as_slice()),
+        (1, &[3, 7, 9][..])
+    );
+    let toggle = model.reasoning_toggle.as_ref().unwrap();
+    assert_eq!(
+        (toggle.name.as_str(), &toggle.off, &toggle.on),
+        ("enable_thinking", &json!(false), &json!(true))
+    );
+    assert_eq!(spec.balance.strategy, BalanceStrategy::LeastRequests);
+    assert_eq!(spec.engines.len(), 2);
+    let core = &spec.engines[1];
+    assert_eq!((core.dp_rank, core.pid), (1, 101));
+    assert_eq!(core.input, "ipc:///tmp/core-1-input");
+}

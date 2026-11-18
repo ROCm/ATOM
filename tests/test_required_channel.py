@@ -229,10 +229,6 @@ def test_k3_required_call_needs_tools_to_call():
 # would notice.
 
 
-class _Submitted(Exception):
-    """Raised by a stub engine once it holds the request's sampling params."""
-
-
 def _k3_chat(tool_choice):
     return {
         "model": "m",
@@ -356,40 +352,6 @@ def test_chat_with_a_response_format_takes_no_tool_call_grammar(monkeypatch):
     body = {**_k3_chat("auto"), "response_format": {"type": "json_object"}}
     params, prepared = _chat_with_grammar(monkeypatch, body, text="{}")
     assert params.json_schema is None and prepared == []
-
-
-@pytest.mark.parametrize("stream", [False, True])
-@pytest.mark.parametrize("tool_choice", ["required", "auto"])
-def test_atomesh_chat_endpoints_hand_the_channel_to_sampling(
-    monkeypatch, stream, tool_choice
-):
-    standalone = pytest.importorskip(
-        "atom.entrypoints.atomesh.atom_standalone_service", exc_type=ImportError
-    )
-    seen = []
-
-    def submit(_prompt, sampling_params, *_args, **_kw):
-        seen.append(sampling_params)
-        raise _Submitted
-
-    service = standalone.AtomStandaloneService.__new__(standalone.AtomStandaloneService)
-    service.model_name = "m"
-    service.default_chat_template_kwargs = {}
-    service.custom_message_encoder = None
-    service.tool_parser_cls = KimiK3Parser
-    service.required_tool_channel = K3_CHANNEL
-    service.tokenizer = K3Tokenizer()
-    service.engine_service = types.SimpleNamespace(generate=submit, start_stream=submit)
-    monkeypatch.setattr(standalone, "apply_chat_template", lambda *a, **k: "prompt")
-
-    entry = (
-        service.start_chat_completions_stream if stream else service.chat_completions
-    )
-    with pytest.raises(_Submitted):
-        entry(_k3_chat(tool_choice))
-    (sampling_params,) = seen
-    expected = K3_CHANNEL if tool_choice == "required" else None
-    assert sampling_params.required_channel == expected
 
 
 # ── the state machine ────────────────────────────────────────────────────

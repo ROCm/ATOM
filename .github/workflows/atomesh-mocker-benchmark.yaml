@@ -6,6 +6,7 @@ on:
     paths:
       - 'atom/mesh/**'
       - 'atom/model_engine/zmq_protocol/**'  # engine_v1.proto, built by atom/mesh/build.rs
+      - 'tests/fixtures/engine_v1/**'  # read by the cross-language tests
       - '.github/scripts/atomesh/atomesh_mocker_benchmark.sh'
       - '.github/scripts/atomesh/atomesh_mocker_benchmark_summary.py'
       - '.github/workflows/atomesh-mocker-benchmark.yaml'
@@ -17,6 +18,7 @@ on:
     paths:
       - 'atom/mesh/**'
       - 'atom/model_engine/zmq_protocol/**'  # engine_v1.proto, built by atom/mesh/build.rs
+      - 'tests/fixtures/engine_v1/**'  # read by the cross-language tests
       - '.github/scripts/atomesh/atomesh_mocker_benchmark.sh'
       - '.github/scripts/atomesh/atomesh_mocker_benchmark_summary.py'
       - '.github/workflows/atomesh-mocker-benchmark.yaml'

@@ -17,11 +17,9 @@ from __future__ import annotations
 
 import ast
 import pathlib
-from typing import ClassVar
 
 import pytest
 
-from atom.entrypoints.atomesh import server as atomesh_server
 from atom.entrypoints.openai.tool_parser import registry
 from atom.entrypoints.openai.tool_parser.registry import (
     PARSERS_BY_NAME,
@@ -171,9 +169,8 @@ class TestUnresolvedMeansUnparsed:
 
 
 class TestABadNameIsCaughtBeforeTheWeightsLoad:
-    """`AtomStandaloneService` raises on an unknown name, and it is built once
-    the model is in memory -- so a typo cost a full load before saying so.
-    """
+    """`validate_tool_call_parser` raises on an unknown name, so a typo is
+    reported at startup rather than after a full model load."""
 
     def test_a_known_name_resolves(self):
         assert validate_tool_call_parser("glm") is PARSERS_BY_NAME["glm"]
@@ -185,52 +182,6 @@ class TestABadNameIsCaughtBeforeTheWeightsLoad:
     def test_an_unknown_name_raises_and_lists_the_real_ones(self):
         with pytest.raises(ValueError, match="not a known format"):
             validate_tool_call_parser("deepseekv4")
-
-    def test_atomesh_validates_before_it_creates_the_engine(self):
-        src = pathlib.Path(atomesh_server.__file__).read_text()
-        assert "validate_tool_call_parser(" in src
-        tree = ast.parse(src)
-        fn = next(
-            n
-            for n in ast.walk(tree)
-            if isinstance(n, ast.FunctionDef) and n.name == "launch_atom_standalone"
-        )
-        calls = [
-            n.func.id
-            for n in ast.walk(fn)
-            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-        ]
-        assert calls.index("parse_standalone_args") < calls.index("initialize_engine")
-
-
-class TestTheMeshRouterStillGetsItsFlag:
-    """`--tool-call-parser` has two consumers: the Rust router declares one in
-    `cliargs.rs` and the Python service resolves one. Registering it here made
-    `parse_known_args` swallow it, so the router silently lost a setting that
-    had been passing straight through as an unrecognised arg.
-    """
-
-    BASE: ClassVar[list] = ["--model", "/x", "--port", "9000"]
-
-    def test_it_reaches_both_layers(self):
-        args = atomesh_server.parse_standalone_args(
-            [*self.BASE, "--tool-call-parser", "dsml"]
-        )
-        assert args.engine_args.tool_call_parser == "dsml"
-        assert "--tool-call-parser" in args.mesh_args
-        assert args.mesh_args[args.mesh_args.index("--tool-call-parser") + 1] == "dsml"
-
-    def test_unset_forwards_nothing(self):
-        """Not "auto" either: the router has its own default to apply."""
-        args = atomesh_server.parse_standalone_args(self.BASE)
-        assert args.engine_args.tool_call_parser is None
-        assert "--tool-call-parser" not in args.mesh_args
-
-    def test_the_network_args_still_get_through(self):
-        args = atomesh_server.parse_standalone_args(
-            [*self.BASE, "--tool-call-parser", "glm"]
-        )
-        assert args.mesh_args[:2] == ["--port", "9000"]
 
 
 class TestGlmDoesNotClaimEveryTemplate:
@@ -264,40 +215,3 @@ class TestGlmDoesNotClaimEveryTemplate:
 
     def test_a_real_glm_template_still_resolves(self):
         assert resolve_from_prompt(self.GLM) is PARSERS_BY_NAME["glm"]
-
-
-class TestTheTwoVocabulariesCoexist:
-    """`--tool-call-parser` has two consumers that do not share a vocabulary.
-
-    The Rust router takes `json` / `python` / `xml` / `hermes`; ATOM's
-    resolver takes `dsml` / `glm` / `kimi` / `kimi_k3` / `minimax` / `qwen`.
-    Validating the flag against ATOM's set would have killed any existing
-    standalone deployment launched with a router name -- before the flag was
-    registered here at all, those passed straight through untouched.
-    """
-
-    BASE: ClassVar[list] = ["--model", "/x", "--port", "9000"]
-
-    def _parse(self, name):
-        return atomesh_server.parse_standalone_args(
-            [*self.BASE, "--tool-call-parser", name]
-        )
-
-    @pytest.mark.parametrize("name", ["json", "python", "xml", "hermes"])
-    def test_a_router_name_starts_and_reaches_the_router(self, name):
-        args = self._parse(name)
-        assert args.mesh_args[-2:] == ["--tool-call-parser", name]
-        assert (
-            args.engine_args.tool_call_parser is None
-        ), "a name ATOM does not know must leave ATOM reading the template"
-
-    @pytest.mark.parametrize("name", sorted(PARSERS_BY_NAME))
-    def test_an_atom_name_binds_atom_and_still_reaches_the_router(self, name):
-        args = self._parse(name)
-        assert args.engine_args.tool_call_parser == name
-        assert args.mesh_args[-2:] == ["--tool-call-parser", name]
-
-    def test_unset_forwards_nothing_and_binds_nothing(self):
-        args = atomesh_server.parse_standalone_args(self.BASE)
-        assert args.engine_args.tool_call_parser is None
-        assert "--tool-call-parser" not in args.mesh_args
