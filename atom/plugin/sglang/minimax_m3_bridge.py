@@ -631,9 +631,7 @@ def build_atom_minimax_m3_attention_metadata_from_sglang(
         prefix_lens_cpu = (
             [
                 int(seq_len) - int(query_len)
-                for seq_len, query_len in zip(
-                    seq_lens_cpu[:bs], extend_lens_cpu[:bs]
-                )
+                for seq_len, query_len in zip(seq_lens_cpu[:bs], extend_lens_cpu[:bs])
             ]
             if seq_lens_cpu is not None and extend_lens_cpu is not None
             else []

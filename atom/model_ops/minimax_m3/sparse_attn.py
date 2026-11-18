@@ -1631,7 +1631,5 @@ def minimax_m3_sparse_attn_prefill_asm(
         # Once every row starts beyond a full selected window, its sparse
         # context is flat instead of the cold prefill's causal ramp. Both the
         # minimum prefix and selected capacity are host-known.
-        dynamic_partition_plan=(
-            min_prefix_len >= sparse_bt.shape[-1] * ASM_PAGE_SIZE
-        ),
+        dynamic_partition_plan=(min_prefix_len >= sparse_bt.shape[-1] * ASM_PAGE_SIZE),
     )

@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""CPU contracts for MiniMax-M3 cached-prefill sparse-PA planning."""
+"""Contracts for MiniMax-M3 cached-prefill sparse-PA planning."""
 
+import pytest
 import torch
+
+pytest.importorskip("triton", reason="sparse_attn defines @triton.jit kernels")
+pytest.importorskip("aiter", reason="sparse_attn imports the AITER runtime")
 
 from atom.model_ops import base_attention
 from atom.model_ops.minimax_m3 import sparse_attn
@@ -47,27 +51,25 @@ def test_prefill_uses_dynamic_plan_only_after_every_prefix_fills_window(monkeypa
         lambda *_args, **kwargs: dynamic.append(kwargs["dynamic_partition_plan"]),
     )
     rows, pages = 4, 8
-    common = dict(
-        q=torch.empty((rows, 16, 128), dtype=torch.bfloat16),
-        k_cache=torch.empty((1, 1, 8, 16, 16), dtype=torch.bfloat16),
-        v_cache=torch.empty((1, 1, 1, 128, 16), dtype=torch.bfloat16),
-        topk_idx=torch.empty((1, rows, 1), dtype=torch.int32),
-        block_table=torch.empty((1, pages), dtype=torch.int32),
-        query_req_id=None,
-        query_abs_pos=None,
-        qo_indptr=torch.arange(rows + 1, dtype=torch.int32),
-        num_kv_heads=1,
-        sm_scale=128**-0.5,
-        output=torch.empty((rows, 16, 128), dtype=torch.bfloat16),
-        sparse_bt=torch.empty((rows, pages), dtype=torch.int32),
-        sparse_ctx=torch.full((rows,), pages * 16, dtype=torch.int32),
-    )
+    common = {
+        "q": torch.empty((rows, 16, 128), dtype=torch.bfloat16),
+        "k_cache": torch.empty((1, 1, 8, 16, 16), dtype=torch.bfloat16),
+        "v_cache": torch.empty((1, 1, 1, 128, 16), dtype=torch.bfloat16),
+        "topk_idx": torch.empty((1, rows, 1), dtype=torch.int32),
+        "block_table": torch.empty((1, pages), dtype=torch.int32),
+        "query_req_id": None,
+        "query_abs_pos": None,
+        "qo_indptr": torch.arange(rows + 1, dtype=torch.int32),
+        "num_kv_heads": 1,
+        "sm_scale": 128**-0.5,
+        "output": torch.empty((rows, 16, 128), dtype=torch.bfloat16),
+        "sparse_bt": torch.empty((rows, pages), dtype=torch.int32),
+        "sparse_ctx": torch.full((rows,), pages * 16, dtype=torch.int32),
+    }
 
     sparse_attn.minimax_m3_sparse_attn_prefill_asm(
         **common, min_prefix_len=pages * 16 - 1
     )
-    sparse_attn.minimax_m3_sparse_attn_prefill_asm(
-        **common, min_prefix_len=pages * 16
-    )
+    sparse_attn.minimax_m3_sparse_attn_prefill_asm(**common, min_prefix_len=pages * 16)
 
     assert dynamic == [False, True]

@@ -1286,7 +1286,9 @@ class TestExplicitPlan:
         )
         sparse_cap = sparse_call["plan_partition_cap"]
         assert isinstance(sparse_cap, ast.IfExp)
-        assert isinstance(sparse_cap.body, ast.Constant) and sparse_cap.body.value is None
+        assert (
+            isinstance(sparse_cap.body, ast.Constant) and sparse_cap.body.value is None
+        )
         assert getattr(sparse_cap.orelse, "id", None) == "max_context_partition_num"
 
         for kw in self._call_kwargs(
