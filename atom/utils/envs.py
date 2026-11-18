@@ -754,10 +754,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Kimi-K3 gfx1250 mono: widths up to this many rows run the routed experts
     # as one fused launch (moe_tdm_gfx1250.build_moe, bit-identical to AITER's
-    # grouped MoE) instead of AITER's; 0 keeps AITER's everywhere. 48 is the
-    # widest whose LDS fits.
+    # grouped MoE) instead of AITER's; 0 keeps AITER's everywhere. Past 48
+    # rows it holds a token's first latent K tiles in LDS and reads the rest.
     "ATOM_KIMI_MONO_FUSED_MOE_ROWS": lambda: int(
-        os.getenv("ATOM_KIMI_MONO_FUSED_MOE_ROWS", "48")
+        os.getenv("ATOM_KIMI_MONO_FUSED_MOE_ROWS", "64")
     ),
     # Kimi-K3 gfx1250 mono: K2's gathering all-reduce, routed RMSNorm and
     # replicated finalize as one resident launch (k2_tail_gfx1250, the same

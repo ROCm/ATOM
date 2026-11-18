@@ -143,6 +143,31 @@ def test_k2_candidate_lds_is_bounded_across_wave32_inputs(tokens, threads):
     assert latent.blocks == tokens * ml.LATENT // 32
 
 
+@pytest.mark.parametrize("rows", (1, 16, 32, 33, 40, 48, 49, 52, 53, 56, 60, 64))
+def test_the_fused_moe_keeps_a_ring_of_four_to_64_rows(rows):
+    from atom.models.kimi_k3.mono.kernels.stages import moe_tdm_gfx1250 as mt
+
+    ring, resident = mt._moe_fit(rows, None, None)
+    assert ring == mt.RING
+    assert mt.moe_lds_bytes(rows, ring, resident) <= GFX1250.max_workgroup_lds_bytes
+    # to 48 rows every latent K tile is resident: the build is the one before
+    k_tiles = ml.LATENT // mt.K_TILE
+    assert (resident == k_tiles) == (rows <= 48)
+    assert resident >= 5
+    name = mt.build_moe(rows).name
+    assert name.startswith(f"k3_gfx1250_moe_s{rows}_p1_u15")
+    assert (f"_k{resident}" in name) == (resident < k_tiles)
+
+
+def test_a_three_item_ring_holds_the_whole_64_row_latent():
+    from atom.models.kimi_k3.mono.kernels.stages import moe_tdm_gfx1250 as mt
+
+    assert mt._moe_fit(64, 3, None) == (3, ml.LATENT // mt.K_TILE)
+    assert "_r3" in mt.build_moe(64, ring=3).name
+    with pytest.raises(ValueError, match="does not fit"):
+        mt.build_moe(64, resident=ml.LATENT // mt.K_TILE)
+
+
 @pytest.mark.parametrize("rows", (10, 40))
 @pytest.mark.parametrize("rolled", (False, True))
 def test_a_rolled_fused_moe_is_a_build_of_its_own(rows, rolled):
