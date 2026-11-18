@@ -3149,6 +3149,17 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
         # finding carries one, else on a distinctive token from the text.
         rid = re.match(r"([A-Z]+\d+[a-z]?):", text)
         if rid:
+            # SKILL.md: "Do NOT use rule codes (B1, D4, A1...) in output -- they are
+            # internal labels only." Parsing one here as a claim made the gate accept
+            # what the instruction forbids, and a model that follows the gate over the
+            # prose is behaving correctly. ATOM#3481's published review opened a finding
+            # with `A5:`, which tells its reader nothing. The id still counts as the
+            # claim below -- withdrawing that would turn such cards into UNREPORTED-FIRE,
+            # which is worse -- but the card does not ship with it.
+            problems.append(("RULE-CODE-IN-CARD", text[:70],
+                             f"opens with the internal rule id `{rid.group(1)}`, which "
+                             "means nothing to a reviewer -- say the thing the rule is "
+                             "about instead"))
             # `-- late finding:` is the exit for what no rule covers, so it cannot excuse a
             # finding that names a rule: claiming G1 the ledger adjudicated CLEAR is a
             # contradiction of the ledger, not a discovery arriving late.

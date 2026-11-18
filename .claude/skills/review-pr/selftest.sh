@@ -441,6 +441,30 @@ t "a card carrying the measured coverage passes" \
 # The label alone, with nothing after the colon, is not a verdict.
 t "a coverage label with nothing after it is refused" \
   "$(_cov_gate "$_SMALL" 'Coverage:')" "EMPTY-COVERAGE"
+# SKILL.md forbids rule codes in output; the gate parsed a leading one as a claim, so
+# the instruction and the gate disagreed and ATOM#3481 shipped a finding opening `A5:`.
+_card_kinds() {  # <card text> -> the problem kinds the card gate raises
+  python3 -c '
+import sys; sys.path.insert(0, sys.argv[1]); import triage
+_, probs = triage.audit_card(sys.argv[2], "", "", "", "", "")
+print(" ".join(sorted({k for k, _, _ in probs})))' "$S" "$1"
+}
+t "a finding opening with a rule code is refused" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+
+⚠️ A5: planner.rs:108 charges the prompt only when req.stream. **Author must** say so.' | grep -c RULE-CODE-IN-CARD)" "1"
+t "the same finding without the rule code is not" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+
+⚠️ planner.rs:108 charges the prompt only when req.stream. **Author must** say so.' | grep -c RULE-CODE-IN-CARD)" "0"
 
 # `[diff-too-large]` (GitHub refusing a diff over 20000 lines) writes no coverage line,
 # so the card has to supply one and it has to say BEYOND ONE PASS.
