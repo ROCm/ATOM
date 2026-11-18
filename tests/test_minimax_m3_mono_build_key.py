@@ -38,10 +38,7 @@ OTHER = {
     "swiglu_limit": 8.0, "debug": True, "xn_flag": 1,
     "shared_mxfp8": True, "mid_flag": 1, "kv_nvfp4": True, "index_nvfp4": True,
     "probe": "loop", "sh_first": 2, "attn_mxfp8": True, "moe_a16w4": False,
-    "sp_f32": False, "prod_round": False, "moe_a4w4": True, "front": True,
-    "moe_back": True, "back_dn_depth": 2, "back_sh_units": 4, "back_steal": 1,
-    "back_dn_split": 1, "back_dn_bdepth": 2, "n_split": 4, "pipe": True,
-    "score_sleep": 2, "copy_batch": 4,
+    "sp_f32": False, "prod_round": False, "moe_a4w4": True,
 }  # fmt: skip
 # a field whose other value is a valid build only beside other settings: both builds take them
 BESIDE = {
@@ -52,32 +49,10 @@ BESIDE = {
     "moe_a16w4": {"shared_mxfp8": True},  # compiled out beside the fused shared expert
     "sh_first": {"shared_mxfp8": True, "tokens": 8},  # the wide MoE's (S >= 5) option
 }
-# More than 16 rows is a front-half or a whole-layer build; the front half is the base of
-# these fields (the whole layer for the back half's), and the whole layer ``front``'s.
-WIDE = {
-    "tokens": 32, "fuse_k1": True, "kv_nvfp4": True, "index_nvfp4": True,
-    "shared_mxfp8": True, "attn_mxfp8": True, "moe_a4w4": True,
-}  # fmt: skip
-WIDE_FIELDS = (
-    "front", "moe_back", "back_dn_depth", "back_sh_units", "back_steal",
-    "back_dn_split", "back_dn_bdepth", "n_split", "pipe", "score_sleep", "copy_batch",
-)  # fmt: skip
-
-
 def _pair(name: str) -> tuple[K4Build, K4Build]:
     """The two builds that differ in field ``name``."""
-    if name in WIDE_FIELDS:
-        front = dataclasses.replace(BASE, **WIDE, front=True)
-        whole = dataclasses.replace(BASE, **WIDE, moe_back=True)
-        if name == "front":  # a front-half build against the whole layer's
-            return whole, dataclasses.replace(whole, moe_back=False, front=True)
-        if name == "moe_back":
-            return front, whole
-        base = whole if name.startswith("back_") else front  # the back half's knobs
-        return base, dataclasses.replace(base, **{name: OTHER[name]})
     base = dataclasses.replace(BASE, **BESIDE.get(name, {}))
     return base, dataclasses.replace(base, **{name: OTHER[name]})
-
 
 def _compile(key: K4Build) -> None:
     heads = IndexHeads(key.index_heads, key.index_own)
@@ -89,11 +64,7 @@ def _compile(key: K4Build) -> None:
         mid_flag=key.mid_flag, kv_nvfp4=key.kv_nvfp4, index_nvfp4=key.index_nvfp4,
         probe=key.probe, sh_first=key.sh_first, attn_mxfp8=key.attn_mxfp8,
         moe_a16w4=key.moe_a16w4, sp_f32=key.sp_f32, prod_round=key.prod_round,
-        moe_a4w4=key.moe_a4w4, front=key.front, moe_back=key.moe_back,
-        back_dn_depth=key.back_dn_depth, back_sh_units=key.back_sh_units,
-        back_steal=key.back_steal, back_dn_split=key.back_dn_split,
-        back_dn_bdepth=key.back_dn_bdepth, n_split=key.n_split, pipe=key.pipe,
-        score_sleep=key.score_sleep, copy_batch=key.copy_batch,
+        moe_a4w4=key.moe_a4w4,
     )  # fmt: skip
     with compile_only():
         launch(*K4_ABI.zeros())

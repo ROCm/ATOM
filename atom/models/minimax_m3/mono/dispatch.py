@@ -26,15 +26,9 @@ from atom.models.minimax_m3.mono.check import (
 )
 from atom.models.minimax_m3.mono.config import (
     MAX_CONTEXT,
+    MAX_TOKENS,
     SUPPORTED_TP,
     Dims,
-)
-from atom.models.minimax_m3.mono.policy import (
-    HYBRID,
-    MONO,
-    PRODUCTION,
-    SMALL_MAX_ROWS,
-    WidthPolicy,
 )
 from atom.models.minimax_m3.mono.runner import MonoDecodeRunner
 from atom.mono.runtime.deployment import common_refusals, first_refusal
@@ -95,17 +89,10 @@ class MonoDecode:
         self._lm = causal_lm
         self._uses_dspark = _uses_dspark(atom_config)
         self._drafter = None
-        # which path a step of n tokens takes (``policy.WidthPolicy``)
-        self.policy = WidthPolicy(
-            envs.ATOM_MONO_HYBRID, envs.ATOM_MONO_WIDE, envs.ATOM_MONO_WIDTHS
-        )
-        # decode steps by path and token count; ``_graph_kind``: the path each
-        # captured graph's rows took (its replays are counted by ``note_replay``)
-        self.steps: dict[str, dict[int, int]] = {
-            k: {} for k in (PRODUCTION, MONO, HYBRID)
-        }
-        self._graph_kind: dict[int, str] = {}
-        self._graph_logged: set[int] = set()
+        # decode steps by token count, [original, mono]; the rows of the graphs
+        # captured on mono
+        self.steps: dict[bool, dict[int, int]] = {False: {}, True: {}}
+        self._graph_mono: set[int] = set()
         self._counted = 0
         # created on its first eligible step (``LazyRunner``)
         self._mono = LazyRunner(
@@ -123,10 +110,6 @@ class MonoDecode:
         if why is not None:
             logger.info("MiniMax-M3 mono decode off: %s", why)
             self._mono.enabled = False
-            return
-        logger.info(
-            "MiniMax-M3 decode paths by token count: %s", self.policy.describe()
-        )
 
     def bind_drafter(self, drafter) -> None:
         if not self._uses_dspark:
@@ -146,15 +129,11 @@ class MonoDecode:
         # a captured graph's forward runs once, at capture: its replays are
         # counted by ``note_replay``; eager decode steps count here
         n = input_ids.numel()
-        kind = self.policy.kind(n) if ok else PRODUCTION
         if torch.cuda.is_current_stream_capturing():
             if ok:
-                self._graph_kind[n] = kind
-            if n not in self._graph_logged and self._is_decode():
-                self._graph_logged.add(n)
-                logger.info("MiniMax-M3 decode graph, %d rows: %s", n, kind)
+                self._graph_mono.add(n)
         elif ok or self._is_decode():
-            self._count(n, kind)
+            self._count(n, ok)
         return ok
 
     def _is_decode(self) -> bool:
@@ -162,22 +141,20 @@ class MonoDecode:
         return ctx is not None and not ctx.is_prefill
 
     def note_replay(self, n: int) -> None:
-        """A decode step replayed an n-row graph: counted under the path its capture took."""
-        self._count(n, self._graph_kind.get(n, PRODUCTION))
+        """A decode step replayed an n-row graph: mono's if its capture took mono."""
+        self._count(n, n in self._graph_mono)
 
-    def _count(self, n: int, kind: str) -> None:
-        self.steps[kind][n] = self.steps[kind].get(n, 0) + 1
+    def _count(self, n: int, mono: bool) -> None:
+        self.steps[mono][n] = self.steps[mono].get(n, 0) + 1
         every = envs.ATOM_MONO_STATS_EVERY
         self._counted += 1
         if not every or self._counted % every:
             return
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         stats = {
-            "mono": dict(sorted(self.steps[MONO].items())),
-            "original": dict(sorted(self.steps[PRODUCTION].items())),
+            "mono": dict(sorted(self.steps[True].items())),
+            "original": dict(sorted(self.steps[False].items())),
         }
-        if self.steps[HYBRID]:
-            stats["hybrid"] = dict(sorted(self.steps[HYBRID].items()))
         if rank == 0:
             logger.info("MiniMax-M3 mono steps by token count: %s", stats)
         path = os.environ.get(
@@ -199,8 +176,7 @@ class MonoDecode:
         n = input_ids.numel()  # a cudagraph's pad rows included
         if intermediate_tensors is not None or inputs_embeds is not None:
             return False
-        kind = self.policy.kind(n)
-        if kind == PRODUCTION:
+        if not 1 <= n <= MAX_TOKENS:
             return False
         # the kernels read every token's position and slot as an int64's low word
         if positions.dtype != torch.int64:
@@ -241,20 +217,10 @@ class MonoDecode:
         if ids is None or ids.dtype != torch.int32 or ids.numel() < n:
             return False
         # the runner and its n-token kernel, both collective: n is TP-uniform
-        if kind == HYBRID:
-            return self._mono.ready(n, HYBRID)
-        return (
-            self._mono.ready(n, "wide") if n > SMALL_MAX_ROWS else self._mono.ready(n)
-        )
+        return self._mono.ready(n)
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         sums = None
-        n = input_ids.numel()
-        if (
-            n > SMALL_MAX_ROWS
-        ):  # hybrid or wide mono (the policy admits nothing else above)
-            kind = "wide" if self.policy.kind(n) == MONO else HYBRID
-            return self._mono.runner.pipelines[kind].forward(input_ids, positions)
         if envs.ATOM_MONO_CHECK:
             out = forward_checked(self._mono.runner, input_ids, positions)
         elif envs.ATOM_MONO_TRACE:
