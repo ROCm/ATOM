@@ -25,6 +25,7 @@ pub mod response_context;
 pub(crate) mod stop_decoder_builder;
 pub(crate) mod thread_tokenizer;
 pub(crate) mod tool_constraints;
+pub mod worker_render;
 
 #[cfg(test)]
 mod tests;

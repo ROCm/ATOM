@@ -22,7 +22,10 @@ use crate::{
     observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
     reasoning_parser::ParserFactory as ReasoningParserFactory,
-    routers::{atom_standalone::AtomStandaloneRuntime, router_manager::RouterManager},
+    routers::{
+        atom_standalone::AtomStandaloneRuntime, prepare::worker_render::WorkerRenders,
+        router_manager::RouterManager,
+    },
     tokenizer::registry::TokenizerRegistry,
     tool_parser::ParserFactory as ToolParserFactory,
 };
@@ -48,9 +51,12 @@ pub struct AppContext {
     pub admission: Arc<crate::core::admission::AdmissionController>,
     pub tokenizer_registry: Arc<TokenizerRegistry>,
     /// Registry ids of the tokenizers whose chats llm-tokenizer renders without
-    /// their Jinja template, found as each registers. HTTP routing does not
-    /// tokenize those chats.
+    /// their Jinja template, found as each registers. HTTP routing tokenizes
+    /// those chats only as a worker renders them.
     pub chats_without_template: Arc<RwLock<HashSet<String>>>,
+    /// The workers HTTP routing asks to render chats, and those that serve no
+    /// render route.
+    pub worker_renders: Arc<WorkerRenders>,
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
     pub tool_parser_factory: Option<ToolParserFactory>,
     pub worker_registry: Arc<WorkerRegistry>,
@@ -287,6 +293,7 @@ impl AppContextBuilder {
                 .tokenizer_registry
                 .ok_or(AppContextBuildError("tokenizer_registry"))?,
             chats_without_template: Default::default(),
+            worker_renders: Default::default(),
             reasoning_parser_factory: self.reasoning_parser_factory,
             tool_parser_factory: self.tool_parser_factory,
             worker_registry,

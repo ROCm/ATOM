@@ -241,7 +241,7 @@ async fn probe_chat_render(
     warn!(
         tokenizer = name,
         "llm-tokenizer renders these chats with a built-in encoder, not the Jinja template{}; \
-         its defaults are not ATOM's, so HTTP routing does not tokenize them",
+         its defaults are not ATOM's, so HTTP routing tokenizes them only as a worker renders them",
         if chat_template.is_some() {
             ", so --chat-template does not apply"
         } else {

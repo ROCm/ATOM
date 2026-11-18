@@ -263,12 +263,25 @@ Supported tool parsers: `json`, `python`, `xml`.
 
 In PD mode, use `--prefill-policy` and `--decode-policy` for per-mode overrides.
 
-`prefix_hash` routes on exact request tokens. Messages and Responses have no
-registered token-routing template, so under `prefix_hash` they return
-`501 token_routing_unsupported`. So do chats for a model whose tokenizer
-llm-tokenizer renders with a built-in encoder chosen from `config.json`, not a
-chat template, such as DeepSeek V3.2 and V4
-([#3377](https://github.com/ROCm/ATOM/issues/3377)). Use a policy that does not
+`prefix_hash`, and `cache_aware` with `--kv-events`, route on exact request
+tokens. A chat without media goes by the tokens one of its model's available
+workers, taken in turn, renders it to: `POST /v1/chat/completions/render`, which
+ATOM and vLLM serve, returns the prompt token IDs the worker's engine runs, so
+they match the blocks its KV events report, whatever template kwargs, reasoning
+controls or encoder the worker resolved. The worker gets the chat as the client
+sent it, with the headers the chat itself would get. When the render fails or
+takes longer than 2 s or half the time the request has left to be prepared, the
+router renders the chat itself, with its template and the request's
+`chat_template_kwargs` and `reasoning_effort`. A worker that answers 404 or 405
+is not asked again for a minute. `mesh_worker_chat_render_total{outcome}` counts
+renders as `rendered`, `unserved`, `failed` or `timed_out`. Under `--ext-proc`,
+the router renders chats itself.
+
+Messages and Responses have no registered token-routing template, so under
+`prefix_hash` they return `501 token_routing_unsupported`. So do chats that no
+worker renders, for a model whose tokenizer llm-tokenizer renders with a built-in
+encoder chosen from `config.json`, not a chat template, such as DeepSeek V3.2 and
+V4 ([#3377](https://github.com/ROCm/ATOM/issues/3377)). Use a policy that does not
 need tokens, such as `cache_aware` or `round_robin`, for these models and APIs.
 
 ## Reliability

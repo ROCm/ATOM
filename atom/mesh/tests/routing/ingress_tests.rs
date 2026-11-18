@@ -5,7 +5,7 @@ use crate::core::{
 };
 use serde_json::json;
 use std::{
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     time::Duration,
 };
 
@@ -1401,5 +1401,308 @@ async fn ingress_prepares_routing_only_for_http_routers() {
             .await
             .unwrap();
         assert_eq!(IngressRouting::for_app(&app).is_some(), prepares);
+    }
+}
+
+/// A worker whose `/v1/chat/completions/render` answers `status` with `reply`,
+/// counting the renders it is asked for and keeping the last one's headers and body.
+struct RenderWorker {
+    url: String,
+    calls: Arc<AtomicUsize>,
+    last: Arc<parking_lot::Mutex<Option<(HeaderMap, Bytes)>>>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl RenderWorker {
+    async fn start(status: http::StatusCode, reply: &'static str) -> Self {
+        Self::answering_after(Duration::ZERO, status, reply).await
+    }
+
+    /// One that answers each render only after `delay`.
+    async fn answering_after(
+        delay: Duration,
+        status: http::StatusCode,
+        reply: &'static str,
+    ) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let last = Arc::new(parking_lot::Mutex::new(None));
+        let (counted, kept) = (calls.clone(), last.clone());
+        let engine = Router::new().route(
+            "/v1/chat/completions/render",
+            post(move |headers: HeaderMap, body: Bytes| {
+                let (counted, kept) = (counted.clone(), kept.clone());
+                async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    *kept.lock() = Some((headers, body));
+                    tokio::time::sleep(delay).await;
+                    (
+                        status,
+                        [(http::header::CONTENT_TYPE, "application/json")],
+                        reply,
+                    )
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, engine).await.unwrap() });
+        Self {
+            url,
+            calls,
+            last,
+            server,
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for RenderWorker {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+const RENDERED: &str = r#"{"request_id":"chatcmpl-1","model":"m","token_ids":[7,8,9]}"#;
+
+fn prefix_hash() -> crate::config::PolicyConfig {
+    crate::config::PolicyConfig::PrefixHash {
+        prefix_token_count: 4,
+        load_factor: 1.25,
+    }
+}
+
+/// A router for model `m` under `policy`, which can render `m`'s chats with the
+/// test tokenizer, and a worker for `m` at each of `urls`.
+async fn render_app(
+    policy: crate::config::PolicyConfig,
+    urls: &[&str],
+) -> (PreparePoolRuntime, AppContext) {
+    render_app_in(default_pool(), policy, urls).await
+}
+
+/// `render_app` with a preparation pool configured as `pool`.
+async fn render_app_in(
+    pool: PoolConfig,
+    policy: crate::config::PolicyConfig,
+    urls: &[&str],
+) -> (PreparePoolRuntime, AppContext) {
+    let pool = PreparePoolRuntime::new(pool).unwrap();
+    let config = crate::config::RouterConfig {
+        policy,
+        ..Default::default()
+    };
+    let app = AppContext::from_config(config, 5, pool.handle())
+        .await
+        .unwrap();
+    app.tokenizer_registry
+        .load("hf-id", "m", "hf-test", || async {
+            Ok(crate::routers::test_mocks::tokenizer::hf_tokenizer())
+        })
+        .await
+        .unwrap();
+    for url in urls {
+        app.worker_registry.register(Arc::new(
+            BasicWorkerBuilder::new(*url)
+                .model_id("m")
+                .api_key("worker-key")
+                .build(),
+        ));
+    }
+    (pool, app)
+}
+
+fn chat() -> serde_json::Value {
+    json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "hello world"}],
+        "chat_template_kwargs": {"enable_thinking": false},
+    })
+}
+
+async fn parse_for_routing(
+    app: &AppContext,
+    path: &str,
+    body: &serde_json::Value,
+) -> Result<InferenceEnvelope, IngressError> {
+    InferenceEnvelope::parse_for_routing(
+        path.parse().unwrap(),
+        json_headers(),
+        Bytes::from(serde_json::to_vec(body).unwrap()),
+        app,
+        IngressRouting::for_app(app),
+    )
+    .await
+}
+
+/// `request`'s routing tokens, prepared in the pool if the parse job left them.
+async fn routed_tokens(
+    app: &AppContext,
+    request: InferenceEnvelope,
+) -> Result<Option<Vec<u32>>, IngressError> {
+    let routing = IngressRouting::new(app);
+    let (_, (_, tokens)) = request.prepare_routing(&app.prepare_pool, &routing).await?;
+    Ok(tokens)
+}
+
+/// A chat placed by tokens goes by the tokens its worker renders. The worker
+/// gets the chat as the client sent it, with the worker's credential, and the
+/// parse job still prepares the routing text.
+#[tokio::test]
+async fn chats_place_by_the_tokens_their_worker_renders() {
+    let worker = RenderWorker::start(http::StatusCode::OK, RENDERED).await;
+    let (_pool, app) = render_app(prefix_hash(), &[&worker.url]).await;
+    let mut request = parse_for_routing(&app, "/v1/chat/completions", &chat())
+        .await
+        .unwrap();
+    let (metadata, tokens) = request.routed.take().unwrap();
+    assert_eq!(tokens, Some(vec![7, 8, 9]));
+    assert_eq!(metadata.text, request.parsed.metadata().text);
+    assert_eq!(worker.calls(), 1);
+    let (headers, sent) = worker.last.lock().take().unwrap();
+    assert_eq!(sent, serde_json::to_vec(&chat()).unwrap());
+    assert_eq!(headers[http::header::CONTENT_TYPE], "application/json");
+    assert_eq!(headers[http::header::AUTHORIZATION], "Bearer worker-key");
+}
+
+/// A chat its worker does not render is rendered by the router, as without the
+/// render route. A worker without the route goes unasked for a while; one whose
+/// render failed is asked again for the next chat.
+#[tokio::test]
+async fn chats_a_worker_does_not_render_are_rendered_by_the_router() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _recorder = metrics::set_default_local_recorder(&recorder);
+    let (_pool, app) = render_app(prefix_hash(), &[]).await;
+    let own = routed_tokens(
+        &app,
+        parse_for_routing(&app, "/v1/chat/completions", &chat())
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_ne!(own, [7, 8, 9]);
+    for (status, reply, asked_again) in [
+        (
+            http::StatusCode::NOT_FOUND,
+            r#"{"detail":"Not Found"}"#,
+            false,
+        ),
+        (http::StatusCode::METHOD_NOT_ALLOWED, "{}", false),
+        (http::StatusCode::INTERNAL_SERVER_ERROR, RENDERED, true),
+        (http::StatusCode::OK, r#"{"token_ids":"none"}"#, true),
+    ] {
+        let worker = RenderWorker::start(status, reply).await;
+        let (_pool, app) = render_app(prefix_hash(), &[&worker.url]).await;
+        for _ in 0..2 {
+            let request = parse_for_routing(&app, "/v1/chat/completions", &chat())
+                .await
+                .unwrap();
+            assert_eq!(
+                routed_tokens(&app, request).await.unwrap().as_ref(),
+                Some(&own),
+                "{status}"
+            );
+        }
+        assert_eq!(worker.calls(), if asked_again { 2 } else { 1 }, "{status}");
+    }
+    let rendered = handle.render();
+    for line in [
+        r#"mesh_worker_chat_render_total{outcome="unserved"} 2"#,
+        r#"mesh_worker_chat_render_total{outcome="failed"} 4"#,
+    ] {
+        assert!(rendered.contains(line), "missing {line} in\n{rendered}");
+    }
+}
+
+/// A late render leaves the router time to render the chat itself.
+#[tokio::test]
+async fn late_renders_leave_the_router_time_to_render_the_chat() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _recorder = metrics::set_default_local_recorder(&recorder);
+    let worker =
+        RenderWorker::answering_after(Duration::from_secs(10), http::StatusCode::OK, RENDERED)
+            .await;
+    let pool = PoolConfig {
+        prepare_timeout: Duration::from_secs(2),
+        ..default_pool()
+    };
+    let (_pool, app) = render_app_in(pool, prefix_hash(), &[&worker.url]).await;
+    let request = parse_for_routing(&app, "/v1/chat/completions", &chat())
+        .await
+        .unwrap();
+    assert!(request.routed.is_none());
+    let tokens = routed_tokens(&app, request).await.unwrap().unwrap();
+    assert_ne!(tokens, [7, 8, 9]);
+    assert_eq!(worker.calls(), 1);
+    let rendered = handle.render();
+    let line = r#"mesh_worker_chat_render_total{outcome="timed_out"} 1"#;
+    assert!(rendered.contains(line), "missing {line} in\n{rendered}");
+}
+
+/// Only chats without media whose policies use tokens are rendered, and only on
+/// available workers.
+#[tokio::test]
+async fn only_text_chats_placed_by_tokens_are_rendered_on_available_workers() {
+    let worker = RenderWorker::start(http::StatusCode::OK, RENDERED).await;
+    let (_pool, app) = render_app(prefix_hash(), &[&worker.url]).await;
+    let image = json!({"model": "m", "messages": [{"role": "user", "content": [
+        {"type": "text", "text": "what is this"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+    ]}]});
+    let _ = parse_for_routing(&app, "/v1/chat/completions", &image).await;
+    for (path, body) in [
+        (
+            "/v1/completions",
+            json!({"model": "m", "prompt": "hello world"}),
+        ),
+        ("/generate", json!({"model": "m", "text": "hello world"})),
+    ] {
+        parse_for_routing(&app, path, &body).await.unwrap();
+    }
+    assert_eq!(worker.calls(), 0);
+
+    app.worker_registry.get_by_model("m")[0].set_healthy(false);
+    let request = parse_for_routing(&app, "/v1/chat/completions", &chat())
+        .await
+        .unwrap();
+    assert!(request.routed.is_some());
+    assert_eq!(worker.calls(), 0);
+
+    let (_pool, app) = render_app(crate::config::PolicyConfig::RoundRobin, &[&worker.url]).await;
+    parse_for_routing(&app, "/v1/chat/completions", &chat())
+        .await
+        .unwrap();
+    assert_eq!(worker.calls(), 0);
+}
+
+/// Chats the router cannot render, as llm-tokenizer renders them with a built-in
+/// encoder, are placed by the tokens their worker renders, and refused only when
+/// no worker renders them.
+#[tokio::test]
+async fn chats_the_router_cannot_render_go_by_their_worker_render() {
+    for (status, reply) in [
+        (http::StatusCode::OK, RENDERED),
+        (http::StatusCode::NOT_FOUND, "{}"),
+    ] {
+        let worker = RenderWorker::start(status, reply).await;
+        let (_pool, app) = render_app(prefix_hash(), &[&worker.url]).await;
+        app.chats_without_template
+            .write()
+            .insert("hf-id".to_string());
+        let request = parse_for_routing(&app, "/v1/chat/completions", &chat())
+            .await
+            .unwrap();
+        let tokens = routed_tokens(&app, request).await;
+        if status.is_success() {
+            assert_eq!(tokens.unwrap(), Some(vec![7, 8, 9]));
+        } else {
+            assert_eq!(tokens.unwrap_err().code, "token_routing_unsupported");
+        }
     }
 }

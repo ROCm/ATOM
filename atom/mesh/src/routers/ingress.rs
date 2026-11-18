@@ -30,7 +30,10 @@ use crate::{
     policies::{LoadBalancingPolicy, PolicyRegistry},
     routers::{
         comm::error::{IngressError, MeshLocalError},
-        prepare::inference::{InferenceMetadata, InferenceRequest, ParsedInference},
+        prepare::{
+            inference::{InferenceMetadata, InferenceRequest, ParsedInference},
+            worker_render::WorkerRenders,
+        },
     },
     server::AppState,
     tokenizer::TokenizerRegistry,
@@ -433,10 +436,55 @@ pub struct InferenceEnvelope {
     /// Routing text and tokens computed in the parse job, so the request does
     /// not queue for the preparation pool a second time.
     routed: Option<RoutingPreparation>,
+    /// A chat whose routing tokens a worker renders once the parse job is done.
+    render: Option<PendingRender>,
 }
 
 /// Execution metadata and, when the policy needs them, routing tokens.
 pub(crate) type RoutingPreparation = (InferenceMetadata, Option<Vec<u32>>);
+
+/// A chat that `worker` renders the routing tokens of.
+struct PendingRender {
+    /// The chat's routing metadata, with its text.
+    metadata: InferenceMetadata,
+    worker: Arc<dyn Worker>,
+}
+
+impl PendingRender {
+    /// The chat's routing preparation with the tokens `worker` renders `body`
+    /// to, or `None` when it does not render them in time; routing then
+    /// renders the chat in the pool.
+    async fn run(
+        self,
+        app: &AppContext,
+        headers: &HeaderMap,
+        body: &Bytes,
+        deadline: Instant,
+    ) -> Option<RoutingPreparation> {
+        let started = Instant::now();
+        // Half the time left, so that the pool still has time to render a chat
+        // whose render is late.
+        let budget = deadline.saturating_duration_since(started) / 2;
+        let rendered = app
+            .worker_renders
+            .render(
+                &app.client,
+                self.worker.as_ref(),
+                headers,
+                body.clone(),
+                budget,
+            )
+            .await;
+        metrics::histogram!("mesh_prepare_stage_seconds", "stage" => "worker_render")
+            .record(started.elapsed().as_secs_f64());
+        let outcome = rendered
+            .as_ref()
+            .map_or_else(|miss| miss.label(), |_| "rendered");
+        metrics::counter!("mesh_worker_chat_render_total", "outcome" => outcome).increment(1);
+        rendered.ok().map(|tokens| (self.metadata, Some(tokens)))
+    }
+}
+
 impl InferenceEnvelope {
     #[cfg(test)]
     pub async fn parse(
@@ -488,20 +536,31 @@ impl InferenceEnvelope {
                 dp_rank_body: None,
                 prepare_deadline: deadline,
                 routed: None,
+                render: None,
             })
         };
-        app.prepare_pool
+        let mut request = app
+            .prepare_pool
             .submit(deadline, move |ctx| -> Result<Self, IngressError> {
                 let mut request = parse()?;
                 if let Some(routing) = routing {
-                    request.routed = Some(routing.prepare(&request.parsed, ctx)?);
+                    match routing.worker_render(&request.parsed, &request.metadata)? {
+                        Some(render) => request.render = Some(render),
+                        None => request.routed = Some(routing.prepare(&request.parsed, ctx)?),
+                    }
                     request.dp_rank_body = routing.dp_rank_body(&request.metadata, &request.body);
                 }
                 Ok(request)
             })
             .await?
             .wait()
-            .await?
+            .await??;
+        if let Some(render) = request.render.take() {
+            request.routed = render
+                .run(app, &request.headers, &request.body, deadline)
+                .await;
+        }
+        Ok(request)
     }
 
     /// Move the envelope through the job and result together.
@@ -632,6 +691,7 @@ pub struct IngressRouting {
     worker_registry: Arc<WorkerRegistry>,
     tokenizer_registry: Arc<TokenizerRegistry>,
     chats_without_template: Arc<RwLock<HashSet<String>>>,
+    renders: Arc<WorkerRenders>,
     pd: bool,
     max_tokenize_bytes: usize,
 }
@@ -643,6 +703,7 @@ impl IngressRouting {
             worker_registry: app.worker_registry.clone(),
             tokenizer_registry: app.tokenizer_registry.clone(),
             chats_without_template: app.chats_without_template.clone(),
+            renders: app.worker_renders.clone(),
             pd: app.router_config.mode.is_pd_mode(),
             max_tokenize_bytes: app.router_config.resolved_max_tokenize_bytes(),
         }
@@ -699,6 +760,32 @@ impl IngressRouting {
             return Ok((metadata, None));
         }
         self.prepare_text_and_tokens(parsed, tokens, ctx)
+    }
+
+    /// The worker to render `parsed`'s routing tokens on, if it is a chat
+    /// without media whose policies use tokens: the next available worker for
+    /// its model that may serve `/v1/chat/completions/render`. `metadata` is
+    /// the chat's routing metadata without text. A worker renders with the
+    /// template kwargs it resolved, which the router's own render does not know.
+    fn worker_render(
+        &self,
+        parsed: &ParsedInference,
+        metadata: &InferenceMetadata,
+    ) -> Result<Option<PendingRender>, IngressError> {
+        if parsed.chat().is_none() || metadata.carries_media {
+            return Ok(None);
+        }
+        let (_, tokens) = self.admit(metadata)?;
+        if tokens == Tokens::Unused {
+            return Ok(None);
+        }
+        let Ok(workers) = self.candidates(metadata, false) else {
+            return Ok(None);
+        };
+        Ok(self.renders.pick(&workers).map(|worker| PendingRender {
+            metadata: parsed.metadata(),
+            worker,
+        }))
     }
 
     /// Validate the API and topology, then return whether the policy needs
@@ -875,7 +962,7 @@ impl IngressRouting {
         let template_started = Instant::now();
         let prompt = if let Some(chat) = parsed.chat() {
             if self.chats_without_template.read().contains(&entry.id) {
-                return Err(IngressError::new(http::StatusCode::NOT_IMPLEMENTED, "token_routing_unsupported", "this model's chats render with a built-in encoder whose defaults are not the engine's; use a policy that does not require exact tokens"));
+                return Err(IngressError::new(http::StatusCode::NOT_IMPLEMENTED, "token_routing_unsupported", "this model's chats render with a built-in encoder whose defaults are not the engine's, and no worker rendered this one; serve /v1/chat/completions/render from its workers, or use a policy that does not require exact tokens"));
             }
             super::prepare::chat_template::process_chat_messages(chat, &*entry.tokenizer)
                 .map_err(IngressError::invalid)?
