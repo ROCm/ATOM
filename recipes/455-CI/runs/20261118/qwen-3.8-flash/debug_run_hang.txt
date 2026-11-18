@@ -1,0 +1,27 @@
+[atom 12:26:21] Scheduled prefill batch: 1 reqs, 1028 new tokens (done: [0], new: [1028]), req_ids: (0,)
+[atom 12:27:03] Engine 000: Avg prompt throughput: 21.6 tokens/s, Avg generation throughput: 0.0 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.0%, Prefix cache hit rate: 0.0%
+[atom 12:27:03] Scheduled prefill batch: 18 reqs, 16364 new tokens (done: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], new: [999, 1013, 996, 986, 916, 1016, 1050, 987, 897, 923, 891, 813, 1010, 910, 920, 969, 812, 256]), req_ids: (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17,
+[atom 12:27:05] Scheduled prefill batch: 19 reqs, 16349 new tokens (done: [256, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], new: [596, 889, 824, 973, 848, 899, 850, 880, 925, 910, 976, 1067, 878, 876, 907, 855, 892, 728, 576]), req_ids: (18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+[atom 12:30:10] Client disconnected (non-stream), aborting request cmpl-095e1859659c4664b8f4ea871b0ebbae
+[atom 12:30:10] Client disconnected (non-stream), aborting request cmpl-80981c3c915a4d47ac3a952326a61650
+[atom 12:30:10] Client disconnected (non-stream), aborting request cmpl-672c5ba7998240ffa56c4b73ee5f03b7
+[atom 12:30:10] Client disconnected (non-stream), aborting request cmpl-b3396af1cbde471a99b0e10243b35737
+...
+[Wed Nov 18 12:27:09 2026] amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:24 vmid:2 pasid:4157)
+[Wed Nov 18 12:27:09 2026] amdgpu 0001:01:00.0:  Process python3 pid 2339460 thread python3 pid 2339460
+[Wed Nov 18 12:27:09 2026] amdgpu 0001:01:00.0:   in page starting at address 0x0000000000cc1000 from IH client 27 (GC_UTCL2)
+[Wed Nov 18 12:27:09 2026] amdgpu 0001:01:00.0:   cookie node_id 12 fault from die AID1.XCD2
+[Wed Nov 18 12:27:09 2026] amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00804060
+[Wed Nov 18 12:27:09 2026] amdgpu 0001:01:00.0: 	 Faulty UTCL2 client ID: TCP (0x8)
+[Wed Nov 18 12:27:09 2026] amdgpu 0001:01:00.0: 	 MORE_FAULTS: 0x0
+[Wed Nov 18 12:27:09 2026] amdgpu 0001:01:00.0: 	 WALKER_ERROR: 0x0
+[Wed Nov 18 12:27:09 2026] amdgpu 0001:01:00.0: 	 PERMISSION_FAULTS: 0x3
+[Wed Nov 18 12:27:09 2026] amdgpu 0001:01:00.0: 	 MAPPING_ERROR: 0x0
+[Wed Nov 18 12:27:09 2026] amdgpu 0001:01:00.0: 	 RW: 0x0
+[Wed Nov 18 12:27:09 2026] amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+[Wed Nov 18 12:27:09 2026] amdgpu 0001:01:00.0: 	 FED: 0x0
+[Wed Nov 18 12:27:11 2026] amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=REMOVE_QUEUE
+[Wed Nov 18 12:29:21 2026] INFO: task grpcpp_sync_ser:103314 blocked for more than 122 seconds.
+[Wed Nov 18 12:29:21 2026]  kfd_procfs_show+0xc9/0x160 [amdgpu]
+[Wed Nov 18 12:29:21 2026]  ? __pfx_kfd_sdma_activity_worker+0x10/0x10 [amdgpu]
+[Wed Nov 18 12:29:21 2026] INFO: task kworker/57:0:2363199 blocked for more than 122 seconds.

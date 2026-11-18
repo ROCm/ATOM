@@ -1,0 +1,16 @@
+[atom 11:45:55] Request 64 arrived, input tokens: 781, pending requests: 65
+[atom 11:45:55] Scheduled prefill batch: 1 reqs, 999 new tokens (done: [0], new: [999]), req_ids: (0,)
+[atom.model_ops.qwen4_exp.qsa_attention 11:46:35] FlyDSL QSA prefill attention is enabled, but QSA attention uses the native kernel: the KV cache is not BF16
+[atom.model_ops.qwen4_exp.qsa_attention 11:46:36] FlyDSL QSA prefill attention is enabled, but QSA attention uses the native kernel: per-rank head shape 24 q / 2 kv heads x 256 (needs 12, 6 or 3 q / 1 kv x 256)
+[atom 11:46:37] Engine 000: Avg prompt throughput: 22.4 tokens/s, Avg generation throughput: 0.0 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.0%, Prefix cache hit rate: 0.0%
+[atom 11:46:37] Scheduled prefill batch: 18 reqs, 16331 new tokens (done: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], new: [1028, 1013, 996, 916, 1050, 897, 1016, 986, 923, 987, 1010, 891, 813, 969, 889, 910, 973, 64]), req_ids: (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18)
+Warning: Queue error - HSA_STATUS_ERROR_MEMORY_FAULT
+VGPU(0x3576a270) hang analysis:
+SWq=0x71d738664000, HWq=0x71960c200000, id=1, priority=1, Dispatch Header = 0xb00 (type=0, barrier=1, acquire=1, release=1), setup=3, cluster_count=[81680, 1, 1], cluster_size=[1, 1, 1], workgroup=[64, 1, 1], private_seg_size=0, group_seg_size=8192, kernel_obj=0x7196340435c0, kernarg_address=0x7196043df300, dep_signal=0x0, completion_signal=0x0, rptr=393794, wptr=395195
+SWq=0x71d738664000, HWq=0x71960c200000, id=1, Metadata Packet [wptr=395195]: header=[0x0, 0x0, 0x0, 0x0], event_id=0x0, kernel_code_entry_byte_offset=0x35540, compute_pgm_rsrc1=0xc00f000f, compute_pgm_rsrc2=0x3b8, compute_pgm_rsrc3=0x9e0, kernel_code_properties=0x408, kernarg_preload=[length=26, offset=0], launch_descriptor=[0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000
+:0:rocdevice.cpp            :3896: 30498192543 us:  Memory Fault Error [host: ctheliosr-rck-g02-e15-07, GPU index: 0, faulting addr: 0x4e2000, kernel: Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x16x32_MI16x16x1_SN_LDSB0_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_AFEM1_ASEM1_BL1_BS1_CD1_1_CLR1_CLS0_CADS0_DTLA0_DTLB0_DTLM0_DTVA0_DTVB0_DTVMXSA0_DTVMXSB0_DTVSM0_DPLB0_EPS0_ELFLR0_EMLLn1_FDSI0_GRPM1_GRVWA1_GR
+Memory access fault by GPU node-2 (Agent handle: 0x3245ac30) on address 0x4e2000. Reason: Page not present or supervisor privilege.
+[atom 11:46:39] AsyncIOProcManager(ModelRunner): [ModelRunner0/1] proc died unexpectedly (exitcode=-6), shutting down.
+[atom 11:46:39] AsyncIOProcManager(ModelRunner): shutdown all runners...
+[atom 11:46:40] AsyncIOProcManager(ModelRunner): All runners are shutdown.
+[atom 11:46:40] [gc] unfroze 2201592 objects
