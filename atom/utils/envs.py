@@ -666,6 +666,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
             if site not in ("", "0")
         )
     ),
+    # Kimi-K3 gfx1250 mono: cold-launch changes to K1 and the front (the
+    # same bits), a comma list: "early" issues the first weight and token
+    # copies before the FP8 scales' load; "preload" preloads the kernel
+    # arguments into SGPRs (K1 derives its late scratch pointer after the
+    # projection), so the first copies wait on no load; "prefetch" adds
+    # s_prefetch_inst of the whole kernel at the entry. 0, the default,
+    # keeps the current kernels.
+    "ATOM_KIMI_MONO_TDM_COLD": lambda: frozenset(
+        site
+        for site in os.getenv("ATOM_KIMI_MONO_TDM_COLD", "0").split(",")
+        if site not in ("", "0")
+    ),
     # Kimi-K3 gfx1250 mono: the fused MoE's gate/up K tiles, its M tiles'
     # epilogues and down tiles, and its staging loops as runtime loops, so a
     # cold launch fetches one body's code each (the same bits); 0 unrolls them

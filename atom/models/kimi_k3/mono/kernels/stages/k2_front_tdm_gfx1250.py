@@ -24,6 +24,7 @@ from atom.models.kimi_k3.mono.kernels.stages import (
     gemv_gfx1250,
     moe_expert_gfx1250,
     moe_gfx1250,
+    tdm_timeline,
 )
 from atom.models.kimi_k3.mono.kernels.stages import gemv_tdm_gfx1250 as gemv_tdm
 from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import (
@@ -232,6 +233,7 @@ def _front_tasks(
             lane,
         )
     gpu.barrier()
+    tdm_timeline.stamp(tdm_timeline.STAGED)
     _front_epilogue(
         lds,
         outputs,
@@ -247,6 +249,8 @@ def _front_tasks(
         rows,
         tiles,
     )
+    tdm_timeline.stamp(tdm_timeline.STORES_ISSUED)
+    tdm_timeline.stores_done()
 
 
 @traced
@@ -527,10 +531,12 @@ def build_replicated_front(
         raise ValueError(f"replicated K2 front needs {lds_bytes(Lds)} B of LDS")
     name = (
         f"k3_k2_gfx1250_replicated_front{'_w' if wide else ''}_d{depth}"
-        f"_s{rows}{'_f8' if fp8_shared else ''}"
+        f"_s{rows}{'_f8' if fp8_shared else ''}{gemv_tdm.cold_suffix()}"
+        f"{tdm_timeline.suffix()}"
     )
 
     sources = SOURCES
+    timeline = tdm_timeline.key()
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def kernel(
@@ -544,11 +550,13 @@ def build_replicated_front(
         latent_scales: Int64,
         shared_hidden: Int64,
     ):
-        _ = sources
+        _ = sources, timeline
         tid = fx.thread_idx.x
         pair = fx.block_idx.x
         lane = tid % GFX1250.wave_size
         wave = tid // GFX1250.wave_size
+        gemv_tdm.prefetch_code(wave, 10 << 10)
+        tdm_timeline.open_cta(pair, wave)
         lds = fx.SharedAllocator().allocate(Lds).peek()
         if pair < PAIRS:
             _front_tasks(
@@ -566,6 +574,7 @@ def build_replicated_front(
                 wide=wide,
                 depth=depth,
             )
+        tdm_timeline.close_cta()
 
     @flyc.jit
     def launch(
@@ -580,7 +589,7 @@ def build_replicated_front(
         shared_hidden: Int64,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
-        _ = sources
+        _ = sources, timeline
         kernel(
             x,
             router_weight,
@@ -600,6 +609,7 @@ def build_replicated_front(
         )
 
     REPLICATED_FRONT_ABI.check(kernel, launch)
+    gemv_tdm.apply_preload(launch)
     return K2ReplicatedFrontKernel(name, launch, (PAIRS,), (THREADS,))
 
 

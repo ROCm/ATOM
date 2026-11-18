@@ -28,12 +28,13 @@ import math
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm, vector
 from flydsl._mlir.dialects import rocdl as rocdl_dialect
-from flydsl._mlir.dialects import vector
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.rocdl import cluster
 from flydsl.expr.typing import T, as_ir_value
 
+from atom.models.kimi_k3.mono.kernels.stages import tdm_timeline
 from atom.models.kimi_k3.mono.kernels.stages.gemv_gfx1250 import (
     ACCUMULATOR_ELEMENTS,
     fp8x8_to_bf16,
@@ -80,10 +81,61 @@ _DESCRIPTOR_TYPE = 2 << 30
 _WEIGHT_CACHE_POLICY = 1
 _CLUSTER_MASK = (1 << TDM_CLUSTER) - 1 if TDM_CLUSTER > 1 else 0
 _ROLLED_UNROLL = envs.ATOM_KIMI_MONO_TDM_ROLLED
+_COLD = envs.ATOM_KIMI_MONO_TDM_COLD
 CLUSTER_LAUNCH = {
     "value_attrs": {"rocdl.cluster_dims": f"{TDM_CLUSTER},1,1"},
     "cluster": (TDM_CLUSTER, 1, 1),
 }
+
+
+def cold_suffix() -> str:
+    """Kernel-name suffix of the ``ATOM_KIMI_MONO_TDM_COLD`` changes built in."""
+    return "".join(f"_c{site}" for site in sorted(_COLD))
+
+
+@traced
+def _prefetch_on(role, asm: str):
+    if role == 0:
+        llvm.inline_asm(None, [], asm, "", has_side_effects=True)
+
+
+def prefetch_code(wave, code_bytes: int) -> None:
+    """``ATOM_KIMI_MONO_TDM_COLD=prefetch``: at the kernel's entry, wave 0
+    prefetches the next ``code_bytes`` of instructions into the instruction
+    cache (31 lines of 128 B per request), on top of the descriptor's
+    INST_PREF_SIZE prefetch from the entry."""
+    if const_expr("prefetch" not in _COLD):
+        return
+    step = 31 * 128
+    asm = "\n".join(
+        f"s_prefetch_inst_pc_rel {offset}, null, 31"
+        for offset in range(0, code_bytes, step)
+    )
+    _prefetch_on(_uniform(wave), asm)
+
+
+def late_scratch() -> bool:
+    return "preload" in _COLD
+
+
+def opaque_pointer(value):
+    """``value`` (an SGPR pair) through an asm copy the compiler cannot see
+    through, so address arithmetic on it stays where it is written."""
+    return fx.Int64(
+        llvm.inline_asm(
+            T.i64, [as_ir_value(fx.Int64(value))], "s_mov_b64 $0, $1", "=s,s"
+        )
+    )
+
+
+def apply_preload(launch) -> None:
+    """``ATOM_KIMI_MONO_TDM_COLD=preload``: ``launch``'s kernel arguments
+    preloaded into SGPRs at dispatch (as many as fit), so the first copies
+    need no kernarg load."""
+    if "preload" in _COLD:
+        options = {**launch.compile_hints.get("llvm_options", {})}
+        options["amdgpu-kernarg-preload-count"] = 16
+        launch.compile_hints = {**launch.compile_hints, "llvm_options": options}
 
 
 def _i32(value: int):
@@ -573,7 +625,9 @@ def _project_rolled(
     task_words = tdm_task_words(fp8)
     stages = depth + 1
     scales = lds + x_words + stages * tasks * task_words
-    if const_expr(fp8):
+    tdm_timeline.stamp(tdm_timeline.GEMV_START)
+
+    def stage_scales():
         row = task_rows[0]
         for t in range_constexpr(1, tasks):
             row = (wave == t).select(task_rows[t], row)
@@ -584,6 +638,12 @@ def _project_rolled(
             dtype=T.i32,
         )
         fx.ptr_store(fx.Int32(word), scales + wave * GFX1250.wave_size + lane)
+
+    # "early": the scales' load (and its wait, for the LDS store) behind the
+    # first copies; they are first read past the slab-0 barrier either way.
+    early = "early" in _COLD
+    if const_expr(fp8 and not early):
+        stage_scales()
 
     role = _uniform(wave)
     task = fx.min(fx.max(role - 1, 0) // 2, tasks - 1)
@@ -647,6 +707,9 @@ def _project_rolled(
     if const_expr(prologue is not None):
         prologue()
         _on_wave(role, 0, lambda: issue_tokens(fx.Int32(0)))
+    if const_expr(fp8 and early):
+        stage_scales()
+    tdm_timeline.stamp(tdm_timeline.ISSUED)
     accs = [
         fx.Vector.filled(ACCUMULATOR_ELEMENTS, 0.0, fx.Float32)
         for _ in range(tasks * tiles)
@@ -658,13 +721,18 @@ def _project_rolled(
     ]
     for s in range(fx.Int32(0), fx.Int32(slabs), unroll=_ROLLED_UNROLL):
         if s > 0:
+            tdm_timeline.slab(s - 1, tdm_timeline.C)
             # The buffers slab s - 1 read are the ones refilled below.
             if const_expr(TDM_CLUSTER > 1):
                 cluster.cluster_barrier()
             else:
                 gpu.barrier()
+        tdm_timeline.slab(s, tdm_timeline.A)
         _rolled_roles(role, s, slabs, tasks, depth, issue_tokens, issue_weight)
+        tdm_timeline.slab(s, tdm_timeline.TOKEN)
+        tdm_timeline.slab(s, tdm_timeline.WEIGHT, 1 + (s & 1))
         gpu.barrier()
+        tdm_timeline.slab(s, tdm_timeline.B)
         slab_weights = [
             (
                 _fp8_operand(
@@ -711,6 +779,8 @@ def _project_rolled(
         ] + list(activations[tiles - 1])
         accs = updated
     accs = _rolled_last_tile(accs, pend, tasks, tiles)
+    tdm_timeline.slab(fx.Int32(slabs - 1), tdm_timeline.C)
+    tdm_timeline.stamp(tdm_timeline.PROJECT_DONE)
     return [[accs[tk * tiles + tl] for tl in range(tiles)] for tk in range(tasks)]
 
 

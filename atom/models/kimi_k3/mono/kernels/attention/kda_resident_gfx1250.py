@@ -35,6 +35,7 @@ from atom.models.kimi_k3.mono.kernels.attention.protocol import (
 )
 from atom.models.kimi_k3.mono.kernels.execution_plan import Gfx1250KimiBuildPlan
 from atom.models.kimi_k3.mono.kernels.stages import gemv_tdm_gfx1250 as gemv_tdm
+from atom.models.kimi_k3.mono.kernels.stages import tdm_timeline
 from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import (
     TDM_SPLIT_GROUP,
     TDM_SPLIT_TILE_WORDS,
@@ -191,6 +192,8 @@ def build_resident_k1(
         declaration.blocks,
         plan.lds_bytes,
         spec,
+        gemv_tdm.cold_suffix(),
+        tdm_timeline.key(),
     )
     cached = _BUILDS.get(cache_key)
     if cached is not None:
@@ -243,13 +246,14 @@ def build_resident_k1(
             declaration.lds.split_stages,
         ),
         SOURCES,
-    )
+    ), (gemv_tdm.cold_suffix(), tdm_timeline.key())
     name = (
         f"k3_k1_gfx1250_resident_s{s}_l{qlen}_nb{declaration.nblocks}"
         f"_u{spec.gemv_unit}_q{int(spec.quant_core)}"
         f"{'_xs' if spec.external_seam else ''}{'_t' if spec.tdm_projection else ''}"
         f"{'_f8' if spec.fp8_projection else ''}"
-        f"{f'_sk{split_stages}' if split_stages else ''}"
+        f"{f'_sk{split_stages}' if split_stages else ''}{gemv_tdm.cold_suffix()}"
+        f"{tdm_timeline.suffix()}"
     )
 
     @traced
@@ -468,6 +472,8 @@ def build_resident_k1(
         bid = fx.block_idx.x
         lane = tid % GFX1250.wave_size
         wave = tid // GFX1250.wave_size
+        gemv_tdm.prefetch_code(wave, 19 << 10)
+        tdm_timeline.open_cta(bid, wave)
         allocator = fx.SharedAllocator()
         smem = allocator.allocate(lds_types.smem).peek()
         role = allocator.allocate(lds_types.role)
@@ -570,7 +576,8 @@ def build_resident_k1(
                     if const_expr(spec.delta or spec.write_idx >= 0):
                         copy_items = rows * (SEAM_COLUMNS // 4)
                         for iteration in range_constexpr(
-                            (copy_items + declaration.threads - 1) // declaration.threads
+                            (copy_items + declaration.threads - 1)
+                            // declaration.threads
                         ):
                             work = tid + declaration.threads * iteration
                             if work < copy_items:
@@ -775,7 +782,15 @@ def build_resident_k1(
                         lane,
                     )
             gpu.barrier()
+            tdm_timeline.stamp(tdm_timeline.STAGED)
             projected_tag = collect_generation(smem.tls.ptr, generation)
+            # ``preload``: derived from ``scratch`` here, after the projection,
+            # so the first copies never wait on its (unpreloaded) kernarg.
+            projected_out = (
+                gemv_tdm.opaque_pointer(scratch) + fx.Int64(layout["proj"][0])
+                if const_expr(gemv_tdm.late_scratch())
+                else projected
+            )
             for task_offset in range_constexpr(PROJECTION_ROWS_PER_CTA):
                 task = first_task + task_offset
                 if task < PROJECTION_TASKS:
@@ -810,15 +825,18 @@ def build_resident_k1(
                                 value = fx.Float32(value)
                                 global_token = tile_starts[tile] + local_token
                                 gfx_backend.mailbox_store_device(
-                                    projected,
+                                    projected_out,
                                     global_token * NPROJ + task * ROWS + row,
                                     value,
                                     projected_tag,
                                 )
+            tdm_timeline.stamp(tdm_timeline.STORES_ISSUED)
             gpu.barrier()
             device["wait_vector_stores"]()
+            tdm_timeline.stamp(tdm_timeline.STORES_DONE)
 
         generation = collect_generation(smem.tls.ptr, generation)
+        tdm_timeline.stamp(tdm_timeline.RECURRENCE)
 
         recurrence_context = {
             "S": s,
@@ -976,6 +994,7 @@ def build_resident_k1(
                     core_out,
                     core_q,
                 )
+        tdm_timeline.close_cta()
 
     @flyc.jit
     def launch(
@@ -1056,6 +1075,7 @@ def build_resident_k1(
             )
 
     LOCAL_ABI.check(resident, launch)
+    gemv_tdm.apply_preload(launch)
     entry = ResidentK1EntryPoint(
         name,
         launch,
