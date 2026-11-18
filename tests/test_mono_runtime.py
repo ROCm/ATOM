@@ -12,7 +12,7 @@ import pytest
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from atom.distributed.group_agreement import group_agree
+from atom.distributed.group_agreement import group_agree, group_min_each
 from atom.mono.runtime.abi import KernelAbi
 from atom.mono.runtime.compile import (
     _COMPILE_ONLY,
@@ -119,6 +119,26 @@ def test_one_refusing_rank_turns_every_rank_down(refuser):
             join=True,
         )
     assert dict(out) == {r: refuser is None for r in range(world)}
+
+
+def _min_each_worker(rank, world, init, out):
+    dist.init_process_group("gloo", init_method=init, rank=rank, world_size=world)
+    out[rank] = group_min_each((rank, -rank, 7), dist.group.WORLD)
+    dist.destroy_process_group()
+
+
+def test_each_position_is_decided_on_its_own_in_one_collective():
+    world = 3
+    with tempfile.TemporaryDirectory() as d:
+        out = mp.Manager().dict()
+        mp.spawn(
+            _min_each_worker,
+            args=(world, f"file://{d}/store", out),
+            nprocs=world,
+            join=True,
+        )
+    assert dict(out) == {r: (0, -2, 7) for r in range(world)}
+    assert group_min_each((3, 1), None) == (3, 1)
 
 
 def _module_files():
@@ -619,3 +639,46 @@ def test_bind_aux_taps_refuses_an_extract_the_kernels_do_not_compute():
     assert bind_aux_taps(_aux_drafter(aux_extract=kernel), 8, kernel).extract is kernel
     # a runner that calls the extract itself takes any
     assert bind_aux_taps(_aux_drafter(aux_extract=other), 8).extract is other
+
+
+@pytest.mark.parametrize("before", [None, "7"])
+def test_srcloc_scoped_keeps_depth_frames_then_flydsls_own_setting(monkeypatch, before):
+    pytest.importorskip("flydsl")
+    from atom.mono.runtime import srcloc
+
+    if before is None:
+        monkeypatch.delenv(srcloc._DEPTH_ENV, raising=False)
+    else:
+        monkeypatch.setenv(srcloc._DEPTH_ENV, before)
+    with srcloc.scoped():
+        assert os.environ[srcloc._DEPTH_ENV] == str(srcloc.DEPTH)
+    assert os.environ.get(srcloc._DEPTH_ENV) == before
+
+
+def test_srcloc_unlocated_captures_no_location_in_any_holder(monkeypatch):
+    pytest.importorskip("flydsl")
+    from atom.mono.runtime import srcloc
+
+    monkeypatch.delenv("FLYDSL_DEBUG_ENABLE_DEBUG_INFO", raising=False)
+    before = [mod.capture_user_location for mod in srcloc._HOLDERS]
+    # restored on an error too
+    with pytest.raises(KeyError), srcloc.unlocated():
+        for mod in srcloc._HOLDERS:
+            assert mod.capture_user_location is srcloc._unknown_location
+        raise KeyError
+    assert [mod.capture_user_location for mod in srcloc._HOLDERS] == before
+
+
+def test_srcloc_unlocated_keeps_locations_when_debug_info_is_on(monkeypatch):
+    """With debug info the locations are in the binary: ``scoped()``'s
+    locations, not none."""
+    pytest.importorskip("flydsl")
+    from atom.mono.runtime import srcloc
+
+    monkeypatch.setenv("FLYDSL_DEBUG_ENABLE_DEBUG_INFO", "1")
+    monkeypatch.delenv(srcloc._DEPTH_ENV, raising=False)
+    before = [mod.capture_user_location for mod in srcloc._HOLDERS]
+    with srcloc.unlocated():
+        assert [mod.capture_user_location for mod in srcloc._HOLDERS] == before
+        assert os.environ[srcloc._DEPTH_ENV] == str(srcloc.DEPTH)
+    assert srcloc._DEPTH_ENV not in os.environ

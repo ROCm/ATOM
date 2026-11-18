@@ -49,6 +49,8 @@ class AttentionWeight(str, Enum):
     FP8_BLOCK128 = "fp8_block128"
     FP8_PTPC = "fp8_ptpc"
     BF16 = "bf16"
+    # row-major BF16 projections read in place, per-tensor FP8 W_UK / W_UV
+    BF16_ABSORB_FP8 = "bf16_absorb_fp8"
 
 
 class Mxfp4WeightLayout(str, Enum):

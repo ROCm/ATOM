@@ -244,8 +244,9 @@ quantization activates only for a supported source format (see § 1).
 When online quantization runs, rank 0 writes
 `online_quant_info_<timestamp>_<ns>.json` to:
 
-1. `$ATOM_TORCH_PROFILER_DIR` if the env var is set, otherwise
-2. the current working directory.
+1. `$ATOM_ONLINE_QUANT_INFO_DIR` if the env var is set, otherwise
+2. `$ATOM_TORCH_PROFILER_DIR` if that one is set, otherwise
+3. the current working directory.
 
 A representative payload:
 

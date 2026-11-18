@@ -133,6 +133,11 @@ def refusal(atom_config, drafter, metadata_builder, dp_ranks: int) -> str:
         return "no DSpark draft"
     if not hasattr(getattr(drafter, "model", None), "block_backbone"):
         return "no DSpark block draft"
+    if drafter.lossless is not None:
+        # Its block draft is greedy and its verify sample-and-match: a step it
+        # served would leave the q slots ATOM_SPEC_LOSSLESS_SAMPLING claimed
+        # holding another draft's q.
+        return "lossless speculative sampling (the hi draft does not publish its q)"
     drafts = getattr(spec, "num_speculative_tokens", None)
     block_drafts = getattr(hf, "dspark_block_size", None)
     if (drafts, block_drafts) != (REQ_ROWS - 1, REQ_ROWS - 1):

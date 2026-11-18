@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""`tbo_on_comm`: a collective a TBO ubatch runs on the comm stream must hold
-what it returns for the compute stream that reads it (why:
-test_tbo_mark_used_on_compute.py). CPU only: the TBO hooks and
-`record_stream` are monkeypatched."""
+"""`tbo_on_comm`: by default a collective a TBO ubatch runs on the comm stream
+holds what it returns for the compute stream that reads it (why:
+test_tbo_mark_used_on_compute.py); the TP all-reduce and the DP gather /
+scatter opt out. CPU only: the TBO hooks and `record_stream` are
+monkeypatched."""
 
 import sys
 from contextlib import nullcontext
@@ -53,7 +54,7 @@ def test_every_tensor_returned_is_held_for_the_compute_stream(tbo):
     tbo.clear()
     assert ub.tbo_on_comm(lambda: a) is a
     assert tbo == ["comm", "compute", (id(a), "compute stream")]
-    # FusedMoE's DP gather returns its rows with their counts.
+    # Nested: rows returned with their counts.
     tbo.clear()
     ub.tbo_on_comm(lambda: ((a, b), 3, [3, 5]))
     assert tbo == ["comm", "compute", *held]
@@ -76,9 +77,16 @@ def test_both_compressor_projections_are_held(tbo, monkeypatch):
     assert tbo == ["comm", "compute", *((id(t), "compute stream") for t in out)]
 
 
-def test_tp_all_reduce_output_is_held(tbo, monkeypatch):
-    """Pure TP+TBO's overlapped all-reduce allocates its output on the comm
-    stream, like the PCP gathers."""
+def test_without_hold_nothing_is_held(tbo):
+    a = torch.zeros(2)
+    assert ub.tbo_on_comm(lambda x: x, a, hold=False) is a
+    assert tbo == ["comm", "compute"]
+
+
+def test_tp_all_reduce_output_is_not_held(tbo, monkeypatch):
+    """KNOWN GAP: the reuse race is still open here. Holding the TP all-reduce
+    output faulted V4-Pro TBO (HSA_STATUS_ERROR_OUT_OF_RESOURCES), so it is not
+    held until a fix that avoids that lands; that fix should flip this."""
     mdo = pytest.importorskip("atom.model_ops.module_dispatch_ops")
     # Imported inside, ahead of the TBO branch; CI's aiter lacks it.
     monkeypatch.setitem(
@@ -99,8 +107,27 @@ def test_tp_all_reduce_output_is_held(tbo, monkeypatch):
         ub, "tbo_get_ubatch_tp_comm", lambda i: SimpleNamespace(all_reduce=all_reduce)
     )
     assert mdo.tbo_all_reduce(torch.zeros(3)) is reduced
-    held = (id(reduced), "compute stream")
-    assert tbo == ["comm", ("all_reduce", "comm stream"), "compute", held]
+    assert tbo == ["comm", ("all_reduce", "comm stream"), "compute"]
+
+
+def test_only_tp_and_dp_collectives_opt_out_of_the_hold():
+    """The PCP gathers (MoE split pass, V4 compressor inputs, extend K) keep
+    the hold: without it the PCP+TBO extend K was overwritten."""
+    import pathlib
+
+    import atom
+
+    root = pathlib.Path(atom.__file__).parent
+    opt_outs = {
+        str(p.relative_to(root)): p.read_text().count("hold=False")
+        for p in root.rglob("*.py")
+        if "hold=False" in p.read_text()
+    }
+    assert opt_outs == {
+        "model_ops/module_dispatch_ops.py": 1,  # TP all-reduce
+        "model_ops/moe.py": 3,  # DP gather, reduce_scatterv, unpadded RS
+        "utils/tbo/ubatching.py": 1,  # the docstring
+    }, opt_outs
 
 
 def test_side_stream_compressors_hold_their_gathered_inputs(monkeypatch):
