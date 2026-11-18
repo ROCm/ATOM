@@ -3434,7 +3434,7 @@ class TestPromptEndAnchorTemplateMargin:
     def test_a_conversation_takes_two_forwards_a_turn(self, interval):
         """One cut at the floored anchor and the rest of the prompt: 12 forwards
         over six turns, with or without a ladder on the chunk grid. Main cuts a
-        demand every turn."""
+        demand on four of the five later turns (16 forwards)."""
         bm = self._grid_bm(interval=interval)
         self._conversation(bm)
         assert (self.forwards, self._demand_cuts(bm)) == (12, 0)
@@ -3527,13 +3527,24 @@ class TestPromptEndAnchorTemplateMargin:
         self._run_turn(bm, p3)
         return [p3[: 5 * self.BLOCK] + self._fresh(self.BLOCK + 5) for _ in range(2)]
 
+    def _forks_below_an_offgrid_hit(self, bm):
+        """Forks two blocks above a hit off the chunk grid: a short header's
+        rung at 1 block, with the fork's own floor, 0, below it."""
+        header = self._fresh(self.BLOCK)
+        for _ in range(2):
+            self._run_turn(bm, header + self._fresh(3 * self.BLOCK + 5))
+        p3 = header + self._fresh(4 * self.BLOCK + 5)
+        self._run_turn(bm, p3)
+        return [p3[: 3 * self.BLOCK] + self._fresh(self.BLOCK + 5) for _ in range(2)]
+
     @pytest.mark.parametrize(
         "forks, resumed, dropped",
         [
             (_forks_one_chunk_up, [CHUNK, 2 * CHUNK], 0),
             (_forks_above_an_offgrid_hit, [3 * BLOCK, CHUNK], 1),
+            (_forks_below_an_offgrid_hit, [BLOCK, 3 * BLOCK], 0),
         ],
-        ids=["one_chunk_up", "offgrid_hit"],
+        ids=["one_chunk_up", "offgrid_hit", "floor_below_offgrid_hit"],
     )
     def test_a_demand_outside_the_dropped_shape_keeps_its_rung(
         self, forks, resumed, dropped

@@ -2745,8 +2745,11 @@ class BlockManager:
         The shape that pays for this is a template header whose checkpoint is
         invalidated before anyone reaches it — there each request cuts a chunk
         and none collects. What bounds that is convergence rather than a
-        threshold: found once, filled once, gone. `chunks_cut_for_demand`
-        against `demands_recorded` is where it would show if it did not.
+        threshold: found once, filled once, gone. On the LMCache chunk grid
+        the rung can settle at the header's chunk floor rather than at the
+        header, and every fork then recomputes the gap (below).
+        `chunks_cut_for_demand` against `demands_recorded` is where it would
+        show if it did not converge.
 
         `--no-state-checkpoint-demand` drops the rung and leaves the prompt-end
         anchor alone. Worth measuring: the rung is most of the write traffic
@@ -2799,9 +2802,13 @@ class BlockManager:
         # of cutting a second chunk and storing a second image every turn. A
         # real fork that close above a grid rung is dropped too: later requests
         # through it recompute at least that gap while the prefix is in HBM,
-        # and past HBM its off-grid demand is out of reach anyway. A hit at 0 is
-        # no floored anchor (one under a chunk never is), so a short shared
-        # header keeps its rung.
+        # and past HBM its off-grid demand is out of reach anyway. The rung can
+        # be the fork's own floor: a shared header S at least a chunk long and
+        # off the grid has its first demand floored to G, every later fork
+        # then hits G and drops its demand, and each request recomputes S - G
+        # for as long as the prefix stays in HBM, where one more cut would
+        # have let them resume at S. A hit at 0 is no floored anchor (one under
+        # a chunk never is), so a short shared header keeps its rung.
         chunk = self._joint_chunk_tokens
         hit_tokens = hit * self.hash_block_size
         if (
@@ -2945,11 +2952,13 @@ class BlockManager:
         # A hash block finer than the chunk (block 128 against chunk 1024
         # without DCP) otherwise loses 7 anchors in 8 once the prompt leaves
         # HBM. While it is still there, the next turn resumes from the floored
-        # anchor and recomputes under one chunk; the demand its KV would ask
-        # for just above is dropped (`_record_checkpoint_demand`), so the floor
-        # costs no extra cut. An anchor below one chunk stays put: the joint
-        # load has no whole chunk to restore it from, so flooring it to 0 would
-        # only take away its HBM reuse.
+        # anchor, up to one chunk below its KV, and the demand its KV would ask
+        # for just above is dropped (`_record_checkpoint_demand`). If the
+        # step-back above (`room`, the last-block cap) crosses a chunk
+        # boundary, the demand is kept and cut, as it would be without the
+        # floor. Either way the floor costs no extra cut. An anchor below one
+        # chunk stays put: the joint load has no whole chunk to restore it from,
+        # so flooring it to 0 would only take away its HBM reuse.
         chunk = self._joint_chunk_tokens
         if (
             chunk > self.hash_block_size
