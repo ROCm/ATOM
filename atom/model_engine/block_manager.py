@@ -178,13 +178,11 @@ def draft_kv_lookahead(
     `C - 1`, so it writes through `C + k - 1` and needs `k` positions past
     `len(seq)` -- one more than the serial count.
 
-    A position past the row's allocated blocks reads its block id from the
-    zeroed tail of the block table, so the write lands in physical block 0 --
-    another request's KV, or the units of a PAGE state checkpoint. For a
-    block drafter that is not hypothetical: a fully accepted step whose last
-    block position starts a new block writes the draft rows of physical
-    block 0, and a PAGE state checkpoint stored there is then restored
-    corrupted by every later request that hits its prefix.
+    A position past the row's allocated blocks resolves to physical block 0
+    through the zeroed block-table tail. PAGE-capable pools keep that block
+    reserved for padding; other pools may use it for live KV. Neither is a
+    valid destination for this row's draft writes, so its whole reach must
+    have allocated blocks even when a padding block is reserved.
     """
     k = max(0, int(num_speculative_tokens or 0))
     return k if block_drafter else max(0, k - 1)
@@ -300,6 +298,7 @@ class BlockManager:
             cache_policy=envs.ATOM_PREFIX_CACHE_POLICY,
             protected_ratio=envs.ATOM_PREFIX_CACHE_PROTECTED_RATIO,
             on_remap=self._note_index_change,
+            reserve_null_block=state_runtime.checkpoint_spec is not None,
         )
         # Per-request cache slot pool. Used by attention types with a
         # stateful per-request buffer (GDN recurrent state, V4 compressor
@@ -398,9 +397,6 @@ class BlockManager:
                 enabled=enabled,
                 readable_midstep=state_runtime.transfer.readable_midstep,
             )
-            if enabled:
-                # Checkpoint images live in KV blocks; block 0 must not be one.
-                self.kv.reserve_null_block()
         # The rolling state class: per-request slots plus a content index over
         # the free ones. A checkpoint IS a free slot whose content is still
         # valid, so it holds no capacity of its own and never blocks admission.
@@ -807,7 +803,7 @@ class BlockManager:
         server needs it published because `num_kvcache_blocks` is measured in
         the engine subprocess and its own Config never learns the value.
         """
-        capacity = self.kv.num_blocks
+        capacity = self.kv.num_usable_blocks
         # A prompt this long needs more than `capacity` blocks on some rank, so
         # it bounds the search from above: each rank holds at least
         # `1 / dcp_world_size` of it, i.e. over `capacity` blocks' worth.
@@ -998,7 +994,7 @@ class BlockManager:
         return {
             "used": used,
             "free": free,
-            "total": self.kv.num_blocks,
+            "total": self.kv.num_usable_blocks,
             "hashed": hashed,
             "retained": max(0, hashed - used),
             "evicted_total": self.total_evicted_blocks,
@@ -3760,7 +3756,7 @@ class BlockManager:
         `lookahead` positions past that (`draft_kv_lookahead`). Checking that
         the pool has room (`can_append`) is not the same as allocating it: a
         position past the last allocated block reads block id 0 from the zeroed
-        block-table tail, and the write lands in whoever owns physical block 0.
+        block-table tail, overwriting the padding block or unrelated live KV.
         """
         # Note: in disaggregated (P/D) mode the scheduler skips the
         # `num_new_tokens` half on the first decode step after remote prefill,
