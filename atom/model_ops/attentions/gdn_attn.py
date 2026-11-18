@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
 import logging
 import math
 from collections.abc import Sequence
@@ -61,6 +62,15 @@ LINEAR_STATE_ROWS = "linear_state"
 
 # Spare state slots, so a full batch still has scratch to build decode images in.
 DECODE_SNAPSHOT_SCRATCH_SLOTS = 4
+
+
+@functools.cache
+def _log_no_decode_checkpoints() -> None:
+    logger.warning(
+        "Decode-time state checkpoints are off: the PAGE image has planes "
+        "beyond conv and SSM that a decode boundary's image does not rebuild."
+    )
+
 
 _GDN_SSM_DTYPES = {
     "fp32": torch.float32,
@@ -639,7 +649,10 @@ class GDNStateMixin(PoolRowsMixin):
         until its builder rebuilds them too."""
         if not (self.replayssm or self.num_spec):
             return KEEP_SETTLED
-        return KEEP_SNAPSHOT if len(self._checkpoint_plane_shapes()) == 2 else KEEP_NONE
+        if len(self._checkpoint_plane_shapes()) == 2:
+            return KEEP_SNAPSHOT
+        _log_no_decode_checkpoints()
+        return KEEP_NONE
 
     def num_state_layers(self) -> int:
         """Layers holding a recurrent state, one slot each.
