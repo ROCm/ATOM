@@ -2437,26 +2437,39 @@ class Config:
     def pcp_group_size(self) -> int:
         return pcp_group_size_of(self)
 
+    def _tp_node_slice(self) -> tuple[int | None, int]:
+        """`(tensor_parallel_size_local, tensor_parallel_rank)` for this node.
+
+        In plugin mode the host framework launches and places the TP workers,
+        and `parallel_config` may be the host's own object (vLLM's has neither
+        field). Cross-node TP is a native-server feature, so a plugin run is
+        always the single-node case: all ranks from rank 0.
+        """
+        if self.plugin_config is not None:
+            return None, 0
+        pc = self.parallel_config
+        return pc.tensor_parallel_size_local, pc.tensor_parallel_rank
+
     @property
     def tp_size_local(self) -> int:
         """TP worker processes on this node: fewer than `tp_world_size` when
         one TP group spans several nodes."""
-        local = self.parallel_config.tensor_parallel_size_local
+        local, _ = self._tp_node_slice()
         return self.tp_world_size if local is None else local
 
     @property
     def tp_rank_start(self) -> int:
         """First TP rank on this node; it runs `tp_size_local` ranks from here."""
-        return self.parallel_config.tensor_parallel_rank
+        return self._tp_node_slice()[1]
 
     @property
     def is_multinode_tp(self) -> bool:
         return self.tp_size_local < self.tp_world_size or self.tp_rank_start > 0
 
     def _check_multinode_tp(self) -> None:
-        pc = self.parallel_config
-        if pc.tensor_parallel_size_local is None and pc.tensor_parallel_rank == 0:
+        if self._tp_node_slice() == (None, 0):
             return
+        pc = self.parallel_config
         local, start, tp = self.tp_size_local, self.tp_rank_start, self.tp_world_size
         if local < 1 or tp % local or start % local or not 0 <= start < tp:
             raise ValueError(

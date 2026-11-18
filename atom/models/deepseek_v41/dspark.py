@@ -43,7 +43,7 @@ from atom.models.deepseek_v4_dspark import (
     DSparkMarkovHead,
     _DSparkInner,
 )
-from atom.models.dspark_draft import DSparkDraftModel
+from atom.models.dspark_draft import DSparkDraftModel, VocabShard
 from atom.spec_decode.drafter import AuxCaptureSpec
 from atom.utils import envs
 
@@ -715,11 +715,50 @@ class DeepseekV41DSpark(DSparkDraftModel):
     _head_and_sample = _DSparkInner.head_and_sample
     forward_head = _DSparkInner.forward_head
 
-    def head_and_sample(self, out, anchor_ids, num_draft):
+    # `head_and_sample` draws the block through the bound `draft_sampling`, so
+    # `DSparkProposer` may arm lossless sampling here; its drafts are verified
+    # as one block.
+    supports_lossless_draft = True
+    lossless_block_verify = True
+
+    @property
+    def markov_head(self):
+        """The last stage's Markov head, the one the block is sampled with."""
+        return self.mtp[-1].markov_head
+
+    def head_and_sample(self, out, anchor_ids, num_draft, *, greedy=False):
         # `num_draft` is the shared surface's; the width rides `out[1]`.
+        if self.draft_sampling is not None and not greedy:
+            return self._head_and_sample_q(*out, anchor_ids)
         if self._sharded_markov_sample():
             return self._head_and_sample_sharded(*out, anchor_ids)
         return self._head_and_sample(*out, anchor_ids)
+
+    def _head_and_sample_q(self, normed, hc_hidden, anchor_ids):
+        """The lossless block: each x_k drawn from, and its q published to,
+        the bound `draft_sampling` (`DSparkMarkovHead.sample_block`). Where the
+        greedy block keeps the LM head sharded (`_sharded_markov_sample`), so
+        does this one: the ranks exchange tile partials, histograms and their
+        share of the stored entries rather than the logits, and store and
+        draw what the whole vocab would (`dspark_markov_sample_tp`)."""
+        B, T, _ = hc_hidden.shape
+        head, markov = self.head, self.mtp[-1].markov_head
+        shard = None
+        if self._sharded_markov_sample():
+            base_logits = tgemm.mm(normed, head.weight).view(B, T, -1)  # [B,T,V/tp]
+            shard = VocabShard(
+                head.vocab_start_idx, get_tp_group(), envs.ATOM_USE_CUSTOM_ALL_GATHER
+            )
+        else:
+            base_logits = head.get_logits(normed).view(B, T, -1)  # [B, T, V]
+        out_ids = markov.sample_block(
+            base_logits, anchor_ids, self.draft_sampling, shard
+        )
+        # The confidence head reads W1[x_{k-1}], which the greedy op hands over
+        # and the sampled one does not.
+        prev_ids = torch.cat([anchor_ids[:, None], out_ids[:, :-1]], dim=1)
+        confidence = self.mtp[-1].confidence_head(hc_hidden, markov.markov_w1(prev_ids))
+        return out_ids, confidence
 
     def _sharded_markov_sample(self) -> bool:
         """Whether the block is sampled off this rank's vocab shard.
