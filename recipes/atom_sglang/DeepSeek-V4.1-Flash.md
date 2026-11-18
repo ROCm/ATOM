@@ -76,6 +76,13 @@ allocated it, instead of waiting for the step in flight. Both are on by default.
 `ATOM_SGLANG_V41_PREFILL_TOKEN_GRAPHS=0` (all prefills eager), `ATOM_SGLANG_V41_PREFILL_TOKEN_GRAPHS_RADIX=0` (steps
 carrying a radix replay eager), `ATOM_SGLANG_V41_EXTEND_ROWS_AT_ALLOC=0` (read the rows back at staging).
 
+After recording them, ATOM runs one eager prefill at the chunk budget (`min(--chunked-prefill-size, builder budget)`
+rows, 8192 with the launch above, split over two sequences under DSpark), as native ATOM's start-up warm-up does. It
+runs on the graph-capture STATE slots and SGLang's padding page, so no request state is touched, and adds about 0.75 s
+to start-up (logged as `eager prefill warm-up of 8192 rows (4096+4096)`). Without it the first chunk-sized prefill after
+a start pays the eager path's first-use costs (kernel loads, allocator growth), about 0.4 s on the first wave's TTFT.
+Kill switch: `ATOM_SGLANG_V41_PREFILL_WARMUP=0`.
+
 A long prompt is prefilled in chunks of `--chunked-prefill-size`. A chunk that leaves at least 128 rows of its prompt
 for later chunks runs layers 0-19 and layer 20's compression only. The decoder layers (20-39) and the DSpark draft
 context write run on the chunk that ends the prompt, as in native ATOM. This saves about 23 ms of GPU time per 8k-token
@@ -177,7 +184,8 @@ opener in all 64 threads at once, which added about 2.5 s to the first wave's TT
 
 The p99 is set by the first wave (64 prompts at once), whose mean TTFT is 1.31-1.34 s on a server that has served
 before and 1.77-1.79 s on the first run after start-up (native 1.46 s, fresh server), whatever
-`--max-running-requests`. At 32 clients the setting
+`--max-running-requests`; these runs predate the start-up eager prefill warm-up (see Prefill), which brings the first
+run after start-up to 1.37-1.39 s. At 32 clients the setting
 changes nothing (wall 158.0 s with 80, 160.1 s with 64, native 158.0 s); acceptance (49.6% with 80, native 49.3%,
 z = 0.90) and lm_eval GSM8K 3-shot (0.922 with 80, 0.920 with 64, native 0.923) are unchanged.
 
@@ -232,6 +240,7 @@ A 598-token request arriving into 31 decoding requests makes the decode round th
 (native: 154 ms; a round without a prefill is 69 ms); a 4096-token one 323 ms (native: 320 ms). A 598-token request that
 hits the radix cache (512 tokens cached) makes it 121 ms.
 
-With `--skip-server-warmup`, the first requests after a server start wait longer for their first token (first-wave TTFT
-1.8-2.9 s at concurrency 32, native 0.9-1.4 s). A server warmup that covers prefill shapes is expected to remove that,
-but this has not been measured.
+With `--skip-server-warmup` and the eager prefill warm-up above, the first wave after a start (3-shot GSM8K, 64
+clients, after 104 short chat requests) has a mean TTFT of 1.37-1.39 s: 1.78-1.84 s without the warm-up, 1.33-1.34 s
+on a server that has served before, 1.46 s for native ATOM on a fresh server. Earlier first-wave numbers for this
+recipe (1.8-2.9 s at 32 clients) also included 1.3-2.5 s spent in the benchmark client's own HTTP set-up.
