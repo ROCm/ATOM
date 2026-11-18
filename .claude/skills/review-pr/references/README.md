@@ -21,20 +21,18 @@ This lives here rather than in `SKILL.md` because `SKILL.md` is injected into ev
 prompt and is held to a 500-line budget; provenance a reviewer reads once does not need to
 cost attention on every run.
 
-
 ## Asking for a run
 
 SKILL.md: "when the action is `run something`, ask for ONE run." The record behind it,
-from ATOM reviews labelled by whether the author acted -- nine judged asks, five carried
-out and four not:
+from ATOM reviews labelled by whether the author acted. Seven of them are asks to RUN
+something -- three carried out, four not. (Two more judged asks in the same family were
+code changes, not runs, and are left out rather than padding the count.)
 
 | | ask | outcome |
 |---|---|---|
 | ✅ | ATOM#3165 "rebase onto current main and re-run the CPU suite and the `ci:atom` heavy jobs" | done |
-| ✅ | ATOM#3165 "the retarget to main plus the `ci:atom` label once #3173 lands" | done |
-| ✅ | ATOM#3275 "one GPU A/B ... once a GPU host is available" | posted 17 h later |
+| ✅ | ATOM#3275 "one GPU A/B ... once a GPU host is available" (two arms, one node, one sitting) | posted 17 h later |
 | ✅ | ATOM#3323 "re-run at least one 512c arm on the final head" | came back with the table |
-| ✅ | ATOM#3323 "replace the call with `lookup_pending(head)` and delete the test stub" | done |
 | ❌ | ATOM#3165 "rebase, re-home `running=self.running` in the refactored `_schedule`, and re-run" | three things, none done |
 | ❌ | ATOM#3165 "admission off vs W only vs W + 512 ... post req/s, errors and preemptions" | merged with the box still empty, after 12 commits |
 | ❌ | ATOM#3306 "GSM8K plus staged/landed throughput on this exact head" | merged unmet, after 14 commits |
