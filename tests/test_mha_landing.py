@@ -278,17 +278,13 @@ def test_chunks_use_receive_global_page_offsets_and_sequences(rank, cached, devi
 
 @pytest.mark.parametrize("rank", range(4))
 @pytest.mark.parametrize("chunks", [False, True])
-@pytest.mark.parametrize("capacity", ["source_too_small", "exact"])
-def test_page_capacity_fallback_preserves_bytes_and_completion(
-    rank, chunks, capacity, device
-):
+def test_a_slot_one_destination_page_wide_stages_every_page(rank, chunks, device):
     h = Harness(LAST, rank, device=device)
     page_bytes = h.owned_page_bytes()
-    # A full P PAGE is wider than its destination head slice. The exact-fit
-    # case must still stage, even though P's PAGE would not fit in the slot.
+    # A full P PAGE is wider than its destination head slice, which alone has
+    # to fit the slot.
     assert max(h.c._per_block_bytes_list) > page_bytes
-    slot_bytes = page_bytes - 4 if capacity == "source_too_small" else page_bytes
-    h.c._kv_staging = torch.empty((1, slot_bytes), dtype=torch.uint8, device=device)
+    h.c._kv_staging = torch.empty((1, page_bytes), dtype=torch.uint8, device=device)
     src, dst = [3, 1, 2], [2, 0, 3]
     if chunks:
         for offset in range(3):
@@ -297,19 +293,14 @@ def test_page_capacity_fallback_preserves_bytes_and_completion(
     else:
         assert h.send(src, dst)
     h.check(src, dst)
-    assert bool(h.ready) == (capacity == "exact")
+    assert h.ready
     base = h.c._kv_staging.data_ptr()
     staged_sources = [
-        base <= address < base + slot_bytes
+        base <= address < base + page_bytes
         for sources, _, _ in h.writes
         for address in sources
     ]
-    assert staged_sources
-    assert (
-        all(staged_sources)
-        if capacity != "source_too_small"
-        else not any(staged_sources)
-    )
+    assert staged_sources and all(staged_sources)
     assert h.c._kv_staging_slots.free == [0]
     h.recv.stage_done(21, h.pp_rank, 3, True, h.req.get("_landed_slots", []))
     assert h.finished == [(21, False)]

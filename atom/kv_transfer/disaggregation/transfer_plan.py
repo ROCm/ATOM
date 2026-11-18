@@ -3,9 +3,10 @@
 
 """Map P/D rank ownership to physical gather units and destination PAGEs.
 
-Topology selects token ownership and TP partition/replication. Region metadata
-selects byte addressing. The transport consumes TransferPlan without knowing
-whether the model uses MLA, MHA, or another attention family.
+Topology selects token ownership; a PAGE plan takes the head cuts its caller
+already validated. Region metadata selects byte addressing. The transport
+consumes TransferPlan without knowing whether the model uses MLA, MHA, or
+another attention family.
 """
 
 from __future__ import annotations
@@ -21,21 +22,15 @@ from atom.kv_transfer.disaggregation.sharded_transfer import (
     DCPShardPlan,
     build_dcp_shard_plan,
     coalesce_contiguous,
-    consumer_head_slices,
     pack_slots,
 )
 
 TOKEN_UNITS = "token_rows_v1"
-# Preserve the PAGE wire identifier used by the first implementation.
-PAGE_UNITS = "mha_pages_v1"
+PAGE_UNITS = "page_units_v1"
 
 
 @dataclass(frozen=True)
 class TransferTopology:
-    source_tp: int = 1
-    source_dcp: int = 1
-    target_tp: int = 1
-    target_tp_rank: int = 0
     target_dcp: int = 1
     target_dcp_rank: int = 0
     interleave: int = 1
@@ -48,8 +43,6 @@ class RegionLayout:
     target_base: int
     source_page_bytes: int
     target_page_bytes: int
-    source_head_runs: tuple[int, int] | None = None
-    target_head_runs: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -67,14 +60,6 @@ class TransferPlan:
     destination_pages: np.ndarray
     units_per_page: int
     wire_layout: str
-
-    @property
-    def minimum_slot_bytes(self) -> int:
-        """Space for one destination PAGE after token/head ownership mapping."""
-        return max(
-            (r.gather.unit_bytes * self.units_per_page for r in self.regions),
-            default=0,
-        )
 
     def pack(self, slot_bytes: int) -> list[list[tuple[int, int, int, int]]]:
         return pack_slots(
@@ -124,34 +109,24 @@ class TransferPlan:
         return tuple(np.concatenate(part).tolist() for part in zip(*runs))
 
 
-def _page_gather(layout: RegionLayout, t: TransferTopology) -> GatherLayout:
-    """One whole PAGE, or the target TP rank's heads of each head-major run."""
-    src, dst = layout.source_page_bytes, layout.target_page_bytes
-    if t.source_tp != t.target_tp:
-        if t.source_tp != 1:
-            raise ValueError("TP repartition requires a TP1 producer")
-        cuts = consumer_head_slices(
-            src,
-            dst,
-            layout.source_head_runs,
-            layout.target_head_runs,
-            t.target_tp_rank,
-            t.target_tp,
-            f"region {layout.source_region}",
-        )
-    else:
-        if src != dst or layout.source_head_runs != layout.target_head_runs:
-            raise ValueError("Equal TP requires matching physical layouts")
-        cuts = np.array([[0, 0, src]], dtype=np.int64)
-    first, width = int(cuts[0, 0]), int(cuts[0, 2])
-    stride = int(cuts[1, 0]) - first if len(cuts) > 1 else src
-    if dst != width * len(cuts) or any(
-        (int(cuts[i, 0]), int(cuts[i, 1]), int(cuts[i, 2]))
-        != (first + i * stride, i * width, width)
-        for i in range(len(cuts))
-    ):
-        raise ValueError("Nonuniform head runs need a physical layout adapter")
-    return GatherLayout(src, dst, first, stride, width)
+def page_transfer_plan(
+    regions: Sequence[PlannedRegion],
+    source_pages: Sequence[int],
+    destination_pages: Sequence[int],
+) -> TransferPlan:
+    """Plan one destination PAGE per source PAGE.
+
+    Each region's gather already holds the consumer rank's cut of a source
+    PAGE (``GatherLayout.from_slices`` over the connector's validated head
+    cuts), so the plan only pairs the two block lists.
+    """
+    return TransferPlan(
+        tuple(regions),
+        np.asarray(source_pages, dtype=np.int64),
+        np.asarray(destination_pages, dtype=np.int64),
+        1,
+        PAGE_UNITS,
+    )
 
 
 def build_transfer_plan(
@@ -163,34 +138,17 @@ def build_transfer_plan(
     *,
     token_ownership: DCPShardPlan | None = None,
 ) -> TransferPlan:
-    """Plan a non-DCP producer's PAGEs onto one consumer rank.
+    """Plan a non-DCP producer's PAGEs onto one DCP consumer rank.
 
     PP layer ownership is already expressed by each region's source/target map.
     DCP ownership is calculated before addressing bytes; a TP-replicated plane
-    is owned by token alone, whatever the two TP sizes, and each region's
-    source and target PAGEs must be equally wide and hold whole token rows.
-    Without DCP, TP head splitting or replication is applied using declared
-    head runs. A simultaneous token and head repartition needs a composed
-    physical adapter and is explicitly refused. token_ownership may reuse the
-    same topology's plan from the direct/index path, so a mixed-region
-    transfer does not calculate DCP ownership twice.
+    is owned by token alone, whatever the two TP sizes. Each region's source
+    and target PAGEs must be equally wide and hold whole token rows.
+    token_ownership may reuse the same topology's plan from the direct/index
+    path, so a mixed-region transfer does not calculate DCP ownership twice.
     """
     t = topology
-    source_pages = np.asarray(source_pages, dtype=np.int64)
     destination_pages = np.asarray(destination_pages, dtype=np.int64)
-    if t.target_dcp == 1:
-        if source_pages.size != destination_pages.size:
-            raise ValueError("Source/destination PAGE count mismatch")
-        regions = tuple(
-            PlannedRegion(
-                layout.source_region,
-                layout.target_region,
-                layout.target_base,
-                _page_gather(layout, t),
-            )
-            for layout in layouts
-        )
-        return TransferPlan(regions, source_pages, destination_pages, 1, PAGE_UNITS)
     ownership = (
         token_ownership
         if token_ownership is not None
@@ -206,12 +164,6 @@ def build_transfer_plan(
     indices = ownership.source_token_per_dst_token()[: ownership.landing_row_count()]
     regions = []
     for layout in layouts:
-        if t.source_tp != t.target_tp and (
-            layout.source_head_runs or layout.target_head_runs
-        ):
-            raise ValueError(
-                "Combined token/head repartition needs a physical layout adapter"
-            )
         width = layout.source_page_bytes // block_size
         regions.append(
             PlannedRegion(

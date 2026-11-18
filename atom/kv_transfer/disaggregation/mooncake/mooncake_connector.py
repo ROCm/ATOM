@@ -41,7 +41,7 @@ from atom.kv_transfer.disaggregation.chunked_prefill import (
     PrefillHandoff,
     chunked_topology_supported,
 )
-from atom.kv_transfer.disaggregation.gather import gather_units
+from atom.kv_transfer.disaggregation.gather import GatherLayout, gather_units
 from atom.kv_transfer.disaggregation.mooncake.endpoint import (
     DEFAULT_HANDSHAKE_PORT,
     producer_endpoint,
@@ -83,10 +83,12 @@ from atom.kv_transfer.disaggregation.staging_config import (
 from atom.kv_transfer.disaggregation.transfer_plan import (
     PAGE_UNITS,
     TOKEN_UNITS,
+    PlannedRegion,
     RegionLayout,
     TransferPlan,
     TransferTopology,
     build_transfer_plan,
+    page_transfer_plan,
 )
 from atom.kv_transfer.disaggregation.types import (
     INDEX_CACHE_FP4_PREFIX,
@@ -3337,30 +3339,21 @@ class MooncakeConnector(KVConnectorBase):
 
         staged_regions: list[tuple[int, int, int]] = []
         staged_token_regions: list[int] = []
-        # Head cuts are already in `plan`. Stage them when the destination
-        # slice fits; a slot that cannot hold that slice keeps the direct
-        # descriptors below. `plan` stays the unit plan either way.
+        # `plan` already holds the validated head cuts; stage them as whole
+        # destination PAGEs, or write them with the descriptors below.
         if (
             plan.cuts is not None
             and self._kv_staging is not None
             and kv_cache_ready_event is not None
         ):
-            staging_plan = self._make_staging_plan(
+            return self._execute_staged_transfer(
                 request_data,
-                src_block_ids,
-                dst_block_ids,
-                cmap,
-                list(range(num_regions)),
+                target,
+                self._make_page_plan(request_data, plan, src_block_ids, dst_block_ids),
+                req_id,
+                kv_cache_ready_event,
+                engine=engine,
             )
-            if staging_plan.minimum_slot_bytes <= self._kv_staging.shape[1]:
-                return self._execute_staged_transfer(
-                    request_data,
-                    target,
-                    staging_plan,
-                    req_id,
-                    kv_cache_ready_event,
-                    engine=engine,
-                )
         source_blocks = np.asarray(src_block_ids, dtype=np.int64)
         destination_blocks = np.asarray(dst_block_ids, dtype=np.int64)
         for region_idx in range(num_regions):
@@ -3471,16 +3464,34 @@ class MooncakeConnector(KVConnectorBase):
                         return False
         return True
 
-    def _target_head_runs(self, request):
-        """Head runs per consumer region, from the unit layout or an explicit list."""
-        explicit = request.get("consumer_head_major_runs")
-        if explicit is not None:
-            return explicit
-        raw = request.get("consumer_unit_layout")
-        if not raw:
-            return None
-        units = msgpack.loads(raw) if isinstance(raw, (bytes, bytearray)) else raw
-        return [unit[5] for unit in units]
+    def _make_page_plan(
+        self,
+        request: dict,
+        plan: _UnitPlan,
+        src_pages: list[int],
+        dst_pages: list[int],
+    ) -> TransferPlan:
+        """`plan`'s head cuts as one staged write of whole destination PAGEs."""
+        bases = request["consumer_base_addrs"]
+        return self._check_staging_sources(
+            page_transfer_plan(
+                [
+                    PlannedRegion(
+                        region,
+                        consumer,
+                        bases[consumer],
+                        GatherLayout.from_slices(
+                            self._per_block_bytes_list[region], dst_bytes, rows
+                        ),
+                    )
+                    for region, (consumer, (dst_bytes, rows)) in enumerate(
+                        zip(plan.cmap, plan.cuts)
+                    )
+                ],
+                src_pages,
+                dst_pages,
+            )
+        )
 
     def _make_staging_plan(
         self,
@@ -3494,8 +3505,6 @@ class MooncakeConnector(KVConnectorBase):
     ) -> TransferPlan:
         """Resolve rank ownership before byte addressing; no attention-family dispatch."""
         widths = request.get("consumer_block_bpb")
-        source_runs = self._block_head_major_runs
-        target_runs = self._target_head_runs(request)
         layouts = []
         for region in regions:
             consumer = cmap[region]
@@ -3507,24 +3516,10 @@ class MooncakeConnector(KVConnectorBase):
                     request["consumer_base_addrs"][consumer],
                     width,
                     widths[consumer] if widths is not None else width,
-                    source_head_runs=(
-                        tuple(source_runs[region])
-                        if source_runs and source_runs[region]
-                        else None
-                    ),
-                    target_head_runs=(
-                        tuple(target_runs[consumer])
-                        if target_runs and target_runs[consumer]
-                        else None
-                    ),
                 )
             )
         plan = build_transfer_plan(
             TransferTopology(
-                source_tp=self.tp_size,
-                source_dcp=self.dcp_size,
-                target_tp=request.get("consumer_tp_size", self.tp_size),
-                target_tp_rank=request.get("consumer_tp_rank", 0),
                 target_dcp=request.get("consumer_dcp_size", 1),
                 target_dcp_rank=request.get("consumer_dcp_rank", 0),
                 interleave=request.get("consumer_dcp_interleave", 1),
@@ -3535,6 +3530,10 @@ class MooncakeConnector(KVConnectorBase):
             self.block_size,
             token_ownership=token_ownership,
         )
+        return self._check_staging_sources(plan)
+
+    def _check_staging_sources(self, plan: TransferPlan) -> TransferPlan:
+        """`plan`, once every source unit it gathers is inside its staged view."""
         last_source_unit = int(plan.source_units.max(initial=-1))
         for region in plan.regions:
             view = self._kv_source_views[region.source_region]

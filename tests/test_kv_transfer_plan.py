@@ -2,18 +2,20 @@
 """Ownership is selected by topology, with physical layouts as separate inputs."""
 
 import ctypes
-from dataclasses import replace
 
 import pytest
 import torch
 
-from atom.kv_transfer.disaggregation.gather import gather_units
+from atom.kv_transfer.disaggregation.gather import GatherLayout, gather_units
+from atom.kv_transfer.disaggregation.sharded_transfer import consumer_head_slices
 from atom.kv_transfer.disaggregation.transfer_plan import (
     PAGE_UNITS,
     TOKEN_UNITS,
+    PlannedRegion,
     RegionLayout,
     TransferTopology,
     build_transfer_plan,
+    page_transfer_plan,
 )
 
 
@@ -81,11 +83,10 @@ def test_tp_rank_owns_its_heads_of_each_page(rank, heads):
     ids = [3, 0, 2]
     destination = torch.zeros(5, 8, 1, 4, dtype=torch.uint8)
     dst_ids = [4, 1, 3]
-    layout = RegionLayout(
-        0, 7, destination.data_ptr(), 32 * heads, 32, (8, heads), (8, 1)
-    )
-    plan = build_transfer_plan(
-        TransferTopology(target_tp=4, target_tp_rank=rank), [layout], ids, dst_ids, 8
+    cuts = consumer_head_slices(32 * heads, 32, (8, heads), (8, 1), rank, 4, "page")
+    gather = GatherLayout.from_slices(32 * heads, 32, cuts)
+    plan = page_transfer_plan(
+        [PlannedRegion(0, 7, destination.data_ptr(), gather)], ids, dst_ids
     )
     assert plan.wire_layout == PAGE_UNITS
     execute_plan(plan, source, destination)
@@ -95,22 +96,14 @@ def test_tp_rank_owns_its_heads_of_each_page(rank, heads):
     assert plan.regions[0].target_region == 7  # explicit PP region mapping
 
 
-@pytest.mark.parametrize("source_tp", [1, 2, 4])
-@pytest.mark.parametrize("rank", range(4))
-def test_tp_replicated_units_can_also_be_partitioned_by_dcp(source_tp, rank):
-    # A replicated latent/auxiliary plane has no per-head TP axis. DCP still
-    # selects tokens whatever the producer and target TP sizes are.
+def test_tp_replicated_units_can_also_be_partitioned_by_dcp():
+    # A replicated latent/auxiliary plane has no per-head TP axis, so DCP
+    # alone selects its tokens: the topology names no TP size.
     source = torch.arange(64, dtype=torch.uint8).view(2, 8, 4)
     destination = torch.full((3, 8, 4), 255, dtype=torch.uint8)
     layout = RegionLayout(0, 0, destination.data_ptr(), 32, 32)
     plan = build_transfer_plan(
-        TransferTopology(
-            source_tp=source_tp,
-            target_tp=4,
-            target_tp_rank=rank,
-            target_dcp=2,
-            target_dcp_rank=1,
-        ),
+        TransferTopology(target_dcp=2, target_dcp_rank=1),
         [layout],
         [1, 0],
         [2],
@@ -120,19 +113,6 @@ def test_tp_replicated_units_can_also_be_partitioned_by_dcp(source_tp, rank):
     assert plan.wire_layout == TOKEN_UNITS
     assert torch.equal(destination[2], source[[1, 0]].reshape(16, 4)[1::2])
     assert (destination[:2] == 255).all()
-
-
-def test_unsupported_layouts_and_topologies_are_rejected():
-    layout = RegionLayout(0, 0, 0, 128, 128)
-    dcp = TransferTopology(target_dcp=4)
-    heads = replace(layout, source_head_runs=(8, 4))
-    with pytest.raises(ValueError, match="Combined token/head"):
-        build_transfer_plan(replace(dcp, target_tp=4), [heads], [0], [0], 8)
-    page = RegionLayout(0, 0, 0, 128, 32, (8, 4), (8, 1))
-    with pytest.raises(ValueError, match="TP1 producer"):
-        build_transfer_plan(
-            TransferTopology(source_tp=2, target_tp=4), [page], [0], [0], 8
-        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU buffer allocation")
