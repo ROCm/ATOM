@@ -43,6 +43,7 @@ struct Selection {
     active_requests: usize,
     branch: &'static str,
     match_ratio: Option<f64>,
+    media_count: usize,
 }
 
 /// Clients can send the header, so it only applies once the operator enables sampling.
@@ -85,10 +86,11 @@ pub(crate) fn record_selection(
     worker: Option<&Arc<dyn Worker>>,
     branch: &'static str,
     match_ratio: Option<f64>,
+    media_count: usize,
 ) {
     let _ = TRACE.try_with(|trace| {
         let Some(worker) = worker else {
-            info!(target: "mesh::route", pool, policy, branch, "No worker selected");
+            info!(target: "mesh::route", pool, policy, branch, media_count, "No worker selected");
             return;
         };
         let mut selections = trace.selections.borrow_mut();
@@ -100,6 +102,7 @@ pub(crate) fn record_selection(
             active_requests: worker.load(),
             branch,
             match_ratio,
+            media_count,
         });
     });
 }
@@ -122,6 +125,7 @@ pub(crate) fn record_dispatch(pool: &'static str, worker: &Arc<dyn Worker>) {
                 .map(|selection| selection.url.as_str()),
             match_ratio = selection.and_then(|selection| selection.match_ratio),
             active_requests = selection.map(|selection| selection.active_requests),
+            media_count = selection.map(|selection| selection.media_count),
             "Selected worker"
         );
     });
@@ -264,6 +268,7 @@ mod tests {
                 Some(&selected),
                 "affinity",
                 Some(0.75),
+                0,
             );
             record_dispatch("prefill", &prefill_rank(1));
         };
@@ -289,7 +294,14 @@ mod tests {
     async fn carried_work_dispatches_in_the_request_span_and_trace() {
         let sampled = logs(true, async {
             let selected = prefill_rank(0);
-            record_selection("prefill", "cache_aware", Some(&selected), "affinity", None);
+            record_selection(
+                "prefill",
+                "cache_aware",
+                Some(&selected),
+                "affinity",
+                None,
+                0,
+            );
             async {
                 let plain = async { record_dispatch("prefill", &prefill_rank(0)) };
                 tokio::spawn(plain).await.unwrap();
@@ -318,6 +330,7 @@ mod tests {
                 Some(&prefill_rank(0)),
                 "affinity",
                 Some(0.75),
+                0,
             );
             record_selection(
                 "prefill",
@@ -325,6 +338,7 @@ mod tests {
                 Some(&prefill_rank(1)),
                 "round_robin",
                 None,
+                0,
             );
             record_dispatch("prefill", &prefill_rank(1));
         })
@@ -341,7 +355,7 @@ mod tests {
     #[tokio::test]
     async fn a_selection_without_a_worker_logs_its_pool() {
         let sampled = logs(true, async {
-            record_selection("decode", "round_robin", None, "no_healthy_workers", None);
+            record_selection("decode", "round_robin", None, "no_healthy_workers", None, 0);
         })
         .await;
 
@@ -394,6 +408,43 @@ mod tests {
             ] {
                 assert!(sampled.contains(field), "missing {field} in\n{sampled}");
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_round_robin_selection_logs_the_requests_media_count() {
+        use crate::core::placement::RequestDescriptor;
+        use crate::core::placement::{policy_apply::apply_policy, test_support::*};
+        use crate::policies::RoundRobinPolicy;
+        use crate::routers::prepare::inference::{InferenceRequest, ParsedInference};
+
+        let image = |url: &str| serde_json::json!({"type": "image_url", "image_url": {"url": url}});
+        let body = serde_json::json!({"model": "m", "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "Which colors are these?"},
+            image("https://example.com/red.png"),
+            image("https://example.com/blue.png"),
+        ]}]});
+        let parsed =
+            ParsedInference::parse("/v1/chat/completions", body.to_string().as_bytes()).unwrap();
+        let metadata = parsed.metadata();
+        let descriptor = RequestDescriptor {
+            carries_media: metadata.carries_media,
+            media_count: metadata.media_count,
+            ..make_descriptor(Some("m"), Some(&metadata.text), None, None)
+        };
+        let candidates = [make_regular_http("http://w:8000", "m")];
+        let sampled = logs(true, async {
+            let policy = RoundRobinPolicy::new();
+            let worker = apply_policy(&candidates, &policy, &descriptor, None)
+                .await
+                .unwrap();
+            record_dispatch("regular", &worker);
+        })
+        .await;
+
+        assert_eq!(sampled.matches("Selected worker").count(), 1, "{sampled}");
+        for field in [r#"policy="round_robin""#, "media_count=2"] {
+            assert!(sampled.contains(field), "missing {field} in\n{sampled}");
         }
     }
 }

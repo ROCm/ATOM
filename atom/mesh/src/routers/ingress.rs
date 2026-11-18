@@ -713,9 +713,10 @@ impl IngressRouting {
         tokens: Tokens,
         ctx: &JobContext,
     ) -> Result<RoutingPreparation, IngressError> {
-        let metadata = parsed.metadata();
+        let (metadata, digested) = parsed.routing_metadata();
+        let chat = digested.as_ref().or(parsed.chat());
         let tokens = match tokens {
-            Tokens::Needed { wanted } => Some(self.tokens(parsed, &metadata, ctx, wanted)?),
+            Tokens::Needed { wanted } => Some(self.tokens(parsed, chat, &metadata, ctx, wanted)?),
             // The index cannot match media, and these APIs have no token-routing template.
             Tokens::Wanted
                 if metadata.carries_media
@@ -727,7 +728,7 @@ impl IngressRouting {
                 None
             }
             // With the special tokens, as ATOM's `tokenizer.encode(prompt)` stores the blocks.
-            Tokens::Wanted => match self.tokens(parsed, &metadata, ctx, true) {
+            Tokens::Wanted => match self.tokens(parsed, chat, &metadata, ctx, true) {
                 Ok(tokens) => Some(tokens),
                 // Routed by its text, unless the job is cancelled or late.
                 Err(error) => {
@@ -830,10 +831,11 @@ impl IngressRouting {
     }
 
     /// The request's `input_ids`, or its prompt encoded, with the tokenizer's special tokens
-    /// when `add_special_tokens`.
+    /// when `add_special_tokens`. A chat's prompt is `chat` templated.
     fn tokens(
         &self,
         parsed: &ParsedInference,
+        chat: Option<&crate::protocols::chat::ChatCompletionRequest>,
         metadata: &InferenceMetadata,
         ctx: &JobContext,
         add_special_tokens: bool,
@@ -869,14 +871,10 @@ impl IngressRouting {
         }
         ctx.check()?;
         let template_started = Instant::now();
-        let prompt = if let Some(chat) = parsed.chat() {
-            let routed = super::prepare::inference::with_media_digests(chat);
-            super::prepare::chat_template::process_chat_messages(
-                routed.as_ref().unwrap_or(chat),
-                &*entry.tokenizer,
-            )
-            .map_err(IngressError::invalid)?
-            .text
+        let prompt = if let Some(chat) = chat {
+            super::prepare::chat_template::process_chat_messages(chat, &*entry.tokenizer)
+                .map_err(IngressError::invalid)?
+                .text
         } else {
             metadata.text.clone()
         };

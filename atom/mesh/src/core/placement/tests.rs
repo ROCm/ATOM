@@ -585,6 +585,7 @@ mod c_regular_planning {
                 headers: None,
                 stream: false,
                 carries_media: false,
+                media_count: 0,
             })
             .await
             .unwrap();
@@ -618,6 +619,7 @@ mod c_regular_planning {
                 headers: None,
                 stream: false,
                 carries_media: false,
+                media_count: 0,
             })
             .await
             .unwrap();
@@ -642,6 +644,7 @@ mod c_regular_planning {
                 headers: None,
                 stream: false,
                 carries_media: false,
+                media_count: 0,
             })
             .await
             .unwrap();
@@ -781,6 +784,7 @@ mod d_pd_planning {
                 headers: None,
                 stream: false,
                 carries_media: false,
+                media_count: 0,
             })
             .await
             .unwrap();
@@ -895,6 +899,7 @@ mod d_pd_planning {
                 headers: None,
                 stream: false,
                 carries_media: false,
+                media_count: 0,
             })
             .await
             .unwrap();
@@ -1088,7 +1093,7 @@ mod e_adapter {
         let decode = make_decode_http("http://decode-1:8000", "m");
         let adapter = SglangAdapter;
         let ctx = adapter
-            .prepare_pair(prefill.as_ref(), decode.as_ref())
+            .prepare_pair(prefill.as_ref(), decode.as_ref(), false)
             .expect("prepare_pair");
         (adapter, ctx)
     }
@@ -1111,7 +1116,7 @@ mod e_adapter {
         let decode = make_decode_http("http://decode-2:8000", "m");
         let adapter = SglangAdapter;
         let ctx = adapter
-            .prepare_pair(prefill.as_ref(), decode.as_ref())
+            .prepare_pair(prefill.as_ref(), decode.as_ref(), false)
             .unwrap();
         let mut body = json!({});
         adapter.inject_prefill_fields(&mut body, &ctx).unwrap();
@@ -1201,7 +1206,7 @@ mod e_adapter {
         let decode = make_decode_http("http://decode:8000", "m");
         let adapter = VllmAdapter::new(vllm_info_with(prefill_url, dp_rank));
         let ctx = adapter
-            .prepare_pair(prefill.as_ref(), decode.as_ref())
+            .prepare_pair(prefill.as_ref(), decode.as_ref(), false)
             .expect("prepare_pair");
         (adapter, ctx)
     }
@@ -1278,7 +1283,7 @@ mod e_adapter {
         let decode = make_decode_http("http://decode:8000", "m");
         let adapter = VllmAdapter::new(vllm_info_with("http://other:8000", 0));
         let err = adapter
-            .prepare_pair(prefill.as_ref(), decode.as_ref())
+            .prepare_pair(prefill.as_ref(), decode.as_ref(), false)
             .unwrap_err();
         assert_eq!(
             err,
@@ -1335,7 +1340,7 @@ mod e_adapter {
         let decode = make_decode_http("http://decode:8000", "m");
         let adapter = VllmAdapter::new(vllm_info_with("http://p:8000", 7));
         let err = adapter
-            .prepare_pair(prefill.as_ref(), decode.as_ref())
+            .prepare_pair(prefill.as_ref(), decode.as_ref(), false)
             .unwrap_err();
         assert_eq!(
             err,
@@ -1376,6 +1381,7 @@ mod f_atom_adapter {
             prefill_dp_size: 2,
             prefill_dp_rank: Some(1),
             decode_dp_rank: None,
+            carries_media: false,
         });
         let mut p = json!({"prompt": [1, 2, 3], "stream": true, "max_tokens": 10});
         let mut d = p.clone();
@@ -1420,7 +1426,7 @@ mod f_atom_adapter {
         let decode = make_decode_http("http://decode:8000", "m");
         let adapter = AtomAdapter::new(atom_info_with(prefill_url, tp_size));
         let ctx = adapter
-            .prepare_pair(prefill.as_ref(), decode.as_ref())
+            .prepare_pair(prefill.as_ref(), decode.as_ref(), false)
             .expect("prepare_pair");
         (adapter, ctx)
     }
@@ -1541,6 +1547,7 @@ mod f_atom_adapter {
             prefill_dp_size: 4,
             prefill_dp_rank: Some(2),
             decode_dp_rank: Some(2),
+            carries_media: false,
         });
         let mut kv = json!({});
         adapter.enrich_decode_kv(&mut kv, &ctx).unwrap();
@@ -1595,6 +1602,7 @@ mod f_atom_adapter {
             prefill_dp_size: 1,
             prefill_dp_rank: None,
             decode_dp_rank: None,
+            carries_media: false,
         });
         let mut kv = json!({});
         let err = adapter.enrich_decode_kv(&mut kv, &ctx).unwrap_err();
@@ -1998,7 +2006,7 @@ mod h_integration {
 
         let adapter = SglangAdapter;
         let ctx = adapter
-            .prepare_pair(p.as_ref(), d.as_ref())
+            .prepare_pair(p.as_ref(), d.as_ref(), false)
             .expect("prepare");
         let mut prefill_body = json!({"prompt": "hello"});
         let mut decode_body = prefill_body.clone();
@@ -2059,7 +2067,7 @@ mod h_integration {
         });
         let adapter = VllmAdapter::new(info);
         let ctx = adapter
-            .prepare_pair(p.as_ref(), d.as_ref())
+            .prepare_pair(p.as_ref(), d.as_ref(), false)
             .expect("prepare");
 
         let mut prefill_body = json!({"prompt": "hi"});
@@ -2114,7 +2122,7 @@ mod h_integration {
         };
 
         let adapter = SglangAdapter;
-        let ctx = adapter.prepare_pair(p.as_ref(), d.as_ref()).unwrap();
+        let ctx = adapter.prepare_pair(p.as_ref(), d.as_ref(), false).unwrap();
         let mut body = json!({"prompt": ["a", "b", "c"]});
         adapter
             .inject_batch_prefill_fields(&mut body, &ctx, 3)
@@ -2154,6 +2162,7 @@ mod h_integration {
             headers: Some(&headers),
             stream: false,
             carries_media: false,
+            media_count: 0,
         };
 
         for _ in 0..2 {

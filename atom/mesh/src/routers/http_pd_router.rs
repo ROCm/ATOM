@@ -285,6 +285,7 @@ struct PDRequestContext<'a> {
     request_text: Option<&'a str>,
     tokens: Option<&'a [u32]>,
     carries_media: bool,
+    media_count: usize,
     model_id: Option<&'a str>,
     headers: Option<Arc<HeaderMap>>,
 }
@@ -299,6 +300,7 @@ impl<'a> PDRequestContext<'a> {
             request_text: Some(&metadata.text),
             tokens: None,
             carries_media: metadata.carries_media,
+            media_count: metadata.media_count,
             model_id: metadata.model.as_deref().filter(|model| !model.is_empty()),
             headers: headers.cloned().map(Arc::new),
         }
@@ -792,6 +794,7 @@ impl PDRouter {
             headers: context.headers.as_deref(),
             stream: context.is_stream,
             carries_media: context.carries_media,
+            media_count: context.media_count,
         };
         let plan = planner
             .plan(&descriptor)
@@ -809,7 +812,10 @@ impl PDRouter {
     ) -> Response {
         let prefill = placement.prefill.clone();
         let decode = placement.decode.clone();
-        let ctx = match self.adapter.prepare_pair(prefill.as_ref(), decode.as_ref()) {
+        let pair =
+            self.adapter
+                .prepare_pair(prefill.as_ref(), decode.as_ref(), context.carries_media);
+        let ctx = match pair {
             Ok(ctx) => ctx,
             Err(error) => return Self::handle_serialization_error(error),
         };
@@ -2307,6 +2313,7 @@ mod tests {
                 request_text: None,
                 tokens: None,
                 carries_media: false,
+                media_count: 0,
                 model_id: None,
                 headers: None,
             };
@@ -2959,6 +2966,7 @@ mod tests {
             request_text: None,
             tokens: None,
             carries_media: false,
+            media_count: 0,
             model_id: Some("m"),
             headers: Some(Arc::new(headers)),
         };

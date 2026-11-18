@@ -20,6 +20,8 @@ pub struct RequestDescriptor<'a> {
     pub headers: Option<&'a HeaderMap>,
     pub stream: bool,
     pub carries_media: bool,
+    /// Media items in the request, for the route trace.
+    pub media_count: usize,
 }
 
 #[derive(Debug)]

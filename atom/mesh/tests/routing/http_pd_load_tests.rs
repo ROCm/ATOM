@@ -159,7 +159,7 @@ fn dispatch_with_policy(
     info.tp_sizes.insert(prefill.url().to_string(), 1);
     let atom = Arc::new(AtomAdapter::new(Arc::new(info)));
     let ctx = atom
-        .prepare_pair(prefill.as_ref(), decode.as_ref())
+        .prepare_pair(prefill.as_ref(), decode.as_ref(), false)
         .unwrap();
     router.atom_adapter = Some(atom);
     tokio::spawn(async move {
@@ -171,6 +171,7 @@ fn dispatch_with_policy(
             request_text: None,
             tokens: None,
             carries_media: false,
+            media_count: 0,
             model_id: None,
             headers: headers.clone().map(Arc::new),
         };

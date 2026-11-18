@@ -52,6 +52,7 @@ impl BackendAdapter for VllmAdapter {
         &self,
         prefill: &dyn Worker,
         _decode: &dyn Worker,
+        _carries_media: bool,
     ) -> Result<PairCtx, AdapterError> {
         let prefill_url = prefill.url().to_string();
         let bootstrap_addr = self

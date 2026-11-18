@@ -461,6 +461,7 @@ impl RouterTrait for Router {
             headers: Some(&request.headers),
             stream: metadata.stream,
             carries_media: metadata.carries_media,
+            media_count: metadata.media_count,
         };
         let policy = self.policies.regular_policy(metadata.model.as_deref());
         let observation = crate::observability::request::RequestMetrics::new(

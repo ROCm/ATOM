@@ -17,8 +17,10 @@ pub struct InferenceMetadata {
     pub batch_size: Option<usize>,
     pub stream: bool,
     pub return_logprob: bool,
-    /// See [`ParsedInference::carries_media`]; set by `ParsedInference` only.
+    /// See [`ParsedInference::media_count`]; set by `ParsedInference` only.
     pub carries_media: bool,
+    /// See [`ParsedInference::media_count`]; set by `ParsedInference` only.
+    pub media_count: usize,
 }
 
 impl InferenceMetadata {
@@ -32,6 +34,7 @@ impl InferenceMetadata {
             stream: self.stream,
             return_logprob: self.return_logprob,
             carries_media: self.carries_media,
+            media_count: self.media_count,
         }
     }
 }
@@ -55,10 +58,7 @@ impl InferenceRequest for ChatCompletionRequest {
             route: "/v1/chat/completions",
             model: Some(self.model.clone()),
             text: if include_text {
-                match with_media_digests(self) {
-                    Some(routed) => routed.extract_text_for_routing(),
-                    None => self.extract_text_for_routing(),
-                }
+                self.extract_text_for_routing()
             } else {
                 String::new()
             },
@@ -66,6 +66,7 @@ impl InferenceRequest for ChatCompletionRequest {
             stream: self.is_stream(),
             return_logprob: self.logprobs,
             carries_media: false,
+            media_count: 0,
         }
     }
 }
@@ -74,13 +75,8 @@ impl InferenceRequest for ChatCompletionRequest {
 /// template tokens otherwise drop media or render it as an identity-free
 /// placeholder, so requests differing only in media would share a prefix the
 /// engine's media-keyed prefix cache never shares.
-pub(crate) fn with_media_digests(request: &ChatCompletionRequest) -> Option<ChatCompletionRequest> {
-    let has_media = request.messages.iter().filter_map(message_content).any(
-        |content| matches!(content, MessageContent::Parts(parts) if parts.iter().any(is_media)),
-    );
-    if !has_media {
-        return None;
-    }
+fn with_media_digests(request: &ChatCompletionRequest) -> Option<ChatCompletionRequest> {
+    media_parts(request).next()?;
     let mut routed = request.clone();
     for message in &mut routed.messages {
         let content = match message {
@@ -109,35 +105,34 @@ pub(crate) fn with_media_digests(request: &ChatCompletionRequest) -> Option<Chat
     Some(routed)
 }
 
-fn message_content(message: &ChatMessage) -> Option<&MessageContent> {
-    match message {
-        ChatMessage::System { content, .. }
-        | ChatMessage::User { content, .. }
-        | ChatMessage::Tool { content, .. }
-        | ChatMessage::Developer { content, .. } => Some(content),
-        ChatMessage::Assistant { content, .. } => content.as_ref(),
-        ChatMessage::Function { .. } => None,
-    }
+/// The image and video parts of a chat's messages.
+fn media_parts(request: &ChatCompletionRequest) -> impl Iterator<Item = &ContentPart> {
+    request
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            ChatMessage::System { content, .. }
+            | ChatMessage::User { content, .. }
+            | ChatMessage::Tool { content, .. }
+            | ChatMessage::Developer { content, .. } => Some(content),
+            ChatMessage::Assistant { content, .. } => content.as_ref(),
+            ChatMessage::Function { .. } => None,
+        })
+        .flat_map(|content| match content {
+            MessageContent::Parts(parts) => parts.as_slice(),
+            MessageContent::Text(_) => &[],
+        })
+        .filter(|part| !matches!(part, ContentPart::Text { .. }))
 }
 
-fn is_media(part: &ContentPart) -> bool {
-    !matches!(part, ContentPart::Text { .. })
-}
-
-/// Control characters keep a digest from matching client text.
+/// A digest marks its media's place in the routing text. Unlike a template's
+/// placeholder it differs by URL; client text that spells the same bytes
+/// would match it, which only merges routing keys, never request content.
 fn media_digest(kind: &str, url: &str) -> String {
     format!(
         "\u{1}{kind}:{:016x}\u{1}",
         xxhash_rust::xxh3::xxh3_64(url.as_bytes())
     )
-}
-
-/// Number of media digests `with_media_digests` put in a routing text.
-pub(crate) fn media_digest_count(text: &str) -> usize {
-    ["\u{1}image:", "\u{1}video:"]
-        .iter()
-        .map(|prefix| text.matches(prefix).count())
-        .sum()
 }
 
 impl InferenceRequest for CompletionRequest {
@@ -161,6 +156,7 @@ impl InferenceRequest for CompletionRequest {
             stream: self.is_stream(),
             return_logprob: self.logprobs.is_some(),
             carries_media: false,
+            media_count: 0,
         }
     }
 }
@@ -185,6 +181,7 @@ impl InferenceRequest for GenerateRequest {
             stream: self.is_stream(),
             return_logprob: self.return_logprob.unwrap_or(false),
             carries_media: false,
+            media_count: 0,
         }
     }
 }
@@ -357,32 +354,32 @@ impl ParsedInference {
     }
 
     /// Images, video, audio or embeddings, which the request's tokens do not show but an
-    /// engine keys every KV block of the prompt by.
-    pub(crate) fn carries_media(&self) -> bool {
+    /// engine keys every KV block of the prompt by: a chat's image and video
+    /// parts; a generate request's image, video and audio items (an array
+    /// counts its elements), and its `input_embeds` as one.
+    pub(crate) fn media_count(&self) -> usize {
         match self {
-            Self::Chat(chat) => chat.messages.iter().any(|message| {
-                let content = match message {
-                    ChatMessage::System { content, .. }
-                    | ChatMessage::User { content, .. }
-                    | ChatMessage::Tool { content, .. }
-                    | ChatMessage::Developer { content, .. } => Some(content),
-                    ChatMessage::Assistant { content, .. } => content.as_ref(),
-                    ChatMessage::Function { .. } => None,
-                };
-                let media = |part: &ContentPart| !matches!(part, ContentPart::Text { .. });
-                matches!(content, Some(MessageContent::Parts(parts)) if parts.iter().any(media))
-            }),
+            Self::Chat(chat) => media_parts(chat).count(),
             Self::Generate(generate) => {
-                let media = [
-                    &generate.image_data,
-                    &generate.video_data,
-                    &generate.audio_data,
-                    &generate.input_embeds,
-                ];
-                media.iter().any(|data| data.is_some())
+                let items = |data: &Option<serde_json::Value>| {
+                    data.as_ref()
+                        .map_or(0, |data| data.as_array().map_or(1, Vec::len))
+                };
+                items(&generate.image_data)
+                    + items(&generate.video_data)
+                    + items(&generate.audio_data)
+                    + usize::from(generate.input_embeds.is_some())
             }
-            Self::Completion(_) | Self::Messages(_) | Self::Responses(_) => false,
+            Self::Completion(_) | Self::Messages(_) | Self::Responses(_) => 0,
         }
+    }
+
+    /// Routing metadata with its text and, for a chat with media, the chat
+    /// with digests in place of its media, which token routing templates.
+    /// The digested chat is built once for both.
+    pub(crate) fn routing_metadata(&self) -> (InferenceMetadata, Option<ChatCompletionRequest>) {
+        let digested = self.chat().and_then(with_media_digests);
+        (self.metadata_of(digested.as_ref(), true), digested)
     }
 
     pub fn chat(&self) -> Option<&ChatCompletionRequest> {
@@ -412,11 +409,26 @@ impl Serialize for RoutingView<'_> {
 
 impl InferenceRequest for ParsedInference {
     fn metadata(&self) -> InferenceMetadata {
-        self.metadata_with_text(true)
+        self.routing_metadata().0
     }
     fn metadata_with_text(&self, include_text: bool) -> InferenceMetadata {
+        if include_text {
+            self.metadata()
+        } else {
+            self.metadata_of(None, false)
+        }
+    }
+}
+
+impl ParsedInference {
+    /// `digested` stands in for a chat's text.
+    fn metadata_of(
+        &self,
+        digested: Option<&ChatCompletionRequest>,
+        include_text: bool,
+    ) -> InferenceMetadata {
         let mut metadata = match self {
-            Self::Chat(r) => r.metadata_with_text(include_text),
+            Self::Chat(r) => digested.unwrap_or(r).metadata_with_text(include_text),
             Self::Completion(r) => r.metadata_with_text(include_text),
             Self::Generate(r) => r.metadata_with_text(include_text),
             Self::Messages(body) | Self::Responses(body) => {
@@ -451,10 +463,12 @@ impl InferenceRequest for ParsedInference {
                     stream: body["stream"].as_bool().unwrap_or(false),
                     return_logprob: false,
                     carries_media: false,
+                    media_count: 0,
                 }
             }
         };
-        metadata.carries_media = self.carries_media();
+        metadata.media_count = self.media_count();
+        metadata.carries_media = metadata.media_count > 0;
         metadata
     }
 }
@@ -629,8 +643,40 @@ mod tests {
             (generate(r#","input_embeds":[[0.1,0.2]]"#), true),
         ] {
             let parsed = ParsedInference::parse(route, body.as_bytes()).unwrap();
-            assert_eq!(parsed.carries_media(), media, "{body}");
+            assert_eq!(parsed.media_count() > 0, media, "{body}");
             assert_eq!(parsed.metadata_with_text(false).carries_media, media);
+        }
+    }
+
+    #[test]
+    fn media_count_counts_items() {
+        let image = r#"{"type":"image_url","image_url":{"url":"https://x/cat.png"}}"#;
+        let chat = format!(
+            r#"{{"model":"m","messages":[{{"role":"user","content":[{image},{{"type":"text","text":"hi"}},{image}]}}]}}"#
+        );
+        let generate = |media: &str| format!(r#"{{"input_ids":[1,2]{media}}}"#);
+        for ((route, body), count) in [
+            (("/v1/chat/completions", chat), 2),
+            (
+                ("/generate", generate(r#","image_data":["a.png","b.png"]"#)),
+                2,
+            ),
+            (
+                (
+                    "/generate",
+                    generate(r#","image_data":"a.png","audio_data":"a.wav""#),
+                ),
+                2,
+            ),
+            (
+                ("/generate", generate(r#","input_embeds":[[0.1],[0.2]]"#)),
+                1,
+            ),
+        ] {
+            let metadata = ParsedInference::parse(route, body.as_bytes())
+                .unwrap()
+                .metadata_with_text(false);
+            assert_eq!(metadata.media_count, count, "{body}");
         }
     }
 }
