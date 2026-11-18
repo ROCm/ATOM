@@ -13,6 +13,7 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
+from atom.models.kimi_k3.mono.config import MAX_ROWS
 from atom.models.kimi_k3.mono.kernels.stages.moe_layout import (
     EXPERTS,
     LATENT,
@@ -617,9 +618,11 @@ def herd_tag(launch):
 
 
 def herd_finalize_words(rows: int) -> dict[str, int]:
-    """LDS i32 words ``stage_herd_finalize`` needs for ``rows`` tokens."""
-    if rows * TOPK > _HERD_ROUTE_SLOTS:
-        raise ValueError(f"HERD finalize stages at most 48 rows, got {rows}")
+    """LDS i32 words ``stage_herd_finalize`` needs for ``rows`` tokens: the
+    kept routes' at least 48 rows' (one layout up to 48)."""
+    if rows > MAX_ROWS:
+        raise ValueError(f"HERD finalize stages at most {MAX_ROWS} rows, got {rows}")
+    slots = max(_HERD_ROUTE_SLOTS, rows * TOPK)
     return {
         "popularity": EXPERTS,
         "counts": EXPERTS,
@@ -627,9 +630,9 @@ def herd_finalize_words(rows: int) -> dict[str, int]:
         "scan": 8,
         "ids": rows * (TOPK + 1),
         "values": rows * (TOPK + 1),
-        "kept_ids": _HERD_ROUTE_SLOTS,
-        "kept_weights": _HERD_ROUTE_SLOTS,
-        "slots": _HERD_ROUTE_SLOTS,
+        "kept_ids": slots,
+        "kept_weights": slots,
+        "slots": slots,
     }
 
 

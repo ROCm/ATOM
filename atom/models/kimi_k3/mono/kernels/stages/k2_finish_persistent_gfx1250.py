@@ -430,13 +430,21 @@ def build_packed_finish(
         name += fresh.suffix("finish") + ("" if unpack else fresh.suffix("moe"))
 
     sources = SOURCES
-    # It is the CTA before the routing ones, and its one shared-down task goes
-    # to the first CTA with a single one.
+    # It is the CTA before the routing ones, and its shared-down tasks (one,
+    # or two past 62 rows) go to the first other CTAs with a single one.
     herd_cta = plan.blocks - rows - 1
     herd_at = herd_scratch_layout(rows)
     profile_at = profile_offset(rows, precompute_herd) // 4
     spare_cta = SHARED_DOWN_TASKS - plan.blocks
-    if precompute_herd and not spare_cta < herd_cta:
+    herd_tasks = [
+        task
+        for task in (herd_cta, herd_cta + plan.blocks)
+        if task < SHARED_DOWN_TASKS
+    ]
+    herd_takers = [
+        cta for cta in range(max(spare_cta, 0), plan.blocks) if cta != herd_cta
+    ][: len(herd_tasks)]
+    if precompute_herd and len(herd_takers) < len(herd_tasks):
         raise ValueError(
             f"no CTA takes the HERD CTA's shared-down task at {rows} rows"
         )
@@ -802,7 +810,10 @@ def build_packed_finish(
             second_task = bid + plan.blocks
             does_shared = True
             if const_expr(precompute_herd and not parallel_herd):
-                second_task = (bid == spare_cta).select(fx.Int32(herd_cta), second_task)
+                for taker, herd_task in zip(herd_takers, herd_tasks):
+                    second_task = (bid == taker).select(
+                        fx.Int32(herd_task), second_task
+                    )
                 does_shared = bid != herd_cta
             tasks = [bid, second_task]
             if const_expr(parallel_herd):
