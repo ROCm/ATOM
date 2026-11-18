@@ -7,8 +7,11 @@ scheduler. The validated configuration is TP4 on MI308X with SGLang 0.5.22.
 On MI308X (gfx942) the routed experts are converted to per-channel FP8 at load and run through aiter's `fused_moe`,
 which needs an aiter with ROCm/aiter#7820: without it the per-token FP8 MoE takes aiter's one-stage kernel, which drops
 the experts' SwiGLU clamp. Native ATOM has the same requirement. ATOM's V4.1 code also imports aiter's
-`get_mla_sparse_prefill_v41_backend` (ROCm/aiter#7407, on aiter main), so #7820 has to sit on a recent aiter main: the
-validated aiter is the #7820 head 7bec3c672 (aiter main 13b6e87ce plus #7820).
+`get_mla_sparse_prefill_v41_backend` (ROCm/aiter#7407) and, to build the DSpark draft's block-32 FP8 linears,
+`gemm_a8w8_blockscale_group32_supported` (ROCm/aiter#8086); without #8086 the draft fails to build with an
+ImportError. All three are merged, so an aiter main at ff2f0ce27 (#8086) or later has them. The validated aiter is
+the #7820 head 7bec3c672 (aiter main 13b6e87ce plus #7820) with #8086's `gemm_a8w8_blockscale_group32_supported`
+added to `aiter/ops/gemm_op_a8w8.py` (on gfx942 it returns False and those linears take the BF16 fallback).
 
 ## Launching Server
 
