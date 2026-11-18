@@ -19,6 +19,7 @@ from atom.model_ops.attentions.pool_layout.entry_arena import (
     EntryField,
     published_bytes_for,
 )
+from atom.model_ops.attentions.pool_layout.sub_pool_spec import plan_pools
 from atom.model_ops.attentions.qwen4_exp_attn import (
     PLE_STATE_SLOT_CLASS,
     Qwen4ExpBackend,
@@ -48,6 +49,7 @@ def _builder():
     builder.num_state_layers = lambda: 2
     builder._state_shape_for_runner = lambda: ((3, 4), (2, 2))
     builder._state_dtypes = lambda: (torch.bfloat16, torch.float32)
+    builder._replayssm_bytes_per_slot = lambda: 0
     builder.model_runner = SimpleNamespace(
         config=SimpleNamespace(
             torch_dtype=torch.bfloat16,
@@ -60,6 +62,8 @@ def _builder():
             decode_context_parallel_size=1,
             enable_tbo=False,
             enable_tbo_decode=False,
+            enable_prefix_caching=True,
+            state_checkpoint_interval_tokens=8192,
             speculative_config=SimpleNamespace(method="mtp"),
             kv_transfer_config={
                 "kv_connector": "lmcache_offload",
@@ -187,22 +191,25 @@ def test_ple_turns_a_midstep_readable_transfer_off_and_says_so(
 
 
 @pytest.mark.parametrize(
-    "replayssm, num_spec, keep",
+    "replayssm, num_spec, keep, state_entries",
     [
-        (True, 1, "snapshot"),
-        (False, 1, "snapshot"),
-        (True, 0, "snapshot"),
-        (False, 0, "settled"),
+        (True, 1, "snapshot", 8 * 1 + 4),
+        (False, 1, "snapshot", 8 * 2 + 4),
+        (True, 0, "snapshot", 8 * 1 + 4),
+        (False, 0, "settled", 8 * 1),
     ],
 )
 def test_decode_keep_builds_the_step_image_with_its_ple_windows(
-    one_tp_rank, replayssm, num_spec, keep
+    one_tp_rank, replayssm, num_spec, keep, state_entries
 ):
     """Under MTP or ReplaySSM a decode boundary is behind the slot, and the
-    step's image covers the PLE planes too."""
+    step's image covers the PLE planes too: they share GDN's slots, scratch
+    included."""
     builder, cls = _builder()
     builder.replayssm, builder.num_spec = replayssm, num_spec
     assert cls.state_transfer(builder).decode_keep == keep
+    plan = plan_pools(cls.sub_pool_specs(builder), 1 << 30, max_num_seqs=8)
+    assert plan.entries[PLE_STATE_SLOT_CLASS] == state_entries
 
 
 def _layout_id(builder, cls):

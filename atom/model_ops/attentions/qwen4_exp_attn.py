@@ -428,10 +428,12 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         planes = self._ple_planes
         if not planes:
             return None
+        # GDN's class: the same slots, decode-image scratch included.
         return state_pool(
             PLE_STATE_SLOT_CLASS,
             sum(plane.slot_bytes for plane in planes),
             entries_per_req=self.slots_per_req(),
+            extra_entries=self.state_spec().extra_entries,
         )
 
     def sub_pool_specs(self) -> list[SubPoolSpec]:
