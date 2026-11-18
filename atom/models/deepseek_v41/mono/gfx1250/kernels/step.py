@@ -142,7 +142,7 @@ def cwith(c, **kw):
     return c.with_(**kw) if isinstance(c, LazyC) else dict(c, **kw)
 
 
-def entry_front(fp, sm, b, row, ne, topk, last=False):
+def entry_front(fp, sm, b, row, ne, topk, last=False, demb=None):
     """A segment entry's attention front (front CTAs): the block state (dR / dy / dpre / dpost / dcomb) through the
     attention front of layer-table row `row` (its a* weights) -> axn / x8 / xs / the gates; R kept in LDS (first)."""
     nof = fx.Int32(0) != fx.Int32(0)
@@ -156,6 +156,8 @@ def entry_front(fp, sm, b, row, ne, topk, last=False):
               cands=fptr(fp, "cands"), npre=fptr(fp, "anpre"), npost=fptr(fp, "anpost"), ncomb=fptr(fp, "ancomb"),
               ids=fptr(fp, "ids"), wts=fptr(fp, "wts"), isffn=nof, xs32=fx.Int32(1) != fx.Int32(0), merge=nof,
               rk=sm + RKOFF, first=fx.Int32(1) != fx.Int32(0), last=(fx.Int32(1) != fx.Int32(0)) if last else nof, hdev=True, ne=ne, topk=topk)
+    if demb is not None:   # the draft entry: its block state built in front_A (FS.front_A, demb)
+        cu.update(demb=demb[0], aid=demb[1], emb=fptr(fp, "emb"), noise=fptr(fp, "noise"))
     FS.front_any(cu)
 
 
@@ -323,18 +325,16 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
                     ST.target(tp, t, b, sm, TCNT, recv, rank, head_d=4, ctx=fptr(fp, "ctxtab"), T=TR, kv_fp4=kv_fp4)
                 # the draft context KV (main_proj .. ring) from the target loop's taps
                 # (the draft context KV runs inside the target sampling's exchanges: ST.target(ctx=...))
-                # the draft entry: the draft block's metadata from this step's verify, its block state, then draft stage 0's
-                # attention front (layer-table row NL + NDR)
+                # the draft entry: the draft block's metadata from this step's verify, then draft stage 0's attention front
+                # (layer-table row NL + NDR; the block state built in the front)
                 if b == 0:
                     CX.draft_meta(dict(t=t, verdict=ST.tptr(tp, "verdict"), rpos=fptr(fp, "rpos"), dgeom=fptr(fp, "dgeom"),
                                        kmeta_d=fptr(fp, "kmeta_d"), kvw_d=fptr(fp, "kvw_d"), rpos_d=fptr(fp, "rpos_d")),
                                   TRD // DSPARK_W, DSPARK_W)
-                CX.stage_block_state(dict(t=t, b=b, aid=ST.tptr(tp, "anc"), emb=fptr(fp, "emb"), noise=fptr(fp, "noise"),
-                                          R=fptr(fp, "dR"), y=fptr(fp, "dy"), pre=fptr(fp, "dpre"), post=fptr(fp, "dpost"),
-                                          comb=fptr(fp, "dcomb")), TRD // DSPARK_W, DSPARK_W)
-                handoff(TCNT + i64(LY.DRAFT_STATE), t, False)
+                # (no block-state stage / DRAFT_STATE handoff: the front builds the block rows from the anchors itself)
                 if b < FS.FRONT_CTAS:
-                    entry_front(fp, sm, b, NL + NDR, DRAFT_NE, DRAFT_TOPK, last=True)   # (R -> aRout for the owners)
+                    entry_front(fp, sm, b, NL + NDR, DRAFT_NE, DRAFT_TOPK, last=True,
+                                demb=((TRD, DSPARK_W), ST.tptr(tp, "anc")))   # (R -> aRout for the owners)
                 handoff(TCNT + i64(LY.DRAFT_FRONT), t, False)
             for Ly in range((lo if split and not DRS else seg_lo), (hi if split and not DRS else seg_hi)):
                 # (fx-v3) every layer, target and draft: the contract-v3 body (layer_v3); the draft segment with its
