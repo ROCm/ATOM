@@ -17,6 +17,7 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl._mlir.dialects import rocdl as rocdl_dialect
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import math as fmath
 from flydsl.expr.typing import T, as_ir_value
 
 from atom.models.kimi_k3.mono.kernels.attention.layout import (
@@ -904,11 +905,20 @@ def replay_rows(c, state, h_rec, rows):
                 key[e] * hw_exp2((total[e] - through[e]) * fx.Float32(LOG2E))
                 for e in range(4)
             ]
-            state = [
-                state[4 * r + e] + us[r] * weighted[e]
-                for r in range(count)
-                for e in range(4)
+            pairs = [
+                fx.Vector.from_elements(weighted[e : e + 2], fx.Float32)
+                for e in (0, 2)
             ]
+            updated = []
+            for r in range_constexpr(count):
+                u2 = fx.Vector.from_elements([us[r], us[r]], fx.Float32)
+                for p in range_constexpr(2):
+                    s2 = fx.Vector.from_elements(
+                        state[4 * r + 2 * p : 4 * r + 2 * p + 2], fx.Float32
+                    )
+                    f2 = fx.Vector(fmath.fma(u2, pairs[p], s2))
+                    updated.extend([f2[0], f2[1]])
+            state = updated
         j = j + fx.Int32(REC_GROUP)
     return state
 
