@@ -225,6 +225,7 @@ def gate_compute(c, k):
             step,
         )
         accumulator = mma_bf16(k["fb"][step], activation, accumulator, GFX1250)
+    decays = []
     for element in range_constexpr(ACCUMULATOR_ELEMENTS):
         output = wave * ROWS + lane_group * ACCUMULATOR_ELEMENTS + element
         value = fx.Float32(accumulator[element]).to(fx.BFloat16)
@@ -233,11 +234,19 @@ def gate_compute(c, k):
             fx.Float32(1.0) + hw_exp2(k["aa"] * g * fx.Float32(-LOG2E))
         )
         gate = fx.Float32(c["lb"]) * sigmoid
-        if lane % ROWS < L:
+        if const_expr(c.get("gate_ilp", False)):
+            decays.append((hw_exp2(gate * fx.Float32(LOG2E)), output))
+        elif lane % ROWS < L:
             fx.ptr_store(
                 hw_exp2(gate * fx.Float32(LOG2E)),
                 c["decay"] + token * GATE_K + output,
             )
+    # One guarded block: a guard an element would keep its chain from
+    # overlapping the others'.
+    if const_expr(len(decays) > 0):
+        if lane % ROWS < L:
+            for decay, output in decays:
+                fx.ptr_store(decay, c["decay"] + token * GATE_K + output)
 
 
 def state_loads(c, k, head, chunk):
@@ -951,7 +960,9 @@ def kda_head(c, request, head, share=None):
 
     metadata = gate_loaded or _head_gate_loads(c, head)
     gate_compute(c, metadata)
+    tdm_timeline.stamp(tdm_timeline.HEAD_GATE_MMA)
     gpu.barrier()
+    tdm_timeline.stamp(tdm_timeline.HEAD_GATE_SYNC)
     qk_normalize(c)
     gpu.barrier()
     tdm_timeline.stamp(tdm_timeline.HEAD_GATES)

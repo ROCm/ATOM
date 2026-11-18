@@ -40,6 +40,8 @@ CYCLES_ENTRY, CYCLES_END = 94, 95
 # its output gates polled, core_out stored; a split head's norm exchange done.
 HEAD_START, HEAD_POLLED, HEAD_CONV, HEAD_GATES = 96, 97, 98, 99
 HEAD_RECUR, HEAD_GATE_POLLED, HEAD_DONE, HEAD_EXCHANGED = 100, 101, 102, 103
+# Inside the gates: the gate WMMA issued (wave 0), then every wave past it.
+HEAD_GATE_MMA, HEAD_GATE_SYNC = 104, 105
 POINTS = {
     "hw_id": HW_ID,
     "entry": ENTRY,
@@ -59,6 +61,8 @@ POINTS = {
     "head_gate_polled": HEAD_GATE_POLLED,
     "head_done": HEAD_DONE,
     "head_exchanged": HEAD_EXCHANGED,
+    "head_gate_mma": HEAD_GATE_MMA,
+    "head_gate_sync": HEAD_GATE_SYNC,
 }
 
 _config: tuple[int, int] | None = None

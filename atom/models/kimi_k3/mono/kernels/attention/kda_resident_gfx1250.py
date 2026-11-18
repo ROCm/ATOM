@@ -185,6 +185,10 @@ def _state_prefetch() -> bool:
     return envs.ATOM_KIMI_MONO_K1_STATE_PREFETCH
 
 
+def _gate_ilp() -> bool:
+    return envs.ATOM_KIMI_MONO_K1_GATE_ILP
+
+
 def _auto_head_split(heads: int, blocks: int) -> int:
     """The most of 4, 2 CTAs a head whose parts all fit the grid at once."""
     return next((count for count in (4, 2) if heads * count <= blocks), 1)
@@ -224,6 +228,7 @@ def build_resident_k1(
         _head_preload(),
         _state_prefetch(),
         envs.ATOM_KIMI_MONO_K1_HEAD_SPLIT,
+        _gate_ilp(),
     )
     cached = _BUILDS.get(cache_key)
     if cached is not None:
@@ -289,6 +294,7 @@ def build_resident_k1(
         _head_preload(),
         _state_prefetch(),
         head_split,
+        _gate_ilp(),
     )
     timeline = tdm_timeline.key()
     name = (
@@ -299,6 +305,7 @@ def build_resident_k1(
         f"{f'_sk{split_stages}' if split_stages else ''}{gemv_tdm.cold_suffix()}"
         f"{'' if _head_preload() else '_nohp'}{'' if _state_prefetch() else '_nosp'}"
         f"{f'_hs{head_split}' if head_split != auto_split else ''}"
+        f"{'' if _gate_ilp() else '_nogi'}"
         f"{tdm_timeline.suffix()}"
     )
 
@@ -927,6 +934,7 @@ def build_resident_k1(
             "matrix_threads": declaration.threads,
             "head_preload": _head_preload(),
             "head_split": head_split,
+            "gate_ilp": _gate_ilp(),
             "red": smem.red.ptr,
             "tls": smem.tls.ptr,
             "fa": recurrence.fa.ptr,
