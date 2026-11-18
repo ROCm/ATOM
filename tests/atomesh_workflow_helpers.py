@@ -74,7 +74,9 @@ def github_expressions(
     """Evaluate the ${{ }} segments of a workflow value for a run with no inputs."""
     event_context = SimpleNamespace(
         schedule=schedule,
-        pull_request=SimpleNamespace(number=pull_request_number),
+        action="",
+        label=SimpleNamespace(name=""),
+        pull_request=SimpleNamespace(number=pull_request_number, label_names=[]),
         review=SimpleNamespace(state=review_state),
     )
     context = {
@@ -90,13 +92,16 @@ def github_expressions(
         expression = re.sub(r"\binputs\.\w+", "''", match.group(1))
         expression = re.sub(r"\bgithub\.event\.schedule\b", "schedule", expression)
         expression = re.sub(r"\bgithub\.(\w+)\b", r"\1", expression)
+        expression = expression.replace(".labels.*.name", ".label_names")
         expression = expression.replace("&&", " and ").replace("||", " or ")
+        expression = re.sub(r"!(?!=)", " not ", expression)
         return str(
             eval(
                 expression,
                 {
                     "__builtins__": {},
                     "format": lambda template, *args: template.format(*args),
+                    "contains": lambda items, item: item in items,
                 },
                 context,
             )
