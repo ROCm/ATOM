@@ -98,6 +98,7 @@ def producer(pp_rank=0, pp_size=1, num_tokens=10):
     c._pending_recv_stall_watch = {}
     c._held_failures = {}
     c._pending_recv_failed = set()
+    c._pending_recv_failed_after_write = set()
     c.done_sending = set()
     c.done_recving = set()
     c.failed_recving = set()
@@ -234,7 +235,9 @@ def test_abort_does_not_release_a_source_while_rdma_is_reading():
         assert c.get_finished().is_empty()
         release.set()
         future.result(timeout=5)
-    c._notify_transfer_result.assert_called_once_with(req, success=False)
+    c._notify_transfer_result.assert_called_once_with(
+        req, success=False, started_writes=True
+    )
     assert c.get_finished().connector_completions == {
         ConnectorCompletion("pd_source_safe", 7, True)
     }
@@ -264,7 +267,9 @@ def test_bad_prompt_or_block_geometry_fails_before_writing():
         state.finish({"first_token_id": 42})
         dispatch(c, req)
         assert c.transfer_engine.writes.empty()
-        c._notify_transfer_result.assert_called_once_with(req, success=False)
+        c._notify_transfer_result.assert_called_once_with(
+            req, success=False, started_writes=False
+        )
 
 
 def consumer(expected=2):
@@ -288,6 +293,7 @@ def consumer(expected=2):
     c._pending_recv_stall_watch = {}
     c._held_failures = {}
     c._pending_recv_failed = set()
+    c._pending_recv_failed_after_write = set()
     c._fence_lock = threading.Lock()
     c._pending_recv_expected = {21: expected}
     c._pending_recv_stages = {}
@@ -357,6 +363,92 @@ def test_chunked_failure_preserves_main_receive_hold(monkeypatch):
     c._report_held_failures()
     assert c.failed_recving == {21}
     assert not c._pending_recv_blocks and not c._received_handoffs
+
+
+@pytest.mark.parametrize("chunked", [True, False])
+@pytest.mark.parametrize(
+    "reports,held",
+    [
+        # (success, started_writes) of PP stage 0, then stage 1.
+        (((False, False), (False, False)), False),
+        (((True, True), (False, False)), False),
+        (((False, False), (False, True)), True),
+        (((False, True), (True, True)), True),
+    ],
+)
+def test_failed_receive_is_held_only_if_a_failed_rank_started_writing(
+    monkeypatch, chunked, reports, held
+):
+    monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
+    now = [100.0]
+    monkeypatch.setattr(mc.time, "monotonic", lambda: now[0])
+    c = consumer(2)
+    if not chunked:
+        c._pending_handoffs = {}
+    for rank, (success, started_writes) in enumerate(reports):
+        assert c._record_write_done(
+            21,
+            rank,
+            0,
+            3,
+            success=success,
+            started_writes=started_writes,
+            handoff={"first_token_id": 42} if success else None,
+        ) is (rank == 1)
+    assert c.failed_recving == (set() if held else {21})
+    assert bool(c._pending_recv_blocks) is held
+    assert not c._pending_recv_failed_after_write and not c.done_recving
+    now[0] += 61
+    c._report_held_failures()
+    assert c.failed_recving == {21} and not c._pending_recv_blocks
+
+
+@pytest.mark.parametrize("started_writes", [False, True, None])
+def test_write_done_tells_the_listener_whether_a_failed_rank_wrote(
+    monkeypatch, started_writes
+):
+    from contextlib import nullcontext
+
+    import msgpack
+
+    monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
+    p, _, request, _, _ = producer()
+    sent = []
+    p._send_on_socket = lambda _addr, parts, repeat=1: sent.append(parts)
+    kwargs = {} if started_writes is None else {"started_writes": started_writes}
+    mc.MooncakeConnector._notify_transfer_result(p, request, success=False, **kwargs)
+    ((msg_type, payload),) = sent
+    if started_writes is None:
+        # A producer that predates the field: its failure keeps the hold.
+        data = msgpack.loads(payload)
+        assert data.pop("started_writes") is True
+        payload = msgpack.dumps(data)
+
+    class StopListener(BaseException):
+        pass
+
+    class OneMessage:
+        def __init__(self):
+            self.parts = [[b"producer", msg_type, payload]]
+
+        def getsockopt(self, _option):
+            return b"tcp://0.0.0.0:5555"
+
+        def recv_multipart(self):
+            if not self.parts:
+                raise StopListener
+            return self.parts.pop()
+
+    d = consumer(1)
+    d._mla_landing = None
+    d._listener_bound, d._listener_error = threading.Event(), None
+    monkeypatch.setattr(
+        mc, "zmq_socket_ctx", lambda *a, **kw: nullcontext(OneMessage())
+    )
+    with pytest.raises(StopListener):
+        d._notification_listener()
+    assert d.failed_recving == (set() if started_writes is not False else {21})
+    assert bool(d._held_failures) is (started_writes is not False)
 
 
 def test_source_release_requires_every_tp_rank_of_every_pp_stage():
@@ -930,9 +1022,14 @@ def test_duplicate_cancelled_request_waits_for_original_rdma():
         assert release.wait(5)
         return write(*args)
 
-    def notify(data, *, success):
+    def notify(data, *, success, started_writes=True):
         d._record_write_done(
-            data["request_id"], 0, 0, data["write_nonce"], success=success
+            data["request_id"],
+            0,
+            0,
+            data["write_nonce"],
+            success=success,
+            started_writes=started_writes,
         )
 
     p.transfer_engine.batch_transfer_sync_write = blocked_write
@@ -953,7 +1050,9 @@ def test_duplicate_cancelled_request_waits_for_original_rdma():
             release.set()
             original.result(timeout=5)
     assert d.failed_recving == {21}
-    p._notify_transfer_result.assert_called_once_with(request, success=False)
+    p._notify_transfer_result.assert_called_once_with(
+        request, success=False, started_writes=True
+    )
 
 
 @pytest.mark.parametrize("aborted", [False, True])
@@ -1042,7 +1141,9 @@ def test_idle_write_listener_expires_unadmitted_chunk_request(monkeypatch):
         p._send_executor = pool
         with pytest.raises(StopListener):
             p._write_listener()
-    p._notify_transfer_result.assert_called_once_with(request, success=False)
+    p._notify_transfer_result.assert_called_once_with(
+        request, success=False, started_writes=False
+    )
     assert request["transfer_id"] in p._retired_chunked_transfers
     assert not p._pending_chunked_requests
 
@@ -1237,7 +1338,9 @@ def test_late_metadata_cannot_resurrect_retired_source():
     worker.start_load_kv(meta)
     assert not worker._chunked_prefills and worker.get_finished().is_empty()
     dispatch(worker, wire)
-    worker._notify_transfer_result.assert_called_once_with(wire, success=False)
+    worker._notify_transfer_result.assert_called_once_with(
+        wire, success=False, started_writes=False
+    )
     assert worker.transfer_engine.writes.empty()
 
 
@@ -2022,7 +2125,7 @@ def test_admission_timeout_without_decode_retires_all_stages(
 @pytest.mark.parametrize("pp_size", [1, 3])
 @pytest.mark.parametrize("cancel_decode", [False, True])
 @pytest.mark.parametrize("admission", [False, True])
-def test_ready_but_capacity_blocked_timeout_preserves_decode_write_safety(
+def test_capacity_blocked_timeout_frees_unwritten_decode_reservation(
     monkeypatch, seq_factory, pp_size, cancel_decode, admission
 ):
     import msgpack
@@ -2053,9 +2156,16 @@ def test_ready_but_capacity_blocked_timeout_preserves_decode_write_safety(
     registration = p.kv_connector.build_connector_meta()
     for rank, worker in enumerate(workers):
         worker.start_load_kv(registration)
-        worker._notify_transfer_result.side_effect = lambda data, success, rank=rank: (
-            dw._record_write_done(
-                data["request_id"], rank, 0, data["write_nonce"], success=success
+        worker._notify_transfer_result.side_effect = (
+            lambda data, success, started_writes=True, rank=rank: (
+                dw._record_write_done(
+                    data["request_id"],
+                    rank,
+                    0,
+                    data["write_nonce"],
+                    success=success,
+                    started_writes=started_writes,
+                )
             )
         )
     dw._send_on_socket.side_effect = lambda _addr, message: [
@@ -2085,20 +2195,18 @@ def test_ready_but_capacity_blocked_timeout_preserves_decode_write_safety(
     assert set(cancellation.reqs_to_save) == {seq.id for seq in ps}
     if cancel_decode:
         assert d.abort_request(ds.id)
+    if admission:
+        assert d.pd_admission.pending_bytes == 12
+        assert d.pd_admission.pending[str(ds.id)].cancelled is cancel_decode
     for rank, worker in enumerate(workers):
         worker.start_load_kv(cancellation)
         worker.get_finished()
         assert worker.transfer_engine.writes.empty()
         d._update_from_kv_xfer_finished(dw.get_finished())
-        assert ds.block_table and d.block_manager.kv.num_free == 0
-    now[0] = 139.0
-    d._update_from_kv_xfer_finished(dw.get_finished())
-    assert ds.block_table and d.block_manager.kv.num_free == 0
-    if admission:
-        assert d.pd_admission.pending_bytes == 12
-        assert d.pd_admission.pending[str(ds.id)].cancelled is cancel_decode
-    now[0] = 140.0
-    d._update_from_kv_xfer_finished(dw.get_finished())
+        if rank < pp_size - 1:
+            # Every stage's terminal result is awaited, as for any failure.
+            assert ds.block_table and d.block_manager.kv.num_free == 0
+    # No stage wrote, so the reservation is freed without the 30 s write hold.
     assert not ds.block_table and d.block_manager.kv.num_free == 3
     if admission:
         assert not d.pd_admission.pending
