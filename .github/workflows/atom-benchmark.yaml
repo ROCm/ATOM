@@ -17,6 +17,10 @@ on:
         type: choice
         options: ['native', 'slurm']
         default: native
+      scope:
+        type: choice
+        options: ['full', 'kimi-sparse']
+        default: full
 permissions:
   contents: read
 concurrency:
@@ -30,6 +34,7 @@ jobs:
     env:
       CONTAINER_NAME: atom-pr-review-${{ github.run_id }}
       AITER_GIT_REF: 0d894387bbbf43df30bdfcba928f483b94a906e2
+      VALIDATION_SCOPE: ${{ inputs.scope || 'full' }}
       IMAGE: rocm/atom-dev@sha256:ad256a94209d2f58bfa6b0a69c555e0f8aab4fd8b76673c3532258803599099c
     steps:
       - uses: actions/checkout@v6
@@ -78,7 +83,7 @@ jobs:
           set -euo pipefail
           mkdir -p review-evidence
           docker inspect --format '{{.Image}}' "$CONTAINER_NAME" > review-evidence/image-id.txt
-          docker exec -e PR -e HEAD_SHA -e BASE_SHA -e AITER_GIT_REF "$CONTAINER_NAME" \
+          docker exec -e PR -e HEAD_SHA -e BASE_SHA -e AITER_GIT_REF -e VALIDATION_SCOPE "$CONTAINER_NAME" \
             python /workspace/_review_harness/.github/scripts/pr_prefill_validation.py
       - name: Stop this run's container
         if: always()
@@ -102,6 +107,7 @@ jobs:
       PR: ${{ inputs.pr }}
       HEAD_SHA: ${{ inputs.head_sha }}
       BASE_SHA: ${{ inputs.base_sha }}
+      VALIDATION_SCOPE: ${{ inputs.scope || 'full' }}
       AITER_GIT_REF: 0d894387bbbf43df30bdfcba928f483b94a906e2
       IMAGE: rocm/atom-dev@sha256:ad256a94209d2f58bfa6b0a69c555e0f8aab4fd8b76673c3532258803599099c
     steps:

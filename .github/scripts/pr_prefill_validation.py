@@ -27,6 +27,10 @@ BASE = os.environ["BASE_SHA"]
 K3 = "moonshotai/Kimi-K3.1-Pro"
 GLM = "zai-org/GLM-5.2-FP8"
 PY = sys.executable
+SCOPE = os.environ.get("VALIDATION_SCOPE", "full")
+SPARSE_CHECK = SCOPE == "kimi-sparse"
+FEWSHOT = 20 if SPARSE_CHECK else 5
+PROMPT_PLAN = None
 BASELINE_GQA_CASES = [
     "test_unified_block_read_matches_the_bidirectional_reference[False-fp8]",
     "test_unified_block_read_matches_the_bidirectional_reference[True-fp8]",
@@ -167,6 +171,15 @@ def profile_gsm8k(argv, folder, env):
     traces = list((folder / "profiler").rglob("*.pt.trace.json.gz"))
     rank0 = [path for path in traces if "rank_0" in path.parts]
     labels = []
+    kernel_counts = dict.fromkeys(
+        (
+            "dcp_sparse_prefill",
+            "patch_work_kv_ranges",
+            "mla_absorb_q_pack",
+            "dcp_a2a_fp8_quant",
+        ),
+        0,
+    )
     for path in rank0:
         with gzip.open(path, "rt") as stream:
             events = json.load(stream)["traceEvents"]
@@ -175,15 +188,31 @@ def profile_gsm8k(argv, folder, env):
             for event in events
             if event.get("name", "").startswith("prefill[")
         )
+        if SPARSE_CHECK:
+            for event in events:
+                for kernel in kernel_counts:
+                    if kernel in event.get("name", ""):
+                        kernel_counts[kernel] += 1
     sizes = [
         int(match[1]) for label in labels if (match := re.search(r"\btok=(\d+)", label))
     ]
     save(
         folder / "gsm8k-prefill-coverage.json",
-        {"labels": labels, "scheduled_tokens": sizes},
+        {"labels": labels, "scheduled_tokens": sizes, "kernel_counts": kernel_counts},
     )
     if not sizes or max(sizes) < 8192:
         raise RuntimeError(f"GSM8K did not witness a >=8192-token prefill: {sizes}")
+    if SPARSE_CHECK:
+        required = ["dcp_sparse_prefill"]
+        if folder.name.startswith("head-"):
+            required += ["patch_work_kv_ranges", "mla_absorb_q_pack"]
+            if env["ATOM_DCP_PREFILL_A2A_FP8"] == "1":
+                required.append("dcp_a2a_fp8_quant")
+        missing = [name for name in required if not kernel_counts[name]]
+        if missing:
+            raise RuntimeError(
+                f"Sparse-path GSM8K did not execute required markers: {missing}"
+            )
     # Keep the raw rank-0 witness; the other seven ranks duplicate the window.
     for path in traces:
         if path not in rank0:
@@ -265,6 +294,7 @@ def scenario(sha, name, model, *, mono="0", payload="0"):
         "argv": argv,
         "mono": mono,
         "payload_fp8": payload,
+        "fewshot": FEWSHOT,
         "accuracy_contract": "FP8 MLA KV, FP8 index, TP8/DCP8; paired main baseline (not the recipe's BF16 KV score)",
         "model_config_sha256": hashlib.sha256(
             (Path(model) / "config.json").read_bytes()
@@ -358,7 +388,7 @@ def scenario(sha, name, model, *, mono="0", payload="0"):
                 "--tasks",
                 "gsm8k",
                 "--num_fewshot",
-                "5",
+                str(FEWSHOT),
                 "--seed",
                 "0,1234,1234,1234",
                 "--log_samples",
@@ -367,6 +397,11 @@ def scenario(sha, name, model, *, mono="0", payload="0"):
             ]
             metadata["eval_argv"] = evaluate
             metadata["eval_rc"] = profile_gsm8k(evaluate, folder, env)
+            if SPARSE_CHECK:
+                from pr_gsm8k_prompts import verify_samples
+
+                verify_samples(folder / "gsm8k", PROMPT_PLAN)
+                metadata["prompt_plan_verified"] = True
             results = list((folder / "gsm8k").rglob("results*.json"))
             if len(results) != 1:
                 raise RuntimeError(f"{name}: expected one GSM8K result, got {results}")
@@ -400,6 +435,8 @@ def scenario(sha, name, model, *, mono="0", payload="0"):
 
 if __name__ == "__main__":
     assert PR in ("3311", "3312")
+    assert SCOPE in ("full", "kimi-sparse")
+    assert not SPARSE_CHECK or PR == "3311"
     assert all(re.fullmatch("[0-9a-f]{40}", sha) for sha in (HEAD, BASE))
     OUT.mkdir(exist_ok=True)
     assert torch.cuda.device_count() == 8
@@ -420,6 +457,7 @@ if __name__ == "__main__":
         "pr": PR,
         "head": HEAD,
         "base": BASE,
+        "scope": SCOPE,
         "torch": torch.__version__,
         "rocm": torch.version.hip,
         "aiter_ref": os.environ["AITER_GIT_REF"],
@@ -432,8 +470,31 @@ if __name__ == "__main__":
     }
     save(OUT / "manifest.json", manifest)
     MODELS = {K3: model_path(K3)}
-    if PR == "3311":
+    if PR == "3311" and not SPARSE_CHECK:
         MODELS[GLM] = model_path(GLM)
+    if SPARSE_CHECK:
+        from pr_gsm8k_prompts import prepare
+
+        assert (
+            HEAD == "d0bbcbde316d38389c438841b361eed4a741f58e"
+        ), "Reassess unit-test reuse after any source change"
+        PROMPT_PLAN = prepare(MODELS[K3], OUT / "gsm8k-prompt-plan.json", FEWSHOT)
+        passed = [
+            scenario(BASE, "base-k3-20shot", MODELS[K3]),
+            scenario(HEAD, "head-k3-20shot", MODELS[K3]),
+            scenario(HEAD, "head-k3-20shot-payload-fp8", MODELS[K3], payload="1"),
+        ]
+        save(
+            OUT / "summary.json",
+            {
+                "scope": SCOPE,
+                "unit_test_evidence_run": 44175722491,
+                "unit_tests_rerun": False,
+                "scenarios": passed,
+                "passed": all(passed),
+            },
+        )
+        sys.exit(0 if all(passed) else 1)
     patterns = (
         [
             "tests/models/test_kimi_k3_indexer_overlap.py",
