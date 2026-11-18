@@ -26,8 +26,9 @@ def apply_rotary_emb(
 
 def get_cos_sin_cache(rotary_emb: nn.Module, query: torch.Tensor) -> torch.Tensor:
     """The [max_position, rotary_dim] cos|sin table of `rotary_emb` in the dtype and
-    on the device of `query`, as the fused q/k norm + RoPE kernels take it. Built
-    once and kept on `rotary_emb` as the `_cos_sin_cache` buffer."""
+    on the device of `query`, as the fused q/k norm + RoPE kernels take it. Kept on
+    `rotary_emb` as the `_cos_sin_cache` buffer and rebuilt when the dtype, device
+    or shape changes; not stored while compiling."""
     cache_name = "_cos_sin_cache"
     cos_cache = rotary_emb.cos_cache.squeeze(-2).squeeze(-2)
     cached = getattr(rotary_emb, cache_name, None)
