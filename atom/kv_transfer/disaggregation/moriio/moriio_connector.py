@@ -40,6 +40,7 @@ from atom.kv_transfer.disaggregation.moriio.fabric import (
     allocate_fabric_pool,
     block_runs,
     desc_fabric_info,
+    fabric_state_pool,
     is_fabric_backend,
     page_digest,
     page_offsets,
@@ -144,6 +145,14 @@ class MoRIIOConnector(KVConnectorBase):
         self.base_handshake_port = kv_transfer_config.get(
             "handshake_port", MoRIIOConstants.DEFAULT_HANDSHAKE_PORT
         )
+        # A producer whose TP group spans hosts (--tensor-parallel-size-local)
+        # reports only its engine core's address as remote_host, but each of its
+        # ranks listens on its own host. remote_tp_hosts maps that address to the
+        # producer's hosts in TP-rank order, so this rank reaches its peer.
+        self._remote_tp_hosts = {
+            str(head): [str(h) for h in hosts]
+            for head, hosts in (kv_transfer_config.get("remote_tp_hosts") or {}).items()
+        }
 
         # Compute unique side-channel port for this (dp, tp) rank
         handshake_port = self.base_handshake_port
@@ -365,6 +374,13 @@ class MoRIIOConnector(KVConnectorBase):
             return None
         return allocate_fabric_pool(nbytes, device)
 
+    @classmethod
+    def per_request_state_pool(cls, config):
+        """moriio_backend fabric keeps the per-request state in fabric memory too."""
+        if not is_fabric_backend(config.kv_transfer_config or {}):
+            return None
+        return fabric_state_pool()
+
     def register_kv_caches(
         self,
         kv_caches: dict[str, Any],
@@ -492,6 +508,11 @@ class MoRIIOConnector(KVConnectorBase):
         pool and its bytes per block, and the peer gets that table in the
         handshake. mori maps a peer's whole allocation per registered
         descriptor, so one descriptor keeps it to one mapping per peer.
+
+        Per-request state (a KDA layer's conv and SSM state) lives outside the
+        pool, in fabric memory of its own (`per_request_state_pool`), and is
+        registered per tensor as on RDMA: a request's slot then moves with its
+        PAGE batch (`_write_blocks`).
         """
         pages = list(getattr(transfer_tensors, "pages", None) or ())
         if not pages:
@@ -499,12 +520,10 @@ class MoRIIOConnector(KVConnectorBase):
                 "moriio_backend fabric moves PAGE regions, and this model "
                 "publishes none"
             )
-        if any(getattr(c, "per_request_state", False) for c in kv_caches.values()) or (
-            getattr(transfer_tensors, "swa_block_regions", None)
-        ):
+        if getattr(transfer_tensors, "swa_block_regions", None):
             raise NotImplementedError(
-                "moriio_backend fabric moves PAGE regions only, and this model "
-                "also keeps per-request state"
+                "moriio_backend fabric moves PAGE regions and per-request state, "
+                "and this model also keeps sliding-window regions"
             )
         regions = [page.region for page in pages]
         if any(region.reverse_indexed for region in regions):
@@ -537,6 +556,23 @@ class MoRIIOConnector(KVConnectorBase):
         if self._verify_kv and self._page_views is None:
             logger.warning("ATOM_MORIIO_VERIFY: PAGE regions without views; off")
             self._verify_kv = False
+        for layer_name, kv_cache in kv_caches.items():
+            if getattr(kv_cache, "per_request_state", False):
+                self._register_state(layer_name, kv_cache)
+        if self._state_tensors:
+            if not self.is_producer and self.transfer_mode == "read":
+                raise NotImplementedError(
+                    "moriio read mode moves block-addressed KV only, and this "
+                    f"model keeps per-request state in {len(self._state_tensors)} "
+                    "tensors; use moriio_mode=write"
+                )
+            logger.info(
+                "MoRIIO fabric: registered %d per-request state tensors: %d "
+                "slots, %d bytes per slot",
+                len(self._state_tensors),
+                self._num_state_slots,
+                sum(slot_bytes for _, slot_bytes, _ in self._state_tensors.values()),
+            )
         self.num_blocks = int(num_blocks or getattr(transfer_tensors, "num_blocks", 0))
         self.block_len = self.kv_cache_block_size
         logger.info(
@@ -557,6 +593,12 @@ class MoRIIOConnector(KVConnectorBase):
             attn_backend_name="aiter",
             page_desc=desc,
             page_regions=[list(region) for region in self._page_regions],
+            state_descs={n: d for n, (d, _, _) in self._state_tensors.items()} or None,
+            state_slot_bytes={
+                n: b for n, (_, b, _) in self._state_tensors.items()
+            }
+            or None,
+            num_state_slots=self._num_state_slots,
         )
         self._start_handshake_listener(metadata)
 
@@ -653,7 +695,9 @@ class MoRIIOConnector(KVConnectorBase):
                     f"it {self._num_state_slots}"
                 )
             slot_bytes = tensor.stride(0) * tensor.element_size()
-            if num_slots * slot_bytes > MAX_RDMA_CHUNK_BYTES:
+            # One registration per tensor on either backend; only RDMA's has a
+            # size limit (a fabric import maps the whole allocation anyway).
+            if not self.use_fabric and num_slots * slot_bytes > MAX_RDMA_CHUNK_BYTES:
                 raise ValueError(
                     f"{name}: {num_slots} slots of {slot_bytes} bytes exceed one "
                     "RDMA registration"
@@ -662,6 +706,12 @@ class MoRIIOConnector(KVConnectorBase):
             desc = self.moriio_wrapper.register_local_buffer(
                 tensor.data_ptr(), num_slots * slot_bytes, device_id
             )
+            if self.use_fabric and not desc_fabric_info(desc)[0]:
+                raise RuntimeError(
+                    f"{name}: per-request state at {tensor.data_ptr():#x} has no "
+                    "fabric handle, so FABRIC cannot move it: it was not "
+                    "allocated under MoRIIOConnector.per_request_state_pool"
+                )
             self._num_state_slots = num_slots
             self._state_tensors[name] = (desc, slot_bytes, tensor)
 
@@ -781,7 +831,7 @@ class MoRIIOConnector(KVConnectorBase):
                 dst_engine_id=meta.remote_engine_id,
                 local_block_ids=meta.local_block_ids,
                 remote_block_ids=meta.remote_block_ids,
-                remote_host=meta.remote_host,
+                remote_host=self._producer_host(meta),
                 remote_handshake_port=meta.remote_handshake_port,
                 remote_dp_rank=meta.remote_dp_rank,
                 remote_tp_size=int(meta.tp_size or 0),
@@ -814,7 +864,7 @@ class MoRIIOConnector(KVConnectorBase):
             )
             self.moriio_wrapper.send_notify(
                 self.request_id_to_transfer_id.get(req_id, meta.transfer_id),
-                meta.remote_host,
+                self._producer_host(meta),
                 port,
             )
         except Exception:
@@ -823,6 +873,20 @@ class MoRIIOConnector(KVConnectorBase):
                 req_id,
                 exc_info=True,
             )
+
+    def _producer_host(self, meta: ReqMeta) -> str:
+        """The host of the producer rank this rank exchanges with."""
+        # getattr: tests build the connector without __init__
+        hosts = getattr(self, "_remote_tp_hosts", {}).get(str(meta.remote_host))
+        if not hosts:
+            return meta.remote_host
+        remote_tp_size = int(meta.tp_size or 0) or self.tp_size
+        if remote_tp_size % len(hosts):
+            raise ValueError(
+                f"remote_tp_hosts for {meta.remote_host} lists {len(hosts)} hosts, "
+                f"which do not split TP {remote_tp_size} evenly"
+            )
+        return hosts[self.tp_rank // (remote_tp_size // len(hosts))]
 
     @staticmethod
     def _rejects_transfer_subset(req_id: ReqId, meta: ReqMeta) -> bool:
@@ -1048,6 +1112,11 @@ class MoRIIOConnector(KVConnectorBase):
 
         if self._verify_kv and self.use_fabric:
             self._verify_page_dst[req_id] = dst
+            if self._state_tensors:
+                self._verify_state_before[req_id] = (
+                    dst_slot,
+                    self._state_digest(dst_slot),
+                )
         elif self._verify_kv:
             first_layer = next(iter(self.layer_name_to_local_kv_cache_metadata))
             is_mla = self.kv_caches[first_layer].v_cache is None
@@ -1083,7 +1152,7 @@ class MoRIIOConnector(KVConnectorBase):
         try:
             self.moriio_wrapper.send_message(
                 [MoRIIOConstants.WRITE_REQ, msgpack.dumps(request)],
-                meta.remote_host,
+                self._producer_host(meta),
                 port,
             )
         except Exception:
@@ -1864,7 +1933,23 @@ class MoRIIOConnector(KVConnectorBase):
         src = [int(b) for b in request["src_block_ids"]]
         self._source_covers(f"transfer {request['transfer_id']}", dst, src)
         if self.use_fabric:
-            return self._write_pages(request, engine_id, src[: len(dst)], dst)
+            # Before any page write: a request that cannot carry its state must
+            # not leave a half-filled destination behind.
+            state_writes = self._state_writes(request, engine_id)
+            statuses = self._write_pages(request, engine_id, src[: len(dst)], dst)
+            try:
+                for session, size, local_offset, remote_offset in state_writes:
+                    statuses.append(
+                        self.moriio_wrapper.write_remote_data_status(
+                            [size], [local_offset], [remote_offset], session
+                        )
+                    )
+            except Exception:
+                logger.exception(
+                    "transfer %s: could not post every write", request["transfer_id"]
+                )
+                statuses.append(_POST_FAILED)
+            return statuses
         sessions, _remote_meta = self._get_or_build_sessions(engine_id)
         # Before any block write: a request that cannot carry its state must not
         # leave a half-filled destination behind.
@@ -2453,7 +2538,7 @@ class MoRIIOConnector(KVConnectorBase):
 
     def _start_read_handshakes(self, remote_engine_id: EngineId, meta: ReqMeta) -> None:
         """Handshake with every producer DP rank not registered or in flight."""
-        host = meta.remote_host
+        host = self._producer_host(meta)
         port = int(meta.remote_handshake_port)
         tp_size = int(meta.tp_size)
         wanted = int(meta.remote_dp_rank or 0)
@@ -2586,6 +2671,7 @@ class MoRIIOConnector(KVConnectorBase):
             for req_id in done_recving:
                 if self.use_fabric:
                     self._verify_page_landed(req_id)
+                    self._verify_state_landed(req_id)
                     continue
                 self._verify_landed(req_id)
                 self._verify_state_landed(req_id)
@@ -2664,14 +2750,19 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
     def get_num_new_matched_tokens(self, seq: Sequence) -> tuple[int, bool]:
         """Check if this sequence needs remote KV prefill.
 
+        The scheduler asks on every pass that considers the sequence and can
+        hold it back after a yes (a full running set), so the answer stays the
+        same until the receive is queued: `update_state_after_alloc` clears
+        ``do_remote_prefill`` then. Answering yes only once sent every request
+        that waited for a slot to a local prefill of its suffix instead.
+
         Returns:
             ``(num_tokens, needs_async_load)`` where ``needs_async_load``
             is True if the scheduler should defer until KV transfer completes.
         """
         params = seq.kv_transfer_params or {}
 
-        if params.get("do_remote_prefill") and not hasattr(seq, "kv_async_tagged"):
-            seq.kv_async_tagged = True
+        if params.get("do_remote_prefill"):
             return len(seq.prompt_token_ids), True
 
         return 0, False

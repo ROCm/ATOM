@@ -269,6 +269,46 @@ def import_connector(name: str = "MoRIIOConnector"):
     return getattr(moriio_connector, name)
 
 
+class RemoteLookupTest(unittest.TestCase):
+    """The consumer's remote-KV lookup, as the scheduler drives it."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.scheduler = import_connector("MoRIIOConnectorScheduler")
+        if cls.scheduler is None:
+            raise unittest.SkipTest("moriio_connector needs aiter, torch and a GPU")
+
+    def make(self):
+        import types
+
+        conn = object.__new__(self.scheduler)
+        conn.is_producer = False
+        conn.request_id_to_transfer_id = {}
+        conn.transfer_id_to_request_id = {}
+        conn._reqs_need_recv = {}
+        seq = types.SimpleNamespace(
+            id=5,
+            prompt_token_ids=[1, 2, 3],
+            kv_transfer_params={"do_remote_prefill": True, "transfer_id": 7},
+            block_table=[0, 1],
+            state_slot=3,
+        )
+        return conn, seq
+
+    def test_a_request_held_back_is_still_loaded_remotely_next_pass(self):
+        conn, seq = self.make()
+        # The pass that asks first can put the request back (running set full)
+        self.assertEqual(conn.get_num_new_matched_tokens(seq), (3, True))
+        self.assertEqual(conn.get_num_new_matched_tokens(seq), (3, True))
+
+    def test_the_lookup_says_no_once_the_receive_is_queued(self):
+        conn, seq = self.make()
+        conn.get_num_new_matched_tokens(seq)
+        conn.update_state_after_alloc(seq)
+        self.assertIn(5, conn._reqs_need_recv)
+        self.assertEqual(conn.get_num_new_matched_tokens(seq), (0, False))
+
+
 class ConnectorBehaviourTest(unittest.TestCase):
     """The same guards as above, executed rather than read."""
 
@@ -799,6 +839,31 @@ class WritePathTest(unittest.TestCase):
         )
         self.assertAlmostEqual(request["deadline"], time.time() + 600, delta=60)
         self.assertEqual(conn._awaiting_write["d1"][0], request["deadline"])
+
+    def test_a_producer_over_two_hosts_is_reached_on_its_ranks_host(self):
+        import types
+
+        # A TP8 producer over two hosts (4 ranks each) reports only its first
+        # host; rank 5 asks, and later notifies, rank 5 on the second.
+        conn = self.make(producer=False)
+        conn.tp_rank = 5
+        conn._remote_tp_hosts = {"10.0.0.1": ["10.0.0.1", "10.0.0.9"]}
+        conn.request_id_to_transfer_id = {"d1": 77}
+        meta = self.recv_meta([4, 5], [10, 11, 12])
+        conn._request_write("d1", meta)
+        ((frames, host, port),) = conn.sent
+        self.assertEqual((host, port), ("10.0.0.9", 7306))
+        conn._notify_producer("d1", meta)
+        self.assertEqual(conn.notified, [(77, "10.0.0.9", 7306)])
+        # Rank 3 is on the first host; a producer the map does not name keeps
+        # its remote_host; hosts that do not split the TP group are refused.
+        conn.tp_rank = 3
+        self.assertEqual(conn._producer_host(meta), "10.0.0.1")
+        other = types.SimpleNamespace(remote_host="10.0.0.3", tp_size=8)
+        self.assertEqual(conn._producer_host(other), "10.0.0.3")
+        conn._remote_tp_hosts = {"10.0.0.1": ["a", "b", "c"]}
+        with self.assertRaises(ValueError):
+            conn._producer_host(meta)
 
     def test_the_consumer_refuses_a_short_source_without_asking(self):
         conn = self.make(producer=False)

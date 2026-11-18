@@ -2435,9 +2435,17 @@ class ModelRunner:
         # `{"mamba_k_cache": ..., "mamba_v_cache": ...}`; for stateless
         # attentions it returns an empty dict (no-op). Values are setattr'd
         # on `self` so model layers can access them as `model_runner.<name>`.
-        per_req_state = self.attn_metadata_builder.allocate_per_req_cache(
-            self.pool_plan.entries
+        # A connector whose peer maps this rank's per-request state as well
+        # routes its allocation to exportable memory.
+        state_pool = (
+            KVConnectorFactory.per_request_state_pool(self.config)
+            if self.config.kv_transfer_config
+            else None
         )
+        with state_pool if state_pool is not None else nullcontext():
+            per_req_state = self.attn_metadata_builder.allocate_per_req_cache(
+                self.pool_plan.entries
+            )
         for name, value in per_req_state.items():
             setattr(self, name, value)
         # The pools are reachable through `self` only now, which is the
