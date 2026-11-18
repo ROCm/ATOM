@@ -9,6 +9,7 @@ import functools
 
 import torch
 from aiter import QuantType, dtypes, get_hip_quant
+from aiter.jit.utils.chip_info import get_cu_num
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from atom.utils.decorators import mark_trace
@@ -391,6 +392,47 @@ def _onorm_gluon_module():
     return rmsnorm_gated_gluon
 
 
+def _rmsnorm_gated_e8m0_plan(
+    quant_type: QuantType | None,
+    quant_dtype: torch.dtype | None,
+    e8m0_scale: bool,
+    is_prefill: bool,
+):
+    """For the per-1x128 E8M0 scheme, ``(Gluon o_norm module or None, col_major)``
+    as ``rmsnorm_gated`` runs it; None for any other scheme."""
+    if not (
+        quant_type == QuantType.per_1x128 and quant_dtype == dtypes.fp8 and e8m0_scale
+    ):
+        return None
+    from atom.utils import envs
+
+    gluon = None if is_prefill else _onorm_gluon_module()
+    return gluon, envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
+
+
+def rmsnorm_gated_e8m0_col_major(
+    quant_type: QuantType | None, quant_dtype: torch.dtype | None, e8m0_scale: bool
+) -> bool | None:
+    """The scale layout (col_major) ``rmsnorm_gated`` gives the gfx1250 Gluon
+    E8M0 o_norm for this scheme at decode, or None when it does not take it."""
+    plan = _rmsnorm_gated_e8m0_plan(quant_type, quant_dtype, e8m0_scale, False)
+    if plan is None or plan[0] is None:
+        return None
+    return plan[1]
+
+
+# The fused decode recurrence + o_norm runs one 4-wave workgroup per (request,
+# head), with BV = V. Past this many workgroups per CU it is slower than the
+# BV = 32 recurrence followed by the separate o_norm.
+_ONORM_MAX_WGS_PER_CU = 3
+
+
+def onorm_fits(num_seqs: int, num_heads: int) -> bool:
+    """Whether the decode recurrence with ``onorm`` (one token per request) is
+    faster than the recurrence plus a separate o_norm at this size."""
+    return num_seqs * num_heads <= _ONORM_MAX_WGS_PER_CU * get_cu_num()
+
+
 @mark_trace
 def rmsnorm_gated(
     x: torch.Tensor,
@@ -420,15 +462,15 @@ def rmsnorm_gated(
     """
     if quant_type == QuantType.per_Token and quant_dtype == dtypes.fp8:
         return _rmsnorm_gated_per_token_quant(x, weight, gate, eps, quant_dtype)
-    if quant_type == QuantType.per_1x128 and quant_dtype == dtypes.fp8 and e8m0_scale:
+    e8m0_plan = _rmsnorm_gated_e8m0_plan(
+        quant_type, quant_dtype, e8m0_scale, is_prefill
+    )
+    if e8m0_plan is not None:
         assert x.ndim == 3 and gate.ndim == 3 and x.shape[-1] == 128, (
             x.shape,
             gate.shape,
         )
-        from atom.utils import envs
-
-        col_major = envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
-        gluon = None if is_prefill else _onorm_gluon_module()
+        gluon, col_major = e8m0_plan
         if gluon is not None:
             return gluon.rmsnorm_gated_e8m0(
                 x, weight, gate, eps, quant_dtype, col_major
