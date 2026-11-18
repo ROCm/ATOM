@@ -21,6 +21,7 @@ from atom.utils.tbo.ubatching import sync_dp_metadata
 
 if TYPE_CHECKING:
     from atom.distributed.pcp_utils import PcpBalGroup
+    from atom.model_ops.dcp_ops import DcpSparsePrefillKV
     from atom.model_ops.indexer import IndexRows
 
 
@@ -698,6 +699,9 @@ class AttentionMetaData:
     sparse_kv_indices: torch.Tensor | None = None
     dcp_sparse_kv_indptr: torch.Tensor | None = None
     dcp_owned_counts: torch.Tensor | None = None
+    # A DCP sparse prefill taking the "kv" transport: the step's gathered-KV
+    # layout; None takes "q".
+    dcp_sparse_prefill_kv: "DcpSparsePrefillKV | None" = None
     # Whether this prefill runs sparse (DSA) MLA, decided once a step by the
     # attention builder: the indexer, MLA and PCP all follow it.
     run_sparse: bool = False

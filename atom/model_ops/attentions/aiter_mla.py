@@ -604,6 +604,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             and dcp_persistent
             and self.block_size == 1
         )
+        self._dcp_sparse_prefill_mode = self._resolve_dcp_sparse_prefill_mode(
+            config.kv_cache_dtype
+        )
+        self._dcp_sparse_prefill_kv_max_tokens = (
+            envs.ATOM_DCP_SPARSE_PREFILL_KV_MAX_TOKENS
+        )
+        self._dcp_sparse_prefill_kv_fallback_warned = False
         if self.dcp_world_size > 1 and dcp_persistent:
             self.persistent_num_heads = mla_dcp_kernel_num_heads(
                 self.num_attention_heads,
@@ -2229,11 +2236,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         prefix: str,
         num_heads: int,
         last_page_lens: torch.Tensor,
+        local_heads: bool = False,
     ) -> None:
         """The persistent sparse prefill's work plan over ``attn_metadata``'s
         query rows, into the ``prefix`` set's buffers; none for the
-        non-persistent DCP sparse prefill, which reads no plan."""
-        if self.dcp_sparse_prefill_nonps:
+        non-persistent DCP sparse prefill, which reads no plan. ``local_heads``:
+        a DCP "kv" prefill, which runs the dcp=1 kernel."""
+        if self.dcp_sparse_prefill_nonps and not local_heads:
             return
         var = self.model_runner.forward_vars
         work = {
@@ -2265,6 +2274,89 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         for name, buffer in work.items():
             setattr(attn_metadata, f"sparse_prefill_{name}", buffer)
 
+    def _resolve_dcp_sparse_prefill_mode(self, kv_cache_dtype):
+        """ATOM_DCP_SPARSE_PREFILL as this builder can run it. The "kv"
+        transport's conditions are `dcp_sparse_prefill_kv_blocker`'s."""
+        from atom.model_ops.dcp_ops import (
+            dcp_sparse_prefill_kv_blocker,
+            dcp_sparse_prefill_mode_env,
+        )
+
+        mode = dcp_sparse_prefill_mode_env()
+        if not self.is_sparse or self.dcp_world_size <= 1:
+            return "q"
+        blocker = dcp_sparse_prefill_kv_blocker(kv_cache_dtype, self.block_size)
+        if blocker is not None and mode != "q":
+            log = logger.warning if mode == "kv" else logger.info
+            log("DCP sparse prefill: %s takes the q transport (%s)", mode, blocker)
+            return "q"
+        logger.info("DCP sparse prefill transport: %s", mode)
+        return mode
+
+    def _dcp_sparse_prefill_kv_plan(self, batch):
+        """This step's DCP sparse prefill transport: the "kv" layout, or None
+        for "q". Reads only the batch, so every DCP rank chooses alike."""
+        from atom.model_ops.dcp_ops import (
+            DCP_SPARSE_PREFILL_KV_CONTEXT_BASE,
+            dcp_sparse_prefill_kv_context_per_new_token,
+            dcp_sparse_prefill_kv_plan,
+            dcp_sparse_prefill_kv_rows,
+        )
+
+        mode = self._dcp_sparse_prefill_mode
+        if mode == "q" or batch.is_dummy_run:
+            return None
+        plan = dcp_sparse_prefill_kv_plan(
+            batch.context_lens,
+            batch.block_tables,
+            self.dcp_world_size,
+            self.model_runner.block_size,
+            self._dcp_sparse_prefill_kv_max_tokens,
+            (
+                float("inf")
+                if mode == "kv"
+                else DCP_SPARSE_PREFILL_KV_CONTEXT_BASE
+                + dcp_sparse_prefill_kv_context_per_new_token(self.dcp_world_size)
+                * int(np.sum(batch.seqlens_q))
+            ),
+            self.device,
+        )
+        if (
+            plan is None
+            and mode == "kv"
+            and not self._dcp_sparse_prefill_kv_fallback_warned
+            and dcp_sparse_prefill_kv_rows(
+                batch.context_lens, self.dcp_world_size, self.model_runner.block_size
+            )
+            * self.dcp_world_size
+            > self._dcp_sparse_prefill_kv_max_tokens
+        ):
+            self._dcp_sparse_prefill_kv_fallback_warned = True
+            logger.warning(
+                "DCP sparse prefill: a step over ATOM_DCP_SPARSE_PREFILL_KV_MAX_TOKENS"
+                "=%d takes the q transport (warned once)",
+                self._dcp_sparse_prefill_kv_max_tokens,
+            )
+        return plan
+
+    def _dcp_sparse_prefill_step(self, batch, attn_metadata, prefix):
+        """Pick this step's DCP sparse prefill transport and build its work
+        plan. The "kv" prefill attends this rank's own heads over the global
+        top-k, as without DCP, so it takes the dcp=1 plan."""
+        kv_plan = self._dcp_sparse_prefill_kv_plan(batch)
+        attn_metadata.dcp_sparse_prefill_kv = kv_plan
+        self._sparse_prefill_work_plan(
+            attn_metadata,
+            prefix,
+            (
+                self.padded_num_attention_heads
+                if kv_plan is not None
+                else self.sparse_prefill_num_heads
+            ),
+            attn_metadata.sparse_kv_last_page_lens,
+            local_heads=kv_plan is not None,
+        )
+
     def _finish_prefill_batch(self, batch, attn_metadata, prefix=""):
         super()._finish_prefill_batch(batch, attn_metadata, prefix)
         bs = batch.scheduled_bs
@@ -2276,12 +2368,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 gathers = self._dcp_pass_gathers(attn_metadata, bs, prefix, passes)
             elif self.dcp_world_size > 1:
                 self._build_dcp_indexer_prefill_meta(attn_metadata, bs, prefix)
-            self._sparse_prefill_work_plan(
-                attn_metadata,
-                prefix,
-                self.sparse_prefill_num_heads,
-                attn_metadata.sparse_kv_last_page_lens,
-            )
+            self._dcp_sparse_prefill_step(batch, attn_metadata, prefix)
             if staged.pcp_split:
                 self._apply_pcp_reindex(
                     attn_metadata, batch.scheduled_tokens, staged.sparse_counts, prefix

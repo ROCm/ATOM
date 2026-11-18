@@ -369,6 +369,9 @@ dense MLA's `cprr` kernel running on a QREP-produced `q_out` — the combination
 the removed `speculative_config` gate used to block.
 
 **Sparse (DSA) prefill** can use QREP too, opt-in via `ATOM_DCP_PREFILL_QREP=1`.
+It applies to the `q` transport only: a step that takes the `kv` transport
+(`ATOM_DCP_SPARSE_PREFILL`, `auto` by default) all-gathers KV rows instead and
+attends this rank's own heads, so it neither gathers nor replicates q.
 Past `index_topk` context (2048 for GLM-5.2) prefill runs the absorbed MLA
 kernel and, like decode, AllGathers Q over the DCP group; through pynccl that
 gather lands rank-major, so `all_gather(dim=1)` also copies the whole gathered q

@@ -571,6 +571,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the whole gathered q back to token-major; this removes both. Costs a
     # group-wide q GEMM + W_K bmm per prefill token. Off by default.
     "ATOM_DCP_PREFILL_QREP": lambda: os.getenv("ATOM_DCP_PREFILL_QREP", "0") == "1",
+    # DCP sparse prefill transport. "q" gathers the group's query heads and
+    # merges partials by LSE; "kv" all-gathers the step's KV rows and attends
+    # this rank's own heads over the whole top-k, with no merge. "auto" takes
+    # "kv" while the step's context is under ~200K + k * its new tokens (k 52
+    # at dcp4, 40 at dcp8) and its gathered KV fits the token cap, else "q";
+    # "kv" skips the first condition and warns when it cannot be taken.
+    "ATOM_DCP_SPARSE_PREFILL": lambda: os.getenv("ATOM_DCP_SPARSE_PREFILL", "auto"),
+    "ATOM_DCP_SPARSE_PREFILL_KV_MAX_TOKENS": lambda: int(
+        os.getenv("ATOM_DCP_SPARSE_PREFILL_KV_MAX_TOKENS", str(1 << 20))
+    ),
     # DCP sparse prefill: use the non-persistent fp8 gqa64 MLA kernel, which
     # needs no work metadata. On by default; needs an aiter with ROCm/aiter#6132.
     "ATOM_DCP_SPARSE_PREFILL_NONPS": lambda: (
