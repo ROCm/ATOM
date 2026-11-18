@@ -474,23 +474,9 @@ A finding that stops at "likely / probably the root cause" without an evidence c
 
 Do NOT use rule codes (B1, D4, A1…) in output — they are internal labels only.
 
-**When the action is "run something", ask for ONE run.** Measured over the ATOM reviews
-this bot has posted: every ask that named a single run was carried out, and every ask that
-named a matrix was not. The cleanest pair is inside one PR, same author, same week —
-ATOM#3165 did "rebase onto current main and re-run the CPU suite and the `ci:atom` heavy
-jobs" (existing jobs, one rebase) and did not do "run the GPU P/D comparison at this head
-(admission off vs W only vs W + 512) ... and post req/s, errors and preemptions" (three
-arms, three metrics). It merged with that one still unchecked on its own list.
-ATOM#3275 ("one GPU A/B ... once a GPU host is available") was posted 17 hours later;
-ATOM#3323 ("re-run **at least one** 512c arm on the final head") came back with the table.
-
-So: name the smallest run that would change the verdict, say what result would settle it,
-and offer the cheaper out — "or name the existing run that covers this code". An ask the
-author cannot fit into their day is indistinguishable, in the record, from one they
-disagreed with. Two arms is a matrix. "Post A, B and C" is a matrix.
-
-This is about cost, not about hedging: a real BLOCK still blocks, and a finding about the
-code itself needs no softening — those land as written.
+**When the action is "run something", ask for ONE run.** Every such ask this bot made
+that named one run was carried out, every one that named a matrix was not (ATOM#3165:
+rebase+CPU suite yes, three-arm GPU comparison never). Offer "or name the existing run".
 
 Examples of good findings:
 - `🔴 deepseek_v2.py:1245 changes torch.zeros → torch.empty, but the old comment explicitly says "trailing pad must be zero for asm reader" and the new comment claims "never read" — if padding IS read, every quantized token in the batch gets corrupted output silently. **Author must** cite the asm spec or a test proving padding is not read.`
