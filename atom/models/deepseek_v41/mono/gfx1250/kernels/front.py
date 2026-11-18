@@ -1077,7 +1077,7 @@ def ffn_post_owner(c, TR):
         # 160 records, gate_j = sigmoid(sign(dot) sqrt(max(|dot|, 1e-6))), R'_j <- bf(R'_j + gate_j value)
         ekv = c["engkv"] + i64(r * (5 * H) + cc) * 2
         kvv = [hx.gload(ekv + i64(h * H) * 2, BF16).to(F32) for h in range(5)]
-        if c["eng"]:
+        if hx.unlikely(c["eng"]):   # (c1 code size: 2 layers of 40, off the hot path)
             if fx.const_expr("erecv" in c):
                 # (engtp) the columns of another rank's shard from its pushes (engram.eng_fetch); the value -> LDS
                 kve = ES.eng_fetch(c, b, r, cc, kvv)

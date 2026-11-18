@@ -303,7 +303,7 @@ def moe_union(c, counted=False):
     # their rank in pick order (the same in every CTA; the first 16 atomic arrivals differ by CTA): rank < 16 -> the
     # expert's list, else chunk rank // 16 - 1; the ranks from per-(round, wave, expert) ballot counts (O_OVP + 64).
     novf = hx.lload(sm + O_OVN, I32)
-    if novf > 0:
+    if hx.unlikely(novf > 0):   # (c1 code size: never with <= MAXTOK rows, off the hot path)
         if w == 0:
             ok = l < novf
             e = ok.select(hx.lload(sm + O_OVP + fx.min(l, I32(15)) * 4, I32), I32(NE))

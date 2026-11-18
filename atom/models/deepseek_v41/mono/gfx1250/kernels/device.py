@@ -468,7 +468,7 @@ def _stop_due(prev, t0):
     fc = _fail()
     r = prev
     if fx.const_expr(fc is not None):
-        if clock() - t0 > fx.Int64(FAST_TICKS):
+        if unlikely(clock() - t0 > fx.Int64(FAST_TICKS)):   # (c1 code size: off the hot path, never past 100 us in c1 serving)
             r = gload(fc[0], fx.Int32, scope="system")
     return r
 
@@ -478,7 +478,7 @@ def _stop_mark(failed):
     """A poll that timed out (failed: this lane's, not because of a STOP it saw): STOP = gen on every rank."""
     fc = _fail()
     if fx.const_expr(fc is not None):
-        if failed:
+        if unlikely(failed):   # (a timeout: off the hot path)
             for a in fc[1]:
                 gstore(a, fc[2], scope="system")
 
