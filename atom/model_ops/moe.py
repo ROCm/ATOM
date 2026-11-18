@@ -9,7 +9,16 @@ from enum import Enum
 from functools import cache, lru_cache
 
 import torch
+import inspect as _inspect
+
 from aiter import ActivationType, QuantType, dtypes, get_hip_quant, topk_gating
+
+# aiter bf37d topk_gating lacks num_valid_rows; wrap to drop it when unsupported.
+if "num_valid_rows" not in _inspect.signature(topk_gating).parameters:
+    _topk_gating_orig = topk_gating
+
+    def topk_gating(*args, num_valid_rows=None, **kwargs):  # noqa: F811
+        return _topk_gating_orig(*args, **kwargs)
 from aiter.dist.parallel_state import get_dp_group, get_pcp_group, get_tp_group
 from aiter.fused_moe import fused_moe
 from aiter.jit.utils.chip_info import get_gfx
