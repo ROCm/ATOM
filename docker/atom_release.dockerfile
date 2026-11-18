@@ -18,10 +18,10 @@ ARG BASE_IMAGE_ROCM10="ubuntu:24.04"
 #   base ──┬── build_rccl  ──┐
 #          └── build_aiter ──┴── atom_image (merge builders + install MORI/ATOM)
 #
-# Triton is NOT built from source: the ROCm PyTorch base image already ships a
-# matching Triton (installed as a torch dependency), and aiter handles its own
-# Triton needs at install time. The previous build_triton stage that compiled
-# ROCm/triton release/internal/3.5.x has been removed.
+# Triton is NOT built from source: the base stage provides it (the pinned AMD
+# wheel on the rocm/pytorch line, the SDK wheel on rocm10), and both AITER
+# installs keep it via AITER_USE_SYSTEM_TRITON=1. The previous build_triton
+# stage that compiled ROCm/triton release/internal/3.5.x has been removed.
 # ====================================================================
 
 # --------------------------------------------------------------------
@@ -512,6 +512,8 @@ ARG INSTALL_MOONCAKE_STORE=1
 # RDMA Store segments); includes the RD-atomic QP depth clamp (#4312).
 ARG MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
 ARG MOONCAKE_COMMIT="206d6340a8b578f44519ccef90bdbfe8483d0231"
+ARG MOONCAKE_GO_VERSION="1.26.10"
+ARG MOONCAKE_GO_SHA256="ccfe7ae822d2c2f41f4fe7c956199967a4dac22d0ee0d2b2bfdb440aab3b20c5"
 ARG USE_HIP_DMABUF=ON
 ARG VENV_PYTHON="/opt/venv/bin/python"
 
@@ -527,8 +529,9 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
         echo "========== Skipped Mooncake (INSTALL_MOONCAKE=0) =========="; \
     fi
 
-# [MC 2/4] Install dependencies (system packages + RDMA + submodules; the Go
-# that dependencies.sh installs is replaced by the pinned Go in [MC 3/4])
+# [MC 2/4] Install dependencies (system packages + RDMA + submodules). The Go
+# that dependencies.sh installs is removed here and replaced in [MC 3/4] by the
+# toolchain the etcd wrapper's go.mod declares (MOONCAKE_GO_VERSION).
 ENV PATH="/usr/local/go/bin:${PATH}"
 RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
         echo "========== [MC 2/4] Install Mooncake dependencies =========="; \
@@ -571,12 +574,17 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
 # HIP hipify copies tests/*.cpp into the build tree but not headers such as
 # rdma_test_peers.h, so BUILD_UNIT_TESTS=ON fails. Upstream ROCm CI also sets
 # BUILD_UNIT_TESTS=OFF; examples are unused in this image.
-# Go builds the etcd wrapper (USE_ETCD=ON). The toolchain stays installed for
-# in-container rebuilds; the module and build caches it fills here are removed
-# in this same RUN, so a rebuild only re-downloads modules.
+# Go builds the etcd wrapper (USE_ETCD=ON). MOONCAKE_GO_VERSION must be the
+# toolchain mooncake-common/etcd/go.mod declares at MOONCAKE_COMMIT;
+# GOTOOLCHAIN=local makes a mismatch fail the build instead of downloading
+# another toolchain. Only this RUN sets it: the image keeps Go's default. The
+# toolchain stays installed, and the module and build caches it fills here are
+# removed in this same RUN, so an in-container rebuild only re-downloads modules.
 RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
-        { wget -q -O /tmp/go.tar.gz https://go.dev/dl/go1.22.2.linux-amd64.tar.gz \
+        { wget -q -O /tmp/go.tar.gz "https://go.dev/dl/go${MOONCAKE_GO_VERSION}.linux-amd64.tar.gz" \
+          && echo "${MOONCAKE_GO_SHA256}  /tmp/go.tar.gz" | sha256sum -c - \
           && tar -C /usr/local -xzf /tmp/go.tar.gz && rm -f /tmp/go.tar.gz; } || exit 1; \
+        export GOTOOLCHAIN=local; \
         MC_WITH_STORE=OFF; \
         if [ "${INSTALL_MOONCAKE_STORE}" = "1" ]; then MC_WITH_STORE=ON; fi; \
         echo "========== [MC 3/4] Build and install Mooncake (USE_HIP=ON USE_HIP_DMABUF=${USE_HIP_DMABUF} ENABLE_MULTI_PROTOCOL=ON WITH_STORE=${MC_WITH_STORE}) =========="; \
@@ -655,8 +663,8 @@ RUN --mount=type=bind,from=build_rccl,source=/rccl-pkgs,target=/tmp/rccl \
         echo "no RCCL .deb staged (BUILD_RCCL=0) -- keeping the base image's RCCL"; \
     fi
 
-# Triton ships with the ROCm PyTorch base image (installed as a torch dependency);
-# no separate build/copy step is needed here.
+# Triton comes from the base stage (pinned AMD wheel on rocm/pytorch, SDK wheel
+# on rocm10); no separate build/copy step is needed here.
 
 # Aiter: copy compiled source tree + re-register editable install
 # (pip install -e creates egg-link automatically, no need to COPY them)
@@ -667,6 +675,20 @@ COPY --from=build_aiter /app/aiter-test /app/aiter-test
 RUN cd /app/aiter-test && \
     AITER_USE_SYSTEM_TRITON=1 pip install -e . --no-build-isolation && \
     pip show amd-aiter
+
+# Reproduces, on the rocm10 flavor, the packages install_triton.sh used to leave
+# behind (triton_kernels and its pytest), without its Triton reinstall.
+ARG ROCM10_TRITON_KERNELS_INDEX_URL="https://pypi.amd.com/triton/release_0914/rocm-7.2.0/simple/"
+ARG ROCM10_TRITON_KERNELS_SPEC="triton-kernels==1.0.0"
+RUN if [ "${ATOM_BASE_IMAGE}" = "rocm10-base" ]; then \
+        echo "========== [ATOM] Install ${ROCM10_TRITON_KERNELS_SPEC} (index ${ROCM10_TRITON_KERNELS_INDEX_URL}) =========="; \
+        python3 -m pip install --extra-index-url "${ROCM10_TRITON_KERNELS_INDEX_URL}" "${ROCM10_TRITON_KERNELS_SPEC}" && \
+        python3 -c "import triton_kernels; from importlib.metadata import version; \
+assert 'rocm10' in version('triton'), version('triton'); \
+print('triton', version('triton'), '| triton_kernels', version('triton_kernels'), '| pytest', version('pytest'))"; \
+    else \
+        echo "========== Skipped triton-kernels restore (not rocm10-base) =========="; \
+    fi
 
 # RTL (rocm-trace-lite): lightweight GPU kernel profiler (~250KB, no build deps)
 RUN pip install rocm-trace-lite && \
