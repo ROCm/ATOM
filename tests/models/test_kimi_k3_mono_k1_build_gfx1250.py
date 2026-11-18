@@ -226,3 +226,34 @@ def test_head_split_refuses_other_counts(monkeypatch):
     monkeypatch.setenv("ATOM_KIMI_MONO_K1_HEAD_SPLIT", "3")
     with pytest.raises(ValueError):
         kda_resident_gfx1250._head_split(48, 256)
+
+
+def test_replay_records_bound_what_a_step_finds_committed():
+    # the serving cache_len 16, DSpark 4's window 5: a flush once h > 6
+    assert builder.replay_records(16, 5) == 11
+    assert builder.replay_staged(16, 5) == 12
+    assert builder.replay_staged(16, 8) == 8
+
+
+def test_replay_lds_appends_to_the_recurrence_only():
+    plain = builder.role_lds_plan(_plan(40), qlen=5)
+    replay = builder.role_lds_plan(_plan(40), qlen=5, replay_cap=16, replay_window=5)
+    assert plain == builder.role_lds_plan(_plan(40), qlen=5, replay_cap=0)
+    assert plain != replay
+    fields = repr(replay)
+    assert "glog" in fields and "rec" in fields
+    assert "glog" not in repr(plain)
+
+
+@pytest.mark.parametrize(
+    ("cap", "window", "message"),
+    (
+        (16, 4, "window"),  # narrower than the query
+        (8, 5, "window"),  # two windows do not fit the buffer
+        (0, 5, "without a record buffer"),
+    ),
+)
+def test_replay_spec_refuses_an_inconsistent_window(cap, window, message):
+    spec = replace(_spec(5), replay_cap=cap, replay_window=window)
+    with pytest.raises(ValueError, match=message):
+        spec.validate(_plan(40))

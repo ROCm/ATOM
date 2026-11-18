@@ -58,6 +58,7 @@ from atom.models.kimi_k3.mono.k1_local_runner_gfx1250 import (
 )
 from atom.models.kimi_k3.mono.kernels.attention.kda_builder_gfx1250 import (
     K1LocalBuildSpec,
+    role_lds_plan,
     split_projection_fits,
 )
 from atom.models.kimi_k3.mono.kernels.execution_plan import (
@@ -129,6 +130,32 @@ from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
 K1_PTPC_FUSION_MAX_ROWS = 40
+
+
+# ReplaySSM's (cache_len, verify window, query length)s K1 is checked
+# against the production path for (``tools/kimi_k3_mono_k1_replay_check.py``):
+# DSpark 4's uniform verify at the serving cache_len
+REPLAY_VERIFIED = frozenset({(16, 5, 5)})
+
+
+def replay_refusal(
+    plan: Gfx1250KimiBuildPlan, cap: int, window: int, qlen: int
+) -> str | None:
+    """Why K1 cannot serve a ReplaySSM step of ``plan``'s rows at ``qlen``
+    (None: it can, or ReplaySSM is off). Mono and the production path keep
+    one state format, so a refused width runs the production step."""
+    if not cap:
+        return None
+    if (cap, window, qlen) not in REPLAY_VERIFIED:
+        return (
+            f"gfx1250 K1 ReplaySSM is unverified at cache_len {cap}, window "
+            f"{window}, query length {qlen}"
+        )
+    try:
+        role_lds_plan(plan, qlen=qlen, replay_cap=cap, replay_window=window)
+    except ValueError as e:
+        return f"gfx1250 K1 ReplaySSM records do not fit LDS: {e}"
+    return None
 
 
 def _uses_ptpc_o_proj(layer) -> bool:
@@ -457,8 +484,6 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         self.ix = None
         if self.debug:
             raise MonoUnsupported("gfx1250 packed mono does not support debug mode")
-        if self.replay_cap:
-            raise MonoUnsupported("gfx1250 K1 does not support ReplaySSM")
         self.blocks = torch.cuda.get_device_properties(
             self.device
         ).multi_processor_count
@@ -538,6 +563,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
 
     def _allocate(self) -> None:
         self.ones = torch.ones(self.max_rows, dtype=torch.int32, device=self.device)
+        self._replay_refused: set[tuple[int, int]] = set()
 
     def close(self) -> None:
         """There is no peer mapping to retire on the RCCL path."""
@@ -545,6 +571,15 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
     def prepare(self, rows: int, qlen: int) -> bool:
         if not 0 < rows <= self.max_rows or rows % qlen:
             return False
+        if self.replay_cap:
+            window = kda_metadata(get_forward_context()).replayssm_max_query_len
+            why = replay_refusal(self._plan(rows, 1), self.replay_cap, window, qlen)
+            if why is not None:
+                key = (rows, qlen)
+                if key not in self._replay_refused:
+                    self._replay_refused.add(key)
+                    logger.warning("Kimi-K3 gfx1250 mono: %d rows: %s", rows, why)
+                return False
         return self.widths.prepare(width_key(rows, qlen))
 
     def _plan(self, rows: int, nblocks: int) -> Gfx1250KimiBuildPlan:

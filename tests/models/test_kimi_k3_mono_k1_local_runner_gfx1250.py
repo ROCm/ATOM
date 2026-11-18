@@ -229,3 +229,32 @@ def test_fp8_in_projection_takes_its_block_scales_through_the_abi():
         Gfx1250K1LocalRunner(plan, _spec(), result)(
             replace(_runtime(), w_in_scale=scale)
         )
+
+
+def _replay_runner(cap):
+    plan = _plan()
+    spec = replace(_spec(), replay_cap=cap, replay_window=1 if cap else 0)
+    declaration = builder.declare_local(plan, qlen=1)
+    kernel = SimpleNamespace(
+        complete=True, launcher=lambda *_args, **_kwargs: None, launch_count=1
+    )
+    result = SimpleNamespace(
+        runnable=True, kernel=kernel, declaration=declaration, launch_count=1
+    )
+    return Gfx1250K1LocalRunner(plan, spec, result)
+
+
+def test_replay_build_requires_its_pointer_table():
+    with pytest.raises(ValueError, match="pointer table"):
+        _replay_runner(16)(_runtime())
+    with pytest.raises(ValueError, match="pointer table"):
+        _replay_runner(16)(
+            replace(_runtime(), replay=torch.zeros(4, dtype=torch.int64))
+        )
+
+
+def test_plain_build_takes_no_replay_table():
+    with pytest.raises(ValueError, match="no replay table"):
+        _replay_runner(0)(
+            replace(_runtime(), replay=torch.zeros(5, dtype=torch.int64))
+        )

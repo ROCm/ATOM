@@ -25,7 +25,7 @@ from atom.models.kimi_k3.mono.kernels.attention.kda_builder_gfx1250 import (
     K1KernelDeclaration,
     K1LocalBuildSpec,
     local_scratch_layout,
-    replay_records,
+    replay_staged,
 )
 from atom.models.kimi_k3.mono.kernels.attention.protocol import (
     ATTENTION_CTAS,
@@ -561,6 +561,10 @@ def build_resident_k1(
                         "rstate": rstate,
                         "rs_seq": rs_seq,
                         "replay": replay,
+                        "cap": spec.replay_cap,
+                        "hmax": replay_staged(spec.replay_cap, spec.replay_window)
+                        if spec.replay_cap
+                        else 0,
                     },
                     unit // HEADS,
                     unit % HEADS,
@@ -989,7 +993,7 @@ def build_resident_k1(
             recurrence_context.update(
                 cap=spec.replay_cap,
                 rwin=spec.replay_window,
-                hmax=replay_records(spec.replay_cap, spec.replay_window),
+                hmax=replay_staged(spec.replay_cap, spec.replay_window),
                 glog=recurrence.glog.ptr,
                 rec=recurrence.rec.ptr,
             )

@@ -101,6 +101,15 @@ def replay_records(cap: int, window: int) -> int:
     return max(window, cap - window)
 
 
+# records K1 replays an iteration (the staged ones past h zeros)
+REPLAY_GROUP = 4
+
+
+def replay_staged(cap: int, window: int) -> int:
+    """The records a K1 task stages: ``replay_records``, whole groups."""
+    return -(-replay_records(cap, window) // REPLAY_GROUP) * REPLAY_GROUP
+
+
 def _align(value: int) -> int:
     return (value + ALIGNMENT - 1) // ALIGNMENT * ALIGNMENT
 
@@ -581,7 +590,7 @@ def role_lds_plan(
     replay = (
         (
             ("glog", qlen * HEAD_DIM * 4),
-            ("rec", replay_records(replay_cap, replay_window) * HEAD_DIM * 8),
+            ("rec", replay_staged(replay_cap, replay_window) * HEAD_DIM * 8),
         )
         if replay_cap
         else ()
