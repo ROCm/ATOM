@@ -253,21 +253,54 @@ RPC targets must not perform cross-DP collectives: each EngineCore dequeues
 control work independently, so another DP engine may already be waiting in the
 busy loop's state all-reduce.
 
-Direct, SHM and IPC weight updates are fenced sessions. The first bucket stops
-serving; CoreManager clears the fence only after every DP engine completes the
-final bucket. Built-in senders abort from ``finally`` if iteration stops early,
-and asynchronous weight-update utility sends are rejected because they have no
-owner to finish or abort them. ``AsyncLLMEngine.get_weight_sync_status()``
-reports a fence, an in-progress session and its last failure.
+Direct, SHM, IPC and RDMA (``AsyncLLMEngine.receive_weights_rdma``) weight
+updates are fenced sessions. The first bucket stops serving; CoreManager clears
+the fence only after every DP engine completes the final bucket. Built-in
+senders abort from ``finally`` if iteration stops early, and asynchronous
+weight-update utility sends are rejected because they have no owner to finish
+or abort them. ``AsyncLLMEngine.get_weight_sync_status()`` reports a fence, an
+in-progress session, its last failure, and whether the weights are whole.
 
 Every update carries the id of the sync it belongs to: one per
 ``weight_sync_session()`` until that sync finishes, and one per update sent
 outside a session. A session whose update failed sends nothing more, and an
 engine refuses the remaining updates and the finish of a failed or aborted
 sync, so the rest of a failed sync cannot commit as a new one. Recovering takes
-a new, complete sync. Weights may be resumed while fenced, since after
+a new sync that rewrites every parameter: once a sync has failed or been
+abandoned between buckets, the runners refuse to complete one that leaves any
+parameter as it was. Weights may be resumed while fenced, since after
 ``sleep(level=2)`` only a resume gives released parameters storage again; the
 fence keeps serving off until that complete sync commits.
+
+What syncs the runners can take is asked once, at engine startup, when
+``Config.weight_sync_runner`` says they answer ``get_worker_capabilities``
+(``AsyncLLMEngine`` sets it); a runner that cannot answer fails startup. Each
+engine reports the answer in its READY, and CoreManager refuses a reload that
+any engine's runners cannot take before any engine runs it -- under PP, one
+stage's runners alone may be the ones that cannot. Such a sync -- a model a
+reload cannot rewrite in place, such as MLA, prefill context parallelism,
+expert-parallel or redundant-expert MoE, or weights in a format a
+full-precision write cannot produce -- writes nothing and fences nothing. The
+engine and the runners refuse it too, before writing. A sync whose updates
+every rank refused before writing, or that never reached a rank, leaves the
+fence and the prefix cache as they were when the sync began. Weights a sleep
+discards are not whole either: the engine stays fenced until a sync that
+rewrites every parameter.
+
+An RDMA stream is decided by the runners. Each waits for every broadcast for
+at most its weight group's ``timeout_s``, and the group is built to abort its
+communicator on a timeout rather than end the process. So a trainer that dies
+mid-stream fails the stream on every rank once that timeout has passed since
+the last frame each rank received, and the group has been torn down. The group
+then has to be joined again, and the engine stays fenced until a sync rewrites
+every parameter. A caller that stops waiting before the engine answers does
+not learn whether the stream was written, and the engine stays fenced the same
+way. A stream's version is used up only once FINISH commits it, so a sync the
+engine failed can be retried at the same version. The engine keeps each group's
+committed version, and forgets it when the runners join that group anew or
+leave it; so ``collective_rpc`` takes ``group_name`` only as a keyword for
+``init_rdma_weight_group`` and ``destroy_rdma_weight_group``, and refuses
+either call otherwise.
 
 ## Sequence lifecycle
 

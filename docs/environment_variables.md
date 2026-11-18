@@ -49,6 +49,12 @@ Every node reads its own environment, so a variable that changes what a rank com
 
 The nodes trust each other: the engine's store and the workers' reply channels are unauthenticated TCP on `--data-parallel-master-ip` and carry pickled objects, so that address must be on a network only the nodes can reach.
 
+## Pipeline parallelism
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_PP_MAX_INFLIGHT** | int | 0 | Batches the PP head keeps in flight before it waits for the oldest to return. Every launched batch counts until the last stage completes it, middle prefill chunks included. `0` uses `pipeline_parallel_size`; a negative value is an error. A larger cap keeps the head issuing while a long batch holds the stages ahead of it. Its cost is queueing: batches past the stage count wait on the stages, so each takes longer to return. Kimi-K3's PP8 P/D prefill at C88 sets 16, ~15% more throughput than 8, and 12 was no better than 16. Other models and PP sizes are unmeasured, so the default stays the stage count. |
+
 ## Prefill delayer (TP/DCP and DP attention)
 
 Coalesces waiting prefills while decode continues. DP attention enables it by

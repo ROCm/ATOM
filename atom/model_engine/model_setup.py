@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import logging
 import os
-import time
 from collections.abc import Callable
 
 import torch
@@ -22,7 +21,6 @@ from atom.distributed.simulated_tp import apply_simulated_tp, reject_simulated_t
 from atom.distributed.ulysses_sp import check_aiter_sp_api, sp_is_enabled
 from atom.model_engine.tp_multinode import managed_store_client
 from atom.model_loader.loader import load_model
-from atom.model_loader.loading_core import rank_tag
 from atom.models.registry import support_model_arch_dict
 from atom.spec_decode.factory import build_drafter
 from atom.utils import resolve_obj_by_qualname
@@ -136,9 +134,9 @@ def init_model_env(config: Config, rank: int) -> torch.device:
 
 
 def get_model(config: Config, device: torch.device, load: ModelLoader) -> nn.Module:
-    """This rank's model with its weights, after ``init_model_env``: ``load``
-    builds it and gets the weights (``load_from_disk``, or a builder whose
-    weights come from elsewhere). Leaves the config's dtype as the default."""
+    """This rank's model, after ``init_model_env``: ``load`` builds it and
+    gets its weights (``build_model`` then ``load_weights``, or a builder
+    whose weights come later). Leaves the config's dtype as the default."""
     torch.set_default_dtype(config.torch_dtype)
     model_class = resolve_obj_by_qualname(
         support_model_arch_dict[config.hf_config.architectures[0]]
@@ -164,29 +162,16 @@ def build_model(config: Config, model_class: type, device: torch.device) -> nn.M
         torch.set_default_device(None)
 
 
-def load_weights(model: nn.Module, config: Config) -> None:
-    """Load the checkpoint into a built model and process it for serving."""
-    load_model(
+def load_weights(model: nn.Module, config: Config) -> set[str]:
+    """Load the checkpoint into a built model and process it for serving.
+    Returns the names of the parameters the checkpoint wrote."""
+    return load_model(
         model,
         config.model,
         config.hf_config,
         config.load_dummy,
         load_fused_expert_weights_fn=getattr(model, "load_fused_expert_weights", None),
     )
-
-
-def load_from_disk(
-    config: Config, model_class: type, device: torch.device, tag: str | None = None
-) -> nn.Module:
-    """The default ModelLoader. ``tag``: how the log names this rank."""
-    model = build_model(config, model_class, device)
-    t0 = time.perf_counter()
-    load_weights(model, config)
-    logger.info(
-        f"[{tag or rank_tag()}] Model load done: {config.model} "
-        f"(weights loaded in {time.perf_counter() - t0:.2f}s)"
-    )
-    return model
 
 
 def load_drafter_from_disk(config: Config, device: torch.device, runner, target):
