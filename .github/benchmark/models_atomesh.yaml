@@ -2769,6 +2769,37 @@ models:
               DECODE_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_device":"rdma4,rdma5,rdma6,rdma7","pd_admission":{"enabled":true,"max_pending_kv_fraction":0.15,"num_reserved_decode_tokens":512}}
 
+        # 1P2D with the Store over both nodes' DRAM: node 1 starts its own owners and joins
+        # node 0's masters. Router and sequence limits follow wanzhenchn's C240 runs.
+        - <<: *m31b_agentx
+          name: m31b-nvfp4-1p2d-pp4-tp4x2-dspark7-mcstore2n-agentx-c240
+          topology: 1p2d
+          display_topology: 1P2D-PP4-2xTP4-DSPARK7-NVFP4-MCSTORE2N
+          pd_worker_layout: packed_nodes
+          concurrency: [240]
+          router:
+            policy: cache_aware
+            balance_abs_threshold: 2
+          decode:
+            workers: 2
+            tp: 4
+            cudagraph: "[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160,176,192,208,224,240]"
+          server:
+            common_args:
+              max_num_seqs: 480
+              decode_max_num_seqs: 240
+              spec_decode_acceptance_length: 4.04
+          env:
+            common:
+              <<: *m31b_common_env
+              # The one prefill's API server tokenizes twice the 1P1D sessions.
+              ATOM_TOKENIZE_CACHE_MB: "2048"
+            prefill:
+              <<: *m31b_mcstore_prefill_env
+              # Node 1 here is half a node (GPUs 4-7): its owners stay on NUMA1 and rdma6/7.
+              MOONCAKE_STORE_DECODE_OWNERS: "1:192:rdma6;1:192:rdma7"
+            decode: *m31b_decode_env
+
         # DSpark4 (InferenceX golden AL 3.19) against DSpark7 at the same concurrency.
         - <<: *m31b_agentx
           name: m31b-nvfp4-1p1d-pp4-tp4-dspark4-mcstore-agentx-c140
