@@ -9,6 +9,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
+from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
+    FP4_GFX950_OPUS,
+    FP4_GFX950_PRESHUFFLE,
+)
+
 
 class MoeMode(str, Enum):
     """Public arithmetic modes for the expert up/gate and down projections."""
@@ -223,6 +228,9 @@ class V4Config:
     attention_fp8_bf16: bool = False
     # Hadamard-rotate indexer q/k as the model does; ATOM's cache is unrotated, so serving it needs False
     indexer_hadamard: bool = True
+    # Native and Mono share the physical index pool across prefill/decode.
+    # Codes are identical; the OPUS ABI permutes E8M0 scales for its MFMA.
+    indexer_layout: str = FP4_GFX950_PRESHUFFLE
     # CSA layers always consume an index selection, but native V4 may only
     # produce a fresh selection every Nth CSA layer.  Reuse layers share the
     # CSA arena with their producer and read ``i_sel`` with that layer's tag.
@@ -318,6 +326,10 @@ class V4Config:
         return self.head_dim**-0.5
 
     def validate(self) -> None:
+        if self.indexer_layout not in (FP4_GFX950_PRESHUFFLE, FP4_GFX950_OPUS):
+            raise ValueError(
+                f"unsupported Mono FP4 index layout {self.indexer_layout!r}"
+            )
         assert self.compress_ratio == 0 or self.window % self.compress_ratio == 0
         assert self.nope_dim % 64 == 0, "act_quant blocks the nope part by 64"
         assert self.heads % self.o_groups == 0
@@ -353,6 +365,7 @@ def shape_dims(cfg) -> dict:
         "compressor_projection_bf16": cfg.compressor_projection_bf16,
         "attention_fp8_bf16": cfg.attention_fp8_bf16,
         "indexer_hadamard": cfg.indexer_hadamard,
+        "indexer_mfma_scales": cfg.indexed and cfg.indexer_layout == FP4_GFX950_OPUS,
         "n_experts": cfg.n_experts,
         "top_k": cfg.top_k,
         "inter": cfg.inter,

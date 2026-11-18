@@ -7,7 +7,6 @@ rows read are the checkpoint's, bit for bit). Chosen at construction, before che
 deployment (``config.config_refusal``, TP1); otherwise the model keeps ATOM's own embedding.
 """
 
-import ctypes
 import functools
 import logging
 import threading
@@ -18,6 +17,7 @@ import triton.language as tl
 from torch import nn
 
 from atom.model_ops.engram import host_memory
+from atom.model_ops.engram.host_memory import device_address
 from atom.model_ops.utils import atom_parameter
 
 logger = logging.getLogger("atom")
@@ -42,37 +42,6 @@ def pin_rows(sources):
         for lease in leases:
             lease.release()
     return out
-
-
-@functools.cache
-def _hip_device_pointer():
-    # The runtime `host_memory` page-locks with: another one does not know
-    # its allocations.
-    hip = host_memory._hip_runtime()
-    if hip is None:
-        return None
-    try:
-        fn = hip.hipHostGetDevicePointer
-    except AttributeError:
-        return None
-    fn.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint]
-    return fn
-
-
-def device_address(host_address: int) -> int:
-    """Where the device reaches page-locked host memory at `host_address`.
-
-    Not always the host address: memory registered in place
-    (`hipHostRegister`) is mapped at a different device address, and a kernel
-    handed the host one faults. Identity where there is no HIP runtime.
-    """
-    fn = _hip_device_pointer()
-    if fn is None:
-        return host_address
-    out = ctypes.c_void_p()
-    if fn(ctypes.byref(out), host_address, 0) != 0 or not out.value:
-        raise RuntimeError(f"no device address for host memory at {host_address:#x}")
-    return out.value
 
 
 class MonoPleHostTable:
@@ -201,7 +170,11 @@ class MonoPleHostTable:
                 address += (first - self.vocab_start) * row_bytes
             else:
                 row_start, pinned = self._rows[shard]
-                address = device_address(pinned.data_ptr())
+                # (not always the host address: memory registered in place is
+                # mapped at another device address, and a kernel handed the
+                # host one faults; the host address where there is no HIP
+                # runtime to ask)
+                address = device_address(pinned.data_ptr(), identity_without_hip=True)
                 address -= (row_start - first) * row_bytes
             bases[shard] = address
         return bases

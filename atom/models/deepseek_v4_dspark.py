@@ -41,6 +41,7 @@ Checkpoint layout (DeepSeek-V4-Pro-DSpark):
   (embed + lm_head are shared with the target via share_with_target)
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
@@ -571,6 +572,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
         self,
         main_x: torch.Tensor,  # [T, dim]  target hidden(s)
         positions: torch.Tensor,  # [T]
+        slot_mapping: torch.Tensor | None = None,  # unused: addressed by position
     ) -> None:
         """Write target-KV rows into each request's rolling window.
 
@@ -584,7 +586,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
         Every scheduled row is written on every step: the window must hold a row
         for every position it spans, and the read side gathers slots by absolute
         position regardless of whether they were ever written. See
-        :meth:`DSparkProposer.propose` for why writing rejected rows is safe.
+        :meth:`DSparkProposer._propose` for why writing rejected rows is safe.
 
         The draft window KV lives in the draft layer's own plane
         (``self.attn.swa_plane``), addressed by ``self.attn.swa_window`` exactly
@@ -598,25 +600,44 @@ class DSparkLayer(Block):  # type: ignore[misc]
         configs and ``swa_write`` asserts the relation rather than aliasing
         silently.
         """
-        from atom.utils.forward_context import get_forward_context
+        self.write_context_kv_rows(self.context_kv_rows(main_x, positions), positions)
 
-        fc = get_forward_context()
-        attn_md = fc.attn_metadata
-        B = fc.context.scheduled_bs
-        cu_seqlens_q = attn_md.cu_seqlens_q[: B + 1]
-        a = self.attn
+    def context_kv_rows(
+        self,
+        main_x: torch.Tensor,  # [T, dim]  target hidden(s)
+        positions: torch.Tensor,  # [T]
+    ) -> tuple[torch.Tensor, ...]:
+        """The window KV rows `write_context_kv` writes, before writing them:
+        `(kv [T, head_dim],)` for a bf16 window, the 2buff pair
+        `(packed fp8 [T, 512], rope bf16 [T, 64])` for an fp8 one. Each row is
+        made on its own, so a PCP rank can make just its rows and gather them."""
         # An fp8 window is the planes' own 2buff layout, so the verified target
         # KV is quantized for real on its way in and scattered across both
         # planes, exactly as the draft block's own KV is by the fused quant in
         # `dspark_attention`. The QAT fake round trip is skipped: it holds the
         # same NoPE lanes at fp8 precision in bf16 storage, which is what the
         # real quant supersedes.
-        to_2buff = a.swa_plane.dtype != torch.bfloat16
-        main_kv = self._compute_main_kv(
-            main_x, positions, fake_quant=not to_2buff
-        )  # [T, head_dim]
+        to_2buff = self.attn.swa_plane.dtype != torch.bfloat16
+        main_kv = self._compute_main_kv(main_x, positions, fake_quant=not to_2buff)
         if to_2buff:
-            k_packed, k_rope = quantize_bf16_to_v4_2buff_triton(main_kv)
+            return quantize_bf16_to_v4_2buff_triton(main_kv)
+        return (main_kv,)
+
+    def write_context_kv_rows(
+        self,
+        rows: tuple[torch.Tensor, ...],  # `context_kv_rows`
+        positions: torch.Tensor,  # [T]
+    ) -> None:
+        """The write half of `write_context_kv`."""
+        from atom.utils.forward_context import get_forward_context
+
+        fc = get_forward_context()
+        attn_md = fc.attn_metadata
+        B = fc.context.running_bs
+        cu_seqlens_q = attn_md.cu_seqlens_q[: B + 1]
+        a = self.attn
+        if a.swa_plane.dtype != torch.bfloat16:
+            k_packed, k_rope = rows
             swa_write(
                 None,  # bf16 KV: unused once the 2buff pair is supplied
                 positions,  # [T] int64
@@ -637,6 +658,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
         # mismatch surfaces here rather than as a silent per-step copy, or as a
         # silently reinterpreted store inside swa_write, which has no dtype
         # guard. `raise`, not `assert`: a bare assert vanishes under `python -O`.
+        (main_kv,) = rows
         if main_kv.dtype != a.swa_plane.dtype:
             raise TypeError(
                 f"DSpark draft KV dtype {main_kv.dtype} != window dtype "
@@ -1017,20 +1039,53 @@ class DeepseekV4DSpark(DSparkDraftModel):
 
     # ---- drafting entry points (called by the proposer) --------------------
 
-    def project_context(self, aux_concat: torch.Tensor) -> torch.Tensor:
-        """``main_norm(main_proj(concat(aux)))`` -- the shared context.
+    def project_context(self, taps: Sequence[torch.Tensor]) -> torch.Tensor:
+        """``main_norm(main_proj(concat(taps)))`` -- the shared context.
 
         Stage 0 owns main_proj/main_norm; the projection runs once and every
         stage then writes its own rolling-KV rows from it (each stage has its
         own kv cache and attention linears).
         """
         stage0 = self.model.mtp[0]
-        return stage0.main_norm(linear_out(stage0.main_proj(aux_concat)))
+        return stage0.main_norm(linear_out(stage0.main_proj(self.concat_taps(taps))))
 
     @property
     def context_layers(self):
         """Every backbone stage keeps its own window; `mtp` is already in order."""
         return self.model.mtp
+
+    def write_split_context_kv(
+        self,
+        taps_local: Sequence[torch.Tensor],  # this PCP rank's stripe of each tap
+        positions: torch.Tensor,  # [num_tokens] absolute positions
+        num_tokens: int,
+        slot_mapping: torch.Tensor | None = None,  # unused: addressed by position
+    ) -> None:
+        """The context and every stage's window KV are made row by row, so make
+        this rank's rows and gather all stages' KV in one collective, already
+        2buff under an fp8 window: 640 B a row against bf16's 1 KiB, and
+        each row is quantized once instead of on every rank."""
+        from atom.distributed.pcp_utils import (
+            get_pcp_world_size,
+            pcp_allgather_rerange_many,
+            pcp_pad_dense,
+            pcp_round_robin_split,
+        )
+
+        pcp_ws = get_pcp_world_size()
+        pad = taps_local[0].shape[0] * pcp_ws - num_tokens
+        local_positions = pcp_round_robin_split(
+            pcp_pad_dense(positions[:num_tokens], pad), pcp_ws
+        )
+        ctx_local = self.project_context(taps_local)
+        layers = list(self.context_layers)
+        local = [layer.context_kv_rows(ctx_local, local_positions) for layer in layers]
+        gathered = iter(
+            pcp_allgather_rerange_many([t for rows in local for t in rows], pcp_ws)
+        )
+        for layer, rows in zip(layers, local):
+            full = tuple(next(gathered)[:num_tokens] for _ in rows)
+            layer.write_context_kv_rows(full, positions)
 
     def forward_spec(
         self,

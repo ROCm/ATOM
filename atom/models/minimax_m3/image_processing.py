@@ -31,6 +31,8 @@ def image_input_refusal(atom_config: "Config") -> str | None:
     """Why this deployment takes no image input, or None."""
     if getattr(atom_config.hf_config, "vision_config", None) is None:
         return "the checkpoint has no vision_config (a text-only export)"
+    if atom_config.sequence_parallel_size > 1:
+        return "Ulysses SP (--sequence-parallel-size > 1)"
     mode = atom_config.compilation_config.cudagraph_mode
     if not atom_config.enforce_eager and mode is not None and mode.uses_tr_hybrid():
         # Image input needs the compiled model to always take inputs_embeds,

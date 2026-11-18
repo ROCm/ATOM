@@ -7,9 +7,11 @@ from atom.model_engine.sequence import Sequence, SequenceStatus, get_exit_sequen
 from atom.sampling_params import SamplingParams
 
 
-def test_speculative_logprobs_are_rejected_before_request_admission():
-    with pytest.raises(ValueError, match="logprobs.*speculative"):
-        Sequence([1, 2], 16, SamplingParams(logprobs=True), num_draft_tokens=5)
+def test_speculative_logprobs_request_is_admitted():
+    seq = Sequence(
+        [1, 2], 16, SamplingParams(logprobs=True, top_logprobs=5), num_draft_tokens=5
+    )
+    assert seq.return_logprobs and seq.top_logprobs == 5
     assert Sequence([1, 2], 16, SamplingParams(logprobs=True)).return_logprobs
 
 
@@ -33,6 +35,12 @@ class TestSequenceCreation:
     def test_explicit_id(self, seq_factory):
         seq = seq_factory([1, 2], id=42)
         assert seq.id == 42
+
+    def test_explicit_id_zero_is_kept(self, seq_factory):
+        # engine_v1 clients may assign 0; only None takes the counter's id.
+        seq_factory([1])  # the counter is past 0, so it cannot hand out 0
+        seq = seq_factory([1, 2], id=0)
+        assert seq.id == 0
 
     def test_sampling_params_propagated(self):
         sp = SamplingParams(temperature=0.5, max_tokens=100, ignore_eos=True)

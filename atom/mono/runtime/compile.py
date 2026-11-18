@@ -57,14 +57,12 @@ def compile_kernels(kernels) -> list:
 
 def trace(launcher, abi) -> Record:
     """``launcher``'s hand-offs, traced compile-only (no launch, no GPU needed
-    with ``ARCH`` set). A build served from FlyDSL's disk cache is not traced,
-    so the caller disables the cache (``FLYDSL_RUNTIME_ENABLE_CACHE=0``)."""
+    with ``ARCH`` set). FlyDSL traces a build before it looks it up, so a
+    build in its disk cache is traced too."""
     with recording() as rec:
         compile_kernels([(launcher, abi)])
     if not rec.stages:
-        raise RuntimeError(
-            "nothing traced: a cached build? set FLYDSL_RUNTIME_ENABLE_CACHE=0"
-        )
+        raise RuntimeError("nothing traced")
     return rec
 
 

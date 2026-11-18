@@ -3,7 +3,6 @@
 
 # from flash_attn import flash_attn_with_kvcache
 import functools
-import importlib
 import logging
 import os
 from abc import ABC, abstractmethod
@@ -22,6 +21,7 @@ from atom.utils.region_graph import eager_region
 from atom.utils.selector import Family, get_attn_backend
 
 from .attention_mla import MLAModules, _mla_output_width
+from .sp_attention import gather_heads, ulysses_attention
 
 logger = logging.getLogger("atom")
 
@@ -213,45 +213,6 @@ def _flydsl_arch_supported() -> bool:
     return get_gfx_runtime() in _FLYDSL_PA_ARCHS
 
 
-@functools.lru_cache(maxsize=1)
-def _flydsl_explicit_plan_api() -> bool:
-    """Whether aiter has #5809's FlyDSL decode API (a required work plan).
-
-    An older aiter would raise on the first call; probing once lets the gate
-    decline the call before entering aiter.
-    """
-    import inspect
-
-    try:
-        # By module path: aiter.ops.flydsl lazily exports a `pa_decode`
-        # function, which `from aiter.ops.flydsl import pa_decode` can return.
-        mod = importlib.import_module("aiter.ops.flydsl.pa_decode")
-    except ImportError:
-        ok = False
-    else:
-        params = inspect.signature(mod.pa_decode).parameters
-        plan = params.get("work_plan")
-        ok = (
-            hasattr(mod, "plan_pa_decode")
-            and plan is not None
-            and plan.kind is inspect.Parameter.KEYWORD_ONLY
-            and plan.default is inspect.Parameter.empty
-            and "max_context_length" in params
-        )
-    if not ok:
-        fallback = (
-            "using gluon"
-            if pa_decode_gluon_supports_arch()
-            else "this GPU has no gluon fallback"
-        )
-        logger.warning(
-            "FlyDSL paged decode is enabled but this aiter predates the #5809 "
-            "decode API; %s.",
-            fallback,
-        )
-    return ok
-
-
 def _flydsl_pa_decode_num_seqs(
     *,
     output: torch.Tensor,
@@ -310,8 +271,6 @@ def _flydsl_pa_decode_num_seqs(
     if k_cache.shape[-2] not in _FLYDSL_PA_BLOCK_SIZES:
         return None
     if not _flydsl_arch_supported():
-        return None
-    if not _flydsl_explicit_plan_api():
         return None
     if context_partition_size != _FLYDSL_PA_TILE:
         return None
@@ -375,15 +334,9 @@ def _flydsl_plan_max_batch() -> int:
     the planner's LDS: the 16-byte-rounded task_ends array plus scan storage
     must fit one block (81792 sequences on gfx1250).
     """
-    import inspect
-
     from aiter.jit.utils.chip_info import get_gfx_runtime
 
-    planner = importlib.import_module("aiter.ops.flydsl.pa_decode").plan_pa_decode
-    if (
-        get_gfx_runtime() != "gfx1250"
-        or "max_batch_size" not in inspect.signature(planner).parameters
-    ):
+    if get_gfx_runtime() != "gfx1250":
         return _FLYDSL_PLAN_MAX_BATCH
     lds = torch.cuda.get_device_properties(
         torch.cuda.current_device()
@@ -496,6 +449,7 @@ def _flydsl_prepare_explicit_plan(
     existing_plan,
     plan_step_owner=None,
     plan_cache_owner=None,
+    plan_segment: int = 0,
 ):
     """Return the explicit plan aiter #5809 requires.
 
@@ -504,6 +458,9 @@ def _flydsl_prepare_explicit_plan(
     default budget.
     ``plan_step_owner``: a per-step object whose calls all share the same
     lengths; the plan is then refreshed once per step instead of every call.
+    ``plan_segment``: which slice of one call's rows this is, for a caller that
+    runs more rows than one plan takes in segments of equal size, each with a plan
+    of its own.
     ``plan_cache_owner``: the object that owns plan/scratch storage. Omit it
     for process-lifetime storage (required by captured decode graphs); sparse
     prefill passes its ephemeral metadata so variable row counts are released.
@@ -544,6 +501,7 @@ def _flydsl_prepare_explicit_plan(
         workgroup_budget,
         device.index,
         plan_step_owner is not None,
+        plan_segment,
     )
     plans = _FLYDSL_RUNTIME_PLANS
     if plan_cache_owner is not None:
@@ -1068,6 +1026,11 @@ def unified_attention_with_output_base(
             positions=positions,
             q_scale=q_scale,
         )
+    elif getattr(self, "sp_columns", None) is not None:
+        # Ulysses: trade this rank's token chunk for its head slice around the
+        # unchanged impl. Inside the custom op, so the collectives stay opaque.
+        out, rows = ulysses_attention(self, q, k, v, positions, q_scale, qkv)
+        return gather_heads(out, rows, self.sp_head_exchange)
     else:
         return self.impl.forward(
             query=q,

@@ -29,7 +29,7 @@ async fn test_conversations_crud_basic() {
         .queue_timeout_secs(5)
         .build_unchecked();
 
-    let ctx = crate::common::create_test_context(router_cfg).await;
+    let (ctx, _prepare_runtime) = crate::common::create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create
@@ -313,7 +313,7 @@ async fn test_conversation_items_create_and_get() {
         .queue_timeout_secs(5)
         .build_unchecked();
 
-    let ctx = crate::common::create_test_context(router_cfg).await;
+    let (ctx, _prepare_runtime) = crate::common::create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create conversation
@@ -399,7 +399,7 @@ async fn test_conversation_items_delete() {
         .queue_timeout_secs(5)
         .build_unchecked();
 
-    let ctx = crate::common::create_test_context(router_cfg).await;
+    let (ctx, _prepare_runtime) = crate::common::create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create conversation
@@ -507,7 +507,7 @@ async fn test_conversation_items_max_limit() {
         .queue_timeout_secs(5)
         .build_unchecked();
 
-    let ctx = crate::common::create_test_context(router_cfg).await;
+    let (ctx, _prepare_runtime) = crate::common::create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create conversation
@@ -564,7 +564,7 @@ async fn test_conversation_items_unsupported_type() {
         .queue_timeout_secs(5)
         .build_unchecked();
 
-    let ctx = crate::common::create_test_context(router_cfg).await;
+    let (ctx, _prepare_runtime) = crate::common::create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create conversation
@@ -620,7 +620,7 @@ async fn test_conversation_items_multi_conversation_sharing() {
         .queue_timeout_secs(5)
         .build_unchecked();
 
-    let ctx = crate::common::create_test_context(router_cfg).await;
+    let (ctx, _prepare_runtime) = crate::common::create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create two conversations

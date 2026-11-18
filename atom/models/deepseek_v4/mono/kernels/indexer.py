@@ -51,6 +51,18 @@ from atom.models.deepseek_v4.mono.kernels.primitives import (
 
 
 @traced
+def index_scale_address(row, group, mfma: bool):
+    """Dword and byte of one E8M0 scale in a 64-row, 128-dim index page.
+
+    FlyDSL packs four rows 16 apart in a word. OPUS packs the two row
+    halves and groups 0/2 or 1/3 in a word (the [2, 32, 4] MFMA plane).
+    """
+    if const_expr(mfma):
+        return (group % 2) * 32 + row % 32, (group // 2) * 2 + row // 32
+    return group * 16 + row % 16, row // 16
+
+
+@traced
 def index_query_stages(ctx):
     """2c-3c. The indexer's compressor, query and head weights (CSA only)."""
     CR = ctx["CR"]
@@ -67,6 +79,7 @@ def index_query_stages(ctx):
     IHD = ctx["IHD"]
     INTER = ctx["INTER"]
     INDEXER_HADAMARD = ctx["INDEXER_HADAMARD"]
+    INDEXER_MFMA_SCALES = ctx["INDEXER_MFMA_SCALES"]
     IW = ctx["IW"]
     K_PB = ctx["K_PB"]
     N_IQB = ctx["N_IQB"]
@@ -272,17 +285,13 @@ def index_query_stages(ctx):
                                 dbase + (w // 4) * IC_GRP_WORDS + w % 4,
                             )
                     if ln == 0:
-                        sbase = (
-                            icb // 16
-                            + blk_i * IC_S_BLK
-                            + (sl % 16) * 4
-                            + (sl % K_PB) // 16
-                        )
+                        sbase = icb // 16 + blk_i * IC_S_BLK
                         for g in range_constexpr(IHD // 32):
+                            word, byte = index_scale_address(sl, g, INDEXER_MFMA_SCALES)
                             bo.buffer_store(
                                 fx.Int8((sw >> (8 * g)) & 0xFF),
                                 rsrc(i_cache_s),
-                                sbase + g * K_PB,
+                                sbase + word * 4 + byte,
                             )
                     put(mb("i_cnew"), tt * IHD + ln, bf16_round(o0))
                     put(mb("i_cnew"), tt * IHD + ln + 64, bf16_round(o1))
@@ -526,6 +535,7 @@ def index_select_stages(ctx):
     IC_S_BLK = ctx["IC_S_BLK"]
     IH = ctx["IH"]
     IHD = ctx["IHD"]
+    INDEXER_MFMA_SCALES = ctx["INDEXER_MFMA_SCALES"]
     K_PB = ctx["K_PB"]
     N_COMP = ctx["N_COMP"]
     N_IHG = ctx["N_IHG"]
@@ -627,24 +637,25 @@ def index_select_stages(ctx):
                     blk_e = bt_block(s, ec)
                     sl_e = ec % K_PB
                     db = icb // 4 + blk_e * IC_BLK_WORDS + sl_e * 4 + lane // 16
-                    sdb = icb // 64 + blk_e * (IC_S_BLK // 4) + sl_e % 16
+                    sdb = icb // 64 + blk_e * (IC_S_BLK // 4)
                     kds = [
                         bo.buffer_load(
                             r_ic2, db + kb * IC_GRP_WORDS, vec_width=1, dtype=T.i32
                         )
                         for kb in range(IHD // 32)
                     ]
-                    sds = [
-                        bo.buffer_load(
-                            r_ics, sdb + kb * (K_PB // 4), vec_width=1, dtype=T.i32
+                    sds, scale_bytes = [], []
+                    for kb in range_constexpr(IHD // 32):
+                        word, byte = index_scale_address(sl_e, kb, INDEXER_MFMA_SCALES)
+                        sds.append(
+                            bo.buffer_load(r_ics, sdb + word, vec_width=1, dtype=T.i32)
                         )
-                        for kb in range(IHD // 32)
-                    ]
+                        scale_bytes.append(byte)
                     # the keys decode once and serve every head group
                     ka = []
                     for kb in range_constexpr(IHD // 32):
                         bsc = (
-                            ((fx.Int32(sds[kb]) >> ((sl_e // 16) * 8)) & 0xFF) << 23
+                            ((fx.Int32(sds[kb]) >> (scale_bytes[kb] * 8)) & 0xFF) << 23
                         ).bitcast(fx.Float32)
                         ka.append(mxfp4_to_bf16x8(fx.Int32(kds[kb]), bsc))
                     vs = [fx.Float32(0.0)] * 4

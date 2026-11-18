@@ -444,6 +444,9 @@ How ATOM runs it:
   block attends that context plus its own K/V.
 - The target layers' outputs are tapped with forward hooks (all-reduced across TP, plus the
   residual). This is why mono decode, which replaces those layers, is off under DSpark.
+- The context is each tapped layer's output before the final norm, as the checkpoint was trained:
+  feeding the last tap through the target's final norm instead (the NeMo recipe's post-norm
+  feature) dropped GSM8K acceptance from 51% to 39%.
 - Block attention. The block's K/V are written into the draft cache at the block's slots and
   the non-causal `[context | block]` attention runs as one q_len = 1 paged decode row per block
   token (the per-row decode the target's sparse layers use), through page tables built outside

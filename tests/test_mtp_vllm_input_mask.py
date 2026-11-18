@@ -37,6 +37,9 @@ MASKED_PREDICTORS = {
     "DeepSeekMTPModel": ("deepseek_mtp.py", "DeepSeekMultiTokenPredictor"),
     "DeepseekV32MTPModel": ("deepseek_mtp.py", "DeepSeekMultiTokenPredictor"),
     "Glm4MoeMTPModel": ("glm4_moe_mtp.py", "Glm4MoeMultiTokenPredictor"),
+    # Glm5NextMTP subclasses DeepSeekMTP and builds the same predictor; only
+    # its layer class differs.
+    "Glm5NextMTPModel": ("deepseek_mtp.py", "DeepSeekMultiTokenPredictor"),
 }
 
 FLAG = "mask_pos0_inputs_embeds"

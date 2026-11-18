@@ -319,6 +319,11 @@ class SplitEntryMajorArena:
         """Bytes into the plane's slot where field `name` begins."""
         return self._by_field[name].field_offset(name)
 
+    def refill_live(self) -> None:
+        """`EntryMajorArena.refill_live` on every plane."""
+        for arena in self.arenas:
+            arena.refill_live()
+
 
 class EntryMajorArena:
     """`entries` fixed-size entries, one stride apart.
@@ -408,8 +413,19 @@ class EntryMajorArena:
                     "buffer, which needs the offset to divide every itemsize"
                 )
             self.buf = buf
+        self.refill_live()
+
+    def refill_live(self) -> None:
+        """Put every field of the live entries back to its `fill`.
+
+        Construction does this once; a caller that lets something write the
+        entries before any request owns them (a CUDA graph capture's warmup)
+        calls it again to hand them out as if fresh.
+        """
         for field in self.fields:
-            self.view(field.name)[:, entries - self.live_entries :].fill_(field.fill)
+            self.view(field.name)[:, self.entries - self.live_entries :].fill_(
+                field.fill
+            )
 
     @property
     def total_bytes(self) -> int:
