@@ -2797,9 +2797,10 @@ models:
               ATOM_TOKENIZE_CACHE_MB: "2048"
             prefill:
               <<: *m31b_mcstore_prefill_env
-              # Node 1 here is half a node (GPUs 4-7): its owners stay on NUMA1 and rdma6/7;
-              # 2 x 448 GiB leaves room for decode 2's load staging and the 128 GiB reserve.
-              MOONCAKE_STORE_DECODE_OWNERS: "1:448:rdma6;1:448:rdma7"
+              # Node 1 here is half a node (GPUs 4-7): its owners stay on NUMA1 and rdma6/7.
+              # g08 NUMA1 compacted 871 of 896 GiB into huge pages; the 4 KiB rest failed NIC
+              # registration, so 2 x 400 GiB keeps under what compaction delivers.
+              MOONCAKE_STORE_DECODE_OWNERS: "1:400:rdma6;1:400:rdma7"
               # Warmup sends ~2x what one PP4 prefills in 300 s; a 300 s admission deadline
               # then livelocks against the decodes' FIFO admission. Unadmitted holds no KV.
               PREFILL_KV_TRANSFER_CONFIG: >-
