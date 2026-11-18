@@ -32,7 +32,7 @@ from flydsl.expr import gpu, range_constexpr
 
 from atom.models.deepseek_v41.mono.gfx1250.kernels import device as hx
 from atom.models.deepseek_v41.mono.gfx1250.kernels import dims as D
-from atom.models.deepseek_v41.mono.gfx1250.kernels.attention import HID, T, e8m0_of, expf, inv_pow2, rsq
+from atom.models.deepseek_v41.mono.gfx1250.kernels.attention import HID, T, e8m0_of, expf, inv_pow2, kv_fp4_of, rsq
 
 F32, I32, I64, BF16 = fx.Float32, fx.Int32, fx.Int64, fx.BFloat16
 LAT = D.KV_DIM                  # the compressed latent (head dim)
@@ -112,6 +112,21 @@ def _projn(c, r1, row, d0, col0, n):
     return [r1.select(v[e].to(BF16).to(F32), v[e]) for e in range(n)]
 
 
+def fp4_main_lane4(rot):
+    """(FP4 KV) a lane's 4 adjacent dims of a main row (f32, 4 lanes a 16-dim group) -> (on even lanes: the pair's 4
+    bytes of E2M1 nibbles, even dim low; the group's E4M3 scale byte): fused_compress "planar_fp4" ==
+    quantization.fp4_groups(E4M3_SCALE=True) on the BF16-rounded row -- scale = e4m3(max(amax, 6 * 2^-9) * f32(1 / 6)),
+    E2M1(x / scale) with an IEEE divide, the sign bit x's."""
+    x = [rot[e].to(BF16).to(F32) for e in range(4)]
+    am = fx.max(fx.max(abs(x[0]), abs(x[1])), fx.max(abs(x[2]), abs(x[3])))
+    am = fx.max(am, am.shuffle_xor(1, 32))
+    am = fx.max(am, am.shuffle_xor(2, 32))
+    sbyte, scl = hx.fp4kv_scale(am)
+    nb = [hx.e2m1(x[e] / scl) for e in range(4)]
+    h16 = nb[0] | (nb[1] << 4) | (nb[2] << 8) | (nb[3] << 12)
+    return h16 | (I32(h16.shuffle_xor(1, 32)) << 16), sbyte
+
+
 @ASTRewriter.transform
 def stage_crow(c, r1):
     """A CTA a compress-plan row (CTAs CROW0 .. CROW0 + ccap - 1), its 8 waves splitting the 512 channels (2 a lane):
@@ -182,8 +197,19 @@ def stage_crow(c, r1):
             rot.append(isr.select(nrm[e] * cs - nrm[e + 1] * sn, nrm[e]))
             rot.append(isr.select(nrm[e + 1] * cs + nrm[e] * sn, nrm[e + 1]))
         mrow = i64(phys) * i64(c["cprow"]) + i64(c["cmain"] + ci % c["crpp"])
-        if live & (w < 4):
-            c["stx"](c["kv"] + (mrow * LAT + i64(d0)) * 2, fx.Vector.from_elements([rot[e].to(BF16) for e in range(4)], BF16).bitcast(fx.Int64)[0])
+        if fx.const_expr(kv_fp4_of(c)):
+            # FP4 KV (fused_compress "planar_fp4"): the BF16 row quantized a 16 dims (4 lanes) at a time --
+            # scale = e4m3(max(amax, 6 * 2^-9) / 6), E2M1(x / scale) (an IEEE divide), sign kept; the owner's main
+            # source row mrow (page * rows_per_page + id % rows_per_page): 256 B of nibbles (even dim low), then an
+            # E4M3 byte a group in the scale plane
+            mword, msbyte = fp4_main_lane4(rot)
+            if live & (w < 4) & (l % 2 == 0):
+                c["stx"](c["kmd"] + mrow * 256 + i64(d0 // 2), mword)
+            if live & (w < 4) & (l % 4 == 0):
+                c["stx"](c["kms"] + mrow * 32 + i64(d0 // 16), msbyte.to(fx.Int8))
+        else:
+            if live & (w < 4):
+                c["stx"](c["kv"] + (mrow * LAT + i64(d0)) * 2, fx.Vector.from_elements([rot[e].to(BF16) for e in range(4)], BF16).bitcast(fx.Int64)[0])
         if w < 4:
             hx.lstore(lb + d0 * 2, fx.Vector.from_elements([live.select(nrm[e], F32(0.0)).to(BF16) for e in range(4)], BF16))
         # M padding rows 1..15 of lb: zero (15 x 1024 B, 16 B a thread x 4)
@@ -221,20 +247,46 @@ def stage_crow(c, r1):
                 ev, od = kn[jj], kn[jj + 1]
                 kr.append(isr2.select((ev * cs2 - od * sn2).to(BF16).to(F32), ev))
                 kr.append(isr2.select((od * cs2 + ev * sn2).to(BF16).to(F32), od))
-            am = _lane_max(fx.max(fx.max(abs(kr[0]), abs(kr[1])), fx.max(abs(kr[2]), abs(kr[3]))))
-            code = e8m0_of(am)
-            inv = inv_pow2(code)
-            cl = [fx.min(fx.max(kr[jj] * inv, F32(-448.0)), F32(448.0)) for jj in range(4)]
-            word = hx.cvt_pk_fp8_w(hx.cvt_pk_fp8_w(0, cl[0], cl[1], False), cl[2], cl[3], True)
             row = posc // ratio2
             phys2 = hx.gload(c["btab"] + (i64(fx.max(bat, I32(0))) * i64(c["bstride"]) + i64(row // c["crpp"])) * 4, I32)
             flat = i64(phys2) * i64(c["crpp"]) + i64(row % c["crpp"])
-            tile = flat // 8
-            tt = flat % 8
-            blk = c["cplane"] + tile * 1056
-            c["stx"](blk + i64((l // 4) * 128) + tt * 16 + i64((l % 4) * 4), word)
-            if l == 0:
-                c["stx"](blk + 1024 + tt * 4, (code << 23).bitcast(F32))   # the fp32 scale 2^(code - 127)
+            a4 = fx.max(fx.max(abs(kr[0]), abs(kr[1])), fx.max(abs(kr[2]), abs(kr[3])))
+            if fx.const_expr(c["ifp4"]):   # FP4 natural plane: 64 B of E2M1 at flat * 64, an E8M0 a 32 dims at flat * 4
+                for o_ in range_constexpr(3):   # (a group = 8 lanes: lane l holds dims 4 l .. 4 l + 3)
+                    a4 = fx.max(a4, a4.shuffle_xor(1 << o_, 32))
+                code4 = hx.mxfp4_code(a4)
+                h16 = hx.fp4_lane4(kr, hx.mxfp4_mul(code4))
+                word4 = h16 | (I32(h16.shuffle_xor(1, 32)) << 16)   # (even lanes: their pair's 4 bytes)
+                sw = (hx.lane_gather(code4, I32(0)) | (hx.lane_gather(code4, I32(8)) << 8)
+                      | (hx.lane_gather(code4, I32(16)) << 16) | (hx.lane_gather(code4, I32(24)) << 24))
+                if l % 2 == 0:
+                    c["stx"](c["cplane"] + flat * 64 + i64((l // 2) * 4), word4)
+                if l == 0:
+                    c["stx"](c["cscale"] + flat * 4, sw)
+            else:
+                am = _lane_max(a4)
+                code = e8m0_of(am)
+                inv = inv_pow2(code)
+                cl = [fx.min(fx.max(kr[jj] * inv, F32(-448.0)), F32(448.0)) for jj in range(4)]
+                word = hx.cvt_pk_fp8_w(hx.cvt_pk_fp8_w(0, cl[0], cl[1], False), cl[2], cl[3], True)
+                tile = flat // 8
+                tt = flat % 8
+                blk = c["cplane"] + tile * 1056
+                c["stx"](blk + i64((l // 4) * 128) + tt * 16 + i64((l % 4) * 4), word)
+                if l == 0:
+                    c["stx"](blk + 1024 + tt * 4, (code << 23).bitcast(F32))   # the fp32 scale 2^(code - 127)
+
+
+@ASTRewriter.transform
+def crow_flag(c):
+    """(B) A compressor-row CTA's new keys (its device-scope stores) are out: its LL flag (CTAs CROW0 .. CROW0 + T - 1;
+    the grouped scorer's last-column tasks wait for all T)."""
+    t, b = c["t"], c["b"]
+    if (b >= CROW0) & (b < CROW0 + T):
+        hx.wait_storecnt0()
+        gpu.barrier()
+        if t == 0:
+            hx.put(c["crflag"] + i64(b - CROW0) * 8, I32(0), c["crtag"])
 
 
 @ASTRewriter.transform

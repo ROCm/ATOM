@@ -103,6 +103,11 @@ class StepTables:
             "imain",
             "lflags",
             "cstate",
+            # (FP4 KV) the layer's window ring planes and its kv owner's main pool planes: 0 on a BF16 pool
+            "kwd",
+            "kws",
+            "kmd",
+            "kms",
         }
         if self.idx:
             self.step.update(
@@ -285,6 +290,8 @@ class StepTables:
                 }
             )
         self.ctx_src = ctx
+        # (FP4 KV) the draft stages' window ring planes (data, scale): addresses, 0 on a BF16 pool (set_geometry)
+        self.ctx_ring = {f"{p}{j}": 0 for p in ("wd", "ws") for j in range(NDR)}
         self.ctxtab = torch.zeros(len(CX.CTPTRS), dtype=torch.int64, device=dev)
         src["ctxtab"] = self.ctxtab
         tsrc = dict(scratch)
@@ -302,7 +309,7 @@ class StepTables:
         miss += [
             k for k in M.ATAB if k not in src and not k.startswith("recv") and k != "kv"
         ]
-        miss += [k for k in CX.CTPTRS if k not in ctx and k != "ring"]
+        miss += [k for k in CX.CTPTRS if k not in ctx and k != "ring" and k not in self.ctx_ring]
         if miss:
             raise MonoUnsupported(f"step tables: no buffer for {miss[:6]}")
         self.src, self.tsrc = src, tsrc
@@ -418,39 +425,88 @@ class StepTables:
             return
         self._geom_key = key
         ix = self.M.LKEYS.index("kring")
+        g = cache.geometry
+        L = self.M.LKEYS
         for Ly, lid in enumerate(layer_ids):
             self.rows[Ly][ix] = int(
                 cache.geometry.window(lid, cache.num_pages).ring_start
             )
+        planar = g.window_fp8
+        if planar:
+            # FP4 KV: each layer's window ring is its own source ([rows, 512] E4M3 then [rows, 16] E8M0, a row
+            # slot * ring_slots + pos % ring_slots: kring 0), each owner's main pool too ([rows, 256] E2M1 then [rows, 32]
+            # E4M3, a row page * rows_per_page + id % rows_per_page): the layer rows carry the four plane addresses
+            if g.kv_dtype != "fp4":
+                raise MonoUnsupported(f"single-launch step: kv cache {g.kv_dtype}")
+            for Ly, lid in enumerate(layer_ids):
+                wd, ws = cache.ring_view(lid)
+                if (
+                    tuple(wd.shape) != (cache.num_slots * g.ring_slots, 512)
+                    or tuple(ws.shape) != (cache.num_slots * g.ring_slots, 16)
+                    or not (wd.is_contiguous() and ws.is_contiguous())
+                ):
+                    raise MonoUnsupported(
+                        f"layer {lid} window planes {tuple(wd.shape)} {tuple(ws.shape)}"
+                    )
+                self.rows[Ly][L.index("kwd")] = int(wd.data_ptr())
+                self.rows[Ly][L.index("kws")] = int(ws.data_ptr())
+                if Ly < NL and self.specs[Ly].ratio:
+                    spec = self.specs[Ly]
+                    md, ms = cache.main_view(spec.kv_owner)
+                    rows = cache.num_pages * g.rows_per_page(spec.ratio)
+                    if (
+                        tuple(md.shape) != (rows, 256)
+                        or tuple(ms.shape) != (rows, 32)
+                        or not (md.is_contiguous() and ms.is_contiguous())
+                        or self.specs[spec.topk_owner].ratio != spec.ratio
+                    ):
+                        raise MonoUnsupported(
+                            f"layer {lid} main planes {tuple(md.shape)} {tuple(ms.shape)}"
+                        )
+                    self.rows[Ly][L.index("kmd")] = int(md.data_ptr())
+                    self.rows[Ly][L.index("kms")] = int(ms.data_ptr())
+            for j, lid in enumerate(layer_ids[NL : NL + NDR]):
+                wd, ws = cache.ring_view(lid)
+                self.ctx_ring[f"wd{j}"] = int(wd.data_ptr())
+                self.ctx_ring[f"ws{j}"] = int(ws.data_ptr())
         if self.idx:
-            g = cache.geometry
-            L = self.M.LKEYS
             for Ly in self.idx_w:
                 spec = self.specs[Ly]
-                if g.packed:
-                    raise MonoUnsupported(
-                        "single-launch step: a packed pool (byte-addressed rows)"
-                    )
+                units = cache.index_units[spec.kv_owner]
+                if units.fp4:   # natural FP4: values [units, 8, 64], scales [units, 8, 4]
+                    if (
+                        units.layout != "natural"
+                        or units.values.stride() != (512, 64, 1)
+                        or units.scales.stride() != (32, 4, 1)
+                    ):
+                        raise MonoUnsupported(
+                            f"FP4 index plane {units.layout} {units.values.stride()} {units.scales.stride()}"
+                        )
                 vals = {
-                    "iplane": cache.index_units[spec.kv_owner].values.data_ptr(),
+                    "iplane": units.values.data_ptr(),
+                    "iscale": units.scales.data_ptr() if units.fp4 else 0,
                     "irpp": g.rows_per_page(spec.ratio),
-                    "imain": g.main_offset(spec.kv_owner),
-                    "cprow": g.page_bytes // g.row_bytes,
+                    # a selected row: page * cprow + imain + id % irpp -- the pool row (BF16), or (FP4 KV) the row in
+                    # the owner's own main source (imain 0)
+                    "imain": 0 if planar else g.main_offset(spec.kv_owner),
+                    "cprow": g.rows_per_page(spec.ratio) if planar else g.page_bytes // g.row_bytes,
                 }
                 if (
                     self.comp and Ly in self.comp_w
                 ):  # the owner's (the layer's own: FULL) main field, index plane and ring state
                     kv_s, sc_s = cache.compress_state(spec.kv_owner)
+                    # bytes a slot of the state arena (the STATE entry; a planar pool's holds no window)
+                    slot_bytes = cache.state_bytes.stride(0)
                     for t_ in (kv_s, sc_s):
                         if (
                             t_.dtype != torch.float32
-                            or t_.stride(0) * 4 != g.state_bytes
+                            or t_.stride(0) * 4 != slot_bytes
                             or tuple(t_.shape[1:]) != (7, 512)
                             or t_.stride(1) != 512
                             or t_.stride(2) != 1
                         ):
                             raise MonoUnsupported(
-                                f"compress state {tuple(t_.shape)} {t_.stride()} {t_.dtype}, slot {g.state_bytes} B"
+                                f"compress state {tuple(t_.shape)} {t_.stride()} {t_.dtype}, slot {slot_bytes} B"
                             )
                     vals.update(
                         cmain=vals["imain"],
@@ -458,7 +514,7 @@ class StepTables:
                         cplane=vals["iplane"],
                         ckv=kv_s.data_ptr(),
                         cscore=sc_s.data_ptr(),
-                        cstate=g.state_bytes,
+                        cstate=slot_bytes,
                     )
                 for k, v in vals.items():
                     self.rows[Ly][L.index(k)] = int(v)
@@ -487,7 +543,9 @@ class StepTables:
         self.ctxtab.copy_(
             torch.tensor(
                 [
-                    (self.pool if k == "ring" else self.ctx_src[k]).data_ptr()
+                    self.ctx_ring[k]
+                    if k in self.ctx_ring
+                    else (self.pool if k == "ring" else self.ctx_src[k]).data_ptr()
                     for k in CX.CTPTRS
                 ],
                 dtype=torch.int64,

@@ -15,16 +15,14 @@ from torch import nn
 from atom.model_engine.token_constraints import has_constraints
 from atom.models.deepseek_v41.mono.gfx1250 import refusal
 from atom.models.deepseek_v41.mono.gfx1250.config import MAX_ROWS, ROWS_PER_REQ
-from atom.models.deepseek_v41.mono.gfx1250.debug import CheckModel
 from atom.mono.runtime.route import LazyRunner
 from atom.mono.runtime.step_override import StepOverrideModel
-from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
 
 
-class SingleStepModel(CheckModel, StepOverrideModel, nn.Module):
+class SingleStepModel(StepOverrideModel, nn.Module):
     """The loaded V4.1 runtime model. ``ModelRunner`` offers it each decode step (``step_override``): it runs the
     step as the single launch, or declines and the production path runs (its forward, unchanged).
 
@@ -49,7 +47,6 @@ class SingleStepModel(CheckModel, StepOverrideModel, nn.Module):
         self._decode_batch = (
             None  # this step's batch when it is a decode step (``step_override``)
         )
-        self._step_batch = None
         if drafter is not None:
             self._wrap_drafter(drafter)
 
@@ -98,7 +95,14 @@ class SingleStepModel(CheckModel, StepOverrideModel, nn.Module):
             if n == running_bs * ROWS_PER_REQ
             else None
         )
-        if runner is not None:
+        if runner is None:
+            md = getattr(get_forward_context(), "attn_metadata", None)
+            if md is not None and md.served_by_round:
+                # laid out for the launch alone (``round.SingleStepRound``): no plans for the production path
+                raise RuntimeError(
+                    "V4.1 single-launch step: a step the decode round gave the launch was not served"
+                )
+        else:
             runner.run_step(input_ids, running_bs, get_forward_context(), batch)
         self._served, self._decode_batch = runner, batch
         return runner
@@ -108,10 +112,11 @@ class SingleStepModel(CheckModel, StepOverrideModel, nn.Module):
         DSpark verify with nothing the kernel does not produce: no structured output, no logprobs, no required
         channel (it returns ids and the verdict, not logits), and request shapes the kernel takes (``precheck``).
         """
-        self._step_batch = batch  # (the ATOM_MONO_CHECK launch's sampling parameters)
-        if envs.ATOM_MONO_CHECK:  # the production path serves, the launch only compares
-            return None
-        if batch is not None and (has_constraints(batch) or batch.any_logprobs):
+        if batch is not None and (
+            has_constraints(batch)
+            or batch.any_logprobs
+            or getattr(batch, "required_channel", None) is not None
+        ):
             return None
         fc = get_forward_context()
         if fc.spec_decode_metadata is None or not self.step_ready(rows):
@@ -126,8 +131,6 @@ class SingleStepModel(CheckModel, StepOverrideModel, nn.Module):
     def forward(self, input_ids, positions, inputs_embeds=None):
         # a production forward (prefill, or an eager decode): not the single launch's step
         self._served = self._decode_batch = None
-        if inputs_embeds is None and envs.ATOM_MONO_CHECK:
-            return self.check_forward(input_ids, positions)
         return self.model(input_ids, positions, inputs_embeds=inputs_embeds)
 
     def compute_logits(self, hidden_states):
@@ -140,9 +143,18 @@ class SingleStepModel(CheckModel, StepOverrideModel, nn.Module):
             return getattr(self.model, name)
 
 
-def install_single_step(model: nn.Module, atom_config, drafter) -> nn.Module:
+def install_single_step(
+    model: nn.Module, atom_config, drafter, metadata_builder=None
+) -> nn.Module:
     why = refusal(atom_config)
     if why is not None:
         logger.info("V4.1 single-launch step off: %s", why)
         return model
-    return SingleStepModel(model, drafter, atom_config)
+    wrapped = SingleStepModel(model, drafter, atom_config)
+    if metadata_builder is not None and hasattr(metadata_builder, "use_decode_round"):
+        # (imported here: it imports Triton)
+        from atom.models.deepseek_v41.mono.gfx1250.round import SingleStepRound
+
+        # the builder's decode round on the launch's steps: lean host prep, the device-side round advance
+        metadata_builder.use_decode_round(SingleStepRound(wrapped, metadata_builder))
+    return wrapped

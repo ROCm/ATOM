@@ -71,6 +71,19 @@ def test_the_supported_deployment_is_not_refused():
 
 
 @pytest.mark.parametrize(
+    "change",
+    [
+        {"kv_cache_dtype": "fp4"},
+        {"kv_cache_dtype": "fp4", "index_cache_dtype": "fp4", "index_cache_layout": "natural"},
+        {"index_cache_dtype": "fp4", "index_cache_layout": "natural"},
+    ],
+)
+def test_the_fp4_caches_are_served(change):
+    # FP4 KV: E2M1 main rows, MXFP8 window rings (planar sources); FP4 index: the natural layout
+    assert config.config_refusal(atom_config(**change), Dims) is None
+
+
+@pytest.mark.parametrize(
     "change, why",
     [
         ({"tensor_parallel_size": 8}, "TP 8"),
@@ -243,12 +256,6 @@ def test_a_request_shape_the_kernel_refuses_takes_the_production_path(
     model, verify_step
 ):
     model._single.runner = _Runner(ok=False)
-    assert model.single_step_runner(_batch(), 48) is None
-
-
-def test_check_mode_never_serves(model, verify_step, monkeypatch):
-    monkeypatch.setenv("ATOM_MONO_CHECK", "1")
-    model._single.runner = _Runner()
     assert model.single_step_runner(_batch(), 48) is None
 
 
@@ -485,6 +492,25 @@ def test_task_counts(kind):
             assert int(IP.lists(Z(n), IP.NLMAX, fan)) <= 1
 
 
+def test_the_index_capacity_holds_agentx_contexts():
+    """buffers.ILW (the scorer's row width; the block tables' columns, 16-token pages) holds a 409600-token context at
+    compression 1 (AgentX trajectories reach ~400K; gfx950 serves them at max-model-len 409600). At that width layer
+    20's top-512 over ILW scores and top-2048 over its ILW / 8 block maxima each reach one list within the levels
+    topk.selection_levels picks (index_plan.tree_levels), and every level's lists fit the row's list stride in ilvl (the
+    kernel's _cdiv(vstride, SEG) k; buffers.scratch_bytes sizes ilvl by the larger of the two)."""
+    from atom.models.deepseek_v41.mono.gfx1250 import buffers
+
+    ilw = buffers.ILW
+    assert ilw >= 409600 and ilw % IP.CHUNK == 0 and buffers.BCOLS * 16 == ilw
+    for kind, n in (("sel", ilw), ("blk", ilw // 8)):
+        k, fan = KINDS[kind]
+        levels = int(IP.tree_levels(Z(n), k))
+        assert levels <= IP.NLMAX and int(IP.lists(Z(n), levels - 1, fan)) == 1, kind
+        stride = -(-n // IP.SEG) * k
+        for lev in range(levels):
+            assert int(IP.lists(Z(n), lev, fan)) * k <= stride, (kind, lev)
+
+
 def rx(bd, cand):
     kept = IP.rx_kept(Z(bd))
     last = Z(cand[max(int(kept) - 1, 0)]) if int(kept) else Z(0)
@@ -565,10 +591,10 @@ def test_units_once(nch, U):
 
 def test_schedules():
     assert [MP.striped(n) for n in (1, 2, 3)] == [False, False, True]
-    assert [MP.sh_early(n) for n in (1, 2, 3)] == [False, False, MP.SH_EARLY]
-    assert MP.dedicated_ctas(3, NUG) == 0  # wide: the shared UG runs early in the front
-    assert MP.dedicated_ctas(1, NUG) == NUG  # narrow: one shared unit a dedicated CTA
-    assert MP.dedicated_ctas(2, NUG) == 2 * NUG
+    assert [MP.sh_early(n) for n in (1, 2, 3)] == [MP.SH_EARLY] * 3
+    # every width: the shared UG runs early in the front, no dedicated CTAs, the shared down after the handoff
+    assert [MP.dedicated_ctas(n, NUG) for n in (1, 2, 3)] == [0, 0, 0]
+    assert [MP.sh8_dnov(n) for n in (1, 2, 3)] == [False, False, False]
 
 
 # --- layout -------------------------------------------------------------------------------------------------------
@@ -602,9 +628,9 @@ def test_lds_regions():
 
 
 def test_the_step_kernel_traces_on_several_threads_at_once(monkeypatch):
-    """Four ranks' target kernels traced at once on four threads, compile-only (``ARCH``: no GPU): every trace counts
-    its poll timeouts through its own kernel's counter, and no IR value of one trace reaches another (a module-level
-    counter pointer failed this: 'operand from a different MLIRContext', or an LLVM abort).
+    """Four ranks' target kernels traced at once on four threads, compile-only (``ARCH``: no GPU): every trace's polls
+    use its own kernel's failure closure (``device.fail_ctx``: thread-local), and no IR value of one trace reaches
+    another (a module-level pointer failed this: 'operand from a different MLIRContext', or an LLVM abort).
     """
     pytest.importorskip("flydsl")
     monkeypatch.setenv("ARCH", "gfx1250")
@@ -616,20 +642,20 @@ def test_the_step_kernel_traces_on_several_threads_at_once(monkeypatch):
     from atom.mono.runtime.compile import compile_only
 
     seen, errors = {}, {}
-    counter = hx._counter
+    fail = hx._fail
 
-    def traced_counter():  # each thread's view of the counter while its trace emits the timeout checks
-        ptr = counter()
-        seen.setdefault(threading.get_ident(), set()).add(ptr is not None)
-        return ptr
+    def traced_fail():  # each thread's view of the closure while its trace emits the cross-rank polls
+        fc = fail()
+        seen.setdefault(threading.get_ident(), set()).add(fc is not None)
+        return fc
 
-    monkeypatch.setattr(hx, "_counter", traced_counter)
+    monkeypatch.setattr(hx, "_fail", traced_fail)
 
     def build(rank):
         try:
             launcher = step.build(6, rank, part="target", trd=5)[0]
             with compile_only():
-                launcher(0, 0, 0, 0, 0, 0, 1.0, 0, 0)
+                launcher(0, 0, 0, 0, 0, 1.0, 0, 0, 0, 40)
         except Exception as error:  # noqa: BLE001 - reported below, per rank
             errors[rank] = error
 
@@ -640,6 +666,4 @@ def test_the_step_kernel_traces_on_several_threads_at_once(monkeypatch):
         thread.join()
     assert not errors, errors
     assert len(seen) == 4 and all(v == {True} for v in seen.values()), seen
-    assert (
-        hx._counter() is None
-    )  # cleared at the end of this thread's traces (none ran here)
+    assert fail() is None  # cleared at the end of this thread's traces (none ran here)

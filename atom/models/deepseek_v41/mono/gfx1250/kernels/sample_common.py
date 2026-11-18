@@ -34,7 +34,9 @@ from atom.models.deepseek_v41.mono.gfx1250.kernels import device as hx
 from atom.models.deepseek_v41.mono.gfx1250.kernels import dims as D
 from atom.models.deepseek_v41.mono.gfx1250.kernels.device import _v, gptr, lptr
 
-ROWS, CPR, NB = D.T_MAX, 5, 256
+# (c1: steps of 6 rows only -- runner.MAX_STEP_ROWS) 6 rows x 40 CTAs a row, not 48 x 5: every CTA scans 808 vocab
+# columns, not 6464 (ROWS * CPR = 240 as before: the record buffers and exchange slots keep their sizes)
+ROWS, CPR, NB = 6, 40, 256
 R = 16.0
 F32, I32, I64 = fx.Float32, fx.Int32, fx.Int64
 LN2 = 0.6931471805599453
@@ -147,9 +149,13 @@ def zload(base, c0, CH, V, t, k, invT):
 @ASTRewriter.transform
 def poll_unit(addr, tag, site=3):
     t0 = hx.clock()
-    while (hx.gload(addr + i64(12), I32, nt=True) != tag) & (hx.clock() - t0 < fx.Int64(hx.POLL_TICKS)):
+    bad_ = (hx.gload(addr + i64(12), I32, nt=True) != tag).select(I32(1), I32(0))
+    st_ = I32(0)
+    while (bad_ != 0) & (hx.clock() - t0 < fx.Int64(hx.POLL_TICKS)) & (st_ == fx.Int32(0)):
         hx.s_sleep(0)
-    hx.note_timeout(t0, site)
+        st_ = hx._stop_due(st_, t0)
+        bad_ = (hx.gload(addr + i64(12), I32, nt=True) != tag).select(I32(1), I32(0))
+    hx._stop_mark((bad_ != 0) & (st_ == fx.Int32(0)))
     return hx.gload(addr, I32, 4, nt=True)
 
 
@@ -333,7 +339,7 @@ def sample_once(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, invT, topp, s
     for k in range(PT):
         z = zload(base, c0, CH, V, t, k, invT)
         j = c0 + t + k * 256
-        u = (F32(lshr(hash32(row, j + rank * V, seed), 8)) + F32(0.5)) * F32(1.0 / 16777216.0)
+        u = (F32(lshr(hash32(row, j + rank * V, seed), 9)) + F32(0.5)) * F32(1.0 / 8388608.0)   # (23 bits: u < 1 exactly; 24 bits + 0.5 rounded to 1.0 in fp32)
         g = F32(-LN2) * log2f(F32(-LN2) * log2f(u))
         g = _greedy_noise(greedy, g)
         pk = fx.Int64(skey(z + g)) * fx.Int64(1 << 32) + (fx.Int64(c32(0xFFFFFFFF) - (j + rank * V)) & fx.Int64(0xFFFFFFFF))

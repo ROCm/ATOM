@@ -9,8 +9,10 @@ SH_EARLY = True  # wide: the shared expert's UG runs in the FFN front's idle CTA
 
 
 def sh_early(nch):
-    """The shared expert's UG in the front's idle CTAs (wide batches)."""
-    return SH_EARLY and nch >= WIDE_NCH
+    """The shared expert's UG in the front's idle CTAs (every width: narrow batches leave the front's CTAs past the
+    first group idle, and the dedicated CTAs' UG -> counter -> down chain was the MoE's critical path at c1).
+    """
+    return SH_EARLY
 
 
 def sh8_upc(nch):
@@ -20,8 +22,8 @@ def sh8_upc(nch):
 
 
 def sh8_dnov(nch):
-    """Narrow batches: the shared down on the dedicated CTAs (wide: after the handoff on all CTAs)."""
-    return nch < WIDE_NCH
+    """The shared down on dedicated CTAs: never (with the early shared UG it runs after the handoff on all CTAs)."""
+    return not sh_early(nch) and nch < WIDE_NCH
 
 
 def dedicated_ctas(nch, nug):

@@ -9,6 +9,7 @@ request, k = 5: the bonus row), 5 CTAs a row, 4 ranks (vocab shards of VR column
 
 sp [48][8] (16 + 16 B a row): invT f32, topp f32, seed i32, greedy i32 | invTd f32 (draft 1/T), hasq i32 (q of this request's
 drafts kept by the kernel's prob drafter last step), qsrc i32 (its row in that step's qlog), seed_acc i32.
+Forced acceptance (ATOM synthetic_acceptance_rates): a request's bonus row words 5..7 = SIM_MAGIC, nf, fr (below).
 qlog [8][5][VR] f32: this rank's pre-temperature draft logits of the previous step (markov_prob writes them).
 dids [8][5] i32 drafts being verified. prow [48][8] (32 B a row) scratch. Outputs: outtok [8][6],
 verdict [3][8], anc [8] (written by CTA 0 after the last handoff).
@@ -45,6 +46,10 @@ NREQ, ND = D.MAX_REQ, D.DSPARK_W
 SPW = 8                      # sp words a row
 SEED_RES = 0x2545F491
 U_IDX = 0x40000000
+# forced acceptance (ATOM --spec-decode-acceptance-length; ``inputs.sim_acc_words``): the request's bonus row (k = 5) sp
+# words 5..7, unused by that row's own sampling (it verifies no draft), = SIM_MAGIC, nf i32, fr f32 -> its rows k < 5
+# are argmax rows and D accepts draft p iff u_p < c_p, c_p = 1 (p < nf), fr (p = nf), 0 (p > nf)
+SIM_MAGIC = 0x53494D41
 NEG = -3e38
 ZOFF = 8192                  # LDS: this CTA's z = l / T chunk [PT][256] f32, then the q row's d * invTd chunk (read once in P0)
 
@@ -54,7 +59,7 @@ def ln(x):
 
 
 def unif(row, idx, seed):
-    return (F32(lshr(hash32(row, idx, seed), 8)) + F32(0.5)) * F32(1.0 / 16777216.0)
+    return (F32(lshr(hash32(row, idx, seed), 9)) + F32(0.5)) * F32(1.0 / 8388608.0)   # (23 bits: u < 1 exactly; 24 bits + 0.5 rounded to 1.0 in fp32)
 
 
 def gumbel(row, idx, seed):
@@ -123,12 +128,13 @@ def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank,
     invT = hx.gload(spb, F32)
     topp = hx.gload(spb + i64(4), F32)
     seed = hx.gload(spb + i64(8), I32)
-    greedy = hx.gload(spb + i64(12), I32) != I32(0)
+    isd = k < ND                                   # a row that verifies draft x_k
+    simr = hx.gload(sp + i64(req * (ND + 1) + ND) * (SPW * 4) + i64(20), I32) == I32(SIM_MAGIC)
+    greedy = (hx.gload(spb + i64(12), I32) != I32(0)) | (simr & isd)   # forced acceptance: the correction is the argmax
     invTd = hx.gload(spb + i64(16), F32)
     hasq = hx.gload(spb + i64(20), I32) != I32(0)
     qsrc = fx.max(hx.gload(spb + i64(24), I32), I32(0))
     seed_acc = hx.gload(spb + i64(28), I32)
-    isd = k < ND                                   # a row that verifies draft x_k
     prob = act & isd & ~greedy                     # T > 0 verification row
     # q is used only if the drafts being verified are the ones the prob drafter kept q for (qids, written with qlog);
     # a mismatch (host truncation, a native step in between, ...) -> the request is verified as without q (exact)
@@ -291,7 +297,7 @@ def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank,
     for kk in range(PT):
         z = hx.lload(sm + ZOFF + (kk * 256 + t) * 4, F32)
         j = c0 + t + kk * 256
-        u = (F32(lshr(hash32(row, j + rank * V, seed), 8)) + F32(0.5)) * F32(1.0 / 16777216.0)
+        u = (F32(lshr(hash32(row, j + rank * V, seed), 9)) + F32(0.5)) * F32(1.0 / 8388608.0)   # (23 bits: u < 1 exactly; 24 bits + 0.5 rounded to 1.0 in fp32)
         g = F32(-LN2) * log2f(F32(-LN2) * log2f(u))
         g = greedy.select(F32(0.0), g)
         pk = fx.Int64(skey(z + g)) * fx.Int64(1 << 32) + (fx.Int64(c32(0xFFFFFFFF) - (j + rank * V)) & fx.Int64(0xFFFFFFFF))
@@ -456,12 +462,24 @@ def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank,
             pxp = hx.gload(prow + i64(r0 + p) * 32, F32)
             uk = unif(r0 + p, I32(U_IDX), sacc)
             fo = (uk < pxp).select(fo, I32(p))
-        f = gq.select(fg, hq.select(tau, fo))
+        # forced acceptance (ATOM's rejection_synthetic_sample_kernel): the first p with u_p >= c_p; the drafts before
+        # it are emitted, its row's argmax corrects it (the rows k < 5 are argmax rows), no rejection -> the bonus sample
+        sb5 = sb + i64(ND * SPW * 4)
+        sim = hx.gload(sb5 + i64(20), I32) == I32(SIM_MAGIC)
+        snf = hx.gload(sb5 + i64(24), I32)
+        sfr = hx.gload(sb5 + i64(28), F32)
+        fs = I32(ND)
+        for p in range_constexpr(ND - 1, -1, -1):
+            cp = (I32(p) < snf).select(F32(1.0), (I32(p) == snf).select(sfr, F32(0.0)))
+            uk = unif(r0 + p, I32(U_IDX), sacc)
+            fs = (uk < cp).select(fs, I32(p))
+        f = sim.select(fs, gq.select(fg, hq.select(tau, fo)))
+        gt = gq | sim
         # the token at f: greedy -> the target id; T > 0 -> the residual winner of row f, or the bonus sample at f = ND
         tf = tid[ND]
         for p in range_constexpr(ND):
             rt = hx.gload(prow + i64(r0 + p) * 32 + i64(12), I32)
-            tf = (f == p).select(gq.select(tid[p], rt), tf)
+            tf = (f == p).select(gt.select(tid[p], rt), tf)
         # a row whose logits are not finite has no p > 0 anywhere ->
         # no residual / p winner -> kid(INT64_MIN) = -1, which the draft entry then embeds (a page fault below emb):
         # fall back to the row's own sample, then to id 0, so a bad row costs a wrong token, not the GPU

@@ -88,12 +88,27 @@ O_RBD = O_CNT + 64 * 4                   # stage_select_any's per-row bound, bat
 LDS_BYTES2 = O_RBD + 3 * 64 * 4
 
 
+# (v7) lds_topk's histogram copies, their merged bins, the block scan's wave totals (past LDS_BYTES2)
+F_H8 = LDS_BYTES2
+NCP = 16
+F_MG = F_H8 + NCP * 256 * 4
+F_SB = F_MG + 256 * 4
+F_LDS = F_SB + 64
+
+
 @ASTRewriter.transform
-def lds_topk(n, k, load, emit, sm, tid):
+def lds_topk(n, k, load, emit, sm, tid, ST=None):
+    hist8 = sm + F_H8
+    merged = sm + F_MG
+    sbuf = sm + F_SB
     """The top k (traced, <= 2048) of n (<= 8192) values: load(q, i) -> the 4 values i..i+3 (thread's quad q);
-    emit(pos, bits, i) for pos < k (bits 0 / i -1 past min(n, k)). A small code footprint (the step kernel is
-    instruction-fetch bound): the thread's 32 order keys go to LDS (keys[tid*32 + d]), and the 4 radix passes, the
-    above / tie counts, the winners' placement (staged in LDS outs) and the emit are runtime loops."""
+    emit(pos, bits, i) for pos < k (bits 0 / i -1 past min(n, k)), pos in position order (ties to the lower index).
+    The thread's order keys in LDS (thread-contiguous runs); up to 4 radix passes of 8 bits, each key adding to copy lane % NCP
+    of the pass's histogram (the scores' concentrated sign / exponent bytes made one shared histogram a chain of
+    same-address atomics), bin t's copies merged (and zeroed) by thread t, every wave scanning the merged bins itself;
+    the passes stop once the k-th key's bin holds exactly the keys still needed (the comparisons then use the resolved
+    prefix, key & mask); the winners placed after a one-barrier block scan. Same winners and order
+    as the 4-pass shared-histogram version it replaced (GPU check: bit-identical), 8192 -> 512 18.0 -> 10.4 us."""
     tid = hx.fresh(tid)
     lane, wave = tid % 32, tid // 32
     keys, hist, buf, outs = sm + O_KEYS, sm + O_HIST, sm + O_BUF, sm + O_OUT
@@ -110,51 +125,65 @@ def lds_topk(n, k, load, emit, sm, tid):
         cz0 = hx.fresh(tid) + THREADS * r
         if cz0 < 2 * HIST_WORDS:
             hx.lstore(hist + cz0 * 4, I32(0))
+    for r in range_constexpr(NCP * 256 // THREADS):
+        hx.lstore(hist8 + (hx.fresh(tid) + r * THREADS) * 4, I32(0))
     gpu.barrier()
+    if fx.const_expr(ST is not None):
+        ST(1)
     prefix = I32(0)
     mask = I32(0)
     need = I32(k)
     n = fx.max(n, I32(0))
     if n > k:
+        # (v5, after hi's topk) 4 passes of 8 bits: a key adds to copy lane % 8 of the pass's 256-bin histogram (8 LDS
+        # copies: the scores' concentrated sign / exponent bytes no longer make 32 lanes add to one word); every wave
+        # sums the copies and scans the bins itself (no second barrier); the passes stop once the k-th key's bin holds
+        # exactly the keys still needed (the comparisons below then use the resolved prefix, key & mask)
+        lp = hx.fresh(tid) % 32
+        hcopy = (lp % NCP) * (256 * 4)
+        done = I32(0)
         for p in range(4):
-            lp = hx.fresh(tid) % 32
-            shift = 24 - 8 * p
-            h = hist + (p % 3) * (HIST_WORDS * 4)
-            dummy = 256 + lp
-            run_bin = I32(256) + lp
-            run = I32(0)
-            for dq in range(nq):
-                kp4 = hx.lload(keys + (base + 4 * dq) * 4, I32, 4)
-                for e in range_constexpr(4):
-                    keyp = kp4[e]
-                    cntd = (base + 4 * dq + e < n) & ((keyp & mask) == prefix)
-                    binp = cntd.select((keyp >> shift) & 255, dummy)
-                    samep = binp == run_bin
-                    hx.latomic_add_i32(h + samep.select(dummy, run_bin) * 4, samep.select(I32(0), run))
-                    run = samep.select(run + 1, I32(1))
-                    run_bin = binp
-            hx.latomic_add_i32(h + run_bin * 4, run)
-            gpu.barrier()
-            if p < 2:
-                for r in range_constexpr((HIST_WORDS + THREADS - 1) // THREADS):
-                    cz = hx.fresh(tid) + r * THREADS
-                    if cz < HIST_WORDS:
-                        hx.lstore(hist + (((p + 2) % 3) * HIST_WORDS + cz) * 4, I32(0))
-            cs = [hx.lload(h + (255 - 8 * lp - q) * 4, I32) for q in range(8)]
-            s4 = cs[0]
-            for q in range_constexpr(1, 8):
-                s4 = s4 + cs[q]
-            before = wave_incl_scan(s4, lp) - s4
-            found = I32(-1)
-            for q in range_constexpr(8):
-                hit = (before < need) & (need <= before + cs[q])
-                found = hit.select(((255 - 8 * lp - q) << 16) | (need - before), found)
-                before = before + cs[q]
-            found = wave_max(found)
-            prefix = prefix | (((found >> 16) & 255) << shift)
-            mask = mask | (I32(255) << shift)
-            need = found & 0xFFFF
+            if done == I32(0):
+                shift = 24 - 8 * p
+                hs = hist8
+                for dq in range(nq):
+                    kp4 = hx.lload(keys + (base + 4 * dq) * 4, I32, 4)
+                    for e in range_constexpr(4):
+                        keyp = kp4[e]
+                        if (base + 4 * dq + e < n) & ((keyp & mask) == prefix):
+                            hx.latomic_add_i32(hs + hcopy + ((keyp >> shift) & 255) * 4, I32(1))
+                gpu.barrier()
+                tb_ = hx.fresh(tid)   # (thread t: bin t of the NCP copies -> merged, the copies zeroed for the next pass)
+                sm_ = I32(0)
+                for cp in range_constexpr(NCP):
+                    sm_ = sm_ + hx.lload(hs + (cp * 256 + tb_) * 4, I32)
+                    hx.lstore(hs + (cp * 256 + tb_) * 4, I32(0))
+                hx.lstore(merged + tb_ * 4, sm_)
+                gpu.barrier()
+                v0 = hx.lload(merged + (248 - 8 * lp) * 4, I32, 4)
+                v1 = hx.lload(merged + (252 - 8 * lp) * 4, I32, 4)
+                cs = [v1[3], v1[2], v1[1], v1[0], v0[3], v0[2], v0[1], v0[0]]
+                s4 = cs[0]
+                for q in range_constexpr(1, 8):
+                    s4 = s4 + cs[q]
+                before = wave_incl_scan(s4, lp) - s4
+                found = I32(-1)
+                fcnt = I32(-1)
+                for q in range_constexpr(8):
+                    hit = (before < need) & (need <= before + cs[q])
+                    found = hit.select(((255 - 8 * lp - q) << 16) | (need - before), found)
+                    fcnt = hit.select(cs[q], fcnt)
+                    before = before + cs[q]
+                found = wave_max(found)
+                fcnt = wave_max(fcnt)
+                prefix = prefix | (((found >> 16) & 255) << shift)
+                mask = mask | (I32(255) << shift)
+                need = found & 0xFFFF
+                done = (fcnt == need).select(I32(1), I32(0))
+    if fx.const_expr(ST is not None):
+        ST(2)
     take_all = n <= k
+    # (v6) the winners from the registers (no LDS reload), one barrier for the block scan, an unrolled placement
     gt_bits = I32(0)
     eq_bits = I32(0)
     above = I32(0)
@@ -163,13 +192,24 @@ def lds_topk(n, k, load, emit, sm, tid):
         kg4 = hx.lload(keys + (base + 4 * dg) * 4, I32, 4)
         for e in range_constexpr(4):
             vd = base + 4 * dg + e < n
-            gt = (vd & ult(prefix, kg4[e])).select(I32(1), I32(0))
-            eq = (vd & (kg4[e] == prefix)).select(I32(1), I32(0))
+            gt = (vd & ult(prefix, kg4[e] & mask)).select(I32(1), I32(0))
+            eq = (vd & ((kg4[e] & mask) == prefix)).select(I32(1), I32(0))
             gt_bits = gt_bits | (gt << (4 * dg + e))
             eq_bits = eq_bits | (eq << (4 * dg + e))
             above = above + gt
             ties = ties + eq
-    packed = block_excl_scan(above | (ties << 16), lane, wave, buf)
+    if fx.const_expr(ST is not None):
+        ST(3)
+    pv = above | (ties << 16)
+    incl = wave_incl_scan(pv, lane)
+    if lane == 31:
+        hx.lstore(sbuf + wave * 4, incl)
+    gpu.barrier()
+    bw = I32(0)
+    for wv in range_constexpr(WAVES):
+        cw = hx.lload(sbuf + wv * 4, I32)
+        bw = bw + (wv < wave).select(cw, I32(0))
+    packed = incl - pv + bw
     ab = packed & 0xFFFF
     tb = packed >> 16
     for dw in range(nq):
@@ -186,12 +226,16 @@ def lds_topk(n, k, load, emit, sm, tid):
                 hx.lstore(outs + at * 8, fx.Vector.from_elements([(kd < 0).select(kd & I32(0x7FFFFFFF), ~kd), iw], I32))
             ab = ab + gtw
             tb = tb + tiew
+    if fx.const_expr(ST is not None):
+        ST(4)
     n_out = fx.min(n, I32(k))
     for rp in range((I32(k) + (THREADS - 1)) // THREADS):   # k traced: runtime loops, one copy of the emit code
         posp = hx.fresh(tid) + THREADS * rp
         if (posp >= n_out) & (posp < k):
             hx.lstore(outs + posp * 8, fx.Vector.from_elements([I32(0), I32(-1)], I32))
     gpu.barrier()
+    if fx.const_expr(ST is not None):
+        ST(5)
     for re in range((I32(k) + (THREADS - 1)) // THREADS):
         pose = hx.fresh(tid) + THREADS * re
         if pose < k:
@@ -203,6 +247,20 @@ def lds_topk(n, k, load, emit, sm, tid):
 SEG, KSEL, KBLK, NCAND, NLMAX = IP.SEG, IP.KSEL, IP.KBLK, IP.NCAND, IP.NLMAX
 _cdiv, _lists, _lists_rt, _list_inputs_rt, _list_count_rt = IP.cdiv, IP.lists, IP.lists_rt, IP.list_inputs_rt, IP.list_count_rt
 MODE_SEL, MODE_RX, MODE_BLK = 0, 1, 2
+
+
+@ASTRewriter.transform
+def selection_levels(c, isrx):
+    """Every wave reads the same row bounds, so every CTA executes the same handoffs."""
+    bound = I32(0)
+    for group in range_constexpr((c["TR"] + 31) // 32):
+        row = fx.min(c["l"] + group * 32, I32(c["TR"] - 1))
+        bound = fx.max(bound, hx.gload(c["ibound"] + i64(row) * 4, I32))
+    bound = wave_max(bound)
+    # REINDEX scores at most 2048 retained blocks x 8 rows.
+    sel = isrx.select(I32(2), IP.tree_levels(bound, KSEL))
+    blk = IP.tree_levels(_cdiv(bound, I32(8)), KBLK)
+    return sel, blk
 
 
 def rx_context(c, tok, bd):
@@ -249,6 +307,21 @@ def _emit_any(c, mode, lev, final, tok, j, q, k, lstride, cur, pbase, pos, bits,
         c["stx"](cur + lslot, fx.Vector.from_elements([(ii >= 0).select(bits, I32(0)), col], I32))
 
 
+def blk_lvl_off(c):
+    """Bytes from lvl to the block tree's lists: past the top-512 tree's NLMAX levels (buffers: ilvl holds both)."""
+    return i64(NLMAX) * i64(T + 1) * i64(_cdiv(c["ilw"], I32(SEG)) * KSEL) * 8
+
+
+@ASTRewriter.transform
+def seg_wait(cnt, nchunk, s0, ns, t):
+    """(segsel) Segments s0 .. s0 + ns - 1 of 8192 columns: each one's score tasks (64, the last ones fewer) counted."""
+    if t == 0:
+        for s in range(ns):
+            sg = s0 + s
+            hx.wait_count(cnt + i64(sg) * 4, fx.min(fx.max(nchunk - sg * (SEG // 128), I32(0)), I32(SEG // 128)), 4)
+    gpu.barrier()
+
+
 @ASTRewriter.transform
 def stage_select_any(c, lev, nlev, mode):
     """Level lev (traced, < nlev) of a selection tree, mode (MODE_*, traced): MODE_SEL the top-512 of a FULL layer's
@@ -287,7 +360,10 @@ def stage_select_any(c, lev, nlev, mode):
     tot0 = hx.lane_gather(inc0, I32(31))
     inc1 = wave_incl_scan(c1, ln) + tot0
     nt = hx.lane_gather(inc1, I32(31))
-    for i in range(b, nt, 256):
+    bb = b
+    if fx.const_expr("rev" in c):   # (traced: the block tree beside the top-512 tree takes its tasks from the last CTA down)
+        bb = c["rev"].select(I32(255) - b, b)
+    for i in range(bb, nt, 256):
         # the task's row: the rows whose inclusive prefix is <= i are before it; j = i - that prefix
         p0 = inc0 <= i
         p1 = inc1 <= i
@@ -312,4 +388,115 @@ def stage_select_any(c, lev, nlev, mode):
         def emit(pos, bits, ii):
             _emit_any(c, mode, lev, final, tok, j, q, k, lstride, cur, pbase, pos, bits, ii)
 
+        if fx.const_expr("segw" in c):   # (segsel) level 0: its segment's score tasks counted (no SCORE handoff)
+            if c["segw"] & l0:
+                seg_wait(c["segcnt"], c["segn"], isblk.select(j * 8, j), isblk.select(I32(8), I32(1)), t)
         lds_topk(n, k, load, emit, c["sm"], t)
+
+
+# ---- (c1) the FULL / REINDEX layers' top-KSEL by a grouped multi-CTA radix select -----------------------------------
+MC_ROWS = 8                       # row slots (TR <= 8)
+MC_G = 32                         # CTAs a row once the step's longest row has > MC_G_MIN_N keys (TR * MC_G <= 256)
+MC_G_SHORT = 8                    # CTAs a row otherwise
+MC_G_MIN_N = 4096                 # (CTAs G r .. G r + G - 1 take row r; the rest skip to the stage's handoff)
+MC_HIST = 4 * MC_ROWS * 256 * 4   # bytes a layer: [4 rounds][rows][256] i32
+MC_CTR = MC_ROWS * 8 * 4          # bytes a layer: [rows] (above, ties, round 0..3 group counts, -, -) i32
+MC_LAYER = MC_HIST + MC_CTR
+O_MC = LDS_BYTES2                 # LDS: (prefix, mask, need, n) i32, then the CTA's 256-bin histogram
+O_MCH = O_MC + 16
+
+
+@ASTRewriter.transform
+def select_mc(c, hb, ctr, isrx, G):
+    """Every row's top KSEL of its n scores (FULL: n = bound, the ilog row; REINDEX: n = its compacted columns, lifted
+    at the emit) -> isel / irow (the tree's final emit), by G CTAs a row (traced: MC_G or MC_G_SHORT): CTA g of row r takes keys
+    [g CH, (g + 1) CH), CH = ceil(n / G); up to 4 radix rounds of 8 bits (done once the k-th key's bin is exactly the keys
+    still needed): its LDS histogram -> global atomics into
+    hb[round][r][256] (zeroed at the step's entry), the group's count ctr[r][2 + round] (every wave's s_wait_storecnt 0, no
+    fences; the bins read by agent-scope loads), every CTA of
+    the group scans the 256 bins alike; then the winners: keys above the k-th key's value take positions from
+    ctr[r][0], ties from ctr[r][1] (< need). n <= k: all, position = index; past min(n, k): -1 (the group's CTA 0)."""
+    t, b, sm, TR = c["t"], c["b"], c["sm"], c["TR"]
+    lane = t % 32
+    k = I32(KSEL)
+    vals, vstride = c["ilog"], c["ilw"]
+    mode = isrx.select(I32(MODE_RX), I32(MODE_SEL))
+    r = fx.min(b // G, I32(TR - 1))
+    g = b % G
+    if b < TR * G:
+        if t == 0:
+            bd0 = hx.gload(c["ibound"] + i64(r) * 4, I32)
+            bd = fx.max(bd0, I32(0))
+            if isrx:
+                bd = fx.max(rx_context(c, r, bd0), I32(0))
+            hx.lstore(sm + O_MC, fx.Vector.from_elements([I32(0), I32(0), k, bd], I32))
+        gpu.barrier()
+        n = hx.lload(sm + O_MC + 12, I32)
+        CH = (n + (G - 1)) // G
+        i0 = g * CH
+        i1 = fx.min(i0 + CH, n)
+        rowp = vals + i64(r) * i64(vstride) * 4
+        if n > k:
+            for p in range(4):
+                if hx.lload(sm + O_MC + 12, I32) >= 0:   # (bit 31: an earlier round's bin held exactly the keys
+                    # still needed: every key of its prefix is in, the selection is final)
+                    shift = 24 - 8 * p
+                    hx.lstore(sm + O_MCH + t * 4, I32(0))
+                    gpu.barrier()
+                    st4 = hx.lload(sm + O_MC, I32, 4)
+                    for i in range(i0 + t, i1, 256):
+                        key = order_key(hx.gload(rowp + i64(i) * 4, I32))
+                        if (key & st4[1]) == st4[0]:
+                            hx.latomic_add_i32(sm + O_MCH + ((key >> shift) & 255) * 4, I32(1))
+                    gpu.barrier()
+                    v = hx.lload(sm + O_MCH + t * 4, I32)
+                    if v != 0:
+                        hx.atomic_add(hb + i64(((p * MC_ROWS + r) * 256 + t) * 4), v)
+                    hx.wait_storecnt0()   # (every wave its bin atomics done: the count needs no release fence)
+                    gpu.barrier()
+                    if t == 0:
+                        hx.atomic_add(ctr + i64((r * 8 + 2 + p) * 4), 1)
+                        hx.wait_count(ctr + i64((r * 8 + 2 + p) * 4), G, 8)
+                    gpu.barrier()
+                    if t < 32:   # wave 0: the bin of the k-th key (lds_topk's scan, over the global bins)
+                        # (agent-scope loads, no acquire fence: the bins are device-scope atomics, read once a layer, so
+                        # loads at their scope see them -- as wait_count's see the count; the fence's cache invalidate
+                        # every round cost the group's CTAs)
+                        cs = [hx.gload(hb + i64(((p * MC_ROWS + r) * 256 + 255 - 8 * lane - q) * 4), I32, scope="agent") for q in range(8)]
+                        s4 = cs[0]
+                        for q in range_constexpr(1, 8):
+                            s4 = s4 + cs[q]
+                        need = st4[2]
+                        before = wave_incl_scan(s4, lane) - s4
+                        found = I32(-1)
+                        done = I32(0)
+                        for q in range_constexpr(8):
+                            hit = (before < need) & (need <= before + cs[q])
+                            found = hit.select(((255 - 8 * lane - q) << 16) | (need - before), found)
+                            done = (hit & (need == before + cs[q])).select(I32(1), done)
+                            before = before + cs[q]
+                        found = wave_max(found)
+                        done = wave_max(done)
+                        if lane == 0:
+                            hx.lstore(sm + O_MC, fx.Vector.from_elements(
+                                [st4[0] | (((found >> 16) & 255) << shift), st4[1] | (I32(255) << shift), found & 0xFFFF,
+                                 (done != 0).select(n | I32(INT_MIN), n)], I32))
+                    gpu.barrier()
+        st4 = hx.lload(sm + O_MC, I32, 4)
+        q = fx.max(hx.gload(c["ibat"] + i64(r) * 4, I32), I32(0))
+        for i in range(i0 + t, i1, 256):
+            pos = I32(-1)
+            if n <= k:
+                pos = i
+            else:
+                key = order_key(hx.gload(rowp + i64(i) * 4, I32)) & st4[1]   # (the resolved prefix: rounds may end early)
+                if ult(st4[0], key):
+                    pos = hx.atomic_add(ctr + i64(r * 32), 1)
+                if key == st4[0]:
+                    tie = hx.atomic_add(ctr + i64(r * 32 + 4), 1)
+                    pos = (tie < st4[2]).select(k - st4[2] + tie, I32(-1))
+            if pos >= 0:
+                _emit_any(c, mode, I32(0), I32(1) > I32(0), r, I32(0), q, k, I32(0), c["lvl"], c["lvl"], pos, I32(0), i)
+        if g == 0:   # padding past min(n, k)
+            for pp in range(fx.min(n, k) + t, k, 256):
+                _emit_any(c, mode, I32(0), I32(1) > I32(0), r, I32(0), q, k, I32(0), c["lvl"], c["lvl"], pp, I32(0), I32(-1))
