@@ -27,7 +27,7 @@ def test_tail_lds_plan_is_aligned_bounded_and_tiled(tokens):
     assert layout.required_bytes <= plan.lds_plan().stage_budget_bytes
 
 
-@pytest.mark.parametrize(("tokens", "waves"), ((0, 8), (49, 8), (1, 0)))
+@pytest.mark.parametrize(("tokens", "waves"), ((0, 8), (65, 8), (1, 0)))
 def test_tail_lds_plan_rejects_unsupported_geometry(tokens, waves):
     with pytest.raises(ValueError):
         tail.tail_lds_plan(tokens, waves)
