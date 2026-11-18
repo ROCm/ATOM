@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # PD-disaggregation + pipeline-parallel unit tests (GPU-free).
 
+import contextlib
 import logging
 import os
 import subprocess
@@ -1300,34 +1301,54 @@ def test_failed_write_done_returns_the_staging_row_to_the_pool():
 def test_a_landed_state_slot_is_scattered_before_the_request_is_done(monkeypatch):
     """The receive-side twin of the staged gather's ready event.
 
-    `_scatter_slot` is an async copy enqueued on this notify-listener
-    thread's stream, which the decode forward no longer shares once the
-    runner computes on a High-priority stream. Nothing else makes decode's
-    read of the state slot wait for it, so the wait happens here, before the
-    request is published and before the staging row goes back for the next
-    RDMA write to overwrite.
+    `_scatter_slot` is an async copy and nothing else makes decode's read of
+    the state slot wait for it, so the wait happens here, before the request
+    is published and before the staging row goes back for the next RDMA write
+    to overwrite. It runs on a private stream: with the flag off this thread's
+    current stream is the null stream the decode forward is enqueued on, and
+    waiting on that would hold every notification behind the in-flight decode
+    step.
     """
     mc = pytest.importorskip(
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
     )
     order = []
+    scatter_stream = SimpleNamespace(
+        synchronize=lambda: order.append("synchronize"),
+    )
+    devices = []
+    monkeypatch.setattr(
+        mc.torch.cuda,
+        "Stream",
+        lambda device: devices.append(device) or scatter_stream,
+    )
+
+    @contextlib.contextmanager
+    def as_current(stream):
+        assert stream is scatter_stream
+        order.append("enter")
+        yield
+
+    monkeypatch.setattr(mc.torch.cuda, "stream", as_current)
+
+    def _no_current_stream(*args, **kwargs):
+        raise AssertionError(
+            "waiting on the listener's current stream parks every "
+            "notification behind the decode forward"
+        )
+
+    monkeypatch.setattr(mc.torch.cuda, "current_stream", _no_current_stream)
     conn = _make_connector(
         _staging_slots=mc.SlotPool(),
         _scatter_slot=lambda *args: order.append(("scatter", *args)),
         _mla_landing=None,
         _cuda_device=3,
+        _recv_scatter_streams=threading.local(),
     )
     release = conn._staging_slots.release
     conn._staging_slots.release = lambda idx: (
         order.append(("release", idx)),
         release(idx),
-    )
-    devices = []
-    monkeypatch.setattr(
-        mc.torch.cuda,
-        "current_stream",
-        lambda device: devices.append(device)
-        or SimpleNamespace(synchronize=lambda: order.append("synchronize")),
     )
     conn._pending_recv_expected["r1"] = 1
     conn._pending_recv.add("r1")
@@ -1335,9 +1356,9 @@ def test_a_landed_state_slot_is_scattered_before_the_request_is_done(monkeypatch
 
     assert conn._record_write_done("r1", 0, 0, 0)
 
-    assert order == [("scatter", 7, 3), "synchronize", ("release", 3)]
-    # The listener thread's current device is not the KV cache's, so the
-    # stream it waits on has to be named by device.
+    assert order == ["enter", ("scatter", 7, 3), "synchronize", ("release", 3)]
+    # The scatter stream belongs to the KV cache's device, which is not
+    # necessarily the listener thread's current one.
     assert devices == [conn._cuda_device]
     assert conn._staging_slots.free == [3]
     assert "r1" in conn.done_recving
