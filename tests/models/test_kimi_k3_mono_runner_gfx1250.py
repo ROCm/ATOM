@@ -555,12 +555,12 @@ def _replay_plan(rows):
     )
 
 
-@pytest.mark.parametrize("rows", (5, 10, 20, 40, 45))
+@pytest.mark.parametrize("rows", (5, 10, 20, 40, 45, 50, 55, 60))
 def test_replay_serves_the_verified_dspark_verify(rows):
     assert runner_module.replay_refusal(_replay_plan(rows), 16, 5, 5) is None
 
 
-@pytest.mark.parametrize("rows", (1, 8, 48))
+@pytest.mark.parametrize("rows", (1, 8, 48, 56, 64))
 def test_replay_serves_the_verified_plain_decode(rows):
     assert runner_module.replay_refusal(_replay_plan(rows), 16, 1, 1) is None
 
@@ -581,6 +581,13 @@ def test_replay_refuses_unverified_configurations(cap, window, qlen):
     rows = 40 if 40 % qlen == 0 else 8 * qlen
     why = runner_module.replay_refusal(_replay_plan(rows), cap, window, qlen)
     assert why is not None and "unverified" in why
+
+
+def test_replay_sizes_lds_with_the_projection_format():
+    # Past 58 rows only the FP8 projection's slabs fit; BF16 ones refuse.
+    assert runner_module.replay_refusal(_replay_plan(60), 16, 5, 5, fp8=True) is None
+    why = runner_module.replay_refusal(_replay_plan(60), 16, 5, 5, fp8=False)
+    assert why is not None and "LDS" in why
 
 
 def test_replay_refuses_records_past_lds(monkeypatch):
