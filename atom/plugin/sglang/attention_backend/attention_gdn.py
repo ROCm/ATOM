@@ -680,6 +680,10 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
                 "intermediate_ssm buffer."
             )
         slot_table = self._spec_ssm_slot_table(bs, draft_token_num, mixed_blocks.device)
+        # A pad row (cache index < 0) gets no conv output, so its q/k/v are
+        # uninitialised. Slot -1 makes the kernel zero its output and skip its
+        # state.
+        ssm_state_indices = torch.where(cache_indices.view(bs, 1) < 0, -1, slot_table)
         flat_phys = pool.view(pool.shape[0] * pool.shape[1], *pool.shape[2:])
         # FlyDSL keeps live state as a logical KV view over physical VK.
         # ``intermediate_ssm`` is that same physical layout. A transpose view
@@ -706,7 +710,7 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
             initial_state=recurrent_state,
             inplace_final_state=True,
             cu_seqlens=cu_seqlens,
-            ssm_state_indices=slot_table,
+            ssm_state_indices=ssm_state_indices,
             use_qk_l2norm_in_kernel=True,
         )
         output_blocks.copy_(

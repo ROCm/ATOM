@@ -134,16 +134,18 @@ def _make_impl(gen: torch.Generator) -> SGLangGatedDeltaNet:
     return impl
 
 
-def _run_once(bs: int, draft: int):
+def _run_once(bs: int, draft: int, slots=None, flydsl_decode: bool = False):
     gen = torch.Generator(device="cuda")
     gen.manual_seed(20260804)
 
     layer_cache = _make_layer_cache(bs, draft, gen)
     impl = _make_impl(gen)
+    if flydsl_decode:
+        impl.gdn_flydsl_policy = SimpleNamespace(decode=True)
     # Deliberately unsorted, non-contiguous mamba slots.
-    cache_indices = torch.tensor(
-        [5, 2, 9, 17, 1, 13][:bs], device="cuda", dtype=torch.int32
-    )
+    if slots is None:
+        slots = [5, 2, 9, 17, 1, 13][:bs]
+    cache_indices = torch.tensor(slots, device="cuda", dtype=torch.int32)
     linear_backend = SimpleNamespace(
         forward_metadata=SimpleNamespace(mamba_cache_indices=cache_indices),
         req_to_token_pool=SimpleNamespace(
@@ -233,6 +235,46 @@ def test_default_ssm_path_uses_one_kernel_call(monkeypatch):
 
     _run_once(3, 8)
     assert calls["n"] == 1, f"batched SSM should run once, got {calls['n']} calls"
+
+
+@pytest.mark.parametrize("flydsl_decode", [False, True], ids=["vk", "logical_kv"])
+@pytest.mark.parametrize("draft", [4, 16])
+def test_pad_rows_zeroed_and_real_rows_unchanged(monkeypatch, draft, flydsl_decode):
+    """CUDA-graph pad rows (cache index -1) skip the conv, so their q/k/v are
+    whatever `torch.empty` held. Fill them with NaN to make that deterministic;
+    the SSM kernel must still give those rows zeros and leave real rows alone.
+    """
+    import atom.plugin.sglang.attention_backend.attention_gdn as gdn_mod
+
+    monkeypatch.setattr(gdn_mod, "replayssm_enabled", lambda: False)
+    real_slots = [5, 2, 9, 17]
+    padded_slots = [5, -1, 9, -1]
+    bs = len(padded_slots)
+    pad_rows = torch.tensor([s < 0 for s in padded_slots], device="cuda")
+    real_rows = ~pad_rows
+
+    real_conv = gdn_mod.causal_conv1d_update
+
+    def conv_with_nan_pads(*args, **kwargs):
+        outs = real_conv(*args, **kwargs)
+        rows_in = kwargs["conv_state_indices_in"].view(-1) < 0
+        for t in outs:
+            t.view(bs, draft, -1)[rows_in] = float("nan")
+        return outs
+
+    monkeypatch.setattr(gdn_mod, "causal_conv1d_update", conv_with_nan_pads)
+    padded = _run_once(bs, draft, slots=padded_slots, flydsl_decode=flydsl_decode)
+    monkeypatch.setattr(gdn_mod, "causal_conv1d_update", real_conv)
+    reference = _run_once(bs, draft, slots=real_slots, flydsl_decode=flydsl_decode)
+
+    out = padded["out"].view(bs, draft, *padded["out"].shape[1:])
+    ref = reference["out"].view(bs, draft, *reference["out"].shape[1:])
+    assert torch.equal(out[pad_rows], torch.zeros_like(out[pad_rows]))
+    assert torch.equal(out[real_rows], ref[real_rows])
+    assert torch.equal(
+        padded["intermediate_ssm"][real_rows], reference["intermediate_ssm"][real_rows]
+    )
+    torch.testing.assert_close(padded["ssm_live"], padded["ssm_before"], rtol=0, atol=0)
 
 
 # --------------------------------------------------------------------------

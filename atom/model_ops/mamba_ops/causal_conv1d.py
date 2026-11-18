@@ -1329,8 +1329,10 @@ def causal_conv1d_update(
         )
     # num_cache_lines masks only the STEP-2 history load (read slot against
     # conv_state_in's rows). The STEP-1 column loads and the store are not
-    # bounds-checked, so both index tables must hold valid slots or
-    # pad_slot_id.
+    # bounds-checked. Only conv_state_indices_in is checked for pad_slot_id,
+    # so a row padded there may hold anything in conv_state_indices; every
+    # other row needs valid slots in both tables. A row padded in
+    # conv_state_indices must also be padded in conv_state_indices_in.
     num_cache_lines = conv_state_in.size(0)
 
     if validate_data:
