@@ -147,7 +147,9 @@ def profile_offset(rows: int, precompute_herd: bool) -> int:
 
 def _realtime():
     """The 100 MHz device clock's low word."""
-    from atom.models.kimi_k3.mono.kernels.stages.moe_tdm_gfx1250 import _realtime as clock
+    from atom.models.kimi_k3.mono.kernels.stages.moe_tdm_gfx1250 import (
+        _realtime as clock,
+    )
 
     return clock()
 
