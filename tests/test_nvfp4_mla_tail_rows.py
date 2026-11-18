@@ -199,8 +199,7 @@ def test_decode_runs_every_padded_row_with_the_step_csr():
     cache, writes = _cache(max_reqs=4)
     seen = {}
 
-    def fake_decode(layer, q, csr, sm_scale, splits=1):
-        assert splits == 1
+    def fake_decode(layer, q, csr, sm_scale):
         seen["q"] = tuple(q.shape)
         seen["csr"] = tuple(t.shape[0] for t in csr)
         return torch.zeros(q.shape[0], 128, 512, dtype=torch.bfloat16)

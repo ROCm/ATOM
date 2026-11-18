@@ -73,7 +73,7 @@ def _fused_vs_producer(seed, pages=600):
     pytest.importorskip("aiter.ops.mla_nvfp4")
     from aiter.ops.mla_nvfp4 import mla_nvfp4_update_cache
 
-    ring, req_ids, positions, values, slots, _ = _case(seed)
+    ring, req_ids, positions, values, slots, _live = _case(seed)
     # Heavy-tailed values, exact zeros and negative zeros, like a real latent.
     gen = torch.Generator(device="cuda").manual_seed(seed + 100)
     scale = torch.exp(torch.randn(DIM, generator=gen, device="cuda") * 2)
@@ -122,7 +122,7 @@ def test_fused_write_matches_the_aiter_producer_byte_for_byte(seed):
 def test_fused_write_replays_in_a_graph():
     from atom.model_ops.attentions.nvfp4_ring_triton import ring_append_quantize
 
-    ring, req_ids, positions, values, slots, _ = _case(9)
+    ring, req_ids, positions, values, slots, _live = _case(9)
     slots = torch.where(slots >= 0, slots % (600 * PAGE), slots)
     nope = torch.zeros((600, 16384), dtype=torch.uint8, device="cuda")
     aux = torch.zeros((600, 8192), dtype=torch.uint8, device="cuda")

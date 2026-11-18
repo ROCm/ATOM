@@ -155,26 +155,6 @@ class Nvfp4HpRing:
         ).to(torch.int32)
         return tiles, valid, page_ids, tile_ids
 
-    def store_tiles(
-        self,
-        layer: int,
-        req_ids: torch.Tensor,
-        positions: torch.Tensor,
-        tiles: torch.Tensor,
-    ) -> None:
-        """Overwrite the whole open tile of each row with ``tiles [N, 16, D]``.
-
-        ``positions`` is any position inside the tile. Rows past the tile's
-        valid count are rewritten too; the next append masks them. No host
-        reads.
-        """
-        req_ids = req_ids.to(device=self.buf.device, dtype=torch.long)
-        positions = positions.to(device=self.buf.device, dtype=torch.long)
-        tile_start = (positions // HP_BLOCK_SIZE) * HP_BLOCK_SIZE
-        offsets = torch.arange(HP_BLOCK_SIZE, device=self.buf.device)
-        slots = torch.remainder(tile_start[:, None] + offsets[None, :], self.ring_size)
-        self.buf[req_ids[:, None], layer, slots] = tiles.to(dtype=self.buf.dtype)
-
     def _check_layer_req(self, layer: int, req: int) -> None:
         if not 0 <= layer < self.layers:
             raise ValueError(f"layer {layer} outside 0..{self.layers - 1}.")

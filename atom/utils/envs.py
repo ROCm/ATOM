@@ -419,21 +419,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # rank, block size 64, and no prefix caching, chunked prefill or MTP. Off
     # by default, so the FP8 path is unchanged. Implies the BF16 tail ring above.
     "ATOM_MLA_NVFP4": lambda: os.getenv("ATOM_MLA_NVFP4", "0") == "1",
-    # NVFP4 decode split-K: the shader walks a request's whole context in one
-    # workgroup, so a request's pages are cut into up to MAX_SPLITS ranges, as
-    # many as keep batch x splits within SPLIT_ROWS, and merged by LSE.
-    "ATOM_MLA_NVFP4_SPLIT_ROWS": lambda: _int_env("ATOM_MLA_NVFP4_SPLIT_ROWS", 2048),
-    "ATOM_MLA_NVFP4_MAX_SPLITS": lambda: _int_env("ATOM_MLA_NVFP4_MAX_SPLITS", 16),
     # NVFP4 decode cache write. 2: one Triton launch appends to the BF16 tail
     # and quantizes the open tile into the FP4 pages. 1: Triton append/gather,
     # then mla_nvfp4_update_cache. 0: torch ops, then mla_nvfp4_update_cache.
     "ATOM_MLA_NVFP4_TRITON_RING": lambda: _int_env("ATOM_MLA_NVFP4_TRITON_RING", 2),
-    # Accuracy experiment only: after each tile write, replace the tail's BF16
-    # with the FP4 round trip of what was written, so the next token requantizes
-    # dequantized FP4 (as a cache with no BF16 tail would) instead of originals.
-    "ATOM_MLA_NVFP4_EMULATE_NO_RING": lambda: os.getenv(
-        "ATOM_MLA_NVFP4_EMULATE_NO_RING", "0"
-    )
+    # NVFP4 decode: quantize Q in Triton, reading NoPE and RoPE in place (no
+    # concat). With TRITON_RING=2 this shares one launch with the cache write.
+    # 0 keeps the concat + mla_nvfp4_quantize_q.
+    "ATOM_MLA_NVFP4_TRITON_Q": lambda: os.getenv("ATOM_MLA_NVFP4_TRITON_Q", "1") == "1",
+    # NVFP4 decode: apply the interleaved RoPE inside that launch (needs
+    # TRITON_Q and TRITON_RING=2), dropping the RoPE launch and its copies.
+    # Taken only under AITER_ROPE_TRITON_BACKEND=1, whose rounding it
+    # reproduces bit for bit, so decode ropes K exactly as prefill does.
+    "ATOM_MLA_NVFP4_TRITON_ROPE": lambda: os.getenv("ATOM_MLA_NVFP4_TRITON_ROPE", "1")
     == "1",
     # Match SGLang's gfx950 prefill fast path, with or without a cached prefix:
     # cast Q/K/V to FP8 and use AITER's head-dim-256 per-tensor FMHA kernel.

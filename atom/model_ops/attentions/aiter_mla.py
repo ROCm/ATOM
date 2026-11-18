@@ -57,8 +57,6 @@ from atom.model_ops.attentions.nvfp4_mla import (
     NVFP4_HEADS,
     NVFP4_PAGE,
     Nvfp4MlaCache,
-    nvfp4_split_count,
-    split_page_csr,
 )
 from atom.model_ops.attentions.selection_pack import (
     pack_row_selections,
@@ -1644,8 +1642,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 device=runner.device,
                 kv_nope=nope,
                 kv_aux=aux,
-                emulate_no_ring=envs.ATOM_MLA_NVFP4_EMULATE_NO_RING,
                 triton_ring=envs.ATOM_MLA_NVFP4_TRITON_RING,
+                triton_q=envs.ATOM_MLA_NVFP4_TRITON_Q,
+                triton_rope=envs.ATOM_MLA_NVFP4_TRITON_ROPE,
             )
             # The step's CSR (`_build_nvfp4_csr`): fixed addresses, so a
             # captured decode reads whatever the builder wrote this step.
@@ -1655,27 +1654,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 torch.zeros(self.max_bs * self.block_table_cols, **i32),
                 torch.zeros(self.max_bs, **i32),
             )
-            # Split-K rows (`split_page_csr`): at most the row budget, or the
-            # batch itself when even one range per request exceeds it.
-            self._nvfp4_split_budget = envs.ATOM_MLA_NVFP4_SPLIT_ROWS
-            self._nvfp4_max_splits = envs.ATOM_MLA_NVFP4_MAX_SPLITS
-            split_rows = max(self._nvfp4_split_budget, self.max_bs)
-            self._nvfp4_split_csr = (
-                torch.zeros(split_rows + 1, **i32),
-                torch.zeros(split_rows, **i32),
-            )
             logger.info(
                 "NVFP4 MLA cache: %d layers x %d pages, %.1f GiB FP4 (paged pool, "
-                "no FP8 rows) + %.2f GiB BF16 tail%s",
+                "no FP8 rows) + %.2f GiB BF16 tail",
                 layers,
                 blocks,
                 self.kv_pool.pool_bytes(blocks) / 2**30,
                 self.nvfp4_cache.ring.nbytes() / 2**30,
-                (
-                    " (emulating no BF16 tail: requantize from FP4)"
-                    if self.nvfp4_cache.emulate_no_ring
-                    else ""
-                ),
             )
         elif envs.ATOM_MLA_NVFP4_HP_RING and layers:
             # Per request, not per page. The paged pool above is unchanged.
@@ -2239,22 +2224,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             indices,
             last[:running_bs],
         )
-        splits = nvfp4_split_count(
-            running_bs, self._nvfp4_split_budget, self._nvfp4_max_splits
-        )
-        attn_metadata.nvfp4_splits = splits
-        if splits == 1:
-            attn_metadata.nvfp4_csr = (indptr, indices, last)
-            return
-        split_indptr, split_last = self._nvfp4_split_csr
-        split_page_csr(
-            indptr[: running_bs + 1],
-            last[:running_bs],
-            splits,
-            split_indptr,
-            split_last,
-        )
-        attn_metadata.nvfp4_csr = (split_indptr, indices, split_last)
+        attn_metadata.nvfp4_csr = (indptr, indices, last)
 
     def release_nvfp4_tails(self, request_ids) -> None:
         if self.nvfp4_cache is not None:
