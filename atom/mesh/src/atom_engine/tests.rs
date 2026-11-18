@@ -503,6 +503,45 @@ async fn a_core_that_stops_unasked_loses_the_client() {
 }
 
 #[tokio::test]
+async fn an_undecodable_output_loses_its_core() {
+    // One envelope that does not decode, one whose stream columns disagree:
+    // either may have held a sequence's end, so the Core is lost with them.
+    let bad_outputs = [
+        vec![b"not an envelope".to_vec()],
+        wire::encode(
+            pb::envelope::Body::Stream(pb::StreamBatch {
+                seq_ids: vec![1, 2],
+                token_counts: vec![1],
+                tokens: vec![7],
+                ..Default::default()
+            }),
+            vec![],
+        ),
+    ];
+    for frames in bad_outputs {
+        let harness = Harness::start(&[None, None]);
+        let mut handles = harness.submit(1, true, false);
+        let (rank, _, _) = harness.first_submission();
+        harness.cores[rank].send_frames(frames);
+        assert!(matches!(
+            next_event(&mut handles[0]).await,
+            SeqEvent::Failed(SeqFailure::Unavailable(_))
+        ));
+        let reason = tokio::time::timeout(WAIT, harness.client.wait_lost())
+            .await
+            .expect("the loss is reported");
+        assert!(
+            reason.starts_with(&format!(
+                "EngineCore DP rank {rank} sent an undecodable output"
+            )),
+            "{reason}"
+        );
+        assert_eq!(harness.client.alive_core_count(), 1);
+        assert_eq!(harness.client.rank_loads().0[rank], 0);
+    }
+}
+
+#[tokio::test]
 async fn shutdown_asks_every_core_to_stop_and_waits_for_them() {
     let harness = Harness::start(&[None, None]);
     // Answer each Shutdown with Stopped from a thread, as a Core would.

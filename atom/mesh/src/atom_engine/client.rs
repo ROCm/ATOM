@@ -419,16 +419,18 @@ impl Shared {
                     return self.core_lost(rank, &format!("output socket failed: {e}"));
                 }
             };
-            match message {
-                Ok(message) => {
-                    if let Err(e) = self.dispatch(rank, &message) {
-                        error!(dp_rank = rank, "dropping undecodable output: {e}");
-                    }
-                    if matches!(message.body, pb::envelope::Body::Stopped(_)) {
-                        return self.core_lost(rank, "stopped");
-                    }
-                }
-                Err(e) => error!(dp_rank = rank, "dropping undecodable output: {e}"),
+            // An output that does not decode may have carried a sequence's
+            // last message, and which ones it was cannot be told: losing the
+            // Core fails them rather than leaving them, and their load, hung.
+            let message = match message {
+                Ok(message) => message,
+                Err(e) => return self.core_lost(rank, &format!("sent an undecodable output: {e}")),
+            };
+            if let Err(e) = self.dispatch(rank, &message) {
+                return self.core_lost(rank, &format!("sent an undecodable output: {e}"));
+            }
+            if matches!(message.body, pb::envelope::Body::Stopped(_)) {
+                return self.core_lost(rank, "stopped");
             }
         }
     }
