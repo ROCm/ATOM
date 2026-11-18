@@ -224,6 +224,7 @@ class _Dest:
         ]
         self.sent = []
         self.finished = []
+        self.held = {}
         self.recv = LandingReceiver(
             device=None,
             pool_slots=pool_slots,
@@ -234,7 +235,7 @@ class _Dest:
             region_block_bytes=[PAGE_BYTES] * num_regions,
             region_indices=list(range(num_regions)),
             send=lambda addr, parts: self.sent.append((addr, parts)),
-            finish=lambda req, failed: self.finished.append((req, failed)),
+            finish=self._finish,
             table_segments=segment_table_capacity(pool_slots * 64),
         )
         pool = self.recv.pool
@@ -248,6 +249,10 @@ class _Dest:
                 )
 
         self.recv._copy_segments = copy
+
+    def _finish(self, req, failed, failed_after_write=True):
+        self.finished.append((req, failed))
+        self.held[req] = failed_after_write
 
     def credits(self):
         out = []
@@ -477,6 +482,7 @@ def test_a_failed_stage_waits_for_the_others_and_late_slots_are_dropped():
     assert dest.credits() == [("stage0", [s0[0]])]
     dest.recv.stage_done("r", 0, 5, True, [s0[0]])
     assert dest.finished == [("r", True)]
+    assert dest.held == {"r": True}  # stage 1 failed after it had written
     # A READY arriving after the request retired returns no credit: its
     # stage's write-done already returned every slot it listed.
     dest.recv.on_ready(_ready("r", s1[0], 0, [[0, 0, 1, 0]], pp=1))
@@ -631,6 +637,29 @@ def test_stages_silent_past_their_window_fail_the_request(first):
         assert dest.recv.stage_done("r", 1, 5, True, [])
     assert "r" not in dest.recv._requests
     assert dest.finished == [("r", True)]  # reported once
+    assert dest.held == {"r": True}  # a silent stage may still have written
+
+
+@pytest.mark.parametrize(
+    "reports,held",
+    [
+        # (success, started_writes) of stage 0, then stage 1.
+        (((False, False), (False, False)), False),
+        (((True, True), (False, False)), False),
+        (((False, False), (False, True)), True),
+    ],
+)
+def test_a_failure_is_held_only_if_a_failed_stage_started_writing(reports, held):
+    dest = _Dest()
+    dest.recv.advertise("stage0", 2)
+    dest.recv.advertise("stage1", 2)
+    dest.recv.begin("r", 5, [1], {0: "stage0", 1: "stage1"})
+    for pp, (success, started_writes) in enumerate(reports):
+        assert dest.recv.stage_done(
+            "r", pp, 5, success, [], started_writes=started_writes
+        )
+    assert dest.finished == [("r", True)]
+    assert dest.held == {"r": held}
 
 
 def test_an_expired_request_is_dropped_once_its_silent_stage_is_given_up():
@@ -702,7 +731,7 @@ def test_a_failed_report_does_not_stop_the_sweep():
         dest.recv.begin(req_id, 5, [1], {0: "stage0"})
         assert dest.recv.stage_acked(req_id, 0, 5, time.monotonic() - 1)
 
-    def finish(req_id, failed):
+    def finish(req_id, failed, **_):
         if req_id == "a":
             raise RuntimeError("notify socket gone")
         dest.finished.append((req_id, failed))
