@@ -69,6 +69,10 @@ RKOFF = LY.RKEEP        # LDS: the residual streams kept between the fronts
 LCB = LY.LAYER_BYTES             # (+ 128..255: the TP1 / TP2 column-group counters, gpub / gwait)  # bytes of handoff counters a layer (16: the indexer layers' extra phases use 4, 44.., 60)
 IDX_LEVELS = 3        # selection-tree capacity (the index capacity buffers.ILW); actual passes depend on the current bound
 MC_BYTES = (D.LAYERS + 4) * (4 * 8 * 256 * 4 + 8 * 8 * 4)   # mchist: [layers] ([4 rounds][8 rows][256] + [8 rows][8]) i32
+MA_OFF = MC_BYTES                 # then select_ma's histograms: topk.MA_SLOTS REINDEX slots of topk.MA_LAYER
+MC_ZERO = MA_OFF + TK.MA_SLOTS * TK.MA_LAYER   # (zeroed at the step's entry)
+MA_KB = MC_ZERO                   # select_ma's kept slots (anchors, LL list counts, lists) [MA_SLOTS] x topk.MA_KEEP
+MC_BYTES = MA_KB + TK.MA_SLOTS * TK.MA_KEEP
 IPF_KB = 32           # instruction prefetch (KB) before the fronts / the MoE
 FPF_SPLIT = True      # (front prefetch layout; the step build does not prefetch the front weights)
 
@@ -269,9 +273,9 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
                     # ran ~25 us longer, in its stages' cold code)
                     hx.code_prefetch_all(t, fptr(fp, "cyc") + i64(CODE_END_OFF), CODE_PF_KB)
                     mz = fptr(fp, "mchist")   # the multi-CTA selection's histograms / position counters: zeroed a step
-                    for zz in range_constexpr((MC_BYTES // 16 + 65535) // 65536):
+                    for zz in range_constexpr((MC_ZERO // 16 + 65535) // 65536):
                         u = b * 256 + t + zz * 65536
-                        if u < MC_BYTES // 16:
+                        if u < MC_ZERO // 16:
                             hx.gstore(mz + i64(u) * 16, fx.Vector.filled(4, 0, fx.Int32))
                     CX.stage_block_state(dict(t=t, b=b, aid=fptr(fp, "tids"), emb=fptr(fp, "emb"), noise=fptr(fp, "noise"),
                                               R=fptr(fp, "dR"), y=fptr(fp, "dy"), pre=fptr(fp, "dpre"), post=fptr(fp, "dpost"),
@@ -626,6 +630,13 @@ def target_layer(E, Ly):
                 isrx = (lfl3 & fx.Int64(64)) != fx.Int64(0)
                 cs_ = cwith(cs_, ibmax=ltab(fp, Ly, "ibmax")(), icand=ltab(fp, Ly, "icand")(), lvl=fptr(fp, "ilvl"),
                             iprod=(lfl3 & fx.Int64(32)) != fx.Int64(0), ts=None, rxpre=isrx)   # (P2: rx_prefill ran on REINDEX)
+                if fx.const_expr(TR <= 6):   # c1 REINDEX: select_ma's score-independent part before the scorer (the iquant
+                    if isrx:                    # CTAs' wait) -> LDS
+                        lnp = hx.opaque_v(fx.thread_idx.x) % 32
+                        rnp = fx.min(lnp, fx.Int32(TR - 1))
+                        nmp = TK.wave_max((lnp < TR).select(TK.rx_context(cs_, rnp, hx.gload(cs_["ibound"] + i64(rnp) * 4, fx.Int32)), fx.Int32(0)))
+                        TK.select_ma_prep(cs_, (nmp > fx.Int32(TK.MC_G_MIN_N)).select(fx.Int32(TK.MC_G), fx.Int32(TK.MC_G_SHORT)),
+                                          fptr(fp, "mchist") + i64(MA_KB) + i64((Ly >> 2) & 3) * TK.MA_KEEP)
                 # (segsel) the candidate layer on the grouped scorer: every score task counts its 8192-column segment (the
                 # layer's select_mc histogram slot, zeroed a step: layer 20 runs no select_mc), the tree's level-0 tasks wait
                 # for their own segments' counts -- no SCORE handoff: a segment's selection starts as its scores land
@@ -646,10 +657,13 @@ def target_layer(E, Ly):
                 segw = cs_["iprod"] & grp
                 if fx.const_expr(L20_ORD and TR <= TK.MC_ROWS):   # (l20) the ordered multi-CTA selection reads whole rows: SCORE
                     segw = fx.Int32(0) != fx.Int32(0)
-                # the selecting CTAs (select_mc: b < TR x MC_G; layer 20's select_ord: up to TR x (GS + GB)): the selection's
-                # code -> the I-cache over the SCORE wait (it runs cold: once in 4+ layers); select_mc / select_ord follow
-                # in the cold index section, inside the 24 KB from here
-                if (b < TR * TK.MC_G) | cs_["iprod"]:
+                # the selecting CTAs (select_mc: b < TR x MC_G; layer 20's select_ord: up to TR x (GS + GB); c1 REINDEX
+                # select_ma: from CTA MA_X0): the selection's code -> the I-cache over the SCORE wait (it runs cold: once in
+                # 4+ layers); select_ma / select_mc / select_ord follow in the cold index section, inside the 24 KB from here
+                bpf = b
+                if fx.const_expr(TR <= 6):
+                    bpf = isrx.select((b - fx.Int32(TK.MA_X0) + fx.Int32(TK.MA_CTAS)) % fx.Int32(TK.MA_CTAS), b)
+                if (bpf < TR * TK.MC_G) | cs_["iprod"]:
                     iprefetch(24)
                 if segw == (fx.Int32(0) != fx.Int32(0)):
                     handoff(lc + i64(LY.SCORE), t, True)
@@ -715,9 +729,23 @@ def target_layer(E, Ly):
                     # (MC_G CTAs a row once some row's n > MC_G_MIN_N: a radix round's keys over 4x the CTAs -- 83K -68,
                     # 30K -45 us a step; short rows keep MC_G_SHORT, where the round's group count over 32 CTAs costs
                     # more than their keys -- 2K +56 us with 32 CTAs always)
-                    TK.select_mc(cwith(cs_, ts=None), mh + i64(Ly) * TK.MC_LAYER,
-                                 mh + i64(Ly) * TK.MC_LAYER + i64(TK.MC_HIST), isrx,
-                                 (nmax > fx.Int32(TK.MC_G_MIN_N)).select(fx.Int32(TK.MC_G), fx.Int32(TK.MC_G_SHORT)))
+                    gsel = (nmax > fx.Int32(TK.MC_G_MIN_N)).select(fx.Int32(TK.MC_G), fx.Int32(TK.MC_G_SHORT))
+                    if fx.const_expr(TR <= 6):   # c1 REINDEX: select_ma (the anchored first round); 0 -> select_mc
+                        mdone = fx.Int32(0)
+                        if isrx:
+                            mdone = TK.select_ma(cwith(cs_, ts=None), mh + i64(Ly) * TK.MC_LAYER,
+                                                 mh + i64(Ly) * TK.MC_LAYER + i64(TK.MC_HIST), gsel,
+                                                 mh + i64(MA_OFF) + i64((Ly >> 2) & 3) * TK.MA_LAYER,
+                                                 mh + i64(MA_KB) + i64((Ly >> 2) & 3) * TK.MA_KEEP,
+                                                 hx.epoch32(tep, Ly, 9))
+                        if mdone == fx.Int32(0):
+                            TK.select_mc(cwith(cs_, ts=None), mh + i64(Ly) * TK.MC_LAYER,
+                                         mh + i64(Ly) * TK.MC_LAYER + i64(TK.MC_HIST), isrx, gsel,
+                                         anc=mh + i64(MA_KB + TK.MA_KANC) + i64((Ly >> 2) & 3) * TK.MA_KEEP,
+                                         x0=isrx.select(fx.Int32(TK.MA_X0), fx.Int32(0)))
+                    else:
+                        TK.select_mc(cwith(cs_, ts=None), mh + i64(Ly) * TK.MC_LAYER,
+                                     mh + i64(Ly) * TK.MC_LAYER + i64(TK.MC_HIST), isrx, gsel)
                     handoff(lc + i64(LY.SELECT0), t, False)
 
     # ---- D (on cflag / kvflag) -> dflag;  D-idle CTAs: this layer's attention mix partials + Sinkhorn
