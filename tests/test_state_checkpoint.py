@@ -2322,30 +2322,55 @@ class TestDecodeBoundaryStep:
         (op,) = bm.take_state_maintenance_ops().checkpoint_stores
         assert (op.src_slot, op.step, op.scratch_slot) == (seq.state_slot, -1, -1)
 
+    @staticmethod
+    def _serving(seq):
+        sched = make_scheduler(paged_copy_config(), state_runtime=PAGED_COPY_RUNTIME)
+        sched.add(seq)
+        return sched, sched.schedule()[0]
+
+    @staticmethod
+    def _postprocess(sched, seq, token, batch):
+        sched.postprocess(
+            list(sched.running),
+            ScheduledBatchOutput(
+                req_ids=[seq.id],
+                token_ids=[(token,)],
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+            ),
+            batch=batch,
+        )
+
     def test_the_real_loop_stores_the_boundaries_it_files(self):
         """`schedule` counts a forward before `postprocess` files its boundary,
         so the next `schedule` stores it rather than dropping it as stale."""
-        sched = make_scheduler(paged_copy_config(), state_runtime=PAGED_COPY_RUNTIME)
         seq = stateful_seq(list(range(BLOCK)))
-        sched.add(seq)
-        batch, _ = sched.schedule()
+        sched, batch = self._serving(seq)
         stores = 0
         for token in range(500, 510):
-            sched.postprocess(
-                list(sched.running),
-                ScheduledBatchOutput(
-                    req_ids=[seq.id],
-                    token_ids=[(token,)],
-                    num_rejected=None,
-                    num_bonus=None,
-                    draft_token_ids=None,
-                ),
-                batch=batch,
-            )
+            self._postprocess(sched, seq, token, batch)
             batch, _ = sched.schedule()
             stores += len(batch.state_maintenance_ops.checkpoint_stores)
         assert stores >= 2
         assert sched.block_manager.paged_state_checkpoints.checkpoints_dropped == 0
+
+    def test_a_boundary_overtaken_before_the_drain_is_dropped(self):
+        """A forward scheduled between the filing and the drain has moved the
+        slot past the boundary, so the drain drops it rather than store it."""
+        seq = stateful_seq(list(range(BLOCK)))
+        sched, batch = self._serving(seq)
+        ckpts = sched.block_manager.paged_state_checkpoints
+        for token in range(500, 510):
+            self._postprocess(sched, seq, token, batch)
+            if ckpts._pending:
+                break
+            batch, _ = sched.schedule()
+        assert ckpts._pending, "no boundary was filed"
+        Scheduler._consume_state_forks({seq.id: seq})  # a forward the drain missed
+        batch, _ = sched.schedule()
+        assert batch.state_maintenance_ops.checkpoint_stores == ()
+        assert ckpts.checkpoints_dropped == 1
 
     @pytest.mark.parametrize("step", [0, 2])
     def test_a_class_keeping_nothing_files_no_step(self, step):

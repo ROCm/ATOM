@@ -137,9 +137,9 @@ def test_decode_images_get_spare_slots_only_where_they_are_built(
     monkeypatch, replayssm, prefix_caching, interval, spare
 ):
     """A full batch leaves no free slot to build a decode image in."""
+    transfer = _transfer(monkeypatch, replayssm=replayssm)  # skips without aiter
     from atom.model_ops.attentions.gdn_attn import DECODE_SNAPSHOT_SCRATCH_SLOTS
 
-    transfer = _transfer(monkeypatch, replayssm=replayssm)
     builder = SimpleNamespace(
         model_runner=SimpleNamespace(
             config=SimpleNamespace(

@@ -3294,7 +3294,7 @@ class BlockManager:
         `next_forward_tokens` is how many tokens the forward right after this
         one carries, and is what each class's `successor_room` is compared
         against. Unset means the prompt's remainder, the prefill answer; decode
-        passes one. Everything else follows from that one number — a class
+        passes 1 or 0. Everything else follows from that one number — a class
         needing a long hand-over (V4's ring, 131) simply never qualifies
         mid-generation, one that hands nothing over (a retaining SWA pool, 0)
         always does, one that cannot keep a checkpoint at all (`inf`) never
@@ -3372,7 +3372,7 @@ class BlockManager:
         elif (
             # A finishing step: the slot is freed, and a stop may have cut the
             # end inside the window `snapshot_step` names.
-            not next_forward_tokens
+            next_forward_tokens == 0
             or pos % self.hash_block_size
             or pos - seq.last_checkpoint_pos < interval
         ):

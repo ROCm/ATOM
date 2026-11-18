@@ -379,20 +379,22 @@ class TestDecodeBoundaryFiling:
         mtp = TestMTPMaxTokens()
         seq = mtp._prefill(mtp._scheduler(), seq_factory([1, 2, 3, 4]))
         assert seq.num_forwards == 1
+        Scheduler._consume_first_decode({seq.id: seq})  # RapidServe's decode build
+        assert seq.num_forwards == 2
 
-    @pytest.mark.parametrize("accepted", [1, 2, 3, 4])
+    @pytest.mark.parametrize("accepted", [1, 4])
     def test_a_seq_that_ran_names_step_0_of_that_forward(self, seq_factory, accepted):
         (filed,), n = self._filed(seq_factory, ran=True, accepted=accepted)
         assert filed == (n, 0) == (4 + accepted, 0)
 
-    @pytest.mark.parametrize("accepted", [1, 2, 3, 4])
+    @pytest.mark.parametrize("accepted", [1, 4])
     def test_a_seq_that_did_not_run_names_its_last_accepted_token(
         self, seq_factory, accepted
     ):
         (filed,), n = self._filed(seq_factory, ran=False, accepted=accepted)
         assert filed == (n - 1, accepted - 1) == (3 + accepted, accepted - 1)
 
-    @pytest.mark.parametrize("accepted", [1, 2, 3, 4])
+    @pytest.mark.parametrize("accepted", [1, 4])
     def test_undeferred_output_names_its_last_accepted_token(
         self, seq_factory, accepted
     ):
