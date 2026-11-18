@@ -13,6 +13,7 @@ from atom.models.kimi_k3.mono.kernels.attention.kda_builder_gfx1250 import (
     HEADS,
     HIDDEN,
     K1_ABI_NAMES,
+    REPLAY_TABLE,
     K1BuildResult,
     K1LocalBuildSpec,
     local_scratch_layout,
@@ -53,6 +54,9 @@ class K1LocalRuntime:
     core_out: torch.Tensor
     core_q: torch.Tensor | None
     core_scale: torch.Tensor | None
+    # ReplaySSM's pointer table (``kda.REPLAY_TABLE``, i64 entries) where the
+    # build has a record buffer (``K1LocalBuildSpec.replay_cap``)
+    replay: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         names = tuple(
@@ -194,6 +198,19 @@ class Gfx1250K1LocalRunner:
         for name in ("st_idx", "num_acc"):
             if getattr(runtime, name).dtype != torch.int32:
                 raise ValueError(f"local K1 {name} must be int32")
+        if self.spec.replay_cap:
+            table = runtime.replay
+            if (
+                table is None
+                or table.dtype != torch.int64
+                or tuple(table.shape) != (len(REPLAY_TABLE),)
+            ):
+                raise ValueError(
+                    f"local K1 ReplaySSM needs its int64 [{len(REPLAY_TABLE)}] "
+                    "pointer table"
+                )
+        elif runtime.replay is not None:
+            raise ValueError("local K1 without a record buffer takes no replay table")
         if runtime.blk_sm < HIDDEN or runtime.blk_sr < HIDDEN:
             raise ValueError("local K1 block strides must span one hidden row")
         if (

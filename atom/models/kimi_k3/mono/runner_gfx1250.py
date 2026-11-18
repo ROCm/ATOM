@@ -564,6 +564,13 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         k1_by_layer: dict[int, Gfx1250K1LocalRunner] = {}
         k2_cache: dict[tuple[int, bool, bool], Gfx1250RoutedK2Build] = {}
         k2_by_layer: dict[int, Gfx1250RoutedK2Build] = {}
+        # ReplaySSM's verify window: a constant of the deployment, the flush
+        # rule's whatever the step's query length (``runner._k1_keys``)
+        window = (
+            kda_metadata(get_forward_context()).replayssm_max_query_len
+            if self.replay_cap
+            else 0
+        )
 
         for layer in self.plans:
             if layer.kda is not None:
@@ -586,6 +593,8 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                         qlen=qlen,
                         fp8=weight.w_in_scale is not None,
                     ),
+                    replay_cap=self.replay_cap,
+                    replay_window=window,
                 )
                 cache_key = spec
                 local = k1_cache.get(cache_key)
@@ -1264,6 +1273,13 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             stream=stream,
         )
 
+    def _replay_k1(self, layer_id: int, metadata) -> torch.Tensor | None:
+        """``_replay_table``'s table itself, which ``K1LocalRuntime`` checks."""
+        if not self.replay_cap:
+            return None
+        self._replay_table(layer_id, metadata)
+        return self._replay_tables[layer_id][0]
+
     def _k1(self, build, plan, prefix, delta, blocks, metadata, taps=None):
         if taps is not None:
             raise ValueError("gfx1250 packed mono does not expose K1 taps")
@@ -1311,6 +1327,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             core_out=core,
             core_q=core_q,
             core_scale=core_scale,
+            replay=self._replay_k1(plan.layer_id, metadata),
         )
         local(runtime, stream=torch.cuda.current_stream())
         return (core_q, core_scale) if local.spec.quant_core else core

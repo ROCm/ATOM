@@ -37,14 +37,21 @@ from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import (
     K_PER_CHUNK,
     PACK_ELEMENTS,
 )
+from atom.models.kimi_k3.mono.kernels.attention.kda_builder_gfx1250 import (
+    REPLAY_TABLE,
+)
 from atom.mono.device.ops import (
     CM_DEV,
+    bf16_pair,
+    bf_hi,
+    bf_lo,
     butterfly,
     hw_exp2,
     hw_rsq,
     lane_all_gather,
     lane_reduce_scatter,
     ld_i32,
+    load_ptr64,
     mma_bf16,
     rsrc,
     traced,
@@ -235,18 +242,23 @@ def gate_compute(c, k):
         )
         gate = fx.Float32(c["lb"]) * sigmoid
         if const_expr(c.get("gate_ilp", False)):
-            decays.append((hw_exp2(gate * fx.Float32(LOG2E)), output))
+            decays.append((hw_exp2(gate * fx.Float32(LOG2E)), gate, output))
         elif lane % ROWS < L:
             fx.ptr_store(
                 hw_exp2(gate * fx.Float32(LOG2E)),
                 c["decay"] + token * GATE_K + output,
             )
+            # ReplaySSM: the log gate is the token's g record
+            if const_expr(c.get("cap", 0)):
+                fx.ptr_store(gate, c["glog"] + token * GATE_K + output)
     # One guarded block: a guard an element would keep its chain from
     # overlapping the others'.
     if const_expr(len(decays) > 0):
         if lane % ROWS < L:
-            for decay, output in decays:
+            for decay, gate, output in decays:
                 fx.ptr_store(decay, c["decay"] + token * GATE_K + output)
+                if const_expr(c.get("cap", 0)):
+                    fx.ptr_store(gate, c["glog"] + token * GATE_K + output)
 
 
 def state_loads(c, k, head, chunk):
@@ -516,6 +528,13 @@ def kda_recur_head(c, k, request, head):
         for row in range(rows)
         for element in range(4)
     ]
+    if const_expr(c.get("cap", 0)):
+        state = replay_rows(c, state, k["replay"]["h_rec"], (row0, rows))
+        if k["replay"]["flush"] & live:
+            # the records folded: the checkpoint moves to here
+            replay_checkpoint_store(
+                c, k, head, state, [row0 + row for row in range(rows)]
+            )
     token = fx.Int32(0)
     while token < L:
         q = [
@@ -531,9 +550,10 @@ def kda_recur_head(c, k, request, head):
             for element in range(4)
         ]
         beta = fx.ptr_load(c["beta"] + token)
-        # Every lane holds the same slot; a VGPR one would put each state
-        # store below in its own waterfall loop over the descriptor.
-        slot = uniform(fx.ptr_load(c["slots"] + token))
+        if const_expr(not c.get("cap", 0)):
+            # Every lane holds the same slot; a VGPR one would put each state
+            # store below in its own waterfall loop over the descriptor.
+            slot = uniform(fx.ptr_load(c["slots"] + token))
         decayed = [
             [state[4 * row + element] * decay[element] for element in range(4)]
             for row in range(rows)
@@ -552,11 +572,13 @@ def kda_recur_head(c, k, request, head):
         )
         updated = []
         outputs = []
+        values = []
         for row in range_constexpr(rows):
             value = (
                 fx.ptr_load(c["vloc"] + token * HEAD_DIM + row0 + row)
                 - projections[row]
             ) * beta
+            values.append(value)
             row_state = [
                 decayed[row][element] + value * key[element] for element in range(4)
             ]
@@ -572,16 +594,24 @@ def kda_recur_head(c, k, request, head):
             outputs, LANE_OFFSETS, lane, architecture=GFX1250
         )
         output = live.select(_bf16_round(output), fx.Float32(0.0))
-        if (slot >= 0) & live:
-            destination = rsrc(
-                args["rstate"] + fx.Int64(slot) * fx.Int64(args["rs_seq"]) * 4
-            )
-            for row in range_constexpr(rows):
-                bo.buffer_store(
-                    fx.Vector.from_elements(state[4 * row : 4 * row + 4], fx.Float32),
-                    destination,
-                    (head * GATE_K + row0 + row) * GATE_K + column,
+        if const_expr(c.get("cap", 0)):
+            # ReplaySSM: the token's u records, not its state (every lane
+            # holds every row's value)
+            if live & (lane == 0):
+                replay_u_store(c, k, token, values, row0)
+        else:
+            if (slot >= 0) & live:
+                destination = rsrc(
+                    args["rstate"] + fx.Int64(slot) * fx.Int64(args["rs_seq"]) * 4
                 )
+                for row in range_constexpr(rows):
+                    bo.buffer_store(
+                        fx.Vector.from_elements(
+                            state[4 * row : 4 * row + 4], fx.Float32
+                        ),
+                        destination,
+                        (head * GATE_K + row0 + row) * GATE_K + column,
+                    )
         # Lanes 2r and 2r + 1 hold row r's output (lanes 32/R r.. of R rows).
         if lane % (GFX1250.wave_size // rows) == 0:
             fx.ptr_store(output, c["ol"] + token * HEAD_DIM + row0 + output_row)
@@ -621,12 +651,20 @@ def _head_state_loads(c, slot, head):
 
 
 @traced
-def prefetch_head_state(args, request, head, tid, threads, part=0, split=1):
+def prefetch_head_state(
+    args, request, head, tid, threads, part=0, split=1, replayed=False
+):
     """``head``'s recurrent state of ``request`` (part ``part`` of ``split``
     row slices) into this XCD's L2, a 128 B line a thread, so
-    ``_head_state_loads`` after the projection hits L2."""
-    acc_idx = uniform(ld_i32(args["num_acc"], request)) - 1
-    slot0 = uniform(ld_i32(args["st_idx"], request * args["st_stride"] + acc_idx))
+    ``_head_state_loads`` after the projection hits L2. ``replayed``
+    (ReplaySSM): the request's checkpoint."""
+    if const_expr(replayed):
+        slot0 = uniform(ld_i32(load_ptr64(args["replay"], 0), request))
+    else:
+        acc_idx = uniform(ld_i32(args["num_acc"], request)) - 1
+        slot0 = uniform(
+            ld_i32(args["st_idx"], request * args["st_stride"] + acc_idx)
+        )
     base = (
         args["rstate"]
         + fx.Int64(fx.max(slot0, 0)) * fx.Int64(args["rs_seq"]) * 4
@@ -644,6 +682,224 @@ def prefetch_head_state(args, request, head, tid, threads, part=0, split=1):
                     as_ir_value(base + fx.Int64(line) * 128),
                 ).result
             )
+
+
+# ---------------------------------------------------------------- ReplaySSM
+# A request's state is its checkpoint plus the (k, u, g) records committed
+# since (``fla_ops.replayssm``): a task rebuilds its own state rows from the
+# records staged in LDS (``replay_rows``), folds them into the checkpoint on a
+# flush, and writes each token's record instead of its state. A record's u is
+# a state row's, so a task reads and writes its own rows' alone; its k and g
+# span the head's columns, which every task of the head stages and one writes
+# (``replay_kg_store``) once the others are past their recurrence: on a flush
+# it rewrites the positions they have just staged.
+REC_WORDS = HEAD_DIM // 2  # a bf16 record's i32 words
+
+
+def replay_slot(c, request):
+    """``request``'s checkpoint slot, the records committed to it
+    (``write_pos``; the prefill sentinel -1 is none), whether this step folds
+    them into the checkpoint first (a flush: the buffer could not take two
+    more windows), and where its own records start -- 0 past a flush, else
+    after the committed ones (``_replayssm_kda_fwd_kernel``)."""
+    table = c["args"]["replay"]
+    rp = {name: load_ptr64(table, i) for i, name in enumerate(REPLAY_TABLE)}
+    slot = uniform(ld_i32(rp["slot_idx"], request))
+    h_rec = uniform(fx.max(ld_i32(rp["write_pos"], fx.max(slot, 0)), fx.Int32(0)))
+    flush = h_rec + 2 * c["rwin"] > c["cap"]
+    return {
+        "rp": rp,
+        "slot": slot,
+        # no step finds more committed (``replay_records``): a stale cursor
+        # replays no record past the staged ones
+        "h_rec": fx.min(h_rec, fx.Int32(c["hmax"])),
+        "flush": flush,
+        "rbase": flush.select(fx.Int32(0), h_rec),
+    }
+
+
+def replay_bases(c, replay, head):
+    """The (slot, head)'s k / u / g records, ``[cap][HEAD_DIM]`` each."""
+    rp = replay["rp"]
+    at = fx.Int64(fx.max(replay["slot"], 0) * HEADS + head) * fx.Int64(
+        c["cap"] * HEAD_DIM
+    )
+    return {
+        "k": rp["rbuf_k"] + at * 2,
+        "u": rp["rbuf_u"] + at * 2,
+        "g": rp["rbuf_g"] + at * 4,
+    }
+
+
+def replay_stage_loads(c, replay, bases, row0, width):
+    """The committed records a task replays (``replay_records`` of them): k
+    and g of every column, u of state rows ``row0 .. row0 + width``, a
+    thread's 16 B chunks, each with its LDS word (``replay_stage_store``).
+    Each plane's descriptor ends at the committed records, so a chunk past
+    them reads zeros without touching memory."""
+    tid, threads, hmax = c["tid"], c["matrix_threads"], c["hmax"]
+    committed = fx.Int64(replay["h_rec"])
+    # (plane, its descriptor's bytes, chunks a record, its first word in a
+    # buffer record / in LDS, record words in the buffer / in LDS)
+    planes = (
+        ("k", committed * (HEAD_DIM * 2), REC_WORDS // 4, 0, hmax * REC_WORDS),
+        ("g", committed * (HEAD_DIM * 4), HEAD_DIM // 4, 0, 2 * hmax * REC_WORDS),
+        ("u", committed * (HEAD_DIM * 2), width // 8, row0 // 2, 0),
+    )
+    loads = []
+    for name, nbytes, chunks, first, lds0 in planes:
+        stride = HEAD_DIM if name == "g" else REC_WORDS
+        resource = rsrc(bases[name], nbytes)
+        n = hmax * chunks
+        for round_index in range_constexpr((n + threads - 1) // threads):
+            raw = tid + threads * round_index
+            e = fx.min(raw, n - 1)
+            word = (e // chunks) * stride + first + (e % chunks) * 4
+            value = fx.Vector(
+                bo.buffer_load(resource, word, vec_width=4, dtype=T.i32)
+            )
+            loads.append((raw < n, lds0 + word, value))
+    return loads
+
+
+@traced
+def replay_stage_store(c, loads):
+    """``replay_stage_loads``' chunks into LDS ``rec``: u, k, g planes of
+    ``replay_records`` records, a record's words where the buffer has them.
+    The caller's barrier publishes them."""
+    for live, word, value in loads:
+        if live:
+            fx.ptr_store(value, c["rec"] + word)
+
+
+def _rec_lds(c, name):
+    hmax = c["hmax"]
+    return c["rec"] + {"u": 0, "k": hmax * REC_WORDS, "g": 2 * hmax * REC_WORDS}[name]
+
+
+def _rec_u_rows(c, j, rows):
+    """Record j's u of state ``rows`` (``(row0, count)`` contiguous from an
+    even row0, else a list of rows) from LDS, as f32."""
+    lu = _rec_lds(c, "u") + j * REC_WORDS
+    if const_expr(isinstance(rows, tuple)):
+        row0, count = rows
+        values = []
+        for at in range_constexpr(0, count // 2, 4):
+            width = min(4, count // 2 - at)
+            words = fx.Vector(
+                fx.ptr_load(
+                    lu + row0 // 2 + at,
+                    result_type=fx.Vector.make_type(width, fx.Int32),
+                )
+            )
+            for w in range_constexpr(width):
+                values.extend([bf_lo(words[w]), bf_hi(words[w])])
+        return values
+    values = []
+    for row in rows:
+        word = fx.Int32(fx.ptr_load(lu + row // 2))
+        values.append((row % 2 == 0).select(bf_lo(word), bf_hi(word)))
+    return values
+
+
+@traced
+def replay_rows(c, state, h_rec, rows):
+    """A thread's state rows ``rows`` (``_rec_u_rows``; columns 4 lane ..)
+    after the slot's ``h_rec`` committed records, from the checkpoint's
+    ``state``: the records' own recurrence S <- diag(exp g_j) S + u_j k_j, in
+    place, each thread its own elements -- the state ``_replay_tiles``' closed
+    form gives. Only the live records are read (a stale one need not be
+    finite)."""
+    lane = c["lane"]
+    lk, lg = _rec_lds(c, "k"), _rec_lds(c, "g")
+    count = len(state) // 4
+    j = fx.Int32(0)
+    while j < h_rec:
+        kw = fx.Vector(
+            fx.ptr_load(
+                lk + j * REC_WORDS + lane * 2,
+                result_type=fx.Vector.make_type(2, fx.Int32),
+            )
+        )
+        key = [bf_lo(kw[0]), bf_hi(kw[0]), bf_lo(kw[1]), bf_hi(kw[1])]
+        gw = fx.Vector(
+            fx.ptr_load(
+                lg + j * HEAD_DIM + lane * 4,
+                result_type=fx.Vector.make_type(4, fx.Int32),
+            )
+        )
+        decay = [
+            hw_exp2(gw[e].bitcast(fx.Float32) * fx.Float32(LOG2E)) for e in range(4)
+        ]
+        us = _rec_u_rows(c, j, rows)
+        state = [
+            state[4 * r + e] * decay[e] + us[r] * key[e]
+            for r in range(count)
+            for e in range(4)
+        ]
+        j = j + fx.Int32(1)
+    return state
+
+
+def replay_u_store(c, k, token, values, row0):
+    """Token ``token``'s u records of the contiguous state rows ``row0 ..``
+    (``values``, a row's delta-corrected value each, bf16), by the caller's
+    one lane."""
+    rp = rsrc(k["rec"]["u"])
+    at = (k["replay"]["rbase"] + token) * REC_WORDS + row0 // 2
+    for q in range_constexpr(0, len(values), 8):
+        part = values[q : q + 8]
+        if const_expr(len(part) == 2):
+            bo.buffer_store(bf16_pair(part[0], part[1]), rp, at + q // 2)
+        else:
+            bo.buffer_store(
+                fx.Vector.from_elements(part, fx.Float32)
+                .to(fx.BFloat16)
+                .bitcast(fx.Int32),
+                rp,
+                at + q // 2,
+            )
+
+
+@traced
+def replay_kg_store(c, k):
+    """The step's k (l2-normed, bf16) and log-gate (f32) records of every
+    column from LDS ``qkl`` / ``glog``, a thread four columns of a token: by
+    the head's one writer, once its other tasks have staged theirs."""
+    L, tid = c["L"], c["tid"]
+    if (tid < L * 32) & (k["slot0"] >= 0):
+        token = tid // 32
+        column = (tid % 32) * 4
+        key = [
+            fx.ptr_load(c["qkl"] + (2 * token + 1) * HEAD_DIM + column + e)
+            for e in range(4)
+        ]
+        gate = [fx.ptr_load(c["glog"] + token * HEAD_DIM + column + e) for e in range(4)]
+        at = k["replay"]["rbase"] + token
+        bo.buffer_store(
+            fx.Vector.from_elements(key, fx.Float32).to(fx.BFloat16).bitcast(fx.Int32),
+            rsrc(k["rec"]["k"]),
+            at * REC_WORDS + column // 2,
+        )
+        bo.buffer_store(
+            fx.Vector.from_elements(gate, fx.Float32),
+            rsrc(k["rec"]["g"]),
+            at * HEAD_DIM + column,
+        )
+
+
+def replay_checkpoint_store(c, k, head, state, rows):
+    """A flush: the task's replayed state rows ``rows`` (absolute) into the
+    checkpoint, columns 4 lane .."""
+    destination = rsrc(
+        c["args"]["rstate"] + fx.Int64(k["slot0"]) * fx.Int64(c["args"]["rs_seq"]) * 4
+    )
+    for index, row in enumerate(rows):
+        bo.buffer_store(
+            fx.Vector.from_elements(state[4 * index : 4 * index + 4], fx.Float32),
+            destination,
+            (head * GATE_K + row) * GATE_K + c["lane"] * 4,
+        )
 
 
 def _head_conv_loads(c, head, slot_c, acc_idx, raw, old=False):
@@ -823,14 +1079,27 @@ def kda_head(c, request, head, share=None):
             request * args["st_stride"] + acc_idx,
         )
     )
-    if tid < L:
-        fx.ptr_store(
-            ld_i32(args["st_idx"], request * args["st_stride"] + tid),
-            c["slots"] + tid,
-        )
+    replay = records = staged = None
+    if const_expr(c.get("cap", 0)):
+        # ReplaySSM: the state starts at the checkpoint (``replay_rows``)
+        replay = replay_slot(c, request)
+        slot0 = replay["slot"]
+        records = replay_bases(c, replay, head)
+    else:
+        if tid < L:
+            fx.ptr_store(
+                ld_i32(args["st_idx"], request * args["st_stride"] + tid),
+                c["slots"] + tid,
+            )
+    # this CTA's state rows: the head's, or a split head's share
+    width = HEAD_DIM // split
+    row_base = share * width if const_expr(split > 1) else 0
     # A split head's state rows (prefetched to L2 at the entry) follow its
-    # poll, so its wait on the projection is not queued behind them.
+    # poll, so its wait on the projection is not queued behind them; so do
+    # its records.
     head_state = None if split > 1 else _head_state_loads(c, slot0, head)
+    if const_expr(c.get("cap", 0) and split == 1):
+        staged = replay_stage_loads(c, replay, records, row_base, width)
 
     projected = _scratch_region(c, "proj")
     threads = c["matrix_threads"]
@@ -884,6 +1153,8 @@ def kda_head(c, request, head, share=None):
         c["head_gates"] = polled[len(polled) - len(gate_pairs) :]
     if const_expr(split > 1):
         head_state = _head_state_loads(c, slot0, head)
+        if const_expr(c.get("cap", 0)):
+            staged = replay_stage_loads(c, replay, records, row_base, width)
     tdm_timeline.stamp(tdm_timeline.HEAD_POLLED)
     for iteration in range_constexpr(fa_rounds):
         if fa_raw[iteration] < n_fa:
@@ -964,11 +1235,16 @@ def kda_head(c, request, head, share=None):
     gpu.barrier()
     tdm_timeline.stamp(tdm_timeline.HEAD_GATE_SYNC)
     qk_normalize(c)
+    if const_expr(c.get("cap", 0)):
+        # landed under the conv and the gates; the barrier publishes them
+        replay_stage_store(c, staged)
     gpu.barrier()
     tdm_timeline.stamp(tdm_timeline.HEAD_GATES)
 
     metadata["slot0"] = slot0
     metadata["state"] = head_state
+    metadata["replay"] = replay
+    metadata["rec"] = records
     c["head_onrm"] = c["head_onrm_lds"]
     kda_recur_head(c, metadata, request, head)
     tdm_timeline.stamp(tdm_timeline.HEAD_RECUR)
@@ -978,6 +1254,12 @@ def kda_head(c, request, head, share=None):
         for stores_conv, conv, new_values in deferred:
             if stores_conv:
                 _head_conv_store(c, conv, new_values)
+        if const_expr(c.get("cap", 0)):
+            # every share has published its norms, so is past its staging
+            if share == 0:
+                replay_kg_store(c, metadata)
+    elif const_expr(c.get("cap", 0)):
+        replay_kg_store(c, metadata)
     kda_head_norm(c, request, head)
     tdm_timeline.stamp(tdm_timeline.HEAD_DONE)
 
@@ -1375,9 +1657,10 @@ def emit_role_lds_types(spec):
         set(smem),
         set(attention),
         set(projection),
-        set(recurrence),
+        set(recurrence) - {"glog", "rec"},
     )
-    if expected != (
+    replay = {"glog", "rec"} & set(recurrence)
+    if replay not in (set(), {"glog", "rec"}) or expected != (
         {"red", "tls"},
         {"vals"},
         {"xl", "acc"},
@@ -1413,6 +1696,23 @@ def emit_role_lds_types(spec):
         beta: fx.Array[fx.Float32, recurrence["beta"].elements, 16]
         slots: fx.Array[fx.Int32, recurrence["slots"].elements, 16]
         onrm: fx.Array[fx.Float32, recurrence["onrm"].elements, 16]
+
+    if replay:
+        # ReplaySSM's log gates and staged records (``role_lds_plan``), past
+        # the fields every build lays out the same
+
+        @fx.struct
+        class KdaLds:
+            fa: fx.Array[fx.Float32, recurrence["fa"].elements, 16]
+            qkl: fx.Array[fx.Float32, recurrence["qkl"].elements, 16]
+            decay: fx.Array[fx.Float32, recurrence["decay"].elements, 16]
+            vloc: fx.Array[fx.Float32, recurrence["vloc"].elements, 16]
+            ol: fx.Array[fx.Float32, recurrence["ol"].elements, 16]
+            beta: fx.Array[fx.Float32, recurrence["beta"].elements, 16]
+            slots: fx.Array[fx.Int32, recurrence["slots"].elements, 16]
+            onrm: fx.Array[fx.Float32, recurrence["onrm"].elements, 16]
+            glog: fx.Array[fx.Float32, recurrence["glog"].elements, 16]
+            rec: fx.Array[fx.Int32, recurrence["rec"].elements, 16]
 
     @fx.union
     class RoleLds:
