@@ -899,7 +899,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             None,
         )
         if local.grouped_experts:
-            fp4_latent = local.front.abi is REPLICATED_FRONT_FP4_ABI
+            fp4_latent = getattr(local.front, "abi", None) is REPLICATED_FRONT_FP4_ABI
             local.front.launcher(
                 x.data_ptr(),
                 weight.w_gate.data_ptr(),
