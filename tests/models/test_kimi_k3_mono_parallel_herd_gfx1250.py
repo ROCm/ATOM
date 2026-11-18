@@ -70,13 +70,13 @@ def test_a_profile_moe_holds_its_first_weights_stamp():
     assert mt.build_moe(20, profile=True).name.endswith("_profile")
 
 
-def test_the_parallel_herd_switch_defaults_off(monkeypatch):
+def test_the_parallel_herd_switch_defaults_on(monkeypatch):
     from atom.utils import envs
 
     monkeypatch.delenv("ATOM_KIMI_MONO_PARALLEL_HERD", raising=False)
-    assert envs.ATOM_KIMI_MONO_PARALLEL_HERD is False
-    monkeypatch.setenv("ATOM_KIMI_MONO_PARALLEL_HERD", "1")
     assert envs.ATOM_KIMI_MONO_PARALLEL_HERD is True
+    monkeypatch.setenv("ATOM_KIMI_MONO_PARALLEL_HERD", "0")
+    assert envs.ATOM_KIMI_MONO_PARALLEL_HERD is False
 
 
 def test_only_a_parallel_herd_finish_bounds_its_polls():
