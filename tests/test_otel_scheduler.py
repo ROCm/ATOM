@@ -392,6 +392,7 @@ def test_engine_initializes_tracing_before_ready(monkeypatch):
         is_multinode_tp=False,
         pcp_group_size=1,
         runner_qualname="unused",
+        weight_sync_runner=False,
         enforce_eager=True,
         disagg_is_decode=False,
         pipeline_parallel_size=1,
