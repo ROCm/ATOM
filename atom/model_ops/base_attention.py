@@ -693,14 +693,16 @@ def run_pa_decode(
         )
         if 'max_context_length' not in _pd_params:
             if _pd_needs_part:
-                def _flydsl_pa_decode(*args, max_context_length=None, max_context_partition_num=1, **kwargs):
-                    return _pa_decode_raw(*args, max_context_partition_num=max_context_partition_num, **kwargs)
+                def _flydsl_pa_decode(*args, max_context_length=None, work_plan=None, **kwargs):
+                    part = int(work_plan.max_partitions) if work_plan is not None and hasattr(work_plan, 'max_partitions') else 1
+                    return _pa_decode_raw(*args, max_context_partition_num=part, work_plan=work_plan, **kwargs)
             else:
                 def _flydsl_pa_decode(*args, max_context_length=None, **kwargs):
                     return _pa_decode_raw(*args, **kwargs)
         elif _pd_needs_part:
-            def _flydsl_pa_decode(*args, max_context_partition_num=1, **kwargs):
-                return _pa_decode_raw(*args, max_context_partition_num=max_context_partition_num, **kwargs)
+            def _flydsl_pa_decode(*args, work_plan=None, **kwargs):
+                part = int(work_plan.max_partitions) if work_plan is not None and hasattr(work_plan, 'max_partitions') else 1
+                return _pa_decode_raw(*args, max_context_partition_num=part, work_plan=work_plan, **kwargs)
         else:
             _flydsl_pa_decode = _pa_decode_raw
 
