@@ -4,5 +4,5 @@ One file per test session, `<YYYYMMDD>-result.md`, named by the session date: Sa
 
 | Session | Scenario | Image | ATOM / aiter | Result |
 |---|---|---|---|---|
-| [2026-11-18 (DeepSeek, zejun)](20261118-result-zejun.md) | MLPerf Endpoint + 8K/1K | `gfx1250-atom-ci455-20261118` | `9b2e67b7f` / `b1d849ff3` | 3/3 DeepSeek passed, ✅ 2 |
+| [2026-11-18](20261118-result.md) | GSM8K only | `gfx1250-atom-ci455-20261118` | `9b2e67b7f` / `b1d849ff3` | 3/8 tested so far: 3 passed, ✅ 2 (5 models to come) |
 | [2026-11-14](20261114-result.md) | MLPerf Endpoint + 8K/1K | `gfx1250-atom-ci455-20261114` | `9fec99786` / `b6f1ff6b7` | 2/8 passed, ❌ 6 |
