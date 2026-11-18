@@ -807,6 +807,8 @@ class FusedMoEMethodBase(QuantizeMethodBase):
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
     """MoE method without quantization."""
 
+    pad_align = 1
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -820,9 +822,24 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
         stream_online_quant = getattr(layer, "_stream_online_quant", False)
         weight_device = "meta" if stream_online_quant else None
 
+        logical_intermediate = intermediate_size_per_partition
+        intermediate_size_per_partition = (
+            (logical_intermediate + self.pad_align - 1)
+            // self.pad_align
+            * self.pad_align
+        )
+        # Keep layer.intermediate_size_per_partition logical for checkpoint
+        # sharding. AITER computes the physical width, including these zeros;
+        # its hidden_pad/intermediate_pad arguments must remain zero.
+        allocate = (
+            torch.zeros
+            if intermediate_size_per_partition != logical_intermediate
+            else torch.empty
+        )
+
         # Fused gate_up_proj (column parallel)
         w13_weight = atom_parameter(
-            torch.empty(
+            allocate(
                 num_experts,
                 2 * intermediate_size_per_partition,
                 hidden_size,
@@ -835,7 +852,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
 
         # down_proj (row parallel)
         w2_weight = atom_parameter(
-            torch.empty(
+            allocate(
                 num_experts,
                 hidden_size,
                 intermediate_size_per_partition,
@@ -2651,6 +2668,8 @@ def _make_mxfp4_moe_method(
 
 # Refer to CompressedTensorsW8A8Fp8MoEMethod in vllm
 class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
+    pad_align = 1
+
     def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
         super().__init__(moe)
         self.quant_config = quant_config
@@ -2713,6 +2732,14 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
                 )
 
         # WEIGHTS
+        logical_intermediate = intermediate_size_per_partition
+        if self.per_channel:
+            intermediate_size_per_partition = (
+                (logical_intermediate + self.pad_align - 1)
+                // self.pad_align
+                * self.pad_align
+            )
+
         w13_weight = atom_parameter(
             torch.empty(
                 num_experts,
@@ -2735,6 +2762,13 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
+        if intermediate_size_per_partition != logical_intermediate:
+            # Byte initialization also works for FP8 storage. Loaders copy
+            # logical TP slices into each physical gate/up half and W2's K
+            # prefix, leaving the padding zero.
+            w13_weight.data.view(torch.uint8).zero_()
+            w2_weight.data.view(torch.uint8).zero_()
+
         # WEIGHT_SCALES - different shapes based on quantization strategy
         if self.per_channel:
             # Per-channel quantization: shape [E, N, 1]
@@ -2748,6 +2782,14 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
                 )
             )
             layer.register_parameter("w13_weight_scale", w13_weight_scale)
+
+            if intermediate_size_per_partition != logical_intermediate:
+                w13_weight_scale.data[
+                    :, logical_intermediate:intermediate_size_per_partition
+                ].zero_()
+                w13_weight_scale.data[
+                    :, intermediate_size_per_partition + logical_intermediate :
+                ].zero_()
 
             w2_weight_scale = atom_parameter(
                 torch.ones(
@@ -2920,6 +2962,10 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
 
             w13.data = shuffle_weight(w13.data)
             w2.data = shuffle_weight(w2.data)
+            # Tensor attributes do not propagate through a Parameter.data
+            # assignment. AITER dispatch checks the final Parameters.
+            w13.is_shuffled = True
+            w2.is_shuffled = True
 
         # Call parent class for any additional processing
         super().process_weights_after_loading(layer)

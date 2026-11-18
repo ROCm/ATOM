@@ -11,6 +11,7 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
 )
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from torch import nn
 
 from atom.config import Config
@@ -134,9 +135,8 @@ class _Qwen4ExpQuantizationConfig:
 
 # The sigmoid-gated shared expert rides through the fused MoE as expert
 # `num_experts` (top-k + 1) and batch-1 MoE goes through
-# `moe_decode_single_token`; both are the default for the served model. MTP
-# builds its own block, and keeps the standalone shared expert because its
-# intent head loads without the extra slot.
+# `moe_decode_single_token` outside the gfx942 tuned PTPC path. On gfx942,
+# BF16 MTP also fuses the shared expert and uses AITER's tuned MoE tables.
 
 
 def _is_dynamic_ptpc_fp8(policy: LayerQuantConfig) -> bool:
@@ -191,6 +191,7 @@ def install_stacked_expert_loaders(experts: FusedMoE) -> None:
     """
     moe_parallel = experts.moe_parallel_config
     tp_rank = moe_parallel.tp_rank
+    tp_size = moe_parallel.tp_size
     expert_map = getattr(experts, "expert_map", None)
     if expert_map is None:
         # A fused shared expert occupies slots past the routed ones.
@@ -208,22 +209,41 @@ def install_stacked_expert_loaders(experts: FusedMoE) -> None:
         expert_slice = slice(first, last + 1)
 
     def stacked_w13(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
-        intermediate = param.data.shape[1] // 2
+        physical = param.data.shape[1] // 2
         full = loaded_weight.shape[1] // 2
+        if full % tp_size:
+            raise ValueError(
+                f"Expert intermediate {full} is not divisible by TP {tp_size}"
+            )
+        logical = full // tp_size
+        if logical > physical:
+            raise ValueError(f"Expert shard {logical} exceeds its buffer {physical}")
         stacked = loaded_weight[expert_slice]
         for half in range(2):
-            source = stacked.narrow(
-                1, half * full + tp_rank * intermediate, intermediate
+            source = stacked.narrow(1, half * full + tp_rank * logical, logical)
+            # The checkpoint has routed rows only. A fused shared expert is
+            # loaded separately into the tail and must survive either order.
+            target = param.data[: stacked.shape[0]].narrow(1, half * physical, physical)
+            target.zero_()
+            target[:, :logical].copy_(
+                source.to(device=target.device, dtype=target.dtype)
             )
-            target = param.data.narrow(1, half * intermediate, intermediate)
-            target.copy_(source.to(device=target.device, dtype=target.dtype))
 
     def stacked_w2(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
-        intermediate = param.data.shape[2]
-        source = loaded_weight[expert_slice].narrow(
-            2, tp_rank * intermediate, intermediate
-        )
-        param.data.copy_(source.to(device=param.device, dtype=param.dtype))
+        full = loaded_weight.shape[2]
+        if full % tp_size:
+            raise ValueError(
+                f"Expert intermediate {full} is not divisible by TP {tp_size}"
+            )
+        logical = full // tp_size
+        if logical > param.shape[2]:
+            raise ValueError(
+                f"Expert shard {logical} exceeds its buffer {param.shape[2]}"
+            )
+        source = loaded_weight[expert_slice].narrow(2, tp_rank * logical, logical)
+        target = param.data[: source.shape[0]]
+        target.zero_()
+        target[:, :, :logical].copy_(source.to(device=param.device, dtype=param.dtype))
 
     def wrap(param: nn.Parameter, stacked_loader):
         stock = param.weight_loader
@@ -246,12 +266,8 @@ def install_stacked_expert_loaders(experts: FusedMoE) -> None:
 class _UnfusedSharedExpertConfig:
     """Config view that hides `n_shared_experts` from `FusedMoE`.
 
-    ATOM synthesizes `n_shared_experts=1` for any checkpoint carrying
-    `shared_expert` tensors, and `FusedMoE` then reserves a 513th expert slot
-    to fuse it into. Qwen3.8-Flash-Next's routed experts arrive as one fixed `[512, ...]`
-    stack with no room for that slot, so the shared expert stays a standalone
-    MLP here -- which is also what the reference implementation does. Every
-    other attribute passes straight through.
+    Used when the selected quantization/backend keeps a standalone shared
+    MLP. Every other attribute passes straight through.
     """
 
     def __init__(self, config) -> None:
@@ -272,12 +288,29 @@ class _FusedSharedExpertConfig(_UnfusedSharedExpertConfig):
         return getattr(self._config, name)
 
 
-def moe_pad_align(intermediate_size: int, tp_size: int) -> int | None:
-    """Expert pad alignment for `FusedMoE`: 128 if the shard needs no padding.
+def moe_pad_align(
+    intermediate_size: int,
+    tp_size: int,
+    quant: LayerQuantConfig | None = None,
+) -> int | None:
+    """Use the gfx942 PTPC/BF16 tuned widths; retain the MXFP4 policy.
 
     TP1 keeps Qwen3.8-Flash-Next's 640 instead of padding it to 768; other
     shards keep the MXFP4 default (256).
     """
+    if (
+        quant is not None
+        and get_gfx_runtime() == "gfx942"
+        and (
+            (quant.quant_type == QuantType.No and quant.quant_dtype == torch.bfloat16)
+            or (
+                quant.quant_method == "compressed-tensors"
+                and quant.quant_type == QuantType.per_Token
+                and quant.quant_dtype == dtypes.fp8
+            )
+        )
+    ):
+        return 64
     return 128 if (intermediate_size // tp_size) % 128 == 0 else None
 
 
@@ -296,6 +329,17 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
         self.prefix = prefix
         self.tp_size = get_tensor_model_parallel_world_size()
         self.n_routed_experts = int(config.num_experts)
+        expert_quant = (
+            quant_config.get_layer_quant_config(
+                f"{prefix}.experts", check_children=True
+            )
+            if quant_config is not None
+            else LayerQuantConfig(quant_dtype=torch.get_default_dtype())
+        )
+        pad_align = moe_pad_align(
+            config.moe_intermediate_size, self.tp_size, expert_quant
+        )
+        self.use_gfx942_tuned_moe = pad_align == 64
         self.fuse_shared = (
             fuse_shared_expert
             and is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
@@ -346,7 +390,7 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
             ),
             shared_expert_scoring_func="sigmoid" if self.fuse_shared else None,
             shared_expert_prefix=f"{prefix}.shared_expert",
-            pad_align=moe_pad_align(config.moe_intermediate_size, self.tp_size),
+            pad_align=pad_align,
         )
         install_stacked_expert_loaders(self.experts)
         self._single_token_ok: bool | None = None
@@ -383,7 +427,11 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
         logits = self.gate(hidden_states)
         if self.fuse_shared:
             # The tail logit is the shared expert's sigmoid gate.
-            if hidden_states.shape[0] == 1 and self._single_token_supported():
+            if (
+                not self.use_gfx942_tuned_moe
+                and hidden_states.shape[0] == 1
+                and self._single_token_supported()
+            ):
                 out = self._single_token_experts(hidden_states, logits)
             else:
                 out = self.experts(hidden_states=hidden_states, router_logits=logits)

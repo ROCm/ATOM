@@ -7,6 +7,7 @@ import json
 import os
 
 import torch
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from torch import nn
 
 from atom.config import Config
@@ -120,6 +121,10 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
                     prefix="mtp.layers.0",
                     layer_num=self.mtp_start_layer_idx,
                     quant_config=quant_config,
+                    fuse_shared_expert=(
+                        isinstance(quant_config, _UnquantizedMTPQuantizationConfig)
+                        and get_gfx_runtime() == "gfx942"
+                    ),
                 )
             ]
         )
@@ -180,6 +185,8 @@ class Qwen4ExpMTP(nn.Module):
         super().__init__()
         self.config = atom_config.hf_config
         self.model = Qwen4ExpMultiTokenPredictor(atom_config)
+        self.fused_shared_experts = int(self.model.layers[0].mlp.fuse_shared)
+        self.disable_fused_shared_loading = not self.fused_shared_experts
         self.lm_head = ParallelLMHead(
             self.config.vocab_size, self.config.hidden_size, prefix="lm_head"
         )
