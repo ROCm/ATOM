@@ -139,7 +139,16 @@ class TransferSlotPool:
         self.base_ptr = int(self._buffer.data_ptr())
         # Register before any slot is handed out: a put from an unregistered
         # address fails every time.
-        client.register(self.base_ptr, self.nbytes)
+        #
+        # hipIpcGetMemHandle requires the START of a hipMalloc allocation, not
+        # an interior pointer. Register the entire backing (from backing.data_ptr())
+        # so the IPC handle covers a valid allocation start. With
+        # PYTORCH_NO_CUDA_MEMORY_CACHING=1, torch.empty() calls hipMalloc
+        # directly, making backing.data_ptr() the start of a hipMalloc. Slot
+        # pointers (self.base_ptr + k*stride) all lie within this registered
+        # range, so the server can access them via offset arithmetic.
+        self._reg_base_ptr = int(self._backing.data_ptr())
+        client.register(self._reg_base_ptr, len(self._backing))
         self._client = client
         self._slots: dict[str, list[Slot]] = {}
         position = 0
@@ -342,7 +351,7 @@ class TransferSlotPool:
                     self.nbytes,
                 )
             else:
-                self._client.unregister(self.base_ptr)
+                self._client.unregister(self._reg_base_ptr)
         finally:
             self._slots = {region: [] for region in REGIONS}
             self._free = {region: deque() for region in REGIONS}
