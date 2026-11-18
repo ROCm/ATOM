@@ -324,8 +324,8 @@ class TestResolveReasoningToggle:
         assert "thinking" not in kwargs, "a hardcoded kwarg name came back"
 
     def test_the_chat_path_writes_no_hardcoded_reasoning_kwarg(self):
-        """That body is inside a route handler no unit test reaches, so this
-        reads the source -- but for the shape of the answer, not a literal:
+        """This reads the source of `_check_chat`, which merges the chat
+        route's kwargs -- but for the shape of the answer, not a literal:
         no `merged_kwargs["<anything about thinking>"] = ...` at all."""
         import ast
         import inspect
@@ -335,7 +335,7 @@ class TestResolveReasoningToggle:
         # an effort level, validated against the dialects' own vocabulary --
         # and is not what the resolved toggle answers.
         _TOGGLE_NAMES = {name for name, _, _ in REASONING_TOGGLES}
-        src = inspect.getsource(api_server._chat_completions)
+        src = inspect.getsource(api_server._check_chat)
         tree = ast.parse(textwrap.dedent(src))
         hardcoded = [
             n.slice.value
