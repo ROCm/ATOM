@@ -95,6 +95,94 @@ class GDNAttentionBackend(AiterBackend):
         return GatedDeltaNet
 
 
+@triton.jit(do_not_specialize=["num_decodes"])
+def _gdn_spec_decode_pad_kernel(
+    ns_idx_ptr,
+    ns_len,
+    sp_idx_ptr,
+    sp_rows,
+    sp_stride,
+    mask_ptr,
+    mask_len,
+    qsl_dst_ptr,
+    qsl_src_ptr,
+    qsl_len,
+    acc_ptr,
+    acc_len,
+    num_decodes,
+    PAD: tl.constexpr,
+    SP_COLS: tl.constexpr,
+    HAS_NS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """`_attach_gdn_decode_metadata`'s speculative-decode padding:
+    ns_idx[nd:] = PAD (HAS_NS), sp_idx[nd:, :] = PAD, mask[nd:] = False,
+    qsl_dst[j] = qsl_src[min(j, nd)], acc[nd:] = 1."""
+    nd = num_decodes
+    tail = qsl_src_ptr + nd
+    last = tl.load(tail)
+    for start in range(0, qsl_len, BLOCK):
+        j = start + tl.arange(0, BLOCK)
+        v = tl.load(qsl_src_ptr + j, mask=j <= nd, other=0)
+        tl.store(qsl_dst_ptr + j, tl.where(j <= nd, v, last), mask=j < qsl_len)
+    for start in range(nd, acc_len, BLOCK):
+        j = start + tl.arange(0, BLOCK)
+        tl.store(
+            acc_ptr + j, tl.full([BLOCK], 1, acc_ptr.dtype.element_ty), mask=j < acc_len
+        )
+    for start in range(nd, mask_len, BLOCK):
+        j = start + tl.arange(0, BLOCK)
+        tl.store(
+            mask_ptr + j,
+            tl.zeros([BLOCK], mask_ptr.dtype.element_ty),
+            mask=j < mask_len,
+        )
+    if HAS_NS:
+        for start in range(nd, ns_len, BLOCK):
+            j = start + tl.arange(0, BLOCK)
+            tl.store(
+                ns_idx_ptr + j,
+                tl.full([BLOCK], PAD, ns_idx_ptr.dtype.element_ty),
+                mask=j < ns_len,
+            )
+    c = tl.arange(0, SP_COLS)
+    for r in range(nd, sp_rows):
+        tl.store(
+            sp_idx_ptr + r.to(tl.int64) * sp_stride + c,
+            tl.full([SP_COLS], PAD, sp_idx_ptr.dtype.element_ty),
+        )
+
+
+def _gdn_spec_decode_pad(ns_idx, sp_idx, masks, qsl_dst, qsl_src, acc, num_decodes):
+    """ATOM_GDN_FUSED_DECODE_PAD: the speculative decode padding of
+    `_attach_gdn_decode_metadata` (four fills, a copy and a broadcast copy) in
+    one launch. The same values."""
+    assert sp_idx.dim() == 2 and sp_idx.stride(1) == 1
+    assert qsl_src.numel() >= num_decodes + 1 and qsl_src.is_contiguous()
+    cols = sp_idx.shape[1]
+    assert cols == triton.next_power_of_2(cols), cols
+    _gdn_spec_decode_pad_kernel[(1,)](
+        ns_idx if ns_idx is not None else acc,
+        ns_idx.shape[0] if ns_idx is not None else 0,
+        sp_idx,
+        sp_idx.shape[0],
+        sp_idx.stride(0),
+        masks,
+        masks.shape[0],
+        qsl_dst,
+        qsl_src,
+        qsl_dst.shape[0],
+        acc,
+        acc.shape[0],
+        num_decodes,
+        PAD=PAD_SLOT_ID,
+        SP_COLS=cols,
+        HAS_NS=ns_idx is not None,
+        BLOCK=256,
+        num_warps=4,
+    )
+
+
 @dataclass
 class GDNAttentionMetadata:
     num_prefills: int
@@ -1225,7 +1313,9 @@ class GDNStateMixin(PoolRowsMixin):
     def _checkpoint_tensors(self, batch: ScheduledBatch, found) -> dict:
         """Exact-size device tensors of the targets, for a step whose GDN
         layers run the eager (unplanned) path."""
-        cols, chunk_slots = self._checkpoint_columns(found, batch.total_seqs_num_prefill)
+        cols, chunk_slots = self._checkpoint_columns(
+            found, batch.total_seqs_num_prefill
+        )
 
         def mk(col):
             return torch.as_tensor(np.ascontiguousarray(col), device=self.device)
@@ -1235,7 +1325,9 @@ class GDNStateMixin(PoolRowsMixin):
         out["chunk_slots"] = mk(chunk_slots)
         return out
 
-    def _staged_checkpoint_targets(self, found, num_prefills: int, nt64_cap: int) -> dict | None:
+    def _staged_checkpoint_targets(
+        self, found, num_prefills: int, nt64_cap: int
+    ) -> dict | None:
         """The targets in fixed-address tables of `_checkpoint_capacity` rows,
         padded with slot -1, and the per-chunk slot table at its fixed address:
         what a recorded prefill graph reads, so the same recording serves a step
@@ -1264,7 +1356,9 @@ class GDNStateMixin(PoolRowsMixin):
             out[name] = self._stage_upload(
                 f"ckpt_{name}", np.ascontiguousarray(padded[:, i]), cap, torch.int32
             )
-        out["chunk_slots"] = self._stage_upload("ckpt_chunk_slots", slots_all, nt64_cap, torch.int32)
+        out["chunk_slots"] = self._stage_upload(
+            "ckpt_chunk_slots", slots_all, nt64_cap, torch.int32
+        )
         if any(v is None for v in out.values()):
             return None
         self._ckpt_tables_clear = None if found else out
@@ -1451,7 +1545,13 @@ class GDNStateMixin(PoolRowsMixin):
                 else torch.zeros(num_prefills, dtype=torch.bool, device=self.device)
             )
             nums_dict, batch_ptr, token_chunk_offset_ptr = self._conv1d_metadata(
-                non_spec_query_start_loc, num_prefills
+                non_spec_query_start_loc,
+                num_prefills,
+                has_init_host=(
+                    np.asarray(batch.num_cached_tokens[:num_prefills]) > 0
+                    if cached is not None
+                    else np.zeros(num_prefills, dtype=np.bool_)
+                ),
             )
             self._prime_chunk_indices(non_spec_query_start_loc, num_prefills)
         else:
@@ -1564,6 +1664,23 @@ class GDNStateMixin(PoolRowsMixin):
         )
 
         # transfer data to ps buffer
+        if self.use_spec_decode and envs.ATOM_GDN_FUSED_DECODE_PAD:
+            # The pad fills and query prefix below in one launch.
+            _gdn_spec_decode_pad(
+                self.non_spec_state_indices_tensor.gpu if self.replayssm else None,
+                self.spec_state_indices_tensor.gpu,
+                self.spec_sequence_masks,
+                self.spec_query_start_loc,
+                gdn_metadata.spec_query_start_loc,
+                self.num_accepted_tokens,
+                num_decodes,
+            )
+            gdn_metadata.spec_query_start_loc = self.spec_query_start_loc[
+                : num_decodes + 1
+            ]
+            gdn_metadata.num_accepted_tokens = self.num_accepted_tokens[:num_decodes]
+            attn_metadata.gdn_metadata = gdn_metadata
+            return
         if self.replayssm:
             # Idle graph-padding entries must resolve to PAD so the kernel
             # skips them instead of touching slot 0's checkpoint.
@@ -1789,6 +1906,7 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
     # below, in one launch plus the `kv_indices` generation. Declared here and
     # nowhere else: that function reproduces this builder's rebuild only.
     supports_fused_mtp_glue = True
+
     # A prefill step pads to a token-graph bucket (`ForwardMode._pad_to_token_graph`,
     # `ModelRunner._record_tr_graphs`): `prepare_prefill` lays the step out at
     # `running_tokens`, the rows past the scheduled ones with slot -1 (written
@@ -1827,6 +1945,7 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         from aiter.dist.parallel_state import get_dp_group
 
         return get_dp_group().world_size > 1
+
     # The bucket a padded prefill is being laid out at, while `prepare_prefill`
     # runs; None otherwise.
     _token_graph_tokens: int | None = None
@@ -2222,7 +2341,10 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         if name not in st:
             st[name] = {
                 "gpu": torch.zeros(cap, dtype=dtype, device=self.device),
-                "cpu": [torch.empty(cap, dtype=dtype, pin_memory=True) for _ in range(self._STAGING_SLOTS)],
+                "cpu": [
+                    torch.empty(cap, dtype=dtype, pin_memory=True)
+                    for _ in range(self._STAGING_SLOTS)
+                ],
                 "ev": [None] * self._STAGING_SLOTS,
                 "next": 0,
             }
@@ -2257,8 +2379,20 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             return torch.as_tensor(values, dtype=torch.int64, device=self.device)
         return out
 
-    def _conv1d_metadata(self, query_start_loc, num_prefills: int):
-        """Return separate row and persistent program tables from host lengths."""
+    def _conv1d_metadata(
+        self,
+        query_start_loc,
+        num_prefills: int,
+        has_init_host: np.ndarray | None = None,
+    ):
+        """Return separate row and persistent program tables from host lengths.
+
+        Under ATOM_GDN_CONV_ROWS_V2 and ATOM_GDN_CONV_PACKED_META (with
+        `has_init_host`, the sequences' initial-state flags) the rows kernel's
+        table also goes up packed:
+        [programs, 8] int32 (sequence, chunk, first token, end token, read
+        slot, write slot, has-initial-state, 0), so a program reads every
+        scalar it needs in one round trip."""
         cu = self.model_runner.forward_vars["cu_seqlens_q"].np[: num_prefills + 1]
         lens = np.diff(cu).astype(np.int64)
         nums_dict = {}
@@ -2307,6 +2441,20 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
                 "batch_ptr": batch_ptr,
                 "token_chunk_offset_ptr": offset_ptr,
             }
+            if (
+                BLOCK_M == 8
+                and has_init_host is not None
+                and envs.ATOM_GDN_CONV_ROWS_V2
+                and envs.ATOM_GDN_CONV_PACKED_META
+            ):
+                packed = self._conv1d_packed_meta(
+                    cu, mlist, offsets, tot, has_init_host
+                )
+                prog_meta = self._stage_upload(
+                    "conv1d_meta_8", packed.reshape(-1), cap * 8, torch.int32
+                )
+                if prog_meta is not None:
+                    nums_dict[BLOCK_M]["prog_meta"] = prog_meta.view(-1, 8)
             if programs_max is not None:
                 nums_dict[BLOCK_M]["programs_max"] = programs_max
         return (
@@ -2314,6 +2462,25 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             nums_dict[8]["batch_ptr"],
             nums_dict[8]["token_chunk_offset_ptr"],
         )
+
+    def _conv1d_packed_meta(self, cu, mlist, offsets, tot, has_init_host):
+        """The rows kernel's [programs, 8] int32 table (pad programs: sequence
+        PAD_SLOT_ID, the rest 0)."""
+        n = len(cu) - 1
+        rows = len(mlist)
+        packed = np.zeros((rows, 8), dtype=np.int32)
+        packed[:, 0] = PAD_SLOT_ID
+        seq = mlist[:tot].astype(np.int64)
+        slot_out = self.non_spec_state_indices_tensor.np[:n]
+        slot_in = self.non_spec_state_indices_in_tensor.np[:n]
+        packed[:tot, 0] = seq
+        packed[:tot, 1] = offsets[:tot]
+        packed[:tot, 2] = cu[seq]
+        packed[:tot, 3] = cu[seq + 1]
+        packed[:tot, 4] = slot_in[seq]
+        packed[:tot, 5] = slot_out[seq]
+        packed[:tot, 6] = has_init_host[:n][seq]
+        return packed
 
     # Chunk index tables for the GDN prefill kernels (`prepare_chunk_indices`:
     # [(sequence, chunk-in-sequence)] per chunk, for the 16- and 64-token
@@ -2334,14 +2501,18 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         for chunk_size in self._CHUNK_INDEX_SIZES:
             counts = -(-lens // chunk_size)
             if len(counts):
-                prepare_max_chunks.prime(
-                    int(counts.max()), query_start_loc, chunk_size
-                )
+                prepare_max_chunks.prime(int(counts.max()), query_start_loc, chunk_size)
             total = int(counts.sum())
             flat = np.empty(2 * total, dtype=np.int64)
             flat[0::2] = np.repeat(np.arange(len(lens)), counts)
-            flat[1::2] = np.arange(total) - np.repeat(np.cumsum(counts) - counts, counts)
-            cap = 2 * (self.model_runner.max_num_batched_tokens // chunk_size + self.model_runner.max_bs + 1)
+            flat[1::2] = np.arange(total) - np.repeat(
+                np.cumsum(counts) - counts, counts
+            )
+            cap = 2 * (
+                self.model_runner.max_num_batched_tokens // chunk_size
+                + self.model_runner.max_bs
+                + 1
+            )
             gpu = self._stage_upload(f"chunk_idx_{chunk_size}", flat, cap, torch.int64)
             if gpu is None:
                 return  # the kernels compute their own (with the sync)
@@ -2389,7 +2560,9 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         batch._gdn_checkpoint_found = found
         return bool(found) and len(found) > self._checkpoint_capacity()
 
-    def _attach_gdn_plan(self, batch, attn_metadata, gdn_metadata, running_tokens) -> None:
+    def _attach_gdn_plan(
+        self, batch, attn_metadata, gdn_metadata, running_tokens
+    ) -> None:
         """The `VarlenPlan` for this prefill's GDN kernels when the step runs
         under the token graph; None keeps the eager path."""
         gdn_metadata.varlen_plan = None
@@ -2431,7 +2604,9 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         offs_t = self._stage_upload("gdn_chunk_offsets", offs, n_max + 1, torch.int32)
         counts_t = self._stage_upload("gdn_counts", counts, 3, torch.int32)
         flags_t = self._stage_upload("gdn_has_h0", has_h0, n_max, torch.int32)
-        flags_b = self._stage_upload("gdn_has_h0_bool", has_h0.astype(np.bool_), n_max, torch.bool)
+        flags_b = self._stage_upload(
+            "gdn_has_h0_bool", has_h0.astype(np.bool_), n_max, torch.bool
+        )
         if offs_t is None or counts_t is None or flags_t is None or flags_b is None:
             return
         gdn_metadata.varlen_plan = VarlenPlan(
@@ -2464,7 +2639,9 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             geometry = self._psplit_geometry = dict(
                 q_per_kv=max(1, self.num_attention_heads // kv_heads),
                 kv_heads=kv_heads,
-                num_cus=torch.cuda.get_device_properties(self.device).multi_processor_count,
+                num_cus=torch.cuda.get_device_properties(
+                    self.device
+                ).multi_processor_count,
             )
         return geometry
 
@@ -2492,15 +2669,22 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         cap_rows = prefix_split.MAX_PARTIAL_ROWS + runner.max_num_batched_tokens
         staged = {}
         for name, cap in (
-            ("cu_q_a", cap_cu), ("cu_k_a", cap_cu), ("cu_q_b", cap_cu), ("cu_k_b", cap_cu),
-            ("q_rep", cap_rows), ("merge_rows", cap_rows),
+            ("cu_q_a", cap_cu),
+            ("cu_k_a", cap_cu),
+            ("cu_q_b", cap_cu),
+            ("cu_k_b", cap_cu),
+            ("q_rep", cap_rows),
+            ("merge_rows", cap_rows),
         ):
             t = self._stage_upload(f"psplit_{name}", plan[name], cap, torch.int32)
             if t is None:
                 return
             staged[name] = t
         attn_metadata.prefix_split = SimpleNamespace(
-            n_full=plan["n_full"], max_q=plan["max_q"], max_k_a=plan["max_k_a"], **staged
+            n_full=plan["n_full"],
+            max_q=plan["max_q"],
+            max_k_a=plan["max_k_a"],
+            **staged,
         )
 
     def _upload_prefill_mirrors(
@@ -2566,7 +2750,9 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
                 f"token-graph bucket of {tokens} rows exceeds the "
                 f"{runner.max_num_batched_tokens}-row token buffers"
             )
-        seq = Sequence([0] * tokens, block_size=runner.block_size, has_per_req_cache=True)
+        seq = Sequence(
+            [0] * tokens, block_size=runner.block_size, has_per_req_cache=True
+        )
         seq.status = SequenceStatus.RUNNING
         seq.type = SequenceType.PREFILL
         if self._gdn_graph_prefill():
@@ -2743,6 +2929,11 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         # instead of this builder's shared plan.
         attn_metadata.flydsl_work_plan = self.refresh_flydsl_plan(
             attn_metadata.context_lens, create=True
+        )
+        # ATOM_UA_DECODE_TOKEN_SPLIT, the same rule: the graph reads the buffer
+        # every replay's prepare_decode publishes first.
+        attn_metadata.decode_token_split_tiles = self._decode_token_split_metadata(
+            attn_metadata.context_lens
         )
 
         positions = var["positions"].copy_to_gpu(capture_tokens)

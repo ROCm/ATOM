@@ -13,6 +13,8 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.utils import envs
+
 from .index import prepare_chunk_indices, prepare_chunk_offsets, prepare_max_chunks
 from .op import exp
 
@@ -492,7 +494,13 @@ def chunk_gated_delta_rule_fwd_h(
         from .chunk_delta_h_gfx1250 import chunk_h_gfx1250
 
         # chunks of the longest walk; a planned (graph) launch knows only its capacity
-        if plan is not None:
+        config_n = None
+        plan_tile = envs.ATOM_GDN_CHUNK_H_PLAN_TILE
+        if plan is not None and plan_tile:
+            # Tile for one sequence of the whole bucket (most graphed steps): the capacity
+            # n_max would pick the widest tile, which leaves most CUs idle at one sequence.
+            config_n, longest_chunks = 1, NT - N + 1
+        elif plan is not None:
             longest_chunks = triton.cdiv(NT, N)
         elif cu_seqlens is not None:
             longest_chunks = prepare_max_chunks(cu_seqlens, BT)
@@ -526,6 +534,8 @@ def chunk_gated_delta_rule_fwd_h(
             BT,
             ckpt_pool=ckpt_pool,
             ckpt_slot=ckpt_slot,
+            config_n=config_n,
+            adapt=config_n is not None and plan_tile == 2,
         )
         return h, v_new, (None if in_place else final_state)
 

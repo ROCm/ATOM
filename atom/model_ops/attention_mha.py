@@ -14,6 +14,12 @@ from aiter.ops.triton.unified_attention import unified_attention
 from torch import nn
 
 from atom.config import get_current_atom_config
+from atom.model_ops.attn_output_epilogue import (
+    current_attention_output_epilogue,
+    unified_attention_takes_output_epilogue,
+    unified_attention_takes_split_reduce,
+    unified_attention_takes_split_reduce_oneshot,
+)
 from atom.model_ops.base_attention import (
     PA_ASM_MAX_QUERY_GROUP_SIZE,
     cp_mha_gather_cache,
@@ -696,6 +702,9 @@ class PagedAttentionImpl(nn.Module):
             # one aiter Gluon kernel: norm, MRoPE, NVFP4 K + fp8 V into the cache, Q out in fp8
             from atom.model_ops.triton_mrope import try_fused_qk_norm_mrope_cache
 
+            # A prefill padded to the token-graph bucket (attention runs eagerly): the
+            # kernel computes only the scheduled rows, as the attention reads them.
+            n_tok = fwd_ctx.context.scheduled_tokens
             fused = try_fused_qk_norm_mrope_cache(
                 self.q_norm,
                 self.k_norm,
@@ -711,6 +720,14 @@ class PagedAttentionImpl(nn.Module):
                 v_cache,
                 fwd_ctx.attn_metadata.slot_mapping,
                 kv_scale=self.kv_scale_float,
+                num_tokens=(
+                    n_tok
+                    if envs.ATOM_QK_NORM_ROPE_SCHEDULED_ROWS
+                    and fwd_ctx.context.is_prefill
+                    and 0 < n_tok < q_raw.shape[0]
+                    and not torch.cuda.is_current_stream_capturing()
+                    else None
+                ),
             )
             if fused is not None:
                 self.per_token_quant = False
@@ -977,10 +994,50 @@ class PagedAttentionImpl(nn.Module):
             o = torch.empty(*q.shape, dtype=torch.bfloat16, device=q.device)
         else:
             o = torch.empty_like(q)
+        # ATOM_MTP_ATTN_GATE_IN_REDUCE: the layer's output gate (and its row
+        # selection) in the epilogue of the attention's reduce.
+        epilogue = {}
+        req = current_attention_output_epilogue()
+        if (
+            req is not None
+            and o.dtype == torch.bfloat16
+            and (req.gate is None or req.gate.dtype == o.dtype)
+            and unified_attention_takes_output_epilogue()
+        ):
+            if req.rows is not None:
+                o = o.new_empty((req.rows.shape[0], *o.shape[1:]))
+            epilogue = {"output_gate": req.gate, "output_rows": req.rows}
+            req.applied = True
+        else:
+            # ATOM_UA_FUSED_OUTPUT_GATE: this forward's gate, over every row.
+            epilogue = _gate_kwarg(self._take_output_gate(q.shape[0]))
 
         sliding_window = (
             (self.sliding_window - 1, 0) if self.sliding_window > 0 else (-1, -1)
         )
+        # A draft mid-step's token split, written by the advance before it
+        # (ATOM_MTP_ADVANCE_TOKEN_SPLIT); aiter computes it otherwise.
+        split = {}
+        if fwd_ctx.context.is_draft and attn_metadata.max_seqlen_q == 1:
+            tiles = getattr(attn_metadata, "gfx12_token_split_tiles", None)
+            if tiles is not None:
+                split["gfx12_token_split_tiles"] = tiles
+        else:
+            # The decode forward's, computed once by the builder from the lengths
+            # this call reads (ATOM_UA_DECODE_TOKEN_SPLIT): every target layer and
+            # the draft's step 0, before any pass advances them.
+            tiles = getattr(attn_metadata, "decode_token_split_tiles", None)
+            if tiles is not None and tiles.seqused_k is attn_metadata.context_lens:
+                split["gfx12_token_split_tiles"] = tiles.metadata()
+        # ATOM_UA_SPLIT_REDUCE: aiter's split-KV reduce for the token split's grid.
+        if envs.ATOM_UA_SPLIT_REDUCE and unified_attention_takes_split_reduce():
+            split["split_reduce"] = True
+            # ATOM_UA_SPLIT_REDUCE_ONESHOT: its one-round-trip variant (bitwise).
+            if (
+                envs.ATOM_UA_SPLIT_REDUCE_ONESHOT
+                and unified_attention_takes_split_reduce_oneshot()
+            ):
+                split["split_reduce_oneshot"] = True
         unified_attention(
             q,
             k_cache,
@@ -1002,7 +1059,8 @@ class PagedAttentionImpl(nn.Module):
             sinks=self.sinks,
             shuffled_kv_cache=not self.use_flash_layout,
             equal_seqlen_q=attn_metadata.equal_seqlen_q,
-            **_gate_kwarg(self._take_output_gate(q.shape[0])),
+            **epilogue,
+            **split,
         )
         return o
 

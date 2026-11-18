@@ -12,6 +12,7 @@ thread-state and buffer primitives are shared with the KV path.
 from __future__ import annotations
 
 import threading
+from time import perf_counter
 from typing import Any
 
 import torch
@@ -131,7 +132,7 @@ class StagedTransfer:
             return torch.cuda.device(self.device)
         return _NullCtx()
 
-    def pack(self, segments: list[torch.Tensor], dst: Any) -> None:
+    def pack(self, segments: list[torch.Tensor], dst: Any, prof=None) -> None:
         """Gather `segments` into one contiguous object via the Triton packer.
 
         The existing kernel needs no modification: it is already a fully
@@ -163,9 +164,10 @@ class StagedTransfer:
             sum(seg_bytes),
             dst,
             lambda buf: fused_pack_chunk_major(segments, seg_bytes, [1], [0], buf),
+            prof,
         )
 
-    def pack_segments(self, ptrs, sizes, dst: Any) -> None:
+    def pack_segments(self, ptrs, sizes, dst: Any, prof=None) -> None:
         """`pack` for segments given as raw device addresses and byte sizes.
 
         For a store whose image is thousands of small segments: the metadata
@@ -192,10 +194,17 @@ class StagedTransfer:
             prepared.nbytes,
             dst,
             lambda buf: fused_pack_segments(prepared, ptrs, buf),
+            prof,
         )
 
-    def _gather(self, nbytes: int, dst: Any, launch) -> None:
-        """Run `launch(device_buf)` on `pack_stream` and land the bytes in `dst`."""
+    def _gather(self, nbytes: int, dst: Any, launch, prof=None) -> None:
+        """Run `launch(device_buf)` on `pack_stream` and land the bytes in `dst`.
+
+        With `prof` (OFFLOAD_PROFILE only) it records `gather_ms` -- launch to
+        the gather draining on `pack_stream`, which includes any time the
+        kernel waits for room beside the forward -- and `d2h_ms`, the copy
+        alone. Splitting them costs one extra `pack_stream.synchronize()`,
+        taken only when profiling."""
         dst_tensor = memory_object_as_uint8(dst, nbytes)
         with self._device_ctx():
             state = self.thread_state()
@@ -226,7 +235,13 @@ class StagedTransfer:
                     # KV bytes under a valid prefix hash. Mirrors the hazard note
                     # on `atom_lmcache_staging.py`'s `ensure_buffer` call.
                     device_buf = self.ensure_buffer(staging_buffer, nbytes)
+                    t_gather = perf_counter()
                     launch(device_buf)
+                if prof is not None:
+                    if state.pack_stream is not None:
+                        state.pack_stream.synchronize()
+                    t_copy = perf_counter()
+                    prof["gather_ms"] = (t_copy - t_gather) * 1e3
                 self._handoff(state, state.pack_stream, state.copy_stream)
                 with state.stream_ctx(state.copy_stream):
                     dst_tensor.copy_(
@@ -234,6 +249,8 @@ class StagedTransfer:
                         non_blocking=dst_tensor.device.type != "cpu",
                     )
                 self._finish(state, state.copy_stream)
+                if prof is not None:
+                    prof["d2h_ms"] = (perf_counter() - t_copy) * 1e3
             except Exception:
                 # The caller must release the source units on this path too --
                 # otherwise a failed store holds a whole image out of the KV

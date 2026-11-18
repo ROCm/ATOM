@@ -13,14 +13,106 @@ aggregator's quorum -- without it a partial store pins the hash forever.
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from time import monotonic
+from time import monotonic, thread_time
 from typing import Any
+
+from atom.utils import envs
 
 logger = logging.getLogger(__name__)
 
 #: A load waiting longer than this for its lane is worth a line: it is time
 #: added straight to TTFT, and the in-flight *count* cannot show it.
 _LOAD_WAIT_WARN_MS = 50.0
+
+
+class _StoreProfile:
+    """Per-store phase timings, logged as one `[STATE-STORE-PROF]` line per
+    interval (OFFLOAD_PROFILE only).
+
+    Answers where a store's wall time goes: waiting in the store lane
+    (`queue`), for the staging semaphore (`budget`) and the codec's store lock
+    (`lock`), evicting old images (`evict`), allocating the CPU object
+    (`alloc`), the gather on the GPU (`gather`), the D2H copy (`d2h`) and
+    LMCache's `batched_put` (`put`). `cpu` is the store thread's CPU time for
+    the same store: a `total` far above `cpu` with small `gather`/`d2h` is a
+    thread that is runnable but not running -- the GIL.
+    """
+
+    _PHASES = (
+        "queue",
+        "budget",
+        "lock",
+        "evict",
+        "alloc",
+        "gather",
+        "d2h",
+        "pack",
+        "put",
+        "total",
+        "cpu",
+    )
+
+    def __init__(self, tag: str, interval_s: float = 10.0) -> None:
+        self._tag = tag
+        self._interval_s = float(interval_s)
+        self._lock = threading.Lock()
+        self._reset(monotonic())
+
+    def _reset(self, now: float) -> None:
+        self._since = now
+        self._ms = {k: [] for k in self._PHASES}
+        self._stored = 0
+        self._refused = 0
+        self._evicted = 0
+
+    def add(self, queue_ms, total_ms, cpu_ms, phases: dict, stored: bool, backlog):
+        with self._lock:
+            self._ms["queue"].append(queue_ms)
+            self._ms["total"].append(total_ms)
+            self._ms["cpu"].append(cpu_ms)
+            for k in (
+                "budget",
+                "lock",
+                "evict",
+                "alloc",
+                "gather",
+                "d2h",
+                "pack",
+                "put",
+            ):
+                v = phases.get(k + "_ms")
+                if v is not None:
+                    self._ms[k].append(v)
+            self._evicted += int(phases.get("evict_n", 0))
+            if stored:
+                self._stored += 1
+            else:
+                self._refused += 1
+            now = monotonic()
+            if now - self._since < self._interval_s:
+                return
+            line = self._format(now - self._since, backlog)
+            self._reset(now)
+        logger.info("%s", line)
+
+    def _format(self, span_s: float, backlog) -> str:
+        n = len(self._ms["total"])
+        busy = sum(self._ms["total"]) / 1e3 / span_s if span_s > 0 else 0.0
+        parts = [
+            (
+                f"[STATE-STORE-PROF] {self._tag} n={n} rate={n / span_s:.1f}/s"
+                f" stored={self._stored} refused={self._refused}"
+                f" evicted={self._evicted} backlog={backlog} busy={busy:.2f}"
+            )
+        ]
+        for k in self._PHASES:
+            v = sorted(self._ms[k])
+            if not v:
+                continue
+            p50 = v[len(v) // 2]
+            p90 = v[min(len(v) - 1, int(0.9 * len(v)))]
+            parts.append(f"{k}={sum(v) / len(v):.2f}/{p50:.2f}/{p90:.2f}")
+        return " ".join(parts) + "  (ms mean/p50/p90)"
 
 
 class StateOffloadTier:
@@ -31,8 +123,18 @@ class StateOffloadTier:
     Neither side can hold a second opinion about what is stored.
     """
 
-    def __init__(self, codec, *, max_workers: int = 1, staging_lanes: int = 2) -> None:
+    def __init__(
+        self,
+        codec,
+        *,
+        max_workers: int = 1,
+        staging_lanes: int = 2,
+        profile_tag: str = "",
+    ) -> None:
         self.codec = codec
+        self._store_profile = (
+            _StoreProfile(profile_tag) if envs.OFFLOAD_PROFILE else None
+        )
         # Two lanes, not one queue. A load is on the TTFT critical path and a
         # store is not; a single serial executor made that unenforceable -- a
         # later-step load queued behind every store in front of it, and one
@@ -153,6 +255,14 @@ class StateOffloadTier:
     def _do_store(self, op, unit_ids) -> None:
         stored = False
         released = False
+        prof = None
+        if self._store_profile is not None:
+            prof = {}
+            t_start = monotonic()
+            cpu_start = thread_time()
+            with self._lock:
+                submitted = self._store_submitted_at.get(op, t_start)
+            queue_ms = (t_start - submitted) * 1e3
 
         def _source_released() -> None:
             # Fires from `codec.put` once `pack`'s gather+D2H drain, before
@@ -169,14 +279,27 @@ class StateOffloadTier:
                 self._source_released.add(op)
 
         try:
+            if prof is not None:
+                t_budget = monotonic()
             with self._staging_budget:
-                stored = bool(
-                    self.codec.put(
-                        int(op.prefix_hash),
-                        unit_ids,
-                        on_source_released=_source_released,
+                if prof is None:
+                    stored = bool(
+                        self.codec.put(
+                            int(op.prefix_hash),
+                            unit_ids,
+                            on_source_released=_source_released,
+                        )
                     )
-                )
+                else:
+                    prof["budget_ms"] = (monotonic() - t_budget) * 1e3
+                    stored = bool(
+                        self.codec.put(
+                            int(op.prefix_hash),
+                            unit_ids,
+                            on_source_released=_source_released,
+                            prof=prof,
+                        )
+                    )
         except Exception:  # deliberately blind
             # `codec.put` reaches into LMCache, whose failure modes are its own.
             # A store that cannot happen must cost one checkpoint's CPU copy --
@@ -209,6 +332,16 @@ class StateOffloadTier:
                 # `indexed | index_failed` rather than await a second report
                 # that will never come from this rank.
                 self._index_failed.add(op)
+            backlog = len(self._store_submitted_at)
+        if prof is not None:
+            self._store_profile.add(
+                queue_ms,
+                (monotonic() - t_start) * 1e3,
+                (thread_time() - cpu_start) * 1e3,
+                prof,
+                stored,
+                backlog,
+            )
 
     def take_store_reports(self) -> tuple[set, set]:
         """`(operations stored, operations failed)` since the last call.

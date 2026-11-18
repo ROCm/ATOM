@@ -180,8 +180,9 @@ def verify(
     mx32 = {}
     if out_scale is not None:
         # ATOM_MXFP8_1X32: fp8 `out` and the 1x32 e8m0 bytes of the out_proj's input (flat
-        # `out_scale`, mxfp8_1x32 layout over the GEMM's `out_scale_rows` rows). Only the
-        # chunk-form kernel has that epilogue; otherwise nothing is launched here.
+        # `out_scale`, mxfp8_1x32 layout over the GEMM's `out_scale_rows` rows). The chunk
+        # form and its matrix form (incl. split / unroll) have that epilogue; otherwise
+        # (compact form, token loop) nothing is launched here.
         from aiter.ops.triton.gated_delta_net.fused_gdn_verify_qkvz import (
             fused_gdn_verify_mx32_supported,
         )

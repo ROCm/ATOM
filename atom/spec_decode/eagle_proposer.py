@@ -292,7 +292,12 @@ class EagleProposer(Drafter):
         )
 
     def _stage_step0(
-        self, running_bs, scheduled_bs, input_ids, positions, hidden_states,
+        self,
+        running_bs,
+        scheduled_bs,
+        input_ids,
+        positions,
+        hidden_states,
         last_token_indices,
     ):
         """Copy the verify stream into the step-0 pass's buffers as flat rows.
@@ -576,6 +581,8 @@ class EagleProposer(Drafter):
             restore()
             return build_context(**kwargs)
 
+        if envs.ATOM_MTP_ADVANCE_TOKEN_SPLIT:
+            self._draft_token_split()  # its buffer, before any capture
         try:
             super().warmup_draft_graphs(build_pristine_context, end_trace)
         finally:
@@ -590,6 +597,16 @@ class EagleProposer(Drafter):
                 ids_dtype=self.step.buffer("input_ids", 0).dtype,
                 query_width=self.mtp_k + 1,
                 max_bs=self.config.max_num_seqs,
+                token_split=(
+                    self._draft_token_split()
+                    if envs.ATOM_MTP_ADVANCE_TOKEN_SPLIT
+                    else None
+                ),
+                rs=(
+                    getattr(self, "spec_rs", None)
+                    if envs.ATOM_MTP_FUSED_RS_STORE
+                    else None
+                ),
             )
 
     def _step_warmup_inputs(self, running_bs, **staged):
@@ -786,6 +803,14 @@ class EagleProposer(Drafter):
             num_reject_tokens=num_reject_tokens,
             **mtp_decode_kwargs,
         )
+        token_split = (
+            self._draft_token_split() if envs.ATOM_MTP_ADVANCE_TOKEN_SPLIT else None
+        )
+        if token_split is not None:
+            # The value the fused advance writes, so that a recording made from
+            # here (warmup) reads the same buffer a served pass does.
+            token_split.write(attn_metadata.context_lens[:running_bs])
+            workinfos["gfx12_token_split_tiles"] = token_split.metadata()
         for k, v in workinfos.items():
             attn_metadata.__dict__[k] = v
         return workinfos
@@ -806,6 +831,23 @@ class EagleProposer(Drafter):
 
         forward_context = get_forward_context()
         context = forward_context.context
+        # What the runner's fused verify epilogue already wrote for this step
+        # (`verify_epilogue_targets`), if it ran.
+        handoff = self.__dict__.pop("verify_handoff", None)
+        # ATOM_MTP_DRAFT_PRESENCE_PENALTY: this step's requests and no drafts yet,
+        # before the (recorded) passes read them.
+        draft_presence = getattr(self, "draft_presence", None)
+        if draft_presence is not None and not (
+            handoff is not None and handoff.presence_begun
+        ):
+            draft_presence.begin(
+                getattr(self.runner, "_presence_step", None), context.scheduled_bs
+            )
+        # A mid-step's token split (ATOM_MTP_ADVANCE_TOKEN_SPLIT) is installed by
+        # the advance that precedes it; none may reach step 0 from a last step.
+        if envs.ATOM_MTP_ADVANCE_TOKEN_SPLIT:
+            forward_context.attn_metadata.__dict__.pop("gfx12_token_split_tiles", None)
+        staged0 = handoff.staged0 if handoff is not None else None
         if self._fused_glue_applies(context):
             return self._propose_fused_glue(
                 target_token_ids,
@@ -814,7 +856,9 @@ class EagleProposer(Drafter):
                 num_reject_tokens,
                 next_token_ids,
                 last_token_indices,
+                staged0=staged0,
             )
+        assert staged0 is None, "step 0 staged for a propose without the fused glue"
         attn_metadata = forward_context.attn_metadata
         scheduled_bs = context.scheduled_bs
         batch_info = self.runner.forward_vars["batch_info"].gpu
@@ -909,9 +953,11 @@ class EagleProposer(Drafter):
                     running_tokens=(
                         running_bs
                         if i
-                        else running_bs * (self.mtp_k + 1)
-                        if step0_graphed
-                        else input_ids.shape[0]
+                        else (
+                            running_bs * (self.mtp_k + 1)
+                            if step0_graphed
+                            else input_ids.shape[0]
+                        )
                     ),
                     # Only a widened pass runs a height the group agreed on.
                     running_tokens_are_unified=(
@@ -1045,6 +1091,10 @@ class EagleProposer(Drafter):
                     next_input_ids = self.model.compute_draft_ids(
                         sample_hidden_states, out=exported
                     )
+                spec_rs = getattr(self, "spec_rs", None)
+                if spec_rs is not None:
+                    # ATOM_MTP_REJECTION_SAMPLING: this pass's q records.
+                    spec_rs.store_step(i, scheduled_bs, context)
 
                 if i < self.mtp_k - 1:
                     # Read before step 0's rewrite below flips it to decode.
@@ -1149,6 +1199,48 @@ class EagleProposer(Drafter):
             and not envs.ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL
         )
 
+    def verify_epilogue_targets(
+        self,
+        target_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+    ) -> tuple[dict | None, object | None]:
+        """`Drafter.verify_epilogue_targets`: step 0's staging where
+        `_propose_fused_glue` would stage it in one launch (a uniform verify
+        replaying a step-0 recording), and the draft presence penalty."""
+        context = get_forward_context().context
+        stage = None
+        if self._fused_glue_applies(context) and not context.is_dummy_run:
+            running_bs = context.running_bs
+            scheduled_bs = context.scheduled_bs
+            q = self.mtp_k + 1
+            if (
+                self._step0_graphed(context, running_bs)
+                and target_token_ids.shape[0] == scheduled_bs * q
+            ):
+                stage = {
+                    "input_ids": target_token_ids,
+                    "positions": (
+                        target_positions[0]
+                        if target_positions.ndim == 2
+                        else target_positions
+                    ),
+                    "hidden_states": target_hidden_states,
+                    "staged": {
+                        role: self.step0.buffer(role, running_bs)
+                        for role in (
+                            "input_ids",
+                            "positions",
+                            "hidden_states",
+                            "last_token_indices",
+                        )
+                    },
+                    "scheduled_bs": scheduled_bs,
+                    "running_bs": running_bs,
+                    "query_width": q,
+                }
+        return stage, getattr(self, "draft_presence", None)
+
     def _fused_glue_deployment_applies(self) -> bool:
         """The deployment half of `_fused_glue_applies`, decided once."""
         applies = getattr(self, "_fused_glue_deployment", None)
@@ -1178,6 +1270,39 @@ class EagleProposer(Drafter):
             and not _pcp_active_for_draft_model(self.model)
         )
 
+    def _draft_token_split(self):
+        """ATOM_MTP_ADVANCE_TOKEN_SPLIT's `DraftTokenSplit`, made once (outside
+        a capture: `warmup_draft_graphs` asks first), or None."""
+        split = getattr(self, "_token_split", False)
+        if split is False:
+            split = None
+            if self._fused_glue_deployment_applies():
+                from atom.spec_decode.eagle_fused_glue import draft_token_split
+
+                split = draft_token_split(
+                    self.runner.attn_metadata_builder, self.device
+                )
+                if split is not None:
+                    logger.info(
+                        "MTP draft token split: written by the advance kernel "
+                        "(tile %d, %d KV heads)",
+                        split.tile,
+                        split.heads,
+                    )
+            self._token_split = split
+        return split
+
+    def _draft_kv_indices(self) -> bool:
+        """Whether the fused advance generates kv_indices (see
+        ATOM_MTP_SKIP_DRAFT_KV_INDICES)."""
+        gen = getattr(self, "_gen_kv_indices", None)
+        if gen is None:
+            from atom.spec_decode.eagle_fused_glue import draft_reads_kv_indices
+
+            gen = draft_reads_kv_indices(self.runner.attn_metadata_builder)
+            self._gen_kv_indices = gen
+        return gen
+
     def _propose_fused_glue(
         self,
         target_token_ids: torch.Tensor,
@@ -1186,6 +1311,7 @@ class EagleProposer(Drafter):
         num_reject_tokens: torch.Tensor,
         next_token_ids: torch.Tensor,
         last_token_indices: torch.Tensor,
+        staged0: dict | None = None,
     ) -> torch.Tensor:
         """`propose` with the eager work between passes fused (`eagle_fused_glue`).
 
@@ -1196,10 +1322,13 @@ class EagleProposer(Drafter):
         staging and draft id export in one launch plus the `kv_indices`
         generation, reading each pass's outputs in place (`borrow`). The draft
         ids are written straight into the ``[scheduled_bs, mtp_k]`` result.
+        ``staged0``: step 0's buffers, already staged by the runner's verify
+        epilogue (`verify_epilogue_targets`).
         """
         from atom.spec_decode.eagle_fused_glue import (
             advance_draft_pass,
             stage_verify_step0,
+            store_last_draft_pass,
         )
 
         forward_context = get_forward_context()
@@ -1230,8 +1359,11 @@ class EagleProposer(Drafter):
         )
         mid_label = self.step.label(scheduled_bs, running_bs)
         # A ragged verify (a sequence short of `q` rows) stages as `propose` does.
-        staged0 = None
-        if step0_graphed and num_tokens == scheduled_bs * q:
+        if staged0 is not None:
+            # The verify epilogue staged exactly what `stage_verify_step0` would.
+            assert step0_graphed and num_tokens == scheduled_bs * q
+            positions_src = staged0["positions"].view(-1)
+        elif step0_graphed and num_tokens == scheduled_bs * q:
             staged0 = stage_verify_step0(
                 target_token_ids,
                 next_token_ids,
@@ -1262,6 +1394,8 @@ class EagleProposer(Drafter):
         step_ids = self.step.buffer("input_ids", running_bs)
         step_hidden = self.step.buffer("hidden_states", running_bs)
         step_positions = self.step.buffer("positions", running_bs)
+        spec_rs = getattr(self, "spec_rs", None)
+        fused_rs_store = envs.ATOM_MTP_FUSED_RS_STORE
         for i in range(self.mtp_k):
             with record_function(
                 f"propose_eagle[{i}/{self.mtp_k} "
@@ -1329,9 +1463,23 @@ class EagleProposer(Drafter):
                         positions=step_positions,
                         hidden_states=step_hidden,
                     )
+                records = None
+                if spec_rs is not None:
+                    # ATOM_MTP_REJECTION_SAMPLING: this pass's q records, before
+                    # the next pass overwrites the scratch they sit in -- in the
+                    # advance / last-pass launch below with ATOM_MTP_FUSED_RS_STORE.
+                    if fused_rs_store:
+                        records = spec_rs.record_args(i, scheduled_bs, context)
+                    else:
+                        spec_rs.store_step(i, scheduled_bs, context)
 
                 if i == self.mtp_k - 1:
-                    draft_ids[:, i].copy_(out_ids[:scheduled_bs])
+                    if fused_rs_store:
+                        store_last_draft_pass(
+                            out_ids, draft_ids, i, scheduled_bs, records=records
+                        )
+                    else:
+                        draft_ids[:, i].copy_(out_ids[:scheduled_bs])
                     continue
                 if i == 0:
                     # The host half of the one-row-per-sequence rewrite. The
@@ -1363,6 +1511,16 @@ class EagleProposer(Drafter):
                     num_reject_tokens=num_reject_tokens if i == 0 else None,
                     positions_src=positions_src if i == 0 else None,
                     anchors=last_token_indices if i == 0 else None,
+                    token_split=(
+                        self._draft_token_split()
+                        if envs.ATOM_MTP_ADVANCE_TOKEN_SPLIT
+                        else None
+                    ),
+                    kv_indices=(
+                        not envs.ATOM_MTP_SKIP_DRAFT_KV_INDICES
+                        or self._draft_kv_indices()
+                    ),
+                    records=records,
                 )
                 for k, v in workinfos.items():
                     attn_metadata.__dict__[k] = v
