@@ -65,6 +65,7 @@ def core_messages() -> dict[str, list]:
         external_request_id="req",
         parent_request_id="req",
         sibling_index=0,
+        prefill_completed=True,
     )
     stream = RequestOutput(
         request_id=0,

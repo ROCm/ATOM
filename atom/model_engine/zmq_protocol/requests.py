@@ -83,6 +83,9 @@ class IngressRequest:
         # The prompt's prefix-cache hash chain (`prefix_hash.ship_prompt_hash_chain`);
         # None leaves the hashing to the engine.
         self.prompt_hash_chain = None
+        # `share_cache` DP routing's estimate of the prefix the chosen rank
+        # holds (`dp_routing.policies`), as on `Sequence`.
+        self.dp_est_cached_tokens = 0
 
     @property
     def num_prompt_tokens(self) -> int:
@@ -133,6 +136,7 @@ class CompletionResult:
         external_request_id: str | None = None,
         parent_request_id: str | None = None,
         sibling_index: int = 0,
+        prefill_completed: bool = False,
     ):
         self.id = id
         self.completion_token_ids = (
@@ -150,6 +154,9 @@ class CompletionResult:
         self.external_request_id = external_request_id
         self.parent_request_id = parent_request_id
         self.sibling_index = sibling_index
+        # The prompt's forward ran to its end (`Sequence.prefill_completed`),
+        # which DP routing's release reads.
+        self.prefill_completed = prefill_completed
 
     @property
     def num_completion_tokens(self) -> int:

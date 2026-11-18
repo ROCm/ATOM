@@ -16,13 +16,14 @@
 // Each EngineCore has three ZMQ sockets to its one client. The client binds,
 // the Core connects; addresses are ipc:// on one node and tcp:// across nodes.
 //
-//   input    client ROUTER  <- Core DEALER   client -> Core: SubmitBatch only
+//   input    client ROUTER  <- Core DEALER   client -> Core: SubmitBatch,
+//                                            DpPrefixCredit
 //   control  client ROUTER  <- Core DEALER   client -> Core: Abort, Utility,
 //                                            AdminCommand, Shutdown
 //   output   client PULL    <- Core PUSH     Core -> client: everything else
 //
-// input carries requests alone, so a control message never queues behind a
-// large SubmitBatch. A client that writes a socket from several threads
+// input carries requests (and the credit corrections that must follow them),
+// so a control message never queues behind a large SubmitBatch. A client that writes a socket from several threads
 // serializes those writes.
 //
 // Handshake. On connecting, the Core sends one empty frame on input and one on
@@ -89,6 +90,11 @@
 //   * aborting: `Abort` names seq_ids; aborting a finished id is a no-op. An
 //     Abort the Core handles before the Submit it follows (the two ride
 //     different sockets) is held for a while and applied on admission.
+//   * `share_cache` DP routing: the client places a request on an estimated
+//     cached prefix (`RequestSpec.dp_est_cached_tokens`) and may correct that
+//     estimate later (`DpPrefixCredit`); a Core run for it reports its prefill
+//     backlog (`PrefillBacklog`) and the prefix it really reused (`DpReuse`).
+//     A client that does not route this way sends neither and may ignore both.
 //   * structured output: a request whose `SamplingParams.json_schema` is set
 //     must have had its grammar prepared on every rank first (the
 //     `prepare_structured_output` utility); a client that cannot prepare it
@@ -202,6 +208,7 @@ message Envelope {
     Utility utility = 12;
     Shutdown shutdown = 13;
     AdminCommand admin = 14;
+    DpPrefixCredit dp_prefix_credit = 15;
     // Core -> Client
     Ready ready = 20;
     Completions completions = 21;
@@ -211,6 +218,8 @@ message Envelope {
     Rejected rejected = 25;
     Stopped stopped = 26;
     AdminReply admin_reply = 27;
+    PrefillBacklog prefill_backlog = 28;
+    DpReuse dp_reuse = 29;
   }
 }
 
@@ -305,6 +314,9 @@ message RequestSpec {
   double arrive_time = 17;        // client wall clock, seconds
   PromptHashChain prompt_hash_chain = 18;  // absent: the Core hashes the prompt
   TraceContext trace = 19;        // absent: the request is not traced
+  // `share_cache` DP routing's estimate of the prompt prefix this Core holds,
+  // in tokens; 0: none.
+  uint64 dp_est_cached_tokens = 20;
 }
 
 message SubmitBatch {
@@ -341,6 +353,13 @@ message AdminCommand {
 
 message Shutdown {}
 
+// Corrected `dp_est_cached_tokens` of requests already submitted, on input
+// after the SubmitBatch that named them; a parallel pair of columns.
+message DpPrefixCredit {
+  repeated uint64 seq_ids = 1;
+  repeated int64 credits = 2;  // tokens
+}
+
 // ---------------------------------------------------------------- outputs --
 
 // The Core is initialized and serving.
@@ -368,6 +387,7 @@ message Completion {
   optional string external_request_id = 11;
   optional string parent_request_id = 12;
   uint32 sibling_index = 13;
+  bool prefill_completed = 14;  // the prompt's forward ran to its end
 }
 
 message Completions {
@@ -439,3 +459,20 @@ message Rejected {
 
 // The Core is going away; no message follows.
 message Stopped {}
+
+// A `share_cache` Core's prefill backlog, sent when it changes: sequences
+// admitted so far, prompt tokens still to prefill, and the `DpPrefixCredit`
+// entries applied since the last report (the same columns, echoed).
+message PrefillBacklog {
+  uint64 ingested = 1;
+  uint64 pending_prefill_tokens = 2;
+  repeated uint64 credit_seq_ids = 3;
+  repeated int64 credits = 4;
+}
+
+// Prompt tokens a `share_cache` Core really reused for requests placed on an
+// estimated prefix, sent ahead of their first output.
+message DpReuse {
+  repeated uint64 seq_ids = 1;
+  repeated uint64 reused_tokens = 2;
+}
