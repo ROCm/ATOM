@@ -500,3 +500,139 @@ def select_mc(c, hb, ctr, isrx, G):
         if g == 0:   # padding past min(n, k)
             for pp in range(fx.min(n, k) + t, k, 256):
                 _emit_any(c, mode, I32(0), I32(1) > I32(0), r, I32(0), q, k, I32(0), c["lvl"], c["lvl"], pp, I32(0), I32(-1))
+
+
+# ---- (l20) a row's top-k by G CTAs, positions in index order (a replaceable selection primitive) --------------------
+OC_ROW = 64 * 8                   # select_ord's per-CTA (above, ties) counts: [rows][64 CTAs] int2, then [rows] group counters
+OC_BYTES = MC_ROWS * OC_ROW + MC_ROWS * 4
+
+
+@ASTRewriter.transform
+def select_ord(c, hb, ctr, oc, r, g, G, n, k, vals, vstride, mode, q, ordered=True):
+    """Row r's top k of its n values (vals + r vstride, f32 bits ordered by order_key) by the G CTAs of its group (this
+    one: g), select_mc's radix rounds (hb [4 rounds][rows][256] / ctr [rows][8]: this instance's zeroed slot) to the k-th
+    key, then the winners' positions in INDEX order (not select_mc's atomic arrival order): every CTA counts its chunk's
+    keys above the k-th one and its ties, the group exchanges the counts (oc), and a key's position is the selected keys
+    before it (the keys above + min(the ties, need) before it: ties taken in index order, deterministic). -> _emit_any
+    (mode: MODE_SEL isel / irow, MODE_BLK icand -- ascending blocks, as rx_context's last kept block needs); past
+    min(n, k): -1 (CTA g 0). The selection's interface: (r, g, G, n, k, vals, vstride, mode) -> the row's final list."""
+    t, sm = c["t"], c["sm"]
+    lane = t % 32
+    wv = t // 32
+    CH = (n + (G - 1)) // G
+    i0 = g * CH
+    i1 = fx.min(i0 + CH, n)
+    rowp = vals + i64(r) * i64(vstride) * 4
+    if t == 0:
+        hx.lstore(sm + O_MC, fx.Vector.from_elements([I32(0), I32(0), I32(k), n], I32))
+    gpu.barrier()
+    if n > I32(k):
+        for p in range(4):
+            if hx.lload(sm + O_MC + 12, I32) >= 0:
+                shift = 24 - 8 * p
+                hx.lstore(sm + O_MCH + t * 4, I32(0))
+                gpu.barrier()
+                st4 = hx.lload(sm + O_MC, I32, 4)
+                for i in range(i0 + t, i1, 256):
+                    key = order_key(hx.gload(rowp + i64(i) * 4, I32))
+                    if (key & st4[1]) == st4[0]:
+                        hx.latomic_add_i32(sm + O_MCH + ((key >> shift) & 255) * 4, I32(1))
+                gpu.barrier()
+                v = hx.lload(sm + O_MCH + t * 4, I32)
+                if v != 0:
+                    hx.atomic_add(hb + i64(((p * MC_ROWS + r) * 256 + t) * 4), v)
+                hx.wait_storecnt0()
+                gpu.barrier()
+                if t == 0:
+                    hx.atomic_add(ctr + i64((r * 8 + 2 + p) * 4), 1)
+                    hx.wait_count(ctr + i64((r * 8 + 2 + p) * 4), G, 8)
+                gpu.barrier()
+                if t < 32:
+                    cs = [hx.gload(hb + i64(((p * MC_ROWS + r) * 256 + 255 - 8 * lane - qq) * 4), I32, scope="agent") for qq in range(8)]
+                    s4 = cs[0]
+                    for qq in range_constexpr(1, 8):
+                        s4 = s4 + cs[qq]
+                    need = st4[2]
+                    before = wave_incl_scan(s4, lane) - s4
+                    found = I32(-1)
+                    done = I32(0)
+                    for qq in range_constexpr(8):
+                        hit = (before < need) & (need <= before + cs[qq])
+                        found = hit.select(((255 - 8 * lane - qq) << 16) | (need - before), found)
+                        done = (hit & (need == before + cs[qq])).select(I32(1), done)
+                        before = before + cs[qq]
+                    found = wave_max(found)
+                    done = wave_max(done)
+                    if lane == 0:
+                        hx.lstore(sm + O_MC, fx.Vector.from_elements(
+                            [st4[0] | (((found >> 16) & 255) << shift), st4[1] | (I32(255) << shift), found & 0xFFFF,
+                             (done != 0).select(n | I32(INT_MIN), n)], I32))
+                gpu.barrier()
+    st4 = hx.lload(sm + O_MC, I32, 4)
+    big = n > I32(k)
+    need = st4[2]
+    if fx.const_expr(not ordered):   # (select_mc's placement: positions in atomic arrival order, one coalesced pass)
+        for i in range(i0 + t, i1, 256):
+            pos = I32(-1)
+            if big:
+                key = order_key(hx.gload(rowp + i64(i) * 4, I32)) & st4[1]
+                if ult(st4[0], key):
+                    pos = hx.atomic_add(ctr + i64(r * 32), 1)
+                if key == st4[0]:
+                    tie = hx.atomic_add(ctr + i64(r * 32 + 4), 1)
+                    pos = (tie < need).select(I32(k) - need + tie, I32(-1))
+            else:
+                pos = i
+            if pos >= 0:
+                _emit_any(c, I32(mode), I32(0), I32(1) > I32(0), r, I32(0), q, I32(k), I32(0), c["lvl"], c["lvl"], pos, I32(0), i)
+    else:
+        # thread t takes a contiguous slice of the CTA's chunk: its keys above the k-th one and its ties (packed: above << 16 |
+        # ties, a chunk < 65536 keys), one block scan -> the thread's bases in the CTA, the CTA's totals -> the group's
+        # exchange -> the CTA's bases in the row; then the thread walks its slice in index order and places its winners
+        SL = (i1 - i0 + 255) // 256
+        s0 = fx.min(i0 + t * SL, i1)
+        s1 = fx.min(s0 + SL, i1)
+        pk = I32(0)
+        for i in range(s0, s1):
+            key = order_key(hx.gload(rowp + i64(i) * 4, I32)) & st4[1]
+            pk = pk + ult(st4[0], key).select(I32(1 << 16), I32(0)) + (key == st4[0]).select(I32(1), I32(0))
+        ob = sm + O_MCH
+        ex = block_excl_scan(pk, lane, wv, ob)
+        if t == 255:
+            hx.lstore(ob + 128, ex + pk)
+        gpu.barrier()
+        tot = hx.lload(ob + 128, I32)
+        if t == 0:
+            c["stx"](oc + i64((r * 64 + g) * 8), fx.Vector.from_elements([tot >> 16, tot & 0xFFFF], I32))
+            hx.wait_storecnt0()
+            hx.atomic_add(oc + i64(MC_ROWS * OC_ROW + r * 4), 1)
+            hx.wait_count(oc + i64(MC_ROWS * OC_ROW + r * 4), G, 8)
+        gpu.barrier()
+        if t < 32:   # the group's counts before this CTA (G <= 64: lanes l, l + 32)
+            pa = hx.gload(oc + i64((r * 64 + fx.min(lane, I32(G - 1))) * 8), fx.Int64, scope="agent")   # (above | ties << 32)
+            pb = hx.gload(oc + i64((r * 64 + fx.min(lane + 32, I32(G - 1))) * 8), fx.Int64, scope="agent")
+            a0 = (lane < g).select(I32(pa), I32(0)) + (lane + 32 < g).select(I32(pb), I32(0))
+            t0 = (lane < g).select(I32(pa >> 32), I32(0)) + (lane + 32 < g).select(I32(pb >> 32), I32(0))
+            for off in (1, 2, 4, 8, 16):
+                a0 = a0 + a0.shuffle_xor(off, 32)
+                t0 = t0 + t0.shuffle_xor(off, 32)
+            if lane == 0:
+                hx.lstore(ob + 136, fx.Vector.from_elements([a0, t0], I32))
+        gpu.barrier()
+        base = hx.lload(ob + 136, I32, 2)
+        cA = base[0] + (ex >> 16)
+        cT = base[1] + (ex & 0xFFFF)
+        for i in range(s0, s1):
+            pos = i
+            if big:
+                key = order_key(hx.gload(rowp + i64(i) * 4, I32)) & st4[1]
+                fa = ult(st4[0], key)
+                ft = key == st4[0]
+                pos = (fa | (ft & (cT < need))).select(cA + fx.min(cT, need), I32(-1))
+                cA = cA + fa.select(I32(1), I32(0))
+                cT = cT + ft.select(I32(1), I32(0))
+            if pos >= 0:
+                _emit_any(c, I32(mode), I32(0), I32(1) > I32(0), r, I32(0), q, I32(k), I32(0), c["lvl"], c["lvl"], pos, I32(0), i)
+    if g == 0:   # padding past min(n, k)
+        for pp in range(fx.min(n, I32(k)) + t, I32(k), 256):
+            _emit_any(c, I32(mode), I32(0), I32(1) > I32(0), r, I32(0), q, I32(k), I32(0), c["lvl"], c["lvl"], pp, I32(0), I32(-1))

@@ -217,6 +217,9 @@ def iprefetch(kb):
 # ENG_ENTRY the target entry ran their sharded kv (slot s of engkv: the s-th such row, ENG_ROWS), the row's own kv is off
 ENG_ENTRY = 512
 ENG_ROWS = (0, 13)
+L20_ORD = True        # (l20) the candidate layer's selections: one pass of topk.select_ord (False: the two trees)
+L20_SEL_ORDERED = False   # (l20) its top-512 in arrival order (as select_mc's FULL layers; the blocks stay ascending)
+L20_BLK_SLOT, L20_OC_SLOT = D.LAYERS + 1, D.LAYERS + 2   # (l20) mchist slots: the block selection's radix bins, the ordered counts
 CODE_END_OFF = 131024   # cyc scratch: the target / draft launches' end PCs (hx.code_end)
 
 
@@ -637,6 +640,8 @@ def target_layer(E, Ly):
                 else:
                     SC.stage_score_any(cs_, isrx)
                 segw = cs_["iprod"] & grp
+                if fx.const_expr(L20_ORD and TR <= TK.MC_ROWS):   # (l20) the ordered multi-CTA selection reads whole rows: SCORE
+                    segw = fx.Int32(0) != fx.Int32(0)
                 if segw == (fx.Int32(0) != fx.Int32(0)):
                     handoff(lc + i64(LY.SCORE), t, True)
                 # (the selection tree's levels past the first only when a row has more than one level-0 list: every row's
@@ -650,7 +655,37 @@ def target_layer(E, Ly):
                 sel_levels, blk_levels = TK.selection_levels(cs_, isrx)   # (2, or 3 past 8192 x 16 index rows)
                 lsel = (nmax > fx.Int32(TK.SEG)).select(sel_levels, fx.Int32(1))
                 npass = isrx.select(lsel, cs_["iprod"].select(sel_levels + blk_levels, lsel))
-                if cs_["iprod"]:   # the candidate-block layer (its top-512 and top-2048 blocks): the selection tree
+                if fx.const_expr(L20_ORD and TR <= TK.MC_ROWS):
+                    if cs_["iprod"]:   # (l20) the candidate layer: both selections in one pass, one handoff
+                        # (topk.select_ord, by row groups of CTAs: the top-512 of the scores on TR x GS CTAs, the top-2048
+                        # blocks of the block maxima (ascending: rx_context's last kept block) on the next TR x GB)
+                        GS = max(1, min(TK.MC_G, (CTAS * 3 // 4) // TR))
+                        GB = max(1, (CTAS - TR * GS) // TR)
+                        mh = fptr(fp, "mchist")
+                        sl = b < TR * GS
+                        bl = (b >= TR * GS) & (b < TR * (GS + GB))
+                        if sl | bl:
+                            bb2 = sl.select(b, b - TR * GS)
+                            gg = sl.select(fx.Int32(GS), fx.Int32(GB))
+                            r2 = fx.min(bb2 // gg, fx.Int32(TR - 1))
+                            g2 = bb2 % gg
+                            bd2 = fx.max(hx.gload(cs_["ibound"] + i64(r2) * 4, fx.Int32), fx.Int32(0))
+                            q2 = fx.max(hx.gload(cs_["ibat"] + i64(r2) * 4, fx.Int32), fx.Int32(0))
+                            if sl:
+                                TK.select_ord(cwith(cs_, ts=None), mh + i64(Ly) * TK.MC_LAYER, mh + i64(Ly) * TK.MC_LAYER + i64(TK.MC_HIST),
+                                              mh + i64(L20_OC_SLOT) * TK.MC_LAYER, r2, g2, GS, bd2, TK.KSEL, cs_["ilog"], cs_["ilw"],
+                                              TK.MODE_SEL, q2, ordered=L20_SEL_ORDERED)
+                            else:
+                                TK.select_ord(cwith(cs_, ts=None), mh + i64(L20_BLK_SLOT) * TK.MC_LAYER,
+                                              mh + i64(L20_BLK_SLOT) * TK.MC_LAYER + i64(TK.MC_HIST),
+                                              mh + i64(L20_OC_SLOT) * TK.MC_LAYER + i64(TK.OC_BYTES), r2, g2, GB,
+                                              (bd2 + 7) // 8, TK.KBLK, cs_["ibmax"], cs_["ilw"] // 8, TK.MODE_BLK, q2)
+                        handoff(lc + i64(LY.SELECT0), t, True)
+                if fx.const_expr(L20_ORD and TR <= TK.MC_ROWS):
+                    iprod_tree = fx.Int32(0) != fx.Int32(0)
+                else:
+                    iprod_tree = cs_["iprod"]
+                if iprod_tree:   # the candidate-block layer (its top-512 and top-2048 blocks): the selection tree
                     # The top-512 tree (ilog) and the top-2048 block tree (ibmax) are independent: pass pi runs level pi of
                     # both, the block tasks from the last CTA down and their lists in the second half of lvl (topk.BLK_LVL):
                     # max(sel, blk) passes and handoffs, not sel + blk (133K: 5 -> 3, <= 131072 keys: 4 -> 2)
@@ -666,7 +701,7 @@ def target_layer(E, Ly):
                                                     isb.select(fx.Int32(TK.MODE_BLK), fx.Int32(TK.MODE_SEL)))
                             gpu.barrier()   # (both share the CTA's LDS task counts)
                         handoff(lc + i64(LY.SELECT0) + i64(pi) * 4, t, True)
-                else:   # FULL / REINDEX: every row's top-512 by 8 or 32 CTAs a row (4 radix rounds, a group count each), one handoff
+                if cs_["iprod"] == (fx.Int32(0) != fx.Int32(0)):   # FULL / REINDEX: every row's top-512 by 8 or 32 CTAs a row (4 radix rounds, a group count each), one handoff
                     mh = fptr(fp, "mchist")
                     # (MC_G CTAs a row once some row's n > MC_G_MIN_N: a radix round's keys over 4x the CTAs -- 83K -68,
                     # 30K -45 us a step; short rows keep MC_G_SHORT, where the round's group count over 32 CTAs costs
