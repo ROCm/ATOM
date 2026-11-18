@@ -2,18 +2,18 @@
 
 ## Highlights
 
-| Model | What happened | Owner |
-|---|---|---|
-| ✅ DeepSeek-V4.1-Flash | recovered from the previous failure |  |
-| ✅ DeepSeek-V4-Pro | recovered from the previous failure |  |
+| Model | What happened |
+|---|---|
+| ✅ DeepSeek-V4.1-Flash | recovered from the previous failure |
+| ✅ DeepSeek-V4-Pro | recovered from the previous failure |
 
 ## Results
 
-| Model | Scenario | 2026-11-14 (GSM8K) | 2026-11-18 (GSM8K) | Delta |
-|---|---|---|---|---|
-| DeepSeek R1 | MLPerf Endpoint | 95.7% | 95.7% | 0.0 pts |
-| DeepSeek-V4.1-Flash | MLPerf Endpoint | — | 91.2% | first |
-| DeepSeek-V4-Pro | 8K/1K | — | 95.1% | first |
+| Model | 2026-11-14 (GSM8K) | 2026-11-18 (GSM8K) | Delta |
+|---|---|---|---|
+| DeepSeek R1 | 95.7% | 95.7% | 0.0 pts |
+| DeepSeek-V4.1-Flash | — | 91.2% | first |
+| DeepSeek-V4-Pro | — | 95.1% | first |
 
 ## Environment
 
