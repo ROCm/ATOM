@@ -26,9 +26,15 @@ def on(site: str) -> bool:
     return site in _SITES
 
 
+_DEFAULT = frozenset({"gather"})
+
+
 def suffix(site: str) -> str:
-    """Kernel-name suffix of ``site``'s prefetch, empty when it is off."""
-    return f"_xpf{site}" if on(site) else ""
+    """Kernel-name suffix of ``site``'s prefetch, empty when it is as by
+    default."""
+    if on(site) == (site in _DEFAULT):
+        return ""
+    return f"_xpf{site}" if on(site) else f"_noxpf{site}"
 
 
 def prefetch(

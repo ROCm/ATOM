@@ -685,11 +685,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # "finish" (the front's router logits and shared rows), "moe" (the lite
     # finish, the front's latent for the fused MoE after it), "tail" (each
     # all-reduce CTA its share of the fused MoE's rows, their route weights
-    # and the shared rows), "gather" (the gathering all-reduce's CTAs alike).
-    # 0, the default, leaves all of them out.
+    # and the shared rows), "gather" (the gathering all-reduce's CTAs alike),
+    # the default; 0 leaves all of them out.
     "ATOM_KIMI_MONO_XPF": lambda: frozenset(
         site
-        for site in os.getenv("ATOM_KIMI_MONO_XPF", "0").split(",")
+        for site in os.getenv("ATOM_KIMI_MONO_XPF", "gather").split(",")
         if site not in ("", "0")
     ),
     # Kimi-K3 gfx1250 mono: the fused MoE's gate/up K tiles, its M tiles'
