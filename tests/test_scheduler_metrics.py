@@ -28,8 +28,14 @@ def clock(monkeypatch):
 
 
 def batch(seqs, decode=0, dummy=False):
+    prefill = list(seqs.values())[: len(seqs) - decode]
     return SimpleNamespace(
-        req_ids=list(seqs), total_seqs_num_decode=decode, is_dummy_run=dummy
+        req_ids=list(seqs),
+        total_seqs_num_prefill=len(seqs) - decode,
+        total_tokens_num_prefill=sum(seq.num_prompt_tokens for seq in prefill),
+        num_cached_tokens=[0] * len(seqs),
+        total_seqs_num_decode=decode,
+        is_dummy_run=dummy,
     )
 
 
@@ -185,7 +191,9 @@ def test_engine_receipt_includes_time_buffered_before_scheduler_admission(
 )
 def test_transfer_ignores_failed_and_offload_loads(clock, is_pd, succeeded, expected):
     metrics = SchedulerMetrics()
-    seq = SimpleNamespace(id=3, kv_transfer_params={"do_remote_prefill": is_pd})
+    seq = SimpleNamespace(
+        id=3, kv_transfer_params={"do_remote_prefill": is_pd}, num_prompt_tokens=4
+    )
     metrics.enqueue(seq)
     metrics.start_kv_wait(seq)
     clock[0] += 0.25
@@ -202,7 +210,7 @@ def test_transfer_ignores_failed_and_offload_loads(clock, is_pd, succeeded, expe
 
 def test_batch_counts_request_rows_and_ignores_dummy_prefill_and_empty(clock):
     metrics = SchedulerMetrics()
-    seqs = {i: SimpleNamespace(id=i) for i in range(5)}
+    seqs = {i: SimpleNamespace(id=i, num_prompt_tokens=4) for i in range(5)}
     for seq in seqs.values():
         metrics.enqueue(seq)
     metrics.record_forward(batch(seqs, decode=5, dummy=True), seqs)

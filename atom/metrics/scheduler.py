@@ -195,7 +195,7 @@ class SchedulerMetrics:
         context_lens = getattr(batch, "context_lens", None)
         # Rows are `[prefill | decode]`: a mixed batch carries both, a pure one
         # only one kind, so these bounds describe every batch.
-        n_prefill = getattr(batch, "total_seqs_num_prefill", 0)
+        n_prefill = batch.total_seqs_num_prefill
         n_rows = len(batch.req_ids)
         for i, req_id in enumerate(batch.req_ids):
             seq = seqs[req_id]

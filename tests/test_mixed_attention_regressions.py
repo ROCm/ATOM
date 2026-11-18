@@ -6,8 +6,13 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from aiter_stub import atom_without_aiter
 
-pytest.importorskip("aiter")
+
+@pytest.fixture(scope="module", autouse=True)
+def kernel_imports():
+    with atom_without_aiter():
+        yield
 
 
 @pytest.mark.parametrize(
@@ -146,3 +151,92 @@ def test_attention_output_reuse_keeps_decode_input_intact(monkeypatch, bf16):
     assert (out.data_ptr() == query.data_ptr()) == bf16
     torch.testing.assert_close(out, (original + 10).reshape(6, 4))
     assert fc.attn_metadata is metadata and ctx.is_prefill
+
+
+@pytest.mark.parametrize("decode", [False, True])
+@pytest.mark.parametrize("fp8", [False, True])
+@pytest.mark.parametrize("ratio", [0, 4, 128])
+def test_sparse_attention_passes_caller_slice_to_kernel(
+    monkeypatch, decode, fp8, ratio
+):
+    import atom.models.deepseek_v4 as model
+    from atom.model_ops.v4_kernels.qk_norm_rope_maybe_quant import QKNormRopeOut
+    from atom.utils.forward_context import AttnState
+
+    query = torch.ones(3, 2, 2, dtype=torch.bfloat16)
+    qkn = (
+        QKNormRopeOut(q_packed=query, q_rope=query, k_packed=query, k_rope=query)
+        if fp8
+        else QKNormRopeOut(q_sa=query, kv=query[:, 0])
+    )
+    parent = torch.full((5, 2, 2), -9.0, dtype=torch.bfloat16)
+    output = parent[1:4]
+    metadata = SimpleNamespace(
+        state=AttnState.DECODE if decode else AttnState.PREFILL_NATIVE,
+        state_slot_out=torch.arange(3),
+        qo_indptr=torch.arange(4),
+        empty_kv_indptr=torch.zeros(4, dtype=torch.int32),
+        cu_seqlens_q=torch.arange(4),
+        max_seqlen_q=1,
+        kv_indices_extend=object(),
+        kv_indptr_extend=object(),
+    )
+    for region in ("swa", "csa", "hca"):
+        for name in (
+            "kv_indices",
+            "kv_indptr",
+            "split_plan",
+            "kv_indices_prefix",
+            "kv_indptr_prefix",
+        ):
+            setattr(metadata, f"{name}_{region}", object())
+    monkeypatch.setattr(
+        model,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            context=SimpleNamespace(is_dummy_run=False), attn_metadata=metadata
+        ),
+    )
+    monkeypatch.delenv("ATOM_V4_BYPASS_ATTN", raising=False)
+    monkeypatch.setattr(model, "_pcp_active", lambda: False)
+    calls = []
+
+    def attend(*args, out, **kwargs):
+        assert out is output
+        assert kwargs["q_packed_in" if decode else "q_packed"] is qkn.q_packed
+        region = {0: "swa", 4: "csa", 128: "hca"}[ratio]
+        indices = "kv_indices" if decode else "kv_indices_prefix"
+        assert args[2] is getattr(metadata, f"{indices}_{region}")
+        calls.append("attention")
+        return out.fill_(7)
+
+    def write(*args, **kwargs):
+        calls.append("swa_write")
+
+    monkeypatch.setattr(model, "sparse_attn_v4_paged_decode", attend)
+    monkeypatch.setattr(model, "sparse_attn_v4_paged_2src", attend)
+    monkeypatch.setattr(model, "swa_write", write)
+    layer = SimpleNamespace(
+        n_local_heads=2,
+        head_dim=2,
+        compress_ratio=ratio,
+        _join_compressors=lambda: None,
+        indexer=None,
+        skip_topk=True,
+        unified_kv=object(),
+        unified_kv_rope=object() if fp8 else None,
+        attn_sink=object(),
+        softmax_scale=1.0,
+        layer_name="test",
+        swa_plane=object(),
+        swa_window=object(),
+        swa_plane_rope=None,
+        window_size=4,
+    )
+    result = model.DeepseekV4Attention._sparse_attention(
+        layer, qkn, torch.arange(3), out=output
+    )
+    assert calls == (["attention"] if decode else ["attention", "swa_write"])
+    assert result.data_ptr() == output.data_ptr() and result.shape == (3, 4)
+    assert torch.all(output == 7) and torch.all(parent[[0, -1]] == -9)
+    assert torch.all(query == 1)

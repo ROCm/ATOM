@@ -376,7 +376,7 @@ def quantize_to_bucket(q: int, buckets: list[int]) -> int:
 
 def resize_decode_tokens(batch, new_lens: np.ndarray) -> None:
     """Shrink decode spans, preserving a mixed batch's prefill prefix exactly."""
-    row0 = getattr(batch, "total_seqs_num_prefill", 0)
+    row0 = batch.total_seqs_num_prefill
     token0 = batch.total_tokens_num_prefill
     old_lens = batch.num_scheduled_tokens[row0:]
     new_lens = np.asarray(new_lens, dtype=old_lens.dtype)
@@ -437,7 +437,7 @@ def apply_q_bucket(batch, drafter, dspark, *, apply_ragged=None) -> int | None:
         return None
 
     max_ell = 0
-    row0 = getattr(batch, "total_seqs_num_prefill", 0)
+    row0 = batch.total_seqs_num_prefill
     for rid in batch.req_ids[row0 : row0 + scheduled_bs]:
         ell = by_req.get(rid)
         max_ell = full_q - 1 if ell is None else max(max_ell, int(ell))

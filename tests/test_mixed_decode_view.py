@@ -8,7 +8,7 @@ from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.sequence import Sequence, SequenceType
 
 
-def make_batch(num_spec_step=1):
+def make_batch(num_spec_step=1, block_rows=None):
     seqs = []
     for i in range(5):
         s = Sequence(
@@ -17,7 +17,7 @@ def make_batch(num_spec_step=1):
         s.type = SequenceType.PREFILL if i < 2 else SequenceType.DECODE
         s.state_slots = [i * 3, i * 3 + 1, i * 3 + 2]
         s.state_fork_src = 50 + i
-        s.block_table = [70 + i]
+        s.block_table = [70 + i] if block_rows is None or i in block_rows else []
         seqs.append(s)
     decode_lens = [2, 1, 2] if num_spec_step else [1, 1, 1]
     return ScheduledBatch(
@@ -58,6 +58,35 @@ def test_non_spec_slice_has_no_draft_token_table():
     child = batch.slice_rows(2, 5)
     assert child.scheduled_spec_decode_tokens is None
     assert child.num_spec_step == 0
+
+
+def test_filtered_block_tables_keep_rows_across_nested_slices():
+    batch = make_batch(block_rows=[1, 2, 4])
+    assert batch.block_table_rows == [1, 2, 4]
+    child = batch.slice_rows(2, 5)
+    assert child.block_table_rows == [0, 2]
+    assert child.block_tables == [[72], [74]]
+    assert child.slice_rows(1, 3).block_table_rows == [1]
+    assert child.slice_rows(1, 3).block_tables == [[74]]
+
+
+@pytest.mark.parametrize("prefill", [False, True])
+def test_pure_batches_do_not_serialize_mixed_block_table_rows(prefill):
+    seq = Sequence([1, 2, 3, 4], block_size=4)
+    seq.type = SequenceType.PREFILL if prefill else SequenceType.DECODE
+    seq.block_table = [7]
+    batch = ScheduledBatch(
+        {seq.id: seq},
+        [1],
+        1,
+        total_seqs_num=1,
+        total_seqs_num_prefill=int(prefill),
+        total_seqs_num_decode=int(not prefill),
+        total_tokens_num_prefill=int(prefill),
+        total_tokens_num_decode=int(not prefill),
+    )
+    assert batch.block_tables == [[7]] and not batch.is_mixed
+    assert "block_table_rows" not in vars(batch)
 
 
 def test_filtered_state_rows_are_gathered_by_their_batch_index():

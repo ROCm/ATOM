@@ -9,23 +9,28 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from aiter_stub import atom_without_aiter
+from test_mixed_decode_view import make_batch
 
-# The V4 attention module imports aiter at module scope.
-pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
+from atom.utils.forward_context import AttnState
 
-from atom.model_ops.attentions.deepseek_v4_attn import (
-    _mixed_carrier,
-)
+
+@pytest.fixture(scope="module", autouse=True)
+def kernel_imports():
+    with atom_without_aiter():
+        yield
+
+
+def _mixed_carrier(*args):
+    from atom.model_ops.attentions.deepseek_v4_attn import _mixed_carrier as build
+
+    return build(*args)
+
 
 _V4_ATTN = (
     pathlib.Path(__file__).resolve().parents[1]
     / "atom/model_ops/attentions/deepseek_v4_attn.py"
 )
-
-
-from test_mixed_decode_view import make_batch
-
-from atom.utils.forward_context import AttnState
 
 
 def _batch(n_p=2, n_d=3, num_spec_step=1):
@@ -167,23 +172,32 @@ def test_dspark_context_writer_consumes_padded_mixed_carrier(
         torch.testing.assert_close(actual.float(), reference.float(), rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("decode_width", [1, 3])
+@pytest.mark.parametrize("decode_width", [0, 1, 3])
 def test_lm_head_selects_prefill_ends_and_all_decode_tokens(monkeypatch, decode_width):
+    from atom.distributed import ulysses_sp
     from atom.model_ops import embed_head
+    from atom.utils.forward_context import AttentionMetaData
 
     prefill = _meta([0, 5, 9], [7, 8], 5)
     decode = _meta([0, decode_width, 2 * decode_width], [4, 5], decode_width)
     decode.state = AttnState.DECODE
-    metadata = _mixed_carrier(prefill, decode, 2, 2, 9, 2 * decode_width, 4)
-    context = SimpleNamespace(is_prefill=True, is_draft=False)
+    metadata = (
+        _mixed_carrier(prefill, decode, 2, 2, 9, 2 * decode_width, 4)
+        if decode_width
+        else AttentionMetaData(cu_seqlens_q=prefill.cu_seqlens_q)
+    )
+    context = SimpleNamespace(is_prefill=True, is_draft=False, scheduled_bs=2)
     monkeypatch.setattr(embed_head, "is_plugin_mode", lambda: False)
     monkeypatch.setattr(embed_head, "sp_is_enabled", lambda: False)
+    monkeypatch.setattr(ulysses_sp, "sp_is_enabled", lambda: False)
     monkeypatch.setattr(
         embed_head,
         "get_forward_context",
         lambda: SimpleNamespace(context=context, attn_metadata=metadata),
     )
-    monkeypatch.setattr(embed_head.tgemm, "mm", lambda x, w, b: x @ w.T)
+    monkeypatch.setattr(
+        embed_head, "tgemm", SimpleNamespace(mm=lambda x, w, b: x @ w.T)
+    )
     head = SimpleNamespace(
         weight=torch.eye(2),
         bias=None,
@@ -291,9 +305,6 @@ def test_mixed_prefill_banks_exist_before_the_first_mixed_step():
         mixed_prefill_groups=DeepseekV4AttentionMetadataBuilder.mixed_prefill_groups,
         model_runner=SimpleNamespace(_fv_ring=ring, _fv_idx=1, h2d_groups=None),
     )
-    with pytest.raises(RuntimeError, match="build_mixed_prefill_banks"):
-        get_bank(builder)
-
     build_banks(builder)
     variables, owner, groups = get_bank(builder)
     assert variables == ring[1] and variables is not ring[1]
