@@ -435,15 +435,22 @@ def profile(rows, local):
         def add(key, ticks, parts=parts):
             parts.setdefault(key, []).append(float(ticks) / 100)
 
+        # the XCDs' realtime clocks are offset from each other, so each CTA's
+        # stamps count from its own start
         for k in range(GN // 2, GN):
             s = st[k, :grid]
-            s = s - s[:, 0].min()
-            add("last_routed_polled", s[: 2 * rows, 6].max())
-            add("last_flag", s[:ar_ctas, 1].max())
-            add("median_flag", s[:ar_ctas, 1].float().median())
+            s = s - s[:, :1]
+            ar = s[:ar_ctas]
+            add("gathered_median", ar[:, 5].float().median())
+            add("routed_polled_max", s[: 2 * rows, 6].max())
+            add("flag_median", ar[:, 1].float().median())
+            add("flag_max", ar[:, 1].max())
+            add("wait_after_flag_median", (ar[:, 2] - ar[:, 1]).float().median())
             add("seen_median", s[:, 2].float().median())
-            add("seen_last", s[:, 2].max())
-            add("end_last", s[:, 4].max())
+            add("seen_max", s[:, 2].max())
+            add("gemv_median", (s[:, 3] - s[:, 2]).float().median())
+            add("end_median", s[:, 4].float().median())
+            add("end_max", s[:, 4].max())
         out["tail_sw" if split else "tail"] = {
             key: round(sorted(v)[len(v) // 2], 2) for key, v in parts.items()
         }
