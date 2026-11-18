@@ -288,33 +288,6 @@ required/named `tool_choice` still applies.
   prompt must still fit within the total context budget.
 - DSpark advertises text input, even if the checkpoint also declares vision.
 - Text output and the configured model's supported effort levels are exposed.
-- `chat_rendering` is how `/v1/chat/completions` turns a request into template
-  kwargs, as resolved at startup, for a router that tokenizes chats to place
-  them, as atomesh's `cache_aware --kv-events` does:
-  - `default_kwargs`: the server's `--default-chat-template-kwargs` (`{}` when
-    unset), under the request's `chat_template_kwargs`;
-  - `reasoning_toggle`: the kwarg that switches reasoning, `{name, off, on}`,
-    or `null` when none does;
-  - `reasoning_rules`: which rules apply `thinking` and `reasoning_effort`
-    (`chat`, or `deepseek_v41`);
-  - `template_efforts`: under the `chat` rules, the effort names they forward
-    to a template; `null` under others, which do not read them;
-  - `encoder`: for a model rendered by its own encoder rather than a Jinja
-    template, the encoder's `name`, the `defaults` it sets, the kwargs it
-    `accepts` (`null` for any), and whether its model `prepares_kwargs` past
-    that; otherwise `null`.
-
-  The endpoint renders a chat with `default_kwargs`, the request's
-  `chat_template_kwargs` over them, then the request's `response_format` and
-  a string `tool_choice`, which replace any kwargs of those names, then its
-  `thinking` and `reasoning_effort` under the rules. An `encoder` then fills
-  unset kwargs from its `defaults`, applies its model's preparation if it
-  `prepares_kwargs`, and keeps only the kwargs it `accepts`.
-
-  The rules and a model's kwargs preparation are code: a router mirrors them
-  by name. `tests/entrypoints/fixtures/chat_rendering.json` holds the kwargs
-  they give for a set of requests; ATOM's tests check these against the
-  endpoint's own functions, and atomesh's against its copy.
 - Unknown capabilities are omitted rather than inferred from a served alias.
 
 The V4.1 adapter advertises `low`, `high`, and `max` thinking effort. The output

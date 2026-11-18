@@ -81,13 +81,39 @@ using V4.1 aliases.
   `response.incomplete`, and `response.failed`, respectively, without `[DONE]`.
   This event lifecycle is shared independently of the model adapter.
 
+## Render endpoints
+
+`POST /v1/chat/completions/render` and `POST /v1/completions/render` take the
+body of `/v1/chat/completions` and `/v1/completions` and return the prompt
+token IDs those routes run for it, without running the model. A router that
+places requests by their prompt, such as atomesh's `cache_aware --kv-events`,
+reads the engine's tokens there instead of rendering chats itself. They follow
+vLLM's [render endpoints](https://docs.vllm.ai/en/stable/serving/online_serving/renderer/),
+with a subset of its response's fields:
+
+- chat render returns one object, `{"request_id", "model", "token_ids"}`;
+- completions render returns a list of them, one per prompt. ATOM takes one
+  prompt per request, so the list has one item.
+
+Chat render checks the request's prompt, resolves its template kwargs and
+renders it with the chat route's own code, then tokenizes the prompt as the
+engine does (`encode_prompt`). A request's `prompt_token_ids` come back as
+sent. A prompt the inference route refuses, such as one for another model, one
+with no messages, an untyped tool, or a tool choice its reasoning mode does not
+allow, gets the same 400; fields that only shape the reply, such as `n` or
+`logprobs`, are not checked. Image input is not rendered yet and gets a 400;
+the `/beta` routes have no render endpoint.
+
 ## Validation
 
 `tests/entrypoints/test_reasoning_controls.py` records the precedence table,
 template-toggle differences, invalid values, and non-mutating merges.
 `tests/entrypoints/test_api_compatibility.py` tests actual ASGI routes with a mock
 engine, including cross-endpoint and non-V4.1 controls, usage framing, stream
-cleanup, and terminal events. The existing V4.1 protocol suite can also use the
+cleanup, and terminal events. `tests/entrypoints/test_render_endpoints.py`
+checks that the render endpoints return the IDs their inference routes give
+the engine, through the V4.1 adapter and through a Jinja template, and refuse
+what those routes refuse. The existing V4.1 protocol suite can also use the
 official encoder by setting `ATOM_DSV41_MODEL` to a local checkpoint directory;
 the reference fixture verifies the encoder hash. These are CPU protocol tests,
 not GPU generation or model-quality qualification.

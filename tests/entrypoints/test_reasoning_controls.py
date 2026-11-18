@@ -70,7 +70,7 @@ def test_model_rules_use_the_resolved_template_toggle(toggle, effort, expected):
 
 
 def test_rules_do_not_rewrite_another_models_effort_vocabulary():
-    rules = ReasoningRules("passthrough", normalize_effort=lambda value: value)
+    rules = ReasoningRules(normalize_effort=lambda value: value)
     assert resolve_reasoning_controls(effort="medium", rules=rules) == (None, "medium")
     assert resolve_reasoning_controls(effort="high", rules=CHAT_REASONING_RULES) == (
         None,

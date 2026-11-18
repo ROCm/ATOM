@@ -31,7 +31,6 @@ def normalize_effort(effort: Any) -> str | int | None:
 
 
 REASONING_RULES = ReasoningRules(
-    "deepseek_v41",
     normalize_effort=normalize_effort,
     string_effort_enables=True,
     reconcile_effort_with_toggle=True,

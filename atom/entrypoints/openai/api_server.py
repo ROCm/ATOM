@@ -150,7 +150,7 @@ from .serving_chat import (
     build_chat_response_multi,
     normalize_chat_tools,
     request_tools,
-    resolve_chat_template_kwargs,
+    resolve_thinking,
     stream_chat_response,
     stream_chat_response_fanout,
     validate_chat_request,
@@ -2040,12 +2040,12 @@ def _model_reasoning_rules(default=CHAT_REASONING_RULES):
 
 
 def _effective_thinking_enabled(kwargs):
-    # Validate against the kwargs the encoder renders with, on a copy so a
-    # predicate cannot change the prompt configuration.
-    if custom_message_encoder is None:
-        effective = dict(kwargs)
-    else:
-        effective = custom_message_encoder.render_kwargs(kwargs)
+    # Validate against the same defaults and normalization used by the encoder,
+    # on a copy so a predicate cannot change the prompt configuration.
+    effective = dict(getattr(custom_message_encoder, "defaults", {}))
+    effective.update(kwargs)
+    if custom_message_encoder is not None:
+        effective = custom_message_encoder.prepare_kwargs(effective)
     if reasoning_toggle is None:
         return True
     name, off_value, on_value = reasoning_toggle
@@ -2104,6 +2104,78 @@ async def beta_chat_completions(
     return await _chat_completions(request, raw_request)
 
 
+def _check_chat(
+    request: ChatCompletionRequest | BetaChatCompletionRequest, *, beta: bool
+):
+    """Check a chat request and resolve what its prompt renders from.
+
+    Returns ``(messages, assistant_prefix, template_kwargs, compatibility)``;
+    messages, tools or a tool choice the chat endpoint refuses raise
+    ValueError (a 400). `/v1/chat/completions/render` shares it, so both take
+    the same prompts and render them with the same kwargs.
+    """
+    request.tools = normalize_chat_tools(request.tools)
+    validate_chat_request(request)
+    # Before any work: an image's source, form and place are the client's
+    # to get right, and nothing is fetched until they are.
+    messages = check_chat_images(request.get_messages())
+    assistant_prefix = None
+    if beta:
+        messages, assistant_prefix = take_assistant_prefix(
+            messages, custom_message_encoder
+        )
+    merged_kwargs = dict(default_chat_template_kwargs)
+    if request.chat_template_kwargs:
+        merged_kwargs.update(request.chat_template_kwargs)
+    # Forward K3 template controls the chat template needs but that pydantic
+    # does not otherwise thread through: structured-output response_format,
+    # a string tool_choice ("auto"/"none"/"required"), and thinking/effort.
+    if request.response_format is not None:
+        merged_kwargs["response_format"] = request.response_format
+    if isinstance(request.tool_choice, str):
+        merged_kwargs["tool_choice"] = request.tool_choice
+    rules = _model_reasoning_rules()
+    merged_kwargs = apply_reasoning_controls(
+        merged_kwargs,
+        reasoning_toggle,
+        resolve_thinking(request, rules=rules),
+        rules=rules,
+    )
+    compatibility = api_compatibility_for(custom_message_encoder)
+    if not compatibility.chat_forced_tools_with_thinking:
+        compatibility.validate_chat_tool_choice(
+            request.tool_choice,
+            thinking_enabled=_effective_thinking_enabled(merged_kwargs),
+        )
+    return messages, assistant_prefix, merged_kwargs, compatibility
+
+
+async def _render_chat_template(
+    request: ChatCompletionRequest, messages, template_kwargs: dict[str, Any]
+) -> str:
+    """A text chat's prompt: its messages rendered, off the event loop."""
+    return await asyncio.to_thread(
+        apply_chat_template,
+        tokenizer,
+        custom_message_encoder,
+        messages,
+        tools=request.tools,
+        preserve_tool_call_arguments=preserve_tool_call_arguments,
+        **template_kwargs,
+    )
+
+
+async def _engine_prompt_ids(prompt_or_tokens: str | list[int]) -> list[int]:
+    """The token IDs the engine runs for a prompt: text tokenized as
+    ``preprocess`` does it (``encode_prompt``), off the event loop."""
+    if not isinstance(prompt_or_tokens, str):
+        return list(prompt_or_tokens)
+    encoded = await asyncio.to_thread(
+        engine.io_processor.encode_prompt, prompt_or_tokens
+    )
+    return list(encoded.token_ids if isinstance(encoded, PrefixEncoding) else encoded)
+
+
 async def _chat_completions(
     request: ChatCompletionRequest | BetaChatCompletionRequest, raw_request: Request
 ):
@@ -2115,29 +2187,10 @@ async def _chat_completions(
     _validate_chunked_receive(request.kv_transfer_params)
 
     try:
-        request.tools = normalize_chat_tools(request.tools)
-        validate_chat_request(request)
-        # Before any work: an image's source, form and place are the client's
-        # to get right, and nothing is fetched until they are.
-        messages = check_chat_images(request.get_messages())
-        assistant_prefix = None
-        if beta:
-            messages, assistant_prefix = take_assistant_prefix(
-                messages, custom_message_encoder
-            )
-        logprob_codec = None
-        merged_kwargs = resolve_chat_template_kwargs(
-            request,
-            defaults=default_chat_template_kwargs,
-            toggle=reasoning_toggle,
-            rules=_model_reasoning_rules(),
+        messages, assistant_prefix, merged_kwargs, compatibility = _check_chat(
+            request, beta=beta
         )
-        compatibility = api_compatibility_for(custom_message_encoder)
-        if not compatibility.chat_forced_tools_with_thinking:
-            compatibility.validate_chat_tool_choice(
-                request.tool_choice,
-                thinking_enabled=_effective_thinking_enabled(merged_kwargs),
-            )
+        logprob_codec = None
 
         effective_n = _coerce_n(request.n, request.temperature)
         _validate_return_token_ids(request.return_token_ids, request.stream)
@@ -2233,14 +2286,8 @@ async def _chat_completions(
             prompt_or_tokens = pretokenized
             kv_transfer_params = _engine_kv_transfer_params(kv_transfer_params)
         else:
-            prompt_or_tokens = await asyncio.to_thread(
-                apply_chat_template,
-                tokenizer,
-                custom_message_encoder,
-                messages,
-                tools=request.tools,
-                preserve_tool_call_arguments=preserve_tool_call_arguments,
-                **merged_kwargs,
+            prompt_or_tokens = await _render_chat_template(
+                request, messages, merged_kwargs
             )
 
         # The K3 template may open the reasoning channel in text or token IDs.
@@ -2477,6 +2524,31 @@ async def _chat_completions(
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+@app.post("/v1/chat/completions/render")
+async def chat_completions_render(request: ChatCompletionRequest):
+    """The prompt token IDs /v1/chat/completions runs ``request`` with, without
+    running the model: vLLM's render endpoint, for a router that places chats
+    by their prompt."""
+    validate_model(request.model)
+    try:
+        messages, _, template_kwargs, _ = _check_chat(request, beta=False)
+        if _has_multimodal_content(messages):
+            raise ValueError("render does not take image input")
+        prompt = request.get_prompt_token_ids()
+        if prompt is None:
+            prompt = await _render_chat_template(request, messages, template_kwargs)
+        token_ids = await _engine_prompt_ids(prompt)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return JSONResponse(
+        content={
+            "request_id": f"chatcmpl-{uuid.uuid4().hex}",
+            "model": model_name,
+            "token_ids": token_ids,
+        }
+    )
+
+
 @app.post("/v1/completions")
 async def completions(request: CompletionRequest, raw_request: Request):
     """Handle text completion requests (OpenAI-compatible)."""
@@ -2533,15 +2605,7 @@ async def _zero_token_output(
     timed: an echoed prompt is not one.
     """
     skip_first_token()
-    if isinstance(prompt_or_tokens, str):
-        encoded = await asyncio.to_thread(
-            engine.io_processor.encode_prompt, prompt_or_tokens
-        )
-        prompt_ids = list(
-            encoded.token_ids if isinstance(encoded, PrefixEncoding) else encoded
-        )
-    else:
-        prompt_ids = list(prompt_or_tokens)
+    prompt_ids = await _engine_prompt_ids(prompt_or_tokens)
     _validate_context_length(len(prompt_ids), 0, _get_engine_max_model_len())
     output: dict[str, Any] = {
         "text": "",
@@ -2768,6 +2832,26 @@ async def _completions(
     except Exception as e:
         logger.exception("Error in %s", route)
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.post("/v1/completions/render")
+async def completions_render(request: CompletionRequest):
+    """The prompt token IDs /v1/completions runs ``request`` with, as vLLM's
+    render endpoint lists them, one item per prompt; ATOM takes one prompt."""
+    validate_model(request.model)
+    try:
+        token_ids = await _engine_prompt_ids(request.get_prompt_or_tokens())
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return JSONResponse(
+        content=[
+            {
+                "request_id": f"cmpl-{uuid.uuid4().hex}",
+                "model": model_name,
+                "token_ids": token_ids,
+            }
+        ]
+    )
 
 
 @app.post("/v1/messages")
@@ -3499,18 +3583,12 @@ async def responses_create(raw_request: Request):
 @app.get("/v1/models")
 async def list_models():
     """List available models."""
-    from .model_capabilities import chat_rendering, deployment_metadata
+    from .model_capabilities import deployment_metadata
 
     return ModelList(
         data=[
             ModelCard(
                 id=model_name,
-                chat_rendering=chat_rendering(
-                    default_chat_template_kwargs,
-                    reasoning_toggle,
-                    custom_message_encoder,
-                    _model_reasoning_rules(),
-                ),
                 **deployment_metadata(_get_engine_config(), custom_message_encoder),
             )
         ]
