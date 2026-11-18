@@ -207,7 +207,14 @@ def test_k1_reads_the_production_seam_and_hands_its_core_to_k2(layer_id):
     plan = SimpleNamespace(layer_id=layer_id, mono=True, kda=object())
 
     out = runner._layer(
-        SimpleNamespace(oproj=None), plan, None, prefix, blocks, add, None, None
+        SimpleNamespace(oproj=None, k2={layer_id: object()}),
+        plan,
+        None,
+        prefix,
+        blocks,
+        add,
+        None,
+        None,
     )
 
     before, write_idx = layer_block(layer_id)
@@ -262,7 +269,14 @@ def test_k1_core_goes_through_the_kernel_o_proj_all_reduce_when_built():
     plan = SimpleNamespace(layer_id=5, mono=True, kda=object())
 
     runner._layer(
-        SimpleNamespace(oproj=kernel), plan, None, prefix, blocks, prefix, None, None
+        SimpleNamespace(oproj=kernel, k2={5: object()}),
+        plan,
+        None,
+        prefix,
+        blocks,
+        prefix,
+        None,
+        None,
     )
 
     assert calls["oproj"][0] is kernel and calls["oproj"][1] == 5
@@ -306,7 +320,7 @@ def test_full_attention_layer_runs_production_attention_then_the_kernel_k2():
     positions = torch.zeros(rows, dtype=torch.long)
 
     runner._layer(
-        SimpleNamespace(oproj=kernel),
+        SimpleNamespace(oproj=kernel, k2={7: object()}),
         plan,
         positions,
         prefix,
@@ -403,12 +417,90 @@ def test_runner_admits_only_supported_rows_and_query_lengths():
         prepare=lambda width: prepared.append(width) or True
     )
 
-    assert runner.max_rows == 48
+    assert runner.max_rows == 64
     assert not runner.prepare(0, 1)
-    assert not runner.prepare(49, 1)
+    assert not runner.prepare(65, 1)
     assert not runner.prepare(3, 2)
     assert runner.prepare(48, 16)
-    assert len(prepared) == 1
+    assert runner.prepare(60, 5)
+    assert len(prepared) == 2
+
+
+@pytest.mark.parametrize("rows", (48, 60))
+def test_k2_kernel_refusal_past_48_rows_falls_back_to_production(rows):
+    runner = object.__new__(K3Gfx1250MonoDecodeRunner)
+
+    def refuse():
+        raise ValueError("does not fit")
+
+    if rows <= runner.k2_fallback_past:
+        with pytest.raises(ValueError, match="does not fit"):
+            runner._k2_or_production(rows, refuse, "K2")
+    else:
+        assert runner._k2_or_production(rows, refuse, "K2") is None
+    built = object()
+    assert runner._k2_or_production(rows, lambda: built, "K2") is built
+
+
+def test_layer_without_a_k2_build_runs_the_production_mlp():
+    rows, hidden = 2, 4
+    prefix = torch.zeros(rows, hidden)
+    blocks = torch.zeros(rows, 3, hidden)
+    core = torch.full((rows, hidden), 2.0)
+    calls = {}
+
+    class Seam:
+        out_quant_dtype = None
+        enabled = False
+
+        def __call__(self, value, visible, add_hidden, add_hidden2):
+            return value + add_hidden, value + add_hidden
+
+    def mlp_attn_res(value, visible, attn):
+        calls["mlp"] = (value, visible.shape[1], attn)
+        return attn * 2, attn + 1
+
+    def ffn(normed):
+        calls["ffn"] = normed
+        return normed + 5, normed + 6
+
+    layer = SimpleNamespace(
+        self_attention_attn_res=Seam(),
+        self_attn=SimpleNamespace(o_proj=lambda value: value + 1),
+        mlp_attn_res=mlp_attn_res,
+        _ffn=ffn,
+    )
+    runner = object.__new__(K3Gfx1250MonoDecodeRunner)
+    runner.inner = SimpleNamespace(layers={5: layer})
+    runner.routed = {5: SimpleNamespace(write_idx=-1, blocks=2)}
+    runner._k1 = lambda *_args: core
+
+    def kernel_k2(*_args):
+        raise AssertionError("ran the kernel K2 without a build")
+
+    runner._routed_k2 = kernel_k2
+    runner._write_aux = lambda *_args: None
+    plan = SimpleNamespace(layer_id=5, mono=True, kda=object())
+
+    out = runner._layer(
+        SimpleNamespace(oproj=None, k2={}),
+        plan,
+        None,
+        prefix,
+        blocks,
+        prefix + 1,
+        None,
+        None,
+    )
+
+    value, visible, attn = calls["mlp"]
+    torch.testing.assert_close(value, prefix + 1)
+    assert visible == 2
+    torch.testing.assert_close(attn, core + 1)
+    torch.testing.assert_close(calls["ffn"], (core + 1) * 2)
+    torch.testing.assert_close(out[0], core + 2)
+    torch.testing.assert_close(out[1], (core + 1) * 2 + 5)
+    torch.testing.assert_close(out[2], (core + 1) * 2 + 6)
 
 
 @pytest.mark.parametrize(

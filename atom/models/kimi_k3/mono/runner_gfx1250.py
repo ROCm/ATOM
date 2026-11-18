@@ -406,7 +406,12 @@ def _mono_attn_res(site, prefix, blocks, add, add2):
 class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
     """One TP8 rank with resident K1 and production K2."""
 
-    max_rows = 48
+    max_rows = GFX1250_MAX_TOKENS
+    # Past this many rows a K2 kernel or the o_proj kernel that refuses its
+    # width leaves the step mono: the layer's K2 (or o_proj) runs on the
+    # production path instead (``_production_k2``). Up to it a refusal
+    # refuses the width, as it always did.
+    k2_fallback_past = 48
     bind_k2 = False
     fp8_in_proj = True
     k2_peers: SymmPeers | None = None
@@ -626,27 +631,52 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                     tail_eps,
                     fp4_latent,
                 )
-                k2_local = k2_cache.get(k2_key)
-                if k2_local is None:
-                    k2_local = self._build_routed_k2(
+                if k2_key not in k2_cache:
+                    k2_cache[k2_key] = self._k2_or_production(
                         rows,
-                        nblocks,
-                        reset,
-                        routed.gu_interleave,
-                        whole_up,
-                        fp8_shared,
-                        tail_eps,
-                        fp4_latent,
+                        lambda: self._build_routed_k2(
+                            rows,
+                            nblocks,
+                            reset,
+                            routed.gu_interleave,
+                            whole_up,
+                            fp8_shared,
+                            tail_eps,
+                            fp4_latent,
+                        ),
+                        "K2",
                     )
-                    k2_cache[k2_key] = k2_local
-                k2_by_layer[layer.layer_id] = k2_local
+                if k2_cache[k2_key] is not None:
+                    k2_by_layer[layer.layer_id] = k2_cache[k2_key]
 
         oproj = (
-            build_oproj_allreduce(self._plan(rows, 1), self.tp, self.dims.proj)
+            self._k2_or_production(
+                rows,
+                lambda: build_oproj_allreduce(
+                    self._plan(rows, 1), self.tp, self.dims.proj
+                ),
+                "o_proj all-reduce",
+            )
             if self.oproj_peers is not None
             else None
         )
         return Gfx1250WidthBuild(k1_by_layer, k2_by_layer, oproj)
+
+    def _k2_or_production(self, rows: int, build, what: str):
+        """``build()``, or None past ``k2_fallback_past`` rows where it
+        refuses the width: the production path then runs it."""
+        if rows <= self.k2_fallback_past:
+            return build()
+        try:
+            return build()
+        except (MonoUnsupported, ValueError) as why:
+            logger.warning(
+                "Kimi-K3 gfx1250 mono: %d rows run the production %s (%s)",
+                rows,
+                what,
+                why,
+            )
+            return None
 
     def _build_routed_k2(
         self,
@@ -916,14 +946,17 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                 attn_out = layer.self_attn.o_proj(core, x_scale=core_scale)
             else:
                 attn_out = layer.self_attn.o_proj(core)
-            prefix, add = self._routed_k2(
-                build,
-                plan,
-                attn_out,
-                prefix,
-                blocks,
-            )
-            out = (prefix, add, None)
+            if plan.layer_id in build.k2:
+                prefix, add = self._routed_k2(
+                    build,
+                    plan,
+                    attn_out,
+                    prefix,
+                    blocks,
+                )
+                out = (prefix, add, None)
+            else:
+                out = self._production_k2(plan, attn_out, prefix, blocks)
 
         rows = blocks.size(0)
         widths = {tensor.size(0) for tensor in out if tensor is not None}
@@ -934,6 +967,20 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             )
         self._write_aux(plan.layer_id, out)
         return out
+
+    def _production_k2(self, plan, attn_out, prefix, blocks):
+        """The layer's MLP AttnRes and FFN on the production path, as
+        ``_fallback`` runs them: ``(prefix, routed + shared out, None)``."""
+        weight = self.routed[plan.layer_id]
+        layer = self.inner.layers[plan.layer_id]
+        reset = weight.write_idx >= 0
+        normed, prefix = layer.mlp_attn_res(
+            None if reset else prefix,
+            blocks[:, : weight.blocks + reset],
+            attn_out,
+        )
+        out, shared = layer._ffn(normed)
+        return prefix, out, shared
 
     def _oproj(self, kernel, layer_id, core):
         """o_proj of the BF16 core rows and its all-reduce, in one kernel."""
