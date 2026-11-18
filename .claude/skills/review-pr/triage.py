@@ -3092,7 +3092,10 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
             findings.append((m.group(1), m.group(2).strip()))
     reported = set()
     for _, text in findings:
-        rid = re.match(r"([A-Z]+\d+[a-z]?):", text)
+        rid = re.match(r"[*`_ ]*([A-Z]+\d+[a-z]?)[*`_]*:", text)  # emphasis too: SKILL.md's
+        # own examples lean on `**`, so `**A5:**` is the shape reached for next, and a
+        # match pinned to offset 0 would miss it here (claim lost -> false
+        # UNREPORTED-FIRE) and below (the id ships).
         if rid:
             reported.add(rid.group(1))
         # SKILL.md's output rules say, in as many words, "Do NOT use rule codes (B1, D4,
@@ -3147,7 +3150,10 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
                              f"cites only {cited[0]} and nothing this PR changes"))
         # Does anything already adjudicated mention this? Match on the rule id if the
         # finding carries one, else on a distinctive token from the text.
-        rid = re.match(r"([A-Z]+\d+[a-z]?):", text)
+        rid = re.match(r"[*`_ ]*([A-Z]+\d+[a-z]?)[*`_]*:", text)  # emphasis too: SKILL.md's
+        # own examples lean on `**`, so `**A5:**` is the shape reached for next, and a
+        # match pinned to offset 0 would miss it here (claim lost -> false
+        # UNREPORTED-FIRE) and below (the id ships).
         if rid:
             # SKILL.md: "Do NOT use rule codes (B1, D4, A1...) in output -- they are
             # internal labels only." Parsing one here as a claim made the gate accept

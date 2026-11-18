@@ -467,6 +467,14 @@ Review: OK
 ⚠️ planner.rs:108 charges the prompt only when req.stream. **Author must** say so.' | grep -c RULE-CODE-IN-CARD)" "0"
 # `FP8:`, `TP8:`, `MI300:` and `V4:` share the rule-id shape and are ordinary ways to open
 # a finding here. Refusing those would be a false positive carrying a nonsense message.
+t "a rule code behind emphasis is still a rule code" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+
+⚠️ **A5:** planner.rs:108 charges the prompt only when req.stream. **Author must** say so.' | grep -c RULE-CODE-IN-CARD)" "1"
 t "an ordinary FP8: opening is not a rule code" \
   "$(_card_kinds '## T
 
