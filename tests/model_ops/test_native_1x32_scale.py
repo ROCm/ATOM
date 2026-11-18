@@ -24,23 +24,30 @@ def _want(raw):
     return shuffle_mxfp8_bpreshuffle_scale(raw.view(dtypes.fp8_e8m0)).view(u8)
 
 
-@pytest.fixture
-def layer():
+def _layer(rows, scale):
     layer = SimpleNamespace(
-        weight=nn.Parameter(torch.randn(N, K).to(dtypes.fp8), requires_grad=False),
+        weight=nn.Parameter(
+            torch.randn(len(scale) * rows, scale.shape[1] * 32).to(dtypes.fp8),
+            requires_grad=False,
+        ),
         weight_scale=nn.Parameter(
-            OLD.clone().view(dtypes.fp8_e8m0), requires_grad=False
+            scale.clone().view(dtypes.fp8_e8m0), requires_grad=False
         ),
         quant_type=QuantType.per_1x32,
         params_dtype=dtypes.fp8,
         needs_preshuffled_weight=True,  # shuffled on every arch
-        native_a8_group_rows=1,
-        weight_scale_row_group=1,
+        native_a8_group_rows=rows,
+        weight_scale_row_group=rows,
         bias=None,
         _parameters={},
     )
     LinearBase.process_weights_after_loading(layer)
     return layer
+
+
+@pytest.fixture
+def layer():
+    return _layer(1, OLD)
 
 
 def test_load(layer):
@@ -57,6 +64,18 @@ def test_sync(layer):
     assert torch.equal(layer.weight.view(u8), weight)
     WeightUpdaterMixin()._post_process_fp8_weight(layer, layer.weight)
     assert torch.equal(layer.weight_scale.view(u8), _want(NEW))
+
+
+def test_sync_32x32():
+    # A native 32x32 scale stays row-major at load and after a sync. Its
+    # (16, 32) shape is one the old 16x16 `shuffle_weights` would permute.
+    old, new = torch.randint(0, 255, (2, 16, 32), dtype=u8, generator=_g)
+    layer = _layer(32, old)
+    assert layer.weight.is_shuffled
+    assert torch.equal(layer.weight_scale.view(u8), old)
+    layer.weight_scale.data.copy_(new.view(dtypes.fp8_e8m0))
+    WeightUpdaterMixin()._post_process_fp8_weight(layer, layer.weight_scale)
+    assert torch.equal(layer.weight_scale.view(u8), new)
 
 
 @pytest.mark.parametrize("start", [0, 16, 32, 48, 96])
