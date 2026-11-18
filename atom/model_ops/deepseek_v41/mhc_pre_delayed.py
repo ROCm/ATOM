@@ -112,6 +112,7 @@ def pre_delayed(
     sublayer_output=None,
     post_mix=None,
     combination=None,
+    persistent_workers=0,
 ):
     """One sublayer seam: optional post, the delayed pre, the input RMSNorm.
 
@@ -121,6 +122,7 @@ def pre_delayed(
     or the original FP32 weight for Triton otherwise.
     With `fuse_quant`, `normed_input` is `(bf16, fp8, e8m0_scale)` with
     row-major scales; it needs the HIP backend and `fuse_quant_supported()`.
+    With fused MXFP8 output, `persistent_workers=256` selects the A01 HIP schedule.
     """
     outputs = v41_mhc_pre_delayed(
         residual,
@@ -139,6 +141,7 @@ def pre_delayed(
         sublayer_output=sublayer_output,
         post_mix=post_mix,
         combination=combination,
+        **({"persistent_workers": persistent_workers} if persistent_workers else {}),
     )
     # Keep the guarded op's outputs flat and preserve the no-post input alias
     # outside it. Only the attention-facing wrapper groups the norm outputs.
@@ -200,6 +203,7 @@ def v41_mhc_pre_delayed(
     sublayer_output: torch.Tensor | None = None,
     post_mix: torch.Tensor | None = None,
     combination: torch.Tensor | None = None,
+    persistent_workers: int = 0,
 ) -> list[torch.Tensor]:
     """The seam as one guarded op, so Dynamo treats the launches as opaque."""
     *outer, hc_mult, hidden = residual.shape
@@ -207,6 +211,10 @@ def v41_mhc_pre_delayed(
     with_post = sublayer_output is not None
     kernel = mhc_fused_post_pre_delayed_rmsnorm
     options = {}
+    if persistent_workers:
+        if not fuse_quant or not w_preshuffle_bf16:
+            raise ValueError("P256 attention mHC (A01) requires fused MXFP8 output and packed HIP weights")
+        options["persistent_workers"] = persistent_workers
     if fuse_quant and not w_preshuffle_bf16:
         raise ValueError("Fused mHC quantization requires the HIP backend")
     if fuse_quant and not fuse_quant_supported():
