@@ -637,11 +637,12 @@ def select_ord(c, hb, ctr, oc, r, g, G, n, k, vals, vstride, mode, q, ordered=Tr
 # ---- a REINDEX row's first radix round from the previous step's 512-th score (the anchor a) ------------------------
 # A row's 512-th score moves little between steps (|delta| p99 ~1, max 2.1 over 30K / 133K, repeated and natural text):
 # round 0's digit is a fine linear bin of the score around the row's anchor -- bins 1..254 over [a - MA_S, a + MA_S),
-# 0 below, 255 above (a monotone digit), counted in one group round (histogram -> device atomics -> the group count). The 512-th score's bin j: keys above it are the winners (positions: one device atomic a CTA), its
-# keys (<= MA_CAP; p99 ~48 at MA_S 2) go to the CTA's own list with an LL count; the group's CTA 0 polls the counts,
-# gathers and ranks the lists (value desc, column asc) for the remaining picks and writes the next anchor. j = 0 / 255
-# or more than MA_CAP keys in j: select_mc as before (it writes the anchor then). Same set as select_mc (ties: the lower
-# column). The anchors (and lists) are kept across steps (step.MA_KB); the first step of a request falls back.
+# 0 below, 255 above (a monotone digit), counted in one group round (histogram -> device atomics -> the group count).
+# The 512-th score's bin j: keys above it are the winners; of j's keys (~14, p99 ~48 at MA_S 2, all within 0.016 of
+# the 512-th score) the first `need` in device-atomic order fill the rest -- an approximate top-512 (~99% of the exact
+# set), no ranking pass; one device atomic a CTA gives both position bases. The group's CTA 0 writes the bin's centre
+# as the next step's anchor. j = 0 / 255: select_mc as before (it writes the anchor then). The anchors are kept across
+# steps (step.MA_KB); the first step of a request falls back.
 MA_CTAS = 256
 
 
@@ -651,19 +652,12 @@ def _ma_mbcnt(m):
 
 
 MA_S = 2.0
-MA_CAP = 64
 MA_LAYER = MC_ROWS * 256 * 4             # a REINDEX layer's MA slot (zeroed a step): the anchored histograms [MC_ROWS][256]
 MA_SLOTS = 4                             # REINDEX layers (24 / 28 / 32 / 36): slot (Ly >> 2) & 3
-# kept across steps (step.MA_KB, a slot of MA_KEEP bytes a REINDEX layer): the rows' anchors [MC_ROWS] f32; the CTAs'
-# j-bin list counts, LL words (count, tag) [MC_ROWS][32]; their lists [MC_ROWS][32][MA_CAP] (order key, column, real
-# row, pool row)
-MA_KANC = 0
-MA_KCNT = 64
-MA_KLST = MA_KCNT + MC_ROWS * 32 * 8
-MA_KEEP = MA_KLST + MC_ROWS * 32 * MA_CAP * 16
-O_MAL = O_MCH + 1024                     # LDS: the j-bin keys (order key, column, real, pool row) x MA_CAP for the
-# ranking CTA; at + 16 MA_CAP the waves' (winners, list) counts [8] x 2, + 64 the CTA's bases, + 128 the histogram's
-# junk lanes, + 256 the group's list (prefix, count) [32] x 2
+MA_KANC = 0                              # kept across steps (step.MA_KB, MA_KEEP bytes a REINDEX layer): the rows' anchors
+MA_KEEP = 64                             # [MC_ROWS] f32
+O_MAL = O_MCH + 1024                     # LDS: the waves' (winners, j-bin) counts [8] x 2, + 64 the CTA's bases, + 128 the
+# histogram's junk lanes
 O_MAP = O_MAL + 4096                     # select_ma_prep's values (before the scorer: past the scorer's LDS) -- (n, lo,
 # -, -), then a thread's (real, pool row) of its 2 keys
 MA_X0 = 64                               # select_ma's row groups from CTA 64 (past the iquant CTAs: the prep in their wait)
@@ -717,14 +711,11 @@ def select_ma_prep(c, G, kp):
 
 
 @ASTRewriter.transform
-def select_ma(c, hb, ctr, G, ma, kp, tag):
+def select_ma(c, hb, ctr, G, ma, kp):
     """A REINDEX layer's rows (module comment above), G CTAs a row as select_mc (n <= 16384: CH <= 512, 2 keys a thread
     in registers), the row groups from CTA MA_X0; select_ma_prep's values in LDS (before the scorer); ma: the layer's MA
-    slot (histograms), kp: its kept slot (the anchors: the 512-th score written back by the ranking CTA, on a fallback by
-    select_mc; the lists), tag: this step's LL tag. Returns 1 when its picks are written, 0 when select_mc must run
-    (uniform). One group round finds the bin; the winners' positions a CTA (one device atomic); the j-bin keys to the
-    CTA's own list + an LL count (no atomic); the group's CTA 0 polls the G counts, gathers and ranks the lists (value
-    desc, column asc)."""
+    slot (histograms), kp: its kept slot (the anchors). Returns 1 when its picks are written, 0 when select_mc must run
+    (uniform)."""
     t, b, sm, TR = c["t"], c["b"], c["sm"], c["TR"]
     lane = t % 32
     wave = t // 32
@@ -752,7 +743,7 @@ def select_ma(c, hb, ctr, G, ma, kp, tag):
         gpu.barrier()
         ba = _ma_bin(xa, lo, inv)
         bb = _ma_bin(xb, lo, inv)
-        junk = I32(O_MAL // 4 + 4 * MA_CAP + 32) + lane
+        junk = I32(O_MAL // 4 + 32) + lane
         hx.latomic_add_i32(sm + va.select(I32(O_MCH // 4) + ba, junk) * 4, I32(1))
         hx.latomic_add_i32(sm + vb.select(I32(O_MCH // 4) + bb, junk) * 4, I32(1))
         gpu.barrier()
@@ -785,19 +776,17 @@ def select_ma(c, hb, ctr, G, ma, kp, tag):
         gpu.barrier()
         st4 = hx.lload(sm + O_MC, I32, 4)
         j = st4[0]
-        mj = st4[1]
         need = st4[2]
-        if (j >= 1) & (j <= 254) & (mj <= MA_CAP):
+        if (j >= 1) & (j <= 254):
             done = I32(1)
             lf = hx.lload(sm + O_MAP + 16 + t * 16, I32, 4)
-            ra, pa, rb, pb = lf[0], lf[1], lf[2], lf[3]
             wa = va & (ba > j)
             wb = vb & (bb > j)
             ma_ = va & (ba == j)
             mb_ = vb & (bb == j)
             bw = [_ballot(wa), _ballot(wb), _ballot(ma_), _ballot(mb_)]
-            if lane == 0:   # the wave's winners / list counts -> LDS
-                hx.lstore(sm + O_MAL + 16 * MA_CAP + wave * 8, fx.Vector.from_elements(
+            if lane == 0:   # the wave's winners / j-bin counts -> LDS
+                hx.lstore(sm + O_MAL + wave * 8, fx.Vector.from_elements(
                     [_popc(bw[0]) + _popc(bw[1]), _popc(bw[2]) + _popc(bw[3])], I32))
             gpu.barrier()
             wpre = I32(0)
@@ -805,67 +794,28 @@ def select_ma(c, hb, ctr, G, ma, kp, tag):
             wtot = I32(0)
             mtot = I32(0)
             for wv in range_constexpr(WAVES):
-                pr = hx.lload(sm + O_MAL + 16 * MA_CAP + wv * 8, I32, 2)
+                pr = hx.lload(sm + O_MAL + wv * 8, I32, 2)
                 wpre = wpre + (wave > wv).select(pr[0], I32(0))
                 mpre = mpre + (wave > wv).select(pr[1], I32(0))
                 wtot = wtot + pr[0]
                 mtot = mtot + pr[1]
-            lst = kp + i64(MA_KLST) + i64((r * 32 + g) * MA_CAP) * 16
-            if ma_:
-                hx.gstore(lst + i64(mpre + _ma_mbcnt(bw[2])) * 16, fx.Vector.from_elements([order_key(xa), ia, ra, pa], I32))
-            if mb_:
-                hx.gstore(lst + i64(mpre + _popc(bw[2]) + _ma_mbcnt(bw[3])) * 16, fx.Vector.from_elements([order_key(xb), ib, rb, pb], I32))
-            hx.wait_storecnt0()
+            if t == 0:   # winners | j-bin keys << 16 (<= 512 winners: no carry), one device atomic; the next anchor
+                hx.lstore(sm + O_MAL + 64, hx.atomic_add(ctr + i64(r * 32), wtot | (mtot << 16)))
+                if g == 0:
+                    hx.gstore(kp + i64(MA_KANC) + i64(r) * 4, lo + (j.to(F32) - F32(0.5)) / inv)
             gpu.barrier()
-            if t == 0:   # the list's LL count; then the winners' base (one device atomic)
-                hx.fence_release("agent")
-                hx.put(kp + i64(MA_KCNT) + i64(r * 32 + g) * 8, mtot, tag)
-                hx.lstore(sm + O_MAL + 16 * MA_CAP + 64, hx.atomic_add(ctr + i64(r * 32), wtot))
-            if g == 0:   # the group's CTA 0: the G lists gathered, ranked, the top `need` of them picked
-                if t < 32:
-                    adr = kp + i64(MA_KCNT) + i64(r * 32 + fx.min(lane, G - 1)) * 8
-                    t0 = hx.clock()
-                    pk = hx.peek(adr)
-                    while (_ballot((pk[1] != tag) & (lane < G)) != I32(0)) & (hx.clock() - t0 < fx.Int64(hx.POLL_TICKS)):
-                        hx.s_sleep(1)
-                        pk = hx.peek(adr)
-                    cn = (lane < G).select(pk[0], I32(0))
-                    hx.lstore(sm + O_MAL + 16 * MA_CAP + 256 + lane * 8, fx.Vector.from_elements([wave_incl_scan(cn, lane) - cn, cn], I32))
-                    hx.fence_acquire("agent")
-                if t < MA_CAP:   # (padding: past mj)
-                    z0 = hx.fresh(I32(0))   # (an opaque zero: the constant vector was hoisted to the kernel entry and spilled)
-                    hx.lstore(sm + O_MAL + t * 16, fx.Vector.from_elements([z0, z0 | I32(0x7FFFFFFF), z0, z0], I32))
-                gpu.barrier()
-                gs = t // 8
-                pc = hx.lload(sm + O_MAL + 16 * MA_CAP + 256 + fx.min(gs, I32(31)) * 8, I32, 2)
-                for e in range(t % 8, pc[1], 8):
-                    if gs < G:
-                        e4 = hx.gload(kp + i64(MA_KLST) + i64((r * 32 + gs) * MA_CAP + e) * 16, I32, 4)
-                        hx.lstore(sm + O_MAL + (pc[0] + e) * 16, e4)
-                gpu.barrier()
-                # member t // 4 ranked by 4 lanes (lane t % 4: every 4th group of 4 members), the parts summed
-                mt = t // 4
-                hm = (mt < mj) & (t % 4 == 0)
-                me = hx.lload(sm + O_MAL + mt * 16, I32, 4)
-                u = me[0]
-                cl = me[1]
-                rk = I32(0)
-                for m4 in range(t % 4, (mj + 3) // 4, 4):   # (4 members a trip: their LDS reads issued together; padding never ranks above)
-                    prs = [hx.lload(sm + O_MAL + (m4 * 4 + h) * 16, I32, 2) for h in range(4)]
-                    for h in range_constexpr(4):
-                        bt = ult(u, prs[h][0]) | ((prs[h][0] == u) & (prs[h][1] < cl))
-                        rk = rk + bt.select(I32(1), I32(0))
-                rk = rk + rk.shuffle_xor(1, 32)
-                rk = rk + rk.shuffle_xor(2, 32)
-                if hm & (rk < need):
-                    _ma_put(c, r, k - need + rk, me[2], me[3])
-                if hm & (rk == need - 1):   # the 512-th score: the next step's anchor
-                    hx.gstore(kp + i64(MA_KANC) + i64(r) * 4, _ma_key_f32(u))
-            gpu.barrier()
-            wbase = hx.lload(sm + O_MAL + 16 * MA_CAP + 64, I32)
+            bs = hx.lload(sm + O_MAL + 64, I32)
+            wb0 = bs & 0xFFFF
+            mb0 = (bs >> 16) & 0xFFFF
+            m0 = mb0 + mpre + _ma_mbcnt(bw[2])
+            m1 = mb0 + mpre + _popc(bw[2]) + _ma_mbcnt(bw[3])
             if wa:
-                _ma_put(c, r, wbase + wpre + _ma_mbcnt(bw[0]), ra, pa)
+                _ma_put(c, r, wb0 + wpre + _ma_mbcnt(bw[0]), lf[0], lf[1])
             if wb:
-                _ma_put(c, r, wbase + wpre + _popc(bw[0]) + _ma_mbcnt(bw[1]), rb, pb)
+                _ma_put(c, r, wb0 + wpre + _popc(bw[0]) + _ma_mbcnt(bw[1]), lf[2], lf[3])
+            if ma_ & (m0 < need):
+                _ma_put(c, r, k - need + m0, lf[0], lf[1])
+            if mb_ & (m1 < need):
+                _ma_put(c, r, k - need + m1, lf[2], lf[3])
         gpu.barrier()   # (select_mc rewrites O_MC when this returns 0)
     return done

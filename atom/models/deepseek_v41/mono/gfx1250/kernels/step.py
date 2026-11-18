@@ -71,7 +71,7 @@ IDX_LEVELS = 3        # selection-tree capacity (the index capacity buffers.ILW)
 MC_BYTES = (D.LAYERS + 4) * (4 * 8 * 256 * 4 + 8 * 8 * 4)   # mchist: [layers] ([4 rounds][8 rows][256] + [8 rows][8]) i32
 MA_OFF = MC_BYTES                 # then select_ma's histograms: topk.MA_SLOTS REINDEX slots of topk.MA_LAYER
 MC_ZERO = MA_OFF + TK.MA_SLOTS * TK.MA_LAYER   # (zeroed at the step's entry)
-MA_KB = MC_ZERO                   # select_ma's kept slots (anchors, LL list counts, lists) [MA_SLOTS] x topk.MA_KEEP
+MA_KB = MC_ZERO                   # select_ma's kept slots (the anchors) [MA_SLOTS] x topk.MA_KEEP
 MC_BYTES = MA_KB + TK.MA_SLOTS * TK.MA_KEEP
 IPF_KB = 32           # instruction prefetch (KB) before the fronts / the MoE
 FPF_SPLIT = True      # (front prefetch layout; the step build does not prefetch the front weights)
@@ -736,8 +736,7 @@ def target_layer(E, Ly):
                             mdone = TK.select_ma(cwith(cs_, ts=None), mh + i64(Ly) * TK.MC_LAYER,
                                                  mh + i64(Ly) * TK.MC_LAYER + i64(TK.MC_HIST), gsel,
                                                  mh + i64(MA_OFF) + i64((Ly >> 2) & 3) * TK.MA_LAYER,
-                                                 mh + i64(MA_KB) + i64((Ly >> 2) & 3) * TK.MA_KEEP,
-                                                 hx.epoch32(tep, Ly, 9))
+                                                 mh + i64(MA_KB) + i64((Ly >> 2) & 3) * TK.MA_KEEP)
                         if mdone == fx.Int32(0):
                             TK.select_mc(cwith(cs_, ts=None), mh + i64(Ly) * TK.MC_LAYER,
                                          mh + i64(Ly) * TK.MC_LAYER + i64(TK.MC_HIST), isrx, gsel,
