@@ -55,7 +55,8 @@ STATE_CHUNKS = HEAD_DIM // VALUE_CHUNK
 ATTENTION_REDUCTION_GROUPS = 8
 LDS_PAD = 8
 # The local resident pipeline is intentionally independent of gfx950's
-# persistent-kernel transport arguments (ReplaySSM and peer-memory buffers).
+# persistent-kernel transport arguments (peer-memory buffers). ReplaySSM's
+# pointers come as gfx950's ``replay`` table (``kda.REPLAY_TABLE``), 0 without.
 K1_ABI_NAMES = (
     "prefix",
     "delta",
@@ -83,8 +84,30 @@ K1_ABI_NAMES = (
     "num_acc",
     "core_out",
     "core_q",
+    "replay",
     "scratch",
 )
+
+
+# the ``replay`` table's i64 entries (gfx950's ``kda.REPLAY_TABLE``, which
+# ``K3MonoDecodeRunner._replay_table`` writes): the requests' checkpoint slots,
+# the slots' record cursors, the layer's k / u / g record buffers
+REPLAY_TABLE = ("slot_idx", "write_pos", "rbuf_k", "rbuf_u", "rbuf_g")
+
+
+def replay_records(cap: int, window: int) -> int:
+    """The most ReplaySSM records a step finds committed: a step flushes once
+    h + 2 window > cap and then writes from 0, so h <= max(window, cap - window)."""
+    return max(window, cap - window)
+
+
+# records K1 replays an iteration (the staged ones past h zeros)
+REPLAY_GROUP = 4
+
+
+def replay_staged(cap: int, window: int) -> int:
+    """The records a K1 task stages: ``replay_records``, whole groups."""
+    return -(-replay_records(cap, window) // REPLAY_GROUP) * REPLAY_GROUP
 
 
 def _align(value: int) -> int:
@@ -378,6 +401,14 @@ class K1LocalBuildSpec:
     # (ATOM_KIMI_MONO_SPLITK=k1): a CTA streams a quarter of K for eight
     # tasks, then sums its two over the cluster.
     split_projection: bool = False
+    # ReplaySSM (``fla_ops.replayssm``): the record buffer's length (its
+    # ``cache_len``), 0 without. A request's state is its checkpoint plus the
+    # (k, u, g) records committed since (``write_pos``), rebuilt here; each
+    # token writes a record instead of a state.
+    replay_cap: int = 0
+    # its verify window (``replayssm_max_query_len``), whatever this step's
+    # query length: the flush rule is the commit's
+    replay_window: int = 0
 
     @property
     def split_format(self) -> str | None:
@@ -437,6 +468,16 @@ class K1LocalBuildSpec:
             raise ValueError("local K1 gemv_unit must be 1 or 2")
         if self.timeline:
             raise ValueError("local K1 resident kernel does not expose timeline taps")
+        if self.replay_cap:
+            # ``replayssm.flush_threshold_ok``: two windows, or a step's
+            # records could run past the buffer
+            if not self.qlen <= self.replay_window <= self.replay_cap // 2:
+                raise ValueError(
+                    f"local K1 ReplaySSM window {self.replay_window} must cover "
+                    f"qlen {self.qlen} and fit twice in cache_len {self.replay_cap}"
+                )
+        elif self.replay_window:
+            raise ValueError("local K1 ReplaySSM window without a record buffer")
 
     @property
     def stage_order(self) -> tuple[str, ...]:
@@ -467,11 +508,15 @@ def role_lds_plan(
     gemv_unit: int = 2,
     split: str | None = None,
     fp8: bool = False,
+    replay_cap: int = 0,
+    replay_window: int = 0,
 ) -> K1RoleLdsPlan:
     """Construct K1's exact Smem + role-union LDS byte layout. ``split``: the
     split-K in-projection's weight format (``K1LocalBuildSpec.split_format``).
     ``fp8``: the in-projection is FP8, whose TDM slabs alone the projection
-    region holds where the BF16 ones would not fit (past 58 rows)."""
+    region holds where the BF16 ones would not fit (past 58 rows).
+    ``replay_cap`` / ``replay_window``: ReplaySSM's (``K1LocalBuildSpec``), whose
+    log gates and staged records the recurrence holds."""
 
     if plan.nblocks is None:
         raise ValueError("gfx1250 K1 LDS needs explicit nblocks")
@@ -548,6 +593,16 @@ def role_lds_plan(
         _fields(("xl", projection_bytes), ("acc", accumulator_bytes)),
     )
     state_width = HEAD_DIM
+    # ReplaySSM: the tokens' log gates (their g records) and a task's staged
+    # committed records -- u and k bf16, g f32, a head's 128 of each a record
+    replay = (
+        (
+            ("glog", qlen * HEAD_DIM * 4),
+            ("rec", replay_staged(replay_cap, replay_window) * HEAD_DIM * 8),
+        )
+        if replay_cap
+        else ()
+    )
     recurrence = RoleLdsVariant(
         "recurrence",
         _fields(
@@ -559,6 +614,7 @@ def role_lds_plan(
             ("beta", 16 * 4),
             ("slots", 16 * 4),
             ("onrm", qlen * STATE_CHUNKS * 4),
+            *replay,
         ),
     )
     variants = attention, projection, recurrence
@@ -588,6 +644,8 @@ def role_lds_type_spec(layout: K1RoleLdsPlan) -> K1LdsTypeSpec:
         "beta": "f32",
         "slots": "i32",
         "onrm": "f32",
+        "glog": "f32",
+        "rec": "i32",
     }
 
     def convert(fields: tuple[LdsField, ...]) -> tuple[LdsTypeField, ...]:
@@ -651,10 +709,20 @@ def declare(
     gemv_unit: int = 2,
     split: str | None = None,
     fp8: bool = False,
+    replay_cap: int = 0,
+    replay_window: int = 0,
 ) -> K1KernelDeclaration:
     """Create the gfx1250 K1 declaration up to kernel-body emission."""
 
-    lds = role_lds_plan(plan, qlen=qlen, gemv_unit=gemv_unit, split=split, fp8=fp8)
+    lds = role_lds_plan(
+        plan,
+        qlen=qlen,
+        gemv_unit=gemv_unit,
+        split=split,
+        fp8=fp8,
+        replay_cap=replay_cap,
+        replay_window=replay_window,
+    )
     GFX1250_MAILBOX.require(*K1_REQUIRED_CAPABILITIES)
     assert plan.nblocks is not None
     name = (
@@ -690,6 +758,8 @@ def declare_local(
     gemv_unit: int = 2,
     split: str | None = None,
     fp8: bool = False,
+    replay_cap: int = 0,
+    replay_window: int = 0,
 ) -> K1KernelDeclaration:
     """Declare K1 for the external-collective path.
 
@@ -699,7 +769,15 @@ def declare_local(
     """
 
     return replace(
-        declare(plan, qlen=qlen, gemv_unit=gemv_unit, split=split, fp8=fp8),
+        declare(
+            plan,
+            qlen=qlen,
+            gemv_unit=gemv_unit,
+            split=split,
+            fp8=fp8,
+            replay_cap=replay_cap,
+            replay_window=replay_window,
+        ),
         unsupported_device_protocol=(),
     )
 
@@ -739,6 +817,8 @@ def build_local(
         gemv_unit=spec.gemv_unit,
         split=spec.split_format,
         fp8=spec.fp8_projection,
+        replay_cap=spec.replay_cap,
+        replay_window=spec.replay_window,
     )
     declaration = replace(
         declaration,
