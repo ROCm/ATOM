@@ -2,6 +2,7 @@
 //! The owner lives through body completion or cancellation, outside backend retries.
 use super::{
     metrics::{bool_to_static_str, metrics_labels, MeshMetrics},
+    route_trace::CacheEstimate,
     ttft::FirstOutputSse,
     usage::UsageObserver,
 };
@@ -32,8 +33,8 @@ pub(crate) struct RequestMetrics {
     error: Option<&'static str>,
     detector: FirstOutputSse,
     usage: UsageObserver,
-    /// Pool that computed the prompt, and the router's expected hit ratio there.
-    reconcile: Option<(&'static str, Option<f64>)>,
+    /// Pool that computed the prompt, and the router's cache estimate there.
+    reconcile: Option<(&'static str, Option<CacheEstimate>)>,
 }
 impl RequestMetrics {
     pub fn new(
@@ -72,9 +73,9 @@ impl RequestMetrics {
         }
     }
     /// Records the cached tokens the response reports against `pool`, the pool
-    /// that computed the prompt, and compares them with `estimated_hit_ratio`.
-    pub fn reconcile(mut self, pool: &'static str, estimated_hit_ratio: Option<f64>) -> Self {
-        self.reconcile = Some((pool, estimated_hit_ratio));
+    /// that computed the prompt, and compares them with `estimate`.
+    pub fn reconcile(mut self, pool: &'static str, estimate: Option<CacheEstimate>) -> Self {
+        self.reconcile = Some((pool, estimate));
         self
     }
     #[cfg(feature = "ext-proc")]
@@ -152,9 +153,15 @@ impl Drop for RequestMetrics {
         if let Some(usage) = self.usage.usage(self.streaming) {
             if let (Some((pool, estimate)), Some(cached)) = (self.reconcile, usage.cached) {
                 MeshMetrics::record_route_cache_tokens(pool, usage.prompt, cached);
-                if let Some(ratio) = estimate {
-                    let estimated = (ratio * usage.prompt as f64).round() as u64;
-                    MeshMetrics::record_route_cache_estimate(pool, usage.prompt, estimated, cached);
+                if let Some(estimate) = estimate {
+                    let tokens = |ratio: f64| (ratio * usage.prompt as f64).round() as u64;
+                    MeshMetrics::record_route_cache_estimate(
+                        pool,
+                        usage.prompt,
+                        tokens(estimate.hit_ratio),
+                        tokens(estimate.offload_ratio),
+                        cached,
+                    );
                 }
             }
             for (kind, token_type, count) in [
@@ -274,12 +281,16 @@ mod tests {
         };
         let cached =
             |tokens: u64| format!(r#","prompt_tokens_details":{{"cached_tokens":{tokens}}}"#);
+        let half = Some(CacheEstimate {
+            hit_ratio: 0.5,
+            offload_ratio: 0.3,
+        });
         let cases = [
-            ("http", Some(0.5), body(100, &cached(40))),
+            ("http", half, body(100, &cached(40))),
             ("http", None, body(100, &cached(40))),
             // No report, and a prompt of 0 tokens, which has no error ratio.
-            ("http", Some(0.5), body(100, "")),
-            ("http", Some(0.5), body(0, &cached(0))),
+            ("http", half, body(100, "")),
+            ("http", half, body(0, &cached(0))),
             // Not reconciled by its router.
             ("ext_proc", None, body(100, &cached(40))),
         ];
@@ -303,6 +314,7 @@ mod tests {
             r#"mesh_route_cache_tokens_total{pool="prefill",kind="cached"} 80"#,
             r#"mesh_route_cache_estimate_tokens_total{pool="prefill",kind="prompt"} 100"#,
             r#"mesh_route_cache_estimate_tokens_total{pool="prefill",kind="estimated"} 50"#,
+            r#"mesh_route_cache_estimate_tokens_total{pool="prefill",kind="estimated_offload"} 30"#,
             r#"mesh_route_cache_estimate_tokens_total{pool="prefill",kind="actual"} 40"#,
             r#"mesh_route_cache_estimate_error_ratio_sum{pool="prefill"} 0.1"#,
             r#"mesh_route_cache_estimate_error_ratio_count{pool="prefill"} 1"#,

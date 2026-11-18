@@ -37,7 +37,15 @@ tokio::task_local! {
 /// The estimate of the latest selection in the pool that computes the prompt.
 struct Estimate {
     worker: Arc<dyn Worker>,
-    hit_ratio: f64,
+    estimate: CacheEstimate,
+}
+
+/// The cache hit ratio a selection expects on its worker, and the part of it the engine
+/// loads from its offload tier.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct CacheEstimate {
+    pub hit_ratio: f64,
+    pub offload_ratio: f64,
 }
 
 /// Latest policy selection per pool; retries replace it.
@@ -116,15 +124,15 @@ pub(crate) fn record_selection(
     });
 }
 
-/// Runs the attempts of one routed request, and returns the cache hit ratio its
-/// last selection expected on the worker that computes the prompt, unless the
+/// Runs the attempts of one routed request, and returns the cache estimate its
+/// last selection made on the worker that computes the prompt, unless the
 /// request went to another worker.
-pub(crate) async fn estimated<F: Future>(attempts: F) -> (F::Output, Option<f64>) {
+pub(crate) async fn estimated<F: Future>(attempts: F) -> (F::Output, Option<CacheEstimate>) {
     ESTIMATE
         .scope(RefCell::new(None), async {
             let output = attempts.await;
             let estimate = ESTIMATE.with(|estimate| estimate.take());
-            (output, estimate.map(|estimate| estimate.hit_ratio))
+            (output, estimate.map(|estimate| estimate.estimate))
         })
         .await
 }
@@ -142,6 +150,7 @@ pub(crate) fn record_estimate(
     pool: &'static str,
     worker: Option<&Arc<dyn Worker>>,
     hit_ratio: Option<f64>,
+    offload_ratio: Option<f64>,
 ) {
     if !computes_prompt(pool) {
         return;
@@ -149,7 +158,10 @@ pub(crate) fn record_estimate(
     let _ = ESTIMATE.try_with(|estimate| {
         *estimate.borrow_mut() = worker.zip(hit_ratio).map(|(worker, hit_ratio)| Estimate {
             worker: worker.clone(),
-            hit_ratio,
+            estimate: CacheEstimate {
+                hit_ratio,
+                offload_ratio: offload_ratio.unwrap_or(0.0),
+            },
         });
     });
 }
@@ -329,26 +341,30 @@ mod tests {
         let decode = worker("http://decode:8000", WorkerType::Decode);
 
         let (_, kept) = estimated(async {
-            record_estimate("prefill", Some(&prefill_rank(0)), Some(0.5));
-            record_estimate("decode", Some(&decode), Some(0.9));
+            record_estimate("prefill", Some(&prefill_rank(0)), Some(0.5), Some(0.25));
+            record_estimate("decode", Some(&decode), Some(0.9), None);
             record_dispatch("prefill", &prefill_rank(0));
             record_dispatch("decode", &decode);
         })
         .await;
         let (_, remapped) = estimated(async {
-            record_estimate("prefill", Some(&prefill_rank(0)), Some(0.5));
+            record_estimate("prefill", Some(&prefill_rank(0)), Some(0.5), None);
             record_dispatch("prefill", &prefill_rank(1));
         })
         .await;
         let (_, retried) = estimated(async {
-            record_estimate("regular", Some(&regular), Some(0.5));
-            record_estimate("regular", Some(&regular), None);
+            record_estimate("regular", Some(&regular), Some(0.5), None);
+            record_estimate("regular", Some(&regular), None, None);
             record_dispatch("regular", &regular);
         })
         .await;
-        assert_eq!((kept, remapped, retried), (Some(0.5), None, None));
+        let kept_estimate = CacheEstimate {
+            hit_ratio: 0.5,
+            offload_ratio: 0.25,
+        };
+        assert_eq!((kept, remapped, retried), (Some(kept_estimate), None, None));
         // Outside `estimated` there is nothing to keep.
-        record_estimate("regular", Some(&regular), Some(0.5));
+        record_estimate("regular", Some(&regular), Some(0.5), None);
         record_dispatch("regular", &regular);
     }
 

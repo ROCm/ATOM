@@ -16,7 +16,7 @@ use super::{
     match_lanes, HolderId, Lane, Partition, PrefixHash,
 };
 use crate::kv_events::{
-    model::{DropReason, EngineHash, KvEvent, StoredBlock},
+    model::{DropReason, EngineHash, KvEvent, StoredBlock, Tier},
     SourceStatus,
 };
 
@@ -274,9 +274,9 @@ async fn the_writer_applies_batches_and_frees_released_lanes() {
     let partition = Partition::start(4, ttl, &tokio::runtime::Handle::current());
     let status = Arc::new(Mutex::new(SourceStatus::default()));
     let mut holders: Vec<_> = (0..64)
-        .map(|_| partition.hold(status.clone()).unwrap())
+        .map(|_| partition.hold(status.clone(), Tier::Device).unwrap())
         .collect();
-    assert!(partition.hold(status.clone()).is_none());
+    assert!(partition.hold(status.clone(), Tier::Device).is_none());
     // Predictions take lanes of their own.
     let predictors: Vec<_> = (0..64).map(|_| partition.predict("w").unwrap()).collect();
     assert!(partition.predict("w").is_none());
@@ -305,7 +305,7 @@ async fn the_writer_applies_batches_and_frees_released_lanes() {
 
     drop(holders.remove(1));
     let holder = loop {
-        if let Some(holder) = partition.hold(status.clone()) {
+        if let Some(holder) = partition.hold(status.clone(), Tier::Device) {
             break holder;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -321,7 +321,7 @@ async fn predictions_last_a_ttl_from_their_last_routing() {
     let ttl = Duration::from_millis(800);
     let partition = Partition::start(4, ttl, &tokio::runtime::Handle::current());
     let status = Arc::new(Mutex::new(SourceStatus::default()));
-    let holder = partition.hold(status).unwrap();
+    let holder = partition.hold(status, Tier::Device).unwrap();
     let predictor = partition.predict("w").unwrap();
     let lanes = [Some(predictor.lane())];
     let seq: Vec<u32> = (0..10).collect();
@@ -364,7 +364,7 @@ async fn predictions_go_on_where_the_events_end() {
     ];
     let holders: Vec<_> = held
         .iter()
-        .map(|_| partition.hold(status.clone()).unwrap())
+        .map(|_| partition.hold(status.clone(), Tier::Device).unwrap())
         .collect();
     let predictors: Vec<_> = held
         .iter()
@@ -530,7 +530,7 @@ async fn bench_match_workers_16_workers() {
     let (workers, count) = (background.len(), size("KV_BENCH_SAMPLES", 2000));
     let status = Arc::new(Mutex::new(SourceStatus::default()));
     let holders: Vec<_> = (0..workers)
-        .map(|_| partition.hold(status.clone()).unwrap())
+        .map(|_| partition.hold(status.clone(), Tier::Device).unwrap())
         .collect();
     for (k, holder) in holders.iter().enumerate() {
         let held = &prefix[..prefix.len() * (k + 1) / workers];

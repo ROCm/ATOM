@@ -8,6 +8,14 @@ use serde::Serialize;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EngineHash(pub u64);
 
+/// Where an engine holds a block: its device (`GPU`), or the host memory of the
+/// in-process LMCache it offloads to (`CPU`), in chunks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Tier {
+    Device,
+    Host,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredBlock {
     pub hash: EngineHash,
@@ -34,7 +42,8 @@ pub enum KvEvent {
 pub enum DropReason {
     /// Not an event of a documented type and shape.
     Decode,
-    /// Another tier than the device's (`GPU`), the only one followed.
+    /// A tier not followed: other than the device's, and the host's of a source that
+    /// reports no in-process LMCache.
     Tier,
     /// Another KV cache group than the full-attention group 0.
     Group,

@@ -321,7 +321,7 @@ impl CacheAwarePolicy {
     /// the request's tokens a worker's device cache holds, the highest first, then the
     /// lower load. None leaves the request to the tree: it has no tokens or has media, or no
     /// candidate holds more of them than `cache_threshold`. The estimate also counts what
-    /// the selected worker's engine will load from a store.
+    /// the selected worker's engine will load from a store or its host tier, apart.
     async fn select_by_kv_events(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -350,12 +350,15 @@ impl CacheAwarePolicy {
         }
         self.routed(info, workers[idx].as_ref());
         workers[idx].increment_processed();
+        let device = cached;
         let cached = provider
-            .cached_tokens(workers[idx].as_ref(), tokens, cached)
+            .cached_tokens(workers[idx].as_ref(), tokens, device)
             .await;
+        let ratio = |tokens_cached: u32| f64::from(tokens_cached) / tokens.len() as f64;
         let decision = RouteDecision {
             match_ratio: Some(match_rate),
-            estimated_hit_ratio: cached.map(|cached| f64::from(cached) / tokens.len() as f64),
+            estimated_hit_ratio: cached.map(ratio),
+            estimated_offload_ratio: cached.map(|cached| ratio(cached.saturating_sub(device))),
             ..RouteDecision::branch("kv_affinity")
         };
         Some((Some(idx), decision))

@@ -43,6 +43,9 @@ pub struct RouteDecision {
     /// when the selected worker is the best candidate, its KV event branch unless the
     /// store the worker loads from does not answer; other policies leave it None.
     pub estimated_hit_ratio: Option<f64>,
+    /// The part of `estimated_hit_ratio` the engine loads from its offload tier; None
+    /// counts as 0.
+    pub estimated_offload_ratio: Option<f64>,
 }
 
 impl RouteDecision {
@@ -51,6 +54,7 @@ impl RouteDecision {
             branch,
             match_ratio: None,
             estimated_hit_ratio: None,
+            estimated_offload_ratio: None,
         }
     }
 }

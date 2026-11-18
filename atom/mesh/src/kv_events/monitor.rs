@@ -6,7 +6,8 @@
 //! its own. What each stream carried is what `/kv_events/sources` shows. A registered
 //! worker without exact events is also predicted to hold the prompts routed to it. What a
 //! worker's engine will report cached also counts what it loads from the store it reads,
-//! if any.
+//! if any, or from the host tier of the in-process LMCache it reports, whose chunks its
+//! stream carries and a partition of their own indexes.
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -31,7 +32,7 @@ use zeromq::{
 };
 
 use super::{
-    model::{DropReason, KvEvent},
+    model::{DropReason, KvEvent, Tier},
     rank_state::{Admit, RankState, Trust},
     source::KvEventSource,
     wire::{self, DecodedBatch},
@@ -39,7 +40,7 @@ use super::{
 use crate::{
     core::{Worker, WorkerType},
     kv_index::{match_lanes, Holder, Lane, Partition, Predictor, PrefixMatchProvider},
-    kv_storage::StorageSources,
+    kv_storage::{loadable_hit, OffloadReport, StorageSources},
     observability::metrics::schema::names,
 };
 
@@ -54,6 +55,8 @@ const REPLAY_DEADLINE: Duration = Duration::from_secs(5);
 const HELD_BATCHES: usize = 1024;
 /// The seq of ATOM's last replay message: `[b"", b"", REPLAY_DONE, window]`.
 const REPLAY_DONE: [u8; 8] = [0xff; 8];
+/// The offload backend whose host tier a worker's own stream carries.
+const LMCACHE: &str = "lmcache";
 
 /// A batch and its seq.
 type Batch = (u64, DecodedBatch);
@@ -61,13 +64,13 @@ type Batch = (u64, DecodedBatch);
 type SocketEvents = futures::channel::mpsc::Receiver<SocketEvent>;
 
 /// The subscriptions and prediction lanes by worker URL, and the index partitions by
-/// model, pool and block size.
+/// model, pool, tier and block size.
 pub struct KvEventMonitor {
     subscriptions: DashMap<String, Subscription>,
     /// Every worker from its registration to its detach; none until it is routed to, or
     /// while its partition has no lane left.
     predictors: DashMap<String, Option<Predictor>>,
-    partitions: DashMap<(String, &'static str, u32), Arc<Partition>>,
+    partitions: DashMap<(String, &'static str, Tier, u32), Arc<Partition>>,
     stores: OnceLock<Arc<StorageSources>>,
     threads: Handle,
     runtime: Option<Runtime>,
@@ -96,6 +99,9 @@ struct Subscription {
     /// The rank's lane, when its partition had one left. The task holds it too, and the
     /// lane is freed once both let go of it.
     holder: Option<Arc<Holder>>,
+    /// The rank's lane among its host tier's chunks, held alike, and the fewest tokens
+    /// the engine loads from the tier.
+    host: Option<(Arc<Holder>, u32)>,
     task: JoinHandle<()>,
 }
 
@@ -105,6 +111,12 @@ impl Subscription {
         // A stream that could not start tells nothing of the rank's cache.
         let holder = self.holder.as_ref().filter(|_| !self.task.is_finished())?;
         Some((holder.lane(), self.status.lock().trust == Trust::Exact))
+    }
+
+    /// The rank's host lane while its stream is followed, its chunk and its least load.
+    fn host(&self) -> Option<(Lane, u32, u32)> {
+        let (holder, min_load) = self.host.as_ref().filter(|_| !self.task.is_finished())?;
+        Some((holder.lane(), holder.block_size(), *min_load))
     }
 }
 
@@ -144,6 +156,19 @@ pub struct SourceStatus {
     pub dropped_batches: u64,
     /// The rank's blocks in the router's index; null when its partition had no lane left.
     pub indexed_blocks: Option<u64>,
+    /// The host tier of the in-process LMCache the engine reports, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<HostStatus>,
+}
+
+/// A rank's host tier as `/kv_events/sources` shows it: blocks are its chunks.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct HostStatus {
+    pub block_size: u32,
+    pub stored_blocks: u64,
+    pub removed_blocks: u64,
+    /// Null when its partition had no lane left.
+    pub indexed_blocks: Option<u64>,
 }
 
 impl KvEventMonitor {
@@ -174,31 +199,39 @@ impl KvEventMonitor {
         source: KvEventSource,
     ) {
         info!(worker, dp_rank, endpoint = %source.endpoint, "Following KV events");
+        let host = source.offload.as_ref().and_then(lmcache_tier);
         let status = Arc::new(Mutex::new(SourceStatus {
             worker: worker.into(),
             model_id: model_id.into(),
             dp_rank,
             source: source.clone(),
+            host: host.map(|(block_size, _)| HostStatus {
+                block_size,
+                ..Default::default()
+            }),
             ..Default::default()
         }));
-        let partition = self.partition(model_id, pool, source.block_size);
-        let holder = partition.hold(status.clone()).map(Arc::new);
-        match &holder {
-            Some(_) => status.lock().indexed_blocks = Some(0),
-            None => warn!(
-                worker,
-                model_id,
-                pool,
-                "Not indexing the rank's KV events: the 64 lanes of its model and pool are taken"
-            ),
-        }
-        let task = self
-            .threads
-            .spawn(follow(source, dp_rank, status.clone(), holder.clone()));
+        let partition = self.partition(model_id, pool, Tier::Device, source.block_size);
+        let holder = self.hold(&partition, &status, Tier::Device, worker);
+        let host = host.and_then(|(chunk, min_load)| {
+            let partition = self.partition(model_id, pool, Tier::Host, chunk);
+            Some((
+                self.hold(&partition, &status, Tier::Host, worker)?,
+                min_load,
+            ))
+        });
+        let task = self.threads.spawn(follow(
+            source,
+            dp_rank,
+            status.clone(),
+            holder.clone(),
+            host.as_ref().map(|(holder, _)| holder.clone()),
+        ));
         let subscription = Subscription {
             status,
             partition,
             holder,
+            host,
             task,
         };
         self.subscriptions.insert(worker.into(), subscription);
@@ -222,11 +255,40 @@ impl KvEventMonitor {
         let _ = self.stores.set(stores);
     }
 
-    fn partition(&self, model_id: &str, pool: &'static str, block_size: u32) -> Arc<Partition> {
+    fn partition(
+        &self,
+        model_id: &str,
+        pool: &'static str,
+        tier: Tier,
+        block_size: u32,
+    ) -> Arc<Partition> {
         self.partitions
-            .entry((model_id.into(), pool, block_size))
+            .entry((model_id.into(), pool, tier, block_size))
             .or_insert_with(|| Partition::start(block_size, PREDICTION_TTL, &self.threads))
             .clone()
+    }
+
+    /// A lane in `partition` for `worker`'s `tier`, its indexed blocks then counted from 0.
+    fn hold(
+        &self,
+        partition: &Arc<Partition>,
+        status: &Arc<Mutex<SourceStatus>>,
+        tier: Tier,
+        worker: &str,
+    ) -> Option<Arc<Holder>> {
+        let holder = partition.hold(status.clone(), tier).map(Arc::new);
+        let mut status = status.lock();
+        match (&holder, tier) {
+            (Some(_), Tier::Device) => status.indexed_blocks = Some(0),
+            (Some(_), Tier::Host) => status.host.get_or_insert_default().indexed_blocks = Some(0),
+            (None, _) => warn!(
+                worker,
+                model_id = %status.model_id,
+                ?tier,
+                "Not indexing the rank's KV events of the tier: the 64 lanes of its partition are taken"
+            ),
+        }
+        holder
     }
 
     pub fn sources(&self) -> Vec<SourceStatus> {
@@ -282,7 +344,7 @@ impl PrefixMatchProvider for KvEventMonitor {
         }
         let partition = subscribed.unwrap_or_else(|| {
             let pool = worker.worker_type().as_metric_label();
-            self.partition(worker.model_id(), pool, PREDICTED_BLOCK_SIZE)
+            self.partition(worker.model_id(), pool, Tier::Device, PREDICTED_BLOCK_SIZE)
         });
         // Under the entry's lock, so that concurrent routings make one predictor, and a
         // worker detached since makes none.
@@ -298,13 +360,42 @@ impl PrefixMatchProvider for KvEventMonitor {
     }
 
     async fn cached_tokens(&self, worker: &dyn Worker, tokens: &[u32], device: u32) -> Option<u32> {
-        match self.stores.get() {
-            // A decode worker takes the prompt's KV from its prefill worker.
-            Some(stores) if !matches!(worker.worker_type(), WorkerType::Decode) => {
-                stores.cached_tokens(worker.url(), tokens, device).await
-            }
-            _ => Some(device),
+        // A decode worker takes the prompt's KV from its prefill worker.
+        if matches!(worker.worker_type(), WorkerType::Decode) {
+            return Some(device);
         }
+        let host = self.subscriptions.get(worker.url()).and_then(|s| s.host());
+        if let Some((lane, chunk, min_load)) = host {
+            let held = match_lanes(tokens, &[Some(lane)], &[])[0].unwrap_or(0);
+            let prompt = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
+            return Some(host_cached_tokens(device, held, prompt, chunk, min_load));
+        }
+        match self.stores.get() {
+            Some(stores) => stores.cached_tokens(worker.url(), tokens, device).await,
+            None => Some(device),
+        }
+    }
+}
+
+/// The host tier's chunk and the fewest tokens the engine loads from it, when `offload`
+/// is an in-process LMCache whose chunks the router can hash.
+fn lmcache_tier(offload: &OffloadReport) -> Option<(u32, u32)> {
+    let chunk = offload.chunk_tokens;
+    (offload.backend == LMCACHE && (1..=65_536).contains(&chunk))
+        .then_some((chunk, offload.min_load_tokens))
+}
+
+/// What ATOM's in-process LMCache scheduler reports cached for a prompt of `prompt`
+/// tokens, `device` of them on the device and `held` in chunks of `chunk` on the host: the
+/// loadable hit when a load from the chunk boundary at or above `device` moves some and
+/// at least `min_load` tokens, the tokens in between recomputed; else `device`.
+fn host_cached_tokens(device: u32, held: u32, prompt: u32, chunk: u32, min_load: u32) -> u32 {
+    let hit = loadable_hit(held, prompt, chunk);
+    let moved = hit.saturating_sub(device.div_ceil(chunk).saturating_mul(chunk));
+    if moved > 0 && moved >= min_load {
+        hit
+    } else {
+        device
     }
 }
 
@@ -336,6 +427,7 @@ async fn follow(
     dp_rank: u32,
     status: Arc<Mutex<SourceStatus>>,
     holder: Option<Arc<Holder>>,
+    host: Option<Arc<Holder>>,
 ) {
     let mut options = SocketOptions::default();
     options.no_connect_timeout();
@@ -358,6 +450,7 @@ async fn follow(
         status,
         admission: RankState::default(),
         holder,
+        host,
     };
     let mut recv_failed = false;
     loop {
@@ -404,6 +497,7 @@ struct Rank {
     status: Arc<Mutex<SourceStatus>>,
     admission: RankState,
     holder: Option<Arc<Holder>>,
+    host: Option<Arc<Holder>>,
 }
 
 impl Rank {
@@ -430,7 +524,8 @@ impl Rank {
 
     /// The batch in `[topic, seq, payload]`, or None, counted, if there is none.
     fn decode(&self, frames: &[Bytes]) -> Option<Batch> {
-        match batch(frames, self.block_size, self.dp_rank) {
+        let host_block_size = self.host.as_ref().map(|host| host.block_size());
+        match batch(frames, self.block_size, host_block_size, self.dp_rank) {
             Ok(batch) => Some(batch),
             Err(e) => {
                 let mut status = self.status.lock();
@@ -463,6 +558,10 @@ impl Rank {
         );
         if let Some(holder) = &self.holder {
             holder.write(reset, batch.events).await;
+        }
+        match &self.host {
+            Some(host) if reset || !batch.host.is_empty() => host.write(reset, batch.host).await,
+            _ => {}
         }
         None
     }
@@ -583,7 +682,12 @@ impl Rank {
 }
 
 /// A message's seq and batch: `[topic, seq as 8 big-endian bytes, payload]`.
-fn batch(frames: &[Bytes], block_size: u32, dp_rank: u32) -> Result<Batch, String> {
+fn batch(
+    frames: &[Bytes],
+    block_size: u32,
+    host_block_size: Option<u32>,
+    dp_rank: u32,
+) -> Result<Batch, String> {
     let [_topic, seq, payload] = frames else {
         return Err(format!(
             "{} frames, not [topic, seq, payload]",
@@ -591,7 +695,7 @@ fn batch(frames: &[Bytes], block_size: u32, dp_rank: u32) -> Result<Batch, Strin
         ));
     };
     let seq = seq.as_ref().try_into().map_err(|_| "seq is not 8 bytes")?;
-    let batch = wire::decode(payload, block_size).map_err(|e| e.to_string())?;
+    let batch = wire::decode(payload, block_size, host_block_size).map_err(|e| e.to_string())?;
     match batch.dp_rank {
         Some(rank) if rank != dp_rank => Err(format!("a batch of DP rank {rank}")),
         _ => Ok((u64::from_be_bytes(seq), batch)),
@@ -614,6 +718,15 @@ fn record(status: &mut SourceStatus, trust: Trust, seq: u64, batch: &DecodedBatc
             KvEvent::Stored { blocks, .. } => status.stored_blocks += blocks.len() as u64,
             KvEvent::Removed { hashes } => status.removed_blocks += hashes.len() as u64,
             KvEvent::Cleared => status.clears += 1,
+        }
+    }
+    if let Some(host) = &mut status.host {
+        for event in &batch.host {
+            match event {
+                KvEvent::Stored { blocks, .. } => host.stored_blocks += blocks.len() as u64,
+                KvEvent::Removed { hashes } => host.removed_blocks += hashes.len() as u64,
+                KvEvent::Cleared => {}
+            }
         }
     }
     for &reason in &batch.dropped {
@@ -792,11 +905,12 @@ mod tests {
             status: Arc::new(Mutex::new(status)),
             admission: RankState::default(),
             holder: None,
+            host: None,
         }
     }
 
     fn decoded(seq: u64, payload: &Bytes) -> Batch {
-        batch(&[Bytes::new(), seq_frame(seq), payload.clone()], 4, 1).unwrap()
+        batch(&[Bytes::new(), seq_frame(seq), payload.clone()], 4, None, 1).unwrap()
     }
 
     #[tokio::test]
@@ -1084,11 +1198,88 @@ mod tests {
         let seq = Bytes::copy_from_slice(&7u64.to_be_bytes());
         let frames = |frames: &[&Bytes]| frames.iter().map(|&f| f.clone()).collect::<Vec<_>>();
         let topic = Bytes::new();
-        let (seq_no, decoded) = batch(&frames(&[&topic, &seq, &payload]), 4, 1).unwrap();
+        let (seq_no, decoded) = batch(&frames(&[&topic, &seq, &payload]), 4, None, 1).unwrap();
         assert_eq!((seq_no, decoded.events), (7, vec![KvEvent::Cleared]));
-        assert!(batch(&frames(&[&topic, &seq, &payload]), 4, 2).is_err());
-        assert!(batch(&frames(&[&seq, &payload]), 4, 1).is_err());
-        assert!(batch(&frames(&[&topic, &payload, &payload]), 4, 1).is_err());
-        assert!(batch(&frames(&[&topic, &seq, &seq]), 4, 1).is_err());
+        assert!(batch(&frames(&[&topic, &seq, &payload]), 4, None, 2).is_err());
+        assert!(batch(&frames(&[&seq, &payload]), 4, None, 1).is_err());
+        assert!(batch(&frames(&[&topic, &payload, &payload]), 4, None, 1).is_err());
+        assert!(batch(&frames(&[&topic, &seq, &seq]), 4, None, 1).is_err());
+    }
+
+    #[test]
+    fn the_host_tier_loads_by_atoms_lmcache_rule() {
+        // A prompt of 20000 tokens in chunks of 256 with 3000 on the device, loading no
+        // fewer than 8192: the load starts at 3072, the tokens before it recomputed.
+        assert_eq!(host_cached_tokens(3000, 16_384, 20_000, 256, 8192), 16_384);
+        assert_eq!(host_cached_tokens(3000, 11_264, 20_000, 256, 8192), 11_264);
+        // A Mooncake Store would load this one from 2816.
+        assert_eq!(host_cached_tokens(3000, 11_008, 20_000, 256, 8192), 3000);
+        // Nothing past the device's chunk boundary; a hit of the whole prompt leaves its
+        // last chunk.
+        assert_eq!(host_cached_tokens(300, 512, 1000, 256, 0), 300);
+        assert_eq!(host_cached_tokens(0, 512, 512, 256, 0), 256);
+        let report = |backend: &str, chunk_tokens| OffloadReport {
+            backend: backend.into(),
+            chunk_tokens,
+            min_load_tokens: 512,
+            ..Default::default()
+        };
+        assert_eq!(lmcache_tier(&report(LMCACHE, 256)), Some((256, 512)));
+        assert_eq!(lmcache_tier(&report(LMCACHE, 0)), None);
+        assert_eq!(lmcache_tier(&report("mooncake_store", 256)), None);
+    }
+
+    /// A rank whose engine offloads to an in-process LMCache: its stream's host chunks are
+    /// indexed apart from its device blocks, and its estimate counts what the engine loads
+    /// of them. A clear without a medium clears both.
+    #[tokio::test]
+    async fn the_host_tier_counts_what_the_engine_loads_of_it() {
+        let endpoint = free_endpoint();
+        let monitor = KvEventMonitor::start().unwrap();
+        let offload = OffloadReport {
+            backend: LMCACHE.into(),
+            chunk_tokens: 8,
+            min_load_tokens: 8,
+            ..Default::default()
+        };
+        let source = KvEventSource {
+            endpoint: endpoint.clone(),
+            topic: "kv".into(),
+            block_size: 4,
+            offload: Some(offload),
+            ..Default::default()
+        };
+        monitor.attach(WORKER, "model", "regular", 1, source);
+        let mut publisher = bind(&endpoint).await;
+        clear_until(&mut publisher, &monitor, |s| s.batches > 0).await;
+        let tokens: Vec<String> = (1..=24).map(|token| token.to_string()).collect();
+        let stored = format!(
+            r#"[{{"type": "BlockStored", "block_hashes": [11], "token_ids": [1, 2, 3, 4], "block_size": 4, "medium": "GPU"}},
+            {{"type": "BlockStored", "block_hashes": [21, 22, 23], "token_ids": [{}], "block_size": 8, "medium": "CPU"}}]"#,
+            tokens.join(", ")
+        );
+        publish(&mut publisher, "kv", 1, &stored, 1).await;
+        // Each tier's writer applies its batches.
+        let applied = |device, host| {
+            move |s: &SourceStatus| {
+                (s.indexed_blocks, s.host.as_ref().unwrap().indexed_blocks)
+                    == (Some(device), Some(host))
+            }
+        };
+        let status = status_once(&monitor, applied(1, 3)).await;
+        assert_eq!(status.host.unwrap().stored_blocks, 3);
+        let worker = BasicWorkerBuilder::new(WORKER).build();
+        let prompt: Vec<u32> = (1..=40).collect();
+        // From 8, the load moves 16; from 24, nothing.
+        assert_eq!(monitor.cached_tokens(&worker, &prompt, 4).await, Some(24));
+        assert_eq!(monitor.cached_tokens(&worker, &prompt, 20).await, Some(20));
+
+        let removed = r#"[{"type": "BlockRemoved", "block_hashes": [22], "medium": "CPU"}]"#;
+        publish(&mut publisher, "kv", 2, removed, 1).await;
+        status_once(&monitor, applied(1, 2)).await;
+        assert_eq!(monitor.cached_tokens(&worker, &prompt, 0).await, Some(8));
+        publish(&mut publisher, "kv", 3, CLEAR, 1).await;
+        status_once(&monitor, applied(0, 0)).await;
+        assert_eq!(monitor.cached_tokens(&worker, &prompt, 4).await, Some(4));
     }
 }

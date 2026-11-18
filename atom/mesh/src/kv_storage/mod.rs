@@ -12,4 +12,5 @@ mod lookup;
 pub(crate) mod mooncake;
 pub mod sources;
 
+pub(crate) use lookup::loadable_hit;
 pub use sources::{OffloadReport, StorageSources};

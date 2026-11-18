@@ -10,6 +10,7 @@ puts on the wire; with ATOM_UPDATE_MESH_SAMPLES=1 it rewrites the file instead.
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from pathlib import Path
@@ -21,6 +22,7 @@ import numpy as np
 import zmq
 
 from atom.distributed import kv_events
+from atom.kv_transfer.offload.tier_events import TierEvents
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.prefix_hash import block_hash
 from atom.model_engine.sequence import Sequence
@@ -46,6 +48,11 @@ NOTES = {
     " [[seed, 0]], seed being the seq's cache_seed in 16 hex digits ({seed}). The"
     " seed also roots the hash chain, so this root event's parent_block_hash is"
     " the cache_seed itself, not a block hash.",
+    "offload_cpu": "The in-process LMCache CPU tier in chunks of 8 tokens, two hash"
+    " blocks: every rank stored a prompt of 16, so one BlockStored of two chunks,"
+    " medium CPU, block_size 8, each chunk's hash the prefix hash of its last hash"
+    " block; then a lookup that stops at 8 retracts the second chunk, a"
+    " BlockRemoved of medium CPU.",
     "dp_rank_2": "Batch from data-parallel rank 2 (seq 1, after that publisher's"
     " startup clear); ATOM fills data_parallel_rank on every batch, 0 in the other"
     " samples.",
@@ -134,16 +141,22 @@ def _published() -> tuple[dict[str, bytes], str]:
         mm = seq(list(range(600, 608)), multimodal_data=media)
         admit(BlockManager(config), mm, pub)
 
+        bm = BlockManager(config)
+        tier, offloaded = TierEvents.for_tier(bm, 8), seq(list(range(700, 716)))
+        tier.stored(offloaded, 0, 16)
+        tier.looked_up(offloaded, 16, 8, math.inf)
+        pub.publish(bm.take_events())
+
         pub_dp = publisher("inproc://mesh-samples-dp", 2)
         admit(BlockManager(config), seq(list(range(100, 108))), pub_dp)
 
     try:
-        published = _replay(pub, "inproc://mesh-samples", 0, 6)
+        published = _replay(pub, "inproc://mesh-samples", 0, 7)
         published_dp = _replay(pub_dp, "inproc://mesh-samples-dp", 2, 2)
     finally:
         pub.shutdown()
         pub_dp.shutdown()
-    payloads = dict(zip(list(NOTES)[:6], published))
+    payloads = dict(zip(list(NOTES)[:7], published))
     payloads["dp_rank_2"] = published_dp[1]
     return payloads, format(mm.cache_seed & (2**64 - 1), "016x")
 

@@ -11,7 +11,8 @@ const SAMPLES: &str = include_str!(concat!(
     "/tests/fixtures/kv_events/samples.jsonl"
 ));
 
-/// Each sample decoded for a source with blocks of 4 tokens: its rank, then its events.
+/// Each sample decoded for a source with blocks of 4 tokens, and host chunks of 8 when it
+/// has `CPU` events: its rank, then its events.
 const EXPECTED: &str = r#"
 startup_clear         | rank 0: cleared
 stored_root           | rank 0: stored 2
@@ -19,18 +20,21 @@ stored_child          | rank 0: stored 1 child
 removed               | rank 0: removed 1; removed 1; removed 1
 remote_kv_gpu         | rank 0: stored 2 child
 multimodal_extra_keys | rank 0: drop namespace
+offload_cpu           | rank 0: host stored 2; host removed 1
 dp_rank_2             | rank 2: stored 2
 "#;
 
 fn render(batch: &DecodedBatch) -> String {
-    let events = batch.events.iter().map(|event| match event {
+    let render = |tier: &str, event: &KvEvent| match event {
         KvEvent::Stored { parent, blocks } => {
             let child = if parent.is_some() { " child" } else { "" };
-            format!("stored {}{child}", blocks.len())
+            format!("{tier}stored {}{child}", blocks.len())
         }
-        KvEvent::Removed { hashes } => format!("removed {}", hashes.len()),
-        KvEvent::Cleared => "cleared".into(),
-    });
+        KvEvent::Removed { hashes } => format!("{tier}removed {}", hashes.len()),
+        KvEvent::Cleared => format!("{tier}cleared"),
+    };
+    let events = (batch.events.iter().map(|event| render("", event)))
+        .chain(batch.host.iter().map(|event| render("host ", event)));
     let dropped = batch
         .dropped
         .iter()
@@ -61,7 +65,7 @@ fn decoded_keys(batch: &DecodedBatch) -> Keys {
         KvEvent::Removed { hashes } => (hashes.iter().map(|hash| hash.0).collect(), None, vec![]),
         KvEvent::Cleared => Default::default(),
     };
-    batch.events.iter().map(keys).collect()
+    batch.events.iter().chain(&batch.host).map(keys).collect()
 }
 
 /// The same, from the sample's events written as JSON.
@@ -100,7 +104,10 @@ fn atom_samples_decode_as_specified() {
     assert_eq!(expected.len(), samples.len(), "unchecked samples");
     for (name, want) in expected {
         let sample = &samples[name.trim()];
-        let batch = decode(&unhex(sample["payload"].as_str().unwrap()), 4).unwrap();
+        let events = sample["events"].as_array().unwrap();
+        let host = events.iter().any(|event| event["medium"] == "CPU");
+        let payload = unhex(sample["payload"].as_str().unwrap());
+        let batch = decode(&payload, 4, host.then_some(8)).unwrap();
         assert_eq!(render(&batch), want.trim(), "{name}");
         if batch.dropped.is_empty() {
             assert_eq!(
@@ -121,7 +128,7 @@ pub(crate) fn encode(batch: &str) -> Vec<u8> {
 }
 
 fn decode_json(batch: &str, block_size: u32) -> Result<DecodedBatch, DecodeError> {
-    decode(&encode(batch), block_size)
+    decode(&encode(batch), block_size, None)
 }
 
 #[test]
@@ -174,8 +181,38 @@ fn only_the_device_tier_of_the_full_attention_group_is_followed() {
 }
 
 #[test]
+fn a_reported_host_tier_is_followed_in_chunks() {
+    let event = |kind: &str, fields: &str| format!(r#"{{"type": "{kind}"{fields}}}"#);
+    let stored = |medium: &str, size: u32| {
+        let tokens: Vec<String> = (1..=size).map(|token| token.to_string()).collect();
+        let fields = format!(
+            r#", "block_hashes": [1], "token_ids": [{}], "block_size": {size}, "medium": "{medium}""#,
+            tokens.join(", ")
+        );
+        event("BlockStored", &fields)
+    };
+    let removed = event("BlockRemoved", r#", "block_hashes": [1], "medium": "CPU""#);
+    let clear = |medium: &str| event("AllBlocksCleared", medium);
+    for (events, want) in [
+        (stored("CPU", 8), "host stored 1"),
+        (stored("CPU", 4), "drop blocksize"),
+        (stored("GPU", 4), "stored 1"),
+        (removed.clone(), "host removed 1"),
+        (clear(""), "cleared; host cleared"),
+        (clear(r#", "medium": "CPU""#), "host cleared"),
+        (clear(r#", "medium": "GPU""#), "cleared"),
+        (event("BlockStored", r#", "medium": "DISK""#), "drop tier"),
+    ] {
+        let batch = decode(&encode(&format!("[1.0, [{events}], 0]")), 4, Some(8)).unwrap();
+        assert_eq!(render(&batch), format!("rank 0: {want}"), "{events}");
+    }
+    let unfollowed = decode_json(&format!("[1.0, [{removed}], 0]"), 4).unwrap();
+    assert_eq!(render(&unfollowed), "rank 0: drop tier");
+}
+
+#[test]
 fn malformed_input_fails_the_batch_or_drops_the_event() {
-    assert!(decode(&[0xc1], 4).is_err());
+    assert!(decode(&[0xc1], 4, None).is_err());
     for batch in ["1", "[1.0]", r#"{"ts": 1.0}"#, "[1.0, [], -1]"] {
         assert!(decode_json(batch, 4).is_err(), "{batch}");
     }
@@ -225,7 +262,7 @@ fn bench_decode() {
         let mut samples: Vec<_> = (0..2000)
             .map(|_| {
                 let started = std::time::Instant::now();
-                assert_eq!(decode(&payload, 16).unwrap().events.len(), events);
+                assert_eq!(decode(&payload, 16, None).unwrap().events.len(), events);
                 started.elapsed()
             })
             .collect();

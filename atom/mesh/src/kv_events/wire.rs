@@ -1,19 +1,23 @@
 //! ATOM's KV event payloads (ROCm/ATOM#3275), encoded as vLLM encodes its own: a batch
 //! is the msgpack array `[ts, events, data_parallel_rank]`, each event a map tagged by
-//! `type`, and fields not read here are ignored. Only the device tier of the
-//! full-attention group 0 is followed. Any other event shape, such as the arrays ATOM
-//! sent before #3275, is dropped as `Decode`.
+//! `type`, and fields not read here are ignored. Only the full-attention group 0 is
+//! followed: on the device, and on the host when the source reports an in-process
+//! LMCache, whose chunks ATOM stores and removes as blocks of medium `CPU`. Any other
+//! event shape, such as the arrays ATOM sent before #3275, is dropped as `Decode`.
 
 use rmpv::Value;
 
-use super::model::{DropReason, EngineHash, KvEvent, StoredBlock};
+use super::model::{DropReason, EngineHash, KvEvent, StoredBlock, Tier};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecodedBatch {
     pub ts: f64,
     pub dp_rank: Option<u32>,
+    /// The device's events.
     pub events: Vec<KvEvent>,
-    /// Why each event missing from `events` was left out.
+    /// The host's events, when it is followed.
+    pub host: Vec<KvEvent>,
+    /// Why each event missing from both was left out.
     pub dropped: Vec<DropReason>,
 }
 
@@ -22,8 +26,13 @@ pub struct DecodedBatch {
 #[error("malformed KV event batch: {0}")]
 pub struct DecodeError(String);
 
-/// Decodes a payload from a source whose blocks hold `block_size` tokens, at least 1.
-pub fn decode(payload: &[u8], block_size: u32) -> Result<DecodedBatch, DecodeError> {
+/// Decodes a payload from a source whose blocks hold `block_size` tokens, at least 1, and
+/// whose host chunks, if followed, `host_block_size`.
+pub fn decode(
+    payload: &[u8],
+    block_size: u32,
+    host_block_size: Option<u32>,
+) -> Result<DecodedBatch, DecodeError> {
     let malformed = |what: &str| DecodeError(what.into());
     let batch = rmpv::decode::read_value(&mut &*payload).map_err(|e| DecodeError(e.to_string()))?;
     let Value::Array(items) = batch else {
@@ -46,38 +55,58 @@ pub fn decode(payload: &[u8], block_size: u32) -> Result<DecodedBatch, DecodeErr
         ts,
         dp_rank,
         events: Vec::with_capacity(events.len()),
+        host: Vec::new(),
         dropped: Vec::new(),
     };
     for event in events {
-        match decode_event(event, block_size) {
-            Ok(event) => batch.events.push(event),
+        match decode_event(event, block_size, host_block_size) {
+            Ok((Some(Tier::Device), event)) => batch.events.push(event),
+            Ok((Some(Tier::Host), event)) => batch.host.push(event),
+            // A clear without a medium clears every tier.
+            Ok((None, event)) => {
+                if host_block_size.is_some() {
+                    batch.host.push(event.clone());
+                }
+                batch.events.push(event);
+            }
             Err(reason) => batch.dropped.push(reason),
         }
     }
     Ok(batch)
 }
 
-fn decode_event(event: &Value, block_size: u32) -> Result<KvEvent, DropReason> {
+/// The event and its tier; no tier for a clear of every tier.
+fn decode_event(
+    event: &Value,
+    block_size: u32,
+    host_block_size: Option<u32>,
+) -> Result<(Option<Tier>, KvEvent), DropReason> {
     let Value::Map(fields) = event else {
         return Err(DropReason::Decode);
     };
     let fields = Fields(fields);
+    let tier = || tier(&fields, host_block_size.is_some());
     match fields.get("type").and_then(Value::as_str) {
-        Some("BlockStored") => stored(&fields, block_size),
-        Some("BlockRemoved") => {
-            on_device(&fields)?;
-            full_attention(&fields)?;
-            Ok(KvEvent::Removed {
-                hashes: hashes(&fields)?,
-            })
+        Some("BlockStored") => {
+            let tier = tier()?.unwrap_or(Tier::Device);
+            let size = match tier {
+                Tier::Device => block_size,
+                Tier::Host => host_block_size.ok_or(DropReason::Tier)?,
+            };
+            Ok((Some(tier), stored(&fields, size)?))
         }
-        Some("AllBlocksCleared") => on_device(&fields).map(|()| KvEvent::Cleared),
+        Some("BlockRemoved") => {
+            let tier = tier()?.unwrap_or(Tier::Device);
+            full_attention(&fields)?;
+            let hashes = hashes(&fields)?;
+            Ok((Some(tier), KvEvent::Removed { hashes }))
+        }
+        Some("AllBlocksCleared") => Ok((tier()?, KvEvent::Cleared)),
         _ => Err(DropReason::Decode),
     }
 }
 
 fn stored(fields: &Fields, block_size: u32) -> Result<KvEvent, DropReason> {
-    on_device(fields)?;
     full_attention(fields)?;
     // ATOM marks every block of a multimodal prompt with the request's media seed.
     let marked = match fields.get("extra_keys") {
@@ -118,10 +147,13 @@ fn stored(fields: &Fields, block_size: u32) -> Result<KvEvent, DropReason> {
     Ok(KvEvent::Stored { parent, blocks })
 }
 
-/// The device tier is `GPU`, or no medium at all.
-fn on_device(fields: &Fields) -> Result<(), DropReason> {
+/// The tier the event's medium names: the device's `GPU`, or the host's `CPU` when the
+/// host is followed; none without a medium.
+fn tier(fields: &Fields, host: bool) -> Result<Option<Tier>, DropReason> {
     match fields.get("medium").map(Value::as_str) {
-        None | Some(Some("GPU")) => Ok(()),
+        None => Ok(None),
+        Some(Some("GPU")) => Ok(Some(Tier::Device)),
+        Some(Some("CPU")) if host => Ok(Some(Tier::Host)),
         Some(Some(_)) => Err(DropReason::Tier),
         Some(None) => Err(DropReason::Decode),
     }

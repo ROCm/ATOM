@@ -524,16 +524,19 @@ impl MeshMetrics {
         }
     }
 
-    /// Reconcile the router's cached-token estimate with the engine's report.
+    /// Reconcile the router's cached-token estimate, and the part of it loaded from the
+    /// offload tier, with the engine's report.
     pub fn record_route_cache_estimate(
         pool: &'static str,
         prompt: u64,
         estimated: u64,
+        estimated_offload: u64,
         actual: u64,
     ) {
         for (kind, count) in [
             (metrics_labels::CACHE_PROMPT, prompt),
             (metrics_labels::CACHE_ESTIMATED, estimated),
+            (metrics_labels::CACHE_ESTIMATED_OFFLOAD, estimated_offload),
             (metrics_labels::CACHE_ACTUAL, actual),
         ] {
             counter!(names::ROUTE_CACHE_ESTIMATE_TOKENS_TOTAL, "pool" => pool, "kind" => kind)

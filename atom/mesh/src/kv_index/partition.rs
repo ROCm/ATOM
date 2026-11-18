@@ -1,4 +1,4 @@
-//! A partition of the index: the ranks of one model, pool and block size, each on a lane,
+//! A partition of the index: the ranks of one model, pool, tier and block size, each on a lane,
 //! and the writer thread that alone applies their admitted batches, in order. The prompts
 //! routed to each worker are predictions on lanes of a second index, kept apart from the
 //! events. A predicted block matches until the first sweep after a TTL from its last
@@ -26,7 +26,10 @@ use super::{
     index::{find_matches, HolderTable, Op, PrefixIndex},
     HolderId, PrefixHash,
 };
-use crate::kv_events::{model::KvEvent, SourceStatus};
+use crate::kv_events::{
+    model::{KvEvent, Tier},
+    SourceStatus,
+};
 
 /// Admitted batches a partition's writer may fall behind by before its ranks wait.
 const QUEUED_BATCHES: usize = 1024;
@@ -58,9 +61,10 @@ pub(crate) struct Partition {
 }
 
 enum Write {
-    /// A rank's admitted batch; `reset` clears what the rank held first.
+    /// A rank's admitted batch of one tier; `reset` clears what the rank held first.
     Batch {
         holder: HolderId,
+        tier: Tier,
         reset: bool,
         events: Vec<KvEvent>,
         status: Arc<Mutex<SourceStatus>>,
@@ -107,12 +111,18 @@ impl Partition {
         partition
     }
 
-    /// A lane for a rank whose batches `status` counts; None once all 64 are taken.
-    pub(crate) fn hold(self: &Arc<Self>, status: Arc<Mutex<SourceStatus>>) -> Option<Holder> {
+    /// A lane for a rank's `tier`, whose batches `status` counts; None once all 64 are
+    /// taken.
+    pub(crate) fn hold(
+        self: &Arc<Self>,
+        status: Arc<Mutex<SourceStatus>>,
+        tier: Tier,
+    ) -> Option<Holder> {
         take(&self.lanes).map(|id| Holder {
             id,
             partition: self.clone(),
             status,
+            tier,
         })
     }
 
@@ -141,11 +151,12 @@ fn take(lanes: &Mutex<u64>) -> Option<HolderId> {
     })
 }
 
-/// A rank's lane, held while the rank is followed.
+/// A rank's lane for one tier, held while the rank is followed.
 pub(crate) struct Holder {
     id: HolderId,
     partition: Arc<Partition>,
     status: Arc<Mutex<SourceStatus>>,
+    tier: Tier,
 }
 
 impl Holder {
@@ -153,10 +164,15 @@ impl Holder {
         (self.partition.clone(), self.id)
     }
 
+    pub(crate) fn block_size(&self) -> u32 {
+        self.partition.block_size
+    }
+
     /// Queues an admitted batch, waiting while the writer is behind.
     pub(crate) async fn write(&self, reset: bool, events: Vec<KvEvent>) {
         let batch = Write::Batch {
             holder: self.id,
+            tier: self.tier,
             reset,
             events,
             status: self.status.clone(),
@@ -286,6 +302,7 @@ async fn write(
         match write {
             Write::Batch {
                 holder,
+                tier,
                 reset,
                 events,
                 status,
@@ -300,7 +317,11 @@ async fn write(
                     .collect();
                 partition.index.apply(holder, &mut ops);
                 let mut status = status.lock();
-                status.indexed_blocks = Some(table.len() as u64);
+                let indexed = Some(table.len() as u64);
+                match tier {
+                    Tier::Device => status.indexed_blocks = indexed,
+                    Tier::Host => status.host.get_or_insert_default().indexed_blocks = indexed,
+                }
                 for reason in dropped {
                     *status.dropped_events.entry(reason).or_default() += 1;
                 }

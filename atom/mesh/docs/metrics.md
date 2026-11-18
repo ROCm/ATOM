@@ -69,7 +69,7 @@ skipped after a failed prefill adds none.
 | `mesh_session_worker_change_total` | Counter, requests | `pool`, `reason`: `rebind`, `expired`, `rank_mapping` | A `dp_sticky` session request is sent to a different worker (URL and DP rank) than the session's previous request (see [below](#worker-changes)). |
 | `mesh_selected_dp_rank_total` | Counter, dispatches | `pool`, `worker` (base URL), `dp_rank` (rank or `none`) | HTTP routers send a request, after DP rank mapping (see [below](#dp-ranks)). |
 | `mesh_route_cache_tokens_total` | Counter, tokens | `pool` (`regular` or `prefill`), `kind`: `prompt`, `cached` | HTTP routers; the response reported cached tokens. Any policy (see [below](#router-estimate-and-engine-reported-cached-tokens)). |
-| `mesh_route_cache_estimate_tokens_total` | Counter, tokens | `pool`, `kind`: `prompt`, `estimated`, `actual` | The same, when the policy also estimated a hit on the worker the prompt ran on; today only `cache_aware`. |
+| `mesh_route_cache_estimate_tokens_total` | Counter, tokens | `pool`, `kind`: `prompt`, `estimated`, `estimated_offload`, `actual` | The same, when the policy also estimated a hit on the worker the prompt ran on; today only `cache_aware`. |
 | `mesh_route_cache_estimate_error_ratio` | Histogram, ratio -1 to 1 | `pool` | Same requests: (estimated - actual) / prompt tokens. |
 | `mesh_kv_events_dropped_predictions_total` | Counter, prompts | `model`, `pool` | `--kv-events`: a prompt routed to a worker is left out of the KV index's predictions, as the writer of its partition is behind. The first drop in a partition also logs a warning. |
 | `mesh_prefix_hash_policy_branch_total` | Counter, decisions | `branch` | `prefix_hash`, the same branches without `pool`. Deprecated by [#3141] for `mesh_route_branch_total{policy="prefix_hash"}`. |
@@ -202,7 +202,12 @@ router drops the estimate when it sends the prompt to a different worker than
 the policy chose, such as another DP rank under
 `--atom-pd-rank-mapping-policy idx2idx`, because ranks keep separate KV caches.
 `kind="actual"` repeats the engine count for exactly those requests, so
-`estimated` and `actual` compare like for like.
+`estimated` and `actual` compare like for like. `kind="estimated_offload"` is
+the part of `estimated` the engine loads from its offload tier: a Mooncake
+Store it reads, or the host tier of its in-process LMCache, whose chunks its
+KV events carry. The rest is the device's part. The engine counts the two
+parts apart, as `atom:prefix_cache_cached_tokens` and
+`atom:prefix_cache_offload_tokens`, but reports their sum per request.
 
 On the tree's branches, the two differ because the ratio counts characters
 while the engine counts tokens in blocks, and the tree does not see engine
@@ -248,6 +253,13 @@ sum by (pool) (rate(mesh_route_cache_tokens_total{kind="cached"}[5m]))
 (sum by (pool) (rate(mesh_route_cache_estimate_tokens_total{kind="estimated"}[5m]))
   - sum by (pool) (rate(mesh_route_cache_estimate_tokens_total{kind="actual"}[5m])))
   / sum by (pool) (rate(mesh_route_cache_estimate_tokens_total{kind="prompt"}[5m]))
+```
+
+The share of the estimate loaded from the offload tier:
+
+```promql
+sum by (pool) (rate(mesh_route_cache_estimate_tokens_total{kind="estimated_offload"}[5m]))
+  / sum by (pool) (rate(mesh_route_cache_estimate_tokens_total{kind="estimated"}[5m]))
 ```
 
 Median prefix match ratio:

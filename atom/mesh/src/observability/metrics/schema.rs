@@ -207,6 +207,7 @@ pub mod labels {
     pub const CACHE_PROMPT: &str = "prompt";
     pub const CACHE_CACHED: &str = "cached";
     pub const CACHE_ESTIMATED: &str = "estimated";
+    pub const CACHE_ESTIMATED_OFFLOAD: &str = "estimated_offload";
     pub const CACHE_ACTUAL: &str = "actual";
 
     // Token types
@@ -515,7 +516,7 @@ pub const METRIC_INVENTORY: &[MetricSpec] = &[
     MetricSpec {
         name: names::ROUTE_CACHE_ESTIMATE_TOKENS_TOTAL,
         kind: MetricKind::Counter,
-        help: "Tokens of those requests that also have a router cache estimate by pool, kind (prompt/estimated/actual)",
+        help: "Tokens of those requests that also have a router cache estimate by pool, kind (prompt/estimated/estimated_offload/actual)",
         status: MetricStatus::Active,
     },
     MetricSpec {

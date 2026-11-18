@@ -194,7 +194,7 @@ fn held_chunks(states: &[KeyState]) -> Option<u32> {
 
 /// What ATOM's scheduler can load of a store's `hit` for a prompt of `prompt` tokens:
 /// a hit of the whole prompt leaves its last token to compute, and loads go by chunks.
-fn loadable_hit(hit: u32, prompt: u32, chunk: u32) -> u32 {
+pub(crate) fn loadable_hit(hit: u32, prompt: u32, chunk: u32) -> u32 {
     let hit = if hit == prompt {
         hit.saturating_sub(1)
     } else {
