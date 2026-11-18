@@ -212,10 +212,10 @@ def make_case(
             if query_override is None
             else query_override
         )
-        # The upstream row-group scorer's long-context ragged fast path
-        # mis-scores a partial final six-row group. Use its one-row path as
+        # The upstream row-group scorer's ragged fast path mis-scores a
+        # partial or padded final six-row group. Use its one-row path as
         # the reference for those tails (same pages, query and arithmetic).
-        scoring_qlen = qlen if rows % qlen == 0 else 1
+        scoring_qlen = qlen if rows % qlen == 0 and not pad else 1
         scoring_table = (
             table if scoring_qlen == qlen else table[batch.clamp_min(0).long()]
         )
@@ -282,16 +282,47 @@ def make_case(
         (13, 8192, 2, "mfma", False, False, 6),
         (40, 163840, 1, "preshuffle", True, False, 6),
         (64, 8192, 2, "mfma", False, False, 1),
+        (33, 8192, 1, "preshuffle", True, False, 1),
+        (48, 8192, 2, "mfma", False, False, 6),
+        (6, 8192, 1, "mfma", False, True, 6),
+        (48, 8192, 1, "mfma", False, True, 6),
+        (48, 163840, 2, "mfma", False, False, 6),
     ],
 )
 def test_standalone_mono_matches_native_and_graph(
-    rows, context, ratio, layout, candidate, reindex, qlen
+    rows, context, ratio, layout, candidate, reindex, qlen, mixed=False
 ):
     from atom.models.deepseek_v41.mono.runner import V41MonoDecodeRunner
 
     case = make_case(
         rows, context, ratio, layout, candidate=candidate, reindex=reindex, qlen=qlen
     )
+    if mixed:
+        lengths = torch.tensor(
+            [
+                1,
+                511,
+                512,
+                513,
+                8191,
+                8192,
+                8193,
+                16383,
+                16384,
+                16385,
+                32767,
+                65536,
+                81920,
+                4096,
+                32768,
+                1024,
+                0,
+            ],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        case.step.visible[ratio].copy_(lengths)
+        case.step.positions.copy_((lengths.long() * ratio - 1).clamp_min(0))
     r = case.runner
     assert r.prepare(rows)
     r.active = True
@@ -357,3 +388,13 @@ def test_standalone_mono_matches_native_and_graph(
     case.hidden.mul_(0.8)
     graph.replay()
     check()
+
+
+@pytest.mark.parametrize(
+    "ratio,layout,candidate", [(2, "mfma", False), (1, "preshuffle", True)]
+)
+def test_mono_indexer_mixed_selection_depths(ratio, layout, candidate):
+    """Small and large requests share dispatch while retaining separate trees."""
+    test_standalone_mono_matches_native_and_graph(
+        17, 163840, ratio, layout, candidate, False, 1, mixed=True
+    )

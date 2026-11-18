@@ -85,3 +85,60 @@ def test_fp8_and_opt_out_keep_the_embedded_indexer(monkeypatch):
     assert not indexer_enabled(False)
     monkeypatch.setenv("ATOM_DSV41_MONO_INDEXER", "0")
     assert not indexer_enabled(True)
+
+
+@pytest.mark.parametrize("tp,rows", [(2, 40), (2, 48)])
+def test_tp2_large_batch_keeps_native_layers_and_mono_indexer(monkeypatch, tp, rows):
+    from atom.models.deepseek_v41.mono import dispatch
+
+    raw, _, lazy, md = setup(monkeypatch)
+    monkeypatch.setenv("ATOM_DSV41_MONO_INDEXER", "1")
+    monkeypatch.setattr(dispatch, "step_supported", lambda *args: True)
+    layer = dispatch.MonoDecodeModel(raw, None, 8192, True, 0, tp)
+    layer._mono = SimpleNamespace(ready=Mock(), runner=SimpleNamespace(forward=Mock()))
+    cfg = SimpleNamespace(
+        max_model_len=8192, index_cache_dtype="fp4", index_cache_layout="mfma"
+    )
+    wrapped = module.MonoIndexerModel(layer, raw, cfg)
+    ids = torch.arange(rows)
+    assert torch.equal(wrapped(ids, ids), ids + 1)
+    assert raw.calls == [True]
+    layer._mono.ready.assert_not_called()
+    layer._mono.runner.forward.assert_not_called()
+    lazy.runner.begin_step.assert_called_once_with(rows, md.cache, md.step)
+    assert not lazy.runner.active
+
+
+@pytest.mark.parametrize(
+    "tp,rows,fp4,enabled",
+    [
+        (2, 8, True, "1"),
+        (4, 40, True, "1"),
+        (8, 40, True, "1"),
+        (2, 40, False, "1"),
+        (2, 40, True, "0"),
+    ],
+)
+def test_other_layer_routes_do_not_prepare_native_indexer(
+    monkeypatch, tp, rows, fp4, enabled
+):
+    from atom.models.deepseek_v41.mono import dispatch
+
+    raw, _, lazy, _ = setup(monkeypatch)
+    monkeypatch.setenv("ATOM_DSV41_MONO_INDEXER", enabled)
+    monkeypatch.setattr(dispatch, "step_supported", lambda *args: True)
+    layer = dispatch.MonoDecodeModel(raw, None, 8192, fp4, 0, tp)
+    layer_run = Mock(side_effect=lambda ids, positions: ids + 2)
+    layer._mono = SimpleNamespace(
+        ready=Mock(return_value=True), runner=SimpleNamespace(forward=layer_run)
+    )
+    cfg = SimpleNamespace(
+        max_model_len=8192, index_cache_dtype="fp4", index_cache_layout="mfma"
+    )
+    wrapped = module.MonoIndexerModel(layer, raw, cfg)
+    ids = torch.arange(rows)
+    assert torch.equal(wrapped(ids, ids), ids + 2)
+    assert raw.calls == []
+    layer_run.assert_called_once()
+    lazy.ready.assert_not_called()
+    lazy.runner.begin_step.assert_not_called()

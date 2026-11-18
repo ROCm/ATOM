@@ -37,9 +37,11 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int32, T
 
 from atom.models.deepseek_v41.mono import index_plan as ip
+from atom.models.deepseek_v41.mono.kernels import index_select_plan as isp
 from atom.models.deepseek_v41.mono.kernels.index_score_fp4 import run_scores4
 from atom.models.deepseek_v41.mono.kernels.token_par import own_rows
 from atom.models.deepseek_v41.mono.kernels.topk import key_bits, lds_topk
+from atom.models.deepseek_v41.mono.kernels.topk_fast import key_offset
 from atom.models.deepseek_v41.mono.step_meta import KMETA
 from atom.mono.device.ops import (
     CM_SYS,
@@ -225,46 +227,96 @@ def stage_iscore(c, lead, span, ch0, width, max_chunks):
 
 
 @traced
+def _wait_chunks(c, token, max_chunks, first, count, groups):
+    """A block-selection segment can depend on more than one flag per thread."""
+    if const_expr(groups == 1):
+        if c["tid"] < count:
+            c["poll"]([(c["isf"], token * max_chunks + first + c["tid"], 1)])
+    else:
+        for u in range(c["tid"], count, THREADS):
+            c["poll"]([(c["isf"], token * max_chunks + first + u, 1)])
+    gpu.barrier()
+
+
+@traced
 def stage_ilist(c, t, j, raw, kind, level, bound_max, max_chunks):
     """List j of ``level`` for token t (``raw`` its column bound); see the
     module. Only the lists ``index_plan.list_count`` gives a token run."""
     tid = c["tid"]
+    segment = c.get("select_seg", ip.SEG)
+    per_thread = segment // THREADS
     a = c["args"]
     k = ip.KINDS[kind]
-    slots = ip.list_slots(kind, level, bound_max)
+    slots = isp.list_slots(segment, kind, level, bound_max)
     bound = ip.kind_bound(kind, raw)
-    if j < ip.list_count(bound, level, k):
-        n = ip.list_inputs(bound, level, j, k)
-        final = ip.is_final(bound, level, k)
+    fast_hist = c.get("fast_select", False)
+    if fast_hist:
+        segment = isp.segment_for(segment, kind)
+        per_thread = segment // THREADS
+        slots = isp.list_slots(segment, kind, level, bound_max)
+    if fast_hist and level > 0:
+        max_inputs = isp.list_inputs(
+            segment, ip.kind_bound(kind, bound_max), level, 0, k
+        )
+        if max_inputs <= 2048:
+            per_thread = 4
+        elif max_inputs <= 8192:
+            per_thread = 16
+    compact_rows = c.get("compact_selected_rows", False)
+    list_ready = c.get("list_ready", False)
+    if j < isp.list_count(segment, bound, level, k):
+        n = isp.list_inputs(segment, bound, level, j, k)
+        final = isp.is_final(segment, bound, level, k)
         # the top level has one list, a token's last: it has no region above it
-        to_final = True if level == ip.top_level(kind, bound_max) else final
+        to_final = True if level == isp.top_level(segment, kind, bound_max) else final
         got = []
         if const_expr(level == 0):
             if const_expr(kind == "sel"):
-                first, count = ip.CHUNKS_PER_SEG * j, ip.seg_chunks(bound, j)
+                first, count = (segment // ip.CHUNK) * j, isp.seg_chunks(
+                    segment, bound, j
+                )
             else:
-                first, count = ip.block_chunks(raw, j)
-            if tid < count:
-                c["poll"]([(c["isf"], t * max_chunks + first + tid, 1)])
-            gpu.barrier()
-        else:
-            below = ip.list_slots(kind, level - 1, bound_max)
-            base = tid * PER_THREAD
-            got = c["poll"](
-                [
-                    (
-                        c[f"i{kind}{level - 1}"],
-                        (
-                            (t * below + j * ip.fan(k) + fx.min(base + d, n - 1) // k)
-                            * k
-                            + fx.min(base + d, n - 1) % k
-                        )
-                        * 2,
-                        2,
-                    )
-                    for d in range(PER_THREAD)
-                ]
+                first, count = isp.block_chunks(segment, raw, j)
+            flag_groups = -(
+                -(segment * (ip.BLOCK_ROWS if kind == "blk" else 1))
+                // (ip.CHUNK * THREADS)
             )
+            _wait_chunks(c, t, max_chunks, first, count, flag_groups)
+        else:
+            below = isp.list_slots(segment, kind, level - 1, bound_max)
+            base = tid * per_thread
+            if const_expr(list_ready):
+                if tid < ip.cdiv(n, k):
+                    c["poll"](
+                        [
+                            (
+                                c[f"i{kind}ready{level-1}"],
+                                t * below + j * isp.fan(segment, k) + tid,
+                                1,
+                            )
+                        ]
+                    )
+                gpu.barrier()
+            else:
+                got = c["poll"](
+                    [
+                        (
+                            c[f"i{kind}{level - 1}"],
+                            (
+                                (
+                                    t * below
+                                    + j * isp.fan(segment, k)
+                                    + fx.min(base + d, n - 1) // k
+                                )
+                                * k
+                                + fx.min(base + d, n - 1) % k
+                            )
+                            * 2,
+                            2,
+                        )
+                        for d in range(per_thread)
+                    ]
+                )
         src, stride = (
             (a["ilog"], a["lstride"]) if kind == "sel" else (a["ibmax"], a["bstride"])
         )
@@ -272,42 +324,153 @@ def stage_ilist(c, t, j, raw, kind, level, bound_max, max_chunks):
         def load(q, i):
             if const_expr(level == 0):
                 # a quad stays in the row: strides are whole chunks / blocks
-                v = fx.Vector(ld_dev(src, t * stride + j * ip.SEG + i, 4))
+                v = fx.Vector(ld_dev(src, t * stride + j * segment + i, 4))
                 return [fx.Int32(v[e]) for e in range(4)]
+            if const_expr(list_ready):
+                return [
+                    fx.Int32(
+                        ld_dev(
+                            c[f"i{kind}{level-1}"].value,
+                            ((t * below + j * isp.fan(segment, k)) * k + i + e) * 4,
+                        )
+                    )
+                    for e in range(4)
+                ]
             return [got[4 * q + e][0] for e in range(4)]
 
         keys = c["sel_lds"]["keys"]
-        first_i = tid * PER_THREAD
+        first_i = tid * per_thread
 
         def ident_of(d, i):
-            return j * ip.SEG + i if level == 0 else got[d][1]
+            if const_expr(level == 0):
+                return j * segment + i
+            if const_expr(list_ready):
+                return fx.Int32(
+                    ld_dev(
+                        c[f"i{kind}{level-1}"].value,
+                        ((t * below + j * isp.fan(segment, k)) * k + i) * 4 + 2,
+                    )
+                )
+            return got[d][1]
 
         # a selection's rows (``_selected_rows``), in flight during the passes
         def selected_rows():
             return [
                 _selected_rows(c, t, ident_of(d, fx.min(first_i + d, n - 1)))
-                for d in range(PER_THREAD)
+                for d in range(per_thread)
             ]
 
-        def emit(pos, d, i, rows):
+        def emit(pos, d, i, rows, value_bits=None):
+            ident = fx.Int32(-1)
             if const_expr(d is None):
                 ident, bits = fx.Int32(-1), fx.Float32(NEG).bitcast(fx.Int32)
-                picked = (fx.Int32(-1), fx.Int32(0))
             else:
-                ident = ident_of(d, i)
-                bits = key_bits(fx.ptr_load(keys + i))
-                picked = _picked_rows(c, kind, t, ident, rows, d)
-            if to_final:
-                _final(c, kind, t, pos, ident, picked)
-            else:
-                c["put_words"](
-                    c[f"i{kind}{level}"], ((t * slots + j) * k + pos) * 2, [bits, ident]
+                bits = (
+                    value_bits
+                    if value_bits is not None
+                    else key_bits(
+                        fx.ptr_load(keys + (key_offset(i) if fast_hist else i))
+                    )
                 )
+            if to_final:
+                if const_expr(compact_rows):
+                    fx.ptr_store(i, c["sel_lds"]["hist"] + pos)
+                else:
+                    if const_expr(d is None):
+                        picked = (fx.Int32(-1), fx.Int32(0))
+                    else:
+                        ident = ident_of(d, i)
+                        picked = _picked_rows(c, kind, t, ident, rows, d)
+                    _final(c, kind, t, pos, ident, picked)
+            else:
+                if const_expr(fast_hist and list_ready):
+                    fx.ptr_store(bits, c["sel_lds"]["hist"] + pos)
+                    fx.ptr_store(i, c["sel_lds"]["hist"] + k + pos)
+                else:
+                    if const_expr(d is not None):
+                        ident = ident_of(d, i)
+                    c["put_words"](
+                        c[f"i{kind}{level}"],
+                        ((t * slots + j) * k + pos) * 2,
+                        [bits, ident],
+                    )
 
-        lds_topk(
-            n, k, load, emit, c["sel_lds"], tid, PER_THREAD,
-            _prefetch_rows(c, kind, selected_rows),
-        )  # fmt: skip
+        if const_expr(fast_hist and per_thread >= 16):
+            medium = 8 if per_thread == 16 else 16
+            if n <= 2048:
+                lds_topk(
+                    n,
+                    k,
+                    load,
+                    emit,
+                    c["sel_lds"],
+                    tid,
+                    4,
+                    fast_hist=True,
+                    emit_key=True,
+                )
+            elif n <= medium * THREADS:
+                lds_topk(
+                    n,
+                    k,
+                    load,
+                    emit,
+                    c["sel_lds"],
+                    tid,
+                    medium,
+                    fast_hist=True,
+                    emit_key=True,
+                )
+            else:
+                lds_topk(
+                    n,
+                    k,
+                    load,
+                    emit,
+                    c["sel_lds"],
+                    tid,
+                    per_thread,
+                    fast_hist=True,
+                    emit_key=True,
+                )
+        else:
+            lds_topk(
+                n, k, load, emit, c["sel_lds"], tid, per_thread,
+                _prefetch_rows(c, kind, selected_rows),
+                fast_hist=fast_hist,
+                emit_key=fast_hist,
+            )  # fmt: skip
+        if const_expr(compact_rows):  # noqa: SIM102
+            if to_final:
+                for r in range_constexpr(-(-k // THREADS)):
+                    pos = tid + r * THREADS
+                    if pos < k:
+                        i = fx.ptr_load(c["sel_lds"]["hist"] + pos)
+                        ident = (i >= 0).select(
+                            ident_of(None, fx.max(i, 0)), fx.Int32(-1)
+                        )
+                        if const_expr(kind == "sel"):
+                            _final(c, kind, t, pos, ident, _selected_rows(c, t, ident))
+                        else:
+                            _final(c, kind, t, pos, ident)
+        has_list_output = list_ready and level < isp.top_level(segment, kind, bound_max)
+        if const_expr(has_list_output):  # noqa: SIM102
+            if ~final:
+                if const_expr(fast_hist):
+                    for r in range_constexpr(-(-k // THREADS)):
+                        pos = tid + r * THREADS
+                        if pos < k:
+                            bits = fx.ptr_load(c["sel_lds"]["hist"] + pos)
+                            i = fx.ptr_load(c["sel_lds"]["hist"] + k + pos)
+                            ident = (i >= 0).select(
+                                ident_of(None, fx.max(i, 0)), fx.Int32(-1)
+                            )
+                            c["put_words"](
+                                c[f"i{kind}{level}"],
+                                ((t * slots + j) * k + pos) * 2,
+                                [bits, ident],
+                            )
+                publish(c["put"], c[f"i{kind}ready{level}"], t * slots + j, 1, tid == 0)
         # a selection's flag for the attention; the candidate blocks' only in a
         # token-parallel launch, which waits for every rank's (``await_candidates``)
         region = "irdy" if kind == "sel" else "icrdy" if c["tok_par"] else None
@@ -357,7 +520,8 @@ def _selected_rows(c, t, ident):
     page = fx.Int32(
         bo.buffer_load(rsrc(a["table"]), toff + live // rpp, vec_width=1, dtype=T.i32)
     )
-    return row, page * a["page_rows"] + a["main_off"] + live % rpp
+    pool_row = page * a["page_rows"] + a["main_off"] + live % rpp
+    return row, (ident >= 0).select(pool_row, fx.Int32(0))
 
 
 def _final(c, kind, t, pos, ident, rows=None):

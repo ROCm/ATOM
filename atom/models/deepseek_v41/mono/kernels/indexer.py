@@ -17,6 +17,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int32, Int64, T
 
 from atom.models.deepseek_v41.mono import index_plan as ip
+from atom.models.deepseek_v41.mono.kernels import index_select_plan as isp
 from atom.models.deepseek_v41.mono.kernels.attn_pre import (
     HIDDEN,
     Q_RANK,
@@ -29,24 +30,35 @@ from atom.models.deepseek_v41.mono.kernels.attn_pre import (
     token_tiles,
 )
 from atom.models.deepseek_v41.mono.kernels.debug import mailbox
+from atom.models.deepseek_v41.mono.kernels.index_project_group import (
+    head_weight,
+    project_group,
+)
 from atom.models.deepseek_v41.mono.kernels.index_query import (
     IDX_ROWS,
     IW_TASKS,
     stage_iquant,
-    stage_iquant_fp4,
     stage_iw,
 )
 from atom.models.deepseek_v41.mono.kernels.index_score import (
-    PER_THREAD,
     run_indexer,
-    scratch_pairs,
     stage_ilist,
 )
 from atom.models.deepseek_v41.mono.kernels.index_score_fp4 import run_scores4
+from atom.models.deepseek_v41.mono.kernels.index_select_plan import SelectionPlan
 from atom.models.deepseek_v41.mono.kernels.topk import lds_words
 from atom.models.deepseek_v41.mono.sources import SOURCES
-from atom.mono.device.ops import CM_DEV, kernel_symbol, launcher, ld_i32, rsrc, traced
-from atom.mono.device.sync import publish, sreg
+from atom.mono.device.ops import (
+    CM_DEV,
+    kernel_symbol,
+    launcher,
+    ld_i32,
+    rsrc,
+    traced,
+    uniform,
+    wave_max,
+)
+from atom.mono.device.sync import publish, shift, sreg
 from atom.mono.plan.build_key import key_tuple
 from atom.mono.plan.execution import BLOCKS, THREADS, WAVES, first_task
 from atom.mono.plan.layout import pair_layout
@@ -75,14 +87,30 @@ ABI = KernelAbi((
 
 
 def scratch_layout(key: IndexerBuild):
+    segment = isp.row_segment(key.bound_max) if key.fp4 else ip.SEG
+    lists = {"isf": key.tokens * ip.chunks(key.bound_max), "irdy": key.tokens}
+    for kind in ip.KINDS:
+        plan = SelectionPlan(isp.segment_for(segment, kind))
+        for level in range(plan.top_level(kind, key.bound_max)):
+            slots = plan.list_slots(kind, level, key.bound_max)
+            lists[f"i{kind}{level}"] = key.tokens * slots * ip.KINDS[kind] * 2
+            lists[f"i{kind}ready{level}"] = key.tokens * slots
     return pair_layout(
         {
             "iq": key.tokens * IDX_ROWS // 2,
             "iw": key.tokens * ip.HEADS,
             "qdone": BLOCKS,
-            **scratch_pairs(key.tokens, key.bound_max),
+            "qready": key.tokens * ip.HEADS * (2 if key.tokens > 32 else 4),
+            "iwready": key.tokens * ip.HEADS if _split_weights(key) else 1,
+            **lists,
         }.items()
     )
+
+
+def _split_weights(key):
+    # Three 16-row query tiles use 192 CTAs. The remaining 64 can compute
+    # two head-weight tiles while the query projections are still running.
+    return key.fp4 and 32 < key.tokens <= 48
 
 
 def scratch_bytes(key: IndexerBuild):
@@ -90,22 +118,22 @@ def scratch_bytes(key: IndexerBuild):
 
 
 @traced
-def _tree(c, s, bid, kind, bound_max):
-    """Fixed slots avoid keeping every query's dynamic tree counts live."""
-    for level in range_constexpr(ip.top_level(kind, bound_max) + 1):
-        slots = ip.list_slots(kind, level, bound_max)
-        for task in range(first_task(bid, 0), s * slots, BLOCKS):
-            t, j = task // slots, task % slots
+def _tree(c, s, bid, kind, bound_max, base=0):
+    """Dispatch against this step's largest bound; keep mailbox strides fixed."""
+    plan = SelectionPlan(isp.segment_for(c["select_seg"], kind))
+    raw_max = uniform(wave_max(ld_i32(c["args"]["ibound"], fx.min(c["lane"], s - 1))))
+    for level in range_constexpr(plan.top_level(kind, bound_max) + 1):
+        slots = isp.list_count(
+            plan.SEG, ip.kind_bound(kind, raw_max), level, ip.KINDS[kind]
+        )
+        for task in range(first_task(bid, base), s * slots, BLOCKS):
+            # Distribute each segment across the rows before its successor;
+            # any second task on a CTA then comes from the final short segment.
+            t, j = task % s, task // s
             raw = ld_i32(c["args"]["ibound"], t)
             stage_ilist(c, t, j, raw, kind, level, bound_max, ip.chunks(bound_max))
-
-
-@traced
-def _run_fp4(c, s, bid, bound_max):
-    run_scores4(c, 0, s, bid, ip.chunks(bound_max))
-    _tree(c, s, bid, "sel", bound_max)
-    if c["args"]["iprod"] != 0:
-        _tree(c, s, bid, "blk", bound_max)
+        base = base + s * slots
+    return base
 
 
 @traced
@@ -133,6 +161,25 @@ def _load_latent(tid, qr, qr_scale, qxl, qxsl, t0, n):
     gpu.barrier()
 
 
+@traced
+def _iw_tile(c, tid, bid, hidden, nbl, first, n):
+    co = {**c, "S": n, "iw": shift(c["iw"], fx.Int64(first * ip.HEADS) * 8)}
+
+    def load_group(g, rows):
+        for u in range(tid, rows * HIDDEN // 2, THREADS):
+            v = bo.buffer_load(
+                rsrc(hidden),
+                (first + g) * (HIDDEN // 2) + u,
+                vec_width=1,
+                dtype=T.i32,
+                cache_modifier=CM_DEV,
+            )
+            fx.ptr_store(v, nbl + u)
+        gpu.barrier()
+
+    stage_iw(co, bid % IW_TASKS, HIDDEN, nbl, load_group)
+
+
 def build_indexer(key: IndexerBuild):
     s = key.tokens
     if not 1 <= s <= MAX_ROWS or key.bound_max <= 0:
@@ -143,7 +190,10 @@ def build_indexer(key: IndexerBuild):
     keyed = key_tuple(key, SOURCES)
     rows = tile_rows(s)
     tiles = token_tiles(s)
-    sel = lds_words(PER_THREAD)
+    parts = 2 if s > 32 else 4
+    split_weights = _split_weights(key)
+    plan = SelectionPlan(isp.row_segment(key.bound_max) if key.fp4 else ip.SEG)
+    sel = lds_words(plan.SEG // THREADS, fast_hist=True)
     sel_keys, sel_hist, sel_buf = sel["keys"], sel["hist"], sel["buf"]
 
     @fx.struct
@@ -151,7 +201,8 @@ def build_indexer(key: IndexerBuild):
         red: fx.Array[fx.Float32, WAVES * 2 * 64 * 4, 16]
         qxl: fx.Array[fx.Int32, rows * lds_row(QX8_WORDS), 16]
         qxsl: fx.Array[fx.Int32, rows * lds_row(Q_RANK // 32), 16]
-        nbl: fx.Array[fx.Int32, min(s, WAVES) * HIDDEN // 2, 16]
+        nbl: fx.Array[fx.Int32, 1 if key.fp4 else min(s, WAVES) * HIDDEN // 2, 16]
+        qbf: fx.Array[fx.BFloat16, rows * ip.DIM, 16]
 
     @fx.struct
     class SelectionLds:
@@ -196,6 +247,15 @@ def build_indexer(key: IndexerBuild):
             "poll": mb.poll, "tok_par": False,
             "defer_selected_rows": True,
             "score_depth": 1,
+            "single_row_depth": 2,
+            "wide_single_row_score": True,
+            "fast_select": True,
+            "compact_selected_rows": True,
+            "list_ready": True,
+            "select_seg": plan.SEG,
+            "query_ready": key.fp4,
+            "query_parts": parts,
+            "split_weights": split_weights,
             "single_row_full": True,
             "index_fp4": key.fp4, "index_mfma": key.mfma,
             "args": {
@@ -214,42 +274,79 @@ def build_indexer(key: IndexerBuild):
         }  # fmt: skip
         for region, (off, _) in layout.items():
             c[region] = sreg(scratch, off, region)
-        task = first_task(bid, 0)
-        ops = gemv_fp8_loads(c, iq_w, iq_ws, Q_RANK, task)
-        for t0, n in tiles:
-            rope = iq_rope(c, task, t0, n)
-            _load_latent(tid, qr, qr_scale, pr.qxl.ptr, pr.qxsl.ptr, t0, n)
-            stage_iq(c, task, ops, t0, n, rope)
+        if const_expr(key.fp4):
+            for rep in range_constexpr(-(-(len(tiles) * ip.HEADS * parts) // BLOCKS)):
+                task = bid + rep * BLOCKS
+                for i, (t0, n) in enumerate(tiles):
+                    if (task >= i * ip.HEADS * parts) & (
+                        task < (i + 1) * ip.HEADS * parts
+                    ):
+                        _load_latent(tid, qr, qr_scale, pr.qxl.ptr, pr.qxsl.ptr, t0, n)
+                        project_group(
+                            c,
+                            hidden,
+                            t0,
+                            n,
+                            (task % (ip.HEADS * parts)) // parts,
+                            task % parts,
+                            parts,
+                            with_weight=not split_weights,
+                        )
+            if const_expr(split_weights):
+                first = (s + 1) // 2
+                for i, (t0, n) in enumerate(((0, first), (first, s - first))):
+                    start = len(tiles) * ip.HEADS * parts + i * ip.HEADS
+                    if (bid >= start) & (bid < start + ip.HEADS):
+                        head = bid - start
+                        head_weight(c, hidden, t0, n, head)
+                        publish(
+                            c["put"],
+                            c["iwready"],
+                            (t0 + tid) * ip.HEADS + head,
+                            1,
+                            tid < n,
+                        )
+        else:
+            task = first_task(bid, 0)
+            ops = gemv_fp8_loads(c, iq_w, iq_ws, Q_RANK, task)
+            for t0, n in tiles:
+                rope = iq_rope(c, task, t0, n)
+                _load_latent(tid, qr, qr_scale, pr.qxl.ptr, pr.qxsl.ptr, t0, n)
+                stage_iq(c, task, ops, t0, n, rope)
 
-        @traced
-        def load_group(g, n):
-            for u in range(tid, n * HIDDEN // 2, THREADS):
-                v = bo.buffer_load(
-                    rsrc(hidden),
-                    g * (HIDDEN // 2) + u,
-                    vec_width=1,
-                    dtype=T.i32,
-                    cache_modifier=CM_DEV,
-                )
-                fx.ptr_store(v, pr.nbl.ptr + u)
-            gpu.barrier()
-
-        for task in range(first_task(bid, 0), IW_TASKS, BLOCKS):
-            stage_iw(c, task, HIDDEN, pr.nbl.ptr, load_group)
-        for task in range(first_task(bid, IW_TASKS), s * ip.HEADS, BLOCKS):
-            if const_expr(key.fp4):
-                stage_iquant_fp4(c, task)
-            else:
+            if const_expr(s >= WAVES):  # noqa: SIM102
+                if bid < (s // WAVES) * IW_TASKS:
+                    _iw_tile(
+                        c,
+                        tid,
+                        bid,
+                        hidden,
+                        pr.nbl.ptr,
+                        (bid // IW_TASKS) * WAVES,
+                        WAVES,
+                    )
+            if const_expr(s % WAVES):  # noqa: SIM102
+                if (bid >= (s // WAVES) * IW_TASKS) & (
+                    bid < ((s // WAVES) + 1) * IW_TASKS
+                ):
+                    _iw_tile(
+                        c, tid, bid, hidden, pr.nbl.ptr, (s // WAVES) * WAVES, s % WAVES
+                    )
+            for task in range(first_task(bid, IW_TASKS), s * ip.HEADS, BLOCKS):
                 stage_iquant(c, task)
         # Quantized Q and IW are plain buffers. Drain them before announcing
         # this CTA; all resident CTAs finish projection before any scores read Q.
-        publish(c["put"], c["qdone"], bid, 1, tid == 0)
-        if tid < BLOCKS:
-            c["poll"]([(c["qdone"], tid, 1)])
-        gpu.barrier()
+        if const_expr(not key.fp4):
+            publish(c["put"], c["qdone"], bid, 1, tid == 0)
+            if tid < BLOCKS:
+                c["poll"]([(c["qdone"], tid, 1)])
+            gpu.barrier()
         c["sel_lds"] = {"keys": se.sk.ptr, "hist": se.sh.ptr, "buf": se.sb.ptr}
         if const_expr(key.fp4):
-            _run_fp4(c, s, bid, key.bound_max)
+            run_scores4(c, 0, s, bid, ip.chunks(key.bound_max))
+            next_base = _tree(c, s, bid, "sel", key.bound_max)
+            if c["args"]["iprod"] != 0:
+                _tree(c, s, bid, "blk", key.bound_max, next_base)
         else:
             run_indexer(c, s, bid, key.bound_max)
         _ = keyed

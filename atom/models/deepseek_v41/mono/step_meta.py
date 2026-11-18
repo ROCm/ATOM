@@ -79,6 +79,64 @@ def _walk_plan(
 
 
 @triton.jit
+def _running_min(a, b):
+    return tl.minimum(a, b)
+
+
+@triton.jit
+def _walk_plan_one(
+    plan,
+    batch_ids,
+    positions,
+    lo,
+    hi,
+    task,
+    RATIO: tl.constexpr,
+    CTAS: tl.constexpr,
+    WALK_ROWS: tl.constexpr,
+    TOPK: tl.constexpr,
+    CHUNK: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    t = lo + tl.arange(0, BLOCK)
+    m = t < hi
+    owner = tl.load(batch_ids + t, mask=m, other=0)
+    prev = tl.load(batch_ids + t - 1, mask=m & (t > lo), other=0)
+    start = m & ((t == lo) | (owner != prev))
+    first_row = tl.associative_scan(tl.where(start, t, 0), 0, _running_max)
+    lead = m & (start | ((t - first_row) % WALK_ROWS == 0))
+    next_lead = tl.associative_scan(
+        tl.where(lead, t, hi), 0, _running_min, reverse=True
+    )
+    ii = tl.arange(0, BLOCK)
+    end = tl.gather(next_lead, tl.minimum(ii + 1, BLOCK - 1), 0)
+    end = tl.where(t + 1 < hi, end, hi)
+    top = tl.full((BLOCK,), 0, tl.int32)
+    for r in tl.static_range(WALK_ROWS):
+        p = tl.load(positions + t + r, mask=lead & (t + r < end), other=-1)
+        top = tl.maximum(top, ((p + 1) // RATIO).to(tl.int32))
+    need = tl.where(lead & (top > TOPK), (top + CHUNK - 1) // CHUNK, 0)
+    total = tl.sum(need, 0)
+    width = tl.maximum((total + CTAS - 1) // CTAS, 1)
+    while tl.sum((need + width - 1) // width, 0) > CTAS:
+        width += 1
+    counts = (need + width - 1) // width
+    first = tl.cumsum(counts, 0) - counts
+    hit = (task >= first) & (task < first + counts)
+    tok = tl.sum(tl.where(hit, t, 0), 0)
+    span = tl.sum(tl.where(hit, end - t, 0), 0)
+    chunks = tl.sum(tl.where(hit, need, 0), 0)
+    num = tl.maximum(tl.sum(tl.where(hit, counts, 0), 0), 1)
+    i = task - tl.sum(tl.where(hit, first, 0), 0)
+    live = tl.sum(hit.to(tl.int32), 0) > 0
+    row = plan + task * 4
+    tl.store(row, tl.where(live, tok, 0))
+    tl.store(row + 1, tl.where(live, span, 0))
+    tl.store(row + 2, tl.where(live, i * chunks // num, 0))
+    tl.store(row + 3, tl.where(live, (i + 1) * chunks // num, 0))
+
+
+@triton.jit
 def _step_meta_kernel(
     batch_ids,
     slots,
@@ -93,6 +151,8 @@ def _step_meta_kernel(
     ring_slots,
     window_size,
     n,
+    reset_buffers,
+    reset_sizes: tl.constexpr,
     WORDS: tl.constexpr,
     RATIOS: tl.constexpr,
     CTAS: tl.constexpr,
@@ -100,10 +160,37 @@ def _step_meta_kernel(
     TOPK: tl.constexpr,
     CHUNK: tl.constexpr,
     BLOCK: tl.constexpr,
+    RESET_CTAS: tl.constexpr,
+    PARALLEL_PLANS: tl.constexpr,
 ):
+    meta_ctas = 1 + len(RATIOS) * (CTAS if PARALLEL_PLANS else 1)
+    if tl.program_id(0) >= meta_ctas:
+        u = (tl.program_id(0) - meta_ctas) * 1024 + tl.arange(0, 1024)
+        for r in tl.static_range(len(reset_sizes)):
+            for base in range(0, reset_sizes[r], RESET_CTAS * 1024):
+                tl.store(reset_buffers[r] + base + u, 0, mask=base + u < reset_sizes[r])
+        return
     # program 0 the per-token integers, program 1 + r ratio r's walk plan
     for r in tl.static_range(len(RATIOS)):
-        if tl.program_id(0) == r + 1:
+        if PARALLEL_PLANS:
+            if (tl.program_id(0) >= 1 + r * CTAS) & (
+                tl.program_id(0) < 1 + (r + 1) * CTAS
+            ):
+                _walk_plan_one(
+                    walk_plans[r],
+                    batch_ids,
+                    positions,
+                    walk_lo,
+                    walk_hi,
+                    tl.program_id(0) - 1 - r * CTAS,
+                    RATIOS[r],
+                    CTAS,
+                    WALK_ROWS,
+                    TOPK,
+                    CHUNK,
+                    BLOCK,
+                )
+        elif tl.program_id(0) == r + 1:
             _walk_plan(
                 walk_plans[r],
                 batch_ids,
@@ -139,7 +226,15 @@ def _step_meta_kernel(
 
 
 def write_step_meta(
-    step, geometry, window, ring_rel, key_meta, walk_plans, walk_rows
+    step,
+    geometry,
+    window,
+    ring_rel,
+    key_meta,
+    walk_plans,
+    walk_rows,
+    reset_buffers=(),
+    parallel_plans=False,
 ) -> None:
     """``ring_rel`` [S] int32: each token's window row before the layer's ring
     start, -1 for a pad row. ``key_meta`` [S, KMETA] int32: its first window
@@ -154,7 +249,10 @@ def write_step_meta(
     # search never ends
     assert n < BLOCKS or not walk_plans, n
     ratios = tuple(walk_plans)
-    _step_meta_kernel[(1 + len(ratios),)](
+    reset_ctas = 32 if reset_buffers else 0
+    _step_meta_kernel[
+        (1 + len(ratios) * (BLOCKS if parallel_plans else 1) + reset_ctas,)
+    ](
         step.batch_ids,
         step.slots,
         step.positions,
@@ -168,6 +266,8 @@ def write_step_meta(
         window.ring_slots,
         geometry.window_size,
         n,
+        reset_buffers,
+        tuple(t.numel() for t in reset_buffers),
         WORDS=KMETA,
         RATIOS=ratios,
         CTAS=BLOCKS,
@@ -175,6 +275,8 @@ def write_step_meta(
         TOPK=ip.TOPK,
         CHUNK=ip.CHUNK,
         BLOCK=triton.next_power_of_2(n),
+        RESET_CTAS=reset_ctas,
+        PARALLEL_PLANS=parallel_plans,
     )
 
 

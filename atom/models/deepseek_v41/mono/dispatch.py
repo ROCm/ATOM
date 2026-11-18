@@ -80,12 +80,15 @@ class MonoDecodeModel(nn.Module):
         max_model_len: int,
         index_fp4: bool,
         dp_ranks: int,
+        tp_size: int = 1,
     ) -> None:
         super().__init__()
         self.model = model
         self._drafter = drafter
         # DP attention's ranks, 0 without it (``step_supported``)
         self._dp_ranks = dp_ranks
+        self._tp_size = tp_size
+        self._index_fp4 = index_fp4
         # created on its first eligible step (``LazyRunner``)
         self._mono = LazyRunner(
             lambda: V41MonoDecodeRunner(model, drafter, max_model_len, index_fp4),
@@ -100,9 +103,21 @@ class MonoDecodeModel(nn.Module):
         return self.model(input_ids, positions, inputs_embeds=inputs_embeds)
 
     def uses_layer_mono(self, input_ids, inputs_embeds=None):
-        return step_supported(
-            input_ids, inputs_embeds, self._dp_ranks
-        ) and self._mono.ready(input_ids.numel())
+        return (
+            step_supported(input_ids, inputs_embeds, self._dp_ranks)
+            and self.layer_rows_supported(input_ids.numel())
+            and self._mono.ready(input_ids.numel())
+        )
+
+    def layer_rows_supported(self, rows):
+        # At TP2, large FP4 decode batches are faster with native layers.
+        # The outer wrapper still runs their standalone Mono indexer.
+        return not (
+            self._tp_size == 2
+            and not self._dp_ranks
+            and rows >= 40
+            and indexer_enabled(self._index_fp4)
+        )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.model.compute_logits(hidden_states)
@@ -222,4 +237,5 @@ def _install_layer_decode(
         atom_config.max_model_len,
         atom_config.index_cache_dtype == "fp4",
         dp_ranks,
+        atom_config.tensor_parallel_size,
     )

@@ -156,7 +156,14 @@ class MonoIndexer:
 
     def begin_step(self, rows, cache, step):
         self.rows = rows
-        self.scratch.zero_()
+        layout = kernel.scratch_layout(self._key(rows))
+        resets = tuple(
+            self.scratch[off : off + n].view(torch.int32)
+            for name, (off, n) in layout.items()
+            if name in ("qdone", "qready", "isf", "irdy")
+            or "ready" in name
+            or (not self.fp4 and name in ("iq", "iw"))
+        )
         write_step_meta(
             step,
             cache.geometry,
@@ -165,6 +172,8 @@ class MonoIndexer:
             self.kmeta[:rows],
             self.walk_plans,
             (0, rows),
+            resets,
+            parallel_plans=True,
         )
 
     def run(self, indexer, hidden, qr, qr_scale, cache, step, rope):
