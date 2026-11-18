@@ -33,6 +33,7 @@ from flydsl.expr import gpu, range_constexpr
 
 from atom.models.deepseek_v41.mono.gfx1250.kernels import device as hx
 from atom.models.deepseek_v41.mono.gfx1250.kernels import dims as D
+from atom.models.deepseek_v41.mono.gfx1250.kernels import engram as ES
 from atom.models.deepseek_v41.mono.gfx1250.kernels.attention import q8words, bf, cluster_sync, e8m0_of, inv_pow2, pack4, rsq, to_e4m3
 from atom.models.deepseek_v41.mono.gfx1250.kernels.moe import sched_barrier, union_count
 
@@ -1077,10 +1078,16 @@ def ffn_post_owner(c, TR):
         ekv = c["engkv"] + i64(r * (5 * H) + cc) * 2
         kvv = [hx.gload(ekv + i64(h * H) * 2, BF16).to(F32) for h in range(5)]
         if c["eng"]:
+            if fx.const_expr("erecv" in c):
+                # (engtp) the columns of another rank's shard from its pushes (engram.eng_fetch); the value -> LDS
+                kve = ES.eng_fetch(c, b, r, cc, kvv)
+                hx.lstore(sm + 6272 + t * 2, kve[4].to(BF16))   # (bf16-exact; ends below Y2L)
+            else:
+                kve = kvv
             gw = [hx.gload(c["enggw"] + i64(h * H + cc) * 4, F32) for h in range(4)]
             pr = []
             for j in range_constexpr(4):
-                pr += [rq[j] * rq[j], kvv[j] * kvv[j], rq[j] * gw[j] * kvv[j]]
+                pr += [rq[j] * rq[j], kve[j] * kve[j], rq[j] * gw[j] * kve[j]]
             for o in range_constexpr(5):
                 pr = [v + v.shuffle_xor(16 >> o, 32) for v in pr]
             if (w < TR) & (l == 0):
@@ -1111,6 +1118,8 @@ def ffn_post_owner(c, TR):
                     hx.lstore(sm + 6144 + (w * 4 + l) * 4, gsel)
             gpu.barrier()
         gts = [hx.lload(sm + 6144 + (r * 4 + j) * 4, F32) for j in range(4)]
+        if fx.const_expr("erecv" in c):
+            kvv[4] = hx.lload(sm + 6272 + t * 2, BF16).to(F32)
         rq = [c["eng"].select(bf(rq[j] + gts[j] * kvv[4]).to(F32), rq[j]) for j in range(4)]
     srs = F32(0.0)
     for j in range_constexpr(4):

@@ -212,6 +212,10 @@ def iprefetch(kb):
         llvm.inline_asm(None, [], f"s_prefetch_inst_pc_rel {off}, null, 31", "", has_side_effects=True)
 
 
+# (engentry) lflags of the rows before the Engram layers (kept with 128: the layer's kv / gate conditions unchanged):
+# ENG_ENTRY the target entry ran their sharded kv (slot s of engkv: the s-th such row, ENG_ROWS), the row's own kv is off
+ENG_ENTRY = 512
+ENG_ROWS = (0, 13)
 CODE_END_OFF = 131024   # cyc scratch: the target / draft launches' end PCs (hx.code_end)
 
 
@@ -266,6 +270,20 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
                     handoff(TCNT + i64(LY.TARGET_STATE), t, False)
                     if b < FS.FRONT_CTAS:
                         entry_front(fp, sm, b, TENTRY_ROW, FS.NE, FS.TOPK, last=True)   # (v2) R -> aRout for layer 0's column owners
+                    # (engentry) the Engram layers' sharded kv (rows ENG_ROWS with ENG_ENTRY) on the CTAs past the front
+                    # ones (idle through it): inputs the host's staged embedding rows, readers those rows' attention posts
+                    if hx.unlikely(((ltab(fp, ENG_ROWS[0], "lflags")() & fx.Int64(ENG_ENTRY)) != fx.Int64(0)) & (b >= FS.FRONT_CTAS)):
+                        te = hx.opaque_v(fx.thread_idx.x)
+                        def SL(sl):   # slot sl's row (ENG_ROWS[sl]) pointers, receive words and tag
+                            Lk = (sl == fx.Int32(1)).select(fx.Int32(ENG_ROWS[1]), fx.Int32(ENG_ROWS[0]))
+                            eo = (i64(Lk % 2) * i64(2 * 4 * ES.ETP_TG) + i64(ES.eng_eoff(TR))) * i64(16)
+                            rv_ = [atab(fp, f"recv{o}")() + i64(tep & 1) * RECV_HALF + eo for o in range(4)]
+                            return dict(engemb=ltab(fp, Lk, "engemb")(), engw=ltab(fp, Lk, "engw")(), engws=ltab(fp, Lk, "engws")(),
+                                        erecv=rv_, etag=hx.epoch32(tep, Lk, 3))
+                        ES.stage_engkv_ent(dict(t=te, b=b, w=te // 32, l=te % 32, sm=sm, MT=(TR + 15) // 16, TR=TR, rank=rank,
+                                                stx=hx.stx_dev, engkv=fptr(fp, "engkv")), FS.FRONT_CTAS, CTAS - FS.FRONT_CTAS,
+                                           ES.ED_ENT, SL)
+                        hx.wait_storecnt0()
                     handoff(TCNT + i64(LY.TARGET_FRONT), t, False)
             TRx = TRD if DRS else TR
             Lx = LD if DRS else L
@@ -426,6 +444,15 @@ def target_layer(E, Ly):
     apnfl, apntg = flag(F_AP, Ly + 1)
     wfl, wtg = flag(F_W, Ly)
     engfl, engtg = flag(F_ENG, Ly)
+
+    def engtp(rv, own=None):       # (engtp) the Engram kv shards' receive words: region par * 2 past tp3's
+        eo = i64((par * 2 * 4 * ES.ETP_TG + ES.eng_eoff(TR)) * 16)
+        d = dict(etag=hx.epoch32(tep, Ly, 3), rank=rank)
+        if own is None:
+            d["erecv"] = [r_ + eo for r_ in rv]
+        else:
+            d["erecv"] = rv[own] + eo
+        return d
     fpf = dict(pflag=pfl, ptag=ptg)                     # FFN post (owners) -> x8_self / router / shared UG
     v3a = dict(a2flag=a2fl, a2tag=a2tg, cflag=cfl, ctag=ctg, kvflag=kvfl, kvtag=kvtg)
     v3f = dict(dflag=dfl, dtag=dtg, eflag=efl, etag=etg)
@@ -455,8 +482,6 @@ def target_layer(E, Ly):
     RPC = Lx["RPC"]
     DCT = ((TR + RPC - 1) // RPC) * CL       # the D CTAs (row x key segment)
 
-    if hx.unlikely(lfl(128)):   # the row before an Engram layer: its embeddings -> MXFP8
-        ES.stage_engq(cwith(c, engemb=ltab(fp, Ly, "engemb")(), eng8=fptr(fp, "eng8"), engs=fptr(fp, "engs")))
 
     # ---- A: x from the TP2 owners (apflag), wqkv -> latents (A2 flags)
     keepA = lfl(8 | 128)   # indexer / Engram-next layers: the KV_C handoff (iq / iw partials -> iquant: index-internal, contract 6.4)
@@ -471,11 +496,18 @@ def target_layer(E, Ly):
                   x1a=plog(X1A), anw=ltab(fp, Lp, "anw")(), norm_eps=D.RMS_EPS, axn=fptr(fp, "axn")))
     pf_rows(c["wqb"] + i64(b) * (16 * QL), QL, 16, QL, t)
     pf_rows(c["wqb"] + i64(b + CTAS) * (16 * QL), QL, 16, QL, t)
-    if hx.unlikely(lfl(128)):   # (Engram-next layers only: the Engram kv reads every CTA's eng8; indexer layers wait on LL flags below)
-        handoff(lc, t, True)   # LY.ATTN_A
     if hx.unlikely(lfl(128)):   # the next layer's Engram kv
-        ES.stage_engkv(cwith(c, eng8=fptr(fp, "eng8"), engs=fptr(fp, "engs"), engw=ltab(fp, Ly, "engw")(),
-                             engws=ltab(fp, Ly, "engws")(), engkv=fptr(fp, "engkv")))
+        if (ltab(fp, Ly, "lflags")() & fx.Int64(S.ENG_ENTRY)) == fx.Int64(0):
+            # (engq-in-CTA) the kv quantizes its A rows from the bf16 embeddings itself: no stage_engq, no ATTN_A handoff
+            ES.stage_engkv(cwith(c, engemb=ltab(fp, Ly, "engemb")(), engw=ltab(fp, Ly, "engw")(),
+                                 engws=ltab(fp, Ly, "engws")(), engkv=fptr(fp, "engkv"), **engtp(c["recv"])))
+        else:
+            if Ly != fx.Int32(S.ENG_ROWS[0]):   # (engentry) slot 1's kv (the entry's) -> engkv, read by this row's gate
+                ekv = fptr(fp, "engkv")
+                for zz in range_constexpr((TR * ES.EN * 2 // 16 + CTAS * 256 - 1) // (CTAS * 256)):
+                    u = b * 256 + t + zz * (CTAS * 256)
+                    if u < TR * ES.EN * 2 // 16:
+                        hx.stx_dev(ekv + i64(u) * 16, hx.gload(ekv + i64(ES.T * ES.EN * 2) + i64(u) * 16, fx.Int32, 4))
 
     # ---- kv, C (on A2 flags) -> kvflag / cflag
     stage_kv(cwith(c, **v3a))
@@ -760,7 +792,7 @@ def target_layer(E, Ly):
                                part2=plog(P2A), cnt=lc + i64(S.LCB + ATT_POST), pflag=apnfl, ptag=apntg,
                                anw=ltab(fp, Ly, "anw")(), x8a=c["x8"], xsa=c["xs"],
                                engkv=fptr(fp, "engkv"), enggw=ltab(fp, Ly, "enggw")(), eng=lfl(128),
-                               engp=plog(ENGP), engflag=engfl, engtag=engtg), TR)
+                               engp=plog(ENGP), engflag=engfl, engtag=engtg, **engtp(c["recv"], rank)), TR)
         if lastL & (b < 16):
             FS.xh_out(dict(t=tq5, b=b, w=tq5 // 32, l=tq5 % 32, sm=sm + FLO, x1g=plog(X1A), part2=plog(P2A),
                            nw=ltab(fp, Ly, "anw")(), norm_eps=D.RMS_EPS, xh=XHP, pflag=apnfl, ptag=apntg), TR)

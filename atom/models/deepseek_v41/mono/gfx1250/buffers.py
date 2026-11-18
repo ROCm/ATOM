@@ -313,7 +313,7 @@ def scratch_bytes(K, nlt: int) -> dict[str, int]:
         "dcomb": T * 64,
         "eng8": T * 6144,
         "engs": T * 192,
-        "engkv": T * 25600 * 2,
+        "engkv": 2 * T * 25600 * 2,   # (engentry) a slot an Engram layer
         "engpart": 768 * 16 * 4,
         "mroute": T * FS.TOPK * 4,
         "mchist": M.MC_BYTES,

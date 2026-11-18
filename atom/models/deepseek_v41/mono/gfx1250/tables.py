@@ -356,6 +356,9 @@ class StepTables:
             )  # (the entry row: 0)
             if Ly < NL and Ly + 1 in self.engram:  # the row before an Engram layer
                 p["lflags"] |= 128
+                # (engentry) the target entry runs this row's sharded kv (step.ENG_ENTRY, rows step.ENG_ROWS)
+                if Ly in (0, 13) and __import__("os").environ.get("ATOM_MONO_ENG_ENTRY", "1") != "0":
+                    p["lflags"] |= 512
                 p.update({k: v.data_ptr() for k, v in self.engram[Ly + 1].items()})
             if self.idx and Ly < NL:
                 spec = self.specs[Ly]
