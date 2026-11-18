@@ -4,14 +4,11 @@ use super::{
     circuit_breaker::{CircuitBreaker, CircuitBreakerConfig},
     worker::{
         BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig, RuntimeType, WorkerMetadata,
-        WorkerRoutingKeyLoad, WorkerType, CHAT_RENDERING_LABEL,
+        WorkerRoutingKeyLoad, WorkerType,
     },
 };
 use crate::{
-    observability::metrics::MeshMetrics,
-    routers::{
-        grpc::engine::worker_client_cache::GrpcClient, prepare::chat_rendering::ChatRendering,
-    },
+    observability::metrics::MeshMetrics, routers::grpc::engine::worker_client_cache::GrpcClient,
 };
 
 /// Builder for creating BasicWorker instances with fluent API
@@ -194,15 +191,6 @@ impl BasicWorkerBuilder {
             _ => None,
         };
 
-        let chat_rendering = self.labels.get(CHAT_RENDERING_LABEL).and_then(|json| {
-            ChatRendering::parse(json)
-                .map_err(|e| {
-                    tracing::warn!(url = %self.url, "ignoring the worker's chat rendering: {e}")
-                })
-                .ok()
-                .map(Arc::new)
-        });
-
         let metadata = WorkerMetadata {
             url: self.url.clone(),
             api_key: self.api_key,
@@ -218,7 +206,6 @@ impl BasicWorkerBuilder {
             reasoning_parser: self.reasoning_parser,
             tool_parser: self.tool_parser,
             chat_template: self.chat_template,
-            chat_rendering,
         };
 
         // Use OnceCell for lock-free gRPC client access after initialization

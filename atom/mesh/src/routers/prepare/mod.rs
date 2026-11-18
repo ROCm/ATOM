@@ -18,7 +18,6 @@ use crate::{
     tokenizer::{registry::TokenizerRegistry, traits::Tokenizer},
 };
 
-pub(crate) mod chat_rendering;
 pub(crate) mod chat_template;
 pub mod generation_payload;
 pub(crate) mod parser_factory_lookup;

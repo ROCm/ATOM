@@ -16,9 +16,7 @@ use super::{CircuitBreaker, WorkerError, WorkerResult, UNKNOWN_MODEL_ID};
 use crate::{
     observability::metrics::{metrics_labels, MeshMetrics},
     protocols::worker_spec::WorkerInfo,
-    routers::{
-        grpc::engine::worker_client_cache::GrpcClient, prepare::chat_rendering::ChatRendering,
-    },
+    routers::grpc::engine::worker_client_cache::GrpcClient,
 };
 
 /// Default worker priority (mid-range on 0-100 scale)
@@ -451,10 +449,6 @@ impl Default for HealthConfig {
     }
 }
 
-/// The label holding how an ATOM worker renders chats, as its `/v1/models`
-/// card's `chat_rendering` reports it, in JSON.
-pub const CHAT_RENDERING_LABEL: &str = "chat_rendering";
-
 /// Metadata associated with a worker
 #[derive(Debug, Clone)]
 pub struct WorkerMetadata {
@@ -486,9 +480,6 @@ pub struct WorkerMetadata {
     pub tool_parser: Option<String>,
     /// Chat template
     pub chat_template: Option<String>,
-    /// How the worker renders chats, from its `chat_rendering` label, if this
-    /// router mirrors that.
-    pub(crate) chat_rendering: Option<Arc<ChatRendering>>,
 }
 
 /// Basic worker implementation
@@ -1776,7 +1767,6 @@ mod tests {
             reasoning_parser: None,
             tool_parser: None,
             chat_template: None,
-            chat_rendering: None,
         };
 
         assert_eq!(metadata.model_id.as_deref(), Some("my-model"));

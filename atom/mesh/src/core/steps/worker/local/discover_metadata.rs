@@ -13,12 +13,8 @@ use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowRe
 use super::strip_protocol;
 use crate::{
     config::BackendType,
-    core::{
-        steps::workflow_data::LocalWorkerWorkflowData, worker::CHAT_RENDERING_LABEL, ConnectionMode,
-    },
-    routers::{
-        grpc::engine::worker_client_cache::GrpcClient, prepare::chat_rendering::ChatRendering,
-    },
+    core::{steps::workflow_data::LocalWorkerWorkflowData, ConnectionMode},
+    routers::grpc::engine::worker_client_cache::GrpcClient,
 };
 
 // HTTP client for metadata fetching
@@ -140,12 +136,6 @@ pub async fn get_server_info(url: &str, api_key: Option<&str>) -> Result<ServerI
 
 /// Get model id from OpenAI-compatible /v1/models endpoint.
 pub async fn get_openai_model_id(url: &str, api_key: Option<&str>) -> Result<String, String> {
-    let card = get_openai_model_card(url, api_key).await?;
-    Ok(card["id"].as_str().unwrap_or_default().to_string())
-}
-
-/// The first model card with an id from OpenAI-compatible /v1/models endpoint.
-async fn get_openai_model_card(url: &str, api_key: Option<&str>) -> Result<Value, String> {
     let base_url = url.trim_end_matches('/');
     let endpoint = format!("{}/v1/models", base_url);
 
@@ -175,13 +165,13 @@ async fn get_openai_model_card(url: &str, api_key: Option<&str>) -> Result<Value
     json.get("data")
         .and_then(|d| d.as_array())
         .and_then(|arr| {
-            arr.iter().find(|m| {
+            arr.iter().find_map(|m| {
                 m.get("id")
                     .and_then(|v| v.as_str())
-                    .is_some_and(|s| !s.is_empty())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
             })
         })
-        .cloned()
         .ok_or_else(|| format!("No model id in /v1/models response from {}", endpoint))
 }
 
@@ -308,30 +298,15 @@ async fn discover_http_sglang(url: &str, api_key: Option<&str>) -> HashMap<Strin
     labels
 }
 
-/// Discover HTTP metadata from an OpenAI-compatible backend (vLLM, ATOM) via
-/// /v1/models: the model id, and how an ATOM card reports it renders chats,
-/// if this router mirrors that.
+/// Discover HTTP metadata from an OpenAI-compatible backend (vLLM) via /v1/models.
 async fn discover_http_openai(url: &str, api_key: Option<&str>) -> HashMap<String, String> {
     let mut labels = HashMap::new();
 
-    match get_openai_model_card(url, api_key).await {
-        Ok(card) => {
-            if let Some(id) = card["id"].as_str() {
-                labels.insert("model_path".to_string(), id.to_string());
-            }
-            let rendering = &card["chat_rendering"];
-            if !rendering.is_null() {
-                match ChatRendering::deserialize(rendering) {
-                    Ok(_) => {
-                        labels.insert(CHAT_RENDERING_LABEL.to_string(), rendering.to_string());
-                    }
-                    Err(e) => warn!(
-                        "{url} reports a chat rendering this router does not read, so its chats \
-                         render with only their own template kwargs: {e}"
-                    ),
-                }
-            }
+    match get_openai_model_id(url, api_key).await {
+        Ok(id) if !id.is_empty() => {
+            labels.insert("model_path".to_string(), id);
         }
+        Ok(_) => {}
         Err(e) => {
             warn!("/v1/models failed for {}: {}", url, e);
         }
@@ -411,46 +386,5 @@ impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
 
     fn is_retryable(&self, _error: &WorkflowError) -> bool {
         true
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use serde_json::json;
-
-    use super::*;
-
-    /// An ATOM card's chat rendering becomes a label, as reported, if this
-    /// router mirrors it.
-    #[tokio::test]
-    async fn test_openai_discovery_records_the_chat_rendering() {
-        let rendering = json!({"default_kwargs": {"enable_thinking": false},
-            "reasoning_toggle": null, "reasoning_rules": "chat",
-            "template_efforts": ["high"], "encoder": null});
-        let mut unmirrored = rendering.clone();
-        unmirrored["reasoning_rules"] = json!("responses");
-        for (card, want) in [
-            (
-                json!({"id": "m", "chat_rendering": rendering}),
-                Some(rendering.to_string()),
-            ),
-            (json!({"id": "m", "chat_rendering": null}), None),
-            (json!({"id": "m"}), None),
-            (json!({"id": "m", "chat_rendering": "chat"}), None),
-            (json!({"id": "m", "chat_rendering": unmirrored}), None),
-        ] {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let url = format!("http://{}", listener.local_addr().unwrap());
-            let models = json!({"object": "list", "data": [card]});
-            let app = axum::Router::new().route(
-                "/v1/models",
-                axum::routing::get(move || async move { axum::Json(models) }),
-            );
-            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-            let labels = discover_http_openai(&url, None).await;
-            assert_eq!(labels.get("model_path").map(String::as_str), Some("m"));
-            assert_eq!(labels.get(CHAT_RENDERING_LABEL), want.as_ref());
-        }
     }
 }

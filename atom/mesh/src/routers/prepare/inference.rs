@@ -1,6 +1,4 @@
 //! Validated routing views; callers retain raw request bodies.
-use std::fmt;
-
 use crate::protocols::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent},
     common::{ContentPart, GenerationRequest, InputIds, StringOrArray},
@@ -8,13 +6,7 @@ use crate::protocols::{
     generate::GenerateRequest,
     validated::Normalizable,
 };
-use serde::{
-    de::{
-        value::{BorrowedStrDeserializer, StrDeserializer},
-        DeserializeSeed, Error as _, MapAccess, SeqAccess, Visitor,
-    },
-    Deserialize, Deserializer, Serialize, Serializer,
-};
+use serde::{Serialize, Serializer};
 use validator::Validate;
 
 #[derive(Debug, Clone)]
@@ -123,195 +115,8 @@ impl InferenceRequest for GenerateRequest {
     }
 }
 
-/// The chat fields ATOM renders as the client sent them, which the typed
-/// request does not keep: it has no `thinking`, gives `tool_choice` a default
-/// when there are tools, and types `response_format`. A `null` is not sent.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct SentControls {
-    pub(crate) thinking: Option<serde_json::Value>,
-    pub(crate) tool_choice: Option<serde_json::Value>,
-    pub(crate) response_format: Option<serde_json::Value>,
-}
-
-impl SentControls {
-    /// `bytes` parsed as a `T`, with the controls as sent.
-    fn parse<'de, T: Deserialize<'de>>(bytes: &'de [u8]) -> serde_json::Result<(T, Self)> {
-        let mut sent = Self::default();
-        let mut deserializer = serde_json::Deserializer::from_slice(bytes);
-        let parsed = T::deserialize(Capture {
-            inner: &mut deserializer,
-            sent: &mut sent,
-        })?;
-        deserializer.end()?;
-        Ok((parsed, sent))
-    }
-
-    fn field(&mut self, control: Control) -> &mut Option<serde_json::Value> {
-        match control {
-            Control::Thinking => &mut self.thinking,
-            Control::ToolChoice => &mut self.tool_choice,
-            Control::ResponseFormat => &mut self.response_format,
-        }
-    }
-}
-
-/// A field `SentControls` keeps.
-#[derive(Clone, Copy)]
-enum Control {
-    Thinking,
-    ToolChoice,
-    ResponseFormat,
-}
-
-impl Control {
-    fn named(key: &str) -> Option<Self> {
-        match key {
-            "thinking" => Some(Self::Thinking),
-            "tool_choice" => Some(Self::ToolChoice),
-            "response_format" => Some(Self::ResponseFormat),
-            _ => None,
-        }
-    }
-}
-
-/// Deserializes as `inner` does, keeping the top-level object's controls in
-/// `sent` on the way: it wraps the deserializer, the request's visitor, and
-/// the map that visitor reads.
-struct Capture<'a, T> {
-    inner: T,
-    sent: &'a mut SentControls,
-}
-
-impl<'de, D: Deserializer<'de>> Deserializer<'de> for Capture<'_, D> {
-    type Error = D::Error;
-
-    fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, D::Error> {
-        let visitor = Capture {
-            inner: visitor,
-            sent: self.sent,
-        };
-        self.inner.deserialize_any(visitor)
-    }
-
-    fn deserialize_map<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, D::Error> {
-        let visitor = Capture {
-            inner: visitor,
-            sent: self.sent,
-        };
-        self.inner.deserialize_map(visitor)
-    }
-
-    fn deserialize_struct<V: Visitor<'de>>(
-        self,
-        name: &'static str,
-        fields: &'static [&'static str],
-        visitor: V,
-    ) -> Result<V::Value, D::Error> {
-        let visitor = Capture {
-            inner: visitor,
-            sent: self.sent,
-        };
-        self.inner.deserialize_struct(name, fields, visitor)
-    }
-
-    serde::forward_to_deserialize_any! {
-        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
-        bytes byte_buf option unit unit_struct newtype_struct seq tuple
-        tuple_struct enum identifier ignored_any
-    }
-}
-
-impl<'de, V: Visitor<'de>> Visitor<'de> for Capture<'_, V> {
-    type Value = V::Value;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-        self.inner.expecting(formatter)
-    }
-
-    fn visit_map<M: MapAccess<'de>>(self, map: M) -> Result<V::Value, M::Error> {
-        self.inner.visit_map(CaptureMap {
-            inner: map,
-            sent: self.sent,
-            control: None,
-        })
-    }
-
-    fn visit_seq<S: SeqAccess<'de>>(self, seq: S) -> Result<V::Value, S::Error> {
-        self.inner.visit_seq(seq)
-    }
-}
-
-/// The request's map, whose controls' values `next_value_seed` keeps.
-struct CaptureMap<'a, M> {
-    inner: M,
-    sent: &'a mut SentControls,
-    /// The control the value to come is for, if any.
-    control: Option<Control>,
-}
-
-impl<'de, M: MapAccess<'de>> MapAccess<'de> for CaptureMap<'_, M> {
-    type Error = M::Error;
-
-    fn next_key_seed<K: DeserializeSeed<'de>>(
-        &mut self,
-        seed: K,
-    ) -> Result<Option<K::Value>, M::Error> {
-        self.inner.next_key_seed(ControlKey {
-            inner: seed,
-            control: &mut self.control,
-        })
-    }
-
-    fn next_value_seed<S: DeserializeSeed<'de>>(&mut self, seed: S) -> Result<S::Value, M::Error> {
-        let Some(control) = self.control.take() else {
-            return self.inner.next_value_seed(seed);
-        };
-        let value: serde_json::Value = self.inner.next_value()?;
-        *self.sent.field(control) = (!value.is_null()).then(|| value.clone());
-        seed.deserialize(value).map_err(M::Error::custom)
-    }
-
-    fn size_hint(&self) -> Option<usize> {
-        self.inner.size_hint()
-    }
-}
-
-/// A key of the request's map, given to the request's own seed as read, and
-/// borrowed where the input allows, noting the control it names.
-struct ControlKey<'a, K> {
-    inner: K,
-    control: &'a mut Option<Control>,
-}
-
-impl<'de, K: DeserializeSeed<'de>> DeserializeSeed<'de> for ControlKey<'_, K> {
-    type Value = K::Value;
-
-    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<K::Value, D::Error> {
-        deserializer.deserialize_str(self)
-    }
-}
-
-impl<'de, K: DeserializeSeed<'de>> Visitor<'de> for ControlKey<'_, K> {
-    type Value = K::Value;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-        formatter.write_str("a field name")
-    }
-
-    fn visit_borrowed_str<E: serde::de::Error>(self, key: &'de str) -> Result<K::Value, E> {
-        *self.control = Control::named(key);
-        self.inner.deserialize(BorrowedStrDeserializer::new(key))
-    }
-
-    fn visit_str<E: serde::de::Error>(self, key: &str) -> Result<K::Value, E> {
-        *self.control = Control::named(key);
-        self.inner.deserialize(StrDeserializer::new(key))
-    }
-}
-
 pub enum ParsedInference {
-    /// A chat, with the controls ATOM renders as sent.
-    Chat(ChatCompletionRequest, SentControls),
+    Chat(ChatCompletionRequest),
     Completion(CompletionRequest),
     Generate(GenerateRequest),
     Messages(serde_json::Value),
@@ -336,11 +141,11 @@ impl ParsedInference {
         let endpoint = EndpointSpec::find(path).ok_or("unsupported inference API")?;
         match endpoint.api {
             Api::Chat => {
-                let (mut request, sent): (ChatCompletionRequest, _) =
-                    SentControls::parse(bytes).map_err(|e| e.to_string())?;
+                let mut request: ChatCompletionRequest =
+                    serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
                 request.normalize();
                 request.validate().map_err(|e| e.to_string())?;
-                Ok(Self::Chat(request, sent))
+                Ok(Self::Chat(request))
             }
             Api::Completions => serde_json::from_slice(bytes)
                 .map(Self::Completion)
@@ -481,7 +286,7 @@ impl ParsedInference {
     /// engine keys every KV block of the prompt by.
     pub(crate) fn carries_media(&self) -> bool {
         match self {
-            Self::Chat(chat, _) => chat.messages.iter().any(|message| {
+            Self::Chat(chat) => chat.messages.iter().any(|message| {
                 let content = match message {
                     ChatMessage::System { content, .. }
                     | ChatMessage::User { content, .. }
@@ -507,13 +312,8 @@ impl ParsedInference {
     }
 
     pub fn chat(&self) -> Option<&ChatCompletionRequest> {
-        self.chat_as_sent().map(|(chat, _)| chat)
-    }
-
-    /// A chat, with the controls ATOM renders as sent.
-    pub(crate) fn chat_as_sent(&self) -> Option<(&ChatCompletionRequest, &SentControls)> {
-        if let Self::Chat(chat, sent) = self {
-            Some((chat, sent))
+        if let Self::Chat(chat) = self {
+            Some(chat)
         } else {
             None
         }
@@ -542,7 +342,7 @@ impl InferenceRequest for ParsedInference {
     }
     fn metadata_with_text(&self, include_text: bool) -> InferenceMetadata {
         let mut metadata = match self {
-            Self::Chat(r, _) => r.metadata_with_text(include_text),
+            Self::Chat(r) => r.metadata_with_text(include_text),
             Self::Completion(r) => r.metadata_with_text(include_text),
             Self::Generate(r) => r.metadata_with_text(include_text),
             Self::Messages(body) | Self::Responses(body) => {

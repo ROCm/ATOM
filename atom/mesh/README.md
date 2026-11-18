@@ -271,40 +271,6 @@ chat template, such as DeepSeek V3.2 and V4
 ([#3377](https://github.com/ROCm/ATOM/issues/3377)). Use a policy that does not
 need tokens, such as `cache_aware` or `round_robin`, for these models and APIs.
 
-Chats are tokenized as their workers render them. An ATOM worker reports in its
-`/v1/models` card how its `/v1/chat/completions` renders chats
-(`chat_rendering`), as it resolved that at startup: its
-`--default-chat-template-kwargs`, the kwarg that switches the template's
-reasoning, the rules it applies `reasoning_effort` and `thinking` by, and the
-encoder it renders with in place of the template, if any (DeepSeek V4.1's
-`encoding/encoding.py`). The router reads it as the worker registers, keeps it
-as the worker's `chat_rendering` label, parsed once there, and renders a chat
-with the kwargs ATOM gives it: the defaults, the request's
-`chat_template_kwargs` over them, its
-`response_format` and a string `tool_choice`, then its reasoning controls, and
-for an encoder, what its adapter passes on. The rules and DeepSeek V4.1's
-kwargs hook are ATOM's code, which the router mirrors by the names the card
-gives them; `tests/entrypoints/fixtures/chat_rendering.json` holds the kwargs
-ATOM gives a set of chats, and both ATOM's and the router's tests check them.
-The router does not mirror the encoder itself: it renders with the model's
-Jinja template, for DeepSeek V4.1 the checkpoint's `chat_template.jinja`, so a
-chat tokenizes as on ATOM as far as that template renders as the encoder does.
-`scripts/atom_chat_parity.py` compares the two on a checkpoint, over chats with
-tool calls and their results, earlier turns' reasoning, and several turns.
-
-A chat renders with only its own `reasoning_effort` and `chat_template_kwargs`
-when the HTTP workers serving its model report no chat rendering, as backends
-other than ATOM do, and, with a warning once for the model, when only some of
-them report one or they report different ones. A worker reporting one that
-names rules or a kwargs hook this router does not mirror, as a newer ATOM's
-may, counts as reporting none, with a warning as it registers. With
-`--kv-events`, such a chat's blocks match only on the workers that render it
-so.
-
-The router reads `reasoning_effort` as a string, as the OpenAI API defines it,
-so it rejects a chat sending ATOM's integer budget there, whatever the policy;
-send the budget as `thinking.effort`.
-
 ## Reliability
 
 - **Request preparation**: Parsing, template rendering and tokenization use a fixed

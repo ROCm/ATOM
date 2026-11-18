@@ -30,10 +30,7 @@ use crate::{
     policies::{LoadBalancingPolicy, PolicyRegistry},
     routers::{
         comm::error::{IngressError, MeshLocalError},
-        prepare::{
-            chat_rendering::{atom_chat_template_kwargs, ChatRendering},
-            inference::{InferenceMetadata, InferenceRequest, ParsedInference},
-        },
+        prepare::inference::{InferenceMetadata, InferenceRequest, ParsedInference},
     },
     server::AppState,
     tokenizer::TokenizerRegistry,
@@ -57,38 +54,20 @@ enum Tokens {
 static UNTOKENIZED_MODELS: LazyLock<DashSet<String>> = LazyLock::new(DashSet::new);
 const MAX_UNTOKENIZED_MODELS: usize = 64;
 
-/// Whether `model` is new to `models`, which keeps up to `MAX_UNTOKENIZED_MODELS`
-/// so that each is warned of once.
-fn warns_first(models: &DashSet<String>, model: &str) -> bool {
-    models.len() < MAX_UNTOKENIZED_MODELS
-        && !models.contains(model)
-        && models.insert(model.to_string())
-}
-
 /// Counts a request that `cache_aware` places by its text, as the router cannot tokenize it.
 fn untokenized(model: Option<&str>, error: &IngressError) {
     metrics::counter!("mesh_kv_events_untokenized_total", "reason" => error.code).increment(1);
     let model = model.unwrap_or_default();
-    if warns_first(&UNTOKENIZED_MODELS, model) {
+    let models = &UNTOKENIZED_MODELS;
+    if models.len() < MAX_UNTOKENIZED_MODELS
+        && !models.contains(model)
+        && models.insert(model.to_string())
+    {
         warn!(
             model,
             reason = error.code,
             error = %error.message,
             "Placing the model's requests by their text: the router cannot tokenize them for the KV event index"
-        );
-    }
-}
-
-/// Models whose chats HTTP routing renders without their workers' chat rendering,
-/// each warned of once, up to `MAX_UNTOKENIZED_MODELS`.
-static UNMIRRORED_MODELS: LazyLock<DashSet<String>> = LazyLock::new(DashSet::new);
-
-fn unmirrored(model: &str, reason: &str) {
-    if warns_first(&UNMIRRORED_MODELS, model) {
-        warn!(
-            model,
-            reason,
-            "HTTP routing renders the model's chats with only their own template kwargs, which may not be the engine's prompt"
         );
     }
 }
@@ -819,7 +798,9 @@ impl IngressRouting {
         };
         workers.retain(|w| matches!(w.connection_mode(), ConnectionMode::Http));
         let configured = !workers.is_empty();
-        workers.retain(|w| self.serves(endpoint, w.as_ref()));
+        workers.retain(|w| {
+            endpoint.supports(w.as_ref()) && matches!(w.worker_type(), WorkerType::Regular) != pd
+        });
         if configured && workers.is_empty() {
             return Err(IngressError::new(
                 http::StatusCode::NOT_IMPLEMENTED,
@@ -852,46 +833,8 @@ impl IngressRouting {
         Ok(())
     }
 
-    /// Whether a request to `endpoint` can be placed on `worker`: an HTTP worker
-    /// serving the API, in this router's topology.
-    fn serves(&self, endpoint: &EndpointSpec, worker: &dyn Worker) -> bool {
-        matches!(worker.connection_mode(), ConnectionMode::Http)
-            && endpoint.supports(worker)
-            && matches!(worker.worker_type(), WorkerType::Regular) != self.pd
-    }
-
-    /// How the workers a chat can be placed on render it: the chat rendering they
-    /// all report. `None` when none reports one, as backends other than ATOM do
-    /// not, and, warning once for the model, when only some of them report one
-    /// or they report different ones. A worker whose card reports one this
-    /// router does not mirror reports none; discovery warns of it.
-    fn chat_rendering(&self, metadata: &InferenceMetadata) -> Option<Arc<ChatRendering>> {
-        let model = metadata.model.as_deref()?;
-        let endpoint = EndpointSpec::find(metadata.route)?;
-        let workers = self.worker_registry.get_by_model(model);
-        let (mut rendering, mut silent) = (None, false);
-        for worker in workers.iter().filter(|w| self.serves(endpoint, w.as_ref())) {
-            match (&worker.metadata().chat_rendering, rendering) {
-                (None, _) => silent = true,
-                (Some(reported), None) => rendering = Some(reported),
-                (Some(reported), Some(first))
-                    if Arc::ptr_eq(reported, first) || reported == first => {}
-                (Some(_), Some(_)) => {
-                    unmirrored(model, "the workers report different chat renderings");
-                    return None;
-                }
-            }
-        }
-        if silent && rendering.is_some() {
-            unmirrored(model, "only some of the workers report a chat rendering");
-            return None;
-        }
-        rendering.cloned()
-    }
-
     /// The request's `input_ids`, or its prompt encoded, with the tokenizer's special tokens
-    /// when `add_special_tokens`. A chat renders with the template kwargs its workers
-    /// render it with, if they report how (`chat_rendering`).
+    /// when `add_special_tokens`.
     fn tokens(
         &self,
         parsed: &ParsedInference,
@@ -930,20 +873,13 @@ impl IngressRouting {
         }
         ctx.check()?;
         let template_started = Instant::now();
-        let prompt = if let Some((chat, sent)) = parsed.chat_as_sent() {
+        let prompt = if let Some(chat) = parsed.chat() {
             if self.chats_without_template.read().contains(&entry.id) {
                 return Err(IngressError::new(http::StatusCode::NOT_IMPLEMENTED, "token_routing_unsupported", "this model's chats render with a built-in encoder whose defaults are not the engine's; use a policy that does not require exact tokens"));
             }
-            let tokenizer = &*entry.tokenizer;
-            let rendered = match self.chat_rendering(metadata) {
-                Some(rendering) => {
-                    let kwargs = atom_chat_template_kwargs(chat, sent, &rendering)
-                        .map_err(IngressError::invalid)?;
-                    super::prepare::chat_template::render_chat_messages(chat, tokenizer, &kwargs)
-                }
-                None => super::prepare::chat_template::process_chat_messages(chat, tokenizer),
-            };
-            rendered.map_err(IngressError::invalid)?.text
+            super::prepare::chat_template::process_chat_messages(chat, &*entry.tokenizer)
+                .map_err(IngressError::invalid)?
+                .text
         } else {
             metadata.text.clone()
         };
