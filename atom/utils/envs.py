@@ -140,14 +140,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Opt-in single-HCA engine pool: "auto" or explicit comma-separated HCAs.
     "ATOM_MOONCAKE_MATCHED_RAILS": lambda: os.getenv("ATOM_MOONCAKE_MATCHED_RAILS", ""),
     # Prefill (`kv_producer`, plain `mooncake`) only: gather the MLA tokens a
-    # DCP decode rank owns into a GPU staging slot and send whole destination
-    # pages instead of one RDMA descriptor per token. 0 = per-token path.
+    # DCP decode rank owns into a GPU staging slot and send one RDMA descriptor
+    # per run of adjacent destination pages instead of one per token.
+    # 0 = per-token path.
     "ATOM_PD_MLA_STAGING": lambda: _flag_env("ATOM_PD_MLA_STAGING", "1"),
     # Decode (`kv_consumer`, DCP > 1) only: give prefill stages partitions of a
-    # GPU landing pool, first come, first served (see mla_landing.py). A stage
+    # GPU landing pool, first come, first served (see mooncake/landing.py). A stage
     # writes a rank's MLA rows packed into one slot with one RDMA descriptor,
     # the decode side scatters them into the paged KV and returns the slot.
-    # 0 = staged per-page writes only.
+    # 0 = staged writes only.
     "ATOM_PD_MLA_LANDING": lambda: _flag_env("ATOM_PD_MLA_LANDING", "1"),
     # Mooncake and MoRIIO P/D: how long a failed transfer may still land. A
     # decode holds a failed receive's KV pages this long before reporting the
