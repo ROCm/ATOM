@@ -556,8 +556,10 @@ def build_replicated_front(
         lane = tid % GFX1250.wave_size
         wave = tid // GFX1250.wave_size
         gemv_tdm.prefetch_code(wave, 10 << 10)
-        tdm_timeline.open_cta(pair, wave)
-        lds = fx.SharedAllocator().allocate(Lds).peek()
+        gemv_tdm.prefetch_tokens(x, rows, HIDDEN * 2, pair, tid, PAIRS)
+        allocator = fx.SharedAllocator()
+        lds = allocator.allocate(Lds).peek()
+        tdm_timeline.open_cta(pair, wave, timeline, allocator)
         if pair < PAIRS:
             _front_tasks(
                 lds,

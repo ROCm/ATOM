@@ -247,6 +247,7 @@ def build_resident_k1(
         ),
         SOURCES,
     ), (gemv_tdm.cold_suffix(), tdm_timeline.key())
+    timeline = tdm_timeline.key()
     name = (
         f"k3_k1_gfx1250_resident_s{s}_l{qlen}_nb{declaration.nblocks}"
         f"_u{spec.gemv_unit}_q{int(spec.quant_core)}"
@@ -473,8 +474,12 @@ def build_resident_k1(
         lane = tid % GFX1250.wave_size
         wave = tid // GFX1250.wave_size
         gemv_tdm.prefetch_code(wave, 19 << 10)
-        tdm_timeline.open_cta(bid, wave)
+        if const_expr(spec.external_seam):
+            gemv_tdm.prefetch_tokens(
+                prefix, s, HIDDEN * 2, bid, tid, declaration.blocks
+            )
         allocator = fx.SharedAllocator()
+        tdm_timeline.open_cta(bid, wave, timeline, allocator)
         smem = allocator.allocate(lds_types.smem).peek()
         role = allocator.allocate(lds_types.role)
         attention = role.attn.peek()

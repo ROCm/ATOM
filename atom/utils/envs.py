@@ -671,8 +671,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # copies before the FP8 scales' load; "preload" preloads the kernel
     # arguments into SGPRs (K1 derives its late scratch pointer after the
     # projection), so the first copies wait on no load; "prefetch" adds
-    # s_prefetch_inst of the whole kernel at the entry. 0, the default,
-    # keeps the current kernels.
+    # s_prefetch_inst of the whole kernel at the entry; "xpf" prefetches the
+    # whole token input into every XCD's L2 at the entry (a freshly written
+    # input is in none of them). 0, the default, keeps the current kernels.
     "ATOM_KIMI_MONO_TDM_COLD": lambda: frozenset(
         site
         for site in os.getenv("ATOM_KIMI_MONO_TDM_COLD", "0").split(",")

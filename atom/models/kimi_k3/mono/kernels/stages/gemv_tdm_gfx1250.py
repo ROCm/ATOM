@@ -114,6 +114,36 @@ def prefetch_code(wave, code_bytes: int) -> None:
     _prefetch_on(_uniform(wave), asm)
 
 
+XCDS = 8
+
+
+def prefetch_tokens(x, rows: int, row_bytes: int, bid, tid, ctas: int) -> None:
+    """``ATOM_KIMI_MONO_TDM_COLD=xpf``: the grid's ``ctas`` CTAs prefetch the
+    128 B lines of ``rows`` token rows of ``row_bytes`` (contiguous) into L2,
+    one line a thread. Clusters go round-robin over the XCDs, so each XCD's
+    CTAs split every line between them: its ``ctas // (XCDS * TDM_CLUSTER)``
+    full rounds of clusters cover all shares, a partial round repeats some."""
+    if const_expr("xpf" not in _COLD):
+        return
+    shares = ctas // (XCDS * TDM_CLUSTER) * TDM_CLUSTER
+    lines = rows * row_bytes // 128
+    share = (bid // (XCDS * TDM_CLUSTER) * TDM_CLUSTER + bid % TDM_CLUSTER) % shares
+    per_cta = (lines + shares - 1) // shares
+    for step in range_constexpr((per_cta + THREADS - 1) // THREADS):
+        _prefetch_line(x, share + (tid + step * THREADS) * shares, lines)
+
+
+@traced
+def _prefetch_line(x, line, lines):
+    if line < lines:
+        rocdl_dialect.global_prefetch(
+            llvm.IntToPtrOp(
+                ir.Type.parse("!llvm.ptr<1>"),
+                as_ir_value(x + fx.Int64(line) * 128),
+            ).result
+        )
+
+
 def late_scratch() -> bool:
     return "preload" in _COLD
 
