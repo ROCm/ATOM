@@ -2904,6 +2904,8 @@ def _check_coverage_line(card_text, work_dir=None):
             )
         except OSError:
             return []
+        # Case-sensitive on purpose, unlike the card scan below: rules.txt is this
+        # module's own output (coverage_line), the card is written by the model.
         for ln in text.splitlines():
             if ln.strip().startswith("coverage:"):
                 want = ln.strip()

@@ -497,6 +497,23 @@ t "a refused diff is not described as measured" \
      | grep -c 'Step 1 measured')" "0"
 t "a measured BEYOND ONE PASS diff still says so" \
   "$(_cov_why "$_BIG" 'Coverage: 47 files / 16647 added lines' | grep -c 'Step 1 measured')" "1"
+# Same for the MISSING branch, which the SOFTENED fix did not cover: a refused diff has
+# no measurement there either, and nothing was checking its wording.
+t "a refused diff with no coverage line is not described as measured" \
+  "$(_cov_why '    [diff-too-large        ] A1 A2' 'Review: OK' | grep -c 'measured')" "0"
+t "MISSING names what it could not find" \
+  "$(_cov_raw '    [diff-too-large        ] A1 A2' - >/dev/null; \
+     python3 -c '
+import sys, tempfile, pathlib
+sys.path.insert(0, sys.argv[1]); import triage
+d = tempfile.mkdtemp()
+pathlib.Path(d, "rules.txt").write_text("    [diff-too-large        ] A1 A2\n")
+print(len(triage._check_coverage_line("## T\n\nReview: OK\n", d)[0][1]) > 0)' "$S")" "True"
+# A real measurement outranks the policy: `[diff-too-large]` alongside a coverage line
+# must compare against the line, not fall back to the refusal rule.
+t "a measured line outranks the diff-too-large policy" \
+  "$(_cov_raw '  coverage: 5 files / 49 added lines -- within one review pass
+    [diff-too-large        ] A1 A2' 'Coverage: 5 files / 49 added lines -- within one review pass')" "ok"
 t "an underivable diff has nothing to compare and stays silent" \
   "$(_cov_raw '    [underivable           ] A1 A2' -)" "ok"
 t "a failed derivation has nothing to compare and stays silent" \
