@@ -36,6 +36,11 @@
       "accuracy_baseline_model": { "type": "string" },
       "client_command": { "type": "string" },
       "priority": { "type": "string", "enum": ["P0", "P1", "P2"] },
+      "nightly_weekday": {
+        "description": "oot_models_accuracy.json: the Beijing weekday whose 00:00 scheduled run validates this nightly case; each case runs once a week.",
+        "type": "string",
+        "enum": ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+      },
       "lm_eval_num_fewshot": { "type": "integer", "minimum": 0 },
       "lm_eval_num_concurrent": { "type": "integer", "minimum": 1 },
       "lm_eval_use_chat_completions": { "type": "string", "enum": ["0", "1", "true", "false"] },

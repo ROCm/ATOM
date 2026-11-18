@@ -290,7 +290,8 @@ class Sequence:
         if sampling_params is None:
             sampling_params = SamplingParams()
         self.block_size = block_size
-        self.id = id or next(Sequence.counter)
+        # 0 is a valid id (engine_v1.proto, REQUESTS); only None takes the counter's.
+        self.id = id if id is not None else next(Sequence.counter)
         self.external_request_id = request_id
         self.status = SequenceStatus.WAITING
         self.type = SequenceType.DUMMY

@@ -25,6 +25,7 @@ from atom.model_ops.sparse_indexer_fp4 import (
     FP4_KV_BLOCK_SIZE,
     FP4_QUANT_BLOCK_SIZE,
     assert_fp4_indexer_supported,
+    fp4_index_block_shapes,
     fp4_index_scale_rows,
     fp4_q_scale_shape,
     sparse_indexer_fp4_enabled,
@@ -75,6 +76,21 @@ def _pool(**overrides):
     return MlaKvPool(**args)
 
 
+def test_index_cache_scale_exists_before_pool_allocation():
+    model = _import_or_skip("atom.models.deepseek_v2")
+    cache = model.DeepseekV32IndexerCache(
+        head_dim=132, dtype=torch.uint8, prefix="indexer.k_cache", cache_config="fp8"
+    )
+    # Compilation sees a tensor before allocation rebinds the FP4 plane.
+    assert isinstance(cache.kv_cache_scale, torch.Tensor)
+    assert cache.kv_cache_scale.dtype == torch.uint8
+    assert cache.kv_cache_scale.numel() == 0
+    assert cache.kv_cache[0].numel() == 0
+    allocated = torch.empty((2, 4, 64), dtype=torch.uint8)
+    cache.kv_cache_scale = allocated
+    assert cache.kv_cache_scale is allocated
+
+
 def test_predicate_is_structural_and_never_probes_the_chip_for_fp8(monkeypatch):
     monkeypatch.setattr(sparse_indexer_fp4, "_gfx", lambda: "gfx950")
     assert sparse_indexer_fp4_enabled("fp4", DSA)
@@ -114,7 +130,7 @@ def test_unsupported_fp4_requests_name_the_knob_that_blocked_them():
     def check(**overrides):
         assert_fp4_indexer_supported(
             **{
-                "fused_writer": True,
+                "packed_writer": True,
                 "prefill_context_parallel": False,
                 **overrides,
             }
@@ -122,7 +138,7 @@ def test_unsupported_fp4_requests_name_the_knob_that_blocked_them():
 
     check()
     with pytest.raises(ValueError, match="fused QK/RoPE/cache"):
-        check(fused_writer=False)
+        check(packed_writer=False)
     # PCP's candidate exchange needs fp32 weights that the FP4 writer does not
     # produce, independently of the native custom op's side-effect-only ABI.
     with pytest.raises(ValueError, match="does not support PCP"):
@@ -1180,3 +1196,104 @@ def test_qsplit_rows_partition_covers_every_row_once(num_rows, world_size):
 def test_qsplit_degenerates_to_the_whole_range_without_dcp():
     """At dcp=1 the rank's slice is every row, i.e. the pre-DCP behaviour."""
     assert qsplit_rows(4096, 0, 1) == (4096, 0, 0, 4096)
+
+
+def test_pool_abi_is_explicitly_opt_in():
+    assert fp4_index_block_shapes(64, 128) == ((1, 4, 64, 16), (1, 4, 64))
+    assert fp4_index_block_shapes(64, 128, layout="mfma") == ((4, 64, 16), (2, 32, 4))
+    assert fp4_q_scale_shape(8, 32, 128, layout="mfma") == (8, 2, 32, 2)
+    assert fp4_q_scale_shape(8, 64, 128, layout="mfma") == (8, 2, 32, 4)
+    with pytest.raises(ValueError, match="Unsupported"):
+        fp4_index_block_shapes(64, 128, layout="natural")
+    with pytest.raises(ValueError, match="H=32/64"):
+        fp4_q_scale_shape(8, 16, 128, layout="mfma")
+
+
+def test_dcp_prefill_preserves_opus_rows_and_all_four_exponents(monkeypatch):
+    mod = _import_or_skip("atom.model_ops.indexer.indexer_forward")
+
+    torch.manual_seed(17)
+    data = torch.randint(0, 256, (4, 4, 64, 16), dtype=torch.uint8)
+    natural_scale = torch.randint(0, 256, (4, 64, 4), dtype=torch.uint8)
+    scale = (
+        natural_scale.reshape(4, 2, 32, 2, 2)
+        .permute(0, 4, 2, 3, 1)
+        .contiguous()
+        .reshape(4, 2, 32, 4)
+    )
+    src = torch.randperm(256)[:64]
+    gather = torch.arange(128).reshape(2, 64).T.flatten()
+    dst = torch.arange(128)
+    monkeypatch.setattr(
+        mod,
+        "get_dcp_group",
+        lambda: SimpleNamespace(all_gather=lambda t, dim: torch.cat((t, t), dim=dim)),
+    )
+    staged, ss = mod._dcp_stage_indexer_fp4_prefill(
+        data,
+        scale,
+        SimpleNamespace(
+            dcp_indexer_fp4_read_page=src // 64,
+            dcp_indexer_fp4_read_row=src % 64,
+            dcp_indexer_gather_index=gather,
+            dcp_indexer_fp4_stage_page=dst // 64,
+            dcp_indexer_fp4_stage_row=dst % 64,
+            dcp_indexer_fp4_stage_pages=2,
+        ),
+        "mfma",
+    )
+    source = src[gather % 64]
+    assert torch.equal(
+        staged[dst // 64, :, dst % 64, :], data[source // 64, :, source % 64, :]
+    )
+    unpacked = (
+        ss.reshape(2, 2, 32, 2, 2).permute(0, 4, 2, 3, 1).contiguous().reshape(128, 4)
+    )
+    assert torch.equal(unpacked, natural_scale.reshape(-1, 4)[source])
+
+
+@pytest.mark.parametrize(
+    "layout,rope,fp4",
+    [
+        ("flydsl", 64, False),
+        ("flydsl", 64, True),
+        ("opus", 0, True),
+        ("opus", 64, True),
+    ],
+)
+@pytest.mark.parametrize("dcp", [1, 8])
+def test_hip_writer_adapter_preserves_outputs_and_dcp_semantics(
+    monkeypatch, layout, rope, fp4, dcp
+):
+    attention_mla = _import_or_skip("atom.model_ops.attention_mla")
+
+    captured = []
+    monkeypatch.setattr(attention_mla, "get_dcp_world_size", lambda: dcp)
+    monkeypatch.setattr(
+        attention_mla,
+        "_indexer_qk_rope_quant_and_cache",
+        lambda *args, **kwargs: captured.append((args, kwargs)),
+    )
+    tensors = tuple(object() for _ in range(12))
+    q_scale, k_scale = (object(), object()) if fp4 else (None, None)
+    attention_mla.indexer_qk_rope_quant_and_cache(
+        *tensors,
+        1e-6,
+        32,
+        "ue8m0",
+        0.125,
+        q_scale_out=q_scale,
+        kv_cache_scale=k_scale,
+        scale_layout=layout,
+        rope_dim=rope,
+    )
+    assert len(captured) == 1
+    args, kwargs = captured[0]
+    assert all(actual is original for actual, original in zip(args[:12], tensors))
+    if fp4:
+        assert kwargs["q_scale_out"] is q_scale
+        assert kwargs["kv_cache_scale"] is k_scale
+    else:
+        assert "q_scale_out" not in kwargs and "kv_cache_scale" not in kwargs
+    assert kwargs["compute_all_q_rope"] == (layout == "opus" or dcp > 1)
+    assert kwargs["scale_layout"] == layout and kwargs["rope_dim"] == rope

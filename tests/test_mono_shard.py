@@ -44,7 +44,10 @@ def test_v41_dims_tile_the_full_model(tp):
     d = Dims(tp)
     assert d.heads * tp == 64 and d.groups * tp == 8
     assert d.o_rows == d.groups * 1024 and d.group_k == 8 * 512
-    assert d.inter_real * tp == 2304 and d.sh_inter * tp == 2304
+    assert d.inter_real * tp == 2304
+    # the shared expert's share: as split at TP2 and TP4, padded by the loader to the group32 FP8 GEMM's 64-k step
+    # (SHARED_PAD) at TP8, 288 -> 320
+    assert d.sh_inter == {2: 1152, 4: 576, 8: 320}[tp]
     assert d.inter % 128 == 0 and 0 <= d.inter - d.inter_real < 128
     assert d.down_scale_cols % 8 == 0 and d.down_scale_cols >= d.inter // 32
     # ug covers the real width, a task of 32 ug_groups columns, inside the
@@ -58,5 +61,5 @@ def test_v41_dims_tile_the_full_model(tp):
 def test_v41_dims_at_tp8_leave_a_ragged_head_tile():
     d = Dims(8)
     assert (d.heads, d.head_tiles.count, d.head_tiles.ragged) == (8, 1, True)
-    # the shared expert's down projection: K = 288, a last quarter FP8 step
-    assert d.sh_inter % 64 == 32
+    # the shared expert's down projection: K = 288, padded by the loader to 320 (a last half FP8 step)
+    assert d.sh_inter == 320

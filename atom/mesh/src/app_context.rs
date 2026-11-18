@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     sync::{Arc, OnceLock},
     time::Duration,
 };
@@ -7,6 +8,7 @@ use data_connector::{
     ConversationItemStorage, ConversationStorage, MemoryConversationItemStorage,
     MemoryConversationStorage, MemoryResponseStorage, ResponseStorage,
 };
+use parking_lot::RwLock;
 use reqwest::Client;
 
 use crate::{
@@ -45,6 +47,10 @@ pub struct AppContext {
     pub rate_limiter: Option<Arc<TokenBucket>>,
     pub admission: Arc<crate::core::admission::AdmissionController>,
     pub tokenizer_registry: Arc<TokenizerRegistry>,
+    /// Registry ids of the tokenizers whose chats llm-tokenizer renders without
+    /// their Jinja template, found as each registers. HTTP routing does not
+    /// tokenize those chats.
+    pub chats_without_template: Arc<RwLock<HashSet<String>>>,
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
     pub tool_parser_factory: Option<ToolParserFactory>,
     pub worker_registry: Arc<WorkerRegistry>,
@@ -280,6 +286,7 @@ impl AppContextBuilder {
             tokenizer_registry: self
                 .tokenizer_registry
                 .ok_or(AppContextBuildError("tokenizer_registry"))?,
+            chats_without_template: Default::default(),
             reasoning_parser_factory: self.reasoning_parser_factory,
             tool_parser_factory: self.tool_parser_factory,
             worker_registry,
