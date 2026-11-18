@@ -1290,6 +1290,7 @@ class MooncakeConnector(KVConnectorBase):
         self._kv_staging_reserve = staging_reserve_bytes(config)
         self._page_staging_enabled = minimax_page_staging(config)
         self._send_worker_streams = threading.local()
+        self._recv_scatter_streams = threading.local()
         self._landing: LandingReceiver | None = None
         self._landing_spec = landing_spec(config)
         self._landing_credits = LandingCredits() if self.is_producer else None
@@ -2363,6 +2364,21 @@ class MooncakeConnector(KVConnectorBase):
         worker's gathers and ready event only, not every other worker's.
         """
         streams = self._send_worker_streams
+        stream = getattr(streams, "stream", None)
+        if stream is None:
+            stream = streams.stream = torch.cuda.Stream(device=self._cuda_device)
+        return stream
+
+    def _recv_scatter_stream(self) -> torch.cuda.Stream:
+        """The calling thread's scatter stream, created on first use.
+
+        The landed state scatter has to be waited on before the slot goes back
+        to the pool, and the notify listener's own current stream is the null
+        stream unless the runner moved off it. Synchronizing that would park
+        every notification behind the in-flight decode step, so the scatter
+        gets a private stream like the send side's gathers do.
+        """
+        streams = self._recv_scatter_streams
         stream = getattr(streams, "stream", None)
         if stream is None:
             stream = streams.stream = torch.cuda.Stream(device=self._cuda_device)
@@ -4697,15 +4713,18 @@ class MooncakeConnector(KVConnectorBase):
         if slot_info is not None and self._scatter_slot is not None:
             compute_slot, pool_idx = slot_info
             if pool_idx >= 0:
-                self._scatter_slot(compute_slot, pool_idx)
-                # The scatter is an async copy on this listener thread's
-                # stream, which the decode forward no longer shares once the
-                # runner computes on a High-priority one. Waiting for it here,
-                # before the request joins `done_recving`, is what keeps decode
-                # from reading a state slot that is still being written -- and
-                # keeps the next RDMA write off a staging row the scatter is
-                # still reading.
-                torch.cuda.current_stream(self._cuda_device).synchronize()
+                # The scatter is an async copy, and waiting for it here, before
+                # the request joins `done_recving`, is what keeps decode from
+                # reading a state slot that is still being written -- and keeps
+                # the next RDMA write off a staging row the scatter is still
+                # reading. It runs on a private stream so the wait covers the
+                # copy alone: this thread's current stream is the null stream
+                # unless the runner moved off it, and synchronizing that would
+                # hold every notification behind the in-flight decode step.
+                stream = self._recv_scatter_stream()
+                with torch.cuda.stream(stream):
+                    self._scatter_slot(compute_slot, pool_idx)
+                stream.synchronize()
                 self._staging_slots.release(pool_idx)
         dst_blocks = self._pending_recv_blocks.pop(req_id, None)
         if dst_blocks:
