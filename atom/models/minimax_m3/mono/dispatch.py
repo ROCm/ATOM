@@ -124,6 +124,8 @@ class MonoDecode:
         intermediate_tensors,
         inputs_embeds,
     ) -> bool:
+        if input_ids is None:
+            return False
         ok = self._supports(input_ids, positions, intermediate_tensors, inputs_embeds)
         # a captured graph's forward runs once, at capture: its replays are
         # counted by ``note_replay``; eager decode steps count here

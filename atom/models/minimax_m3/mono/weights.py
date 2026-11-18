@@ -72,6 +72,11 @@ def _mxfp8(
         linear.quant_type.value == QuantType.per_1x32.value,
         f"{name}: not per-1x32",
     )
+    # only the native loader keeps the scales row-major; a generic 1x32 one shuffles them
+    _need(
+        getattr(linear, "native_a8_group_rows", None) is not None,
+        f"{name}: not the checkpoint's native 1x32 layout",
+    )
     _need(
         w.dtype == dtypes.fp8 and tuple(w.shape) == (rows, cols) and w.is_contiguous(),
         f"{name}: weight {w.dtype} {tuple(w.shape)}",
