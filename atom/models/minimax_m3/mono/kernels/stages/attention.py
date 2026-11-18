@@ -97,7 +97,6 @@ def split_defs(k4ctx):
     v_cache = k4ctx["v_cache"]
     v_scale = k4ctx["v_scale"]
     wave = k4ctx["wave"]
-    wrsrc = k4ctx["wrsrc"]
     sp_f32 = k4ctx["sp_f32"]
 
     def put_sp_o_f32(i, ov):
@@ -113,8 +112,8 @@ def split_defs(k4ctx):
     # dynamic if / for as region state, so names must not be shared across stages.
     # ============================================================ 1. split
     def stage_split():
-        r_k, r_v = wrsrc("kv", k_cache), wrsrc("kv", v_cache)
-        r_ks, r_vs = wrsrc("kv", k_scale), wrsrc("kv", v_scale)
+        r_k, r_v = rsrc(k_cache), rsrc(v_cache)
+        r_ks, r_vs = rsrc(k_scale), rsrc(v_scale)
         PPW = SPLIT_KEYS // WAVES // PAGE16  # pages per wave
         for ts in range(start("split"), N_SPLIT * tokens, G):
             ts = fx.Int32(ts)  # token tok's partition t: ts = tok N_SPLIT + t
@@ -574,13 +573,12 @@ def o_defs(k4ctx):
     v4f = k4ctx["v4f"]
     own_task = k4ctx["own_task"]
     w_o = k4ctx["w_o"]
-    wrsrc = k4ctx["wrsrc"]
     wave = k4ctx["wave"]
     xs = k4ctx["xs"]
 
     # ================================================ 3. o_proj + attn reduce
     def stage_o():
-        r_wo = wrsrc("o", w_o)
+        r_wo = rsrc(w_o)
         O_CPW = O_K // 64 // 4  # 64-k chunks per wave: 4 waves per 16-row group
         if const_expr(attn_mxfp8):
             osc = xs + tokens * O_ROW  # the activation's codes, 4 to a word
@@ -640,7 +638,7 @@ def o_defs(k4ctx):
                 # g of dword p (shifted to byte 0)
                 ws_dw = fx.Vector(
                     bo.buffer_load(
-                        wrsrc("o", s_o),
+                        rsrc(s_o),
                         ((rg * 16 + l16) * (O_K // 32) + 16 * (wave % 4)) // 4,
                         vec_width=4,
                         dtype=T.i32,
@@ -649,7 +647,7 @@ def o_defs(k4ctx):
             else:
                 ws = fx.Float32(
                     bo.buffer_load(
-                        wrsrc("o", s_o),
+                        rsrc(s_o),
                         t * O_ROWS + tid % O_ROWS,
                         vec_width=1,
                         dtype=T.f32,
@@ -741,7 +739,7 @@ def o_defs(k4ctx):
             if const_expr(AG_RS):
                 # the owner sums every peer's partials in rank order and gathers
                 # the sums to every rank's a_ag (h_mid: the router tasks)
-                if own_task(t, "attn") & (tid < O_ROWS // 2 * tokens):
+                if own_task(t) & (tid < O_ROWS // 2 * tokens):
                     ptk = tid // (O_ROWS // 2)
                     row = t * O_ROWS + (tid % (O_ROWS // 2)) * 2
                     own = preg(sym, SY["attn"], "attn")
@@ -755,7 +753,7 @@ def o_defs(k4ctx):
                     )
                     for w in range_constexpr(W):
                         mb_put_bf(
-                            preg(peer_addr(w, "attn"), SY["a_ag"], "a_ag"),
+                            preg(peer_addr(w), SY["a_ag"], "a_ag"),
                             ptk * HIDDEN + row,
                             [t0, t1],
                         )

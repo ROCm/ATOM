@@ -37,7 +37,7 @@ OTHER = {
     "sm_scale": 0.09, "eps": 1e-5, "route_scale": 2.0, "shared_weight": 0.5,
     "swiglu_limit": 8.0, "debug": True, "xn_flag": 1,
     "shared_mxfp8": True, "mid_flag": 1, "kv_nvfp4": True, "index_nvfp4": True,
-    "probe": "loop", "sh_first": 2, "attn_mxfp8": True, "moe_a16w4": False,
+    "sh_first": 2, "attn_mxfp8": True, "moe_a16w4": False,
     "sp_f32": False, "prod_round": False, "moe_a4w4": True,
 }  # fmt: skip
 # a field whose other value is a valid build only beside other settings: both builds take them
@@ -49,10 +49,13 @@ BESIDE = {
     "moe_a16w4": {"shared_mxfp8": True},  # compiled out beside the fused shared expert
     "sh_first": {"shared_mxfp8": True, "tokens": 8},  # the wide MoE's (S >= 5) option
 }
+
+
 def _pair(name: str) -> tuple[K4Build, K4Build]:
     """The two builds that differ in field ``name``."""
     base = dataclasses.replace(BASE, **BESIDE.get(name, {}))
     return base, dataclasses.replace(base, **{name: OTHER[name]})
+
 
 def _compile(key: K4Build) -> None:
     heads = IndexHeads(key.index_heads, key.index_own)
@@ -62,7 +65,7 @@ def _compile(key: K4Build) -> None:
         timeline=key.timeline, fuse_k1=key.fuse_k1, heads=heads, debug=key.debug,
         index_topk=key.index_topk, xn_flag=key.xn_flag, shared_mxfp8=key.shared_mxfp8,
         mid_flag=key.mid_flag, kv_nvfp4=key.kv_nvfp4, index_nvfp4=key.index_nvfp4,
-        probe=key.probe, sh_first=key.sh_first, attn_mxfp8=key.attn_mxfp8,
+        sh_first=key.sh_first, attn_mxfp8=key.attn_mxfp8,
         moe_a16w4=key.moe_a16w4, sp_f32=key.sp_f32, prod_round=key.prod_round,
         moe_a4w4=key.moe_a4w4,
     )  # fmt: skip

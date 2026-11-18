@@ -193,7 +193,7 @@ def emit_pre_attn(
     tid, bid, lane, wave, x8, red, mb_put, mb_put_words, mb_poll, qkv_mb, x8_mb,
     x8s_mb, stamp, eps, tokens, heads, ptrs, signal=None, long_step=None,
     index_topk=True, dense=False, plain_norm=False, kv_nvfp4=False, index_nvfp4=False,
-    strip=(), attn_mxfp8=False, xsc=None, xsc_mb=None,
+    attn_mxfp8=False, xsc=None, xsc_mb=None,
 ):  # fmt: skip
     """K1's body: the GEMV tasks (ROWS_PER_TASK of the ``heads`` projection's rows
     each: the rank's own on CTAs 0 .. ONE_GEMV, its other index q heads' on CTAs
@@ -450,7 +450,7 @@ def emit_pre_attn(
         # scheduling barrier keeps the compiler from interleaving them again (nothing
         # before it uses a loaded value, so it does not wait either)
         rocdl.sched_barrier(0)
-        r_w = rsrc(w_qkv, 0 if "qkv" in strip else None)
+        r_w = rsrc(w_qkv)
         # 64-k chunk kc of row group rg is 1 KB at ((rg*K/32 + 2kc)*512); lane l
         # holds row l%16, k = 64kc + 16(l/16) + [0, 16).
         wts = []
@@ -470,7 +470,7 @@ def emit_pre_attn(
         if const_expr(attn_mxfp8):
             # this lane's row's E8M0 bytes of the wave's 24 blocks (6 MFMAs x 4), 8 B
             # aligned: 4 + 2 dwords; MFMA i takes block g of dword i (shifted to byte 0)
-            r_ws = rsrc(s_qkv, 0 if "qkv" in strip else None)
+            r_ws = rsrc(s_qkv)
             w_row = ((rg * ROWS_PER_TASK + lane % 16) * K_SCALE_BYTES + 24 * wave) // 4
             ws_dw = [
                 fx.Vector(bo.buffer_load(r_ws, w_row, vec_width=4, dtype=T.i32)),
@@ -480,7 +480,7 @@ def emit_pre_attn(
         else:
             ws = fx.Float32(  # row tid % 16's scale, sampled below by tid < 16 tokens
                 bo.buffer_load(
-                    rsrc(s_qkv, 0 if "qkv" in strip else None),
+                    rsrc(s_qkv),
                     rg * ROWS_PER_TASK + tid % ROWS_PER_TASK,
                     vec_width=1,
                     dtype=T.f32,
@@ -792,7 +792,7 @@ def emit_k1(
     tid, bid, lane, wave, x8, red, qs, stamp, layer, eps, index_scale, tokens,
     q_len, init_blocks, local_blocks, heads, ptrs, bt_width, signal=False, diag=None,
     region_ids=None, index_topk=True, dense=False, plain_norm=False, kv_nvfp4=False,
-    index_nvfp4=False, skip=(), strip=(), attn_mxfp8=False, xsc=None,
+    index_nvfp4=False, attn_mxfp8=False, xsc=None,
 ):  # fmt: skip
     """K1 whole: the GEMV / head / norm tasks, then every CTA's indexer scores
     (``index_topk``; else the layer reuses a selection: no index q / k, no scores).
@@ -811,7 +811,7 @@ def emit_k1(
         slot_mapping, k_cache, v_cache, k_scale, v_scale, index_cache, q_out, iq_out,
         block_table, seq_lens, iscore, scratch,
     ) = ptrs  # fmt: skip
-    mbox = Mailbox(layer, diag, region_ids, skip)
+    mbox = Mailbox(layer, diag, region_ids)
     qkv_mb = sreg(scratch, SCRATCH_QKV, "k1.qkv")
     x8_mb = scratch + fx.Int64(SCRATCH_X8)  # plain words, behind x8s's tags
     x8s_mb = sreg(scratch, SCRATCH_X8S, "k1.x8s")
@@ -900,7 +900,6 @@ def emit_k1(
         plain_norm,
         kv_nvfp4,
         index_nvfp4,
-        strip,
         attn_mxfp8,
         xsc,
         xsc_mb,
@@ -925,7 +924,6 @@ def emit_k1(
             q_frag, tokens, q_len, init_blocks, local_blocks, index_scale, index_cache,
             block_table, seq_lens, bt_width, wait_new_keys if signal else None,
             make_index_q, heads, q_frag_head, make_index_q_heads, nvfp4=index_nvfp4,
-            strip=strip,
         )  # fmt: skip
     stamp(6)
 

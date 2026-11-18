@@ -160,7 +160,7 @@ def test_zero_block_quantizes_to_zero():
 
 
 def test_fp4_error_is_about_five_times_fp8():
-    """The numerics budget of the switch (PLAN.md 4.1): one routed-MoE call vs a16w4."""
+    """The numerics budget of the switch: one routed-MoE call vs a16w4."""
     g = torch.Generator().manual_seed(1)
     E = 4
     deq = lambda w: _dq_weight(w)

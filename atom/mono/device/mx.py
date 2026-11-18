@@ -98,7 +98,7 @@ def fp4_scale(amax):
 def fp4_pack2(old, a, b, scale, sel):
     """``old`` with byte ``sel`` (0..3, compile time) := the e2m1 nibbles of ``a`` (low) and ``b``
     (high) divided by ``scale`` (a power of two, the forward scale), RNE, saturating at 6
-    (``v_cvt_scalef32_pk_fp4_f32``; bit-exact with aiter's quantization, hip/fp4_mfma_probe.cpp).
+    (``v_cvt_scalef32_pk_fp4_f32``; bit-exact with aiter's quantization).
     """
     return fx.Int32(
         rocdl.cvt_scalef32_pk_fp4_f32(

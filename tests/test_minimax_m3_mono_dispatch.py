@@ -222,7 +222,7 @@ def test_install_hands_the_runner_its_replay_counter(monkeypatch):
     ):
         assert dispatch.install_mono_decode(model, None, None) is model
         model.mono_note_replay(4)
-    assert mono.steps["production"] == {4: 2}
+    assert mono.steps[False] == {4: 2}
 
 
 def _step(n, pos_dtype=torch.int64):

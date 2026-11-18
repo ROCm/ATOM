@@ -11,7 +11,6 @@ from flydsl.expr.typing import T, as_ir_value
 
 from atom.models.minimax_m3.mono.config import (
     HIDDEN,
-    MAX_TOKENS,
     N_ROUTED,
     SHARED_EXPERT,
     TOP_K,
@@ -92,10 +91,6 @@ def router_defs(k4ctx):
     tokens = k4ctx["tokens"]
     v4f = k4ctx["v4f"]
     w_gate = k4ctx["w_gate"]
-    wrsrc = k4ctx["wrsrc"]
-    PIN = k4ctx["P"].pin
-    tl = k4ctx["tl"]
-    layer = k4ctx["layer"]
     wave = k4ctx["wave"]
     xs = k4ctx["xs"]
 
@@ -164,7 +159,7 @@ def router_defs(k4ctx):
     def lds_b8(chunk_word):
         """This lane's B operand of the 128-k chunk at LDS word ``chunk_word``:
         fp8 k 16 g .. + 16 then 64 + 16 g .. + 16 (g = lane // 16), the
-        f8f6f4 MFMA's B layout (harness/mfma_f4f8_probe.py)."""
+        f8f6f4 MFMA's B layout."""
         h = [
             fx.Vector(
                 fx.ptr_load(xs + (chunk_word + 16 * j + 4 * g4), result_type=v4f)
@@ -177,7 +172,7 @@ def router_defs(k4ctx):
 
     def lds_b4(word):
         """This lane's MXFP4 B operand (a4w4) of the 128-k chunk at LDS word ``word``: k 32 g .. + 32
-        (g = lane // 16), 16 B, the fp4 A tile's K assignment (hip/fp4_mfma_probe.cpp).
+        (g = lane // 16), 16 B, the fp4 A tile's K assignment.
         """
         return fx.Vector(fx.ptr_load(xs + (word + 4 * g4), result_type=v4f)).bitcast(
             fx.Int32
@@ -196,7 +191,7 @@ def router_defs(k4ctx):
     # ============================================================ 4. router
     def stage_router():
         r_g = rsrc(g_post)
-        r_gate = wrsrc("gate", w_gate)
+        r_gate = rsrc(w_gate)
         # this thread's 12 consecutive elements of the row (512 x 12 = HIDDEN):
         # the poll is 3 specs per rank, 12 in one batch, every thread busy
         RE = HIDDEN // THREADS
@@ -382,26 +377,8 @@ def router_defs(k4ctx):
             # routing starts at the max rounds
             sc = hw_rcp(1.0 + hw_exp2(-bf16_round(logit) * LOG2E))
             rk = route_key(sc + bias_r, e_r)
-            if const_expr(PIN):
-                # a probe: the real step's pair, whatever this build's data says (the
-                # select keeps the computed pair live: a nonzero table word wins)
-                pv = fx.Vector(
-                    bo.buffer_load(
-                        rsrc(tl),
-                        ((layer * MAX_TOKENS + k) * N_ROUTED + e_r) * 4,
-                        vec_width=4,
-                        dtype=T.i32,
-                    )
-                )
-                rk = (pv[0] != 0).select(fx.Int32(pv[0]), rk)
-                sc_bits = (pv[2] != 0).select(fx.Int32(pv[2]), sc.bitcast(fx.Int32))
-                if lane < SCORE_COPIES:
-                    mb_put_words(scores_copy(lane, k), e_r * 2, [rk, sc_bits])
-            else:
-                if lane < SCORE_COPIES:
-                    mb_put_words(
-                        scores_copy(lane, k), e_r * 2, [rk, sc.bitcast(fx.Int32)]
-                    )
+            if lane < SCORE_COPIES:
+                mb_put_words(scores_copy(lane, k), e_r * 2, [rk, sc.bitcast(fx.Int32)])
             if const_expr(XN_FLAG and not XN_EARLY):
                 # this task's xn slice is out: its flag (after the logits, not
                 # in front of them)

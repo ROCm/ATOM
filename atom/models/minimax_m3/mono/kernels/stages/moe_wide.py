@@ -142,7 +142,7 @@ def moe_wide_defs(k4ctx):
     rwt = k4ctx["rwt"]
     s13 = k4ctx["s13"]
     s2 = k4ctx["s2"]
-    scores_read = k4ctx["scores_read"]
+    scores_copy = k4ctx["scores_copy"]
     stamp = k4ctx["stamp"]
     start = k4ctx["start"]
     swiglu_limit = k4ctx["swiglu_limit"]
@@ -153,7 +153,6 @@ def moe_wide_defs(k4ctx):
     urow = k4ctx["urow"]
     uwt = k4ctx["uwt"]
     w13 = k4ctx["w13"]
-    wrsrc = k4ctx["wrsrc"]
     w2 = k4ctx["w2"]
     wave = k4ctx["wave"]
     xs = k4ctx["xs"]
@@ -200,12 +199,11 @@ def moe_wide_defs(k4ctx):
         u = t // UG_PER_SLOT
         cg = t % UG_PER_SLOT
         e_u = fx.min(uniform(fx.ptr_load(uexp + u)), SHARED_EXPERT)
-        r_w = wrsrc(
-            "moeu",
+        r_w = rsrc(
             w13 + fx.Int64(e_u) * W13_BYTES,
             has.select(fx.Int32(W13_BYTES), fx.Int32(0)),
         )
-        r_s = wrsrc("moeu", s13, has.select(fx.Int32(S13_BYTES), fx.Int32(0)))
+        r_s = rsrc(s13, has.select(fx.Int32(S13_BYTES), fx.Int32(0)))
         wts = []
         scs = []
         for gu in range_constexpr(2):
@@ -234,8 +232,8 @@ def moe_wide_defs(k4ctx):
     def wsh_load(cg, has):
         """The shared expert's up / gate tiles of 16-row group ``cg`` (MXFP8, one scale
         a tile): wts[gu][chunk], scs[gu][chunk]; without the task, zero-sized reads."""
-        r_w = wrsrc("shu", w13s, has.select(fx.Int32(W13S_BYTES), fx.Int32(0)))
-        r_s = wrsrc("shu", s13s, has.select(fx.Int32(S13S_BYTES), fx.Int32(0)))
+        r_w = rsrc(w13s, has.select(fx.Int32(W13S_BYTES), fx.Int32(0)))
+        r_s = rsrc(s13s, has.select(fx.Int32(S13S_BYTES), fx.Int32(0)))
         wts, scs = [], []
         for gu in range_constexpr(2):
             row = (gu * UG_PER_SLOT + cg) * 16 + l16
@@ -482,7 +480,7 @@ def moe_wide_defs(k4ctx):
         wave_toks = [fx.min(wave + WAVES * j, tokens - 1) for j in range(ROUTE_ITERS)]
         sg = mb_poll(
             [
-                (scores_read(mine, k), (lane + 64 * h) * 2, 2)
+                (scores_copy(mine, k), (lane + 64 * h) * 2, 2)
                 for k in wave_toks
                 for h in range(2)
             ]
@@ -717,8 +715,7 @@ def moe_wide_defs(k4ctx):
             dkc = fx.min(dkc, DN_KC - 1)
             de = fx.min(uniform(fx.ptr_load(uexp + du)), SHARED_EXPERT)
             dwv = fp4_tile_load(
-                wrsrc(
-                    "moed",
+                rsrc(
                     w2 + fx.Int64(de) * W2_BYTES,
                     ok.select(fx.Int32(W2_BYTES), fx.Int32(0)),
                 ),
@@ -729,7 +726,7 @@ def moe_wide_defs(k4ctx):
                 lane * 4,
             )
             dsc = e8m0_load(
-                wrsrc("moed", s2, ok.select(fx.Int32(S2_BYTES), fx.Int32(0))),
+                rsrc(s2, ok.select(fx.Int32(S2_BYTES), fx.Int32(0))),
                 group_scale_byte(de, HIDDEN, rg_d, dkc, W2_SCALE_COLS),
             )
             return dwv, dsc, du, dkc, ok
@@ -751,8 +748,8 @@ def moe_wide_defs(k4ctx):
                 sok = skc < DN_KC
                 skc = fx.min(skc, DN_KC - 1)
                 srow = rg_d * 16 + l16
-                sr_w = wrsrc("shd", w2s, sok.select(fx.Int32(W2S_BYTES), fx.Int32(0)))
-                sr_s = wrsrc("shd", s2s, sok.select(fx.Int32(S2S_BYTES), fx.Int32(0)))
+                sr_w = rsrc(w2s, sok.select(fx.Int32(W2S_BYTES), fx.Int32(0)))
+                sr_s = rsrc(s2s, sok.select(fx.Int32(S2S_BYTES), fx.Int32(0)))
                 sh_units.append(
                     (
                         fp8_tile_load(sr_w, srow, INTER, skc),
@@ -884,8 +881,7 @@ def moe_wide_defs(k4ctx):
                 uniform(fx.ptr_load(uexp + fx.min(du, U_MAX - 1))), SHARED_EXPERT
             )
             dwv = fp4_tile_load(
-                wrsrc(
-                    "moed",
+                rsrc(
                     w2 + fx.Int64(de) * W2_BYTES,
                     ok.select(fx.Int32(W2_BYTES), fx.Int32(0)),
                 ),
@@ -896,7 +892,7 @@ def moe_wide_defs(k4ctx):
                 lane * 4,
             )
             dsc = e8m0_load(
-                wrsrc("moed", s2, ok.select(fx.Int32(S2_BYTES), fx.Int32(0))),
+                rsrc(s2, ok.select(fx.Int32(S2_BYTES), fx.Int32(0))),
                 group_scale_byte(de, HIDDEN, rg_d, i % DN_KC, W2_SCALE_COLS),
             )
             return dwv, dsc
@@ -907,8 +903,8 @@ def moe_wide_defs(k4ctx):
             sok = skc < DN_KC
             skc = fx.min(skc, DN_KC - 1)
             srow = rg_d * 16 + l16
-            sr_w = wrsrc("shd", w2s, sok.select(fx.Int32(W2S_BYTES), fx.Int32(0)))
-            sr_s = wrsrc("shd", s2s, sok.select(fx.Int32(S2S_BYTES), fx.Int32(0)))
+            sr_w = rsrc(w2s, sok.select(fx.Int32(W2S_BYTES), fx.Int32(0)))
+            sr_s = rsrc(s2s, sok.select(fx.Int32(S2S_BYTES), fx.Int32(0)))
             sh_units.append(
                 (
                     fp8_tile_load(sr_w, srow, INTER, skc),
@@ -1030,8 +1026,7 @@ def moe_wide_defs(k4ctx):
                 uniform(fx.ptr_load(uexp + fx.min(du, U_MAX - 1))), SHARED_EXPERT
             )
             dwv = fp4_tile_load(
-                wrsrc(
-                    "moed",
+                rsrc(
                     w2 + fx.Int64(de) * W2_BYTES,
                     ok.select(fx.Int32(W2_BYTES), fx.Int32(0)),
                 ),
@@ -1042,7 +1037,7 @@ def moe_wide_defs(k4ctx):
                 lane * 4,
             )
             dsc = e8m0_load(
-                wrsrc("moed", s2, ok.select(fx.Int32(S2_BYTES), fx.Int32(0))),
+                rsrc(s2, ok.select(fx.Int32(S2_BYTES), fx.Int32(0))),
                 group_scale_byte(de, HIDDEN, rg_d, i % DN_KC, W2_SCALE_COLS),
             )
             return dwv, dsc
@@ -1053,8 +1048,8 @@ def moe_wide_defs(k4ctx):
             sok = skc < DN_KC
             skc = fx.min(skc, DN_KC - 1)
             srow = rg_d * 16 + l16
-            sr_w = wrsrc("shd", w2s, sok.select(fx.Int32(W2S_BYTES), fx.Int32(0)))
-            sr_s = wrsrc("shd", s2s, sok.select(fx.Int32(S2S_BYTES), fx.Int32(0)))
+            sr_w = rsrc(w2s, sok.select(fx.Int32(W2S_BYTES), fx.Int32(0)))
+            sr_s = rsrc(s2s, sok.select(fx.Int32(S2S_BYTES), fx.Int32(0)))
             sh_units.append(
                 (
                     fp8_tile_load(sr_w, srow, INTER, skc),

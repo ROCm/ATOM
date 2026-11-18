@@ -14,7 +14,7 @@ recomputes everything else in float64 / float32 from the logical (unshuffled) we
   shared (always)   : xn -> MXFP8, MXFP8 gate/up, swiglu, mid -> bf16 -> MXFP8, MXFP8 down
   ``prod_round`` off: routed f32 sum (slot weights applied in f32) + shared f32, rounded to bf16 once (the old kernel)
   ``prod_round`` on : shared gate/up rounded to bf16 before swiglu, (a16w4) per-slot bf16(acc * w), routed = bf16(sum of the 4 slot
-                      values), shared down rounded to bf16, out = bf16(routed + shared)  (PLAN.md section 0 / 3)
+                      values), shared down rounded to bf16, out = bf16(routed + shared)
   (``a16w4`` alone keeps the f32 weight / sum / single rounding of the old kernel.)
 
 Tolerances: rel L2 of a token's row (median <= 1e-3, max <= 5e-3; measured legacy 2e-4..1.2e-3 median, <= 2.5e-3 max) against the oracle of the same flags. What is not bit-exact on

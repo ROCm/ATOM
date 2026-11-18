@@ -113,7 +113,6 @@ def moe_common_defs(k4ctx):
     tid = k4ctx["tid"]
     tokens = k4ctx["tokens"]
     w13 = k4ctx["w13"]
-    wrsrc = k4ctx["wrsrc"]
     w2 = k4ctx["w2"]
     w2s = k4ctx["w2s"]
     w13s = k4ctx["w13s"]
@@ -166,8 +165,8 @@ def moe_common_defs(k4ctx):
             fx.Int32(SHARED_EXPERT),
             fx.min(uniform(fx.ptr_load(route + (8 * tk + slot))), SHARED_EXPERT),
         )
-        r_w = wrsrc("moeu", w13 + fx.Int64(e_u) * W13_BYTES)
-        r_s = wrsrc("moeu", s13)
+        r_w = rsrc(w13 + fx.Int64(e_u) * W13_BYTES)
+        r_s = rsrc(s13)
         wts = []  # [gate, up][chunk]
         scs = []
         for gu in range_constexpr(2):
@@ -284,10 +283,10 @@ def moe_common_defs(k4ctx):
         if const_expr(SH8):
             sizes = (W13S_BYTES, S13S_BYTES)
             if const_expr(has is None):
-                r_w, r_s = wrsrc("shu", w13s), wrsrc("shu", s13s)
+                r_w, r_s = rsrc(w13s), rsrc(s13s)
             else:  # a CTA without the task reads through zero-sized buffers
-                r_w = wrsrc("shu", w13s, has.select(fx.Int32(sizes[0]), fx.Int32(0)))
-                r_s = wrsrc("shu", s13s, has.select(fx.Int32(sizes[1]), fx.Int32(0)))
+                r_w = rsrc(w13s, has.select(fx.Int32(sizes[0]), fx.Int32(0)))
+                r_s = rsrc(s13s, has.select(fx.Int32(sizes[1]), fx.Int32(0)))
             kcs = [wave * UG_CPW + i for i in range(UG_CPW)]
             return (
                 [fp8_tile_load(r_w, row, HIDDEN, kc) for kc in kcs],
@@ -295,15 +294,14 @@ def moe_common_defs(k4ctx):
             )
         rg = row // 16
         if const_expr(has is None):
-            r_w = wrsrc("moeu", w13 + fx.Int64(SHARED_EXPERT) * W13_BYTES)
-            r_s = wrsrc("moeu", s13)
+            r_w = rsrc(w13 + fx.Int64(SHARED_EXPERT) * W13_BYTES)
+            r_s = rsrc(s13)
         else:  # a CTA without the task reads through zero-sized buffers
-            r_w = wrsrc(
-                "moeu",
+            r_w = rsrc(
                 w13 + fx.Int64(SHARED_EXPERT) * W13_BYTES,
                 has.select(fx.Int32(W13_BYTES), fx.Int32(0)),
             )
-            r_s = wrsrc("moeu", s13, has.select(fx.Int32(S13_BYTES), fx.Int32(0)))
+            r_s = rsrc(s13, has.select(fx.Int32(S13_BYTES), fx.Int32(0)))
         wts = []
         scs = []
         # the row's part of scale_index, once: a chunk adds 256 (kc / 2) + 2 (kc % 2)
@@ -382,7 +380,7 @@ def moe_common_defs(k4ctx):
                 kc = jj % DN_KC
             e_d = fx.min(uniform(fx.ptr_load(route + (8 * k + sl))), SHARED_EXPERT)
             wv = fp4_tile_load(
-                wrsrc("moed", w2 + fx.Int64(e_d) * W2_BYTES, dn_bytes),
+                rsrc(w2 + fx.Int64(e_d) * W2_BYTES, dn_bytes),
                 0,
                 rg_d,
                 INTER,
@@ -390,7 +388,7 @@ def moe_common_defs(k4ctx):
                 lane * 4,
             )
             sc = e8m0_load(
-                wrsrc("moed", s2, dn_scale_bytes),
+                rsrc(s2, dn_scale_bytes),
                 group_scale_byte(e_d, HIDDEN, rg_d, kc, W2_SCALE_COLS),
             )
             wgt = (j < DN_UNITS).select(
@@ -404,8 +402,8 @@ def moe_common_defs(k4ctx):
         rg_d = td * 2 + wave // 4
         units = []
         if const_expr(SH8):
-            r_w = wrsrc("shd", w2s, has_dn.select(fx.Int32(W2S_BYTES), fx.Int32(0)))
-            r_s = wrsrc("shd", s2s, has_dn.select(fx.Int32(S2S_BYTES), fx.Int32(0)))
+            r_w = rsrc(w2s, has_dn.select(fx.Int32(W2S_BYTES), fx.Int32(0)))
+            r_s = rsrc(s2s, has_dn.select(fx.Int32(S2S_BYTES), fx.Int32(0)))
             for i in range_constexpr(SH_UPW):
                 j = (wave % 4) + 4 * i
                 kc = fx.min(j, DN_KC - 1)
@@ -426,7 +424,7 @@ def moe_common_defs(k4ctx):
             j = (wave % 4) + 4 * i
             kc = fx.min(j, DN_KC - 1)
             wv = fp4_tile_load(
-                wrsrc("moed", w2 + fx.Int64(SHARED_EXPERT) * W2_BYTES, dn_bytes),
+                rsrc(w2 + fx.Int64(SHARED_EXPERT) * W2_BYTES, dn_bytes),
                 0,
                 rg_d,
                 INTER,
@@ -434,7 +432,7 @@ def moe_common_defs(k4ctx):
                 lane * 4,
             )
             sc = e8m0_load(
-                wrsrc("moed", s2, dn_scale_bytes),
+                rsrc(s2, dn_scale_bytes),
                 group_scale_byte(SHARED_EXPERT, HIDDEN, rg_d, kc, W2_SCALE_COLS),
             )
             wgt = (j < DN_KC).select(fx.Float32(shared_weight), fx.Float32(0.0))

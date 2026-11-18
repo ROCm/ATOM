@@ -46,7 +46,6 @@ This module builds the kernel and runs its program: the stages' functions live i
 in program order.
 """
 
-import hashlib
 from dataclasses import dataclass, field
 
 import flydsl.compiler as flyc
@@ -125,23 +124,16 @@ from atom.models.minimax_m3.mono.layout import (
     xb_lds_rows,
 )
 from atom.models.minimax_m3.mono.sources import SOURCES
-from atom.mono.device.ops import CM_DEV, kernel_symbol, launcher, load_ptr64, rsrc
+from atom.mono.device.ops import CM_DEV, kernel_symbol, launcher, load_ptr64
 from atom.mono.device.ops import block_max as block_max_of
 from atom.mono.device.stamps import stamp as stamp_point
 from atom.mono.device.stamps import stamp_begin, stamp_flush
-from atom.mono.device.sync import Addr, Mailbox, preg, shift, sreg
+from atom.mono.device.sync import Mailbox, preg, shift, sreg
 from atom.mono.plan.build_key import key_tuple, symbol_params
 from atom.mono.plan.execution import BLOCKS, THREADS, WAVES, first_task
-from atom.mono.plan.probe import parse as parse_probe
-from atom.mono.plan.trace import Space, enter_stage
+from atom.mono.plan.trace import enter_stage
 from atom.mono.runtime.abi import KernelAbi
 from atom.mono.runtime.debug import region_ids
-
-
-def hash_probe(text: str) -> int:
-    """A stable number for a probe string (the symbol names the probe build)."""
-    return int.from_bytes(hashlib.sha256(text.encode()).digest()[:4], "big")
-
 
 # The launch goes on the caller's current stream (graph capture included).
 _CURRENT_STREAM = fx.Stream(None)
@@ -184,14 +176,13 @@ class K4Build:
     mid_flag: int = 0
     kv_nvfp4: bool = False
     index_nvfp4: bool = False
-    probe: str = ""  # a timing probe (``atom.mono.plan.probe``); empty: production
     sh_first: int = (
         0  # wide MoE: the shared pairs first, their tiles loaded early; 0 off, else ``UG_SHARED_UNITS``
     )
     attn_mxfp8: bool = (
         False  # qkv / o_proj are native MXFP8 1x32 (E8M0 scales), not ptpc fp8
     )
-    # numerics aligned with the production path (task-mono-align/PLAN.md); False = the
+    # numerics aligned with the production path; False = the
     # previous behaviour, code object for code object
     moe_a16w4: bool = True  # routed experts: bf16 activations (F1); False: MXFP8 (a8w4)
     sp_f32: bool = True  # split -> merge partition outputs in f32 (F2); False: bf16
@@ -223,7 +214,6 @@ def build_post_attn_kernel(
     mid_flag: int = 0,
     kv_nvfp4: bool = False,
     index_nvfp4: bool = False,
-    probe: str = "",
     sh_first: int = 0,
     attn_mxfp8: bool = False,
     moe_a16w4: bool = True,
@@ -272,11 +262,10 @@ def build_post_attn_kernel(
         route_scale=route_scale, shared_weight=shared_weight,
         swiglu_limit=swiglu_limit, debug=debug, xn_flag=xn_flag,
         shared_mxfp8=shared_mxfp8, mid_flag=mid_flag, kv_nvfp4=kv_nvfp4,
-        index_nvfp4=index_nvfp4, probe=probe, sh_first=sh_first, attn_mxfp8=attn_mxfp8,
+        index_nvfp4=index_nvfp4, sh_first=sh_first, attn_mxfp8=attn_mxfp8,
         moe_a16w4=moe_a16w4, sp_f32=sp_f32, prod_round=prod_round,
         moe_a4w4=moe_a4w4,
     )  # fmt: skip
-    P = parse_probe(probe)
     build_key = key_tuple(key, SOURCES)  # the launcher references it: keyed
     # a debug build's wait records name a region by its ``region_id``
     REGION_IDS = region_ids(
@@ -344,11 +333,9 @@ def build_post_attn_kernel(
         # fuse_k1: index q (every head's: in the pool)
         qs: fx.Array[fx.Float32, HEAD_DIM // 2 * tokens if heads.count == 1 else 1, 16]
 
-    sym_extra = {"pb": abs(hash_probe(probe)) % 10**8} if probe else {}
     kernel_name = kernel_symbol(
         "minimax_m3_mono_layer" if fuse_k1 else "minimax_m3_post_attn",
         **symbol_params(key),
-        **sym_extra,
     )
 
     # the kernel body rebuilds IndexHeads from ints: an object in a closure is not
@@ -438,7 +425,7 @@ def build_post_attn_kernel(
         v2i = fx.Vector.make_type(2, fx.Int32)
 
         diag = scratch + fx.Int64(SCRATCH["diag"]) if debug else None
-        mbox = Mailbox(layer, diag, REGION_IDS, P.skip)
+        mbox = Mailbox(layer, diag, REGION_IDS)
         # Plain names, not method calls: flydsl's AST rewriter carries every local
         # whose method is called inside a dynamic if/for as loop state.
         mb_put = mbox.put
@@ -466,20 +453,6 @@ def build_post_attn_kernel(
                 mr("scores"), (fx.Int64(c) * MAX_TOKENS + fx.Int64(k)) * (N_ROUTED * 16)
             )
 
-        def scores_read(c, k=0):
-            """Where a consumer reads copy c of token k's router outputs: the mailbox,
-            or (a probe skipping the ``scores`` wait) the pinned table's image of the
-            real step's pairs, so the route is the real one without the wait."""
-            if const_expr(P.pin and "scores" in P.skip):
-                return Addr(
-                    "scores",
-                    Space.SCRATCH,
-                    tl
-                    + fx.Int64(layer) * (MAX_TOKENS * N_ROUTED * 16)
-                    + fx.Int64(k) * (N_ROUTED * 16),
-                )
-            return scores_copy(c, k)
-
         def route_key(v, e):
             """Signed-orderable i32 of score ``v`` with its low 7 bits replaced by
             127 - expert ``e``: a pick is one integer max, a tie goes to the lower
@@ -488,21 +461,17 @@ def build_post_attn_kernel(
             b = (b < 0).select(b ^ fx.Int32(0x7FFFFFFF), b)
             return (b & fx.Int32(-128)) | (127 - e)
 
-        # each wave pushes to one peer (a ``loop`` probe: to this rank's own buffer)
+        # each wave pushes to one peer
+
         peer_dst = load_ptr64(peers, fx.min(wave, W - 1))
         AG_RS = tokens >= AG_RS_FROM
 
-        def peer_addr(w, region=""):
-            return sym if region in P.loop else load_ptr64(peers, w)
+        def peer_addr(w):
+            return load_ptr64(peers, w)
 
-        def own_task(t, region=""):
+        def own_task(t):
             """Whether this rank sums (and gathers) row group t's all-reduce."""
-            return (t >= 0) if region in P.loop else (t % W == rank)
-
-        def wrsrc(kind, addr, nbytes=None):
-            """A weight / cache buffer; a probe's ``nb`` kinds read through a
-            zero-sized one (the loads issue, no byte comes from memory)."""
-            return rsrc(addr, 0 if kind in P.nb else nbytes)
+            return t % W == rank
 
         def start(name):
             return first_task(bid, BASE[name])
@@ -519,22 +488,19 @@ def build_post_attn_kernel(
             the peers' ``region``, a pair a lane, wave w -> peer w (itself too);
             ``only``: to that peer alone."""
             half = n_rows // 2
-            looped = region in P.loop
-            to = (wave < W) if (only is None or looped) else (wave == only)
-            dst = sym if looped else peer_dst
+            to = (wave < W) if only is None else (wave == only)
+
             for c in range_constexpr((half * tokens + 63) // 64):
                 i = lane + 64 * c
                 if to & (i < half * tokens):
                     mb_put_bf(
-                        preg(dst, SY[region], region),
-                        ((wave if looped else rank) * MAX_TOKENS + i // half) * HIDDEN
+                        preg(peer_dst, SY[region], region),
+                        (rank * MAX_TOKENS + i // half) * HIDDEN
                         + row0
                         + (i % half) * 2,
                         [fx.ptr_load(misc + i * 2), fx.ptr_load(misc + (i * 2 + 1))],
                     )
 
-        if const_expr(P.exit == "start"):
-            return
         stamp_begin(timeline, tls, tid, TL_POINTS)
 
         if const_expr(fuse_k1):
@@ -567,13 +533,11 @@ def build_post_attn_kernel(
                 index_topk,
                 kv_nvfp4=kv_nvfp4,
                 index_nvfp4=index_nvfp4,
-                skip=P.skip,
-                strip=P.nb,
                 attn_mxfp8=attn_mxfp8,
                 xsc=xs + tokens * (HIDDEN // 4) if attn_mxfp8 else None,
             )  # fmt: skip
             gpu.barrier()
-            k1_mbox = Mailbox(layer, diag, REGION_IDS, P.skip)
+            k1_mbox = Mailbox(layer, diag, REGION_IDS)
             k1_poll = k1_mbox.poll
             hdone_mb = sreg(scratch1, K1_SCRATCH_HDONE, "k1.hdone")
             rdone_mb = sreg(scratch1, K1_SCRATCH_RDONE, "k1.rdone")
@@ -581,9 +545,6 @@ def build_post_attn_kernel(
             # K1's hand-offs: the stage factories bind every name they read, used
             # only under fuse_k1 or not (``stages``)
             k1_poll = hdone_mb = rdone_mb = None
-        if const_expr(P.exit == "k1"):
-            return
-
         # ============================================================ 0. index
         # Indexer: K1 scored every block the selection does not pin (index_score);
         # here only the selection runs.
@@ -613,13 +574,9 @@ def build_post_attn_kernel(
         if const_expr(index_topk):
             enter_stage("select_long")
             stage_select_long()
-        if const_expr(P.exit == "sel"):
-            return
         enter_stage("split")
         stage_split()
         stamp(1)
-        if const_expr(P.exit == "split"):
-            return
 
         k4ctx.update(locals())
         k4ctx.update(merge_defs(k4ctx))
@@ -627,8 +584,6 @@ def build_post_attn_kernel(
 
         enter_stage("merge")
         stage_merge()
-        if const_expr(P.exit == "merge"):
-            return
 
         k4ctx.update(locals())
         k4ctx.update(o_defs(k4ctx))
@@ -637,8 +592,6 @@ def build_post_attn_kernel(
         enter_stage("o")
         stage_o()
         stamp(4)
-        if const_expr(P.exit == "o"):
-            return
 
         # a8w4 operands in xs (Int32 words, never through f32 arithmetic): the up /
         # gate stage holds every token's MXFP8 xn then its E8M0 scales; the down
@@ -668,8 +621,6 @@ def build_post_attn_kernel(
         enter_stage("router")
         stage_router()
         stamp(5)
-        if const_expr(P.exit == "router"):
-            return
 
         # ================================ 5. experts: up / gate -> down -> FFN reduce
         UG_KC = HIDDEN // 128  # 128-k chunks
