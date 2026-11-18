@@ -42,6 +42,7 @@ from atom.kv_transfer.offload.chunked_scheduler import (
     DENSE_PAGE_STORE_CHANNEL,
 )
 from atom.kv_transfer.offload.hybrid.dsv4.codec import DSV4PageSlotCodec
+from atom.kv_transfer.offload.kv_store import worker as store_worker_mod
 from atom.kv_transfer.offload.metadata import (
     LMCacheOffloadMetadata,
     LMCacheReqMeta,
@@ -49,7 +50,6 @@ from atom.kv_transfer.offload.metadata import (
     SaveSpec,
 )
 from atom.kv_transfer.offload.mooncake_store import keys
-from atom.kv_transfer.offload.mooncake_store import worker as worker_mod
 from atom.kv_transfer.offload.mooncake_store.worker import (
     MooncakeStoreOffloadConnector,
 )
@@ -163,7 +163,9 @@ def test_kv_round_trip_through_the_store(monkeypatch, layout):
     if _RDMA_DEVICE:
         monkeypatch.setenv("MC_NUM_QP_PER_EP", "1")
     monkeypatch.setattr(
-        worker_mod, "_tp_group", lambda: SimpleNamespace(world_size=1, rank_in_group=0)
+        store_worker_mod,
+        "_tp_group",
+        lambda: SimpleNamespace(world_size=1, rank_in_group=0),
     )
     device = torch.device("cuda", torch.cuda.current_device())
     kv_caches = _kv_caches(device)
