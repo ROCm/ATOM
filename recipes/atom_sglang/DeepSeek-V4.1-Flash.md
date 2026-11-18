@@ -161,11 +161,14 @@ output tokens) it costs throughput instead: with `--max-running-requests` = conc
 
 ## Measured
 
-The tables below were measured on an earlier PR 3102 head (fc0acaf6b). Re-checked on 3102 at 111930487 (aiter #7820
-head 7bec3c672), launch above, same GPUs and client: 3-shot GSM8K (1319 prompts, cold) wall 161.4 s at concurrency 32
-and 113.4 s at 64 (native ATOM DSpark with prefix caching, a fresh server for each: 162.1 s and 123.5 s); acceptance
-49.37%, accept length 3.47 (native 49.56%, 3.48) on the same prompts (z = -0.58); lm_eval GSM8K 3-shot 0.920 (native
-0.927).
+The tables below were measured on an earlier PR 3102 head (fc0acaf6b). Re-checked on 3102 at 483d8feae with the
+validated aiter above, the launch above, 4 fresh plugin servers (2 with and 2 without
+`SGLANG_DSPARK_USE_GREEDY_DRAFT=1`) and 2 fresh native ATOM DSpark servers with prefix caching, same GPUs and client:
+3-shot GSM8K (1319 prompts, cold) wall 154.7-157.0 s at concurrency 32 and 109.5-111.1 s at 64 (native 158.2 s and
+122.2 s); acceptance 49.43-49.58% at 32 and 49.19-49.63% at 64, accept length 3.46-3.48 (native 49.57% and 49.48%)
+on the same prompts (|z| <= 0.43 at 32 and <= 0.94 at 64); lm_eval GSM8K 3-shot 0.922-0.923 on every plugin server; radix-hit TTFT
+(4105-token prompt, 3840 tokens cached, 12 pairs per prompt set, 2 sets per server) 97-128 ms per set, 108 ms mean
+(native 105-107 ms); first-wave TTFT at 64 clients on a fresh server 1.34-1.39 s (native 1.45 s).
 
 TP4 MI308X, SGLang 0.5.22, DSpark block 5 + radix cache
 + overlap + decode / verify / draft CUDA graphs + prefill token graphs, real DSpark acceptance (49-50% on GSM8K, accept
