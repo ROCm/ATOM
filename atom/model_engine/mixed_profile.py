@@ -46,6 +46,8 @@ def mixed_profile_shapes(
         1,
         min(max_seqs - 1, max(1, token_budget // (2 * width))),
         min(max_seqs - 1, (token_budget - floor) // width),
+        # A short prefill leaves its unused token budget to more decode rows.
+        min(max_seqs - 1, (token_budget - 1) // width),
     }
     return [
         (min(token_budget - n * width, (max_seqs - n) * max_model_len), n, width)

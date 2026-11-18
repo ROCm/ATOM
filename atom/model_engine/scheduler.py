@@ -1573,7 +1573,13 @@ class Scheduler:
         candidates = list(self._decode_candidates(scheduled_seqs))
         budget = self._budget_for_decodes(len(candidates))
         width = self.decode_spec_width + 1
-        seats = (self.max_num_batched_tokens - budget) // width
+        # Prefill may use less than its token budget. Protect every decode
+        # that could join even a one-token, one-row prefill; the decode loop
+        # can spend all remaining tokens. Without prefill, no pages are spent
+        # on its admission and the ordinary decode checks govern the step.
+        seats = max(
+            0, min(self.max_num_seqs - 1, (self.max_num_batched_tokens - 1) // width)
+        )
         blocks = sum(
             self.block_manager.append_blocks_needed(seq, width, self.draft_lookahead)
             for seq in candidates[:seats]
