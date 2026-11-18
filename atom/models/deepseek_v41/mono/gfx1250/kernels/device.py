@@ -436,6 +436,13 @@ def unlikely(b):
     return fx.Boolean(llvm.call_intrinsic(i1, "llvm.expect.i1", [_v(b), f], [], []))
 
 
+def likely(b):
+    """llvm.expect(b, true): the guarded code stays on the fall-through path."""
+    i1 = ir.IntegerType.get_signless(1)
+    t = arith.ConstantOp(i1, ir.IntegerAttr.get(i1, 1)).result
+    return fx.Boolean(llvm.call_intrinsic(i1, "llvm.expect.i1", [_v(b), t], [], []))
+
+
 # Every bounded poll (cross-rank tag waits, device handoffs) gives up after POLL_TICKS clock ticks (20 s: the first
 # launch's rank skew, module load, must not hit it) and the kernel goes on with whatever it read. The failure closure:
 # the cross-rank polls (TP1 / TP2 receives, the sampling / Markov exchanges; fail_ctx) also end on the step's STOP word,

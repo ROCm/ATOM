@@ -749,7 +749,16 @@ def target_layer(E, Ly):
 
     # ---- D (on cflag / kvflag) -> dflag;  D-idle CTAs: this layer's attention mix partials + Sinkhorn
     # (design 8 A/B, 11-12: TileRT's separate A2 merge CTAs +2.1 us; the merge stays in the hardware cluster)
-    stage_D(cwith(c, **v3f, **v3a))
+    if fx.const_expr(DRS):   # (the draft rows run no index chain: D always polls its kv / C flags)
+        stage_D(cwith(c, **v3f, **v3a))
+    else:   # the indexer layers (lflags bit 8): the all-CTA handoff before D -- INDEX_QUANT (no scorer) or SELECT0 (every
+        # selection path above) -- follows every C CTA's stored-out q tiles, so D's q copies skip the cflag poll (dwait)
+        cD = cwith(c, **v3f, **v3a)
+        # (a vector load of the layer's lflags word: a scalar one kept live across the layer added an SGPR spill)
+        cD._th["dwait"] = lambda: (hx.gload(fp + (i64(len(FPTRS) + len(ATAB)) + i64(Ly) * len(LKEYS) + i64(LKEYS.index("lflags"))) * 8,
+                                            fx.Int64) & fx.Int64(8)) == fx.Int64(0)
+        dict.__setitem__(cD, "dwait", None)
+        stage_D(cD)
     MX0 = DCT
     NID = CTAS - MX0
     if newA & (b >= MX0):

@@ -773,6 +773,13 @@ def stage_D(c):
     if fx.const_expr(kv_fp4_of(c)):   # (FP4 KV) D's code -> the I-cache while the kv rows' flags are awaited
         _iprefetch(12)
     # every row: ceil(TR / RPC) clusters (a draft width 5 B need not be a multiple of RPC)
+    # dwait (the caller's, a wave's vector load of the layer's lflags issued here, used only at the q copies below):
+    # False on the indexer layers -- there every C CTA's q tiles are written and stored out (s_wait_storecnt 0) before
+    # its flag and before the device-wide handoff of all CTAS CTAs that precedes D (SELECT0, or INDEX_QUANT with no
+    # scorer: step.py), so the q copies need no cflag poll (a satisfied poll is a ~0.6-0.9 us round trip on D's path).
+    # Absent (the draft launch): always poll.
+    dw = "dwait" in c
+    dwv = c["dwait"] if dw else None
     if fx.const_expr("cflag" in c):   # (v3 e4) the kv ring rows first: the key rows load while C still runs
         if cl < (TR + RPC - 1) // RPC:
             hx.wait_flags(c["kvflag"], (TR + 3) // 4, c["kvtag"], w, l, 8)
@@ -815,9 +822,14 @@ def stage_D(c):
             _dstamp(c, 3, t0s)
             for rr in range_constexpr(RPC):
                 _kg_decode(c, t, sm, o, rr)
-        if fx.const_expr("cflag" in c):   # every C CTA's q tiles: only the q copies wait for them
-            hx.wait_flags(c["cflag"], CTAS, c["ctag"], w, l, 8)
-            gpu.barrier()
+        if fx.const_expr("cflag" in c):   # every C CTA's q tiles: only the q copies wait for them (not where dwait is False)
+            if fx.const_expr(not dw):
+                hx.wait_flags(c["cflag"], CTAS, c["ctag"], w, l, 8)
+                gpu.barrier()
+            else:
+                if hx.likely(dwv):
+                    hx.wait_flags(c["cflag"], CTAS, c["ctag"], w, l, 8)
+                    gpu.barrier()
         _dstamp(c, 4, t0s)
         for it in range(QV * HD // 8 // THREADS):
             i = t + it * THREADS
