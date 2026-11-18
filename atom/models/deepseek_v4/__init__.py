@@ -99,6 +99,7 @@ from atom.model_ops.linear import (
     ReplicatedLinear,
     RowParallelLinear,
     fp8_group32_k_pad_align,
+    weight_is_stored_preshuffled,
 )
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.quant_v4 import act_quant_inplace
@@ -2806,39 +2807,39 @@ class Expert(nn.Module):
         self.use_fused_clamp_act_mul = shared_expert_fused_act_enabled(
             self.w2.input_size
         )
-        # Decided on the first forward, once the weights are loaded and
-        # shuffled (`_gate_up_silu_applies`).
-        self._gate_up_silu = None
+        # Decided once here, from the configuration alone: forward runs
+        # inside torch.compile regions, which cannot trace the architecture
+        # query (`_gate_up_silu_applies`).
+        self._gate_up_silu = self._gate_up_silu_applies()
 
     def _gate_up_silu_applies(self) -> bool:
         """Whether gate_up can run with the SwiGLU and the MXFP8 quant for w2
-        in its epilogue: gfx1250, native MX (group 32) FP8 weights shuffled
-        for the FlyDSL GEMM, no bias, a clamped SwiGLU, and a native MX w2
-        that takes the quantized activation as it is."""
-        if self._gate_up_silu is None:
-            gate_up = self.gate_up_proj
-            self._gate_up_silu = (
-                get_gfx_runtime() == "gfx1250"
-                and not self.use_fused_clamp_act_mul
-                and self.swiglu_limit > 0
-                and gate_up.native_a8_group_rows == 32
-                and self.w2.native_a8_group_rows is not None
-                and getattr(gate_up.weight, "is_shuffled", False)
-                and gate_up.weight.dtype == torch.float8_e4m3fn
-                and gate_up.weight_scale.dtype == torch.float8_e8m0fnu
-                and getattr(gate_up, "bias", None) is None
+        in its epilogue: gfx1250, native MX (group 32) FP8 weights that the
+        load shuffles for the FlyDSL GEMM (`weight_is_stored_preshuffled`, the
+        load's own predicate), a clamped SwiGLU, no fused activation of
+        ATOM_V4_USE_TRITON_FUSION, and a native MX w2 that takes the quantized
+        activation as it is. Everything it reads is fixed at construction."""
+        gate_up = self.gate_up_proj
+        return bool(
+            get_gfx_runtime() == "gfx1250"
+            and not self.use_fused_clamp_act_mul
+            and self.swiglu_limit > 0
+            and gate_up.native_a8_group_rows == 32
+            and self.w2.native_a8_group_rows is not None
+            and gate_up.weight.dtype == torch.float8_e4m3fn
+            and gate_up.weight_scale.dtype == torch.float8_e8m0fnu
+            and weight_is_stored_preshuffled(
+                gate_up.quant_type, gate_up.weight.dtype, native_group_rows=32
             )
-        return self._gate_up_silu
+        )
 
     def _fused_gate_up_silu(self, x: torch.Tensor) -> torch.Tensor | None:
         """gate_up GEMM with silu(min(g, L)) * clamp(u, -L, L) and its group-32
         MXFP8 quant in the epilogue, feeding w2 directly: the codes and scales
         of GEMM -> silu_and_mul -> quantize_fp8. None where it does not apply
-        (`_gate_up_silu_applies`, or a row count the AITER kernel table leaves
-        to the unfused path)."""
-        if x.dim() != 2 or x.dtype != torch.bfloat16:
-            return None
-        if not self._gate_up_silu_applies():
+        (`_gate_up_silu`, or a row count the AITER kernel table leaves to the
+        unfused path)."""
+        if not self._gate_up_silu or x.dim() != 2 or x.dtype != torch.bfloat16:
             return None
         # gfx1250 only, so imported here.
         from aiter.ops.flydsl.batched_gemm_a8w8_gfx1250 import (
