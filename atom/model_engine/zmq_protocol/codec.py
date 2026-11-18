@@ -293,6 +293,7 @@ def encode_submit(requests: list[IngressRequest], *, max_tokens=None) -> list:
         spec.arrive_time = req.arrive_time
         if req.prompt_hash_chain is not None:
             _encode_chain(req.prompt_hash_chain, spec.prompt_hash_chain, writer)
+        spec.dp_est_cached_tokens = req.dp_est_cached_tokens
         trace = tracing.wire_context(req)
         if trace is not None:
             carrier, model, request_id = trace
@@ -370,6 +371,18 @@ def encode_utility(payload: dict) -> list:
     return writer.frames(envelope)
 
 
+def encode_dp_prefix_credit(updates) -> list:
+    """`share_cache`'s corrected estimates, `[(seq_id, credit)]`, for the
+    input socket after the SubmitBatch that named those sequences."""
+    envelope = pb.Envelope()
+    msg = envelope.dp_prefix_credit
+    msg.SetInParent()
+    for seq_id, credit in updates:
+        msg.seq_ids.append(seq_id)
+        msg.credits.append(credit)
+    return FrameWriter().frames(envelope)
+
+
 def encode_shutdown() -> list:
     envelope = pb.Envelope()
     envelope.shutdown.SetInParent()
@@ -399,6 +412,7 @@ def _decode_completion(msg, reader: FrameReader) -> CompletionResult:
         external_request_id=_optional(msg, "external_request_id"),
         parent_request_id=_optional(msg, "parent_request_id"),
         sibling_index=msg.sibling_index,
+        prefill_completed=msg.prefill_completed,
     )
 
 
@@ -502,9 +516,28 @@ def decode_core_message(frames: list):
             if ready.HasField("max_pool_tokens")
             else None
         )
+    if body == "prefill_backlog":
+        backlog = envelope.prefill_backlog
+        return EngineCoreRequestType.PREFILL_BACKLOG, (
+            backlog.ingested,
+            backlog.pending_prefill_tokens,
+            _pairs(backlog.credit_seq_ids, backlog.credits),
+        )
+    if body == "dp_reuse":
+        reuse = envelope.dp_reuse
+        return EngineCoreRequestType.DP_REUSE, _pairs(
+            reuse.seq_ids, reuse.reused_tokens
+        )
     if body == "stopped":
         return EngineCoreRequestType.SHUTDOWN, None
     raise ProtocolError(f"unexpected message from an EngineCore: {body}")
+
+
+def _pairs(ids, values) -> list[tuple[int, int]]:
+    """Two parallel columns as the `(id, value)` pairs they encode."""
+    if len(ids) != len(values):
+        raise ProtocolError("paired columns disagree in length")
+    return list(zip(ids, values))
 
 
 # ------------------------------------------------------------ core side ----
@@ -517,6 +550,7 @@ class AdmissionSpec:
     __slots__ = (
         "arrive_time",
         "cache_seed",
+        "dp_est_cached_tokens",
         "kwargs",
         "max_tokens",
         "prompt_hash_chain",
@@ -533,6 +567,7 @@ class AdmissionSpec:
         prompt_hash_chain=None,
         trace=None,
         max_tokens=None,
+        dp_est_cached_tokens=0,
     ):
         self.seq_id = seq_id
         self.arrive_time = arrive_time
@@ -543,6 +578,7 @@ class AdmissionSpec:
         self.prompt_hash_chain = prompt_hash_chain
         # `(carrier, model, request_id)`, as `tracing.wire_context` gave it.
         self.trace = trace
+        self.dp_est_cached_tokens = dp_est_cached_tokens
 
 
 def _decode_spec(msg, reader: FrameReader) -> AdmissionSpec:
@@ -582,6 +618,7 @@ def _decode_spec(msg, reader: FrameReader) -> AdmissionSpec:
         ),
         trace=trace,
         max_tokens=max_tokens,
+        dp_est_cached_tokens=msg.dp_est_cached_tokens,
     )
 
 
@@ -592,7 +629,7 @@ def decode_client_message(frames: list):
     `(seq_id, reason, code)` for those that did not, each of which the Core
     must reject so its client is not left waiting. UTILITY's data is `(cmd,
     payload)`, from a Utility or an AdminCommand alike; ABORT's is the
-    sequence ids.
+    sequence ids; DP_PREFIX_CREDIT's the `(seq_id, credit)` pairs.
     """
     envelope = decode_envelope(frames)
     reader = FrameReader(frames)
@@ -618,6 +655,13 @@ def decode_client_message(frames: list):
         return EngineCoreRequestType.UTILITY, _decode_admin(envelope.admin), []
     if body == "abort":
         return EngineCoreRequestType.ABORT, list(envelope.abort.seq_ids), []
+    if body == "dp_prefix_credit":
+        credit = envelope.dp_prefix_credit
+        return (
+            EngineCoreRequestType.DP_PREFIX_CREDIT,
+            _pairs(credit.seq_ids, credit.credits),
+            [],
+        )
     if body == "shutdown":
         return EngineCoreRequestType.SHUTDOWN, None, []
     raise ProtocolError(f"unexpected message from a client: {body}")
@@ -723,6 +767,7 @@ def build_sequence(spec: AdmissionSpec, context: AdmissionContext):
             del multimodal_data["cache_seed"]
     seq.max_tokens = spec.max_tokens
     seq.arrive_time = spec.arrive_time
+    seq.dp_est_cached_tokens = spec.dp_est_cached_tokens
     # The BlockManager checks a shipped chain before it trusts it.
     seq.prompt_hash_chain = spec.prompt_hash_chain
     if spec.trace is not None:
@@ -757,6 +802,7 @@ def _encode_completion(seq, msg, writer: FrameWriter) -> None:
     if seq.parent_request_id is not None:
         msg.parent_request_id = seq.parent_request_id
     msg.sibling_index = seq.sibling_index
+    msg.prefill_completed = seq.prefill_completed
 
 
 def encode_completions(seqs) -> list:
@@ -993,6 +1039,32 @@ def _decode_admin_reply(msg, reader: FrameReader) -> dict:
     if msg.HasField("request_id"):
         reply["request_id"] = msg.request_id
     return reply
+
+
+def encode_prefill_backlog(report) -> list:
+    """`(ingested, pending prefill tokens, applied credits)`, the last as the
+    `(seq_id, credit)` pairs the Core took from `DpPrefixCredit`."""
+    ingested, pending, applied = report
+    envelope = pb.Envelope()
+    msg = envelope.prefill_backlog
+    msg.SetInParent()
+    msg.ingested = ingested
+    msg.pending_prefill_tokens = pending
+    for seq_id, credit in applied:
+        msg.credit_seq_ids.append(seq_id)
+        msg.credits.append(credit)
+    return FrameWriter().frames(envelope)
+
+
+def encode_dp_reuse(reports) -> list:
+    """`[(seq_id, prompt tokens reused)]`."""
+    envelope = pb.Envelope()
+    msg = envelope.dp_reuse
+    msg.SetInParent()
+    for seq_id, reused in reports:
+        msg.seq_ids.append(seq_id)
+        msg.reused_tokens.append(reused)
+    return FrameWriter().frames(envelope)
 
 
 def encode_stopped() -> list:
