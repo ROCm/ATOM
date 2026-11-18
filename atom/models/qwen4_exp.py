@@ -53,7 +53,7 @@ from atom.models.utils import (
 )
 from atom.quant_spec import LayerQuantConfig
 from atom.utils import envs
-from atom.utils.forward_context import get_forward_context
+from atom.utils.forward_context import get_forward_context, pass_scheduled_tokens_gpu
 
 
 def qwen4_exp_packed_modules_mapping(
@@ -424,6 +424,32 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
         reduce-scatters it under sequence parallelism)."""
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, orig_shape[-1])
+        valid_rows = (
+            pass_scheduled_tokens_gpu(hidden_states.shape[0])
+            if self.use_gfx942_tuned_moe
+            else None
+        )
+        if valid_rows is not None:
+            # gfx942 whole-MoE kernels operate on every physical row and do
+            # not accept num_local_tokens. MoE has no recurrent/cache writes:
+            # make dummy inputs finite, route them to valid experts, and let
+            # the caller trim them. Disabling the count only in this scope
+            # also prevents top-k from emitting unsupported -1 expert ids.
+            rows = hidden_states.shape[0]
+            hidden_states = torch.where(
+                torch.arange(rows, device=hidden_states.device)[:, None] < valid_rows,
+                hidden_states,
+                0,
+            )
+            with get_forward_context().use_pass_rows(rows, None):
+                out = self._forward_experts(hidden_states, reduce_results)
+        else:
+            out = self._forward_experts(hidden_states, reduce_results)
+        return out.view(orig_shape)
+
+    def _forward_experts(
+        self, hidden_states: torch.Tensor, reduce_results: bool
+    ) -> torch.Tensor:
         logits = self.gate(hidden_states)
         if self.fuse_shared:
             # The tail logit is the shared expert's sigmoid gate.
@@ -437,7 +463,7 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
                 out = self.experts(hidden_states=hidden_states, router_logits=logits)
             if self.tp_size > 1 and reduce_results:
                 out = tensor_model_parallel_all_reduce(out)
-            return out.view(orig_shape)
+            return out
         routed = self.experts(
             hidden_states=hidden_states,
             router_logits=logits[:, : self.n_routed_experts],
@@ -446,7 +472,7 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
         out = sigmoid_mul(shared, logits[:, self.n_routed_experts :], routed)
         if self.tp_size > 1 and reduce_results:
             out = tensor_model_parallel_all_reduce(out)
-        return out.view(orig_shape)
+        return out
 
     def _single_token_experts(self, hidden_states, logits):
         ex = self.experts

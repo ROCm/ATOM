@@ -213,6 +213,75 @@ def test_gfx942_blockscale_keeps_existing_alignment(monkeypatch):
     assert qwen4_exp.moe_pad_align(640, 2, blockscale) is None
 
 
+@pytest.mark.parametrize("valid", [0, 1, 3, 4])
+def test_native_token_padding_is_scoped_to_moe(monkeypatch, valid):
+    from atom.utils import forward_context
+
+    count = torch.tensor([valid], dtype=torch.int32)
+    context = SimpleNamespace(running_tokens=4, scheduled_tokens_gpu=count)
+    forward = forward_context.ForwardContext(context=context)
+    monkeypatch.setattr(forward_context, "_forward_context", forward)
+
+    class Experts(torch.nn.Module):
+        def forward(self, hidden_states, router_logits):
+            assert forward_context.pass_scheduled_tokens_gpu(4) is None
+            assert torch.isfinite(hidden_states).all()
+            torch.testing.assert_close(router_logits, hidden_states)
+            return hidden_states * 2
+
+    block = qwen4_exp.Qwen4ExpSparseMoeBlock.__new__(qwen4_exp.Qwen4ExpSparseMoeBlock)
+    torch.nn.Module.__init__(block)
+    block.use_gfx942_tuned_moe = True
+    block.fuse_shared = True
+    block.tp_size = 2
+    block.gate = torch.nn.Identity()
+    block.experts = Experts()
+    x = torch.randn(4, 32)
+    x[valid:] = float("nan")
+    output = block(x, reduce_results=False)
+    torch.testing.assert_close(output[:valid], x[:valid] * 2)
+    assert not output[valid:].count_nonzero()
+    assert context.scheduled_tokens_gpu is count
+    assert context.running_tokens == 4
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_native_padding_count_changes_on_graph_replay(monkeypatch):
+    from atom.utils import forward_context
+
+    count = torch.tensor([3], dtype=torch.int32, device="cuda")
+    context = SimpleNamespace(running_tokens=4, scheduled_tokens_gpu=count)
+    forward = forward_context.ForwardContext(context=context)
+    monkeypatch.setattr(forward_context, "_forward_context", forward)
+
+    class Experts(torch.nn.Module):
+        def forward(self, hidden_states, router_logits):
+            assert forward_context.pass_scheduled_tokens_gpu(4) is None
+            return hidden_states * 2
+
+    block = qwen4_exp.Qwen4ExpSparseMoeBlock.__new__(qwen4_exp.Qwen4ExpSparseMoeBlock)
+    torch.nn.Module.__init__(block)
+    block.use_gfx942_tuned_moe = True
+    block.fuse_shared = True
+    block.tp_size = 2
+    block.gate = torch.nn.Identity()
+    block.experts = Experts()
+    x = torch.ones(4, 32, device="cuda")
+    block(x, reduce_results=False)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = block(x, reduce_results=False)
+    for valid in (1, 4, 0, 3):
+        count.fill_(valid)
+        x.fill_(1)
+        x[valid:] = float("nan")
+        graph.replay()
+        torch.cuda.synchronize()
+        assert (output[:valid] == 2).all()
+        assert not output[valid:].count_nonzero()
+        assert context.scheduled_tokens_gpu is count
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 @pytest.mark.parametrize("tp", [2, 4])
 @pytest.mark.parametrize("mode", ["bf16", "fp8"])
@@ -326,3 +395,10 @@ def test_gpu_padded_moe_matches_torch_reference(tp, mode):
         print(
             f"{mode} TP{tp}: relative_l2={relative_l2.max().item():.6f}, logits_diff={logits_diff.item():.6g}, graph_rms_diff={((graph_y - y).abs() / rms).max().item():.6f}"
         )
+        # Native graph padding routes finite zero inputs to ordinary expert
+        # ids. The real BF16/FP8 kernel must leave those rows exactly zero.
+        hidden.zero_()
+        zero_output = run()
+        torch.cuda.synchronize()
+        assert torch.isfinite(zero_output).all()
+        assert not zero_output.count_nonzero()
