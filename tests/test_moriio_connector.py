@@ -973,8 +973,9 @@ class WritePathTest(unittest.TestCase):
         self.assertEqual(conn._sending_writes, {})
         self.assertEqual(len(conn._pending_writes), 1)
 
-        with mock.patch("torch.cuda.Event", FakeEvent), mock.patch(
-            "torch.cuda.current_stream", lambda: None
+        with (
+            mock.patch("torch.cuda.Event", FakeEvent),
+            mock.patch("torch.cuda.current_stream", lambda: None),
         ):
             conn.record_kv_cache_ready([9])
         conn._kv_ready_events[9].done = True
@@ -999,8 +1000,9 @@ class WritePathTest(unittest.TestCase):
         stale, kept = FakeEvent(), FakeEvent()
         conn._kv_ready_events = {1: stale, 2: kept}
         conn._kv_ready_batches.append((time.monotonic() - 1e6, stale, [1, 2]))
-        with mock.patch("torch.cuda.Event", FakeEvent), mock.patch(
-            "torch.cuda.current_stream", lambda: None
+        with (
+            mock.patch("torch.cuda.Event", FakeEvent),
+            mock.patch("torch.cuda.current_stream", lambda: None),
         ):
             conn.record_kv_cache_ready([2, 3])
         self.assertNotIn(1, conn._kv_ready_events)
