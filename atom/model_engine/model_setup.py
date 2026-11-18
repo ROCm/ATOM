@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from collections.abc import Callable
 
 import torch
@@ -186,5 +187,11 @@ def load_drafter_from_disk(config: Config, device: torch.device, runner, target)
     finally:
         torch.set_default_device(None)
     logger.info("Loading drafter model...")
+    load_start = time.perf_counter()
     drafter.load_model(target)
+    load_elapsed = time.perf_counter() - load_start
+    logger.info(
+        f"[{runner.rank_name}] Drafter load done: {config.speculative_config.method} "
+        f"(weights loaded in {load_elapsed:.2f}s)"
+    )
     return drafter
