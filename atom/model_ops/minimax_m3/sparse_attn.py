@@ -20,6 +20,7 @@ import torch
 # which couples to vLLM internals. ATOM imports triton directly everywhere else.
 import triton
 import triton.language as tl
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.attention import pa_fwd_asm_supports_arch
 
 from atom.model_ops.minimax_m3.geometry import SPARSE_BLOCK_SIZE
@@ -1493,7 +1494,8 @@ def sparse_pa_per_row(
     max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads_view)
     context_partition_size = 256
     use_dynamic_partition_plan = (
-        dynamic_partition_plan
+        get_gfx_runtime() == "gfx1250"
+        and dynamic_partition_plan
         and sparse_bt.shape[-1] * ASM_PAGE_SIZE > context_partition_size
         and num_seqs < _default_plan_task_budget(q.device)
     )

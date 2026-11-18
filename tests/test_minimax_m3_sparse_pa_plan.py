@@ -13,7 +13,13 @@ from atom.model_ops import base_attention
 from atom.model_ops.minimax_m3 import sparse_attn
 
 
-def test_cached_prefill_lets_device_lengths_choose_plan_capacity(monkeypatch):
+@pytest.mark.parametrize(
+    ("gfx", "expected_cap"),
+    [("gfx1250", None), ("gfx950", 1)],
+)
+def test_cached_prefill_lets_device_lengths_choose_plan_capacity(
+    monkeypatch, gfx, expected_cap
+):
     captured = {}
     monkeypatch.setattr(
         base_attention, "run_pa_decode", lambda **kwargs: captured.update(kwargs)
@@ -24,6 +30,7 @@ def test_cached_prefill_lets_device_lengths_choose_plan_capacity(monkeypatch):
     )
     monkeypatch.setattr(sparse_attn, "_sparse_pa_ran_on_asm", lambda *_: False)
     monkeypatch.setattr(sparse_attn, "_default_plan_task_budget", lambda *_: 512)
+    monkeypatch.setattr(sparse_attn, "get_gfx_runtime", lambda: gfx)
     rows = 128
     sparse_attn.sparse_pa_per_row(
         torch.randn(rows, 16, 128, dtype=torch.bfloat16),
@@ -40,7 +47,7 @@ def test_cached_prefill_lets_device_lengths_choose_plan_capacity(monkeypatch):
     )
 
     assert captured["max_context_partition_num"] == 1
-    assert captured["plan_partition_cap"] is None
+    assert captured["plan_partition_cap"] is expected_cap
 
 
 def test_prefill_uses_dynamic_plan_only_after_every_prefix_fills_window(monkeypatch):
