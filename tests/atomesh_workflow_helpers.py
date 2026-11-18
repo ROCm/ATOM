@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import yaml
 
@@ -60,14 +61,29 @@ def run_matrix_step(script: str, env: dict[str, str]) -> tuple[list[dict], str]:
         return cells, output.read_text()
 
 
-def github_expressions(source: str, event: str, schedule: str = "") -> str:
+def github_expressions(
+    source: str,
+    event: str,
+    schedule: str = "",
+    workflow: str = "Atomesh Benchmark",
+    pull_request_number: str = "",
+    review_state: str = "",
+    ref: str = "refs/heads/main",
+    run_id: str = "1",
+) -> str:
     """Evaluate the ${{ }} segments of a workflow value for a run with no inputs."""
+    event_context = SimpleNamespace(
+        schedule=schedule,
+        pull_request=SimpleNamespace(number=pull_request_number),
+        review=SimpleNamespace(state=review_state),
+    )
     context = {
+        "event": event_context,
         "event_name": event,
         "schedule": schedule,
-        "workflow": "Atomesh Benchmark",
-        "ref": "refs/heads/main",
-        "run_id": "1",
+        "workflow": workflow,
+        "ref": ref,
+        "run_id": run_id,
     }
 
     def evaluate(match: re.Match) -> str:
@@ -75,6 +91,15 @@ def github_expressions(source: str, event: str, schedule: str = "") -> str:
         expression = re.sub(r"\bgithub\.event\.schedule\b", "schedule", expression)
         expression = re.sub(r"\bgithub\.(\w+)\b", r"\1", expression)
         expression = expression.replace("&&", " and ").replace("||", " or ")
-        return str(eval(expression, {"__builtins__": {}}, context))
+        return str(
+            eval(
+                expression,
+                {
+                    "__builtins__": {},
+                    "format": lambda template, *args: template.format(*args),
+                },
+                context,
+            )
+        )
 
     return re.sub(r"\$\{\{(.*?)\}\}", evaluate, source)

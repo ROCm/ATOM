@@ -485,10 +485,10 @@ ARG INSTALL_MOONCAKE=1
 # INSTALL_MOONCAKE_STORE=0 configures WITH_STORE=OFF, for a base on which a
 # Store dependency (cachelib) does not build.
 ARG INSTALL_MOONCAKE_STORE=1
-# Upstream Mooncake release tag with HIP dma-buf MR support.
-# Note: this tag does not include the Ionic QP atomic resource clamp.
+# Upstream Mooncake main after v0.3.14 (kvcache-ai/Mooncake#5151, THP-backed
+# RDMA Store segments); includes the RD-atomic QP depth clamp (#4312).
 ARG MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
-ARG MOONCAKE_COMMIT="v0.3.14-rc1"
+ARG MOONCAKE_COMMIT="206d6340a8b578f44519ccef90bdbfe8483d0231"
 ARG USE_HIP_DMABUF=ON
 ARG VENV_PYTHON="/opt/venv/bin/python"
 

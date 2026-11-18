@@ -206,7 +206,7 @@ def test_native_tool_header_does_not_allow_undeclared_whitespace(controller):
         {
             "prefix": "|DSML|",
             "section": "function_calls",
-            "names": ["get_weather"],
+            "tools": [{"name": "get_weather", "parameters": None}],
             "required": True,
         }
     )
@@ -564,3 +564,576 @@ def test_admitted_matcher_survives_compilation_cache_eviction(controller):
     assert torch.isfinite(logits[0, ord("{")])
     controller.release([11])
     assert not controller.states
+
+
+WEATHER = {
+    "type": "object",
+    "properties": {
+        "city": {"type": "string", "description": "free text"},
+        "unit": {"enum": ["c", "f"]},
+        "days": {"type": "integer", "minimum": 1, "maximum": 7},
+        "where": {"$ref": "#/$defs/point"},
+    },
+    "required": ["city", "unit", "days", "where"],
+    "additionalProperties": False,
+    "$defs": {
+        "point": {
+            "type": "object",
+            "properties": {"lat": {"type": "number"}},
+            "required": ["lat"],
+            "additionalProperties": False,
+        }
+    },
+}
+
+
+def strict_call(city="Paris", unit="c", days="3", where='{"lat": 1.5}', order=None):
+    params = {
+        "city": f'<parameter name="city" string="true">{city}</parameter>',
+        "unit": f'<parameter name="unit" string="true">{unit}</parameter>',
+        "days": f'<parameter name="days" string="false">{days}</parameter>',
+        "where": f'<parameter name="where" string="false">{where}</parameter>',
+    }
+    body = "\n".join(params[k] for k in order or params)
+    return f'<calls>\n<invoke name="weather">\n{body}\n</invoke>\n</calls>'
+
+
+def accepts(controller, compiled, text):
+    matcher = xgr.GrammarMatcher(compiled)
+    return all(matcher.accept_token(t) for t in [*text.encode(), 127])
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        (strict_call(), True),
+        # Raw strings are exact: whatever the value, nothing is padded.
+        (strict_call(city=" Paris, FR "), True),
+        (strict_call(unit="k"), False),
+        (strict_call(days="9"), False),
+        (strict_call(days='"3"'), False),
+        (strict_call(where='{"lat": "north"}'), False),
+        (strict_call(where='{"lat": 1, "lon": 2}'), False),
+        (strict_call(order=["unit", "city", "days", "where"]), False),
+        (strict_call(order=["city", "unit", "days"]), False),
+        (strict_call().replace('"city" string="true"', '"city" string="false"'), False),
+        # Free text may precede the calls, but cannot open a call of its own.
+        ("Checking.\n\n" + strict_call(), True),
+        ("plain answer", True),
+        ('<invoke name="weather"></invoke>', False),
+    ],
+)
+def test_strict_tool_arguments_follow_the_parameters_schema(controller, text, expected):
+    spec = json.dumps(
+        {
+            "prefix": "",
+            "section": "calls",
+            "tools": [{"name": "weather", "parameters": WEATHER}],
+            "required": False,
+        }
+    )
+    assert accepts(controller, controller.compile(None, spec), text) == expected
+
+
+def test_strict_and_free_tools_share_one_reply(controller):
+    spec = json.dumps(
+        {
+            "prefix": "",
+            "section": "calls",
+            "tools": [
+                {"name": "weather", "parameters": WEATHER},
+                {"name": "search", "parameters": None},
+            ],
+            "required": True,
+        }
+    )
+    compiled = controller.compile(None, spec)
+    free = '<invoke name="search"><parameter name="q">anything</parameter></invoke>'
+    assert accepts(
+        controller, compiled, strict_call().replace("</calls>", free + "</calls>")
+    )
+    assert not accepts(controller, compiled, "plain answer")
+    assert not accepts(controller, compiled, strict_call(unit="k"))
+
+
+def _strict_spec(parameters):
+    return json.dumps(
+        {
+            "prefix": "",
+            "section": "calls",
+            "tools": [{"name": "f", "parameters": parameters}],
+            "required": True,
+        }
+    )
+
+
+def _strict_object(props, **extra):
+    return {
+        "type": "object",
+        "properties": props,
+        "required": list(props),
+        "additionalProperties": False,
+        **extra,
+    }
+
+
+def _invoke(key, value):
+    parameter = (
+        f'<parameter name="{key}" string="false">{json.dumps(value)}</parameter>'
+    )
+    return f'<calls>\n<invoke name="f">\n{parameter}\n</invoke>\n</calls>'
+
+
+# DeepSeek's documented strict-mode keywords: a valid value, then invalid ones.
+DOCUMENTED_STRICT_KEYWORDS = [
+    ({"type": "string", "pattern": "^[0-9]{5}$"}, "12345", ["1234"]),
+    ({"type": "string", "format": "email"}, "a@b.co", ["nope"]),
+    ({"type": "string", "format": "hostname"}, "example.com", ["bad host!"]),
+    ({"type": "string", "format": "ipv4"}, "10.1.2.3", ["999.1.1.1"]),
+    ({"type": "string", "format": "ipv6"}, "::1", ["zz::1"]),
+    (
+        {"type": "string", "format": "uuid"},
+        "123e4567-e89b-12d3-a456-426614174000",
+        ["not-a-uuid"],
+    ),
+    ({"type": "integer", "minimum": 2, "maximum": 10, "multipleOf": 2}, 4, [3, 12]),
+    ({"type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 100}, 9.5, [0, 100]),
+    ({"type": "integer", "const": 3, "default": 3}, 3, [4]),
+    ({"type": "boolean"}, True, ["yes"]),
+    ({"type": "integer", "enum": [1, 2]}, 2, [3]),
+    ({"anyOf": [{"type": "string"}, {"type": "integer"}]}, 7, [[1]]),
+    ({"type": "array", "items": {"type": "string"}}, ["a"], [["a", 1]]),
+]
+
+
+@pytest.mark.parametrize("schema, good, bads", DOCUMENTED_STRICT_KEYWORDS)
+def test_documented_strict_keywords_constrain_arguments(controller, schema, good, bads):
+    compiled = controller.compile(None, _strict_spec(_strict_object({"v": schema})))
+    assert accepts(controller, compiled, _invoke("v", good))
+    for bad in bads:
+        assert not accepts(controller, compiled, _invoke("v", bad)), bad
+
+
+def test_def_references_resolve_and_may_recurse(controller):
+    author = _strict_object(
+        {
+            "name": {"type": "string"},
+            "mentor": {"anyOf": [{"$ref": "#/$def/author"}, {"type": "null"}]},
+        }
+    )
+    parameters = _strict_object(
+        {"author": {"$ref": "#/$def/author"}}, **{"$def": {"author": author}}
+    )
+    compiled = controller.compile(None, _strict_spec(parameters))
+    chain = {"name": "Ada", "mentor": {"name": "Bob", "mentor": None}}
+    assert accepts(controller, compiled, _invoke("author", chain))
+    assert not accepts(controller, compiled, _invoke("author", {"name": "Ada"}))
+
+
+DSML_MARKERS = [
+    "<|DSML|tool_call",
+    "<|DSML|invoke",
+    "<invoke name=",
+    "<tool_calls>",
+    "<tool_call>",
+]
+FREE_CALL = (
+    "<|DSML|function_calls>\n"
+    '<|DSML|invoke name="get_weather">anything</|DSML|invoke>\n'
+    "</|DSML|function_calls>"
+)
+
+
+def _dsml_spec(tools, required=False):
+    return json.dumps(
+        {
+            "prefix": "|DSML|",
+            "section": "function_calls",
+            "markers": DSML_MARKERS,
+            "tools": tools,
+            "required": required,
+        }
+    )
+
+
+FREE_TOOL = [{"name": "get_weather", "parameters": None}]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        FREE_CALL,
+        "\n" + FREE_CALL,
+        "\n\n" + FREE_CALL + "\n",
+        '{"x": 1}',
+        '\n{"x": 1}\n',
+    ],
+)
+def test_whitespace_around_the_answer_and_the_calls_is_free(controller, text):
+    """`response_format` with ordinary tools on /v1: a line break after the
+    reasoning must not lock the reply into the JSON answer."""
+    compiled = controller.compile(json.dumps({"type": "object"}), _dsml_spec(FREE_TOOL))
+    assert accepts(controller, compiled, text)
+
+
+def test_a_required_call_may_follow_a_line_break(controller):
+    compiled = controller.compile(None, _dsml_spec(FREE_TOOL, required=True))
+    assert accepts(controller, compiled, "\n" + FREE_CALL + "\n")
+    assert not accepts(controller, compiled, "no call")
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("plain answer, where a < b", True),
+        ("Checking.\n" + FREE_CALL, True),
+        # What the tool parser would read as a call, prefix or not.
+        ('Sure: <invoke name="get_weather"></invoke>', False),
+        ('Sure: <invoke name="get_weather"></invoke>\n' + FREE_CALL, False),
+        ("use the <tool_call> tag", False),
+        ("<tool_calls>", False),
+        ('<|DSML|invoke name="get_weather">', False),
+    ],
+)
+def test_free_text_cannot_open_a_call_the_parser_would_read(controller, text, expected):
+    compiled = controller.compile(None, _dsml_spec(FREE_TOOL))
+    assert accepts(controller, compiled, text) == expected
+
+
+def test_each_parameter_carries_only_the_definitions_it_references():
+    from atom.structured_output.dsml_grammar import dsml_grammar
+
+    leaf = _strict_object({"n": {"type": "integer"}}, description="LEAF")
+    used = _strict_object({"leaf": {"$ref": "#/$defs/leaf"}}, description="USED")
+    unused = _strict_object({"m": {"type": "integer"}}, description="UNUSED")
+    parameters = _strict_object(
+        {"a": {"$ref": "#/$defs/used"}, "b": {"type": "integer"}},
+        **{"$defs": {"used": used, "leaf": leaf, "unused": unused}},
+    )
+    lark = dsml_grammar(json.loads(_strict_spec(parameters)))
+    assert "UNUSED" not in lark
+    # Parameter `a` carries `used` and, through it, `leaf`; `b` carries neither.
+    assert lark.count("USED") == lark.count("LEAF") == 1
+
+
+def test_a_tool_grammar_cannot_outgrow_its_schemas():
+    from atom.structured_output.dsml_grammar import dsml_grammar
+
+    big = _strict_object({"n": {"type": "integer"}}, description="x" * 50_000)
+
+    def spec(count):
+        props = {f"p{i}": {"$ref": "#/$defs/big"} for i in range(count)}
+        return json.loads(
+            _strict_spec(_strict_object(props, **{"$defs": {"big": big}}))
+        )
+
+    assert dsml_grammar(spec(4))
+    with pytest.raises(ValueError, match="too large"):
+        dsml_grammar(spec(40))
+
+
+def test_parameters_share_one_expansion_budget(controller):
+    # 200 values to keep after the negation: within one budget, not two.
+    narrow = {"type": "integer", "minimum": 0, "maximum": 199, "not": {"const": 5}}
+    controller.compile(None, _strict_spec(_strict_object({"a": narrow})))
+    with pytest.raises(ValueError, match="budget"):
+        controller.compile(
+            None, _strict_spec(_strict_object({"a": narrow, "b": narrow}))
+        )
+
+
+def test_def_contents_are_normalized_like_defs(controller):
+    digit = {"type": "integer", "minimum": 0, "maximum": 9, "not": {"const": 5}}
+    parameters = _strict_object(
+        {"d": {"$ref": "#/$def/digit"}}, **{"$def": {"digit": digit}}
+    )
+    compiled = controller.compile(None, _strict_spec(parameters))
+    assert accepts(controller, compiled, _invoke("d", 4))
+    assert not accepts(controller, compiled, _invoke("d", 5))
+
+
+def test_a_property_named_like_a_literal_keyword_keeps_its_definitions(controller):
+    example = _strict_object({"text": {"type": "string"}})
+    task = _strict_object(
+        {"examples": {"type": "array", "items": {"$ref": "#/$defs/Example"}}}
+    )
+    parameters = _strict_object(
+        {"task": {"$ref": "#/$defs/Task"}},
+        **{"$defs": {"Task": task, "Example": example}},
+    )
+    compiled = controller.compile(None, _strict_spec(parameters))
+    assert accepts(
+        controller, compiled, _invoke("task", {"examples": [{"text": "hi"}]})
+    )
+
+
+NOTE = [
+    {"name": "note", "parameters": _strict_object({"text": {"type": "string"}})},
+    {"name": "search", "parameters": None},
+]
+
+
+def _note(text):
+    return (
+        '<|DSML|function_calls>\n<|DSML|invoke name="note">\n'
+        f'<|DSML|parameter name="text" string="true">{text}</|DSML|parameter>\n'
+        "</|DSML|invoke>\n</|DSML|function_calls>"
+    )
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("a < b, and a > b", True),
+        ("closing tags look like </div>", True),
+        # Text the parser would read as the end of the value or of the call,
+        # or as another call: the value would come back cut short.
+        ('To call a tool write <invoke name="rm_rf"> then', False),
+        ("end with </invoke> marker", False),
+        ("use </parameter> here", False),
+        ('a <parameter name="k"> b', False),
+        ("see <function_calls> tag", False),
+        ("see <tool_call> tag", False),
+        ('<|DSML|invoke name="x">', False),
+    ],
+)
+def test_a_raw_strict_value_cannot_hold_what_ends_it(controller, text, expected):
+    compiled = controller.compile(None, _dsml_spec(NOTE, required=True))
+    assert accepts(controller, compiled, _note(text)) == expected
+
+
+def test_a_strict_call_cannot_hide_in_a_free_body(controller):
+    """An unclosed free call followed by a strict one: the parser reads two
+    calls, the strict one never constrained."""
+    compiled = controller.compile(None, _dsml_spec(NOTE, required=True))
+    free_then_strict = _note("x").replace(
+        '<|DSML|invoke name="note">',
+        '<|DSML|invoke name="search">\n<|DSML|invoke name="note">',
+    )
+    assert not accepts(controller, compiled, free_then_strict)
+    closed_free = (
+        '<|DSML|function_calls>\n<|DSML|invoke name="search">\n'
+        '<|DSML|parameter name="q" string="true">anything</|DSML|parameter>\n'
+        "</|DSML|invoke>\n</|DSML|function_calls>"
+    )
+    assert accepts(controller, compiled, closed_free)
+
+
+@pytest.mark.parametrize("separator", ["\x1c", "\x1d", "\x1e", "\x1f"])
+def test_python_whitespace_cannot_open_a_call_in_a_value(controller, separator):
+    """The parser's `\\s` is Python's, which counts \\x1c-\\x1f; llguidance's
+    does not."""
+    compiled = controller.compile(None, _dsml_spec(NOTE, required=True))
+    assert not accepts(
+        controller, compiled, _note(f'x<invoke{separator}name="search">y')
+    )
+    assert not accepts(controller, compiled, _note(f"keep<parameter{separator}tail"))
+
+
+def test_a_literal_holding_a_value_stop_goes_as_json(controller):
+    risky = "a</|DSML|invoke>b"
+    tools = [{"name": "f", "parameters": _strict_object({"v": {"enum": ["a", risky]}})}]
+    compiled = controller.compile(None, _dsml_spec(tools, required=True))
+
+    def call(string, value):
+        return (
+            '<|DSML|function_calls>\n<|DSML|invoke name="f">\n'
+            f'<|DSML|parameter name="v" string="{string}">{value}</|DSML|parameter>\n'
+            "</|DSML|invoke>\n</|DSML|function_calls>"
+        )
+
+    assert not accepts(controller, compiled, call("true", risky))
+    assert accepts(controller, compiled, call("false", json.dumps(risky)))
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {"anyOf": [{"type": "string"}, {"type": "null"}], "default": None},
+        {"type": ["string", "null"], "description": "optional"},
+    ],
+)
+def test_a_nullable_string_may_be_written_raw(controller, schema):
+    """As the encoder writes strings, and `null` as JSON."""
+    tools = [{"name": "f", "parameters": _strict_object({"city": schema})}]
+    compiled = controller.compile(None, _dsml_spec(tools, required=True))
+
+    def call(string, value):
+        return (
+            '<|DSML|function_calls>\n<|DSML|invoke name="f">\n'
+            f'<|DSML|parameter name="city" string="{string}">{value}</|DSML|parameter>\n'
+            "</|DSML|invoke>\n</|DSML|function_calls>"
+        )
+
+    assert accepts(controller, compiled, call("true", "Paris"))
+    assert accepts(controller, compiled, call("false", "null"))
+    assert accepts(controller, compiled, call("false", '"Paris"'))
+    assert not accepts(controller, compiled, call("false", "3"))
+
+
+def test_a_percent_encoded_definition_reference_resolves(controller):
+    parameters = _strict_object(
+        {"d": {"$ref": "#/$defs/my%20digit"}},
+        **{"$defs": {"my digit": {"type": "integer", "minimum": 0, "maximum": 9}}},
+    )
+    compiled = controller.compile(None, _strict_spec(parameters))
+    assert accepts(controller, compiled, _invoke("d", 4))
+    assert not accepts(controller, compiled, _invoke("d", 12))
+
+
+UNIT = {"type": "string", "enum": ["c", "f"], "title": "Unit"}
+
+
+def _one_param(schema, **defs):
+    tools = [{"name": "f", "parameters": _strict_object({"v": schema}, **defs)}]
+    return _dsml_spec(tools, required=True)
+
+
+def _call_f(string, value):
+    return (
+        '<|DSML|function_calls>\n<|DSML|invoke name="f">\n'
+        f'<|DSML|parameter name="v" string="{string}">{value}</|DSML|parameter>\n'
+        "</|DSML|invoke>\n</|DSML|function_calls>"
+    )
+
+
+def test_an_enum_behind_a_reference_is_written_raw(controller):
+    """How pydantic spells an Enum field, and how the encoder writes a string."""
+    compiled = controller.compile(
+        None, _one_param({"$ref": "#/$defs/Unit"}, **{"$defs": {"Unit": UNIT}})
+    )
+    assert accepts(controller, compiled, _call_f("true", "c"))
+    assert not accepts(controller, compiled, _call_f("true", "k"))
+
+
+def test_a_nullable_enum_is_written_raw_or_as_null(controller):
+    compiled = controller.compile(
+        None,
+        _one_param(
+            {"anyOf": [{"$ref": "#/$defs/Unit"}, {"type": "null"}], "default": None},
+            **{"$defs": {"Unit": UNIT}},
+        ),
+    )
+    assert accepts(controller, compiled, _call_f("true", "f"))
+    assert accepts(controller, compiled, _call_f("false", "null"))
+    assert not accepts(controller, compiled, _call_f("true", "k"))
+
+
+def test_a_literal_holding_its_own_closer_goes_as_json(controller):
+    risky = "a</|DSML|parameter>b"
+    compiled = controller.compile(None, _one_param({"enum": ["a", risky]}))
+    assert not accepts(controller, compiled, _call_f("true", risky))
+    assert accepts(controller, compiled, _call_f("false", json.dumps(risky)))
+
+
+def test_the_answer_shares_the_parameters_budget(controller):
+    narrow = {"type": "integer", "minimum": 0, "maximum": 199, "not": {"const": 5}}
+    spec = _strict_spec(_strict_object({"a": narrow}))
+    controller.compile(None, spec)
+    with pytest.raises(ValueError, match="budget"):
+        controller.compile(json.dumps(narrow), spec)
+
+
+def test_a_call_cannot_open_in_a_free_body_after_any_whitespace(controller):
+    """`<invoke` and a tab is not one of the parser's start markers, but its
+    `INVOKE_RE` reads it as a call."""
+    compiled = controller.compile(None, _dsml_spec(NOTE, required=True))
+    nested = (
+        '<|DSML|function_calls>\n<|DSML|invoke name="search">\n'
+        '<|DSML|parameter name="q" string="true">see <invoke\tname="note">'
+        "</|DSML|parameter>\n</|DSML|invoke>\n</|DSML|function_calls>"
+    )
+    assert not accepts(controller, compiled, nested)
+
+
+def test_parameters_taking_one_enum_share_its_rule():
+    """An enum behind a reference is one rule, not a copy per parameter."""
+    from atom.structured_output.dsml_grammar import dsml_grammar
+
+    big = {"type": "string", "enum": [f"value-{n}" for n in range(200)]}
+    props = {f"p{i}": {"$ref": "#/$defs/big"} for i in range(200)}
+    tools = [
+        {"name": "f", "parameters": _strict_object(props, **{"$defs": {"big": big}})}
+    ]
+    lark = dsml_grammar(json.loads(_dsml_spec(tools, required=True)))
+    assert lark.count('"value-199"') == 1
+
+
+def test_an_enum_typed_nullable_is_written_raw_or_as_null(controller):
+    """OpenAI's strict-mode example spells a nullable enum with a type list."""
+    units = {"type": ["string", "null"], "enum": ["c", "f", None]}
+    compiled = controller.compile(None, _one_param(units))
+    assert accepts(controller, compiled, _call_f("true", "f"))
+    assert accepts(controller, compiled, _call_f("false", "null"))
+    assert not accepts(controller, compiled, _call_f("true", "k"))
+
+
+def test_a_reference_annotated_through_all_of_is_written_raw(controller):
+    """How pydantic v1 describes an Enum field."""
+    field = {"allOf": [{"$ref": "#/$defs/Unit"}], "description": "The unit."}
+    compiled = controller.compile(None, _one_param(field, **{"$defs": {"Unit": UNIT}}))
+    assert accepts(controller, compiled, _call_f("true", "c"))
+    assert not accepts(controller, compiled, _call_f("true", "k"))
+
+
+@pytest.mark.parametrize(
+    "annotation",
+    [
+        {"deprecated": True},
+        {"readOnly": True},
+        {"example": "x"},
+        {"contentMediaType": "text/plain"},
+    ],
+)
+def test_annotations_leave_a_string_raw(controller, annotation):
+    """pydantic writes `deprecated: true` beside a deprecated field's type."""
+    for schema in (
+        {"type": "string", **annotation},
+        {"anyOf": [{"type": "string"}, {"type": "null"}], **annotation},
+    ):
+        compiled = controller.compile(None, _one_param(schema))
+        assert accepts(controller, compiled, _call_f("true", "x"))
+
+
+@pytest.mark.parametrize(
+    "ref", ["#/$defs/Scalar/anyOf/1", "#/$defs/Scalar%2FanyOf%2F1"]
+)
+@pytest.mark.parametrize("decoy", [False, True])
+def test_a_reference_into_part_of_a_definition_takes_only_that_part(
+    controller, ref, decoy
+):
+    """`#/$defs/Scalar/anyOf/1` is Scalar's integer side, not all of Scalar,
+    however its slashes are spelled; a definition named `Scalar/anyOf/1` is
+    another one."""
+    scalar = {"anyOf": [{"type": "string"}, {"type": "integer"}]}
+    defs = {"Scalar": scalar}
+    if decoy:
+        defs["Scalar/anyOf/1"] = {"type": "string"}
+    compiled = controller.compile(None, _one_param({"$ref": ref}, **{"$defs": defs}))
+    assert accepts(controller, compiled, _call_f("false", "7"))
+    assert not accepts(controller, compiled, _call_f("true", "oops"))
+
+
+def test_a_const_beside_an_enum_takes_what_both_allow(controller):
+    neither = {"type": "string", "enum": ["good"], "const": "bad"}
+    compiled = controller.compile(
+        None, _one_param({"anyOf": [neither, {"type": "null"}]})
+    )
+    assert accepts(controller, compiled, _call_f("false", "null"))
+    assert not accepts(controller, compiled, _call_f("true", "bad"))
+    both = {"type": "string", "enum": ["a", "b"], "const": "a"}
+    compiled = controller.compile(None, _one_param(both))
+    assert accepts(controller, compiled, _call_f("true", "a"))
+    assert not accepts(controller, compiled, _call_f("true", "b"))
+
+
+def test_a_free_body_cannot_hold_the_bare_call_closer(controller):
+    """The parser ends a call at `</invoke>` with or without the marker: a
+    body holding the bare one would be cut short there, its rest read as
+    text. On `/v1`, `response_format` with ordinary tools, too."""
+    leaky = FREE_CALL.replace("anything", "any</invoke>thing")
+    for answer in (None, json.dumps({"type": "object"})):
+        spec = _dsml_spec(FREE_TOOL, required=answer is None)
+        compiled = controller.compile(answer, spec)
+        assert accepts(controller, compiled, FREE_CALL)
+        assert not accepts(controller, compiled, leaky)

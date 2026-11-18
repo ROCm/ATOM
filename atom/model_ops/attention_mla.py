@@ -62,11 +62,11 @@ from atom.distributed.dcp_utils import (
 )
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
-    pcp_allgather_rerange,
+    pcp_allgather_rerange_many,
     pcp_is_enabled,
 )
 from atom.model_ops.attentions.sparse_mla_head_groups import (
-    MLA_WORK_NAMES,
+    PERSISTENT_WORK_BUFFERS,
 )
 from atom.model_ops.dcp_ops import dcp_all_gather_prefill_query_heads
 from atom.model_ops.indexer.schedule import skips_index_topk
@@ -106,9 +106,9 @@ def indexer_qk_rope_quant_and_cache(
     slot_mapping: torch.Tensor,
     norm_weight: torch.Tensor,
     norm_bias: torch.Tensor,
-    positions: torch.Tensor,
-    cos_cache: torch.Tensor,
-    sin_cache: torch.Tensor,
+    positions: torch.Tensor | None,
+    cos_cache: torch.Tensor | None,
+    sin_cache: torch.Tensor | None,
     epsilon: float,
     quant_block_size: int,
     scale_fmt: str | None,
@@ -117,14 +117,16 @@ def indexer_qk_rope_quant_and_cache(
     is_neox: bool = True,
     q_scale_out: torch.Tensor | None = None,
     kv_cache_scale: torch.Tensor | None = None,
+    *,
+    scale_layout: str = "flydsl",
+    rope_dim: int = 64,
 ) -> None:
-    """Run the fused indexer cache op with ATOM's DCP query semantics.
+    """Run AITER's fused HIP indexer writer with ATOM's DCP query semantics.
 
-    The two scale buffers together switch the op to packed E2M1 + e8m0 outputs,
-    and are forwarded only when given so that an aiter predating them still
-    accepts the FP8 call -- the same version tolerance the seg-variant import
-    above keeps. One without the other would fall back to FP8 and write that
-    layout into FP4-shaped buffers, so it is refused here rather than passed on.
+    The two scale buffers together switch the op to packed E2M1 + e8m0 outputs.
+    Supplying only one is refused before it can write FP8 into FP4 buffers.
+    OPUS accepts NoPE and publishes all Q rows. The writer receives the
+    explicit layout and RoPE width on every call, including FP8/FlyDSL defaults.
     """
     if (q_scale_out is None) != (kv_cache_scale is None):
         raise ValueError(
@@ -136,6 +138,8 @@ def indexer_qk_rope_quant_and_cache(
         if q_scale_out is not None
         else {}
     )
+    if scale_layout != "flydsl" and q_scale_out is None:
+        raise ValueError("An explicit FP4 layout requires both scale buffers")
     _indexer_qk_rope_quant_and_cache(
         q,
         q_out,
@@ -155,7 +159,10 @@ def indexer_qk_rope_quant_and_cache(
         weights_scale,
         preshuffle=preshuffle,
         is_neox=is_neox,
-        compute_all_q_rope=get_dcp_world_size() > 1,
+        # OPUS has always published every Q row, including negative K slots.
+        compute_all_q_rope=scale_layout == "opus" or get_dcp_world_size() > 1,
+        scale_layout=scale_layout,
+        rope_dim=rope_dim,
         **fp4_out,
     )
 
@@ -355,6 +362,30 @@ def mla_dcp_kernel_num_heads(
             "mla_decode_fwd. Lower decode_context_parallel_size or raise tp."
         )
     return gathered
+
+
+def mla_dcp_persistent_width(
+    num_heads: int,
+    dcp_world_size: int,
+    min_kernel_heads: int = _MLA_MIN_HEADS,
+    *,
+    kv_cache_dtype: str,
+) -> int | None:
+    """Gathered width a persistent DCP decode runs at, or None when DCP is off
+    or aiter has no persistent kernel at that width (``dcp_persistent_supported``).
+    """
+    if dcp_world_size <= 1:
+        return None
+    width = mla_dcp_kernel_num_heads(
+        num_heads,
+        dcp_world_size,
+        min_kernel_heads,
+        kv_cache_dtype=kv_cache_dtype,
+        persistent=True,
+    )
+    if not dcp_persistent_supported(width, kv_cache_dtype, dcp_world_size):
+        return None
+    return width
 
 
 def mla_dcp_sparse_prefill_num_heads(
@@ -702,9 +733,10 @@ class MLAAttention(nn.Module):
             if self.topk_tokens is not None
             else 16
         )
-        # Shared layers have no indexer buffer at construction; the metadata
-        # builder rebinds it to the shared `_sparse_kv_indices_gpu` at runtime,
-        # so the layer reads the prior full layer's selected indices.
+        # Not read by this layer (its forward reads `sparse_kv_indices`): the
+        # metadata builder rebinds it to the shared `_sparse_kv_indices_gpu`,
+        # where a mono layer writes its selection
+        # (`glm52.mono.contract.shared_sparse_buffer`).
         self.sparse_kv_indices_buffer = (
             mla_modules.indexer.sparse_kv_indices_buffer
             if mla_modules.indexer is not None
@@ -878,6 +910,11 @@ class MLAAttention(nn.Module):
         )
         # Which collective pattern the output merge uses; see _dcp_merge.
         self.dcp_comm_backend = get_current_atom_config().dcp_config.comm_backend
+        assert self.dcp_comm_backend != "auto", "Config resolves comm_backend"
+        # Collective, once per (DCP group, heads, head dim): every DCP rank
+        # builds the same MLA layers in the same order, as for the weights.
+        if self.dcp_world_size > 1 and self.dcp_comm_backend == "mailbox":
+            self._prepare_dcp_mailbox()
 
         # Row view of q_proj used by prefill; see _local_q_proj. Initialized here
         # rather than in process_weights_after_loading so it exists no matter
@@ -885,7 +922,6 @@ class MLAAttention(nn.Module):
         self._qrep_local_proj = None
         self._qrep_local_src = None
 
-        self.dcp_persistent_supported = dcp_persistent_supported()
         self.dcp_prefill_merge_bf16_ok = dcp_prefill_merge_bf16_ok()
         # Every sparse DCP shape is per-token q_len=1 rows -- one per sequence
         # in decode, one per query token in sparse prefill and MTP verify.
@@ -893,11 +929,6 @@ class MLAAttention(nn.Module):
         self.sparse_dcp_metadata_rebuild = (
             self.is_sparse_mla and self.dcp_world_size > 1
         )
-
-        # Compacted per-layer sparse offsets for DCP decode; rebound by the
-        # metadata builder to the shared buffer (see aiter_mla.py).
-        self.dcp_sparse_kv_indptr_buffer = None
-        self.dcp_owned_counts_buffer = None
 
         self._configure_dcp_decode_head_padding(self.dcp_world_size)
         # Read from the same predicate the width/rebuild decision came from,
@@ -935,6 +966,17 @@ class MLAAttention(nn.Module):
         The vLLM plugin initializes its process groups independently from the
         native ATOM config, so it calls this again with vLLM's DCP size.
         """
+        # Whether aiter runs this layer's DCP decode persistent, at the width
+        # the persistent path gathers to.
+        self.dcp_persistent_supported = (
+            mla_dcp_persistent_width(
+                self.num_heads,
+                dcp_world_size,
+                self.min_query_heads,
+                kv_cache_dtype=self.kv_cache_dtype,
+            )
+            is not None
+        )
         # DCP decode all-gathers Q on the head dim, so the width reaching
         # mla_decode_fwd is the gathered num_heads * dcp rounded up to a
         # dispatchable one. The pad sits entirely inside _forward_decode: it goes
@@ -988,7 +1030,6 @@ class MLAAttention(nn.Module):
                 dcp_world_size,
                 self.num_heads * dcp_world_size,
                 self.kv_cache_dtype.startswith("fp8"),
-                self.dcp_persistent_supported,
                 get_current_atom_config().max_num_batched_tokens,
             )
             (
@@ -1340,32 +1381,54 @@ class MLAAttention(nn.Module):
             self._qrep_local_src = w
         return self._qrep_local_proj
 
-    def _dcp_merge(self, o, lse, ctx=None, owned_counts=None, quant_dtype=None):
-        """Bind this layer's DCP group and backend to ``dcp_ops.dcp_lse_merge``."""
+    def _prepare_dcp_mailbox(self):
+        """Map the mailbox merge's peer buffer while every rank builds the same
+        layer (collective, and before the KV cache is sized). Plugin mode never
+        gets here: Config resolves it to all-to-all."""
+        from atom.model_ops.dcp_ops import dcp_mailbox_max_tokens, prepare_dcp_mailbox
+
+        if not prepare_dcp_mailbox(
+            self.dcp_group,
+            self.num_heads,
+            self.v_head_dim if self.pbm_enabled else self.kv_lora_rank,
+            dcp_mailbox_max_tokens(get_current_atom_config()),
+        ):  # prepare_dcp_mailbox logged why, once
+            self.dcp_comm_backend = "a2a"
+
+    def _dcp_merge(
+        self, o, lse, ctx=None, owned_counts=None, quant_dtype=None, decode=False
+    ):
+        """Bind this layer's DCP group and backend to ``dcp_ops.dcp_lse_merge``.
+        The mailbox backend serves decode only; prefill merges with a2a."""
         from atom.model_ops.dcp_ops import dcp_lse_merge
 
+        backend = self.dcp_comm_backend
+        if backend == "mailbox" and not decode:
+            backend = "a2a"
         return dcp_lse_merge(
             o,
             lse,
             self.dcp_group,
-            self.dcp_comm_backend,
+            backend,
             ctx=ctx,
             owned_counts=owned_counts,
             quant_dtype=quant_dtype,
         )
 
     def _dcp_fused_quant_dtype(self):
-        """o_proj's activation dtype if the combine can emit it, else None.
+        """o_proj's activation dtype if the combine may emit it, else None.
 
         The combine can only absorb the quant when o_proj reads its output
-        directly (PBM) and wants exactly a per-token FP8 activation. A static
+        directly (PBM) and wants exactly a per-token FP8 activation. The
+        mailbox combine emits bf16 even then (``(rows, None)``); the a2a
+        combine it falls back to quantizes. A static
         input_scale is not a per-token scale, and the block schemes need a scale
         per channel GROUP with a layout choice; all of those keep the standalone
         quant kernel they have today.
         """
         if not self.pbm_enabled:
             return None
-        if self.dcp_comm_backend != "a2a":
+        if self.dcp_comm_backend not in ("a2a", "mailbox"):
             return None
         op = getattr(self, "o_proj", None)
         qt = getattr(op, "quant_type", None)
@@ -1387,7 +1450,7 @@ class MLAAttention(nn.Module):
 
     @mark_trace(prefix="dcp_project_merge_out", torch_compile=False)
     def _dcp_project_merge_out(
-        self, o, lse, ctx=None, merge_in_fp32=False, owned_counts=None
+        self, o, lse, ctx=None, merge_in_fp32=False, owned_counts=None, decode=False
     ):
         """Shared tail of both DCP paths: PBM projection, merge, o_proj.
 
@@ -1410,7 +1473,12 @@ class MLAAttention(nn.Module):
             )
         else:
             o = self._dcp_merge(
-                o, lse, ctx=ctx, owned_counts=owned_counts, quant_dtype=fused_quant
+                o,
+                lse,
+                ctx=ctx,
+                owned_counts=owned_counts,
+                quant_dtype=fused_quant,
+                decode=decode,
             )
         if fused_quant is not None:
             o, o_scale = o
@@ -1418,8 +1486,8 @@ class MLAAttention(nn.Module):
                 return self.o_proj(
                     o.reshape(-1, self.num_heads * self.v_head_dim), o_scale
                 )
-            # Single-rank DCP: there was no combine to fold into, so the tensor
-            # came back unquantized and o_proj quantizes it as it always has.
+            # Single-rank DCP, or the mailbox combine: the rows came back
+            # unquantized and o_proj quantizes them as it always has.
         if self.pbm_enabled:
             return self.o_proj(o.reshape(-1, self.num_heads * self.v_head_dim))
         return self._v_up_proj_and_o_proj(o)
@@ -1453,7 +1521,7 @@ class MLAAttention(nn.Module):
             o,
             lse,
             merge_in_fp32=not self.dcp_prefill_merge_bf16_ok,
-            owned_counts=self.dcp_owned_counts_buffer[: q_out.shape[0]],
+            owned_counts=attn_metadata.dcp_owned_counts[: q_out.shape[0]],
         )
 
     @mark_trace(prefix="dcp_decode", torch_compile=False)
@@ -1471,8 +1539,8 @@ class MLAAttention(nn.Module):
             q_out = dcp_all_gather_query_heads(self.dcp_group, q_out)
         o, lse = self._forward_decode(q_out, kv_cache, attn_metadata, return_lse=True)
         owned_counts = (
-            self.dcp_owned_counts_buffer[: q_out.shape[0]]
-            if self.is_sparse_mla and self.dcp_owned_counts_buffer is not None
+            attn_metadata.dcp_owned_counts[: q_out.shape[0]]
+            if self.is_sparse_mla and attn_metadata.dcp_owned_counts is not None
             else None
         )
         return self._dcp_project_merge_out(
@@ -1480,6 +1548,7 @@ class MLAAttention(nn.Module):
             lse,
             ctx=self._cp_triton_ctx,
             owned_counts=owned_counts,
+            decode=True,
         )
 
     def _v_up_proj(self, x, W_V=None, W_V_scale=None, num_heads=None):
@@ -1496,18 +1565,16 @@ class MLAAttention(nn.Module):
         # passes the raw decode output, which is not guaranteed contiguous the
         # way the post-ReduceScatter tensor is.
         x = x.reshape(-1, num_heads, self.kv_lora_rank).transpose(0, 1)
-        # Multiply (N, B, L) x (N, L, V) -> (N, B, V), Convert from (N, B, V) to (B, N, V)
-        # x = torch.bmm(x, self.W_UV).transpose(0, 1)
-        # Convert from (B, N, L) to (N, B, L)
+        # All V-up GEMMs write into the same contiguous (B, N, V) output.
+        output = torch.empty(
+            x.shape[1],
+            x.shape[0],
+            W_V.shape[1],
+            device=x.device,
+            dtype=torch.bfloat16,
+        )
         if is_rocm_aiter_fp4bmm_enabled():
-            output = torch.empty(
-                x.shape[1],
-                x.shape[0],
-                W_V.shape[1],
-                device=x.device,
-                dtype=torch.bfloat16,
-            )
-            output = batched_gemm_a16wfp4(
+            batched_gemm_a16wfp4(
                 x,
                 W_V,
                 W_V_scale,
@@ -1516,19 +1583,18 @@ class MLAAttention(nn.Module):
                 prequant=True,
                 y_scale=None,
             )
-            # x = x.transpose(0, 1).flatten(1, 2)
-            x = output
         elif W_V_scale is None:
             # BF16 absorb via Triton batched GEMM (gfx1250-safe; torch.bmm's
             # hipBLASLt bf16 batched path memory-faults). batched_gemm_bf16 does
-            # X @ W^T with W (B,N,K): x (N,B,L) @ W_V (N,V,L)^T -> (N,B,V), then
-            # -> (B,N,V) to match the fp8/fp4 output layout.
-            x = _aiter_triton_bf16_bmm(x, W_V).transpose(0, 1)
+            # X @ W^T with W (B,N,K): x (N,B,L) @ W_V (N,V,L)^T -> (N,B,V),
+            # stored through output strides into a contiguous (B,N,V) buffer so
+            # the (B, N*V) view o_proj takes needs no transpose copy.
+            _aiter_triton_bf16_bmm(x, W_V, YQ=output.transpose(0, 1))
         else:
-            x = _aiter_triton_fp8_bmm(
-                x, W_V, W_V_scale, group_size=128, transpose_bm=True
+            _aiter_triton_fp8_bmm(
+                x, W_V, W_V_scale, group_size=128, YQ=output, transpose_bm=True
             )
-        return x.reshape(-1, num_heads, self.v_head_dim)
+        return output
 
     @mark_trace(prefix="v_up_proj_and_o_proj", torch_compile=False)
     def _v_up_proj_and_o_proj(self, x):
@@ -2335,7 +2401,7 @@ class MLAAttention(nn.Module):
         if self.is_sparse_mla:
             paged_cu_seqlens_q = attn_metadata.sparse_cu_seqlens_q
             paged_kv_indptr = attn_metadata.sparse_kv_indptr
-            paged_kv_indices = self.sparse_kv_indices_buffer
+            paged_kv_indices = attn_metadata.sparse_kv_indices
             # Sparse attention needs one last-page len per query token; the dense
             # kv_last_page_lens (per-seq) would over-read -> illegal access.
             kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens
@@ -2344,7 +2410,7 @@ class MLAAttention(nn.Module):
                 # of each query token's region, so the region lengths are the
                 # per-rank (and per-layer) ones, not the global sparse_kv_indptr.
                 # Same substitution the decode path makes.
-                paged_kv_indptr = self.dcp_sparse_kv_indptr_buffer[
+                paged_kv_indptr = attn_metadata.dcp_sparse_kv_indptr[
                     : paged_cu_seqlens_q.shape[0]
                 ]
             max_q_len = 1
@@ -2438,7 +2504,7 @@ class MLAAttention(nn.Module):
                 elif use_work_meta:
                     work = {
                         name: getattr(attn_metadata, f"sparse_prefill_{name}", None)
-                        for name in MLA_WORK_NAMES
+                        for name in PERSISTENT_WORK_BUFFERS
                     }
                 else:
                     work = {}
@@ -2561,7 +2627,7 @@ class MLAAttention(nn.Module):
     ) -> None:
         """Rebuild persistent work/reduce metadata from this layer's DCP top-k.
 
-        A full GLM IndexShare layer rewrites ``dcp_sparse_kv_indptr_buffer``
+        A full GLM IndexShare layer rewrites ``dcp_sparse_kv_indptr``
         after selecting and compacting the rank-owned top-k. Persistent work
         descriptors embed those region boundaries, so they must be rebuilt
         after that mutation rather than once per decode step from the global
@@ -2615,6 +2681,17 @@ class MLAAttention(nn.Module):
             uni_seqlen_qo=1,
             fast_mode=1,
             max_split_per_batch=_MLA_SPLIT_BUDGET_AUTO,
+        )
+
+    def decode_is_persistent(self) -> bool:
+        """Whether this layer's aiter decode runs the persistent kernel over the
+        step's work plan (`should_use_persistent_mode`)."""
+        return should_use_persistent_mode(
+            dp_size=get_dp_group().world_size,
+            dpa_persistent_supported=self._dpa_persistent_supported,
+            page_size=envs.ATOM_MLA_PAGE_SIZE,
+            dcp_world_size=self.dcp_world_size,
+            dcp_persistent_supported=self.dcp_persistent_supported,
         )
 
     def _forward_decode(
@@ -2717,11 +2794,29 @@ class MLAAttention(nn.Module):
                 if attn_metadata.max_seqlen_q > 1:
                     # MTP verify: per-token layout with max_q_len=1.
                     # Persistent metadata is per-token (from _set_mla_persistent_worker_buffers_sparse_mtp).
-                    paged_cu_seqlens_q = attn_metadata.sparse_cu_seqlens_q
+                    # Cut to q's rows: the drafter's step 0 runs fewer than the
+                    # padded running_tokens these are published for, and the
+                    # DCP rebuild below plans from them.
+                    paged_cu_seqlens_q = attn_metadata.sparse_cu_seqlens_q[: B + 1]
                     paged_kv_indptr = attn_metadata.sparse_kv_indptr
-                    paged_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens
-                    paged_kv_indices = self.sparse_kv_indices_buffer
+                    paged_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens[:B]
+                    paged_kv_indices = attn_metadata.sparse_kv_indices
                     max_q_len = 1
+                    # The persistent kernel reads q and writes o for every work
+                    # item, so a plan over more rows than q holds runs past both.
+                    # The MTP drafter's step 0 reuses this plan with the
+                    # target's unpadded stream (#287), hence the check on q's
+                    # own rows. Host ints only: no sync, safe under capture.
+                    # DCP rebuilds the sparse_mtp_ plan per layer below.
+                    planned_tokens = getattr(
+                        attn_metadata, "sparse_mtp_num_tokens", None
+                    )
+                    if self.dcp_world_size == 1 and planned_tokens is not None:
+                        assert planned_tokens <= B, (
+                            f"sparse MTP plan covers {planned_tokens} query "
+                            f"rows but q holds {B}: the decode would read q "
+                            f"and write o past their ends"
+                        )
                 else:
                     # Non-MTP sparse decode: KV is packed per token at
                     # page_size=1, so last_page_len is 1 for every seq. Use the
@@ -2730,22 +2825,15 @@ class MLAAttention(nn.Module):
                     # past the written sparse-index region -> illegal access).
                     paged_cu_seqlens_q = attn_metadata.cu_seqlens_q[: B + 1]
                     paged_kv_indptr = attn_metadata.sparse_kv_indptr[: B + 1]
-                    paged_kv_indices = self.sparse_kv_indices_buffer
+                    paged_kv_indices = attn_metadata.sparse_kv_indices
                     paged_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens[:B]
                 if self.dcp_world_size > 1:
                     # The indexer compacted this layer's owned top-k, so the
                     # real lengths are here, not in sparse_kv_indptr; `B` is a
                     # token count on both branches.
-                    paged_kv_indptr = self.dcp_sparse_kv_indptr_buffer[: B + 1]
+                    paged_kv_indptr = attn_metadata.dcp_sparse_kv_indptr[: B + 1]
 
-            dp_size = get_dp_group().world_size
-            use_persistent_mode = should_use_persistent_mode(
-                dp_size=dp_size,
-                dpa_persistent_supported=self._dpa_persistent_supported,
-                page_size=envs.ATOM_MLA_PAGE_SIZE,
-                dcp_world_size=self.dcp_world_size,
-                dcp_persistent_supported=self.dcp_persistent_supported,
-            )
+            use_persistent_mode = self.decode_is_persistent()
             # Sparse DCP persistent decode rebuilds the work plan below from
             # the layer-local compact indptr; MTP verify is per-token q_len=1
             # rows and rebuilds into the sparse_mtp_ buffers.
@@ -3123,9 +3211,12 @@ class MLAAttention(nn.Module):
             if pcp:
                 pcp_ws = get_pcp_world_size()
                 n_real = attn_metadata.slot_mapping.shape[0]
-                k_nope_full = pcp_allgather_rerange(k_nope, pcp_ws)[:n_real]
-                k_rope_full = pcp_allgather_rerange(k_rope, pcp_ws)[:n_real]
-                positions_full = pcp_allgather_rerange(positions, pcp_ws)[:n_real]
+                k_nope_full, k_rope_full, positions_full = (
+                    g[:n_real]
+                    for g in pcp_allgather_rerange_many(
+                        [k_nope, k_rope, positions], pcp_ws
+                    )
+                )
                 write_slot_mapping = attn_metadata.slot_mapping_owned
             else:
                 write_slot_mapping = attn_metadata.slot_mapping

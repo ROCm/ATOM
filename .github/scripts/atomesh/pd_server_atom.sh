@@ -879,6 +879,7 @@ wait_http() {
   local timeout="$3"
   local pid="${4:-}"
   local deadline=$(( $(date +%s) + timeout ))
+  local peer
   echo "[wait] ${name} ${url} timeout=${timeout}s"
   until curl -sf --max-time 10 "${url}" >/dev/null 2>&1; do
     exit_if_mooncake_store_died
@@ -890,6 +891,12 @@ wait_http() {
       [[ "${rc}" -eq 0 ]] && rc=1
       echo "[wait][FAIL] ${name} process exited before becoming ready rc=${rc}" >&2
       exit "${rc}"
+    fi
+    # After this node's own checks: when both failed, its own failure is the
+    # one to report.
+    if peer="$(failed_peer_node)"; then
+      echo "[wait][FAIL] ${name}: another node's launcher exited (${peer})" >&2
+      exit 1
     fi
     if [[ "$(date +%s)" -ge "${deadline}" ]]; then
       echo "[wait][FAIL] ${name} not ready after ${timeout}s" >&2
@@ -1600,13 +1607,34 @@ stop_mooncake_store() {
   [[ -z "${mooncake_store_failed_rc}" ]]
 }
 
+# Prints the rank-rc-* of another node whose launcher exited non-zero: the
+# servers, router or Store owners that node was to bring never come. Only Spur
+# workers publish rank-rc-* (cleanup_spur in pd_slurm_job.sh); under plain
+# Slurm there are none, and srun --kill-on-bad-exit=1 stops the other nodes.
+failed_peer_node() {
+  local f rc
+  for f in "${RUN_DIR}"/rank-rc-*; do
+    [[ -f "${f}" && "${f}" != *.tmp && "${f##*/}" != "rank-rc-${NODE_RANK}" ]] || continue
+    rc="$(cat "${f}" 2>/dev/null)"
+    if [[ -n "${rc}" && "${rc}" != "0" ]]; then
+      echo "${f##*/}=${rc}"
+      return 0
+    fi
+  done
+  return 1
+}
+
 # Fails startup (stopping what it started) unless <condition> holds within
-# <timeout> seconds; a dying Store process fails it at once.
+# <timeout> seconds. It fails at once when a Store process dies, when a Store
+# log reports a failure (Failed to setup client, Failed to mount, Check failed,
+# FATAL), or when another node's launcher exits non-zero, checked in that
+# order: when this node and another both failed, this node's failure is the
+# one to report.
 wait_for_mooncake_store() {
   local what="$1" timeout="$2"
   shift 2
   local deadline=$(( $(date +%s) + timeout ))
-  local log
+  local log peer
   until "$@"; do
     if ! reap_dead_mooncake_store; then
       echo "[wait][FAIL] mooncake-store ${what}: a Store process exited" >&2
@@ -1621,6 +1649,11 @@ wait_for_mooncake_store() {
         exit 1
       fi
     done
+    if peer="$(failed_peer_node)"; then
+      echo "[wait][FAIL] mooncake-store ${what}: another node's launcher exited (${peer})" >&2
+      stop_mooncake_store || true
+      exit 1
+    fi
     if [[ "$(date +%s)" -ge "${deadline}" ]]; then
       for log in "${mooncake_store_logs[@]}"; do
         tail -n 20 "${log}" >&2 || true
@@ -2453,6 +2486,18 @@ wait_for_torch_traces() {
   done
 }
 
+# Saves the router's /metrics with its scrape time. A failed scrape only warns.
+save_router_metrics() {
+  local output="$1"
+  local scraped_at metrics
+  scraped_at="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
+  if metrics="$(curl -sSf --max-time 10 "http://127.0.0.1:${ROUTER_PORT}/metrics")"; then
+    printf '# scraped_at %s\n%s\n' "${scraped_at}" "${metrics}" > "${output}"
+  else
+    echo "[aiperf] WARNING: router /metrics snapshot failed" >&2
+  fi
+}
+
 run_aiperf_agentic_benchmark() {
   ensure_agentx_harness
 
@@ -2522,6 +2567,12 @@ run_aiperf_agentic_benchmark() {
         > >(tee "${out_dir}/torch_profile.log") 2>&1 &
       profile_pid=$!
     fi
+    # collect_metrics.py creates metrics/ itself, so the baseline waits outside it.
+    local router_before="${out_dir}/router-metrics-before.prom"
+    rm -f "${router_before}"
+    if [[ "${AGGREGATED}" != "1" ]]; then
+      save_router_metrics "${router_before}"
+    fi
     AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT="${AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT}" \
     AIPERF_HTTP_TCP_USER_TIMEOUT="${AIPERF_HTTP_TCP_USER_TIMEOUT}" \
     AIPERF_DATASET_CONFIGURATION_TIMEOUT="${AIPERF_DATASET_CONFIGURATION_TIMEOUT}" \
@@ -2563,6 +2614,22 @@ run_aiperf_agentic_benchmark() {
     echo "${aiperf_pid}" > "${aiperf_pid_file}"
     local aiperf_rc=0
     wait "${aiperf_pid}" || aiperf_rc=$?
+    if [[ "${AGGREGATED}" != "1" ]]; then
+      # Every concurrency level shares this router, so the counters after the
+      # run include the earlier levels. Stage the baseline and this run's
+      # increase with the latency report.
+      local router_metrics="${out_dir}/metrics"
+      mkdir -p "${router_metrics}"
+      save_router_metrics "${router_metrics}/router-metrics.prom"
+      if [[ -f "${router_before}" ]]; then
+        mv "${router_before}" "${router_metrics}/"
+      fi
+      python3 "${ATOMESH_SCRIPT_DIR}/observability/router_metrics_delta.py" \
+        "${router_metrics}/router-metrics-before.prom" \
+        "${router_metrics}/router-metrics.prom" \
+        --output "${router_metrics}/router-metrics-delta.prom" \
+        || echo "[aiperf] WARNING: router metrics increase not computed" >&2
+    fi
 
     if [[ -n "${profile_pid}" ]]; then
       touch "${profile_done}"

@@ -33,10 +33,26 @@ def _load(path: Path):
         return json.load(fh)
 
 
-def _semantic_checks(entry: dict, idx: int) -> list[str]:
+# Catalogs whose nightly entries each run on one Beijing weekday a week.
+WEEKLY_NIGHTLY_CATALOGS = {"oot_models_accuracy.json"}
+
+
+def _semantic_checks(entry: dict, idx: int, filename: str) -> list[str]:
     """Cross-field rules the schema cannot express. Returns a list of problems."""
     problems: list[str] = []
     name = entry.get("model_name", f"#{idx}")
+
+    # The vLLM accuracy nightly only runs a nightly entry on its weekday, and
+    # refuses the whole night when one has none; catch that at PR time.
+    if (
+        filename in WEEKLY_NIGHTLY_CATALOGS
+        and entry.get("test_level") == "nightly"
+        and "nightly_weekday" not in entry
+    ):
+        problems.append(
+            f"[{name}] nightly entry needs nightly_weekday (Mon ... Sun): "
+            "the Beijing weekday it runs on"
+        )
 
     # Every entry must declare a pass bar under exactly one of the two spellings
     # the catalogs use today (accuracy_threshold / accuracy_test_threshold). This
@@ -77,7 +93,7 @@ def validate_one(filename: str, validator: Draft202012Validator) -> list[str]:
         for idx, entry in enumerate(data):
             if isinstance(entry, dict):
                 problems.extend(
-                    f"{filename}: {p}" for p in _semantic_checks(entry, idx)
+                    f"{filename}: {p}" for p in _semantic_checks(entry, idx, filename)
                 )
 
     return problems

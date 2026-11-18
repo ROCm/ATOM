@@ -7,6 +7,7 @@
     "runner": "linux-atom-pitt-mi350x-8",
     "test_level": "nightly",
     "priority": "P2",
+    "nightly_weekday": "Mon",
     "accuracy_test_threshold": 0.87,
     "accuracy_baseline": 0.87,
     "accuracy_baseline_model": "Qwen/Qwen3-235B-A22B-Instruct-2507"
@@ -19,6 +20,7 @@
     "runner": "linux-atom-pitt-mi350x-8",
     "test_level": "nightly",
     "priority": "P0",
+    "nightly_weekday": "Mon",
     "accuracy_test_threshold": 0.81
   },
   {
@@ -29,6 +31,7 @@
     "runner": "linux-atom-pitt-mi350x-8",
     "test_level": "nightly",
     "priority": "P2",
+    "nightly_weekday": "Mon",
     "accuracy_test_threshold": 0.81
   },
   {
@@ -39,6 +42,7 @@
     "runner": "linux-atom-pitt-mi350x-8",
     "test_level": "nightly",
     "priority": "P1",
+    "nightly_weekday": "Mon",
     "accuracy_test_threshold": 0.81,
     "accuracy_baseline": 0.76,
     "accuracy_baseline_model": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8"
@@ -51,6 +55,7 @@
     "runner": "linux-atom-pitt-mi350x-8",
     "test_level": "nightly",
     "priority": "P0",
+    "nightly_weekday": "Mon",
     "accuracy_test_threshold": 0.8
   },
   {
@@ -61,6 +66,7 @@
     "runner": "linux-atom-pitt-mi350x-8",
     "test_level": "nightly",
     "priority": "P0",
+    "nightly_weekday": "Mon",
     "accuracy_test_threshold": 0.8,
     "accuracy_baseline": 0.81,
     "accuracy_baseline_model": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
@@ -74,6 +80,7 @@
     "runner": "linux-atom-pitt-mi350x-8",
     "test_level": "nightly",
     "priority": "P2",
+    "nightly_weekday": "Tue",
     "accuracy_test_threshold": 0.83,
     "accuracy_baseline": 0.83,
     "accuracy_baseline_model": "Qwen/Qwen3.5-397B-A17B-FP8"
@@ -86,6 +93,7 @@
     "runner": "linux-atom-pitt-mi350x-8",
     "test_level": "nightly",
     "priority": "P2",
+    "nightly_weekday": "Tue",
     "accuracy_test_threshold": 0.83
   },
   {
@@ -96,6 +104,7 @@
     "runner": "linux-atom-pitt-mi350x-8",
     "test_level": "nightly",
     "priority": "P2",
+    "nightly_weekday": "Tue",
     "accuracy_test_threshold": 0.83,
     "accuracy_baseline": 0.83,
     "accuracy_baseline_model": "Qwen/Qwen3.5-397B-A17B"
@@ -109,6 +118,7 @@
     "runner": "linux-atom-pitt-mi350x-8",
     "test_level": "nightly",
     "priority": "P2",
+    "nightly_weekday": "Tue",
     "accuracy_test_threshold": 0.83,
     "accuracy_baseline": 0.82,
     "accuracy_baseline_model": "Qwen/Qwen3-235B-A22B-Instruct-2507",
@@ -122,6 +132,7 @@
     "runner": "linux-atom-pitt-mi350x-8",
     "test_level": "nightly",
     "priority": "P2",
+    "nightly_weekday": "Tue",
     "accuracy_test_threshold": 0.93,
     "accuracy_baseline": 0.91,
     "accuracy_baseline_model": "Meta-Llama-3.1-405B-Instruct-FP8/",
@@ -135,6 +146,7 @@
     "runner": "linux-atom-pitt-mi350x-8",
     "test_level": "nightly",
     "priority": "P2",
+    "nightly_weekday": "Tue",
     "accuracy_test_threshold": 0.73,
     "accuracy_baseline": 0.75,
     "accuracy_baseline_model": "meta-llama/Llama-3.1-8B-Instruct",
@@ -148,6 +160,7 @@
     "runner": "linux-atom-pitt-mi350x-8",
     "test_level": "nightly",
     "priority": "P1",
+    "nightly_weekday": "Wed",
     "accuracy_test_threshold": 0.9
   },
   {
@@ -158,6 +171,7 @@
     "runner": "linux-atom-pitt-mi350x-8",
     "test_level": "nightly",
     "priority": "P1",
+    "nightly_weekday": "Wed",
     "accuracy_test_threshold": 0.9,
     "accuracy_baseline": 0.9,
     "accuracy_baseline_model": "amd/Kimi-K2-Thinking-MXFP4"
@@ -170,6 +184,7 @@
     "runner": "linux-atom-pitt-mi350x-8",
     "test_level": "nightly",
     "priority": "P0",
+    "nightly_weekday": "Wed",
     "accuracy_test_threshold": 0.92
   },
   {
@@ -180,6 +195,7 @@
     "runner": "linux-atom-pitt-mi350x-8",
     "test_level": "nightly",
     "priority": "P1",
+    "nightly_weekday": "Wed",
     "accuracy_test_threshold": 0.93,
     "accuracy_baseline": 0.93,
     "accuracy_baseline_model": "amd/Kimi-K2.5-MXFP4",
@@ -194,6 +210,7 @@
     "runner": "linux-atom-pitt-mi350x-8",
     "test_level": "nightly",
     "priority": "P0",
+    "nightly_weekday": "Wed",
     "lm_eval_num_fewshot": 5,
     "accuracy_test_threshold": 0.95,
     "accuracy_baseline": 0.9553,
@@ -208,6 +225,7 @@
     "runner": "linux-atom-pitt-mi350x-8",
     "test_level": "nightly",
     "priority": "P1",
+    "nightly_weekday": "Thu",
     "accuracy_test_threshold": 0.93,
     "accuracy_baseline": 0.93,
     "accuracy_baseline_model": "deepseek-ai/DeepSeek-R1-0528"
@@ -220,6 +238,7 @@
     "runner": "linux-atom-pitt-mi350x-8",
     "test_level": "nightly",
     "priority": "P1",
+    "nightly_weekday": "Thu",
     "accuracy_threshold": 0.93,
     "accuracy_baseline": 0.93,
     "accuracy_baseline_model": "deepseek-ai/DeepSeek-R1-0528"
@@ -232,6 +251,7 @@
     "runner": "linux-atom-pitt-mi350x-8",
     "test_level": "nightly",
     "priority": "P1",
+    "nightly_weekday": "Thu",
     "accuracy_test_threshold": 0.93,
     "accuracy_baseline": 0.93,
     "accuracy_baseline_model": "deepseek-ai/DeepSeek-R1-0528"
@@ -244,6 +264,7 @@
     "runner": "linux-atom-pitt-mi350x-8",
     "test_level": "nightly",
     "priority": "P0",
+    "nightly_weekday": "Thu",
     "lm_eval_num_fewshot": 20,
     "accuracy_test_threshold": 0.94,
     "accuracy_baseline": 0.94,
@@ -258,6 +279,7 @@
     "runner": "linux-atom-pitt-mi350x-8",
     "test_level": "nightly",
     "priority": "P0",
+    "nightly_weekday": "Fri",
     "lm_eval_num_fewshot": 20,
     "accuracy_test_threshold": 0.93
   },
@@ -269,6 +291,7 @@
     "runner": "linux-atom-pitt-mi350x-8",
     "test_level": "nightly",
     "priority": "P1",
+    "nightly_weekday": "Fri",
     "lm_eval_num_fewshot": 20,
     "accuracy_test_threshold": 0.93,
     "accuracy_baseline": 0.956,
@@ -283,6 +306,7 @@
     "runner": "linux-atom-pitt-mi350x-8",
     "test_level": "nightly",
     "priority": "P0",
+    "nightly_weekday": "Fri",
     "lm_eval_num_fewshot": 20,
     "accuracy_test_threshold": 0.93
   },
@@ -294,6 +318,7 @@
     "runner": "linux-atom-pitt-mi350x-8",
     "test_level": "nightly",
     "priority": "P0",
+    "nightly_weekday": "Fri",
     "lm_eval_num_fewshot": 20,
     "accuracy_test_threshold": 0.93
   },
@@ -306,6 +331,7 @@
     "runner": "linux-atom-pitt-mi350x-8",
     "test_level": "nightly",
     "priority": "P0",
+    "nightly_weekday": "Sun",
     "accuracy_test_threshold": 0.88,
     "accuracy_baseline": 0.9,
     "accuracy_baseline_model": "openai/gpt-oss-120b"
@@ -319,6 +345,7 @@
     "runner": "linux-atom-pitt-mi350x-8",
     "test_level": "nightly",
     "priority": "P1",
+    "nightly_weekday": "Sun",
     "accuracy_test_threshold": 0.88,
     "accuracy_baseline": 0.9,
     "accuracy_baseline_model": "openai/gpt-oss-120b"
@@ -332,6 +359,7 @@
     "runner": "linux-atom-pitt-mi350x-8",
     "test_level": "nightly",
     "priority": "P1",
+    "nightly_weekday": "Sun",
     "accuracy_test_threshold": 0.88
   },
   {
@@ -342,6 +370,7 @@
     "runner": "linux-atom-pitt-mi350x-8",
     "test_level": "nightly",
     "priority": "P0",
+    "nightly_weekday": "Fri",
     "accuracy_test_threshold": 0.92
   },
   {
@@ -352,6 +381,7 @@
     "runner": "linux-atom-pitt-mi350x-8",
     "test_level": "nightly",
     "priority": "P1",
+    "nightly_weekday": "Fri",
     "accuracy_test_threshold": 0.92
   },
   {
@@ -362,6 +392,7 @@
     "runner": "linux-atom-pitt-mi350x-8",
     "test_level": "nightly",
     "priority": "P1",
+    "nightly_weekday": "Sat",
     "accuracy_test_threshold": 0.92
   },
   {
@@ -372,6 +403,7 @@
     "runner": "linux-atom-pitt-mi350x-8",
     "test_level": "nightly",
     "priority": "P0",
+    "nightly_weekday": "Sat",
     "accuracy_test_threshold": 0.92,
     "accuracy_baseline": 0.9386,
     "accuracy_baseline_model": "zai-org/GLM-4.7-FP8"
@@ -384,6 +416,7 @@
     "runner": "linux-atom-pitt-mi350x-8",
     "test_level": "nightly",
     "priority": "P0",
+    "nightly_weekday": "Sat",
     "accuracy_test_threshold": 0.92
   },
   {
@@ -394,6 +427,7 @@
     "runner": "linux-atom-pitt-mi350x-8",
     "test_level": "nightly",
     "priority": "P0",
+    "nightly_weekday": "Sat",
     "accuracy_test_threshold": 0.92
   },
   {
@@ -404,6 +438,7 @@
     "runner": "linux-atom-pitt-mi350x-8",
     "test_level": "nightly",
     "priority": "P2",
+    "nightly_weekday": "Sat",
     "lm_eval_num_fewshot": 20,
     "accuracy_test_threshold": 0.88,
     "accuracy_baseline": 0.9545,
@@ -418,6 +453,7 @@
     "runner": "linux-atom-pitt-mi350x-8",
     "test_level": "nightly",
     "priority": "P0",
+    "nightly_weekday": "Sun",
     "lm_eval_num_fewshot": 20,
     "accuracy_test_threshold": 0.92,
     "accuracy_baseline": 0.9447,
@@ -432,6 +468,7 @@
     "runner": "linux-atom-pitt-mi350x-8",
     "test_level": "nightly",
     "priority": "P0",
+    "nightly_weekday": "Sun",
     "lm_eval_num_fewshot": 20,
     "accuracy_test_threshold": 0.92,
     "accuracy_baseline": 0.9447,
@@ -446,6 +483,7 @@
     "runner": "linux-atom-pitt-mi350x-8",
     "test_level": "nightly",
     "priority": "P0",
+    "nightly_weekday": "Sun",
     "lm_eval_num_fewshot": 20,
     "accuracy_test_threshold": 0.92,
     "accuracy_baseline": 0.9447,
@@ -460,6 +498,7 @@
     "runner": "linux-atom-pitt-mi350x-8",
     "test_level": "nightly",
     "priority": "P0",
+    "nightly_weekday": "Sun",
     "lm_eval_num_fewshot": 20,
     "accuracy_test_threshold": 0.92,
     "accuracy_baseline": 0.9447,
@@ -474,6 +513,7 @@
     "runner": "linux-atom-pitt-mi350x-8",
     "test_level": "nightly",
     "priority": "P0",
+    "nightly_weekday": "Thu",
     "lm_eval_num_fewshot": 20,
     "accuracy_test_threshold": 0.91,
     "accuracy_baseline": 0.9303,
@@ -488,6 +528,7 @@
     "runner": "linux-atom-pitt-mi350x-8",
     "test_level": "nightly",
     "priority": "P0",
+    "nightly_weekday": "Thu",
     "lm_eval_num_fewshot": 20,
     "accuracy_test_threshold": 0.91,
     "accuracy_baseline": 0.9253,

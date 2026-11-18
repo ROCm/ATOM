@@ -2,8 +2,8 @@
 """Generate regression re-run configs from a regression report and model registry.
 
 Reads regression_report.json (from summarize.py) and models.json (model config
-registry), selects the top-N most regressed configs, resolves their full model
-config (server args, bench args), and outputs configs for CI.
+registry), resolves each regressed config to its catalog variant (server args,
+bench args), and outputs the top-N most regressed resolved configs for CI.
 
 Two output modes:
   --output (-o)        Flat pipe-delimited text (legacy, one config per line)
@@ -19,42 +19,59 @@ Usage:
 
 import argparse
 import json
-import re
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from catalog import load_variants  # noqa: E402
+from catalog import load_variants
 
 
-def _find_model_config(regression_entry, models):
-    """Match a regression entry to a models.json config.
+def _normalize_model_path(path):
+    """Strip the /models/ mount that CI uses for pre-downloaded checkpoints.
 
-    Matches by model_id (HF path) + variant suffix, NOT by display name,
-    because display name formats differ between summarize.py output
-    (e.g. "DeepSeek-R1-0528-mtp3") and models.json (e.g. "DeepSeek-R1-0528 MTP3").
+    With MODEL_HOST_ROOT set, benchmark-tmpl.yml serves "/models/<path>", so a
+    result's model_id is e.g. "/models/deepseek-ai/DeepSeek-V4-Pro" while the
+    catalog path is "deepseek-ai/DeepSeek-V4-Pro".
+    """
+    return path.removeprefix("/models/").rstrip("/")
+
+
+def _find_model_configs(regression_entry, models):
+    """Find every load_variants() record a regression entry could mean.
+
+    summarize.py reports a result's benchmark_model_name, which is the catalog
+    display of the variant (e.g. "DeepSeek-V4-Pro DPA DSpark"), as "model", and
+    the served checkpoint (e.g. "/models/deepseek-ai/DeepSeek-V4-Pro-DSpark",
+    a variant-level path) as "model_id". Results without benchmark_model_name
+    are reported as "<checkpoint basename>[-mtp<N>]"; those match basename +
+    suffix. Variants sharing a display are told apart by their concurrency
+    band. Returns zero (unmapped), one (resolved) or several (ambiguous)
+    records; the caller reports zero and several differently.
+
+    An entry without a concurrency cannot pick between variants that share a
+    display, so every candidate is returned; generate_configs reports such an
+    entry as incomplete before it resolves anything.
     """
     model_id = regression_entry.get("model_id", "")
     display = regression_entry.get("model", "")
 
-    # Detect variant from display name (e.g. "...-mtp3" -> suffix "-mtp3")
-    variant_match = re.search(r"-(mtp\d*)$", display, re.IGNORECASE)
-    variant_suffix = f"-{variant_match.group(1).lower()}" if variant_match else ""
-
-    # Primary match: model_id (HF path) + suffix
     if model_id:
-        for m in models:
-            if m["path"] == model_id and m.get("suffix", "") == variant_suffix:
-                return m
+        model_id = _normalize_model_path(model_id)
+        models = [m for m in models if _normalize_model_path(m["path"]) == model_id]
 
-    # Fallback: match by path basename (for old reports without model_id)
-    display_base = re.sub(r"-(mtp\d*)$", "", display, flags=re.IGNORECASE)
-    for m in models:
-        path_basename = m["path"].split("/")[-1]
-        if path_basename == display_base and m.get("suffix", "") == variant_suffix:
-            return m
+    matches = [m for m in models if m["display"] == display]
+    if not matches:
+        matches = [
+            m
+            for m in models
+            if (m["path"].split("/")[-1] + m.get("suffix", "")).lower()
+            == display.lower()
+        ]
 
-    return None
+    conc = regression_entry.get("conc")
+    if len(matches) > 1 and conc is not None:
+        matches = [m for m in matches if m["conc_min"] <= conc <= m["conc_max"]]
+    return matches
 
 
 def _regression_severity(r):
@@ -75,21 +92,17 @@ def generate_configs(report_path, models_path, top_n=3):
     if not regressions:
         return []
 
-    # Sort by severity and take top N
+    # Sort by severity; top N is taken after resolution so an entry that has
+    # no catalog config, or is incomplete, does not use up a rerun slot.
     regressions.sort(key=_regression_severity)
-    regressions = regressions[:top_n]
 
     configs = []
     for r in regressions:
-        model_cfg = _find_model_config(r, models)
-        if model_cfg is None:
-            print(
-                f"WARNING: No model config found for {r.get('model', '?')}, skipping",
-                file=sys.stderr,
-            )
-            continue
-
         isl, osl, conc = r.get("isl"), r.get("osl"), r.get("conc")
+        # Checked before resolution: without all three there is nothing to
+        # rerun, and a missing concurrency cannot tell variants that share a
+        # display apart, so the report entry is what is incomplete here — the
+        # catalog may well be fine.
         if None in (isl, osl, conc):
             print(
                 f"WARNING: skipping {r.get('model', '?')} — missing isl/osl/conc",
@@ -97,6 +110,32 @@ def generate_configs(report_path, models_path, top_n=3):
             )
             continue
 
+        matches = _find_model_configs(r, models)
+        if len(matches) != 1:
+            if matches:
+                # Several variants share the display and their concurrency
+                # bands both contain the entry's concurrency: a catalog error,
+                # not an unknown model.
+                candidates = "; ".join(
+                    f"{m['path']}{m.get('suffix', '')} "
+                    f"conc {m['conc_min']}-{m['conc_max']}"
+                    for m in matches
+                )
+                print(
+                    f"WARNING: ambiguous model config for {r.get('model', '?')} "
+                    f"at conc {conc}: "
+                    f"{len(matches)} candidates ({candidates}), skipping",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"WARNING: No model config found for {r.get('model', '?')}, "
+                    "skipping",
+                    file=sys.stderr,
+                )
+            continue
+
+        model_cfg = matches[0]
         configs.append(
             {
                 "model_path": model_cfg["path"],
@@ -106,9 +145,13 @@ def generate_configs(report_path, models_path, top_n=3):
                 "osl": osl,
                 "conc": conc,
                 "env_vars": model_cfg.get("env_vars", ""),
-                "prefix": model_cfg.get("prefix", ""),
+                # prefix + suffix, as in the benchmark RESULT_FILENAME, so two
+                # variants of one model get distinct trace dirs and artifacts
+                "prefix": model_cfg.get("prefix", "") + model_cfg.get("suffix", ""),
             }
         )
+
+    configs = configs[:top_n]
 
     # Sort by model_path + server_args so same-server configs are adjacent
     # (allows the YAML loop to group server launches)
@@ -140,17 +183,33 @@ def generate_matrix(report_path, models_path, top_n=3):
     # Load models.json to look up runner field
     models = load_variants(models_path)
 
+    # The cell prefix names the per-cell artifacts, so it must be unique. Each
+    # group keeps the prefix of its first config (all configs in a group share
+    # the server settings) unless an earlier group already has it (e.g. one
+    # variant with different args per concurrency band); that group then gets
+    # the first "<prefix>-<n>" that no other group uses or would use.
+    cell_prefixes = []
+    taken = {g[0]["prefix"] for g in groups.values()}
+    for group_configs in groups.values():
+        prefix = group_configs[0]["prefix"]
+        if prefix in cell_prefixes:
+            n = 2
+            while f"{prefix}-{n}" in taken:
+                n += 1
+            prefix = f"{prefix}-{n}"
+            taken.add(prefix)
+        cell_prefixes.append(prefix)
+
     matrix = []
-    for (model_path, server_args, env_vars), group_configs in groups.items():
+    for ((model_path, server_args, env_vars), group_configs), prefix in zip(
+        groups.items(), cell_prefixes
+    ):
         # Find runner from models.json (first matching model)
         runner = "linux-atom-pitt-mi350x-8"
         for m in models:
             if m["path"] == model_path and m.get("args", "") == server_args:
                 runner = m.get("runner", runner)
                 break
-
-        # Use prefix from first config (all configs in group share model)
-        prefix = group_configs[0]["prefix"]
 
         matrix.append(
             {

@@ -186,10 +186,7 @@ def resumes_offload_prefill(seq) -> bool:
     lookup prefetch, which must agree: a lookup sent for a request that skips
     the match is never consumed and only holds read locks.
     """
-    return (
-        getattr(seq, "offload_loaded", False)
-        or getattr(seq, "offload_load_failed", False)
-    ) and len(seq.block_table) > 0
+    return (seq.offload_loaded or seq.offload_load_failed) and len(seq.block_table) > 0
 
 
 @dataclass
@@ -293,7 +290,8 @@ class Sequence:
         if sampling_params is None:
             sampling_params = SamplingParams()
         self.block_size = block_size
-        self.id = id or next(Sequence.counter)
+        # 0 is a valid id (engine_v1.proto, REQUESTS); only None takes the counter's.
+        self.id = id if id is not None else next(Sequence.counter)
         self.external_request_id = request_id
         self.status = SequenceStatus.WAITING
         self.type = SequenceType.DUMMY
@@ -414,6 +412,11 @@ class Sequence:
         # `1 + accepted` puts it, and there the grid is unreachable — see
         # `BlockManager.checkpointers_at`, which measures spacing from here.
         self.last_checkpoint_pos = 0
+        # The furthest prompt position whose checkpoint was decided when its
+        # chunk was scheduled (`BlockManager.checkpoint_when_scheduled`) rather
+        # than when it retired. Retire files nothing at or before it: with
+        # forwards in flight the slot has moved on by then.
+        self.scheduled_checkpoint_pos = 0
         self.prefix_cache_hit_tokens = 0
         # True iff this seq is mid-prefill (chunked prefill produced KV for
         # some prompt tokens but not all). Maintained by the scheduler:
@@ -422,6 +425,10 @@ class Sequence:
         # garbage sampled tokens from intermediate chunks and to skip the
         # scheduler's Phase 1 scan when no partials exist.
         self.is_partial_prefill = False
+        # Set after the local prompt forward completes, or when P/D admission
+        # confirms the producer's completed prompt KV. The router uses this
+        # even for an abort with no sampled output.
+        self.prefill_completed = False
         # `new_block_table` is main's: an array("i") rather than a list,
         # because every forward marshals these into the int32 buffer.
         self.block_table = new_block_table()
@@ -446,6 +453,16 @@ class Sequence:
         # move together through admission and load. Grouped so a joint reset
         # cannot forget a field; see `OffloadJointRecord`.
         self.offload_joint = OffloadJointRecord()
+        self.offload_loaded = False
+        self.offload_load_failed = False
+        # Tokens its tier load covers once the connector planned it.
+        self.offload_loaded_tokens = 0
+        # `hbm_cached_tokens` the planned load started from (P/D / early load
+        # publication); None until a connector plans one.
+        self.offload_load_start_tokens = None
+        # Prefix tokens `share_cache` routing credited this request when it
+        # placed it, until its rank reports what it really reused.
+        self.dp_est_cached_tokens = 0
         self.temperature = sampling_params.temperature
         self.top_k = sampling_params.top_k
         self.top_p = sampling_params.top_p

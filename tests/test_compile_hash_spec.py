@@ -19,6 +19,7 @@ def _hash(spec=None):
         dcp_config=None,
         enable_dp_attention=True,
         index_cache_dtype="fp4",
+        index_cache_layout=None,
         enable_decoder_swa_bounded_replay=True,
         hf_config=SimpleNamespace(),
         max_model_len=4096,
@@ -31,6 +32,7 @@ def _hash(spec=None):
 
 
 def _spec(method="dspark", k=3, **kw):
+    kw.setdefault("draft_kv_dtype", "bf16")  # a field of every SpeculativeConfig
     return SimpleNamespace(method=method, num_speculative_tokens=k, **kw)
 
 

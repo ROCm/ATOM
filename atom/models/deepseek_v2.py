@@ -53,6 +53,7 @@ from atom.config import Config, QuantizationConfig, get_current_atom_config
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
     pcp_allgather_rerange,
+    pcp_allgather_rerange_many,
     pcp_is_enabled,
     pcp_pad_dense,
     pcp_pad_len,
@@ -79,6 +80,7 @@ from atom.model_ops.embed_head import (
 # Side-effect import: registers `torch.ops.aiter.sparse_attn_indexer`, the op
 # `Indexer.forward_impl` runs.
 from atom.model_ops.indexer import indexer_forward as _indexer_forward  # noqa: F401
+from atom.model_ops.indexer.layout import MFMA, PRESHUFFLE
 from atom.model_ops.indexer.schedule import skips_index_topk
 from atom.model_ops.layernorm import LayerNorm, RMSNorm
 from atom.model_ops.linear import (
@@ -1267,6 +1269,10 @@ class DeepseekV32IndexerCache(nn.Module):
     ):
         super().__init__()
         self.kv_cache = [torch.tensor([])]
+        # Warmup compiles the OPUS custom op before the KV pool is bound.
+        # Keep a tensor input so rebinding the real scale plane after warmup
+        # cannot freeze a constant None into the level-3 compiled graph.
+        self.kv_cache_scale: torch.Tensor | None = torch.empty(0, dtype=torch.uint8)
         self.head_dim = head_dim
         self.prefix = prefix
         self.cache_config = cache_config
@@ -1524,11 +1530,32 @@ class Indexer(nn.Module):
         self._indexer_fp4 = sparse_indexer_fp4_enabled(
             atom_config.index_cache_dtype, config
         )
+        self._index_cache_layout = (
+            (atom_config.index_cache_layout or PRESHUFFLE)
+            if self._indexer_fp4
+            else PRESHUFFLE
+        )
+        self._indexer_opus = self._indexer_fp4 and self._index_cache_layout == MFMA
         # self.indexer_cfg = config.attn_module_list_cfg[0]["attn_index"]
         self.topk_tokens = config.index_topk
         self.n_head = config.index_n_heads  # 64
         self.head_dim = config.index_head_dim  # 128
         self.rope_dim = getattr(config, "index_rope_dim", config.qk_rope_head_dim)
+        if self._indexer_opus:
+            if self.n_head not in (32, 64) or self.rope_dim not in (0, 64):
+                raise ValueError("OPUS DSA FP4 requires 32/64 heads and RoPE 0/64")
+            from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+            connector = KVConnectorFactory.connector_name(
+                atom_config.kv_transfer_config
+            )
+            if atom_config.plugin_config or (
+                atom_config.kv_transfer_config and connector != "lmcache_mp"
+            ):
+                raise ValueError(
+                    "OPUS DSA FP4 supports only standalone lmcache_mp cache transfer; "
+                    "other connectors and plugin routes are not yet supported"
+                )
         # A NoPE FP8 cache has its own writer: the RoPE writer requires 64
         # rotary lanes and uses a different Q scale policy. Under DCP every
         # rank still projects all Q rows; the writer skips negative K slots.
@@ -1601,9 +1628,8 @@ class Indexer(nn.Module):
         self._weights_scale = self.softmax_scale * self.n_head**-0.5
         if self._indexer_fp4:
             assert_fp4_indexer_supported(
-                fused_writer=self.use_qk_rope_cache_fusion,
+                packed_writer=self.use_qk_rope_cache_fusion or self._indexer_opus,
                 prefill_context_parallel=pcp_is_enabled(),
-                prefill_ubatching=get_current_atom_config().enable_tbo,
             )
 
         # TODO (zyongye) change dim to fp8 later to (self.head_dim + 4)
@@ -1721,7 +1747,7 @@ class Indexer(nn.Module):
         # for padded rows, and only the owner rank writes K cache.
         unfused_qk_rope = (not self.use_qk_rope_cache_fusion) or pcp
         positions_op = positions
-        if self.use_nope_cache_fusion:
+        if self.use_nope_cache_fusion or self._indexer_opus:
             # The custom op publishes the normalized K and folds Q scales into
             # head weights in one launch. Pass the unnormalized BF16 projections.
             q_input = q
@@ -1729,8 +1755,7 @@ class Indexer(nn.Module):
             if pcp:
                 pcp_ws = get_pcp_world_size()
                 # k is 1/pcp (from 1/pcp hidden); gather to full padded [S_pad].
-                k = pcp_allgather_rerange(k, pcp_ws)
-                positions_op = pcp_allgather_rerange(positions, pcp_ws)
+                k, positions_op = pcp_allgather_rerange_many([k, positions], pcp_ws)
             k = self.k_norm(k)
             if self.rope_dim:
                 q_pe, _ = torch.split(
@@ -1796,6 +1821,11 @@ class Indexer(nn.Module):
             rotary_emb.is_neox_style if self.rope_dim else False,
             not unfused_qk_rope,
             self.stable_topk,
+            **(
+                {"kv_cache_scale": self.k_cache.kv_cache_scale}
+                if self._indexer_opus
+                else {}
+            ),
         )
 
 
@@ -2853,9 +2883,12 @@ class DeepseekV2ForCausalLM(nn.Module):
         # forward IntermediateTensors (already 1/pcp) unchanged.
         if pcp and get_pp_group().is_last_rank:
             if isinstance(hidden_states, tuple):
-                hs, aux = hidden_states
-                hs = pcp_allgather_rerange(hs, pcp_ws)[:n_global]
-                aux = [pcp_allgather_rerange(a, pcp_ws)[:n_global] for a in aux]
+                hs, *aux = (
+                    g[:n_global]
+                    for g in pcp_allgather_rerange_many(
+                        [hidden_states[0], *hidden_states[1]], pcp_ws
+                    )
+                )
                 hidden_states = (hs, aux)
             elif isinstance(hidden_states, torch.Tensor):
                 hidden_states = pcp_allgather_rerange(hidden_states, pcp_ws)[:n_global]

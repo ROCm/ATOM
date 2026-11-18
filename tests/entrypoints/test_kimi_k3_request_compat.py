@@ -529,6 +529,12 @@ def test_responses_render_receives_preserve_flag(server):
     assert server.template_kwargs[-1]["preserve_tool_call_arguments"] is True
 
 
+PNG_1X1 = (
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42"
+    "mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
+)
+
+
 def test_multimodal_chat_keeps_tool_call_arguments(server, monkeypatch):
     # Real _prepare_multimodal_inputs; only the media pipeline below it is
     # stubbed, so the flag is checked where the image path builds its messages.
@@ -558,7 +564,8 @@ def test_multimodal_chat_keeps_tool_call_arguments(server, monkeypatch):
         "role": "user",
         "content": [
             {"type": "text", "text": "Describe the image."},
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+            # A 1x1 PNG: the image path decodes it before building messages.
+            {"type": "image_url", "image_url": {"url": PNG_1X1}},
         ],
     }
     call = {"id": "c1", "type": "function", "function": {"name": "f", "arguments": raw}}

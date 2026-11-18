@@ -1,22 +1,29 @@
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::OnceLock,
     time::Duration,
 };
 
-use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 
 use super::{
     config::{default_duration_buckets, PrometheusConfig},
     schema,
 };
 
+static PROMETHEUS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
+
 pub(crate) fn init_metrics() {
     schema::describe_all_metrics();
 }
 
-pub fn start_prometheus(config: PrometheusConfig) {
-    init_metrics();
+/// The installed registry, rendered by the router port's `/metrics` while the
+/// Prometheus port keeps serving the same data.
+pub(crate) fn prometheus_handle() -> Option<&'static PrometheusHandle> {
+    PROMETHEUS_HANDLE.get()
+}
 
+pub fn start_prometheus(config: PrometheusConfig) {
     let duration_matcher = Matcher::Suffix(String::from("duration_seconds"));
     let duration_bucket: Vec<f64> = config
         .duration_buckets
@@ -28,7 +35,7 @@ pub fn start_prometheus(config: PrometheusConfig) {
         .unwrap_or(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)));
     let socket_addr = SocketAddr::new(ip_addr, config.port);
 
-    PrometheusBuilder::new()
+    let mut builder = PrometheusBuilder::new()
         .with_http_listener(socket_addr)
         .upkeep_timeout(Duration::from_secs(5 * 60))
         .set_buckets_for_metric(duration_matcher, &duration_bucket)
@@ -37,9 +44,21 @@ pub fn start_prometheus(config: PrometheusConfig) {
             Matcher::Full(schema::names::ROUTER_TTFT_SECONDS.to_string()),
             &duration_bucket,
         )
-        .expect("failed to set TTFT buckets")
-        .install()
-        .expect("failed to install Prometheus metrics exporter");
+        .expect("failed to set TTFT buckets");
+    for (name, buckets) in schema::ROUTE_HISTOGRAM_BUCKETS {
+        builder = builder
+            .set_buckets_for_metric(Matcher::Full((*name).to_string()), buckets)
+            .expect("failed to set routing buckets");
+    }
+    // build() spawns the upkeep task, so this must run inside the Tokio runtime.
+    let (recorder, exporter) = builder
+        .build()
+        .expect("failed to build Prometheus metrics exporter");
+    let _ = PROMETHEUS_HANDLE.set(recorder.handle());
+    tokio::spawn(exporter);
+    metrics::set_global_recorder(recorder).expect("failed to install Prometheus metrics recorder");
+    // Descriptions go to the global recorder, so HELP lines need it installed first.
+    init_metrics();
 }
 
 #[cfg(test)]

@@ -28,6 +28,7 @@ Atomesh can also run in an **ATOM standalone** mode. In this mode, Python owns t
 | `POST /parse/reasoning` / `/parse/function_call` | Reasoning and tool-call parsing |
 | `GET /health` / `/readiness` / `/liveness` | Health probes |
 | `GET /engine_metrics` | Aggregated worker engine Prometheus metrics |
+| `GET /metrics` | Mesh self metrics, the same registry as the Prometheus exporter |
 | `GET /v1/models` | Model metadata |
 
 Responses resource operations (GET, DELETE, cancel and input_items) probe regular
@@ -76,8 +77,9 @@ listing it; accepting an unknown JSON field does not establish rank-routing supp
   source "$HOME/.cargo/env"
   ```
 
-- **Protocol Buffers compiler (`protoc`)**, only when enabling the optional
-  `ext-proc` Cargo feature, for the vendored Envoy protocol bindings:
+- **Protocol Buffers compiler (`protoc`)**, for every build: the `smg-grpc-client`
+  dependency's build script runs it (this crate's own protos, including the optional
+  `ext-proc` Envoy bindings, are compiled in-process by protox):
   ```bash
   sudo apt-get install protobuf-compiler
   ```
@@ -93,7 +95,7 @@ cargo build
 # Release build (optimized)
 cargo build --release
 
-# Release build with optional Envoy ext-proc support (requires protoc)
+# Release build with optional Envoy ext-proc support
 cargo build --release --features ext-proc
 ```
 
@@ -128,8 +130,8 @@ ATOM_MESH_BUILD=1 ATOM_MESH_FEATURES=ext-proc python -m pip install -e .
 
 `ATOM_MESH_FEATURES` accepts Cargo's comma- or space-separated feature list and
 defaults to empty. Both `docker/Dockerfile` and `docker/atom_release.dockerfile`
-accept `--build-arg ATOM_MESH_FEATURES=ext-proc` for the same opt-in; the build
-image must provide `protoc` when enabling it.
+accept `--build-arg ATOM_MESH_FEATURES=ext-proc` for the same opt-in. The build
+image must provide `protoc` either way, for `smg-grpc-client`.
 
 ## Usage
 
@@ -247,6 +249,7 @@ Supported tool parsers: `json`, `python`, `xml`.
 | `GET` / `PUT` / `DELETE` | `/workers/{id}` | Inspect, update, or remove worker |
 | `POST` | `/flush_cache` | Flush cache across HTTP workers |
 | `GET` | `/get_loads` | Sample current worker loads |
+| `GET` | `/kv_events/sources` | With `--kv-events`: each followed worker rank's KV event stream and what it carried. A worker not followed, as with the engine's KV events off (`ATOM_KV_EVENTS_ENABLE`) or sources that cannot be read, has no row, as if not registered; the log says why |
 
 ## Load balancing
 
@@ -254,7 +257,7 @@ Supported tool parsers: `json`, `python`, `xml`.
 |--------|-------------|
 | `random` | Uniform random selection |
 | `round_robin` | Sequential rotation with atomic counters |
-| `cache_aware` | Prefix-tree matching for cache reuse, with configurable balance thresholds |
+| `cache_aware` | Prefix-tree matching for cache reuse, with configurable balance thresholds; with `--kv-events`, a request the router can tokenize goes by the blocks each worker's device cache holds, once one holds more of it than `cache_threshold`. Requests with media, imbalanced load and workers without indexed events stay on the tree |
 | `power_of_two` | Chooses the lighter of two randomly sampled workers |
 | `prefix_hash` | Consistent prefix hashing |
 
@@ -262,8 +265,11 @@ In PD mode, use `--prefill-policy` and `--decode-policy` for per-mode overrides.
 
 `prefix_hash` routes on exact request tokens. Messages and Responses have no
 registered token-routing template, so under `prefix_hash` they return
-`501 token_routing_unsupported`. Use a policy that does not need tokens, such as
-`cache_aware` or `round_robin`, for models served through these APIs.
+`501 token_routing_unsupported`. So do chats for a model whose tokenizer
+llm-tokenizer renders with a built-in encoder chosen from `config.json`, not a
+chat template, such as DeepSeek V3.2 and V4
+([#3377](https://github.com/ROCm/ATOM/issues/3377)). Use a policy that does not
+need tokens, such as `cache_aware` or `round_robin`, for these models and APIs.
 
 ## Reliability
 
@@ -298,10 +304,14 @@ registered token-routing template, so under `prefix_hash` they return
 
 Default bind: `0.0.0.0:29000` (`--prometheus-host` / `--prometheus-port`)
 
-Mesh self metrics are exposed by the Prometheus exporter above. Worker engine
-metrics remain available through the router's `/engine_metrics` endpoint, which
-scrapes backend workers, injects `worker_addr`, and aggregates their Prometheus
-text without changing worker metric names.
+Mesh self metrics are exposed by the Prometheus exporter above and by the
+router's own `/metrics` endpoint, which returns 503 when the exporter is not
+running. The router port serves the whole registry whatever `--prometheus-host`
+is set to, so binding the exporter to a private address does not hide these
+metrics from clients that can reach the router. Worker engine metrics remain
+available through the router's `/engine_metrics` endpoint, which scrapes backend
+workers, injects `worker_addr`, and aggregates their Prometheus text without
+changing worker metric names.
 
 | Layer | Prefix | Description |
 |-------|--------|-------------|
@@ -309,12 +319,23 @@ text without changing worker metric names.
 | Router | `mesh_router_*` | Requests by model/endpoint, latency, errors |
 | Inference | `mesh_router_ttft/tpot/tokens_*` | TTFT, TPOT, token counts (gRPC) |
 | Worker | `mesh_worker_*` | Pool size, connections, health, selection |
+| Routing | `mesh_route_*`, `mesh_session_*` | Policy decisions, session worker changes, engine-reported cached tokens against the router estimate |
 | Circuit breaker | `mesh_worker_cb_*` | State, transitions, outcomes |
 | Retry | `mesh_worker_retries_*` | Attempts, exhaustion, backoff |
+
+[Routing metrics](docs/metrics.md) covers each routing metric's labels, the
+policies and branches that record it, how to read the values, and example
+queries.
 
 ### Logging
 
 Structured logging via `tracing`, optional file sink (`--log-dir`), and log level (`--log-level`).
+
+`--route-log-sample-rate` (0 to 1, default 0 = off) logs the routing decisions of
+that fraction of inference requests at info level under target `mesh::route`.
+While it is above 0, a request carrying the `x-mesh-route-trace` header is always
+logged. HTTP routers only: gRPC workers and Envoy external processing do not
+emit these logs.
 
 ## Security
 

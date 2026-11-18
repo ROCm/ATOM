@@ -31,6 +31,7 @@ def _prefill_batch(is_final_chunk: list[bool]) -> ScheduledBatch:
     batch.total_seqs_num = len(is_final_chunk)
     batch.total_seqs_num_prefill = len(is_final_chunk)
     batch.total_seqs_num_decode = 0
+    batch.has_prefill = True
     batch.is_final_chunk = is_final_chunk
     return batch
 
@@ -40,11 +41,27 @@ def _batch_info():
     return SimpleNamespace(np=np.zeros(3, dtype=np.int32), copy_to_gpu=mock.Mock())
 
 
-def _batch_with_ids(req_ids: list[int], *, is_dummy_run: bool) -> ScheduledBatch:
-    """The two fields `get_token_locations` reads, and nothing else."""
+def _input_ids_group():
+    """The runner's `token_inputs`, as far as `prepare_input_ids` sees it."""
+    group = SimpleNamespace(
+        counts=[None, None, None],
+        indices={"input_ids": 0, "decode_src": 1, "batch_info": 2},
+        publish=mock.Mock(),
+        check_writable=mock.Mock(),
+    )
+
+    def set_counts(counts):
+        for name, count in counts.items():
+            group.counts[group.indices[name]] = count
+
+    group.set_counts = set_counts
+    return group
+
+
+def _batch_with_ids(req_ids: list[int]) -> ScheduledBatch:
+    """The one field `get_token_locations` reads, and nothing else."""
     batch = object.__new__(ScheduledBatch)
     batch.req_ids = req_ids
-    batch.is_dummy_run = is_dummy_run
     return batch
 
 
@@ -54,39 +71,12 @@ def _locations(prev: ScheduledBatch, cur: ScheduledBatch):
     return tokenIDProcessor.get_token_locations(processor, cur)
 
 
-def test_a_dummy_carries_nothing_over_to_the_next_dummy():
-    """Back-to-back DP-sync dummies must not look like one carried-over request.
-
-    `dummy_execution` fabricates its sequence with a fixed id, so a second
-    dummy matches the first by id and is taken for a request that ran last
-    step. It then reads that "request's" anchor and drafts out of
-    `prev_token_ids` / `draft_token_ids`, which by then hold whatever the draft
-    pass's graph-pool storage was overwritten with -- out-of-vocab ids that
-    fault the target's embedding gather. A rank idling behind someone else's
-    long chunked prefill runs dummies back to back, so this is the ordinary
-    case at high concurrency, not a corner.
-    """
-    dummy_id = -1  # what dummy_execution builds; the collision is with ITSELF
-    first = _batch_with_ids([dummy_id], is_dummy_run=True)
-    second = _batch_with_ids([dummy_id], is_dummy_run=True)
-
-    locs = _locations(first, second)
-
-    assert locs.deferred_curr.tolist() == []
-    assert locs.deferred_prev.tolist() == []
-    assert locs.new_curr.tolist() == [0]
-
-
 def test_a_real_batch_after_a_dummy_takes_the_host_path():
-    """...and so does a real request that wakes up after one.
-
-    Not a consolation prize for the line above: the dummy's own `postprocess`
-    reports the PREVIOUS batch's tokens, so by the time this request is
-    scheduled its anchor is already on the host. Reading `prev_token_ids`
-    instead would be reading the dummy's forward.
-    """
-    dummy = _batch_with_ids([-1], is_dummy_run=True)
-    real = _batch_with_ids([7, 9], is_dummy_run=False)
+    """A DP-sync dummy schedules no request, so nothing carries over from it:
+    its own `postprocess` reports the PREVIOUS batch's tokens, so by the time
+    this request is scheduled its anchor is already on the host."""
+    dummy = _batch_with_ids([])
+    real = _batch_with_ids([7, 9])
 
     locs = _locations(dummy, real)
 
@@ -96,8 +86,8 @@ def test_a_real_batch_after_a_dummy_takes_the_host_path():
 
 def test_a_real_batch_still_carries_over_from_a_real_batch():
     """The dummy rule must not cost an ordinary decode step its deferred rows."""
-    prev = _batch_with_ids([7, 9], is_dummy_run=False)
-    cur = _batch_with_ids([9, 11], is_dummy_run=False)
+    prev = _batch_with_ids([7, 9])
+    cur = _batch_with_ids([9, 11])
 
     locs = _locations(prev, cur)
 
@@ -108,7 +98,7 @@ def test_a_real_batch_still_carries_over_from_a_real_batch():
 
 def _processor() -> tokenIDProcessor:
     processor = object.__new__(tokenIDProcessor)
-    processor.runner = SimpleNamespace(h2d_groups={"input_ids": mock.Mock()})
+    processor.runner = SimpleNamespace(h2d_groups={"input_ids": _input_ids_group()})
     processor.input_ids = SimpleNamespace(
         np=np.zeros(8, dtype=np.int32),
         gpu=np.zeros(8, dtype=np.int32),
@@ -239,6 +229,7 @@ def _decode_batch(*, num_spec_step: int) -> ScheduledBatch:
     batch.total_seqs_num = 3
     batch.total_seqs_num_prefill = 0
     batch.total_seqs_num_decode = 3
+    batch.has_prefill = False
     batch.num_spec_step = num_spec_step
     return batch
 
@@ -254,11 +245,15 @@ def _recurrent_producer_processor() -> tokenIDProcessor:
 
 def test_a_non_deferred_decode_stages_the_scheduled_ids_as_they_are():
     processor = _recurrent_producer_processor()
+    group = processor.runner.h2d_groups["input_ids"]
 
-    tokenIDProcessor.prepare_input_ids(processor, _decode_batch(num_spec_step=0), 1)
+    tokenIDProcessor.prepare_input_ids(
+        processor, _decode_batch(num_spec_step=0), 1, group
+    )
 
     np.testing.assert_array_equal(processor.input_ids.np[:3], [11, 12, 13])
-    processor.input_ids.copy_to_gpu.assert_called_once_with(3)
+    assert group.counts == [3, None, 3]
+    group.publish.assert_called_once()
 
 
 def test_the_non_deferred_branch_refuses_a_batch_carrying_drafts():
@@ -269,7 +264,12 @@ def test_the_non_deferred_branch_refuses_a_batch_carrying_drafts():
     processor = _recurrent_producer_processor()
 
     with pytest.raises(AssertionError, match="num_spec_step=3"):
-        tokenIDProcessor.prepare_input_ids(processor, _decode_batch(num_spec_step=3), 4)
+        tokenIDProcessor.prepare_input_ids(
+            processor,
+            _decode_batch(num_spec_step=3),
+            4,
+            processor.runner.h2d_groups["input_ids"],
+        )
 
 
 @pytest.mark.parametrize(("is_pd_producer", "expected_q"), [(False, 4), (True, 1)])
@@ -289,8 +289,10 @@ def test_a_dp_dummy_runs_at_the_schedulers_query_width(is_pd_producer, expected_
     ModelRunner.dummy_execution(runner)
 
     (batch,) = seen
-    assert batch.is_dummy_run
-    assert batch.total_tokens_num == expected_q
+    # A step with no request, not a fabricated one: its rows are padding.
+    assert not batch.is_dummy_run and not batch.has_prefill
+    # It schedules nothing; `decide` reads the query width off `num_spec_step`.
+    assert batch.total_seqs_num == batch.total_tokens_num == 0
     assert batch.num_spec_step == expected_q - 1
 
 
@@ -327,20 +329,21 @@ def test_only_a_producer_with_a_drafter_may_miss_a_recording():
 
 
 @pytest.mark.parametrize(
-    ("is_pd_producer", "drafter", "is_prefill", "is_dummy_run", "expected"),
+    ("is_pd_producer", "drafter", "is_prefill", "decodes", "expected"),
     [
-        (False, True, False, False, True),
+        (False, True, False, 2, True),
         # The producer's decode surfaces a deferred T0 at q=1: no drafts, so a
         # rejection pass would select over zero target rows.
-        (True, True, False, False, False),
-        (False, True, True, False, False),
-        (False, True, False, True, False),
-        (True, True, False, True, False),
-        (False, False, False, False, False),
+        (True, True, False, 2, False),
+        (False, True, True, 2, False),
+        # An idle DP rank's step: no request, nothing drafted to score.
+        (False, True, False, 0, False),
+        (True, True, False, 0, False),
+        (False, False, False, 2, False),
     ],
 )
 def test_only_a_drafting_decode_verifies(
-    is_pd_producer, drafter, is_prefill, is_dummy_run, expected
+    is_pd_producer, drafter, is_prefill, decodes, expected
 ):
     """Both the spec-decode metadata and its packed indices follow this
     predicate, so a producer step neither scores nor publishes drafts."""
@@ -348,18 +351,21 @@ def test_only_a_drafting_decode_verifies(
     runner.tokenID_processor = SimpleNamespace(is_pd_producer=is_pd_producer)
     if drafter:
         runner.drafter = SimpleNamespace(mtp_k=3)
-    batch = SimpleNamespace(is_dummy_run=is_dummy_run)
+    batch = SimpleNamespace(total_seqs_num_decode=decodes)
 
     assert ModelRunner._verifies_drafts(runner, batch, is_prefill) is expected
 
 
 def test_middle_prefills_preserve_status_until_mixed_final_batch():
     processor = _processor()
+    group = processor.runner.h2d_groups["input_ids"]
 
     # Pure middle chunks skip postprocess, so neither the deferred-token queue
     # nor its matching speculative-status queue may advance.
-    tokenIDProcessor.prepare_input_ids(processor, _prefill_batch([False]), 1)
-    tokenIDProcessor.prepare_input_ids(processor, _prefill_batch([False, False]), 1)
+    tokenIDProcessor.prepare_input_ids(processor, _prefill_batch([False]), 1, group)
+    tokenIDProcessor.prepare_input_ids(
+        processor, _prefill_batch([False, False]), 1, group
+    )
 
     processor.recv_spec_status.assert_not_called()
     np.testing.assert_array_equal(processor.prev_rejected_num, [7])
@@ -368,7 +374,9 @@ def test_middle_prefills_preserve_status_until_mixed_final_batch():
     # If any request reaches its final chunk, the batch runs postprocess. Its
     # status dequeue must therefore happen exactly once, even though another
     # request in the same batch is still a middle chunk.
-    tokenIDProcessor.prepare_input_ids(processor, _prefill_batch([False, True]), 1)
+    tokenIDProcessor.prepare_input_ids(
+        processor, _prefill_batch([False, True]), 1, group
+    )
 
     processor.recv_spec_status.assert_called_once_with()
     np.testing.assert_array_equal(processor.prev_rejected_num, [2])
@@ -391,12 +399,7 @@ def _deferred_processor(cu_seqlens_q: np.ndarray, new_curr: list[int]):
     )
     processor.batch_info = _batch_info()
     processor.draft_tokens_per_seq = 3
-    input_ids_group = SimpleNamespace(
-        counts=[None, None, None],
-        indices={"input_ids": 0, "decode_src": 1, "batch_info": 2},
-        publish=mock.Mock(),
-        check_writable=mock.Mock(),
-    )
+    input_ids_group = _input_ids_group()
     processor.is_deferred_out = True
     processor.prev_batch = object()
     processor.use_spec = True
@@ -447,6 +450,7 @@ def test_deferred_decode_returns_the_flat_width_it_staged():
         total_seqs_num=2,
         total_seqs_num_prefill=0,
         total_seqs_num_decode=2,
+        has_prefill=False,
         num_scheduled_tokens=np.array([4, 4], dtype=np.int32),
         req_ids=[10, 11],
         num_spec_step=3,
@@ -459,7 +463,9 @@ def test_deferred_decode_returns_the_flat_width_it_staged():
     with mock.patch(
         "atom.model_engine.model_runner.fill_deferred_decode_ids"
     ) as fill_ids:
-        result = tokenIDProcessor.prepare_input_ids(processor, batch, 4)
+        result = tokenIDProcessor.prepare_input_ids(
+            processor, batch, 4, input_ids_group
+        )
 
     assert result.shape == (8,)
     assert input_ids_group.counts == [8, 2, 3]
@@ -474,9 +480,9 @@ def test_deferred_decode_returns_the_flat_width_it_staged():
 
 def test_a_producer_dp_dummy_stages_without_a_draft_table():
     """A producer keeps `use_spec` (its drafter writes context KV) but its DP
-    dummy is q=1 with `num_spec_step=0`, so the batch has no
-    `scheduled_spec_decode_tokens`. The dummy is always a new sequence; reading
-    the draft table for it raised AttributeError on every idle DPA rank."""
+    dummy is q=1 with `num_spec_step=0`, and it schedules nothing, so staging
+    it reads no draft table: that raised AttributeError on every idle DPA rank
+    when the dummy still fabricated a request."""
     runner = ModelRunner.__new__(ModelRunner)
     runner.drafter = SimpleNamespace(mtp_k=3)
     runner.tokenID_processor = SimpleNamespace(is_pd_producer=True)
@@ -490,11 +496,10 @@ def test_a_producer_dp_dummy_stages_without_a_draft_table():
     spec = getattr(batch, "scheduled_spec_decode_tokens", None)
     assert spec is None or spec.size == 0
 
-    processor, input_ids_group = _deferred_processor(
-        np.array([0, 1], dtype=np.int32), [0]
-    )
+    processor, input_ids_group = _deferred_processor(np.array([0], dtype=np.int32), [])
     with mock.patch("atom.model_engine.model_runner.fill_deferred_decode_ids"):
-        result = tokenIDProcessor.prepare_input_ids(processor, batch, 1)
+        result = tokenIDProcessor.prepare_input_ids(
+            processor, batch, 1, input_ids_group
+        )
 
-    assert result.shape == (1,)
-    assert input_ids_group.counts == [1, 1, 3]
+    assert result.shape == (0,)
