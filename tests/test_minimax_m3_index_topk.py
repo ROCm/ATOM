@@ -572,7 +572,7 @@ class TestSelectorDispatch:
             (2048, True, True),
         ],
     )
-    def test_gfx1250_decode_keeps_main_width_gate(self, width, emit, want):
+    def test_gfx1250_decode_uses_width_only_gate(self, width, emit, want):
         assert (
             m._aiter_selector_wins(
                 width,
@@ -837,7 +837,7 @@ def test_page128_prefill_emit_uses_aiter_or_fallback_without_parallel_workspace(
 def test_prefill_launch_policy_preserves_scores_and_selection(
     monkeypatch, heads, strided_q, cache_dtype, qlens, prefixes, q_zero
 ):
-    """Compare the full tuned launch with the previous scorer configuration."""
+    """Compare the tuned launch with `_default_prefill_score_config`'s launch."""
     import triton
 
     if m.get_gfx_runtime() != "gfx1250":

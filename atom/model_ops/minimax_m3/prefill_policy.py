@@ -141,6 +141,7 @@ def prefill_score_config(
         return fallback
 
     planes = batch * heads
+    q_tiles = _cdiv(max_query_len, SCORE_BLOCK_SIZE_Q)
     grouped_q_tiles = _cdiv(max_query_len, 64)
     grouped_plane_tiles = grouped_q_tiles * planes
     block_waves = max(1, (max_block + compute_units // 2) // compute_units)
@@ -159,10 +160,9 @@ def prefill_score_config(
         ),
     )
     grouped_chunk_blocks = _cdiv(max_block, grouped_chunks)
-    q128_tiles = _cdiv(max_query_len, SCORE_BLOCK_SIZE_Q)
     grouped_store_too_deep = (
         planes == 1
-        and q128_tiles >= _cdiv(compute_units, 8)
+        and q_tiles >= _cdiv(compute_units, 8)
         and grouped_chunk_blocks > _cdiv(compute_units, _GFX1250_CTAS_PER_CU)
     )
     if (
@@ -194,7 +194,6 @@ def prefill_score_config(
         return fallback
 
     planes = heads
-    q_tiles = _cdiv(max_query_len, SCORE_BLOCK_SIZE_Q)
     # The optimized paths repay their setup only with a long block row and more
     # than one Q128 tile per 16 CUs across independent heads.
     if max_block <= compute_units or q_tiles * planes <= _cdiv(compute_units, 16):
