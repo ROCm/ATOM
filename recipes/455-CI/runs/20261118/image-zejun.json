@@ -1,0 +1,16 @@
+{
+ "image": "rocm/fw-bringup-mlperf:gfx1250-atom-ci455-20261118",
+ "digest": "sha256:d17a28d3ea228c67c25fd1d15ae7138162287a7002ba13e2bae3ee33ed14cb69",
+ "base_image": "rocm/fw-bringup-mlperf:gfx1250-atom-ci455-20261114",
+ "atom": {
+  "commit": "9b2e67b7f6f5841b0d32db9589e989ff52673761",
+  "date": "2026-11-18",
+  "title": "fix(engine): honor ATOM_TORCH_PROFILER_DIR (#2925)"
+ },
+ "aiter": {
+  "commit": "b1d849ff36907402d7ea6a3483e6f0dafa995aca",
+  "date": "2026-11-18",
+  "title": "[Config] [Perf] Add DeepSeek-V4.1-Flash EP8 MXFP4 (a4w4) fused-MoE rows for gfx950 (#7582)"
+ },
+ "dependency_changes": []
+}
