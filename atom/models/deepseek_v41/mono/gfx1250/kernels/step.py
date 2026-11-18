@@ -54,7 +54,7 @@ DSPARK_W = D.DSPARK_W          # the DSpark block width: a build's draft request
 TENTRY_ROW = LY.TARGET_ENTRY_ROW       # the layer-table row of the target entry's attention front (tables.StepTables: after 40 + 3 layers and the draft entry)
 
 FRONT_LDS_OFF = LY.FRONT_LDS                # keep the TP payload ([TR][20] f32 at LDS 0) intact
-FPTRS = ['R', 'y', 'pre', 'post', 'comb', 'fnh', 'fnl', 'hsc', 'hbs', 'nw', 'gate', 'gbias', 'Rout', 'xn', 'fx8', 'fxs', 'part', 'plog', 'cand', 'cands', 'npre', 'npost', 'ncomb', 'ids', 'wts', 'mout', 'mid8', 'midc', 'afnh', 'afnl', 'ahsc', 'ahbs', 'anw', 'aRout', 'axn', 'anpre', 'anpost', 'ancomb', 'tp2out', 'cyc', 'y1', 'y2', 'shplane', 'kmeta', 'knsel', 'ksel', 'kvw', 'rpos', 'iq', 'iwp', 'iq_out', 'iqs_out', 'iw_out', 'xh', 'cpart', 'ilvl', 'aux8', 'auxs', 'tpep', 'kmeta_d', 'kvw_d', 'rpos_d', 'dR', 'dy', 'dpre', 'dpost', 'dcomb', 'emb', 'noise', 'x8', 'xs', 'ctxtab', 'dgeom', 'tids', 'eng8', 'engs', 'engkv', 'engpart', 'mroute', 'mchist']   # the step's pointers, in a device table (kernel arg `fp`):
+FPTRS = ['R', 'y', 'pre', 'post', 'comb', 'fnh', 'fnl', 'hsc', 'hbs', 'nw', 'gate', 'gbias', 'Rout', 'xn', 'fx8', 'fxs', 'part', 'plog', 'cand', 'cands', 'npre', 'npost', 'ncomb', 'ids', 'wts', 'mout', 'mid8', 'midc', 'afnh', 'afnl', 'ahsc', 'ahbs', 'anw', 'aRout', 'axn', 'anpre', 'anpost', 'ancomb', 'tp2out', 'cyc', 'y1', 'y2', 'shplane', 'kmeta', 'knsel', 'ksel', 'kvw', 'rpos', 'iq', 'iwp', 'iq_out', 'iqs_out', 'iw_out', 'xh', 'cpart', 'ilvl', 'aux8', 'auxs', 'tpep', 'kmeta_d', 'kvw_d', 'rpos_d', 'dR', 'dy', 'dpre', 'dpost', 'dcomb', 'emb', 'noise', 'x8', 'xs', 'ctxtab', 'dgeom', 'tids', 'eng8', 'engs', 'engkv', 'engpart', 'mroute', 'mchist', 'englook']   # the step's pointers, in a device table (kernel arg `fp`):
 # as ~30 more kernel args they pushed SGPRs into spills and a 64-bit VGPR spill whose ~45 scratch reloads each waited,
 # by the in-order loadcnt, for every outstanding load of the stage they sat in
 ATAB = ("x8 xs wqkv wqkv_s qnw kvnw wqb wqb_s kv sel sink rcos rsin woa woa_s wob wob_s qkv_part qkv ss qr8 qrs kvn q "
@@ -64,6 +64,7 @@ LKEYS = ("wqkv wqkv_s wqb wqb_s woa woa_s wob wob_s qnw kvnw sink fnh fnl hsc hb
 WAVES_PER_EU = 4      # the step body's occupancy hint (FlyDSL rocdl.waves_per_eu): caps its VGPRs at 256
 RECV_HALF = 16 * 40960 * 16 + (2 << 20)   # bytes a parity half of a receive buffer (TP regions + tail)
 STOP_OFF = 2 * RECV_HALF   # a receive buffer's STOP word, past the two halves (never zeroed a step: runner.STOP_OFF)
+assert ES.LOOK_OFF >= ST.SOFF2 + 4096 and ES.LOOK_END == RECV_HALF   # (englook) its words past the tail's
 RKOFF = LY.RKEEP        # LDS: the residual streams kept between the fronts
 LCB = LY.LAYER_BYTES             # (+ 128..255: the TP1 / TP2 column-group counters, gpub / gwait)  # bytes of handoff counters a layer (16: the indexer layers' extra phases use 4, 44.., 60)
 IDX_LEVELS = 3        # selection-tree capacity (the index capacity buffers.ILW); actual passes depend on the current bound
@@ -229,6 +230,7 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
     parameter is in `keyed`, which the kernel and the launcher reference: all of them reach FlyDSL's JIT cache key (an edit to a helper
     the cache walk does not reach still rebuilds)."""
     assert part in ("all", "target", "draft")
+    assert ES.look_ok(TR), TR   # (englook) the entry's Engram row pushes fit the receive half (every served width)
     keyed = (("TR", TR), ("rank", rank), ("NL", NL), ("ndr", ndr), ("trd", trd), ("part", part), ("sources", sources), ("moe_ids", moe_ids), ("split", split), ("index_fp4", index_fp4), ("kv_fp4", kv_fp4), ("dstamp", AS.DSTAMP))
     L = smem_layout(TR)
     TPG = TR * 10 // 3
@@ -271,18 +273,24 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
                     if b < FS.FRONT_CTAS:
                         entry_front(fp, sm, b, TENTRY_ROW, FS.NE, FS.TOPK, last=True)   # (v2) R -> aRout for layer 0's column owners
                     # (engentry) the Engram layers' sharded kv (rows ENG_ROWS with ENG_ENTRY) on the CTAs past the front
-                    # ones (idle through it): inputs the host's staged embedding rows, readers those rows' attention posts
+                    # ones (idle through it): inputs the rows the entry looks up itself, readers those rows' attention posts
                     if hx.unlikely(((ltab(fp, ENG_ROWS[0], "lflags")() & fx.Int64(ENG_ENTRY)) != fx.Int64(0)) & (b >= FS.FRONT_CTAS)):
                         te = hx.opaque_v(fx.thread_idx.x)
                         def SL(sl):   # slot sl's row (ENG_ROWS[sl]) pointers, receive words and tag
                             Lk = (sl == fx.Int32(1)).select(fx.Int32(ENG_ROWS[1]), fx.Int32(ENG_ROWS[0]))
                             eo = (i64(Lk % 2) * i64(2 * 4 * ES.ETP_TG) + i64(ES.eng_eoff(TR))) * i64(16)
                             rv_ = [atab(fp, f"recv{o}")() + i64(tep & 1) * RECV_HALF + eo for o in range(4)]
-                            return dict(engemb=ltab(fp, Lk, "engemb")(), engw=ltab(fp, Lk, "engw")(), engws=ltab(fp, Lk, "engws")(),
-                                        erecv=rv_, etag=hx.epoch32(tep, Lk, 3))
-                        ES.stage_engkv_ent(dict(t=te, b=b, w=te // 32, l=te % 32, sm=sm, MT=(TR + 15) // 16, TR=TR, rank=rank,
-                                                stx=hx.stx_dev, engkv=fptr(fp, "engkv")), FS.FRONT_CTAS, CTAS - FS.FRONT_CTAS,
-                                           ES.ED_ENT, SL)
+                            # (englook) the rows' pushes: the 4 ranks' look bases in this step's receive half
+                            lb = [atab(fp, f"recv{o}")() + i64(tep & 1) * RECV_HALF + i64(ES.LOOK_OFF) for o in range(4)]
+                            return dict(engw=ltab(fp, Lk, "engw")(), engws=ltab(fp, Lk, "engws")(), erecv=rv_,
+                                        etag=hx.epoch32(tep, Lk, 3), lrecv=lb, lmine=lb[rank], ltag=hx.epoch32(tep, Lk, 4),
+                                        englook=fptr(fp, "englook") + i64(sl * (ES.LW * 8)))
+                        ckv = dict(t=te, b=b, w=te // 32, l=te % 32, sm=sm, MT=(TR + 15) // 16, TR=TR, rank=rank, stx=hx.stx_dev,
+                                   engkv=fptr(fp, "engkv"))
+                        # (englook) the rows' hash + host lookup on the wave tasks past the kv's CTA-tasks
+                        ES.stage_englook(ckv, FS.FRONT_CTAS + ES.NSLOT * (ES.ENT // 8),
+                                         CTAS - FS.FRONT_CTAS - ES.NSLOT * (ES.ENT // 8), SL)
+                        ES.stage_engkv_ent(ckv, FS.FRONT_CTAS, CTAS - FS.FRONT_CTAS, ES.ED_ENT, SL)
                         hx.wait_storecnt0()
                     handoff(TCNT + i64(LY.TARGET_FRONT), t, False)
             TRx = TRD if DRS else TR

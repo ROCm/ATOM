@@ -14,7 +14,7 @@ from atom.models.deepseek_v41.mono.gfx1250 import buffers
 from atom.models.deepseek_v41.mono.gfx1250.config import ROWS_PER_REQ
 from atom.models.deepseek_v41.mono.gfx1250.step_plans import fill_step_plans
 from atom.models.deepseek_v41.mono.gfx1250.step_prep import prep_step
-from atom.models.deepseek_v41.mono.gfx1250.tables import BCOLS, ILW
+from atom.models.deepseek_v41.mono.gfx1250.tables import BCOLS, ENG_W, ILW
 from atom.models.deepseek_v41.mono.gfx1250.tables import T as T_MAX
 from atom.models.deepseek_v41.mono.step_meta import write_step_meta
 from atom.mono.runtime.consensus import MonoUnsupported
@@ -161,13 +161,16 @@ class StepInputs:
                 if emb is not None
                 else None
             )
-            if e is None or e.shape[-2] < rows or e.shape[-1] != w["engemb"].shape[1]:
+            if e is None or e.shape[-2] < rows or e.shape[-1] != ENG_W:
                 raise MonoUnsupported(
                     f"engram layer {k}: embedding rows {None if e is None else tuple(e.shape)}"
                 )
             engs[k] = e
             key += [e.data_ptr(), tuple(e.shape)]
         er = self._eng_rows
+        if self.tables.engram and getattr(self, "_eng_staged", None) is None:
+            # (englook) the entry hashes the staging's snapshot and looks the rows up itself
+            raise MonoUnsupported("engram: no staged rows (the step kernel reads their snapshot)")
         if (
             er is not None
         ):  # the staged Engram inputs the graph captures (fixed addresses: EngramStep)
@@ -260,9 +263,6 @@ class StepInputs:
             # step (as the fixture does), else the drafts keep earlier steps' winners
             mbest=self.scratch["mbest"].view(torch.int64),
         )
-        for k, w in self.tables.engram.items():
-            e = engs[k]
-            w["engemb"][:rows].copy_(e.reshape(-1, e.shape[-1])[:rows])
 
     def _sampling(self, batch, req) -> None:
         """Each target row's sampling from its request (``ScheduledBatch`` temperatures / top_ps / top_ks), as the

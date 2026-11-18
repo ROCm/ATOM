@@ -224,13 +224,15 @@ NSLOT = 2              # Engram layers (rows before them: the layer table's rows
 
 @ASTRewriter.transform
 def stage_engkv_ent(c, e0, ncta, EDL, S):
-    """The sharded kv (stage_engkv's SH tiles: rank k's 400 tiles a layer) of NSLOT Engram layers on the CTAs e0 ..
+    """The sharded kv (rank k's 400 16-column N tiles a layer: ENT) of NSLOT Engram layers on the CTAs e0 ..
     e0 + ncta - 1 (the entry's CTAs without a front role): CTA-task j = (slot j // 50, tiles (j % 50) 8 + w), one a CTA.
-    A (all of K) quantized in the CTA from the slot's bf16 embeddings (stage_engq's arithmetic) into LDS once; the B
+    A (all of K): the slot's rows from stage_englook's pushes (polled), dequantized to bf16 and quantized in the CTA
+    (e8m0_of / q8words per 32-group) into LDS once; the B
     loads come by whole rows into the wave's LDS ring (4 async copies of 4 rows a K128 step: the coalesced ring of the
-    entry kv, b64e8aa06), each lane reading its wmma operand back. Stores as stage_engkv: the slot's engkv (slot s at
-    engkv + s T EN 2) and the self-tagged pushes to the peers (the slot's receive words). S: per-slot dicts (traced
-    pointers / tags): engemb engw engws erecv etag (S(slot), slot a traced i32). The kv bits are those of stage_engkv."""
+    entry kv, b64e8aa06), each lane reading its wmma operand back. Stores: the slot's engkv (slot s at engkv + s T EN 2)
+    and the self-tagged pushes to the peers (the slot's receive words, eng_fetch's layout). S: per-slot dicts (traced
+    pointers / tags): engw engws erecv etag lmine ltag (S(slot), slot a traced i32). The kv bits are those of the replicated
+    kv (an MXFP8 GEMM of the quantized rows, f32 accumulation in K order)."""
     t, b, w, l, MT, sm = c["t"], c["b"], c["w"], c["l"], c["MT"], c["sm"]
     TR = c["TR"]
     rank = c["rank"]
@@ -246,7 +248,7 @@ def stage_engkv_ent(c, e0, ncta, EDL, S):
     if (bb >= 0) & (bb < NSLOT * TPL) & (bb < ncta):
         sl = bb // TPL
         Sd = S(sl)   # (the slot's pointers / tag loaded for this CTA's slot only: fewer live scalars)
-        engemb, engw, engws, etag, erecv = Sd["engemb"], Sd["engw"], Sd["engws"], Sd["etag"], Sd["erecv"]
+        engw, engws, etag, erecv = Sd["engw"], Sd["engws"], Sd["etag"], Sd["erecv"]
         engkv = c["engkv"] + i64(sl * (T * EN * 2))
         q = (bb % TPL) * 8 + w
         n0 = (q // ETL) * HD5 + (rank * ETL + q % ETL) * 16
@@ -269,9 +271,17 @@ def stage_engkv_ent(c, e0, ncta, EDL, S):
                 row = e // EG
                 g = e % EG
                 live = row < TR
-                src = engemb + i64(fx.min(row, TR - 1) * EK + g * 32) * 2
-                vs = [hx.gload(src + i64(16 * k), BF16, 8) for k in range(4)]
-                vals = [live.select(vs[k][e_].to(F32), F32(0.0)) for k in range(4) for e_ in range(8)]
+                # the group's 32 codes + scale from its column owner's pushes (stage_englook), dequantized as ATOM's UVA
+                # lookup does (code x 2^(s - 127) -> bf16): the staged row's exact values
+                col = g // 8
+                gq = g % 8
+                wb = (col // HPR) * look_words(TR) + ((sl * TR + fx.min(row, TR - 1)) * HPR + col % HPR) * LKW
+                lps = [Sd["lmine"] + i64(wb + gq * 4 + k) * 16 for k in range(4)] + [Sd["lmine"] + i64(wb + 32) * 16]
+                got = _poll_ll(lps, Sd["ltag"], live)
+                sw = (gq < 4).select(got[4][0], got[4][2])
+                scl = (((sw >> ((gq % 4) * 8)) & 255) << 23).bitcast(F32)
+                fv = [hx.fp8x8_f32([got[k][0], got[k][2]]) for k in range(4)]
+                vals = [live.select((fv[k][e_] * scl).to(BF16).to(F32), F32(0.0)) for k in range(4) for e_ in range(8)]
                 am = F32(0.0)
                 for e_ in range_constexpr(32):
                     am = fx.max(am, abs(vals[e_]))
@@ -312,3 +322,100 @@ def stage_engkv_ent(c, e0, ncta, EDL, S):
                     for o in range_constexpr(4):
                         if o != rank:
                             hx.gstore(erecv[o] + i64(rank * ETP_TG + slot) * 16, v, nt=True)
+
+
+# ---- (englook) the Engram rows' hash and host-table lookup in the target entry ------------------------------------------
+# What ATOM's staging did on its side stream before the launch (hashing.engram_snapshot_indices on the step's snapshot,
+# uva.uva_gather_into of this rank's hash columns, the TP all-gather), done by idle entry CTAs: a wave a (slot, row,
+# column of this rank) hashes the row's n-grams (the snapshot the preparation graph still writes: EngramStaging._snapshot),
+# reads the column's table row from the page-locked host shard (UVA: 256 e4m3 codes + 8 e8m0 scales) and pushes it raw,
+# as LL words, to every rank's receive half (itself included); the entry kv's A loop polls them (the dequantization there).
+NGR = 4                # n-gram length (the token and 3 before it)
+NHC = 8                # hash columns a lookback length
+NCOL = (NGR - 1) * NHC # 24 hash columns ("heads")
+HPR = NCOL // 4        # columns a TP rank (its host shard)
+LKW = 33               # LL words a (row, column): 32 code words of 8 B, then the 8 scale bytes
+LW = 64                # int64 words a slot in englook (runner._englook fills them once)
+LW_MULT, LW_SIZE, LW_OFF, LW_PAD, LW_ROW0, LW_WP, LW_SP, LW_SNAP = 0, 4, 28, 52, 53, 54, 55, 56
+LOOK_OFF = 16 * 40960 * 16 + 4 * 4 * 48 * 96 * 16 + (64 << 10)   # bytes into a receive half: past tail.SOFF2's Markov words
+LOOK_END = 16 * 40960 * 16 + (2 << 20)                            # the half's end (step.RECV_HALF)
+
+
+def look_words(TR):
+    """LL words a source rank's pushes take in a receive half."""
+    return NSLOT * TR * HPR * LKW
+
+
+def look_ok(TR):
+    """The pushes of TR rows fit the receive half's free tail (TR <= 32: every served width, runner.MAX_STEP_ROWS = 6)."""
+    return LOOK_OFF + 4 * look_words(TR) * 16 <= LOOK_END
+
+
+@ASTRewriter.transform
+def _poll_ll(ptrs, tag, want):
+    """16-byte LL words {d0, tag, d1, tag} at ptrs, polled until every one carries tag (want False: no wait, the loads
+    as they are); bounded, the stop protocol as eng_fetch."""
+    t0 = hx.clock()
+    got = [hx.gload(p, I32, 4, nt=True) for p in ptrs]
+    bad = I32(0)
+    for k in range_constexpr(len(ptrs)):
+        bad = bad | ((got[k][1] != tag) | (got[k][3] != tag)).select(I32(1), I32(0))
+    bad = want.select(bad, I32(0))
+    st = I32(0)
+    while (bad != 0) & (hx.clock() - t0 < fx.Int64(hx.POLL_TICKS)) & (st == fx.Int32(0)):
+        hx.s_sleep(0)
+        st = hx._stop_due(st, t0)
+        got = [hx.gload(p, I32, 4, nt=True) for p in ptrs]
+        bad = I32(0)
+        for k in range_constexpr(len(ptrs)):
+            bad = bad | ((got[k][1] != tag) | (got[k][3] != tag)).select(I32(1), I32(0))
+    hx._stop_mark((bad != 0) & (st == fx.Int32(0)))
+    return got
+
+
+@ASTRewriter.transform
+def stage_englook(c, e0, ncta, S):
+    """Wave task q = (CTA b - e0) x 8 + wave over NSLOT x TR x HPR (slot, row, this rank's column hl): the column's row id
+    (hashing._engram_hash_kernel, SNAPSHOT: the lookbacks latch at DEAD -1 to the pad id, rolling = XOR of id x multiplier,
+    id = rolling % size + offset (remsi, as Triton's), a padded row -2: no read, zeros), its 256 codes (lane l: bytes
+    8l..8l+7) and 8 scales from the host shard (rows from LW_ROW0), pushed to the 4 ranks' receive halves: word ((slot TR
+    + row) HPR + hl) LKW + l of this rank's source block (lane 0 also the scale word, + 32). S(slot): englook (the slot's
+    int64 words), lrecv (the 4 ranks' look bases this step), ltag."""
+    t, b, w, l = c["t"], c["b"], c["w"], c["l"]
+    TR, rank = c["TR"], c["rank"]
+    q = (b - e0) * 8 + w
+    if (b >= e0) & (b < e0 + ncta) & (q < NSLOT * TR * HPR):
+        sl = q // (TR * HPR)
+        rem = q % (TR * HPR)
+        row = rem // HPR
+        hl = rem % HPR
+        col = hl + rank * HPR
+        Sd = S(sl)
+        P = Sd["englook"]
+        snap = hx.gload(P + i64(LW_SNAP * 8), fx.Int64)
+        zs = [hx.gload(snap + i64(row * NGR + k) * 8, fx.Int64) for k in range(NGR)]
+        pad = hx.gload(P + i64(LW_PAD * 8), fx.Int64)
+        blocked = zs[0] == fx.Int64(-1)
+        roll = blocked.select(pad, zs[0]) * hx.gload(P + i64(LW_MULT * 8), fx.Int64)
+        rolls = [roll]
+        for k in range_constexpr(1, NGR):
+            blocked = blocked | (zs[k] == fx.Int64(-1))
+            roll = roll ^ (blocked.select(pad, zs[k]) * hx.gload(P + i64((LW_MULT + k) * 8), fx.Int64))
+            rolls.append(roll)
+        nl = col // NHC + 1
+        rolling = (nl == 1).select(rolls[1], (nl == 2).select(rolls[2], rolls[3]))
+        size = hx.gload(P + i64(LW_SIZE + col) * 8, fx.Int64)
+        off = hx.gload(P + i64(LW_OFF + col) * 8, fx.Int64)
+        padded = zs[0] == fx.Int64(-2)
+        local = padded.select(fx.Int64(0), rolling % size + off - hx.gload(P + i64(LW_ROW0 * 8), fx.Int64))
+        cw = hx.gload(hx.gload(P + i64(LW_WP * 8), fx.Int64) + local * 256 + i64(l * 8), I32, 2)
+        sw = hx.gload(hx.gload(P + i64(LW_SP * 8), fx.Int64) + local * 8, I32, 2)
+        z = I32(0)
+        tag = Sd["ltag"]
+        v = fx.Vector.from_elements([padded.select(z, cw[0]), tag, padded.select(z, cw[1]), tag], I32)
+        vs = fx.Vector.from_elements([padded.select(z, sw[0]), tag, padded.select(z, sw[1]), tag], I32)
+        wi = rank * look_words(TR) + ((sl * TR + row) * HPR + hl) * LKW
+        for o in range_constexpr(4):
+            hx.gstore(Sd["lrecv"][o] + i64(wi + l) * 16, v, nt=True)
+            if l == 0:
+                hx.gstore(Sd["lrecv"][o] + i64(wi + 32) * 16, vs, nt=True)

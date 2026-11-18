@@ -106,6 +106,7 @@ FPTRS_ROLE = {
     "engpart": SCRATCH,
     "mroute": SCRATCH,  # a fixed route table (build moe_ids="mroute": the fixture's Zipf routing); unused by the server
     "mchist": SCRATCH,  # the multi-CTA selection's radix histograms / position counters (step.MC_BYTES, zeroed a step)
+    "englook": SCRATCH,  # (englook) the entry's Engram lookup inputs: engram.LW int64 a slot (runner._englook, once)
 }
 
 # fp table, after FPTRS (ATAB): the attention's
@@ -317,6 +318,7 @@ def scratch_bytes(K, nlt: int) -> dict[str, int]:
         "engpart": 768 * 16 * 4,
         "mroute": T * FS.TOPK * 4,
         "mchist": M.MC_BYTES,
+        "englook": 2 * 64 * 8,
         # step tail
         "xh": T * HF.HID * 2,
         "logits": T * HF.VR * 4,

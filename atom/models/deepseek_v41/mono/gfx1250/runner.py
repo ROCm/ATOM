@@ -28,7 +28,7 @@ from aiter.dist.parallel_state import (
     get_tp_group,
 )
 
-from atom.model_ops.engram.device.staging import EngramStagedRows
+from atom.model_ops.engram.device.staging import EngramStagedRows, EngramStaging
 from atom.models.deepseek_v41.mono.gfx1250 import buffers
 from atom.models.deepseek_v41.mono.gfx1250.config import (
     NDR,
@@ -120,6 +120,15 @@ class SingleStepRunner(StepInputs):
             raise MonoUnsupported(
                 f"step kernel import: {type(err).__name__}: {err}"
             ) from err
+        # (englook) the target entry hashes and looks the Engram rows up itself: of ATOM's EngramStaging it drives only
+        # the snapshot and the cursor advance (``launch``), two private steps -- if that class no longer has them, the
+        # single-launch step declines (ATOM's own path serves)
+        if not all(
+            callable(getattr(EngramStaging, m, None)) for m in ("_snapshot", "_advance_cursor")
+        ):
+            raise MonoUnsupported(
+                "engram: EngramStaging has no _snapshot / _advance_cursor (the step kernel's lookup drives them)"
+            )
         # the kernel's ring slots (window + block width) and pool row width (bf16 elements) are compile-time constants
         AS = self.K["attention"]
         if int(window.ring_slots) != AS.KG_RING:
@@ -224,6 +233,7 @@ class SingleStepRunner(StepInputs):
         # the stream the verdict's copies run on: ModelRunner's output D2H waits for it, not for the draft launch
         self.output_stream = self._verify_stream = torch.cuda.Stream()
         self._eng_rows = None
+        self._eng_staged = None
         # each request's first position of the step (its preparation writes it): where the decode round's next step
         # advances from (``round.SingleStepRound``)
         self.first_positions = torch.zeros(
@@ -335,6 +345,8 @@ class SingleStepRunner(StepInputs):
         args = (*self._launch_args(), torch.cuda.current_stream())
 
         er = self._eng_rows
+        if getattr(self, "_eng_staged", None) is not None:
+            self._englook(self._eng_staged)
 
         def first():  # the step's device preparation (the Engram stage first) and its first launch
             if er is not None:
@@ -343,7 +355,13 @@ class SingleStepRunner(StepInputs):
                 st = er.staging
                 if st.step is not None and st.step.served_by_round:
                     st.step = dataclasses.replace(st.step, served_by_round=False)
-                er.stage()
+                # (englook) the entry hashes the snapshot and looks the rows up itself: of EngramStaging.start only the
+                # snapshot and the cursor advance (no side stream, lookup or all-gather); its join then waits on nothing,
+                # as for a step the model's own round serves
+                st = er.staging
+                st._served = True
+                st._snapshot(er.width)
+                st._advance_cursor(er.width)
                 # join Engram's side stream BEFORE the launch: the step kernel occupies every WGP and spins on its peers,
                 # so a side-stream collective (the embedding all-gather) queued behind it on one GPU while its peers' step
                 # kernels wait for this GPU's is a cross-GPU circular wait; the launch also reads the embedding rows
@@ -381,6 +399,48 @@ class SingleStepRunner(StepInputs):
                 self._log_dstamps()
         self._qrow = self._qrow_next
 
+    def _englook(self, er) -> None:
+        """(englook) The entry's Engram lookup inputs, once: engram.LW int64 words a slot -- the layer's hash constants
+        (multipliers, column sizes / offsets, pad id), this rank's page-locked host shard (codes, scales, first row) and
+        the staging snapshot's address (fixed: graph-captured)."""
+        if getattr(self, "_englook_set", False):
+            return
+        ES = self.K["step"].ES
+        st = er.staging
+        host, tabs = getattr(st, "host", None), getattr(getattr(st, "uva", None), "hash_tables", None)
+        lids = sorted(self.tables.engram)
+        if (
+            host is None
+            or tabs is None
+            or getattr(st, "snapshot", None) is None
+            or list(host.layer_ids) != lids
+            or len(lids) != ES.NSLOT
+            or tabs.ngram != ES.NGR
+            or tabs.heads != ES.NCOL
+            or host.local_heads != ES.HPR
+            or host.head_start != self.rank * ES.HPR
+            or st.snapshot.shape[1] != ES.NGR
+        ):
+            raise MonoUnsupported("engram: staging geometry (the step kernel's lookup: 4-grams, 24 columns, 6 a rank)")
+        w = torch.zeros(ES.NSLOT, ES.LW, dtype=torch.int64)
+        for s_, lid in enumerate(lids):
+            mult, sizes, offs = (x.detach().cpu().to(torch.int64) for x in tabs.layers[lid])
+            table = host.prefetcher._tables[lid]
+            if table.head_dim != 256 or (table.block_size or 0) != 32:
+                raise MonoUnsupported(f"engram: table rows {table.head_dim} / blocks {table.block_size}")
+            weight, scales, row0, _ = table.registered_shard()
+            w[s_, ES.LW_MULT : ES.LW_MULT + ES.NGR] = mult[: ES.NGR]
+            w[s_, ES.LW_SIZE : ES.LW_SIZE + ES.NCOL] = sizes[: ES.NCOL]
+            w[s_, ES.LW_OFF : ES.LW_OFF + ES.NCOL] = offs[: ES.NCOL]
+            w[s_, ES.LW_PAD] = int(tabs.pad_id)
+            w[s_, ES.LW_ROW0] = int(row0)
+            w[s_, ES.LW_WP] = weight.data_ptr()
+            w[s_, ES.LW_SP] = scales.data_ptr()
+            w[s_, ES.LW_SNAP] = st.snapshot.data_ptr()
+        self.scratch["englook"].view(torch.int64)[: w.numel()].copy_(w.view(-1))
+        torch.cuda.current_stream().synchronize()
+        self._englook_set = True
+
     def _log_dstamps(self):
         """(diagnostic, ATOM_MONO_DSTAMP=1) every 50 launches: D CTA 0's mean steady-counter time (us, 100 MHz) from D's
         entry to each phase point, over the target layers and the draft layers (attention._dstamp)."""
@@ -416,6 +476,8 @@ class SingleStepRunner(StepInputs):
         # the Engram stage (its lookups, the side-stream gather and the join) runs inside the launch's preparation graph
         # (``launch``): issued op by op here it was ~0.26 ms of host time between the verdict and the next launch
         self._eng_rows = rows if staged else None
+        # (englook) the staging whose snapshot the entry hashes (staged here or, outside the forward, already)
+        self._eng_staged = rows if isinstance(rows, EngramStagedRows) else None
         self.launch(input_ids, forward_context, batch)
 
     def verify_outputs(self, bs: int):

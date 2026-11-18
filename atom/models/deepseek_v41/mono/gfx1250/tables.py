@@ -89,7 +89,7 @@ class StepTables:
             "engw",
             "engws",
             "enggw",
-            "engemb",
+            "engemb",  # (the in-layer kv's input: unused, its rows run in the entry -- a dummy pointer)
             "ibat",
             "kring",
             "ccap",
@@ -180,9 +180,9 @@ class StepTables:
                     }
                 self.keep.append(self.comp_w)
         self.specs = [target[i].attn.spec for i in range(NL)]
-        # Engram (layers k with an EngramOp): row k - 1 (lflags bit 7) quantizes this step's embedding rows and projects
-        # them (kv = emb . wkv^T); layer k's attention front gates the value into R'. The runner copies the staged
-        # embedding rows into engemb[k] each step.
+        # Engram (layers k with an EngramOp): row k - 1 (lflags bit 7) carries layer k's wkv / gate weights; the target
+        # entry looks the step's rows up and projects them (kv = rows . wkv^T, step.ENG_ROWS); layer k's attention front
+        # gates the value into R'.
         self.engram = {}
         for k in range(1, NL):
             op = getattr(target[k], "engram", None)
@@ -203,7 +203,6 @@ class StepTables:
                 "engw": w.contiguous(),
                 "engws": ws.contiguous(),
                 "enggw": op.gate_weight.float().contiguous(),
-                "engemb": torch.zeros(T, ENG_W, dtype=torch.bfloat16, device=dev),
             }
         self.keep.append(self.engram)
         if self.engram and sorted(self.engram) != [1, 14]:
