@@ -14,7 +14,7 @@ from aiter.dist.parallel_state import get_tp_group
 
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.scheduler import ScheduledBatch
-from atom.model_engine.state_cache import KEEP_SETTLED, KEEP_SNAPSHOT
+from atom.model_engine.state_cache import KEEP_NONE, KEEP_SETTLED, KEEP_SNAPSHOT
 from atom.model_engine.state_runtime import StateTransfer, midstep_checkpoint_targets
 from atom.model_ops.attention_gdn import GatedDeltaNet
 from atom.model_ops.fla_ops.chunk import CHUNK_SIZE
@@ -634,8 +634,12 @@ class GDNStateMixin(PoolRowsMixin):
 
     def _decode_keep(self) -> str:
         """`StateTransfer.decode_keep` for a PAGE copy: under MTP or ReplaySSM
-        the slot is ahead of a decode boundary, so the step's image is built."""
-        return KEEP_SNAPSHOT if self.replayssm or self.num_spec else KEEP_SETTLED
+        the slot is ahead of a decode boundary, so the step's image is built.
+        That rebuilds conv and SSM alone; an image with more planes keeps none
+        until its builder rebuilds them too."""
+        if not (self.replayssm or self.num_spec):
+            return KEEP_SETTLED
+        return KEEP_SNAPSHOT if len(self._checkpoint_plane_shapes()) == 2 else KEEP_NONE
 
     def num_state_layers(self) -> int:
         """Layers holding a recurrent state, one slot each.

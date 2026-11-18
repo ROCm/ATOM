@@ -374,6 +374,12 @@ class TestDecodeBoundaryFiling:
         )
         return filed, seq.num_finalized_tokens
 
+    def test_a_scheduled_batch_counts_its_forward(self, seq_factory):
+        """What a filed checkpoint is checked against at the drain."""
+        mtp = TestMTPMaxTokens()
+        seq = mtp._prefill(mtp._scheduler(), seq_factory([1, 2, 3, 4]))
+        assert seq.num_forwards == 1
+
     @pytest.mark.parametrize("accepted", [1, 2, 3, 4])
     def test_a_seq_that_ran_names_step_0_of_that_forward(self, seq_factory, accepted):
         (filed,), n = self._filed(seq_factory, ran=True, accepted=accepted)

@@ -3148,7 +3148,7 @@ class Scheduler:
 
     @staticmethod
     def _consume_state_forks(scheduled_seqs: dict[int, Sequence]) -> None:
-        """Clear the fork flags the batch just snapshotted.
+        """Clear the fork flags the batch just snapshotted, and count its forward.
 
         A fork describes one forward: the batch carries `state_fork_src`, and
         every later batch for the same seq must read and write the same slot
@@ -3157,10 +3157,12 @@ class Scheduler:
         """
         for seq in scheduled_seqs.values():
             seq.state_fork_src = -1
+            seq.num_forwards += 1
 
     @staticmethod
     def _consume_first_decode(scheduled_seqs: dict[int, Sequence]) -> None:
-        """Clear the first-decode flags the batch just snapshotted.
+        """Clear the first-decode flags the batch just snapshotted, and count
+        its forward.
 
         Same contract as `_consume_state_forks`: the flag describes one
         forward, and the batch constructor reads it off `Sequence`, so it can
@@ -3168,6 +3170,7 @@ class Scheduler:
         """
         for seq in scheduled_seqs.values():
             seq.is_first_decode = False
+            seq.num_forwards += 1
 
     # -- Remote KV / offload admission helpers ------------------------------
     def _resolve_waiting_remote_kv(

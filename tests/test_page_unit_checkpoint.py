@@ -772,8 +772,29 @@ def _snapshot_coordinator(free_slots, decode_keep=KEEP_SNAPSHOT):
 
 def _seq(slot, spec_slots=()):
     return SimpleNamespace(
-        has_per_req_cache=True, state_slot=slot, state_slots=[slot, *spec_slots]
+        has_per_req_cache=True,
+        state_slot=slot,
+        state_slots=[slot, *spec_slots],
+        num_forwards=0,
     )
+
+
+@pytest.mark.parametrize(
+    "staged, forwards, kept", [(False, 0, 1), (False, 1, 0), (True, 1, 1), (True, 2, 0)]
+)
+def test_a_boundary_is_stored_only_while_the_slot_holds_it(staged, forwards, kept):
+    """One filed after its forward expects no other before the drain; one staged
+    with its forward in the batch being built expects that one."""
+    c, _ = _snapshot_coordinator(1, KEEP_SETTLED)
+    seq = _seq(5)
+    if staged:
+        c.checkpoint_when_scheduled(seq, 101)
+        assert c.take_checkpoint_ops()[0] == ()  # held back from its own batch
+    else:
+        c.checkpoint(seq, 8, 101)
+    seq.num_forwards += forwards
+    stores, _ = c.take_checkpoint_ops()
+    assert (len(stores), c.checkpoints_dropped) == (kept, 1 - kept)
 
 
 @pytest.mark.parametrize("spec_slots, step_slot", [((), 5), ((6, 7, 8), 7)])

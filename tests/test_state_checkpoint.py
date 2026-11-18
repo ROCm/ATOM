@@ -2322,6 +2322,31 @@ class TestDecodeBoundaryStep:
         (op,) = bm.take_state_maintenance_ops().checkpoint_stores
         assert (op.src_slot, op.step, op.scratch_slot) == (seq.state_slot, -1, -1)
 
+    def test_the_real_loop_stores_the_boundaries_it_files(self):
+        """`schedule` counts a forward before `postprocess` files its boundary,
+        so the next `schedule` stores it rather than dropping it as stale."""
+        sched = make_scheduler(paged_copy_config(), state_runtime=PAGED_COPY_RUNTIME)
+        seq = stateful_seq(list(range(BLOCK)))
+        sched.add(seq)
+        batch, _ = sched.schedule()
+        stores = 0
+        for token in range(500, 510):
+            sched.postprocess(
+                list(sched.running),
+                ScheduledBatchOutput(
+                    req_ids=[seq.id],
+                    token_ids=[(token,)],
+                    num_rejected=None,
+                    num_bonus=None,
+                    draft_token_ids=None,
+                ),
+                batch=batch,
+            )
+            batch, _ = sched.schedule()
+            stores += len(batch.state_maintenance_ops.checkpoint_stores)
+        assert stores >= 2
+        assert sched.block_manager.paged_state_checkpoints.checkpoints_dropped == 0
+
     @pytest.mark.parametrize("step", [0, 2])
     def test_a_class_keeping_nothing_files_no_step(self, step):
         """Nor does it spend the spacing on one it cannot keep."""
