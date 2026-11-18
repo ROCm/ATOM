@@ -237,7 +237,7 @@
   {
     "model_name": "Kimi-K3 DSpark",
     "model_path": "moonshotai/Kimi-K3",
-    "extraArgs": "--kv_cache_dtype fp8 -tp 8 --trust-remote-code --gpu-memory-utilization 0.93 --block-size 128 --no-enable_prefix_caching --method dspark --draft-model Inferact/Kimi-K3-DSpark --num-speculative-tokens 7 --max-num-seqs 64",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 8 --trust-remote-code --gpu-memory-utilization 0.93 --block-size 128 --no-enable_prefix_caching --method dspark --draft-model Inferact/Kimi-K3-DSpark --num-speculative-tokens 7 --max-num-seqs 64 --cudagraph-capture-sizes '[64]'",
     "env_vars": "",
     "runner": "linux-atom-do-mi350x-8",
     "test_level": "pr",
@@ -245,7 +245,7 @@
     "accuracy_timeout_minutes": 45,
     "accuracy_baseline": 0.95,
     "accuracy_baseline_model": "moonshotai/Kimi-K3 + Inferact/Kimi-K3-DSpark",
-    "_baseline_note": "Kimi-K3 DSpark block spec-decode (7 tokens) on the Kimi-K3 target with the Inferact/Kimi-K3-DSpark draft. Spec-decode is lossless w.r.t. the target, so baseline reuses the Kimi-K3 FP8 base (0.95); threshold 0.94 matches the target. mtp_accept_threshold intentionally omitted until the first CI run reports the DSpark acceptance rate -- add it once measured."
+    "_baseline_note": "Kimi-K3 DSpark block spec-decode (7 tokens) on the Kimi-K3 target with the Inferact/Kimi-K3-DSpark draft. Spec-decode is lossless w.r.t. the target, so baseline reuses the Kimi-K3 FP8 base (0.95); threshold 0.94 matches the target. mtp_accept_threshold intentionally omitted until the first CI run reports the DSpark acceptance rate -- add it once measured. --cudagraph-capture-sizes is pinned to --max-num-seqs: lm_eval's 65 concurrent requests hold the decode batch at 64 (512 verify rows, past the 64 rows mono decode serves, so the original path) and a smaller batch pads up to that graph. The default ladder also captures 1..8, each compiling its own mono kernel set that only the eval's last 8 requests would reach: 326 s of a 347 s capture in run 44230061928. Keep the two flags equal: a batch past the largest captured size decodes eagerly."
   },
   {
     "model_name": "Kimi-K3 DSpark PP2",
@@ -263,7 +263,7 @@
   {
     "model_name": "Kimi-K3.1-Pro",
     "model_path": "moonshotai/Kimi-K3.1-Pro",
-    "extraArgs": "-tp 8 --trust-remote-code --decode-context-parallel-size 8 --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 131072 --max-num-seqs 64 --block-size 128",
+    "extraArgs": "-tp 8 --trust-remote-code --decode-context-parallel-size 8 --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-model-len 131072 --max-num-seqs 64 --block-size 128 --cudagraph-capture-sizes '[64]'",
     "env_vars": "",
     "runner": "linux-atom-do-mi350x-8",
     "test_level": "pr",
@@ -271,12 +271,12 @@
     "accuracy_timeout_minutes": 45,
     "accuracy_baseline": 0.97,
     "accuracy_baseline_model": "moonshotai/Kimi-K3.1-Pro",
-    "_baseline_note": "Kimi-K3.1-Pro, TP8 DCP8, BF16 MLA KV, FP8 index cache, mono decode on, at the server's default compilation level and graph mode. Measured GSM8K 5-shot flexible-extract 0.9765 / 0.9757 on MI355X with the recipes/Kimi-K3.1.md launch (which also pins level 0, FULL graphs, 2048 batched tokens, 0.85 memory and AITER_CUSTOM_AR_MAX_SIZE); CI runs 3-shot at the defaults, so baseline 0.97 and threshold 0.96 until the first CI run reports its own value."
+    "_baseline_note": "Kimi-K3.1-Pro, TP8 DCP8, BF16 MLA KV, FP8 index cache, mono decode on, at the server's default compilation level and graph mode. Measured GSM8K 5-shot flexible-extract 0.9765 / 0.9757 on MI355X with the recipes/Kimi-K3.1.md launch (which also pins level 0, FULL graphs, 2048 batched tokens, 0.85 memory and AITER_CUSTOM_AR_MAX_SIZE); CI runs 3-shot at the defaults, so baseline 0.97 and threshold 0.96 until the first CI run reports its own value. --cudagraph-capture-sizes is pinned to --max-num-seqs: lm_eval's 65 concurrent requests hold the decode batch at 64, the one mono width the eval runs on, and a smaller batch pads up to that graph. The default ladder compiles a mono kernel set for each of its 12 sizes up to 64 (a 342 s capture in run 44230061928, 66 s of it the 64-row set), and the other 11 serve only the eval's last requests as they drain. Keep the two flags equal: a batch past the largest captured size decodes eagerly."
   },
   {
     "model_name": "Kimi-K3.1-Pro DSpark",
     "model_path": "moonshotai/Kimi-K3.1-Pro",
-    "extraArgs": "-tp 8 --trust-remote-code --decode-context-parallel-size 8 --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-num-seqs 16 --gpu-memory-utilization 0.9 --block-size 128 --method dspark --draft-model Inferact/Kimi-K3.1-DSpark --num-speculative-tokens 7",
+    "extraArgs": "-tp 8 --trust-remote-code --decode-context-parallel-size 8 --kv_cache_dtype bf16 --index-cache-dtype fp8 --max-num-seqs 16 --gpu-memory-utilization 0.9 --block-size 128 --method dspark --draft-model Inferact/Kimi-K3.1-DSpark --num-speculative-tokens 7 --cudagraph-capture-sizes '[16]'",
     "env_vars": "",
     "runner": "linux-atom-do-mi350x-8",
     "test_level": "pr",
@@ -285,7 +285,7 @@
     "accuracy_baseline": 0.97,
     "accuracy_baseline_model": "moonshotai/Kimi-K3.1-Pro + Inferact/Kimi-K3.1-DSpark",
     "mtp_accept_threshold": 0.25,
-    "_baseline_note": "Kimi-K3.1-Pro with the Inferact/Kimi-K3.1-DSpark draft (7 tokens; ReplaySSM is on by default with speculative decoding). Measured GSM8K 5-shot flexible-extract 0.9742 / 0.9735 on MI355X (with level 0, FULL graphs and AITER_CUSTOM_AR_MAX_SIZE, which CI leaves at their defaults); spec-decode is lossless w.r.t. the target, so it shares the target's baseline and threshold. Acceptance over that run 31.3% (3.19 tokens a forward); mtp_accept_threshold 0.25 catches a broken draft, which GSM8K alone cannot."
+    "_baseline_note": "Kimi-K3.1-Pro with the Inferact/Kimi-K3.1-DSpark draft (7 tokens; ReplaySSM is on by default with speculative decoding). Measured GSM8K 5-shot flexible-extract 0.9742 / 0.9735 on MI355X (with level 0, FULL graphs and AITER_CUSTOM_AR_MAX_SIZE, which CI leaves at their defaults); spec-decode is lossless w.r.t. the target, so it shares the target's baseline and threshold. Acceptance over that run 31.3% (3.19 tokens a forward); mtp_accept_threshold 0.25 catches a broken draft, which GSM8K alone cannot. --cudagraph-capture-sizes is pinned to --max-num-seqs: lm_eval's 65 concurrent requests hold the decode batch at 16 (128 verify rows, past the 64 rows mono decode serves, so the original path) and a smaller batch pads up to that graph. The default ladder also captures 1..8, each compiling its own mono kernel set that only the eval's last 8 requests would reach: 355 s of a 388 s capture in run 44230061928. Keep the two flags equal: a batch past the largest captured size decodes eagerly."
   },
   {
     "model_name": "Qwen3.5-35B-A3B TP2",
