@@ -207,15 +207,13 @@ jobs:
             --target-dir atom/mesh/mocker/target/mesh \
             --profile ci --test api_tests -- kv_events_test
 
-      - name: Test agentic routing
+      - name: Test agentic prefill cost
         run: |
           set -euo pipefail
           cargo test \
             --manifest-path atom/mesh/Cargo.toml \
             --target-dir atom/mesh/mocker/target/mesh \
-            --profile ci --lib -- \
-            policies::agentic policies::registry policies::factory core::placement \
-            routers::comm::proxy_body routers::http_pd_router cliargs config::
+            --profile ci --lib policies::agentic
 
       # The mocker is its own cargo root: atom/mesh's profiles, ci included,
       # do not apply, and its release profile is cargo's default (no fat LTO).

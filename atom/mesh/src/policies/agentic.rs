@@ -1,11 +1,7 @@
 //! `agentic`: places each request on the worker (`url@rank`) with the lowest
 //! prefill cost, weighing the prefix the worker's GPU KV cache holds against the
-//! prefill queued on it.
-//!
-//! [`AgenticCost`] scores snapshots and owns no state. [`AgenticPolicy`] feeds it
-//! each worker's cached prefix (from the KV event index, or the text tree when the
-//! request cannot match the index) and in-flight prefill tokens and requests, and
-//! reports the selected worker's uncached tokens as the prefill it is charged.
+//! prefill queued on it. [`AgenticCost`] scores snapshots and owns no state;
+//! [`AgenticPolicy`] feeds it live hits and load and reports the prefill charge.
 
 use std::sync::{Arc, OnceLock};
 
@@ -117,7 +113,8 @@ pub struct AgenticConfig {
     pub cost: AgenticCost,
     /// Seconds between text tree evictions; 0 never evicts.
     pub eviction_interval_secs: u64,
-    /// Size each text tree is evicted down to, as `cache_aware`'s `max_tree_size`.
+    /// Characters each worker keeps in the text tree after an eviction, as
+    /// `cache_aware`'s `max_tree_size`: the cap is per worker, not per tree.
     pub max_tree_size: usize,
 }
 
@@ -179,6 +176,13 @@ impl AgenticPolicy {
     /// Credits cache hits from the KV event index from now on.
     pub(crate) fn set_kv_events(&self, provider: Arc<dyn PrefixMatchProvider>) {
         let _ = self.kv_events.set(provider);
+    }
+
+    /// Forgets a removed worker's text in every tree.
+    pub(crate) fn remove_worker_by_url(&self, url: &str) {
+        for tree in self.trees.iter() {
+            tree.remove_tenant(url);
+        }
     }
 
     fn tree(&self, worker: &dyn Worker) -> Arc<Tree> {
