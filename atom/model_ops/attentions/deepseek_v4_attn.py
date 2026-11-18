@@ -1196,10 +1196,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         whichever request first crosses a rung. Hundreds of milliseconds, once,
         on one unlucky request.
 
-        Slot 0 into the pool's first units. Both are real addresses, which is
-        the point: a warmup on scratch would compile a kernel and fill nothing.
-        The bytes it writes are read by nobody -- a KV block is written before
-        it is read, and this runs before any block has been handed out.
+        Each planned span is copied onto itself. This warms the real source
+        addresses and copy kernel without changing PAGE bytes, including the
+        reserved padding page on eager startup where no capture reset follows.
         """
         if self.model_runner.state_runtime.checkpoint_spec is None:
             return
@@ -1208,11 +1207,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             return
         units = self.model_runner.state_runtime.checkpoint_spec.units_per_checkpoint
         staging = self._checkpoint_staging()
-        plan.write_descriptor(
-            staging.rows(0)[: plan.num_spans],
-            self._checkpoint_slot_bases()[:1],
-            self._page_unit_bases([list(range(units))]),
+        rows = staging.rows(0)[: plan.num_spans]
+        destinations = np.zeros(
+            (1, len(self._page_unit_stream_sizes(units))), dtype=np.int64
         )
+        plan.write_descriptor(rows, self._checkpoint_slot_bases()[:1], destinations)
+        rows[:, 1] = rows[:, 0]
         launch_copy_descriptor(staging.upload(0, plan.num_spans), plan)
 
     def _checkpoint_descriptor_device(self) -> torch.device:

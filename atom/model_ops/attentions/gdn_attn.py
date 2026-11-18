@@ -1053,10 +1053,9 @@ class GDNStateMixin(PoolRowsMixin):
         `_copy_tiles_kernel` -- otherwise lands inside the batch of whichever
         request first crosses a rung.
 
-        Slot 0 into the pool's first units. Both are real addresses, which is
-        the point: a warmup on scratch would compile a kernel and fill nothing.
-        The bytes it writes are read by nobody -- a KV block is written before
-        it is read, and this runs before any block has been handed out.
+        Each planned span is copied onto itself. This warms the real source
+        addresses and copy kernel without changing PAGE bytes, including the
+        reserved padding page on eager startup where no capture reset follows.
         """
         runtime = getattr(self.model_runner, "state_runtime", None)
         spec = None if runtime is None else runtime.checkpoint_spec
@@ -1066,11 +1065,13 @@ class GDNStateMixin(PoolRowsMixin):
         if not plan.num_spans:
             return
         staging = self._checkpoint_staging()
-        plan.write_descriptor(
-            staging.rows(0)[: plan.num_spans],
-            self._checkpoint_slot_bases()[:1],
-            self._page_unit_bases([list(range(spec.units_per_checkpoint))]),
+        rows = staging.rows(0)[: plan.num_spans]
+        destinations = np.zeros(
+            (1, len(self._page_unit_stream_sizes(spec.units_per_checkpoint))),
+            dtype=np.int64,
         )
+        plan.write_descriptor(rows, self._checkpoint_slot_bases()[:1], destinations)
+        rows[:, 1] = rows[:, 0]
         launch_copy_descriptor(staging.upload(0, plan.num_spans), plan)
 
     def state_entry_views(self, slot: int) -> list[torch.Tensor]:

@@ -800,8 +800,9 @@ class BlockManager:
         frontend can predict that verdict and refuse an oversized prompt with an
         error while it is still answering the client, instead of leaving the
         scheduler to discover it once the client is already waiting. The API
-        server needs it published because `num_kvcache_blocks` is measured in
-        the engine subprocess and its own Config never learns the value.
+        server needs it published because the engine measures the physical
+        `num_kvcache_blocks`, while this limit uses `kv.num_usable_blocks`
+        after reserving padding; the frontend's Config knows neither value.
         """
         capacity = self.kv.num_usable_blocks
         # A prompt this long needs more than `capacity` blocks on some rank, so

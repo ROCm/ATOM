@@ -96,6 +96,7 @@ class BlockPool:
             raise ValueError(
                 f"{num_blocks} blocks outside {self._first_block}..{self.max_blocks}"
             )
+        # Physical exclusive block-ID bound; capacity is num_usable_blocks.
         self.num_blocks: int = num_blocks
         self._on_evict = on_evict
         # Called with a hash whose index entry moved to another block id
