@@ -158,7 +158,7 @@ Exception: method override where base class forces the signature but subclass le
 FP self-check (rename / param-removed): before firing, confirm the old symbol is NOT preserved by a compatibility shim added in the same PR — a same-named wrapper, an alias, or a backward-compat re-export. A rename/removal behind such a shim is backward-compatible — do not fire. (cf. aiter#4227: `get_mla_metadata_v1` renamed but a same-named wrapper preserved the symbol → not a break.)
 Real examples (param-discard): `expert_mask` accepted but `# return None` commented out → TP expert-parallel callers silently routed wrong; `needs_independent_noise` dropped in `prefill_forward` — first token uses wrong sampling mode (ATOM#860).
 Real example (attr-missing): `getattr(self.args,'n_shared_experts',0)` silent zero fallback — shared expert slots silently dropped from mapping with no warning if attribute absent (ATOM#1548).
-→ `🔴/⚠️ B5-[sub-type]: [what changed] — [downstream not updated] — [failure]`
+→ `🔴/⚠️ [sub-type]: [what changed] — [downstream not updated] — [failure]`
 
 **B6 — New dispatch value not handled by all paths, no warning** ⚠️/🔴
 When a PR introduces a new routing value to a multi-way dispatch — a new dtype, a new arch string, a new layout flag, a new `getattr` attribute key — every reachable dispatch branch must either (a) handle it explicitly, (b) fall through to a documented safe default, or (c) assert/warn before the wrong branch is reached. Silent fallback to an incorrect behavior is a bug.

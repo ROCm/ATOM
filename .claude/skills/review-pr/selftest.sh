@@ -538,7 +538,7 @@ t "no rule template opens with an internal rule id" \
 import re, sys, pathlib
 sys.path.insert(0, sys.argv[1]); import triage
 s = pathlib.Path(sys.argv[1], "rules.md").read_text()
-print(len([m for m in re.findall(r"[\u26a0\ufe0f\U0001f4dd\U0001f534]\s*([A-Z]+\d+[a-z]?):", s)
+print(len([m for m in re.findall(r"[\u26a0\ufe0f\U0001f4dd\U0001f534/]+\s*([A-Z]+\d+[a-z]?)[-\w\[\]]*\s*:", s)
            if m in triage.RULE_SET]))' "$S")" "0"
 t "an unrelated finding does not claim a path-less FIRE" \
   "$(_card_kinds '## T
@@ -623,10 +623,55 @@ Review: OK
 Validation (deterministic): N/A -- no runtime surface changed
 
 ⚠️ foo.py:3 has no guard on the index. **Author must** add one.
-📝 The caller releases prefill_tokens while draining. **Author must** assert it.' \
+📝 prefill_tokens go unasserted. **Author must** fix that.' \
      "A5 FIRE -- foo.py:3 guard missing
-B1 FIRE -- the caller releases prefill_tokens while draining" \
+B1 FIRE -- prefill_tokens leak under cancellation" \
      "diff --git a/foo.py b/foo.py" | grep -c UNREPORTED-FIRE)" "0"
+# An ALL-CAPS name is an identifier too. Folding before the identifier test killed that
+# branch outright, so a reason whose only distinctive word was `KVCACHE` had nothing
+# claimable at all and its card was left with the refused id or an untrue
+# `-- not reported:`.
+t "an ALL-CAPS name is an identifier" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ foo.py:3 has no guard on the index. **Author must** add one.
+📝 The KVCACHE pool is never resized. **Author must** resize it.' \
+     "A5 FIRE -- foo.py:3 guard missing
+B1 FIRE -- KVCACHE size not updated" \
+     "diff --git a/foo.py b/foo.py")" ""
+# A digit in the first segment is still an identifier.
+t "fp8_scale is an identifier" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ foo.py:3 has no guard on the index. **Author must** add one.
+📝 fp8_scale is wrong on reload. **Author must** recompute it.' \
+     "A5 FIRE -- foo.py:3 guard missing
+B1 FIRE -- fp8_scale dropped" \
+     "diff --git a/foo.py b/foo.py")" ""
+# A reason with one claimable word cannot be asked for two.
+t "a one-word reason can still be claimed" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ foo.py:3 has no guard on the index. **Author must** add one.
+📝 The capture path has a deadlock. **Author must** order the stages.' \
+     "A5 FIRE -- foo.py:3 guard missing
+B1 FIRE -- deadlock" \
+     "diff --git a/foo.py b/foo.py")" ""
 t "a rule id behind the verified tag is still a rule id" \
   "$(_card_kinds '## T
 
@@ -637,6 +682,26 @@ Validation (deterministic): N/A -- no runtime surface changed
 
 ⚠️ [verified] A5: planner.rs:108 charges only on req.stream. **Author must** say so.' \
      "$_V_PATH" "$_DIFF" | grep -c RULE-CODE-IN-CARD)" "1"
+t "so is one behind a double dash" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ A5 -- planner.rs:108 charges only on req.stream. **Author must** say so.' \
+     "$_V_PATH" "$_DIFF" | grep -c RULE-CODE-IN-CARD)" "1"
+t "and one carrying a sub-type" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ B5-param-discard: planner.rs:108 drops it. **Author must** say so.' \
+     "B5 FIRE -- planner.rs:108 drops the param" "$_DIFF" | grep -c RULE-CODE-IN-CARD)" "1"
 t "so is one behind an em dash" \
   "$(_card_kinds '## T
 

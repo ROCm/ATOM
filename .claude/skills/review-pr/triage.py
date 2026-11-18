@@ -2822,23 +2822,36 @@ def audit_core_files(text, diff_text, root=None):
 
 # ----------------------------------------------------------------- card gate
 FINDING = re.compile(r"^\s*(\U0001F534|\u26A0\uFE0F?|\U0001F4DD)\s*(.+)$")
-# A rule id at the head of a finding, through whatever emphasis or tag precedes it.
-# Compiled once and read through _rule_head by both callers -- the one that registers the
-# claim and the one that refuses to ship the id -- so they cannot disagree.
+# An identifier as it is spelled, before any folding: `KVCACHE`, `fp8_scale`, `w8a8_gemm`.
+# IDENT itself cannot be widened here -- it is read by other gates -- so the claim path
+# carries its own, which also admits a digit in the first segment.
+CLAIM_IDENT = re.compile(r"[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]{2,}|[A-Z][A-Z0-9_]{3,}")
+
+
 def _claim_tokens(text):
-    """Words a card and a verdict reason must share to be about the same thing.
+    """-> {lower-cased word: the spelling it was found with}.
 
-    Lower-cased on both sides -- the stopwords are lower case and matching was not, so
-    `Prefill` missed `prefill` while `This` sailed through. Pure numbers out (a shared
-    `1024` says nothing), and the words SKILL.md mandates on every finding out, because
-    `must` appearing in both is not evidence of anything.
+    Lower case decides whether two sides share a word, because the stopword list is lower
+    case and matching against it was not -- `Prefill` missed `prefill` while `This` sailed
+    through. The original spelling is kept because that is the only thing that can tell an
+    identifier from an ordinary word: lower-casing first killed IDENT's ALL_CAPS branch
+    outright, so a reason whose only distinctive word was `KVCACHE` had no claimable token
+    at all. Pure numbers are out (a shared `1024` is not a shared subject), and so are the
+    words SKILL.md mandates on every finding.
     """
-    return {w for w in re.findall(r"\b\w{4,}\b", _fold_punct(text).lower())
-            if not w.isdigit()
-            and w not in _FIRE_STOPWORDS and w not in _CLAIM_TEMPLATE_WORDS}
+    out = {}
+    for w in re.findall(r"\b[\w]{4,}\b", _fold_punct(text)):
+        k = w.lower()
+        if k.isdigit() or k in _FIRE_STOPWORDS or k in _CLAIM_TEMPLATE_WORDS:
+            continue
+        out.setdefault(k, w)
+    return out
 
 
-RULE_ID_HEAD = re.compile(r"[*`_ ]*([A-Z]+\d+[a-z]?)[*`_]*\s*(?::|—|--)")
+# A rule id at the head of a finding, through whatever emphasis, tag or sub-type sits in
+# front of it. Read only through _rule_head, by both the caller that registers the claim
+# and the one that refuses to ship the id, so the two cannot disagree.
+RULE_ID_HEAD = re.compile(r"[*`_ ]*([A-Z]+\d+[a-z]?)(?:-[\w-]+)?[*`_]*\s*(?::|—|–|--)")
 # `[verified]` leads most card findings and SKILL.md requires the tag, and
 # `_publish.first_clause` strips it before publishing -- so `[verified] A5: ...` ships
 # opening `A5:`, the ATOM#3481 symptom with one token in front of it. Stripped the same
@@ -3161,11 +3174,16 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
                 # refuses it, drop the id and UNREPORTED-FIRE fires, and both are fatal --
                 # so the only way through was a `-- not reported:` that is untrue.
                 want, have = fire_tokens[rule], _claim_tokens(text)
-                shared = want & have
-                # Two ordinary words, or one identifier. One shared word was far too
-                # loose: SKILL.md mandates "**Author must**" on every finding, so `must`
-                # alone let any finding claim any path-less FIRE whose reason used it.
-                if len(shared) >= 2 or any(IDENT.fullmatch(w) for w in shared):
+                shared = set(want) & set(have)
+                # Two ordinary words, or one identifier -- one shared word was far too
+                # loose, because SKILL.md mandates "**Author must**" on every finding and
+                # `must` alone then let any finding claim any path-less FIRE. The
+                # identifier test reads the spelling the verdict used, not the folded key.
+                # And a reason with only one claimable word to give cannot be asked for
+                # two: `B1 FIRE -- deadlock` would otherwise have no legal card at all.
+                enough = len(shared) >= 2 or len(want) < 2
+                if shared and (enough
+                               or any(CLAIM_IDENT.fullmatch(want[w]) for w in shared)):
                     claims.setdefault(rule, []).append(text[:40])
     # A finding may report more than one rule, and often should: aiter#3165 fired B4 and
     # E5 on the same changed file and one accurate bullet covered both. Requiring N
@@ -3217,7 +3235,7 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
             # what the instruction forbids, and a model that follows the gate over the
             # prose is behaving correctly. ATOM#3481's published review opened a finding
             # with `A5:`, which tells its reader nothing. The id still counts as the
-            # claim below -- withdrawing that would turn such cards into UNREPORTED-FIRE,
+            # claim above -- withdrawing that would turn such cards into UNREPORTED-FIRE,
             # which is worse -- but the card does not ship with it.
             problems.append(("RULE-CODE-IN-CARD", text[:70],
                              f"opens with the internal rule id `{rid}`, which "
