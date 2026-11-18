@@ -124,6 +124,7 @@ Four rules carry the module:
 | `kv_store/keys.py` | Layout namespace (with each backend's own prefix), the prompt's 16-byte chunk hash chain, and object key spelling. |
 | `kv_store/layouts.py` | The layouts a KV store moves (dense, M3 PAGE, V4.1 replay PAGE) and the codec for each; a backend names the subset it moves. |
 | `kv_store/pool.py` | `TransferSlotPool`: the registered save/load slots in HBM, with quarantine. |
+| `kv_store/save_pipeline.py` | Opt-in save pipeline (`ATOM_STORE_SAVE_BATCH_CHUNKS`, default 0): one sender thread per worker makes a save's lookups and puts, so the save thread packs the next batch while the previous one is put. |
 | `kv_store/scheduler.py`, `kv_store/worker.py` | The scheduler (digest-carrying requests, paced save retries, lookup helpers) and worker (windowed put/get through the pool, completion protocol) every KV-store backend extends. |
 | `mooncake_store/config.py` | The `mooncake_store.*` settings (per-NIC Store pools included) and the startup refusals (layouts other than dense, M3 PAGE, and V4.1 PAGE, DCP > 1, odd chunks). |
 | `mooncake_store/layouts.py` | Which layouts this connector moves (dense, M3 PAGE, V4.1 replay PAGE). |
@@ -448,6 +449,11 @@ reverse).
   quarantined (below) leaves the rest working. A save packs a window (highest chunks
   first, like the dense tail-to-head order), then puts it; a load gets a
   window (lowest first), then unpacks it.
+  With `ATOM_STORE_SAVE_BATCH_CHUNKS` set (1-64), a sender thread puts each
+  batch while the save packs the next. A non-integer or a value outside
+  0-64 raises at connector init, and so, with the flag at 1-64, does
+  `OFFLOAD_COPY_WORKERS` > 1: the sender's one preparing flag serves a
+  single save thread.
 
 ### Keys and lookup
 
@@ -539,6 +545,12 @@ reverse).
   stage reports the same per-chunk set (a stage that stopped early would
   otherwise leave those groups short of their all-stage quorum for good). An
   exception from the GPU copy claims neither; `_guard` reports the failure.
+  With `ATOM_STORE_SAVE_BATCH_CHUNKS` on, the save instead waits for its
+  queued puts, then, if a fresh device fence succeeds, claims the source
+  quiescent and reports source-safe every chunk below the lowest one read
+  (on the staged path that can repeat a group already reported before a
+  later one raised; the aggregators drop repeats); if the fence fails, it
+  reports the failure without either claim.
 - Every load ends in exactly one done or failed, all-or-nothing: any key whose
   result is not exactly the chunk's size (missing, unready, lease expired, an
   object of another size) fails the whole load.
@@ -718,7 +730,11 @@ this worker config.
   `put_chunks`; `windows`, the windows the save reached, each looked up once,
   and `segments`, the runs of missing chunks it packed and put, of which
   `in_place_segments` in place; `put_bytes`, the bytes of the chunks it
-  put, held chunks not included; `exists_ms`, `pack_ms`, `put_ms`)
+  put, held chunks not included; `exists_ms`, `pack_ms`, `put_ms`; with
+  `ATOM_STORE_SAVE_BATCH_CHUNKS` on, `segments` counts batches, `put_ms`
+  sums the native time of the save's puts, and `exists_ms` is the wait for
+  each lookup, which includes the time it queues behind this save's earlier
+  puts on the sender thread and building the next window's keys)
   and `[OFFLOAD-LOAD-PROF]` (`get_ms`, `unpack_ms`, `retrieve_ms`,
   `effective_gbps`) per operation, with `status=ok` or the failure that ended
   it, whose rate-limited warning names the first Mooncake result code.
