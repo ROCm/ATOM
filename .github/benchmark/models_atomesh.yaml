@@ -997,6 +997,8 @@ models:
       # (router.kv_events: pd_server_atom.sh passes --kv-events and turns the
       # workers' publishers on). Dispatch-only (suite=kv_events); the Store
       # cells keep the mooncake_store cells' pit2-p03 (TW MI355X) limit.
+      # No lmcache c96: its prefill's staged-index RDMA to the decode passed
+      # the 120 s deadline from the 80th request on (run 43698617209).
       kv_events:
         - &glm52_agentic_mcstore_kvev_cpp4_dcp4
           <<: *glm52_agentic_mcstore_cpp4_dcp4
@@ -1034,10 +1036,6 @@ models:
           display_topology: 1P1D-CPP4-DCP4-TP1-TP4-LMCACHE-KVEV
           concurrency: [72]
           router: *kv_events_router
-
-        - <<: *glm52_agentic_lmcache_kvev_cpp4_dcp4
-          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-kvev-1m-c96
-          concurrency: [96]
 
         - <<: *glm52_agentic_lmcache_kvev_cpp4_dcp4
           name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-kvev-1m-c56
