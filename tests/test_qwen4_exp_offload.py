@@ -119,7 +119,9 @@ def test_ple_planes_are_all_allocated_or_none():
 
 def test_decode_image_steps_the_ple_windows_back_to_the_verify_step():
     """A verify leaves each PLE window `history + num_spec` wide; the image of
-    step `s` is the history-wide window starting `s` columns in."""
+    step `s` is the history-wide window starting `s` columns in. Like the GDN
+    conv, it comes from the live slot, also without ReplaySSM, where the SSM
+    comes from the step's slot."""
     builder, cls = _builder()
     builder.num_spec = num_spec = 2
     # (ple_conv_kernel_size - 1) * ngram_size taps; ngram_size - 1 context ids.
@@ -136,7 +138,8 @@ def test_decode_image_steps_the_ple_windows_back_to_the_verify_step():
     src = (conv[1].clone(), ngram[1].clone())
     for step in range(num_spec + 1):
         cls._build_decode_images(
-            builder, [SimpleNamespace(src_slot=1, scratch_slot=3, step=step)]
+            builder,
+            [SimpleNamespace(src_slot=1, scratch_slot=3, step=step, step_slot=2)],
         )
         assert torch.equal(
             conv[3, :, :conv_history], src[0][:, step : step + conv_history]
@@ -183,17 +186,23 @@ def test_ple_turns_a_midstep_readable_transfer_off_and_says_so(
     assert transfer.paged_layout_id.startswith(readable.paged_layout_id + ":")
 
 
-@pytest.mark.parametrize("replayssm", [True, False])
-def test_decode_snapshot_is_the_gdn_parents(one_tp_rank, replayssm):
-    """The PAGE planes carry no ReplaySSM records, so under ReplaySSM a decode
-    image must be built at its verify step, never copied as the slot is."""
+@pytest.mark.parametrize(
+    "replayssm, num_spec, keep",
+    [
+        (True, 1, "snapshot"),
+        (False, 1, "snapshot"),
+        (True, 0, "snapshot"),
+        (False, 0, "settled"),
+    ],
+)
+def test_decode_keep_builds_the_step_image_with_its_ple_windows(
+    one_tp_rank, replayssm, num_spec, keep
+):
+    """Under MTP or ReplaySSM a decode boundary is behind the slot, and the
+    step's image covers the PLE planes too."""
     builder, cls = _builder()
-    builder.replayssm = replayssm
-    transfer = cls.state_transfer(builder)
-    assert transfer.copies
-    assert transfer.decode_snapshot is replayssm
-    parent = GDNAttentionMetadataBuilder.state_transfer(builder)
-    assert transfer.decode_snapshot is parent.decode_snapshot
+    builder.replayssm, builder.num_spec = replayssm, num_spec
+    assert cls.state_transfer(builder).decode_keep == keep
 
 
 def _layout_id(builder, cls):

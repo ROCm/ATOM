@@ -466,18 +466,37 @@ def _qwen38_builder():
     return c
 
 
+@pytest.mark.parametrize("replayssm", [True, False])
 @pytest.mark.parametrize("step", [0, 1, 3])
-def test_a_qwen38_decode_image_resumes_its_ple_windows_at_the_verify_step(step):
+def test_a_qwen38_decode_image_resumes_its_ple_windows_at_the_verify_step(
+    step, replayssm
+):
     """The next verify would read each PLE window `step` columns into the live
     slot; a prefill resumed from the image reads it from column 0. Both reads
-    of the same new tokens have to agree."""
+    of the same new tokens have to agree. Like the GDN conv, PLE stays in the
+    live slot without ReplaySSM too; only the SSM comes from the step's."""
     torch.manual_seed(step)
     c = _qwen38_builder()
+    c.replayssm = replayssm
     r = c.model_runner
-    _decode(c, LIVE, 1, *_step_inputs())
+    if replayssm:
+        _decode(c, LIVE, 1, *_step_inputs())
+    else:
+        _decode_spec(c, 1, *_step_inputs())
     c._build_decode_images(
-        [SimpleNamespace(src_slot=LIVE, scratch_slot=SCRATCH, step=step)]
+        [
+            SimpleNamespace(
+                src_slot=LIVE,
+                scratch_slot=SCRATCH,
+                step=step,
+                step_slot=SPEC_SLOTS[step],
+            )
+        ]
     )
+    if not replayssm:
+        assert torch.equal(
+            r.mamba_v_cache[:, SCRATCH], r.mamba_v_cache[:, SPEC_SLOTS[step]]
+        ), "the SSM is not the step's slot"
 
     def one(value):
         return torch.tensor([value], dtype=torch.int32, device=DEV)

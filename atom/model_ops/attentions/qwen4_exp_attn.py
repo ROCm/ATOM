@@ -35,6 +35,7 @@ import torch
 from atom.kv_transfer.disaggregation.page_region import page_region
 from atom.kv_transfer.disaggregation.types import KVTransferTensors
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
+from atom.model_engine.state_cache import KEEP_NONE, KEEP_SNAPSHOT
 from atom.model_ops.fla_ops.gdn_flydsl import select_policy_for_slot
 from atom.model_ops.qwen4_exp.ops.qsa import (
     qsa_cache_row_layout,
@@ -495,6 +496,12 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         return super()._checkpoint_plane_tensors() + [
             state.unsqueeze(0) for state in self._ple_tensors()
         ]
+
+    def _decode_keep(self) -> str:
+        # The parent keeps none only for planes its build does not rebuild;
+        # `_build_decode_images` rebuilds the PLE windows as well.
+        keep = super()._decode_keep()
+        return KEEP_SNAPSHOT if keep == KEEP_NONE else keep
 
     def _build_decode_images(self, ops) -> None:
         super()._build_decode_images(ops)

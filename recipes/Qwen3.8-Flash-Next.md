@@ -89,7 +89,7 @@ and draft share the embedding and output head.
 - LMCache offload (`lmcache_offload`, `lmcache_mp`) stores the QSA pages plus
   a checkpoint of the GDN and PLE state.
   With MTP, a decode-step checkpoint is stored as the image of its verify
-  step (under ReplaySSM, MTP's default).
+  step.
   P/D connectors are rejected: they would move the pages without the state.
 - This example covers FP8 with TP1. Pure TP2 is not currently validated;
   it can fail MoE warmup on gfx950 due to an MoE dispatch limitation.
