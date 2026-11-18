@@ -774,7 +774,7 @@ class WritePathTest(unittest.TestCase):
         )
         return caches
 
-    def register(self, conn, kv_caches):
+    def register(self, conn, kv_caches, transfer_tensors=None):
         """Run `register_kv_caches` with the listener stubbed; return its metadata."""
         conn.kv_cache_shape = None
         conn.blocks_per_chunk = None
@@ -784,7 +784,7 @@ class WritePathTest(unittest.TestCase):
         advertised = []
         conn._handshake_listener = lambda metadata, *_rest: advertised.append(metadata)
         conn._start_write_service = lambda: None
-        conn.register_kv_caches(kv_caches)
+        conn.register_kv_caches(kv_caches, transfer_tensors)
         conn._handshake_listener_thread.join(timeout=5)
         return advertised[0]
 
@@ -1663,6 +1663,58 @@ class WritePathTest(unittest.TestCase):
             caches[name].replay_write_pos = None
         with self.assertRaises(ValueError) as caught:
             self.register(conn, caches)
+        self.assertIn("replay_write_pos", str(caught.exception))
+
+    def fabric_registration(self, conn):
+        """Make `conn` register over the fabric: one PAGE region, and buffers
+        whose packed descriptors carry a fabric handle."""
+        types = self.types
+        conn.use_fabric = True
+        conn._verify_kv = False
+
+        def register_local_buffer(ptr, size, device):
+            fields = [b"key", 1, 0, b"bus", ptr, size, 1, b"", 0, 0, b"\x01" * 64]
+            return self.msgpack.packb(fields + [16, b"ppod", 0, size, {}])
+
+        conn.moriio_wrapper.register_local_buffer = register_local_buffer
+        region = types.SimpleNamespace(
+            base_addr=0x10000,
+            total_bytes=8 * 16,
+            unit_bytes=16,
+            semantic_role="mla.kv",
+            reverse_indexed=False,
+        )
+        view = types.SimpleNamespace(device=types.SimpleNamespace(index=0))
+        return types.SimpleNamespace(
+            pages=[types.SimpleNamespace(region=region, view=view)],
+            swa_block_regions=[],
+            num_blocks=8,
+        )
+
+    def test_the_fabric_registers_the_state_rdma_does(self):
+        # ReplaySSM records and cursor included, and the same transfer slots.
+        config = self.types.SimpleNamespace(state_transfer_slots=2)
+        rdma = self.make(producer=True)
+        rdma._config = config
+        rdma_meta = self.register(rdma, self.replay_caches())
+
+        conn = self.make(producer=True)
+        conn._config = config
+        tensors = self.fabric_registration(conn)
+        meta = self.register(conn, self.replay_caches(), tensors)
+        self.assertEqual(list(conn._state_tensors), list(rdma._state_tensors))
+        self.assertEqual(meta.state_slot_bytes, rdma_meta.state_slot_bytes)
+        self.assertEqual(set(meta.state_descs), set(rdma_meta.state_descs))
+        self.assertEqual((meta.num_state_slots, conn._first_transfer_slot), (6, 4))
+        self.assertEqual(rdma._first_transfer_slot, 4)
+
+        caches = self.replay_caches()
+        for name in ("layer_0", "layer_3"):
+            caches[name].replay_write_pos = None
+        conn = self.make(producer=True)
+        tensors = self.fabric_registration(conn)
+        with self.assertRaises(ValueError) as caught:
+            self.register(conn, caches, tensors)
         self.assertIn("replay_write_pos", str(caught.exception))
 
     def test_the_cursor_is_pushed_and_digested_with_the_slot(self):
