@@ -788,7 +788,7 @@ def test_settled_early_owner_keeps_fifo_until_the_head_cannot_allocate(
     monkeypatch.setattr(
         sched.block_manager,
         "can_allocate_memoized",
-        lambda seq: -1 if seq is head else original(seq),
+        lambda seq, **kw: -1 if seq is head else original(seq, **kw),
     )
     sched._prioritize_ready_remote_kv_requests()
     assert list(sched.waiting) == [owner, head]
@@ -820,10 +820,37 @@ def test_a_settled_early_owner_behind_a_runnable_head_does_not_rebuild_waiting(
     monkeypatch.setattr(
         sched.block_manager,
         "can_allocate_memoized",
-        lambda seq: -1 if seq is head else original(seq),
+        lambda seq, **kw: -1 if seq is head else original(seq, **kw),
     )
     sched._prioritize_ready_remote_kv_requests()
     assert Counting.clears == 1
+    assert list(sched.waiting) == [owner, head]
+
+
+def test_settled_early_owner_passes_a_head_blocked_by_decode_reservation(
+    monkeypatch, seq_factory
+):
+    from test_mixed_budget_consistency import _decode
+
+    sched, _, (head, owner) = _make(monkeypatch, seq_factory, n=2)
+    sched.kv_connector.not_ready_ids = {head.id}
+    sched.schedule()
+    sched.finished_recving_kv_req_ids.append(owner.id)
+    sched.schedule()
+    assert list(sched.waiting) == [head, owner]
+    sched.enable_mixed_prefill_decode = True
+    _decode(sched, 3)
+    limits = sched._prefill_limits()
+    assert limits.reserved_decode_blocks == 1
+    # Leave exactly enough free pages for the head, but not its decode peer.
+    bm = sched.block_manager
+    needed = head.num_blocks
+    while bm.kv.num_free > needed:
+        filler = seq_factory([99] * 4)
+        assert bm.allocate(filler, 0)
+    assert bm.can_allocate_memoized(head) >= 0
+    assert bm.can_allocate_memoized(head, reserved_decode_blocks=1) < 0
+    sched._prioritize_ready_remote_kv_requests()
     assert list(sched.waiting) == [owner, head]
 
 
@@ -841,7 +868,7 @@ def test_a_load_in_flight_ahead_of_the_blocked_head_does_not_hide_it(
     monkeypatch.setattr(
         sched.block_manager,
         "can_allocate_memoized",
-        lambda seq: -1 if seq is head else original(seq),
+        lambda seq, **kw: -1 if seq is head else original(seq, **kw),
     )
     sched.waiting.extend([loading, head, done])
     sched.finished_recving_kv_req_ids = [done.id]

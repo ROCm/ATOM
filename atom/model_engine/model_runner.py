@@ -4114,7 +4114,10 @@ class ModelRunner:
         # continuous batching reorders requests between steps.
         verify_scheduler = getattr(self.drafter, "verify_scheduler", None)
         if verify_scheduler is not None:
-            verify_scheduler.record_ell(batch.req_ids[: batch.total_seqs_num])
+            # Matches the confidence rows admitted by DSparkProposer. Prefill
+            # rows get full-width drafts until their first decode proposal.
+            first = batch.total_seqs_num_prefill if batch.is_mixed else 0
+            verify_scheduler.record_ell(batch.req_ids[first : batch.total_seqs_num])
         return self.tokenID_processor.prepare_draft_ids(batch, draft_token)
 
     def start_capture_profiler(self):

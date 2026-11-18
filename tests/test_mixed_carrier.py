@@ -3,8 +3,6 @@
 
 """The mixed decode view's row checks, and the one mixed carrier both builders use."""
 
-import ast
-import pathlib
 from types import SimpleNamespace
 
 import pytest
@@ -25,12 +23,6 @@ def _mixed_carrier(*args):
     from atom.model_ops.attentions.deepseek_v4_attn import _mixed_carrier as build
 
     return build(*args)
-
-
-_V4_ATTN = (
-    pathlib.Path(__file__).resolve().parents[1]
-    / "atom/model_ops/attentions/deepseek_v4_attn.py"
-)
 
 
 def _batch(n_p=2, n_d=3, num_spec_step=1):
@@ -210,18 +202,6 @@ def test_lm_head_selects_prefill_ends_and_all_decode_tokens(monkeypatch, decode_
     torch.testing.assert_close(actual, expected)
 
 
-def test_whole_batch_and_ubatch_use_the_carrier_helper():
-    fn = "prepare_mixed"
-    """A second hand-built copy is how the two drifted apart before."""
-    tree = ast.parse(_V4_ATTN.read_text(encoding="utf-8"))
-    body = next(
-        n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == fn
-    )
-    src = ast.unparse(body)
-    assert "_mixed_carrier(" in src
-    assert "AttentionMetaData_DSV4(" not in src
-
-
 @pytest.mark.parametrize("num_spec_step", [0, 1])
 def test_prepare_mixed_calls_both_halves_with_their_real_signatures(
     monkeypatch, num_spec_step
@@ -244,12 +224,12 @@ def test_prepare_mixed_calls_both_halves_with_their_real_signatures(
     batch.num_scheduled_tokens = np.array([8, 8, 1, 1, 1], dtype=np.int32)
     calls = {}
 
-    def _stub(name, positions):
+    def _stub(name, positions, metadata):
         sig = inspect.signature(getattr(builder_cls, name))
 
         def run(self, *args, **kwargs):
             calls[name] = sig.bind(self, *args, **kwargs).arguments
-            return SimpleNamespace(), positions
+            return metadata, positions
 
         return run
 
@@ -266,13 +246,16 @@ def test_prepare_mixed_calls_both_halves_with_their_real_signatures(
         lambda self, b: contextlib.nullcontext(),
     )
     monkeypatch.setattr(
-        builder_cls, "prepare_prefill", _stub("prepare_prefill", torch.arange(16))
+        builder_cls,
+        "prepare_prefill",
+        _stub("prepare_prefill", torch.arange(16), _meta([0, 8, 16], [7, 8], 8)),
     )
     monkeypatch.setattr(
-        builder_cls, "stage_decode", _stub("stage_decode", torch.arange(3))
+        builder_cls,
+        "stage_decode",
+        _stub("stage_decode", torch.arange(3), _meta([0, 1, 2, 3], [4, 5, 6], 1)),
     )
     monkeypatch.setattr(builder_cls, "finish_decode", lambda *a: None)
-    monkeypatch.setattr(v4, "_mixed_carrier", lambda *a: SimpleNamespace(args=a))
 
     merged, positions = builder.prepare_mixed(batch, n_p + n_d, p_tokens + n_d)
 
@@ -287,7 +270,11 @@ def test_prepare_mixed_calls_both_halves_with_their_real_signatures(
         1,
     )
     assert positions.numel() == p_tokens + n_d
-    assert merged.args[2:6] == (n_p, n_d, p_tokens, n_d)
+    assert merged.is_mixed
+    assert (merged.num_prefill_tokens, merged.num_decode_tokens) == (p_tokens, n_d)
+    assert merged.cu_seqlens_q.tolist() == [0, 8, 16, 17, 18, 19]
+    assert merged.sampled_token_indices.tolist() == [7, 15, 16, 17, 18]
+    assert merged.state_slot_out.tolist() == [7, 8, 4, 5, 6]
 
 
 def test_mixed_prefill_banks_exist_before_the_first_mixed_step():
@@ -313,27 +300,111 @@ def test_mixed_prefill_banks_exist_before_the_first_mixed_step():
     assert get_bank(builder)[0] == ring[0]
 
 
-def test_runner_builds_the_banks_before_warmup():
-    """Before `_maybe_warmup`, whose memory profile sizes the KV cache."""
-    runner_src = (
-        pathlib.Path(__file__).resolve().parents[1]
-        / "atom/model_engine/model_runner.py"
-    ).read_text(encoding="utf-8")
-    init = next(
-        n
-        for n in ast.walk(ast.parse(runner_src))
-        if isinstance(n, ast.ClassDef) and n.name == "ModelRunner"
+@pytest.mark.parametrize("mixed", [False, True])
+def test_runner_builds_the_banks_before_warmup(monkeypatch, mixed):
+    from unittest.mock import Mock
+
+    from atom.model_engine import model_runner as mr
+    from atom.model_ops.attentions.deepseek_v4_attn import (
+        DeepseekV4AttentionMetadataBuilder as Builder,
     )
-    body = ast.unparse(
-        next(
-            n
-            for n in init.body
-            if isinstance(n, ast.FunctionDef) and n.name == "__init__"
-        )
+    from atom.model_ops.fused_moe import sp_mega_moe
+    from atom.utils import debug_helper
+
+    class WarmupReached(Exception):
+        pass
+
+    def builder(runner=None, *, model_runner=None):
+        obj = Builder.__new__(Builder)
+        obj.model_runner = model_runner
+        return obj
+
+    cfg = SimpleNamespace(
+        hf_config=SimpleNamespace(model_type="deepseek_v4", architectures=["test"]),
+        kv_cache_block_size=4,
+        kv_cache_dtype="bf16",
+        enforce_eager=True,
+        tensor_parallel_size=1,
+        tp_world_size=1,
+        torch_dtype=torch.bfloat16,
+        parallel_config=SimpleNamespace(
+            data_parallel_rank_local=0, data_parallel_size=1
+        ),
+        torch_profiler_dir=None,
+        speculative_config=None,
+        max_num_batched_tokens=8,
+        max_num_seqs=4,
+        max_model_len=16,
+        quant_config=Mock(),
+        enable_tbo=False,
+        enable_mixed_prefill_decode=mixed,
     )
-    built = body.index("build_mixed_prefill_banks()")
-    assert body.index("_init_h2d_publication()") < built
-    assert built < body.index("_maybe_warmup()")
+    monkeypatch.setattr(mr, "set_current_atom_config", lambda _: None)
+    monkeypatch.setattr(mr, "DynamicChunkingWorker", lambda _: None)
+    monkeypatch.setattr(mr, "attn_family", lambda _: None)
+    monkeypatch.setattr(mr, "has_mla_indexer", lambda _: False)
+    monkeypatch.setattr(
+        mr,
+        "get_attn_backend",
+        lambda _: SimpleNamespace(get_builder_cls=lambda: builder),
+    )
+    monkeypatch.setattr(mr, "init_exit_handler", lambda _: None)
+    monkeypatch.setattr(mr, "tokenIDProcessor", lambda *a: None)
+    monkeypatch.setattr(mr, "sampler_from_config", lambda _: None)
+    monkeypatch.setattr(mr, "support_model_arch_dict", {"test": "test"})
+    monkeypatch.setattr(mr, "resolve_obj_by_qualname", lambda _: object)
+    monkeypatch.setattr(mr, "sp_is_enabled", lambda: False)
+    monkeypatch.setattr(mr, "mono_decode_installers", {})
+    monkeypatch.setattr(mr.PPAuxRelay, "build", lambda *a: None)
+    monkeypatch.setattr(mr, "initialize_eplb_runtime", lambda _: None)
+    monkeypatch.setattr(sp_mega_moe, "initialize_sp_mega_moe", lambda *a: None)
+    monkeypatch.setattr(debug_helper, "install_block_forward_hooks", lambda _: 0)
+    monkeypatch.setattr(debug_helper, "maybe_dump_weights_and_exit", lambda _: None)
+    monkeypatch.setattr(torch, "set_default_dtype", lambda _: None)
+    monkeypatch.setattr(torch, "set_default_device", lambda _: None)
+    monkeypatch.setattr(torch.cuda, "Stream", lambda *a: None)
+    monkeypatch.setattr(torch.cuda, "Event", lambda *a: None)
+
+    class Runner(mr.ModelRunner):
+        def _setup_device_and_distributed(self, *args):
+            self.device = torch.device("cpu")
+
+        def _build_and_load_model(self, _):
+            self.model = torch.nn.Identity()
+
+        def allocate_forward_vars(self):
+            self.forward_vars = {"mtp_k": 0}
+
+        def _arm_lossless(self, _):
+            pass
+
+        def _state_pool_names(self):
+            return []
+
+        def _refuse_unrelayed_pp_taps(self, _):
+            pass
+
+        def _init_forward_vars_ring(self):
+            self._fv_ring = [self.forward_vars]
+            self._fv_idx = 0
+
+        def _init_h2d_publication(self):
+            self.h2d_groups = None
+
+        def _maybe_warmup(self):
+            assert self.h2d_groups is None
+            if mixed:
+                bank, owner, groups = (
+                    self.attn_metadata_builder._get_mixed_prefill_bank()
+                )
+                assert bank == self.forward_vars and bank is not self.forward_vars
+                assert owner is None and groups is None
+            else:
+                assert not hasattr(self.attn_metadata_builder, "_mixed_prefill_banks")
+            raise WarmupReached
+
+    with pytest.raises(WarmupReached):
+        Runner(0, cfg)
 
 
 @pytest.mark.parametrize("slots", [1, 2])

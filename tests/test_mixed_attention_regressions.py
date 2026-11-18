@@ -140,6 +140,7 @@ def test_attention_output_reuse_keeps_decode_input_intact(monkeypatch, bf16):
     attention = SimpleNamespace(
         n_local_heads=2,
         head_dim=2,
+        indexer=None,
         _qk_norm_rope=lambda *args: qkn,
         _launch_compressors=lambda x: None,
         _sparse_attention=attend,
@@ -151,6 +152,119 @@ def test_attention_output_reuse_keeps_decode_input_intact(monkeypatch, bf16):
     assert (out.data_ptr() == query.data_ptr()) == bf16
     torch.testing.assert_close(out, (original + 10).reshape(6, 4))
     assert fc.attn_metadata is metadata and ctx.is_prefill
+
+
+@pytest.mark.parametrize("fp4_index", [False, True])
+def test_mixed_projects_opaque_qr_scales_before_slicing(monkeypatch, fp4_index):
+    import atom.models.deepseek_v4 as model
+    from atom.model_ops.v4_kernels.qk_norm_rope_maybe_quant import QKNormRopeOut
+
+    torch.manual_seed(41)
+    rows, split, groups, heads, dim = 9, 5, 2, 2, 4
+    qr = torch.randn(rows, 256)
+    # Exactly the column-major storage q_norm exposes as shape [M, G].
+    logical_scale = torch.rand(rows, groups) + torch.arange(rows)[:, None]
+    scale = logical_scale.T.contiguous().view(rows, groups)
+    weight = torch.randn(heads * dim, 256)
+    keys = torch.randn(64, dim)
+    projected_rows = []
+
+    def project(qr, *, x_scale):
+        n = qr.shape[0]
+        projected_rows.append(n)
+        dequant = qr * x_scale.reshape(groups, n).T.repeat_interleave(128, 1)
+        return dequant @ weight.T
+
+    def quantize(q, *args, **kwargs):
+        # The indexer's output scales, unlike qr_scale, ARE token-major.
+        s = q.abs().amax(-1, keepdim=True).clamp_min(1e-4)
+        return q / s, s
+
+    monkeypatch.setattr(model, "quantize_query", quantize)
+    monkeypatch.setattr(
+        model, "fold_query_scale", lambda w, s, *a, **kw: w * s.squeeze(-1)
+    )
+    indexer = SimpleNamespace(
+        wq_b=project,
+        weights_proj=lambda x: x,
+        n_heads=heads,
+        head_dim=dim,
+        rope_head_dim=0,
+        rotary_emb=SimpleNamespace(cos_cache=None, sin_cache=None),
+        _indexer_fp4=fp4_index,
+        _layout=None,
+        _weights_scale=1,
+        prefix="test",
+    )
+    indexer.forward_pre = model.Indexer.forward_pre.__get__(indexer)
+    indexer.forward_batched = model.Indexer.forward_batched.__get__(indexer)
+
+    def score(q, weights, q_scale):
+        q = q if q_scale is None else q * q_scale
+        logits = torch.einsum("thd,kd->thk", q, keys).relu()
+        return (logits * weights[:, :, None]).sum(1).topk(8).indices
+
+    indexer.score_topk_from = score
+    x = torch.rand(rows, heads)
+    pos = torch.arange(rows)
+    expected = []
+    for sl in (slice(0, split), slice(split, rows)):
+        # Separate forwards get independently packed q_norm scales.
+        packed = logical_scale[sl].T.contiguous().view(-1, groups)
+        expected.append(score(*indexer.forward_pre(x[sl], qr[sl], pos[sl], packed)))
+    projected_rows.clear()
+    metadata = SimpleNamespace(
+        num_prefill_tokens=split,
+        num_decode_tokens=rows - split,
+        prefill_attn_metadata=object(),
+        decode_attn_metadata=object(),
+    )
+    ctx = SimpleNamespace(is_prefill=True, input_ids=pos)
+    fc = SimpleNamespace(context=ctx, attn_metadata=metadata)
+    monkeypatch.setattr(model, "get_forward_context", lambda: fc)
+    selections = []
+
+    def attend(
+        qkn,
+        positions,
+        *,
+        out,
+        idx_q_quant=None,
+        idx_weights=None,
+        idx_q_scale=None,
+        **kw,
+    ):
+        selections.append(
+            model.Indexer.topk(
+                indexer,
+                kw["x"],
+                kw.get("qr"),
+                positions,
+                kw.get("qr_scale"),
+                pre_q_quant=idx_q_quant,
+                pre_weights=idx_weights,
+                pre_q_scale=idx_q_scale,
+            )
+        )
+        out.zero_()
+
+    query = torch.zeros(rows, heads, dim)
+    attention = SimpleNamespace(
+        n_local_heads=heads,
+        head_dim=dim,
+        indexer=indexer,
+        skip_topk=False,
+        _qk_norm_rope=lambda *a: QKNormRopeOut(q_sa=query),
+        _launch_compressors=lambda *a: None,
+        _sparse_attention=attend,
+    )
+    model.DeepseekV4Attention._attn_mixed(
+        attention, metadata, query, query, qr, scale, x, pos
+    )
+    torch.testing.assert_close(
+        torch.cat(selections), torch.cat(expected), rtol=0, atol=0
+    )
+    assert projected_rows == [rows]
 
 
 @pytest.mark.parametrize("decode", [False, True])

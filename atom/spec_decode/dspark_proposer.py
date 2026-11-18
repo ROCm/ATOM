@@ -886,24 +886,30 @@ class DSparkProposer(Drafter):
         with record_function(f"propose_dspark[{label} T={num_draft}]"):
             draft_token_ids, confidence = pass_.run(running_bs, **staged)
         draft_token_ids = draft_token_ids[:scheduled_bs, : self.mtp_k]
-        if confidence is not None:
-            # compute_ell takes its batch size from confidence.shape and zips the
-            # resulting ell against batch.req_ids by position.
-            confidence = confidence[:scheduled_bs]
         # Confidence-scheduled verification. The hardware-aware prefix scheduler
         # consumes the confidence head to pick a per-request verify length
         # ell_r. We compute ell here and stash it; the actual variable-length
         # verification (Level B) is applied downstream by truncating each
         # request's scheduled spec tokens to ell_r, which frees batch capacity
         # instead of the no-op in-block masking of Level A.
-        if self.verify_scheduler is not None and confidence is not None:
-            with record_function(f"dspark_sched[bs={scheduled_bs}]"):
-                self.verify_scheduler.set_last_ell(
-                    self.verify_scheduler.compute_ell(confidence[:, : self.mtp_k])
-                )
-        elif self.verify_scheduler is not None:
-            self.verify_scheduler.set_last_ell(None)
+        self._set_verify_lengths(confidence, attn_metadata, scheduled_bs, self.mtp_k)
         return draft_token_ids
+
+    def _set_verify_lengths(self, confidence, attn_metadata, scheduled_bs, width):
+        if self.verify_scheduler is None:
+            return
+        if confidence is None:
+            self.verify_scheduler.set_last_ell(None)
+            return
+        # The global throughput budget must only include rows whose drafts
+        # will be verified. A mixed step's prefill rows, including final chunks,
+        # keep full-width drafts until they produce a decode proposal.
+        first = attn_metadata.num_prefill_seqs if attn_metadata.is_mixed else 0
+        confidence = confidence[first:scheduled_bs, :width]
+        with record_function(f"dspark_sched[bs={confidence.shape[0]}]"):
+            self.verify_scheduler.set_last_ell(
+                self.verify_scheduler.compute_ell(confidence)
+            )
 
     # ---- separate-draft-model path (Kimi-K3) --------------------------------
 
@@ -1260,10 +1266,5 @@ class DSparkProposer(Drafter):
         with record_function(f"propose_dspark[{label} T={T}]"):
             draft_token_ids, confidence = pass_.run(running_bs, **staged)
 
-        if self.verify_scheduler is not None:
-            self.verify_scheduler.set_last_ell(
-                self.verify_scheduler.compute_ell(confidence[:scheduled_bs, :T])
-                if confidence is not None
-                else None
-            )
+        self._set_verify_lengths(confidence, attn_metadata, scheduled_bs, T)
         return draft_token_ids[:scheduled_bs, :T]

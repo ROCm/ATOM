@@ -2401,6 +2401,13 @@ class DeepseekV4Attention(nn.Module):
         # metadata/is_prefill swap and its restore belong to
         # `_segment_forward_context`, per segment.
         saved_input_ids = ctx.input_ids
+        # q_norm scales can be column-major or padded/shuffled. Their apparent
+        # first dimension is not a token axis: project before splitting them.
+        idx_q_quant = idx_weights = idx_q_scale = None
+        if self.indexer is not None and not self.skip_topk:
+            idx_q_quant, idx_weights, idx_q_scale = self.indexer.forward_pre(
+                x, qr, positions, qr_scale
+            )
         qkn = self._qk_norm_rope(q, kv_pre, positions)
 
         # Each segment writes only its own rows, preserving the other query slice.
@@ -2432,9 +2439,10 @@ class DeepseekV4Attention(nn.Module):
                 self._sparse_attention(
                     qkn.slice_tokens(sl),
                     positions[sl],
+                    idx_q_quant=None if idx_q_quant is None else idx_q_quant[sl],
+                    idx_weights=None if idx_weights is None else idx_weights[sl],
+                    idx_q_scale=None if idx_q_scale is None else idx_q_scale[sl],
                     x=x[sl],
-                    qr=qr[sl],
-                    qr_scale=None if qr_scale is None else qr_scale[sl],
                     out=out[sl],
                 )
 

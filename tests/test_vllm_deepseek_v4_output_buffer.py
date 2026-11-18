@@ -54,6 +54,7 @@ def layer(modules):
     torch.nn.Module.__init__(layer)
     layer.n_local_heads = 2
     layer.head_dim = 2
+    layer.indexer = None
     return layer
 
 

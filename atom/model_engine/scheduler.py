@@ -646,6 +646,8 @@ class ScheduledBatch:
 
     def slice_rows(self, start: int, stop: int) -> ScheduledBatch:
         """A mixed batch's attention segment; transfers/metrics stay on the parent."""
+        if "block_table_rows" not in vars(self):
+            raise ValueError("slice_rows requires mixed-batch row metadata")
         if not 0 <= start <= stop <= self.total_seqs_num:
             raise ValueError(f"invalid batch row slice [{start}:{stop}]")
         known = (
@@ -2509,7 +2511,8 @@ class Scheduler:
         num_scheduled_tokens: list[int] = []
         scheduled_spec_decode_tokens: dict[int, np.ndarray] = {}
 
-        self._prioritize_ready_remote_kv_requests()
+        limits = self._prefill_limits()
+        self._prioritize_ready_remote_kv_requests(limits=limits)
         self._park_ready_offload_partial_prefills()
         # Reclaim aborted heads even when decode protection vetoes Phase 2.
         while self.waiting and self.waiting[0].status == SequenceStatus.ABORTED:
@@ -2524,8 +2527,6 @@ class Scheduler:
                 prefetch(
                     itertools.islice(self.waiting, 0, envs.OFFLOAD_ASYNC_LOOKUP_DEPTH)
                 )
-
-        limits = self._prefill_limits()
 
         # Start tier loads for waiting requests whose lookup answered, on this
         # tick whatever the delayer decides. Before the delayer so a request
@@ -3231,8 +3232,8 @@ class Scheduler:
         # be decoded yet. Re-queue them at the tail (like partial prefills) so
         # they are reconsidered once the head releases them post-postprocess.
         skipped_pp_inflight: list[Sequence] = []
-        mixed_order = tuple(self.running) if num_seqs_prefill else ()
-        decode_candidates = {seq.id for seq in self._decode_candidates(scheduled_seqs)}
+        mixed_order = tuple(self.running) if num_seqs_prefill and admit_decode else ()
+        _pp_block = self._pp_inflight_token_block
         # Seat count and token budget are shared with the prefill rows a mixed
         # batch already placed, hence `num_seqs_prefill +` and the running
         # `num_batched_tokens` (checked before each row, not once up front).
@@ -3247,13 +3248,14 @@ class Scheduler:
             if num_batched_tokens + tokens_per_decode_seq > self.max_num_batched_tokens:
                 break
             seq = self.running.popleft()
-            if seq.id not in decode_candidates:
-                if seq.id in scheduled_seqs:
-                    decode_carryover.append(seq)
-                elif seq.is_partial_prefill:
-                    skipped_partial_prefills.append(seq)
-                else:
-                    skipped_pp_inflight.append(seq)
+            if num_seqs_prefill and seq.id in scheduled_seqs:
+                decode_carryover.append(seq)
+                continue
+            if seq.is_partial_prefill:
+                skipped_partial_prefills.append(seq)
+                continue
+            if _pp_block and seq.id in _pp_block:
+                skipped_pp_inflight.append(seq)
                 continue
             blocked_by_pinned_save = False
             preempted_current = False
@@ -5991,7 +5993,7 @@ class Scheduler:
             seq.status = SequenceStatus.WAITING
             self._mark_offload_load_ready(seq)
 
-    def _prioritize_ready_remote_kv_requests(self) -> None:
+    def _prioritize_ready_remote_kv_requests(self, *, limits=None) -> None:
         """Prioritize completed remote requests before sizing prefill work.
 
         Re-sorts `waiting` in one stable pass, and only on one of two triggers:
@@ -6048,6 +6050,7 @@ class Scheduler:
         # after its completion event has already been consumed.
         head_blocked = False
         if settled_early:
+            limits = self._prefill_limits() if limits is None else limits
             # The head is the first entry Phase 2 would try: it walks past the
             # loads in flight and the settled resumes this pass promotes.
             head = next(
@@ -6062,7 +6065,11 @@ class Scheduler:
                 len(self.running) + self._num_parked_remote_kv >= self.max_num_seqs
             )
             head_blocked = head is not None and (
-                slots_full or self.block_manager.can_allocate_memoized(head) < 0
+                slots_full
+                or self.block_manager.can_allocate_memoized(
+                    head, reserved_decode_blocks=limits.reserved_decode_blocks
+                )
+                < 0
             )
         # A settled early load waiting behind a head that can run stays put.
         if not recving and not head_blocked:

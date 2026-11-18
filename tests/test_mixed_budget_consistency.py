@@ -81,7 +81,7 @@ def test_admissions_share_one_decode_reservation(monkeypatch):
     assert batch.total_seqs_num_prefill == 6
     assert batch.total_seqs_num_decode == 3
     assert limits.call_count == 1
-    assert candidates.call_count == 2  # reservation, then decode execution
+    assert candidates.call_count == 1  # reservation; decode checks popped rows
 
 
 def test_mixed_decode_pass_preserves_partial_prefill_order():
@@ -109,6 +109,29 @@ def test_mixed_decode_pass_preserves_partial_prefill_order():
     batch, _ = sched.schedule()
     assert batch.req_ids == [partials[0].id, new.id]
     assert list(sched.running) == [*partials, new]
+
+
+@pytest.mark.parametrize("prefill", [False, True])
+def test_mixed_off_does_not_scan_decode_candidates_or_snapshot_running(prefill):
+    from collections import deque
+
+    class NoSnapshot(deque):
+        def __iter__(self):
+            raise AssertionError("mixed-off scheduling must not scan running")
+
+    sched = Scheduler(
+        MockConfig(num_kvcache_blocks=100, max_num_seqs=8, max_num_batched_tokens=16)
+    )
+    decode = _decode(sched, 3)
+    if prefill:
+        new = Sequence([20] * 4, block_size=4)
+        sched.add(new)
+    sched.running = NoSnapshot(sched.running)
+    # Call the scheduling phase directly: outer metrics may walk running.
+    sched._tick_cost = 0
+    sched._tick_cost_limit = float("inf")
+    batch, _ = sched._schedule()
+    assert batch.req_ids == ([new.id] if prefill else [decode.id])
 
 
 @pytest.mark.parametrize("paged_state", [False, True])

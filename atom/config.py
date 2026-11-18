@@ -3661,6 +3661,11 @@ class Config:
         # (is this config affected, what it is, why it cannot run mixed)
         refusals = [
             (
+                envs.ATOM_SPEC_LOSSLESS_SAMPLING,
+                "ATOM_SPEC_LOSSLESS_SAMPLING",
+                "lossless draft staging does not support mixed batches",
+            ),
+            (
                 self.enable_tbo or self.enable_tbo_decode,
                 "TBO",
                 "mixed microbatch splitting is not enabled; disable both TBO modes",

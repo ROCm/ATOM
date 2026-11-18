@@ -76,13 +76,16 @@ delayer whether this tick allows prefill. It then selects work in three phases:
    their completion; ready offload resumes retain their existing allocations.
    Local checkpoint waiters permit a bounded scan for independent work and
    retain their relative FIFO order. See the [delayer settings](environment_variables.md#prefill-delayer-tpdcp-and-dp-attention).
-3. If no prefill was selected, schedule decode from `running`. `can_append`
+3. If no prefill was selected, or mixed prefill/decode is enabled, schedule
+   decode from `running` within the remaining token and request budgets. `can_append`
    checks extension capacity; pressure can preempt a running request back to
    `waiting`. `may_append` reserves the selected tokens, including speculative
    tokens when enabled. Partial prefills skipped by the delayer return to the
    tail of `running`.
 
-Prefill batches return without decode mixing. A waiting cancellation is removed
+By default, prefill batches return without decode mixing. With
+`--enable-mixed-prefill-decode`, admitted decode rows follow the prefill rows in
+the same batch. A waiting cancellation is removed
 on the abort event rather than waiting for admission to reach it. In-flight
 transfers retain their resources until their terminal notification; running
 cancellations finish through postprocess.
@@ -828,8 +831,9 @@ def num_tokens(self, value):
 
 `--enable-mixed-prefill-decode` packs a batch as `[prefill | decode]`.
 The feature requires chunked prefill and supports DSpark.
-TBO, PCP, DCP, EPLB, TR_HYBRID graph modes, other speculative methods, and
-speculative decoding with pipeline parallelism are rejected at startup.
+TBO, PCP, DCP, EPLB, TR_HYBRID graph modes, other speculative methods,
+`ATOM_SPEC_LOSSLESS_SAMPLING`, and speculative decoding with pipeline parallelism
+are rejected at startup.
 Expert parallelism alone does not enable EPLB.
 
 ### Scheduling
@@ -852,9 +856,11 @@ including completed prefills waiting for their first decode.
 
 ### Attention execution
 
-Dense projection, QK normalization, RoPE, and the output projection run on
-the combined token tensor. The attention tail dispatches the prefill and
-decode segments to their respective compressors, indexer, and sparse kernels.
+Dense and indexer projections, QK normalization, RoPE, and the output projection
+run on the combined token tensor. The indexer consumes the intact quantized
+Q-latent scale layout before its token-major outputs are sliced. The attention
+tail dispatches the prefill and decode segments to their respective compressors,
+indexer scoring, and sparse kernels.
 The combined QK/RoPE kernel fuses decode SWA stores. Prefill tokens carry a
 negative store mask, so their window is written only after prefill attention
 has consumed the preceding chunk's KV.
@@ -868,6 +874,10 @@ The V4 builder passes resolved rejection counts explicitly to decode
 preparation, which uses the common context rollback helper. The V4 carrier
 owns segment boundaries and a sampled-token row map shared by the LM head,
 draft verification, and anchor settlement; Context does not duplicate them.
+
+DSpark confidence scheduling on a mixed step computes and records verify lengths
+only for decode requests. Prefill rows do not consume the decode throughput
+budget; their drafts retain full width until their first decode proposal.
 
 V4 owns separate publication banks for prefill metadata and decode metadata.
 Each bank has its own host sources, device destinations, and H2D ownership.

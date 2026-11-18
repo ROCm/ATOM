@@ -156,6 +156,18 @@ def _bind():
     _FakeConfig._validate_mixed_prefill_decode = Config._validate_mixed_prefill_decode
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_lossless_sampling_is_refused_only_with_mixed(monkeypatch, enabled):
+    _bind()
+    monkeypatch.setenv("ATOM_SPEC_LOSSLESS_SAMPLING", "1")
+    config = _FakeConfig(enabled=enabled, spec=_spec())
+    if enabled:
+        with pytest.raises(ValueError, match="ATOM_SPEC_LOSSLESS_SAMPLING"):
+            config._validate_mixed_prefill_decode()
+    else:
+        config._validate_mixed_prefill_decode()
+
+
 def test_validator_runs_against_a_real_config_surface():
     """The regression: it read an attribute Config does not have."""
     _bind()
