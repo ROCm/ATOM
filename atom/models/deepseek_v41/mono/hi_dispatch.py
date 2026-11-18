@@ -145,7 +145,7 @@ class HiDraftModel(MonoDraftModel):
         hook = self.hi
         width = self.model.block_size if num_draft is None else num_draft
         requests = input_ids.numel()
-        if hook.draft_serves(requests, width):
+        if self.model.draft_kv_dtype != "fp8" and hook.draft_serves(requests, width):
             # the block draft on the hi path: its ids are ``head_and_sample``'s
             metadata = get_forward_context().attn_metadata
             hook.draft_run(

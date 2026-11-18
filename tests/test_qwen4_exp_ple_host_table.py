@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from conftest import atom_config_double
 from safetensors import safe_open
 from safetensors.torch import save_file
 
@@ -22,6 +23,7 @@ from atom.model_ops.engram import host_memory
 from atom.model_ops.qwen4_exp.ple_host_table import HostTableHooks, PleHostTable
 from atom.rollout.memory_manager import MemoryManagerMixin
 from atom.rollout.weight_updater import WeightUpdaterMixin
+from atom.utils.selector import Family
 
 DIM = 160
 SHARD_ROWS = 37
@@ -205,6 +207,7 @@ class _Embedding(HostTableHooks, torch.nn.Module):
 
 def _runner(model, device="cpu"):
     runner = MemoryManagerMixin()
+    runner._init_memory_manager()
     runner.model, runner.device, runner.label = model, torch.device(device), "ple"
     runner.enforce_eager = True
     return runner
@@ -417,12 +420,15 @@ class _Model(torch.nn.Module):
 def _updater(model, device="cpu"):
     class _Updater(WeightUpdaterMixin):
         label, rank, world_size = "ple", 0, 1
+        config = atom_config_double()
+        attn_family = Family.MHA
 
         def clear_kv_cache(self):
             pass
 
     updater = _Updater()
     updater.model, updater.device = model, torch.device(device)
+    updater._init_weight_updater()
     return updater
 
 
@@ -467,7 +473,8 @@ def test_an_update_waits_for_the_lookups_once_before_any_row(
     fake_pin, monkeypatch, fail_at
 ):
     """The rows are written from the host, after one device-wide wait per
-    update for the lookups of the step that ended -- not one per shard."""
+    update for the lookups of the step that ended -- not one per shard. A
+    sync's completion may wait again, for its writes, once the rows are in."""
     fake_pin.fail_at = fail_at
     old, new = _table(), _table().neg()
     model = _Model()
@@ -488,8 +495,9 @@ def test_an_update_waits_for_the_lookups_once_before_any_row(
         waits.clear()
         shards = _sync_tensors(after, torch.ones(4, 4), True)[:NUM_SHARDS]
         assert updater.update_weights(shards) == NUM_SHARDS
-        assert [device for device, _ in waits] == [torch.device("cuda")]
+        assert waits and {device for device, _ in waits} == {torch.device("cuda")}
         assert _bitwise_equal(waits[0][1], before[ids])
+        assert all(_bitwise_equal(seen, after[ids]) for _, seen in waits[1:])
         assert _bitwise_equal(rows(), after[ids])
 
 

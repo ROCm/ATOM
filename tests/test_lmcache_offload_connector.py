@@ -33,7 +33,7 @@ except ModuleNotFoundError:
     _torch_stub = types.ModuleType("torch")
     sys.modules["torch"] = _torch_stub
 
-from conftest import MockConfig
+from conftest import MockConfig, with_min_load
 
 from atom.kv_transfer.disaggregation import (
     ConnectorCompletion,
@@ -51,7 +51,11 @@ from atom.kv_transfer.disaggregation.types import (
 from atom.kv_transfer.offload import _block_gpu_connector
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
-from atom.kv_transfer.offload._offload_common import OffloadSchedulerMixin
+from atom.kv_transfer.offload._offload_common import (
+    OffloadSchedulerMixin,
+    SaveLifecycle,
+    wait_save_fence,
+)
 from atom.kv_transfer.offload.dense.connector import (
     DenseOffloadConnector,
     DenseOffloadScheduler,
@@ -90,15 +94,20 @@ from atom.kv_transfer.offload.hybrid.kimi_k3.state_tier import (
     StateOffloadTier,
     _JointPark,
 )
-from atom.kv_transfer.offload.hybrid.qwen.connector import QwenOffloadScheduler
+from atom.kv_transfer.offload.hybrid.qwen.connector import (
+    QwenOffloadConnector,
+    QwenOffloadScheduler,
+)
 from atom.kv_transfer.offload.metadata import (
     ATOMRawBytesLMCacheMetadata,
     LMCacheOffloadMetadata,
     LMCacheReqMeta,
+    SaveSpec,
     SlotLoadSpec,
     SlotSaveSpec,
 )
 from atom.model_engine.block_manager import BlockManager
+from atom.model_engine.early_load import EarlyLoadState
 from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import OffloadJointRecord, SequenceStatus
 from atom.sampling_params import SamplingParams
@@ -418,9 +427,11 @@ def _install_fake_fused_chunk_major(codec: DenseKVByteCodec) -> None:
 
 def _registration_connector() -> LMCacheOffloadConnector:
     connector = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
-    connector._config = SimpleNamespace(
-        kv_transfer_config={},
-        kv_cache_block_size=4,
+    connector._config = with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={},
+            kv_cache_block_size=4,
+        )
     )
     connector.block_size = 4
     connector.chunk_size = None
@@ -434,10 +445,12 @@ def _registration_connector() -> LMCacheOffloadConnector:
 
 def _dense_registration_connector() -> DenseOffloadConnector:
     connector = DenseOffloadConnector.__new__(DenseOffloadConnector)
-    connector._config = SimpleNamespace(
-        kv_transfer_config={},
-        kv_cache_block_size=4,
-        decode_context_parallel_size=1,
+    connector._config = with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={},
+            kv_cache_block_size=4,
+            decode_context_parallel_size=1,
+        )
     )
     connector.block_size = 4
     connector.virtual_block_size = 4
@@ -1269,6 +1282,9 @@ def test_staged_pipeline_allocates_on_first_consumer_stream(
         def record(self, stream):
             trace.append(("record", self.name, stream.name))
 
+        def synchronize(self):
+            trace.append(("host_wait", self.name))
+
     class _StreamContext:
         def __init__(self, state, stream):
             self.state = state
@@ -1284,6 +1300,9 @@ def test_staged_pipeline_allocates_on_first_consumer_stream(
             self.state.current_stream = None
 
     class _FakeState:
+        def begin_transfer(self):
+            pass
+
         def __init__(self):
             self.current_stream = None
             self.staging_buffer = SimpleNamespace(
@@ -1366,7 +1385,13 @@ def test_staged_pipeline_skips_the_handshake_on_a_shared_stream(shared_stream):
         def record(self, stream):
             calls.append(("record", self.name))
 
+        def synchronize(self):
+            calls.append(("host_wait", self.name))
+
     class _FakeState:
+        def begin_transfer(self):
+            pass
+
         def __init__(self):
             self.staging_buffer = SimpleNamespace(
                 tensor=None,
@@ -1441,7 +1466,13 @@ def _exception_pipeline(monkeypatch, direction: str, *, failed_stream: str | Non
         def record(self, stream) -> None:
             self.record_calls += 1
 
+        def synchronize(self) -> None:
+            pass
+
     class _FakeState:
+        def begin_transfer(self):
+            pass
+
         def __init__(self) -> None:
             self.pack_stream = _FakeStream("pack")
             self.copy_stream = _FakeStream("copy")
@@ -1632,6 +1663,9 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
     monkeypatch.setattr(connector, "_ensure_staging_buffer", _ensure_staging_buffer)
 
     class _FakeState:
+        def begin_transfer(self):
+            pass
+
         def __init__(self) -> None:
             # Real streams and events, not doubles: the connector hands these
             # to `torch.cuda.stream()` and to `Stream.wait_event`, which read a
@@ -2060,12 +2094,14 @@ def test_scheduler_alignment_uses_dcp_hash_blocks_and_lmcache_chunks(monkeypatch
         lambda _config: SimpleNamespace(chunk_size=24),
     )
     monkeypatch.setattr(offcfg, "build_lmcache_metadata", lambda *_args: object())
-    config = SimpleNamespace(
-        kv_transfer_config={},
-        kv_cache_block_size=4,
-        decode_context_parallel_size=2,
-        state_checkpoint_interval_tokens=16,
-        tensor_parallel_size=1,
+    config = with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={},
+            kv_cache_block_size=4,
+            decode_context_parallel_size=2,
+            state_checkpoint_interval_tokens=16,
+            tensor_parallel_size=1,
+        )
     )
 
     sched = LMCacheOffloadConnectorScheduler(config)
@@ -2082,12 +2118,14 @@ def test_scheduler_snaps_checkpoint_interval_before_sidecar_cadence(monkeypatch)
         lambda _config: SimpleNamespace(chunk_size=24),
     )
     monkeypatch.setattr(offcfg, "build_lmcache_metadata", lambda *_args: object())
-    config = SimpleNamespace(
-        kv_transfer_config={},
-        kv_cache_block_size=4,
-        decode_context_parallel_size=2,
-        state_checkpoint_interval_tokens=25,
-        tensor_parallel_size=1,
+    config = with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={},
+            kv_cache_block_size=4,
+            decode_context_parallel_size=2,
+            state_checkpoint_interval_tokens=25,
+            tensor_parallel_size=1,
+        )
     )
 
     sched = LMCacheOffloadConnectorScheduler(config)
@@ -2104,12 +2142,14 @@ def test_zero_checkpoint_interval_keeps_terminal_alignment(monkeypatch):
         lambda _config: SimpleNamespace(chunk_size=24),
     )
     monkeypatch.setattr(offcfg, "build_lmcache_metadata", lambda *_args: object())
-    config = SimpleNamespace(
-        kv_transfer_config={},
-        kv_cache_block_size=4,
-        decode_context_parallel_size=2,
-        state_checkpoint_interval_tokens=0,
-        tensor_parallel_size=1,
+    config = with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={},
+            kv_cache_block_size=4,
+            decode_context_parallel_size=2,
+            state_checkpoint_interval_tokens=0,
+            tensor_parallel_size=1,
+        )
     )
 
     sched = LMCacheOffloadConnectorScheduler(config)
@@ -2123,11 +2163,13 @@ def test_dsv4_scheduler_invalid_lmcache_config_fails_fast(monkeypatch):
         raise ValueError("invalid LMCache storage")
 
     monkeypatch.setattr(offcfg, "build_lmcache_config", invalid_config)
-    config = SimpleNamespace(
-        kv_transfer_config={},
-        kv_cache_block_size=4,
-        decode_context_parallel_size=2,
-        tensor_parallel_size=1,
+    config = with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={},
+            kv_cache_block_size=4,
+            decode_context_parallel_size=2,
+            tensor_parallel_size=1,
+        )
     )
 
     with pytest.raises(ValueError, match="invalid LMCache storage"):
@@ -2145,11 +2187,13 @@ def test_dsv4_scheduler_invalid_lmcache_metadata_fails_fast(monkeypatch):
         raise ValueError("invalid LMCache TP geometry")
 
     monkeypatch.setattr(offcfg, "build_lmcache_metadata", invalid_metadata)
-    config = SimpleNamespace(
-        kv_transfer_config={},
-        kv_cache_block_size=4,
-        decode_context_parallel_size=2,
-        tensor_parallel_size=1,
+    config = with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={},
+            kv_cache_block_size=4,
+            decode_context_parallel_size=2,
+            tensor_parallel_size=1,
+        )
     )
 
     with pytest.raises(ValueError, match="invalid LMCache TP geometry"):
@@ -2162,11 +2206,13 @@ def test_dsv4_scheduler_rejects_fractional_lmcache_chunk(monkeypatch):
         "build_lmcache_config",
         lambda _config: SimpleNamespace(chunk_size=24.5),
     )
-    config = SimpleNamespace(
-        kv_transfer_config={},
-        kv_cache_block_size=4,
-        decode_context_parallel_size=2,
-        tensor_parallel_size=1,
+    config = with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={},
+            kv_cache_block_size=4,
+            decode_context_parallel_size=2,
+            tensor_parallel_size=1,
+        )
     )
 
     with pytest.raises(ValueError, match="LMCache chunk size must be an integer"):
@@ -2178,9 +2224,11 @@ def test_dsv4_scheduler_rejects_fractional_lmcache_chunk(monkeypatch):
     [LMCacheOffloadConnector, LMCacheOffloadConnectorScheduler],
 )
 def test_unknown_kv_role_fails_fast(connector_cls):
-    config = SimpleNamespace(
-        kv_transfer_config={"kv_role": "unknown"},
-        kv_cache_block_size=4,
+    config = with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={"kv_role": "unknown"},
+            kv_cache_block_size=4,
+        )
     )
 
     with pytest.raises(ValueError, match="kv_role"):
@@ -2442,7 +2490,11 @@ def test_engine_core_dispatches_idle_lookup_unpin_metadata(monkeypatch):
 
     core = EngineCore.__new__(EngineCore)
     core.kv_transfer_enabled = True
-    core.scheduler = SimpleNamespace(kv_connector=_Connector())
+    core.scheduler = SimpleNamespace(
+        kv_connector=_Connector(),
+        _publish_state_loads=lambda: None,
+        _publish_state_stores=lambda: None,
+    )
     core.runner_mgr = SimpleNamespace(
         call_func=lambda name, value: dispatched.append((name, value))
     )
@@ -3587,6 +3639,7 @@ def test_tp_cross_generation_reports_do_not_clear_or_commit_until_matched():
     boundary_hash = boundary.slot_save_spec.boundary_block_hash
     aggregator = KVOutputAggregator(world_size=2)
     host = Scheduler.__new__(Scheduler)
+    host._early_load = EarlyLoadState()
     host.kv_connector = sched
     host.deferred_free_blocks = {}
     host.finished_recving_kv_req_ids = []
@@ -3681,6 +3734,7 @@ def test_collapsed_sidecar_and_save_completion_clears_page_inflight():
     sched._save_inflight["723"] = {prior_operation}
     boundary_operation = sched.build_connector_meta().requests[0].save_operation
     host = Scheduler.__new__(Scheduler)
+    host._early_load = EarlyLoadState()
     host.kv_connector = sched
     host.deferred_free_blocks = {}
     host.finished_recving_kv_req_ids = []
@@ -3744,6 +3798,8 @@ def test_aborted_parked_load_defers_owned_resources_until_terminal(
     seq = SimpleNamespace(
         id=729,
         status=SequenceStatus.ABORTED,
+        offload_loaded=False,
+        offload_load_failed=False,
         block_table=[10, 11],
         has_per_req_cache=True,
         state_slot=3,
@@ -3769,6 +3825,8 @@ def test_aborted_parked_load_defers_owned_resources_until_terminal(
         value.state_slot = -1
 
     host = Scheduler.__new__(Scheduler)
+
+    host._early_load = EarlyLoadState()
     host._inflight_prefix_wait = {}
     host.kv_connector = _Connector()
     host.block_manager = SimpleNamespace(deallocate=deallocate)
@@ -3811,6 +3869,8 @@ def test_aborted_parked_load_consumes_already_queued_terminal(queued_field):
     seq = SimpleNamespace(
         id=731,
         status=SequenceStatus.ABORTED,
+        offload_loaded=False,
+        offload_load_failed=False,
         block_table=[12, 13],
         has_per_req_cache=True,
         state_slot=4,
@@ -3836,6 +3896,8 @@ def test_aborted_parked_load_consumes_already_queued_terminal(queued_field):
         value.state_slot = -1
 
     host = Scheduler.__new__(Scheduler)
+
+    host._early_load = EarlyLoadState()
     host._inflight_prefix_wait = {}
     host.kv_connector = _Connector()
     host.block_manager = SimpleNamespace(deallocate=deallocate)
@@ -3910,6 +3972,8 @@ def test_abort_cleans_load_whose_terminal_was_already_consumed(
         value.state_slot = -1
 
     host = Scheduler.__new__(Scheduler)
+
+    host._early_load = EarlyLoadState()
     host._inflight_prefix_wait = {}
     host.kv_connector = _Connector()
     host.block_manager = SimpleNamespace(
@@ -3961,6 +4025,8 @@ def test_consume_failed_remote_kv_does_not_repeat_terminal_callback():
             calls.append(req_id)
 
     host = Scheduler.__new__(Scheduler)
+
+    host._early_load = EarlyLoadState()
     host.kv_connector = _Connector()
     host.failed_recving_kv_req_ids = [seq.id]
     host._num_parked_remote_kv = 0
@@ -4098,6 +4164,7 @@ def test_tp_partial_sidecar_completion_never_commits():
     save_operation = meta.requests[0].save_operation
     boundary_hash = meta.requests[0].slot_save_spec.boundary_block_hash
     host = Scheduler.__new__(Scheduler)
+    host._early_load = EarlyLoadState()
     host.kv_connector = sched
     host.deferred_free_blocks = {}
     aggregator = KVOutputAggregator(world_size=2)
@@ -4158,6 +4225,7 @@ def test_tp_sidecar_failure_prevents_commit_after_all_workers_terminal():
     save_operation = meta.requests[0].save_operation
     boundary_hash = meta.requests[0].slot_save_spec.boundary_block_hash
     host = Scheduler.__new__(Scheduler)
+    host._early_load = EarlyLoadState()
     host.kv_connector = sched
     host.deferred_free_blocks = {}
     aggregator = KVOutputAggregator(world_size=2)
@@ -5112,6 +5180,7 @@ def test_chunked_prefill_save_uses_computed_frontier_and_serializes_inflight(
     pending_send = {str(seq.id)}
     freed = []
     engine_sched = Scheduler.__new__(Scheduler)
+    engine_sched._early_load = EarlyLoadState()
     engine_sched.deferred_free_blocks = {seq.id: seq}
     engine_sched.block_manager = SimpleNamespace(deallocate=freed.append)
     engine_sched.kv_connector = SimpleNamespace(
@@ -5214,6 +5283,8 @@ def test_finished_saving_releases_deferred_free_with_string_req_id():
             return str(seq.id) in self.inflight
 
     sched = Scheduler.__new__(Scheduler)
+
+    sched._early_load = EarlyLoadState()
     sched.block_manager = _BlockManager()
     sched.kv_connector = _Connector()
     seq = SimpleNamespace(id=9)
@@ -5243,6 +5314,8 @@ def test_producer_waits_for_send_and_final_save(send_first):
             return self.pending_save or self.pending_send
 
     host = Scheduler.__new__(Scheduler)
+
+    host._early_load = EarlyLoadState()
     host.kv_connector = Connector()
     freed = []
     host.block_manager = SimpleNamespace(deallocate=lambda seq: freed.append(seq.id))
@@ -5261,6 +5334,7 @@ def test_producer_waits_for_send_and_final_save(send_first):
 
 def test_finished_recv_matches_string_req_id():
     sched = Scheduler.__new__(Scheduler)
+    sched._early_load = EarlyLoadState()
     sched.finished_recving_kv_req_ids = ["123"]
     # kv_events disabled: skip the remote-store recording path so this test
     # only exercises string/int req_id matching in _pop_req_id.
@@ -5826,7 +5900,11 @@ def _idle_engine(meta: LMCacheOffloadMetadata):
     )
     return SimpleNamespace(
         kv_transfer_enabled=True,
-        scheduler=SimpleNamespace(kv_connector=connector),
+        scheduler=SimpleNamespace(
+            kv_connector=connector,
+            _publish_state_loads=lambda: None,
+            _publish_state_stores=lambda: None,
+        ),
         runner_mgr=_RecordingRunnerMgr(),
         pp_transport=_RecordingPPTransport(),
     )
@@ -5874,6 +5952,22 @@ def test_dispatch_skips_metadata_with_no_work_at_all():
 
     assert engine.runner_mgr.calls == []
     assert engine.pp_transport.sent == []
+
+
+def test_pp_head_shutdown_drain_publishes_no_state_work():
+    from atom.model_engine.pp_engine_core import PPEngineCoreProc
+
+    published = []
+    engine = _idle_engine(LMCacheOffloadMetadata())
+    engine.scheduler._publish_state_loads = lambda: published.append("loads")
+    engine.scheduler._publish_state_stores = lambda: published.append("stores")
+    engine._dispatch_connector_only_batch = lambda batch: None
+
+    PPEngineCoreProc._dispatch_idle_offload_work(engine, dispatch_new=False)
+    assert published == []
+
+    PPEngineCoreProc._dispatch_idle_offload_work(engine)
+    assert published == ["loads", "stores"]
 
 
 def test_multi_metadata_exposes_sub_meta_unpins():
@@ -5925,6 +6019,104 @@ def _k3_scheduler() -> KimiK3OffloadScheduler:
     return s
 
 
+def test_only_k3_scales_the_default_pending_saves_with_pp(monkeypatch):
+    monkeypatch.delenv("OFFLOAD_MAX_PENDING_SAVES", raising=False)
+    monkeypatch.setenv("OFFLOAD_COPY_WORKERS", "1")
+    monkeypatch.setattr(DenseOffloadScheduler, "__init__", lambda self, config: None)
+    config = SimpleNamespace(kv_transfer_config={}, pipeline_parallel_size=8)
+    monkeypatch.setattr(offcfg, "select_offload_layout", lambda _config: "kimi_k3")
+    assert KimiK3OffloadScheduler(config)._max_pending_saves == 16
+    monkeypatch.setattr(offcfg, "select_offload_layout", lambda _config: "qwen")
+    assert QwenOffloadScheduler(config)._max_pending_saves == 2
+
+
+def _pp2_stage_tier(monkeypatch, cls, layout, stage, spec):
+    """`cls`'s worker tier for one stage of a PP2 x TP2 run, at TP rank 0."""
+    import torch
+
+    from atom.kv_transfer.offload.hybrid.kimi_k3 import connector as k3_connector
+
+    monkeypatch.setattr(offcfg, "select_offload_layout", lambda _config: layout)
+    monkeypatch.setattr(offcfg, "build_lmcache_config", lambda _kvc: None)
+    monkeypatch.setattr(
+        offcfg, "build_lmcache_metadata", lambda *_: SimpleNamespace(model_name="m")
+    )
+    monkeypatch.setattr(k3_connector, "StagedTransfer", lambda *_a, **_k: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.dist.parallel_state",
+        SimpleNamespace(
+            get_tp_group=lambda: SimpleNamespace(world_size=2, rank_in_group=0)
+        ),
+    )
+    image = spec.image_bytes if spec else 1 << 20
+    backend = SimpleNamespace(
+        model_runner=SimpleNamespace(
+            state_runtime=SimpleNamespace(checkpoint_spec=spec)
+        ),
+        state_entry_views=lambda _slot: [torch.empty(image, dtype=torch.uint8)],
+        page_unit_views=lambda *_: [],
+    )
+    worker = cls.__new__(cls)
+    worker._config = SimpleNamespace(
+        kv_transfer_config={},
+        pipeline_parallel_size=2,
+        parallel_config=SimpleNamespace(pipeline_parallel_rank=stage),
+    )
+    worker._engine = SimpleNamespace(
+        gpu_connector=SimpleNamespace(
+            device="cpu", release_gpu_staging_after_transfer=False
+        ),
+        storage_manager=None,
+    )
+    worker._state_tier = None
+    worker._build_state_tier(SimpleNamespace(state_backend=backend))
+    return worker._state_tier
+
+
+def test_pp_stages_build_k3_tiers_that_key_apart_and_match_the_engine_cap(
+    monkeypatch,
+):
+    """The 2 MiB and 1 MiB stages pool 2 GiB over a 3 MiB joint image, so both
+    keep 682 images, the cap the engine's index mirrors for the same spec."""
+    from atom.model_engine.state_offload import state_tier_cpu_entries
+
+    monkeypatch.setenv("OFFLOAD_STATE_CPU_SIZE", "1")
+    tiers = []
+    for stage, image in ((0, 2 << 20), (1, 1 << 20)):
+        # what each stage's checkpoint spec gives the tier
+        spec = SimpleNamespace(
+            layout_id="pp2-joint:tier-test",
+            image_bytes=image,
+            pipeline_op_bytes=3 << 20,
+        )
+        tier = _pp2_stage_tier(
+            monkeypatch, KimiK3OffloadConnector, "kimi_k3", stage, spec
+        )
+        tiers.append(tier)
+        assert tier.codec._max_entries == state_tier_cpu_entries(
+            spec, SimpleNamespace(pipeline_parallel_size=2)
+        )
+    for tier in tiers:
+        tier.shutdown()
+    assert [t.codec._max_entries for t in tiers] == [682, 682]
+    # Stage 1's TP rank 0 is worker 2 of 4, not stage 0's worker 0.
+    assert [(t.codec._worker_id, t.codec._world_size) for t in tiers] == [
+        (0, 4),
+        (2, 4),
+    ]
+
+
+def test_a_qwen_pp_worker_logs_the_pipeline_refusal(monkeypatch, caplog):
+    with caplog.at_level(logging.INFO, logger="atom"):
+        tier = _pp2_stage_tier(monkeypatch, QwenOffloadConnector, "qwen", 0, None)
+    assert tier is None
+    assert "layout 'qwen' keeps no state tier at pipeline_parallel_size=2" in (
+        caplog.text
+    )
+    assert "layout id" not in caplog.text
+
+
 def _k3_seq(*, hbm: int, joint: int = 0, kv: int = 0, claimed: int = 0):
     return SimpleNamespace(
         id=1,
@@ -5958,6 +6150,7 @@ def test_bounded_saves_are_shared_round_robin_not_head_first():
     s.block_size = 256
     s._do_save = True
     s._do_load = False
+    s._lookup_client = None
     s._reqs_need_recv = {}
     s._lookup_in_step = []
     s._save_tracker = {}
@@ -5997,8 +6190,10 @@ def test_bounded_saves_are_shared_round_robin_not_head_first():
 def test_layout_selection_picks_kimi_k3_for_a_kda_config():
     """K3's paged KV is ordinary dense MLA, so the layout cannot be read off
     the KV shape -- the KDA state is what makes it its own family."""
-    cfg = SimpleNamespace(
-        hf_config=SimpleNamespace(model_type="kimi_linear"), kv_transfer_config={}
+    cfg = with_min_load(
+        SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="kimi_linear"), kv_transfer_config={}
+        )
     )
     assert offcfg.select_offload_layout(cfg) == "kimi_k3"
 
@@ -7825,6 +8020,22 @@ class TestStateLoadsAndStoresRunInSeparateLanes:
             tier.shutdown()
 
 
+@pytest.fixture(autouse=True)
+def _synthetic_stream_operation_completion(monkeypatch):
+    # Synthetic CPU streams model completion via synchronize(). Real streams
+    # keep the actual event fence; its ordering has dedicated contract tests.
+    from atom.kv_transfer.offload import atom_lmcache_staging as staging
+
+    original = staging.fence_submitted_work
+
+    def complete(stream):
+        if hasattr(stream, "cuda_stream"):
+            return original(stream)
+        return stream.synchronize()
+
+    monkeypatch.setattr(staging, "fence_submitted_work", complete)
+
+
 @pytest.mark.parametrize("cache_seed, salt", [(11, "11"), (12, "12"), (-1, "")])
 def test_a_dsv4_prompt_carries_its_media_salt_to_lookup_save_and_load(cache_seed, salt):
     asked = []
@@ -7970,3 +8181,174 @@ class TestAStateStoreWaitsForTheCopyThatFillsItsUnits:
         worker._start_state_stores(SimpleNamespace(state_stores=[(a, [3]), (b, [5])]))
         assert submitted == []
         assert worker._store_failed_no_tier == {a, b}
+
+
+class TestBothSavePathsKeepTheAsyncSaveContract:
+    """The dense KV save and the Kimi-K3 state store keep the contract written
+    out in `_offload_common.py`: one fence per step on the current stream,
+    carried into the save thread and waited on before the source is read, and
+    per save at most one source release and exactly one terminal. The state
+    store's release and failure paths are covered in the two classes above."""
+
+    _Event = TestAStateStoreWaitsForTheCopyThatFillsItsUnits._Event
+
+    @staticmethod
+    def _worker(log):
+        worker = KimiK3OffloadConnector(
+            SimpleNamespace(
+                kv_transfer_config={"kv_role": "offload"},
+                kv_cache_block_size=4,
+                decode_context_parallel_size=1,
+                tensor_parallel_size=1,
+            )
+        )
+        worker.chunk_size = 8
+        stored = []
+
+        class _Engine:
+            gpu_connector = object()
+
+            @staticmethod
+            def store(_tokens, **kwargs):
+                log.append("store")
+                stored.append(kwargs["producer_event"])
+
+        worker._engine = _Engine()
+        terminals = []
+        record = worker._record_store_terminal
+
+        def _record_store_terminal(req, succeeded):
+            terminals.append(succeeded)
+            record(req, succeeded)
+
+        worker._record_store_terminal = _record_store_terminal
+        return worker, stored, terminals
+
+    @staticmethod
+    def _save(req_id=51):
+        return LMCacheReqMeta(
+            req_id=req_id,
+            token_ids=list(range(8)),
+            block_ids=[3],
+            save_spec=SaveSpec(skip_leading_tokens=0),
+            save_operation=SaveOperationId(req_id=req_id, generation=1),
+        )
+
+    @staticmethod
+    def _join(worker):
+        worker._save_executor.shutdown(wait=True)
+        worker._load_executor.shutdown(wait=True)
+
+    def test_each_path_fences_before_it_submits_and_waits_before_it_reads(
+        self, monkeypatch
+    ):
+        log, events, stream = [], [], object()
+
+        def _event():
+            events.append(self._Event(log))
+            return events[-1]
+
+        monkeypatch.setattr(torch.cuda, "Event", _event)
+        monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+        worker, stored, terminals = self._worker(log)
+        submitted = []
+
+        class _Tier:
+            def submit_store(self, *args):
+                log.append("submit_store")
+                submitted.append(args)
+
+        worker._state_tier = _Tier()
+        op = StateStoreOperationId(7, 1)
+        metadata = LMCacheOffloadMetadata()
+        metadata.requests.append(self._save())
+        metadata.state_stores.append((op, [4, 5]))
+        try:
+            worker.start_load_kv(metadata)
+        finally:
+            self._join(worker)
+        state_fence, kv_fence = events
+        assert state_fence.stream is stream and kv_fence.stream is stream
+        assert submitted == [(op, (4, 5), state_fence)]
+        assert stored == [kv_fence]
+        assert log == ["record", "submit_store", "record", "synchronize", "store"]
+        assert terminals == [True]
+
+    def test_a_kv_fence_that_raises_fails_the_save_once_before_it_reads(self):
+        log = []
+        worker, stored, terminals = self._worker(log)
+        req = self._save()
+        try:
+            worker._guard(
+                "save",
+                worker._do_save_req,
+                req,
+                producer_event=self._Event(log, fail=True),
+            )
+            assert worker.get_finished().finished_saving == {req.save_operation}
+            assert worker.get_finished().finished_saving == set()
+        finally:
+            self._join(worker)
+        assert log == ["synchronize"] and stored == []
+        assert terminals == [False]
+
+    def test_a_kv_store_that_raises_reports_one_failed_terminal(self):
+        log = []
+        worker, _stored, terminals = self._worker(log)
+
+        def _store(_tokens, **_kwargs):
+            log.append("store")
+            raise RuntimeError("LocalCPU allocation failed")
+
+        worker._engine.store = _store
+        try:
+            worker._guard(
+                "save",
+                worker._do_save_req,
+                self._save(),
+                producer_event=self._Event(log),
+            )
+        finally:
+            self._join(worker)
+        assert log == ["synchronize", "store"]
+        assert terminals == [False]
+
+    def test_a_state_store_handed_no_fence_fails_before_it_reads(self):
+        with pytest.raises(ValueError):
+            wait_save_fence(None)
+        log = []
+        codec = TestAStateStoreWaitsForTheCopyThatFillsItsUnits._Codec(log)
+        tier = StateOffloadTier(codec)
+        op = StateStoreOperationId(8, 1)
+        try:
+            tier.submit_store(op, (0,), None)
+            tier.drain()
+        finally:
+            tier.shutdown()
+        assert log == []
+        assert tier.take_source_releases() == {op}
+        assert tier.take_store_reports() == (set(), {op})
+
+    @staticmethod
+    def _lifecycle(log):
+        return SaveLifecycle(
+            threading.Lock(),
+            release_source=lambda: log.append("release"),
+            report_terminal=lambda ok: log.append(("terminal", ok)),
+        )
+
+    def test_a_lifecycle_releases_once_and_reports_one_terminal(self):
+        log = []
+        lifecycle = self._lifecycle(log)
+        lifecycle.release_source()
+        lifecycle.release_source()
+        lifecycle.finish(True)
+        lifecycle.finish(False)
+        assert log == ["release", ("terminal", True)]
+
+    def test_a_terminal_with_no_earlier_release_releases_first(self):
+        log = []
+        lifecycle = self._lifecycle(log)
+        lifecycle.finish(False)
+        lifecycle.release_source()
+        assert log == ["release", ("terminal", False)]

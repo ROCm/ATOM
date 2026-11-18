@@ -31,7 +31,6 @@ INDEX_HEADS = TP
 def traces():
     with pytest.MonkeyPatch.context() as patch:
         patch.setenv("ARCH", "gfx950")
-        patch.setenv("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
         return {
             "layer": trace(contract.build_layer(TOKENS, INDEX_HEADS), K4_ABI),
             "dense": trace(contract.build_dense(TOKENS), DENSE_POST_ABI),

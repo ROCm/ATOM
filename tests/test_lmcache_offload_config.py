@@ -23,6 +23,7 @@ def _config():
         kv_cache_block_size=256,
         tensor_parallel_size=4,
         decode_context_parallel_size=2,
+        dcp_config=SimpleNamespace(interleave_size=1),
         speculative_config=SimpleNamespace(
             method="mtp",
             num_speculative_tokens=3,
@@ -566,15 +567,17 @@ def test_a_state_owning_model_keeps_its_own_layout(override):
     assert offcfg.select_offload_layout(config) == "qwen"
 
 
-def test_v41_keeps_the_namespace_hybrid_gave_it(monkeypatch):
-    """V4.1 resolved to `hybrid` before it had a layout of its own, and keeps
-    the namespace native ATOM's tiers were filled under. Its window and
-    candidate-block fields move no namespace here, V4.1's or another model's:
-    only the vLLM plugin, which never had such tiers, hashes them."""
+def test_bf16_v41_keeps_the_namespace_hybrid_gave_it(monkeypatch):
+    """BF16 PAGE bytes retain their historical layout and namespace.
+
+    Window and candidate-block fields do not change this PAGE format.
+    Quantized V4.1 has a separate namespace for its source planes.
+    """
     assert offcfg.PAGE_LAYOUT_VERSION == 3
 
     def namespace(model_type, **fields):
         config = _config()
+        config.kv_cache_dtype = "bf16"
         config.hf_config.model_type = model_type
         for name, value in fields.items():
             setattr(config.hf_config, name, value)
@@ -587,3 +590,38 @@ def test_v41_keeps_the_namespace_hybrid_gave_it(monkeypatch):
     )
     monkeypatch.setattr(offcfg, "select_offload_layout", lambda _config: "hybrid")
     assert v41 == namespace("deepseek_v41", sliding_window=128, candidate_block_size=8)
+
+
+@pytest.mark.parametrize("kv_dtype", ["bf16", "fp8", "fp4"])
+def test_v41_persistent_keys_include_the_page_format(monkeypatch, kv_dtype):
+    from atom.kv_transfer.offload.kv_store import keys as store_keys
+    from atom.kv_transfer.offload.mooncake_store import keys
+    from atom.kv_transfer.offload.mp import deployment
+
+    config = _config()
+    config.kv_cache_dtype = kv_dtype
+    config.hf_config.model_type = "deepseek_v41_text"
+    cfg = _lmcache_config()
+    world_size = offcfg.lmcache_replica_world_size(config)
+    # Old interleaved V4.1 pages used the hybrid PAGE namespace.
+    with monkeypatch.context() as legacy:
+        legacy.setattr(offcfg, "select_offload_layout", lambda _: "hybrid")
+        legacy_page = offcfg.build_page_namespace(config, cfg, world_size)
+    monkeypatch.setattr(offcfg, "build_lmcache_config", lambda _: cfg)
+    monkeypatch.setattr(store_keys, "kv_storage_formats", lambda _: {"gfx": "gfx950"})
+
+    def namespaces():
+        page = offcfg.build_page_namespace(config, cfg, world_size)
+        config.kv_transfer_config = {"kv_connector": "lmcache_mp"}
+        mp = deployment._model_namespace(config)
+        config.kv_transfer_config = {"kv_connector": "mooncake_store"}
+        store = keys.store_namespace(config, cfg.chunk_size)
+        return {"page": page, "lmcache_mp": mp, "mooncake_store": store}
+
+    current = namespaces()
+    with monkeypatch.context() as legacy:
+        legacy.setattr(offcfg, "build_page_namespace", lambda *_: legacy_page)
+        previous = namespaces()
+    # PAGE-only replay has no checkpoint identity to separate versions.
+    for name in current:
+        assert (current[name] == previous[name]) is (kv_dtype == "bf16"), name

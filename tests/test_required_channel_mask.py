@@ -19,11 +19,10 @@ pytest.importorskip("triton", reason="needs the Triton GPU kernel library")
 
 from atom.model_ops.required_channel import (
     DeviceChannel,
-    advance_states,
     advance_states_reference,
-    constrain_logits,
     constrain_logits_reference,
 )
+from atom.model_ops.triton_required_channel import advance_states, constrain_logits
 from atom.sampling_params import UNCONSTRAINED, RequiredChannel
 
 V = 64

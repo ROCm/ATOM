@@ -8,7 +8,13 @@ from torch.profiler import record_function
 
 from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
 from atom.spec_decode.draft_graph import DraftGraph, StagedInput
-from atom.spec_decode.drafter import AuxCaptureSpec, Drafter, _resolve_decoder_layers
+from atom.spec_decode.drafter import (
+    AuxCaptureSpec,
+    Drafter,
+    _resolve_decoder_layers,
+    aux_blocks,
+    pcp_aux_rows,
+)
 from atom.spec_decode.dspark_lossless import DSparkLossless
 from atom.spec_decode.dspark_verify import VerifyScheduler
 from atom.utils import envs
@@ -696,8 +702,10 @@ class DSparkProposer(Drafter):
 
         Called once by the runner right after each target forward, while the
         forward context still holds the TARGET's slot mapping / cu_seqlens.
-        ``model.write_context_kv`` fans the projected context out to the
-        draft's context layers, each of which writes its own storage:
+        The model gets the taps as ``aux_for`` serves them (under PP the
+        leading ones may come joined) and joins them only if its projection
+        needs to. ``model.write_context_kv`` fans the projected context out to
+        the draft's context layers, each of which writes its own storage:
           * V4 / V4.1 (inline drafts): a private rolling target-KV window,
             addressed by position off the live forward context.
           * Kimi-K3 and MiniMax-M3.1 (standalone drafts): a paged pool, at the
@@ -716,6 +724,10 @@ class DSparkProposer(Drafter):
         rows are harmless -- they land on future positions, unread until the
         step that accepts them rewrites them.
 
+        After a PCP row-split prefill the aux hooks hold this rank's stripe of
+        each tap; the stripes go to the model as they are, and it gathers what
+        it needs.
+
         `next_token_ids` is unused: DSpark drafts from aux hidden states.
         """
         del next_token_ids
@@ -724,19 +736,24 @@ class DSparkProposer(Drafter):
         metadata = get_forward_context().attn_metadata
         if metadata is not None and metadata.served_by_round:
             return
-        aux_hidden_states = self.aux_for(hidden_states)
-        if aux_hidden_states is None:
-            return
         forward_context = get_forward_context()
         scheduled_bs = forward_context.context.scheduled_bs
         num_rows = positions.shape[0]
-        # One block when every tap was relayed from earlier PP stages.
-        if len(aux_hidden_states) == 1:
-            main_hidden_all = aux_hidden_states[0][:num_rows]
+        n = hidden_states.shape[0]
+        n_local = pcp_aux_rows(n)
+        if n_local is None:
+            taps, kw = self.aux_for(hidden_states), {}
+            if taps is not None:
+                taps = [h[:num_rows] for h in taps]
         else:
-            main_hidden_all = torch.cat(
-                [h[:num_rows] for h in aux_hidden_states], dim=-1
+            # PCP row-split prefill: hand the model this rank's stripe of each
+            # tap, ungathered.
+            taps = (
+                [b[:n_local] for b in aux_blocks(self)] if self._captures_aux else None
             )
+            kw = {"pcp_num_tokens": min(n, num_rows)}
+        if taps is None:
+            return
         spec = self.model.kv_pool_spec
         if spec is not None and spec.needs_own_ctx_slots(self.config):
             ctx_slots = self.runner.forward_vars.get("draft_ctx_slots")
@@ -756,10 +773,8 @@ class DSparkProposer(Drafter):
             slot_mapping = forward_context.attn_metadata.slot_mapping
             if slot_mapping is not None:
                 slot_mapping = slot_mapping[:num_rows]
-        with record_function(
-            f"draft_kv[bs={scheduled_bs} tok={main_hidden_all.shape[0]}]"
-        ):
-            self.model.write_context_kv(main_hidden_all, positions, slot_mapping)
+        with record_function(f"draft_kv[bs={scheduled_bs} tok={min(n, num_rows)}]"):
+            self.model.write_context_kv(taps, positions, slot_mapping, **kw)
 
     def _propose(
         self,

@@ -410,6 +410,7 @@ pub fn make_descriptor<'a>(
         tokens,
         headers,
         stream: false,
+        carries_media: false,
     }
 }
 
@@ -473,6 +474,7 @@ mod fixture_smoke_tests {
             tokens: Some(&[1, 2, 3]),
             headers: Some(&hm),
             hash_ring: None,
+            carries_media: false,
         };
         let _ = policy.select_worker(&workers, &info).await;
         let calls = policy.calls();
