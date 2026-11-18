@@ -777,6 +777,39 @@ class TestPPLoopPublication:
         assert published == [("shutdown", [stored, removed])]
 
 
+def test_disagg_decode_publishes_each_steps_events():
+    """The disagg decode process owns the KV blocks, so its step override runs
+    under the same step-then-publish as `EngineCore`'s."""
+    from aiter_stub import stubbed_aiter
+
+    with stubbed_aiter():
+        from atom.model_engine.engine_core import DecodeEngineCore
+
+    stored, log, published = TestPPLoopPublication.STORED, [], []
+
+    def schedule():
+        # Still waiting for PrefillDone: returns None, after logging an event.
+        log.append(stored)
+
+    def take_events():
+        events = log[:]
+        log.clear()
+        return events
+
+    scheduler = SimpleNamespace(
+        block_manager=SimpleNamespace(take_events=take_events),
+        kv_event_publisher=SimpleNamespace(publish=published.append),
+        has_requests=lambda: True,
+        schedule=schedule,
+    )
+    scheduler.publish_kv_events = lambda: Scheduler.publish_kv_events(scheduler)
+    core = object.__new__(DecodeEngineCore)
+    core.scheduler = scheduler
+    assert core._process_engine_step() is False
+    assert published == [[stored]]
+    assert log == []
+
+
 # ── Per-DP-rank endpoints ──────────────────────────────────────────────────
 
 

@@ -1659,7 +1659,7 @@ class DecodeEngineCore(EngineCore):
             self._send_block_assignment(seq)
         return False
 
-    def _process_engine_step(self):
+    def _process_engine_step_inner(self):
         """Override: handle None from DecodeScheduler when prefill_waiting is
         non-empty but running is empty (sequences are still being prefilled)."""
         if not self.scheduler.has_requests():
