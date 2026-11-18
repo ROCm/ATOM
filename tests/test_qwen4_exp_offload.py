@@ -14,6 +14,7 @@ pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
 
 from atom.kv_transfer.disaggregation.page_region import page_region
 from atom.kv_transfer.disaggregation.types import KVTransferTensors
+from atom.model_ops.attentions import gdn_attn
 from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadataBuilder
 from atom.model_ops.attentions.pool_layout.entry_arena import (
     EntryField,
@@ -200,16 +201,38 @@ def test_ple_turns_a_midstep_readable_transfer_off_and_says_so(
     ],
 )
 def test_decode_keep_builds_the_step_image_with_its_ple_windows(
-    one_tp_rank, replayssm, num_spec, keep, state_entries
+    one_tp_rank, monkeypatch, replayssm, num_spec, keep, state_entries
 ):
     """Under MTP or ReplaySSM a decode boundary is behind the slot, and the
     step's image covers the PLE planes too: they share GDN's slots, scratch
-    included."""
+    included. Nothing claims decode checkpoints are off."""
+    logged = []
+    monkeypatch.setattr(
+        gdn_attn, "_log_no_decode_checkpoints", lambda: logged.append(True)
+    )
     builder, cls = _builder()
     builder.replayssm, builder.num_spec = replayssm, num_spec
     assert cls.state_transfer(builder).decode_keep == keep
     plan = plan_pools(cls.sub_pool_specs(builder), 1 << 30, max_num_seqs=8)
     assert plan.entries[PLE_STATE_SLOT_CLASS] == state_entries
+    assert not logged
+
+
+def test_a_plane_besides_ple_keeps_no_decode_image(one_tp_rank, monkeypatch):
+    """The step's image rebuilds conv, SSM and PLE; any other plane would be
+    restored as the slot is."""
+    logged = []
+    monkeypatch.setattr(
+        gdn_attn, "_log_no_decode_checkpoints", lambda: logged.append(True)
+    )
+    monkeypatch.setattr(
+        GDNAttentionMetadataBuilder,
+        "_checkpoint_plane_shapes",
+        lambda self: [(8, 1)] * 3,
+    )
+    builder, cls = _builder()
+    assert cls.state_transfer(builder).decode_keep == "none"
+    assert logged
 
 
 def _layout_id(builder, cls):
