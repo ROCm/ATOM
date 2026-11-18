@@ -1,5 +1,8 @@
 # Qwen-3.8 Flash: GPU page fault at the first multi-request prefill batch on gfx1250 (455-CI 2026-11-18)
 
+- Written: 2026-11-18 (Beijing time), 455-CI 2026-11-18 session.
+- Status as of 2026-11-18: open, no fix PR. Owner: mengdie (minmengdie).
+
 ## Environment
 - Image: `rocm/fw-bringup-mlperf:gfx1250-atom-ci455-20261118` (digest `sha256:d17a28d3ea228c67c25fd1d15ae7138162287a7002ba13e2bae3ee33ed14cb69`)
 - ATOM `main@9b2e67b7f6f5841b0d32db9589e989ff52673761`, aiter `main@b1d849ff36907402d7ea6a3483e6f0dafa995aca`. Both include ROCm/ATOM#3225 and ROCm/aiter#7847, the Qwen3.8 gfx1250 fixes and tunings.

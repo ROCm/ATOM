@@ -1,5 +1,8 @@
 # DeepSeek R1: GPU memory fault in `_triton_gather_kv_b_proj` with chunked prefill at concurrency 64 (455-CI 2026-11-14)
 
+- Written: 2026-11-14 (Beijing time), follow-up E2E of the 455-CI 2026-11-14 session.
+- Status as of 2026-11-18: not reproduced since. The R1 recipe now runs with prefix caching and chunked prefill (455-CI `6941c359`), and that recipe passed c64 on 455 (1220/1220 samples, no GPU fault; see `followups.csv`).
+
 ## Environment
 - Image: `rocm/fw-bringup-mlperf:gfx1250-atom-ci455-20261114` (digest `sha256:9c38aef6ad030885b5309ad90b30ff778da4f764161aecdf7b7c7d8ae3ea1eb9`)
 - aiter `main@b6f1ff6b7` (as in the image). ATOM: `main@ed372e0ab` + ROCm/ATOM#3345 (`626b2d235`), mounted over `/app/ATOM`. #3345 only changes how history tool-call arguments reach the chat template; without it most agentic turns fail with HTTP 500 before reaching this load.

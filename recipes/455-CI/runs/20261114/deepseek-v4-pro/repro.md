@@ -1,5 +1,8 @@
 # DeepSeek-V4-Pro: MegaMoE stage-1 (S1F) GEMM1 asserts `slot_width <= 128` in warmup after ROCm/aiter#5899 (455-CI 2026-11-14)
 
+- Written: 2026-11-14 (Beijing time), 455-CI 2026-11-14 session.
+- Status as of 2026-11-18: fixed on main by [ROCm/aiter#7973](https://github.com/ROCm/aiter/pull/7973) (merged 2026-11-16), which gives the S1F 256x256 tile a 2x2 wave layout. Verified in the 2026-11-18 session: server up, no assert, GSM8K 0.9507.
+
 ## Environment
 - Image: `rocm/fw-bringup-mlperf:gfx1250-atom-ci455-20261114` (digest `sha256:9c38aef6ad030885b5309ad90b30ff778da4f764161aecdf7b7c7d8ae3ea1eb9`)
 - ATOM `main@9fec99786b088168aec7729858c1176e99d818e6`, aiter `main@b6f1ff6b7f3754aca8cc8c403b5fcd7a258eba47`. That aiter contains ROCm/aiter#5899 (`56121ed0b`, merged 2026-11-13 20:27 +0800) and the earlier V4-Pro fixes ROCm/aiter#7920 + #7924.

@@ -1,5 +1,8 @@
 # MiniMax-M3 (428B): GSM8K 87.3%, 7.4 points below the known-good 94.7% (455-CI 2026-11-14)
 
+- Written: 2026-11-16 (Beijing time) for the 455-CI 2026-11-14 session; result of the next step added 2026-11-17.
+- Status as of 2026-11-18: resolved, the gap was the eval method. The recipe switched MiniMax-M3 GSM8K to 5-shot chat (455-CI `52631dbe`), and the 2026-11-18 session scored 0.9500.
+
 ## Environment
 
 - Image: `rocm/fw-bringup-mlperf:gfx1250-atom-ci455-20261114`
