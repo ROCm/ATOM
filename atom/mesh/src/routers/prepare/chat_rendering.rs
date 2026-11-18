@@ -6,9 +6,9 @@
 //! mirrored here: `tests/entrypoints/fixtures/chat_rendering.json` holds the
 //! kwargs ATOM renders a set of chats with, which its tests and these check.
 
-use std::{collections::HashMap, fmt};
+use std::collections::HashMap;
 
-use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::inference::SentControls;
@@ -18,21 +18,52 @@ type Kwargs = HashMap<String, Value>;
 
 /// How an ATOM worker renders chats: its `/v1/models` card's `chat_rendering`
 /// (ATOM's `model_capabilities.chat_rendering`). A card parses as one only
-/// when this router mirrors the rules and the kwargs hook it names.
+/// when this router mirrors the rules and the kwargs hook it names, and it
+/// reports template efforts exactly when its rules read them.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(try_from = "RenderingCard")]
 pub(crate) struct ChatRendering {
     /// The server's `--default-chat-template-kwargs`.
     default_kwargs: Kwargs,
     /// The kwarg that switches reasoning, if one does.
     reasoning_toggle: Option<ReasoningToggle>,
     /// The rules the chat endpoint applies reasoning controls by.
-    #[serde(deserialize_with = "mirrored_rules")]
-    reasoning_rules: &'static ReasoningRules,
-    /// The efforts ATOM's `chat` rules forward to a template; `None` under
-    /// other rules, which do not read them.
-    template_efforts: Option<Vec<String>>,
+    reasoning_rules: ReasoningRules,
     /// The encoder the worker renders chats with instead of the template, if any.
     encoder: Option<ChatEncoder>,
+}
+
+/// A `ChatRendering` as the card reports it.
+#[derive(Deserialize)]
+struct RenderingCard {
+    default_kwargs: Kwargs,
+    reasoning_toggle: Option<ReasoningToggle>,
+    reasoning_rules: RulesName,
+    template_efforts: Option<Vec<String>>,
+    encoder: Option<ChatEncoder>,
+}
+
+impl TryFrom<RenderingCard> for ChatRendering {
+    type Error = String;
+
+    fn try_from(card: RenderingCard) -> Result<Self, String> {
+        let reasoning_rules = match (card.reasoning_rules, card.template_efforts) {
+            (RulesName::Chat, Some(template_efforts)) => ReasoningRules::Chat { template_efforts },
+            (RulesName::Chat, None) => {
+                return Err("the chat rules need template_efforts".to_string())
+            }
+            (RulesName::DeepseekV41, None) => ReasoningRules::DeepseekV41,
+            (RulesName::DeepseekV41, Some(_)) => {
+                return Err("the deepseek_v41 rules read no template_efforts".to_string())
+            }
+        };
+        Ok(Self {
+            default_kwargs: card.default_kwargs,
+            reasoning_toggle: card.reasoning_toggle,
+            reasoning_rules,
+            encoder: card.encoder,
+        })
+    }
 }
 
 /// A template kwarg that switches the model's reasoning, with its off and on values.
@@ -136,12 +167,11 @@ pub(crate) fn atom_chat_template_kwargs(
     {
         kwargs.insert("tool_choice".to_string(), choice.clone());
     }
-    let rules = rendering.reasoning_rules;
+    let rules = &rendering.reasoning_rules;
     let controls = resolve_reasoning_controls(
         sent.thinking.as_ref(),
         request.reasoning_effort.as_deref(),
         rules,
-        rendering.template_efforts.as_deref().unwrap_or_default(),
     )?;
     let toggle = rendering.reasoning_toggle.as_ref();
     apply_reasoning_controls(&mut kwargs, toggle, controls, rules);
@@ -151,61 +181,50 @@ pub(crate) fn atom_chat_template_kwargs(
     }
 }
 
-/// The effort a request names, or an error for one ATOM rejects, given the
-/// efforts the worker's templates read.
-type NormalizeEffort = fn(Option<&Value>, &[String]) -> Result<Option<Value>, String>;
-
-/// ATOM's `ReasoningRules`.
-pub(crate) struct ReasoningRules {
-    /// What ATOM's `/v1/models` calls them.
-    pub(crate) name: &'static str,
-    normalize_effort: NormalizeEffort,
-    string_effort_enables: bool,
-    none_disables: bool,
-    reconcile_effort_with_toggle: bool,
+/// ATOM's `ReasoningRules` a chat can render under, by the names its
+/// `/v1/models` gives them, mirrored here.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RulesName {
+    Chat,
+    DeepseekV41,
 }
 
-impl fmt::Debug for ReasoningRules {
-    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-        formatter.write_str(self.name)
+impl RulesName {
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 2] = [Self::Chat, Self::DeepseekV41];
+}
+
+/// ATOM's `ReasoningRules`, with what the card reports for them.
+#[derive(Clone, Debug, PartialEq)]
+enum ReasoningRules {
+    /// `CHAT_REASONING_RULES`, which forward an effort the worker's templates
+    /// read.
+    Chat { template_efforts: Vec<String> },
+    /// `deepseek_v41_encoder.REASONING_RULES`.
+    DeepseekV41,
+}
+
+impl ReasoningRules {
+    /// The effort a request names, or an error for one ATOM rejects.
+    fn normalize_effort(&self, effort: Option<&Value>) -> Result<Option<Value>, String> {
+        match self {
+            Self::Chat { template_efforts } => legacy_chat_effort(effort, template_efforts),
+            Self::DeepseekV41 => deepseek_v41_effort(effort),
+        }
     }
-}
 
-/// Rules are told apart by the name ATOM gives each.
-impl PartialEq for ReasoningRules {
-    fn eq(&self, other: &Self) -> bool {
-        self.name == other.name
+    fn string_effort_enables(&self) -> bool {
+        matches!(self, Self::DeepseekV41)
     }
-}
 
-/// ATOM's `ReasoningRules` a chat can render under: `CHAT_REASONING_RULES`
-/// and `deepseek_v41_encoder.REASONING_RULES`.
-pub(crate) static REASONING_RULES: [ReasoningRules; 2] = [
-    ReasoningRules {
-        name: "chat",
-        normalize_effort: legacy_chat_effort,
-        string_effort_enables: false,
-        none_disables: true,
-        reconcile_effort_with_toggle: false,
-    },
-    ReasoningRules {
-        name: "deepseek_v41",
-        normalize_effort: |effort, _| deepseek_v41_effort(effort),
-        string_effort_enables: true,
-        none_disables: true,
-        reconcile_effort_with_toggle: true,
-    },
-];
+    fn none_disables(&self) -> bool {
+        true
+    }
 
-/// The `ReasoningRules` a card names, if mirrored here.
-fn mirrored_rules<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> Result<&'static ReasoningRules, D::Error> {
-    let name = String::deserialize(deserializer)?;
-    REASONING_RULES
-        .iter()
-        .find(|rules| rules.name == name)
-        .ok_or_else(|| D::Error::custom(format!("unknown reasoning rules {name:?}")))
+    fn reconcile_effort_with_toggle(&self) -> bool {
+        matches!(self, Self::DeepseekV41)
+    }
 }
 
 /// ATOM's `resolve_reasoning_controls`: whether a chat switches reasoning on or
@@ -216,7 +235,6 @@ fn resolve_reasoning_controls(
     thinking: Option<&Value>,
     reasoning_effort: Option<&str>,
     rules: &ReasoningRules,
-    template_efforts: &[String],
 ) -> Result<(Option<bool>, Option<Value>), String> {
     let field = |key| {
         thinking
@@ -224,16 +242,16 @@ fn resolve_reasoning_controls(
             .filter(|value| !value.is_null())
     };
     let mut enabled = field("type").map(|kind| *kind != "disabled");
-    if rules.none_disables && reasoning_effort == Some("none") {
+    if rules.none_disables() && reasoning_effort == Some("none") {
         enabled = Some(false);
     }
     let reasoning_effort = reasoning_effort.map(Value::from);
     let effort = field("effort").or(reasoning_effort.as_ref());
-    let effort = (rules.normalize_effort)(effort, template_efforts)?;
-    if rules.none_disables && effort.as_ref().is_some_and(|effort| *effort == "none") {
+    let effort = rules.normalize_effort(effort)?;
+    if rules.none_disables() && effort.as_ref().is_some_and(|effort| *effort == "none") {
         return Ok((Some(false), None));
     }
-    if rules.string_effort_enables
+    if rules.string_effort_enables()
         && enabled.is_none()
         && effort.as_ref().is_some_and(Value::is_string)
     {
@@ -252,7 +270,7 @@ fn apply_reasoning_controls(
     (enabled, effort): (Option<bool>, Option<Value>),
     rules: &ReasoningRules,
 ) {
-    let reconcile = rules.reconcile_effort_with_toggle;
+    let reconcile = rules.reconcile_effort_with_toggle();
     let inherited_off = || {
         kwargs
             .get("thinking_effort")

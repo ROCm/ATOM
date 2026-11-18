@@ -57,15 +57,19 @@ enum Tokens {
 static UNTOKENIZED_MODELS: LazyLock<DashSet<String>> = LazyLock::new(DashSet::new);
 const MAX_UNTOKENIZED_MODELS: usize = 64;
 
+/// Whether `model` is new to `models`, which keeps up to `MAX_UNTOKENIZED_MODELS`
+/// so that each is warned of once.
+fn warns_first(models: &DashSet<String>, model: &str) -> bool {
+    models.len() < MAX_UNTOKENIZED_MODELS
+        && !models.contains(model)
+        && models.insert(model.to_string())
+}
+
 /// Counts a request that `cache_aware` places by its text, as the router cannot tokenize it.
 fn untokenized(model: Option<&str>, error: &IngressError) {
     metrics::counter!("mesh_kv_events_untokenized_total", "reason" => error.code).increment(1);
     let model = model.unwrap_or_default();
-    let models = &UNTOKENIZED_MODELS;
-    if models.len() < MAX_UNTOKENIZED_MODELS
-        && !models.contains(model)
-        && models.insert(model.to_string())
-    {
+    if warns_first(&UNTOKENIZED_MODELS, model) {
         warn!(
             model,
             reason = error.code,
@@ -76,15 +80,11 @@ fn untokenized(model: Option<&str>, error: &IngressError) {
 }
 
 /// Models whose chats HTTP routing renders without their workers' chat rendering,
-/// each warned of once, as many as `UNTOKENIZED_MODELS` keeps.
+/// each warned of once, up to `MAX_UNTOKENIZED_MODELS`.
 static UNMIRRORED_MODELS: LazyLock<DashSet<String>> = LazyLock::new(DashSet::new);
 
 fn unmirrored(model: &str, reason: &str) {
-    let models = &UNMIRRORED_MODELS;
-    if models.len() < MAX_UNTOKENIZED_MODELS
-        && !models.contains(model)
-        && models.insert(model.to_string())
-    {
+    if warns_first(&UNMIRRORED_MODELS, model) {
         warn!(
             model,
             reason,

@@ -1189,9 +1189,7 @@ mod g_chat_rendering {
     use crate::protocols::{chat::ChatCompletionRequest, validated::Normalizable};
     use crate::routers::{
         prepare::{
-            chat_rendering::{
-                atom_chat_template_kwargs, ChatRendering, KwargsHook, REASONING_RULES,
-            },
+            chat_rendering::{atom_chat_template_kwargs, ChatRendering, KwargsHook, RulesName},
             chat_template::{process_chat_messages, render_chat_messages, ProcessedMessages},
             inference::{ParsedInference, SentControls},
         },
@@ -1234,8 +1232,7 @@ mod g_chat_rendering {
     #[test]
     fn test_the_rules_and_hooks_are_atoms() {
         let fixture = fixture();
-        let rules: Vec<_> = REASONING_RULES.iter().map(|rules| rules.name).collect();
-        assert_eq!(json!(rules), fixture["reasoning_rules"]);
+        assert_eq!(json!(RulesName::ALL), fixture["reasoning_rules"]);
         assert_eq!(json!(KwargsHook::ALL), fixture["kwargs_hooks"]);
     }
 
@@ -1257,11 +1254,14 @@ mod g_chat_rendering {
         }
     }
 
-    /// A rendering naming rules or a kwargs hook not mirrored here is not read;
-    /// an encoder with no hook needs none.
+    /// A rendering naming rules or a kwargs hook not mirrored here, or template
+    /// efforts other than its rules read, is not read; an encoder with no hook
+    /// needs none.
     #[test]
     fn test_only_mirrored_renderings_are_read() {
-        let v41 = fixture()["renderings"]["deepseek_v41"].clone();
+        let fixture = fixture();
+        let renderings = &fixture["renderings"];
+        let v41 = renderings["deepseek_v41"].clone();
         let with = |pointer: &str, value: Value| {
             let mut rendering = v41.clone();
             *rendering.pointer_mut(pointer).unwrap() = value;
@@ -1269,6 +1269,11 @@ mod g_chat_rendering {
         };
         assert!(with("/reasoning_rules", json!("responses")).is_err());
         assert!(with("/encoder/name", json!("encoding_kimi")).is_err());
+        assert!(with("/template_efforts", json!(["high"])).is_err());
+        let mut template = renderings["template"].clone();
+        assert!(ChatRendering::parse(&template.to_string()).is_ok());
+        template["template_efforts"] = Value::Null;
+        assert!(ChatRendering::parse(&template.to_string()).is_err());
         let mut plain = v41.clone();
         plain["encoder"]["name"] = json!("encoding_kimi");
         plain["encoder"]["prepares_kwargs"] = json!(false);
