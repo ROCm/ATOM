@@ -518,6 +518,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_MTP_SELECT_ROWS_BEFORE_MOE": lambda: (
         os.getenv("ATOM_MTP_SELECT_ROWS_BEFORE_MOE", "0") == "1"
     ),
+    # Qwen3.5 / 3.6 MTP drafter on gfx1250, TP1 / DP ranks, passes of at most 16 rows
+    # (atom/models/qwen3_5_draft_mono). All off by default.
+    # ATOM_MTP_MONO: o_proj, the post-attention norm, the MoE, the final norm, the LM
+    # head and the argmax of a draft pass as one persistent FlyDSL kernel. Needs
+    # ATOM_MTP_MONO_HEAD: a checkpoint directory whose outside.safetensors holds an
+    # MXFP8 1x32 lm_head (weight + weight_scale); the MTP experts are quantized to
+    # MXFP4 1x32 from the served checkpoint.
+    # ATOM_MTP_MONO_PRE: the embedding rows, the pre-fc norms, fc, the input norm and
+    # the q/k/v projection as one kernel.
+    # ATOM_MTP_MONO_CHECK (eager passes): ATOM's path serves; the kernel's hidden
+    # rows and token ids are compared and logged.
+    "ATOM_MTP_MONO": lambda: os.getenv("ATOM_MTP_MONO", "0") == "1",
+    "ATOM_MTP_MONO_PRE": lambda: os.getenv("ATOM_MTP_MONO_PRE", "0") == "1",
+    "ATOM_MTP_MONO_CHECK": lambda: os.getenv("ATOM_MTP_MONO_CHECK", "0") == "1",
+    "ATOM_MTP_MONO_HEAD": lambda: os.getenv("ATOM_MTP_MONO_HEAD", ""),
     "ATOM_SHARED_EXPERT_GATED_GEMM": lambda: (
         os.getenv("ATOM_SHARED_EXPERT_GATED_GEMM", "0") == "1"
     ),

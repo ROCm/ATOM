@@ -104,6 +104,14 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
                 self.mtp_start_layer_idx + self.num_mtp_layers,
             )
         )
+        # ATOM_MTP_MONO: one kernel for the pass after the attention (TP1 / DP
+        # ranks only; off by default)
+        if envs.ATOM_MTP_MONO and get_tp_group().world_size == 1:
+            from atom.models.qwen3_5_draft_mono import make_hook
+
+            hook = make_hook(atom_config.model)
+            for layer in self.layers:
+                layer.draft_mono = hook
 
         self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.pre_fc_norm_hidden = Qwen3_5RMSNorm(
@@ -210,10 +218,23 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
     ) -> torch.Tensor:
         """The final-normed hidden states, of rows `select_rows` only when
         given (`out[i]` is row `select_rows[i]`, as `index_select` picks them)."""
-        fc_input = None
-        if inputs_embeds is None and self.fused_embed_pre_fc_norm:
+        fc_input = fc_out = None
+        pre = self.__dict__.get("_mono_pre")
+        if (
+            pre is not None
+            and inputs_embeds is None
+            and pre.applies(input_ids, hidden_states)
+        ):
+            # ATOM_MTP_MONO_PRE: one kernel up to the q/k/v projection; the layer
+            # takes its residual (the fc output) and the attention its q/k/v from it
+            fc_out, qkv = pre.run(input_ids, hidden_states)
+            layer = self.layers[spec_step_idx % self.num_mtp_layers]
+            layer._mono_pre_out = (fc_out, qkv)
+        if fc_out is None and inputs_embeds is None and self.fused_embed_pre_fc_norm:
             fc_input = self._embed_pre_fc_norms(input_ids, hidden_states)
-        if fc_input is not None:
+        if fc_out is not None:
+            pass
+        elif fc_input is not None:
             hidden_states = fc_input
         else:
             if inputs_embeds is None:
@@ -227,7 +248,7 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
                 inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
                 hidden_states = self.pre_fc_norm_hidden(hidden_states)
                 hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
-        hidden_states = self._fc(hidden_states)
+        hidden_states = fc_out if fc_out is not None else self._fc(hidden_states)
         residual = None
 
         current_step_idx = spec_step_idx % self.num_mtp_layers
@@ -251,6 +272,13 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         )
         if layer_rows is not None:
             select_rows = None  # already selected
+        mono = getattr(self.layers[current_step_idx], "draft_mono", None)
+        if mono is not None and residual is None and mono.last is hidden_states:
+            # ATOM_MTP_MONO: the kernel ran the MoE, the final norm and the head;
+            # these are the final-normed rows
+            if select_rows is not None:
+                hidden_states = torch.index_select(hidden_states, 0, select_rows)
+            return hidden_states
 
         if isinstance(hidden_states, MoEGatedSum):
             # ATOM_FUSED_MOE_TAIL_NORM: the layer's gated shared-expert add, its
@@ -262,6 +290,8 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         hidden_states, _ = self.norm(hidden_states, residual)
         if select_rows is not None:
             hidden_states = torch.index_select(hidden_states, 0, select_rows)
+        if mono is not None:
+            mono.check_hidden(hidden_states)
         return hidden_states
 
 
@@ -348,6 +378,13 @@ class Qwen3_5MTP(nn.Module):
         rather than re-read from the checkpoint, so the replicated rows are
         those very bits. A no-op with the flag off.
         """
+        mono = getattr(self.model.layers[0], "draft_mono", None)
+        if mono is not None:
+            mono._init()  # compile and bind before any graph capture
+        if envs.ATOM_MTP_MONO_PRE and get_tp_group().world_size == 1:
+            from atom.models.qwen3_5_draft_mono import make_pre_hook
+
+            self.model._mono_pre = make_pre_hook(self.model)
         tp = get_tp_group()
         if not (envs.ATOM_QWEN35_MTP_REPLICATED_EMBED and tp.world_size > 1):
             return
@@ -413,7 +450,15 @@ class Qwen3_5MTP(nn.Module):
         prefill last-token slice (is_draft is set for the whole propose loop),
         so both see the same rows.
         """
-        return self.lm_head.compute_argmax_token(hidden_states, out=out)
+        mono = getattr(self.model.layers[0], "draft_mono", None)
+        if mono is not None and mono.last is hidden_states and mono.ids is not None:
+            # ATOM_MTP_MONO: the kernel's own argmax
+            out.reshape(-1)[: mono.ids.shape[0]].copy_(mono.ids)
+            return out
+        ids = self.lm_head.compute_argmax_token(hidden_states, out=out)
+        if mono is not None:
+            mono.check_ids(ids)
+        return ids
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales

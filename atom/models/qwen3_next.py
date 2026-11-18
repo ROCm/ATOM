@@ -680,7 +680,9 @@ class Qwen3NextAttention(nn.Module):
         hidden_states: torch.Tensor,
         x_scale=None,
     ) -> torch.Tensor:
-        qkv = self.qkv_proj(hidden_states, x_scale=x_scale)
+        qkv = self.__dict__.pop("_mono_qkv", None)  # ATOM_MTP_MONO_PRE
+        if qkv is None:
+            qkv = self.qkv_proj(hidden_states, x_scale=x_scale)
 
         if self.attn_output_gate:
             gate, qkv = torch.split(
@@ -1148,8 +1150,18 @@ class Qwen3NextDecoderLayer(nn.Module):
         their KV), keep only these rows for the MLP; the layer then returns
         `len(select_rows)` rows (the MTP drafter's step 0)."""
         # Self Attention
-        mx32_in = self._input_norm_mx32(hidden_states, residual)
-        if mx32_in is not None:
+        pre_out = self.__dict__.pop("_mono_pre_out", None)
+        mx32_in = (
+            None
+            if pre_out is not None
+            else self._input_norm_mx32(hidden_states, residual)
+        )
+        if pre_out is not None:
+            # ATOM_MTP_MONO_PRE: the residual and the q/k/v projection come from
+            # the drafter's pre-attention kernel
+            residual, self.self_attn._mono_qkv = pre_out
+            x_scale = hidden_bf16 = None
+        elif mx32_in is not None:
             hidden_states, x_scale, residual = mx32_in
             hidden_bf16 = None
         elif self.input_layernorm.use_fused_quant:
@@ -1179,11 +1191,39 @@ class Qwen3NextDecoderLayer(nn.Module):
                 x_scale=x_scale,
             )
         elif self.layer_type == "full_attention":
-            hidden_states = self.self_attn(
-                hidden_states=hidden_states,
-                positions=positions,
-                x_scale=x_scale,
-            )
+            # ATOM_MTP_MONO (the MTP drafter): the attention keeps its gated output
+            # before o_proj; one kernel runs the rest of the pass on the selected
+            # rows (qwen3_5_draft_mono).
+            mono = getattr(self, "draft_mono", None)
+            if mono is not None and mono.applies(
+                self.self_attn, hidden_states, select_rows
+            ):
+                keep = self.self_attn.skip_out_proj
+                self.self_attn.skip_out_proj = True
+                try:
+                    x0 = self.self_attn(
+                        hidden_states=hidden_states,
+                        positions=positions,
+                        x_scale=x_scale,
+                    )
+                finally:
+                    self.self_attn.skip_out_proj = keep
+                if select_rows is not None:
+                    x0 = torch.index_select(x0, 0, select_rows)
+                out = mono.run(x0, residual, select_rows)
+                if out is not None:
+                    return out, None
+                # ATOM_MTP_MONO_CHECK: ATOM's own path from here, on the selected rows
+                hidden_states = self.self_attn.o_proj(x0)
+                if select_rows is not None:
+                    residual = torch.index_select(residual, 0, select_rows)
+                    select_rows = None
+            else:
+                hidden_states = self.self_attn(
+                    hidden_states=hidden_states,
+                    positions=positions,
+                    x_scale=x_scale,
+                )
         else:
             raise ValueError("Invalid layer_type")
 
