@@ -259,3 +259,124 @@ def test_draft_rows_trim_drops_the_layout(modules, flydsl):
     )
     trimmed = qsa.for_tokens(TOKENS - 2)
     assert trimmed.flydsl_prefill is None
+
+
+def _mark(rows, width):
+    """What the selection spies write: row r, column c holds 1000 * r + c."""
+    return (
+        1000 * torch.arange(rows, dtype=torch.int32)[:, None]
+        + torch.arange(width, dtype=torch.int32)
+    ).contiguous()
+
+
+@pytest.mark.parametrize("sharded", [False, True], ids=["whole", "sequence-parallel"])
+def test_forward_selects_into_the_kernel_buffer(modules, flydsl, monkeypatch, sharded):
+    """`forward` on a prefill: the layout is made, the selection lands in its
+    kernel-width buffer (`out=`, and `out[:, :width]` when the rows are
+    sharded), and that buffer is what the kernel reads. Without `out` the
+    kernel would read an all -1 buffer; a wrong slice moves the selection."""
+    qa = modules.qsa_attention
+    heads, dim = 12, 256
+    q_size, kv_size = heads * dim, dim
+    layer = _layer(
+        indexer=SimpleNamespace(
+            compress_ratio=4,
+            token_topk=2048,
+            # The spies read the query rows back from the index query.
+            project_qk=lambda h, p: (
+                torch.arange(h.shape[0], dtype=torch.float32)[:, None],
+                None,
+            ),
+            normalize_compressed_keys=lambda pooled, first: None,
+        ),
+        q_size=q_size,
+        kv_size=kv_size,
+        raw_key_cache=None,
+        rope_position_cache=None,
+        compressed_key_scale=None,
+        rotary_emb=None,
+        qkv_proj=lambda h: torch.zeros(
+            h.shape[0], 2 * q_size + 2 * kv_size, dtype=torch.bfloat16
+        ),
+        qk_norm=lambda q, k: (q, k),
+        o_proj=lambda x: x,
+        _store_kv=lambda key, value, slots: None,
+    )
+    for name in ("_select_tokens", "_flydsl_attention"):
+        setattr(layer, name, getattr(qa.Qwen4ExpAttention, name).__get__(layer))
+
+    def native(*args, **kwargs):
+        raise AssertionError("a ready layout must not reach the native kernel")
+
+    layer._attend = native
+    qsa = _qsa(modules, max_seq_len=40)
+    width = qa.qsa_selection_widths(
+        layer.compressed_key_cache, qsa.block_tables, 2048, 4, qsa.max_seq_len
+    )[2]
+    context = SimpleNamespace(is_prefill=True, is_draft=False)
+    forward_context = SimpleNamespace(
+        attn_metadata=SimpleNamespace(qsa_metadata=qsa), context=context
+    )
+
+    def select_tokens(index_q, *args, out=None, **kwargs):
+        if out is None:
+            out = torch.empty(index_q.shape[0], width, dtype=torch.int32)
+        assert out.shape[0] == index_q.shape[0] and out.shape[1] >= width
+        out = out[:, :width]
+        out.copy_(_mark(out.shape[0], width))
+        return out
+
+    def select_groups(index_q, *args, **kwargs):
+        return index_q.to(torch.int32), width
+
+    def expand(
+        groups,
+        positions,
+        seq_lens,
+        token_to_req,
+        ratio,
+        topk,
+        out=None,
+        *,
+        output_width,
+    ):
+        selection = groups * 1000 + torch.arange(output_width, dtype=torch.int32)
+        if out is None:
+            return selection
+        assert out.shape == selection.shape, "out must be exactly [rows, width]"
+        return out.copy_(selection)
+
+    for name, value in {
+        "get_forward_context": lambda: forward_context,
+        "qsa_apply_mrope": lambda rope, positions, q, k: (q, k),
+        "qsa_store_rows": lambda *args: None,
+        "qsa_compress_groups": lambda *args, **kwargs: (None, None),
+        "qsa_select_paged_tokens": select_tokens,
+        "qsa_select_paged_groups": select_groups,
+        "qsa_expand_block_indices": expand,
+        "is_per_token_fp8_linear": lambda proj: False,
+        "sigmoid_mul": lambda x, gate: x,
+    }.items():
+        monkeypatch.setattr(qa, name, value)
+
+    rows = None
+    if sharded:
+        # This rank holds rows 4..7 of two ranks' 8; the gather returns every
+        # rank's groups, row r's as r.
+        def gather(local):
+            groups = torch.arange(TOKENS, dtype=torch.int32)[:, None]
+            assert torch.equal(local, groups[4:])
+            return groups
+
+        rows = SimpleNamespace(start=4, chunk=4, num_tokens=TOKENS, gather=gather)
+    hidden = torch.zeros(TOKENS, 64, dtype=torch.bfloat16)
+    positions = torch.arange(TOKENS)
+    out = qa.Qwen4ExpAttention.forward(layer, positions, hidden, rows=rows)
+
+    assert out.shape == (TOKENS, q_size)
+    ((_, _, indices, _),) = flydsl
+    plan = qsa.flydsl_prefill
+    assert plan.ready and indices is plan.indices
+    assert indices.shape == (TOKENS, plan.width) and plan.width > width
+    assert torch.equal(indices[:, :width], _mark(TOKENS, width))
+    assert bool((indices[:, width:] == -1).all())
