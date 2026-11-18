@@ -1173,6 +1173,17 @@ def test_fused_tail_takes_the_gather_norm_and_finalize_in_one_launch(monkeypatch
     assert out is buffers["final"]
 
 
+def test_fused_tail_serves_widths_a_line_a_thread():
+    from atom.models.kimi_k3.mono.kernels.stages import k2_tail_gfx1250 as tail
+
+    assert tail.tail_line_rows() == 42 < tail.tail_max_rows()
+    assert all(runner_module._tail_width(rows) for rows in range(1, 43))
+    assert not any(
+        runner_module._tail_width(rows)
+        for rows in range(43, tail.tail_max_rows() + 1)
+    )
+
+
 def test_fused_tail_needs_the_plain_routed_norm(monkeypatch):
     plain = SimpleNamespace(use_fused_quant=False, x_pad_to_multiple=0)
     assert runner_module._plain_routed_norm(plain)

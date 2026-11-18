@@ -103,7 +103,7 @@ from atom.models.kimi_k3.mono.kernels.stages.k2_oproj_ar_gfx1250 import (
 from atom.models.kimi_k3.mono.kernels.stages.k2_tail_gfx1250 import (
     build_k2_tail,
     tail_flag_words,
-    tail_max_rows,
+    tail_line_rows,
 )
 from atom.models.kimi_k3.mono.kernels.stages.moe_tdm_gfx1250 import (
     FLAG_WORDS,
@@ -172,6 +172,13 @@ def _uses_ptpc_o_proj(layer) -> bool:
 def _fuse_ptpc_core(layer, rows: int) -> bool:
     """Measured crossover against K1 + AITER per-token quant on gfx1250."""
     return rows <= K1_PTPC_FUSION_MAX_ROWS and _uses_ptpc_o_proj(layer)
+
+
+def _tail_width(rows: int) -> bool:
+    """Widths the fused K2 tail serves: a line a thread (42 rows). Past
+    that its shares take rounds, bitwise but slower than the three
+    launches at TP4."""
+    return rows <= tail_line_rows()
 
 
 def _plain_routed_norm(norm) -> bool:
@@ -874,7 +881,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             tail_eps is not None
             and allreduce is not None
             and allreduce.abi is GATHER_ALLREDUCE_ABI
-            and rows <= tail_max_rows()
+            and _tail_width(rows)
         ):
             # the fused MoE's routes are its own rows: ``fused_rows``
             tail = build_k2_tail(
