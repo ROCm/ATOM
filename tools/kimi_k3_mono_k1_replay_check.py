@@ -350,6 +350,18 @@ def check(rows):
                     diff(p["conv"][slot], old)["max_abs"],
                     flush=True,
                 )
+                for ch in (0, 1600):
+                    print(
+                        "conv_debug ch",
+                        ch,
+                        "old",
+                        [round(v, 3) for v in old[ch].float().tolist()],
+                        "x",
+                        [round(v, 3) for v in x[r, :, ch].float().tolist()],
+                        "prod",
+                        [round(v, 3) for v in p["conv"][slot, ch].float().tolist()],
+                        flush=True,
+                    )
         if step == 0:
             report["vs_plain_core_out"] = diff(core, p_core)
             report["vs_plain_conv"] = diff(m["conv"][idx], p_conv[idx])

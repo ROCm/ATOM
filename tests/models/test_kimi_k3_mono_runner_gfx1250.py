@@ -453,6 +453,11 @@ def test_replay_serves_the_verified_dspark_verify(rows):
     assert runner_module.replay_refusal(_replay_plan(rows), 16, 5, 5) is None
 
 
+@pytest.mark.parametrize("rows", (1, 8, 48))
+def test_replay_serves_the_verified_plain_decode(rows):
+    assert runner_module.replay_refusal(_replay_plan(rows), 16, 1, 1) is None
+
+
 def test_replay_is_off_without_a_record_buffer():
     assert runner_module.replay_refusal(_replay_plan(40), 0, 0, 5) is None
 
