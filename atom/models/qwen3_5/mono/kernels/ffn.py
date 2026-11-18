@@ -2,9 +2,9 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # ruff: noqa: B023  (traced stage closures read the loop's values on purpose: the tracer unrolls)
 """The MoE FFN of the Qwen3.5 layer kernel: the router (+ the shared-expert gate), expert up/gate and
-down with softmax top-k routing and SwiGLU, and the FFN-side TP reduce. The FP8 checkpoint's shared
-expert is a sigmoid-gated slot of its W8A8 bank; the MXFP4 checkpoint's routed experts run A4W4 and
-its shared expert is a separate BF16 MLP."""
+down with softmax top-k routing and SwiGLU, and the FFN-side TP reduce. The experts run W8A8 (FP8) or
+A4W4 (both MXFP4 checkpoints); the shared expert is a sigmoid-gated slot of the bank (FP8,
+MXFP4-AttnFP8) or a separate BF16 MLP (MXFP4)."""
 
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
@@ -263,7 +263,7 @@ def ffn_stages(ctx):
 
     r_shug, r_shdn = rsrc(w_sh_ug), rsrc(w_sh_dn)
 
-    # ================================ 6. expert up/gate + SiLU (W8A8; MXFP4: A4W4 and the BF16 shared expert)
+    # ================================ 6. expert up/gate + SiLU (W8A8, or A4W4 with MXFP4)
     UG_NKC = HIDDEN // 64
     # the MXFP4 checkpoint's BF16 shared gate_up (wave w: K range w of WAVES) rounds as baseline ATOM's GEMM
     SH_UG_RULE = bf16_gemm_rule("shared_ug", ctx["GEMM_M"]) if SH_BF16 else None
@@ -356,9 +356,6 @@ def ffn_stages(ctx):
                 )
             return units
 
-        def stage_xf4():
-            stage_fp4("xb", XF4_SC)
-
         def sh_units(w_rg, w_ln):
             """The BF16 shared expert's tile (its [gate | up] rows, row-major) against the normed input;
             every sample a B column."""
@@ -377,6 +374,26 @@ def ffn_stages(ctx):
                 )
             return units
 
+        def silu_mul(g, v):
+            if const_expr(MX):
+                # aiter's FlyDSL stage-1 silu_mul_batch and -ffast-math silu_and_mul:
+                # (g * v_rcp(1 + exp(-g))) * u
+                return g * sigmoid_fast(g) * v
+            return silu(g) * v
+
+        def route_out(sn, sl):
+            """The routing (expert, weight) of slot ``sl``: no stage reads it (down routes for itself).
+            Kept: with these stores gone the register allocator spills the FP8 8-row and MTP 4 / 8-row
+            builds, which then fall back to the original path (measured 2026-10-20)."""
+            put(mb("sel"), sn * MOE_SLOTS + sl, lds_ld(keys, sn * MOE_SLOTS + sl))
+            put(mb("prob"), sn * MOE_SLOTS + sl, lds_ld(dnw, sn * MOE_SLOTS + sl))
+
+        def tile_rows(c):
+            """(w_rg, w_ln) of up / gate tile c: its 8 gate and 8 up rows."""
+            w_rg = ((lane % 16) // 8) * (INTER // 16) + c // 2
+            w_ln = (lane & -16) | ((c % 2) * 8 + lane % 8)
+            return w_rg, w_ln
+
         def ug8_emit(c, slot, sample, shared, live):
             if tid < (S if shared else 1) * UG8 // 2:
                 n = tid // (UG8 // 2)
@@ -385,9 +402,8 @@ def ffn_stages(ctx):
                 v0, v1 = lds_ld(outs, n * 16 + UG8 + r), lds_ld(
                     outs, n * 16 + UG8 + r + 1
                 )
-                if const_expr(
-                    SH_BF16 and shared
-                ):  # the BF16 MLP's gate_up output is bf16
+                # the BF16 MLP's gate_up output is bf16
+                if const_expr(SH_BF16 and shared):
                     g0, g1, v0, v1 = (
                         bf16_round(g0),
                         bf16_round(g1),
@@ -397,30 +413,17 @@ def ffn_stages(ctx):
                 sn = n if shared else fx.Int32(sample)
                 sl = fx.Int32(0) if shared else slot
                 if live:
-                    if const_expr(MX):
-                        # aiter's FlyDSL stage-1 silu_mul_batch and -ffast-math silu_and_mul:
-                        # (g * v_rcp(1 + exp(-g))) * u
-                        m0, m1 = g0 * sigmoid_fast(g0) * v0, g1 * sigmoid_fast(g1) * v1
-                    else:
-                        m0, m1 = silu(g0) * v0, silu(g1) * v1
-                    put2(mb("mid"), (sn * MOE_SLOTS + sl) * INTER + c * UG8 + r, m0, m1)
-            # the routing (expert, weight) a slot -- no stage reads it (down routes for itself). Kept: with
-            # these stores gone the register allocator spills the FP8 8-row and MTP 4 / 8-row builds,
-            # which then fall back to the original path (measured 2026-10-20)
+                    put2(
+                        mb("mid"),
+                        (sn * MOE_SLOTS + sl) * INTER + c * UG8 + r,
+                        silu_mul(g0, v0),
+                        silu_mul(g1, v1),
+                    )
             if (c == 0) & (tid < S if shared else tid == 0):
                 sn = tid if shared else fx.Int32(sample)
                 sl = fx.Int32(0) if shared else slot
                 if live:
-                    put(
-                        mb("sel"),
-                        sn * MOE_SLOTS + sl,
-                        lds_ld(keys, sn * MOE_SLOTS + sl),
-                    )
-                    put(
-                        mb("prob"),
-                        sn * MOE_SLOTS + sl,
-                        lds_ld(dnw, sn * MOE_SLOTS + sl),
-                    )
+                    route_out(sn, sl)
 
         def ug8_tile(u):
             """Tile ``u`` (clamped; ``live`` masks a dead one): (live, uu, c, slot, has_sh, w_rg, w_ln, s_rg).
@@ -431,8 +434,7 @@ def ffn_stages(ctx):
             c = uu % UG_PER_SLOT
             has_sh = uu < UG_PER_SLOT
             slot = has_sh.select(fx.Int32(MOE_SLOTS - 1), uu // UG_PER_SLOT)
-            w_rg = ((lane % 16) // 8) * (INTER // 16) + c // 2
-            w_ln = (lane & -16) | ((c % 2) * 8 + lane % 8)
+            w_rg, w_ln = tile_rows(c)
             s_rg = (lane // 32) * (INTER // 16) + c // 2
             return live, uu, c, slot, has_sh, w_rg, w_ln, s_rg
 
@@ -479,12 +481,12 @@ def ffn_stages(ctx):
                     gpu.barrier()
                     ug8_emit(c0, slot0, 0, True, live0)
                 gpu.barrier()
-                stage_xf4()
+                stage_fp4("xb", XF4_SC)
                 gpu.barrier()
             else:
                 # the fused bank: the shared expert's tile on the routed experts' input
                 if const_expr(MX):
-                    stage_xf4()
+                    stage_fp4("xb", XF4_SC)
                 else:
                     stage_moe_input(list(range(S)))
                 gpu.barrier()
@@ -540,44 +542,31 @@ def ffn_stages(ctx):
 
         def g_units(it, t):
             live, shared, grp, sample, slot = it
-            c = grp * GRP + t
-            w_rg = ((lane % 16) // 8) * (INTER // 16) + c // 2
-            w_ln = (lane & -16) | ((c % 2) * 8 + lane % 8)
+            w_rg, w_ln = tile_rows(grp * GRP + t)
             e = uniform(lds_ld(keys, sample * MOE_SLOTS + slot))
             return mx_units(w_rg, w_ln, e, shared.select(n_sel(), sample), live)
 
         def g_emit(it, t):
-            """Tile t's mids, (g * v_rcp(1 + exp(-g))) * u as aiter's stage 1, into MID_BUF."""
-            live, shared, grp, sample, slot = it
-            if tid < shared.select(fx.Int32(S), fx.Int32(1)) * (UG8 // 2):
+            """Tile t's mids into MID_BUF."""
+            shared = it[1]
+            cols = shared.select(fx.Int32(S), fx.Int32(1))
+            if tid < cols * (UG8 // 2):
                 n = tid // (UG8 // 2)
                 r = (tid % (UG8 // 2)) * 2
                 for h in range_constexpr(2):
-                    gv = lds_ld(outs, n * 16 + r + h)
-                    uv = lds_ld(outs, n * 16 + UG8 + r + h)
                     lds_st(
                         xs,
                         MID_BUF + n * 32 + t * UG8 + r + h,
-                        gv * sigmoid_fast(gv) * uv,
+                        silu_mul(
+                            lds_ld(outs, n * 16 + r + h),
+                            lds_ld(outs, n * 16 + UG8 + r + h),
+                        ),
                     )
-            # the routing a slot (see ug8_emit)
-            if (
-                (grp == 0)
-                & (t == 0)
-                & live
-                & (tid < shared.select(fx.Int32(S), fx.Int32(1)))
-            ):
-                sn = shared.select(tid, sample)
-                put(
-                    mb("sel"),
-                    sn * MOE_SLOTS + slot,
-                    lds_ld(keys, sn * MOE_SLOTS + slot),
-                )
-                put(
-                    mb("prob"),
-                    sn * MOE_SLOTS + slot,
-                    lds_ld(dnw, sn * MOE_SLOTS + slot),
-                )
+
+        def g_route(it):
+            live, shared, grp, sample, slot = it
+            if (grp == 0) & live & (tid < shared.select(fx.Int32(S), fx.Int32(1))):
+                route_out(shared.select(tid, sample), slot)
 
         def g_publish(it):
             """The item's 32-mid blocks per-32 MXFP4 (aiter's stage-1 epilogue quant): 16 lanes a
@@ -605,7 +594,7 @@ def ffn_stages(ctx):
             gpu.barrier()
             items = [g_item(0)]
             cur = g_units(items[0], 0)
-            stage_xf4()
+            stage_fp4("xb", XF4_SC)
             gpu.barrier()
             for kk in range_constexpr(G_ITEMS * GRP):
                 k, t = kk // GRP, kk % GRP
@@ -620,6 +609,8 @@ def ffn_stages(ctx):
                 )
                 gpu.barrier()
                 g_emit(items[k], t)
+                if const_expr(t == 0):
+                    g_route(items[k])
                 if const_expr(t == GRP - 1):
                     gpu.barrier()
                     g_publish(items[k])
@@ -749,8 +740,9 @@ def ffn_stages(ctx):
                     blk = wave + (r0 + b) * WAVES
                     if blk < DN_BLK:
                         if const_expr(MX):
-                            # the routed slots per-32 MXFP4 (A4W4) from the f32 silu * up, as aiter's stage-1
-                            # epilogue quantizes; the shared expert's (a BF16 MLP) bf16; bf16 values in LDS, K order
+                            # the routed slots per-32 MXFP4 (A4W4) from the f32 silu * up, as aiter's
+                            # stage-1 epilogue quantizes; the shared expert's (a BF16 MLP) bf16; bf16
+                            # values in LDS, K order
                             m0, m1 = mxfp4_qd(mids[b][0], mids[b][1])
                             if const_expr(SH_BF16):
                                 v0, v1 = bf16_round(mids[b][0]), bf16_round(mids[b][1])

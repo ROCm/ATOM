@@ -31,6 +31,7 @@ from atom.mono.device.ops import (
     bf16_round,
     mxfp4_to_bf16x8,
     traced,
+    wave_max,
     wave_sum,
     xshfl,
 )
@@ -106,12 +107,13 @@ def start(st, name):
 
 
 @traced
-def block_sums(st, vs):
-    """Block-wide sums of several per-thread values with one LDS exchange."""
+def block_reduce(st, vs, wave_op, op):
+    """Block-wide reductions (``wave_op`` within a wave, ``op`` across waves) of several per-thread
+    values with one LDS exchange."""
     lane = st.lane
     red = st.red
     wave = st.wave
-    ws = [wave_sum(v) for v in vs]
+    ws = [wave_op(v) for v in vs]
     if lane == 0:
         for i in range_constexpr(len(vs)):
             lds_st(red, i * WAVES + wave, ws[i])
@@ -120,10 +122,20 @@ def block_sums(st, vs):
     for i in range_constexpr(len(vs)):
         t = lds_ld(red, i * WAVES)
         for w in range_constexpr(1, WAVES):
-            t = t + lds_ld(red, i * WAVES + w)
+            t = op(t, lds_ld(red, i * WAVES + w))
         tots.append(t)
     gpu.barrier()
     return tots
+
+
+def block_sums(st, vs):
+    """Block-wide sums of several per-thread values with one LDS exchange."""
+    return block_reduce(st, vs, wave_sum, lambda a, b: a + b)
+
+
+def block_maxes(st, vs):
+    """Block-wide maxima of several per-thread values with one LDS exchange."""
+    return block_reduce(st, vs, wave_max, fx.max)
 
 
 @traced
@@ -160,9 +172,8 @@ def unit_f8f8(st, w_rsrc, s_rsrc, rg, kc, NKC, K, b_word, coef, ln=None):
         )
         for h in range(2)
     ]
-    if (
-        s_rsrc is None
-    ):  # a per-channel FP8 matrix: the scales apply once, after the whole K sum
+    # a per-channel FP8 matrix: the scales apply once, after the whole K sum
+    if s_rsrc is None:
         return ("f8f8", wv, None, b_word + (lane // 16) * 4)
     s = ld_f32(s_rsrc, (rg * 16 // SCALE_BM) * (K // 128) + kc // 2)
     return ("f8f8", wv, lambda: s * coef(), b_word + (lane // 16) * 4)
@@ -599,6 +610,7 @@ HELPERS = (
     get2_many,
     start,
     block_sums,
+    block_maxes,
     block_sum,
     unit_f8f8,
     unit_bf16,

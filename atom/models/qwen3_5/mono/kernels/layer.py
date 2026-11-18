@@ -148,9 +148,8 @@ def build_qwen35_kernel(
     MX = experts_mxfp4(WFMT)  # MXFP4 experts (A4W4)
     PTPC = proj_kind(WFMT) == "ptpc"  # FP8 projections, per channel x per token
     FSE = shared_fused(WFMT)  # the shared expert is the bank's last entry
-    FP4_MIDS = fp4_mids(
-        WFMT, S
-    )  # up / gate publishes the mids as MXFP4 (config.fp4_mids)
+    # up / gate publishes the mids as MXFP4 (config.fp4_mids)
+    FP4_MIDS = fp4_mids(WFMT, S)
     assert (
         proj_kind(WFMT) != "bf16" or GEMM_M in BF16_GEMM_RULES["out"]
     ), "no BF16 GEMM rule at this M"

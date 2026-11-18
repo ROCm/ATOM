@@ -453,8 +453,16 @@ def stage_tasks(
                 -(-S // router_spt(S, n_experts))
                 * (router_rows(n_experts) // ROUTER_TILE),
             ),
-            # one tile per (routed slot, 8 intermediates); the first inter / UG8 also carry the shared expert
-            ("ug", S * top_k * (inter // UG8)),
+            # one tile per (routed slot, 8 intermediates), the first inter / UG8 also carrying the shared
+            # expert; fp4_mids: four tiles (a 32-mid block) per (sample, routed slot) or shared-expert item
+            (
+                "ug",
+                (
+                    inter // 32 + S * top_k * (inter // 32)
+                    if fp4_mids(weights, S)
+                    else S * top_k * (inter // UG8)
+                ),
+            ),
             ("down", hidden // dn_tile(S, hidden)),
         ]
     )

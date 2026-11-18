@@ -163,7 +163,13 @@ def test_every_stage_has_tasks_and_gdn_runs_a_task_per_sequence_head(
                 layout.stage_tasks(tokens, full, **dims, tokens_per_seq=tokens_per_seq)
             )
             assert all(n > 0 for n in tasks.values()), tasks
-            assert tasks["ug"] == tokens * dims["top_k"] * dims["inter"] // layout.UG8
+            k, inter = dims["top_k"], dims["inter"]
+            # a tile a task, or (fp4_mids) a 32-mid block a task, the shared expert's for every sample
+            assert tasks["ug"] == (
+                inter // 32 + tokens * k * (inter // 32)
+                if fp4_mids(weights, tokens)
+                else tokens * k * inter // layout.UG8
+            )
             if not full:
                 assert tasks["gdn"] == tokens // tokens_per_seq * dims["hv"]
 

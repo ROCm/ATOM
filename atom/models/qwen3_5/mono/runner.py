@@ -337,7 +337,7 @@ class Qwen35MonoDecodeRunner:
             )
         why = (
             bf16_gemm_refusal(self.cfg)
-            or ptpc_gemm_refusal(self.cfg)
+            or ptpc_gemm_refusal(self.cfg, max_rows(self.cfg.weights, self.T))
             or (flydsl_refusal(self.cfg) if self.cfg.pa_flydsl else None)
         )
         if why is not None:
@@ -390,9 +390,8 @@ class Qwen35MonoDecodeRunner:
         fse = cfg.shared_fused
         pk = cfg.proj_kind
         E, inter, hidden = cfg.n_experts, cfg.local_inter, cfg.hidden
-        EB = E + (
-            1 if fse else 0
-        )  # the bank: the routed experts (and a fused shared expert)
+        # the bank: the routed experts (and a fused shared expert)
+        EB = E + (1 if fse else 0)
         # the BF16 projections and a fused shared expert leave kernel arguments unused: a placeholder
         none = torch.zeros(1, dtype=torch.float32, device=self.dev)
         model = torch.bfloat16
@@ -427,50 +426,50 @@ class Qwen35MonoDecodeRunner:
                 None,
                 nbytes=EB * hidden * (-(-(inter // 32) // 8) * 8),
             )
-        if mx and not fse:
-            sh = cfg.shared_inter // cfg.tp
-            _need(
-                i,
-                "shared gate_up",
-                mlp.shared_expert.gate_up_proj.weight,
-                (2 * sh, hidden),
-                model,
-                False,
-            )
-            _need(
-                i,
-                "shared down",
-                mlp.shared_expert.down_proj.weight,
-                (hidden, sh),
-                model,
-                False,
-            )
-        if not mx and (
-            ex.w13_weight.dtype != torch.float8_e4m3fn
-            or ex.w13_weight.shape[0] != cfg.n_experts + 1
-        ):
-            raise MonoUnsupported(
-                f"layer {i}: routed experts {ex.w13_weight.dtype} {tuple(ex.w13_weight.shape)}, the kernel's"
-                f" FP8 bank of {cfg.n_experts} + the fused shared expert"
-            )
-        if not mx:
-            f8, f32_ = torch.float8_e4m3fn, torch.float32
-            _need(i, "w13", ex.w13_weight, (E + 1, 2 * inter, hidden), f8, True)
-            _need(
-                i,
-                "w13 scale",
-                ex.w13_weight_scale,
-                (E + 1, 2 * inter // 128, hidden // 128),
-                f32_,
-            )
-            _need(i, "w2", ex.w2_weight, (E + 1, hidden, inter), f8, True)
-            _need(
-                i,
-                "w2 scale",
-                ex.w2_weight_scale,
-                (E + 1, hidden // 128, inter // 128),
-                f32_,
-            )
+            if not fse:
+                sh = cfg.shared_inter // cfg.tp
+                _need(
+                    i,
+                    "shared gate_up",
+                    mlp.shared_expert.gate_up_proj.weight,
+                    (2 * sh, hidden),
+                    model,
+                    False,
+                )
+                _need(
+                    i,
+                    "shared down",
+                    mlp.shared_expert.down_proj.weight,
+                    (hidden, sh),
+                    model,
+                    False,
+                )
+        else:
+            if (
+                ex.w13_weight.dtype != torch.float8_e4m3fn
+                or ex.w13_weight.shape[0] != EB
+            ):
+                raise MonoUnsupported(
+                    f"layer {i}: routed experts {ex.w13_weight.dtype} {tuple(ex.w13_weight.shape)}, the"
+                    f" kernel's FP8 bank of {cfg.n_experts} + the fused shared expert"
+                )
+                f8, f32_ = torch.float8_e4m3fn, torch.float32
+                _need(i, "w13", ex.w13_weight, (EB, 2 * inter, hidden), f8, True)
+                _need(
+                    i,
+                    "w13 scale",
+                    ex.w13_weight_scale,
+                    (EB, 2 * inter // 128, hidden // 128),
+                    f32_,
+                )
+                _need(i, "w2", ex.w2_weight, (EB, hidden, inter), f8, True)
+                _need(
+                    i,
+                    "w2 scale",
+                    ex.w2_weight_scale,
+                    (EB, hidden // 128, inter // 128),
+                    f32_,
+                )
         # 512 experts, then the shared-expert gate row (one merged linear in both formats), zero rows
         w_r = mlp.gate.weight
         p = {

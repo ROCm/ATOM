@@ -4,7 +4,7 @@
 
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T, as_ir_value
 
@@ -14,7 +14,7 @@ from atom.models.qwen3_5.mono.kernels.helpers import (
     LaunchState,
     traced,
 )
-from atom.models.qwen3_5.mono.kernels.ops import lds_ld, lds_st
+from atom.models.qwen3_5.mono.kernels.ops import lds_st
 from atom.models.qwen3_5.mono.layout import MOE_MISC
 from atom.mono.device.ops import (
     bf2_f32,
@@ -31,7 +31,7 @@ from atom.mono.device.ops import (
     write_lane_i32,
     xshfl,
 )
-from atom.mono.plan.execution import THREADS, WAVES
+from atom.mono.plan.execution import THREADS
 
 
 def sort_network(n):
@@ -244,22 +244,6 @@ def common_defs(ctx):
     block_sums = st.block_sums
     rmsnorm_tail_ks = st.rmsnorm_tail_ks
 
-    def block_maxes(vs):
-        """Block-wide maxima of several per-thread values with one LDS exchange."""
-        ws = [wave_max(v) for v in vs]
-        if lane == 0:
-            for i in range_constexpr(len(vs)):
-                lds_st(red, i * WAVES + wave, ws[i])
-        gpu.barrier()
-        tots = []
-        for i in range_constexpr(len(vs)):
-            t = lds_ld(red, i * WAVES)
-            for w in range_constexpr(1, WAVES):
-                t = fx.max(t, lds_ld(red, i * WAVES + w))
-            tots.append(t)
-        gpu.barrier()
-        return tots
-
     def absmax4(a):
         return fx.max(
             fx.max(fmath.absf(a[0]), fmath.absf(a[1])),
@@ -339,7 +323,7 @@ def common_defs(ctx):
                     for i in range_constexpr(1, per):
                         m = fx.max(m, absmax4(vbs[s_][i]))
                     amaxes.append(m)
-                for s_, amax in enumerate(block_maxes(amaxes)):
+                for s_, amax in enumerate(st.block_maxes(amaxes)):
                     sc, q = quant_rule_ptpc(amax)
                     s = c0 + s_
                     for i in range_constexpr(per):
@@ -464,7 +448,7 @@ def common_defs(ctx):
             a0, a1 = bf2_f32(v[0].bitcast(fx.Int32))
             a2, a3 = bf2_f32(v[1].bitcast(fx.Int32))
             rows.append([a0, a1, a2, a3])
-        for s, amax in enumerate(block_maxes([absmax4(a) for a in rows])):
+        for s, amax in enumerate(st.block_maxes([absmax4(a) for a in rows])):
             sc, q = quant_rule_ptpc(amax)
             lds_st(
                 xs,

@@ -29,6 +29,11 @@ BUILDS = (
         for w in ("fp8", "mxfp4", "mxfp4_attnfp8")
         for T, cap in ((1, 0), (4, 0), (4, 16), (6, 0), (6, 16))
     ]
+    # MXFP4-AttnFP8 GDN layers with the mids published as MXFP4 (from 8 rows)
+    + [
+        (False, "mxfp4_attnfp8", T, cap, False, S)
+        for T, cap, S in ((1, 0, 8), (4, 16, 12), (6, 16, 12))
+    ]
     + [
         (True, w, T, 0, False, 4)
         for w in ("fp8", "mxfp4", "mxfp4_attnfp8")
@@ -45,6 +50,7 @@ BUILDS = (
             ("fp8", 6, 12),
             ("mxfp4", 1, 4),
             ("mxfp4", 6, 6),
+            ("mxfp4_attnfp8", 1, 8),
             ("mxfp4_attnfp8", 4, 4),
             ("mxfp4_attnfp8", 6, 12),
         )

@@ -8,8 +8,8 @@ then the final norm. That layer is the target's full-attention kernel (``runner`
 layer's own weights and KV cache; everything around it stays ATOM's.
 
 ATOM runs draft step 0 eagerly (``EagleProposer._declare_draft_graphs``) and replays steps 1.. from CUDA
-graphs; on mono the layer is one launch either way. A propose loop's steps come in two shapes: step 0 runs the target's
-verify rows (``spec_steps + 1`` consecutive tokens a request, the kernel's verify layout), steps 1..
+graphs; on mono the layer is one launch either way. A propose loop's steps come in two shapes: step 0
+runs the target's verify rows (``spec_steps + 1`` consecutive tokens a request, the kernel's verify layout), steps 1..
 one row a request. Each shape has its own launch widths (``WidthBuilds``).
 """
 
