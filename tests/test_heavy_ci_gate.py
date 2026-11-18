@@ -1007,9 +1007,7 @@ def _noop_group_suffix(group, *args):
 
 @pytest.mark.parametrize("filename", GATED_WORKFLOWS)
 def test_only_gate_opening_label_events_share_the_cancelling_group(tmp_path, filename):
-    config = yaml.safe_load(
-        (REPO_ROOT / ".github/workflows" / filename).read_text()
-    )
+    config = yaml.safe_load((REPO_ROOT / ".github/workflows" / filename).read_text())
     group = config["concurrency"]["group"]
     gate_env = next(
         step["env"]
