@@ -48,8 +48,12 @@ from atom.spec_decode.drafter import AuxCaptureSpec
 from atom.utils import envs
 
 from .attention import Attention
-from .config import build_attention_topology
-from .layers import converted_linear_spec, native_quant_config
+from .config import FP4PTPC_RECIPE, build_attention_topology
+from .layers import (
+    converted_linear_spec,
+    native_quant_config,
+    routed_experts_are_ptpc,
+)
 from .model import Block, DeepseekV41ForCausalLM
 
 logger = logging.getLogger("atom")
@@ -245,6 +249,12 @@ class DeepseekV41DSpark(DSparkDraftModel):
         # Read by the loader's shared-expert rename (`_fuse_shared_expert`).
         self.quant_config = self.moe_quant_config
         topology = build_attention_topology(args)[args.num_hidden_layers :]
+        if args.fp4ptpc and not all(
+            routed_experts_are_ptpc(self.moe_quant_config, f"mtp.{i}.ffn.experts")
+            for i in range(len(topology))
+        ):
+            # The draft's FP4 experts run only converted, as the backbone's.
+            raise ValueError(f"mtp: {FP4PTPC_RECIPE}")
         # The backbone's, handed down: the two models never run at once, so a
         # stream of its own would buy nothing. Absent when built offline,
         # which is also where nothing is fast enough to care.

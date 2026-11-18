@@ -11,7 +11,10 @@ Chat, tool and reasoning-effort protocol integration is complete, and native
 image requests support chunked prefill and request-owned embedding lifetime.
 
 The reference revision is `dba1be0a40aa45a94ad051997016db3960a90277`, AITER is
-pinned to `88f8a553860199ee1194e6d92a5fb547417ab861`, and Engram builds on
+pinned to `a53213dc474521a52ace1cecc079b70e3a0afafb` (it was
+`2039d2b96cd547ebc52f8d55f5f29ec1b8290796` until the
+[gfx942 (MI308X)](#gfx942-mi308x) section; the other sections' numbers predate
+the change), and Engram builds on
 ROCm/ATOM PR #2185. The primary deployment scope is TP4 with whole-expert EP
 on MI355X GPUs. For measured TP2/TP4 no-EP, level-3 FULL AgentX performance,
 see the [AgentX benchmark recipe](DeepSeek-V4.1-Flash-Agentic.md), using
@@ -220,11 +223,11 @@ DSpark, from the FP4PTPC checkpoint (`quant_method: w8a8_fp8`): the native
 checkpoint with its dense linears stored as per-channel FP8.
 
 - **Routed experts.** FP4 in the checkpoint, converted to per-channel FP8 at
-  load by the `--online_quant_config` below. It is required: the runtime
-  refuses to start unless the pattern covers every layer's routed experts.
-  The per-channel FP8 shared expert then runs in their fused slot, which
-  `ATOM_ONLINE_QUANT_STREAMING` does not support. As with any online quant
-  config, the comm-fused MoE backend is off.
+  load by the `--online_quant_config` below. It is required: the model
+  refuses to build unless every routed expert is converted, the draft's
+  included, and the backbone's per-channel FP8 shared expert runs in their
+  fused slot. Expert parallel and data parallel are refused. As with any
+  online quant config, the comm-fused MoE backend is off.
 - **BF16 fallback.** AITER has no group32 FP8 GEMM on gfx942, so the linears
   the checkpoint keeps native 32x32 (`wo_a` and DSpark's draft) are
   dequantized to BF16 at load. At TP4 that costs 0.31 GiB more per GPU for
@@ -232,7 +235,7 @@ checkpoint with its dense linears stored as per-channel FP8.
 - **AITER.** Needs [#8086](https://github.com/ROCm/aiter/pull/8086) (the
   group32 GEMM query) and [#8178](https://github.com/ROCm/aiter/pull/8178)
   (the clamped per-channel FP8 MoE at this checkpoint's 576-wide TP4
-  intermediate).
+  intermediate). The pin above has both.
 
 TP4 (add `--method dspark --num-speculative-tokens 5` for DSpark):
 

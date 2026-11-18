@@ -46,6 +46,13 @@ class LayerAttentionSpec:
 
 
 FP4PTPC_METHOD = "w8a8_fp8"
+# FP4PTPC runs only with every FP4 routed expert converted to per-channel FP8:
+# the backbone's per-channel FP8 shared expert then takes their fused slot.
+FP4PTPC_RECIPE = (
+    "DeepSeek-V4.1 FP4PTPC needs its routed experts converted to per-channel "
+    'FP8: --online_quant_config \'{"layer_quant_config": {"*.ffn.experts*": '
+    '"ptpc_fp8"}}\''
+)
 
 
 def quantization_format(config) -> Literal["native", "fp4ptpc"]:
@@ -457,6 +464,16 @@ def validate_runtime_config(config):
             "online quantization of the native checkpoint",
             config.online_quant_config is not None and not config.hf_config.fp4ptpc,
         ),
+        (
+            # Run only tensor parallel, its shared expert in the routed
+            # experts' fused slot.
+            "FP4PTPC with expert or data parallel",
+            config.hf_config.fp4ptpc
+            and (
+                config.enable_expert_parallel
+                or config.parallel_config.data_parallel_size != 1
+            ),
+        ),
         ("EPLB", config.eplb_enable),
         (
             # The plane the paged scorer reads: FP8, or FP4 in the row-group
@@ -486,40 +503,6 @@ def validate_runtime_config(config):
     if config.kv_cache_block_size % 2:
         raise ValueError("DeepSeek-V4.1 PAGE token count must be even")
     validate_speculative_config(config)
-    validate_fp4ptpc_recipe(config)
-
-
-def validate_fp4ptpc_recipe(config):
-    """FP4PTPC runs only with every layer's FP4 routed experts converted to
-    per-channel FP8; unconverted, its per-channel FP8 shared expert cannot
-    take their fused slot."""
-    if not config.hf_config.fp4ptpc:
-        return
-    from aiter import QuantType, dtypes
-
-    from atom.utils import envs
-
-    if envs.ATOM_ONLINE_QUANT_STREAMING:
-        # The shared expert is staged into routed buffers that streaming
-        # leaves on meta; left standalone, its TP4 width (576) has no GEMM.
-        raise ValueError(
-            "DeepSeek-V4.1 FP4PTPC does not support ATOM_ONLINE_QUANT_STREAMING"
-        )
-    routed = (
-        config.quant_config.online_pattern_spec(f"layers.{layer}.ffn.experts")
-        for layer in range(config.hf_config.num_hidden_layers)
-    )
-    if any(
-        spec is None
-        or spec.quant_type.value != QuantType.per_Token.value
-        or spec.quant_dtype != dtypes.fp8
-        for spec in routed
-    ):
-        raise ValueError(
-            "DeepSeek-V4.1 FP4PTPC needs its routed experts converted to "
-            'per-channel FP8: --online_quant_config \'{"layer_quant_config": '
-            '{"*.ffn.experts*": "ptpc_fp8"}}\''
-        )
 
 
 def validate_tbo_parallelism(config):

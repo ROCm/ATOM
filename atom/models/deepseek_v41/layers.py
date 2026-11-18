@@ -5,7 +5,7 @@ import torch
 from aiter import QuantType, dtypes
 
 from atom.config import QuantizationConfig
-from atom.quant_spec import LayerQuantConfig
+from atom.quant_spec import LayerQuantConfig, effective_layer_quant
 
 
 def _native_spec(fp4=False):
@@ -43,3 +43,10 @@ def converted_linear_spec(config):
 def converted_linear_config(config):
     """`converted_linear_spec` as a linear's `quant_config`."""
     return _as_config(converted_linear_spec(config))
+
+
+def routed_experts_are_ptpc(quant_config, prefix: str) -> bool:
+    """Whether the routed experts at `prefix` run per-channel FP8, online
+    quantization included, as an FP4PTPC checkpoint's must."""
+    quant_type, quant_dtype = effective_layer_quant(quant_config, prefix)
+    return quant_type.value == QuantType.per_Token.value and quant_dtype == dtypes.fp8

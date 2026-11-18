@@ -76,7 +76,11 @@ def test_fp4ptpc_shared_expert_is_per_channel_on_the_backbone_only(
     """An FP4PTPC backbone's shared expert is per-channel FP8 like its
     attention projections, on both lookups; the draft's stays native."""
     monkeypatch.setattr(unallocated_moe, "fp4ptpc", True)
-    instance = build_v41(entrypoint, {"global_quant_config": "per_block_fp8"})
+    online = {
+        "global_quant_config": "per_block_fp8",
+        "layer_quant_config": {"*.ffn.experts*": "ptpc_fp8"},
+    }
+    instance = build_v41(entrypoint, online)
     draft = entrypoint.startswith("draft")
     config = instance.moe_quant_config
     for block in instance.mtp if draft else instance.layers:
@@ -87,6 +91,37 @@ def test_fp4ptpc_shared_expert_is_per_channel_on_the_backbone_only(
             QuantType.per_1x32 if draft else QuantType.per_Token
         )
         assert online == source
+
+
+def test_fp4ptpc_refuses_an_unfused_shared_expert(
+    monkeypatch, single_rank, unallocated_moe, build_v41
+):
+    """Whatever leaves an FP4PTPC backbone's shared expert standalone (an
+    unconverted or excluded layer, a topology) is refused at build."""
+    from atom.models.deepseek_v4 import MoE as V4MoE
+
+    record = V4MoE.__init__
+
+    def unfused(self, *args, **kwargs):
+        record(self, *args, **kwargs)
+        self._fuse_shared_into_routed = False
+
+    monkeypatch.setattr(V4MoE, "__init__", unfused)
+    build_v41("offline")  # The native checkpoint's is its own module.
+    monkeypatch.setattr(unallocated_moe, "fp4ptpc", True)
+    with pytest.raises(ValueError, match="FP4PTPC needs its routed experts"):
+        build_v41("offline")
+
+
+@pytest.mark.parametrize(
+    "online", [None, {"layer_quant_config": {"layers.*.ffn.experts*": "ptpc_fp8"}}]
+)
+def test_fp4ptpc_refuses_unconverted_draft_experts(
+    monkeypatch, single_rank, unallocated_moe, build_v41, online
+):
+    monkeypatch.setattr(unallocated_moe, "fp4ptpc", True)
+    with pytest.raises(ValueError, match="FP4PTPC needs its routed experts"):
+        build_v41("draft", online)
 
 
 def test_shared_loading_follows_any_fused_layer():

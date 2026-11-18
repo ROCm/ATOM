@@ -779,39 +779,24 @@ def test_the_attention_output_buffer_is_one_row_per_token_not_per_sequence():
 
 
 @pytest.mark.parametrize(
-    "online,ok",
+    "override",
     [
-        (None, False),
-        ({"layer_quant_config": {"*.attn.*": "ptpc_fp8"}}, False),
-        ({"layer_quant_config": {"*.ffn.experts*": "ptpc_fp8"}}, True),
-        # Every layer's, not just the first.
-        ({"layer_quant_config": {"layers.0.ffn.experts*": "ptpc_fp8"}}, False),
-        # A global spec leaves the routed experts in their source format.
-        ({"global_quant_config": "ptpc_fp8"}, False),
+        {"enable_expert_parallel": True},
+        {
+            "parallel_config": SimpleNamespace(data_parallel_size=2),
+            "enable_dp_attention": True,
+        },
     ],
 )
-def test_fp4ptpc_needs_its_routed_experts_converted(monkeypatch, online, ok):
-    pytest.importorskip("aiter", reason="the quant specs are AITER enums")
-    from atom.config import QuantizationConfig
-
-    monkeypatch.setenv("ATOM_ONLINE_QUANT_STREAMING", "0")
-    checkpoint = SimpleNamespace(torch_dtype=None, quantization_config=None)
-    config = runtime_config(
-        hf_config=SimpleNamespace(
-            sliding_window=128, fp4ptpc=True, num_hidden_layers=2
-        ),
-        online_quant_config=online,
-        quant_config=QuantizationConfig(checkpoint, online),
-    )
-    if ok:
-        validate_runtime_config(config)
-        # Streamed routed buffers cannot take the fused shared expert.
-        monkeypatch.setenv("ATOM_ONLINE_QUANT_STREAMING", "1")
-        with pytest.raises(ValueError, match="ATOM_ONLINE_QUANT_STREAMING"):
-            validate_runtime_config(config)
-    else:
-        with pytest.raises(ValueError, match="FP4PTPC needs its routed experts"):
-            validate_runtime_config(config)
+def test_fp4ptpc_runs_only_tensor_parallel(override):
+    fp4ptpc = {
+        "hf_config": SimpleNamespace(sliding_window=128, fp4ptpc=True),
+        "online_quant_config": {"layer_quant_config": {"*.ffn.experts*": "ptpc_fp8"}},
+        "enable_expert_parallel": False,
+    }
+    validate_runtime_config(runtime_config(**fp4ptpc))
+    with pytest.raises(ValueError, match="FP4PTPC with expert or data parallel"):
+        validate_runtime_config(runtime_config(**{**fp4ptpc, **override}))
 
 
 def test_pd_store_requires_bounded_replay_for_the_offload_leaf():
@@ -833,20 +818,3 @@ def test_pd_store_requires_bounded_replay_for_the_offload_leaf():
             kv_cache_block_size=256,
         )
     )
-
-
-def test_fp4ptpc_needs_per_token_fp8_experts():
-    pytest.importorskip("aiter", reason="the quant specs are AITER enums")
-    from aiter import QuantType, dtypes
-
-    from atom.quant_spec import LayerQuantConfig
-
-    fp4 = LayerQuantConfig(quant_type=QuantType.per_Token, quant_dtype=dtypes.fp4x2)
-    config = runtime_config(
-        hf_config=SimpleNamespace(
-            sliding_window=128, fp4ptpc=True, num_hidden_layers=2
-        ),
-        quant_config=SimpleNamespace(online_pattern_spec=lambda _name: fp4),
-    )
-    with pytest.raises(ValueError, match="FP4PTPC needs its routed experts"):
-        validate_runtime_config(config)

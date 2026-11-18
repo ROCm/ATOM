@@ -1240,6 +1240,11 @@ class LinearBase(nn.Module):
             self.quant_type, self.params_dtype, online_layer_quant_config
         ):
             return
+        if self.params_dtype == torch.float4_e2m1fn_x2:
+            # Only MoE experts convert from MXFP4.
+            raise ValueError(
+                f"{self.prefix}: an MXFP4 linear is not an online quantization source"
+            )
 
         assert online_quant_dtype in [
             dtypes.fp8,

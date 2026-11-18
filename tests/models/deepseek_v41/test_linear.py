@@ -47,6 +47,22 @@ def _online_quant_config(block_rows=1):
     )
 
 
+def test_an_mxfp4_linear_is_not_an_online_quant_source(linear_modules):
+    """Only MoE experts convert from MXFP4."""
+    from aiter import QuantType, dtypes
+
+    linear, _ = linear_modules
+    target = LayerQuantConfig(quant_type=QuantType.per_Token, quant_dtype=dtypes.fp8)
+    module = SimpleNamespace(
+        prefix="layers.0.proj",
+        quant_type=QuantType.per_1x32,
+        params_dtype=torch.float4_e2m1fn_x2,
+        quant_config=SimpleNamespace(get_layer_quant_config=lambda *_a, **_k: target),
+    )
+    with pytest.raises(ValueError, match="MXFP4 linear"):
+        linear.LinearBase.online_quantize_weight(module)
+
+
 def test_online_requantized_source_drops_the_native_layout(linear_modules):
     """MiniMax-M3-MXFP8's attention linears, which online quant overwrites.
 

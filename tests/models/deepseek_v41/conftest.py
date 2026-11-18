@@ -113,6 +113,7 @@ def unallocated_moe(monkeypatch):
         self.alt_stream = alt_stream
         self.n_routed_experts = args.n_routed_experts
         self.n_activated_experts = args.n_activated_experts
+        self._fuse_shared_into_routed = True
 
     monkeypatch.setattr(V4MoE, "__init__", capture_v4)
 

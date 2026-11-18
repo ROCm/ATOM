@@ -228,6 +228,9 @@ def should_stream_online_quant(
 
     if not envs.ATOM_ONLINE_QUANT_STREAMING:
         return False
+    # MXFP4 sources convert in the post-load pass, which gathers w2.
+    if source_quant_dtype == d_dtypes.get("fp4x2"):
+        return False
     # can_dequant_weight_online recognizes only torch dtypes; NVFP4 is decoded
     # by its own source decoder, `dequantize_nvfp4`.
     if source_quant_dtype != NVFP4_DTYPE and not can_dequant_weight_online(

@@ -51,7 +51,7 @@ is one of:
 | _(none, i.e. BF16/FP16 model)_ | Quantized directly from float weights. |
 | `fp8` (block FP8, `QuantType.per_1x128`) | FP8 block weights are dequantized to BF16 first, then re-quantized. |
 | `quark` / `modelopt` with NVFP4 layers | Packed group-16 NVFP4 weights are decoded with their E4M3 block scales and required FP32 global weight scales, then converted to MXFP4. This source currently supports only an `mxfp4` online target; direct NVFP4 inference is rejected. |
-| `mxfp4` | MXFP4 weights are dequantized to BF16 first, then re-quantized. MoE experts with hidden padding or an expert bias are rejected. |
+| `mxfp4` | MXFP4 MoE experts are dequantized to BF16 first, then re-quantized; experts with hidden padding or an expert bias are rejected. MXFP4 dense linears are rejected. |
 
 ## Configuration syntax
 

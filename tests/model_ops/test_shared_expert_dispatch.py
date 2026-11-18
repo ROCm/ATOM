@@ -310,11 +310,15 @@ def test_ptpc_shared_expert_staging(monkeypatch, shared, routed, online, staged)
 
 def test_ptpc_shared_expert_is_not_staged_into_streamed_experts(monkeypatch):
     """The staging refuses streamed routed buffers, so the decision leaves the
-    shared expert standalone."""
+    shared expert standalone. MXFP4 sources are not streamed."""
     monkeypatch.setenv("ATOM_ONLINE_QUANT_STREAMING", "1")
-    quant_config = _QuantConfig(_PTPC, _MXFP4, _PTPC)
     prefix = "model.layers.3.mlp.experts"
-    assert not fuses_ptpc_shared_into_online_ptpc(quant_config, prefix, _PTPC, _MXFP4)
+    for routed, staged in ((_BLOCK, False), (_MXFP4, True)):
+        quant_config = _QuantConfig(_PTPC, routed, _PTPC)
+        assert (
+            fuses_ptpc_shared_into_online_ptpc(quant_config, prefix, _PTPC, routed)
+            is staged
+        )
 
 
 @pytest.mark.parametrize(
