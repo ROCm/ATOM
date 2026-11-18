@@ -2214,6 +2214,7 @@ def _run_slot_transfer(mc, connector, request_data):
         [1, 2],
         {"slot_index": 5},
         "req-1",
+        None,
     )
 
 
