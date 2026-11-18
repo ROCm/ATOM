@@ -20,3 +20,24 @@ both are cited rather than replaced.
 This lives here rather than in `SKILL.md` because `SKILL.md` is injected into every review
 prompt and is held to a 500-line budget; provenance a reviewer reads once does not need to
 cost attention on every run.
+
+
+## Asking for a run
+
+SKILL.md: "when the action is `run something`, ask for ONE run." The record behind it,
+from ATOM reviews labelled by whether the author acted -- five judged asks, three carried
+out and two not:
+
+| | ask | outcome |
+|---|---|---|
+| ✅ | ATOM#3165 "rebase onto current main and re-run the CPU suite and the `ci:atom` heavy jobs" | done |
+| ✅ | ATOM#3275 "one GPU A/B ... once a GPU host is available" | posted 17 h later |
+| ✅ | ATOM#3323 "re-run at least one 512c arm on the final head" | came back with the table |
+| ❌ | ATOM#3165 "admission off vs W only vs W + 512 ... post req/s, errors and preemptions" | merged with the box still empty, after 12 commits |
+| ❌ | ATOM#3306 "GSM8K plus staged/landed throughput" | still open after 14 commits |
+
+Small N, and the cleanest comparison is the ATOM#3165 pair: one author, one PR, one week.
+What separates them is how much the ask costs, not how it was worded.
+
+An ask the author cannot fit into their day looks, in the record, exactly like one they
+disagreed with.
