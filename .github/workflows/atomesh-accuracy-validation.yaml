@@ -141,14 +141,11 @@ jobs:
           current = level_map.get(event, "pr")
           allowed = {"pr": {"pr"}, "main": {"pr", "main"}, "nightly": {"pr", "main", "nightly"}}[current]
           models = json.load(open(".github/benchmark/models_accuracy.json", encoding="utf-8"))
-          # NOTE: Meta-Llama-3-8B-Instruct was this whitelist's only "pr" entry
-          # and has been removed from models_accuracy.json, so atomesh
-          # standalone currently validates nothing on a pull request. Promoting
-          # a replacement changes what every atomesh PR pays for, so it is left
-          # to the job owner rather than decided here.
+          # Each "pr" model runs on every ATOMesh pull request the heavy CI gate
+          # opens, and that PR's ATOMesh Accuracy Gate fails without one.
           atomesh_levels = {
               "DeepSeek-R1-0528": "main",
-              "gpt-oss-120b": "nightly",
+              "gpt-oss-120b": "pr",
           }
           filtered = [m for m in models if atomesh_levels.get(m["model_name"], "skip") in allowed]
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
@@ -172,9 +169,9 @@ jobs:
       fail-fast: false
       matrix:
         include: ${{ fromJson(needs.load-test-models.outputs.models_json || '[{"runner":"ubuntu-latest","model_name":"skip"}]') }}
-    # On a pull request an empty model list (every one today) must skip the
-    # job: a matrix without entries fails the run before any job starts. On
-    # push and nightly an empty list still fails the run.
+    # On a pull request an empty model list must skip the job: a matrix
+    # without entries fails the run before any job starts. On push and
+    # nightly an empty list still fails the run.
     if: ${{ needs.ci-gate.outputs.should_run == 'true' && needs.download_aiter_wheel.result == 'success' && needs.load-test-models.result == 'success' && (!github.event.pull_request || needs.load-test-models.outputs.models_json != '[]') }}
     runs-on: ${{ matrix.runner }}
 
@@ -591,12 +588,11 @@ jobs:
           decidable: ${{ needs.ci-gate.outputs.decidable }}
           reason: ${{ needs.ci-gate.outputs.reason }}
           ci-gate-result: ${{ needs.ci-gate.result }}
-          optional-results: |
-            atomesh-test=${{ needs.atomesh-test.result }}
           required-results: |
             check-signal=${{ needs.check-signal.result }}
             download_aiter_wheel=${{ needs.download_aiter_wheel.result }}
             load-test-models=${{ needs.load-test-models.result }}
+            atomesh-test=${{ needs.atomesh-test.result }}
 
   # ---------- Publish Atomesh accuracy data for the mocker benchmark dashboard ----------
   publish-atomesh-accuracy-data:

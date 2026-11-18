@@ -3,6 +3,10 @@
 
 """What the ATOMesh workflows run on a pull request."""
 
+import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import yaml
@@ -70,14 +74,28 @@ def test_atomesh_accuracy_uses_required_heavy_ci_gate():
         if step.get("uses") == "./.github/actions/evaluate-test-gate"
     )
     evaluate_inputs = evaluate_step["with"]
-    assert (
-        "atomesh-test=${{ needs.atomesh-test.result }}"
-        in evaluate_inputs["optional-results"]
+    required = evaluate_inputs["required-results"]
+    assert "load-test-models=${{ needs.load-test-models.result }}" in required
+    assert "atomesh-test=${{ needs.atomesh-test.result }}" in required
+    assert "optional-results" not in evaluate_inputs
+
+
+def test_a_pull_request_checks_one_model_on_atomesh_standalone(tmp_path):
+    jobs = _jobs("atomesh-accuracy-validation.yaml")
+    assert jobs["atomesh-test"]["env"]["USE_ATOMESH_ENTRYPOINTS"] == 1
+    load = next(s for s in jobs["load-test-models"]["steps"] if s.get("id") == "load")
+    script = load["run"].split("python3 << 'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+    output = tmp_path / "output"
+    subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=WORKFLOWS.parents[1],
+        env=dict(os.environ, EVENT_NAME="pull_request", GITHUB_OUTPUT=str(output)),
+        check=True,
+        capture_output=True,
+        timeout=30,
     )
-    assert (
-        "load-test-models=${{ needs.load-test-models.result }}"
-        in evaluate_inputs["required-results"]
-    )
+    models = json.loads(output.read_text().split("models_json=", 1)[1])
+    assert [m["model_name"] for m in models] == ["gpt-oss-120b"]
 
 
 def test_atomesh_benchmark_uses_required_heavy_ci_gate():
@@ -173,9 +191,59 @@ def test_mocker_benchmark_stays_off_pull_requests():
     jobs = _jobs("atomesh-mocker-benchmark.yaml")
     benchmark = jobs["run_atomesh_mocker_benchmark"]
     assert benchmark["if"] == "${{ github.event_name != 'pull_request' }}"
-    assert "github.event.pull_request.draft == false" in (
-        jobs["run_atomesh_test_harness"]["if"]
+    assert jobs["run_atomesh_test_harness"]["if"] == (
+        "${{ needs.unit-test-scope.outputs.should_run == 'true' }}"
     )
+
+
+def test_every_pull_request_publishes_the_atomesh_unit_test_gate():
+    workflow = _workflow("atomesh-mocker-benchmark.yaml")
+    events = workflow.get("on", workflow.get(True))
+    assert "paths" not in events["pull_request"]
+
+    jobs = workflow["jobs"]
+    assert jobs["run_atomesh_test_harness"]["needs"] == ["unit-test-scope"]
+    gate = jobs["unit-test-gate"]
+    assert gate["name"] == "ATOMesh non-GPU unit tests"
+    assert gate["if"] == "always()"
+    assert gate["needs"] == ["unit-test-scope", "run_atomesh_test_harness"]
+    inputs = next(
+        step["with"]
+        for step in gate["steps"]
+        if step.get("uses") == "./.github/actions/evaluate-test-gate"
+    )
+    assert inputs["ci-gate-result"] == "${{ needs.unit-test-scope.result }}"
+    assert inputs["required-results"].strip() == (
+        "run_atomesh_test_harness=${{ needs.run_atomesh_test_harness.result }}"
+    )
+
+
+def test_the_unit_test_scope_follows_the_changed_files(tmp_path):
+    scope = _jobs("atomesh-mocker-benchmark.yaml")["unit-test-scope"]["steps"][0]
+    gh = tmp_path / "gh"
+    gh.write_text('#!/bin/sh\nprintf "%s\\n" $CHANGED_FILES\n')
+    gh.chmod(0o755)
+    cases = (
+        ("1", "false", "docs/a.md atom/mesh/src/lib.rs", "true"),
+        ("1", "false", "docs/a.md atom/model_engine/a.py", "false"),
+        ("1", "true", "atom/mesh/src/lib.rs", "false"),
+        ("", "false", "", "true"),
+    )
+    for pr_number, is_draft, changed_files, should_run in cases:
+        output = tmp_path / "output"
+        output.write_text("")
+        env = {
+            "PATH": f"{tmp_path}:{os.environ['PATH']}",
+            "GITHUB_OUTPUT": str(output),
+            "GITHUB_REPOSITORY": "ROCm/ATOM",
+            "PATHS_INCLUDE": scope["env"]["PATHS_INCLUDE"],
+            "PR_NUMBER": pr_number,
+            "IS_DRAFT": is_draft,
+            "CHANGED_FILES": changed_files,
+        }
+        subprocess.run(["bash", "-c", scope["run"]], env=env, check=True, timeout=10)
+        lines = output.read_text().splitlines()
+        assert f"should_run={should_run}" in lines, (pr_number, is_draft, changed_files)
 
 
 def _steps(job):
