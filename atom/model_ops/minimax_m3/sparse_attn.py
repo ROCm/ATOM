@@ -20,7 +20,11 @@ import torch
 # which couples to vLLM internals. ATOM imports triton directly everywhere else.
 import triton
 import triton.language as tl
-from aiter.ops.attention import pa_fwd_asm_supports_arch
+try:
+    from aiter.ops.attention import pa_fwd_asm_supports_arch
+except ImportError:
+    # aiter pre-ASM-arch-check (bf37d container); ASM path disabled → gluon/triton used
+    pa_fwd_asm_supports_arch = lambda: False  # noqa: E731
 
 from atom.model_ops.minimax_m3.geometry import SPARSE_BLOCK_SIZE
 from atom.model_ops.minimax_m3.index_buffers import IndexScoreBuffers

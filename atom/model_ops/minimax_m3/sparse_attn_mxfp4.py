@@ -18,8 +18,14 @@ MXFP4 pages), each with a plan from the shared cache. Prefill runs plan-free
 """
 
 import torch
-from aiter.ops.flydsl.pa_decode import pa_decode
-from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
+try:
+    from aiter.ops.flydsl.pa_decode import pa_decode
+except ImportError:
+    pa_decode = None  # aiter pre-flydsl (bf37d container); MXFP4 sparse PA unavailable
+try:
+    from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
+except ImportError:
+    get_recommended_splits = lambda *_: 1  # noqa: E731
 
 from atom.model_ops.base_attention import (
     _FLYDSL_PLAN_MAX_BATCH,
