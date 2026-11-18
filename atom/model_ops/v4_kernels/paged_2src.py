@@ -52,6 +52,7 @@ import torch
 import triton
 import triton.language as tl
 
+from atom import plugin_host
 from atom.model_ops.v4_kernels.paged_decode import _cu_count
 from atom.model_ops.v4_kernels.pool_index import row_offset
 from atom.utils import envs
@@ -842,6 +843,7 @@ def sparse_attn_v4_paged_2src_reference(
     return _sparse_attn_ragged_torch(q, pool, attn_sink, topk_idxs, softmax_scale)
 
 
+@plugin_host.site("v41.attn.attend")
 @mark_trace
 def sparse_attn_v4_paged_2src(
     q: torch.Tensor,
