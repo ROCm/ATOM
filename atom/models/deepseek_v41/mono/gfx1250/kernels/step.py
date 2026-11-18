@@ -225,6 +225,7 @@ L20_ORD = True        # (l20) the candidate layer's selections: one pass of topk
 L20_SEL_ORDERED = False   # (l20) its top-512 in arrival order (as select_mc's FULL layers; the blocks stay ascending)
 L20_BLK_SLOT, L20_OC_SLOT = D.LAYERS + 1, D.LAYERS + 2   # (l20) mchist slots: the block selection's radix bins, the ordered counts
 CODE_END_OFF = 131024   # cyc scratch: the target / draft launches' end PCs (hx.code_end)
+L0_MID_KB, L0_MID_ONE_IN = 96, 16   # layer 0's mid-layer L2 code prefetch (target_layer): E4 .. the layer's end (86.5 KB)
 CODE_PF_KB = 160   # the target entry's L2 code prefetch: the layer loop's hot code (layout checked: inside .text)
 
 
@@ -842,6 +843,13 @@ def target_layer(E, Ly):
 
     # ---- wo_a by head (dflag -> wflag), head fold (-> eflag), wo_b 160 x 32 (eflag), TP1 -> y1
     v3e = dict(wpart=c["ypart"], wflag=wfl, wtag=wtg, NDF=DCT)
+    if fx.const_expr(not DRS):
+        # layer 0: the layer's code from here (wo_a) to its end -> L2 again, one CTA a cluster (device.code_prefetch_near).
+        # Without it, in most runs some CTA clusters of 1-2 ranks ran layer 0's router / MoE UG +6..+10 us slower (the
+        # ranks' max at TP2); an L2 code prefetch here removed that, an I-cache one did not (step probe, 11-18)
+        pc0 = hx.getpc()   # (here, on the hot path: the prefetch itself sits in a cold block)
+        if hx.unlikely((Ly == fx.Int32(0)) & (b % L0_MID_ONE_IN == 0)):
+            hx.code_prefetch_near(hx.opaque_v(fx.thread_idx.x), b, fptr(fp, "cyc") + i64(S.CODE_END_OFF), L0_MID_KB, pc=pc0)
     AS.stage_E4(cwith(c, **v3f, **v3e))   # (wo_a with the head sum in the CTA: no fold hop)
     AS.stage_F3(cwith(c, **v3f, NEF=64))
     AS.tp3(cwith(c, ytgt=fptr(fp, "y1")), par * 2, 2 * Ly + 1)

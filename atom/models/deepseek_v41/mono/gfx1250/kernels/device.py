@@ -221,6 +221,27 @@ def code_prefetch_all(t, endp, kb):
 
 
 @_ASTR.transform
+def code_prefetch_near(t, b, endp, kb, off=0, one_in=1, pc=None):
+    """Warm L2 with the code a stage is about to run, just before it (the entry's code_prefetch_all no longer holds by
+    the middle of a layer: the weight stream evicts it): from here + off (bytes, a compile-time constant) for `kb` KB,
+    one 128-byte global_prefetch a line, the CTA's threads striding over it; one_in > 1: only CTAs b % one_in == 0
+    issue it (a cluster's L2 is shared). Bounded as code_prefetch_all: by the end PC the previous run recorded at endp
+    (code_end; nothing on the first run) and nothing on an implausible end (not 0 < end - here < 512 KB). pc: "here"
+    taken by the caller (getpc on its hot path) when this call sits in a cold block."""
+    if fx.const_expr(pc is None):
+        pc = getpc()
+    end = gload(endp, fx.Int64)
+    ok = (end > pc + fx.Int64(off)) & (end - pc < fx.Int64(512 * 1024))
+    nl = ok.select(fx.min((end - pc - fx.Int64(off)) // 128, fx.Int64(kb * 8)), fx.Int64(0))
+    if fx.const_expr(one_in > 1):
+        nl = ((b % one_in) == 0).select(nl, fx.Int64(0))
+    for j in range_constexpr((kb * 8 + 255) // 256):
+        i = fx.Int64(t) + fx.Int64(j * 256)
+        if i < nl:
+            prefetch(pc + fx.Int64(off) + i * 128)
+
+
+@_ASTR.transform
 def code_end(t, b, endp):
     """Record this kernel's PC near its end for the next run's code_prefetch."""
     if (b == 0) & (t == 0):
