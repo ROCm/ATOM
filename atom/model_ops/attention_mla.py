@@ -330,7 +330,7 @@ def _ps1_multi_token_num_heads(
     except ImportError as e:
         raise RuntimeError(
             "Speculative decode with DCP on gfx1250 needs an aiter with "
-            "get_mla_decode_num_heads (ROCm/aiter#7913)."
+            "get_mla_decode_num_heads (ROCm/aiter#8181)."
         ) from e
     dtype = dtypes.fp8 if kv_cache_dtype.startswith("fp8") else torch.bfloat16
     heads = get_mla_decode_num_heads(

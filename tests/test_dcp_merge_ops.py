@@ -2097,7 +2097,7 @@ def test_gfx1250_multi_token_decode_needs_aiters_helper(monkeypatch):
 
     monkeypatch.setattr(attention_mla_module, "get_gfx", lambda: "gfx1250")
     monkeypatch.delattr(aiter_attention, "get_mla_decode_num_heads", raising=False)
-    with pytest.raises(RuntimeError, match="ROCm/aiter#7913"):
+    with pytest.raises(RuntimeError, match="ROCm/aiter#8181"):
         mla_dcp_kernel_num_heads(
             8, 2, 16, kv_cache_dtype="fp8", persistent=True, max_seqlen_q=5
         )
