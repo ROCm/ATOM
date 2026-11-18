@@ -21,9 +21,23 @@ import torch
 try:
     from aiter.ops.flydsl.pa_decode import pa_decode as _pa_decode_raw
     import inspect as _inspect
-    if 'max_context_length' not in _inspect.signature(_pa_decode_raw).parameters:
-        def pa_decode(*args, max_context_length=None, **kwargs):
-            return _pa_decode_raw(*args, **kwargs)
+    _pd_params = _inspect.signature(_pa_decode_raw).parameters
+    # aiter bf37d requires max_context_partition_num as a positional arg that
+    # newer aiter removed (now computed from work_plan internally).
+    _pd_needs_part = (
+        'max_context_partition_num' in _pd_params
+        and _pd_params['max_context_partition_num'].default is _inspect.Parameter.empty
+    )
+    if 'max_context_length' not in _pd_params:
+        if _pd_needs_part:
+            def pa_decode(*args, max_context_length=None, max_context_partition_num=1, **kwargs):
+                return _pa_decode_raw(*args, max_context_partition_num=max_context_partition_num, **kwargs)
+        else:
+            def pa_decode(*args, max_context_length=None, **kwargs):
+                return _pa_decode_raw(*args, **kwargs)
+    elif _pd_needs_part:
+        def pa_decode(*args, max_context_partition_num=1, **kwargs):
+            return _pa_decode_raw(*args, max_context_partition_num=max_context_partition_num, **kwargs)
     else:
         pa_decode = _pa_decode_raw
 except ImportError:
