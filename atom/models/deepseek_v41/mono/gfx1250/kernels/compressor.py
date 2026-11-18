@@ -279,6 +279,19 @@ def stage_crow(c, r1):
 
 
 @ASTRewriter.transform
+def crow_wk_prefetch(c):
+    """(before the KV_C wait) A live plan row's CTA: its index-key weights wk (128 x 512 bf16, 128 KB, 512 B a thread)
+    -> L2. ktrace L2 / L8 / L14 (133K): the wk loads + WMMA 5.6 / 4.6 / 4.8 -> 3.8 us; the row's other loads
+    prefetched as well changed nothing."""
+    t, b = c["t"], c["b"]
+    q = b - CROW0
+    qq = fx.max(fx.min(q, c["ccap"] - 1), I32(0))
+    if (b >= CROW0) & (q < c["ccap"]) & (hx.gload(c["cplan"] + i64(qq * 4 + 2) * 4, I32) >= 0):
+        for k in range_constexpr(4):
+            hx.prefetch(c["cwk"] + i64(t * 512 + k * 128))
+
+
+@ASTRewriter.transform
 def crow_flag(c):
     """(B) A compressor-row CTA's new keys (its device-scope stores) are out: its LL flag (CTAs CROW0 .. CROW0 + T - 1;
     the grouped scorer's last-column tasks wait for all T)."""

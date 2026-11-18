@@ -665,6 +665,8 @@ def target_layer(E, Ly):
             # INDEX_QUANT handoff after the compressor rows, as before
             iqonly = early | ((lfl2 & fx.Int64(2)) == fx.Int64(0))
             if ((lfl2 & fx.Int64(2)) != fx.Int64(0)) & (b >= CS.CROW0):   # (the compressor rows read the GEMM's partials)
+                CS.crow_wk_prefetch(dict(t=t, b=b, cwk=ltab(fp, Ly, "cwk")(), cplan=ltab(fp, Ly, "cplan")(),
+                                         ccap=fx.Int32(ltab(fp, Ly, "ccap")())))   # (wk -> L2 over the wait)
                 if t == 0:
                     hx.wait_count(lc + i64(LY.KV_C), CTAS, 4)
                 gpu.barrier()
