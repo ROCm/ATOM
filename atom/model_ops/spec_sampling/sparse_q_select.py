@@ -11,7 +11,8 @@ The cut is by level, the gap below the row max in 1/8 nats, not by exact value:
 the boundary level's lowest ids fill n = min(K, top-k, ids within 19 nats).
 That only moves acceptance: the draft samples from what is stored.
 Launches: histogram (which first reduces the row max from stage 1's tile
-maxima), compact (which first makes the row's cut from the histogram tables),
+maxima; past 16 rows on the whole vocab a separate combine does, and a
+separate cut launch makes the cut), compact (which first makes the row's cut from the histogram tables),
 finalize (normalize, the exponential race over the stored entries, and the
 row's raw argmax from stage 1's tile pairs). Each folded reduction reads the
 same per-tile inputs in the same fixed order a separate launch did, so the
@@ -29,7 +30,7 @@ import triton.language as tl
 
 from atom.model_ops.sampler import SAMPLER_EPS
 from atom.model_ops.spec_sampling.sampling_scratch import Region
-from atom.model_ops.spec_sampling.softmax_tiles import race_key
+from atom.model_ops.spec_sampling.softmax_tiles import race_key, softmax_combine_kernel
 from atom.model_ops.tile_argmax import argmax_lowest_id, argmax_of_tiles
 
 # Histogram and compact tile V identically (the cut hands each tile a slot range).
@@ -41,6 +42,9 @@ _Q_LEVELS_PER_NAT = 8.0
 _Q_MAX_GAP = 19.0
 # Stored entries one finalize iteration covers.
 _Q_FINAL_BLOCK = 1024
+# Whole vocab: up to this many rows the combine and the cut fold into the
+# histogram, the compaction and finalize.
+_FOLD_ROWS = 16
 
 
 @triton.jit
@@ -86,15 +90,17 @@ def _dspark_q_histogram(
     NUM_BINS: tl.constexpr,
     LEVELS_PER_NAT: tl.constexpr,
     MAX_GAP: tl.constexpr,
+    REDUCE_ROW_MAX: tl.constexpr,
 ):
     """One (row, V tile): how many of the tile's ids sit at each level.
 
-    The row max is reduced here from stage 1's ``num_parts`` tile maxima (the
-    whole row's, ``part_stride`` apart), and tile 0 publishes it for the
-    compaction. Its table goes to `hist_ptr + (row * hist_row_stride + tile *
-    hist_tile_stride) * NUM_BINS`: row-major `[B, tiles, bins]` for the whole
-    vocab, tile-major `[tiles, B, bins]` for a TP shard, whose tables the
-    ranks then gather (`select_and_draw_q_tp`).
+    ``REDUCE_ROW_MAX``: the row max is reduced here from stage 1's
+    ``num_parts`` tile maxima (the whole row's, ``part_stride`` apart), and
+    tile 0 publishes it for the compaction; otherwise it is read from
+    ``row_max_ptr``. Its table goes to `hist_ptr + (row * hist_row_stride +
+    tile * hist_tile_stride) * NUM_BINS`: row-major `[B, tiles, bins]` for the
+    whole vocab, tile-major `[tiles, B, bins]` for a TP shard, whose tables
+    the ranks then gather (`select_and_draw_q_tp`).
     """
     row = tl.program_id(0)
     tile = tl.program_id(1)
@@ -103,15 +109,18 @@ def _dspark_q_histogram(
         tl.load(temperatures_ptr + row) <= greedy_temperature
     ):
         return
-    offs_part = tl.arange(0, BLOCK_PARTS)
-    maxes = tl.load(
-        part_max_ptr + offs_part * part_stride + row,
-        mask=offs_part < num_parts,
-        other=float("-inf"),
-    )
-    row_max = tl.max(maxes, axis=0)
-    if tile == 0:
-        tl.store(row_max_ptr + row, row_max)
+    if REDUCE_ROW_MAX:
+        offs_part = tl.arange(0, BLOCK_PARTS)
+        maxes = tl.load(
+            part_max_ptr + offs_part * part_stride + row,
+            mask=offs_part < num_parts,
+            other=float("-inf"),
+        )
+        row_max = tl.max(maxes, axis=0)
+        if tile == 0:
+            tl.store(row_max_ptr + row, row_max)
+    else:
+        row_max = tl.load(row_max_ptr + row)
     offs_v = tile * BLOCK_V + tl.arange(0, BLOCK_V)
     v_mask = offs_v < vocab_size
     s = tl.load(
@@ -130,59 +139,29 @@ def _dspark_q_histogram(
 
 
 @triton.jit
-def _dspark_q_compact(
-    s_ptr,
-    row_max_ptr,
-    q_row_base_ptr,
-    temperatures_ptr,
-    greedy_temperature,
+def _row_cut(
+    hist_ptr,
+    row,
     top_k_ptr,
     top_p_ptr,
-    hist_ptr,
+    num_tiles,
     hist_row_stride,
     hist_tile_stride,
-    tile_off_ptr,
-    row_n_ptr,
-    q_ids_ptr,
-    q_probs_ptr,
-    vocab_size,
-    stride_s_row,
-    num_tiles,
     store_width,
-    position,
-    tile_base,
-    id_base,
     BLOCK_TILE: tl.constexpr,
-    BLOCK_V: tl.constexpr,
     NUM_BINS: tl.constexpr,
     LEVELS_PER_NAT: tl.constexpr,
-    MAX_GAP: tl.constexpr,
-    DEST_BY_ROW: tl.constexpr,
 ):
-    """One (row, V tile): make the row's cut, then store the tile's chosen ids
-    and their unnormalized weights ``exp(s - max)`` at its slot range, in id
-    order.
+    """One row's cut from its ``num_tiles`` histogram tables, read in id order:
+    ``(n, boundary level, each tile's quota, each tile's first slot)``.
 
-    The cut: n = min(store width, the request's top-k, ids within reach of the
-    max), then the request's top-p at level granularity. The boundary level is
-    the lowest one whose cumulative count reaches n; its ids are taken lowest
-    id first, so each tile's share of them (its quota) is what the tiles before
+    n = min(store width, the request's top-k, ids within reach of the max),
+    then the request's top-p at level granularity. The boundary level is the
+    lowest one whose cumulative count reaches n; its ids are taken lowest id
+    first, so each tile's share of them (its quota) is what the tiles before
     it leave over, and each tile's first output slot is the running total of
-    the tiles before it. Exactly n ids are then stored. Every tile of a row
-    makes the same cut from the same ``num_tiles`` tables, read in id order;
-    tile 0 publishes n and every tile's first slot for finalize.
-
-    ``s`` holds ``vocab_size`` ids from ``id_base``, which are the cut's tiles
-    from ``tile_base`` (both 0 for the whole vocab; a TP shard's otherwise,
-    `select_and_draw_q_tp`). ``DEST_BY_ROW`` writes batch row ``row``'s slots
-    to row ``row`` of a ``[B, store_width]`` staging pair rather than to its
-    store row.
+    the tiles before it. Exactly n ids are then stored.
     """
-    row = tl.program_id(0)
-    tile = tl.program_id(1)
-    q_base = tl.load(q_row_base_ptr + row)
-    if (q_base < 0) | (tl.load(temperatures_ptr + row) <= greedy_temperature):
-        return
     offs_tile = tl.arange(0, BLOCK_TILE)
     tile_mask = offs_tile < num_tiles
     bins = tl.arange(0, NUM_BINS)
@@ -229,13 +208,134 @@ def _dspark_q_compact(
     tile_quota = tl.minimum(tile_edge, tl.maximum(quota - edge_before, 0))
     tile_n = tile_below + tile_quota
     tile_off = tl.cumsum(tile_n, axis=0) - tile_n
-    if tile == 0:
-        tl.store(row_n_ptr + row, n)
-        tl.store(tile_off_ptr + row * num_tiles + offs_tile, tile_off, mask=tile_mask)
-    my_tile = tile_base + tile
-    my_quota = tl.sum(tl.where(offs_tile == my_tile, tile_quota, 0), axis=0)
-    my_off = tl.sum(tl.where(offs_tile == my_tile, tile_off, 0), axis=0)
+    return n, cut, tile_quota, tile_off
 
+
+@triton.jit
+def _dspark_q_cut(
+    hist_ptr,
+    q_row_base_ptr,
+    temperatures_ptr,
+    greedy_temperature,
+    top_k_ptr,
+    top_p_ptr,
+    tile_off_ptr,
+    tile_quota_ptr,
+    row_cut_ptr,
+    row_n_ptr,
+    num_tiles,
+    hist_row_stride,
+    hist_tile_stride,
+    store_width,
+    BLOCK_TILE: tl.constexpr,
+    NUM_BINS: tl.constexpr,
+    LEVELS_PER_NAT: tl.constexpr,
+):
+    """One row: `_row_cut`, published for the compaction and finalize."""
+    row = tl.program_id(0)
+    if (tl.load(q_row_base_ptr + row) < 0) | (
+        tl.load(temperatures_ptr + row) <= greedy_temperature
+    ):
+        return
+    n, cut, tile_quota, tile_off = _row_cut(
+        hist_ptr,
+        row,
+        top_k_ptr,
+        top_p_ptr,
+        num_tiles,
+        hist_row_stride,
+        hist_tile_stride,
+        store_width,
+        BLOCK_TILE,
+        NUM_BINS,
+        LEVELS_PER_NAT,
+    )
+    offs_tile = tl.arange(0, BLOCK_TILE)
+    tile_mask = offs_tile < num_tiles
+    tl.store(tile_off_ptr + row * num_tiles + offs_tile, tile_off, mask=tile_mask)
+    tl.store(tile_quota_ptr + row * num_tiles + offs_tile, tile_quota, mask=tile_mask)
+    tl.store(row_cut_ptr + row, cut)
+    tl.store(row_n_ptr + row, n)
+
+
+@triton.jit
+def _dspark_q_compact(
+    s_ptr,
+    row_max_ptr,
+    q_row_base_ptr,
+    temperatures_ptr,
+    greedy_temperature,
+    top_k_ptr,
+    top_p_ptr,
+    hist_ptr,
+    hist_row_stride,
+    hist_tile_stride,
+    tile_off_ptr,
+    tile_quota_ptr,
+    row_cut_ptr,
+    row_n_ptr,
+    q_ids_ptr,
+    q_probs_ptr,
+    vocab_size,
+    stride_s_row,
+    num_tiles,
+    store_width,
+    position,
+    tile_base,
+    id_base,
+    BLOCK_TILE: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+    NUM_BINS: tl.constexpr,
+    LEVELS_PER_NAT: tl.constexpr,
+    MAX_GAP: tl.constexpr,
+    MAKE_CUT: tl.constexpr,
+    DEST_BY_ROW: tl.constexpr,
+):
+    """One (row, V tile): store the tile's chosen ids and their unnormalized
+    weights ``exp(s - max)`` at its slot range, in id order.
+
+    ``MAKE_CUT``: every tile of a row makes the row's `_row_cut` itself, and
+    tile 0 publishes n and every tile's first slot for finalize; otherwise the
+    cut is `_dspark_q_cut`'s. ``s`` holds ``vocab_size`` ids from ``id_base``,
+    which are the cut's tiles from ``tile_base`` (both 0 for the whole vocab;
+    a TP shard's otherwise, `select_and_draw_q_tp`). ``DEST_BY_ROW`` writes
+    batch row ``row``'s slots to row ``row`` of a ``[B, store_width]`` staging
+    pair rather than to its store row.
+    """
+    row = tl.program_id(0)
+    tile = tl.program_id(1)
+    q_base = tl.load(q_row_base_ptr + row)
+    if (q_base < 0) | (tl.load(temperatures_ptr + row) <= greedy_temperature):
+        return
+    my_tile = tile_base + tile
+    if MAKE_CUT:
+        n, cut, tile_quota, tile_off = _row_cut(
+            hist_ptr,
+            row,
+            top_k_ptr,
+            top_p_ptr,
+            num_tiles,
+            hist_row_stride,
+            hist_tile_stride,
+            store_width,
+            BLOCK_TILE,
+            NUM_BINS,
+            LEVELS_PER_NAT,
+        )
+        offs_tile = tl.arange(0, BLOCK_TILE)
+        if tile == 0:
+            tl.store(row_n_ptr + row, n)
+            tl.store(
+                tile_off_ptr + row * num_tiles + offs_tile,
+                tile_off,
+                mask=offs_tile < num_tiles,
+            )
+        quota = tl.sum(tl.where(offs_tile == my_tile, tile_quota, 0), axis=0)
+        first = tl.sum(tl.where(offs_tile == my_tile, tile_off, 0), axis=0)
+    else:
+        cut = tl.load(row_cut_ptr + row)
+        quota = tl.load(tile_quota_ptr + row * num_tiles + my_tile)
+        first = tl.load(tile_off_ptr + row * num_tiles + my_tile)
     offs_v = tile * BLOCK_V + tl.arange(0, BLOCK_V)
     v_mask = offs_v < vocab_size
     s = tl.load(
@@ -246,8 +346,8 @@ def _dspark_q_compact(
     row_max = tl.load(row_max_ptr + row)
     level = _q_level(s, row_max, v_mask, NUM_BINS, LEVELS_PER_NAT, MAX_GAP)
     edge = level == cut
-    take = (level < cut) | (edge & (tl.cumsum(edge.to(tl.int32), axis=0) <= my_quota))
-    slot = my_off + (tl.cumsum(take.to(tl.int32), axis=0) - 1)
+    take = (level < cut) | (edge & (tl.cumsum(edge.to(tl.int32), axis=0) <= quota))
+    slot = first + (tl.cumsum(take.to(tl.int32), axis=0) - 1)
     if DEST_BY_ROW:
         dest = row.to(tl.int64) * store_width + slot
     else:
@@ -292,6 +392,7 @@ def _dspark_q_finalize(
     part_idx_ptr,
     part_stride,
     num_parts,
+    row_argmax_ptr,
     row_n_ptr,
     seed_ptr,
     out_ptr,
@@ -304,6 +405,7 @@ def _dspark_q_finalize(
     noise_offset,
     stride_out,
     FROM_STAGING: tl.constexpr,
+    ARGMAX_FROM_PARTS: tl.constexpr,
     WORLD: tl.constexpr,
     BLOCK_PARTS: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -406,9 +508,12 @@ def _dspark_q_finalize(
         best_slot = tl.where(better, chunk_slot, best_slot)
 
     drawn = best > 0.0
-    _, row_argmax = argmax_of_tiles(
-        part_val_ptr, part_idx_ptr, row, part_stride, num_parts, BLOCK_PARTS
-    )
+    if ARGMAX_FROM_PARTS:
+        _, row_argmax = argmax_of_tiles(
+            part_val_ptr, part_idx_ptr, row, part_stride, num_parts, BLOCK_PARTS
+        )
+    else:
+        row_argmax = tl.load(row_argmax_ptr + row)
     x = tl.where(drawn, best_id, row_argmax)
     tl.store(q_ids_ptr + base, x, mask=has_q & ~drawn)
     tl.store(q_probs_ptr + base, 1.0, mask=has_q & ~drawn)
@@ -427,7 +532,10 @@ class QSelectScratch(NamedTuple):
 
     hist: torch.Tensor  # [B, tiles, bins]
     tile_off: torch.Tensor  # [B, tiles]
+    tile_quota: torch.Tensor  # [B, tiles]
+    row_cut: torch.Tensor  # [B]
     row_n: torch.Tensor  # [B]
+    row_argmax: torch.Tensor  # [B]
 
 
 def q_select_scratch(num_rows: int, vocab_size: int) -> QSelectScratch:
@@ -437,6 +545,9 @@ def q_select_scratch(num_rows: int, vocab_size: int) -> QSelectScratch:
     return QSelectScratch(
         Region((num_rows, q_tiles, _Q_BINS), i32),
         Region((num_rows, q_tiles), i32),
+        Region((num_rows, q_tiles), i32),
+        Region((num_rows,), i32),
+        Region((num_rows,), i32),
         Region((num_rows,), i32),
     )
 
@@ -482,7 +593,28 @@ def select_and_draw_q(
     q_tiles = triton.cdiv(vocab_size, _Q_BLOCK_V)
     num_parts = part_max.shape[0]
     block_parts = triton.next_power_of_2(num_parts)
-    hist, tile_off, row_n = scratch
+    hist, tile_off, tile_quota, row_cut, row_n, row_argmax = scratch
+    # Folding the combine and the cut makes each of a row's q_tiles programs
+    # redo per-row work; past _FOLD_ROWS rows that costs more than the two
+    # launches it saves (gfx950, B=32), so larger batches keep them.
+    fold = num_rows <= _FOLD_ROWS
+    if not fold:
+        softmax_combine_kernel[(num_rows,)](
+            part_max,
+            None,
+            row_max,
+            None,
+            part_amax_val,
+            part_amax_idx,
+            row_argmax,
+            part_max.stride(0),
+            num_parts,
+            BLOCK_TILE=block_parts,
+            WITH_ARGMAX=True,
+            WITH_INV_Z=False,
+            num_warps=4,
+            num_stages=1,
+        )
     _dspark_q_histogram[(num_rows, q_tiles)](
         s_scratch,
         part_max,
@@ -500,8 +632,30 @@ def select_and_draw_q(
         BLOCK_PARTS=block_parts,
         BLOCK_V=_Q_BLOCK_V,
         **_LEVELS,
+        REDUCE_ROW_MAX=fold,
         num_warps=4,
     )
+    if not fold:
+        _dspark_q_cut[(num_rows,)](
+            hist,
+            q_row_base,
+            temperatures,
+            SAMPLER_EPS,
+            top_k,
+            top_p,
+            tile_off,
+            tile_quota,
+            row_cut,
+            row_n,
+            q_tiles,
+            q_tiles,
+            1,
+            store_width,
+            BLOCK_TILE=triton.next_power_of_2(q_tiles),
+            NUM_BINS=_Q_BINS,
+            LEVELS_PER_NAT=_Q_LEVELS_PER_NAT,
+            num_warps=8,
+        )
     _dspark_q_compact[(num_rows, q_tiles)](
         s_scratch,
         row_max,
@@ -514,6 +668,8 @@ def select_and_draw_q(
         q_tiles,
         1,
         tile_off,
+        tile_quota,
+        row_cut,
         row_n,
         q_ids,
         q_probs,
@@ -527,8 +683,9 @@ def select_and_draw_q(
         BLOCK_TILE=triton.next_power_of_2(q_tiles),
         BLOCK_V=_Q_BLOCK_V,
         **_LEVELS,
+        MAKE_CUT=fold,
         DEST_BY_ROW=False,
-        num_warps=8,
+        num_warps=8 if fold else 4,
     )
     _dspark_q_finalize[(num_rows,)](
         q_ids,
@@ -543,6 +700,7 @@ def select_and_draw_q(
         part_amax_idx,
         part_amax_val.stride(0),
         num_parts,
+        row_argmax,
         row_n,
         seed,
         out,
@@ -555,6 +713,7 @@ def select_and_draw_q(
         noise_offset,
         out.stride(0),
         FROM_STAGING=False,
+        ARGMAX_FROM_PARTS=fold,
         WORLD=1,
         BLOCK_PARTS=block_parts,
         BLOCK=_Q_FINAL_BLOCK,
@@ -668,6 +827,7 @@ def select_and_draw_q_tp(
         BLOCK_PARTS=block_parts,
         BLOCK_V=_Q_BLOCK_V,
         **_LEVELS,
+        REDUCE_ROW_MAX=True,
         num_warps=4,
     )
     _dspark_q_compact[(num_rows, local_tiles)](
@@ -682,6 +842,8 @@ def select_and_draw_q_tp(
         1,
         num_rows,
         tile_off,
+        None,
+        None,
         row_n,
         stage[0],
         stage[1].view(torch.float32),
@@ -695,6 +857,7 @@ def select_and_draw_q_tp(
         BLOCK_TILE=triton.next_power_of_2(num_tiles),
         BLOCK_V=_Q_BLOCK_V,
         **_LEVELS,
+        MAKE_CUT=True,
         DEST_BY_ROW=True,
         num_warps=8,
     )
@@ -711,6 +874,7 @@ def select_and_draw_q_tp(
         part_amax_idx,
         part_amax_val.stride(0),
         num_parts,
+        None,
         row_n,
         seed,
         out,
@@ -723,6 +887,7 @@ def select_and_draw_q_tp(
         noise_offset,
         out.stride(0),
         FROM_STAGING=True,
+        ARGMAX_FROM_PARTS=True,
         WORLD=world,
         BLOCK_PARTS=block_parts,
         BLOCK=_Q_FINAL_BLOCK,

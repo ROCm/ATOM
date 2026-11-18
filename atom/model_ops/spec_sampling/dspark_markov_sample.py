@@ -9,7 +9,8 @@ the stored set, so truncation costs acceptance, never exactness (`Q_WIDTH`).
 Four launches per position: GEMV + 1/T into the fp32 ``s`` scratch with tile
 partials; then histogram, compact and finalize (`sparse_q_select`), which
 reduce the row max, the cut and the raw argmax from those partials and tables
-themselves (finalize normalizes over the stored set).
+themselves (finalize normalizes over the stored set). Past 16 rows the whole
+vocab keeps the softmax combine and the cut as their own launches (six).
 Fixed-order reductions, no atomics: TP ranks must store and draw alike.
 CUDA-graph safe: seed, row bases and filters are device tensors; position and
 noise offset are static host ints; no data-dependent grid.
