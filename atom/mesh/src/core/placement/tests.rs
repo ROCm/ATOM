@@ -720,7 +720,7 @@ mod d_pd_planning {
     use super::super::test_support::*;
     use super::super::traits::{PdPlanner, PolicySource, WorkerSource};
     use super::super::types::{PlacementError, PlacementPlan, Protocol, RequestDescriptor};
-    use crate::core::WorkerType;
+    use crate::core::{Worker, WorkerType};
     use crate::policies::{LoadBalancingPolicy, RandomPolicy, RoundRobinPolicy};
 
     fn make_planner(src: MockWorkerSource, policies: MockPolicySource) -> DefaultPlanner {
@@ -748,6 +748,51 @@ mod d_pd_planning {
                 Some(8998),
             ))
             .add_worker(make_decode_grpc(&format!("http://{}-d:8000", model), model))
+    }
+
+    fn dp_worker(base_url: &str, dp_rank: usize, worker_type: WorkerType) -> Arc<dyn Worker> {
+        let builder =
+            crate::core::DPAwareWorkerBuilder::new_with_type(base_url, dp_rank, 2, worker_type);
+        Arc::new(builder.model_id("m").build())
+    }
+
+    fn prefill_url(plan: PlacementPlan) -> String {
+        match plan {
+            PlacementPlan::Pair { prefill, .. } => prefill.url().to_string(),
+            other => panic!("expected Pair, got {:?}", other),
+        }
+    }
+
+    fn prefill() -> WorkerType {
+        WorkerType::Prefill {
+            bootstrap_port: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_idx2idx_selects_decode_first_and_prefill_on_its_rank() {
+        let workers = [
+            dp_worker("http://p", 0, prefill()),
+            dp_worker("http://p", 1, prefill()),
+            dp_worker("http://d", 1, WorkerType::Decode),
+        ];
+        let source = workers
+            .iter()
+            .fold(MockWorkerSource::new(), |source, worker| {
+                source.add_worker(worker.clone())
+            });
+        let planner =
+            make_planner(source, MockPolicySource::new()).with_prefill_on_decode_rank(true);
+        let descriptor = make_descriptor(Some("m"), None, None, None);
+
+        for _ in 0..4 {
+            let plan = planner.plan(&descriptor).await.unwrap();
+            assert_eq!(prefill_url(plan), "http://p@1");
+        }
+        // Without a healthy prefill on the decode's rank, any prefill is a candidate.
+        workers[1].set_healthy(false);
+        let plan = planner.plan(&descriptor).await.unwrap();
+        assert_eq!(prefill_url(plan), "http://p@0");
     }
 
     #[tokio::test]

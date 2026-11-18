@@ -529,6 +529,16 @@ impl RouterConfig {
             .unwrap_or(DEFAULT_MAX_TOKENIZE_BYTES)
     }
 
+    /// Whether P/D planners select decode first and prefill on the decode's DP rank:
+    /// the ATOM backend with idx2idx rank mapping.
+    pub fn prefill_on_decode_rank(&self) -> bool {
+        matches!(self.backend, BackendType::Atom)
+            && matches!(
+                self.atom_pd_rank_mapping_policy,
+                AtomPdRankMappingPolicy::Idx2Idx
+            )
+    }
+
     /// Create a new configuration with mode and policy
     pub fn new(mode: RoutingMode, policy: PolicyConfig) -> Self {
         Self {
