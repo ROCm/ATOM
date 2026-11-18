@@ -759,6 +759,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KIMI_MONO_FUSED_MOE_ROWS": lambda: int(
         os.getenv("ATOM_KIMI_MONO_FUSED_MOE_ROWS", "64")
     ),
+    # Kimi-K3 gfx1250 mono: the fused MoE's gate/up on three waves of 64 rows,
+    # an MXFP4 block each, each fragment read by half the waves and each block
+    # quantized and stored by its own wave; 0 keeps six waves of 32.
+    "ATOM_KIMI_MONO_FUSED_MOE_WIDE": lambda: int(
+        os.getenv("ATOM_KIMI_MONO_FUSED_MOE_WIDE", "0")
+    ),
     # Kimi-K3 gfx1250 mono: K2's gathering all-reduce, routed RMSNorm and
     # replicated finalize as one resident launch (k2_tail_gfx1250, the same
     # bits) where the gathering all-reduce runs a line a thread; 0 keeps the
