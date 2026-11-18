@@ -110,10 +110,12 @@ RUN echo "========== [SGLANG-ATOM 2/6] Back up base image Triton ==========" && 
       "packaging>=20.0" \
       "pyyaml>=5.1" \
       "tqdm>=4.60" && \
-    if [ -d /app/sglang/rust/target ]; then \
+    if [ -d /app/sglang/rust/target/release ]; then \
       cd /app/sglang/rust/target && \
       find . -mindepth 1 -maxdepth 1 ! -name release -exec rm -rf {} + && \
       find release -mindepth 1 -maxdepth 1 ! -name '*.so' -exec rm -rf {} +; \
+    elif [ -d /app/sglang/rust/target ]; then \
+      echo "sglang rust/target has no release/ profile; leaving it unchanged"; \
     fi && \
     rm -rf /root/.cargo/registry /root/.cargo/git && \
     { "${VENV_PYTHON}" -m pip show sglang torch triton transformers IPython orjson pybase64 petit-kernel wave-lang xgrammar outlines apache-tvm-ffi || true; } && \

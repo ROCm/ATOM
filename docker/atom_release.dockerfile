@@ -386,11 +386,9 @@ ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 ARG AITER_COMMIT="HEAD"
 ARG PREBUILD_KERNELS=1
 ARG MAX_JOBS
-# Keep AITER compiled against the Triton the base image ships (the ROCm 10
-# SDK's 3.8.0 build). Without this, AITER's setup resolves its own Triton
-# from PyPI and the prebuilt kernels then mismatch the runtime Triton.
-# Only meaningful on the rocm10 flavor (the rocm/pytorch apt images carry a
-# Triton AITER already agrees with), but harmless to set everywhere.
+# AITER must keep the Triton the base stage installed, on every flavor:
+# without this, AITER's setup.py runs install_triton.sh and replaces it.
+# The final-stage AITER install sets the same variable.
 ENV AITER_USE_SYSTEM_TRITON=1
 
 RUN pip install --upgrade setuptools_scm
@@ -695,7 +693,7 @@ RUN git clone $ATOM_REPO /app/ATOM && \
     cd /app/ATOM/atom/mesh/target && \
     find . -mindepth 1 -maxdepth 1 ! -name release -exec rm -rf {} + && \
     find release -mindepth 1 -maxdepth 1 ! -name atomesh ! -name libmesh.so -exec rm -rf {} + && \
-    test -x release/atomesh && \
+    test -x release/atomesh && test -f release/libmesh.so && \
     rm -rf /root/.cargo/registry /root/.cargo/git
 RUN pip show atom || true
 
