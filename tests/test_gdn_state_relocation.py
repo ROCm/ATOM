@@ -12,6 +12,7 @@
 # of the per-slot allocation: a checkpoint holds a committed state and has no
 # speculation to roll back, so it costs one slot rather than a full group.
 
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -37,13 +38,23 @@ K3 = pytest.importorskip(
 
 LAYERS = 3
 SLOTS = 12
-SHAPE_K = (2, 5)
+# A conv unit is (conv_kernel - 1 + num_spec) rows of [q | k | v].
+SHAPE_K = (2, 6)
 SHAPE_V = (2, 3, 4)
 
 
 CAP = 6
 REC_K = (2, 5)
 REC_V = (2, 3)
+
+
+@pytest.fixture(autouse=True)
+def _tp_size(monkeypatch):
+    """The K3 builder reads its TP size from the TP group, which no test here
+    initializes. One rank unless a test sets another."""
+    tp = SimpleNamespace(world_size=1)
+    monkeypatch.setattr(K3, "get_tp_group", lambda: tp)
+    return tp
 
 
 def build(num_spec: int, replayssm: bool = False):
@@ -333,6 +344,25 @@ class _MLABase:
         return tensors
 
 
+class _Layer:
+    """A bound module, as far as row placement reads one: its layer number."""
+
+    def __init__(self, layer_num):
+        self.layer_num = layer_num
+
+
+# Eight layers, full attention at 3 and 7: the MLA rows are layers [3, 7] and
+# the KDA slots layers [0, 1, 2, 4, 5, 6]. The second of two PP stages holds
+# layers 4-7, so one MLA row (global MLA 1) and three KDA rows (global KDA 3-5),
+# which is what the relocation fixture's three cache layers are.
+NUM_HIDDEN_LAYERS = 8
+FULL_ATTENTION_LAYERS = [3, 7]
+SECOND_STAGE_ROWS = {
+    K3.MLA_ROWS: {_Layer(7): 0},
+    K3.LINEAR_STATE_ROWS: {_Layer(4): 0, _Layer(5): 1, _Layer(6): 2},
+}
+
+
 def kimi_builder(kv_transfer_config, pp_size=1, replayssm=False):
     """A K3 builder over the relocation fixture's caches.
 
@@ -349,16 +379,26 @@ def kimi_builder(kv_transfer_config, pp_size=1, replayssm=False):
     builder = _Builder()
     builder.model_runner = stub.model_runner
     builder.replayssm = replayssm
-    builder.mla_idx_by_layer = dict.fromkeys(range(24), 0)
-    builder.kda_idx_by_layer = dict.fromkeys(range(LAYERS), 0)
+    builder.num_spec = 0
+    builder._pool_rows = SECOND_STAGE_ROWS if pp_size > 1 else None
     builder.model_runner.config = SimpleNamespace(
         kv_transfer_config=kv_transfer_config,
         pipeline_parallel_size=pp_size,
-        hf_config=SimpleNamespace(model_type="kimi_linear"),
+        hf_config=SimpleNamespace(
+            model_type="kimi_linear",
+            num_hidden_layers=NUM_HIDDEN_LAYERS,
+            linear_conv_kernel_dim=SHAPE_K[0] + 1,
+            # q, k and v convs of 2 channels each: SHAPE_K's 6 at TP1
+            linear_num_key_heads=2,
+            linear_key_head_dim=1,
+        ),
     )
+    builder.model_runner.full_attention_layers = FULL_ATTENTION_LAYERS
+    builder.model_runner.has_mla_indexer = False
     # No checkpoint spec, so the answer is the P/D join alone rather than the
     # `lmcache_mp` checkpoint contract layered on it.
     builder.model_runner.state_runtime = SimpleNamespace(checkpoint_spec=None)
+    builder.model_runner.num_spec_tokens = 0
     return builder
 
 
@@ -440,16 +480,94 @@ def test_a_pd_connector_that_cannot_move_the_state_is_refused(monkeypatch):
         builder.get_kv_transfer_tensors()
 
 
-def test_pipeline_parallelism_is_refused():
-    """`_consumer_region_map` aligns a stage's regions by shifting over
-    `num_hidden_layers`; the slot regions are indexed by KDA layer, a shorter
-    axis. The misalignment writes one layer's state onto another's rather than
-    failing, so it is refused where it is knowable.
+def test_moriio_keeps_refusing_pp():
+    """Only the Mooncake path places a PP stage's rows by layer; MoRIIO reads
+    none of that placement."""
+    builder = kimi_builder({"kv_connector": "moriio"}, pp_size=2)
+
+    with pytest.raises(NotImplementedError, match="over moriio does not support"):
+        builder.get_kv_transfer_tensors()
+
+
+def test_a_sparse_mla_model_keeps_refusing_pp():
+    builder = kimi_builder({"kv_connector": "mooncake"}, pp_size=2)
+    builder.model_runner.has_mla_indexer = True
+
+    with pytest.raises(NotImplementedError, match="sparse MLA indexer"):
+        builder.get_kv_transfer_tensors()
+
+
+def test_a_pp_stage_places_its_rows_by_layer_number():
+    """From this stage's `start_layer` of 4, the connector's fallback would put
+    its one MLA row at peer region 4 and its KDA state at 4-6, past the peer's
+    two MLA rows and onto other layers' state. Placed by layer number, the MLA
+    row is the peer's second and the KDA rows its fourth to sixth, conv then
+    SSM.
     """
     builder = kimi_builder({"kv_connector": "mooncake"}, pp_size=2)
 
-    with pytest.raises(NotImplementedError, match="pipeline parallelism"):
-        builder.get_kv_transfer_tensors()
+    tensors = builder.get_kv_transfer_tensors()
+
+    assert tensors.block_region_consumer_indices == [1]
+    assert tensors.slot_region_consumer_indices == [3, 4, 5, 9, 10, 11]
+
+
+def test_the_last_stage_places_the_drafters_mla_row_after_the_targets():
+    """The drafter's layer 8 is past the target's eight, so it has no target
+    MLA position; the peer lists draft rows after the target's two."""
+    builder = kimi_builder({"kv_connector": "mooncake"}, pp_size=2)
+    builder._pool_rows = {
+        **SECOND_STAGE_ROWS,
+        K3.MLA_ROWS: {_Layer(7): 0, _Layer(NUM_HIDDEN_LAYERS): 1},
+    }
+
+    mla, slots = builder._pp_consumer_region_indices(2, 6)
+
+    assert mla == [1, 2]
+    assert slots == [3, 4, 5, 9, 10, 11]
+
+
+def test_a_pp_stage_places_replayssm_records_and_the_cursor():
+    """Three more per-layer groups, then the one cursor every layer shares."""
+    builder = kimi_builder({"kv_connector": "mooncake"}, pp_size=2, replayssm=True)
+
+    tensors = builder.get_kv_transfer_tensors()
+
+    kda = [3, 4, 5]
+    assert tensors.slot_region_consumer_indices == [
+        group * 6 + pos for group in range(5) for pos in kda
+    ] + [30]
+
+
+def test_a_single_stage_leaves_region_placement_to_the_connector():
+    tensors = kimi_builder({"kv_connector": "mooncake"}).get_kv_transfer_tensors()
+
+    assert tensors.block_region_consumer_indices is None
+    assert tensors.slot_region_consumer_indices is None
+
+
+def test_kda_slot_regions_publish_their_tp_shards():
+    """A conv unit is rows of [q | k | v], each run sharded by head blocks; an
+    SSM unit and a ReplaySSM record are sharded along their leading head axis.
+    The cursor is the same on every rank, so it is marked replicated instead.
+    """
+    builder = kimi_builder({"kv_connector": "mooncake"}, replayssm=True)
+
+    tensors = builder.get_kv_transfer_tensors()
+
+    rows, channels = SHAPE_K
+    f32 = 4  # the fixture's caches are float32
+    records = [(CAP,) + shape for shape in (REC_K, REC_V, REC_K)]
+    assert tensors.slot_region_tp_segments == (
+        [(channels // 3 * f32,) * (3 * rows)] * LAYERS
+        + [(math.prod(SHAPE_V) * f32,)] * LAYERS
+        + [(math.prod(shape) * f32,) for shape in records for _ in range(LAYERS)]
+        + [None]
+    )
+    assert tensors.slot_region_tp_replicated == [False] * (5 * LAYERS) + [True]
+    for region, segments in zip(tensors.slot_regions, tensors.slot_region_tp_segments):
+        if segments is not None:
+            assert sum(segments) == region.unit_bytes
 
 
 # ---- the producer's guard on a transfer that carries no slot ----------------
@@ -475,6 +593,9 @@ def transfer_stub(slot_regions):
         # are about.
         _consumer_region_map=lambda n, *_: list(range(n)),
         _block_region_consumer_indices=None,
+        _slot_region_consumer_indices=None,
+        _slot_region_tp_segments=None,
+        _slot_region_tp_replicated=None,
         # No block regions: an empty plan.
         _block_plan=lambda *_: SimpleNamespace(cmap=[], cuts=None),
         _MAX_RDMA_ENTRIES_PER_BATCH=4096,

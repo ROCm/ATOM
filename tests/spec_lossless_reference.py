@@ -297,11 +297,12 @@ def verify(
     step=0,
     top_ks=None,
     top_ps=None,
+    block=False,
     **args,
 ):
     """`rejection_sample` on `verify_batch` arguments: the ratio verify of
-    ``q`` at Philox ``step`` under these filters, or exact match where ``q``
-    is None."""
+    ``q`` at Philox ``step`` under these filters, by the block rule where
+    ``block``, or exact match where ``q`` is None."""
     ratio = None
     if q is not None:
         ratio = RatioVerifyInputs(
@@ -312,6 +313,7 @@ def verify(
             top_ks,
             top_ps,
             ratio_scratch,
+            block,
         )
     return rejection_sample(**args, ratio=ratio)
 
@@ -494,7 +496,33 @@ def _residual_reference(p_row, q_row, raw_argmax, e):
     return raw_argmax, near
 
 
-def ratio_verify_reference(args, q, step, top_ks=None, top_ps=None):
+#: How near its stopping probability h a block-rule coin may fall and still
+#: be taken either way: h is a ratio of fp32 sums over the stored entries.
+_H_RTOL = 1e-4
+
+
+def _block_reference(start, end, q_x, p_x, p_f, q_dense, q_row, coins, cut_near):
+    """``(tau, w_tau, near)`` of one request under the block rule (see
+    `ratio_verify_reference`), its draft rows ``start .. end``."""
+    weight, tau, weight_at_tau, near = 1.0, 0, 1.0, False
+    for row in range(start, end):
+        q, p = float(q_x[row]), float(p_x[row])
+        weight = min(weight * p / q, 1.0) if q > 0 else 0.0
+        h = weight
+        if row + 1 < end:
+            mass = float(
+                (weight * p_f[row + 1] - q_dense[q_row[row + 1]]).clamp(min=0).sum()
+            )
+            denom = mass + 1.0 - weight
+            h = mass / denom if denom > 0 else 1.0
+        u = float(coins[row])
+        near = near or cut_near[row] or abs(u - h) <= _H_RTOL * max(h, 1e-30)
+        if u <= h:
+            tau, weight_at_tau = row + 1 - start, weight
+    return tau, weight_at_tau, near
+
+
+def ratio_verify_reference(args, q, step, top_ks=None, top_ps=None, block=False):
     """The ratio verify of `verify_batch` ``args`` over the store ``q`` at
     Philox ``step``, under per-request filters (or None), in fp64 torch with
     none of the verify's code: ``(out, verdict, undecided)``, ``undecided``
@@ -509,7 +537,15 @@ def ratio_verify_reference(args, q, step, top_ks=None, top_ps=None):
     request accepts x iff ``q(x) > 0`` and ``u * q(x) < p_f(x)``, a greedy one
     iff x is the raw logits' lowest-id argmax, and at the first rejection
     emits that argmax (greedy) or `_residual_reference`'s draw. Then the bonus
-    or -1, the -1 tail, and the verdict `_finish_request` writes."""
+    or -1, the -1 tail, and the verdict `_finish_request` writes.
+
+    With ``block``, a sampled request with q takes the block rule instead
+    (Sun et al. 2024): ``w_i = min(w_{i-1} p_f(x_i) / q(x_i), 1)`` from
+    ``w_0 = 1`` (0 once q(x_i) is 0), ``h_i = R_i / (R_i + 1 - w_i)`` with
+    ``R_i`` the dense ``sum relu(w_i p_f - q)`` of the next row (1 where that
+    is 0 / 0), ``h = w`` at the last draft; it keeps the first ``tau = max{i :
+    u_i <= h_i}`` drafts on the accept coins and races ``relu(w_tau p_f - q)``
+    at row ``tau``. A coin within `_H_RTOL` of its ``h`` is undecided."""
     logits = args["target_logits"]
     rows, vocab = logits.shape
     steps = args["num_spec_steps"]
@@ -564,16 +600,23 @@ def ratio_verify_reference(args, q, step, top_ks=None, top_ps=None):
     for b, end in enumerate(cu):
         near = False
         accepted = 0
-        for row in range(start, end):
-            if greedy[b]:
-                ok = greedy_accept[row]
-            else:
-                ok = sampled_accept[row]
-                near = near or accept_near[row] or cut_near[row]
-            if not ok:
-                break
-            out[b, accepted] = draft_ids[row]
-            accepted += 1
+        weight = 1.0
+        if block and has_q[start] and not greedy[b]:
+            accepted, weight, near = _block_reference(
+                start, end, q_x, p_x, p_f, q_dense, q_row, coins, cut_near
+            )
+            out[b, :accepted] = torch.tensor(draft_ids[start : start + accepted])
+        else:
+            for row in range(start, end):
+                if greedy[b]:
+                    ok = greedy_accept[row]
+                else:
+                    ok = sampled_accept[row]
+                    near = near or accept_near[row] or cut_near[row]
+                if not ok:
+                    break
+                out[b, accepted] = draft_ids[row]
+                accepted += 1
         if accepted == end - start:
             out[b, accepted] = bonus[b]
         elif greedy[b]:
@@ -584,7 +627,7 @@ def ratio_verify_reference(args, q, step, top_ks=None, top_ps=None):
             e = -triton_rand(_RATIO_RESIDUAL_KEY | step, offsets).double().log()
             q_race = q_dense[q_row[race]] if has_q[race] else torch.zeros_like(e)
             token, race_near = _residual_reference(
-                p_f[race], q_race, argmax_ids[race], e
+                weight * p_f[race], q_race, argmax_ids[race], e
             )
             out[b, accepted] = token
             near = near or race_near

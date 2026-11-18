@@ -98,6 +98,7 @@ from atom.model_ops.linear import (
     MergedReplicatedLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    fp8_group32_k_pad_align,
 )
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.quant_v4 import act_quant_inplace
@@ -2754,12 +2755,16 @@ class Expert(nn.Module):
         # Fused [w1; w3] (gate_up_proj): both share input x, both ColumnParallel
         # — standard llama/dsv2 fusion. Disk still split; routed via
         # packed_modules_mapping in DeepseekV4ForCausalLM.
+        # A per-rank intermediate the group32 FP8 GEMM cannot step (V4.1-Flash's
+        # 2304 at TP8: 288) is padded by the pair, zero rows / columns (320).
+        k_pad = fp8_group32_k_pad_align(quant_config, f"{prefix}.w2")
         self.gate_up_proj = MergedColumnParallelLinear(
             dim,
             [inter_dim, inter_dim],
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
+            output_pad_align=k_pad,
         )
         self.w2 = RowParallelLinear(
             inter_dim,
@@ -2768,13 +2773,15 @@ class Expert(nn.Module):
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=f"{prefix}.w2",
+            input_pad_align=k_pad,
         )
         self.swiglu_limit = swiglu_limit
         # ATOM_V4_USE_TRITON_FUSION: clamp + silu(gate)*up [+ weights] + FP8
         # quant in one aiter triton kernel, and w2 takes its `x_scale` instead
         # of quantizing itself. The kernel needs this rank's intermediate
         # width to be a multiple of 128 (V4.1-Flash's 2304: whole or at TP2,
-        # not 576 at TP4 or 288 at TP8); other widths keep the unfused path.
+        # not 576 at TP4 or the padded 320 at TP8); other widths keep the
+        # unfused path.
         self.use_fused_clamp_act_mul = shared_expert_fused_act_enabled(
             self.w2.input_size
         )

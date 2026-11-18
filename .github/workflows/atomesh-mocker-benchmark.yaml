@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'atom/mesh/**'
+      - 'atom/model_engine/zmq_protocol/**'  # engine_v1.proto, built by --features atom-engine
       - '.github/scripts/atomesh/atomesh_mocker_benchmark.sh'
       - '.github/scripts/atomesh/atomesh_mocker_benchmark_summary.py'
       - '.github/workflows/atomesh-mocker-benchmark.yaml'
@@ -15,6 +16,7 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - 'atom/mesh/**'
+      - 'atom/model_engine/zmq_protocol/**'  # engine_v1.proto, built by --features atom-engine
       - '.github/scripts/atomesh/atomesh_mocker_benchmark.sh'
       - '.github/scripts/atomesh/atomesh_mocker_benchmark_summary.py'
       - '.github/workflows/atomesh-mocker-benchmark.yaml'
@@ -100,16 +102,28 @@ jobs:
       # The ci profile, not release: release's fat LTO and single codegen unit
       # made this build the slowest step, and only the benchmark measures the
       # binary's speed.
-      - name: Test P/D router request lifecycle
+      - name: Run atomesh unit tests
         run: |
           set -euo pipefail
+          # Every unit test in the library, the optional ATOM engine runtime's
+          # included.
           cargo test \
             --manifest-path atom/mesh/Cargo.toml \
             --target-dir atom/mesh/mocker/target/mesh \
-            --profile ci --lib routers::http_pd_router
+            --profile ci --lib --features atom-engine
 
-      # KV events: following the engines' streams, the prefix index, and the routing code
-      # it feeds.
+      # Nothing else builds the optional ext-proc feature or its protox
+      # codegen; checking it, its tests included, keeps that path compiling.
+      - name: Check atomesh with ext-proc
+        run: |
+          set -euo pipefail
+          cargo check \
+            --manifest-path atom/mesh/Cargo.toml \
+            --target-dir atom/mesh/mocker/target/mesh \
+            --profile ci --features ext-proc --tests
+
+      # KV events: following the engines' streams, the prefix index, and the routing and
+      # observability code it feeds.
       - name: Test KV events
         run: |
           set -euo pipefail
@@ -118,7 +132,7 @@ jobs:
             --target-dir atom/mesh/mocker/target/mesh \
             --profile ci --lib -- \
             kv_events:: kv_index:: policies::cache_aware policies::registry \
-            routers::prepare routers::ingress
+            observability:: routers::prepare routers::ingress
           cargo test \
             --manifest-path atom/mesh/Cargo.toml \
             --target-dir atom/mesh/mocker/target/mesh \

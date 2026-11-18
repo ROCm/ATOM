@@ -2892,33 +2892,57 @@ def _check_coverage_line(card_text, work_dir=None):
     Compared against rules.txt rather than re-derived here: Step 1 owns the measurement,
     this only enforces that it reached the reader.
     """
+    # rules.txt is readable and non-empty by the time this runs: the ledger gate (Step
+    # 1b, SKILL.md:380) opens it without a guard and exits 1 on LEDGER UNUSABLE, both
+    # before the card gate. So an unreadable file is already a red, and this returns [].
     want = ""
+    text = None
     if work_dir:
         try:
-            for ln in (pathlib.Path(work_dir) / "rules.txt").read_text(
+            text = (pathlib.Path(work_dir) / "rules.txt").read_text(
                 encoding="utf-8", errors="replace"
-            ).splitlines():
-                if ln.strip().startswith("coverage:"):
-                    want = ln.strip()
-                    break
+            )
         except OSError:
             return []
-    if not want:
+        # Case-sensitive on purpose, unlike the card scan below: rules.txt is this
+        # module's own output (coverage_line), the card is written by the model.
+        for ln in text.splitlines():
+            if ln.strip().startswith("coverage:"):
+                want = ln.strip()
+                break
+    # `[diff-too-large]` writes no coverage line, so BEYOND ONE PASS is required here by
+    # policy, not by measurement: GitHub's 20000-line cap counts every line of the diff,
+    # while BIG_ADDED counts only non-test added lines, so a deletion-heavy refusal could
+    # still measure as one pass. The policy holds because the diff was never served -- a
+    # review of what could not be read is a sample whatever the counts would have said.
+    # `[underivable]` and `[derivation-failed]` measured nothing, so no verdict exists
+    # for the card to drop.
+    too_large = text is not None and not want and "[diff-too-large" in text
+    if not want and not too_large:
         return []
+    spell = ("Coverage: BEYOND ONE PASS -- GitHub would not serve this diff (over 20000 "
+             "lines). Findings below are a sample, not a sweep.")
+    strict = too_large or "BEYOND ONE PASS" in want
     for line in (card_text or "").splitlines():
         st = line.strip()
         if st.lower().startswith("coverage:"):
-            body = st.split(":", 1)[1].strip()
-            if not body:
+            if not st.split(":", 1)[1].strip():
                 return [("EMPTY-COVERAGE", st[:70],
                          "no verdict after the colon -- copy rules.txt's coverage line")]
-            if "BEYOND ONE PASS" in want and "BEYOND ONE PASS" not in st:
+            if strict and "BEYOND ONE PASS" not in st:
+                # Two different reasons, and the message has to name the right one: the
+                # measured path has a rules.txt verdict behind it, the refused one does
+                # not and rests on the policy above.
+                why = ("GitHub would not serve this diff, so it counts as BEYOND ONE "
+                       "PASS, and the card does not say so" if too_large else
+                       "Step 1 measured this diff as BEYOND ONE PASS and the card does "
+                       "not say so")
                 return [("SOFTENED-COVERAGE", st[:70],
-                         "Step 1 measured this diff as BEYOND ONE PASS and the card does "
-                         "not say so -- the findings below read as complete when they are "
-                         "a sample")]
+                         why + " -- the findings below read as complete when they are "
+                         "a sample" + (f". Write: `{spell}`" if too_large else ""))]
             return []
-    return [("MISSING-COVERAGE", want[:70],
+    return [("MISSING-COVERAGE", (want or "[diff-too-large]")[:70],
+             f"rules.txt has no line to copy here, so write: `{spell}`" if too_large else
              "Step 1 measured the diff's reviewability and the card drops it; copy the "
              "`coverage:` line from rules.txt above the findings")]
 
