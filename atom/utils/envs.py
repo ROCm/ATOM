@@ -679,6 +679,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
         for site in os.getenv("ATOM_KIMI_MONO_TDM_COLD", "xpf").split(",")
         if site not in ("", "0")
     ),
+    # Kimi-K3 gfx1250 mono: the other kernels' freshly written inputs
+    # prefetched into every XCD's L2 (the same bits), a comma list of the
+    # kernels that do it, each at its entry: "oproj" (K1's core rows),
+    # "finish" (the front's router logits and shared rows), "tail" (each
+    # all-reduce CTA its share of the fused MoE's rows, their route weights
+    # and the shared rows). 0, the default, leaves all of them out.
+    "ATOM_KIMI_MONO_XPF": lambda: frozenset(
+        site
+        for site in os.getenv("ATOM_KIMI_MONO_XPF", "0").split(",")
+        if site not in ("", "0")
+    ),
     # Kimi-K3 gfx1250 mono: the fused MoE's gate/up K tiles, its M tiles'
     # epilogues and down tiles, and its staging loops as runtime loops, so a
     # cold launch fetches one body's code each (the same bits); 0 unrolls them

@@ -38,10 +38,14 @@ from flydsl.expr.typing import Int32, Int64, T
 
 from atom.models.kimi_k3.mono.config import HIDDEN
 from atom.models.kimi_k3.mono.kernels.execution_plan import Gfx1250KimiBuildPlan
-from atom.models.kimi_k3.mono.kernels.stages import gemv_gfx1250
+from atom.models.kimi_k3.mono.kernels.stages import fresh_prefetch_gfx1250 as fresh
+from atom.models.kimi_k3.mono.kernels.stages import gemv_gfx1250, tdm_timeline
 from atom.models.kimi_k3.mono.kernels.stages import gemv_tdm_gfx1250 as gemv_tdm
 from atom.models.kimi_k3.mono.kernels.stages import k2_allreduce_gfx1250 as ar
-from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import tdm_lds_words
+from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import (
+    TDM_CLUSTER,
+    tdm_lds_words,
+)
 from atom.models.kimi_k3.mono.kernels.stages.moe_tdm_gfx1250 import _realtime
 from atom.models.kimi_k3.mono.sources import SOURCES
 from atom.mono.device.ops import (
@@ -392,9 +396,11 @@ def build_oproj_allreduce(
 
     name = (
         f"k3_k2_gfx1250_oproj_ar_tp{tp}_s{rows}{'_os' if oneshot else ''}"
-        f"{'_profile' if profile else ''}"
+        f"{'_profile' if profile else ''}{fresh.suffix('oproj')}"
+        f"{tdm_timeline.suffix()}"
     )
     sources = SOURCES
+    timeline = tdm_timeline.key()
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def kernel(
@@ -407,12 +413,17 @@ def build_oproj_allreduce(
         rank: Int32,
         stamps: Int64,
     ):
-        _ = sources
+        _ = sources, timeline
         tid = fx.Int32(fx.thread_idx.x)
         bid = fx.Int32(fx.block_idx.x)
         lane = tid % GFX1250.wave_size
         wave = tid // GFX1250.wave_size
-        lds = fx.SharedAllocator().allocate(Lds).peek()
+        fresh.prefetch(
+            "oproj", core, rows * proj * 2, bid, tid, CTAS, THREADS, TDM_CLUSTER
+        )
+        allocator = fx.SharedAllocator()
+        lds = allocator.allocate(Lds).peek()
+        tdm_timeline.open_cta(bid, wave, timeline, allocator)
 
         def stamp(index, local=None):
             # thread 0's view (``local``: the thread's index in its group)
@@ -546,6 +557,7 @@ def build_oproj_allreduce(
         counter = bid + tid * CTAS
         if counter < ar.MAX_CTAS:
             bo.buffer_store(epoch, rsrc(epochs), counter)
+        tdm_timeline.close_cta()
 
     @flyc.jit
     def launch(
@@ -559,7 +571,7 @@ def build_oproj_allreduce(
         stamps: Int64,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
-        _ = sources
+        _ = sources, timeline
         kernel(
             core,
             w_o,

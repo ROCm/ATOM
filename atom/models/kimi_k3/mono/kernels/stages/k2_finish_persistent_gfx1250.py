@@ -31,6 +31,9 @@ from atom.models.kimi_k3.mono.kernels.execution_plan import (
     Gfx1250KimiBuildPlan,
 )
 from atom.models.kimi_k3.mono.kernels.stages import (
+    fresh_prefetch_gfx1250 as fresh,
+)
+from atom.models.kimi_k3.mono.kernels.stages import (
     gemv_gfx1250,
     moe_expert_gfx1250,
     moe_gfx1250,
@@ -416,6 +419,7 @@ def build_packed_finish(
         f"{'_ph' if parallel_herd else ''}"
         f"{f'_pl{herd_poll_limit}' if herd_poll_limit is not None else ''}"
         f"{'_profile' if profile else ''}"
+        f"{fresh.suffix('finish') if replicated_front else ''}"
     )
     # After a replicated front there is no gathered latent to unpack.
     unpack = not (rolled and replicated_front)
@@ -469,6 +473,26 @@ def build_packed_finish(
         bid = fx.block_idx.x
         lane = tid % GFX1250.wave_size
         wave = tid // GFX1250.wave_size
+        if const_expr(fused is None and replicated_front):
+            # The front's router logits and activated shared rows.
+            fresh.prefetch(
+                "finish",
+                front_gathered,
+                rows * EXPERTS * 4,
+                bid,
+                tid,
+                plan.blocks,
+                THREADS,
+            )
+            fresh.prefetch(
+                "finish",
+                shared_hidden,
+                rows * SHARED_INTERMEDIATE * 2,
+                bid,
+                tid,
+                plan.blocks,
+                THREADS,
+            )
         route_role = role.route.peek()
         prep = role.prep.peek()
         shared_down = role.shared_down.peek()

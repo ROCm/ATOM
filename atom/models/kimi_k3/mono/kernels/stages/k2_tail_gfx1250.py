@@ -37,6 +37,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T
 
 from atom.models.kimi_k3.mono.config import HIDDEN, LATENT, TOPK
+from atom.models.kimi_k3.mono.kernels.stages import fresh_prefetch_gfx1250 as fresh
 from atom.models.kimi_k3.mono.kernels.stages import gemv_gfx1250
 from atom.models.kimi_k3.mono.kernels.stages import gemv_tdm_gfx1250 as gemv_tdm
 from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import (
@@ -392,7 +393,9 @@ def _ar_push(c):
             rows_of = [token * TOPK + k for k in range(TOPK)]
             weights = []
             for quad in range_constexpr(TOPK // 4):
-                loaded = fx.Vector(ld_dev(c["route_weights"], token * TOPK + 4 * quad, 4))
+                loaded = fx.Vector(
+                    ld_dev(c["route_weights"], token * TOPK + 4 * quad, 4)
+                )
                 weights.extend(
                     fx.Int32(loaded[k]).bitcast(fx.Float32) for k in range(4)
                 )
@@ -471,6 +474,42 @@ def _wait_flags(flags, tid, ctas, epoch):
 
 
 @traced
+def _prefetch_share(data, grouped, route_weights, rows, ar_ctas, bid, tid):
+    """``ATOM_KIMI_MONO_XPF=tail``: the lines this CTA's all-reduce share
+    gathers, ahead of its first weight copies: a routed CTA's TOPK half rows
+    of ``grouped`` and its token's route weights, a shared CTA's lines of
+    ``data``'s shared rows."""
+    per_row = HALF * 2 // 128
+    if bid < 2 * rows:
+        token = bid // 2
+        half = bid % 2
+        fresh.prefetch_own(
+            "tail",
+            lambda i: grouped
+            + fx.Int64((token * TOPK + i // per_row) * LATENT + half * HALF) * 2
+            + fx.Int64(i % per_row * 128),
+            TOPK * per_row,
+            tid,
+            THREADS,
+        )
+        fresh.prefetch_own(
+            "tail",
+            lambda i: route_weights + fx.Int64(token * TOPK * 4),
+            1,
+            tid,
+            THREADS,
+        )
+    if (bid >= 2 * rows) & (bid < ar_ctas):
+        fresh.prefetch_own(
+            "tail",
+            lambda i: data + fx.Int64(bid * THREADS * LINE7_ELEMENTS * 2 + i * 128),
+            THREADS * LINE7_ELEMENTS * 2 // 128,
+            tid,
+            THREADS,
+        )
+
+
+@traced
 def _store_epochs(epochs, bid, tid, grid, epoch):
     counter = bid + tid * grid
     if counter < MAX_CTAS:
@@ -510,6 +549,7 @@ def build_k2_tail(
         f"k3_k2_gfx1250_tail_tp{tp}_s{rows}_d{layout.depth}_t{layout.tokens}"
         + ("_id" if identity_routes else "")
         + ("_profile" if profile else "")
+        + fresh.suffix("tail")
     )
     sources = SOURCES
 
@@ -542,6 +582,8 @@ def build_k2_tail(
         bid = fx.Int32(fx.block_idx.x)
         lane = tid % GFX1250.wave_size
         wave = tid // GFX1250.wave_size
+        if const_expr(fused is None and fresh.on("tail")):
+            _prefetch_share(data, grouped, route_weights, rows, ar_ctas, bid, tid)
         words = storage.words.peek().ptr
         floats = storage.floats.peek().ptr
         if const_expr(profile):
@@ -729,4 +771,6 @@ def build_k2_tail(
         )
 
     TAIL_ABI.check(kernel, launch)
-    return K2TailKernel(name, launch, (grid,), (THREADS,), ar_ctas, eps, lds=Lds, body=body)
+    return K2TailKernel(
+        name, launch, (grid,), (THREADS,), ar_ctas, eps, lds=Lds, body=body
+    )
