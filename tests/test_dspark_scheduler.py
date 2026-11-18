@@ -962,6 +962,7 @@ def _decode_batch(width, num_spec_step):
     return SimpleNamespace(
         has_prefill=False,
         total_tokens_num_prefill=0,
+        total_seqs_num_prefill=0,
         total_seqs_num_decode=1,
         total_tokens_num_decode=width,
         total_tokens_num=width,

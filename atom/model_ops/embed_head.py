@@ -259,7 +259,7 @@ class ParallelLMHead(VocabParallelEmbedding):
             context = forward_context.context
             attn_metadata = forward_context.attn_metadata
             # context = get_context()
-            if getattr(attn_metadata, "is_mixed", False) and not context.is_draft:
+            if attn_metadata.is_mixed and not context.is_draft:
                 x = x[attn_metadata.sampled_token_indices].contiguous()
             elif context.is_prefill and not context.is_draft:
                 bs = context.scheduled_bs

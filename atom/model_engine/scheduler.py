@@ -470,9 +470,11 @@ class ScheduledBatch:
         self.block_tables = [
             seq.block_table for seq in seqs.values() if seq.block_table
         ]
-        self.block_table_rows = [
-            i for i, seq in enumerate(seqs.values()) if seq.block_table
-        ]
+        # Only mixed attention splits this filtered table into row segments.
+        if total_seqs_num_prefill and total_seqs_num_decode:
+            self.block_table_rows = [
+                i for i, seq in enumerate(seqs.values()) if seq.block_table
+            ]
         self.last_block_num_tokens = [
             _seq.last_block_num_tokens for _seq in seqs.values()
         ]
@@ -643,7 +645,7 @@ class ScheduledBatch:
     )
 
     def slice_rows(self, start: int, stop: int) -> ScheduledBatch:
-        """An attention sub-batch; step-level transfers/metrics stay on the parent."""
+        """A mixed batch's attention segment; transfers/metrics stay on the parent."""
         if not 0 <= start <= stop <= self.total_seqs_num:
             raise ValueError(f"invalid batch row slice [{start}:{stop}]")
         known = (
@@ -1019,9 +1021,7 @@ class Scheduler:
         self._detailed_annotation_enabled = envs.ATOM_ENABLE_DETAILED_ANNOTATION
 
         self.enable_chunked_prefill = config.enable_chunked_prefill
-        self.enable_mixed_prefill_decode = getattr(
-            config, "enable_mixed_prefill_decode", False
-        )
+        self.enable_mixed_prefill_decode = config.enable_mixed_prefill_decode
         self.dynamic_chunking_smooth_factor = config.dynamic_chunking_smooth_factor
         self.dynamic_chunking_min_chunk_size = config.dynamic_chunking_min_chunk_size
         self.enable_dynamic_chunking = config.enable_dynamic_chunking
@@ -1557,24 +1557,6 @@ class Scheduler:
             and seq.id not in scheduled_seqs
         )
 
-    def _prefill_budget(self, scheduled_seqs=()) -> int:
-        """Tokens this step's prefill may take: the batch budget less the
-        decode-first reserve. Under mixed batching every running decode the
-        decode loop can schedule this step keeps the width it spends on it
-        (`decode_spec_width + 1`); without it the reserve is 0 and prefill
-        takes the whole budget.
-
-        Not counted: a row whose PP token is still in flight, which the decode
-        loop skips (`_pp_inflight_token_block`). And the reserve never takes
-        the last `max_num_batched_tokens // 8`: with enough decodes it would
-        reach the whole budget, and an in-progress chunked prompt, which holds
-        its blocks, would get no chunk until the decodes drain. The FCFS decode
-        tail may wait until earlier decodes finish or the long prefill ends."""
-        if not self.enable_mixed_prefill_decode:
-            return self.max_num_batched_tokens
-        n_decode = sum(1 for _ in self._decode_candidates(scheduled_seqs))
-        return self._budget_for_decodes(n_decode)
-
     def _budget_for_decodes(self, n_decode):
         budget = self.max_num_batched_tokens
         n_decode = min(n_decode, self.max_num_seqs)
@@ -1598,7 +1580,7 @@ class Scheduler:
 
     def _estimate_prefill_chunk_cost(self, limits=None) -> float:
         """Cost of the chunk this rank would prefill with its prefill budget
-        (`_prefill_budget`, the decode-first one under mixed batching):
+        (`_prefill_limits().tokens`, after reserving mixed decode tokens):
         resumable partials first, then the head of `waiting`, probing the
         prefix cache without recording (`can_allocate_memoized`). An estimate
         -- the real admission may park or skip some of these seqs."""

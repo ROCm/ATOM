@@ -6,22 +6,123 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-
-pytest.importorskip("aiter")
+from aiter_stub import atom_without_aiter
 
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
-from atom.model_engine.model_runner import ModelRunner, tokenIDProcessor
 from atom.model_engine.scheduler import ScheduledBatch
-from atom.model_ops.attentions import backends
-from atom.model_ops.attentions import deepseek_v4_attn as v4
 from atom.spec_decode.dspark_scheduler import resize_decode_tokens
 from atom.utils import CpuGpuBuffer
 from tests.test_mixed_decode_view import make_batch
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU H2D")
+
+@pytest.fixture(scope="module", autouse=True)
+def kernel_imports():
+    with atom_without_aiter():
+        yield
+
+
+def _cpu_query_runner(monkeypatch, slots=1):
+    from atom.model_ops.attentions.deepseek_v4_attn import (
+        DeepseekV4AttentionMetadataBuilder,
+    )
+    from atom.utils.h2d import PublicationOwner, PublicationRegistry
+
+    registry = PublicationRegistry()
+
+    def bind(variables, event=None, *, partial=False):
+        owner = PublicationOwner("cpu", registry=registry)
+        bindings = [owner.bind(buffer, name) for name, buffer in variables.items()]
+        early = owner.group("early", bindings)
+        return owner, {"early": early, "token_inputs": early}
+
+    ring = [
+        {
+            name: CpuGpuBuffer(
+                32,
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=False,
+                publication_group="early",
+            )
+            for name in ("cu_seqlens_q", "batch_id_per_q_token")
+        }
+        for _ in range(slots)
+    ]
+    owners, groups = zip(*(bind(variables) for variables in ring))
+    runner = SimpleNamespace(
+        forward_vars=ring[0],
+        _fv_ring=ring,
+        _fv_idx=0,
+        h2d_owner=owners[0],
+        h2d_groups=groups[0],
+        build_h2d_slot=bind,
+    )
+    builder = DeepseekV4AttentionMetadataBuilder.__new__(
+        DeepseekV4AttentionMetadataBuilder
+    )
+    builder.model_runner = runner
+    runner.attn_metadata_builder = builder
+    monkeypatch.setattr(torch.cuda, "Event", lambda: None)
+    builder.build_mixed_prefill_banks()
+    return runner, builder, owners, groups
+
+
+@pytest.mark.parametrize("slots", [1, 2])
+@pytest.mark.parametrize("fail", [False, True])
+def test_bank_publishes_prefill_spans_and_restores_live_owner(monkeypatch, slots, fail):
+    from atom.utils.h2d import PublicationError
+
+    runner, builder, owners, groups = _cpu_query_runner(monkeypatch, slots)
+    batch = make_batch()
+    prefill = batch.slice_rows(0, batch.total_seqs_num_prefill)
+    for slot in range(slots):
+        runner._fv_idx = slot
+        live = runner.forward_vars = runner._fv_ring[slot]
+        live_owner = runner.h2d_owner = owners[slot]
+        live_groups = runner.h2d_groups = groups[slot]
+        live_owner.begin()
+        builder.publish_query_metadata(np.array([2, 1, 2]), 3, 5)
+        bank, owner, bank_groups = builder._get_mixed_prefill_bank()
+
+        def prepare(bank=bank, owner=owner, bank_groups=bank_groups):
+            with builder.mixed_prefill_bank_active(prefill):
+                assert runner.forward_vars is bank
+                assert runner.h2d_owner is owner and runner.h2d_groups is bank_groups
+                assert bank["cu_seqlens_q"].gpu[:3].tolist() == [0, 8, 16]
+                assert (
+                    bank["batch_id_per_q_token"].gpu[:16].tolist() == [0] * 8 + [1] * 8
+                )
+                with pytest.raises(PublicationError):
+                    builder.publish_query_metadata(np.array([8, 8]), 2, 16)
+                if fail:
+                    raise ValueError("prefill failed")
+
+        if fail:
+            with pytest.raises(ValueError, match="prefill failed"):
+                prepare()
+        else:
+            prepare()
+        assert runner.forward_vars is live
+        assert runner.h2d_owner is live_owner and runner.h2d_groups is live_groups
+        assert live["cu_seqlens_q"].gpu[:4].tolist() == [0, 2, 3, 5]
+        assert live["batch_id_per_q_token"].gpu[:5].tolist() == [0, 0, 1, 2, 2]
+        # finish seals a successful bank; failure prevents reuse altogether.
+        with pytest.raises(PublicationError, match="failed" if fail else "sealed"):
+            bank_groups["early"].check_writable()
+        if fail:
+            with pytest.raises(PublicationError, match="failed"):
+                owner.begin()
+        else:
+            with builder.mixed_prefill_bank_active(prefill):
+                assert bank["cu_seqlens_q"].gpu[:3].tolist() == [0, 8, 16]
+        live_owner.finish()
 
 
 def _runner(monkeypatch, slots):
+    from atom.model_engine.model_runner import ModelRunner, tokenIDProcessor
+    from atom.model_ops.attentions import backends
+    from atom.model_ops.attentions import deepseek_v4_attn as v4
+
     runner = ModelRunner.__new__(ModelRunner)
     runner.device = torch.device("cuda", 0)
     runner.block_size = 256
@@ -86,6 +187,7 @@ def _runner(monkeypatch, slots):
     return runner, builder
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU H2D")
 @pytest.mark.parametrize("slots", [1, 2])
 @pytest.mark.parametrize("query_width", [1, 2])
 def test_idle_v4_decode_publishes_padding_with_previous_spec_status(
@@ -112,6 +214,7 @@ def test_idle_v4_decode_publishes_padding_with_previous_spec_status(
     np.testing.assert_array_equal(previous_rejected, [0, 1, 1])
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU H2D")
 @pytest.mark.parametrize("slots", [1, 2])
 @pytest.mark.parametrize("spec,query_width", [(0, 1), (1, 1), (1, 2)])
 def test_mixed_stage_publish_finish_preserves_both_segments(

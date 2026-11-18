@@ -2360,7 +2360,7 @@ class DeepseekV4Attention(nn.Module):
         # compress_plans=None and each half's plans live on its own
         # sub-metadata, so `_attn_mixed` launches them per segment.
         attn_md = cast("AttentionMetaData_DSV4", fc.attn_metadata)
-        is_mixed = getattr(attn_md, "is_mixed", False)
+        is_mixed = attn_md.is_mixed
         if not is_mixed:
             self._launch_compressors(x)
         q, kv_pre, qr, qr_scale, *_ = self._attn_pre(
@@ -2548,9 +2548,8 @@ class DeepseekV4Attention(nn.Module):
 
         ``out``, when given, is the ``[num_tokens, n_local_heads, head_dim]``
         buffer the attention lands in -- a mixed batch's segment of the whole
-        batch's output (`_attn_mixed`). Backends with output-buffer support
-        write directly into it; legacy API and reference fallbacks copy
-        their result in.
+        batch's output (`_attn_mixed`). Every attention backend writes directly
+        into the supplied buffer and returns it.
 
         Every launch here is sized by the token count -- `csa_translate_pack`'s grid
         is `(T, ...)`, the paged kernels take `N = qo_indptr.numel()-1`, the FP8
@@ -2773,9 +2772,6 @@ class DeepseekV4Attention(nn.Module):
                 prefix=f"{self.layer_name}.swa_write",
             )
 
-        if out is not None and o.data_ptr() != out.data_ptr():
-            out.copy_(o)
-            o = out
         # `o` is returned un-inverse-RoPE'd: `_wo_a_grouped_lora` removes the
         # absolute-position contribution the value-side RoPE carried in, on every
         # path, so the positions travel downstream instead.

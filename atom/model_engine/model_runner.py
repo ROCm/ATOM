@@ -1114,7 +1114,9 @@ class ModelRunner:
         logger.info(f"Model warmup done: {self.config.model}")
 
     def _kv_budget_extra_reserve(self, total_bytes: int) -> int:
-        """Override point for processes sharing the GPU (e.g. RapidServe)."""
+        """Extra GPU bytes to hold back from the KV cache budget beyond the
+        base overhead. Base runner reserves nothing; override point for
+        setups that share the GPU with another process."""
         return 0
 
     def _setup_device_and_distributed(self, rank: int, config: Config):
@@ -1154,6 +1156,7 @@ class ModelRunner:
         #    are non-daemon, so leaving them running wedges interpreter shutdown
         #    or races an in-flight copy against atexit. Must run BEFORE the KV
         #    pool it copies out of is dropped and before the dist env goes away.
+        #    Guarded: only offload workers define close() (moriio etc. do not).
         connector = get_kvconnector()
         close = getattr(connector, "close", None) if connector is not None else None
         if callable(close):

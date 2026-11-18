@@ -610,7 +610,7 @@ class PrefillDelayer:
                 partials plus waiting heads that fit the free seq slots.
                 None falls back to `waiting_requests`.
             prefill_budget: the prefill tokens one step can admit on this rank
-                (`Scheduler._prefill_budget`): ``max_num_batched_tokens`` less
+                (`Scheduler._prefill_limits().tokens`): ``max_num_batched_tokens`` less
                 the decode-first reserve under mixed batching. None means the
                 whole batch budget.
         """

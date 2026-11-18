@@ -4193,16 +4193,16 @@ class TestMixedBatch:
             sched.register_prefill_hashes(batch, list(sched.running))
         assert [c.args[0] for c in hash_blocks.call_args_list] == [prefill_seq]
 
-    def test_reserve_skips_rows_whose_pp_token_is_in_flight(self):
+    def test_reserve_skips_rows_whose_pp_token_is_in_flight(self, seq_factory):
         """The decode loop skips a row whose PP token is in flight, so the
         reserve does not hold its width back from prefill."""
         sched = self._mixed_scheduler(max_num_batched_tokens=64, max_num_seqs=16)
-        sched.running.extend(
-            SimpleNamespace(id=i, is_partial_prefill=False) for i in range(6)
-        )
-        assert sched._prefill_budget() == 64 - 6
-        sched._pp_inflight_token_block.update({0, 1, 2})
-        assert sched._prefill_budget() == 64 - 3
+        seqs = [
+            self._ready_decode_seq(sched, seq_factory, [1, 2, 3, 4]) for _ in range(6)
+        ]
+        assert sched._prefill_limits().tokens == 64 - 6
+        sched._pp_inflight_token_block.update(seq.id for seq in seqs[:3])
+        assert sched._prefill_limits().tokens == 64 - 3
 
     def test_an_in_progress_prompt_keeps_a_chunk_under_a_full_reserve(
         self, seq_factory

@@ -61,8 +61,8 @@ def test_previous_final_prefill_still_reserves_first_decode(seq_factory):
     old.num_cached_tokens = old.num_prompt_tokens
     old.append_token(5)
     assert old.type == SequenceType.PREFILL
-    assert sched._prefill_budget() == 7
-    assert sched._prefill_budget({old.id: old}) == 8
+    assert sched._prefill_limits().tokens == 7
+    assert sched._prefill_limits({old.id: old}).tokens == 8
 
 
 def test_partial_prefill_probe_uses_the_scheduled_budget(seq_factory, monkeypatch):

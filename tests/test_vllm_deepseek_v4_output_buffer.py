@@ -5,14 +5,37 @@ from types import SimpleNamespace as NS
 
 import pytest
 import torch
+from aiter_stub import atom_without_aiter
 
-pytest.importorskip("aiter", reason="the native V4 model reaches AITER ops")
-pytest.importorskip("vllm", reason="the plugin imports the vLLM metadata bridge")
 
-from atom.model_ops.v4_kernels.qk_norm_rope_maybe_quant import QKNormRopeOut
-from atom.models import deepseek_v4 as native
-from atom.plugin.vllm.models import deepseek_v4 as plugin
-from atom.utils.forward_context import AttnState
+@pytest.fixture(scope="module")
+def modules():
+    import importlib.util
+    import sys
+    from pathlib import Path
+    from types import ModuleType
+
+    with atom_without_aiter() as load, pytest.MonkeyPatch.context() as patch:
+        native = load("atom.models.deepseek_v4")
+        bridge = ModuleType("atom.plugin.vllm.deepseek_v4_bridge")
+        bridge.ATOM_DEEPSEEK_V4_BLOCK_SIZE = 128
+        patch.setitem(sys.modules, bridge.__name__, bridge)
+        patch.setattr(native, "_V4_BLOCK_SIZE", native._V4_BLOCK_SIZE)
+        path = (
+            Path(__file__).resolve().parents[1]
+            / "atom/plugin/vllm/models/deepseek_v4.py"
+        )
+        spec = importlib.util.spec_from_file_location("_vllm_v4_output_test", path)
+        plugin = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(plugin)
+        yield NS(
+            native=native,
+            plugin=plugin,
+            QKNormRopeOut=load(
+                "atom.model_ops.v4_kernels.qk_norm_rope_maybe_quant"
+            ).QKNormRopeOut,
+            AttnState=load("atom.utils.forward_context").AttnState,
+        )
 
 
 @pytest.fixture(params=["cpu", "cuda"])
@@ -23,7 +46,8 @@ def device(request):
 
 
 @pytest.fixture
-def layer():
+def layer(modules):
+    plugin = modules.plugin
     # No weights or KV pool are needed to exercise the model's dispatch and
     # buffer contract. Only the final attention computation is replaced below.
     layer = plugin.DeepseekV4AttentionVllm.__new__(plugin.DeepseekV4AttentionVllm)
@@ -36,8 +60,10 @@ def layer():
 @pytest.mark.parametrize("path", ["padded_prefill", "prefill", "decode", "no_metadata"])
 @pytest.mark.parametrize("supplied_output", [False, True])
 def test_sparse_output_clipping_and_padding(
-    monkeypatch, device, layer, path, supplied_output
+    monkeypatch, device, layer, modules, path, supplied_output
 ):
+    native, plugin = modules.native, modules.plugin
+    AttnState, QKNormRopeOut = modules.AttnState, modules.QKNormRopeOut
     num_in = 6
     num_real = 3 if path == "padded_prefill" else num_in
     metadata = NS(
@@ -88,7 +114,9 @@ def test_sparse_output_clipping_and_padding(
     assert torch.all(parent[[0, -1]] == -9)
 
 
-def test_dummy_forward_zeros_the_supplied_slice(monkeypatch, device, layer):
+def test_dummy_forward_zeros_the_supplied_slice(monkeypatch, device, layer, modules):
+    native, plugin = modules.native, modules.plugin
+    QKNormRopeOut = modules.QKNormRopeOut
     fc = NS(context=NS(is_dummy_run=True), attn_metadata=None)
     monkeypatch.setattr(plugin, "get_forward_context", lambda: fc)
     monkeypatch.setattr(native, "get_forward_context", lambda: fc)
@@ -101,7 +129,11 @@ def test_dummy_forward_zeros_the_supplied_slice(monkeypatch, device, layer):
 
 
 @pytest.mark.parametrize("bf16", [False, True])
-def test_inherited_mixed_forward_writes_both_segments(monkeypatch, device, layer, bf16):
+def test_inherited_mixed_forward_writes_both_segments(
+    monkeypatch, device, layer, modules, bf16
+):
+    native, plugin = modules.native, modules.plugin
+    AttnState, QKNormRopeOut = modules.AttnState, modules.QKNormRopeOut
     query = torch.arange(24, device=device, dtype=torch.bfloat16).reshape(6, 2, 2)
     original = query.clone()
     qkn = QKNormRopeOut(q_sa=query) if bf16 else QKNormRopeOut(q_packed=query)

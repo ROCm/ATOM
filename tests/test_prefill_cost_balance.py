@@ -119,7 +119,7 @@ def test_estimate_prices_the_chunk_the_prefill_budget_allows(
     monkeypatch, seq_factory, mixed
 ):
     """Under mixed batching the running decodes keep their rows
-    (`_prefill_budget`), so the estimate prices the chunk that is left, not
+    (`_prefill_limits().tokens`), so the estimate prices the chunk that is left, not
     one the batch budget would allow and admission then could not take."""
     sched = _sched(monkeypatch, mixed=mixed)
     for i in range(6):
@@ -131,7 +131,7 @@ def test_estimate_prices_the_chunk_the_prefill_budget_allows(
     sched.add(seq_factory(list(range(100, 164))))
     chunk = 64 - 6 if mixed else 64  # one row per decode (no drafts)
     assert sched._estimate_prefill_chunk_cost() == sched._chunk_cost(0, chunk)
-    assert sched._prefill_budget() == chunk
+    assert sched._prefill_limits().tokens == chunk
 
 
 def test_delayer_is_told_what_a_mixed_step_can_admit(monkeypatch, seq_factory):

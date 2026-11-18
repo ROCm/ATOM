@@ -90,6 +90,7 @@ class MockConfig:
             "throughput_log_interval_steps": 0,
             "cache_hit_rate_window": 1000,
             "enable_chunked_prefill": True,
+            "enable_mixed_prefill_decode": False,
             "enable_dynamic_chunking": False,
             "dynamic_chunking_smooth_factor": 0.75,
             "dynamic_chunking_min_chunk_size": 4096,

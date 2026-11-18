@@ -654,6 +654,10 @@ class Context:
 class AttentionMetaData:
     """Attention metadata for prefill and decode batched together."""
 
+    @property
+    def is_mixed(self) -> bool:
+        return False
+
     cu_seqlens_q: torch.Tensor | None = None
     cu_seqlens_k: torch.Tensor | None = None
     max_seqlen_q: int = 0

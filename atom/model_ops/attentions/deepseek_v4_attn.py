@@ -2710,24 +2710,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         Prefill uploads and decode staging use separate buffers. The bank shares
         the slot lifetime; uploads and forward reads are ordered on its stream."""
-        banks = getattr(self, "_mixed_prefill_banks", None)
-        if banks is None:
-            # Building here would allocate mid-serve, after the KV cache took
-            # the memory the profile left.
-            raise RuntimeError(
-                "mixed prefill banks were not built: the runner calls "
-                "build_mixed_prefill_banks() before warmup when "
-                "--enable-mixed-prefill-decode is set"
-            )
-        return banks[getattr(self.model_runner, "_fv_idx", 0)]
+        return self._mixed_prefill_banks[self.model_runner._fv_idx]
 
     def build_mixed_prefill_banks(self) -> None:
         """Allocate V4 prefill metadata banks before warmup so memory profiling includes them."""
         runner = self.model_runner
-        ring = getattr(runner, "_fv_ring", None) or [runner.forward_vars]
-        private_groups = getattr(
-            self, "mixed_prefill_groups", self.mixed_prefill_groups
-        )
+        ring = runner._fv_ring
+        private_groups = self.mixed_prefill_groups
         banks = {}
         for slot, forward_vars in enumerate(ring):
             # `clone()` carries `pin_memory`: an unpinned source would make
@@ -2743,7 +2732,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             }
             variables = {**forward_vars, **private}
             owner = groups = None
-            if getattr(runner, "h2d_groups", None) is not None:
+            if runner.h2d_groups is not None:
                 # Binding a shared buffer again would steal it from the live
                 # slot's owner. Only the clones belong to this publication slot.
                 owner, groups = runner.build_h2d_slot(
@@ -2759,8 +2748,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         variables, owner, groups = self._get_mixed_prefill_bank()
         saved = (
             runner.forward_vars,
-            getattr(runner, "h2d_owner", None),
-            getattr(runner, "h2d_groups", None),
+            runner.h2d_owner,
+            runner.h2d_groups,
         )
         runner.forward_vars = variables
         if owner is not None:
