@@ -10,7 +10,6 @@
 from typing import NamedTuple
 
 import torch
-
 import triton
 import triton.language as tl
 from aiter import dtypes
