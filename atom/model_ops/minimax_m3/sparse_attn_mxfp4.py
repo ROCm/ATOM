@@ -19,7 +19,13 @@ MXFP4 pages), each with a plan from the shared cache. Prefill runs plan-free
 
 import torch
 try:
-    from aiter.ops.flydsl.pa_decode import pa_decode
+    from aiter.ops.flydsl.pa_decode import pa_decode as _pa_decode_raw
+    import inspect as _inspect
+    if 'max_context_length' not in _inspect.signature(_pa_decode_raw).parameters:
+        def pa_decode(*args, max_context_length=None, **kwargs):
+            return _pa_decode_raw(*args, **kwargs)
+    else:
+        pa_decode = _pa_decode_raw
 except ImportError:
     pa_decode = None  # aiter pre-flydsl (bf37d container); MXFP4 sparse PA unavailable
 try:

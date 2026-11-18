@@ -682,7 +682,13 @@ def run_pa_decode(
         )
 
     if flydsl_seqs:
-        from aiter.ops.flydsl.pa_decode import pa_decode as _flydsl_pa_decode
+        from aiter.ops.flydsl.pa_decode import pa_decode as _pa_decode_raw
+        import inspect as _inspect
+        if 'max_context_length' not in _inspect.signature(_pa_decode_raw).parameters:
+            def _flydsl_pa_decode(*args, max_context_length=None, **kwargs):
+                return _pa_decode_raw(*args, **kwargs)
+        else:
+            _flydsl_pa_decode = _pa_decode_raw
 
         n = flydsl_seqs
         context_bound = _flydsl_context_bound(max_context_length, block_tables, k_cache)
