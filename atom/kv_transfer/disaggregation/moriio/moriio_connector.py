@@ -30,12 +30,6 @@ from atom.kv_transfer.disaggregation.base import (
     KVConnectorBase,
     KVConnectorSchedulerBase,
 )
-from atom.kv_transfer.disaggregation.moriio.moriio_common import (
-    _MORIIO_AVAILABLE,
-    MoRIIOAgentMetadata,
-    MoRIIOConstants,
-    get_port_offset,
-)
 from atom.kv_transfer.disaggregation.moriio.fabric import (
     allocate_fabric_pool,
     block_runs,
@@ -46,6 +40,12 @@ from atom.kv_transfer.disaggregation.moriio.fabric import (
     page_region_digests,
     pool_span,
     repeated_blocks,
+)
+from atom.kv_transfer.disaggregation.moriio.moriio_common import (
+    _MORIIO_AVAILABLE,
+    MoRIIOAgentMetadata,
+    MoRIIOConstants,
+    get_port_offset,
 )
 from atom.kv_transfer.disaggregation.moriio.moriio_engine import MoRIIOWrapper
 from atom.kv_transfer.disaggregation.types import (

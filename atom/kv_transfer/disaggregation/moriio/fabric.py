@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 from typing import Any
@@ -51,12 +52,10 @@ class _FabricBuffer:
         }
 
     def __del__(self) -> None:
-        try:
+        with contextlib.suppress(Exception):
             from mori.io import fabric_free
 
             fabric_free(self._ptr)
-        except Exception:
-            pass
 
 
 # The pool this process allocated, as (base, nbytes).
