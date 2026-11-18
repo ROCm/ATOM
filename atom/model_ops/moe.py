@@ -5676,7 +5676,8 @@ class FusedMoE(torch.nn.Module):
                 reassign_gathered_shared_ids(self, out[2])
                 return out, local_tokens, sizes, gathered_rows
 
-            out, local_tokens, sizes, gathered_rows = tbo_on_comm(gather)
+            # Not held, like the TP all-reduce: see `tbo_on_comm`.
+            out, local_tokens, sizes, gathered_rows = tbo_on_comm(gather, hold=False)
             hidden_states, topk_weights, topk_ids, *scale = out
             x_scale = scale[0] if scale else None
 
@@ -5697,11 +5698,14 @@ class FusedMoE(torch.nn.Module):
                 final_hidden_states = final_hidden_states[:gathered_rows]
             if dp_eager_mode:
                 final_hidden_states = tbo_on_comm(
-                    reduce_scatterv, final_hidden_states, sizes, dp_group
+                    reduce_scatterv, final_hidden_states, sizes, dp_group, hold=False
                 )
             else:
                 final_hidden_states = tbo_on_comm(
-                    reduce_scatter_with_unpadding, final_hidden_states, local_tokens
+                    reduce_scatter_with_unpadding,
+                    final_hidden_states,
+                    local_tokens,
+                    hold=False,
                 )
 
         if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
