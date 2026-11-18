@@ -63,10 +63,8 @@ def sigmoid_fast(x):
 
 
 def mxfp4_qd(v0, v1):
-    """Per-32 MXFP4 quantize-dequantize of the pair (v0, v1) a lane holds, a 32-element block on 16
-    consecutive lanes, as aiter's decode MoE quantizes (``mxfp4_moe_sort_quant_fwd`` and its stage-1
-    epilogue, RCEIL): the E8M0 scale ``ceil_pow2(amax * fl(1 / 6))``, E2M1 round to nearest even, back
-    to f32 (exact in bf16).
+    """Per-32 MXFP4 quantize-dequantize of a lane's pair (a 32-block on 16 consecutive lanes), as aiter's
+    decode MoE (RCEIL): E8M0 scale ``ceil_pow2(amax * fl(1 / 6))``, E2M1 round-to-nearest-even.
     """
     word, ef = mxfp4_q(v0, v1)
     one = as_ir_value(fx.Float32(1.0))
@@ -111,13 +109,8 @@ def mxfp4_q(v0, v1):
 
 
 def div_rn(x, d, r):
-    """Kept apart from ``atom.mono.device.ops.div_rn``, which returns +0 for x = -0: the divide (and the
-    FP8 byte a -0 quantizes to) keeps the sign.
-
-    ``x / d`` as an IEEE divide rounds it, given ``r`` = ``1 / d`` correctly rounded: Markstein's sequence
-    (q0 = x r, the exact residual x - q0 d by fma, q0 + residual r), one reciprocal for many quotients. A zero
-    ``x`` keeps its sign as the division does. Exact while x / d does not underflow; an underflowing quotient
-    is far below any FP8 / bf16 step (and keeps its sign), so a value only rounded to those is unchanged.
+    """IEEE-rounded ``x / d`` from ``r`` = ``1 / d`` (Markstein's sequence). Unlike
+    ``atom.mono.device.ops.div_rn``, keeps the sign of x = -0 (the FP8 byte a -0 quantizes to).
     """
     q0 = x * r
     q1 = fmath.fma(fmath.fma(-q0, d, x), r, q0)
@@ -269,13 +262,9 @@ def common_defs(ctx):
             lds_st(misc, MOE_MISC + s * XQ_BLOCKS + k // 128, sc)
 
     def stage_x_gemma(ld4s, n, gamma, count=None, fp8_rule=None):
-        """LDS X[s][0:n] = rmsnorm(x_s) * gamma for ``count`` samples, ``gamma`` an f32 vector (the Gemma
-        ``1 + w``, formed on the host); ld4s([(s, k)]) -> [(x_s[k], .., x_s[k+3])]. As bf16 pairs, or
-        with ``fp8_rule`` (one of the ``quant_rule_*``) as FP8 bytes in K order quantized per 128-block
-        from the f32 normed values, the block scales in misc[MOE_MISC + s * XQ_BLOCKS + block]. With
-        ``fp8_rule="ptpc"``, per token as the per-token FP8 projections' input: the normed values rounded
-        to bf16 (the norm's output), quantized with the row's max (``quant_rule_ptpc``), the row's scale in
-        misc[MOE_MISC + s].
+        """LDS X[s][0:n] = rmsnorm(x_s) * gamma (f32 Gemma ``1 + w``) for ``count`` samples;
+        ld4s([(s, k)]) -> [(x_s[k], .., x_s[k+3])]. bf16 pairs, or with ``fp8_rule`` FP8 per 128-block
+        (scales in misc[MOE_MISC + s * XQ_BLOCKS + block]); ``"ptpc"``: bf16-rounded, per-row FP8.
         """
         ptpc = fp8_rule == "ptpc"
         count = S if count is None else count
@@ -301,8 +290,7 @@ def common_defs(ctx):
             return ss
 
         def stage_chunk(c0, cn):
-            """Samples c0 .. c0 + cn - 1 from registers: their sums of squares, one block reduction, the
-            normed values (FP8 or bf16 pairs) into LDS; their rstds."""
+            """Norm samples c0 .. c0 + cn - 1 into LDS with one block reduction; returns their rstds."""
             vals = ld4s([(c0 + s, k) for s in range(cn) for k in ks])
             sss = [sumsq(vals, s) for s in range(cn)]
             rstds = [rsq(tot * (1.0 / n) + EPS) for tot in block_sums(sss)]
@@ -359,8 +347,7 @@ def common_defs(ctx):
                             )
             return rstds
 
-        # more than 8 samples: groups of 8 (what registers hold at once), each normalized from its own
-        # registers (the stream is f32, the norm's operand unrounded: no bf16 parking)
+        # groups of 8 samples (what registers hold at once)
         rstds = []
         for c0 in range_constexpr(0, count, 8):
             if const_expr(c0 > 0):
@@ -438,9 +425,8 @@ def common_defs(ctx):
                     lds_st(misc, MOE_MISC + w // 32, sc)
 
     def stage_pairs_q8_rows(name, n):
-        """LDS FP8 [S, n] (K order) of the bf16 mailbox ``name``, quantized per row as aiter's per-token quant
-        (``quant_rule_ptpc``): a row is n / 4 words, a thread's word each (n = 4 * THREADS); the row
-        scales to misc[MOE_MISC + s]."""
+        """LDS FP8 [S, n] (K order) of the bf16 mailbox ``name``, per-row quantized (``quant_rule_ptpc``);
+        row scales to misc[MOE_MISC + s]."""
         assert n == 4 * THREADS, "a row is one word a thread"
         rows = []
         for s in range_constexpr(S):
@@ -459,10 +445,8 @@ def common_defs(ctx):
                 lds_st(misc, MOE_MISC + s, sc)
 
     def route_softmax(s):
-        """Softmax top-``TOP_K`` of sample ``s``'s router logits (one whole wave), as aiter's
-        ``topkGatingSoftmax``: the picks on the raw (bf16) logits in descending order, ties to the
-        lower expert id; ``expf(l - l_max)`` of each pick, their sum in pick order, each times
-        ``1 / sum``. Returns (expert id, weight) of pick ``lane``, valid in lanes < TOP_K.
+        """Softmax top-``TOP_K`` of sample ``s``'s logits (whole wave), as aiter's ``topkGatingSoftmax``
+        (ties to the lower id, sum in pick order). Returns (expert, weight) of pick ``lane`` (lane < TOP_K).
         """
         KPL = N_EXPERTS // 64
         raws = st.getf_many(

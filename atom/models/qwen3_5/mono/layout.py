@@ -52,8 +52,8 @@ def router_spt(S: int, n_experts: int) -> int:
 
 
 def dn_tile(S: int, hidden: int) -> int:
-    """Hidden rows per expert-down / FFN peer-reduce task: 32 at S = 1, else about one task per CTA,
-    a multiple of 16 so a tile never straddles the row groups ``reduce_rows`` emits."""
+    """Hidden rows per expert-down / FFN peer-reduce task: 32 at S = 1, else about one task per CTA;
+    a multiple of 16 so a tile never straddles ``reduce_rows``'s row groups."""
     return 32 if S == 1 else max(16, -(-(hidden // BLOCKS) // 16) * 16)
 
 
@@ -68,23 +68,19 @@ def flydsl_capacity(seqs: int) -> int:
 
 
 def pa_splits(seqs: int) -> int:
-    """KV splits of the full-attention decode for ``seqs`` sequences: baseline ATOM's
-    ``dense_decode_splits`` (aiter's ``get_recommended_splits`` on BLOCKS CUs, occupancy 2, one KV head
-    a rank, raised to a power-of-two share of 128 programs, at most 32). Its splits are rounding points
-    (each rounds its partial output to bf16), so the kernel takes the same ones."""
+    """KV splits of the full-attention decode for ``seqs`` sequences, as ATOM's ``dense_decode_splits``:
+    each split rounds its partial output to bf16, so the kernel must take the same ones.
+    """
     rec = min(-(-2 * BLOCKS // seqs), 8)
     boost = 1 << (min(32, -(-128 // seqs)).bit_length() - 1)
     return min(32, max(rec, boost))
 
 
-# Baseline ATOM's BF16 GEMMs are aiter tuned_gemm (tgemm.mm) picks per (shape, M), and some picks round
-# partial sums: aiter 45f966883's tuned configs on gfx950 (``tests/test_qwen3_5_mono_layout.py`` checks the
-# table against the installed aiter). ``("halves",)``: the FlyDSL hgemm with two K-waves (t16x16x256,
-# w1x1x2), each 256-wide K tile's first and second 128 summed by one wave each, both rounded to bf16 and
-# added: bf16(bf16(sum half 0) + bf16(sum half 1)). ``("splitk", n)``: the FlyDSL split-K hgemm, K in n
-# equal ranges, each range's sum rounded to bf16 and added into the bf16 output by atomics (the order
-# is not deterministic; the kernel takes range order). ``("single",)``: one fp32 sum, one rounding
-# (torch / hipBLASLt, skinny, Triton: Triton's split-K reduces fp32 partials).
+# How baseline ATOM's BF16 GEMMs (aiter tuned_gemm picks per (shape, M) on gfx950) round partial sums;
+# ``tests/test_qwen3_5_mono_layout.py`` checks the table against the installed aiter.
+# ``("halves",)``: bf16(bf16(sum K half 0) + bf16(sum K half 1)) per 256-wide K tile (two K-waves).
+# ``("splitk", n)``: n K ranges, each rounded to bf16 and added (the kernel takes range order).
+# ``("single",)``: one fp32 sum, one rounding.
 _SPLITK_512x4096 = {
     1: ("single",),
     2: ("splitk", 8),
@@ -98,17 +94,14 @@ BF16_GEMM_RULES = {
     "out": {m: ("halves",) if m <= 8 or m == 12 else ("single",) for m in range(1, 17)},
     # the MXFP4 checkpoint's shared gate_up (N 512, K 4096)
     "shared_ug": _SPLITK_512x4096,
-    # the router and the shared-expert gate: one merged GEMM (N 513, which ATOM pads to 528; K 4096; both
-    # checkpoints), torch
+    # the router and shared-expert gate merged (N 513 padded to 528, K 4096)
     "router": {m: ("single",) for m in range(1, 17)},
 }
 
 
 def bf16_gemms(cfg) -> list[tuple[str, int, int, str | None]]:
-    """Baseline ATOM's BF16 GEMMs on the decode path the kernel reproduces, as (name, N, K, its
-    ``BF16_GEMM_RULES`` entry or None: the kernel sums those in one fp32 pass) for a ``Q35Config``
-    rank: the router; the GDN b | a projection unless it is FP8 (the per-token checkpoint's merged input
-    projection); the MXFP4 checkpoint's BF16 projections and shared expert."""
+    """Baseline ATOM's BF16 decode GEMMs for a ``Q35Config`` rank, as (name, N, K, ``BF16_GEMM_RULES``
+    key or None for one fp32 pass)."""
     gemms = [("router", router_rows(cfg.n_experts), cfg.hidden, "router")]
     if cfg.proj_kind != "ptpc":
         gemms.append(("in_proj_ba", 2 * cfg.hv, cfg.hidden, None))
@@ -131,9 +124,8 @@ def bf16_gemms(cfg) -> list[tuple[str, int, int, str | None]]:
 
 
 def ptpc_gemms(cfg) -> list[tuple[str, int, int, str]]:
-    """Baseline ATOM's per-token FP8 GEMMs (aiter's ``gemm_a8w8_bpreshuffle``, the MXFP4-AttnFP8
-    checkpoint's projections), as (name, N as ATOM pads it to 128, K, the epilogue order the kernel follows:
-    "w_x" ``(acc * w_scale) * x_scale``, "x_w" ``(acc * x_scale) * w_scale``) for a ``Q35Config`` rank.
+    """Baseline ATOM's per-token FP8 GEMMs for a ``Q35Config`` rank, as (name, N padded to 128, K,
+    epilogue order: "w_x" ``(acc * w_scale) * x_scale``, "x_w" ``(acc * x_scale) * w_scale``).
     """
     if cfg.proj_kind != "ptpc":
         return []
@@ -179,8 +171,7 @@ def aiter_ptpc_order(pick: dict | None) -> str | tuple:
 
 def aiter_bf16_rule(pick: dict | None) -> tuple:
     """The partial-sum rounding (a ``BF16_GEMM_RULES`` value) of an aiter tuned_gemm config ``pick``
-    (``get_GEMM_A16W16_config``; None: untuned, torch). A FlyDSL pick whose name does not read as one
-    of those is ``("unknown", name)``, which matches no rule."""
+    (None: untuned, torch); ``("unknown", name)`` for an unrecognized FlyDSL pick."""
     pick = pick or {}
     name = pick.get("kernelName") or ""
     if pick.get("libtype") == "flydsl":
@@ -203,11 +194,10 @@ def aiter_bf16_rule(pick: dict | None) -> tuple:
     return ("single",)
 
 
-# Past XIN_MIN rows the FP8 checkpoint's input norm + FP8 quant runs once a layer (stage ``xin``, a task per row)
-# instead of in every projection task (each restaged every row: the cost grew with the rows)
+# from XIN_MIN rows the FP8 checkpoint's input norm + quant runs once (stage ``xin``), not per projection task
 XIN_MIN = 4
 
-# ATOM_MONO_TIMELINE: a CTA's stamps (atom.mono.device.stamps): kernel entry, each stage's entry, kernel end
+# ATOM_MONO_TIMELINE stamps per CTA: kernel entry, each stage's entry, kernel end
 TL_POINTS = 12
 
 
@@ -288,7 +278,7 @@ def layout(
                 "kvnew",
                 S * (2 * head_dim + 2) * pr,
             ),  # this token's K / V FP8 codes + their scales
-            # a split's / plan slot's bf16 output per row, and its running max, exp sum
+            # per split: bf16 output, running max and exp sum
             ("sp_out", parts * heads * head_dim // 2 * pr),
             ("sp_ml", parts * heads * 2 * pr),
         ]
@@ -299,18 +289,16 @@ def layout(
             ("z", S * g["value_dim"] * pr),
             ("ba", S * 2 * hv * pr),  # b then a, per v-head
         ]
-    if (
-        full and qk_fusion and weights == "fp8"
-    ):  # gated, f32 (one a pair): quantized from f32
+    if full and qk_fusion and weights == "fp8":  # gated, f32
         out_in = [("gated", S * out_k(full, dims) * pr)]
     elif full or proj_kind(weights) != "block":  # the mixer's output, bf16 pairs
         out_in = [("gated", S * out_k(full, dims) // 2 * pr)]
-    else:  # the FP8 checkpoint's GDN output: FP8 (four bytes a pair) and its per-128 scales
+    else:  # FP8 checkpoint's GDN output: FP8 codes and per-128 scales
         out_in = [
             ("gq", S * out_k(full, dims) // 4 * pr),
             ("gqs", S * out_k(full, dims) // 128 * pr),
         ]
-    # stage xin's output: the normed input as FP8 (four bytes a pair) and its per-128 scales
+    # stage xin's output: FP8 codes and per-128 scales
     xin = (
         [("xinq", S * hidden // 4 * pr), ("xins", S * hidden // 128 * pr)]
         if xin_stage(S, weights)
@@ -321,7 +309,7 @@ def layout(
         + mixer
         + out_in
         + [
-            # the f32 post-mixer stream (one value a pair): the MoE input norm's operand
+            # the f32 post-mixer stream
             ("a", S * hidden * pr),
             (
                 "scores",
@@ -331,8 +319,7 @@ def layout(
             ("xqs", S * hidden // 128 * pr),
             ("sel", S * slots * pr),
             ("prob", S * slots * pr),
-            # silu(gate) * up as f32 pairs, or (fp4_mids) as the MoE input below: per-32 MXFP4 codes, then
-            # a word a 32-block's E8M0 scale
+            # silu(gate) * up as f32, or (fp4_mids) MXFP4 codes then E8M0 scales
             (
                 "mid",
                 (
@@ -342,8 +329,8 @@ def layout(
                 )
                 * pr,
             ),
-            # MXFP4 experts: the MoE input per-32 MXFP4 (the bank's: a word a 8 E2M1 codes, then a word a
-            # 32-block's E8M0 scale), and normed as bf16 pairs (the separate BF16 shared expert's, "mxfp4")
+            # MXFP4 experts: MoE input as MXFP4 (codes then E8M0 scales); "mxfp4" also as bf16 for the
+            # BF16 shared expert
             *([("x2b", S * hidden // 2 * pr)] if weights == "mxfp4" else []),
             *(
                 [("xb", (S * hidden // 8 + S * hidden // 32) * pr)]
@@ -352,8 +339,7 @@ def layout(
             ),
         ]
     )
-    # a debug build's wait records (one a CTA, atom.mono.device.sync), zeroed with the mailboxes at a
-    # step's start
+    # a debug build's wait records, one per CTA
     items = items + [("diag", BLOCKS * DIAG_WORDS * 4)]
     off, scratch = 0, {}
     for name, size in items:
@@ -366,9 +352,8 @@ def layout(
 
 
 def mailbox_regions(S: int, full: bool, weights: str, npes: int) -> list[RegionDecl]:
-    """The layer kernel's hand-offs: every mailbox region, its space and the stage that puts it (checked on a
-    traced build, ``contract.py``). ``attn`` / ``ffn`` are the TP peer reduces (each rank's partials, polled
-    by the putting stage: an exchange), absent at one rank."""
+    """Every mailbox region, its space and the stage that puts it (checked by ``contract.py``).
+    ``attn`` / ``ffn`` are the TP peer-reduce exchanges, absent at one rank."""
     r = [
         RegionDecl("a", Space.SCRATCH, "out"),
         RegionDecl("scores", Space.SCRATCH, "router"),
@@ -417,9 +402,7 @@ def stage_tasks(
     pa_flydsl=False,
     tokens_per_seq=1,
 ):
-    """[(stage name, task count)] in execution order (``tokens_per_seq``: MTP verify, a GDN task per sequence;
-    ``pa_flydsl``: a split task per FlyDSL plan slot).
-    """
+    """[(stage name, task count)] in execution order."""
     xin = [("xin", S)] if xin_stage(S, weights) else []
     if full:
         mixer = [
@@ -453,8 +436,7 @@ def stage_tasks(
                 -(-S // router_spt(S, n_experts))
                 * (router_rows(n_experts) // ROUTER_TILE),
             ),
-            # one tile per (routed slot, 8 intermediates), the first inter / UG8 also carrying the shared
-            # expert; fp4_mids: four tiles (a 32-mid block) per (sample, routed slot) or shared-expert item
+            # a tile per (routed slot, UG8 intermediates) plus the shared expert; fp4_mids: 32-mid blocks
             (
                 "ug",
                 (

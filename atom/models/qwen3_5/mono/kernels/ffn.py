@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # ruff: noqa: B023  (traced stage closures read the loop's values on purpose: the tracer unrolls)
-"""The MoE FFN of the Qwen3.5 layer kernel: the router (+ the shared-expert gate), expert up/gate and
-down with softmax top-k routing and SwiGLU, and the FFN-side TP reduce. The experts run W8A8 (FP8) or
-A4W4 (both MXFP4 checkpoints); the shared expert is a sigmoid-gated slot of the bank (FP8,
-MXFP4-AttnFP8) or a separate BF16 MLP (MXFP4)."""
+"""MoE FFN stages: router (+ shared-expert gate), expert up/gate and down, and the FFN TP reduce.
+Experts are W8A8 (FP8) or A4W4 (MXFP4); the shared expert is a sigmoid-gated slot of the bank or a
+separate BF16 MLP ("mxfp4")."""
 
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
@@ -159,8 +158,7 @@ def ffn_stages(ctx):
         xa = []
 
         def ld_a(sks):
-            # sks = (local sample s, k) pairs; local sample s is sample rs0 + s. Mailbox ``a`` holds the
-            # f32 post-attention stream (one value a pair): the norm's operand, unrounded
+            # sks = (local sample s, k) pairs (sample rs0 + s); mailbox ``a`` is the unrounded f32 stream
             n4 = len(sks)
             specs = []
             for s, k in sks:
@@ -186,9 +184,8 @@ def ffn_stages(ctx):
                     a1 * rstds[s_l] * xg[1]
                 )
                 if const_expr(MX):
-                    # MXFP4 checkpoint: the normed input (the BF16 shared expert's) and its per-32 MXFP4
-                    # quant (the A4W4 routed experts'): mailbox ``xb`` holds the E2M1 codes, one word a
-                    # 8 elements, sample-major, then the E8M0 scales, one word a 32-block
+                    # ``xb``: E2M1 codes (a word per 8 elements, sample-major), then E8M0 scales (a word
+                    # per 32-block)
                     if const_expr(SH_BF16):
                         put_bf(mb("x2b"), x_s * HIDDEN + xk, [v0, v1])
                     qb, qe = mxfp4_q(v0, v1)
@@ -244,15 +241,14 @@ def ffn_stages(ctx):
 
     def dn_route():
         """Wave w routes samples w, w + WAVES, ..: slot 0 the shared expert (weight sigmoid(gate)),
-        slots 1..TOP_K the picks -> keys[s * MOE_SLOTS + slot], dnw[...]; the scores must have landed.
+        slots 1..TOP_K the picks -> keys / dnw[s * MOE_SLOTS + slot]; the scores must have landed.
         """
         for j in range_constexpr(-(-S // WAVES)):
             s_ = wave + j * WAVES
             if s_ < S:
                 e, w = route_softmax(s_)
-                # the shared expert's weight: the top-k kernel's f32 sigmoid of the bf16 logit (a fused
-                # bank: aiter's, ATOM's Triton top-k at decode, alike); torch's, to bf16, for the separate
-                # BF16 shared expert ("mxfp4")
+                # shared-expert weight: f32 sigmoid of the bf16 logit, as the top-k kernel; rounded to
+                # bf16 for the separate BF16 shared expert, as torch
                 sg = sigmoid_precise(getf(mb("scores"), s_ * ROUTER_ROWS + N_EXPERTS))
                 if const_expr(SH_BF16):
                     sg = bf16_round(sg)
@@ -382,9 +378,8 @@ def ffn_stages(ctx):
             return silu(g) * v
 
         def route_out(sn, sl):
-            """The routing (expert, weight) of slot ``sl``: no stage reads it (down routes for itself).
-            Kept: with these stores gone the register allocator spills the FP8 8-row and MTP 4 / 8-row
-            builds, which then fall back to the original path (measured 2026-10-20)."""
+            """Publish slot ``sl``'s routing (expert, weight). No stage reads it, but removing these stores
+            makes the FP8 8-row and MTP 4 / 8-row builds spill."""
             put(mb("sel"), sn * MOE_SLOTS + sl, lds_ld(keys, sn * MOE_SLOTS + sl))
             put(mb("prob"), sn * MOE_SLOTS + sl, lds_ld(dnw, sn * MOE_SLOTS + sl))
 
@@ -723,8 +718,8 @@ def ffn_stages(ctx):
             # the mids as up / gate published them: per-32 MXFP4 codes, then the scale words
             stage_fp4("mid", DN_BLK * 16)
         else:
-            # the mids in rounds of at most DN_MID_ROUND blocks a lane (S <= 8 is one round): at S = 16 all
-            # of them in flight next to the prefetched weights spill
+            # rounds of at most DN_MID_ROUND blocks a lane: at S = 16 all in flight next to the
+            # prefetched weights spill
             for r0 in range_constexpr(0, DN_MID_BLOCKS, DN_MID_ROUND):
                 rb = min(DN_MID_ROUND, DN_MID_BLOCKS - r0)
                 mids = get2_many(
@@ -740,9 +735,8 @@ def ffn_stages(ctx):
                     blk = wave + (r0 + b) * WAVES
                     if blk < DN_BLK:
                         if const_expr(MX):
-                            # the routed slots per-32 MXFP4 (A4W4) from the f32 silu * up, as aiter's
-                            # stage-1 epilogue quantizes; the shared expert's (a BF16 MLP) bf16; bf16
-                            # values in LDS, K order
+                            # routed slots per-32 MXFP4 qdq, as aiter's stage-1 epilogue; the BF16
+                            # shared expert's bf16; bf16 values in LDS, K order
                             m0, m1 = mxfp4_qd(mids[b][0], mids[b][1])
                             if const_expr(SH_BF16):
                                 v0, v1 = bf16_round(mids[b][0]), bf16_round(mids[b][1])
@@ -771,14 +765,12 @@ def ffn_stages(ctx):
 
             run_units(u_dn, DN_UPW, DN_BATCH, pre, each=dn_part)
             if const_expr(not SH_BF16):
-                # every wave's partials in LDS before the combine reads them (the separate shared
-                # expert's reduce_rows below was this barrier on the "mxfp4" checkpoint)
+                # every wave's partials in LDS before the combine (with SH_BF16, reduce_rows' barrier)
                 gpu.barrier()
         else:
             acc = run_units(u_dn, DN_UPW, DN_BATCH, pre)
         if const_expr(SH_BF16):
-            # baseline ATOM's MoE block on the MXFP4 checkpoint: the shared expert apart (BF16 MLP, its
-            # down bf16), times the bf16 sigmoid gate (bf16), plus the routed experts' bf16 output (bf16)
+            # as baseline ATOM: bf16(bf16 shared down * bf16 gate + bf16 routed output)
             sh_acc = mma_units([fx.Float32(0.0) for _ in range(4)], [sh_dn_unit()])
 
             def emit_sh(rl, n, v):
@@ -788,8 +780,7 @@ def ffn_stages(ctx):
             gpu.barrier()
 
         def sh_combine(n, k, v):
-            """Output k = n * DN_TILE + row: the shared expert's part (its bf16 down times the bf16 gate)
-            plus the routed part, as baseline ATOM's torch ops round them."""
+            """Output k = n * DN_TILE + row: shared + routed part, rounded as baseline ATOM."""
             sh = bf16_round(lds_ld(dnw, n * MOE_SLOTS) * lds_ld(outs, S * DN_TILE + k))
             return bf16_round(sh + bf16_round(v))
 
@@ -797,10 +788,9 @@ def ffn_stages(ctx):
             lds_st(outs, n * DN_TILE + rl, v)
 
         if const_expr(MX):
-            # baseline ATOM's MXFP4 GEMM2 epilogue: a route's full-K fp32 sum times its weight, bf16; the
-            # routes in aiter's id-column order (the picks, then a fused shared expert: column TOP_K), bf16
-            # atomic adds at M <= 4, else an fp32 sum rounded once
-            # (part slot, weight slot) per route: parts index the down's slots, weights the routing's
+            # baseline ATOM's MXFP4 GEMM2 epilogue: bf16(route fp32 sum * weight), routes in aiter's
+            # id-column order (picks, then a fused shared expert), bf16 atomic adds at M <= 4, else an
+            # fp32 sum rounded once; routes are (part slot, weight slot)
             routes = (
                 [(sl, 1 + sl) for sl in range(TOP_K)]
                 if SH_BF16
@@ -841,8 +831,7 @@ def ffn_stages(ctx):
             gpu.barrier()
 
         def store_x(s, row, v0, v1):
-            # the layer's output: the f32 stream (the next input norm's operand; its bf16 rounding is
-            # the stored residual)
+            # f32 stream: the next norm's operand; its bf16 rounding is the residual
             bo.buffer_store(
                 fx.Vector.from_elements([v0, v1], fx.Float32),
                 rsrc(x_out),

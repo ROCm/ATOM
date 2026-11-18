@@ -2,12 +2,8 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Device helpers of the Qwen3.5 mono layer kernel.
 
-Every helper is a plain function whose first argument is the kernel's ``LaunchState``: the values of
-one launch (``mbox``, ``lane`` / ``wave`` / ``tid``, scratch layout, LDS pointers, task bases, ...).
-``LaunchState`` also exposes each helper bound to it (``st.put``, ``st.poll``, ...), and helpers call
-one another through it, so a kernel that installs its own variant (``st.poll = partial(poll, st,
-batch=...)``, or a function of its own) changes it for every helper. Variants are
-keyword arguments (``poll``, ``peer_reduce``) or separate functions, each a build-time choice.
+Each helper takes the launch's ``LaunchState`` first and calls the others through it (``st.poll``, ...),
+so a variant installed on the state (e.g. ``st.poll = partial(poll, st, batch=...)``) applies to all.
 """
 
 from functools import partial
@@ -40,8 +36,7 @@ from atom.mono.device.sync import preg, sreg
 from atom.mono.plan.execution import THREADS, WAVES
 from atom.mono.plan.trace import enter_stage
 
-# a kernel captures this digest of the model's kernel sources and the mono framework
-# (``sources.SOURCES``): the JIT cache keys a helper's source only when its walk reaches it
+# captured by the kernel so the JIT cache key covers helper sources its walk would not reach
 SHARED_SOURCE_KEY = SOURCES
 
 # --------------------------------------------------------------------------- tagged-pair mailboxes
@@ -93,8 +88,7 @@ def get2_many(st, specs):
 
 
 def start(st, name):
-    """This CTA's first task of stage ``name`` (every stage's task loop starts here, in stage order: the
-    traced hand-off contract records the stage)."""
+    """This CTA's first task of stage ``name``; call in stage order (the hand-off trace records it)."""
     enter_stage(name)
     stamp(st.timeline, st.tls, st.tid, 1 + list(st.base).index(name))
     G = st.G
@@ -158,9 +152,8 @@ def block_sum(st, v):
 
 
 def unit_f8f8(st, w_rsrc, s_rsrc, rg, kc, NKC, K, b_word, coef, ln=None):
-    """Issue one 128-k chunk (64-k chunks kc, kc + 1) of row group ``rg`` against the
-    FP8 activation at LDS word ``b_word``; ``coef()`` = activation scale (x route weight). ``s_rsrc`` None:
-    no per-block scale (a per-channel matrix), the chunk's partial summed plainly.
+    """Issue one 128-k chunk (64-k chunks kc, kc + 1) of row group ``rg`` against the FP8 activation
+    at LDS word ``b_word``; ``coef()`` = activation scale (x route weight); ``s_rsrc`` None: per-channel.
     """
     lane = st.lane
     ln = lane if ln is None else ln
@@ -180,9 +173,8 @@ def unit_f8f8(st, w_rsrc, s_rsrc, rg, kc, NKC, K, b_word, coef, ln=None):
 
 
 def unit_bf16_rows(st, w_rsrc, rg, kc, K, b_word, ln=None):
-    """Issue one 64-k chunk of row group ``rg`` of a row-major BF16 ``[N, K]`` matrix (ATOM's unshuffled
-    layout): lane ``16 * g + r`` reads K 64 kc + 16 g .. + 15 of row r (32 contiguous bytes), the activation
-    order of the ``fp8s`` units."""
+    """Issue one 64-k chunk of row group ``rg`` of a row-major BF16 ``[N, K]`` matrix: lane ``16 * g + r``
+    reads K 64 kc + 16 g .. + 15 of row r."""
     lane = st.lane
     ln = lane if ln is None else ln
     base = ((rg * 16 + ln % 16) * K + kc * 64 + (ln // 16) * 16) // 2
@@ -214,10 +206,9 @@ def unit_mxfp4_atom(
     st, w_rsrc, s_rsrc, rg, kc, K, b_word, coef=None, ln=None, b_scale=None
 ):
     """Issue one 128-K tile of an MXFP4 bank in ATOM's gfx950 layout and its E8M0 scale (lane
-    ``16 * kl + r`` holds one 32-K scale block of row ``r``; the scale dword's four bytes cover
-    tiles kc (even, odd) x row groups (even, odd)). With ``b_scale`` the activation is staged MXFP4:
-    ``b_word`` its first E2M1 code word, ``b_scale`` its first 32-block's scale word (one native FP4
-    MFMA); without, bf16 words."""
+    ``16 * kl + r``: 32-K block of row ``r``; the scale dword's bytes cover kc parity x rg parity).
+    With ``b_scale`` the activation is staged MXFP4 (one native FP4 MFMA); without, bf16 words.
+    """
     lane = st.lane
     ln = lane if ln is None else ln
     k1n = -(-(K // 32) // 8)  # scale K blocks, padded to 8, in groups of 8
@@ -336,9 +327,9 @@ def mma_units(st, acc, units):
 
 
 def run_units(st, make_unit, cpw, batch, pre=None, each=None):
-    """Software pipelined: issue batch b+1's loads before computing batch b.
-    ``pre`` = the already-issued first batch (prefetched before a wait). With ``each``, every unit is
-    computed on its own and handed over, ``each(c, tile)``, instead of summed."""
+    """Software pipelined: issue batch b+1's loads before computing batch b. ``pre``: an already-issued
+    first batch; with ``each``, each unit's tile goes to ``each(c, tile)`` instead of the sum.
+    """
     mma_units = st.mma_units
     acc = [fx.Float32(0.0) for _ in range(4)]
     starts = list(range(0, cpw, batch))
@@ -361,11 +352,9 @@ def run_units(st, make_unit, cpw, batch, pre=None, each=None):
 
 
 def bf16_combine(rule, parts):
-    """The sum of a BF16 GEMM's per-wave fp32 partials ``parts`` (each a contiguous K share, in K order)
-    as baseline ATOM's GEMM rounds it (``layout.BF16_GEMM_RULES``): ``("single",)`` one fp32 sum;
-    ``("splitk", n)`` n equal K ranges, each rounded to bf16 and added into a bf16 sum in range order;
-    ``("halves",)`` the even and the odd partials (each 256-wide K tile's first / second 128) summed,
-    rounded to bf16 and added, bf16."""
+    """Sum per-wave fp32 partials (K order) as baseline ATOM's BF16 GEMM rounds it: ``single`` one fp32
+    sum; ``splitk, n`` n K ranges, each bf16-rounded into a bf16 sum; ``halves`` even / odd partials
+    summed, each bf16-rounded, added in bf16."""
     W = len(parts)
     if const_expr(rule[0] == "single"):
         tot = parts[0]
@@ -412,9 +401,8 @@ def _wave_total(rule, parts):
 
 @traced
 def reduce_rows(st, R, acc, emit, count=None, rule=None):
-    """Sum per-wave MFMA tiles; emit(row_local, local sample column, value). With ``rule`` (a BF16 GEMM's,
-    see ``bf16_combine``) the waves' partials are combined as baseline ATOM's GEMM rounds them.
-    """
+    """Sum per-wave MFMA tiles; emit(row_local, local sample column, value). ``rule``: see
+    ``bf16_combine``."""
     S = st.S
     lane = st.lane
     red = st.red
@@ -455,9 +443,8 @@ def n_sel(st, count=None):
 
 
 def rmsnorm_tail_ks(st, n):
-    """This thread's group-of-4 starting indices of n elements. A ragged tail is
-    clamped to the last group (idempotent rewrites); ``active`` masks its
-    contribution to sums (None when there is no tail)."""
+    """This thread's group-of-4 start indices of n elements; a ragged tail is clamped to the last group
+    and ``active`` masks it from sums (None without a tail)."""
     tid = st.tid
     nq = n // 4
     full = nq // THREADS
@@ -496,9 +483,8 @@ def stage_x_pairs(st, name, n_total, src_of):
 
 @traced
 def st_f8(st, k, q0, q1):
-    """LDS FP8 activation bytes k, k + 1 (k even, held by this lane; lane ^ 1 holds
-    k ^ 2) in K order (the order aiter's ``shuffle_weight`` (16, 16) matrices take).
-    Call from the whole wave."""
+    """LDS FP8 activation bytes k, k + 1 (k even; lane ^ 1 holds k ^ 2) in K order. Call from the
+    whole wave."""
     lane = st.lane
     xs = st.xs
     w = fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, q0, q1, fx.Int32(0), False)) & 0xFFFF
@@ -521,12 +507,9 @@ def peer_reduce(
     *,
     residual_f32=False,
 ):
-    """Push BF16 partials in tagged pairs to every peer, then sum all ranks' pairs from the own
-    symmetric buffer in rank order (W = 1: no exchange). As aiter's fused all-reduce + RMSNorm, the
-    rank sum is rounded to bf16 before the residual joins in f32: out_fn(s, row, v0, v1) gets
-    ``residual + bf16(sum)``, unrounded. ``residual`` is fn(s, row) -> (r0, r1) (plain loads, issued
-    first), a mailbox base (pairs s * HIDDEN + row, polled with the peers; with ``residual_f32`` one f32 a
-    pair, the residual its bf16 rounding), or None when the caller adds its own.
+    """Push BF16 partials to every peer, sum all ranks' in rank order, and call out_fn(s, row, v0, v1)
+    with ``residual + bf16(sum)`` (rounded as aiter's fused all-reduce + RMSNorm). ``residual``:
+    fn(s, row) -> (r0, r1), a mailbox base (``residual_f32``: f32 pairs, bf16-rounded), or None.
     """
     HIDDEN = st.HIDDEN
     S = st.S
@@ -629,9 +612,7 @@ HELPERS = (
 
 
 class LaunchState:
-    """One launch's values for the shared helpers, and the helpers bound to it (``st.put`` ...).
-
-    ``source_key`` is the kernel's captured ``SHARED_SOURCE_KEY`` (see there)."""
+    """One launch's values for the shared helpers, and the helpers bound to it (``st.put`` ...)."""
 
     def __init__(
         self,

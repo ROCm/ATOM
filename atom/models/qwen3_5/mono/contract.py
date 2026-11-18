@@ -31,9 +31,8 @@ def build_layer(
     cap: int = 0,
     pa_flydsl: bool = False,
 ):
-    """The layer kernel for ``S`` rows (an MTP verify of ``T`` tokens a request; ``cap`` > 0 its GDN on
-    ReplaySSM records; ``pa_flydsl``: decode attention as ATOM_PA_FLYDSL's), full attention or GDN, and
-    its launch ABI."""
+    """The layer kernel for ``S`` rows (``T`` tokens a request, ``cap`` > 0: ReplaySSM) and its launch
+    ABI."""
     cfg = Q35Config(tp=TP, rank=0, weights=weights, pa_flydsl=pa_flydsl)
     fn = build_qwen35_kernel(
         S,

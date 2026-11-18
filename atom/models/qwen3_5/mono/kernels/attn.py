@@ -1,13 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # ruff: noqa: B023  (traced stage closures read the loop's values on purpose: the tracer unrolls)
-"""The gated full-attention mixer of the Qwen3.5 MonoKernel: q | gate, k, v projection; q / k Gemma
-norm + partial RoPE and the K / V write into ATOM's paged FP8 cache; split (flash-decoding) attention;
-the merge with the sigmoid output gate, publishing ``gated`` for the shared out_proj.
+"""Gated full-attention mixer: q | gate, k, v projection; q / k norm + partial RoPE + K / V write into
+ATOM's paged FP8 cache; split attention; merge with the sigmoid output gate -> ``gated``.
 
-The cache is ATOM's MHA pool layout (block size BS = 16): K ``[blocks, kv_heads, head_dim / 16, BS, 16]``,
-V ``[blocks, kv_heads, BS / 16, head_dim, 16]``, one fp32 scale per (kv head, token) for each. A tile
-keeps the FP8 codes (exact in bf16) and applies a key's scale to its score / softmax weight.
+Cache (BS = 16): K ``[blocks, kv_heads, head_dim / 16, BS, 16]``, V ``[blocks, kv_heads, BS / 16,
+head_dim, 16]``, one fp32 scale per (kv head, token); tiles keep the FP8 codes and apply the key's scale.
 """
 
 import flydsl.expr as fx
@@ -94,9 +92,8 @@ def attn_stages(ctx):
     r_pos, r_bt, r_slot = rsrc(positions), rsrc(block_tables), rsrc(slot_mapping)
     r_ctx = rsrc(context_lens)
     r_ks, r_vs = rsrc(k_scale), rsrc(v_scale)
-    # A layer's K / V pool passes 4 GiB, the reach of a buffer offset (about 5 GB at TP4): a cache
-    # block's bytes are addressed from that block's own 64-bit base, never as one offset from the
-    # pool's (the scales, 64 B a block, stay within reach)
+    # a K / V pool can pass 4 GiB (a buffer offset's reach): address each cache block from its own
+    # 64-bit base (the scales stay within reach)
     KVB = HD * BS  # bytes of a cache block (this rank's one KV head), K and V alike
 
     def kv_block(pool, blk):
@@ -119,7 +116,7 @@ def attn_stages(ctx):
 
     # ================================ 1. q | gate, k, v projection (FP8)
     def qkv_epilogue(s, row, v):
-        # ATOM's row order: every local head's gate, then every head's q; mailbox qg holds [q, gate] per head
+        # ATOM's row order: every head's gate, then every head's q; mailbox qg holds [q, gate] per head
         if row < QG:
             hq = row % (QG // 2)
             put(
@@ -141,10 +138,9 @@ def attn_stages(ctx):
     HALF = ROPE // 2
 
     def kv_quant(x, live):
-        """Per-token FP8 E4M3 over the head as the original path writes it -> (FP8 value as f32, scale,
-        the FP8 word). aiter's ``reshape_and_cache``: the scale ``amax / 448`` (stored as is: 0 for an
-        all-zero head), x times ``1 / max(scale, 1e-12)``; ATOM's fused q / k norm + RoPE + cache kernel
-        (QKF): ``amax / 448`` (1 for an all-zero head), x divided by it."""
+        """Per-token FP8 E4M3 over the head -> (value as f32, scale, FP8 word). aiter's reshape_and_cache:
+        scale amax / 448 (0 if all-zero), x * 1 / max(scale, 1e-12); QKF (ATOM's fused kernel):
+        amax / 448 (1 if all-zero), x / scale."""
         amax = block_max(live.select(fmath.absf(x), fx.Float32(0.0)), lane, wave, red)
         sc = amax / FP8_MAX
         if const_expr(QKF):
@@ -166,7 +162,7 @@ def attn_stages(ctx):
         pos = ld_pos(s)
         live = tid < HD
         d = fx.min(tid, HD - 1)
-        # q / gate rows (qg) or the K / V rows (kvr): one address, the region named by the q tasks
+        # qg or kvr rows: one address, named by the q tasks' region
         src = Addr("qg", Space.SCRATCH, is_kv.select(mb("kvr").value, mb("qg").value))
         idx = is_kv.select(s * 2 * KVD + d, s * QG + j * 2 * HD + d)
         gam = is_kv.select(ld_f32(r_gk, d), ld_f32(r_gq, d))
@@ -174,8 +170,8 @@ def attn_stages(ctx):
         x = got[0][0].bitcast(fx.Float32)
         vraw = got[1][0].bitcast(fx.Float32)
         rstd = rsq(block_sum(live.select(x * x, fx.Float32(0.0))) * (1.0 / HD) + EPS)
-        # the Gemma norm, then RoPE: rounded to bf16 between (the original's two kernels), or once after
-        # (QKF: its fused kernel, which also quantizes K for the cache from the unrounded value)
+        # norm then RoPE: bf16-rounded between (two kernels), or once after under QKF (fused kernel,
+        # which also quantizes K from the unrounded value)
         xn = x * rstd * gam
         if const_expr(not QKF):
             xn = bf16_round(xn)
@@ -192,7 +188,7 @@ def attn_stages(ctx):
         if is_kv:
             k8, ksc, kword = kv_quant(y_f if QKF else y, live)
             v8, vsc, vword = kv_quant(vraw, live)
-            # the token's cache slot (block * BS + offset) is the engine's; -1 = a padding row: no write
+            # slot = block * BS + offset; -1 = padding row: no write
             slot = uniform(bo.buffer_load(r_slot, s, vec_width=1, dtype=T.i32))
             blk = slot // BS
             t = slot % BS
@@ -206,7 +202,7 @@ def attn_stages(ctx):
                     vb, kv_block(v_cache, blk), ((t // 16) * HD + d) * 16 + t % 16
                 )
             if live:
-                # this launch's row for the split tasks: other CTAs may not see the cache stores yet
+                # for the split tasks: other CTAs may not see the cache stores yet
                 put(mb("kvnew"), s * (2 * HD + 2) + d, k8)
                 put(mb("kvnew"), s * (2 * HD + 2) + HD + d, v8)
             if (tid == 0) & (slot >= 0):
@@ -217,23 +213,17 @@ def attn_stages(ctx):
                 put(mb("kvnew"), s * (2 * HD + 2) + 2 * HD + 1, vsc)
 
     if const_expr(ctx["PA_FLYDSL"]):
-        # ATOM_PA_FLYDSL: baseline's decode attention is aiter's FlyDSL paged decode
+        # baseline's decode attention is aiter's FlyDSL paged decode
         flydsl_split_merge(ctx)
         return {}
 
     # ================================ 3. split attention (aiter's pa_decode_gluon, FP8 compute)
-    # Baseline ATOM's decode attention, rounding point for rounding point (spec: aiter's
-    # paged_attention_decode_sliding_window_head_1 + the pa_ps reduce): NSPLIT splits a sequence's
-    # tokens evenly (page = ceil(ctx / NSPLIT)); a split walks the 256-key partitions it touches in order,
-    # keeping only its own keys. Per partition: Q (FP8, unscaled) x K on FP8 MFMAs (head dim in order),
-    # the score (scale * k_scale) * dot, an online softmax in exp2, P' = FP8(v_scale * (448 / vmax) * p)
-    # with vmax the partition's largest V scale, and P' x V on FP8 MFMAs (keys in order) times vmax / 448.
-    # A split publishes its bf16 output and its (max, exp sum). Task = (row, split): the row's 8 heads are
-    # the MFMA's rows. This launch's keys (positions pos0 ..) come from ``kvnew``: other CTAs may not see
-    # their cache stores yet.
+    # matches aiter's rounding: NSPLIT even splits walk their 256-key partitions in order; per partition
+    # FP8 Q x K, score (scale * k_scale) * dot, online softmax in exp2, P' = FP8(v_scale * (448 / vmax) * p),
+    # P' x V times vmax / 448. Task = (row, split), the row's 8 heads the MFMA rows; this launch's keys
+    # come from ``kvnew`` (other CTAs may not see their cache stores yet)
     MASKV = -3.4e38
-    # rows padded off the 64-word stride: the 16 lanes of an MFMA operand / score row group would hit one
-    # LDS bank (an even pad keeps the 8-byte operand loads aligned)
+    # rows padded off the 64-word stride to avoid LDS bank conflicts (even pad: 8-byte loads aligned)
     SXS, SPP, SQ8 = CPS + 1, CPS // 4 + 2, HD // 4 + 2
     XS = 0  # scores [16 heads][CPS] f32
     XPP = XS + 16 * SXS  # P' FP8 [16 heads][CPS / 4 words]
@@ -268,10 +258,8 @@ def attn_stages(ctx):
         s = tt // NSPLIT
         js = tt % NSPLIT
         gpu.barrier()
-        # the sequence's KV length (cached + this launch's T_SEQ keys, as ATOM's attention takes it: an
-        # MRoPE position is not the cache index); rows s0 .. s0 + T_SEQ - 1, keys pos0 .. this launch's.
-        # A padded row's length is raised to T_SEQ (its keys masked as before) and any length kept within
-        # what its block-table row addresses (a capture's synthetic lengths)
+        # KV length from context_lens (an MRoPE position is not the cache index), raised to T_SEQ for a
+        # padded row and clamped to its block-table row (a capture's synthetic lengths)
         ctx_len = fx.min(
             fx.max(
                 uniform(bo.buffer_load(r_ctx, s // T_SEQ, vec_width=1, dtype=T.i32)),
@@ -290,13 +278,12 @@ def attn_stages(ctx):
         last_blk = (ctx_len - 1) // BS
 
         def raw_loads(tb):
-            """Partition ``tb``'s global loads, none waiting on this launch: per QK block (2) its 8 K words
-            and 4 k scales, the softmax's 4 v scales, P' V's 16 V words. A block past the context reads the
-            last one (masked at use)."""
+            """Partition ``tb``'s global loads: per QK block (2) 8 K words + 4 k scales, 4 v scales, 16 V
+            words. A block past the context reads the last one (masked at use)."""
             out = []
             for gi in range_constexpr(2):
                 bi = tb // BS + wave * 2 + gi
-                blk = uniform(ld_block(s0, fx.min(bi, last_blk)))  # this wave's block
+                blk = uniform(ld_block(s0, fx.min(bi, last_blk)))
                 r_kb = kv_block(k_cache, blk)
                 for c in range_constexpr(HD // 32):
                     d = 32 * c + 8 * g4
@@ -320,9 +307,8 @@ def attn_stages(ctx):
                     out.append(v_words(blk, dim * 16 + tk % 16))
             return out
 
-        # the first partition's loads before this launch's inputs: their latency hides under the wait
-        # MTP verify (T_SEQ > 1) loads each partition at its top: carrying the loads across the loop next to
-        # the verify path's live values spills SGPRs into a scratch slot
+        # prefetch the first partition before the input wait; under MTP verify (T_SEQ > 1) carrying the
+        # loads across the loop spills SGPRs, so each partition loads at its top
         PIPE = T_SEQ == 1
         raw0 = raw_loads(p0 * CPS) if PIPE else []
         # Q -> FP8 bytes (unscaled), heads >= H zero; P' rows >= H zero
@@ -343,8 +329,7 @@ def attn_stages(ctx):
                 XPP + (H + tid // (CPS // 4)) * SPP + tid % (CPS // 4),
                 fx.Float32(0.0),
             )
-        # this launch's keys, for every split with a tile: K / V codes back to bytes, a word a thread
-        # (in rounds: past 4 tokens a request the words outnumber the threads)
+        # this launch's K / V codes back to bytes, a word a thread (in rounds past 4 tokens a request)
         NKW = T_SEQ * 2 * HD // 4
         for rnd in range_constexpr(-(-NKW // THREADS)):
             wk = tid if rnd == 0 else tid + rnd * THREADS
@@ -378,8 +363,8 @@ def attn_stages(ctx):
         # raw_loads' layout: per QK block gi, 8 K words then 4 k scales; 4 v scales; 16 V words
         RAW_K, RAW_VS, RAW_V = 0, 24, 28
         RAW_VEC = [isinstance(x, fx.Vector) for x in raw0]
-        # the online softmax's (max, exp sum), the P V accumulators (heads 4 g4 + e, this wave's two 16-dim
-        # groups) and the partition's loads, carried; a partition issues the next one's loads
+        # carried: softmax (max, exp sum), P V accumulators (heads 4 g4 + e, this wave's two 16-dim
+        # groups), the prefetched loads
         init = [fx.Float32(float("-inf")), fx.Float32(0.0)]
         init += [fx.Float32(0.0) for _ in range(8)] + raw0
         for pi, carry in range(0, npart, fx.Int32(1), init=init):
@@ -461,8 +446,7 @@ def attn_stages(ctx):
                 for c in range_constexpr(CPS // 32):
                     tk = 32 * c + 8 * g4  # this lane's 8 keys (one cache block's half)
                     w2 = raw[RAW_V + n * (CPS // 32) + c]
-                    # this launch's keys (the suffix from pos0 on) are not in the cache yet for every
-                    # CTA: their bytes zeroed here, their products added below
+                    # keys >= pos0 may not be in the cache yet: zeroed here, added from LDS below
                     nk = fx.min(
                         fx.max(pos0 - (tb + tk), 0), 8
                     )  # this lane's cached keys
@@ -549,8 +533,7 @@ def attn_stages(ctx):
         s = tt // H
         h = tt % H
         gpu.barrier()
-        # every wave reduces the (at most 64) splits alike, wave 0 stores the weights: no wave-divergent
-        # region around the lane shuffles
+        # every wave reduces the splits, wave 0 stores: no divergence around the lane shuffles
         jt = fx.min(lane, NSPLIT - 1)
         ml = poll([(mb("sp_ml"), ((s * NSPLIT + jt) * H + h) * 2, 2)])[0]
         in_ = lane < NSPLIT
@@ -560,7 +543,7 @@ def attn_stages(ctx):
         sgmax = (gmax > -3.4028234663852886e38).select(gmax, fx.Float32(0.0))
         valid = mj > -3.4028234663852886e38
         x = lj * valid.select(exp(mj - sgmax), fx.Float32(0.0))
-        # the exp sum by xor butterfly over the next power of two of lanes
+        # xor butterfly over the next power of two of lanes
         tot = (lane < NSP2).select(x, fx.Float32(0.0))
         for o_ in BUTTERFLY:
             tot = tot + xshfl(tot, o_)

@@ -63,18 +63,16 @@ def proj_kind(weights: str) -> str:
 
 
 def max_rows(weights: str, T: int) -> int:
-    """The widest step mono serves with this checkpoint at ``T`` tokens a request. MXFP4-AttnFP8:
-    past 8 rows of plain decode and 12 of an MTP verify the original path's fused-shared MXFP4 MoE
-    (aiter's a4w4 kernels) makes the step faster than the kernel's."""
+    """The widest step mono serves at ``T`` tokens a request. MXFP4-AttnFP8: past 8 rows (12 for an
+    MTP verify) the original path's a4w4 MoE is faster."""
     if weights == "mxfp4_attnfp8":
         return 8 if T == 1 else 12
     return MAX_TOKENS
 
 
 def fp4_mids(weights: str, S: int) -> bool:
-    """Does up / gate publish the MXFP4 mids (E2M1 codes, E8M0 scales) for down to stage as they are?
-    The fused bank from 8 rows (an up / gate item is then the four tiles of a 32-mid block; fewer rows
-    would leave too few items to keep every CTA streaming weights)."""
+    """Does up / gate publish MXFP4 mids (E2M1 codes, E8M0 scales) for down? From 8 rows only: fewer
+    leave too few items to keep every CTA streaming weights."""
     return weights == "mxfp4_attnfp8" and S >= 8
 
 
@@ -104,14 +102,12 @@ class Q35Config:
     inter: int = INTER
     shared_inter: int = SHARED_INTER
     eps: float = EPS
-    # checkpoint format: "fp8" (FP8 128 x 128 matrices, the shared expert fused into the bank), "mxfp4"
-    # (amd/Qwen3.5-397B-A17B-MXFP4: MXFP4 routed experts on MXFP4 activations, A4W4; BF16 projections,
-    # a separate BF16 shared expert) or "mxfp4_attnfp8" (amd/Qwen3.5-397B-A17B-MXFP4-AttnFP8-V2: A4W4
-    # experts with the shared expert fused into the bank; FP8 projections, per-channel weights and
-    # per-token activations)
+    # checkpoint format: "fp8" (FP8 128 x 128 blocks, fused shared expert), "mxfp4" (A4W4 experts, BF16
+    # projections, separate BF16 shared expert) or "mxfp4_attnfp8" (A4W4 experts, fused shared expert,
+    # FP8 per-channel x per-token projections)
     weights: str = "fp8"
-    # ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION: the original attention's fused q / k norm + RoPE +
-    # cache-quant kernel (one bf16 rounding; its KV and o_proj input quants), which the kernel follows
+    # ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION: follow the original's fused q / k norm + RoPE +
+    # cache-quant kernel (one bf16 rounding)
     qk_fusion: bool = False
     # ATOM_PA_FLYDSL: follow aiter's FlyDSL paged decode instead of pa_decode_gluon
     pa_flydsl: bool = False
@@ -129,7 +125,7 @@ class Q35Config:
 
     @property
     def shared_fused(self) -> bool:
-        """The shared expert is the last entry of the expert bank (ATOM's fused shared expert)."""
+        """The shared expert is the last entry of the expert bank."""
         return shared_fused(self.weights)
 
     # --- Gated DeltaNet shard

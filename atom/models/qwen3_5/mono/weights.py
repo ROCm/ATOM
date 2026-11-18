@@ -19,12 +19,9 @@ class LayerWeights:
 
 
 def rope_tables(rotary_emb, cfg: Q35Config, max_pos: int, spare: int = 0):
-    """The kernel's RoPE tables: ATOM's own (aiter's ``RotaryEmbedding`` caches, model dtype) as f32
-    cos, sin [max_pos + spare, rope_dim / 2], or None when they do not cover ``max_pos`` positions.
-
-    The kernel reads a row per token unguarded, and an MTP verify or draft step reaches ``spare`` = k
-    positions past the last kept token: rows past the caches repeat their last one (a token there is
-    dropped, so any finite value serves)."""
+    """ATOM's RoPE caches as f32 cos, sin [max_pos + spare, rope_dim / 2], or None when they do not
+    cover ``max_pos``. The kernel reads rows unguarded, so the ``spare`` rows past the caches repeat the
+    last one (tokens there are dropped)."""
     cos = rotary_emb.cos_cache.reshape(rotary_emb.cos_cache.shape[0], -1)
     sin = rotary_emb.sin_cache.reshape(rotary_emb.sin_cache.shape[0], -1)
     if cos.shape[0] < max_pos or cos.shape[1] != cfg.rope_dim // 2:

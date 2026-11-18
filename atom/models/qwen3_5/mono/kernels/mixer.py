@@ -82,9 +82,9 @@ def mixer_defs(ctx):
         return res
 
     def xin_stage():
-        """Stage ``xin`` (past XIN_MIN rows): a task per row normalizes it and quantizes it to FP8 once, as each
-        projection task otherwise would (the same values and rounding), publishing the bytes (``xinq``) and
-        the per-128 scales (``xins``) the FP8 projections stage from."""
+        """Stage ``xin`` (past XIN_MIN rows): a task per row norms + FP8-quantizes it once (same rounding as
+        each projection task would), publishing bytes (``xinq``) and per-128 scales (``xins``).
+        """
         NQ, NB = HIDDEN // 4, HIDDEN // 128
         for tt in range(start("xin"), S, G):
             s = fx.Int32(tt)
@@ -104,16 +104,10 @@ def mixer_defs(ctx):
                 put(mb("xins"), s * NB + tid, lds_ld(misc, MOE_MISC + tid))
 
     def proj_stage(name, n_groups, w, sc, bf16_w, epilogue, prefetch=None, row0=0):
-        """Stage ``name``: ``n_groups`` 16-row groups of FP8 (scales ``sc``) or BF16 matrix ``w``,
-        PROJ_GROUPS per task; ``epilogue(s, row, value)`` takes each output (``tid`` < S * rows). An FP8
-        matrix runs W8A8 (aiter's blockscale GEMM): the input FP8 per 1x128, each 128-K block's partial
-        times ``a_scale * w_scale``. An FP8 matrix of the MXFP4 checkpoint (``MX``) is BF16 there,
-        row-major as ATOM holds it. A per-token checkpoint's (``PTPC``) is FP8 per channel: the input FP8
-        per token, f32 sums over K (128-K MFMA blocks, the waves' partials in order), then
-        ``(sum * w_scale[row]) * x_scale`` (aiter's CK bpreshuffle epilogue), ``sc`` the per-row scales;
-        its rows start at ``row0`` of ``w`` (a merged projection).
-        ``prefetch(s, row)`` (every thread, s clamped) issues the epilogue's loads before the GEMM; its
-        result is the epilogue's fourth argument.
+        """Stage ``name``: ``n_groups`` 16-row groups of ``w`` (FP8 with scales ``sc``, or BF16), PROJ_GROUPS
+        per task, each output to ``epilogue(s, row, value[, prefetch(s, row)])``. FP8 is W8A8 (aiter
+        blockscale, input per 1x128); MX: BF16 row-major; PTPC: per-channel FP8 from row ``row0``,
+        ``(sum * w_scale[row]) * x_scale`` as aiter's CK bpreshuffle epilogue.
         """
         r_w, r_s = rsrc(w), (None if bf16_w else rsrc(sc))
         ptpc = PTPC and not bf16_w
@@ -163,7 +157,6 @@ def mixer_defs(ctx):
                 return unit_bf16_rows(r_w, rg, kc, HIDDEN, bw)  # MX: BF16 row-major
 
             pre = [u(c) for c in range(batch)]
-            # the epilogue's loads, ahead of the GEMM
             if const_expr(prefetch is not None):
                 pf = prefetch(fx.min(tid // ROWS, S - 1), t * ROWS + tid % ROWS)
             if const_expr(ptpc):  # the output row's weight scale, ahead of the GEMM
@@ -204,11 +197,9 @@ def mixer_defs(ctx):
 
 @traced
 def out_stages(ctx):
-    """out_proj over the mixer's [S, OUT_K] output, the attention-side TP peer reduce and the residual
-    ``h`` -> mailbox ``a``. The FP8 checkpoint runs it W8A8: attention's bf16 ``gated`` output quantized
-    as aiter's per-1x128 quant does (Q1), the GDN output FP8 already (``gq``, its gated norm's Q3). The
-    per-token checkpoint (``PTPC``) quantizes the bf16 ``gated`` row per token and sums all of K, then
-    ``(sum * x_scale) * w_scale`` (aiter's FlyDSL bpreshuffle epilogue for this shape).
+    """out_proj over [S, OUT_K], the attention-side TP peer reduce and the residual -> mailbox ``a``.
+    W8A8: attention's ``gated`` quantized per 1x128 (Q1), GDN's already FP8 (``gq``, Q3); PTPC: per-token
+    quant, ``(sum * x_scale) * w_scale`` as aiter's FlyDSL bpreshuffle epilogue.
     """
     FULL = ctx["FULL"]
     PTPC = ctx["PTPC"]
@@ -297,7 +288,6 @@ def out_stages(ctx):
             )
 
         pre = [u_o(c) for c in range(OUT_UPW)]
-        # this thread's output row's weight scale, ahead of the GEMM
         if const_expr(PTPC):
             ws_row = fx.Float32(
                 bo.buffer_load(

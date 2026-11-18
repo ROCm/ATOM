@@ -23,11 +23,9 @@ __all__ = ["Qwen35MonoKernel", "Qwen35Variant"]
 
 
 class Qwen35Variant:
-    """The compiled launch and the scratch that every layer of one kind (GDN or full attention) shares at
-    one sample count, and the symmetric peer buffer: ``peers``, a runner's (the width's two kinds share
-    one; the runner begins its steps), or else the variant's own, its steps begun by ``begin_step``. A
-    mailbox tag is the launch's ``layer + 1``: every mailbox is zeroed at a step's start
-    (``atom.mono.runtime.mailboxes``), so the layers of a step take distinct ``layer`` values.
+    """The compiled launch and scratch shared by every layer of one kind at one sample count, and the
+    symmetric peer buffer (a runner's ``peers``, or the variant's own, begun by ``begin_step``). Mailbox
+    tags are ``layer + 1`` and mailboxes are zeroed per step, so a step's layers take distinct ``layer``.
     """
 
     _cache: ClassVar[dict] = {}
@@ -70,18 +68,18 @@ class Qwen35Variant:
         self.scratch = torch.zeros(
             self.scr_layout["_bytes"], dtype=torch.uint8, device=dev
         )
-        # a step zeroes every mailbox buffer, a multiple of the zeroing's 16 B
+        # mailbox zeroing works in 16 B units
         assert self.scr_layout["_bytes"] % ZERO_ALIGN == 0
         self.mailboxes = None
         if peers is None:
-            # collective over ``group`` (a CPU group): every rank builds its variants alike
+            # collective over ``group`` (a CPU group)
             peers, self._free_peers = owned_peer_buffer(
                 self, self.sym_layout["_bytes"], group, rank, npes, dev
             )
             self.mailboxes = StepMailboxes(peers, self.scratch, debug=debug)
         self.peer_buffer = peers
         self.sym, self.peers = peers.local, peers.addresses
-        # the unused pointer arguments' target: one buffer, not a fill kernel in every launch's graph
+        # target of unused pointer arguments
         self.zero = torch.zeros(1, dtype=torch.int32, device=dev)
         self.key = (
             samples,
@@ -120,9 +118,7 @@ class Qwen35Variant:
         return given_up_waits(self.scratch[off : off + DIAG_BYTES], region_namer(names))
 
     def begin_step(self):
-        """A step's start on the variant's own peer buffer: its mailboxes zeroed, then the peer fence
-        (one launch; graph-capturable). A runner's variant: the runner begins its steps.
-        """
+        """Zero the variant's own mailboxes and fence peers (one launch; graph-capturable)."""
         assert (
             self.mailboxes is not None
         ), "a runner's variant: the runner begins its steps"
@@ -130,12 +126,9 @@ class Qwen35Variant:
 
 
 class Qwen35MonoKernel:
-    """One rank of one decoder layer: ``packed``, the kernel's view of ATOM's weights (shared by
-    every launch width of the layer), run on a ``Qwen35Variant`` of its kind and width.
-
-    State belongs to the caller (ATOM's pools): a GDN layer's conv / recurrent state and its slots; a
-    full-attention layer's paged FP8 K / V cache, its scales, positions, block tables and slot
-    mapping, and the RoPE tables."""
+    """One rank of one decoder layer: ``packed`` (the kernel's view of ATOM's weights, shared across
+    widths) run on a ``Qwen35Variant``. State (GDN conv / SSM, paged KV, RoPE) belongs to the caller.
+    """
 
     def __init__(
         self,
@@ -174,23 +167,18 @@ class Qwen35MonoKernel:
         tl=0,
         check_only=False,
     ):
-        """One layer on the residual stream ``h`` [S, hidden] f32 -> the next layer's; updates the state in
-        place. The stream is the value aiter's fused all-reduce RMSNorm normalizes (``residual +
-        bf16(rank sum)``, unrounded); its bf16 rounding is the residual ATOM stores.
+        """One layer on the f32 residual stream ``h`` [S, hidden] (``residual + bf16(rank sum)``,
+        unrounded) -> the next layer's; updates state in place.
 
-        GDN: ``gdn_state = (conv_state, ssm_state, slots_in, slots_out)``; an MTP verify variant
-        (``tokens_per_seq`` T > 1) takes ``(conv_state, ssm_state, n_accepted, spec_slots)``: per sequence the
-        tokens accepted last step, per row the state slot after its token (ATOM's ``spec_state_indices``,
-        flattened), the conv window [slots, T + 2, conv_dim] in each sequence's first slot. A ReplaySSM variant
-        (``replay_cap`` > 0) takes ``(conv_state, ckpt, n_accepted, conv_slots, slot_idx, write_pos, rec_k,
-        rec_u, rec_g)``: per row the conv slot, per sequence the checkpoint slot, ATOM's per-slot record
-        cursor and record buffers (k, u: bf16 [slots, hv, cap, 128]; g: f32 [slots, hv, cap]). Full attention: ``kv = (k_cache,
-        v_cache, k_scale, v_scale, positions, context_lens, block_tables, slot_mapping)`` in ATOM's MHA pool layout (the
-        new token goes to cache slot ``slot_mapping[s]``, -1 = no write) and ``rope = (cos, sin)``, f32
-        ``[positions, rope_dim / 2]``.
+        GDN ``gdn_state``: ``(conv, ssm, slots_in, slots_out)``; MTP verify (T > 1): ``(conv, ssm,
+        n_accepted, spec_slots)``, conv window [slots, T + 2, conv_dim]; ReplaySSM (``replay_cap`` > 0):
+        ``(conv, ckpt, n_accepted, conv_slots, slot_idx, write_pos, rec_k, rec_u, rec_g)``, k, u bf16
+        [slots, hv, cap, 128], g f32 [slots, hv, cap]. Full attention: ``kv = (k_cache, v_cache, k_scale,
+        v_scale, positions, context_lens, block_tables, slot_mapping)`` in ATOM's MHA pool layout
+        (slot -1 = no write), ``rope = (cos, sin)`` f32 [positions, rope_dim / 2].
 
-        Every tensor is checked against what the kernel addresses (shape, dtype, the strides it assumes)
-        first; ``check_only`` stops there. A mismatch raises ``StepInputError``."""
+        Tensors are checked first (``check_only`` stops there); a mismatch raises ``StepInputError``.
+        """
         cfg, S = self.W.cfg, self.S
         if (
             tuple(h.shape) != (S, cfg.hidden)
@@ -317,7 +305,7 @@ class Qwen35MonoKernel:
             return p[k].data_ptr() if k in p else 0
 
         v = self.variant
-        if begin:  # standalone: this launch is a step of the variant's own mailboxes
+        if begin:  # standalone: the variant's own mailboxes
             v.begin_step()
         _run_compiled(
             v.launch,

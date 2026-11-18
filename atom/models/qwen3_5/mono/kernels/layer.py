@@ -1,29 +1,19 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Qwen3.5-MoE decoder layer (Gated DeltaNet or gated full attention) in ONE persistent launch per rank.
+"""Qwen3.5-MoE decoder layer (Gated DeltaNet or gated full attention) in one persistent launch per rank.
 
-One launch of ``grid = 256 CTAs x 512 threads`` runs the whole layer for this rank's shard, up to 16
-samples (rows). GDN::
+GDN::
 
-    input RMSNorm (Gemma 1 + w) -> qkv | z GEMV (+ causal conv1d, SiLU, conv-state shift)
-      -> b | a BF16 GEMV -> per (sample, v-head): L2 norms, gates, delta rule on the bf16 state
-         (or, verifying drafted tokens, on ReplaySSM's checkpoint and records),
-         gated RMSNorm x silu(z) -> out_proj -> attention TP peer reduce + residual   (sym attn)
-      -> post-attention RMSNorm -> router (512 experts + the shared-expert gate) + the MoE input
-      -> softmax top-10 -> shared + 10 routed expert up/gate + SiLU
-      -> expert down + route weighting -> MoE TP peer reduce + residual -> x_out     (sym ffn)
+    input RMSNorm -> qkv | z GEMV (+ conv1d, SiLU) -> b | a GEMV -> delta rule on the bf16 state
+      -> gated RMSNorm x silu(z) -> out_proj -> attention TP reduce + residual
+      -> post-attention RMSNorm -> router -> top-k -> expert up/gate + SiLU
+      -> expert down + route weighting -> MoE TP reduce + residual -> x_out
 
-Full attention replaces the mixer: q | gate, k, v GEMV -> Gemma q / k norm + partial RoPE, K / V into
-ATOM's paged FP8 cache -> split attention (one wave per query head) -> merge x sigmoid(gate) -> out_proj.
+Full attention replaces the mixer: q | gate, k, v GEMV -> q / k norm + partial RoPE, K / V into ATOM's
+paged FP8 cache -> split attention (one wave per query head) -> merge x sigmoid(gate) -> out_proj.
 
-``weights`` is the checkpoint's format: "fp8" (FP8 128 x 128 matrices, W8A8 experts, the shared expert
-a slot of the bank), "mxfp4" (BF16 projections, A4W4 MXFP4 experts, a BF16 shared expert) or
-"mxfp4_attnfp8" (per-channel FP8 projections on per-token FP8 activations, A4W4 MXFP4 experts, the shared
-expert a slot of the bank).
-
-Task ``t`` of a stage runs on CTA ``(stage_base + t) % 256``; every CTA walks the stages in order;
-hand-offs are tagged ``(value, tag)`` pairs (atom.mono.device.sync), polled until the tag is this launch's
-(``layer + 1``; every mailbox zeroed at a step's start).
+Task ``t`` of a stage runs on CTA ``(stage_base + t) % 256``; hand-offs are tagged ``(value, tag)``
+pairs polled until the tag is ``layer + 1`` (every mailbox zeroed at a step's start).
 """
 
 import enum
@@ -104,12 +94,9 @@ def build_qwen35_kernel(
     debug=False,
     timeline=False,
 ):
-    """Return the ``@flyc.jit`` launcher for one rank's whole layer: full attention when ``full``, else
-    Gated DeltaNet. ``heads`` / ``inter`` are this rank's (one K / V head per rank). ``tokens_per_seq`` > 1:
-    an MTP verify step, rows ``q * tokens_per_seq + j`` = token j of sequence q (consecutive positions).
-    ``replay_cap`` > 0: the verify runs on ReplaySSM GDN state (a checkpoint per request and ``replay_cap``
-    records of (k, u, g) a v-head), as ATOM keeps it by default under speculative decoding.
-    """
+    """The ``@flyc.jit`` launcher for one rank's layer (full attention when ``full``, else GDN).
+    ``heads`` / ``inter`` are per rank; ``tokens_per_seq`` > 1: MTP verify, row ``q * tokens_per_seq + j``
+    = token j of sequence q; ``replay_cap`` > 0: verify on ReplaySSM GDN state."""
     assert 1 <= S <= 16, "the samples sit in the MFMA's 16 B columns"
     assert (
         k_dim == v_dim == 128
@@ -119,8 +106,7 @@ def build_qwen35_kernel(
     assert inter % 128 == 0 and hidden % 128 == 0
     HIDDEN = hidden
     T_SEQ = tokens_per_seq
-    # the M baseline ATOM's GEMMs run this step at: the step's rows, which ATOM pads to its capture size
-    # (graph replay, and an eager decode alike) before the model sees them. The BF16 GEMMs' rounding
+    # the M baseline ATOM's GEMMs run at (rows padded to the capture size); the BF16 GEMMs' rounding
     # and the MXFP4 combine's order follow it
     GEMM_M = S
     assert S % T_SEQ == 0
@@ -141,8 +127,8 @@ def build_qwen35_kernel(
     ) == 0, "b | a rows must fill whole proj tasks"
     assert VALUE_DIM % 256 == 0 and HIDDEN % ROW_TILE == 0
     N_EXPERTS, TOP_K, INTER = n_experts, top_k, inter
-    # "mxfp4": BF16 projections, MXFP4 routed experts on MXFP4 activations (A4W4), a BF16 shared expert;
-    # "mxfp4_attnfp8": the same experts with the shared expert fused into the bank, per-token FP8 projections
+    # "fp8": W8A8; "mxfp4": BF16 projections, A4W4 experts, BF16 shared expert; "mxfp4_attnfp8": A4W4
+    # experts with the shared expert fused into the bank, per-token FP8 projections
     WFMT = weights
     assert WFMT in WEIGHTS
     MX = experts_mxfp4(WFMT)  # MXFP4 experts (A4W4)
@@ -160,8 +146,8 @@ def build_qwen35_kernel(
     N_ROUTER = ROUTER_ROWS // ROUTER_TILE
     ID_BITS = max(8, (N_EXPERTS - 1).bit_length())
     ID_MASK = (1 << ID_BITS) - 1
-    # the top-k key keeps a logit's high bits and the expert id in its low ID_BITS: exact, since the
-    # router logits are bf16 (their f32 low 16 bits zero); ties go to the lower id, as aiter's top-k
+    # top-k key = logit high bits | expert id in the low ID_BITS: exact since the logits are bf16;
+    # ties go to the lower id, as aiter's top-k
     assert ID_BITS <= 16, "the router key would drop logit bits"
     XQ_BLOCKS = HIDDEN // 128
     XIN = xin_stage(S, WFMT)  # the input norm + FP8 quant once a layer (stage xin)
@@ -183,7 +169,7 @@ def build_qwen35_kernel(
     QG = H * 2 * HD
     SCALE = HD**-0.5
     NSPLIT = pa_splits(S // T_SEQ)
-    # ATOM_PA_FLYDSL: decode attention as aiter's FlyDSL paged decode (kernels/attn_flydsl.py)
+    # ATOM_PA_FLYDSL: decode attention as aiter's FlyDSL paged decode
     PA_FLYDSL = bool(pa_flydsl) and full
     assert (
         not full or PA_FLYDSL or T_SEQ <= GLUON_VERIFY_TOKENS
@@ -371,8 +357,7 @@ def build_qwen35_kernel(
         h_in, x_out = pinned(h_in), pinned(x_out)
         # the full-attention projection's matrix comes in the GDN qkvz slot
         w_qkv, s_qkv = w_qkvz, s_qkvz
-        # this launch's mailbox: tag layer + 1, every mailbox zeroed at the step's start (the runner's
-        # StepMailboxes); ATOM_MONO_DEBUG: every wait bounded, a give-up recorded in the diag records
+        # tag layer + 1; ATOM_MONO_DEBUG: every wait bounded, a give-up recorded in the diag records
         mbox = Mailbox(
             layer,
             scratch + fx.Int64(SC["diag"]) if const_expr(debug) else None,

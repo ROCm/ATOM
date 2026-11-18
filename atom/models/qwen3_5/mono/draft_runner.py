@@ -1,16 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""The MTP draft's decoder layer on the mono kernel.
+"""The MTP draft's single full-attention decoder layer on the mono kernel.
 
-Qwen3.5's MTP draft (``qwen3_5_mtp.Qwen3_5MultiTokenPredictor``) is embed, two RMSNorms, a concat
-with the target's hidden state, ``fc`` and its all-gather, then ONE full-attention decoder layer,
-then the final norm. That layer is the target's full-attention kernel (``runner``) over the draft
-layer's own weights and KV cache; everything around it stays ATOM's.
-
-ATOM runs draft step 0 eagerly (``EagleProposer._declare_draft_graphs``) and replays steps 1.. from CUDA
-graphs; on mono the layer is one launch either way. A propose loop's steps come in two shapes: step 0
-runs the target's verify rows (``spec_steps + 1`` consecutive tokens a request, the kernel's verify layout), steps 1..
-one row a request. Each shape has its own launch widths (``WidthBuilds``).
+Only that layer runs mono (the target's full-attention kernel over the draft's weights and KV cache);
+embed, norms, ``fc`` and the final norm stay ATOM's. Step 0 runs the verify rows (``spec_steps + 1``
+tokens a request), steps 1.. one row a request; each shape has its own ``WidthBuilds``.
 """
 
 import logging
@@ -54,14 +48,13 @@ class Qwen35MonoDraftRunner(Qwen35MonoDecodeRunner):
         self.debug = envs.ATOM_MONO_DEBUG
         self.max_len = atom_config.max_model_len
         bind_agreed(lambda: self._bind_draft(draft), self.group)
-        # ATOM_MONO_TIMELINE: the draft layer's stamps, apart from the target's (<prefix>_draft_...)
+        # ATOM_MONO_TIMELINE: the draft's stamps go to <prefix>_draft_...
         tl_prefix = envs.ATOM_MONO_TIMELINE
         self.timeline = (
             LayerTimeline(f"{tl_prefix}_draft", 1, TL_POINTS, self.rank, self.dev)
             if tl_prefix
             else None
         )
-        # step 0 (T rows a request) and steps 1.. (one row a request)
         self.by_t = {
             t: WidthBuilds(
                 lambda S, t=t: self._build_draft_width(S, t),
@@ -85,18 +78,14 @@ class Qwen35MonoDraftRunner(Qwen35MonoDecodeRunner):
             raise MonoUnsupported(
                 f"{cus} CUs: the kernel needs all {BLOCKS} CTAs co-resident"
             )
-        # the draft layer is built for the FP8 checkpoint (W8A8 projections and bank); the MXFP4
-        # checkpoint's draft keeps the original path
+        # the draft layer is built for the FP8 checkpoint only
         w13 = layer.mlp.experts.w13_weight
         if w13.dtype != torch.float8_e4m3fn:
             raise MonoUnsupported(
                 f"MTP layer experts {w13.dtype}: the draft runs mono with the FP8 checkpoint"
             )
-        # ATOM builds the MTP layer without the all-reduce + RMSNorm fusion (Qwen3_5MTP), and the kernel
-        # follows that: its input norm quantizes as the unfused norm kernel does (the launch's layer 0),
-        # and an all-reduce summing the ranks in order and rounding once to bf16, then the add + norm
-        # on the f32 sum, is what the kernel's exchange and residual compute. A fused MTP layer's
-        # input norm would quantize as the fused one does instead
+        # the kernel follows ATOM's unfused MTP layer (all-reduce, then add + norm); a fused layer's
+        # input norm would quantize differently
         if getattr(layer, "fuse_allreduce_norm", True):
             raise MonoUnsupported(
                 "the MTP layer folds its all-reduce into its norms; the kernel follows the unfused layer"
@@ -116,8 +105,7 @@ class Qwen35MonoDraftRunner(Qwen35MonoDecodeRunner):
         self.full = [True]
         self.layers = [(LayerWeights(self.cfg, True), self._pack(0, layer))]
         self.layer_nums = [layer.self_attn.attn.layer_num]
-        # positions < max_model_len, and the draft's past it: its step 0 runs the verify's k + 1 rows
-        # one position on, each later step one more, up to 2k past the last kept token
+        # the draft reaches up to 2k positions past the last kept token
         rope = rope_tables(
             layer.self_attn.rotary_emb, self.cfg, self.max_len, spare=2 * (self.T - 1)
         )
@@ -160,9 +148,8 @@ class Qwen35MonoDraftRunner(Qwen35MonoDecodeRunner):
         }
 
     def step_t(self, rows: int) -> int | None:
-        """This draft step's tokens a request: step 0 runs the verify rows, steps 1.. one row a
-        request; None for a step mono does not serve. A batch whose verify is past MAX_TOKENS rows (the
-        target's verify is then ATOM's) keeps every draft step ATOM's too."""
+        """This draft step's tokens a request (T for step 0, 1 after), or None when mono does not serve
+        it (a verify past MAX_TOKENS rows keeps every draft step ATOM's)."""
         bs = get_forward_context().context.scheduled_bs
         if bs * self.T > MAX_TOKENS:
             return None
@@ -177,16 +164,15 @@ class Qwen35MonoDraftRunner(Qwen35MonoDecodeRunner):
         return t is not None and self.by_t[t].prepare(rows)
 
     def prebuild(self) -> None:
-        """Every width a draft step can take, built now (collective, at install): ATOM runs draft step 0
-        eagerly (and captures steps 1.. at warm-up), so a width first met on a serving step would stall it
-        for its compile and peer handshake."""
+        """Build every draft width now (collective): step 0 runs eagerly, so a width first met while
+        serving would stall on its compile and peer handshake."""
         for bs in range(1, MAX_TOKENS // self.T + 1):
             self.by_t[self.T].prepare(bs * self.T)
             self.by_t[1].prepare(bs)
 
     def layer(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        """The decoder layer on ``x`` [rows, hidden] (the ``fc`` output, gathered): the f32 residual
-        stream after it (the draft's final norm is the caller's)."""
+        """The decoder layer on ``x`` [rows, hidden]; returns the f32 residual stream (final norm is
+        the caller's)."""
         md = get_forward_context().attn_metadata
         S = x.shape[0]
         T = self.step_t(S)
@@ -206,7 +192,6 @@ class Qwen35MonoDraftRunner(Qwen35MonoDecodeRunner):
             "rope": (self.cos, self.sin),
         }
         check_inputs(built, get_forward_context().kv_cache_data, h, [ins])
-        # every draft launch is a step of its own mailboxes (its tag is layer 0's)
         built["mailboxes"].begin_step()
         out = built["ops"][0].forward(
             h,

@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # ruff: noqa: B023  (traced stage closures read the loop's values on purpose: the tracer unrolls)
-"""Full-attention stages 3-4 (split, merge) under ``ATOM_PA_FLYDSL=1``: aiter's FlyDSL paged decode
-(work plan, tile, reduce; aiter 59fae2078 ``kernels/pa_decode*``), bit for bit. A split task is one plan
-slot covering all of its request's rows.
+"""Full-attention split + merge under ``ATOM_PA_FLYDSL=1``: aiter's FlyDSL paged decode (plan, tile,
+reduce; ``kernels/pa_decode*`` at aiter 59fae2078), bit for bit. A split task is one plan slot.
 """
 
 import flydsl.expr as fx

@@ -1,22 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""One decode step of up to ``MAX_TOKENS`` rows on the Qwen3.5 layer kernel: every decoder layer one
-launch (``op.Qwen35MonoKernel``), over ATOM's own weights and state.
+"""One decode step of up to ``MAX_TOKENS`` rows on the Qwen3.5 layer kernel: one launch per decoder
+layer (``op.Qwen35MonoKernel``).
 
-State is ATOM's: the GDN conv / recurrent pools and their state slots, the paged FP8 KV cache with its
-scales, block tables and slot mapping, read and written in place, so a sequence can switch paths
-between steps. The weights are ATOM's tensors, read in place in the layouts aiter's ``shuffle_weight``
-(16, 16) gives them: the FP8 checkpoint's matrices and block scales (the shared expert fused into the
-bank as expert 512), or the MXFP4 checkpoint's E2M1 bank and E8M0 scales with its BF16 projections
-and shared expert. Only small tensors are derived at install: the f32 Gemma gammas ``1 + w``, the
-router in MFMA tiles, the GDN b | a projection.
-
-A step launches at its own width (rows): a plain decode one row a request, an MTP verify ``T =
-spec_steps + 1`` rows a request on ATOM's GDN state -- ReplaySSM by default (a checkpoint a request
-and ``replay_cap`` records of (k, u, g) a v-head; ATOM advances the record cursor before the step),
-or the snapshot state (``ATOM_ENABLE_REPLAYSSM=0``: a state slot a drafted token). A width's kernels
-and buffers (scratch, peer memory) are built on its first step (``WidthBuilds``); the layers of one
-kind (GDN, full attention) share them.
+Weights and state (GDN pools, paged FP8 KV cache) are ATOM's, read and written in place in aiter's
+shuffled layouts, so a sequence can switch paths between steps; only small tensors (Gemma gammas
+``1 + w``, the router and GDN b | a in MFMA tiles) are derived at install. An MTP verify runs ``T =
+spec_steps + 1`` rows a request on ReplaySSM or snapshot GDN state. Each width's kernels and buffers
+are built on its first step (``WidthBuilds``).
 """
 
 import inspect
@@ -76,10 +67,9 @@ def _zero_abi(launcher) -> KernelAbi:
 
 
 def baseline_refusal(experts, rows: int = 16) -> str | None:
-    """Why the original path's MXFP4 routed experts do not compute what the kernel does -- MXFP4 weights
-    on MXFP4 activations (A4W4, aiter's per_1x32), gate / up not interleaved, in aiter's shuffled gfx950
-    layout -- on a decode of up to ``rows`` rows, or None. Asked of aiter's own activation rule, so mono
-    serves only a deployment whose decode it reproduces."""
+    """Why the original path's MXFP4 routed experts on a decode of up to ``rows`` rows are not what the
+    kernel computes (A4W4, gate / up not interleaved, aiter's shuffled layout), or None.
+    """
     qm = experts.quant_method
     if getattr(qm, "use_triton", False) or getattr(qm, "use_triton_decode", False):
         return "routed experts on the Triton MoE path"
@@ -114,7 +104,7 @@ def flydsl_refusal(cfg) -> str | None:
     from atom.model_ops import base_attention as ba
 
     try:
-        # before ATOM's probe: until imported, aiter.ops.flydsl.pa_decode names the function
+        # until imported, aiter.ops.flydsl.pa_decode names the function, not the module
         importlib.import_module("aiter.ops.flydsl.pa_decode")
         from aiter.ops.flydsl.kernels.pa_decode import traits
     except ImportError:
@@ -133,10 +123,9 @@ def flydsl_refusal(cfg) -> str | None:
 
 
 def bf16_gemm_refusal(cfg, rows: int = MAX_TOKENS) -> str | None:
-    """Why one of the original path's BF16 GEMMs (``layout.bf16_gemms``) rounds its partial sums
-    otherwise than the kernel does at some decode M up to ``rows``, or None. Asked of the installed
-    aiter's tuned picks (``tgemm.mm``), so a re-tune, an aiter update or ``AITER_CONFIG_GEMM_BF16``
-    cannot change the original path's rounding under the kernel."""
+    """Why one of the original path's BF16 GEMMs rounds partial sums unlike the kernel at some M up to
+    ``rows``, or None. Asked of the installed aiter's tuned picks, so a re-tune cannot diverge silently.
+    """
     try:
         from aiter.tuned_gemm import get_GEMM_A16W16_config
     except ImportError as e:
@@ -157,9 +146,8 @@ def bf16_gemm_refusal(cfg, rows: int = MAX_TOKENS) -> str | None:
 
 
 def ptpc_gemm_refusal(cfg, rows: int = MAX_TOKENS) -> str | None:
-    """Why one of the original path's per-token FP8 GEMMs (``layout.ptpc_gemms``) takes an aiter kernel
-    whose epilogue order is not the kernel's at some decode M up to ``rows``, or None. Asked of the
-    installed aiter's tuned bpreshuffle picks, as ``gemm_a8w8_bpreshuffle`` looks them up.
+    """Why one of the original path's per-token FP8 GEMMs takes an epilogue order unlike the kernel's at
+    some M up to ``rows``, or None (asked of the installed aiter's tuned picks).
     """
     if cfg.proj_kind != "ptpc":
         return None
@@ -188,8 +176,8 @@ def ptpc_gemm_refusal(cfg, rows: int = MAX_TOKENS) -> str | None:
 
 
 def _need(i, name, t, shape, dtype=None, shuffled=None, nbytes=None):
-    """Layer ``i``'s tensor ``name`` as the kernel reads it -- its shape (or byte size), dtype and,
-    for a weight the kernel reads in place, whether ATOM holds it shuffled -- or MonoUnsupported.
+    """Check layer ``i``'s tensor ``name`` has the shape (or byte size), dtype and shuffling the kernel
+    reads; raises MonoUnsupported.
     """
     sh = bool(getattr(t, "is_shuffled", False))
     ok = (
@@ -208,9 +196,8 @@ def _need(i, name, t, shape, dtype=None, shuffled=None, nbytes=None):
 
 
 def check_inputs(built, kvd, x, ins) -> None:
-    """Every layer's step tensors against what its kernel addresses, before the step's first launch;
-    raises ``StepInputError`` (the step keeps the original path). The KV and state pools are fixed once
-    bound, so after a width's first step only one layer of each kind is checked (the step's metadata).
+    """Check every layer's step tensors before the first launch; raises ``StepInputError``. The pools
+    are fixed once bound, so later steps check one layer of each kind.
     """
     ops = built["ops"]
     each = [i for i, op in enumerate(ops) if op.full][:1] + [
@@ -226,11 +213,9 @@ def check_inputs(built, kvd, x, ins) -> None:
 
 
 def check_splits(md, requests: int, T: int = 1, flydsl: bool = False) -> None:
-    """The original decode attention splits each sequence by the count of its metadata's
-    ``context_lens`` (ATOM's ``dense_decode_splits``), and each split is a rounding point: a step
-    whose metadata counts other than its ``requests`` rows (a graph's padded batch around an eager
-    draft) would split differently, so it raises ``StepInputError``. Under ATOM_PA_FLYDSL it follows
-    ``_flydsl_pa_decode_num_seqs``."""
+    """Raise ``StepInputError`` when the original attention would split KV differently from the kernel
+    (it splits by the metadata's sequence count, e.g. a graph's padded batch; each split is a rounding
+    point)."""
     seqs = md.context_lens.shape[0]
     if flydsl:
         qlen = int(md.max_seqlen_q)
@@ -256,18 +241,15 @@ def language_model(causal_lm):
 
 
 def raise_on_given_up_waits(variants, mailboxes, rank: int, rows: int) -> None:
-    """A debug build's step (eager): raise with every mailbox wait of ``variants`` that gave up and every
-    rank the step fence of ``mailboxes`` gave up on."""
+    """Debug build, eager: raise listing every mailbox wait and step fence that gave up."""
     waits = [w for var in variants for w in var.given_up_waits()]
     raise_if_given_up("Qwen3.5 mono", rank, rows, waits, mailboxes)
 
 
 class Qwen35MonoDecodeRunner:
-    """Owns the per-layer weight views (bound at install, before the KV cache is sized) and, per
-    launch width, the compiled kernels and their buffers.
+    """Owns the per-layer weight views and, per launch width, the compiled kernels and buffers.
 
-    Construction is collective over the TP group: every rank binds and checks its shard, then all
-    agree (``consensus.bind_agreed``), so a rank that refuses turns mono off on every rank.
+    Construction is collective: a rank that refuses turns mono off on every rank (``bind_agreed``).
     """
 
     def __init__(
@@ -276,14 +258,12 @@ class Qwen35MonoDecodeRunner:
         tp = get_tp_group()
         self.group = tp.cpu_group
         self.tp, self.rank = tp.world_size, tp.rank_in_group
-        # an MTP verify: T rows a request, the anchor and its drafted tokens
         self.T = spec_steps + 1 if spec_steps else 1
-        # ReplaySSM's record buffer length (0: the snapshot GDN state)
+        # 0: snapshot GDN state
         self.replay_cap = replay_cap
         self.debug = envs.ATOM_MONO_DEBUG
         self.max_len = atom_config.max_model_len
         bind_agreed(lambda: self._bind(causal_lm), self.group)
-        # ATOM_MONO_TIMELINE: every layer's stamps, saved after the warm-up steps (eager)
         tl_prefix = envs.ATOM_MONO_TIMELINE
         self.timeline = (
             LayerTimeline(tl_prefix, len(self.layers), TL_POINTS, self.rank, self.dev)
@@ -304,10 +284,7 @@ class Qwen35MonoDecodeRunner:
             raise MonoUnsupported(
                 f"{cus} CUs: the kernel needs all {BLOCKS} CTAs co-resident"
             )
-        # the checkpoint format, from the expert bank: FP8 (the shared expert fused into it), MXFP4 with a
-        # separate BF16 shared expert (amd/Qwen3.5-397B-A17B-MXFP4: BF16 projections) or MXFP4 with the
-        # shared expert fused into the bank (amd/Qwen3.5-397B-A17B-MXFP4-AttnFP8-V2: per-token FP8
-        # projections); the bind checks every tensor against the format
+        # the checkpoint format, from the expert bank (see Q35Config.weights)
         w13 = self.lm.layers[0].mlp.experts.w13_weight
         if w13.dtype != getattr(torch, "float4_e2m1fn_x2", None):
             weights = "fp8"
@@ -322,14 +299,13 @@ class Qwen35MonoDecodeRunner:
             qk_fusion=envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION,
             pa_flydsl=envs.ATOM_PA_FLYDSL,
         )
-        # the layers' f32 residual stream and their input quant follow the fused all-reduce + RMSNorm
+        # the kernel's residual stream and input quant follow the fused all-reduce + RMSNorm
         from atom.models.qwen3_5.model import allreduce_norm_fusion_enabled
 
         if not allreduce_norm_fusion_enabled():
             raise MonoUnsupported(
                 "the original path's all-reduce + RMSNorm fusion is off; the kernel reproduces it"
             )
-        # a per-token checkpoint's input norm quantizes in one fused kernel under this switch
         if self.cfg.proj_kind == "ptpc" and envs.ATOM_FUSED_NORM_PER_TOKEN_QUANT:
             raise MonoUnsupported(
                 "ATOM_FUSED_NORM_PER_TOKEN_QUANT=1: the original input norm quantizes per token in its"
@@ -350,7 +326,6 @@ class Qwen35MonoDecodeRunner:
                 raise MonoUnsupported(
                     f"layer {i} is {layer.layer_type}, the kernel's plan {want}"
                 )
-        # per layer: (LayerWeights (shape only), the kernel's tensors: ATOM's, viewed)
         self.layers = [
             (LayerWeights(self.cfg, self.full[i]), self._pack(i, layer))
             for i, layer in enumerate(self.lm.layers)
@@ -390,12 +365,11 @@ class Qwen35MonoDecodeRunner:
         fse = cfg.shared_fused
         pk = cfg.proj_kind
         E, inter, hidden = cfg.n_experts, cfg.local_inter, cfg.hidden
-        # the bank: the routed experts (and a fused shared expert)
         EB = E + (1 if fse else 0)
-        # the BF16 projections and a fused shared expert leave kernel arguments unused: a placeholder
+        # placeholder for unused kernel arguments
         none = torch.zeros(1, dtype=torch.float32, device=self.dev)
         model = torch.bfloat16
-        # ATOM zero-pads the router + shared-gate rows (513) to 16 (output_row_alignment)
+        # ATOM zero-pads the router + shared-gate rows (513) to a multiple of 16
         _need(i, "router", mlp.gate.weight, (router_rows(E), hidden), model)
         for k in ("input_layernorm", "post_attention_layernorm"):
             _need(i, k, getattr(layer, k).weight, (hidden,))
@@ -453,24 +427,24 @@ class Qwen35MonoDecodeRunner:
                     f"layer {i}: routed experts {ex.w13_weight.dtype} {tuple(ex.w13_weight.shape)}, the"
                     f" kernel's FP8 bank of {cfg.n_experts} + the fused shared expert"
                 )
-                f8, f32_ = torch.float8_e4m3fn, torch.float32
-                _need(i, "w13", ex.w13_weight, (EB, 2 * inter, hidden), f8, True)
-                _need(
-                    i,
-                    "w13 scale",
-                    ex.w13_weight_scale,
-                    (EB, 2 * inter // 128, hidden // 128),
-                    f32_,
-                )
-                _need(i, "w2", ex.w2_weight, (EB, hidden, inter), f8, True)
-                _need(
-                    i,
-                    "w2 scale",
-                    ex.w2_weight_scale,
-                    (EB, hidden // 128, inter // 128),
-                    f32_,
-                )
-        # 512 experts, then the shared-expert gate row (one merged linear in both formats), zero rows
+            f8, f32_ = torch.float8_e4m3fn, torch.float32
+            _need(i, "w13", ex.w13_weight, (EB, 2 * inter, hidden), f8, True)
+            _need(
+                i,
+                "w13 scale",
+                ex.w13_weight_scale,
+                (EB, 2 * inter // 128, hidden // 128),
+                f32_,
+            )
+            _need(i, "w2", ex.w2_weight, (EB, hidden, inter), f8, True)
+            _need(
+                i,
+                "w2 scale",
+                ex.w2_weight_scale,
+                (EB, hidden // 128, inter // 128),
+                f32_,
+            )
+        # experts, then the shared-expert gate row, then zero rows
         w_r = mlp.gate.weight
         p = {
             "g_in1": 1.0 + f32(layer.input_layernorm.weight),
@@ -478,7 +452,6 @@ class Qwen35MonoDecodeRunner:
             "w_r": pack_bf16(w_r),
         }
         if mx:
-            # ATOM's bank as it holds it: gfx950 E2M1 tiles and E8M0 scales, gate / up not interleaved
 
             def pad8(n):
                 return -(-n // 8) * 8
@@ -507,8 +480,8 @@ class Qwen35MonoDecodeRunner:
                 w_dn=ex.w2_weight,
                 s_dn=ex.w2_weight_scale,
             )
-        # the projections: FP8 in aiter's shuffled layout with 128 x 128 scales ("block") or a scale a row,
-        # its rows padded to 128 as ATOM pads them for the per-token GEMM ("ptpc"), or BF16 row-major
+        # projections: shuffled FP8 with 128 x 128 scales ("block") or per-row scales and rows padded to
+        # 128 ("ptpc"), or BF16 row-major
         proj = torch.bfloat16 if pk == "bf16" else torch.float8_e4m3fn
 
         def need_proj(name, lin, n, k):
@@ -546,8 +519,7 @@ class Qwen35MonoDecodeRunner:
             )
         else:
             a = layer.linear_attn
-            # the per-token checkpoint's input projection is one merged [q | k | v | z | b | a] layer (ATOM's
-            # gdn_in_proj_is_merged); the others' the qkvz + b | a pair
+            # "ptpc" merges the input projection into [q | k | v | z | b | a]; else qkvz + b | a
             merged = pk == "ptpc"
             if merged != hasattr(a, "in_proj_qkvzba") or (
                 not merged
@@ -610,13 +582,12 @@ class Qwen35MonoDecodeRunner:
         return p
 
     def _build_width(self, S: int) -> dict:
-        """The S-row launch: a variant (kernel, scratch, peer memory) per layer kind and an op per
-        layer. Collective (the peer handshakes): every rank builds the same widths in the same order.
+        """The S-row launch: a variant per layer kind and an op per layer. Collective: every rank builds
+        the same widths in the same order.
         """
         T = self.T
         self._check_records()
-        # one peer buffer for both kinds (the same symmetric regions; a layer's tags are its own),
-        # freed with the runner; collective over the CPU group
+        # one peer buffer for both kinds (a layer's tags are its own)
         dims = shape_dims(self.cfg)
         sym_bytes = layout(S, self.tp, True, tokens_per_seq=T, **dims)[1]["_bytes"]
         peers, free_peers = owned_peer_buffer(
@@ -650,7 +621,6 @@ class Qwen35MonoDecodeRunner:
             )
             for W, p in self.layers
         ]
-        # every step zeroes the width's mailboxes (the peer buffer and both scratches), then fences
         mailboxes = StepMailboxes(
             peers, variants[False].scratch, variants[True].scratch, debug=self.debug
         )
@@ -663,9 +633,8 @@ class Qwen35MonoDecodeRunner:
         }
 
     def _check_records(self) -> None:
-        """ReplaySSM's record buffers as the kernel reads them. They bind with the KV
-        cache: a width built before (at install) leaves them to the step's own check
-        (``check_inputs``), which also compares their shape before the first launch."""
+        """Check ReplaySSM's record buffers; skipped before the KV cache binds (``check_inputs`` covers
+        that case)."""
         if not self.replay_cap:
             return
         kvd = get_forward_context().kv_cache_data
@@ -690,8 +659,7 @@ class Qwen35MonoDecodeRunner:
         return out
 
     def launch_width(self, rows: int) -> int | None:
-        """The launch width of a ``rows``-row step, or None (not served): whole requests' rows, up to the
-        checkpoint's widest (``config.max_rows``)."""
+        """The launch width of a ``rows``-row step, or None when not served."""
         widest = max_rows(self.cfg.weights, self.T)
         return rows if 0 < rows <= widest and rows % self.T == 0 else None
 
@@ -701,8 +669,8 @@ class Qwen35MonoDecodeRunner:
         return S is not None and self.widths.prepare(S)
 
     def prebuild(self) -> None:
-        """Every width a step can take, built now (collective, at install). A CUDA-graph deployment
-        builds them while capturing; an eager one would otherwise stall a serving step on each.
+        """Build every width now (collective); for eager deployments, which would otherwise stall a
+        serving step on each build.
         """
         for rows in range(self.T, max_rows(self.cfg.weights, self.T) + 1, self.T):
             self.prepare(rows)
@@ -714,13 +682,12 @@ class Qwen35MonoDecodeRunner:
         x = self._layers(
             self.lm.embed_tokens(input_ids).float(), pos, ctx, slots, bt, gdn
         )
-        # the layers' f32 stream is what the original path's final (fused all-reduce) norm normalizes
         return final_norm(self.lm.norm, x)
 
     def step_inputs(self, input_ids: torch.Tensor, positions: torch.Tensor):
-        """The step's (positions, KV lengths, cache slots, block tables, GDN state indices) as the kernel
-        takes them. The KV lengths are the attention metadata's (an MRoPE position is the cache index plus
-        the request's delta: RoPE takes the position, the cache range the length)."""
+        """The step's (positions, KV lengths, cache slots, block tables, GDN state indices). KV lengths
+        come from the metadata, not positions (an MRoPE position includes the request's delta).
+        """
         fwd = get_forward_context()
         md = fwd.attn_metadata
         S = input_ids.numel()
@@ -728,8 +695,8 @@ class Qwen35MonoDecodeRunner:
         g = md.gdn_metadata
         sm = md.slot_mapping
         if sm.numel() < S:
-            # GDN's verify-graph capture metadata slices the per-token slot buffer to the sequence
-            # count (gdn_attn.build_for_cudagraph_capture); the buffer itself holds every token's slot
+            # verify-graph capture metadata slices the slot buffer to the sequence count; the
+            # underlying buffer holds every token's slot
             if not (
                 sm.is_contiguous()
                 and sm.untyped_storage().nbytes()
@@ -752,7 +719,6 @@ class Qwen35MonoDecodeRunner:
             spec = g.spec_state_indices_tensor[:Q]
             n_acc = g.num_accepted_tokens[:Q].to(torch.int32)
             if self.replay_cap:
-                # the conv window in each request's slot; the state its checkpoint + records
                 conv_rows = spec[:, 0].to(torch.int32).repeat_interleave(T)
                 gdn = (n_acc, conv_rows, g.slot_idx[:Q].to(torch.int32), g.write_pos)
             else:

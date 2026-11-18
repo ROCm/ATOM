@@ -100,15 +100,12 @@ def gdn_stages(ctx):
 
     r_si, r_so, r_na = rsrc(slots_in), rsrc(slots_out), rsrc(n_accepted)
     r_conv, r_wc = rsrc(conv_state), rsrc(w_conv)
-    # MTP verify (T_SEQ > 1): rows q * T_SEQ + j are token j of sequence q; slots_out[row] = the state slot
-    # after the row's token (ATOM's spec_state_indices), n_accepted[q] = the tokens the last step accepted.
-    # The sequence's conv window lives in token 0's slot (CW = T_SEQ + 2 inputs, read from n_accepted - 1).
+    # MTP verify (T_SEQ > 1): row q * T_SEQ + j = token j of sequence q; slots_out[row] = state slot after
+    # that token, n_accepted[q] = tokens accepted last step; the conv window (CW inputs) is in token 0's slot
     CW = T_SEQ + 2
-    # ReplaySSM (REPLAY, a verify step): the request's state is a checkpoint (slot slots_in[q], the
-    # ssm_state pool) plus the first h = write_pos[slot] of CAP records (k, u, g) a v-head, the state
-    # S_h = e^{C} S_0 + sum_j e^{C - C_j} k_j u_j^T (C_j the running sum of the log-decays g). A step
-    # whose window might not fit (h + 2 T_SEQ > CAP) first folds them into the checkpoint and writes its
-    # records from 0; its tokens append theirs, the cursor advanced by ATOM (``replayssm_commit``).
+    # REPLAY: state = checkpoint (slots_in[q]) + the first h = write_pos[slot] of CAP records (k, u, g) per
+    # v-head: S_h = e^C S_0 + sum_j e^{C - C_j} k_j u_j^T (C_j running sum of g). If h + 2 T_SEQ > CAP the
+    # records fold into the checkpoint first and writing restarts at 0; ATOM advances the cursor
     r_wp = rsrc(write_pos)
     ROWS = PROJ_TILE * PROJ_GROUPS
 
@@ -285,9 +282,8 @@ def gdn_stages(ctx):
             for j in range(KPT)
         ]
         if const_expr(REPLAY):
-            # S_h: the checkpoint decayed by e^{C}, plus each record weighted by e^{C - C_j}, as ATOM's
-            # replay. The gates are wave-uniform (scalar registers); the records run as a loop over the h live
-            # ones, the state carried: unrolled over all CAP, their loads hoisted together spill at S = 8.
+            # S_h as ATOM's replay; records loop over the h live ones (state carried): unrolling all CAP
+            # spills at S = 8
             r_g0 = rsrc(rec_g + rec0 * 4)
 
             def gate(j):

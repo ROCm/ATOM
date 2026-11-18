@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""The BF16 MFMA tiles of the small matrices the runner packs (router, GDN b | a). The FP8 and MXFP4
-weights the kernel reads in place, in ATOM's own layout (``tests/test_qwen3_5_mono_layout.py`` checks
-that layout against aiter's shuffles)."""
+"""BF16 MFMA tiling of the small matrices the runner packs (router, GDN b | a); other weights are read
+in place in ATOM's layout."""
 
 import torch
 

@@ -2,18 +2,11 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Layer-by-layer comparison of the Qwen3.5 mono path against the original decoder layers.
 
-Debug only (``ATOM_MONO_CHECK=1``, meant for ``--enforce-eager``). The original layers run the step as
-the reference chain; every layer also runs as its mono kernel on exactly the reference's input, the f32
-stream ``residual + bf16(rank sum)`` the original layer's fused all-reduce norm normalizes (the original
-layer gets the reduced output on rank 0 and zeros elsewhere, so its all-reduce reproduces it). A GDN layer's
-state slots are saved before the mono kernel runs and restored before the original layer does, so both
-advance the same state once. Rank 0 logs, per layer and token, how far mono's output stream (and a GDN
-layer's new recurrent state) is from the reference's, and how far its mixer's contribution to the stream
-(``a`` minus the bf16 input: before the MoE, whose baseline kernels are not deterministic) is from the
-reference's (the bf16 rank sum of the mixer output the post-attention norm takes). As the yardstick
-for the stream, ``rerun`` is the reference's own MoE run again on the same input (its kernels are not
-deterministic) against its first run. The step returns the
-reference's hidden states. Verify steps (MTP) are not checked.
+Debug only (``ATOM_MONO_CHECK=1``, ``--enforce-eager``). The original layers are the reference chain;
+each mono layer runs on the reference's input, with GDN state saved and restored so both advance it
+once. Rank 0 logs per layer and token the stream, mixer and GDN-state errors, and ``rerun``: the
+reference MoE run twice (its kernels are not deterministic) as the yardstick. Returns the reference's
+hidden states. MTP verify steps are not checked.
 """
 
 import logging
@@ -43,7 +36,7 @@ def forward_checked(
     hidden = lm.embed_tokens(input_ids)
     residual = None
     x = hidden.float()
-    # the step's tensors before anything runs: a refused step runs the original model once, untouched
+    # check before anything runs: a refused step runs the original model once, untouched
     from atom.models.qwen3_5.mono.runner import check_inputs
 
     check_inputs(
@@ -76,7 +69,6 @@ def forward_checked(
             a_mb.view(torch.int32).view(-1, 2)[:, 0].contiguous().view(torch.float32)
         )
         got_a = got_a.view(n, -1)
-        # the original layer on the same input
         if residual is not None and layer.fuse_allreduce_norm and runner.rank != 0:
             hidden = torch.zeros_like(hidden)
         hooks = [
@@ -113,8 +105,7 @@ def forward_checked(
                     n,
                     int(pos[k]),
                     compare(got[k], ref[k]),
-                    # the residual joins bf16-rounded (as the fused all-reduce norm's), so equal
-                    # sums compare equal
+                    # the residual joins bf16-rounded, as in the fused all-reduce norm
                     compare(got_a[k] - xr[k], (xr[k] + mix[k].float()) - xr[k]),
                     compare(rerun[k], ref[k]),
                     (
