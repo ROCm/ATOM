@@ -200,6 +200,7 @@ exports = {
     "DECODE_PORT": decode.get("port", 8020),
     "ROUTER_PORT": router.get("port", 8000),
     "ROUTER_POLICY": router.get("policy", "random"),
+    "ROUTER_PREFILL_POLICY": router.get("prefill_policy", ""),
     "ROUTER_BALANCE_ABS_THRESHOLD": router.get("balance_abs_threshold", ""),
     "ROUTER_KV_EVENTS": str(router.get("kv_events", False)).lower(),
     "PROMETHEUS_PORT": router.get("prometheus_port", 29100),
