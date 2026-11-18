@@ -170,7 +170,7 @@ def build_model(config: Config, model_class: type, device: torch.device) -> nn.M
 
 def load_weights(model: nn.Module, config: Config) -> set[str]:
     """Load the checkpoint into a built model and process it for serving.
-    Returns the names of the parameters the checkpoint wrote."""
+    Returns the names of the parameters loaded or created at load."""
     return load_model(
         model,
         config.model,

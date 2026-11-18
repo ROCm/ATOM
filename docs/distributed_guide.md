@@ -141,14 +141,14 @@ When a DP rank has no real work but other ranks do, it executes dummy batches to
 
 ### Device assignment
 
-When DP is enabled on a single node, each DP rank uses a different set of GPUs. The device mapping in `init_model_env()` (`atom/model_engine/model_setup.py`) is:
+When DP is enabled on a single node, each DP rank uses a different set of GPUs. `init_model_env()` (`atom/model_engine/model_setup.py`) takes the device from `local_device_index()` (`atom/config.py`):
 
 ```python
-local_device_rank = dp_rank_local * config.tensor_parallel_size + rank
+local_device_rank = local_device_index(config, rank)
 device = torch.device(f"cuda:{local_device_rank}")
 ```
 
-For example, with DP=2 and TP=4:
+With DP and TP only, that is `dp_rank_local * tensor_parallel_size + rank`. For example, with DP=2 and TP=4:
 - DP rank 0: GPUs 0, 1, 2, 3
 - DP rank 1: GPUs 4, 5, 6, 7
 
