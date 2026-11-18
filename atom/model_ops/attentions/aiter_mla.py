@@ -586,9 +586,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # gathered width, not the per-rank one. Pad it the same way the module
         # does (mla_dcp_decode_is_persistent picks the width set), so these
         # descriptors always describe the kernel that will actually run.
-        # Only where aiter runs DCP decode persistent (gfx942 lacks the lse
-        # persistent kernel and stays non-persistent, where this metadata is
-        # unused) does it scale by dcp; elsewhere it keeps the per-rank sizing.
+        # Only where aiter runs this call persistent does it scale by dcp; where
+        # it has no persistent kernel for it the width is None, this metadata is
+        # unused and a speculative verify is refused by the layer
+        # (MLAAttention._configure_dcp_decode_head_padding). Elsewhere it keeps
+        # the per-rank sizing.
         # Target layers only: min_query_heads is the DSpark draft's, and the
         # draft plans its own descriptors (DSparkProposer). Sparse / DSA layers
         # decode and run MTP verify as per-token q_len=1 rows (no round-robin

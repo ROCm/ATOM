@@ -2103,9 +2103,10 @@ def test_speculative_dcp_decode_refuses_without_a_persistent_kernel(monkeypatch)
         layer._configure_dcp_decode_head_padding(2)
 
 
-def _spec_dcp_layer(monkeypatch, *, causal=True, sparse=False, decode_query_len=0):
-    """A bare MLAAttention under speculative decode with k = 4 (verify q = 5)."""
-    spec = SimpleNamespace(num_speculative_tokens=4)
+def _spec_dcp_layer(monkeypatch, *, causal=True, sparse=False, decode_query_len=0, k=4):
+    """A bare MLAAttention under speculative decode with k drafted tokens
+    (verify q = k + 1)."""
+    spec = SimpleNamespace(num_speculative_tokens=k)
     monkeypatch.setattr(
         attention_mla_module,
         "get_current_atom_config",
@@ -2134,6 +2135,106 @@ def test_dspark_draft_block_sizes_for_its_block_width(monkeypatch):
     layer._configure_dcp_decode_head_padding(8)
     assert {args[1] for args, _ in calls} == {4}
     assert layer.dcp_kernel_num_heads == 64
+
+
+@needs_dcp_ops
+def test_persistent_width_is_none_when_aiter_names_no_width(monkeypatch):
+    """aiter naming no width for a multi-row call is an answer, not an error:
+    the persistent width is None, so both metadata builders stay
+    non-persistent and only the layer's refusal speaks."""
+    _ask_aiter(monkeypatch, None)
+
+    def unreachable(*_args):
+        raise AssertionError("no width to check")
+
+    monkeypatch.setattr(attention_mla_module, "dcp_persistent_supported", unreachable)
+    assert (
+        attention_mla_module.mla_dcp_persistent_width(
+            8, 2, 16, kv_cache_dtype="fp8", max_seqlen_q=9
+        )
+        is None
+    )
+    width, max_seqlen_q, causal = attention_mla_module.mla_dcp_layers_persistent_width(
+        [_spec_dcp_layer(monkeypatch)], 8, 2, 16, kv_cache_dtype="fp8"
+    )
+    assert (width, max_seqlen_q, causal) == (None, 5, True)
+
+
+@needs_dcp_ops
+def test_speculative_dcp_decode_refuses_when_aiter_names_no_width(monkeypatch):
+    """No stub width: aiter names none for the verify (e.g. gfx942, or gfx1250
+    without the FlyDSL PS1 route), so the refusal fires with aiter's reasons
+    instead of an error from inside the width query."""
+    _ask_aiter(monkeypatch, None)
+    layer = _spec_dcp_layer(monkeypatch)
+    monkeypatch.setattr(
+        attention_mla_module,
+        "mla_dcp_decode_shape_support",
+        _no_shape("gfx942", ["no persistent decode kernel"]),
+    )
+    with pytest.raises(
+        ValueError,
+        match=r"persistent round-robin MLA decode for 16 gathered query heads x 5 "
+        r"rows .*aiter on gfx942: no persistent decode kernel",
+    ) as err:
+        layer._configure_dcp_decode_head_padding(2)
+    assert "num_speculative_tokens" not in str(err.value)
+
+
+def _ps1_head_rules(rows):
+    """A stand-in for aiter's get_mla_decode_num_heads under gfx1250's PS1 rules:
+    the fewest of 16 / 32 / 64 / 96 / 128 heads, at least the gathered count,
+    that takes ``q`` rows -- ``rows`` gives the row limit per head count, 96
+    takes any, 128 only one row."""
+
+    def get_mla_decode_num_heads(heads, q, *_args, **_kwargs):
+        for h in (16, 32, 64, 96, 128):
+            if h >= heads and (h == 96 or q <= rows.get(h, 1)):
+                return h
+        return None
+
+    return get_mla_decode_num_heads
+
+
+# Row limits per head count: aiter main + ROCm/aiter#8181, and with #7913.
+_PS1_ROWS = {"aiter8181": {16: 4, 32: 4, 64: 2}, "aiter7913": {16: 4, 32: 8, 64: 8}}
+
+
+@needs_dcp_ops
+@pytest.mark.parametrize(
+    "rules,k", [("aiter8181", 2), ("aiter7913", 8)], ids=["8181_k2", "7913_k8"]
+)
+def test_draft_builder_plans_the_width_its_layers_pad_to(monkeypatch, rules, k):
+    """The DSpark draft's KV group: the builder plans the call the draft makes
+    (non-causal, T = k rows) at the width the draft layer pads to (64), not the
+    target's causal k + 1 verify (96 under these rules)."""
+    monkeypatch.setattr(
+        attention_mla_module,
+        "get_mla_decode_num_heads",
+        _ps1_head_rules(_PS1_ROWS[rules]),
+    )
+    monkeypatch.setattr(
+        attention_mla_module, "dcp_persistent_supported", lambda *_: True
+    )
+    monkeypatch.setenv("ATOM_MLA_PAGE_SIZE", "1")
+    layer = _spec_dcp_layer(monkeypatch, causal=False, decode_query_len=k, k=k)
+    layer._configure_dcp_decode_head_padding(8)
+    width, max_seqlen_q, causal = attention_mla_module.mla_dcp_layers_persistent_width(
+        [layer], layer.num_heads, 8, layer.min_query_heads, kv_cache_dtype="fp8"
+    )
+    assert (max_seqlen_q, causal) == (k, False)
+    assert width == layer.dcp_kernel_num_heads == 64
+    # What the plugin's builder planned before: the target's causal verify.
+    assert (
+        attention_mla_module.mla_dcp_persistent_width(
+            layer.num_heads,
+            8,
+            layer.min_query_heads,
+            kv_cache_dtype="fp8",
+            max_seqlen_q=k + 1,
+        )
+        == 96
+    )
 
 
 @needs_dcp_ops
@@ -2221,14 +2322,17 @@ def test_dcp_decode_call_is_the_one_forward_makes(dcp, q, causal, cp_world_size)
 
 
 @pytest.mark.parametrize(
-    "supported,backend,expected",
+    "supported,status,expected",
     [
-        (True, "asm", True),
-        (False, "asm", False),
-        (None, "flydsl_ps1", True),
+        (True, "ok", True),
+        (False, "no_kernel", False),
+        # A route without an availability table (FlyDSL PS1, opus): a yes, as
+        # aiter's get_mla_decode_num_heads counts it.
+        (None, "not_asm", True),
         # A failed asm query is not a yes.
-        (None, "asm", False),
+        (None, "unknown", False),
     ],
+    ids=["asm_ok", "asm_no_kernel", "no_table", "asm_query_failed"],
 )
 @pytest.mark.parametrize("kv_cache_dtype", ["fp8", "bf16"])
 @pytest.mark.parametrize(
@@ -2239,7 +2343,7 @@ def test_dcp_decode_call_is_the_one_forward_makes(dcp, q, causal, cp_world_size)
 def test_dcp_persistent_supported_reads_aiters_answer(
     monkeypatch,
     supported,
-    backend,
+    status,
     expected,
     kv_cache_dtype,
     max_seqlen_q,
@@ -2252,22 +2356,24 @@ def test_dcp_persistent_supported_reads_aiters_answer(
 
     from atom.distributed.dcp_utils import dcp_persistent_supported
 
-    class MlaBackend(str, enum.Enum):
-        ASM = "asm"
-        FLYDSL_PS1 = "flydsl_ps1"
+    class MlaAsmStatus(str, enum.Enum):
+        OK = "ok"
+        NO_KERNEL = "no_kernel"
+        NOT_ASM = "not_asm"
+        UNKNOWN = "unknown"
 
     calls = []
 
     def get_mla_decode_shape_support(*args, **kwargs):
         calls.append((args, kwargs))
-        return SimpleNamespace(supported=supported, backend=MlaBackend(backend))
+        return SimpleNamespace(supported=supported, asm_status=MlaAsmStatus(status))
 
     fp8 = object()
     aiter = types.ModuleType("aiter")
     aiter.dtypes = SimpleNamespace(fp8=fp8)
     ops = types.ModuleType("aiter.ops")
     attention = types.ModuleType("aiter.ops.attention")
-    attention.MlaBackend = MlaBackend
+    attention.MlaAsmStatus = MlaAsmStatus
     attention.get_mla_decode_shape_support = get_mla_decode_shape_support
     for name, module in (
         ("aiter", aiter),

@@ -58,11 +58,12 @@ def mla_dcp_decode_call(
     dcp_world_size: int, max_seqlen_q: int = 1, causal: bool = True
 ) -> dict:
     """How a persistent DCP decode calls ``mla_decode_fwd``, as aiter's shape
-    queries take it; both ``dcp_persistent_supported`` and the gfx1250 width
-    query ask with it. Mirrors ``MLAAttention._forward_decode``: only a causal
-    decode of more than one row masks on global positions, through the
-    round-robin (``g_kv_indptr``) kernel; every other decode, the DSpark draft's
-    non-causal block among them, runs as if DCP were off."""
+    queries take it; both ``dcp_persistent_supported`` and the multi-token width
+    query (``get_mla_decode_num_heads``) ask with it. Mirrors
+    ``MLAAttention._forward_decode``: only a causal decode of more than one row
+    masks on global positions, through the round-robin (``g_kv_indptr``) kernel;
+    every other decode, the DSpark draft's non-causal block among them, runs as
+    if DCP were off."""
     round_robin = dcp_world_size > 1 and max_seqlen_q > 1 and causal
     return {
         "persistent": True,
@@ -120,15 +121,17 @@ def dcp_persistent_supported(
     and falls back to the triton stage2 reduce. Cache the result once per
     ``__init__``; it is not for the forward pass.
     """
-    from aiter.ops.attention import MlaBackend
+    from aiter.ops.attention import MlaAsmStatus
 
     support = mla_dcp_decode_shape_support(
         num_heads, kv_cache_dtype, dcp_world_size, max_seqlen_q, causal
     )
-    # aiter has no table for the FlyDSL PS1 route and answers None there; a
-    # None from any other route is a failed query, not a yes.
+    # As aiter's get_mla_decode_num_heads counts a width that runs: a known
+    # kernel, or a route without an availability table (not asm: FlyDSL PS1,
+    # opus), where aiter answers None. A None from an asm route is a failed
+    # query, not a yes.
     return bool(support.supported) or (
-        support.supported is None and support.backend is MlaBackend.FLYDSL_PS1
+        support.supported is None and support.asm_status is MlaAsmStatus.NOT_ASM
     )
 
 

@@ -18,8 +18,8 @@ from vllm.v1.attention.backend import (
 from atom.config import get_current_atom_config
 from atom.model_ops.attention_mla import (
     _MLA_MIN_HEADS,
-    mla_dcp_decode_query_len,
-    mla_dcp_persistent_width,
+    MLAAttention,
+    mla_dcp_layers_persistent_width,
     mla_kernel_num_heads,
 )
 from atom.plugin.vllm.attention.layer_mla import (
@@ -1370,21 +1370,28 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         # head count reaching mla_decode_fwd (and thus the persistent decode
         # metadata) is the gathered width padded up to a dispatchable kernel.
         # dcp size is sourced from the parallel config so it is available here in
-        # __init__. Only where aiter runs DCP decode persistent does it scale by
-        # dcp (gfx942 stays non-persistent, where this metadata is unused);
-        # elsewhere, and with dcp=1, it keeps the per-rank sizing. Cached once to
-        # gate both the metadata sizing and the runtime persistent path.
+        # __init__. Only where aiter runs this call persistent does it scale by
+        # dcp; where it has no persistent kernel for it the width is None, this
+        # metadata is unused and a speculative verify is refused by the layer
+        # (MLAAttention._configure_dcp_decode_head_padding). With dcp=1 it keeps
+        # the per-rank sizing. Cached once to gate both the metadata sizing and
+        # the runtime persistent path.
         dcp_size = self.parallel_config.decode_context_parallel_size
         # These descriptors are only ever handed to the kernel on the
         # persistent path (`if use_persistent_metadata` in build()), so the
         # width they must describe is the persistent one whatever the step
-        # later decides.
-        dcp_persistent_width = mla_dcp_persistent_width(
-            self.num_attention_heads,
-            dcp_size,
-            self.min_query_heads,
-            kv_cache_dtype=config.cache_config.cache_dtype,
-            max_seqlen_q=mla_dcp_decode_query_len(get_current_atom_config()),
+        # later decides -- for the call these layers make, as they pad their
+        # queries for it: a DSpark draft's group decodes its non-causal block at
+        # T rows, the target verifies k + 1 causal rows, and aiter can name a
+        # different width for each.
+        dcp_persistent_width, self.dcp_decode_query_len, self.dcp_decode_causal = (
+            mla_dcp_layers_persistent_width(
+                [layer for layer in mla_layers if isinstance(layer, MLAAttention)],
+                self.num_attention_heads,
+                dcp_size,
+                self.min_query_heads,
+                kv_cache_dtype=config.cache_config.cache_dtype,
+            )
         )
         self.dcp_persistent_supported = dcp_persistent_width is not None
         self.persistent_num_heads = (
