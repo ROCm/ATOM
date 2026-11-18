@@ -600,6 +600,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # occupancy in the block scorer, winning above ~1M batch*context tokens and
     # losing below. Unset leaves the config field alone.
     "ATOM_M3_INDEXER_CP": lambda: os.getenv("ATOM_M3_INDEXER_CP"),
+    # MiniMax-M3 sequence-parallel prefill (atom/models/minimax_m3/sp_prefill.py):
+    # from ATOM_M3_SP_MIN_TOKENS tokens (each TBO micro-batch from
+    # ATOM_M3_SP_MIN_UBATCH_TOKENS) the residual stream is sharded by tokens and
+    # the two per-layer TP all-reduces become an all-to-all + reduce-scatter and
+    # gathers. Costs an unsharded o_proj (~3.1 GB per rank at TP4).
+    "ATOM_M3_SP_PREFILL": lambda: os.getenv("ATOM_M3_SP_PREFILL", "0") == "1",
+    "ATOM_M3_SP_MIN_TOKENS": lambda: int(os.getenv("ATOM_M3_SP_MIN_TOKENS", "4096")),
+    "ATOM_M3_SP_MIN_UBATCH_TOKENS": lambda: int(
+        os.getenv("ATOM_M3_SP_MIN_UBATCH_TOKENS", "8192")
+    ),
+    # SP MoE layers: gather MXFP4 codes + routing and run the FlyDSL MXFP4 prefill
+    # chain (0: gather bf16 rows and call the layer). _CHECK: log each layer's
+    # cosine against the regular MoE once (debug; an extra bf16 gather).
+    "ATOM_M3_SP_FLYDSL_MOE": lambda: os.getenv("ATOM_M3_SP_FLYDSL_MOE", "1") == "1",
+    "ATOM_M3_SP_MOE_CHECK": lambda: os.getenv("ATOM_M3_SP_MOE_CHECK", "0") == "1",
     # Smallest decode batch (requests) that takes the indexer-CP arm; a smaller
     # one scores on the TP path. Unset: 16 for an FP4/NVFP4 index cache (the CP
     # exchange costs ~9-10us a layer, which the 1/P scoring only repays from 16
