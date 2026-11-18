@@ -2527,6 +2527,24 @@ models:
             fewshot_as_multiturn: true
             threshold: 0.94
 
+
+        # PP2 x TP1 prefill (GPUs 0,1; layers 32,28) -> the same TP4 decode: checks the two-stage
+        # P->D layer map and DSpark aux relay before the 6-GPU AgentX numbers are trusted.
+        - <<: *m31b_gsm8k
+          name: m31b-nvfp4-1p1d-pp2-tp4-dspark7-gsm8k20-c32
+          display_topology: 1P1D-PP2-TP4-DSPARK7-NVFP4
+          prefill:
+            workers: 1
+            tp: 1
+            extra_args: "--pipeline-parallel-size 2 --enforce-eager --max-num-batched-tokens 8192"
+          env:
+            common: *m31b_common_env
+            prefill:
+              <<: *m31b_prefill_env
+              HIP_VISIBLE_DEVICES: "0,1"
+              VLLM_PP_LAYER_PARTITION: "32,28"
+            decode: *m31b_decode_env
+
       mooncake_store:
         # AgentX, InferenceX golden AL for DSpark7 (4.04, performance only).
         - &m31b_agentx
@@ -2672,6 +2690,84 @@ models:
             common_args:
               max_num_seqs: 280
               spec_decode_acceptance_length: 4.04
+
+        # 6 GPUs: PP2 x TP1 prefill on GPUs 0,1 (P/D NICs rdma0,rdma1; Store clients rdma3,rdma0) ->
+        # the same TP4 decode on GPUs 4-7; GPUs 2,3 idle, tok/s/GPU over 6. 32,28: stage 1 holds the draft KV.
+        - &m31b_pp2_agentx
+          <<: *m31b_agentx
+          name: m31b-nvfp4-1p1d-pp2-tp4-dspark7-mcstore-agentx-c140
+          display_topology: 1P1D-PP2-TP4-DSPARK7-NVFP4-MCSTORE
+          concurrency: [140]
+          prefill:
+            workers: 1
+            tp: 1
+            # TP1: a step stays <= 16383 tokens (4 KV heads per launch row), as in every PP cell.
+            extra_args: "--pipeline-parallel-size 2 --enforce-eager --max-num-batched-tokens 8192"
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: "[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160,176,192,208,224,240,256,280]"
+          server:
+            common_args:
+              max_num_seqs: 280
+              spec_decode_acceptance_length: 4.04
+          env:
+            common: *m31b_common_env
+            prefill:
+              <<: *m31b_mcstore_prefill_env
+              HIP_VISIBLE_DEVICES: "0,1"
+              VLLM_PP_LAYER_PARTITION: "32,28"
+            decode: *m31b_decode_env
+
+        - <<: *m31b_pp2_agentx
+          name: m31b-nvfp4-1p1d-pp2-tp4-dspark7-mcstore-agentx-c150
+          concurrency: [150]
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: "[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160,176,192,208,224,240,256,280,300]"
+          server:
+            common_args:
+              max_num_seqs: 300
+              spec_decode_acceptance_length: 4.04
+
+        - <<: *m31b_pp2_agentx
+          name: m31b-nvfp4-1p1d-pp2-tp4-dspark7-mcstore-agentx-c130
+          concurrency: [130]
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: "[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160,176,192,208,224,240,260]"
+          server:
+            common_args:
+              max_num_seqs: 260
+              spec_decode_acceptance_length: 4.04
+
+        # Decode KV +8% (utilization 0.95) with decode MRs on rdma4-7 only (no alternate HCA):
+        # same PCI-local landing NICs, none on the prefill/Store-requester NICs rdma0-3.
+        - <<: *m31b_agentx
+          name: m31b-nvfp4-1p1d-pp4-tp4-dspark7-mcstore-agentx-c150-dmem095-dnic47
+          display_topology: 1P1D-PP4-TP4-DSPARK7-NVFP4-MCSTORE-DMEM095-DNIC47
+          concurrency: [150]
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: "[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160,176,192,208,224,240,256,280,300]"
+            extra_args: "--gpu-memory-utilization 0.95"
+          server:
+            common_args:
+              max_num_seqs: 300
+              spec_decode_acceptance_length: 4.04
+          env:
+            common: *m31b_common_env
+            prefill:
+              <<: *m31b_mcstore_prefill_env
+              # Diagnostics only: a CQ completion timeout then names the stuck peer NIC path.
+              MC_TRACK_RDMA_POSTED_SLICES: "1"
+            decode:
+              <<: *m31b_decode_env
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_device":"rdma4,rdma5,rdma6,rdma7","pd_admission":{"enabled":true,"max_pending_kv_fraction":0.15,"num_reserved_decode_tokens":512}}
 
         # DSpark4 (InferenceX golden AL 3.19) against DSpark7 at the same concurrency.
         - <<: *m31b_agentx
