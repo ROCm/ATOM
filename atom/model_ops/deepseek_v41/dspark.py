@@ -464,16 +464,15 @@ def build_block_state(anchor_embed, noise_embed, width, hc_mult):
         batch, width, hc_mult, device=anchor_embed.device, dtype=torch.float32
     )
     rows = batch * width
-    if rows:
-        write_stream_state(
-            residual.view(rows, hc_mult, hidden),
-            pre_mix.view(rows, hc_mult),
-            anchor_embed,
-            fill=noise_embed,
-            width=width,
-            # The tile this launch was measured at for draft batches.
-            block_h=1024,
-        )
+    write_stream_state(
+        residual.view(rows, hc_mult, hidden),
+        pre_mix.view(rows, hc_mult),
+        anchor_embed,
+        fill=noise_embed,
+        width=width,
+        # The tile this launch was measured at for draft batches.
+        block_h=1024,
+    )
     return residual, pre_mix
 
 

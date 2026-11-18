@@ -158,10 +158,7 @@ def embed_state(
     body itself.
     """
     if torch.compiler.is_compiling() or not (
-        hidden.is_cuda
-        and hidden.is_contiguous()
-        and hidden.dim() >= 1
-        and hc_mult in (1, 2, 4, 8, 16)
+        hidden.is_cuda and hidden.is_contiguous() and hc_mult in (1, 2, 4, 8, 16)
     ):
         return None
     *outer, hidden_size = hidden.shape
@@ -170,13 +167,12 @@ def embed_state(
     )
     pre_mix = torch.empty(*outer, hc_mult, dtype=torch.float32, device=hidden.device)
     rows = hidden.numel() // hidden_size if hidden_size else 0
-    if rows:
-        write_stream_state(
-            residual.view(rows, hc_mult, hidden_size),
-            pre_mix.view(rows, hc_mult),
-            hidden,
-            block_h=_EMBED_BLOCK_H,
-        )
+    write_stream_state(
+        residual.view(rows, hc_mult, hidden_size),
+        pre_mix.view(rows, hc_mult),
+        hidden,
+        block_h=_EMBED_BLOCK_H,
+    )
     return residual, pre_mix
 
 
