@@ -423,12 +423,13 @@ class Attention(nn.Module):
 
     def _project_out(self, output, rope, positions):
         """Inverse RoPE fused into the MXFP8 group quant, then the grouped FP8
-        `wo_a` GEMM and `wo_b`. `positions` are the rows' positions, in the
-        order of `output`'s leading dims.
+        `wo_a` GEMM and `wo_b`. Where `wo_a.runs_bf16` (no group32 FP8 GEMM),
+        the inverse RoPE runs in place in BF16 and `wo_a` is one bmm written
+        through a strided view straight into `wo_b`'s input. `positions` are
+        the rows' positions, in the order of `output`'s leading dims.
         """
         rows = output.shape[:-2].numel()
         if self.wo_a.runs_bf16:
-            # wo_a is BF16 here: BF16 inverse RoPE and bmm.
             x = output.reshape(rows, self.heads, self.head_dim)
             if not x.is_contiguous():
                 x = x.contiguous()
