@@ -37,12 +37,14 @@ from atom.utils.forward_context import plugin_graph_is_piecewise
 #
 # Caller contract (the MoE module looked up by `layer_name`):
 #   - `_use_dual_stream: bool`
+#   - `_dual_stream_token_threshold: int` -- the largest row count that forks
+#     (`envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD` unless the model sets its
+#     own default)
 #   - `single_stream_moe_forward(hidden_states) -> Tensor`
 #   - `dual_stream_moe_forward(hidden_states) -> Tensor`
 #
 # Per-token gating: decode benefits from dual-stream, prefill doesn't —
-# threshold from `envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD`, or the module's
-# own `_dual_stream_token_threshold` where it sets one.
+# rows above `_dual_stream_token_threshold` stay single-stream.
 
 
 def _dual_stream_is_active(self, num_tokens: int) -> bool:
@@ -58,13 +60,7 @@ def _dual_stream_is_active(self, num_tokens: int) -> bool:
     # plugin frontend's own PIECEWISE graphs are left single-stream.
     return (
         self._use_dual_stream
-        and 0
-        < num_tokens
-        <= getattr(
-            self,
-            "_dual_stream_token_threshold",
-            envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD,
-        )
+        and 0 < num_tokens <= self._dual_stream_token_threshold
         and not tbo_active()
         and not plugin_graph_is_piecewise()
     )
@@ -107,6 +103,7 @@ direct_register_custom_op(
 #
 # Caller contract (the MoE module looked up by `layer_name`):
 #   - `_use_dual_stream: bool`
+#   - `_dual_stream_token_threshold: int` (as above)
 #   - `single_stream_split_moe_forward(hidden_states) -> (Tensor, Tensor)`
 #   - `dual_stream_split_moe_forward(hidden_states) -> (Tensor, Tensor)`
 #

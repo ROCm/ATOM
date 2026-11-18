@@ -1089,6 +1089,54 @@ def test_dual_stream_gate_reads_the_module_threshold(monkeypatch, atom_modules, 
     )
     monkeypatch.delenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", raising=False)
     v4 = SimpleNamespace(_use_dual_stream=True, _dual_stream_token_threshold=1536)
-    other = SimpleNamespace(_use_dual_stream=True)
+    other = SimpleNamespace(_use_dual_stream=True, _dual_stream_token_threshold=1024)
     assert dispatch._dual_stream_is_active(v4, rows) == (rows <= 1536)
     assert dispatch._dual_stream_is_active(other, rows) == (rows <= 1024)
+
+
+@pytest.mark.parametrize(("env", "expected"), [(None, 1536), ("2048", 2048)])
+def test_dsv4_moe_init_sets_its_dual_stream_threshold(
+    monkeypatch, atom_modules, env, expected
+):
+    """`MoE.__init__` itself stores the V4 bound the dispatch gate reads."""
+    if env is None:
+        monkeypatch.delenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", raising=False)
+    else:
+        monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", env)
+    v4 = atom_modules.deepseek_v4
+    forward_context = {}
+    config = SimpleNamespace(
+        compilation_config=SimpleNamespace(static_forward_context=forward_context)
+    )
+    monkeypatch.setattr(v4, "get_current_atom_config", lambda: config)
+    monkeypatch.setattr(v4, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(v4, "ReplicatedLinear", lambda *a, **k: torch.nn.Module())
+
+    def fused_moe(**kwargs):
+        experts = torch.nn.Module()
+        experts.num_fused_shared_experts = 0
+        experts._comm_fused_moe = None
+        return experts
+
+    monkeypatch.setattr(v4, "FusedMoE", fused_moe)
+    monkeypatch.setattr(v4, "Expert", lambda *a, **k: torch.nn.Module())
+    args = SimpleNamespace(
+        dim=8,
+        n_routed_experts=4,
+        n_activated_experts=2,
+        n_hash_layers=0,
+        route_scale=1.0,
+        swiglu_limit=7.0,
+        quant_config=None,
+        n_shared_experts=1,
+        moe_inter_dim=16,
+        score_func="sqrtsoftplus",
+        moe_fp8_activations=False,
+        vocab_size=32,
+    )
+
+    moe = v4.MoE(3, args, prefix="model.layers.3.ffn", alt_stream=object())
+
+    assert moe._use_dual_stream
+    assert moe._dual_stream_token_threshold == expected
+    assert forward_context["model.layers.3.ffn"] is moe

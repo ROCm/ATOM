@@ -2818,21 +2818,23 @@ class Expert(nn.Module):
 
 
 # The V4 family's dual-stream MoE row bound when
-# ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD is not set: the 1152-1536-row decode
-# graphs of a large EP batch (6 rows a request) also overlap the shared expert
-# with the routed experts.
+# ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD is not set. 1536 = 256 requests a rank
+# x 6 DSpark rows a request: the largest of the 1152/1344/1536-row decode
+# graphs of a 1024-request expert-parallel batch, the shapes the shared/routed
+# overlap was measured on (a multi-rank MegaMoE bench, shared on the side
+# stream against shared in series). Row counts above it were not measured, so
+# they keep the single-stream path. It is a fixed bound rather than the
+# configured graph size because larger decode graphs are untested.
 V4_DUAL_STREAM_MOE_TOKEN_THRESHOLD = 1536
 
 
 def v4_dual_stream_token_threshold() -> int:
     """The V4 MoE's dual-stream row bound: ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
-    where it is set (0 still turns the dual stream off), else the larger of
-    its default and `V4_DUAL_STREAM_MOE_TOKEN_THRESHOLD`."""
+    where it is set (0 still turns the dual stream off), else
+    `V4_DUAL_STREAM_MOE_TOKEN_THRESHOLD`."""
     if envs.is_set("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD"):
         return envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
-    return max(
-        envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD, V4_DUAL_STREAM_MOE_TOKEN_THRESHOLD
-    )
+    return V4_DUAL_STREAM_MOE_TOKEN_THRESHOLD
 
 
 class MoE(nn.Module):
