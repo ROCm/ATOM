@@ -74,6 +74,20 @@ def _scalar_fields(key, prefix: str) -> list:
     return out
 
 
+def kernel_symbol(stem, **params):
+    """An Itanium-mangled ATOM symbol, without importing the GPU compiler.
+
+    Match AITER kernel-signature rendering: keep parameter order, encode
+    booleans as 0/1, and replace minus signs for the amdhsa assembler.
+    """
+    signature = "_".join(
+        f"{key}{int(value) if isinstance(value, bool) else value}"
+        for key, value in params.items()
+    ).replace("-", "_")
+    name = f"{stem}_{signature}"
+    return f"_ZN4atom{len(name)}{name}E"
+
+
 def symbol_params(key) -> dict:
     """The fields that name the kernel symbol (``metadata={"sym": short name}``),
     short name -> value, in field order."""

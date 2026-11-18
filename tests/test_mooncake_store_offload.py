@@ -52,6 +52,9 @@ from atom.kv_transfer.offload.dense.connector import (
     DenseOffloadScheduler,
 )
 from atom.kv_transfer.offload.dense.kv_byte_codec import DenseKVByteCodec
+from atom.kv_transfer.offload.kv_store import pool as pool_mod
+from atom.kv_transfer.offload.kv_store import scheduler as store_scheduler_mod
+from atom.kv_transfer.offload.kv_store import worker as store_worker_mod
 from atom.kv_transfer.offload.metadata import (
     LMCacheOffloadMetadata,
     LMCacheReqMeta,
@@ -60,7 +63,6 @@ from atom.kv_transfer.offload.metadata import (
 )
 from atom.kv_transfer.offload.mooncake_store import client as store_client
 from atom.kv_transfer.offload.mooncake_store import keys, nic
-from atom.kv_transfer.offload.mooncake_store import pool as pool_mod
 from atom.kv_transfer.offload.mooncake_store import scheduler as scheduler_mod
 from atom.kv_transfer.offload.mooncake_store import taint as taint_mod
 from atom.kv_transfer.offload.mooncake_store import worker as worker_mod
@@ -577,11 +579,14 @@ def scheduler_clock(monkeypatch):
     dispatch stamp with their own ``time.monotonic()``.
     """
     clock = SimpleNamespace(now=time.monotonic())
-    monkeypatch.setattr(
-        scheduler_mod,
-        "time",
-        SimpleNamespace(monotonic=lambda: clock.now, perf_counter=time.perf_counter),
-    )
+    for module in (scheduler_mod, store_scheduler_mod):
+        monkeypatch.setattr(
+            module,
+            "time",
+            SimpleNamespace(
+                monotonic=lambda: clock.now, perf_counter=time.perf_counter
+            ),
+        )
     return clock
 
 
@@ -1766,8 +1771,8 @@ def test_lookup_hashes_a_sequence_prompt_once(cluster):
     seq.token_ids.extend([999] * 5)  # generated tokens are not prompt
     assert scheduler._lookup_token_ids(seq) is seq
     assert _completed_lookup(scheduler._lookup_client, seq) == 0
-    assert seq._mooncake_store_chunk_hashes == _hashes(16)
-    seq._mooncake_store_chunk_hashes = b"\x01" * 32  # cached: not hashed again
+    assert seq._kv_store_chunk_hashes == _hashes(16)
+    seq._kv_store_chunk_hashes = b"\x01" * 32  # cached: not hashed again
     assert prompt_chunk_hashes(seq, CHUNK) == b"\x01" * 32
     media = _seq(5, 20, cache_seed=77)
     assert prompt_chunk_hashes(media, CHUNK) != _hashes(16)
@@ -2221,6 +2226,183 @@ def test_putting_an_existing_chunk_succeeds(cluster, make_worker):
     assert _store(again.save_operation) in worker.get_finished().connector_completions
 
 
+def _counting_source_safe(worker, gpu):
+    """Count every source-safe report of ``worker``, by chunk index."""
+    reported = []
+    report = worker._source_group_safe
+
+    def counting(identity):
+        [(start, _end)] = identity.ranges
+        reported.append(start // CHUNK)
+        report(identity)
+
+    worker._source_group_safe = counting
+    gpu.source_safe = counting
+    return reported
+
+
+def _puts(worker):
+    return [call[1] for call in worker._client._store.calls if call[0] == "put"]
+
+
+def test_a_save_of_chunks_all_held_reads_and_puts_nothing(cluster, make_worker):
+    worker, gpu = make_worker(save_slots=8)
+    worker._do_save_req(_save_req(31, 40))
+    worker.get_finished()
+    puts_before, packs_before = len(_puts(worker)), len(gpu.calls)
+    reported = _counting_source_safe(worker, gpu)
+    again = _save_req(32, 40, generation=1)
+    worker._do_save_req(again)
+    assert len(_puts(worker)) == puts_before
+    assert len(gpu.calls) == packs_before
+    assert sorted(reported) == list(range(5))
+    operation = again.save_operation
+    assert worker.get_finished().connector_completions == {
+        _store(operation),
+        _quiescent(operation),
+        *(_safe(operation, index) for index in range(5)),
+    }
+    # One lookup per window: three windows of each save.
+    assert worker._save_counts == {"lookups": 6, "put_chunks": 5, "held_chunks": 5}
+
+
+def test_a_save_puts_only_the_chunks_the_store_lacks(cluster, make_worker):
+    worker, gpu = make_worker(save_slots=8)
+    request = _save_req(33, 48)
+    hashes = request.chunk_hashes
+    objects = cluster.objects.setdefault(MASTER, {})
+    for index in (1, 3, 4):
+        objects[_key(hashes, index)] = b"held" * (CHUNK_BYTES // 4)
+    reported = _counting_source_safe(worker, gpu)
+    worker._do_save_req(request)
+    # Packed and put tail first, only the chunks missing, in runs, each in
+    # its own chunk's group.
+    assert gpu.calls == [("from", [40]), ("from", [16]), ("from", [0])]
+    assert _puts(worker)[-3:] == [
+        [_key(hashes, 5)],
+        [_key(hashes, 2)],
+        [_key(hashes, 0)],
+    ]
+    store = worker._client._store
+    assert store.put_group_ids[-3:] == [
+        [keys.chunk_group_id(NAMESPACE, keys.chunk_digest(hashes, index))]
+        for index in (5, 2, 0)
+    ]
+    for index in (0, 2, 5):
+        expected = gpu.pattern(2 * index) + gpu.pattern(2 * index + 1)
+        assert objects[_key(hashes, index)] == expected
+    for index in (1, 3, 4):
+        assert objects[_key(hashes, index)] == b"held" * (CHUNK_BYTES // 4)
+    assert sorted(reported) == list(range(6))
+    operation = request.save_operation
+    assert worker.get_finished().connector_completions == {
+        _store(operation),
+        _quiescent(operation),
+        *(_safe(operation, index) for index in range(6)),
+    }
+    assert worker._save_counts == {"lookups": 3, "put_chunks": 3, "held_chunks": 3}
+    assert worker._pool.quarantined("save") == 0
+
+
+def test_a_failed_lookup_puts_the_whole_save(cluster, make_worker, caplog):
+    worker, _ = make_worker(save_slots=8)
+    worker._do_save_req(_save_req(34, 40))
+    worker.get_finished()
+    worker._client._store.raise_on = "exists"
+    again = _save_req(35, 40, generation=1)
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        worker._do_save_req(again)
+    worker._client._store.raise_on = None
+    assert "lookup failed" in caplog.text
+    assert [len(batch) for batch in _puts(worker)[-3:]] == [2, 2, 1]
+    assert _store(again.save_operation) in worker.get_finished().connector_completions
+    assert worker._save_counts["put_chunks"] == 10
+    assert worker._save_counts["held_chunks"] == 0
+
+
+def test_a_chunk_the_lookup_has_no_answer_for_is_put(cluster, make_worker):
+    worker, gpu = make_worker(save_slots=8)
+    request = _save_req(36, 16)
+    hashes = request.chunk_hashes
+    objects = cluster.objects.setdefault(MASTER, {})
+    objects[_key(hashes, 0)] = b"held" * (CHUNK_BYTES // 4)
+    objects[_key(hashes, 1)] = b"held" * (CHUNK_BYTES // 4)
+    # A master error for chunk 1 is not a hit: it is put as without a lookup,
+    # and Mooncake keeps the bytes it holds.
+    worker._client._store.exist_codes[_key(hashes, 1)] = store_client.RPC_FAIL
+    worker._do_save_req(request)
+    assert _puts(worker) == [[_key(hashes, 1)]]
+    assert gpu.calls == [("from", [8])]
+    assert _store(request.save_operation) in worker.get_finished().connector_completions
+
+
+def test_a_failed_put_after_held_chunks_reports_each_chunk_once(cluster, make_worker):
+    worker, gpu = make_worker(save_slots=8)
+    request = _save_req(37, 48)
+    hashes = request.chunk_hashes
+    objects = cluster.objects.setdefault(MASTER, {})
+    for index in (4, 5):
+        objects[_key(hashes, index)] = b"held" * (CHUNK_BYTES // 4)
+    worker._client._store.put_codes[_key(hashes, 3)] = store_client.NO_AVAILABLE_HANDLE
+    reported = _counting_source_safe(worker, gpu)
+    worker._do_save_req(request)
+    # Chunks 4-5 held, 2-3 read and put (3 refused), 0-1 never read: each
+    # source-safe once, so every PP stage reports the same set.
+    assert sorted(reported) == list(range(6))
+    operation = request.save_operation
+    assert worker.get_finished().connector_completions == {
+        _store(operation, False),
+        _quiescent(operation),
+        *(_safe(operation, index) for index in range(6)),
+    }
+    assert worker._save_counts == {"lookups": 2, "put_chunks": 2, "held_chunks": 2}
+    assert worker._pool.quarantined("save") == 0
+
+
+def test_held_runs_split_a_window_highest_first():
+    runs = store_worker_mod._held_runs(range(4, 9), [True, False, False, True, True])
+    assert runs == [(range(7, 9), True), (range(5, 7), False), (range(4, 5), True)]
+    assert store_worker_mod._held_runs(range(2, 3), [False]) == [(range(2, 3), False)]
+
+
+def test_the_save_profile_counts_windows_and_segments_apart(
+    cluster, make_worker, monkeypatch, caplog
+):
+    worker, _ = make_worker(save_slots=8)
+    request = _save_req(38, 48)
+    hashes = request.chunk_hashes
+    objects = cluster.objects.setdefault(MASTER, {})
+    for index in (1, 3, 4):
+        objects[_key(hashes, index)] = b"held" * (CHUNK_BYTES // 4)
+    monkeypatch.setattr(worker, "_profile_enabled", lambda: True)
+    worker._next_stats_log_at = 0.0
+    with caplog.at_level(logging.INFO, logger="atom"):
+        worker._do_save_req(request)
+    [profile] = [
+        r.getMessage() for r in caplog.records if "SAVE-PROF" in r.getMessage()
+    ]
+    # Three windows of two chunks, each looked up once; three runs put.
+    for field in (
+        "chunks=6 ",
+        "held_chunks=3 ",
+        "put_chunks=3 ",
+        "windows=3 ",
+        "segments=3 ",
+        "in_place_segments=0 ",
+        # Only the chunks it put, not the held ones.
+        f"put_bytes={3 * CHUNK_BYTES} ",
+        "status=ok",
+    ):
+        assert field in profile, field
+    [stats] = [
+        r.getMessage() for r in caplog.records if "STORE-STATS" in r.getMessage()
+    ]
+    assert (
+        f"save_exists=3 save_put_chunks=3 save_held_chunks=3 "
+        f"save_held_bytes={3 * CHUNK_BYTES} "
+    ) in stats
+
+
 def test_put_failure_is_quiescent_and_reports_every_chunk(cluster, make_worker):
     worker, gpu = make_worker(save_slots=8)
     request = _save_req(16, 40)
@@ -2575,7 +2757,7 @@ def test_gpu_copy_failure_without_a_fence_retires_its_slots(
     def no_fence(_device):
         raise RuntimeError("sticky HIP error")
 
-    monkeypatch.setattr(worker_mod, "_synchronize", no_fence)
+    monkeypatch.setattr(store_worker_mod, "_synchronize", no_fence)
     worker._guard("save", worker._do_save_req, _save_req(21, 16))
     # A copy that may still run has no time bound: out of use for good.
     assert worker._pool.quarantined("save") == 2
@@ -2584,7 +2766,7 @@ def test_gpu_copy_failure_without_a_fence_retires_its_slots(
 def test_a_save_queued_past_its_deadline_reads_nothing(cluster, make_worker):
     worker, gpu = make_worker()
     request = _save_req(22, 24)
-    request._mooncake_store_dispatched_at = time.monotonic() - 10_000
+    request._kv_store_dispatched_at = time.monotonic() - 10_000
     worker._do_save_req(request)
     assert gpu.calls == []
     assert cluster.objects.get(MASTER, {}) == {}
@@ -2605,7 +2787,7 @@ def test_a_saves_deadline_counts_from_its_dispatch_not_its_receipt(
     clock = SimpleNamespace(monotonic=5000.0)
     # No wall clock: the worker reads none, so no step of it moves a deadline.
     monkeypatch.setattr(
-        worker_mod,
+        store_worker_mod,
         "time",
         SimpleNamespace(
             monotonic=lambda: clock.monotonic, perf_counter=time.perf_counter
@@ -2626,7 +2808,7 @@ def test_a_saves_deadline_counts_from_its_dispatch_not_its_receipt(
     metadata = LMCacheOffloadMetadata()
     metadata.add_request(request)
     worker.start_load_kv(metadata)
-    assert request._mooncake_store_dispatched_at == clock.monotonic - 3.0
+    assert request._kv_store_dispatched_at == clock.monotonic - 3.0
     clock.monotonic += runs_after_s - 3.0
     worker._do_save_req(request)
     operation = request.save_operation
@@ -2654,7 +2836,7 @@ def test_a_saves_deadline_counts_from_its_dispatch_not_its_receipt(
 def test_a_save_stamped_on_a_clock_the_worker_cannot_place_reads_nothing(
     cluster, make_worker, monkeypatch, dispatch_clock, own_clock
 ):
-    monkeypatch.setattr(worker_mod, "monotonic_clock_id", lambda: own_clock)
+    monkeypatch.setattr(store_worker_mod, "monotonic_clock_id", lambda: own_clock)
     # Enqueue nothing: the test runs the save when its thread would get to it.
     monkeypatch.setattr(DenseOffloadConnector, "start_load_kv", lambda *_: None)
     worker, gpu = make_worker()
@@ -2681,7 +2863,7 @@ def test_neither_side_starts_where_the_boot_is_unnamed(
 ):
     # A save's stamp is read on the clock it names: without a boot ID every
     # save would read nothing, so neither half starts.
-    monkeypatch.setattr(scheduler_mod, "_BOOT_ID_PATH", str(tmp_path / "missing"))
+    monkeypatch.setattr(store_scheduler_mod, "_BOOT_ID_PATH", str(tmp_path / "missing"))
     scheduler_mod.monotonic_clock_id.cache_clear()
     try:
         build = (
@@ -2741,7 +2923,7 @@ def test_start_load_kv_stamps_saves_and_shares_one_fence(
     worker.start_load_kv(metadata)
     worker._save_executor.shutdown(wait=True)
     # No dispatch time: the deadline counts from receipt.
-    assert all(r._mooncake_store_dispatched_at >= before for r in metadata.requests)
+    assert all(r._kv_store_dispatched_at >= before for r in metadata.requests)
     assert len(events) == 1 and gpu.events == [events[0], events[0]]
     output = worker.get_finished()
     assert output.finished_saving == {r.save_operation for r in metadata.requests}
@@ -3006,6 +3188,7 @@ def test_under_pp_each_stage_fences_a_save_after_the_forwards_it_reads(
     head_rpcs, sent, acks = [], [], deque()
     head = SimpleNamespace(
         pp_size=4,
+        pp_max_inflight=4,
         scheduler=engine,
         kv_transfer_enabled=True,
         _in_flight=deque(),
@@ -3241,7 +3424,7 @@ def _kv_caches(num_blocks=8):
 @pytest.fixture
 def one_rank(monkeypatch):
     monkeypatch.setattr(
-        worker_mod,
+        store_worker_mod,
         "_tp_group",
         lambda: SimpleNamespace(world_size=1, rank_in_group=0),
     )
@@ -4171,7 +4354,7 @@ def test_m3_store_namespace_separates_complete_pages_from_dense_codec(monkeypatc
 @pytest.mark.parametrize("layout", ["dense", "m3"])
 def test_store_codec_version_changes_only_its_own_namespace(monkeypatch, layout):
     from atom.kv_transfer.offload.hybrid.m3 import codec as m3_codec
-    from atom.kv_transfer.offload.mooncake_store import layouts
+    from atom.kv_transfer.offload.kv_store import layouts
 
     config = _config()
     monkeypatch.setattr(offcfg, "select_offload_layout", lambda _: layout)

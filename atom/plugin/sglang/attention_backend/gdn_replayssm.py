@@ -174,20 +174,24 @@ def prepare_layer(
     return (*bufs, _RUNTIME.write_pos)
 
 
-def note_full_state_write(slot_idx: torch.Tensor | None) -> None:
+def note_full_state_write(slot_idx: torch.Tensor) -> None:
     """A prefill just rewrote the checkpoint. Drop uncommitted records.
 
     Commit runs after verify, not before the next kernel, so the Native
     prefill sentinel (-1) would discard the first verify's accepts. Parking
     the cursor at 0 is the equivalent: the next verify folds nothing.
+
+    Pad rows (< 0) are routed to a spare trailing entry rather than dropped
+    with a boolean mask, whose size the host would have to read back.
     """
     write_pos = _RUNTIME.write_pos
-    if write_pos is None or slot_idx is None or slot_idx.numel() == 0:
+    if write_pos is None or slot_idx.numel() == 0:
         return
-    live = slot_idx[slot_idx >= 0].to(torch.int64)
-    if live.numel() == 0:
-        return
-    write_pos.index_fill_(0, live, 0)
+    slots = int(write_pos.shape[0])
+    rows = slot_idx.to(torch.int64).masked_fill(slot_idx < 0, slots)
+    parked = torch.zeros(slots + 1, dtype=torch.bool, device=write_pos.device)
+    parked.index_fill_(0, rows, True)
+    write_pos.masked_fill_(parked[:slots], 0)
 
 
 def install_sglang_replayssm_commit() -> None:
