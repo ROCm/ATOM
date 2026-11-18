@@ -1525,6 +1525,9 @@ jobs:
           echo "RDMA smoke summary written to ${summary_path}"
 
   run-model-benchmark:
+    # Not on pull requests: their merge checks are the ATOMesh unit tests and
+    # the standalone accuracy run. To benchmark a PR branch, dispatch this
+    # workflow on it.
     name: ${{ matrix.group.name }}
     needs: [ci-gate, load-config]
     if: >-
@@ -1532,7 +1535,6 @@ jobs:
       && (
         github.event_name == 'schedule'
         || (github.event_name == 'workflow_dispatch' && inputs.run_model_benchmark)
-        || (github.event.pull_request && !github.event.pull_request.head.repo.fork)
       )
     strategy:
       fail-fast: false
@@ -1832,7 +1834,7 @@ jobs:
             summarize-results=${{ needs.summarize-results.result }}
           required-results: |
             load-config=${{ needs.load-config.result }}
-            run-model-benchmark=${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_model_benchmark) || (github.event.pull_request && !github.event.pull_request.head.repo.fork)) && needs.run-model-benchmark.result || 'success' }}
+            run-model-benchmark=${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_model_benchmark)) && needs.run-model-benchmark.result || 'success' }}
 
   dashboard:
     concurrency:

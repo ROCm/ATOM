@@ -118,10 +118,7 @@ def test_atomesh_benchmark_uses_required_heavy_ci_gate():
     assert jobs["load-config"]["needs"] == ["ci-gate"]
     assert jobs["rdma-smoke-test"]["needs"] == ["ci-gate", "load-config"]
     assert jobs["run-model-benchmark"]["needs"] == ["ci-gate", "load-config"]
-    assert (
-        "github.event.pull_request && !github.event.pull_request.head.repo.fork"
-        in jobs["run-model-benchmark"]["if"]
-    )
+    assert "github.event.pull_request" not in jobs["run-model-benchmark"]["if"]
 
     test_gate = jobs["atomesh-benchmark-gate"]
     assert test_gate["if"] == "always()"
@@ -146,6 +143,7 @@ def test_atomesh_benchmark_uses_required_heavy_ci_gate():
         "run-model-benchmark=${{ (github.event_name == 'schedule'"
         in evaluate_inputs["required-results"]
     )
+    assert "github.event.pull_request" not in evaluate_inputs["required-results"]
     assert "run-model-benchmark=${{ needs.run-model-benchmark.result }}" in (
         evaluate_inputs["optional-results"]
     )
