@@ -1746,7 +1746,7 @@ def _count_fits(sched, monkeypatch):
     monkeypatch.setattr(
         sched.block_manager,
         "can_allocate_memoized",
-        lambda seq: calls.append(seq) or fit(seq),
+        lambda seq, probe=None: calls.append(seq) or fit(seq, probe),
     )
     return calls
 

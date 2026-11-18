@@ -34,7 +34,10 @@ import numpy as np
 
 from atom.config import Config
 from atom.kv_transfer.disaggregation import KVConnectorOutput, kv_config_has_producer
-from atom.kv_transfer.disaggregation.pd_admission import PdAdmissionController
+from atom.kv_transfer.disaggregation.pd_admission import (
+    DecodeGrowthReserve,
+    PdAdmissionController,
+)
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.block_manager import (
     AdmissionProbe,
@@ -689,6 +692,7 @@ class Scheduler:
     # on to keep what was running (see `preempt_running`).
     can_recompute_prompts = True
     pd_admission: PdAdmissionController | None = None
+    receive_reserve_deferred: int = 0
 
     def __init__(
         self,
@@ -901,12 +905,27 @@ class Scheduler:
         decode_reach = max(
             1 + (self.mtp_k if self.use_spec else 0), self.draft_lookahead
         )
+        first_decode_tokens = 1 + self.mtp_k + decode_reach
         self.pd_admission = PdAdmissionController.from_config(
             config,
             self.kv_connector,
             self.block_manager,
-            first_decode_tokens=1 + self.mtp_k + decode_reach,
+            first_decode_tokens=first_decode_tokens,
         )
+        # The controller keeps the decode reserve. Without it (off, or not
+        # allowed at DCP > 1 or with a state pool) the scheduler keeps it.
+        self._receive_reserve = (
+            None
+            if self.pd_admission is not None
+            else DecodeGrowthReserve(
+                self.block_manager,
+                tokens=first_decode_tokens,
+                first_decode_tokens=first_decode_tokens,
+            )
+        )
+        # Receives `_receive_reserve` deferred, once per admission wait.
+        self.receive_reserve_deferred = 0
+        self._receive_reserve_head: int | None = None
         bind_block_manager = getattr(self.kv_connector, "bind_block_manager", None)
         if callable(bind_block_manager):
             bind_block_manager(self.block_manager)
@@ -1186,9 +1205,12 @@ class Scheduler:
                 resume, cached = tier_waiter
             else:
                 # The exact probe's answer; the walk is memoised across ticks.
-                cached_blocks = self.block_manager.can_allocate_memoized(seq)
-                if cached_blocks < 0:
-                    break  # Phase 2 also stops at the first allocation refusal.
+                probe = AdmissionProbe()
+                cached_blocks = self.block_manager.can_allocate_memoized(seq, probe)
+                if cached_blocks < 0 or not self._receive_leaves_decode_room(
+                    seq, probe
+                ):
+                    break  # Phase 2 also stops at an allocation or reserve refusal.
                 if slots <= parked:
                     # A connector query can pin remote KV, so leave it to
                     # admission. Do not count uncertain remote-slot fit as
@@ -1538,7 +1560,12 @@ class Scheduler:
             # KV-pressured requests definitely cannot prefill. A fit probe, not
             # an admission: it records nothing, and runs every tick, so the
             # walk is memoised across ticks.
-            return self.block_manager.can_allocate_memoized(seq) >= 0
+            probe = AdmissionProbe()
+            if self.block_manager.can_allocate_memoized(seq, probe) < 0:
+                return False
+            # Phase 2 defers a receive that leaves decode no room; reporting it
+            # prefillable would skip this rank's decode for nothing.
+            return self._receive_leaves_decode_room(seq, probe)
         return False
 
     def _prefix_bypass_limit(self) -> int:
@@ -2695,11 +2722,17 @@ class Scheduler:
             pd_plan = None
             if self.pd_admission is not None and needs_remote_load:
                 admitted, pd_plan = self.pd_admission.check(
-                    seq, hbm_probe, running=self.running
+                    seq, hbm_probe, held=self._decode_rows()
                 )
                 if not admitted:
                     self.waiting.appendleft(seq)
                     break
+            elif needs_remote_load and not self._receive_leaves_decode_room(
+                seq, hbm_probe
+            ):
+                self._count_receive_deferral(seq)
+                self.waiting.appendleft(seq)
+                break
 
             allocated = self._allocate_admitted_prefill(
                 seq, hbm_probe, num_cached_blocks
@@ -3580,6 +3613,36 @@ class Scheduler:
             seq.num_cached_tokens
         )
         return needs_remote_load
+
+    def _decode_rows(self) -> Iterable[Sequence]:
+        """What this rank holds for decode: the running rows and the parked loads,
+        which decode once their KV lands (an aborted one only drains)."""
+        if not self._parked_loads:
+            return self.running
+        parked = [
+            s
+            for s in self._parked_loads.values()
+            if s.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+        ]
+        return [*self.running, *parked]
+
+    def _receive_leaves_decode_room(self, seq: Sequence, probe: AdmissionProbe) -> bool:
+        """Whether P/D receive `seq` leaves the held rows their decode reserve,
+        recording nothing. Phase 2 and the DP readiness probes all ask this."""
+        if not (seq.kv_transfer_params or {}).get("do_remote_prefill"):
+            return True
+        held = self._decode_rows()
+        if self.pd_admission is not None:
+            return self.pd_admission.leaves_decode_room(seq, probe, held=held)
+        # Only an idle D admits below it, as with the controller.
+        return not held or self._receive_reserve.leaves_room(seq, probe, held)
+
+    def _count_receive_deferral(self, seq: Sequence) -> None:
+        # Admission stops at a deferred receive, so it heads the queue until it
+        # enters, and it enters only once: count it on its first deferral.
+        if seq.id != self._receive_reserve_head:
+            self._receive_reserve_head = seq.id
+            self.receive_reserve_deferred += 1
 
     def _schedule_first_decode_after_remote_kv(self, seq: Sequence) -> None:
         """P/D path: a remote prefill completed, so schedule first decode."""
@@ -4568,11 +4631,18 @@ class Scheduler:
         seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
         self._count_inflight_load(seq)
 
+    @property
+    def _parked_loads(self) -> dict[int, Sequence]:
+        """The loads `_num_parked_remote_kv` counts, by seq id. Created on first
+        use, so schedulers built without `__init__` (test doubles) work."""
+        return self.__dict__.setdefault("_parked_loads_by_id", {})
+
     def _count_inflight_load(self, seq: Sequence) -> None:
         if not getattr(seq, "_counted_as_inflight_load", False):
             if metrics := getattr(self, "metrics", None):
                 metrics.start_kv_wait(seq)
             self._num_parked_remote_kv += 1
+            self._parked_loads[seq.id] = seq
             seq._counted_as_inflight_load = True
 
     def _uncount_inflight_load(self, seq: Sequence) -> None:
@@ -4582,6 +4652,7 @@ class Scheduler:
             if metrics := getattr(self, "metrics", None):
                 metrics.finish_kv_wait(seq.id, succeeded=False)
             self._num_parked_remote_kv -= 1
+            self._parked_loads.pop(seq.id, None)
             seq._counted_as_inflight_load = False
 
     def _adjust_prefill_chunk_after_alloc(self, seq: Sequence, chunk: int) -> int:
@@ -6027,6 +6098,7 @@ class PrefillScheduler:
     can_recompute_prompts = False
     # P/D admission is decode-side Mooncake policy; this prefill side has none.
     pd_admission: PdAdmissionController | None = None
+    receive_reserve_deferred: int = 0
 
     def __init__(self, config: Config, disagg_cu_shm_name: str = ""):
         self.max_num_seqs = config.max_num_seqs

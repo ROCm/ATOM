@@ -747,6 +747,10 @@ class BlockManager:
             count, protected_hash=protected_checkpoint_hash
         )
 
+    def has_page_units(self, count: int) -> bool:
+        """Whether `count` page units are free, or freeable from state checkpoints."""
+        return self._has_page_units(count)
+
     def _ensure_page_units(self, count: int) -> bool:
         if self.paged_state_checkpoints is None:
             return self.kv.has_free(count)
@@ -1505,7 +1509,9 @@ class BlockManager:
             return None
         return walk
 
-    def can_allocate_memoized(self, seq: Sequence) -> int:
+    def can_allocate_memoized(
+        self, seq: Sequence, probe: AdmissionProbe | None = None
+    ) -> int:
         """`can_allocate(seq, record=False)` for the delayer and the DP chunk
         cost, with the walk memoised per seq. The same `_evaluate`, so state
         room, the gates, the replay, checkpoint demand/end, the used hit blocks
@@ -1517,9 +1523,10 @@ class BlockManager:
         `_RECENT_INDEX_CHANGES` since the last check re-walks), no
         `clear_cache`, the first miss still resolves the same (a hit only grows
         by a publish of that hash), and token count and seed are unchanged.
+        A `probe` gets the fit's demand, as `can_allocate`'s does.
         """
         walk_of = self._memoised_walk if self.walk_memo else self._walk_prefix
-        return self._evaluate(seq, walk_of, False, None)
+        return self._evaluate(seq, walk_of, False, None, probe)
 
     def _memoised_walk(self, seq: Sequence) -> _PrefixWalk:
         memo = self._cached_walks.get(seq)

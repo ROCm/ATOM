@@ -1025,5 +1025,12 @@ class EngineUtilityHandler:
                         "pending_kv_bytes": admission.pending_bytes,
                         "deferred": dict(admission.deferred),
                     }
+                elif self.scheduler.receive_reserve_deferred:
+                    # The decode reserve without the controller: no credits.
+                    result["scheduler_metrics"]["pd_admission"] = {
+                        "deferred": {
+                            "free_kv": self.scheduler.receive_reserve_deferred
+                        },
+                    }
 
         return result

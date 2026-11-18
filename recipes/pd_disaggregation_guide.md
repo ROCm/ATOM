@@ -25,9 +25,13 @@ still apply. See [the implementation and CPU verification notes](../docs/pd_chun
 
 Mooncake reserves D's destination KV blocks before P writes them, so a backlog
 of pending receives can hold most of D's KV pool while few requests decode.
-The opt-in `pd_admission` policy defers a new receive while the receive targets
-already pending would exceed a per-rank byte budget, and can keep room free for
-the admitted requests to keep decoding. Set it in the consumer's
+D always keeps a decode reserve: it defers a new receive unless, after the
+receive takes its blocks, every request D holds and the receive itself could
+still take their first decode step. A P/D request preempted for room drops the
+KV it received and recomputes its whole prompt on D.
+The opt-in `pd_admission` policy also defers a new receive while the receive
+targets already pending would exceed a per-rank byte budget, and can raise the
+reserve. Set it in the consumer's
 top-level `--kv-transfer-config`; with `multi`, put it next to `connectors` and
 list the Mooncake consumer first:
 
@@ -43,7 +47,7 @@ rejected.
 | --- | --- |
 | `max_pending_kv_fraction` | Fraction of each D rank's paged KV pool, converted to bytes at startup. |
 | `max_pending_kv_bytes` | Bytes per D rank, instead of a fraction. |
-| `num_reserved_decode_tokens` | Decode tokens kept free for each admitted request to grow by, for example `512`. A new receive is deferred if, after it takes its blocks, the free pool could not grow every receiving, ready and running request and itself by that many tokens, each capped by what it may still generate but never below what a P/D receive's first decode takes. Reusable cached blocks count as free, and a local prefix hit on a block another request holds takes nothing. That first decode appends the first token and `num_speculative_tokens` verify slots, then needs room for one decode step past them: `2 × (num_speculative_tokens + 1)` tokens with speculative decoding, 2 without. Startup rejects a smaller value. |
+| `num_reserved_decode_tokens` | Decode tokens kept free for each admitted request to grow by, for example `512`. A new receive is deferred if, after it takes its blocks, the free pool could not grow every receiving, ready and running request and itself by that many tokens, each capped by what it may still generate but never below what a P/D receive's first decode takes. Reusable cached blocks count as free, and a local prefix hit on a block another request holds takes nothing. That first decode appends the first token and `num_speculative_tokens` verify slots, then needs room for one decode step past them: `2 × (num_speculative_tokens + 1)` tokens with speculative decoding, 2 without. Startup rejects a smaller value; unset, the reserve is that first decode. |
 
 The byte budget charges the blocks Mooncake writes: a local prefix hit is
 charged only on a full transfer (offset 0). Whole-prompt and chunked receives
@@ -51,13 +55,14 @@ share the budget. A request
 holds its credit until its first local forward; preemption, a failed receive
 and a cancelled one (once its writes drain) return it. With nothing pending,
 one request may exceed the byte budget, so long prompts are not starved. The
-decode reserve covers every admitted request, including one past its first
-forward, so it holds while any request runs on D; only an idle D admits below
-it. Falling below it defers admission only and never preempts. Both limits
-apply to Mooncake P/D receives only: a request parked for a tier or replay KV
-load through an offload connector is not checked, and holds its blocks outside
-the reserve until its load lands and it runs. D must have PP=1, DCP=1, PCP=1,
-SP=1 and a single paged KV pool. Metrics are listed under `atom:pd_admission_*`
+decode reserve covers every request D holds, running or parked for its KV,
+including one past its first forward, so it holds while any request runs on D;
+only an idle D admits below it. Falling below it defers admission only and never
+preempts. Both limits check Mooncake P/D receives only: a request parked for a
+tier or replay KV load through an offload connector is not checked, but the
+reserve keeps room for its decode. `pd_admission` needs D at PP=1, DCP=1, PCP=1,
+SP=1 and a single paged KV pool; without it the reserve still applies, at the
+first decode. Metrics are listed under `atom:pd_admission_*`
 in the [metrics guide](../docs/metrics_guide.md#scheduler).
 
 ## Prerequisites
