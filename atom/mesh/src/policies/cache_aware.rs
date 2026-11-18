@@ -427,52 +427,50 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         let tree = self.trees.get(&model_id).map(|entry| entry.value().clone());
 
         if let Some(tree) = tree {
-            // Now we work with the tree without holding the HashMap lock
-            // Use prefix_match_with_counts to avoid redundant chars().count() calls
-            let result = tree.prefix_match_with_counts(text);
+            // Match among the healthy candidates only. Other tenants may be alive outside
+            // them (another DP rank under idx2idx, or an ext-proc subset), so they stay in
+            // the tree; removed workers leave it through `remove_worker_by_url`.
+            let candidates: Vec<&str> = healthy_indices
+                .iter()
+                .map(|&idx| workers[idx].url())
+                .collect();
+            let result = tree.prefix_match_among(text, &candidates);
             let match_rate = if result.input_char_count == 0 {
                 0.0
             } else {
                 result.matched_char_count as f32 / result.input_char_count as f32
             };
             let tenant_url: &str = &result.tenant;
-            // A match whose tenant is not a healthy candidate is relocated like a low match.
-            // The tenant may be alive outside the candidates (another DP rank under idx2idx,
-            // or an ext-proc subset), so it stays in the tree; removed workers leave it
-            // through `remove_worker_by_url`.
-            let tenant_idx = workers
-                .iter()
-                .position(|w| w.url() == tenant_url)
-                .filter(|&idx| {
-                    match_rate > self.config.cache_threshold && workers[idx].is_healthy()
-                });
+            let tenant_idx = (match_rate > self.config.cache_threshold)
+                .then(|| {
+                    healthy_indices
+                        .iter()
+                        .copied()
+                        .find(|&idx| workers[idx].url() == tenant_url)
+                })
+                .flatten();
+            let idx = tenant_idx
+                .or_else(|| least_loaded(workers, &healthy_indices))
+                .unwrap_or(healthy_indices[0]);
+
+            // Update the tree with this request (use worker URL directly, no allocation)
+            tree.insert(text, workers[idx].url());
+            self.routed(info, workers[idx].as_ref());
+
+            // Increment processed counter
+            workers[idx].increment_processed();
+
             let decision = RouteDecision {
                 match_ratio: Some(match_rate as f64),
+                estimated_hit_ratio: (workers[idx].url() == tenant_url)
+                    .then_some(match_rate as f64),
                 ..RouteDecision::branch(if tenant_idx.is_some() {
                     "affinity"
                 } else {
                     "relocate"
                 })
             };
-            let selected_idx = tenant_idx.or_else(|| least_loaded(workers, &healthy_indices));
-
-            if let Some(idx) = selected_idx {
-                // Update the tree with this request (use worker URL directly, no allocation)
-                tree.insert(text, workers[idx].url());
-                self.routed(info, workers[idx].as_ref());
-
-                // Increment processed counter
-                workers[idx].increment_processed();
-
-                let decision = RouteDecision {
-                    estimated_hit_ratio: (workers[idx].url() == tenant_url)
-                        .then_some(match_rate as f64),
-                    ..decision
-                };
-                return (Some(idx), decision);
-            }
-
-            (None, RouteDecision::branch(NO_HEALTHY_WORKERS))
+            (Some(idx), decision)
         } else {
             // No tree for this key: cache affinity is dead and every request is
             // placed at random, which is indistinguishable from "cache_aware is
@@ -755,11 +753,11 @@ mod tests {
             select("hello, friend").await,
             (first, "relocate", (ratio(5.0, 13.0), ratio(5.0, 13.0)))
         );
-        // An unhealthy tenant is relocated from and stays in the tree.
+        // An unhealthy tenant's match does not count; the healthy worker is credited its own.
         workers[first].set_healthy(false);
         assert_eq!(
             select("hello world").await,
-            (1 - first, "relocate", (Some(1.0), None))
+            (1 - first, "relocate", (ratio(3.0, 11.0), ratio(3.0, 11.0)))
         );
         workers[first].set_healthy(true);
         for _ in 0..20 {

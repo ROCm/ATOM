@@ -99,8 +99,8 @@ Defaults are the CLI defaults.
 | `power_of_two` | `single_worker` | The only healthy worker. | |
 | | `token_load` | The lower of two random workers by the token load the load monitor last reported. | |
 | | `request_load` | The same by active requests, when either worker has no token load. | |
-| `cache_aware` | `affinity` | Match ratio above `--cache-threshold` (0.3): the worker holding the longest match. | ratio |
-| | `relocate` | Match ratio at or below the threshold, or the matched worker is not a healthy candidate: the least-loaded worker, ties broken at random. The matched worker stays in the tree. | ratio |
+| `cache_aware` | `affinity` | The longest match a healthy candidate holds has a ratio above `--cache-threshold` (0.3): that candidate. | ratio |
+| | `relocate` | That ratio is at or below the threshold: the least-loaded worker, ties broken at random. Workers outside the candidates keep their matches in the tree. | ratio |
 | | `imbalanced` | The max minus min load exceeds `--balance-abs-threshold` (64) and the max exceeds `--balance-rel-threshold` (1.5) times the min: the least-loaded worker, without a tree lookup. | |
 | | `no_tree` | No tree for the model and pool: a random healthy worker. | |
 | `prefix_hash` | `ring_hit` | The hash ring owner of the first `--prefix-token-count` (256) tokens, when its load is at most `--prefix-hash-load-factor` (1.25) times the average load including this request. | |
@@ -115,15 +115,14 @@ Defaults are the CLI defaults.
 ### Prefix match ratio
 
 `cache_aware` keeps a character tree of the request texts it routed, per model
-and pool, and records matched characters over input characters for the best
-match. It counts characters of the prompt text, not tokens or KV blocks. The
+and pool, and records matched characters over input characters for the longest
+match a healthy candidate holds. It counts characters of the prompt text, not tokens or KV blocks. The
 router prunes the tree on its own schedule (`--eviction-interval`,
 `--max-tree-size`) and does not see engine eviction, so the ratio estimates
 reuse rather than measuring it. `imbalanced` and `no_tree` skip the lookup, so
 neither records a ratio and the histogram count can be lower than the
-`cache_aware` decision count. Mass above the threshold corresponds to `affinity`,
-or to `relocate` when the matched worker is not a candidate; mass near 0 comes
-from first turns and unrelated prompts.
+`cache_aware` decision count. Mass above the threshold corresponds to `affinity`;
+mass near 0 comes from first turns and unrelated prompts.
 
 ### Selected worker's active requests
 
@@ -145,7 +144,8 @@ to a worker (URL and DP rank) in router memory:
 - `hit`: the pinned worker is healthy and its circuit breaker admits requests;
 - `new`: first request of the session; it goes to the worker with the fewest
   live sessions, ties broken by load;
-- `rebind`: the pinned worker is unhealthy, removed or circuit-open, so the
+- `rebind`: the pinned worker is unhealthy, removed or circuit-open, or under
+  idx2idx not among the prefill candidates the decode's rank leaves, so the
   session is reassigned like a new one;
 - `expired`: the session was idle for more than 120 minutes and is reassigned.
 
@@ -166,9 +166,10 @@ that moved the session; an expired session reassigned to its old worker counts
 nothing. `rank_mapping` means the pin held, but
 `--atom-pd-rank-mapping-policy idx2idx` mapped the prefill request to a
 different DP rank than the previous one. Under idx2idx the planner selects
-decode first and, when one is healthy, offers prefill only the workers on the
-decode's rank, so a session pinned to another rank is usually re-pinned there
-and counts as `rebind` instead. A session that moves leaves its KV
+decode first and offers prefill the workers on the decode's rank plus those
+idx2idx does not move (no DP size, or one the decode's rank is outside), or
+every prefill when none of them is healthy. A session pinned to another rank
+is then usually re-pinned and counts as `rebind` instead. A session that moves leaves its KV
 cache on the old worker. The HTTP routers and the external-processing PD
 executor record it; gRPC routers do not.
 

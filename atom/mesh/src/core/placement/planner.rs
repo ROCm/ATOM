@@ -24,25 +24,26 @@ fn report_no_candidates(pool: &'static str, policy: &dyn LoadBalancingPolicy) {
     route_trace::record_selection(pool, policy.name(), None, NO_HEALTHY_WORKERS, None);
 }
 
-/// The prefill candidates idx2idx keeps for `decode`: those on its DP rank, and those it
-/// does not remap (no DP size, or the decode rank is outside it). All of them when none
-/// is left, as the remap then keeps the selected prefill.
+/// The DP rank ATOM's idx2idx rank mapping moves `prefill` to for `decode`: the decode's
+/// rank, when the prefill's DP size covers it and the prefill is on another rank. `None`
+/// keeps the prefill as selected.
+pub(crate) fn idx2idx_rank(prefill: &dyn Worker, decode: &dyn Worker) -> Option<usize> {
+    let rank = decode.dp_rank()?;
+    (rank < prefill.dp_size()? && prefill.dp_rank() != Some(rank)).then_some(rank)
+}
+
+/// The prefill candidates idx2idx keeps for `decode`, or all of them when it would move
+/// every one, as the remap then keeps the selected prefill.
 fn on_decode_rank(prefill: Vec<Arc<dyn Worker>>, decode: &dyn Worker) -> Vec<Arc<dyn Worker>> {
-    let Some(rank) = decode.dp_rank() else {
-        return prefill;
-    };
-    let mapped: Vec<_> = prefill
+    let kept: Vec<_> = prefill
         .iter()
-        .filter(|worker| match worker.dp_size() {
-            Some(size) if rank < size => worker.dp_rank() == Some(rank),
-            _ => true,
-        })
+        .filter(|worker| idx2idx_rank(worker.as_ref(), decode).is_none())
         .cloned()
         .collect();
-    if mapped.is_empty() {
+    if kept.is_empty() {
         prefill
     } else {
-        mapped
+        kept
     }
 }
 
@@ -62,8 +63,8 @@ impl DefaultPlanner {
     }
 
     /// Under ATOM's idx2idx rank mapping, select decode first and offer the prefill policy
-    /// the candidates [`on_decode_rank`] keeps for it, so the prefill it selects is the one
-    /// the request runs on.
+    /// the candidates idx2idx keeps for it ([`idx2idx_rank`]), so the prefill it selects is
+    /// the one the request runs on.
     pub fn with_prefill_on_decode_rank(mut self, enabled: bool) -> Self {
         self.prefill_on_decode_rank = enabled;
         self
@@ -122,29 +123,33 @@ impl DefaultPlanner {
 
         let hash_ring = self.hash_ring_for(req.model_id);
 
-        let (prefill, decode) = if self.prefill_on_decode_rank {
-            let decode = apply_policy(
+        let select_decode = || {
+            apply_policy(
                 &decode_candidates,
                 decode_policy.as_ref(),
                 req,
                 hash_ring.clone(),
             )
-            .await?;
-            let prefill_candidates = on_decode_rank(prefill_candidates, decode.as_ref());
-            let prefill =
-                apply_policy(&prefill_candidates, prefill_policy.as_ref(), req, hash_ring).await?;
-            (prefill, decode)
+        };
+        let decode_first = if self.prefill_on_decode_rank {
+            Some(select_decode().await?)
         } else {
-            let prefill = apply_policy(
-                &prefill_candidates,
-                prefill_policy.as_ref(),
-                req,
-                hash_ring.clone(),
-            )
-            .await?;
-            let decode =
-                apply_policy(&decode_candidates, decode_policy.as_ref(), req, hash_ring).await?;
-            (prefill, decode)
+            None
+        };
+        let prefill_candidates = match &decode_first {
+            Some(decode) => on_decode_rank(prefill_candidates, decode.as_ref()),
+            None => prefill_candidates,
+        };
+        let prefill = apply_policy(
+            &prefill_candidates,
+            prefill_policy.as_ref(),
+            req,
+            hash_ring.clone(),
+        )
+        .await?;
+        let decode = match decode_first {
+            Some(decode) => decode,
+            None => select_decode().await?,
         };
         debug!(
             stage = "placement.pair.selected",
