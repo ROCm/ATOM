@@ -8,7 +8,23 @@ from atom.models.kimi_k3.mono.config import HIDDEN, LATENT
 from atom.models.kimi_k3.mono.kernels.stages import k2_allreduce_gfx1250 as ar
 
 
-@pytest.mark.parametrize("rows", (1, 5, 16, 40, 48))
+WIDE = (50, 55, 60, 64)
+
+
+def _rows(*rows):
+    """``rows``, those past the token cap skipped until it is raised."""
+    from atom.models.kimi_k3.mono.kernels.token_tiling import GFX1250_MAX_TOKENS
+
+    return [
+        pytest.param(
+            r,
+            marks=pytest.mark.skipif(r > GFX1250_MAX_TOKENS, reason="token cap"),
+        )
+        for r in rows
+    ]
+
+
+@pytest.mark.parametrize("rows", (1, 5, 16, 40, 48, *WIDE))
 def test_lines_cover_the_routed_and_shared_partials(rows):
     lines = ar.allreduce_lines(rows)
     assert lines * ar.LINE_ELEMENTS == rows * (LATENT + HIDDEN)
@@ -45,7 +61,7 @@ def test_o_proj_all_reduce_gives_each_rank_whole_ctas_of_columns():
     )
 
 
-@pytest.mark.parametrize("rows", (1, 5, 16, 40, 48))
+@pytest.mark.parametrize("rows", (1, 5, 16, 40, 48, *WIDE))
 def test_gathering_all_reduce_takes_a_line_a_thread(rows):
     kernel = ar.build_gather_allreduce(8, rows)
     assert kernel.abi is ar.GATHER_ALLREDUCE_ABI
@@ -87,3 +103,25 @@ def test_gathering_all_reduce_profile_and_barrier_builds(rows):
     bare = ar.build_gather_allreduce(4, rows, prepush_barrier=False)
     assert bare.name == plain.name + "_nb"
     assert bare.grid == plain.grid
+
+
+def test_o_proj_all_reduce_takes_a_line_a_thread_a_round():
+    from atom.models.kimi_k3.mono.kernels.stages import k2_oproj_ar_gfx1250 as oar
+
+    assert all(oar.line_rounds(rows) == 1 for rows in range(1, 49))
+    assert all(oar.line_rounds(rows) == 2 for rows in range(49, 65))
+    assert oar.triples(64) * oar.CTA_PAIRS <= 2 * oar.THREADS
+
+
+@pytest.mark.parametrize("rows", _rows(40, 48, *WIDE))
+@pytest.mark.parametrize("oneshot", (False, True))
+def test_o_proj_all_reduce_builds_to_64_rows(rows, oneshot):
+    from atom.models.kimi_k3.mono.kernels.execution_plan import Gfx1250KimiBuildPlan
+    from atom.models.kimi_k3.mono.kernels.stages import k2_oproj_ar_gfx1250 as oar
+
+    plan = Gfx1250KimiBuildPlan(
+        threads=256, blocks=256, lds_bytes=320 * 1024, tokens=rows, nblocks=1
+    )
+    kernel = oar.build_oproj_allreduce(plan, 8, 1536, oneshot=oneshot)
+    assert kernel.grid == (oar.CTAS,) and kernel.block == (oar.THREADS,)
+    assert f"_s{rows}" in kernel.name

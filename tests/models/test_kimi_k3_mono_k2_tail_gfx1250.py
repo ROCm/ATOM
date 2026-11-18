@@ -18,8 +18,10 @@ from atom.mono.plan.architecture import GFX1250
 WIDTHS = range(1, tail.tail_max_rows() + 1)
 
 
-def test_tail_takes_the_widths_of_the_seven_element_gathering_all_reduce():
-    rows = tail.tail_max_rows()
+def test_tail_takes_a_share_a_cta_at_the_widths_of_the_seven_element_all_reduce():
+    rows = tail.tail_line_rows()
+    assert rows == 42 and tail.tail_max_rows() == 64
+    assert tail.tail_rounds(rows) == 1 and tail.tail_rounds(rows + 1) == 2
     assert ar.allreduce7_lines(rows) <= ar.MAX_CTAS * ar.THREADS
     assert ar.allreduce7_lines(rows + 1) > ar.MAX_CTAS * ar.THREADS
     assert ar.build_gather_allreduce(8, rows).name.startswith(
@@ -32,7 +34,10 @@ def test_grid_holds_every_all_reduce_cta_and_the_finalize_in_whole_clusters(rows
     grid = tail.tail_grid(rows)
     assert grid % TDM_CLUSTER == 0 and tail.PAIRS <= grid <= ar.MAX_CTAS
     ctas = tail.tail_ar_ctas(rows)
-    assert ctas <= grid
+    # every share a CTA's in some round, the routed ones (and their
+    # partners) in round 0
+    assert ctas <= tail.tail_rounds(rows) * grid and 2 * rows <= grid
+    assert (ctas <= grid) == (tail.tail_rounds(rows) == 1)
     # a line a thread covers both partials; a routed row is two CTAs' lines
     assert ctas * ar.THREADS * ar.LINE7_ELEMENTS == rows * (LATENT + HIDDEN)
     assert ar.LINE7_ROUTED == 2 * ar.THREADS
@@ -67,7 +72,7 @@ def test_norm_reduces_in_aiter_rmsnorm2d_thread_order():
 
 
 @pytest.mark.parametrize("identity", (False, True))
-@pytest.mark.parametrize("rows", (1, 20, 40, 42))
+@pytest.mark.parametrize("rows", (1, 20, 40, 42, 43, 50, 55, 60, 64))
 def test_builder_launches_the_grid_on_the_tail_abi(rows, identity):
     kernel = tail.build_k2_tail(8, rows, 1e-5, identity_routes=identity)
     assert kernel.abi is tail.TAIL_ABI
@@ -75,9 +80,14 @@ def test_builder_launches_the_grid_on_the_tail_abi(rows, identity):
     assert kernel.ar_ctas == tail.tail_ar_ctas(rows) and kernel.eps == 1e-5
 
 
-def test_builder_refuses_widths_past_a_line_a_thread():
+def test_builder_refuses_widths_past_the_cap():
     with pytest.raises(ValueError):
         tail.build_k2_tail(8, tail.tail_max_rows() + 1, 1e-5)
+
+
+def test_a_profile_tail_takes_a_share_a_cta():
+    with pytest.raises(ValueError, match="share a CTA"):
+        tail.build_k2_tail(8, 64, 1e-5, profile=True)
 
 
 def test_flags_hold_a_word_a_cta_and_the_profile_stamps():
