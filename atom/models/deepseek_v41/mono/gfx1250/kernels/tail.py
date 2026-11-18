@@ -61,9 +61,20 @@ def _ctxp(ctx, t, b, T, kv_fp4=False):   # (plain python) the draft context KV's
     return None if ctx is None else CX.ctx_parts(ctx, t, b, T, 65536, kv_fp4)
 
 
+# the target tail's code (head, sampling + verification, the draft context stages) -> L2 at its start (device.
+# code_prefetch_near, bounded by the launch's recorded end; one CTA in 16: a cluster shares the L2): it runs once a step,
+# after the layer loop's weight stream (ktrace gapS, 133K: the sampling passes' computation before each exchange 7-14 us)
+TAIL_L2_KB = 96
+TAIL_L2_ONE_IN = 16
+
+
 @ASTRewriter.transform
-def target(tp, t, b, sm, tc, recv, rank, head_d=4, ctx=None, T=None, kv_fp4=False):
+def target(tp, t, b, sm, tc, recv, rank, head_d=4, ctx=None, T=None, kv_fp4=False, codeend=None):
     P = {k: tptr(tp, k) for k in ('xh', 'hw', 'logits', 's0', 's1', 's2', 's3', 'sids', 'dids', 'outtok', 'verdict', 'anc')}
+    if fx.const_expr(codeend is not None):   # the head's and the sampling's code -> L2 (see TAIL_L2_KB)
+        pc0 = hx.getpc()
+        if b % TAIL_L2_ONE_IN == 0:
+            hx.code_prefetch_near(t, b, codeend, TAIL_L2_KB, pc=pc0)
     handoff(tc, t, False)   # LY.HEAD (offset 0)
     HF.head_once_r(P['xh'], P['hw'], P['logits'], t, t % 32, t // 32, sm, b, head_d, 2, 4)
     handoff(tc + i64(LY.HEAD_DONE), t, False)
