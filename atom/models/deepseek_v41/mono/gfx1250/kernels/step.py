@@ -543,6 +543,9 @@ def target_layer(E, Ly):
         if hx.unlikely(isidx):
             # (contract 6.4) iq reads A2's q blocks + ss (the 40 q-block flags), iw / the compressor GEMM read axn (the 32
             # publishers' flags; layer 0: the entry front's, before the loop): LL waits, not the ATTN_A handoff
+            lfl0 = ltab(fp, Ly, "lflags")()
+            if (lfl0 & fx.Int64(2)) != fx.Int64(0):   # (the compressor GEMM's weight tile -> L2 over the flag waits)
+                CS.cgemm_prefetch(dict(t=t, b=b, cwkv=ltab(fp, Ly, "cwkv")()), (lfl0 & fx.Int64(4)) != fx.Int64(0))
             ll_w = hx.opaque_v(fx.thread_idx.x) // 32
             ll_l = hx.opaque_v(fx.thread_idx.x) % 32
             hx.wait_flags(a2fl, AS.QL // 32, a2tg, ll_w, ll_l, 8)

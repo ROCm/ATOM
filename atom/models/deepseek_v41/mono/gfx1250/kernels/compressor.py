@@ -47,6 +47,23 @@ def i64(x):
 
 
 @ASTRewriter.transform
+def cgemm_prefetch(c, r1):
+    """(at the index chain's entry, before its A2 / axn flag waits) This CTA's wkv tile of stage_cgemm -- 16 rows x its
+    K slice (640 / 1280 bf16) -> L2, 2 lines a thread. ktrace L2 / L8 / L14 (133K): stage_cgemm on wave 3 took ~10 us
+    (10 rounds of its 4-step load batch, ~1 us a round trip), the KV_C count's last arrival (the crows / iquant wait)."""
+    t, b = c["t"], c["b"]
+    ks_n = r1.select(I32(8), I32(4))
+    nt = b // ks_n
+    ks = b % ks_n
+    kper = HID // ks_n
+    lpr = kper * 2 // 128                       # lines a row: 10 or 20
+    for k in range_constexpr(2):
+        j = t * 2 + k
+        if j < 16 * lpr:
+            hx.prefetch(c["cwkv"] + i64((nt * 16 + j // lpr) * HID + ks * kper) * 2 + i64((j % lpr) * 128))
+
+
+@ASTRewriter.transform
 def stage_cgemm(c, r1):
     """r1: the layer is ratio 1 (runtime bool)."""
     t, b, w, l, MT = c["t"], c["b"], c["w"], c["l"], c["MT"]
