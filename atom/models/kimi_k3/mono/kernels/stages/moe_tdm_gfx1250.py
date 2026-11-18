@@ -1294,8 +1294,14 @@ def build_moe(
                     g_item = n * k_tiles + g_tile
                     g_before = clock()
                     wait_for(g_item)
+                    if const_expr(publish_at >= resident):
+                        if g_tile == publish_at:
+                            rocdl.s_wait_storecnt(0)
                     _lds_barrier()
                     up_wait = up_wait + since(g_before)
+                    if const_expr(publish_at >= resident):  # noqa: SIM102
+                        if (g_tile == publish_at) & (tid == 0) & (pending >= 0):
+                            publish(pending)
                     if g_item + ring - 1 < flat:
                         issue(g_item + ring - 1, (g_item + ring - 1) % ring)
                     g_stage = smem.stages.ptr + (g_item % ring) * (SLOT_BYTES // 4)
