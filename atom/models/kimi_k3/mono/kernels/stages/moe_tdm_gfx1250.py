@@ -525,6 +525,13 @@ def _load_v8(resource, first, second):
     )
 
 
+def _latent_fragment(latent, token, step, lane):
+    """``_activation_fragment`` of the latent in global memory, its rows
+    ``LATENT_WORDS`` apart: a K tile past those the fused MoE holds in LDS."""
+    base = token * LATENT_WORDS + step * 16 + lane // 16 * 4
+    return _load_v8(rsrc(latent), base, base + 8)
+
+
 def _down_loads(c, slot, block, lane):
     """Expert ``slot``'s down weights and scales for rows 16 ``block`` .., and
     its first 16 picks' FP4 intermediates and E8M0 words: what the wave issues
@@ -880,16 +887,33 @@ def _down_share(union, bid, ups, up_units=UP_UNITS):
     return first, last - first, late_first, late_last - late_first
 
 
-def moe_lds_bytes(rows: int, ring: int = RING) -> int:
-    """The fused MoE's LDS at ``rows`` with a ``ring``-item weight ring."""
+def moe_lds_bytes(rows: int, ring: int = RING, resident: int = LATENT // K_TILE) -> int:
+    """The fused MoE's LDS at ``rows`` with a ``ring``-item weight ring and
+    each token's first ``resident`` latent K tiles."""
     return 4 * (
         ring * (SLOT_BYTES // 4 + SCALE_WORDS)
-        + rows * (LATENT_TDM_WORDS + LATENT_SCALES // 4)
+        + rows * (resident * (STEPS * 16 + 1) + LATENT_SCALES // 4)
         + UP_WAVES * GFX1250.wave_size * 8
         + 2 * EXPERTS
-        + 4 * rows * TOPK
+        + 3 * min(rows * TOPK, EXPERTS)
+        + rows * TOPK
         + WAVES
     )
+
+
+def _moe_fit(rows: int, ring: int | None, resident: int | None) -> tuple[int, int]:
+    """The ring and resident latent K tiles a ``rows`` fused MoE runs: four
+    items, as many of every token's latent K tiles as then fit (all seven to
+    48 rows, five at 56..64), the rest read from global memory; a ring of
+    three -- 7% slower at 48 rows -- only when asked."""
+    k_tiles = LATENT // K_TILE
+    if rows < 1:
+        raise ValueError(f"the fused MoE serves 1.. rows, got {rows}")
+    for r in (ring,) if ring else (RING,):
+        for k in (resident,) if resident else range(k_tiles, 3, -1):
+            if moe_lds_bytes(rows, r, k) <= GFX1250.max_workgroup_lds_bytes:
+                return r, k
+    raise ValueError(f"the fused MoE's {rows}-row LDS does not fit")
 
 
 def build_moe(
@@ -898,6 +922,8 @@ def build_moe(
     publish_at: int = 1,
     up_units: int = UP_UNITS,
     rolled: bool | None = None,
+    ring: int | None = None,
+    resident: int | None = None,
 ) -> MoeKernel:
     """The routed experts of ``rows`` tokens in one resident 256-CTA launch,
     with no grid barrier and no queue: every CTA works out the same static,
@@ -924,21 +950,11 @@ def build_moe(
     if rolled is None:
         rolled = envs.ATOM_KIMI_MONO_ROLLED_MOE
     routes = rows * TOPK
-    # Past 48 rows every token's latent and a ring of four do not fit: the
-    # ring is three.
-    ring = next(
-        (
-            r
-            for r in (RING, RING - 1)
-            if moe_lds_bytes(rows, r) <= GFX1250.max_workgroup_lds_bytes
-        ),
-        None,
-    )
-    if rows < 1 or ring is None:
-        raise ValueError(
-            f"the fused MoE's {rows}-row LDS ({moe_lds_bytes(rows, RING - 1)} B)"
-            " does not fit"
-        )
+    # Past 48 rows every token's latent and a ring of four do not fit: a
+    # token's last K tiles are read from global memory (L2), the ring kept.
+    ring, resident = _moe_fit(rows, ring, resident)
+    latq_words = resident * (STEPS * 16 + 1)
+    slots = min(routes, EXPERTS)
     tiles = (rows + 15) // 16
     blocks = UP_BLOCKS
     k_tiles = LATENT // K_TILE
@@ -951,19 +967,21 @@ def build_moe(
     class Lds:
         stages: fx.Array[fx.Int32, ring_words, 16]
         item_scales: fx.Array[fx.Int32, ring * SCALE_WORDS, 16]
-        latq: fx.Array[fx.Int32, rows * LATENT_TDM_WORDS, 16]
+        latq: fx.Array[fx.Int32, rows * latq_words, 16]
         latsc: fx.Array[fx.Int32, rows * LATENT_SCALES // 4, 16]
         red: fx.Array[fx.Float32, UP_WAVES * GFX1250.wave_size * 8, 16]
         count: fx.Array[fx.Int32, EXPERTS, 16]
         slot: fx.Array[fx.Int32, EXPERTS, 16]
-        expert: fx.Array[fx.Int32, routes, 16]
-        start: fx.Array[fx.Int32, routes, 16]
-        picks_n: fx.Array[fx.Int32, routes, 16]
+        expert: fx.Array[fx.Int32, slots, 16]
+        start: fx.Array[fx.Int32, slots, 16]
+        picks_n: fx.Array[fx.Int32, slots, 16]
         picks: fx.Array[fx.Int32, routes, 16]
         scan: fx.Array[fx.Int32, WAVES, 16]
 
     name = (
         f"k3_gfx1250_moe_s{rows}_p{publish_at}_u{up_units}"
+        + (f"_r{ring}" if ring != RING else "")
+        + (f"_k{resident}" if resident != k_tiles else "")
         + ("_rl" if rolled else "")
         + ("_profile" if profile else "")
     )
@@ -1019,7 +1037,7 @@ def build_moe(
                     rows,
                     padded=False,
                     whole=True,
-                    width=LATENT // 4,
+                    width=resident * K_TILE // 4,
                     pad_every=LATENT_PAD_EVERY,
                 )
             if wave == SCALE_ISSUER:
@@ -1219,7 +1237,7 @@ def build_moe(
             ]
             accumulators = [fx.Vector.filled(16, 0.0, fx.Float32) for _ in range(tiles)]
             if const_expr(rolled):
-                for k_tile in range(fx.Int32(0), fx.Int32(k_tiles), unroll=1):
+                for k_tile in range(fx.Int32(0), fx.Int32(resident), unroll=1):
                     k_item = n * k_tiles + k_tile
                     k_before = clock()
                     wait_for(k_item)
@@ -1255,7 +1273,7 @@ def build_moe(
                                         k_weights[step],
                                         _activation_fragment(
                                             k_latq,
-                                            LATENT_TDM_WORDS,
+                                            latq_words,
                                             tokens[m],
                                             k_tile * STEPS + step,
                                             lane,
@@ -1266,6 +1284,52 @@ def build_moe(
                                             lds["latsc"]
                                             + tokens[m] * (LATENT_SCALES // 4)
                                             + k_tile * STEPS
+                                            + step
+                                        ),
+                                    )
+            if const_expr(rolled and resident < k_tiles):
+                for g_tile in range(
+                    fx.Int32(resident), fx.Int32(k_tiles), unroll=1
+                ):
+                    g_item = n * k_tiles + g_tile
+                    g_before = clock()
+                    wait_for(g_item)
+                    _lds_barrier()
+                    up_wait = up_wait + since(g_before)
+                    if g_item + ring - 1 < flat:
+                        issue(g_item + ring - 1, (g_item + ring - 1) % ring)
+                    g_stage = smem.stages.ptr + (g_item % ring) * (SLOT_BYTES // 4)
+                    if wave < UP_WAVES:
+                        g_scale = (
+                            smem.item_scales.ptr
+                            + (g_item % ring) * SCALE_WORDS
+                            + wave * STEPS * 32
+                            + lane
+                        )
+                        g_weights = [
+                            _weight_operand(g_stage, wave, lane, step)
+                            for step in range(STEPS)
+                        ]
+                        g_weight_scales = [
+                            fx.ptr_load(g_scale + step * 32) for step in range(STEPS)
+                        ]
+                        for m in range_constexpr(tiles):
+                            if m == 0 or m * 16 < count:
+                                for step in range_constexpr(STEPS):
+                                    accumulators[m] = _wmma(
+                                        g_weights[step],
+                                        _latent_fragment(
+                                            latent,
+                                            tokens[m],
+                                            g_tile * STEPS + step,
+                                            lane,
+                                        ),
+                                        accumulators[m],
+                                        g_weight_scales[step],
+                                        fx.ptr_load(
+                                            lds["latsc"]
+                                            + tokens[m] * (LATENT_SCALES // 4)
+                                            + g_tile * STEPS
                                             + step
                                         ),
                                     )
@@ -1308,11 +1372,13 @@ def build_moe(
                                     weights[step],
                                     _activation_fragment(
                                         lds["latq"] + k_step * 16 // LATENT_PAD_EVERY,
-                                        LATENT_TDM_WORDS,
+                                        latq_words,
                                         tokens[m],
                                         k_step,
                                         lane,
-                                    ),
+                                    )
+                                    if tile_k < resident
+                                    else _latent_fragment(latent, tokens[m], k_step, lane),
                                     accumulators[m],
                                     weight_scales[step],
                                     fx.ptr_load(
