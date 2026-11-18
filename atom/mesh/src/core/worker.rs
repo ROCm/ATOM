@@ -1002,9 +1002,9 @@ impl WorkerLoadGuard {
     }
 
     /// Also charge `tokens` of prefill to the worker until the guard drops or
-    /// [`Self::release_prefill`] runs.
+    /// [`Self::release_prefill`] runs. Call once, on a new guard.
     pub fn with_prefill_tokens(mut self, tokens: usize) -> Self {
-        self.release_prefill();
+        debug_assert_eq!(self.prefill_tokens, 0, "prefill already charged");
         if tokens > 0 {
             self.worker.charge_prefill_tokens(tokens);
             self.prefill_tokens = tokens;
