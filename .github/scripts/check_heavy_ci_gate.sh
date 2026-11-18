@@ -5,10 +5,10 @@
 # currently has one of CI_GATE_LABELS, or GitHub reports that the PR's current
 # aggregate review decision is APPROVED. Dismissed or superseded reviews must
 # not authorize unrelated heavy CI workflows.
-# Labels and approvals only open the gate: a label event runs heavy CI only
-# when the label it adds is the PR's gate-opening label (see
-# find_allowed_pr_label), and any other label event is a no-op that must not
-# replace the PR's checks.
+# A label event is not a code change; it can only open the gate. It is judged
+# like a code change only when, in its own payload, the label it adds is the
+# PR's gate-opening label (find_allowed_pr_label); any other label event is a
+# no-op that must not replace the PR's checks (check_label_event).
 
 set -euo pipefail
 
@@ -29,19 +29,36 @@ trim() {
   sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
 }
 
-label_is_allowed() {
-  local candidate="$1"
-  local raw_label allowed_label
+# CI_GATE_LABELS in gate-opening priority: their listed order, but with the
+# catch-all ci:full last. Each workflow's concurrency group and gate check
+# name spell out the same order.
+GATE_LABELS=()
+load_gate_labels() {
+  local raw_label label has_full="false"
   local -a raw_labels
 
   IFS=',' read -ra raw_labels <<< "${CI_GATE_LABELS}"
   for raw_label in "${raw_labels[@]}"; do
-    allowed_label="$(printf '%s' "${raw_label}" | trim)"
-    if [ -n "${allowed_label}" ] && [ "${candidate}" = "${allowed_label}" ]; then
+    label="$(printf '%s' "${raw_label}" | trim)"
+    if [ "${label}" = "ci:full" ]; then
+      has_full="true"
+    elif [ -n "${label}" ]; then
+      GATE_LABELS+=("${label}")
+    fi
+  done
+  if [ "${has_full}" = "true" ]; then
+    GATE_LABELS+=("ci:full")
+  fi
+}
+load_gate_labels
+
+label_is_allowed() {
+  local allowed_label
+  for allowed_label in "${GATE_LABELS[@]}"; do
+    if [ "$1" = "${allowed_label}" ]; then
       return 0
     fi
   done
-
   return 1
 }
 
@@ -52,45 +69,27 @@ load_pr_labels() {
   fi
 
   # A rerun replays the original event payload, whose labels may be stale.
-  if [ "${GITHUB_RUN_ATTEMPT:-1}" -gt 1 ]; then
-    if ! PR_LABELS="$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/labels" --jq '.[].name')"; then
-      emit_undecidable "labels-query-failed"
-      exit 0
-    fi
-    return 0
+  if [ "${GITHUB_RUN_ATTEMPT:-1}" -le 1 ]; then
+    PR_LABELS="$(jq -r '.pull_request.labels[]?.name // empty' "${EVENT_PATH}")"
+    [ -z "${PR_LABELS}" ] || return 0
   fi
 
-  PR_LABELS="$(jq -r '.pull_request.labels[]?.name // empty' "${EVENT_PATH}")"
-  if [ -z "${PR_LABELS}" ]; then
-    PR_LABELS="$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/labels" --jq '.[].name' 2>/dev/null || true)"
+  if ! PR_LABELS="$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/labels" --jq '.[].name')"; then
+    emit_undecidable "labels-query-failed"
+    exit 0
   fi
 }
 
-# The PR's gate-opening label: the first of CI_GATE_LABELS, in their listed
-# order but with the catch-all ci:full last, that the PR carries. Each
-# workflow's concurrency group and gate check name spell out the same order.
+# The gate-opening label among the newline-separated labels in $1: the first
+# of GATE_LABELS that they include.
 find_allowed_pr_label() {
-  local raw_label candidate
-  local -a raw_labels candidates=()
-
-  IFS=',' read -ra raw_labels <<< "${CI_GATE_LABELS}"
-  for raw_label in "${raw_labels[@]}"; do
-    candidate="$(printf '%s' "${raw_label}" | trim)"
-    if [ -n "${candidate}" ] && [ "${candidate}" != "ci:full" ]; then
-      candidates+=("${candidate}")
-    fi
-  done
-  if label_is_allowed "ci:full"; then
-    candidates+=("ci:full")
-  fi
-
-  for candidate in "${candidates[@]}"; do
-    if grep -Fxq -- "${candidate}" <<< "${PR_LABELS}"; then
+  local candidate
+  for candidate in "${GATE_LABELS[@]}"; do
+    if grep -Fxq -- "${candidate}" <<< "$1"; then
       printf '%s\n' "${candidate}"
       return 0
     fi
   done
-
   return 1
 }
 
@@ -276,22 +275,35 @@ run_published_pr_check() {
 detect_replaced_pr_run() {
   [ -n "${CI_GATE_PR_CHECK_JOB:-}" ] || return 0
 
-  local run_id conclusion jobs job_count later_ids later_id status
+  local pr_run_ids candidate noop run_id="" conclusion jobs job_count later_ids later_id status
   if ! load_previous_runs; then
     echo "Could not read earlier runs (${PREVIOUS_RUNS_ERROR}); assuming no PR run was replaced."
     return 0
   fi
 
-  run_id="$(jq -r '[.[] | select(.event == "pull_request")] | last | .id // empty' <<< "${PREVIOUS_RUNS}")"
+  # The latest pull_request run of the PR's concurrency group. No-op label
+  # runs are pull_request runs in groups of their own: they never replace or
+  # get replaced, so look past them. Their first job carries CI_GATE_NOOP_JOB
+  # as its name from the start, unlike the gate check, which is named last.
+  pr_run_ids="$(jq -r '[.[] | select(.event == "pull_request") | .id] | reverse | .[]' <<< "${PREVIOUS_RUNS}")"
+  while IFS= read -r candidate; do
+    [ -n "${candidate}" ] || continue
+    if ! jobs="$(query_run_jobs "${candidate}")" \
+      || ! noop="$(jq -r --arg name "${CI_GATE_NOOP_JOB:-}" \
+        '$name != "" and any(.[].jobs[]; .name == $name)' <<< "${jobs}")"; then
+      echo "Could not read jobs of run ${candidate}; assuming no PR run was replaced."
+      return 0
+    fi
+    if [ "${noop}" != "true" ]; then
+      run_id="${candidate}"
+      break
+    fi
+  done <<< "${pr_run_ids}"
   [ -n "${run_id}" ] || return 0
   conclusion="$(jq -r --argjson id "${run_id}" '.[] | select(.id == $id) | .conclusion // empty' <<< "${PREVIOUS_RUNS}")"
   [ "${conclusion}" = "cancelled" ] || return 0
 
-  if ! jobs="$(query_run_jobs "${run_id}")" \
-    || ! job_count="$(jq -r '[.[].jobs[]] | length' <<< "${jobs}")"; then
-    echo "Could not read jobs of run ${run_id}; assuming it was not replaced."
-    return 0
-  fi
+  job_count="$(jq -r '[.[].jobs[]] | length' <<< "${jobs}")"
   # GitHub cancels a queued run without creating its jobs when a newer run
   # takes its place in the concurrency group, so a cancelled run with no jobs
   # never published its PR checks.
@@ -368,59 +380,38 @@ allow_heavy_ci() {
   emit_decision "true" "$@"
 }
 
-# Whether the event's own payload made this label the gate-opening one, i.e.
-# whether the workflow put this run in the PR's group under the real gate name.
-payload_opened_gate() {
-  local live_labels="${PR_LABELS}" opened=1
-  PR_LABELS="$(jq -r '.pull_request.labels[]?.name // empty' "${EVENT_PATH}")"
-  if [ "$(find_allowed_pr_label || true)" = "$1" ]; then
-    opened=0
-  fi
-  PR_LABELS="${live_labels}"
-  return "${opened}"
-}
-
 check_label_event() {
-  # A label is not a code change: it can only open a closed gate. The event
-  # opens it only if the label it adds is the PR's gate-opening label, a rule
-  # that holds when two gate labels are added at once and both payloads carry
-  # both. The workflow's concurrency group mirrors this test so that only that
-  # event can cancel the PR's running work. Adding ci:full and later the
-  # workflow's own label opens the gate twice; that one duplicate is accepted.
+  # The event opens the gate only if, in its own payload, the label it adds is
+  # the PR's gate-opening label. That holds for exactly one of two gate labels
+  # added at once, whose payloads both carry both. The workflow's concurrency
+  # group and gate check name test the same payload, so only that event joins
+  # the PR's group, can cancel its running work and publishes the real gate
+  # check; every other label event is a no-op in a group of its own. Adding
+  # ci:full and later the workflow's own label opens the gate twice; that one
+  # duplicate is accepted.
   #
-  # A rerun is checked the same way against the live labels: a no-op run sits
-  # in its own concurrency group, so heavy CI started there would run beside
-  # the PR's. To retry heavy CI, rerun the run that holds the PR's group (the
+  # A rerun replays the payload, and with it the run's group and gate check
+  # name, so it is decided the same way: a no-op stays a no-op whatever the
+  # live labels say (heavy CI started there would run beside the PR group's),
+  # and a gate-opening run is re-judged like a code-change rerun on the PR's
+  # current state. To retry heavy CI, rerun a run of the PR's group (the
   # code-change or gate-opening run).
-  local added_label opening_label declined=""
+  #
+  # A current approval is deliberately not checked here. The concurrency group
+  # cannot see it, so a gate-opening run may have cancelled the approval's
+  # heavy CI and must take that work over rather than leave the sha without it.
+  local added_label payload_labels opening_label
   added_label="$(jq -r '.label.name // ""' "${EVENT_PATH}")"
   if ! label_is_allowed "${added_label}"; then
     emit_decision "false" "label-not-gating"
     exit 0
   fi
-  # Only a rerun reads live labels, which may no longer include the label.
-  if ! opening_label="$(find_allowed_pr_label)"; then
-    declined="label-removed"
-  elif [ "${added_label}" != "${opening_label}" ]; then
-    declined="gate-already-open"
-  fi
-  [ -n "${declined}" ] || return 0
-  # A rerun replays the original payload, so the workflow still gives a run
-  # that opened the gate the real gate check name and the PR's group. A clean
-  # "not requested" there would publish that required check as passed with no
-  # heavy CI behind it; fail it instead and point at the run to retry.
-  if [ "${GITHUB_RUN_ATTEMPT:-1}" -gt 1 ] && payload_opened_gate "${added_label}"; then
-    echo "This rerun replays a gate-opening label event that live labels no" \
-      "longer back (${declined}); rerun the current code-change or" \
-      "gate-opening run instead."
-    emit_undecidable "superseded-gate-opening-run"
+  payload_labels="$(jq -r '.pull_request.labels[]?.name // empty' "${EVENT_PATH}")"
+  opening_label="$(find_allowed_pr_label "${payload_labels}" || true)"
+  if [ "${added_label}" != "${opening_label}" ]; then
+    emit_decision "false" "gate-already-open" "${opening_label}"
     exit 0
   fi
-  emit_decision "false" "${declined}" "${opening_label}"
-  exit 0
-  # A current approval is deliberately not checked here. The concurrency group
-  # cannot see it, so this run may have cancelled the approval's heavy CI and
-  # must take that work over rather than leave the sha without it.
 }
 
 case "${EVENT_NAME}" in
@@ -491,12 +482,12 @@ fi
 OWNER="${REPO%%/*}"
 NAME="${REPO#*/}"
 
-load_pr_labels
 if [ "${ACTION}" = "labeled" ]; then
   check_label_event
 fi
 
-MATCHED_LABEL="$(find_allowed_pr_label || true)"
+load_pr_labels
+MATCHED_LABEL="$(find_allowed_pr_label "${PR_LABELS}" || true)"
 if [ -n "${MATCHED_LABEL}" ]; then
   allow_heavy_ci "label-present" "${MATCHED_LABEL}"
   exit 0

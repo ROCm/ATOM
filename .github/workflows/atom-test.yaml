@@ -34,7 +34,8 @@ concurrency:
   # Likewise every label event except the one that opens the gate -- adding
   # ci:atom, or ci:full to a PR without ci:atom (check_label_event in the gate
   # script) -- so an unrelated label can never cancel running heavy CI. The
-  # gate job's name repeats this test; keep both in sync with CI_GATE_LABELS.
+  # ci-gate and gate jobs' names repeat this test; keep all three in sync with
+  # CI_GATE_LABELS.
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.pull_request.number && 'pr' || github.event_name }}${{ github.event_name == 'pull_request_review' && github.event.review.state != 'approved' && format('-review-{0}', github.run_id) || '' }}${{ github.event_name == 'pull_request' && github.event.action == 'labeled' && !(github.event.label.name == 'ci:atom' || (github.event.label.name == 'ci:full' && !contains(github.event.pull_request.labels.*.name, 'ci:atom'))) && format('-noop-{0}', github.run_id) || '' }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event_name != 'pull_request_review' }}
 
@@ -48,7 +49,10 @@ env:
 
 jobs:
   ci-gate:
-    name: Check Heavy CI Gate
+    # A no-op label run (the -noop- concurrency group above) is named apart from
+    # its first job on, so an approval can tell it from the PR group's runs
+    # when it looks for a pending run it replaced (CI_GATE_NOOP_JOB).
+    name: ${{ github.event_name == 'pull_request' && github.event.action == 'labeled' && !(github.event.label.name == 'ci:atom' || (github.event.label.name == 'ci:full' && !contains(github.event.pull_request.labels.*.name, 'ci:atom'))) && 'Check Heavy CI Gate (no-op label)' || 'Check Heavy CI Gate' }}
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -69,6 +73,7 @@ jobs:
         env:
           CI_GATE_WORKFLOW: atom-test.yaml
           CI_GATE_PR_CHECK_JOB: Offline inference smoke test
+          CI_GATE_NOOP_JOB: Check Heavy CI Gate (no-op label)
           CI_GATE_LABELS: ci:full,ci:atom
           CI_GATE_PATHS_IGNORE: |
             **/*.md
