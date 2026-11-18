@@ -22,6 +22,7 @@ export SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=atom.plugin.sglang.models
 export OMP_NUM_THREADS=4 AITER_REUSE_IDENTICAL_COMM_GROUPS=1
 export AITER_LOG_LEVEL=WARNING
 export SGLANG_RAGGED_VERIFY_MODE=static
+export SGLANG_DSPARK_USE_GREEDY_DRAFT=1  # temperature-0 workloads; see "Greedy draft" below
 rm -rf /root/.cache/atom/*
 
 python3 -m sglang.launch_server \
@@ -181,10 +182,26 @@ The 40-document runs differ in output length (6.5k-7.5k tokens). Scaled to the s
 is 1.5-2.0% behind native (0.6-1.5% with `SGLANG_DSPARK_USE_GREEDY_DRAFT=1`, see below). Before the chunk change above,
 it was 4.4-4.8% behind on the 40 documents and 3-7% on the shared documents.
 
-`SGLANG_DSPARK_USE_GREEDY_DRAFT=1` makes the draft always take the argmax, as native's draft does, and runs ATOM's
-sharded fused argmax in the draft graph. In a decode round of 4 long requests it cuts the draft step from 1.85 to
-1.46 ms (the round is about 21 ms). It changes the acceptance rule only for sampled requests (temperature > 0);
-greedy requests draft the same tokens up to numerics.
+### Greedy draft (`SGLANG_DSPARK_USE_GREEDY_DRAFT=1`, temperature-0 workloads)
+
+The launch above sets `SGLANG_DSPARK_USE_GREEDY_DRAFT=1` for temperature-0 (greedy) serving: the draft always takes
+the argmax, as native's draft does, and the draft graph runs ATOM's sharded fused argmax (each rank's LM-head shard,
+the ranks exchanging only each row's `(max, id)`) instead of SGLang's Markov chain over all-gathered full-vocab logits.
+In a decode round of 4 long requests it cuts the draft step from 1.85 to 1.46 ms (the round is about 21 ms). Greedy
+requests draft the same tokens up to numerics. Measured on MI308X TP4 (DSpark K=5 + radix, temperature 0, a fresh
+server per session, 4 sessions each way): on 4k-token prompts with 512 output tokens a decode round is 2.7% shorter at
+c1, 1.6% at c8 and 1.0% at c32, which leaves the plugin's round 0.7% / 1.6% / 0.1% above native ATOM's instead of
+3.4% / 3.3% / 1.1%; GSM8K 1319 c32 wall time, acceptance (z = -0.04 against native) and lm_eval GSM8K are unchanged
+within session noise.
+
+Sampled requests (temperature > 0) are not covered by these numbers: with the flag, a sampled request's draft is still
+the argmax and is accepted with the target's probability of that token (native's rule) instead of SGLang's rejection
+sampling against a sampled draft, so its acceptance and outputs differ from SGLang's default and were not measured.
+For workloads with temperature > 0, unset it to keep SGLang's sampled draft. Native ATOM also drafts the argmax by
+default and verifies a sampled request by the target's own draw. Its lossless sampled draft
+(`ATOM_SPEC_LOSSLESS_SAMPLING=1`: the draft samples its block from q and the verify accepts by the probability ratio,
+as one block for DeepSeek-V4.1 since ATOM #2724) is opt-in and has no counterpart in the plugin; with the flag unset, a
+sampled request takes SGLang's own sampled draft and verify instead.
 
 A 598-token request arriving into 31 decoding requests makes the decode round that holds its prefill 146 ms long
 (native: 154 ms; a round without a prefill is 69 ms); a 4096-token one 323 ms (native: 320 ms). A 598-token request that
