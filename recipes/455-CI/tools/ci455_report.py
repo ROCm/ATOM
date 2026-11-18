@@ -234,7 +234,7 @@ def _follow_text(f):
 
 
 LOWLIGHT_COLUMNS = ("Model", "What happened", "Cause", "Fix", "Owner")
-HIGHLIGHT_COLUMNS = ("Model", "What happened", "Owner")
+HIGHLIGHT_COLUMNS = ("Model", "What happened")
 GOOD_NEWS = (4, 5)  # categories of _news: gains, recoveries
 
 
@@ -257,10 +257,10 @@ def lowlights(results, followups=None):
 
 def highlights(results):
     """The rows of the highlights table, one per piece of good news (🟢 a gain,
-    ✅ a recovery): the flag and the short model name, what happened and a
-    blank owner."""
+    ✅ a recovery): the flag and the short model name and what happened. Only
+    the lowlights have an owner column."""
     return [
-        [f"{flag} {who}", what, ""]
+        [f"{flag} {who}", what]
         for category, _, flag, who, what, _ in _news(results)
         if category in GOOD_NEWS
     ]
@@ -353,9 +353,10 @@ def perf_ran(results):
 
 
 def accuracy_row(r, ref):
-    """Model, scenario, previous and current GSM8K (flexible-extract; the
-    previous one dated only when it is not from the `ref` session the column is
-    headed with), the change in points. N/A: GSM8K failed."""
+    """Model, previous and current GSM8K (flexible-extract; the previous one
+    dated only when it is not from the `ref` session the column is headed
+    with), the change in points. N/A: GSM8K failed. No scenario: in a session
+    that measured accuracy only, the performance scenario would only confuse."""
     a = r.acc
     prev = (
         "—"
@@ -373,7 +374,7 @@ def accuracy_row(r, ref):
             if a.delta is None
             else f"{acc_flag(a.delta)} {pts(a.delta)}".strip()
         )
-    return [r.name, LABEL[r.scenario], prev, now, delta]
+    return [r.name, prev, now, delta]
 
 
 def _perf_value(c):
@@ -439,8 +440,8 @@ def _lights_and_results(date, env, results, followups):
     else:
         aref = max((r.acc.prev_date for r in results if r.acc.prev_date), default=None)
         table = [
-            f"| Model | Scenario | {aref or '—'} (GSM8K) | {date} (GSM8K) | Delta |",
-            "|---|---|---|---|---|",
+            f"| Model | {aref or '—'} (GSM8K) | {date} (GSM8K) | Delta |",
+            "|---|---|---|---|",
             *["| " + " | ".join(accuracy_row(r, aref)) + " |" for r in results],
         ]
     return out + [

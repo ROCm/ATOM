@@ -12,10 +12,10 @@
 
 ## Highlights
 
-| Model | What happened | Owner |
-|---|---|---|
-| 🟢 DeepSeek-V4.1-Flash | throughput up 6.8% |  |
-| ✅ Kimi-K3 | recovered from the previous failure |  |
+| Model | What happened |
+|---|---|
+| 🟢 DeepSeek-V4.1-Flash | throughput up 6.8% |
+| ✅ Kimi-K3 | recovered from the previous failure |
 
 ## Results
 

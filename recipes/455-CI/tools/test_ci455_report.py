@@ -257,7 +257,7 @@ def test_one_report_holds_the_lights_results_environment_findings_and_details():
         "\n## Lowlights\n",
         "\n| Model | What happened | Cause | Fix | Owner |",
         "\n## Highlights\n",
-        "\n| Model | What happened | Owner |",
+        "\n| Model | What happened |\n",
         "\n## Results\n",
         "\n| Model | Scenario |",
         "\n## Environment\n",
@@ -303,7 +303,7 @@ def test_the_owner_column_stays_blank_whatever_the_follow_up_says():
     assert row[4] == ""
 
 
-def test_gains_and_recoveries_are_highlights_with_a_blank_owner():
+def test_gains_and_recoveries_are_highlights_without_an_owner_column():
     rows = highlights(
         [
             model("Alpha", **GAINING),
@@ -317,8 +317,8 @@ def test_gains_and_recoveries_are_highlights_with_a_blank_owner():
         ]
     )
     assert rows == [
-        ["🟢 Alpha", "throughput up 4.0%", ""],
-        ["✅ Bravo", "recovered from the previous failure", ""],
+        ["🟢 Alpha", "throughput up 4.0%"],
+        ["✅ Bravo", "recovered from the previous failure"],
     ]
 
 
@@ -759,10 +759,10 @@ def test_an_accuracy_only_session_reports_gsm8k_and_no_performance():
     )
     results = text.split("\n## Results\n\n")[1].split("\n\n")[0].splitlines()
     assert results == [
-        "| Model | Scenario | 2026-11-14 (GSM8K) | 2026-11-18 (GSM8K) | Delta |",
-        "|---|---|---|---|---|",
-        "| Alpha | MLPerf Endpoint | 95.0% | 95.2% | +0.2 pts |",
-        "| Bravo | 8K/1K | 95.0% | 88.0% | 🔴 −7.0 pts |",
+        "| Model | 2026-11-14 (GSM8K) | 2026-11-18 (GSM8K) | Delta |",
+        "|---|---|---|---|",
+        "| Alpha | 95.0% | 95.2% | +0.2 pts |",
+        "| Bravo | 95.0% | 88.0% | 🔴 −7.0 pts |",
     ]
     assert "| 🔴 Bravo | GSM8K down 7.0 points to 88.0% |" in text
     assert "### Performance" not in text and "tok/s/GPU" not in text

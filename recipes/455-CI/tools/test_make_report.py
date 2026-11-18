@@ -382,8 +382,6 @@ def test_a_wednesday_gsm8k_session_reports_accuracy_only(ci):
     )
     main(["--date", "2026-11-18", "--data-dir", str(ci)])
     text = result(ci, "20261118").read_text()
-    assert (
-        "| Model | Scenario | 2026-11-14 (GSM8K) | 2026-11-18 (GSM8K) | Delta |" in text
-    )
-    assert "| Kimi-K3 (2.8T) | MLPerf Endpoint | 95.0% | 88.0% | 🔴 −7.0 pts |" in text
+    assert "| Model | 2026-11-14 (GSM8K) | 2026-11-18 (GSM8K) | Delta |" in text
+    assert "| Kimi-K3 (2.8T) | 95.0% | 88.0% | 🔴 −7.0 pts |" in text
     assert "### Performance" not in text and "tok/s/GPU" not in text

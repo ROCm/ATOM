@@ -614,7 +614,7 @@ recipes/
 
 **一天一个结果文件**：周六两个场景的 8 个模型都写进同一个 `<YYYYMMDD>-result.md`。`make_report.py` 不加 `--scenario` 就会把当天跑过的场景都写进去，不要另起 `-8k1k-result.md` 这样的文件。
 
-**周三只测 GSM8K**：结果里的 Results 是一张 GSM8K 表（上一场、本场、变化），Details 里没有性能表和吞吐趋势图。Lowlights 和 Highlights 的规则不变，周三只会有 GSM8K 的条目。GSM8K 都和上一次测过精度的那场比：周六和上周三比，周三和上周六比。
+**周三只测 GSM8K**：结果里的 Results 是一张 GSM8K 表（Model、上一场、本场、变化），不写 Scenario 列：只测精度时性能场景没有意义，写出来容易误解。Details 里没有性能表和吞吐趋势图。Lowlights 和 Highlights 的规则不变，周三只会有 GSM8K 的条目。GSM8K 都和上一次测过精度的那场比：周六和上周三比，周三和上周六比。
 
 **用英文写**，标题是 `<YYYY-MM-DD> MI455 Workload Weekly Status Report`，不写 `## Summary`，标题下面直接是 Lowlights 和 Highlights，依次是：
 
@@ -643,7 +643,7 @@ recipes/
 | Fix | 说法（§3.7）：需要什么 PR，验证过没有；只有复现文档时链接写成 `reproducer` |
 | Owner | 始终留空，由 user 自己填（例如贴到 Teams 之前）。重新生成会清掉手填的内容 |
 
-**Highlights 只写好消息**：吞吐比上一场高 3% 及以上（🟢），或上一场跑挂、这一场跑通（✅）。三列：Model、What happened、Owner，Owner 同样留空。
+**Highlights 只写好消息**：吞吐比上一场高 3% 及以上（🟢），或上一场跑挂、这一场跑通（✅）。两列：Model、What happened。Owner 列只在 Lowlights 里有，Highlights 不要。
 
 哪一节没有内容就整节不写：没有问题就没有 Lowlights，没有好消息就没有 Highlights。持平、变化不大或第一次有数据的模型两边都不提。
 
@@ -692,10 +692,10 @@ Lowlights 每一行的 Fix 列都要写上说法，不能只报问题。下面�
 
 ## Highlights
 
-| Model | What happened | Owner |
-|---|---|---|
-| 🟢 DeepSeek-V4.1-Flash | throughput up 6.8% |  |
-| ✅ Kimi-K3 | recovered from the previous failure |  |
+| Model | What happened |
+|---|---|
+| 🟢 DeepSeek-V4.1-Flash | throughput up 6.8% |
+| ✅ Kimi-K3 | recovered from the previous failure |
 
 ## Results
 
@@ -725,7 +725,7 @@ Lowlights 每一行的 Fix 列都要写上说法，不能只报问题。下面�
 ……（§5.3）
 ```
 
-- 总表（Results）一个模型一行，依次是 Model、Scenario、上一场、本场、Delta、GSM8K delta。表格下面不加说明文字。
+- 总表（Results）一个模型一行，依次是 Model、Scenario、上一场、本场、Delta、GSM8K delta。表格下面不加说明文字。周三只测精度时是 Model、上一场、本场、Delta 四列，不写 Scenario。
 - 第三、四列是并发 64 的每卡吞吐（口径见 §4.1：endpoint 是输出 token，8K/1K 是输入加输出 token），表头写上一场和本场的日期。上一场取该模型最近一次成功的那一场：例子里 Kimi-K3 上一场（11-07）跑挂了，就和 10-31 那场比，并在格子里注明日期。
 - Delta 只写百分比，例如 `+6.9%`。GSM8K delta 写掉了多少、现在多少，例如 `−4.6 pts (now 88.1%)`；它和上一次测过精度的那场比，周六的格子里因此写着 `(vs <上周三>)`。
 - N/A 表示跑挂、没有值；— 表示没有结果（例如机器挂了没测成，§3.6）；first 表示第一次有数据，没有可比的。
