@@ -263,7 +263,7 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             f":spec={self.num_spec}"
             ":carry=all"
         )
-        return StateTransfer.copy(layout_id, decode_snapshot=self.replayssm)
+        return StateTransfer.copy(layout_id, decode_keep=self._decode_keep())
 
     def sub_pool_specs(self) -> list[SubPoolSpec]:
         """MLA paged KV for the full-attention layers, plus the KDA/GDN

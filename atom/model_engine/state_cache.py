@@ -5,6 +5,11 @@ from typing import Protocol, runtime_checkable
 
 from atom.model_engine.sequence import Sequence
 
+# `StateCache.decode_keep`.
+KEEP_SETTLED = "settled"
+KEEP_SNAPSHOT = "snapshot"
+KEEP_NONE = "none"
+
 
 @runtime_checkable
 class StateCache(Protocol):
@@ -76,9 +81,10 @@ class StateCache(Protocol):
     #: can a copying one, so neither implies the other.
     readable_midstep: bool
 
-    #: Whether a decode boundary past verify step 0 can be kept: the class
-    #: builds the step's image rather than keeping its slot as it stands.
-    decode_snapshot: bool
+    #: What a decode boundary keeps: the slot as it stands, which holds the
+    #: boundary at any verify step (`KEEP_SETTLED`); the step's image, built
+    #: from the slot (`KEEP_SNAPSHOT`); or nothing (`KEEP_NONE`).
+    decode_keep: str
 
     def applies(self, seq: Sequence) -> bool:
         """Whether this class gates or checkpoints anything for `seq`."""

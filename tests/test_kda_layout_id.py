@@ -57,9 +57,8 @@ def builder(
         _state_shape_for_runner=lambda: (shape_k, shape_v),
         _state_dtypes=lambda: (dt_k, dt_v),
     )
-    stub._uses_paged_checkpoints = Builder._uses_paged_checkpoints.__get__(
-        stub, type(stub)
-    )
+    for name in ("_uses_paged_checkpoints", "_decode_keep"):
+        setattr(stub, name, getattr(Builder, name).__get__(stub, type(stub)))
     return stub
 
 
@@ -163,7 +162,16 @@ class TestPagedCheckpointsAreRefusedWhereSizingWouldRaise:
         with tp_world(TP):
             assert not Builder.state_transfer(builder()).readable_midstep
 
-    def test_only_a_replayssm_copy_builds_decode_snapshots(self):
+    @pytest.mark.parametrize(
+        "replayssm, num_spec, keep",
+        [(True, 2, "snapshot"), (False, 2, "none"), (False, 0, "settled")],
+    )
+    def test_a_decode_boundary_keeps_what_the_slot_can_give(
+        self, replayssm, num_spec, keep
+    ):
+        """ReplaySSM rebuilds any verify step; without it MTP leaves none."""
         with tp_world(TP):
-            assert not Builder.state_transfer(builder()).decode_snapshot
-            assert Builder.state_transfer(builder(replayssm=True)).decode_snapshot
+            transfer = Builder.state_transfer(
+                builder(replayssm=replayssm, num_spec=num_spec)
+            )
+        assert transfer.decode_keep == keep

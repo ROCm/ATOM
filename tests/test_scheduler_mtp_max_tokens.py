@@ -339,7 +339,7 @@ class TestDecodeBoundaryFiling:
     """A deferred seq that ran files step 0 of that forward; otherwise its slot
     still holds the window that sampled, so it files that window's last token."""
 
-    def _filed(self, seq_factory, ran, deferred=True):
+    def _filed(self, seq_factory, ran, deferred=True, accepted=4):
         mtp = TestMTPMaxTokens()
         sched = mtp._scheduler()
         seq = mtp._prefill(
@@ -365,8 +365,8 @@ class TestDecodeBoundaryFiling:
             [seq] if ran else [],
             ScheduledBatchOutput(
                 req_ids=[seq.id],
-                token_ids=[(5, 6, 7, 8)],
-                num_rejected=np.asarray([0]),
+                token_ids=[tuple(range(5, 5 + accepted))],
+                num_rejected=np.asarray([sched.mtp_k + 1 - accepted]),
                 num_bonus=np.asarray([0]),
                 draft_token_ids=np.asarray([[20, 21, 22]]),
                 is_deferred_out=deferred,
@@ -374,14 +374,23 @@ class TestDecodeBoundaryFiling:
         )
         return filed, seq.num_finalized_tokens
 
-    def test_a_seq_that_ran_names_step_0_of_that_forward(self, seq_factory):
-        (filed,), n = self._filed(seq_factory, ran=True)
-        assert filed == (n, 0) == (8, 0)
+    @pytest.mark.parametrize("accepted", [1, 2, 3, 4])
+    def test_a_seq_that_ran_names_step_0_of_that_forward(self, seq_factory, accepted):
+        (filed,), n = self._filed(seq_factory, ran=True, accepted=accepted)
+        assert filed == (n, 0) == (4 + accepted, 0)
 
-    def test_a_seq_that_did_not_run_names_its_last_accepted_token(self, seq_factory):
-        (filed,), n = self._filed(seq_factory, ran=False)
-        assert filed == (n - 1, 3) == (7, 3)
+    @pytest.mark.parametrize("accepted", [1, 2, 3, 4])
+    def test_a_seq_that_did_not_run_names_its_last_accepted_token(
+        self, seq_factory, accepted
+    ):
+        (filed,), n = self._filed(seq_factory, ran=False, accepted=accepted)
+        assert filed == (n - 1, accepted - 1) == (3 + accepted, accepted - 1)
 
-    def test_undeferred_output_names_its_last_accepted_token(self, seq_factory):
-        (filed,), n = self._filed(seq_factory, ran=True, deferred=False)
-        assert filed == (n - 1, 3) == (10, 3)
+    @pytest.mark.parametrize("accepted", [1, 2, 3, 4])
+    def test_undeferred_output_names_its_last_accepted_token(
+        self, seq_factory, accepted
+    ):
+        (filed,), n = self._filed(
+            seq_factory, ran=True, deferred=False, accepted=accepted
+        )
+        assert filed == (n - 1, accepted - 1) == (6 + accepted, accepted - 1)

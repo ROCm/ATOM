@@ -35,7 +35,12 @@ from atom.model_engine.page_unit_checkpoint import (
 from atom.model_engine.prefix_hash import full_prompt_blocks
 from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceType
-from atom.model_engine.state_cache import StateCache
+from atom.model_engine.state_cache import (
+    KEEP_NONE,
+    KEEP_SETTLED,
+    KEEP_SNAPSHOT,
+    StateCache,
+)
 from atom.model_engine.state_offload import StateOffloadIndex
 from atom.model_engine.state_pool import StateSlotPool
 from atom.model_engine.state_runtime import (
@@ -2294,14 +2299,15 @@ class TestDecodeBoundaryStep:
         bm.hash_decode_blocks(seq, end, next_forward_tokens=1, snapshot_step=step)
         return seq
 
-    def test_a_snapshot_backend_builds_the_step_in_scratch(self):
+    def _bm(self, keep):
         runtime = StateRuntime(
-            transfer=StateTransfer.copy(
-                PAGED_COPY_SPEC.layout_id, decode_snapshot=True
-            ),
+            transfer=StateTransfer.copy(PAGED_COPY_SPEC.layout_id, decode_keep=keep),
             checkpoint_spec=PAGED_COPY_SPEC,
         )
-        bm = make_block_manager(ckpt_config(), state_runtime=runtime)
+        return make_block_manager(ckpt_config(), state_runtime=runtime)
+
+    def test_a_snapshot_backend_builds_the_step_in_scratch(self):
+        bm = self._bm(KEEP_SNAPSHOT)
         seq = self._decode_to(bm, 3 * BLOCK, step=2)
         (op,) = bm.take_state_maintenance_ops().checkpoint_stores
         assert (op.src_slot, op.step) == (seq.state_slot, 2)
@@ -2310,10 +2316,17 @@ class TestDecodeBoundaryStep:
         bm.complete_previous_state_batch()
         assert bm.state.is_free(op.scratch_slot), "the scratch is lent one batch"
 
-    def test_a_slot_kept_as_it_stands_files_no_later_step(self):
-        """Nor does it spend the spacing on one it cannot keep."""
-        bm = make_block_manager(ckpt_config(), state_runtime=PAGED_COPY_RUNTIME)
+    def test_a_settled_slot_is_copied_as_it_stands(self):
+        bm = self._bm(KEEP_SETTLED)
         seq = self._decode_to(bm, 3 * BLOCK, step=2)
+        (op,) = bm.take_state_maintenance_ops().checkpoint_stores
+        assert (op.src_slot, op.step, op.scratch_slot) == (seq.state_slot, -1, -1)
+
+    @pytest.mark.parametrize("step", [0, 2])
+    def test_a_class_keeping_nothing_files_no_step(self, step):
+        """Nor does it spend the spacing on one it cannot keep."""
+        bm = self._bm(KEEP_NONE)
+        seq = self._decode_to(bm, 3 * BLOCK, step=step)
         assert bm.take_state_maintenance_ops().checkpoint_stores == ()
         assert seq.last_checkpoint_pos == 0
 
@@ -2515,7 +2528,7 @@ class StubStateCache:
         self.successor_room = successor_room
         self.enabled = enabled
         self.readable_midstep = readable_midstep
-        self.decode_snapshot = False
+        self.decode_keep = KEEP_SETTLED
         self._cap = cap
 
     def applies(self, seq):
@@ -4494,7 +4507,7 @@ def test_checkpoint_funnel_includes_second_state_class():
         """Minimal StateCache with checkpoint_fates — mimics a second real class."""
 
         successor_room = 0
-        decode_snapshot = False
+        decode_keep = KEEP_SETTLED
 
         def applies(self, seq):
             return False

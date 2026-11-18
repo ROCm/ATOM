@@ -14,6 +14,7 @@ from aiter.dist.parallel_state import get_tp_group
 
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.scheduler import ScheduledBatch
+from atom.model_engine.state_cache import KEEP_NONE, KEEP_SETTLED, KEEP_SNAPSHOT
 from atom.model_engine.state_runtime import StateTransfer, midstep_checkpoint_targets
 from atom.model_ops.attention_gdn import GatedDeltaNet
 from atom.model_ops.fla_ops.chunk import CHUNK_SIZE
@@ -631,6 +632,14 @@ class GDNStateMixin(PoolRowsMixin):
         """
         return StateTransfer.fork(1, readable_midstep=False)
 
+    def _decode_keep(self) -> str:
+        """`StateTransfer.decode_keep` for a PAGE copy. ReplaySSM's records
+        rebuild any verify step; without them a verify leaves the accepted
+        step's state in its own spec slot and the conv window unrolled."""
+        if self.replayssm:
+            return KEEP_SNAPSHOT
+        return KEEP_NONE if self.num_spec else KEEP_SETTLED
+
     def num_state_layers(self) -> int:
         """Layers holding a recurrent state, one slot each.
 
@@ -669,7 +678,7 @@ class GDNStateMixin(PoolRowsMixin):
         cfg = self.model_runner.config
         # Decode images are built in scratch, which a full batch leaves none of.
         scratch = (
-            self.state_transfer().decode_snapshot
+            self.state_transfer().decode_keep == KEEP_SNAPSHOT
             and cfg.enable_prefix_caching
             and cfg.state_checkpoint_interval_tokens > 0
         )
@@ -1892,7 +1901,7 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             ":carry=all"
         )
         if not envs.ATOM_GDN_STATE_MIDSTEP:
-            return StateTransfer.copy(layout_id, decode_snapshot=self.replayssm)
+            return StateTransfer.copy(layout_id, decode_keep=self._decode_keep())
         from atom.model_ops.fla_ops.chunk import CHUNK_SIZE
 
         # Midstep: positions inside a forward are snapshotted from the chunk
@@ -1904,7 +1913,7 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             readable_midstep=True,
             midstep_grid=CHUNK_SIZE,
             midstep_min_offset=self._conv_state_len(),
-            decode_snapshot=self.replayssm,
+            decode_keep=self._decode_keep(),
         )
 
     def checkpoint_page_unit_bytes(self) -> int | None:

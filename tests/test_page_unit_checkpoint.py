@@ -19,6 +19,7 @@ from atom.model_engine.page_unit_checkpoint import (
     PageUnitCheckpointStore,
     published_page_unit_bytes,
 )
+from atom.model_engine.state_cache import KEEP_SETTLED, KEEP_SNAPSHOT
 from atom.model_engine.state_pool import StateSlotPool
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
     page_pool,
@@ -757,12 +758,12 @@ def test_page_unit_needs_target_page_bytes():
         published_page_unit_bytes(_Builder([state_pool("s", 64, entries_per_req=1)]))
 
 
-def _snapshot_coordinator(free_slots, decode_snapshot=True):
+def _snapshot_coordinator(free_slots, decode_keep=KEEP_SNAPSHOT):
     c = PagedStateCheckpointCoordinator(
         BlockPool(20),
         PagedStateCheckpointSpec(10, 25, "layout-v1", image_bytes=25),
         enabled=True,
-        decode_snapshot=decode_snapshot,
+        decode_keep=decode_keep,
     )
     pool = StateSlotPool(free_slots)
     c.attach_midstep_scratch(pool, 8)
@@ -781,10 +782,10 @@ def test_a_decode_boundary_with_no_scratch_free_is_dropped():
     assert c.checkpoints_dropped == 1
 
 
-@pytest.mark.parametrize("decode_snapshot, step", [(False, 0), (True, -1)])
-def test_a_slot_copied_as_is_borrows_nothing(decode_snapshot, step):
+@pytest.mark.parametrize("decode_keep, step", [(KEEP_SETTLED, 2), (KEEP_SNAPSHOT, -1)])
+def test_a_slot_copied_as_is_borrows_nothing(decode_keep, step):
     """A backend keeping its slot as it stands, or a slot a prefill wrote whole."""
-    c, pool = _snapshot_coordinator(1, decode_snapshot)
+    c, pool = _snapshot_coordinator(1, decode_keep)
     c.checkpoint(_seq(5), 8, 101, step=step)
     stores, _ = c.take_checkpoint_ops()
     assert [(op.src_slot, op.step, op.scratch_slot) for op in stores] == [(5, -1, -1)]

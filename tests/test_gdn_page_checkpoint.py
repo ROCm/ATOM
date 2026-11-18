@@ -81,6 +81,7 @@ def _transfer(monkeypatch, **kwargs):
         _state_shape_for_runner=lambda: (params["shape_k"], params["shape_v"]),
         _state_dtypes=lambda: (params["dtype_k"], params["dtype_v"]),
     )
+    builder._decode_keep = lambda: builder_cls._decode_keep(builder)
     return builder_cls.state_transfer(builder)
 
 
@@ -89,11 +90,24 @@ def _layout(monkeypatch, **kwargs):
 
 
 @pytest.mark.parametrize("midstep", [False, True])
-@pytest.mark.parametrize("replayssm", [False, True])
-def test_only_a_replayssm_copy_builds_decode_snapshots(monkeypatch, replayssm, midstep):
-    transfer = _transfer(monkeypatch, replayssm=replayssm, midstep=midstep)
+@pytest.mark.parametrize(
+    "replayssm, num_spec, keep",
+    [
+        (True, 3, "snapshot"),
+        (True, 0, "snapshot"),
+        (False, 3, "none"),
+        (False, 0, "settled"),
+    ],
+)
+def test_a_decode_boundary_keeps_what_the_slot_can_give(
+    monkeypatch, replayssm, num_spec, keep, midstep
+):
+    """ReplaySSM rebuilds any verify step, MTP or not; without it MTP leaves none."""
+    transfer = _transfer(
+        monkeypatch, replayssm=replayssm, num_spec=num_spec, midstep=midstep
+    )
     assert transfer.readable_midstep is midstep
-    assert transfer.decode_snapshot is replayssm
+    assert transfer.decode_keep == keep
 
 
 @pytest.mark.parametrize(

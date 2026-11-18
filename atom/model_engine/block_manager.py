@@ -36,7 +36,7 @@ from atom.model_engine.prefix_hash import (
     prompt_fingerprint,
 )
 from atom.model_engine.sequence import Sequence
-from atom.model_engine.state_cache import StateCache, StateCheckpointCache
+from atom.model_engine.state_cache import KEEP_NONE, StateCache, StateCheckpointCache
 from atom.model_engine.state_pool import StateSlotPool
 from atom.model_engine.state_runtime import (
     DEFAULT_STATE_RUNTIME,
@@ -397,7 +397,7 @@ class BlockManager:
                 checkpoint_spec,
                 enabled=enabled,
                 readable_midstep=state_runtime.transfer.readable_midstep,
-                decode_snapshot=state_runtime.transfer.decode_snapshot,
+                decode_keep=state_runtime.transfer.decode_keep,
             )
         # The rolling state class: per-request slots plus a content index over
         # the free ones. A checkpoint IS a free slot whose content is still
@@ -3299,8 +3299,8 @@ class BlockManager:
         mid-generation, one that hands nothing over (a retaining SWA pool, 0)
         always does, one that cannot keep a checkpoint at all (`inf`) never
         does, and a request stopping on this step passes 0 and keeps nothing
-        that nothing will ever resume from. A decode boundary past verify step
-        0 (`snapshot_step`) is kept only by a class with `decode_snapshot`.
+        that nothing will ever resume from. A decode boundary (`snapshot_step`
+        >= 0) is kept only by a class whose `decode_keep` is not `KEEP_NONE`.
 
         The position must be exact. A checkpoint holds state as of the forward's
         last token, so a forward that overshoots a rung is ahead of the hash it
@@ -3397,8 +3397,7 @@ class BlockManager:
             if not (aimed and c.readable_midstep)
             and c.applies(seq)
             and next_forward_tokens >= c.successor_room
-            # A slot kept as it stands is trusted only at verify step 0.
-            and (snapshot_step <= 0 or c.decode_snapshot)
+            and (snapshot_step < 0 or c.decode_keep != KEEP_NONE)
         ]
 
     def publish_loaded_prefix(
