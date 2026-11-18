@@ -6,7 +6,8 @@
 - ``StepMeta`` / ``meta_buffers`` / ``target_puts``: the kernels' int32 metadata args and how a step fills them
   (one fused launch, ``prep.fused_puts``);
 - ``GDNPools`` / ``QSAPools``: ATOM's pools a layer reads and writes in place, checked against the geometry;
-- ``draft_rows_error``: the addressing contract of a served draft step.
+- ``draft_rows_error``: the addressing contract of a served draft step;
+- ``draft_attention_fused``: which path the fallback draft's QSA attention takes.
 
 A step has ``rows = batch * spec`` rows; row ``r`` is request ``r // spec`` at offset ``r % spec``. Classic verify
 (the GDN state snapshotted per verify row): with slots ``idx = spec_state_indices [batch, SPEC]`` and ``a`` accepted
@@ -64,6 +65,9 @@ class StepMeta:
     ssm_read: torch.Tensor  # [batch]: the state slot read
     ssm_write: torch.Tensor  # [batch, SPEC]: the state slot after each row
     spec: int = SPEC
+    # [batch]: ATOM's RoPE position of the request's rows minus their cache rows (an image request's MRoPE
+    # offset; 0 for text)
+    rope_off: torch.Tensor | None = None
 
 
 @dataclass
@@ -93,6 +97,7 @@ def meta_buffers(batch: int, spec: int, width: int, io_width: int, device) -> di
         "gdn.ssm_read": torch.zeros(batch, dtype=i32, device=device),
         "gdn.ssm_write": torch.zeros(rows, dtype=i32, device=device),
         "seq_lens": torch.zeros(batch, dtype=i32, device=device),
+        "rope_off": torch.zeros(batch, dtype=i32, device=device),
         "block_table": torch.zeros(batch, width, dtype=i32, device=device),
         "sel": torch.zeros(batch, dtype=i32, device=device),
         "h1_mem": torch.zeros(rows, io_width, dtype=torch.bfloat16, device=device),
@@ -102,9 +107,10 @@ def meta_buffers(batch: int, spec: int, width: int, io_width: int, device) -> di
 
 def target_puts(m: dict, meta: StepMeta) -> list[Put]:
     """A target step's metadata args: the kernels place the step's K / V and index keys at ``seq_lens[b] + s``
-    through the block table (ATOM's ``slot_mapping``)."""
+    through the block table (ATOM's ``slot_mapping``) and rotate them at ``seq_lens[b] + s + rope_off[b]``
+    (ATOM's positions)."""
     bt = meta.block_tables
-    return [
+    puts = [
         Put(m["gdn.conv_slot"], meta.conv_slot),
         Put(m["gdn.conv_off"], meta.conv_off, masked=False),
         Put(m["gdn.ssm_read"], meta.ssm_read),
@@ -118,6 +124,9 @@ def target_puts(m: dict, meta: StepMeta) -> list[Put]:
             stride=bt.stride(0),
         ),
     ]
+    if meta.rope_off is not None:
+        puts.append(Put(m["rope_off"], meta.rope_off, fill=0))
+    return puts
 
 
 @dataclass
@@ -191,7 +200,8 @@ class GDNPools:
 class QSAPools:
     """One QSA layer's paged caches (one block table): ``k``, ``v`` [blocks, bs, kv_heads, head_dim] (bf16, or fp8
     with fp32 ``k_scale`` / ``v_scale`` [blocks, bs, kv_heads]), ``index_raw`` [blocks, bs, 1, index_dim],
-    ``index_cmp`` [blocks, bs / compress, 1, index_dim] (bf16)."""
+    ``index_cmp`` [blocks, bs / compress, 1, index_dim] (bf16), and with a multimodal config the RoPE positions
+    ``rope_positions`` [blocks, bs, 1, 3] (int64)."""
 
     geo: object  # Geometry
     k: torch.Tensor
@@ -200,6 +210,7 @@ class QSAPools:
     index_cmp: torch.Tensor
     k_scale: torch.Tensor | None = None
     v_scale: torch.Tensor | None = None
+    rope_positions: torch.Tensor | None = None
 
     def __post_init__(self):
         g = self.geo
@@ -233,10 +244,32 @@ class QSAPools:
                     raise ValueError(
                         f"fp8 QSA caches need fp32 {name} [{n}, {bs}, {g.kv_heads}]"
                     )
+        p = self.rope_positions
+        if p is not None and (
+            tuple(p.shape) != (n, bs, 1, 3)
+            or p.dtype != torch.int64
+            or not p.is_contiguous()
+        ):
+            raise ValueError(
+                f"unsupported QSA rope_positions cache {tuple(p.shape)} {p.dtype}, want int64 [{n}, {bs}, 1, 3]"
+            )
         if bs % g.index_compress:
             raise ValueError(
                 f"QSA block size {bs} is not a multiple of {g.index_compress}"
             )
+
+
+def draft_attention_fused(
+    meta, is_prefill: bool, rows: int, rope_position_cache
+) -> bool:
+    """Whether the fallback draft's QSA attention takes its fused path (``draft_fallback.attention``): a decode step
+    of one or ``SPEC`` rows a request, with the three-axis RoPE position cache the fused index preparation reads.
+    Otherwise ATOM's module: a prefill, no QSA metadata, another row count, or a text-only pool (no position cache;
+    ATOM's module rebuilds text positions arithmetically)."""
+    if meta is None or is_prefill or rope_position_cache is None:
+        return False
+    requests = meta.block_tables.shape[0]
+    return rows in (requests, SPEC * requests)
 
 
 def draft_rows_error(

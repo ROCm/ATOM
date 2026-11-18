@@ -39,7 +39,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 
 from .op import exp
 
@@ -436,6 +436,18 @@ def _replayssm_commit_kernel(
     prev_flushed = h + 2 * T_MAX > CAP
     base = tl.where(prev_flushed, 0, h)
     tl.store(write_pos + slot, base + tl.load(num_accepted + i_n))
+
+
+def seed_forked_slots(ckpt: torch.Tensor, fork_slots: torch.Tensor | None) -> None:
+    """Copy a state fork's source checkpoint onto its write slot.
+
+    The kernels read and write `slot_idx` only, and a fork's write slot must
+    hold the base its records fold onto. The builder parks that slot's cursor
+    at -1, so nothing is folded over it. `fork_slots` is the builder's int64
+    `[2, F]` (write, source) pairs, so this indexes without a host sync.
+    """
+    if fork_slots is not None:
+        ckpt[fork_slots[0]] = ckpt[fork_slots[1]]
 
 
 def replayssm_commit(
@@ -1342,11 +1354,30 @@ def _serial_launch_config(
     where BV=64 stays best; num_stages is flat either way.
 
     The small-batch rule is gated to gfx950, the only architecture it was
-    measured on. Other targets (gfx942, gfx1250) keep the large-batch config
-    until tests/bench_replayssm_decode.py shows BV=16 winning there too.
+    measured on. The gfx1250 ladder below is gated to the one shape it was
+    measured on; other shapes and gfx942 keep the large-batch config.
     """
     if not is_kda and max_query_len > 1 and N * HV <= 768 and get_gfx() == "gfx950":
         return min(triton.next_power_of_2(V), 16), 1, 3
+    if (
+        not is_kda
+        and HV == 48
+        and V == 128
+        and max_query_len == 4
+        and get_gfx_runtime() == "gfx1250"
+    ):
+        # gfx1250, Qwen3.8 H=16 HV=48 K=V=128 T=4, cold state, CUDA graph,
+        # us at BV=64 -> chosen BV: bs1 9.3 -> 6.6 (BV16), bs4 9.5 -> 8.3
+        # (BV16), bs8 10.5 -> 10.5 (BV64), bs16 20.6 -> 18.7 (BV32), bs48
+        # 49.3 -> 43.7 (BV32), bs128 128.7 -> 113.1 (BV32). num_warps=2 is
+        # slower at every size.
+        if N * HV <= 192:
+            bv = 16
+        elif N * HV <= 384:
+            bv = 64
+        else:
+            bv = 32
+        return min(triton.next_power_of_2(V), bv), 1, 3
     return min(triton.next_power_of_2(V), 64), 1, 3
 
 
@@ -1369,6 +1400,7 @@ def replayssm_gated_delta_rule(
     is_kda: bool = False,
     route: str = "auto",
     o: torch.Tensor | None = None,
+    fork_slots: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """ReplaySSM forward for one linear-attention layer.
 
@@ -1390,6 +1422,8 @@ def replayssm_gated_delta_rule(
         o: optional contiguous ``[T_tot, HV, V]`` destination (e.g. a slice of
             the layer's output buffer); the kernel writes into it directly
             instead of a fresh tensor, saving the caller a device copy.
+        fork_slots: a state fork's (write, source) slot pairs, see
+            :func:`seed_forked_slots`.
 
     Returns:
         ``o`` of shape ``[1, T_tot, HV, V]`` -- same leading-batch convention
@@ -1397,6 +1431,7 @@ def replayssm_gated_delta_rule(
         replacement at the call sites in ``attention_gdn.py``.
     """
     assert q.shape[0] == 1, "varlen layout expected (B == 1)"
+    seed_forked_slots(ckpt, fork_slots)
     _, T_tot, H, K = q.shape
     HV, V = v.shape[2], v.shape[3]
     N = cu_seqlens.numel() - 1
@@ -1778,6 +1813,7 @@ def replayssm_sigmoid_gating_delta_rule(
     scale: float | None = None,
     use_qk_l2norm_in_kernel: bool = False,
     lower_bound: float | None = None,
+    fork_slots: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """ReplaySSM for the KDA (Kimi-K3) linear-attention layer.
 
@@ -1786,9 +1822,11 @@ def replayssm_sigmoid_gating_delta_rule(
     the pool holds one checkpoint per request instead of one state per
     speculative token.  See the module docstring for the algebra.
 
-    ``o`` may be passed to write the output in place (K3 does this).
+    ``o`` may be passed to write the output in place (K3 does this);
+    ``fork_slots`` as in :func:`replayssm_gated_delta_rule`.
     """
     assert q.shape[0] == 1, "varlen layout expected (B == 1)"
+    seed_forked_slots(ckpt, fork_slots)
     _, T_tot, H, K = q.shape
     HV, V = v.shape[2], v.shape[3]
     N = cu_seqlens.numel() - 1

@@ -217,7 +217,7 @@ impl PdExecutor {
                         ProcessingError::new(413, "body_too_large", "executor body limit exceeded")
                     })?;
             if parts.method != http::Method::POST
-                || parts.uri.path() != execution.path
+                || parts.uri.path_and_query().map(|v| v.as_str()).unwrap_or("") != execution.path
                 || blake3::hash(&body) != execution.body_hash
             {
                 return Err(ProcessingError::invalid(
@@ -249,6 +249,7 @@ impl PdExecutor {
                     &parts.headers,
                     body,
                     &execution.metadata,
+                    &execution.path,
                     execution.placement,
                 )
                 .await)

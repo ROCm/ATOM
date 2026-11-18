@@ -20,7 +20,7 @@ Mooncake facts this wrapper is shaped by (v0.3.14):
   work, so a buffer whose key failed that way may still be read or written by
   the NIC. Sooner, a key fails only once every transfer of it has completed or
   failed, or before one was posted (see :func:`buffer_settled`).
-* The data, lookup and remove calls release the GIL; ``setup`` and ``close`` do
+* The data, lookup, remove and ``setup`` calls release the GIL; ``close`` does
   not. A blocked call spins its thread's CPU core until the transfer is done.
 """
 
@@ -31,6 +31,8 @@ import threading
 import time
 from collections import Counter
 from typing import Any
+
+from atom.kv_transfer.offload.kv_store.client import CallRefused
 
 logger = logging.getLogger("atom")
 
@@ -129,14 +131,6 @@ class CallClock:
         return max(time.monotonic() - self._monotonic, time.time() - self._wall)
 
 
-class CallRefused(RuntimeError):
-    """This client refused a call before handing it to Mooncake.
-
-    Nothing was posted, so no transfer can reach the call's buffers or the
-    Store's memory.
-    """
-
-
 def _new_distributed_store() -> Any:
     """A fresh ``MooncakeDistributedStore``; imported here, never at load time."""
     from mooncake.store import MooncakeDistributedStore
@@ -164,7 +158,11 @@ def _new_marker_config(replicas: int) -> Any:
 
 
 class MooncakeStoreClient:
-    """One ``MooncakeDistributedStore`` set up as a pure, zero-copy client."""
+    """One ``MooncakeDistributedStore`` set up as a pure, zero-copy client.
+
+    Implements :class:`~atom.kv_transfer.offload.kv_store.client.KVStoreClient`
+    with Mooncake's own per-key codes, plus ``put_marker`` and ``remove``.
+    """
 
     def __init__(
         self,

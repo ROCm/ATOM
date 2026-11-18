@@ -65,6 +65,12 @@ class ReasoningDialect:
     # output or at a channel other than the answer's own, was the reply,
     # written where reasoning goes; see `ReasoningFilter._close_channel`.
     answer_end_markers: tuple[str, ...] = ()
+    # What opens the answer after `think_end_marker`, in a format that gives
+    # the answer a channel of its own; empty when the answer follows the
+    # closer directly. Kimi-K3's encoder renders every assistant turn as
+    # think, then `<|open|>response<|sep|>`, and opens `response` directly
+    # when thinking is off.
+    answer_open_marker: str = ""
 
     @property
     def end_markers(self) -> tuple[str, ...]:
@@ -132,6 +138,7 @@ _CHANNEL_DIALECT = ReasoningDialect(
     # The answer's closer, which the trained format writes only after
     # `<|open|>response<|sep|>`.
     answer_end_markers=(k3.RESPONSE_END,),
+    answer_open_marker=k3.RESPONSE_START,
     template_efforts=frozenset({"low", "high", "max"}),  # Kimi-K3
     template_markers=(k3.THINK_START, k3.THINK_END),
     content_framing=_CHANNEL_CONTENT_FRAMING,

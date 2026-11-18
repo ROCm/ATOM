@@ -228,7 +228,7 @@ class MarkerScanner:
         found = self._pattern.search(buf, pos)
         if found is not None:
             self._pos = found.end()
-            return Scan(buf[pos : found.start()], found.group())
+            return Scan(buf[pos : found.start()], buf[found.start() : found.end()])
 
         start = max(pos, len(buf) - self._longest + 1)
         cut = len(buf) - _suffix_len(buf[start:], *self._plan)

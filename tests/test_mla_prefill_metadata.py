@@ -111,6 +111,7 @@ def test_sparse_prefill_does_not_read_the_dense_last_page_lens(monkeypatch):
         max_seqlen_q=n_tokens,
         sparse_cu_seqlens_q=sparse_cu_seqlens_q,
         sparse_kv_indptr=torch.arange(n_tokens + 1, dtype=torch.int32),
+        sparse_kv_indices=attn.sparse_kv_indices_buffer,
         sparse_kv_last_page_lens=sparse_kv_last_page_lens,
     )
 

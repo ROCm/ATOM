@@ -17,6 +17,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from .images import NO_FILES_API
 from .reasoning import ReasoningChannel
 from .sse import event_frame
 from .tool_parser import ToolCallStreamParser
@@ -74,6 +75,47 @@ def _block_field(block: dict, key: str) -> Any:
     return value
 
 
+_IMAGES_NOT_HERE = "images are allowed in user messages and tool results only, not in "
+
+
+def _has_image(blocks: Any) -> bool:
+    return isinstance(blocks, list) and any(
+        isinstance(block, dict) and block.get("type") == "image" for block in blocks
+    )
+
+
+def _parts(blocks: list) -> list[dict]:
+    """Text and image blocks as chat content parts, in their order."""
+    parts = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text":
+            parts.append({"type": "text", "text": _block_field(block, "text")})
+        elif block.get("type") == "image":
+            parts.append(_image_part(block))
+    return parts
+
+
+def _image_part(block: dict) -> dict:
+    """An ``image`` block as the chat ``image_url`` part; the server checks it
+    with every other image (``images.check_chat_images``)."""
+    source = block.get("source")
+    kind = source.get("type") if isinstance(source, dict) else None
+    if kind == "base64":
+        media_type, data = source.get("media_type"), source.get("data")
+        if not isinstance(media_type, str) or not isinstance(data, str):
+            raise ValueError("a base64 image source requires media_type and data")
+        url = f"data:{media_type};base64,{data}"
+    elif kind == "url":
+        url = source.get("url")
+    elif kind == "file":
+        raise ValueError(NO_FILES_API)
+    else:
+        raise ValueError("an image block needs a base64 or url source")
+    return {"type": "image_url", "image_url": {"url": url}}
+
+
 def anthropic_to_openai_messages(
     messages: list[AnthropicMessage],
     system: Any | None = None,
@@ -86,6 +128,8 @@ def anthropic_to_openai_messages(
         if isinstance(system, str):
             result.append({"role": "system", "content": system})
         elif isinstance(system, list):
+            if _has_image(system):
+                raise ValueError(_IMAGES_NOT_HERE + "the system prompt")
             text_parts = []
             for b in system:
                 if b.get("type") == "text":
@@ -104,6 +148,8 @@ def anthropic_to_openai_messages(
             if isinstance(content, str):
                 result.append({"role": "assistant", "content": content})
             elif isinstance(content, list):
+                if _has_image(content):
+                    raise ValueError(_IMAGES_NOT_HERE + "assistant messages")
                 text_parts = []
                 reasoning_parts = []
                 tool_calls = []
@@ -147,7 +193,9 @@ def anthropic_to_openai_messages(
                             text_parts.append(_block_field(block, "text"))
                         elif block.get("type") == "tool_result":
                             tool_content = block.get("content", "")
-                            if isinstance(tool_content, list):
+                            if _has_image(tool_content):
+                                tool_content = _parts(tool_content)
+                            elif isinstance(tool_content, list):
                                 tool_content = "\n".join(
                                     b.get("text", "")
                                     for b in tool_content
@@ -157,13 +205,21 @@ def anthropic_to_openai_messages(
                                 {
                                     "role": "tool",
                                     "tool_call_id": _block_field(block, "tool_use_id"),
-                                    "content": str(tool_content),
+                                    "content": (
+                                        tool_content
+                                        if isinstance(tool_content, list)
+                                        else str(tool_content)
+                                    ),
                                 }
                             )
-                if text_parts:
+                if _has_image(content):
+                    result.append({"role": "user", "content": _parts(content)})
+                elif text_parts:
                     result.append({"role": "user", "content": "\n".join(text_parts)})
                 result.extend(tool_results)
         else:
+            if _has_image(content):
+                raise ValueError(_IMAGES_NOT_HERE + f"{role} messages")
             result.append({"role": role, "content": str(content) if content else ""})
 
     return result

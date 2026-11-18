@@ -51,6 +51,12 @@ For other options:
 bash atom/mesh/scripts/ext-proc/test_envoy_atom.sh --help
 ```
 
+Ext-proc parsing and tokenization use the shared request preparation pool,
+configured with the Mesh `--prepare-*` options (see the Mesh README). The legacy
+`--ext-proc-parser-concurrency` and `--ext-proc-max-tokenize-bytes` options are
+still accepted; each applies only when `--prepare-workers` or
+`--prepare-max-tokenize-bytes`, respectively, is unset.
+
 The Envoy template disables automatic request ID generation and preserves client
 request IDs. Keep `generate_request_id: false` and
 `preserve_external_request_id: true` when adapting the configuration so Mesh can
@@ -60,6 +66,13 @@ upstream and returned in the `x-request-id` response header. Header mutations us
 `disallow_is_error: true` so rejected filtering operations fail the request.
 
 ## Send Requests
+
+Chat Completions, Messages and Responses support JSON and SSE through both
+ordinary HTTP and ext-proc. The supplied Envoy wildcard route already covers
+these endpoints; custom path allow-lists must include `/v1/messages` and
+`/v1/responses`. Responses resource operations (`GET`/`DELETE
+/v1/responses/{id}`, `/cancel` and `/input_items`) are only served by the Mesh
+HTTP ingress; through ext-proc they return `501 unsupported_in_ext_proc`.
 
 Non-streaming completion:
 

@@ -206,12 +206,17 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         #     self.physical_expert_start + self.n_local_physical_experts
         # )
 
+        # 512 experts + the merged shared_expert_gate row is N=513, which has
+        # no tuned GEMM row and which FlyDSL hgemm rejects (odd N), so it runs
+        # on a hipBLASLt split-K plus a reduce kernel at decode. Padded to 528
+        # rows, the shape AITER's tuned table can carry FlyDSL rows for.
         self.gate = MergedReplicatedLinear(
             config.hidden_size,
             [config.num_experts, config.n_shared_experts],
             bias=False,
             quant_config=None,
             prefix=f"{prefix}.gate",
+            output_row_alignment=16,
         )
         self.is_rocm_aiter_fusion_shared_expert_enabled = (
             is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(

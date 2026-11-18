@@ -6,8 +6,8 @@ Each kernel's mailbox regions (``scratch_layout`` of its module, the peer
 regions) with the stages that put them; tracing a build (compile-only, no
 launch, no GPU needed with ``ARCH`` set) records its accesses
 (``atom.mono.plan.trace``) and ``atom.mono.plan.check`` holds them to the table.
-A build served from FlyDSL's disk cache is not traced, so the caller disables
-the cache (``FLYDSL_RUNTIME_ENABLE_CACHE=0``).
+FlyDSL traces a build before it looks it up, so a build in its disk cache is
+traced too.
 
 K1, K2a and K2b of a layer share the scratch: their regions of one name are
 told apart by the tag ranges their launches take (``runner.POST_TAG0`` /
@@ -156,8 +156,15 @@ if __name__ == "__main__":
     for s in sizes:
         for feeds_index, fp4 in ((False, False), (True, False), (True, True)):
             check_k1(k1.AttnPreBuild(tokens=s, feeds_index=feeds_index, index_fp4=fp4))
-        for bound, fp4 in ((0, False), (65536, False), (65536, True)):
-            check_k2(k2.LayerPostBuild(tokens=s, index_bound_max=bound, index_fp4=fp4))
+        for bound, fp4, mfma in (
+            (0, False, False),
+            (65536, False, False),
+            (65536, True, False),
+            (65536, True, True),
+        ):
+            check_k2(k2.LayerPostBuild(
+                tokens=s, index_bound_max=bound, index_fp4=fp4, index_mfma=mfma
+            ))  # fmt: skip
         # an FP8 pool: the window row's bytes, the attention's dequant
         check_k1(k1.AttnPreBuild(tokens=s, kv_fp8=True))
         check_k2(k2.LayerPostBuild(

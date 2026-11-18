@@ -8,6 +8,10 @@ selection trees are shared.
 
     kv  [pages, 4 (key % 4), 4 (K chunk), 2 (key // 4 % 2), 16 B]
     ks  [pages, 4 (K chunk), 8 (key)] E8M0
+
+With ``index_mfma``, keys/scales instead use OPUS 64-row groups, addressed
+from the same logical 8-row page IDs. The query and arithmetic stay the same.
+
     iq  [S, HEADS, DIM / 2] E2M1, iqs [S, 4 (K chunk), 16 (head % 16), 4
         (head // 16, padded)] E8M0, iw [S, HEADS] f32
 
@@ -233,6 +237,23 @@ def _keys(c, page, nt):
     l, g = lane % 16, lane // 16
     # 64-bit addresses: a pool past 4 GiB is out of a buffer offset's reach
     page = fx.Int64(page)
+    if const_expr(c["index_mfma"]):
+        # A logical page names eight rows inside a 64-row OPUS group.
+        # Keep this scorer's 16x16x128 operands and query layout: only the
+        # key/scale addresses change, preserving Mono's accumulation order.
+        group = page // 8
+        row = (page % 8) * 8 + fx.Int64((l % 2) * 4)
+        base = a["plane"] + group * 4096 + fx.Int64(g * 1024) + row * 16
+        kv = [fx.Vector(global_load(base + t * 16, 4, nt)) for t in range(4)]
+        scale_base = (
+            a["pscale"] + group * 256 + fx.Int64((g % 2) * 128) + (row % 32) * 4
+        )
+        byte = fx.Int32(g // 2 * 2) + fx.Int32(row // 32)
+        kvs = fx.Int32(0)
+        for t in range_constexpr(4):
+            word = fx.Int32(global_load(scale_base + t * 4))
+            kvs = kvs | (((word >> (byte * 8)) & 255) << (t * 8))
+        return kv, kvs
     kvs = fx.Int32(
         global_load(a["pscale"] + page * PAGE_SCALES + fx.Int64(g * 8 + (l % 2) * 4))
     )

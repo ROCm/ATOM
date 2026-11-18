@@ -244,6 +244,9 @@ class Layer:
                     "v_cache": q.v,
                     "index_raw": q.index_raw,
                     "index_cmp": q.index_cmp,
+                    "rope_positions": (
+                        0 if q.rope_positions is None else q.rope_positions
+                    ),
                 }
             )
             if q.k_scale is not None:
@@ -252,6 +255,7 @@ class Layer:
                 {
                     "block_table": m["block_table"],
                     "seq_lens": m["seq_lens"],
+                    "rope_off": m["rope_off"],
                     "sel": m["sel"],
                 }
             )
@@ -346,7 +350,7 @@ class TargetRunner:
                     len(self.layers), BATCHES, self.width, sorted(self.kernels.served))  # fmt: skip
 
     def step_meta(
-        self, input_ids, intermediate_tensors, inputs_embeds
+        self, input_ids, positions, intermediate_tensors, inputs_embeds
     ) -> StepMeta | None:
         """The step's metadata if Mono serves it (the embedding already written into ``io[1]``), else None."""
         if intermediate_tensors is not None or inputs_embeds is not None:
@@ -366,9 +370,9 @@ class TargetRunner:
         idx_in = gdn.spec_state_indices_in_tensor
         idx_in = idx if idx_in is None else idx_in[:batch]
         inner = self.model.model
-        valid, prev, slot, ssm_read = self.prep(input_ids[:rows], inner.embed_tokens.weight, self.io[1][:rows],
-                                                gdn.num_accepted_tokens, idx, idx_in, batch, inner.hc_count,
-                                                md.slot_mapping, SPEC)  # fmt: skip
+        valid, prev, slot, ssm_read, rope_off = self.prep(
+            input_ids[:rows], inner.embed_tokens.weight, self.io[1][:rows], gdn.num_accepted_tokens, idx, idx_in,
+            batch, inner.hc_count, md.slot_mapping, SPEC, positions, md.context_lens)  # fmt: skip
         return StepMeta(
             batch,
             valid,
@@ -378,6 +382,7 @@ class TargetRunner:
             prev,
             ssm_read,
             idx,
+            rope_off=rope_off,
         )
 
     def _pools(self, i: int, caches):
@@ -392,7 +397,7 @@ class TargetRunner:
         q = self._qsa_layers.get(i)
         if q is not None:
             return QSAPools(self.geo, q.k_cache, q.v_cache, q.raw_key_cache, q.compressed_key_cache,
-                            q.k_scale_cache, q.v_scale_cache)  # fmt: skip
+                            q.k_scale_cache, q.v_scale_cache, rope_positions=q.rope_position_cache)  # fmt: skip
         raise NotImplementedError(
             f"Qwen mono: layer {i} pools (GDN and QSA layers are wired)"
         )

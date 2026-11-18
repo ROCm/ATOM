@@ -56,18 +56,6 @@ def pack_routed_rows(
     return rows if x_scale is None else (*rows, x_scale)
 
 
-_CARRIERS = {4: torch.float32, 2: torch.bfloat16, 1: torch.bfloat16}
-
-
-def gather_rows(gather, rows):
-    """`gather(list of tensors) -> list of tensors` over `rows`, each carried
-    as the float dtype of its byte width (int32 ids as fp32; fp8 / e8m0 byte
-    pairs as bf16, so a one-byte row's width must be even): a gather moves
-    bytes, but PyNCCL and the custom all-gather take float dtypes only."""
-    gathered = gather([t.view(_CARRIERS[t.element_size()]) for t in rows])
-    return tuple(g.view(t.dtype) for g, t in zip(gathered, rows))
-
-
 def resolve_routed_rows_wire(
     in_dtype: torch.dtype,
     hidden_dim: int,

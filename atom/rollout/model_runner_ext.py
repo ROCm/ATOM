@@ -45,6 +45,8 @@ class RLHFModelRunner(
     DP_DEVICE_MAP_ENV = "VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER"
 
     def __init__(self, rank: int, config):
+        if config.sequence_parallel_size > 1:
+            raise ValueError("RLHF rollout does not support Ulysses SP (-sp).")
         # 0 -- the default -- means "this checkpoint's vocabulary is not
         # padded", which is the right answer for almost every model and costs
         # one comparison per step.

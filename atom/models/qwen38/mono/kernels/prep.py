@@ -6,8 +6,10 @@
 input buffer, repeated into every residual stream, and the step's derived GDN metadata as contiguous int32 buffers.
 Per request ``b`` (``idx = spec_state_indices [batch, spec]``, ``a = num_accepted_tokens``): ``valid[b] = idx[b, 0] >= 0
 and slot_mapping[b * spec] >= 0`` (a capture's rows carry PAD_SLOT_ID: nothing written), ``prev[b] = max(a[b] - 1,
-0)``, ``slot[b] = idx[b, 0]``, ``ssm_read[b] = idx_in[b, prev[b]]``. Per row ``r``: ``out[r, s * H + c] = embed[ids[r],
-c]`` for every stream ``s`` (the rows of ``embed(ids).repeat(1, streams)``, bit for bit).
+0)``, ``slot[b] = idx[b, 0]``, ``ssm_read[b] = idx_in[b, prev[b]]``, ``rope_off[b] = positions[b * spec] -
+(context_lens[b] - spec)`` (ATOM's RoPE position of the request's first row minus its cache row: an image request's
+MRoPE offset, 0 for text and for an invalid request). Per row ``r``: ``out[r, s * H + c] = embed[ids[r], c]`` for every
+stream ``s`` (the rows of ``embed(ids).repeat(1, streams)``, bit for bit).
 
 ``fused_puts``: the target step's metadata args (``step_meta.target_puts``) and every kind's step counter in one launch.
 A put is ``dst[i] = (valid[i // group] if masked else True) ? src[i // inner * stride + i % inner] - sub : fill`` for
@@ -21,6 +23,7 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.models.qwen38.mono.kernels.geometry import ROPE_OFFSET
 from atom.models.qwen38.mono.step_meta import Put
 
 
@@ -41,6 +44,9 @@ def _prep_kernel(
     slot,
     ssm_read,
     slots,
+    pos,
+    ctx,
+    rope_off,
     spec,
     rows,
     batch,
@@ -66,7 +72,13 @@ def _prep_kernel(
         s0 = tl.load(idx + b * idx_stride, mask=m, other=-1)
         sr = tl.load(idx_in + b * idx_in_stride + p, mask=m, other=-1)
         sm = tl.load(slots + b * spec, mask=m, other=-1)
-        tl.store(valid + b, (s0 >= 0) & (sm >= 0), mask=m)
+        ok = (s0 >= 0) & (sm >= 0)
+        # ATOM's position of the request's first row minus its cache row (context - spec)
+        p0 = tl.load(pos + b * spec, mask=m, other=0)
+        cl = tl.load(ctx + b, mask=m, other=0)
+        off = tl.where(ok, p0 - (cl.to(tl.int64) - spec), 0)
+        tl.store(rope_off + b, off.to(tl.int32), mask=m)
+        tl.store(valid + b, ok, mask=m)
         tl.store(prev + b, p.to(tl.int32), mask=m)
         tl.store(slot + b, s0.to(tl.int32), mask=m)
         tl.store(ssm_read + b, sr.to(tl.int32), mask=m)
@@ -81,6 +93,7 @@ class VerifyPrep:
         self.prev = torch.zeros(max_batch, dtype=i32, device=device)
         self.slot = torch.zeros(max_batch, dtype=i32, device=device)
         self.ssm_read = torch.zeros(max_batch, dtype=i32, device=device)
+        self.rope_off = torch.zeros(max_batch, dtype=i32, device=device)
 
     def __call__(
         self,
@@ -94,15 +107,21 @@ class VerifyPrep:
         streams: int,
         slot_mapping,
         spec: int,
+        positions,
+        context_lens,
     ):
         rows, h = ids.numel(), emb.shape[1]
+        # (MRoPE positions are [3, N]: a text row's three are equal, and the step's rows are text)
+        pos = positions[0] if positions.dim() == 2 else positions
+        assert pos.stride(-1) == 1
         assert out.stride(1) == 1 and emb.stride(1) == 1 and out.shape[1] == streams * h
         assert (
             idx.stride(1) == 1 and idx_in.stride(1) == 1 and batch <= self.valid.numel()
         )
         _prep_kernel[(rows + 1,)](
             ids, emb, emb.stride(0), out, out.stride(0), accepted, idx, idx.stride(0), idx_in, idx_in.stride(0),
-            self.valid, self.prev, self.slot, self.ssm_read, slot_mapping, spec, rows, batch,
+            self.valid, self.prev, self.slot, self.ssm_read, slot_mapping, pos, context_lens, self.rope_off,
+            spec, rows, batch,
             H=h, STREAMS=streams, BLOCK=1024, BB=max(2, triton.next_power_of_2(batch)),
         )  # fmt: skip
         return (
@@ -110,6 +129,7 @@ class VerifyPrep:
             self.prev[:batch],
             self.slot[:batch],
             self.ssm_read[:batch],
+            self.rope_off[:batch],
         )
 
 
@@ -256,12 +276,15 @@ def _draft_meta_kernel(
     bt,
     bt_stride,
     sel_src,
+    rope_pos,
     seq_lens,
     block_table,
     sel,
+    rope_off,
     counter,
     width,
     spec,
+    shift,
     HAS_SEL: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -275,6 +298,8 @@ def _draft_meta_kernel(
     tl.store(block_table + b * width + j, tl.where(ok, v, -1).to(tl.int32), mask=m)
     if c == 0:
         tl.store(seq_lens + b, tl.where(ok, first, 0).to(tl.int32))
+        off = tl.load(rope_pos + b * spec) - first - shift
+        tl.store(rope_off + b, tl.where(ok, off, 0).to(tl.int32))
         if HAS_SEL:
             tl.store(sel + b, tl.load(sel_src + b).to(tl.int32))
         if b == 0:
@@ -282,17 +307,21 @@ def _draft_meta_kernel(
 
 
 def draft_meta(
-    m: dict, counters: list, pos, slots, bt, select, batch: int, spec: int
+    m: dict, counters: list, pos, slots, bt, select, rope_pos, batch: int, spec: int
 ) -> None:
     """The MTP drafter's step metadata into ``m`` (``runner.Kernels.begin_step_buffers``) and its step counter + 1, in
     one launch: ``seq_lens[b]`` = request ``b``'s first cache position, its block-table row, ``sel`` (the first step's
-    selected rows); a request whose first row is padding (position or slot -1) gets 0 / -1, so the kernels touch no
-    pool for it."""
+    selected rows), ``rope_off[b]`` = the drafter's RoPE position of that row (``rope_pos``) minus the cache
+    position and ``ROPE_OFFSET["mtp"]`` (an image request's MRoPE offset, 0 for text); a request whose first row is
+    padding (position or slot -1) gets 0 / -1 / 0, so the kernels touch no pool."""
     assert len(counters) == 1, "one program kind (mtp)"
     width = m["block_table"].shape[1]
     assert bt.shape[1] == width and bt.stride(1) == 1
+    # (MRoPE positions are [3, N]: a text row's three are equal, and the step's rows are text)
+    rope = rope_pos[0] if rope_pos.dim() == 2 else rope_pos
+    assert rope.stride(-1) == 1
     block = 1024
     _draft_meta_kernel[(batch, triton.cdiv(width, block))](
-        pos, slots, bt, bt.stride(0), select if select is not None else pos, m["seq_lens"], m["block_table"], m["sel"],
-        counters[0], width, spec, HAS_SEL=select is not None, BLOCK=block,
+        pos, slots, bt, bt.stride(0), select if select is not None else pos, rope, m["seq_lens"], m["block_table"],
+        m["sel"], m["rope_off"], counters[0], width, spec, ROPE_OFFSET["mtp"], HAS_SEL=select is not None, BLOCK=block,
     )  # fmt: skip
