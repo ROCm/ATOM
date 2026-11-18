@@ -1080,47 +1080,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                 ),
             )
         if local.replicated_finalize:
-            tail = getattr(local, "tail", None)
-            if tail is not None and gathered is not None:
-                tail.launcher(
-                    buffers["reduce"].data_ptr(),
-                    *[t.data_ptr() for t in gathered],
-                    weight.ln_w.data_ptr(),
-                    weight.w_up_full.data_ptr(),
-                    buffers["final"].data_ptr(),
-                    self.k2_tail_flags.data_ptr(),
-                    self.k2_peers.peers.data_ptr(),
-                    self.k2_peers.epochs.data_ptr(),
-                    self.rank,
-                    stream=stream,
-                )
-                return prefix, buffers["final"]
-            if local.allreduce is not None:
-                local.allreduce.launcher(
-                    buffers["reduce"].data_ptr(),
-                    *([] if gathered is None else [t.data_ptr() for t in gathered]),
-                    self.k2_peers.peers.data_ptr(),
-                    self.k2_peers.epochs.data_ptr(),
-                    self.rank,
-                    stream=stream,
-                )
-                reduced = buffers["reduce"]
-            else:
-                reduced = get_tp_group().all_reduce(
-                    buffers["reduce"], ca_fp8_quant=False
-                )
-            if reduced is None:
-                reduced = buffers["reduce"]
-            rows = buffers["routed"].size(0)
-            routed = moe.routed_expert_norm(reduced[: rows * LATENT].view(rows, LATENT))
-            local.finalize.launcher(
-                routed.data_ptr(),
-                reduced[rows * LATENT :].data_ptr(),
-                weight.w_up_full.data_ptr(),
-                buffers["final"].data_ptr(),
-                stream=stream,
-            )
-            return prefix, buffers["final"]
+            return prefix, self._replicated_tail(weight, local, moe, gathered, stream)
         routed = get_tp_group().all_reduce(buffers["routed"], ca_fp8_quant=False)
         if routed is None:
             routed = buffers["routed"]
@@ -1137,6 +1097,51 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         )
         final = get_tp_group().all_reduce(buffers["final"], ca_fp8_quant=False)
         return prefix, buffers["final"] if final is None else final
+
+    def _replicated_tail(self, weight, local, moe, gathered, stream):
+        """K2's all-reduce, routed norm and replicated finalize into
+        ``final``: the fused tail where built and the all-reduce gathers
+        ``gathered``, else the three launches."""
+        buffers = local.buffers
+        tail = getattr(local, "tail", None)
+        if tail is not None and gathered is not None:
+            tail.launcher(
+                buffers["reduce"].data_ptr(),
+                *[t.data_ptr() for t in gathered],
+                weight.ln_w.data_ptr(),
+                weight.w_up_full.data_ptr(),
+                buffers["final"].data_ptr(),
+                self.k2_tail_flags.data_ptr(),
+                self.k2_peers.peers.data_ptr(),
+                self.k2_peers.epochs.data_ptr(),
+                self.rank,
+                stream=stream,
+            )
+            return buffers["final"]
+        if local.allreduce is not None:
+            local.allreduce.launcher(
+                buffers["reduce"].data_ptr(),
+                *([] if gathered is None else [t.data_ptr() for t in gathered]),
+                self.k2_peers.peers.data_ptr(),
+                self.k2_peers.epochs.data_ptr(),
+                self.rank,
+                stream=stream,
+            )
+            reduced = buffers["reduce"]
+        else:
+            reduced = get_tp_group().all_reduce(buffers["reduce"], ca_fp8_quant=False)
+        if reduced is None:
+            reduced = buffers["reduce"]
+        rows = buffers["routed"].size(0)
+        routed = moe.routed_expert_norm(reduced[: rows * LATENT].view(rows, LATENT))
+        local.finalize.launcher(
+            routed.data_ptr(),
+            reduced[rows * LATENT :].data_ptr(),
+            weight.w_up_full.data_ptr(),
+            buffers["final"].data_ptr(),
+            stream=stream,
+        )
+        return buffers["final"]
 
     def _sharded_front(self, plan, weight, local, attn_out, prefix, blocks, x):
         """This rank's router/latent rows and the packed all-gather of them."""

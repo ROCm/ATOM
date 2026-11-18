@@ -93,3 +93,75 @@ def test_a_profile_tail_takes_a_share_a_cta():
 def test_flags_hold_a_word_a_cta_and_the_profile_stamps():
     assert tail.tail_flag_words() == ar.MAX_CTAS
     assert tail.tail_flag_words(profile=True) == ar.MAX_CTAS * (1 + tail.STAMPS)
+    # a bounded build's give-up mark sits past every CTA's flag and stamps
+    assert tail.GAVE_UP_WORD == tail.tail_flag_words(profile=True)
+    assert tail.tail_flag_words(bounded=True) == tail.GAVE_UP_WORD + 1
+    assert tail.tail_flag_words(True, bounded=True) == tail.GAVE_UP_WORD + 1
+
+
+def test_split_waves_push_and_reduce_every_line_of_the_cta_once():
+    assert tail.PUSH_WAVES * 2 == tail.WAVES
+    pushed = sorted(
+        t + k * tail.PUSH_THREADS
+        for t in range(tail.PUSH_THREADS)
+        for k in range(tail.SPLIT_LINES)
+    )
+    reduced = sorted(
+        line
+        for tid in range(tail.PUSH_THREADS, ar.THREADS)
+        for line in tail._split_lines({"tid": tid})
+    )
+    assert pushed == reduced == list(range(ar.THREADS))
+
+
+@pytest.mark.parametrize("rows", range(1, tail.tail_line_rows() + 1))
+def test_split_lds_holds_the_lines_and_gains_inside_the_token_slabs(rows):
+    layout = tail.tail_layout(rows, split=True)
+    assert layout.words * 4 <= GFX1250.max_workgroup_lds_bytes
+    weights = layout.gemv + layout.tokens * rows * TDM_ROW_STRIDE // 2
+    assert tail.SPLIT_AR_WORDS <= weights
+    assert tail.SPLIT_AR_WORDS == (
+        tail.AR_WORDS + ar.THREADS * ar.LINE_WORDS + ar.THREADS * ar.LINE7_ELEMENTS
+    )
+    # the split's scratch moves nothing at the widths it fits beside
+    plain = tail.tail_layout(rows)
+    if tail.SPLIT_AR_WORDS <= plain.gemv + plain.tokens * rows * TDM_ROW_STRIDE // 2:
+        assert layout == plain
+
+
+def test_split_and_bounded_builds_are_named_apart(monkeypatch):
+    plain = tail.build_k2_tail(4, 20, 1e-5, identity_routes=True, split=False)
+    split = tail.build_k2_tail(4, 20, 1e-5, identity_routes=True, split=True)
+    bounded = tail.build_k2_tail(4, 20, 1e-5, split=True, poll_bound=1 << 22)
+    assert "_sw" not in plain.name and split.name == plain.name + "_sw"
+    assert bounded.name.endswith(f"_sw_b{1 << 22}")
+    monkeypatch.setenv("ATOM_KIMI_MONO_TAIL_SPLIT", "1")
+    assert tail.build_k2_tail(4, 20, 1e-5, identity_routes=True).name == split.name
+
+
+def test_split_waves_refuse_rounds_and_the_switch_skips_them(monkeypatch):
+    wide = tail.tail_line_rows() + 1
+    assert tail.tail_rounds(wide) > 1
+    with pytest.raises(ValueError, match="split waves take a share a CTA"):
+        tail.build_k2_tail(4, wide, 1e-5, identity_routes=True, split=True)
+    monkeypatch.setenv("ATOM_KIMI_MONO_TAIL_SPLIT", "1")
+    plain = tail.build_k2_tail(4, wide, 1e-5, identity_routes=True, split=False)
+    assert tail.build_k2_tail(4, wide, 1e-5, identity_routes=True).name == plain.name
+
+
+def test_tail_defaults_on(monkeypatch):
+    from atom.utils import envs
+
+    monkeypatch.delenv("ATOM_KIMI_MONO_TAIL", raising=False)
+    assert envs.ATOM_KIMI_MONO_TAIL is True
+    monkeypatch.setenv("ATOM_KIMI_MONO_TAIL", "0")
+    assert envs.ATOM_KIMI_MONO_TAIL is False
+
+
+def test_split_switch_defaults_off(monkeypatch):
+    from atom.utils import envs
+
+    monkeypatch.delenv("ATOM_KIMI_MONO_TAIL_SPLIT", raising=False)
+    assert envs.ATOM_KIMI_MONO_TAIL_SPLIT is False
+    monkeypatch.setenv("ATOM_KIMI_MONO_TAIL_SPLIT", "1")
+    assert envs.ATOM_KIMI_MONO_TAIL_SPLIT is True
