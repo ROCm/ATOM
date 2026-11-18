@@ -150,6 +150,8 @@ def _scheduler(monkeypatch, *, chunks, replay=REPLAY, min_load=0):
     config = with_min_load(
         SimpleNamespace(
             kv_cache_block_size=4,
+            decode_context_parallel_size=1,
+            dcp_config=SimpleNamespace(interleave_size=1),
             kv_transfer_config={
                 "kv_role": "offload",
                 "kv_connector_extra_config": {"lmcache.chunk_size": CHUNK},

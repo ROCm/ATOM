@@ -765,6 +765,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the Markov head is built, so it must be set before the server starts.
     # Once ATOM_SPEC_LOSSLESS_SAMPLING arms, Kimi-K3 honours this only on steps
     # that replay the greedy block (no row draws q).
+    # On DeepSeek-V4.1 under TP, "0" also has the sampled block gather the
+    # logits rather than keep the LM head sharded.
     "ATOM_DSPARK_FUSED_MARKOV_SAMPLE": lambda: (
         os.getenv("ATOM_DSPARK_FUSED_MARKOV_SAMPLE", "1") == "1"
     ),

@@ -142,6 +142,10 @@ class SingleStepModel(CheckModel, StepOverrideModel, nn.Module):
 
 def install_single_step(model: nn.Module, atom_config, drafter) -> nn.Module:
     why = refusal(atom_config)
+    if why is None and drafter is not None and drafter.lossless is not None:
+        # The step drafts and verifies inside the kernel, without the q the
+        # ratio verify of a step it does not serve would read.
+        why = "lossless speculative sampling (the kernel's draft publishes no q)"
     if why is not None:
         logger.info("V4.1 single-launch step off: %s", why)
         return model

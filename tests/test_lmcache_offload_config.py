@@ -23,6 +23,7 @@ def _config():
         kv_cache_block_size=256,
         tensor_parallel_size=4,
         decode_context_parallel_size=2,
+        dcp_config=SimpleNamespace(interleave_size=1),
         speculative_config=SimpleNamespace(
             method="mtp",
             num_speculative_tokens=3,
@@ -593,6 +594,7 @@ def test_bf16_v41_keeps_the_namespace_hybrid_gave_it(monkeypatch):
 
 @pytest.mark.parametrize("kv_dtype", ["bf16", "fp8", "fp4"])
 def test_v41_persistent_keys_include_the_page_format(monkeypatch, kv_dtype):
+    from atom.kv_transfer.offload.kv_store import keys as store_keys
     from atom.kv_transfer.offload.mooncake_store import keys
     from atom.kv_transfer.offload.mp import deployment
 
@@ -606,7 +608,7 @@ def test_v41_persistent_keys_include_the_page_format(monkeypatch, kv_dtype):
         legacy.setattr(offcfg, "select_offload_layout", lambda _: "hybrid")
         legacy_page = offcfg.build_page_namespace(config, cfg, world_size)
     monkeypatch.setattr(offcfg, "build_lmcache_config", lambda _: cfg)
-    monkeypatch.setattr(keys, "kv_storage_formats", lambda _: {"gfx": "gfx950"})
+    monkeypatch.setattr(store_keys, "kv_storage_formats", lambda _: {"gfx": "gfx950"})
 
     def namespaces():
         page = offcfg.build_page_namespace(config, cfg, world_size)

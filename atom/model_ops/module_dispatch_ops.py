@@ -241,8 +241,11 @@ def tbo_all_reduce(x: torch.Tensor) -> torch.Tensor:
         return x
 
     # Out-of-place all_reduce on this ubatch's dedicated communicator, on the
-    # comm stream, overlapping the partner ubatch's compute.
-    return tbo_on_comm(lambda: ub_comm.all_reduce(x, stream=tbo_get_comm_stream()))
+    # comm stream, overlapping the partner ubatch's compute. Not held: see
+    # `tbo_on_comm`.
+    return tbo_on_comm(
+        lambda: ub_comm.all_reduce(x, stream=tbo_get_comm_stream()), hold=False
+    )
 
 
 def _tbo_all_reduce_fake(x: torch.Tensor) -> torch.Tensor:
