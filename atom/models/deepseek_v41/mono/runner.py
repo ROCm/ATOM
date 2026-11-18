@@ -35,6 +35,7 @@ from atom.model_ops.v4_kernels.paged_decode import LOG2E
 from atom.models.deepseek_v41.config import AttentionMode
 from atom.models.deepseek_v41.dspark import DeepseekV41DSpark
 from atom.models.deepseek_v41.mono import index_plan as ip
+from atom.models.deepseek_v41.mono import index_tp_plan as itp
 from atom.models.deepseek_v41.mono.check import (
     check_front,
     check_index_projections,
@@ -68,6 +69,7 @@ from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
 from atom.mono.runtime.debug import DIAG_BYTES, given_up_waits, raise_if_given_up
 from atom.mono.runtime.lifecycle import owned_peer_buffer
 from atom.mono.runtime.mailboxes import StepMailboxes
+from atom.mono.runtime.step_begin import FENCE_BYTES
 from atom.mono.runtime.timeline import LayerTimeline
 from atom.mono.runtime.uncached import uncached_bytes
 from atom.mono.runtime.widths import WidthBuilds
@@ -95,6 +97,7 @@ _ROW_BUFFERS = (
     ("qr_scale", 1), ("ring_rel", 0), ("key_meta", 0), ("ilog", 0), ("ibmax", 0),
     ("isel", 0), ("irow", 0), ("icand", 0), ("no_bound", 0), ("iq", 0),
     ("iq_scale", 0), ("iw", 0),
+    ("ix_meta",0),
 )  # fmt: skip
 # the MoE's input: every rank's rows under DP attention (``LayerPostBuild.ep``)
 _MOE_ROW_BUFFERS = ("ffn_normed",)
@@ -120,6 +123,7 @@ class RowsBuild:
     attn_post: object = None
     moe: object = None
     indexer: object = None
+    indexer_local: object = None
 
 
 # the layers whose attention norm has other readers (the compressor, the indexer)
@@ -176,14 +180,23 @@ class V41MonoDecodeRunner:
         group = self._group().cpu_group
         bind_agreed(bind, group)
         plain = plain_layout(self.max_rows, len(self.selecting))
+        ix_world = self._indexer_key(self.max_rows).world
+        ix_peer_bytes = (
+            itp.layout_bytes(itp.peer_layout(self.max_rows, ix_world))
+            if ix_world > 1
+            else 0
+        )
+        ix_plain_bytes = (
+            itp.layout_bytes(itp.plain_layout(self.max_rows)) if ix_world > 1 else 0
+        )
         self.peers, self._finalizer = owned_peer_buffer(
             self,
-            peer_bytes(self.max_rows * self.dp, self.moe_dims),
+            peer_bytes(self.max_rows * self.dp, self.moe_dims) + ix_peer_bytes,
             group,
             self.rank,
             self.moe_dims.ranks,
             self.scratch.device,
-            plain_bytes=sum(n for _, n in plain.values()),
+            plain_bytes=sum(n for _, n in plain.values()) + ix_plain_bytes,
         )
         self._place_index_outputs(plain)
         self._full = {name: getattr(self, name) for name, _ in _ROW_BUFFERS}
@@ -272,6 +285,10 @@ class V41MonoDecodeRunner:
             for spec, block in zip(model.topology, model.layers)
             if block.attn.indexer is not None
         ]
+        self.indexer_has_reindex = any(
+            block.attn.indexer is not None and spec.candidate_source is not None
+            for spec, block in zip(model.topology, model.layers)
+        )
         self._allocate(model.config)
 
     def index_query(self):
@@ -414,6 +431,11 @@ class V41MonoDecodeRunner:
             if self.indexer_apart and self.index_bound_max
             else None
         )
+        indexer_local = (
+            ki.build_indexer(ki.reindex_build(self._indexer_key(s)))
+            if indexer is not None and getattr(self, "indexer_has_reindex", False)
+            else None
+        )
         if self.split_k2:
             key_a, key_b = post_key.halves()
             return RowsBuild(
@@ -422,14 +444,45 @@ class V41MonoDecodeRunner:
                 attn_post=k2a.build_attn_post(key_a),
                 moe=k2b.build_moe(key_b),
                 indexer=indexer,
+                indexer_local=indexer_local,
             )
         return RowsBuild(
-            keys, launchers, layer_post=k2.build_layer_post(post_key), indexer=indexer
+            keys,
+            launchers,
+            layer_post=k2.build_layer_post(post_key),
+            indexer=indexer,
+            indexer_local=indexer_local,
         )
 
     def _indexer_key(self, rows):
+        world = self.tp if self.indexer_apart and self.index_fp4 and self.dp == 1 else 1
+        world = itp.kernel_world(world, rows, self.index_bound_max)
+        peer_offset = (
+            peer_bytes(self.max_rows * self.dp, self.moe_dims) if world > 1 else 0
+        )
+        peer_plain = (
+            (
+                peer_offset
+                + itp.layout_bytes(itp.peer_layout(self.max_rows, world))
+                + FENCE_BYTES
+                + sum(
+                    n
+                    for _, n in plain_layout(
+                        self.max_rows, len(self.selecting)
+                    ).values()
+                )
+            )
+            if world > 1
+            else 0
+        )
         return ki.IndexerBuild(
-            rows, self.index_bound_max, self.index_fp4, self.index_layout == FP4_MFMA
+            rows,
+            self.index_bound_max,
+            self.index_fp4,
+            self.index_layout == FP4_MFMA,
+            world=world,
+            peer_offset=peer_offset,
+            peer_plain=peer_plain,
         )
 
     @staticmethod
@@ -438,6 +491,8 @@ class V41MonoDecodeRunner:
         kernels = [(launcher, k1.ABI) for launcher in build.launchers.values()]
         if build.indexer is not None:
             kernels.append((build.indexer, ki.ABI))
+        if getattr(build, "indexer_local", None) is not None:
+            kernels.append((build.indexer_local, ki.ABI))
         if build.layer_post is not None:
             return kernels + [(build.layer_post, k2.ABI)]
         return kernels + [(build.attn_post, k2a.ABI), (build.moe, k2b.ABI)]
@@ -551,6 +606,35 @@ class V41MonoDecodeRunner:
             if self.indexer_apart and self.index_bound_max
             else None
         )
+        self.local_index_scratch = (
+            uncached_bytes(
+                ki.scratch_bytes(ki.reindex_build(self._indexer_key(s))), dev
+            )
+            if self.index_scratch is not None
+            and getattr(self, "indexer_has_reindex", False)
+            else None
+        )
+        self.ix_meta = torch.empty(s, 4, device=dev, dtype=torch.int32)
+
+    def _index_reset_buffers(self, rows):
+        """Only synchronization flags need clearing between indexer steps."""
+        resets, split_resets = [], []
+        key = self._indexer_key(rows)
+        for build, scratch in (
+            (key, self.index_scratch),
+            (ki.reindex_build(key), self.local_index_scratch),
+        ):
+            if scratch is None:
+                continue
+            for name, (off, size) in ki.scratch_layout(build).items():
+                if name == "ix_rowhist":
+                    split_resets.append(scratch[off : off + size].view(torch.int32))
+                elif (
+                    name in ("qdone", "qready", "isf", "irdy", "ix_fenced")
+                    or "ready" in name
+                ):
+                    resets.append(scratch[off : off + size].view(torch.int32))
+        return tuple(resets), tuple(split_resets)
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         model = self.model
@@ -561,8 +645,7 @@ class V41MonoDecodeRunner:
         rows = input_ids.numel()
         self._use_rows(rows)
         self.mailboxes.begin_step()
-        if self.index_scratch is not None:
-            self.index_scratch.zero_()
+        index_resets, split_index_resets = self._index_reset_buffers(rows)
         hidden = model.embed(input_ids).view(1, rows, -1)
         model.begin_forward(hidden, None)
         # Engram staging's side-stream all-gather spins on CUs until every
@@ -581,6 +664,11 @@ class V41MonoDecodeRunner:
             # The standalone indexer scores every row on this rank. The
             # embedded token-parallel scorer owns only this rank's rows.
             (0, rows) if self.indexer_apart else self._own_rows(rows),
+            index_resets,
+            ix_meta=self.ix_meta if self._indexer_key(rows).world > 1 else None,
+            tp_world=self._indexer_key(rows).world,
+            tp_rank=self.rank,
+            split_reset_buffers=split_index_resets,
         )
         state = SinglePassHCState.from_embeddings(hidden, model.config.hc_mult)
         for spec, block, weights, key in zip(
@@ -857,6 +945,10 @@ class V41MonoDecodeRunner:
         selection = self._selection_args(spec, attn, cache, step)
         selection.pop("iact")
         geometry = cache.geometry
+        local = (
+            spec.candidate_source is not None
+            and getattr(self.build, "indexer_local", None) is not None
+        )
         args = ki.ABI.pack(
             {
                 **selection,
@@ -878,11 +970,17 @@ class V41MonoDecodeRunner:
                     else geometry.page_bytes // geometry.row_bytes
                 ),
                 "main_off": geometry.main_offset(spec.kv_owner),
-                "scratch": p(self.index_scratch),
+                "scratch": p(self.local_index_scratch if local else self.index_scratch),
                 "layer": spec.layer_id,
+                "peers": self.peers.addresses.data_ptr(),
+                "rank": self.rank,
+                "ix_meta": p(self.ix_meta),
+                "step_state": 0,
+                "step_fence": 0,
             }
         )
-        _run_compiled(self.build.indexer, *args, torch.cuda.current_stream())
+        launcher = self.build.indexer_local if local else self.build.indexer
+        _run_compiled(launcher, *args, torch.cuda.current_stream())
 
     def _selection_args(self, spec, attn, cache, step) -> dict:
         """K2a's indexer arguments: a selecting layer's scorer inputs, its bound

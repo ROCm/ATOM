@@ -1329,6 +1329,7 @@ def _choose(c, p, bins, vs, lowers, heres):
     c["stamp"](c["tl_pass"] + 3 * p + 2)
     mine = vs[0]
     radix = c["radix"]
+    capture_bucket = radix.local or c.get("capture_bucket", False)
     for k in range_constexpr(1, radix.bins_per_lane):
         mine = mine + vs[k]
     incl = wave_incl_scan(mine, lane)
@@ -1343,7 +1344,7 @@ def _choose(c, p, bins, vs, lowers, heres):
         if deciding & (above < need) & (need <= above + vs[k]):
             fx.ptr_store(bins[k], sel + SEL_DIGIT)
             fx.ptr_store(need - above, sel + SEL_NEED)
-            if const_expr(radix.local):
+            if const_expr(capture_bucket):
                 fx.ptr_store(vs[k], sel + SEL_BUCKET)
             # the last pass: the threshold bin's count on the lower ranks
             # and here

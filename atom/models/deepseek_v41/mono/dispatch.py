@@ -174,21 +174,9 @@ class MonoDraftModel(nn.Module):
 def install_mono_decode(
     model: nn.Module, atom_config, drafter, *, metadata_builder=None
 ) -> nn.Module:
-    from atom.models.deepseek_v41.mono.indexer import MonoIndexerModel
-
-    wrapped = _install_layer_decode(
+    return _install_layer_decode(
         model, atom_config, drafter, metadata_builder=metadata_builder
     )
-    # Same gfx950 deployment checks as the layer path; the standalone kernel
-    # does not exchange across DP attention ranks.
-    if (
-        indexer_enabled(atom_config.index_cache_dtype == "fp4")
-        and config_refusal(atom_config) is None
-        and not dp_attention_ranks(atom_config)
-        and (wrapped is model or isinstance(wrapped, MonoDecodeModel))
-    ):
-        return MonoIndexerModel(wrapped, model, atom_config)
-    return wrapped
 
 
 def _install_layer_decode(
@@ -231,7 +219,7 @@ def _install_layer_decode(
             hi_gate.log_once(logging.INFO, "V4.1 mono hi off: %s", why)
     if drafter is not None and hasattr(drafter.model, "block_backbone"):
         drafter.model = MonoDraftModel(drafter.model, dp_ranks)
-    return MonoDecodeModel(
+    wrapped = MonoDecodeModel(
         model,
         drafter,
         atom_config.max_model_len,
@@ -239,3 +227,10 @@ def _install_layer_decode(
         dp_ranks,
         atom_config.tensor_parallel_size,
     )
+    # Only the ordinary gfx950 route owns this hook. HI and gfx1250 return
+    # above, and disabled/refused deployments never import the GPU indexer.
+    if indexer_enabled(atom_config.index_cache_dtype == "fp4") and not dp_ranks:
+        from atom.models.deepseek_v41.mono.indexer import MonoIndexerModel
+
+        return MonoIndexerModel(wrapped, model, atom_config)
+    return wrapped

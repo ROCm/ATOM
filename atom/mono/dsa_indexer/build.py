@@ -63,7 +63,8 @@ class IxBuild:
     score_blocks: int = field(default=BLOCKS, metadata={"sym": "sb"})
     # gfx950 short verify: BF16 prepacked Q projection and local MQA scheduling.
     short_gemm: bool = field(default=False, metadata={"sym": "sq"})
-    # Local experiment: keep <=8K K3 FP4 plain decode rank-local.
+    # Eligible K3 FP4 plain-decode builds (capacity <=256K) switch each step
+    # to rank-local execution only when every live request has <=8K keys.
     short_decode: bool = field(default=False, metadata={"sym": "d1"})
 
     @property

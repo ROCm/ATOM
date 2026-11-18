@@ -40,6 +40,7 @@ from flydsl.expr import math as fmath
 from flydsl.expr.typing import Int32, T, as_ir_value
 
 from atom.models.deepseek_v41.mono import index_plan as ip
+from atom.models.deepseek_v41.mono.kernels.index_tp_work import row_work
 from atom.mono.device.mx import FP4, mfma_scaled
 from atom.mono.device.ops import (
     CM_DEV,
@@ -49,6 +50,8 @@ from atom.mono.device.ops import (
     permlane_swap,
     rsrc,
     traced,
+    uniform,
+    wave_max,
 )
 from atom.mono.plan.execution import BLOCKS, THREADS, WAVES
 from atom.mono.plan.trace import enter_stage
@@ -543,6 +546,15 @@ def run_scores4(c, t0, n, bid, max_chunks):
     }
     _read_all(a.values())
     enter_stage("k2a.iscore")
+    if const_expr(c.get("world", 1) > 1):
+        _scores_tp(c, one_row, bid, max_chunks)
+    else:
+        _scores_local(c, one_row, t0, n, bid, max_chunks)
+
+
+@traced
+def _scores_local(c, one_row, t0, n, bid, max_chunks):
+    a = _stage_args(c)
     if a["ilift"] != 0:
         per = ip.reindex_split(n, BLOCKS, REINDEX_TASK_CHUNKS)
         if bid < n * per:
@@ -551,20 +563,48 @@ def run_scores4(c, t0, n, bid, max_chunks):
                 one_row, t0 + bid // per, fx.Int32(1), ch0, ch1, max_chunks, 1
             )
     else:
-        task = _sload4(a["iplan"] + fx.Int64(bid) * 16)
-        if task[1] > 0:
-            if const_expr(_single_row_full(c)):
-                # qlen=1 pieces need one query's MFMAs, not five repeated
-                # padding rows. Keep the multi-row walk for speculative rows.
-                if task[1] == 1:
-                    stage_iscore4(
-                        one_row, task[0], task[1], task[2], task[3], max_chunks, 1
-                    )
-                else:
-                    stage_iscore4(
-                        c, task[0], task[1], task[2], task[3], max_chunks, ip.WALK_ROWS
-                    )
+        _scores_full(c, one_row, bid, max_chunks)
+
+
+@traced
+def _scores_tp(c, one_row, bid, max_chunks):
+    if c["args"]["ilift"] != 0:
+        _run_tp_reindex(one_row, bid, max_chunks)
+    else:
+        _scores_full(c, one_row, bid, max_chunks)
+
+
+@traced
+def _scores_full(c, one_row, bid, max_chunks):
+    a = _stage_args(c)
+    task = _sload4(a["iplan"] + fx.Int64(bid) * 16)
+    if task[1] > 0:
+        if const_expr(_single_row_full(c)):
+            # qlen=1 pieces need one query's MFMAs, not five repeated
+            # padding rows. Keep the multi-row walk for speculative rows.
+            if task[1] == 1:
+                stage_iscore4(
+                    one_row, task[0], task[1], task[2], task[3], max_chunks, 1
+                )
             else:
                 stage_iscore4(
                     c, task[0], task[1], task[2], task[3], max_chunks, ip.WALK_ROWS
                 )
+        else:
+            stage_iscore4(
+                c, task[0], task[1], task[2], task[3], max_chunks, ip.WALK_ROWS
+            )
+
+
+@traced
+def _run_tp_reindex(c, bid, max_chunks):
+    per = fx.max(BLOCKS // fx.max(c["ix_active_rows"], 1), 1)
+    hit = c["ix_active"] & (c["ix_active_prefix"] == bid // per)
+    row = uniform(wave_max(hit.select(c["lane"], fx.Int32(-1))))
+    if (row >= 0) & (bid < c["ix_active_rows"] * per):
+        _mode, _owner, first, count = row_work(c, row)
+        chunks = ip.chunks(count)
+        ch0 = first // ip.CHUNK + (bid % per) * chunks // per
+        ch1 = first // ip.CHUNK + (bid % per + 1) * chunks // per
+        if ch1 > ch0:
+            stage_iscore4(c, row, fx.Int32(1), ch0, ch1, max_chunks, 1)

@@ -390,6 +390,63 @@ def dispatch_module(monkeypatch):
 
 
 @pytest.mark.parametrize("mode", ["auto", "1"])
+def test_hi_result_is_never_wrapped_by_the_standalone_indexer(
+    mi355x, served, monkeypatch, dispatch_module, mode
+):
+    import types
+
+    dispatch = dispatch_module
+
+    class HiResult(dispatch.MonoDecodeModel):
+        pass
+
+    result = object.__new__(HiResult)
+    stub = types.ModuleType("atom.models.deepseek_v41.mono.hi_dispatch")
+    stub.install_hi = lambda *a, **k: result
+    monkeypatch.setitem(sys.modules, stub.__name__, stub)
+    # A CPU-only deployment cannot import this GPU module. This also catches
+    # accidentally wrapping HiDecodeModel, which subclasses MonoDecodeModel.
+    monkeypatch.setitem(sys.modules, "atom.models.deepseek_v41.mono.indexer", None)
+    monkeypatch.setenv("ATOM_DSV41_MONO_INDEXER", "1")
+    monkeypatch.setenv("ATOM_DSV41_MONO_HI", mode)
+    monkeypatch.setattr(dispatch, "config_refusal", lambda cfg: None)
+    monkeypatch.setattr(dispatch, "dp_attention_ranks", lambda cfg: 0)
+    monkeypatch.setattr(dispatch.hi_gate, "decide", lambda *a: True)
+    assert dispatch.install_mono_decode("model", served, None) is result
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_ordinary_route_imports_indexer_only_after_opt_in(
+    mi355x, served, monkeypatch, dispatch_module, enabled
+):
+    import types
+
+    dispatch = dispatch_module
+    calls = []
+    if enabled:
+        stub = types.ModuleType("atom.models.deepseek_v41.mono.indexer")
+
+        def wrap(*args):
+            calls.append(args)
+            return "independent indexer"
+
+        stub.MonoIndexerModel = wrap
+        monkeypatch.setitem(sys.modules, stub.__name__, stub)
+        monkeypatch.setenv("ATOM_DSV41_MONO_INDEXER", "1")
+    else:
+        monkeypatch.setitem(sys.modules, "atom.models.deepseek_v41.mono.indexer", None)
+        monkeypatch.delenv("ATOM_DSV41_MONO_INDEXER", raising=False)
+    monkeypatch.setattr(dispatch, "config_refusal", lambda cfg: None)
+    monkeypatch.setattr(dispatch, "dp_attention_ranks", lambda cfg: 0)
+    monkeypatch.setattr(dispatch.hi_gate, "decide", lambda *a: False)
+    # Installation must not use isinstance with the replaceable constructor.
+    monkeypatch.setattr(dispatch, "MonoDecodeModel", lambda *a: "atom mono")
+    got = dispatch.install_mono_decode("model", served, None)
+    assert got == ("independent indexer" if enabled else "atom mono")
+    assert calls == ([("atom mono", "model", served)] if enabled else [])
+
+
+@pytest.mark.parametrize("mode", ["auto", "1"])
 def test_a_model_the_hi_path_does_not_serve_falls_back(
     mi355x, served, monkeypatch, caplog, dispatch_module, mode
 ):
@@ -514,7 +571,9 @@ def _install_world(hi_dispatch, monkeypatch, *, local=None, others=(None, None, 
         model_runner=None,
         use_decode_round=lambda rnd: log.append("use round"),
     )
-    cfg = SimpleNamespace(max_model_len=4096, index_cache_dtype="fp4")
+    cfg = SimpleNamespace(
+        max_model_len=4096, index_cache_dtype="fp4", tensor_parallel_size=4
+    )
     return log, (object(), cfg, drafter, builder, 0), draft
 
 

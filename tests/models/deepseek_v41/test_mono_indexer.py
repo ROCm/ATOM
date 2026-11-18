@@ -62,7 +62,9 @@ def make_case(
             with safe_open(
                 os.path.join(directory, index[key]), framework="pt", device=dev
             ) as f:
-                return f.get_tensor(key)
+                return f.get_tensor(key).to(
+                    torch.device("cuda", torch.cuda.current_device())
+                )
 
         w = weight("wq_b.weight")
         ws = weight("wq_b.scale").view(torch.float8_e8m0fnu)

@@ -15,12 +15,16 @@ from torch import nn
 
 from atom.model_ops.deepseek_v41.index_plane import FP4_MFMA
 from atom.models.deepseek_v41.mono import index_plan as ip
+from atom.models.deepseek_v41.mono import index_tp_plan as tp
 from atom.models.deepseek_v41.mono.kernels import indexer as kernel
 from atom.models.deepseek_v41.mono.kernels.index_query import QS_BYTES
 from atom.models.deepseek_v41.mono.step_meta import KMETA, write_step_meta
 from atom.mono.plan.execution import BLOCKS
 from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
+from atom.mono.runtime.lifecycle import owned_peer_buffer
+from atom.mono.runtime.mailboxes import StepMailboxes
 from atom.mono.runtime.route import LazyRunner
+from atom.mono.runtime.step_begin import FENCE_BYTES
 from atom.mono.runtime.uncached import uncached_bytes
 from atom.mono.runtime.widths import WidthBuilds
 from atom.utils.forward_context import get_forward_context
@@ -31,13 +35,53 @@ logger = logging.getLogger("atom")
 class MonoIndexer:
     max_rows = kernel.MAX_ROWS
 
-    def __init__(self, model, max_model_len, fp4, layout, group=None):
+    def __init__(
+        self, model, max_model_len, fp4, layout, group=None, *, replicated=True
+    ):
         self.model, self.fp4 = model, fp4
         self.layout = layout if fp4 else "fp8"
         self.bound_max = ip.cdiv(max_model_len, ip.CHUNK) * ip.CHUNK
+        self.world = (
+            torch.distributed.get_world_size(group)
+            if fp4
+            and replicated
+            and group is not None
+            and torch.distributed.is_initialized()
+            else 1
+        )
+        self.rank = torch.distributed.get_rank(group) if self.world > 1 else 0
+        self.peer_plain = (
+            tp.layout_bytes(tp.peer_layout(self.max_rows, self.world)) + FENCE_BYTES
+            if self.world > 1
+            else 0
+        )
+        self.local_scratch = None
         bind_agreed(self._bind, group)
+        if self.world > 1:
+            self.peers, self._finalizer = owned_peer_buffer(
+                self,
+                self.peer_plain - FENCE_BYTES,
+                group,
+                self.rank,
+                self.world,
+                self.scratch.device,
+                tp.layout_bytes(tp.plain_layout(self.max_rows)),
+            )
+            self.mailboxes = StepMailboxes(self.peers)
         self.widths = WidthBuilds(
             self._build, lambda k: [(k, kernel.ABI)], group, "V4.1 Mono indexer"
+        )
+        self.local_widths = (
+            WidthBuilds(
+                lambda rows: kernel.build_indexer(
+                    kernel.reindex_build(self._key(rows))
+                ),
+                lambda k: [(k, kernel.ABI)],
+                group,
+                "V4.1 local REINDEX",
+            )
+            if self.local_scratch is not None
+            else None
         )
         self.active = False
 
@@ -101,6 +145,14 @@ class MonoIndexer:
             raise MonoUnsupported("V4.1 indexer RoPE must be on this rank's GPU")
         s, width = self.max_rows, self.bound_max
         self.scratch = uncached_bytes(kernel.scratch_bytes(self._key(s)), dev)
+        if self.fp4 and any(
+            block.attn.indexer is not None
+            and block.attn.indexer.spec.candidate_source is not None
+            for block in self.model.layers
+        ):
+            self.local_scratch = uncached_bytes(
+                kernel.scratch_bytes(kernel.reindex_build(self._key(s))), dev
+            )
         # Projection and scoring exchange these plain rows within one launch
         # across XCDs. As with the tagged scratch, keep them uncached: draining
         # the producer's stores alone does not invalidate a consumer's cache.
@@ -127,6 +179,7 @@ class MonoIndexer:
         self.candidates = torch.empty(s, ip.TOPK_BLOCKS, device=dev, dtype=torch.int32)
         self.ring_rel = torch.empty(s, device=dev, dtype=torch.int32)
         self.kmeta = torch.empty(s, KMETA, device=dev, dtype=torch.int32)
+        self.ix_meta = torch.empty(s, 4, device=dev, dtype=torch.int32)
         self.walk_plans = (
             {
                 r: torch.empty(BLOCKS, 4, device=dev, dtype=torch.int32)
@@ -144,26 +197,50 @@ class MonoIndexer:
         )
 
     def _key(self, rows):
+        world = tp.kernel_world(self.world, rows, self.bound_max)
         return kernel.IndexerBuild(
-            rows, self.bound_max, self.fp4, self.layout == FP4_MFMA
+            rows,
+            self.bound_max,
+            self.fp4,
+            self.layout == FP4_MFMA,
+            world=world,
+            peer_plain=self.peer_plain if world > 1 else 0,
         )
 
     def _build(self, rows):
         return kernel.build_indexer(self._key(rows))
 
     def prepare(self, rows):
-        return 0 < rows <= self.max_rows and self.widths.prepare(rows)
+        return (
+            0 < rows <= self.max_rows
+            and self.widths.prepare(rows)
+            and (self.local_widths is None or self.local_widths.prepare(rows))
+        )
+
+    def _launch_context(self, spec, rows):
+        if self.local_widths is not None and spec.candidate_source is not None:
+            return self.local_widths[rows], self.local_scratch
+        return self.widths[rows], self.scratch
 
     def begin_step(self, rows, cache, step):
         self.rows = rows
-        layout = kernel.scratch_layout(self._key(rows))
+        key = self._key(rows)
+        world = key.world
+        layout = kernel.scratch_layout(key)
         resets = tuple(
             self.scratch[off : off + n].view(torch.int32)
             for name, (off, n) in layout.items()
-            if name in ("qdone", "qready", "isf", "irdy")
+            if name in ("qdone", "qready", "isf", "irdy", "ix_fenced")
             or "ready" in name
             or (not self.fp4 and name in ("iq", "iw"))
         )
+        if self.local_scratch is not None:
+            local_layout = kernel.scratch_layout(kernel.reindex_build(self._key(rows)))
+            resets += tuple(
+                self.local_scratch[off : off + n].view(torch.int32)
+                for name, (off, n) in local_layout.items()
+                if name in ("qdone", "qready", "isf", "irdy") or "ready" in name
+            )
         write_step_meta(
             step,
             cache.geometry,
@@ -174,6 +251,24 @@ class MonoIndexer:
             (0, rows),
             resets,
             parallel_plans=True,
+            ix_meta=self.ix_meta[:rows] if world > 1 else None,
+            tp_world=world,
+            tp_rank=self.rank if world > 1 else 0,
+            peer_reset=(
+                self.peers.bytes[: tp.layout_bytes(tp.peer_layout(rows, world))].view(
+                    torch.int32
+                )
+                if world > 1
+                else None
+            ),
+            split_reset_buffers=tuple(
+                self.scratch[off : off + n].view(torch.int32)
+                for name, (off, n) in layout.items()
+                if name == "ix_rowhist"
+            ),
+            peer_nonsplit_bytes=(
+                tp.peer_layout(rows, world)["ix_hist"][0] if world > 1 else None
+            ),
         )
 
     def run(self, indexer, hidden, qr, qr_scale, cache, step, rope):
@@ -202,6 +297,8 @@ class MonoIndexer:
         if geometry.index_fp4 != self.fp4 or (self.fp4 and units.layout != self.layout):
             return False
         reindex = spec.candidate_source is not None
+        launcher, scratch = self._launch_context(spec, rows)
+        world = self._key(rows).world
         shift = 0
         if reindex:
             candidates = step.candidates[spec.candidate_source]
@@ -297,11 +394,16 @@ class MonoIndexer:
                     else geometry.page_bytes // geometry.row_bytes
                 ),
                 "main_off": geometry.main_offset(spec.kv_owner),
-                "scratch": p(self.scratch),
+                "scratch": p(scratch),
                 "layer": spec.layer_id,
+                "peers": self.peers.addresses.data_ptr() if world > 1 else 0,
+                "rank": self.rank,
+                "ix_meta": p(self.ix_meta),
+                "step_state": self.mailboxes._state.data_ptr() if world > 1 else 0,
+                "step_fence": int(world > 1 and spec.layer_id == min(self.weights)),
             }
         )
-        _run_compiled(self.widths[rows], *args, torch.cuda.current_stream())
+        _run_compiled(launcher, *args, torch.cuda.current_stream())
         indexer._publish(
             selected, self.candidates[:rows] if spec.produces_candidates else None, step
         )
@@ -340,6 +442,7 @@ class MonoIndexerModel(nn.Module):
                 config.index_cache_dtype == "fp4",
                 config.index_cache_layout,
                 get_tp_group().cpu_group,
+                replicated=not getattr(config, "enable_dp_attention", False),
             ),
             "V4.1 Mono indexer",
         )

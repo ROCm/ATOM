@@ -19,6 +19,70 @@ KMETA = 4
 
 
 @triton.jit
+def _request_groups(batch_ids, lo, hi, BLOCK: tl.constexpr):
+    t = lo + tl.arange(0, BLOCK)
+    live = t < hi
+    ids = tl.load(batch_ids + t, mask=live, other=-1)
+    prev = tl.load(batch_ids + t - 1, mask=live & (t > lo), other=-1)
+    boundary = live & ((t == lo) | (ids != prev))
+    start = boundary & (ids >= 0)
+    first = tl.associative_scan(tl.where(start, t, lo), 0, _running_max)
+    ends = tl.associative_scan(tl.where(boundary, t, hi), 0, _running_min, reverse=True)
+    next_row = tl.gather(ends, tl.minimum(tl.arange(0, BLOCK) + 1, BLOCK - 1), 0)
+    next_row = tl.where(t + 1 < hi, next_row, hi)
+    end = tl.gather(next_row, first - lo, 0)
+    ordinal = tl.cumsum(start.to(tl.int32), 0) - 1
+    return (
+        t,
+        live & (ids >= 0),
+        start,
+        first,
+        end,
+        ordinal,
+        tl.sum(start.to(tl.int32), 0),
+    )
+
+
+@triton.jit
+def _rank_chunks(
+    batch_ids,
+    positions,
+    lo,
+    hi,
+    top,
+    lead,
+    RATIO: tl.constexpr,
+    CHUNK: tl.constexpr,
+    BLOCK: tl.constexpr,
+    WORLD: tl.constexpr,
+    RANK: tl.constexpr,
+):
+    _t, live, start, first, end, request, requests = _request_groups(
+        batch_ids, lo, hi, BLOCK
+    )
+    last_pos = tl.load(positions + end - 1, mask=live, other=-1)
+    request_bound = ((last_pos + 1) // RATIO).to(tl.int32)
+    first_pos = tl.load(positions + first, mask=start, other=-1)
+    first_bound = ((first_pos + 1) // RATIO).to(tl.int32)
+    local = tl.sum((start & (first_bound > 8192)).to(tl.int32), 0) == 0
+    total = tl.sum(tl.where(start, request_bound, 0), 0)
+    split = ((requests < WORLD) & (request_bound > 8192)) | (
+        (request_bound > 262144) & (2 * WORLD * request_bound > total)
+    )
+    span = ((request_bound + CHUNK - 1) // CHUNK + WORLD - 1) // WORLD
+    offset = tl.where(~local & split, RANK * span, 0)
+    need = tl.maximum(tl.minimum((top + CHUNK - 1) // CHUNK - offset, span), 0)
+    owns = request % WORLD == RANK
+    need = tl.where(
+        local,
+        (top + CHUNK - 1) // CHUNK,
+        tl.where(split, need, tl.where(owns, (top + CHUNK - 1) // CHUNK, 0)),
+    )
+    need = tl.where(lead & live & (top > 512), need, 0)
+    return offset, need
+
+
+@triton.jit
 def _running_max(a, b):
     return tl.maximum(a, b)
 
@@ -36,6 +100,8 @@ def _walk_plan(
     TOPK: tl.constexpr,
     CHUNK: tl.constexpr,
     BLOCK: tl.constexpr,
+    WORLD: tl.constexpr = 1,
+    RANK: tl.constexpr = 0,
 ):
     """``index_plan.fill_walk_plan`` over ``index_plan.walk_pieces`` of rows lo
     .. hi, each row's bound its visible columns at ``RATIO``: ``plan`` [CTAS, 4]
@@ -56,6 +122,22 @@ def _walk_plan(
     inside = (t[None, :] >= t[:, None]) & (t[None, :] < end[:, None])
     top = tl.max(tl.where(inside, bound[None, :], 0), 1)
     need = tl.where(lead & (top > TOPK), (top + CHUNK - 1) // CHUNK, 0)
+    offset = tl.full((BLOCK,), 0, tl.int32)
+    if WORLD > 1:  # noqa: SIM102
+        if tl.max(tl.where(run_start & (owner >= 0), bound, 0), 0) > 8192:
+            offset, need = _rank_chunks(
+                batch_ids,
+                positions,
+                lo,
+                hi,
+                top,
+                lead,
+                RATIO,
+                CHUNK,
+                BLOCK,
+                WORLD,
+                RANK,
+            )
     # the narrowest width a chunk run that leaves every piece a task fits in CTAS
     total = tl.sum(need, 0)
     width = tl.maximum((total + CTAS - 1) // CTAS, 1)
@@ -74,8 +156,9 @@ def _walk_plan(
     row = plan + tl.arange(0, CTAS) * 4
     tl.store(row, tl.where(live, task_lead, 0))
     tl.store(row + 1, tl.where(live, task_span, 0))
-    tl.store(row + 2, tl.where(live, i * task_need // task_k, 0))
-    tl.store(row + 3, tl.where(live, (i + 1) * task_need // task_k, 0))
+    task_offset = tl.sum(tl.where(hit, offset[None, :], 0), 1)
+    tl.store(row + 2, tl.where(live, task_offset + i * task_need // task_k, 0))
+    tl.store(row + 3, tl.where(live, task_offset + (i + 1) * task_need // task_k, 0))
 
 
 @triton.jit
@@ -97,6 +180,8 @@ def _walk_plan_one(
     TOPK: tl.constexpr,
     CHUNK: tl.constexpr,
     BLOCK: tl.constexpr,
+    WORLD: tl.constexpr = 1,
+    RANK: tl.constexpr = 0,
 ):
     t = lo + tl.arange(0, BLOCK)
     m = t < hi
@@ -116,6 +201,23 @@ def _walk_plan_one(
         p = tl.load(positions + t + r, mask=lead & (t + r < end), other=-1)
         top = tl.maximum(top, ((p + 1) // RATIO).to(tl.int32))
     need = tl.where(lead & (top > TOPK), (top + CHUNK - 1) // CHUNK, 0)
+    offset = tl.full((BLOCK,), 0, tl.int32)
+    if WORLD > 1:
+        first_pos = tl.load(positions + t, mask=start & (owner >= 0), other=-1)
+        if tl.max((first_pos + 1) // RATIO, 0) > 8192:
+            offset, need = _rank_chunks(
+                batch_ids,
+                positions,
+                lo,
+                hi,
+                top,
+                lead,
+                RATIO,
+                CHUNK,
+                BLOCK,
+                WORLD,
+                RANK,
+            )
     total = tl.sum(need, 0)
     width = tl.maximum((total + CTAS - 1) // CTAS, 1)
     while tl.sum((need + width - 1) // width, 0) > CTAS:
@@ -132,8 +234,9 @@ def _walk_plan_one(
     row = plan + task * 4
     tl.store(row, tl.where(live, tok, 0))
     tl.store(row + 1, tl.where(live, span, 0))
-    tl.store(row + 2, tl.where(live, i * chunks // num, 0))
-    tl.store(row + 3, tl.where(live, (i + 1) * chunks // num, 0))
+    chunk_offset = tl.sum(tl.where(hit, offset, 0), 0)
+    tl.store(row + 2, tl.where(live, chunk_offset + i * chunks // num, 0))
+    tl.store(row + 3, tl.where(live, chunk_offset + (i + 1) * chunks // num, 0))
 
 
 @triton.jit
@@ -152,7 +255,13 @@ def _step_meta_kernel(
     window_size,
     n,
     reset_buffers,
+    ix_meta,
+    peer_reset,
     reset_sizes: tl.constexpr,
+    reset_split_only: tl.constexpr,
+    PEER_BYTES: tl.constexpr,
+    PEER_NONSPLIT_BYTES: tl.constexpr,
+    SPLIT_RESETS: tl.constexpr,
     WORDS: tl.constexpr,
     RATIOS: tl.constexpr,
     CTAS: tl.constexpr,
@@ -162,13 +271,39 @@ def _step_meta_kernel(
     BLOCK: tl.constexpr,
     RESET_CTAS: tl.constexpr,
     PARALLEL_PLANS: tl.constexpr,
+    WORLD: tl.constexpr,
+    RANK: tl.constexpr,
 ):
     meta_ctas = 1 + len(RATIOS) * (CTAS if PARALLEL_PLANS else 1)
     if tl.program_id(0) >= meta_ctas:
         u = (tl.program_id(0) - meta_ctas) * 1024 + tl.arange(0, 1024)
+        long_step = tl.full((), False, tl.int1)
+        split_step = tl.full((), False, tl.int1)
+        if PEER_BYTES or SPLIT_RESETS:
+            t = tl.arange(0, BLOCK)
+            live = t < n
+            ids = tl.load(batch_ids + t, mask=live, other=-1)
+            prev = tl.load(batch_ids + t - 1, mask=live & (t > 0), other=-1)
+            start = live & (ids >= 0) & ((t == 0) | (ids != prev))
+            p = tl.load(positions + t, mask=live & (ids >= 0), other=-1)
+            long_step = tl.max(tl.where(start, p + 1, 0), 0) > 8192
+            # Conservative over all compression ratios: only low-request
+            # steps or a possible dominant >256K request can split keys.
+            # Owners never read radix histograms, including after a split.
+            split_step = long_step & (
+                (tl.sum(start.to(tl.int32), 0) < WORLD) | (tl.max(p + 1, 0) > 262144)
+            )
         for r in tl.static_range(len(reset_sizes)):
-            for base in range(0, reset_sizes[r], RESET_CTAS * 1024):
-                tl.store(reset_buffers[r] + base + u, 0, mask=base + u < reset_sizes[r])
+            if not reset_split_only[r] or split_step:
+                for base in range(0, reset_sizes[r], RESET_CTAS * 1024):
+                    tl.store(
+                        reset_buffers[r] + base + u, 0, mask=base + u < reset_sizes[r]
+                    )
+        if PEER_BYTES:  # noqa: SIM102
+            if long_step:
+                peer_words = tl.where(split_step, PEER_BYTES, PEER_NONSPLIT_BYTES) // 4
+                for base in range(0, peer_words, RESET_CTAS * 1024):
+                    tl.store(peer_reset + base + u, 0, mask=base + u < peer_words)
         return
     # program 0 the per-token integers, program 1 + r ratio r's walk plan
     for r in tl.static_range(len(RATIOS)):
@@ -189,6 +324,8 @@ def _step_meta_kernel(
                     TOPK,
                     CHUNK,
                     BLOCK,
+                    WORLD,
+                    RANK,
                 )
         elif tl.program_id(0) == r + 1:
             _walk_plan(
@@ -203,9 +340,21 @@ def _step_meta_kernel(
                 TOPK,
                 CHUNK,
                 BLOCK,
+                WORLD,
+                RANK,
             )
     if tl.program_id(0) != 0:
         return
+    if WORLD > 1:
+        t, valid, start, first, end, request, requests = _request_groups(
+            batch_ids, 0, n, BLOCK
+        )
+        tl.store(ix_meta + t * 4, tl.where(valid, request, -1), mask=t < n)
+        tl.store(ix_meta + t * 4 + 1, first, mask=t < n)
+        tl.store(ix_meta + t * 4 + 2, end - 1, mask=t < n)
+        first_pos = tl.load(positions + t, mask=start, other=-1)
+        short = tl.sum((start & (first_pos + 1 > 8192)).to(tl.int32), 0) == 0
+        tl.store(ix_meta + t * 4 + 3, requests | tl.where(short, 65536, 0), mask=t < n)
     i = tl.arange(0, BLOCK)
     m = i < n
     batch = tl.load(batch_ids + i, mask=m, other=-1).to(tl.int64)
@@ -235,6 +384,12 @@ def write_step_meta(
     walk_rows,
     reset_buffers=(),
     parallel_plans=False,
+    ix_meta=None,
+    tp_world=1,
+    tp_rank=0,
+    peer_reset=None,
+    split_reset_buffers=(),
+    peer_nonsplit_bytes=None,
 ) -> None:
     """``ring_rel`` [S] int32: each token's window row before the layer's ring
     start, -1 for a pad row. ``key_meta`` [S, KMETA] int32: its first window
@@ -245,11 +400,17 @@ def write_step_meta(
     n = ring_rel.shape[0]
     walk_lo, walk_n = walk_rows
     assert key_meta.shape == (n, KMETA) and key_meta.is_contiguous()
+    if peer_nonsplit_bytes is not None:
+        assert peer_reset is not None
+        assert 0 <= peer_nonsplit_bytes <= peer_reset.nbytes
+        assert peer_nonsplit_bytes % 4 == 0
     # a piece a row at most, and each needs a task of its own: else the width
     # search never ends
     assert n < BLOCKS or not walk_plans, n
     ratios = tuple(walk_plans)
-    reset_ctas = 32 if reset_buffers else 0
+    split_only = (False,) * len(reset_buffers) + (True,) * len(split_reset_buffers)
+    resets = tuple(reset_buffers) + tuple(split_reset_buffers)
+    reset_ctas = 32 if resets or peer_reset is not None else 0
     _step_meta_kernel[
         (1 + len(ratios) * (BLOCKS if parallel_plans else 1) + reset_ctas,)
     ](
@@ -266,8 +427,18 @@ def write_step_meta(
         window.ring_slots,
         geometry.window_size,
         n,
-        reset_buffers,
-        tuple(t.numel() for t in reset_buffers),
+        resets,
+        ix_meta if ix_meta is not None else ring_rel,
+        peer_reset if peer_reset is not None else ring_rel,
+        tuple(t.numel() for t in resets),
+        split_only,
+        PEER_BYTES=peer_reset.nbytes if peer_reset is not None else 0,
+        PEER_NONSPLIT_BYTES=(
+            (peer_reset.nbytes if peer_nonsplit_bytes is None else peer_nonsplit_bytes)
+            if peer_reset is not None
+            else 0
+        ),
+        SPLIT_RESETS=bool(split_reset_buffers),
         WORDS=KMETA,
         RATIOS=ratios,
         CTAS=BLOCKS,
@@ -277,6 +448,8 @@ def write_step_meta(
         BLOCK=triton.next_power_of_2(n),
         RESET_CTAS=reset_ctas,
         PARALLEL_PLANS=parallel_plans,
+        WORLD=tp_world,
+        RANK=tp_rank,
     )
 
 

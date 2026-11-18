@@ -37,8 +37,10 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int32, T
 
 from atom.models.deepseek_v41.mono import index_plan as ip
+from atom.models.deepseek_v41.mono import index_tp_plan as tp
 from atom.models.deepseek_v41.mono.kernels import index_select_plan as isp
 from atom.models.deepseek_v41.mono.kernels.index_score_fp4 import run_scores4
+from atom.models.deepseek_v41.mono.kernels.index_tp_work import row_work
 from atom.models.deepseek_v41.mono.kernels.token_par import own_rows
 from atom.models.deepseek_v41.mono.kernels.topk import key_bits, lds_topk
 from atom.models.deepseek_v41.mono.kernels.topk_fast import key_offset
@@ -244,6 +246,8 @@ def stage_ilist(c, t, j, raw, kind, level, bound_max, max_chunks):
     module. Only the lists ``index_plan.list_count`` gives a token run."""
     tid = c["tid"]
     segment = c.get("select_seg", ip.SEG)
+    if const_expr(kind == "blk"):
+        segment = c.get("block_select_seg", segment)
     per_thread = segment // THREADS
     a = c["args"]
     k = ip.KINDS[kind]
@@ -254,6 +258,10 @@ def stage_ilist(c, t, j, raw, kind, level, bound_max, max_chunks):
         segment = isp.segment_for(segment, kind)
         per_thread = segment // THREADS
         slots = isp.list_slots(segment, kind, level, bound_max)
+    storage_segment = c.get("list_storage_segment", segment)
+    if const_expr(kind == "blk"):
+        storage_segment = c.get("block_list_storage_segment", segment)
+    slots = isp.list_slots(storage_segment, kind, level, bound_max)
     if fast_hist and level > 0:
         max_inputs = isp.list_inputs(
             segment, ip.kind_bound(kind, bound_max), level, 0, k
@@ -264,6 +272,12 @@ def stage_ilist(c, t, j, raw, kind, level, bound_max, max_chunks):
             per_thread = 16
     compact_rows = c.get("compact_selected_rows", False)
     list_ready = c.get("list_ready", False)
+    distributed = c.get("world", 1) > 1
+    mode, key_first = fx.Int32(tp.LOCAL), fx.Int32(0)
+    if const_expr(distributed):
+        mode, _owner, key_first, raw = row_work(c, t)
+    bound = ip.kind_bound(kind, raw)
+    value_first = key_first if kind == "sel" else key_first // ip.BLOCK_ROWS
     if j < isp.list_count(segment, bound, level, k):
         n = isp.list_inputs(segment, bound, level, j, k)
         final = isp.is_final(segment, bound, level, k)
@@ -277,13 +291,31 @@ def stage_ilist(c, t, j, raw, kind, level, bound_max, max_chunks):
                 )
             else:
                 first, count = isp.block_chunks(segment, raw, j)
+            if const_expr(distributed):
+                # A split tail <=512 still has scored keys when its global
+                # row needs Top512. Poll those global chunk flags as usual.
+                if const_expr(kind == "sel"):
+                    count = ip.cdiv(
+                        isp.SelectionPlan(segment).seg_len(raw, j), ip.CHUNK
+                    )
+                else:
+                    count = ip.cdiv(
+                        ip.imax(
+                            ip.imin(raw, (j + 1) * segment * ip.BLOCK_ROWS)
+                            - j * segment * ip.BLOCK_ROWS,
+                            0,
+                        ),
+                        ip.CHUNK,
+                    )
+                count = (ld_i32(a["ibound"], t) > ip.TOPK).select(count, fx.Int32(0))
+                first = first + key_first // ip.CHUNK
             flag_groups = -(
                 -(segment * (ip.BLOCK_ROWS if kind == "blk" else 1))
                 // (ip.CHUNK * THREADS)
             )
             _wait_chunks(c, t, max_chunks, first, count, flag_groups)
         else:
-            below = isp.list_slots(segment, kind, level - 1, bound_max)
+            below = isp.list_slots(storage_segment, kind, level - 1, bound_max)
             base = tid * per_thread
             if const_expr(list_ready):
                 if tid < ip.cdiv(n, k):
@@ -324,7 +356,9 @@ def stage_ilist(c, t, j, raw, kind, level, bound_max, max_chunks):
         def load(q, i):
             if const_expr(level == 0):
                 # a quad stays in the row: strides are whole chunks / blocks
-                v = fx.Vector(ld_dev(src, t * stride + j * segment + i, 4))
+                v = fx.Vector(
+                    ld_dev(src, t * stride + value_first + j * segment + i, 4)
+                )
                 return [fx.Int32(v[e]) for e in range(4)]
             if const_expr(list_ready):
                 return [
@@ -343,7 +377,7 @@ def stage_ilist(c, t, j, raw, kind, level, bound_max, max_chunks):
 
         def ident_of(d, i):
             if const_expr(level == 0):
-                return j * segment + i
+                return value_first + j * segment + i
             if const_expr(list_ready):
                 return fx.Int32(
                     ld_dev(
@@ -374,7 +408,14 @@ def stage_ilist(c, t, j, raw, kind, level, bound_max, max_chunks):
                 )
             if to_final:
                 if const_expr(compact_rows):
-                    fx.ptr_store(i, c["sel_lds"]["hist"] + pos)
+                    if const_expr(distributed):
+                        if mode != tp.LOCAL:
+                            fx.ptr_store(bits, c["sel_lds"]["hist"] + pos)
+                            fx.ptr_store(i, c["sel_lds"]["hist"] + k + pos)
+                        else:
+                            fx.ptr_store(i, c["sel_lds"]["hist"] + pos)
+                    else:
+                        fx.ptr_store(i, c["sel_lds"]["hist"] + pos)
                 else:
                     if const_expr(d is None):
                         picked = (fx.Int32(-1), fx.Int32(0))
@@ -442,17 +483,25 @@ def stage_ilist(c, t, j, raw, kind, level, bound_max, max_chunks):
             )  # fmt: skip
         if const_expr(compact_rows):  # noqa: SIM102
             if to_final:
-                for r in range_constexpr(-(-k // THREADS)):
-                    pos = tid + r * THREADS
-                    if pos < k:
-                        i = fx.ptr_load(c["sel_lds"]["hist"] + pos)
-                        ident = (i >= 0).select(
-                            ident_of(None, fx.max(i, 0)), fx.Int32(-1)
-                        )
-                        if const_expr(kind == "sel"):
-                            _final(c, kind, t, pos, ident, _selected_rows(c, t, ident))
-                        else:
-                            _final(c, kind, t, pos, ident)
+                if const_expr(distributed):
+                    if mode != tp.LOCAL:
+                        for r in range_constexpr(-(-k // THREADS)):
+                            pos = tid + r * THREADS
+                            if pos < k:
+                                bits = fx.ptr_load(c["sel_lds"]["hist"] + pos)
+                                i = fx.ptr_load(c["sel_lds"]["hist"] + k + pos)
+                                ident = (i >= 0).select(
+                                    ident_of(None, fx.max(i, 0)), fx.Int32(-1)
+                                )
+                                st_dev(
+                                    fx.Vector.from_elements([bits, ident], fx.Int32),
+                                    c["ix_pairs"][kind],
+                                    (t * k + pos) * 2,
+                                )
+                    else:
+                        _compact_final(c, kind, t, k, ident_of)
+                else:
+                    _compact_final(c, kind, t, k, ident_of)
         has_list_output = list_ready and level < isp.top_level(segment, kind, bound_max)
         if const_expr(has_list_output):  # noqa: SIM102
             if ~final:
@@ -474,9 +523,43 @@ def stage_ilist(c, t, j, raw, kind, level, bound_max, max_chunks):
         # a selection's flag for the attention; the candidate blocks' only in a
         # token-parallel launch, which waits for every rank's (``await_candidates``)
         region = "irdy" if kind == "sel" else "icrdy" if c["tok_par"] else None
-        if const_expr(region is not None):  # noqa: SIM102
+        if const_expr(region is not None):
             if final:
-                _publish_all(c, region, t)
+                if const_expr(distributed):
+                    if mode != tp.LOCAL:
+                        publish(
+                            c["put"],
+                            c["ix_root_ready"],
+                            tp.KINDS.index(kind) * c["S"] + t,
+                            fx.min(bound, k),
+                            tid == 0,
+                        )
+                    else:
+                        _publish_all(c, region, t)
+                else:
+                    _publish_all(c, region, t)
+        elif const_expr(distributed):  # noqa: SIM102
+            if final & (mode != tp.LOCAL):
+                publish(
+                    c["put"],
+                    c["ix_root_ready"],
+                    tp.KINDS.index(kind) * c["S"] + t,
+                    fx.min(bound, k),
+                    tid == 0,
+                )
+
+
+@traced
+def _compact_final(c, kind, t, k, ident_of):
+    for r in range_constexpr(-(-k // THREADS)):
+        pos = c["tid"] + r * THREADS
+        if pos < k:
+            i = fx.ptr_load(c["sel_lds"]["hist"] + pos)
+            ident = (i >= 0).select(ident_of(None, fx.max(i, 0)), fx.Int32(-1))
+            if const_expr(kind == "sel"):
+                _final(c, kind, t, pos, ident, _selected_rows(c, t, ident))
+            else:
+                _final(c, kind, t, pos, ident)
 
 
 def _prefetch_rows(c, kind, fn):

@@ -9,6 +9,7 @@ import torch
 from torch import nn
 
 pytest.importorskip("aiter")
+pytest.importorskip("flydsl")
 from atom.models.deepseek_v41.mono import indexer as module
 from atom.models.deepseek_v41.mono.config import indexer_enabled
 
@@ -79,12 +80,91 @@ def test_unsupported_step_keeps_native_route(monkeypatch):
     assert raw.calls == [False]
 
 
-def test_fp8_and_opt_out_keep_the_embedded_indexer(monkeypatch):
+def test_default_off_and_fp8_keep_the_embedded_indexer(monkeypatch):
     monkeypatch.delenv("ATOM_DSV41_MONO_INDEXER", raising=False)
+    assert not indexer_enabled(True)
+    monkeypatch.setenv("ATOM_DSV41_MONO_INDEXER", "1")
     assert indexer_enabled(True)
     assert not indexer_enabled(False)
     monkeypatch.setenv("ATOM_DSV41_MONO_INDEXER", "0")
     assert not indexer_enabled(True)
+
+
+def test_dp_attention_keeps_rank_local_indexer_work(monkeypatch):
+    # Attention DP ranks carry different requests and caches, so they cannot
+    # exchange selections even if a TP process group exists for the FFN.
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 4)
+    monkeypatch.setattr(module, "bind_agreed", lambda bind, group: None)
+    monkeypatch.setattr(module, "WidthBuilds", lambda *args: object())
+    peers = Mock()
+    monkeypatch.setattr(module, "owned_peer_buffer", peers)
+    r = module.MonoIndexer(None, 163840, True, "mfma", object(), replicated=False)
+    assert r.world == 1 and r.rank == 0 and r._key(8).world == 1
+    peers.assert_not_called()
+
+
+def test_bounded_small_width_uses_local_key_without_peer_offsets():
+    r = module.MonoIndexer.__new__(module.MonoIndexer)
+    r.world, r.bound_max, r.peer_plain = 4, 163968, 4096
+    r.fp4, r.layout = True, "mfma"
+    assert r._key(8).world == 1 and r._key(8).peer_plain == 0
+    assert r._key(16).world == 4 and r._key(16).peer_plain == 4096
+    r.bound_max = 262272
+    assert r._key(8).world == 4
+
+
+def test_reindex_launches_local_binary_with_its_own_scratch():
+    r = module.MonoIndexer.__new__(module.MonoIndexer)
+    r.widths = {8: object()}
+    r.local_widths = {8: object()}
+    r.scratch, r.local_scratch = object(), object()
+    assert r._launch_context(SimpleNamespace(candidate_source=None), 8) == (
+        r.widths[8],
+        r.scratch,
+    )
+    assert r._launch_context(SimpleNamespace(candidate_source=20), 8) == (
+        r.local_widths[8],
+        r.local_scratch,
+    )
+    r.local_widths = None
+    assert r._launch_context(SimpleNamespace(candidate_source=20), 8) == (
+        r.widths[8],
+        r.scratch,
+    )
+
+
+def test_layer_reset_preserves_candidate_data_and_separates_split_histograms():
+    from atom.models.deepseek_v41.mono.kernels import indexer as kernel
+    from atom.models.deepseek_v41.mono.runner import V41MonoDecodeRunner
+
+    key = kernel.IndexerBuild(8, 163968, world=4)
+    r = V41MonoDecodeRunner.__new__(V41MonoDecodeRunner)
+    r._indexer_key = lambda rows: key
+    r.index_scratch = torch.full((kernel.scratch_bytes(key),), 7, dtype=torch.uint8)
+    local_key = kernel.reindex_build(key)
+    r.local_index_scratch = torch.full(
+        (kernel.scratch_bytes(local_key),), 7, dtype=torch.uint8
+    )
+    resets, split_resets = r._index_reset_buffers(8)
+    assert resets and len(split_resets) == 1
+    assert (
+        sum(x.numel() * x.element_size() for x in resets) < r.index_scratch.numel() // 2
+    )
+    for flags in resets:
+        flags.zero_()
+    for build, scratch in ((key, r.index_scratch), (local_key, r.local_index_scratch)):
+        layout = kernel.scratch_layout(build)
+        # Retained scores/IDs are overwritten by their producers, not cleared.
+        for name in ("iq", "isel0"):
+            if name in layout:
+                off, size = layout[name]
+                assert torch.all(scratch[off : off + size] == 7)
+        off, size = layout["irdy"]
+        assert not torch.any(scratch[off : off + size])
+    assert torch.all(split_resets[0].view(torch.uint8) == 7)
+    split_resets[0].zero_()
+    assert not torch.any(split_resets[0])
 
 
 @pytest.mark.parametrize("tp,rows", [(2, 40), (2, 48)])
