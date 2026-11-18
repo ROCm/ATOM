@@ -1,0 +1,87 @@
+[atom 11:20:58] Engine Core Mgr: Starting EngineCore for DP rank 2/4
+[atom 11:20:58] Engine Core Mgr: Starting EngineCore for DP rank 3/4
+[atom 11:21:01] [gc] thresholds (700, 10, 10) -> (20000, 50, 50)
+[atom 11:21:01] [gc] thresholds (700, 10, 10) -> (20000, 50, 50)
+[atom 11:21:01] [gc] thresholds (700, 10, 10) -> (20000, 50, 50)
+[atom 11:21:01] [gc] thresholds (700, 10, 10) -> (20000, 50, 50)
+[atom 11:21:06] [gc] thresholds (700, 10, 10) -> (20000, 50, 50)
+[atom 11:21:06] [gc] thresholds (700, 10, 10) -> (20000, 50, 50)
+[atom 11:21:06] [gc] thresholds (700, 10, 10) -> (20000, 50, 50)
+[atom 11:21:06] Create lazy wrapper for FusedMoE to change the naming
+[atom 11:21:06] [gc] thresholds (700, 10, 10) -> (20000, 50, 50)
+[atom 11:21:06] Create lazy wrapper for FusedMoE to change the naming
+[atom 11:21:06] Create lazy wrapper for FusedMoE to change the naming
+[atom 11:21:06] Create lazy wrapper for FusedMoE to change the naming
+Process ModelRunner0/1:
+Traceback (most recent call last):
+  File "/usr/lib/python3.12/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.12/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/app/ATOM/atom/model_engine/async_proc.py", line 227, in __init__
+    runner_class = resolve_obj_by_qualname(runner_qualname)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/utils/__init__.py", line 965, in resolve_obj_by_qualname
+    module = importlib.import_module(module_name)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/importlib/__init__.py", line 90, in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen importlib._bootstrap>", line 1387, in _gcd_import
+  File "<frozen importlib._bootstrap>", line 1360, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1331, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 935, in _load_unlocked
+  File "<frozen importlib._bootstrap_external>", line 995, in exec_module
+  File "<frozen importlib._bootstrap>", line 488, in _call_with_frames_removed
+  File "/app/ATOM/atom/model_engine/model_runner.py", line 129, in <module>
+    from atom.spec_decode.factory import build_drafter
+  File "/app/ATOM/atom/spec_decode/factory.py", line 4, in <module>
+    from atom.spec_decode.eagle_proposer import EagleProposer
+  File "/app/ATOM/atom/spec_decode/eagle_proposer.py", line 18, in <module>
+    from atom.model_ops.attentions.backends import PAD_SLOT_ID
+  File "/app/ATOM/atom/model_ops/attentions/backends.py", line 28, in <module>
+    from atom.model_ops.attention_mla import MLAModules
+  File "/app/ATOM/atom/model_ops/attention_mla.py", line 74, in <module>
+    from atom.model_ops.linear import use_triton_gemm
+  File "/app/ATOM/atom/model_ops/linear.py", line 26, in <module>
+    from aiter.tuned_gemm import tgemm
+  File "/app/aiter/aiter/tuned_gemm.py", line 51, in <module>
+    tune_path = AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/aiter/aiter/jit/core.py", line 450, in AITER_CONFIG_GEMM_BF16_FILE
+    return self.get_config_file(
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/app/aiter/aiter/jit/core.py", line 860, in get_config_file
+    config_file = self.update_config_files(
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^
+----- last 30 lines -----
+[atom 11:21:07] AsyncIOProcManager(ModelRunner): shutdown all runners...
+[atom 11:21:08] AsyncIOProcManager(ModelRunner): All runners are shutdown.
+[atom 11:21:08] [gc] unfroze 375 objects
+[atom 11:21:08] Engine Core: load model runner failed
+[atom 11:21:08] AsyncIOProcManager(ModelRunner): All runners are shutdown.
+[atom 11:21:08] AsyncIOProcManager(ModelRunner): All runners are shutdown.
+[atom 11:21:08] [gc] unfroze 375 objects
+[atom 11:21:08] [gc] unfroze 375 objects
+[atom 11:21:08] Engine Core: load model runner failed
+[atom 11:21:08] Engine Core: load model runner failed
+[atom 11:21:12] Engine Core Mgr: All EngineCores shut down
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/app/ATOM/atom/entrypoints/openai_server.py", line 27, in <module>
+    main()
+  File "/app/ATOM/atom/entrypoints/openai/api_server.py", line 3814, in main
+    engine = engine_args.create_engine(tokenizer=tokenizer)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/model_engine/arg_utils.py", line 1075, in create_engine
+    return LLMEngine(self.model, tokenizer=tokenizer, **self._get_engine_kwargs())
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/model_engine/llm_engine.py", line 98, in __init__
+    self.core_mgr = CoreManager(config)
+                    ^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/model_engine/engine_core_mgr.py", line 728, in __init__
+    self._wait_for_all_ready_signals()
+  File "/app/ATOM/atom/model_engine/engine_core_mgr.py", line 816, in _wait_for_all_ready_signals
+    raise RuntimeError(
+RuntimeError: Engine Core Mgr: Received unexpected SHUTDOWN signal from DP rank 2 during initialization
