@@ -1,7 +1,7 @@
-//! A prompt looked up on the request path in the store a worker reads: ATOM's keys of
-//! its chunks, asked of every pool within a deadline, and what the engine loads of the
-//! prefix the store holds. A source that keeps failing is skipped for a while, and so are
-//! the lookups past a cap on the requests in flight to its pools.
+//! A sampled prompt looked up on the request path in the store a worker reads: ATOM's
+//! keys of its chunks, asked of every pool within a deadline, and what the engine loads of
+//! the prefix the store holds. A source that keeps failing is skipped for a while, and so
+//! are the lookups past a cap on the requests in flight to its pools.
 
 use std::{
     sync::{
@@ -12,6 +12,7 @@ use std::{
 };
 
 use parking_lot::Mutex;
+use rand::Rng;
 
 use super::{
     keys,
@@ -110,13 +111,16 @@ pub(super) struct Read {
     pub lookups: Arc<Lookups>,
     /// From the first request to the last answer; later answers are dropped.
     pub deadline: Duration,
+    /// The fraction of the prompts the store could add to that are looked up.
+    pub sample_rate: f64,
 }
 
 impl Read {
     /// The tokens of `tokens` the engine reports cached when its device cache holds
     /// `device` of them, after it loads what it will of what the store holds; None when
-    /// the store does not answer. This costs the request the keys of at most
-    /// `MAX_CHUNKS` chunks, about 1.2 µs each, and at most `deadline` of waiting.
+    /// the prompt is not sampled or the store does not answer. A sampled prompt costs the
+    /// request the keys of at most `MAX_CHUNKS` chunks, about 1.2 µs each, and at most
+    /// `deadline` of waiting.
     pub async fn cached_tokens(
         &self,
         client: &reqwest::Client,
@@ -132,6 +136,10 @@ impl Read {
         if loaded(prompt).is_none() {
             self.count("skipped");
             return Some(device);
+        }
+        if rand::rng().random::<f64>() >= self.sample_rate {
+            self.count("unsampled");
+            return None;
         }
         let held = self.lookup(client, tokens).await;
         self.count(match held {
@@ -324,6 +332,7 @@ mod tests {
             readable: true,
             lookups: Arc::default(),
             deadline: Duration::from_millis(500),
+            sample_rate: 1.0,
         }
     }
 
@@ -407,6 +416,27 @@ mod tests {
             rendered.contains(lookups),
             "missing {lookups} in\n{rendered}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_unsampled_prompt_is_not_looked_up() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let admin = Arc::new(Admin::default());
+        let read = Read {
+            sample_rate: 0.0,
+            ..source(admin.clone()).await
+        };
+        let client = reqwest::Client::new();
+        let prompt: Vec<u32> = (0..64).collect();
+        // Its estimate is unknown, unless the store could not add to it anyway.
+        assert_eq!(read.cached_tokens(&client, &prompt, 0).await, None);
+        assert_eq!(read.cached_tokens(&client, &prompt, 48).await, Some(48));
+        assert_eq!(admin.asked.load(Ordering::Relaxed), 0);
+        let line = r#"mesh_kv_storage_lookups_total{source="atom-mooncake-01234567",result="unsampled"} 1"#;
+        let rendered = handle.render();
+        assert!(rendered.contains(line), "missing {line} in\n{rendered}");
     }
 
     #[tokio::test]

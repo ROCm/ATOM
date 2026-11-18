@@ -320,8 +320,8 @@ impl CacheAwarePolicy {
     /// The tree's affinity branch, with the match rate of the KV event index: the share of
     /// the request's tokens a worker's device cache holds, the highest first, then the
     /// lower load. None leaves the request to the tree: it has no tokens or has media, or no
-    /// candidate holds more of them than `cache_threshold`. The estimate also counts what
-    /// the selected worker's engine will load from a store.
+    /// candidate holds more of them than `cache_threshold`. For a sample of the requests,
+    /// the estimate also counts what the selected worker's engine will load from a store.
     async fn select_by_kv_events(
         &self,
         workers: &[Arc<dyn Worker>],

@@ -279,7 +279,8 @@ impl AppContextBuilder {
         let kv_storage = (router_config.kv_events).then(|| {
             let deadline = Duration::from_millis(router_config.kv_storage_deadline_ms);
             let port = router_config.mooncake_admin_port;
-            Arc::new(StorageSources::new(port, deadline, client.clone()))
+            let sources = StorageSources::new(port, deadline, client.clone());
+            Arc::new(sources.sampled(router_config.kv_storage_sample_rate))
         });
         if let Some(monitor) = &kv_event_monitor {
             if let Some(storage) = &kv_storage {

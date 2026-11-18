@@ -379,6 +379,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn kv_storage_sample_rate(mut self, rate: f64) -> Self {
+        self.config.kv_storage_sample_rate = rate;
+        self
+    }
+
     /// Inverse of disable_retries field
     pub fn retries(mut self, enable: bool) -> Self {
         self.config.disable_retries = !enable;

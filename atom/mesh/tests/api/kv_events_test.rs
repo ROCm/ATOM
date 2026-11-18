@@ -459,6 +459,7 @@ async fn cache_aware_places_requests_by_the_kv_event_index() {
     config.kv_events = true;
     config.mooncake_admin_port = admin_port;
     config.kv_storage_deadline_ms = 1000;
+    config.kv_storage_sample_rate = 1.0;
     let ctx = AppTestContext::new_with_config(config, vec![]).await;
     let dir = tempfile::tempdir().unwrap();
     let tokenizer = bos_tokenizer(dir.path());
