@@ -35,6 +35,9 @@ def test_embed_state_is_bit_exact(shape, hc_mult):
     hidden = torch.randn(*shape, device="cuda", dtype=torch.bfloat16)
     hidden.view(-1)[::7] = float("nan")
     hidden.view(-1)[1::11] = float("inf")
+    # The fused path is the one under test: a gate that stopped taking it
+    # would leave the torch body to pass the comparison below on its own.
+    assert mhc.embed_state(hidden, hc_mult) is not None
     state = mhc.SinglePassHCState.from_embeddings(hidden, hc_mult)
     residual, pre_mix = _torch_body(hidden, hc_mult)
     assert state.residual.shape == residual.shape
@@ -59,7 +62,7 @@ def test_embed_state_empty_and_strided_rows():
     assert torch.equal(state.residual, _torch_body(strided, 4)[0])
 
 
-def test_embed_state_leaves_cpu_and_odd_widths_to_torch():
+def test_embed_state_leaves_cpu_and_non_power_of_two_hc_mult_to_torch():
     mhc = _mhc()
     assert mhc.embed_state(torch.zeros(2, 8), 4) is None
     if torch.cuda.is_available():

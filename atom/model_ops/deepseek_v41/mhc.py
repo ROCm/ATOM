@@ -82,31 +82,81 @@ def collapse_streams(residual, pre_mix):
     return out
 
 
+# Hidden columns a program copies when `from_embeddings` builds the state.
+_EMBED_BLOCK_H = 2048
+
+
 @triton.jit
-def _embed_state_kernel(
-    hidden_ptr,
-    residual_ptr,
-    pre_ptr,
+def _stream_state_kernel(
+    anchor_ptr,  # [rows / width, H]: the embedding of every width-th row
+    fill_ptr,  # [H]: the embedding of every other row
+    residual_ptr,  # [rows, M, H]
+    pre_mix_ptr,  # [rows, M] fp32
     hidden_size,
-    M: tl.constexpr,
+    width,
+    M: tl.constexpr,  # hc_mult
     BLOCK_H: tl.constexpr,
 ):
-    # `from_embeddings` in one pass: each row's embedding copied to its M
-    # streams, and a pre-mix of (1, 0, ..., 0) beside it.
+    # The initial mHC state in one pass: each row's embedding copied to its M
+    # streams, and a pre-mix of (1, 0, ..., 0) beside it -- the bytes the
+    # expand().contiguous() + zeros + fill of `from_embeddings` write. Row r
+    # carries anchor r // width when r % width == 0 and the fill row otherwise:
+    # width 1 is every row its own embedding, width > 1 the DSpark draft
+    # block (the anchor, then the noise token).
     row = tl.program_id(0).to(tl.int64)
     cols = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
     mask = cols < hidden_size
-    x = tl.load(hidden_ptr + row * hidden_size + cols, mask=mask)
-    for m in tl.static_range(M):
-        tl.store(residual_ptr + (row * M + m) * hidden_size + cols, x, mask=mask)
+    src = tl.where(
+        row % width == 0, anchor_ptr + (row // width) * hidden_size, fill_ptr
+    )
+    value = tl.load(src + cols, mask=mask)
+    dst = residual_ptr + row * M * hidden_size
+    for stream in tl.static_range(M):
+        tl.store(dst + stream * hidden_size + cols, value, mask=mask)
     if tl.program_id(1) == 0:
-        j = tl.arange(0, M)
-        tl.store(pre_ptr + row * M + j, tl.where(j == 0, 1.0, 0.0))
+        streams = tl.arange(0, M)
+        tl.store(
+            pre_mix_ptr + row * M + streams,
+            tl.where(streams == 0, 1.0, 0.0).to(tl.float32),
+        )
 
 
-def embed_state(hidden, hc_mult):
-    """(residual, pre_mix) of `from_embeddings`, bit for bit, in one launch;
-    None where the torch body has to serve (CPU, strided rows, odd hc_mult)."""
+def write_stream_state(residual, pre_mix, anchors, *, block_h, width=1, fill=None):
+    """Write the initial mHC state into ``residual [rows, M, H]`` and
+    ``pre_mix [rows, M]`` (both contiguous) in one launch.
+
+    Row r holds ``anchors[r // width]`` where ``r % width == 0`` and ``fill``
+    elsewhere; ``width=1`` (no ``fill``) is `from_embeddings`, ``width > 1``
+    the DSpark draft block (`build_block_state`). ``M`` must be a power of
+    two (`tl.arange`). ``block_h`` is the caller's hidden tile.
+    """
+    rows, hc_mult, hidden_size = residual.shape
+    if not rows:
+        return
+    _stream_state_kernel[(rows, triton.cdiv(hidden_size, block_h))](
+        anchors,
+        anchors if fill is None else fill,
+        residual,
+        pre_mix,
+        hidden_size,
+        width,
+        M=hc_mult,
+        BLOCK_H=block_h,
+        num_warps=4,
+    )
+
+
+def embed_state(
+    hidden: torch.Tensor, hc_mult: int
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """(residual, pre_mix) of `from_embeddings`, bit for bit, in one launch.
+
+    None where the torch body serves instead: CPU tensors, non-contiguous
+    rows, an ``hc_mult`` that is not a power of two up to 16 (the kernel
+    spans the streams with one `tl.arange`), and a traced forward
+    (`torch.compiler.is_compiling()`), where the compiler fuses the torch
+    body itself.
+    """
     if torch.compiler.is_compiling() or not (
         hidden.is_cuda
         and hidden.is_contiguous()
@@ -121,15 +171,11 @@ def embed_state(hidden, hc_mult):
     pre_mix = torch.empty(*outer, hc_mult, dtype=torch.float32, device=hidden.device)
     rows = hidden.numel() // hidden_size if hidden_size else 0
     if rows:
-        block = 2048
-        _embed_state_kernel[(rows, triton.cdiv(hidden_size, block))](
+        write_stream_state(
+            residual.view(rows, hc_mult, hidden_size),
+            pre_mix.view(rows, hc_mult),
             hidden,
-            residual,
-            pre_mix,
-            hidden_size,
-            M=hc_mult,
-            BLOCK_H=block,
-            num_warps=4,
+            block_h=_EMBED_BLOCK_H,
         )
     return residual, pre_mix
 
