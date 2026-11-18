@@ -765,6 +765,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KIMI_MONO_FUSED_MOE_WIDE": lambda: int(
         os.getenv("ATOM_KIMI_MONO_FUSED_MOE_WIDE", "0")
     ),
+    # Kimi-K3 gfx1250 mono: the fused MoE's WMMAs see zeros, not the last
+    # pick's copy, in an M tile's columns past its expert's picks (the same
+    # outputs, less switching under the power cap); 0 keeps the copies.
+    "ATOM_KIMI_MONO_FUSED_MOE_ZERO_PAD": lambda: int(
+        os.getenv("ATOM_KIMI_MONO_FUSED_MOE_ZERO_PAD", "0")
+    ),
     # Kimi-K3 gfx1250 mono: K2's gathering all-reduce, routed RMSNorm and
     # replicated finalize as one resident launch (k2_tail_gfx1250, the same
     # bits) where the gathering all-reduce runs a line a thread; 0 keeps the

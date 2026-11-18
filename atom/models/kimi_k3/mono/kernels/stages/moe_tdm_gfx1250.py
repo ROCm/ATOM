@@ -520,6 +520,17 @@ def _wmma16(weight, activation, accumulator, weight_scale, activation_scale):
     )
 
 
+def _past_picks(fragment, index, count, zero):
+    """``fragment`` (v8 i32), zeros in a lane whose pick ``index`` is past
+    ``count`` when ``zero``: a padding column's products are never stored."""
+    if not zero:
+        return fragment
+    live = index < count
+    return fx.Vector.from_elements(
+        [live.select(fragment[e], fx.Int32(0)) for e in range_constexpr(8)], fx.Int32
+    )
+
+
 def _load_v8(resource, first, second):
     a = fx.Vector(bo.buffer_load(resource, first, vec_width=4, dtype=T.i32))
     b = fx.Vector(bo.buffer_load(resource, second, vec_width=4, dtype=T.i32))
@@ -834,16 +845,16 @@ def _lds_barrier():
 
 
 @traced
-def _bounded_wait(flags, slot, tag, state, bid):
-    """Until expert ``slot``'s four gate/up flags carry ``tag``; past
-    ``POLL_LIMIT`` polls the wait records (CTA, slot, a flag) in ``state[3]``
-    and goes on."""
+def _bounded_wait(flags, slot, tag, state, bid, nap=1):
+    """Until expert ``slot``'s four gate/up flags carry ``tag``, ``nap``
+    s_sleep units (64 clocks) between polls; past ``POLL_LIMIT`` polls the
+    wait records (CTA, slot, a flag) in ``state[3]`` and goes on."""
     polls = fx.Int32(0)
     v = fx.Vector(ld_dev(flags, slot * FLAG_WORDS, 4))
     while ((v[0] != tag) | (v[1] != tag) | (v[2] != tag) | (v[3] != tag)) & (
         polls < POLL_LIMIT
     ):
-        rocdl.s_sleep(1)
+        rocdl.s_sleep(nap)
         polls = polls + 1
         v = fx.Vector(ld_dev(flags, slot * FLAG_WORDS, 4))
     if polls >= POLL_LIMIT:
@@ -928,6 +939,8 @@ def build_moe(
     ring: int | None = None,
     resident: int | None = None,
     wide: bool | None = None,
+    zero_pad: bool | None = None,
+    nap: int = 1,
 ) -> MoeKernel:
     """The routed experts of ``rows`` tokens in one resident 256-CTA launch,
     with no grid barrier and no queue: every CTA works out the same static,
@@ -956,12 +969,22 @@ def build_moe(
     gate/up runs on three waves of 64 rows -- an MXFP4 block each, its two
     32-row halves' WMMAs on every activation fragment it reads -- so each
     fragment is read by half the waves, and a wave quantizes and stores its
-    own block: no ``red``, no barrier."""
+    own block: no ``red``, no barrier.
+
+    ``zero_pad`` (default ``ATOM_KIMI_MONO_FUSED_MOE_ZERO_PAD``): an M tile's
+    lanes past its expert's picks feed the WMMAs zeros, not the last pick's
+    activation -- at 40 rows an expert has 1-2 picks of a tile's 16, so most
+    of every activation operand is padding; the stored outputs are the same.
+
+    ``nap``: s_sleep units between a down switch's flag polls."""
     if rolled is None:
         rolled = envs.ATOM_KIMI_MONO_ROLLED_MOE
     if wide is None:
         wide = envs.ATOM_KIMI_MONO_FUSED_MOE_WIDE
     wide = bool(wide) and rolled
+    if zero_pad is None:
+        zero_pad = envs.ATOM_KIMI_MONO_FUSED_MOE_ZERO_PAD
+    zero_pad = bool(zero_pad)
     halves = 2 if wide else 1
     routes = rows * TOPK
     # Past 48 rows every token's latent and a ring of four do not fit: a
@@ -997,6 +1020,8 @@ def build_moe(
         + (f"_r{ring}" if ring != RING else "")
         + (f"_k{resident}" if resident != k_tiles else "")
         + ("_w" if wide else "")
+        + ("_z" if zero_pad else "")
+        + (f"_n{nap}" if nap != 1 else "")
         + ("_rl" if rolled else "")
         + ("_profile" if profile else "")
     )
@@ -1290,12 +1315,17 @@ def build_moe(
                             for m in range_constexpr(tiles):
                                 if m == 0 or m * 16 < count:
                                     for step in range_constexpr(STEPS):
-                                        fragment = _activation_fragment(
-                                            w_latq,
-                                            latq_words,
-                                            tokens[m],
-                                            k_tile * STEPS + step,
-                                            lane,
+                                        fragment = _past_picks(
+                                            _activation_fragment(
+                                                w_latq,
+                                                latq_words,
+                                                tokens[m],
+                                                k_tile * STEPS + step,
+                                                lane,
+                                            ),
+                                            m * 16 + lane % 16,
+                                            count,
+                                            zero_pad,
                                         )
                                         fragment_scale = fx.ptr_load(
                                             lds["latsc"]
@@ -1333,12 +1363,17 @@ def build_moe(
                                     for step in range_constexpr(STEPS):
                                         accumulators[m] = _wmma(
                                             k_weights[step],
-                                            _activation_fragment(
-                                                k_latq,
-                                                latq_words,
-                                                tokens[m],
-                                                k_tile * STEPS + step,
-                                                lane,
+                                            _past_picks(
+                                                _activation_fragment(
+                                                    k_latq,
+                                                    latq_words,
+                                                    tokens[m],
+                                                    k_tile * STEPS + step,
+                                                    lane,
+                                                ),
+                                                m * 16 + lane % 16,
+                                                count,
+                                                zero_pad,
                                             ),
                                             accumulators[m],
                                             k_weight_scales[step],
@@ -1388,11 +1423,16 @@ def build_moe(
                             for m in range_constexpr(tiles):
                                 if m == 0 or m * 16 < count:
                                     for step in range_constexpr(STEPS):
-                                        g_fragment = _latent_fragment(
-                                            latent,
-                                            tokens[m],
-                                            g_tile * STEPS + step,
-                                            lane,
+                                        g_fragment = _past_picks(
+                                            _latent_fragment(
+                                                latent,
+                                                tokens[m],
+                                                g_tile * STEPS + step,
+                                                lane,
+                                            ),
+                                            m * 16 + lane % 16,
+                                            count,
+                                            zero_pad,
                                         )
                                         g_fragment_scale = fx.ptr_load(
                                             lds["latsc"]
@@ -1428,11 +1468,16 @@ def build_moe(
                                     for step in range_constexpr(STEPS):
                                         accumulators[m] = _wmma(
                                             g_weights[step],
-                                            _latent_fragment(
-                                                latent,
-                                                tokens[m],
-                                                g_tile * STEPS + step,
-                                                lane,
+                                            _past_picks(
+                                                _latent_fragment(
+                                                    latent,
+                                                    tokens[m],
+                                                    g_tile * STEPS + step,
+                                                    lane,
+                                                ),
+                                                m * 16 + lane % 16,
+                                                count,
+                                                zero_pad,
                                             ),
                                             accumulators[m],
                                             g_weight_scales[step],
@@ -1480,15 +1525,20 @@ def build_moe(
                                 k_step = tile_k * STEPS + step
                                 accumulators[m] = _wmma(
                                     weights[step],
-                                    _activation_fragment(
-                                        lds["latq"] + k_step * 16 // LATENT_PAD_EVERY,
-                                        latq_words,
-                                        tokens[m],
-                                        k_step,
-                                        lane,
-                                    )
-                                    if tile_k < resident
-                                    else _latent_fragment(latent, tokens[m], k_step, lane),
+                                    _past_picks(
+                                        _activation_fragment(
+                                            lds["latq"] + k_step * 16 // LATENT_PAD_EVERY,
+                                            latq_words,
+                                            tokens[m],
+                                            k_step,
+                                            lane,
+                                        )
+                                        if tile_k < resident
+                                        else _latent_fragment(latent, tokens[m], k_step, lane),
+                                        m * 16 + lane % 16,
+                                        count,
+                                        zero_pad,
+                                    ),
                                     accumulators[m],
                                     weight_scales[step],
                                     fx.ptr_load(
@@ -1619,7 +1669,7 @@ def build_moe(
                 )
                 before = fx.Int32(_realtime()) if profile else fx.Int32(0)
                 if tid == 0:
-                    _bounded_wait(flags, slot, tag, state, bid)
+                    _bounded_wait(flags, slot, tag, state, bid, nap)
                 _lds_barrier()
                 if const_expr(profile):
                     waited = waited + (fx.Int32(_realtime()) - before)
@@ -1693,8 +1743,13 @@ def build_moe(
                     for step in range_constexpr(DOWN_STEPS):
                         down_acc = _wmma(
                             down_weights[step],
-                            _activation_fragment(
-                                rows_lds, INTER_LDS_WORDS, down_local, step, lane
+                            _past_picks(
+                                _activation_fragment(
+                                    rows_lds, INTER_LDS_WORDS, down_local, step, lane
+                                ),
+                                down_index,
+                                count,
+                                zero_pad,
                             ),
                             down_acc,
                             down_scales[step],
@@ -1730,8 +1785,13 @@ def build_moe(
                     for step in range_constexpr(DOWN_STEPS):
                         accumulator = _wmma(
                             _weight_operand(stage, wave, lane, step, GROUP_DOWN_BYTES),
-                            _activation_fragment(
-                                rows_lds, INTER_LDS_WORDS, local, step, lane
+                            _past_picks(
+                                _activation_fragment(
+                                    rows_lds, INTER_LDS_WORDS, local, step, lane
+                                ),
+                                index,
+                                count,
+                                zero_pad,
                             ),
                             accumulator,
                             fx.ptr_load(item_scale + step * 32),
