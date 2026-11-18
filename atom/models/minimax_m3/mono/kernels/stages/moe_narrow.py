@@ -228,7 +228,7 @@ def moe_narrow_defs(k4ctx):
                 )
             cur = ug_load(ug_task_id(0)[0])
             stamp(7)
-            if const_expr(sh_late):
+            if const_expr(sh_late):  # noqa: SIM102
                 if has_sh:  # while the first routed task's weights are in flight
                     sh_compute(sh_j, sh_w[0], sh_w[1])
             # task i + 1's weights go out before task i's GEMV (software pipeline);

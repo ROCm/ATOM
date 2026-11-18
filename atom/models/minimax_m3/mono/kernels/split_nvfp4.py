@@ -411,7 +411,7 @@ def build_split_nvfp4_kernel(sm_scale: float, tasks: int, timed: bool = False):
             tid, lane, wave, ts // N_SPLIT, ts % N_SPLIT, blk, q, kv, kg, vg,
             sm_scale, lds.hst.ptr, lds.opart.ptr, n_ctx, put_o, put_m, put_l,
         )  # fmt: skip
-        if const_expr(timed):
+        if const_expr(timed):  # noqa: SIM102
             if tid == 0:
                 bo.buffer_store(fx.Int32(memrealtime() - t0), rsrc(tl), ts)
 

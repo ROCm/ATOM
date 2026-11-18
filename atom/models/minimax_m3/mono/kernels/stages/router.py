@@ -234,7 +234,7 @@ def router_defs(k4ctx):
                 for qq in range(2)
                 for i, f in enumerate(bf2_f32(arow[h][qq]))
             ]
-            if const_expr(AG_RS):
+            if const_expr(AG_RS):  # noqa: SIM102
                 # h_mid = bf16(bf16(sum) + residual): task t writes slice t
                 if tid // (XN_SLICE // RE) == t:
                     hw = (k * HIDDEN + tid * RE) // 2
