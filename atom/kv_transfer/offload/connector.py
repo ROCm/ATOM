@@ -219,6 +219,11 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         callback = getattr(self._impl, "bind_block_manager", None)
         if callable(callback):
             callback(block_manager)
+        # The CPU tier is this engine's own, so its chunks ride the engine's
+        # KV events.
+        publish = getattr(self._impl, "publish_tier_events", None)
+        if callable(publish):
+            publish()
 
     def prefetch_lookups(self, seqs) -> None:
         callback = getattr(self._impl, "prefetch_lookups", None)

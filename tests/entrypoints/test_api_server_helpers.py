@@ -1077,6 +1077,39 @@ def test_kv_event_sources_reports_the_store_keys_as_its_connector_builds_them(
     assert asyncio.run(api_server.kv_event_sources()) == expected
 
 
+@pytest.mark.parametrize(
+    "min_load, reported", [(None, 8192), ("0", 0)], ids=["default", "env"]
+)
+def test_kv_event_sources_reports_the_lmcache_load_rule(
+    monkeypatch, min_load, reported
+):
+    if min_load is None:
+        monkeypatch.delenv("OFFLOAD_MIN_LOAD_TOKENS", raising=False)
+    else:
+        monkeypatch.setenv("OFFLOAD_MIN_LOAD_TOKENS", min_load)
+    lmcache = {
+        "kv_connector": "lmcache_offload",
+        "kv_role": "offload",
+        "kv_connector_extra_config": {"lmcache.chunk_size": 128},
+    }
+    pd = {"kv_connector": "mooncake", "kv_role": "kv_producer"}
+    _kv_events_engine(
+        monkeypatch,
+        kv_transfer_config={"kv_connector": "multi", "connectors": [pd, lmcache]},
+        enable=True,
+        endpoint="tcp://*:5557",
+        topic="kv",
+    )
+    expected = _tcp_sources({0: 5557, 1: 5558})
+    for source in expected.values():
+        source["offload"] = {
+            "backend": "lmcache",
+            "chunk_tokens": 128,
+            "min_load_tokens": reported,
+        }
+    assert asyncio.run(api_server.kv_event_sources()) == expected
+
+
 # ---- --api-server-count: the worker side of api_server ----
 
 

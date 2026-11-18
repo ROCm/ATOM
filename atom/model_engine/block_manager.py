@@ -15,6 +15,7 @@ import numpy as np
 
 from atom.config import Config, DCPConfig
 from atom.distributed.kv_events import (
+    MEDIUM_CPU,
     MEDIUM_GPU,
     AllBlocksCleared,
     BlockRemoved,
@@ -100,8 +101,8 @@ def _make_block_stored(
     )
 
 
-def _make_block_removed(hashes: list[int]) -> BlockRemoved:
-    return BlockRemoved(block_hashes=hashes, medium=MEDIUM_GPU)
+def _make_block_removed(hashes: list[int], medium: str = MEDIUM_GPU) -> BlockRemoved:
+    return BlockRemoved(block_hashes=hashes, medium=medium)
 
 
 def _make_all_cleared() -> AllBlocksCleared:
@@ -3839,3 +3840,34 @@ class BlockManager:
                 cache_seed=cache_seed,
             )
         )
+
+    def record_offload_store(
+        self,
+        block_hashes: list[int],
+        token_ids: list[int],
+        parent_block_hash: int | None,
+        chunk_tokens: int,
+        token_offset: int,
+        cache_seed: int = -1,
+    ) -> None:
+        """Emit a BlockStored for chunks the CPU offload tier now holds on
+        every rank: medium CPU, one `chunk_tokens` block per chunk."""
+        if self._event_log is None or not block_hashes:
+            return
+        self._event_log.append(
+            _make_block_stored(
+                block_hashes,
+                token_ids,
+                parent_block_hash,
+                chunk_tokens,
+                medium=MEDIUM_CPU,
+                token_offset=token_offset,
+                cache_seed=cache_seed,
+            )
+        )
+
+    def record_offload_removed(self, block_hashes: list[int]) -> None:
+        """Emit a BlockRemoved for chunks the CPU offload tier no longer holds."""
+        if self._event_log is None or not block_hashes:
+            return
+        self._event_log.append(_make_block_removed(block_hashes, MEDIUM_CPU))

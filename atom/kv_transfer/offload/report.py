@@ -4,7 +4,9 @@
 """The offload tier as the Atomesh router reads it (`/kv_event_sources`).
 
 From a Mooncake Store's report the router finds the masters to ask which of a
-prompt's chunks the Store holds, under the keys `keys.chunk_keys` builds.
+prompt's chunks the Store holds, under the keys `keys.chunk_keys` builds. The
+in-process LMCache tier's chunks come in the engine's KV events instead
+(`tier_events`); its report gives the load rule the router applies to them.
 """
 
 from __future__ import annotations
@@ -18,11 +20,18 @@ from atom.kv_transfer.offload.mooncake_store.config import parse_mooncake_store_
 
 
 def offload_report(config: Any) -> dict[str, Any] | None:
-    """The report of the Mooncake Store connector `config` runs, on its own
-    view of `config` (a `multi` entry's); None without one."""
+    """The report of the Mooncake Store or in-process LMCache connector
+    `config` runs, on its own view of `config` (a `multi` entry's); None
+    without one."""
     for name, leaf in KVConnectorFactory.leaf_connectors(config) or ():
         if name == "mooncake_store":
             return _mooncake_store_report(leaf)
+        if name == "lmcache_offload":
+            return {
+                "backend": "lmcache",
+                "chunk_tokens": offcfg.lmcache_chunk_tokens(leaf.kv_transfer_config),
+                "min_load_tokens": leaf.offload_min_load_tokens,
+            }
     return None
 
 

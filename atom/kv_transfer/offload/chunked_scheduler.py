@@ -31,6 +31,7 @@ from atom.kv_transfer.offload.metadata import (
     LoadSpec,
     SaveSpec,
 )
+from atom.kv_transfer.offload.tier_events import TierEvents
 from atom.model_engine.sequence import SequenceStatus, resumes_offload_prefill
 from atom.utils import envs
 
@@ -54,6 +55,10 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
     _supports_early_block_release = False
     _request_meta_type = LMCacheReqMeta
     _step_meta_type = LMCacheOffloadMetadata
+    # The tier's chunks as KV events, once `publish_tier_events` found them
+    # publishable; `_tier_saves` then holds each save in flight as
+    # `(seq, saved, aligned)` until every rank stored it.
+    _tier_events: TierEvents | None = None
 
     def __init__(
         self,
@@ -171,6 +176,25 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         if self._block_manager is not None and self._block_manager is not block_manager:
             raise RuntimeError("offload scheduler is already bound to a block manager")
         self._block_manager = block_manager
+
+    def publish_tier_events(self) -> None:
+        """Publish the tier's chunks in the bound block manager's KV events,
+        when it records them. For a tier local to this engine only: a shared
+        store is read by the router directly."""
+        self._tier_events = TierEvents.for_tier(self._block_manager, self.chunk_size)
+        self._tier_saves: dict[SaveOperationId, tuple[object, int, int]] = {}
+
+    def _finish_save_statistics(self, operation) -> None:
+        super()._finish_save_statistics(operation)
+        if self._tier_events is not None:
+            saved = self._tier_saves.pop(operation, None)
+            if saved is not None:
+                self._tier_events.stored(*saved)
+
+    def _cancel_save_statistics(self, operation) -> None:
+        super()._cancel_save_statistics(operation)
+        if self._tier_events is not None:
+            self._tier_saves.pop(operation, None)
 
     # -- match: how many extra tokens can come from CPU/NVMe -------------
     def _begin_load_lifecycle(self, seq) -> None:
@@ -563,6 +587,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         if sid not in self._lookup_in_step:
             self._lookup_in_step.append(sid)
         self._lookup_results[sid] = (seq, 0)
+        asked = time.monotonic()
         _t0 = time.perf_counter()
         try:
             hit = self._lookup_client.lookup(
@@ -592,6 +617,15 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             hit = int(hit)
             self._lookup_results[sid] = (seq, hit)
         self._remember_tier_hit(seq, sid, hit)
+        if hit is not None and self._tier_events is not None:
+            # An answer an asynchronous lookup took earlier is as old as its query.
+            started = self._lookup_client.query_started(sid)
+            self._tier_events.looked_up(
+                seq,
+                len(token_ids),
+                hit,
+                asked if started is None else min(asked, started),
+            )
         if logger.isEnabledFor(logging.DEBUG):
             _lh = None
             try:
@@ -1076,6 +1110,8 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                     self._block_manager.free_leased_blocks(late_acquired)
                 continue
             self._track_save_statistics(save_operation, aligned - saved)
+            if self._tier_events is not None:
+                self._tier_saves[save_operation] = (seq, saved, aligned)
             meta.add_request(request)
             entry[1] = aligned
             self._save_previous_frontier[save_operation] = saved
