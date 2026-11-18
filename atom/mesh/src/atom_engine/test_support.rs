@@ -57,6 +57,11 @@ impl FakeCore {
             .unwrap();
     }
 
+    /// Frames sent as they are, encoded or not.
+    pub fn send_frames(&self, frames: Vec<Vec<u8>>) {
+        self.output.send_multipart(frames, 0).unwrap();
+    }
+
     /// The next message on `socket` within `timeout`: its body and data frames.
     pub fn recv_on(
         socket: &zmq::Socket,

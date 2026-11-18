@@ -3,7 +3,7 @@
 //! template kwargs the way it turns them. What reaches mesh's shared prepare
 //! is then rendered as api_server renders it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use axum::response::Response;
 use serde_json::Value;
@@ -13,7 +13,7 @@ use crate::{
     atom_engine::ReasoningToggle,
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage, MessageContent},
-        common::{ContentPart, ResponseFormat, ToolChoice, ToolChoiceValue},
+        common::{ContentPart, ResponseFormat, StreamOptions, Tool, ToolChoice, ToolChoiceValue},
     },
     routers::comm::error,
 };
@@ -79,6 +79,8 @@ impl AtomEngineRouter {
         if request.top_logprobs.is_some() && !request.logprobs {
             return Err(bad_request("top_logprobs requires logprobs=true".into()));
         }
+        validate_stream_options(request.stream, request.stream_options.as_ref())?;
+        validate_tool_list(request.tools.as_deref().unwrap_or_default())?;
 
         // Defaults under the request's own kwargs, then what api_server adds.
         let mut kwargs = request.chat_template_kwargs.take().unwrap_or_default();
@@ -114,6 +116,34 @@ impl AtomEngineRouter {
             required_tool_call,
         })
     }
+}
+
+/// `validate_stream_options`: `stream_options` only with `stream=true`. A
+/// non-boolean `include_usage` already fails to deserialize (a 400). Chat and
+/// `/v1/completions` both hold to it.
+pub(super) fn validate_stream_options(
+    stream: bool,
+    stream_options: Option<&StreamOptions>,
+) -> Result<(), Response> {
+    if stream_options.is_some() && !stream {
+        return Err(bad_request("stream_options requires stream=true".into()));
+    }
+    Ok(())
+}
+
+/// `validate_tool_list`: every tool a function, no name declared twice.
+fn validate_tool_list(tools: &[Tool]) -> Result<(), Response> {
+    let mut seen = HashSet::with_capacity(tools.len());
+    for (i, tool) in tools.iter().enumerate() {
+        if tool.tool_type != "function" {
+            return Err(bad_request(format!("tools[{i}].type must be 'function'")));
+        }
+        let name = tool.function.name.as_str();
+        if !seen.insert(name) {
+            return Err(bad_request(format!("duplicate tool name: {name}")));
+        }
+    }
+    Ok(())
 }
 
 /// `validate_chat_request`'s `tool_choice` rules; a string choice goes to the
@@ -384,7 +414,7 @@ mod tests {
         assert!(kwargs.is_empty());
     }
 
-    fn tool(name: &str) -> crate::protocols::common::Tool {
+    fn tool(name: &str) -> Tool {
         serde_json::from_value(
             json!({"type": "function", "function": {"name": name, "parameters": {}}}),
         )
