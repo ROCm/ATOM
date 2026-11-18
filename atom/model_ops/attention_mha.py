@@ -1800,6 +1800,8 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         max_seq_len,
         max_query_len,
         index_scorer=None,
+        index_score_work_map=None,
+        index_score_max_block=0,
     ):
         """Decode top-k with the context sharded across the indexer-CP group.
 
@@ -1812,8 +1814,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         world*topk keys per token at any context length.
 
         ``index_scorer`` (the MXFP4 index cache's, the step's record of this shard)
-        scores with aiter's FlyDSL scorer into its workspace; without one the
-        Triton scorer reads the BF16/FP8 cache.
+        scores with aiter's FlyDSL MXFP4 scorer into its workspace; without one the
+        FP8 cache is scored by the FlyDSL FP8 scorer on the step's
+        ``index_score_work_map`` (the shard's map, at its local ``index_score_max_block``).
         """
         from atom.distributed.indexer_cp import exchange_candidates
         from atom.model_ops.minimax_m3.indexer_candidate_exchange import (
@@ -1848,6 +1851,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 self.indexer_cp_world,
                 max_query_len,
                 self.scale,
+                # Built once per step in the metadata (this rank's local bound).
+                work_map=index_score_work_map,
+                max_block=index_score_max_block,
             )
         # Forced blocks are pinned in BOTH passes on purpose: one that lost its
         # owner shard's top-k would never arrive at the merge to be pinned.
@@ -1911,6 +1917,8 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                     sparse_metadata.max_seq_len,
                     max_query_len,
                     index_scorer=self._index_scorer(sparse_metadata),
+                    index_score_work_map=sparse_metadata.index_score_work_map,
+                    index_score_max_block=sparse_metadata.index_score_max_block,
                 )
             else:
                 topk_idx, sparse_bt, sparse_ctx = minimax_m3_index_topk_decode(
@@ -1928,6 +1936,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                     max_query_len=max_query_len,
                     n_valid_column_per_row=sparse_metadata.n_valid_column_per_row,
                     index_scorer=self._index_scorer(sparse_metadata),
+                    # Built once per step in the metadata: ~120us per layer otherwise.
+                    index_score_work_map=sparse_metadata.index_score_work_map,
+                    index_score_max_block=sparse_metadata.index_score_max_block,
                     **self._select_page_kwargs,
                 )
             self._store_cached_topk(

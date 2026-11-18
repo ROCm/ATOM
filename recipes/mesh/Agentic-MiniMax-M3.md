@@ -92,6 +92,7 @@ python -m atom.entrypoints.openai_server \
   --tensor-parallel-size 4 \
   --gpu-memory-utilization 0.8 \
   --block-size 128 \
+  --kv_cache_dtype fp8 \
   --max-model-len 262144 \
   --max-num-seqs 64 \
   --max-num-batched-tokens 65536 \
@@ -133,6 +134,7 @@ python -m atom.entrypoints.openai_server \
   --tensor-parallel-size 4 \
   --gpu-memory-utilization 0.8 \
   --block-size 128 \
+  --kv_cache_dtype fp8 \
   --max-model-len 262144 \
   --max-num-seqs 64 \
   --max-num-batched-tokens 262144 \

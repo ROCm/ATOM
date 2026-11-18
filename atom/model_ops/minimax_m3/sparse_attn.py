@@ -25,6 +25,7 @@ from aiter.ops.attention import pa_fwd_asm_supports_arch
 from atom.model_ops.minimax_m3.geometry import SPARSE_BLOCK_SIZE
 from atom.model_ops.minimax_m3.index_buffers import IndexScoreBuffers
 from atom.model_ops.minimax_m3.index_topk import (
+    build_index_score_work_map,
     build_n_valid_column_per_row,
     flydsl_ops,
 )
@@ -99,6 +100,20 @@ class MiniMaxM3SparseMetadata:
     `deepseek_v4_attn.csa_n_committed_per_token` hoists out for the sibling
     indexer. `index_topk` consumes it and never derives its own.
     """
+    index_score_work_map: torch.Tensor | None = None
+    """[grid, 2] int32 GPU -- the decode index-score kernel's packed dispatch
+    order, built once per step (~120us a call). None on prefill, on an empty
+    batch, with an MXFP4 scorer (`index_scorer` carries its own map) and under
+    ``score_work_map=False`` (a split decode); the FP8 scorer then builds its
+    own, correctly but per layer.
+    """
+    index_score_max_block: int = 0
+    """The bound `index_score_work_map` was built against, in 128-token blocks.
+
+    NOT `ceil(max_seq_len / 128)`: the map's row count is the grid baked at
+    capture, so the bound must not move -- `ceil(max_model_len / 128)`, or under
+    indexer CP this rank's LOCAL `ceil(that / world)`.
+    """
     index_scorer: IndexScoreBuffers | None = None
     """The MXFP4 index scorer's record for this step; None for any other index cache
     and on an empty batch (the scorer then refuses)."""
@@ -167,9 +182,20 @@ def make_sparse_decode_metadata(
     num_idx_heads: int,
     max_query_len: int = 1,
     n_valid_column_per_row_out: torch.Tensor | None = None,
+    index_score_work_map_out: torch.Tensor | None = None,
+    index_score_max_block: int = 0,
+    index_score_cp_world: int = 1,
+    index_score_cp_rank: int = 0,
+    index_score_num_idx_heads: int = 0,
     index_scorer: IndexScoreBuffers | None = None,
+    score_work_map: bool = True,
 ) -> MiniMaxM3SparseMetadata:
-    """``index_scorer`` is the builder's MXFP4 index scorer record (None for any other
+    """``score_work_map`` False skips the FP8 scorer's map (``index_score_work_map``):
+    the builder passes it for a split decode, fp8 cache or not (the micro-batches
+    carry their own maps), and for an MXFP4 cache (its map is the ``index_scorer``'s);
+    with an ``index_scorer`` the map is never built.
+
+    ``index_scorer`` is the builder's MXFP4 index scorer record (None for any other
     index cache): the step's work map is built into its capacity buffer here, once, at
     its ``max_block``, and the metadata carries the record with that map; an empty batch
     builds none. Under indexer CP the map is the record's shard over every index head
@@ -182,6 +208,13 @@ def make_sparse_decode_metadata(
         seq_lens=seq_lens, block_table=block_table, max_query_len=max_query_len
     )
     batch = seq_lens.shape[0]
+    # A caller that captures cudagraphs MUST pass its own fixed bound; this
+    # fallback is for eager and test paths.
+    index_score_max_block = index_score_max_block or triton.cdiv(
+        triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE), index_score_cp_world
+    )
+    # Differs from `num_idx_heads` under indexer CP (one score head per CP rank).
+    index_score_num_idx_heads = index_score_num_idx_heads or num_idx_heads
     step_scorer = None
     if index_scorer is not None and batch > 0:
         step_scorer = replace(
@@ -213,6 +246,20 @@ def make_sparse_decode_metadata(
             decode_max_q=max_query_len,
             out=n_valid_column_per_row_out,
         ),
+        index_score_work_map=(
+            build_index_score_work_map(
+                seq_lens,
+                max_block=index_score_max_block,
+                max_query_len=max_query_len,
+                num_idx_heads=index_score_num_idx_heads,
+                out=index_score_work_map_out,
+                cp_world=index_score_cp_world,
+                cp_rank=index_score_cp_rank,
+            )
+            if score_work_map and index_scorer is None
+            else None
+        ),
+        index_score_max_block=index_score_max_block,
         index_scorer=step_scorer,
     )
 

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
-"""FlyDSL is imported where an MXFP4 index step or a wide-row selection reaches for it,
-not by the modules every deployment loads (`aiter.ops.flydsl` imports `flydsl`, so a
-module-level import would make it mandatory for every MHA model and bf16 / fp8 cache).
+"""FlyDSL is imported where an index step or a wide-row selection reaches for it, not
+by the modules every deployment loads (`aiter.ops.flydsl` imports `flydsl`, so a
+module-level import would make it mandatory for every MHA model).
 Run in a subprocess with `flydsl` made unimportable."""
 
 import subprocess
@@ -38,7 +38,8 @@ _SCRIPT = textwrap.dedent("""
     from atom.model_ops.minimax_m3.sparse_attn import make_sparse_decode_metadata
     assert "flydsl" not in sys.modules
 
-    # a bf16 / fp8 step: no scorer record, the work map is not asked for
+    # an fp8 step needs the work map and an MXFP4 one the scorer record's: both raise where
+    # the step is built, not at import. `score_work_map=False` is the builder's split decode
     sparse_attn.build_n_valid_column_per_row = lambda *a, **k: None  # a Triton launch
     step = dict(
         seq_lens=torch.tensor([300], dtype=torch.int32),
@@ -47,7 +48,7 @@ _SCRIPT = textwrap.dedent("""
         max_seq_len=300,
         num_idx_heads=1,
     )
-    assert make_sparse_decode_metadata(**step).index_scorer is None
+    assert make_sparse_decode_metadata(**step, score_work_map=False).index_scorer is None
 
     # the MXFP4 index and the wide-row selector raise where reached, not at import
     def refused(call):
@@ -57,6 +58,7 @@ _SCRIPT = textwrap.dedent("""
             return
         raise AssertionError("no ImportError")
 
+    refused(lambda: make_sparse_decode_metadata(**step))
     refused(index_topk.flydsl_ops)
     refused(index_topk._small_k_selector)
     record = IndexScoreBuffers(scores=None, work_map=torch.empty(4, 2), max_block=3)
@@ -64,7 +66,7 @@ _SCRIPT = textwrap.dedent("""
     """)
 
 
-def test_bf16_and_fp8_need_no_flydsl_and_the_flydsl_paths_fail_where_selected():
+def test_importing_needs_no_flydsl_and_the_flydsl_paths_fail_where_selected():
     proc = subprocess.run(
         [sys.executable, "-c", _SCRIPT],
         check=False,

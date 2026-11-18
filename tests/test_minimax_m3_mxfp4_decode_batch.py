@@ -123,6 +123,8 @@ def test_the_sparse_attention_runs_only_the_rows_the_metadata_covers(
         max_seq_len=100,
         n_valid_column_per_row=None,
         index_scorer=object() if index == "fp4" else None,
+        index_score_work_map=None,
+        index_score_max_block=0,
         decode=types.SimpleNamespace(seq_lens=seq, block_table=table, max_query_len=mq),
         prefill=types.SimpleNamespace(
             cu_seqlens_q=torch.arange(batch + 1, dtype=torch.int32) * mq,
@@ -145,6 +147,7 @@ def test_the_sparse_attention_runs_only_the_rows_the_metadata_covers(
     [
         (True, 3, 24, 8, None, 3),  # a DP step padded past its requests: rows decide
         (False, 3, 24, 8, None, 8),  # the other index caches keep the padded batch
+        (False, 7, 8, 1, None, 8),  # 7 live of a bs=8 graph: the map is the capture's
         (True, 9, 24, 8, None, ValueError),  # fewer rows than scheduled: refused
         (True, 8, 8, 1, [1, 2], "split"),  # a split decode builds no whole-batch scorer
     ],
@@ -167,6 +170,8 @@ def test_the_decode_row_rule_and_the_split_step_are_the_mxfp4_indexs(
     b.refresh_flydsl_plan = lambda *_a, **_k: None
     b._get_sparse_attention_block_tables = lambda bt, sl, bs: bt
     b._n_valid_column_per_row_buffer = lambda: None
+    b._index_score_max_block = b._index_score_num_idx_heads = 0
+    b._index_score_cp_world, b._index_score_cp_rank = 1, 0
     b._has_sparse_attention, b.device, b.max_bs = True, "cpu", 16
     b.max_num_blocks_per_seq = b.block_table_cols = 4
     b.model_runner = types.SimpleNamespace(

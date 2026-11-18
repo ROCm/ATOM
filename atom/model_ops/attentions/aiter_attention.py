@@ -302,6 +302,34 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             if self._has_sparse_attention
             else {}
         )
+        # The FP8 index cache's decode scorer: one persistent dispatch map, refilled
+        # per step outside the graph (an MXFP4 cache carries its map in
+        # `_index_scorers`). Its row count is the baked grid, so the bound is the model
+        # length, local to this rank's shard under indexer CP.
+        self._index_score_max_block = 0
+        self._index_score_num_idx_heads = 0
+        self._index_score_cp_world, self._index_score_cp_rank = self._index_cp_shard()
+        if self._has_sparse_attention and "" not in self._index_scorers:
+            from atom.model_ops.minimax_m3.geometry import SPARSE_BLOCK_SIZE
+
+            self._index_score_max_block = triton.cdiv(
+                triton.cdiv(config.max_model_len, SPARSE_BLOCK_SIZE),
+                self._index_score_cp_world,
+            )
+            # NOT `_num_idx_heads`: under indexer CP the sparse layer scores one
+            # head per CP rank (`attention_mha.py`), and the row-count assert in
+            # `decode_index_score` would not catch a divergence.
+            self._index_score_num_idx_heads = (
+                self._index_score_cp_world
+                if self._index_score_cp_world > 1
+                else num_head_k
+            )
+            rows = self._index_score_work_map_rows(self.max_bs, max_qlen)
+            self.model_runner.forward_vars["sparse_attention_index_score_work_map"] = (
+                torch.empty((rows, 2), dtype=torch.int32, device=self.device)
+                if rows
+                else None
+            )
         self._pa_decode_bf16_asm_enabled = (
             use_pa_decode_bf16_asm() and model_runner.block_size == 256
         )
@@ -365,6 +393,14 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 shapes["sparse_attention_block_tables"] = (
                     self.max_bs,
                     self.max_num_blocks_per_seq,
+                )
+            work_map = var.get("sparse_attention_index_score_work_map")
+            if work_map is not None:
+                # Per micro-batch for the same reason: one shared map would have the
+                # second overwrite the first before its layers ran.
+                shapes["sparse_attention_index_score_work_map"] = (
+                    self._index_score_work_map_rows(self.max_bs, var["max_qlen"]),
+                    2,
                 )
         return shapes
 
@@ -508,9 +544,14 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # the one geometry check of an MXFP4 page, as the K / V layout makes it
             Mxfp4KvLayout().check(self.block_size, dim, entry_tokens // self.block_size)
             return _IndexCacheSpec(rows, (PAGE_BYTES,), torch.uint8, (-1, PAGE_BYTES))
-        if index_dtype not in ("bf16", "fp8"):
+        if index_dtype == "bf16":
+            # refused here, at allocation, not 57 layers into the first decode step
+            from atom.model_ops.minimax_m3.index_topk import index_cache_must_be_fp8
+
+            raise ValueError(index_cache_must_be_fp8("native", "'bf16'"))
+        if index_dtype != "fp8":
             raise ValueError(
-                f"index_cache_dtype must be 'bf16', 'fp8' or 'fp4', got {index_dtype!r}"
+                f"index_cache_dtype must be 'fp8' or 'fp4', got {index_dtype!r}"
             )
         dtype = dtypes.d_dtypes[index_dtype]
         return _IndexCacheSpec(
@@ -651,6 +692,36 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         return self.model_runner.forward_vars[
             f"{prefix}sparse_attention_n_valid_column_per_row"
         ]
+
+    def _index_score_work_map_rows(self, max_bs: int, max_qlen: int) -> int:
+        """Rows of a decode work-map buffer: aiter's CAPACITY, not the exact grid at
+        ``max_bs``, which is non-monotonic in the batch."""
+        from atom.model_ops.minimax_m3.index_topk import index_score_work_map_capacity
+
+        return index_score_work_map_capacity(
+            max_bs,
+            self._index_score_max_block,
+            max_qlen,
+            self._index_score_num_idx_heads,
+            self._index_score_cp_world,
+            self._index_score_cp_rank,
+        )
+
+    def _index_score_kwargs(self, prefix: str = "", *, skip: bool = False) -> dict:
+        """`make_sparse_decode_metadata`'s FP8-index work-map arguments for the
+        ``prefix`` set. An MXFP4 cache takes its map from `_index_scorers`, and a
+        split decode (``skip``) runs only its micro-batches' maps: both ask for none."""
+        if skip or "" in self._index_scorers:
+            return {"score_work_map": False}
+        return {
+            "index_score_work_map_out": self.model_runner.forward_vars.get(
+                f"{prefix}sparse_attention_index_score_work_map"
+            ),
+            "index_score_max_block": self._index_score_max_block,
+            "index_score_num_idx_heads": self._index_score_num_idx_heads,
+            "index_score_cp_world": self._index_score_cp_world,
+            "index_score_cp_rank": self._index_score_cp_rank,
+        }
 
     @staticmethod
     def _index_cp_shard() -> tuple[int, int]:
@@ -915,6 +986,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 max_query_len=1,
                 num_idx_heads=self._num_idx_heads,
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(),
+                **self._index_score_kwargs(),
                 index_scorer=self._index_scorers.get(""),
             )
         # Same short-circuit as the metadata launch above. A dummy step would
@@ -1121,6 +1193,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 max_query_len=int(max_seqlen_q),
                 num_idx_heads=self._num_idx_heads,
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(),
+                **self._index_score_kwargs(skip=attn_metadata.ubatches is not None),
                 # a split decode (cut before the builder runs, `_cut_ubatches`) runs only its
                 # micro-batches' metadata, each with the map of its own (`finish_ubatch`):
                 # the whole batch's would be a launch nobody reads
@@ -1165,6 +1238,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(
                     f"ub{ubatch_idx}_"
                 ),
+                **self._index_score_kwargs(f"ub{ubatch_idx}_"),
                 # both ubatches' metadata are alive at once on one stream: a shared map
                 # would be overwritten by the second before the first one's layers ran
                 index_scorer=self._index_scorers.get(f"ub{ubatch_idx}_"),
@@ -1217,6 +1291,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 max_query_len=max_q_len,
                 num_idx_heads=self._num_idx_heads,
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(),
+                **self._index_score_kwargs(skip=bool(decode_ubatch_slices)),
                 # a split bucket runs on its micro-batches' maps, as in `finish_decode`
                 index_scorer=(
                     None if decode_ubatch_slices else self._index_scorers.get("")
