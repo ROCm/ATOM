@@ -230,7 +230,15 @@ python3 -m atom.entrypoints.openai_server \
 
 ### gsm8k
 
-按指南 §3.3，`MODEL_PATH=/models/GLM-5.2-MXFP4`，`PORT=8000`。
+GLM-5.2 先思考再回答，要走 chat 接口：用 ATOM main `recipes/GLM-5.md` 的命令（修正了它 URL 里的 `//v1` 和接口类型），5-shot，和 LLM-Booster#470 的 baseline（strict 0.9644 / flexible 0.9636）同一测法。指南 §3.3 的 `local-completions` 3-shot 不套 chat template，2026-11-14 同一个镜像和 server 上只有 0.9219，换成下面的命令是 0.9629。
+
+```bash
+HF_HUB_OFFLINE=0 lm_eval --model local-chat-completions --apply_chat_template \
+  --model_args "model=/models/GLM-5.2-MXFP4,base_url=http://127.0.0.1:8000/v1/chat/completions,api_key=EMPTY,eos_string=</s>,max_retries=5,num_concurrent=64,timeout=1800,tokenized_requests=False,max_length=1048576" \
+  --tasks gsm8k --gen_kwargs max_tokens=16384,temperature=0,top_p=1 --num_fewshot 5 --output_path "$ACC_DIR" > "$ACC_DIR/lm_eval.log" 2>&1
+```
+
+accuracy.csv 的 `num_fewshot` 写 `5`。
 
 ### bench
 
@@ -286,7 +294,15 @@ python3 -u -m atom.entrypoints.openai_server \
 
 ### gsm8k
 
-按指南 §3.3，`MODEL_PATH=/models/MiniMax-M3-MXFP4`，`PORT=8890`。
+MiniMax-M3 默认开思考（`thinking_mode: enabled`），要走 chat 接口：用 ATOM main `recipes/MiniMax-M3.md` 的命令（chat template，few-shot 按多轮，`max_gen_toks=16384`），5-shot，和那里的 known-good（MXFP4 + EAGLE3 TP4 flexible 0.947）同一测法。指南 §3.3 的 `local-completions` 3-shot 不套 chat template，2026-11-14 同一个镜像和 server 上只有 0.8726，换成下面的命令是 0.9492；3-shot 把 `max_gen_toks` 放到 2048 也只有 0.8590，不是截断。
+
+```bash
+HF_HUB_OFFLINE=0 lm_eval --model local-chat-completions --apply_chat_template --fewshot_as_multiturn \
+  --model_args "model=/models/MiniMax-M3-MXFP4,base_url=http://127.0.0.1:8890/v1/chat/completions,num_concurrent=32,max_retries=3,max_gen_toks=16384,tokenized_requests=False,trust_remote_code=True" \
+  --tasks gsm8k --num_fewshot 5 --output_path "$ACC_DIR" > "$ACC_DIR/lm_eval.log" 2>&1
+```
+
+accuracy.csv 的 `num_fewshot` 写 `5`。
 
 ### bench
 
