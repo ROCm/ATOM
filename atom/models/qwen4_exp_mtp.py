@@ -124,6 +124,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
                     fuse_shared_expert=(
                         isinstance(quant_config, _UnquantizedMTPQuantizationConfig)
                         and get_gfx_runtime() == "gfx942"
+                        and not atom_config.enable_expert_parallel
                     ),
                 )
             ]

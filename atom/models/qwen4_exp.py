@@ -339,7 +339,6 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
         pad_align = moe_pad_align(
             config.moe_intermediate_size, self.tp_size, expert_quant
         )
-        self.use_gfx942_tuned_moe = pad_align == 64
         self.fuse_shared = (
             fuse_shared_expert
             and is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
@@ -392,6 +391,9 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
             shared_expert_prefix=f"{prefix}.shared_expert",
             pad_align=pad_align,
         )
+        # The whole-MoE table is for pure TP; EP keeps its dispatch/masking
+        # contract, including the real token count on padded rows.
+        self.use_gfx942_tuned_moe = pad_align == 64 and not self.experts.use_ep
         install_stacked_expert_loaders(self.experts)
         self._single_token_ok: bool | None = None
 
