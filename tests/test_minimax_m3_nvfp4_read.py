@@ -2,7 +2,7 @@
 """NVFP4 read path end to end, without the model: pages written by aiter's
 ``fused_qknorm_idxrqknorm`` (its NVFP4 mode, from random qkv rows),
 scored and selected by ``minimax_m3_index_topk{,_decode}`` (an ``nvfp4`` `IndexScoreBuffers`), attended
-by ``sparse_attn_nvfp4``. Oracles are plain torch on the *dequantized pages* (a
+by aiter's ``sparse_pa_nvfp4_{decode,prefill}``. Oracles are plain torch on the *dequantized pages* (a
 token-major reader written here from the page offsets of ``nvfp4_pages``, independent of
 both the writer and the kernels; so it also pins the page layout the writer and the
 readers share):
@@ -13,7 +13,8 @@ readers share):
 * the attention: softmax over the keys of the blocks the selector *picked*, fp64.
 
 Needs gfx950 and an aiter with the NVFP4 kernels (FlyDSL scorers and sparse PA, the
-fused writer's NVFP4 mode); an older aiter skips, like the MXFP4 tests.
+fused writer's NVFP4 mode), which are all on aiter main. Only the arch is a skip: an
+aiter that lacks one of them fails here, as it would fail the server.
 """
 
 import pytest
@@ -21,35 +22,10 @@ import torch
 
 aiter = pytest.importorskip("aiter")
 
-_KERNELS = (
-    "minimax_m3_index_score_nvfp4_flydsl",
-    "minimax_m3_index_score_prefill_nvfp4_flydsl",
-    "sparse_pa_nvfp4_decode",
-    "sparse_pa_nvfp4_prefill",
-)
-
-
-def _missing_kernels():
-    """The NVFP4 FlyDSL kernels this aiter lacks (it exports them lazily)."""
-    try:
-        from aiter.ops import flydsl
-    except ImportError:
-        return list(_KERNELS)
-    missing = []
-    for name in _KERNELS:
-        try:
-            getattr(flydsl, name)
-        except (AttributeError, ImportError):
-            missing.append(name)
-    return missing
-
-
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
-    or "gfx950" not in torch.cuda.get_device_properties(0).gcnArchName
-    or bool(_missing_kernels()),
-    reason="needs gfx950 and an aiter with the NVFP4 FlyDSL kernels "
-    f"(missing: {_missing_kernels()})",
+    or "gfx950" not in torch.cuda.get_device_properties(0).gcnArchName,
+    reason="needs gfx950",
 )
 
 from atom.model_ops.minimax_m3.nvfp4_pages import (
@@ -82,14 +58,11 @@ def write_pages(kv, idx, slots, heads, group, ks, vs, gen):
     cos_sin = torch.randn(4096, rotary, device="cuda", generator=gen).to(torch.bfloat16)
     q_out = torch.empty(n, nq * DIM, dtype=torch.bfloat16, device="cuda")
     iq_out = torch.empty(n, DIM, dtype=torch.float8_e4m3fn, device="cuda")
-    try:
-        aiter.fused_qknorm_idxrqknorm(
-            qkv, weight(), weight(), cos_sin, pos, nq, heads, rotary, 1e-6,
-            weight(), weight(), 1, slots, kv, kv, idx, 128, q_out, iq_out, slots,
-            kv_cache_dtype="nvfp4", index_cache_dtype="nvfp4", k_scale=ks, v_scale=vs,
-        )  # fmt: skip
-    except Exception as e:  # noqa: BLE001 - an aiter without the NVFP4 write mode
-        pytest.skip(f"aiter's fused writer has no NVFP4 mode: {e}")
+    aiter.fused_qknorm_idxrqknorm(
+        qkv, weight(), weight(), cos_sin, pos, nq, heads, rotary, 1e-6,
+        weight(), weight(), 1, slots, kv, kv, idx, 128, q_out, iq_out, slots,
+        kv_cache_dtype="nvfp4", index_cache_dtype="nvfp4", k_scale=ks, v_scale=vs,
+    )  # fmt: skip
 
 
 def _fp4_values(codes):
@@ -240,11 +213,11 @@ def test_decode_select_and_attend(lens, S, heads, gs):
     from aiter.ops.flydsl import (
         minimax_m3_index_score_work_map,
         minimax_m3_index_score_work_map_capacity,
+        sparse_pa_nvfp4_decode,
     )
 
     from atom.model_ops.minimax_m3.index_buffers import IndexScoreBuffers
     from atom.model_ops.minimax_m3.index_topk import minimax_m3_index_topk_decode
-    from atom.model_ops.minimax_m3.sparse_attn_nvfp4 import sparse_pa_nvfp4_decode
     from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
 
     case = Case(lens, heads=heads, seed=len(lens) * 7 + S, gs=gs)
@@ -275,8 +248,9 @@ def test_decode_select_and_attend(lens, S, heads, gs):
             assert got == want[h], f"row {r} head {h}"
     out = torch.empty_like(q)
     sparse_pa_nvfp4_decode(
-        q, case.kv, topk, case.table, seq, sm, case.ks, case.vs, S, out
-    )
+        q, case.kv, topk, case.table, seq, sm,
+        out=out, k_scale=case.ks, v_scale=case.vs, query_len=S,
+    )  # fmt: skip
     ref = attend_reference(case, q, topk, rows_req, rows_causal, sm)
     assert rel_l2(out, ref) < 2.5e-3
 
@@ -286,12 +260,11 @@ def test_decode_select_and_attend(lens, S, heads, gs):
     [([37, 200, 5], [0, 128 * 12, 128 * 30 + 3], 1), ([64, 9], [128 * 8, 0], 2)],
 )
 def test_prefill_select_and_attend(qlens, prefix, heads):
+    from aiter.ops.flydsl import sparse_pa_nvfp4_prefill
+
     from atom.model_ops.minimax_m3.index_buffers import IndexScoreBuffers
     from atom.model_ops.minimax_m3.index_topk import minimax_m3_index_topk
-    from atom.model_ops.minimax_m3.sparse_attn_nvfp4 import (
-        prefill_row_positions,
-        sparse_pa_nvfp4_prefill,
-    )
+    from atom.model_ops.minimax_m3.sparse_attn_nvfp4 import prefill_row_positions
     from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
 
     lens = [p + n for p, n in zip(prefix, qlens)]
@@ -319,7 +292,8 @@ def test_prefill_select_and_attend(qlens, prefix, heads):
             assert got == want[h], f"row {r} head {h}"
     out = torch.empty_like(q)
     sparse_pa_nvfp4_prefill(
-        q, case.kv, topk, case.table, req, kvl, sm, case.ks, case.vs, out
-    )
+        q, case.kv, topk, case.table, req, kvl, sm,
+        out=out, k_scale=case.ks, v_scale=case.vs,
+    )  # fmt: skip
     ref = attend_reference(case, q, topk, rows_req, rows_causal, sm)
     assert rel_l2(out, ref) < 2.5e-3

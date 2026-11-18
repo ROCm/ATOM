@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""The MXFP4 index scorer's persistent state as one record, and its allocation, in a
-module that imports no aiter or triton at the top: the kernels' modules (`sparse_attn`,
-`index_topk`) import aiter, and the non-GPU test suite has to be able to build the
-record."""
+"""The FP4 (MXFP4 / NVFP4) index scorer's persistent state as one record, and its
+allocation, in a module that imports no aiter or triton at the top: the kernels' modules
+(`sparse_attn`, `index_topk`) import aiter, and the non-GPU test suite has to be able to
+build the record."""
 
 from dataclasses import dataclass, replace
 
@@ -16,7 +16,7 @@ from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
 
 @dataclass(frozen=True)
 class IndexScoreBuffers:
-    """The MXFP4 index scorer's persistent state, one immutable record.
+    """The FP4 (MXFP4 / NVFP4) index scorer's persistent state, one immutable record.
 
     ``scores`` is the `LogitsWorkspace` every layer's scorer writes its fp32 block
     scores into, viewed contiguous ``[heads, rows, width]`` (what aiter's selector

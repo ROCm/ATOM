@@ -31,17 +31,17 @@ from dataclasses import dataclass
 import torch
 
 from atom.model_ops.attentions.pool_layout.entry_arena import EntryField
+from atom.model_ops.minimax_m3.geometry import SPARSE_BLOCK_SIZE
 
-PAGE_TOKENS = 128
 HEAD_DIM = 128
 GROUP = 16  # elements one e4m3 scale covers
 GROUPS = HEAD_DIM // GROUP
 DATA_BYTES = HEAD_DIM // 2  # per token
 SCALE_BYTES = GROUPS  # per token, index page
-INDEX_DATA_PAGE_BYTES = PAGE_TOKENS * DATA_BYTES
-INDEX_PAGE_BYTES = PAGE_TOKENS * (DATA_BYTES + SCALE_BYTES)  # 9216
-HEAD_DATA_BYTES = PAGE_TOKENS * DATA_BYTES  # one head of one side, 8192
-HEAD_SCALE_BYTES = PAGE_TOKENS * SCALE_BYTES  # 1024
+INDEX_DATA_PAGE_BYTES = SPARSE_BLOCK_SIZE * DATA_BYTES
+INDEX_PAGE_BYTES = SPARSE_BLOCK_SIZE * (DATA_BYTES + SCALE_BYTES)  # 9216
+HEAD_DATA_BYTES = SPARSE_BLOCK_SIZE * DATA_BYTES  # one head of one side, 8192
+HEAD_SCALE_BYTES = SPARSE_BLOCK_SIZE * SCALE_BYTES  # 1024
 HEAD_SIDE_BYTES = HEAD_DATA_BYTES + HEAD_SCALE_BYTES  # 9216 == INDEX_PAGE_BYTES
 
 
@@ -67,10 +67,10 @@ def index_page_views(pages: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     lead, lead_strides = tuple(pages.shape[:-1]), tuple(pages.stride()[:-1])
     off = pages.storage_offset()
     data = pages.as_strided(
-        (*lead, PAGE_TOKENS, DATA_BYTES), (*lead_strides, DATA_BYTES, 1), off
+        (*lead, SPARSE_BLOCK_SIZE, DATA_BYTES), (*lead_strides, DATA_BYTES, 1), off
     )
     scale = pages.as_strided(
-        (*lead, PAGE_TOKENS, SCALE_BYTES),
+        (*lead, SPARSE_BLOCK_SIZE, SCALE_BYTES),
         (*lead_strides, SCALE_BYTES, 1),
         off + INDEX_DATA_PAGE_BYTES,
     )
@@ -104,9 +104,13 @@ class Nvfp4KvLayout:
     tag: str = "nvfp4"
 
     def check(self, block_size: int, head_dim: int, blocks_per_entry: int) -> None:
-        if block_size != PAGE_TOKENS or head_dim != HEAD_DIM or blocks_per_entry != 1:
+        if (
+            block_size != SPARSE_BLOCK_SIZE
+            or head_dim != HEAD_DIM
+            or blocks_per_entry != 1
+        ):
             raise ValueError(
-                f"an NVFP4 KV page is {PAGE_TOKENS} tokens of head_dim {HEAD_DIM}, "
+                f"an NVFP4 KV page is {SPARSE_BLOCK_SIZE} tokens of head_dim {HEAD_DIM}, "
                 f"one block an entry; got block_size {block_size}, head_dim "
                 f"{head_dim}, {blocks_per_entry} blocks an entry"
             )

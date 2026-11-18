@@ -1984,8 +1984,9 @@ FP4_CACHE_DTYPES = ("fp4", "nvfp4")
 
 
 def _check_fp4_kv(kv_cache_dtype: str, *, is_m3: bool, is_v41: bool) -> None:
-    """``--kv-cache-dtype fp4`` is MiniMax-M3.1's to ask for and DeepSeek-V4.1's own;
-    refused for every other model. The guard admits the MiniMax-M3 architecture and
+    """``--kv-cache-dtype fp4`` (MXFP4) is MiniMax-M3.1's to ask for and DeepSeek-V4.1's
+    own, and ``nvfp4`` is MiniMax-M3's alone; each is refused for every other model.
+    The guard admits the MiniMax-M3 architecture and
     ``minimax_m3.config.validate_runtime_config`` then refuses what is not M3.1
     (a model with dense attention layers)."""
     if kv_cache_dtype == "fp4" and not (is_m3 or is_v41):

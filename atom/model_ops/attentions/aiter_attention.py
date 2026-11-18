@@ -464,8 +464,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 blocks_per_entry=self.block_ratio,
                 num_kv_heads=geometry.num_kv_heads,
                 head_dim=geometry.head_dim,
-                # An MXFP4 layout declares its own bytes (uint8 pages); the dtype
-                # is read only by the dtype-wide cache, which `fp4` is not.
+                # An FP4 (MXFP4 / NVFP4) layout declares its own bytes (uint8 pages);
+                # the dtype is read only by the dtype-wide cache, which FP4 is not.
                 kv_dtype=(
                     torch.uint8
                     if geometry.layout is not None
@@ -609,7 +609,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # the layout has scale planes): page-128 SHUFFLE, which
             # SparseMHAPagedAttentionImpl.rope_cache re-views as page-16 at attention
             # time; under `--kv-cache-dtype fp4`, scale-less MXFP4 pages (8704 B a page
-            # and kv head) used as they are. Only the separate indexer-key cache is
+            # and kv head), under `nvfp4` NVFP4 pages (data and scales in one buffer,
+            # 18432 B a page and kv head), used as they are. Only the separate
+            # indexer-key cache is
             # bound here; each sparse layer has its own row in that second space.
             runner = self.model_runner
             pool = next(p for p in self.kv_pools.values() if p.extra_fields)
@@ -638,9 +640,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         row = self.pool_rows[geometry][module]
 
         k_cache, v_cache = pool.kv_views(row)
-        # A layout with scale planes hands them over; an MXFP4 pool has none, its
-        # pages carry their own (the sparse impl takes the (data, scale) views of
-        # them, mxfp4_pages.page_views).
+        # A layout with scale planes hands them over; an FP4 (MXFP4 / NVFP4) pool has
+        # none, its pages carry their own (the sparse impl takes the (data, scale)
+        # views of them, mxfp4_pages.page_views).
         if pool.scale_fields:
             module.k_scale, module.v_scale = pool.scale_views(row)
 
@@ -681,7 +683,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
     @staticmethod
     def _index_cp_shard() -> tuple[int, int]:
         """This rank's indexer-CP ``(world, rank)``, ``(1, 0)`` without CP: under it the
-        MXFP4 decode scorer runs every index head over the rank's 1/P of the blocks."""
+        FP4 decode scorer runs every index head over the rank's 1/P of the blocks."""
         from atom.distributed.indexer_cp import (
             get_indexer_cp_rank,
             get_indexer_cp_world_size,
@@ -986,6 +988,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 num_prefill_tokens=batch.scheduled_tokens,
                 num_idx_heads=self._num_idx_heads,
                 index_scorer=self._index_scorers.get(""),
+                nvfp4_kv=self.model_runner.config.kv_cache_dtype == "nvfp4",
             )
 
     def _refuse_ragged_on_rectangular_layers(
@@ -1122,15 +1125,15 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # Plain decode (q==1) and eagle3 spec-verify (q==num_spec+1) both run
             # the DECODE sparse path; the decode kernels handle q>1 per-token
             # causal internally via max_query_len.
-            # The MXFP4 scorer takes its batch off the rows of idx_q, which a DP step
+            # The FP4 scorer takes its batch off the rows of idx_q, which a DP step
             # can make more or fewer than `running_bs * q`; `_sparse_decode` slices q /
             # idx_q to this batch. The other index caches keep the padded batch.
             index_bs = running_bs
-            if "" in self._index_scorers:  # the MXFP4 index cache
+            if "" in self._index_scorers:  # an FP4 (MXFP4 / NVFP4) index cache
                 index_bs = min(running_bs, running_tokens // max_seqlen_q)
                 if index_bs < batch.total_seqs_num_decode:
                     raise ValueError(
-                        f"MXFP4 index decode: {running_tokens} rows of {max_seqlen_q} "
+                        f"FP4 index decode: {running_tokens} rows of {max_seqlen_q} "
                         f"query tokens do not cover the {batch.total_seqs_num_decode} "
                         "scheduled requests"
                     )

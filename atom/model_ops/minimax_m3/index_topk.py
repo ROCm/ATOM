@@ -9,14 +9,14 @@ sparse block maps to exactly one page.
 
 The two phases score differently -- prefill over whole query tiles, decode over
 one request's rows at a time -- and then share a selector. A bf16 / fp8 index cache
-is scored by the Triton kernels here; an MXFP4 one (``--index-cache-dtype fp4``) by
-aiter's FlyDSL scorers, which write the same fp32 block scores (see
-:func:`minimax_m3_index_topk_decode` for their layout). The selector after either is
-this module's Triton one, or aiter's per-row one where it is cheaper.
+is scored by the Triton kernels here; an FP4 one (``--index-cache-dtype fp4`` for MXFP4,
+``nvfp4`` for NVFP4) by aiter's FlyDSL scorers, which write the same fp32 block scores
+(see :func:`minimax_m3_index_topk_decode` for their layout). The selector after either
+is this module's Triton one, or aiter's per-row one where it is cheaper.
 
 Index-K cache layout: ``(num_blocks, 128, idx_head_dim)`` for bf16 / fp8, uint8
-``(num_blocks, 8704)`` MXFP4 pages otherwise. The indexer is MQA: index_q carries
-num_idx_heads heads, index_k one, shared by all of them.
+``(num_blocks, 8704)`` MXFP4 pages or ``(num_blocks, 9216)`` NVFP4 pages otherwise. The
+indexer is MQA: index_q carries num_idx_heads heads, index_k one, shared by all of them.
 
 Only the paths MiniMax M3 uses are implemented: score_type="max", index value
 disabled (score-only indexer). The selected block ids feed the block-sparse
@@ -40,7 +40,7 @@ from atom.model_ops.minimax_m3.nvfp4_pages import index_page_views as nvfp4_page
 
 @functools.cache
 def flydsl_ops():
-    """aiter's FlyDSL module (MXFP4 index scorers, work map), imported on first use:
+    """aiter's FlyDSL module (FP4 index scorers, work map), imported on first use:
     every bf16 / fp8 deployment imports this module and must not need FlyDSL."""
     from aiter.ops import flydsl
 
@@ -790,7 +790,7 @@ def _select_with_aiter(
 
     Declines rather than raises: k past the wave width, or a survivor buffer
     past the LDS budget, are shapes the Triton selector still handles. `topk_idx`
-    and `score` are contiguous (every scorer writes one, the MXFP4 ones into the
+    and `score` are contiguous (every scorer writes one, the FP4 ones into the
     index workspace), so their flattenings are views.
     """
     heads, total_q, max_block = score.shape

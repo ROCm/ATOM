@@ -7,28 +7,31 @@ imports neither the model nor AITER until the architecture check needs it."""
 from atom.config import FP4_CACHE_DTYPES
 
 
-def _mxfp4_kv_refusal(config) -> str | None:
-    """Why ``--kv-cache-dtype fp4`` cannot run this MiniMax-M3 here, or None.
+def _fp4_kv_refusal(config) -> str | None:
+    """Why ``--kv-cache-dtype fp4|nvfp4`` cannot run this MiniMax-M3 here, or None.
 
-    The MXFP4 KV has a writer and a reader only for indexed sparse layers (M3.1: every
-    layer), so nothing falls back to FP8 for a layer or page it cannot hold: refused.
+    The FP4 (MXFP4 / NVFP4) KV has a writer and a reader only for indexed sparse layers
+    (M3.1: every layer), so nothing falls back to FP8 for a layer or page it cannot
+    hold: refused.
     """
     import torch
 
     if config.torch_dtype != torch.bfloat16:
-        # aiter's MXFP4 pa_decode only writes bf16; an fp16 model fails in its first forward.
+        # aiter's FP4 writers and sparse PA only handle bf16; an fp16 model fails in its
+        # first forward.
         return f"it needs a bfloat16 model, got {config.torch_dtype}"
     if config.kv_transfer_config:
         # Offload / P-D transfer moves pages by a layout that does not know this format.
         return "it does not run with KV offload or --kv-transfer-config"
     if config.sequence_parallel_size > 1:
         # Ulysses leaves a top-k reusing layer's qkv without index columns; the fused
-        # MXFP4 writer checks the row width and needs them.
+        # FP4 writer checks the row width and needs them.
         return "it does not run with --sequence-parallel-size > 1"
     spec = config.speculative_config
     if spec is not None and spec.draft_kv_dtype in FP4_CACHE_DTYPES:
-        # An FP4 dtype is left only on a draft in the target's pool (MTP), which has no
-        # FP4 attention impl to write its rows; an own-pool draft is bf16 and passes.
+        # An FP4 dtype (either) is left only on a draft in the target's pool (MTP),
+        # which has no FP4 attention impl to write its rows; an own-pool draft is bf16
+        # and passes.
         return "the speculative draft would have FP4 KV, which it has no layout for"
 
     text = getattr(config.hf_config, "text_config", None) or config.hf_config
@@ -49,7 +52,7 @@ def _mxfp4_kv_refusal(config) -> str | None:
             "it needs every one of num_hidden_layers attention layers to be an "
             "indexed sparse one (sparse_attention_config.use_sparse_attention and "
             "a sparse_attention_freq of exactly 1 per layer, as MiniMax-M3.1); "
-            "dense attention layers have no MXFP4 writer or reader"
+            "dense attention layers have no FP4 writer or reader"
         )
     return None
 
@@ -105,7 +108,7 @@ def validate_runtime_config(config):
             f"--index-cache-dtype nvfp4 needs --kv-cache-dtype nvfp4, got {kv}"
         )
     if kv in FP4_CACHE_DTYPES:
-        why = _mxfp4_kv_refusal(config)
+        why = _fp4_kv_refusal(config)
         if why is not None:
             raise ValueError(f"--kv-cache-dtype {kv}: {why}")
     block_size = config.kv_cache_block_size
