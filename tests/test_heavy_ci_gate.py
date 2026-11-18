@@ -23,11 +23,14 @@ def _run_gate(
     tmp_path,
     *,
     labels=(),
+    live_labels=None,
+    labels_query_fails=False,
     review_decision="",
     review_query_fails=False,
     allowed="ci:full,ci:vllm",
     event_name="pull_request",
     action="synchronize",
+    added_label=None,
     review_state="approved",
     run_attempt=1,
     current_pr=None,
@@ -48,6 +51,7 @@ def _run_gate(
         json.dumps(
             {
                 "action": action,
+                **({"label": {"name": added_label}} if added_label else {}),
                 "review": {"state": review_state},
                 "pull_request": {
                     "number": 2166,
@@ -99,6 +103,11 @@ elif [[ "${2:-}" == "graphql" ]]; then
     exit 1
   fi
   printf '%s\\n' "${FAKE_REVIEW_DECISION:-}"
+elif [[ " $* " == *"/issues/"*"/labels"* ]]; then
+  if [[ "${FAKE_LABELS_QUERY_FAIL:-0}" == "1" ]]; then
+    exit 1
+  fi
+  printf '%s\\n' "${FAKE_LIVE_LABELS}"
 elif [[ " $* " == *" /labels "* ]]; then
   exit 0
 else
@@ -134,6 +143,10 @@ fi
                 if current_pr is not None
                 else _current_pr(labels=[{"name": label} for label in labels])
             ),
+            "FAKE_LIVE_LABELS": "\n".join(
+                labels if live_labels is None else live_labels
+            ),
+            "FAKE_LABELS_QUERY_FAIL": "1" if labels_query_fails else "0",
             "FAKE_CHANGED_FILES": changed_files,
             "FAKE_RUNS": json.dumps(
                 [{"workflow_runs": []}, {"workflow_runs": list(runs)}]
@@ -413,12 +426,163 @@ def test_repeat_approval_reuses_previous_review_run(tmp_path):
     assert result["reason"] == "heavy-ci-already-started"
 
 
-def test_explicit_label_trigger_is_unchanged(tmp_path):
+def _label(tmp_path, added_label, labels, **kwargs):
+    return _run_gate(
+        tmp_path,
+        **{
+            "action": "labeled",
+            "added_label": added_label,
+            "labels": labels,
+            "allowed": "ci:full,ci:atom",
+            **kwargs,
+        },
+    )
+
+
+def test_label_that_opens_the_gate_runs_heavy_ci(tmp_path):
+    result = _label(tmp_path, "ci:atom", ("ci:atom",), runs_query_fails=True)
+    assert result["should_run"] == "true"
+    assert result["reason"] == "label-present"
+    assert result["smoke_requested"] == "true"
+    assert not (tmp_path / "api.log").exists()
+
+
+@pytest.mark.parametrize(
+    "added_label, labels, reason",
+    [
+        ("LGTM", ("ci:atom", "LGTM"), "label-not-gating"),
+        ("LGTM", ("LGTM",), "label-not-gating"),
+        ("ci:vllm", ("ci:atom", "ci:vllm"), "label-not-gating"),
+        ("ci:full", ("ci:atom", "ci:full"), "gate-already-open"),
+    ],
+)
+def test_label_that_does_not_open_the_gate_is_a_noop(
+    tmp_path, added_label, labels, reason
+):
+    result = _label(tmp_path, added_label, labels, review_decision="APPROVED")
+    assert result["should_run"] == "false"
+    assert result["reason"] == reason
+    assert result["decidable"] == "true"
+    assert result["smoke_requested"] == "false"
+    assert not (tmp_path / "api.log").exists()
+
+
+def _opened_gate(tmp_path, events, **kwargs):
+    opened = []
+    for index, (added_label, labels) in enumerate(events):
+        run_dir = tmp_path / str(index)
+        run_dir.mkdir(parents=True)
+        result = _label(run_dir, added_label, labels, **kwargs)
+        if result["should_run"] == "true":
+            opened.append(added_label)
+    return opened
+
+
+def test_two_gate_labels_added_at_once_open_the_gate_exactly_once(tmp_path):
+    # Both payloads carry both labels; only the event of the first gate label
+    # in priority order (ci:full last) opens the gate.
+    both = ("ci:full", "ci:atom")
+    opened = _opened_gate(tmp_path, [("ci:atom", both), ("ci:full", both)])
+    assert opened == ["ci:atom"]
+
+
+def test_gate_labels_added_one_after_another(tmp_path):
+    # ci:atom first: the later ci:full is a no-op.
+    opened = _opened_gate(
+        tmp_path / "atom-first",
+        [("ci:atom", ("ci:atom",)), ("ci:full", ("ci:atom", "ci:full"))],
+    )
+    assert opened == ["ci:atom"]
+    # ci:full first: the later ci:atom opens again -- the one accepted duplicate.
+    opened = _opened_gate(
+        tmp_path / "full-first",
+        [("ci:full", ("ci:full",)), ("ci:atom", ("ci:full", "ci:atom"))],
+    )
+    assert opened == ["ci:full", "ci:atom"]
+
+
+@pytest.mark.parametrize(
+    "added_label, live_labels, reason",
+    [
+        ("LGTM", ("ci:atom", "LGTM"), "label-not-gating"),
+        ("ci:full", ("ci:atom", "ci:full"), "gate-already-open"),
+    ],
+)
+def test_rerun_of_noop_label_run_does_not_start_heavy_ci(
+    tmp_path, added_label, live_labels, reason
+):
+    # A no-op run sits in its own concurrency group: heavy CI started by its
+    # rerun would run beside the PR group's run.
+    result = _label(
+        tmp_path,
+        added_label,
+        ("ci:atom", added_label),
+        run_attempt=2,
+        live_labels=live_labels,
+    )
+    assert result["should_run"] == "false"
+    assert result["reason"] == reason
+    assert result["smoke_requested"] == "false"
+
+
+@pytest.mark.parametrize(
+    "added_label, labels, live_labels, should_run, reason",
+    [
+        # ci:atom was removed since the event, so ci:full now opens the gate.
+        ("ci:full", ("ci:atom", "ci:full"), ("ci:full",), "true", "label-present"),
+        # The gate-opening run's own label was removed since.
+        ("ci:atom", ("ci:atom",), (), "false", "label-removed"),
+    ],
+)
+def test_rerun_judges_labels_by_their_live_state(
+    tmp_path, added_label, labels, live_labels, should_run, reason
+):
+    result = _label(
+        tmp_path, added_label, labels, run_attempt=2, live_labels=live_labels
+    )
+    assert result["should_run"] == should_run
+    assert result["reason"] == reason
+
+
+def test_rerun_of_code_change_reads_live_labels(tmp_path):
+    # The replayed payload still shows the labels from before ci:vllm was added.
     result = _run_gate(
-        tmp_path, action="labeled", labels=("ci:vllm",), runs_query_fails=True
+        tmp_path, run_attempt=2, labels=("bug",), live_labels=("bug", "ci:vllm")
     )
     assert result["should_run"] == "true"
-    assert not (tmp_path / "api.log").exists()
+    assert result["reason"] == "label-present"
+    assert "/issues/2166/labels" in (tmp_path / "api.log").read_text()
+
+
+def test_rerun_label_query_failure_fails_closed(tmp_path):
+    result = _label(
+        tmp_path, "ci:atom", ("ci:atom",), run_attempt=2, labels_query_fails=True
+    )
+    assert result["should_run"] == "false"
+    assert result["reason"] == "labels-query-failed"
+    assert result["decidable"] == "false"
+
+
+def test_gating_label_on_approved_pr_takes_over_work_it_may_have_cancelled(tmp_path):
+    # The concurrency group cannot see the approval, so this run shares the
+    # PR's group and may have cancelled the approval's heavy CI.
+    result = _label(tmp_path, "ci:atom", ("ci:atom",), review_decision="APPROVED")
+    assert result["should_run"] == "true"
+    assert result["reason"] == "label-present"
+
+
+def test_rerun_of_gate_opening_label_run_runs_heavy_ci_again(tmp_path):
+    result = _label(tmp_path, "ci:atom", ("ci:atom",), run_attempt=2)
+    assert result["should_run"] == "true"
+    assert result["reason"] == "label-present"
+
+
+def test_approval_does_not_repeat_heavy_ci_opened_by_label(tmp_path):
+    result = _approve(
+        tmp_path, labels=("ci:vllm",), runs=[_previous_run()], jobs={100: _jobs()}
+    )
+    assert result["should_run"] == "false"
+    assert result["reason"] == "heavy-ci-already-started"
 
 
 @pytest.mark.parametrize(
@@ -792,6 +956,130 @@ def test_workflow_wiring_preserves_existing_checks_and_separates_noop_reviews():
             assert {"push", "schedule", "workflow_dispatch"} <= events.keys()
         else:
             assert "smoke_requested" not in config["jobs"]["ci-gate"]["outputs"]
+
+
+GATED_WORKFLOWS = (
+    "atom-test.yaml",
+    "atom-vllm-test.yaml",
+    "atom-sglang-test.yaml",
+    "atomesh-benchmark.yaml",
+    "atomesh-accuracy-validation.yaml",
+)
+
+
+class _Ns(dict):
+    __getattr__ = dict.get
+
+
+def _evaluate(term, event_name, action=None, added_label=None, labels=(), **outputs):
+    """Evaluate one `${{ }}` workflow expression for one event."""
+    term = term.split("${{", 1)[1].rsplit("}}", 1)[0]
+    for old, new in (
+        ("github.event.pull_request.labels.*.name", "pr_label_names"),
+        ("needs.ci-gate.outputs.", "gate_outputs."),
+        ("!=", " <> "),
+        ("!", " not "),
+        (" <> ", " != "),
+        ("&&", " and "),
+        ("||", " or "),
+    ):
+        term = term.replace(old, new)
+    github = _Ns(
+        event_name=event_name,
+        run_id=7,
+        event=_Ns(action=action, label=_Ns(name=added_label)),
+    )
+    scope = {
+        "github": github,
+        "gate_outputs": _Ns(outputs),
+        "pr_label_names": list(labels),
+        "contains": lambda items, item: item in items,
+        "format": lambda fmt, *args: fmt.format(*args),
+    }
+    # The term comes from the repository's own workflow file under test.
+    return eval(term, scope)
+
+
+def _noop_group_suffix(group, *args):
+    term = next(t for t in group.split("${{")[1:] if "-noop-" in t)
+    return _evaluate("${{" + term, *args)
+
+
+@pytest.mark.parametrize("filename", GATED_WORKFLOWS)
+def test_only_gate_opening_label_events_share_the_cancelling_group(tmp_path, filename):
+    config = yaml.safe_load(
+        (REPO_ROOT / ".github/workflows" / filename).read_text()
+    )
+    group = config["concurrency"]["group"]
+    gate_env = next(
+        step["env"]
+        for step in config["jobs"]["ci-gate"]["steps"]
+        if step.get("id") == "gate"
+    )
+    allowed = gate_env["CI_GATE_LABELS"]
+    gate_labels = [label.strip() for label in allowed.split(",")]
+    assert len(gate_labels) == 2 and "ci:full" in gate_labels
+    own_label = next(label for label in gate_labels if label != "ci:full")
+
+    gate_job_name = next(
+        job["name"]
+        for job in config["jobs"].values()
+        if "Gate not requested" in str(job.get("name", ""))
+    )
+    real_name = _evaluate(gate_job_name, "pull_request", should_run="true")
+    assert not real_name.endswith("not requested")
+
+    cases = [
+        ("synchronize", None, (own_label,)),
+        ("closed", None, (own_label,)),
+        ("labeled", "LGTM", (own_label, "LGTM")),
+        ("labeled", "ci:other", ("ci:other",)),
+        ("labeled", own_label, (own_label,)),
+        ("labeled", "ci:full", ("ci:full",)),
+        # Both gate labels on the PR: added at once, or one after the other.
+        ("labeled", "ci:full", (own_label, "ci:full")),
+        ("labeled", own_label, (own_label, "ci:full")),
+    ]
+    for index, (action, added_label, labels) in enumerate(cases):
+        event = ("pull_request", action, added_label, labels)
+        suffix = _noop_group_suffix(group, *event)
+        # Even with an undecidable gate (should_run false), only a no-op run
+        # may hide the required gate check; a run that may have cancelled the
+        # PR's previous run reports it.
+        name = _evaluate(gate_job_name, *event, should_run="false")
+        assert (name == real_name) == (suffix == ""), (action, labels)
+        if action != "labeled":
+            # Code changes and closing keep the PR group, so they still cancel
+            # stale runs (closing or merging stops the PR's in-flight heavy CI).
+            assert suffix == ""
+            continue
+        run_dir = tmp_path / str(index)
+        run_dir.mkdir()
+        result = _run_gate(
+            run_dir,
+            action=action,
+            added_label=added_label,
+            labels=labels,
+            allowed=allowed,
+        )
+        # A label event may share the PR's cancelling group only if the gate
+        # lets it run the heavy CI it might have cancelled there.
+        assert (suffix == "") == (result["should_run"] == "true"), (action, labels)
+
+    both = (own_label, "ci:full")
+    opening = [
+        label
+        for label in both
+        if _noop_group_suffix(group, "pull_request", "labeled", label, both) == ""
+    ]
+    assert opening == [own_label]
+
+    for event_name in ("push", "schedule", "pull_request_review"):
+        assert _noop_group_suffix(group, event_name) == ""
+    # Reviews keep their naming: only a run that releases heavy CI or takes
+    # over the PR checks reports the gate.
+    review_name = _evaluate(gate_job_name, "pull_request_review", should_run="false")
+    assert review_name.endswith("not requested")
 
 
 def _run_evaluate_gate(tmp_path, **overrides):

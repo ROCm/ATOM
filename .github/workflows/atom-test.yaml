@@ -31,7 +31,11 @@ concurrency:
   # Keep scheduled main runs from blocking push-triggered validation.
   # Approval runs queue behind existing work. Other reviews get their own
   # group so they cannot replace a pending approval run in GitHub's queue.
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.pull_request.number && 'pr' || github.event_name }}${{ github.event_name == 'pull_request_review' && github.event.review.state != 'approved' && format('-review-{0}', github.run_id) || '' }}
+  # Likewise every label event except the one that opens the gate -- adding
+  # ci:atom, or ci:full to a PR without ci:atom (check_label_event in the gate
+  # script) -- so an unrelated label can never cancel running heavy CI. The
+  # gate job's name repeats this test; keep both in sync with CI_GATE_LABELS.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.pull_request.number && 'pr' || github.event_name }}${{ github.event_name == 'pull_request_review' && github.event.review.state != 'approved' && format('-review-{0}', github.run_id) || '' }}${{ github.event_name == 'pull_request' && github.event.action == 'labeled' && !(github.event.label.name == 'ci:atom' || (github.event.label.name == 'ci:full' && !contains(github.event.pull_request.labels.*.name, 'ci:atom'))) && format('-noop-{0}', github.run_id) || '' }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event_name != 'pull_request_review' }}
 
 env:
@@ -779,7 +783,7 @@ jobs:
           docker rmi "rocm/atom-dev:pre-build-${{ env.GITHUB_COMMIT_SHA }}" || true
 
   atom-test-gate:
-    name: ${{ (github.event_name != 'pull_request_review' || needs.ci-gate.outputs.should_run == 'true' || needs.ci-gate.outputs.pr_check_takeover == 'true') && 'ATOM Test Gate' || 'ATOM Test Gate not requested' }}
+    name: ${{ ((github.event_name != 'pull_request_review' && !(github.event.action == 'labeled' && !(github.event.label.name == 'ci:atom' || (github.event.label.name == 'ci:full' && !contains(github.event.pull_request.labels.*.name, 'ci:atom'))))) || needs.ci-gate.outputs.should_run == 'true' || needs.ci-gate.outputs.pr_check_takeover == 'true') && 'ATOM Test Gate' || 'ATOM Test Gate not requested' }}
     if: always()
     runs-on: ubuntu-latest
     permissions:
