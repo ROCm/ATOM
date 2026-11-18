@@ -527,11 +527,8 @@ class PPEngineCoreProc(EngineCore):
                 self.runner_mgr.call_func("flush_pp_send", wait_out=True)
             except Exception:
                 logger.exception("flush_pp_send during shutdown failed")
-            try:
-                self.scheduler.publish_kv_events()
-            except Exception:
-                logger.exception("KV event publish during shutdown failed")
-            self.scheduler.shutdown_kv_events()
+            # Only the head publishes KV events; a later stage's scheduler has
+            # the null publisher.
             self.scheduler.close_kv_connector()
 
     def _poll_and_send_kv_status(self):

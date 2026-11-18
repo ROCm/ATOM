@@ -771,10 +771,12 @@ class TestPPLoopPublication:
             self._run("_head_busy_loop", steps, publish=fail)
         assert caplog.text.count(failed) == 3
 
-    def test_downstream_stages_publish_nothing_while_serving(self):
-        stored, removed = self.STORED, self.REMOVED
-        published, _ = self._run("_downstream_busy_loop", [[stored], [removed]])
-        assert published == [("shutdown", [stored, removed])]
+    def test_downstream_stages_publish_nothing(self):
+        calls = []
+        steps = [[self.STORED], [self.REMOVED]]
+        published, _ = self._run("_downstream_busy_loop", steps, calls=calls)
+        assert published == []
+        assert calls == []
 
 
 def test_disagg_decode_publishes_each_steps_events():
