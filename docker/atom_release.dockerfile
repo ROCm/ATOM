@@ -220,6 +220,11 @@ ENV ATOM_BASE_IMAGE=${BASE_IMAGE}
 # same setting in vllm's own docker/Dockerfile.rocm.
 ENV HSA_ENABLE_IPC_MODE_LEGACY=1
 
+# Build-time only (ARG, not ENV): wheels pip downloads during the build are not
+# left in /root/.cache/pip of a layer, while pip inside the shipped image keeps
+# its default cache. ARGs do not cross FROM, so atom_image declares it again.
+ARG PIP_NO_CACHE_DIR=1
+
 # AITER's prebuilt and runtime-JIT modules must use the same pybind ABI.
 RUN pip install --upgrade pip "pybind11==3.0.4" && \
     apt-get update && \
@@ -433,6 +438,21 @@ else:
         print("torch_utils.py already carries the torch.Stream branch (upstream fix landed)")
 PY
 
+# The prebuild leaves its ninja intermediates under aiter/jit/build: object
+# files, plus a second copy of every linked module (aiter.jit.core copies
+# build/<md>/build/<md>.so to aiter/jit/<md>.so). Runtime loads aiter/jit/*.so
+# and a cold JIT build writes into its own build/<md>, so neither is read; the
+# only cost is that a forced rebuild of a prebuilt module is no longer
+# incremental. Generated sources and JIT metadata (compiled_kids_opus.json)
+# stay. Only byte-identical copies are removed.
+RUN cd /app/aiter-test/aiter/jit && \
+    echo "aiter/jit/build before cleanup: $(du -sh build | cut -f1)" && \
+    find build -name '*.o' -type f -delete && \
+    find build -path '*/build/*.so' -type f | while read -r so; do \
+        if cmp -s "${so}" "$(basename "${so}")"; then rm -f "${so}"; fi; \
+    done && \
+    echo "aiter/jit/build after cleanup: $(du -sh build | cut -f1)"
+
 # The LMCache wheel, published by .github/workflows/lmcache-rocm-wheel.yaml.
 FROM ${LMCACHE_WHEEL_IMAGE} AS lmcache_wheel
 
@@ -442,6 +462,7 @@ FROM ${LMCACHE_WHEEL_IMAGE} AS lmcache_wheel
 FROM base AS atom_image
 ARG ATOM_REPO="https://github.com/ROCm/ATOM.git"
 ARG ATOM_COMMIT="HEAD"
+ARG PIP_NO_CACHE_DIR=1
 
 # pip packages (lm-eval is lightweight, install directly)
 RUN pip install lm-eval[api]
@@ -517,7 +538,8 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
         rm -rf /usr/local/go && \
         wget -q https://go.dev/dl/go1.22.2.linux-amd64.tar.gz && \
         tar -C /usr/local -xzf go1.22.2.linux-amd64.tar.gz && \
-        rm go1.22.2.linux-amd64.tar.gz; \
+        rm go1.22.2.linux-amd64.tar.gz && \
+        rm -rf /var/lib/apt/lists/*; \
     fi
 
 # [MC 2.5/4] Install AMD Pensando ionic RDMA provider for Mooncake RDMA transport.
@@ -619,21 +641,25 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 # WARNING: dpkg -i --force-all overwrites Ubuntu-repo rccl with the ROCm custom
 # build, breaking rocm-hip's version dep in dpkg metadata. All apt-get install
 # operations (Mooncake, Rust, etc.) MUST be completed before this step.
-COPY --from=build_rccl /rccl-pkgs/ /tmp/rccl/
-RUN if ls /tmp/rccl/*.deb >/dev/null 2>&1; then \
+# Bind-mounted rather than COPY'd so the .deb files never land in a layer.
+RUN --mount=type=bind,from=build_rccl,source=/rccl-pkgs,target=/tmp/rccl \
+    if ls /tmp/rccl/*.deb >/dev/null 2>&1; then \
         DEBIAN_FRONTEND=noninteractive dpkg -i --force-all /tmp/rccl/*.deb; \
     else \
         echo "no RCCL .deb staged (BUILD_RCCL=0) -- keeping the base image's RCCL"; \
-    fi && \
-    rm -rf /tmp/rccl
+    fi
 
 # Triton ships with the ROCm PyTorch base image (installed as a torch dependency);
 # no separate build/copy step is needed here.
 
 # Aiter: copy compiled source tree + re-register editable install
 # (pip install -e creates egg-link automatically, no need to COPY them)
+# AITER_USE_SYSTEM_TRITON=1 as in build_aiter: without it AITER's setup.py runs
+# install_triton.sh, which uninstalls and reinstalls Triton here and writes a
+# second full copy of it (~1.6 GB) into this layer.
 COPY --from=build_aiter /app/aiter-test /app/aiter-test
-RUN cd /app/aiter-test && pip install -e . --no-build-isolation && \
+RUN cd /app/aiter-test && \
+    AITER_USE_SYSTEM_TRITON=1 pip install -e . --no-build-isolation && \
     pip show amd-aiter
 
 # RTL (rocm-trace-lite): lightweight GPU kernel profiler (~250KB, no build deps)
@@ -660,8 +686,7 @@ RUN pip install --no-cache-dir msgpack msgspec quart
 # atomesh: install the binary produced by the ATOM package build hook to /usr/local/bin
 RUN echo "========== Install atomesh binary ==========" && \
     cd /app/ATOM/atom/mesh && \
-    strip target/release/atomesh && \
-    cp target/release/atomesh /usr/local/bin/atomesh && \
+    strip -o /usr/local/bin/atomesh target/release/atomesh && \
     atomesh --version
 
 # ========== LMCache (ROCm 7.2.4 / torch 2.10) for KV offload ==========
