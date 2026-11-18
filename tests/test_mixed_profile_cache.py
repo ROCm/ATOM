@@ -7,15 +7,21 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from aiter_stub import atom_without_aiter
 
-pytest.importorskip("aiter")
-from atom.model_ops.attentions.deepseek_v4_attn import (
-    DeepseekV4AttentionMetadataBuilder,
-)
+
+@pytest.fixture(scope="module")
+def builder_cls():
+    with atom_without_aiter() as load:
+        yield load(
+            "atom.model_ops.attentions.deepseek_v4_attn"
+        ).DeepseekV4AttentionMetadataBuilder
 
 
 @pytest.mark.parametrize("fail_forward", [False, True])
-def test_temporary_pool_restores_registered_buffers(monkeypatch, fail_forward):
+def test_temporary_pool_restores_registered_buffers(
+    monkeypatch, fail_forward, builder_cls
+):
     module = torch.nn.Module()
     placeholder = torch.ones(1)
     module.register_buffer("kv_cache", placeholder)
@@ -49,7 +55,7 @@ def test_temporary_pool_restores_registered_buffers(monkeypatch, fail_forward):
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
 
     def profile():
-        with DeepseekV4AttentionMetadataBuilder.temporary_profile_cache(builder, 64):
+        with builder_cls.temporary_profile_cache(builder, 64):
             assert module.kv_cache.numel() == 8
             assert module.scale.numel() == 8
             if fail_forward:
