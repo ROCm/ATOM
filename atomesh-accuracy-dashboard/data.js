@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794943775072,
+  "lastUpdate": 1795028660021,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -5102,6 +5102,40 @@ window.BENCHMARK_DATA = {
             "value": 0.8901,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44123216193 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611171508 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1471 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "yelkhamra",
+            "username": "yelkhamra",
+            "email": "yelkhamr@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "9b2e67b7f6f5841b0d32db9589e989ff52673761",
+          "message": "fix(engine): honor ATOM_TORCH_PROFILER_DIR (#2925)\n\n* fix(engine): honor ATOM_TORCH_PROFILER_DIR\n\nOmit an unspecified profiler directory from EngineArgs kwargs so Config\ncan resolve its existing environment default. Explicit CLI values retain\nprecedence, and direct Config callers keep their current semantics.\n\nRead an empty ATOM_TORCH_PROFILER_DIR as unset in envs, so `VAR=` clears\nit instead of aborting startup on os.makedirs(\"\"). Give the online-quant\ndump its own ATOM_ONLINE_QUANT_INFO_DIR, falling back to the profiler\ndirectory, and stop the ATOMesh launcher exporting a profiler directory\non every launch now that the engine honors it.\n\nCover the hand-off through EngineArgs.create_engine() -> LLMEngine ->\nConfig with the environment unset, empty and set, and with and without\nan explicit --torch-profiler-dir.\n\nSigned-off-by: Yaakoub El Khamra <176948988+yelkhamra@users.noreply.github.com>\n\n* fix: address review: profiling example and empty env dirs\n\nHonor ATOM_TORCH_PROFILER_DIR in the offline profiling example, which\nreplaced an omitted flag with its own default before EngineArgs saw it.\nResolve the way the engine does -- flag, then environment, then the\nexample's ./profiler_traces -- and name the source that supplied the\ndirectory in the notice.\n\nRead an empty ATOM_ENGRAM_CACHE_DIR as its default cache path rather\nthan \"\", which Path resolves to the working directory, and an empty\nATOM_RTL_TRACE_DIR as None, like ATOM_TORCH_PROFILER_DIR. State the rule\nonce in _optional_path_env / _path_env, which the profiler, online-quant\nand ATOM_V4_CG_INSTR_DIR knobs now use as well.\n\nCover the example's resolution over seven cases, including the notice,\nand the two sibling variables with default, override and empty-value\ntests.\n\nSigned-off-by: Yaakoub El Khamra <176948988+yelkhamra@users.noreply.github.com>\n\n* refactor(profiler): keep online-quant fallback in the loader; trim example\n\nATOM_ONLINE_QUANT_INFO_DIR reported ATOM_TORCH_PROFILER_DIR's value when its\nown variable was unset, so the attribute did not name what it returned. Make\nit a plain _optional_path_env of its own variable and write the fallback once\nat its only call site, in the loader: the dump's directory, else the profiler\ndirectory, else the working directory. Pin that effective directory in a new\nloader test, and have the envs test assert the knob reads only its own\nvariable.\n\nReduce the offline profiling example to the resolution it needs: the flag, or\nATOM_TORCH_PROFILER_DIR, or the example's own directory, then a print of the\ndirectory. The empty-flag rule is now a comment where it applies and states\nthat it is specific to this example, since EngineArgs forwards \"\" to Config.\n\nRevert the ATOM_V4_CG_INSTR_DIR edit, which changed nothing: the knob already\nread an empty value as None.\n\nRebased onto 004f342ab; docs/environment_variables.md resolves to main's\nEngram rows plus this branch's single added sentence.\n\nSigned-off-by: Yaakoub El Khamra <176948988+yelkhamra@users.noreply.github.com>\n\n* test(loader): reuse atom_without_aiter in the online-quant dir test\n\nReplace the test's hand-written try/except ImportError fallback with\naiter_stub.atom_without_aiter, the helper the other stand-in tests use, so\nthe loader is loaded exactly as theirs is.\n\nThat helper gated on `import aiter`, which succeeds on a host with an AITER\nbuild and no GPU: AITER defers its arch probe, and the submodule that binds a\nkernel -- reached from the loader's import chain -- then fails on the missing\ndevice. Take the stand-ins unless a GPU is available, the line\ntests/conftest.gpu_stack_import already draws. A GPU host and the CI unit\nrunner (no AITER at all) keep the paths they had.\n\nSigned-off-by: Yaakoub El Khamra <176948988+yelkhamra@users.noreply.github.com>\n\n* docs(envs): describe ATOM_RTL_TRACE_DIR's actual consumer\n\nThe comment said an empty value disables tracing, but no Python code reads\nenvs.ATOM_RTL_TRACE_DIR: the variable's only consumer is\n.github/scripts/atom_test.sh, which uses it as the output directory for\n`rtl trace -o` under ENABLE_RTL_PROFILER=1 and, there, an empty value falls\nback to /app/rtl_traces. Say that instead, and note the empty-reads-as-unset\nrule only for the Python reader, consistent with the other directory knobs.\n\nSigned-off-by: Yaakoub El Khamra <176948988+yelkhamra@users.noreply.github.com>\n\n---------\n\nSigned-off-by: Yaakoub El Khamra <176948988+yelkhamra@users.noreply.github.com>\nCo-authored-by: Yaakoub El Khamra <176948988+yelkhamra@users.noreply.github.com>",
+          "timestamp": "2026-11-18T09:00:49Z",
+          "url": "https://github.com/ROCm/ATOM/commit/9b2e67b7f6f5841b0d32db9589e989ff52673761"
+        },
+        "date": 1795028659334,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9484,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44344350327 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202611181513 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9462 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8976,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44344350327 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611181513 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1842 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
