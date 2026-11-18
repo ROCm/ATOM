@@ -88,9 +88,15 @@ CLUSTER_LAUNCH = {
 }
 
 
+_COLD_DEFAULT = frozenset({"xpf"})
+
+
 def cold_suffix() -> str:
-    """Kernel-name suffix of the ``ATOM_KIMI_MONO_TDM_COLD`` changes built in."""
-    return "".join(f"_c{site}" for site in sorted(_COLD))
+    """Kernel-name suffix of the ``ATOM_KIMI_MONO_TDM_COLD`` changes built in,
+    empty for the default set."""
+    if _COLD == _COLD_DEFAULT:
+        return ""
+    return "".join(f"_c{site}" for site in sorted(_COLD)) or "_c0"
 
 
 @traced

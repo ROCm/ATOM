@@ -673,10 +673,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # projection), so the first copies wait on no load; "prefetch" adds
     # s_prefetch_inst of the whole kernel at the entry; "xpf" prefetches the
     # whole token input into every XCD's L2 at the entry (a freshly written
-    # input is in none of them). 0, the default, keeps the current kernels.
+    # input is in none of them), the default; 0 leaves all of them out.
     "ATOM_KIMI_MONO_TDM_COLD": lambda: frozenset(
         site
-        for site in os.getenv("ATOM_KIMI_MONO_TDM_COLD", "0").split(",")
+        for site in os.getenv("ATOM_KIMI_MONO_TDM_COLD", "xpf").split(",")
         if site not in ("", "0")
     ),
     # Kimi-K3 gfx1250 mono: the fused MoE's gate/up K tiles, its M tiles'
