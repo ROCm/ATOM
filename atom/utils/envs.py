@@ -692,6 +692,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
         for site in os.getenv("ATOM_KIMI_MONO_XPF", "gather").split(",")
         if site not in ("", "0")
     ),
+    # Kimi-K3 gfx1250 mono: K1's whole-head recurrence issues its conv
+    # weights and state window, gate fragments and output-norm weights before
+    # waiting on the projection (the same bits), the default; 0 loads each
+    # where used.
+    "ATOM_KIMI_MONO_K1_HEAD_PRELOAD": lambda: os.getenv(
+        "ATOM_KIMI_MONO_K1_HEAD_PRELOAD", "1"
+    )
+    == "1",
+    # Kimi-K3 gfx1250 mono: each K1 whole-head CTA prefetches its head's
+    # recurrent state into its XCD's L2 at the entry, so the state's load
+    # after the projection is no cold HBM read, the default; 0 leaves it out.
+    "ATOM_KIMI_MONO_K1_STATE_PREFETCH": lambda: os.getenv(
+        "ATOM_KIMI_MONO_K1_STATE_PREFETCH", "1"
+    )
+    == "1",
     # Kimi-K3 gfx1250 mono: the fused MoE's gate/up K tiles, its M tiles'
     # epilogues and down tiles, and its staging loops as runtime loops, so a
     # cold launch fetches one body's code each (the same bits); 0 unrolls them

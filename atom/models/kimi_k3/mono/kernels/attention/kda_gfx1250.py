@@ -13,8 +13,11 @@ from dataclasses import dataclass
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels import communication_ops_utils as comm_ops
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm
+from flydsl._mlir.dialects import rocdl as rocdl_dialect
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.typing import T
+from flydsl.expr.typing import T, as_ir_value
 
 from atom.models.kimi_k3.mono.kernels.attention.layout import (
     GATE_K,
@@ -23,6 +26,7 @@ from atom.models.kimi_k3.mono.kernels.attention.layout import (
     KdaMatrixContract,
 )
 from atom.models.kimi_k3.mono.kernels.attention.protocol import ATTENTION_CTAS
+from atom.models.kimi_k3.mono.kernels.stages import tdm_timeline
 from atom.models.kimi_k3.mono.kernels.stages.gemv_gfx1250 import (
     ACCUMULATOR_ELEMENTS,
     TH_NT,
@@ -448,6 +452,7 @@ def kda_head_norm(c, request, head):
         ],
         c["tag"],
     )
+    tdm_timeline.stamp(tdm_timeline.HEAD_GATE_POLLED)
     for round_index in range_constexpr(rounds):
         item = items[round_index]
         token = item // HEAD_DIM
@@ -461,12 +466,16 @@ def kda_head_norm(c, request, head):
             square_sum * fx.Float32(1.0 / HEAD_DIM)
             + fx.Float32(c["onorm_eps"])
         )
-        weight = fx.Float32(
-            bo.buffer_load(
-                rsrc(c["args"]["on_w"]),
-                row,
-                vec_width=1,
-                dtype=T.f32,
+        weight = (
+            c["on_w_loaded"][round_index]
+            if const_expr("on_w_loaded" in c)
+            else fx.Float32(
+                bo.buffer_load(
+                    rsrc(c["args"]["on_w"]),
+                    row,
+                    vec_width=1,
+                    dtype=T.f32,
+                )
             )
         )
         output = (
@@ -607,11 +616,104 @@ def _head_state_loads(c, slot, head):
 
 
 @traced
+def prefetch_head_state(args, request, head, tid, threads):
+    """``head``'s recurrent state of ``request`` into this XCD's L2, a 128 B
+    line a thread, so ``_head_state_loads`` after the projection hits L2."""
+    acc_idx = uniform(ld_i32(args["num_acc"], request)) - 1
+    slot0 = uniform(ld_i32(args["st_idx"], request * args["st_stride"] + acc_idx))
+    base = (
+        args["rstate"]
+        + fx.Int64(fx.max(slot0, 0)) * fx.Int64(args["rs_seq"]) * 4
+        + fx.Int64(head * GATE_K * GATE_K * 4)
+    )
+    lines = GATE_K * GATE_K * 4 // 128
+    for step in range_constexpr((lines + threads - 1) // threads):
+        line = tid + step * threads
+        if line < lines:
+            rocdl_dialect.global_prefetch(
+                llvm.IntToPtrOp(
+                    ir.Type.parse("!llvm.ptr<1>"),
+                    as_ir_value(base + fx.Int64(line) * 128),
+                ).result
+            )
+
+
+def _head_conv_loads(c, head, slot_c, acc_idx, raw, old=False):
+    """A conv channel round's weights and state window (and, ``old``, the
+    state values it keeps), none of which needs the projection."""
+    args = c["args"]
+    channels = 3 * HEAD_DIM
+    local_channel = fx.min(raw, channels - 1)
+    part = local_channel // HEAD_DIM
+    column = local_channel % HEAD_DIM
+    channel = part * PROJ + head * HEAD_DIM + column
+    state = args["conv_st"] + fx.Int64(fx.max(slot_c, 0)) * fx.Int64(args["cs_seq"]) * 2
+    state_offset = channel * args["cs_dim"]
+    weights = fx.Vector(
+        bo.buffer_load(rsrc(args["conv_w"]), channel * 4, vec_width=4, dtype=T.f32)
+    )
+    window = [
+        _load_bf(state, state_offset + (acc_idx + tap) * args["cs_tok"])
+        for tap in range(3)
+    ]
+    kept = None
+    if old:
+        kept = [
+            _load_bf(state, state_offset + (acc_idx + 1 + token) * args["cs_tok"])
+            for token in range(c["SL"] - c["L"])
+        ]
+    return {
+        "part": part,
+        "column": column,
+        "state": state,
+        "state_offset": state_offset,
+        "weights": weights,
+        "window": window,
+        "old": kept,
+    }
+
+
+def _head_gate_loads(c, head):
+    metadata = {}
+    metadata["fb"], metadata["dtb"] = gate_loads(c, head)
+    metadata["aa"] = hw_exp2(
+        fx.Float32(
+            bo.buffer_load(
+                rsrc(c["args"]["a_log"]),
+                head,
+                vec_width=1,
+                dtype=T.f32,
+            )
+        )
+        * LOG2E
+    )
+    return metadata
+
+
+def _head_norm_weight_loads(c):
+    """``kda_head_norm``'s ``on_w`` values, one a round."""
+    L, tid, threads = c["L"], c["tid"], c["matrix_threads"]
+    outputs = L * HEAD_DIM
+    return [
+        fx.Float32(
+            bo.buffer_load(
+                rsrc(c["args"]["on_w"]),
+                fx.min(tid + threads * round_index, outputs - 1) % HEAD_DIM,
+                vec_width=1,
+                dtype=T.f32,
+            )
+        )
+        for round_index in range_constexpr((outputs + threads - 1) // threads)
+    ]
+
+
+@traced
 def kda_head(c, request, head):
     """One plain-decode request/head without cross-CTA QK/ONRM handoffs."""
 
     L, tid = c["L"], c["tid"]
     args = c["args"]
+    tdm_timeline.stamp(tdm_timeline.HEAD_START)
     acc_idx = uniform(ld_i32(args["num_acc"], request)) - 1
     slot_c = uniform(ld_i32(args["st_idx"], request * args["st_stride"]))
     slot0 = uniform(
@@ -644,6 +746,16 @@ def kda_head(c, request, head):
         + fx.min(raw, channels - 1) % HEAD_DIM
         for raw in channel_raw
     ]
+    # ``head_preload``: every load that needs no projected value issued
+    # before the poll, the head's wait on the projection covering it.
+    preload = c.get("head_preload", False)
+    conv_loaded = [
+        _head_conv_loads(c, head, slot_c, acc_idx, raw, True) if preload else None
+        for raw in channel_raw
+    ]
+    gate_loaded = _head_gate_loads(c, head) if preload else None
+    if const_expr(preload):
+        c["on_w_loaded"] = _head_norm_weight_loads(c)
     # Clamped indices keep every polled pair a published one; each value is
     # stored below only by the thread that owns it.
     polled = mailbox_poll_many_device(
@@ -662,6 +774,7 @@ def kda_head(c, request, head):
         ],
         c["tag"],
     )
+    tdm_timeline.stamp(tdm_timeline.HEAD_POLLED)
     for iteration in range_constexpr(fa_rounds):
         if fa_raw[iteration] < n_fa:
             fx.ptr_store(_f32_of(polled[iteration]), c["fa"] + fa_index[iteration])
@@ -674,30 +787,10 @@ def kda_head(c, request, head):
 
     for round_index in range_constexpr(channel_rounds):
         raw = channel_raw[round_index]
-        local_channel = fx.min(raw, channels - 1)
-        part = local_channel // HEAD_DIM
-        column = local_channel % HEAD_DIM
-        channel = part * PROJ + head * HEAD_DIM + column
-        state = (
-            args["conv_st"]
-            + fx.Int64(fx.max(slot_c, 0)) * fx.Int64(args["cs_seq"]) * 2
-        )
-        state_offset = channel * args["cs_dim"]
-        weights = fx.Vector(
-            bo.buffer_load(
-                rsrc(args["conv_w"]),
-                channel * 4,
-                vec_width=4,
-                dtype=T.f32,
-            )
-        )
-        window = [
-            _load_bf(
-                state,
-                state_offset + (acc_idx + tap) * args["cs_tok"],
-            )
-            for tap in range(3)
-        ]
+        conv = conv_loaded[round_index] or _head_conv_loads(c, head, slot_c, acc_idx, raw)
+        part, column = conv["part"], conv["column"]
+        state, state_offset = conv["state"], conv["state_offset"]
+        weights, window = conv["weights"], conv["window"]
         new_values = [
             _f32_of(polled[fa_rounds + 1 + round_index * L + token])
             for token in range(L)
@@ -706,10 +799,13 @@ def kda_head(c, request, head):
             resource = rsrc(state)
             for token in range_constexpr(c["SL"]):
                 value = (
-                    _load_bf(
-                        state,
-                        state_offset
-                        + (acc_idx + 1 + token) * args["cs_tok"],
+                    (
+                        conv["old"][token]
+                        if const_expr(conv["old"] is not None)
+                        else _load_bf(
+                            state,
+                            state_offset + (acc_idx + 1 + token) * args["cs_tok"],
+                        )
                     )
                     if token < c["SL"] - L
                     else new_values[token - (c["SL"] - L)]
@@ -742,30 +838,22 @@ def kda_head(c, request, head):
                         c["vloc"] + token * HEAD_DIM + column,
                     )
     gpu.barrier()
+    tdm_timeline.stamp(tdm_timeline.HEAD_CONV)
 
-    metadata = {}
-    metadata["fb"], metadata["dtb"] = gate_loads(c, head)
-    metadata["aa"] = hw_exp2(
-        fx.Float32(
-            bo.buffer_load(
-                rsrc(args["a_log"]),
-                head,
-                vec_width=1,
-                dtype=T.f32,
-            )
-        )
-        * LOG2E
-    )
+    metadata = gate_loaded or _head_gate_loads(c, head)
     gate_compute(c, metadata)
     gpu.barrier()
     qk_normalize(c)
     gpu.barrier()
+    tdm_timeline.stamp(tdm_timeline.HEAD_GATES)
 
     metadata["slot0"] = slot0
     metadata["state"] = head_state
     c["head_onrm"] = c["head_onrm_lds"]
     kda_recur_head(c, metadata, request, head)
+    tdm_timeline.stamp(tdm_timeline.HEAD_RECUR)
     kda_head_norm(c, request, head)
+    tdm_timeline.stamp(tdm_timeline.HEAD_DONE)
 
 
 @traced

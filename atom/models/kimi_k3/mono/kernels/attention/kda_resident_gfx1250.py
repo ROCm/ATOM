@@ -55,6 +55,7 @@ from atom.mono.device.ops import (
 from atom.mono.plan.architecture import GFX1250
 from atom.mono.plan.build_key import key_tuple
 from atom.mono.runtime.abi import KernelAbi
+from atom.utils import envs
 
 FUSED_ROWS = 6284
 ROWS = 16
@@ -176,6 +177,14 @@ def _task_start(block, first, blocks):
     return (block - first + blocks) % blocks
 
 
+def _head_preload() -> bool:
+    return envs.ATOM_KIMI_MONO_K1_HEAD_PRELOAD
+
+
+def _state_prefetch() -> bool:
+    return envs.ATOM_KIMI_MONO_K1_STATE_PREFETCH
+
+
 def build_resident_k1(
     plan: Gfx1250KimiBuildPlan,
     declaration: K1KernelDeclaration,
@@ -194,6 +203,8 @@ def build_resident_k1(
         spec,
         gemv_tdm.cold_suffix(),
         tdm_timeline.key(),
+        _head_preload(),
+        _state_prefetch(),
     )
     cached = _BUILDS.get(cache_key)
     if cached is not None:
@@ -246,7 +257,7 @@ def build_resident_k1(
             declaration.lds.split_stages,
         ),
         SOURCES,
-    ), (gemv_tdm.cold_suffix(), tdm_timeline.key())
+    ), (gemv_tdm.cold_suffix(), tdm_timeline.key(), _head_preload(), _state_prefetch())
     timeline = tdm_timeline.key()
     name = (
         f"k3_k1_gfx1250_resident_s{s}_l{qlen}_nb{declaration.nblocks}"
@@ -254,6 +265,7 @@ def build_resident_k1(
         f"{'_xs' if spec.external_seam else ''}{'_t' if spec.tdm_projection else ''}"
         f"{'_f8' if spec.fp8_projection else ''}"
         f"{f'_sk{split_stages}' if split_stages else ''}{gemv_tdm.cold_suffix()}"
+        f"{'' if _head_preload() else '_nohp'}{'' if _state_prefetch() else '_nosp'}"
         f"{tdm_timeline.suffix()}"
     )
 
@@ -478,6 +490,26 @@ def build_resident_k1(
             gemv_tdm.prefetch_tokens(
                 prefix, s, HIDDEN * 2, bid, tid, declaration.blocks
             )
+        if const_expr(
+            _state_prefetch() and (qlen == 1 or task_count > declaration.blocks)
+        ):
+            # Only a CTA that projects first; the others' state loads already
+            # hide under their wait on the projection.
+            head_task = _task_start(bid, spec.kda0, declaration.blocks)
+            if (bid >= ATTENTION_CTAS) & (head_task < (s // qlen) * HEADS):
+                gfx_backend.prefetch_head_state(
+                    {
+                        "num_acc": num_acc,
+                        "st_idx": st_idx,
+                        "st_stride": st_stride,
+                        "rstate": rstate,
+                        "rs_seq": rs_seq,
+                    },
+                    head_task // HEADS,
+                    head_task % HEADS,
+                    tid,
+                    declaration.threads,
+                )
         allocator = fx.SharedAllocator()
         tdm_timeline.open_cta(bid, wave, timeline, allocator)
         smem = allocator.allocate(lds_types.smem).peek()
@@ -852,6 +884,7 @@ def build_resident_k1(
             "wave": wave,
             "matrix_waves": declaration.waves,
             "matrix_threads": declaration.threads,
+            "head_preload": _head_preload(),
             "red": smem.red.ptr,
             "tls": smem.tls.ptr,
             "fa": recurrence.fa.ptr,

@@ -3,7 +3,7 @@
 """Debug-only per-CTA timeline of the TDM GEMV kernels (resident K1, the
 replicated front): the low word of the shader cycle counter at each point
 (the 100 MHz realtime counter, a message round trip, at entry and end only),
-kept in a 96-word LDS record and copied to a global buffer at the CTA's end
+kept in a 128-word LDS record and copied to a global buffer at the CTA's end
 (a global store each point would make every barrier's release wait for it).
 
 ``enable(address, launches)`` before a build bakes the buffer in: the first
@@ -21,7 +21,7 @@ from flydsl.expr.typing import T, as_ir_value
 from atom.mono.device.ops import traced
 
 CTAS = 256
-WORDS = 96
+WORDS = 128
 LANES = 32
 # Points: 0 HW_ID1, 1 entry, 2 first global access of the GEMV, 3 its first
 # copies issued; then per slab s, SLAB0 + SLAB_WORDS * s + one of
@@ -35,6 +35,11 @@ PROJECT_DONE, STAGED, STORES_ISSUED, STORES_DONE, RECURRENCE, END = range(88, 94
 # ENTRY and END are realtime; every other point is the low word of the shader
 # cycle counter (no message round trip), with these two to convert them.
 CYCLES_ENTRY, CYCLES_END = 94, 95
+# K1's whole-head recurrence task (``kda_gfx1250.kda_head``, the CTA's first):
+# entered, its projected rows polled, conv done, gates done, recurrence done,
+# its output gates polled, core_out stored.
+HEAD_START, HEAD_POLLED, HEAD_CONV, HEAD_GATES = 96, 97, 98, 99
+HEAD_RECUR, HEAD_GATE_POLLED, HEAD_DONE = 100, 101, 102
 POINTS = {
     "hw_id": HW_ID,
     "entry": ENTRY,
@@ -46,6 +51,13 @@ POINTS = {
     "stores_done": STORES_DONE,
     "recurrence": RECURRENCE,
     "end": END,
+    "head_start": HEAD_START,
+    "head_polled": HEAD_POLLED,
+    "head_conv": HEAD_CONV,
+    "head_gates": HEAD_GATES,
+    "head_recur": HEAD_RECUR,
+    "head_gate_polled": HEAD_GATE_POLLED,
+    "head_done": HEAD_DONE,
 }
 
 _config: tuple[int, int] | None = None
