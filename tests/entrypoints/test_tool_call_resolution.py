@@ -186,21 +186,9 @@ class TestABadNameIsCaughtBeforeTheWeightsLoad:
         with pytest.raises(ValueError, match="not a known format"):
             validate_tool_call_parser("deepseekv4")
 
-    def test_atomesh_validates_before_it_creates_the_engine(self):
+    def test_atomesh_validates_the_parser_it_is_given(self):
         src = pathlib.Path(atomesh_server.__file__).read_text()
         assert "validate_tool_call_parser(" in src
-        tree = ast.parse(src)
-        fn = next(
-            n
-            for n in ast.walk(tree)
-            if isinstance(n, ast.FunctionDef) and n.name == "launch_atom_standalone"
-        )
-        calls = [
-            n.func.id
-            for n in ast.walk(fn)
-            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-        ]
-        assert calls.index("parse_standalone_args") < calls.index("initialize_engine")
 
 
 class TestTheMeshRouterStillGetsItsFlag:

@@ -1,8 +1,8 @@
 """Python entrypoint for running Atomesh with a Python-owned engine.
 
-This module intentionally mirrors the engine/tokenizer initialization used by
-``atom.entrypoints.openai.api_server``. The Rust side receives the already
-constructed Python objects and uses them in ``AtomStandaloneRouter``.
+``mesh-only`` starts the Rust router alone. Standalone (the default) is served
+by the Rust frontend as the one client of the EngineCores, and is refused
+until this launcher writes the engine spec it starts from.
 """
 
 from __future__ import annotations
@@ -20,11 +20,6 @@ from typing import Any
 from atom.entrypoints.openai.tool_parser.registry import (
     TOOL_CALL_PARSER_HELP,
     validate_tool_call_parser,
-)
-from atom.utils.gc_utils import (
-    freeze_gc_heap,
-    maybe_attach_gc_debug_callback,
-    tune_gc,
 )
 
 logger = logging.getLogger("atom")
@@ -249,27 +244,14 @@ def parse_standalone_args(raw_args: list[str]) -> StandaloneArgs:
 
 
 def launch_atom_standalone(atomesh_runner: Any, raw_args: list[str]) -> None:
-    standalone_args = parse_standalone_args(raw_args)
-    parsed_args = atomesh_runner.parse_from(standalone_args.mesh_args)
-    cli_args = parsed_args["cli_args"]
-    initialize_engine(standalone_args.engine_args)
-    standalone_service = initialize_standalone_service(
-        standalone_args.engine_args,
-        standalone_args.default_chat_template_kwargs,
-    )
-
-    # This frontend is the api_server's counterpart -- same tokenizer, same
-    # per-request accumulators -- but it builds its engine itself and never
-    # runs that FastAPI lifespan, so it has to apply the GC policy here.
-    tune_gc()
-    maybe_attach_gc_debug_callback("atomesh")
-    freeze_gc_heap("atomesh")
-
-    print("\033[32mATOM starting...\033[0m")
-    print(f"\033[32mHost: {cli_args['host']}:{cli_args['port']}\033[0m")
-    atomesh_runner.launch_mesh(
-        server_config=parsed_args["server_config"],
-        standalone_service=standalone_service,
+    # The Rust frontend now serves standalone itself, as the one client of
+    # the EngineCores (`launch_mesh(engine_spec=...)`); it no longer calls a
+    # Python service. Refuse before loading the model until this launcher
+    # writes that spec and the EngineCores speak engine_v1.
+    raise SystemExit(
+        "ATOM standalone is unavailable until its launcher writes an engine spec "
+        "for the Rust frontend. Use `mesh-only`, or "
+        "`python -m atom.entrypoints.openai_server`, meanwhile."
     )
 
 
@@ -296,10 +278,7 @@ def launch_atomesh(atomesh_runner: Any, raw_args: list[str]) -> None:
     if cli_args["pd_disaggregation"] and decode_urls:
         print(f"Decode nodes: {decode_urls}")
 
-    atomesh_runner.launch_mesh(
-        server_config=parsed_args["server_config"],
-        standalone_service=None,
-    )
+    atomesh_runner.launch_mesh(server_config=parsed_args["server_config"])
 
 
 def main() -> None:
