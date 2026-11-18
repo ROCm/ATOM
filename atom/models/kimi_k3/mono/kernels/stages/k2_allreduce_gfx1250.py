@@ -28,7 +28,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import gpu, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T, as_ir_value
 
 from atom.models.kimi_k3.mono.config import HIDDEN, LATENT, TOPK
@@ -38,9 +38,11 @@ from atom.mono.device.ops import (
     load_ptr64,
     rsrc,
     spin_pause,
+    st_dev,
     traced,
 )
 from atom.mono.runtime.abi import KernelAbi
+from atom.utils import envs
 
 THREADS = 256
 MAX_CTAS = 256
@@ -58,6 +60,7 @@ ALLREDUCE_ABI = KernelAbi(("data", "peers", "epochs", "rank"))
 GATHER_ALLREDUCE_ABI = KernelAbi(
     ("data", "grouped", "route_rows", "route_weights", "peers", "epochs", "rank")
 )
+GATHER_ALLREDUCE_PROFILE_ABI = KernelAbi((*GATHER_ALLREDUCE_ABI.names, "stamps"))
 # a routed row's words
 ROUTED_WORDS = LATENT // 2
 
@@ -91,6 +94,33 @@ class K2AllReduceKernel:
     ctas: int
     abi: KernelAbi = ALLREDUCE_ABI
     launch_count: int = 1
+
+
+class TailedLauncher:
+    """``launch`` with trailing arguments the caller does not pass (a
+    non-profile build's ``stamps``); its ``_mem_cache`` is ``launch``'s, for
+    ``launcher_resources``."""
+
+    def __init__(self, launch, tail):
+        self.launch = launch
+        self.tail = tail
+
+    def __call__(self, *args, **kwargs):
+        return self.launch(*args, *self.tail, **kwargs)
+
+    @property
+    def _mem_cache(self):
+        return self.launch._mem_cache
+
+
+# A gathering all-reduce profile build's i32 stamps a CTA (thread 0's line):
+# the low half of the 100 MHz clock.
+GATHER_STAMPS = 8
+GATHER_START, GATHER_ROUTED, GATHER_GATHERED, GATHER_PUSHED = 0, 1, 2, 3
+GATHER_SEEN, GATHER_END = 4, 5
+# a profile build drains its stores (its pushes' fabric acks, as the tail's
+# flag does) after the poll, stamped
+GATHER_DRAINED = 6
 
 
 def _load_lines(mine, ats):
@@ -534,7 +564,7 @@ def _store_seven(local, element, values):
 
 
 @traced
-def _push_reduce7(local, mine, bases, rank, tp, lines, bank, tag, line, values):
+def _push_reduce7(local, mine, bases, rank, tp, lines, bank, tag, line, values, stamp):
     """Line ``line``'s seven values pushed to every rank, then every rank's
     copy reduced in rank order in fp32 and stored back as BF16."""
     words = [_pack(values[2 * w], values[2 * w + 1]) for w in range(3)]
@@ -543,9 +573,11 @@ def _push_reduce7(local, mine, bases, rank, tp, lines, bank, tag, line, values):
     at = fx.Int64(bank + (rank * lines + line) * LINE_WORDS) * 4
     for base in bases:
         _store_line_sys(base + at, out)
+    stamp(GATHER_PUSHED)
     got = _poll_lines7(
         mine, [bank + (p * lines + line) * LINE_WORDS for p in range(tp)], tag
     )
+    stamp(GATHER_SEEN)
     reduced = None
     for p in range_constexpr(tp):
         copy = []
@@ -556,19 +588,32 @@ def _push_reduce7(local, mine, bases, rank, tp, lines, bank, tag, line, values):
     _store_seven(local, line * LINE7_ELEMENTS, [bf16_round(v) for v in reduced])
 
 
-def build_gather_allreduce(tp: int, rows: int) -> K2AllReduceKernel:
+def build_gather_allreduce(
+    tp: int, rows: int, profile: bool = False, prepush_barrier: bool | None = None
+) -> K2AllReduceKernel:
     """``build_allreduce`` whose routed lines this rank computes itself: AITER's
     MoE gather-reduce of ``grouped`` (the grouped MoE's gemm2 rows, BF16) by
     the routes' rows and weights (``[rows, TOPK]`` i32 and f32), bit for bit,
     in place of reading them -- one launch fewer. Seven-element lines, a line
-    a thread, while those fit MAX_CTAS CTAs; six-element ones past that."""
+    a thread, while those fit MAX_CTAS CTAs; six-element ones past that.
+    ``profile``: ``GATHER_STAMPS`` i32 a CTA to a trailing ``stamps``
+    argument. ``prepush_barrier`` (``ATOM_KIMI_MONO_GATHER_AR_PREPUSH_BARRIER``):
+    the CTA's barrier between the gathers and the pushes."""
     lines = allreduce7_lines(rows)
     if lines > MAX_CTAS * THREADS:
+        assert not profile
         return _build_gather_allreduce6(tp, rows)
+    if prepush_barrier is None:
+        prepush_barrier = envs.ATOM_KIMI_MONO_GATHER_AR_PREPUSH_BARRIER
+    from atom.models.kimi_k3.mono.kernels.stages.moe_tdm_gfx1250 import _realtime
+
     ctas = -(-lines // THREADS)
     routed_lines = rows * LINE7_ROUTED
     bank_words = tp * lines * LINE_WORDS
-    name = f"k3_k2_gfx1250_gather_allreduce7_tp{tp}_s{rows}"
+    name = (
+        f"k3_k2_gfx1250_gather_allreduce7_tp{tp}_s{rows}"
+        f"{'' if prepush_barrier else '_nb'}{'_profile' if profile else ''}"
+    )
 
     @fx.struct
     class Lds:
@@ -583,10 +628,26 @@ def build_gather_allreduce(tp: int, rows: int) -> K2AllReduceKernel:
         peers: Int64,
         epochs: Int64,
         rank: Int32,
+        stamps: Int64,
     ):
         tid = fx.Int32(fx.thread_idx.x)
         bid = fx.Int32(fx.block_idx.x)
         lds = fx.SharedAllocator().allocate(Lds).peek()
+
+        def stamp(index):
+            if const_expr(profile):
+                if tid == 0:
+                    st_dev(fx.Int32(_realtime()), stamps, bid * GATHER_STAMPS + index)
+                if const_expr(index == GATHER_SEEN):
+                    rocdl.s_wait_storecnt(0)
+                    if tid == 0:
+                        st_dev(
+                            fx.Int32(_realtime()),
+                            stamps,
+                            bid * GATHER_STAMPS + GATHER_DRAINED,
+                        )
+
+        stamp(GATHER_START)
         epoch = (
             fx.Int32(bo.buffer_load(rsrc(epochs), bid, vec_width=1, dtype=T.i32)) + 1
         )
@@ -611,6 +672,7 @@ def build_gather_allreduce(tp: int, rows: int) -> K2AllReduceKernel:
             )
             fx.ptr_store(fx.Float32(route_weight), lds.routes.ptr + 2 * tid + 1)
         gpu.barrier()
+        stamp(GATHER_ROUTED)
         v0 = v1 = v2 = v3 = v4 = v5 = v6 = fx.Float32(0.0)
         if routed:
             source = rsrc(grouped)
@@ -636,7 +698,9 @@ def build_gather_allreduce(tp: int, rows: int) -> K2AllReduceKernel:
             v0, v1, v2, v3, v4, v5, v6 = plain
         # every thread has its words before any pushes: a CU with remote
         # stores in flight holds back the gathers' loads behind them
-        gpu.barrier()
+        if const_expr(prepush_barrier):
+            gpu.barrier()
+        stamp(GATHER_GATHERED)
         if live:
             _push_reduce7(
                 local,
@@ -649,8 +713,10 @@ def build_gather_allreduce(tp: int, rows: int) -> K2AllReduceKernel:
                 tag,
                 line,
                 [v0, v1, v2, v3, v4, v5, v6],
+                stamp,
             )
         gpu.barrier()
+        stamp(GATHER_END)
         counter = bid + tid * ctas
         if counter < MAX_CTAS:
             bo.buffer_store(epoch, rsrc(epochs), counter)
@@ -664,13 +730,14 @@ def build_gather_allreduce(tp: int, rows: int) -> K2AllReduceKernel:
         peers: Int64,
         epochs: Int64,
         rank: Int32,
+        stamps: Int64,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
-        kernel(data, grouped, route_rows, route_weights, peers, epochs, rank).launch(
-            grid=(ctas,), block=(THREADS,), stream=stream
-        )
+        kernel(
+            data, grouped, route_rows, route_weights, peers, epochs, rank, stamps
+        ).launch(grid=(ctas,), block=(THREADS,), stream=stream)
 
-    GATHER_ALLREDUCE_ABI.check(kernel, launch)
-    return K2AllReduceKernel(
-        name, launch, (ctas,), (THREADS,), ctas, GATHER_ALLREDUCE_ABI
-    )
+    abi = GATHER_ALLREDUCE_PROFILE_ABI if profile else GATHER_ALLREDUCE_ABI
+    GATHER_ALLREDUCE_PROFILE_ABI.check(kernel, launch)
+    launcher = launch if profile else TailedLauncher(launch, (0,))
+    return K2AllReduceKernel(name, launcher, (ctas,), (THREADS,), ctas, abi)

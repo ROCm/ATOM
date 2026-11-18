@@ -19,6 +19,13 @@ current: no fence, no barrier between the CTAs. A CTA stages its pairs in LDS
 to cut them into lines; the last token triple's spare tokens carry zeros.
 Epochs are ``k2_allreduce_gfx1250``'s counters, so a launch of either kernel
 takes the next epoch; regions of epoch ``e`` live in bank ``e & 1``.
+
+One-shot (``ATOM_KIMI_MONO_OPROJ_AR_ONESHOT``): the CTA pushes its partials to
+every rank instead of the owner, and every rank's CTA ``b`` sums its columns'
+partials in rank order itself -- the owner's arithmetic, so the output is
+bit for bit the same -- with one fabric hop, not two, and no remote store
+left to drain at the launch's end. Its banks hold every rank's partials of
+every column.
 """
 
 from dataclasses import dataclass
@@ -35,6 +42,7 @@ from atom.models.kimi_k3.mono.kernels.stages import gemv_gfx1250
 from atom.models.kimi_k3.mono.kernels.stages import gemv_tdm_gfx1250 as gemv_tdm
 from atom.models.kimi_k3.mono.kernels.stages import k2_allreduce_gfx1250 as ar
 from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import tdm_lds_words
+from atom.models.kimi_k3.mono.kernels.stages.moe_tdm_gfx1250 import _realtime
 from atom.models.kimi_k3.mono.sources import SOURCES
 from atom.mono.device.ops import (
     bf2_f32,
@@ -42,10 +50,12 @@ from atom.mono.device.ops import (
     load_ptr64,
     rsrc,
     spin_pause,
+    st_dev,
     traced,
 )
 from atom.mono.plan.architecture import GFX1250
 from atom.mono.runtime.abi import KernelAbi
+from atom.utils import envs
 
 THREADS = 256
 WAVES = 8
@@ -65,6 +75,13 @@ assert THREADS == 2 * ROWS * 8
 assert CTAS <= ar.MAX_CTAS
 
 OPROJ_AR_ABI = KernelAbi(("core", "w_o", "w_o_scale", "out", "peers", "epochs", "rank"))
+OPROJ_AR_PROFILE_ABI = KernelAbi((*OPROJ_AR_ABI.names, "stamps"))
+# a profile build's i32 stamps a CTA: the low half of the 100 MHz clock
+STAMPS = 8
+STAMP_START, STAMP_STAGED, STAMP_PUSHED = 0, 1, 2
+# the partials summed (the owner, or every rank one-shot), the sums pushed,
+# the sums landed (a rank not owning the columns), the end
+STAMP_SUMMED, STAMP_SUMS_PUSHED, STAMP_LANDED, STAMP_END = 3, 4, 5, 6
 
 
 def own_pairs(tp: int) -> int:
@@ -87,8 +104,20 @@ def bank_words(tp: int, rows: int) -> int:
     return LINE_WORDS * triples(rows) * (tp * own_pairs(tp) + HIDDEN // 2)
 
 
-def oproj_peer_bytes(tp: int, rows: int) -> int:
-    return 2 * bank_words(tp, rows) * 4
+def oneshot_bank_words(tp: int, rows: int) -> int:
+    """A one-shot bank: the partials ``[source rank][token triple][pair]``."""
+    return LINE_WORDS * triples(rows) * tp * (HIDDEN // 2)
+
+
+def _oneshot(oneshot: bool | None) -> bool:
+    return envs.ATOM_KIMI_MONO_OPROJ_AR_ONESHOT if oneshot is None else oneshot
+
+
+def oproj_peer_bytes(tp: int, rows: int, oneshot: bool | None = None) -> int:
+    words = bank_words(tp, rows)
+    if _oneshot(oneshot):
+        words = max(words, oneshot_bank_words(tp, rows))
+    return 2 * words * 4
 
 
 @dataclass(frozen=True)
@@ -172,7 +201,7 @@ def _land_line(live, out, rows, triple, column_pair, words):
 
 
 @traced
-def _reduce_share(mine, bases, rank, rows, tp, own, bank, epoch, bid, tid):
+def _reduce_share(mine, bases, rank, rows, tp, own, bank, epoch, bid, tid, stamp):
     """This CTA's share of the lines this rank owns, ``[triple][owned pair]``
     dealt evenly to the grid: every rank's partials summed and pushed to every
     rank."""
@@ -191,6 +220,7 @@ def _reduce_share(mine, bases, rank, rows, tp, own, bank, epoch, bid, tid):
         for p in range(tp)
     ]
     partials = _poll_lines(mine, words, epoch)
+    stamp(STAMP_SUMMED)
     for k, (live, item) in enumerate(picks):
         totals = _sum_lines(partials[k * tp : (k + 1) * tp])
         column_pair = rank * own + item % own
@@ -202,10 +232,35 @@ def _reduce_share(mine, bases, rank, rows, tp, own, bank, epoch, bid, tid):
         )
         for base in bases:
             _push_line(live, base + at, totals, epoch)
+    stamp(STAMP_SUMS_PUSHED)
 
 
 @traced
-def _reduce_owned(mine, bases, out, rank, rows, tp, own, bank, epoch, bid, tid):
+def _oneshot_sums(mine, out, rows, tp, bank, epoch, bid, tid, stamp):
+    """This CTA's columns from every rank's partials (``_reduce_owned``'s
+    sums), landed here: no sum leaves the rank."""
+    count = triples(rows)
+    if tid < count * CTA_PAIRS:
+        triple = tid // CTA_PAIRS
+        column_pair = bid * CTA_PAIRS + tid % CTA_PAIRS
+        partials = _poll_lines(
+            mine,
+            [
+                bank + LINE_WORDS * ((p * count + triple) * (HIDDEN // 2) + column_pair)
+                for p in range(tp)
+            ],
+            epoch,
+        )
+        stamp(STAMP_SUMMED)
+        _land_line(
+            fx.Int32(1) == 1, out, rows, triple, column_pair, _sum_lines(partials)
+        )
+
+
+@traced
+def _reduce_owned(
+    mine, bases, out, rank, rows, tp, own, bank, epoch, bid, tid, stamp
+):  # fmt: skip
     """This CTA's own columns on the rank owning them: every rank's partials
     summed, pushed to every rank and landed here directly."""
     count = triples(rows)
@@ -224,6 +279,7 @@ def _reduce_owned(mine, bases, out, rank, rows, tp, own, bank, epoch, bid, tid):
         for p in range(tp)
     ]
     partials = _poll_lines(mine, words, epoch)
+    stamp(STAMP_SUMMED)
     for k, (live, triple, pair) in enumerate(items):
         totals = _sum_lines(partials[k * tp : (k + 1) * tp])
         column_pair = bid * CTA_PAIRS + pair
@@ -234,28 +290,34 @@ def _reduce_owned(mine, bases, out, rank, rows, tp, own, bank, epoch, bid, tid):
         for base in bases:
             _push_line(live, base + at, totals, epoch)
         _land_line(live, out, rows, triple, column_pair, totals)
+    stamp(STAMP_SUMS_PUSHED)
 
 
 @traced
-def _owner_sums(mine, bases, out, rank, rows, tp, own, bank, epoch, bid, tid):
+def _owner_sums(mine, bases, out, rank, rows, tp, own, bank, epoch, bid, tid, stamp):
     if bid // (CTAS // tp) == rank:
-        _reduce_owned(mine, bases, out, rank, rows, tp, own, bank, epoch, bid, tid)
+        _reduce_owned(
+            mine, bases, out, rank, rows, tp, own, bank, epoch, bid, tid, stamp
+        )  # fmt: skip
     else:
-        _land_sums(mine, out, rows, tp, own, bank, epoch, bid, tid, THREADS)
+        _land_sums(mine, out, rows, tp, own, bank, epoch, bid, tid, THREADS, stamp)
 
 
 @traced
-def _split_waves(mine, bases, out, rank, rows, tp, own, bank, epoch, bid, tid):
+def _split_waves(mine, bases, out, rank, rows, tp, own, bank, epoch, bid, tid, stamp):
     if tid < SUM_THREADS:
-        _reduce_share(mine, bases, rank, rows, tp, own, bank, epoch, bid, tid)
+        _reduce_share(
+            mine, bases, rank, rows, tp, own, bank, epoch, bid, tid, stamp
+        )  # fmt: skip
     else:
         _land_sums(
-            mine, out, rows, tp, own, bank, epoch, bid, tid - SUM_THREADS, LAND_THREADS
-        )
+            mine, out, rows, tp, own, bank, epoch, bid, tid - SUM_THREADS,
+            LAND_THREADS, stamp,
+        )  # fmt: skip
 
 
 @traced
-def _land_sums(mine, out, rows, tp, own, bank, epoch, bid, tid, threads):
+def _land_sums(mine, out, rows, tp, own, bank, epoch, bid, tid, threads, stamp=None):
     """This CTA's columns from their owner's sums, on ``threads`` lanes."""
     count = triples(rows)
     rounds = -(-count * CTA_PAIRS // threads)
@@ -278,6 +340,8 @@ def _land_sums(mine, out, rows, tp, own, bank, epoch, bid, tid, threads):
         ],
         epoch,
     )
+    if const_expr(stamp is not None):
+        stamp(STAMP_LANDED, tid)
     for (live, triple, column_pair), words in zip(items, sums):
         _land_line(live, out, rows, triple, column_pair, words)
 
@@ -289,8 +353,15 @@ def _store_stage(live, address, word):
 
 
 def build_oproj_allreduce(
-    plan: Gfx1250KimiBuildPlan, tp: int, proj: int
+    plan: Gfx1250KimiBuildPlan,
+    tp: int,
+    proj: int,
+    oneshot: bool | None = None,
+    profile: bool = False,
 ) -> K2OprojAllReduceKernel:
+    """``oneshot``: one fabric hop (default ``ATOM_KIMI_MONO_OPROJ_AR_ONESHOT``;
+    the banks then need ``oproj_peer_bytes(tp, rows, True)``). ``profile``:
+    ``STAMPS`` i32 a CTA to a trailing ``stamps`` argument."""
     if plan.architecture is not GFX1250:
         raise ValueError("the o_proj all-reduce requires gfx1250")
     if plan.threads != THREADS or plan.waves != WAVES:
@@ -304,7 +375,9 @@ def build_oproj_allreduce(
         raise ValueError(f"the o_proj all-reduce cuts {rows} rows into a line a thread")
     tiles = (rows + ROWS - 1) // ROWS
     own = own_pairs(tp)
-    words_a_bank = bank_words(tp, rows)
+    oneshot = _oneshot(oneshot)
+    words_a_bank = oneshot_bank_words(tp, rows) if oneshot else bank_words(tp, rows)
+    abi = OPROJ_AR_PROFILE_ABI if profile else OPROJ_AR_ABI
 
     @fx.struct
     class Lds:
@@ -317,7 +390,10 @@ def build_oproj_allreduce(
         # the CTA's pairs ``[token][pair]``, cut into lines once all are in
         stage: fx.Array[fx.Int32, triples(rows) * LINE_TOKENS * CTA_PAIRS, 16]
 
-    name = f"k3_k2_gfx1250_oproj_ar_tp{tp}_s{rows}"
+    name = (
+        f"k3_k2_gfx1250_oproj_ar_tp{tp}_s{rows}{'_os' if oneshot else ''}"
+        f"{'_profile' if profile else ''}"
+    )
     sources = SOURCES
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -329,6 +405,7 @@ def build_oproj_allreduce(
         peers: Int64,
         epochs: Int64,
         rank: Int32,
+        stamps: Int64,
     ):
         _ = sources
         tid = fx.Int32(fx.thread_idx.x)
@@ -336,6 +413,14 @@ def build_oproj_allreduce(
         lane = tid % GFX1250.wave_size
         wave = tid // GFX1250.wave_size
         lds = fx.SharedAllocator().allocate(Lds).peek()
+
+        def stamp(index, local=None):
+            # thread 0's view (``local``: the thread's index in its group)
+            if const_expr(profile):  # noqa: SIM102
+                if (tid if local is None else local) == 0:
+                    st_dev(fx.Int32(_realtime()), stamps, bid * STAMPS + index)
+
+        stamp(STAMP_START)
         epoch = (
             fx.Int32(bo.buffer_load(rsrc(epochs), bid, vec_width=1, dtype=T.i32)) + 1
         )
@@ -398,7 +483,36 @@ def build_oproj_allreduce(
             if tid < spare:
                 fx.ptr_store(fx.Int32(0), lds.stage.ptr + rows * CTA_PAIRS + tid)
         gpu.barrier()
-        if tid < triples(rows) * CTA_PAIRS:
+        stamp(STAMP_STAGED)
+        if const_expr(oneshot):
+            if tid < triples(rows) * CTA_PAIRS:
+                triple = tid // CTA_PAIRS
+                words = [
+                    fx.ptr_load(
+                        lds.stage.ptr
+                        + (triple * LINE_TOKENS + j) * CTA_PAIRS
+                        + tid % CTA_PAIRS
+                    )
+                    for j in range(LINE_TOKENS)
+                ]
+                line = fx.Vector.from_elements([*words, epoch], fx.Int32)
+                at = (
+                    fx.Int64(
+                        bank
+                        + LINE_WORDS
+                        * (
+                            (rank * triples(rows) + triple) * (HIDDEN // 2)
+                            + bid * CTA_PAIRS
+                            + tid % CTA_PAIRS
+                        )
+                    )
+                    * 4
+                )
+                for base in bases:
+                    ar._store_line_sys(base + at, line)
+            stamp(STAMP_PUSHED)
+            _oneshot_sums(mine, out, rows, tp, bank, epoch, bid, tid, stamp)
+        elif tid < triples(rows) * CTA_PAIRS:
             triple = tid // CTA_PAIRS
             pair = tid % CTA_PAIRS
             words = [
@@ -417,11 +531,18 @@ def build_oproj_allreduce(
             ar._store_line_sys(
                 owner_base + at, fx.Vector.from_elements([*words, epoch], fx.Int32)
             )
-        if const_expr(rows > SPREAD_ROWS):
-            _split_waves(mine, bases, out, rank, rows, tp, own, bank, epoch, bid, tid)
-        else:
-            _owner_sums(mine, bases, out, rank, rows, tp, own, bank, epoch, bid, tid)
+        if const_expr(not oneshot):
+            stamp(STAMP_PUSHED)
+            if const_expr(rows > SPREAD_ROWS):
+                _split_waves(
+                    mine, bases, out, rank, rows, tp, own, bank, epoch, bid, tid, stamp
+                )
+            else:
+                _owner_sums(
+                    mine, bases, out, rank, rows, tp, own, bank, epoch, bid, tid, stamp
+                )
         gpu.barrier()
+        stamp(STAMP_END)
         counter = bid + tid * CTAS
         if counter < ar.MAX_CTAS:
             bo.buffer_store(epoch, rsrc(epochs), counter)
@@ -435,6 +556,7 @@ def build_oproj_allreduce(
         peers: Int64,
         epochs: Int64,
         rank: Int32,
+        stamps: Int64,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         _ = sources
@@ -446,6 +568,7 @@ def build_oproj_allreduce(
             peers,
             epochs,
             rank,
+            stamps,
             value_attrs=gemv_tdm.CLUSTER_LAUNCH["value_attrs"],
         ).launch(
             grid=(CTAS,),
@@ -454,5 +577,6 @@ def build_oproj_allreduce(
             cluster=gemv_tdm.CLUSTER_LAUNCH["cluster"],
         )
 
-    OPROJ_AR_ABI.check(kernel, launch)
-    return K2OprojAllReduceKernel(name, launch, (CTAS,), (THREADS,))
+    OPROJ_AR_PROFILE_ABI.check(kernel, launch)
+    launcher = launch if profile else ar.TailedLauncher(launch, (0,))
+    return K2OprojAllReduceKernel(name, launcher, (CTAS,), (THREADS,), abi)

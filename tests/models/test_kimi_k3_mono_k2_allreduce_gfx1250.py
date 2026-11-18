@@ -57,3 +57,28 @@ def test_gathering_all_reduce_takes_a_line_a_thread(rows):
         assert kernel.block[0] * ar.PAYLOAD_WORDS <= ar.ROUTED_WORDS
     # every epoch counter is in some thread's reach
     assert kernel.grid[0] * kernel.block[0] >= ar.MAX_CTAS
+
+
+def test_one_shot_o_proj_banks_hold_every_ranks_partials_of_every_column():
+    from atom.models.kimi_k3.mono.kernels.stages import k2_oproj_ar_gfx1250 as oar
+
+    for tp in (2, 4, 8):
+        words = oar.oneshot_bank_words(tp, 40)
+        assert words == 4 * 14 * tp * (HIDDEN // 2)
+        both = oar.oproj_peer_bytes(tp, 40, True)
+        assert both == 2 * 4 * max(words, oar.bank_words(tp, 40))
+        assert oar.oproj_peer_bytes(tp, 40, False) == 2 * 4 * oar.bank_words(tp, 40)
+
+
+@pytest.mark.parametrize("rows", (10, 40))
+def test_gathering_all_reduce_profile_and_barrier_builds(rows):
+    profile = ar.build_gather_allreduce(4, rows, profile=True)
+    assert profile.abi is ar.GATHER_ALLREDUCE_PROFILE_ABI
+    assert profile.abi.names[-1] == "stamps"
+    assert profile.name.endswith("_profile")
+    plain = ar.build_gather_allreduce(4, rows, prepush_barrier=True)
+    assert plain.abi is ar.GATHER_ALLREDUCE_ABI
+    assert isinstance(plain.launcher, ar.TailedLauncher)
+    bare = ar.build_gather_allreduce(4, rows, prepush_barrier=False)
+    assert bare.name == plain.name + "_nb"
+    assert bare.grid == plain.grid
