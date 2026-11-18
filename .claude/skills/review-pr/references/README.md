@@ -24,8 +24,8 @@ cost attention on every run.
 ## Asking for a run
 
 SKILL.md: "when the action is `run something`, ask for ONE run." The record behind it,
-from ATOM reviews labelled by whether the author acted. Seven of them are asks to RUN
-something -- three carried out, four not. (Two more judged asks in the same family were
+from ATOM reviews labelled by whether the author acted. Six of them are asks to RUN
+something -- three carried out, three not. (Two more judged asks in the same family were
 code changes, not runs, and are left out rather than padding the count.)
 
 | | ask | outcome |
@@ -33,22 +33,24 @@ code changes, not runs, and are left out rather than padding the count.)
 | ✅ | ATOM#3165 "rebase onto current main and re-run the CPU suite and the `ci:atom` heavy jobs" | done |
 | ✅ | ATOM#3275 "one GPU A/B ... once a GPU host is available" (two arms, one node, one sitting) | posted 17 h later |
 | ✅ | ATOM#3323 "re-run at least one 512c arm on the final head" | came back with the table |
-| ❌ | ATOM#3165 "rebase, re-home `running=self.running` in the refactored `_schedule`, and re-run" | three things, none done |
 | ❌ | ATOM#3165 "admission off vs W only vs W + 512 ... post req/s, errors and preemptions" | merged with the box still empty, after 12 commits |
 | ❌ | ATOM#3306 "GSM8K plus staged/landed throughput on this exact head" | merged unmet, after 14 commits |
 | ❌ | ATOM#3306 "attach **one** P/D throughput run on this head, **or name the existing run**" | merged unmet |
 
-**The last row is the counterexample, and it is the useful one.** It names a single run and
-offers the cheaper out, which is exactly what this rule asks for, and it still died. The
-difference is not the shape of the ask: ATOM#3306's body says its control run's "node failed
-the GPU-idle preflight, and was not rerun", while ATOM#3323 ran "both arms at the same time on
-one node" and ATOM#3275 had "one MI355X". The authors who complied had a working setup; the
-one who did not, did not.
+**The ATOM#3306 row is the counterexample, and it is the useful one.** It names a single run
+and offers the cheaper out, which is exactly what this rule asks for, and it still went unmet
+through fourteen commits and a merge.
 
-So minimising the ask is a lever, not a guarantee. A matrix is reliably out of reach. A single
-run is out of reach too when the machine is. What the rule buys is that when an author *can*
-act, the ask is small enough to be worth acting on -- and the cleanest evidence is still the
-ATOM#3165 pair: one author, one PR, one week, cheap ask done and three-arm ask not.
+Why it went unmet is not known. The body says only "No performance run was made for this
+head" and gives no reason. An earlier draft of this file blamed a missing machine, citing
+"node failed the GPU-idle preflight" -- that sentence is about the GSM8K control run on main,
+not the P/D throughput run that was asked for, and ATOM#3165 and ATOM#3306 share an author who
+complied on one and not the other. The contrast does not hold; the reason is simply absent.
 
-An ask the author cannot fit into their day -- or cannot run at all -- looks, in the record,
-exactly like one they disagreed with.
+So minimising the ask is a lever with no guarantee behind it. A matrix is reliably too much.
+A single run is sometimes too much as well, for reasons the record does not show. What the
+rule buys is that when an author can act, the ask is small enough to be worth acting on -- and
+the cleanest evidence stays the ATOM#3165 pair: one author, one PR, one week, cheap ask done
+and three-arm ask not.
+
+An ask the author does not act on looks, in the record, exactly like one they disagreed with.
