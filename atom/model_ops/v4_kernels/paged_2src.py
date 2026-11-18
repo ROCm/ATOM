@@ -48,12 +48,11 @@ Numerics: identical online-softmax + sink finalization to
 (then equivalent to a decode call with the same prefix indices).
 """
 
-import functools
-
 import torch
 import triton
 import triton.language as tl
 
+from atom.model_ops.v4_kernels.paged_decode import _cu_count
 from atom.model_ops.v4_kernels.pool_index import row_offset
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
@@ -580,15 +579,10 @@ _SPLIT_BLOCK_K = 16
 _COMBINE_BLOCK_DC = 64  # D columns per combine program
 
 
-@functools.lru_cache(maxsize=8)
-def _cu_count(device_index: int) -> int:
-    return torch.cuda.get_device_properties(device_index).multi_processor_count
-
-
-def _csa_num_splits(tokens: int, head_blocks: int, avg_keys: float, device) -> int:
-    target = 2 * _cu_count(device.index if device.index is not None else 0)
+def _csa_num_splits(tokens: int, head_blocks: int, avg_keys: float) -> int:
+    target = 2 * _cu_count()
     programs = tokens * head_blocks
-    if programs >= target // 2:
+    if not programs or programs >= target // 2:
         return 1
     want = -(-target // programs)
     cap = max(1, int(avg_keys // _SPLIT_MIN_KEYS))
@@ -662,7 +656,6 @@ def _sparse_attn_v4_paged_2src_triton(
             T,
             triton.cdiv(H, block_h),
             avg_prefix_len + kv_indices_extend.numel() / max(T, 1),
-            q.device,
         )
         if use_csa_fast_kernel
         else 1

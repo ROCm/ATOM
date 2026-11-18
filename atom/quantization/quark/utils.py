@@ -607,8 +607,8 @@ def dequant_weight_online(
     if source_quant_type == QuantType.per_1x128:
         return dequant_per_block_fp8(weight, weight_scale)
     if source_quant_type == QuantType.per_1x32:
-        # per_1x32 is only the block layout; the (8-bit) dtype check above has
-        # already ruled out MXFP4, so a valid source here is always MXFP8.
+        # per_1x32 is only the block layout; MXFP4 returned above, so an 8-bit
+        # source here is always MXFP8.
         return dequant_mxfp8(weight, weight_scale)
     raise ValueError(
         f"Unsupported source quant_type for online dequant: {source_quant_type}. "

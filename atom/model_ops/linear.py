@@ -28,6 +28,7 @@ from aiter.utility import fp4_utils
 from torch import nn
 
 from atom.config import QuantizationConfig, get_current_atom_config
+from atom.model_ops.blockscale import dequantize_fp8_weight
 from atom.model_ops.communication_op import tensor_model_parallel_all_reduce
 from atom.model_ops.utils import (
     atom_parameter,
@@ -1425,8 +1426,6 @@ class LinearBase(nn.Module):
             if self.runs_bf16:
                 # No group32 FP8 GEMM here: a BF16 weight, never shuffled.
                 if self.weight.numel() and self.weight.dtype == torch.float8_e4m3fn:
-                    from atom.model_ops.blockscale import dequantize_fp8_weight
-
                     self.weight = atom_parameter(
                         dequantize_fp8_weight(
                             self.weight.data,
@@ -1434,6 +1433,8 @@ class LinearBase(nn.Module):
                             group_rows=self.native_a8_group_rows,
                         )
                     )
+                    # A fresh Parameter: weight_loader() reads this off it.
+                    self.weight.weight_loader_process = self.weight_loader_process
                     self.weight_scale = None
                 return
             if self.weight.numel() and weight_is_stored_preshuffled(

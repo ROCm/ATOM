@@ -307,6 +307,10 @@ def test_native_linear_bf16_fallback(linear_modules, monkeypatch):
     module, x, full_weight = _native_dispatch_case(linear, monkeypatch)
     assert module.weight_scale is None
     assert torch.equal(module.weight.float().cpu(), full_weight)
+    # A later weight update (a rollout sync) loads through the BF16 weight.
+    module.weight_loader(module.weight, 2 * full_weight)
+    assert torch.equal(module.weight.float().cpu(), 2 * full_weight)
+    module.weight_loader(module.weight, full_weight)
 
     def reached(*_args, **_kwargs):
         raise AssertionError("a BF16 weight reached the shuffle decision")

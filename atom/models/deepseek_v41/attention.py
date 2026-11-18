@@ -55,7 +55,6 @@ from atom.model_ops.linear import (
 )
 from atom.model_ops.utils import atom_parameter
 from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src
-from atom.model_ops.v4_kernels.inverse_rope import inverse_rope_inplace
 from atom.utils import envs, forward_context
 from atom.utils.region_graph import eager_region, forks, join_stream
 
@@ -430,18 +429,10 @@ class Attention(nn.Module):
         """
         rows = output.shape[:-2].numel()
         if self.wo_a.runs_bf16:
-            x = output.reshape(rows, self.heads, self.head_dim)
-            if not x.is_contiguous():
-                x = x.contiguous()
-            pos = positions.flatten()
-            if pos.stride(0) != 1:
-                pos = pos.contiguous()
-            inverse_rope_inplace(
-                x,
-                rope.cos_cache[:, None, None, :],
-                rope.sin_cache[:, None, None, :],
-                pos,
-                rope.rope_dim,
+            x = rope(
+                output.reshape(1, rows, self.heads, self.head_dim).contiguous(),
+                positions.flatten(),
+                inverse=True,
             )
             # The bmm writes through y's [groups, rows, o_rank] view, so y is
             # already wo_b's [rows, groups * o_rank] input: no transpose copy.

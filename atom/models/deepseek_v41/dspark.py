@@ -75,7 +75,8 @@ class DraftAttention(Attention):
     def wkv_shard(self):
         """`wqkv_a` narrowed to the KV rows, for the fused context-KV GEMM."""
         if self._wkv_shard is None:
-            self._wkv_shard = self.wqkv_a.shard_view(1)
+            # A view of `wqkv_a`, not a submodule: kept out of `_modules`.
+            object.__setattr__(self, "_wkv_shard", self.wqkv_a.shard_view(1))
         return self._wkv_shard
 
     def project_context(self, hidden, positions, rope, *, packed=False):

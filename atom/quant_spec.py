@@ -267,13 +267,14 @@ def fuses_ptpc_shared_into_online_ptpc(
     while loading and copies it into its slot after the online quant.
     """
     # Same-format routed experts fuse without staging; an unquantized source has
-    # no weight-scale params to stage the scales through.
+    # no weight-scale params to stage the scales through, and streamed routed
+    # buffers are still on meta when the staging is built.
+    source = (quant_config, routed_prefix, routed.quant_type, routed.quant_dtype)
     if (
         shared.quant_type != QuantType.per_Token
         or routed.quant_type in (QuantType.per_Token, QuantType.No)
-        or not will_online_requant(
-            quant_config, routed_prefix, routed.quant_type, routed.quant_dtype
-        )
+        or not will_online_requant(*source)
+        or should_stream_online_quant(*source)
     ):
         return False
     online = quant_config.get_layer_quant_config(routed_prefix, use_online_quant=True)

@@ -298,13 +298,23 @@ _BF16 = _spec(QuantType.No, torch.bfloat16)
         (_PTPC, _BF16, _PTPC, False),
     ],
 )
-def test_ptpc_shared_expert_staging(shared, routed, online, staged):
+def test_ptpc_shared_expert_staging(monkeypatch, shared, routed, online, staged):
+    monkeypatch.setenv("ATOM_ONLINE_QUANT_STREAMING", "0")
     quant_config = _QuantConfig(shared, routed, online)
     prefix = "model.layers.3.mlp.experts"
     assert (
         fuses_ptpc_shared_into_online_ptpc(quant_config, prefix, shared, routed)
         is staged
     )
+
+
+def test_ptpc_shared_expert_is_not_staged_into_streamed_experts(monkeypatch):
+    """The staging refuses streamed routed buffers, so the decision leaves the
+    shared expert standalone."""
+    monkeypatch.setenv("ATOM_ONLINE_QUANT_STREAMING", "1")
+    quant_config = _QuantConfig(_PTPC, _MXFP4, _PTPC)
+    prefix = "model.layers.3.mlp.experts"
+    assert not fuses_ptpc_shared_into_online_ptpc(quant_config, prefix, _PTPC, _MXFP4)
 
 
 @pytest.mark.parametrize(

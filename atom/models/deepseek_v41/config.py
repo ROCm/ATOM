@@ -452,6 +452,11 @@ def validate_runtime_config(config):
             and not config.enable_encoder_swa_bounded_replay,
         ),
         ("RapidServe", config.enable_rapidserve),
+        (
+            # Validated only as FP4PTPC's routed-expert conversion.
+            "online quantization of the native checkpoint",
+            config.online_quant_config is not None and not config.hf_config.fp4ptpc,
+        ),
         ("EPLB", config.eplb_enable),
         (
             # The plane the paged scorer reads: FP8, or FP4 in the row-group
@@ -485,18 +490,30 @@ def validate_runtime_config(config):
 
 
 def validate_fp4ptpc_recipe(config):
-    """FP4PTPC runs only with its FP4 routed experts converted to per-channel
-    FP8; unconverted, its per-channel FP8 shared expert cannot take their
-    fused slot."""
+    """FP4PTPC runs only with every layer's FP4 routed experts converted to
+    per-channel FP8; unconverted, its per-channel FP8 shared expert cannot
+    take their fused slot."""
     if not config.hf_config.fp4ptpc:
         return
     from aiter import QuantType, dtypes
 
-    routed = config.quant_config.online_pattern_spec("layers.0.ffn.experts")
-    if (
-        routed is None
-        or routed.quant_type.value != QuantType.per_Token.value
-        or routed.quant_dtype != dtypes.fp8
+    from atom.utils import envs
+
+    if envs.ATOM_ONLINE_QUANT_STREAMING:
+        # The shared expert is staged into routed buffers that streaming
+        # leaves on meta; left standalone, its TP4 width (576) has no GEMM.
+        raise ValueError(
+            "DeepSeek-V4.1 FP4PTPC does not support ATOM_ONLINE_QUANT_STREAMING"
+        )
+    routed = (
+        config.quant_config.online_pattern_spec(f"layers.{layer}.ffn.experts")
+        for layer in range(config.hf_config.num_hidden_layers)
+    )
+    if any(
+        spec is None
+        or spec.quant_type.value != QuantType.per_Token.value
+        or spec.quant_dtype != dtypes.fp8
+        for spec in routed
     ):
         raise ValueError(
             "DeepSeek-V4.1 FP4PTPC needs its routed experts converted to "

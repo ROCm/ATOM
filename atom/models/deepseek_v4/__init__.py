@@ -2819,8 +2819,13 @@ class Expert(nn.Module):
         # silu/clamp/mul in fp32 internally regardless of input dtype, so we
         # feed the bf16 GEMM output directly.
         combined = self.gate_up_proj(x)  # [num_tokens, 2*inter_dim_per_tp]
-        # A BF16 w2 (no group32 FP8 GEMM here) takes no quantized input.
-        if self.use_fused_clamp_act_mul and not self.w2.runs_bf16:
+        # A BF16 w2 (no group32 FP8 GEMM here) takes no quantized input, and a
+        # per-channel one quantizes its own.
+        scale_kwargs = fused_scale_kwargs(
+            self.w2.native_a8_group_rows,
+            self.w2.quant_type.value == QuantType.per_1x128.value,
+        )
+        if self.use_fused_clamp_act_mul and scale_kwargs and not self.w2.runs_bf16:
             native_mx = self.w2.native_a8_group_rows is not None
             x_fp8, x_scale = fused_clamp_act_mul(
                 combined,
@@ -2828,7 +2833,7 @@ class Expert(nn.Module):
                 activation="silu",
                 weights=weights,
                 dtype_quant=dtypes.fp8,
-                **fused_scale_kwargs(self.w2.native_a8_group_rows),
+                **scale_kwargs,
             )
             if native_mx:
                 x_scale = x_scale.view(torch.float8_e8m0fnu)

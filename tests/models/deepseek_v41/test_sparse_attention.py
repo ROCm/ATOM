@@ -161,7 +161,7 @@ def test_csa_split_kv_matches_the_unsplit_kernel(monkeypatch, count):
         dim**-0.5,
     )
 
-    monkeypatch.setattr(paged_2src, "_cu_count", lambda _: 80)
+    monkeypatch.setattr(paged_2src, "_cu_count", lambda: 80)
     chosen = []
     real = paged_2src._csa_num_splits
     monkeypatch.setattr(
@@ -174,3 +174,5 @@ def test_csa_split_kv_matches_the_unsplit_kernel(monkeypatch, count):
     monkeypatch.setattr(paged_2src, "_csa_num_splits", lambda *a: 1)
     whole = paged_2src._sparse_attn_v4_paged_2src_triton(*args)
     torch.testing.assert_close(split, whole, rtol=1 / 64, atol=2**-10)
+    # A step with no tokens has no programs to split.
+    assert real(0, 1, 640.0) == 1
