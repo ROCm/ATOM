@@ -2826,6 +2826,22 @@ FINDING = re.compile(r"^\s*(\U0001F534|\u26A0\uFE0F?|\U0001F4DD)\s*(.+)$")
 # IDENT itself cannot be widened here -- it is read by other gates -- so the claim path
 # carries its own, which also admits a digit in the first segment.
 CLAIM_IDENT = re.compile(r"[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]{2,}|[A-Z][A-Z0-9_]{3,}")
+# ...but the ALL-CAPS half of that shape is also how this codebase writes its ordinary
+# vocabulary, and those words name nothing. `B1 FIRE -- GEMM output cast drops the scale`
+# must not be claimed by an unrelated card line that happens to say `BF16 GEMM`. Dtypes
+# and architectures are already VALUE's business; the rest are spelled out, because the
+# distinction is which words are common here, not what shape they have.
+_GENERIC_CAPS = frozenset(
+    "GEMM GEMV MOE MLA CUDA HIP ROCM AITER NCCL RCCL RDMA API ABI CPU GPU "
+    "TODO FIXME XXX NOTE JSON YAML HTML HTTP HTTPS URL UUID ASCII UTF8 LRU FIFO LIFO "
+    "MI300 MI308 MI325 MI355 CDNA RDNA WMMA MFMA TP8 TP4 DP8 EP8 PP8 SGLANG VLLM ATOM "
+    "PR CI README SPDX AMD NVIDIA".split())
+
+
+def _is_claim_identifier(word):
+    """Does this spelling name something, rather than describe a kind of thing?"""
+    return bool(CLAIM_IDENT.fullmatch(word)) and word.upper() not in _GENERIC_CAPS \
+        and not VALUE.fullmatch(word)
 
 
 def _claim_tokens(text):
@@ -3183,7 +3199,7 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
                 # two: `B1 FIRE -- deadlock` would otherwise have no legal card at all.
                 enough = len(shared) >= 2 or len(want) < 2
                 if shared and (enough
-                               or any(CLAIM_IDENT.fullmatch(want[w]) for w in shared)):
+                               or any(_is_claim_identifier(want[w]) for w in shared)):
                     claims.setdefault(rule, []).append(text[:40])
     # A finding may report more than one rule, and often should: aiter#3165 fired B4 and
     # E5 on the same changed file and one accurate bullet covered both. Requiring N

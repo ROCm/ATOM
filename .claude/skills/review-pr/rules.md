@@ -780,13 +780,13 @@ later, re-add the specific one with that citation — not the whole family uncit
 
 | Check | Trigger | Flag |
 |---|---|---|
-| Temp script | `runperf-*.sh`, `test_local_*.py` in diff | `⚠️ [file] looks temporary — remove before merge` |
-| Unrelated files | Files with no connection to PR purpose | `⚠️ [file] appears unrelated` |
-| Bug fix without test | No regression test or repro script | `📝 bug fix without test — how to prevent regression?` |
-| TODO/stub in new path | `# TODO`, `# FIXME`, `raise NotImplementedError`, lone `pass` on a `+` line inside a new branch | `⚠️ [location] — incomplete implementation in new code path, will silently not execute on default path` |
-| Undocumented new env var | `os.environ.get("ATOM_...` or `os.environ.get("AITER_...` on a `+` line | `📝 new env var [NAME] — register in atom/envs.py AND document in README` |
-| Test reference dtype promotion | New test reference impl uses Python float literal (`1.0 + weight`, `0.5 * x.float()`) or explicit upcast (`.to(torch.float32)`, `.double()`) promoting to fp32 while kernel runs in bf16/fp8 — comparison calibrated against wrong-precision baseline | `⚠️ reference [fn] promotes to fp32 — cast back to [kernel dtype] before comparison` |
-| New third-party dependency | New package in `requirements*.txt`, `setup.py`, `pyproject.toml`; or new top-level `import [pkg]` not already a project dep. Exception: ROCm system packages (`amdsmi`, `hip`, `rccl`) are intentionally not on PyPI — flag only if there is no `try/except ImportError` guard AND no comment explaining the ROCm-only dependency | `📝 new dependency [pkg] — add to requirements, or add try/except ImportError with a comment for ROCm system packages` |
+| HK1 Temp script | `runperf-*.sh`, `test_local_*.py` in diff | `⚠️ [file] looks temporary — remove before merge` |
+| HK2 Unrelated files | Files with no connection to PR purpose | `⚠️ [file] appears unrelated` |
+| HK3 Bug fix without test | No regression test or repro script | `📝 bug fix without test — how to prevent regression?` |
+| HK4 TODO/stub in new path | `# TODO`, `# FIXME`, `raise NotImplementedError`, lone `pass` on a `+` line inside a new branch | `⚠️ [location] — incomplete implementation in new code path, will silently not execute on default path` |
+| HK5 Undocumented new env var | `os.environ.get("ATOM_...` or `os.environ.get("AITER_...` on a `+` line | `📝 new env var [NAME] — register in atom/envs.py AND document in README` |
+| HK6 Test reference dtype promotion | New test reference impl uses Python float literal (`1.0 + weight`, `0.5 * x.float()`) or explicit upcast (`.to(torch.float32)`, `.double()`) promoting to fp32 while kernel runs in bf16/fp8 — comparison calibrated against wrong-precision baseline | `⚠️ reference [fn] promotes to fp32 — cast back to [kernel dtype] before comparison` |
+| HK7 New third-party dependency | New package in `requirements*.txt`, `setup.py`, `pyproject.toml`; or new top-level `import [pkg]` not already a project dep. Exception: ROCm system packages (`amdsmi`, `hip`, `rccl`) are intentionally not on PyPI — flag only if there is no `try/except ImportError` guard AND no comment explaining the ROCm-only dependency | `📝 new dependency [pkg] — add to requirements, or add try/except ImportError with a comment for ROCm system packages` |
 
 
 ## Refutation

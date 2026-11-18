@@ -533,6 +533,19 @@ t "a path-less FIRE can be claimed by the words of its reason" \
 # worker through `expand`, so the model was being shown the opening it would be refused
 # for. Refusing the output while the examples teach it is the same instruction/gate
 # disagreement this PR is about, one level up.
+# The template rewrite stripped the only `HKn` from each Housekeeping row, and
+# `expand_rules` finds those rows by that id -- so any diff deriving an HK rule got
+# MISSING-RULE-TEXT, rc 1, and fetch.sh aborted the whole review. A `.sh` file, a
+# `# TODO`, an `ATOM_` env var or three top-level dirs is enough to trigger it, which
+# includes this PR. The ids live in the Check column now, where expand reads them and no
+# card ever quotes them.
+t "a diff deriving housekeeping rules still expands" \
+  "$(d=$(mktemp -d)
+     printf 'diff --git a/x.sh b/x.sh\n--- a/x.sh\n+++ b/x.sh\n@@ -0,0 +1,2 @@\n+# TODO fix\n+export ATOM_FOO=1\n' > "$d/pr.diff"
+     python3 "$S/triage.py" rules "$d/pr.diff" > "$d/rules.txt" 2>/dev/null
+     grep -qE 'HK[0-9]' "$d/rules.txt" || { echo NO-HK-DERIVED; exit; }
+     python3 "$S/triage.py" expand "$d/rules.txt" "$S/rules.md" >/dev/null 2>&1
+     echo $?)" "0"
 t "no rule template opens with an internal rule id" \
   "$(python3 -c '
 import re, sys, pathlib
@@ -644,6 +657,20 @@ Validation (deterministic): N/A -- no runtime surface changed
      "A5 FIRE -- foo.py:3 guard missing
 B1 FIRE -- KVCACHE size not updated" \
      "diff --git a/foo.py b/foo.py")" ""
+# ...but GEMM, BF16, CUDA and TODO have that shape too and name nothing. An unrelated
+# card line saying `BF16 GEMM` must not claim `B1 FIRE -- GEMM output cast ...`.
+t "a generic ALL-CAPS word is not an identifier" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ foo.py:3 BF16 GEMM tuned config missing. **Author must** add one.' \
+     "A5 FIRE -- foo.py:3 tuned config missing
+B1 FIRE -- GEMM output cast drops the per-token scale" \
+     "diff --git a/foo.py b/foo.py" | grep -c UNREPORTED-FIRE)" "1"
 # A digit in the first segment is still an identifier.
 t "fp8_scale is an identifier" \
   "$(_card_kinds '## T
