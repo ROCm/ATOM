@@ -1291,6 +1291,15 @@ class TestExplicitPlan:
         )
         assert getattr(sparse_cap.orelse, "id", None) == "max_context_partition_num"
 
+        import pathlib
+
+        import atom
+
+        source = (
+            pathlib.Path(atom.__file__).parent / "model_ops/minimax_m3/sparse_attn.py"
+        ).read_text()
+        assert 'get_gfx_runtime() == "gfx1250"' in source
+
         for kw in self._call_kwargs(
             "plugin/vllm/attention/layer_mha.py", "run_pa_decode"
         ):
