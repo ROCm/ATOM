@@ -1,29 +1,29 @@
-"""CPU checks for ATOM_DP_MAIN_ARGMAX (needs aiter; the pack kernel runs in
-the Triton interpreter):
+"""CPU checks for the opt-in DP main argmax path, with external kernels stubbed.
 
-  TRITON_INTERPRET=1 python -m pytest -q tests/test_dp_main_argmax.py
+The real head exchange and runner methods run without AITER or a GPU. The
+exchange's pack boundary uses a CPU reference; test_lm_head_argmax.py covers
+the actual Triton kernel separately. Constraint/fallback and sampler-bypass
+coverage lives in test_token_constraint_wiring.py.
 """
 
-import os
 import types
 
 import numpy as np
 import pytest
 import torch
+from aiter_stub import atom_without_aiter
 
-_arch = pytest.importorskip(
-    "aiter.ops.triton.utils._triton.arch_info",
-    reason="model_runner and embed_head import the AITER runtime",
-)
-if _arch._CACHED_ARCH is None and not torch.cuda.is_available():
-    _arch._CACHED_ARCH = "gfx1250"  # GPU-less: aiter probes the arch at import
+mr = eh = None  # bound against the CPU stand-ins by `_modules`
 
-import atom.model_engine.model_runner as mr
-import atom.model_ops.embed_head as eh
 
-interpret_only = pytest.mark.skipif(
-    os.environ.get("TRITON_INTERPRET") != "1", reason="needs TRITON_INTERPRET=1"
-)
+@pytest.fixture(scope="module", autouse=True)
+def _modules():
+    global mr, eh
+    with atom_without_aiter() as load:
+        mr = load("atom.model_engine.model_runner")
+        eh = load("atom.model_ops.embed_head")
+        yield
+
 
 DP, VSHARD = 4, 129280 // 4
 
@@ -64,21 +64,31 @@ def _lowest_max_id(rows):
     return torch.where(hit, torch.arange(f.shape[1]), f.shape[1]).min(dim=1).values
 
 
-@interpret_only
+def _cpu_pack(logits, vocab_start):
+    """Reference for the external pack boundary, with first-index tie breaking."""
+    values, indices = logits.float().max(dim=1)
+    return torch.stack((values, (indices + vocab_start).float()), dim=1)
+
+
 @pytest.mark.parametrize("local_rows", [3, 2])
 def test_dp_argmax_matches_lowest_id_of_full_row(monkeypatch, local_rows):
-    """Real pack kernel (interpreted) + the real exchange in `_dp_sharded_logits`
-    pick, per row, the lowest global id of the full-vocab max: what the
-    allgather head + `topk_select(k=1, tie="low")` greedy sampler picks."""
+    """The real exchange chooses the lowest global max id across vocab shards,
+    including padding, cross-shard ties, signed zero and all-negative-infinity
+    rows. Only the external GEMM and pack kernels are replaced."""
     max_rows = 3
     full = _rows_with_ties(DP * max_rows)  # the Σrows x V logits every path sees
     ref = _lowest_max_id(full)
     shards = [full[:, r * VSHARD : (r + 1) * VSHARD].contiguous() for r in range(DP)]
-    packs = [eh.lm_head_argmax_pack(shards[r], r * VSHARD) for r in range(DP)]
+    packs = [_cpu_pack(shards[r], r * VSHARD) for r in range(DP)]
 
-    monkeypatch.setattr(eh.envs, "ATOM_USE_CUSTOM_ALL_GATHER", False)
+    monkeypatch.setattr(
+        eh, "envs", types.SimpleNamespace(ATOM_USE_CUSTOM_ALL_GATHER=False)
+    )
+    monkeypatch.setattr(eh, "lm_head_argmax_pack", _cpu_pack)
     for rank in range(DP):
-        monkeypatch.setattr(eh.tgemm, "mm", lambda *a, _r=rank, **k: shards[_r])
+        monkeypatch.setattr(
+            eh, "tgemm", types.SimpleNamespace(mm=lambda *a, _r=rank, **k: shards[_r])
+        )
 
         def gather(x, dim=0, use_custom=False, _r=rank):
             if x.shape[-1] == 2 and x.dtype == torch.float32:
@@ -128,7 +138,7 @@ def test_dp_argmax_token_gate(monkeypatch, plugin, mode, ctx, dp_meta, expect):
     for k, v in ctx.items():
         setattr(c, k, v)
     monkeypatch.setattr(eh, "is_plugin_mode", lambda: plugin)
-    monkeypatch.setattr(eh.envs, "ATOM_DP_LM_HEAD_MODE", mode)
+    monkeypatch.setattr(eh, "envs", types.SimpleNamespace(ATOM_DP_LM_HEAD_MODE=mode))
     monkeypatch.setattr(
         eh, "get_dp_group", lambda: types.SimpleNamespace(world_size=DP)
     )
@@ -176,13 +186,12 @@ def _runner(head=None, compute_head=None):
     return runner
 
 
-def _batch(n=3, temps=None, logprobs=False, structured=None, channel=None):
-    temps = np.zeros(n, np.float32) if temps is None else np.asarray(temps, np.float32)
+def _batch(n=3):
     return types.SimpleNamespace(
-        temperatures=temps,
-        any_logprobs=logprobs,
-        structured_requests=structured or {},
-        required_channel=channel,
+        temperatures=np.zeros(n, np.float32),
+        any_logprobs=False,
+        structured_requests={},
+        required_channel=None,
     )
 
 
@@ -199,31 +208,11 @@ def test_head_output_takes_ids_only_with_logits():
     assert r._head_output(torch.zeros(3, 4)).shape == (3, 8)
 
 
-def test_step_head_greedy_serves_int32_ids():
-    ids = torch.tensor([5.0, 129279.0, 0.0])
-    r = _runner(_Head(ids))
-    out = r._step_head(ids, torch.zeros(4, 4), _batch(3))
-    assert out.dtype == torch.int32 and out.tolist() == [5, 129279, 0]
-    assert out.data_ptr() != ids.data_ptr()
-    assert r.compute_logits_calls == 0
-
-
-@pytest.mark.parametrize(
-    "kw",
-    [
-        {"temps": [0.0, 0.7, 0.0]},
-        {"logprobs": True},
-        {"structured": {0: object()}},
-        {"channel": object()},
-        None,
-    ],
-)
-def test_step_head_fallback_is_local_logits(kw):
+def test_step_head_without_batch_uses_local_logits():
     ids = torch.tensor([5.0, 7.0, 1.0])
     head = _Head(ids)
     r = _runner(head)
-    batch = None if kw is None else _batch(3, **kw)
-    out = r._step_head(ids, torch.zeros(4, 4), batch)
+    out = r._step_head(ids, torch.zeros(4, 4), None)
     assert out.dim() == 2 and out.shape == (3, 8)
     assert head.local_rows == [3]
     assert r.compute_logits_calls == 0
@@ -238,61 +227,3 @@ def test_step_head_logits_untouched():
     ids = torch.tensor([5.0, 7.0, 1.0])
     off = _runner(None)  # flag off: a 1-D head is not taken for ids
     assert off._step_head(ids, torch.zeros(3, 4), _batch(3)) is ids
-
-
-# ----------------------------------------------------------- postprocess ---
-def test_postprocess_takes_ids_without_sampler(monkeypatch):
-    monkeypatch.setattr(mr, "get_pcp_world_size", lambda: 1)
-    monkeypatch.setattr(mr, "pcp_is_enabled", lambda: False)
-    monkeypatch.setattr(mr, "sp_is_enabled", lambda: False)
-    monkeypatch.setattr(
-        mr,
-        "get_forward_context",
-        lambda: types.SimpleNamespace(spec_decode_metadata=None),
-    )
-    monkeypatch.setattr(mr, "get_tp_group", lambda: types.SimpleNamespace(world_size=1))
-    seen = {}
-    runner = object.__new__(mr.ModelRunner)
-    runner.rank = 0
-    runner._served = None
-    runner.dp_argmax_head = object()
-
-    def sampler(*a, **k):
-        raise AssertionError("sampler must not run on ids")
-
-    runner.sampler = sampler
-
-    def prepare(batch, sampled, *a, **k):
-        seen["sampled"] = sampled
-        return {}, {}
-
-    runner.forward_done_event = types.SimpleNamespace(record=lambda stream=None: None)
-    runner.tokenID_processor = types.SimpleNamespace(
-        is_deferred_out=False,
-        prev_batch=None,
-        zero_spec_counts=torch.zeros(128, dtype=torch.int32),
-        prepare_sampled_ids=prepare,
-    )
-    batch = types.SimpleNamespace(
-        total_seqs_num=3,
-        total_tokens_num=3,
-        req_ids=[0, 1, 2],
-        return_logprobs=[False] * 3,
-        any_logprobs=False,
-        logprob_rows=None,
-        structured_requests={},
-        required_channel=None,
-        num_spec_step=0,
-    )
-    ids = torch.tensor([4, 9, 2, 6], dtype=torch.int32)
-    runner.postprocess(
-        batch=batch,
-        logits=ids,
-        temperatures=torch.full((3,), 1e-10),
-        top_ks=None,
-        top_ps=None,
-        all_greedy=True,
-        hidden_states=None,
-    )
-    assert seen["sampled"].dtype == torch.int32
-    assert seen["sampled"].tolist() == [4, 9, 2]
