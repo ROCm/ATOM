@@ -1013,6 +1013,39 @@ models:
           name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-kvev-1m-c56
           concurrency: [56]
 
+        # 2P1D A/B on three nodes (multi_node): each CPP4 prefill on a node of
+        # its own, with that node's Mooncake Store, and the DCP4 decode on the
+        # third; the 1P1D Store cells' settings otherwise. The cells differ
+        # only in how the router places a turn on a prefill: by the KV events
+        # (cache_aware), by session (dp_sticky, which a multi-prefill agentic
+        # cell gets by default), or in turn (round_robin). Only the first
+        # follows events.
+        - &glm52_agentic_mcstore_kvev_2p1d_cpp4_dcp4
+          <<: *glm52_agentic_mcstore_kvev_cpp4_dcp4
+          name: glm-52-mxfp4-2p1d-cpp4-dcp4-agentic-mcstore-kvev-1m-c72
+          topology: 2p1d_cpp4_dcp4
+          display_topology: 2P1D-CPP4-DCP4-TP1-TP4-MCSTORE-KVEV
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_2P1D_NODES}"
+          prefill:
+            workers: 2
+            tp: 1
+            cudagraph: none
+            extra_args: "--pipeline-parallel-size 4 --enforce-eager --max-num-batched-tokens 8192 --timeout-keep-alive 900"
+
+        - <<: *glm52_agentic_mcstore_kvev_2p1d_cpp4_dcp4
+          name: glm-52-mxfp4-2p1d-cpp4-dcp4-agentic-mcstore-sticky-1m-c72
+          display_topology: 2P1D-CPP4-DCP4-TP1-TP4-MCSTORE-STICKY
+          router:
+            policy: random
+
+        - <<: *glm52_agentic_mcstore_kvev_2p1d_cpp4_dcp4
+          name: glm-52-mxfp4-2p1d-cpp4-dcp4-agentic-mcstore-rr-1m-c72
+          display_topology: 2P1D-CPP4-DCP4-TP1-TP4-MCSTORE-RR
+          router:
+            policy: round_robin
+            prefill_policy: round_robin
+
     accuracy:
       task: gsm8k
       fewshot: 20
