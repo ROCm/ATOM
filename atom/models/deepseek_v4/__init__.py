@@ -2953,8 +2953,9 @@ class MoE(nn.Module):
         # routed experts on the current stream. Mirrors V2's pattern. Only
         # active when shared_experts exist (not fused into routed) AND the
         # env threshold is positive AND we got an alt_stream from the model.
-        # Per-call token count gating happens inside the custom op dispatcher
-        # — prefill (large batch) skips dual-stream (overhead > benefit).
+        # Per-call row gating happens inside the custom op dispatcher: a call
+        # with more rows than `_dual_stream_token_threshold` (set below) stays
+        # single-stream.
         self._use_dual_stream = (
             self.shared_experts is not None
             and self.alt_stream is not None

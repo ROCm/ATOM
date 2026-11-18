@@ -1094,7 +1094,7 @@ def test_dual_stream_gate_reads_the_module_threshold(monkeypatch, atom_modules, 
     assert dispatch._dual_stream_is_active(other, rows) == (rows <= 1024)
 
 
-@pytest.mark.parametrize(("env", "expected"), [(None, 1536), ("2048", 2048)])
+@pytest.mark.parametrize(("env", "expected"), [(None, 1536), ("2048", 2048), ("0", 0)])
 def test_dsv4_moe_init_sets_its_dual_stream_threshold(
     monkeypatch, atom_modules, env, expected
 ):
@@ -1137,6 +1137,7 @@ def test_dsv4_moe_init_sets_its_dual_stream_threshold(
 
     moe = v4.MoE(3, args, prefix="model.layers.3.ffn", alt_stream=object())
 
-    assert moe._use_dual_stream
     assert moe._dual_stream_token_threshold == expected
-    assert forward_context["model.layers.3.ffn"] is moe
+    # 0 turns the dual stream off: no fork and no registration for it.
+    assert moe._use_dual_stream == (expected > 0)
+    assert (forward_context.get("model.layers.3.ffn") is moe) == (expected > 0)

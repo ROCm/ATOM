@@ -43,8 +43,8 @@ from atom.utils.forward_context import plugin_graph_is_piecewise
 #   - `single_stream_moe_forward(hidden_states) -> Tensor`
 #   - `dual_stream_moe_forward(hidden_states) -> Tensor`
 #
-# Per-token gating: decode benefits from dual-stream, prefill doesn't —
-# rows above `_dual_stream_token_threshold` stay single-stream.
+# Per-call row gating: a call with more rows than
+# `_dual_stream_token_threshold` stays single-stream.
 
 
 def _dual_stream_is_active(self, num_tokens: int) -> bool:
