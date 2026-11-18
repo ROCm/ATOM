@@ -17,6 +17,7 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl._mlir.dialects import rocdl as rocdl_dialect
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import math as fmath
 from flydsl.expr.typing import T, as_ir_value
 
 from atom.models.kimi_k3.mono.kernels.attention.layout import (
@@ -905,7 +906,7 @@ def replay_rows(c, state, h_rec, rows):
                 for e in range(4)
             ]
             state = [
-                state[4 * r + e] + us[r] * weighted[e]
+                fx.Float32(fmath.fma(us[r], weighted[e], state[4 * r + e]))
                 for r in range(count)
                 for e in range(4)
             ]
