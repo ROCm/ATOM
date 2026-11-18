@@ -2952,9 +2952,9 @@ class BlockManager:
         # A hash block finer than the chunk (block 128 against chunk 1024
         # without DCP) otherwise loses 7 anchors in 8 once the prompt leaves
         # HBM. While it is still there, the next turn resumes from the floored
-        # anchor, up to one chunk below its KV, and the demand its KV would ask
-        # for just above is dropped (`_record_checkpoint_demand`). If the
-        # step-back above (`room`, the last-block cap) crosses a chunk
+        # anchor, under one chunk below the stepped-back end, and the demand its
+        # KV would ask for just above is dropped (`_record_checkpoint_demand`).
+        # If the step-back above (`room`, the last-block cap) crosses a chunk
         # boundary, the demand is kept and cut, as it would be without the
         # floor. Either way the floor costs no extra cut. An anchor below one
         # chunk stays put: the joint load has no whole chunk to restore it from,
