@@ -309,12 +309,23 @@ def atom_under_stubs():
 
 @contextmanager
 def atom_without_aiter():
-    """`importlib.import_module`, against the stand-ins only where AITER is
-    not installed (the CPU job); a GPU host keeps the real kernels."""
+    """`importlib.import_module`, against the stand-ins only where AITER
+    cannot run here (the CPU job); a GPU host keeps the real kernels.
+
+    `import aiter` alone does not answer that: an AITER build on a host with
+    no GPU still imports, because its arch probe is deferred, and the
+    submodule that binds a kernel then fails on the missing device. An ATOM
+    module whose import chain reaches that submodule needs the stand-ins
+    there too. `gpu_stack_import` in tests/conftest.py draws the same line.
+    """
     try:
         import aiter  # noqa: F401
     except ImportError:
+        usable = False
+    else:
+        usable = torch.cuda.is_available()
+    if usable:
+        yield importlib.import_module
+    else:
         with atom_under_stubs() as load:
             yield load
-    else:
-        yield importlib.import_module

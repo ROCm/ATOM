@@ -114,6 +114,20 @@ def _nonnegative_int_env(name: str, default: int) -> int:
     return value
 
 
+def _optional_path_env(name: str) -> str | None:
+    """Unset or empty reads as None: ``VAR=`` clears a path inline."""
+    return os.getenv(name) or None
+
+
+def _path_env(name: str, default: str) -> str:
+    """Unset or empty reads as ``default``, never as the empty path.
+
+    ``Path("")`` is the working directory, so falling through to it would
+    silently write wherever the process happens to run.
+    """
+    return os.getenv(name) or default
+
+
 def _finite_float_env(name: str, default: float, *, allow_zero: bool) -> float:
     """Unset or empty reads as ``default``; a set value must be a valid float."""
     raw = os.getenv(name)
@@ -843,7 +857,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_METRICS_DEVICE_TIMER": lambda: (
         os.getenv("ATOM_ENABLE_METRICS_DEVICE_TIMER", "0") == "1"
     ),
-    "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv("ATOM_TORCH_PROFILER_DIR", None),
+    # Unset reads as None, and so does empty: `ATOM_TORCH_PROFILER_DIR=` is
+    # how a launcher clears the variable inline, and Config would otherwise
+    # abort startup on os.makedirs("") for the empty path.
+    "ATOM_TORCH_PROFILER_DIR": lambda: _optional_path_env("ATOM_TORCH_PROFILER_DIR"),
     # Move the startup heap (model, compiled graph, tokenizer, KV block pool)
     # into CPython's permanent generation once warmup is done, so collections
     # stop scanning it.  On by default; set 0 to keep the old behaviour.
@@ -896,10 +913,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # WARNING, ...); applied by atom.utils.set_atom_log_level(), which turns
     # NOTSET and unknown names into INFO.
     "ATOM_LOG_LEVEL": lambda: os.getenv("ATOM_LOG_LEVEL", "INFO"),
-    # RTL (rocm-trace-lite) GPU kernel tracing — set to output directory to enable.
-    # When set, the server launch is wrapped with `rtl trace` to collect per-kernel
-    # GPU timestamps for both prefill and decode phases.
-    "ATOM_RTL_TRACE_DIR": lambda: os.getenv("ATOM_RTL_TRACE_DIR", None),
+    # RTL (rocm-trace-lite) GPU kernel tracing. No Python code outside tests
+    # consumes this value: it names the output directory that
+    # .github/scripts/atom_test.sh passes to `rtl trace -o` when
+    # ENABLE_RTL_PROFILER=1, and reads back when the server stops; an empty
+    # value falls back to /app/rtl_traces there. Empty reads as unset here,
+    # like the other directory knobs.
+    "ATOM_RTL_TRACE_DIR": lambda: _optional_path_env("ATOM_RTL_TRACE_DIR"),
     # --- Model Loading ---
     "ATOM_DISABLE_MMAP": lambda: (
         os.getenv("ATOM_DISABLE_MMAP", "false").lower() == "true"
@@ -959,6 +979,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # to a warning when bringing up a checkpoint that is known to be partial.
     "ATOM_LOADER_STRICT_COVERAGE": lambda: (
         os.getenv("ATOM_LOADER_STRICT_COVERAGE", "true").lower() == "true"
+    ),
+    # Directory rank 0 writes the online_quant_info_*.json dump to, when set.
+    # Its own knob so that a launcher collecting the dump no longer has to
+    # hand the engine a profiler directory to get it.
+    "ATOM_ONLINE_QUANT_INFO_DIR": lambda: _optional_path_env(
+        "ATOM_ONLINE_QUANT_INFO_DIR"
     ),
     # Quantize eligible modules as they load to reduce peak memory. Streaming
     # quantizes local TP shards, so results may differ slightly from offline.
@@ -1377,7 +1403,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Where the compressed-vocab table is cached between runs. The table is
     # reproducible from the tokenizer, so this only trades startup time for
     # disk; point it at shared storage to let several servers build it once.
-    "ATOM_ENGRAM_CACHE_DIR": lambda: os.getenv(
+    # Empty reads as the default, like the other directory knobs: Path("") is
+    # the working directory, so `ATOM_ENGRAM_CACHE_DIR=` would otherwise drop
+    # the cache beside whatever directory the server was launched from.
+    "ATOM_ENGRAM_CACHE_DIR": lambda: _path_env(
         "ATOM_ENGRAM_CACHE_DIR", str(Path.home() / ".cache" / "atom" / "engram")
     ),
     # Overlap hash/UVA lookup and TP reassembly with early layers, using private
