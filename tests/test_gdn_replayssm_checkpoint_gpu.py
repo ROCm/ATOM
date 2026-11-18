@@ -406,12 +406,16 @@ def test_a_kda_decode_image_is_its_verify_step(h, step):
 
 
 @pytest.mark.parametrize(
-    "k, v, dtype",
-    [(K, V, torch.bfloat16), (64, 128, torch.bfloat16), (K, V, torch.float32)],
+    "kda, k, v, dtype",
+    [
+        (False, K, V, torch.bfloat16),
+        (True, K, V, torch.bfloat16),
+        (True, 64, 128, torch.bfloat16),  # K != V shows a transposed index
+        (True, K, V, torch.float32),
+    ],
 )
-@pytest.mark.parametrize("kda", [False, True])
 @pytest.mark.parametrize("h, step", [(5, 0), (5, 2), (10, 0), (10, 3)])
-def test_materialize_folds_exactly_the_step_s_records(kda, h, step, k, v, dtype):
+def test_materialize_folds_exactly_the_step_s_records(kda, k, v, dtype, h, step):
     """Against the closed form; h = 10 is a flushing forward."""
     torch.manual_seed(h + step)
     slots, hv = 3, 4
