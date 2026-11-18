@@ -415,7 +415,8 @@ class GDNStateMixin(PoolRowsMixin):
 
         gdn_metadata.ssm_checkpoints = ckpt = self._checkpoint_targets(batch)
         gdn_metadata.ssm_conv_state_len = self._conv_state_len()
-        if ckpt is not None:
+        # KDA writes re-run final states and has no GDN chunk snapshots.
+        if ckpt is not None and "interior_host" in ckpt:
             # Same mapping the chunk kernel builds internally, computed once
             # per step rather than per layer.
             gdn_metadata.ssm_chunk_offsets = prepare_chunk_offsets(
@@ -1226,6 +1227,26 @@ class GDNStateMixin(PoolRowsMixin):
         """
         return self.model_runner.config.hf_config.linear_conv_kernel_dim - 1
 
+    def _midstep_targets(self, batch: ScheduledBatch, grid: int) -> list:
+        """`midstep_checkpoint_targets` for this step's reservations, or []."""
+        all_saves = getattr(batch, "state_save_all", None)
+        if not all_saves or not any(all_saves):
+            return []
+        # Every reservation is checked against the predicate the scheduler
+        # placed it with, and raises if it fails: `commit_midstep` publishes
+        # its hash after this forward regardless, so a target dropped here is
+        # a findable checkpoint over unwritten bytes.
+        return midstep_checkpoint_targets(
+            batch.state_rows,
+            batch.num_cached_tokens,
+            batch.num_scheduled_tokens,
+            batch.state_slots_committed,
+            all_saves,
+            num_slots=self.model_runner.mamba_k_cache.shape[1],
+            grid=grid,
+            min_offset=self._conv_state_len(),
+        )
+
     def _checkpoint_targets(self, batch: ScheduledBatch) -> dict | None:
         """Checkpoints this step reaches, as device index tensors.
 
@@ -1269,25 +1290,7 @@ class GDNStateMixin(PoolRowsMixin):
         is. One slot is the whole checkpoint — a resumed prefix has no
         speculation to roll back, so it needs no scratch beside it.
         """
-        all_saves = getattr(batch, "state_save_all", None)
-        if not all_saves or not any(all_saves):
-            return None
-        from atom.model_ops.fla_ops.chunk import CHUNK_SIZE
-
-        # Every reservation is checked against the predicate the scheduler
-        # placed it with, and raises if it fails: `commit_midstep` publishes
-        # its hash after this forward regardless, so a target dropped here is
-        # a findable checkpoint over unwritten bytes.
-        found = midstep_checkpoint_targets(
-            batch.state_rows,
-            batch.num_cached_tokens,
-            batch.num_scheduled_tokens,
-            batch.state_slots_committed,
-            all_saves,
-            num_slots=self.model_runner.mamba_k_cache.shape[1],
-            grid=CHUNK_SIZE,
-            min_offset=self._conv_state_len(),
-        )
+        found = self._midstep_targets(batch, CHUNK_SIZE)
         if not found:
             return None
 

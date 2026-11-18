@@ -43,21 +43,24 @@ def builder(
     num_spec=0,
     pp=1,
     rapidserve=False,
+    model_type="kimi_linear",
 ):
     config = SimpleNamespace(
         pipeline_parallel_size=pp,
         enable_rapidserve=rapidserve,
+        hf_config=SimpleNamespace(linear_conv_kernel_dim=4),
     )
     stub = SimpleNamespace(
-        model_runner=SimpleNamespace(config=config),
+        model_runner=SimpleNamespace(
+            config=config, hf_text_config=SimpleNamespace(model_type=model_type)
+        ),
         num_state_layers=lambda: layers,
         num_spec=num_spec,
         _state_shape_for_runner=lambda: (shape_k, shape_v),
         _state_dtypes=lambda: (dt_k, dt_v),
     )
-    stub._uses_paged_checkpoints = Builder._uses_paged_checkpoints.__get__(
-        stub, type(stub)
-    )
+    for name in ("_uses_paged_checkpoints", "_reads_midstep", "_conv_state_len"):
+        setattr(stub, name, getattr(Builder, name).__get__(stub, type(stub)))
     return stub
 
 
@@ -155,8 +158,19 @@ class TestPagedCheckpointsAreRefusedWhereSizingWouldRaise:
             transfer = Builder.state_transfer(builder())
         assert transfer.copies and not transfer.forks
 
-    def test_a_copy_is_never_midstep_readable(self):
-        """KDA's chunk kernel returns only the final state, so there is no
-        interior state to slice a checkpoint out of."""
+    def test_k3_writes_a_checkpoint_inside_a_prefill(self):
+        """KDA's chunk kernel returns only the final state, so K3's forward
+        re-runs an interior checkpoint's head, which ends on any token; the
+        conv window still needs `conv_kernel - 1` of the forward's tokens."""
         with tp_world(TP):
-            assert not Builder.state_transfer(builder()).readable_midstep
+            transfer = Builder.state_transfer(builder())
+        assert transfer.readable_midstep
+        assert (transfer.midstep_grid, transfer.midstep_min_offset) == (1, 3)
+
+    def test_nothing_else_writes_one(self):
+        """Not under PP, where the scratch slot's hand-back is unchecked;
+        GLM-5.3 shares the builder but not the forward that writes it."""
+        with tp_world(TP):
+            assert not Builder.state_transfer(builder(pp=2)).readable_midstep
+            glm = builder(model_type="glm5_next_text")
+            assert not Builder.state_transfer(glm).readable_midstep
