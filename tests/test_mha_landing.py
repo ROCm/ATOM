@@ -323,15 +323,7 @@ def test_chunk_handoff_is_checked_before_landing_completion(bad):
     c = h.c
     c._landing = h.recv
     c._landing_spec = LandingSpec(1, MHA_SCATTER_SEGMENTS, PAGE_UNITS, True)
-    c._pending_handoffs = {
-        21: {
-            "failed": False,
-            "metadata": None,
-            "landing_nonce": 3,
-            "expected": 2,
-            "stages": set(),
-        }
-    }
+    c._pending_handoffs = {21: mc._PendingHandoff(landing_nonce=3, expected=2)}
     h.recv.advertise("s1", 2)
     h.recv.begin(21, 3, [2, 0, 3], {0: "s0", 1: "s1"})
     good = {"first_token_id": 42, "draft_token_ids": []}
@@ -340,7 +332,7 @@ def test_chunk_handoff_is_checked_before_landing_completion(bad):
     # Wrong nonce and duplicate must not poison metadata or finish another stage.
     c._record_write_done(21, 1, write_nonce=9, handoff=bad, landed_slots=[])
     c._record_write_done(21, 0, write_nonce=3, handoff=bad, landed_slots=[])
-    assert not c._pending_handoffs[21]["failed"]
+    assert not c._pending_handoffs[21].failed
     c._record_write_done(21, 1, write_nonce=3, handoff=bad, landed_slots=[])
     assert h.finished == [(21, True)]
 

@@ -19,7 +19,7 @@ import threading
 import time
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, astuple, dataclass
+from dataclasses import asdict, astuple, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -987,6 +987,32 @@ class _UnitPlan:
     num_consumer_regions: int = 0
 
 
+@dataclass
+class _PendingHandoff:
+    """A chunked receive's prefill handoff, which every PP stage must agree on."""
+
+    metadata: dict | None = None
+    failed: bool = False
+    # A landing receive settles in LandingReceiver, outside the write-done
+    # tables, so its stages are counted here before their handoffs fold in.
+    landing_nonce: int | None = None
+    expected: int = 0
+    stages: set[int] = field(default_factory=set)
+
+    def fold(self, req_id: ReqId, success: bool, handoff: dict | None) -> bool:
+        """Fold one stage's result in; returns whether the receive still holds."""
+        if success:
+            try:
+                PrefillHandoff.from_wire(req_id, handoff)
+            except (TypeError, ValueError):
+                success = False
+        if not success or (self.metadata is not None and self.metadata != handoff):
+            self.failed = True
+        else:
+            self.metadata = handoff
+        return not self.failed
+
+
 class _RdmaBatch:
     """Descriptors queued for one RDMA write, flushed every `limit` entries."""
 
@@ -1272,7 +1298,7 @@ class MooncakeConnector(KVConnectorBase):
         self._retired_chunked_transfers: OrderedDict[ReqId, None] = OrderedDict()
         self._pending_chunked_requests: list[tuple[dict, float]] = []
         self._received_handoffs: dict[ReqId, PrefillHandoff] = {}
-        self._pending_handoffs: dict[ReqId, dict] = {}
+        self._pending_handoffs: dict[ReqId, _PendingHandoff] = {}
         self._chunked_admissions: dict[ReqId, TransferId] = {}
         self._admission_results: set[ConnectorCompletion] = set()
         self._transfer_refcount: dict[ReqId, int] = {}
@@ -2149,13 +2175,9 @@ class MooncakeConnector(KVConnectorBase):
             if stage_requests:
                 if meta.chunked_transfer:
                     with self._completion_lock:
-                        self._pending_handoffs[req_id] = {
-                            "failed": False,
-                            "metadata": None,
-                            "landing_nonce": write_nonce,
-                            "expected": remote_pp_size,
-                            "stages": set(),
-                        }
+                        self._pending_handoffs[req_id] = _PendingHandoff(
+                            landing_nonce=write_nonce, expected=remote_pp_size
+                        )
                 landing.begin(req_id, write_nonce, dst_block_ids, stage_addrs)
             else:
                 with self._completion_lock:
@@ -2163,10 +2185,7 @@ class MooncakeConnector(KVConnectorBase):
                     self._pending_recv_nonce[req_id] = write_nonce
                     self._pending_recv_stall_watch[req_id] = time.monotonic()
                     if meta.chunked_transfer:
-                        self._pending_handoffs[req_id] = {
-                            "failed": False,
-                            "metadata": None,
-                        }
+                        self._pending_handoffs[req_id] = _PendingHandoff()
             self._pending_recv.add(req_id)
             # Only delta blocks need fencing; reused prefix blocks are coherent.
             self._pending_recv_blocks[req_id] = list(dst_block_ids)
@@ -4426,29 +4445,20 @@ class MooncakeConnector(KVConnectorBase):
         window fail it (``_expire_pending_recvs``).
         """
         landing = self._landing
-        if landing is not None and getattr(self, "_pending_handoffs", None):
+        if landing is not None:
             with self._completion_lock:
-                pending = getattr(self, "_pending_handoffs", {}).get(req_id)
-                if pending is not None and "landing_nonce" in pending:
+                pending = self._pending_handoffs.get(req_id)
+                if pending is not None and pending.landing_nonce is not None:
+                    # Fold the handoff in before the receiver hears of the
+                    # stage: a misrouted or repeated one must not count.
                     if (
-                        pending["landing_nonce"] != write_nonce
-                        or not 0 <= pp_rank < pending["expected"]
+                        pending.landing_nonce != write_nonce
+                        or not 0 <= pp_rank < pending.expected
+                        or pp_rank in pending.stages
                     ):
                         return False
-                    if pp_rank in pending["stages"]:
-                        return False
-                    pending["stages"].add(pp_rank)
-                    try:
-                        if not success:
-                            raise ValueError("failed prefill stage")
-                        PrefillHandoff.from_wire(req_id, handoff)
-                        previous = pending["metadata"]
-                        if previous is not None and previous != handoff:
-                            raise ValueError("PP stages disagree on handoff")
-                        pending["metadata"] = handoff
-                    except (TypeError, ValueError):
-                        pending["failed"] = True
-                    success = success and not pending["failed"]
+                    pending.stages.add(pp_rank)
+                    success = pending.fold(req_id, success, handoff)
         if landing is not None and landing.stage_done(
             req_id, pp_rank, write_nonce, success, landed_slots
         ):
@@ -4469,30 +4479,18 @@ class MooncakeConnector(KVConnectorBase):
                 return False
             pending_handoff = self._pending_handoffs.get(req_id)
             if pending_handoff is not None:
-                if success:
-                    try:
-                        PrefillHandoff.from_wire(req_id, handoff)
-                    except (TypeError, ValueError):
-                        success = False
-                        handoff = None
                 stages = self._pending_recv_stages.setdefault(req_id, set())
-                stage = (pp_rank, tp_rank)
                 if not 0 <= pp_rank < expected or any(
                     rank[0] == pp_rank for rank in stages
                 ):
                     return False
-                stages.add(stage)
-                pending_handoff["failed"] |= not success or handoff is None
-                if handoff is not None:
-                    previous = pending_handoff["metadata"]
-                    if previous is not None and previous != handoff:
-                        pending_handoff["failed"] = True
-                    pending_handoff["metadata"] = handoff
+                stages.add((pp_rank, tp_rank))
+                pending_handoff.fold(req_id, success, handoff)
                 # A failure cannot let D reuse memory while another PP stage
                 # still writes it. Wait for every stage's terminal result.
                 if len(stages) < expected:
                     return False
-                success = not pending_handoff["failed"]
+                success = not pending_handoff.failed
             if not success:
                 self._pending_recv_failed.add(req_id)
             stages = self._pending_recv_stages.setdefault(req_id, set())
@@ -4641,10 +4639,6 @@ class MooncakeConnector(KVConnectorBase):
         """
         with self._completion_lock:
             pending_handoff = self._pending_handoffs.pop(req_id, None)
-            if pending_handoff is not None:
-                failed |= (
-                    pending_handoff["failed"] or pending_handoff["metadata"] is None
-                )
         if failed:
             hold_s = envs.ATOM_PD_FAILED_WRITE_HOLD_S
             if hold_s > 0:
@@ -4672,7 +4666,7 @@ class MooncakeConnector(KVConnectorBase):
                 self._blocks_pending_fence.extend(dst_blocks)
         with self._completion_lock:
             if pending_handoff is not None:
-                info = pending_handoff["metadata"]
+                info = pending_handoff.metadata
                 self._received_handoffs[req_id] = PrefillHandoff.from_wire(req_id, info)
             self.done_recving.add(req_id)
             self._pending_recv.discard(req_id)

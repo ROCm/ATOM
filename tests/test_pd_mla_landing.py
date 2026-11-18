@@ -1353,6 +1353,8 @@ def _listen(monkeypatch, mc, listener, messages):
 def _consumer(mc, dest):
     conn = object.__new__(mc.MooncakeConnector)
     conn._landing = dest.recv
+    conn._completion_lock = threading.Lock()
+    conn._pending_handoffs = {}
     return conn
 
 
