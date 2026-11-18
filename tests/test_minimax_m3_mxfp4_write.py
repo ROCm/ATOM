@@ -79,12 +79,12 @@ def pages(*lead, dtype=torch.uint8):
 
 def reference(qkv, position, slots):
     """The same kernel writing bf16 (plain page-128 layout): rk, rv, ri, index q."""
-    from atom.models.minimax_m3.model import _minimax_m3_cos_sin_cache
+    from atom.model_ops.rotary_embedding import get_cos_sin_cache
 
     ref = make_impl(False, "auto")  # only carries the norm weights and rotary tables
     rk = torch.zeros(PAGES, 128, NKV, D, **BF16)
     rv, ri = torch.zeros_like(rk), torch.zeros(PAGES, 128, D, **BF16)
-    cs = _minimax_m3_cos_sin_cache(ref.rotary_emb, qkv)
+    cs = get_cos_sin_cache(ref.rotary_emb, qkv)
     q = torch.empty(len(qkv), NQ * D, **BF16)
     iq = torch.empty(len(qkv), NIQ * D, **BF16)
     aiter.fused_qknorm_idxrqknorm(

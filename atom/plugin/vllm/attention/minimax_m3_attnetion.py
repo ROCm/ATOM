@@ -523,7 +523,7 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
         main_metadata,
         index_metadata,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, object, object]:
-        from atom.models.minimax_m3.model import _minimax_m3_cos_sin_cache
+        from atom.model_ops.rotary_embedding import get_cos_sin_cache
 
         if self.kv_cache.numel() == 0 or self.index_cache_layer.kv_cache.numel() == 0:
             num_tokens = qkv.shape[0]
@@ -550,7 +550,7 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
             qkv,
             self.q_norm.weight,
             self.k_norm.weight,
-            _minimax_m3_cos_sin_cache(self.rotary_emb, qkv),
+            get_cos_sin_cache(self.rotary_emb, qkv),
             positions,
             self.num_heads,
             self.num_kv_heads,
@@ -1069,14 +1069,14 @@ class MiniMaxM3DenseAttentionForVllm(nn.Module, AttentionLayerBase):
         qkv: torch.Tensor,
         positions: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        from atom.models.minimax_m3.model import _minimax_m3_cos_sin_cache
+        from atom.model_ops.rotary_embedding import get_cos_sin_cache
 
         qkv = qkv.contiguous()
         aiter.fused_qknorm_idxrqknorm(
             qkv,
             self.q_norm.weight,
             self.k_norm.weight,
-            _minimax_m3_cos_sin_cache(self.rotary_emb, qkv),
+            get_cos_sin_cache(self.rotary_emb, qkv),
             positions,
             self.num_heads,
             self.num_kv_heads,

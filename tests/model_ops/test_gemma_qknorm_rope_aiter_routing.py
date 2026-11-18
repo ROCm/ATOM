@@ -5,7 +5,6 @@ and keeps the answer; it never asks off the gfx1250 family, for a non-NeoX
 rotation or for q/k norms with different eps. The numerics are in
 test_gemma_qknorm_rope_aiter_gpu.py."""
 
-import sys
 from types import SimpleNamespace
 
 import pytest
@@ -18,12 +17,8 @@ from torch import nn
 def mha(monkeypatch):
     with atom_without_aiter() as load:
         mha = load("atom.model_ops.attention_mha")
-    # imported by the route at its first use; the cos/sin table is not read here
-    monkeypatch.setitem(
-        sys.modules,
-        "atom.models.minimax_m3.model",
-        SimpleNamespace(_minimax_m3_cos_sin_cache=lambda rope, qkv: None),
-    )
+    # the layers' rotary is a stub: the cos/sin table is not read here
+    monkeypatch.setattr(mha, "get_cos_sin_cache", lambda rope, qkv: None)
     monkeypatch.setattr(mha, "get_gfx", lambda: "gfx1250")
     return mha
 

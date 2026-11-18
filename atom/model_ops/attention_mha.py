@@ -25,6 +25,7 @@ from atom.model_ops.base_attention import (
     run_pa_fwd_asm,
 )
 from atom.model_ops.minimax_m3.geometry import SPARSE_BLOCK_SIZE
+from atom.model_ops.rotary_embedding import get_cos_sin_cache
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
 from atom.utils.forward_context import ForwardContext, get_forward_context
@@ -484,8 +485,6 @@ class PagedAttentionImpl(nn.Module):
             self._aiter_takes_norm_rope = False
         if self._aiter_takes_norm_rope is False:
             return None
-        from atom.models.minimax_m3.model import _minimax_m3_cos_sin_cache
-
         q = torch.empty(
             (qkv.shape[0], self.num_heads * self.head_dim),
             dtype=qkv.dtype,
@@ -495,7 +494,7 @@ class PagedAttentionImpl(nn.Module):
             qkv,
             self.q_norm.weight,
             self.k_norm.weight,
-            _minimax_m3_cos_sin_cache(self.rotary_emb, qkv),
+            get_cos_sin_cache(self.rotary_emb, qkv),
             position,
             self.num_heads,
             self.num_kv_heads,
@@ -539,6 +538,7 @@ class PagedAttentionImpl(nn.Module):
         """
         q_aiter = self._aiter_gemma_norm_rope(qkv, position)
         if q_aiter is not None:
+            # k is the caller's torch.split view of qkv, roped in place by aiter
             q = q_aiter
         else:
             from atom.model_ops.layernorm import DualRMSNorm
@@ -1535,9 +1535,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
 
         qkv = qkv.contiguous()
         num_tokens = qkv.shape[0]
-        from atom.models.minimax_m3.model import _minimax_m3_cos_sin_cache
-
-        cos_sin_cache = _minimax_m3_cos_sin_cache(self.rotary_emb, qkv)
+        cos_sin_cache = get_cos_sin_cache(self.rotary_emb, qkv)
 
         is_fp8 = self.kv_cache_dtype == "fp8"
         kv_cache_dtype = _AITER_WRITER_DTYPE.get(self.kv_cache_dtype, "auto")
