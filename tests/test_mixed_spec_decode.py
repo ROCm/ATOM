@@ -21,13 +21,17 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from aiter_stub import atom_without_aiter
 
-# Every test here reaches `model_runner`, `drafter` or `deepseek_v4_attn`, and
-# each imports aiter at module scope; the CPU CI runner has none, and a stubbed
-# aiter does not survive their custom-op registration (`tests/aiter_stub.py`
-# covers only the connectors). Same convention as
-# test_cudagraph_capture_bounds.py: these run wherever aiter is installed.
-pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
+
+@pytest.fixture(scope="module", autouse=True)
+def kernel_imports():
+    # Keep the real runner, drafter and carrier arithmetic on CPU. The shared
+    # import seam replaces only unavailable kernel dependencies and restores
+    # the module state afterwards; GPU hosts retain the real AITER modules.
+    with atom_without_aiter():
+        yield
+
 
 N_P, N_D, K = 2, 2, 3
 PREFILL_LENS = [5, 3]
@@ -35,6 +39,7 @@ N_P_TOKENS = sum(PREFILL_LENS)
 NUM_SCHEDULED = np.array(PREFILL_LENS + [K + 1] * N_D, dtype=np.int32)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="stages through the GPU")
 def test_pipeline_mixed_drafts_leave_prefill_tokens_untouched(monkeypatch):
     from atom.model_ops.attentions.deepseek_v4_attn import (
         DeepseekV4AttentionMetadataBuilder,
