@@ -56,6 +56,18 @@ class KVConnectorBase(ABC):
         """
         return None
 
+    @classmethod
+    def per_request_state_pool(cls, config: Any) -> Any:
+        """A context to allocate per-request state under, or None.
+
+        The per-request state (a KDA layer's conv and SSM state) moves with the
+        KV, so a backend whose peer maps this rank's KV pool needs it in
+        exportable memory as well. Asked before any connector is built (see
+        :meth:`KVConnectorFactory.per_request_state_pool`); None, the default,
+        lets the attention backend allocate it as usual.
+        """
+        return None
+
     @abstractmethod
     def register_kv_caches(
         self,
