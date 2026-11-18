@@ -90,7 +90,7 @@ def _flydsl_linear_impls() -> list[Any]:
 
 
 def _flydsl_prefill_supported(device: torch.device) -> bool:
-    """FlyDSL prefill GEMM is valid on gfx942. gfx950 hits hipBLAS internally."""
+    """FlyDSL prefill is validated only on gfx942."""
     if torch.version.hip is None or device.type != "cuda":
         return True
     arch = torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]

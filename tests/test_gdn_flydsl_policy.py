@@ -101,6 +101,31 @@ def test_replayssm_prefill_needs_gfx942_even_when_forced(
     assert fly.select_policy(replayssm=False, **kwargs).prefill
 
 
+@pytest.mark.parametrize("prefill_backend", ["auto", "flydsl"])
+@pytest.mark.parametrize("replayssm", [False, True])
+def test_policy_is_empty_without_hip_before_probing_the_arch(
+    fly, monkeypatch, prefill_backend, replayssm
+):
+    def no_arch():
+        raise RuntimeError("get_gfx_runtime needs a ROCm device")
+
+    chip_info = types.ModuleType("aiter.jit.utils.chip_info")
+    chip_info.get_gfx_runtime = no_arch
+    monkeypatch.setitem(sys.modules, chip_info.__name__, chip_info)
+    monkeypatch.setattr(fly, "backend", lambda stage: prefill_backend)
+    monkeypatch.setattr(fly.torch.version, "hip", None)
+    fly.ops.cache_clear()
+    fly._validated_on_gfx942.cache_clear()
+    policy = fly.select_policy(
+        allowed=True,
+        replayssm=replayssm,
+        lossy_decode=False,
+        state=_state(),
+        activation_dtype=torch.bfloat16,
+    )
+    assert policy == fly.GDNFlyDSLPolicy()
+
+
 @pytest.mark.parametrize(
     ("arch", "validated"), [("gfx942", True), ("gfx950", False), ("gfx1250", False)]
 )
