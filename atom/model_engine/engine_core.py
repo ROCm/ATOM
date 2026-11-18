@@ -21,7 +21,10 @@ from atom.model_engine.dynamic_chunking import (
     ChunkSizePredictor,
 )
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
-from atom.model_engine.engine_utility import EngineUtilityHandler
+from atom.model_engine.engine_utility import (
+    EngineUtilityHandler,
+    ask_what_runners_cannot_take,
+)
 from atom.model_engine.prefill_backlog import prefill_backlog
 from atom.model_engine.prefix_hash import attach_shipped_chains
 from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
@@ -221,6 +224,12 @@ class EngineCore:
                     f"{self.label}: cudagraph capture{decode_sizes} cost: {cap_cost:.2f} "
                     f"seconds, pool: {pool_bytes / (1 << 30):.2f}GB"
                 )
+            # Fixed once the model is loaded, so asked once.
+            unavailable = (
+                ask_what_runners_cannot_take(self.runner_mgr, self.label)
+                if config.weight_sync_runner
+                else {}
+            )
             good = True
         finally:
             logger.info(
@@ -266,7 +275,9 @@ class EngineCore:
             self.output_queue,
             label=self.label,
             scheduler=self.scheduler,
+            unavailable=unavailable,
         )
+        self._weight_syncs_unavailable = unavailable
 
         # KV cache allocated, graphs captured, BlockPool built: everything this
         # process holds for its lifetime exists, and the next thing is traffic.
@@ -336,7 +347,7 @@ class EngineCore:
     def _send_ready_signal(self):
         self.output_queue.put_nowait(("READY", self._ready_payload()))
 
-    def _ready_payload(self) -> dict[str, int] | None:
+    def _ready_payload(self) -> dict[str, object] | None:
         """Startup facts the frontend cannot read off its own Config.
 
         `num_kvcache_blocks` is measured in this subprocess, so the API server's
@@ -344,10 +355,18 @@ class EngineCore:
         ceiling rather than the raw block count leaves the dcp arithmetic with
         its owner, `BlockManager`, and gives the frontend a single number to
         compare a prompt against.
+
+        `weight_syncs_unavailable` maps each weight-sync feature this engine's
+        runners cannot take to the reason. CoreManager merges every engine's
+        and refuses such a sync before any engine runs it: under PP, one
+        stage's runners alone may be the ones that cannot.
         """
-        if self.scheduler is None:
-            return None
-        return {"max_pool_tokens": self.scheduler.block_manager.max_pool_tokens}
+        payload = {}
+        if self.scheduler is not None:
+            payload["max_pool_tokens"] = self.scheduler.block_manager.max_pool_tokens
+        if self._weight_syncs_unavailable:
+            payload["weight_syncs_unavailable"] = self._weight_syncs_unavailable
+        return payload or None
 
     def _post_model_load_hook(self):
         """Called after ModelRunner is initialized (model loaded) but before
