@@ -206,6 +206,9 @@ class StepTables:
                 "engemb": torch.zeros(T, ENG_W, dtype=torch.bfloat16, device=dev),
             }
         self.keep.append(self.engram)
+        if self.engram and sorted(self.engram) != [1, 14]:
+            # the kernel's Engram kv runs in the target entry for the rows before layers 1 and 14 (step.ENG_ROWS)
+            raise MonoUnsupported(f"Engram layers {sorted(self.engram)} (the step kernel's: [1, 14])")
         # the layer rows' weights
         rows = []
         for i in range(NL):
@@ -357,8 +360,7 @@ class StepTables:
             if Ly < NL and Ly + 1 in self.engram:  # the row before an Engram layer
                 p["lflags"] |= 128
                 # (engentry) the target entry runs this row's sharded kv (step.ENG_ENTRY, rows step.ENG_ROWS)
-                if Ly in (0, 13) and __import__("os").environ.get("ATOM_MONO_ENG_ENTRY", "1") != "0":
-                    p["lflags"] |= 512
+                p["lflags"] |= 512
                 p.update({k: v.data_ptr() for k, v in self.engram[Ly + 1].items()})
             if self.idx and Ly < NL:
                 spec = self.specs[Ly]
