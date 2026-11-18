@@ -151,6 +151,7 @@ impl AtomEngineRouter {
         body: &CompletionRequest,
         extras: &RawExtras,
     ) -> Result<Response, Response> {
+        chat::validate_stream_options(body.stream, body.stream_options.as_ref())?;
         let mut generate = completion_to_generate(body).map_err(|msg| {
             // The adapter is the gRPC router's too, and says so.
             let msg = msg.replace("gRPC /v1/completions path", "ATOM standalone server");
@@ -309,14 +310,15 @@ impl RouterTrait for AtomEngineRouter {
 
     async fn get_server_info(&self, _req: Request<Body>) -> Response {
         let client = &self.engine.client;
+        let (inflight, queued_prefill) = client.rank_loads();
         Json(json!({
             "router_type": self.router_type(),
             "model": self.engine.model.served_name,
             "engine_cores": client.core_count(),
             "alive_engine_cores": client.alive_core_count(),
             "max_pool_tokens": client.max_pool_tokens(),
-            "inflight_requests_per_rank": client.rank_loads().0,
-            "queued_prefill_tokens_per_rank": client.rank_loads().1,
+            "inflight_requests_per_rank": inflight,
+            "queued_prefill_tokens_per_rank": queued_prefill,
         }))
         .into_response()
     }

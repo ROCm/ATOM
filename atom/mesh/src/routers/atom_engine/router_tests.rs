@@ -360,3 +360,54 @@ async fn health_follows_the_cores() {
         .expect("the loss is reported");
     assert_eq!(health().await, StatusCode::SERVICE_UNAVAILABLE);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn requests_the_python_server_refuses_are_refused() {
+    let served = Served::start(1).await;
+    let tool =
+        |name: &str| json!({"type": "function", "function": {"name": name, "parameters": {}}});
+    let chats = [
+        (
+            json!({"stream_options": {"include_usage": true}}),
+            "stream_options requires stream=true",
+        ),
+        (
+            json!({"tools": [tool("get"), tool("put"), tool("get")]}),
+            "duplicate tool name: get",
+        ),
+        (
+            json!({"tools": [{"type": "retrieval", "function": {"name": "get", "parameters": {}}}]}),
+            "tools[0].type must be 'function'",
+        ),
+    ];
+    for (extra, refusal) in chats {
+        let request = chat(user_hello(extra));
+        let (status, body) = json_body(served.router.route_chat(None, &request, None).await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.to_string().contains(refusal), "{body}");
+    }
+    let completion = serde_json::from_value(json!({
+        "model": MODEL,
+        "prompt": "hello",
+        "stream_options": {"include_usage": true},
+    }))
+    .unwrap();
+    let (status, body) = json_body(
+        served
+            .router
+            .route_completion(None, &completion, None)
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body.to_string()
+            .contains("stream_options requires stream=true"),
+        "{body}"
+    );
+    assert!(FakeCore::recv_on(
+        &served.cores[0].input,
+        std::time::Duration::from_millis(200)
+    )
+    .is_none());
+}
