@@ -2822,15 +2822,46 @@ def audit_core_files(text, diff_text, root=None):
 
 # ----------------------------------------------------------------- card gate
 FINDING = re.compile(r"^\s*(\U0001F534|\u26A0\uFE0F?|\U0001F4DD)\s*(.+)$")
-# A rule id at the head of a finding, through the emphasis SKILL.md's own examples use:
-# `**A5:**` is the shape reached for once a plain `A5:` is refused. Compiled once and
-# shared by both readers -- one registers the claim, the other refuses to ship the id.
-RULE_ID_HEAD = re.compile(r"[*`_ ]*([A-Z]+\d+[a-z]?)[*`_]*:")
+# A rule id at the head of a finding, through whatever emphasis or tag precedes it.
+# Compiled once and read through _rule_head by both callers -- the one that registers the
+# claim and the one that refuses to ship the id -- so they cannot disagree.
+def _claim_tokens(text):
+    """Words a card and a verdict reason must share to be about the same thing.
+
+    Lower-cased on both sides -- the stopwords are lower case and matching was not, so
+    `Prefill` missed `prefill` while `This` sailed through. Pure numbers out (a shared
+    `1024` says nothing), and the words SKILL.md mandates on every finding out, because
+    `must` appearing in both is not evidence of anything.
+    """
+    return {w for w in re.findall(r"\b\w{4,}\b", _fold_punct(text).lower())
+            if not w.isdigit()
+            and w not in _FIRE_STOPWORDS and w not in _CLAIM_TEMPLATE_WORDS}
+
+
+RULE_ID_HEAD = re.compile(r"[*`_ ]*([A-Z]+\d+[a-z]?)[*`_]*\s*(?::|—|--)")
+# `[verified]` leads most card findings and SKILL.md requires the tag, and
+# `_publish.first_clause` strips it before publishing -- so `[verified] A5: ...` ships
+# opening `A5:`, the ATOM#3481 symptom with one token in front of it. Stripped the same
+# way _publish strips it, before the id is read.
+LEADING_TAG = re.compile(r"^\s*\[[^\]]{0,60}\]\s*")
+
+
+def _rule_head(text):
+    """-> the rule id this finding opens with, or None.
+
+    One reader for both callers -- the one that registers the claim and the one that
+    refuses to ship the id -- so they cannot disagree about what counts. `FP8:`, `TP8:`,
+    `MI300:` and `GPU0:` share the shape and none of them is a rule.
+    """
+    m = RULE_ID_HEAD.match(LEADING_TAG.sub("", text))
+    return m.group(1) if m and m.group(1) in RULE_SET else None
 RULE_SET = frozenset(ALL_RULES.split())
 # The in-card scan kept its own copy of CITATION's extension list and drifted from it:
 # no `rs|toml`, so a Rust-only finding read as citing nothing and skipped both the
 # UNANCHORED and the UNBACKED check. Derived from CITATION so they cannot diverge again.
 CITATION_BARE = CITATION.pattern.split("(?::(")[0]
+_CLAIM_TEMPLATE_WORDS = frozenset(
+    "author must reviewer should ask verified inferred finding findings".split())
 _FIRE_STOPWORDS = frozenset(
     "this that with from into when which where there their then than only also "
     "every each both same other another still never always would could should "
@@ -3100,10 +3131,7 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
             # For a reason that cites no file: the words a card would have to reuse to be
             # talking about the same thing. Stopwords out, and only tokens long enough to
             # be distinctive.
-            fire_tokens[m.group(1)] = {
-                w for w in re.findall(r"\b\w{4,}\b", _fold_punct(m.group(2)))
-                if w not in _FIRE_STOPWORDS
-            }
+            fire_tokens[m.group(1)] = _claim_tokens(m.group(2))
     backing = _fold_punct((verdicts_text or "") + "\n" + (diagnostic_text or "")
                           + "\n" + (answers_text or ""))
     problems = []
@@ -3114,14 +3142,9 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
             findings.append((m.group(1), m.group(2).strip()))
     reported = set()
     for _, text in findings:
-        rid = RULE_ID_HEAD.match(text)
-        if rid and rid.group(1) not in RULE_SET:
-            # `FP8:`, `TP8:`, `MI300:` and `GPU0:` share the shape and are ordinary ways
-            # to open a finding here. One guard, before either reader, so the refusal and
-            # the claim can never disagree about what counts as a rule id.
-            rid = None
+        rid = _rule_head(text)
         if rid:
-            reported.add(rid.group(1))
+            reported.add(rid)
         # SKILL.md's output rules say, in as many words, "Do NOT use rule codes (B1, D4,
         # A1...) in output -- they are internal labels only". Claiming a FIRE by its rule
         # id was therefore something the card was forbidden to do, and every correctly
@@ -3137,7 +3160,12 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
                 # the card had no legal move left: name the id and the no-rule-codes gate
                 # refuses it, drop the id and UNREPORTED-FIRE fires, and both are fatal --
                 # so the only way through was a `-- not reported:` that is untrue.
-                if fire_tokens[rule] & set(re.findall(r"\b\w+\b", folded)):
+                want, have = fire_tokens[rule], _claim_tokens(text)
+                shared = want & have
+                # Two ordinary words, or one identifier. One shared word was far too
+                # loose: SKILL.md mandates "**Author must**" on every finding, so `must`
+                # alone let any finding claim any path-less FIRE whose reason used it.
+                if len(shared) >= 2 or any(IDENT.fullmatch(w) for w in shared):
                     claims.setdefault(rule, []).append(text[:40])
     # A finding may report more than one rule, and often should: aiter#3165 fired B4 and
     # E5 on the same changed file and one accurate bullet covered both. Requiring N
@@ -3182,12 +3210,7 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
                              f"cites only {cited[0]} and nothing this PR changes"))
         # Does anything already adjudicated mention this? Match on the rule id if the
         # finding carries one, else on a distinctive token from the text.
-        rid = RULE_ID_HEAD.match(text)
-        if rid and rid.group(1) not in RULE_SET:
-            # `FP8:`, `TP8:`, `MI300:` and `GPU0:` share the shape and are ordinary ways
-            # to open a finding here. One guard, before either reader, so the refusal and
-            # the claim can never disagree about what counts as a rule id.
-            rid = None
+        rid = _rule_head(text)
         if rid:
             # SKILL.md: "Do NOT use rule codes (B1, D4, A1...) in output -- they are
             # internal labels only." Parsing one here as a claim made the gate accept
@@ -3197,15 +3220,15 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
             # claim below -- withdrawing that would turn such cards into UNREPORTED-FIRE,
             # which is worse -- but the card does not ship with it.
             problems.append(("RULE-CODE-IN-CARD", text[:70],
-                             f"opens with the internal rule id `{rid.group(1)}`, which "
+                             f"opens with the internal rule id `{rid}`, which "
                              "means nothing to a reviewer -- say the thing the rule is "
                              "about instead"))
             # `-- late finding:` is the exit for what no rule covers, so it cannot excuse a
             # finding that names a rule: claiming G1 the ledger adjudicated CLEAR is a
             # contradiction of the ledger, not a discovery arriving late.
-            if not re.search(rf"(?<![\w]){re.escape(rid.group(1))}\b\s+FIRE", backing):
+            if not re.search(rf"(?<![\w]){re.escape(rid)}\b\s+FIRE", backing):
                 problems.append(("UNBACKED-FINDING", text[:70],
-                                 f"{rid.group(1)} is reported but was not adjudicated FIRE"))
+                                 f"{rid} is reported but was not adjudicated FIRE"))
         elif LATE_MARK.search(text):
             # The honest path for a Step 7 discovery no rule covers. Before this existed
             # the only way past the gate was to edit an artifact that had already passed
@@ -3385,7 +3408,10 @@ if __name__ == "__main__":
             # traces -- counting it under "cannot be traced" misnames it.
             about_findings = len({t for k, t, _ in problems
                                   if k not in ("UNREPORTED-FIRE", "RULE-CODE-IN-CARD")})
+            codes = len({t for k, t, _ in problems if k == "RULE-CODE-IN-CARD"})
             parts = []
+            if codes:
+                parts.append(f"{codes} finding(s) ship an internal rule id")
             if about_findings:
                 parts.append(f"{about_findings} of {len(findings)} findings cannot be "
                              f"traced")

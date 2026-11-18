@@ -526,6 +526,127 @@ t "the same card without the id traces by path" \
 # `-- not reported:`.
 t "a path-less FIRE can be claimed by the words of its reason" \
   "$(_card_kinds "$_CARD_TOKENS" "$_V_NOPATH" "$_DIFF")" ""
+# One shared 4-letter word was far too loose. SKILL.md mandates "**Author must**" on
+# every finding, so `must` alone let any finding claim any path-less FIRE whose reason
+# used it -- silencing the UNREPORTED-FIRE that should have fired for the other rule.
+# rules.md taught the shape the gate now withholds: ~50 `→ ⚠️ A1:` templates reach the
+# worker through `expand`, so the model was being shown the opening it would be refused
+# for. Refusing the output while the examples teach it is the same instruction/gate
+# disagreement this PR is about, one level up.
+t "no rule template opens with an internal rule id" \
+  "$(python3 -c '
+import re, sys, pathlib
+sys.path.insert(0, sys.argv[1]); import triage
+s = pathlib.Path(sys.argv[1], "rules.md").read_text()
+print(len([m for m in re.findall(r"[\u26a0\ufe0f\U0001f4dd\U0001f534]\s*([A-Z]+\d+[a-z]?):", s)
+           if m in triage.RULE_SET]))' "$S")" "0"
+t "an unrelated finding does not claim a path-less FIRE" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ foo.py:3 has no guard on the index. **Author must** add one.' \
+     "A5 FIRE -- foo.py:3 guard missing
+B1 FIRE -- the caller must hold the scheduler lock" \
+     "diff --git a/foo.py b/foo.py" | grep -c UNREPORTED-FIRE)" "1"
+# `[verified]` leads most findings and SKILL.md requires it; `_publish.first_clause`
+# strips it, so `[verified] A5: ...` publishes opening `A5:` -- the same symptom with one
+# token in front of it. So do the em-dash and double-dash separators.
+# One ordinary shared word is not evidence either: two findings about the same file can
+# both say `scheduler` without being about the same rule. Two words, or one identifier.
+# The words SKILL.md mandates on every finding are not evidence: without dropping them,
+# `**Author must**` on the card and `the author must ...` in a reason share two tokens and
+# the claim goes through on nothing.
+t "the mandated Author/must wording cannot carry a claim" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ foo.py:3 has no guard on the index. **Author must** add one.' \
+     "A5 FIRE -- foo.py:3 guard missing
+B1 FIRE -- the author must hold the scheduler lock" \
+     "diff --git a/foo.py b/foo.py" | grep -c UNREPORTED-FIRE)" "1"
+# Matching was case-sensitive while the stopword list is lower case, so `Prefill` missed
+# `prefill`. Here the identifier is the only thing the two sides share, and it differs
+# only in case: without folding there is no claim at all.
+t "case does not decide whether a claim lands" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ foo.py:3 has no guard on the index. **Author must** add one.
+📝 prefill_tokens go unasserted. **Author must** fix that.' \
+     "A5 FIRE -- foo.py:3 guard missing
+B1 FIRE -- Prefill_tokens leak" \
+     "diff --git a/foo.py b/foo.py" | grep -c UNREPORTED-FIRE)" "0"
+# A shared number is not a shared subject. Two of them used to be enough.
+t "shared numbers do not carry a claim" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ foo.py:3 has no guard on the index. **Author must** add one.
+📝 the limit is 1024 rows and 2048 pages. **Author must** document it.' \
+     "A5 FIRE -- foo.py:3 guard missing
+B1 FIRE -- the cap is 1024 blocks and 2048 slots" \
+     "diff --git a/foo.py b/foo.py" | grep -c UNREPORTED-FIRE)" "1"
+t "a single ordinary shared word does not claim a FIRE" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ foo.py:3 has no guard on the scheduler index. **Author must** add one.' \
+     "A5 FIRE -- foo.py:3 guard missing
+B1 FIRE -- the caller holds the scheduler lock while draining" \
+     "diff --git a/foo.py b/foo.py" | grep -c UNREPORTED-FIRE)" "1"
+t "but a shared identifier does" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ foo.py:3 has no guard on the index. **Author must** add one.
+📝 The caller releases prefill_tokens while draining. **Author must** assert it.' \
+     "A5 FIRE -- foo.py:3 guard missing
+B1 FIRE -- the caller releases prefill_tokens while draining" \
+     "diff --git a/foo.py b/foo.py" | grep -c UNREPORTED-FIRE)" "0"
+t "a rule id behind the verified tag is still a rule id" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ [verified] A5: planner.rs:108 charges only on req.stream. **Author must** say so.' \
+     "$_V_PATH" "$_DIFF" | grep -c RULE-CODE-IN-CARD)" "1"
+t "so is one behind an em dash" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ A5 — planner.rs:108 charges only on req.stream. **Author must** say so.' \
+     "$_V_PATH" "$_DIFF" | grep -c RULE-CODE-IN-CARD)" "1"
 t "and naming its id instead is still refused, not silently accepted" \
   "$(_card_kinds "$_CARD_ID" "$_V_NOPATH" "$_DIFF")" "RULE-CODE-IN-CARD"
 t "a backticked rule id is a rule id" \
@@ -567,6 +688,18 @@ Validation (deterministic): N/A -- no runtime surface changed
 
 ⚠️ A5: planner.rs:108 charges only on req.stream. **Author must** say so.' \
     'A5 FIRE -- planner.rs:108 charges only on req.stream' | grep -c 'cannot be traced')" "0"
+# ...and says something rather than printing a bare `CARD NOT NAILED DOWN: `. The check
+# above passes on an empty line, and on a crash.
+t "and names the rule code instead of saying nothing" \
+  "$(_card_summary '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ A5: planner.rs:108 charges only on req.stream. **Author must** say so.' \
+    'A5 FIRE -- planner.rs:108 charges only on req.stream' | grep -c 'ship an internal rule id')" "1"
 t "a non-rule id cannot claim a FIRE" \
   "$(_card_kinds '## T
 
