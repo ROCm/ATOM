@@ -22,12 +22,13 @@ with no extra bonus, as in the engine's `least_tokens` DP balancer.
 | `request_token_equivalent` | `--agentic-request-token-equivalent` (512). Keep it equal to the engine's `ATOM_DP_LB_REQ_EQUIV`. |
 
 The selected worker is charged its `uncached_tokens`, released when its P/D
-prefill response completes or at a streaming response's first frame;
-non-streaming regular responses are not charged. Under idx2idx the planner
-selects decode first, so `agentic` chooses among the prefill workers on its
-rank. For a request the index can match, `agentic` predicts the selected
-worker's blocks (`on_routed`) and reports an estimated hit ratio, reconciled
-with the cached tokens the engine reports.
+prefill response completes or at a streaming response's first frame.
+Non-streaming regular, gRPC and ext-proc single-worker requests are not
+charged, so their prefills weigh only through `inflight_requests`. Under
+idx2idx the planner selects decode first, so `agentic` chooses among the
+prefill workers on its rank. For a request the index can match, `agentic`
+predicts the selected worker's blocks (`on_routed`) and reports an estimated
+hit ratio, reconciled with the cached tokens the engine reports.
 
 ## Branches
 
