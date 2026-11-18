@@ -244,3 +244,10 @@ def test_the_flag_names_the_cluster(monkeypatch, value, cluster):
     assert envs.ATOM_KIMI_MONO_ATTN_RES_SLICED == cluster
     if cluster:
         plan.SlicedGeometry(cluster)
+
+
+def test_the_flag_defaults_to_four_ctas(monkeypatch):
+    from atom.utils import envs
+
+    monkeypatch.delenv("ATOM_KIMI_MONO_ATTN_RES_SLICED", raising=False)
+    assert envs.ATOM_KIMI_MONO_ATTN_RES_SLICED == 4
