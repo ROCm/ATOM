@@ -150,7 +150,7 @@ from .serving_chat import (
     build_chat_response_multi,
     normalize_chat_tools,
     request_tools,
-    resolve_chat_template_kwargs,
+    resolve_thinking,
     stream_chat_response,
     stream_chat_response_fanout,
     validate_chat_request,
@@ -2040,12 +2040,12 @@ def _model_reasoning_rules(default=CHAT_REASONING_RULES):
 
 
 def _effective_thinking_enabled(kwargs):
-    # Validate against the kwargs the encoder renders with, on a copy so a
-    # predicate cannot change the prompt configuration.
-    if custom_message_encoder is None:
-        effective = dict(kwargs)
-    else:
-        effective = custom_message_encoder.render_kwargs(kwargs)
+    # Validate against the same defaults and normalization used by the encoder,
+    # on a copy so a predicate cannot change the prompt configuration.
+    effective = dict(getattr(custom_message_encoder, "defaults", {}))
+    effective.update(kwargs)
+    if custom_message_encoder is not None:
+        effective = custom_message_encoder.prepare_kwargs(effective)
     if reasoning_toggle is None:
         return True
     name, off_value, on_value = reasoning_toggle
@@ -2126,11 +2126,22 @@ async def _chat_completions(
                 messages, custom_message_encoder
             )
         logprob_codec = None
-        merged_kwargs = resolve_chat_template_kwargs(
-            request,
-            defaults=default_chat_template_kwargs,
-            toggle=reasoning_toggle,
-            rules=_model_reasoning_rules(),
+        merged_kwargs = dict(default_chat_template_kwargs)
+        if request.chat_template_kwargs:
+            merged_kwargs.update(request.chat_template_kwargs)
+        # Forward K3 template controls the chat template needs but that pydantic
+        # does not otherwise thread through: structured-output response_format,
+        # a string tool_choice ("auto"/"none"/"required"), and thinking/effort.
+        if request.response_format is not None:
+            merged_kwargs["response_format"] = request.response_format
+        if isinstance(request.tool_choice, str):
+            merged_kwargs["tool_choice"] = request.tool_choice
+        rules = _model_reasoning_rules()
+        merged_kwargs = apply_reasoning_controls(
+            merged_kwargs,
+            reasoning_toggle,
+            resolve_thinking(request, rules=rules),
+            rules=rules,
         )
         compatibility = api_compatibility_for(custom_message_encoder)
         if not compatibility.chat_forced_tools_with_thinking:
@@ -3499,18 +3510,12 @@ async def responses_create(raw_request: Request):
 @app.get("/v1/models")
 async def list_models():
     """List available models."""
-    from .model_capabilities import chat_rendering, deployment_metadata
+    from .model_capabilities import deployment_metadata
 
     return ModelList(
         data=[
             ModelCard(
                 id=model_name,
-                chat_rendering=chat_rendering(
-                    default_chat_template_kwargs,
-                    reasoning_toggle,
-                    custom_message_encoder,
-                    _model_reasoning_rules(),
-                ),
                 **deployment_metadata(_get_engine_config(), custom_message_encoder),
             )
         ]

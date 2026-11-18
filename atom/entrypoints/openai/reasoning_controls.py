@@ -32,19 +32,16 @@ def _passthrough_effort(effort: Any) -> Any:
 
 @dataclass(frozen=True)
 class ReasoningRules:
-    # What /v1/models calls these rules, for a router that renders chats with
-    # them (see `model_capabilities.chat_rendering`).
-    name: str
     normalize_effort: Callable[[Any], Any] = _legacy_chat_effort
     string_effort_enables: bool = False
     none_disables: bool = True
     reconcile_effort_with_toggle: bool = False
 
 
-CHAT_REASONING_RULES = ReasoningRules("chat")
+CHAT_REASONING_RULES = ReasoningRules()
 # Preserve the existing non-adapted Responses path, including template extensions.
 RESPONSES_REASONING_RULES = ReasoningRules(
-    "responses", normalize_effort=_passthrough_effort, none_disables=False
+    normalize_effort=_passthrough_effort, none_disables=False
 )
 
 
