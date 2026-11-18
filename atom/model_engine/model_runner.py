@@ -99,6 +99,7 @@ from atom.model_engine.token_logprobs import (
     pack_token_logprobs,
     unpack_token_logprobs,
 )
+from atom.model_engine.tp_multinode import managed_store_client
 from atom.model_loader.loader import load_model
 from atom.model_ops.attentions.pool_layout.entry_arena import plan_regions
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
@@ -136,7 +137,11 @@ from atom.utils import (
     resolve_obj_by_qualname,
     worker_process_name,
 )
-from atom.utils.distributed.utils import raise_timeout_if_dp_spans_nodes
+from atom.utils.distributed.utils import (
+    kv_blocks_differ_across_ranks,
+    raise_timeout_if_dp_spans_nodes,
+    raise_timeout_if_tp_spans_nodes,
+)
 from atom.utils.forward_context import (
     Context,
     ForwardMode,
@@ -1093,13 +1098,15 @@ class ModelRunner:
             fused_shared_expert_load_fn = self.model.load_fused_expert_weights
         torch.set_default_device(None)
         load_start = time.perf_counter()
-        load_model(
+        loaded = load_model(
             self.model,
             config.model,
             config.hf_config,
             config.load_dummy,
             load_fused_expert_weights_fn=fused_shared_expert_load_fn,
         )
+        # The parameters the checkpoint wrote, by name; None if none was read.
+        self._checkpoint_param_names = None if config.load_dummy else frozenset(loaded)
         load_elapsed = time.perf_counter() - load_start
         logger.info(
             f"[{self.rank_name}] Model load done: {config.model} "
@@ -1156,19 +1163,17 @@ class ModelRunner:
         dp_rank = config.parallel_config.data_parallel_rank
         global_rank = (dp_rank * pp_size + pp_rank) * stage_span + rank
         raise_timeout_if_dp_spans_nodes(config.parallel_config)
+        raise_timeout_if_tp_spans_nodes(config)
         if (
             config.parallel_config._managed_distributed_store
             and not torch.distributed.is_initialized()
         ):
             # Preserve AITER's environment setup when preinitializing its group.
+            visible = config.tp_size_local if config.is_multinode_tp else world_size
             os.environ.setdefault(
-                "HIP_VISIBLE_DEVICES", ",".join(map(str, range(world_size)))
+                "HIP_VISIBLE_DEVICES", ",".join(map(str, range(visible)))
             )
-            store = torch.distributed.TCPStore(
-                config.parallel_config.data_parallel_master_ip,
-                config.parallel_config.data_parallel_base_port,
-                is_master=False,
-            )
+            store = managed_store_client(config)
             torch.distributed.init_process_group(
                 backend="nccl", store=store, rank=global_rank, world_size=world_size
             )
@@ -1585,17 +1590,18 @@ class ModelRunner:
             )
 
     def _init_forward_vars_ring(self):
-        """Build a ring of independent ``forward_vars`` copies, one per possible
-        in-flight pipeline microbatch.
+        """Build a ring of ``pp_size`` independent ``forward_vars`` copies.
 
-        The head launches up to ``pp_size`` forwards back-to-back without a GPU
-        sync, so a single reused ``forward_vars`` set would let microbatch N+1's
-        ``prepare_inputs`` overwrite staging buffers microbatch N's kernels are
-        still reading. Each in-flight slot gets its own buffer set; reuse of a
-        slot is gated by a per-slot CUDA event (see ``_advance_forward_vars`` /
-        ``_record_forward_vars_event``), bounding the CPU's GPU lead to the ring
-        size even when the head runs middle-chunk or DP-sync dummy batches
-        without a GPU sync.
+        The head launches up to ``pp_max_inflight`` forwards back-to-back
+        without a GPU sync (``pp_size`` unless ATOM_PP_MAX_INFLIGHT says
+        otherwise), so a single reused ``forward_vars`` set would let
+        microbatch N+1's ``prepare_inputs`` overwrite staging buffers
+        microbatch N's kernels are still reading. Each slot gets its own buffer
+        set; reuse of a slot is gated by a per-slot CUDA event (see
+        ``_advance_forward_vars`` / ``_record_forward_vars_event``), bounding
+        the CPU's GPU lead to the ring size even when more forwards are in
+        flight, or the head runs middle-chunk or DP-sync dummy batches without
+        a GPU sync.
 
         When ``pp_size == 1`` the ring is the single original dict and advance is
         a no-op, so behavior is unchanged.
@@ -1723,6 +1729,7 @@ class ModelRunner:
                 int(self.drafter.model.vocab_size),
                 config.torch_dtype,
                 self.device,
+                block=lossless.block_verify,
             )
         elif envs.ATOM_SPEC_LOSSLESS_SAMPLING:
             # Without a drafter there is no draft to sample, and a DSpark
@@ -2016,7 +2023,6 @@ class ModelRunner:
             )
         units = max(entry[3] for entry in stages)
         op_bytes = sum(entry[1] for entry in stages)
-        largest_image = max(entry[1] for entry in stages)
         digest = hashlib.sha256(repr(stages).encode()).hexdigest()[:16]
         layout_id = f"pp{len(stages)}-joint:{digest}"
         logger.info(
@@ -2028,7 +2034,7 @@ class ModelRunner:
             op_bytes,
             layout_id,
         )
-        return spec.for_pipeline(layout_id, units, op_bytes, largest_image)
+        return spec.for_pipeline(layout_id, units, op_bytes)
 
     def get_num_blocks(self) -> dict[str, object]:
         torch.set_default_device(self.device)
@@ -2137,13 +2143,14 @@ class ModelRunner:
                 )
             raise RuntimeError(base_msg + fix_msg) from exc
 
-        # PP stages compute different block counts; block ids must be valid on
-        # every stage's KV tensor, so reduce to the global minimum. Fold the
+        # PP stages, and TP ranks on another node, compute different block
+        # counts; block ids must be valid on every rank's KV tensor, so reduce
+        # to the global minimum (kv_blocks_differ_across_ranks). Fold the
         # result back into the plan before publishing anything: the plan is the
         # single source for every entry count, so it must never disagree with
         # the number the pool is actually built at.
         num_kvcache_blocks = plan.paged_entries
-        if config.pipeline_parallel_size > 1 and torch.distributed.is_initialized():
+        if kv_blocks_differ_across_ranks(config) and torch.distributed.is_initialized():
             t = torch.tensor(
                 [num_kvcache_blocks], dtype=torch.int64, device=self.device
             )
@@ -4279,7 +4286,8 @@ class ModelRunner:
         # all-to-all. No-op unless the flag is on.
         from atom.distributed.indexer_cp import warmup_exchange
 
-        warmup_exchange(self.device)
+        full_q_len = self.drafter.mtp_k + 1 if hasattr(self, "drafter") else 1
+        warmup_exchange(self.device, self.config.max_num_seqs * full_q_len)
 
         tr_hybrid = self._tr_hybrid_active()
         if tr_hybrid:
@@ -4313,7 +4321,6 @@ class ModelRunner:
         #
         # Warn rather than raise so a misconfig (default cuda_graph_sizes=[512]
         # vs e.g. max_num_seqs=16) stays recoverable.
-        full_q_len = self.drafter.mtp_k + 1 if hasattr(self, "drafter") else 1
         max_seq_bs = self.config.max_num_seqs
         max_tok_bs = self.config.max_num_batched_tokens // full_q_len
         max_bs = max_schedulable_decode_bs(
@@ -4591,6 +4598,11 @@ class ModelRunner:
         # The captures and the calibration ran the model for real; take back
         # what they wrote into the cache before the first request is admitted.
         self.attn_metadata_builder.reset_cache_after_capture()
+
+        if self.config.dcp_config.comm_backend == "mailbox":
+            from atom.model_ops.dcp_ops import check_dcp_mailbox_launches
+
+            check_dcp_mailbox_launches()
 
         # How much GPU memory the CUDA graph capture consumed (pool = reserved
         # delta; the allocated delta is what the graphs pin live).
@@ -5298,6 +5310,10 @@ class RapidServeModelRunner(ModelRunner):
             stream = self._prefill_streams[batch.cu_stream_fraction]
         else:
             stream = torch.cuda.current_stream()
+        # A connector that stages on the forward's stream follows it.
+        connector = get_kvconnector()
+        if connector is not None:
+            connector.set_forward_stream(stream)
         with torch.cuda.stream(stream):
             self._advance_forward_vars()
             self._gate_staging_reuse()

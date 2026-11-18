@@ -64,4 +64,5 @@ fn record_decision(
         decision.match_ratio,
         media_count,
     );
+    route_trace::record_estimate(pool, selected, decision.estimated_hit_ratio);
 }

@@ -699,9 +699,11 @@ def quantize_weight_to_fp8_128x128_blockscale(
     if scale_dtype == dtypes.fp8_e8m0:
         # frexp: scale = m * 2**e with m in [0.5, 1); m == 0.5 is already 2**(e-1).
         mant, exp = torch.frexp(scale)
-        scale = torch.ldexp(
-            torch.ones_like(scale), torch.where(mant == 0.5, exp - 1, exp)
-        )
+        exp = torch.where(mant == 0.5, exp - 1, exp)
+        # Build 2**exp from its E8M0 code, which is exact (scale >= fp32 tiny keeps
+        # the code in 1..254). An fp32 torch.ldexp is one ulp low at some exponents
+        # on gfx950 with torch 2.10 / ROCm 7.2.4.
+        scale = (exp + 127).to(torch.uint8).view(torch.float8_e8m0fnu).float()
 
     q_blocks = torch.clamp(
         w_blocks / scale.unsqueeze(-1).unsqueeze(-1), min=finfo.min, max=finfo.max

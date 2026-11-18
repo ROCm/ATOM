@@ -42,7 +42,7 @@ def shared_expert_fused_act_enabled(intermediate_per_rank: int) -> bool:
 
     The kernel asserts the half width is at least 128 and a multiple of 128.
     With the flag on and a width that fails that, log once per width and keep
-    the unfused path (V4.1-Flash at TP4 is 576, at TP8 is 288).
+    the unfused path (V4.1-Flash at TP4 is 576, at TP8 the padded 320).
     """
     if not envs.ATOM_V4_USE_TRITON_FUSION:
         return False

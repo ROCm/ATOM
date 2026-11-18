@@ -1256,7 +1256,7 @@ def rocm_aiter_fused_moe_fake(
     return torch.empty_like(hidden_states)
 
 
-direct_register_custom_op(
+rocm_aiter_fused_moe_op = direct_register_custom_op(
     op_name="rocm_aiter_fused_moe",
     op_func=rocm_aiter_fused_moe_impl,
     mutates_args=[],
@@ -3108,7 +3108,7 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
                 x_scale=x_scale,
             )
         else:
-            return torch.ops.aiter.rocm_aiter_fused_moe(
+            return rocm_aiter_fused_moe_op(
                 x,
                 layer.w13_weight,
                 layer.w2_weight,
@@ -3516,7 +3516,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             "swiglu_limit": getattr(layer, "swiglu_limit", 0.0),
         }
         if self.quant_type == QuantType.per_Tensor or self.fused_experts is None:
-            return torch.ops.aiter.rocm_aiter_fused_moe(
+            return rocm_aiter_fused_moe_op(
                 x,
                 layer.w13_weight,
                 layer.w2_weight,
@@ -3573,7 +3573,7 @@ def moe_forward_fake(
     return torch.empty_like(hidden_states)
 
 
-direct_register_custom_op(
+moe_forward_op = direct_register_custom_op(
     op_name="moe_forward",
     op_func=moe_forward,
     mutates_args=["hidden_states"],
@@ -5455,7 +5455,9 @@ class FusedMoE(torch.nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
-        return torch.ops.aiter.moe_forward(
+        # The custom op is an opaque boundary for torch.compile and for
+        # TorchDispatchMode (FakeTensorMode, make_fx); eager calls skip it.
+        return moe_forward_op(
             hidden_states,
             self._routing_logits(hidden_states, router_logits),
             self.layer_name,
@@ -5676,7 +5678,8 @@ class FusedMoE(torch.nn.Module):
                 reassign_gathered_shared_ids(self, out[2])
                 return out, local_tokens, sizes, gathered_rows
 
-            out, local_tokens, sizes, gathered_rows = tbo_on_comm(gather)
+            # Not held, like the TP all-reduce: see `tbo_on_comm`.
+            out, local_tokens, sizes, gathered_rows = tbo_on_comm(gather, hold=False)
             hidden_states, topk_weights, topk_ids, *scale = out
             x_scale = scale[0] if scale else None
 
@@ -5697,11 +5700,14 @@ class FusedMoE(torch.nn.Module):
                 final_hidden_states = final_hidden_states[:gathered_rows]
             if dp_eager_mode:
                 final_hidden_states = tbo_on_comm(
-                    reduce_scatterv, final_hidden_states, sizes, dp_group
+                    reduce_scatterv, final_hidden_states, sizes, dp_group, hold=False
                 )
             else:
                 final_hidden_states = tbo_on_comm(
-                    reduce_scatter_with_unpadding, final_hidden_states, local_tokens
+                    reduce_scatter_with_unpadding,
+                    final_hidden_states,
+                    local_tokens,
+                    hold=False,
                 )
 
         if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
