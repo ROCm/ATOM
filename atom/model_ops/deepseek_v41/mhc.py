@@ -8,7 +8,12 @@ from dataclasses import dataclass
 import torch
 import triton
 import triton.language as tl
-from aiter import mhc_post, mhc_post_reduce
+from aiter import (
+    mhc_post,
+    mhc_post_reduce,
+    mhc_post_reduce_supported,
+    mhc_post_supported,
+)
 
 from atom.model_ops.deepseek_v41.projections import hc_projection
 from atom.model_ops.sparse_attn_v4 import hc_split_sinkhorn
@@ -304,25 +309,32 @@ class SinglePassHCState:
             self.combination,
         )
 
+    def _reduce_owed(self, pre_mix=None):
+        """An owed post and the stream reduction after it as one
+        `aiter.mhc_post_reduce` (the ``pre_mix`` weighted sum, or with
+        ``pre_mix=None`` the mean), shaped like one stream. None unless a post
+        is owed and `post_reduce_supported` holds; the caller then settles and
+        reduces in two steps."""
+        if self.pending is None or not post_reduce_supported(
+            self.pending, self.residual
+        ):
+            return None
+        *outer, _, hidden = self.residual.shape
+        return post_reduce_streams(
+            self.pending, self.residual, self.post_mix, self.combination, pre_mix
+        ).view(*outer, hidden)
+
     def collapse(self):
         """BF16 streams weighted by the FP32 pre-mix, settling an owed post.
 
         The Triton body is the same expression in one launch instead of four,
         and keeps its multiply and sum apart so the two agree to the bit. The
         torch one stays for callers off the GPU. An owed post and the collapse
-        run as one aiter launch where it covers the shape.
+        run as one aiter launch where `post_reduce_supported` holds.
         """
-        if self.pending is not None and post_reduce_supported(
-            self.pending, self.residual
-        ):
-            *outer, _, hidden = self.residual.shape
-            return post_reduce_streams(
-                self.pending,
-                self.residual,
-                self.post_mix,
-                self.combination,
-                self.pre_mix,
-            ).view(*outer, hidden)
+        fused = self._reduce_owed(self.pre_mix)
+        if fused is not None:
+            return fused
         residual = self.settle().residual
         if not residual.is_cuda:
             return (
@@ -343,15 +355,11 @@ class SinglePassHCState:
         """The mean over the streams, settling an owed post: what a DSpark
         draft reads at a target layer's input (V4.1's taps and the vLLM
         plugin's aux hidden states). An owed post and the mean run as one
-        aiter launch where it covers the shape, without writing the settled
-        residual; elsewhere `settle()` and torch's mean."""
-        if self.pending is not None and post_reduce_supported(
-            self.pending, self.residual
-        ):
-            *outer, _, hidden = self.residual.shape
-            return post_reduce_streams(
-                self.pending, self.residual, self.post_mix, self.combination
-            ).view(*outer, hidden)
+        aiter launch where `post_reduce_supported` holds, without writing the
+        settled residual; elsewhere `settle()` and torch's mean."""
+        fused = self._reduce_owed()
+        if fused is not None:
+            return fused
         return self.settle().residual.mean(dim=-2)
 
 
@@ -385,14 +393,13 @@ def expand_residual(sublayer_output, residual, post_mix, combination):
 
     The torch body materializes a [tokens, hc, hc, dim] product before reducing
     it. `aiter.mhc_post` is the same expression as one ROCm op, and it is the
-    one V4 and vLLM's ROCm V4.1 both call here. The test (`mhc_post_covers`) is
-    the kernel's own coverage, which it traps on rather than reports; vLLM
-    gates the shape the same way. It is also what keeps the small-hidden
-    reference tests, which demand bit-exactness against the pinned model, on
-    the body below.
+    one V4 and vLLM's ROCm V4.1 both call here, where aiter says it runs
+    (`mhc_post_supported`, asked through `_aiter_serves`). That is also what
+    keeps the small-hidden reference tests, which demand bit-exactness against
+    the pinned model, on the body below.
     """
     hc_mult, hidden = residual.shape[-2], residual.shape[-1]
-    if mhc_post_covers(residual):
+    if _aiter_serves(hidden, hc_mult, residual.dtype, False):
         flat = residual.view(-1, hc_mult, hidden)
         rows = flat.shape[0]
         out = torch.empty_like(flat)
@@ -410,32 +417,26 @@ def expand_residual(sublayer_output, residual, post_mix, combination):
     )
 
 
-def mhc_post_covers(residual) -> bool:
-    """The shapes `aiter.mhc_post` serves, which it traps on rather than
-    reports: 4 streams, the 16-bit float dtypes its dispatch takes (and rounds
-    every stream to), and a hidden size its tiles cover -- a multiple of 256
-    holding at least two of the widest tile (1024, 512 or 256 columns) that
-    divides it, because the kernel prefetches one tile ahead."""
-    hidden = residual.shape[-1]
-    tile = next((t for t in (1024, 512, 256) if hidden % t == 0), None)
-    return (
-        residual.shape[-2] == 4
-        and tile is not None
-        and hidden >= 2 * tile
-        and residual.dtype in (torch.bfloat16, torch.float16)
-    )
+@torch.compiler.assume_constant_result
+def _aiter_serves(hidden_size: int, hc_mult: int, dtype: torch.dtype, reduce: bool):
+    """aiter's own answer to whether `mhc_post` (with ``reduce``,
+    `mhc_post_reduce`) runs this shape, so ATOM does not restate its tile
+    dispatch. A traced forward takes the answer as a constant: the query
+    reads the live GPU arch, which Dynamo must not trace into."""
+    query = mhc_post_reduce_supported if reduce else mhc_post_supported
+    return query(hidden_size, hc_mult, dtype)
 
 
 def post_reduce_supported(pending, residual) -> bool:
     """Where an owed post and the stream reduction after it run as one
-    `aiter.mhc_post_reduce`: `mhc_post`'s coverage with hidden a multiple of
-    512, both operands contiguous, on the GPU."""
+    `aiter.mhc_post_reduce`: aiter takes the shape and dtype
+    (`mhc_post_reduce_supported`), and the operands are on the GPU and
+    contiguous."""
     return (
         residual.is_cuda
-        and mhc_post_covers(residual)
-        and residual.shape[-1] % 512 == 0
         and residual.is_contiguous()
         and pending.is_contiguous()
+        and _aiter_serves(residual.shape[-1], residual.shape[-2], residual.dtype, True)
     )
 
 
@@ -446,17 +447,17 @@ def post_reduce_streams(pending, residual, post_mix, combination, pre_mix=None):
     own body and reduces it as those two do (FP32, streams in order, products
     and sums rounded apart), so the result is the two-kernel path's to the
     bit. Callers check `post_reduce_supported` first."""
-    hidden = residual.shape[-1]
-    flat = residual.view(-1, 4, hidden)
+    hc_mult, hidden = residual.shape[-2], residual.shape[-1]
+    flat = residual.view(-1, hc_mult, hidden)
     rows = flat.shape[0]
     out = torch.empty(rows, hidden, dtype=residual.dtype, device=residual.device)
     mhc_post_reduce(
         out,
         pending.view(rows, hidden),
         flat,
-        post_mix.reshape(rows, 4, 1).contiguous(),
-        combination.reshape(rows, 4, 4).contiguous(),
-        None if pre_mix is None else pre_mix.reshape(rows, 4).contiguous(),
+        post_mix.reshape(rows, hc_mult, 1).contiguous(),
+        combination.reshape(rows, hc_mult, hc_mult).contiguous(),
+        None if pre_mix is None else pre_mix.reshape(rows, hc_mult).contiguous(),
     )
     return out
 
