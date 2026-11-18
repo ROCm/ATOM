@@ -1272,23 +1272,30 @@ class TestExplicitPlan:
         assert calls, f"{relpath} no longer calls {func}; test moved"
         return calls
 
-    def test_static_cap_callers_pass_their_split_count(self):
+    def test_partition_cap_callers_are_explicit(self):
         """Who keeps a static plan ceiling is a choice, not an invariant.
 
-        Sparse keeps it because each row's selected context is a bounded topk
-        window; the vLLM bridge keeps it until it is measured at aiter's
-        default. A later measurement may change either; this pins the current
-        choice so a change is deliberate. (The SGLang bridge computes in bf16,
-        which FlyDSL rejects, so it never plans.)
+        Sparse cached prefill deliberately lets device lengths use the default
+        planner capacity; cold prefill and the vLLM dense bridge retain their
+        static split ceilings.
         """
-        for relpath in (
-            "model_ops/minimax_m3/sparse_attn.py",
-            "plugin/vllm/attention/layer_mha.py",
+        import ast
+
+        (sparse_call,) = self._call_kwargs(
+            "model_ops/minimax_m3/sparse_attn.py", "run_pa_decode"
+        )
+        sparse_cap = sparse_call["plan_partition_cap"]
+        assert isinstance(sparse_cap, ast.IfExp)
+        assert isinstance(sparse_cap.body, ast.Constant) and sparse_cap.body.value is None
+        assert getattr(sparse_cap.orelse, "id", None) == "max_context_partition_num"
+
+        for kw in self._call_kwargs(
+            "plugin/vllm/attention/layer_mha.py", "run_pa_decode"
         ):
-            for kw in self._call_kwargs(relpath, "run_pa_decode"):
-                assert getattr(kw.get("plan_partition_cap"), "id", None) == (
-                    "max_context_partition_num"
-                ), f"{relpath}: plan cap is not the static split count"
+            assert (
+                getattr(kw.get("plan_partition_cap"), "id", None)
+                == "max_context_partition_num"
+            )
 
     def test_callers_leave_gluon_scratch_to_aiter(self):
         """No caller keeps its own copy of the kernel's scratch shapes."""
