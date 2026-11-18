@@ -10,7 +10,6 @@ the same object hierarchy and skips the vision tower/projector tensors.
 
 from typing import ClassVar
 
-import aiter
 import torch
 from aiter import ActivationType, QuantType, dtypes
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
@@ -178,7 +177,8 @@ def _is_e8m0_blockscale(
     quant_config: QuantizationConfig | None, quant_type: QuantType
 ) -> bool:
     """Whether a per_1x128 consumer runs E8M0 block scales (same test as
-    LinearBase). FP32-scale fused producers stand down for it."""
+    LinearBase). The MLA q/kv norm then emits E8M0 scales; the FP32-scale o_proj
+    producer stands down."""
     return (
         quant_config is not None
         and quant_type.value == QuantType.per_1x128.value
@@ -849,12 +849,8 @@ class KimiFullAttention(nn.Module):
         qknorm_type, qknorm_dtype = effective_layer_quant(
             quant_config, f"{prefix}.q_b_proj"
         )
-        # An older aiter aborts on an E8M0 scale here; q_b_proj then quantizes q.
         self.qknorm_e8m0_scale = _is_e8m0_blockscale(quant_config, qknorm_type)
-        self.fuse_qknorm_quant = qknorm_dtype in (dtypes.fp8, dtypes.fp4x2) and (
-            not self.qknorm_e8m0_scale
-            or getattr(aiter, "FUSED_QK_RMSNORM_SUPPORTS_E8M0_GROUP_SCALE", False)
-        )
+        self.fuse_qknorm_quant = qknorm_dtype in (dtypes.fp8, dtypes.fp4x2)
         self.qknorm_dtype = qknorm_dtype if self.fuse_qknorm_quant else torch.bfloat16
         self.qknorm_quant_type_value = (
             qknorm_type.value if self.fuse_qknorm_quant else QuantType.No.value
