@@ -106,6 +106,8 @@ PREFILL_PORT="${PREFILL_PORT:-8010}"
 DECODE_PORT="${DECODE_PORT:-8020}"
 ROUTER_PORT="${ROUTER_PORT:-8000}"
 ROUTER_POLICY="${ROUTER_POLICY:-random}"
+ROUTER_PREFILL_POLICY="${ROUTER_PREFILL_POLICY:-}"
+ROUTER_DECODE_POLICY="${ROUTER_DECODE_POLICY:-}"
 ATOM_PD_RANK_MAPPING_POLICY="${ATOM_PD_RANK_MAPPING_POLICY:-none}"
 PROMETHEUS_PORT="${PROMETHEUS_PORT:-29100}"
 HANDSHAKE_PORT="${HANDSHAKE_PORT:-6301}"
@@ -2221,6 +2223,14 @@ start_router() {
   fi
   local -a router_dp_aware_args=()
   local -a router_prefill_policy_args=()
+  local -a explicit_policy_args=()
+  if [[ -n "${ROUTER_PREFILL_POLICY}" ]]; then
+    explicit_policy_args+=(--prefill-policy "${ROUTER_PREFILL_POLICY}")
+  fi
+  if [[ -n "${ROUTER_DECODE_POLICY}" ]]; then
+    explicit_policy_args+=(--decode-policy "${ROUTER_DECODE_POLICY}")
+  fi
+  if [[ ${#explicit_policy_args[@]} -eq 0 ]]; then
   if is_agentic_dpa; then
     # Respect explicit cache-aware routing for DPA workloads.
     if [[ "${router_policy}" != "cache_aware" ]]; then
@@ -2235,8 +2245,15 @@ start_router() {
   elif [[ "${#router_rank_mapping_args[@]}" -gt 0 ]]; then
     router_dp_aware_args=(--dp-aware)
   fi
+  else
+    # A case that names prefill_policy or decode_policy keeps that choice.
+    # Omitting both restores dp_sticky / cache_aware.
+    if is_agentic_dpa || [[ ${#router_rank_mapping_args[@]} -gt 0 ]]; then
+      router_dp_aware_args=(--dp-aware)
+    fi
+  fi
   local -a router_policy_args=(--policy "${router_policy}")
-  if [[ "${router_policy}" == "cache_aware" ]]; then
+  if [[ ${#explicit_policy_args[@]} -eq 0 && "${router_policy}" == "cache_aware" ]]; then
     # Keep the InferenceX defaults, with a case-level absolute-load override.
     router_policy_args+=(
       --prefill-policy cache_aware --decode-policy cache_aware
@@ -2256,6 +2273,7 @@ start_router() {
     "${decode_args[@]}"
     "${router_policy_args[@]}"
     "${router_prefill_policy_args[@]}"
+    "${explicit_policy_args[@]}"
     "${router_rank_mapping_args[@]}"
     "${router_dp_aware_args[@]}"
     --backend atom
