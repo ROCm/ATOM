@@ -415,10 +415,6 @@ def build_post_attn_kernel(
         def peer_addr(w):
             return load_ptr64(peers, w)
 
-        def own_task(t):
-            """Whether this rank sums (and gathers) row group t's all-reduce."""
-            return t % W == rank
-
         def start(name):
             return first_task(bid, BASE[name])
 
