@@ -22,9 +22,6 @@ from atom.models.deepseek_v41.mono.indexer_build import (
     IndexerBuild,
     _select_segment,
     _split_weights,
-    full_build,  # noqa: F401 - public compatibility export
-    reindex_build,  # noqa: F401 - public compatibility export
-    scratch_bytes,  # noqa: F401 - public compatibility export
     scratch_layout,
     selection_keys,
 )
@@ -330,7 +327,7 @@ def build_indexer(key: IndexerBuild):
     split_weights = _split_weights(key)
     plan = SelectionPlan(_select_segment(key))
     sel = lds_words(plan.SEG // THREADS, fast_hist=True)
-    sel_keys, sel_hist, sel_buf = sel["keys"], sel["hist"], sel["buf"]
+    sel_hist, sel_buf = sel["hist"], sel["buf"]
     peer_topk = ip.TOPK if key.full_only else ip.TOPK_BLOCKS
     sel_keys = selection_keys(key)
 

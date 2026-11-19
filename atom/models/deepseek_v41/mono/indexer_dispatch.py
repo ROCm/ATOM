@@ -4,26 +4,10 @@
 
 from torch import nn
 
+from atom.models.deepseek_v41.mono.decode_step import step_supported
 from atom.models.deepseek_v41.mono.indexer_build import MAX_ROWS
 from atom.mono.runtime.route import LazyRunner
 from atom.utils.forward_context import get_forward_context
-
-
-def step_supported(input_ids, inputs_embeds):
-    rows = input_ids.numel()
-    fwd = get_forward_context()
-    step = getattr(fwd.attn_metadata, "step", None)
-    return (
-        inputs_embeds is None
-        and 0 < rows <= MAX_ROWS
-        and fwd.context is not None
-        and not fwd.context.is_prefill
-        and fwd.ubatch_slices is None
-        and step is not None
-        and step.decode
-        and step.running_tokens == rows
-        and getattr(fwd.attn_metadata, "image_mask", None) is None
-    )
 
 
 class MonoIndexerModel(nn.Module):
@@ -58,9 +42,9 @@ class MonoIndexerModel(nn.Module):
         # the native hook here would allocate and clear an unused second set.
         if self.model.uses_layer_mono(input_ids, inputs_embeds):
             return self.model(input_ids, positions)
-        active = step_supported(input_ids, inputs_embeds) and self._mono.ready(
-            input_ids.numel()
-        )
+        active = step_supported(
+            input_ids, inputs_embeds, max_rows=MAX_ROWS
+        ) and self._mono.ready(input_ids.numel())
         if active:
             md = get_forward_context().attn_metadata
             self._mono.runner.begin_step(input_ids.numel(), md.cache, md.step)

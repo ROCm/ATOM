@@ -187,10 +187,6 @@ def stage_iquant(c, task):
             )
 
 
-# the FP4 query's E8M0 scales a token, as the row-group scorer packs them:
-# [32-dim chunk][head % 16][head // 16, the M tiles padded to a dword]
-QS_M_TILES = -(-(ip.HEADS // 16) // 4) * 4
-QS_BYTES = ip.DIM // 32 * 16 * QS_M_TILES
 FP4_MIN_AMAX = 6.0 * 2.0**-126  # the smallest normal times E2M1's max
 
 
@@ -238,9 +234,9 @@ def stage_iquant_fp4(c, task):
             bo.buffer_store(
                 fx.Int8(code),
                 rsrc(a["iqs_out"]),
-                t * QS_BYTES
-                + lane // 16 * (16 * QS_M_TILES)
-                + h % 16 * QS_M_TILES
+                t * ip.QS_BYTES
+                + lane // 16 * (16 * ip.QS_M_TILES)
+                + h % 16 * ip.QS_M_TILES
                 + h // 16,
             )
         if lane == 0:

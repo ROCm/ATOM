@@ -454,8 +454,9 @@ def test_ordinary_route_defaults_on_and_accepts_opt_out(
 
 
 @pytest.mark.parametrize("mode", ["auto", "1"])
+@pytest.mark.parametrize("indexer_flag", ["0", None])
 def test_a_model_the_hi_path_does_not_serve_falls_back(
-    mi355x, served, monkeypatch, caplog, dispatch_module, mode
+    mi355x, served, monkeypatch, caplog, dispatch_module, mode, indexer_flag
 ):
     """A mismatch only the loaded model shows (``MonoUnsupported`` from ``install_hi``, e.g. the routed experts outside
     the gfx950 FlyDSL layout): under "auto" ``install_mono_decode`` logs one line and keeps ATOM's mono decode; under
@@ -465,7 +466,16 @@ def test_a_model_the_hi_path_does_not_serve_falls_back(
     from atom.mono.runtime.consensus import MonoUnsupported
 
     dispatch = dispatch_module
-    monkeypatch.setenv("ATOM_DSV41_MONO_INDEXER", "0")
+    if indexer_flag is None:
+        monkeypatch.delenv("ATOM_DSV41_MONO_INDEXER", raising=False)
+        wrapper = types.ModuleType("atom.models.deepseek_v41.mono.indexer_dispatch")
+        wrapper.MonoIndexerModel = lambda *a, **k: "independent indexer"
+        monkeypatch.setitem(sys.modules, wrapper.__name__, wrapper)
+        workspace = types.ModuleType("atom.models.deepseek_v41.mono.indexer_workspace")
+        workspace.IndexerWorkspace = lambda *a: "shared workspace"
+        monkeypatch.setitem(sys.modules, workspace.__name__, workspace)
+    else:
+        monkeypatch.setenv("ATOM_DSV41_MONO_INDEXER", indexer_flag)
 
     def install_hi(*a, **k):
         raise MonoUnsupported("routed experts not in the gfx950 FlyDSL layout")
@@ -484,7 +494,7 @@ def test_a_model_the_hi_path_does_not_serve_falls_back(
         return
     with caplog.at_level(logging.INFO, logger="atom"):
         got = dispatch.install_mono_decode("model", served, None, metadata_builder=None)
-    assert got == "atom mono"
+    assert got == ("independent indexer" if indexer_flag is None else "atom mono")
     assert [r.getMessage() for r in caplog.records] == [
         "V4.1 mono hi off: routed experts not in the gfx950 FlyDSL layout"
     ]

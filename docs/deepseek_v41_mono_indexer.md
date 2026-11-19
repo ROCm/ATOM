@@ -5,7 +5,7 @@ FP4 TP2/TP4 deployments. TP8 requires explicit `ATOM_DSV41_MONO_INDEXER=1`
 until TP8 GPU and answer-accuracy qualification is available.
 Set `ATOM_DSV41_MONO_INDEXER=0` to retain the embedded/native indexer.
 Native decode and ordinary low-concurrency layer Mono share the indexer
-kernel. The DSpark HI route and its fallback retain their existing indexer.
+kernel. A successfully installed DSpark HI hook and its per-step fallback retain their existing indexer. An install-time HI refusal under `auto` enters ordinary decode and follows the indexer flag.
 
 The kernel reads attention-normalized BF16 hidden rows and MXFP8 query
 latents, then fuses query projection, GPT-J tail RoPE, head-weight projection,
@@ -86,6 +86,27 @@ FP8 index caches, attention DP and DSpark HI retain their existing indexers.
 At TP2 without attention DP, FP4 widths of 40 rows or more use native layers
 with the standalone indexer: the ordinary layer route was slower there in
 the earlier measurements. No aiter source or query-interface change is needed.
+
+## DP attention and HI routing
+
+The standalone indexer is disabled under DP attention, including when
+`ATOM_DSV41_MONO_INDEXER=1` is explicitly set. Each attention-DP rank owns
+different requests and cache rows, so the replicated-cache TP ownership and
+K-splitting protocol cannot merge these ranks' selections. Supported DP
+layer Mono keeps its existing embedded indexer; unsupported layer steps use
+native attention. Non-DP standalone-indexer timings do not qualify DP gains.
+
+Successful HI installation keeps its own indexer on both HI-served steps and
+its per-step fallback. An install-time refusal with `ATOM_DSV41_MONO_HI=auto`
+instead enters ordinary decode and follows the standalone-indexer flag.
+FP8 KV with an FP4 index cache is eligible for the ordinary route; it is the
+FP8 **index** cache that keeps the existing indexer.
+
+The shared workspace is reserved before KV sizing, so its cost reduces KV
+capacity. Uncached arenas follow the existing process-lifetime policy in
+`atom/mono/runtime/uncached.py`; a later owner refusal retains those arenas.
+Measure the flag-0/flag-1 KV block counts with the same model, cache dtype,
+maximum context, sequence cap and memory utilization when assessing that cost.
 
 ## Numerical qualification
 

@@ -39,7 +39,7 @@ def setup(monkeypatch):
     monkeypatch.setattr(
         module, "get_forward_context", lambda: SimpleNamespace(attn_metadata=md)
     )
-    monkeypatch.setattr(module, "step_supported", lambda *args: True)
+    monkeypatch.setattr(module, "step_supported", lambda *args, **kwargs: True)
     config = SimpleNamespace(
         max_model_len=8192,
         index_cache_dtype="fp4",
@@ -74,7 +74,7 @@ def test_layer_runner_owns_its_indexer_without_preparing_native_buffers(monkeypa
 
 def test_unsupported_step_keeps_native_route(monkeypatch):
     raw, wrapped, lazy, _ = setup(monkeypatch)
-    monkeypatch.setattr(module, "step_supported", lambda *args: False)
+    monkeypatch.setattr(module, "step_supported", lambda *args, **kwargs: False)
     ids = torch.arange(65)
     wrapped(ids, ids)
     lazy.ready.assert_not_called()
@@ -180,21 +180,21 @@ def test_full_binary_is_separate_from_candidate_and_reindex_buffers(gpu_module):
 def test_layer_reset_preserves_candidate_data_and_separates_split_histograms(
     gpu_module,
 ):
-    from atom.models.deepseek_v41.mono.kernels import indexer as kernel
+    from atom.models.deepseek_v41.mono import indexer_build as ib
     from atom.models.deepseek_v41.mono.runner import V41MonoDecodeRunner
 
-    key = kernel.IndexerBuild(8, 163968, world=4)
+    key = ib.IndexerBuild(8, 163968, world=4)
     r = V41MonoDecodeRunner.__new__(V41MonoDecodeRunner)
     r._indexer_key = lambda rows: key
-    r.index_scratch = torch.full((kernel.scratch_bytes(key),), 7, dtype=torch.uint8)
-    local_key = kernel.reindex_build(key)
+    r.index_scratch = torch.full((ib.scratch_bytes(key),), 7, dtype=torch.uint8)
+    local_key = ib.reindex_build(key)
     r.local_index_scratch = torch.full(
-        (kernel.scratch_bytes(local_key),), 7, dtype=torch.uint8
+        (ib.scratch_bytes(local_key),), 7, dtype=torch.uint8
     )
     r.indexer_full_ratio = 2
-    full_key = kernel.full_build(key, 2)
+    full_key = ib.full_build(key, 2)
     r.full_index_scratch = torch.full(
-        (kernel.scratch_bytes(full_key),), 7, dtype=torch.uint8
+        (ib.scratch_bytes(full_key),), 7, dtype=torch.uint8
     )
     resets, split_resets = r._index_reset_buffers(8)
     assert resets and len(split_resets) == 1
@@ -208,7 +208,7 @@ def test_layer_reset_preserves_candidate_data_and_separates_split_histograms(
         (local_key, r.local_index_scratch),
         (full_key, r.full_index_scratch),
     ):
-        layout = kernel.scratch_layout(build)
+        layout = ib.scratch_layout(build)
         # Retained scores/IDs are overwritten by their producers, not cleared.
         for name in ("iq", "isel0"):
             if name in layout:
@@ -229,7 +229,7 @@ def test_tp2_large_batch_keeps_native_layers_and_mono_indexer(
 
     raw, _, lazy, md = setup(monkeypatch)
     monkeypatch.setenv("ATOM_DSV41_MONO_INDEXER", "1")
-    monkeypatch.setattr(dispatch, "step_supported", lambda *args: True)
+    monkeypatch.setattr(dispatch, "step_supported", lambda *args, **kwargs: True)
     layer = dispatch.MonoDecodeModel(raw, None, 8192, True, 0, tp)
     layer._mono = SimpleNamespace(ready=Mock(), runner=SimpleNamespace(forward=Mock()))
     cfg = SimpleNamespace(
@@ -265,7 +265,7 @@ def test_other_layer_routes_do_not_prepare_native_indexer(
 
     raw, _, lazy, _ = setup(monkeypatch)
     monkeypatch.setenv("ATOM_DSV41_MONO_INDEXER", enabled)
-    monkeypatch.setattr(dispatch, "step_supported", lambda *args: True)
+    monkeypatch.setattr(dispatch, "step_supported", lambda *args, **kwargs: True)
     layer = dispatch.MonoDecodeModel(raw, None, 8192, fp4, 0, tp)
     layer_run = Mock(side_effect=lambda ids, positions: ids + 2)
     layer._mono = SimpleNamespace(
@@ -339,7 +339,7 @@ def test_workspace_is_shared_at_install_before_any_decode(monkeypatch, dispatch_
     monkeypatch.setenv("ATOM_DSV41_MONO_INDEXER", "1")
     monkeypatch.setattr(dispatch, "config_refusal", lambda cfg: None)
     monkeypatch.setattr(dispatch, "dp_attention_ranks", lambda cfg: 0)
-    monkeypatch.setattr(dispatch.hi_gate, "decide", lambda *args: False)
+    monkeypatch.setattr(dispatch.hi_gate, "decide", lambda *args, **kwargs: False)
     monkeypatch.setattr(dispatch, "MonoDecodeModel", layer)
     monkeypatch.setattr(module, "MonoIndexerModel", hook)
     # atom_under_stubs imports a fresh copy, so patch that copy too.

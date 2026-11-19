@@ -15,12 +15,8 @@ from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 from atom.model_ops.deepseek_v41.index_plane import FP4_MFMA
 from atom.models.deepseek_v41.mono import index_plan as ip
 from atom.models.deepseek_v41.mono import index_tp_plan as tp
-from atom.models.deepseek_v41.mono.indexer_dispatch import (
-    MonoIndexerModel,  # noqa: F401 - public compatibility export
-    step_supported,  # noqa: F401 - public compatibility export
-)
+from atom.models.deepseek_v41.mono import indexer_build as build
 from atom.models.deepseek_v41.mono.kernels import indexer as kernel
-from atom.models.deepseek_v41.mono.kernels.index_query import QS_BYTES
 from atom.models.deepseek_v41.mono.step_meta import KMETA, write_step_meta
 from atom.mono.plan.execution import BLOCKS
 from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
@@ -34,7 +30,7 @@ logger = logging.getLogger("atom")
 
 
 class MonoIndexer:
-    max_rows = kernel.MAX_ROWS
+    max_rows = build.MAX_ROWS
 
     def __init__(
         self,
@@ -80,14 +76,12 @@ class MonoIndexer:
             )
             self.mailboxes = StepMailboxes(self.peers)
         self.widths = WidthBuilds(
-            self._build, lambda k: [(k, kernel.ABI)], group, "V4.1 Mono indexer"
+            self._build, lambda k: [(k, build.ABI)], group, "V4.1 Mono indexer"
         )
         self.local_widths = (
             WidthBuilds(
-                lambda rows: kernel.build_indexer(
-                    kernel.reindex_build(self._key(rows))
-                ),
-                lambda k: [(k, kernel.ABI)],
+                lambda rows: kernel.build_indexer(build.reindex_build(self._key(rows))),
+                lambda k: [(k, build.ABI)],
                 group,
                 "V4.1 local REINDEX",
             )
@@ -97,7 +91,7 @@ class MonoIndexer:
         self.full_widths = (
             WidthBuilds(
                 lambda rows: kernel.build_indexer(self._full_key(rows)),
-                lambda k: [(k, kernel.ABI)],
+                lambda k: [(k, build.ABI)],
                 group,
                 "V4.1 FULL indexer",
             )
@@ -179,14 +173,14 @@ class MonoIndexer:
             self.scratch = workspace.scratch
             self.local_scratch = workspace.local_scratch
         else:
-            self.scratch = uncached_bytes(kernel.scratch_bytes(self._key(s)), dev)
+            self.scratch = uncached_bytes(build.scratch_bytes(self._key(s)), dev)
             if self.fp4 and any(
                 block.attn.indexer is not None
                 and block.attn.indexer.spec.candidate_source is not None
                 for block in self.model.layers
             ):
                 self.local_scratch = uncached_bytes(
-                    kernel.scratch_bytes(kernel.reindex_build(self._key(s))), dev
+                    build.scratch_bytes(build.reindex_build(self._key(s))), dev
                 )
         self.full_ratio = (
             min(
@@ -206,7 +200,7 @@ class MonoIndexer:
             self.full_scratch = workspace.full_scratch
         elif self.full_ratio is not None:
             self.full_scratch = uncached_bytes(
-                kernel.scratch_bytes(self._full_key(s)), dev
+                build.scratch_bytes(self._full_key(s)), dev
             )
         # Projection and scoring exchange these plain rows within one launch
         # across XCDs. As with the tagged scratch, keep them uncached: draining
@@ -225,9 +219,9 @@ class MonoIndexer:
                 .view(s, ip.HEADS, ip.DIM // (2 if self.fp4 else 1))
             )
             self.iqs = (
-                uncached_bytes(s * (QS_BYTES if self.fp4 else ip.HEADS * 4), dev)
+                uncached_bytes(s * (ip.QS_BYTES if self.fp4 else ip.HEADS * 4), dev)
                 .view(torch.uint8 if self.fp4 else torch.float32)
-                .view(s, QS_BYTES if self.fp4 else ip.HEADS)
+                .view(s, ip.QS_BYTES if self.fp4 else ip.HEADS)
             )
             self.iw = (
                 uncached_bytes(s * ip.HEADS * 4, dev)
@@ -265,7 +259,7 @@ class MonoIndexer:
 
     def _key(self, rows):
         world = tp.kernel_world(self.world, rows, self.bound_max)
-        return kernel.IndexerBuild(
+        return build.IndexerBuild(
             rows,
             self.bound_max,
             self.fp4,
@@ -278,7 +272,7 @@ class MonoIndexer:
         return kernel.build_indexer(self._key(rows))
 
     def _full_key(self, rows):
-        return kernel.full_build(self._key(rows), self.full_ratio)
+        return build.full_build(self._key(rows), self.full_ratio)
 
     def prepare(self, rows):
         return (
@@ -303,7 +297,7 @@ class MonoIndexer:
         self.rows = rows
         key = self._key(rows)
         world = key.world
-        layout = kernel.scratch_layout(key)
+        layout = build.scratch_layout(key)
         resets = tuple(
             self.scratch[off : off + n].view(torch.int32)
             for name, (off, n) in layout.items()
@@ -312,14 +306,14 @@ class MonoIndexer:
             or (not self.fp4 and name in ("iq", "iw"))
         )
         if self.local_scratch is not None:
-            local_layout = kernel.scratch_layout(kernel.reindex_build(self._key(rows)))
+            local_layout = build.scratch_layout(build.reindex_build(self._key(rows)))
             resets += tuple(
                 self.local_scratch[off : off + n].view(torch.int32)
                 for name, (off, n) in local_layout.items()
                 if name in ("qdone", "qready", "isf", "irdy") or "ready" in name
             )
         if self.full_scratch is not None:
-            full_layout = kernel.scratch_layout(self._full_key(rows))
+            full_layout = build.scratch_layout(self._full_key(rows))
             resets += tuple(
                 self.full_scratch[off : off + n].view(torch.int32)
                 for name, (off, n) in full_layout.items()
@@ -435,7 +429,7 @@ class MonoIndexer:
         p = torch.Tensor.data_ptr
         iq_w, iq_ws, iw_w = self.weights[spec.layer_id]
         selected = self.selected[spec.layer_id][:rows]
-        args = kernel.ABI.pack(
+        args = build.ABI.pack(
             {
                 "hidden": p(hidden),
                 "qr": p(qr),

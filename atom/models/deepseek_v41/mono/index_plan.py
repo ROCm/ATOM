@@ -25,6 +25,10 @@ STEP = 64  # keys an FP4 walk step: a wave's 4 MFMA tiles, 8 pages
 WALK_ROWS = 6  # query rows an FP4 walk scores off each key load
 HEADS = 32  # the indexer's heads (``index_n_heads``)
 DIM = 128  # an index head's dims (``index_head_dim``)
+# Packed E8M0 query scales: [32-dim chunk][head % 16][head // 16],
+# with the M tile count padded to a dword for the row-group FP4 scorer.
+QS_M_TILES = -(-(HEADS // 16) // 4) * 4
+QS_BYTES = DIM // 32 * 16 * QS_M_TILES
 # the two selections: a token's top rows, and on a candidate-producing layer its
 # top blocks -- each a tree over its own bound (``kind_bound``)
 KINDS = {"sel": TOPK, "blk": TOPK_BLOCKS}

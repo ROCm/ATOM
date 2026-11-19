@@ -65,6 +65,7 @@ from atom.mono.dsa_indexer.selection_plan import (
     COUNT_BITS,
     DEFAULT_RADIX,
     LOCAL_RADIX,
+    ROW_COPIES,
     SHORT_VERIFY_CTX,
     prefix_row,
     request_owner,
@@ -94,7 +95,6 @@ BEFORE_WAVES = BLOCKS // 64
 # row's keys at most, ``kernel.unfit``), the segments added in above
 # a row histogram's copies: segment g adds into copy g % ROW_COPIES (a word
 # takes fewer atomics), its readers sum them
-from atom.mono.dsa_indexer.selection_plan import ROW_COPIES
 
 # LDS ``rows`` words a row: context, keys here, long | split << 1 |
 # short-verify-step << 2. The last flag is uniform over rows and ranks.

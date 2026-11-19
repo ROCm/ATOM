@@ -12,7 +12,7 @@ from atom.config import CompilationConfig, Config, CUDAGraphMode
 from atom.model_engine.model_runner import ModelRunner
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence
-from atom.models.deepseek_v41.mono.indexer import MonoIndexerModel
+from atom.models.deepseek_v41.mono.indexer_dispatch import MonoIndexerModel
 from atom.sampling_params import SamplingParams
 
 rank = int(os.environ["RANK"])

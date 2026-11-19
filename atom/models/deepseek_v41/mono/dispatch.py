@@ -27,47 +27,17 @@ from atom.models.deepseek_v41.mono import hi_gate
 from atom.models.deepseek_v41.mono.config import (
     MAX_MOE_ROWS,
     MAX_REQUESTS,
-    MAX_ROWS,
     config_refusal,
     indexer_enabled,
 )
+from atom.models.deepseek_v41.mono.decode_step import step_supported
 from atom.models.deepseek_v41.mono.draft_runner import DraftMonoRunner
 from atom.models.deepseek_v41.mono.runner import V41MonoDecodeRunner
 from atom.mono.runtime.consensus import MonoUnsupported
 from atom.mono.runtime.deployment import dp_attention_ranks
 from atom.mono.runtime.route import LazyRunner
-from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
-
-
-def step_supported(input_ids: torch.Tensor, inputs_embeds, dp_ranks: int = 0) -> bool:
-    """Is this forward a decode step of up to ``MAX_ROWS`` rows? Its width,
-    not the scheduled request count: a captured graph's width is the one
-    its replays run, while the scheduled count differs from replay to replay.
-
-    Under DP attention over ``dp_ranks`` ranks every rank runs its own requests
-    (an idle one a dummy step), and the MoE spans them all: a step is mono on
-    every rank or on none, of up to ``MAX_MOE_ROWS / dp_ranks`` rows a rank
-    (the MoE's widest step their sum) and ``MAX_ROWS`` at most. It is only
-    when no rank prefills
-    (``running_tokens_are_unified``, agreed across DP); then every rank's width
-    is the agreed ``running_tokens``, and an idle rank's step, requests or
-    none, is a decode as well."""
-    rows = input_ids.numel()
-    max_rows = min(MAX_ROWS, MAX_MOE_ROWS // dp_ranks) if dp_ranks else MAX_ROWS
-    if inputs_embeds is not None or not 0 < rows <= max_rows:
-        return False
-    fwd = get_forward_context()
-    if fwd.context is None or fwd.context.is_prefill or fwd.ubatch_slices is not None:
-        return False
-    if dp_ranks and not fwd.context.running_tokens_are_unified:
-        return False
-    md = fwd.attn_metadata
-    step = getattr(md, "step", None)
-    if step is None or getattr(md, "image_mask", None) is not None:
-        return False
-    return step.decode and step.running_tokens == rows
 
 
 class MonoDecodeModel(nn.Module):
@@ -253,8 +223,8 @@ def _install_layer_decode(
         atom_config.tensor_parallel_size,
         indexer_workspace=workspace,
     )
-    # Only the ordinary gfx950 route owns this hook. HI and gfx1250 return
-    # above. This branch installs the ordinary native-layer indexer hook.
+    # A successfully installed HI hook and gfx1250 return above. An auto HI
+    # install refusal reaches this ordinary route and follows its indexer flag.
     if standalone:
         from atom.models.deepseek_v41.mono.indexer_dispatch import MonoIndexerModel
 

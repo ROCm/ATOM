@@ -8,6 +8,8 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from atom.models.deepseek_v41.mono import decode_step
+
 pytest.importorskip("aiter")
 
 from atom.models.deepseek_v41.config import AttentionMode
@@ -237,7 +239,7 @@ def _context(monkeypatch, *, prefill=False, ubatch=None, **step_fields):
         ubatch_slices=ubatch,
         attn_metadata=SimpleNamespace(step=step, image_mask=None),
     )
-    monkeypatch.setattr(dispatch, "get_forward_context", lambda: fwd)
+    monkeypatch.setattr(decode_step, "get_forward_context", lambda: fwd)
     return fwd
 
 
@@ -280,10 +282,9 @@ def test_other_steps_keep_the_original_model(monkeypatch, tokens, kwargs):
 def test_the_target_is_routed_by_its_rows_alone(monkeypatch, tokens, routed):
     # a padded graph width: neither the scheduled request count nor how the rows
     # split into requests is read
-    monkeypatch.setattr(dispatch, "MAX_ROWS", 12)
     _context(monkeypatch, running_tokens=tokens, requests=[object()])
     ids = torch.zeros(tokens, dtype=torch.int64)
-    assert dispatch.step_supported(ids, None) is routed
+    assert dispatch.step_supported(ids, None, max_rows=12) is routed
 
 
 class _DraftRunner:

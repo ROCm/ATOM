@@ -7,10 +7,11 @@ import pytest
 
 pytest.importorskip("aiter")
 pytest.importorskip("flydsl")
+from atom.models.deepseek_v41.mono import indexer_build as build
 from atom.models.deepseek_v41.mono.kernels import indexer as kernel
 from atom.mono.runtime.compile import compile_only, launcher_resources
 
-BASE = kernel.IndexerBuild(8, 8320, fp4=True, mfma=False)
+BASE = build.IndexerBuild(8, 8320, fp4=True, mfma=False)
 OTHER = {
     "tokens": 16,
     "bound_max": 163968,
@@ -30,7 +31,7 @@ OTHER = {
 def _compile(key):
     fn = kernel.build_indexer(key)
     with compile_only():
-        fn(*kernel.ABI.zeros())
+        fn(*build.ABI.zeros())
     return fn
 
 
@@ -39,7 +40,7 @@ def _compile(key):
 )
 def test_full_tp_binary_has_no_private_scratch(monkeypatch, world, rows):
     monkeypatch.setenv("ARCH", "gfx950")
-    key = kernel.full_build(
+    key = build.full_build(
         dataclasses.replace(
             BASE, tokens=rows, bound_max=163968, mfma=True, world=world
         ),

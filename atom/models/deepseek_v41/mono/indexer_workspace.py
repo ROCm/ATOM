@@ -53,9 +53,7 @@ class IndexerWorkspace:
         self.iq = uncached_bytes(rows * ip.HEADS * ip.DIM // 2, dev).view(
             rows, ip.HEADS, ip.DIM // 2
         )
-        qs_tiles = ip.cdiv(ip.HEADS // 16, 4) * 4
-        qs_bytes = ip.DIM // 32 * 16 * qs_tiles
-        self.iqs = uncached_bytes(rows * qs_bytes, dev).view(rows, qs_bytes)
+        self.iqs = uncached_bytes(rows * ip.QS_BYTES, dev).view(rows, ip.QS_BYTES)
         self.iw = (
             uncached_bytes(rows * ip.HEADS * 4, dev)
             .view(torch.float32)

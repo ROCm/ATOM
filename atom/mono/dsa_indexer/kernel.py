@@ -69,7 +69,6 @@ from atom.mono.dsa_indexer.build import (
     TL_PASS0,
     IxBuild,
     dual_score_resources_fit,
-    short_decode_enabled,  # noqa: F401 - public compatibility export
     unfit,
 )
 from atom.mono.dsa_indexer.plan import (

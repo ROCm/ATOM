@@ -18,8 +18,6 @@ from atom.models.deepseek_v41.mono.kernels.attn_pre import (
 from atom.models.deepseek_v41.mono.kernels.index_query import (
     FP4_MIN_AMAX,
     IDX_WEIGHTS_SCALE,
-    QS_BYTES,
-    QS_M_TILES,
     _e2m1,
     _wv_reduce,
 )
@@ -166,9 +164,9 @@ def project_group(c, hidden, t0, n, h, group, parts, with_weight=True):
             bo.buffer_store(
                 fx.Int8(code),
                 rsrc(a["iqs_out"]),
-                tok * QS_BYTES
-                + (group * (width // 32) + rp // 16) * 16 * QS_M_TILES
-                + (h % 16) * QS_M_TILES
+                tok * ip.QS_BYTES
+                + (group * (width // 32) + rp // 16) * 16 * ip.QS_M_TILES
+                + (h % 16) * ip.QS_M_TILES
                 + h // 16,
             )
     if const_expr(with_weight):  # noqa: SIM102

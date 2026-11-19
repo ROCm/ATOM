@@ -36,6 +36,7 @@ from atom.models.deepseek_v41.config import AttentionMode
 from atom.models.deepseek_v41.dspark import DeepseekV41DSpark
 from atom.models.deepseek_v41.mono import index_plan as ip
 from atom.models.deepseek_v41.mono import index_tp_plan as itp
+from atom.models.deepseek_v41.mono import indexer_build as ib
 from atom.models.deepseek_v41.mono.check import (
     check_front,
     check_index_projections,
@@ -53,10 +54,6 @@ from atom.models.deepseek_v41.mono.kernels import indexer as ki
 from atom.models.deepseek_v41.mono.kernels import layer_post as k2
 from atom.models.deepseek_v41.mono.kernels import moe as k2b
 from atom.models.deepseek_v41.mono.kernels.dims import Dims
-from atom.models.deepseek_v41.mono.kernels.index_query import (
-    QS_BYTES,
-    QS_M_TILES,
-)
 from atom.models.deepseek_v41.mono.kernels.moe_shape import EXPERTS, TOPK
 from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_bytes, plain_layout
 from atom.models.deepseek_v41.mono.kernels.token_par import own_rows
@@ -325,7 +322,7 @@ class V41MonoDecodeRunner:
         if not self.index_fp4:
             return self.iq
         rows = self.iq.shape[0]
-        scales = self.iq_scale.view(rows, 1, 1, ip.DIM // 32, 16, QS_M_TILES)
+        scales = self.iq_scale.view(rows, 1, 1, ip.DIM // 32, 16, ip.QS_M_TILES)
         if self.index_layout == FP4_MFMA:
             # Debug/reference scorer only: K1 and K2 keep their query ABI.
             natural = scales[:, 0, 0, :, :, : ip.HEADS // 16].permute(0, 3, 2, 1)
@@ -460,13 +457,13 @@ class V41MonoDecodeRunner:
             else None
         )
         indexer_local = (
-            ki.build_indexer(ki.reindex_build(self._indexer_key(s)))
+            ki.build_indexer(ib.reindex_build(self._indexer_key(s)))
             if indexer is not None and self.indexer_has_reindex
             else None
         )
         indexer_full = (
             ki.build_indexer(
-                ki.full_build(self._indexer_key(s), self.indexer_full_ratio)
+                ib.full_build(self._indexer_key(s), self.indexer_full_ratio)
             )
             if indexer is not None and self.indexer_full_ratio is not None
             else None
@@ -512,7 +509,7 @@ class V41MonoDecodeRunner:
             if world > 1
             else 0
         )
-        return ki.IndexerBuild(
+        return ib.IndexerBuild(
             rows,
             self.index_bound_max,
             self.index_fp4,
@@ -527,11 +524,11 @@ class V41MonoDecodeRunner:
         """Every kernel of ``build``, each with its ABI."""
         kernels = [(launcher, k1.ABI) for launcher in build.launchers.values()]
         if build.indexer is not None:
-            kernels.append((build.indexer, ki.ABI))
+            kernels.append((build.indexer, ib.ABI))
         if build.indexer_local is not None:
-            kernels.append((build.indexer_local, ki.ABI))
+            kernels.append((build.indexer_local, ib.ABI))
         if build.indexer_full is not None:
-            kernels.append((build.indexer_full, ki.ABI))
+            kernels.append((build.indexer_full, ib.ABI))
         if build.layer_post is not None:
             return kernels + [(build.layer_post, k2.ABI)]
         return kernels + [(build.attn_post, k2a.ABI), (build.moe, k2b.ABI)]
@@ -619,13 +616,6 @@ class V41MonoDecodeRunner:
         # a scale a head, or E2M1 and E8M0s in the FP4 scorer's packed order
         # (its padding never written: zero, as ``pack_q_scales`` pads)
         heads, dim = config.index_n_heads, config.index_head_dim
-        if self.index_fp4:
-            self.iq = torch.empty(s, heads, dim // 2, device=dev, dtype=torch.uint8)
-            self.iq_scale = torch.zeros(s, QS_BYTES, device=dev, dtype=torch.uint8)
-        else:
-            self.iq = torch.empty(s, heads, dim, device=dev, dtype=torch.float8_e4m3fn)
-            self.iq_scale = torch.empty(s, heads, device=dev, dtype=f32)
-        self.iw = torch.empty(s, heads, device=dev, dtype=f32)
         if self.indexer_apart and workspace is not None:
             self.iq, self.iq_scale, self.iw = (
                 workspace.iq[:s],
@@ -633,11 +623,22 @@ class V41MonoDecodeRunner:
                 workspace.iw[:s],
             )
         elif self.indexer_apart:
-            # The standalone launch hands these rows between XCDs before the
-            # launch completes; use the same uncached memory as its mailboxes.
+            # These rows are handed across XCDs before the launch completes.
             self.iq = uncached_bytes(s * heads * dim // 2, dev).view(s, heads, dim // 2)
-            self.iq_scale = uncached_bytes(s * QS_BYTES, dev).view(s, QS_BYTES)
+            self.iq_scale = uncached_bytes(s * ip.QS_BYTES, dev).view(s, ip.QS_BYTES)
             self.iw = uncached_bytes(s * heads * 4, dev).view(f32).view(s, heads)
+        else:
+            if self.index_fp4:
+                self.iq = torch.empty(s, heads, dim // 2, device=dev, dtype=torch.uint8)
+                self.iq_scale = torch.zeros(
+                    s, ip.QS_BYTES, device=dev, dtype=torch.uint8
+                )
+            else:
+                self.iq = torch.empty(
+                    s, heads, dim, device=dev, dtype=torch.float8_e4m3fn
+                )
+                self.iq_scale = torch.empty(s, heads, device=dev, dtype=f32)
+            self.iw = torch.empty(s, heads, device=dev, dtype=f32)
         self.diag_off = -1
         post_key = self._post_key(s)
         key_a, key_b = post_key.halves()
@@ -659,21 +660,21 @@ class V41MonoDecodeRunner:
             self.full_index_scratch = workspace.full_scratch
         else:
             self.index_scratch = (
-                uncached_bytes(ki.scratch_bytes(self._indexer_key(s)), dev)
+                uncached_bytes(ib.scratch_bytes(self._indexer_key(s)), dev)
                 if self.indexer_apart and self.index_bound_max
                 else None
             )
             self.local_index_scratch = (
                 uncached_bytes(
-                    ki.scratch_bytes(ki.reindex_build(self._indexer_key(s))), dev
+                    ib.scratch_bytes(ib.reindex_build(self._indexer_key(s))), dev
                 )
                 if self.index_scratch is not None and self.indexer_has_reindex
                 else None
             )
             self.full_index_scratch = (
                 uncached_bytes(
-                    ki.scratch_bytes(
-                        ki.full_build(self._indexer_key(s), self.indexer_full_ratio)
+                    ib.scratch_bytes(
+                        ib.full_build(self._indexer_key(s), self.indexer_full_ratio)
                     ),
                     dev,
                 )
@@ -689,16 +690,16 @@ class V41MonoDecodeRunner:
         key = self._indexer_key(rows)
         builds = [
             (key, self.index_scratch),
-            (ki.reindex_build(key), self.local_index_scratch),
+            (ib.reindex_build(key), self.local_index_scratch),
         ]
         if self.full_index_scratch is not None:
             builds.append(
-                (ki.full_build(key, self.indexer_full_ratio), self.full_index_scratch)
+                (ib.full_build(key, self.indexer_full_ratio), self.full_index_scratch)
             )
         for build, scratch in builds:
             if scratch is None:
                 continue
-            for name, (off, size) in ki.scratch_layout(build).items():
+            for name, (off, size) in ib.scratch_layout(build).items():
                 if name == "ix_rowhist":
                     split_resets.append(scratch[off : off + size].view(torch.int32))
                 elif (
@@ -1030,7 +1031,7 @@ class V41MonoDecodeRunner:
             if local
             else self.full_index_scratch if full else self.index_scratch
         )
-        args = ki.ABI.pack(
+        args = ib.ABI.pack(
             {
                 **selection,
                 "hidden": p(self.normed),
