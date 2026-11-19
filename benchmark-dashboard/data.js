@@ -1,36 +1,8 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795047274018,
+  "lastUpdate": 1795057439899,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
-      {
-        "commit": {
-          "author": {
-            "name": "jasen",
-            "username": "Jasen2201",
-            "email": "38908462+Jasen2201@users.noreply.github.com"
-          },
-          "committer": {
-            "name": "jasen",
-            "username": "Jasen2201",
-            "email": "38908462+Jasen2201@users.noreply.github.com"
-          },
-          "id": "c127b008b2e429bf2334084e57ba1600c04d70b6",
-          "message": "ci(atomesh): sweep-only, re-extract crate sources when the node cache lost files\n\nOn g25 an extracted crate kept its .cargo-ok marker after its Cargo.toml\nwas removed from /tmp, so cargo failed with \"unable to get packages from\nsource\" and never re-extracted it. Drop registry/src and retry once.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
-          "timestamp": "2026-10-18T12:52:05Z",
-          "url": "https://github.com/ROCm/ATOM/commit/c127b008b2e429bf2334084e57ba1600c04d70b6"
-        },
-        "date": 1792331051075,
-        "tool": "customBiggerIsBetter",
-        "benches": [
-          {
-            "name": "Atomesh::Kimi-K3-MXFP4 mi355x_atomesh-atom_mxfp4_1p2d_tp8_dspark7 1048576/1024 c=4 perf point",
-            "value": 6.5021,
-            "unit": "point",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39126789934 | docker_image=rocm/atom-dev:nightly_202610151507 | precision=MXFP4 | display_topology=1P2D-TP8-DSPARK7 | perf_point=%7B%22backend%22%3A%22atomesh-atom%22%2C%22benchmark_kind%22%3A%22aiperf_agentic%22%2C%22cache_hit_rate%22%3A0.9712%2C%22cache_hit_tokens%22%3A74595584%2C%22cache_total_tokens%22%3A76805908%2C%22chart_group%22%3A%22atomesh-model-performance%22%2C%22chart_label%22%3A%22MI355X%20%28atomesh-atom%20MXFP4%29%22%2C%22client_bench%22%3A%22inferencemax%20bench%22%2C%22completed%22%3A457%2C%22concurrency%22%3A4%2C%22config_label%22%3A%22mi355x_atomesh-atom_mxfp4_1p2d_tp8_dspark7%22%2C%22decode_dcp%22%3A1%2C%22decode_dpa%22%3Afalse%2C%22decode_tp%22%3A8%2C%22decode_workers%22%3A2%2C%22disaggregated%22%3Atrue%2C%22duration%22%3A3604.3602%2C%22e2el_ms%22%3A9842.094%2C%22e2el_p90%22%3A27558.7676%2C%22e2el_p99%22%3A62614.0005%2C%22hardware%22%3A%22mi355x%22%2C%22image%22%3A%22rocm%2Fatom-dev%3Anightly_202610151507%22%2C%22input_tput%22%3A21309.1648%2C%22input_tput_per_gpu%22%3A887.8819%2C%22interactivity%22%3A50.2433%2C%22interactivity_method%22%3A%22p90_e2e_normalized%22%2C%22interactivity_n_requests%22%3A456%2C%22interactivity_p90_itl%22%3A121.4624%2C%22isl%22%3A1048576%2C%22itl_ms%22%3A6.9446%2C%22itl_p90%22%3A8.233%2C%22median_e2el_ms%22%3A3382.2679%2C%22median_itl_ms%22%3A7.1322%2C%22median_tpot_ms%22%3A7.1322%2C%22median_ttft_ms%22%3A1111.3005%2C%22model%22%3A%22Kimi-K3-MXFP4%22%2C%22num_decode_gpu%22%3A16%2C%22num_prefill_gpu%22%3A8%2C%22num_speculative_tokens%22%3A7%2C%22osl%22%3A1024%2C%22output_tput%22%3A156.0493%2C%22output_tput_per_gpu%22%3A6.5021%2C%22precision%22%3A%22mxfp4%22%2C%22prefill_dcp%22%3A1%2C%22prefill_dpa%22%3Afalse%2C%22prefill_tp%22%3A8%2C%22prefill_workers%22%3A1%2C%22public_dataset%22%3A%22semianalysis_cc_traces_weka_062126%22%2C%22ratio%22%3A0.8%2C%22req_tput%22%3A0.1259%2C%22rocm%22%3A%22%22%2C%22run_id%22%3A%22pd-atom-Kimi-K3-MXFP4-1p2d-isl1048576-osl1024-conc4-0.8%22%2C%22run_url%22%3A%22https%3A%2F%2Fgithub.com%2FROCm%2FATOM%2Factions%2Fruns%2F39126789934%22%2C%22scenario%22%3A%22inferencex-agentx-mvp%22%2C%22slurm_job%22%3A%22%22%2C%22source%22%3A%22ATOMesh%22%2C%22speculative_method%22%3A%22dspark-7%22%2C%22total_gpu%22%3A24%2C%22total_tput%22%3A21465.2141%2C%22tpot_ms%22%3A6.9446%2C%22tpot_p90%22%3A8.233%2C%22tpot_p99%22%3A8.9112%2C%22tput_per_gpu%22%3A894.3839%2C%22ttft_ms%22%3A1262.2508%2C%22ttft_p90%22%3A2014.6866%2C%22ttft_p99%22%3A4309.5334%7D"
-          }
-        ]
-      },
       {
         "commit": {
           "author": {
@@ -272815,6 +272787,255 @@ window.BENCHMARK_DATA = {
             "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=8 _tp",
             "value": 4,
             "unit": ""
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "wanzhenchn@gmail.com",
+            "name": "wanzhenchn",
+            "username": "wanzhenchn"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "adbf4e3b49e2a1fda53a1524edfa2f8e2d767ecd",
+          "message": "feat(mesh): KV events 4/5 — Mooncake Store sources from ATOM's offload report (#3340)\n\n* feat(mesh): KV events 2/5 — prefix index fed by the partition writers, cache_aware routes by it\n\n- kv_index: 64-shard open-addressing table of prefix hash -> lane mask, one lane per\n  rank; grows at 3/4 and shrinks below 1/4; SMG's XXH3 chained prefix hashes.\n- Per-rank holder tables: idempotent stores, parent required, 4M-block cap; a clear\n  or a seq gap removes only the rank's own entries.\n- One writer task per (model, pool, block size) on the monitor's thread, fed by a\n  bounded channel; a batch write-locks its shards once, in ascending order.\n- KvEventMonitor implements PrefixMatchProvider; AppContext hands it to every\n  cache_aware policy, which places requests with tokens by the cached share\n  (kv_affinity / kv_relocate) and leaves the rest to the tree.\n- wants_tokens: ingress tokenizes for such policies when it can.\n- /kv_events/sources gains indexed_blocks; drops gain unknown_parent and capacity.\n\n* fix(mesh): leave requests with media to the tree under KV events\n\nATOM keys every KV block of a media prompt by its media, so the router's tokens of\nsuch a request would score text-only blocks it cannot reuse. Ingress gives a policy\nthat only wants tokens none for a request with images, video, audio or embeddings.\n\n* feat(mesh): follow ATOM's KV event streams (--kv-events, /kv_events/sources)\n\nWith --kv-events, registering a worker reads its /kv_event_sources (ROCm/ATOM#3275)\nand follows each DP rank's ZMQ PUB stream with a pure-Rust zeromq SUB, on a\nthread of its own so that decoding never holds up the request path. Removing\nthe worker stops following it. GET /kv_events/sources shows each stream: whether\nit is connected, how far it can be trusted (seq admission), and what it carried.\n\n- kv_events::wire decodes ATOM's msgpack batches; only Device-tier events of the\n  full-attention group, in the source's block size and without a namespace, are\n  kept, the rest are counted by reason.\n- kv_events::rank_state admits batches by seq: a gap or a restart clears.\n- follow_kv_events / stop_following_kv_events run in the worker registration\n  and removal workflows.\n- tests/fixtures/kv_events/samples.jsonl holds payloads a real ATOM BlockManager\n  published; tests/test_kv_events_mesh_samples.py checks they still are.\n\n* fix(mesh): keep a rank's lane while it is followed; a stream that cannot start matches nothing\n\n* fix(mesh): start a rank over after a lost connection; decode only what 1/5 reads\n\n- A lost connection leaves the rank's holder stale: the next batch clears it and is\n  exact only from seq 1 or a clear, so an engine that restarted and resumed at the\n  seq that follows is not taken as in order.\n- Stored events carry only block hashes, the token count still checked; #3269 adds\n  each block's tokens and the parent where the index reads them.\n- KvEventMonitor::start() runs its one thread; detach returns nothing.\n- A worker that is not DP-aware is followed at its only rank, whatever its number.\n- Each rank of a DP-aware worker is tested followed at its own endpoint, and all of\n  them detached when the worker is removed.\n- The runtime's error is logged; the removal DAG shows stop_following_kv_events.\n\n* fix(mesh): encode as ATOM does and leave sub-threshold requests to the tree\n\n- Encode the KV index's tokens with the tokenizer's special tokens, as\n  ATOM's `tokenizer.encode(prompt)` stores the blocks; prefix_hash keeps\n  its encoding.\n- Warn once per model (at most 64) when the router cannot tokenize a\n  request for the index, and count it in\n  `mesh_kv_events_untokenized_total{reason}`.\n- At or below `cache_threshold`, leave the request to the tree, which\n  learns every placement.\n- A release that finds the writer's queue full waits on the partition's\n  runtime.\n- Tests: chat and completion e2e with a BOS tokenizer, the Wanted failure\n  path, media variants, and a tokenization cost bench.\n\n* ci(mesh): run the KV event tests in the mocker workflow\n\n* test(kv_index): size the benches from the environment; time applying blocks\n\n* feat(mesh): KV events 3/5 — replay, predictions and cached-token reconciliation\n\n- Replay a rank's missed batches from ATOM: `/kv_event_sources` reports\n  its replay endpoint, and the monitor asks it over DEALER for the\n  batches from the first missing seq, holding live ones meanwhile. A\n  lost connection starts the holder over, also during a replay. Batches\n  the engine no longer keeps are given up, the holder then partial.\n- Predict the caches of workers without exact KV events from the prompts\n  routed to them, in a second index per partition, written through the\n  partition's writer, each block until 120 s after it was last routed,\n  at most 4M blocks a worker.\n- `cache_aware` records every placement it makes with tokens; a match is\n  the more of a worker's events and its predictions.\n- Reconcile engine-reported cached tokens with the router's estimate\n  (from the closed #3296): `mesh_route_cache_tokens_total`,\n  `mesh_route_cache_estimate_tokens_total` and\n  `mesh_route_cache_estimate_error_ratio`; `kv_affinity` estimates its\n  match rate.\n\n* test(kv_events): bench decoding a decode and a prefill step's batch\n\n* test(kv_index): drop a cast clippy flags\n\n* test(kv_index): size the match_workers and predict benches from the environment\n\n* ci(mesh): run the ingress tests, which the library compiles, with the KV tests\n\n* feat(mesh): KV events 4/5 — Mooncake Store sources from ATOM's offload report\n\nATOM reports, with each rank's KV event source, the Mooncake Store it offloads\nto (masters, key namespace, chunk_tokens, world, min_load_tokens and the\nchain_check digest). The router makes one source per store a model's workers\nreport, read by those workers from registration to removal, checks that it\ncomputes ATOM's chunk digests, and shows every source at /kv_storage/sources\nwith each pool master's admin service asked whether it holds ATOM's taint key.\n\n* fix(mesh): bound the engine's offload report before reading its store\n\nchunk_tokens sizes what chain_check hashes, world and namespace the keys the\nrouter builds, and masters what /kv_storage/sources asks: a report with more\nthan 65536 tokens a chunk, a world outside 1..=1024, a namespace longer than\n128 bytes or more than 64 masters makes no source.\n\n* perf(kv_index): a walk never waits behind a waiting writer\n\n- The writer applies a batch sorted by shard, at most 512 ops per hold of\n  the shards they touch, and marks those still read as wanted. Walks give\n  them up every 16 blocks and take them again behind the writer, so a walk\n  waits for one hold, not for the walks under way, and the writer for the\n  walks' next 16 blocks.\n- A writer that kept a walk waiting pauses as long as it held the shards,\n  so that even a writer without pause leaves the walks half the time; one\n  writer at a time.\n- Benches: bench_writer_with_walkers also times the walks alone, and\n  KV_BENCH_WRITE_EVERY_US paces the writer. Test: walkers without pause\n  until two writers finish.\n\n* perf(kv_index): the writer hashes predictions; one walk of both indexes\n\n- `record` hands the prompt's tokens to the writer, which hashes them, so the request\n  copies 100k tokens instead of hashing them (79 -> 19 us); a 64 MB budget of queued\n  tokens bounds the writer's backlog.\n- Events and predictions both hold whole prefixes, so the walk of a partition looks a\n  block up in the predictions only for the workers whose events miss it, from where they\n  end: partial workers with predictions 205/249 -> 153/187 us p50/p99. Without\n  prediction lanes the walk is the events' alone.\n- `bench_predict_100k_tokens` times the request once the writer is done with the routing\n  before, as when it keeps up; test: predictions go on where the events end.\n\n* ci(mesh): run only the KV event tests in this PR's step\n\nThe other modules' filters come with the PRs that add or change them.\n\n* fix(kv_events): say when the engine has KV events off; a lost connection makes the rank partial\n\n- An engine that reports no sources has KV events off or a null publisher; the step says so instead of asking for a DP-aware registration.\n- A lost connection sets the rank's trust to partial at once, not at the next batch.\n- The first receive error is logged.\n- Docs say what the caller must do on ClearAndApply, and what resets, error and dropped_batches count; the README says that a worker not followed has no row.\n\n* ci(mesh): run the prefix index and routing tests in the KV step\n\n* docs(kv_events): the holder is what ClearAndApply clears\n\n* ci(mesh): run the observability tests in the KV step\n\n* ci(mesh): run the shared-store tests in the KV step\n\n* fix(kv_events): log a receive failure again after the stream recovers\n\n- A received message clears the flag, so each outage of a rank is logged.\n- An API test registers a worker whose engine has KV events off: not followed, no row.\n- The README names the engine's setting (ATOM_KV_EVENTS_ENABLE).\n\n* fix(mesh): tokens a P/D pair shares carry the special tokens when cache_aware wants them\n\nWith --kv-events, cache_aware matches the blocks ATOM stores, which start with the special tokens. A prefix_hash on the other side needs the tokens, which made them encoded without, so cache_aware never matched. prefix_hash only hashes them, so they are now encoded with the special tokens whenever a policy wants them. A test covers both orders of the pair with a BOS tokenizer, and prefix_hash's encoding without --kv-events.\n\n* test(mesh): register the BOS tokenizers at their file\n\nPreparation workers encode with copies they load from a tokenizer's\nsource. With a made-up source, each group tried to download it from the\nHugging Face Hub before falling back to the shared instance; in a full\nparallel run of api_tests that went past the 5 s prepare deadline, and\ncache_aware_places_requests_by_the_kv_event_index got a 504. Now the\ncopies load the file, as a registration's do, and both tests check that\nthey keep the BOS.\n\n* feat(mesh): KV events 2/5 — prefix index fed by the partition writers, cache_aware routes by it\n\n- kv_index: 64-shard open-addressing table of prefix hash -> lane mask, one lane per\n  rank; grows at 3/4 and shrinks below 1/4; SMG's XXH3 chained prefix hashes.\n- Per-rank holder tables: idempotent stores, parent required, 4M-block cap; a clear\n  or a seq gap removes only the rank's own entries.\n- One writer task per (model, pool, block size) on the monitor's thread, fed by a\n  bounded channel; a batch write-locks its shards once, in ascending order.\n- KvEventMonitor implements PrefixMatchProvider; AppContext hands it to every\n  cache_aware policy, which places requests with tokens by the cached share\n  (kv_affinity / kv_relocate) and leaves the rest to the tree.\n- wants_tokens: ingress tokenizes for such policies when it can.\n- /kv_events/sources gains indexed_blocks; drops gain unknown_parent and capacity.\n\n* fix(mesh): leave requests with media to the tree under KV events\n\nATOM keys every KV block of a media prompt by its media, so the router's tokens of\nsuch a request would score text-only blocks it cannot reuse. Ingress gives a policy\nthat only wants tokens none for a request with images, video, audio or embeddings.\n\n* fix(mesh): keep a rank's lane while it is followed; a stream that cannot start matches nothing\n\n* fix(mesh): encode as ATOM does and leave sub-threshold requests to the tree\n\n- Encode the KV index's tokens with the tokenizer's special tokens, as\n  ATOM's `tokenizer.encode(prompt)` stores the blocks; prefix_hash keeps\n  its encoding.\n- Warn once per model (at most 64) when the router cannot tokenize a\n  request for the index, and count it in\n  `mesh_kv_events_untokenized_total{reason}`.\n- At or below `cache_threshold`, leave the request to the tree, which\n  learns every placement.\n- A release that finds the writer's queue full waits on the partition's\n  runtime.\n- Tests: chat and completion e2e with a BOS tokenizer, the Wanted failure\n  path, media variants, and a tokenization cost bench.\n\n* test(kv_index): size the benches from the environment; time applying blocks\n\n* test(kv_index): drop a cast clippy flags\n\n* perf(kv_index): a walk never waits behind a waiting writer\n\n- The writer applies a batch sorted by shard, at most 512 ops per hold of\n  the shards they touch, and marks those still read as wanted. Walks give\n  them up every 16 blocks and take them again behind the writer, so a walk\n  waits for one hold, not for the walks under way, and the writer for the\n  walks' next 16 blocks.\n- A writer that kept a walk waiting pauses as long as it held the shards,\n  so that even a writer without pause leaves the walks half the time; one\n  writer at a time.\n- Benches: bench_writer_with_walkers also times the walks alone, and\n  KV_BENCH_WRITE_EVERY_US paces the writer. Test: walkers without pause\n  until two writers finish.\n\n* ci(mesh): run the prefix index and routing tests in the KV step\n\n* docs(kv_events): the holder is what ClearAndApply clears\n\n* fix(mesh): tokens a P/D pair shares carry the special tokens when cache_aware wants them\n\nWith --kv-events, cache_aware matches the blocks ATOM stores, which start with the special tokens. A prefix_hash on the other side needs the tokens, which made them encoded without, so cache_aware never matched. prefix_hash only hashes them, so they are now encoded with the special tokens whenever a policy wants them. A test covers both orders of the pair with a BOS tokenizer, and prefix_hash's encoding without --kv-events.\n\n* test(mesh): register the BOS tokenizers at their file\n\nPreparation workers encode with copies they load from a tokenizer's\nsource. With a made-up source, each group tried to download it from the\nHugging Face Hub before falling back to the shared instance; in a full\nparallel run of api_tests that went past the 5 s prepare deadline, and\ncache_aware_places_requests_by_the_kv_event_index got a 504. Now the\ncopies load the file, as a registration's do, and both tests check that\nthey keep the BOS.\n\n* fix(mesh): leave media to the tree with a P/D pair; index writer on its own thread\n\n- cache_aware leaves requests with media to the tree also when the other\n  policy of a P/D pair needs tokens: InferenceMetadata.carries_media goes\n  through RequestDescriptor to SelectWorkerInfo.\n- Messages and Responses, which have no token-routing template, are not\n  tokenized for cache_aware, so they no longer count as untokenized.\n- Each partition's writer runs on its own thread: its waits for walks and its\n  fairness pause no longer hold the monitor runtime's one thread, which reads\n  the ranks' sockets.\n- Tests: media in a P/D pair, a match rate at cache_threshold, imbalanced load\n  with an index set.\n- Docs: the ext-proc path tokenizes for cache_aware as the HTTP routers do.\n\n* docs(mesh): the KV index writer has a thread of its own\n\nThe monitor's module doc still put the writer on the monitor's threads.\nAlso test that a writer woken after its partition is gone ends.\n\n* mesh: count dropped predictions, make each predictor once, test replay exits\n\n- Predictor::record reports a prompt dropped while the writer is behind. The monitor counts mesh_kv_events_dropped_predictions_total{model, pool} and warns once per partition.\n- A worker's predictor lives from its registration (FollowKvEventsStep, attach) to its detach. It is made under the worker's map entry, so concurrent first routings make one, and a routing after detach makes none. Once the rank is followed, it moves to the rank's partition.\n- Tests: the replay deadline on paused time (tokio test-util, dev only); a connection lost mid-replay; a worker from registration to detach; the counter.\n\n* fix(mesh): register the dropped-predictions counter; warn on replay receive errors\n\n- names::KV_EVENTS_DROPPED_PREDICTIONS_TOTAL with a MetricSpec, so that\n  describe_all_metrics gives it HELP and TYPE; the counter uses it, and\n  docs/metrics.md lists it.\n- docs/metrics.md: the tree's estimate error comes from characters against\n  tokens in blocks; kv_affinity's from where the index is not the engine's\n  cache.\n- Rank::replay warns once per replay on a live-socket receive error, as the\n  follow loop does.\n- Docs: RankState::next is None after a lost connection or a restart; a\n  predicted block matches for up to TTL + TTL/8.\n\n* test(moe): set use_flydsl_herd on test_comm_fused_moe's hand-built Mxfp4MoEMethod\n\n#2713 has Mxfp4MoEMethod.apply() read use_flydsl_herd. The\n_mxfp4_method_with_recording_experts helper builds the method with\nobject.__new__ and sets apply()'s other flags itself, so it sets this one too,\nas test_mega_mxfp4_method and test_mxfp4_triton_moe_decode do.\n\n(cherry picked from commit cc1cb890aaf46671188087763d24a3a99d95fdce)\n\n* fix(kv_events): report the min load tokens the engine resolved\n\nSince #3097, OFFLOAD_MIN_LOAD_TOKENS is None unless it is set, and Config\nresolves it per tier into offload_min_load_tokens: 512 for a Mooncake Store.\nReporting the env var sent null, which the router's OffloadReport cannot\nparse, so the router dropped the worker's whole /kv_event_sources.\n\nReport the resolved value. Test the Store default and an explicit value, and\nrun the P/D side as a producer: validate_multi_config now refuses a consumer\nbeside an offload tier.\n\n(cherry picked from commit 429fd84b575e78adb167326e020b5ae255e200e3)\n\n* fix(kv_storage): share a store source only among readers that report it alike\n\nReaders of one model shared a source by namespace and masters alone, so the\nfirst reader's report stood for all of them: another reader's min_load_tokens\nwas lost, and its chain_check was never compared, whichever result it would\nhave had. A source is now shared only by readers whose whole report, masters\nsorted and deduplicated, is the same.\n\n* fix(kv_events): a rank reads no store its engine no longer reports\n\nRegistered again, as a DP-aware service restarted at its address is, a rank\nkept the store it had read when /kv_event_sources left out its offload, the\nrank, or every source. A successful answer now drops the store each of the\nworker's ranks read before reading what it reports; a failed fetch changes\nnothing.\n\n* refactor(kv_events): import the offload report only with events on\n\nEngines with KV events off no longer import the offload report and the Store\nmodules behind it. kv_storage's keys and mooncake modules are crate-private,\nand the docs say min_load_tokens is the threshold the engine resolved.\n\n* test(kv_events): an answer a worker cannot read leaves its store as it was\n\nA fetch of /kv_event_sources that fails is not an answer: the ranks keep reading the store they reported last. The test now waits for each registration to finish, so it also fails if the store is dropped before the fetch.\n\n---------\n\nCo-authored-by: cguo <cguo@amd.com>",
+          "timestamp": "2026-11-19T09:28:13+08:00",
+          "tree_id": "1de4777b2a6866b033a3757fb817c436090b070e",
+          "url": "https://github.com/ROCm/ATOM/commit/adbf4e3b49e2a1fda53a1524edfa2f8e2d767ecd"
+        },
+        "date": 1795057439166,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP accuracy (GSM8K)",
+            "value": 0.95,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44437144366 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: Same base model as DeepSeek-R1-0528 FP8 | Docker: rocm/atom-dev:nightly_202611181513 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9454 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP MTP acceptance (%)",
+            "value": 67.26,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44437144366 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: Same base model as DeepSeek-R1-0528 FP8 | Docker: rocm/atom-dev:nightly_202611181513 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9454 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP avg toks/fwd (tok/fwd)",
+            "value": 3.02,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-FP4 accuracy (GSM8K)",
+            "value": 0.9447,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44437144366 | Threshold: 0.93 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (deepseek-ai/DeepSeek-R1-0528 is natively FP8) | Docker: rocm/atom-dev:nightly_202611181513 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9416 | fewshot: 3 | Model: /models/amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-FP4 MTP accuracy (GSM8K)",
+            "value": 0.9424,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44437144366 | Threshold: 0.93 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (deepseek-ai/DeepSeek-R1-0528 is natively FP8) | Docker: rocm/atom-dev:nightly_202611181513 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9371 | fewshot: 3 | Model: /models/amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-FP4 MTP MTP acceptance (%)",
+            "value": 64.77,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44437144366 | Threshold: 0.93 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (deepseek-ai/DeepSeek-R1-0528 is natively FP8) | Docker: rocm/atom-dev:nightly_202611181513 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9371 | fewshot: 3 | Model: /models/amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-FP4 MTP avg toks/fwd (tok/fwd)",
+            "value": 2.94,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro accuracy (GSM8K)",
+            "value": 0.953,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44437144366 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Full-eval (1319 samples) 3-shot flexible-extract = 0.9522 ± 0.0059 | Docker: rocm/atom-dev:nightly_202611181513 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.953 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DSpark accuracy (GSM8K)",
+            "value": 0.9522,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44437144366 | Threshold: 0.93 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: DSpark spec-decode (7 tokens, dp-attention, TR_HYBRID cudagraph) on the DeepSeek-V4-Pro-DSpark checkpoint. Spec-decode is lossless w.r.t. the target, so baseline reuses the DeepSeek-V4-Pro FP8 base (0.96); threshold 0.93 leaves ~3pp headroom for spec-decode / dp-attention run-to-run variance. mtp_accept_threshold intentionally omitted until the first CI run reports the DSpark acceptance rate — add it once measured to guard draft-head regressions. | Docker: rocm/atom-dev:nightly_202611181513 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.953 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro-DSpark"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DSpark MTP acceptance (%)",
+            "value": 44.28,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44437144366 | Threshold: 0.93 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: DSpark spec-decode (7 tokens, dp-attention, TR_HYBRID cudagraph) on the DeepSeek-V4-Pro-DSpark checkpoint. Spec-decode is lossless w.r.t. the target, so baseline reuses the DeepSeek-V4-Pro FP8 base (0.96); threshold 0.93 leaves ~3pp headroom for spec-decode / dp-attention run-to-run variance. mtp_accept_threshold intentionally omitted until the first CI run reports the DSpark acceptance rate — add it once measured to guard draft-head regressions. | Docker: rocm/atom-dev:nightly_202611181513 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.953 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro-DSpark"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DSpark avg toks/fwd (tok/fwd)",
+            "value": 4.1,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4.1-Flash DSpark accuracy (GSM8K)",
+            "value": 0.9181,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44437144366 | Threshold: 0.91 | Baseline: 0.9224 | BaselineModel: deepseek-ai/DeepSeek-V4.1-Flash | BaselineNote: The V4.1 runtime rejects a KV cache other than bf16/fp8/fp4, an index plane other than fp8/fp4, and any DSpark that is not 5 tokens on a bf16 or fp8 cache (atom/models/deepseek_v41/config.py); the cache here is the MXFP8 pool (1.84x the rows of bf16) and the FP4 index plane. The baseline below was measured on the bf16 pool; the fp8 pool's full 3-shot runs since, 0.9174 / 0.9204 / 0.9212 flexible-extract at TP4 (the last two with mono decode), sit inside the same spread, so it stands for both. Nothing pins the compilation level or max-num-seqs, so this runs at the server's own defaults, level 3 and 512 sequences. The baseline below was measured at 512 but at level 0, because the development box resolves torch's Triton specialization hook to neither name it has been given: Inductor then drops a hand-written Triton kernel silently and the model emits repeated tokens out of whatever the allocator last held, which tests/test_triton_inductor_pairing.py states at the kernel level and is red there. That is a property of one torch/Triton pair, not of this model, so the first CI runs are what confirm the number at level 3 — until then read the baseline as level 0's. Baseline is the mean of three full 1319-question 3-shot runs on this branch, each on a fresh server: 0.9189 / 0.9212 / 0.9272 flexible-extract (strict within 0.0015 of flexible every time), mean 0.9224. Treat the 0.83pp they span as a lower bound on the noise, not the noise itself — an earlier build of this same branch gave 0.9143 / 0.9143 / 0.9151, three runs inside 0.08pp, and reading that as a variance would have been wrong. This model is known to depend on memory layout, and DSpark verifies every draft token against the target, so draft quality moves which batch shapes run rather than what the answer is. The 0.91 bar leaves 1.24pp; a single red is noise until a rerun agrees with it, and a real regression shows up as two. mtp_accept_threshold intentionally omitted until a CI run reports this model's DSpark acceptance rate. | Docker: rocm/atom-dev:nightly_202611181513 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9181 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4.1-Flash"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4.1-Flash DSpark MTP acceptance (%)",
+            "value": 49.17,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44437144366 | Threshold: 0.91 | Baseline: 0.9224 | BaselineModel: deepseek-ai/DeepSeek-V4.1-Flash | BaselineNote: The V4.1 runtime rejects a KV cache other than bf16/fp8/fp4, an index plane other than fp8/fp4, and any DSpark that is not 5 tokens on a bf16 or fp8 cache (atom/models/deepseek_v41/config.py); the cache here is the MXFP8 pool (1.84x the rows of bf16) and the FP4 index plane. The baseline below was measured on the bf16 pool; the fp8 pool's full 3-shot runs since, 0.9174 / 0.9204 / 0.9212 flexible-extract at TP4 (the last two with mono decode), sit inside the same spread, so it stands for both. Nothing pins the compilation level or max-num-seqs, so this runs at the server's own defaults, level 3 and 512 sequences. The baseline below was measured at 512 but at level 0, because the development box resolves torch's Triton specialization hook to neither name it has been given: Inductor then drops a hand-written Triton kernel silently and the model emits repeated tokens out of whatever the allocator last held, which tests/test_triton_inductor_pairing.py states at the kernel level and is red there. That is a property of one torch/Triton pair, not of this model, so the first CI runs are what confirm the number at level 3 — until then read the baseline as level 0's. Baseline is the mean of three full 1319-question 3-shot runs on this branch, each on a fresh server: 0.9189 / 0.9212 / 0.9272 flexible-extract (strict within 0.0015 of flexible every time), mean 0.9224. Treat the 0.83pp they span as a lower bound on the noise, not the noise itself — an earlier build of this same branch gave 0.9143 / 0.9143 / 0.9151, three runs inside 0.08pp, and reading that as a variance would have been wrong. This model is known to depend on memory layout, and DSpark verifies every draft token against the target, so draft quality moves which batch shapes run rather than what the answer is. The 0.91 bar leaves 1.24pp; a single red is noise until a rerun agrees with it, and a real regression shows up as two. mtp_accept_threshold intentionally omitted until a CI run reports this model's DSpark acceptance rate. | Docker: rocm/atom-dev:nightly_202611181513 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9181 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4.1-Flash"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4.1-Flash DSpark avg toks/fwd (tok/fwd)",
+            "value": 3.46,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOM::GLM-5.3-Flash-kpool-16shot accuracy (GSM8K)",
+            "value": 0.9666,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44437144366 | Threshold: 0.94 | Baseline: 0.9682 | BaselineModel: zai-org/GLM-5.3-Flash | BaselineNote: Guards the POOLED (kpool) indexer path. 16-shot prompts run 1939-3591 tokens (mean 2728), so all but one of the 1319 questions exceed index_topk=2048 and pooled scoring plus pooled top-k decide what the model attends to. The GLM-5.3-Flash entry above does NOT cover this: at or below index_topk the indexer selects every token, attention_mla runs dense, and the pooled selection is computed but never used -- a short-context score only shows the pooled writes did no harm. KV is fp8: aiter's bf16 MLA decode misreads KV past 4 GiB inside a layer (ROCm/ATOM#3120), which a long-running server reaches and a GSM8K run does not. fp8 measured 2026-11-10 with this exact command: flexible-extract 0.9682 and 0.9697 over two runs. bf16, measured 2026-08-28: flexible-extract=0.9659, strict-match=0.9666, matching the 0.9682/0.9689 of the dense 3-shot entry within run-to-run spread (two runs of identical code disagree on ~28 of 1319 questions in each direction). Needs --max-model-len 8192, not 4096: lm_eval samples its shots at random, the longest prompt is 3591 tokens, and 3591 + max_gen_toks 512 overflows a 4096 cap -- 4 requests then 400 and lm_eval aborts the whole eval after its retries. The short-context GLM-5.3-Flash entry (max-model-len 2048, 3-shot) was removed in favour of this one: below index_topk the indexer selects every token and attention_mla runs dense, so that entry exercised a strict subset of this path while costing a second 8-GPU nightly. Threshold stays at 0.94. This entry is test_level pr, so every unrelated PR runs it on 8 GPUs; repeat bf16 runs of IDENTICAL code have landed at 0.9613/0.9629/0.9644/0.9659, so a 0.96 threshold is cleared by 0.0013 in the worst case and would fail roughly one PR in four on unchanged code -- a gate that flaky trains people to re-run until green and stops carrying information. Baseline is 0.9682, the lower of the two fp8 runs. | Docker: rocm/atom-dev:nightly_202611181513 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9674 | fewshot: 16 | Model: /models/zai-org/GLM-5.3-Flash"
+          },
+          {
+            "name": "ATOM::Kimi-K3 accuracy (GSM8K)",
+            "value": 0.9666,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44437144366 | Threshold: 0.94 | Baseline: 0.95 | BaselineModel: moonshotai/Kimi-K3 | BaselineNote: Kimi-K3 (kimi_linear KDA+MLA, MXFP4 MoE) native ATOM FP8 kv-cache, TP8 (GSM8K 3-shot flexible-extract). Baseline 0.95; threshold 0.94 leaves ~1pp headroom. Refresh after the first CI run. | Docker: rocm/atom-dev:nightly_202611181513 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9666 | fewshot: 3 | Model: /models/moonshotai/Kimi-K3"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark accuracy (GSM8K)",
+            "value": 0.9644,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44437144366 | Threshold: 0.94 | Baseline: 0.95 | BaselineModel: moonshotai/Kimi-K3 + Inferact/Kimi-K3-DSpark | BaselineNote: Kimi-K3 DSpark block spec-decode (7 tokens) on the Kimi-K3 target with the Inferact/Kimi-K3-DSpark draft. Spec-decode is lossless w.r.t. the target, so baseline reuses the Kimi-K3 FP8 base (0.95); threshold 0.94 matches the target. mtp_accept_threshold intentionally omitted until the first CI run reports the DSpark acceptance rate -- add it once measured. | Docker: rocm/atom-dev:nightly_202611181513 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9644 | fewshot: 3 | Model: /models/moonshotai/Kimi-K3"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark MTP acceptance (%)",
+            "value": 51.63,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44437144366 | Threshold: 0.94 | Baseline: 0.95 | BaselineModel: moonshotai/Kimi-K3 + Inferact/Kimi-K3-DSpark | BaselineNote: Kimi-K3 DSpark block spec-decode (7 tokens) on the Kimi-K3 target with the Inferact/Kimi-K3-DSpark draft. Spec-decode is lossless w.r.t. the target, so baseline reuses the Kimi-K3 FP8 base (0.95); threshold 0.94 matches the target. mtp_accept_threshold intentionally omitted until the first CI run reports the DSpark acceptance rate -- add it once measured. | Docker: rocm/atom-dev:nightly_202611181513 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9644 | fewshot: 3 | Model: /models/moonshotai/Kimi-K3"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark avg toks/fwd (tok/fwd)",
+            "value": 4.61,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark PP2 accuracy (GSM8K)",
+            "value": 0.9644,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44437144366 | Threshold: 0.94 | Baseline: 0.95 | BaselineModel: moonshotai/Kimi-K3 + Inferact/Kimi-K3-DSpark | BaselineNote: The only pipeline-parallel accuracy case: Kimi-K3 pp2 x tp4 with DSpark (7 tokens) and prefix caching on, which together exercise the PP-only paths -- the undeferred verify window, the cross-stage aux relay, the checkpoint hold and a KDA state fork landing on a verify step. Eager because PP decode has no CUDA graphs yet, hence the longer timeout. ptpc_fp8 online quant on the target only, as the Kimi-K3 TP8 case runs it (that case has no drafter); \"context_proj\" and \"layers\" (the draft's unprefixed module names, which no target module matches) keep the DSpark draft in BF16 as the Kimi-K3 DSpark TP8 case runs it. Spec decode is lossless, so baseline and threshold match Kimi-K3. | Docker: rocm/atom-dev:nightly_202611181513 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9644 | fewshot: 3 | Model: /models/moonshotai/Kimi-K3"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark PP2 MTP acceptance (%)",
+            "value": 51.59,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44437144366 | Threshold: 0.94 | Baseline: 0.95 | BaselineModel: moonshotai/Kimi-K3 + Inferact/Kimi-K3-DSpark | BaselineNote: The only pipeline-parallel accuracy case: Kimi-K3 pp2 x tp4 with DSpark (7 tokens) and prefix caching on, which together exercise the PP-only paths -- the undeferred verify window, the cross-stage aux relay, the checkpoint hold and a KDA state fork landing on a verify step. Eager because PP decode has no CUDA graphs yet, hence the longer timeout. ptpc_fp8 online quant on the target only, as the Kimi-K3 TP8 case runs it (that case has no drafter); \"context_proj\" and \"layers\" (the draft's unprefixed module names, which no target module matches) keep the DSpark draft in BF16 as the Kimi-K3 DSpark TP8 case runs it. Spec decode is lossless, so baseline and threshold match Kimi-K3. | Docker: rocm/atom-dev:nightly_202611181513 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9644 | fewshot: 3 | Model: /models/moonshotai/Kimi-K3"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark PP2 avg toks/fwd (tok/fwd)",
+            "value": 4.61,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOM::Kimi-K3.1-Pro accuracy (GSM8K)",
+            "value": 0.9712,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44437144366 | Threshold: 0.96 | Baseline: 0.97 | BaselineModel: moonshotai/Kimi-K3.1-Pro | BaselineNote: Kimi-K3.1-Pro, TP8 DCP8, BF16 MLA KV, FP8 index cache, mono decode on, at the server's default compilation level and graph mode. Measured GSM8K 5-shot flexible-extract 0.9765 / 0.9757 on MI355X with the recipes/Kimi-K3.1.md launch (which also pins level 0, FULL graphs, 2048 batched tokens, 0.85 memory and AITER_CUSTOM_AR_MAX_SIZE); CI runs 3-shot at the defaults, so baseline 0.97 and threshold 0.96 until the first CI run reports its own value. | Docker: rocm/atom-dev:nightly_202611181513 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9712 | fewshot: 3 | Model: /models/moonshotai/Kimi-K3.1-Pro"
+          },
+          {
+            "name": "ATOM::Kimi-K3.1-Pro DSpark accuracy (GSM8K)",
+            "value": 0.9727,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44437144366 | Threshold: 0.96 | Baseline: 0.97 | BaselineModel: moonshotai/Kimi-K3.1-Pro + Inferact/Kimi-K3.1-DSpark | BaselineNote: Kimi-K3.1-Pro with the Inferact/Kimi-K3.1-DSpark draft (7 tokens; ReplaySSM is on by default with speculative decoding). Measured GSM8K 5-shot flexible-extract 0.9742 / 0.9735 on MI355X (with level 0, FULL graphs and AITER_CUSTOM_AR_MAX_SIZE, which CI leaves at their defaults); spec-decode is lossless w.r.t. the target, so it shares the target's baseline and threshold. Acceptance over that run 31.3% (3.19 tokens a forward); mtp_accept_threshold 0.25 catches a broken draft, which GSM8K alone cannot. | Docker: rocm/atom-dev:nightly_202611181513 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9719 | fewshot: 3 | Model: /models/moonshotai/Kimi-K3.1-Pro"
+          },
+          {
+            "name": "ATOM::Kimi-K3.1-Pro DSpark MTP acceptance (%)",
+            "value": 45.7,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44437144366 | Threshold: 0.96 | Baseline: 0.97 | BaselineModel: moonshotai/Kimi-K3.1-Pro + Inferact/Kimi-K3.1-DSpark | BaselineNote: Kimi-K3.1-Pro with the Inferact/Kimi-K3.1-DSpark draft (7 tokens; ReplaySSM is on by default with speculative decoding). Measured GSM8K 5-shot flexible-extract 0.9742 / 0.9735 on MI355X (with level 0, FULL graphs and AITER_CUSTOM_AR_MAX_SIZE, which CI leaves at their defaults); spec-decode is lossless w.r.t. the target, so it shares the target's baseline and threshold. Acceptance over that run 31.3% (3.19 tokens a forward); mtp_accept_threshold 0.25 catches a broken draft, which GSM8K alone cannot. | Docker: rocm/atom-dev:nightly_202611181513 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9719 | fewshot: 3 | Model: /models/moonshotai/Kimi-K3.1-Pro"
+          },
+          {
+            "name": "ATOM::Kimi-K3.1-Pro DSpark avg toks/fwd (tok/fwd)",
+            "value": 4.2,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4-Preview accuracy (GSM8K)",
+            "value": 0.9052,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44437144366 | Threshold: 0.88 | Baseline: 0.9 | BaselineModel: meta-llama/Llama-3.3-70B-Instruct | BaselineNote: HF page inaccessible; needs CI measurement of baseline | Docker: rocm/atom-dev:nightly_202611181513 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.6164 | fewshot: 3 | Model: /models/amd/Llama-3.3-70B-Instruct-MXFP4-Preview"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 accuracy (GSM8K)",
+            "value": 0.9416,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44437144366 | Threshold: 0.93 | Baseline: 0.9363 | BaselineModel: amd/MiniMax-M3-MXFP4 | BaselineNote: FP4 M3 tp8. GSM8K 5-shot chat (apply_chat_template + fewshot_as_multiturn, num_concurrent=32, max_gen_toks=16384) | Docker: rocm/atom-dev:nightly_202611181513 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9416 | fewshot: 5 | Model: /models/amd/MiniMax-M3-MXFP4"
+          },
+          {
+            "name": "ATOM::Qwen3-235B-A22B-Instruct-2507-FP8 accuracy (GSM8K)",
+            "value": 0.9067,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44437144366 | Threshold: 0.87 | Baseline: 0.909 | BaselineModel: Qwen/Qwen3-235B-A22B-Instruct-2507 | BaselineNote: HF: amd/Qwen3-235B-A22B-Instruct-2507-MXFP4 card shows baseline=0.909 | Docker: rocm/atom-dev:nightly_202611181513 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.8908 | fewshot: 3 | Model: /models/Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"
+          },
+          {
+            "name": "ATOM::Qwen3-Next-80B-A3B-Thinking accuracy (GSM8K)",
+            "value": 0.6816,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44437144366 | Threshold: 0.65 | Baseline: 0.69 | BaselineModel: Qwen/Qwen3-Next-80B-A3B-Thinking | BaselineNote: No public GSM8K baseline; HF card has no GSM8K | Docker: rocm/atom-dev:nightly_202611181513 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.7991 | fewshot: 3 | Model: /models/Qwen/Qwen3-Next-80B-A3B-Thinking"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP accuracy (GSM8K)",
+            "value": 0.8719,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44437144366 | Threshold: 0.85 | Baseline: 0.9538 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: Same base model as Qwen3.5-397B-A17B-FP8; MTP3 | Docker: rocm/atom-dev:nightly_202611181513 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.8582 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B-FP8"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP MTP acceptance (%)",
+            "value": 84.99,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44437144366 | Threshold: 0.85 | Baseline: 0.9538 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: Same base model as Qwen3.5-397B-A17B-FP8; MTP3 | Docker: rocm/atom-dev:nightly_202611181513 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.8582 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B-FP8"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP avg toks/fwd (tok/fwd)",
+            "value": 3.55,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 accuracy (GSM8K)",
+            "value": 0.8597,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44437144366 | Threshold: 0.835 | Baseline: 0.9538 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: CI baseline=0.8605. HF card reports 0.9538 but uses chat API with reasoning_parser | Docker: rocm/atom-dev:nightly_202611181513 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.8438 | fewshot: 3 | Model: /models/amd/Qwen3.5-397B-A17B-MXFP4"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 MTP accuracy (GSM8K)",
+            "value": 0.8575,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44437144366 | Threshold: 0.835 | Baseline: 0.9538 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: CI baseline=0.8605. HF card reports 0.9538 but uses chat API with reasoning_parser | Docker: rocm/atom-dev:nightly_202611181513 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.8393 | fewshot: 3 | Model: /models/amd/Qwen3.5-397B-A17B-MXFP4"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 MTP MTP acceptance (%)",
+            "value": 85.2,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44437144366 | Threshold: 0.835 | Baseline: 0.9538 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: CI baseline=0.8605. HF card reports 0.9538 but uses chat API with reasoning_parser | Docker: rocm/atom-dev:nightly_202611181513 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.8393 | fewshot: 3 | Model: /models/amd/Qwen3.5-397B-A17B-MXFP4"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 MTP avg toks/fwd (tok/fwd)",
+            "value": 3.56,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8961,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44437144366 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611181513 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1319 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b (2 GPUs) accuracy (GSM8K)",
+            "value": 0.8893,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44437144366 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611181513 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1736 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
