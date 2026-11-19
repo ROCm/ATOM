@@ -538,7 +538,9 @@ class PagedAttentionImpl(nn.Module):
         """
         q_aiter = self._aiter_gemma_norm_rope(qkv, position)
         if q_aiter is not None:
-            # k is the caller's torch.split view of qkv, roped in place by aiter
+            # k is the caller's torch.split view of qkv, roped in place by aiter.
+            # Unlike DualRMSNorm's k it is strided, so the bf16 D128 gfx1250 ASM
+            # varlen prefill copies it contiguous; the op has no k output to avoid it.
             q = q_aiter
         else:
             from atom.model_ops.layernorm import DualRMSNorm
