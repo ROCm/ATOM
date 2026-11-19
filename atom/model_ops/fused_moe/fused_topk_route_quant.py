@@ -27,10 +27,33 @@ from atom.utils import envs
 # (prefill) take aiter's prefill kernel where it has one.
 _MAX_ROWS = 512
 
+# ATOM_FOLD_TOPK_ROUTER: the routing the router kernel computed for the next MoE
+# call, keyed by its router logits: (logits, geometry, routed, num_valid_rows).
+_PREPARED: list = []
+
+
+def set_prepared_routing(logits, geometry, routed, num_valid_rows) -> None:
+    """Hand the next `try_defer_topk_route_quant` on `logits` the top-k, routing
+    and activation quant the folded router kernel already computed."""
+    _PREPARED.clear()
+    _PREPARED.append((logits, geometry, routed, num_valid_rows))
+
+
+def _take_prepared(logits):
+    if not _PREPARED:
+        return None
+    p = _PREPARED.pop()
+    if p[0].data_ptr() != logits.data_ptr() or p[0].shape[0] != logits.shape[0]:
+        return None
+    return p
+
 
 def try_defer_topk_route_quant(method, layer, x, logits):
     """`(topk_weights, topk_ids)` left for aiter's grouped MoE to fill, or None
     to route as usual."""
+    # ATOM_FOLD_TOPK_ROUTER: a routing prepared for these logits is consumed here
+    # either way, so it never outlives this call.
+    prepared = _take_prepared(logits)
     if not envs.ATOM_MOE_FUSED_TOPK_ROUTE_QUANT:
         return None
     try:
@@ -99,9 +122,22 @@ def try_defer_topk_route_quant(method, layer, x, logits):
     ):
         return None
     n = logits.shape[0]
+    nvr = pass_scheduled_tokens_gpu(n)
+    if (
+        prepared is not None
+        and layer.top_k == 8
+        and (prepared[3] is None) == (nvr is None)
+        and (nvr is None or prepared[3].data_ptr() == nvr.data_ptr())
+    ):
+        _, geometry, routed, pnvr = prepared
+        weights, ids = routed[0], routed[1]
+        defer_topk_softmax(
+            weights, ids, logits, True, nvr, prepared=(geometry, routed, pnvr)
+        )
+        return weights, ids
     weights = torch.empty((n, layer.top_k), dtype=torch.float32, device=x.device)
     ids = torch.empty((n, layer.top_k), dtype=torch.int32, device=x.device)
-    defer_topk_softmax(weights, ids, logits, True, pass_scheduled_tokens_gpu(n))
+    defer_topk_softmax(weights, ids, logits, True, nvr)
     return weights, ids
 
 

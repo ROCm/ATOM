@@ -565,6 +565,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FUSED_ROUTER_SHARED_EXPERT": lambda: (
         os.getenv("ATOM_FUSED_ROUTER_SHARED_EXPERT", "0") == "1"
     ),
+    # ATOM_FOLD_TOPK_ROUTER (with ATOM_FUSED_ROUTER_SHARED_EXPERT and
+    # ATOM_MOE_FUSED_TOPK_ROUTE_QUANT): at decode sizes (<= 16 rows) the router +
+    # shared expert kernel also computes the MoE top-k, routing and MXFP4
+    # activation quant (aiter's fused_gemm_a16w16_router_shared_expert_topk), so
+    # the grouped MoE skips its moe_topk_route_quant launch. Bitwise the same.
+    "ATOM_FOLD_TOPK_ROUTER": lambda: (
+        os.getenv("ATOM_FOLD_TOPK_ROUTER", "0") == "1"
+    ),
     "ATOM_FUSED_ROUTER_SHARED_EXPERT_MAX_TOKENS": lambda: int(
         os.getenv("ATOM_FUSED_ROUTER_SHARED_EXPERT_MAX_TOKENS", "512")
     ),

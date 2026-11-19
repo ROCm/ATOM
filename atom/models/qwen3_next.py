@@ -449,6 +449,10 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             return None
         w_router = self.gate.weight
         padded = self._router_weight_padded()
+        if envs.ATOM_FOLD_TOPK_ROUTER:
+            folded = self._fold_topk_router(hidden_states, padded, w_router.shape[0])
+            if folded is not None:
+                return folded
         return router_shared_expert(
             hidden_states,
             padded,
@@ -457,6 +461,64 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             mlp.down_proj.weight,
             prefill=m > envs.ATOM_FUSED_ROUTER_SHARED_EXPERT_MAX_TOKENS,
         )
+
+    def _fold_topk_router(
+        self, hidden_states: torch.Tensor, w_router_padded: torch.Tensor, n_router: int
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """ATOM_FOLD_TOPK_ROUTER: (router logits, shared expert output) from the
+        router + shared expert kernel that also computes this block's MoE top-k,
+        routing and MXFP4 activation quant, handed to the experts' deferred top-k
+        (the grouped MoE then skips moe_topk_route_quant). None where it does not
+        apply: then the plain kernel runs, and the routing as usual. The geometry
+        of the routing is aiter's, learned from an unfused call at this row count
+        (the first layer of the first step at it, e.g. the warmup)."""
+        try:
+            from aiter.ops.flydsl.grouped_moe_gfx1250 import (
+                topk_route_quant_decode_geometry,
+            )
+            from aiter.ops.triton.gemm.fused.fused_gemm_a16w16_router_shared_expert_topk import (
+                fused_gemm_a16w16_router_shared_expert_topk,
+                fused_gemm_a16w16_router_shared_expert_topk_supported,
+            )
+        except ImportError:
+            return None
+        from atom.model_ops.fused_moe.fused_topk_route_quant import (
+            set_prepared_routing,
+        )
+        from atom.utils.forward_context import pass_scheduled_tokens_gpu
+
+        m, k = hidden_states.shape
+        if (
+            not envs.ATOM_MOE_FUSED_TOPK_ROUTE_QUANT
+            or self.is_rocm_aiter_fusion_shared_expert_enabled
+            or self.n_routed_experts != 256
+        ):
+            return None
+        geometry = topk_route_quant_decode_geometry(m, k, 8)
+        mlp = self.shared_expert
+        if geometry is None or not fused_gemm_a16w16_router_shared_expert_topk_supported(
+            hidden_states,
+            w_router_padded,
+            mlp.gate_up_proj.weight,
+            mlp.down_proj.weight,
+            n_router,
+            geometry[0],
+        ):
+            return None
+        nvr = pass_scheduled_tokens_gpu(m)
+        logits, shared, routed = fused_gemm_a16w16_router_shared_expert_topk(
+            hidden_states,
+            w_router_padded,
+            mlp.gate_up_proj.weight,
+            mlp.down_proj.weight,
+            n_router,
+            align_m=geometry[0],
+            contiguous_m=geometry[1],
+            wmma_rep=geometry[2],
+            num_valid_rows=nvr,
+        )
+        set_prepared_routing(logits, geometry, routed, nvr)
+        return logits, shared
 
     def combine_tail_forward(
         self, hidden_states: torch.Tensor, residual: torch.Tensor
