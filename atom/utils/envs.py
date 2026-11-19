@@ -195,6 +195,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KV_OFFLOAD_EXTRA_CONFIG": lambda: os.getenv(
         "ATOM_KV_OFFLOAD_EXTRA_CONFIG", ""
     ),
+    # Prefill: the mooncake_store keeps a sliding-window DSpark draft's rows only
+    # for each prompt's read window, as objects of their own. Opt-in.
+    "ATOM_MOONCAKE_STORE_DRAFT_WINDOW": lambda: _flag_env(
+        "ATOM_MOONCAKE_STORE_DRAFT_WINDOW"
+    ),
     # --- Data Parallelism ---
     "ATOM_DP_RANK": lambda: int(os.getenv("ATOM_DP_RANK", "0")),
     "ATOM_DP_RANK_LOCAL": lambda: int(os.getenv("ATOM_DP_RANK_LOCAL", "0")),

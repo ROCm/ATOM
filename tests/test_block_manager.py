@@ -11,6 +11,7 @@ from conftest import MockConfig
 from atom.model_engine import block_manager as bm_module
 from atom.model_engine import state_offload as so
 from atom.model_engine.block_manager import BlockManager
+from atom.model_engine.block_pool import BlockPool
 
 # ── compute_hash ───────────────────────────────────────────────────────────
 
@@ -1443,3 +1444,218 @@ class TestStateTierVerifyWindow:
         assert bm._joint_chunk_tokens == 0
         assert bm.state_offload.verified_for_s == so.tier_verified_for_s(0)
         assert sum(r.exc_info is not None for r in caplog.records) == 1
+
+
+# ── draft rows a tier load left unwritten (Block.draft_rows_missing) ───────
+
+
+def _draft_bm(blocks=40, window=8, page=2):
+    """Blocks of 4 tokens; the draft reads 8 keys back from 2-token pages."""
+    from atom.spec_decode.draft_window_geometry import DraftReadWindow
+
+    bm = BlockManager(
+        MockConfig(
+            num_kvcache_blocks=blocks, kv_cache_block_size=4, enable_prefix_caching=True
+        )
+    )
+    bm.draft_read_window = DraftReadWindow(window=window, read_page=page)
+    return bm
+
+
+def _marked(bm, seq):
+    return [bm.kv.block(b).draft_rows_missing for b in seq.block_table]
+
+
+def _computed(bm, seq):
+    """Admit `seq` and publish its prompt as a forward would."""
+    bm.allocate(seq, bm.can_allocate(seq))
+    bm.hash_blocks(seq, seq.num_prompt_tokens - seq.num_cached_tokens)
+    return seq
+
+
+def test_draft_read_window_follows_the_m3_draft_config(seq_factory):
+    from atom.spec_decode.draft_window_geometry import draft_read_window
+
+    draft = SimpleNamespace(
+        architectures=["DSparkMiniMaxDraftModel"], model_type="minimax_m3"
+    )
+    spec = SimpleNamespace(method="dspark", draft_model_hf_config=draft)
+    draft.sliding_window = 4096
+    window = draft_read_window(SimpleNamespace(speculative_config=spec))
+    assert (window.window, window.read_page) == (4096, 16)
+    # A row at 8192 reads from the page holding 4097: R(8191) is 4096.
+    assert window.first_read_token(8191) == 4096
+    assert window.first_read_token(4095) == 0
+    draft.sliding_window = 0
+    assert draft_read_window(SimpleNamespace(speculative_config=spec)) is None
+    assert BlockManager(MockConfig()).draft_read_window is None
+
+
+def test_loaded_prefix_marks_blocks_below_the_draft_start(seq_factory):
+    bm = _draft_bm()
+    seq = seq_factory(list(range(24)))
+    bm.allocate(seq)
+    assert bm.publish_loaded_prefix(seq, 0, 16, draft_start=8) == 16
+    assert _marked(bm, seq) == [True, True, False, False, False, False]
+    assert bm.draft_marked_blocks == 2
+    # No draft start: the load wrote every draft row.
+    other = seq_factory(list(range(100, 124)))
+    bm.allocate(other)
+    bm.publish_loaded_prefix(other, 0, 16)
+    assert not any(_marked(bm, other))
+    # Marked whether or not the prefix is indexed.
+    plain = BlockManager(MockConfig(num_kvcache_blocks=8, kv_cache_block_size=4))
+    seq = seq_factory(list(range(16)))
+    plain.allocate(seq)
+    assert plain.publish_loaded_prefix(seq, 0, 16, draft_start=16) == 0
+    assert all(_marked(plain, seq))
+    # V: tokens up to the end of the highest marked block.
+    assert bm.draft_rows_from(other) == 0
+    assert plain.draft_rows_from(seq) == 16
+
+
+def test_hbm_hit_is_cut_at_a_marked_block_in_the_window(seq_factory):
+    bm = _draft_bm()
+    loaded = seq_factory(list(range(24)))
+    bm.allocate(loaded)
+    bm.publish_loaded_prefix(loaded, 0, 24, draft_start=8)  # blocks 0-1 marked
+    marked = loaded.block_table[1]
+    bm.deallocate(loaded)
+    # A next turn reads draft rows from 20 (block 5): the marks lie below it.
+    turn = seq_factory(list(range(24)) + [90, 91, 92, 93])
+    assert bm.can_allocate(turn) == 6
+    # A short fork reads from 6 (block 1), a marked block: the hit stops there.
+    fork = seq_factory(list(range(12)) + [90, 91])
+    assert bm.can_allocate(fork) == 1
+    assert bm.allocate(fork, 1)
+    assert fork.num_cached_tokens == 4
+    assert marked not in fork.block_table and bm.kv.block(marked).ref_count == 0
+    assert (bm.hbm_draft_gate_cuts, bm.hbm_draft_gate_cut_tokens) == (1, 8)
+    bm.deallocate(fork)
+
+    # `allocate` gates again: a hash re-pointed to a marked copy after the probe.
+    probe = seq_factory(list(range(12)) + [70, 71, 72, 73])
+    hit = bm.can_allocate(probe)
+    assert hit == 3
+    stale = seq_factory(list(range(12)) + [60])
+    bm.allocate(stale)
+    bm.publish_loaded_prefix(stale, 0, 12, draft_start=12)
+    copy = bm.kv.block(stale.block_table[2])
+    bm.kv.publish(stale.block_table[2], copy.hash, copy.token_ids)
+    assert bm.allocate(probe, hit)
+    # Claims stop at the cut, so the forward writes no shared block.
+    assert probe.num_cached_tokens == 8
+    assert probe.block_table[2] != stale.block_table[2]
+    assert bm.kv.block(probe.block_table[2]).hash == -1
+    assert bm.hbm_draft_gate_cuts == 2
+
+
+def test_a_marked_block_below_the_window_is_kept(seq_factory):
+    bm = _draft_bm()
+    loaded = seq_factory(list(range(40)))
+    bm.allocate(loaded)
+    bm.publish_loaded_prefix(loaded, 0, 40, draft_start=16)  # blocks 0-3 marked
+    bm.deallocate(loaded)
+    # Reads draft rows from 34 (block 8): every marked block lies below it.
+    later = seq_factory(list(range(40)) + [90])
+    assert bm.can_allocate(later) == 10
+    assert bm.allocate(later, 10)
+    assert later.num_cached_tokens == 40
+    assert bm.hbm_draft_gate_cuts == 0
+
+
+def test_recomputed_or_loaded_unmarked_block_replaces_a_marked_canonical(
+    seq_factory,
+):
+    bm = _draft_bm()
+    first = seq_factory(list(range(16)) + [1])
+    bm.allocate(first)
+    bm.publish_loaded_prefix(first, 0, 16, draft_start=16)  # all four marked
+    canonical = list(first.block_table[:4])
+    # A load that wrote the draft rows of blocks 2-3 takes their index entries.
+    second = seq_factory(list(range(16)) + [2])
+    bm.allocate(second)
+    bm.publish_loaded_prefix(second, 0, 16, draft_start=8)
+    chain = bm.prefix_hash_chain(second, [], 4)
+    assert [bm.kv.lookup(h) for h in chain] == canonical[:2] + list(
+        second.block_table[2:4]
+    )
+    # A marked copy never displaces an unmarked canonical block.
+    third = seq_factory(list(range(16)) + [3])
+    bm.allocate(third)
+    bm.publish_loaded_prefix(third, 0, 16, draft_start=16)
+    assert [bm.kv.lookup(h) for h in chain][2:] == list(second.block_table[2:4])
+    # A forward's blocks are fresh, and `hash_blocks` re-points the index.
+    for seq in (first, second, third):
+        bm.deallocate(seq)
+    bm.kv.block(canonical[0]).draft_rows_missing = True
+    computed = seq_factory(list(range(16)) + [4])
+    bm.allocate(computed)
+    bm.hash_blocks(computed, 16)
+    assert bm.kv.lookup(chain[0]) == computed.block_table[0]
+
+
+def test_received_prefix_marks_blocks_below_v(seq_factory):
+    bm = _draft_bm()
+    received = seq_factory(list(range(24)), kv_transfer_params={"draft_rows_from": 8})
+    bm.allocate(received)
+    assert bm.register_received_prefix(received) == 6
+    assert _marked(bm, received) == [True, True, False, False, False, False]
+    # A producer that writes every draft row sends no V: nothing is marked.
+    plain = seq_factory(list(range(100, 124)), kv_transfer_params={})
+    bm.allocate(plain)
+    bm.register_received_prefix(plain)
+    assert not any(_marked(bm, plain))
+    # A V that is not a token count marks every received block.
+    bad = seq_factory(
+        list(range(200, 224)), kv_transfer_params={"draft_rows_from": "8"}
+    )
+    bm.allocate(bad)
+    bm.register_received_prefix(bad)
+    assert all(_marked(bm, bad))
+
+
+def test_received_blocks_below_the_local_hit_are_not_marked(seq_factory):
+    bm = _draft_bm()
+    local = _computed(bm, seq_factory(list(range(8)) + [50]))
+    bm.deallocate(local)
+    received = seq_factory(list(range(24)), kv_transfer_params={"draft_rows_from": 16})
+    bm.allocate(received, bm.can_allocate(received))
+    assert received.num_cached_tokens == 8
+    bm.register_received_prefix(received)
+    assert _marked(bm, received) == [False, False, True, True, False, False]
+
+
+def test_an_unmarked_received_block_replaces_a_marked_canonical(seq_factory):
+    bm = _draft_bm()
+    first = seq_factory(list(range(24)), kv_transfer_params={"draft_rows_from": 24})
+    bm.allocate(first)
+    bm.register_received_prefix(first)
+    bm.deallocate(first)
+    second = seq_factory(list(range(24)), kv_transfer_params={})
+    # The decode's own hit stops at the marked block its window starts on.
+    hit = bm.can_allocate(second)
+    assert hit == 4
+    bm.allocate(second, hit)
+    bm.register_received_prefix(second)
+    chain = bm.prefix_hash_chain(second, [], 6)
+    assert [bm.kv.lookup(h) for h in chain][4:] == list(second.block_table[4:6])
+
+
+def test_allocate_reset_clears_the_mark(seq_factory):
+    bm = _draft_bm(blocks=2)
+    seq = seq_factory(list(range(8)))
+    bm.allocate(seq)
+    bm.mark_draft_rows_missing(seq, 0, 8)
+    blocks = list(seq.block_table)
+    bm.deallocate(seq)
+    again = seq_factory(list(range(100, 108)))
+    bm.allocate(again)
+    assert sorted(again.block_table) == sorted(blocks)
+    assert not any(_marked(bm, again))
+    # A block a shrinking pool relocates keeps its mark with its contents.
+    pool = BlockPool(3)
+    pool.allocate(2)
+    pool.block(2).draft_rows_missing = True
+    assert pool.retire_top().moved_to == 0
+    assert pool.block(0).draft_rows_missing and not pool.block(2).draft_rows_missing

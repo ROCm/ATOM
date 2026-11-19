@@ -601,6 +601,11 @@ class ReqMeta:
     prefill_handoff: dict | None = None
     prefill_aborted: bool = False
     prompt_digest: str | None = None
+    # A non-chunked producer's V (`PrefillHandoff.draft_rows_from`), echoed back.
+    draft_rows_from: int | None = None
+    # Leading blocks of the destination that the consumer's own prefix cache
+    # holds; a full transfer (offset 0) writes over them.
+    local_hit_blocks: int = 0
 
 
 @dataclass
@@ -699,6 +704,8 @@ class ConnectorMetadata:
             prefill_handoff=kv_transfer_params.get("prefill_handoff"),
             prefill_aborted=kv_transfer_params.get("prefill_aborted", False),
             prompt_digest=kv_transfer_params.get("prompt_digest"),
+            draft_rows_from=kv_transfer_params.get("draft_rows_from"),
+            local_hit_blocks=kv_transfer_params.get("local_hit_blocks", 0),
         )
 
     def add_new_req_to_save(
