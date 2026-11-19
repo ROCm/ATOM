@@ -15,7 +15,10 @@ pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
 from atom.kv_transfer.disaggregation.page_region import page_region
 from atom.kv_transfer.disaggregation.types import KVTransferTensors
 from atom.model_ops.attentions import gdn_attn
-from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadataBuilder
+from atom.model_ops.attentions.gdn_attn import (
+    LINEAR_STATE_ROWS,
+    GDNAttentionMetadataBuilder,
+)
 from atom.model_ops.attentions.pool_layout.entry_arena import (
     EntryField,
     published_bytes_for,
@@ -26,6 +29,7 @@ from atom.model_ops.attentions.qwen4_exp_attn import (
     Qwen4ExpBackend,
     Qwen4ExpMetadataBuilder,
 )
+from atom.model_ops.fla_ops import gdn_flydsl
 from atom.plugin.vllm.kv_transfer.mp_page_layout import build_mp_transfer_tensors
 
 
@@ -271,9 +275,6 @@ def test_layout_id_names_the_page_fields_and_the_ssm_storage(one_tp_rank):
 
 def _flydsl_builder(monkeypatch, *, replayssm=False):
     """A builder with one GDN layer whose 128x128 SSM state FlyDSL can decode."""
-    from atom.model_ops.attentions.gdn_attn import LINEAR_STATE_ROWS
-    from atom.model_ops.fla_ops import gdn_flydsl
-
     monkeypatch.setattr(gdn_flydsl, "ops", lambda: object())
     monkeypatch.setattr(gdn_flydsl, "_validated_on_gfx942", lambda: True)
     gdn_flydsl.backend.cache_clear()
@@ -307,8 +308,6 @@ def test_ssm_storage_follows_the_decode_switches(
     monkeypatch, one_tp_rank, env, replayssm, storage
 ):
     """The layout id and the binding read one decision."""
-    from atom.model_ops.fla_ops import gdn_flydsl
-
     for name, value in env.items():
         monkeypatch.setenv(name, value)
     try:

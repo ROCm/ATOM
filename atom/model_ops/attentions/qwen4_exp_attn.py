@@ -35,6 +35,7 @@ import torch
 from atom.kv_transfer.disaggregation.page_region import page_region
 from atom.kv_transfer.disaggregation.types import KVTransferTensors
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
+from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.fla_ops.gdn_flydsl import select_policy_for_slot
 from atom.model_ops.qwen4_exp.ops.qsa import (
     qsa_cache_row_layout,
@@ -449,7 +450,7 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         # its `validate_config` admits only tiers that read PAGE images.
         return bool(kv_transfer_leaves(config))
 
-    def state_transfer(self):
+    def state_transfer(self) -> StateTransfer:
         transfer = super().state_transfer()
         if not transfer.copies:
             return transfer

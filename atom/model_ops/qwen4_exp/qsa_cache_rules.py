@@ -9,6 +9,10 @@ and `ops/qsa.py`, which import Triton and AITER, so `kv_transfer` can import
 them and CPU CI runs their tests.
 """
 
+from collections.abc import Iterable
+
+import torch
+
 from atom.utils import envs
 
 QSA_CACHE_FORMATS = ("bf16", "fp8", "fp4")
@@ -98,7 +102,12 @@ def _shape_and_dtype(shape, dtype) -> str:
     return f"{tuple(shape)},{dtype}".replace(" ", "")
 
 
-def qsa_paged_layout_id(base: str, ssm_storage: str, page_fields, ple_planes) -> str:
+def qsa_paged_layout_id(
+    base: str,
+    ssm_storage: str,
+    page_fields: Iterable[tuple[str, tuple[int, ...], torch.dtype]],
+    ple_planes: Iterable[tuple[str, tuple[int, ...], torch.dtype]],
+) -> str:
     """`base` plus what it cannot see: the SSM's physical order, the PAGE
     fields `(name, shape, dtype)` and the PLE planes `(tag, shape, dtype)`,
     each in image order."""
