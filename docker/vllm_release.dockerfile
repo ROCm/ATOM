@@ -28,16 +28,40 @@ ENV CMAKE_MAKE_PROGRAM=/usr/local/bin/ninja
 # /opt/rocm, which then shadows the custom build via ldconfig. That regresses
 # GLM-5.2 decode perf (memory-bound kernels run ~40% slower under the stock rccl
 # even though its collective kernels are never called in decode). Back it up here
-# and restore after all OOT installs (mirrors the Triton backup/restore below).
+# and restore it right after `apt --fix-broken install` (mirrors the Triton
+# backup/restore below).
 RUN echo "========== [OOT 0/7] Back up base-image custom RCCL ==========" && \
     mkdir -p /tmp/rccl-base-backup && \
     (cp -a /usr/local/lib/librccl.so* /tmp/rccl-base-backup/ 2>/dev/null || true) && \
     (cp -a /etc/ld.so.conf.d/rccl.conf /tmp/rccl-base-backup/ 2>/dev/null || true) && \
     ls -l /tmp/rccl-base-backup/ || true
 
+# Restore the base image's custom RCCL over the stock rccl that `apt --fix-broken
+# install` pulls into /opt/rocm, so the OOT image runs the SAME custom RCCL as the
+# native image. It runs in the same RUN as `--fix-broken`, so the stock library
+# is never stored in a layer; no later RUN calls apt. Removes the stock /opt/rocm
+# librccl so ldconfig unambiguously resolves the custom build in /usr/local/lib
+# (leaving the stock rccl dpkg metadata in place keeps rocm-hip's dep satisfied —
+# only the .so is swapped, exactly the runtime state the native image ships).
 RUN echo "========== [OOT 1/7] Prepare build tools ==========" && \
     apt-get update && \
     apt --fix-broken install -y && \
+    echo "========== [OOT] Restore base-image custom RCCL ==========" && \
+    if ls /tmp/rccl-base-backup/librccl.so* >/dev/null 2>&1; then \
+      echo "Removing stock rccl from /opt/rocm and restoring custom build to /usr/local/lib" && \
+      rm -f /opt/rocm*/lib/librccl.so* && \
+      cp -a /tmp/rccl-base-backup/librccl.so* /usr/local/lib/ && \
+      if [ -f /tmp/rccl-base-backup/rccl.conf ]; then \
+        cp -a /tmp/rccl-base-backup/rccl.conf /etc/ld.so.conf.d/rccl.conf ; \
+      else \
+        echo "/usr/local/lib" > /etc/ld.so.conf.d/rccl.conf ; \
+      fi && \
+      ldconfig && \
+      echo "librccl now resolves to:" && ldconfig -p | grep -i librccl ; \
+    else \
+      echo "WARNING: no base-image custom RCCL backup found; leaving rccl unchanged" ; \
+    fi && \
+    rm -rf /tmp/rccl-base-backup && \
     apt-get install -y --no-install-recommends ca-certificates jq ninja-build vim && \
     "${VENV_PYTHON}" -m pip install --upgrade cmake && \
     cmake --version && \
@@ -155,30 +179,6 @@ RUN echo "========== [OOT 2/7] Verify base packages (atom/aiter/mori) ==========
     rm -rf /tmp/triton-base-backup && \
     "${VENV_PYTHON}" -c "import triton; print(f'triton.__version__ = {triton.__version__}')" && \
     { "${VENV_PYTHON}" -m pip show triton || true; }
-
-# Restore the base image's custom RCCL over any stock rccl that OOT apt pulled
-# into /opt/rocm, so the OOT image runs the SAME custom RCCL as the native image.
-# Must run after ALL OOT apt/pip installs. Removes the stock /opt/rocm librccl so
-# ldconfig unambiguously resolves the custom build in /usr/local/lib (leaving the
-# stock rccl dpkg metadata in place keeps rocm-hip's dep satisfied — only the .so
-# is swapped, exactly the runtime state the native image ships).
-RUN echo "========== [OOT] Restore base-image custom RCCL ==========" && \
-    if ls /tmp/rccl-base-backup/librccl.so* >/dev/null 2>&1; then \
-      echo "Removing stock rccl from /opt/rocm and restoring custom build to /usr/local/lib" && \
-      rm -f /opt/rocm*/lib/librccl.so* && \
-      cp -a /tmp/rccl-base-backup/librccl.so* /usr/local/lib/ && \
-      if [ -f /tmp/rccl-base-backup/rccl.conf ]; then \
-        cp -a /tmp/rccl-base-backup/rccl.conf /etc/ld.so.conf.d/rccl.conf ; \
-      else \
-        echo "/usr/local/lib" > /etc/ld.so.conf.d/rccl.conf ; \
-      fi && \
-      ldconfig && \
-      echo "librccl now resolves to:" && ldconfig -p | grep -i librccl ; \
-    else \
-      echo "WARNING: no base-image custom RCCL backup found; leaving rccl unchanged" ; \
-    fi && \
-    rm -rf /tmp/rccl-base-backup
-
 
 RUN echo "========== [vLLM-ATOM] Final transformers version ==========" && \
     "${VENV_PYTHON}" -c "import transformers; print(f'transformers.__version__ = {transformers.__version__}')" && \
