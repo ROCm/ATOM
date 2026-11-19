@@ -129,6 +129,8 @@ def test_the_engine_serves_its_store_to_other_nodes_for_cross_node_tp(
         enable_dp_attention=False,
         tensor_parallel_size=8,
         is_multinode_tp=multinode_tp,
+        is_multinode_pp=False,
+        pp_size_local=1,
     )
     manager = CoreManager.__new__(CoreManager)
     manager.label = "test"
@@ -190,6 +192,7 @@ def test_a_rank_store_client_waits_as_long_as_tp_setup(
     monkeypatch.setattr(dist, "TCPStore", lambda *a, **k: clients.append((a, k)))
     config = SimpleNamespace(
         is_multinode_tp=spans_nodes,
+        is_multinode_pp=False,
         parallel_config=SimpleNamespace(
             data_parallel_master_ip="10.0.0.1", data_parallel_base_port=29600
         ),
@@ -205,14 +208,16 @@ def test_a_rank_store_client_waits_as_long_as_tp_setup(
 def test_a_tp_group_across_nodes_raises_the_group_timeout(monkeypatch, spans_nodes):
     from torch.distributed import distributed_c10d
 
-    from atom.utils.distributed.utils import raise_timeout_if_tp_spans_nodes
+    from atom.utils.distributed.utils import raise_timeout_if_model_spans_nodes
 
     monkeypatch.setenv("ATOM_MULTINODE_PG_TIMEOUT_S", "3600")
     monkeypatch.setattr(distributed_c10d, "default_pg_timeout", timedelta(minutes=30))
     monkeypatch.setattr(
         distributed_c10d, "default_pg_nccl_timeout", timedelta(minutes=10)
     )
-    raise_timeout_if_tp_spans_nodes(SimpleNamespace(is_multinode_tp=spans_nodes))
+    raise_timeout_if_model_spans_nodes(
+        SimpleNamespace(is_multinode_tp=spans_nodes, is_multinode_pp=False)
+    )
     # What the default group and aiter's groups, created without one, get.
     gloo = distributed_c10d._get_default_timeout(dist.Backend.GLOO)
     nccl = distributed_c10d._get_default_timeout(dist.Backend.NCCL)
@@ -513,6 +518,7 @@ def test_a_worker_nodes_ranks_use_its_own_gpus_from_zero(start, rank, device):
             data_parallel_rank_local=0, pipeline_parallel_rank=0
         ),
         pipeline_parallel_size=1,
+        pp_size_local=1,
         tp_world_size=8,
         pcp_group_size=1,
         tp_rank_start=start,

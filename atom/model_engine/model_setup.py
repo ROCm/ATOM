@@ -18,7 +18,12 @@ from aiter import init_dist_env
 from aiter.dist.utils import get_distributed_init_method
 from torch import nn
 
-from atom.config import Config, local_device_index, set_current_atom_config
+from atom.config import (
+    Config,
+    local_device_index,
+    set_current_atom_config,
+    worker_global_rank,
+)
 from atom.distributed.simulated_tp import apply_simulated_tp, reject_simulated_tp
 from atom.distributed.ulysses_sp import check_aiter_sp_api, sp_is_enabled
 from atom.model_engine.tp_multinode import managed_store_client
@@ -28,7 +33,7 @@ from atom.spec_decode.factory import build_drafter
 from atom.utils import resolve_obj_by_qualname
 from atom.utils.distributed.utils import (
     raise_timeout_if_dp_spans_nodes,
-    raise_timeout_if_tp_spans_nodes,
+    raise_timeout_if_model_spans_nodes,
 )
 
 if TYPE_CHECKING:
@@ -82,16 +87,22 @@ def init_model_env(config: Config, rank: int) -> torch.device:
     )
     dp_size = config.parallel_config.data_parallel_size
     world_size = dp_size * pp_size * stage_span
-    dp_rank = config.parallel_config.data_parallel_rank
-    global_rank = (dp_rank * pp_size + pp_rank) * stage_span + rank
+    global_rank = worker_global_rank(config, rank)
     raise_timeout_if_dp_spans_nodes(config.parallel_config)
-    raise_timeout_if_tp_spans_nodes(config)
+    raise_timeout_if_model_spans_nodes(config)
     if (
         config.parallel_config._managed_distributed_store
         and not torch.distributed.is_initialized()
     ):
-        # Preserve AITER's environment setup when preinitializing its group.
-        visible = config.tp_size_local if config.is_multinode_tp else world_size
+        # Preserve AITER's environment setup when preinitializing its group:
+        # the GPUs this node runs, which is fewer than the world when the TP
+        # group or the pipeline spans nodes.
+        if config.is_multinode_tp:
+            visible = config.tp_size_local
+        elif config.is_multinode_pp:
+            visible = config.pp_size_local * stage_span
+        else:
+            visible = world_size
         os.environ.setdefault("HIP_VISIBLE_DEVICES", ",".join(map(str, range(visible))))
         store = managed_store_client(config)
         torch.distributed.init_process_group(
@@ -101,11 +112,6 @@ def init_model_env(config: Config, rank: int) -> torch.device:
     if config.pipeline_parallel_size > 1:
         from atom.distributed.pp_comm import init_pp_aware_dist_env
 
-        # No local_rank here, unlike the non-PP branch below. Safe only
-        # because PP is single-node today: CoreManager rejects multi-node
-        # DP when pp_size > 1, and asserts PP+DP out entirely, so
-        # global_rank is already the physical device index. Revisit if
-        # either restriction is lifted.
         init_pp_aware_dist_env(
             tensor_model_parallel_size=config.tensor_parallel_size,
             pipeline_model_parallel_size=pp_size,
@@ -115,6 +121,10 @@ def init_model_env(config: Config, rank: int) -> torch.device:
             backend="nccl",
             data_parallel_size=dp_size,
             prefill_context_model_parallel_size=config.pcp_group_size,
+            # Every group's device. On one node it equals global_rank (PP
+            # excludes DP); a stage on a later node of a pipeline that
+            # spans nodes has a global rank past its node's GPUs.
+            local_rank=local_device_rank,
         )
     else:
         # The group spans the devices that exist; apply_simulated_tp then

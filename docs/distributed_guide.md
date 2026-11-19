@@ -659,6 +659,7 @@ indefinitely for an identity handshake that never arrives.
   engine-index space folds PP stages into DP ranks and the two mappings are not
   reconciled across nodes.
 - PP + DP is separately unsupported (single-node assertion, pre-existing).
+  One pipeline without DP may span nodes: see section 11.
 
 ## 9. Wide expert parallelism (multi-node EP)
 
@@ -752,3 +753,101 @@ the whole group.
   node), and so are barrier RPCs (the TP barrier is a local multiprocessing one).
 - The custom all-reduce is node-local, so collectives between nodes go through
   RCCL. On gfx950 also set `ATOM_USE_CUSTOM_ALL_GATHER=0`.
+
+## 11. Multi-node pipeline parallelism
+
+One pipeline -- one serving instance -- may run its stages on several nodes:
+each node runs a contiguous, equal slice of the stages, and every stage's TP
+group stays on its node. The node that runs stage 0 is the **coordinator**: the
+API server, the CoreManager router, the model-runner TCPStore and every engine
+socket live there, as on a multi-node DP coordinator. Every other node runs only
+its stages' EngineCores, which connect back to it.
+
+Multi-node PP is inferred from the sizes -- `--pipeline-parallel-size-local`
+below `-pp` (`Config.is_multinode_pp`). Without the new flags every path is the
+single-node one.
+
+### Flags
+
+| Flag | Meaning |
+|---|---|
+| `--pipeline-parallel-size-local` | Stages on **this** node (default: all of them) |
+| `--pipeline-parallel-rank` | First stage this node runs: 0 on the coordinator |
+| `--pipeline-parallel-node-ips` | IPv4 address of every node, in stage order, the same on every node |
+| `--data-parallel-master-ip` | The coordinator's address (the node of stage 0) |
+| `--data-parallel-master-port` | Base of the derived socket ports (same on every node) |
+| `--data-parallel-base-port` | Model-runner TCPStore port (nonzero, same on every node) |
+
+### Example -- PP8 x TP1 on two 4-GPU nodes
+
+```bash
+# Node 0 (10.0.0.1): stages 0-3 on its GPUs 0-3, serves the API
+python -m atom.entrypoints.openai_server --model <model> -tp 1 -pp 8 \
+  --enforce-eager \
+  --pipeline-parallel-size-local 4 --pipeline-parallel-rank 0 \
+  --pipeline-parallel-node-ips 10.0.0.1,10.0.0.2 \
+  --data-parallel-master-ip 10.0.0.1 --data-parallel-master-port 29500 \
+  --data-parallel-base-port 29501
+
+# Node 1 (10.0.0.2): stages 4-7 on its GPUs 0-3, no API server
+python -m atom.entrypoints.openai_server --model <model> -tp 1 -pp 8 \
+  --enforce-eager \
+  --pipeline-parallel-size-local 4 --pipeline-parallel-rank 4 \
+  --pipeline-parallel-node-ips 10.0.0.1,10.0.0.2 \
+  --data-parallel-master-ip 10.0.0.1 --data-parallel-master-port 29500 \
+  --data-parallel-base-port 29501
+```
+
+Worker `r` of stage `s` has global rank `s * tp + r` (the same on every node)
+and runs on its node's GPU `(s mod pipeline_parallel_size_local) * tp + r`
+(`atom.config.worker_global_rank` / `local_device_index`).
+
+### Ports
+
+Derived from the master port on every node, without negotiation. With
+`base = master_port + 100` and `pp` stages:
+
+| Port | Purpose | Bound by |
+|---|---|---|
+| `base + 3s` .. `base + 3s + 2` | stage `s`'s engine sockets (requests, outputs, control) | the coordinator |
+| `base + 3pp + s`, `s >= 1` | stage `s` receives the head's scheduled batches | stage `s`'s node |
+| `base + 4pp` | the head receives the last stage's completions | node 0 |
+| `base + 4pp + 1` | the head receives every stage's KV-transfer status | node 0 |
+
+Each stage channel keeps `PPStageTransport`'s polarity (receiver binds
+`0.0.0.0`, sender connects to the receiver's node IP from
+`--pipeline-parallel-node-ips`); `InternodePPChannelPlan` in
+`engine_core_mgr.py` gives every stage its own view of the endpoints. With the
+defaults above, PP8 uses 29600-29633 plus the TCPStore port; keep the store
+port outside that range. Like the DP coordinator, nothing here is
+authenticated.
+
+### Timeouts
+
+- `ATOM_MULTINODE_TP_TIMEOUT_S` (1800): how long a stage's ranks wait on the
+  model-runner store, for the NCCL id of a communicator created on first use.
+- `ATOM_MULTINODE_PG_TIMEOUT_S` (7200): floor for the process groups' gloo and
+  NCCL timeouts, so a slow node's weight load does not time them out.
+
+### P/D
+
+A Mooncake producer whose pipeline spans nodes advertises the node of each stage
+(`remote_pp_hosts`, from `--pipeline-parallel-node-ips`), and the consumer sends
+each stage its write request there instead of to `remote_host`. The decode nodes
+must reach those addresses too.
+
+### Restrictions
+
+- Every stage's TP group stays on its node (a TP group across nodes is refused
+  with PP), and DP, DP-attention, PCP, RapidServe and `--fake-eplb` are
+  refused.
+- A KV offload tier is refused. An LMCache tier's scheduler asks every
+  worker's lookup server, which listens on an `ipc://` path of its own host, and
+  a store-backed tier times each save from the head's `CLOCK_MONOTONIC`, which a
+  worker on another host cannot read.
+- Set `GLOO_SOCKET_IFNAME` / `NCCL_SOCKET_IFNAME` where the default interface is
+  not the one the nodes reach each other on, and the same environment on every
+  node: `ATOM_PP_SEND_ALLGATHER`, for one, decides what a stage sends the next,
+  and nothing checks it across nodes.
+- A worker node whose coordinator died is not torn down: it waits, as a
+  multi-node DP worker node does.
