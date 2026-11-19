@@ -508,6 +508,18 @@ def test_a_sparse_pp_stage_refuses_a_region_count_it_did_not_place():
         builder._pp_consumer_region_indices([9, 4], 1, 6)
 
 
+def test_a_pooled_indexer_keeps_refusing_pp(monkeypatch):
+    """GLM-5.3-Flash pools index keys; its tail cache is no slot region, so a
+    PP prefill would report a transfer that left those keys behind."""
+    monkeypatch.setenv("ATOM_GLM5_KPOOL", "1")
+    builder = kimi_builder({"kv_connector": "mooncake"}, pp_size=2)
+    builder.model_runner.has_mla_indexer = True
+    builder.model_runner.config.hf_config.index_kpool = 4
+
+    with pytest.raises(NotImplementedError, match="pooled sparse indexer"):
+        builder.get_kv_transfer_tensors()
+
+
 @pytest.mark.parametrize(
     "builder_cls", ("KimiAiterMLAGDNMetadataBuilder", "KimiTritonMLAGDNMetadataBuilder")
 )
