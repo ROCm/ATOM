@@ -886,6 +886,22 @@ mod d_pd_planning {
         assert_eq!(shared.url(), "http://p2@0");
     }
 
+    /// Round-robin on both pools still reaches every prefill: the prefill position
+    /// advances per decode rank, not in step with the decode's.
+    #[tokio::test]
+    async fn test_idx2idx_round_robin_reaches_every_prefill() {
+        let cluster = Idx2Idx::new(Arc::new(RoundRobinPolicy::new()));
+        let descriptor = make_descriptor(Some("m"), None, None, None);
+
+        let mut placed = std::collections::HashMap::new();
+        for _ in 0..8 {
+            let url = prefill_url(cluster.planner.plan(&descriptor).await.unwrap());
+            *placed.entry(url).or_insert(0) += 1;
+        }
+        assert_eq!(placed.len(), 4, "{placed:?}");
+        assert!(placed.values().all(|&requests| requests == 2), "{placed:?}");
+    }
+
     /// A session pinned to a prefill off the decode's rank is rebound by the planner.
     #[tokio::test]
     async fn test_idx2idx_dp_sticky_rebinds_to_the_decode_rank() {

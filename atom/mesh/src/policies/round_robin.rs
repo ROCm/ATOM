@@ -6,6 +6,7 @@ use std::sync::{
 };
 
 use async_trait::async_trait;
+use dashmap::DashMap;
 
 use super::{
     get_healthy_worker_indices, LoadBalancingPolicy, RouteDecision, SelectWorkerInfo,
@@ -15,17 +16,18 @@ use crate::core::Worker;
 
 /// Round-robin selection policy
 ///
-/// Selects workers in sequential order, cycling through all healthy workers.
+/// Selects workers in sequential order, cycling through all healthy workers. Prefill
+/// candidates narrowed to the decode's DP rank cycle per rank: a single position would
+/// advance in step with a round-robin decode and skip workers.
 #[derive(Debug, Default)]
 pub struct RoundRobinPolicy {
     counter: AtomicUsize,
+    rank_counters: DashMap<usize, AtomicUsize>,
 }
 
 impl RoundRobinPolicy {
     pub fn new() -> Self {
-        Self {
-            counter: AtomicUsize::new(0),
-        }
+        Self::default()
     }
 }
 
@@ -34,7 +36,7 @@ impl LoadBalancingPolicy for RoundRobinPolicy {
     async fn select_with_decision(
         &self,
         workers: &[Arc<dyn Worker>],
-        _info: &SelectWorkerInfo<'_>,
+        info: &SelectWorkerInfo<'_>,
     ) -> (Option<usize>, RouteDecision) {
         let healthy_indices = get_healthy_worker_indices(workers);
 
@@ -43,7 +45,14 @@ impl LoadBalancingPolicy for RoundRobinPolicy {
         }
 
         // Get and increment counter atomically
-        let count = self.counter.fetch_add(1, Ordering::Relaxed);
+        let count = match info.decode_rank {
+            Some(rank) => self
+                .rank_counters
+                .entry(rank)
+                .or_default()
+                .fetch_add(1, Ordering::Relaxed),
+            None => self.counter.fetch_add(1, Ordering::Relaxed),
+        };
         let selected_idx = count % healthy_indices.len();
 
         (
@@ -58,6 +67,7 @@ impl LoadBalancingPolicy for RoundRobinPolicy {
 
     fn reset(&self) {
         self.counter.store(0, Ordering::Relaxed);
+        self.rank_counters.clear();
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
