@@ -73,6 +73,16 @@ RUN echo "========== [OOT 1/7] Prepare build tools ==========" && \
     echo "${TORCH_LIB}" > /etc/ld.so.conf.d/torch.conf && \
     ldconfig
 
+# The stock rccl-dev left by `--fix-broken` ships rccl-targets.cmake, whose
+# roc::rccl target points at /opt/rocm-7.2.4/lib/librccl.so.1.0.70204. The vLLM
+# build reaches it through torch's LoadHIP.cmake (find_package(rccl)), and CMake
+# fails if that file is missing, which it is once the restore above removed the
+# stock library. Point that path at the custom RCCL so the build configures and
+# links against the same library the image runs. The file name follows the stock
+# rccl version of the ROCm 7.2.4 base (the OOT image is built only on the ROCm 7
+# line); update it when the base image's ROCm version changes.
+RUN ln -s /usr/local/lib/librccl.so.1.0 /opt/rocm-7.2.4/lib/librccl.so.1.0.70204
+
 COPY docker/patches/vllm-torch210-compat.patch /tmp/vllm-torch210-compat.patch
 
 # Keep OOT aligned with the Triton that the ATOM base image ships.
