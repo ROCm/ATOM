@@ -297,7 +297,6 @@ def _with_one_gdn_layer(builder, layer, state):
     the GDN layers in the pool rows."""
     from atom.model_ops.attentions.gdn_attn import LINEAR_STATE_ROWS
 
-    builder.device = state.device
     builder._pool_rows = {LINEAR_STATE_ROWS: {layer: 0}}
     builder._state_shape_for_runner = lambda: (None, tuple(state.shape[1:]))
     builder._state_dtypes = lambda: (None, state.dtype)

@@ -280,7 +280,6 @@ def _flydsl_builder(monkeypatch, *, replayssm=False):
     builder, cls = _builder()
     del builder._ssm_storage
     builder.replayssm = replayssm
-    builder.device = torch.device("cpu")
     builder._state_shape_for_runner = lambda: ((3, 4), (2, 128, 128))
     builder._state_dtypes = lambda: (torch.bfloat16, torch.float32)
 
