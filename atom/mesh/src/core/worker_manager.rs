@@ -16,6 +16,7 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use crate::{
+    config::BackendType,
     core::{ConnectionMode, Worker, WorkerRegistry, WorkerType},
     policies::PolicyRegistry,
     protocols::worker_spec::{FlushCacheResult, WorkerLoadInfo, WorkerLoadsResult},
@@ -144,42 +145,49 @@ impl WorkerManager {
     pub async fn get_all_worker_loads(
         worker_registry: &WorkerRegistry,
         client: &reqwest::Client,
+        backend: BackendType,
     ) -> WorkerLoadsResult {
         let workers = worker_registry.get_all();
         let total_workers = workers.len();
 
-        let futures: Vec<_> = workers
-            .iter()
-            .map(|worker| {
-                let url = worker.url().to_string();
-                let api_key = worker.api_key().clone();
-                let worker_type = match worker.worker_type() {
-                    WorkerType::Regular => None,
-                    WorkerType::Prefill { .. } => Some("prefill".to_string()),
-                    WorkerType::Decode => Some("decode".to_string()),
-                };
-                let is_http = matches!(worker.connection_mode(), ConnectionMode::Http);
-                let client = client.clone();
+        let mut groups: HashMap<String, Vec<Arc<dyn Worker>>> = HashMap::new();
+        let mut non_http = Vec::new();
+        for worker in workers {
+            if matches!(worker.connection_mode(), ConnectionMode::Http) {
+                groups
+                    .entry(worker.base_url().to_string())
+                    .or_default()
+                    .push(worker);
+            } else {
+                non_http.push(worker);
+            }
+        }
 
-                async move {
-                    let load = if is_http {
-                        Self::parse_load_response(&client, &url, api_key.as_deref()).await
-                    } else {
-                        -1
-                    };
-                    WorkerLoadInfo {
-                        worker: url,
-                        worker_type,
-                        load,
-                    }
-                }
-            })
-            .collect();
+        let mut loads = Vec::with_capacity(total_workers);
+        for worker in non_http {
+            loads.push(worker_load_info(&worker, -1));
+        }
 
-        let loads = future::join_all(futures).await;
-        let successful = loads.iter().filter(|l| l.load >= 0).count();
-        let failed = loads.iter().filter(|l| l.load < 0).count();
+        let group_loads = future::join_all(groups.into_iter().map(|(base, group)| {
+            let client = client.clone();
+            async move {
+                let fetched = fetch_base_loads(&client, &base, &group, backend).await;
+                group
+                    .into_iter()
+                    .map(|worker| {
+                        let load = fetched.get(worker.url()).copied().unwrap_or(-1);
+                        worker_load_info(&worker, load)
+                    })
+                    .collect::<Vec<_>>()
+            }
+        }))
+        .await;
+        for group in group_loads {
+            loads.extend(group);
+        }
 
+        let successful = loads.iter().filter(|info| info.load >= 0).count();
+        let failed = loads.iter().filter(|info| info.load < 0).count();
         WorkerLoadsResult {
             loads,
             total_workers,
@@ -187,31 +195,145 @@ impl WorkerManager {
             failed,
         }
     }
+}
 
-    async fn parse_load_response(
-        client: &reqwest::Client,
-        url: &str,
-        api_key: Option<&str>,
-    ) -> isize {
-        let load_url = format!("{}/get_load", url);
-        let mut req = client.get(&load_url).timeout(REQUEST_TIMEOUT);
-        if let Some(key) = api_key {
-            req = req.bearer_auth(key);
+fn worker_load_info(worker: &Arc<dyn Worker>, load: isize) -> WorkerLoadInfo {
+    let worker_type = match worker.worker_type() {
+        WorkerType::Regular => None,
+        WorkerType::Prefill { .. } => Some("prefill".to_string()),
+        WorkerType::Decode => Some("decode".to_string()),
+    };
+    WorkerLoadInfo {
+        worker: worker.url().to_string(),
+        worker_type,
+        load,
+    }
+}
+
+/// One request per instance. A failed fetch leaves every worker in the group
+/// out of the map, which [`WorkerManager::get_all_worker_loads`] reports as `-1`.
+async fn fetch_base_loads(
+    client: &reqwest::Client,
+    base: &str,
+    group: &[Arc<dyn Worker>],
+    backend: BackendType,
+) -> HashMap<String, isize> {
+    let api_key = group.first().and_then(|worker| worker.api_key().clone());
+    if backend == BackendType::Atom {
+        let body = match get_text(client, &format!("{base}/metrics"), api_key.as_deref()).await {
+            Some(body) => body,
+            None => return HashMap::new(),
+        };
+        let by_rank = parse_dp_inflight(&body);
+        let mut loads = HashMap::new();
+        for worker in group {
+            if let Some(rank) = worker.dp_rank() {
+                if let Some(load) = by_rank.get(&rank) {
+                    loads.insert(worker.url().to_string(), *load);
+                }
+            } else if group.len() == 1 && !by_rank.is_empty() {
+                let sum = by_rank.values().sum();
+                loads.insert(worker.url().to_string(), sum);
+            }
         }
+        return loads;
+    }
 
-        match req.send().await {
-            Ok(r) if r.status().is_success() => match r.json::<Value>().await {
-                Ok(json) if json.is_array() => json
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .filter_map(|e| e.get("num_tokens").and_then(|v| v.as_i64()))
-                    .sum::<i64>() as isize,
-                _ => -1,
-            },
-            _ => -1,
+    let body = match get_text(client, &format!("{base}/get_load"), api_key.as_deref()).await {
+        Some(body) => body,
+        None => return HashMap::new(),
+    };
+    let Ok(json) = serde_json::from_str::<Value>(&body) else {
+        return HashMap::new();
+    };
+    let Some(total) = sum_num_tokens(&json) else {
+        return HashMap::new();
+    };
+    let mut loads = HashMap::new();
+    for worker in group {
+        // An instance total is not a per-rank load. DP ranks stay absent so
+        // power_of_two falls back to its local request count.
+        if worker.dp_rank().is_none() {
+            loads.insert(worker.url().to_string(), total);
         }
     }
+    loads
+}
+
+async fn get_text(client: &reqwest::Client, url: &str, api_key: Option<&str>) -> Option<String> {
+    let mut req = client.get(url).timeout(REQUEST_TIMEOUT);
+    if let Some(key) = api_key {
+        req = req.bearer_auth(key);
+    }
+    let response = req.send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    response.text().await.ok()
+}
+
+fn sum_num_tokens(json: &Value) -> Option<isize> {
+    let entries = json.as_array()?;
+    Some(
+        entries
+            .iter()
+            .filter_map(|entry| entry.get("num_tokens").and_then(|value| value.as_i64()))
+            .sum::<i64>() as isize,
+    )
+}
+
+/// `atom:dp_inflight_requests{rank="k"}` values. Lines without a rank label are skipped.
+pub(crate) fn parse_dp_inflight(body: &str) -> HashMap<usize, isize> {
+    let mut loads = HashMap::new();
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("atom:dp_inflight_requests") else {
+            continue;
+        };
+        // `atom:dp_inflight_requests_total` and similar names are different metrics.
+        if rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
+            continue;
+        }
+        let Some(rank) = label_value(rest, "rank").and_then(|rank| rank.parse().ok()) else {
+            continue;
+        };
+        let Some(value) = line
+            .split_whitespace()
+            .next_back()
+            .and_then(|token| token.parse::<f64>().ok())
+        else {
+            continue;
+        };
+        if value.is_finite() {
+            loads.insert(rank, value as isize);
+        }
+    }
+    loads
+}
+
+fn label_value<'a>(metric_rest: &'a str, name: &str) -> Option<&'a str> {
+    let labels = metric_rest
+        .trim_start()
+        .strip_prefix('{')?
+        .split('}')
+        .next()?;
+    let needle = format!("{name}=\"");
+    let start = labels.find(&needle)? + needle.len();
+    let value = labels[start..].split('"').next()?;
+    Some(value)
+}
+
+/// Loads `power_of_two` may compare. Failures stay out so a cached `-1` cannot
+/// look like a real token count.
+pub(crate) fn cacheable_loads(loads: &[WorkerLoadInfo]) -> HashMap<String, isize> {
+    loads
+        .iter()
+        .filter(|info| info.load >= 0)
+        .map(|info| (info.worker.clone(), info.load))
+        .collect()
 }
 
 /// Load monitoring service that periodically fetches worker loads
@@ -219,6 +341,7 @@ pub struct LoadMonitor {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
     client: reqwest::Client,
+    backend: BackendType,
     interval: Duration,
     tx: watch::Sender<HashMap<String, isize>>,
     rx: watch::Receiver<HashMap<String, isize>>,
@@ -238,11 +361,17 @@ impl LoadMonitor {
             worker_registry,
             policy_registry,
             client,
+            backend: BackendType::Sglang,
             interval: Duration::from_secs(interval_secs),
             tx,
             rx,
             monitor_handle: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub fn with_backend(mut self, backend: BackendType) -> Self {
+        self.backend = backend;
+        self
     }
 
     pub async fn start(&self) {
@@ -260,11 +389,20 @@ impl LoadMonitor {
         let worker_registry = Arc::clone(&self.worker_registry);
         let policy_registry = Arc::clone(&self.policy_registry);
         let client = self.client.clone();
+        let backend = self.backend;
         let interval = self.interval;
         let tx = self.tx.clone();
 
         let handle = tokio::spawn(async move {
-            Self::monitor_loop(worker_registry, policy_registry, client, interval, tx).await;
+            Self::monitor_loop(
+                worker_registry,
+                policy_registry,
+                client,
+                backend,
+                interval,
+                tx,
+            )
+            .await;
         });
 
         *handle_guard = Some(handle);
@@ -287,6 +425,7 @@ impl LoadMonitor {
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
         client: reqwest::Client,
+        backend: BackendType,
         interval: Duration,
         tx: watch::Sender<HashMap<String, isize>>,
     ) {
@@ -302,12 +441,9 @@ impl LoadMonitor {
                 continue;
             }
 
-            let result = WorkerManager::get_all_worker_loads(&worker_registry, &client).await;
-
-            let mut loads = HashMap::new();
-            for load_info in result.loads {
-                loads.insert(load_info.worker, load_info.load);
-            }
+            let result =
+                WorkerManager::get_all_worker_loads(&worker_registry, &client, backend).await;
+            let loads = cacheable_loads(&result.loads);
 
             if !loads.is_empty() {
                 debug!(
@@ -338,5 +474,46 @@ impl Drop for LoadMonitor {
                 handle.abort();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocols::worker_spec::WorkerLoadInfo;
+
+    #[test]
+    fn parse_dp_inflight_maps_ranks_and_skips_the_instance_gauge() {
+        let body = r#"
+# HELP atom:dp_inflight_requests Current in-flight requests charged to each data-parallel rank.
+# TYPE atom:dp_inflight_requests gauge
+atom:dp_inflight_requests{rank="0"} 4
+atom:dp_inflight_requests{rank="1"} 9
+atom:kv_cache_usage_ratio 0.5
+atom:dp_inflight_requests 13
+"#;
+        let loads = parse_dp_inflight(body);
+        assert_eq!(loads.get(&0), Some(&4));
+        assert_eq!(loads.get(&1), Some(&9));
+        assert_eq!(loads.len(), 2);
+    }
+
+    #[test]
+    fn cacheable_loads_drops_failures() {
+        let loads = vec![
+            WorkerLoadInfo {
+                worker: "http://ok".to_string(),
+                worker_type: None,
+                load: 3,
+            },
+            WorkerLoadInfo {
+                worker: "http://down".to_string(),
+                worker_type: None,
+                load: -1,
+            },
+        ];
+        let cached = cacheable_loads(&loads);
+        assert_eq!(cached.get("http://ok"), Some(&3));
+        assert!(!cached.contains_key("http://down"));
     }
 }
