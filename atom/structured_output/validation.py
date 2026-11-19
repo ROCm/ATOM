@@ -791,7 +791,13 @@ async def configure_request(
     relaxed_mtp=False,
     synthetic=False,
     strict_schemas=None,
+    prepare=True,
 ):
+    """Constrain ``sampling_params`` to ``schema`` and the strict tools.
+
+    With ``prepare`` false, only refuse what this would refuse before the
+    grammar is prepared; ``sampling_params`` is left as it was.
+    """
     if schema is None and not strict_schemas:
         return
     validate_execution_options(
@@ -804,6 +810,8 @@ async def configure_request(
     )
     tool_format = structured_tool_format(parser_cls, tools, tool_choice, strict_schemas)
     reasoning_end = structured_reasoning_marker(channel, tokenizer)
+    if not prepare:
+        return
     sampling_params.json_schema = schema
     sampling_params.structured_tool_format = tool_format
     sampling_params.structured_reasoning_end = reasoning_end

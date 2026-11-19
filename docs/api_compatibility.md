@@ -95,24 +95,34 @@ with a subset of its response's fields:
 - completions render returns a list of them, one per prompt. ATOM takes one
   prompt per request, so the list has one item.
 
-Chat render checks the request's prompt, resolves its template kwargs and
-renders it with the chat route's own code, then tokenizes the prompt as the
-engine does (`encode_prompt`). A request's `prompt_token_ids` come back as
-sent. Each endpoint refuses, with its inference route's 400 and in the same
-`{"error": ...}` form, a request that route refuses for its prompt:
+Chat render resolves the request's template kwargs and renders its prompt with
+the chat route's own code, then tokenizes the prompt as the engine does
+(`encode_prompt`). A request's `prompt_token_ids` come back as sent.
+
+Each endpoint makes the checks its inference route makes before it hands a
+request to the engine, with the route's code and in its order, and refuses what
+they refuse with the route's 400, in the same `{"error": ...}` form and logged
+as the route logs it. That includes:
 
 - one for another model;
 - a chat with no messages, an untyped tool, a tool choice its reasoning mode
-  does not allow, or a malformed or unsafe `response_format`, and one pairing
-  fields the chat route checks first, such as `top_logprobs` without `logprobs`
-  or `stream_options` without `stream`;
+  does not allow, or a malformed or unsafe `response_format`;
+- fields the route takes only together or apart, such as `top_logprobs`
+  without `logprobs`, `stream_options` without `stream`, or `return_token_ids`
+  with `stream`;
+- a `max_tokens` below 1 or above the deployment's output cap;
+- a `response_format` the deployment cannot hold the output to: one sent with
+  `stop` or `ignore_eos`, with tools its tool parser does not write as DSML, or
+  under a framed reasoning dialect such as Kimi-K3's, and any on a deployment
+  that cannot run a grammar (pipeline parallelism, P/D, rapidserve, relaxed MTP,
+  synthetic acceptance, or speculative decoding with `logprobs`);
 - a prompt that does not fit `max_model_len` with the request's `max_tokens`,
   or leaves no room for any output when `max_tokens` is left to the server, and
   one larger than the KV cache can hold.
 
-Other fields that only shape the reply, such as `n`, `temperature`, or a
-`max_tokens` above the deployment's output cap, are not checked. Image input is
-not rendered yet and gets a 400; the `/beta` routes have no render endpoint.
+Render prepares no grammar, so only a `response_format` whose grammar does not
+compile gets past it, to be refused by the chat route. Image input is not
+rendered yet and gets a 501; the `/beta` routes have no render endpoint.
 
 ## Validation
 
