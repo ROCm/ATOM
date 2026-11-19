@@ -778,23 +778,92 @@ def _v41_publication_epoch(owner, *, resume=False):
         owner.finish()
 
 
+# Kill switch: "0" publishes the shim runner's step metadata as before: one
+# group per builder-declared phase, every member its own H2D copy (a decode
+# step issued about a dozen ~5 us copies on the stream its graph waits on).
+# Read when the publication owner is built (first staged step).
+V41_PACKED_H2D_ENV = "ATOM_SGLANG_V41_PACKED_H2D"
+
+
+def v41_packed_h2d_enabled() -> bool:
+    return os.environ.get(V41_PACKED_H2D_ENV, "1") != "0"
+
+
+def _compose_v41_phase_groups(owner, groups, forward_vars, builder_members):
+    """The phase groups native ATOM's runner composes
+    (`ModelRunner._init_h2d_publication`): ``prefill_metadata`` from the
+    ``seq_metadata`` and ``positions`` producers when the runner has both, and
+    one group per builder-declared phase (``h2d_group_members``), each joining
+    the members a builder names. Returns the composed groups' names: the
+    packed transport's consumer boundaries."""
+    composed = {}
+    if "seq_metadata" in groups and "positions" in groups:
+        composed["prefill_metadata"] = [
+            *groups["seq_metadata"].members,
+            *groups["positions"].members,
+        ]
+    for name, names in builder_members.items():
+        members = composed.setdefault(name, [])
+        for item in names:
+            binding = forward_vars[item]._publication
+            if binding not in members:
+                members.append(binding)
+    for name, members in composed.items():
+        groups[name] = owner.group(name, members)
+    return set(composed)
+
+
+def _init_v41_publication(forward_vars, members, device, *, packed=None):
+    """The shim runner's publication owner and groups over ``forward_vars``.
+
+    Packed (`ATOM_SGLANG_V41_PACKED_H2D`, the default): native's phase groups
+    (`_compose_v41_phase_groups`) on the packed transport native configures
+    (`ModelRunner._init_h2d_publication`): each phase group's members are
+    gathered into one pinned arena and go up as one H2D copy plus one scatter
+    kernel. Direct: one group per builder-declared phase (``members``), every
+    member published with its own copy. The bytes every destination receives
+    are the same either way."""
+    owner, groups = _v41_publication_owner(forward_vars, device)
+    if packed is None:
+        packed = v41_packed_h2d_enabled()
+    if not packed:
+        for name, names in members.items():
+            groups[name] = owner.group(
+                name, [forward_vars[item]._publication for item in names]
+            )
+        return owner, groups
+    boundaries = _compose_v41_phase_groups(owner, groups, forward_vars, members)
+    for group in owner.use_packed_transport(boundaries):
+        logger.info(
+            "ATOM DeepSeek-V4.1 SGLang H2D group %s: %s (%d members)%s",
+            group.name,
+            group.transport,
+            len(group.members),
+            f" ({group.fallback_reason})" if group.fallback_reason else "",
+        )
+    if owner.completion is not None:
+        # Cover the transports' pointer-table uploads before the first
+        # preparation, as native records after configuring.
+        owner.completion.record()
+    return owner, groups
+
+
 def _publish_v41_metadata(prepare):
     """Run a step's staging inside one H2D publication epoch.
 
     ATOM's runner owns the publication registry natively; the shim runner here
-    gets one built over its ``forward_vars`` on first use.
+    gets one built over its ``forward_vars`` on first use
+    (`_init_v41_publication`: native's packed phase groups unless
+    ``ATOM_SGLANG_V41_PACKED_H2D=0``).
     """
 
     @wraps(prepare)
     def publish(self, *args, **kwargs):
         runner = self.model_runner
         if getattr(runner, "h2d_owner", None) is None:
-            owner, groups = _v41_publication_owner(runner.forward_vars, self.device)
-            for name, names in self.h2d_group_members().items():
-                groups[name] = owner.group(
-                    name, [runner.forward_vars[item]._publication for item in names]
-                )
-            runner.h2d_owner, runner.h2d_groups = owner, groups
+            runner.h2d_owner, runner.h2d_groups = _init_v41_publication(
+                runner.forward_vars, self.h2d_group_members(), self.device
+            )
         with _v41_publication_epoch(runner.h2d_owner):
             return prepare(self, *args, **kwargs)
 

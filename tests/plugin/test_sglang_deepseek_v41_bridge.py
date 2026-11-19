@@ -3218,3 +3218,120 @@ class TestDecoderFloors:
         bridge.publish_v41_decoder_floors(metadata, np.asarray([512, 0, 0]))
         floors = getattr(metadata, bridge.DECODER_FLOORS_ATTR)
         assert floors.tolist() == [512, 1920, 0] and floors.dtype == torch.int32
+
+
+def _publication_vars(device, pin, seed=0):
+    from atom.utils import CpuGpuBuffer
+
+    g = torch.Generator().manual_seed(seed)
+
+    def buf(group, n=8, dtype=torch.int32):
+        b = CpuGpuBuffer(
+            n, dtype=dtype, device=device, pin_memory=pin, publication_group=group
+        )
+        b.np[:] = torch.randint(0, 1 << 20, (n,), generator=g).numpy()
+        return b
+
+    return {
+        "seq_a": buf("seq_metadata"),
+        "pos": buf("positions", dtype=torch.int64),
+        "plan": buf("v4_plans"),
+        "step": buf("v41_step", n=16),
+        "block_tables": buf(None, n=12),
+    }
+
+
+_STEP_MEMBERS = {"step_metadata": ("plan", "step", "block_tables")}
+
+
+def test_v41_shim_runner_composes_native_phase_groups():
+    """The shim runner's publication owner gets native's phase groups: a
+    builder-declared phase joins its members (shared destinations allowed,
+    each once), ``prefill_metadata`` composes ``seq_metadata`` + ``positions``,
+    and those composed names are the packed transport's boundaries."""
+    from atom.utils.h2d import PublicationOwner
+
+    forward_vars = _publication_vars("cpu", False)
+    owner, groups = bridge._v41_publication_owner(forward_vars, "cpu")
+    assert isinstance(owner, PublicationOwner)
+    boundaries = bridge._compose_v41_phase_groups(
+        owner,
+        groups,
+        forward_vars,
+        {"step_metadata": ("plan", "step", "block_tables", "plan")},
+    )
+    assert boundaries == {"prefill_metadata", "step_metadata"}
+    assert [b.name for b in groups["step_metadata"].members] == [
+        "plan",
+        "step",
+        "block_tables",
+    ]
+    assert [b.name for b in groups["prefill_metadata"].members] == ["seq_a", "pos"]
+    # Producer groups stay addressable for their producers.
+    assert [b.name for b in groups["v4_plans"].members] == ["plan"]
+    # Off the GPU the transport stays direct (the packed arena needs a device).
+    configured = owner.use_packed_transport(boundaries)
+    assert all(g.transport == "direct" for g in configured)
+
+
+def test_v41_publication_kill_switch_keeps_builder_phases(monkeypatch):
+    forward_vars = _publication_vars("cpu", False)
+    monkeypatch.setenv(bridge.V41_PACKED_H2D_ENV, "0")
+    assert not bridge.v41_packed_h2d_enabled()
+    _, groups = bridge._init_v41_publication(forward_vars, _STEP_MEMBERS, "cpu")
+    # As before: the builder's phase, members in its order.
+    assert [b.name for b in groups["step_metadata"].members] == [
+        "plan",
+        "step",
+        "block_tables",
+    ]
+    assert "prefill_metadata" not in groups
+    assert all(g.transport == "direct" for g in groups.values())
+    monkeypatch.delenv(bridge.V41_PACKED_H2D_ENV)
+    assert bridge.v41_packed_h2d_enabled()
+
+
+def test_gpu_packed_publication_writes_the_direct_bytes():
+    """Packed vs direct over the same sources: every destination identical,
+    step after step (counts change, a member skipped, a member zeroed)."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs a GPU")
+    dev = torch.device("cuda", torch.cuda.current_device())
+    arms = {}
+    for packed in (True, False):
+        fv = _publication_vars(dev, True, seed=7)
+        owner, groups = bridge._init_v41_publication(
+            fv, _STEP_MEMBERS, dev, packed=packed
+        )
+        arms[packed] = (fv, owner, groups)
+    assert arms[True][2]["step_metadata"].transport == "packed"
+    assert arms[True][2]["prefill_metadata"].transport == "packed"
+    assert all(g.transport == "direct" for g in arms[False][2].values())
+    steps = [
+        {"plan": 8, "step": 16, "block_tables": 12},
+        {"plan": 3, "step": 5, "block_tables": 0},
+        {"plan": 8, "step": 9},
+    ]
+    for i, counts in enumerate(steps):
+        for packed, (fv, owner, groups) in arms.items():
+            owner.begin()
+            g = torch.Generator().manual_seed(100 + i)
+            for name in ("plan", "step", "block_tables", "seq_a", "pos"):
+                fv[name].np[:] = torch.randint(
+                    0, 1 << 20, (fv[name].np.shape[0],), generator=g
+                ).numpy()
+            groups["step_metadata"].set_counts(counts)
+            groups["step_metadata"].publish()
+            # Producer groups a packed phase covers stay direct when published
+            # on their own, as the plugin's core staging publishes them.
+            groups["seq_metadata"].set_counts({"seq_a": 8 - i})
+            groups["seq_metadata"].publish()
+            groups["positions"].set_counts({"pos": 8})
+            groups["positions"].publish()
+            owner.finish()
+        torch.cuda.synchronize()
+        for name in arms[True][0]:
+            assert torch.equal(arms[True][0][name].gpu, arms[False][0][name].gpu), (
+                i,
+                name,
+            )
