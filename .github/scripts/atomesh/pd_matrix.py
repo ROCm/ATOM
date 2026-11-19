@@ -132,15 +132,25 @@ def worker_gpu_count(role_cfg: dict[str, Any]) -> int:
     return int(role_cfg.get("tp", 8)) * (int(match.group(1)) if match else 1)
 
 
-def packed_node_count(prefill_cfg: dict[str, Any], decode_cfg: dict[str, Any]) -> int:
-    """Mirror pd_server_atom.sh: fill nodes P-first; no worker spans two nodes."""
+def packed_node_count(
+    prefill_cfg: dict[str, Any],
+    decode_cfg: dict[str, Any],
+    prefill_store: bool = False,
+) -> int:
+    """Mirror pd_server_atom.sh: fill nodes P-first; no worker spans two nodes.
+
+    A node's Mooncake Store serves one prefill worker, so with prefill_store
+    each prefill worker starts a node.
+    """
     nodes, used = 1, 0
-    for role_cfg in (prefill_cfg, decode_cfg):
+    for role, role_cfg in (("prefill", prefill_cfg), ("decode", decode_cfg)):
         gpus = worker_gpu_count(role_cfg)
         if gpus > GPUS_PER_NODE:
             raise ValueError("packed_nodes workers must fit on one 8-GPU node")
         for _ in range(int(role_cfg.get("workers", 1))):
-            if used + gpus > GPUS_PER_NODE:
+            if used + gpus > GPUS_PER_NODE or (
+                prefill_store and role == "prefill" and used
+            ):
                 nodes, used = nodes + 1, 0
             used += gpus
     return nodes
@@ -181,6 +191,7 @@ def required_node_count(
     prefill_cfg: dict[str, Any],
     decode_cfg: dict[str, Any],
     aggregated: bool = False,
+    prefill_store: bool = False,
 ) -> int:
     if pd_worker_layout == "single_node":
         return 1
@@ -188,7 +199,7 @@ def required_node_count(
         # The aggregated server is configured by the decode block.
         return role_nodes(decode_cfg)
     if pd_worker_layout == "packed_nodes":
-        return packed_node_count(prefill_cfg, decode_cfg)
+        return packed_node_count(prefill_cfg, decode_cfg, prefill_store)
     if pd_worker_layout == "prefill_single_node":
         return 1 + int(decode_cfg.get("workers", 1))
     if pd_worker_layout == "decode_single_node":
@@ -371,8 +382,25 @@ def build_cell(
         )
     for role, role_cfg in (("prefill", prefill_cfg), ("decode", decode_cfg)):
         validate_role_nodes(cell_name, role, pd_worker_layout, role_cfg)
+    prefill_store = (
+        str(
+            merged_role_env(
+                defaults,
+                backend_cfg,
+                model_cfg,
+                suite_cfg,
+                "prefill",
+                str(runner_cfg.get("slurm_submit_runner", "")),
+            ).get("MOONCAKE_STORE", "0")
+        )
+        == "1"
+    )
     required_nodes = required_node_count(
-        pd_worker_layout, prefill_cfg, decode_cfg, aggregated=aggregated
+        pd_worker_layout,
+        prefill_cfg,
+        decode_cfg,
+        aggregated=aggregated,
+        prefill_store=prefill_store,
     )
     slurm_submit_runner = str(runner_cfg.get("slurm_submit_runner", ""))
     allow_auto_nodes = slurm_submit_runner in {

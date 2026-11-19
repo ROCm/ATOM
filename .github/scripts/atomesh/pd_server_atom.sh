@@ -581,6 +581,11 @@ elif [[ "${PACKED_NODES_PD}" == "1" ]]; then
     packed_used=$((packed_used + width))
   }
   for idx in $(seq 0 $((xP - 1))); do
+    # A node's Mooncake Store serves one prefill worker, so each such worker
+    # starts a node; the decode workers fill in after the last one.
+    if (( idx > 0 )) && [[ "${ATOMESH_PREFILL_ENV_MOONCAKE_STORE:-${MOONCAKE_STORE:-0}}" == "1" ]]; then
+      packed_used=8
+    fi
     place_packed_worker "$((PREFILL_PP_SIZE * PREFILL_TP_SIZE))" prefill_nodes prefill_gpus
     prefill_ips+=("${IP_ARRAY[${prefill_nodes[$idx]}]:-}")
     prefill_ports+=("$((PREFILL_PORT + idx))")

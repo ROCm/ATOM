@@ -1055,6 +1055,30 @@ models:
             <<: *kv_events_router
             kv_storage_weight: 1.0
 
+        # The same A/B on two nodes (packed_nodes): a Store-backed prefill
+        # starts a node, so the first node runs one prefill with its Store and
+        # the second the other with its Store and the decode on GPUs 4-7, as a
+        # 1P1D Store node does.
+        - &glm52_agentic_mcstore_kvtier_2p1d_2n_cpp4_dcp4
+          <<: *glm52_agentic_mcstore_kvev_2p1d_cpp4_dcp4
+          name: glm-52-mxfp4-2p1d-cpp4-dcp4-agentic-mcstore-kvtier-2n-1m-c72
+          display_topology: 2P1D-CPP4-DCP4-TP1-TP4-MCSTORE-KVTIER-2N
+          pd_worker_layout: packed_nodes
+          router:
+            <<: *kv_events_router
+            kv_storage_weight: 1.0
+
+        - <<: *glm52_agentic_mcstore_kvtier_2p1d_2n_cpp4_dcp4
+          name: glm-52-mxfp4-2p1d-cpp4-dcp4-agentic-mcstore-kvev-2n-1m-c72
+          display_topology: 2P1D-CPP4-DCP4-TP1-TP4-MCSTORE-KVEV-2N
+          router: *kv_events_router
+
+        - <<: *glm52_agentic_mcstore_kvtier_2p1d_2n_cpp4_dcp4
+          name: glm-52-mxfp4-2p1d-cpp4-dcp4-agentic-mcstore-sticky-2n-1m-c72
+          display_topology: 2P1D-CPP4-DCP4-TP1-TP4-MCSTORE-STICKY-2N
+          router:
+            policy: random
+
     accuracy:
       task: gsm8k
       fewshot: 20

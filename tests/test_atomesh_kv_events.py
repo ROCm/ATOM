@@ -143,7 +143,10 @@ start_prefill prefill-rank-0 "${SERVER_PORT}"
                 )
                 for concurrency in concurrencies
             }
-            | {("2P1D-CPP4-DCP4-TP1-TP4-MCSTORE-KVTIER", (72,))},
+            | {
+                (f"2P1D-CPP4-DCP4-TP1-TP4-MCSTORE-{policy}", (72,))
+                for policy in ("KVTIER", "KVTIER-2N", "KVEV-2N")
+            },
         )
         for cell in events:
             with self.subTest(cell=cell["name"]):
@@ -162,8 +165,7 @@ start_prefill prefill-rank-0 "${SERVER_PORT}"
     def test_2p1d_controls_place_a_turn_by_session_or_in_turn(self):
         cells = {
             cell["display_topology"].rsplit("-", 1)[1]: cell
-            for cell in self.cells
-            if cell["display_topology"].startswith("2P1D-")
+            for cell in self.cells_2p1d()
         }
         self.assertEqual(set(cells), {"KVEV", "STICKY", "RR", "KVTIER"})
 
@@ -201,8 +203,7 @@ start_prefill prefill-rank-0 "${SERVER_PORT}"
     def test_the_2p1d_tier_cell_weighs_what_a_prefill_loads_from_its_store(self):
         cells = {
             cell["display_topology"].rsplit("-", 1)[1]: json.loads(json.dumps(cell))
-            for cell in self.cells
-            if cell["display_topology"].startswith("2P1D-")
+            for cell in self.cells_2p1d()
         }
         tier, kvev = cells["KVTIER"], cells["KVEV"]
         self.assertEqual(tier["service"]["router"].pop("kv_storage_weight"), 1.0)
@@ -238,6 +239,35 @@ start_prefill prefill-rank-0 "${SERVER_PORT}"
             for cell in self.cells
             if cell["display_topology"].endswith("-MCSTORE-KVTIER")
         )
+
+    def cells_2p1d(self, nodes=3):
+        return [
+            cell
+            for cell in self.cells
+            if cell["display_topology"].startswith("2P1D-")
+            and cell["display_topology"].endswith("-2N") == (nodes == 2)
+        ]
+
+    def test_the_2n_cells_are_the_2p1d_cells_packed_on_two_nodes(self):
+        by_topology = {cell["display_topology"]: cell for cell in self.cells_2p1d()}
+        packed = self.cells_2p1d(nodes=2)
+        self.assertEqual(
+            {cell["display_topology"].rsplit("-", 2)[1] for cell in packed},
+            {"KVTIER", "KVEV", "STICKY"},
+        )
+        moved = ("id", "name", "display_topology", "nodes", "num_nodes")
+        for cell in packed:
+            with self.subTest(cell=cell["name"]):
+                want = json.loads(
+                    json.dumps(by_topology[cell["display_topology"][: -len("-2N")]])
+                )
+                got = json.loads(json.dumps(cell))
+                self.assertEqual(got["num_nodes"], 2)
+                self.assertEqual(got.pop("pd_worker_layout"), "packed_nodes")
+                self.assertEqual(want.pop("pd_worker_layout"), "multi_node")
+                for key in moved:
+                    del got[key], want[key]
+                self.assertEqual(got, want)
 
     def test_submit_exports_the_switch(self):
         source = (SCRIPTS / "pd_submit.sh").read_text()
@@ -330,7 +360,7 @@ start_mooncake_page_cache_dropper
             for cell in self.cells
             if cell["env"]["prefill"].get("MOONCAKE_STORE") == "1"
         ]
-        self.assertEqual(len(stores), 7)
+        self.assertEqual(len(stores), 10)
         for cell in stores:
             with self.subTest(cell=cell["name"]):
                 drop_for = cell["env"]["prefill"]["MOONCAKE_STORE_PAGE_CACHE_DROP_FOR"]
