@@ -913,6 +913,74 @@ async fn tokenize_endpoint_limits_the_total_prompt_bytes() {
     }
 }
 
+/// With earlier prompts kept, a turn over the byte limit is tokenized when what it appends
+/// is within the limit.
+#[tokio::test]
+async fn a_cached_router_tokenizes_a_turn_over_the_limit() {
+    use crate::routers::prepare::prefix_tokens::tests as prefix;
+
+    let mut config = crate::config::RouterConfig {
+        policy: crate::config::PolicyConfig::PrefixHash {
+            prefix_token_count: 4,
+            load_factor: 1.25,
+        },
+        ..Default::default()
+    };
+    config.prepare_pool.max_tokenize_bytes = Some(4096);
+    let pool = PreparePoolRuntime::new(default_pool()).unwrap();
+    let app = AppContext::from_config(config, 5, pool.handle())
+        .await
+        .unwrap();
+    let (_dir, toy) = prefix::entry(&prefix::description());
+    let tokenizer = toy.tokenizer.clone();
+    app.tokenizer_registry
+        .load(
+            &TokenizerRegistry::generate_id(),
+            "m",
+            &toy.source,
+            || async { Ok(tokenizer) },
+        )
+        .await
+        .unwrap();
+    let system = prefix::system();
+    let turn1 = format!("{system}<|user|> alpha<|assistant|><think>");
+    let turn2 =
+        format!("{system}<|user|> alpha<|assistant|></think> beta<|user|> x<|assistant|><think>");
+
+    // Over the limit with nothing kept, turn 1 is encoded in the background.
+    let error = prepare_prompt(&app, &turn1).await.unwrap_err();
+    assert_eq!(error.code, "tokenizer_input_too_large");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let tokens = loop {
+        match prepare_prompt(&app, &turn2).await {
+            Ok(tokens) => break tokens,
+            Err(error) => {
+                assert_eq!(error.code, "tokenizer_input_too_large");
+                assert!(Instant::now() < deadline, "turn 1 was not kept");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    };
+    let plain = toy.tokenizer.encode(&turn2, false).unwrap();
+    assert_eq!(tokens.as_deref(), Some(plain.token_ids()));
+}
+
+async fn prepare_prompt(app: &AppContext, prompt: &str) -> Result<Option<Vec<u32>>, IngressError> {
+    let body = serde_json::to_vec(&json!({"model": "m", "prompt": prompt})).unwrap();
+    let parsed = ParsedInference::parse("/v1/completions", &body).unwrap();
+    let routing = IngressRouting::new(app);
+    app.prepare_pool
+        .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
+            routing.prepare(&parsed, ctx)
+        })
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap()
+        .map(|(_, tokens)| tokens)
+}
+
 fn json_request(path: &str, body: serde_json::Value) -> Request {
     Request::builder()
         .uri(path)
