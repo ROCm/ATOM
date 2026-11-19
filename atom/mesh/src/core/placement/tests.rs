@@ -716,11 +716,11 @@ mod d_pd_planning {
 
     use http::HeaderMap;
 
-    use super::super::planner::DefaultPlanner;
+    use super::super::planner::{idx2idx, DefaultPlanner, Idx2Idx};
     use super::super::test_support::*;
     use super::super::traits::{PdPlanner, PolicySource, WorkerSource};
     use super::super::types::{PlacementError, PlacementPlan, Protocol, RequestDescriptor};
-    use crate::core::{Worker, WorkerType};
+    use crate::core::{DPAwareWorkerBuilder, Worker, WorkerType};
     use crate::policies::{LoadBalancingPolicy, RandomPolicy, RoundRobinPolicy};
 
     fn make_planner(src: MockWorkerSource, policies: MockPolicySource) -> DefaultPlanner {
@@ -751,8 +751,7 @@ mod d_pd_planning {
     }
 
     fn dp_worker(base_url: &str, dp_rank: usize, worker_type: WorkerType) -> Arc<dyn Worker> {
-        let builder =
-            crate::core::DPAwareWorkerBuilder::new_with_type(base_url, dp_rank, 2, worker_type);
+        let builder = DPAwareWorkerBuilder::new_with_type(base_url, dp_rank, 2, worker_type);
         Arc::new(builder.model_id("m").build())
     }
 
@@ -767,6 +766,20 @@ mod d_pd_planning {
         WorkerType::Prefill {
             bootstrap_port: None,
         }
+    }
+
+    #[test]
+    fn test_idx2idx_moves_keeps_or_reports_a_dp_size_mismatch() {
+        let decode = |rank| dp_worker("http://d", rank, WorkerType::Decode);
+        let prefill_rank_0 = dp_worker("http://p", 0, prefill());
+        let move_to = |decode: Arc<dyn Worker>| idx2idx(prefill_rank_0.as_ref(), decode.as_ref());
+        assert_eq!(move_to(decode(1)), Idx2Idx::Move(1));
+        assert_eq!(move_to(decode(0)), Idx2Idx::Keep);
+        let wider = DPAwareWorkerBuilder::new_with_type("http://d", 3, 4, WorkerType::Decode);
+        let wider: Arc<dyn Worker> = Arc::new(wider.model_id("m").build());
+        assert_eq!(move_to(wider), Idx2Idx::OutOfRange { rank: 3, size: 2 });
+        let no_dp = make_prefill_http("http://q:8000", "m", None);
+        assert_eq!(idx2idx(no_dp.as_ref(), decode(1).as_ref()), Idx2Idx::Keep);
     }
 
     #[tokio::test]
@@ -797,7 +810,7 @@ mod d_pd_planning {
 
     /// Prefill instances p1 and p2 and decode instance d, each on DP ranks 0 and 1, planned
     /// decode first with `prefill_policy`.
-    struct Idx2Idx {
+    struct Idx2IdxCluster {
         planner: DefaultPlanner,
         prefills: [Arc<dyn Worker>; 4],
         decodes: [Arc<dyn Worker>; 2],
@@ -805,7 +818,7 @@ mod d_pd_planning {
 
     const ALL: &[usize] = &[0, 1, 2, 3];
 
-    impl Idx2Idx {
+    impl Idx2IdxCluster {
         fn new(prefill_policy: Arc<dyn LoadBalancingPolicy>) -> Self {
             let prefills = [("p1", 0), ("p1", 1), ("p2", 0), ("p2", 1)]
                 .map(|(host, rank)| dp_worker(&format!("http://{host}"), rank, prefill()));
@@ -848,9 +861,9 @@ mod d_pd_planning {
         }
     }
 
-    fn cache_aware_idx2idx() -> Idx2Idx {
+    fn cache_aware_idx2idx() -> Idx2IdxCluster {
         let cache_aware = Arc::new(crate::policies::CacheAwarePolicy::new());
-        let cluster = Idx2Idx::new(cache_aware.clone());
+        let cluster = Idx2IdxCluster::new(cache_aware.clone());
         cache_aware.init_workers(&cluster.prefills);
         cluster
     }
@@ -890,7 +903,7 @@ mod d_pd_planning {
     /// advances per decode rank, not in step with the decode's.
     #[tokio::test]
     async fn test_idx2idx_round_robin_reaches_every_prefill() {
-        let cluster = Idx2Idx::new(Arc::new(RoundRobinPolicy::new()));
+        let cluster = Idx2IdxCluster::new(Arc::new(RoundRobinPolicy::new()));
         let descriptor = make_descriptor(Some("m"), None, None, None);
 
         let mut placed = std::collections::HashMap::new();
@@ -909,7 +922,7 @@ mod d_pd_planning {
         let handle = recorder.handle();
         let _recorder = metrics::set_default_local_recorder(&recorder);
         let dp_sticky = Arc::new(crate::policies::DpStickyPolicy::new());
-        let cluster = Idx2Idx::new(dp_sticky.clone());
+        let cluster = Idx2IdxCluster::new(dp_sticky.clone());
         let mut headers = HeaderMap::new();
         headers.insert("x-session-id", http::HeaderValue::from_static("session-1"));
 

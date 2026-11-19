@@ -24,12 +24,28 @@ fn report_no_candidates(pool: &'static str, policy: &dyn LoadBalancingPolicy) {
     route_trace::record_selection(pool, policy.name(), None, NO_HEALTHY_WORKERS, None);
 }
 
-/// The DP rank ATOM's idx2idx rank mapping moves `prefill` to for `decode`: the decode's
-/// rank, when the prefill's DP size covers it and the prefill is on another rank. `None`
-/// keeps the prefill as selected.
-pub(crate) fn idx2idx_rank(prefill: &dyn Worker, decode: &dyn Worker) -> Option<usize> {
-    let rank = decode.dp_rank()?;
-    (rank < prefill.dp_size()? && prefill.dp_rank() != Some(rank)).then_some(rank)
+/// What ATOM's idx2idx rank mapping does with a prefill selected for a decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Idx2Idx {
+    /// Moved to the decode's DP rank.
+    Move(usize),
+    /// Kept: no DP rank or size to map, or already on the decode's rank.
+    Keep,
+    /// Kept: the decode's rank is outside the prefill's DP size.
+    OutOfRange { rank: usize, size: usize },
+}
+
+pub(crate) fn idx2idx(prefill: &dyn Worker, decode: &dyn Worker) -> Idx2Idx {
+    let (Some(rank), Some(size)) = (decode.dp_rank(), prefill.dp_size()) else {
+        return Idx2Idx::Keep;
+    };
+    if rank >= size {
+        Idx2Idx::OutOfRange { rank, size }
+    } else if prefill.dp_rank() == Some(rank) {
+        Idx2Idx::Keep
+    } else {
+        Idx2Idx::Move(rank)
+    }
 }
 
 /// The prefill candidates idx2idx keeps for `decode`, or all of them when it would move
@@ -37,7 +53,7 @@ pub(crate) fn idx2idx_rank(prefill: &dyn Worker, decode: &dyn Worker) -> Option<
 fn on_decode_rank(prefill: Vec<Arc<dyn Worker>>, decode: &dyn Worker) -> Vec<Arc<dyn Worker>> {
     let kept: Vec<_> = prefill
         .iter()
-        .filter(|worker| idx2idx_rank(worker.as_ref(), decode).is_none())
+        .filter(|worker| !matches!(idx2idx(worker.as_ref(), decode), Idx2Idx::Move(_)))
         .cloned()
         .collect();
     if kept.is_empty() {
@@ -63,8 +79,8 @@ impl DefaultPlanner {
     }
 
     /// Under ATOM's idx2idx rank mapping, select decode first and offer the prefill policy
-    /// the candidates idx2idx keeps for it ([`idx2idx_rank`]), so the prefill it selects is
-    /// the one the request runs on.
+    /// the candidates idx2idx keeps for it, so the prefill it selects is the one the
+    /// request runs on.
     pub fn with_prefill_on_decode_rank(mut self, enabled: bool) -> Self {
         self.prefill_on_decode_rank = enabled;
         self
