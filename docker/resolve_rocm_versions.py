@@ -101,8 +101,11 @@ def main():
     ]:
         per_pkg[pkg] = dates_for_sdk(args.index_url, pkg, args.series)
 
-    versioned = [("torch", args.torch), ("torchvision", args.torchvision),
-                 ("torchaudio", args.torchaudio)]
+    versioned = [
+        ("torch", args.torch),
+        ("torchvision", args.torchvision),
+        ("torchaudio", args.torchaudio),
+    ]
     versioned += [(f"amd-torch-device-{a}", args.torch) for a in arches]
     versioned += [(f"amd-torchvision-device-{a}", args.torchvision) for a in arches]
     for pkg, ver in versioned:
