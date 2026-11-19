@@ -572,7 +572,66 @@ python3 -m atom.entrypoints.openai_server \
 
 ### gsm8k
 
-先用上面的命令去掉 `--spec-decode-acceptance-length 2.32` 起 server，其余不变，再按指南 §3.3 测，`MODEL_PATH=/models/Qwen3.8-Flash-Next-Quark-MXFP4`，`PORT=8000`。测完按指南 §3.2 第 4 步停掉 server，再用完整命令起 server 测性能。
+先用上面的命令去掉 `--spec-decode-acceptance-length 2.32` 起 server，其余不变。测完按指南 §3.2 第 4 步停掉 server，再用完整命令起 server 测性能。
+
+Qwen-3.8 Flash 先思考再回答，要走 chat 接口：chat template，5-shot，`max_tokens=12288`，任务定义用 Qwen3.8 开发同事测 known-good 时的 `qwen38_gsm8k.yaml`（题目后要求最后一行写 `#### <数字>`）。指南 §3.3 的 `local-completions` 3-shot 不套 chat template，生成上限是 lm_eval 默认的 256 token，思考常常写不完。2026-11-19 同一个镜像（`gfx1250-atom-ci455-20261118`）、同一个 server 上，§3.3 的命令只有 0.4754，换成下面的命令是 0.9795，和开发分支上测的 0.978 一致。
+
+按指南 §3.3 的流程测（`wait_infer_drain.sh` 盯 server、读分数都不变），把其中的 `lm_eval` 换成下面两条：
+
+```bash
+cat > "$ACC_DIR/qwen38_gsm8k.yaml" <<'EOF'
+tag:
+  - math_word_problems
+task: gsm8k
+dataset_path: openai/gsm8k
+dataset_name: main
+output_type: generate_until
+training_split: train
+fewshot_split: train
+test_split: test
+doc_to_text: "Question: {{question}}\nEnd your response with the answer on the last line, formatted as: #### [number]\nAnswer:"
+doc_to_target: "{{answer}}"
+metric_list:
+  - metric: exact_match
+    aggregation: mean
+    higher_is_better: true
+    ignore_case: true
+    ignore_punctuation: false
+    regexes_to_ignore:
+      - ","
+      - "\\$"
+      - "(?s).*#### "
+      - "\\.$"
+generation_kwargs:
+  until:
+    - "</s>"
+    - "<|im_end|>"
+  do_sample: false
+  temperature: 0.0
+repeats: 1
+num_fewshot: 5
+filter_list:
+  - name: strict-match
+    filter:
+      - function: regex
+        group_select: -1
+        regex_pattern: "#### (\\-?[0-9\\.\\,]+)"
+      - function: take_first
+  - name: flexible-extract
+    filter:
+      - function: regex
+        group_select: -1
+        regex_pattern: "(-?[$0-9.,]{2,})|(-?[0-9]+)"
+      - function: take_first
+metadata:
+  version: 3.0
+EOF
+HF_HUB_OFFLINE=0 lm_eval --model local-chat-completions --apply_chat_template --tasks "$ACC_DIR/qwen38_gsm8k.yaml" \
+  --model_args "model=/models/Qwen3.8-Flash-Next-Quark-MXFP4,base_url=http://127.0.0.1:8000/v1/chat/completions,api_key=EMPTY,eos_string=,max_retries=5,num_concurrent=65,timeout=1800,tokenized_requests=False,max_length=16384" \
+  --gen_kwargs max_tokens=12288,temperature=0,top_p=1 --output_path "$ACC_DIR" > "$ACC_DIR/lm_eval.log" 2>&1
+```
+
+few-shot 数写在 yaml 里，命令行不再给 `--num_fewshot`。1319 题在 65 并发下约 4 分钟。accuracy.csv 的 `num_fewshot` 写 `5`。
 
 ### bench
 
