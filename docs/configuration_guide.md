@@ -257,7 +257,7 @@ Supported target format strings:
 Notes:
 
 - An empty JSON object (`--online_quant_config '{}'`) is treated the same as not passing the flag and does not enable online quantization.
-- Online quantization currently applies when the source model is unquantized or uses supported FP8 block quantization (`QuantType.per_1x128`). The loader dequantizes FP8 block weights before applying the requested target format.
+- Online quantization currently applies when the source model is unquantized, uses supported FP8 block quantization (`QuantType.per_1x128`) or has MXFP4 MoE experts (`QuantType.per_1x32`). The loader dequantizes FP8 block weights and MXFP4 experts before applying the requested target format.
 - Tensor-parallel weights are gathered before quantization only when local quantization would produce different scales than quantizing the full unpartitioned weight.
 - Rank 0 writes an `online_quant_info_*.json` summary with elapsed time and per-layer target formats. The file is written under `ATOM_ONLINE_QUANT_INFO_DIR` when set, otherwise under `ATOM_TORCH_PROFILER_DIR`, otherwise in the current working directory.
 

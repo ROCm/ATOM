@@ -215,9 +215,8 @@ def test_engine_teardown_always_flushes_traces(monkeypatch, engine_kind, failure
     # Teardown is tested without a DP group; interval agreement has its own tests.
     core._validate_dp_sync_interval = lambda interval: interval
     monkeypatch.setattr(tracing, "shutdown", lambda: calls.append("trace"))
-    if failure in {"drain", "shutdown"} and not (
-        engine_kind == "pp_downstream" and failure == "drain"
-    ):
+    # A later PP stage neither drains KV work nor shuts a KV event publisher down.
+    if failure in {"drain", "shutdown"} and engine_kind != "pp_downstream":
         with pytest.raises(RuntimeError, match=failure):
             core.busy_loop()
     else:

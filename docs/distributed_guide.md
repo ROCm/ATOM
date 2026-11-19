@@ -37,7 +37,7 @@ ATOM provides parallel linear layer classes in `atom/model_ops/linear.py`:
 
 ### Process Group Initialization
 
-In `ModelRunner.__init__()`, the distributed environment is set up via AITER:
+In `init_model_env()` (`atom/model_engine/model_setup.py`, called from `ModelRunner.__init__()`), the distributed environment is set up via AITER:
 
 ```python
 from aiter import init_dist_env
@@ -141,14 +141,14 @@ When a DP rank has no real work but other ranks do, it executes dummy batches to
 
 ### Device assignment
 
-When DP is enabled on a single node, each DP rank uses a different set of GPUs. The device mapping in `ModelRunner.__init__()` is:
+When DP is enabled on a single node, each DP rank uses a different set of GPUs. `init_model_env()` (`atom/model_engine/model_setup.py`) takes the device from `local_device_index()` (`atom/config.py`):
 
 ```python
-local_device_rank = dp_rank_local * config.tensor_parallel_size + rank
+local_device_rank = local_device_index(config, rank)
 device = torch.device(f"cuda:{local_device_rank}")
 ```
 
-For example, with DP=2 and TP=4:
+With DP and TP only, that is `dp_rank_local * tensor_parallel_size + rank`. For example, with DP=2 and TP=4:
 - DP rank 0: GPUs 0, 1, 2, 3
 - DP rank 1: GPUs 4, 5, 6, 7
 
@@ -268,7 +268,7 @@ The compressed prefix index stores consecutive chained-hash intervals, retaining
 
 **Index budget trade-off and how to see it.** The index is bounded (`PrefixSpreadRouter.CAP` tokens of unique intervals; how many hash blocks that is depends on the hash block size, which is `block_size` times the DCP size), and over that budget the router sheds finished history oldest interval first, shortening an interval from its tail when the overage is small. To see whether it runs, read `atom:dp_prefix_index_events_total` (or the Python dict `LLMEngine.get_metrics_statistics()["dp_router"]["prefix_index"]`; there is no HTTP JSON endpoint for it): `tail_trim` and `leaf_evict` both 0 and `atom:dp_prefix_index_tokens` well under `CAP` mean the trade-off never applied. Nonzero counters mean old history was shed, not that hot prefixes were lost -- cold one-shot history is shed the same way; a rising `tail_trim` / `leaf_evict` rate together with a falling `atom:dp_prefix_route_total{decision="owner"}` share and `atom:dp_prefix_moved_tokens_total` is the pattern to look into. `blocked` rising means the index is still over budget after eviction ran out of evictable history: what is left is still-prefilling history and the finished ancestors of it, which cannot be shed while they have children. If it matters, raise `PrefixSpreadRouter.CAP` (there is no environment variable).
 
-With one routable engine or pipeline parallelism, `prefix_spread` has no effect and its routing requirements are not enforced. LMCache MP requires the configured chunk to match the server when this router is active; PAGE-only single-engine runs use the server's chunk. Native-state transfers retain their own chunk-matching requirement.
+With one routable engine, pipeline parallelism or RapidServe, `prefix_spread` and `share_cache` have no effect and their routing requirements are not enforced. LMCache MP requires the configured chunk to match the server when this router is active; PAGE-only single-engine runs use the server's chunk. Native-state transfers retain their own chunk-matching requirement.
 
 When `prefix_spread` or `share_cache` is active, Mooncake Store must expose one shared `(master, metadata)` pair to all DP ranks. Per-NIC aliases in `mooncake_store.pools` are accepted only when every alias names that same pair. Distinct per-NIC pools are rejected at router startup because a worker can load only from its selected NIC's pool; a scheduler lookup across pools does not make those prefixes transferable. Distinct pools remain available with other routing policies, or when neither router is active.
 
@@ -567,7 +567,8 @@ This means each GPU runs an independent attention computation (no TP AllReduce f
 | `atom/utils/envs.py` | `ATOM_DP_*` environment variables (lazy evaluation) |
 | `atom/model_engine/engine_core.py` | `EngineCore`, `DPEngineCoreProc` (DP busy loop, sync, dummy batches) |
 | `atom/model_engine/engine_core_mgr.py` | `CoreManager` (multi-process DP orchestration, ZMQ IPC) |
-| `atom/model_engine/model_runner.py` | `ModelRunner` (`init_dist_env`, device assignment, `DPMetadata` usage) |
+| `atom/model_engine/model_setup.py` | `init_model_env` (`init_dist_env`, device assignment) |
+| `atom/model_engine/model_runner.py` | `ModelRunner` (`DPMetadata` usage) |
 | `atom/model_engine/arg_utils.py` | `EngineArgs` CLI argument definitions |
 | `atom/utils/distributed/utils.py` | `stateless_init_torch_distributed_process_group()` (Gloo PG creation) |
 | `atom/utils/forward_context.py` | `DPMetadata`, `ForwardContext` (per-step DP token metadata) |
