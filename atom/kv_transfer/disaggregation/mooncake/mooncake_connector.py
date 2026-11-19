@@ -805,6 +805,17 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             seq.kv_transfer_params_output = None
             return
 
+        block_ids = list(seq.block_table)
+        if self.is_producer:
+            # The prompt's blocks only. With deferred output a seq is
+            # scheduled for one more step before its prefill's output
+            # finishes it, and that step's `may_append` can add blocks past
+            # the prompt: one whenever the prompt fills its last block. The
+            # consumer has no destination for them (it computes the first
+            # token's KV itself), and the send aborts on a count mismatch.
+            tokens_per_block = self.block_size * self.dcp_size
+            block_ids = block_ids[: -(-seq.num_prompt_tokens // tokens_per_block)]
+
         # Claim iff we will send: the same `do_remote_decode` gate that fills
         # `_reqs_need_save`.
         if self.is_producer and (getattr(seq, "kv_transfer_params", None) or {}).get(
@@ -817,7 +828,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             # aborted load releases the allocation.
             self._reqs_need_save[seq.id] = (
                 seq,
-                list(seq.block_table),
+                block_ids,
                 seq.state_slot,
             )
 
@@ -830,7 +841,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         seq.kv_transfer_params_output = {
             "do_remote_prefill": True,
             "do_remote_decode": False,
-            "remote_block_ids": list(seq.block_table),
+            "remote_block_ids": list(block_ids),
             # The consumer's SWA ring slot; the producer keys the SWA region
             # transfer by it. Empty for backends with no SWA state.
             "remote_swa_block_ids": _swa_ring_ids(seq),

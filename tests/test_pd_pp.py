@@ -204,6 +204,7 @@ def test_producer_advertises_remote_pp_size():
     seq = SimpleNamespace(
         output_tokens=[7],
         spec_token_ids=None,
+        num_prompt_tokens=130,
         block_table=[1, 2, 3],
         id=99,
         state_slot=7,
@@ -217,6 +218,45 @@ def test_producer_advertises_remote_pp_size():
     assert seq.kv_transfer_params_output["dcp_size"] == 1
     assert seq.kv_transfer_params_output["remote_block_ids"] == [1, 2, 3]
     assert seq.kv_transfer_params_output["remote_slot_index"] == 7
+
+
+@pytest.mark.parametrize("dcp_size", [1, 2])
+def test_producer_publishes_only_the_prompt_blocks(dcp_size):
+    """With deferred output a finished prefill is scheduled for one more step,
+    and a prompt that fills its last block gets a block for the first token
+    there. The consumer allocates the prompt's blocks only."""
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    sched = object.__new__(mc.MooncakeConnectorScheduler)
+    sched.pp_size = 1
+    sched.tp_size = 1
+    sched.hash_block_size = 16
+    sched.block_size = 16
+    sched.dcp_size = dcp_size
+    sched.dp_rank = 0
+    sched.engine_id = "eng"
+    sched.host_ip = "10.0.0.1"
+    sched.handshake_port = 40000
+    sched.base_handshake_port = 6301
+    sched.is_producer = True
+    sched._awaiting_send = set()
+    sched._reqs_need_save = {}
+
+    seq = SimpleNamespace(
+        kv_transfer_params={"do_remote_decode": True},
+        output_tokens=[7],
+        spec_token_ids=None,
+        num_prompt_tokens=2 * 16 * dcp_size,
+        block_table=[1, 2, 3],
+        id=99,
+        state_slot=-1,
+        state_slots=[],
+        kv_transfer_params_output=None,
+    )
+    mc.MooncakeConnectorScheduler.request_finished(sched, seq)
+    assert seq.kv_transfer_params_output["remote_block_ids"] == [1, 2]
+    assert sched._reqs_need_save[seq.id][1] == [1, 2]
 
 
 @pytest.mark.parametrize(
