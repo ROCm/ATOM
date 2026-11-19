@@ -744,6 +744,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_KIMI_MONO_K1_PAIRED_SLABS", "1"
     )
     == "1",
+    # Kimi-K3 gfx1250 mono: the K2 TDM GEMVs ("front", "oproj", "finalize")
+    # that walk K two slabs a step where their LDS plan fits the width; 0
+    # none.
+    "ATOM_KIMI_MONO_PAIRED_SLABS": lambda: frozenset(
+        site
+        for site in os.getenv(
+            "ATOM_KIMI_MONO_PAIRED_SLABS", "front,oproj,finalize"
+        ).split(",")
+        if site not in ("", "0")
+    ),
     # Kimi-K3 gfx1250 mono: K1's whole-head recurrence over a step's query
     # tokens as one chunk (the projections and outputs of the starting state
     # reduced side by side, the tokens' interactions solved per row) instead

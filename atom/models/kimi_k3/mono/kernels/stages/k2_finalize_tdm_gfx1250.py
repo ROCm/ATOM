@@ -32,6 +32,8 @@ WAVES = 8
 ROWS = 16
 PAIRS = HIDDEN // (2 * ROWS)
 ACCUMULATOR_WORDS = WAVES * GFX1250.wave_size * gemv_gfx1250.ACCUMULATOR_ELEMENTS
+# Paired slabs two ahead: the weight stages of the unpaired TDM_DEPTH.
+PAIR_DEPTH = 2
 # The epilogue reduces both tasks of a tile in one round.
 assert THREADS == 2 * ROWS * 8
 
@@ -57,34 +59,41 @@ def build_replicated_finalize(plan: Gfx1250KimiBuildPlan) -> K2ReplicatedFinaliz
         raise ValueError(f"replicated K2 finalize needs {PAIRS} CTAs")
     rows = plan.tokens
     tiles = (rows + ROWS - 1) // ROWS
+    red_words = 2 * tiles * ACCUMULATOR_WORDS
+    # ``paired`` (ATOM_KIMI_MONO_PAIRED_SLABS "finalize"): K two slabs a step,
+    # where the LDS holds four token slabs.
+    paired = (
+        "finalize" in gemv_tdm.paired_sites()
+        and 4 * max(sum(tdm_lds_words(rows, 2, depth=PAIR_DEPTH, group=2)), red_words)
+        <= GFX1250.max_workgroup_lds_bytes
+    )
+    depth = PAIR_DEPTH if paired else gemv_tdm.DEPTH
+    gemv_words = sum(tdm_lds_words(rows, 2, depth=depth, group=2 if paired else 1))
 
     # Where both do not fit (64 rows) the accumulators overlay the GEMV's LDS,
     # written once every wave is past its last read of it.
-    overlay = (
-        4 * (sum(tdm_lds_words(rows, 2)) + 2 * tiles * ACCUMULATOR_WORDS)
-        > GFX1250.max_workgroup_lds_bytes
-    )
+    overlay = 4 * (gemv_words + red_words) > GFX1250.max_workgroup_lds_bytes
 
     @fx.struct
     class Lds:
-        gemv: fx.Array[fx.Int32, sum(tdm_lds_words(rows, 2)), 16]
+        gemv: fx.Array[fx.Int32, gemv_words, 16]
         # Both tasks' accumulators of every tile.
-        red: fx.Array[fx.Float32, 2 * tiles * ACCUMULATOR_WORDS, 16]
+        red: fx.Array[fx.Float32, red_words, 16]
 
     @fx.struct
     class GemvLds:
-        gemv: fx.Array[fx.Int32, sum(tdm_lds_words(rows, 2)), 16]
+        gemv: fx.Array[fx.Int32, gemv_words, 16]
 
     @fx.struct
     class RedLds:
-        red: fx.Array[fx.Float32, 2 * tiles * ACCUMULATOR_WORDS, 16]
+        red: fx.Array[fx.Float32, red_words, 16]
 
     @fx.union
     class OverlayLds:
         gemv: GemvLds
         red: RedLds
 
-    name = f"k3_k2_gfx1250_replicated_finalize_s{rows}"
+    name = f"k3_k2_gfx1250_replicated_finalize_s{rows}{'_ps' if paired else ''}"
 
     sources = SOURCES
 
@@ -128,6 +137,8 @@ def build_replicated_finalize(plan: Gfx1250KimiBuildPlan) -> K2ReplicatedFinaliz
             [row0, row0 + ROWS],
             lane,
             wave,
+            depth=depth,
+            paired=paired,
         )
         if const_expr(overlay):
             gpu.barrier()

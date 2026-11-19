@@ -99,6 +99,12 @@ def cold_suffix() -> str:
     return "".join(f"_c{site}" for site in sorted(_COLD)) or "_c0"
 
 
+def paired_sites() -> frozenset:
+    """The K2 GEMVs ``ATOM_KIMI_MONO_PAIRED_SLABS`` pairs (``project(paired)``
+    needs the rolled loop), as of the build."""
+    return envs.ATOM_KIMI_MONO_PAIRED_SLABS if _ROLLED_UNROLL else frozenset()
+
+
 @traced
 def _prefetch_on(role, asm: str):
     if role == 0:
@@ -374,7 +380,7 @@ def project(
     ``paired`` (rolled): two slabs a step, ``depth`` slabs ahead -- one
     barrier pair a step, four token slabs resident
     (``tdm_lds_words(group=2)``); each accumulator sums the slabs in the same
-    order."""
+    order. An odd last slab takes a step of its own."""
 
     if k % SLAB:
         raise ValueError(f"TDM GEMV needs K divisible by {SLAB}, got {k}")
@@ -384,8 +390,10 @@ def project(
         raise ValueError(f"FP8 TDM GEMV holds one slab's scales a lane, K={k}")
     tasks = len(task_rows)
     rolled = _ROLLED_UNROLL and wide and token_buffers == 2 and 1 + 2 * tasks <= WAVES
-    if paired and not (rolled and slabs % 2 == 0 and depth % 2 == 0):
-        raise ValueError("paired TDM GEMV slabs need the rolled loop, even K slabs and depth")
+    if paired and not (rolled and slabs >= 2 and depth % 2 == 0):
+        raise ValueError(
+            "paired TDM GEMV slabs need the rolled loop, two slabs and even depth"
+        )
     if rolled:
         return _project_rolled(
             lds,
@@ -577,12 +585,23 @@ def project(
 def _rolled_token_step(s, slabs, issue, group=1):
     """Wave 0's part of step ``s`` (slabs ``group s`` ..): copy the next
     step's token slabs, then wait for this step's."""
-    if (s + 1) * group < slabs:
-        for g in range_constexpr(group):
-            issue((s + 1) * group + g)
-    rocdl.s_wait_tensorcnt(group)
-    if (s + 1) * group >= slabs:
-        rocdl.s_wait_tensorcnt(0)
+    if const_expr(slabs % group):
+        # odd paired slabs: the last whole step copies the one last slab
+        tail = slabs // group
+        if s + 1 < tail:
+            for g in range_constexpr(group):
+                issue((s + 1) * group + g)
+            rocdl.s_wait_tensorcnt(group)
+        if s + 1 == tail:
+            issue(fx.Int32(slabs - 1))
+            rocdl.s_wait_tensorcnt(1)
+    else:
+        if (s + 1) * group < slabs:
+            for g in range_constexpr(group):
+                issue((s + 1) * group + g)
+        rocdl.s_wait_tensorcnt(group)
+        if (s + 1) * group >= slabs:
+            rocdl.s_wait_tensorcnt(0)
 
 
 @traced
@@ -858,6 +877,25 @@ def _project_rolled(
             slab_weights[tk][st] for tk in range(tasks) for st in range(WAVE_STEPS)
         ] + list(activations[tiles - 1])
         accs = updated
+    if const_expr(slabs % group):
+        # The odd last slab: its copies are every wave's last in flight, and
+        # no buffer is refilled, so no cluster barrier.
+        s = slabs // group
+        tdm_timeline.slab(fx.Int32(s - 1), tdm_timeline.C)
+        tdm_timeline.slab(fx.Int32(s), tdm_timeline.A)
+        rocdl.s_wait_tensorcnt(0)
+        gpu.barrier()
+        tdm_timeline.slab(fx.Int32(s), tdm_timeline.B)
+        slab_weights, activations = operands(slabs - 1)
+        accs = multiply(
+            _rolled_last_tile(accs, pend, tasks, tiles),
+            slab_weights,
+            activations,
+            tiles - 1,
+        )
+        pend = [
+            slab_weights[tk][st] for tk in range(tasks) for st in range(WAVE_STEPS)
+        ] + list(activations[tiles - 1])
     accs = _rolled_last_tile(accs, pend, tasks, tiles)
     tdm_timeline.slab(fx.Int32(slabs - 1), tdm_timeline.C)
     tdm_timeline.stamp(tdm_timeline.PROJECT_DONE)

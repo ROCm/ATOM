@@ -44,6 +44,7 @@ from atom.models.kimi_k3.mono.kernels.stages import gemv_tdm_gfx1250 as gemv_tdm
 from atom.models.kimi_k3.mono.kernels.stages import k2_allreduce_gfx1250 as ar
 from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import (
     TDM_CLUSTER,
+    TDM_FP8_PAIR_DEPTH,
     tdm_lds_words,
 )
 from atom.models.kimi_k3.mono.kernels.stages.moe_tdm_gfx1250 import _realtime
@@ -446,12 +447,22 @@ def build_oproj_allreduce(
     oneshot = _oneshot(oneshot)
     words_a_bank = oneshot_bank_words(tp, rows) if oneshot else bank_words(tp, rows)
     abi = OPROJ_AR_PROFILE_ABI if profile else OPROJ_AR_ABI
+    # ``paired`` (ATOM_KIMI_MONO_PAIRED_SLABS "oproj"): K two slabs a step,
+    # where the LDS holds four token slabs.
+    rest = 2 * tiles * ACCUMULATOR_WORDS + triples(rows) * LINE_TOKENS * CTA_PAIRS
+    paired = (
+        "oproj" in gemv_tdm.paired_sites()
+        and proj >= 2 * gemv_tdm.SLAB
+        and sum(tdm_lds_words(rows, 2, True, TDM_FP8_PAIR_DEPTH, 2)) + rest
+        <= plan.lds_bytes // 4
+    )
+    depth = TDM_FP8_PAIR_DEPTH if paired else gemv_tdm.FP8_DEPTH
 
     @fx.struct
     class Lds:
         gemv: fx.Array[
             fx.Int32,
-            sum(tdm_lds_words(rows, 2, True, depth=gemv_tdm.FP8_DEPTH)),
+            sum(tdm_lds_words(rows, 2, True, depth, 2 if paired else 1)),
             16,
         ]
         red: fx.Array[fx.Float32, 2 * tiles * ACCUMULATOR_WORDS, 16]
@@ -460,6 +471,7 @@ def build_oproj_allreduce(
 
     name = (
         f"k3_k2_gfx1250_oproj_ar_tp{tp}_s{rows}{'_os' if oneshot else ''}"
+        f"{'_ps' if paired else ''}"
         f"{'_profile' if profile else ''}{fresh.suffix('oproj')}"
         f"{tdm_timeline.suffix()}"
     )
@@ -519,7 +531,8 @@ def build_oproj_allreduce(
             lane,
             wave,
             w_scale=w_o_scale,
-            depth=gemv_tdm.FP8_DEPTH,
+            depth=depth,
+            paired=paired,
         )
         for tile in range_constexpr(tiles):
             for index in range_constexpr(2):
