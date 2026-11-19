@@ -80,7 +80,6 @@ export SGLANG_PLUGINS=atom_sglang
 export SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
 export SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=atom.plugin.sglang.models
 export SGLANG_USE_AITER=1
-export AITER_CONFIG_FMOE="${AITER_MODEL_CONFIGS}/qwen38_flash_next_fp8_ptpc_tuned_fmoe.csv:${AITER_MODEL_CONFIGS}/qwen38_flash_next_bf16_tuned_fmoe.csv"
 export AITER_BYPASS_TUNE_CONFIG=0
 export AITER_ONLINE_TUNE=0
 
