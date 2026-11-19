@@ -118,6 +118,7 @@ def test_gdn_warmup_preserves_padding_and_state_without_capture(monkeypatch):
 
     data = builder(num_slots=2)
     b = object.__new__(GDNAttentionMetadataBuilder)
+    b.replayssm = False
     b.model_runner = data.model_runner
     for name in ("num_state_layers", "_state_shape_for_runner", "_state_dtypes"):
         setattr(b, name, getattr(data, name))

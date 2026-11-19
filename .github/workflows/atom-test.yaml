@@ -31,7 +31,12 @@ concurrency:
   # Keep scheduled main runs from blocking push-triggered validation.
   # Approval runs queue behind existing work. Other reviews get their own
   # group so they cannot replace a pending approval run in GitHub's queue.
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.pull_request.number && 'pr' || github.event_name }}${{ github.event_name == 'pull_request_review' && github.event.review.state != 'approved' && format('-review-{0}', github.run_id) || '' }}
+  # Likewise every label event except the one that opens the gate -- adding
+  # ci:atom, or ci:full to a PR without ci:atom (check_label_event in the gate
+  # script) -- so an unrelated label can never cancel running heavy CI. The
+  # ci-gate and gate jobs' names repeat this test; keep all three in sync with
+  # CI_GATE_LABELS.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.pull_request.number && 'pr' || github.event_name }}${{ github.event_name == 'pull_request_review' && github.event.review.state != 'approved' && format('-review-{0}', github.run_id) || '' }}${{ github.event_name == 'pull_request' && github.event.action == 'labeled' && !(github.event.label.name == 'ci:atom' || (github.event.label.name == 'ci:full' && !contains(github.event.pull_request.labels.*.name, 'ci:atom'))) && format('-noop-{0}', github.run_id) || '' }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event_name != 'pull_request_review' }}
 
 env:
@@ -44,7 +49,10 @@ env:
 
 jobs:
   ci-gate:
-    name: Check Heavy CI Gate
+    # A no-op label run (the -noop- concurrency group above) is named apart from
+    # its first job on, so an approval can tell it from the PR group's runs
+    # when it looks for a pending run it replaced (CI_GATE_NOOP_JOB).
+    name: ${{ github.event_name == 'pull_request' && github.event.action == 'labeled' && !(github.event.label.name == 'ci:atom' || (github.event.label.name == 'ci:full' && !contains(github.event.pull_request.labels.*.name, 'ci:atom'))) && 'Check Heavy CI Gate (no-op label)' || 'Check Heavy CI Gate' }}
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -65,6 +73,7 @@ jobs:
         env:
           CI_GATE_WORKFLOW: atom-test.yaml
           CI_GATE_PR_CHECK_JOB: Offline inference smoke test
+          CI_GATE_NOOP_JOB: Check Heavy CI Gate (no-op label)
           CI_GATE_LABELS: ci:full,ci:atom
           CI_GATE_PATHS_IGNORE: |
             **/*.md
@@ -551,10 +560,46 @@ jobs:
               echo "Model download failed for '${{ matrix.model_path }}'. Aborting."
               exit 1
             fi
+
+            # A speculative-decoding case also needs its draft checkpoint. Left
+            # as a Hub id, the server fetches it on every launch into the
+            # throwaway container's HF cache, and that fetch goes through
+            # hf-xet, which intermittently stalls: the same ~5 GiB file took
+            # 5s on most runs and 118s, 250s and 836s on others, all of it
+            # spent silently inside "Waiting for ATOM server to be ready".
+            # Cache it under /models next to the target instead, so the launch
+            # reads a local directory and never touches the network.
+            draft_id="$(printf '%s\n' "${MODEL_EXTRA_ARGS}" | sed -nE 's/.*--draft-model[ =]+([^ ]+).*/\1/p')"
+            if [[ "${draft_id}" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
+              draft_dir="/models/${draft_id}"
+              echo "draft model '${draft_id}' found in extraArgs, checking cache and lock-protected download for ${draft_dir}"
+              # Xet is off for this one download: over plain HTTP the file
+              # lands in ~30s every time, which is what a one-off cache fill
+              # wants. A stall here would otherwise sit until the timeout.
+              if docker exec \
+                -e HF_TOKEN="${HF_TOKEN:-}" \
+                -e HF_HUB_DISABLE_XET=1 \
+                -e MODEL_ID="${draft_id}" \
+                -e TARGET_DIR="${draft_dir}" \
+                -e MODEL_DOWNLOAD_TIMEOUT="${DRAFT_MODEL_DOWNLOAD_TIMEOUT}" \
+                -e MODEL_LOCK_WAIT_SECONDS="${MODEL_LOCK_WAIT_SECONDS}" \
+                -e MODEL_LOCK_POLL_INTERVAL="${MODEL_LOCK_POLL_INTERVAL}" \
+                -e MODEL_PROGRESS_INTERVAL="${MODEL_PROGRESS_INTERVAL}" \
+                "$CONTAINER_NAME" bash -lc 'bash /workspace/.github/scripts/download_model_with_lock.sh "$MODEL_ID" "$TARGET_DIR"'; then
+                echo "DRAFT_MODEL_ID=${draft_id}" >> "$GITHUB_ENV"
+                echo "DRAFT_MODEL_DIR=${draft_dir}" >> "$GITHUB_ENV"
+              else
+                # Not fatal: the server can still fetch the draft itself, as it
+                # did before this cache existed.
+                echo "::warning::Could not cache draft model '${draft_id}' under ${draft_dir}; the server will download it at launch."
+              fi
+            fi
           else
             echo "container /models directory not found, skipping model download"
           fi
         env:
+          MODEL_EXTRA_ARGS: ${{ matrix.extraArgs }}
+          DRAFT_MODEL_DOWNLOAD_TIMEOUT: "10m"
           MODEL_DOWNLOAD_TIMEOUT: "30m"
           MODEL_LOCK_WAIT_SECONDS: "1800"
           MODEL_LOCK_POLL_INTERVAL: "30"
@@ -631,9 +676,17 @@ jobs:
           else
             model_path="${{ matrix.model_path }}"
           fi
+          # Point --draft-model at the copy "Download models" cached under
+          # /models, so the launch does not download it from the Hub again.
+          launch_args="${MODEL_EXTRA_ARGS}"
+          if [ -n "${DRAFT_MODEL_ID:-}" ] && docker exec "$CONTAINER_NAME" test -f "${DRAFT_MODEL_DIR}/config.json"; then
+            launch_args="${launch_args/--draft-model ${DRAFT_MODEL_ID}/--draft-model ${DRAFT_MODEL_DIR}}"
+            launch_args="${launch_args/--draft-model=${DRAFT_MODEL_ID}/--draft-model=${DRAFT_MODEL_DIR}}"
+            echo "Using cached draft model: ${DRAFT_MODEL_DIR}"
+          fi
           # Pipe via stdin so container bash parses shell quoting in extraArgs
           # (e.g. single-quoted JSON in --default-chat-template-kwargs) naturally.
-          echo ".github/scripts/atom_test.sh launch $model_path $MODEL_EXTRA_ARGS" | \
+          echo ".github/scripts/atom_test.sh launch $model_path $launch_args" | \
             docker exec \
               -e ATOM_DEBUG_DEVICE_MAPPING="${ATOM_DEBUG_DEVICE_MAPPING}" \
               -i "$CONTAINER_NAME" bash -l
@@ -779,7 +832,7 @@ jobs:
           docker rmi "rocm/atom-dev:pre-build-${{ env.GITHUB_COMMIT_SHA }}" || true
 
   atom-test-gate:
-    name: ${{ (github.event_name != 'pull_request_review' || needs.ci-gate.outputs.should_run == 'true' || needs.ci-gate.outputs.pr_check_takeover == 'true') && 'ATOM Test Gate' || 'ATOM Test Gate not requested' }}
+    name: ${{ ((github.event_name != 'pull_request_review' && !(github.event.action == 'labeled' && !(github.event.label.name == 'ci:atom' || (github.event.label.name == 'ci:full' && !contains(github.event.pull_request.labels.*.name, 'ci:atom'))))) || needs.ci-gate.outputs.should_run == 'true' || needs.ci-gate.outputs.pr_check_takeover == 'true') && 'ATOM Test Gate' || 'ATOM Test Gate not requested' }}
     if: always()
     runs-on: ubuntu-latest
     permissions:
