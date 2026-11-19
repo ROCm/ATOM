@@ -100,16 +100,46 @@ def prefill_score_config(
     batch: int,
     heads: int,
     compute_units: int,
+    fp4: bool = False,
 ) -> PrefillScoreConfig:
     """Choose a scorer launch without consulting live device-side lengths.
 
     ``None`` warp, stage, or chunk values mean that the generic launch policy
     owns that field. Keeping that distinction in a named value makes the
     policy/caller contract explicit and keeps CUDA Graph bounds stable.
-    """
-    if arch != "gfx1250" or not is_fp8:
-        return DEFAULT_PREFILL_SCORE_CONFIG
 
+    ``fp4``: the FP4 index cache (``index_fp4``). It takes the FP8 buckets --
+    the same page traffic pattern at 72 B a row instead of 128 -- with every
+    specialization at one stage: its rows are dequantized in registers
+    (``nvfp4_load_rows``), which deeper pipelining only multiplies (gfx1250
+    offline build at one stage: Q64 grouped 368 VGPRs, Q256 340, the Q128
+    multi-plane tile 338 at four warps -- 694 at its FP8 two -- none spilled).
+    """
+    if arch != "gfx1250" or not (is_fp8 or fp4):
+        return DEFAULT_PREFILL_SCORE_CONFIG
+    config = _gfx1250_prefill_score_config(
+        max_query_len, max_block, batch, heads, compute_units
+    )
+    if fp4 and config is not DEFAULT_PREFILL_SCORE_CONFIG:
+        config = config._replace(num_stages=FP4_PREFILL_SCORE_NUM_STAGES)
+        if config.block_size_q == SCORE_BLOCK_SIZE_Q and config.num_warps == 2:
+            # The multi-plane Q128 tile: at two warps the FP4 build needs 694
+            # VGPRs and spills SGPRs, at four 338.
+            config = config._replace(num_warps=4)
+    return config
+
+
+# Stages of every tuned FP4 prefill specialization (see `prefill_score_config`).
+FP4_PREFILL_SCORE_NUM_STAGES = 1
+
+
+def _gfx1250_prefill_score_config(
+    max_query_len: int,
+    max_block: int,
+    batch: int,
+    heads: int,
+    compute_units: int,
+) -> PrefillScoreConfig:
     planes = batch * heads
     grouped_q_tiles = _cdiv(max_query_len, 64)
     grouped_plane_tiles = grouped_q_tiles * planes
@@ -215,7 +245,8 @@ def prefill_score_config(
     return PrefillScoreConfig(
         block_size_q=tile_q,
         chunk_blocks=_cdiv(max_block, chunks),
-        num_warps=4,
+        # The 4-warp build (505 VGPRs, SGPRs spilled to VGPR lanes) hangs the GPU at long prefill.
+        num_warps=8,
         num_stages=1,
         store_group=1,
         prefetch_pages=False,

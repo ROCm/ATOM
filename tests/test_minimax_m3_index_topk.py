@@ -315,9 +315,10 @@ def test_emitted_order_is_full_blocks_by_score_then_the_partial_tail():
         torch.device("cuda"),
     )
     m._index_block_score_kernel[(q_tiles, len(qlens) * heads, triton.cdiv(max_block, cb))](
-        kw["idx_q"], kw["index_kv_cache"], score, kw["block_table"], kw["cu_seqlens_q"],
-        kw["seq_lens"], kw["prefix_lens"], heads, HEAD_DIM, kw["sm_scale"], cb,
-        *kw["idx_q"].stride(), *kw["index_kv_cache"].stride(), *score.stride(),
+        kw["idx_q"], kw["index_kv_cache"], kw["index_kv_cache"], score,
+        kw["block_table"], kw["cu_seqlens_q"], kw["seq_lens"], kw["prefix_lens"],
+        heads, HEAD_DIM, kw["sm_scale"], cb,
+        *kw["idx_q"].stride(), *kw["index_kv_cache"].stride(), 0, 0, *score.stride(),
         kw["block_table"].stride(0), BLOCK_SIZE_Q=m.SCORE_BLOCK_SIZE_Q,
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE, num_stages=m.SCORE_NUM_STAGES,
     )  # fmt: skip
@@ -663,6 +664,7 @@ def test_prefill_launch_policy_preserves_scores_and_selection(
         ](
             q,
             cache,
+            cache,  # scale pointer, unused without IS_FP4
             result,
             kw["block_table"],
             kw["cu_seqlens_q"],
@@ -674,6 +676,8 @@ def test_prefill_launch_policy_preserves_scores_and_selection(
             chunk,
             *q.stride(),
             *cache.stride(),
+            0,  # scale strides, unused without IS_FP4
+            0,
             *result.stride(),
             kw["block_table"].stride(0),
             BLOCK_SIZE_Q=block_q,
@@ -734,7 +738,7 @@ def test_prefill_launch_policy_preserves_scores_and_selection(
         patch.setattr(
             m,
             "_prefill_score_config",
-            lambda *args: DEFAULT_PREFILL_SCORE_CONFIG,
+            lambda *args, **kwargs: DEFAULT_PREFILL_SCORE_CONFIG,
         )
         patch.setattr(m, "_parallel_prefill_selector_wins", lambda **kwargs: False)
         old_outputs = m.minimax_m3_index_topk(**kw, emit_sparse_block_table=True)
@@ -849,8 +853,11 @@ def test_decode_chunk_policy_scores_selection_and_replay(
     def score(policy):
         out = torch.full((heads, total_q, pages), float("-inf"), device=device)
         chunks = policy(batch, pages)
-        m._decode_index_score_tiled_kernel[(batch, chunks)](
+        # The tiled scorer's grid is (chunk, request); the cache doubles as the
+        # unused FP4 scale pointer, with zero scale strides.
+        m._decode_index_score_tiled_kernel[(chunks, batch)](
             q,
+            cache,
             cache,
             out,
             table,
@@ -860,6 +867,8 @@ def test_decode_chunk_policy_scores_selection_and_replay(
             triton.cdiv(pages, chunks),
             *q.stride(),
             *cache.stride(),
+            0,
+            0,
             *out.stride(),
             table.stride(0),
             NUM_IDX_HEADS=heads,
@@ -960,8 +969,16 @@ def test_transposed_decode_score_matches_baseline_and_replay(
 
     def score(kernel, warps):
         out = torch.empty((heads, batch * max_q, pages), device=device)
-        kernel[(batch, chunks)](
+        # (chunk, request) for the tiled scorer, (request, chunk) for the
+        # transposed one; the cache doubles as the unused FP4 scale pointer.
+        grid = (
+            (chunks, batch)
+            if kernel is m._decode_index_score_tiled_kernel
+            else (batch, chunks)
+        )
+        kernel[grid](
             q,
+            cache,
             cache,
             out,
             table,
@@ -971,6 +988,8 @@ def test_transposed_decode_score_matches_baseline_and_replay(
             triton.cdiv(pages, chunks),
             *q.stride(),
             *cache.stride(),
+            0,
+            0,
             *out.stride(),
             table.stride(0),
             NUM_IDX_HEADS=heads,
@@ -1116,7 +1135,7 @@ def test_gfx1250_issue_341_tp4_launch_is_bit_exact(
         patch.setattr(
             m,
             "_prefill_score_config",
-            lambda *args: DEFAULT_PREFILL_SCORE_CONFIG,
+            lambda *args, **kwargs: DEFAULT_PREFILL_SCORE_CONFIG,
         )
         previous = m.minimax_m3_index_topk(**kw, emit_sparse_block_table=True)
     torch.cuda.synchronize()

@@ -419,6 +419,13 @@ def build_page_namespace(
     index_layout = getattr(config, "index_cache_layout", None)
     if index_layout is not None:
         document["index_cache_layout"] = index_layout
+    from atom.utils import envs
+
+    if envs.ATOM_M3_SPARSE_KV_NVFP4:
+        # NVFP4 sparse K/V bytes at the same block size: only the env says so,
+        # and an FP8 tier's chunk would load into them. Added only when set,
+        # so every other server's namespace is unchanged.
+        document["sparse_kv_format"] = "nvfp4"
     canonical = json.dumps(
         document,
         sort_keys=True,

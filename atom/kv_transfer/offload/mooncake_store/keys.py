@@ -79,13 +79,17 @@ def kv_layout_selectors() -> dict[str, Any]:
     it spawns read the same environment. A switch a model does not use costs a
     miss across servers that differ in it, never another layout's KV.
     """
-    return {
+    selectors = {
         "mla_page_size": int(envs.ATOM_MLA_PAGE_SIZE),
         "triton_mla": bool(envs.ATOM_USE_TRITON_MLA),
         "triton_mla_shuffle_kv": bool(envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV),
         "unified_attn": bool(envs.ATOM_USE_UNIFIED_ATTN),
         "force_attn_triton": bool(envs.ATOM_FORCE_ATTN_TRITON),
     }
+    # MiniMax-M3's NVFP4 sparse K/V; present only when set, so other keys keep.
+    if envs.ATOM_M3_SPARSE_KV_NVFP4:
+        selectors["m3_sparse_kv_nvfp4"] = True
+    return selectors
 
 
 def kv_storage_formats(config: Any) -> dict[str, str]:

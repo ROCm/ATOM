@@ -164,3 +164,40 @@ def test_prefill_score_config_cache_is_bounded():
         "maxsize": 128,
         "typed": False,
     }
+
+
+@pytest.mark.parametrize(
+    "q_len, blocks, batch, heads",
+    [
+        (2517, 823, 1, 1),  # Q64 grouped
+        (8193, 640, 1, 4),  # multi-plane
+        (131072, 2048, 1, 1),  # Q256
+        (1024, 640, 1, 1),  # default
+        (96, 640, 1, 4),  # default
+    ],
+)
+def test_fp4_takes_the_fp8_buckets_at_one_stage(q_len, blocks, batch, heads):
+    """The FP4 index cache: the FP8 bucket for the shape, every tuned
+    specialization at FP4_PREFILL_SCORE_NUM_STAGES (its rows are dequantized in
+    registers) and the multi-plane tile at four warps, the default left to the
+    generic launch policy."""
+    from atom.model_ops.minimax_m3.prefill_policy import FP4_PREFILL_SCORE_NUM_STAGES
+
+    fp8 = prefill_score_config("gfx1250", True, q_len, blocks, batch, heads, 256)
+    fp4 = prefill_score_config(
+        "gfx1250", False, q_len, blocks, batch, heads, 256, fp4=True
+    )
+    if fp8 is DEFAULT_PREFILL_SCORE_CONFIG:
+        assert fp4 is DEFAULT_PREFILL_SCORE_CONFIG
+    else:
+        want = fp8._replace(num_stages=FP4_PREFILL_SCORE_NUM_STAGES)
+        if fp8 == MULTI_PLANE:
+            want = want._replace(num_warps=4)  # two warps: 694 VGPRs on FP4
+        assert fp4 == want
+    # Off gfx1250 the FP4 cache keeps the default, as FP8 does.
+    assert (
+        prefill_score_config(
+            "gfx950", False, q_len, blocks, batch, heads, 256, fp4=True
+        )
+        is DEFAULT_PREFILL_SCORE_CONFIG
+    )

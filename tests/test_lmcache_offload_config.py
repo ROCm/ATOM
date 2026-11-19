@@ -580,3 +580,18 @@ def test_v41_keeps_the_namespace_hybrid_gave_it(monkeypatch):
     )
     monkeypatch.setattr(offcfg, "select_offload_layout", lambda _config: "hybrid")
     assert v41 == namespace("deepseek_v41", sliding_window=128, candidate_block_size=8)
+
+
+def test_nvfp4_sparse_kv_gets_its_own_offload_namespace(monkeypatch):
+    """NVFP4 sparse K/V (an env switch) writes other bytes at the same block
+    size, so it must not share an FP8 server's LMCache / Mooncake keys; with the
+    switch off, both namespaces are what they were."""
+    from atom.kv_transfer.offload.mooncake_store.keys import kv_layout_selectors
+
+    monkeypatch.delenv("ATOM_M3_SPARSE_KV_NVFP4", raising=False)
+    fp8_namespace = offcfg.build_page_namespace(_config(), _lmcache_config(), 4)
+    fp8_selectors = kv_layout_selectors()
+    assert "m3_sparse_kv_nvfp4" not in fp8_selectors
+    monkeypatch.setenv("ATOM_M3_SPARSE_KV_NVFP4", "1")
+    assert offcfg.build_page_namespace(_config(), _lmcache_config(), 4) != fp8_namespace
+    assert kv_layout_selectors() == {**fp8_selectors, "m3_sparse_kv_nvfp4": True}

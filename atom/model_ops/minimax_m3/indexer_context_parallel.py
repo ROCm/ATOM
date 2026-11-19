@@ -15,6 +15,13 @@ from atom.model_ops.minimax_m3.index_topk import (
     _launch_select,
     _require_packable,
 )
+from atom.model_ops.minimax_m3.nvfp4_kernels.nvfp4 import (
+    NVFP4_SCALED_DOT,
+    nvfp4_block_max,
+    nvfp4_load_packed,
+    nvfp4_scaled_dot,
+    nvfp4_split_query,
+)
 
 # A decode graph is captured for max_model_len, so a grid sized by the launch
 # width is mostly programs past every request. The grid is sized by the batch
@@ -22,6 +29,20 @@ from atom.model_ops.minimax_m3.index_topk import (
 CP_SCORE_PROGRAMS = 1024
 CP_SCORE_MIN_SPAN = 2  # blocks a program scores at least
 CP_SCORE_PAD_TILE = 64  # -inf slots a store writes past the live blocks
+CP_SCORE_FP4_NUM_STAGES = 1
+# FP4 programs (all requests together), warps and query rows a program. A
+# program walks its blocks one at a time and the scaled read's block max
+# dominates each step, so FP4 wants many short programs and one warp. MI455X b64
+# sweeps (us; FP8 CP at 1024 x 4 warps: q1 131K 19.7, q1 300K 46.4, q8 131K
+# 24.9, q8 300K 51.9): q1 16384 x 1 warp 12.5 / 31.5; q8 with all 32 rows (4
+# heads x 8) in one program, 16384 x 1 20.3 / 43.3 -- splitting them over two
+# 16-row programs (grid axis 2) was slower, 22.0 / 52.9 at its best: the second
+# read of each block costs more than the smaller tile saves. Rows beyond
+# CP_SCORE_FP4_ROWS still split (MTP16 and up). One warp builds to 136 VGPRs at
+# 16 rows and 290 at 32, none spilled.
+CP_SCORE_FP4_PROGRAMS = 16384
+CP_SCORE_FP4_NUM_WARPS = 1
+CP_SCORE_FP4_ROWS = 32
 
 
 @functools.cache
@@ -31,11 +52,13 @@ def _transposed_score() -> bool:
     return get_gfx_runtime() == "gfx1250"
 
 
-def _context_score_programs(batch: int, local_blocks: int) -> int:
+def _context_score_programs(
+    batch: int, local_blocks: int, total: int = CP_SCORE_PROGRAMS
+) -> int:
     return max(
         1,
         min(
-            CP_SCORE_PROGRAMS // max(1, batch),
+            total // max(1, batch),
             triton.cdiv(local_blocks, CP_SCORE_MIN_SPAN),
         ),
     )
@@ -62,12 +85,29 @@ def _context_score(
     N: tl.constexpr,
     SCALE: tl.constexpr,
     TRANSPOSED: tl.constexpr,
+    # FP4 index (`index_fp4`): Cache is the payload [pages, 128, 64] uint8 and
+    # Scales its E4M3 scales [pages, 128, 8], pages PAGE_STRIDE / SCALE_PAGE_STRIDE
+    # bytes apart, read by the scaled WMMA against the query in two E4M3 terms
+    # (`nvfp4_scaled_dot`) -- the gfx1250 TP decode scorer's read, so the
+    # selection is the TP path's. Left
+    # None otherwise: constexpr, so the FP8 / BF16 build is the one before them.
+    Scales=None,
+    PAGE_STRIDE=None,
+    SCALE_PAGE_STRIDE=None,
+    IS_FP4: tl.constexpr = False,
+    # Query-row split (FP4): grid axis 2 has ROW_SPLIT programs, each scoring
+    # rows [N * split, N * split + N) of the request's HEADS * QUERY_LEN.
+    ROW_SPLIT: tl.constexpr = 1,
 ):
+    tl.static_assert(not IS_FP4 or (NVFP4_SCALED_DOT and TRANSPOSED))
     request = tl.program_id(0)
     tokens = tl.num_programs(0) * QUERY_LEN
     program = tl.program_id(1)
     programs = tl.num_programs(1)
-    n = tl.arange(0, N)
+    if ROW_SPLIT > 1:
+        n = tl.arange(0, N) + tl.program_id(2) * N
+    else:
+        n = tl.arange(0, N)
     token, head = n // HEADS, n % HEADS
     row = request * QUERY_LEN + token
     live = n < HEADS * QUERY_LEN
@@ -90,22 +130,41 @@ def _context_score(
             q = tl.load(q_rows[:, None] + d[None, :], mask=live[:, None], other=0)
         else:
             q = tl.load(q_rows[None, :] + d[:, None], mask=live[None, :], other=0)
+        if IS_FP4:
+            q_hi, q_lo, q_lo_scale = nvfp4_split_query(q)
         for local in tl.range(start, end):
             block = local * WORLD + RANK
             page = tl.load(Table + request * TABLE_STRIDE + block).to(tl.int64)
-            k_page = Cache + page * 128 * 128
-            if TRANSPOSED:
-                k = tl.load(
-                    k_page + pos[None, :] * 128 + d[:, None], cache_modifier=".cv"
+            if IS_FP4:
+                payload, kscale = nvfp4_load_packed(
+                    Cache,
+                    Scales,
+                    page * PAGE_STRIDE,
+                    page * SCALE_PAGE_STRIDE,
+                    pos,
+                    128,
                 )
-                dot = tl.dot(q, k.to(q.dtype), out_dtype=tl.float32) * SCALE
-                in_ctx = block * 128 + pos[None, :] < cutoff[:, None]
-                score = tl.max(tl.where(in_ctx, dot, float("-inf")), 1)
+                score = nvfp4_block_max(
+                    nvfp4_scaled_dot(q_hi, q_lo, q_lo_scale, payload, kscale),
+                    block * 128,
+                    pos,
+                    cutoff,
+                    SCALE,
+                )
             else:
-                k = tl.load(k_page + pos[:, None] * 128 + d[None, :])
-                dot = tl.dot(k.to(q.dtype), q, out_dtype=tl.float32) * SCALE
-                in_ctx = block * 128 + pos[:, None] < cutoff[None, :]
-                score = tl.max(tl.where(in_ctx, dot, float("-inf")), 0)
+                k_page = Cache + page * 128 * 128
+                if TRANSPOSED:
+                    k = tl.load(
+                        k_page + pos[None, :] * 128 + d[:, None], cache_modifier=".cv"
+                    )
+                    dot = tl.dot(q, k.to(q.dtype), out_dtype=tl.float32) * SCALE
+                    in_ctx = block * 128 + pos[None, :] < cutoff[:, None]
+                    score = tl.max(tl.where(in_ctx, dot, float("-inf")), 1)
+                else:
+                    k = tl.load(k_page + pos[:, None] * 128 + d[None, :])
+                    dot = tl.dot(k.to(q.dtype), q, out_dtype=tl.float32) * SCALE
+                    in_ctx = block * 128 + pos[:, None] < cutoff[None, :]
+                    score = tl.max(tl.where(in_ctx, dot, float("-inf")), 0)
             tl.store(s_row + local, score, mask=live)
     # Every output slot is overwritten, including empty shards and replay padding.
     pad_span = (LOCAL_BLOCKS - live_end + programs - 1) // programs
@@ -130,11 +189,14 @@ def indexer_context_scores(
     world_size,
     max_query_len,
     sm_scale,
+    index_scale=None,
 ):
     """Return [heads,tokens,ceil(blocks/world)] with round-robin logical blocks.
 
     Index cache remains replicated. Caller supplies valid live lengths no greater
     than max_seq_len and in-bounds physical pages; no host reads of live metadata.
+    ``index_scale``: the FP4 index cache (``--index-cache-dtype fp4``), whose
+    payload ``index_cache`` is then uint8 ``[pages, 128, 64]`` (see index_fp4).
     """
     if (
         world_size < 1
@@ -155,13 +217,34 @@ def indexer_context_scores(
     tokens, heads, _ = idx_q.shape
     if heads < 1 or seq_lens.ndim != 1 or tokens != seq_lens.numel() * max_query_len:
         raise ValueError("query rows must equal batch * max_query_len")
-    if (
+    is_fp4 = index_scale is not None
+    if is_fp4:
+        # The two planes' rows are contiguous; their pages may sit anywhere
+        # (pool fields), 16 B apart at least.
+        if (
+            not NVFP4_SCALED_DOT
+            or not _transposed_score()
+            or index_cache.dtype != torch.uint8
+            or index_scale.dtype != torch.uint8
+            or index_cache.ndim != 3
+            or index_cache.shape[1:] != (128, 64)
+            or index_cache.stride()[1:] != (64, 1)
+            or index_scale.shape != (index_cache.shape[0], 128, 8)
+            or index_scale.stride()[1:] != (8, 1)
+            or index_cache.stride(0) % 16
+            or index_scale.stride(0) % 16
+        ):
+            raise ValueError(
+                "FP4 index cache must be uint8 [pages,128,64] with uint8 scales "
+                "[pages,128,8], contiguous rows, on an arch reading whole rows"
+            )
+    elif (
         index_cache.ndim != 3
         or index_cache.shape[1:] != (128, 128)
         or not index_cache.is_contiguous()
     ):
         raise ValueError("index cache must be contiguous [pages,128,128]")
-    if index_cache.dtype not in (
+    elif index_cache.dtype not in (
         torch.bfloat16,
         torch.float8_e4m3fn,
         torch.float8_e4m3fnuz,
@@ -184,6 +267,7 @@ def indexer_context_scores(
     if any(
         not x.is_cuda or x.device != idx_q.device
         for x in (idx_q, index_cache, block_table, seq_lens)
+        + ((index_scale,) if is_fp4 else ())
     ):
         raise ValueError("all score inputs must be on the same GPU")
     local = triton.cdiv(blocks, world_size)
@@ -191,8 +275,19 @@ def indexer_context_scores(
         (heads, tokens, local), dtype=torch.float32, device=idx_q.device
     )
     if tokens:
-        programs = _context_score_programs(seq_lens.numel(), local)
-        _context_score[(seq_lens.numel(), programs)](
+        programs = _context_score_programs(
+            seq_lens.numel(),
+            local,
+            CP_SCORE_FP4_PROGRAMS if is_fp4 else CP_SCORE_PROGRAMS,
+        )
+        rows = heads * max_query_len
+        rows_pow2 = max(16, triton.next_power_of_2(rows))
+        # FP4: at most CP_SCORE_FP4_ROWS query rows a program, the rest on grid
+        # axis 2 (FP8 / BF16 score every row in one program).
+        row_tile = min(rows_pow2, CP_SCORE_FP4_ROWS) if is_fp4 else rows_pow2
+        row_split = triton.cdiv(rows, row_tile)
+        grid = (seq_lens.numel(), programs) + ((row_split,) if row_split > 1 else ())
+        _context_score[grid](
             idx_q,
             index_cache,
             block_table,
@@ -209,10 +304,23 @@ def indexer_context_scores(
             WORLD=world_size,
             MIN_SPAN=CP_SCORE_MIN_SPAN,
             PAD_TILE=CP_SCORE_PAD_TILE,
-            N=max(16, triton.next_power_of_2(heads * max_query_len)),
+            N=row_tile,
             SCALE=sm_scale * 1.4426950409,
             TRANSPOSED=_transposed_score(),
-            num_stages=3,
+            **(
+                {
+                    "Scales": index_scale,
+                    "PAGE_STRIDE": index_cache.stride(0),
+                    "SCALE_PAGE_STRIDE": index_scale.stride(0),
+                    "IS_FP4": True,
+                    # One stage, one warp (see CP_SCORE_FP4_PROGRAMS).
+                    "num_stages": CP_SCORE_FP4_NUM_STAGES,
+                    "num_warps": CP_SCORE_FP4_NUM_WARPS,
+                    "ROW_SPLIT": row_split,
+                }
+                if is_fp4
+                else {"num_stages": 3}
+            ),
         )
     return scores
 

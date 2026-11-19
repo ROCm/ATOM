@@ -23,6 +23,7 @@ _POOL_VIEW_ATTRS = (
     "k_scale",
     "v_scale",
     "index_cache",
+    "index_scale",
 )
 
 

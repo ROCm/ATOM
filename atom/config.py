@@ -1984,6 +1984,71 @@ def qrep_for_step(
     return qrep_enabled and not use_seg_mla and (not is_prefill or prefill_qrep)
 
 
+def m3_reuses_index_topk(text_config) -> bool:
+    """Whether any MiniMax-M3 sparse layer reuses the previous layer's top-k:
+    the model's own schedule (``models/minimax_m3/index_schedule``) over its
+    sparse layers, ``index_skip_topk_offset`` and the pattern's bounds included."""
+    from atom.models.minimax_m3.index_schedule import reuses_index_topk
+
+    return reuses_index_topk(text_config)
+
+
+def m3_fp4_cache_unsupported_reason(
+    gfx: str,
+    index_fp4: bool,
+    kv_nvfp4: bool,
+    tp_size: int,
+    num_heads: int,
+    num_kv_heads: int,
+    reuses_topk: bool,
+    plugin: bool = False,
+) -> str | None:
+    """Why MiniMax-M3's FP4 index cache / NVFP4 sparse KV cannot run here, or None.
+
+    Pure for the same reason as ``indexer_cp_unsupported_reason``. Both caches
+    run on gfx950 (Gluon attention and fused verify top-k, hardware e2m1
+    decode) and gfx1250 (Triton attention, unfused score + top-k, integer e2m1
+    decode). The NVFP4 attention serves 16 q heads per kv head on a rank (M3.1
+    at TP4: 16 / 1; the gfx950 kernel's shape, kept for both) and only layers
+    that run their own indexer: a layer reusing the previous top-k writes no
+    NVFP4 K/V. The vLLM / SGLang plugin bridges bind their own caches and know
+    neither layout, so a plugin deployment would silently keep FP8.
+    """
+    if not (index_fp4 or kv_nvfp4):
+        return None
+    if plugin:
+        return "FP4/NVFP4 MiniMax-M3 caches are not supported in plugin mode"
+    if gfx not in ("gfx950", "gfx1250"):
+        return f"FP4/NVFP4 MiniMax-M3 caches need gfx950 or gfx1250, not {gfx}"
+    if kv_nvfp4:
+        q_per_kv = (num_heads // tp_size) // max(1, num_kv_heads // tp_size)
+        if q_per_kv != 16:
+            return (
+                "ATOM_M3_SPARSE_KV_NVFP4 needs 16 q heads per kv head on a rank, "
+                f"got {q_per_kv} at TP{tp_size}"
+            )
+        if reuses_topk:
+            return "ATOM_M3_SPARSE_KV_NVFP4 does not cover top-k-reusing layers"
+    return None
+
+
+def indexer_cp_fp4_index_unsupported_reason(gfx: str) -> str | None:
+    """Why the MiniMax-M3 indexer-CP scorer cannot read the FP4 index cache here,
+    or None.
+
+    The CP context scorer reads FP4 index rows whole (``nvfp4_load_rows``), the
+    formulation of the gfx1250 TP decode scorers, so its selection is theirs.
+    gfx950's TP scorers read the rows as even / odd halves (and score with the
+    fused verify top-k under NVFP4 K/V), which the CP scorer does not model.
+    """
+    if gfx != "gfx1250":
+        return (
+            "--index-cache-dtype fp4 with the CP scorer is gfx1250-only "
+            f"(whole-row FP4 reads), not {gfx}"
+        )
+    return None
+
+
 def indexer_cp_unsupported_reason(
     arches,
     tp_size: int,
@@ -2915,6 +2980,10 @@ class Config:
                 self.enable_tbo or self.enable_tbo_decode,
                 is_plugin_mode(),
             )
+            if indexer_cp_off is None and self.index_cache_dtype == "fp4":
+                from aiter.jit.utils.chip_info import get_gfx
+
+                indexer_cp_off = indexer_cp_fp4_index_unsupported_reason(get_gfx())
             if indexer_cp_off is not None:
                 logger.warning(
                     "dcp_config.indexer_dcp_only disabled: %s.", indexer_cp_off
@@ -2956,6 +3025,25 @@ class Config:
                 self.index_cache_dtype = "fp8"
             else:
                 self.index_cache_dtype = self.kv_cache_dtype
+
+        if _is_minimax_m3_config(self.hf_config):
+            text_cfg = getattr(self.hf_config, "text_config", self.hf_config)
+            index_fp4 = self.index_cache_dtype == "fp4"
+            if index_fp4 or envs.ATOM_M3_SPARSE_KV_NVFP4:
+                from aiter.jit.utils.chip_info import get_gfx
+
+                fp4_off = m3_fp4_cache_unsupported_reason(
+                    get_gfx(),
+                    index_fp4,
+                    envs.ATOM_M3_SPARSE_KV_NVFP4,
+                    self.tensor_parallel_size,
+                    text_cfg.num_attention_heads,
+                    text_cfg.num_key_value_heads,
+                    m3_reuses_index_topk(text_cfg),
+                    plugin=self.plugin_config is not None,
+                )
+                if fp4_off is not None:
+                    raise ValueError(fp4_off)
 
         if self.hf_config.model_type == "deepseek_v41_text":
             # CSA2's index plane is paged by the same scorer GLM's is, so a
