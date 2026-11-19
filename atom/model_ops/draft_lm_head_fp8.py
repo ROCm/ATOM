@@ -38,7 +38,16 @@ class DraftLMHeadFP8:
             per_1x128_e8m0_quant,
         )
 
-        xq, xs = per_1x128_e8m0_quant(x.contiguous(), dtypes.fp8, transpose_scale=True)
+        from atom.model_ops import draft_tail_quant
+
+        # ATOM_MTP_TAIL_LMHEAD_QUANT: the quant the final norm's launch wrote, if any.
+        pre = draft_tail_quant.take_prepared(x) if draft_tail_quant.ENABLED else None
+        if pre is not None:
+            xq, xs = pre
+        else:
+            xq, xs = per_1x128_e8m0_quant(
+                x.contiguous(), dtypes.fp8, transpose_scale=True
+            )
         return gemm_a8w8_blockscale_preshuffle_impl(
             xq, self.weight, xs, self.weight_scale, torch.bfloat16
         )

@@ -386,6 +386,30 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             select_rows = None  # already selected
 
         if isinstance(hidden_states, MoEGatedSum):
+            # ATOM_MTP_TAIL_LMHEAD_QUANT: the same launch also writes the draft
+            # FP8 LM head's activation quant (draft_tail_quant).
+            from atom.model_ops import draft_tail_quant
+
+            if (
+                draft_tail_quant.ENABLED
+                and not self.norm.fused_allreduce
+                and draft_tail_quant.applies(
+                    hidden_states, residual, self.norm.weight, select_rows, False
+                )
+                and (
+                    select_rows.shape[0]
+                    if select_rows is not None
+                    else hidden_states.shared.shape[0]
+                )
+                <= draft_tail_quant.MAX_ROWS
+            ):
+                return draft_tail_quant.moe_gather_tail_rmsnorm_fp8g128(
+                    hidden_states,
+                    residual,
+                    self.norm.weight,
+                    self.norm.variance_epsilon,
+                    select_rows,
+                )
             # ATOM_FUSED_MOE_TAIL_NORM: the layer's gated shared-expert add, its
             # residual add and this norm in one launch, over the selected rows
             # only, and no residual store (nothing reads it).

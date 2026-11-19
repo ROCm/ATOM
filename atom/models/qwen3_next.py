@@ -1083,6 +1083,14 @@ class Qwen3NextAttention(nn.Module):
             if fold_enabled()
             else None
         )
+        if qkv is None and x_scale is None:
+            # ATOM_FOLD_QKNORM_QKV_BF16: the same fold for a bf16 qkv_proj (the MTP drafter's)
+            from atom.model_ops import fold_qkv_qknorm_bf16
+
+            if fold_qkv_qknorm_bf16.ENABLED:
+                qkv = fold_qkv_qknorm_bf16.try_fold_qkv_bf16(
+                    self, positions, hidden_states
+                )
         if qkv is None:
             qkv = self.qkv_proj(hidden_states, x_scale=x_scale)
         gate = None
@@ -1681,9 +1689,25 @@ class Qwen3NextDecoderLayer(nn.Module):
         else:
             if rows_before_o_proj is not None:
                 residual = torch.index_select(residual, 0, rows_before_o_proj)
-            hidden_states, residual = self.post_attention_layernorm(
-                hidden_states, residual
-            )
+            # ATOM_MTP_ROWS_IN_POST_ATTN_NORM: the step-0 row selection in the norm's launch
+            rows_norm = None
+            if select_rows is not None and rows_before_o_proj is None:
+                from atom.model_ops import draft_rows_norm
+
+                if draft_rows_norm.ENABLED:
+                    rows_norm = draft_rows_norm.try_post_attn_norm_rows(
+                        self.post_attention_layernorm,
+                        hidden_states,
+                        residual,
+                        select_rows,
+                    )
+            if rows_norm is not None:
+                hidden_states, residual = rows_norm
+                select_rows = None  # already selected
+            else:
+                hidden_states, residual = self.post_attention_layernorm(
+                    hidden_states, residual
+                )
 
         if select_rows is not None and rows_before_o_proj is None:
             hidden_states = torch.index_select(hidden_states, 0, select_rows)
