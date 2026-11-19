@@ -184,12 +184,13 @@ cannot affect a server that does not use the feature.
 
 ### Qwen3.8-Flash-Next (GDN)
 
-Both are read once per process, when the GDN state cache is bound (native ATOM, and the SGLang and RTP-LLM plugins). FlyDSL needs HIP and aiter's FlyDSL GDN ops; when they do not import, both stages stay on Triton.
+The two backend switches are read once per process, when the GDN state cache is bound (native ATOM, and the SGLang and RTP-LLM plugins). FlyDSL needs HIP and aiter's FlyDSL GDN ops; when they do not import, both stages stay on Triton.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_GDN_PREFILL_BACKEND** | str | `auto` | GDN prefill kernel: `auto` or `flydsl` runs aiter's FlyDSL chunked prefill, `triton` forces Triton; any other value raises `ValueError`. `flydsl` behaves like `auto`: it does not override the gates below, and a forward FlyDSL does not support (its shapes, or `ATOM_GDN_STATE_MIDSTEP` snapshots) runs Triton. Under ReplaySSM (MTP target verification, on by default) FlyDSL prefill runs only on gfx942, the arch it is validated on, and writes its checkpoint into the same contiguous KV pool as Triton; the RTP-LLM plugin keeps Triton there. The SGLang plugin runs FlyDSL prefill only on gfx942, with or without ReplaySSM. Set `triton` to roll back. |
 | **ATOM_GDN_DECODE_BACKEND** | str | `auto` | GDN decode kernel: `auto` or `flydsl` runs aiter's FlyDSL decode on a zero-copy VK view of the state, `triton` forces Triton; any other value raises `ValueError`. FlyDSL decode runs only on gfx942, with 128x128 BF16 or FP32 state and BF16 activations, and never under ReplaySSM, whose kernels address the contiguous KV pool; `ATOM_ENABLE_GDN_DECODE_LOSSY_FAST=1` also keeps Triton. A batch whose inputs FlyDSL does not support runs Triton. Set `triton` to roll back. |
+| **ATOM_ENABLE_GDN_DECODE_LOSSY_FAST** | bool | 0 (false) | Set to `1` to run decode-only GDN batches with no speculative tokens, when ReplaySSM is off, through `gdn_decode_update_lossy_fast`: one Triton kernel that fuses the gating into the recurrent update, instead of `fused_gdn_gating` followed by `fused_recurrent_gated_delta_rule`. It is approximate: the state update can differ from that path at BF16 scale (#838 reports GSM8K on par on Qwen3.5-35B-A3B-FP8). Applies to every ATOM GDN layer (Qwen3-Next, Qwen3.5, Qwen3.8-Flash-Next), natively and in the SGLang and RTP-LLM plugins; where it applies, FlyDSL decode does not run. |
 
 ### GLM-5.3
 
