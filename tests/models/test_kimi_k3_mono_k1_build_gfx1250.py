@@ -320,3 +320,87 @@ def test_replay_spec_refuses_an_inconsistent_window(cap, window, message):
     spec = replace(_spec(5), replay_cap=cap, replay_window=window)
     with pytest.raises(ValueError, match=message):
         spec.validate(_plan(40))
+
+
+def test_chunk_recurrence_defaults_to_replay_builds(monkeypatch):
+    from atom.models.kimi_k3.mono.kernels.attention import kda_resident_gfx1250
+    from atom.utils import envs
+
+    monkeypatch.delenv("ATOM_KIMI_MONO_K1_CHUNK_RECUR", raising=False)
+    assert envs.ATOM_KIMI_MONO_K1_CHUNK_RECUR == "auto"
+    chunk = kda_resident_gfx1250._chunk_recur
+    assert chunk(8, True) and chunk(5, True)
+    assert not chunk(8, False) and not chunk(5, False)
+    assert not chunk(1, True)
+    monkeypatch.setenv("ATOM_KIMI_MONO_K1_CHUNK_RECUR", "1")
+    assert chunk(8, False) and chunk(5, True) and not chunk(1, False)
+    monkeypatch.setenv("ATOM_KIMI_MONO_K1_CHUNK_RECUR", "0")
+    assert not chunk(8, True)
+
+
+@pytest.mark.parametrize("qlen", range(2, 17))
+def test_chunk_interactions_fit_the_gate_staging(qlen):
+    from atom.models.kimi_k3.mono.kernels.attention import kda_gfx1250
+
+    words = kda_gfx1250.chunk_interaction_words(qlen)
+    assert words >= qlen * qlen and words % kda_gfx1250.CHUNK_SUM_GROUP == 0
+    # every wave's words in ``fa`` (qlen * 128 words)
+    assert words * 8 <= qlen * kda_gfx1250.HEAD_DIM
+
+
+def test_chunk_interactions_of_the_serving_windows():
+    from atom.models.kimi_k3.mono.kernels.attention import kda_gfx1250
+
+    assert kda_gfx1250.chunk_interaction_words(5) == 32
+    assert kda_gfx1250.chunk_interaction_words(8) == 64
+    # the gates' bound at -5: L = 8's cumulative decay divides safely
+    assert -5.0 * 8 >= kda_gfx1250.CHUNK_MIN_LOG_DECAY
+
+
+@pytest.mark.parametrize("qlen", [5, 8])
+def test_chunk_form_matches_the_token_recurrence(qlen):
+    """``kda_recur_head_chunk``'s algebra (f64, host): S_0's projections and
+    outputs through the cumulative decays, the interactions solved forward,
+    against the token-by-token delta rule, and its last state."""
+    import torch
+
+    gen = torch.Generator().manual_seed(qlen)
+    rows, dim = 16, 128
+    state0 = torch.randn(rows, dim, generator=gen, dtype=torch.float64) * 0.05
+    q = torch.nn.functional.normalize(
+        torch.randn(qlen, dim, generator=gen, dtype=torch.float64), dim=-1
+    )
+    k = torch.nn.functional.normalize(
+        torch.randn(qlen, dim, generator=gen, dtype=torch.float64), dim=-1
+    )
+    v = torch.randn(qlen, rows, generator=gen, dtype=torch.float64)
+    beta = torch.rand(qlen, generator=gen, dtype=torch.float64)
+    decay = torch.exp(-5.0 * torch.rand(qlen, dim, generator=gen, dtype=torch.float64))
+
+    state, outputs, values = state0.clone(), [], []
+    for t in range(qlen):
+        state = state * decay[t]
+        value = (v[t] - state @ k[t]) * beta[t]
+        state = state + value[:, None] * k[t]
+        values.append(value)
+        outputs.append(state @ q[t])
+
+    cumulative = torch.cumprod(decay, dim=0)
+    key_t, query_t, key_j = k * cumulative, q * cumulative, k / cumulative
+    m, p = key_t @ key_j.T, query_t @ key_j.T
+    chunk_values, chunk_outputs = [], []
+    for t in range(qlen):
+        correction = state0 @ key_t[t]
+        for j in range(t):
+            correction = correction + m[t, j] * chunk_values[j]
+        chunk_values.append((v[t] - correction) * beta[t])
+        output = state0 @ query_t[t]
+        for j in range(t + 1):
+            output = output + p[t, j] * chunk_values[j]
+        chunk_outputs.append(output)
+    last = state0
+    for t in range(qlen):
+        last = last * decay[t] + chunk_values[t][:, None] * k[t]
+    torch.testing.assert_close(torch.stack(chunk_values), torch.stack(values))
+    torch.testing.assert_close(torch.stack(chunk_outputs), torch.stack(outputs))
+    torch.testing.assert_close(last, state)
