@@ -209,7 +209,9 @@ def _auto_head_split(heads: int, blocks: int) -> int:
     return next((count for count in (4, 2) if heads * count <= blocks), 1)
 
 
-REPLAY_MAX_SPLIT = 2
+# ReplaySSM verify windows whose head split beyond this many CTAs spills
+# SGPRs (DSpark 4's at four; DSpark 7's window 8 is clean at four)
+REPLAY_MAX_SPLIT = {5: 2}
 
 
 def _head_split(heads: int, blocks: int) -> int:
@@ -286,10 +288,9 @@ def build_resident_k1(
     auto_split = (
         _auto_head_split((s // qlen) * HEADS, declaration.blocks) if whole_heads else 1
     )
-    if spec.replay_cap:
-        # a ReplaySSM head split four or eight ways spills SGPRs
-        head_split = min(head_split, REPLAY_MAX_SPLIT)
-        auto_split = min(auto_split, REPLAY_MAX_SPLIT)
+    if spec.replay_cap and spec.replay_window in REPLAY_MAX_SPLIT:
+        head_split = min(head_split, REPLAY_MAX_SPLIT[spec.replay_window])
+        auto_split = min(auto_split, REPLAY_MAX_SPLIT[spec.replay_window])
     keyed = key_tuple(
         ResidentBuildKey(
             s,
