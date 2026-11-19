@@ -21,7 +21,10 @@ from atom.entrypoints.openai.chat_encoders import (
 )
 from atom.entrypoints.openai.model_capabilities import deployment_metadata
 from atom.entrypoints.openai.protocol import DEFAULT_MAX_TOKENS
-from atom.entrypoints.openai.reasoning import template_opens_reasoning_implicitly
+from atom.entrypoints.openai.reasoning import (
+    VALID_TEMPLATE_EFFORTS,
+    template_opens_reasoning_implicitly,
+)
 from atom.entrypoints.openai.reasoning_dialects import THINK_END_MARKER, resolve_dialect
 from atom.entrypoints.openai.tool_parser.registry import (
     PARSERS_BY_NAME,
@@ -217,6 +220,8 @@ def build_engine_spec(
                     if toggle is None
                     else dict(zip(("name", "off", "on"), toggle, strict=True))
                 ),
+                # The named efforts a request may give; others are dropped.
+                "template_efforts": sorted(VALID_TEMPLATE_EFFORTS),
             },
             "balance": {
                 "strategy": config.dp_load_balance,

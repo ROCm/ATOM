@@ -56,6 +56,11 @@
     },
     "served_name": "served",
     "synthetic_acceptance": false,
+    "template_efforts": [
+      "high",
+      "low",
+      "max"
+    ],
     "tokenizer_path": "/models/m"
   }
 }

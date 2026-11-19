@@ -72,6 +72,13 @@ def test_only_forced_acceptance_withholds_logprobs(monkeypatch):
     assert build(monkeypatch, speculative=forced)["synthetic_acceptance"] is True
 
 
+def test_the_named_efforts_are_the_python_servers(monkeypatch):
+    from atom.entrypoints.openai.reasoning import VALID_TEMPLATE_EFFORTS
+
+    efforts = build(monkeypatch)["template_efforts"]
+    assert efforts == sorted(VALID_TEMPLATE_EFFORTS)
+
+
 def test_the_reasoning_switch_is_handed_over(monkeypatch):
     model = build(monkeypatch, toggle=("thinking_mode", "disabled", "enabled"))
     assert model["reasoning_toggle"] == {
