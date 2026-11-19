@@ -46,9 +46,8 @@ def a2a_calls(monkeypatch):
         owned_counts=None,
         quant_dtype=None,
         head_major=False,
-        payload_dtype=None,
     ):
-        assert not head_major and payload_dtype is None
+        assert not head_major
         calls.append(quant_dtype)
         return "a2a"
 
@@ -272,9 +271,8 @@ def _merge_layer(monkeypatch, seen):
         owned_counts=None,
         quant_dtype=None,
         head_major=False,
-        payload_dtype=None,
     ):
-        assert not head_major and payload_dtype is None
+        assert not head_major
         seen.append((backend, quant_dtype))
         return o if quant_dtype is None else (o, None)
 

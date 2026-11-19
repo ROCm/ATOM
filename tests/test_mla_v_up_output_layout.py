@@ -190,19 +190,12 @@ def test_projection_layout_follows_the_merge_that_can_use_it(
     dtype = torch.float8_e4m3fn
     attn._dcp_fused_quant_dtype = lambda: dtype if fused else None
     attn.o_proj = lambda flat: flat
-    namespace.update(
-        dtypes=SimpleNamespace(fp8=dtype),
-        envs=SimpleNamespace(ATOM_DCP_PREFILL_A2A_FP8=True),
-    )
     seen = _stub_bmm(namespace, "bf16", weights, None)
 
     def merge(out, lse, **kwargs):
         assert kwargs["head_major"] == heads_layout
         assert kwargs["decode"] == decode
         assert seen["output"].is_contiguous() == (not heads_layout)
-        assert kwargs.get("payload_dtype") == (
-            dtype if heads_layout and not fp32 else None
-        )
         logical = out.transpose(0, 1) if heads_layout else out
         logical = logical.contiguous()
         return (logical, None) if kwargs.get("quant_dtype") is not None else logical
@@ -229,11 +222,10 @@ def test_head_major_mailbox_request_stays_on_a2a():
     )
     # Equal H and T would pass a shape-only check while interchanging axes.
     output = torch.arange(4 * 4 * 8).reshape(4, 4, 8)
-    dtype = torch.float8_e4m3fn
 
     def a2a(out, lse, group, **kwargs):
         assert out is output
-        assert kwargs["head_major"] and kwargs["payload_dtype"] == dtype
+        assert kwargs["head_major"]
         return "a2a"
 
     namespace.update(
@@ -244,7 +236,93 @@ def test_head_major_mailbox_request_stays_on_a2a():
     )
     assert (
         namespace["dcp_lse_merge"](
-            output, None, None, backend="mailbox", head_major=True, payload_dtype=dtype
+            output, None, None, backend="mailbox", head_major=True
         )
         == "a2a"
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("mask_empty", [False, True])
+def test_head_major_exchange_preserves_partials_and_fp32_lse(
+    monkeypatch, dtype, mask_empty
+):
+    """Exercise the real exchange wrapper; only the collective/kernel are CPU stand-ins."""
+    path = Path(__file__).resolve().parents[1] / "atom/model_ops/dcp_ops.py"
+    names = {"cp_lse_a2a", "_lse_pack_slots", "mask_empty_dcp_lse"}
+    functions = [
+        node
+        for node in ast.parse(path.read_text(encoding="utf-8")).body
+        if isinstance(node, ast.FunctionDef) and node.name in names
+    ]
+    assert {node.name for node in functions} == names
+    namespace = {
+        "torch": torch,
+        "triton": SimpleNamespace(next_power_of_2=lambda n: 1 << (n - 1).bit_length()),
+    }
+    exec(  # noqa: S102 - execute only the checked-in CPU wrapper bodies
+        compile(ast.Module(body=functions, type_ignores=[]), str(path), "exec"),
+        namespace,
+    )
+    ranks, tokens, heads, width = 2, 3, 4, 8
+    local_heads = heads // ranks
+    g = torch.Generator().manual_seed(3311)
+    partials = torch.randn(ranks, tokens, heads, width, generator=g).to(dtype)
+    lse = torch.randn(ranks, tokens, heads, generator=g)
+    counts = torch.ones(ranks, tokens, dtype=torch.int32)
+    if mask_empty:
+        counts[0, 0] = 0
+        counts[:, 1] = 0
+        partials[counts == 0] = float("nan")
+    expected_lse = lse.masked_fill(counts[:, :, None] == 0, float("-inf"))
+    calls = []
+    group = object()
+
+    def exchange(recv, send, *, group):
+        assert group is cp_group.device_group
+        calls.append(send)
+        if len(calls) == 1:
+            assert send.dtype == torch.uint8
+            expected = partials[0].transpose(0, 1).contiguous().view(torch.uint8)
+            assert torch.equal(send, expected)
+            peers = partials[:, :, :local_heads].transpose(1, 2).contiguous()
+            recv.copy_(peers.reshape(heads, tokens, width).view(torch.uint8))
+        else:
+            assert len(calls) == 2
+            assert send.dtype == torch.float32 and send.shape == (heads, tokens)
+            assert torch.equal(send, expected_lse[0].T)
+            peers = expected_lse[:, :, :local_heads].transpose(1, 2).contiguous()
+            recv.copy_(peers.reshape(heads, tokens))
+
+    class Combine:
+        def __getitem__(self, grid):
+            assert grid == (tokens, local_heads)
+            return self.run
+
+        def run(self, recv, out, out_lse, *args, recv_lse_ptr, **kwargs):
+            assert recv.dtype == dtype
+            assert torch.equal(
+                recv.view(torch.uint8), partials[:, :, :local_heads].view(torch.uint8)
+            )
+            received_lse = recv_lse_ptr.reshape(ranks, tokens, local_heads)
+            assert torch.equal(received_lse, expected_lse[:, :, :local_heads])
+            weights = torch.softmax(received_lse.double(), dim=0).nan_to_num()
+            out.copy_((recv.double().nan_to_num() * weights[..., None]).sum(0))
+            out_lse.copy_(torch.logsumexp(received_lse, dim=0))
+
+    cp_group = SimpleNamespace(world_size=ranks, device_group=group)
+    monkeypatch.setattr(torch.distributed, "all_to_all_single", exchange)
+    namespace["_dcp_a2a_unpack_combine_kernel"] = Combine()
+    out, out_lse = namespace["cp_lse_a2a"](
+        partials[0].transpose(0, 1).contiguous(),
+        lse[0],
+        cp_group,
+        owned_counts=counts[0] if mask_empty else None,
+        head_major=True,
+        return_lse=True,
+    )
+    assert len(calls) == 2
+    expected_weights = torch.softmax(expected_lse.double(), dim=0).nan_to_num()
+    expected = (partials.double().nan_to_num() * expected_weights[..., None]).sum(0)
+    assert torch.equal(out, expected[:, :local_heads].to(dtype))
+    assert torch.equal(out_lse, torch.logsumexp(expected_lse, dim=0)[:, :local_heads])

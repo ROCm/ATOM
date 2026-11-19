@@ -426,24 +426,21 @@ Covers both decode and sparse prefill. Costs a DCP-group-wide copy of `W_V`
 
 ### `comm_backend`
 
-Without payload quantization, the backends implement the same LSE-weighted
-sum, with floating-point differences from accumulation order. Packed `a2a`
+The backends implement the same LSE-weighted sum, with floating-point
+differences from accumulation order. Packed `a2a`
 bit-preserves fp32 LSE in two 16-bit slots when its buffer is bf16/fp16.
 Head-major prefill instead sends LSE as plain fp32 in a separate all-to-all.
-The optional FP8 payload quantizes partial outputs before the merge and adds
-rounding error; its result is not mathematically equivalent to the unquantized
-merge.
 
 | Value | Pattern | Collectives |
 |-------|---------|-------------|
 | `auto` (default) | `mailbox` on gfx950 with DCP > 1 when decode TBO and plugin mode are off, `a2a` otherwise; the choice is logged at startup | |
-| `a2a` | packed output and LSE share one all-to-all; head-major prefill exchanges output and LSE/scales separately, then combines locally | 1 packed / 2 head-major |
+| `a2a` | packed output and LSE share one all-to-all; head-major prefill exchanges output and LSE separately, then combines locally | 1 packed / 2 head-major |
 | `ag_rs` | AllGather LSE + local correct + ReduceScatter output | 2 |
 | `mailbox` | decode only: aiter's FlyDSL `dcp_lse_combine`, one launch that stores each owner's rows and LSEs into its IPC-mapped mailbox and combines them there | **0** (no collective launch) |
 
 Packed `a2a` saves one collective launch and synchronization compared with
 `ag_rs`. Head-major prefill instead avoids packing the output and sends its
-LSE and optional FP8 payload scale separately.
+LSE separately.
 
 `mailbox` needs aiter `78a14ae5d` or later (aiter PR #6972 and #7943) and
 FlyDSL >= 0.5.0. That is required, not detected: an aiter without
