@@ -211,7 +211,6 @@ def test_atomesh_benchmark_uses_required_heavy_ci_gate():
     assert jobs["load-config"]["needs"] == ["ci-gate"]
     assert jobs["rdma-smoke-test"]["needs"] == ["ci-gate", "load-config"]
     assert jobs["run-model-benchmark"]["needs"] == ["ci-gate", "load-config"]
-    assert "github.event.pull_request" not in jobs["run-model-benchmark"]["if"]
 
     test_gate = jobs["atomesh-benchmark-gate"]
     assert test_gate["if"] == "always()"
@@ -232,11 +231,6 @@ def test_atomesh_benchmark_uses_required_heavy_ci_gate():
         "load-config=${{ needs.load-config.result }}"
         in evaluate_inputs["required-results"]
     )
-    assert (
-        "run-model-benchmark=${{ (github.event_name == 'schedule'"
-        in evaluate_inputs["required-results"]
-    )
-    assert "github.event.pull_request" not in evaluate_inputs["required-results"]
     assert "run-model-benchmark=${{ needs.run-model-benchmark.result }}" in (
         evaluate_inputs["optional-results"]
     )
@@ -250,13 +244,34 @@ def test_a_push_to_main_runs_the_benchmark_smoke():
         if step.get("id") == "matrix"
     )
     assert github_expressions(matrix_env["SUITE"], "push") == "smoke"
-    assert "|| github.event_name == 'push'" in jobs["run-model-benchmark"]["if"]
+
+
+def test_only_push_and_schedule_run_and_require_the_benchmark():
+    jobs = _jobs("atomesh-benchmark.yaml")
+    condition = " ".join(jobs["run-model-benchmark"]["if"].split()).replace(
+        "needs.load-config.outputs.has_matrix", "'true'"
+    )
     gate_inputs = next(
         step["with"]
         for step in jobs["atomesh-benchmark-gate"]["steps"]
         if step.get("uses") == "./.github/actions/evaluate-test-gate"
     )
-    assert "|| github.event_name == 'push' ||" in gate_inputs["required-results"]
+    # A failed benchmark fails the gate only where its result is required.
+    required = next(
+        line
+        for line in gate_inputs["required-results"].splitlines()
+        if line.startswith("run-model-benchmark=")
+    ).replace("needs.run-model-benchmark.result", "'failure'")
+    for event, runs in [
+        ("pull_request", False),
+        ("pull_request_review", False),
+        ("push", True),
+        ("schedule", True),
+    ]:
+        assert github_expressions("${{ " + condition + " }}", event) == str(runs), event
+        assert github_expressions(required, event) == (
+            "run-model-benchmark=" + ("failure" if runs else "success")
+        ), event
 
 
 def test_atomesh_heavy_gate_concurrency_groups_separate_non_approval_reviews():
@@ -320,6 +335,9 @@ def test_every_pull_request_publishes_the_atomesh_unit_test_gate():
         for step in gate["steps"]
         if step.get("uses") == "./.github/actions/evaluate-test-gate"
     )
+    assert inputs["should-run"] == "${{ needs.unit-test-scope.outputs.should_run }}"
+    assert inputs["decidable"] == "true"
+    assert inputs["reason"] == "${{ needs.unit-test-scope.outputs.reason }}"
     assert inputs["ci-gate-result"] == "${{ needs.unit-test-scope.result }}"
     assert inputs["required-results"].strip() == (
         "run_atomesh_test_harness=${{ needs.run_atomesh_test_harness.result }}"

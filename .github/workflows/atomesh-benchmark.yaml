@@ -1526,7 +1526,7 @@ jobs:
 
   run-model-benchmark:
     # Not on pull requests: their merge checks are the ATOMesh unit tests and
-    # the standalone accuracy run. The latest push to main on this workflow's
+    # the accuracy runs. The latest push to main on this workflow's
     # paths runs the smoke suite (DeepSeek-V4 1P1D over Mooncake), since a newer
     # push cancels a run still pending. To run it on a PR branch, dispatch this
     # workflow with suite=smoke and case_names=ds-v4-1p1d-tp8-smoke.
