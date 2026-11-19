@@ -1561,10 +1561,9 @@ class Scheduler:
         )
 
     def _budget_for_decodes(self, n_decode, reserved_blocks=0):
-        # A prompt owns its pages across chunks, but decode's append demand
-        # changes every tick. When it no longer fits, keep ALL prefills in the
-        # ordinary running queue so decode can preempt the newest request.
-        if reserved_blocks and not self.block_manager._has_page_units(reserved_blocks):
+        # Zero prevents prefill execution, not transfer completion or reclaiming
+        # a settled KV owner. Decode demand is finalized before selecting chunks.
+        if reserved_blocks and not self.block_manager.has_page_units(reserved_blocks):
             return 0
         budget = self.max_num_batched_tokens
         n_decode = min(n_decode, self.max_num_seqs)
@@ -1601,19 +1600,50 @@ class Scheduler:
             self._budget_for_decodes(len(candidates), blocks), blocks, len(candidates)
         )
 
-    def _reserve_promoted_decode(
-        self, limits: PrefillLimits, seq: Sequence
-    ) -> PrefillLimits:
-        """Charge a newly received P/D request before admitting the next prompt."""
-        width = self.decode_spec_width + 1
-        seats = self._mixed_decode_seats()
-        blocks = limits.reserved_decode_blocks
-        if limits.num_decodes < seats:
-            blocks += self.block_manager.append_blocks_needed(
-                seq, width, self.draft_lookahead
+    def _promote_mixed_remote_decodes(self, limits: PrefillLimits) -> PrefillLimits:
+        """Promote ready P/D receives with running slots before selecting prefill.
+
+        Promotion does not spend prefill tokens. A receive that cannot yet join
+        running still owns KV and remains a possible pressure victim.
+        """
+        if self._connector_flag("is_offload") or not (
+            self.finished_recving_kv_req_ids or self.failed_recving_kv_req_ids
+        ):
+            return limits
+        ready = {
+            str(req_id)
+            for req_id in itertools.chain(
+                self.finished_recving_kv_req_ids, self.failed_recving_kv_req_ids
             )
-        count = limits.num_decodes + 1
-        return PrefillLimits(self._budget_for_decodes(count, blocks), blocks, count)
+        }
+        count = limits.num_decodes
+        blocks = limits.reserved_decode_blocks
+        seats = self._mixed_decode_seats()
+        width = self.decode_spec_width + 1
+        for _ in range(len(self.waiting)):
+            seq = self.waiting.popleft()
+            if (
+                seq.status != SequenceStatus.WAITING_FOR_REMOTE_KVS
+                or str(seq.id) not in ready
+                or len(self.running) >= self.max_num_seqs
+            ):
+                self.waiting.append(seq)
+                continue
+            reason = self._unschedulable_reason(seq)
+            if reason is not None:
+                self._finish_rejected_waiting(seq, reason=f"unschedulable: {reason}")
+                continue
+            remote_ready = self._resolve_waiting_remote_kv(seq, self.waiting)
+            if remote_ready:
+                self._schedule_first_decode_after_remote_kv(seq)
+                if count < seats:
+                    blocks += self.block_manager.append_blocks_needed(
+                        seq, width, self.draft_lookahead
+                    )
+                count += 1
+            elif remote_ready is False:
+                self.waiting.append(seq)
+        return PrefillLimits(limits.tokens, blocks, count)
 
     def _estimate_prefill_chunk_cost(self, limits=None) -> float:
         """Cost of the chunk this rank would prefill with its prefill budget
@@ -2553,7 +2583,7 @@ class Scheduler:
             if self.enable_mixed_prefill_decode
             and (
                 self._partial_prefill_count
-                or len(self.waiting) > self._num_parked_remote_kv
+                or next(self._waiting_prefills(), None) is not None
                 or self.finished_recving_kv_req_ids
                 or self.failed_recving_kv_req_ids
             )
@@ -2564,6 +2594,15 @@ class Scheduler:
         # Reclaim aborted heads even when decode protection vetoes Phase 2.
         while self.waiting and self.waiting[0].status == SequenceStatus.ABORTED:
             self._finish_rejected_waiting(self.waiting.popleft())
+        if self.enable_mixed_prefill_decode:
+            limits = self._promote_mixed_remote_decodes(limits)
+            # Offload resolution may also change page availability. Finalize
+            # after every completion, before early loads, probes or chunks.
+            limits = limits._replace(
+                tokens=self._budget_for_decodes(
+                    limits.num_decodes, limits.reserved_decode_blocks
+                )
+            )
         if self.enable_dynamic_chunking:
             self._record_prefill_supply()
         if self.kv_connector is not None and self.waiting:
@@ -2683,7 +2722,7 @@ class Scheduler:
         # Phase 2 in lockstep. Inside that, skip the running-queue scan entirely
         # when no seq is mid-prefill — the common steady-state decode case —
         # using the counter maintained by postprocess / preempt / finished-removal.
-        if delayer_allows and self._partial_prefill_count > 0:
+        if delayer_allows and prefill_budget > 0 and self._partial_prefill_count > 0:
             for seq in self.running:
                 if num_seqs_prefill >= self.max_num_seqs:
                     break
@@ -2828,9 +2867,6 @@ class Scheduler:
 
             if remote_ready_for_decode:
                 self._schedule_first_decode_after_remote_kv(seq)
-                if self.enable_mixed_prefill_decode:
-                    limits = self._reserve_promoted_decode(limits, seq)
-                    prefill_budget = limits.tokens
                 continue
 
             if offload_resume:
@@ -3334,10 +3370,9 @@ class Scheduler:
             # every rank's forward replays its token graph (`ForwardMode.decide`).
             return None
 
-        # The reservation allowed these prefills only while decode's append
-        # pages fit. A zero prefill budget leaves partials in the normal decode
-        # queue and its tail-first preemption policy. Scheduled prefill rows
-        # must not also be selected for decode in this step.
+        # P/D demand was included before selecting these prefills, and admission
+        # preserved its append pages. Prefill rows must not also decode. Unselected
+        # owners in running AND waiting remain available to pressure preemption.
         mixed_order = ()
         if num_seqs_prefill:
             mixed_order = tuple(self.running)
@@ -5056,7 +5091,12 @@ class Scheduler:
         return not self._connector_should_defer_free(seq)
 
     def _preempt_one_running(self) -> bool:
-        """Preempt the last preemptable running sequence."""
+        """Reclaim a tail KV owner, including settled waiters on mixed ticks."""
+        # Waiting owners would join behind the current running rows on
+        # admission. Their queue placement must not shield settled KV from
+        # pressure. This scan runs only on allocation failure, not per row.
+        if self.enable_mixed_prefill_decode and self._preempt_waiting_kv_owner():
+            return True
         for index in range(len(self.running) - 1, -1, -1):
             candidate = self.running[index]
             if not self._is_preemptable(candidate):
@@ -5065,6 +5105,54 @@ class Scheduler:
             if self.preempt(candidate):
                 return True
             self.running.insert(index, candidate)
+        return False
+
+    def _preempt_waiting_kv_owner(self) -> bool:
+        """Reclaim the newest settled waiting owner before a running decode."""
+        offload = self._connector_flag("is_offload")
+        for index in range(len(self.waiting) - 1, -1, -1):
+            seq = self.waiting[index]
+            settled = seq.status == SequenceStatus.WAITING and (
+                offload and self._is_offload_prefill_resume(seq)
+            )
+            received = (
+                not offload
+                and seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+                and self._has_req_id(self.finished_recving_kv_req_ids, seq.id)
+            )
+            if (
+                not (settled or received)
+                or not seq.block_table
+                or seq.id in self._pp_inflight_token_block
+                or not self._is_preemptable(seq)
+            ):
+                continue
+            del self.waiting[index]
+            if received:
+                # Preserve the producer's real T0 and let preempt strip only
+                # unverified drafts, just as for an admitted first decode.
+                resolved = self._resolve_waiting_remote_kv(seq, self.waiting)
+                if resolved is not True:
+                    if resolved is False:
+                        self.waiting.insert(index, seq)
+                    continue
+                self._schedule_first_decode_after_remote_kv(seq)
+                self.running.pop()
+            if self.preempt(seq):
+                self._uncount_inflight_load(seq)
+                self._early_load.note_gone(seq.id)
+                seq.offload_loaded = False
+                seq.offload_load_failed = False
+                seq.offload_loaded_tokens = 0
+                seq.offload_load_start_tokens = None
+                seq.offload_promoted_tokens = 0
+                return True
+            if received:
+                # A refused reclaim retains the initialized decode, including
+                # its single T0 injection, in the running queue.
+                self.running.append(seq)
+            else:
+                self.waiting.insert(index, seq)
         return False
 
     def preempt_running(self) -> int:

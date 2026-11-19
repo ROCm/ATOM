@@ -66,7 +66,7 @@ On TP, the interval and coalescer are enabled together.
 This applies to the standard scheduler, including connector-based P/D roles.
 RapidServe's dedicated `PrefillScheduler`/`DecodeScheduler` do not use the delayer.
 
-After each executed prefill, the decode interval runs before all coalescing
+After each executed prefill-only forward, the decode interval runs before all coalescing
 bounds. Once it expires, fill, queue age, KV pressure, partial-prefill, no-decode
 and stall bounds decide when to release; with DP, a group where some rank has no
 prefill also waits for alignment, and stall and the cost gate release it only
