@@ -112,6 +112,11 @@ jobs:
             --target-dir atom/mesh/mocker/target/mesh \
             --profile ci --lib --features atom-engine
 
+      # The vendored ext-proc protos must match the checksums pinned in
+      # manifest.json; offline, so a drifted file or manifest fails here.
+      - name: Check vendored ext-proc protos
+        run: python3 atom/mesh/proto/vendor_ext_proc.py --check
+
       # Nothing else builds the optional ext-proc feature or its protox
       # codegen; checking it, its tests included, keeps that path compiling.
       - name: Check atomesh with ext-proc
