@@ -52,6 +52,7 @@ U_IDX = 0x40000000
 SIM_MAGIC = 0x53494D41
 NEG = -3e38
 PRB = 2048                   # LDS: P1's row records (CPR x (m, s), then CPR x (mq, sq, dx, -)), past P0's q statistics
+RACE_OFF = 6144              # LDS: (keepall) the race's CTA winner (8 B) + 32 z(x_k) slots, before ZOFF
 ZOFF = 8192                  # LDS: this CTA's z = l / T chunk [PT][256] f32, then the q row's d * invTd chunk (read once in P0)
 
 
@@ -88,30 +89,31 @@ def _ctxmid(ctxp, i):   # (plain python: outside the AST rewriter)
 
 @ASTRewriter.transform
 def xchg6(recv, rank, p, row, c, t, sm, ws, tag, mid=None):
-    """6 i32 words of this rank's row record (2 tagged units of slot p) -> LDS HB + src * 24 for src 0..3."""
+    """3 n i32 words of this rank's row record (n tagged units of slot p; 6 words: 2) -> LDS HB + src * 12 n for src
+    0..3 (_lw's stride)."""
+    nu = len(ws) // 3
     if (c == 0) & (t == 0):
-        v0 = fx.Vector.from_elements([ws[0], ws[1], ws[2], I32(tag)], I32)
-        v1 = fx.Vector.from_elements([ws[3], ws[4], ws[5], I32(tag)], I32)
-        for o in range_constexpr(4):
-            if fx.const_expr(o != rank):
-                hx.gstore(recv[o] + roff(p, rank, row, 0), v0, nt=True)
-                hx.gstore(recv[o] + roff(p, rank, row, 1), v1, nt=True)
+        for u_ in range_constexpr(nu):
+            v = fx.Vector.from_elements([ws[3 * u_], ws[3 * u_ + 1], ws[3 * u_ + 2], I32(tag)], I32)
+            for o in range_constexpr(4):
+                if fx.const_expr(o != rank):
+                    hx.gstore(recv[o] + roff(p, rank, row, u_), v, nt=True)
     if t == rank:
-        for q in range_constexpr(6):
-            hx.lstore(sm + HB + t * 24 + q * 4, ws[q])
+        for q in range_constexpr(3 * nu):
+            hx.lstore(sm + HB + t * (12 * nu) + q * 4, ws[q])
     if fx.const_expr(mid is not None):   # other work (all threads) while the peers' words travel
         mid()
-    if (t < 8) & ((t % 4) != rank):
+    if (t < 4 * nu) & ((t % 4) != rank):
         src = t % 4
         u = t // 4
         got = poll_unit(recv[rank] + roff(p, src, row, u), tag)
         for q in range_constexpr(3):
-            hx.lstore(sm + HB + src * 24 + (u * 3 + q) * 4, got[q])
+            hx.lstore(sm + HB + src * (12 * nu) + (u * 3 + q) * 4, got[q])
     gpu.barrier()
 
 
-def _lw(sm, src, q, kind=F32):
-    return hx.lload(sm + HB + src * 24 + q * 4, kind)
+def _lw(sm, src, q, kind=F32, nw=6):
+    return hx.lload(sm + HB + src * (4 * nw) + q * 4, kind)
 
 
 @ASTRewriter.transform
@@ -151,6 +153,24 @@ def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank,
     qbase = qlog + i64((qsrc * ND + fx.min(k, I32(ND - 1))) * V) * 4
     xl = xk - rank * V                             # x_k's local column (outside [0, V): another rank's)
     NCT = ROWS * CPR   # (the sampling CTAs alone: tail.target runs the draft context on the others meanwhile)
+    # Does every row of the step keep every id (greedy, a forced-acceptance argmax row, or top_p >= 1)? sparam: the same
+    # on every rank, a uniform branch (as anyprob). Then th = -inf: P1 / P2 (the top-p threshold) are skipped and P3's
+    # draw needs nothing of this pass's exchange: P0 also draws it (the same Gumbel keys, below), X0 carries it, and P3,
+    # its handoff and its exchange X3 are skipped.
+    nucl = I32(0)
+    for r_ in range_constexpr(ROWS):
+        sr_ = sp + i64(r_) * (SPW * 4)
+        bon_ = sp + i64((r_ // (ND + 1)) * (ND + 1) + ND) * (SPW * 4)
+        sim_ = (hx.gload(bon_ + i64(20), I32) == I32(SIM_MAGIC)) & (I32(r_ % (ND + 1)) < I32(ND))
+        keep_ = (hx.gload(sr_ + i64(12), I32) != I32(0)) | sim_ | (hx.gload(sr_ + i64(4), F32) >= F32(1.0))
+        nucl = nucl + keep_.select(I32(0), I32(1))
+    keepall = nucl == I32(0)
+    if keepall:   # (the race's per-CTA maxima, before any thread's atomics: the barrier)
+        if t == 0:
+            hx.lstore(sm + RACE_OFF, I64MIN())
+        if t < 32:
+            hx.lstore(sm + RACE_OFF + 8 + t * 4, I32(0))
+        gpu.barrier()
     # P0: (max, sum exp) of z = l / T, and of the q row's d * invTd; d(x_k)
     m = F32(-1e30)
     s = F32(0.0)
@@ -177,6 +197,22 @@ def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank,
             mq = mqn
             j = c0 + t + kk * 256
             dx = (j == xl).select(d, dx)
+    best0 = I64MIN()
+    zx0 = F32(NEG)
+    if keepall:
+        # P3's draw with th = -inf, here: the same key a column (u from hash32(row, global id, the row's seed): the
+        # same counter, row and seed words; greedy rows g = 0), every column (as z >= -inf in P3), z(x_k) as P3's
+        for kk in range(PT):
+            z = hx.lload(sm + ZOFF + (kk * 256 + t) * 4, F32)
+            j = c0 + t + kk * 256
+            u = (F32(lshr(hash32(row, j + rank * V, seed), 9)) + F32(0.5)) * F32(1.0 / 8388608.0)
+            g = F32(-LN2) * log2f(F32(-LN2) * log2f(u))
+            g = greedy.select(F32(0.0), g)
+            pk = fx.Int64(skey(z + g)) * fx.Int64(1 << 32) + (fx.Int64(c32(0xFFFFFFFF) - (j + rank * V)) & fx.Int64(0xFFFFFFFF))
+            best0 = fx.max(best0, pk)
+            zx0 = (j == xl).select(z, zx0)
+        latomic_max64(sm + RACE_OFF, best0)
+        hx.latomic_max_u32(sm + RACE_OFF + 8 + (t % 32) * 4, skey(zx0) ^ I32(-2147483648))
     hx.lstore(sm + t * 8, m)
     hx.lstore(sm + t * 8 + 4, s)
     hx.lstore(sm + 2048 + t * 12, mq)
@@ -207,6 +243,12 @@ def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank,
         hx.gstore(rec0 + i64(row * CPR + c) * 8 + i64(t) * 4, hx.lload(sm + t * 4, F32))
     if act & (t < 3):   # q statistics after the (m, s) records: [ROWS*CPR][4] f32
         hx.gstore(rec0 + i64(ROWS * CPR * 8) + i64(row * CPR + c) * 16 + i64(t) * 4, hx.lload(sm + 2048 + t * 4, F32))
+    if keepall & act & (t == 0):   # the race's CTA record, where P3 writes its own (rec3)
+        zxs = I32(-2147483648)
+        for q in range_constexpr(32):
+            zxs = fx.max(zxs, hx.lload(sm + RACE_OFF + 8 + q * 4, I32) ^ I32(-2147483648))
+        hx.gstore(rec3 + i64(row * CPR + c) * 8, hx.lload(sm + RACE_OFF, fx.Int64))
+        hx.gstore(rec3 + i64(ROWS * CPR * 12) + i64(row * CPR + c) * 8 + i64(4), ((zxs < 0).select(zxs ^ I32(0x7FFFFFFF), zxs)).bitcast(F32))
     handoff(cnt, t, NCT)
     # P1: rank-row (m, s) and (mq, sq, dx) -> exchange -> global; histogram of z in [M - R, M)
     # the row's CPR records read once (lane q < CPR: record q) into LDS PRB, then every thread folds them in q order (the
@@ -230,20 +272,31 @@ def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank,
     sqr = F32(0.0)
     for q in range_constexpr(CPR):
         sqr = sqr + hx.lload(sm + PRB + CPR * 8 + q * 16 + 4, F32) * expf(hx.lload(sm + PRB + CPR * 8 + q * 16, F32) - mqr)
+    wb0 = I64MIN()
+    zxr0 = F32(NEG)
+    if keepall:   # the rank-row race winner and z(x_k) (P4's fold of the CTA records)
+        for q in range_constexpr(CPR):
+            wb0 = fx.max(wb0, hx.gload(rec3 + i64(row * CPR + q) * 8, fx.Int64))
+            zxr0 = fx.max(zxr0, hx.gload(rec3 + i64(ROWS * CPR * 12) + i64(row * CPR + q) * 8 + i64(4), F32))
     xchg6(recv, rank, 0, row, c, t, sm, [mr.bitcast(I32), sr.bitcast(I32), mqr.bitcast(I32), sqr.bitcast(I32),
-                                          dxr.bitcast(I32), I32(0)], tag0, mid=_ctxmid(ctxp, 0))
+                                          dxr.bitcast(I32), zxr0.bitcast(I32), I32(wb0 & fx.Int64(0xFFFFFFFF)),
+                                          I32(wb0 >> 32), I32(0)], tag0, mid=_ctxmid(ctxp, 0))
     M = F32(-1e30)
     MQ = F32(-1e30)
     DX = F32(NEG)
+    GB0 = I64MIN()
+    ZX0 = F32(NEG)
     for o in range_constexpr(4):
-        M = fx.max(M, _lw(sm, o, 0))
-        MQ = fx.max(MQ, _lw(sm, o, 2))
-        DX = fx.max(DX, _lw(sm, o, 4))
+        M = fx.max(M, _lw(sm, o, 0, nw=9))
+        MQ = fx.max(MQ, _lw(sm, o, 2, nw=9))
+        DX = fx.max(DX, _lw(sm, o, 4, nw=9))
+        ZX0 = fx.max(ZX0, _lw(sm, o, 5, nw=9))
+        GB0 = fx.max(GB0, (fx.Int64(_lw(sm, o, 7, I32, nw=9)) << 32) | (fx.Int64(_lw(sm, o, 6, I32, nw=9)) & fx.Int64(0xFFFFFFFF)))
     Z = F32(0.0)
     ZQ = F32(0.0)
     for o in range_constexpr(4):
-        Z = Z + _lw(sm, o, 1) * expf(_lw(sm, o, 0) - M)
-        ZQ = ZQ + _lw(sm, o, 3) * expf(_lw(sm, o, 2) - MQ)
+        Z = Z + _lw(sm, o, 1, nw=9) * expf(_lw(sm, o, 0, nw=9) - M)
+        ZQ = ZQ + _lw(sm, o, 3, nw=9) * expf(_lw(sm, o, 2, nw=9) - MQ)
     qx = expf(DX - MQ) / ZQ
     gpu.barrier()
     hx.lstore(sm + t * 4, F32(0.0))
@@ -254,14 +307,10 @@ def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank,
     # whole row lies within R of M -- then the two passes cut the lowest sub-bin, here nothing is cut, ATOM's top_p 1).
     # When every row of the step is such a row (sparam: the same on every rank, a uniform branch, as anyprob), the two
     # passes, their handoffs and their exchanges are skipped (T = 0, and T > 0 at the default top_p 1).
-    nucl = I32(0)
-    for r_ in range_constexpr(ROWS):
-        sr_ = sp + i64(r_) * (SPW * 4)
-        bon_ = sp + i64((r_ // (ND + 1)) * (ND + 1) + ND) * (SPW * 4)
-        sim_ = (hx.gload(bon_ + i64(20), I32) == I32(SIM_MAGIC)) & (I32(r_ % (ND + 1)) < I32(ND))
-        keep_ = (hx.gload(sr_ + i64(12), I32) != I32(0)) | sim_ | (hx.gload(sr_ + i64(4), F32) >= F32(1.0))
-        nucl = nucl + keep_.select(I32(0), I32(1))
     th = F32(NEG)
+    gb = GB0
+    ZN = Z     # (every id kept: the nucleus mass is Z)
+    ZX = ZX0
     if nucl > I32(0):
         sc1 = F32(NB / R)
         for kk in range(PT):
@@ -307,56 +356,57 @@ def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank,
         suffix_scan(sm, t)
         b2, rem2 = crossing(sm, t, rem1)
         th = (b1 < 0).select(F32(NEG), lo2 + F32(fx.max(b2, I32(0))) * F32(R / (NB * NB)))
+        th = greedy.select(F32(NEG), th)
+        if t == 0:
+            hx.lstore(sm + 2048, I64MIN())
+        hx.lstore(sm + 4096 + t * 4, F32(0.0))
+        gpu.barrier()
+        best = I64MIN()
+        zn = F32(0.0)
+        zx = F32(NEG)
+        for kk in range(PT):
+            z = hx.lload(sm + ZOFF + (kk * 256 + t) * 4, F32)
+            j = c0 + t + kk * 256
+            u = (F32(lshr(hash32(row, j + rank * V, seed), 9)) + F32(0.5)) * F32(1.0 / 8388608.0)   # (23 bits: u < 1 exactly; 24 bits + 0.5 rounded to 1.0 in fp32)
+            g = F32(-LN2) * log2f(F32(-LN2) * log2f(u))
+            g = greedy.select(F32(0.0), g)
+            pk = fx.Int64(skey(z + g)) * fx.Int64(1 << 32) + (fx.Int64(c32(0xFFFFFFFF) - (j + rank * V)) & fx.Int64(0xFFFFFFFF))
+            best = (z >= th).select(fx.max(best, pk), best)
+            zn = zn + (z >= th).select(expf(z - M), F32(0.0))
+            zx = (j == xl).select(z, zx)
+        latomic_max64(sm + 2048, best)
+        hx.latomic_add_f32(sm + 4096 + (t % 32) * 4, zn)
+        hx.latomic_max_u32(sm + 4096 + 128 + (t % 32) * 4, skey(zx) ^ I32(-2147483648))
+        gpu.barrier()
+        if act & (t == 0):
+            hx.gstore(rec3 + i64(row * CPR + c) * 8, hx.lload(sm + 2048, fx.Int64))
+            hx.gstore(rec3 + i64(ROWS * CPR * 8) + i64(row * CPR + c) * 4, th)
+            znc = F32(0.0)
+            zxs = I32(-2147483648)
+            for q in range_constexpr(32):
+                znc = znc + hx.lload(sm + 4096 + q * 4, F32)
+                zxs = fx.max(zxs, hx.lload(sm + 4096 + 128 + q * 4, I32) ^ I32(-2147483648))   # unsigned slot -> its skey
+            hx.gstore(rec3 + i64(ROWS * CPR * 12) + i64(row * CPR + c) * 8, znc)
+            hx.gstore(rec3 + i64(ROWS * CPR * 12) + i64(row * CPR + c) * 8 + i64(4), ((zxs < 0).select(zxs ^ I32(0x7FFFFFFF), zxs)).bitcast(F32))
+        handoff(cnt + i64(12), t, NCT)
+        # P4: rank-row winner, nucleus mass, z(x_k) -> exchange -> global (every CTA of a row, every rank)
+        wb = I64MIN()
+        znr = F32(0.0)
+        zxr = F32(NEG)
+        for q in range_constexpr(CPR):
+            wb = fx.max(wb, hx.gload(rec3 + i64(row * CPR + q) * 8, fx.Int64))
+            znr = znr + hx.gload(rec3 + i64(ROWS * CPR * 12) + i64(row * CPR + q) * 8, F32)
+            zxr = fx.max(zxr, hx.gload(rec3 + i64(ROWS * CPR * 12) + i64(row * CPR + q) * 8 + i64(4), F32))
+        xchg6(recv, rank, 3, row, c, t, sm, [I32(wb & fx.Int64(0xFFFFFFFF)), I32(wb >> 32), znr.bitcast(I32), zxr.bitcast(I32),
+                                              I32(0), I32(0)], tag0 + 3, mid=_ctxmid(ctxp, 3))
+        gb = I64MIN()
+        ZN = F32(0.0)
+        ZX = F32(NEG)
+        for o in range_constexpr(4):
+            gb = fx.max(gb, (fx.Int64(_lw(sm, o, 1, I32)) << 32) | (fx.Int64(_lw(sm, o, 0, I32)) & fx.Int64(0xFFFFFFFF)))
+            ZN = ZN + _lw(sm, o, 2)
+            ZX = fx.max(ZX, _lw(sm, o, 3))
     th = greedy.select(F32(NEG), th)
-    if t == 0:
-        hx.lstore(sm + 2048, I64MIN())
-    hx.lstore(sm + 4096 + t * 4, F32(0.0))
-    gpu.barrier()
-    best = I64MIN()
-    zn = F32(0.0)
-    zx = F32(NEG)
-    for kk in range(PT):
-        z = hx.lload(sm + ZOFF + (kk * 256 + t) * 4, F32)
-        j = c0 + t + kk * 256
-        u = (F32(lshr(hash32(row, j + rank * V, seed), 9)) + F32(0.5)) * F32(1.0 / 8388608.0)   # (23 bits: u < 1 exactly; 24 bits + 0.5 rounded to 1.0 in fp32)
-        g = F32(-LN2) * log2f(F32(-LN2) * log2f(u))
-        g = greedy.select(F32(0.0), g)
-        pk = fx.Int64(skey(z + g)) * fx.Int64(1 << 32) + (fx.Int64(c32(0xFFFFFFFF) - (j + rank * V)) & fx.Int64(0xFFFFFFFF))
-        best = (z >= th).select(fx.max(best, pk), best)
-        zn = zn + (z >= th).select(expf(z - M), F32(0.0))
-        zx = (j == xl).select(z, zx)
-    latomic_max64(sm + 2048, best)
-    hx.latomic_add_f32(sm + 4096 + (t % 32) * 4, zn)
-    hx.latomic_max_u32(sm + 4096 + 128 + (t % 32) * 4, skey(zx) ^ I32(-2147483648))
-    gpu.barrier()
-    if act & (t == 0):
-        hx.gstore(rec3 + i64(row * CPR + c) * 8, hx.lload(sm + 2048, fx.Int64))
-        hx.gstore(rec3 + i64(ROWS * CPR * 8) + i64(row * CPR + c) * 4, th)
-        znc = F32(0.0)
-        zxs = I32(-2147483648)
-        for q in range_constexpr(32):
-            znc = znc + hx.lload(sm + 4096 + q * 4, F32)
-            zxs = fx.max(zxs, hx.lload(sm + 4096 + 128 + q * 4, I32) ^ I32(-2147483648))   # unsigned slot -> its skey
-        hx.gstore(rec3 + i64(ROWS * CPR * 12) + i64(row * CPR + c) * 8, znc)
-        hx.gstore(rec3 + i64(ROWS * CPR * 12) + i64(row * CPR + c) * 8 + i64(4), ((zxs < 0).select(zxs ^ I32(0x7FFFFFFF), zxs)).bitcast(F32))
-    handoff(cnt + i64(12), t, NCT)
-    # P4: rank-row winner, nucleus mass, z(x_k) -> exchange -> global (every CTA of a row, every rank)
-    wb = I64MIN()
-    znr = F32(0.0)
-    zxr = F32(NEG)
-    for q in range_constexpr(CPR):
-        wb = fx.max(wb, hx.gload(rec3 + i64(row * CPR + q) * 8, fx.Int64))
-        znr = znr + hx.gload(rec3 + i64(ROWS * CPR * 12) + i64(row * CPR + q) * 8, F32)
-        zxr = fx.max(zxr, hx.gload(rec3 + i64(ROWS * CPR * 12) + i64(row * CPR + q) * 8 + i64(4), F32))
-    xchg6(recv, rank, 3, row, c, t, sm, [I32(wb & fx.Int64(0xFFFFFFFF)), I32(wb >> 32), znr.bitcast(I32), zxr.bitcast(I32),
-                                          I32(0), I32(0)], tag0 + 3, mid=_ctxmid(ctxp, 3))
-    gb = I64MIN()
-    ZN = F32(0.0)
-    ZX = F32(NEG)
-    for o in range_constexpr(4):
-        gb = fx.max(gb, (fx.Int64(_lw(sm, o, 1, I32)) << 32) | (fx.Int64(_lw(sm, o, 0, I32)) & fx.Int64(0xFFFFFFFF)))
-        ZN = ZN + _lw(sm, o, 2)
-        ZX = fx.max(ZX, _lw(sm, o, 3))
     px = (ZX >= th).select(expf(ZX - M) / ZN, F32(0.0))
     if act & (c == 0) & (t == 0):
         hx.gstore(ids + i64(row) * 4, kid(gb))
