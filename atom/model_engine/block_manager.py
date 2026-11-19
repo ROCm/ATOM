@@ -1278,7 +1278,7 @@ class BlockManager:
             return -1
         # The draft's window, cached blocks included: a claim takes a free block
         # as surely as a fresh one does.
-        if not self.draft_window.has_free(
+        if self.draft_window.enabled and not self.draft_window.has_free(
             self.draft_window.admission_blocks(
                 seq,
                 self.num_pool_blocks(len(seq)) + self.draft_lookahead_blocks(len(seq)),
@@ -1841,46 +1841,17 @@ class BlockManager:
         """Allocate blocks for `seq`. `num_cached_blocks` is the hit count
         returned by `can_allocate` (0 if caller didn't call it).
 
-        The KV blocks first (`_allocate_kv`), then a windowed draft's: from
-        where the prefill actually resumes, which the KV half can still lower.
-        The draft gate runs again before either, because another admission in
-        the same pass can have evicted a draft block `can_allocate` counted on,
-        and the KV claims have to stop where the draft's do -- a forward
-        resuming below a claimed block would write into a shared one. What it
-        cuts is fresh blocks `can_allocate` did not charge for; without room
-        for them this returns False, which requeues the seq.
+        The KV blocks first (`_allocate_kv`), then a windowed draft's from where
+        the prefill resumes; `can_allocate` already gated the hit on the draft.
         """
-        if num_cached_blocks and self.draft_window.enabled:
-            gated = self.draft_window.gate(
-                seq, num_cached_blocks, self._hash_chain(seq, num_cached_blocks)
-            )
-            if gated < num_cached_blocks and not self._has_page_units(
-                num_cached_blocks - gated
-            ):
-                return False
-            num_cached_blocks = gated
         if not self._allocate_kv(seq, num_cached_blocks):
             return False
         if self.draft_window.enabled:
             hit = seq.num_cached_tokens // self._hash_block_size()
             self.draft_window.allocate(
-                seq, hit, self._hash_chain(seq, hit), len(seq.block_table)
+                seq, hit, self._chain_to(seq, [], hit), len(seq.block_table)
             )
         return True
-
-    def _hash_chain(self, seq: Sequence, blocks: int) -> list[int]:
-        """Content hashes of `seq`'s first `blocks` blocks: the prompt's from
-        its chain, and past the prompt -- a preempted seq resuming over its own
-        generated blocks -- hashed here, since only prompt blocks are final."""
-        chain = self._prompt_hashes(seq)
-        if blocks <= len(chain):
-            return chain
-        hashes = list(chain)
-        h = hashes[-1] if hashes else seq.cache_seed
-        for i in range(len(hashes), blocks):
-            h = self._block_hash(seq, chain, i, h)
-            hashes.append(h)
-        return hashes
 
     def _allocate_kv(self, seq: Sequence, num_cached_blocks: int = 0) -> bool:
         """Allocate `seq`'s KV blocks for a prefill resuming at
