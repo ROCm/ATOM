@@ -2,23 +2,25 @@
 //!
 //! An agentic conversation resends its whole history every turn, so encoding
 //! its prompt takes time linear in the context (about 1.6 MB/s on one core for
-//! GLM-5.2), and a prompt over `max_tokenize_bytes` is routed by its text.
-//! Prompts are therefore kept with their ids and where each added token in them
-//! ends. A later prompt that starts the same way reuses the ids up to the last
-//! added token both share and encodes only the rest, which is what
+//! GLM-5.2), and a prompt over `max_tokenize_bytes` is not tokenized: a policy
+//! that needs tokens rejects it, and one that only wants them routes it by its
+//! text. Prompts are therefore kept with their ids and where each added token
+//! in them ends. A later prompt that starts the same way reuses the ids up to
+//! the last added token both share and encodes only the rest, which is what
 //! `max_tokenize_bytes` then bounds. A prompt over the limit with no such turn
-//! is still routed by its text, and encoded in the background so that the
-//! conversation's next turn finds it.
+//! is still not tokenized, and is encoded in the background, when it has an
+//! added token a later turn could cut at, so that the conversation's next turn
+//! finds it.
 //!
 //! This is the conversation level of ATOM's `SegmentTokenizer`
 //! (`atom/model_engine/segment_tokenizer.py`), with its conditions for a cut
 //! right after an added token to be exact. The first reuses within the byte
-//! limit are also compared with a plain encode, special tokens included, and a
-//! difference turns the cache off for good. A longer one is not: its plain
-//! encode is what the cache keeps off the request path, and whether a cut is
-//! exact depends on the tokenizer, not on the prompt's length. The ids only
-//! place requests, so an unchecked one can cost a cache miss on the engine,
-//! never a wrong answer.
+//! limit, or `VERIFY_BYTES` when that is larger, are also compared with a plain
+//! encode, special tokens included, and a difference turns the cache off for
+//! good. A longer one is not: its plain encode is what the cache keeps off the
+//! request path, and whether a cut is exact depends on the tokenizer, not on
+//! the prompt's length. The ids only place requests, so an unchecked one can
+//! cost a cache miss on the engine, never a wrong answer.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -30,6 +32,7 @@ use std::{
     },
 };
 
+use aho_corasick::AhoCorasick;
 use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::Value;
@@ -51,6 +54,9 @@ const BUCKET_ENTRIES: usize = 256;
 const COMPARE_CHUNK: usize = 64 * 1024;
 /// Reuses compared with a plain encode before the cache is trusted.
 const VERIFY_FIRST: usize = 4;
+/// Prompts up to this many bytes are compared even when the byte limit is
+/// lower, as no prompt within the bucket key is reused.
+const VERIFY_BYTES: usize = 4 * KEY_BYTES;
 /// Prompts waiting to be encoded in the background; more are dropped.
 const FILL_QUEUE: usize = 4;
 /// A background encode covers at most this many times the byte limit, and a
@@ -88,7 +94,9 @@ struct Stored {
 
 impl Stored {
     fn size(&self) -> usize {
-        self.text.len() + self.ids.len() * size_of::<u32>() + self.cuts.len() * size_of::<Cut>()
+        self.text.capacity()
+            + self.ids.capacity() * size_of::<u32>()
+            + self.cuts.capacity() * size_of::<Cut>()
     }
 
     fn end(&self) -> Cut {
@@ -203,6 +211,8 @@ pub(crate) struct PrefixTokens {
     name: String,
     /// Added tokens by id; where one ends in a prompt is a cut.
     added: HashMap<u32, String>,
+    /// Finds the added tokens in a prompt's text.
+    finder: AhoCorasick,
     /// What `encode` wraps a prompt in with its special tokens.
     head: Vec<u32>,
     tail: Vec<u32>,
@@ -248,13 +258,16 @@ impl PrefixTokens {
         let start = (0..=full.len().saturating_sub(bare.len()))
             .find(|&at| full[at..].starts_with(&bare))
             .ok_or("encoding adds more than special tokens around a prompt")?;
+        let added: HashMap<u32, String> = description
+            .added_tokens
+            .into_iter()
+            .map(|t| (t.id, t.content))
+            .collect();
+        let finder = AhoCorasick::new(added.values()).map_err(|e| e.to_string())?;
         let cache = Self {
             name: name.to_string(),
-            added: description
-                .added_tokens
-                .into_iter()
-                .map(|t| (t.id, t.content))
-                .collect(),
+            added,
+            finder,
             head: full[..start].to_vec(),
             tail: full[start + bare.len()..].to_vec(),
             budget,
@@ -326,15 +339,19 @@ impl PrefixTokens {
                 .map_err(EncodeError::Failed);
         }
         let found = self.find(&prompt);
-        let rest = prompt.len() - found.as_ref().map_or(0, |f| f.end().bytes);
+        let start = found.as_ref().map_or(0, |f| f.end().bytes);
+        let rest = prompt.len() - start;
         if rest > limit {
-            if rest <= limit.saturating_mul(FILL_LIMITS) {
+            // `store` keeps a prompt only up to an added token past both of these.
+            let past = &prompt.as_bytes()[start.max(KEY_BYTES)..];
+            if rest <= limit.saturating_mul(FILL_LIMITS) && self.finder.is_match(past) {
                 self.encode_later(prompt, background.clone());
             }
             return Err(EncodeError::TooLarge);
         }
-        let verify =
-            found.is_some() && prompt.len() <= limit && self.index.lock().verified < VERIFY_FIRST;
+        let verify = found.is_some()
+            && prompt.len() <= limit.max(VERIFY_BYTES)
+            && self.index.lock().verified < VERIFY_FIRST;
         let (ids, cuts) = self
             .extend(&prompt, found.as_ref(), encoder)
             .map_err(EncodeError::Failed)?;
@@ -453,7 +470,13 @@ impl PrefixTokens {
     /// generation prompt, which the template rewrites once the turn is answered),
     /// and sits beside it otherwise (another conversation with the same start, or
     /// a fork).
-    fn store(&self, prompt: String, ids: &[u32], found: Option<Found>, new_cuts: Vec<Cut>) -> bool {
+    fn store(
+        &self,
+        mut prompt: String,
+        ids: &[u32],
+        found: Option<Found>,
+        new_cuts: Vec<Cut>,
+    ) -> bool {
         // With no added token past the reused cut, `found` already serves the prompt.
         let Some(bucket) = bucket_of(&prompt).filter(|_| !new_cuts.is_empty()) else {
             return false;
@@ -474,6 +497,9 @@ impl PrefixTokens {
         if end.bytes <= KEY_BYTES {
             return false;
         }
+        // A rendered prompt can have up to twice its length allocated.
+        prompt.shrink_to_fit();
+        cuts.shrink_to_fit();
         let stored = Arc::new(Stored {
             ids: ids[..end.ids].to_vec(),
             text: prompt,
@@ -598,6 +624,10 @@ struct Description {
     #[serde(default)]
     pre_tokenizer: Value,
     model: Model,
+    #[serde(default)]
+    truncation: Value,
+    #[serde(default)]
+    padding: Value,
 }
 
 #[derive(Deserialize)]
@@ -626,12 +656,16 @@ impl Description {
     /// tokens before anything else and encodes the text between them on its
     /// own, unless a token takes in its neighbours' whitespace, the
     /// pre-tokenizer treats the start of its input specially, the normalizer
-    /// changes text a normalized token is matched in, the model samples, or
-    /// what follows a cut can change what is extracted before it.
+    /// changes text a normalized token is matched in, the model samples, the
+    /// tokenizer truncates or pads what it encodes, or what follows a cut can
+    /// change what is extracted before it.
     fn check(&self) -> Result<(), String> {
         let tokens = &self.added_tokens;
         if tokens.is_empty() {
             return Err("no added tokens to cut at".into());
+        }
+        if !self.truncation.is_null() || !self.padding.is_null() {
+            return Err("the tokenizer truncates or pads what it encodes".into());
         }
         if tokens.iter().any(|t| t.lstrip || t.rstrip || t.single_word) {
             return Err("an added token strips whitespace or matches whole words only".into());
@@ -835,6 +869,11 @@ pub(crate) mod tests {
         format!("<|system|>{}", words.join(" "))
     }
 
+    /// Whether a stored prompt covers `prompt` up to one of its added tokens.
+    pub(crate) fn covers(cache: &PrefixTokens, prompt: &str) -> bool {
+        cache.find(prompt).is_some()
+    }
+
     fn plain(entry: &TokenizerEntry, prompt: &str, special: bool) -> Vec<u32> {
         entry
             .tokenizer
@@ -931,14 +970,43 @@ pub(crate) mod tests {
             encode(&cache, &entry, &turn2, limit).unwrap(),
             plain(&entry, &turn2, true)
         );
-        // Turn 2 is over the limit, so its reuse was not compared with a plain encode.
-        assert_eq!(cache.index.lock().verified, 0);
+        // Over the limit but within `VERIFY_BYTES`, turn 2's reuse was compared
+        // with a plain encode.
+        assert_eq!(cache.index.lock().verified, 1);
         // A turn that appends more than the limit is not encoded on the request path.
         let long = format!("{turn2}</think> {}", "gamma ".repeat(1000));
         assert!(matches!(
             encode(&cache, &entry, &long, limit),
             Err(EncodeError::TooLarge)
         ));
+    }
+
+    #[test]
+    fn a_prompt_no_later_turn_could_cut_is_not_encoded_in_the_background() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let later = || {
+            let rendered = handle.render();
+            ["queued", "dropped"]
+                .iter()
+                .any(|result| rendered.contains(&format!(r#"result="{result}""#)))
+        };
+        let (_dir, entry) = entry(&description());
+        let cache = Arc::new(PrefixTokens::for_entry(&entry, 1 << 30).unwrap());
+        // Its only added token is within the bucket key.
+        let system = system();
+        assert!(matches!(
+            encode(&cache, &entry, &system, 4096),
+            Err(EncodeError::TooLarge)
+        ));
+        assert!(!later());
+        let turn = format!("{system}<|user|> alpha<|assistant|><think>");
+        assert!(matches!(
+            encode(&cache, &entry, &turn, 4096),
+            Err(EncodeError::TooLarge)
+        ));
+        assert!(later());
     }
 
     #[test]
@@ -1035,6 +1103,24 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_prompt_is_cut_after_each_added_token() {
+        let (_dir, entry) = entry(&description());
+        let tokens = PrefixTokens::for_entry(&entry, 1 << 30).unwrap();
+        assert_eq!(tokens.head, [0]);
+        assert!(tokens.tail.is_empty());
+        let prompt = "<|user|> alpha<|assistant|><think>";
+        let encoding = entry.tokenizer.encode(prompt, false).unwrap();
+        assert_eq!(
+            tokens.cuts(prompt, &encoding, Cut::default()),
+            [
+                Cut { bytes: 8, ids: 1 },
+                Cut { bytes: 27, ids: 3 },
+                Cut { bytes: 34, ids: 4 },
+            ]
+        );
+    }
+
+    #[test]
     fn cuts_are_exact_only_for_plain_added_token_splits() {
         let check = |edit: &dyn Fn(&mut Value)| {
             let mut description = description();
@@ -1046,6 +1132,8 @@ pub(crate) mod tests {
         assert!(check(&|_| {}).is_ok());
         assert!(check(&|d| d["added_tokens"][3]["rstrip"] = json!(true)).is_err());
         assert!(check(&|d| d["model"]["dropout"] = json!(0.1)).is_err());
+        assert!(check(&|d| d["truncation"] = json!({"max_length": 8192})).is_err());
+        assert!(check(&|d| d["padding"] = json!({"strategy": "BatchLongest"})).is_err());
         assert!(check(&|d| d["added_tokens"][3]["normalized"] = json!(true)).is_ok());
         assert!(check(&|d| {
             d["added_tokens"][3]["normalized"] = json!(true);

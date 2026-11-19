@@ -947,20 +947,18 @@ async fn a_cached_router_tokenizes_a_turn_over_the_limit() {
     let turn2 =
         format!("{system}<|user|> alpha<|assistant|></think> beta<|user|> x<|assistant|><think>");
 
-    // Over the limit with nothing kept, turn 1 is encoded in the background.
+    // Over the limit with nothing kept, turn 1 is encoded in the background, and
+    // turn 2 extends it.
     let error = prepare_prompt(&app, &turn1).await.unwrap_err();
     assert_eq!(error.code, "tokenizer_input_too_large");
+    let entry = app.tokenizer_registry.get_by_name("m").unwrap();
+    let cache = prefix_tokens::cache(&entry, 1 << 30).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
-    let tokens = loop {
-        match prepare_prompt(&app, &turn2).await {
-            Ok(tokens) => break tokens,
-            Err(error) => {
-                assert_eq!(error.code, "tokenizer_input_too_large");
-                assert!(Instant::now() < deadline, "turn 1 was not kept");
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        }
-    };
+    while !prefix::covers(&cache, &turn2) {
+        assert!(Instant::now() < deadline, "turn 1 was not kept");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let tokens = prepare_prompt(&app, &turn2).await.unwrap();
     let plain = toy.tokenizer.encode(&turn2, false).unwrap();
     assert_eq!(tokens.as_deref(), Some(plain.token_ids()));
 }

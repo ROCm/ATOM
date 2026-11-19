@@ -68,6 +68,7 @@ parking_lot = "0.12.4"
 thiserror = "2.0.12"
 regex = "1.10"
 memchr = "2.7"  # SIMD-optimized byte pattern searching
+aho-corasick = "1.1"
 url = "2.5.4"
 validator = { version = "0.20.0", features = ["derive"] }
 tokio-stream = { version = "0.1", features = ["sync"] }

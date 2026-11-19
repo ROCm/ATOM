@@ -288,7 +288,7 @@ need tokens, such as `cache_aware` or `round_robin`, for these models and APIs.
   their slot immediately. All request parsing runs on this pool. Each request's
   preparation shares one `--prepare-timeout-ms` deadline (default: 5000 ms), and
   tokenization input is limited by `--prepare-max-tokenize-bytes` (default: 1 MiB).
-  `--prepare-prefix-cache-mb` (default: 1024, for each registered tokenizer) keeps
+  `--prepare-prefix-cache-mb` (default: 256, for each registered tokenizer) keeps
   earlier prompts with their tokens, so a conversation's next turn encodes only what
   it appends and the limit applies to that, in a prompt of at most 16 times the
   limit; longer prompts are rejected before they are rendered. It needs the

@@ -124,7 +124,7 @@ pub const DEFAULT_PREPARE_TIMEOUT_MS: u64 = 5000;
 /// Default `--prepare-max-tokenize-bytes`.
 pub const DEFAULT_MAX_TOKENIZE_BYTES: usize = 1024 * 1024;
 /// Default `--prepare-prefix-cache-mb`.
-pub const DEFAULT_PREFIX_CACHE_MB: usize = 1024;
+pub const DEFAULT_PREFIX_CACHE_MB: usize = 256;
 /// Waiting jobs per preparation thread when `--prepare-queue-capacity` is unset.
 pub const PREPARE_QUEUE_SLOTS_PER_WORKER: usize = 10;
 
