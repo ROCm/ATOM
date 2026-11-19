@@ -33,6 +33,7 @@ from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import (
     GemmaRMSNorm,
     fused_allreduce_gemma_rms_norm,
+    fused_allreduce_gemma_rms_norm_mxfp8_quant,
     fused_allreduce_gemma_rms_norm_quant,
 )
 from atom.model_ops.linear import (
@@ -148,6 +149,19 @@ def _defer_splitk_reduce(linear: nn.Module, consumer_claims: bool) -> None:
     call whether it splits K (aiter.gemm_a8w8_bpreshuffle_splitk_deferred)."""
     if consumer_claims and splitk_consumer_reduce_supported():
         linear.splitk_consumer_max_m = envs.ATOM_SPLITK_CONSUMER_REDUCE_MAX_M
+
+
+def _linear_consumes_mxfp8(linear: nn.Module) -> bool:
+    """Whether a linear consumes native E4M3 plus row-major group-32 E8M0."""
+    quant_type = getattr(linear, "quant_type", None)
+    quant_type_value = getattr(quant_type, "value", quant_type)
+    params_dtype = getattr(linear, "params_dtype", None)
+    return (
+        quant_type_value == QuantType.per_1x32.value
+        and params_dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+        and getattr(linear, "native_a8_group_rows", None) is not None
+        and not getattr(linear, "runs_bf16", False)
+    )
 
 
 def _minimax_m3_cos_sin_cache(
@@ -736,6 +750,15 @@ class MiniMaxM3DecoderLayer(nn.Module):
             not self.is_moe_layer
             and _linear_consumes_per_token_fp8(self.mlp.gate_up_proj)
         )
+        enable_mxfp8_fused_ar = envs.ATOM_MINIMAX_M3_GLUON_AR_MXFP8
+        fuse_input_ar_rmsnorm_mxfp8 = enable_mxfp8_fused_ar and _linear_consumes_mxfp8(
+            self.self_attn.qkv_proj
+        )
+        fuse_post_attention_ar_rmsnorm_mxfp8 = (
+            enable_mxfp8_fused_ar
+            and not self.is_moe_layer
+            and _linear_consumes_mxfp8(self.mlp.gate_up_proj)
+        )
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -743,6 +766,14 @@ class MiniMaxM3DecoderLayer(nn.Module):
             hidden_states, hidden_states_scale, residual = (
                 fused_allreduce_gemma_rms_norm_quant(
                     hidden_states, residual, self.input_layernorm
+                )
+            )
+        elif fuse_input_ar_rmsnorm_mxfp8:
+            hidden_states, hidden_states_scale, residual = (
+                fused_allreduce_gemma_rms_norm_mxfp8_quant(
+                    hidden_states,
+                    residual,
+                    self.input_layernorm,
                 )
             )
         else:
@@ -766,6 +797,15 @@ class MiniMaxM3DecoderLayer(nn.Module):
             hidden_states, hidden_states_scale, residual = (
                 fused_allreduce_gemma_rms_norm_quant(
                     hidden_states, residual, self.post_attention_layernorm
+                )
+            )
+            hidden_states = ffn(hidden_states, x_scale=hidden_states_scale)
+        elif fuse_post_attention_ar_rmsnorm_mxfp8:
+            hidden_states, hidden_states_scale, residual = (
+                fused_allreduce_gemma_rms_norm_mxfp8_quant(
+                    hidden_states,
+                    residual,
+                    self.post_attention_layernorm,
                 )
             )
             hidden_states = ffn(hidden_states, x_scale=hidden_states_scale)
