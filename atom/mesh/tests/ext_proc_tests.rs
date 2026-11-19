@@ -688,6 +688,68 @@ async fn generate_optional_model_uses_default_policy_and_preserves_candidate_fil
     assert_eq!(other.load(), 0);
 }
 
+impl Stream {
+    /// Routes a chat request of `session` and returns its destination.
+    async fn session_destination(&mut self, session: &str) -> String {
+        self.send(Request::RequestHeaders(Self::headers(
+            &[
+                (":method", "POST"),
+                (":path", "/v1/chat/completions"),
+                ("content-type", "application/json"),
+                ("x-request-id", "same-id"),
+                ("x-session-id", session),
+            ],
+            false,
+        )))
+        .await;
+        self.body(Self::BODY, true).await;
+        let destination = self.destination().await;
+        assert!(matches!(self.recv().await, Response::RequestBody(_)));
+        destination
+    }
+}
+
+#[tokio::test]
+async fn a_worker_server_error_releases_the_session_binding_and_a_client_error_does_not() {
+    for (status, kept) in [("400", true), ("503", false)] {
+        let fixture = Fixture::new(RouterConfig {
+            policy: mesh::config::PolicyConfig::DpSticky,
+            ..Default::default()
+        })
+        .await;
+        let other: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://127.0.0.1:18002")
+                .model_id("test-model")
+                .build(),
+        );
+        fixture.app.worker_registry.register(other.clone());
+
+        let mut first = fixture.open().await;
+        let bound = first.session_destination("session-1").await;
+        first
+            .send(Request::ResponseHeaders(Stream::headers(
+                &[(":status", status)],
+                true,
+            )))
+            .await;
+        assert!(matches!(first.recv().await, Response::ResponseHeaders(_)));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while fixture.worker.load() + other.load() != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        // A 5xx from the worker placed the session again; a 4xx kept it.
+        let mut second = fixture.open().await;
+        let next = second.session_destination("session-1").await;
+        assert_eq!(next == bound, kept, "{status}: {bound} then {next}");
+        drop(second);
+        fixture.runtime.shutdown().await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn dp_rank_uses_origin_address_and_preserves_extension_fields() {
     let fixture = Fixture::new(RouterConfig::default()).await;

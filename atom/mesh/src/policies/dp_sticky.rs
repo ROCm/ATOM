@@ -4,7 +4,8 @@
 //! selected for that session. A new session goes to the worker holding the
 //! fewest live sessions (load breaks ties); requests without a session ID use
 //! minimum-load balancing. A stale mapping is replaced when its worker is no
-//! longer healthy or the session has been idle for too long.
+//! longer healthy, the session has been idle for too long, or a request of the
+//! session failed on it with a server error or got no response.
 
 use std::{
     collections::HashMap,
@@ -42,6 +43,22 @@ struct StickyAssignment {
     dispatched: Option<WorkerIdentity>,
     /// Why the session was last reassigned, until a request is sent.
     reassigned: Option<&'static str>,
+    /// A request of the session failed on the worker it was sent to, so the
+    /// next request, a retry included, is placed again.
+    failed: bool,
+    /// Workers the session's requests failed on since its last hit. Placing
+    /// it again leaves them out while another worker is healthy.
+    avoid: Vec<WorkerIdentity>,
+}
+
+impl StickyAssignment {
+    /// Whether a request sent to `worker` belongs to this binding: `worker` is
+    /// the bound worker, or, under DP rank mapping, the one the session's last
+    /// request was sent to while no reassignment is pending.
+    fn owns(&self, worker: &WorkerIdentity) -> bool {
+        self.worker == *worker
+            || (self.reassigned.is_none() && self.dispatched.as_ref() == Some(worker))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -100,11 +117,13 @@ impl DpStickyPolicy {
     }
 
     /// Select the healthy worker holding the fewest non-expired assignments,
-    /// tie-broken by current request load. Caller must hold `assign_lock`.
+    /// tie-broken by current request load, other than the workers in `avoid`
+    /// unless every healthy worker is in it. Caller must hold `assign_lock`.
     fn select_new_session_worker(
         &self,
         workers: &[Arc<dyn Worker>],
         now: Instant,
+        avoid: &[WorkerIdentity],
     ) -> Option<usize> {
         let mut live_sessions: HashMap<WorkerIdentity, usize> = HashMap::new();
         for entry in self.assignments.iter() {
@@ -114,15 +133,24 @@ impl DpStickyPolicy {
             }
         }
 
-        get_healthy_worker_indices(workers)
-            .into_iter()
-            .min_by_key(|&index| {
-                let identity = Self::worker_identity(&workers[index]);
-                (
-                    live_sessions.get(&identity).copied().unwrap_or(0),
-                    workers[index].load(),
-                )
-            })
+        let mut candidates = get_healthy_worker_indices(workers);
+        if !avoid.is_empty() {
+            let others: Vec<usize> = candidates
+                .iter()
+                .copied()
+                .filter(|&index| !avoid.contains(&Self::worker_identity(&workers[index])))
+                .collect();
+            if !others.is_empty() {
+                candidates = others;
+            }
+        }
+        candidates.into_iter().min_by_key(|&index| {
+            let identity = Self::worker_identity(&workers[index]);
+            (
+                live_sessions.get(&identity).copied().unwrap_or(0),
+                workers[index].load(),
+            )
+        })
     }
 
     /// Returns the selection with the session outcome: hit, new, rebind,
@@ -141,10 +169,11 @@ impl DpStickyPolicy {
         if let Some(mut assignment) = self.assignments.get_mut(session_id) {
             let is_expired = now.saturating_duration_since(assignment.last_access)
                 > SESSION_REASSIGNMENT_IDLE_TIMEOUT;
-            if !is_expired {
+            if !is_expired && !assignment.failed {
                 if let Some(index) = Self::healthy_worker_for_identity(workers, &assignment.worker)
                 {
                     assignment.last_access = now;
+                    assignment.avoid.clear();
                     return (Some(index), AFFINITY_HIT);
                 }
             }
@@ -156,25 +185,35 @@ impl DpStickyPolicy {
             .assign_lock
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let (outcome, dispatched) = match self.assignments.get_mut(session_id) {
-            None => (AFFINITY_NEW, None),
+        let (outcome, dispatched, avoid) = match self.assignments.get_mut(session_id) {
+            None => (AFFINITY_NEW, None, Vec::new()),
             Some(mut assignment) => {
                 let is_expired = now.saturating_duration_since(assignment.last_access)
                     > SESSION_REASSIGNMENT_IDLE_TIMEOUT;
                 if is_expired {
-                    (AFFINITY_EXPIRED, assignment.dispatched.clone())
+                    (
+                        AFFINITY_EXPIRED,
+                        assignment.dispatched.clone(),
+                        std::mem::take(&mut assignment.avoid),
+                    )
                 } else if let Some(index) =
                     Self::healthy_worker_for_identity(workers, &assignment.worker)
+                        .filter(|_| !assignment.failed)
                 {
                     assignment.last_access = now;
+                    assignment.avoid.clear();
                     return (Some(index), AFFINITY_HIT);
                 } else {
-                    (AFFINITY_REBIND, assignment.dispatched.clone())
+                    (
+                        AFFINITY_REBIND,
+                        assignment.dispatched.clone(),
+                        std::mem::take(&mut assignment.avoid),
+                    )
                 }
             }
         };
 
-        let Some(selected_index) = self.select_new_session_worker(workers, now) else {
+        let Some(selected_index) = self.select_new_session_worker(workers, now, &avoid) else {
             return (None, outcome);
         };
         self.assignments.insert(
@@ -184,6 +223,8 @@ impl DpStickyPolicy {
                 last_access: now,
                 dispatched,
                 reassigned: (outcome != AFFINITY_NEW).then_some(outcome),
+                failed: false,
+                avoid,
             },
         );
         (Some(selected_index), outcome)
@@ -238,6 +279,26 @@ impl LoadBalancingPolicy for DpStickyPolicy {
             MeshMetrics::record_session_worker_change(pool, reason);
         }
         assignment.dispatched = Some(identity);
+    }
+
+    /// A failed request releases its session's binding: the next request, a
+    /// retry included, is placed again as `rebind`, away from every worker the
+    /// session failed on since its last hit while another one is healthy. A
+    /// late failure on a worker the session has since left keeps the new
+    /// binding.
+    fn on_dispatch_failed(&self, headers: Option<&http::HeaderMap>, worker: &Arc<dyn Worker>) {
+        let Some(session_id) = extract_sticky_routing_key(headers) else {
+            return;
+        };
+        let identity = Self::worker_identity(worker);
+        if let Some(mut assignment) = self.assignments.get_mut(session_id) {
+            if assignment.owns(&identity) {
+                assignment.failed = true;
+                if !assignment.avoid.contains(&identity) {
+                    assignment.avoid.push(identity);
+                }
+            }
+        }
     }
 
     fn name(&self) -> &'static str {
@@ -512,6 +573,130 @@ mod tests {
             worker_changes(&handle.render()),
             [r#"mesh_session_worker_change_total{pool="prefill",reason="rank_mapping"} 1"#]
         );
+    }
+
+    #[tokio::test]
+    async fn dispatch_failure_places_the_retry_again() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let policy = DpStickyPolicy::new();
+        let workers = workers();
+        let headers = headers("session-1");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+
+        assert_eq!(route(&policy, &workers, "regular", "session-1").await, 0);
+        policy.on_dispatch_failed(Some(&headers), &workers[0]);
+        // The retry avoids worker 0, where it failed.
+        let (retry, decision) = policy.select_with_decision(&workers, &info).await;
+        assert_eq!((retry, decision.branch), (Some(1), "rebind"));
+        policy.on_dispatch("regular", Some(&headers), &workers[1]);
+        assert_eq!(branch(&policy, &workers, &info).await, "hit");
+
+        assert_eq!(
+            worker_changes(&handle.render()),
+            [r#"mesh_session_worker_change_total{pool="regular",reason="rebind"} 1"#]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retry_avoids_the_worker_it_failed_on() {
+        let policy = DpStickyPolicy::new();
+        let workers = workers();
+        assert_eq!(route(&policy, &workers, "regular", "s1").await, 0);
+        assert_eq!(route(&policy, &workers, "regular", "s2").await, 1);
+        assert_eq!(route(&policy, &workers, "regular", "s3").await, 0);
+        let s2 = headers("s2");
+        let info = SelectWorkerInfo {
+            headers: Some(&s2),
+            ..Default::default()
+        };
+
+        // Worker 1 holds fewer sessions, but s2 failed there.
+        policy.on_dispatch_failed(Some(&s2), &workers[1]);
+        let (retry, decision) = policy.select_with_decision(&workers, &info).await;
+        assert_eq!((retry, decision.branch), (Some(0), "rebind"));
+
+        // With no other healthy worker, the retry stays where it failed.
+        let only = &workers[1..];
+        assert_eq!(route(&policy, only, "regular", "s4").await, 0);
+        let s4 = headers("s4");
+        policy.on_dispatch_failed(Some(&s4), &only[0]);
+        let info = SelectWorkerInfo {
+            headers: Some(&s4),
+            ..Default::default()
+        };
+        let (retry, decision) = policy.select_with_decision(only, &info).await;
+        assert_eq!((retry, decision.branch), (Some(0), "rebind"));
+    }
+
+    #[tokio::test]
+    async fn retries_avoid_every_worker_the_session_failed_on_until_a_hit() {
+        let policy = DpStickyPolicy::new();
+        let workers: Vec<Arc<dyn Worker>> = ["http://a:8000", "http://b:8000", "http://c:8000"]
+            .into_iter()
+            .map(|url| Arc::new(BasicWorkerBuilder::new(url).build()) as Arc<dyn Worker>)
+            .collect();
+        // Worker c holds two other sessions, so a and b are lighter.
+        for other in ["other-1", "other-2"] {
+            route(&policy, &workers[2..], "regular", other).await;
+        }
+        assert_eq!(route(&policy, &workers, "regular", "s").await, 0);
+        let s = headers("s");
+
+        // a fails, then b: the next retry goes to c, not back to a.
+        policy.on_dispatch_failed(Some(&s), &workers[0]);
+        assert_eq!(route(&policy, &workers, "regular", "s").await, 1);
+        policy.on_dispatch_failed(Some(&s), &workers[1]);
+        assert_eq!(route(&policy, &workers, "regular", "s").await, 2);
+
+        // A hit on c clears the set: a failure on c then avoids c alone.
+        assert_eq!(route(&policy, &workers, "regular", "s").await, 2);
+        policy.on_dispatch_failed(Some(&s), &workers[2]);
+        assert_eq!(route(&policy, &workers, "regular", "s").await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_late_failure_on_the_previous_worker_keeps_the_new_binding() {
+        let policy = DpStickyPolicy::new();
+        let workers = workers();
+        let headers = headers("session-1");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+
+        assert_eq!(route(&policy, &workers, "regular", "session-1").await, 0);
+        workers[0].set_healthy(false);
+        assert_eq!(branch(&policy, &workers, &info).await, "rebind");
+        // A request still running on worker 0 fails, before and after the
+        // rebound session's next request is sent to worker 1.
+        policy.on_dispatch_failed(Some(&headers), &workers[0]);
+        policy.on_dispatch("regular", Some(&headers), &workers[1]);
+        policy.on_dispatch_failed(Some(&headers), &workers[0]);
+        workers[0].set_healthy(true);
+        let (selected, decision) = policy.select_with_decision(&workers, &info).await;
+        assert_eq!((selected, decision.branch), (Some(1), "hit"));
+    }
+
+    #[tokio::test]
+    async fn a_failure_on_the_mapped_rank_places_the_session_again() {
+        let policy = DpStickyPolicy::new();
+        let ranks = dp_workers();
+        let headers = headers("session-1");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+
+        // The pin is rank 0; rank mapping sends the request to rank 1.
+        assert_eq!(policy.select_worker(&ranks, &info).await, Some(0));
+        policy.on_dispatch("prefill", Some(&headers), &ranks[1]);
+        policy.on_dispatch_failed(Some(&headers), &ranks[1]);
+        assert_eq!(branch(&policy, &ranks, &info).await, "rebind");
     }
 
     #[tokio::test]
