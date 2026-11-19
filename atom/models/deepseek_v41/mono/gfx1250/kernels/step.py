@@ -749,13 +749,13 @@ def target_layer(E, Ly):
                 segw = cs_["iprod"] & grp
                 if fx.const_expr(L20_ORD and TR <= TK.MC_ROWS):   # (l20) the ordered multi-CTA selection reads whole rows: SCORE
                     segw = fx.Int32(0) != fx.Int32(0)
-                # the selecting CTAs (select_mc: b < TR x MC_G; layer 20's select_ord: up to TR x (GS + GB); c1 REINDEX
-                # select_ma: from CTA MA_X0): the selection's code -> the I-cache over the SCORE wait (it runs cold: once in
+                # the selecting CTAs (select_mc: b < TR x MC_G, long FULL rows TR x mc_g_long; layer 20's select_ord: up to
+                # TR x (GS + GB); c1 REINDEX select_ma: from CTA MA_X0): the selection's code -> the I-cache over the SCORE wait (it runs cold: once in
                 # 4+ layers); select_ma / select_mc / select_ord follow in the cold index section, inside the 24 KB from here
                 bpf = b
                 if fx.const_expr(TR <= 6):
                     bpf = isrx.select((b - fx.Int32(TK.MA_X0) + fx.Int32(TK.MA_CTAS)) % fx.Int32(TK.MA_CTAS), b)
-                if (bpf < TR * TK.MC_G) | cs_["iprod"]:
+                if (bpf < isrx.select(fx.Int32(TR * TK.MC_G), fx.Int32(TR * TK.mc_g_long(TR)))) | cs_["iprod"]:
                     iprefetch(24)
                 if segw == (fx.Int32(0) != fx.Int32(0)):
                     handoff(lc + i64(LY.SCORE), t, True)
@@ -822,6 +822,9 @@ def target_layer(E, Ly):
                     # 30K -45 us a step; short rows keep MC_G_SHORT, where the round's group count over 32 CTAs costs
                     # more than their keys -- 2K +56 us with 32 CTAs always)
                     gsel = (nmax > fx.Int32(TK.MC_G_MIN_N)).select(fx.Int32(TK.MC_G), fx.Int32(TK.MC_G_SHORT))
+                    # (FULL rows past MC_G_LONG_N keys: every CTA in a row group, topk.mc_g_long -- REINDEX keeps MC_G)
+                    gsel = ((isrx == (fx.Int32(0) != fx.Int32(0))) & (nmax > fx.Int32(TK.MC_G_LONG_N))).select(
+                        fx.Int32(TK.mc_g_long(TR)), gsel)
                     if fx.const_expr(TR <= 6):   # c1 REINDEX: select_ma (the anchored first round); 0 -> select_mc
                         mdone = fx.Int32(0)
                         if isrx:

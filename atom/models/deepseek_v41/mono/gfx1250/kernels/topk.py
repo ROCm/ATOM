@@ -389,9 +389,19 @@ MC_ROWS = 8                       # row slots (TR <= 8)
 MC_G = 32                         # CTAs a row once the step's longest row has > MC_G_MIN_N keys (TR * MC_G <= 256)
 MC_G_SHORT = 8                    # CTAs a row otherwise
 MC_G_MIN_N = 4096                 # (CTAs G r .. G r + G - 1 take row r; the rest skip to the stage's handoff)
+MC_G_LONG_N = 16384               # FULL rows: past this many keys, every CTA in a row group (mc_g_long)
 MC_HIST = 4 * MC_ROWS * 256 * 4   # bytes a layer: [4 rounds][rows][256] i32
 MC_CTR = MC_ROWS * 8 * 4          # bytes a layer: [rows] (above, ties, round 0..3 group counts, -, -) i32
 MC_LAYER = MC_HIST + MC_CTR
+
+
+def mc_g_long(TR):
+    """CTAs a FULL row once the step's longest row has > MC_G_LONG_N keys: as many as the grid holds for TR rows (TR = 6:
+    42, 252 CTAs) -- a radix round's keys a CTA scale with the row (133K: 33K, 400K: 100K keys a row), its group count
+    does not."""
+    return max(MC_G, D.CTAS // TR)
+
+
 O_MC = LDS_BYTES2                 # LDS: (prefix, mask, need, n) i32, then the CTA's 256-bin histogram
 O_MCH = O_MC + 16
 
