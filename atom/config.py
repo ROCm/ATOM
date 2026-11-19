@@ -3323,9 +3323,9 @@ class Config:
                 requested=spec.kv_cache_dtype,
             )
             if spec.draft_kv_dtype != self.kv_cache_dtype and self.kv_transfer_config:
-                # The offload namespace keys the target's KV dtype alone, so a
-                # draft page of another dtype would share a key with the target's.
-                # The flag has no fp4 / nvfp4 to match an FP4 target with.
+                # Not verified: no KV connector or offload path (save, restore,
+                # P/D transfer) has run with a draft whose dtype differs from the
+                # target's. The flag has no fp4 / nvfp4 to match an FP4 target with.
                 hint = (
                     ""
                     if self.kv_cache_dtype in FP4_CACHE_DTYPES

@@ -165,10 +165,8 @@ def test_an_mtp_draft_shares_the_targets_pool(monkeypatch):
         _llama(monkeypatch, kv_cache_dtype="fp8", speculative_config=spec)
 
 
-def test_a_draft_dtype_beside_the_targets_cannot_share_the_offload_namespace(
-    monkeypatch,
-):
-    # the offload namespace keys the target's KV dtype alone
+def test_a_draft_dtype_beside_the_targets_is_refused_with_offload(monkeypatch):
+    # unverified with a KV connector or offload, so refused at startup
     with pytest.raises(
         ValueError,
         match="draft KV dtype fp8 differs.*--spec-decode-kv-cache-dtype bf16",
