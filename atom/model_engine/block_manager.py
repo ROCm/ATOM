@@ -771,15 +771,21 @@ class BlockManager:
         """
         if self.dcp_world_size <= 1:
             return (seq_len + self.block_size - 1) // self.block_size
-        from atom.model_ops.dcp_ops import get_dcp_local_seq_lens
+        return int(self.num_pool_blocks_many([seq_len])[0])
 
-        local_len = get_dcp_local_seq_lens(
-            np.array([seq_len]),
-            self.dcp_world_size,
-            self.dcp_rank,
-            self.cp_kv_cache_interleave_size,
-        )[0]
-        return int((local_len + self.block_size - 1) // self.block_size)
+    def num_pool_blocks_many(self, seq_lens) -> np.ndarray:
+        """`num_pool_blocks` of each length in `seq_lens`, in one numpy pass."""
+        lens = np.asarray(seq_lens, dtype=np.int64)
+        if self.dcp_world_size > 1:
+            from atom.model_ops.dcp_ops import get_dcp_local_seq_lens
+
+            lens = get_dcp_local_seq_lens(
+                lens,
+                self.dcp_world_size,
+                self.dcp_rank,
+                self.cp_kv_cache_interleave_size,
+            )
+        return (lens + self.block_size - 1) // self.block_size
 
     def draft_lookahead_blocks(self, seq_len: int) -> int:
         """Blocks past `num_pool_blocks(seq_len)` that `draft_lookahead` adds.
@@ -1726,6 +1732,7 @@ class BlockManager:
             return False
         probe.num_cached_blocks = lowered
         probe.num_new_blocks = demand
+        probe.protected_hash = protected
         return True
 
     def retreat_joint_to_hbm(self, seq: Sequence) -> bool:

@@ -7,6 +7,8 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
+
 from atom.model_engine.capabilities import pcp_group_size_of
 
 logger = logging.getLogger("atom")
@@ -79,20 +81,21 @@ class DecodeGrowthReserve:
         return block_manager.has_page_units(demand + reserve, probe.protected_hash)
 
     def blocks(self, seq, num_blocks, admitted) -> int:
-        """Blocks `seq`, holding `num_blocks`, and each of `admitted` need to grow."""
-        reserve = self._growth_blocks(seq, num_blocks)
-        for other in admitted:
-            reserve += self._growth_blocks(other, len(other.block_table))
-        return reserve
-
-    def _growth_blocks(self, seq, held: int) -> int:
-        # Past the blocks `seq` holds, which can lead its length by a draft
-        # lookahead already allocated or trail it by the block this step's
-        # decode has yet to take. No more than it may still generate, but no
-        # less than a first decode takes whatever is left.
-        left = max(0, seq.max_tokens - seq.num_completion_tokens)
-        tokens = max(min(self.tokens, left), self.first_decode_tokens)
-        return max(0, self._block_manager.num_pool_blocks(len(seq) + tokens) - held)
+        """Blocks `seq` (holding `num_blocks`) and each of `admitted` need to grow:
+        at least a first decode, at most what is left to generate. One pool pass."""
+        rows = [seq, *admitted]
+        held = np.fromiter(
+            (num_blocks, *(len(s.block_table) for s in admitted)), np.int64, len(rows)
+        )
+        lengths = np.fromiter((len(s) for s in rows), np.int64, len(rows))
+        left = np.fromiter(
+            (s.max_tokens - s.num_completion_tokens for s in rows), np.int64, len(rows)
+        )
+        tokens = np.maximum(
+            np.minimum(self.tokens, np.maximum(left, 0)), self.first_decode_tokens
+        )
+        need = self._block_manager.num_pool_blocks_many(lengths + tokens) - held
+        return int(np.maximum(need, 0).sum())
 
 
 class PdAdmissionController:

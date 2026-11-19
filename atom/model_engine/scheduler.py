@@ -878,6 +878,8 @@ class Scheduler:
         self._schedule_tick: int = 0
 
         self._num_parked_remote_kv: int = 0
+        # The loads `_num_parked_remote_kv` counts, by seq id.
+        self._parked_loads: dict[int, Sequence] = {}
 
         # Under PP the head keeps several batches in flight, so schedule() must
         # advance chunked-prefill progress itself rather than defer it to
@@ -913,15 +915,18 @@ class Scheduler:
             first_decode_tokens=first_decode_tokens,
         )
         # The controller keeps the decode reserve. Without it (off, or not
-        # allowed at DCP > 1 or with a state pool) the scheduler keeps it.
+        # allowed at DCP > 1 or with a state pool) the scheduler keeps it, for
+        # the connectors whose match query a deferred receive can ask again.
         self._receive_reserve = (
-            None
-            if self.pd_admission is not None
-            else DecodeGrowthReserve(
+            DecodeGrowthReserve(
                 self.block_manager,
                 tokens=first_decode_tokens,
                 first_decode_tokens=first_decode_tokens,
             )
+            if self.pd_admission is None
+            and self.kv_connector is not None
+            and self.kv_connector.supports_pd_admission
+            else None
         )
         # Receives `_receive_reserve` deferred, once per admission wait.
         self.receive_reserve_deferred = 0
@@ -3634,8 +3639,11 @@ class Scheduler:
         held = self._decode_rows()
         if self.pd_admission is not None:
             return self.pd_admission.leaves_decode_room(seq, probe, held=held)
-        # Only an idle D admits below it, as with the controller.
-        return not held or self._receive_reserve.leaves_room(seq, probe, held)
+        if self._receive_reserve is None:
+            return True
+        # Only an idle D admits below it; a cancelled load still draining is not idle.
+        idle = not held and not self._parked_loads
+        return idle or self._receive_reserve.leaves_room(seq, probe, held)
 
     def _count_receive_deferral(self, seq: Sequence) -> None:
         # Admission stops at a deferred receive, so it heads the queue until it
@@ -4630,12 +4638,6 @@ class Scheduler:
         skipped_waiting_requests.append(seq)
         seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
         self._count_inflight_load(seq)
-
-    @property
-    def _parked_loads(self) -> dict[int, Sequence]:
-        """The loads `_num_parked_remote_kv` counts, by seq id. Created on first
-        use, so schedulers built without `__init__` (test doubles) work."""
-        return self.__dict__.setdefault("_parked_loads_by_id", {})
 
     def _count_inflight_load(self, seq: Sequence) -> None:
         if not getattr(seq, "_counted_as_inflight_load", False):

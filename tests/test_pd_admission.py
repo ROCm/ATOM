@@ -3,16 +3,19 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 from aiter_stub import stubbed_aiter
 from conftest import MockConfig
 
 from atom.kv_transfer.disaggregation.chunked_prefill import PrefillHandoff
 from atom.kv_transfer.disaggregation.pd_admission import (
+    DecodeGrowthReserve,
     PdAdmissionController,
     ReceivePlan,
 )
 from atom.kv_transfer.disaggregation.types import KVConnectorOutput
+from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.prefill_delayer import PrefillDecision
 from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import SequenceStatus
@@ -35,6 +38,7 @@ def build(monkeypatch, mooncake_module, seq_factory):
         prefix=False,
         connector_wrapper=None,
         chunked=False,
+        backend="mooncake",
         **overrides,
     ):
         config = MockConfig(
@@ -48,7 +52,7 @@ def build(monkeypatch, mooncake_module, seq_factory):
             ),
             enable_prefix_caching=prefix,
             kv_transfer_config={
-                "kv_connector": "mooncake",
+                "kv_connector": backend,
                 "kv_role": "kv_consumer",
                 "enable_chunked_transfer": chunked,
                 # By default, exactly one 8-token request (2 blocks) fits.
@@ -61,7 +65,16 @@ def build(monkeypatch, mooncake_module, seq_factory):
         )
         for k, v in overrides.items():
             setattr(config, k, v)
-        connector = mooncake_module.MooncakeConnectorScheduler(config)
+        if backend == "moriio":
+            with stubbed_aiter():
+                moriio = pytest.importorskip(
+                    "atom.kv_transfer.disaggregation.moriio.moriio_connector"
+                )
+            monkeypatch.setattr(moriio, "get_open_port", lambda: 30000)
+            monkeypatch.setattr(moriio, "get_ip", lambda: "127.0.0.1")
+            connector = moriio.MoRIIOConnectorScheduler(config)
+        else:
+            connector = mooncake_module.MooncakeConnectorScheduler(config)
         if connector_wrapper:
             connector = connector_wrapper(connector)
         monkeypatch.setattr(
@@ -124,6 +137,7 @@ def standalone(max_bytes, *, reserve_tokens=None, free_blocks=0):
     connector = SimpleNamespace(pd_receive_block_offset=lambda seq, n, cached: 0)
     block_manager = SimpleNamespace(
         num_pool_blocks=lambda tokens: tokens,
+        num_pool_blocks_many=lambda lengths: np.asarray(lengths),
         draft_lookahead_blocks=lambda tokens: 0,
         has_page_units=lambda count, protected_hash=None: count <= free_blocks,
         kv=SimpleNamespace(lookup=lambda h: -1, num_free=free_blocks),
@@ -1101,6 +1115,53 @@ def test_the_reserve_covers_a_speculative_first_decode(build, options, chunked):
     assert b.id in batch.req_ids
     assert sched.total_preemptions == 0
     assert free_kv_deferrals(sched) == 1
+
+
+def test_the_reserve_sizes_every_row_in_one_pass_at_dcp():
+    # DCP8, 4-token blocks, rank 0: a row of n tokens holds ceil(ceil(n / 8) / 4).
+    bm = BlockManager(
+        MockConfig(
+            num_kvcache_blocks=64, kv_cache_block_size=4, decode_context_parallel_size=8
+        )
+    )
+
+    def pool_blocks(n):
+        local = (n + 7) // 8
+        return (local + 3) // 4
+
+    lengths = [1, 7, 8, 9, 100, 1000, 4097]
+    assert bm.num_pool_blocks_many(lengths).tolist() == [
+        pool_blocks(n) for n in lengths
+    ]
+    rows = [SizedSeq(num_tokens=n, block_table=[0] * pool_blocks(n)) for n in lengths]
+    reserve = DecodeGrowthReserve(bm, tokens=40, first_decode_tokens=8)
+    expected = sum(pool_blocks(n + 40) - pool_blocks(n) for n in lengths)
+    assert reserve.blocks(rows[0], pool_blocks(lengths[0]), rows[1:]) == expected
+
+
+def test_a_moriio_receive_is_never_deferred_into_a_local_prefill(build):
+    # MoRIIO answers its match query once, so a receive deferred after it would
+    # return as a local prefill into the blocks its RDMA writes.
+    sched, request = build(
+        options={"enabled": False}, backend="moriio", num_kvcache_blocks=5
+    )
+    a, b = request(), request()
+    sched.extend([a, b])
+    for _ in range(3):
+        batch, _ = sched.schedule()
+        receiving = set(batch.connector_meta_output.reqs_to_recv)
+        assert not receiving & set(batch.req_ids)
+    assert a.status == b.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+
+
+def test_a_draining_cancelled_receive_keeps_the_decoder_from_idling(build):
+    sched, request = build(options={"enabled": False}, num_kvcache_blocks=2)
+    seq = request()  # its prompt takes the whole pool
+    probe = SimpleNamespace(num_new_blocks=2, protected_hash=None)
+    assert sched._receive_leaves_decode_room(seq, probe), "an idle D may"
+    # A cancelled receive leaves the decode rows but holds its blocks until it drains.
+    sched._parked_loads[99] = SimpleNamespace(status=SequenceStatus.FINISHED)
+    assert not sched._receive_leaves_decode_room(seq, probe)
 
 
 def test_without_the_controller_a_lone_receive_may_take_the_whole_pool(build):

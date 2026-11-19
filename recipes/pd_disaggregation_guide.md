@@ -25,10 +25,11 @@ still apply. See [the implementation and CPU verification notes](../docs/pd_chun
 
 Mooncake reserves D's destination KV blocks before P writes them, so a backlog
 of pending receives can hold most of D's KV pool while few requests decode.
-D always keeps a decode reserve: it defers a new receive unless, after the
-receive takes its blocks, every request D holds and the receive itself could
-still take their first decode step. A P/D request preempted for room drops the
-KV it received and recomputes its whole prompt on D.
+A Mooncake D checks a decode reserve when it admits a receive: it defers the
+receive unless, after it takes its blocks, every request D holds and the
+receive itself could still take their first decode step. A P/D request
+preempted for room drops the KV it received and recomputes its whole prompt on
+D. Local prefills on D (such as that recompute) are not held to the reserve.
 The opt-in `pd_admission` policy also defers a new receive while the receive
 targets already pending would exceed a per-rank byte budget, and can raise the
 reserve. Set it in the consumer's
