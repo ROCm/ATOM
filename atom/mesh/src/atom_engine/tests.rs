@@ -189,6 +189,7 @@ fn a_link_handshakes_and_routes_input_and_control_to_their_core() {
     let spec = core_spec(&dir, std::process::id());
     let ready = pb::envelope::Body::Ready(pb::Ready {
         max_pool_tokens: Some(4096),
+        ..Default::default()
     });
     let core = fake_core(spec.clone(), ready);
 
@@ -786,7 +787,8 @@ async fn python_core_messages_drive_the_client() {
     assert!(matches!(
         decode("core_ready"),
         pb::envelope::Body::Ready(pb::Ready {
-            max_pool_tokens: Some(4096)
+            max_pool_tokens: Some(4096),
+            ..
         })
     ));
     assert!(matches!(
