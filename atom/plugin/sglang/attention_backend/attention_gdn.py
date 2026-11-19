@@ -89,14 +89,6 @@ def _flydsl_linear_impls() -> list[Any]:
     return impls
 
 
-def _flydsl_prefill_supported(device: torch.device) -> bool:
-    """FlyDSL prefill is validated only on gfx942."""
-    if torch.version.hip is None or device.type != "cuda":
-        return True
-    arch = torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
-    return arch == "gfx942"
-
-
 def _ensure_flydsl_policy(state: torch.Tensor):
     """Bind Native `select_policy` once, same as `_build_gdn_cache_tensor`."""
     impls = _flydsl_linear_impls()
@@ -105,7 +97,11 @@ def _ensure_flydsl_policy(state: torch.Tensor):
     policy = impls[0].gdn_flydsl_policy
     if policy is not None:
         return policy
-    from atom.model_ops.fla_ops.gdn_flydsl import GDNFlyDSLPolicy, select_policy
+    from atom.model_ops.fla_ops.gdn_flydsl import (
+        GDNFlyDSLPolicy,
+        _validated_on_gfx942,
+        select_policy,
+    )
 
     # Under ReplaySSM the ring addresses the raw contiguous checkpoint, so
     # `select_policy` keeps decode (and its VK view) off; prefill runs only on gfx942.
@@ -116,7 +112,8 @@ def _ensure_flydsl_policy(state: torch.Tensor):
         state=state,
         activation_dtype=impls[0].dt_bias.dtype,
     )
-    if policy.prefill and not _flydsl_prefill_supported(state.device):
+    # FlyDSL prefill is validated only on gfx942, with or without ReplaySSM.
+    if policy.prefill and not _validated_on_gfx942():
         policy = GDNFlyDSLPolicy(prefill=False, decode=policy.decode)
     for impl in impls:
         impl.gdn_flydsl_policy = policy

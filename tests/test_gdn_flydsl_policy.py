@@ -4,7 +4,7 @@
 """FlyDSL GDN backend policy, without AITER or Triton.
 
 `select_policy` reads only the backend settings, the device arch and whether
-AITER's FlyDSL ops import. `atom.model_ops.fla_ops` imports Triton kernels at
+HIP is present. `atom.model_ops.fla_ops` imports Triton kernels at
 package import, so this file loads `gdn_flydsl.py` on its own with Triton and
 its two sibling kernel modules stubbed, and the arch test stubs AITER's
 `get_gfx_runtime`. That keeps the policy matrix in the non-GPU unit tests,
@@ -114,8 +114,6 @@ def test_policy_is_empty_without_hip_before_probing_the_arch(
     monkeypatch.setitem(sys.modules, chip_info.__name__, chip_info)
     monkeypatch.setattr(fly, "backend", lambda stage: prefill_backend)
     monkeypatch.setattr(fly.torch.version, "hip", None)
-    fly.ops.cache_clear()
-    fly._validated_on_gfx942.cache_clear()
     policy = fly.select_policy(
         allowed=True,
         replayssm=replayssm,
@@ -124,6 +122,22 @@ def test_policy_is_empty_without_hip_before_probing_the_arch(
         activation_dtype=torch.bfloat16,
     )
     assert policy == fly.GDNFlyDSLPolicy()
+
+
+@pytest.mark.parametrize("stage", ["prefill", "decode"])
+@pytest.mark.parametrize("replayssm", [False, True])
+def test_invalid_backend_raises_whatever_the_gates(fly, monkeypatch, stage, replayssm):
+    monkeypatch.setenv(f"ATOM_GDN_{stage.upper()}_BACKEND", "bogus")
+    monkeypatch.setattr(fly, "ops", lambda: object())
+    monkeypatch.setattr(fly, "_validated_on_gfx942", lambda: True)
+    with pytest.raises(ValueError, match=f"Invalid ATOM GDN {stage} backend"):
+        fly.select_policy(
+            allowed=True,
+            replayssm=replayssm,
+            lossy_decode=False,
+            state=_state(),
+            activation_dtype=torch.bfloat16,
+        )
 
 
 @pytest.mark.parametrize(

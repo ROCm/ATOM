@@ -39,19 +39,21 @@ def _validated_on_gfx942():
 def select_policy(*, allowed, replayssm, lossy_decode, state, activation_dtype):
     if not allowed:
         return GDNFlyDSLPolicy()
-    prefill_wanted = backend("prefill") != "triton"
+    # Read both switches before any gate, so an invalid value always raises.
+    prefill_backend, decode_backend = backend("prefill"), backend("decode")
+    prefill_wanted = prefill_backend != "triton"
     # ReplaySSM kernels address a contiguous KV pool. Do not reinterpret it as
     # VK even when K == V makes the shape identical; keep decode original.
     decode_wanted = (
         not replayssm
-        and backend("decode") != "triton"
+        and decode_backend != "triton"
         and not lossy_decode
         and state.ndim == 4
         and state.shape[-2:] == (128, 128)
         and state.dtype in (torch.bfloat16, torch.float32)
         and activation_dtype == torch.bfloat16
     )
-    # `_validated_on_gfx942` imports AITER; without HIP or AITER it raises.
+    # `_validated_on_gfx942` imports AITER, which needs HIP.
     if not (prefill_wanted or decode_wanted) or ops() is None:
         return GDNFlyDSLPolicy()
     # The ReplaySSM pool does not rule prefill out (prefill reads and writes the
@@ -78,27 +80,23 @@ def backend(stage):
 def ops():
     if torch.version.hip is None:
         return None
-    try:
-        from aiter.ops.flydsl.linear_attention_kernels import flydsl_gdr_decode
-        from aiter.ops.flydsl.linear_attention_prefill_kernels import (
-            chunk_gated_delta_rule_fwd_h_flydsl_opt,
-            gdn_prepare_flydsl_supported,
-            gdn_prepare_fwd_flydsl,
-        )
-        from aiter.ops.prefill_batch_metadata import (
-            build_gated_delta_rule_prefill_metadata,
-        )
+    from aiter.ops.flydsl.linear_attention_kernels import flydsl_gdr_decode
+    from aiter.ops.flydsl.linear_attention_prefill_kernels import (
+        chunk_gated_delta_rule_fwd_h_flydsl_opt,
+        gdn_prepare_flydsl_supported,
+        gdn_prepare_fwd_flydsl,
+    )
+    from aiter.ops.prefill_batch_metadata import (
+        build_gated_delta_rule_prefill_metadata,
+    )
 
-        return (
-            flydsl_gdr_decode,
-            gdn_prepare_fwd_flydsl,
-            chunk_gated_delta_rule_fwd_h_flydsl_opt,
-            build_gated_delta_rule_prefill_metadata,
-            gdn_prepare_flydsl_supported,
-        )
-    except (ImportError, AttributeError, RuntimeError, OSError) as error:
-        logger.warning("AITER FlyDSL GDN unavailable; keeping Triton: %s", error)
-        return None
+    return (
+        flydsl_gdr_decode,
+        gdn_prepare_fwd_flydsl,
+        chunk_gated_delta_rule_fwd_h_flydsl_opt,
+        build_gated_delta_rule_prefill_metadata,
+        gdn_prepare_flydsl_supported,
+    )
 
 
 def build_prefill_metadata(lengths, cu_seqlens):
