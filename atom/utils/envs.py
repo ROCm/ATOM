@@ -670,7 +670,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # With ATOM_MONO_STATS_EVERY: also write those counts to <prefix>.rank<r>.json.
     "ATOM_MONO_STATS_FILE": lambda: os.getenv("ATOM_MONO_STATS_FILE"),
     # Debug, with ATOM_MONO_CHECK: compare the routed experts alone (the mono kernels' shared expert
-    # weight 0, the original layers' shared expert dropped), on the real activations.
+    # weight 0, the original layers' shared expert dropped), on the real activations. A shared
+    # expert fused into the routed experts cannot be dropped: mono is refused then.
     "ATOM_MONO_CHECK_ROUTED_ONLY": lambda: os.getenv("ATOM_MONO_CHECK_ROUTED_ONLY", "0")
     == "1",
     # DeepSeek-V4.1: how many of an attention layer's branches leave the main

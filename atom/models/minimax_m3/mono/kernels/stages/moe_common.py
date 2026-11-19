@@ -14,11 +14,14 @@ from atom.models.minimax_m3.mono.config import (
     INTER,
     MOE_SLOTS,
     N_ROUTED,
+    SHARED_EXPERT,
     TOP_K,
 )
 from atom.models.minimax_m3.mono.kernels.stages.shared import (
     S2_BYTES,
+    S2F_BYTES,
     S2S_BYTES,
+    S13F_BYTES,
     S13S_BYTES,
     W2_BYTES,
     W2_SCALE_COLS,
@@ -42,6 +45,7 @@ from atom.mono.device.mx import (
     FP8,
     fp4_tile_load,
     mfma_scaled,
+    scale_index,
 )
 from atom.mono.device.ops import (
     CM_NT,
@@ -55,7 +59,12 @@ from atom.mono.device.ops import (
 
 @traced
 def moe_common_defs(k4ctx):
-    """The functions of the narrow MoE's up / gate / down tasks."""
+    """The functions of the narrow MoE's up / gate / down tasks. ``fused_shared``: the
+    shared expert is expert SHARED_EXPERT of the MXFP4 tables and every GEMV a8w4
+    (the MXFP8 xn and mid as B)."""
+    FUSED = k4ctx["fused_shared"]
+    # the last expert a route may address (the bound keeps a corrupt one in the table)
+    E_LAST = SHARED_EXPERT if FUSED else N_ROUTED - 1
     X4S_LDS = k4ctx["X4S_LDS"]
     X4_LDS = k4ctx["X4_LDS"]
     CPT = k4ctx["CPT"]
@@ -116,8 +125,7 @@ def moe_common_defs(k4ctx):
     def ug_load(t):
         """Up / gate weights and scales of task t."""
         tk, slot, cg = ug_task(t)
-        # the bound keeps a corrupt route from addressing past the expert table
-        e_u = fx.min(uniform(fx.ptr_load(route + (8 * tk + slot))), N_ROUTED - 1)
+        e_u = fx.min(uniform(fx.ptr_load(route + (8 * tk + slot))), E_LAST)
         r_w = rsrc(w13 + fx.Int64(e_u) * W13_BYTES)
         r_s = rsrc(s13)
         wts = []  # [gate, up][chunk]
@@ -142,20 +150,34 @@ def moe_common_defs(k4ctx):
         tk, slot, cg = ug_task(t)
         cg_ = fx.Vector.filled(4, 0.0, fx.Float32)
         cu_ = fx.Vector.filled(4, 0.0, fx.Float32)
-        # the token's MXFP4 xn row and codes (the router's words, after the MXFP8 rows)
-        # against the weights, one fp4 x fp4 MFMA a 128-k chunk
-        xrow = X4_LDS + (0 if CPT is not None else tk * XN4_ROW)
-        srow = X4S_LDS + (0 if CPT is not None else tk * XSC_ROW)
-        sbs = [lds_i32(srow + (wave * UG_CPW + i) * 4 + g4) for i in range(UG_CPW)]
-        for i in range_constexpr(UG_CPW):
-            kc = wave * UG_CPW + i
-            xb = lds_b4(xrow + kc * 16)
-            cg_ = mfma_scaled(
-                wts[0][i], xb, cg_, scs[0][i], sbs[i], a_fmt=FP4, b_fmt=FP4
-            )
-            cu_ = mfma_scaled(
-                wts[1][i], xb, cu_, scs[1][i], sbs[i], a_fmt=FP4, b_fmt=FP4
-            )
+        if const_expr(FUSED):
+            # the token's MXFP8 xn row, every chunk's B scale up front: read at use,
+            # each MFMA waited out an LDS latency (S = 4 up / gate 3.5 us over the
+            # unscaled floor)
+            sbs = [
+                lds_i32(XSC_LDS + tk * XSC_ROW + (wave * UG_CPW + i) * 4 + g4)
+                for i in range(UG_CPW)
+            ]
+            for i in range_constexpr(UG_CPW):
+                kc = wave * UG_CPW + i
+                xb = lds_b8(tk * XN8_ROW + kc * 32)
+                cg_ = mfma_scaled(wts[0][i], xb, cg_, scs[0][i], sbs[i], a_fmt=FP4)
+                cu_ = mfma_scaled(wts[1][i], xb, cu_, scs[1][i], sbs[i], a_fmt=FP4)
+        else:
+            # the token's MXFP4 xn row and codes (the router's words, after the MXFP8
+            # rows) against the weights, one fp4 x fp4 MFMA a 128-k chunk
+            xrow = X4_LDS + (0 if CPT is not None else tk * XN4_ROW)
+            srow = X4S_LDS + (0 if CPT is not None else tk * XSC_ROW)
+            sbs = [lds_i32(srow + (wave * UG_CPW + i) * 4 + g4) for i in range(UG_CPW)]
+            for i in range_constexpr(UG_CPW):
+                kc = wave * UG_CPW + i
+                xb = lds_b4(xrow + kc * 16)
+                cg_ = mfma_scaled(
+                    wts[0][i], xb, cg_, scs[0][i], sbs[i], a_fmt=FP4, b_fmt=FP4
+                )
+                cu_ = mfma_scaled(
+                    wts[1][i], xb, cu_, scs[1][i], sbs[i], a_fmt=FP4, b_fmt=FP4
+                )
         stamp(9)
         # gate partials in red, up partials in opart (free once the split is done)
         fx.ptr_store(cg_, red + (wave * 64 + lane) * 4)
@@ -203,10 +225,48 @@ def moe_common_defs(k4ctx):
         )  # fmt: skip
         return w >> (g4 * 8)
 
+    def sh_load_fp4(row, has):
+        """``sh_load`` of the fused shared expert: its MXFP4 rows of the routed table."""
+        rg = row // 16
+        if const_expr(has is None):
+            r_w = rsrc(w13 + fx.Int64(SHARED_EXPERT) * W13_BYTES)
+            r_s = rsrc(s13)
+        else:  # a CTA without the task reads through zero-sized buffers
+            r_w = rsrc(
+                w13 + fx.Int64(SHARED_EXPERT) * W13_BYTES,
+                has.select(fx.Int32(W13_BYTES), fx.Int32(0)),
+            )
+            r_s = rsrc(s13, has.select(fx.Int32(S13F_BYTES), fx.Int32(0)))
+        wts = []
+        scs = []
+        # the row's part of scale_index, once: a chunk adds 256 (kc / 2) + 2 (kc % 2)
+        sc_row = scale_index(SHARED_EXPERT * W13_ROWS + row, g4, W13_SCALE_COLS)
+        for i in range_constexpr(UG_CPW):
+            kc = wave * UG_CPW + i
+            wts.append(
+                fx.Vector(
+                    bo.buffer_load(
+                        r_w,
+                        (
+                            (rg * (HIDDEN // 64) + kc * 2) * 512
+                            + (g4 * 16 + row % 16) * 16
+                        )
+                        // 4,
+                        vec_width=4,
+                        dtype=T.i32,
+                        cache_modifier=CM_NT,
+                    )
+                )
+            )
+            scs.append(e8m0_load(r_s, sc_row + kc // 2 * 256 + kc % 2 * 2))
+        return wts, scs
+
     def sh_load(j, has=None):
         """The shared expert's half task j: gate rows 8 j .. + 8 on lanes l16 < 8,
         the up rows alike on the rest -- one MFMA tile; the waves split k."""
         row = (l16 < 8).select(SH_ROWS * j + l16, INTER + SH_ROWS * j + l16 - 8)
+        if const_expr(FUSED):
+            return sh_load_fp4(row, has)
         if const_expr(has is None):
             r_w, r_s = rsrc(w13s), rsrc(s13s)
         else:  # a CTA without the task reads through zero-sized buffers
@@ -230,7 +290,12 @@ def moe_common_defs(k4ctx):
         for i in range_constexpr(UG_CPW):
             kc = wave * UG_CPW + i
             c = mfma_scaled(
-                wts[i], lds_b8(col * XN8_ROW + kc * 32), c, scs[i], sbs[i], a_fmt=FP8
+                wts[i],
+                lds_b8(col * XN8_ROW + kc * 32),
+                c,
+                scs[i],
+                sbs[i],
+                a_fmt=FP4 if FUSED else FP8,
             )
         fx.ptr_store(c, red + (wave * 64 + lane) * 4)
         gpu.barrier()
@@ -238,9 +303,12 @@ def moe_common_defs(k4ctx):
         if tid < SH_ROWS * tokens:
             r = tid % SH_ROWS
             col = tid // SH_ROWS
-            # production's gate_up_proj output is bf16, the swiglu reads that
-            gsum = bf16_round(row_sum(red, r, col))
-            usum = bf16_round(row_sum(red, r + 8, col))
+            gsum = row_sum(red, r, col)
+            usum = row_sum(red, r + 8, col)
+            if const_expr(not FUSED):
+                # production's gate_up_proj output is bf16, the swiglu reads that
+                gsum = bf16_round(gsum)
+                usum = bf16_round(usum)
             y = swiglu_mul_batch([gsum], [usum], fx.Float32(-swiglu_limit))[0]
             mb_put(
                 mr("mid"),
@@ -253,16 +321,26 @@ def moe_common_defs(k4ctx):
         """Token k's route-weighted down units of row group td; a CTA without a
         down task reads through zero-sized buffers."""
         dn_bytes = has_dn.select(fx.Int32(W2_BYTES), fx.Int32(0))
-        dn_scale_bytes = has_dn.select(fx.Int32(S2_BYTES), fx.Int32(0))
+        dn_scale_bytes = has_dn.select(
+            fx.Int32(S2F_BYTES if FUSED else S2_BYTES), fx.Int32(0)
+        )
         rg_d = td * 2 + wave // 4
         units = []
         for i in range_constexpr(DN_UPW):
-            # a wave of the row group takes one slot, all its chunks: the slot's sum
-            # is complete in the wave, where production rounds it (bf16(acc * w))
-            j = (wave % 4) * DN_KC + i
-            sl = wave % 4
-            kc = i
-            e_d = fx.min(uniform(fx.ptr_load(route + (8 * k + sl))), N_ROUTED - 1)
+            if const_expr(FUSED):
+                # wave q of the row group takes units q, q + 4, ..
+                j = (wave % 4) + 4 * i
+                jj = fx.min(j, DN_UNITS - 1)
+                sl = jj // DN_KC
+                kc = jj % DN_KC
+            else:
+                # a wave of the row group takes one slot, all its chunks: the slot's
+                # sum is complete in the wave, where production rounds it
+                # (bf16(acc * w))
+                j = (wave % 4) * DN_KC + i
+                sl = wave % 4
+                kc = i
+            e_d = fx.min(uniform(fx.ptr_load(route + (8 * k + sl))), E_LAST)
             wv = fp4_tile_load(
                 rsrc(w2 + fx.Int64(e_d) * W2_BYTES, dn_bytes),
                 0,
@@ -281,8 +359,36 @@ def moe_common_defs(k4ctx):
             units.append((wv, sc, sl, kc, wgt))
         return units
 
+    def down_load_shared_fp4(td, has_dn):
+        """``down_load_shared`` of the fused shared expert: its MXFP4 rows of the
+        routed table."""
+        dn_bytes = has_dn.select(fx.Int32(W2_BYTES), fx.Int32(0))
+        dn_scale_bytes = has_dn.select(fx.Int32(S2F_BYTES), fx.Int32(0))
+        rg_d = td * 2 + wave // 4
+        units = []
+        for i in range_constexpr(SH_UPW):
+            j = (wave % 4) + 4 * i
+            kc = fx.min(j, DN_KC - 1)
+            wv = fp4_tile_load(
+                rsrc(w2 + fx.Int64(SHARED_EXPERT) * W2_BYTES, dn_bytes),
+                0,
+                rg_d,
+                INTER,
+                kc,
+                lane * 4,
+            )
+            sc = e8m0_load(
+                rsrc(s2, dn_scale_bytes),
+                group_scale_byte(SHARED_EXPERT, HIDDEN, rg_d, kc, W2_SCALE_COLS),
+            )
+            wgt = (j < DN_KC).select(fx.Float32(shared_weight), fx.Float32(0.0))
+            units.append((wv, sc, kc, wgt))
+        return units
+
     def down_load_shared(td, has_dn):
         """The shared expert's down units of row group td (every token's)."""
+        if const_expr(FUSED):
+            return down_load_shared_fp4(td, has_dn)
         rg_d = td * 2 + wave // 4
         units = []
         r_w = rsrc(w2s, has_dn.select(fx.Int32(W2S_BYTES), fx.Int32(0)))

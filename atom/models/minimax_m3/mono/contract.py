@@ -30,16 +30,18 @@ def build_layer(
     kv_nvfp4: bool = False,
     index_nvfp4: bool = False,
     attn_mxfp8: bool = False,
+    fused_shared: bool = False,
 ):
     """The layer kernel for ``tokens`` and ``index_heads`` (1 or TP), K1 fused in
     or not (``fuse_k1``), selecting or reusing a selection (``index_topk``), NVFP4
     K/V / index pages (``kv_nvfp4`` / ``index_nvfp4``), native MXFP8 qkv / o_proj
-    (``attn_mxfp8``)."""
+    (``attn_mxfp8``), the shared expert fused into the routed tables
+    (``fused_shared``)."""
     heads = IndexHeads(index_heads, 0)
     return build_post_attn_kernel(
         TP, 0.088, 1e-6, 1.0, 1.0, 7.0, 1, 1, tokens, fuse_k1=fuse_k1, heads=heads,
         index_topk=index_topk, kv_nvfp4=kv_nvfp4, index_nvfp4=index_nvfp4,
-        attn_mxfp8=attn_mxfp8,
+        attn_mxfp8=attn_mxfp8, fused_shared=fused_shared,
     )  # fmt: skip
 
 
@@ -56,6 +58,7 @@ def check_build(
     kv_nvfp4: bool = False,
     index_nvfp4: bool = False,
     attn_mxfp8: bool = False,
+    fused_shared: bool = False,
 ) -> None:
     """Trace ``build_layer`` and check its hand-offs; raises ``ContractError``."""
     check_traced(
@@ -67,9 +70,10 @@ def check_build(
             kv_nvfp4,
             index_nvfp4,
             attn_mxfp8,
+            fused_shared,
         ),
         K4_ABI,
-        mailbox_regions(tokens, index_heads, fuse_k1, index_topk),
+        mailbox_regions(tokens, index_heads, fuse_k1, index_topk, fused_shared),
     )
 
 
@@ -90,3 +94,5 @@ if __name__ == "__main__":
             for nv in (False, True):
                 check_build(s, ih, attn_mxfp8=True, kv_nvfp4=nv, index_nvfp4=nv)
                 print(f"S={s} index heads={ih} attn_mxfp8 nvfp4={nv}: contract holds")
+                check_build(s, ih, kv_nvfp4=nv, index_nvfp4=nv, fused_shared=True)
+                print(f"S={s} index heads={ih} fused shared nvfp4={nv}: contract holds")

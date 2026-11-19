@@ -6,7 +6,8 @@ logical weights; the routed experts' xn and mid are quantized MXFP4 (per 1x32, E
 the CPU rule ``fp4_quant_kernel_rule`` of test_minimax_m3_mono_moe_a4w4.py) before the GEMVs; slots rounded to bf16 per
 (expert, token) as production's gemm2 epilogue does; the shared expert is MXFP8 and its swiglu reads bf16 gate / up.
 ``run_case(S, seed)`` -> (got, oracle, details); ``python tests/test_minimax_m3_mono_moe_a4w4_gpu.py [--S 1,4,16]`` prints a
-table with the rel L2 of the kernel against the oracle.
+table with the rel L2 of the kernel against the oracle. ``fused=True``: the shared expert fused into the MXFP4 tables (expert
+N_ROUTED of 129, ``fused_shared``), every expert a8w4 (MXFP8 xn and mid), the slots summed in f32 (``moe_oracle_fused``).
 """
 
 import argparse
@@ -101,7 +102,7 @@ def swiglu(g, u):
 class Experts:
     """The logical (unshuffled) MoE weights and their kernel (preshuffled) images."""
 
-    def __init__(self, seed):
+    def __init__(self, seed, fused=False):
         g = torch.Generator(device=DEV).manual_seed(1000 + seed)
         r8 = lambda *s: torch.randint(
             0, 256, s, dtype=torch.uint8, device=DEV, generator=g
@@ -109,7 +110,7 @@ class Experts:
         codes = lambda *s: torch.randint(
             117, 121, s, dtype=torch.uint8, device=DEV, generator=g
         )
-        E = N_ROUTED
+        E = N_ROUTED + int(fused)
         self.b13, self.c13 = r8(E, 2 * INTER, HIDDEN // 2), codes(
             E, 2 * INTER, HIDDEN // 32
         )
@@ -171,11 +172,11 @@ class Experts:
 _EXPERTS = {}
 
 
-def experts_of(seed):
-    if seed not in _EXPERTS:
+def experts_of(seed, fused=False):
+    if (seed, fused) not in _EXPERTS:
         _EXPERTS.clear()
-        _EXPERTS[seed] = Experts(seed)
-    return _EXPERTS[seed]
+        _EXPERTS[(seed, fused)] = Experts(seed, fused)
+    return _EXPERTS[(seed, fused)]
 
 
 def norm(h_in, g_post, eps=1e-6):
@@ -215,6 +216,27 @@ def moe_oracle(h_in, g_post, experts, routing, *, S):
     return bf(routed + sh)
 
 
+def moe_oracle_fused(h_in, g_post, experts, routing, *, S):
+    """The fused-shared-expert MoE's ``ar_out`` [S, HIDDEN] f32 (bf16 values): MXFP8 xn and mids against every
+    expert's MXFP4 weights, the shared expert (table expert N_ROUTED) a fifth slot of weight SHARED_WEIGHT, the
+    route-weighted slots summed unrounded."""
+    ids, w = routing
+    xq = mx8(norm(h_in, g_post))
+    ids = torch.cat([ids, torch.full((S, 1), N_ROUTED, device=DEV)], 1)
+    w = torch.cat([w, torch.full((S, 1), SHARED_WEIGHT, device=DEV)], 1)
+    mid = torch.zeros(S, MOE_SLOTS, INTER, device=DEV)
+    for e in ids.unique().tolist():
+        t, s = (ids == e).nonzero(as_tuple=True)
+        o = (xq[t] @ experts.dq13(e).T).float()
+        mid[t, s] = bf(swiglu(o[:, :INTER], o[:, INTER:]))
+    midq = mx8(mid.view(-1, INTER)).view(S, MOE_SLOTS, INTER)
+    out = torch.zeros(S, HIDDEN, dtype=torch.float64, device=DEV)
+    for e in ids.unique().tolist():
+        t, s = (ids == e).nonzero(as_tuple=True)
+        out.index_add_(0, t, (midq[t, s] @ experts.dq2(e).T) * w[t, s, None].double())
+    return bf(out.float())
+
+
 def _route_check(h_in, gate, bias, g_post, ids, w):
     """The kernel's routing against a torch router (bf16 logit, sigmoid, bias for the pick, renormalized, x route_scale)."""
     xn = norm(h_in, g_post)
@@ -226,11 +248,12 @@ def _route_check(h_in, gate, bias, g_post, ids, w):
     return same_set, (w - wref).abs().max().item()
 
 
-def run_case(S, seed=0):
+def run_case(S, seed=0, fused=False):
     """One launch of the single-rank layer kernel on random data. Returns (got, oracle, details): ``got`` the kernel's ``ar_out``
     and ``oracle`` the oracle's as f32 [S, HIDDEN] cpu tensors; ``details``: rel L2 per token, identical fraction, whether the
-    torch router picked the kernel's experts."""
-    ex = experts_of(seed)
+    torch router picked the kernel's experts. ``fused``: the fused-shared-expert build and its oracle.
+    """
+    ex = experts_of(seed, fused)
     g = torch.Generator(device=DEV).manual_seed(seed * 7 + S)
     h_in = (torch.randn(S, HIDDEN, device=DEV, generator=g) * 3).to(BF)
     g_post = (torch.randn(HIDDEN, device=DEV, generator=g) * 0.3).to(BF)
@@ -251,9 +274,10 @@ def run_case(S, seed=0):
     ids_t = torch.arange(S, dtype=torch.int32, device=DEV)
     launch = build_post_attn_kernel(
         1, 0.088, 1e-6, ROUTE_SCALE, SHARED_WEIGHT, SWIGLU_LIMIT, 1, 1, S,
-        attn_mxfp8=True,
+        attn_mxfp8=True, fused_shared=fused,
     )  # fmt: skip
     p = lambda t: t.data_ptr()
+    ps = lambda t: 0 if fused else t.data_ptr()  # the MXFP8 shared expert's
     args = K4_ABI.pack(
         {
             "h_in": p(h_in), "q": p(c["q"]), "block_table": p(c["bt"]), "seq_lens": p(c["seq"]),
@@ -263,7 +287,7 @@ def run_case(S, seed=0):
             "h_mid": p(h_mid), "ar_out": p(ar_out), "scratch": scratch.data_ptr(), "sym": sym.data_ptr(),
             "peers": p(peers), "rank": 0, "layer": 3, "bt_width": 1, "q_len": 1, "tl": 0, "k1_args": p(k1),
             "positions": p(ids_t), "slot_mapping": p(ids_t), "res": p(h_in), "batch_ids": p(ids_t),
-            "w13s": p(ex.w13s), "s13s": p(ex.k13), "w2s": p(ex.w2s), "s2s": p(ex.k2),
+            "w13s": ps(ex.w13s), "s13s": ps(ex.k13), "w2s": ps(ex.w2s), "s2s": ps(ex.k2),
         }
     )  # fmt: skip
     launch(*args)
@@ -277,7 +301,7 @@ def run_case(S, seed=0):
     w = sel[:, 1, :TOP_K].contiguous().view(torch.float32)
     assert (ids >= 0).all() and (ids < N_ROUTED).all(), ids
     got = ar_out.float()
-    want = moe_oracle(h_in, g_post, ex, (ids, w), S=S)
+    want = (moe_oracle_fused if fused else moe_oracle)(h_in, g_post, ex, (ids, w), S=S)
     rel = lambda a, b: ((a - b).norm(dim=-1) / b.norm(dim=-1))
     same_set, wdiff = _route_check(h_in, gate, bias, g_post, ids, w)
     details = {
@@ -298,14 +322,23 @@ def test_moe_matches_the_oracle(tokens):
     assert d["rel"].median() <= 2e-3 and d["rel"].max() <= 1e-2, d["rel"]
 
 
+@pytest.mark.parametrize("tokens", [1, 2, 3, 4, 5, 8, 12, 16])
+def test_fused_shared_expert_moe_matches_the_oracle(tokens):
+    got, _want, d = run_case(tokens, fused=True)
+    assert torch.isfinite(got).all() and got.abs().max() > 0
+    assert d["route_match"], d["ids"]
+    assert d["rel"].median() <= 2e-3 and d["rel"].max() <= 1e-2, d["rel"]
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--S", default="1,2,3,4,5,8,12,16")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--fused", action="store_true")
     a = ap.parse_args()
     print("S | rel L2 vs the oracle median / max | identical | router match")
     for s in [int(x) for x in a.S.split(",")]:
-        got, want, d = run_case(s, seed=a.seed)
+        got, want, d = run_case(s, seed=a.seed, fused=a.fused)
         r = d["rel"]
         print(
             f"S={s:2d} | {r.median():.2e} / {r.max():.2e} | {d['identical']:.4f} | "

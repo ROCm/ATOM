@@ -60,6 +60,7 @@ def router_defs(k4ctx):
     bias = k4ctx["bias"]
     eps = k4ctx["eps"]
     fuse_k1 = k4ctx["fuse_k1"]
+    fused_shared = k4ctx["fused_shared"]
     g4 = k4ctx["g4"]
     g_post = k4ctx["g_post"]
     h_in = k4ctx["h_in"]
@@ -294,30 +295,34 @@ def router_defs(k4ctx):
                     mb_put_words(mr("xn8"), xw, [word])
                     if tid % 8 == 0:
                         mb_put_words(mr("xsc"), xsw, [e])
-                # the routed experts' MXFP4 xn (a4w4): the same 32-blocks, E8M0 RoundUp; a lane's 4
-                # elements are 2 bytes, an even lane stores its neighbour's beside its own
-                amax4 = fx.max(fx.max(f[0], -f[0]), fx.max(f[1], -f[1]))
-                amax4 = fx.max(amax4, fx.max(fx.max(f[2], -f[2]), fx.max(f[3], -f[3])))
-                e4, sc4 = fp4_scale(butterfly(amax4, (1, 2, 4), fx.max))
-                w16 = fp4_pack2(fx.Int32(0), f[0], f[1], sc4, 0)
-                w16 = fp4_pack2(w16, f[2], f[3], sc4, 1) & 0xFFFF
-                word4 = w16 | (xshfl(w16, 1) << 16)
-                xw4 = k * XN4_WORDS + t * (XN_SLICE // 8) + tid // 2
-                xsw4 = k * XSC_WORDS + t * (XN_SLICE // 32) + tid // 8
-                if const_expr(WIDE):
-                    if tid % 2 == 0:
-                        bo.buffer_store(
-                            word4, rsrc(mb("xn4p")), xw4, cache_modifier=CM_DEV
-                        )
-                    if tid % 8 == 0:
-                        bo.buffer_store(
-                            e4, rsrc(mb("xs4p")), xsw4, cache_modifier=CM_DEV
-                        )
-                else:
-                    if tid % 2 == 0:
-                        mb_put_words(mr("xn4"), xw4, [word4])
-                    if tid % 8 == 0:
-                        mb_put_words(mr("xs4"), xsw4, [e4])
+                # the routed experts' MXFP4 xn (a4w4; ``fused_shared``: they read the
+                # MXFP8 one): the same 32-blocks, E8M0 RoundUp; a lane's 4 elements
+                # are 2 bytes, an even lane stores its neighbour's beside its own
+                if const_expr(not fused_shared):
+                    amax4 = fx.max(fx.max(f[0], -f[0]), fx.max(f[1], -f[1]))
+                    amax4 = fx.max(
+                        amax4, fx.max(fx.max(f[2], -f[2]), fx.max(f[3], -f[3]))
+                    )
+                    e4, sc4 = fp4_scale(butterfly(amax4, (1, 2, 4), fx.max))
+                    w16 = fp4_pack2(fx.Int32(0), f[0], f[1], sc4, 0)
+                    w16 = fp4_pack2(w16, f[2], f[3], sc4, 1) & 0xFFFF
+                    word4 = w16 | (xshfl(w16, 1) << 16)
+                    xw4 = k * XN4_WORDS + t * (XN_SLICE // 8) + tid // 2
+                    xsw4 = k * XSC_WORDS + t * (XN_SLICE // 32) + tid // 8
+                    if const_expr(WIDE):
+                        if tid % 2 == 0:
+                            bo.buffer_store(
+                                word4, rsrc(mb("xn4p")), xw4, cache_modifier=CM_DEV
+                            )
+                        if tid % 8 == 0:
+                            bo.buffer_store(
+                                e4, rsrc(mb("xs4p")), xsw4, cache_modifier=CM_DEV
+                            )
+                    else:
+                        if tid % 2 == 0:
+                            mb_put_words(mr("xn4"), xw4, [word4])
+                        if tid % 8 == 0:
+                            mb_put_words(mr("xs4"), xsw4, [e4])
             stamp(26)
             # bf16 pair dot products, one accumulator per pair position: four
             # 12-long chains instead of one 96-long FMA chain behind 192 widenings

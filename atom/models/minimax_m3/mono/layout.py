@@ -130,6 +130,10 @@ SCRATCH = _layout(
         ("xs4p", HIDDEN // 32 * MAX_TOKENS // 2),
         ("mid4p", TOP_K * INTER // 8 * MAX_TOKENS // 2),
         ("mids4p", TOP_K * INTER // 32 * MAX_TOKENS // 2),
+        # ``fused_shared``, wide: every slot's mid rows (row k MOE_SLOTS + slot, the
+        # shared expert's slot TOP_K) as MXFP8 plain words and their E8M0 scales
+        ("mid8f", MOE_SLOTS * INTER * MAX_TOKENS // 8),
+        ("midsf", MOE_SLOTS * INTER // 32 * MAX_TOKENS // 2),
     ]
 )
 SCRATCH_BYTES = SCRATCH["_bytes"]
@@ -170,6 +174,7 @@ def mailbox_regions(
     index_heads: int,
     fuse_k1: bool,
     index_topk: bool = True,
+    fused_shared: bool = False,
 ) -> list[RegionDecl]:
     """The fused layer kernel's mailbox regions for a build: each one's space and
     the one stage that puts it (``atom.mono.plan.check``; the stages are the ones
@@ -177,7 +182,7 @@ def mailbox_regions(
     select_long, split, merge (S > 1), o, router, ug, down). Without
     ``index_topk`` (a build reusing a selection) the indexer's regions are gone. The
     wide MoE hands xn and the mid rows over as plain words behind flags, the narrow
-    one as tagged pairs."""
+    one as tagged pairs. ``fused_shared``: every expert reads the MXFP8 xn."""
     S, P = Space.SCRATCH, Space.PEER
     regions = []
     if fuse_k1:
@@ -210,7 +215,8 @@ def mailbox_regions(
     else:
         # the MXFP8 words and codes the shared expert reads, the MXFP4 ones the routed
         # experts read, then the mid rows
-        regions += [RegionDecl(n, S, "router") for n in ("xn8", "xsc", "xn4", "xs4")]
+        xn = ("xn8", "xsc") if fused_shared else ("xn8", "xsc", "xn4", "xs4")
+        regions += [RegionDecl(n, S, "router") for n in xn]
         regions.append(RegionDecl("mid", S, "ug"))
     regions.append(RegionDecl("sel", S, "ug"))  # the routing record (tests)
     regions.append(RegionDecl("ffn", P, "down", exchange=True))
@@ -395,16 +401,22 @@ def narrow_words(tokens: int) -> int:
     return max(up, down)
 
 
-def pool_words(tokens: int) -> int:
+def pool_words(tokens: int, fused_shared: bool = False) -> int:
     """LDS words of the activation pool ``x``. Narrow: every token's bf16 xn (the
     largest stage operand) or the MXFP8 / MXFP4 operands of the stages (``narrow_words``).
     Wide: the largest of the split's PV partials, the up / gate stage's MXFP8 xn +
     scales + up partials + router sigmoids, and the down stage's pool
     (``wide_down_layout``; only the shared expert's CTAs hold the MXFP8 xn rows, the
-    routed operands are in registers)."""
+    routed operands are in registers). ``fused_shared`` (every expert a8w4): the
+    narrow stages' MXFP8 operands fit in the bf16 xn's room; the wide down stage
+    holds every slot's MXFP8 mid rows + scales and a zero row."""
     if not wide_moe(tokens):
+        if fused_shared:
+            return HIDDEN // 2 * tokens
         return max(HIDDEN // 2 * tokens, narrow_words(tokens))
     up = tokens * (XN8_ROW + XSC_ROW + N_ROUTED) + WAVES * 64 * 4
+    if fused_shared:
+        return max(WAVES * O_K, up, (MOE_SLOTS * tokens + 1) * (MID_ROW + MIDSC_ROW))
     return max(WAVES * O_K, up, wide_down_words(tokens))
 
 

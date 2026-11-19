@@ -36,6 +36,9 @@ W2S_BYTES = HIDDEN * INTER
 S2S_BYTES = HIDDEN * W2_SCALE_COLS
 S2_BYTES = N_ROUTED * HIDDEN * W2_SCALE_COLS  # e8m0, every routed expert
 S13_BYTES = N_ROUTED * W13_ROWS * W13_SCALE_COLS
+# ``fused_shared``: the tables hold the shared expert too, as expert N_ROUTED
+S2F_BYTES = (N_ROUTED + 1) * HIDDEN * W2_SCALE_COLS
+S13F_BYTES = (N_ROUTED + 1) * W13_ROWS * W13_SCALE_COLS
 
 
 def _f32(x: float) -> float:
