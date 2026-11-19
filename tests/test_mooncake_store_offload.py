@@ -2273,6 +2273,31 @@ def test_the_scheduler_relays_the_store_tier_with_its_kv_events(cluster):
         publisher.close(linger=0)
 
 
+def test_one_dp_rank_relays_the_store_tier_of_an_engine(cluster):
+    extra = _extra(kv_events="tcp://127.0.0.1:26070", chunk_tokens=16)
+    ranks = [
+        MooncakeStoreOffloadScheduler(
+            _config(
+                extra=extra, parallel_config=SimpleNamespace(data_parallel_rank=rank)
+            )
+        )
+        for rank in range(2)
+    ]
+    try:
+        for scheduler in ranks:
+            scheduler.bind_block_manager(
+                SimpleNamespace(kv_events_enabled=True, record_events=list)
+            )
+            scheduler.build_connector_meta()
+        assert [scheduler._store_tier is not None for scheduler in ranks] == [
+            True,
+            False,
+        ]
+    finally:
+        for scheduler in ranks:
+            scheduler.close()
+
+
 # --- worker: save -------------------------------------------------------------
 
 

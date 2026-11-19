@@ -417,6 +417,12 @@ class MooncakeStoreOffloadScheduler(KVStoreOffloadScheduler):
             "mooncake_store"
         )
         self._world = world
+        # The DP ranks of an engine share its objects (the namespace has no DP
+        # rank), so DP rank 0 relays the store tier for all of them.
+        parallel = getattr(config, "parallel_config", None)
+        self._relays_store_tier = not int(
+            getattr(parallel, "data_parallel_rank", 0) or 0
+        )
         # The masters whose store tier this scheduler relays; see
         # `build_connector_meta`.
         self._store_tier_endpoints: list[str] = []
@@ -428,7 +434,7 @@ class MooncakeStoreOffloadScheduler(KVStoreOffloadScheduler):
         # pool's: a chunk's ranks may be in different pools.
         pools = self._store_cfg.store_masters()
         endpoints = [pool.kv_events for pool in pools if pool.kv_events]
-        if not endpoints:
+        if not endpoints or not self._relays_store_tier:
             return
         if not block_manager.kv_events_enabled or len(endpoints) < len(pools):
             logger.warning(
