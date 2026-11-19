@@ -2861,10 +2861,13 @@ class Expert(nn.Module):
         silu_and_mul and quantize_fp8, the values w2 would compute from the
         bf16 activation itself.
 
-        The fused epilogue matches that chain up to one e4m3 step (AITER's
-        exp / rcp can land a value on the other side of a rounding midpoint),
-        so the same token's w2 input can differ by one step between a forward
-        whose row count takes the fused kernel and one that does not."""
+        The fused epilogue and that chain can round an activation to adjacent
+        bf16 values (AITER's exp / rcp), so the same token's w2 input can
+        differ between a forward whose row count takes the fused kernel and
+        one that does not: the dequantized values stay within one e4m3 step,
+        but a 32-wide group's E8M0 scale (and so every code in it) can differ
+        when its max sits on 448 * 2**k in one chain and on the next bf16
+        value in the other."""
         from aiter.ops.batched_gemm_op_a8w8 import gate_up_silu_mxfp8_32
         from aiter.ops.flydsl.batched_gemm_a8w8_gfx1250 import gate_up_silu_kernel_for
 

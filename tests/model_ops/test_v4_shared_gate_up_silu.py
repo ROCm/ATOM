@@ -128,12 +128,14 @@ def flydsl(monkeypatch, atom_modules):
 
     def quantize_fp8(x):
         calls.setdefault("quantized", []).append(x)
-        return (
+        out = (
             torch.full(x.shape, 3, dtype=torch.uint8).view(torch.float8_e4m3fn),
             torch.full((*x.shape[:-1], x.shape[-1] // 32), 4, dtype=torch.uint8).view(
                 torch.float8_e8m0fnu
             ),
         )
+        calls.setdefault("quantized_out", []).append(out)
+        return out
 
     monkeypatch.setattr(blockscale, "quantize_fp8", quantize_fp8)
     return calls
@@ -179,8 +181,12 @@ def test_fused_rows_feed_w2_the_epilogue_quant(
     x = torch.zeros(3, DIM, dtype=torch.bfloat16)
     act, act_scale = expert.gate_up_silu_quant(x)
     xq, wq, xs, ws, limit, out, out_scale = flydsl["runs"][-1]
-    assert flydsl["quantized"] == [x] and xq.shape == (3, DIM)
-    assert xs.shape == (3, DIM // 32)
+    # AITER gets quantize_fp8(x): the e4m3 rows and their E8M0 scales.
+    assert flydsl["quantized"] == [x]
+    x_fp8, x_scale = flydsl["quantized_out"][-1]
+    assert xq is x_fp8 and xs is x_scale
+    assert xq.dtype == torch.float8_e4m3fn and xq.shape == (3, DIM)
+    assert xs.dtype == torch.float8_e8m0fnu and xs.shape == (3, DIM // 32)
     assert wq is expert.gate_up_proj.weight
     assert ws is expert.gate_up_proj.weight_scale
     assert act is out and act_scale is out_scale
@@ -333,6 +339,30 @@ def test_init_decides_and_registers(
     registry = atom_config.compilation_config.static_forward_context
     assert (registry.get("m.shared_experts") is expert) == fused
     assert ("supported_shape" in flydsl) == fused
+
+
+@pytest.mark.parametrize("m", [0, 3, 5000])
+def test_op_fake_shapes_and_dtypes(atom_modules, m):
+    """The op's fake (what torch.compile traces with) returns w2's quantized
+    input: e4m3 [m, inter] and E8M0 [m, inter / 32], on x's device; directly
+    and through the registered op under FakeTensorMode."""
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    ops = importlib.import_module("atom.model_ops.module_dispatch_ops")
+    x = torch.zeros(m, DIM, dtype=torch.bfloat16)
+    weight = torch.zeros(2 * INTER, DIM, dtype=torch.float8_e4m3fn)
+
+    def check(act, act_scale):
+        assert act.shape == (m, INTER) and act.dtype == torch.float8_e4m3fn
+        assert act_scale.shape == (m, INTER // 32)
+        assert act_scale.dtype == torch.float8_e8m0fnu
+        assert act.device == x.device and act_scale.device == x.device
+
+    check(*ops._v4_shared_gate_up_silu_quant_fake(x, weight, "unused"))
+    with FakeTensorMode() as mode:
+        fx = mode.from_tensor(x)
+        fw = mode.from_tensor(weight)
+        check(*torch.ops.aiter.v4_shared_gate_up_silu_quant(fx, fw, "unused"))
 
 
 if __name__ == "__main__":
