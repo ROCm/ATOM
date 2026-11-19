@@ -77,6 +77,8 @@ def producer(pp_rank=0, pp_size=1, num_tokens=10):
     c._unit_layout = None
     c._block_region_roles = [None]
     c._per_block_bytes_list = [4]
+    c._kv_staging_reserve = 0
+    c._landing_spec = None
     c._completed_prefills_lock = threading.Lock()
     c._completed_prefills_cv = threading.Condition(c._completed_prefills_lock)
     c._chunked_prefills = {}
@@ -269,6 +271,8 @@ def consumer(expected=2):
     c = mc.MooncakeConnector.__new__(mc.MooncakeConnector)
     c.is_producer = False
     c._cuda_device = 0
+    c._kv_staging_reserve = 0
+    c._landing_spec = None
     # Drive the real receive queue by hand; CPU tests have no GPU worker.
     c._write_queue = []
     c._write_cv = threading.Condition()
@@ -696,12 +700,12 @@ def test_swa_only_pool_transfers_final_relocated_slot(monkeypatch, reverse_index
         },
         local_swa_block_ids=[2],
     )
-    d._mla_landing = MagicMock()
+    d._landing = MagicMock()
     d.start_load_kv(meta)
     d._send_on_socket.assert_not_called()
     post_write_requests(d, monkeypatch)
-    d._mla_landing.advertise.assert_not_called()
-    d._mla_landing.begin.assert_not_called()
+    d._landing.advertise.assert_not_called()
+    d._landing.begin.assert_not_called()
     assert meta.reqs_to_recv.keys() <= d._pending_handoffs.keys()
     _, (_, payload) = d._send_on_socket.call_args.args
     request = msgpack.loads(payload)

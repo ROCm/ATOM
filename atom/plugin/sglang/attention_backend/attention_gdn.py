@@ -364,22 +364,6 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
                 )
             out = super().forward(mixed_qkv, b, a, core_attn_out, layer_name)
             self._track_mamba_states(forward_batch, mixed_qkv)
-            # Chunked prefill rewrites the checkpoint in place. The ring
-            # cursor has to drop the previous tenant's records or the next
-            # verify folds them on top of that new state.
-            mode = None if forward_batch is None else forward_batch.forward_mode
-            draft_extend = bool(
-                mode is not None
-                and callable(getattr(mode, "is_draft_extend_v2", None))
-                and mode.is_draft_extend_v2()
-            )
-            if (
-                replayssm_enabled()
-                and mode is not None
-                and mode.is_extend()
-                and not draft_extend
-            ):
-                note_full_state_write(self._verify_cache_slots(forward_batch))
             return out
 
         attn_backend = SGLangGDNForwardContext._resolve_attn_backend(forward_batch)
@@ -528,17 +512,6 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
                 "intermediate states, but this prefill kept none."
             )
         linear_backend._track_mamba_state_extend(forward_batch, h, ssm_states, metadata)
-
-    def _verify_cache_slots(self, forward_batch: Any) -> torch.Tensor | None:
-        attn_backend = SGLangGDNForwardContext._resolve_attn_backend(forward_batch)
-        if attn_backend is None:
-            return None
-        linear = SGLangGDNForwardContext._linear_attn_backend(attn_backend)
-        metadata = getattr(linear, "forward_metadata", None)
-        indices = getattr(metadata, "mamba_cache_indices", None)
-        if indices is None:
-            return None
-        return indices[: int(forward_batch.batch_size)]
 
     def _verify_replayssm(
         self,
@@ -1049,6 +1022,12 @@ class SGLangGDNForwardContext:
             if reconstructed is None:
                 return None
             query_start_loc, idx = reconstructed
+            num_query_tokens = None
+        else:
+            # Extend only: SGLang's host sum of extend_seq_lens, i.e. the value
+            # of query_start_loc[-1].
+            num_query_tokens = fm.logical_num_tokens
+        live_slots = idx
         device = query_start_loc.device
         # Decode cuda-graph: keep Hybrid's static buffers (already pad=-1 on
         # dead rows in ``_replay_metadata``). Cloning here bakes a throwaway
@@ -1104,9 +1083,18 @@ class SGLangGDNForwardContext:
             )
 
         if mode.is_extend():
+            if replayssm_enabled():
+                # Chunked prefill rewrites the checkpoint in place. The ring
+                # cursor, shared by every GDN layer, has to drop the previous
+                # tenant's records once per forward or the next verify folds
+                # them on top of that new state.
+                note_full_state_write(live_slots[:bs])
             # SGLang's seq_lens_sum includes cached prefix tokens for some
             # hybrid batches; GDN only receives the active query tokens.
-            seq_sum = int(query_start_loc[-1].item())
+            if num_query_tokens is None:
+                # Reconstructed metadata has no host count.
+                num_query_tokens = query_start_loc[-1].item()
+            seq_sum = int(num_query_tokens)
             epl = forward_batch.extend_prefix_lens
             has_initial_state = None if epl is None else epl > 0
             nums_dict, batch_ptr, token_chunk_offset_ptr = (

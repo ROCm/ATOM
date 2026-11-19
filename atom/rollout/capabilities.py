@@ -11,7 +11,11 @@ useful failure.
 
 import logging
 
-from atom.model_engine.capabilities import COLLECTIVE_RPC_PROTOCOL_VERSION
+from atom.model_engine.capabilities import (
+    COLLECTIVE_RPC_PROTOCOL_VERSION,
+    RDMA_WEIGHT_RECEIVE_FEATURE,
+    WEIGHT_RELOAD_FEATURE,
+)
 from atom.model_engine.collective_rpc import COLLECTIVE_RPC_METHODS
 
 logger = logging.getLogger("atom")
@@ -21,7 +25,8 @@ class CapabilityProviderMixin:
     """Lets a ModelRunner describe itself to a negotiating caller."""
 
     def get_worker_capabilities(self) -> dict:
-        """Report this rank's protocol version, position, and what it supports.
+        """Report this rank's protocol version, position, and what it supports,
+        with the reason for each weight sync it cannot take (``unavailable``).
 
         Returns a plain dict rather than a dataclass so the reply stays
         picklable across the worker boundary without the engine and the worker
@@ -47,6 +52,19 @@ class CapabilityProviderMixin:
         # Engine-side (AsyncLLMEngine.pause_generation), reported here so a
         # caller has one place to ask what this ATOM supports.
         features.add("pause_generation")
+        # A weight sync that rewrites this model in place (direct, SHM, IPC),
+        # and AsyncLLMEngine.receive_weights_rdma. The engine asks once, at
+        # startup, and refuses a sync these rule out with the reason.
+        unavailable = {}
+        for feature, ask in (
+            (WEIGHT_RELOAD_FEATURE, self._reload_refusal),
+            (RDMA_WEIGHT_RECEIVE_FEATURE, self._rdma_receive_refusal),
+        ):
+            reason = ask()
+            if reason is None:
+                features.add(feature)
+            else:
+                unavailable[feature] = reason
         config = getattr(self, "config", None)
         parallel = getattr(config, "parallel_config", None)
         return {
@@ -55,6 +73,7 @@ class CapabilityProviderMixin:
             "dp_rank_local": int(getattr(parallel, "data_parallel_rank_local", 0) or 0),
             "methods": methods,
             "features": sorted(features),
+            "unavailable": unavailable,
         }
 
     def _holds_fp8_weights(self) -> bool:
