@@ -39,6 +39,7 @@ from fastapi.exception_handlers import (
 )
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from jinja2 import TemplateError
 from transformers import AutoProcessor, AutoTokenizer
 
 from atom import SamplingParams
@@ -134,6 +135,7 @@ from .request_timing import (
 from .serving_anthropic import (
     AnthropicBlocks,
     AnthropicMessagesRequest,
+    anthropic_context_length_message,
     anthropic_to_openai_messages,
     anthropic_to_openai_tools,
     build_anthropic_response,
@@ -662,6 +664,17 @@ def _coerce_n(requested_n: int | None, temperature: float | None) -> int:
     return n
 
 
+class ContextLengthError(ValueError):
+    """A request that does not fit the context: a 400, which an endpoint may
+    word in its own API's terms from the counts."""
+
+    def __init__(self, message: str, prompt_tokens: int, max_tokens: int, limit: int):
+        super().__init__(message)
+        self.prompt_tokens = prompt_tokens
+        self.max_tokens = max_tokens
+        self.limit = limit
+
+
 def _validate_context_length(
     num_prompt_tokens: int,
     max_tokens: int,
@@ -675,12 +688,15 @@ def _validate_context_length(
     if total_tokens <= int(max_model_len):
         return
 
-    raise ValueError(
+    raise ContextLengthError(
         f"This model's maximum context length is {max_model_len} tokens. "
         f"However, you requested {requested_output_tokens} output tokens and "
         f"your prompt contains at least {num_prompt_tokens} input tokens, for "
         f"a total of at least {total_tokens} tokens. Please reduce the length "
-        f"of the input prompt or the number of requested output tokens."
+        f"of the input prompt or the number of requested output tokens.",
+        int(num_prompt_tokens),
+        requested_output_tokens,
+        int(max_model_len),
     )
 
 
@@ -718,11 +734,15 @@ def _validate_pool_capacity(
     if max_pool_tokens is None or int(num_prompt_tokens) <= int(max_pool_tokens):
         return
 
-    raise ValueError(
+    raise ContextLengthError(
         f"This server's KV cache holds at most {max_pool_tokens} tokens for a "
         f"single request, and your prompt contains at least {num_prompt_tokens} "
         f"input tokens. Please shorten the prompt, or restart the server with a "
-        f"higher --gpu-memory-utilization to enlarge the cache."
+        f"higher --gpu-memory-utilization to enlarge the cache.",
+        int(num_prompt_tokens),
+        0,
+        # The prompt alone is too long: a limit it fills.
+        int(max_pool_tokens) + 1,
     )
 
 
@@ -731,7 +751,12 @@ def _validate_sequence_context_length(seq, sampling_params=None) -> None:
     if getattr(sampling_params, "max_tokens_is_default", False) and limit is not None:
         remaining = limit - seq.num_prompt_tokens
         if remaining <= 0:
-            raise ValueError("The prompt leaves no context space for output tokens")
+            raise ContextLengthError(
+                "The prompt leaves no context space for output tokens",
+                seq.num_prompt_tokens,
+                0,
+                limit,
+            )
         seq.max_tokens = min(seq.max_tokens, remaining)
     _validate_context_length(
         seq.num_prompt_tokens,
@@ -1375,15 +1400,18 @@ def _prepare_prompt(
     preserve_tool_call_arguments: bool,
     max_tokens: int,
     kv_transfer_params: dict[str, Any] | None,
+    cut_to_context: bool,
 ) -> tuple[PrefixEncoding | list[int], str]:
-    """Render, tokenize the engine's way and cut to the context, in one
-    executor step for ``/v1/messages`` and ``/v1/responses``.
+    """Render and tokenize the engine's way, in one executor step for
+    ``/v1/messages`` and ``/v1/responses``.
 
     Returns ``(engine_input, text)``: what preprocess takes in place of the
     prompt (no second tokenize), and the text the engine runs, which seeds the
-    reasoning channel. A prompt longer than the context minus the output
-    headroom is cut from the end; a context with no room for any prompt is
-    refused (ValueError, a 400)."""
+    reasoning channel. With ``cut_to_context`` (``/v1/responses``) a prompt
+    longer than the context minus the output headroom is cut from the end, and
+    a context with no room for any prompt is refused (ValueError, a 400).
+    Without it (``/v1/messages``) the prompt is returned whole and admission
+    refuses an over-long one (``ContextLengthError``)."""
     prompt = apply_chat_template(
         tokenizer,
         custom_message_encoder,
@@ -1393,6 +1421,8 @@ def _prepare_prompt(
         **template_kwargs,
     )
     encoded = engine.io_processor.encode_prompt(prompt)
+    if not cut_to_context:
+        return encoded, prompt
     max_ctx = int(_get_engine_max_model_len() or 30720)
     cap = max_ctx - _prompt_headroom(max_tokens, max_ctx, kv_transfer_params)
     if cap < 1:
@@ -1411,6 +1441,30 @@ def _prepare_prompt(
     return token_ids, text
 
 
+def _renders_without_mid_system(
+    messages, template_kwargs: dict[str, Any], tools
+) -> bool:
+    """Whether the template takes ``messages`` once the system messages after
+    the first one are dropped: run only after it refused them, to tell a
+    template that wants its system message first from one that failed for
+    another reason."""
+    kept = [m for i, m in enumerate(messages) if i == 0 or m.role != "system"]
+    if len(kept) == len(messages):
+        return False
+    try:
+        apply_chat_template(
+            tokenizer,
+            custom_message_encoder,
+            kept,
+            tools=tools,
+            preserve_tool_call_arguments=preserve_tool_call_arguments,
+            **template_kwargs,
+        )
+    except TemplateError:
+        return False
+    return True
+
+
 async def _prepare_engine_input(
     messages,
     template_kwargs: dict[str, Any],
@@ -1418,13 +1472,14 @@ async def _prepare_engine_input(
     tools,
     max_tokens: int,
     kv_transfer_params: dict[str, Any] | None,
+    cut_to_context: bool,
 ) -> tuple[PrefixEncoding | list[int], dict[str, Any] | None, bool]:
     """``(engine_input, multimodal_data, starts_in_reasoning)`` for
     ``/v1/messages`` and ``/v1/responses``.
 
     A request with images is prepared as on the chat path, and is not cut to
     the context: a cut could end inside an image. One without goes through
-    ``_prepare_prompt`` as before."""
+    ``_prepare_prompt``, which cuts it unless ``cut_to_context`` is False."""
     if _has_multimodal_content(messages):
         if kv_transfer_params is not None:
             # A prefill leg cannot hand an image request off, so neither leg
@@ -1444,6 +1499,7 @@ async def _prepare_engine_input(
         preserve_tool_call_arguments=preserve_tool_call_arguments,
         max_tokens=max_tokens,
         kv_transfer_params=kv_transfer_params,
+        cut_to_context=cut_to_context,
     )
     return engine_input, None, prompt_starts_in_reasoning(prompt)
 
@@ -2881,15 +2937,35 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         request_id = uuid.uuid4().hex[:24]
         set_request_id(request_id)
         kv_transfer_params = _engine_kv_transfer_params(request.kv_transfer_params)
-        engine_input, multimodal_data, starts_in_reasoning = (
-            await _prepare_engine_input(
+        try:
+            engine_input, multimodal_data, starts_in_reasoning = (
+                await _prepare_engine_input(
+                    messages,
+                    merged_kwargs,
+                    tools=anthropic_to_openai_tools(request.tools),
+                    max_tokens=sampling_params.max_tokens,
+                    kv_transfer_params=kv_transfer_params,
+                    # Cutting an over-long prompt drops its end -- the latest
+                    # turn and the generation prompt -- and answers 200 on
+                    # the rest; refused at admission instead.
+                    cut_to_context=False,
+                )
+            )
+        except TemplateError as exc:
+            # A template that only takes a system message first. Claude Code
+            # answers this 400 by resending with those messages folded into
+            # user turns -- so only when they are what the template refused.
+            if await asyncio.to_thread(
+                _renders_without_mid_system,
                 messages,
                 merged_kwargs,
-                tools=anthropic_to_openai_tools(request.tools),
-                max_tokens=sampling_params.max_tokens,
-                kv_transfer_params=kv_transfer_params,
-            )
-        )
+                anthropic_to_openai_tools(request.tools),
+            ):
+                raise ValueError(
+                    f'Unexpected role "system" in messages: this model\'s chat '
+                    f"template rejected it ({exc})"
+                ) from exc
+            raise
 
         if request.stream:
             # Streaming response
@@ -3135,11 +3211,18 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         # Client hung up; seq already aborted + popped. Nothing to return.
         return JSONResponse(status_code=499, content={"detail": "client disconnected"})
     except ValueError as exc:
+        message = (
+            anthropic_context_length_message(
+                exc.prompt_tokens, exc.max_tokens, exc.limit
+            )
+            if isinstance(exc, ContextLengthError)
+            else str(exc)
+        )
         return JSONResponse(
             status_code=400,
             content={
                 "type": "error",
-                "error": {"type": "invalid_request_error", "message": str(exc)},
+                "error": {"type": "invalid_request_error", "message": message},
             },
         )
     except Exception as e:
@@ -3306,6 +3389,7 @@ async def responses_create(raw_request: Request):
                 tools=openai_tools,
                 max_tokens=sampling_params.max_tokens,
                 kv_transfer_params=kv_transfer_params,
+                cut_to_context=True,
             )
         )
 

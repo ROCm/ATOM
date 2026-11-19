@@ -10,10 +10,12 @@ to drop the field on both legs, so the decode recomputed the whole prompt.
 """
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 import httpx
 import pytest
+from jinja2 import TemplateError
 
 from atom.entrypoints.openai import api_server
 from atom.entrypoints.openai.serving_anthropic import (
@@ -181,53 +183,153 @@ class TestResponses:
 
 
 class TestBothLegsTruncateAlike:
-    """Prefill gets max_tokens=1, decode the client's value: same prompt."""
+    """Prefill gets max_tokens=1, decode the client's value: same prompt.
+
+    /v1/responses only: /v1/messages does not cut (TestMessagesIsNotCut)."""
 
     @staticmethod
-    def _sent_prompt(server, endpoint, max_tokens, kv):
+    def _sent_prompt(server, max_tokens, kv):
         server.generate.clear()
-        if endpoint == "messages":
-            _messages(max_tokens=max_tokens, kv_transfer_params=kv)
-        else:
-            body = {"model": "m", "input": "hi", "max_output_tokens": max_tokens}
-            if kv is not None:
-                body["kv_transfer_params"] = kv
-            _responses(body)
+        body = {"model": "m", "input": "hi", "max_output_tokens": max_tokens}
+        if kv is not None:
+            body["kv_transfer_params"] = kv
+        _responses(body)
         return server.generate[0][0]
 
-    @pytest.mark.parametrize("endpoint", ["messages", "responses"])
-    def test_with_handoff_the_prompt_does_not_depend_on_max_tokens(
-        self, server, endpoint
-    ):
+    def test_with_handoff_the_prompt_does_not_depend_on_max_tokens(self, server):
         server.template = "<long prompt>"
 
-        prefill = self._sent_prompt(server, endpoint, 1, HANDOFF)
-        decode = self._sent_prompt(server, endpoint, 4096, HANDOFF)
+        prefill = self._sent_prompt(server, 1, HANDOFF)
+        decode = self._sent_prompt(server, 4096, HANDOFF)
 
         assert len(prefill) == len(decode) == MAX_CTX - MAX_CTX // 8
 
-    @pytest.mark.parametrize("endpoint", ["messages", "responses"])
-    def test_without_handoff_truncation_still_follows_max_tokens(
-        self, server, endpoint
-    ):
+    def test_without_handoff_truncation_still_follows_max_tokens(self, server):
         server.template = "<long prompt>"
 
         # max_tokens=1 leaves room for the whole prompt; 4096 does not.
-        assert len(self._sent_prompt(server, endpoint, 1, None)) == LONG_PROMPT_TOKENS
-        assert (
-            len(self._sent_prompt(server, endpoint, 4096, None))
-            == MAX_CTX - MAX_CTX // 8
+        assert len(self._sent_prompt(server, 1, None)) == LONG_PROMPT_TOKENS
+        assert len(self._sent_prompt(server, 4096, None)) == MAX_CTX - MAX_CTX // 8
+
+    def test_input_tokens_are_the_engine_count_of_what_it_ran(self, server):
+        server.template = "<long prompt>"
+        body = {"model": "m", "input": "hi", "max_output_tokens": 4096}
+        usage = _responses(body).json()["usage"]
+        assert usage["input_tokens"] == MAX_CTX - MAX_CTX // 8
+
+
+class TestMessagesIsNotCut:
+    """/v1/messages hands the engine the whole prompt: a cut drops its end, the
+    latest turn and the generation prompt, and the over-long request is refused
+    at admission instead. Both PD legs therefore run the same prompt."""
+
+    @pytest.mark.parametrize("kv", [None, HANDOFF])
+    @pytest.mark.parametrize("max_tokens", [1, 4096])
+    def test_the_whole_prompt_reaches_the_engine(self, server, kv, max_tokens):
+        server.template = "<long prompt>"
+        reply = _messages(max_tokens=max_tokens, kv_transfer_params=kv)
+        assert len(server.generate[0][0]) == LONG_PROMPT_TOKENS
+        assert reply["usage"]["input_tokens"] == LONG_PROMPT_TOKENS
+
+    @pytest.mark.parametrize(
+        "prompt_tokens, max_tokens, message",
+        [
+            # The prompt fits, its output does not: Claude Code lowers max_tokens.
+            (
+                8000,
+                4096,
+                (
+                    "input length and `max_tokens` exceed context limit: 8000 + "
+                    "4096 > 8192, decrease input length or `max_tokens` and try again"
+                ),
+            ),
+            # The prompt alone fills the context: Claude Code compacts.
+            (8192, 16, "prompt is too long: 8192 tokens > 8191 maximum"),
+            # max_tokens omitted: admission clamps it, and refuses only a full one.
+            (8192, None, "prompt is too long: 8192 tokens > 8191 maximum"),
+        ],
+    )
+    def test_an_over_long_request_is_refused_in_anthropic_wording(
+        self, server, monkeypatch, prompt_tokens, max_tokens, message
+    ):
+        monkeypatch.setattr(
+            api_server.engine.io_processor,
+            "encode_prompt",
+            lambda _text, **_kw: [0] * prompt_tokens,
         )
 
-    @pytest.mark.parametrize("endpoint", ["messages", "responses"])
-    def test_input_tokens_are_the_engine_count_of_what_it_ran(self, server, endpoint):
+        async def admit(prompt, sampling, _request_id, **_kw):
+            # The admission check the real engine call runs.
+            seq = SimpleNamespace(
+                num_prompt_tokens=len(prompt), max_tokens=sampling.max_tokens
+            )
+            api_server._validate_sequence_context_length(seq, sampling)
+            yield {}
+
+        monkeypatch.setattr(api_server, "generate_async", admit)
+        kwargs = {} if max_tokens is None else {"max_tokens": max_tokens}
+        reply = _messages(**kwargs)
+        assert reply.status_code == 400
+        assert json.loads(reply.body)["error"] == {
+            "type": "invalid_request_error",
+            "message": message,
+        }
+
+    def test_a_prompt_the_kv_pool_cannot_hold_is_too_long(self, server, monkeypatch):
+        monkeypatch.setattr(api_server, "_get_engine_max_pool_tokens", lambda: 4000)
+
+        async def admit(prompt, sampling, _request_id, **_kw):
+            seq = SimpleNamespace(
+                num_prompt_tokens=len(prompt), max_tokens=sampling.max_tokens
+            )
+            api_server._validate_sequence_context_length(seq, sampling)
+            yield {}
+
+        monkeypatch.setattr(api_server, "generate_async", admit)
         server.template = "<long prompt>"
-        if endpoint == "messages":
-            usage = _messages(max_tokens=4096)["usage"]
-        else:
-            body = {"model": "m", "input": "hi", "max_output_tokens": 4096}
-            usage = _responses(body).json()["usage"]
-        assert usage["input_tokens"] == MAX_CTX - MAX_CTX // 8
+        reply = _messages(max_tokens=16)
+        assert reply.status_code == 400
+        assert json.loads(reply.body)["error"]["message"] == (
+            "prompt is too long: 8000 tokens > 4000 maximum"
+        )
+
+    @staticmethod
+    def _with_mid_system(server, monkeypatch, template):
+        monkeypatch.setattr(api_server, "apply_chat_template", template)
+        request = AnthropicMessagesRequest(
+            model="m",
+            max_tokens=16,
+            messages=[
+                AnthropicMessage(role="user", content="hi"),
+                AnthropicMessage(role="system", content="reminder"),
+            ],
+        )
+        return asyncio.run(api_server.anthropic_messages(request, None))
+
+    def test_a_template_that_refuses_a_system_message_is_a_400(
+        self, server, monkeypatch
+    ):
+        def refuse(_tok, _enc, messages, **_kw):
+            if any(m.role == "system" for m in messages[1:]):
+                raise TemplateError("System message must be at the beginning.")
+            return "<rendered prompt>"
+
+        reply = self._with_mid_system(server, monkeypatch, refuse)
+        assert reply.status_code == 400
+        # The wording Claude Code retries on, folding the message into a user turn.
+        assert json.loads(reply.body)["error"]["message"].startswith(
+            'Unexpected role "system"'
+        )
+
+    def test_a_template_that_fails_for_another_reason_is_not_blamed_on_it(
+        self, server, monkeypatch
+    ):
+        def fail(*_a, **_kw):
+            raise TemplateError("Tool names may not contain '::'.")
+
+        reply = self._with_mid_system(server, monkeypatch, fail)
+        # Not the retry-on-fold 400: folding would fail the same way.
+        assert "Unexpected role" not in json.loads(reply.body)["error"]["message"]
 
 
 class TestStructuredResponsesCutFirst:

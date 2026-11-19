@@ -1259,6 +1259,7 @@ class TestPreparePrompt:
                 preserve_tool_call_arguments=False,
                 max_tokens=max_tokens,
                 kv_transfer_params=kv,
+                cut_to_context=True,
             )
 
         return run
