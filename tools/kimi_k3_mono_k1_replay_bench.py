@@ -12,6 +12,9 @@ CHUNK_AB=1 times the chunked head recurrence (ATOM_KIMI_MONO_K1_CHUNK_RECUR)
 against the sequential one instead, each arm off and on at every cursor: ABBA
 rounds seq / chunk / chunk / seq, then the sustained arms the same way.
 
+SPLIT_AB=a,b times ReplaySSM on at head split a against b (the serving
+recurrence both), each cursor: ABBA rounds a / b / b / a, then sustained.
+
 Run on one gfx1250 GPU: ROWS=40 H=0,5,6,8,11 python tools/kimi_k3_mono_k1_replay_bench.py"""
 
 import json
@@ -36,6 +39,7 @@ RUNS = int(os.environ.get("RUNS", "8"))
 SUSTAIN = float(os.environ.get("SUSTAIN", "0"))
 SUSTAIN_H = int(os.environ.get("SUSTAIN_H", "4"))
 CHUNK_AB = os.environ.get("CHUNK_AB", "0") == "1"
+SPLIT_AB = [s for s in os.environ.get("SPLIT_AB", "").split(",") if s]
 dev, gen = rc.dev, rc.gen
 QLEN, CAP, WINDOW = rc.QLEN, rc.CAP, rc.WINDOW
 
@@ -67,7 +71,14 @@ def main():
     plan = Gfx1250KimiBuildPlan(
         threads=256, blocks=256, lds_bytes=320 * 1024, tokens=ROWS, nblocks=1
     )
-    if CHUNK_AB:
+    if SPLIT_AB:
+        kernels = {}
+        for split in SPLIT_AB:
+            os.environ["ATOM_KIMI_MONO_K1_HEAD_SPLIT"] = split
+            kernels[f"on_s{split}"] = plan.make_k1_local_runner(
+                rc.spec(ROWS, True)
+            ).prepare(dev)
+    elif CHUNK_AB:
         kernels = {}
         for arm, chunk in (("seq", False), ("chunk", True)):
             on_k1, off_k1 = rc.builds(plan, ROWS, chunk)
@@ -149,6 +160,9 @@ def main():
         held.append((blk1, core, runtime))
         return lambda: k1(runtime, stream=torch.cuda.current_stream())
 
+    if SPLIT_AB:
+        split_ab(kernels, launcher, st_on, table, write_pos)
+        return
     if CHUNK_AB:
         chunk_ab(kernels, launcher, st_off, st_on, table, write_pos)
         return
@@ -250,6 +264,39 @@ def chunk_ab(kernels, launcher, st_off, st_on, table, write_pos):
                 sustained.setdefault(f"{kind}_{arm}", []).append(
                     sustain(graphs[f"{kind}_{arm}"])
                 )
+    print(
+        json.dumps(
+            {
+                "rows": ROWS,
+                "names": {t: k.entrypoint.name for t, k in kernels.items()},
+                "median_us": {
+                    t: round(sorted(v)[len(v) // 2], 2) for t, v in times.items()
+                },
+                "min_us": {t: round(min(v), 2) for t, v in times.items()},
+                "sustained_us": sustained,
+                "sustained_h": SUSTAIN_H if SUSTAIN > 0 else None,
+            }
+        ),
+        flush=True,
+    )
+
+
+def split_ab(kernels, launcher, st_on, table, write_pos):
+    graphs = {name: graph(launcher(k1, st_on, table)) for name, k1 in kernels.items()}
+    first, second = (f"on_s{split}" for split in SPLIT_AB)
+    times = {}
+    for _ in range(RUNS):
+        for h in HS:
+            write_pos.fill_(h)
+            torch.cuda.synchronize()
+            for arm in (first, second, second, first):
+                times.setdefault(f"h{h}_{arm}", []).append(time_us(graphs[arm]))
+    sustained = {}
+    if SUSTAIN > 0:
+        write_pos.fill_(SUSTAIN_H)
+        torch.cuda.synchronize()
+        for arm in (first, second, second, first):
+            sustained.setdefault(arm, []).append(sustain(graphs[arm]))
     print(
         json.dumps(
             {
