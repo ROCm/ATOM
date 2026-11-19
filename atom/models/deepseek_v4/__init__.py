@@ -614,7 +614,14 @@ def _wo_a_is_bf16_on_disk(model_path):
     return False
 
 
-def make_v4_quant_config(hf_config, model_path=None, online_quant_config=None):
+def make_v4_quant_config(
+    hf_config,
+    model_path=None,
+    online_quant_config=None,
+    *,
+    shared_expert_spec=None,
+    online_routed_experts=False,
+):
     """Build a QuantizationConfig that knows V4's per-layer quant scheme.
 
     Two V4 SKUs supported:
@@ -646,6 +653,10 @@ def make_v4_quant_config(hf_config, model_path=None, online_quant_config=None):
     preserved on BOTH the source lookup AND the online lookup — returning
     the same spec on the online path triggers the FusedMoE/Linear
     ``source == online_target`` early-return so those layers stay untouched.
+
+    ``shared_expert_spec`` pins the shared experts on both lookups.
+    ``online_routed_experts`` lets an online layer pattern convert the routed
+    experts.
     """
 
     base = QuantizationConfig(hf_config, online_quant_config=online_quant_config)
@@ -695,7 +706,17 @@ def make_v4_quant_config(hf_config, model_path=None, online_quant_config=None):
         # dequant→requant round-trip for these layers (which would either
         # crash on the moe assert or further damage already-quantized weights).
         if ".ffn.experts" in layer_name:
+            if (
+                online_routed_experts
+                and use_online_quant
+                and base.online_pattern_spec(layer_name) is not None
+            ):
+                return orig_lookup(
+                    layer_name, use_online_quant=True, check_children=check_children
+                )
             return routed_spec
+        if shared_expert_spec is not None and ".shared_experts" in layer_name:
+            return shared_expert_spec
         # BF16 / fp32 raw paths
         if (
             ".compressor.wkv" in layer_name
@@ -2798,7 +2819,13 @@ class Expert(nn.Module):
         # silu/clamp/mul in fp32 internally regardless of input dtype, so we
         # feed the bf16 GEMM output directly.
         combined = self.gate_up_proj(x)  # [num_tokens, 2*inter_dim_per_tp]
-        if self.use_fused_clamp_act_mul:
+        # A BF16 w2 (no group32 FP8 GEMM here) takes no quantized input, and a
+        # per-channel one quantizes its own.
+        scale_kwargs = fused_scale_kwargs(
+            self.w2.native_a8_group_rows,
+            self.w2.quant_type.value == QuantType.per_1x128.value,
+        )
+        if self.use_fused_clamp_act_mul and scale_kwargs and not self.w2.runs_bf16:
             native_mx = self.w2.native_a8_group_rows is not None
             x_fp8, x_scale = fused_clamp_act_mul(
                 combined,
@@ -2806,7 +2833,7 @@ class Expert(nn.Module):
                 activation="silu",
                 weights=weights,
                 dtype_quant=dtypes.fp8,
-                **fused_scale_kwargs(self.w2.native_a8_group_rows),
+                **scale_kwargs,
             )
             if native_mx:
                 x_scale = x_scale.view(torch.float8_e8m0fnu)
@@ -3895,15 +3922,17 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     @property
     def disable_fused_shared_loading(self) -> bool:
-        """True when shared experts are NOT fused into the routed MoE kernel, so
-        the weight loader must keep `ffn.shared_experts.*` on the standalone
-        Expert module instead of rewriting them into the fused slot. Read from
-        the actual built MoE layers so it always agrees with model structure.
+        """True when no MoE layer fuses its shared experts into the routed
+        kernel, so the weight loader must keep `ffn.shared_experts.*` on the
+        standalone Expert module instead of rewriting them into the fused slot.
+        Read from the actual built MoE layers so it always agrees with model
+        structure.
         """
-        for m in self.model.modules():
-            if m.__class__.__name__ == "MoE":
-                return not getattr(m, "_fuse_shared_into_routed", True)
-        return False
+        return not any(
+            m._fuse_shared_into_routed
+            for m in self.model.modules()
+            if m.__class__.__name__ == "MoE"
+        )
 
     def forward(
         self,
