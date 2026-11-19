@@ -5033,6 +5033,51 @@ def test_a_held_target_does_not_hold_its_draft_object(cluster, make_draft_worker
     assert kinds.index("safe") > max(i for i, k in enumerate(kinds) if k == "pack")
     assert _store(request.save_operation) in worker.get_finished().connector_completions
     assert worker._save_counts["held_chunks"] == 8
+    assert worker._save_counts["draft_held_chunks"] == 0
+
+
+def test_a_held_draft_object_does_not_hold_its_target(cluster, make_draft_worker):
+    worker, gpu, codec, _stream = make_draft_worker()
+    request = _draft_save_req(76)
+    hashes = request.chunk_hashes
+    objects = cluster.objects.setdefault(MASTER, {})
+    for index in range(4, 8):
+        objects[_draft_key(hashes, index)] = b"d" * DRAFT_CHUNK_BYTES
+    worker._do_save_req(request)
+    # No draft row read or put; every target is.
+    assert codec.calls == [] and _draft_calls(cluster.store_of(MASTER), "put") == []
+    assert gpu.calls != []
+    assert all(_key(hashes, i, rank=1, world=2) in objects for i in range(8))
+    assert all(
+        objects[_draft_key(hashes, i)] == b"d" * DRAFT_CHUNK_BYTES for i in range(4, 8)
+    )
+    assert _store(request.save_operation) in worker.get_finished().connector_completions
+    assert worker._save_counts["held_chunks"] == 0
+    assert worker._save_counts["draft_held_chunks"] == 4
+
+
+def test_a_save_puts_only_the_draft_objects_the_store_lacks(cluster, make_draft_worker):
+    worker, _gpu, codec, _stream = make_draft_worker()
+    request = _draft_save_req(77)
+    hashes = request.chunk_hashes
+    objects = cluster.objects.setdefault(MASTER, {})
+    for index in (5, 7):
+        objects[_draft_key(hashes, index)] = b"d" * DRAFT_CHUNK_BYTES
+    # A key the lookup has no answer for is put, as without a lookup.
+    worker._client._store.exist_codes[_draft_key(hashes, 7)] = store_client.RPC_FAIL
+    worker._do_save_req(request)
+    store = cluster.store_of(MASTER)
+    assert [len(call[1]) for call in store.calls if call[0] == "exists"][:1] == [4]
+    # Runs highest first: 6-7 put together, 5 held, 4 put.
+    assert _draft_calls(store, "put") == [
+        [_draft_key(hashes, 6), _draft_key(hashes, 7)],
+        [_draft_key(hashes, 4)],
+    ]
+    assert [call[0] for call in codec.calls] == ["pack"] * 3
+    assert objects[_draft_key(hashes, 5)] == b"d" * DRAFT_CHUNK_BYTES
+    assert objects[_draft_key(hashes, 6)] == _draft_bytes(6)
+    assert worker._save_counts["draft_held_chunks"] == 1
+    assert worker._save_counts["draft_lookups"] == 1
 
 
 def test_a_failed_draft_put_is_counted_not_fatal(cluster, make_draft_worker):
@@ -5329,12 +5374,14 @@ def test_profile_lines_time_the_draft_objects_apart(
 
     save, load = last("[OFFLOAD-SAVE-PROF]"), last("[OFFLOAD-LOAD-PROF]")
     # The target fields time the target objects; the draft phase has its own.
-    assert "status=ok draft_chunks=4 draft_bytes=48 draft_pack_ms=" in save
+    assert "status=ok draft_chunks=4 draft_bytes=48 draft_held_chunks=0 " in save
+    assert " draft_exists_ms=" in save and " draft_pack_ms=" in save
     assert " draft_put_ms=" in save and save.endswith(" draft_status=ok")
     assert "total_bytes=192 " in load
     assert " draft_chunks=4 draft_bytes=48 draft_get_ms=" in load
     assert " draft_unpack_ms=" in load
     assert last("[OFFLOAD-STORE-STATS]").endswith(
         " draft_puts=1 draft_put_keys=4 draft_put_bytes=48"
+        " draft_save_exists=1 draft_save_held_chunks=0"
         " draft_gets=1 draft_get_keys=4 draft_get_bytes=48"
     )
