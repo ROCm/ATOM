@@ -664,16 +664,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Read and checked by atom/mono/polling.py at import, which needs no ATOM
     # import; 1 restores the pre-backoff polling (ROCm/ATOM#3369).
     "ATOM_MONO_POLL_SLEEP_UNITS": lambda: os.getenv("ATOM_MONO_POLL_SLEEP_UNITS"),
-    # MiniMax-M3 mono: log (rank 0) how many decode steps took mono and how many the
-    # original path, by token count, every this many counted decode steps; 0 off.
-    "ATOM_MONO_STATS_EVERY": lambda: int(os.getenv("ATOM_MONO_STATS_EVERY", "0")),
-    # With ATOM_MONO_STATS_EVERY: also write those counts to <prefix>.rank<r>.json.
-    "ATOM_MONO_STATS_FILE": lambda: os.getenv("ATOM_MONO_STATS_FILE"),
-    # Debug, with ATOM_MONO_CHECK: compare the routed experts alone (the mono kernels' shared expert
-    # weight 0, the original layers' shared expert dropped), on the real activations. A shared
-    # expert fused into the routed experts cannot be dropped: mono is refused then.
-    "ATOM_MONO_CHECK_ROUTED_ONLY": lambda: os.getenv("ATOM_MONO_CHECK_ROUTED_ONLY", "0")
-    == "1",
     # DeepSeek-V4.1: how many of an attention layer's branches leave the main
     # stream. 0 none; 1 the compressor, on the MoE's `alt_stream`, waited at
     # the scorer that first reads it; 2 the indexer as well, on one of its own.

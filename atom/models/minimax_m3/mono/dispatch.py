@@ -13,7 +13,6 @@ that disagreed would wait on each other forever (a per-rank flag such as
 ``is_dummy_run`` must never gate this).
 """
 
-import json
 import logging
 
 import torch
@@ -88,12 +87,6 @@ class MonoDecode:
         self._lm = causal_lm
         self._uses_dspark = _uses_dspark(atom_config)
         self._drafter = None
-        # decode steps by token count, [original, mono]; the rows of the graphs
-        # captured on mono
-        self.steps: dict[bool, dict[int, int]] = {False: {}, True: {}}
-        self._graph_mono: set[int] = set()
-        self._counted = 0
-        self._stats_every = envs.ATOM_MONO_STATS_EVERY
         # created on its first eligible step (``LazyRunner``)
         self._mono = LazyRunner(
             lambda: MonoDecodeRunner(
@@ -126,54 +119,6 @@ class MonoDecode:
         inputs_embeds,
     ) -> bool:
         if input_ids is None or not self._mono.enabled:
-            return False
-        ok = self._supports(input_ids, positions, intermediate_tensors, inputs_embeds)
-        if not self._stats_every:
-            return ok
-        # a captured graph's forward runs once, at capture: its replays are
-        # counted by ``note_replay``; eager decode steps count here
-        n = input_ids.numel()
-        if torch.cuda.is_current_stream_capturing():
-            if ok:
-                self._graph_mono.add(n)
-        elif ok or self._is_decode():
-            self._count(n, ok)
-        return ok
-
-    def _is_decode(self) -> bool:
-        ctx = get_forward_context().context
-        return ctx is not None and not ctx.is_prefill
-
-    def note_replay(self, n: int) -> None:
-        """A decode step replayed an n-row graph: mono's if its capture took mono."""
-        if self._stats_every:
-            self._count(n, n in self._graph_mono)
-
-    def _count(self, n: int, mono: bool) -> None:
-        self.steps[mono][n] = self.steps[mono].get(n, 0) + 1
-        self._counted += 1
-        if self._counted % self._stats_every:
-            return
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        stats = {
-            "mono": dict(sorted(self.steps[True].items())),
-            "original": dict(sorted(self.steps[False].items())),
-        }
-        if rank == 0:
-            logger.info("MiniMax-M3 mono steps by token count: %s", stats)
-        path = envs.ATOM_MONO_STATS_FILE  # a bench's proof, one file a rank
-        if path:
-            with open(f"{path}.rank{rank}.json", "w") as f:
-                json.dump(stats, f)
-
-    def _supports(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        intermediate_tensors,
-        inputs_embeds,
-    ) -> bool:
-        if not self._mono.enabled:
             return False
         n = input_ids.numel()  # a cudagraph's pad rows included
         if intermediate_tensors is not None or inputs_embeds is not None:
@@ -241,13 +186,7 @@ class MonoDecode:
 def install_mono_decode(
     model: torch.nn.Module, _atom_config, drafter, *, metadata_builder=None
 ):
-    """Bind MiniMax's in-model Mono router after drafter hooks are armed.
-
-    The runner reports each cudagraph replay as ``model.mono_note_replay(n)``;
-    it is attached here so the model definition carries no counter hook.
-    """
+    """Bind MiniMax's in-model Mono router after drafter hooks are armed."""
     if drafter is not None:
         model.bind_mono_drafter(drafter)
-    lm = getattr(model, "language_model", model)
-    model.mono_note_replay = lm._mono.note_replay
     return model

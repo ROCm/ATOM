@@ -194,45 +194,8 @@ def _mono(monkeypatch, fwd, builds=True):
     mono._lm = SimpleNamespace(model=SimpleNamespace(aux_hidden_state_layers=()))
     mono._mono = LazyRunner(None, "MiniMax-M3 mono decode")
     mono._mono.runner = SimpleNamespace(prepare=lambda n: builds)
-    mono.steps, mono._graph_mono, mono._counted = {False: {}, True: {}}, set(), 0
-    mono._stats_every = 1 << 30  # counted, never dumped
     monkeypatch.setattr(dispatch, "get_forward_context", lambda: fwd)
     return mono
-
-
-def test_steps_are_counted_by_token_count(monkeypatch):
-    md = _forward_context(_decode_md(rows=4))
-    mono = _mono(monkeypatch, md)
-    assert mono.supports(*_step(4), None, None)
-    assert not mono.supports(*_step(17), None, None)
-    mono.note_replay(4)  # a graph replay: mono's only if its capture took mono
-    mono._graph_mono.add(4)
-    mono.note_replay(4)
-    mono.note_replay(32)
-    assert mono.steps == {True: {4: 2}, False: {4: 1, 17: 1, 32: 1}}
-
-
-def test_no_step_is_counted_with_stats_off(monkeypatch):
-    mono = _mono(monkeypatch, _forward_context(_decode_md(rows=4)))
-    mono._stats_every = 0
-    assert mono.supports(*_step(4), None, None)
-    assert not mono.supports(*_step(17), None, None)
-    mono.note_replay(4)
-    assert mono.steps == {True: {}, False: {}}
-
-
-def test_install_hands_the_runner_its_replay_counter(monkeypatch):
-    """The model definition carries no replay hook: the installer attaches it, on the
-    causal LM itself or through a wrapper's ``language_model``."""
-    mono = _mono(monkeypatch, _forward_context(_decode_md(rows=4)))
-    lm = SimpleNamespace(_mono=mono, bind_mono_drafter=lambda drafter: None)
-    for model in (
-        lm,
-        SimpleNamespace(language_model=lm, bind_mono_drafter=lambda d: None),
-    ):
-        assert dispatch.install_mono_decode(model, None, None) is model
-        model.mono_note_replay(4)
-    assert mono.steps[False] == {4: 2}
 
 
 def _step(n, pos_dtype=torch.int64):

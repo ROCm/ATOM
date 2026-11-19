@@ -285,13 +285,7 @@ class MonoDecodeRunner:
             "native MXFP8 1x32" if self.attn_mxfp8 else "ptpc FP8",
             "fused (MXFP4, a8w4)" if self.fused_shared else "MXFP8 MLP",
         )
-        routed_only = envs.ATOM_MONO_CHECK and envs.ATOM_MONO_CHECK_ROUTED_ONLY
         if self.fused_shared:
-            # the original layers' fused shared expert cannot be left out of the check
-            if routed_only:
-                raise MonoUnsupported(
-                    "ATOM_MONO_CHECK_ROUTED_ONLY with a fused shared expert"
-                )
             # the fused shared expert's routing weight is whatever the topK metadata
             # holds, read through the module: the metadata is assigned after this
             # file is imported
@@ -300,9 +294,8 @@ class MonoDecodeRunner:
                 raise MonoUnsupported("fused shared expert id")
             shared_weight = float(total_w[0, TOP_K].item())
         else:
-            # the shared expert is added to the routed sum as it is (a check of the
-            # routed experts alone: not at all)
-            shared_weight = 0.0 if routed_only else 1.0
+            # the unfused shared expert is added to the routed sum as it is
+            shared_weight = 1.0
         self.sm_scale = impl.scale
         if abs(self.sm_scale - HEAD_DIM**-0.5) > 1e-12:
             raise MonoUnsupported(f"softmax scale {self.sm_scale}")
