@@ -1551,8 +1551,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         """Whether producer index pages can be gathered into DCP consumer pages.
 
         The gather reconstructs scheduler-block MFMA tiles from token-granular
-        physical pages. Hybrid KDA builders whose index cache is already
-        scheduler-block indexed (and may compress tokens) override this.
+        physical pages. The Kimi builders override this to opt out when their
+        index is pooled (one key per `index_kpool` tokens).
         """
         return True
 
