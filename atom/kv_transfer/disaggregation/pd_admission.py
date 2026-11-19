@@ -66,9 +66,9 @@ class DecodeGrowthReserve:
         self.tokens = tokens
         self.first_decode_tokens = first_decode_tokens
 
-    def leaves_room(self, seq, probe, admitted) -> bool:
-        """Whether `seq` may take its prompt's blocks and still leave itself and
-        every request in `admitted` room to grow. The caller exempts an idle D."""
+    def leaves_room(self, seq, probe, held_blocks: int) -> bool:
+        """Whether `seq` may take its prompt's blocks and leave itself and the held
+        rows (`held_blocks`: `held_need`) room to grow. An idle D is exempt."""
         block_manager = self._block_manager
         # What this request takes off the free list now: the prompt's share
         # of the allocator's demand, where a hit on a cached-but-free block
@@ -76,17 +76,24 @@ class DecodeGrowthReserve:
         # receive takes the demand's draft lookahead only at its first
         # decode, which the reserve below covers.
         demand = probe.num_new_blocks - block_manager.draft_lookahead_blocks(len(seq))
-        reserve = self.blocks(seq, block_manager.num_pool_blocks(len(seq)), admitted)
+        own = self.need(seq, block_manager.num_pool_blocks(len(seq)))
         # The hit's checkpoint is pinned by `allocate`, so it cannot fund either.
-        return block_manager.has_page_units(demand + reserve, probe.protected_hash)
-
-    def blocks(self, seq, num_blocks, admitted) -> int:
-        """Blocks `seq` (holding `num_blocks`) and each of `admitted` need to grow:
-        at least a first decode, at most what is left to generate. One pool pass."""
-        rows = [seq, *admitted]
-        held = np.fromiter(
-            (num_blocks, *(len(s.block_table) for s in admitted)), np.int64, len(rows)
+        return block_manager._has_page_units(
+            demand + own + held_blocks, probe.protected_hash
         )
+
+    def need(self, seq, num_blocks=None) -> int:
+        """Blocks `seq` (holding `num_blocks`, else its block table) needs to grow."""
+        if num_blocks is None:
+            num_blocks = len(seq.block_table)
+        return self._need([seq], [num_blocks])
+
+    def held_need(self, rows) -> int:
+        """`need` summed over the held `rows`, in one pool pass."""
+        return self._need(rows, [len(s.block_table) for s in rows])
+
+    def _need(self, rows, held) -> int:
+        # At least a first decode, at most what is left to generate.
         lengths = np.fromiter((len(s) for s in rows), np.int64, len(rows))
         left = np.fromiter(
             (s.max_tokens - s.num_completion_tokens for s in rows), np.int64, len(rows)
@@ -94,7 +101,9 @@ class DecodeGrowthReserve:
         tokens = np.maximum(
             np.minimum(self.tokens, np.maximum(left, 0)), self.first_decode_tokens
         )
-        need = self._block_manager.num_pool_blocks_many(lengths + tokens) - held
+        need = self._block_manager.num_pool_blocks_many(lengths + tokens) - np.asarray(
+            held, np.int64
+        )
         return int(np.maximum(need, 0).sum())
 
 
@@ -134,7 +143,8 @@ class PdAdmissionController:
         byte_limit = _positive_int(
             "max_pending_kv_bytes", options.get("max_pending_kv_bytes")
         )
-        # Each limit is opt-in; the 0.15 byte budget applies only when none is set.
+        # The byte budget is opt-in (0.15 only when no limit is set); the decode
+        # reserve is always on, `num_reserved_decode_tokens` only raises it.
         fraction = _fraction(
             "max_pending_kv_fraction",
             options.get("max_pending_kv_fraction", None if limits else 0.15),
@@ -216,14 +226,16 @@ class PdAdmissionController:
                 states["receiving"] += 1
         return states
 
-    def check(self, seq, probe, *, held) -> tuple[bool, ReceivePlan | None]:
+    def check(
+        self, seq, probe, *, held, held_blocks
+    ) -> tuple[bool, ReceivePlan | None]:
         """Whether `seq` may allocate now, and the range a later `commit` charges.
 
         Takes no credit and publishes no receive; it only records a deferral.
         A caller that does not reach `commit` (allocation or detach declined)
         just drops the result. The plan is `None` when this is not a PD
         receive. `held` is what the scheduler holds for decode on this D rank:
-        its running requests and parked loads.
+        its running requests and parked loads; `held_blocks` their growth.
         """
         num_blocks = self._block_manager.num_pool_blocks(len(seq))
         offset = self._connector.pd_receive_block_offset(
@@ -241,7 +253,7 @@ class PdAdmissionController:
             receive_blocks = num_blocks - offset - self._charged_hits(probe, offset)
             if self.pending_bytes + receive_blocks * self.block_bytes > self.max_bytes:
                 hit.append("bytes")
-        if not self.leaves_decode_room(seq, probe, held=held):
+        if not self.leaves_decode_room(seq, probe, held=held, held_blocks=held_blocks):
             hit.append("free_kv")
         if not hit:
             return True, plan
@@ -257,21 +269,13 @@ class PdAdmissionController:
                 self.deferred[reason] += 1
         return False, plan
 
-    def leaves_decode_room(self, seq, probe, *, held) -> bool:
+    def leaves_decode_room(self, seq, probe, *, held, held_blocks) -> bool:
         """The reserve half of `check`, recording nothing. Only an idle D admits
-        below it, so a request that alone exceeds it is not starved."""
+        below it, so a request that alone exceeds it is not starved. `held`
+        already lists the pending receives, as parked loads."""
         if not (self.pending or held):
             return True
-        return self.reserve.leaves_room(seq, probe, self.growing(held))
-
-    def growing(self, held) -> list:
-        """What the reserve grows: `held` and the pending receives, each once (a
-        ready one can already be RUNNING). A cancelled one drains undecoded."""
-        rows = {s.id: s for s in held}
-        for entry in self.pending.values():
-            if not entry.cancelled:
-                rows.setdefault(entry.sequence.id, entry.sequence)
-        return list(rows.values())
+        return self.reserve.leaves_room(seq, probe, held_blocks)
 
     def _charged_hits(self, probe, offset: int) -> int:
         """Prefix hits inside the receive range that pending credits already hold.

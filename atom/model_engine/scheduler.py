@@ -668,6 +668,30 @@ class ScheduledBatchOutput:
         return self._req_id_to_idx.get(req_id)
 
 
+class _HeldGrowth:
+    """The rows a P/D receive leaves decode room for, and their growth in blocks,
+    summed once a scheduling pass; Phase 2 adds each receive it parks."""
+
+    __slots__ = ("_scheduler", "blocks", "rows")
+
+    def __init__(self, scheduler: Scheduler):
+        self._scheduler = scheduler
+        self.rows: list[Sequence] | None = None
+        self.blocks = 0
+
+    def get(self) -> tuple[list[Sequence], int]:
+        if self.rows is None:
+            scheduler = self._scheduler
+            self.rows = list(scheduler._decode_rows())
+            self.blocks = scheduler._decode_reserve().held_need(self.rows)
+        return self.rows, self.blocks
+
+    def add(self, seq: Sequence) -> None:
+        if self.rows is not None:
+            self.rows.append(seq)
+            self.blocks += self._scheduler._decode_reserve().need(seq)
+
+
 class Scheduler:
     """Manages the lifecycle of inference requests through prefill and decode.
 
@@ -914,8 +938,8 @@ class Scheduler:
             self.block_manager,
             first_decode_tokens=first_decode_tokens,
         )
-        # The controller keeps the decode reserve. Without it (off, or not
-        # allowed at DCP > 1 or with a state pool) the scheduler keeps it, for
+        # The controller keeps the decode reserve. Without it (off, or refused at
+        # PP, DCP, PCP or SP > 1 or with a state pool) the scheduler keeps it, for
         # the connectors whose match query a deferred receive can ask again.
         self._receive_reserve = (
             DecodeGrowthReserve(
@@ -1201,6 +1225,7 @@ class Scheduler:
         # A chunk counts the rows its forward computes, not the reused prefix.
         slots = self.max_num_seqs - len(self.running)
         parked = self._num_parked_remote_kv
+        held_growth = self._held_growth_for_pass()
         for seq in self._waiting_prefills():
             tier_waiter = self._tier_waiter_resume(seq)
             offload_resume = tier_waiter is not None
@@ -1210,10 +1235,10 @@ class Scheduler:
                 resume, cached = tier_waiter
             else:
                 # The exact probe's answer; the walk is memoised across ticks.
-                if self.pd_admission is None and self._receive_reserve is None:
+                if held_growth is None:
                     cached_blocks = self.block_manager.can_allocate_memoized(seq)
                 else:
-                    cached_blocks = self._head_fit_blocks(seq)
+                    cached_blocks = self._head_fit_blocks(seq, held_growth)
                 if cached_blocks < 0:
                     break  # Phase 2 also stops at an allocation or reserve refusal.
                 if slots <= parked:
@@ -1399,6 +1424,7 @@ class Scheduler:
                     return cost
                 cost += self._chunk_cost(seq.num_cached_tokens, k)
                 tokens += k
+        held_growth = self._held_growth_for_pass()
         for seq in itertools.islice(self._waiting_prefills(), self.max_num_seqs):
             if tokens >= token_cap:
                 break
@@ -1408,10 +1434,10 @@ class Scheduler:
             else:
                 # Runs on every tick with prefill work, holds included: reuse
                 # the walk across ticks; the answer is the exact probe's.
-                if self.pd_admission is None and self._receive_reserve is None:
+                if held_growth is None:
                     cached_blocks = self.block_manager.can_allocate_memoized(seq)
                 else:
-                    cached_blocks = self._head_fit_blocks(seq)
+                    cached_blocks = self._head_fit_blocks(seq, held_growth)
                 if cached_blocks < 0:
                     break
                 # From where the forward will really start, as admission
@@ -1569,9 +1595,10 @@ class Scheduler:
             # an admission: it records nothing, and runs every tick, so the
             # walk is memoised across ticks. Phase 2 defers a receive that
             # leaves decode no room, so that counts as a refusal too.
-            if self.pd_admission is None and self._receive_reserve is None:
+            held_growth = self._held_growth_for_pass()
+            if held_growth is None:
                 return self.block_manager.can_allocate_memoized(seq) >= 0
-            return self._head_fit_blocks(seq) >= 0
+            return self._head_fit_blocks(seq, held_growth) >= 0
         return False
 
     def _prefix_bypass_limit(self) -> int:
@@ -2440,6 +2467,7 @@ class Scheduler:
                 num_scheduled_tokens.append(chunk)
 
         # ---- Phase 2: new requests from waiting ----
+        held_growth = self._held_growth_for_pass()
         prefix_waiters: deque[Sequence] = deque()
         prefix_bypass_left = self._prefix_bypass_limit()
         # Early-loading requests held in `prefix_waiters` (they keep their place
@@ -2727,14 +2755,17 @@ class Scheduler:
             # request deferred here must leave nothing committed.
             pd_plan = None
             if self.pd_admission is not None and needs_remote_load:
+                held_rows, held_blocks = held_growth.get()
                 admitted, pd_plan = self.pd_admission.check(
-                    seq, hbm_probe, held=self._decode_rows()
+                    seq, hbm_probe, held=held_rows, held_blocks=held_blocks
                 )
                 if not admitted:
                     self.waiting.appendleft(seq)
                     break
-            elif needs_remote_load and not self._receive_leaves_decode_room(
-                seq, hbm_probe
+            elif (
+                needs_remote_load
+                and self._receive_reserve is not None
+                and not self._receive_leaves_decode_room(seq, hbm_probe, held_growth)
             ):
                 self._count_receive_deferral(seq)
                 self.waiting.appendleft(seq)
@@ -2795,6 +2826,8 @@ class Scheduler:
                     self.waiting.appendleft(seq)
                     break
                 self._park_for_remote_load(seq, skipped_waiting_requests)
+                if held_growth is not None:
+                    held_growth.add(seq)
                 self._inflight_prefix_wait.pop(seq.id, None)
                 continue
 
@@ -2843,6 +2876,8 @@ class Scheduler:
                 # same wake-up -- because to the scheduler both are one event:
                 # a transfer into blocks this request already holds.
                 self._park_for_remote_load(seq, skipped_waiting_requests)
+                if held_growth is not None:
+                    held_growth.add(seq)
                 self._inflight_prefix_wait.pop(seq.id, None)
                 continue
 
@@ -3638,28 +3673,43 @@ class Scheduler:
             self.pd_admission is not None or self._receive_reserve is not None
         )
 
-    def _head_fit_blocks(self, seq: Sequence) -> int:
+    def _held_growth_for_pass(self) -> _HeldGrowth | None:
+        """A pass's held rows and their growth, or None when no decode reserve runs."""
+        if self.pd_admission is None and self._receive_reserve is None:
+            return None
+        return _HeldGrowth(self)
+
+    def _decode_reserve(self):
+        if self.pd_admission is not None:
+            return self.pd_admission.reserve
+        return self._receive_reserve
+
+    def _head_fit_blocks(self, seq: Sequence, held: _HeldGrowth) -> int:
         """With a decode reserve, the DP probes' and chunk-cost fit: as
         `can_allocate_memoized`, or -1 for a receive the reserve defers."""
         if not self._receive_reserve_applies(seq):
             return self.block_manager.can_allocate_memoized(seq)
         probe = AdmissionProbe()
         cached_blocks = self.block_manager.can_allocate_memoized(seq, probe)
-        if cached_blocks < 0 or not self._receive_leaves_decode_room(seq, probe):
+        if cached_blocks < 0 or not self._receive_leaves_decode_room(seq, probe, held):
             return -1
         return cached_blocks
 
-    def _receive_leaves_decode_room(self, seq: Sequence, probe: AdmissionProbe) -> bool:
+    def _receive_leaves_decode_room(
+        self, seq: Sequence, probe: AdmissionProbe, held: _HeldGrowth
+    ) -> bool:
         """Whether P/D receive `seq` leaves held rows their decode reserve, recording
         nothing. The DP probes ask this, Phase 2 only without `pd_admission`."""
         if not self._receive_reserve_applies(seq):
             return True
-        held = self._decode_rows()
+        rows, blocks = held.get()
         if self.pd_admission is not None:
-            return self.pd_admission.leaves_decode_room(seq, probe, held=held)
+            return self.pd_admission.leaves_decode_room(
+                seq, probe, held=rows, held_blocks=blocks
+            )
         # Only an idle D admits below it; a cancelled load still draining is not idle.
-        idle = not held and not self._parked_loads
-        return idle or self._receive_reserve.leaves_room(seq, probe, held)
+        idle = not rows and not self._parked_loads
+        return idle or self._receive_reserve.leaves_room(seq, probe, blocks)
 
     def _count_receive_deferral(self, seq: Sequence) -> None:
         # Admission stops at a deferred receive, so it heads the queue until it
@@ -4660,7 +4710,8 @@ class Scheduler:
             if metrics := getattr(self, "metrics", None):
                 metrics.start_kv_wait(seq)
             self._num_parked_remote_kv += 1
-            self._parked_loads[seq.id] = seq
+            if self.pd_admission is not None or self._receive_reserve is not None:
+                self._parked_loads[seq.id] = seq
             seq._counted_as_inflight_load = True
 
     def _uncount_inflight_load(self, seq: Sequence) -> None:
@@ -4670,7 +4721,8 @@ class Scheduler:
             if metrics := getattr(self, "metrics", None):
                 metrics.finish_kv_wait(seq.id, succeeded=False)
             self._num_parked_remote_kv -= 1
-            self._parked_loads.pop(seq.id, None)
+            if self.pd_admission is not None or self._receive_reserve is not None:
+                self._parked_loads.pop(seq.id, None)
             seq._counted_as_inflight_load = False
 
     def _adjust_prefill_chunk_after_alloc(self, seq: Sequence, chunk: int) -> int:

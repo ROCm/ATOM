@@ -28,8 +28,10 @@ of pending receives can hold most of D's KV pool while few requests decode.
 A Mooncake D checks a decode reserve when it admits a receive: it defers the
 receive unless, after it takes its blocks, every request D holds and the
 receive itself could still take their first decode step. A P/D request
-preempted for room drops the KV it received and recomputes its whole prompt on
-D. Local prefills on D (such as that recompute) are not held to the reserve.
+preempted for room frees the KV it received and is prefilled again locally on
+D; with prefix caching on, prompt blocks still cached are reused, so only the
+evicted part is recomputed. Local prefills on D (such as that one) are not
+held to the reserve.
 The opt-in `pd_admission` policy also defers a new receive while the receive
 targets already pending would exceed a per-rank byte budget, and can raise the
 reserve. Set it in the consumer's
@@ -40,9 +42,11 @@ list the Mooncake consumer first:
 "pd_admission": {"enabled": true, "max_pending_kv_fraction": 0.15}
 ```
 
-Each limit applies only when set; with none set, the byte budget defaults to
-`max_pending_kv_fraction: 0.15`. Omit a limit to turn it off; `null` is
-rejected.
+The decode reserve is always on; `num_reserved_decode_tokens` only raises it
+above a first decode. The byte budget is opt-in: with no option but `enabled`
+set it defaults to `max_pending_kv_fraction: 0.15`, and setting any option
+(`num_reserved_decode_tokens` included) drops that default. Omit an option to
+leave it unset; `null` is rejected.
 
 | Option | Meaning |
 | --- | --- |

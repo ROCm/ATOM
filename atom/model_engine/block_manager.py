@@ -14,6 +14,7 @@ from weakref import WeakKeyDictionary
 import numpy as np
 
 from atom.config import Config, DCPConfig
+from atom.distributed.dcp_layout import get_dcp_local_seq_lens
 from atom.distributed.kv_events import (
     MEDIUM_GPU,
     AllBlocksCleared,
@@ -749,11 +750,6 @@ class BlockManager:
             count, protected_hash=protected_checkpoint_hash
         )
 
-    def has_page_units(self, count: int, protected_hash: int | None = None) -> bool:
-        """Whether `count` page units are free, or freeable from state checkpoints
-        other than `protected_hash`'s."""
-        return self._has_page_units(count, protected_hash)
-
     def _ensure_page_units(self, count: int) -> bool:
         if self.paged_state_checkpoints is None:
             return self.kv.has_free(count)
@@ -771,8 +767,6 @@ class BlockManager:
         """
         if self.dcp_world_size <= 1:
             return (seq_len + self.block_size - 1) // self.block_size
-        from atom.distributed.dcp_layout import get_dcp_local_seq_lens
-
         local_len = get_dcp_local_seq_lens(
             np.array([seq_len]),
             self.dcp_world_size,
@@ -785,8 +779,6 @@ class BlockManager:
         """`num_pool_blocks` of each length in `seq_lens`, in one numpy pass."""
         lens = np.asarray(seq_lens, dtype=np.int64)
         if self.dcp_world_size > 1:
-            from atom.distributed.dcp_layout import get_dcp_local_seq_lens
-
             lens = get_dcp_local_seq_lens(
                 lens,
                 self.dcp_world_size,

@@ -17,7 +17,7 @@ from atom.kv_transfer.disaggregation.pd_admission import (
 from atom.kv_transfer.disaggregation.types import KVConnectorOutput
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.prefill_delayer import PrefillDecision
-from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
+from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler, _HeldGrowth
 from atom.model_engine.sequence import SequenceStatus
 
 
@@ -139,7 +139,7 @@ def standalone(max_bytes, *, reserve_tokens=None, free_blocks=0):
         num_pool_blocks=lambda tokens: tokens,
         num_pool_blocks_many=lambda lengths: np.asarray(lengths),
         draft_lookahead_blocks=lambda tokens: 0,
-        has_page_units=lambda count, protected_hash=None: count <= free_blocks,
+        _has_page_units=lambda count, protected_hash=None: count <= free_blocks,
         kv=SimpleNamespace(lookup=lambda h: -1, num_free=free_blocks),
     )
     return PdAdmissionController(
@@ -155,7 +155,9 @@ def try_admit(policy, seq, *, running=()):
         num_new_blocks=len(seq),
         protected_hash=None,
     )
-    admitted, plan = policy.check(seq, probe, held=running)
+    admitted, plan = policy.check(
+        seq, probe, held=running, held_blocks=policy.reserve.held_need(running)
+    )
     if admitted:
         policy.commit(seq, plan)
     return admitted
@@ -331,20 +333,16 @@ def test_decode_reclaims_cached_blocks_before_preempting(build, seq_factory, chu
     assert not b.block_table
 
 
-def test_decode_reserve_counts_each_growing_request_once():
+def test_decode_reserve_sums_the_held_rows_and_the_candidate():
     policy = standalone(None, reserve_tokens=4, free_blocks=100)
     ready = SizedSeq(id=1, block_table=[1])
-    cancelled = SizedSeq(id=2, block_table=[2])
-    assert try_admit(policy, ready) and try_admit(policy, cancelled)
-    policy.cancel(cancelled)
     nearly_done = SizedSeq(
         id=3, block_table=[3], max_tokens=10, num_completion_tokens=9
     )
     candidate = SizedSeq(id=4, block_table=[4])
-    # READY is pending and already RUNNING: counted once. CANCELLED drains
-    # without decoding. NEARLY_DONE may emit one more token.
-    growing = policy.growing([ready, nearly_done])
-    assert policy.reserve.blocks(candidate, len(candidate), growing) == 4 + 1 + 4
+    # NEARLY_DONE may emit one more token; the others grow by the reserve.
+    held = policy.reserve.held_need([ready, nearly_done])
+    assert held + policy.reserve.need(candidate, len(candidate)) == 4 + 1 + 4
 
 
 def test_decode_reserve_starts_from_the_blocks_a_request_holds():
@@ -357,7 +355,10 @@ def test_decode_reserve_starts_from_the_blocks_a_request_holds():
     spent = SizedSeq(id=3, block_table=[9, 10, 11], num_tokens=1, max_tokens=1)
     candidate = SizedSeq(id=4, block_table=[12])
     running = [ahead, lagging, spent]
-    assert policy.reserve.blocks(candidate, len(candidate), running) == 2 + 5 + 0 + 4
+    reserve = policy.reserve
+    assert reserve.held_need(running) + reserve.need(candidate, len(candidate)) == (
+        2 + 5 + 0 + 4
+    )
 
 
 @pytest.mark.parametrize(
@@ -1139,7 +1140,8 @@ def test_the_reserve_sizes_every_row_in_one_pass_at_dcp():
     rows = [SizedSeq(num_tokens=n, block_table=[0] * pool_blocks(n)) for n in lengths]
     reserve = DecodeGrowthReserve(bm, tokens=40, first_decode_tokens=8)
     expected = sum(pool_blocks(n + 40) - pool_blocks(n) for n in lengths)
-    assert reserve.blocks(rows[0], pool_blocks(lengths[0]), rows[1:]) == expected
+    own = reserve.need(rows[0], pool_blocks(lengths[0]))
+    assert own + reserve.held_need(rows[1:]) == expected
 
 
 def test_a_moriio_receive_is_never_deferred_into_a_local_prefill(build):
@@ -1161,10 +1163,12 @@ def test_a_draining_cancelled_receive_keeps_the_decoder_from_idling(build):
     sched, request = build(options={"enabled": False}, num_kvcache_blocks=2)
     seq = request()  # its prompt takes the whole pool
     probe = SimpleNamespace(num_new_blocks=2, protected_hash=None)
-    assert sched._receive_leaves_decode_room(seq, probe), "an idle D may"
+    assert sched._receive_leaves_decode_room(
+        seq, probe, _HeldGrowth(sched)
+    ), "an idle D may"
     # A cancelled receive leaves the decode rows but holds its blocks until it drains.
     sched._parked_loads[99] = SimpleNamespace(status=SequenceStatus.FINISHED)
-    assert not sched._receive_leaves_decode_room(seq, probe)
+    assert not sched._receive_leaves_decode_room(seq, probe, _HeldGrowth(sched))
 
 
 def test_without_the_controller_a_lone_receive_may_take_the_whole_pool(build):
@@ -1209,6 +1213,7 @@ def test_a_deferred_receive_keeps_no_dp_rank_off_decode(build, options, chunked)
     # decode, on every tick, while only that decode can free B's room.
     assert not sched._can_admit_head_prefill()
     assert sched._probe_local_prefill_work() == (False, 0)
+    assert sched._estimate_prefill_chunk_cost() == 0
     for _ in range(3):
         batch, _ = sched.schedule()
         assert a.id in batch.req_ids
@@ -1258,7 +1263,7 @@ def test_a_moriio_receive_is_probed_as_on_main(build, monkeypatch):
     sched.add(request())
     fits = _record_fits(sched, monkeypatch)
     monkeypatch.setattr(
-        sched, "_head_fit_blocks", lambda seq: pytest.fail("not main's fit")
+        sched, "_head_fit_blocks", lambda *_: pytest.fail("not main's fit")
     )
     sched._can_admit_head_prefill()
     sched._probe_local_prefill_work()
@@ -1268,14 +1273,14 @@ def test_a_moriio_receive_is_probed_as_on_main(build, monkeypatch):
 
 def test_reserve_deferrals_are_exported_without_the_controller(build):
     sched, request = build(options={"enabled": False}, num_kvcache_blocks=5)
-    # Nothing deferred yet: no admission series at all.
-    assert admission_series(sched) == {}
-    a, b = request(), request()
-    sched.extend([a, b])
-    sched.schedule()
-    sched.schedule()
     deferred = (
         "atom:pd_admission_deferred_total",
         (*SERIES_LABELS, ("reason", "free_kv")),
     )
+    # Exported from 0, so a counter rate sees the first deferral.
+    assert admission_series(sched) == {deferred: 0}
+    a, b = request(), request()
+    sched.extend([a, b])
+    sched.schedule()
+    sched.schedule()
     assert admission_series(sched) == {deferred: 1}

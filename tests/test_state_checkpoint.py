@@ -2940,16 +2940,16 @@ class TestDemandDrivenCheckpoints:
         need = (
             probe.num_new_blocks
             - bm.draft_lookahead_blocks(len(second))
-            + reserve.blocks(second, bm.num_pool_blocks(len(second)), [])
+            + reserve.need(second, bm.num_pool_blocks(len(second)))
         )
         # One unit short of the receive and its reserve: only that image's
         # units could make up the difference.
         bm.kv.reserve_units(bm.kv.num_free - (need - 1), ("live-kv", 0))
         probe = AdmissionProbe()
         assert bm.can_allocate(second, record=False, probe=probe) > 0
-        assert bm.has_page_units(need), "reachable by spending the pinned image"
+        assert bm._has_page_units(need), "reachable by spending the pinned image"
 
-        assert not reserve.leaves_room(second, probe, [])
+        assert not reserve.leaves_room(second, probe, 0)
 
     def test_a_demand_recorded_while_there_was_room_is_withdrawn_when_it_goes(self):
         """The gate is the store's question, so it has to be asked afresh.
