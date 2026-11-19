@@ -504,7 +504,7 @@ def main():
     bad += check_publish_review_is_advisory()
     bad += check_range_anchor_shape()
     bad += check_unanchorable_citations_are_linked()
-    print(f"{'OK' if bad == 0 else 'DRIFT'}: {bad} drift(s)")
+    print(f"{'OK' if bad == 0 else 'REFUSED'}: {bad} check(s) failed")
     return bad
 
 
