@@ -709,7 +709,7 @@ ARG LMCACHE_WHEEL_SHA256=68c0f6870c82497b4a1fef5c365960119bedfe66715a410457ae45e
 # the pip SDK's (torch 2.11 on ROCm 10.0, 2.13 on the 10.1 nightly), and the
 # validation below asserts that exact version string. LMCache publishes no
 # ROCm 10 wheel today -- every rocm asset on their releases, up to v0.5.5rc7,
-# is built for ROCm 7.2 -- so the ROCm 10 line keeps building the HIP c_ops
+# is built for ROCm 7.2 -- so the ROCm 10 line keeps building the HIP cuda_ops
 # from source, which is how the images validated on gfx950 were built. ROCM_HOME
 # is set only by the rocm10-base stage and inherited through the image, so it
 # tells the two apart. Collapse this back to one path once a matching wheel
@@ -763,7 +763,7 @@ RUN --mount=type=bind,from=lmcache_wheel,target=/tmp/lmcache-wheel \
       assert AtomMPWorkerAdapter.__module__ == 'lmcache.integration.atom.multi_process_adapter'; \
       print('OK: lmcache', lmcache.__version__, 'HIP cuda_ops; torch', torch.__version__)" ; \
     else \
-      echo "========== [ATOM] LMCache HIP c_ops (${LMCACHE_TAG}, arch=${PYTORCH_ROCM_ARCH}) ==========" && \
+      echo "========== [ATOM] LMCache HIP cuda_ops (${LMCACHE_TAG}, arch=${PYTORCH_ROCM_ARCH}) ==========" && \
           git clone https://github.com/LMCache/LMCache.git /opt/LMCache && \
           cd /opt/LMCache && git checkout ${LMCACHE_TAG} && \
           "${VENV_PYTHON}" -m pip install -r requirements/build.txt && \
@@ -776,19 +776,24 @@ RUN --mount=type=bind,from=lmcache_wheel,target=/tmp/lmcache-wheel \
           # common.txt pins prometheus_client<=0.24.1, downgrading ATOM's required
           # >=0.25; restore ATOM's pin (lmcache only uses it for optional metrics).
           "${VENV_PYTHON}" -m pip install "prometheus_client==0.25.0" && \
-          "${VENV_PYTHON}" -c "import glob, torch; \
-      c_ops_paths = glob.glob('/opt/LMCache/lmcache/c_ops*.so'); \
-      assert c_ops_paths, 'LMCache HIP c_ops extension was not built'; \
+          # The extension is lmcache.cuda_ops, which is what the wheel branch
+          # above and .github/scripts/validate_lmcache_wheel_for_atom.py already
+          # assert; it was lmcache.c_ops up to v0.4.x and no alias was left
+          # behind. Import rather than glob a path: an editable install is free
+          # to keep the .so outside the source tree, and __file__ is the check
+          # that actually matters -- a python fallback would not end in .so.
+          "${VENV_PYTHON}" -c "import torch; \
       torch.cuda.is_available = lambda: True; \
-      import lmcache, lmcache.c_ops; \
+      import lmcache, lmcache.cuda_ops; \
       from lmcache.v1.cache_engine import LMCacheEngineBuilder; \
       from lmcache.v1.memory_management import MemoryFormat; \
       from lmcache.v1.lookup_client.factory import LookupClientFactory; \
       from lmcache.v1.config import LMCacheEngineConfig; \
       from lmcache.v1.metadata import LMCacheMetadata; \
       assert 'rocm' in torch.__version__, torch.__version__; \
-      assert lmcache.c_ops.__file__.endswith('.so'), 'c_ops fell back to python backend!'; \
-      print('OK: lmcache', lmcache.__version__, 'HIP c_ops; torch', torch.__version__)" ; \
+      assert lmcache.cuda_ops.__file__.endswith('.so'), lmcache.cuda_ops.__file__; \
+      assert hasattr(lmcache.cuda_ops, 'execute_object_group_transfer'), 'cuda_ops extension is incomplete'; \
+      print('OK: lmcache', lmcache.__version__, 'HIP cuda_ops; torch', torch.__version__)" ; \
     fi
 
 # ========== AgentX harness (agentic benchmark client) ==========
