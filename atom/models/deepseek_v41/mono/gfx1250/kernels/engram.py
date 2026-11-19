@@ -315,7 +315,6 @@ def stage_engkv_ent(c, e0, ncta, EDL, S):
             # the producers' count (one waiter a CTA, then acquire)
             if t == 0:
                 hx.wait_count(c["enga_cnt"], I32(ENGA_CTAS), 4)
-                hx.acquire_se()
             gpu.barrier()
             a8 = c["eng8"] + i64(sl * RA * EK)
             as_ = c["engs"] + i64(sl * RA * EG)

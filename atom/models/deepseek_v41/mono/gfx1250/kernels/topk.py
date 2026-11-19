@@ -308,7 +308,8 @@ def seg_wait(cnt, nchunk, s0, ns, t):
     if t == 0:
         for s in range(ns):
             sg = s0 + s
-            hx.wait_count(cnt + i64(sg) * 4, fx.min(fx.max(nchunk - sg * (SEG // 128), I32(0)), I32(SEG // 128)), 4)
+            hx.wait_count(cnt + i64(sg) * 4, fx.min(fx.max(nchunk - sg * (SEG // 128), I32(0)), I32(SEG // 128)), 4, acq=False)
+        hx.acquire_se()   # (one acquire for the segments' scores)
     gpu.barrier()
 
 
@@ -458,7 +459,7 @@ def select_mc(c, hb, ctr, isrx, G, anc=None, x0=None):
                     gpu.barrier()
                     if t == 0:
                         hx.atomic_add(ctr + i64((r * 8 + 2 + p) * 4), 1)
-                        hx.wait_count(ctr + i64((r * 8 + 2 + p) * 4), G, 8)
+                        hx.wait_count(ctr + i64((r * 8 + 2 + p) * 4), G, 8, acq=False)   # (the bins / counts below: agent-scope loads)
                     gpu.barrier()
                     if t < 32:   # wave 0: the bin of the k-th key (lds_topk's scan, over the global bins)
                         # (agent-scope loads, no acquire fence: the bins are device-scope atomics, read once a layer, so
@@ -550,7 +551,7 @@ def select_ord(c, hb, ctr, oc, r, g, G, n, k, vals, vstride, mode, q, ordered=Tr
                 gpu.barrier()
                 if t == 0:
                     hx.atomic_add(ctr + i64((r * 8 + 2 + p) * 4), 1)
-                    hx.wait_count(ctr + i64((r * 8 + 2 + p) * 4), G, 8)
+                    hx.wait_count(ctr + i64((r * 8 + 2 + p) * 4), G, 8, acq=False)   # (the bins / counts below: agent-scope loads)
                 gpu.barrier()
                 if t < 32:
                     cs = [hx.gload(hb + i64(((p * MC_ROWS + r) * 256 + 255 - 8 * lane - qq) * 4), I32, scope="agent") for qq in range(8)]
@@ -611,7 +612,7 @@ def select_ord(c, hb, ctr, oc, r, g, G, n, k, vals, vstride, mode, q, ordered=Tr
             c["stx"](oc + i64((r * 64 + g) * 8), fx.Vector.from_elements([tot >> 16, tot & 0xFFFF], I32))
             hx.wait_storecnt0()
             hx.atomic_add(oc + i64(MC_ROWS * OC_ROW + r * 4), 1)
-            hx.wait_count(oc + i64(MC_ROWS * OC_ROW + r * 4), G, 8)
+            hx.wait_count(oc + i64(MC_ROWS * OC_ROW + r * 4), G, 8, acq=False)   # (the bins / counts below: agent-scope loads)
         gpu.barrier()
         if t < 32:   # the group's counts before this CTA (G <= 64: lanes l, l + 32)
             pa = hx.gload(oc + i64((r * 64 + fx.min(lane, I32(G - 1))) * 8), fx.Int64, scope="agent")   # (above | ties << 32)
@@ -764,7 +765,7 @@ def select_ma(c, hb, ctr, G, ma, kp):
         gpu.barrier()
         if t == 0:
             hx.atomic_add(ctr + i64((r * 8 + 6) * 4), 1)
-            hx.wait_count(ctr + i64((r * 8 + 6) * 4), G, 8)
+            hx.wait_count(ctr + i64((r * 8 + 6) * 4), G, 8, acq=False)   # (the bins / counts below: agent-scope loads)
         gpu.barrier()
         if t < 32:   # wave 0: the bin of the 512-th key (select_mc's scan)
             cs = [hx.gload(lad + i64(255 - 8 * lane - qq) * 4, I32, scope="agent") for qq in range(8)]

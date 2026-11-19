@@ -631,7 +631,6 @@ def target_layer(E, Ly):
                         iqtag = hx.epoch32(tep, Ly, 2)
                         if (w == 3) & (l == 0):
                             hx.wait_count(lc + i64(LY.KV_C), fx.Int32(KVC_WAVES), 4)
-                            hx.acquire_se()   # (as the CTA's one acquire before its barrier did: the CTA's waves read past it)
                             hx.lstore(sm + IQ_LCNT, fx.Int32(0), scope="workgroup")
                             hx.lstore(sm + IQ_LFLAG, iqtag, scope="workgroup")
                         if (w < IQW) & (b * IQW + w < TR * IS.HEADS):
@@ -641,7 +640,6 @@ def target_layer(E, Ly):
                     if b < NIQC:
                         if t == 0:
                             hx.wait_count(lc + i64(LY.KV_C), fx.Int32(CTAS), 4)
-                            hx.acquire_se()   # (the producers' stores are device-scope; acquire before iquant reads them)
                         gpu.barrier()
             else:
                 hx.wait_storecnt0()

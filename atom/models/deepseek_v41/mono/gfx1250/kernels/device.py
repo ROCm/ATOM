@@ -561,12 +561,15 @@ def wait_lds_tag(off, tag):
 
 
 @_ASTR.transform
-def wait_count(addr, n, site):
-    """Spin until the agent-scope int32 counter at addr reaches n (bounded: POLL_TICKS, a timeout counted at site).
+def wait_count(addr, n, site, acq=True):
+    """Spin until the agent-scope int32 counter at addr reaches n (bounded: POLL_TICKS, a timeout counted at site), then
+    acquire (acquire_se) for the CTA.
     addr: an address, or a function giving it (evaluated in the loop, as the polls were written before this helper)."""
     t0 = clock()
     while (gload(addr() if callable(addr) else addr, fx.Int32, scope="agent") < n) & (clock() - t0 < fx.Int64(POLL_TICKS)):
         s_sleep(1)
+    if fx.const_expr(acq):   # (acq False: the caller's reads past the count are at agent scope themselves)
+        acquire_se()   # (GFX12.5) the agent acquire of the count: the CTA's WGP$ drops lines the counted producers may have changed
 
 
 @_ASTR.transform
@@ -586,8 +589,7 @@ def handoff(cnt, t, hdev, n=256, site=None):
         gpu.barrier()
         if t == 0:
             atomic_add(cnt, 1)
-            wait_count(cnt, n, 5 if site is None else site)
-            acquire_se()
+            wait_count(cnt, n, 5 if site is None else site)   # (its acquire inside)
         gpu.barrier()
 
 
