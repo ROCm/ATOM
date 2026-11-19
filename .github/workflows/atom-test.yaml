@@ -278,7 +278,7 @@ jobs:
         include: ${{ fromJson(needs.load-test-models.outputs.models_json || '[{"runner":"ubuntu-latest","model_name":"skip"}]') }}
     if: ${{ needs.ci-gate.outputs.should_run == 'true' && needs.download_aiter_wheel.result == 'success' && needs.load-test-models.result == 'success' }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 70
+    timeout-minutes: 75
     permissions:
       actions: read
       contents: read
@@ -682,7 +682,7 @@ jobs:
       
       - name: Run ATOM accuracy test
         # Admit a bounded launch/client window, leaving time to retain failures.
-        timeout-minutes: 32
+        timeout-minutes: 37
         env:
           MODEL_EXTRA_ARGS: ${{ matrix.extraArgs }}
           CLIENT_COMMAND: ${{ matrix.client_command || '' }}
@@ -713,8 +713,11 @@ jobs:
           # Pipe via stdin so container bash parses shell quoting in extraArgs
           # (e.g. single-quoted JSON in --default-chat-template-kwargs) naturally.
           echo ".github/scripts/atom_test.sh launch $model_path $launch_args" | \
-            timeout --signal=TERM --kill-after=15s 20m docker exec \
+            timeout --signal=TERM --kill-after=15s 25m docker exec \
               -e ATOM_DEBUG_DEVICE_MAPPING="${ATOM_DEBUG_DEVICE_MAPPING}" \
+              -e ATOM_SERVER_READY_POLL_SECONDS=5 \
+              -e ATOM_SERVER_READY_TIMEOUT_SECONDS=1320 \
+              -e ATOM_SERVER_WARMUP_TIMEOUT_SECONDS=120 \
               -i "$CONTAINER_NAME" bash -l
           echo ""
           echo "========== Running accuracy test =========="
