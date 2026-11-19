@@ -527,6 +527,11 @@ def can_dequant_weight_online(
     """Return whether the online path can dequantize this source."""
     if source_quant_type == QuantType.No:
         return True
+    if (
+        source_quant_type == QuantType.per_1x32
+        and source_quant_dtype == torch.float4_e2m1fn_x2
+    ):
+        return True
     if source_quant_dtype is not None and source_quant_dtype not in _FP8_SOURCE_DTYPES:
         return False
     return source_quant_type in (
@@ -553,20 +558,21 @@ def dequant_weight_online(
 
     A source is identified by BOTH its ``quant_type`` (the block layout) and its
     element ``quant_dtype``. The layout alone is not enough: ``per_1x32`` is the
-    MX layout, which the format allows to carry 4-bit elements as well, and only
-    the 8-bit (MXFP8) form is accepted here. Supported sources:
+    MX layout, which carries 8-bit (MXFP8) or 4-bit (MXFP4) elements. Supported
+    sources:
 
     - ``No``: unquantized, returned unchanged.
     - ``per_Tensor``: per-tensor FP8, one scalar scale per output partition.
     - ``per_Token`` (ptpc_fp8): per-output-channel FP8, scale ``(N, 1)``.
     - ``per_1x128``: DeepSeek-style 128x128 block FP8.
-    - ``per_1x32``: MXFP8 (1x32 E8M0 shared scale).
+    - ``per_1x32``: MXFP8, or MXFP4 for MoE experts (1x32 E8M0 shared scale); a
+      Linear refuses an MXFP4 source before it gets here.
 
     :param weight: The quantized (or float, for ``No``) weight tensor.
     :param weight_scale: The source weight scale (``None`` for ``No``).
     :param source_quant_type: The source quantization scheme (block layout).
     :param source_quant_dtype: The source element dtype. Used together with
-        ``source_quant_type`` to reject non-8-bit (e.g. MXFP4) sources. When
+        ``source_quant_type`` to tell MXFP4 from 8-bit sources. When
         ``None`` the dtype check is skipped (caller vouches for an 8-bit source).
     :param output_partition_sizes: row counts of each merged output partition,
         only used (and required) by ``per_Tensor`` merged layers.
@@ -575,9 +581,20 @@ def dequant_weight_online(
     if source_quant_type == QuantType.No:
         return weight
 
-    # Reject any non-8-bit source up front. The element dtype -- not just the
-    # block layout -- decides whether we can dequantize: MXFP4 (fp4x2) shares
-    # the per_1x32 layout with MXFP8 but is a target-only format.
+    # MXFP4 source, e.g. V4.1's routed experts.
+    if (
+        source_quant_type == QuantType.per_1x32
+        and source_quant_dtype == torch.float4_e2m1fn_x2
+    ):
+        from atom.model_ops.quant_v4 import dequant_fp4_e2m1
+
+        return dequant_fp4_e2m1(
+            weight.view(torch.int8),
+            weight_scale.view(torch.float8_e8m0fnu),
+            out_dtype=torch.get_default_dtype(),
+        )
+
+    # Every other source must be 8-bit FP8.
     if source_quant_dtype is not None and source_quant_dtype not in _FP8_SOURCE_DTYPES:
         raise ValueError(
             f"Unsupported online dequant source dtype={source_quant_dtype} "
@@ -591,8 +608,8 @@ def dequant_weight_online(
     if source_quant_type == QuantType.per_1x128:
         return dequant_per_block_fp8(weight, weight_scale)
     if source_quant_type == QuantType.per_1x32:
-        # per_1x32 is only the block layout; the (8-bit) dtype check above has
-        # already ruled out MXFP4, so a valid source here is always MXFP8.
+        # per_1x32 is only the block layout; MXFP4 returned above, so an 8-bit
+        # source here is always MXFP8.
         return dequant_mxfp8(weight, weight_scale)
     raise ValueError(
         f"Unsupported source quant_type for online dequant: {source_quant_type}. "

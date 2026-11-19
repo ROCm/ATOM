@@ -18,6 +18,23 @@ from . import oracle_kernels
 
 FIXTURES = Path(__file__).parent / "fixtures"
 MANIFEST = json.loads((FIXTURES / "reference_manifest.json").read_text())
+# The published FP4PTPC checkpoint's quantization_config: the fixture model
+# with its converted linears per-channel FP8 (`config.quantization_format`).
+FP4PTPC_QUANTIZATION = {
+    "quant_method": "w8a8_fp8",
+    "activation_scheme": "dynamic",
+    "scale_fmt": "ue8m0",
+    "expert_dtype": "fp4",
+}
+
+
+def fp4ptpc_config():
+    """The fixture model as an FP4PTPC checkpoint, through the real
+    normalization."""
+    from atom.models.deepseek_v41.config import normalize_hf_config
+
+    raw = json.loads((FIXTURES / "config.json").read_text())
+    return normalize_hf_config({**raw, "quantization_config": FP4PTPC_QUANTIZATION})
 
 
 def check_reference_sources(model_dir):
