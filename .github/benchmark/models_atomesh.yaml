@@ -2953,6 +2953,37 @@ models:
               DECODE_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_device":"rdma4,rdma5,rdma6,rdma7","pd_admission":{"enabled":true,"max_pending_kv_fraction":0.15,"num_reserved_decode_tokens":512}}
 
+        # C240 draft window with twice the decodes' P/D admission credit (pending
+        # receives up to 30% of a decode rank's KV pool, from 15%).
+        - <<: *m31b_1p2d_store2n_agentx
+          name: m31b-nvfp4-1p2d-pp4-tp4x2-dspark7-mcstore2n-agentx-c240-draftwin-cred30
+          concurrency: [240]
+          decode:
+            workers: 2
+            tp: 4
+            cudagraph: "[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160,176,192,208,224,240]"
+          server:
+            common_args:
+              max_num_seqs: 480
+              decode_max_num_seqs: 240
+              spec_decode_acceptance_length: 4.04
+          env:
+            common:
+              <<: *m31b_common_env
+              ATOM_TOKENIZE_CACHE_MB: "2048"
+            prefill:
+              <<: *m31b_mcstore_prefill_env
+              MOONCAKE_STORE_DECODE_OWNERS: "1:400:rdma6;1:400:rdma7"
+              MOONCAKE_STORE_EVICTION_HIGH_WATERMARK: "0.89"
+              MOONCAKE_STORE_EVICTION_RATIO: "0.02"
+              ATOM_MOONCAKE_STORE_DRAFT_WINDOW: "1"
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":true,"chunked_admission_timeout_s":1500}
+            decode:
+              <<: *m31b_decode_env
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_device":"rdma4,rdma5,rdma6,rdma7","pd_admission":{"enabled":true,"max_pending_kv_fraction":0.30,"num_reserved_decode_tokens":512}}
+
         # Control for the draft-window layout: C220, today's layout at its own safe
         # eviction setting (0.88/0.02), node 0's decode on rdma4-7.
         - <<: *m31b_1p2d_store2n_agentx
