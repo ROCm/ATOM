@@ -721,10 +721,11 @@ RUN pip show atom || true
 
 RUN pip install --no-cache-dir msgpack msgspec quart
 
-# atomesh: install the binary produced by the ATOM package build hook to /usr/local/bin
+# atomesh: expose the binary produced by the ATOM package build hook on PATH.
+# A symlink, so the image does not carry a second copy of the binary, which
+# stays at target/release/atomesh for the PD scripts.
 RUN echo "========== Install atomesh binary ==========" && \
-    cd /app/ATOM/atom/mesh && \
-    strip -o /usr/local/bin/atomesh target/release/atomesh && \
+    ln -sf /app/ATOM/atom/mesh/target/release/atomesh /usr/local/bin/atomesh && \
     atomesh --version
 
 # ========== LMCache (ROCm 7.2.4 / torch 2.10) for KV offload ==========
