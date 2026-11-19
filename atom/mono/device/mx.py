@@ -9,7 +9,7 @@ An E8M0 code is a biased exponent; ``pow2(code)`` is the scale it stands for.
 
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import range_constexpr, rocdl
+from flydsl.expr import rocdl
 from flydsl.expr.typing import T, as_ir_value
 
 from atom.mono.device.ops import CM_NT
@@ -89,7 +89,9 @@ FP4_INV_MAX = (
 def fp4_scale(amax):
     """(E8M0 code, forward scale 2^(code - 127)) of an MXFP4 32-block of absolute maximum ``amax``:
     aiter's RoundUp, ceil_pow2(amax * f32(1/6)) (``mxfp4_gemm_common._e8m0_roundup``, csrc
-    mx_quant_utils.h ``fp_f32_to_e8m0_scale<RoundUp, FP4_E2M1>``); see ``code_ceil`` for the clamp.
+    mx_quant_utils.h ``fp_f32_to_e8m0_scale<RoundUp, FP4_E2M1>``), the same code for every
+    amax > 0. An all-zero block (amax == 0) gets code 1 (``code_ceil``'s floor) where aiter's
+    gives 0: its elements are e2m1 zeros under either scale, so the dequantized block is the same.
     """
     e = code_ceil(amax * fx.Float32(FP4_INV_MAX))
     return e, pow2(e)
@@ -103,25 +105,10 @@ def fp4_pack2(old, a, b, scale, sel):
     return fx.Int32(
         rocdl.cvt_scalef32_pk_fp4_f32(
             T.i32,
-            as_ir_value(old),
-            as_ir_value(a),
-            as_ir_value(b),
-            as_ir_value(scale),
+            as_ir_value(fx.Int32(old)),
+            as_ir_value(fx.Float32(a)),
+            as_ir_value(fx.Float32(b)),
+            as_ir_value(fx.Float32(scale)),
             sel,
         )
     )
-
-
-def fp4x8_bf16(word, code):
-    """The eight E2M1 values of dword ``word`` (low nibble first) times the E8M0
-    scale ``code`` (its low byte) as a v8bf16 MFMA operand: exact (a product of a
-    power of two and a 2-bit-mantissa value), by four ``v_cvt_scalef32_pk_bf16_fp4``
-    (aiter's a16w4 kernels' up-conversion)."""
-    scale = as_ir_value(((code & 0xFF) << 23).bitcast(fx.Float32))
-    out = []
-    for sel in range_constexpr(4):
-        pair = rocdl.cvt_scalef32_pk_bf16_fp4(
-            T.vec(2, T.bf16), as_ir_value(word), scale, sel
-        )
-        out.append(fx.Vector(pair).bitcast(fx.Int32)[0])
-    return fx.Vector.from_elements(out, fx.Int32).bitcast(fx.BFloat16)
