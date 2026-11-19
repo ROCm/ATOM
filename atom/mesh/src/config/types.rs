@@ -64,6 +64,16 @@ pub const DEFAULT_SESSION_ID_HEADERS: &str =
 /// such as a per-request value, would otherwise grow the table for a whole TTL.
 pub const DEFAULT_SESSION_AFFINITY_MAX_ENTRIES: usize = 1_000_000;
 
+/// `hard` keeps the bound worker. `soft` keeps it too, unless the inner policy
+/// opts in and chooses another worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionAffinityMode {
+    #[default]
+    Hard,
+    Soft,
+}
+
 /// `independent` gives each session its own binding. `group` binds requests
 /// that carry a parent session id under one shared key; the parent session
 /// itself keeps its own binding.
@@ -79,10 +89,12 @@ pub enum SessionParentMode {
 #[serde(default)]
 pub struct SessionAffinityConfig {
     /// Headers checked in order for a session key. An empty list turns session
-    /// affinity off: `dp_sticky` then keys on `x-session-id` only.
+    /// affinity off for every policy but `dp_sticky`, which then keys on
+    /// `x-session-id` only.
     pub session_id_headers: Vec<String>,
     pub ttl_secs: u64,
     pub max_entries: usize,
+    pub mode: SessionAffinityMode,
     pub parent_mode: SessionParentMode,
 }
 
@@ -95,6 +107,7 @@ impl Default for SessionAffinityConfig {
                 .collect(),
             ttl_secs: DEFAULT_SESSION_AFFINITY_TTL_SECS,
             max_entries: DEFAULT_SESSION_AFFINITY_MAX_ENTRIES,
+            mode: SessionAffinityMode::Hard,
             parent_mode: SessionParentMode::Independent,
         }
     }
@@ -156,7 +169,7 @@ pub struct RouterConfig {
     pub atom_pd_rank_mapping_policy: AtomPdRankMappingPolicy,
 
     pub policy: PolicyConfig,
-    /// Session table settings for `dp_sticky`. Prefill and decode each get a table.
+    /// Session table layered on every policy. Prefill and decode each get a table.
     #[serde(default)]
     pub session_affinity: SessionAffinityConfig,
     pub host: String,

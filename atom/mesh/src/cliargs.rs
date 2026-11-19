@@ -6,7 +6,7 @@ use crate::{
     config::{
         AtomPdRankMappingPolicy, BackendType, CircuitBreakerConfig, ConfigError, ConfigResult,
         HealthCheckConfig, MetricsConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
-        SessionAffinityConfig, SessionParentMode, TokenizerCacheConfig,
+        SessionAffinityConfig, SessionAffinityMode, SessionParentMode, TokenizerCacheConfig,
         DEFAULT_SESSION_AFFINITY_MAX_ENTRIES, DEFAULT_SESSION_AFFINITY_TTL_SECS,
         DEFAULT_SESSION_ID_HEADERS,
     },
@@ -299,6 +299,17 @@ pub struct CliArgs {
         help_heading = "Routing Policy"
     )]
     pub session_affinity_max_entries: usize,
+
+    /// `hard` keeps the bound worker. `soft` lets `cache_aware` move a session whose
+    /// worker is over `--balance-abs-threshold` and `--balance-rel-threshold` against
+    /// the least-loaded worker; other policies keep the binding.
+    #[arg(
+        long,
+        default_value = "hard",
+        value_parser = ["hard", "soft"],
+        help_heading = "Routing Policy"
+    )]
+    pub session_affinity_mode: String,
 
     /// `independent` binds each session alone. `group` shares a binding across one parent's children.
     #[arg(
@@ -596,6 +607,17 @@ impl CliArgs {
     }
 
     fn session_affinity_config(&self) -> ConfigResult<SessionAffinityConfig> {
+        let mode = match self.session_affinity_mode.as_str() {
+            "hard" => SessionAffinityMode::Hard,
+            "soft" => SessionAffinityMode::Soft,
+            other => {
+                return Err(ConfigError::InvalidValue {
+                    field: "session_affinity_mode".to_string(),
+                    value: other.to_string(),
+                    reason: "expected hard or soft".to_string(),
+                });
+            }
+        };
         let parent_mode = match self.session_parent_mode.as_str() {
             "independent" => SessionParentMode::Independent,
             "group" => SessionParentMode::Group,
@@ -617,6 +639,7 @@ impl CliArgs {
             session_id_headers,
             ttl_secs: self.session_affinity_ttl_secs,
             max_entries: self.session_affinity_max_entries,
+            mode,
             parent_mode,
         })
     }
@@ -953,6 +976,8 @@ mod tests {
         let config = launch_config(&[
             "--session-affinity-ttl-secs",
             "14400",
+            "--session-affinity-mode",
+            "soft",
             "--session-parent-mode",
             "group",
             "--session-id-headers",
@@ -961,6 +986,7 @@ mod tests {
         .expect("router config");
         let affinity = config.session_affinity;
         assert_eq!(affinity.ttl_secs, 14400);
+        assert_eq!(affinity.mode, SessionAffinityMode::Soft);
         assert_eq!(affinity.parent_mode, SessionParentMode::Group);
         assert_eq!(
             affinity.session_id_headers,
@@ -1011,6 +1037,7 @@ impl Default for CliArgs {
             session_id_headers: DEFAULT_SESSION_ID_HEADERS.to_string(),
             session_affinity_ttl_secs: DEFAULT_SESSION_AFFINITY_TTL_SECS,
             session_affinity_max_entries: DEFAULT_SESSION_AFFINITY_MAX_ENTRIES,
+            session_affinity_mode: "hard".to_string(),
             session_parent_mode: "independent".to_string(),
             pd_disaggregation: false,
             decode: Vec::new(),

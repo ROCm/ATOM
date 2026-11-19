@@ -66,9 +66,10 @@ skipped after a failed prefill adds none.
 | `mesh_route_branch_total` | Counter, decisions | `pool`, `policy`, `branch` (see [Branches](#branches)) | Every selection, including one in a pool without candidates. |
 | `mesh_route_prefix_match_ratio` | Histogram, ratio 0 to 1 | `pool`, `policy` | `cache_aware` branches `affinity` and `relocate`. |
 | `mesh_route_selected_worker_active_requests` | Histogram, active requests | `pool`, `policy`, `branch` | Every selection that picks a worker, before the router adds the request (see [below](#selected-workers-active-requests)). |
+| `mesh_session_affinity_total` | Counter, decisions | `result`: `hit`, `new`, `rebind`, `expired`; `scope`: `regular`, `prefill`, `decode` | Every selection of a request with a session key that picks a worker, in every policy (see [session affinity](#session-affinity)). |
 | `mesh_session_affinity_entries` | Gauge, bindings | `scope` | A session table is swept or evicts (see [session affinity](#session-affinity)). |
 | `mesh_session_affinity_evicted_total` | Counter, bindings | `scope` | A new session finds its table over `--session-affinity-max-entries`. |
-| `mesh_session_worker_change_total` | Counter, requests | `pool`, `reason`: `rebind`, `expired`, `rank_mapping` | A `dp_sticky` session request is sent to a different worker (URL and DP rank) than the session's previous request (see [below](#worker-changes)). |
+| `mesh_session_worker_change_total` | Counter, requests | `pool`, `reason`: `rebind`, `expired`, `rank_mapping` | A session request is sent to a different worker (URL and DP rank) than the session's previous request (see [below](#worker-changes)). |
 | `mesh_selected_dp_rank_total` | Counter, dispatches | `pool`, `worker` (base URL), `dp_rank` (rank or `none`) | HTTP routers send a request, after DP rank mapping (see [below](#dp-ranks)). |
 | `mesh_route_cache_tokens_total` | Counter, tokens | `pool` (`regular` or `prefill`), `kind`: `prompt`, `cached` | HTTP routers; the response reported cached tokens. Any policy (see [below](#router-estimate-and-engine-reported-cached-tokens)). |
 | `mesh_route_cache_estimate_tokens_total` | Counter, tokens | `pool`, `kind`: `prompt`, `estimated`, `actual` | The same, when the policy also estimated a hit on the worker the prompt ran on; today only `cache_aware`. |
@@ -112,6 +113,7 @@ Defaults are the CLI defaults.
 | | `no_tokens` | The request has no tokens: no worker. | |
 | `dp_sticky` | `hit`, `new`, `rebind`, `expired` | See [session affinity](#session-affinity). | |
 | | `no_session` | No session key: the least-loaded worker. | |
+| every other policy | `hit` | The session's bound worker; a request that is not a hit records the policy's own branch. See [session affinity](#session-affinity). | |
 
 ## Reading the values
 
@@ -142,30 +144,38 @@ workers, and on `affinity` that cache hits queue behind other requests.
 
 ### Session affinity
 
-`dp_sticky` pins a session to a worker (URL and DP rank) in router memory. The
-session key is the first non-empty header of `--session-id-headers`
+Every policy pins a session to a worker (URL and DP rank) in router memory.
+The session key is the first non-empty header of `--session-id-headers`
 (`x-dynamo-session-id`, `x-session-id`, `x-smg-routing-key`,
-`x-session-affinity`); an empty list, or `grpc://` workers, key on
-`x-session-id` only. A request without a key goes to the least-loaded worker
-(`no_session`). Its branches:
+`x-session-affinity`); a request without one is routed by the policy alone
+(`dp_sticky`: the least-loaded worker, `no_session`). An empty list, or
+`grpc://` workers, turn this off, except for `dp_sticky`, which then keys on
+`x-session-id` only; with `grpc://` workers the router logs a warning at
+startup. `mesh_session_affinity_total` counts each selection of a request with
+a key:
 
 - `hit`: the pinned worker is healthy and its circuit breaker admits requests;
-- `new`: first request of the session; it goes to the worker with the fewest
-  live sessions, ties broken by load;
+- `new`: first request of the session; the policy places it, and `dp_sticky`
+  picks the worker with the fewest live sessions, ties broken by load;
 - `rebind`: the pinned worker is unhealthy, removed or circuit-open, or the
   session's last request to it failed with a server error or no response
-  (a retry included), so the session is placed again like a new one;
+  (a retry included), so the session is placed again like a new one. With
+  `--session-affinity-mode soft`, `cache_aware` also rebinds a session whose
+  worker is over `--balance-abs-threshold` and `--balance-rel-threshold`
+  against the least-loaded worker;
 - `expired`: the session was idle for more than `--session-affinity-ttl-secs`
   (120 minutes) and is placed again.
 
 With N turns per session and stable workers, the hit rate approaches
 (N - 1) / N. `rebind` points at worker churn; a router restart makes every
-session `new` again. Each pool that runs `dp_sticky` keeps its own table.
+session `new` again. Each pool keeps its own table, labelled by `scope`.
 Idle bindings are dropped every 30 seconds, so a session that returns after
 that counts as `new`, not `expired`. Past `--session-affinity-max-entries`
 bindings (1,000,000), a new session drops idle bindings, then the least
 recently used tenth of the table; a steadily rising
 `mesh_session_affinity_evicted_total` means the key is not stable per session.
+`dp_sticky` also records the result as its branch; any other policy records
+`hit` for a hit and its own branch for a placement.
 
 ### Worker changes
 
@@ -236,8 +246,14 @@ sum by (pool, policy, branch) (rate(mesh_route_branch_total[5m]))
     sum by (pool, policy) (rate(mesh_route_branch_total[5m]))
 ```
 
-Session affinity hit rate, over the `dp_sticky` decisions of requests with a
-session key:
+Session affinity hit rate per table, over the requests with a session key:
+
+```promql
+sum by (scope) (rate(mesh_session_affinity_total{result="hit"}[5m]))
+  / sum by (scope) (rate(mesh_session_affinity_total[5m]))
+```
+
+The same for `dp_sticky` from its branches:
 
 ```promql
 sum by (pool) (rate(mesh_route_branch_total{policy="dp_sticky",branch="hit"}[5m]))

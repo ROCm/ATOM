@@ -107,6 +107,18 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         // Default: no-op for policies that do not track sessions
     }
 
+    /// Called when session affinity sends a request to its bound worker,
+    /// `workers[index]`, without asking this policy. A policy that learns from
+    /// its own placements can learn from this one too.
+    fn on_session_hit(
+        &self,
+        _workers: &[Arc<dyn Worker>],
+        _info: &SelectWorkerInfo<'_>,
+        _index: usize,
+    ) {
+        // Default: no-op for policies that keep no placement history
+    }
+
     /// Called when a request sent to `worker` fails with a server error or
     /// never gets a response. Client errors are not failures.
     fn on_dispatch_failed(
@@ -133,6 +145,12 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// The policy routes better with the request's tokens but routes without them too, so
     /// the router tokenizes the request only when it can.
     fn wants_tokens(&self) -> bool {
+        false
+    }
+
+    /// Soft affinity may move this session when the returned value is true.
+    /// Existing policies keep the bound worker, matching a hard pin.
+    fn overrides_session_affinity(&self) -> bool {
         false
     }
 
@@ -209,6 +227,9 @@ pub struct SelectWorkerInfo<'a> {
     pub tokens: Option<&'a [u32]>,
     /// HTTP headers for header-based routing policies
     pub headers: Option<&'a http::HeaderMap>,
+    /// Bound worker index supplied by session affinity in soft mode.
+    /// Policies that do not override session affinity ignore it.
+    pub preferred_worker: Option<usize>,
     /// Pre-computed hash ring for O(log n) consistent hashing
     /// Built and cached by WorkerRegistry, passed through to avoid per-request rebuilds
     pub hash_ring: Option<Arc<HashRing>>,

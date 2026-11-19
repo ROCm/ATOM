@@ -3,9 +3,9 @@
 use std::sync::Arc;
 
 use super::{
-    session_affinity::SessionAffinityScope, CacheAwareConfig, CacheAwarePolicy, DpStickyPolicy,
-    LoadBalancingPolicy, PowerOfTwoPolicy, PrefixHashConfig, PrefixHashPolicy, RandomPolicy,
-    RoundRobinPolicy,
+    session_affinity::{SessionAffinityPolicy, SessionAffinityScope},
+    CacheAwareConfig, CacheAwarePolicy, DpStickyPolicy, LoadBalancingPolicy, PowerOfTwoPolicy,
+    PrefixHashConfig, PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
 };
 use crate::config::{PolicyConfig, SessionAffinityConfig};
 
@@ -49,9 +49,9 @@ impl PolicyFactory {
         }
     }
 
-    /// Create a policy whose `dp_sticky` session table uses `affinity` and
-    /// reports `scope`. Each call gets its own table, so prefill and decode do
-    /// not share bindings.
+    /// Create a policy with a session table that uses `affinity` and reports
+    /// `scope`, unless session affinity is off; `dp_sticky` always has one.
+    /// Each call gets its own table, so prefill and decode do not share bindings.
     pub(crate) fn create_in(
         config: &PolicyConfig,
         affinity: &SessionAffinityConfig,
@@ -63,7 +63,22 @@ impl PolicyFactory {
                 scope,
             ));
         }
-        Self::create_from_config(config)
+        Self::wrap(affinity, Self::create_from_config(config), scope)
+    }
+
+    fn wrap(
+        affinity: &SessionAffinityConfig,
+        bare: Arc<dyn LoadBalancingPolicy>,
+        scope: SessionAffinityScope,
+    ) -> Arc<dyn LoadBalancingPolicy> {
+        if !affinity.is_enabled() {
+            return bare;
+        }
+        Arc::new(SessionAffinityPolicy::around_scoped(
+            affinity.clone(),
+            bare,
+            scope,
+        ))
     }
 
     /// Create a policy by name (for dynamic loading)
@@ -79,7 +94,7 @@ impl PolicyFactory {
         }
     }
 
-    /// [`Self::create_by_name`], with `dp_sticky` using `affinity`.
+    /// [`Self::create_by_name`], with the session table [`Self::create_in`] adds.
     pub(crate) fn create_by_name_with(
         name: &str,
         affinity: &SessionAffinityConfig,
@@ -89,7 +104,8 @@ impl PolicyFactory {
                 dp_sticky_affinity(affinity),
                 SessionAffinityScope::Regular,
             ))),
-            _ => Self::create_by_name(name),
+            _ => Self::create_by_name(name)
+                .map(|bare| Self::wrap(affinity, bare, SessionAffinityScope::Regular)),
         }
     }
 }
@@ -256,11 +272,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn affinity_off_keeps_dp_sticky_on_x_session_id_only() {
+    async fn affinity_off_leaves_policies_bare_and_dp_sticky_on_x_session_id_only() {
         let off = SessionAffinityConfig {
             session_id_headers: Vec::new(),
             ..SessionAffinityConfig::default()
         };
+        let random =
+            PolicyFactory::create_in(&PolicyConfig::Random, &off, SessionAffinityScope::Regular);
+        assert!(random.as_any().downcast_ref::<RandomPolicy>().is_some());
+        let named = PolicyFactory::create_by_name_with("round_robin", &off).unwrap();
+        assert!(named.as_any().downcast_ref::<RoundRobinPolicy>().is_some());
+
         let dp_sticky =
             PolicyFactory::create_in(&PolicyConfig::DpSticky, &off, SessionAffinityScope::Regular);
         let workers: Vec<Arc<dyn crate::core::Worker>> = ["http://w1:8000", "http://w2:8000"]
@@ -295,6 +317,13 @@ mod tests {
             let policy = PolicyFactory::create_in(&PolicyConfig::DpSticky, &affinity, scope);
             let dp_sticky = policy.as_any().downcast_ref::<DpStickyPolicy>().unwrap();
             assert_eq!(dp_sticky.scope_label(), label);
+
+            let policy = PolicyFactory::create_in(&PolicyConfig::Random, &affinity, scope);
+            let wrapped = policy
+                .as_any()
+                .downcast_ref::<SessionAffinityPolicy>()
+                .unwrap();
+            assert_eq!(wrapped.scope_label(), label);
         }
     }
 }
