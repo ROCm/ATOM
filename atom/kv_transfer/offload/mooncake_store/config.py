@@ -31,16 +31,21 @@ class StorePool(NamedTuple):
 
     master: str
     metadata: str
+    # Where the master publishes its KV events (`-kv_events_bind_endpoint`),
+    # `tcp://host:port`; None when it publishes none.
+    kv_events: str | None = None
 
 
 @dataclass(frozen=True)
 class MooncakeStoreOffloadConfig:
     """Parsed ``mooncake_store.*`` settings; see the offload README's table."""
 
-    # One shared pool: its master's RPC address and metadata server. Both None
-    # when `pools` is set.
+    # One shared pool: its master's RPC address and metadata server, and where
+    # the master publishes its KV events, if it does. All None when `pools` is
+    # set.
     master: str | None
     metadata: str | None
+    kv_events: str | None
     # Per-NIC pools keyed by RDMA device; empty for one shared pool.
     pools: Mapping[str, StorePool]
     # Without pools, a worker NIC in this list is refused.
@@ -76,7 +81,7 @@ class MooncakeStoreOffloadConfig:
             ValueError: Per-NIC pools have none for ``nic``.
         """
         if not self.pools:
-            return StorePool(str(self.master), str(self.metadata))
+            return StorePool(str(self.master), str(self.metadata), self.kv_events)
         pool = self.pools.get(nic)
         if pool is None:
             raise ValueError(
@@ -128,8 +133,9 @@ def parse_mooncake_store_config(
     pools = _pools(values.get("pools"))
     master = values.get("master")
     metadata = values.get("metadata")
+    kv_events = values.get("kv_events")
     if pools:
-        if master is not None or metadata is not None:
+        if master is not None or metadata is not None or kv_events is not None:
             raise ValueError(
                 "set either mooncake_store.master and mooncake_store.metadata "
                 "(one shared pool) or mooncake_store.pools (one pool per NIC), "
@@ -148,6 +154,7 @@ def parse_mooncake_store_config(
             )
         master = _address("mooncake_store.master", master)
         metadata = _text("mooncake_store.metadata", metadata)
+        kv_events = _endpoint("mooncake_store.kv_events", kv_events)
 
     local_hostname = values.get("local_hostname")
     if local_hostname is None:
@@ -158,6 +165,7 @@ def parse_mooncake_store_config(
     return MooncakeStoreOffloadConfig(
         master=master,
         metadata=metadata,
+        kv_events=kv_events,
         pools=pools,
         owner_rdma_devices=_devices(
             "mooncake_store.owner_rdma_devices", values.get("owner_rdma_devices", "")
@@ -234,6 +242,17 @@ def _address(name: str, value: Any) -> str:
     return text
 
 
+def _endpoint(name: str, value: Any) -> str | None:
+    """A ``tcp://host:port`` ZMQ endpoint, or None when unset."""
+    if value is None:
+        return None
+    text = _text(name, value)
+    if not text.startswith("tcp://"):
+        raise ValueError(f"{name} must be tcp://host:port, got {value!r}")
+    _address(name, text[len("tcp://") :])
+    return text
+
+
 def _devices(name: str, value: Any) -> tuple[str, ...]:
     if not isinstance(value, str):
         raise ValueError(f"{name} must be a comma-separated string")  # noqa: TRY004
@@ -258,6 +277,7 @@ def _pools(value: Any) -> dict[str, StorePool]:
         pools[_text(name, device)] = StorePool(
             _address(f"{name}.master", pool.get("master")),
             _text(f"{name}.metadata", pool.get("metadata")),
+            _endpoint(f"{name}.kv_events", pool.get("kv_events")),
         )
     return pools
 

@@ -25,6 +25,9 @@ logger = logging.getLogger("atom")
 MEDIUM_GPU: Final[str] = "GPU"
 MEDIUM_CPU: Final[str] = "CPU"
 MEDIUM_DISK: Final[str] = "DISK"
+# The Mooncake Store this engine offloads to, by chunks: each block is one,
+# named by its digest (`offload.mooncake_store.events`).
+MEDIUM_STORE: Final[str] = "STORE"
 
 # Reserved seq frame that terminates a replay response (vLLM's END_SEQ). Its
 # payload is a msgpack `[oldest_available_seq, latest_seq]` window so a consumer

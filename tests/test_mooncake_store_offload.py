@@ -27,11 +27,19 @@ from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
+import msgspec
 import numpy as np
 import pytest
 import torch
+import zmq
 from conftest import MockConfig, with_min_load
 
+from atom.distributed.kv_events import (
+    MEDIUM_STORE,
+    AllBlocksCleared,
+    BlockRemoved,
+    BlockStored,
+)
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.kv_transfer.disaggregation.pp_kv_aggregator import PPKVAggregator
 from atom.kv_transfer.disaggregation.types import (
@@ -71,6 +79,7 @@ from atom.kv_transfer.offload.mooncake_store.config import (
     check_engine_compatibility,
     parse_mooncake_store_config,
 )
+from atom.kv_transfer.offload.mooncake_store.events import StoreTier
 from atom.kv_transfer.offload.mooncake_store.layouts import mooncake_codec_id
 from atom.kv_transfer.offload.mooncake_store.pool import (
     SlotPoolExhausted,
@@ -648,6 +657,13 @@ def test_config_per_nic_pools():
         StorePool("10.0.0.1:26051", METADATA),
         StorePool("10.0.0.1:26151", METADATA),
     ]
+    # A pool's master may publish its KV events.
+    pools["rdma1"]["kv_events"] = "tcp://10.0.0.1:26170"
+    cfg = parse_mooncake_store_config(
+        _extra(master=None, metadata=None, protocol="rdma", pools=pools)
+    )
+    assert cfg.pool_of("rdma1").kv_events == "tcp://10.0.0.1:26170"
+    assert cfg.pool_of("rdma0").kv_events is None
 
 
 @pytest.mark.parametrize(
@@ -695,6 +711,8 @@ def test_config_takes_the_launcher_worker_config(launcher_json):
         ({"save_abandon_timeout_s": float("inf")}, "finite and > 0"),
         ({"save_abandon_timeout_s": "300"}, "number of seconds"),
         ({"rdma_devices": ["rdma0"]}, "comma-separated string"),
+        ({"kv_events": "10.0.0.1:26070"}, "kv_events must be tcp://host:port"),
+        ({"kv_events": "tcp://10.0.0.1"}, "host:port"),
     ],
 )
 def test_config_refuses_bad_settings(overrides, match):
@@ -2153,6 +2171,93 @@ def test_max_pending_saves_bounds_saves_in_flight(cluster):
     [operation] = scheduler._save_inflight.values()
     scheduler.save_finished(operation)
     assert len(scheduler.build_connector_meta().requests) == 1
+
+
+# --- store tier ---------------------------------------------------------------
+
+# The first two digests of the chain atom/mesh/src/kv_storage/keys.rs asserts,
+# and the names the router gives them.
+_DIGESTS = ("48a73da894d8d0ef643123150b31991e", "a53c74ba1da5cce48218d8a3729dc7a1")
+_NAMES = [0x48A73DA894D8D0EF, 0xA53C74BA1DA5CCE4]
+
+
+def _master_event(kind, key, medium="cpu"):
+    """An event of a Mooncake master's KV event batch (Mooncake#2214)."""
+    return {"event_type": kind, "object_key": key, "medium": medium}
+
+
+def _stored_chunks(names):
+    return BlockStored(
+        block_hashes=names,
+        parent_block_hash=None,
+        token_ids=[],
+        block_size=16,
+        lora_id=None,
+        medium=MEDIUM_STORE,
+        lora_name=None,
+    )
+
+
+def test_the_store_tier_holds_a_chunk_once_every_rank_of_it_is_stored():
+    namespace = "atomkv1-0123456789abcdef01234567"
+    tier = StoreTier(namespace, world=2, chunk_tokens=16)
+
+    def key(rank, digest=_DIGESTS[0], world=2):
+        return f"{namespace}/w{rank}of{world}/{digest}"
+
+    for event in (
+        _master_event("stored", key(0)),
+        _master_event("stored", key(0), "disk"),
+        # Another world's or namespace's chunk, or one rank of the second.
+        _master_event("stored", key(0, _DIGESTS[1], world=4)),
+        _master_event("stored", "atomkv1-other/w1of2/" + _DIGESTS[0]),
+        _master_event("stored", key(0, _DIGESTS[1])),
+        _master_event("stored", key(1)),
+    ):
+        tier.apply(event)
+    assert tier.take() == [_stored_chunks(_NAMES[:1])]
+    # Held while one medium holds every rank's object.
+    tier.apply(_master_event("removed", key(0)))
+    assert tier.take() == []
+    tier.apply(_master_event("removed", key(0), "disk"))
+    assert tier.take() == [BlockRemoved(block_hashes=_NAMES[:1], medium=MEDIUM_STORE)]
+    # Chunks completed together are held in one event.
+    tier.apply(_master_event("stored", key(0)))
+    tier.apply(_master_event("stored", key(1, _DIGESTS[1])))
+    assert tier.take() == [_stored_chunks(_NAMES)]
+    # A tainted Store holds nothing until the marker goes.
+    tier.apply(_master_event("stored", keys.STORE_TAINT_KEY))
+    assert tier.take() == [AllBlocksCleared(medium=MEDIUM_STORE)]
+    tier.apply(_master_event("removed", key(1)))
+    tier.apply(_master_event("removed", keys.STORE_TAINT_KEY))
+    assert tier.take() == [_stored_chunks(_NAMES[1:])]
+    tier.apply({"event_type": "cleared", "medium": "cpu"})
+    assert tier.take() == [AllBlocksCleared(medium=MEDIUM_STORE)]
+
+
+def test_the_scheduler_relays_the_store_tier_with_its_kv_events(cluster):
+    publisher = zmq.Context.instance().socket(zmq.PUB)
+    port = publisher.bind_to_random_port("tcp://127.0.0.1")
+    extra = _extra(kv_events=f"tcp://127.0.0.1:{port}", chunk_tokens=16)
+    scheduler = MooncakeStoreOffloadScheduler(_config(extra=extra))
+    recorded = []
+    scheduler.bind_block_manager(
+        SimpleNamespace(kv_events_enabled=True, record_events=recorded.extend)
+    )
+    key = f"{scheduler._namespace}/w0of1/{_DIGESTS[0]}"
+    batch = msgspec.msgpack.encode([0, [_master_event("stored", key)], 0])
+    try:
+        # A subscriber misses what is published before it joins.
+        for seq in range(200):
+            publisher.send_multipart([b"", seq.to_bytes(8, "big"), batch])
+            scheduler.build_connector_meta()
+            if recorded:
+                break
+            time.sleep(0.05)
+        assert recorded == [_stored_chunks(_NAMES[:1])]
+    finally:
+        scheduler.close()
+        publisher.close(linger=0)
 
 
 # --- worker: save -------------------------------------------------------------

@@ -3849,6 +3849,12 @@ class BlockManager:
         """True iff KV events are being recorded."""
         return self._event_log is not None
 
+    def record_events(self, events: list[KVCacheEvent]) -> None:
+        """Publish `events` of another tier after those recorded so far, from
+        the scheduler thread, as this cache's are."""
+        if self._event_log is not None:
+            self._event_log.extend(events)
+
     def record_remote_store(
         self,
         block_hashes: list[int],

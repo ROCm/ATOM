@@ -646,6 +646,7 @@ settings. The same keys work in `kv_connector_extra_config` of
 | `mooncake_store.master` | required without `pools` | Master RPC address, `host:port`. |
 | `mooncake_store.metadata` | required without `pools` | Metadata server, `http://host:port/metadata` (or `P2PHANDSHAKE`). |
 | `mooncake_store.pools` | -- | Per-NIC pools instead, as a JSON object: `{"rdma0": {"master": "h:p", "metadata": "<url>"}, ...}`. A worker uses its NIC's pool; needs the `rdma` protocol. |
+| `mooncake_store.kv_events` | -- | Where the master publishes its KV events, `tcp://host:port` (`mooncake_master -enable_kv_events -kv_events_emit_object_key -kv_events_bind_endpoint=...`); a pool's `"kv_events"` with pools. When every pool's is set and the engine's KV events are on, the engine relays the chunks the Store holds in its own KV events, as medium `STORE`. |
 | `mooncake_store.owner_rdma_devices` | `""` | Without pools, a worker whose NIC is listed here is refused. |
 | `mooncake_store.rdma_devices` | `""` | NIC override: one for every GPU, or one per local GPU ordinal. Default: the GPU's NIC in the PCI tree. |
 | `mooncake_store.protocol` | `rdma` | Worker transfer protocol (`rdma` or `tcp`). Lookups always use tcp. |

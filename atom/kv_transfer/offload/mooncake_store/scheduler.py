@@ -39,6 +39,7 @@ from atom.kv_transfer.offload.mooncake_store.config import (
     check_engine_compatibility,
     parse_mooncake_store_config,
 )
+from atom.kv_transfer.offload.mooncake_store.events import StoreTier, StoreTierRelay
 from atom.kv_transfer.offload.mooncake_store.keys import (
     DIGEST_BYTES,
     STORE_TAINT_KEY,
@@ -415,6 +416,43 @@ class MooncakeStoreOffloadScheduler(KVStoreOffloadScheduler):
         self.lowers_hbm_hit_to_chunk = KVConnectorFactory.lowers_hbm_hit_to_chunk(
             "mooncake_store"
         )
+        self._world = world
+        self._store_tier: StoreTierRelay | None = None
+
+    def bind_block_manager(self, block_manager) -> None:
+        super().bind_block_manager(block_manager)
+        # The store tier goes with the cache's own KV events, and needs every
+        # pool's: a chunk's ranks may be in different pools.
+        pools = self._store_cfg.store_masters()
+        endpoints = [pool.kv_events for pool in pools if pool.kv_events]
+        if self._store_tier is not None or not endpoints:
+            return
+        if not block_manager.kv_events_enabled or len(endpoints) < len(pools):
+            logger.warning(
+                "Mooncake Store offload: not relaying the store tier: %s",
+                (
+                    "KV events are off"
+                    if len(endpoints) == len(pools)
+                    else "a pool's master publishes no KV events"
+                ),
+            )
+            return
+        tier = StoreTier(self._namespace, self._world, self._store_cfg.chunk_tokens)
+        self._store_tier = StoreTierRelay(endpoints, tier)
+        logger.info(
+            "Mooncake Store offload: relaying the store tier from %s",
+            ",".join(endpoints),
+        )
+
+    def build_connector_meta(self):
+        if self._store_tier is not None:
+            self._block_manager.record_events(self._store_tier.drain())
+        return super().build_connector_meta()
+
+    def close(self) -> None:
+        if self._store_tier is not None:
+            self._store_tier.close()
+        super().close()
 
     def offer_lookups(self, seqs):
         # Called on arrival after tokenization, before admission/prefill.
