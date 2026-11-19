@@ -60,6 +60,10 @@ logger = logging.getLogger("atom")
 # would fire one worker RPC round per spin; 1ms matches the PP head's existing
 # idle token-poll timeout and is far below any transfer latency.
 KV_IDLE_DRAIN_INTERVAL_S = 0.001
+# Pace of an idle engine's KV event publication, for what its connector relays
+# with no step to carry it (the Mooncake Store's tier). About a step's pace, so
+# the batches the replay buffer keeps still span as long a window.
+KV_IDLE_PUBLISH_INTERVAL_S = 0.05
 # How long a busy loop that finds its engine held sleeps before it looks again.
 HELD_POLL_S = 0.01
 
@@ -266,6 +270,7 @@ class EngineCore:
 
         self.kv_transfer_enabled = bool(config.kv_transfer_config)
         self._next_idle_kv_drain = 0.0
+        self._next_idle_kv_publish = 0.0
         if self.kv_transfer_enabled:
             # Physical: one output per launched worker, else this waits forever.
             self.kv_aggregator = KVOutputAggregator(world_size=config.tp_world_size)
@@ -573,6 +578,7 @@ class EngineCore:
                     self.scheduler.engine_stats.note_idle(now)
                     if self.has_pending_kv_work():
                         self._advance_idle_kv_transfer()
+                    self._publish_idle_kv_events(now)
         finally:
             try:
                 # Teardown runs even on exceptions so the sender thread/socket
@@ -601,6 +607,15 @@ class EngineCore:
                 self.scheduler.publish_kv_events()
             except Exception:
                 logger.exception("KV event publish after engine step failed")
+
+    def _publish_idle_kv_events(self, now: float) -> None:
+        if now < self._next_idle_kv_publish:
+            return
+        self._next_idle_kv_publish = now + KV_IDLE_PUBLISH_INTERVAL_S
+        try:
+            self.scheduler.publish_kv_events()
+        except Exception:
+            logger.exception("KV event publish while idle failed")
 
     def _release_request_resources(self, sequences):
         structured_ids = [seq.id for seq in sequences if is_structured(seq)]
@@ -1168,6 +1183,7 @@ class DPEngineCoreProc(EngineCore):
                         # would run the delayer's cross-DP all_reduce off
                         # lockstep, so the idle drain must stay off that path.
                         self._advance_idle_kv_transfer()
+                    self._publish_idle_kv_events(now)
                     continue
 
                 self.scheduler.engine_stats.note_busy(now)

@@ -225,6 +225,11 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         if callable(callback):
             callback(seqs)
 
+    def relay_kv_events(self) -> None:
+        callback = getattr(self._impl, "relay_kv_events", None)
+        if callable(callback):
+            callback()
+
     def note_scheduled_tokens(self, scheduled_seqs, num_scheduled_tokens) -> None:
         callback = getattr(self._impl, "note_scheduled_tokens", None)
         if callable(callback):

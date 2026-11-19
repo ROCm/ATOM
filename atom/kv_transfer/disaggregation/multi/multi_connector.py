@@ -450,6 +450,13 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             if callable(bind):
                 bind(block_manager)
 
+    def relay_kv_events(self) -> None:
+        """Log what each sub relays (the Mooncake Store's tier) as KV events."""
+        for connector in self._connectors:
+            relay = getattr(connector, "relay_kv_events", None)
+            if callable(relay):
+                relay()
+
     def lookup_pending(self, seq: Any) -> bool:
         """True while any sub's external-tier lookup for `seq` is in flight."""
         return any(c.lookup_pending(seq) for c in self._connectors)

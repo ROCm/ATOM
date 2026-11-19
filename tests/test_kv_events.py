@@ -662,13 +662,14 @@ class TestPPLoopPublication:
     REMOVED = BlockRemoved(block_hashes=[1], medium=MEDIUM_GPU)
 
     @staticmethod
-    def _run(loop, steps, *, work="forward", publish=None, calls=None):
+    def _run(loop, steps, *, work="forward", publish=None, calls=None, relayed=()):
         """Run a PP stage's `loop` for one iteration per entry of `steps`: the
         events the iteration's work logs, ending, if the work fails, with the
         exception it raises. The head's `work` is a forward, idle KV-transfer
-        progress (`"kv"`), or none. Returns what reached the publisher, with the
-        phase it reached it in, and the events left in the log; `calls` gets the
-        phase of every `publish_kv_events` call."""
+        progress (`"kv"`), or none; its connector relays `relayed` once. Returns
+        what reached the publisher, with the phase it reached it in, and the
+        events left in the log; `calls` gets the phase of every
+        `publish_kv_events` call."""
         from aiter_stub import stubbed_aiter
 
         with stubbed_aiter():
@@ -690,6 +691,12 @@ class TestPPLoopPublication:
             log.clear()
             return events
 
+        relayed = list(relayed)
+
+        def relay_kv_events():
+            log.extend(relayed)
+            relayed.clear()
+
         def shutdown_requested():
             if next(left) == 0:
                 phase[0] = "shutdown"
@@ -709,6 +716,7 @@ class TestPPLoopPublication:
             return EngineCore._run_then_publish_kv_events(proc, step)
 
         scheduler = SimpleNamespace(
+            kv_connector=SimpleNamespace(relay_kv_events=relay_kv_events),
             block_manager=SimpleNamespace(take_events=take_events),
             kv_event_publisher=SimpleNamespace(publish=publish or record),
             heartbeat_throughput=lambda _: None,
@@ -727,6 +735,7 @@ class TestPPLoopPublication:
             _in_flight=(),
             _pp_head_step=do_work,
             _run_then_publish_kv_events=run_then_publish,
+            _next_idle_kv_publish=0.0,
             has_pending_kv_work=lambda: work == "kv",
             _advance_idle_kv_transfer=do_work,
             _drain_kv_work_at_exit=lambda: None,
@@ -734,6 +743,9 @@ class TestPPLoopPublication:
             pp_transport=SimpleNamespace(recv_metadata=recv_metadata),
             runner_mgr=SimpleNamespace(call_func=lambda *_, **__: None),
             scheduler=scheduler,
+        )
+        proc._publish_idle_kv_events = lambda now: (
+            EngineCore._publish_idle_kv_events(proc, now)
         )
         getattr(PPEngineCoreProc, loop)(proc)
         return published, log
@@ -754,10 +766,22 @@ class TestPPLoopPublication:
         assert published == [("serving", [removed])]
         assert left == []
 
-    def test_head_publishes_nothing_on_an_idle_spin(self):
-        calls = []
-        self._run("_head_busy_loop", [[]] * 1000, work=None, calls=calls)
-        assert calls == ["shutdown"]
+    def test_an_idle_head_publishes_what_its_connector_relays_paced(self, monkeypatch):
+        from aiter_stub import stubbed_aiter
+
+        with stubbed_aiter():
+            from atom.model_engine import pp_engine_core
+
+        # The clock stands still, so every idle spin after the first is paced out.
+        clock = SimpleNamespace(monotonic=lambda: 0.0, sleep=time.sleep)
+        monkeypatch.setattr(pp_engine_core, "time", clock)
+        calls, steps = [], [[]] * 1000
+        published, left = self._run(
+            "_head_busy_loop", steps, work=None, calls=calls, relayed=[self.STORED]
+        )
+        assert calls == ["serving", "shutdown"]
+        assert published == [("serving", [self.STORED])]
+        assert left == []
 
     def test_a_publisher_error_is_logged_and_masks_no_step_error(self, caplog):
         def fail(events):
@@ -799,6 +823,7 @@ def test_disagg_decode_publishes_each_steps_events():
         return events
 
     scheduler = SimpleNamespace(
+        kv_connector=None,
         block_manager=SimpleNamespace(take_events=take_events),
         kv_event_publisher=SimpleNamespace(publish=published.append),
         has_requests=lambda: True,

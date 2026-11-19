@@ -101,6 +101,7 @@ class _Engine:
         self._generation_paused = False
         self.forwards = 0
         self.dummies = 0
+        self.idle_publishes = []
 
     def _advance(self):
         self._pass += 1
@@ -147,6 +148,9 @@ class _Engine:
 
     def _advance_idle_kv_transfer(self):
         raise AssertionError("no KV work was scripted")
+
+    def _publish_idle_kv_events(self, now):
+        self.idle_publishes.append(now)
 
     def _drain_kv_work_at_exit(self):
         return None
@@ -259,3 +263,19 @@ def test_time_mode_loops_leave_the_origin_alone(class_name):
     """The default path: every deployment that never sets the step interval."""
     engine = _run(class_name, BURST_IDLE_BURST, interval_steps=0)
     assert engine.stats._throughput_last_log_time == 0.0
+
+
+@pytest.mark.parametrize("class_name", ["EngineCore", "DPEngineCoreProc"])
+def test_an_idle_pass_publishes_kv_events_paced(class_name):
+    """What a connector relays (the Mooncake Store's tier) has no step to carry it."""
+    assert _run(class_name, BURST_IDLE_BURST).idle_publishes == [2.0, 3.0]
+    publish, scope = _extract("EngineCore", "_publish_idle_kv_events")
+    scope["KV_IDLE_PUBLISH_INTERVAL_S"] = 0.05
+    published = []
+    engine = SimpleNamespace(
+        _next_idle_kv_publish=0.0,
+        scheduler=SimpleNamespace(publish_kv_events=lambda: published.append(1)),
+    )
+    for now in (1.0, 1.04, 1.06):
+        publish(engine, now)
+    assert published == [1, 1]

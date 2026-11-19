@@ -458,9 +458,13 @@ class MooncakeStoreOffloadScheduler(KVStoreOffloadScheduler):
                 "Mooncake Store offload: relaying the store tier from %s",
                 ",".join(self._store_tier_endpoints),
             )
+        return super().build_connector_meta()
+
+    def relay_kv_events(self) -> None:
+        """Log the store tier's events since the last call with the cache's
+        own, which the scheduler publishes next."""
         if self._store_tier is not None:
             self._block_manager.record_events(self._store_tier.drain())
-        return super().build_connector_meta()
 
     def close(self) -> None:
         if self._store_tier is not None:

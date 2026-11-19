@@ -1736,8 +1736,14 @@ class Scheduler:
 
     def publish_kv_events(self) -> None:
         """Drain BlockManager's event log and publish as one EventBatch. Called
-        by EngineCore at the end of each scheduler step. No-op when events are
-        disabled (NullEventPublisher swallows the publish call)."""
+        by EngineCore at the end of each scheduler step, and paced while idle.
+        No-op when events are disabled (NullEventPublisher swallows the publish
+        call)."""
+        relay = getattr(self.kv_connector, "relay_kv_events", None)
+        if callable(relay):
+            # What the connector relays (the Mooncake Store's tier) goes out
+            # with the cache's own events.
+            relay()
         events = self.block_manager.take_events()
         if events:
             self.kv_event_publisher.publish(events)

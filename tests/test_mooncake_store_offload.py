@@ -2264,6 +2264,7 @@ def test_the_scheduler_relays_the_store_tier_with_its_kv_events(cluster):
         for seq in range(200):
             publisher.send_multipart([b"", seq.to_bytes(8, "big"), batch])
             scheduler.build_connector_meta()
+            scheduler.relay_kv_events()
             if recorded:
                 break
             time.sleep(0.05)
@@ -2271,6 +2272,17 @@ def test_the_scheduler_relays_the_store_tier_with_its_kv_events(cluster):
     finally:
         scheduler.close()
         publisher.close(linger=0)
+
+
+def test_the_scheduler_publishes_what_its_connector_relays():
+    events = []
+    scheduler = SimpleNamespace(
+        kv_connector=SimpleNamespace(relay_kv_events=lambda: events.append("relayed")),
+        block_manager=SimpleNamespace(take_events=lambda: events[:]),
+        kv_event_publisher=SimpleNamespace(publish=events.append),
+    )
+    Scheduler.publish_kv_events(scheduler)
+    assert events == ["relayed", ["relayed"]]
 
 
 def test_one_dp_rank_relays_the_store_tier_of_an_engine(cluster):
