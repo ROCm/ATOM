@@ -279,15 +279,16 @@ pub struct CliArgs {
     #[arg(long, default_value_t = 9003, help_heading = "Routing Policy")]
     pub mooncake_admin_port: u16,
 
-    /// With --kv-events, how long a request waits for the store its worker loads from to
-    /// say what it holds of the prompt, in milliseconds; later answers are dropped
+    /// With --kv-storage-weight, how long a request waits for the stores its workers load
+    /// from to say what they hold of the prompt, in milliseconds; later answers are dropped
     #[arg(long, default_value_t = 3, help_heading = "Routing Policy")]
     pub kv_storage_deadline_ms: u64,
 
-    /// With --kv-events, the fraction of requests (0 to 1) whose worker's store is asked,
-    /// of those it could add cached tokens to; the others neither wait nor get an estimate
-    #[arg(long, default_value_t = 0.1, value_parser = parse_fraction, help_heading = "Routing Policy")]
-    pub kv_storage_sample_rate: f64,
+    /// With --kv-events, what a token a worker's engine will load from the Mooncake Store
+    /// it reads counts for in cache_aware's match rate (0 to 1), against one its device
+    /// cache holds. Above 0, a request waits for the stores that could add to it; 0 asks none
+    #[arg(long, default_value_t = 0.0, value_parser = parse_fraction, help_heading = "Routing Policy")]
+    pub kv_storage_weight: f64,
 
     // ==================== PD Disaggregation ====================
     /// Enable PD (Prefill-Decode) disaggregated mode
@@ -704,7 +705,7 @@ impl CliArgs {
             .kv_events(self.kv_events)
             .mooncake_admin_port(self.mooncake_admin_port)
             .kv_storage_deadline_ms(self.kv_storage_deadline_ms)
-            .kv_storage_sample_rate(self.kv_storage_sample_rate)
+            .kv_storage_weight(self.kv_storage_weight)
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
             .build()
@@ -911,7 +912,7 @@ impl Default for CliArgs {
             kv_events: false,
             mooncake_admin_port: 9003,
             kv_storage_deadline_ms: 3,
-            kv_storage_sample_rate: 0.1,
+            kv_storage_weight: 0.0,
             pd_disaggregation: false,
             decode: Vec::new(),
             prefill_policy: None,

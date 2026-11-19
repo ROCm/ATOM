@@ -41,14 +41,21 @@ pub(crate) trait PrefixMatchProvider: Send + Sync + Debug {
     /// index's writer.
     fn on_routed(&self, _tokens: &[u32], _worker: &dyn Worker) {}
 
-    /// The tokens of `tokens` `worker`'s engine will report cached when its device cache
-    /// holds `device` of them, with what it loads from a store; None when that is unknown.
+    /// The tokens of `tokens` each worker's engine will report cached, in the order of
+    /// `workers`, when its device cache holds what `device` says: that, with what it then
+    /// loads from a store `store_weight` counts; None where that store does not answer.
     async fn cached_tokens(
         &self,
-        _worker: &dyn Worker,
         _tokens: &[u32],
-        device: u32,
-    ) -> Option<u32> {
-        Some(device)
+        _workers: &[Arc<dyn Worker>],
+        device: &[Option<u32>],
+    ) -> Vec<Option<u32>> {
+        device.to_vec()
+    }
+
+    /// What a token an engine loads from a store counts for in a match rate, against one
+    /// its device cache holds: 0 while no store is asked.
+    fn store_weight(&self) -> f64 {
+        0.0
     }
 }

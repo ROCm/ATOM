@@ -86,8 +86,6 @@ pub struct StorageSources {
     admin_port: u16,
     /// How long a lookup waits, from its first request to its last answer.
     deadline: Duration,
-    /// The fraction of the prompts a store could add to that are looked up.
-    sample_rate: f64,
     client: reqwest::Client,
     sources: Mutex<Vec<StorageSource>>,
 }
@@ -97,16 +95,9 @@ impl StorageSources {
         Self {
             admin_port,
             deadline,
-            sample_rate: 1.0,
             client,
             sources: Mutex::new(Vec::new()),
         }
-    }
-
-    /// Looks up `rate` of the prompts a store could add to; the others get no estimate.
-    pub fn sampled(mut self, rate: f64) -> Self {
-        self.sample_rate = rate;
-        self
     }
 
     /// Makes `worker` a reader of the store `offload` reports, and of no other.
@@ -158,29 +149,48 @@ impl StorageSources {
         remove_reader(&mut self.sources.lock(), worker);
     }
 
-    /// The tokens of `tokens` `worker`'s engine reports cached when its device cache holds
-    /// `device` of them, after it loads what it will from the store it reads, if any; None
-    /// when the prompt is not sampled or that store does not answer.
-    pub async fn cached_tokens(&self, worker: &str, tokens: &[u32], device: u32) -> Option<u32> {
-        let read = self
-            .sources
-            .lock()
-            .iter()
-            .find(|s| s.readers.contains(worker))
-            .map(|s| Read {
-                id: s.id.clone(),
-                report: s.report.clone(),
-                admins: (s.report.masters.iter())
-                    .map(|master| mooncake::admin_url(master, self.admin_port))
-                    .collect(),
-                readable: s.chain_check_passed,
-                lookups: s.lookups.clone(),
-                deadline: self.deadline,
-                sample_rate: self.sample_rate,
-            });
-        match read {
-            Some(read) => read.cached_tokens(&self.client, tokens, device).await,
-            None => Some(device),
+    /// The tokens of `tokens` each worker's engine reports cached, given the tokens its
+    /// device cache holds, after it loads what it will from the store it reads, if any;
+    /// None where that store does not answer. Every store is asked once, all at once.
+    pub async fn cached_tokens(&self, tokens: &[u32], workers: &[(&str, u32)]) -> Vec<Option<u32>> {
+        let reads: Vec<(Read, Vec<usize>)> = (self.sources.lock().iter())
+            .filter_map(|source| {
+                let readers: Vec<usize> = (0..workers.len())
+                    .filter(|&i| source.readers.contains(workers[i].0))
+                    .collect();
+                (!readers.is_empty()).then(|| (self.read(source), readers))
+            })
+            .collect();
+        let held = join_all(reads.iter().map(|(read, readers)| {
+            let device = readers
+                .iter()
+                .map(|&i| workers[i].1)
+                .min()
+                .unwrap_or_default();
+            read.held(&self.client, tokens, device)
+        }))
+        .await;
+        let prompt = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
+        let mut cached: Vec<Option<u32>> =
+            workers.iter().map(|&(_, device)| Some(device)).collect();
+        for ((read, readers), held) in reads.iter().zip(held) {
+            for &i in readers {
+                cached[i] = held.map(|held| read.cached(held, prompt, workers[i].1));
+            }
+        }
+        cached
+    }
+
+    fn read(&self, source: &StorageSource) -> Read {
+        Read {
+            id: source.id.clone(),
+            report: source.report.clone(),
+            admins: (source.report.masters.iter())
+                .map(|master| mooncake::admin_url(master, self.admin_port))
+                .collect(),
+            readable: source.chain_check_passed,
+            lookups: source.lookups.clone(),
+            deadline: self.deadline,
         }
     }
 

@@ -221,10 +221,10 @@ impl ConfigValidator {
             });
         }
 
-        if !(0.0..=1.0).contains(&config.kv_storage_sample_rate) {
+        if !(0.0..=1.0).contains(&config.kv_storage_weight) {
             return Err(ConfigError::InvalidValue {
-                field: "kv_storage_sample_rate".to_string(),
-                value: config.kv_storage_sample_rate.to_string(),
+                field: "kv_storage_weight".to_string(),
+                value: config.kv_storage_weight.to_string(),
                 reason: "Must be between 0 and 1".to_string(),
             });
         }
@@ -459,17 +459,14 @@ mod tests {
     }
 
     #[test]
-    fn kv_storage_sample_rate_must_be_a_fraction() {
-        for rate in [-0.1, 1.5, f64::NAN] {
+    fn kv_storage_weight_must_be_a_fraction() {
+        for weight in [-0.1, 1.5, f64::NAN] {
             let config = RouterConfig {
-                kv_storage_sample_rate: rate,
+                kv_storage_weight: weight,
                 ..Default::default()
             };
             let error = config.validate().unwrap_err();
-            assert!(
-                error.to_string().contains("kv_storage_sample_rate"),
-                "{error}"
-            );
+            assert!(error.to_string().contains("kv_storage_weight"), "{error}");
         }
     }
 

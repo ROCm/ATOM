@@ -68,7 +68,7 @@ pub struct KvEventMonitor {
     /// while its partition has no lane left.
     predictors: DashMap<String, Option<Predictor>>,
     partitions: DashMap<(String, &'static str, u32), Arc<Partition>>,
-    stores: OnceLock<Arc<StorageSources>>,
+    stores: OnceLock<(Arc<StorageSources>, f64)>,
     threads: Handle,
     runtime: Option<Runtime>,
 }
@@ -217,9 +217,9 @@ impl KvEventMonitor {
     }
 
     /// Counts, in what a worker's engine will report cached, what it loads from the store
-    /// it reads among `stores`.
-    pub fn read_stores(&self, stores: Arc<StorageSources>) {
-        let _ = self.stores.set(stores);
+    /// it reads among `stores`, and in its match rate `weight` of each of those tokens.
+    pub fn read_stores(&self, stores: Arc<StorageSources>, weight: f64) {
+        let _ = self.stores.set((stores, weight));
     }
 
     fn partition(&self, model_id: &str, pool: &'static str, block_size: u32) -> Arc<Partition> {
@@ -297,14 +297,33 @@ impl PrefixMatchProvider for KvEventMonitor {
         }
     }
 
-    async fn cached_tokens(&self, worker: &dyn Worker, tokens: &[u32], device: u32) -> Option<u32> {
-        match self.stores.get() {
-            // A decode worker takes the prompt's KV from its prefill worker.
-            Some(stores) if !matches!(worker.worker_type(), WorkerType::Decode) => {
-                stores.cached_tokens(worker.url(), tokens, device).await
-            }
-            _ => Some(device),
+    async fn cached_tokens(
+        &self,
+        tokens: &[u32],
+        workers: &[Arc<dyn Worker>],
+        device: &[Option<u32>],
+    ) -> Vec<Option<u32>> {
+        let mut cached = device.to_vec();
+        let Some((stores, _)) = self.stores.get() else {
+            return cached;
+        };
+        // A decode worker takes the prompt's KV from its prefill worker.
+        let (readers, asked): (Vec<usize>, Vec<(&str, u32)>) = (workers.iter().zip(device))
+            .enumerate()
+            .filter(|(_, (worker, _))| !matches!(worker.worker_type(), WorkerType::Decode))
+            .filter_map(|(i, (worker, device))| Some((i, (worker.url(), (*device)?))))
+            .unzip();
+        for (i, found) in readers
+            .into_iter()
+            .zip(stores.cached_tokens(tokens, &asked).await)
+        {
+            cached[i] = found;
         }
+        cached
+    }
+
+    fn store_weight(&self) -> f64 {
+        self.stores.get().map_or(0.0, |(_, weight)| *weight)
     }
 }
 

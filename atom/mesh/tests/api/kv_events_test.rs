@@ -426,8 +426,8 @@ fn stored(hashes: &[u64], tokens: &[u32]) -> Bytes {
 /// With `cache_aware`, a request whose tokens a worker's device cache holds goes to that
 /// worker, whatever the tree learned: its `input_ids`, or its prompt or chat encoded with
 /// the special tokens, as ATOM stores the blocks. One with media is placed by its text.
-/// What the engine will load of the request from the store the worker reads is asked of
-/// the store by ATOM's keys.
+/// What the engine will load of the request from the store the worker reads, which counts
+/// with `--kv-storage-weight`, is asked of the store by ATOM's keys.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cache_aware_places_requests_by_the_kv_event_index() {
     let mut publisher = PubSocket::new();
@@ -459,7 +459,7 @@ async fn cache_aware_places_requests_by_the_kv_event_index() {
     config.kv_events = true;
     config.mooncake_admin_port = admin_port;
     config.kv_storage_deadline_ms = 1000;
-    config.kv_storage_sample_rate = 1.0;
+    config.kv_storage_weight = 1.0;
     let ctx = AppTestContext::new_with_config(config, vec![]).await;
     let dir = tempfile::tempdir().unwrap();
     let tokenizer = bos_tokenizer(dir.path());

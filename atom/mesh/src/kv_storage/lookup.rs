@@ -1,7 +1,7 @@
-//! A sampled prompt looked up on the request path in the store a worker reads: ATOM's
-//! keys of its chunks, asked of every pool within a deadline, and what the engine loads of
-//! the prefix the store holds. A source that keeps failing is skipped for a while, and so
-//! are the lookups past a cap on the requests in flight to its pools.
+//! A prompt looked up on the request path in the store its workers read: ATOM's keys of
+//! its chunks, asked of every pool within a deadline, and what each worker's engine loads
+//! of the prefix the store holds. A source that keeps failing is skipped for a while, and
+//! so are the lookups past a cap on the requests in flight to its pools.
 
 use std::{
     sync::{
@@ -12,7 +12,6 @@ use std::{
 };
 
 use parking_lot::Mutex;
-use rand::Rng;
 
 use super::{
     keys,
@@ -111,35 +110,19 @@ pub(super) struct Read {
     pub lookups: Arc<Lookups>,
     /// From the first request to the last answer; later answers are dropped.
     pub deadline: Duration,
-    /// The fraction of the prompts the store could add to that are looked up.
-    pub sample_rate: f64,
 }
 
 impl Read {
-    /// The tokens of `tokens` the engine reports cached when its device cache holds
-    /// `device` of them, after it loads what it will of what the store holds; None when
-    /// the prompt is not sampled or the store does not answer. A sampled prompt costs the
-    /// request the keys of at most `MAX_CHUNKS` chunks, about 1.2 µs each, and at most
-    /// `deadline` of waiting.
-    pub async fn cached_tokens(
-        &self,
-        client: &reqwest::Client,
-        tokens: &[u32],
-        device: u32,
-    ) -> Option<u32> {
+    /// The tokens from the start of `tokens` the store holds, for readers whose device
+    /// caches hold at least `device` of them: 0, unasked, when the engine would load
+    /// nothing past that even if the store held the whole prompt; None when the store does
+    /// not answer. A lookup costs the request the keys of at most `MAX_CHUNKS` chunks,
+    /// about 1.2 µs each, and at most `deadline` of waiting.
+    pub async fn held(&self, client: &reqwest::Client, tokens: &[u32], device: u32) -> Option<u32> {
         let prompt = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
-        let (chunk, min_load) = (self.report.chunk_tokens, self.report.min_load_tokens);
-        let loaded = |hit| {
-            let hit = loadable_hit(hit, prompt, chunk);
-            (load_tokens(device, hit, chunk, min_load) > 0).then_some(hit)
-        };
-        if loaded(prompt).is_none() {
+        if self.cached(prompt, prompt, device) == device {
             self.count("skipped");
-            return Some(device);
-        }
-        if rand::rng().random::<f64>() >= self.sample_rate {
-            self.count("unsampled");
-            return None;
+            return Some(0);
         }
         let held = self.lookup(client, tokens).await;
         self.count(match held {
@@ -147,7 +130,19 @@ impl Read {
             Ok(_) => "hit",
             Err(reason) => reason,
         });
-        Some(loaded(held.ok()?).unwrap_or(device))
+        held.ok()
+    }
+
+    /// The tokens of a prompt of `prompt` the engine reports cached when its device cache
+    /// holds `device` of them and the store `held`: it loads what it will of the latter.
+    pub fn cached(&self, held: u32, prompt: u32, device: u32) -> u32 {
+        let (chunk, min_load) = (self.report.chunk_tokens, self.report.min_load_tokens);
+        let hit = loadable_hit(held, prompt, chunk);
+        if load_tokens(device, hit, chunk, min_load) > 0 {
+            hit
+        } else {
+            device
+        }
     }
 
     fn count(&self, result: &'static str) {
@@ -240,6 +235,7 @@ mod tests {
     use serde_json::{json, Map};
 
     use super::*;
+    use crate::kv_storage::StorageSources;
 
     #[test]
     fn the_engine_loads_a_hit_that_adds_enough_past_its_device_cache() {
@@ -332,8 +328,19 @@ mod tests {
             readable: true,
             lookups: Arc::default(),
             deadline: Duration::from_millis(500),
-            sample_rate: 1.0,
         }
+    }
+
+    /// What the engine reports cached of `prompt` with `device` of it on its device, by
+    /// what `read`'s store holds; None when the store does not answer.
+    async fn estimate(
+        read: &Read,
+        client: &reqwest::Client,
+        prompt: &[u32],
+        device: u32,
+    ) -> Option<u32> {
+        let held = read.held(client, prompt, device).await?;
+        Some(read.cached(held, prompt.len() as u32, device))
     }
 
     #[tokio::test]
@@ -345,7 +352,7 @@ mod tests {
         let read = source(admin.clone()).await;
         let client = reqwest::Client::new();
         let prompt: Vec<u32> = (0..64).collect();
-        let cached = |device| read.cached_tokens(&client, &prompt, device);
+        let cached = |device| estimate(&read, &client, &prompt, device);
 
         // All 4 chunks held: the engine loads 3 of them, from the chunk boundary at or
         // below what its device holds.
@@ -390,7 +397,7 @@ mod tests {
             lookups: Arc::default(),
             ..read
         };
-        let cached = |device| unreadable.cached_tokens(&client, &prompt, device);
+        let cached = |device| estimate(&unreadable, &client, &prompt, device);
         assert_eq!(cached(0).await, None);
         assert_eq!(admin.asked.load(Ordering::Relaxed), 10);
 
@@ -419,24 +426,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unsampled_prompt_is_not_looked_up() {
-        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
-        let handle = recorder.handle();
-        let _recorder = metrics::set_default_local_recorder(&recorder);
+    async fn a_store_is_asked_once_for_the_workers_that_read_it() {
         let admin = Arc::new(Admin::default());
-        let read = Read {
-            sample_rate: 0.0,
-            ..source(admin.clone()).await
+        let read = source(admin.clone()).await;
+        let port = read.admins[0].rsplit_once(':').unwrap().1.parse().unwrap();
+        let sources = StorageSources::new(port, read.deadline, reqwest::Client::new());
+        let report = OffloadReport {
+            masters: vec!["127.0.0.1:50051".into()],
+            chain_check: keys::chain_check(16),
+            ..read.report.clone()
         };
-        let client = reqwest::Client::new();
+        sources.add("http://a:8000", "m", &report);
+        sources.add("http://b:8000", "m", &report);
         let prompt: Vec<u32> = (0..64).collect();
-        // Its estimate is unknown, unless the store could not add to it anyway.
-        assert_eq!(read.cached_tokens(&client, &prompt, 0).await, None);
-        assert_eq!(read.cached_tokens(&client, &prompt, 48).await, Some(48));
-        assert_eq!(admin.asked.load(Ordering::Relaxed), 0);
-        let line = r#"mesh_kv_storage_lookups_total{source="atom-mooncake-01234567",result="unsampled"} 1"#;
-        let rendered = handle.render();
-        assert!(rendered.contains(line), "missing {line} in\n{rendered}");
+        let workers = [
+            ("http://a:8000", 0),
+            ("http://b:8000", 40),
+            ("http://c:8000", 10),
+        ];
+        // Each reader loads past its own device cache; c reads no store.
+        admin.held.store(3, Ordering::Relaxed);
+        let cached = sources.cached_tokens(&prompt, &workers).await;
+        assert_eq!(cached, [Some(48), Some(48), Some(10)]);
+        assert_eq!(admin.asked.load(Ordering::Relaxed), 1);
+        admin.fail.store(true, Ordering::Relaxed);
+        let cached = sources.cached_tokens(&prompt, &workers).await;
+        assert_eq!(cached, [None, None, Some(10)]);
     }
 
     #[tokio::test]
@@ -446,9 +461,7 @@ mod tests {
         // The pool holds every key it is asked for, besides the taint key.
         admin.held.store(mooncake::BATCH_KEYS, Ordering::Relaxed);
         let prompt: Vec<u32> = (0..(MAX_CHUNKS as u32 + 10) * 16).collect();
-        let cached = read
-            .cached_tokens(&reqwest::Client::new(), &prompt, 0)
-            .await;
+        let cached = estimate(&read, &reqwest::Client::new(), &prompt, 0).await;
         assert_eq!(cached, Some(MAX_CHUNKS as u32 * 16));
         assert_eq!(
             admin.asked.load(Ordering::Relaxed),

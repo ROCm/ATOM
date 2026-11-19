@@ -379,8 +379,8 @@ impl RouterConfigBuilder {
         self
     }
 
-    pub fn kv_storage_sample_rate(mut self, rate: f64) -> Self {
-        self.config.kv_storage_sample_rate = rate;
+    pub fn kv_storage_weight(mut self, weight: f64) -> Self {
+        self.config.kv_storage_weight = weight;
         self
     }
 

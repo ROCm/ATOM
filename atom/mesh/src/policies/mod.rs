@@ -41,8 +41,7 @@ pub struct RouteDecision {
     /// Expected prefix cache hit ratio on the selected worker, reconciled with the
     /// cached tokens its response reports. `cache_aware`'s tree branches set it only
     /// when the selected worker is the best candidate, its KV event branch unless the
-    /// store the worker loads from is not asked, for an unsampled request, or does not
-    /// answer; other policies leave it None.
+    /// store the worker loads from does not answer; other policies leave it None.
     pub estimated_hit_ratio: Option<f64>,
 }
 
