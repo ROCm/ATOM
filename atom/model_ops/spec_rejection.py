@@ -38,6 +38,7 @@ least recently scheduled recycled first, as the presence-penalty slots are. TP1
 LM heads only: the draft draws are per rank.
 """
 
+import os
 from collections import OrderedDict
 
 import numpy as np
@@ -49,6 +50,12 @@ _EPS = (
     1e-10  # the sampler's greedy floor (SAMPLER_EPS): temperatures arrive clamped to it
 )
 _PINNED_RING = 8  # host staging buffers for the per-step slot ids (async H2D)
+# ATOM_MTP_DRAFT_FUSED_SELECT=1 (with ATOM_MTP_DRAFT_DEVICE_RNG and aiter's Gluon
+# select): the draft draw's uniform (`_draft_uniform_kernel`'s Philox draw, the
+# counter advanced by the stats kernel), the copy of the tokens to the pass's
+# ids and the draft presence record (`DraftPresencePenalty.record`) made in the
+# sampler's kernels: three launches fewer a pass, the same bits.
+_FUSED_SELECT = os.environ.get("ATOM_MTP_DRAFT_FUSED_SELECT", "0") == "1"
 
 
 def _kb(k: int) -> int:
@@ -193,6 +200,8 @@ class SpecRejectionSampling:
         self._free = list(range(self.num_slots - 1, -1, -1))
         self._presence = None
         self.active_bs = 0
+        # set by sample_draft: the draft presence record was made in its kernel
+        self.recorded_presence = False
 
     # ---- per step (eager) -------------------------------------------------
     def _slots_for(self, req_ids) -> np.ndarray:
@@ -303,6 +312,34 @@ class SpecRejectionSampling:
         u = self.u_draft[:rows]
         from atom.utils import envs
 
+        gluon_ok = tts.topk_topp_sample_gluon_select_supported(logits, self.draft_k)
+        self.recorded_presence = False
+        if (
+            _FUSED_SELECT
+            and envs.ATOM_MTP_DRAFT_DEVICE_RNG
+            and gluon_ok
+            and out.is_contiguous()
+            and out.numel() == rows
+        ):
+            rec = None
+            if draft_presence is not None:
+                rec = (draft_presence.ctx, draft_presence.pos, draft_presence.ctx_width)
+            tts.topk_topp_sample(
+                logits,
+                self.row_temp,
+                self.draft_k,
+                self.row_topp,
+                eps=_EPS,
+                out=self.tok_scratch[:rows],
+                debug=self.dbg_scratch[:rows],
+                presence=self._presence_args(draft_presence),
+                gluon_select=True,
+                rng_state=(self._rng_state, self._rng_seed),
+                out2=out.view(-1),
+                record=rec,
+            )
+            self.recorded_presence = rec is not None
+            return out
         if envs.ATOM_MTP_DRAFT_DEVICE_RNG:
             _draft_uniform_kernel[(1,)](
                 u,

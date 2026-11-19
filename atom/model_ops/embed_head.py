@@ -503,7 +503,10 @@ class ParallelLMHead(VocabParallelEmbedding):
                 # The verify's sampler draws the draft, the draft presence
                 # penalty applied in its kernel (no separate vocab pass).
                 draft_rs.sample_draft(logits, out, draft_presence)
-                if draft_presence is not None:
+                # ATOM_MTP_DRAFT_FUSED_SELECT: recorded in the sampler's kernel
+                if draft_presence is not None and not getattr(
+                    draft_rs, "recorded_presence", False
+                ):
                     draft_presence.record(out)
                 return out
             if draft_presence is not None:
