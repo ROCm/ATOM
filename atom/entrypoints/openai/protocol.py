@@ -48,6 +48,14 @@ PromptTokenIds = list[NonNegativeInt]
 _PROMPT_TOKEN_IDS_ADAPTER = TypeAdapter(PromptTokenIds)
 
 
+def check_media_handoff(kv_transfer_params: dict[str, Any] | None) -> None:
+    """Reject a media handoff key that is not an integer."""
+    handoff = kv_transfer_params or {}
+    for key in ("cache_seed", "mrope_position_delta"):
+        if key in handoff and type(handoff[key]) is not int:
+            raise ValueError(f"kv_transfer_params[{key!r}] must be an integer")
+
+
 def resolve_prompt_token_ids(
     prompt_token_ids: PromptTokenIds | None,
     kv_transfer_params: dict[str, Any] | None,
@@ -56,6 +64,7 @@ def resolve_prompt_token_ids(
 
     Reject empty lists and conflicting IDs between the two locations.
     """
+    check_media_handoff(kv_transfer_params)
     from_kv = (kv_transfer_params or {}).get("prompt_token_ids")
     if prompt_token_ids is None and from_kv is None:
         return None

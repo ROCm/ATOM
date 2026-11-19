@@ -362,10 +362,12 @@ class ScheduledBatch:
             for seq in seqs.values()
             if getattr(seq, "mrope_positions", None) is not None
         }
+        # A decode leg has no positions, only the delta its prefill handed it.
         self.mrope_position_deltas = {
             seq.id: getattr(seq, "mrope_position_delta", 0)
             for seq in seqs.values()
             if getattr(seq, "mrope_positions", None) is not None
+            or getattr(seq, "mrope_position_delta", 0)
         }
 
         # num_cached_tokens for chunked prefill support
@@ -4178,11 +4180,8 @@ class Scheduler:
         # surrendered blocks (the mutator half of `should_defer_free`'s escape).
         self._connector_release_stalled_save(seq)
         self.block_manager.deallocate(seq)
-        if seq.multimodal_data is None and "cache_seed" in (
-            seq.kv_transfer_params or {}
-        ):
-            # A decode leg's image stayed with its prefill instance: a local
-            # recompute would read the image placeholders as text.
+        if seq.media_on_prefill_instance:
+            # A local recompute would read the image placeholders as text.
             self._finish_rejected_waiting(
                 seq, reason="unschedulable: preempted image decode has no media"
             )

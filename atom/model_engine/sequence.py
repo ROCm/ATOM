@@ -312,6 +312,10 @@ class Sequence:
         # A decode leg has no media: it keeps what its prefill derived from it.
         handoff = kv_transfer_params or {}
         self.cache_seed = handoff.get("cache_seed", -1)
+        # A decode leg whose prefill kept the media: it cannot recompute.
+        self.media_on_prefill_instance = (
+            multimodal_data is None and "cache_seed" in handoff
+        )
         if multimodal_data is not None:
             from atom.model_engine.multimodal_runtime import multimodal_cache_seed
 

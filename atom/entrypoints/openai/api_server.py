@@ -1058,9 +1058,7 @@ async def generate_async_multimodal(
 
     def completion_callback(request_output: RequestOutput):
         nonlocal kv_transfer_output_meta_info
-        kv_transfer_output_meta_info = getattr(
-            request_output, "kv_transfer_params_output", None
-        )
+        kv_transfer_output_meta_info = request_output.kv_transfer_params_output
         now = time.time()
         loop.call_soon_threadsafe(
             token_queue.put_nowait,
@@ -2221,9 +2219,12 @@ async def _chat_completions(
         kv_transfer_params = request.kv_transfer_params
         pretokenized = request.get_prompt_token_ids()
         # A decode leg takes its prefill's expanded ids; its media went to P.
+        # Without P's cache seed its blocks would hash as text: keep the media.
+        handoff = kv_transfer_params or {}
         is_multimodal = _has_multimodal_content(messages) and not (
             pretokenized is not None
-            and (kv_transfer_params or {}).get("do_remote_prefill")
+            and handoff.get("do_remote_prefill")
+            and "cache_seed" in handoff
         )
         if assistant_prefix is not None and (is_multimodal or pretokenized is not None):
             # Only rendered text can be continued.
