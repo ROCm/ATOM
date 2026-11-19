@@ -159,6 +159,49 @@ def test_flag_off_builds_no_stream(cuda, monkeypatch):
     assert cuda == []
 
 
+def _init_call_lines(name):
+    """Lines in `ModelRunner.__init__` that call `name`, outermost first."""
+    module = ast.parse(MODEL_RUNNER.read_text())
+    owner = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.ClassDef) and node.name == "ModelRunner"
+    )
+    init = next(
+        node
+        for node in owner.body
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+    )
+    lines = []
+    for node in ast.walk(init):
+        if not isinstance(node, ast.Call):
+            continue
+        f = node.func
+        called = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", None)
+        if called == name:
+            lines.append(node.lineno)
+    return sorted(lines)
+
+
+def test_the_thread_switches_streams_only_once_the_weights_are_loaded():
+    """The loader hands each `weight_loader` to a thread pool, and those
+    threads launch on the default stream, which a non-blocking stream is not
+    ordered against. Switching before the load leaves the init `zero_`s and
+    `process_weights_after_loading` racing the copies, for silently wrong
+    weights. `enter_compute_stream` drains the device before it switches, so
+    the ordering is the call's position in `__init__`.
+    """
+    switch = _init_call_lines("enter_compute_stream")
+    assert len(switch) == 1, "one switch, or this test checks the wrong one"
+    loads = _init_call_lines("_build_and_load_model") + _init_call_lines("load_model")
+    assert loads, "no model load found in __init__; has it been renamed?"
+
+    assert switch[0] > max(loads), (
+        f"enter_compute_stream at line {switch[0]} runs before a model load at "
+        f"{sorted(loads)}; the loader threads' copies are unordered against it"
+    )
+
+
 @pytest.mark.parametrize("flag", ["0", "1"])
 def test_rapidserve_prefill_and_decode_pools_share_a_priority(
     runner, monkeypatch, flag

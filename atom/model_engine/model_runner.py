@@ -876,7 +876,6 @@ class ModelRunner:
 
         self.attn_backend = get_attn_backend(self.attn_family)
         self._setup_device_and_distributed(rank, config)
-        self.compute_stream = enter_compute_stream(self.config, self.device)
 
         self.capture_sizes = [0]  # for eager fallback
         # The same ladder as an ASCENDING int32 array, which is what
@@ -983,6 +982,14 @@ class ModelRunner:
             # forward returns the final (concatenated) output. See arm_aux_capture.
 
         torch.set_default_device(self.device)
+        # Only now that every weight is loaded: the loader hands each
+        # `weight_loader` to a thread pool whose threads launch on the default
+        # stream, and a non-blocking stream is not ordered against it, so the
+        # init `zero_`s and `process_weights_after_loading` could race the
+        # copies. Draining is what `enter_compute_stream` does before it
+        # switches. Graph capture and the first forward are still below, and
+        # only the stream a graph is launched from matters.
+        self.compute_stream = enter_compute_stream(self.config, self.device)
         self.async_execute_stream = torch.cuda.Stream(self.device)
         self.allocate_forward_vars()
         self._arm_lossless(config)
