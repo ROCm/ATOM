@@ -8,7 +8,6 @@ GPU GEMM/RoPE arithmetic is stubbed here; bit-exact GPU validation is separate.
 
 import ast
 import importlib.util
-import inspect
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -47,7 +46,6 @@ def projection(monkeypatch):
         in {
             "_mla_absorb_bf16_enabled",
             "_mla_absorb_bf16_fuse_qout_enabled",
-            "_mla_q_nope_prestored_supported",
         }
     ]
     assert {n.name for n in methods} == method_names
@@ -56,7 +54,6 @@ def projection(monkeypatch):
     namespace = {
         "torch": torch,
         "envs": envs,
-        "inspect": inspect,
         "is_rocm_aiter_fp4bmm_enabled": lambda: False,
         "qrep_for_step": lambda *args: False,
         "pcp_is_enabled": lambda: False,
@@ -131,38 +128,13 @@ def test_bf16_k_up_writes_strided_q_nope_slice_without_touching_rope(projection,
     assert torch.equal(rope, x.reshape(tokens, 3, 6)[..., 4:])
 
 
-@pytest.mark.parametrize("arch", ["gfx942", "gfx950", "gfx1250", "gfx1250-strict"])
-@pytest.mark.parametrize("kernel_available", [False, True])
-@pytest.mark.parametrize("new_api", [False, True])
-def test_capability_requires_arch_kernel_and_public_parameter(
-    projection, arch, kernel_available, new_api
-):
-    _, namespace, _ = projection
-    namespace["triton_fused_kv_cache"] = SimpleNamespace(
-        DEVICE_ARCH=arch, gluon_qpe_htile_kernel=object() if kernel_available else None
-    )
-
-    def old(q):
-        pass
-
-    def new(q, q_nope_prestored=False):
-        pass
-
-    namespace["triton_fused_qk_rope_cat_and_cache_mla"] = new if new_api else old
-    assert namespace["_mla_q_nope_prestored_supported"]() == (
-        arch in ("gfx1250", "gfx1250-strict") and kernel_available and new_api
-    )
-
-
 @pytest.mark.parametrize(
     "case",
     [
         "on",
         "off",
         "small",
-        "gfx950",
-        "missing_gluon",
-        "old_api",
+        "unsupported",
         "scaled_weight",
         "unshuffled",
         "fp4",
@@ -181,24 +153,9 @@ def test_forward_selects_prestored_only_for_supported_decode(
     tokens = 63 if case == "small" else 64
     if case == "off":
         monkeypatch.setenv("ATOM_MLA_ABSORB_BF16_FUSE_QOUT", "0")
-    if case in ("gfx950", "missing_gluon", "old_api"):
-        namespace["triton_fused_kv_cache"] = SimpleNamespace(
-            DEVICE_ARCH="gfx950" if case == "gfx950" else "gfx1250",
-            gluon_qpe_htile_kernel=None if case == "missing_gluon" else object(),
-        )
-
-        def api(q, q_nope_prestored=False):
-            pass
-
-        def old(q):
-            pass
-
-        namespace["triton_fused_qk_rope_cat_and_cache_mla"] = (
-            old if case == "old_api" else api
-        )
-        layer._q_nope_prestored_supported = namespace[
-            "_mla_q_nope_prestored_supported"
-        ]()
+    if case == "unsupported":
+        # aiter's q_nope_prestored_supported() said no (gfx942/950).
+        layer._q_nope_prestored_supported = False
     layer.kv_shuffled = case not in ("unshuffled", "seg", "head_pad", "dcp")
     layer.use_seg_mla = case == "seg"
     layer._fused_q_head_pad = case == "head_pad"
@@ -221,8 +178,6 @@ def test_forward_selects_prestored_only_for_supported_decode(
 
     def rope(*args, **kwargs):
         seen["rope_kwargs"] = kwargs
-        if case == "old_api":
-            assert "q_nope_prestored" not in kwargs
 
     namespace.update(
         {
