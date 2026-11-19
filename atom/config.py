@@ -16,6 +16,8 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import torch
 from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 
+from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+from atom.kv_transfer.disaggregation.multi.multi_connector import validate_multi_config
 from atom.model_engine.capabilities import pcp_group_size_of
 from atom.model_engine.prefill_delayer import PREFILL_ADMIT_POLICIES
 from atom.model_loader.weight_utils import (
@@ -27,6 +29,7 @@ from atom.model_loader.weight_utils import (
 from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
     MQA_LOGITS_PRESHUFFLE_ROWS,
 )
+from atom.model_ops.indexer.layout import MFMA, PRESHUFFLE
 from atom.plugin import is_plugin_mode, is_vllm
 from atom.plugin.config import PluginConfig
 from atom.quant_spec import (
@@ -1095,6 +1098,14 @@ class ParallelConfig:
 
     data_parallel_master_ip: str = "127.0.0.1"
 
+    tensor_parallel_size_local: int | None = None
+    """TP ranks (model-runner workers) this node runs. None means all of them,
+    the single-node case. Set it below tensor_parallel_size to spread one TP
+    group over several nodes; see atom/model_engine/tp_multinode.py."""
+    tensor_parallel_rank: int = 0
+    """First TP rank this node runs. The node that runs rank 0 also runs the
+    engine and the API server; the others run only their workers."""
+
     @property
     def is_multinode_dp(self) -> bool:
         """Whether this node owns only part of the global DP group.
@@ -1827,7 +1838,7 @@ class EPLBConfig:
         return cls(**cfg)
 
 
-DCP_COMM_BACKENDS = ("ag_rs", "a2a")
+DCP_COMM_BACKENDS = ("auto", "ag_rs", "a2a", "mailbox")
 
 
 @dataclass
@@ -1839,7 +1850,8 @@ class DCPConfig:
     interleave_size: int = 1
     enable_query_replication: bool = True
     enable_project_before_merge: bool = True
-    comm_backend: str = "a2a"
+    # "auto" is resolved by Config: "mailbox" where it is validated, else "a2a".
+    comm_backend: str = "auto"
     # Context-parallelize the MiniMax-M3 lightning indexer INSTEAD of the KV
     # cache: every rank scores all index heads over 1/P of the blocks, then an
     # all-to-all routes each head's candidates to the rank that owns it. Sparse
@@ -1982,15 +1994,23 @@ def qrep_for_step(
     return qrep_enabled and not use_seg_mla and (not is_prefill or prefill_qrep)
 
 
+# The FP4 cache dtypes: "fp4" is MXFP4 (e2m1 + e8m0 per 32), "nvfp4" is NVFP4
+# (e2m1 + e4m3 per 16).
+FP4_CACHE_DTYPES = ("fp4", "nvfp4")
+
+
 def _check_fp4_kv(kv_cache_dtype: str, *, is_m3: bool, is_v41: bool) -> None:
-    """``--kv-cache-dtype fp4`` is MiniMax-M3.1's to ask for and DeepSeek-V4.1's own;
-    refused for every other model. The guard admits the MiniMax-M3 architecture and
+    """``--kv-cache-dtype fp4`` (MXFP4) is MiniMax-M3.1's to ask for and DeepSeek-V4.1's
+    own, and ``nvfp4`` is MiniMax-M3's alone; each is refused for every other model.
+    The guard admits the MiniMax-M3 architecture and
     ``minimax_m3.config.validate_runtime_config`` then refuses what is not M3.1
     (a model with dense attention layers)."""
     if kv_cache_dtype == "fp4" and not (is_m3 or is_v41):
         raise ValueError(
             "--kv-cache-dtype fp4 is supported by MiniMax-M3.1 and DeepSeek-V4.1 only"
         )
+    if kv_cache_dtype == "nvfp4" and not is_m3:
+        raise ValueError("--kv-cache-dtype nvfp4 is supported by MiniMax-M3 only")
 
 
 def resolve_draft_kv_dtype(
@@ -1999,8 +2019,8 @@ def resolve_draft_kv_dtype(
     """The KV dtype of a speculative draft's pages.
 
     A draft with a pool of its own (``own_pool``) takes the dtype it ``requested``
-    (``--spec-decode-kv-cache-dtype``), else the target's, except bf16 under an fp4
-    target, which has no draft layout. A draft in the target's pool has the
+    (``--spec-decode-kv-cache-dtype``), else the target's, except bf16 under an FP4
+    target (fp4 / nvfp4), which has no draft layout. A draft in the target's pool has the
     target's dtype and cannot request another.
     """
     # argparse restricts the flag; a Python caller can pass anything
@@ -2018,7 +2038,7 @@ def resolve_draft_kv_dtype(
         return target_dtype
     if requested is not None:
         return requested
-    return "bf16" if target_dtype == "fp4" else target_dtype
+    return "bf16" if target_dtype in FP4_CACHE_DTYPES else target_dtype
 
 
 def indexer_cp_unsupported_reason(
@@ -2029,6 +2049,7 @@ def indexer_cp_unsupported_reason(
     dcp_size: int,
     enable_tbo: bool,
     plugin_mode: bool = False,
+    nvfp4_caches: bool = False,
 ) -> str | None:
     """Why MiniMax-M3 indexer-only context parallelism cannot run here, or None.
 
@@ -2056,6 +2077,8 @@ def indexer_cp_unsupported_reason(
         # error. ``indexer_cp_enabled`` refuses them at runtime; this clears the
         # flag so nothing downstream (log line, compile hash) disagrees.
         return "plugin mode (the vLLM/SGLang bridges keep the TP indexer path)"
+    if nvfp4_caches:
+        return "the NVFP4 caches are not wired to the CP scorer"
     if dcp_size > 1:
         return (
             "decode_context_parallel_size > 1 (KV-cache DCP owns the context "
@@ -2184,6 +2207,25 @@ def _hf_architecture_factor(hf_config) -> tuple:
     return (_hf_config_fields(hf_config), _hf_config_fields(text_config))
 
 
+def _check_mono_poll_sleep_units() -> None:
+    """Reject a bad ATOM_MONO_POLL_SLEEP_UNITS (importing ``atom.mono.polling``
+    raises) before the workers, which read the same environment, spawn; warn
+    once when it is below the default."""
+    from atom.mono import polling
+
+    if polling.POLL_SLEEP_UNITS < polling.DEFAULT:
+        logger.warning(
+            "%s=%d: Mono mailbox polls back off less than the default %d. "
+            "Values below %d hung beside concurrent KV copies (offload or P/D "
+            "connectors) in the reproducer (ROCm/ATOM#3369); use it only on a "
+            "deployment without them.",
+            polling.ENV,
+            polling.POLL_SLEEP_UNITS,
+            polling.DEFAULT,
+            polling.DEFAULT,
+        )
+
+
 @dataclass
 class Config:
     model: str
@@ -2274,9 +2316,9 @@ class Config:
     num_kvcache_blocks: int = -1
     kv_cache_dtype: str = "bf16"
     index_cache_dtype: str | None = None
-    # V4/V4.1 FP4 physical layout, resolved before config is sent to scheduler
-    # and workers. Their PAGE namespace must describe the same stored bytes.
-    index_cache_layout: str | None = field(default=None, init=False)
+    # FP4 physical layout, resolved before config is sent to scheduler/workers.
+    # DSA permits an explicit OPUS opt-in; V4/V4.1 follow their scorer backend.
+    index_cache_layout: str | None = None
     enable_prefix_caching: bool = True
     enable_chunked_prefill: bool = True
     enable_log_stats: bool = True
@@ -2345,6 +2387,7 @@ class Config:
     torch_dtype: torch.dtype = field(init=False)
     speculative_config: SpeculativeConfig | None = None
     kv_transfer_config: dict = field(default_factory=dict)
+    offload_min_load_tokens: int | None = field(default=None, init=False)
     # A frontend's own stable form of its speculative config, which the offload
     # PAGE namespace hashes in place of `speculative_config`: only the frontend
     # knows which of its fields differ between processes. None hashes
@@ -2369,6 +2412,10 @@ class Config:
     # from all2all backend/mode: Mega owns dispatch, both GEMMs, and combine.
     moe_backend: str = "standard"
     runner_qualname: str = "atom.model_engine.model_runner.ModelRunner"
+    # The runners take weight syncs and say which they cannot
+    # (`get_worker_capabilities`), as RLHFModelRunner does: EngineCore asks
+    # them once, at startup. Set by AsyncLLMEngine.
+    weight_sync_runner: bool = False
     # EPLB master switch + sub-config
     eplb_enable: bool = False
     eplb_config: EPLBConfig = field(default_factory=EPLBConfig)
@@ -2430,6 +2477,74 @@ class Config:
     def pcp_group_size(self) -> int:
         return pcp_group_size_of(self)
 
+    def _tp_node_slice(self) -> tuple[int | None, int]:
+        """`(tensor_parallel_size_local, tensor_parallel_rank)` for this node.
+
+        In plugin mode the host framework launches and places the TP workers,
+        and `parallel_config` may be the host's own object (vLLM's has neither
+        field). Cross-node TP is a native-server feature, so a plugin run is
+        always the single-node case: all ranks from rank 0.
+        """
+        if self.plugin_config is not None:
+            return None, 0
+        pc = self.parallel_config
+        return pc.tensor_parallel_size_local, pc.tensor_parallel_rank
+
+    @property
+    def tp_size_local(self) -> int:
+        """TP worker processes on this node: fewer than `tp_world_size` when
+        one TP group spans several nodes."""
+        local, _ = self._tp_node_slice()
+        return self.tp_world_size if local is None else local
+
+    @property
+    def tp_rank_start(self) -> int:
+        """First TP rank on this node; it runs `tp_size_local` ranks from here."""
+        return self._tp_node_slice()[1]
+
+    @property
+    def is_multinode_tp(self) -> bool:
+        return self.tp_size_local < self.tp_world_size or self.tp_rank_start > 0
+
+    def _check_multinode_tp(self) -> None:
+        if self._tp_node_slice() == (None, 0):
+            return
+        pc = self.parallel_config
+        local, start, tp = self.tp_size_local, self.tp_rank_start, self.tp_world_size
+        if local < 1 or tp % local or start % local or not 0 <= start < tp:
+            raise ValueError(
+                f"--tensor-parallel-size-local {local} and --tensor-parallel-rank "
+                f"{start} must cut -tp {tp} into whole, equal per-node slices"
+            )
+        if not self.is_multinode_tp:
+            return
+        unsupported = [
+            name
+            for name, used in (
+                ("data parallelism", pc.data_parallel_size > 1),
+                ("--enable-dp-attention", self.enable_dp_attention),
+                ("pipeline parallelism", self.pipeline_parallel_size > 1),
+                ("prefill context parallelism", self.prefill_context_parallel_size > 1),
+                ("--fake-eplb", self.fake_eplb),
+                ("RapidServe", self.enable_rapidserve),
+            )
+            if used
+        ]
+        if unsupported:
+            raise ValueError(
+                "tensor parallelism across nodes does not support "
+                + ", ".join(unsupported)
+            )
+        if pc.data_parallel_base_port == 0 or pc.data_parallel_master_ip in (
+            "127.0.0.1",
+            "localhost",
+        ):
+            raise ValueError(
+                "tensor parallelism across nodes needs --data-parallel-master-ip "
+                "set to the address of the node that runs TP rank 0, and the "
+                "same nonzero --data-parallel-base-port on every node"
+            )
+
     @property
     def capture_sizes(self) -> list[int]:
         """The declared CUDAGraph capture ladder, in batch sizes.
@@ -2459,8 +2574,9 @@ class Config:
         `busy_loop` outright (`pp_engine_core.py`), so `bump_step` is never
         reached and the line would go silent after announcing a logging mode.
         RapidServe and P/D are a scope choice: `PrefillEngineCore` and
-        `DecodeEngineCore` inherit the base loop and override only
-        `_process_engine_step`, so the counter would in fact advance there --
+        `DecodeEngineCore` inherit the base loop and override only a step
+        method, `_process_engine_step` and `_process_engine_step_inner`
+        respectively, so the counter would in fact advance there --
         it is simply untested, and a step number nobody has lined up across a
         disaggregated pair is worth less than the clock. Degrade rather than
         raise: a stale flag in a shared launch script must not stop a server
@@ -2615,11 +2731,61 @@ class Config:
                 "experimental RCCL prepare/finalize backend"
             )
 
+    def _resolve_dcp_comm_backend(self) -> None:
+        """``dcp.comm_backend="auto"``: the mailbox combine where it has been
+        validated (gfx950, DCP > 1, no decode TBO, not plugin mode), else
+        all-to-all. An explicit backend is kept as given, except an explicit
+        ``mailbox`` in plugin mode, which rebinds its DCP group after the model
+        is built and so takes all-to-all. Runs after ``_resolve_tbo``, so
+        ``enable_tbo_decode`` is final here."""
+        dcp = self.dcp_config
+        if (
+            dcp.comm_backend == "mailbox"
+            and self.decode_context_parallel_size > 1
+            and is_plugin_mode()
+        ):
+            logger.warning(
+                "DCP comm_backend 'mailbox' is unavailable in plugin mode; "
+                "merging with 'a2a'"
+            )
+            dcp.comm_backend = "a2a"
+        if dcp.comm_backend != "auto":
+            # The mailbox combine spins in-kernel on its peers; next to decode
+            # TBO's comm-stream collectives that is unverified.
+            assert not (
+                self.decode_context_parallel_size > 1
+                and self.enable_tbo_decode
+                and dcp.comm_backend == "mailbox"
+            ), (
+                "DCP comm_backend 'mailbox' with decode TBO (--enable-tbo all) is "
+                "unverified. Use --enable-tbo (prefill only) or comm_backend 'a2a'."
+            )
+            return
+        if self.decode_context_parallel_size <= 1:
+            reason = "no DCP"
+        elif is_plugin_mode():
+            reason = "plugin mode"
+        elif self.enable_tbo_decode:
+            reason = "decode TBO (--enable-tbo all)"
+        else:
+            from aiter.jit.utils.chip_info import get_gfx
+
+            gfx = get_gfx()
+            reason = None if gfx == "gfx950" else f"validated on gfx950 only, not {gfx}"
+        dcp.comm_backend = "a2a" if reason else "mailbox"
+        if self.decode_context_parallel_size > 1:
+            logger.info(
+                "DCP comm_backend auto -> %s%s",
+                dcp.comm_backend,
+                f" ({reason})" if reason else "",
+            )
+
     def __post_init__(self):
         if self.sequence_parallel_size < 1:
             raise ValueError("sequence_parallel_size must be at least 1")
         if envs.ATOM_DSV41_A8W4_ATTN not in ("auto", "off"):
             raise ValueError("ATOM_DSV41_A8W4_ATTN must be auto or off")
+        _check_mono_poll_sleep_units()
         self.moe_all2all_backend = (
             str(self.moe_all2all_backend or "auto").strip().lower()
         )
@@ -2694,6 +2860,7 @@ class Config:
             )
 
         assert 1 <= self.tensor_parallel_size <= 8
+        self._check_multinode_tp()
         if self.decode_context_parallel_size > 1:
             assert self.tensor_parallel_size % self.decode_context_parallel_size == 0, (
                 f"tp_size ({self.tensor_parallel_size}) must be divisible by "
@@ -2783,6 +2950,14 @@ class Config:
                 import ast
 
                 self.kv_transfer_config = ast.literal_eval(self.kv_transfer_config)
+        if (
+            isinstance(self.kv_transfer_config, dict)
+            and str(self.kv_transfer_config.get("kv_connector", "")).strip().casefold()
+            == "multi"
+        ):
+            # Refuse a composite the engine cannot run now, not when a worker
+            # builds it after the weights are loaded.
+            validate_multi_config(self.kv_transfer_config)
         if self.sequence_parallel_size > 1:
             self._init_sequence_parallel()
         # transformers 5+ exposes rope_parameters; <5 often only rope_scaling + rope_theta.
@@ -2900,10 +3075,13 @@ class Config:
             # llama.py adds a key to the live `rope_parameters` while a worker
             # builds the model.
             self.offload_kv_encoding = snapshot_kv_encoding(self.hf_config)
+        self._resolve_offload_min_load_tokens()
         self._resolve_dynamic_chunking()
         self._resolve_tbo()
         self._check_pp_support()
         self._check_tbo_support()
+        # After TBO is final: "auto" never picks the mailbox next to decode TBO.
+        self._resolve_dcp_comm_backend()
 
         if self.speculative_config is not None:
             num_spec = self.speculative_config.num_speculative_tokens
@@ -3068,6 +3246,7 @@ class Config:
                 self.decode_context_parallel_size,
                 self.enable_tbo or self.enable_tbo_decode,
                 is_plugin_mode(),
+                "nvfp4" in (self.index_cache_dtype, self.kv_cache_dtype),
             )
             if indexer_cp_off is not None:
                 logger.warning(
@@ -3109,11 +3288,15 @@ class Config:
                 # load. Overriding it here would accept the flag and ignore it.
                 self.index_cache_dtype = "fp8"
             else:
-                # M3's fp4 KV needs the fp4 index (the MXFP4 attention reads the
+                # M3's FP4 KV needs the matching FP4 index (the FP4 attention reads the
                 # selector's rows, which only that scorer sizes to match), which is
                 # what following the KV dtype gives; an explicit other index dtype
                 # is refused by `validate_runtime_config`.
                 self.index_cache_dtype = self.kv_cache_dtype
+        if self.index_cache_dtype == "nvfp4" and not is_m3:
+            raise ValueError(
+                "--index-cache-dtype nvfp4 is supported by MiniMax-M3 only"
+            )
         if self.speculative_config is not None:
             from atom.spec_decode.draft_kv import draft_owns_kv_pool
 
@@ -3142,10 +3325,10 @@ class Config:
             if spec.draft_kv_dtype != self.kv_cache_dtype and self.kv_transfer_config:
                 # The offload namespace keys the target's KV dtype alone, so a
                 # draft page of another dtype would share a key with the target's.
-                # The flag has no fp4 to match an fp4 target with.
+                # The flag has no fp4 / nvfp4 to match an FP4 target with.
                 hint = (
                     ""
-                    if self.kv_cache_dtype == "fp4"
+                    if self.kv_cache_dtype in FP4_CACHE_DTYPES
                     else ". Pass --spec-decode-kv-cache-dtype "
                     f"{self.kv_cache_dtype} to match the target"
                 )
@@ -3213,8 +3396,13 @@ class Config:
         )
 
     def _resolve_index_cache_layout(self) -> None:
+        requested = self.index_cache_layout
         self.index_cache_layout = None
         if self.index_cache_dtype != "fp4":
+            if requested is not None:
+                raise ValueError(
+                    "--index-cache-layout requires --index-cache-dtype fp4"
+                )
             return
         is_v41 = self.hf_config.model_type == "deepseek_v41_text"
         arches = getattr(self.hf_config, "architectures", None) or []
@@ -3223,12 +3411,23 @@ class Config:
             for a in arches
         )
         if not (is_v4 or is_v41):
+            hf = getattr(self.hf_config, "text_config", self.hf_config)
+            if getattr(hf, "index_topk", None):
+                # DSA OPUS and legacy FP4 have equal byte widths but different
+                # permutations. Keep their prefix/offload namespaces apart.
+                if requested not in (None, PRESHUFFLE, MFMA):
+                    raise ValueError("DSA FP4 index layout must be preshuffle or mfma")
+                self.index_cache_layout = requested or PRESHUFFLE
+            elif requested is not None:
+                raise ValueError("--index-cache-layout requires a supported indexer")
             return
         from aiter.jit.utils.chip_info import get_gfx_runtime
 
         arch = get_gfx_runtime()
         if is_v4 and arch == "gfx942":
             # The V4 runtime falls back to FP8 on gfx942, even for explicit FP4.
+            if requested is not None:
+                raise ValueError("V4 on gfx942 uses FP8 and has no FP4 index layout")
             return
         if is_v41:
             from atom.model_ops.deepseek_v41.index_plane import (
@@ -3241,6 +3440,11 @@ class Config:
         self.index_cache_layout = layout_for_arch(
             arch, backend=envs.ATOM_V4_UNIFIED_MQA
         )
+        if requested is not None and requested != self.index_cache_layout:
+            raise ValueError(
+                f"Index layout {requested} does not match the V4/V4.1 scorer "
+                f"layout {self.index_cache_layout}"
+            )
 
     def _resolve_tbo(self) -> None:
         """Turn TBO off where it cannot run (`_check_tbo_support` refuses what
@@ -3443,6 +3647,10 @@ class Config:
                 "supported with pipeline_parallel_size > 1."
             )
 
+    def _resolve_offload_min_load_tokens(self) -> None:
+        # Resolve once before spawning workers, identically for CLI and API.
+        self.offload_min_load_tokens = KVConnectorFactory.resolve_min_load_tokens(self)
+
     def _resolve_dynamic_chunking(self) -> None:
         """Validate dynamic chunking, or turn it off where it cannot size a chunk.
 
@@ -3611,14 +3819,15 @@ def local_device_index(config: Config, rank: int) -> int:
 
     On a single node the physical GPU index equals the global distributed rank
     in the DPxPPxPCPxTP layout: each EngineCore (one per (dp,pp) stage) owns a
-    contiguous slice of `tp_world_size * pcp_group_size` GPUs.
+    contiguous slice of `tp_world_size * pcp_group_size` GPUs. A TP group that
+    spans nodes has its ranks from `tp_rank_start` on this node.
     """
     pc = config.parallel_config
     engine_index = (
         pc.data_parallel_rank_local or 0
     ) * config.pipeline_parallel_size + pc.pipeline_parallel_rank
     stage_span = config.tp_world_size * config.pcp_group_size
-    return engine_index * stage_span + rank
+    return engine_index * stage_span + rank - config.tp_rank_start
 
 
 _current_atom_config: Config | None = None

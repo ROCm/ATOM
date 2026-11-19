@@ -347,16 +347,19 @@ ATOMESH_TORCH_PROFILE_ROLES="${ATOMESH_TORCH_PROFILE_ROLES:-prefill,decode}"
 PREFILL_KV_TRANSFER_CONFIG="${PREFILL_KV_TRANSFER_CONFIG:-}"
 DECODE_KV_TRANSFER_CONFIG="${DECODE_KV_TRANSFER_CONFIG:-}"
 
-default_profiler_dir="${RUN_DIR}/online_quant/rank-${NODE_RANK}"
+# Rank 0's online_quant_info_*.json dump for this run. It has its own variable
+# so that collecting it does not also hand the engine a profiler directory on
+# every launch; the profiler window below supplies one per worker instead.
+online_quant_dir="${RUN_DIR}/online_quant/rank-${NODE_RANK}"
 if [[ "${ATOMESH_EXECUTION_PHASE}" != "combined" ]]; then
-  default_profiler_dir="${RUN_DIR}/online_quant/${ATOMESH_EXECUTION_PHASE}/rank-${NODE_RANK}"
+  online_quant_dir="${RUN_DIR}/online_quant/${ATOMESH_EXECUTION_PHASE}/rank-${NODE_RANK}"
 fi
-export ATOM_TORCH_PROFILER_DIR="${ATOM_TORCH_PROFILER_DIR:-${default_profiler_dir}}"
+export ATOM_ONLINE_QUANT_INFO_DIR="${ATOM_ONLINE_QUANT_INFO_DIR:-${online_quant_dir}}"
 RUNTIME_LOG_DIR="${RUN_DIR}/logs"
 if [[ "${ATOMESH_EXECUTION_PHASE}" != "combined" ]]; then
   RUNTIME_LOG_DIR="${RUNTIME_LOG_DIR}/${ATOMESH_EXECUTION_PHASE}"
 fi
-mkdir -p "${RUNTIME_LOG_DIR}" "${RUN_DIR}"/{benchmark_results,eval_results} "${ATOM_TORCH_PROFILER_DIR}"
+mkdir -p "${RUNTIME_LOG_DIR}" "${RUN_DIR}"/{benchmark_results,eval_results} "${ATOM_ONLINE_QUANT_INFO_DIR}"
 
 role_tp="${PREFILL_TP_SIZE}"
 if [[ "${AGGREGATED}" == "1" ]]; then
@@ -879,6 +882,7 @@ wait_http() {
   local timeout="$3"
   local pid="${4:-}"
   local deadline=$(( $(date +%s) + timeout ))
+  local peer
   echo "[wait] ${name} ${url} timeout=${timeout}s"
   until curl -sf --max-time 10 "${url}" >/dev/null 2>&1; do
     exit_if_mooncake_store_died
@@ -890,6 +894,12 @@ wait_http() {
       [[ "${rc}" -eq 0 ]] && rc=1
       echo "[wait][FAIL] ${name} process exited before becoming ready rc=${rc}" >&2
       exit "${rc}"
+    fi
+    # After this node's own checks: when both failed, its own failure is the
+    # one to report.
+    if peer="$(failed_peer_node)"; then
+      echo "[wait][FAIL] ${name}: another node's launcher exited (${peer})" >&2
+      exit 1
     fi
     if [[ "$(date +%s)" -ge "${deadline}" ]]; then
       echo "[wait][FAIL] ${name} not ready after ${timeout}s" >&2
@@ -1600,13 +1610,34 @@ stop_mooncake_store() {
   [[ -z "${mooncake_store_failed_rc}" ]]
 }
 
+# Prints the rank-rc-* of another node whose launcher exited non-zero: the
+# servers, router or Store owners that node was to bring never come. Only Spur
+# workers publish rank-rc-* (cleanup_spur in pd_slurm_job.sh); under plain
+# Slurm there are none, and srun --kill-on-bad-exit=1 stops the other nodes.
+failed_peer_node() {
+  local f rc
+  for f in "${RUN_DIR}"/rank-rc-*; do
+    [[ -f "${f}" && "${f}" != *.tmp && "${f##*/}" != "rank-rc-${NODE_RANK}" ]] || continue
+    rc="$(cat "${f}" 2>/dev/null)"
+    if [[ -n "${rc}" && "${rc}" != "0" ]]; then
+      echo "${f##*/}=${rc}"
+      return 0
+    fi
+  done
+  return 1
+}
+
 # Fails startup (stopping what it started) unless <condition> holds within
-# <timeout> seconds; a dying Store process fails it at once.
+# <timeout> seconds. It fails at once when a Store process dies, when a Store
+# log reports a failure (Failed to setup client, Failed to mount, Check failed,
+# FATAL), or when another node's launcher exits non-zero, checked in that
+# order: when this node and another both failed, this node's failure is the
+# one to report.
 wait_for_mooncake_store() {
   local what="$1" timeout="$2"
   shift 2
   local deadline=$(( $(date +%s) + timeout ))
-  local log
+  local log peer
   until "$@"; do
     if ! reap_dead_mooncake_store; then
       echo "[wait][FAIL] mooncake-store ${what}: a Store process exited" >&2
@@ -1621,6 +1652,11 @@ wait_for_mooncake_store() {
         exit 1
       fi
     done
+    if peer="$(failed_peer_node)"; then
+      echo "[wait][FAIL] mooncake-store ${what}: another node's launcher exited (${peer})" >&2
+      stop_mooncake_store || true
+      exit 1
+    fi
     if [[ "$(date +%s)" -ge "${deadline}" ]]; then
       for log in "${mooncake_store_logs[@]}"; do
         tail -n 20 "${log}" >&2 || true
@@ -1942,10 +1978,10 @@ write_metadata() {
 EOF
 }
 
-# ATOM_TORCH_PROFILER_DIR above does not reach the engine: EngineArgs always
-# passes its own torch_profiler_dir (None by default), which overrides the env
-# default in Config, so the profiler is off unless the flag is on the command.
-# One directory per worker keeps P/D ranks that share a node apart.
+# Put a profiler directory on the command line only while the window is on:
+# this script exports no ATOM_TORCH_PROFILER_DIR, so a launch that does not
+# profile carries none. One directory per worker keeps P/D ranks that share a
+# node apart; an explicit flag also outranks the environment default in Config.
 build_torch_profiler_args() {
   local log_name="$1"
   local -n out_args="$2"

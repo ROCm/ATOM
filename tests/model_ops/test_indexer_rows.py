@@ -302,7 +302,7 @@ def test_striped_rows_come_back_rank_major(
     monkeypatch.setattr(
         score_module,
         "_score_concat",
-        lambda query, weights, cache, rows, topk, stable, out, keys, local: (
+        lambda query, weights, cache, rows, topk, stable, out, local: (
             score(query, weights, rows, out)
         ),
     )
@@ -359,14 +359,13 @@ def test_striped_rows_come_back_rank_major(
     [
         {"out": torch.zeros(4, 3, dtype=torch.int32)},
         {"on_band": lambda scores, span: None},
-        {"keys": ()},
         {"request_local": False},
     ],
-    ids=["out", "on_band", "keys", "request_global"],
+    ids=["out", "on_band", "request_global"],
 )
 def test_striped_split_refuses_to_read_its_rows_in_place(kwargs):
     """A striped split hands its selection back rank-major: `out`,
-    `on_band`, `keys` and request-global ids all assume rows in order."""
+    `on_band` and request-global ids all assume rows in order."""
     split = rows_module.RowSplit.striped(4, 0, 2)
     rows = rows_module.IndexRows(
         torch.zeros(split.end, dtype=torch.int32), 1, ((0, split.end),), split

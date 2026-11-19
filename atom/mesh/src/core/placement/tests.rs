@@ -584,6 +584,7 @@ mod c_regular_planning {
                 tokens: Some(&[1u32, 2, 3]),
                 headers: None,
                 stream: false,
+                carries_media: false,
             })
             .await
             .unwrap();
@@ -616,6 +617,7 @@ mod c_regular_planning {
                 tokens: None,
                 headers: None,
                 stream: false,
+                carries_media: false,
             })
             .await
             .unwrap();
@@ -639,6 +641,7 @@ mod c_regular_planning {
                 tokens: None,
                 headers: None,
                 stream: false,
+                carries_media: false,
             })
             .await
             .unwrap();
@@ -777,6 +780,7 @@ mod d_pd_planning {
                 tokens: None,
                 headers: None,
                 stream: false,
+                carries_media: false,
             })
             .await
             .unwrap();
@@ -890,6 +894,7 @@ mod d_pd_planning {
                 tokens: None,
                 headers: None,
                 stream: false,
+                carries_media: false,
             })
             .await
             .unwrap();
@@ -2148,6 +2153,7 @@ mod h_integration {
             tokens: Some(&tokens),
             headers: Some(&headers),
             stream: false,
+            carries_media: false,
         };
 
         for _ in 0..2 {

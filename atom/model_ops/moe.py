@@ -6,7 +6,7 @@ from abc import abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from functools import lru_cache
+from functools import cache, lru_cache
 
 import torch
 from aiter import ActivationType, QuantType, dtypes, get_hip_quant, topk_gating
@@ -20,6 +20,7 @@ from aiter.ops.shuffle import (
     moe_shuffle_scale,
     moe_shuffle_weight,
 )
+from aiter.ops.topk import _FLYDSL_HERD_MAX_M, _FLYDSL_HERD_MIN_M, _FLYDSL_USE_HERD
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -232,8 +233,16 @@ class FusedMoEParallelConfig:
     pcp_merge: bool = False
 
     @property
+    def exchanges_tokens(self) -> bool:
+        """Whether routed tokens actually cross ranks: expert parallelism over
+        more than one real DP rank. TP-only EP (one DP rank) reduces instead,
+        and simulated DP (``dp_logical_ratio`` > 1) has a finer expert map than
+        the launched process group, so neither exchanges tokens."""
+        return self.use_ep and self.dp_size > 1 and self.dp_logical_ratio == 1
+
+    @property
     def selected_all2all_backend(self) -> str | None:
-        if self.dp_size <= 1 or not self.use_ep or self.dp_logical_ratio != 1:
+        if not self.exchanges_tokens:
             return None
         if self.requested_all2all_backend == "none":
             return None
@@ -1255,7 +1264,7 @@ def rocm_aiter_fused_moe_fake(
     return torch.empty_like(hidden_states)
 
 
-direct_register_custom_op(
+rocm_aiter_fused_moe_op = direct_register_custom_op(
     op_name="rocm_aiter_fused_moe",
     op_func=rocm_aiter_fused_moe_impl,
     mutates_args=[],
@@ -1449,6 +1458,49 @@ class Nvfp4MoEMethod(FusedMoEMethodBase):
         )
 
 
+@cache
+def _aiter_serves_flydsl_herd() -> bool:
+    """Whether aiter's fused_moe(herd_topk) serves DeepSeek-V4 and Kimi-K3:
+    aiter v0.1.29 (ROCm/aiter#7494) or later. Older ones abort the process on
+    Kimi-K3's Top-17 candidates with an FP32 correction bias."""
+    # In aiter since the HERD constants above (v0.1.26, ROCm/aiter#5693).
+    from aiter.ops.flydsl import herd_topk
+
+    if hasattr(herd_topk, "herd_route_psum"):
+        return True
+    logger.warning(
+        "AITER_FLYDSL_USE_HERD=1 needs aiter v0.1.29 (ROCm/aiter#7494) or "
+        "later; HERD stays off"
+    )
+    return False
+
+
+def _herd_sees_own_rows(parallel_config: FusedMoEParallelConfig) -> bool:
+    """Whether the experts run only their pass's rows, whose trailing pad rows
+    aiter's HERD drop leaves out by the count fused_moe gets. A DP-attention or
+    PCP gather, and simulated DP's repeat, interleave every rank's -1 pad rows,
+    pass no count, and can exceed the 1024 rows fused_moe(herd_topk) takes."""
+    return not (
+        parallel_config.pcp_merge
+        or parallel_config.dp_logical_ratio > 1
+        or (
+            parallel_config.dp_size > 1
+            and get_current_atom_config().enable_dp_attention
+        )
+    )
+
+
+def _herd_routing(layer: torch.nn.Module) -> bool:
+    """DeepSeek-V4's sqrtsoftplus top-k or Kimi-K3's sigmoid grouped top-k over
+    one group: the routings HERD serves, both folding the routed scale in."""
+    if layer.use_grouped_topk:
+        return layer.scoring_func == "sigmoid" and (
+            layer.num_expert_group,
+            layer.topk_group,
+        ) == (1, 1)
+    return layer.scoring_func == "sqrtsoftplus"
+
+
 class Mxfp4MoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
         super().__init__(moe)
@@ -1512,6 +1564,17 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.use_triton = False
             self.use_triton_decode = False
             self.use_triton_ep = False
+
+        # AITER_FLYDSL_USE_HERD: aiter's gfx1250 HERD drop, TP only (no expert_mask).
+        self.use_flydsl_herd = (
+            _FLYDSL_USE_HERD
+            and self.is_gfx1250
+            and self.is_guinterleave
+            and not ep_moe
+            and not getattr(get_current_atom_config(), "eplb_enable", False)
+            and _herd_sees_own_rows(self.moe.moe_parallel_config)
+            and _aiter_serves_flydsl_herd()
+        )
 
         # Triton MoE under EP exists only for gfx95x and gfx125x -- those are the
         # arches whose branch-A weight prep and gluon experts are wired up. The
@@ -2077,6 +2140,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """The base routing over the layer's logical experts, its prefilled
         shared column widened in where the legacy layout fuses one."""
+        if self._flydsl_herd_step(layer, router_logits):
+            # Raw Top-(K+1) scores; fused_moe(herd_topk=K) drops and scales.
+            # Pad rows route to -1, and the drop keeps them out of its
+            # popularity only by the count apply() passes as num_local_tokens.
+            return FusedMoE.select_experts(
+                hidden_states=x,
+                router_logits=router_logits,
+                top_k=layer.top_k + 1,
+                use_grouped_topk=layer.use_grouped_topk,
+                topk_group=layer.topk_group,
+                num_expert_group=layer.num_expert_group,
+                renormalize=False,
+                scoring_func=layer.scoring_func,
+                e_score_correction_bias=layer.e_score_correction_bias,
+            )
         layout = layer.expert_layout
         return _select_logical(
             layer,
@@ -2272,6 +2350,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 )
             return _moe_result
 
+        # The step select_experts routed Top-(K+1) HERD candidates for: the same
+        # decision over the same rows (it reads their count; HERD never runs on
+        # gathered rows), not a guess from the ids' width.
+        herd_topk = (
+            layer.top_k
+            if self.use_flydsl_herd and self._flydsl_herd_step(layer, x)
+            else 0
+        )
         a1_scale = getattr(layer, "w13_input_scale", None)
         a2_scale = getattr(layer, "w2_input_scale", None)
         moe_extra_args = {
@@ -2289,6 +2375,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             moe_extra_args["linear_beta"] = getattr(
                 layer, "activation_situ_linear_beta", None
             )
+        if herd_topk:
+            moe_extra_args["herd_topk"] = herd_topk
+            # Both _herd_routing routings fold the routed scale in.
+            moe_extra_args["herd_routed_scaling_factor"] = layer.routed_scaling_factor
         _ep_triton_now = False
         if self.use_triton_ep and self.using_modular_kernel:
             # Phase split, transport version. FusedMoEModularKernel.forward runs
@@ -2495,6 +2585,35 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             moe_extra_args=moe_extra_args,
             x_scale=x_scale,
             **shared_kwargs,
+        )
+
+    def _flydsl_herd_step(
+        self, layer: torch.nn.Module, router_logits: torch.Tensor
+    ) -> bool:
+        """Whether this step routes Top-(K+1) candidates for fused_moe(herd_topk):
+        decode steps in aiter's HERD window that reach the FlyDSL experts, on
+        a `_herd_routing` routing (the drop renormalises the kept K)."""
+        tokens = router_logits.shape[0]
+        if (
+            not self.use_flydsl_herd
+            or self.use_triton
+            or self.fused_experts is not None
+            or not _FLYDSL_HERD_MIN_M <= tokens <= _FLYDSL_HERD_MAX_M
+            or not layer.renormalize
+            or layer.custom_routing_function is not None
+            or layer.apply_router_weight_on_input
+            or layer.num_fused_shared_experts > 0
+            or not _herd_routing(layer)
+        ):
+            return False
+        comm_fused = getattr(layer, "_comm_fused_moe", None)
+        if comm_fused is not None and comm_fused.supports(tokens):
+            return False
+        ctx = get_forward_context().context
+        return (
+            ctx is not None
+            and not ctx.is_prefill
+            and bool(getattr(ctx, "running_tokens_are_unified", True))
         )
 
     def _apply_shared_experts_dense(self, layer, x, activation):
@@ -2997,7 +3116,7 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
                 x_scale=x_scale,
             )
         else:
-            return torch.ops.aiter.rocm_aiter_fused_moe(
+            return rocm_aiter_fused_moe_op(
                 x,
                 layer.w13_weight,
                 layer.w2_weight,
@@ -3405,7 +3524,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             "swiglu_limit": getattr(layer, "swiglu_limit", 0.0),
         }
         if self.quant_type == QuantType.per_Tensor or self.fused_experts is None:
-            return torch.ops.aiter.rocm_aiter_fused_moe(
+            return rocm_aiter_fused_moe_op(
                 x,
                 layer.w13_weight,
                 layer.w2_weight,
@@ -3462,7 +3581,7 @@ def moe_forward_fake(
     return torch.empty_like(hidden_states)
 
 
-direct_register_custom_op(
+moe_forward_op = direct_register_custom_op(
     op_name="moe_forward",
     op_func=moe_forward,
     mutates_args=["hidden_states"],
@@ -5344,7 +5463,9 @@ class FusedMoE(torch.nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
-        return torch.ops.aiter.moe_forward(
+        # The custom op is an opaque boundary for torch.compile and for
+        # TorchDispatchMode (FakeTensorMode, make_fx); eager calls skip it.
+        return moe_forward_op(
             hidden_states,
             self._routing_logits(hidden_states, router_logits),
             self.layer_name,
@@ -5565,7 +5686,8 @@ class FusedMoE(torch.nn.Module):
                 reassign_gathered_shared_ids(self, out[2])
                 return out, local_tokens, sizes, gathered_rows
 
-            out, local_tokens, sizes, gathered_rows = tbo_on_comm(gather)
+            # Not held, like the TP all-reduce: see `tbo_on_comm`.
+            out, local_tokens, sizes, gathered_rows = tbo_on_comm(gather, hold=False)
             hidden_states, topk_weights, topk_ids, *scale = out
             x_scale = scale[0] if scale else None
 
@@ -5586,11 +5708,14 @@ class FusedMoE(torch.nn.Module):
                 final_hidden_states = final_hidden_states[:gathered_rows]
             if dp_eager_mode:
                 final_hidden_states = tbo_on_comm(
-                    reduce_scatterv, final_hidden_states, sizes, dp_group
+                    reduce_scatterv, final_hidden_states, sizes, dp_group, hold=False
                 )
             else:
                 final_hidden_states = tbo_on_comm(
-                    reduce_scatter_with_unpadding, final_hidden_states, local_tokens
+                    reduce_scatter_with_unpadding,
+                    final_hidden_states,
+                    local_tokens,
+                    hold=False,
                 )
 
         if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):

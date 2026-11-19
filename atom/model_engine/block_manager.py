@@ -21,6 +21,7 @@ from atom.distributed.kv_events import (
     BlockStored,
     KVCacheEvent,
 )
+from atom.kv_transfer.offload.load_math import chunk_floor, tier_load_tokens
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import (
@@ -233,6 +234,7 @@ class BlockManager:
         *,
         state_runtime: StateRuntime = DEFAULT_STATE_RUNTIME,
     ):
+        self._min_load_tokens = config.offload_min_load_tokens
         block_size = config.kv_cache_block_size
         num_blocks = config.num_kvcache_blocks
         assert num_blocks > 0
@@ -561,6 +563,10 @@ class BlockManager:
         self.demands_recorded: int = 0
         self.chunks_cut_for_demand: int = 0
         self.demands_declined_no_room: int = 0
+        # Dropped because the demand's chunk floor is a nonzero hit: the shape a
+        # floored anchor leaves the next turn, and also a real fork under one
+        # chunk above a grid rung (`_record_checkpoint_demand`).
+        self.demands_dropped_at_grid_hit: int = 0
         # The anchor's own cut counter, kept separate from the demand's: the
         # anchor fires on nearly every prompt and would drown the convergence
         # signal `chunks_cut_for_demand` exists to expose.
@@ -847,7 +853,7 @@ class BlockManager:
             return hit
         # The connector skips a load under OFFLOAD_MIN_LOAD_TOKENS, so neither
         # LMCache figure counts unless it clears that above where it starts.
-        min_load = envs.OFFLOAD_MIN_LOAD_TOKENS
+        min_load = self._min_load_tokens
         resume = hit * hbs
         tier_hit = int(seq.offload_joint.kv_prefix_tokens or 0)
         if tier_hit - resume >= min_load:
@@ -1251,10 +1257,13 @@ class BlockManager:
         if seq.has_per_req_cache and not self.state.has_free(self.state_slots_per_req):
             return -1
         if not self.enable_prefix_caching:
-            if not self._has_page_units(
-                self.num_pool_blocks(len(seq)) + self.draft_lookahead_blocks(len(seq))
-            ):
+            num_new_blocks = self.num_pool_blocks(
+                len(seq)
+            ) + self.draft_lookahead_blocks(len(seq))
+            if not self._has_page_units(num_new_blocks):
                 return -1
+            if probe is not None:
+                probe.num_new_blocks = num_new_blocks
             return 0
         # Step 1: compressed prefix (CSA/HCA/indexer share the block hash and
         # read the WHOLE history, so this stays a full front-to-back chained
@@ -1639,6 +1648,78 @@ class BlockManager:
         if joint_hash != -1:
             return joint_hash
         return -1 if self.tier_resume_replays(seq) else hit_hash
+
+    def lower_hit_to_chunk(
+        self,
+        seq: Sequence,
+        probe: AdmissionProbe,
+        chunk: int,
+        tier_hit: int,
+    ) -> bool:
+        """Lower an unaligned HBM hit to the tier's chunk floor, so a load can
+        start there.
+
+        A tier moves whole `chunk`-token chunks, so a load starts only on a
+        chunk boundary. Without lowering, an HBM hit that ends inside a chunk
+        needs a hand-off prefill up to the next boundary, then the load, then
+        the rest: two prefill releases. Lowering treats the part of the hit
+        past the floor as a miss. `allocate` then claims only the blocks below the floor
+        and fills the rest with fresh ones, which the load writes whole; the
+        shared blocks past the floor are left alone. The tier re-supplies at
+        most `chunk - hash_block` tokens that HBM already held.
+
+        Lowers `probe` in place and returns True when:
+          - the hit is a chunk multiple off, and the tier's hit reaches past
+            the HBM hit and, from the floor, clears `min_load`;
+          - the hit can be lowered at all: no joint boundary, and a request
+            state that is rebuilt by replay (or none);
+          - every cache class still accepts the lowered boundary -- the same
+            SWA-window and state gates `can_allocate` applied to the original,
+            so a lowered hit never claims a block whose window is gone;
+          - the pool can give the extra fresh blocks.
+        Otherwise leaves `probe` untouched and returns False.
+        """
+        hbs = self.hash_block_size
+        hit_blocks = probe.num_cached_blocks
+        if hit_blocks <= 0 or probe.num_new_blocks is None:
+            return False
+        if chunk <= 0 or chunk % hbs:
+            return False
+        hit = hit_blocks * hbs
+        floor = chunk_floor(hit, chunk)
+        if (
+            floor == hit
+            or tier_hit <= hit
+            or not tier_load_tokens(floor, tier_hit, chunk, self._min_load_tokens)
+        ):
+            return False
+        if seq.offload_joint.boundary_tokens:
+            return False
+        if seq.has_per_req_cache and not self.state.transfer.replays:
+            # A checkpointed state cannot be rebuilt below the hit it was
+            # taken at.
+            return False
+        lowered = floor // hbs
+        chain = probe.block_hashes
+        if lowered > len(chain):
+            return False
+        if lowered and self._gated_hit(seq, lowered, chain) != lowered:
+            return False
+        # `probe.num_new_blocks` already counts a cached-free block of the hit
+        # as one to allocate: claiming it or taking a fresh one costs the same
+        # unit. Only a dropped block some request still holds is a new unit.
+        in_use = 0
+        for i in range(lowered, hit_blocks):
+            block_id = self.kv.lookup(chain[i])
+            if block_id != -1 and self.kv.is_used(block_id):
+                in_use += 1
+        demand = probe.num_new_blocks + in_use
+        protected = chain[lowered - 1] if lowered else None
+        if not self._has_page_units(demand, protected):
+            return False
+        probe.num_cached_blocks = lowered
+        probe.num_new_blocks = demand
+        return True
 
     def retreat_joint_to_hbm(self, seq: Sequence) -> bool:
         """Drop a failed unaligned joint and resume at the HBM hit it lowered.
@@ -2667,8 +2748,11 @@ class BlockManager:
         The shape that pays for this is a template header whose checkpoint is
         invalidated before anyone reaches it — there each request cuts a chunk
         and none collects. What bounds that is convergence rather than a
-        threshold: found once, filled once, gone. `chunks_cut_for_demand`
-        against `demands_recorded` is where it would show if it did not.
+        threshold: found once, filled once, gone. On the LMCache chunk grid
+        the rung can settle at the header's chunk floor rather than at the
+        header, and every fork then recomputes the gap (below).
+        `chunks_cut_for_demand` against `demands_recorded` is where it would
+        show if it did not converge.
 
         `--no-state-checkpoint-demand` drops the rung and leaves the prompt-end
         anchor alone. Worth measuring: the rung is most of the write traffic
@@ -2694,6 +2778,14 @@ class BlockManager:
             if interval_on and self.state_checkpoint_demand and wanted > hit
             else 0
         )
+        # A replayed hit (`_replay_hit`) reaches `wanted` already, and the
+        # replay bounds what the missing checkpoint costs. A demand would cut
+        # every replay admission's forward at the hit and write a checkpoint
+        # there, for a branch at that exact hit that may never come:
+        # conversations resume at prompt ends, which the anchor covers, the
+        # hit included (`scheduler._cut_floor` lets it land there).
+        if seq.replays_hit:
+            demand = 0
         # Onto the LMCache chunk grid when the joint load serves this tier, as
         # the prompt-end anchor is (`_record_checkpoint_end`), and for the same
         # missing chunk. A demand sits where prompts fork, so the chunk covering
@@ -2703,25 +2795,37 @@ class BlockManager:
         # lookup, so an off-grid demand is never reached and the fork recomputes
         # from its HBM hit (`no_rung_above_hbm`). An unaligned HBM hit is not
         # the problem; the joint load reloads its partial chunk. Flooring costs
-        # each fork under one chunk while the prefix is still in HBM. A floor
-        # at or below the hit would be no rung at all, so the demand then stays
-        # where it was and serves HBM alone.
+        # each fork under one chunk while the prefix is still in HBM.
+        #
+        # A floor below an unaligned hit would be no rung at all, so the demand
+        # stays where it was and serves HBM alone. A floor right at a nonzero
+        # hit is what a floored prompt-end anchor leaves the next turn: the hit
+        # stops at the anchor while the KV runs on to the unfloored end. The
+        # demand is dropped there and this forward recomputes the gap, instead
+        # of cutting a second chunk and storing a second image every turn. A
+        # real fork that close above a grid rung is dropped too: later requests
+        # through it recompute at least that gap while the prefix is in HBM,
+        # and past HBM its off-grid demand is out of reach anyway. The rung can
+        # be the fork's own floor: a shared header S at least a chunk long and
+        # off the grid has its first demand floored to G, every later fork
+        # then hits G and drops its demand, and each request recomputes S - G
+        # for as long as the prefix stays in HBM, where one more cut would
+        # have let them resume at S. A hit at 0 is no floored anchor (one under
+        # a chunk never is), so a short shared header keeps its rung.
         chunk = self._joint_chunk_tokens
+        hit_tokens = hit * self.hash_block_size
         if (
             demand
             and chunk > self.hash_block_size
             and chunk % self.hash_block_size == 0
-            and demand - demand % chunk > hit * self.hash_block_size
         ):
-            demand -= demand % chunk
-        # A replayed hit (`_replay_hit`) reaches `wanted` already, and the
-        # replay bounds what the missing checkpoint costs. A demand would cut
-        # every replay admission's forward at the hit and write a checkpoint
-        # there, for a branch at that exact hit that may never come:
-        # conversations resume at prompt ends, which the anchor covers, the
-        # hit included (`scheduler._cut_floor` lets it land there).
-        if seq.replays_hit:
-            demand = 0
+            floor = demand - demand % chunk
+            if floor > hit_tokens:
+                demand = floor
+            elif floor == hit_tokens > 0:
+                self.demands_dropped_at_grid_hit += not seq.checkpoint_demand_dropped
+                seq.checkpoint_demand_dropped = True
+                demand = 0
         # A demand is an instruction to cut a prefill chunk onto a rung, and
         # that cut costs the request a forward. Buying one for a store
         # `begin_store` is about to refuse is the only part of this funnel
@@ -2842,16 +2946,22 @@ class BlockManager:
         # than merely getting no better. Capping costs the continuation at most
         # one block of reuse — the same trade `room` above already takes.
         end = min(end, (self._n_hash_blocks(seq) - 1) * self.hash_block_size)
-        # Onto the LMCache chunk grid when the joint load serves this tier. HBM
+        # Onto the LMCache chunk grid when the joint load serves this tier and
+        # its chunk is a multiple of the hash block, coarser than it. HBM
         # keeps a checkpoint only as long as its KV (`_record_evicted`), so past
         # an eviction the anchor resumes only through `_joint_kv_boundary`,
         # whose KV leg needs the whole chunk covering it -- and for an off-grid
         # anchor that chunk runs past this prompt, so no store ever holds it.
-        # A hash block finer than the chunk (PP: 128 against 1024) otherwise
-        # loses 7 anchors in 8 once the prompt leaves HBM; flooring costs under
-        # one chunk of reuse while it is still there. An anchor below one chunk
-        # stays put: the joint load has no whole chunk to restore it from, so
-        # flooring it to 0 would only take away its HBM reuse.
+        # A hash block finer than the chunk (block 128 against chunk 1024
+        # without DCP) otherwise loses 7 anchors in 8 once the prompt leaves
+        # HBM. While it is still there, the next turn resumes from the floored
+        # anchor, under one chunk below the stepped-back end, and the demand its
+        # KV would ask for just above is dropped (`_record_checkpoint_demand`).
+        # If the step-back above (`room`, the last-block cap) crosses a chunk
+        # boundary, the demand is kept and cut, as it would be without the
+        # floor. Either way the floor costs no extra cut. An anchor below one
+        # chunk stays put: the joint load has no whole chunk to restore it from,
+        # so flooring it to 0 would only take away its HBM reuse.
         chunk = self._joint_chunk_tokens
         if (
             chunk > self.hash_block_size
@@ -3144,6 +3254,7 @@ class BlockManager:
         return {
             "demands_recorded": self.demands_recorded,
             "demands_declined_no_room": self.demands_declined_no_room,
+            "demands_dropped_at_grid_hit": self.demands_dropped_at_grid_hit,
             "chunks_cut_for_demand": self.chunks_cut_for_demand,
             "chunks_cut_for_end": self.chunks_cut_for_end,
             "midstep_positions_unreadable": self.midstep_positions_unreadable,
@@ -3588,10 +3699,11 @@ class BlockManager:
         seq.replays_hit = seq.replay_kv_load = False
         # Likewise the demand: it describes one admission against one cache
         # state, and a re-admitted seq gets a fresh answer from `can_allocate`
-        # — including a fresh place in both funnel counters.
+        # — including a fresh place in each funnel counter.
         seq.checkpoint_demand_pos = 0
         seq.checkpoint_demand_counted = False
         seq.checkpoint_demand_declined = False
+        seq.checkpoint_demand_dropped = False
         # The anchor is derived from `num_prompt_tokens` alone, so it would
         # still be correct on re-admission — but `_record_checkpoint_end` runs
         # unconditionally in `can_allocate`, and leaving a stale value here

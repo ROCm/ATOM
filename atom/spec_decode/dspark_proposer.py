@@ -702,8 +702,10 @@ class DSparkProposer(Drafter):
 
         Called once by the runner right after each target forward, while the
         forward context still holds the TARGET's slot mapping / cu_seqlens.
-        ``model.write_context_kv`` fans the projected context out to the
-        draft's context layers, each of which writes its own storage:
+        The model gets the taps as ``aux_for`` serves them (under PP the
+        leading ones may come joined) and joins them only if its projection
+        needs to. ``model.write_context_kv`` fans the projected context out to
+        the draft's context layers, each of which writes its own storage:
           * V4 / V4.1 (inline drafts): a private rolling target-KV window,
             addressed by position off the live forward context.
           * Kimi-K3 and MiniMax-M3.1 (standalone drafts): a paged pool, at the
@@ -722,8 +724,9 @@ class DSparkProposer(Drafter):
         rows are harmless -- they land on future positions, unread until the
         step that accepts them rewrites them.
 
-        After a PCP row-split prefill the aux hooks hold this rank's stripe;
-        it goes to the model as is, which gathers what it needs.
+        After a PCP row-split prefill the aux hooks hold this rank's stripe of
+        each tap; the stripes go to the model as they are, and it gathers what
+        it needs.
 
         `next_token_ids` is unused: DSpark drafts from aux hidden states.
         """
@@ -739,19 +742,18 @@ class DSparkProposer(Drafter):
         n = hidden_states.shape[0]
         n_local = pcp_aux_rows(n)
         if n_local is None:
-            aux, kw = self.aux_for(hidden_states), {}
-            if aux is not None:
-                aux = [h[:num_rows] for h in aux]
+            taps, kw = self.aux_for(hidden_states), {}
+            if taps is not None:
+                taps = [h[:num_rows] for h in taps]
         else:
-            # PCP row-split prefill: hand the model this rank's stripe, ungathered.
-            aux = (
+            # PCP row-split prefill: hand the model this rank's stripe of each
+            # tap, ungathered.
+            taps = (
                 [b[:n_local] for b in aux_blocks(self)] if self._captures_aux else None
             )
             kw = {"pcp_num_tokens": min(n, num_rows)}
-        if aux is None:
+        if taps is None:
             return
-        # One block when every tap was relayed from earlier PP stages.
-        aux = aux[0] if len(aux) == 1 else torch.cat(aux, dim=-1)
         spec = self.model.kv_pool_spec
         if spec is not None and spec.needs_own_ctx_slots(self.config):
             ctx_slots = self.runner.forward_vars.get("draft_ctx_slots")
@@ -772,7 +774,7 @@ class DSparkProposer(Drafter):
             if slot_mapping is not None:
                 slot_mapping = slot_mapping[:num_rows]
         with record_function(f"draft_kv[bs={scheduled_bs} tok={min(n, num_rows)}]"):
-            self.model.write_context_kv(aux, positions, slot_mapping, **kw)
+            self.model.write_context_kv(taps, positions, slot_mapping, **kw)
 
     def _propose(
         self,
