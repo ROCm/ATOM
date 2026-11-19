@@ -190,9 +190,10 @@ class DeviceRound:
         state.cur_served = False
         return state.on or state.first
 
-    def laid_out(self, metadata) -> None:
+    def laid_out(self, metadata, in_launch=None) -> None:
         """After the builder's layout: a device-round step's (``RoundService.DEVICE``) positions advanced on the
         device. The step's routing decision is taken: no later layout of this forward is a device-round one.
+        ``in_launch(anchors, requests)``: True when the model's own launch advances them (no ``_advance_kernel``).
         """
         state, hook, step = self.state, self.hook, metadata.step
         running_bs, running_tokens = int(step.slots.shape[0]), step.running_tokens
@@ -208,6 +209,9 @@ class DeviceRound:
             raise RuntimeError(
                 "V4.1 mono: a device-round step without the verdict it advances from"
             )
+        if in_launch is not None and in_launch(state.advance_from, running_bs):
+            state.steps += 1
+            return
         # after the step's publication on this stream: every reader of the positions runs after this
         advance(
             step.positions,

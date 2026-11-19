@@ -16,7 +16,7 @@ and SOFF2 (Markov, 2.5 KB) after the TP regions -> allocate >= 16*40960*16 + 2 M
 Inputs/outputs (all per rank): xh [48][5120] bf16 final-normed target hidden; hw [32320 tiles packed][5120] bf16 head shard
 (head v3 layout); logits [48][32320] f32; s0..s3 sampling records; sids [48] i32; dids [8][5] i32 previous drafts;
 outtok [8][6], verdict [3][8], anc [8]; dh [48][5120] bf16 draft hidden (rows req*5+k); dlog [48][32320] f32;
-mw1 [129280][256], mw2 shard [32320][256] bf16; mids [8][5], memb [8][5][256]; mbest [40] i64 (= INT64_MIN each step)."""
+mw1 [129280][256], mw2 shard [32320][256] bf16; mids [8][5] (i32; mids64 the same as i64), memb [8][5][256]; mbest [40] i64 (= INT64_MIN each step)."""
 from __future__ import annotations
 
 
@@ -33,7 +33,7 @@ from atom.models.deepseek_v41.mono.gfx1250.kernels import draft_ctx as CX
 from atom.models.deepseek_v41.mono.gfx1250.kernels.attention import handoff
 
 TPTRS = ['xh', 'hw', 'logits', 's0', 's1', 's2', 's3', 'sids', 'dids', 'outtok', 'verdict', 'anc', 'dh', 'dlog', 'mw1',
-         'mw2', 'mids', 'memb', 'mbest', 'sparam', 'qlog', 'prow', 'qids']
+         'mw2', 'mids', 'memb', 'mbest', 'sparam', 'qlog', 'prow', 'qids', 'mids64', 'tcom']
 # sparam [48][8] (32 B a row, host-filled a step; sample.SPW): invT, topp, seed, greedy | invTd, hasq, qsrc, seed_acc.
 # T > 0 rows use the recipe's prob drafting + block verification (markov / sample; ATOM dspark_prob_sample
 # PROB_DRAFT + BLOCK_VERIFY), greedy rows the argmax match. qlog [8][5][32320] f32: this rank's draft logits of the step
@@ -80,7 +80,7 @@ def target(tp, t, b, sm, tc, recv, rank, head_d=4, ctx=None, T=None, kv_fp4=Fals
     if b < SF.ROWS * SF.CPR:
         SPF.sample_once_p(P['logits'], P['s0'], P['s1'], P['s2'], P['s3'], P['sids'], tc + i64(LY.SAMPLE), t, b, sm, HF.VR,
                           [r + i64(SOFF) for r in recv], rank, 1, tptr(tp, 'sparam'), tptr(tp, 'qlog'), P['dids'],
-                          tptr(tp, 'prow'), P['outtok'], P['verdict'], P['anc'], tptr(tp, 'qids'))
+                          tptr(tp, 'prow'), P['outtok'], P['verdict'], P['anc'], tptr(tp, 'qids'), com=tptr(tp, 'tcom'))
     else:
         if fx.const_expr(ctx is not None):
             CX.ctx_split(ctx, t, b, T, tc + i64(LY.CTX_SPLIT), SF.ROWS * SF.CPR, CX.CTAS - SF.ROWS * SF.CPR, kv_fp4)
@@ -96,4 +96,5 @@ def draft(tp, t, b, sm, tc, recv, rank, head_d=4):
     HF.head_once_r(P['dh'], P['hw'], P['dlog'], t, t % 32, t // 32, sm, b, head_d, 2, 4)
     handoff(tc + i64(LY.DRAFT_HEAD_DONE), t, False)
     MPF.markov_once(P['dlog'], P['anc'], P['mw1'], P['mw2'], P['mids'], P['memb'], P['mbest'], tc + i64(LY.MARKOV),
-                    [r + i64(SOFF2) for r in recv], rank, 101, t, b, sm, tptr(tp, 'sparam'), tptr(tp, 'qlog'), tptr(tp, 'qids'))
+                    [r + i64(SOFF2) for r in recv], rank, 101, t, b, sm, tptr(tp, 'sparam'), tptr(tp, 'qlog'), tptr(tp, 'qids'),
+                    ids64=tptr(tp, 'mids64'))

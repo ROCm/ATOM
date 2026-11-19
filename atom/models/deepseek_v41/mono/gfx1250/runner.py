@@ -42,7 +42,7 @@ from atom.mono.plan.build_key import source_digest
 from atom.mono.runtime.compile import compile_only
 from atom.mono.runtime.consensus import MonoUnsupported
 from atom.mono.runtime.peer_memory import SymmetricPeerBuffer
-from atom.utils.forward_context import get_forward_context
+from atom.utils.forward_context import RoundService, get_forward_context
 
 logger = logging.getLogger("atom")
 
@@ -195,7 +195,15 @@ class SingleStepRunner(StepInputs):
         # an in-rank poll that timed out (a local producer's ready never came) leaves no STOP (in-rank polls stay as
         # small as before: code size is the step's cost), but costs its launch >= POLL_TICKS: the step's GPU time
         # bounds it (POLL_TICKS 20 s; a normal step is ~4 ms)
-        self._step_ev = []  # (start, end) timing events of the previous target launch
+        # the previous target launch's steady-counter stamps (prep's entry, each CTA's exit: sample.COM_T0 / COM_EXIT),
+        # copied with the STOP word after its verify (``verify_outputs``) and checked at the next launch: no timing events
+        # on the step's stream (each record there cost the GPU ~3 us between the step's operations, E0)
+        SPF = self.K["sample"]
+        if SPF.COM_NEXIT < self.K["attention"].CTAS:
+            raise MonoUnsupported("tcom: fewer exit stamps than the step's CTAs")
+        self._ts_words = (SPF.COM_T0, SPF.COM_EXIT + SPF.COM_NEXIT)
+        self._ts_host = torch.zeros(self._ts_words[1] - self._ts_words[0], dtype=torch.int64, pin_memory=True)
+        self._ts_owed = False
         logger.info(
             "V4.1 single-launch step: %.1f MB scratch, %.1f MB receive (rank %d)",
             sum(t.numel() for t in self.scratch.values()) / 2**20,
@@ -235,6 +243,7 @@ class SingleStepRunner(StepInputs):
         self.output_stream = self._verify_stream = torch.cuda.Stream()
         self._eng_rows = None
         self._eng_staged = None
+        self._adv = self._adv_next = self._com = False
         # each request's first position of the step (its preparation writes it): where the decode round's next step
         # advances from (``round.SingleStepRound``)
         self.first_positions = torch.zeros(
@@ -321,11 +330,12 @@ class SingleStepRunner(StepInputs):
         if not torch.cuda.is_current_stream_capturing():
             self._stop_ready.synchronize()
         stop = int(self._stop_host[0])
-        # the previous target launch's timing (its verify copy was waited for just above: no extra wait)
-        while self._step_ev:
-            e0, e1 = self._step_ev.pop(0)
-            e1.synchronize()
-            ms = e0.elapsed_time(e1)
+        # the previous target launch's GPU time, prep's entry to its last CTA's exit (its stamps were copied with the STOP
+        # word, waited for just above: a hung launch still blocks there, as its end event did; a timed-out poll ends it)
+        if self._ts_owed and not torch.cuda.is_current_stream_capturing():
+            self._ts_owed = False
+            ts = self._ts_host
+            ms = (int(ts[1:].max()) - int(ts[0])) / 1e5   # (steady counter: 100 MHz)
             if ms > 18000.0:   # (a timed-out poll costs >= POLL_TICKS = 20 s; the first launch's module-load rank skew stays below it)
                 raise RuntimeError(
                     f"V4.1 single-launch step: a step took {ms:.0f} ms on the GPU (a device poll timed out, "
@@ -375,18 +385,23 @@ class SingleStepRunner(StepInputs):
             self._device_inputs(input_ids, forward_context, engs)
             launches[0](*args[:-1], torch.cuda.current_stream())
 
-        ev = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
-        ev[0].record()
-        g = self._graphs.get(rows)
+        # the device round's advance runs in this step's preparation (``advances``): its own build, so its own graph
+        # (only on the device-round step the round laid out for it: a flag left by a step the launch did not serve lapses)
+        md = forward_context.attn_metadata
+        adv = self._adv = bool(self._adv_next) and md.served_by_round is RoundService.DEVICE
+        self._adv_next = False
+        gk = (rows, adv)
+        g = self._graphs.get(gk)
         if g is not None and g[0] == key:
             g[1].replay()
-        elif self._seen.get(rows) == key:
+            self._com = g[2]
+        elif self._seen.get(gk) == key:
             # the same addresses / shapes as the width's previous (eager) step: capture its preparation and first
             # launch, then replay -- a key change (a reallocation, a geometry or plan-capacity change) recaptures
             gr = torch.cuda.CUDAGraph()
             with torch.cuda.graph(gr, capture_error_mode="thread_local"):
                 first()
-            self._graphs[rows] = (key, gr)
+            self._graphs[gk] = (key, gr, self._com)
             logger.info(
                 "V4.1 single-launch step: captured the preparation graph of %d rows (rank %d)",
                 rows,
@@ -394,13 +409,12 @@ class SingleStepRunner(StepInputs):
             )
             gr.replay()
         else:
-            self._seen[rows] = key
+            self._seen[gk] = key
             first()
-        self._ev_verify.record()  # the verdict is ready here; the draft launch follows on the same stream
-        ev[1].record()   # (the target launch's end: the step's outputs; a draft-launch timeout costs only acceptance)
+        # the verdict is ready here (and the target launch's stamps); the draft launch follows on the same stream
+        self._ev_verify.record()
         launches[1](*args)
         if not torch.cuda.is_current_stream_capturing():
-            self._step_ev.append(ev)
             if self.K["attention"].DSTAMP:
                 self._log_dstamps()
         self._qrow = self._qrow_next
@@ -510,17 +524,43 @@ class SingleStepRunner(StepInputs):
             self.verify_ready.record()
             # after the event: the output D2H does not wait for it; the next launch reads it
             self._stop_host.copy_(self._stop, non_blocking=True)
+            a_, b_ = self._ts_words
+            self._ts_host.copy_(self.scratch["tcom"].view(torch.int64)[a_:b_], non_blocking=True)
+            self._ts_owed = True
             self._stop_ready.record()
         out.record_stream(cur)
         verdict.record_stream(cur)
         cur.wait_event(self.verify_ready)
+        # the anchors this launch's verify committed in the kernel (``committed_in_kernel``) and that its successor's
+        # preparation may advance from (``advances``): the copy's row, as the round hands them back
+        self._verdict_anchors = verdict[2].data_ptr() if bs else None
+        self._verdict_ref = verdict  # (held: no other tensor takes its address while the pointer checks below use it)
         return out, verdict
 
-    def draft_ids(self, bs: int):
-        """The next step's drafts [bs, 5] (the kernel's Markov block sampling, mids), as ``Drafter.propose`` returns."""
-        return (
-            self.scratch["mids"]
-            .view(torch.int32)[: 8 * 5]
-            .view(8, 5)[:bs]
-            .to(torch.int64)
+    def committed_in_kernel(self, anchors) -> bool:
+        """Whether the last launch's verify committed the Engram cursors at ``anchors`` (sample.commit: its preparation
+        staged every request's candidates, int64 rows) -- the runner's own verdict, as ``verify_outputs`` gave it."""
+        return bool(
+            getattr(self, "_com", False)
+            and anchors is not None
+            and anchors.data_ptr() == getattr(self, "_verdict_anchors", None)
         )
+
+    def advances(self, anchors, requests: int) -> bool:
+        """The next launch's preparation advances its positions from the last launch's verdict (kernels/prep.py adv; in
+        place of ``device_round.advance``) when ``anchors`` are that verdict's (still in the scratch: no launch since)
+        and the preparation is the one-launch kind."""
+        ok = bool(
+            self.tables.idx
+            and self.tables.comp
+            and anchors is not None
+            and anchors.data_ptr() == getattr(self, "_verdict_anchors", None)
+            and tuple(anchors.shape) == (requests,)
+        )
+        self._adv_next = ok
+        return ok
+
+    def draft_ids(self, bs: int):
+        """The next step's drafts [bs, 5] int64 (the kernel's Markov block sampling, mids64), as ``Drafter.propose``
+        returns: a view (the next draft launch rewrites it, after the next step's preparation has read it)."""
+        return self.scratch["mids64"].view(torch.int64)[: 8 * 5].view(8, 5)[:bs]

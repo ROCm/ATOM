@@ -129,9 +129,25 @@ class SingleStepRound(DecodeRound):
 
     def laid_out(self, metadata) -> None:
         if self.device is not None:
-            self.device.laid_out(metadata)
+            # the launch's preparation advances the positions itself (kernels/prep.py adv) from the verdict it left
+            runner = self.model.single_runner
+            self.device.laid_out(metadata, runner.advances if runner is not None else None)
 
     def committed(self, metadata, anchors) -> bool:
+        """The launch's verify committed the Engram cursors at ``anchors`` (kernels/sample.py ``commit``): only the
+        bookkeeping of ``cache.commit_tentative`` here, as the hi path's ``PostVerify.committed``. Any other step (anchors
+        not the launch's verdict, a launch that did not stage every request's candidates) -> ATOM's commit, which rewrites
+        the same rows where the kernel wrote them."""
         if self.device is not None:
             self.device.committed(metadata, anchors)
-        return False
+        runner = self.model.single_runner
+        if runner is None or not runner.committed_in_kernel(anchors):
+            return False
+        cache = metadata.cache
+        pending = getattr(cache, "pending", None)
+        if pending is None or not pending.staged_on_device:
+            return False
+        if pending.step is not metadata.step:
+            raise RuntimeError("Tentative state was not prepared for this step")
+        cache.pending = None
+        return True

@@ -116,7 +116,7 @@ def _lw(sm, src, q, kind=F32):
 
 @ASTRewriter.transform
 def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank, tag0, sp, qlog, dids, prow, outtok,
-                  verdict, anc, qids=None, ctxp=None):
+                  verdict, anc, qids=None, ctxp=None, com=None):
     t = hx.opaque_v(t)
     b = hx.opaque_s(b)
     row = b // CPR
@@ -501,6 +501,38 @@ def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank,
         hx.gstore(verdict + i64(NREQ + rr) * 4, I32(ND) - f)
         hx.gstore(verdict + i64(2 * NREQ + rr) * 4, r0 + f)
         hx.gstore(anc + i64(rr) * 4, tf)
+        if fx.const_expr(com is not None):
+            commit(com, rr, f)
+
+
+# tcom (i64 words, kernels/prep.py writes it each step): the Engram commit of the verify (ATOM's _commit_cursors) and
+# each request's first position (the next step's device round advances from it)
+COM_N, COM_CUR, COM_CAND, COM_CST, COM_CS0, COM_CS1, COM_W, COM_FIRSTP, COM_SLOT, COM_FIRST, COM_REQ = (
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 16, 24)
+# the target launch's steady-counter stamps (100 MHz): prep's entry (COM_T0), each CTA's exit from the target launch
+# (COM_EXIT + CTA): the host's poll-timeout check (``runner.launch``: no timing events on the step's stream)
+COM_T0, COM_EXIT, COM_NEXIT = 25, 32, 256
+COM_WMAX = 8                 # cursor row width bound (the history + 1: 4 for 4-grams)
+
+
+@ASTRewriter.transform
+def commit(com, rr, f):
+    """Request rr (D's thread): its first position -> firstp; when the step staged cursor candidates (COM_N requests),
+    its accepted prefix's candidate cursor (prefix f: the request's rows start at rr x 6) -> cursor[its slot]."""
+    r64 = fx.Int64(rr)
+    if r64 < hx.gload(com + i64(COM_REQ * 8), fx.Int64):
+        fp = hx.gload(com + i64(COM_FIRSTP * 8), fx.Int64)
+        hx.gstore(fp + r64 * 4, hx.gload(com + i64(COM_FIRST * 8) + r64 * 8, fx.Int64).to(I32))
+    if r64 < hx.gload(com + i64(COM_N * 8), fx.Int64):
+        cs0 = hx.gload(com + i64(COM_CS0 * 8), fx.Int64)
+        cs1 = hx.gload(com + i64(COM_CS1 * 8), fx.Int64)
+        src = hx.gload(com + i64(COM_CAND * 8), fx.Int64) + (r64 * cs0 + fx.Int64(f) * cs1) * 8
+        slot = hx.gload(com + i64(COM_SLOT * 8) + r64 * 8, fx.Int64)
+        dst = hx.gload(com + i64(COM_CUR * 8), fx.Int64) + slot * hx.gload(com + i64(COM_CST * 8), fx.Int64) * 8
+        width = hx.gload(com + i64(COM_W * 8), fx.Int64)
+        for w in range_constexpr(COM_WMAX):
+            if fx.Int64(w) < width:
+                hx.gstore(dst + i64(w * 8), hx.gload(src + i64(w * 8), fx.Int64))
 
 
 def build(V, rank, rep=1):

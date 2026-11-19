@@ -48,14 +48,19 @@ def _st(p, i, v, w):
         hx.gstore(p + I64(i) * 4, I64(v).to(I32))
 
 
-def build(widths, rows_per_request, bcols, ratios, extra_write, cap, eng=None):
+def build(widths, rows_per_request, bcols, ratios, extra_write, cap, eng=None, adv=False):
     """The launcher for the given integer widths (dict name -> 4 / 8) and the step's constants. eng: None, or (ngram,
     has a dead mask, stages cursor candidates): the Engram stage's compress and snapshot kernels
-    (model_ops/engram/device/hashing.py: _compress_kernel, _engram_snapshot_kernel with COUNTED) in this launch."""
+    (model_ops/engram/device/hashing.py: _compress_kernel, _engram_snapshot_kernel with COUNTED) in this launch.
+    adv: the device round's advance (round/device_round.py ``_advance_kernel``) in this launch: row i of request q is at
+    firstp[q] + 1 + anchor[q] - q x rows + i % rows (firstp: the previous step's first positions, the target's verify
+    writes them; anchor: its verdict's row 2, still in vptr), in place of the host's positions (rewritten by CTA 0).
+    Every launch also writes tcom (sample.COM_*): the step's first positions and, with a staged verify (ncom
+    requests), the Engram commit's addresses, which the target's verify reads."""
     W = dict(widths)
     ROWS = rows_per_request
     RA, RB = ratios
-    keyed = (tuple(sorted(W.items())), ROWS, bcols, RA, RB, extra_write, cap, eng)
+    keyed = (tuple(sorted(W.items())), ROWS, bcols, RA, RB, extra_write, cap, eng, adv)
     ENG = eng is not None
     NGR, HAS_MASK, STAGE = eng if ENG else (1, False, False)
 
@@ -67,17 +72,29 @@ def build(widths, rows_per_request, bcols, ratios, extra_write, cap, eng=None):
              n: fx.Int32, req: fx.Int32, nbt: fx.Int32, cc: fx.Int32, btstride: fx.Int32, slot_rows: fx.Int32,
              ring_slots: fx.Int32, wsize: fx.Int32, ncnt: fx.Int32, nss: fx.Int32, nmbest: fx.Int32, nsp: fx.Int32,
              lookup: Int64, eids: Int64, elive: Int64, edead: Int64, ecomp: Int64, ecu: Int64, ehist: Int64,
-             ehidx: Int64, esnap: Int64, ecand: Int64, hstride: fx.Int32, nsnap: fx.Int32, cs0: fx.Int32, cs1: fx.Int32):
+             ehidx: Int64, esnap: Int64, ecand: Int64, hstride: fx.Int32, nsnap: fx.Int32, cs0: fx.Int32, cs1: fx.Int32,
+             tcom: Int64, ccur: Int64, ncom: fx.Int32, cw: fx.Int32, vptr: Int64):
         _ = keyed
         t = hx.opaque_v(fx.thread_idx.x)
         b = hx.opaque_s(fx.block_idx.x)
+
+        def P(i):   # row i's position: the host's, or (adv) the device round's from the previous verdict
+            if fx.const_expr(adv):
+                q = I64(i) // I64(ROWS)
+                return (_ld(firstp, q, W["firstp"]) + I64(1) + hx.gload(vptr + (I64(2 * 8) + q) * 4, I32).to(I64)
+                        - q * I64(ROWS) + I64(i) % I64(ROWS))
+            return _ld(pos, i, W["pos"])
         if b == 0:
+            if t == 0:   # the launch's start stamp (sample.COM_T0)
+                hx.gstore(tcom + I64(25 * 8), hx.clock())
             if t < n:   # write_step_meta (program 0) and prep_step's rows
                 batch = _ld(bids, t, W["bids"])
                 live = batch >= I64(0)
                 brow = fx.max(batch, I64(0))
                 slot = _ld(slots, brow, W["slots"])
-                p = _ld(pos, t, W["pos"])
+                p = P(t)
+                if fx.const_expr(adv):
+                    _st(pos, t, p, W["pos"])
                 rel = live.select(slot * I64(slot_rows) + p % I64(ring_slots), I64(-1))
                 _st(kvw, t, rel, 4)
                 _st(ctxkvw, t, rel, W["ctxkvw"])
@@ -87,8 +104,8 @@ def build(widths, rows_per_request, bcols, ratios, extra_write, cap, eng=None):
                 _st(kmeta, t * WORDS + 2, brow * I64(btstride), 4)
                 _st(kmeta, t * WORDS + 3, slot * I64(slot_rows), 4)
                 _st(rpos, t, p, W["rpos"])
-                if t % ROWS == 0:
-                    _st(firstp, t // ROWS, p, W["firstp"])
+                if t % ROWS == 0:   # (firstp itself: the target's verify, after every reader of the old one here)
+                    hx.gstore(tcom + (I64(16) + I64(t // ROWS)) * 8, p)
                 _st(tids, t, _ld(ids, t, W["ids"]), W["tids"])
                 _st(ibat, t, batch, W["ibat"])
             if t < req * (ROWS - 1):
@@ -97,16 +114,23 @@ def build(widths, rows_per_request, bcols, ratios, extra_write, cap, eng=None):
                 _st(dgeom, t + 8, _ld(slots, t, W["slots"]), 4)
             if t < nbt:
                 _st(slotsd, t, _ld(slots, t, W["slots"]), W["slotsd"])
+            if t < ncom:   # the commit's slots (sample.commit: ATOM's _commit_cursors' slots = history_index)
+                hx.gstore(tcom + (I64(8) + I64(t)) * 8, _ld(ehidx, t, W["ehidx"]) if ENG else I64(0))
+            if t == 0:   # sample.COM_*: N, CUR, CAND, CST, CS0, CS1, W, FIRSTP, ..., REQ
+                hdr = [I64(ncom), ccur, ecand, I64(hstride), I64(cs0), I64(cs1), I64(cw), firstp]
+                for z in range_constexpr(8):
+                    hx.gstore(tcom + I64(z * 8), hdr[z])
+                hx.gstore(tcom + I64(24 * 8), I64(req))
         if b == 1:   # the draft context's RoPE rows (f32 tables, 32 a row)
             for k0 in range_constexpr(0, 48 * 32, THREADS):
                 k = t + k0
                 if k < n * 32:
-                    src = _ld(pos, k // 32, W["pos"]) * I64(32) + I64(k % 32)
+                    src = P(k // 32) * I64(32) + I64(k % 32)
                     hx.gstore(ctxcos + I64(k) * 4, hx.gload(cos + src * 4, fx.Float32))
                     hx.gstore(ctxsin + I64(k) * 4, hx.gload(sin + src * 4, fx.Float32))
         if b == 2:   # fill_step_plans: the visible counts, every plan row -1, then the live rows in order
             if t < n:
-                p = _ld(pos, t, W["pos"]).to(I32)
+                p = P(t).to(I32)
                 _st(vis1, t, (p + I32(1)) // I32(RA), W["vis"])
                 _st(vis2, t, (p + I32(1)) // I32(RB), W["vis"])
             for f0 in range_constexpr(0, 4 * cap, THREADS):
@@ -125,7 +149,7 @@ def build(widths, rows_per_request, bcols, ratios, extra_write, cap, eng=None):
                     wi = I32(0)
                     for i_ in range(n):
                         i = I32(i_)
-                        p = _ld(pos, i, W["pos"]).to(I32)
+                        p = P(i).to(I32)
                         j = i % ROWS
                         bb = i // ROWS
                         end = p - j + ROWS
@@ -179,7 +203,7 @@ def build(widths, rows_per_request, bcols, ratios, extra_write, cap, eng=None):
                                     _st(ecand, batch * I64(cs0) + local * I64(cs1) + I64(NGR - 1 - shift), src, W["ecand"])
                         if fx.const_expr(STAGE):
                             if live:
-                                position = _ld(pos, tk - local, W["pos"])
+                                position = P(tk - local)
                                 _st(ecand, batch * I64(cs0) + local * I64(cs1), position + local + I64(1), W["ecand"])
         g = b * THREADS + t
         for s in range(0, ncnt, NCTA * THREADS):
@@ -207,11 +231,12 @@ def build(widths, rows_per_request, bcols, ratios, extra_write, cap, eng=None):
                ring_slots: fx.Int32, wsize: fx.Int32, ncnt: fx.Int32, nss: fx.Int32, nmbest: fx.Int32, nsp: fx.Int32,
                lookup: Int64, eids: Int64, elive: Int64, edead: Int64, ecomp: Int64, ecu: Int64, ehist: Int64,
                ehidx: Int64, esnap: Int64, ecand: Int64, hstride: fx.Int32, nsnap: fx.Int32, cs0: fx.Int32, cs1: fx.Int32,
+               tcom: Int64, ccur: Int64, ncom: fx.Int32, cw: fx.Int32, vptr: Int64,
                stream: fx.Stream = fx.Stream(None)):
         _ = keyed
         body(pos, ids, bids, slots, cos, sin, bt, kvw, kmeta, vis1, vis2, cp1, wp1, cp2, wp2, spsrc, spdst, rpos, firstp,
              tids, dids, dgeom, ctxkvw, ctxcos, ctxsin, ibat, btab, slotsd, cnt, ss, mbest, n, req, nbt, cc, btstride,
              slot_rows, ring_slots, wsize, ncnt, nss, nmbest, nsp, lookup, eids, elive, edead, ecomp, ecu, ehist,
-             ehidx, esnap, ecand, hstride, nsnap, cs0, cs1).launch(grid=(NCTA,), block=(THREADS,), smem=0,
+             ehidx, esnap, ecand, hstride, nsnap, cs0, cs1, tcom, ccur, ncom, cw, vptr).launch(grid=(NCTA,), block=(THREADS,), smem=0,
                                                                         stream=stream)
     return launch

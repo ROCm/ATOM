@@ -291,6 +291,9 @@ class StepInputs:
                     btab=S["btab"], slotsd=S["slots"], vis=S["ibound1"])
         er = getattr(self, "_eng_prep", None)
         eng, ex = None, (0,) * 10 + (0, 0, 0, 0)
+        # the target's verify commits the accepted prefix's Engram cursor (sample.commit: ATOM's _commit_cursors) when
+        # this launch stages the candidates of every request of the step, int64 rows (``committed_in_kernel``)
+        ccur, ncom, cw = 0, 0, 0
         if er is not None:
             # the Engram stage (EngramStaging._snapshot: engram_compress + engram_snapshot) in this launch
             est, stg = er.staging.step, er.staging
@@ -302,6 +305,11 @@ class StepInputs:
             if est.batch_ids.data_ptr() != step.batch_ids.data_ptr() or est.positions.data_ptr() != step.positions.data_ptr():
                 raise MonoUnsupported("engram: the staging's batch ids / positions are not the step's")
             eng = (int(tabs.ngram), True, True)
+            cand, cur = est.candidates, est.cursor
+            if (cand.dtype == torch.int64 and cur.dtype == torch.int64 and cur.stride(1) == 1 and cand.stride(2) == 1
+                    and cur.shape[1] <= self.K["sample"].COM_WMAX and cand.shape[2] == cur.shape[1]
+                    and step.scheduled_bs == req):
+                ccur, ncom, cw = cur.data_ptr(), req, int(cur.shape[1])
             ex = (tabs.lookup.data_ptr(), est.input_ids.data_ptr(), est.live.data_ptr(), est.dead.data_ptr(),
                   stg.compressed.data_ptr(), est.cu_seqlens.data_ptr(), hist.data_ptr(), est.history_index.data_ptr(),
                   stg.snapshot.data_ptr(), est.candidates.data_ptr(), hist.stride(0), w_,
@@ -313,11 +321,15 @@ class StepInputs:
         assert S["kvw"].element_size() == 4 and S["kmeta"].element_size() == 4 and S["dgeom"].element_size() == 4
         assert all(S[f"{p}{r}"].dtype == torch.int32 for p in ("cplan", "wplan") for r in (1, 2))
         assert S["ibound2"].dtype == S["ibound1"].dtype and self._sp_pin.is_pinned()
-        launch = self._prep_builds.get((widths, eng)) if hasattr(self, "_prep_builds") else None
+        # the device round's advance in this launch (``round.SingleStepRound.laid_out``: this step's positions are the
+        # previous verdict's, the host laid them out as if no draft had been rejected)
+        adv = bool(getattr(self, "_adv", False))
+        self._com = ncom > 0
+        launch = self._prep_builds.get((widths, eng, adv)) if hasattr(self, "_prep_builds") else None
         if launch is None:
             self._prep_builds = getattr(self, "_prep_builds", {})
-            launch = self._prep_builds[(widths, eng)] = self.K["prep"].build(
-                widths, ROWS_PER_REQ, BCOLS, (1, 2), geom.speculative_tokens, T_MAX, eng
+            launch = self._prep_builds[(widths, eng, adv)] = self.K["prep"].build(
+                widths, ROWS_PER_REQ, BCOLS, (1, 2), geom.speculative_tokens, T_MAX, eng, adv
             )
         cnt = self.scratch["cnt"].view(torch.int32)
         ss = self.scratch["ss"].view(torch.int32)
@@ -332,6 +344,7 @@ class StepInputs:
             P(S["btab"]), P(S["slots"]), P(cnt), P(ss), P(mbest),
             rows, req, nbt, cc, bt.stride(0), int(window.slot_rows), int(window.ring_slots), int(geom.window_size),
             cnt.numel(), ss.numel(), mbest.numel(), self._sp_pin.numel(), *ex,
+            P(self.scratch["tcom"]), ccur, ncom, cw, P(self.scratch["verdict"]),
             torch.cuda.current_stream(),
         )
 

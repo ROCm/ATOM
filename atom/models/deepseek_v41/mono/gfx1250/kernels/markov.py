@@ -59,7 +59,8 @@ def roff(k, src, req):
 
 
 @ASTRewriter.transform
-def markov_once(base, anchors, w1, w2s, ids_out, emb_out, best, cnt, recv, rank, tag0, t, b, sm, sp=None, qlog=None, qids=None):
+def markov_once(base, anchors, w1, w2s, ids_out, emb_out, best, cnt, recv, rank, tag0, t, b, sm, sp=None, qlog=None, qids=None,
+                ids64=None):
     t = hx.opaque_v(t)
     b = hx.opaque_s(b)
     w = t // 32
@@ -148,6 +149,8 @@ def markov_once(base, anchors, w1, w2s, ids_out, emb_out, best, cnt, recv, rank,
             hx.lstore(sm + LX + t * 4, xi)
             if b == 0:
                 hx.gstore(ids_out + i64(t * TB + k) * 4, xi)
+                if fx.const_expr(ids64 is not None):   # the host's draft ids (int64: ``runner.draft_ids``)
+                    hx.gstore(ids64 + i64(t * TB + k) * 8, fx.Int64(xi))
                 if fx.const_expr(qids is not None):   # the drafts qlog was kept for (persistent; checked by the verify)
                     hx.gstore(qids + i64(t * TB + k) * 4, xi)
         gpu.barrier()

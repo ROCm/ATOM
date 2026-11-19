@@ -169,7 +169,10 @@ TPTRS_ROLE = {
     "dlog": SCRATCH,
     "mw1": WEIGHT,
     "mw2": WEIGHT,  # the Markov sampler's
-    "mids": SCRATCH,  # draft tokens out -> ``draft_ids``
+    "mids": SCRATCH,  # draft tokens out (the next step's dids)
+    "mids64": SCRATCH,  # the same as int64 -> ``draft_ids`` (no widening launch after the draft)
+    # the verify's Engram commit and first positions (prep writes it, the target's verify reads it: ``kernels.prep``)
+    "tcom": SCRATCH,
     "memb": SCRATCH,
     "mbest": SCRATCH,
     # each target row's sampling [T][8] (invT, top_p, seed, greedy | invTd, hasq, qsrc, seed_acc) -> ``runner._sampling``
@@ -334,6 +337,8 @@ def scratch_bytes(K, nlt: int) -> dict[str, int]:
         "dh": T * HF.HID * 2,
         "dlog": T * HF.VR * 4,
         "mids": TD_MAX * 4,
+        "mids64": TD_MAX * 8,
+        "tcom": (32 + 256) * 8,  # sample.COM_*: the commit words, then the target launch's CTA exit stamps
         "memb": TD_MAX * 256 * 2,
         "mbest": TD_MAX * 8,
         # context KV
