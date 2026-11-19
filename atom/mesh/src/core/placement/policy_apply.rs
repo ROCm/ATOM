@@ -20,6 +20,7 @@ pub async fn apply_policy(
         headers: descriptor.headers,
         hash_ring,
         carries_media: descriptor.carries_media,
+        preferred_worker: None,
     };
     let (idx, decision) = policy.select_with_decision(candidates, &info).await;
     let selected = idx.map(|idx| candidates[idx].clone());

@@ -407,8 +407,8 @@ impl AppContextBuilder {
         let session_affinity = config.effective_session_affinity();
         if config.session_affinity.is_enabled() && !session_affinity.is_enabled() {
             tracing::warn!(
-                "session affinity settings are not supported with gRPC workers; \
-                 dp_sticky keys on x-session-id"
+                "session affinity is not supported with gRPC workers; policies run without \
+                 the session table, and dp_sticky keys on x-session-id"
             );
         }
         self.policy_registry = Some(Arc::new(PolicyRegistry::with_session_affinity(
@@ -463,5 +463,41 @@ impl AppContextBuilder {
 impl Default for AppContextBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        config::PolicyConfig,
+        core::{prepare_pool::PreparePoolRuntime, ConnectionMode},
+        policies::RandomPolicy,
+    };
+
+    async fn policies_for(connection_mode: ConnectionMode, policy: PolicyConfig) -> AppContext {
+        let pool =
+            PreparePoolRuntime::new(RouterConfig::default().resolved_prepare_pool().unwrap())
+                .unwrap();
+        let config = RouterConfig {
+            connection_mode,
+            policy,
+            ..Default::default()
+        };
+        AppContext::from_config(config, 5, pool.handle())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn grpc_workers_get_policies_without_the_session_table() {
+        let grpc = ConnectionMode::Grpc { port: None };
+        let random = policies_for(grpc, PolicyConfig::Random).await;
+        let default = random.policy_registry.get_default_policy();
+        assert!(default.as_any().downcast_ref::<RandomPolicy>().is_some());
+
+        let http = policies_for(ConnectionMode::Http, PolicyConfig::Random).await;
+        let default = http.policy_registry.get_default_policy();
+        assert!(default.as_any().downcast_ref::<RandomPolicy>().is_none());
     }
 }
