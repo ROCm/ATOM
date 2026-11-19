@@ -218,6 +218,15 @@ def test_decode_keep_builds_the_step_image_with_its_ple_windows(
     assert not logged
 
 
+@pytest.mark.parametrize("gdn_layers", [2, 0])
+def test_every_pp_stage_answers_the_decode_image_alike(one_tp_rank, gdn_layers):
+    """A stage with no GDN or PLE layer still has their planes, the PLE ones
+    from the model's config, so it answers as the others do."""
+    builder, cls = _builder()
+    builder.num_state_layers = lambda: gdn_layers
+    assert cls._decode_image_is_conv_and_ssm(builder)
+
+
 def test_a_plane_besides_ple_keeps_no_decode_image(one_tp_rank, monkeypatch):
     """The step's image rebuilds conv, SSM and PLE; any other plane would be
     restored as the slot is."""
