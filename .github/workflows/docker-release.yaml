@@ -236,19 +236,16 @@ jobs:
               # image to pull: the ROCm 10 stack is assembled from an AMD wheel
               # channel on plain ubuntu:24.04.
               #
-              # This is a tracking line, not a release base. It follows the
-              # nightly channel because the device-memory queue signal work
-              # (rocm-systems #12988/#13424/#13507) is absent from 10.2 GA and
-              # only defaults on from 10.3.0a20261115 -- hence that floor. The
-              # torch trio stays pinned: one nightly date publishes several
-              # torch lines at once, so letting it float would land the image on
-              # a torch alpha. CACHEBUST is the day stamp, so the resolve layer
-              # rebuilds once a day instead of being served from cache.
+              # The pin is a nightly, deliberately: the device-memory queue
+              # signal work (rocm-systems #12988/#13424/#13507) is in no GA
+              # release yet -- 10.2 GA does not carry it -- and 10.3.0a20261118
+              # is a build where it is present and on by default. Everything is
+              # an exact version, so the build stays reproducible; refresh the
+              # pin with docker/resolve_rocm_versions.py before the channel's
+              # ~90-day retention ages it out.
               BASE_IMAGE="rocm10-base"
               EXTRA_BUILD_ARGS="--build-arg ROCM_INDEX_URL=https://nightly.repo.amd.com/rocm/whl-next/"
-              EXTRA_BUILD_ARGS="${EXTRA_BUILD_ARGS} --build-arg ROCM_SDK_SERIES=10.3"
-              EXTRA_BUILD_ARGS="${EXTRA_BUILD_ARGS} --build-arg ROCM_SDK_MIN_VERSION=10.3.0a20261115"
-              EXTRA_BUILD_ARGS="${EXTRA_BUILD_ARGS} --build-arg ROCM_SDK_CACHEBUST=$(date -u +%Y%m%d)"
+              EXTRA_BUILD_ARGS="${EXTRA_BUILD_ARGS} --build-arg ROCM_SDK_VERSION=10.3.0a20261118"
               EXTRA_BUILD_ARGS="${EXTRA_BUILD_ARGS} --build-arg ROCM_TORCH_VERSION=2.14.0"
               EXTRA_BUILD_ARGS="${EXTRA_BUILD_ARGS} --build-arg ROCM_TORCHVISION_VERSION=0.29.0"
               EXTRA_BUILD_ARGS="${EXTRA_BUILD_ARGS} --build-arg ROCM_TORCHAUDIO_VERSION=2.11.0.3"
@@ -259,6 +256,12 @@ jobs:
               # device-memory queue signals off, so the line that exists to carry
               # that fix has to turn it off to actually carry it.
               EXTRA_BUILD_ARGS="${EXTRA_BUILD_ARGS} --build-arg ROCPROFILER_REGISTER_ENABLED=0"
+              # The pinned RCCL commit carries its own hipMemFabricHandle_st
+              # shim, written when HIP had none. ROCm 10.3 defines the type
+              # itself (hip_runtime_api.h:852), so the source build dies on a
+              # redefinition. Nothing is lost by skipping it: the pip SDK ships
+              # librccl.so.1 and rccl/rccl.h, and the image keeps those.
+              EXTRA_BUILD_ARGS="${EXTRA_BUILD_ARGS} --build-arg BUILD_RCCL=0"
               ;;
             */*|*:*)
               # A literal image reference, for a one-off build on something

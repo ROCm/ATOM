@@ -32,16 +32,23 @@ ARG BASE_IMAGE_ROCM10="ubuntu:24.04"
 # wheels, installed into site-packages rather than /opt/rocm). Ported from
 # sglang's docker/rocm.Dockerfile rocm1000-base stage.
 #
-# Version policy:
-#   - Pinned line: stable channel, an exact ROCM_SDK_VERSION (10.0.0 is the
-#     combination sglang validated). Reproducible; what a release is cut from.
-#   - Nightly tracking line (10.3): set ROCM_SDK_SERIES and let the stage
-#     resolve the newest dated build at or above ROCM_SDK_MIN_VERSION. ROCm 10.2
-#     GA does not carry the device-memory queue signal work (rocm-systems
-#     #12988/#13424/#13507), and the queue-signal default only flipped on in
-#     10.3.0a20261115, which is why that date is the floor. NOT a release
-#     artifact: it exists to surface breaks early. Once the work lands in a GA
-#     release, pin that version here and drop ROCM_SDK_SERIES.
+# Version policy: always an exact ROCM_SDK_VERSION, from whichever channel
+# ROCM_INDEX_URL names. The stable channel carries GA versions (10.0.0 is the
+# combination sglang validated); the nightly channel carries dated builds.
+#
+# The ROCm 10 line pins a *nightly*, which is unusual and deliberate: the
+# device-memory queue signal work (rocm-systems #12988/#13424/#13507) is absent
+# from 10.2 GA -- verified down to the shipped libamdhip64.so -- so no GA
+# release carries it yet, and without it MI355X decode pays 8-12%. The pin is a
+# nightly at or above 10.3.0a20261115, the first build where the queue-signal
+# default is on (#15318, merged 2026-11-14); earlier builds have the code but
+# default it off.
+#
+# A pinned nightly expires: the channel keeps a rolling ~90 days (measured
+# 2026-11-19: 88 consecutive dated builds, oldest 10.1.0a20260823, nothing
+# older). Refresh the pin before it ages out -- docker/resolve_rocm_versions.py
+# reports the newest date carrying a complete, self-consistent set, which is
+# the date to pin. Drop all of this once the work ships in a GA release.
 #
 # Python 3.12 (Ubuntu 24.04 default): the wheel channel publishes cp312 for
 # the whole stack; torch 2.11+rocm10.0.0 is the version sglang validated.
@@ -69,15 +76,9 @@ ENV ROCM_INDEX_URL=${ROCM_INDEX_URL}
 # new stage. The nightly channel prunes old date-stamped builds, so such a
 # line has to resolve its versions at build time rather than pin them.
 #
-# So a nightly line floats exactly one thing: the date. ROCM_SDK_SERIES turns
-# resolution on, ROCM_SDK_MIN_VERSION is the floor below which the line must not
-# land, and the torch trio above stays pinned -- one nightly date publishes
-# several torch lines side by side, so "newest of each" would quietly carry the
-# image onto a torch alpha. Leave ROCM_SDK_SERIES empty and the stage behaves
-# exactly as before, honouring the ROCM_SDK_VERSION pin.
-ARG ROCM_SDK_SERIES=""
-ARG ROCM_SDK_MIN_VERSION=""
-ARG ROCM_PYTHON_TAG="cp312"
+# Note the torch trio is pinned separately from the SDK: one nightly date
+# publishes several torch lines side by side (2.13, 2.14, 2.15, 2.16.0a0 against
+# the same SDK), so the SDK version alone does not determine them.
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
@@ -99,39 +100,11 @@ RUN python3 -m venv "$VIRTUAL_ENV"
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 RUN python3 -m pip install --no-cache-dir -U pip setuptools setuptools_scm wheel
 
-# Resolve the nightly date, if this is a tracking line. This stage carries no
-# CACHEBUST on purpose -- that one lives in atom_image so the parallel builder
-# stages stay cached -- but a line whose whole point is "today's nightly" must
-# not be served yesterday's layer. ROCM_SDK_CACHEBUST is the caller's knob: a
-# date stamp on a daily line, empty on a pinned one, which leaves the stable
-# line's cache untouched.
-ARG ROCM_SDK_CACHEBUST=""
-COPY docker/resolve_rocm_versions.py /tmp/resolve_rocm_versions.py
-RUN set -eux; \
-    if [ -n "${ROCM_SDK_SERIES}" ]; then \
-        python3 /tmp/resolve_rocm_versions.py \
-            --index-url "${ROCM_INDEX_URL}" \
-            --series "${ROCM_SDK_SERIES}" \
-            --min-version "${ROCM_SDK_MIN_VERSION}" \
-            --arches "${GPU_ARCH}" \
-            --python-tag "${ROCM_PYTHON_TAG}" \
-            --torch "${ROCM_TORCH_VERSION}" \
-            --torchvision "${ROCM_TORCHVISION_VERSION}" \
-            --torchaudio "${ROCM_TORCHAUDIO_VERSION}" \
-            > /tmp/rocm-versions.env; \
-    else \
-        echo "ROCM_SDK_VERSION=${ROCM_SDK_VERSION}" > /tmp/rocm-versions.env; \
-    fi; \
-    cat /tmp/rocm-versions.env
-
 # Unlike the sglang rocm1000 flavors (one device payload per image), the ATOM
 # release image is a single multi-arch image: GPU_ARCH="gfx942;gfx950" gets a
 # device payload for every listed arch. Loop over GPU_ARCH_LIST so adding an
 # arch stays a GPU_ARCH change, not a new package list.
 RUN set -eux; \
-    # Pinned line: the ROCM_SDK_VERSION already in the environment. Tracking
-    # line: the date the resolve step landed on, which overrides it here.
-    . /tmp/rocm-versions.env; \
     for arch in $(printf '%s' "${GPU_ARCH}" | tr ';' ' '); do \
         python3 -m pip install --no-cache-dir \
             --index-url ${ROCM_INDEX_URL} \
