@@ -124,6 +124,13 @@ def test_policy_is_empty_without_hip_before_probing_the_arch(
     assert policy == fly.GDNFlyDSLPolicy()
 
 
+def test_ops_raises_on_hip_when_an_aiter_symbol_is_missing(fly, monkeypatch):
+    monkeypatch.setattr(fly.torch.version, "hip", "6.4")
+    monkeypatch.setitem(sys.modules, "aiter.ops.flydsl.linear_attention_kernels", None)
+    with pytest.raises(ImportError):
+        fly.ops()
+
+
 @pytest.mark.parametrize("stage", ["prefill", "decode"])
 @pytest.mark.parametrize("replayssm", [False, True])
 @pytest.mark.parametrize("hip", [True, False])
