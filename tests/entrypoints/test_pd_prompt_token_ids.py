@@ -11,6 +11,7 @@ import fastapi.routing
 import httpx
 import numpy as np
 import pytest
+from conftest import gpu_stack_import
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 
@@ -23,7 +24,6 @@ from atom.entrypoints.openai.protocol import (
 from atom.model_engine.multimodal_runtime import multimodal_cache_seed
 from atom.model_engine.sequence import Sequence, SequenceStatus
 from atom.sampling_params import SamplingParams
-from conftest import gpu_stack_import
 
 PROMPT_IDS = [101, 102, 103, 104]
 
