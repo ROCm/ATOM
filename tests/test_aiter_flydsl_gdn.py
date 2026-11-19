@@ -701,9 +701,12 @@ def test_replayssm_prefill_layer_dispatch_matches_triton(monkeypatch, keep):
         )
         builder = object.__new__(Qwen4ExpMetadataBuilder)
         builder.replayssm = True
-        bound = builder.build_kv_cache_tensor(
-            SimpleNamespace(base_linear_attention=None, impl=attention)
+        builder.model_runner = SimpleNamespace(
+            config=SimpleNamespace(kv_transfer_config=None)
         )
+        layer = _GdnLayer(attention)
+        _with_one_gdn_layer(builder, layer, pool)
+        bound = builder.build_kv_cache_tensor(layer)
         assert bound.v_cache is pool
         assert not attention.gdn_flydsl_policy.decode
         metadata = SimpleNamespace(
