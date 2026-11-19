@@ -20,7 +20,9 @@ from atom.model_loader.weight_iterator import _MAX_SAFETENSORS_HEADER_BYTES
 # Launch options (Config fields) that change the loaded weights. The cache
 # does not find these by itself: a server whose setting is missing here gets
 # another launch's weights without a word, so add one when loading starts to
-# depend on it. What only picks a kernel or sizes a cache does not belong.
+# depend on it. What only picks a kernel or sizes a cache does not belong,
+# unless an object loading creates reads it: a server gets that object as the
+# daemon built it.
 _CONFIG_FIELDS = (
     "load_dummy",
     # Which MoE implementation, and whether the shared expert is fused in.
@@ -62,6 +64,11 @@ _ENV_VARS = (
     "ATOM_USE_TRITON_MXFP4_BMM",
     # Whether each rank holds the whole vocabulary embedding.
     "ATOM_REPLICATE_VOCAB_EMBED",
+    # Read by the MoE method online quantization swaps in while loading.
+    "AITER_FLYDSL_USE_HERD",
+    "ATOM_MORI_FP4_DISPATCH",
+    "ATOM_MORI_V2",
+    "ATOM_USE_TRITON_MOE_A4W4",
 )
 
 _SMALL_FILE = 1 << 20

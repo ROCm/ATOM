@@ -29,10 +29,13 @@ from atom.model_loader.weight_cache.values import (
 )
 
 _MAX_MESSAGE = 1 << 30
-# Sockets, locks and daemon logs. Not /dev/shm: containers started with
-# --ipc=host share it (and are all root), and IPC handles do not cross
-# containers anyway.
-_DIR = f"/tmp/atom_weight_cache_{os.getuid()}"
+# Sockets, locks and daemon logs: under the user's runtime directory, which
+# nobody else can create first; /tmp where there is none (in a container).
+# Not /dev/shm: containers started with --ipc=host share it (and are all
+# root), and IPC handles do not cross containers anyway.
+_DIR = os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR") or "/tmp", f"atom_weight_cache_{os.getuid()}"
+)
 
 
 def socket_dir() -> str:

@@ -240,8 +240,8 @@ def _digest_sums(t: torch.Tensor):
 
 
 def _digests(tensors) -> list[str]:
-    """Exact content digests (two position-weighted sums over the raw bytes),
-    with one host sync per device."""
+    """Content checksums (two position-weighted wrapping sums over the raw
+    bytes), with one host sync per device."""
     sums = [_digest_sums(t) for t in tensors]
     out = [s if isinstance(s, str) else "" for s in sums]
     by_device: dict = {}
@@ -279,7 +279,7 @@ def _recursable(v: Any) -> bool:
     ):
         return False
     if (
-        not hasattr(v, "__dict__")
+        not t.__dictoffset__  # no __dict__ (not hasattr: a lazy proxy would resolve)
         or not mod.startswith(_DIFF_PACKAGES)
         or mod.startswith(_NO_RECURSE)
     ):

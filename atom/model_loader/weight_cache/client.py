@@ -19,7 +19,6 @@ import torch
 from torch import nn
 
 from atom.distributed.group_agreement import group_agree, group_max, group_min
-from atom.model_engine.model_setup import build_model, construct_drafter
 from atom.model_loader.weight_cache.export import (
     _leftover_meta,
     _run_prepare_finalize,
@@ -39,7 +38,9 @@ from atom.model_loader.weight_cache.preload import (
     _spawn_daemon,
     _started_by_launch,
     launch_recorded,
+    mark_uncacheable,
     stop_daemon,
+    uncacheable,
 )
 from atom.model_loader.weight_cache.transport import (
     _recv,
@@ -69,13 +70,25 @@ class _Rank(NamedTuple):
     group: Any  # every runner of the launch: they decide together
 
 
-def _rank(config, device, rank: int) -> _Rank:
-    try:
-        from aiter.dist.parallel_state import get_world_group
+def build_model(config, model_class, device):
+    """model_setup's, imported when called: the GPU stack is behind it, and
+    what this module decides is tested without."""
+    from atom.model_engine import model_setup
 
-        group = get_world_group().cpu_group
-    except Exception:  # noqa: BLE001 - single process
-        group = None
+    return model_setup.build_model(config, model_class, device)
+
+
+def construct_drafter(config, device, runner):
+    from atom.model_engine import model_setup
+
+    return model_setup.construct_drafter(config, device, runner)
+
+
+def _rank(config, device, rank: int) -> _Rank:
+    # init_model_env made the groups before anything loads.
+    from aiter.dist.parallel_state import get_world_group
+
+    group = get_world_group().cpu_group
     return _Rank(worker_process_name(config, rank), socket_path(device), device, group)
 
 
@@ -183,6 +196,9 @@ def _check_payload(payload: dict, own_key) -> list[str]:
             "the checkpoint, the shard or a setting that decides it differ:"
         ] + diffs
     if payload["export"]["unshippable"]:
+        # The same load, so the same result next time: no daemon is started
+        # for it again.
+        mark_uncacheable(own_key(), payload["export"]["unshippable"])
         return ["the daemon's load created state that cannot be shared:"] + payload[
             "export"
         ]["unshippable"]
@@ -289,11 +305,14 @@ def _stop_together(me: _Rank, why, held: bool, pid=None, started=None) -> None:
         _close(hold)
 
 
-def _replace_daemon(me: _Rank, reasons, held, pid, started, present) -> dict | None:
+def _replace_daemon(
+    me: _Rank, reasons, held, pid, started, present, own_key
+) -> dict | None:
     """The launch cannot use what is on its GPUs (``reasons``; ``present``:
     a daemon is on some): stop it and start a daemon of this launch's own.
     Returns the daemon started; None: load from disk, as the one this launch
-    started cannot be used either, or none can be started."""
+    started cannot be used either, none can be started, or an earlier launch
+    found that this load leaves state the cache cannot share."""
     if started is not None:
         _stop_together(me, reasons, held, started=started)
         logger.warning(
@@ -302,14 +321,23 @@ def _replace_daemon(me: _Rank, reasons, held, pid, started, present) -> dict | N
             f"log {started['log']}):\n  {_detail(reasons)}"
         )
         return None
+    skip = group_max(int(uncacheable(own_key())), me.group)  # on any rank
     if present:
         logger.warning(
-            f"{_TAG} {me.label}: restarting the weight cache daemon"
-            f"{f' (pid {pid})' if pid else ''}, it cannot be used here:\n  {_detail(reasons)}"
+            f"{_TAG} {me.label}: {'stopping' if skip else 'restarting'} the weight "
+            f"cache daemon{f' (pid {pid})' if pid else ''}, it cannot be used here:"
+            f"\n  {_detail(reasons)}"
         )
         why = ["it would need a restart, since it cannot be used here:"] + reasons
         _stop_together(me, why, held, pid)
-    else:
+    if skip:
+        logger.warning(
+            f"{_TAG} {me.label}: an earlier launch found that this load leaves state "
+            "the cache cannot share, so no daemon is started and this server loads "
+            "from disk (python -m atom.model_loader.weight_cache stop forgets this)"
+        )
+        return None
+    if not present:
         logger.info(f"{_TAG} {me.label}: no weight cache daemon here; starting one")
     err = None
     try:
@@ -377,8 +405,9 @@ def load_from_cache(config, model_class, device, *, rank: int) -> nn.Module | No
     global _draft
     if not launch_recorded():
         logger.warning(
-            f"{_TAG} {worker_process_name(config, rank)}: ATOM_PRELOAD works under "
-            "the API server only; loading from disk"
+            f"{_TAG} {worker_process_name(config, rank)}: ATOM_PRELOAD needs the "
+            "launch its API server records (see that server's log if there is one); "
+            "loading from disk"
         )
         return None
     t0 = time.perf_counter()
@@ -414,7 +443,7 @@ def load_from_cache(config, model_class, device, *, rank: int) -> nn.Module | No
                 )
             ]
         _close(sock)
-        started = _replace_daemon(me, reasons, held, pid, started, hi > _NONE)
+        started = _replace_daemon(me, reasons, held, pid, started, hi > _NONE, own_key)
         if started is None:
             return None
 
@@ -459,8 +488,12 @@ def load_drafter_from_cache(config, device, runner, target, *, rank: int):
         _agree(built.error or _differs(draft, drafter.model), me.group)
         mapped, error = _map(drafter.model, draft["export"], device)
         _agree(error, me.group)
-        mapped += _apply_process(me, draft["process"])
-        _run_prepare_finalize(drafter.model)
+        try:
+            mapped += apply_process(draft["process"], device)
+            _run_prepare_finalize(drafter.model)
+        except Exception as e:  # noqa: BLE001 - every rank must reach the agreement
+            error = [f"applying what the drafter's load changed failed: {e!r}"]
+        _agree(error, me.group)
         try:
             # Replaces what the daemon left out with the target's modules.
             drafter.attach_to_target(target, set(draft["loaded"]))

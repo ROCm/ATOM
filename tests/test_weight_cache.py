@@ -1113,6 +1113,13 @@ def loop(client, monkeypatch):
         "_started_by_launch": lambda: None,
         "launch_recorded": lambda: True,
         "_hold_unused": lambda path: (None, None),
+        # What needs the GPU stack: the launch's group, the real build, a key.
+        "_rank": lambda config, device, rank: client._Rank(
+            "TP0", "/nonexistent/gpu.sock", device, None
+        ),
+        "build_model": lambda config, model_class, device: model_class(config),
+        "compute_key": lambda config, rank: {"rank": rank},
+        "uncacheable": lambda key: False,
         "exported_structure": lambda built, export: calls.built,
         "apply_export": lambda model, export, device: 0,
         "apply_process": lambda export, device: 0,
@@ -1280,6 +1287,27 @@ def test_preload_takes_1_or_daemon_only(monkeypatch):
         _ = envs.ATOM_PRELOAD
 
 
+def test_uncacheable_loads_are_remembered_until_stop(cache_dir, capsys):
+    key_a, key_b = {"rank": 0, "quant": "a"}, {"rank": 0, "quant": "b"}
+    assert not preload.uncacheable(key_a)
+    preload.mark_uncacheable(key_a, ["layers.0._stream_lock: a lock"])
+    assert preload.uncacheable(key_a) and not preload.uncacheable(key_b)
+    assert cli.main(["stop"]) == 0
+    assert "forgot" in capsys.readouterr().out
+    assert not preload.uncacheable(key_a)
+
+
+def test_a_launch_that_cannot_be_recorded_goes_without_the_cache(
+    cache_dir, monkeypatch
+):
+    def taken():  # e.g. another user made the directory first
+        raise PermissionError("not this user's directory")
+
+    monkeypatch.setattr(preload, "socket_dir", taken)
+    preload.record_launch()  # the server starts all the same
+    assert not preload.launch_recorded()
+
+
 def test_socket_dir_must_be_private(monkeypatch):
     d = tempfile.mkdtemp(dir="/tmp")
     try:
@@ -1347,6 +1375,34 @@ def test_loads_from_disk_when_no_daemon_can_start(loop, client, monkeypatch):
     monkeypatch.setattr(client, "_spawn_daemon", no_spawn)
     loop.probes = [(False, [])]
     assert _from_cache(client) is None
+
+
+def test_a_load_found_uncacheable_starts_no_daemon(loop, client, monkeypatch):
+    # An earlier launch's daemon held state the cache cannot share.
+    monkeypatch.setattr(client, "uncacheable", lambda key: True)
+    loop.probes = [(False, [])]
+    assert _from_cache(client) is None  # a disk load, at once
+    assert loop.spawned == loop.stopped == 0
+    # A daemon of another launch on these GPUs is stopped for the disk load.
+    loop.probes = [(True, ["options.moe_backend: daemon=standard client=mega"])]
+    assert _from_cache(client) is None
+    assert loop.spawned == 0 and loop.stopped == 1
+
+
+def test_drafter_state_that_cannot_be_applied_loads_from_disk(
+    loop, client, monkeypatch
+):
+    monkeypatch.setattr(client, "construct_drafter", lambda c, d, r: _Drafter(c))
+
+    def broken(export, device):
+        raise RuntimeError("a global the daemon's load set cannot be set here")
+
+    loop.probes = [(True, [])]
+    config = _config()
+    target = _from_cache(client, config)
+    monkeypatch.setattr(client, "apply_process", broken)
+    cpu = torch.device("cpu")
+    assert client.load_drafter_from_cache(config, cpu, None, target, rank=0) is None
 
 
 def test_leaves_a_daemon_other_servers_use(loop, client, monkeypatch):

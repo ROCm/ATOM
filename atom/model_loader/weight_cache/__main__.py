@@ -10,7 +10,11 @@ import datetime
 import sys
 import time
 
-from atom.model_loader.weight_cache.preload import _hold_unused, stop_daemon
+from atom.model_loader.weight_cache.preload import (
+    _hold_unused,
+    forget_uncacheable,
+    stop_daemon,
+)
 from atom.model_loader.weight_cache.transport import (
     _ping,
     daemon_state,
@@ -116,6 +120,8 @@ def main(argv: list[str] | None = None) -> int:
         help="stop: also stop daemons that running servers use",
     )
     args = parser.parse_args(argv)
+    if args.command == "stop" and forget_uncacheable():
+        print("forgot the launches found uncacheable")
     launches = _running_daemons()
     if not launches:
         print(f"no weight cache daemon running (in {socket_dir()})")

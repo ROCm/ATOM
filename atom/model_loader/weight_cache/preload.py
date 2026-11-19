@@ -7,6 +7,7 @@ from __future__ import annotations
 import atexit
 import contextlib
 import glob
+import hashlib
 import json
 import os
 import signal
@@ -104,7 +105,18 @@ def _launch_file() -> str | None:
 def record_launch() -> None:
     """Called by the API server (ATOM_PRELOAD=1) before it starts any
     process: name the launch for them, and save its command line and
-    environment, to start a daemon with."""
+    environment, to start a daemon with. Where that cannot be saved, the
+    launch goes without the cache."""
+    try:
+        _record_launch()
+    except OSError as e:
+        os.environ.pop(_LAUNCH_ENV, None)
+        logger.warning(
+            f"{_TAG} ATOM_PRELOAD is off for this launch, which loads from disk: {e}"
+        )
+
+
+def _record_launch() -> None:
     os.environ[_LAUNCH_ENV] = f"{os.getpid()}_{time.time()!r}"
     if os.getpid() == 1:
         logger.warning(
@@ -254,6 +266,29 @@ def stop_daemon(path: str, timeout_s: float = 180) -> int | None:
             )
         time.sleep(0.5)
     return main
+
+
+def _uncacheable_file(key: dict) -> str:
+    digest = hashlib.sha256(json.dumps(key, sort_keys=True, default=str).encode())
+    return os.path.join(socket_dir(), f"uncacheable_{digest.hexdigest()[:16]}")
+
+
+def mark_uncacheable(key: dict, why: list[str]) -> None:
+    """A load with this key left state the cache cannot share. Launches skip
+    the daemon for it from now on, until `stop` (after a change to loading
+    code, as for everything the key does not see)."""
+    with contextlib.suppress(OSError), open(_uncacheable_file(key), "w") as f:
+        json.dump(why[:10], f)
+
+
+def uncacheable(key: dict) -> bool:
+    return os.path.exists(_uncacheable_file(key))
+
+
+def forget_uncacheable() -> int:
+    marks = glob.glob(os.path.join(socket_dir(), "uncacheable_*"))
+    _remove(*marks)
+    return len(marks)
 
 
 def _hold_unused(path: str, wait_s: float = 5):
