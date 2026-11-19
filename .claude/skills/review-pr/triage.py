@@ -2822,26 +2822,18 @@ def audit_core_files(text, diff_text, root=None):
 
 # ----------------------------------------------------------------- card gate
 FINDING = re.compile(r"^\s*(\U0001F534|\u26A0\uFE0F?|\U0001F4DD)\s*(.+)$")
-# An identifier as it is spelled, before any folding: `KVCACHE`, `fp8_scale`, `w8a8_gemm`.
-# IDENT itself cannot be widened here -- it is read by other gates -- so the claim path
-# carries its own, which also admits a digit in the first segment.
-CLAIM_IDENT = re.compile(r"[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]{2,}|[A-Z][A-Z0-9_]{3,}")
-# ...but the ALL-CAPS half of that shape is also how this codebase writes its ordinary
-# vocabulary, and those words name nothing. `B1 FIRE -- GEMM output cast drops the scale`
-# must not be claimed by an unrelated card line that happens to say `BF16 GEMM`. Dtypes
-# and architectures are already VALUE's business; the rest are spelled out, because the
-# distinction is which words are common here, not what shape they have.
-_GENERIC_CAPS = frozenset(
-    "GEMM GEMV MOE MLA CUDA HIP ROCM AITER NCCL RCCL RDMA API ABI CPU GPU "
-    "TODO FIXME XXX NOTE JSON YAML HTML HTTP HTTPS URL UUID ASCII UTF8 LRU FIFO LIFO "
-    "MI300 MI308 MI325 MI355 CDNA RDNA WMMA MFMA TP8 TP4 DP8 EP8 PP8 SGLANG VLLM ATOM "
-    "PR CI README SPDX AMD NVIDIA".split())
+# A path-less FIRE is claimed by a symbol its own reason put in backticks, and by nothing
+# else. Five rounds of review found a hole each time in the shape-based version -- one
+# shared word, then lower-casing, then GEMM/BF16, then FP32/MI355X/num_tokens -- because
+# no shape separates a name from this codebase's ordinary vocabulary, and the word list
+# that tried to was never going to be complete. A backtick is the author saying "this is
+# a name"; guessing gets no credit.
+CLAIM_SYMBOL = re.compile(r"`([^`\n]{2,60})`")
 
 
-def _is_claim_identifier(word):
-    """Does this spelling name something, rather than describe a kind of thing?"""
-    return bool(CLAIM_IDENT.fullmatch(word)) and word.upper() not in _GENERIC_CAPS \
-        and not VALUE.fullmatch(word)
+def _claim_symbols(reason):
+    """-> the backticked symbols a reason offers as its handle."""
+    return {m.strip() for m in CLAIM_SYMBOL.findall(reason) if m.strip()}
 
 
 def _same_file(a, b):
@@ -2896,8 +2888,11 @@ def _rule_head(text):
     `MI300:` and `GPU0:` share the shape and none of them is a rule.
     """
     m = RULE_ID_HEAD.match(LEADING_TAG.sub("", text))
-    return m.group(1) if m and m.group(1) in RULE_SET else None
+    return m.group(1) if m and m.group(1) in REFUSED_IDS else None
 RULE_SET = frozenset(ALL_RULES.split())
+# Every id rules.md names, not only the derivable ones: SKILL.md:234 tells the worker
+# `If not -> 📝 HK3`, and HK3 lives in UNREACHABLE_BY_DESIGN, so the card shipped it.
+REFUSED_IDS = RULE_SET | frozenset(UNREACHABLE_BY_DESIGN)
 # The in-card scan kept its own copy of CITATION's extension list and drifted from it:
 # no `rs|toml`, so a Rust-only finding read as citing nothing and skipped both the
 # UNANCHORED and the UNBACKED check. Derived from CITATION so they cannot diverge again.
@@ -3170,10 +3165,9 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
             # The files this verdict cited, so a card that obeys the no-rule-codes rule
             # can still be matched to the FIRE it is reporting.
             fire_paths[m.group(1)] = [pp for pp, _ in CITATION.findall(m.group(2))]
-            # For a reason that cites no file: the words a card would have to reuse to be
-            # talking about the same thing. Stopwords out, and only tokens long enough to
-            # be distinctive.
-            fire_tokens[m.group(1)] = _claim_tokens(m.group(2))
+            # For a reason that cites no file: the symbols it backticked, which are the
+            # only handle it offers.
+            fire_tokens[m.group(1)] = _claim_symbols(m.group(2))
     backing = _fold_punct((verdicts_text or "") + "\n" + (diagnostic_text or "")
                           + "\n" + (answers_text or ""))
     problems = []
@@ -3198,22 +3192,9 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
             if paths and any(_same_file(pp, cp) for pp in paths for cp in cited_here):
                 claims.setdefault(rule, []).append(text[:40])
             elif not paths and fire_tokens.get(rule):
-                # A verdict reason may name only a symbol or a condition (SKILL.md's
-                # format allows it), and then there is no path to match on. Without this
-                # the card had no legal move left: name the id and the no-rule-codes gate
-                # refuses it, drop the id and UNREPORTED-FIRE fires, and both are fatal --
-                # so the only way through was a `-- not reported:` that is untrue.
-                want, have = fire_tokens[rule], _claim_tokens(text)
-                shared = set(want) & set(have)
-                # Two ordinary words, or one identifier -- one shared word was far too
-                # loose, because SKILL.md mandates "**Author must**" on every finding and
-                # `must` alone then let any finding claim any path-less FIRE. The
-                # identifier test reads the spelling the verdict used, not the folded key.
-                # And a reason with only one claimable word to give cannot be asked for
-                # two: `B1 FIRE -- deadlock` would otherwise have no legal card at all.
-                enough = len(shared) >= 2 or len(want) < 2
-                if shared and (enough
-                               or any(_is_claim_identifier(want[w]) for w in shared)):
+                # The card has to name one of them. Matched as written, not folded: the
+                # reason chose the spelling when it chose the backticks.
+                if any(sym in text for sym in fire_tokens[rule]):
                     claims.setdefault(rule, []).append(text[:40])
     # A finding may report more than one rule, and often should: aiter#3165 fired B4 and
     # E5 on the same changed file and one accurate bullet covered both. Requiring N

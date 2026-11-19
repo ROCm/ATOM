@@ -520,75 +520,14 @@ t "an A5: card against an A5 FIRE is refused for the id, not for tracing" \
   "$(_card_kinds "$_CARD_ID" "$_V_PATH" "$_DIFF")" "RULE-CODE-IN-CARD"
 t "the same card without the id traces by path" \
   "$(_card_kinds "$_CARD_PATH" "$_V_PATH" "$_DIFF")" ""
-# A verdict reason may name only a symbol or a condition. Before this, such a FIRE had no
-# legal card at all: name the id and the no-rule-codes gate refuses it, drop the id and
-# UNREPORTED-FIRE fires, and both are fatal -- the only way out was an untrue
-# `-- not reported:`.
-t "a path-less FIRE can be claimed by the words of its reason" \
-  "$(_card_kinds "$_CARD_TOKENS" "$_V_NOPATH" "$_DIFF")" ""
-# One shared 4-letter word was far too loose. SKILL.md mandates "**Author must**" on
-# every finding, so `must` alone let any finding claim any path-less FIRE whose reason
-# used it -- silencing the UNREPORTED-FIRE that should have fired for the other rule.
-# rules.md taught the shape the gate now withholds: ~50 `→ ⚠️ A1:` templates reach the
-# worker through `expand`, so the model was being shown the opening it would be refused
-# for. Refusing the output while the examples teach it is the same instruction/gate
-# disagreement this PR is about, one level up.
-# The template rewrite stripped the only `HKn` from each Housekeeping row, and
-# `expand_rules` finds those rows by that id -- so any diff deriving an HK rule got
-# MISSING-RULE-TEXT, rc 1, and fetch.sh aborted the whole review. A `.sh` file, a
-# `# TODO`, an `ATOM_` env var or three top-level dirs is enough to trigger it, which
-# includes this PR. The ids live in the Check column now, where expand reads them and no
-# card ever quotes them.
-t "a diff deriving housekeeping rules still expands" \
-  "$(d=$(mktemp -d)
-     printf 'diff --git a/x.sh b/x.sh\n--- a/x.sh\n+++ b/x.sh\n@@ -0,0 +1,2 @@\n+# TODO fix\n+export ATOM_FOO=1\n' > "$d/pr.diff"
-     python3 "$S/triage.py" rules "$d/pr.diff" > "$d/rules.txt" 2>/dev/null
-     grep -qE 'HK[0-9]' "$d/rules.txt" || { echo NO-HK-DERIVED; exit; }
-     python3 "$S/triage.py" expand "$d/rules.txt" "$S/rules.md" >/dev/null 2>&1
-     echo $?)" "0"
-t "no rule template opens with an internal rule id" \
-  "$(python3 -c '
-import re, sys, pathlib
-sys.path.insert(0, sys.argv[1]); import triage
-s = pathlib.Path(sys.argv[1], "rules.md").read_text()
-print(len([m for m in re.findall(r"[\u26a0\ufe0f\U0001f4dd\U0001f534/]+\s*([A-Z]+\d+[a-z]?)[-\w\[\]]*\s*:", s)
-           if m in triage.RULE_SET]))' "$S")" "0"
-t "an unrelated finding does not claim a path-less FIRE" \
-  "$(_card_kinds '## T
-
-**what**
-
-Review: OK
-Validation (deterministic): N/A -- no runtime surface changed
-
-⚠️ foo.py:3 has no guard on the index. **Author must** add one.' \
-     "A5 FIRE -- foo.py:3 guard missing
-B1 FIRE -- the caller must hold the scheduler lock" \
-     "diff --git a/foo.py b/foo.py" | grep -c UNREPORTED-FIRE)" "1"
-# `[verified]` leads most findings and SKILL.md requires it; `_publish.first_clause`
-# strips it, so `[verified] A5: ...` publishes opening `A5:` -- the same symptom with one
-# token in front of it. So do the em-dash and double-dash separators.
-# One ordinary shared word is not evidence either: two findings about the same file can
-# both say `scheduler` without being about the same rule. Two words, or one identifier.
-# The words SKILL.md mandates on every finding are not evidence: without dropping them,
-# `**Author must**` on the card and `the author must ...` in a reason share two tokens and
-# the claim goes through on nothing.
-t "the mandated Author/must wording cannot carry a claim" \
-  "$(_card_kinds '## T
-
-**what**
-
-Review: OK
-Validation (deterministic): N/A -- no runtime surface changed
-
-⚠️ foo.py:3 has no guard on the index. **Author must** add one.' \
-     "A5 FIRE -- foo.py:3 guard missing
-B1 FIRE -- the author must hold the scheduler lock" \
-     "diff --git a/foo.py b/foo.py" | grep -c UNREPORTED-FIRE)" "1"
-# Matching was case-sensitive while the stopword list is lower case, so `Prefill` missed
-# `prefill`. Here the identifier is the only thing the two sides share, and it differs
-# only in case: without folding there is no claim at all.
-t "case does not decide whether a claim lands" \
+# Before any of this, such a FIRE had no legal card at all: name the id and the
+# no-rule-codes gate refuses it, drop the id and UNREPORTED-FIRE fires, and both are
+# fatal -- the only way out was an untrue `-- not reported:`.
+# A path-less FIRE is claimed by a symbol its own reason backticked, and by nothing else.
+# The shape-based version this replaces lost a round of review five times running -- one
+# shared word, lower-casing, GEMM/BF16, then FP32/MI355X/num_tokens -- because no shape
+# separates a name from this codebase's vocabulary.
+t "a path-less FIRE is claimed by a backticked symbol from its reason" \
   "$(_card_kinds '## T
 
 **what**
@@ -597,70 +536,13 @@ Review: OK
 Validation (deterministic): N/A -- no runtime surface changed
 
 ⚠️ foo.py:3 has no guard on the index. **Author must** add one.
-📝 prefill_tokens go unasserted. **Author must** fix that.' \
+📝 kv_scale is dropped on reload. **Author must** recompute it.' \
      "A5 FIRE -- foo.py:3 guard missing
-B1 FIRE -- Prefill_tokens leak" \
-     "diff --git a/foo.py b/foo.py" | grep -c UNREPORTED-FIRE)" "0"
-# A shared number is not a shared subject. Two of them used to be enough.
-t "shared numbers do not carry a claim" \
-  "$(_card_kinds '## T
-
-**what**
-
-Review: OK
-Validation (deterministic): N/A -- no runtime surface changed
-
-⚠️ foo.py:3 has no guard on the index. **Author must** add one.
-📝 the limit is 1024 rows and 2048 pages. **Author must** document it.' \
-     "A5 FIRE -- foo.py:3 guard missing
-B1 FIRE -- the cap is 1024 blocks and 2048 slots" \
-     "diff --git a/foo.py b/foo.py" | grep -c UNREPORTED-FIRE)" "1"
-t "a single ordinary shared word does not claim a FIRE" \
-  "$(_card_kinds '## T
-
-**what**
-
-Review: OK
-Validation (deterministic): N/A -- no runtime surface changed
-
-⚠️ foo.py:3 has no guard on the scheduler index. **Author must** add one.' \
-     "A5 FIRE -- foo.py:3 guard missing
-B1 FIRE -- the caller holds the scheduler lock while draining" \
-     "diff --git a/foo.py b/foo.py" | grep -c UNREPORTED-FIRE)" "1"
-t "but a shared identifier does" \
-  "$(_card_kinds '## T
-
-**what**
-
-Review: OK
-Validation (deterministic): N/A -- no runtime surface changed
-
-⚠️ foo.py:3 has no guard on the index. **Author must** add one.
-📝 prefill_tokens go unasserted. **Author must** fix that.' \
-     "A5 FIRE -- foo.py:3 guard missing
-B1 FIRE -- prefill_tokens leak under cancellation" \
-     "diff --git a/foo.py b/foo.py" | grep -c UNREPORTED-FIRE)" "0"
-# An ALL-CAPS name is an identifier too. Folding before the identifier test killed that
-# branch outright, so a reason whose only distinctive word was `KVCACHE` had nothing
-# claimable at all and its card was left with the refused id or an untrue
-# `-- not reported:`.
-t "an ALL-CAPS name is an identifier" \
-  "$(_card_kinds '## T
-
-**what**
-
-Review: OK
-Validation (deterministic): N/A -- no runtime surface changed
-
-⚠️ foo.py:3 has no guard on the index. **Author must** add one.
-📝 The KVCACHE pool is never resized. **Author must** resize it.' \
-     "A5 FIRE -- foo.py:3 guard missing
-B1 FIRE -- KVCACHE size not updated" \
+B1 FIRE -- \`kv_scale\` dropped on reload" \
      "diff --git a/foo.py b/foo.py")" ""
-# A verdict writes the path it found; SKILL.md's own good examples write the basename.
-# Matching the verdict's exact string meant the form the skill teaches could not claim
-# the FIRE it was reporting.
-t "the basename form SKILL.md teaches can claim a path FIRE" \
+# Without backticks the reason offers no handle, whatever its words look like. FP32,
+# MI355X, GSM8K, num_tokens and head_dim all used to pass as names.
+t "a reason that backticks nothing is not claimed by look-alike words" \
   "$(_card_kinds '## T
 
 **what**
@@ -668,49 +550,25 @@ t "the basename form SKILL.md teaches can claim a path FIRE" \
 Review: OK
 Validation (deterministic): N/A -- no runtime surface changed
 
-⚠️ x.py:1 drops the scale. **Author must** keep it.' \
-     "A5 FIRE -- atom/models/x.py:1 drops the scale" \
-     "diff --git a/atom/models/x.py b/atom/models/x.py")" ""
-# ...on a segment boundary. A bare endswith would let `scale.py` answer for
-# `atom/models/kv_scale.py`, which is a different file whose name merely ends the same way.
-t "a file whose name merely ends the same way does not" \
-  "$(_card_kinds '## T
-
-**what**
-
-Review: OK
-Validation (deterministic): N/A -- no runtime surface changed
-
-⚠️ scale.py:1 drops it. **Author must** keep it.' \
-     "A5 FIRE -- atom/models/kv_scale.py:1 drops the scale" \
-     "diff --git a/scale.py b/scale.py" | grep -c UNREPORTED-FIRE)" "1"
-t "a same-named file elsewhere does not" \
-  "$(_card_kinds '## T
-
-**what**
-
-Review: OK
-Validation (deterministic): N/A -- no runtime surface changed
-
-⚠️ other/x.py:1 drops the scale. **Author must** keep it.' \
-     "A5 FIRE -- atom/models/x.py:1 drops the scale" \
-     "diff --git a/other/x.py b/other/x.py" | grep -c UNREPORTED-FIRE)" "1"
-# ...but GEMM, BF16, CUDA and TODO have that shape too and name nothing. An unrelated
-# card line saying `BF16 GEMM` must not claim `B1 FIRE -- GEMM output cast ...`.
-t "a generic ALL-CAPS word is not an identifier" \
-  "$(_card_kinds '## T
-
-**what**
-
-Review: OK
-Validation (deterministic): N/A -- no runtime surface changed
-
-⚠️ foo.py:3 BF16 GEMM tuned config missing. **Author must** add one.' \
+⚠️ foo.py:3 FP32 num_tokens tuned config missing. **Author must** add one.' \
      "A5 FIRE -- foo.py:3 tuned config missing
-B1 FIRE -- GEMM output cast drops the per-token scale" \
+B1 FIRE -- FP32 output cast drops num_tokens per-token scale" \
      "diff --git a/foo.py b/foo.py" | grep -c UNREPORTED-FIRE)" "1"
-# A digit in the first segment is still an identifier.
-t "fp8_scale is an identifier" \
+# And a card that does not name the symbol does not claim it either.
+t "an unrelated finding does not claim a backticked FIRE" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ foo.py:3 has no guard on the index. **Author must** add one.' \
+     "A5 FIRE -- foo.py:3 guard missing
+B1 FIRE -- \`kv_scale\` dropped on reload" \
+     "diff --git a/foo.py b/foo.py" | grep -c UNREPORTED-FIRE)" "1"
+# Matched as the reason spelled it: the backticks were the author's choice of spelling.
+t "a symbol is matched as it was written" \
   "$(_card_kinds '## T
 
 **what**
@@ -719,12 +577,13 @@ Review: OK
 Validation (deterministic): N/A -- no runtime surface changed
 
 ⚠️ foo.py:3 has no guard on the index. **Author must** add one.
-📝 fp8_scale is wrong on reload. **Author must** recompute it.' \
+📝 KV_SCALE is dropped on reload. **Author must** recompute it.' \
      "A5 FIRE -- foo.py:3 guard missing
-B1 FIRE -- fp8_scale dropped" \
-     "diff --git a/foo.py b/foo.py")" ""
-# A reason with one claimable word cannot be asked for two.
-t "a one-word reason can still be claimed" \
+B1 FIRE -- \`kv_scale\` dropped on reload" \
+     "diff --git a/foo.py b/foo.py" | grep -c UNREPORTED-FIRE)" "1"
+# SKILL.md:234 tells the worker `If not -> 📝 HK3`, and HK3 is UNREACHABLE_BY_DESIGN
+# rather than ALL_RULES, so the card shipped the id unrefused.
+t "an id rules.md names but never derives is refused too" \
   "$(_card_kinds '## T
 
 **what**
@@ -732,61 +591,8 @@ t "a one-word reason can still be claimed" \
 Review: OK
 Validation (deterministic): N/A -- no runtime surface changed
 
-⚠️ foo.py:3 has no guard on the index. **Author must** add one.
-📝 The capture path has a deadlock. **Author must** order the stages.' \
-     "A5 FIRE -- foo.py:3 guard missing
-B1 FIRE -- deadlock" \
-     "diff --git a/foo.py b/foo.py")" ""
-t "a rule id behind the verified tag is still a rule id" \
-  "$(_card_kinds '## T
-
-**what**
-
-Review: OK
-Validation (deterministic): N/A -- no runtime surface changed
-
-⚠️ [verified] A5: planner.rs:108 charges only on req.stream. **Author must** say so.' \
-     "$_V_PATH" "$_DIFF" | grep -c RULE-CODE-IN-CARD)" "1"
-t "so is one behind an en dash" \
-  "$(_card_kinds '## T
-
-**what**
-
-Review: OK
-Validation (deterministic): N/A -- no runtime surface changed
-
-⚠️ A5 – planner.rs:108 charges only on req.stream. **Author must** say so.' \
-     "$_V_PATH" "$_DIFF" | grep -c RULE-CODE-IN-CARD)" "1"
-t "so is one behind a double dash" \
-  "$(_card_kinds '## T
-
-**what**
-
-Review: OK
-Validation (deterministic): N/A -- no runtime surface changed
-
-⚠️ A5 -- planner.rs:108 charges only on req.stream. **Author must** say so.' \
-     "$_V_PATH" "$_DIFF" | grep -c RULE-CODE-IN-CARD)" "1"
-t "and one carrying a sub-type" \
-  "$(_card_kinds '## T
-
-**what**
-
-Review: OK
-Validation (deterministic): N/A -- no runtime surface changed
-
-⚠️ B5-param-discard: planner.rs:108 drops it. **Author must** say so.' \
-     "B5 FIRE -- planner.rs:108 drops the param" "$_DIFF" | grep -c RULE-CODE-IN-CARD)" "1"
-t "so is one behind an em dash" \
-  "$(_card_kinds '## T
-
-**what**
-
-Review: OK
-Validation (deterministic): N/A -- no runtime surface changed
-
-⚠️ A5 — planner.rs:108 charges only on req.stream. **Author must** say so.' \
-     "$_V_PATH" "$_DIFF" | grep -c RULE-CODE-IN-CARD)" "1"
+📝 HK3: foo.py:3 has no integration test. **Author must** add one.' \
+     "" "diff --git a/foo.py b/foo.py" | grep -c RULE-CODE-IN-CARD)" "1"
 t "and naming its id instead is still refused, not silently accepted" \
   "$(_card_kinds "$_CARD_ID" "$_V_NOPATH" "$_DIFF")" "RULE-CODE-IN-CARD"
 t "a backticked rule id is a rule id" \
