@@ -190,7 +190,7 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             self._kpool_size()
         ):
             # A pooled indexer's tail keys (`kpool_tail_cache`) are no slot
-            # region, so a PP prefill would leave them behind.
+            # region, so P/D leaves them behind; refused here only under PP.
             raise NotImplementedError(
                 f"{model_type} disaggregated serving does not support pipeline "
                 "parallelism with a pooled sparse indexer (index_kpool="
