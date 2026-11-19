@@ -55,7 +55,7 @@ SCORE_COPIES = 8
 
 def _layout(items, align=256):
     """``pair_layout``'s byte offsets, each region on an ``align`` boundary, and
-    ``_bytes``: the whole, a multiple of ``align``."""
+    ``_bytes``: the end of the last, rounded up to a multiple of ``align``."""
     regions = pair_layout(items, align)
     end = max(o + n for o, n in regions.values())
     return {name: o for name, (o, _) in regions.items()} | {
@@ -70,56 +70,56 @@ SPARSE_TABLE_WORDS = TOPK_BLOCKS * PAGES_PER_BLOCK + 2
 # best (key, block) (indexer context parallelism: the peers' sel_cp)
 SEL_LONG_PAIRS = N_SPLIT * TOPK_BLOCKS * 2
 
-# every region holds MAX_TOKENS rows (token k at k * the one-token size)
-SCRATCH = _layout(
-    [
-        # indexer block scores, token k's block b at pair k * MAX_INDEX_BLOCKS + b
-        ("iscore", MAX_INDEX_BLOCKS * MAX_TOKENS),
-        ("sparse_table", SPARSE_TABLE_WORDS // 2 * MAX_TOKENS),
-        ("sp_o", N_SPLIT * H * HEAD_DIM // 2 * MAX_TOKENS),  # packed bf16 pairs
-        ("sp_m", N_SPLIT * H * MAX_TOKENS),
-        ("sp_l", N_SPLIT * H * MAX_TOKENS),
-        ("attnq", O_K // 4 * MAX_TOKENS // 2),  # merged attention, plain FP8 words
-        ("attnq_s", MAX_TOKENS),  # and its per-token scale
-        # the finished attention all-reduce + residual, bf16 pairs (o tasks -> router)
-        ("a", HIDDEN // 2 * MAX_TOKENS),
-        ("xn8", HIDDEN // 4 * MAX_TOKENS),  # MXFP8 xn, 4 fp8 per word
-        ("xsc", HIDDEN // 32 * MAX_TOKENS),  # and its per-1x32 E8M0 scales
-        # copy c, token k at pairs [(c * MAX_TOKENS + k) * N_ROUTED, ..)
-        # per expert (routing key, sigmoid) pairs, see route_key
-        ("scores", 2 * N_ROUTED * MAX_TOKENS * SCORE_COPIES),
-        ("mid", MOE_SLOTS * INTER * MAX_TOKENS),
-        # routing record read by the tests: token k's expert ids, then weights
-        ("sel", 2 * MOE_SLOTS * MAX_TOKENS),
-        # token k's split task p's candidates: rank r at pairs 2 ((k N_SPLIT + p)
-        # TOPK_BLOCKS + r) + (0 key, 1 block)
-        ("sel_long", SEL_LONG_PAIRS * MAX_TOKENS),
-        # wide: the MXFP8 xn and scales as plain words (every token's row), and a
-        # done flag per router task
-        ("xn8p", HIDDEN // 4 * MAX_TOKENS // 2),
-        ("xscp", HIDDEN // 32 * MAX_TOKENS // 2),
-        ("xndone", N_ROUTER * MAX_TOKENS),
-        # and the shared expert's mid rows (row k = token k) as MXFP8 words, their E8M0
-        # scales a word each (the down stage's LDS layout), a done flag per up / gate
-        # task pair
-        ("mid8p", INTER * MAX_TOKENS // 8),
-        ("midsp", INTER // 32 * MAX_TOKENS // 2),
-        ("ugdone", (TOP_K * MAX_TOKENS + 1) * UG_PER_SLOT // 2),
-        # dense layers (dense_post): the post-attention norm's per-token FP8 rows
-        # as plain words, each row's scale (its pair is the flag), and the MLP's
-        # bf16 mid pairs
-        ("dx8", HIDDEN // 4 * MAX_TOKENS // 2),
-        ("dxs", MAX_TOKENS),
-        ("dmid", DENSE_INTER // 2 * MAX_TOKENS),
-        # and (S > 2) each mid row's per-token FP8 as plain words, then its scale
-        ("dmid8", DENSE_INTER // 4 * MAX_TOKENS // 2),
-        ("dmids", MAX_TOKENS),
-        # a debug build's wait records, one a CTA; last, so the regions above
-        # keep their offsets in every build
-        ("diag", BLOCKS * DIAG_WORDS * 4 // PAIR_BYTES),
-        # ``attn_mxfp8``: the merged attention's per-1x32 E8M0 codes, 4 to a plain word
-        # (behind ``attnq_s``'s flags); after ``diag`` so every region above keeps its offset
-        ("attnq_sc", MAX_TOKENS * (O_K // 128) // 2),
+# every region holds MAX_TOKENS rows (token k at k * the one-token size); first the
+# regions of every build
+_SCRATCH_COMMON = [
+    # indexer block scores, token k's block b at pair k * MAX_INDEX_BLOCKS + b
+    ("iscore", MAX_INDEX_BLOCKS * MAX_TOKENS),
+    ("sparse_table", SPARSE_TABLE_WORDS // 2 * MAX_TOKENS),
+    ("sp_o", N_SPLIT * H * HEAD_DIM // 2 * MAX_TOKENS),  # packed bf16 pairs
+    ("sp_m", N_SPLIT * H * MAX_TOKENS),
+    ("sp_l", N_SPLIT * H * MAX_TOKENS),
+    ("attnq", O_K // 4 * MAX_TOKENS // 2),  # merged attention, plain FP8 words
+    ("attnq_s", MAX_TOKENS),  # and its per-token scale
+    # the finished attention all-reduce + residual, bf16 pairs (o tasks -> router)
+    ("a", HIDDEN // 2 * MAX_TOKENS),
+    ("xn8", HIDDEN // 4 * MAX_TOKENS),  # MXFP8 xn, 4 fp8 per word
+    ("xsc", HIDDEN // 32 * MAX_TOKENS),  # and its per-1x32 E8M0 scales
+    # copy c, token k at pairs [(c * MAX_TOKENS + k) * N_ROUTED, ..)
+    # per expert (routing key, sigmoid) pairs, see route_key
+    ("scores", 2 * N_ROUTED * MAX_TOKENS * SCORE_COPIES),
+    ("mid", MOE_SLOTS * INTER * MAX_TOKENS),
+    # routing record read by the tests: token k's expert ids, then weights
+    ("sel", 2 * MOE_SLOTS * MAX_TOKENS),
+    # token k's split task p's candidates: rank r at pairs 2 ((k N_SPLIT + p)
+    # TOPK_BLOCKS + r) + (0 key, 1 block)
+    ("sel_long", SEL_LONG_PAIRS * MAX_TOKENS),
+    # wide: the MXFP8 xn and scales as plain words (every token's row), and a
+    # done flag per router task
+    ("xn8p", HIDDEN // 4 * MAX_TOKENS // 2),
+    ("xscp", HIDDEN // 32 * MAX_TOKENS // 2),
+    ("xndone", N_ROUTER * MAX_TOKENS),
+    # and a done flag per up / gate task pair
+    ("ugdone", (TOP_K * MAX_TOKENS + 1) * UG_PER_SLOT // 2),
+    # dense layers (dense_post): the post-attention norm's per-token FP8 rows
+    # as plain words, each row's scale (its pair is the flag), and the MLP's
+    # bf16 mid pairs
+    ("dx8", HIDDEN // 4 * MAX_TOKENS // 2),
+    ("dxs", MAX_TOKENS),
+    ("dmid", DENSE_INTER // 2 * MAX_TOKENS),
+    # and (S > 2) each mid row's per-token FP8 as plain words, then its scale
+    ("dmid8", DENSE_INTER // 4 * MAX_TOKENS // 2),
+    ("dmids", MAX_TOKENS),
+    # a debug build's wait records, one a CTA
+    ("diag", BLOCKS * DIAG_WORDS * 4 // PAIR_BYTES),
+    # ``attn_mxfp8``: the merged attention's per-1x32 E8M0 codes, 4 to a plain word
+    # (behind ``attnq_s``'s flags)
+    ("attnq_sc", MAX_TOKENS * (O_K // 128) // 2),
+]
+# then the MoE's regions of one shared-expert kind, laid over the other kind's: a
+# runner's K4 builds are all ``fused_shared`` or none (``runner``)
+_SCRATCH_MOE = {
+    False: [
         # the routed experts' MXFP4 xn (packed e2m1, 8 to a word, low nibble = lower k) and its
         # per-32 E8M0 codes (a word each): narrow tagged (``xn4`` / ``xs4``), wide plain words behind the
         # xn flag (``xn4p`` / ``xs4p``); wide: the routed mid rows (row k TOP_K + slot) and their codes
@@ -130,11 +130,30 @@ SCRATCH = _layout(
         ("xs4p", HIDDEN // 32 * MAX_TOKENS // 2),
         ("mid4p", TOP_K * INTER // 8 * MAX_TOKENS // 2),
         ("mids4p", TOP_K * INTER // 32 * MAX_TOKENS // 2),
-        # ``fused_shared``, wide: every slot's mid rows (row k MOE_SLOTS + slot, the
-        # shared expert's slot TOP_K) as MXFP8 plain words and their E8M0 scales
+        # and the MXFP8 shared expert's mid rows (row k = token k) as MXFP8 words, their
+        # E8M0 scales a word each (the down stage's LDS layout)
+        ("mid8p", INTER * MAX_TOKENS // 8),
+        ("midsp", INTER // 32 * MAX_TOKENS // 2),
+    ],
+    True: [
+        # wide: every slot's mid rows (row k MOE_SLOTS + slot, the shared expert's
+        # slot TOP_K) as MXFP8 plain words and their E8M0 scales
         ("mid8f", MOE_SLOTS * INTER * MAX_TOKENS // 8),
         ("midsf", MOE_SLOTS * INTER // 32 * MAX_TOKENS // 2),
-    ]
+    ],
+}
+# a build's own table: its regions and its extent ``_bytes``, all a step zeroes
+SCRATCH_OF = {
+    fused: _layout(_SCRATCH_COMMON + moe) for fused, moe in _SCRATCH_MOE.items()
+}
+# every build's regions (their offsets agree), the buffer holding either kind
+SCRATCH = SCRATCH_OF[False] | SCRATCH_OF[True]
+SCRATCH["_bytes"] = max(t["_bytes"] for t in SCRATCH_OF.values())
+assert all(
+    SCRATCH[name] == t[name]
+    for t in SCRATCH_OF.values()
+    for name in t
+    if name != "_bytes"
 )
 SCRATCH_BYTES = SCRATCH["_bytes"]
 

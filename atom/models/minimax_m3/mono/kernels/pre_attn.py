@@ -123,7 +123,8 @@ SCRATCH_X8S = SCRATCH_X8 + MAX_TOKENS * HIDDEN // 4 * 8  # and their scales
 # fused layer kernel only: a head task's / the residual's done flags
 SCRATCH_HDONE = SCRATCH_X8S + MAX_TOKENS * 8
 SCRATCH_RDONE = SCRATCH_HDONE + MAX_TOKENS * N_HEAD_TASKS * 8
-# ``attn_mxfp8``, S > 2: the norm tasks' per-1x32 E8M0 codes, 4 to a word (plain, behind x8s's flags)
+# ``attn_mxfp8``, S > 2: the norm tasks' per-1x32 E8M0 codes, 4 to a word (plain, behind x8s's flags);
+# last: a runner without ``attn_mxfp8`` zeroes the scratch up to here
 SCRATCH_XSC = SCRATCH_RDONE + MAX_TOKENS * 8
 SCRATCH_BYTES = SCRATCH_XSC + MAX_TOKENS * (HIDDEN // 128) * 4
 K_SCALE_BYTES = HIDDEN // 32  # an MXFP8 weight row's scale bytes

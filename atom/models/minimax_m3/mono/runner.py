@@ -70,7 +70,15 @@ from atom.models.minimax_m3.mono.kernels.pre_attn import (
 from atom.models.minimax_m3.mono.kernels.pre_attn import (
     SCRATCH_BYTES as K1_SCRATCH_BYTES,
 )
-from atom.models.minimax_m3.mono.layout import SCRATCH, diag_region_names, sym_layout
+from atom.models.minimax_m3.mono.kernels.pre_attn import (
+    SCRATCH_XSC as K1_SCRATCH_XSC,
+)
+from atom.models.minimax_m3.mono.layout import (
+    SCRATCH,
+    SCRATCH_OF,
+    diag_region_names,
+    sym_layout,
+)
 from atom.models.minimax_m3.mono.layout import SCRATCH_BYTES as K4_SCRATCH_BYTES
 from atom.models.minimax_m3.mono.weights import DenseLayer, SparseMoeLayer
 from atom.mono.plan.execution import BLOCKS
@@ -366,9 +374,14 @@ class MonoDecodeRunner:
             self.npes,
             dev,
         )
-        # every mailbox pair, zeroed at each step's start (forward)
+        # every mailbox pair, zeroed at each step's start (forward): the scratch this
+        # runner's builds use (K1's codes only ``attn_mxfp8``'s, K4's MoE regions
+        # only its shared-expert kind's)
         self.mailboxes = StepMailboxes(
-            self.peers, self.scratch1, self.scratch4, debug=self.debug
+            self.peers,
+            self.scratch1[: K1_SCRATCH_BYTES if self.attn_mxfp8 else K1_SCRATCH_XSC],
+            self.scratch4[: SCRATCH_OF[self.fused_shared]["_bytes"]],
+            debug=self.debug,
         )
         bf16 = torch.bfloat16
         # row k = token k of the step; sparse layer i reads ars[i % 2] (the
