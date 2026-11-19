@@ -13,10 +13,13 @@ their own, and the rest is asserted against the source.
 from __future__ import annotations
 
 import ast
+import functools
 import os
 import unittest
 from pathlib import Path
 from unittest import mock
+
+from aiter_stub import atom_without_aiter
 
 ROOT = Path(__file__).resolve().parents[1]
 CONNECTOR = ROOT / "atom/kv_transfer/disaggregation/moriio/moriio_connector.py"
@@ -253,19 +256,26 @@ class ConnectorSourceTest(unittest.TestCase):
         )
 
 
-def import_connector(name: str = "MoRIIOConnector"):
-    """A class from the connector module, or None where it cannot be imported.
-
-    aiter resolves the gfx arch from rocminfo while importing, so this only
-    succeeds in a container that can see the GPUs.
-    """
+@functools.cache
+def connector_modules():
+    """`moriio_connector` and `moriio_common`, under the AITER and Triton stand-ins
+    where those cannot run; kept, as the stand-ins are gone once this returns."""
     try:
-        from atom.kv_transfer.disaggregation.moriio import moriio_connector
+        with atom_without_aiter() as load:
+            return (
+                load("atom.kv_transfer.disaggregation.moriio.moriio_connector"),
+                load("atom.kv_transfer.disaggregation.moriio.moriio_common"),
+            )
     # Broad on purpose: whatever stops the native stack loading means skip,
     # and an unexpected type must not turn the CPU lane red.
     except Exception:  # noqa: BLE001
         return None
-    return getattr(moriio_connector, name)
+
+
+def import_connector(name: str = "MoRIIOConnector"):
+    """A class from the connector module, or None where it cannot be loaded."""
+    modules = connector_modules()
+    return None if modules is None else getattr(modules[0], name)
 
 
 class ConnectorBehaviourTest(unittest.TestCase):
@@ -534,13 +544,9 @@ class WritePathTest(unittest.TestCase):
         import msgpack
         import torch
 
-        from atom.kv_transfer.disaggregation.moriio.moriio_common import (
-            MoRIIOConstants,
-        )
-
         cls.msgpack = msgpack
         cls.torch = torch
-        cls.constants = MoRIIOConstants
+        cls.constants = connector_modules()[1].MoRIIOConstants
 
     def make(self, *, producer: bool, layers: int = 2, blocks: int = 8):
         """A connector holding only what the write path reads.
@@ -803,12 +809,15 @@ class WritePathTest(unittest.TestCase):
     def test_a_read_with_nothing_past_the_kept_prefix_is_refused(self):
         conn = self.make(producer=False)
         conn.transfer_mode = "read"
-        conn._read_blocks = lambda **kwargs: self.fail("posted an empty read")
+        # Recorded, not failed in place: the read path swallows exceptions.
+        reads = []
+        conn._read_blocks = lambda **kwargs: reads.append(kwargs)
         meta = self.recv_meta([4, 5], [10, 11])
         meta.num_computed_blocks = 2
         meta.remote_engine_id = "engine"
         with self.assertLogs("atom", "ERROR"):
             conn._issue_read_for_req("d1", meta)
+        self.assertEqual(reads, [])
         self.assertEqual(conn._failed_before_read, {"d1"})
 
     def test_the_kept_prefix_check_covers_v(self):

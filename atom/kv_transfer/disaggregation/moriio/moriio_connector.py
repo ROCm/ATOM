@@ -944,10 +944,12 @@ class MoRIIOConnector(KVConnectorBase):
         return (idx[:, None] * self.kv_cache_block_size + offsets[None, :]).reshape(-1)
 
     def _verify_digest(self, rows: Any) -> dict[str, int]:
-        """Position-weighted byte digest of each layer's destination rows.
+        """Position-weighted byte digest of each K plane, and each V plane where
+        the layer has one, over the given rows (received blocks or the kept
+        prefix).
 
         Read as uint8 so the digest is dtype-agnostic, and stacked so all
-        layers cost one device sync rather than one each. Weighted because a
+        planes cost one device sync rather than one each. Weighted because a
         reused block still holds an earlier request's KV, and under a plain
         byte sum new KV with the same total looks like KV that never landed.
         """
