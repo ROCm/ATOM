@@ -415,6 +415,15 @@ class MultiConnector(KVConnectorBase):
 class MultiConnectorScheduler(KVConnectorSchedulerBase):
     """Scheduler-side composite connector."""
 
+    # Answered here rather than left to the scheduler's defaults. The scheduler
+    # reads `receives_suffix_and_state` once, for every remote prefill it will
+    # admit, and only a MoRIIO consumer configured directly declares it, so a
+    # decode under `multi` keeps the state gate. Transfer slots are sized only
+    # for a MoRIIO producer configured directly
+    # (`GDNStateMixin.state_transfer_slots`), so nothing is staged either.
+    receives_suffix_and_state = False
+    stage_state_for_send = None
+
     def _prefetch_tier(self):
         # The one offload sub (`validate_multi_config` refuses a second, and a
         # P/D consumer beside it).

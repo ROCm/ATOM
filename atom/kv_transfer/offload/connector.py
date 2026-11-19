@@ -211,6 +211,11 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
 
     is_producer = False
     is_offload = True
+    # The P/D members the scheduler reads (`receives_suffix_and_state`,
+    # `stage_state_for_send`): an offload tier receives no remote prefill and
+    # pushes no state, so the state gate stays and nothing is staged.
+    receives_suffix_and_state = False
+    stage_state_for_send = None
 
     def __init__(self, config) -> None:
         self._impl = _build_scheduler(config)
