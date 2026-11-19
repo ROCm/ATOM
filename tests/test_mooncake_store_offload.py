@@ -4827,3 +4827,486 @@ def test_draft_window_refusals(cluster, monkeypatch):
         other.kv_transfer_config = transfer
         with pytest.raises(ValueError, match="only the mooncake P/D connector"):
             KVConnectorFactory.create_connector(other, role="scheduler")
+
+
+# --- the split layout's draft objects on the worker ------------------------
+
+
+def _draft_pattern(block: int) -> bytes:
+    return bytes((block * 13 + i + 1) % 249 for i in range(DRAFT_BLOCK_BYTES))
+
+
+def _flat(group):
+    return [b for item in group for b in (item if isinstance(item, list) else [item])]
+
+
+class FakeDraftCodec:
+    """The PAGE codec's prepared API over the draft's rows, block by block."""
+
+    has_fused_chunk_major_staging = True
+    supports_strided_restore = True
+    bytes_per_block = DRAFT_BLOCK_BYTES
+
+    def __init__(self, events=None) -> None:
+        self.device = torch.device("cpu")
+        self.kv: dict[int, bytes] = {}
+        self.calls: list[tuple] = []
+        self.events = [] if events is None else events
+
+    def prepare_block_id_groups(self, groups, *, device, stream):
+        return SimpleNamespace(groups=[list(g) for g in groups], stream=stream)
+
+    def gpu_to_chunk_major_device_buffer_prepared(self, buf, owner, index, *, stream):
+        assert stream is owner.stream
+        blocks = _flat(owner.groups[index])
+        data = b"".join(self.kv.get(b, _draft_pattern(b)) for b in blocks)
+        assert buf.numel() == len(data)
+        buf.copy_(torch.frombuffer(bytearray(data), dtype=torch.uint8))
+        self.calls.append(("pack", blocks))
+        self.events.append(("pack", blocks))
+
+    def chunk_major_device_buffer_to_gpu_prepared(self, buf, owner, index, *, stream):
+        blocks = _flat(owner.groups[index])
+        data = buf.numpy().tobytes()
+        for item, block in enumerate(blocks):
+            start = item * DRAFT_BLOCK_BYTES
+            self.kv[block] = data[start : start + DRAFT_BLOCK_BYTES]
+        self.calls.append(("unpack", blocks))
+
+    def chunk_major_strided_buffer_to_gpu_prepared(
+        self, buf, owner, index, *, stream, items_per_chunk, chunk_stride_bytes
+    ):
+        data = buf.numpy().tobytes()
+        for chunk, blocks in enumerate(owner.groups[index]):
+            assert len(blocks) == items_per_chunk
+            for item, block in enumerate(blocks):
+                start = chunk * chunk_stride_bytes + item * DRAFT_BLOCK_BYTES
+                self.kv[block] = data[start : start + DRAFT_BLOCK_BYTES]
+        self.calls.append(("strided", items_per_chunk, chunk_stride_bytes))
+
+
+@pytest.fixture
+def make_draft_worker(make_worker, monkeypatch, draft_window):
+    """A last-stage worker (rank 1 of PP2) that also moves draft objects."""
+
+    def build(*, save_slots=16, load_slots=16, codec=None):
+        worker, gpu = make_worker(
+            rank=1,
+            world=2,
+            save_slots=save_slots,
+            load_slots=load_slots,
+            config=_draft_config(pp=2),
+        )
+        codec = FakeDraftCodec() if codec is None else codec
+        stream = FakeStream()
+        worker._draft_codec = codec
+        worker._draft_chunk_bytes = DRAFT_CHUNK_BYTES
+        monkeypatch.setattr(worker, "_in_place_stream", lambda: stream)
+        return worker, gpu, codec, stream
+
+    return build
+
+
+def _draft_save_req(req_id, *, skip=0, draft=(4, 8), offset=0):
+    request = _save_req(req_id, 64, skip=skip, offset=offset)
+    request.draft_chunks = draft
+    return request
+
+
+def _draft_calls(store, op):
+    """The `op` calls of a fake Store that named draft objects."""
+    return [
+        c[1] for c in store.calls if c[0] == op and any("/draft/" in k for k in c[1])
+    ]
+
+
+def _draft_bytes(index):
+    return _draft_pattern(2 * index) + _draft_pattern(2 * index + 1)
+
+
+def test_save_puts_window_draft_objects_ungrouped(cluster, make_draft_worker):
+    worker, _gpu, _codec, _stream = make_draft_worker()
+    request = _draft_save_req(60)
+    worker._do_save_req(request)
+    store = cluster.store_of(MASTER)
+    objects = cluster.objects[MASTER]
+    # One put without groups for the draft objects, at the draft's size.
+    draft_puts = [ids for ids in store.put_group_ids if ids is None]
+    assert len(draft_puts) == 1
+    for index in range(8):
+        target = objects[_key(request.chunk_hashes, index, rank=1, world=2)]
+        assert len(target) == CHUNK_BYTES
+        assert store.groups[_key(request.chunk_hashes, index, rank=1, world=2)]
+        draft = objects.get(_draft_key(request.chunk_hashes, index))
+        if index < 4:
+            assert draft is None
+            continue
+        assert draft == _draft_bytes(index)
+        assert _draft_key(request.chunk_hashes, index) not in store.groups
+    assert _store(request.save_operation) in worker.get_finished().connector_completions
+    stats = worker._client.stats()["counts"]
+    assert (stats["draft_put_calls"], stats["draft_put_keys"]) == (1, 4)
+    assert stats["draft_put_bytes"] == 4 * DRAFT_CHUNK_BYTES
+
+
+def test_a_stage_without_the_draft_puts_no_draft_object(cluster, make_worker):
+    worker, _ = make_worker(rank=0, world=2)
+    request = _draft_save_req(61)
+    worker._do_save_req(request)
+    assert not any("/draft/" in key for key in cluster.objects[MASTER])
+    assert cluster.store_of(MASTER).put_group_ids != [] and all(
+        ids is not None for ids in cluster.store_of(MASTER).put_group_ids
+    )
+
+
+def _safe_events(worker, gpu, events):
+    report = worker._source_group_safe
+
+    def safe(identity):
+        events.append(("safe", identity.ranges))
+        report(identity)
+
+    worker._source_group_safe = gpu.source_safe = safe
+
+
+def test_draft_rows_are_packed_before_their_chunks_are_source_safe(
+    cluster, make_draft_worker
+):
+    events = []
+    worker, gpu, _codec, _stream = make_draft_worker(codec=FakeDraftCodec(events))
+    _safe_events(worker, gpu, events)
+    worker._do_save_req(_draft_save_req(62))
+    kinds = [event[0] for event in events]
+    assert kinds.count("pack") == 4 and kinds.count("safe") == 8
+    assert kinds.index("safe") > max(
+        i for i, kind in enumerate(kinds) if kind == "pack"
+    )
+
+
+def test_a_held_target_does_not_hold_its_draft_object(cluster, make_draft_worker):
+    events = []
+    worker, gpu, _codec, _stream = make_draft_worker(codec=FakeDraftCodec(events))
+    _safe_events(worker, gpu, events)
+    request = _draft_save_req(75)
+    hashes = request.chunk_hashes
+    objects = cluster.objects.setdefault(MASTER, {})
+    for index in range(8):
+        objects[_key(hashes, index, rank=1, world=2)] = b"t" * CHUNK_BYTES
+    worker._do_save_req(request)
+    # No target read or put; every draft object of the window is, and the
+    # held targets turn source-safe only after those packs.
+    assert gpu.calls == []
+    assert _draft_calls(cluster.store_of(MASTER), "put") == [
+        [_draft_key(hashes, index) for index in range(4, 8)]
+    ]
+    assert all(objects[_draft_key(hashes, i)] == _draft_bytes(i) for i in range(4, 8))
+    kinds = [event[0] for event in events]
+    assert kinds.count("pack") == 4 and kinds.count("safe") == 8
+    assert kinds.index("safe") > max(i for i, k in enumerate(kinds) if k == "pack")
+    assert _store(request.save_operation) in worker.get_finished().connector_completions
+    assert worker._save_counts["held_chunks"] == 8
+
+
+def test_a_failed_draft_put_is_counted_not_fatal(cluster, make_draft_worker):
+    worker, _gpu, _codec, _stream = make_draft_worker()
+    request = _draft_save_req(63)
+    store = cluster.store_of(MASTER)
+    store.put_codes[_draft_key(request.chunk_hashes, 5)] = (
+        store_client.NO_AVAILABLE_HANDLE
+    )
+    worker._do_save_req(request)
+    # The save stands: a draft object missing only cuts a later lookup.
+    assert _store(request.save_operation) in worker.get_finished().connector_completions
+    objects = cluster.objects[MASTER]
+    assert all(
+        _key(request.chunk_hashes, i, rank=1, world=2) in objects for i in range(8)
+    )
+    assert _draft_key(request.chunk_hashes, 5) not in objects
+    failures = worker._client.stats()["failures"]
+    assert failures == {"draft_put:NO_AVAILABLE_HANDLE(-200)": 1}
+    assert worker._store_distrusted is None
+    assert worker._pool.quarantined("save") == 0
+
+
+def test_an_unsettled_draft_put_distrusts_the_store(
+    cluster, make_draft_worker, slow_calls
+):
+    worker, _gpu, _codec, _stream = make_draft_worker()
+    request = _draft_save_req(64)
+    store = cluster.store_of(MASTER)
+    store.put_codes[_draft_key(request.chunk_hashes, 6)] = store_client.TRANSFER_FAIL
+    worker._do_save_req(request)
+    assert _store(request.save_operation) in worker.get_finished().connector_completions
+    assert worker._store_distrusted is not None
+    assert worker._pool.quarantined("save") == 1
+
+
+def _draft_load_req(req_id, *, hbm=0, draft=(4, 8)):
+    request = _load_req(
+        req_id, hbm=hbm, lmc=64, block_ids=list(range(100, 117)), num_tokens=64
+    )
+    request.draft_chunks = draft
+    return request
+
+
+def _store_draft_prompt(cluster, request, *, draft_size=DRAFT_CHUNK_BYTES):
+    objects = cluster.objects.setdefault(MASTER, {})
+    patterns = {}
+    for index in range(8):
+        objects[_key(request.chunk_hashes, index, rank=1, world=2)] = bytes(
+            (index + i) % 251 for i in range(CHUNK_BYTES)
+        )
+        data = bytes((index * 7 + i) % 241 for i in range(draft_size))
+        objects[_draft_key(request.chunk_hashes, index)] = data
+        patterns[index] = data
+    return patterns
+
+
+def test_load_gets_the_window_all_or_nothing(cluster, make_draft_worker):
+    worker, _gpu, codec, _stream = make_draft_worker()
+    request = _draft_load_req(65, hbm=2 * CHUNK)
+    patterns = _store_draft_prompt(cluster, request)
+    worker._do_load_req(request)
+    assert worker.get_finished().finished_loading == {request.load_operation}
+    for index in range(4, 8):
+        for item in range(2):
+            block = 100 + 2 * index + item
+            width = DRAFT_BLOCK_BYTES
+            assert codec.kv[block] == patterns[index][item * width : (item + 1) * width]
+    # Below the window nothing was restored; the scheduler marks those blocks.
+    assert not any(100 + b in codec.kv for b in range(8))
+    stats = worker._client.stats()["counts"]
+    assert (stats["draft_get_calls"], stats["draft_get_keys"]) == (1, 4)
+
+    # A draft object missing or of another size fails the whole load.
+    del cluster.objects[MASTER][_draft_key(request.chunk_hashes, 6)]
+    missing = _draft_load_req(66, hbm=2 * CHUNK)
+    worker._do_load_req(missing)
+    assert worker.get_finished().failed_loading == {missing.load_operation}
+    _store_draft_prompt(cluster, request, draft_size=DRAFT_CHUNK_BYTES - 1)
+    resized = _draft_load_req(67, hbm=2 * CHUNK)
+    worker._do_load_req(resized)
+    assert worker.get_finished().failed_loading == {resized.load_operation}
+
+
+def test_registration_refuses_draft_regions_off_the_last_stage(
+    cluster, draft_window, monkeypatch
+):
+    worker = MooncakeStoreOffloadConnector(_draft_config(pp=2))
+    worker._codec = SimpleNamespace(bytes_per_block=16)
+    try:
+
+        def draft_codec(bytes_per_block):
+            monkeypatch.setattr(
+                worker_mod,
+                "build_mooncake_draft_codec",
+                lambda config, tt, n: (
+                    None
+                    if bytes_per_block is None
+                    else SimpleNamespace(bytes_per_block=bytes_per_block)
+                ),
+            )
+
+        draft_codec(6)
+        with pytest.raises(ValueError, match="rank 0 holds draft KV regions"):
+            worker._register_draft_codec(None, 8, 0)
+        worker._register_draft_codec(None, 8, 1)
+        assert worker._draft_chunk_bytes == 6 * CHUNK // BLOCK
+        draft_codec(None)
+        with pytest.raises(ValueError, match="rank 1 lacks draft KV regions"):
+            worker._register_draft_codec(None, 8, 1)
+        draft_codec(32)
+        with pytest.raises(ValueError, match="exceed the target's"):
+            worker._register_draft_codec(None, 8, 1)
+    finally:
+        worker.close()
+
+
+def _exhaust_slots_inside(worker, phase, monkeypatch):
+    """Every slot `worker.<phase>` asks for finds its region exhausted."""
+    inside = []
+    run, acquire = getattr(worker, phase), worker._pool.acquire
+
+    def in_phase(*args, **kwargs):
+        inside.append(phase)
+        try:
+            return run(*args, **kwargs)
+        finally:
+            inside.pop()
+
+    def acquire_outside(region, n):
+        if inside:
+            raise SlotPoolExhausted(f"the {region} region has no usable slot")
+        return acquire(region, n)
+
+    monkeypatch.setattr(worker, phase, in_phase)
+    monkeypatch.setattr(worker._pool, "acquire", acquire_outside)
+
+
+def _fail_draft_calls(client, op, failure, monkeypatch):
+    """`client.<op>` refuses or raises for draft objects, as `failure` says."""
+    call = getattr(client, op)
+
+    def draft_fails(names, ptrs, sizes, **kwargs):
+        if kwargs.get("tally") != "draft_":
+            return call(names, ptrs, sizes, **kwargs)
+        if failure.endswith("refused"):
+            raise store_client.CallRefused("refused before Mooncake had the call")
+        raise RuntimeError(f"batch_{op} blew up")
+
+    monkeypatch.setattr(client, op, draft_fails)
+
+
+def test_a_draft_save_past_its_deadline_reads_and_puts_nothing(
+    cluster, make_draft_worker
+):
+    # The draft pack runs first: past the deadline the scheduler may have handed
+    # its source blocks on, and their rows must not be stored under these keys.
+    worker, gpu, codec, _stream = make_draft_worker()
+    request = _draft_save_req(68)
+    request._kv_store_dispatched_at = time.monotonic() - 10_000
+    worker._do_save_req(request)
+    assert codec.calls == [] and gpu.calls == []
+    assert not any(call[0] == "put" for call in worker._client._store.calls)
+    operation = request.save_operation
+    assert worker.get_finished().connector_completions == {
+        _store(operation, False),
+        _quiescent(operation),
+        *(_safe(operation, index) for index in range(8)),
+    }
+
+
+@pytest.mark.parametrize("failure", ["pool_exhausted", "put_refused", "put_raised"])
+def test_a_draft_save_that_fails_still_stores_the_targets(
+    cluster, make_draft_worker, monkeypatch, caplog, failure
+):
+    worker, _gpu, _codec, _stream = make_draft_worker()
+    if failure == "pool_exhausted":
+        _exhaust_slots_inside(worker, "_save_draft_chunks", monkeypatch)
+    else:
+        _fail_draft_calls(worker._client, "put", failure, monkeypatch)
+    request = _draft_save_req(69)
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        worker._do_save_req(request)
+    assert f"draft objects ({failure}:" in caplog.text
+    # The save stands: a draft object missing only cuts a later lookup.
+    assert _store(request.save_operation) in worker.get_finished().connector_completions
+    objects = cluster.objects[MASTER]
+    assert all(
+        _key(request.chunk_hashes, i, rank=1, world=2) in objects for i in range(8)
+    )
+    assert not any("/draft/" in key for key in objects)
+    # Only a put that may still read its slots retires them and distrusts the
+    # Store; one refused before Mooncake had it leaves both alone.
+    raised = failure == "put_raised"
+    assert worker._pool.quarantined("save") == (4 if raised else 0)
+    assert (worker._store_distrusted is not None) == raised
+
+
+@pytest.mark.parametrize(
+    "failure", ["pool_exhausted", "draft_get_refused", "draft_get_raised"]
+)
+def test_a_draft_load_that_fails_fails_the_load(
+    cluster, make_draft_worker, monkeypatch, caplog, failure
+):
+    worker, _gpu, codec, _stream = make_draft_worker()
+    if failure == "pool_exhausted":
+        _exhaust_slots_inside(worker, "_load_draft_chunks", monkeypatch)
+    else:
+        _fail_draft_calls(worker._client, "get", failure, monkeypatch)
+    request = _draft_load_req(70, hbm=2 * CHUNK)
+    _store_draft_prompt(cluster, request)
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        worker._do_load_req(request)
+    assert worker.get_finished().failed_loading == {request.load_operation}
+    assert f"a load failed ({failure}:" in caplog.text
+    assert codec.calls == []
+    # A get that raised may still write its slots; the Store stays trusted.
+    raised = failure == "draft_get_raised"
+    assert worker._pool.quarantined("load") == (4 if raised else 0)
+    assert worker._store_distrusted is None
+
+
+def test_a_draft_get_run_while_the_store_was_marked_fails_the_load(
+    cluster, make_draft_worker
+):
+    # The final look for the marker comes after the draft get, which may have
+    # read what an abandoned write corrupted.
+    worker, _gpu, _codec, _stream = make_draft_worker()
+    request = _draft_load_req(71, hbm=2 * CHUNK)
+    _store_draft_prompt(cluster, request)
+    store = worker._client._store
+    get = store.batch_get_into
+
+    def mark_during_the_draft_get(names, ptrs, sizes):
+        if any("/draft/" in name for name in names):
+            cluster.exist_codes[keys.STORE_TAINT_KEY] = 1
+        return get(names, ptrs, sizes)
+
+    store.batch_get_into = mark_during_the_draft_get
+    worker._do_load_req(request)
+    assert len(_draft_calls(store, "get")) == 1
+    assert worker.get_finished().failed_loading == {request.load_operation}
+
+
+def test_a_draft_get_looks_for_the_marker_first(cluster, make_draft_worker):
+    worker, _gpu, _codec, _stream = make_draft_worker()
+    request = _draft_load_req(72, hbm=2 * CHUNK)
+    _store_draft_prompt(cluster, request)
+    store = worker._client._store
+    get = store.batch_get_into
+    last_target = _key(request.chunk_hashes, 7, rank=1, world=2)
+
+    def mark_during_the_last_target_get(names, ptrs, sizes):
+        if last_target in names:
+            cluster.exist_codes[keys.STORE_TAINT_KEY] = 1
+        return get(names, ptrs, sizes)
+
+    store.batch_get_into = mark_during_the_last_target_get
+    worker._do_load_req(request)
+    assert worker.get_finished().failed_loading == {request.load_operation}
+    assert _draft_calls(store, "get") == []
+
+
+def test_scattered_load_slots_restore_the_draft_rows_one_by_one(
+    cluster, make_draft_worker, monkeypatch
+):
+    worker, _gpu, codec, _stream = make_draft_worker()
+    monkeypatch.setattr(worker._pool, "strided_view", lambda slots: None)
+    request = _draft_load_req(73, hbm=2 * CHUNK)
+    patterns = _store_draft_prompt(cluster, request)
+    worker._do_load_req(request)
+    assert worker.get_finished().finished_loading == {request.load_operation}
+    assert [call[0] for call in codec.calls] == ["unpack"] * 4
+    width = DRAFT_BLOCK_BYTES
+    for index in range(4, 8):
+        for item in range(2):
+            block = 100 + 2 * index + item
+            assert codec.kv[block] == patterns[index][item * width : (item + 1) * width]
+
+
+def test_profile_lines_time_the_draft_objects_apart(
+    cluster, make_draft_worker, monkeypatch, caplog
+):
+    worker, _gpu, _codec, _stream = make_draft_worker()
+    monkeypatch.setattr(worker, "_profile_enabled", lambda: True)
+    with caplog.at_level(logging.INFO, logger="atom"):
+        worker._do_save_req(_draft_save_req(74))
+        worker._do_load_req(_draft_load_req(74, hbm=2 * CHUNK))
+        worker._next_stats_log_at = 0.0
+        worker._maybe_log_store_stats()
+
+    def last(tag):
+        return [r.getMessage() for r in caplog.records if tag in r.getMessage()][-1]
+
+    save, load = last("[OFFLOAD-SAVE-PROF]"), last("[OFFLOAD-LOAD-PROF]")
+    # The target fields time the target objects; the draft phase has its own.
+    assert "status=ok draft_chunks=4 draft_bytes=48 draft_pack_ms=" in save
+    assert " draft_put_ms=" in save and save.endswith(" draft_status=ok")
+    assert "total_bytes=192 " in load
+    assert " draft_chunks=4 draft_bytes=48 draft_get_ms=" in load
+    assert " draft_unpack_ms=" in load
+    assert last("[OFFLOAD-STORE-STATS]").endswith(
+        " draft_puts=1 draft_put_keys=4 draft_put_bytes=48"
+        " draft_gets=1 draft_get_keys=4 draft_get_bytes=48"
+    )
