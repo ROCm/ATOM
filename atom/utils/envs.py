@@ -1122,6 +1122,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # "0" (default) = SEPARATED layout; "1" = INTERLEAVE layout. Always
     # INTERLEAVE on gfx1250: aiter's gfx1250 fused_moe takes no other layout.
     "ATOM_MOE_GU_ITLV": lambda: os.getenv("ATOM_MOE_GU_ITLV", "0") == "1",
+    # Experimental DSV4.1 TP4 routed experts: BF16 activations and native MXFP4 weights.
+    "ATOM_DSV41_A16W4_MOE": lambda: _flag_env("ATOM_DSV41_A16W4_MOE"),
     # --- MoE all2all (MoRI) wire format ---
     "ATOM_MORI_FP4_DISPATCH": lambda: os.getenv("ATOM_MORI_FP4_DISPATCH", "0") == "1",
     # Combine-side codec. "none" (the MoRI default) sends bf16 back;
