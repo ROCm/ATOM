@@ -36,6 +36,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T, as_ir_value
 
+from atom.mono.plan.architecture import GFX950, Architecture, MatrixIsa
 from atom.mono.plan.build_key import kernel_symbol  # noqa: F401
 from atom.mono.plan.execution import THREADS, WAVES
 from atom.mono.polling import SPIN_PAUSE_ASM
@@ -194,16 +195,19 @@ def div_rn(x, d, r):
     return fx.Float32(fmath.fma(fx.Float32(fmath.fma(-q, d, x)), r, q))
 
 
-def xshfl(v, off):
+def xshfl(v, off, architecture: Architecture = GFX950):
     """Value of lane ``lane ^ off``: offsets 32 / 16 via v_permlane*_swap, in-row
     offsets via DPP (VALU latency, not LDS). Powers of two only: any other
     offset would take the lane ^ 1 path."""
-    assert off in (1, 2, 4, 8, 16, 32), off
+    assert off in architecture.reduction_offsets, (architecture.gfx, off)
     if off >= 16:
-        return v.shuffle_xor(off, 64)
+        return v.shuffle_xor(off, architecture.wave_size)
     is_f = isinstance(v, fx.Float32)
     x = v.bitcast(fx.Int32) if is_f else fx.Int32(v)
-    if off == 8:
+    if off in (8, 4) and architecture.wave_size == 32:
+        # DPP16 row_xmask: lane ^ off within its row, in one move
+        y = fx.Int32(update_dpp_i32(x, x, 0x160 | off, 0xF, 0xF, False))
+    elif off == 8:
         y = fx.Int32(update_dpp_i32(x, x, 0x118, 0xF, 0xC, False))
         y = fx.Int32(update_dpp_i32(y, x, 0x108, 0xF, 0x3, False))
     elif off == 4:
@@ -216,10 +220,10 @@ def xshfl(v, off):
     return y.bitcast(fx.Float32) if is_f else y
 
 
-def xred(v, off, op):
+def xred(v, off, op, architecture: Architecture = GFX950):
     """op(v, lane ^ off) for a symmetric op; 32 / 16 take both halves of one swap."""
-    if off < 16:
-        return op(v, xshfl(v, off))
+    if off < 16 or not architecture.native_permlane_exchange:
+        return op(v, xshfl(v, off, architecture))
     is_f = isinstance(v, fx.Float32)
     x = v.bitcast(fx.Int32) if is_f else fx.Int32(v)
     a, b = permlane_swap(off, x, x)
@@ -232,13 +236,13 @@ def _add(a, b):
     return a + b
 
 
-def butterfly(v, offsets, op=_add):
+def butterfly(v, offsets, op=_add, architecture: Architecture = GFX950):
     """Butterfly reduction over the given xor offsets, in the given order.
 
     The order is the numerical contract: the aiter per-head norm reduces 32
     lanes with offsets 16, 8, 4, 2, 1, and matching it keeps rstd bit-exact."""
     for off in offsets:
-        v = xred(v, off, op)
+        v = xred(v, off, op, architecture)
     return v
 
 
@@ -259,7 +263,7 @@ def _scatter_offsets(n, offsets):
     return offsets[:k]
 
 
-def lane_reduce_scatter(vs, offsets, lane):
+def lane_reduce_scatter(vs, offsets, lane, architecture: Architecture = GFX950):
     """``butterflies(vs, offsets)`` (a power-of-two count of f32 sums over the
     lanes the offsets span) when a lane needs one of the sums: over the first
     log2(len(vs)) offsets a lane keeps half of what it carries -- the values
@@ -271,7 +275,7 @@ def lane_reduce_scatter(vs, offsets, lane):
     for off in scat:
         h = len(vs) // 2
         bit = (lane & off) != 0
-        if off == 16:
+        if off == 16 and architecture.native_permlane_exchange:
             # v_permlane16_swap(x, y): the even row gets (its x, the odd row's
             # x), the odd row (the even row's y, its y): the low half's sum on
             # the even row, the high half's on the odd -- low + high both
@@ -281,18 +285,21 @@ def lane_reduce_scatter(vs, offsets, lane):
         else:
             keep = [bit.select(vs[i + h], vs[i]) for i in range(h)]
             send = [bit.select(vs[i], vs[i + h]) for i in range(h)]
-            vs = [fx.Float32(k) + xshfl(fx.Float32(s), off) for k, s in zip(keep, send)]
+            vs = [
+                fx.Float32(k) + xshfl(fx.Float32(s), off, architecture)
+                for k, s in zip(keep, send)
+            ]
         row = row + bit.select(fx.Int32(h), fx.Int32(0))
     (v,) = vs
-    return butterfly(v, offsets[len(scat) :]), row
+    return butterfly(v, offsets[len(scat) :], architecture=architecture), row
 
 
-def lane_all_gather(v, n, offsets, lane):
+def lane_all_gather(v, n, offsets, lane, architecture: Architecture = GFX950):
     """Every lane all n sums of ``lane_reduce_scatter(.., offsets, ..)`` from its own
     one (v), in ``vs``' order: the halving undone, the last offset first."""
     vs = [v]
     for off in reversed(_scatter_offsets(n, offsets)):
-        if off == 16:
+        if off == 16 and architecture.native_permlane_exchange:
             # x = y: the even row gets (its own, the odd row's), the odd row
             # (the even row's, its own) -- (low half's, high half's) both
             pairs = [permlane_swap(16, x.bitcast(fx.Int32), x.bitcast(fx.Int32))
@@ -302,15 +309,15 @@ def lane_all_gather(v, n, offsets, lane):
             ]
         else:
             bit = (lane & off) != 0
-            other = [xshfl(x, off) for x in vs]
+            other = [xshfl(x, off, architecture) for x in vs]
             vs = [fx.Float32(bit.select(o, x)) for x, o in zip(vs, other)] + [
                 fx.Float32(bit.select(x, o)) for x, o in zip(vs, other)
             ]
     return vs
 
 
-def wave_sum(v):
-    return butterfly(v, (32, 16, 8, 4, 2, 1))
+def wave_sum(v, architecture: Architecture = GFX950):
+    return butterfly(v, architecture.reduction_offsets, architecture=architecture)
 
 
 def traced(fn):
@@ -319,8 +326,10 @@ def traced(fn):
     return ASTRewriter.transform(fn)
 
 
-def wave_max(v):
-    return butterfly(v, (32, 16, 8, 4, 2, 1), fx.max)
+def wave_max(v, architecture: Architecture = GFX950):
+    return butterfly(
+        v, architecture.reduction_offsets, fx.max, architecture=architecture
+    )
 
 
 @traced
@@ -489,8 +498,29 @@ def rows_to_lds(tid, src, rows, row_words, dst, dst_row):
     )  # fmt: skip
 
 
+def mma_bf16(a, b, c, architecture: Architecture):
+    """One architecture-native BF16 16x16x32 matrix operation."""
+    if architecture.bf16_mma.isa is MatrixIsa.MFMA:
+        acc_type = T.vec(architecture.bf16_mma.accumulator_elements_per_lane, T.f32)
+        return fx.Vector(rocdl.mfma_f32_16x16x32_bf16(acc_type, [a, b, c]))
+    if architecture.bf16_mma.isa is MatrixIsa.WMMA:
+        acc_type = fx.Vector.make_type(
+            architecture.bf16_mma.accumulator_elements_per_lane, fx.Float32
+        )
+        result = rocdl.wmma_f32_16x16x32_bf16(
+            acc_type,
+            as_ir_value(a),
+            as_ir_value(b),
+            as_ir_value(c),
+            reuseA=False,
+            reuseB=False,
+        ).result
+        return fx.Vector(result)
+    raise AssertionError(architecture.bf16_mma.isa)
+
+
 def mfma_bf16(a, b, c):
-    return fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b, c]))
+    return mma_bf16(a, b, c, GFX950)
 
 
 def row_sum(red, r, t, waves=None):

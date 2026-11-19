@@ -908,10 +908,13 @@ class KimiFullAttention(nn.Module):
         )
 
     def _gated_core(
-        self, positions: torch.Tensor, hidden_states: torch.Tensor
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        quantize: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """sigmoid(g_proj) * attention output, i.e. ``o_proj``'s input, and its
-        activation scale when ``o_proj`` runs fp8 (else None)."""
+        activation scale when ``o_proj`` runs fp8 and ``quantize`` (else None)."""
         # deepseek_v2 pattern: one _fuse_rmsnorm_quant kernel does q_a norm +
         # kv_a norm (+ q-activation quant), then q's scale is forwarded into the
         # MLA module (q_proj consumes it).
@@ -984,7 +987,7 @@ class KimiFullAttention(nn.Module):
         attn_out, attn_scale = fused_sigmoid_mul_maybe_quant(
             attn_out,
             gate,
-            quant=self.fuse_sigmoid_mul_quant,
+            quant=self.fuse_sigmoid_mul_quant and quantize,
             quant_type_value=self.o_proj_quant_type_value,
             e8m0_scale=self.o_proj_e8m0_scale,
         )
@@ -999,11 +1002,10 @@ class KimiFullAttention(nn.Module):
     def forward_pre_o(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
-        """``forward`` without ``o_proj``: the bf16 gated core, for the mono K2
-        kernel that applies ``o_proj`` itself (``mono.weights.bind_moe`` refuses
-        a quantized ``o_proj``, so there is never an activation scale)."""
-        attn_out, attn_scale = self._gated_core(positions, hidden_states)
-        assert attn_scale is None, "o_proj is quantized; K2 reads it as bf16"
+        """``forward`` without ``o_proj``: the bf16 gated core, for a mono K2
+        that applies ``o_proj`` itself (and quantizes its input there, if at
+        all)."""
+        attn_out, _ = self._gated_core(positions, hidden_states, quantize=False)
         return attn_out
 
 

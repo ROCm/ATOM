@@ -51,7 +51,12 @@ def _runner(monkeypatch, caches, *, mono_layers=(0, 1, 2)):
     runner = object.__new__(K3MonoDecodeRunner)
     runner.dims = SimpleNamespace(qkv=QKV)
     runner.plans = [
-        SimpleNamespace(layer_id=lid, mono=lid in mono_layers) for lid in range(4)
+        SimpleNamespace(
+            layer_id=lid,
+            mono=lid in mono_layers,
+            kda=object() if lid in mono_layers else None,
+        )
+        for lid in range(4)
     ]
     monkeypatch.setattr(
         runner_mod,

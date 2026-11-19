@@ -1,0 +1,1279 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+"""Single-launch resident-grid sharded K2 finish for gfx1250.
+
+The kernel consumes the packed TP8 front all-gather and fuses router,
+quantization, routed experts, and the shared expert into one launch.  The
+routed latent partial is reduced before finalization by the host-side RCCL
+runner.
+"""
+
+from dataclasses import dataclass
+
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+from aiter.ops.flydsl.kernels import buffer_ops as bo
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr.typing import Int64, T
+
+from atom.models.kimi_k3.mono.config import (
+    EXPERTS,
+    HIDDEN,
+    LATENT,
+    SUPPORTED_TP,
+    TOPK,
+)
+from atom.models.kimi_k3.mono.external_collectives import FrontPayloadLayout
+from atom.models.kimi_k3.mono.kernels.attention import (
+    kda_gfx1250 as protocol_device,
+)
+from atom.models.kimi_k3.mono.kernels.execution_plan import (
+    Gfx1250KimiBuildPlan,
+)
+from atom.models.kimi_k3.mono.kernels.stages import (
+    fresh_prefetch_gfx1250 as fresh,
+)
+from atom.models.kimi_k3.mono.kernels.stages import (
+    gemv_gfx1250,
+    moe_expert_gfx1250,
+    moe_gfx1250,
+    moe_tail_gfx1250,
+)
+from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import LDS_PAD
+from atom.models.kimi_k3.mono.kernels.token_tiling import WMMA_TOKEN_ROWS
+from atom.models.kimi_k3.mono.sources import SOURCES
+from atom.mono.device.ops import CM_DEV, bf_hi, bf_lo, rsrc, traced
+from atom.mono.plan.architecture import GFX1250
+from atom.mono.runtime.abi import KernelAbi
+from atom.utils import envs
+
+THREADS = 256
+WAVES = 8
+TP = SUPPORTED_TP[0]
+LOCAL_LATENT = LATENT // TP
+FINISH_REQUIRED_LDS_BYTES = 113_664
+SHARED_INTERMEDIATE = 768
+ROUTED_INTERMEDIATE = 384
+ROUTED_DOWN_TASKS = LATENT // 32
+SHARED_DOWN_TASKS = HIDDEN // 16
+GATE_UP_GROUPS = 12
+LOCAL_UNION_MAX_TILES = 2
+
+FINISH_PACKED_FRONT_ABI = KernelAbi(
+    (
+        "front_gathered",
+        "router_bias",
+        "shared_gate_up",
+        "shared_down_weight",
+        "shared_down_scale",
+        "w13",
+        "w13s",
+        "w2",
+        "w2s",
+        "shared_hidden",
+        "route",
+        "tile_route",
+        "flags",
+        "experts",
+        "kof",
+        "union_sizes",
+        "latent_fp4",
+        "latent_scales",
+        "routed_intermediate_fp4",
+        "routed_intermediate_scales",
+        "routed_partial",
+        "shared_partial",
+        "scratch",
+    )
+)
+
+
+def herd_scratch_layout(rows: int) -> dict[str, tuple[int, int]]:
+    """``{name: (byte offset, words)}`` of a ``precompute_herd`` finish's
+    scratch past the grid epoch: the launch counter, the ``tile_m`` and routed
+    scaling factor the host sets, the routing CTAs' tagged candidates
+    (sigmoid, ``moe_gfx1250.herd_tag`` | expert) and the HERD outputs (i32, f32
+    ``topk_weights``), each 64-byte aligned."""
+
+    layout = {"launch": (8, 1), "tile_m": (12, 1), "routed_scaling_factor": (16, 1)}
+    end = 64
+    for name, words in (
+        ("candidates", 2 * rows * (TOPK + 1)),
+        ("topk_ids", rows * TOPK),
+        ("topk_weights", rows * TOPK),
+        ("topids_to_rows", rows * TOPK),
+        ("masked_m", EXPERTS),
+        ("psum", EXPERTS),
+    ):
+        layout[name] = (end, words)
+        end += -(-4 * words // 64) * 64
+    return layout
+
+
+@dataclass(frozen=True)
+class K2FinishKernel:
+    name: str
+    launcher: object
+    grid: tuple[int]
+    block: tuple[int]
+    required_lds_bytes: int
+    scratch_bytes: int
+    abi: KernelAbi = FINISH_PACKED_FRONT_ABI
+    launch_count: int = 1
+    # its LDS union and kernel body, for a launch that runs it as a part
+    lds: object = None
+    body: object = None
+
+
+def _direct_poll(requests):
+    values = []
+    for pointer, index, _tag in requests:
+        word = fx.Int32(bo.buffer_load(rsrc(pointer), index, vec_width=1, dtype=T.i32))
+        values.append((word, fx.Int32(1)))
+    return values
+
+
+# A ``profile`` finish's stamps a CTA, in order: its start, its token's routes
+# stored (routing CTAs), every token's HERD candidates in and HERD's outputs
+# stored (the HERD CTA), its shared down's stores issued, its stores drained.
+PROFILE_STAMPS = ("start", "routed", "herd_in", "herd_done", "shared_done", "end")
+PROFILE_WORDS = 8
+
+
+def profile_offset(rows: int, precompute_herd: bool) -> int:
+    """A ``profile`` finish's stamps' byte offset in its scratch."""
+    if not precompute_herd:
+        return 64
+    end = max(at + 4 * words for at, words in herd_scratch_layout(rows).values())
+    return -(-end // 64) * 64
+
+
+def _realtime():
+    """The 100 MHz device clock's low word."""
+    from atom.models.kimi_k3.mono.kernels.stages.moe_tdm_gfx1250 import (
+        _realtime as clock,
+    )
+
+    return clock()
+
+
+def _out_cm(fused):
+    """A fused launch's outputs' cache policy: device scope, read in it."""
+    return 0 if fused is None else CM_DEV
+
+
+def _direct_put(pointer, index, value):
+    bo.buffer_store(value, rsrc(pointer), index)
+
+
+@traced
+def _grid_barrier(scratch, ticket, blocks):
+    """All-resident monotonic grid barrier using the validated K1 primitive."""
+
+    tid = fx.thread_idx.x
+    # Every wave has drained its stores before thread 0 arrives for the CTA.
+    gpu.barrier()
+    if tid == 0:
+        generation = protocol_device.epoch_arrive_system_atomic(scratch, fx.Int32(1))
+        fx.ptr_store(generation, ticket)
+    gpu.barrier()
+    generation = fx.ptr_load(ticket)
+    target = (generation // fx.Int32(blocks) + fx.Int32(1)) * fx.Int32(blocks)
+    if tid == 0:
+        arrived = protocol_device.epoch_load_system_acquire(scratch)
+        while arrived < target:
+            arrived = protocol_device.epoch_load_system_acquire(scratch)
+    protocol_device.epoch_fence_system_acquire()
+    gpu.barrier()
+
+
+@traced
+def _build_tile_union(
+    tid, lane, wave, tile, tile_rows, tile_route_in, lds, publish, outputs
+):
+    """Build one tile's ascending expert union in ``lds``.
+
+    ``publish`` CTAs also store the union for the routed-down phase.
+    """
+
+    context = {
+        "S": tile_rows,
+        "tid": tid,
+        "lane": lane,
+        "wave": wave,
+        "poll": _direct_poll,
+        "scan": lds["scan"],
+        "route": tile_route_in,
+        "rt": {
+            "route": lds["route"],
+            "flag": lds["flag"],
+            "expert": lds["expert"],
+            "kof": lds["kof"],
+        },
+    }
+    union_size = moe_gfx1250.load_route(context, THREADS, WAVES)
+    if publish:
+        if tid == 0:
+            bo.buffer_store(union_size, rsrc(outputs["union_sizes"]), tile)
+        for iteration in range_constexpr((16 * 32 + THREADS - 1) // THREADS):
+            index = tid + THREADS * iteration
+            if index < tile_rows * 32:
+                bo.buffer_store(
+                    fx.ptr_load(lds["route"] + index),
+                    rsrc(outputs["tile_route"]),
+                    tile * 16 * 32 + index,
+                )
+        for iteration in range_constexpr((EXPERTS + THREADS - 1) // THREADS):
+            index = tid + THREADS * iteration
+            if index < EXPERTS:
+                bo.buffer_store(
+                    fx.ptr_load(lds["flag"] + index),
+                    rsrc(outputs["flags"]),
+                    tile * EXPERTS + index,
+                )
+        for iteration in range_constexpr((256 + THREADS - 1) // THREADS):
+            index = tid + THREADS * iteration
+            if index < union_size:
+                bo.buffer_store(
+                    fx.ptr_load(lds["expert"] + index),
+                    rsrc(outputs["experts"]),
+                    tile * 256 + index,
+                )
+        for iteration in range_constexpr((256 * 16 + THREADS - 1) // THREADS):
+            index = tid + THREADS * iteration
+            if index < union_size * tile_rows:
+                bo.buffer_store(
+                    fx.ptr_load(lds["kof"] + index),
+                    rsrc(outputs["kof"]),
+                    tile * 256 * 16 + index,
+                )
+    return union_size
+
+
+def build_packed_finish(
+    plan: Gfx1250KimiBuildPlan,
+    *,
+    gu_interleave: bool = False,
+    include_shared: bool = True,
+    include_routed: bool = True,
+    replicated_front: bool = False,
+    herd: bool = False,
+    local_union: bool | None = None,
+    fp8_shared_down: bool = False,
+    precompute_herd: bool = False,
+    rolled: bool | None = None,
+    profile: bool = False,
+    parallel_herd: bool = False,
+    herd_poll_limit: int | None = None,
+) -> K2FinishKernel:
+    """Without ``include_routed`` the routed experts are left to AITER's grouped
+    MoE: ``route`` and ``tile_route`` then receive contiguous [rows, 16] expert
+    ids and weights, and ``latent_scales`` one E8M0 byte per 32-column group.
+    After a ``replicated_front`` there is no gathered payload: ``front_gathered``
+    is the rank's [rows, EXPERTS] f32 router logits, the latent planes are
+    already in place and ``shared_hidden`` holds the activated shared rows.
+    With ``herd`` the routes are [rows, 17] Top-(K+1) candidates and their raw
+    sigmoid scores, for AITER's HERD drop. With ``fp8_shared_down`` the
+    grouped-MoE finish reads ATOM's online per_1x128 FP8 shared down, its E8M0
+    block scales in ``shared_down_scale``. With ``precompute_herd`` one CTA also
+    finishes HERD for the grouped MoE (``moe_gfx1250``'s ``stage_herd_finalize``)
+    into ``herd_scratch_layout``'s outputs in ``scratch``. ``rolled`` (default
+    ``ATOM_KIMI_MONO_ROLLED_LITE``) routes a token by its whole CTA in runtime
+    loops (``stage_route_cta``, the same routes) and the shared down's tiles
+    and reduction too: a cold launch fetches far less code. ``profile``: each
+    CTA's 100 MHz stamps (``PROFILE_STAMPS``) in ``scratch`` past
+    ``profile_offset(...)``, ``PROFILE_WORDS`` a CTA. ``parallel_herd`` (with
+    ``precompute_herd``): each routing CTA finishes its own token's HERD
+    ``topk_ids`` and ``topk_weights`` (``stage_herd_token``, the same bits)
+    and runs no shared down, the other CTAs taking every shared-down task;
+    HERD's grouped layout (``masked_m``, ``psum``, ``topids_to_rows``) is not
+    written, so only a MoE reading the ids and weights alone may follow.
+    ``herd_poll_limit``: its routing CTAs give up on the candidates past that
+    many polls (wrong routes, never a hung GPU)."""
+    if rolled is None:
+        rolled = envs.ATOM_KIMI_MONO_ROLLED_LITE
+    if precompute_herd and not (herd and replicated_front):
+        raise ValueError("only a HERD grouped-MoE finish precomputes the routes")
+    if parallel_herd and not precompute_herd:
+        raise ValueError("only a finish precomputing HERD finishes it in parallel")
+    if herd_poll_limit is not None and not parallel_herd:
+        raise ValueError("only a parallel-HERD finish bounds its candidate polls")
+    if fp8_shared_down and (include_routed or not include_shared):
+        raise ValueError("only the grouped-MoE finish reads an FP8 shared down")
+    if replicated_front and include_routed:
+        raise ValueError("a replicated front feeds only the grouped-MoE finish")
+    if herd and include_routed:
+        raise ValueError("HERD candidates feed only the grouped-MoE finish")
+    if plan.architecture is not GFX1250:
+        raise ValueError("persistent K2 finish requires gfx1250")
+    if plan.threads != THREADS or plan.waves != WAVES:
+        raise ValueError("persistent K2 finish requires 256 threads/eight waves")
+    if include_shared and not include_routed and SHARED_DOWN_TASKS > 2 * plan.blocks:
+        raise ValueError("grouped-MoE finish holds two shared-down tasks a CTA")
+    rows = plan.tokens
+    tiles = plan.token_tiling.tile_count
+    payload = FrontPayloadLayout(rows)
+    if local_union is None:
+        # Rebuilding a union costs each CTA about as much as one grid
+        # barrier, so three-tile widths keep the published union.
+        local_union = tiles <= LOCAL_UNION_MAX_TILES
+
+    route_lds_words = moe_gfx1250.route_cta_words(THREADS) if rolled else {}
+
+    @fx.struct
+    class RouteRole:
+        red: fx.Array[fx.Float32, moe_gfx1250.ROUTE_RED_WORDS, 16]
+        maxima: fx.Array[fx.Int32, route_lds_words.get("maxima", 1), 16]
+        count: fx.Array[fx.Int32, route_lds_words.get("count", 1), 16]
+        ahead: fx.Array[fx.Int32, route_lds_words.get("ahead", 1), 16]
+        keys: fx.Array[fx.Int32, route_lds_words.get("keys", 1), 16]
+        experts: fx.Array[fx.Int32, route_lds_words.get("experts", 1), 16]
+        sigmoids: fx.Array[fx.Float32, route_lds_words.get("sigmoids", 1), 16]
+        top_experts: fx.Array[fx.Int32, route_lds_words.get("top_experts", 1), 16]
+        top_sigmoids: fx.Array[fx.Float32, route_lds_words.get("top_sigmoids", 1), 16]
+
+    @fx.struct
+    class PrepRole:
+        scan: fx.Array[fx.Int32, WAVES, 16]
+        route: fx.Array[fx.Int32, 16 * 32, 16]
+        flag: fx.Array[fx.Int32, EXPERTS, 16]
+        expert: fx.Array[fx.Int32, 256, 16]
+        kof: fx.Array[fx.Int32, 256 * 16, 16]
+        latent_fp4: fx.Array[fx.Int32, 16 * (LATENT // 8), 16]
+        latent_scales: fx.Array[fx.Int32, 16 * (LATENT // 32), 16]
+
+    # Without routed experts every token's activated row stays staged.
+    staged_rows = WMMA_TOKEN_ROWS * (1 if include_routed else tiles)
+    # With ``parallel_herd`` the CTAs ahead of the routing ones take every
+    # shared-down task, ``shared_slots`` at most a CTA.
+    shared_ctas = plan.blocks - rows if parallel_herd else plan.blocks
+    shared_slots = -(-SHARED_DOWN_TASKS // shared_ctas) if parallel_herd else 2
+    shared_accumulator_words = (
+        WAVES * GFX1250.wave_size * gemv_gfx1250.ACCUMULATOR_ELEMENTS
+        if include_routed
+        else moe_tail_gfx1250.sdown_accumulator_words(shared_slots, rows, WAVES)
+    )
+
+    @fx.struct
+    class SharedDownRole:
+        rows: fx.Array[
+            fx.Int32,
+            staged_rows * (SHARED_INTERMEDIATE + LDS_PAD) // 2,
+            16,
+        ]
+        accumulator: fx.Array[fx.Float32, shared_accumulator_words, 16]
+
+    @fx.struct
+    class GateUpRole:
+        latent_fp4: fx.Array[fx.Int32, 16 * (LATENT // 8), 16]
+        latent_scales: fx.Array[fx.Int32, 16 * (LATENT // 32), 16]
+        experts: fx.Array[fx.Int32, 256, 16]
+        kof: fx.Array[fx.Int32, 256 * 16, 16]
+        accumulator: fx.Array[fx.Float32, 8 * 32 * 16, 16]
+        route: fx.Array[fx.Int32, 16 * 32, 16]
+        flag: fx.Array[fx.Int32, EXPERTS, 16]
+        scan: fx.Array[fx.Int32, WAVES, 16]
+
+    @fx.struct
+    class DownRole:
+        route: fx.Array[fx.Int32, 16 * 32, 16]
+        experts: fx.Array[fx.Int32, 256, 16]
+        kof: fx.Array[fx.Int32, 256 * 16, 16]
+        intermediate_fp4: fx.Array[fx.Int32, 256 * (ROUTED_INTERMEDIATE // 8), 16]
+        intermediate_scales: fx.Array[fx.Int32, 256 * (ROUTED_INTERMEDIATE // 32), 16]
+        contributions: fx.Array[fx.Float32, 256 * 32, 16]
+
+    herd_words = moe_gfx1250.herd_finalize_words(rows if precompute_herd else 1)
+    experts_words, counts_words = herd_words["popularity"], herd_words["counts"]
+    starts_words = herd_words["starts"]
+    candidate_words, route_words = herd_words["ids"], herd_words["slots"]
+
+    @fx.struct
+    class HerdRole:
+        popularity: fx.Array[fx.Int32, experts_words, 16]
+        counts: fx.Array[fx.Int32, counts_words, 16]
+        starts: fx.Array[fx.Int32, starts_words, 16]
+        scan: fx.Array[fx.Int32, WAVES, 16]
+        ids: fx.Array[fx.Int32, candidate_words, 16]
+        values: fx.Array[fx.Float32, candidate_words, 16]
+        kept_ids: fx.Array[fx.Int32, route_words, 16]
+        kept_weights: fx.Array[fx.Float32, route_words, 16]
+        slots: fx.Array[fx.Int32, route_words, 16]
+
+    @fx.union
+    class RoleLds:
+        route: RouteRole
+        prep: PrepRole
+        shared_down: SharedDownRole
+        gate_up: GateUpRole
+        down: DownRole
+        herd: HerdRole
+
+    wave_drop = parallel_herd and envs.ATOM_KIMI_MONO_HERD_WAVE_DROP
+    split_bound = rolled and envs.ATOM_KIMI_MONO_ROUTE_SPLIT_BOUND
+    name = (
+        f"k3_k2_gfx1250_persistent_finish_s{rows}_b{plan.blocks}"
+        f"{'_rl' if rolled else ''}"
+        f"_gu{int(gu_interleave)}_sh{int(include_shared)}"
+        f"_pq_u{int(local_union)}_r{int(include_routed)}"
+        f"{'_rf' if replicated_front else ''}{'_herd' if herd else ''}"
+        f"{'_f8' if fp8_shared_down else ''}{'_hp' if precompute_herd else ''}"
+        f"{'_ph' if parallel_herd else ''}"
+        f"{'_nohwd' if parallel_herd and not wave_drop else ''}"
+        f"{'_norsb' if rolled and not split_bound else ''}"
+        f"{f'_pl{herd_poll_limit}' if herd_poll_limit is not None else ''}"
+        f"{'_profile' if profile else ''}"
+    )
+    # After a replicated front there is no gathered latent to unpack.
+    unpack = not (rolled and replicated_front)
+    if replicated_front:
+        name += fresh.suffix("finish") + ("" if unpack else fresh.suffix("moe"))
+
+    sources = SOURCES
+    # It is the CTA before the routing ones, and its shared-down tasks (one,
+    # or two past 62 rows) go to the first other CTAs with a single one.
+    herd_cta = plan.blocks - rows - 1
+    herd_at = herd_scratch_layout(rows)
+    profile_at = profile_offset(rows, precompute_herd) // 4
+    spare_cta = SHARED_DOWN_TASKS - plan.blocks
+    herd_tasks = [
+        task
+        for task in (herd_cta, herd_cta + plan.blocks)
+        if task < SHARED_DOWN_TASKS
+    ]
+    herd_takers = [
+        cta for cta in range(max(spare_cta, 0), plan.blocks) if cta != herd_cta
+    ][: len(herd_tasks)]
+    if precompute_herd and len(herd_takers) < len(herd_tasks):
+        raise ValueError(
+            f"no CTA takes the HERD CTA's shared-down task at {rows} rows"
+        )
+
+    @traced
+    def body(
+        role,
+        front_gathered,
+        router_bias,
+        shared_gate_up,
+        shared_down_weight,
+        shared_down_scale,
+        w13,
+        w13s,
+        w2,
+        w2s,
+        shared_hidden,
+        route,
+        tile_route,
+        flags,
+        experts,
+        kof,
+        union_sizes,
+        latent_fp4,
+        latent_scales,
+        routed_intermediate_fp4,
+        routed_intermediate_scales,
+        routed_partial,
+        shared_partial,
+        scratch,
+        fused=None,
+    ):
+        """The kernel on ``role`` (a ``RoleLds``). ``fused``: the launch's
+        first part (``k2_fused_gfx1250``), its outputs at device scope:
+        ``put`` a route's store, ``route_done(token)`` once a token's routes
+        are stored, ``herd_done()`` once HERD's are, ``shared_done()`` once
+        the CTA's shared down is (each its stores drained first)."""
+        tid = fx.thread_idx.x
+        bid = fx.block_idx.x
+        lane = tid % GFX1250.wave_size
+        wave = tid // GFX1250.wave_size
+        if const_expr(fused is None and replicated_front):
+            # The front's router logits and activated shared rows.
+            fresh.prefetch(
+                "finish",
+                front_gathered,
+                rows * EXPERTS * 4,
+                bid,
+                tid,
+                plan.blocks,
+                THREADS,
+            )
+            fresh.prefetch(
+                "finish",
+                shared_hidden,
+                rows * SHARED_INTERMEDIATE * 2,
+                bid,
+                tid,
+                plan.blocks,
+                THREADS,
+            )
+        if const_expr(fused is None and replicated_front and not unpack):
+            # The front's latent for the fused MoE after this launch.
+            fresh.prefetch(
+                "moe", latent_fp4, rows * LATENT // 2, bid, tid, plan.blocks, THREADS
+            )
+            fresh.prefetch(
+                "moe",
+                latent_scales,
+                rows * LATENT // 32,
+                bid,
+                tid,
+                plan.blocks,
+                THREADS,
+            )
+        route_role = role.route.peek()
+        prep = role.prep.peek()
+        shared_down = role.shared_down.peek()
+        gate_up = role.gate_up.peek()
+        down = role.down.peek()
+        herd_lds = role.herd.peek()
+        ticket = down.route.ptr
+
+        def stamp(name):
+            if const_expr(profile):  # noqa: SIM102
+                if tid == 0:
+                    bo.buffer_store(
+                        fx.Int32(_realtime()),
+                        rsrc(scratch),
+                        profile_at + bid * PROFILE_WORDS + PROFILE_STAMPS.index(name),
+                        cache_modifier=CM_DEV,
+                    )
+
+        stamp("start")
+
+        stride = plan.blocks * THREADS
+        # Rank-major compressed payload -> logical token-major FP4/scales.
+        total_words = 0 if replicated_front else rows * (LATENT // 8)
+        work = bid * THREADS + tid
+        if const_expr(unpack):
+            while work < total_words:
+                token = work // (LATENT // 8)
+                column_word = work % (LATENT // 8)
+                rank = column_word // (LOCAL_LATENT // 8)
+                local_word = column_word % (LOCAL_LATENT // 8)
+                source = (
+                    rank * payload.local_bytes
+                    + payload.latent_offset
+                    + (token * (LOCAL_LATENT // 8) + local_word) * 4
+                )
+                value = fx.Int32(
+                    bo.buffer_load(
+                        rsrc(front_gathered + fx.Int64(source)),
+                        0,
+                        vec_width=1,
+                        dtype=T.i32,
+                    )
+                )
+                bo.buffer_store(value, rsrc(latent_fp4), work)
+                work = work + stride
+        total_scales = 0 if replicated_front else rows * (LATENT // 32)
+        work = bid * THREADS + tid
+        if const_expr(unpack):
+            while work < total_scales:
+                token = work // (LATENT // 32)
+                group = work % (LATENT // 32)
+                rank = group // (LOCAL_LATENT // 32)
+                local_group = group % (LOCAL_LATENT // 32)
+                source = (
+                    rank * payload.local_bytes
+                    + payload.latent_scale_offset
+                    + token * (LOCAL_LATENT // 32)
+                    + local_group
+                )
+                code = fx.Int32(
+                    bo.buffer_load(
+                        rsrc(front_gathered + fx.Int64(source)),
+                        0,
+                        vec_width=1,
+                        dtype=T.i8,
+                    )
+                ) & fx.Int32(0xFF)
+                if const_expr(include_routed):
+                    bo.buffer_store(code, rsrc(latent_scales), work)
+                else:
+                    bo.buffer_store(fx.Int8(code), rsrc(latent_scales), work)
+                work = work + stride
+        # The unpacked latent is first read by gate/up, so the unpack shares
+        # the routing phase instead of paying for its own grid barrier.
+
+        # Routing and shared SiTU are independent after their gathered/local
+        # inputs become visible.
+        route_outputs = (
+            {"route": route}
+            if include_routed
+            else {"route": route, "route_weights": tile_route}
+        )
+        # Without routed experts nothing below waits on a grid barrier, so
+        # routing takes the CTAs with the fewest shared-down tasks.
+        route_token = bid if include_routed else bid - (plan.blocks - rows)
+        launch_word = herd_at["launch"][0] // 4
+        candidates = scratch + fx.Int64(herd_at["candidates"][0])
+        launch = fx.Int32(
+            bo.buffer_load(rsrc(scratch), launch_word, vec_width=1, dtype=T.i32)
+        )
+        def herd_context(tag):
+            """``stage_herd_finalize``'s context (``stage_herd_token``'s too)."""
+            return {
+                "tid": tid,
+                "lane": lane,
+                "wave": wave,
+                "threads": THREADS,
+                "waves": WAVES,
+                "candidates": (candidates, tag),
+                **{
+                    name: scratch + fx.Int64(herd_at[name][0])
+                    for name in (
+                        "topk_ids",
+                        "topk_weights",
+                        "topids_to_rows",
+                        "masked_m",
+                        "psum",
+                    )
+                },
+                "tile_m": fx.Int32(
+                    bo.buffer_load(
+                        rsrc(scratch),
+                        herd_at["tile_m"][0] // 4,
+                        vec_width=1,
+                        dtype=T.i32,
+                    )
+                ),
+                "routed_scaling_factor": fx.Float32(
+                    bo.buffer_load(
+                        rsrc(scratch),
+                        herd_at["routed_scaling_factor"][0] // 4,
+                        vec_width=1,
+                        dtype=T.f32,
+                    )
+                ),
+                "herd_lds": {
+                    name: getattr(herd_lds, name).ptr for name in herd_words
+                },
+                "store_cm": _out_cm(fused),
+                **({"stamp": stamp} if profile else {}),
+            }
+
+        if (route_token >= 0) & (route_token < rows):
+            herd_candidates = (
+                {"herd_candidates": (candidates, moe_gfx1250.herd_tag(launch))}
+                if precompute_herd
+                else {}
+            )
+            context = {
+                "S": rows,
+                "tid": tid,
+                "lane": lane,
+                "wave": wave,
+                "red": route_role.red.ptr,
+                "poll": _direct_poll,
+                "put": _direct_put if fused is None else fused["put"],
+                "peer": {"rlog_own": front_gathered},
+                "args": {"bias": router_bias},
+                "contiguous_logits": replicated_front,
+                "herd": herd,
+                **route_outputs,
+                **herd_candidates,
+            }
+            # One CTA owns one token.  The old candidate serialized all rows
+            # through CTA 0 even though routing has no cross-token reduction.
+            if const_expr(rolled):
+                moe_gfx1250.stage_route_cta(
+                    {
+                        **context,
+                        "threads": THREADS,
+                        "route_lds": {
+                            name: getattr(route_role, name).ptr for name in route_lds_words
+                        },
+                        "split_bound": split_bound,
+                    },
+                    route_token,
+                    payload.local_bytes // 4,
+                )
+            else:
+                moe_gfx1250.stage_route(
+                    context,
+                    route_token,
+                    payload.local_bytes // 4,
+                )
+            stamp("routed")
+            if const_expr(fused is not None):
+                fused["route_done"](route_token)
+            if const_expr(parallel_herd):
+                if const_expr(fused is not None):
+                    raise ValueError("a fused launch takes HERD from one CTA")
+                # The token's own HERD, past every token's candidates; the
+                # first token's CTA moves the launch counter on (every routing
+                # CTA has read it: its candidates carry its tag).
+                moe_gfx1250.stage_herd_token(
+                    {
+                        **herd_context(moe_gfx1250.herd_tag(launch)),
+                        "poll_limit": herd_poll_limit,
+                        "wave_drop": wave_drop,
+                    },
+                    rows,
+                    route_token,
+                )
+                stamp("herd_done")
+                if (route_token == 0) & (tid == 0):
+                    bo.buffer_store(launch + 1, rsrc(scratch), launch_word)
+        if const_expr(precompute_herd and not parallel_herd):
+            # The CTA before the routing ones has no shared-down task: it polls
+            # every token's tagged candidates and finishes HERD while the other
+            # CTAs run their shared down, then moves the launch counter on.
+            tag = moe_gfx1250.herd_tag(launch)
+            if bid == herd_cta:
+                moe_gfx1250.stage_herd_finalize(herd_context(tag), rows)
+                stamp("herd_done")
+                if tid == 0:
+                    bo.buffer_store(launch + 1, rsrc(scratch), launch_word)
+                if const_expr(fused is not None):
+                    fused["herd_done"]()
+
+        if include_shared and include_routed:
+            pairs = rows * SHARED_INTERMEDIATE // 2
+            pair = bid * THREADS + tid
+            while pair < pairs:
+                token = pair // (SHARED_INTERMEDIATE // 2)
+                column_pair = pair % (SHARED_INTERMEDIATE // 2)
+                gate_at = (token * (2 * SHARED_INTERMEDIATE) + 2 * column_pair) // 2
+                up_at = (
+                    token * (2 * SHARED_INTERMEDIATE)
+                    + SHARED_INTERMEDIATE
+                    + 2 * column_pair
+                ) // 2
+                gate = fx.Int32(
+                    bo.buffer_load(
+                        rsrc(shared_gate_up),
+                        gate_at,
+                        vec_width=1,
+                        dtype=T.i32,
+                    )
+                )
+                up = fx.Int32(
+                    bo.buffer_load(
+                        rsrc(shared_gate_up),
+                        up_at,
+                        vec_width=1,
+                        dtype=T.i32,
+                    )
+                )
+                low = moe_expert_gfx1250._situ(bf_lo(gate), bf_lo(up))
+                high = moe_expert_gfx1250._situ(bf_hi(gate), bf_hi(up))
+                packed = (
+                    fx.Vector.from_elements([low, high], fx.Float32)
+                    .to(fx.BFloat16)
+                    .bitcast(fx.Int32)[0]
+                )
+                bo.buffer_store(
+                    packed,
+                    rsrc(shared_hidden),
+                    token * (SHARED_INTERMEDIATE // 2) + column_pair,
+                )
+                pair = pair + stride
+        if const_expr(include_routed):
+            rocdl.s_wait_storecnt(0)
+            _grid_barrier(scratch, ticket, plan.blocks)
+
+        union_outputs = {
+            "union_sizes": union_sizes,
+            "tile_route": tile_route,
+            "flags": flags,
+            "experts": experts,
+            "kof": kof,
+        }
+        if const_expr(include_routed and not local_union):
+            # One control CTA per token tile builds and publishes the union.
+            prep_lds = {
+                "scan": prep.scan.ptr,
+                "route": prep.route.ptr,
+                "flag": prep.flag.ptr,
+                "expert": prep.expert.ptr,
+                "kof": prep.kof.ptr,
+            }
+            for tile in range_constexpr(tiles):
+                if bid == tile:
+                    tile_start = tile * WMMA_TOKEN_ROWS
+                    _build_tile_union(
+                        tid,
+                        lane,
+                        wave,
+                        tile,
+                        min(WMMA_TOKEN_ROWS, rows - tile_start),
+                        route + tile_start * 32 * 4,
+                        prep_lds,
+                        bid == tile,
+                        union_outputs,
+                    )
+            rocdl.s_wait_storecnt(0)
+            _grid_barrier(scratch, ticket, plan.blocks)
+
+        if const_expr(include_shared and not include_routed):
+            second_task = bid + plan.blocks
+            does_shared = True
+            if const_expr(precompute_herd and not parallel_herd):
+                for taker, herd_task in zip(herd_takers, herd_tasks):
+                    second_task = (bid == taker).select(
+                        fx.Int32(herd_task), second_task
+                    )
+                does_shared = bid != herd_cta
+            tasks = [bid, second_task]
+            if const_expr(parallel_herd):
+                does_shared = bid < shared_ctas
+                tasks = [bid + slot * shared_ctas for slot in range(shared_slots)]
+            if does_shared:
+                # Every task's weights are in flight before the rows are staged.
+                operands = [
+                    (
+                        gemv_gfx1250.fp8_loads(
+                            lane,
+                            wave,
+                            WAVES,
+                            shared_down_weight,
+                            shared_down_scale,
+                            fx.min(task, SHARED_DOWN_TASKS - 1) * 16,
+                            SHARED_INTERMEDIATE,
+                        )
+                        if fp8_shared_down
+                        else gemv_gfx1250.loads(
+                            lane,
+                            wave,
+                            WAVES,
+                            shared_down_weight,
+                            fx.min(task, SHARED_DOWN_TASKS - 1) * 16,
+                            SHARED_INTERMEDIATE,
+                        )
+                    )
+                    for task in tasks
+                ]
+                staging = {
+                    "S": rows,
+                    "tid": tid,
+                    "threads": THREADS,
+                    "tail": {"gemv_rows": shared_down.rows.ptr},
+                }
+                if const_expr(replicated_front):
+                    # The replicated front already activated the shared columns.
+                    moe_tail_gfx1250.stage_hidden_rows(staging, shared_hidden)
+                else:
+                    moe_tail_gfx1250.stage_activated_rows(staging, shared_gate_up)
+                moe_tail_gfx1250.sdown_tasks(
+                    {
+                        "S": rows,
+                        "tid": tid,
+                        "threads": THREADS,
+                        "lane": lane,
+                        "wave": wave,
+                        "tail": {"gemv_accumulator": shared_down.accumulator.ptr},
+                        "shared_partial": shared_partial,
+                        "store_cm": _out_cm(fused),
+                    },
+                    tasks,
+                    operands,
+                    WAVES,
+                    shared_down.rows.ptr,
+                    rolled,
+                )
+                stamp("shared_done")
+            if const_expr(fused is not None):
+                fused["shared_done"]()
+
+        # Shared-down and routed gate/up are independent and share a static
+        # resident work queue.  Runtime union masks never change barriers.
+        for tile in range_constexpr(tiles if include_routed else 0):
+            tile_start = tile * WMMA_TOKEN_ROWS
+            tile_rows = min(WMMA_TOKEN_ROWS, rows - tile_start)
+            if include_shared:
+                task = bid
+                while task < SHARED_DOWN_TASKS:
+                    operands = gemv_gfx1250.loads(
+                        lane,
+                        wave,
+                        WAVES,
+                        shared_down_weight,
+                        task * 16,
+                        SHARED_INTERMEDIATE,
+                    )
+                    context = {
+                        "S": tile_rows,
+                        "tid": tid,
+                        "threads": THREADS,
+                        "lane": lane,
+                        "wave": wave,
+                        "tail": {
+                            "h": (shared_hidden + tile_start * SHARED_INTERMEDIATE * 2),
+                            "gemv_rows": shared_down.rows.ptr,
+                            "gemv_accumulator": shared_down.accumulator.ptr,
+                        },
+                        "shared_partial": (shared_partial + tile_start * HIDDEN * 2),
+                    }
+                    moe_tail_gfx1250.stage_sdown(context, task, operands, WAVES)
+                    task = task + plan.blocks
+
+            if const_expr(include_routed):
+                if const_expr(local_union):
+                    # Every CTA rebuilds the tile union in its own LDS instead of
+                    # waiting on a grid barrier for the published copy.
+                    union_size = _build_tile_union(
+                        tid,
+                        lane,
+                        wave,
+                        tile,
+                        tile_rows,
+                        route + tile_start * 32 * 4,
+                        {
+                            "scan": gate_up.scan.ptr,
+                            "route": gate_up.route.ptr,
+                            "flag": gate_up.flag.ptr,
+                            "expert": gate_up.experts.ptr,
+                            "kof": gate_up.kof.ptr,
+                        },
+                        bid == tile,
+                        union_outputs,
+                    )
+                else:
+                    union_size = fx.Int32(
+                        bo.buffer_load(
+                            rsrc(union_sizes),
+                            tile,
+                            vec_width=1,
+                            dtype=T.i32,
+                        )
+                    )
+                maximum_union = tile_rows * 16
+                task = bid
+                active = task < union_size * GATE_UP_GROUPS
+                if active:
+                    for iteration in range_constexpr(
+                        (16 * (LATENT // 8) + THREADS - 1) // THREADS
+                    ):
+                        index = tid + THREADS * iteration
+                        if index < tile_rows * (LATENT // 8):
+                            value = fx.Int32(
+                                bo.buffer_load(
+                                    rsrc(latent_fp4),
+                                    tile_start * (LATENT // 8) + index,
+                                    vec_width=1,
+                                    dtype=T.i32,
+                                )
+                            )
+                            fx.ptr_store(value, gate_up.latent_fp4.ptr + index)
+                    for iteration in range_constexpr(
+                        (16 * (LATENT // 32) + THREADS - 1) // THREADS
+                    ):
+                        index = tid + THREADS * iteration
+                        if index < tile_rows * (LATENT // 32):
+                            value = fx.Int32(
+                                bo.buffer_load(
+                                    rsrc(latent_scales),
+                                    tile_start * (LATENT // 32) + index,
+                                    vec_width=1,
+                                    dtype=T.i32,
+                                )
+                            )
+                            fx.ptr_store(value, gate_up.latent_scales.ptr + index)
+                    for iteration in range_constexpr(
+                        0 if local_union else (256 + THREADS - 1) // THREADS
+                    ):
+                        index = tid + THREADS * iteration
+                        if index < maximum_union:
+                            value = fx.Int32(
+                                bo.buffer_load(
+                                    rsrc(experts),
+                                    tile * 256 + index,
+                                    vec_width=1,
+                                    dtype=T.i32,
+                                )
+                            )
+                            fx.ptr_store(value, gate_up.experts.ptr + index)
+                    for iteration in range_constexpr(
+                        0 if local_union else (256 * 16 + THREADS - 1) // THREADS
+                    ):
+                        index = tid + THREADS * iteration
+                        if index < maximum_union * tile_rows:
+                            value = fx.Int32(
+                                bo.buffer_load(
+                                    rsrc(kof),
+                                    tile * 256 * 16 + index,
+                                    vec_width=1,
+                                    dtype=T.i32,
+                                )
+                            )
+                            fx.ptr_store(value, gate_up.kof.ptr + index)
+                    gpu.barrier()
+                # Even waves own ``task`` and odd waves the task one grid stride
+                # later, so all eight waves run WMMAs.
+                while task < maximum_union * GATE_UP_GROUPS:
+                    if task < union_size * GATE_UP_GROUPS:
+                        own_task = task + (wave % 2) * plan.blocks
+                        own_valid = own_task < union_size * GATE_UP_GROUPS
+                        own_task = fx.min(own_task, union_size * GATE_UP_GROUPS - 1)
+                        context = {
+                            "S": tile_rows,
+                            "tid": tid,
+                            "lane": lane,
+                            "wave": wave,
+                            "rt": {
+                                "expert": gate_up.experts.ptr,
+                                "kof": gate_up.kof.ptr,
+                            },
+                            "latq": gate_up.latent_fp4.ptr,
+                            "latsc": gate_up.latent_scales.ptr,
+                            "expert_red": gate_up.accumulator.ptr,
+                            "args": {"w13": w13, "w13s": w13s},
+                            "interq_out": (
+                                routed_intermediate_fp4
+                                + tile * 256 * (ROUTED_INTERMEDIATE // 8) * 4
+                            ),
+                            "intsc_out": (
+                                routed_intermediate_scales
+                                + tile * 256 * (ROUTED_INTERMEDIATE // 32) * 4
+                            ),
+                        }
+                        operands = moe_expert_gfx1250.ug_loads(
+                            context,
+                            own_task,
+                            gu_interleave,
+                        )
+                        moe_expert_gfx1250.stage_ug(
+                            context,
+                            own_task,
+                            operands,
+                            gu_interleave,
+                            valid=own_valid,
+                        )
+                    task = task + 2 * plan.blocks
+        rocdl.s_wait_storecnt(0)
+        if const_expr(include_routed):
+            _grid_barrier(scratch, ticket, plan.blocks)
+
+            for tile in range_constexpr(tiles):
+                tile_start = tile * WMMA_TOKEN_ROWS
+                tile_rows = min(WMMA_TOKEN_ROWS, rows - tile_start)
+                # Tile t's row groups start at CTA t * ROUTED_DOWN_TASKS (mod grid)
+                # so later tiles run on otherwise idle CTAs.
+                down_task = (bid + (-tile * ROUTED_DOWN_TASKS) % plan.blocks) % plan.blocks
+                if down_task < ROUTED_DOWN_TASKS:
+                    for iteration in range_constexpr((16 * 32 + THREADS - 1) // THREADS):
+                        index = tid + THREADS * iteration
+                        if index < tile_rows * 32:
+                            value = fx.Int32(
+                                bo.buffer_load(
+                                    rsrc(tile_route),
+                                    tile * 16 * 32 + index,
+                                    vec_width=1,
+                                    dtype=T.i32,
+                                )
+                            )
+                            fx.ptr_store(value, down.route.ptr + index)
+                    for iteration in range_constexpr((256 + THREADS - 1) // THREADS):
+                        index = tid + THREADS * iteration
+                        if index < tile_rows * 16:
+                            value = fx.Int32(
+                                bo.buffer_load(
+                                    rsrc(experts),
+                                    tile * 256 + index,
+                                    vec_width=1,
+                                    dtype=T.i32,
+                                )
+                            )
+                            fx.ptr_store(value, down.experts.ptr + index)
+                    for iteration in range_constexpr((256 * 16 + THREADS - 1) // THREADS):
+                        index = tid + THREADS * iteration
+                        if index < tile_rows * 16 * tile_rows:
+                            value = fx.Int32(
+                                bo.buffer_load(
+                                    rsrc(kof),
+                                    tile * 256 * 16 + index,
+                                    vec_width=1,
+                                    dtype=T.i32,
+                                )
+                            )
+                            fx.ptr_store(value, down.kof.ptr + index)
+                    for iteration in range_constexpr(
+                        (256 * (ROUTED_INTERMEDIATE // 8) + THREADS - 1) // THREADS
+                    ):
+                        index = tid + THREADS * iteration
+                        if index < 256 * (ROUTED_INTERMEDIATE // 8):
+                            value = fx.Int32(
+                                bo.buffer_load(
+                                    rsrc(routed_intermediate_fp4),
+                                    tile * 256 * (ROUTED_INTERMEDIATE // 8) + index,
+                                    vec_width=1,
+                                    dtype=T.i32,
+                                )
+                            )
+                            fx.ptr_store(value, down.intermediate_fp4.ptr + index)
+                    for iteration in range_constexpr(
+                        (256 * (ROUTED_INTERMEDIATE // 32) + THREADS - 1) // THREADS
+                    ):
+                        index = tid + THREADS * iteration
+                        if index < 256 * (ROUTED_INTERMEDIATE // 32):
+                            value = fx.Int32(
+                                bo.buffer_load(
+                                    rsrc(routed_intermediate_scales),
+                                    tile * 256 * (ROUTED_INTERMEDIATE // 32) + index,
+                                    vec_width=1,
+                                    dtype=T.i32,
+                                )
+                            )
+                            fx.ptr_store(value, down.intermediate_scales.ptr + index)
+                    for iteration in range_constexpr((256 * 32 + THREADS - 1) // THREADS):
+                        index = tid + THREADS * iteration
+                        if index < 256 * 32:
+                            fx.ptr_store(
+                                fx.Float32(0.0),
+                                down.contributions.ptr + index,
+                            )
+                    gpu.barrier()
+                    union_size = fx.Int32(
+                        bo.buffer_load(
+                            rsrc(union_sizes),
+                            tile,
+                            vec_width=1,
+                            dtype=T.i32,
+                        )
+                    )
+                    context = {
+                        "S": tile_rows,
+                        "tid": tid,
+                        "lane": lane,
+                        "wave": wave,
+                        "rt": {
+                            "route": down.route.ptr,
+                            "expert": down.experts.ptr,
+                            "kof": down.kof.ptr,
+                        },
+                        "interq": down.intermediate_fp4.ptr,
+                        "intsc": down.intermediate_scales.ptr,
+                        "contrib": down.contributions.ptr,
+                        "args": {"w2": w2, "w2s": w2s},
+                        "routed_partial": (routed_partial + tile_start * LATENT * 2),
+                    }
+                    moe_expert_gfx1250.stage_down(context, down_task, union_size, WAVES)
+        rocdl.s_wait_storecnt(0)
+        stamp("end")
+
+    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
+    def kernel(
+        front_gathered: Int64,
+        router_bias: Int64,
+        shared_gate_up: Int64,
+        shared_down_weight: Int64,
+        shared_down_scale: Int64,
+        w13: Int64,
+        w13s: Int64,
+        w2: Int64,
+        w2s: Int64,
+        shared_hidden: Int64,
+        route: Int64,
+        tile_route: Int64,
+        flags: Int64,
+        experts: Int64,
+        kof: Int64,
+        union_sizes: Int64,
+        latent_fp4: Int64,
+        latent_scales: Int64,
+        routed_intermediate_fp4: Int64,
+        routed_intermediate_scales: Int64,
+        routed_partial: Int64,
+        shared_partial: Int64,
+        scratch: Int64,
+    ):
+        _ = sources
+        body(
+            fx.SharedAllocator().allocate(RoleLds),
+            front_gathered,
+            router_bias,
+            shared_gate_up,
+            shared_down_weight,
+            shared_down_scale,
+            w13,
+            w13s,
+            w2,
+            w2s,
+            shared_hidden,
+            route,
+            tile_route,
+            flags,
+            experts,
+            kof,
+            union_sizes,
+            latent_fp4,
+            latent_scales,
+            routed_intermediate_fp4,
+            routed_intermediate_scales,
+            routed_partial,
+            shared_partial,
+            scratch,
+        )
+
+    @flyc.jit
+    def launch(
+        front_gathered: Int64,
+        router_bias: Int64,
+        shared_gate_up: Int64,
+        shared_down_weight: Int64,
+        shared_down_scale: Int64,
+        w13: Int64,
+        w13s: Int64,
+        w2: Int64,
+        w2s: Int64,
+        shared_hidden: Int64,
+        route: Int64,
+        tile_route: Int64,
+        flags: Int64,
+        experts: Int64,
+        kof: Int64,
+        union_sizes: Int64,
+        latent_fp4: Int64,
+        latent_scales: Int64,
+        routed_intermediate_fp4: Int64,
+        routed_intermediate_scales: Int64,
+        routed_partial: Int64,
+        shared_partial: Int64,
+        scratch: Int64,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        _ = sources
+        kernel(
+            front_gathered,
+            router_bias,
+            shared_gate_up,
+            shared_down_weight,
+            shared_down_scale,
+            w13,
+            w13s,
+            w2,
+            w2s,
+            shared_hidden,
+            route,
+            tile_route,
+            flags,
+            experts,
+            kof,
+            union_sizes,
+            latent_fp4,
+            latent_scales,
+            routed_intermediate_fp4,
+            routed_intermediate_scales,
+            routed_partial,
+            shared_partial,
+            scratch,
+        ).launch(grid=(plan.blocks,), block=(THREADS,), stream=stream)
+
+    FINISH_PACKED_FRONT_ABI.check(kernel, launch)
+    return K2FinishKernel(
+        name=name,
+        launcher=launch,
+        grid=(plan.blocks,),
+        block=(THREADS,),
+        required_lds_bytes=FINISH_REQUIRED_LDS_BYTES,
+        scratch_bytes=(
+            4 * (profile_at + plan.blocks * PROFILE_WORDS)
+            if profile
+            else max(at + 4 * words for at, words in herd_at.values())
+            if precompute_herd
+            else 8
+        ),
+        lds=RoleLds,
+        body=body,
+    )

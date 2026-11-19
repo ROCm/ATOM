@@ -80,12 +80,18 @@ def dp_attention_ranks(atom_config) -> int:
     return dp if dpa and dp > 1 else 0
 
 
-def peer_memory_refusals(atom_config) -> list[tuple[bool, str]]:
+def peer_memory_refusals(
+    atom_config, multinode_ok: bool = False
+) -> list[tuple[bool, str]]:
     """``(holds, why not)`` of any launch that maps its TP group's peer
     buffers (HIP IPC): a model's mono kernels and the shared mono LM head
-    alike. HIP IPC cannot reach a GPU on another node."""
+    alike. HIP IPC cannot reach a GPU on another node; ``multinode_ok`` is a
+    runner whose peer buffers are symmetric memory instead, which can."""
     return [
-        (not atom_config.is_multinode_tp, "TP group spans nodes (HIP IPC peer memory)")
+        (
+            multinode_ok or not atom_config.is_multinode_tp,
+            "TP group spans nodes (HIP IPC peer memory)",
+        )
     ]
 
 
@@ -96,14 +102,17 @@ def common_refusals(
     supported_dpa=(),
     *,
     refuse_tr_hybrid: bool = True,
+    supported_gfx: tuple[str, ...] = ("gfx950",),
     refuse_decode_cp: bool = True,
+    multinode_gfx: tuple[str, ...] = (),
 ) -> list[tuple[bool, str]]:
     """``(holds, why not)`` of the conditions every mono model needs: ``dims``
     (the model's ``Dims``) shards at this TP, which is one of ``supported_tp``,
     and no expert or data parallelism -- or DP attention over one of
     ``supported_dpa`` ranks with the MoE expert parallel (``dims(1, ranks)``)
-    or TP (``dims(ranks)``) over them; no pipeline or context parallelism, no
-    TBO, not a plugin.
+    or TP (``dims(ranks)``) over them; one of ``supported_gfx``; no pipeline or
+    context parallelism, no TBO, not a plugin. Models that do not pass
+    ``supported_gfx`` retain the historical gfx950-only admission.
 
     ``refuse_tr_hybrid`` gates one more check: no TR_HYBRID graph mode.
     MiniMax-M3 and DeepSeek-V4.1 mono wraps the *compiled* inner model, so a
@@ -121,7 +130,10 @@ def common_refusals(
     (its attention layers stay on the production path, which handles the
     split) or are written for that split and refuse any other themselves
     (the shared DSA indexer, ``dsa_indexer.bind``) passes
-    ``refuse_decode_cp=False``."""
+    ``refuse_decode_cp=False``.
+
+    ``multinode_gfx`` lists architecture-local runners whose TP communication
+    uses ordinary collectives instead of HIP IPC peer buffers."""
     tp = atom_config.tensor_parallel_size
     dpa = dp_attention_ranks(atom_config)
     if dpa not in (0, *supported_dpa):
@@ -141,8 +153,9 @@ def common_refusals(
         ]
     gfx = _gfx()
     checks = [
-        # the persistent kernels are gfx950 code: wave64, MFMA, permlane32
-        (gfx == "gfx950", f"arch {gfx}"),
+        # Each model opts into architectures only after its complete runner,
+        # weight layouts and collective protocol are deployment-qualified.
+        (gfx in supported_gfx, f"arch {gfx} not in {supported_gfx}"),
         *parallel,
         (atom_config.pipeline_parallel_size == 1, "PP > 1"),
         (
@@ -150,7 +163,9 @@ def common_refusals(
             "decode CP",
         ),
         (pcp_group_size_of(atom_config) == 1, "prefill CP or Ulysses SP"),
-        *peer_memory_refusals(atom_config),
+        # Mono's peer buffers are HIP IPC mappings, which cannot reach a GPU on
+        # another node; on ``multinode_gfx`` they are symmetric memory, which can.
+        *peer_memory_refusals(atom_config, multinode_ok=gfx in multinode_gfx),
         (not (atom_config.enable_tbo or atom_config.enable_tbo_decode), "TBO"),
         (not (is_vllm() or is_sglang()), "plugin mode"),
         (
