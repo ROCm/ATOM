@@ -386,7 +386,8 @@ impl ParsedInference {
     }
 
     /// Images, video, audio or embeddings, which the request's tokens do not show but an
-    /// engine keys every KV block of the prompt by: a chat's image and video
+    /// engine keys KV blocks by (ATOM every block of the prompt, vLLM and SGLang
+    /// the blocks from the media part on): a chat's image and video
     /// parts; a generate request's image, video and audio items (arrays,
     /// nested as a batch's are, count the non-null items they hold, so `[]`
     /// and `[[],[]]` count none), and its `input_embeds` as one.
