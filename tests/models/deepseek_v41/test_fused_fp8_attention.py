@@ -275,13 +275,13 @@ def test_fused_support_query_is_owned_by_aiter(single_rank, monkeypatch, support
     assert model._use_fused_attention(activation, cache, rope) is supported
     assert calls[-1] == (
         (64, 512),
-        dict(
-            q_dtype=torch.float16,
-            cos_dtype=torch.float32,
-            sin_dtype=torch.float16,
-            rope_dim=96,
-            device=activation.device,
-        ),
+        {
+            "q_dtype": torch.float16,
+            "cos_dtype": torch.float32,
+            "sin_dtype": torch.float16,
+            "rope_dim": 96,
+            "device": activation.device,
+        },
     )
     for kv_fp8, packed in ((False, False), (True, True)):
         cache.kv_fp8, cache.packed = kv_fp8, packed

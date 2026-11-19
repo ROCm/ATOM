@@ -18,7 +18,6 @@ from atom.model_ops.blockscale_kernels.quantization import FP8_DTYPE
 from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src_reference
 from atom.utils.decorators import mark_trace
 
-
 # Re-export the AITER predicate; the operator owns its capability rules.
 fused_attention_available = is_fused_norm_rope_attn_rope_cast_supported
 
