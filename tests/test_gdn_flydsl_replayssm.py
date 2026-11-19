@@ -64,7 +64,11 @@ def test_qwen_binding_keeps_the_replayssm_checkpoint_contiguous(
     builder._state_shape_for_runner = lambda: ((), tuple(raw.shape[1:]))
     builder._state_dtypes = lambda: (raw.dtype, raw.dtype)
     attention = SimpleNamespace(allow_aiter_flydsl=True, dt_bias=raw)
-    module = Mock(base_linear_attention=None, impl=attention)
+    module = Mock(
+        spec=["base_linear_attention", "impl"],
+        base_linear_attention=None,
+        impl=attention,
+    )
     builder._pool_rows = {LINEAR_STATE_ROWS: {module: 0}}
     cache = builder.build_kv_cache_tensor(module)
     policy = attention.gdn_flydsl_policy
