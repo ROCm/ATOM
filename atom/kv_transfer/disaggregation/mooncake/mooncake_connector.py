@@ -4462,6 +4462,9 @@ class MooncakeConnector(KVConnectorBase):
         way, ranks that acknowledged and then stay silent past their write
         window fail it (``_expire_pending_recvs``).
         """
+        # Judged on the producer's own report: a success the handoff checks
+        # below turn into a failure had already finished writing.
+        started_writes = started_writes and not success
         landing = self._landing
         if landing is not None and getattr(self, "_pending_handoffs", None):
             with self._completion_lock:

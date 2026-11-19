@@ -131,6 +131,7 @@ class Harness:
         if self.device.type == "cuda":
             self.event.record()
         self.finished = []
+        self.held = {}
         self.ready = []
         self.writes = []
         self.recv = LandingReceiver(
@@ -145,7 +146,7 @@ class Harness:
             send=lambda addr, parts: c._landing_credits.release(
                 "cpu:1", self.recv.epoch, msgpack.loads(parts[-1])["slots"]
             ),
-            finish=lambda req, failed, **_: self.finished.append((req, failed)),
+            finish=self._finish,
             table_segments=16,
         )
         if self.device.type == "cpu":
@@ -186,6 +187,10 @@ class Harness:
             return 0
 
         c.transfer_engine = SimpleNamespace(batch_transfer_sync_write=write)
+
+    def _finish(self, req, failed, failed_after_write=True):
+        self.finished.append((req, failed))
+        self.held[req] = failed_after_write
 
     def pump(self):
         tasks = []
@@ -342,6 +347,38 @@ def test_chunk_handoff_is_checked_before_landing_completion(bad):
     assert not c._pending_handoffs[21]["failed"]
     c._record_write_done(21, 1, write_nonce=3, handoff=bad, landed_slots=[])
     assert h.finished == [(21, True)]
+    assert h.held == {21: False}  # both stages reported success
+
+
+@pytest.mark.parametrize("unwritten_first", [True, False])
+def test_mixed_stage_outcomes_hold_only_a_failure_that_started_writing(
+    unwritten_first,
+):
+    # One stage failed before writing, the other succeeded: the success that
+    # the aggregate turns into a failure had finished, so nothing may land.
+    h = Harness(LAST, 0)
+    c = h.c
+    c._landing = h.recv
+    c._landing_spec = LandingSpec(1, MHA_SCATTER_SEGMENTS, PAGE_UNITS, True)
+    c._pending_handoffs = {
+        21: {
+            "failed": False,
+            "metadata": None,
+            "landing_nonce": 3,
+            "expected": 2,
+            "stages": set(),
+        }
+    }
+    h.recv.begin(21, 3, [2, 0, 3], {0: "s0", 1: "s1"})
+    good = {"first_token_id": 42, "draft_token_ids": []}
+    reports = [
+        {"success": False, "started_writes": False, "handoff": None},
+        {"success": True, "handoff": good},
+    ]
+    for pp, report in enumerate(reports if unwritten_first else reports[::-1]):
+        c._record_write_done(21, pp, write_nonce=3, landed_slots=[], **report)
+    assert h.finished == [(21, True)]
+    assert h.held == {21: False}
 
 
 @pytest.mark.parametrize("workers", [1, 8, 64])
