@@ -1918,16 +1918,17 @@ class TestInitialRampFullChunk:
         assert report["full_chunk"] is True  # 16 + 20 >= 32
         assert report["admittable_requests"] == 2
 
-    def test_parked_remote_kv_takes_free_slots(self, seq_factory):
+    def test_parked_remote_kv_leaves_fresh_slots(self, seq_factory):
         sched = self._sched()
+        sched.cost_balance = True
         sched.add(seq_factory(list(range(10, 30))))
         sched.add(seq_factory(list(range(30, 50))))
-        # Three parked remote-KV loads hold three of the 4 seq slots: only the
-        # first 20-token prompt fits the one left.
+        # Parked remote-KV loads hold back only another remote load: both
+        # fresh prompts still fit the 4 seq slots, as admission sees them.
         sched._num_parked_remote_kv = 3
         report = self._report(sched, _RampDelayer())
-        assert report["full_chunk"] is False
-        assert report["admittable_requests"] == 1
+        assert report["full_chunk"] is True  # 20 + 20 >= 32
+        assert report["admittable_requests"] == 2
 
     def test_default_dp_scans_the_queue_once(self, seq_factory):
         sched = self._sched()

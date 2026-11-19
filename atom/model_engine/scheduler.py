@@ -2290,10 +2290,9 @@ class Scheduler:
             running_decode_batch = max(
                 0, len(self.running) - self._partial_prefill_count
             )
-            # A parked remote-KV seq holds a slot too.
-            free_slots = max(
-                0, self.max_num_seqs - len(self.running) - self._num_parked_remote_kv
-            )
+            # Seq slots a fresh admission fills; a parked remote-KV load holds
+            # back only another remote load, as admission does.
+            free_slots = max(0, self.max_num_seqs - len(self.running))
             # The tokens the ramp could prefill this tick: probed against the
             # prefix cache, so a mostly cached prompt is not a full chunk.
             ramp_tokens = None
