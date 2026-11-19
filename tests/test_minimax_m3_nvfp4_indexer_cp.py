@@ -5,7 +5,8 @@ The CP decode scores each rank's round-robin shard of the blocks with aiter's NV
 scorer, as it does with the MXFP4 one; selection and the candidate merge are the
 existing CP path's. The GPU test runs the four ranks in one process and checks each
 shard's scores against the TP decode's (`minimax_m3_index_topk_decode` with the step's
-NVFP4 scorer record) bit for bit on every live block.
+NVFP4 scorer record) bit for bit on every live block, and the merged top-k, with no
+sparse block table (the NVFP4 KV reads block ids), against the TP decode's.
 """
 
 import types
@@ -148,6 +149,7 @@ def test_the_cp_scorer_hands_aiter_the_shard(monkeypatch):
     import inspect
 
     flydsl = pytest.importorskip("aiter.ops.flydsl")
+    from atom.model_ops.minimax_m3 import index_topk
     from atom.model_ops.minimax_m3 import indexer_context_parallel as icp
     from atom.model_ops.minimax_m3.index_buffers import IndexScoreBuffers
     from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
@@ -160,12 +162,12 @@ def test_the_cp_scorer_hands_aiter_the_shard(monkeypatch):
         seen.update(args=args, kwargs=kwargs)
         return kwargs["out"]
 
-    monkeypatch.setattr(
-        icp,
-        "flydsl_ops",
-        lambda: types.SimpleNamespace(minimax_m3_index_score_nvfp4_flydsl=scorer),
+    ops = types.SimpleNamespace(
+        minimax_m3_index_score_prefill_nvfp4_flydsl=None,
+        minimax_m3_index_score_nvfp4_flydsl=scorer,
     )
-    monkeypatch.setattr(icp, "nvfp4_page_views", lambda cache: ("data", "scale"))
+    monkeypatch.setattr(index_topk, "flydsl_ops", lambda: ops)
+    monkeypatch.setattr(index_topk, "nvfp4_page_views", lambda cache: ("data", "scale"))
     batch, S, local, rank = 3, 2, 5, 1
     rows = batch * S
     wmap = torch.zeros(4, 2, dtype=torch.int32)
@@ -217,3 +219,62 @@ def test_cp_shard_scores_equal_tp(batch, S, blocks, ties):
                 torch.where(live, mine.view(torch.int32), 0),
                 torch.where(live, ref.view(torch.int32), 0),
             ), f"head {h} shard {r} scores"
+
+
+@gfx950
+@pytest.mark.parametrize("ties", ["none", "coarse"])
+@pytest.mark.parametrize("batch,S,blocks", [(4, 8, 300), (3, 1, 2050)])
+def test_cp_topk_equals_tp_with_no_sparse_block_table(batch, S, blocks, ties):
+    """The four shards' candidates, merged with no sparse block table as the NVFP4 KV
+    runs it, give every head's TP top-k: row by row, as sets."""
+    from atom.model_ops.minimax_m3.index_topk import minimax_m3_index_topk_decode
+    from atom.model_ops.minimax_m3.indexer_candidate_exchange import (
+        local_candidate_keys,
+        merge_candidate_keys,
+    )
+
+    cache, table, seq, q = make_case(batch, S, blocks, batch * 1000 + blocks + 1, ties)
+    keys = [
+        local_candidate_keys(
+            cp_scores(cache, table, seq, q, S, r),
+            seq,
+            TOPK,
+            r,
+            WORLD,
+            S,
+            blocks,
+            INIT,
+            LOCAL,
+        )
+        for r in range(WORLD)
+    ]
+    for h in range(WORLD):
+        md = _step(table, seq, S, (1, 0))
+        want = minimax_m3_index_topk_decode(
+            q[:, h : h + 1].contiguous(),
+            cache,
+            table,
+            seq,
+            blocks * 128,
+            TOPK,
+            INIT,
+            LOCAL,
+            1,
+            SM_SCALE,
+            emit_sparse_block_table=False,
+            max_query_len=S,
+            n_valid_column_per_row=md.n_valid_column_per_row,
+            index_scorer=md.index_scorer,
+        )
+        got = merge_candidate_keys(
+            torch.stack([k[h] for k in keys]),
+            table,
+            seq,
+            TOPK,
+            INIT,
+            LOCAL,
+            S,
+            emit_sparse_block_table=False,
+        )
+        assert got.shape == want.shape, f"head {h}"
+        assert torch.equal(got.sort(-1).values, want.sort(-1).values), f"head {h}"

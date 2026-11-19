@@ -124,6 +124,7 @@ def test_the_decode_metadata_builds_the_shards_map(monkeypatch):
 def _cp_scorer(monkeypatch):
     """`indexer_context_scores_fp4` with aiter's scorer doubled; returns it and
     what the double was handed."""
+    from atom.model_ops.minimax_m3 import index_topk
     from atom.model_ops.minimax_m3 import indexer_context_parallel as icp
 
     seen = {}
@@ -132,12 +133,14 @@ def _cp_scorer(monkeypatch):
         seen.update(args=args, **kwargs)
         return kwargs["out"]
 
-    monkeypatch.setattr(
-        icp,
-        "flydsl_ops",
-        lambda: types.SimpleNamespace(minimax_m3_index_score_flydsl=scorer),
+    ops = types.SimpleNamespace(
+        minimax_m3_index_score_prefill_fp4_flydsl=None,
+        minimax_m3_index_score_fp4_flydsl=None,
+        minimax_m3_index_score_flydsl=scorer,
     )
-    monkeypatch.setattr(icp, "page_views", lambda cache: ("data", "scale"))
+    monkeypatch.setattr(index_topk, "flydsl_ops", lambda: ops)
+    monkeypatch.setattr(icp, "flydsl_ops", lambda: ops)
+    monkeypatch.setattr(index_topk, "page_views", lambda cache: ("data", "scale"))
     return icp.indexer_context_scores_fp4, seen
 
 
@@ -288,8 +291,8 @@ def test_the_installed_aiter_takes_the_shards_calls(monkeypatch):
     than at the first MXFP4 CP decode. The scorer's `k_scale` needs aiter#7060, the
     PR that added the MXFP4 scorer itself; its `cp_world` / `cp_rank` are older."""
     flydsl = pytest.importorskip("aiter.ops.flydsl")
+    from atom.model_ops.minimax_m3 import index_topk, sparse_attn
     from atom.model_ops.minimax_m3 import indexer_context_parallel as icp
-    from atom.model_ops.minimax_m3 import sparse_attn
     from atom.model_ops.minimax_m3.index_buffers import allocate_index_scorers
 
     bound = {}
@@ -318,7 +321,7 @@ def test_the_installed_aiter_takes_the_shards_calls(monkeypatch):
         sparse_attn, "build_n_valid_column_per_row", lambda *a, **k: None
     )
     monkeypatch.setattr(icp, "flydsl_ops", lambda: ops)
-    monkeypatch.setattr(icp, "page_views", lambda cache: ("data", "scale"))
+    monkeypatch.setattr(index_topk, "page_views", lambda cache: ("data", "scale"))
 
     seq = torch.ones(2, dtype=torch.int32)
     record = allocate_index_scorers(
