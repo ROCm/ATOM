@@ -768,7 +768,8 @@ class EngineArgs:
             "interval does. The default-on ATOM_PREFILL_INITIAL_RAMP releases "
             "full chunks from resumable partials and slot-fitting waiting "
             "requests ahead of either policy until a rank cannot fill or KV "
-            "reaches the high watermark.",
+            "reaches the high watermark, overriding a positive interval and "
+            "adaptive; set it to 0 to keep them exact.",
         )
         parser.add_argument(
             "--mark-trace",

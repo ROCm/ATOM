@@ -1339,10 +1339,15 @@ class Scheduler:
         return max(min(room, cap_room), 0)
 
     def _estimate_prefill_chunk_cost(self) -> float:
+        return self._estimate_prefill_chunk(0)[0]
+
+    def _estimate_prefill_chunk(self, slots: int) -> tuple[float, int]:
         """Cost of the chunk this rank would prefill with the whole batch
         budget: resumable partials first, then the head of `waiting`, probing
         the prefix cache without recording (`can_allocate_memoized`). An
-        estimate -- the real admission may park or skip some of these seqs."""
+        estimate -- the real admission may park or skip some of these seqs.
+        Also the chunk's tokens from the partials and the first `slots`
+        waiting heads: the initial ramp's fill."""
         token_cap = self.max_num_batched_tokens
         tokens, cost = 0, 0.0
         if self._partial_prefill_count > 0:
@@ -1360,10 +1365,12 @@ class Scheduler:
                     )
                 k = min(remaining, token_cap - tokens)
                 if k <= 0:
-                    return cost
+                    return cost, tokens
                 cost += self._chunk_cost(seq.num_cached_tokens, k)
                 tokens += k
-        for seq in itertools.islice(self._waiting_prefills(), self.max_num_seqs):
+        slot_tokens = tokens
+        heads = itertools.islice(self._waiting_prefills(), self.max_num_seqs)
+        for i, seq in enumerate(heads):
             if tokens >= token_cap:
                 break
             tier_waiter = self._tier_waiter_resume(seq)
@@ -1383,7 +1390,9 @@ class Scheduler:
             if k > 0:
                 cost += self._chunk_cost(start, k)
                 tokens += k
-        return cost
+                if i < slots:
+                    slot_tokens += k
+        return cost, slot_tokens
 
     def _balance_prefill_step(self, own: float) -> None:
         """Set this prefill step's cost target from every DP rank's chunk cost.
@@ -1618,7 +1627,7 @@ class Scheduler:
                     seq.dp_est_cached_tokens, max(0, int(credit))
                 )
 
-    def _waiting_new_token_count(self, max_seqs: int | None = None) -> int:
+    def _waiting_new_token_count(self) -> int:
         """Sum of new (uncached) tokens across the ADMITTABLE waiting queue,
         saturated at `max_num_batched_tokens`.
 
@@ -1641,20 +1650,9 @@ class Scheduler:
         `num_cached_tokens` discount is best-effort:
         an un-admitted seq has not been probed against the prefix cache yet, so
         this is an upper bound on new tokens for cache-hit prompts.
-        ``max_seqs`` counts only that many admittable seqs (the free seq slots).
         """
         cap = self.max_num_batched_tokens
         total = 0
-        if max_seqs is not None and max_seqs <= 0:
-            return 0
-        for num_new_tokens in itertools.islice(self._waiting_new_tokens(), max_seqs):
-            total += num_new_tokens
-            if total >= cap:
-                return cap
-        return total
-
-    def _waiting_new_tokens(self):
-        """New tokens of waiting prefills eligible for the queue fill signal."""
         for seq in self._waiting_prefills():
             num_new_tokens = self.pending_prefill_tokens(seq)
             if (
@@ -1662,19 +1660,10 @@ class Scheduler:
                 and num_new_tokens > self.max_num_batched_tokens
             ):
                 continue
-            yield max(0, num_new_tokens)
-
-    def _waiting_new_token_counts(self, free_slots: int) -> tuple[int, int]:
-        """Backlog and slot-limited fill signals from one capped queue scan."""
-        cap = self.max_num_batched_tokens
-        total = slot_total = 0
-        for i, tokens in enumerate(self._waiting_new_tokens()):
-            total += tokens
-            if i < free_slots:
-                slot_total += tokens
+            total += max(0, num_new_tokens)
             if total >= cap:
-                return cap, min(slot_total, cap)
-        return total, slot_total
+                return cap
+        return total
 
     def _partial_prefill_remaining_tokens(self) -> int:
         """Sum of remaining (not-yet-computed) tokens across mid-chunked-prefill
@@ -2305,7 +2294,9 @@ class Scheduler:
             free_slots = max(
                 0, self.max_num_seqs - len(self.running) - self._num_parked_remote_kv
             )
-            partial_tokens = ramp_waiting_tokens = 0
+            # The tokens the ramp could prefill this tick: probed against the
+            # prefix cache, so a mostly cached prompt is not a full chunk.
+            ramp_tokens = None
             protects_decode = self.prefill_delayer.protects_decode(running_decode_batch)
             if protects_decode or (
                 self._local_prefill_coalescing and not running_decode_batch
@@ -2320,17 +2311,12 @@ class Scheduler:
                 pending_tokens = 0
             elif self._local_prefill_coalescing:
                 prefillable, pending_tokens = self._local_prefill_pending_work()
+                ramp_tokens = pending_tokens
             else:
                 prefillable = self._can_admit_head_prefill()
-                partial_tokens = self._partial_prefill_remaining_tokens()
-                if self.prefill_delayer.ramp_active:
-                    waiting_tokens, ramp_waiting_tokens = (
-                        self._waiting_new_token_counts(free_slots)
-                    )
-                else:
-                    waiting_tokens = self._waiting_new_token_count()
                 pending_tokens = min(
-                    waiting_tokens + partial_tokens,
+                    self._waiting_new_token_count()
+                    + self._partial_prefill_remaining_tokens(),
                     self.max_num_batched_tokens,
                 )
             # DP prefill cost balancing: this rank's chunk cost rides the same
@@ -2338,27 +2324,20 @@ class Scheduler:
             # skipped inside the decode-protection window: whether the delayer
             # holds there depends on every rank's decode load, known only after
             # the reduce (with no decode anywhere it fires through that window).
-            prefill_cost = (
-                self._estimate_prefill_chunk_cost()
-                if self.cost_balance and prefillable
-                else 0.0
-            )
+            prefill_cost = 0.0
+            if self.cost_balance and prefillable:
+                prefill_cost, slot_tokens = self._estimate_prefill_chunk(free_slots)
+                if ramp_tokens is None:
+                    ramp_tokens = slot_tokens
             waiting_requests = len(self.waiting) + self._partial_prefill_count
-            if (
-                prefillable
-                and self.prefill_delayer.ramp_active
-                and (protects_decode or self._local_prefill_coalescing)
-            ):
-                partial_tokens = self._partial_prefill_remaining_tokens()
-                ramp_waiting_tokens = self._waiting_new_token_count(max_seqs=free_slots)
-            # Ramp fill includes resumable partials and waiting heads that fit
-            # free slots. Reuse the coalescer scan on the default DP path.
-            full_chunk = (
-                prefillable
-                and self.prefill_delayer.ramp_active
-                and partial_tokens + ramp_waiting_tokens
-                >= self.prefill_delayer.target_fill * self.max_num_batched_tokens
-            )
+            full_chunk = False
+            if prefillable and self.prefill_delayer.ramp_active:
+                if ramp_tokens is None:
+                    ramp_tokens = self._local_prefill_pending_work()[1]
+                full_chunk = (
+                    ramp_tokens
+                    >= self.prefill_delayer.target_fill * self.max_num_batched_tokens
+                )
             decision = self.prefill_delayer.should_allow_prefill(
                 prefillable=prefillable,
                 pending_tokens=pending_tokens,
