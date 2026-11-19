@@ -82,7 +82,9 @@ at most 64 query rows; ordinary layer Mono retains its 48-row cap. Builds
 with private scratch are refused collectively. Prefill, incompatible inputs,
 unsupported widths and refused builds use the existing path.
 
-FP8 index caches, attention DP and DSpark HI retain their existing indexers.
+FP8 index caches and attention DP retain their existing indexers.
+A successfully installed DSpark HI hook retains its embedded indexer;
+install-time refusals under auto follow the ordinary route described below.
 At TP2 without attention DP, FP4 widths of 40 rows or more use native layers
 with the standalone indexer: the ordinary layer route was slower there in
 the earlier measurements. No aiter source or query-interface change is needed.
@@ -282,3 +284,82 @@ Dataset SHA256: `5f0b75439f4dea8ec8705847df9d72c9f8572b12e2eaea5b8eea07e4a96c956
 
 Full model, indexer performance and paired results:
 [PR #3524 qualification](https://github.com/ROCm/ATOM/pull/3524).
+
+## Latest review qualification (2026-11-19)
+
+Product source: `77589d55f5e9f140facc358af992b591547beb5a`. A documentation-only follow-up records these
+results without changing the tested executable source. Real DeepSeek-V4.1-Flash
+on g15 MI355X/gfx950, TP4 on physical GPUs 0–3 (HIP order `1,3,2,0`).
+The standalone flag is explicitly 0 versus 1; `ATOM_MONO_ENABLE` and
+`ATOM_DSV41_MONO_HI` are unset and resolve to enabled and `auto`.
+Flag 0 keeps the existing embedded/native indexer while layer Mono remains
+enabled. Flag 1 uses the standalone indexer on eligible ordinary steps.
+
+The CI deployment is FP8 KV, FP4/mfma index cache (layout resolved by the
+default backend), DSpark with five speculative tokens, max context 1048576,
+512 sequences, memory utilization 0.9 and 16384 batched tokens. Compilation
+is level 3/FULL with the default graph sizes; no bounded-replay,
+checkpoint-interval, capture-list or DSpark calibration overrides were used.
+HI refuses the FP8 KV deployment, so this exercises ordinary decode.
+
+Each flag used a fresh server and the CI lm-eval 0.4.13 local-completions
+protocol: all 1319 GSM8K questions, 3-shot, 65 concurrent, three retries,
+string requests and default generation settings (256 tokens, temperature 0).
+Only raw-response and sample logging were added. Every paired document,
+prompt and target hash matches; capped responses remain in the official
+scores. No individual output was replaced by a rerun.
+
+| Standalone flag | Flexible | Strict | Length-capped |
+|---|---:|---:|---:|
+| 0 | 1214/1319 (92.039%) | 1214/1319 (92.039%) | 2 |
+| 1 | 1225/1319 (92.873%) | 1225/1319 (92.873%) | 1 |
+
+Both scores pass CI's 0.91 threshold. Flexible correctness improves on
+36 questions and worsens on 25; all changed
+answers and complete generations are retained. This is one paired test-set
+observation, not token equivalence or a formal non-inferiority proof.
+The 1M number is the configured upper limit, not GSM8K prompt length or a
+qualification of actual 1M-token long-context requests.
+
+### Measured KV capacity
+
+The same flag A/B also covers BF16 KV without DSpark at limit 166016.
+Both configurations retain 512 sequences and utilization 0.9. All four
+ranks agree on each block count. Workspace bytes are the sum of unique
+tensor storages measured immediately after installation, before KV sizing.
+
+| Configuration | Flag 0 KV blocks | Flag 1 KV blocks | Change | Flag 1 workspace/rank |
+|---|---:|---:|---:|---:|
+| BF16 KV, no DSpark, 166016 limit | 461,604 | 461,319 | -285 (-0.062%) | 95.214 MiB |
+| FP8 KV, DSpark 5, 1048576 limit | 831,858 | 828,754 | -3,104 (-0.373%) | 560.354 MiB |
+
+These are measured launch pairs; small non-Torch/allocator peak variations
+also enter the budget, so block differences are not a byte-exact attribution
+to workspace alone. The separate candidate, REINDEX and FULL uncached arenas
+follow the existing process-lifetime policy. A later owner refusal retains
+them; this change does not eliminate that retention. The cost is budgeted
+before KV allocation rather than added afterward.
+
+### Review regression and scope
+
+- Related installed-stack routing/HI/build regression: 344 passed.
+- GPU compiler, numeric, CUDA Graph and handoff regression: 49 passed.
+- GPU-stack-blocked CPU regression: 196 passed, 6 skipped. Suites overlap.
+- BF16 flag 1 captures built every ordinary layer width and the 64-row native
+  FULL/candidate/REINDEX widths without refusal, with shared workspace identity
+  verified on all ranks. FP8/DSpark uses its recorded eligible qlen6 widths.
+- One CPU-only `step_supported(..., max_rows=...)` now serves both entry points;
+  scale constants live in `index_plan`, new compatibility re-exports are removed,
+  and query buffers branch to their final storage before allocating.
+- HI install-refusal tests cover unset and explicit-off indexer flags. A
+  successfully installed HI hook retains its embedded indexer on per-step
+  fallback; an auto install refusal follows the ordinary indexer flag.
+- DP attention still disables the standalone hook, even with flag 1. Its
+  existing embedded/native indexers remain; these non-DP results establish no
+  DP performance gain. TP2/TP4 ordinary FP4 defaults stay on, TP8 is explicit
+  opt-in, and the K3 short-decode switch stays default-off.
+
+The earlier complete TP2 5-shot GSM8K and TP4 frozen long-context regression
+on 4ec57 are retained in the PR. Earlier performance and larger long-context
+datasets keep their original source attribution; they were not rerun here.
+aiter remains clean at `b5b4bf978160b2d495e59b163e932fadc584675d`.
