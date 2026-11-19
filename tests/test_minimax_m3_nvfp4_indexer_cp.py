@@ -142,17 +142,21 @@ def cp_scores(cache, table, seq, q, S, rank):
 def test_the_cp_scorer_hands_aiter_the_shard(monkeypatch):
     """The NVFP4 CP decode scores with aiter's public NVFP4 scorer: every index head of the
     step's rows over the shard's local blocks, the cache's two page views, the step's map
-    and the record's workspace, and the shard. With an aiter whose scorer takes the shard,
-    the call binds to its signature."""
+    and the record's workspace, and the shard. The call binds to the installed aiter's
+    signature, so an aiter whose scorer does not take the shard (ROCm/aiter#8285) fails
+    here, with no GPU."""
     import inspect
 
+    flydsl = pytest.importorskip("aiter.ops.flydsl")
     from atom.model_ops.minimax_m3 import indexer_context_parallel as icp
     from atom.model_ops.minimax_m3.index_buffers import IndexScoreBuffers
     from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
 
+    signature = inspect.signature(flydsl.minimax_m3_index_score_nvfp4_flydsl)
     seen = {}
 
     def scorer(*args, **kwargs):
+        signature.bind(*args, **kwargs)
         seen.update(args=args, kwargs=kwargs)
         return kwargs["out"]
 
