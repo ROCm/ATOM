@@ -6,6 +6,8 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
 
+import numpy as np
+
 import torch
 import triton
 import triton.language as tl
@@ -28,6 +30,7 @@ from atom.plugin.rtpllm.utils.forward_context import (
     RTPForwardQwen35HybridContext,
     _target_verify_state_slots_graph_kernel,
 )
+from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 
@@ -43,6 +46,7 @@ def _qsa_graph_slots_kernel(
     table_stride_col,
     table_cols: tl.constexpr,
     block_size: tl.constexpr,
+    slot_page_size: tl.constexpr,
     ratio: tl.constexpr,
     tile: tl.constexpr,
 ):
@@ -56,7 +60,7 @@ def _qsa_graph_slots_kernel(
         live & (position >= 0),
         -1,
     )
-    slot = tl.where(page >= 0, page * block_size + position % block_size, -1)
+    slot = tl.where(page >= 0, page * slot_page_size + position % slot_page_size, -1)
     compressed = tl.where(
         (slot >= 0) & ((position + 1) % ratio == 0), slot // ratio, -1
     )
@@ -204,6 +208,7 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
         if seq_lens is None or seq_lens.numel() != batch_size:
             raise ValueError("invalid Qwen4Exp MTP target-verify sequence lengths")
         in_capture = torch.cuda.is_current_stream_capturing()
+        split_conv_slots = None
         if in_capture:
             if (
                 triton is None
@@ -239,21 +244,27 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
                 raise RuntimeError(
                     "Qwen4Exp MTP target Graph requires device prefix lengths"
                 )
-            _target_verify_state_slots_graph_kernel[(triton.cdiv(batch_size, 128),)](
-                block_table,
-                seq_lens,
-                prefix_lengths,
-                read_slots,
-                write_slots,
-                invalid_live_rows,
-                batch_size,
-                block_table.stride(0),
-                block_table.stride(1),
-                block_table.shape[1],
-                seq_size_per_block,
-                query_len,
-                128,
+            from atom.plugin.rtpllm.utils.split_ssm_storage import target_slots
+            split_conv_slots = target_slots(
+                attn_inputs, block_table, seq_lens, prefix_lengths, read_slots,
+                write_slots, invalid_live_rows, batch_size, seq_size_per_block, query_len,
             )
+            if split_conv_slots is None:
+                _target_verify_state_slots_graph_kernel[(triton.cdiv(batch_size, 128),)](
+                    block_table,
+                    seq_lens,
+                    prefix_lengths,
+                    read_slots,
+                    write_slots,
+                    invalid_live_rows,
+                    batch_size,
+                    block_table.stride(0),
+                    block_table.stride(1),
+                    block_table.shape[1],
+                    seq_size_per_block,
+                    query_len,
+                    128,
+                )
             # The index kernel overwrites every active tile's flag on each
             # replay. A bad live row must fail before GDN touches block 0.
             valid_slots = (
@@ -334,6 +345,8 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
         metadata.rtp_target_verify_block_map = block_table
         metadata.rtp_target_verify_sequence_lengths = seq_lens.to(torch.int32)
         metadata.rtp_seq_size_per_block = seq_size_per_block
+        from atom.plugin.rtpllm.utils.split_ssm_storage import attach_target_conv_metadata
+        attach_target_conv_metadata(metadata, split_conv_slots)
         return metadata
 
     @staticmethod
@@ -345,17 +358,26 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
         return gdn, full, mla
 
     @staticmethod
+    def _kv_cache_signature(runtime, layer_maps):
+        from atom.plugin.rtpllm.utils.linear_double_buffer import pool_signature
+
+        return RTPForwardQwen35HybridContext._kv_cache_signature(runtime, layer_maps) + pool_signature(runtime, layer_maps[0])
+
+    @staticmethod
     def _build_kv_cache_tensors(runtime: Any, layer_maps: Any) -> dict[str, Any]:
-        caches = RTPForwardQwen35HybridContext._build_kv_cache_tensors(
-            runtime, layer_maps
-        )
+        from atom.plugin.rtpllm.utils.split_ssm_storage import enabled, build_caches
+        parent = RTPForwardQwen35HybridContext._build_kv_cache_tensors
+        from atom.plugin.rtpllm.utils.linear_double_buffer import enabled as request_pool_enabled, build_cache_views
+        if request_pool_enabled(runtime):
+            return build_cache_views(runtime, layer_maps, parent)
+        caches = build_caches(runtime, layer_maps, parent) if enabled() else parent(runtime, layer_maps)
         model_config = getattr(runtime, "_rtp_model_config", None)
         if model_config is None:
             model_config = getattr(runtime, "model_config", None)
         linear_config = getattr(model_config, "linear_attention_config", None)
-        if getattr(linear_config, "ssm_state_dtype", None) == DataType.TYPE_FP32:
+        if not enabled() and getattr(linear_config, "ssm_state_dtype", None) == DataType.TYPE_FP32:
             for layer_num, layer in layer_maps[0].items():
-                raw = runtime.kv_cache.get_layer_cache(layer_num).kv_cache_base
+                raw = runtime.kv_cache.get_layer_cache(layer_num, "linear").kv_cache_base
                 base = raw.reshape(raw.shape[0], -1)
                 if base.dtype != torch.bfloat16 or not base.is_contiguous():
                     raise ValueError(
@@ -389,10 +411,12 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
         # AITER decode expects physical VK storage exposed as a logical KV
         # view. Bind that view before the first state write; the prefill path
         # and Triton decode fallback both honor its inner strides. MTP target
-        # verification still uses the original KV state layout.
-        if not getattr(
-            model_config, "atom_qwen4_exp_mtp_target", False
-        ) and not getattr(model_config, "is_mtp", False):
+        # verification uses physical VK storage for FlyDSL MTP.
+        from atom.plugin.rtpllm.utils.replay_policy import flydsl_mtp_enabled
+        if (not getattr(model_config, "atom_qwen4_exp_mtp_target", False)
+            and not getattr(model_config, "is_mtp", False)) or (
+                flydsl_mtp_enabled()
+                and getattr(model_config, "atom_qwen4_exp_mtp_target", False)):
             for layer_num, layer in layer_maps[0].items():
                 state = caches[f"layer_{layer_num}"].v_cache
                 k_dim, v_dim = state.shape[-2:]
@@ -495,26 +519,89 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
             raise ValueError("Qwen4Exp full-attention physical block table is empty")
         return table
 
+    @classmethod
+    def _qsa_state_slots(cls, tag, prefix, runtime, inputs, logical, query_starts,
+                         page_size, ratio, graph_buffers):
+        tagged = inputs.attention_inputs_by_tag[tag]
+        if int(runtime.kv_cache.get_seq_size_per_block(tag)) != page_size:
+            raise ValueError(f"{tag} and full cache page sizes differ")
+        buffers = None
+        verify = getattr(tagged, "is_target_verify", False)
+        if graph_buffers is not None:
+            buffers = dict(graph_buffers)
+            buffers["physical_block_table_i32"] = buffers[prefix + "raw_physical_block_table_i32"]
+            if verify:
+                for key, name in (("target_read_slots_i32", "read_slots_i32"),
+                                  ("target_write_slots_i32", "write_slots_i32"),
+                                  ("target_invalid_live_rows", "invalid_live_rows")):
+                    buffers[key] = buffers[prefix + "qsa_state_" + name]
+        blocks = cls._resolve_qsa_block_table(
+            tagged, page_size, int(runtime.kv_cache.get_kernel_seq_size_per_block(tag)), buffers
+        )
+        read = candidates = None
+        if verify:
+            meta = cls._build_gdn_metadata(tagged, seq_size_per_block=page_size,
+                                           num_tokens=logical.numel(), cg_bufs=buffers)
+            read = meta.spec_state_indices_in_tensor[:, 0]
+            candidates = meta.spec_state_indices_tensor
+            pages = candidates.reshape(-1).to(torch.int64)
+            slots = torch.where(pages > 0, pages * (2 * ratio) + logical.remainder(2 * ratio), -1)
+        elif buffers is not None:
+            slots = buffers[prefix + "qsa_raw_slots_i64"][:logical.numel()]
+            _qsa_graph_slots_kernel[(triton.cdiv(slots.numel(), 128),)](
+                blocks, logical, buffers["seq_id_i32"], slots,
+                buffers["qsa_raw_compressed_slots"], slots.numel(),
+                blocks.stride(0), blocks.stride(1), blocks.shape[1], page_size, 2 * ratio, ratio, 128,
+            )
+        else:
+            slots = cls._build_slot_mapping(positions=logical, query_start_loc=query_starts,
+                                            block_table=blocks, seq_size_per_block=page_size)
+            slots = torch.where(slots >= 0, (slots // page_size) * (2 * ratio) + logical.remainder(2 * ratio), slots)
+        return blocks, slots, read, candidates
+
     @staticmethod
     def _bind_qsa_caches(runtime: Any, qsa_layers: list[Any], block_size: int) -> None:
         from rtp_llm.models_py.modules.factory.attention.common import (
             reshape_paged_kv_cache,
         )
 
+        cfg = runtime._rtp_model_config
+        has_positions = not cfg.is_mtp and cfg.mm_model_config.is_multimodal
         for module in qsa_layers:
             ratio = int(module.indexer.compress_ratio)
             if block_size <= 0 or ratio <= 0 or block_size % ratio:
                 raise ValueError(
                     f"QSA block size {block_size} must be divisible by compression ratio {ratio}"
                 )
-            layer_cache = runtime.kv_cache.get_layer_cache(module.layer_num)
+            layer_cache = runtime.kv_cache.get_layer_cache(module.layer_num, "full")
             raw = layer_cache.kv_cache_base
             if raw is None:
                 raise ValueError(f"QSA layer {module.layer_num} has no RTP KV cache")
-            if raw.dtype != torch.bfloat16:
-                raise ValueError("QSA RTP KV cache requires BF16 storage")
+            is_fp8 = raw.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+            if raw.dtype != torch.bfloat16 and not is_fp8:
+                raise ValueError("QSA RTP KV cache requires BF16 or FP8 storage")
+            scale = layer_cache.kv_scale_base
+            if is_fp8 and (scale is None or scale.numel() == 0):
+                raise ValueError("QSA FP8 KV cache requires per-token FP32 scales")
             num_blocks = int(raw.shape[0])
-            signature = (raw.data_ptr(), num_blocks, block_size, str(raw.dtype))
+            index_base = runtime.kv_cache.get_layer_cache(module.layer_num, "indexer_kv").kv_cache_base
+            raw_base = runtime.kv_cache.get_layer_cache(module.layer_num, "indexer_state").kv_cache_base
+            if index_base is None or index_base.dtype != torch.uint8 or index_base.ndim != 2:
+                raise ValueError("QSA indexer_kv pool is missing or has invalid storage")
+            if raw_base is None or raw_base.dtype != torch.float32 or raw_base.ndim != 2:
+                raise ValueError("QSA indexer_state pool is missing or has invalid storage")
+            index_blocks = int(index_base.shape[0])
+            position_base = None
+            if has_positions:
+                position_base = runtime.kv_cache.get_layer_cache(
+                    module.layer_num, "indexer_rope_positions"
+                ).kv_cache_base
+                if (position_base is None or position_base.dtype != torch.int32
+                        or position_base.ndim != 2 or position_base.size(1) < 2 * ratio * 3):
+                    raise ValueError("invalid indexer_rope_positions pool")
+            signature = (raw.data_ptr(), num_blocks, block_size, str(raw.dtype),
+                         scale.data_ptr() if is_fp8 else 0, index_base.data_ptr(), raw_base.data_ptr(),
+                         position_base.data_ptr() if has_positions else 0)
             if getattr(module, "_rtp_qsa_cache_signature", None) == signature:
                 continue
             # The QSA module is already TP-sharded; RTP allocates this layer's
@@ -539,46 +626,31 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
             )
             key = token_major[:, 0]
             value = token_major[:, 1]
+            k_scale = v_scale = None
+            if is_fp8:
+                if scale.dtype != torch.float32 or scale.numel() != num_blocks * 2 * block_size * stored_heads:
+                    raise ValueError("QSA FP8 KV scale layout does not match RTP cache")
+                token_scale = scale.view(num_blocks, 2, block_size, stored_heads)
+                k_scale, v_scale = token_scale[:, 0], token_scale[:, 1]
             device = raw.device
             index_dim = int(module.indexer.index_head_dim)
+            state_rows = 2 * ratio
+            state_bytes = state_rows * index_dim * 4
+            compressed_bytes = block_size // ratio * index_dim * 2
+            if raw_base.shape[1] * raw_base.element_size() < state_bytes or index_base.shape[1] < compressed_bytes:
+                raise ValueError("QSA side pool row is too small")
             side = (
-                torch.zeros(
-                    (num_blocks, block_size, 1, index_dim),
-                    device=device,
-                    dtype=raw.dtype,
+                raw_base[:, :state_rows * index_dim].reshape(
+                    raw_base.shape[0], state_rows, 1, index_dim
                 ),
-                torch.zeros(
-                    (
-                        num_blocks,
-                        block_size // ratio,
-                        1,
-                        index_dim,
-                    ),
-                    device=device,
-                    dtype=raw.dtype,
-                ),
+                index_base[:, :compressed_bytes]
+                .view(torch.bfloat16).reshape(index_blocks, block_size // ratio, 1, index_dim),
             )
-            model_config = getattr(runtime, "_rtp_model_config", None)
-            has_vision = bool(
-                getattr(
-                    getattr(model_config, "mm_model_config", None),
-                    "is_multimodal",
-                    False,
-                )
+            rope_positions = None if position_base is None else position_base[:, :state_rows * 3].view(
+                position_base.size(0), state_rows, 1, 3
             )
-            rope_positions = (
-                torch.zeros(
-                    (num_blocks, block_size, 1, 3),
-                    device=device,
-                    dtype=torch.int64,
-                )
-                if has_vision
-                else None
-            )
-            if has_vision:
-                module.bind_caches(key, value, *side, rope_positions)
-            else:
-                module.bind_caches(key, value, *side)
+            module.bind_caches(key, value, *side, rope_position_cache=rope_positions,
+                               k_scale_cache=k_scale, v_scale_cache=v_scale)
             module._rtp_qsa_cache_signature = signature
 
     @staticmethod
@@ -593,41 +665,62 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
         ple = ple_layers[0]
         if not gdn_layers:
             raise ValueError("PLE requires a GDN layer cache")
-        raw = runtime.kv_cache.get_layer_cache(min(gdn_layers)).kv_cache_base
-        slots = int(raw.shape[0])
-        signature = (raw.data_ptr(), slots, ple.hc_hidden_size, ple.conv_state_len)
+        ple_layer = next(
+            idx for idx, layer in enumerate(model.model.layers) if layer.ple is not None
+        )
+        conv_raw = runtime.kv_cache.get_layer_cache(ple_layer, "ple_conv_state").kv_cache_base
+        ngram_raw = runtime.kv_cache.get_layer_cache(ple_layer, "ple_ngram_ctx").kv_cache_base
+        if conv_raw is None or ngram_raw is None:
+            raise ValueError("PLE state pools are missing")
+        conv_slots = int(conv_raw.shape[0])
+        ngram_slots = int(ngram_raw.shape[0])
+        signature = (conv_raw.data_ptr(), ngram_raw.data_ptr(), conv_slots,
+                     ngram_slots, ple.hc_hidden_size, ple.conv_state_len)
         if getattr(runtime, "_rtp_ple_cache_signature", None) != signature:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
                     "Qwen4Exp PLE caches must be bound before Graph capture"
                 )
-            runtime._rtp_ple_ngram = torch.full(
-                (slots, ple.ple_embedding.ngram_size - 1),
-                int(model.config.eos_token_id),
-                device=raw.device,
-                dtype=torch.int64,
+            from rtp_llm.models_py.utils.cache_payload_view import (
+                CachePayloadGeometry, payload_view,
             )
-            runtime._rtp_ple_conv = torch.zeros(
-                (slots, ple.hc_hidden_size, ple.conv_state_len),
-                device=raw.device,
-                dtype=model.atom_config.torch_dtype,
-            )
+            ngram_width = ple.ple_embedding.ngram_size - 1
+            runtime._rtp_ple_ngram = payload_view(
+                ngram_raw,
+                CachePayloadGeometry(torch.int64, torch.int64, ngram_width, 1),
+                "PLE ngram context",
+            ).squeeze(-1)
+            runtime._rtp_ple_conv = payload_view(
+                conv_raw,
+                CachePayloadGeometry(torch.bfloat16, torch.bfloat16,
+                                     ple.conv_state_len, ple.hc_hidden_size),
+                "PLE convolution state",
+            ).transpose(1, 2)
+            runtime._rtp_ple_ngram.fill_(int(model.config.eos_token_id))
+            runtime._rtp_ple_conv.zero_()
             runtime._rtp_ple_cache_signature = signature
         return ple
 
     @classmethod
     def _ple_metadata(
-        cls, runtime: Any, model: Any, attn_metadata: Any, gdn_layers: dict[int, Any]
+        cls,
+        runtime: Any,
+        attn_metadata: Any,
+        ple_state_metadata: GDNAttentionMetadata | None = None,
+        ngram_state_metadata: GDNAttentionMetadata | None = None,
     ) -> Qwen4ExpPLEMetadata | None:
-        ple = cls._bind_ple_caches(runtime, model, gdn_layers)
-        if ple is None:
-            return None
-        gdn = attn_metadata.gdn_metadata
+        gdn = ple_state_metadata
         if gdn is None or (
             gdn.non_spec_state_indices_tensor is None
             and gdn.spec_state_indices_tensor is None
         ):
             raise ValueError("PLE requires GDN state-slot metadata")
+        ngram = ngram_state_metadata
+        if ngram is None or (
+            ngram.non_spec_state_indices_tensor is None
+            and ngram.spec_state_indices_tensor is None
+        ):
+            raise ValueError("PLE requires ngram state-slot metadata")
         spec_indices = (
             gdn.spec_state_indices_tensor
             if getattr(gdn, "rtp_target_verify_block_map", None) is not None
@@ -636,9 +729,13 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
         if spec_indices is not None:
             indices = spec_indices[:, -1]
             input_indices = gdn.spec_state_indices_in_tensor[:, 0]
+            ngram_indices = ngram.spec_state_indices_tensor[:, -1]
+            ngram_input_indices = ngram.spec_state_indices_in_tensor[:, 0]
         else:
             indices = gdn.non_spec_state_indices_tensor
             input_indices = gdn.non_spec_state_indices_in_tensor
+            ngram_indices = ngram.non_spec_state_indices_tensor
+            ngram_input_indices = ngram.non_spec_state_indices_in_tensor
         has_initial = gdn.has_initial_state
         if has_initial is None:
             if torch.cuda.is_current_stream_capturing():
@@ -661,10 +758,15 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
             state_indices_out=indices,
             has_initial_state=has_initial,
             conv_state=runtime._rtp_ple_conv,
+            ngram_indices_in=ngram_input_indices,
+            ngram_indices_out=ngram_indices,
         )
         # RTP-only per-candidate slots are deliberately not part of the
         # framework-neutral Qwen4ExpPLEMetadata dataclass.
         metadata.rtp_spec_state_indices = spec_indices
+        metadata.rtp_ngram_spec_state_indices = (
+            ngram.spec_state_indices_tensor if spec_indices is not None else None
+        )
         return metadata
 
     @classmethod
@@ -681,7 +783,8 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
         cg_bufs: dict | None = None,
     ) -> Iterator[None]:
         resolved_layer_maps = layer_maps or cls.collect_layer_maps(model)
-        with super().bind(
+        from atom.plugin.rtpllm.utils.split_ssm_storage import target_metadata_scope
+        with target_metadata_scope(runtime, inputs, cg_bufs), super().bind(
             model=model,
             runtime=runtime,
             inputs=inputs,
@@ -711,6 +814,33 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
                 gdn_metadata.ssm_conv_state_len = (
                     int(model.config.linear_conv_kernel_dim) - 1
                 )
+            from atom.plugin.rtpllm.utils.replay_policy import flydsl_mtp_enabled
+            from atom.plugin.rtpllm.utils.replay_hybrid import prepare_metadata
+
+            if gdn_metadata is not None:
+                gdn_metadata.rtp_flydsl_mtp = (
+                    flydsl_mtp_enabled()
+                    and bool(resolved_layer_maps[0])
+                    and all(
+                        layer.allow_aiter_flydsl
+                        and forward_context.kv_cache_data[f"layer_{number}"].v_cache.stride(-2) == 1
+                        for number, layer in resolved_layer_maps[0].items()
+                    )
+                    and gdn_metadata.num_spec_decodes > 0
+                    and gdn_metadata.num_prefills == 0
+                    and gdn_metadata.num_decodes == 0
+                )
+                if gdn_metadata.rtp_flydsl_mtp:
+                    gdn_metadata.rtp_flydsl_read_indices = (
+                        gdn_metadata.spec_state_indices_in_tensor[:, 0].contiguous()
+                    )
+            from atom.plugin.rtpllm.utils.split_ssm_storage import bind_conv
+            bind_conv(cls, runtime, inputs, positions, gdn_metadata, cg_bufs)
+            from atom.plugin.rtpllm.utils.linear_double_buffer import enabled as request_pool_enabled, prepare_metadata as prepare_request_pool
+            if request_pool_enabled(runtime):
+                prepare_request_pool(runtime, gdn_metadata, inputs)
+            else:
+                prepare_metadata(runtime, gdn_metadata, forward_context.kv_cache_data, resolved_layer_maps[0])
             cls._configure_gdn_backends(
                 metadata.gdn_metadata,
                 resolved_layer_maps[0],
@@ -746,6 +876,23 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
             full_blocks = cls._resolve_qsa_block_table(
                 full_inputs, full_block_size, kernel_block_size, graph_buffers
             )
+            index_inputs = getattr(inputs, "attention_inputs_by_tag", {}).get("indexer_kv")
+            if index_inputs is None:
+                raise ValueError("Qwen4Exp requires RTP's indexer_kv cache tag")
+            index_graph_buffers = graph_buffers
+            if graph_buffers is not None:
+                index_graph_buffers = dict(graph_buffers)
+                index_graph_buffers["physical_block_table_i32"] = graph_buffers[
+                    "index_physical_block_table_i32"
+                ]
+            index_blocks = cls._resolve_qsa_block_table(
+                index_inputs,
+                int(runtime.kv_cache.get_seq_size_per_block("indexer_kv")),
+                int(runtime.kv_cache.get_kernel_seq_size_per_block("indexer_kv")),
+                index_graph_buffers,
+            )
+            if int(runtime.kv_cache.get_seq_size_per_block("indexer_kv")) != full_block_size:
+                raise ValueError("QSA indexer_kv and full cache page sizes differ")
             if in_capture:
                 if graph_buffers is None:
                     raise RuntimeError("Qwen4Exp Graph requires prewarmed QSA buffers")
@@ -761,6 +908,24 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
                     full_blocks.stride(0),
                     full_blocks.stride(1),
                     full_blocks.shape[1],
+                    full_block_size,
+                    full_block_size,
+                    ratio,
+                    128,
+                )
+                index_slots = graph_buffers["qsa_index_slots_i64"][: slots.numel()]
+                index_compressed = graph_buffers["qsa_index_compressed_slots"][: slots.numel()]
+                _qsa_graph_slots_kernel[(triton.cdiv(slots.numel(), 128),)](
+                    index_blocks,
+                    positions,
+                    graph_buffers["seq_id_i32"][: slots.numel()],
+                    index_slots,
+                    index_compressed,
+                    slots.numel(),
+                    index_blocks.stride(0),
+                    index_blocks.stride(1),
+                    index_blocks.shape[1],
+                    full_block_size,
                     full_block_size,
                     ratio,
                     128,
@@ -782,6 +947,52 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
                     ratio,
                     compressed,
                 )
+                index_slots = cls._build_slot_mapping(
+                    positions=positions.reshape(-1),
+                    query_start_loc=plugin.rtp_cu_seqlens_q,
+                    block_table=index_blocks,
+                    seq_size_per_block=full_block_size,
+                )
+                index_compressed = torch.empty_like(index_slots)
+                qsa_compressed_slots(index_slots, logical, ratio, index_compressed)
+            state_args = (runtime, inputs, logical, plugin.rtp_cu_seqlens_q,
+                          full_block_size, ratio, graph_buffers)
+            raw_blocks, raw_slots, state_read_pages, state_candidate_pages = cls._qsa_state_slots(
+                "indexer_state", "", *state_args
+            )
+            position_blocks = position_slots = position_read = position_candidates = None
+            if qsa_layers[0].rope_position_cache is not None:
+                position_blocks, position_slots, position_read, position_candidates = cls._qsa_state_slots(
+                    "indexer_rope_positions", "position_", *state_args
+                )
+            host_lens = context_slots = None
+            if (
+                envs.ATOM_QSA_FLYDSL_ATTN
+                and forward_context.context.is_prefill
+                and not runtime._rtp_model_config.is_mtp
+                and not getattr(full_inputs, "is_target_verify", False)
+                and not in_capture
+                and full_inputs.input_lengths.device.type == "cpu"
+                and full_inputs.prefix_lengths.device.type == "cpu"
+            ):
+                query_lens = tuple(int(v) for v in full_inputs.input_lengths.tolist())
+                prefix_lens = tuple(int(v) for v in full_inputs.prefix_lengths.tolist())
+                seq_lens = tuple(q + p for q, p in zip(query_lens, prefix_lens))
+                if (len(query_lens) == full_blocks.shape[0]
+                    and len(query_lens) == len(prefix_lens)
+                    and sum(query_lens) == int(logical.numel())
+                    and all(q >= 0 and p >= 0 for q, p in zip(query_lens, prefix_lens))):
+                    host_lens = (query_lens, seq_lens)
+                    if any(prefix_lens):
+                        lengths = np.asarray(seq_lens, dtype=np.int64)
+                        requests = np.repeat(np.arange(len(seq_lens), dtype=np.int64), lengths)
+                        tokens = np.arange(len(requests), dtype=np.int64) - np.repeat(
+                            np.cumsum(lengths) - lengths, lengths
+                        )
+                        host = torch.from_numpy(np.stack((requests, tokens))).pin_memory()
+                        requests, tokens = host.to(full_blocks.device, non_blocking=True)
+                        pages = full_blocks[requests, tokens // full_block_size].to(torch.int64)
+                        context_slots = pages * full_block_size + tokens % full_block_size
             metadata.qsa_metadata = Qwen4ExpQSAMetadata(
                 block_tables=full_blocks,
                 slot_mapping=slots,
@@ -795,12 +1006,81 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
                 logical_positions=logical,
                 seq_lens=metadata.context_lens,
                 max_seq_len=int(metadata.max_seqlen_k),
+                index_block_tables=index_blocks,
+                index_slot_mapping=index_slots,
+                index_compressed_slot_mapping=index_compressed,
+                raw_index_block_tables=raw_blocks,
+                raw_index_slot_mapping=raw_slots,
+                state_page_size=int(runtime.kv_cache.get_seq_size_per_block("indexer_state")),
+                position_block_tables=position_blocks,
+                position_slot_mapping=position_slots,
+                position_read_pages=position_read,
+                position_candidate_pages=position_candidates,
+                state_read_pages=state_read_pages,
+                state_candidate_pages=state_candidate_pages,
+                host_lens=host_lens,
+                context_slots=context_slots,
             )
+            # The MTP draft is a single QSA layer with no PLE cache groups.
+            # Keep its QSA metadata live through forward without binding PLE.
+            if runtime._rtp_model_config.is_mtp or cls._bind_ple_caches(
+                runtime, model, resolved_layer_maps[0]
+            ) is None:
+                metadata.ple_metadata = None
+                yield
+                return
+            tagged_inputs = getattr(inputs, "attention_inputs_by_tag", {})
+            ple_inputs = tagged_inputs.get("ple_conv_state")
+            ngram_inputs = tagged_inputs.get("ple_ngram_ctx")
+            ple_state_metadata = ngram_state_metadata = None
+            for tag, tagged, buffer_key in (
+                ("ple_conv_state", ple_inputs, "ple_previous_state_slots_i32"),
+                ("ple_ngram_ctx", ngram_inputs, "ple_ngram_previous_state_slots_i32"),
+            ):
+                if tagged is None:
+                    raise ValueError(f"Qwen4Exp requires RTP's {tag} cache tag")
+                tagged_buffers = graph_buffers
+                if graph_buffers is not None:
+                    tagged_buffers = dict(graph_buffers)
+                    tagged_buffers["previous_state_slots_i32"] = graph_buffers[buffer_key]
+                    if getattr(tagged, "is_target_verify", False):
+                        for name in (
+                            "target_read_slots_i32",
+                            "target_write_slots_i32",
+                            "target_invalid_live_rows",
+                        ):
+                            tagged_buffers[name] = graph_buffers[f"{tag}_{name}"]
+                state_metadata = cls._build_gdn_metadata(
+                    tagged,
+                    seq_size_per_block=int(runtime.kv_cache.get_seq_size_per_block(tag)),
+                    num_tokens=int(logical.numel()),
+                    cg_bufs=tagged_buffers,
+                )
+                if tag == "ple_conv_state":
+                    ple_state_metadata = state_metadata
+                else:
+                    ngram_state_metadata = state_metadata
             metadata.ple_metadata = cls._ple_metadata(
-                runtime, model, metadata, resolved_layer_maps[0]
+                runtime, metadata, ple_state_metadata, ngram_state_metadata,
             )
             if metadata.ple_metadata is not None and gdn_metadata is not None:
-                metadata.ple_metadata.rtp_checkpoint_targets = (
-                    gdn_metadata.ssm_checkpoints
-                )
+                ple_checkpoints = None
+                if (
+                    getattr(runtime._rtp_model_config, "atom_qwen4_exp_prefix_cache_enabled", False)
+                    and ple_state_metadata is not None
+                    and ple_state_metadata.num_prefills
+                ):
+                    ple_checkpoints = {
+                        "conv": cls._prefill_state_checkpoints(
+                            ple_inputs, ple_state_metadata,
+                            int(runtime.kv_cache.get_seq_size_per_block("ple_conv_state")),
+                            int(runtime.kv_cache.get_kernel_seq_size_per_block("ple_conv_state")),
+                        ),
+                        "ngram": cls._prefill_state_checkpoints(
+                            ngram_inputs, ngram_state_metadata,
+                            int(runtime.kv_cache.get_seq_size_per_block("ple_ngram_ctx")),
+                            int(runtime.kv_cache.get_kernel_seq_size_per_block("ple_ngram_ctx")),
+                        ),
+                    }
+                metadata.ple_metadata.rtp_checkpoint_targets = ple_checkpoints
             yield

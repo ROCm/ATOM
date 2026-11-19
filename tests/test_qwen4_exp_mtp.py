@@ -142,6 +142,7 @@ def test_middle_prefill_draft_preserves_position_axes(
 @pytest.mark.parametrize("k", [1, 2, 3])
 @torch.inference_mode()
 def test_qsa_rope_cache_matches_implicit_positions(monkeypatch, qsa_rope, is_draft, k):
+    from atom.model_ops.attentions.qwen4_exp_attn import Qwen4ExpQSAMetadata
     from atom.model_ops.layernorm import GemmaRMSNorm
     from atom.model_ops.qwen4_exp import qsa_attention
 
@@ -196,7 +197,7 @@ def test_qsa_rope_cache_matches_implicit_positions(monkeypatch, qsa_rope, is_dra
         requests[-2:] = -1
         compressed = torch.empty_like(slots)
         qsa_compressed_slots(slots, logical, ratio, compressed)
-        metadata = SimpleNamespace(
+        metadata = Qwen4ExpQSAMetadata(
             block_tables=tables,
             token_to_req=requests,
             logical_positions=logical,
@@ -482,13 +483,16 @@ def test_mtp_shared_projection_uses_full_width_hidden_norm():
     from atom.models.qwen4_exp_mtp import Qwen4ExpMultiTokenPredictor
 
     class IdentityDecoder(torch.nn.Module):
-        def forward(self, positions, hidden, input_ids):
+        fused_hc = False
+
+        def forward(self, positions, hidden, input_ids, sp=None):
             return hidden
 
     torch.manual_seed(17)
     n, hc, width, eps = 5, 4, 64, 1e-6
     model = Qwen4ExpMultiTokenPredictor.__new__(Qwen4ExpMultiTokenPredictor)
     torch.nn.Module.__init__(model)
+    model.allow_sequence_parallel = False
     model.hc_count, model.hidden_size = hc, width
     model.pre_fc_norm_hidden = Qwen4ExpGroupedRMSNorm(hc * width, hc * width, eps)
     model.pre_fc_norm_embedding = Qwen4ExpGroupedRMSNorm(width, width, eps)

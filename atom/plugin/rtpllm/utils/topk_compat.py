@@ -74,7 +74,17 @@ def rtp_topk_softmax(
     )
     scoring = fused_shared_experts_scoring_func or ""
     args = (weights, ids, token_ids, gating_output, renormalize, shared, scoring)
-    if _accepts_valid_rows(topk_softmax):
+    from atom.plugin.prepare import is_rtpllm
+
+    if (torch.version.hip is not None and is_rtpllm()
+        and __import__("os").getenv("ATOM_RTP_TOPK512", "1") == "1"
+        and renormalize and topk == 10 and 0 < token <= 4
+        and gating_output.dtype == torch.bfloat16 and gating_output.stride(1) == 1
+        and gating_output.shape[1] == 512 + shared and shared in (0, 1)
+        and (shared == 0 or scoring == "sigmoid")):
+        from atom.plugin.rtpllm.utils.topk512 import run
+        run(gating_output, weights, ids, num_valid_rows)
+    elif _accepts_valid_rows(topk_softmax):
         topk_softmax(*args, num_valid_rows)
     else:
         topk_softmax(*args)

@@ -45,6 +45,14 @@ from atom.utils.forward_context import (
 )
 
 
+def _primary_layer_cache(kv_cache: Any, layer_num: int, tag: str):
+    """Keep legacy single-region models while selecting tagged hybrid pools."""
+    groups = kv_cache.get_layer_cache_groups(layer_num)
+    if len(groups) == 1:
+        return groups[0]
+    return kv_cache.get_layer_cache(layer_num, tag)
+
+
 @dataclass
 class AiterFlashAttentionPhaseMetadata:
     max_query_len: int
@@ -1520,7 +1528,7 @@ class RTPForwardContext:
 
         # Build GDN cache views from RTP LayerKVCache flat buffers.
         for layer_num, gdn_layer in gdn_layer_map.items():
-            layer_cache = runtime.kv_cache.get_layer_cache(layer_num)
+            layer_cache = _primary_layer_cache(runtime.kv_cache, layer_num, "linear")
             kv_cache_base = getattr(layer_cache, "kv_cache_base", None)
             if kv_cache_base is None:
                 raise ValueError(f"Layer {layer_num} kv_cache_base is missing.")
@@ -1587,7 +1595,7 @@ class RTPForwardContext:
             if layer_key in cache_tensors:
                 continue
 
-            layer_cache = runtime.kv_cache.get_layer_cache(layer_num)
+            layer_cache = _primary_layer_cache(runtime.kv_cache, layer_num, "full")
             kv_cache_base = getattr(layer_cache, "kv_cache_base", None)
             if kv_cache_base is None:
                 raise ValueError(
@@ -1649,7 +1657,12 @@ class RTPForwardContext:
             | set(mla_layer_map.keys())
         )
         for layer_num in all_layer_nums:
-            layer_cache = runtime.kv_cache.get_layer_cache(layer_num)
+            if layer_num in gdn_layer_map:
+                layer_cache = _primary_layer_cache(runtime.kv_cache, layer_num, "linear")
+            elif layer_num in full_attn_layer_map:
+                layer_cache = _primary_layer_cache(runtime.kv_cache, layer_num, "full")
+            else:
+                layer_cache = runtime.kv_cache.get_layer_cache(layer_num)
             kv_cache_base = getattr(layer_cache, "kv_cache_base", None)
             if kv_cache_base is None:
                 signature.append((int(layer_num), None))

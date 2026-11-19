@@ -360,14 +360,28 @@ def _sparse_pa_ran_on_asm(
 # ---------------------------------------------------------------------------
 # GQA block-sparse attention. BLOCK_SIZE_K == 128, matching one selected block.
 # ---------------------------------------------------------------------------
+def _gqa_sparse_fwd_kernel_heuristic_0(args):
+    return triton.next_power_of_2(args['head_dim'])
+
+
+def _gqa_sparse_fwd_kernel_heuristic_1(args):
+    return triton.next_power_of_2(args['gqa_group_size'])
+
+
+def _gqa_sparse_fwd_kernel_heuristic_2(args):
+    return triton.next_power_of_2(args['max_topk'])
+
+
+def _gqa_sparse_fwd_kernel_heuristic_3(args):
+    return args['BLOCK_SIZE_Q'] * triton.next_power_of_2(args['gqa_group_size'])
+
+
 @triton.heuristics(
     {
-        "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
-        "BLOCK_SIZE_H": lambda args: triton.next_power_of_2(args["gqa_group_size"]),
-        "BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["max_topk"]),
-        "BLOCK_SIZE_QH": lambda args: (
-            args["BLOCK_SIZE_Q"] * triton.next_power_of_2(args["gqa_group_size"])
-        ),
+        "BLOCK_SIZE_D": _gqa_sparse_fwd_kernel_heuristic_0,
+        "BLOCK_SIZE_H": _gqa_sparse_fwd_kernel_heuristic_1,
+        "BLOCK_SIZE_T": _gqa_sparse_fwd_kernel_heuristic_2,
+        "BLOCK_SIZE_QH": _gqa_sparse_fwd_kernel_heuristic_3,
     }
 )
 @triton.jit
@@ -531,13 +545,23 @@ def _gqa_sparse_fwd_kernel(
 # on shape constants so the grid is fixed within a cuda graph. Base-2
 # (exp2/log2) softmax matches the prefill kernel.
 # ---------------------------------------------------------------------------
+def _gqa_sparse_decode_kernel_heuristic_0(args):
+    return max(16, triton.next_power_of_2(args['gqa_group_size']))
+
+
+def _gqa_sparse_decode_kernel_heuristic_1(args):
+    return triton.next_power_of_2(args['head_dim'])
+
+
+def _gqa_sparse_decode_kernel_heuristic_2(args):
+    return triton.next_power_of_2(args['max_topk'])
+
+
 @triton.heuristics(
     {
-        "BLOCK_SIZE_H": lambda args: max(
-            16, triton.next_power_of_2(args["gqa_group_size"])
-        ),
-        "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
-        "BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["max_topk"]),
+        "BLOCK_SIZE_H": _gqa_sparse_decode_kernel_heuristic_0,
+        "BLOCK_SIZE_D": _gqa_sparse_decode_kernel_heuristic_1,
+        "BLOCK_SIZE_T": _gqa_sparse_decode_kernel_heuristic_2,
     }
 )
 @triton.jit

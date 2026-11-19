@@ -226,6 +226,9 @@ class GatedDeltaNet(nn.Module):
         # than one state per speculative token; the per-draft states it used
         # to hold are reconstructed from `replay_buf_*` on demand.
         ssm_state = layer_cache.v_cache
+        rtp_checkpoints = getattr(gdn_metadata, "rtp_linear_prefill_checkpoints", None)
+        if rtp_checkpoints is not None:
+            ssm_state = rtp_checkpoints[self.layer_num]
         use_replayssm = getattr(gdn_metadata, "replayssm", False)
         flydsl_policy = self.gdn_flydsl_policy
 
@@ -253,6 +256,8 @@ class GatedDeltaNet(nn.Module):
         mixed_qkv = mixed_qkv[:num_actual_tokens]
         b = b[:num_actual_tokens]
         a = a[:num_actual_tokens]
+
+        conv_metadata = getattr(gdn_metadata, "rtp_conv_metadata", gdn_metadata)
 
         # 1. Convolution sequence transformation
         conv_weights = self.conv1d.weight.view(
@@ -291,7 +296,7 @@ class GatedDeltaNet(nn.Module):
                 mixed_qkv_spec,
                 conv_state,
                 conv_weights,
-                gdn_metadata,
+                conv_metadata,
                 num_accepted_tokens,
                 use_replayssm,
             )
@@ -312,12 +317,12 @@ class GatedDeltaNet(nn.Module):
                 activation=self.activation,
                 conv_states=conv_state,
                 has_initial_state=has_initial_state,
-                cache_indices=non_spec_state_indices_tensor,
-                cache_indices_in=non_spec_state_indices_in_tensor,
+                cache_indices=conv_metadata.non_spec_state_indices_tensor,
+                cache_indices_in=conv_metadata.non_spec_state_indices_in_tensor,
                 query_start_loc=non_spec_query_start_loc,
                 k_dim_size=self.num_k_heads * self.head_k_dim // self.tp_size,
                 v_dim_size=self.num_v_heads * self.head_v_dim // self.tp_size,
-                metadata=gdn_metadata,
+                metadata=conv_metadata,
             )
         elif gdn_metadata.num_decodes > 0:
             query_non_spec, key_non_spec, value_non_spec = causal_conv1d_update(
@@ -328,10 +333,10 @@ class GatedDeltaNet(nn.Module):
                 self.num_v_heads * self.head_v_dim // self.tp_size,
                 self.conv1d.bias,
                 self.activation,
-                conv_state_indices=non_spec_state_indices_tensor[
+                conv_state_indices=conv_metadata.non_spec_state_indices_tensor[
                     : gdn_metadata.num_actual_tokens
                 ],
-                conv_state_indices_in=non_spec_state_indices_in_tensor[
+                conv_state_indices_in=conv_metadata.non_spec_state_indices_in_tensor[
                     : gdn_metadata.num_actual_tokens
                 ],
                 validate_data=True,
@@ -349,6 +354,15 @@ class GatedDeltaNet(nn.Module):
                 1, num_tokens_nonspec, -1, self.head_v_dim
             )
 
+        # Convolution and split SSM have independent physical pool indices.
+        # Override only after convolution consumed the original metadata.
+        ssm_non_spec = getattr(gdn_metadata, "rtp_ssm_non_spec_indices", None)
+        if ssm_non_spec is not None:
+            non_spec_state_indices_tensor = ssm_non_spec
+            non_spec_state_indices_in_tensor = ssm_non_spec
+        use_flydsl_mtp = bool(getattr(gdn_metadata, "rtp_flydsl_mtp", False))
+        if use_flydsl_mtp and use_replayssm:
+            raise ValueError("FlyDSL GDN MTP cannot run ReplaySSM")
         use_flydsl_decode = False
         if (
             flydsl_policy is not None
@@ -374,7 +388,7 @@ class GatedDeltaNet(nn.Module):
                 non_spec_state_indices_tensor,
             )
 
-        if use_lossy_gdn_decode or use_flydsl_decode:
+        if use_lossy_gdn_decode or use_flydsl_decode or use_flydsl_mtp:
             g_spec = None
             beta_spec = None
             g_non_spec = None
@@ -403,7 +417,32 @@ class GatedDeltaNet(nn.Module):
 
         # 2.1: Process the multi-query part
         if spec_sequence_masks is not None:
-            if use_replayssm:
+            if use_flydsl_mtp:
+                from atom.model_ops.fla_ops.gdn_flydsl import mtp_rtp
+                hybrid_records = getattr(gdn_metadata, "rtp_hybrid_records", None)
+                if hybrid_records is not None:
+                    from aiter.ops.flydsl.linear_attention_kernels import flydsl_gdr_mtp_hybrid
+                    batch, width = spec_state_indices_tensor.shape
+                    output = core_attn_out[:query_spec.shape[1]]
+                    flydsl_gdr_mtp_hybrid(
+                        query_spec.reshape(batch,width,*query_spec.shape[-2:]),
+                        key_spec.reshape(batch,width,*key_spec.shape[-2:]),
+                        value_spec.reshape(batch,width,*value_spec.shape[-2:]),
+                        a.reshape(batch,width,-1), b.reshape(batch,width,-1),
+                        self.dt_bias,self.A_log,ssm_state.transpose(-1,-2),
+                        output.reshape(batch,width,*value_spec.shape[-2:]),
+                        gdn_metadata.rtp_flydsl_read_indices,
+                        getattr(gdn_metadata, "rtp_flydsl_ssm_write_indices", spec_state_indices_tensor),
+                        hybrid_records[self.layer_num],
+                        record_indices=getattr(gdn_metadata, "rtp_hybrid_record_indices", None),
+                        record_only=getattr(gdn_metadata, "rtp_hybrid_record_only", False))
+                    core_attn_out_spec, last_recurrent_state = output.unsqueeze(0), None
+                else:
+                    core_attn_out_spec, last_recurrent_state = mtp_rtp(
+                        query_spec, key_spec, value_spec, a, b, ssm_state,
+                        self.A_log, self.dt_bias, gdn_metadata.rtp_flydsl_read_indices,
+                        spec_state_indices_tensor, core_attn_out[:query_spec.shape[1]])
+            elif use_replayssm:
                 # No per-draft state snapshot: the kernel rebuilds the state
                 # from the checkpoint plus the committed records, so the
                 # rejected drafts of the previous step are undone simply by
@@ -549,11 +588,16 @@ class GatedDeltaNet(nn.Module):
                     ),
                 )
             # Init cache
-            ssm_state.index_copy_(
-                0,
-                gdn_metadata.non_spec_state_indices_i64,
-                last_recurrent_state.to(ssm_state.dtype),
-            )
+            if rtp_checkpoints is None or gdn_metadata.rtp_linear_prefill_save_tail:
+                ssm_state.index_copy_(
+                    0,
+                    gdn_metadata.non_spec_state_indices_i64,
+                    last_recurrent_state.to(ssm_state.dtype),
+                )
+            if rtp_checkpoints is not None:
+                layer_cache.v_cache.index_copy_(
+                    0, gdn_metadata.rtp_linear_prefill_slots, last_recurrent_state
+                )
             # SSM state cache: copy out every checkpoint this step reached.
             #
             # A checkpoint slot is never where the recurrence runs — the live

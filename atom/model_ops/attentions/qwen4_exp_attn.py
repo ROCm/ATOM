@@ -76,6 +76,20 @@ class Qwen4ExpQSAMetadata:
     host_lens: tuple[tuple[int, ...], tuple[int, ...]] | None = None
     context_slots: torch.Tensor | None = None
 
+    # RTP plugin can place index keys in an independently transferred pool.
+    index_block_tables: torch.Tensor | None = None
+    index_slot_mapping: torch.Tensor | None = None
+    index_compressed_slot_mapping: torch.Tensor | None = None
+    raw_index_block_tables: torch.Tensor | None = None
+    raw_index_slot_mapping: torch.Tensor | None = None
+    state_page_size: int = 0
+    state_read_pages: torch.Tensor | None = None
+    state_candidate_pages: torch.Tensor | None = None
+    position_block_tables: torch.Tensor | None = None
+    position_slot_mapping: torch.Tensor | None = None
+    position_read_pages: torch.Tensor | None = None
+    position_candidate_pages: torch.Tensor | None = None
+
     def for_tokens(self, num_tokens: int) -> "Qwen4ExpQSAMetadata":
         """Draft step zero uses real rows, without the target graph's padding."""
         if self.slot_mapping.numel() == num_tokens:
@@ -84,6 +98,22 @@ class Qwen4ExpQSAMetadata:
             self,
             slot_mapping=self.slot_mapping[:num_tokens],
             compressed_slot_mapping=self.compressed_slot_mapping[:num_tokens],
+            position_slot_mapping=(
+                None if self.position_slot_mapping is None
+                else self.position_slot_mapping[:num_tokens]
+            ),
+            index_slot_mapping=(
+                None if self.index_slot_mapping is None
+                else self.index_slot_mapping[:num_tokens]
+            ),
+            index_compressed_slot_mapping=(
+                None if self.index_compressed_slot_mapping is None
+                else self.index_compressed_slot_mapping[:num_tokens]
+            ),
+            raw_index_slot_mapping=(
+                None if self.raw_index_slot_mapping is None
+                else self.raw_index_slot_mapping[:num_tokens]
+            ),
             token_to_req=self.token_to_req[:num_tokens],
             logical_positions=self.logical_positions[:num_tokens],
         )
@@ -100,6 +130,8 @@ class Qwen4ExpPLEMetadata:
     has_initial_state: torch.Tensor  # [reqs] bool
     conv_state: torch.Tensor  # [slots, channels, state_len] short-conv pool
     num_accepted_tokens: torch.Tensor | None = None
+    ngram_indices_in: torch.Tensor | None = None
+    ngram_indices_out: torch.Tensor | None = None
 
 
 class Qwen4ExpBackend(GDNAttentionBackend):

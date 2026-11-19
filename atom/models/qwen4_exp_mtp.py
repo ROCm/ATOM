@@ -15,6 +15,7 @@ from atom.model_loader.weight_utils import local_model_dir
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.linear import ReplicatedLinear
 from atom.model_ops.qwen4_exp.hyperconnection import (
+    HC_QUANT_ROWS_MAX,
     Qwen4ExpGroupedRMSNorm,
     Qwen4ExpHyperConnection,
 )
@@ -71,6 +72,7 @@ class _UnquantizedMTPQuantizationConfig(_Qwen4ExpQuantizationConfig):
 class Qwen4ExpMultiTokenPredictor(nn.Module):
     def __init__(self, atom_config: Config):
         super().__init__()
+        self.allow_sequence_parallel = _SequenceParallel.allowed_for_model(atom_config)
         config = copy.deepcopy(atom_config.hf_config)
         mtp = getattr(config, "mtp", {}) or {}
         layer_types = mtp.get("layer_types", ["full_attention"])
@@ -134,6 +136,12 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
                     prefix="mtp.layers.0",
                     layer_num=self.mtp_start_layer_idx,
                     quant_config=quant_config,
+                    fused_hc=(
+                        torch.version.hip is not None
+                        and atom_config.plugin_config is not None
+                        and atom_config.plugin_config.is_rtpllm
+                        and os.environ.get("ATOM_RTP_MTP_HC_FUSION", "1") == "1"
+                    ),
                 )
             ]
         )
@@ -159,7 +167,10 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
         hidden_states = hidden_states.reshape(n, -1)
-        sp = _SequenceParallel.maybe(n)
+        layer = self.layers[0]
+        sp = None
+        if self.allow_sequence_parallel and (not layer.fused_hc or n > HC_QUANT_ROWS_MAX):
+            sp = _SequenceParallel.maybe(n)
         if sp is not None:
             inputs_embeds = sp.shard(inputs_embeds)
             hidden_states = sp.shard(hidden_states)
@@ -169,10 +180,12 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         hidden = self.fc_hidden(hidden.reshape(-1, self.hidden_size))
         hidden = hidden.view(rows, self.hc_count, self.hidden_size)
         hidden = (hidden + embedding[:, None, :]).flatten(1)
-        if sp is None:
-            hidden = self.layers[0](positions, hidden, None)
-        else:
-            hidden = sp.gather(self.layers[0](positions, hidden, None, sp=sp))
+        hidden = layer(positions, hidden, None, sp=sp)
+        if layer.fused_hc:
+            hidden, pending = hidden
+            hidden = layer.mlp_hyper_connection.apply_pending(hidden, pending)
+        if sp is not None:
+            hidden = sp.gather(hidden)
         return hidden.view(n, self.hc_count, self.hidden_size)
 
 
@@ -217,7 +230,10 @@ class Qwen4ExpMTP(nn.Module):
         return self.model(input_ids, positions, hidden_states, inputs_embeds)
 
     def _head_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.model.hyper_connection_mixer.mix(hidden_states.flatten(1))[0]
+        mixer = self.model.hyper_connection_mixer
+        if self.model.layers[0].fused_hc:
+            return mixer.mix_fused(hidden_states.flatten(1))[0]
+        return mixer.mix(hidden_states.flatten(1))[0]
 
     def compute_logits(
         self, hidden_states: torch.Tensor, spec_step_idx: int = 0
