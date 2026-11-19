@@ -3,10 +3,11 @@
 use std::sync::Arc;
 
 use super::{
-    CacheAwareConfig, CacheAwarePolicy, DpStickyPolicy, LoadBalancingPolicy, PowerOfTwoPolicy,
-    PrefixHashConfig, PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
+    session_affinity::SessionAffinityScope, CacheAwareConfig, CacheAwarePolicy, DpStickyPolicy,
+    LoadBalancingPolicy, PowerOfTwoPolicy, PrefixHashConfig, PrefixHashPolicy, RandomPolicy,
+    RoundRobinPolicy,
 };
-use crate::config::PolicyConfig;
+use crate::config::{PolicyConfig, SessionAffinityConfig};
 
 /// Factory for creating policy instances
 pub struct PolicyFactory;
@@ -48,6 +49,23 @@ impl PolicyFactory {
         }
     }
 
+    /// Create a policy whose `dp_sticky` session table uses `affinity` and
+    /// reports `scope`. Each call gets its own table, so prefill and decode do
+    /// not share bindings.
+    pub(crate) fn create_in(
+        config: &PolicyConfig,
+        affinity: &SessionAffinityConfig,
+        scope: SessionAffinityScope,
+    ) -> Arc<dyn LoadBalancingPolicy> {
+        if matches!(config, PolicyConfig::DpSticky) {
+            return Arc::new(DpStickyPolicy::with_config(
+                dp_sticky_affinity(affinity),
+                scope,
+            ));
+        }
+        Self::create_from_config(config)
+    }
+
     /// Create a policy by name (for dynamic loading)
     pub fn create_by_name(name: &str) -> Option<Arc<dyn LoadBalancingPolicy>> {
         match name.to_lowercase().as_str() {
@@ -59,6 +77,32 @@ impl PolicyFactory {
             "prefix_hash" | "prefixhash" => Some(Arc::new(PrefixHashPolicy::with_defaults())),
             _ => None,
         }
+    }
+
+    /// [`Self::create_by_name`], with `dp_sticky` using `affinity`.
+    pub(crate) fn create_by_name_with(
+        name: &str,
+        affinity: &SessionAffinityConfig,
+    ) -> Option<Arc<dyn LoadBalancingPolicy>> {
+        match name.to_lowercase().as_str() {
+            "dp_sticky" | "dpsticky" => Some(Arc::new(DpStickyPolicy::with_config(
+                dp_sticky_affinity(affinity),
+                SessionAffinityScope::Regular,
+            ))),
+            _ => Self::create_by_name(name),
+        }
+    }
+}
+
+/// `dp_sticky` pins sessions whether or not session affinity is on. Off, it keys
+/// on `x-session-id` only, as it did before session affinity existed.
+fn dp_sticky_affinity(affinity: &SessionAffinityConfig) -> SessionAffinityConfig {
+    if affinity.is_enabled() {
+        return affinity.clone();
+    }
+    SessionAffinityConfig {
+        session_id_headers: vec!["x-session-id".to_string()],
+        ..affinity.clone()
     }
 }
 
@@ -208,6 +252,49 @@ mod tests {
                 input,
                 expected_name
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn affinity_off_keeps_dp_sticky_on_x_session_id_only() {
+        let off = SessionAffinityConfig {
+            session_id_headers: Vec::new(),
+            ..SessionAffinityConfig::default()
+        };
+        let dp_sticky =
+            PolicyFactory::create_in(&PolicyConfig::DpSticky, &off, SessionAffinityScope::Regular);
+        let workers: Vec<Arc<dyn crate::core::Worker>> = ["http://w1:8000", "http://w2:8000"]
+            .into_iter()
+            .map(|url| {
+                Arc::new(crate::core::BasicWorkerBuilder::new(url).build())
+                    as Arc<dyn crate::core::Worker>
+            })
+            .collect();
+        for (header, branch) in [
+            ("x-session-id", "new"),
+            ("x-session-affinity", "no_session"),
+        ] {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(header, "session-1".parse().unwrap());
+            let info = crate::policies::SelectWorkerInfo {
+                headers: Some(&headers),
+                ..Default::default()
+            };
+            let (_, decision) = dp_sticky.select_with_decision(&workers, &info).await;
+            assert_eq!(decision.branch, branch, "{header}");
+        }
+    }
+
+    #[test]
+    fn prefill_and_decode_tables_keep_their_scope() {
+        let affinity = SessionAffinityConfig::default();
+        for (scope, label) in [
+            (SessionAffinityScope::Prefill, "prefill"),
+            (SessionAffinityScope::Decode, "decode"),
+        ] {
+            let policy = PolicyFactory::create_in(&PolicyConfig::DpSticky, &affinity, scope);
+            let dp_sticky = policy.as_any().downcast_ref::<DpStickyPolicy>().unwrap();
+            assert_eq!(dp_sticky.scope_label(), label);
         }
     }
 }

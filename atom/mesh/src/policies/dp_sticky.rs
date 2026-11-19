@@ -8,9 +8,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use super::session_affinity::SessionAffinityPolicy;
+use super::session_affinity::{SessionAffinityPolicy, SessionAffinityScope};
 use super::{LoadBalancingPolicy, RouteDecision, SelectWorkerInfo};
-use crate::core::Worker;
+use crate::{config::SessionAffinityConfig, core::Worker};
 
 #[derive(Debug)]
 pub struct DpStickyPolicy {
@@ -19,14 +19,26 @@ pub struct DpStickyPolicy {
 
 impl DpStickyPolicy {
     pub fn new() -> Self {
+        Self::with_config(
+            SessionAffinityConfig::default(),
+            SessionAffinityScope::Regular,
+        )
+    }
+
+    pub(crate) fn with_config(config: SessionAffinityConfig, scope: SessionAffinityScope) -> Self {
         Self {
-            inner: SessionAffinityPolicy::dp_sticky(),
+            inner: SessionAffinityPolicy::dp_sticky_scoped(config, scope),
         }
     }
 
     #[cfg(test)]
     fn set_last_access(&self, key: &str, when: std::time::Instant) {
         self.inner.set_last_access(key, when);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scope_label(&self) -> &'static str {
+        self.inner.scope_label()
     }
 }
 
@@ -114,7 +126,9 @@ mod tests {
     fn expire(policy: &DpStickyPolicy, session: &str) {
         policy.set_last_access(
             session,
-            Instant::now() - Duration::from_secs(120 * 60) - Duration::from_secs(1),
+            Instant::now()
+                - Duration::from_secs(SessionAffinityConfig::default().ttl_secs)
+                - Duration::from_secs(1),
         );
     }
 

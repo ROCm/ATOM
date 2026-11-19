@@ -9,8 +9,14 @@ use tracing::{debug, info, warn};
 /// When the first worker of a new model is added, it determines the policy for that model.
 /// All subsequent workers of the same model use the established policy.
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
-use super::{CacheAwarePolicy, LoadBalancingPolicy, PolicyFactory};
-use crate::{config::types::PolicyConfig, core::Worker, kv_index::PrefixMatchProvider};
+use super::{
+    session_affinity::SessionAffinityScope, CacheAwarePolicy, LoadBalancingPolicy, PolicyFactory,
+};
+use crate::{
+    config::{PolicyConfig, SessionAffinityConfig},
+    core::Worker,
+    kv_index::PrefixMatchProvider,
+};
 
 /// Registry for managing model-to-policy mappings
 #[derive(Clone)]
@@ -23,6 +29,10 @@ pub struct PolicyRegistry {
 
     /// Default policy instance (cached, immutable after creation)
     default_policy: Arc<dyn LoadBalancingPolicy>,
+
+    /// Session table settings for every `dp_sticky` this registry creates,
+    /// including one picked by a worker hint.
+    session_affinity: SessionAffinityConfig,
 
     /// Prefill policy for PD mode (set once at startup, lock-free reads via OnceLock)
     prefill_policy: Arc<OnceLock<Arc<dyn LoadBalancingPolicy>>>,
@@ -37,9 +47,23 @@ pub struct PolicyRegistry {
 impl PolicyRegistry {
     /// Create a new PolicyRegistry with a default policy
     pub fn new(default_policy_config: PolicyConfig) -> Self {
-        let default_policy = Self::create_policy_from_config(&default_policy_config);
+        Self::with_session_affinity(default_policy_config, SessionAffinityConfig::default())
+    }
+
+    /// Create a registry whose policies share these session-affinity settings.
+    /// Each policy still gets its own session table.
+    pub fn with_session_affinity(
+        default_policy_config: PolicyConfig,
+        session_affinity: SessionAffinityConfig,
+    ) -> Self {
+        let default_policy = PolicyFactory::create_in(
+            &default_policy_config,
+            &session_affinity,
+            SessionAffinityScope::Regular,
+        );
 
         Self {
+            session_affinity,
             model_policies: Arc::new(DashMap::new()),
             model_worker_counts: Arc::new(DashMap::new()),
             default_policy,
@@ -185,15 +209,24 @@ impl PolicyRegistry {
 
     /// Create a policy from a type string (delegates to PolicyFactory)
     fn create_policy_from_type(&self, policy_type: &str) -> Arc<dyn LoadBalancingPolicy> {
-        PolicyFactory::create_by_name(policy_type).unwrap_or_else(|| {
-            warn!("Unknown policy type '{}', using default", policy_type);
-            Arc::clone(&self.default_policy)
-        })
+        PolicyFactory::create_by_name_with(policy_type, &self.session_affinity).unwrap_or_else(
+            || {
+                warn!("Unknown policy type '{}', using default", policy_type);
+                Arc::clone(&self.default_policy)
+            },
+        )
     }
 
-    /// Create a policy from a PolicyConfig (delegates to PolicyFactory)
-    fn create_policy_from_config(config: &PolicyConfig) -> Arc<dyn LoadBalancingPolicy> {
-        PolicyFactory::create_from_config(config)
+    pub fn create_prefill_policy(&self, config: &PolicyConfig) -> Arc<dyn LoadBalancingPolicy> {
+        PolicyFactory::create_in(
+            config,
+            &self.session_affinity,
+            SessionAffinityScope::Prefill,
+        )
+    }
+
+    pub fn create_decode_policy(&self, config: &PolicyConfig) -> Arc<dyn LoadBalancingPolicy> {
+        PolicyFactory::create_in(config, &self.session_affinity, SessionAffinityScope::Decode)
     }
 
     /// Get current model->policy mappings (for debugging/monitoring)
