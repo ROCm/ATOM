@@ -41,6 +41,10 @@ TPTRS = ['xh', 'hw', 'logits', 's0', 's1', 's2', 's3', 'sids', 'dids', 'outtok',
 # prow [48][8] f32 scratch.
 SOFF = 16 * 40960 * 16
 SOFF2 = SOFF + 4 * 4 * 48 * SF.UNITS * 16
+# (ctx TP) draft_ctx's main_proj exchange slots: past the sampling slots actually used (4 passes x 4 sources x ROWS rows x
+# UNITS units), before the Markov words
+assert CX.CX_OFF >= SOFF + 4 * 4 * SF.ROWS * SF.UNITS * 16 and CX.CX_OFF + CX.TPR * CX.CX_SRC <= SOFF2
+CX_TAG_LAYER = hx.LAYER_SLOTS - 1   # (ctx TP) the exchange's tag slot: past every layer's (target + draft + entries)
 HEAD_LDS = 2 * HF.geom(2, 4)[3]      # LDS the head needs (launch smem >= this)
 
 
@@ -65,7 +69,7 @@ TAIL_L2_ONE_IN = 16
 
 
 @ASTRewriter.transform
-def target(tp, t, b, sm, tc, recv, rank, head_d=4, ctx=None, T=None, kv_fp4=False, codeend=None, done=True):
+def target(tp, t, b, sm, tc, recv, rank, head_d=4, ctx=None, T=None, kv_fp4=False, codeend=None, done=True, tep=None):
     P = {k: tptr(tp, k) for k in ('xh', 'hw', 'logits', 's0', 's1', 's2', 's3', 'sids', 'dids', 'outtok', 'verdict', 'anc')}
     if fx.const_expr(codeend is not None):   # the head's and the sampling's code -> L2 (see TAIL_L2_KB)
         pc0 = hx.getpc()
@@ -83,7 +87,9 @@ def target(tp, t, b, sm, tc, recv, rank, head_d=4, ctx=None, T=None, kv_fp4=Fals
                           tptr(tp, 'prow'), P['outtok'], P['verdict'], P['anc'], tptr(tp, 'qids'), com=tptr(tp, 'tcom'))
     else:
         if fx.const_expr(ctx is not None):
-            CX.ctx_split(ctx, t, b, T, tc + i64(LY.CTX_SPLIT), SF.ROWS * SF.CPR, CX.CTAS - SF.ROWS * SF.CPR, kv_fp4)
+            # (ctx TP, with the step epoch) main_proj split over the ranks, its columns exchanged in the receive halves
+            CX.ctx_split(ctx, t, b, T, tc + i64(LY.CTX_SPLIT), SF.ROWS * SF.CPR, CX.CTAS - SF.ROWS * SF.CPR, kv_fp4,
+                         **({} if tep is None else dict(recv=recv, rank=rank, tag=hx.epoch32(tep, fx.Int32(CX_TAG_LAYER), 0))))
     # done: the verify's outputs reach the rest of this launch (one launch: the draft entry reads them); a launch that
     # ends here leaves them to stream order (the draft launch, the host's copies after its end event)
     if fx.const_expr(done):

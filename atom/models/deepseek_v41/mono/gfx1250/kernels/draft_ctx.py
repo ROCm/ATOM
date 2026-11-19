@@ -62,22 +62,26 @@ def _row_rms(vals, n):
 
 
 @ASTRewriter.transform
-def stage_hnorm(c, T):
+def stage_hnorm(c, T, tp=False):
     """a CTA a row (CTAs 0..T-1), thread g < 160 a 32-col group: its 32 values (hpref f32, bf16-rounded as the bf16 hpre
     was), the row's sum of squares (wave xor tree, then the 5 waves' partials in LDS), main_norm -> bf16 -> MXFP8 -> h8 /
-    hs. The atomic-sum columns of hpref (tiles 256..319, cols 4096..) are zeroed after the read for the next step."""
+    hs. The atomic-sum columns of hpref (tiles 256..319, cols 4096..) are zeroed after the read for the next step.
+    tp (stage_proj_tp): the 32 values are the owner rank's bf16 hpre words in this rank's receive half (_hpre_units)."""
     b, t, w, l, sm = c["b"], c["t"], c["w"], c["l"], c["sm"]
     if b < T:
         r = b
         g = fx.min(t, I32(H // 32 - 1))
         col = g * 32
         live = t < H // 32
-        hv = [hx.gload(c["hpref"] + (i64(r) * H + i64(col + 4 * k)) * 4, F32, 4) for k in range(8)]
         wv = [hx.gload(c["mnw"] + i64(col + 8 * k) * 2, BF16, 8) for k in range(4)]
-        xs = [bfr(hv[k // 4][k % 4]) for k in range(32)]
-        if live & (col >= CTAS * 16):
-            for k in range_constexpr(8):
-                hx.gstore(c["hpref"] + (i64(r) * H + i64(col + 4 * k)) * 4, fx.Vector.filled(4, 0.0, F32))
+        if fx.const_expr(tp):
+            xs = _hpre_units(c, T, r, col)
+        else:
+            hv = [hx.gload(c["hpref"] + (i64(r) * H + i64(col + 4 * k)) * 4, F32, 4) for k in range(8)]
+            xs = [bfr(hv[k // 4][k % 4]) for k in range(32)]
+            if live & (col >= CTAS * 16):
+                for k in range_constexpr(8):
+                    hx.gstore(c["hpref"] + (i64(r) * H + i64(col + 4 * k)) * 4, fx.Vector.filled(4, 0.0, F32))
         ss = F32(0.0)
         for v in xs:
             ss = ss + v * v
@@ -386,6 +390,105 @@ def ctptr(tab, name):
     return (fx.Int64(rf(v[1])) << 32) | (fx.Int64(rf(v[0])) & fx.Int64(0xFFFFFFFF))
 
 
+# (ctx TP) main_proj split by output columns over the TP ranks: rank r computes the N tiles [r CX_TILES, (r + 1) CX_TILES)
+# (each output's K sum exactly as before: a tile whole on a CTA, the 8 waves' K slices summed in LDS in wave order) and
+# pushes them, bf16 (the value stage_hnorm rounds them to), to every rank (itself included) as tagged 16-byte units:
+# unit ((tile * T + row) * 3 + j) of source slot r = columns 6 j .. 6 j + 5 of that tile row (3 words of bf16 pairs; j = 2:
+# columns 12..15, the last word padding). The slots live in each rank's receive half at CX_OFF (zeroed with the half a
+# step; tag: the step epoch's), between the sampling slots and the Markov words (tail.SOFF .. SOFF2).
+TPR = 4
+CX_TILES = H // 16 // TPR                     # 80 N tiles a rank
+CX_TMAX = 8                                   # rows a step (c1: 6)
+CX_SRC = CX_TILES * CX_TMAX * 3 * 16          # 30720 bytes a source slot
+CX_OFF = 16 * 40960 * 16 + (512 << 10)        # bytes into a receive half (tail.SOFF + 512 KB)
+CX_STAGE = 8192                               # LDS bytes: a tile's [T][16] bf16, past _lds_sum_out's partials
+
+
+def _cx_unit(base, src, tile, T, r, j):
+    return base + i64(CX_OFF) + i64(src * CX_SRC) + (i64(tile * T + r) * 3 + i64(j)) * 16
+
+
+@ASTRewriter.transform
+def poll_units(addrs, tag):
+    """The 16-byte units at addrs (tag in word 3), polled together: (bounded: POLL_TICKS; a timeout marks STOP, as
+    sample_common.poll_unit) -> their 3 data words each."""
+    n = len(addrs)
+    t0 = hx.clock()
+    bad = I32(0)
+    for i in range_constexpr(n):
+        bad = bad + (hx.gload(addrs[i] + i64(12), I32, nt=True) != tag).select(I32(1), I32(0))
+    st_ = I32(0)
+    while (bad != 0) & (hx.clock() - t0 < fx.Int64(hx.POLL_TICKS)) & (st_ == I32(0)):
+        hx.s_sleep(0)
+        st_ = hx._stop_due(st_, t0)
+        bad = I32(0)
+        for i in range_constexpr(n):
+            bad = bad + (hx.gload(addrs[i] + i64(12), I32, nt=True) != tag).select(I32(1), I32(0))
+    hx._stop_mark((bad != 0) & (st_ == I32(0)))
+    return [hx.gload(addrs[i], I32, 4, nt=True) for i in range(n)]
+
+
+def _hpre_units(c, T, r, col):
+    """Row r's bf16 hpre at columns col .. col + 31 (one owner rank: 1280 columns a rank, 32 | 1280) from the receive half
+    -> 32 f32 (exactly bfr of the owner's f32 sums)."""
+    own = col // (CX_TILES * 16)
+    t0 = (col % (CX_TILES * 16)) // 16
+    addrs = [_cx_unit(c["rmine"], own, t0 + q // 3, T, r, q % 3) for q in range(6)]
+    us = poll_units(addrs, c["cxtag"])
+    xs = []
+    for k in range(32):
+        cc = k % 16
+        wd = us[(k // 16) * 3 + cc // 6][(cc % 6) // 2]
+        xs.append(((wd << 16) if cc % 2 == 0 else (wd & I32(-65536))).bitcast(F32))
+    return xs
+
+
+@ASTRewriter.transform
+def _lds_sum_push(c, accs, MT, T, tile, tl):
+    """_lds_sum_out's wave sum of a 16-col tile (n0 = 16 tile), then its [T][16] bf16 pushed to the 4 ranks' source slot
+    of this rank (local tile tl): thread j3 < 3 T a unit (row j3 // 3, columns 6 (j3 % 3) ..)."""
+    w, l, sm, t = c["w"], c["l"], c["sm"], c["t"]
+    for mi in range_constexpr(MT):
+        o = sm + ((mi * WAVES + w) * 32 + l) * 32
+        hx.lstore(o, fx.Vector.from_elements([accs[mi][i] for i in range(4)], F32), align=16)
+        hx.lstore(o + 16, fx.Vector.from_elements([accs[mi][i] for i in range(4, 8)], F32), align=16)
+    gpu.barrier()
+    if w < MT:
+        tot = [F32(0.0)] * 8
+        for ww in range_constexpr(WAVES):
+            lo = hx.lload(sm + ((w * WAVES + ww) * 32 + l) * 32, F32, 4, align=16)
+            hi = hx.lload(sm + ((w * WAVES + ww) * 32 + l) * 32 + 16, F32, 4, align=16)
+            tot = [tot[i] + lo[i] for i in range(4)] + [tot[i + 4] + hi[i] for i in range(4)]
+        for i in range_constexpr(8):
+            r = w * 16 + (l // 16) * 8 + i
+            if r < T:
+                hx.lstore(sm + CX_STAGE + (r * 16 + l % 16) * 2, tot[i].to(BF16))
+    gpu.barrier()
+    if t < 3 * T:
+        rr = t // 3
+        j = t % 3
+        wd = hx.lload(sm + CX_STAGE + rr * 32 + j * 12, I32, 3, align=4)
+        v = fx.Vector.from_elements([wd[0], wd[1], wd[2], c["cxtag"]], I32)
+        for o in range_constexpr(TPR):
+            hx.gstore(_cx_unit(c["recv"][o], c["rank"], tl, T, rr, j), v, nt=True)
+    gpu.barrier()
+
+
+@ASTRewriter.transform
+def stage_proj_tp(c, T, nc):
+    """main_proj's N tiles of this rank (c["rank"] * CX_TILES + tl, tl < CX_TILES) on nc CTAs, tl = vb + k nc (module
+    comment above _cx_unit): each pushed to every rank (_lds_sum_push), read by stage_hnorm(tp=True) there."""
+    b, w = c["b"], c["w"]
+    MT = (T + 15) // 16
+    KS = KA // 128 // WAVES   # 15
+    for kk in range_constexpr((CX_TILES + nc - 1) // nc):
+        tl = b + kk * nc
+        if tl < CX_TILES:
+            tile = c["rank"] * CX_TILES + tl
+            accs = _gemv_part_m(c, c["aux8"], c["auxs"], KA, c["mpw"], c["mps"], tile * 16, T, w * KS, KS, MT)
+            _lds_sum_push(c, accs, MT, T, tile, tl)
+
+
 @ASTRewriter.transform
 def stage_proj_nc(c, T, nc):
     """main_proj -> hpref on nc CTAs (virtual ids c["b"] 0..nc-1): the 320 N tiles whole, tile vb + k nc, the 8 waves
@@ -415,17 +518,25 @@ def stage_wkv_nc(c, T, nc):
             _ntile_splitk(c, c["h8"], c["hs"], H, wk, wks, (task % (KVD // 16)) * 16, T, c["kvp"], KVD, d * T)
 
 
-def ctx_split(tab, t, b, T, cnt, e0, nc, kv_fp4=False):
+def ctx_split(tab, t, b, T, cnt, e0, nc, kv_fp4=False, recv=None, rank=None, tag=None):
     """The draft context KV on CTAs e0 .. e0 + nc - 1 alone (while the others sample: tail.target): main_proj -> main_norm
     -> 3 x wkv -> kv_norm / RoPE / QAT -> ring, the stages separated by nc-CTA handoffs on cnt, cnt + 4, cnt + 8 (zeroed
-    a step). The CTAs' virtual ids b - e0 take ctx_tail's roles (hnorm: a row a CTA; kvrow: a wave a (layer, row))."""
+    a step). The CTAs' virtual ids b - e0 take ctx_tail's roles (hnorm: a row a CTA; kvrow: a wave a (layer, row)).
+    recv (the 4 ranks' receive halves of this step), rank, tag: main_proj split over the ranks (stage_proj_tp: each rank's
+    columns pushed to every rank, polled by stage_hnorm -- no handoff between the two)."""
     c = {k: ctptr(tab, k) for k in CTPTRS if k != 'roff'}
     ro = ctptr(tab, 'roff')
     c.update(t=t, b=b - e0, w=t // 32, l=t % 32, sm=hx.lds_base(), roff0=hx.gload(ro, I32), roff1=hx.gload(ro + i64(4), I32),
              roff2=hx.gload(ro + i64(8), I32), kvfp4=kv_fp4)
-    stage_proj_nc(c, T, nc)
-    hx.handoff(cnt, t, False, nc)
-    stage_hnorm(c, T)
+    if recv is not None:
+        assert T <= CX_TMAX
+        c.update(recv=recv, rank=rank, rmine=recv[rank], cxtag=tag)
+        stage_proj_tp(c, T, nc)
+        stage_hnorm(c, T, tp=True)
+    else:
+        stage_proj_nc(c, T, nc)
+        hx.handoff(cnt, t, False, nc)
+        stage_hnorm(c, T)
     hx.handoff(cnt + i64(4), t, False, nc)
     stage_wkv_nc(c, T, nc)
     hx.handoff(cnt + i64(8), t, False, nc)
