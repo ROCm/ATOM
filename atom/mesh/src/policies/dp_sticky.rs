@@ -42,6 +42,9 @@ struct StickyAssignment {
     dispatched: Option<WorkerIdentity>,
     /// Why the session was last reassigned, until a request is sent.
     reassigned: Option<&'static str>,
+    /// A request of the session failed on the worker it was sent to, so the
+    /// next request, a retry included, is placed again.
+    failed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -141,7 +144,7 @@ impl DpStickyPolicy {
         if let Some(mut assignment) = self.assignments.get_mut(session_id) {
             let is_expired = now.saturating_duration_since(assignment.last_access)
                 > SESSION_REASSIGNMENT_IDLE_TIMEOUT;
-            if !is_expired {
+            if !is_expired && !assignment.failed {
                 if let Some(index) = Self::healthy_worker_for_identity(workers, &assignment.worker)
                 {
                     assignment.last_access = now;
@@ -165,6 +168,7 @@ impl DpStickyPolicy {
                     (AFFINITY_EXPIRED, assignment.dispatched.clone())
                 } else if let Some(index) =
                     Self::healthy_worker_for_identity(workers, &assignment.worker)
+                        .filter(|_| !assignment.failed)
                 {
                     assignment.last_access = now;
                     return (Some(index), AFFINITY_HIT);
@@ -184,6 +188,7 @@ impl DpStickyPolicy {
                 last_access: now,
                 dispatched,
                 reassigned: (outcome != AFFINITY_NEW).then_some(outcome),
+                failed: false,
             },
         );
         (Some(selected_index), outcome)
@@ -238,6 +243,22 @@ impl LoadBalancingPolicy for DpStickyPolicy {
             MeshMetrics::record_session_worker_change(pool, reason);
         }
         assignment.dispatched = Some(identity);
+    }
+
+    /// A failed request releases its session's binding: the next request, a
+    /// retry included, is placed again and counts as `rebind`.
+    fn on_dispatch_failed(
+        &self,
+        _pool: &'static str,
+        headers: Option<&http::HeaderMap>,
+        _worker: &Arc<dyn Worker>,
+    ) {
+        let Some(session_id) = extract_sticky_routing_key(headers) else {
+            return;
+        };
+        if let Some(mut assignment) = self.assignments.get_mut(session_id) {
+            assignment.failed = true;
+        }
     }
 
     fn name(&self) -> &'static str {
@@ -511,6 +532,33 @@ mod tests {
         assert_eq!(
             worker_changes(&handle.render()),
             [r#"mesh_session_worker_change_total{pool="prefill",reason="rank_mapping"} 1"#]
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_failure_places_the_retry_again() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let policy = DpStickyPolicy::new();
+        let workers = workers();
+        let headers = headers("session-1");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+
+        assert_eq!(route(&policy, &workers, "regular", "session-1").await, 0);
+        policy.on_dispatch_failed("regular", Some(&headers), &workers[0]);
+        // Worker 0 still counts the session, so fewest-session placement moves it.
+        let (retry, decision) = policy.select_with_decision(&workers, &info).await;
+        assert_eq!((retry, decision.branch), (Some(1), "rebind"));
+        policy.on_dispatch("regular", Some(&headers), &workers[1]);
+        assert_eq!(branch(&policy, &workers, &info).await, "hit");
+
+        assert_eq!(
+            worker_changes(&handle.render()),
+            [r#"mesh_session_worker_change_total{pool="regular",reason="rebind"} 1"#]
         );
     }
 

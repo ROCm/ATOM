@@ -146,8 +146,9 @@ to a worker (URL and DP rank) in router memory:
 - `hit`: the pinned worker is healthy and its circuit breaker admits requests;
 - `new`: first request of the session; it goes to the worker with the fewest
   live sessions, ties broken by load;
-- `rebind`: the pinned worker is unhealthy, removed or circuit-open, so the
-  session is reassigned like a new one;
+- `rebind`: the pinned worker is unhealthy, removed or circuit-open, or the
+  session's last request to it failed with a server error or no response
+  (a retry included), so the session is placed again like a new one;
 - `expired`: the session was idle for more than 120 minutes and is reassigned.
 
 With N turns per session and stable workers, the hit rate approaches

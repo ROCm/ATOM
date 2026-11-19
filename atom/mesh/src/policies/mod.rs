@@ -106,6 +106,17 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         // Default: no-op for policies that do not track sessions
     }
 
+    /// Called when a request sent to `worker` fails with a server error or
+    /// never gets a response. Client errors are not failures.
+    fn on_dispatch_failed(
+        &self,
+        _pool: &'static str,
+        _headers: Option<&http::HeaderMap>,
+        _worker: &Arc<dyn Worker>,
+    ) {
+        // Default: no-op for policies that do not track sessions
+    }
+
     /// Get policy name for metrics and debugging
     fn name(&self) -> &'static str;
 

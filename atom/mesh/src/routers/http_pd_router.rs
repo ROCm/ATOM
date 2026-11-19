@@ -1829,17 +1829,25 @@ impl PDRouter {
         worker: Arc<dyn Worker>,
         headers: Option<&HeaderMap>,
     ) -> Result<WorkerResponse, reqwest::Error> {
-        let policy = self.dispatch(&worker, headers);
-        Self::send(request, worker, policy).await
+        let (pool, policy) = self.dispatch(&worker, headers);
+        let response = Self::send(request, Arc::clone(&worker), Arc::clone(&policy)).await;
+        let failed = match &response {
+            Ok(response) => response.inner.status().is_server_error(),
+            Err(_) => true,
+        };
+        if failed {
+            policy.on_dispatch_failed(pool, headers, &worker);
+        }
+        response
     }
 
     /// Runs the dispatch hooks right before the request is sent to `worker`,
-    /// and returns the policy that owns it.
+    /// and returns the pool and the policy that owns it.
     fn dispatch(
         &self,
         worker: &Arc<dyn Worker>,
         headers: Option<&HeaderMap>,
-    ) -> Arc<dyn crate::policies::LoadBalancingPolicy> {
+    ) -> (&'static str, Arc<dyn crate::policies::LoadBalancingPolicy>) {
         let (pool, policy) = match worker.worker_type() {
             crate::core::WorkerType::Prefill { .. } => (
                 metrics_labels::WORKER_PREFILL,
@@ -1853,7 +1861,7 @@ impl PDRouter {
         // Only a request that is actually sent moves the session.
         policy.on_dispatch(pool, headers, worker);
         crate::observability::route_trace::record_dispatch(pool, worker);
-        policy
+        (pool, policy)
     }
 
     async fn send(

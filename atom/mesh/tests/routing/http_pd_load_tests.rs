@@ -709,6 +709,52 @@ async fn dispatch_hooks_wait_until_the_new_decode_receives_a_request() {
 }
 
 #[tokio::test]
+async fn a_decode_server_error_releases_the_session_binding_and_a_client_error_does_not() {
+    for kind in KINDS {
+        for (status, kept) in [
+            (StatusCode::BAD_REQUEST, true),
+            (StatusCode::SERVICE_UNAVAILABLE, false),
+        ] {
+            let policy: Arc<dyn LoadBalancingPolicy> = Arc::new(DpStickyPolicy::new());
+            let (mut p, mut a) = servers().await;
+            let b = GatedServer::start(WorkerType::Decode).await;
+            let decode = [a.worker.clone(), b.worker.clone()];
+            let mut headers = HeaderMap::new();
+            headers.insert("x-session-id", HeaderValue::from_static("session-1"));
+            let info = SelectWorkerInfo {
+                headers: Some(&headers),
+                ..Default::default()
+            };
+
+            assert_eq!(policy.select_worker(&decode, &info).await, Some(0));
+            let task = dispatch_with_policy(
+                kind,
+                &p,
+                &a,
+                false,
+                Some(headers.clone()),
+                Some(policy.clone()),
+            );
+            p.wait_entered().await;
+            p.respond(prefill_response());
+            a.wait_entered().await;
+            a.respond(status.into_response());
+            assert_eq!(result(task).await.status(), status, "{kind:?}");
+
+            // The retry or next request: a 5xx placed the session again, away
+            // from the worker that failed; a 4xx kept the binding.
+            let (selected, decision) = policy.select_with_decision(&decode, &info).await;
+            let expected = if kept {
+                (Some(0), "hit")
+            } else {
+                (Some(1), "rebind")
+            };
+            assert_eq!((selected, decision.branch), expected, "{kind:?} {status}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn decode_http_error_does_not_reacquire_prefill_load() {
     for kind in KINDS {
         let (mut p, mut d) = servers().await;
