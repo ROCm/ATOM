@@ -1527,8 +1527,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # "lmcache.mp.mp_transfer_mode" takes precedence.
     "LMCACHE_MP_TRANSFER_MODE": lambda: os.getenv("LMCACHE_MP_TRANSFER_MODE", "auto"),
     # LMCache's own chunk size, as the connector configures LMCache with it.
-    # Read on the ATOM side only by `prefix_spread`, which predicts loads with
-    # it and checks it against an LMCache MP server's chunk at registration.
+    # Read on the ATOM side only by `prefix_spread` and `share_cache`, which
+    # predict loads with it and check it against an LMCache MP server's chunk
+    # at registration.
     "LMCACHE_CHUNK_SIZE": lambda: _int_env("LMCACHE_CHUNK_SIZE", 256),
 }
 
