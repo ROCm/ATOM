@@ -2762,39 +2762,6 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
         return views
 
 
-# Graph-safe row-masking kernel for scheduled_tokens_gpu under CUDA graphs.
-# Defined at module level so Triton caches it once; the caller only provides
-# arguments. NUM_VALID is a single-element int32 tensor on device.
-try:
-    import triton
-    import triton.language as tl
-
-    @triton.jit
-    def _a16w4_mask_rows_kernel(
-        IDS_IN,
-        WTS_IN,
-        IDS_OUT,
-        WTS_OUT,
-        NUM_VALID,
-        stride_i: tl.constexpr,
-        stride_w: tl.constexpr,
-        TOPK: tl.constexpr,
-    ):
-        row = tl.program_id(0)
-        num_valid = tl.load(NUM_VALID)
-        mask = row < num_valid
-        for k in range(TOPK):
-            i_off = row * stride_i + k
-            w_off = row * stride_w + k
-            id_val = tl.load(IDS_IN + i_off)
-            wt_val = tl.load(WTS_IN + w_off)
-            tl.store(IDS_OUT + i_off, tl.where(mask, id_val, -1))
-            tl.store(WTS_OUT + w_off, tl.where(mask, wt_val, 0.0))
-
-except ImportError:
-    _a16w4_mask_rows_kernel = None
-
-
 class A16W4MoEMethod(Mxfp4MoEMethod):
     """Native MXFP4 experts over BF16 activations, with the existing TP loader."""
 
@@ -2893,29 +2860,11 @@ class A16W4MoEMethod(Mxfp4MoEMethod):
             raise RuntimeError("A16W4 requires BF16 activations and SiLU")
         from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import flydsl_a16w4_moe
 
-        ids = topk_ids.to(torch.int32).contiguous()
-        weights = topk_weights.to(torch.float32).contiguous()
-        if scheduled_tokens_gpu is not None:
-            # Graph-safe: mask invalid rows to expert -1 / weight 0 so the
-            # FlyDSL sort drops them and the output stays zero on padding.
-            rows, topk = ids.shape
-            ids_out = torch.empty_like(ids)
-            weights_out = torch.empty_like(weights)
-            assert (
-                _a16w4_mask_rows_kernel is not None
-            ), "triton is required for scheduled_tokens_gpu masking"
-            _a16w4_mask_rows_kernel[(rows,)](
-                ids,
-                weights,
-                ids_out,
-                weights_out,
-                scheduled_tokens_gpu,
-                stride_i=ids.stride(0),
-                stride_w=weights.stride(0),
-                TOPK=topk,
-            )
-            ids = ids_out
-            weights = weights_out
+        from atom.model_ops.fused_moe.a16w4_routing import prepare_a16w4_routes
+
+        ids, weights = prepare_a16w4_routes(
+            topk_ids, topk_weights, self.num_experts, scheduled_tokens_gpu
+        )
         return flydsl_a16w4_moe(
             hidden_states=x.contiguous(),
             w1=layer.w13_weight,
