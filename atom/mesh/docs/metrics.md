@@ -150,8 +150,11 @@ to a worker (URL and DP rank) in router memory:
 - `expired`: the session was idle for more than 120 minutes and is reassigned.
 
 With N turns per session and stable workers, the hit rate approaches
-(N - 1) / N. `rebind` points at worker churn; a router restart makes every
-session `new` again. Each pool that runs `dp_sticky` records its own branches.
+(N - 1) / N, and `rebind` points at worker churn. Under idx2idx a prefill pin
+holds only while decode lands on its rank: with a decode policy that does not
+follow the session, about (D - 1) / D of turns rebind, D being the decode's DP
+size. A router restart makes every session `new` again. Each pool that runs
+`dp_sticky` records its own branches.
 
 ### Worker changes
 
@@ -166,10 +169,13 @@ that moved the session; an expired session reassigned to its old worker counts
 nothing. `rank_mapping` means the pin held, but
 `--atom-pd-rank-mapping-policy idx2idx` mapped the prefill request to a
 different DP rank than the previous one. Under idx2idx the planner selects
-decode first and offers prefill the workers on the decode's rank plus those
-idx2idx does not move (no DP size, or one the decode's rank is outside), or
-every prefill when none of them is healthy. A session pinned to another rank
-is then usually re-pinned and counts as `rebind` instead. A session that moves leaves its KV
+decode first and offers prefill the workers idx2idx keeps for the decode: those
+on its rank, and those it does not move (no DP size, or one the decode's rank
+is outside). A session pinned to another rank is re-pinned and counts as
+`rebind`. Only when idx2idx would move every healthy prefill are all of them
+offered, and then the remap leaves the selected one in place, as its target on
+the decode's rank is unavailable; `rank_mapping` therefore takes a health
+change between planning and reservation. A session that moves leaves its KV
 cache on the old worker. The HTTP routers and the external-processing PD
 executor record it; gRPC routers do not.
 
@@ -202,8 +208,9 @@ every `affinity` decision and any `relocate` that happened to pick it. With
 event index, short of the block of the prompt's last token, which the engine
 always computes. The
 router drops the estimate when it sends the prompt to a different worker than
-the policy chose, such as another DP rank under
-`--atom-pd-rank-mapping-policy idx2idx`, because ranks keep separate KV caches.
+the policy chose, because DP ranks keep separate KV caches; under
+`--atom-pd-rank-mapping-policy idx2idx` that takes a health change between
+planning and reservation.
 `kind="actual"` repeats the engine count for exactly those requests, so
 `estimated` and `actual` compare like for like.
 

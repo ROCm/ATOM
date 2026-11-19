@@ -35,10 +35,10 @@ struct Position {
 /// pool's models, ext-proc's subsets, prefill narrowed to the decode's DP rank) do not
 /// skip workers by sharing one.
 ///
-/// A new set starts at a random position. A new set seen [`SWEEP_INTERVAL`] or more
-/// after the last sweep drops the sets unused since it, so the map holds the sets used
-/// in the last interval or two, however many they are; dropping one costs nothing but
-/// its place in the cycle.
+/// A new set starts at a random position. The map grows only with new sets: a new set
+/// seen [`SWEEP_INTERVAL`] or more after the last sweep drops the sets unused since it,
+/// so a set in use is kept however many there are, and a dropped one loses only its
+/// place in the cycle.
 #[derive(Debug)]
 pub struct RoundRobinPolicy {
     positions: DashMap<u64, Position>,
@@ -101,15 +101,20 @@ impl RoundRobinPolicy {
     /// Drops the sets unused since the last sweep, once the sweep interval has passed.
     fn sweep_if_due(&self) {
         let now_ms = self.created.elapsed().as_millis() as u64;
-        let due_ms =
-            self.swept_at_ms.load(Ordering::Relaxed) + self.sweep_interval.as_millis() as u64;
-        if now_ms < due_ms || self.sweeping.swap(true, Ordering::Acquire) {
+        let due = || {
+            let swept_at_ms = self.swept_at_ms.load(Ordering::Relaxed);
+            now_ms >= swept_at_ms + self.sweep_interval.as_millis() as u64
+        };
+        if !due() || self.sweeping.swap(true, Ordering::Acquire) {
             return;
         }
-        self.swept_at_ms.store(now_ms, Ordering::Relaxed);
-        let ended = self.generation.fetch_add(1, Ordering::Relaxed);
-        self.positions
-            .retain(|_, position| position.used.load(Ordering::Relaxed) >= ended);
+        // Another thread may have swept between the check and the swap.
+        if due() {
+            self.swept_at_ms.store(now_ms, Ordering::Relaxed);
+            let ended = self.generation.fetch_add(1, Ordering::Relaxed);
+            self.positions
+                .retain(|_, position| position.used.load(Ordering::Relaxed) >= ended);
+        }
         self.sweeping.store(false, Ordering::Release);
     }
 }

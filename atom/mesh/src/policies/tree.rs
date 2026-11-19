@@ -1032,7 +1032,9 @@ mod tests {
 
     #[test]
     fn test_prefix_match_among_ignores_other_tenants() {
+        // Twice, so "a"'s timestamp is above 0 should it have taken the first epoch.
         let tree = Tree::new();
+        tree.insert("hello world", "a");
         tree.insert("hello world", "a");
         tree.insert("hello there", "b");
         let matched = |text: &str, tenants: &[&str]| {
@@ -2088,10 +2090,10 @@ mod tests {
         );
     }
 
-    // ==================== Last Tenant Cache Tests ====================
+    // ==================== Shared Path Tests ====================
 
     #[test]
-    fn test_last_tenant_cache_update() {
+    fn test_match_after_another_tenant_inserts_the_same_path() {
         let tree = Tree::new();
 
         // Insert for tenant1
@@ -2104,20 +2106,17 @@ mod tests {
         // Insert for tenant2 on same path
         tree.insert("hello", "tenant2");
 
-        // Match again - should still work (cache or iteration)
+        // Match again
         let (matched, _) = tree.prefix_match("hello");
         assert_eq!(matched, "hello");
     }
 
     #[test]
-    fn test_stale_cache_after_tenant_removal() {
+    fn test_match_after_a_tenant_is_removed() {
         let tree = Tree::new();
 
         tree.insert("hello", "tenant1");
         tree.insert("hello", "tenant2");
-
-        // Access to populate cache
-        let _ = tree.prefix_match("hello");
 
         // Remove tenant1
         tree.remove_tenant("tenant1");

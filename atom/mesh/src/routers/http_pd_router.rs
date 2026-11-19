@@ -439,8 +439,8 @@ impl PDRouter {
                 "PD execution requires a pair",
             ));
         };
-        // Under idx2idx the planner already selects prefill among the workers this maps the
-        // decode to; the remap still covers a prefill selected without them.
+        // Under idx2idx the planner already selects a prefill idx2idx keeps for the decode;
+        // the remap moves one only if health changed between planning and this reservation.
         let prefill = if matches!(self.backend, BackendType::Atom) {
             self.apply_atom_pd_rank_mapping_policy(prefill, &decode)
         } else {
