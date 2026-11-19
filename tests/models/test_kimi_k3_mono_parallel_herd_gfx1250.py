@@ -83,3 +83,17 @@ def test_only_a_parallel_herd_finish_bounds_its_polls():
     assert _finish(40, parallel_herd=True, herd_poll_limit=1024).name.endswith("_ph_pl1024")
     with pytest.raises(ValueError, match="bounds its candidate polls"):
         _finish(40, herd_poll_limit=1024)
+
+
+@pytest.mark.parametrize("rows", (1, 5, 8, 10, 15, 32, 33, 40))
+def test_a_finish_without_herd_keeps_its_routing_ctas_off_the_shared_down(rows):
+    plain = fin.build_packed_finish(
+        _plan(rows),
+        gu_interleave=True,
+        include_routed=False,
+        replicated_front=True,
+        fp8_shared_down=True,
+    )
+    apart = fin.SHARED_DOWN_TASKS <= 2 * (256 - rows)
+    assert plain.name.endswith("_ra") == apart
+    assert apart == (rows <= 32)
