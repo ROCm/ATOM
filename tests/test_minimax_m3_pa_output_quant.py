@@ -105,6 +105,54 @@ def test_attention_hands_o_proj_the_fp8_pair(monkeypatch, sp):
     assert out.dtype == dtypes.fp8 and scale.shape == (3, 1)
 
 
+@pytest.mark.parametrize(
+    "sp, asked, impl_writes, want",
+    [
+        (False, True, True, True),
+        (False, True, False, False),
+        (False, False, True, False),
+        (False, False, False, False),
+        # under SP the head exchange decides, whatever the impl writes
+        (True, True, False, True),
+        (True, True, True, False),
+    ],
+)
+def test_attention_turns_the_fp8_output_on(monkeypatch, sp, asked, impl_writes, want):
+    from atom.model_ops import paged_attention as pa
+
+    class Impl(torch.nn.Module):
+        supports_output_quant = impl_writes
+
+        def __init__(self, **kw):
+            super().__init__()
+
+        @staticmethod
+        def qkv_fields(heads, kv_heads, dim, **kw):
+            return [(heads, dim), (kv_heads, dim), (kv_heads, dim)]
+
+    config = SimpleNamespace(
+        torch_dtype=torch.bfloat16,
+        compilation_config=SimpleNamespace(static_forward_context={}),
+    )
+    monkeypatch.setattr(pa, "is_plugin_mode", lambda: False)
+    monkeypatch.setattr(pa, "get_sp_world_size", lambda: 2 if sp else 1)
+    monkeypatch.setattr(pa, "get_current_atom_config", lambda: config)
+    monkeypatch.setattr(pa, "get_attn_backend", lambda family: None)
+    monkeypatch.setattr(
+        pa, "sp_fp8_attention_output_supported", lambda: not impl_writes
+    )
+    monkeypatch.setattr(pa, "get_pcp_group", lambda: None)
+    monkeypatch.setattr(pa, "head_exchange_comm", lambda group: None)
+    monkeypatch.setattr(pa, "send_columns", lambda fields, device: object())
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    attn = pa.Attention(
+        16, 128, 1.0, 2, rotary_emb=torch.nn.Identity(), prefix="L",
+        impl_cls=Impl, per_token_fp8_out=asked,
+    )  # fmt: skip
+    assert (attn.sp_columns is not None) is sp
+    assert attn.per_token_fp8_out is want
+
+
 @pytest.mark.parametrize("fp8", [False, True])
 def test_sparse_rows_hand_the_pa_the_fp8_output(monkeypatch, fp8):
     seen = {}
