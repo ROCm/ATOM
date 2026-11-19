@@ -294,10 +294,13 @@ which ships the routed experts as MXFP4.
   gate_up/down). Drop it to keep attention in native MXFP8.
 - **Fused shared expert (FSE).** The checkpoint's shared expert is MXFP8 and cannot share the
   MXFP4 MoE as is. With `ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4=1` (off by default) ATOM stages it at
-  load, re-quantizes it MXFP8 → MXFP4 and writes it into the fused slot, so the MoE runs as the
-  tuned 129-expert / top-5 MXFP4 kernel (no `no tuned FlyDSL config` warning in the log).
-  Without it the shared expert runs as its own MXFP8 MLP next to a 128-expert / top-4 MoE.
-  The fusion needs MXFP4 routed experts in the checkpoint.
+  load, re-quantizes it MXFP8 → MXFP4 and writes it into the fused slot, so the original path's
+  MoE runs as the tuned 129-expert / top-5 MXFP4 kernel (no `no tuned FlyDSL config` warning in
+  the log), on MXFP4 activations like the routed experts. Without it the shared expert runs as
+  its own MXFP8 MLP next to a 128-expert / top-4 MoE. The fusion needs MXFP4 routed experts in
+  the checkpoint, kept as shipped (an `--online_quant_config` that re-quantizes the MoE is
+  refused at load; the one below excludes it). The setting also picks mono decode's MoE kernel
+  (next bullets).
 - **DSpark, CUDA-graph captured.** See [DSpark Speculative Decoding](#dspark-speculative-decoding-minimax-m31)
   below. Expect `Draft passes warmed at [1, ..., 128] ... ['DSparkProposer._block_backbone (captured)']`.
 - **Image input.** With the checkpoint's `vision_config`, ATOM runs the vision tower natively
@@ -306,10 +309,14 @@ which ships the routed experts as MXFP4.
 - **Mono decode.** Decode steps of up to 16 rows (a DSpark verify is 8 rows a request, so up
   to 2 requests) run on the MiniMax-M3 mono kernels from layer 3 on; layers 0–2, sparse
   attention in M3.1, run on the original modules. Both shared-expert layouts are served, each
-  with its own MoE kernel: with `ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4=1` (the command below) the
-  shared expert is expert 128 of the MXFP4 table and every expert runs on MXFP8 activations
-  (a8w4, the kernel `amd/MiniMax-M3-MXFP4` runs on); without it the routed experts run on
-  MXFP4 activations (a4w4) and the shared expert on its own MXFP8 weights. The log reads
+  with its own MoE kernel, and they differ numerically:
+  - With `ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4=1` (the command below), the shared expert is expert
+    128 of the MXFP4 table. Mono runs every expert on MXFP8 activations (a8w4, the same mono
+    kernel as for `amd/MiniMax-M3-MXFP4`), where the original path quantizes them to MXFP4.
+  - Without it, mono runs the routed experts on MXFP4 activations (a4w4) and the shared
+    expert on its own MXFP8 weights, which is the original path's quantization.
+
+  The log reads
   `MiniMax-M3 mono: attention linears ptpc FP8, shared expert fused (MXFP4, a8w4)` (or
   `... shared expert MXFP8 MLP`); `ATOM_MONO_ENABLE=0` turns mono off.
 
@@ -370,7 +377,9 @@ Without speculative decoding, drop the last three flags. Notes:
 ### Accuracy Test
 
 Day-0 accuracy with the launch command above (PTPC FP8 attention, fused shared expert, DSpark
-with 7 drafts, FP8 KV and index cache, thinking on), lm-eval through the chat endpoint:
+with 7 drafts, FP8 KV and index cache, thinking on), lm-eval through the chat endpoint. This
+and the switch ablation below were measured before mono decode served M3.1, so every step ran
+the original path:
 
 | Checkpoint | GSM8K flexible / strict | AIME 2026 mean@16 | AIME 2025 mean@16 | MMMU-Pro standard / vision |
 |---|---:|---:|---:|---:|
