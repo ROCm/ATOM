@@ -94,7 +94,11 @@ def _transfer(monkeypatch, **kwargs):
         _state_shape_for_runner=lambda: (params["shape_k"], params["shape_v"]),
         _state_dtypes=lambda: (params["dtype_k"], params["dtype_v"]),
     )
-    for name in ("_decode_keep", "_checkpoint_plane_shapes"):
+    for name in (
+        "_decode_keep",
+        "_decode_image_is_conv_and_ssm",
+        "_checkpoint_plane_shapes",
+    ):
         setattr(builder, name, getattr(builder_cls, name).__get__(builder))
     return builder_cls.state_transfer(builder)
 

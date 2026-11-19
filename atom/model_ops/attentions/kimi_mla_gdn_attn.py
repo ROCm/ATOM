@@ -513,6 +513,11 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             )
         return total // layers, layers
 
+    def _decode_image_is_conv_and_ssm(self) -> bool:
+        # By the model's kpool, not this stage's planes: under PP only the
+        # stages with indexer layers hold a tail.
+        return self._kpool_size() <= 1
+
     def _checkpoint_plane_shapes(self) -> list[tuple[int, int]]:
         """KDA planes plus the partial kpool keys needed to resume exactly."""
         shapes = super()._checkpoint_plane_shapes()
