@@ -1490,6 +1490,19 @@ class SchedulerSlotTest(unittest.TestCase):
         fields.update(attrs)
         return types.SimpleNamespace(**fields)
 
+    def test_the_lookup_answers_until_the_receive_is_queued(self):
+        sched = self.make(producer=False)
+        seq = self.seq(
+            kv_transfer_params={"do_remote_prefill": True, "transfer_id": 7},
+            prompt_token_ids=[1, 2, 3],
+            state_slot=-1,
+        )
+        # Held back after the first yes (a full running set), asked again.
+        self.assertEqual(sched.get_num_new_matched_tokens(seq), (3, True))
+        self.assertEqual(sched.get_num_new_matched_tokens(seq), (3, True))
+        sched.update_state_after_alloc(seq)
+        self.assertEqual(sched.get_num_new_matched_tokens(seq), (0, False))
+
     def test_the_producer_publishes_its_state_slot(self):
         sched = self.make(producer=True)
         seq = self.seq(state_slot=6)

@@ -1989,8 +1989,9 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
         """
         params = seq.kv_transfer_params or {}
 
-        if params.get("do_remote_prefill") and not hasattr(seq, "kv_async_tagged"):
-            seq.kv_async_tagged = True
+        # Every time until `update_state_after_alloc` queues the receive: the
+        # scheduler can hold a request back after a yes (a full running set).
+        if params.get("do_remote_prefill"):
             return len(seq.prompt_token_ids), True
 
         return 0, False
