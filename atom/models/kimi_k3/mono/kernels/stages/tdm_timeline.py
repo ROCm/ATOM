@@ -42,6 +42,11 @@ HEAD_START, HEAD_POLLED, HEAD_CONV, HEAD_GATES = 96, 97, 98, 99
 HEAD_RECUR, HEAD_GATE_POLLED, HEAD_DONE, HEAD_EXCHANGED = 100, 101, 102, 103
 # Inside the gates: the gate WMMA issued (wave 0), then every wave past it.
 HEAD_GATE_MMA, HEAD_GATE_SYNC = 104, 105
+# The sliced AttnRes mix (``attn_res_sliced_gfx1250``), its last pass: its
+# rows summed (landed), each exchange's stores drained and its cluster barrier
+# passed, the scores staged, the output stores issued.
+MIX_SUMMED, MIX_DRAINED, MIX_PASSED, MIX_SCORED = 106, 107, 108, 109
+MIX_NORM_DRAINED, MIX_NORM_PASSED, MIX_STORED = 110, 111, 112
 POINTS = {
     "hw_id": HW_ID,
     "entry": ENTRY,
@@ -63,6 +68,13 @@ POINTS = {
     "head_exchanged": HEAD_EXCHANGED,
     "head_gate_mma": HEAD_GATE_MMA,
     "head_gate_sync": HEAD_GATE_SYNC,
+    "mix_summed": MIX_SUMMED,
+    "mix_drained": MIX_DRAINED,
+    "mix_passed": MIX_PASSED,
+    "mix_scored": MIX_SCORED,
+    "mix_norm_drained": MIX_NORM_DRAINED,
+    "mix_norm_passed": MIX_NORM_PASSED,
+    "mix_stored": MIX_STORED,
 }
 
 _config: tuple[int, int] | None = None
