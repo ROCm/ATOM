@@ -403,6 +403,15 @@ def test_failed_receive_is_held_only_if_a_failed_rank_started_writing(
     assert c.failed_recving == {21} and not c._pending_recv_blocks
 
 
+def test_a_success_failed_by_its_handoff_is_not_held(monkeypatch):
+    monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
+    c = consumer(2)
+    assert not c._record_write_done(21, 0, 0, 3, success=False, started_writes=False)
+    # Its writes finished; only the handoff it sent is unusable.
+    assert c._record_write_done(21, 1, 0, 3, handoff={"first_token_id": "bad"})
+    assert c.failed_recving == {21} and not c._held_failures
+
+
 @pytest.mark.parametrize("started_writes", [False, True, None])
 def test_write_done_tells_the_listener_whether_a_failed_rank_wrote(
     monkeypatch, started_writes
