@@ -637,8 +637,8 @@ pub struct IngressRouting {
     pd: bool,
     max_tokenize_bytes: usize,
     /// ATOM backends get a media chat's routing text and templated prompt
-    /// with one digest of all its media in front ([`RoutingChat::front`]);
-    /// vLLM and SGLang get only the in-place digests.
+    /// with one digest of the chat up to its last media in front
+    /// ([`RoutingChat::front`]); vLLM and SGLang get only the in-place digests.
     front_media_digest: bool,
 }
 

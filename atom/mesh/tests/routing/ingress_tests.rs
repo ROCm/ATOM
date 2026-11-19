@@ -1378,8 +1378,9 @@ fn nested_generate_media_counts_the_items_it_holds() {
     }
 }
 
-/// The routing text ATOM backends get starts with one digest of all a chat's media, in
-/// order; vLLM and SGLang get the in-place digests alone.
+/// The routing text ATOM backends get starts with one digest of the chat up to its last
+/// media ([`RoutingChat::front`]), which media order changes; vLLM and SGLang get the
+/// in-place digests alone.
 #[test]
 fn atom_routing_text_starts_with_one_digest_of_all_media() {
     let two = |first: &str, second: &str| {
@@ -1425,12 +1426,14 @@ fn atom_routing_text_starts_with_one_digest_of_all_media() {
     assert_eq!(text(&plain, true), "hi");
 }
 
-/// ATOM keys every KV block of a media prompt by all its media. Under `--backend atom`, two
-/// chats that share a text longer than `prefix_hash`'s token window and differ only in a
-/// later image URL get different `prefix_hash` keys, and `cache_aware` does not place the
-/// second by the first; the same URL gets the same key and is placed with the first. Under
-/// `--backend vllm`, whose cache keys a block by the media it covers, the image past the
-/// window leaves the key the text's, and `cache_aware` matches the shared text.
+/// ATOM keys every KV block of a media prompt by its media and the text before them
+/// ([`RoutingChat::front`]; DeepSeek-V4.1 also by the prompt's length, which the key does
+/// not see). Under `--backend atom`, two chats that share a text longer than `prefix_hash`'s
+/// token window and differ only in a later image URL get different `prefix_hash` keys, and
+/// `cache_aware` does not place the second by the first; the same URL gets the same key and
+/// is placed with the first. Under `--backend vllm`, whose cache keys a block by the media it
+/// covers, the image past the window leaves the key the text's, and `cache_aware` matches
+/// the shared text.
 #[tokio::test]
 async fn atom_keys_a_media_chat_by_all_its_media_at_the_front() {
     use crate::{
@@ -1520,6 +1523,156 @@ async fn atom_keys_a_media_chat_by_all_its_media_at_the_front() {
         } else {
             assert_eq!(keys[0], keys[1]);
             assert_eq!(branches[1], "affinity");
+        }
+    }
+}
+
+/// ATOM keys every KV block of a media prompt by its media's pixels, which an image's
+/// `detail: "low"` changes, and by their token positions, which the text before them sets.
+/// Under `--backend atom`, chats after one long system prompt that differ only in the text
+/// before the same image, in their second image or in a low `detail` get different
+/// `prefix_hash` keys and `cache_aware` places none by another; a later turn after the same
+/// images, text after the last image in its message and `detail: "auto"` keep the key and
+/// are placed with the first. Under `--backend vllm` all of them keep the system prompt's
+/// key and are placed together. DeepSeek-V4.1 also keys every block by the prompt's length,
+/// so on it that later turn shares no block, though its key is one.
+#[tokio::test]
+async fn atom_keys_a_media_chat_by_the_chat_up_to_its_last_media() {
+    use crate::{
+        config::BackendType,
+        policies::{CacheAwareConfig, CacheAwarePolicy, PrefixHashConfig, PrefixHashPolicy},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let source = qwen2_vl_tokenizer(dir.path());
+    let prefix_token_count = 64;
+    let system = json!({"role": "system", "content": "0123456789abcdef".repeat(8)});
+    let image = |url: &str| json!({"type": "image_url", "image_url": {"url": url}});
+    let user = |text: &str, images: &[serde_json::Value]| {
+        let content = [vec![json!({"type": "text", "text": text})], images.to_vec()].concat();
+        json!({"role": "user", "content": content})
+    };
+    let (a, b, c) = (
+        image("https://x/a.png"),
+        image("https://x/b.png"),
+        image("https://x/c.png"),
+    );
+    let detail = |detail: &str| json!({"type": "image_url", "image_url": {"url": "https://x/a.png", "detail": detail}});
+    let (low, auto) = (detail("low"), detail("auto"));
+    // Each chat after the first is compared with the one it names.
+    let chats = [
+        ("first", None, vec![system.clone(), user("1", &[a.clone()])]),
+        (
+            "different text",
+            Some(0),
+            vec![system.clone(), user("22", &[a.clone()])],
+        ),
+        (
+            "later turn",
+            Some(0),
+            vec![
+                system.clone(),
+                user("1", &[a.clone()]),
+                json!({"role": "assistant", "content": "3"}),
+                json!({"role": "user", "content": "4"}),
+            ],
+        ),
+        (
+            "[a,b]",
+            None,
+            vec![system.clone(), user("1", &[a.clone(), b])],
+        ),
+        (
+            "[a,c]",
+            Some(3),
+            vec![system.clone(), user("1", &[a.clone(), c])],
+        ),
+        ("detail", Some(0), vec![system.clone(), user("1", &[low])]),
+        (
+            "detail auto",
+            Some(0),
+            vec![system.clone(), user("1", &[auto])],
+        ),
+        (
+            "text after",
+            Some(0),
+            vec![
+                system.clone(),
+                json!({"role": "user", "content": [
+                    {"type": "text", "text": "1"}, a.clone(), {"type": "text", "text": "x"}]}),
+            ],
+        ),
+    ];
+    let workers: Vec<Arc<dyn Worker>> = ["http://w1:8000", "http://w2:8000"]
+        .into_iter()
+        .map(|url| Arc::new(BasicWorkerBuilder::new(url).build()) as Arc<dyn Worker>)
+        .collect();
+    for backend in [BackendType::Atom, BackendType::Vllm] {
+        let pool = PreparePoolRuntime::new(default_pool()).unwrap();
+        let config = crate::config::RouterConfig {
+            policy: crate::config::PolicyConfig::PrefixHash {
+                prefix_token_count,
+                load_factor: 1.25,
+            },
+            backend,
+            ..Default::default()
+        };
+        let app = AppContext::from_config(config, 5, pool.handle())
+            .await
+            .unwrap();
+        let tokenizer: Arc<dyn crate::tokenizer::traits::Tokenizer> =
+            Arc::new(crate::tokenizer::HuggingFaceTokenizer::from_file(&source).unwrap());
+        app.tokenizer_registry
+            .load("qwen2-vl-id", "m", &source, || async { Ok(tokenizer) })
+            .await
+            .unwrap();
+        let prefix_hash = PrefixHashPolicy::new(PrefixHashConfig {
+            prefix_token_count,
+            load_factor: 1.25,
+        });
+        let cache_aware = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.5,
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        cache_aware.init_workers(&workers);
+        let mut keys = Vec::new();
+        for (case, compared, messages) in &chats {
+            let body = json!({"model": "m", "messages": messages}).to_string();
+            let parsed = ParsedInference::parse("/v1/chat/completions", body.as_bytes()).unwrap();
+            let routing = IngressRouting::new(&app);
+            let (metadata, tokens) = app
+                .prepare_pool
+                .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
+                    routing.prepare(&parsed, ctx)
+                })
+                .await
+                .unwrap()
+                .wait()
+                .await
+                .unwrap()
+                .unwrap();
+            let tokens = tokens.unwrap();
+            assert!(tokens.len() > prefix_token_count);
+            keys.push(prefix_hash.compute_prefix_hash(&tokens));
+            let info = crate::policies::SelectWorkerInfo {
+                request_text: Some(&metadata.text),
+                ..Default::default()
+            };
+            let branch = cache_aware
+                .select_with_decision(&workers, &info)
+                .await
+                .1
+                .branch;
+            let Some(compared) = *compared else { continue };
+            let shared = backend == BackendType::Vllm
+                || matches!(*case, "later turn" | "detail auto" | "text after");
+            assert_eq!(
+                keys[compared] == keys[keys.len() - 1],
+                shared,
+                "{backend:?} {case}"
+            );
+            let placed = if shared { "affinity" } else { "relocate" };
+            assert_eq!(branch, placed, "{backend:?} {case}");
         }
     }
 }

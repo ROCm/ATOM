@@ -75,12 +75,19 @@ pub(crate) struct RoutingChat {
     /// The chat's messages with digests in place of their media; the template
     /// takes the rest of the chat from the client's request.
     pub messages: Vec<ChatMessage>,
-    /// For ATOM backends: one digest of all the chat's media, which goes before
-    /// the routing text and before the templated prompt. ATOM keys every KV
-    /// block of a media prompt by all its media, so two prompts that differ only
-    /// in an image past `prefix_hash`'s token window, or after a long shared
-    /// text, share no block. `None` for vLLM and SGLang, whose prefix caches
-    /// key a block by the media it covers, as the in-place digests do.
+    /// For ATOM backends: one digest of the chat up to and including its last
+    /// media part, with whether each image's `detail` is `"low"`, the one value
+    /// that changes its pixels; it goes before the routing text and before the
+    /// templated prompt. ATOM keys every KV block of a media prompt by its
+    /// media's pixels and token positions, so two prompts that differ only in an
+    /// image, in whether its `detail` is low or in the text before an image share
+    /// no block, however long their shared text; a later turn after the same
+    /// media keeps the digest. DeepSeek-V4.1 also keys every block by each
+    /// prompt token's type, so its prompts that differ in length after the last
+    /// media share no block though the digest is one; nor does the digest see a
+    /// URL whose image changes between requests. `None` for vLLM and SGLang,
+    /// whose prefix caches key a block by the media it covers, as the in-place
+    /// digests do.
     pub front: Option<String>,
 }
 
@@ -161,16 +168,20 @@ fn digested(message: &ChatMessage) -> ChatMessage {
     }
 }
 
+/// A message's content parts; none for text content or no content.
+fn parts(message: &ChatMessage) -> &[ContentPart] {
+    match content(message) {
+        Some(MessageContent::Parts(parts)) => parts,
+        _ => &[],
+    }
+}
+
 /// The kind and URL of each image and video part of a chat's messages.
 fn media_parts(request: &ChatCompletionRequest) -> impl Iterator<Item = (&'static str, &str)> {
     request
         .messages
         .iter()
-        .filter_map(content)
-        .flat_map(|content| match content {
-            MessageContent::Parts(parts) => parts.as_slice(),
-            MessageContent::Text(_) => &[],
-        })
+        .flat_map(parts)
         .filter_map(media_url)
 }
 
@@ -183,15 +194,41 @@ fn media_url(part: &ContentPart) -> Option<(&'static str, &str)> {
     }
 }
 
-/// One digest of all of a chat's media, in order.
-fn all_media_digest(request: &ChatCompletionRequest) -> String {
-    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
-    for (kind, url) in media_parts(request) {
-        hasher.update(kind.as_bytes());
-        hasher.update(&(url.len() as u64).to_le_bytes());
-        hasher.update(url.as_bytes());
-    }
-    format!("\u{1}media:{:016x}\u{1}", hasher.digest())
+/// See [`RoutingChat::front`]: one digest of `digested`, `request`'s messages
+/// with their media digested in place, up to and including the last media part,
+/// and of whether each image's `detail` is `"low"`, which the in-place digests
+/// leave out.
+fn front_digest(request: &ChatCompletionRequest, digested: &[ChatMessage]) -> String {
+    let (message, part) = request
+        .messages
+        .iter()
+        .enumerate()
+        .flat_map(|(m, message)| {
+            let media = parts(message).iter().enumerate();
+            media.filter_map(move |(p, part)| media_url(part).map(|_| (m, p)))
+        })
+        .last()
+        .expect("a front digest is for a chat with media");
+    let mut front = serde_json::to_value(&digested[..=message]).expect("messages serialize");
+    front[message]["content"]
+        .as_array_mut()
+        .expect("media is a content part")
+        .truncate(part + 1);
+    // Only `detail: "low"` changes an image's pixels; any other value leaves them.
+    let low_details: Vec<bool> = request
+        .messages
+        .iter()
+        .flat_map(parts)
+        .filter_map(|part| match part {
+            ContentPart::ImageUrl { image_url } => Some(image_url.detail.as_deref() == Some("low")),
+            _ => None,
+        })
+        .collect();
+    let bytes = serde_json::to_vec(&(front, low_details)).expect("JSON values serialize");
+    format!(
+        "\u{1}media:{:016x}\u{1}",
+        xxhash_rust::xxh3::xxh3_64(&bytes)
+    )
 }
 
 /// A digest marks its media's place in the routing text. Unlike a template's
@@ -422,8 +459,9 @@ impl ParsedInference {
     }
 
     /// Images, video, audio or embeddings, which the request's tokens do not show but an
-    /// engine keys KV blocks by (ATOM every block of the prompt, vLLM and SGLang
-    /// the blocks from the media part on): a chat's image and video
+    /// engine keys KV blocks by (ATOM every block of the prompt, by the media and
+    /// the text up to the last, DeepSeek-V4.1 also by the prompt's length; vLLM and
+    /// SGLang the blocks from the media part on): a chat's image and video
     /// parts; a generate request's image, video and audio items (arrays,
     /// nested as a batch's are, count the non-null items they hold, so `[]`
     /// and `[[],[]]` count none), and its `input_embeds` as one.
@@ -450,23 +488,23 @@ impl ParsedInference {
 
     /// Routing metadata with its text and, for a chat with media, its
     /// [`RoutingChat`], built once for both. `media_count` is this request's
-    /// [`Self::media_count`], counted once by the caller. With `front_digest`
+    /// [`Self::media_count`], counted once by the caller. With `with_front`
     /// (ATOM backends), the routing text starts with [`RoutingChat::front`].
     pub(crate) fn routing_metadata(
         &self,
         media_count: usize,
-        front_digest: bool,
+        with_front: bool,
     ) -> (InferenceMetadata, Option<RoutingChat>) {
         let Some(chat) = self.chat().filter(|_| media_count > 0) else {
             return (self.metadata_of(media_count, true), None);
         };
         let mut metadata = self.metadata_of(media_count, false);
-        let front = front_digest.then(|| all_media_digest(chat));
         // The routing text reads only the messages.
         let messages_only = ChatCompletionRequest {
             messages: with_media_digests(chat),
             ..Default::default()
         };
+        let front = with_front.then(|| front_digest(chat, &messages_only.messages));
         metadata.text =
             front.clone().unwrap_or_default() + &messages_only.extract_text_for_routing();
         let routed = RoutingChat {
