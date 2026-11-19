@@ -116,6 +116,32 @@ def _lw(sm, src, q, kind=F32, nw=6):
     return hx.lload(sm + HB + src * (4 * nw) + q * 4, kind)
 
 
+# (row folds) a row's CPR = 32 CTA records, record q in lane q of every wave, folded by an xor butterfly: 5 shuffle steps
+# instead of a 32-long serial chain a thread. Every lane ends with the same bits (each step adds / maxes a lane's value
+# with its partner's, commutative), so every CTA of the row and every rank fold alike.
+assert CPR == 32
+
+
+def _bf_sum(x):
+    for o in (16, 8, 4, 2, 1):
+        x = x + x.shuffle_xor(o, 32)
+    return x
+
+
+def _bf_max(x):
+    for o in (16, 8, 4, 2, 1):
+        x = fx.max(x, x.shuffle_xor(o, 32))
+    return x
+
+
+def _bf_max64(x):
+    for o in (16, 8, 4, 2, 1):
+        lo = I32(x & fx.Int64(0xFFFFFFFF)).shuffle_xor(o, 32)
+        hi = I32(x >> 32).shuffle_xor(o, 32)
+        x = fx.max(x, (fx.Int64(hi) << 32) | (fx.Int64(lo) & fx.Int64(0xFFFFFFFF)))
+    return x
+
+
 @ASTRewriter.transform
 def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank, tag0, sp, qlog, dids, prow, outtok,
                   verdict, anc, qids=None, ctxp=None, com=None):
@@ -258,26 +284,19 @@ def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank,
         hx.lstore(sm + PRB + t * 8, hx.gload(rec0 + i64(row * CPR + t) * 8, F32, 2))
         hx.lstore(sm + PRB + CPR * 8 + t * 16, hx.gload(qb + i64(t * 16), F32, 4))
     gpu.barrier()
-    mr = F32(-1e30)
-    for q in range_constexpr(CPR):
-        mr = fx.max(mr, hx.lload(sm + PRB + q * 8, F32))
-    sr = F32(0.0)
-    for q in range_constexpr(CPR):
-        sr = sr + hx.lload(sm + PRB + q * 8 + 4, F32) * expf(hx.lload(sm + PRB + q * 8, F32) - mr)
-    mqr = F32(-1e30)
-    dxr = F32(NEG)
-    for q in range_constexpr(CPR):
-        mqr = fx.max(mqr, hx.lload(sm + PRB + CPR * 8 + q * 16, F32))
-        dxr = fx.max(dxr, hx.lload(sm + PRB + CPR * 8 + q * 16 + 8, F32))
-    sqr = F32(0.0)
-    for q in range_constexpr(CPR):
-        sqr = sqr + hx.lload(sm + PRB + CPR * 8 + q * 16 + 4, F32) * expf(hx.lload(sm + PRB + CPR * 8 + q * 16, F32) - mqr)
+    lq = t % 32
+    mq_ = hx.lload(sm + PRB + lq * 8, F32)
+    mr = _bf_max(mq_)
+    sr = _bf_sum(hx.lload(sm + PRB + lq * 8 + 4, F32) * expf(mq_ - mr))
+    qm_ = hx.lload(sm + PRB + CPR * 8 + lq * 16, F32)
+    mqr = _bf_max(qm_)
+    dxr = _bf_max(hx.lload(sm + PRB + CPR * 8 + lq * 16 + 8, F32))
+    sqr = _bf_sum(hx.lload(sm + PRB + CPR * 8 + lq * 16 + 4, F32) * expf(qm_ - mqr))
     wb0 = I64MIN()
     zxr0 = F32(NEG)
     if keepall:   # the rank-row race winner and z(x_k) (P4's fold of the CTA records)
-        for q in range_constexpr(CPR):
-            wb0 = fx.max(wb0, hx.gload(rec3 + i64(row * CPR + q) * 8, fx.Int64))
-            zxr0 = fx.max(zxr0, hx.gload(rec3 + i64(ROWS * CPR * 12) + i64(row * CPR + q) * 8 + i64(4), F32))
+        wb0 = _bf_max64(hx.gload(rec3 + i64(row * CPR + lq) * 8, fx.Int64))
+        zxr0 = _bf_max(hx.gload(rec3 + i64(ROWS * CPR * 12) + i64(row * CPR + lq) * 8 + i64(4), F32))
     xchg6(recv, rank, 0, row, c, t, sm, [mr.bitcast(I32), sr.bitcast(I32), mqr.bitcast(I32), sqr.bitcast(I32),
                                           dxr.bitcast(I32), zxr0.bitcast(I32), I32(wb0 & fx.Int64(0xFFFFFFFF)),
                                           I32(wb0 >> 32), I32(0)], tag0, mid=_ctxmid(ctxp, 0))
@@ -390,13 +409,9 @@ def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank,
             hx.gstore(rec3 + i64(ROWS * CPR * 12) + i64(row * CPR + c) * 8 + i64(4), ((zxs < 0).select(zxs ^ I32(0x7FFFFFFF), zxs)).bitcast(F32))
         handoff(cnt + i64(12), t, NCT)
         # P4: rank-row winner, nucleus mass, z(x_k) -> exchange -> global (every CTA of a row, every rank)
-        wb = I64MIN()
-        znr = F32(0.0)
-        zxr = F32(NEG)
-        for q in range_constexpr(CPR):
-            wb = fx.max(wb, hx.gload(rec3 + i64(row * CPR + q) * 8, fx.Int64))
-            znr = znr + hx.gload(rec3 + i64(ROWS * CPR * 12) + i64(row * CPR + q) * 8, F32)
-            zxr = fx.max(zxr, hx.gload(rec3 + i64(ROWS * CPR * 12) + i64(row * CPR + q) * 8 + i64(4), F32))
+        wb = _bf_max64(hx.gload(rec3 + i64(row * CPR + lq) * 8, fx.Int64))
+        znr = _bf_sum(hx.gload(rec3 + i64(ROWS * CPR * 12) + i64(row * CPR + lq) * 8, F32))
+        zxr = _bf_max(hx.gload(rec3 + i64(ROWS * CPR * 12) + i64(row * CPR + lq) * 8 + i64(4), F32))
         xchg6(recv, rank, 3, row, c, t, sm, [I32(wb & fx.Int64(0xFFFFFFFF)), I32(wb >> 32), znr.bitcast(I32), zxr.bitcast(I32),
                                               I32(0), I32(0)], tag0 + 3, mid=_ctxmid(ctxp, 3))
         gb = I64MIN()
@@ -465,14 +480,10 @@ def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank,
             hx.gstore(r5 + i64(8), hx.lload(sm + 2048, fx.Int64))
             hx.gstore(r5 + i64(16), hx.lload(sm + 2056, fx.Int64))
         handoff(cnt + i64(20), t, NCT)
-        rmr = F32(0.0)
-        brr = I64MIN()
-        bpr = I64MIN()
-        for q in range_constexpr(CPR):
-            rq = rec1 + i64(row * CPR + q) * 32
-            rmr = rmr + hx.gload(rq, F32)
-            brr = fx.max(brr, hx.gload(rq + i64(8), fx.Int64))
-            bpr = fx.max(bpr, hx.gload(rq + i64(16), fx.Int64))
+        rq = rec1 + i64(row * CPR + lq) * 32
+        rmr = _bf_sum(hx.gload(rq, F32))
+        brr = _bf_max64(hx.gload(rq + i64(8), fx.Int64))
+        bpr = _bf_max64(hx.gload(rq + i64(16), fx.Int64))
         xchg6(recv, rank, 1, row, c, t, sm, [rmr.bitcast(I32), I32(brr & fx.Int64(0xFFFFFFFF)), I32(brr >> 32),
                                               I32(bpr & fx.Int64(0xFFFFFFFF)), I32(bpr >> 32), I32(0)], tag0 + 4)
         RM = F32(0.0)
