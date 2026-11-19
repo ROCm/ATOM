@@ -53,7 +53,9 @@ def head_once_r(x, wb, out, t, l, w, sm, b, D, TW, NPH):
     b = hx.opaque_s(b)
     kq = w % TW
     grp = w // TW
-    tiles = [fx.min(b * 8 + grp * TW + i, I32(NT - 1)) for i in range(TW)]
+    # the 2048 - 2020 slots past the last tile (CTAs 252..255) read real tiles mod NT (stores still guarded by tile < NT):
+    # clamped to tile NT - 1 they were 28 waves streaming the same 229 KB, the head's slowest CTAs by ~5 us every step
+    tiles = [(b * 8 + grp * TW + i) % NT for i in range(TW)]
     wt = [wb + i64(tiles[i]) * (16 * HID * 2) + i64(kq * NS) * 1024 + i64(l) * 32 for i in range(TW)]
     acc = [[fx.Vector.filled(8, 0.0, F32) for _ in range(NN)] for _ in range(TW)]
 

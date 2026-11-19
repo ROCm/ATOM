@@ -65,7 +65,7 @@ TAIL_L2_ONE_IN = 16
 
 
 @ASTRewriter.transform
-def target(tp, t, b, sm, tc, recv, rank, head_d=4, ctx=None, T=None, kv_fp4=False, codeend=None):
+def target(tp, t, b, sm, tc, recv, rank, head_d=4, ctx=None, T=None, kv_fp4=False, codeend=None, done=True):
     P = {k: tptr(tp, k) for k in ('xh', 'hw', 'logits', 's0', 's1', 's2', 's3', 'sids', 'dids', 'outtok', 'verdict', 'anc')}
     if fx.const_expr(codeend is not None):   # the head's and the sampling's code -> L2 (see TAIL_L2_KB)
         pc0 = hx.getpc()
@@ -84,7 +84,10 @@ def target(tp, t, b, sm, tc, recv, rank, head_d=4, ctx=None, T=None, kv_fp4=Fals
     else:
         if fx.const_expr(ctx is not None):
             CX.ctx_split(ctx, t, b, T, tc + i64(LY.CTX_SPLIT), SF.ROWS * SF.CPR, CX.CTAS - SF.ROWS * SF.CPR, kv_fp4)
-    handoff(tc + i64(LY.VERIFY_DONE), t, False)
+    # done: the verify's outputs reach the rest of this launch (one launch: the draft entry reads them); a launch that
+    # ends here leaves them to stream order (the draft launch, the host's copies after its end event)
+    if fx.const_expr(done):
+        handoff(tc + i64(LY.VERIFY_DONE), t, False)
 
 
 @ASTRewriter.transform

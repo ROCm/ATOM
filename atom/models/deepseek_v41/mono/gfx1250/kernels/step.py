@@ -363,7 +363,7 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
             b = hx.opaque_s(fx.block_idx.x)
             sm = hx.lds_base()
             ST.target(tp, t, b, sm, cnt + i64((NL + NDR) * LCB), recv, rank, head_d=4,
-                     ctx=_ctxtab(fp, NDR), T=TR, kv_fp4=kv_fp4, codeend=fptr(fp, "cyc") + i64(CODE_END_OFF))
+                     ctx=_ctxtab(fp, NDR), T=TR, kv_fp4=kv_fp4, codeend=fptr(fp, "cyc") + i64(CODE_END_OFF), done=False)
         if fx.const_expr(NDR > 0 and part != "target"):
             t = hx.opaque_v(fx.thread_idx.x)
             b = hx.opaque_s(fx.block_idx.x)
