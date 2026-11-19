@@ -2248,6 +2248,9 @@ start_router() {
       --kv-events --mooncake-admin-port "${ATOMESH_MOONCAKE_METRICS_PORT}"
       --prepare-queue-timeout-ms 5000 --prepare-prefix-cache-mb 4096
     )
+    if [[ -n "${ROUTER_KV_STORAGE_WEIGHT:-}" ]]; then
+      router_kv_events_args+=(--kv-storage-weight "${ROUTER_KV_STORAGE_WEIGHT}")
+    fi
   fi
   local -a router_cmd=(
     "${mesh_binary}" launch

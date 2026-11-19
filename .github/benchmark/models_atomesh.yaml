@@ -1046,6 +1046,15 @@ models:
             policy: round_robin
             prefill_policy: round_robin
 
+        # Tiered scoring: the kvev cell, with a token a prefill will load from
+        # its node's Store counted as one its device holds.
+        - <<: *glm52_agentic_mcstore_kvev_2p1d_cpp4_dcp4
+          name: glm-52-mxfp4-2p1d-cpp4-dcp4-agentic-mcstore-kvtier-1m-c72
+          display_topology: 2P1D-CPP4-DCP4-TP1-TP4-MCSTORE-KVTIER
+          router:
+            <<: *kv_events_router
+            kv_storage_weight: 1.0
+
     accuracy:
       task: gsm8k
       fewshot: 20

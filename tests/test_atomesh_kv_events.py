@@ -142,7 +142,8 @@ start_prefill prefill-rank-0 "${SERVER_PORT}"
                     ("2P1D", "MCSTORE", (72,)),
                 )
                 for concurrency in concurrencies
-            },
+            }
+            | {("2P1D-CPP4-DCP4-TP1-TP4-MCSTORE-KVTIER", (72,))},
         )
         for cell in events:
             with self.subTest(cell=cell["name"]):
@@ -164,7 +165,7 @@ start_prefill prefill-rank-0 "${SERVER_PORT}"
             for cell in self.cells
             if cell["display_topology"].startswith("2P1D-")
         }
-        self.assertEqual(set(cells), {"KVEV", "STICKY", "RR"})
+        self.assertEqual(set(cells), {"KVEV", "STICKY", "RR", "KVTIER"})
 
         def setup(cell):
             setup = {k: v for k, v in cell.items() if k not in ("id", "name")}
@@ -196,6 +197,47 @@ start_prefill prefill-rank-0 "${SERVER_PORT}"
                     [prefill_policy],
                 )
                 self.assertNotIn("--kv-events", args)
+
+    def test_the_2p1d_tier_cell_weighs_what_a_prefill_loads_from_its_store(self):
+        cells = {
+            cell["display_topology"].rsplit("-", 1)[1]: json.loads(json.dumps(cell))
+            for cell in self.cells
+            if cell["display_topology"].startswith("2P1D-")
+        }
+        tier, kvev = cells["KVTIER"], cells["KVEV"]
+        self.assertEqual(tier["service"]["router"].pop("kv_storage_weight"), 1.0)
+        for cell in (tier, kvev):
+            del cell["id"], cell["name"], cell["display_topology"]
+        self.assertEqual(tier, kvev)
+        source = (SCRIPTS / "pd_submit.sh").read_text()
+        start = source.index("python3 - <<'PY'\n") + len("python3 - <<'PY'\n")
+        exports = source[start : source.index("\nPY\n", start)]
+        result = subprocess.run(
+            [sys.executable, "-c", exports],
+            env=dict(self.env, CELL_JSON=json.dumps(self.tier_cell())),
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertIn("export ROUTER_KV_STORAGE_WEIGHT=1.0", result.stdout.splitlines())
+        for weight, want in (("1.0", ["1.0"]), ("", [])):
+            args = self.router_args(
+                self.tier_cell(),
+                ROUTER_KV_EVENTS="true",
+                ROUTER_KV_STORAGE_WEIGHT=weight,
+            )
+            self.assertEqual(
+                [args[i + 1] for i, a in enumerate(args) if a == "--kv-storage-weight"],
+                want,
+            )
+
+    def tier_cell(self):
+        return next(
+            cell
+            for cell in self.cells
+            if cell["display_topology"].endswith("-MCSTORE-KVTIER")
+        )
 
     def test_submit_exports_the_switch(self):
         source = (SCRIPTS / "pd_submit.sh").read_text()
@@ -288,7 +330,7 @@ start_mooncake_page_cache_dropper
             for cell in self.cells
             if cell["env"]["prefill"].get("MOONCAKE_STORE") == "1"
         ]
-        self.assertEqual(len(stores), 6)
+        self.assertEqual(len(stores), 7)
         for cell in stores:
             with self.subTest(cell=cell["name"]):
                 drop_for = cell["env"]["prefill"]["MOONCAKE_STORE_PAGE_CACHE_DROP_FOR"]
