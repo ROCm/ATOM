@@ -33,6 +33,7 @@ _HF = {
     "candidate_block_size": 8,
     "index_n_heads": 32,
     "index_head_dim": 128,
+    "fp4ptpc": False,
 }
 
 
@@ -160,6 +161,10 @@ def test_per_request_verify_lengths_are_served(native, schedule, ragged):
         (
             {"hf_config": SimpleNamespace(**{**_HF, "index_n_heads": 64})},
             "indexer shape",
+        ),
+        (
+            {"hf_config": SimpleNamespace(**{**_HF, "fp4ptpc": True})},
+            "FP4PTPC checkpoint's per-channel FP8 linears",
         ),
     ],
 )
@@ -431,7 +436,9 @@ def test_weight_table_is_the_loaded_tp4_shard():
         (8, "attn.wo_a.weight", (1024, 4096)),
         # 288 padded to the 128-k MXFP4 step
         (8, "ffn.experts.w13_weight", (384, 768, 2560)),
-        (8, "ffn.shared_experts.w2.weight_scale", (160, 9)),
+        # the shared expert's 288 padded by the loader to the group32 FP8 GEMM's 64-k step
+        (8, "ffn.shared_experts.w2.weight_scale", (160, 10)),
+        (8, "ffn.shared_experts.gate_up_proj.weight", (640, 5120)),
     ],
 )
 def test_weight_table_follows_the_tp_size(tp, name, shape):

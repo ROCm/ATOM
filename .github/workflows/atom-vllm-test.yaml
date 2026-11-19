@@ -11,8 +11,12 @@ on:
     types: [submitted]
 
 concurrency:
-  # Non-approval reviews must not replace a pending approval run.
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}${{ github.event_name == 'pull_request_review' && github.event.review.state != 'approved' && format('-review-{0}', github.run_id) || '' }}
+  # Non-approval reviews must not replace a pending approval run. Every label
+  # event except the one that opens the gate -- adding ci:vllm, or ci:full to
+  # a PR without ci:vllm (check_label_event in the gate script) -- gets its own
+  # group too, so an unrelated label can never cancel running heavy CI. The
+  # gate job's name repeats this test; keep both in sync with CI_GATE_LABELS.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}${{ github.event_name == 'pull_request_review' && github.event.review.state != 'approved' && format('-review-{0}', github.run_id) || '' }}${{ github.event_name == 'pull_request' && github.event.action == 'labeled' && !(github.event.label.name == 'ci:vllm' || (github.event.label.name == 'ci:full' && !contains(github.event.pull_request.labels.*.name, 'ci:vllm'))) && format('-noop-{0}', github.run_id) || '' }}
   cancel-in-progress: ${{ github.event_name != 'pull_request_review' }}
 
 env:
@@ -320,7 +324,7 @@ jobs:
           if-no-files-found: ignore
 
   atom-vllm-test-gate:
-    name: ${{ (github.event_name != 'pull_request_review' || needs.ci-gate.outputs.should_run == 'true') && 'ATOM vLLM Test Gate' || 'ATOM vLLM Test Gate not requested' }}
+    name: ${{ ((github.event_name != 'pull_request_review' && !(github.event.action == 'labeled' && !(github.event.label.name == 'ci:vllm' || (github.event.label.name == 'ci:full' && !contains(github.event.pull_request.labels.*.name, 'ci:vllm'))))) || needs.ci-gate.outputs.should_run == 'true') && 'ATOM vLLM Test Gate' || 'ATOM vLLM Test Gate not requested' }}
     if: always()
     runs-on: ubuntu-latest
     permissions:

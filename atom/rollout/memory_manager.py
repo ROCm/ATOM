@@ -163,11 +163,18 @@ class MemoryManagerMixin:
       - self.capture_cudagraph() — method
       - self.get_num_blocks() — method
 
+    and calls ``_init_memory_manager()`` before any release.
+
     A model module holding weight memory outside its parameters, or handing
     its kernels their addresses, defines ``release_weight_memory()`` and
     ``resume_weight_memory()``, called after the parameters are discarded and
     reallocated (before the graphs are recaptured).
     """
+
+    def _init_memory_manager(self) -> None:
+        # Whether a release discarded the weights' contents and no resume has
+        # allocated them again.
+        self._weights_discarded = False
 
     def _weight_memory_modules(self):
         return (m for m in self.model.modules() if hasattr(m, "resume_weight_memory"))
@@ -183,8 +190,9 @@ class MemoryManagerMixin:
         logger.debug(f"{self.label}: KV cache cleared")
         return True
 
-    def release_memory(self, tags: list[str] | None = None) -> bool:
-
+    def release_memory(self, tags: list[str] | None = None) -> dict:
+        """Release the memory *tags* name; whether the weights' contents were
+        discarded, which no resume brings back."""
         if tags is None:
             tags = ["weights", "kv_cache"]
 
@@ -210,7 +218,7 @@ class MemoryManagerMixin:
         torch.cuda.empty_cache()
 
         logger.info(f"{self.label}: GPU memory released, tags={tags}")
-        return True
+        return {"weights_discarded": self._weights_discarded}
 
     def resume_memory(self, tags: list[str] | None = None) -> bool:
 
@@ -258,13 +266,11 @@ class MemoryManagerMixin:
     def _resume_weights(self) -> None:
         if not hasattr(self, "model") or self.model is None:
             return
-        if sleep_keeps_memory_resident(self) and not getattr(
-            self, "_weights_discarded", False
-        ):
+        if sleep_keeps_memory_resident(self) and not self._weights_discarded:
             # Nothing was released, so there is nothing to restore -- and the
             # point of the option is that no parameter moves.
             return
-        if getattr(self, "_weights_discarded", False):
+        if self._weights_discarded:
             # Weights were discarded — allocate empty GPU tensors with the
             # correct shape so that weight sync (SHM or IPC) can copy_ into
             # them.  This avoids the CPU→GPU round-trip entirely.

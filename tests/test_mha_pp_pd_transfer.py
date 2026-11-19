@@ -83,6 +83,9 @@ def _producer(pages, mem, heads, partition, rank, monkeypatch):
             mc._pack_unit_layout(pages) and tuple(p.unit_spec for p in pages)
         ),
         _block_region_consumer_indices=None,
+        _slot_region_consumer_indices=None,
+        _slot_region_tp_segments=None,
+        _slot_region_tp_replicated=None,
         _unit_plans={},
         _slot_regions=[],
         _swa_block_regions=[],
@@ -95,7 +98,7 @@ def _producer(pages, mem, heads, partition, rank, monkeypatch):
         num_hidden_layers=LAYERS,
         _start_layer=sum(partition[:rank]),
         block_size=BLOCK,
-        _mla_staging=None,
+        _kv_staging=None,
         _MAX_RDMA_ENTRIES_PER_BATCH=7,
         _rdma_write=lambda target, s, d, n, *a, **k: mem.write(s, d, n) or True,
     )

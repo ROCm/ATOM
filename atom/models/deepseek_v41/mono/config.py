@@ -7,8 +7,9 @@ from atom.models.deepseek_v41.mono.kernels.dims import Dims
 from atom.mono.runtime.deployment import common_refusals, first_refusal
 from atom.utils import envs
 
-# the TP sizes the kernels are built for (``kernels.dims``): TP2 and TP4 run on
-# GPU; TP8's builds compile and fit, but the original path does not start there
+# the TP sizes the kernels are built for (``kernels.dims``); at TP8 on gfx950 the
+# shared expert's share is padded in place, 288 -> 320 (``Dims.sh_inter``,
+# ``linear.fp8_group32_k_pad_align``, until ROCm/aiter#7967)
 SUPPORTED_TP = (2, 4, 8)
 # DP attention ranks (attention TP 1, the MoE expert parallel over them,
 # ``kernels.dims``): the builds measured
@@ -40,6 +41,8 @@ def config_refusal(atom_config) -> str | None:
     keys = hf.sliding_window + hf.index_topk
     checks = [(envs.ATOM_MONO_ENABLE, "switched off")]
     checks += common_refusals(atom_config, Dims, SUPPORTED_TP, SUPPORTED_DPA) + [
+        # the kernels read the native 32x32 FP8 dense weights
+        (not hf.fp4ptpc, "an FP4PTPC checkpoint's per-channel FP8 linears"),
         (
             atom_config.kv_cache_dtype in ("bf16", "fp8"),
             f"kv cache {atom_config.kv_cache_dtype}",
