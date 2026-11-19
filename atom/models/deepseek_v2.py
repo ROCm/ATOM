@@ -646,6 +646,10 @@ def _qkv_a_rmsnorm_fp4(
 
 
 def _qkv_a_norm_fp4_supported(attn: nn.Module) -> bool:
+    # The kernel uses the standard RMSNorm rounding order. Preserve the
+    # separate RMSNorm path when model-sensitive precision is requested.
+    if envs.ATOM_USE_MODEL_SENSITIVE_RMSNORM:
+        return False
     try:
         from aiter.ops.rmsnorm import qkv_a_rmsnorm_fp4  # noqa: F401
     except ImportError:
