@@ -583,6 +583,25 @@ B1 FIRE -- \`kv_scale\` dropped on reload" \
      "diff --git a/foo.py b/foo.py" | grep -c UNREPORTED-FIRE)" "1"
 # SKILL.md:234 tells the worker `If not -> 📝 HK3`, and HK3 is UNREACHABLE_BY_DESIGN
 # rather than ALL_RULES, so the card shipped the id unrefused.
+# `_publish.first_clause` strips the `[verified]` tag before publishing, so anything the
+# tag or the emphasis hides still reaches the reader as an id-led line. ATOM#3481 used
+# bold. Main refused none of these.
+_head_forms() {  # -> how many of the decorated forms are refused
+  python3 -c '
+import sys; sys.path.insert(0, sys.argv[1]); import triage
+forms = ["**[verified] B1:** x", "**[verified]** B1: x", "`[verified]` B1: x",
+         "[verified] [B1] x", "[verified] (B1): x", "A5/B1: x", "D4 - x"]
+print(sum(1 for f in forms if triage._rule_head(f)))' "$S"
+}
+t "a rule id hidden behind a tag, emphasis or brackets is still refused" "$(_head_forms)" "7"
+_head_passes() {  # -> how many ordinary openings are left alone
+  python3 -c '
+import sys; sys.path.insert(0, sys.argv[1]); import triage
+forms = ["FP8: x", "MI300: x", "[verified] x.py:1 drops it", "The caller must hold it",
+         "[inferred] planner.rs:108 charges only on req.stream"]
+print(sum(1 for f in forms if triage._rule_head(f) is None))' "$S"
+}
+t "and an ordinary opening is left alone" "$(_head_passes)" "5"
 t "an id rules.md names but never derives is refused too" \
   "$(_card_kinds '## T
 

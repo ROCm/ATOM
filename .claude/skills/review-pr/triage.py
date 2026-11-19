@@ -2873,22 +2873,37 @@ def _claim_tokens(text):
 # front of it. Read only through _rule_head, by both the caller that registers the claim
 # and the one that refuses to ship the id, so the two cannot disagree.
 RULE_ID_HEAD = re.compile(r"[*`_ ]*([A-Z]+\d+[a-z]?)(?:-[\w-]+)?[*`_]*\s*(?::|—|–|--)")
-# `[verified]` leads most card findings and SKILL.md requires the tag, and
-# `_publish.first_clause` strips it before publishing -- so `[verified] A5: ...` ships
-# opening `A5:`, the ATOM#3481 symptom with one token in front of it. Stripped the same
-# way _publish strips it, before the id is read.
-LEADING_TAG = re.compile(r"^\s*\[[^\]]{0,60}\]\s*")
+# What can sit in front of the id: the `[verified]` tag SKILL.md requires, the emphasis
+# its own examples use, and either of those wrapped in the other. `_publish.first_clause`
+# strips the tag before publishing, so anything the tag hides still reaches the reader as
+# an id-led line -- the ATOM#3481 symptom with decoration in front of it.
+LEAD_NOISE = re.compile(r"^[\s*`_]+")
+LEAD_GROUP = re.compile(r"^[\[(]([^\])]{0,60})[\])]")
+BARE_ID = re.compile(r"^([A-Z]+\d+[a-z]?)(?:-[\w-]+)?(?:\s*[/,]\s*[A-Z]+\d+[a-z]?)*"
+                     r"[\s*`_]*(?::|—|–|--|-(?!\w))")
 
 
 def _rule_head(text):
-    """-> the rule id this finding opens with, or None.
+    """-> the rule id this finding opens with, through whatever sits in front of it.
 
     One reader for both callers -- the one that registers the claim and the one that
     refuses to ship the id -- so they cannot disagree about what counts. `FP8:`, `TP8:`,
     `MI300:` and `GPU0:` share the shape and none of them is a rule.
     """
-    m = RULE_ID_HEAD.match(LEADING_TAG.sub("", text))
-    return m.group(1) if m and m.group(1) in REFUSED_IDS else None
+    rest = text
+    for _ in range(6):                       # tag, emphasis, and one wrapped in the other
+        rest = LEAD_NOISE.sub("", rest)
+        m = BARE_ID.match(rest)
+        if m:
+            return m.group(1) if m.group(1) in REFUSED_IDS else None
+        g = LEAD_GROUP.match(rest)
+        if not g:
+            return None
+        inner = g.group(1).strip(" *`_")
+        if inner in REFUSED_IDS:             # `[B1]` is the id itself, not a tag over it
+            return inner
+        rest = rest[g.end():]
+    return None
 RULE_SET = frozenset(ALL_RULES.split())
 # Every id rules.md names, not only the derivable ones: SKILL.md:234 tells the worker
 # `If not -> 📝 HK3`, and HK3 lives in UNREACHABLE_BY_DESIGN, so the card shipped it.
