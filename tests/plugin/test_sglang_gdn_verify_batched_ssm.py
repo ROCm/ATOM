@@ -1,7 +1,8 @@
 """End-to-end coverage for the batched (non-ReplaySSM) DFLASH verify path.
 
-With MTP, TARGET_VERIFY goes through ReplaySSM by default; this path runs only
-with ``ATOM_ENABLE_REPLAYSSM=0``. Every test here forces ReplaySSM off.
+With speculative decoding (MTP, DFLASH, ...), TARGET_VERIFY goes through
+ReplaySSM by default; this path runs only with ``ATOM_ENABLE_REPLAYSSM=0``.
+Every test here forces ReplaySSM off.
 
 ``test_gdn_target_verify_batched_equiv.py`` compares the two *kernel call
 patterns in isolation. This module drives the real
@@ -213,7 +214,7 @@ def _run_once(bs: int, draft: int, slots=None, flydsl_decode: bool = False):
 
 @pytest.mark.parametrize("draft", [4, 8, 16])
 @pytest.mark.parametrize("bs", [1, 3])
-def test_default_batched_path_populates_verify_buffers(bs: int, draft: int):
+def test_batched_path_populates_verify_buffers(bs: int, draft: int):
     result = _run_once(bs, draft)
     assert result["out"].shape[0] == bs * draft
     assert result["intermediate_ssm"].shape[:2] == (bs, draft)
@@ -230,7 +231,7 @@ def test_live_state_unchanged_after_verify(draft: int):
     torch.testing.assert_close(result["ssm_live"], result["ssm_before"], rtol=0, atol=0)
 
 
-def test_default_ssm_path_uses_one_kernel_call(monkeypatch):
+def test_batched_ssm_path_uses_one_kernel_call(monkeypatch):
     import atom.plugin.sglang.attention_backend.attention_gdn as gdn_mod
 
     calls = {"n": 0}
