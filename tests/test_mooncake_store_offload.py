@@ -36,6 +36,7 @@ from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.kv_transfer.disaggregation.pp_kv_aggregator import PPKVAggregator
 from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
+    KVConnectorOutput,
     LoadOperationId,
     SaveOperationId,
     SaveSourceGroupId,
@@ -2057,6 +2058,71 @@ def _park_after_a_wait_for_blocks(cluster, scheduler_clock, store_engine, meanwh
     again = int(meanwhile != "lookups_paused")
     assert sum(1 for call in store.calls if call[0] == "exists") == asked + again
     return seq, loads[0]
+
+
+@pytest.mark.parametrize("dispatched", [False, True])
+def test_abort_pending_renewal_cancels_only_undispatched_load(
+    cluster, scheduler_clock, store_engine, dispatched
+):
+    """Abort through the real scheduler, before and after worker ownership."""
+    from concurrent.futures import Future
+
+    from atom.kv_transfer.offload.mooncake_store.renewal_gate import RenewalGate
+
+    engine, offload = store_engine.engine, store_engine.offload
+    offload._async_renew = True
+    _store_chunks(cluster, _hashes(40), range(5))
+    seq = Sequence(list(range(41)), BLOCK, sampling_params=SamplingParams())
+    engine.add(seq)
+    store_engine.withheld.on = True
+    _await_store_lookup(offload, seq)
+    engine.schedule()
+    assert offload.get_num_new_matched_tokens(seq) == (40, True)
+    scheduler_clock.now += 3.0
+    future = Future()
+    # A native renewal already running cannot be cancelled; its late result
+    # must not transfer ownership of this aborted request to a worker.
+    assert future.set_running_or_notify_cancel()
+    offload._lookup_client.renew_executor.shutdown()
+    offload._lookup_client.renew_executor = SimpleNamespace(
+        submit=lambda fn, keys: future, shutdown=lambda: None
+    )
+    offload._renew_gate = RenewalGate(
+        offload._lookup_client, clock=lambda: scheduler_clock.now
+    )
+    store_engine.withheld.on = False
+    batch, _ = engine.schedule()
+    sid = str(seq.id)
+    assert seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+    assert seq._counted_as_inflight_load
+    assert sid in offload._renew_gate.tickets
+    assert batch.connector_meta_output.requests == []
+    assert sid not in offload._active_load_operations
+    if dispatched:
+        future.set_result((5, scheduler_clock.now, scheduler_clock.now))
+        [load] = offload.build_connector_meta().requests
+        assert offload._active_load_operations[sid] == (seq, load.load_operation)
+
+    assert engine.abort_request(seq.id)
+    assert seq.status == SequenceStatus.FINISHED
+    if dispatched:
+        # Submitted DMA still owns the reservation until an exact terminal.
+        assert seq._counted_as_inflight_load
+        assert seq._awaiting_aborted_load_cleanup
+        assert seq.block_table
+        engine._update_from_kv_xfer_finished(
+            KVConnectorOutput(failed_loading={load.load_operation})
+        )
+    else:
+        future.set_result((5, scheduler_clock.now, scheduler_clock.now))
+    assert offload.build_connector_meta().requests == []
+    assert sid not in offload._reqs_need_recv
+    assert sid not in offload._load_specs
+    assert sid not in offload._renew_gate.tickets
+    assert not seq._counted_as_inflight_load
+    assert not seq.block_table
+    assert engine._num_parked_remote_kv == 0
+    assert sid not in offload._active_load_operations
 
 
 @pytest.mark.parametrize(
