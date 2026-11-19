@@ -1243,6 +1243,9 @@ class KimiKDAAttention(nn.Module):
         # Wrappers/subclasses and other geometries have no measured crossover.
         return (
             type(self) is __class__
+            # Child post-load hooks may quantize the fused BF16 weight later.
+            and effective_layer_quant(self.in_proj.quant_config, self.in_proj.prefix)[0]
+            == QuantType.No
             and self.tp_size == 8
             and self.hidden_size == 7168
             and self.local_proj_size == 1536

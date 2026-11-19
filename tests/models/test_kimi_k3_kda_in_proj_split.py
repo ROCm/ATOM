@@ -37,6 +37,11 @@ def modules():
         ({"shape": (6285, 7168)}, "gfx950", False),
         ({"shape": (6284, 4096)}, "gfx950", False),
         ({"glm": True}, "gfx950", False),
+        ({"online_type": "No"}, "gfx950", True),
+        ({"online_type": "per_Tensor"}, "gfx950", False),
+        ({"online_type": "per_Token"}, "gfx950", False),
+        ({"online_type": "per_1x128"}, "gfx950", False),
+        ({"online_type": "per_1x32"}, "gfx950", False),
     ],
 )
 def test_only_measured_native_geometry_is_supported(
@@ -57,12 +62,35 @@ def test_only_measured_native_geometry_is_supported(
         "head_dim": 128,
     }.items():
         setattr(attn, name, override.get(name, value))
+    # Parent KDA fuses BF16 before the child can apply its online target.
+    quant_config = None
+    prefix = "layers.0.self_attn.in_proj"
+    if "online_type" in override:
+
+        def layer_config(name, use_online_quant=False):
+            assert name == prefix
+            return SimpleNamespace(
+                quant_type=(
+                    getattr(modules.kimi.QuantType, override["online_type"])
+                    if use_online_quant
+                    else modules.kimi.QuantType.No
+                ),
+                quant_dtype=(
+                    modules.kimi.dtypes.fp8 if use_online_quant else torch.bfloat16
+                ),
+            )
+
+        quant_config = SimpleNamespace(
+            online_quant=True, get_layer_quant_config=layer_config
+        )
     # Metadata only: no production-sized weights or device allocation.
     attn.in_proj = SimpleNamespace(
+        quant_config=quant_config,
+        prefix=prefix,
         weight=SimpleNamespace(
             dtype=override.get("dtype", torch.bfloat16),
             shape=override.get("shape", (6284, 7168)),
-        )
+        ),
     )
     monkeypatch.setattr(modules.chip, "get_gfx_runtime", lambda: arch)
     # Plugin construction temporarily rebinds this module symbol.
