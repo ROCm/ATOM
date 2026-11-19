@@ -141,7 +141,7 @@ fail() {  # <class> <exit-code> <message...>
   exit "$code"
 }
 
-# Fail fast if check_prompts.py refuses. Drift is three of its sixteen checks; the rest
+# Fail fast if check_prompts.py refuses. Drift is two of its sixteen checks; the rest
 # are fail classes, the run budget, the OWNERS wiring, the gate's identity exclusions,
 # the runner label, _publish.py's permission closure and the citation gating. Reporting
 # every one of them as "prompts drifted" -- with the output that named the real one sent
@@ -151,7 +151,11 @@ fail() {  # <class> <exit-code> <message...>
 # >>> prompt-gate (selftest extracts and runs this block verbatim)
 _cp_out="$(python3 "$SKILL/check_prompts.py" 2>&1)" || {
   printf '%s\n' "$_cp_out" >&2
-  fail flow 4 "check_prompts.py refused: $(printf '%s' "$_cp_out" | grep -m3 '^❌' | tr '\n' ';' | sed 's/;$//')"
+  _why="$(printf '%s' "$_cp_out" | grep -m3 '^❌' | tr '\n' ';' | sed 's/;$//')"
+  # A crash prints a traceback and no ❌ at all, and an empty reason is the problem this
+  # block exists to remove. Fall back to the last line it did print.
+  [ -n "$_why" ] || _why="$(printf '%s' "$_cp_out" | grep -v '^$' | tail -1)"
+  fail flow 4 "check_prompts.py refused: ${_why:-no output; run it by hand}"
 }
 # <<< prompt-gate
 

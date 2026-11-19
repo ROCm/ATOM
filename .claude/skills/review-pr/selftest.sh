@@ -439,7 +439,7 @@ t "a card that softens BEYOND ONE PASS is refused" \
 t "a card carrying the measured coverage passes" \
   "$(_cov_gate "$_SMALL" 'Coverage: 5 files / 49 added lines -- within one review pass')" "ok"
 # The label alone, with nothing after the colon, is not a verdict.
-# check_prompts.py runs sixteen checks and only three are drift. run_one reported every
+# check_prompts.py runs sixteen checks and only two are drift. run_one reported every
 # refusal as "prompts drifted" and sent the output that named the real one to /dev/null,
 # so the owner was told to regenerate files that were fine. aiter#8255's review aborted
 # that way on 2026-11-19 against prompts that matched SKILL.md verbatim.
@@ -455,6 +455,20 @@ _flow_msg() {  # <python snippet that makes check_prompts fail> -> what run_one 
   SKILL="$d" bash -c "fail(){ printf '%s\n' \"\$3\"; exit \"\$2\"; }
 $blk" 2>/dev/null
 }
+# A crash prints a traceback and no ❌ at all. An empty reason is the very thing this
+# block exists to remove, so it falls back to the last line check_prompts did print.
+_flow_raw() {  # <python body for a stand-in check_prompts> -> what run_one would say
+  d=$(mktemp -d); printf '%s\n' "$1" > "$d/check_prompts.py"
+  blk=$(sed -n '/# >>> prompt-gate/,/# <<< prompt-gate/p' "$S/run_one.sh")
+  SKILL="$d" bash -c "fail(){ printf '%s\n' \"\$3\"; exit \"\$2\"; }
+$blk" 2>/dev/null
+}
+t "a crash with a message reports the message" \
+  "$(_flow_raw 'import sys
+print("Traceback: boom", file=sys.stderr)
+raise SystemExit(1)' | grep -c 'Traceback: boom')" "1"
+t "and a crash with no output still says something" \
+  "$(_flow_raw 'raise SystemExit(7)' | grep -c 'run it by hand')" "1"
 t "a drifted prompt is reported as drift" \
   "$(_flow_msg '
 import pathlib,sys
