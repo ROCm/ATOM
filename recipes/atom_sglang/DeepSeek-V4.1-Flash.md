@@ -9,17 +9,16 @@ which needs an aiter with ROCm/aiter#7820: without it the per-token FP8 MoE take
 the experts' SwiGLU clamp. Native ATOM has the same requirement. ATOM's V4.1 code also imports aiter's
 `get_mla_sparse_prefill_v41_backend` (ROCm/aiter#7407) and, to build the DSpark draft's block-32 FP8 linears,
 `gemm_a8w8_blockscale_group32_supported` (ROCm/aiter#8086); without #8086 the draft fails to build with an
-ImportError. All three are merged, but aiter main does not run this model yet (checked at ca7cfa1c3, 2026-11-18):
-ROCm/aiter#7361, merged before #7820, makes `fused_moe` raise `NotImplementedError: fused_moe cannot apply
-swiglu_limit=10.0 for QuantType.per_Token SiLU at inter_dim=576; the runtime-limit CK stage1 needs a multiple of 128`
-(TP4 gives the routed experts inter_dim 576) before it reaches #7820's gfx942 FlyDSL path, so the plugin and native
-ATOM both fail at the first MoE call (CUDA graph capture or warm-up). Until aiter main raises that error only when the
-FlyDSL path is not taken, use the validated aiter: the #7820 head 7bec3c672 (aiter main 13b6e87ce plus #7820) with
-#8086's `gemm_a8w8_blockscale_group32_supported` added to `aiter/ops/gemm_op_a8w8.py` (on gfx942 it returns False and
-those linears take the BF16 fallback). aiter main ca7cfa1c3 with only that check deferred selects the same MoE kernels
-and gives the same acceptance, accuracy and speed (see Measured). ROCm/aiter#8178, merged on 2026-11-18 as a53213dc4
-(the AITER PR 3102's recipe pins at 85999b8b4), moves that check after the gfx942 FlyDSL path; the plugin has not been
-run on it yet.
+ImportError. Since ATOM #2914 (in ATOM main), ATOM's sampler, which the DSpark
+speculative config loads, also imports aiter's `fused_mixed_sample` (ROCm/aiter#7416). All four are in aiter main.
+aiter main between ROCm/aiter#7361 and ROCm/aiter#8178 (merged on 2026-11-18 as a53213dc4) does not run this model:
+#7361 makes `fused_moe` raise `NotImplementedError: fused_moe cannot apply swiglu_limit=10.0 for QuantType.per_Token
+SiLU at inter_dim=576; the runtime-limit CK stage1 needs a multiple of 128` (TP4 gives the routed experts inter_dim
+576) before it reaches #7820's gfx942 FlyDSL path, so the plugin and native ATOM both fail at the first MoE call.
+#8178 moves that check after the FlyDSL path. On ATOM main 765d5c45a the plugin was validated with aiter main
+5385051a5 plus that check deferred (#8178 has the same effect upstream) and two gfx942 tuned-config files (mHC and M=1 BF16
+GEMM rows; performance only). aiter a53213dc4 or later, which native ATOM's DeepSeek-V4.1-Flash recipe pins, should
+need no patch; the plugin has not been run on it yet.
 
 ## Launching Server
 
@@ -168,7 +167,8 @@ Between two decode graphs the plugin now does two things the way native ATOM doe
   destination receives the same bytes. Kill switch: `ATOM_SGLANG_V41_PACKED_H2D=0`.
 
 Measured on MI308X TP4 on 3102 at 483d8feae (aiter main 5385051a5 with #7361's check deferred and gfx942 tuned
-configs; 3 fresh sessions per arm in alternating order, paired 95% CI, 2026-11-19), not re-measured on 85999b8b4.
+configs; 3 fresh sessions per arm in alternating order, paired 95% CI, 2026-11-19). On main 765d5c45a (one
+session per arm) the gap is +18 us at concurrency 1 and +21 us at 2.
 Without speculation and radix (`--context-length 67584`), median ITL plugin minus native ATOM on 4096-token prompts
 goes from +57 us to -1 us [-17, +15] at concurrency 1 and from +144 us to +14 us [-5, +34] at 2; at 63488 tokens
 +106 / +124 us remain, from aiter's indexer top-k on gfx942, not the plugin. With the launch above (DSpark K=5 + radix,
@@ -200,11 +200,15 @@ validated aiter above, the launch above, 4 fresh plugin servers (2 with and 2 wi
 122.2 s); acceptance 49.43-49.58% at 32 and 49.19-49.63% at 64, accept length 3.46-3.48 (native 49.57% and 49.48%)
 on the same prompts (|z| <= 0.43 at 32 and <= 0.94 at 64); lm_eval GSM8K 3-shot 0.922-0.923 on every plugin server; radix-hit TTFT
 (4105-token prompt, 3840 tokens cached, 12 pairs per prompt set, 2 sets per server) 97-128 ms per set, 108 ms mean
-(native 105-107 ms); first-wave TTFT at 64 clients on a fresh server 1.34-1.39 s (native 1.45 s). PR 3102 has since
+(native 105-107 ms); first-wave TTFT at 64 clients on a fresh server 1.34-1.39 s (native 1.45 s). PR 3102 then
 moved to 85999b8b4 (FP4PTPC review fixes: V4.1 now refuses an FP4PTPC layer whose shared expert did not fuse into the
 converted routed experts, and a draft whose routed experts are not converted; the plugin's gfx942 default converts
-them, for an FP4PTPC checkpoint only). On 85999b8b4 the plugin is checked by its unit tests only (CPU); the numbers
-in this recipe have not been re-measured on GPU there yet.
+them, for an FP4PTPC checkpoint only) and was merged into ATOM main as 765d5c45a with the same content. On main
+765d5c45a (aiter as validated above, one fresh server per arm, 2026-11-19): lm_eval GSM8K 3-shot 0.9227 (native
+0.9257, McNemar p = 0.69); acceptance on the same 1319 prompts at concurrency 32 49.41%, accept length 3.471 (native
+49.36%, z = +0.15); wall 150.5 s (native 155.6 s); verify and draft graphs in every round. The tables below are from
+PR 3102 head fc0acaf6b; the re-checks above, the greedy draft and the decode step tail from 483d8feae (the core-pinning
+numbers from 2026-11-18, before 85999b8b4).
 
 TP4 MI308X, SGLang 0.5.22, DSpark block 5 + radix cache
 + overlap + decode / verify / draft CUDA graphs + prefill token graphs, real DSpark acceptance (49-50% on GSM8K, accept
@@ -295,7 +299,7 @@ requests draft the same tokens up to numerics. Measured on MI308X TP4 (DSpark K=
 server per session, 4 sessions each way): on 4k-token prompts with 512 output tokens a decode round is 2.7% shorter at
 c1, 1.6% at c8 and 1.0% at c32, which leaves the plugin's round 0.7% / 1.6% / 0.1% above native ATOM's instead of
 3.4% / 3.3% / 1.1%. On GSM8K (1319 prompts, real acceptance, 6 fresh sessions each way, measured on 3102 at
-483d8feae) the greedy draft shortens wall time by 1.05% (95% CI 0.08-2.03%) at concurrency 32, 152.7 s against 154.3 s,
+483d8feae with aiter main 5385051a5, #7361's check deferred and gfx942 tuned configs) the greedy draft shortens wall time by 1.05% (95% CI 0.08-2.03%) at concurrency 32, 152.7 s against 154.3 s,
 and by 1.28% (0.18-2.38%) at 64, 109.5 s against 110.9 s; acceptance (49.47% with it, 49.43% without, native 49.43%)
 and lm_eval GSM8K 3-shot (0.9200 and 0.9218, difference -0.19%, CI -0.93% to +0.54%) are unchanged.
 
