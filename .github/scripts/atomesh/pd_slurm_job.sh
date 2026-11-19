@@ -198,24 +198,24 @@ start_vllm_router() {
   local -a mode_args=(--kv-connector moriio --vllm-discovery-address "0.0.0.0:${discovery_port}")
   (( $# )) && mode_args=(--kv-connector mooncake "$@")
 
+  local -a router_command=(vllm-router --vllm-pd-disaggregation "${mode_args[@]}")
+  if [[ "${ATOMESH_ENV_ATOMESH_VLLM_ROUTER_BACKEND:-}" == atomesh ]]; then
+    (( $# )) || { echo "ERROR: ATOMesh requires healthy Mooncake static workers" >&2; return 2; }
+    router_command=(atomesh launch --backend vllm --pd-disaggregation "$@")
+  fi
+  router_command+=(--host 0.0.0.0 --port "${port}" --policy "${ROUTER_POLICY}"
+    --prefill-policy "${ROUTER_POLICY}" --decode-policy "${ROUTER_POLICY}"
+    --prometheus-port "$((port + 10000))" --log-level info)
   bounded_docker_rm "${container}"
   docker pull "${image}" || return $?
+  docker image inspect --format '{{json .RepoDigests}} {{json .Config.Labels}}' "${image}" > "${log_file}.image.json"
+  docker run --rm --network none --entrypoint "${router_command[0]}" "${image}" --version > "${log_file}.version.txt" 2>&1 || return $?
   echo "[router] ${container} port=${port} ${mode_args[*]} log=${log_file}"
   docker run -d --name "${container}" \
     --user "$(id -u):$(id -g)" \
     --network host \
     --ulimit nofile=1048576:1048576 \
-    "${image}" \
-    vllm-router \
-    --vllm-pd-disaggregation \
-    "${mode_args[@]}" \
-    --host 0.0.0.0 \
-    --port "${port}" \
-    --policy "${ROUTER_POLICY}" \
-    --prefill-policy "${ROUTER_POLICY}" \
-    --decode-policy "${ROUTER_POLICY}" \
-    --prometheus-port "$((port + 10000))" \
-    --log-level info >/dev/null || return $?
+    --entrypoint "${router_command[0]}" "${image}" "${router_command[@]:1}" >/dev/null || return $?
   docker logs -f "${container}" > "${log_file}" 2>&1 &
   # Detached docker run only acknowledges container creation. A different
   # listener can answer HTTP after this router exits with AddrInUse, so check

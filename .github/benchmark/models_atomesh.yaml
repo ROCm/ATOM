@@ -17326,3 +17326,90 @@ models:
             common:
               ATOMESH_M31_VLLM_SHA: 0f1fbe69071cf155e64468849186d808d0bc4141
               ATOMESH_M31_D_MAX_SEQS: "12"
+
+
+  MiniMax-M3.1-Flash-SA-ATOMesh:
+    backend: vllm
+    model_path: /share_nfs/models/amd/.hf-vllm-m31/models--amd--MiniMax-M3.1-Flash-Quark-MXFP4/snapshots/1442d09d4926cb286fa2dc6646c83c4af2b3898c
+    precision: MXFP4
+    image: vllm/vllm-openai-rocm:minimax-m31-flash-75bc8cf1@sha256:f8e8ab239e5edb7c3070c5802fc7fc0cbb889513bf81183dfc98ce1c77e1dfe1
+    vllm:
+      served_model_name: MiniMaxAI/MiniMax-M3.1-Flash
+      router:
+        image: rocm/atom-dev:nightly_202611110332@sha256:19712185deac1eca8db5f21bc25ff2f9a3f44758bfd7cec8cc1c7889fbea097d
+        discovery_port: 36367
+    service:
+      prefill:
+        port: 8100
+        tp: 4
+      decode:
+        port: 8200
+        tp: 4
+      router:
+        port: 8000
+        policy: dp_sticky
+    env:
+      common:
+        ATOMESH_M31_MORIIO: '1'
+        ATOMESH_M31_VLLM_REPO: https://github.com/vllm-project/vllm.git
+        ATOMESH_M31_VLLM_SHA: 4fab5a07475822c6eaa971dceb2e2220d0446808
+        ATOMESH_M31_VLLM_BASE_SHA: 4fab5a07475822c6eaa971dceb2e2220d0446808
+        ATOMESH_M31_AGENTX_VERSION: 1.0.12
+        ATOMESH_M31_P_CPU_OFFLOAD_BYTES: '1349000000000'
+        ATOMESH_PRE_CLEAN_GPU: '0'
+        ATOMESH_PRE_CLEAN_CELL_PREFIX: ''
+        ATOMESH_PRE_CLEAN_ALL: '0'
+        ROCPROFILER_REGISTER_ENABLED: '0'
+        MORI_IO_SQ_BACKOFF_TIMEOUT_US: '1000000'
+        ATOMESH_DECODE_START_STAGGER_S: '120'
+        MORI_IO_QP_MAX_SEND_WR: '16384'
+        MORI_IO_QP_MAX_CQE: '32768'
+        MORI_IO_QP_MAX_SGE: '2'
+        MORI_IO_TC_DISABLE: '0'
+        MORI_RDMA_TC: '104'
+        ATOMESH_M31_EXTRA_ENV: VLLM_USE_BREAKABLE_CUDAGRAPH=1 DEBUG_HIP_IGNORE_STREAM_PRIORITY=0
+          PYTHONHASHSEED=0
+        ATOMESH_M31_D_MAX_SEQS: '5'
+        ATOMESH_M31_P_DBO: '1'
+        ATOMESH_M31_CONNECTOR: mooncake
+        MC_GID_INDEX: '1'
+        MC_IB_TC: '104'
+        MC_MAX_CONCURRENT_REG_MR: '1'
+        VLLM_MOONCAKE_CONNECTOR_TIMEOUT: '600'
+        ATOMESH_M31_EXTRA_ARGS: --renderer-num-workers 8 --enable-prompt-tokens-details
+          --enable-batch-sharded-sampling
+        ATOMESH_M31_P_EXTRA_ARGS: --compilation-config {"max_cudagraph_capture_size":2048}
+        ATOMESH_M31_P_CPU_LRU_EVICTION: 'true'
+        ATOMESH_M31_IMAGE_ONLY: '1'
+        ATOMESH_VLLM_ROUTER_BACKEND: atomesh
+        AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID: 'true'
+    suites:
+      vllm:
+      - name: sa-atomesh-vllm-mooncake-c40
+        topology: 1p2d
+        pd_worker_layout: decode_single_node
+        nodes: []
+        isl:
+        - 1048576
+        osl: 1024
+        concurrency:
+        - 40
+        prefill:
+          workers: 1
+          tp: 4
+        decode:
+          workers: 2
+          tp: 4
+        run_eval: false
+        benchmark:
+          kind: aiperf_agentic
+          benchmark_duration: 900
+          wait_server_timeout: 7200
+          wait_router_timeout: 600
+        image: vllm/vllm-openai-rocm:minimax-m31-flash-75bc8cf1@sha256:f8e8ab239e5edb7c3070c5802fc7fc0cbb889513bf81183dfc98ce1c77e1dfe1
+        runner:
+          time_limit: 04:00:00
+          slurm_account: amd-atom
+          slurm_partition: amd-spur
+          slurm_qos: amd-atom-qos
+          slurm_submit_runner: atomesh-cicd

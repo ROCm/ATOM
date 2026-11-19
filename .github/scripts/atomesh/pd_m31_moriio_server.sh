@@ -104,7 +104,24 @@ print(f"[m31] overlay {stack['overlay_counts']} on {vllm.__version__}; stack {ou
 PY
 }
 
-m31_overlay || exit $?
+if [[ "${ATOMESH_M31_IMAGE_ONLY:-0}" == "1" ]]; then
+  python3 - "${RUN_DIR}/m31-stack-rank-${NODE_RANK}.json" <<'PY' || exit $?
+import hashlib, importlib.metadata, inspect, json, pathlib, sys
+import vllm
+from mooncake.engine import TransferEngine
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import MooncakeConnector
+path=pathlib.Path(inspect.getfile(MooncakeConnector))
+versions={}
+for name in ("vllm", "torch", "mori", "mooncake-transfer-engine-rocm"):
+    try:
+        versions[name]=importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        versions[name]=None
+pathlib.Path(sys.argv[1]).write_text(json.dumps({"source_overlay":False,"vllm_file":vllm.__file__,"distributions":versions,"mooncake_connector_file":str(path),"mooncake_connector_sha256":hashlib.sha256(path.read_bytes()).hexdigest()},indent=2))
+PY
+else
+  m31_overlay || exit $?
+fi
 
 # m31_moriio ROLE HTTP_PORT HANDSHAKE_PORT NOTIFY_PORT: TP rank r listens on handshake/notify base+r.
 # One QP per transfer overflows its 16384-WR send queue on a ~230K-token prompt at C64 (SQ full).
@@ -233,9 +250,22 @@ run_aiperf_agentic_benchmark() {
 
   quote "${argv[@]}" > "${out}/benchmark_command.txt"
   m31_scrape "${out}" before
+  if [[ "${ATOMESH_VLLM_ROUTER_BACKEND:-}" == atomesh ]]; then
+    curl -fsS "http://127.0.0.1:${ROUTER_PORT}/workers" > "${out}/router-workers-before.json" || return $?
+    python3 - "${out}/router-workers-before.json" "${#prefill_ips[@]}" "${#decode_ips[@]}" <<'PY' || return $?
+import json, sys
+record=json.load(open(sys.argv[1]))
+assert record['stats']['prefill_count'] == int(sys.argv[2]), record
+assert record['stats']['decode_count'] == int(sys.argv[3]), record
+PY
+  fi
   rc=0
   AIPERF_HTTP_TCP_USER_TIMEOUT=900000 "${argv[@]}" 2>&1 | tee "${out}/benchmark.log" || rc=$?
   m31_scrape "${out}" final
+  if [[ "${ATOMESH_VLLM_ROUTER_BACKEND:-}" == atomesh ]]; then
+    curl -fsS "http://127.0.0.1:${ROUTER_PORT}/workers" > "${out}/router-workers-final.json" || true
+    curl -fsS "http://127.0.0.1:$((ROUTER_PORT + 10000))/metrics" > "${out}/router-metrics-final.txt" || true
+  fi
 
   aiperf_json="$(find "${out}/aiperf_artifacts" -maxdepth 2 -name profile_export_aiperf.json -print -quit)"
   [[ -n "${aiperf_json}" ]] || { echo "[aiperf][FAIL] profile_export_aiperf.json was not produced" >&2; return 1; }
