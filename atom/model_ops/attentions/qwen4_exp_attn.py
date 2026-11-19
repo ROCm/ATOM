@@ -193,6 +193,8 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
     """GDN hybrid plus the QSA side caches and the PLE state."""
 
     BACKEND = Qwen4ExpBackend
+    # Whether any bound GDN layer runs FlyDSL prefill; set at cache binding.
+    _flydsl_prefill_enabled = False
 
     @cached_property
     def _gdn_flydsl_policies(self) -> dict:
@@ -230,9 +232,7 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             attention = module.impl
             policy = self._gdn_flydsl_policies[module]
             attention.gdn_flydsl_policy = policy
-            self._flydsl_prefill_enabled = (
-                getattr(self, "_flydsl_prefill_enabled", False) or policy.prefill
-            )
+            self._flydsl_prefill_enabled |= policy.prefill
             if policy.decode:
                 # Physical VK storage, exposed as a logical KV view. This is
                 # zero-copy and preserves all gather/scatter/fork interfaces.
@@ -790,11 +790,7 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             return
         num_reqs = batch.total_seqs_num_prefill
         query_lens = np.asarray(batch.num_scheduled_tokens[:num_reqs], dtype=np.int64)
-        if (
-            attn_metadata.gdn_metadata is not None
-            and getattr(self, "_flydsl_prefill_enabled", False)
-            and not self.replayssm
-        ):
+        if attn_metadata.gdn_metadata is not None and self._flydsl_prefill_enabled:
             from atom.model_ops.fla_ops.gdn_flydsl import build_prefill_metadata
 
             attn_metadata.gdn_metadata.flydsl_prefill_metadata = build_prefill_metadata(

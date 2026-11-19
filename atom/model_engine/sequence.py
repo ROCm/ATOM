@@ -290,7 +290,8 @@ class Sequence:
         if sampling_params is None:
             sampling_params = SamplingParams()
         self.block_size = block_size
-        self.id = id or next(Sequence.counter)
+        # 0 is a valid id (engine_v1.proto, REQUESTS); only None takes the counter's.
+        self.id = id if id is not None else next(Sequence.counter)
         self.external_request_id = request_id
         self.status = SequenceStatus.WAITING
         self.type = SequenceType.DUMMY
@@ -360,15 +361,16 @@ class Sequence:
         # `BlockManager._record_checkpoint_demand` at admission; this one is
         # read by `checkpoint_cut` and `checkpointers_at`, which must agree.
         self.checkpoint_demand_pos = 0
-        # Which of the two demand counters this seq has already been put
+        # Which of the three demand counters this seq has already been put
         # against. `can_allocate` re-runs for a sequence the queue keeps
-        # deferring, and the position above cannot serve as the marker for
-        # either one: a declined demand writes 0 back, so it does not remember
-        # the decline, and a decline retracts a demand the recorded counter had
-        # already taken. Both are cleared by `deallocate`, so a re-admitted
+        # deferring, and the position above cannot serve as the marker for any
+        # of them: a declined or dropped demand writes 0 back, so it does not
+        # remember why, and a decline retracts a demand the recorded counter
+        # had already taken. All are cleared by `deallocate`, so a re-admitted
         # request counts again, which it should.
         self.checkpoint_demand_counted = False
         self.checkpoint_demand_declined = False
+        self.checkpoint_demand_dropped = False
         # The demand's sibling: this prompt's own end, floored to the hash
         # grid. 0 = nowhere.
         #

@@ -1697,9 +1697,9 @@ class GDNStateMixin(PoolRowsMixin):
         md.replayssm_max_query_len = self.replayssm_max_query_len
 
         if is_prefill:
-            # A prefill (re)initialises the checkpoint wholesale via
-            # `chunk_gated_delta_rule` and writes NO records, so the next
-            # forward must fold none.  Parking the cursor at -1 rather than 0
+            # A prefill (re)initialises the checkpoint wholesale via the
+            # chunked prefill (Triton or FlyDSL) and writes NO records, so the
+            # next forward must fold none.  Parking the cursor at -1 rather than 0
             # is what says that: `num_bonus` is 0 on the first decode after a
             # prefill, so the commit below would otherwise advance 0 -> 1 and
             # fold record 0 -- which this generation never wrote, and which on

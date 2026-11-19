@@ -152,6 +152,49 @@ def test_the_sampled_block_chains_positions_through_the_shared_head(monkeypatch)
     assert calls == [(bs, k, k * max_bs * V) for k in range(steps)]
 
 
+def test_a_sharded_sampled_block_keeps_the_whole_vocabs_counters(monkeypatch):
+    """With a `VocabShard`, `sample_block` hands each position to the sharded
+    op with the shard's start and group, and strides the noise counter by the
+    whole vocab, not the shard: every rank draws the uniform a (position, row,
+    id) would get from the whole-vocab op."""
+    from atom.models.dspark_draft import VocabShard
+
+    max_bs, bs, steps, V, world = 4, 3, 2, 12, 3
+    head = DSparkMarkovHead(vocab_size=V, rank=2)
+    per_row = torch.zeros(max_bs)
+    sampling = types.SimpleNamespace(
+        q_store=(None, None, None),
+        q_row_base=torch.zeros(max_bs, dtype=torch.int32),
+        temperatures=per_row,
+        top_k=per_row,
+        top_p=per_row,
+        seed=None,
+        scratch=None,
+    )
+    group = types.SimpleNamespace(world_size=world)
+    shard = VocabShard(V // world, group, False)
+    calls = []
+
+    def sample_tp(*args):
+        base, prev, *_, out = args[:5]
+        position, noise_offset = args[9], args[14]
+        calls.append((position, noise_offset, args[16:]))
+        assert base.shape == (bs, V // world)
+        out.copy_(prev + 1)
+
+    def whole(*args, **kwargs):
+        raise AssertionError("a sharded block must not take the whole-vocab op")
+
+    monkeypatch.setattr(dspark_markov_sample_mod, "dspark_markov_sample_tp", sample_tp)
+    monkeypatch.setattr(dspark_markov_sample_mod, "dspark_markov_sample", whole)
+    anchors = torch.tensor([0, 3, 5])
+    drafts = head.sample_block(
+        torch.randn(bs, steps, V // world), anchors, sampling, shard
+    )
+    assert torch.equal(drafts, anchors[:, None] + torch.arange(1, steps + 1))
+    assert calls == [(k, k * max_bs * V, tuple(shard)) for k in range(steps)]
+
+
 def _real_hf_config_override():
     """Load the real SpeculativeConfig.hf_config_override despite conftest stubs.
 
@@ -3264,6 +3307,7 @@ def test_lossless_sampling_arms_on_the_built_gqa_draft(monkeypatch):
     p.config = types.SimpleNamespace(
         max_num_seqs=8,
         pipeline_parallel_size=1,
+        tensor_parallel_size=1,
         kv_transfer_config={},
         enable_rapidserve=False,
         disagg_is_decode=False,
