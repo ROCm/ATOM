@@ -41,6 +41,7 @@ from atom.model_ops.deepseek_v41.paged_scoring import (
     score_topk_quantized,
 )
 from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
+from atom.model_ops.indexer.query import can_fuse_weights_proj, project_query_fp4
 from atom.model_ops.layernorm import (
     DualRMSNormBF16,
     DualRMSNormMXFP8,
@@ -152,13 +153,24 @@ class Indexer(nn.Module):
         query = self.wq_b(qr, x_scale=qr_scale).unflatten(
             -1, (self.heads, self.head_dim)
         )
-        weights = self.weights_proj(hidden)[0]
         if cache.geometry.index_fp4:
             units = cache.index_units[self.spec.kv_owner]
+            if can_fuse_weights_proj(
+                units.layout, query[0], hidden[0], self.weights_proj.weight, rope
+            ):
+                # One launch rotates + MXFP4-quantizes the query AND projects
+                # the head weights, so weights_proj is not a separate GEMM.
+                # The scorer still folds `weights_scale` (see score_quantized),
+                # so the fused weights stay raw (weights_scale=1.0 here).
+                return project_query_fp4(
+                    query[0], rope, positions, hidden[0], self.weights_proj.weight
+                )
+            weights = self.weights_proj(hidden)[0]
             return (
                 quantize_query_fp4(query[0], rope, positions, layout=units.layout),
                 weights,
             )
+        weights = self.weights_proj(hidden)[0]
         return rope(query, positions)[0], weights
 
     def score(self, query, weights, cache, step):

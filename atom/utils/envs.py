@@ -575,6 +575,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 0 restores the full per-rank scoring. This and the bound below must be the
     # same on every rank: a split step's ranks gather together.
     "ATOM_V4_INDEXER_QSPLIT": lambda: _flag_env("ATOM_V4_INDEXER_QSPLIT", "1"),
+    # gfx1250 FP4 indexer: fold the per-layer weights_proj GEMM into the query
+    # RoPE/MXFP4-quant launch (one launch instead of two) for decode steps of at
+    # most FUSE_WEIGHTS_PROJ_MAX_ROWS rows. Off restores the standalone GEMM.
+    "ATOM_DSV41_FUSE_WEIGHTS_PROJ": lambda: _flag_env(
+        "ATOM_DSV41_FUSE_WEIGHTS_PROJ", "1"
+    ),
     # The fewest index logits -- the keys a prefill step's rows see in all -- at
     # which ATOM_V4_INDEXER_QSPLIT splits the step. The split saves index
     # scoring, which grows with them, and on FP4 the logits bands a rank no
