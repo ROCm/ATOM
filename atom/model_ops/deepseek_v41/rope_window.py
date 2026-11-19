@@ -370,7 +370,7 @@ def rope_quant_window(
     ring=None,
     query_fp8=None,
 ):
-    """Rotate `query` in place and run the KV row to whichever sinks are given.
+    """Rotate `query`, optionally quantizing it, and write the requested KV sinks.
 
     `qat` takes the dequantized BF16 row an extend pass attends to, `values`
     and `scales` the FP8 pair (rows of any stride) a later window write or an

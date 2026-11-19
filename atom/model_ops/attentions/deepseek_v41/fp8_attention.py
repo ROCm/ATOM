@@ -18,7 +18,7 @@ from atom.utils.decorators import mark_trace
 
 
 def fused_attention_available():
-    """The API is required; only its GPU architecture support is optional."""
+    """Return whether a usable GPU supports fusion; the AITER API is required."""
     if not torch.cuda.is_available():
         return False
     try:
