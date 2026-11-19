@@ -279,6 +279,13 @@ _RMS_FUSABLE_QUANT_TYPES = (
 # tuned asm kernel serves the tile-aligned [q | k | v | g] rows (its M=8192 row).
 _KDA_IN_PROJ_SPLIT_MIN_TOKENS = 8192
 
+# The latent MoE's merged front GEMM (ATOM#3320) up to this many tokens: on gfx1250
+# it wins up to 3072 rows (48% at 640, 11.5% at 3072) and loses from 3584 (-15% to
+# -19% at 8192 / 16384) in the front-merge GEMM UT; larger batches run the three.
+_MOE_FRONT_MERGE_MAX_TOKENS = int(
+    __import__("os").environ.get("K3_MOE_FRONT_MERGE_MAX_TOKENS", "3072")
+)
+
 
 def _is_e8m0_blockscale(
     quant_config: QuantizationConfig | None, quant_type: QuantType
@@ -785,7 +792,11 @@ class KimiSparseMoeBlock(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Routed and shared branches, returned unsummed where deferring is
         legal. See `forward` for why the add is worth deferring."""
-        if self.front_proj is not None and self.front_proj.merged_weight is not None:
+        if (
+            self.front_proj is not None
+            and self.front_proj.merged_weight is not None
+            and hidden_states.shape[0] <= _MOE_FRONT_MERGE_MAX_TOKENS
+        ):
             gate_up, router_logits, routed_input = self.front_proj(hidden_states)
             # aiter's fused MoE takes its tuned kernels only on contiguous input.
             routed_input = routed_input.contiguous()
