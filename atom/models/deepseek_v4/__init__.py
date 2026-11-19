@@ -2824,6 +2824,33 @@ class Expert(nn.Module):
         return self.w2(out)  # [num_tokens, dim]
 
 
+# The V4 family's dual-stream MoE row bound on expert-parallel decode steps
+# when ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD is not set. 1536 = 256 requests a rank
+# x 6 DSpark rows a request: the largest of the 1152/1344/1536-row decode
+# graphs of a 1024-request expert-parallel batch, the shapes the shared/routed
+# overlap was measured on (a multi-rank MegaMoE bench, shared on the side
+# stream against shared in series). Row counts above it were not measured, so
+# they keep the single-stream path. It is a fixed bound rather than the
+# configured graph size because larger decode graphs are untested. The gain
+# comes from hiding the shared expert behind the routed MoE's expert-parallel
+# token exchange (dispatch/combine waits), so a deployment without one
+# (`FusedMoEParallelConfig.exchanges_tokens`: no EP, TP-only EP, simulated DP)
+# keeps the generic bound, as do prefill steps (chunks of these sizes were not
+# measured).
+V4_DUAL_STREAM_DECODE_TOKEN_THRESHOLD = 1536
+
+
+def v4_dual_stream_decode_token_threshold(exchanges_tokens: bool) -> int:
+    """The V4 MoE's dual-stream row bound on decode steps:
+    ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD where it is set (0 still turns the
+    dual stream off), else `V4_DUAL_STREAM_DECODE_TOKEN_THRESHOLD` where the
+    routed MoE exchanges tokens across ranks (``exchanges_tokens``) and the
+    variable's default where it does not."""
+    if envs.is_set("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD") or not exchanges_tokens:
+        return envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
+    return V4_DUAL_STREAM_DECODE_TOKEN_THRESHOLD
+
+
 class MoE(nn.Module):
     """Mixture-of-Experts: top-k routed experts (FusedMoE) + 1 shared expert.
 
@@ -2940,12 +2967,25 @@ class MoE(nn.Module):
         # routed experts on the current stream. Mirrors V2's pattern. Only
         # active when shared_experts exist (not fused into routed) AND the
         # env threshold is positive AND we got an alt_stream from the model.
-        # Per-call token count gating happens inside the custom op dispatcher
-        # — prefill (large batch) skips dual-stream (overhead > benefit).
+        # Per-call row gating happens inside the custom op dispatcher: a call
+        # with more rows than its step's bound (set below) stays single-stream.
         self._use_dual_stream = (
             self.shared_experts is not None
             and self.alt_stream is not None
             and envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0
+        )
+        # V4 family with an expert-parallel token exchange: the routed MoE
+        # waits on it for a large part of each layer, which the side-stream
+        # shared expert fills up to larger decode batches than the generic
+        # default. Prefill steps and deployments without such an exchange keep
+        # the generic bound; an explicitly set ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD applies
+        # to every case. Decided here from the parallel config, never in
+        # forward.
+        self._dual_stream_token_threshold = envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
+        self._dual_stream_decode_token_threshold = (
+            v4_dual_stream_decode_token_threshold(
+                self.experts.moe_parallel_config.exchanges_tokens
+            )
         )
         # Keep comm-fused token-bucket dispatch dynamic under torch.compile.
         self._use_comm_fused_dispatch = self.experts._comm_fused_moe is not None

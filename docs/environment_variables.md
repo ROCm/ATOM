@@ -279,7 +279,7 @@ Applies with `--enable-eplb`; the schedule itself is set by `--eplb-config`
 | **ATOM_ENABLE_DS_QKNORM_FUSION** | bool | 1 (true) | If set to `1`, use the fused Q/K RMSNorm path (`fused_qk_rmsnorm`) in the DeepSeek MLA attention module when Q-LoRA is enabled and QK norm+quant fusion is not used. If set to `0`, apply separate RMSNorm for the Q and KV branches instead. |
 | **ATOM_ENABLE_DS_QKNORM_QUANT_FUSION** | bool | 1 (true) | If set to `1`, fuse QK norm with quantization in MLA attention module. |
 | **ATOM_V4_USE_TRITON_FUSION** | bool | 0 (false) | DeepSeek-V4/V4.1 shared expert: run clamp + `silu(gate) * up` + FP8 quant as one aiter triton kernel (`fused_clamp_act_mul`) and pass its scale to `w2`. A native MX `w2` (V4.1, 32x32 weights) gets a row-major 1x32 E8M0 scale, a blockscale `w2` a transposed FP32 1x128 one. The kernel needs the rank's intermediate width to be a multiple of 128 (V4.1-Flash's 2304: unsharded, e.g. under DP attention, or at TP2; not at TP4 or TP8), so other widths keep the unfused path. |
-| **ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD** | int | 1024 | Upper bound on MoE token count (`num_tokens` in the MoE forward) for using the dual-stream path: shared experts on a secondary CUDA stream while routed experts run on the default stream. If `num_tokens` exceeds this value, that forward uses single-stream MoE instead. Set to `0` to disable dual-stream setup entirely (no alt stream, no `maybe_dual_stream_forward` registration). The fork is taken in eager runs, FULL capture and token-graph segments alike; only a plugin frontend's own PIECEWISE graphs stay single-stream. |
+| **ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD** | int | 1024 | Upper bound on MoE token count (`num_tokens` in the MoE forward) for using the dual-stream path: shared experts on a secondary CUDA stream while routed experts run on the default stream. If `num_tokens` exceeds this value, that forward uses single-stream MoE instead. DeepSeek-V4 / V4.1 / V4-Pro MoE layers whose experts exchange tokens across ranks (expert parallelism over more than one DP rank) use 1536 on decode steps when the variable is not set (prefill steps and deployments without such an exchange, e.g. plain TP or TP-only expert parallelism, keep 1024); an explicit value applies to every case, as to every other model. Set to `0` to disable dual-stream setup entirely (no alt stream, no `maybe_dual_stream_forward` registration). The fork is taken in eager runs, FULL capture and token-graph segments alike; only a plugin frontend's own PIECEWISE graphs stay single-stream. |
 
 ### DSpark block sampling
 
@@ -524,7 +524,13 @@ server runs to where its publisher binds: `endpoint`, offset per rank like the
 bind itself (a wildcard host stays a wildcard, so a consumer substitutes the
 server's address), `topic`, `block_size`, the tokens per hashed block, and
 `replay_endpoint`, offset alike, when replay is on. It is `{}` with events off or
-the `null` publisher.
+the `null` publisher. A server that offloads to a Mooncake Store
+(`mooncake_store`) also reports `offload`, the same for every rank: `backend`,
+the pools' `masters`, and the key rule's `namespace`, `chunk_tokens` and `world`,
+with `min_load_tokens`, the threshold the engine resolved (`OFFLOAD_MIN_LOAD_TOKENS`
+when set, else the Store's own 512), and `chain_check`, the hex
+digest of the first chunk of tokens `0..chunk_tokens`, by which a router checks
+that it computes the same keys.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
