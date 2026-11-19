@@ -106,32 +106,26 @@ def mla_dcp_decode_shape_support(
 
 
 def dcp_persistent_supported(
-    num_heads: int,
-    kv_cache_dtype: str,
-    dcp_world_size: int,
-    max_seqlen_q: int = 1,
-    causal: bool = True,
+    num_heads: int, kv_cache_dtype: str, dcp_world_size: int
 ) -> bool:
-    """Whether DCP decode can run in *persistent* mode at ``num_heads`` gathered
-    query heads, for the call ``mla_dcp_decode_call`` describes.
+    """Whether a one-row DCP decode can run in *persistent* mode at
+    ``num_heads`` gathered query heads.
 
     Asks aiter whether mla_decode_fwd has a persistent decode that returns the
     lse DCP's merge needs, for this call: gfx950's ASM kernels, and gfx1250's
     PS1 ones when AITER_MLA_DECODE_PS1_FLYDSL=1 selects them. gfx942 has none
-    and falls back to the triton stage2 reduce. Cache the result once per
-    ``__init__``; it is not for the forward pass.
+    and falls back to the triton stage2 reduce. A decode of more than one row
+    takes the width aiter's get_mla_decode_num_heads names instead
+    (``_persistent_width`` in ``atom.model_ops.attention_mla``). Cache the
+    result once per ``__init__``; it is not for the forward pass.
     """
-    from aiter.ops.attention import MlaAsmStatus
+    from aiter.ops.attention import MlaBackend
 
-    support = mla_dcp_decode_shape_support(
-        num_heads, kv_cache_dtype, dcp_world_size, max_seqlen_q, causal
-    )
-    # As aiter's get_mla_decode_num_heads counts a width that runs: a known
-    # kernel, or a route without an availability table (not asm: FlyDSL PS1,
-    # opus), where aiter answers None. A None from an asm route is a failed
-    # query, not a yes.
+    support = mla_dcp_decode_shape_support(num_heads, kv_cache_dtype, dcp_world_size)
+    # aiter has no table for the FlyDSL PS1 route and answers None there; a
+    # None from any other route (opus among them) is not a yes.
     return bool(support.supported) or (
-        support.supported is None and support.asm_status is MlaAsmStatus.NOT_ASM
+        support.supported is None and support.backend is MlaBackend.FLYDSL_PS1
     )
 
 

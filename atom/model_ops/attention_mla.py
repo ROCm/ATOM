@@ -87,7 +87,6 @@ from atom.model_ops.utils import (
     get_and_maybe_dequant_weights,
     quant_fp8_per_tensor,
 )
-from atom.plugin import is_plugin_mode
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
 from atom.utils.forward_context import (
@@ -306,11 +305,11 @@ _MLA_DCP_MAX_KERNEL_HEADS = 128
 
 
 def mla_dcp_decode_query_len(atom_config) -> int:
-    """Query rows per sequence a dense target layer's DCP decode takes: with
+    """The longest query a dense target layer's DCP decode takes: with
     speculative decode the verify pass, the drafted tokens plus the one they
-    follow; 1 otherwise. The dense layer and the metadata builders size the
-    gathered width from this one value, so they agree on it. Layers whose
-    decode call is shaped differently size from ``_layer_dcp_decode_query_len``.
+    follow; 1 otherwise. ``mla_dcp_decode_query_lens`` gives every length the
+    layer decodes, the set the layer and the metadata builders size the gathered
+    width from; ``_layer_dcp_decode_query_lens`` gives it per layer.
     """
     spec_config = atom_config.speculative_config
     if spec_config is None:
@@ -319,21 +318,17 @@ def mla_dcp_decode_query_len(atom_config) -> int:
 
 
 def mla_dcp_decode_query_lens(atom_config) -> tuple[int, ...]:
-    """Every query length a dense causal layer's DCP decode runs at. Without
-    speculative decode, 1. With k drafted tokens, the verify's k + 1 and 1: the
-    MTP draft steps after the first run one row per sequence on layers of the
-    same kind (``deepseek_mtp`` builds ``DeepseekV2DecoderLayer``), on the
-    target's persistent work plan (``prepare_mtp_decode``). Under the vLLM
-    plugin, every length from 1 to k + 1: a decode batch also carries requests
-    verifying fewer drafted tokens. The layer and the metadata builders size
+    """Every query length a dense causal layer's DCP decode runs at: 1 without
+    speculative decode, every length from 1 to k + 1 with k drafted tokens. The
+    verify takes k + 1 rows; the MTP draft steps after the first run one row per
+    sequence on layers of the same kind (``deepseek_mtp`` builds
+    ``DeepseekV2DecoderLayer``), on the target's persistent work plan
+    (``prepare_mtp_decode``); and a decode batch also carries shorter verifies
+    (requests verifying fewer drafted tokens under the vLLM plugin, DSpark's
+    ``confidence_schedule`` buckets). The layer and the metadata builders size
     the gathered width from this one set, so they agree on it.
     """
-    verify = mla_dcp_decode_query_len(atom_config)
-    if verify == 1:
-        return (1,)
-    if is_plugin_mode():
-        return tuple(range(1, verify + 1))
-    return (1, verify)
+    return tuple(range(1, mla_dcp_decode_query_len(atom_config) + 1))
 
 
 def _layer_dcp_decode_query_lens(layer) -> tuple[int, ...]:
@@ -393,6 +388,11 @@ def _persistent_multi_token_num_heads(
     )
 
 
+# Q head counts aiter's MLA decode kernels are built for: the counts its
+# get_mla_decode_num_heads pads a query to.
+_MLA_DECODE_PAD_WIDTHS = (16, 32, 64, 96, 128)
+
+
 def _persistent_width(
     gathered: int,
     query_lens: tuple[int, ...],
@@ -403,33 +403,43 @@ def _persistent_width(
     """One width a persistent DCP decode can pad ``gathered`` heads to at every
     length in ``query_lens``, or None.
 
-    A one-row decode takes the gathered width as-is (a dedicated kernel or a
-    fold); a longer one takes the width aiter names for that call
-    (``_persistent_multi_token_num_heads``). The widest of those is the
-    candidate, and it has to run at every length: aiter's widths need not nest,
-    so the shape query (``dcp_persistent_supported``) is asked wherever aiter
-    did not name exactly that width for that length -- always at one row, whose
-    route must also write the LSE the DCP merge reads.
+    One row only (no speculative decode): the gathered width as is, a dedicated
+    kernel or a fold, where ``dcp_persistent_supported`` says it runs.
+
+    Past one row, aiter names a width for each length
+    (``_persistent_multi_token_num_heads``). Its widths need not nest, so the
+    widest of them, then each wider kernel head count, is tried, and the first
+    that runs at every length is taken: past one row where aiter names that
+    width for itself, at one row where ``dcp_persistent_supported`` says so (the
+    one-row route must also write the LSE the DCP merge reads).
     """
+    lens = sorted(set(query_lens))
+    if lens == [1]:
+        if dcp_persistent_supported(gathered, kv_cache_dtype, dcp_world_size):
+            return gathered
+        return None
     named = {}
-    for q in sorted(set(query_lens)):
-        width = (
-            gathered
-            if q == 1
-            else _persistent_multi_token_num_heads(
+    for q in lens:
+        if q > 1:
+            width = _persistent_multi_token_num_heads(
                 gathered, q, kv_cache_dtype, dcp_world_size, causal
             )
+            if width is None:
+                return None
+            named[q] = width
+
+    def runs(width: int, q: int) -> bool:
+        if q == 1:
+            return dcp_persistent_supported(width, kv_cache_dtype, dcp_world_size)
+        return named[q] == width or width == _persistent_multi_token_num_heads(
+            width, q, kv_cache_dtype, dcp_world_size, causal
         )
-        if width is None:
-            return None
-        named[q] = width
-    width = max(named.values())
-    for q, named_width in named.items():
-        if (q == 1 or named_width != width) and not dcp_persistent_supported(
-            width, kv_cache_dtype, dcp_world_size, q, causal
-        ):
-            return None
-    return width
+
+    widest = max(named.values())
+    for width in (widest, *(w for w in _MLA_DECODE_PAD_WIDTHS if w > widest)):
+        if all(runs(width, q) for q in lens):
+            return width
+    return None
 
 
 _MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT = (16, 32, 128)
@@ -528,11 +538,9 @@ def mla_dcp_persistent_width(
 ) -> int | None:
     """Gathered width a persistent DCP decode runs at, at every query length in
     ``query_lens`` (``(max_seqlen_q,)`` when omitted), or None when DCP is off
-    or aiter has no persistent kernel for one of those calls: no width named
-    for a decode of more than one row (``get_mla_decode_num_heads``), or none
-    at the width (``dcp_persistent_supported``; see ``_persistent_width``). None
-    keeps the callers non-persistent, and a speculative verify is then refused
-    where the layer pads its queries
+    or no width runs persistent at all of those calls (``_persistent_width``).
+    None keeps the callers non-persistent, and a speculative verify is then
+    refused where the layer pads its queries
     (``MLAAttention._configure_dcp_decode_head_padding``).
     """
     if dcp_world_size <= 1:
@@ -1179,8 +1187,8 @@ class MLAAttention(nn.Module):
             )
         # Whether aiter runs this layer's DCP decode persistent, at one width
         # the persistent path gathers to for every call this layer makes: a
-        # dense layer under MTP decodes the verify's k + 1 rows and one-row draft
-        # steps on the same width.
+        # dense layer under speculative decode decodes every length from 1 to
+        # k + 1 on the same width.
         query_lens = _layer_dcp_decode_query_lens(self)
         max_seqlen_q = max(query_lens)
         self.dcp_persistent_supported = (
