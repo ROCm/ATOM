@@ -1210,11 +1210,8 @@ class Scheduler:
                 resume, cached = tier_waiter
             else:
                 # The exact probe's answer; the walk is memoised across ticks.
-                probe = AdmissionProbe()
-                cached_blocks = self.block_manager.can_allocate_memoized(seq, probe)
-                if cached_blocks < 0 or not self._receive_leaves_decode_room(
-                    seq, probe
-                ):
+                cached_blocks = self._head_fit_blocks(seq)
+                if cached_blocks < 0:
                     break  # Phase 2 also stops at an allocation or reserve refusal.
                 if slots <= parked:
                     # A connector query can pin remote KV, so leave it to
@@ -1564,13 +1561,9 @@ class Scheduler:
                 return True
             # KV-pressured requests definitely cannot prefill. A fit probe, not
             # an admission: it records nothing, and runs every tick, so the
-            # walk is memoised across ticks.
-            probe = AdmissionProbe()
-            if self.block_manager.can_allocate_memoized(seq, probe) < 0:
-                return False
-            # Phase 2 defers a receive that leaves decode no room; reporting it
-            # prefillable would skip this rank's decode for nothing.
-            return self._receive_leaves_decode_room(seq, probe)
+            # walk is memoised across ticks. Phase 2 defers a receive that
+            # leaves decode no room, so that counts as a refusal too.
+            return self._head_fit_blocks(seq) >= 0
         return False
 
     def _prefix_bypass_limit(self) -> int:
@@ -3631,16 +3624,31 @@ class Scheduler:
         ]
         return [*self.running, *parked]
 
+    def _receive_reserve_applies(self, seq: Sequence) -> bool:
+        """Whether `seq` is a P/D receive that a decode reserve checks."""
+        return bool((seq.kv_transfer_params or {}).get("do_remote_prefill")) and (
+            self.pd_admission is not None or self._receive_reserve is not None
+        )
+
+    def _head_fit_blocks(self, seq: Sequence) -> int:
+        """The DP readiness probes' fit: `can_allocate_memoized`, or -1 for a
+        receive its reserve defers. Only such a receive builds a probe."""
+        if not self._receive_reserve_applies(seq):
+            return self.block_manager.can_allocate_memoized(seq)
+        probe = AdmissionProbe()
+        cached_blocks = self.block_manager.can_allocate_memoized(seq, probe)
+        if cached_blocks < 0 or not self._receive_leaves_decode_room(seq, probe):
+            return -1
+        return cached_blocks
+
     def _receive_leaves_decode_room(self, seq: Sequence, probe: AdmissionProbe) -> bool:
         """Whether P/D receive `seq` leaves the held rows their decode reserve,
         recording nothing. Phase 2 and the DP readiness probes all ask this."""
-        if not (seq.kv_transfer_params or {}).get("do_remote_prefill"):
+        if not self._receive_reserve_applies(seq):
             return True
         held = self._decode_rows()
         if self.pd_admission is not None:
             return self.pd_admission.leaves_decode_room(seq, probe, held=held)
-        if self._receive_reserve is None:
-            return True
         # Only an idle D admits below it; a cancelled load still draining is not idle.
         idle = not held and not self._parked_loads
         return idle or self._receive_reserve.leaves_room(seq, probe, held)

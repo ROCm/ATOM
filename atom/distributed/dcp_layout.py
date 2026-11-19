@@ -3,9 +3,9 @@
 
 """DCP token-ownership arithmetic shared by attention and KV transfer.
 
-These helpers are pure ``//`` / ``%`` so they stay elementwise over Python
-ints, numpy arrays, and torch tensors. They live outside ``dcp_ops`` so P/D
-relayout can follow the same rule without importing Triton or aiter.
+The owner / index helpers are pure ``//`` / ``%`` (Python ints, numpy arrays,
+torch tensors); ``get_dcp_local_seq_lens`` is numpy-based. They live outside
+``dcp_ops`` so P/D relayout and the scheduler need neither Triton nor aiter.
 """
 
 import numpy as np

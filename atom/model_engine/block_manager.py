@@ -771,7 +771,15 @@ class BlockManager:
         """
         if self.dcp_world_size <= 1:
             return (seq_len + self.block_size - 1) // self.block_size
-        return int(self.num_pool_blocks_many([seq_len])[0])
+        from atom.distributed.dcp_layout import get_dcp_local_seq_lens
+
+        local_len = get_dcp_local_seq_lens(
+            np.array([seq_len]),
+            self.dcp_world_size,
+            self.dcp_rank,
+            self.cp_kv_cache_interleave_size,
+        )[0]
+        return int((local_len + self.block_size - 1) // self.block_size)
 
     def num_pool_blocks_many(self, seq_lens) -> np.ndarray:
         """`num_pool_blocks` of each length in `seq_lens`, in one numpy pass."""
