@@ -627,6 +627,11 @@ def test_replay_serves_the_verified_dspark_verify(rows):
     assert runner_module.replay_refusal(_replay_plan(rows), 16, 5, 5) is None
 
 
+@pytest.mark.parametrize("rows", (8, 16, 24, 32, 40, 48, 56, 64))
+def test_replay_serves_the_verified_dspark7_verify(rows):
+    assert runner_module.replay_refusal(_replay_plan(rows), 16, 8, 8) is None
+
+
 @pytest.mark.parametrize("rows", (1, 8, 48, 56, 64))
 def test_replay_serves_the_verified_plain_decode(rows):
     assert runner_module.replay_refusal(_replay_plan(rows), 16, 1, 1) is None
@@ -640,8 +645,9 @@ def test_replay_is_off_without_a_record_buffer():
     ("cap", "window", "qlen"),
     (
         (16, 5, 1),  # plain decode: not yet checked against production
+        (16, 8, 1),
         (32, 5, 5),
-        (16, 8, 8),
+        (32, 8, 8),
     ),
 )
 def test_replay_refuses_unverified_configurations(cap, window, qlen):

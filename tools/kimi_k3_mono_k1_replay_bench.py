@@ -1,5 +1,7 @@
 """K1 alone, ReplaySSM off against on (``kimi_k3_mono_k1_replay_check``'s
-setup), each a CUDA graph of REPS launches timed over RUNS alternating runs.
+setup), each a CUDA graph of REPS launches timed over RUNS ABBA rounds, then
+(SUSTAIN seconds) each arm replayed back to back, off / on / on / off, at
+cursor SUSTAIN_H.
 
 Off: every token's state stored (DSpark slots). On: one checkpoint a request,
 each step's records written; ``H`` committed records (non-flush: h + 2 window
@@ -11,6 +13,7 @@ Run on one gfx1250 GPU: ROWS=40 H=0,5,6,8,11 python tools/kimi_k3_mono_k1_replay
 import json
 import os
 import sys
+import time
 
 import torch
 
@@ -25,6 +28,9 @@ ROWS = int(os.environ.get("ROWS", "40"))
 HS = [int(h) for h in os.environ.get("H", "0,5,6,8,11").split(",")]
 REPS = int(os.environ.get("REPS", "20"))
 RUNS = int(os.environ.get("RUNS", "8"))
+# seconds each arm replays back to back after the bursts (0: none), at cursor
+SUSTAIN = float(os.environ.get("SUSTAIN", "0"))
+SUSTAIN_H = int(os.environ.get("SUSTAIN_H", "4"))
 dev, gen = rc.dev, rc.gen
 QLEN, CAP, WINDOW = rc.QLEN, rc.CAP, rc.WINDOW
 
@@ -137,12 +143,39 @@ def main():
     times = {"off": []}
     for h in HS:
         times[f"on_h{h}"] = []
+    def time_on(h):
+        write_pos.fill_(h)
+        torch.cuda.synchronize()
+        times[f"on_h{h}"].append(time_us(on))
+
     for _ in range(RUNS):
+        # ABBA: off, on at every cursor, on again in reverse, off
         times["off"].append(time_us(graphs["off"]))
         for h in HS:
-            write_pos.fill_(h)
+            time_on(h)
+        for h in reversed(HS):
+            time_on(h)
+        times["off"].append(time_us(graphs["off"]))
+    sustained = {}
+    if SUSTAIN > 0:
+        # each arm replayed back to back for SUSTAIN seconds, off / on / on / off
+        write_pos.fill_(SUSTAIN_H)
+        torch.cuda.synchronize()
+        for name in ("off", "on", "on", "off"):
+            g = graphs["off"] if name == "off" else on
+            start, end = torch.cuda.Event(True), torch.cuda.Event(True)
+            launches, began = 0, time.monotonic()
+            start.record()
+            while time.monotonic() - began < SUSTAIN:
+                for _ in range(50):
+                    g.replay()
+                launches += 50 * REPS
+                torch.cuda.synchronize()
+            end.record()
             torch.cuda.synchronize()
-            times[f"on_h{h}"].append(time_us(on))
+            sustained.setdefault(name, []).append(
+                round(start.elapsed_time(end) * 1000 / launches, 2)
+            )
     report = {
         "rows": ROWS,
         "names": {t: k.entrypoint.name for t, k in kernels.items()},
@@ -151,6 +184,8 @@ def main():
             t: round(sorted(v)[len(v) // 2], 2) for t, v in times.items()
         },
         "min_us": {t: round(min(v), 2) for t, v in times.items()},
+        "sustained_us": sustained,
+        "sustained_h": SUSTAIN_H if SUSTAIN > 0 else None,
     }
     print(json.dumps(report), flush=True)
 

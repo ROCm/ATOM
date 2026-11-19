@@ -134,10 +134,11 @@ K1_PTPC_FUSION_MAX_ROWS = 40
 
 # ReplaySSM's (cache_len, verify window, query length)s K1 is checked
 # against the production path for (``tools/kimi_k3_mono_k1_replay_check.py``):
-# DSpark 4's uniform verify and plain decode, at the serving cache_len. A
+# DSpark 4's and DSpark 7's uniform verify and plain decode, at the serving
+# cache_len (at DSpark 7's window every step with a committed record flushes). A
 # plain decode under a verify window is not: there production rolls the conv
 # state's first width - 1 positions, K1 the whole window.
-REPLAY_VERIFIED = frozenset({(16, 5, 5), (16, 1, 1)})
+REPLAY_VERIFIED = frozenset({(16, 5, 5), (16, 8, 8), (16, 1, 1)})
 
 
 def replay_refusal(

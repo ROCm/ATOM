@@ -255,6 +255,7 @@ def test_replay_records_bound_what_a_step_finds_committed():
     # the serving cache_len 16, DSpark 4's window 5: a flush once h > 6
     assert builder.replay_records(16, 5) == 11
     assert builder.replay_staged(16, 5) == 12
+    assert builder.replay_records(16, 8) == 8  # every committed step flushes
     assert builder.replay_staged(16, 8) == 8
 
 
