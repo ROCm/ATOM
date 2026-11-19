@@ -458,6 +458,47 @@ def test_k2_kernel_hazard_past_48_rows_falls_back_to_production(monkeypatch):
     assert runner._k2_or_production(48, lambda: built, "K2", kernels) is built
 
 
+def test_width_build_compiles_the_fused_moe_once():
+    moe = _Launcher()
+    shared = SimpleNamespace(launcher=_Launcher(), abi=KernelAbi(("x",)))
+    k2 = SimpleNamespace(
+        front=shared,
+        finish=shared,
+        finalize=shared,
+        allreduce=None,
+        fused_moe=SimpleNamespace(launcher=moe, abi=KernelAbi(("ids", "state"))),
+    )
+    kernels = Gfx1250WidthBuild({}, {1: k2, 2: k2}).kernels()
+    assert [launcher for launcher, _ in kernels] == [shared.launcher, moe]
+    compile_kernels(kernels)
+    assert moe.calls == [((0, 0), "1")]
+
+
+@pytest.mark.parametrize("hazards", [(), ("12 vgpr spill",)])
+def test_hazardous_fused_moe_leaves_the_width_on_the_grouped_moe(monkeypatch, hazards):
+    runner = object.__new__(K3Gfx1250MonoDecodeRunner)
+    runner.device = torch.device("cpu")
+    kernel = SimpleNamespace(launcher=object(), abi=KernelAbi(("ids",)))
+    compiled = []
+    monkeypatch.setenv("ATOM_KIMI_MONO_FUSED_MOE_ROWS", "64")
+    monkeypatch.setattr(runner_module, "build_moe", lambda rows: kernel)
+    monkeypatch.setattr(
+        runner_module,
+        "compile_kernels",
+        lambda pairs: compiled.extend(pairs) or [launcher for launcher, _ in pairs],
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "_resident_hazards",
+        lambda launcher: hazards if launcher is kernel.launcher else ("wrong",),
+    )
+    expected = None if hazards else kernel
+    assert runner._fused_moe_for(40) is expected
+    assert runner._fused_moe_for(40) is expected
+    assert compiled == [(kernel.launcher, kernel.abi)]
+    assert runner._fused_moe_for(65) is None
+
+
 def test_layer_without_a_k2_build_runs_the_production_mlp():
     rows, hidden = 2, 4
     prefix = torch.zeros(rows, hidden)

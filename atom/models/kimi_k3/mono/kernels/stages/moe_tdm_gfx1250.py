@@ -62,6 +62,7 @@ from atom.mono.device.ops import (
     uniform,
 )
 from atom.mono.plan.architecture import GFX1250
+from atom.mono.runtime.abi import KernelAbi
 from atom.utils import envs
 
 THREADS = 256
@@ -792,6 +793,11 @@ def profile_words() -> int:
     return MOE_STATE_WORDS + 256 * 12
 
 
+MOE_ABI = KernelAbi(
+    ("ids", "latent", "scales", "w13", "w13s", "w2", "w2s", "inter", "grouped", "flags", "state")
+)  # fmt: skip
+
+
 @dataclass(frozen=True)
 class MoeKernel:
     name: str
@@ -800,6 +806,7 @@ class MoeKernel:
     # its LDS struct and kernel body, for a launch that runs it as a part
     lds: object = None
     body: object = None
+    abi: KernelAbi = MOE_ABI
 
 
 def _realtime():

@@ -327,6 +327,9 @@ class Gfx1250WidthBuild:
             tail = getattr(k2, "tail", None)
             if tail is not None:
                 pairs.append((tail.launcher, tail.abi))
+            fused_moe = getattr(k2, "fused_moe", None)
+            if fused_moe is not None:
+                pairs.append((fused_moe.launcher, fused_moe.abi))
         if self.oproj is not None:
             pairs.append((self.oproj.launcher, self.oproj.abi))
 
@@ -921,13 +924,33 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
 
     def _fused_moe_for(self, rows: int):
         """The width's fused MoE launcher where ATOM_KIMI_MONO_FUSED_MOE_ROWS
-        covers it and its LDS fits, else None; its flags and epoch (one set
-        for every layer and width: launches never overlap) made on first use."""
+        covers it, its LDS fits and it compiles free of resident hazards
+        (``_resident_hazards``), else None; its flags and epoch (one set for
+        every layer and width: launches never overlap) made on first use.
+
+        None leaves the width's K2 on the grouped MoE (AITER's): a hazard here
+        would otherwise reach the width's ``kernels()`` and refuse the whole
+        width at up to ``k2_fallback_past`` rows, or past it send the layer's
+        whole K2 to production. Every rank compiles the same binary, so every
+        rank finds the same hazards."""
         if rows > envs.ATOM_KIMI_MONO_FUSED_MOE_ROWS:
             return None
         try:
             kernel = build_moe(rows)
         except ValueError:
+            return None
+        hazards = self.__dict__.setdefault("fused_moe_hazards", {})
+        if rows not in hazards:
+            (launcher,) = compile_kernels([(kernel.launcher, kernel.abi)])
+            hazards[rows] = _resident_hazards(launcher)
+            if hazards[rows]:
+                logger.warning(
+                    "Kimi-K3 gfx1250 mono: %d rows run the grouped MoE: the "
+                    "fused MoE has resident resource hazards (%s)",
+                    rows,
+                    ", ".join(hazards[rows]),
+                )
+        if hazards[rows]:
             return None
         if "fused_moe_sync" not in self.__dict__:
             self.fused_moe_sync = (
