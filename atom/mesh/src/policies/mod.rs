@@ -13,6 +13,7 @@ mod agentic;
 mod cache_aware;
 mod dp_sticky;
 mod factory;
+mod least_load;
 mod power_of_two;
 mod prefix_hash;
 mod random;
@@ -24,6 +25,7 @@ pub use agentic::{AgenticConfig, AgenticCost, AgenticPolicy};
 pub use cache_aware::CacheAwarePolicy;
 pub use dp_sticky::DpStickyPolicy;
 pub use factory::PolicyFactory;
+pub use least_load::LeastLoadPolicy;
 pub use power_of_two::PowerOfTwoPolicy;
 pub use prefix_hash::{PrefixHashConfig, PrefixHashPolicy};
 pub use random::RandomPolicy;
@@ -49,6 +51,9 @@ pub struct RouteDecision {
     /// Prompt tokens the selected worker still has to prefill, for policies that
     /// estimate its cache reuse. `None` charges the whole prompt.
     pub prefill_tokens: Option<usize>,
+    /// Id of a load reservation `least_load` already charged. The placement
+    /// layer takes it so a dropped plan releases the charge.
+    pub reservation_id: Option<u64>,
 }
 
 impl RouteDecision {
@@ -58,6 +63,7 @@ impl RouteDecision {
             match_ratio: None,
             estimated_hit_ratio: None,
             prefill_tokens: None,
+            reservation_id: None,
         }
     }
 }
@@ -147,6 +153,11 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
 
     /// Get as Any for downcasting
     fn as_any(&self) -> &dyn std::any::Any;
+
+    /// Take a load reservation recorded by [`RouteDecision::reservation_id`].
+    fn take_load_reservation(&self, _id: u64) -> Option<crate::core::LoadReservation> {
+        None
+    }
 }
 
 /// Configuration for cache-aware policy

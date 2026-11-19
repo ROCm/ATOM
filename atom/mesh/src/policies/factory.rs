@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use super::{
     AgenticConfig, AgenticCost, AgenticPolicy, CacheAwareConfig, CacheAwarePolicy, DpStickyPolicy,
-    LoadBalancingPolicy, PowerOfTwoPolicy, PrefixHashConfig, PrefixHashPolicy, RandomPolicy,
-    RoundRobinPolicy,
+    LeastLoadPolicy, LoadBalancingPolicy, PowerOfTwoPolicy, PrefixHashConfig, PrefixHashPolicy,
+    RandomPolicy, RoundRobinPolicy,
 };
 use crate::config::PolicyConfig;
 
@@ -57,6 +57,9 @@ impl PolicyFactory {
                 eviction_interval_secs: *eviction_interval_secs,
                 max_tree_size: *max_tree_size,
             })),
+            PolicyConfig::LeastLoad {
+                request_token_equivalent,
+            } => Arc::new(LeastLoadPolicy::new(*request_token_equivalent)),
         }
     }
 
@@ -70,6 +73,7 @@ impl PolicyFactory {
             "cache_aware" | "cacheaware" => Some(Arc::new(CacheAwarePolicy::new())),
             "prefix_hash" | "prefixhash" => Some(Arc::new(PrefixHashPolicy::with_defaults())),
             "agentic" => Some(Arc::new(AgenticPolicy::default())),
+            "least_load" | "leastload" => Some(Arc::new(LeastLoadPolicy::default())),
             _ => None,
         }
     }
@@ -182,6 +186,12 @@ mod tests {
                     max_tree_size: 500,
                 },
             ),
+            (
+                "least_load",
+                PolicyConfig::LeastLoad {
+                    request_token_equivalent: 512,
+                },
+            ),
         ];
 
         for (expected_name, config) in configs {
@@ -215,6 +225,8 @@ mod tests {
             ("prefixhash", "prefix_hash"),
             ("agentic", "agentic"),
             ("Agentic", "agentic"),
+            ("least_load", "least_load"),
+            ("leastload", "least_load"),
         ];
 
         for (input, expected_name) in cases {
