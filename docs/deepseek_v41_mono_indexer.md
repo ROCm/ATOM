@@ -141,8 +141,9 @@ These are indexer timings, excluding TTFT, scheduling, serving throughput
 and whole-model decoding. The instrumented real-model generation check
 contains live projection comparisons and cannot be used as a timing result.
 DSV4.1's runtime supports compilation levels 0/3 and rejects 1/2. The current
-real-model check uses supported level3/FULL CUDA Graphs. Formal GSM8K and
-actual 8K/160K whole-model serving performance remain to be qualified.
+real-model check uses supported level3/FULL CUDA Graphs. TP4 formal GSM8K and actual 8K/160K whole-model serving were qualified
+on c6f06f5f3; the PR preserves their complete results. The default-on
+long-context follow-up is recorded separately below.
 
 
 ## Current FULL optimization qualification (2026-11-19)
@@ -175,7 +176,7 @@ Validation:
 - Final dispatch/build-key/resource suite: 55 passed, including TP2/4/8 FULL binaries with zero private scratch (TP8 compile-only).
 - Related CPU/GPU numerical and handoff regression: 473 passed, 18 subtests. CPU import checks with real aiter/FlyDSL blocked: 124 passed, 2 skipped, 18 subtests.
 - TP4 and TP2 each passed 12 real-weight exact-selection cases. TP4 adaptive and forced cross-TP same-graph mode changes each passed 63 transitions.
-- Real TP4 checkpoint, level3/FULL Graph: all 16 short/~25.6K prompt cases at BS1/8 completed. Both Mono routes checked all eight live head-weight projections with zero error markers. Native plus standalone indexer matched native on 18/18 generated sequences; ordinary layer Mono matched 17/18; native repeat matched 18/18. One long-prompt BS8 layer Mono sequence differed. Formal GSM8K remains unqualified; instrumented decode_ms is not a performance result.
+- Real TP4 checkpoint, level3/FULL Graph: all 16 short/~25.6K prompt cases at BS1/8 completed. Both Mono routes checked all eight live head-weight projections with zero error markers. Native plus standalone indexer matched native on 18/18 generated sequences; ordinary layer Mono matched 17/18; native repeat matched 18/18. One long-prompt BS8 layer Mono sequence differed. Formal GSM8K was separately qualified on c6f06f5f3; instrumented decode_ms is not a performance result.
 - After the complete model results were written, aiter IPCBuffer/CustomAllreduce destructors printed ignored PyTorch schema errors during interpreter shutdown; torchrun exited 0. The full log is retained.
 - Black, Ruff and git diff --check passed.
 
@@ -188,3 +189,67 @@ V=tests/models/deepseek_v41/mono_indexer_validation
 HIP_VISIBLE_DEVICES=1,3,2,0 TP_POINTS=1:8192:1,1:163840:1,8:163840:1 \
   torchrun --standalone --nproc-per-node=4 "$V/tp_full_optimization_benchmark.py"
 ```
+
+## Default-on TP4 long-context qualification (2026-11-19)
+
+The GPU runs use `d2aa3faeef6aec4b6f2967ff70af2c1e7273220b`. Documentation-only follow-ups do not
+change the code qualified here. Real DeepSeek-V4.1-Flash weights on
+MI355X/gfx950, physical GPUs 0–3, TP4, BF16 KV and FP4/mfma index cache;
+level3/FULL CUDA Graph, no HI/DSpark. Both Mono routes leave
+`ATOM_MONO_ENABLE` and `ATOM_DSV41_MONO_INDEXER` unset; all four ranks
+recorded enabled defaults. The ordinary layer runner recorded
+`indexer_apart=true` and all capture widths built without refusal.
+
+The fixed paired set contains 352 RULER inputs (11 tasks, 16 samples
+per task/budget, 128K and extended 160K budgets) and 64 LongBench-v2
+documents selected before inference by actual length and subdomain
+(24/24/16 in 32K–64K/64K–128K/128K–160K). RULER uses lm-eval 0.4.13's
+original generators and string_match_all. LongBench-v2 uses a fixed
+generative answer-letter prompt; this is a subset, not the full official
+benchmark score. No source truncation; every API prompt length checked.
+Common settings: temperature 0, 512 output-token cap, HTTP concurrency 8.
+
+| Route | RULER score (512) | LB raw parser (512) | LB raw parser (2048) | Caps: primary 416 / follow-up 64 |
+|---|---:|---:|---:|---:|
+| native | 99.754% | 37/64 | 37/64 | 0 / 0 |
+| native_indexer | 99.754% | 37/64 | 34/64 | 1 / 0 |
+| layer_indexer | 99.754% | 35/64 | 38/64 | 3 / 0 |
+
+The original extractor missed some Markdown answer formats. A uniform
+reference-independent normalization of every route/budget is also retained:
+
+| Route | LongBench normalized answers (512) | LongBench normalized answers (2048) |
+|---|---:|---:|
+| native | 37/64 | 37/64 |
+| native_indexer | 37/64 | 36/64 |
+| layer_indexer | 35/64 | 38/64 |
+
+The independent-only 2048 route differs on one answer choice versus
+native (36/64 versus 37/64). These are small-subset observations, not proof
+of per-question equivalence or formal non-inferiority. RULER aggregates
+are equal; all normalized paired changes are retained in the PR results.
+
+Two primary layer-Mono LongBench arithmetic responses exhausted the
+512-token budget before producing their final answer. A separate uniform
+2048-token follow-up repeats all 64 documents on all three routes with
+unchanged prompts/scoring. Both runs and their caps remain recorded; the
+follow-up does not replace the original primary samples.
+
+Budget is not actual input length: most 160K retrieval/tracking inputs
+are roughly 163K tokens; the original CWE generator produces
+132,546–132,762 tokens at that budget, and FWE varies between
+146,091–162,630. These aggregation cases are not labeled exact-160K.
+Paired changes and capped response details are retained in the PR and
+qualification archive; observations do not establish formal non-inferiority.
+
+The default-on dispatch/HI suite passed 123 tests; selected CPU regressions
+passed 454 tests plus 18 subtests; import-boundary checks with real
+aiter/FlyDSL blocked passed 124 tests, 2 skipped, 18 subtests. These
+suites overlap. A separate 16-concurrent short passkey smoke passed 16/16.
+TP2/TP8 long-context accuracy, FP8 and HI GPU qualification are outside
+this follow-up. No aiter source/query-interface changes were made.
+
+Dataset SHA256: `5f0b75439f4dea8ec8705847df9d72c9f8572b12e2eaea5b8eea07e4a96c9560`.
+
+Full model, indexer performance and paired results:
+[PR #3524 qualification](https://github.com/ROCm/ATOM/pull/3524).
