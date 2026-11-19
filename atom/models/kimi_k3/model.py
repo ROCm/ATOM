@@ -1017,13 +1017,12 @@ def kda_attention_with_output(
     its all-reduce are sized by the bucket alone, so they land in the graph.
     Every other forward runs the mixer as one region (`_kda_mixer`).
     """
-    self = get_current_atom_config().compilation_config.static_forward_context[
-        layer_name
-    ]
     fwd_ctx = get_forward_context()
     context = fwd_ctx.context
-    recording = fwd_ctx.tr_graph == "record"
-    if recording and context is not None and context.is_prefill:
+    if fwd_ctx.tr_graph == "record" and context is not None and context.is_prefill:
+        self = get_current_atom_config().compilation_config.static_forward_context[
+            layer_name
+        ]
         return self._forward_prefill_split(hidden_states, hidden_states_scale)
     return _kda_mixer(hidden_states, hidden_states_scale, layer_name)
 

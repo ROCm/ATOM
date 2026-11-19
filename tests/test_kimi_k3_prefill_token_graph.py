@@ -168,6 +168,31 @@ def test_kimi_records_prefill_token_graphs_without_dp_while_its_layers_split(
     assert not supports(1, mla_layer(), kda_layer)
 
 
+def test_the_capture_step_is_a_request_less_dummy_prefill_of_the_bucket():
+    with _einops(), atom_without_aiter() as load:
+        kimi = load("atom.model_ops.attentions.kimi_mla_gdn_attn")
+    positions = torch.full((16,), 7)
+    runner = SimpleNamespace(
+        config=SimpleNamespace(max_num_batched_tokens=8),
+        forward_vars={"positions": SimpleNamespace(gpu=positions)},
+    )
+    build = kimi._KimiMLAGDNCommon.build_for_token_graph_capture
+    builder = SimpleNamespace(model_runner=runner)
+
+    attn_metadata, context = build(builder, 8)
+    assert context.is_prefill and context.is_dummy_run
+    assert (context.scheduled_bs, context.scheduled_tokens) == (1, 8)
+    assert (context.running_bs, context.running_tokens) == (1, 8)
+    assert attn_metadata.max_seqlen_q == attn_metadata.max_seqlen_k == 8
+    # The runner's own positions, zeroed over the bucket and left alone past it.
+    assert context.positions.data_ptr() == positions.data_ptr()
+    assert torch.count_nonzero(positions[:8]) == 0
+    assert bool((positions[8:] == 7).all())
+    for tokens in (0, 9):
+        with pytest.raises(ValueError, match="exceeds max_num_batched_tokens"):
+            build(builder, tokens)
+
+
 @pytest.mark.parametrize(
     "use_mla, tr_graph, taken",
     [
