@@ -262,19 +262,28 @@ impl IngressBackend {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let (capture, requests) = mpsc::unbounded_channel();
-        let app = Router::new().route(
-            "/v1/chat/completions",
-            post(move |body: Bytes| {
-                let capture = capture.clone();
-                async move {
-                    let (reply, response) = oneshot::channel();
-                    capture
-                        .send((serde_json::from_slice::<Value>(&body).unwrap(), reply))
-                        .unwrap();
-                    response.await.unwrap()
-                }
-            }),
-        );
+        let app = Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(move |body: Bytes| {
+                    let capture = capture.clone();
+                    async move {
+                        let (reply, response) = oneshot::channel();
+                        capture
+                            .send((serde_json::from_slice::<Value>(&body).unwrap(), reply))
+                            .unwrap();
+                        response.await.unwrap()
+                    }
+                }),
+            )
+            // An ATOM prefill that offers chunked transfer, for ATOM PD routers.
+            .route(
+                "/kv_transfer_info",
+                axum::routing::get(|| async {
+                    axum::Json(json!({"tp_size": 1, "kv_role": "kv_producer",
+                        "chunked_transfer": {"remote_host": "127.0.0.1"}}))
+                }),
+            );
         Self {
             worker: Arc::new(
                 BasicWorkerBuilder::new(url)
@@ -425,6 +434,99 @@ async fn pd_ingress_dispatches_next_request_while_prefill_body_is_blocked() {
     let first = result(first).await;
     assert_eq!(first.status(), StatusCode::OK);
     first.into_body().collect().await.unwrap();
+    assert_eq!((prefill.worker.load(), decode.worker.load()), (0, 0));
+    assert_eq!(pool.shutdown().await, 0);
+}
+
+/// Through ingress, an ATOM PD router dispatches a text chat chunked when its prefill offers
+/// chunked transfer, but an `image_url` chat through the response relay: decode receives it
+/// only after prefill answers, with no `chunked_transfer` in its `kv_transfer_params`.
+#[tokio::test]
+async fn atom_pd_ingress_relays_an_image_chat_without_chunked_transfer() {
+    use crate::{
+        app_context::AppContext,
+        config::{PolicyConfig, RouterConfig, RoutingMode},
+        core::prepare_pool::PreparePoolRuntime,
+        routers::ingress::InferenceEnvelope,
+    };
+
+    let mut prefill = IngressBackend::start(WorkerType::Prefill {
+        bootstrap_port: None,
+    })
+    .await;
+    let mut decode = IngressBackend::start(WorkerType::Decode).await;
+    let config = RouterConfig {
+        mode: RoutingMode::PrefillDecode {
+            prefill_urls: vec![],
+            decode_urls: vec![],
+            prefill_policy: None,
+            decode_policy: None,
+        },
+        policy: PolicyConfig::RoundRobin,
+        backend: BackendType::Atom,
+        disable_retries: true,
+        ..Default::default()
+    };
+    let mut pool = PreparePoolRuntime::new(config.resolved_prepare_pool().unwrap()).unwrap();
+    let app = Arc::new(
+        AppContext::from_config(config, 5, pool.handle())
+            .await
+            .unwrap(),
+    );
+    app.worker_registry.register(prefill.worker.clone());
+    app.worker_registry.register(decode.worker.clone());
+    let router = PDRouter::new(&app).await.unwrap();
+    let text = json!({"type": "text", "text": "Which color is this?"});
+    let image = json!({"type": "image_url", "image_url": {"url": "https://x/red.png"}});
+    for (content, chunked) in [(json!([text]), true), (json!([text, image]), false)] {
+        let body = json!({"model": "pd-ingress-test",
+            "messages": [{"role": "user", "content": content}]});
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let request = InferenceEnvelope::parse(
+            "/v1/chat/completions".parse().unwrap(),
+            headers,
+            Bytes::from(body.to_string()),
+            &app,
+        )
+        .await
+        .unwrap();
+        let (router, app) = (router.clone(), app.clone());
+        let task = tokio::spawn(async move { router.route_inference(request, &app).await });
+        let (prefill_body, prefill_reply) = prefill.next_request().await;
+        let chunked_param = |body: &Value| body["kv_transfer_params"]["chunked_transfer"].clone();
+        if chunked {
+            assert_eq!(chunked_param(&prefill_body), json!(true));
+            let (decode_body, decode_reply) = decode.next_request().await;
+            assert_eq!(chunked_param(&decode_body), json!(true));
+            prefill_reply
+                .send(axum::Json(json!({"choices": []})).into_response())
+                .unwrap();
+            decode_reply
+                .send(axum::Json(json!({"choices": []})).into_response())
+                .unwrap();
+        } else {
+            assert_eq!(chunked_param(&prefill_body), Value::Null, "{prefill_body}");
+            // Decode waits for prefill's answer.
+            assert!(timeout(Duration::from_millis(100), decode.requests.recv())
+                .await
+                .is_err());
+            prefill_reply.send(prefill_response()).unwrap();
+            let (decode_body, decode_reply) = decode.next_request().await;
+            assert_eq!(decode_body["messages"], body["messages"]);
+            assert!(
+                decode_body["kv_transfer_params"].is_object(),
+                "{decode_body}"
+            );
+            assert_eq!(chunked_param(&decode_body), Value::Null, "{decode_body}");
+            decode_reply
+                .send(axum::Json(json!({"choices": []})).into_response())
+                .unwrap();
+        }
+        let response = result(task).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        response.into_body().collect().await.unwrap();
+    }
     assert_eq!((prefill.worker.load(), decode.worker.load()), (0, 0));
     assert_eq!(pool.shutdown().await, 0);
 }

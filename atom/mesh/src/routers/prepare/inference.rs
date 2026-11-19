@@ -70,6 +70,19 @@ impl InferenceRequest for ChatCompletionRequest {
         }
     }
 }
+/// The routing copy of a chat with media, which token routing templates.
+pub(crate) struct RoutingChat {
+    /// The chat with digests in place of its media.
+    pub chat: ChatCompletionRequest,
+    /// For ATOM backends: one digest of all the chat's media, which goes before
+    /// the routing text and before the templated prompt. ATOM keys every KV
+    /// block of a media prompt by all its media, so two prompts that differ only
+    /// in an image past `prefix_hash`'s token window, or after a long shared
+    /// text, share no block. `None` for vLLM and SGLang, whose prefix caches
+    /// key a block by the media it covers, as the in-place digests do.
+    pub front: Option<String>,
+}
+
 /// A routing copy of `request` with each image and video replaced in place by
 /// a text digest of its URL, or `None` when it has no media. Routing text and
 /// template tokens otherwise drop media or render it as an identity-free
@@ -94,12 +107,11 @@ fn with_media_digests(request: &ChatCompletionRequest) -> Option<ChatCompletionR
             continue;
         };
         for part in parts {
-            let digest = match part {
-                ContentPart::ImageUrl { image_url } => media_digest("image", &image_url.url),
-                ContentPart::VideoUrl { video_url } => media_digest("video", &video_url.url),
-                ContentPart::Text { .. } => continue,
-            };
-            *part = ContentPart::Text { text: digest };
+            if let Some((kind, url)) = media_url(part) {
+                *part = ContentPart::Text {
+                    text: media_digest(kind, url),
+                };
+            }
         }
     }
     Some(routed)
@@ -123,6 +135,26 @@ fn media_parts(request: &ChatCompletionRequest) -> impl Iterator<Item = &Content
             MessageContent::Text(_) => &[],
         })
         .filter(|part| !matches!(part, ContentPart::Text { .. }))
+}
+
+/// A media part's kind and URL; `None` for text.
+fn media_url(part: &ContentPart) -> Option<(&'static str, &str)> {
+    match part {
+        ContentPart::ImageUrl { image_url } => Some(("image", &image_url.url)),
+        ContentPart::VideoUrl { video_url } => Some(("video", &video_url.url)),
+        ContentPart::Text { .. } => None,
+    }
+}
+
+/// One digest of all of a chat's media, in order.
+fn all_media_digest(request: &ChatCompletionRequest) -> String {
+    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+    for (kind, url) in media_parts(request).filter_map(media_url) {
+        hasher.update(kind.as_bytes());
+        hasher.update(&(url.len() as u64).to_le_bytes());
+        hasher.update(url.as_bytes());
+    }
+    format!("\u{1}media:{:016x}\u{1}", hasher.digest())
 }
 
 /// A digest marks its media's place in the routing text. Unlike a template's
@@ -355,16 +387,21 @@ impl ParsedInference {
 
     /// Images, video, audio or embeddings, which the request's tokens do not show but an
     /// engine keys every KV block of the prompt by: a chat's image and video
-    /// parts; a generate request's image, video and audio items (an array
-    /// counts its elements), and its `input_embeds` as one.
+    /// parts; a generate request's image, video and audio items (arrays,
+    /// nested as a batch's are, count the non-null items they hold, so `[]`
+    /// and `[[],[]]` count none), and its `input_embeds` as one.
     pub(crate) fn media_count(&self) -> usize {
+        fn items(data: &serde_json::Value) -> usize {
+            match data {
+                serde_json::Value::Array(values) => values.iter().map(items).sum(),
+                serde_json::Value::Null => 0,
+                _ => 1,
+            }
+        }
         match self {
             Self::Chat(chat) => media_parts(chat).count(),
             Self::Generate(generate) => {
-                let items = |data: &Option<serde_json::Value>| {
-                    data.as_ref()
-                        .map_or(0, |data| data.as_array().map_or(1, Vec::len))
-                };
+                let items = |data: &Option<serde_json::Value>| data.as_ref().map_or(0, items);
                 items(&generate.image_data)
                     + items(&generate.video_data)
                     + items(&generate.audio_data)
@@ -374,12 +411,24 @@ impl ParsedInference {
         }
     }
 
-    /// Routing metadata with its text and, for a chat with media, the chat
-    /// with digests in place of its media, which token routing templates.
-    /// The digested chat is built once for both.
-    pub(crate) fn routing_metadata(&self) -> (InferenceMetadata, Option<ChatCompletionRequest>) {
-        let digested = self.chat().and_then(with_media_digests);
-        (self.metadata_of(digested.as_ref(), true), digested)
+    /// Routing metadata with its text and, for a chat with media, its
+    /// [`RoutingChat`], built once for both. With `front_digest` (ATOM
+    /// backends), the routing text starts with [`RoutingChat::front`].
+    pub(crate) fn routing_metadata(
+        &self,
+        front_digest: bool,
+    ) -> (InferenceMetadata, Option<RoutingChat>) {
+        let routed = self.chat().and_then(|chat| {
+            Some(RoutingChat {
+                chat: with_media_digests(chat)?,
+                front: front_digest.then(|| all_media_digest(chat)),
+            })
+        });
+        let mut metadata = self.metadata_of(routed.as_ref().map(|routed| &routed.chat), true);
+        if let Some(front) = routed.as_ref().and_then(|routed| routed.front.as_deref()) {
+            metadata.text.insert_str(0, front);
+        }
+        (metadata, routed)
     }
 
     pub fn chat(&self) -> Option<&ChatCompletionRequest> {
@@ -408,8 +457,9 @@ impl Serialize for RoutingView<'_> {
 }
 
 impl InferenceRequest for ParsedInference {
+    /// The routing metadata vLLM and SGLang backends get.
     fn metadata(&self) -> InferenceMetadata {
-        self.routing_metadata().0
+        self.routing_metadata(false).0
     }
     fn metadata_with_text(&self, include_text: bool) -> InferenceMetadata {
         if include_text {

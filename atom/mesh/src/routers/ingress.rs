@@ -30,7 +30,7 @@ use crate::{
     policies::{LoadBalancingPolicy, PolicyRegistry},
     routers::{
         comm::error::{IngressError, MeshLocalError},
-        prepare::inference::{InferenceMetadata, InferenceRequest, ParsedInference},
+        prepare::inference::{InferenceMetadata, InferenceRequest, ParsedInference, RoutingChat},
     },
     server::AppState,
     tokenizer::TokenizerRegistry,
@@ -634,6 +634,10 @@ pub struct IngressRouting {
     chats_without_template: Arc<RwLock<HashSet<String>>>,
     pd: bool,
     max_tokenize_bytes: usize,
+    /// ATOM backends get a media chat's routing text and templated prompt
+    /// with one digest of all its media in front ([`RoutingChat::front`]);
+    /// vLLM and SGLang get only the in-place digests.
+    front_media_digest: bool,
 }
 
 impl IngressRouting {
@@ -645,6 +649,7 @@ impl IngressRouting {
             chats_without_template: app.chats_without_template.clone(),
             pd: app.router_config.mode.is_pd_mode(),
             max_tokenize_bytes: app.router_config.resolved_max_tokenize_bytes(),
+            front_media_digest: app.router_config.backend == crate::config::BackendType::Atom,
         }
     }
 
@@ -717,10 +722,10 @@ impl IngressRouting {
         tokens: Tokens,
         ctx: &JobContext,
     ) -> Result<RoutingPreparation, IngressError> {
-        let (metadata, digested) = parsed.routing_metadata();
-        let chat = digested.as_ref().or(parsed.chat());
+        let (metadata, routed) = parsed.routing_metadata(self.front_media_digest);
+        let routed = routed.as_ref();
         let tokens = match tokens {
-            Tokens::Needed { wanted } => Some(self.tokens(parsed, chat, &metadata, ctx, wanted)?),
+            Tokens::Needed { wanted } => Some(self.tokens(parsed, routed, &metadata, ctx, wanted)?),
             // The index cannot match media, and these APIs have no token-routing template.
             Tokens::Wanted
                 if metadata.carries_media
@@ -732,7 +737,7 @@ impl IngressRouting {
                 None
             }
             // With the special tokens, as ATOM's `tokenizer.encode(prompt)` stores the blocks.
-            Tokens::Wanted => match self.tokens(parsed, chat, &metadata, ctx, true) {
+            Tokens::Wanted => match self.tokens(parsed, routed, &metadata, ctx, true) {
                 Ok(tokens) => Some(tokens),
                 // Routed by its text, unless the job is cancelled or late.
                 Err(error) => {
@@ -835,11 +840,12 @@ impl IngressRouting {
     }
 
     /// The request's `input_ids`, or its prompt encoded, with the tokenizer's special tokens
-    /// when `add_special_tokens`. A chat's prompt is `chat` templated.
+    /// when `add_special_tokens`. A chat's prompt is its `routed` copy, when it has one,
+    /// templated, after that copy's `front` digest.
     fn tokens(
         &self,
         parsed: &ParsedInference,
-        chat: Option<&crate::protocols::chat::ChatCompletionRequest>,
+        routed: Option<&RoutingChat>,
         metadata: &InferenceMetadata,
         ctx: &JobContext,
         add_special_tokens: bool,
@@ -875,13 +881,18 @@ impl IngressRouting {
         }
         ctx.check()?;
         let template_started = Instant::now();
-        let prompt = if let Some(chat) = chat {
+        let prompt = if let Some(chat) = routed.map(|routed| &routed.chat).or(parsed.chat()) {
             if self.chats_without_template.read().contains(&entry.id) {
                 return Err(IngressError::new(http::StatusCode::NOT_IMPLEMENTED, "token_routing_unsupported", "this model's chats render with a built-in encoder whose defaults are not the engine's; use a policy that does not require exact tokens"));
             }
-            super::prepare::chat_template::process_chat_messages(chat, &*entry.tokenizer)
-                .map_err(IngressError::invalid)?
-                .text
+            let mut prompt =
+                super::prepare::chat_template::process_chat_messages(chat, &*entry.tokenizer)
+                    .map_err(IngressError::invalid)?
+                    .text;
+            if let Some(front) = routed.and_then(|routed| routed.front.as_deref()) {
+                prompt.insert_str(0, front);
+            }
+            prompt
         } else {
             metadata.text.clone()
         };

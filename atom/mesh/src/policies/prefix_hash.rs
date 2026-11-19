@@ -104,7 +104,7 @@ impl PrefixHashPolicy {
 
     /// Compute hash of prefix tokens using xxhash
     #[inline]
-    fn compute_prefix_hash(&self, tokens: &[u32]) -> u64 {
+    pub(crate) fn compute_prefix_hash(&self, tokens: &[u32]) -> u64 {
         let prefix_len = tokens.len().min(self.config.prefix_token_count);
         let prefix = &tokens[..prefix_len];
 
