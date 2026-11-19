@@ -145,8 +145,16 @@ def test_long_context_work_is_bounded_without_reducing_query_shapes(
 
 
 @pytest.mark.parametrize("fail_unsplit", [False, True])
-def test_profile_budgets_reserved_peak_and_releases_scratch(monkeypatch, fail_unsplit):
+@pytest.mark.parametrize("confidence", [False, True])
+def test_profile_budgets_reserved_peak_and_releases_scratch(
+    monkeypatch, fail_unsplit, confidence
+):
     from atom.model_engine import mixed_profile
+    from atom.spec_decode.dspark_verify import VerifyScheduler
+
+    verify = VerifyScheduler.__new__(VerifyScheduler)
+    verify._ell_map = {}
+    verify._ell_pending = []
 
     config = SimpleNamespace(
         max_num_seqs=4,
@@ -170,6 +178,9 @@ def test_profile_budgets_reserved_peak_and_releases_scratch(monkeypatch, fail_un
 
     def forward(batch):
         observed.append(memory["reserved"])
+        if confidence:
+            verify._ell_map = {42: 1}
+            verify._ell_pending.append(object())
         if fail_unsplit:
             raise RuntimeError("unsplit forward failed")
         allocated, reserved = 128, 140
@@ -184,6 +195,8 @@ def test_profile_budgets_reserved_peak_and_releases_scratch(monkeypatch, fail_un
         tokenID_processor=SimpleNamespace(clean=lambda: None),
         forward=forward,
     )
+    if confidence:
+        runner.drafter = SimpleNamespace(mtp_k=7, verify_scheduler=verify)
     monkeypatch.setattr(
         mixed_profile,
         "_batch",
@@ -211,3 +224,5 @@ def test_profile_budgets_reserved_peak_and_releases_scratch(monkeypatch, fail_un
         assert mixed_profile.profile_mixed_memory(runner) == (80 + (140 - 100), 7)
     assert not pool_open
     assert observed
+    assert verify._ell_pending == []
+    assert verify.ell_by_req == {}

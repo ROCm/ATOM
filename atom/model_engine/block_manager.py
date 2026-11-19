@@ -3797,9 +3797,13 @@ class BlockManager:
         (`mtp_k - 1`), so the lookahead never raises the bar there; it is
         passed so the check states what it covers.
         """
-        return self._has_page_units(
-            self.append_blocks_needed(seq, num_new_tokens, lookahead)
-        )
+        seq_len = len(seq)
+        current_blocks = len(seq.block_table)
+        ebs = self._effective_block_size()
+        reach = seq_len + max(num_new_tokens, lookahead)
+        needed_blocks = (reach + ebs - 1) // ebs
+        new_blocks_needed = max(0, needed_blocks - current_blocks)
+        return self._has_page_units(new_blocks_needed)
 
     def append_blocks_needed(
         self, seq: Sequence, num_new_tokens: int = 1, lookahead: int = 0

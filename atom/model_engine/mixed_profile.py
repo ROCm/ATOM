@@ -209,7 +209,13 @@ def profile_mixed_memory(runner) -> tuple[int, int]:
                     )
                     del batch
         finally:
+            # Profiling uses synthetic request IDs. Drain their copies before
+            # dropping the confidence generations the first real decode reads.
+            torch.cuda.synchronize()
             runner.tokenID_processor.clean()
+            drafter = getattr(runner, "drafter", None)
+            if drafter is not None and drafter.verify_scheduler is not None:
+                drafter.verify_scheduler.ell_by_req = {}
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
