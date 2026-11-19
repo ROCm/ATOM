@@ -12,6 +12,9 @@ Pull the latest development image:
 docker pull rocm/atom-dev:latest
 ```
 
+MXFP8 (1x32) linears that stay native, with no online target, need an AITER
+build with [ROCm/aiter#8086](https://github.com/ROCm/aiter/pull/8086) or later.
+
 ## MXFP4 on 4xMI355 GPUs
 
 ### Launching Server
