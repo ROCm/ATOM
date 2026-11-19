@@ -151,10 +151,15 @@ fail() {  # <class> <exit-code> <message...>
 # >>> prompt-gate (selftest extracts and runs this block verbatim)
 _cp_out="$(python3 "$SKILL/check_prompts.py" 2>&1)" || {
   printf '%s\n' "$_cp_out" >&2
-  _why="$(printf '%s' "$_cp_out" | grep -m3 '^❌' | tr '\n' ';' | sed 's/;$//')"
+  # Both greps `|| true`: this script runs under `set -euo pipefail`, where a grep that
+  # matches nothing fails the whole pipeline and takes the assignment -- and the script --
+  # with it. That is the case these lines exist for, so without it the fallback below is
+  # unreachable and the run dies with no classified status at all, which is the failure
+  # this block was written to end.
+  _why="$(printf '%s' "$_cp_out" | grep -m3 '^❌' | tr '\n' ';' | sed 's/;$//' || true)"
   # A crash prints a traceback and no ❌ at all, and an empty reason is the problem this
   # block exists to remove. Fall back to the last line it did print.
-  [ -n "$_why" ] || _why="$(printf '%s' "$_cp_out" | grep -v '^$' | tail -1)"
+  [ -n "$_why" ] || _why="$(printf '%s' "$_cp_out" | grep -v '^$' | tail -1 || true)"
   fail flow 4 "check_prompts.py refused: ${_why:-no output; run it by hand}"
 }
 # <<< prompt-gate

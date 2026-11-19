@@ -452,7 +452,10 @@ _flow_msg() {  # <python snippet that makes check_prompts fail> -> what run_one 
   # The block run here is extracted from run_one.sh, not a copy of it: a test that
   # reimplements the thing it guards passes whatever run_one.sh does.
   blk=$(sed -n '/# >>> prompt-gate/,/# <<< prompt-gate/p' "$S/run_one.sh")
-  SKILL="$d" bash -c "fail(){ printf '%s\n' \"\$3\"; exit \"\$2\"; }
+  # run_one.sh is `set -euo pipefail`; a harness without it is a different shell, and the
+  # difference is load-bearing here (a grep that matches nothing aborts the script).
+  SKILL="$d" bash -c "set -euo pipefail
+fail(){ printf '%s\n' \"\$3\"; exit \"\$2\"; }
 $blk" 2>/dev/null
 }
 # A crash prints a traceback and no ❌ at all. An empty reason is the very thing this
@@ -460,9 +463,18 @@ $blk" 2>/dev/null
 _flow_raw() {  # <python body for a stand-in check_prompts> -> what run_one would say
   d=$(mktemp -d); printf '%s\n' "$1" > "$d/check_prompts.py"
   blk=$(sed -n '/# >>> prompt-gate/,/# <<< prompt-gate/p' "$S/run_one.sh")
-  SKILL="$d" bash -c "fail(){ printf '%s\n' \"\$3\"; exit \"\$2\"; }
+  # run_one.sh is `set -euo pipefail`; a harness without it is a different shell, and the
+  # difference is load-bearing here (a grep that matches nothing aborts the script).
+  SKILL="$d" bash -c "set -euo pipefail
+fail(){ printf '%s\n' \"\$3\"; exit \"\$2\"; }
 $blk" 2>/dev/null
 }
+# The two harnesses above hand-copy run_one.sh's shell options. If run_one gains or loses
+# one, they silently go on testing a shell that no longer exists -- which is how the grep
+# abort above survived a green suite. Pin them to the real line.
+t "the harness runs the block under run_one's own shell options" \
+  "$(grep -c '^set -euo pipefail$' "$S/run_one.sh")$(grep -c 'bash -c "set -euo pipefail$' "$S/selftest.sh")" "12"
+
 t "a crash with a message reports the message" \
   "$(_flow_raw 'import sys
 print("Traceback: boom", file=sys.stderr)
