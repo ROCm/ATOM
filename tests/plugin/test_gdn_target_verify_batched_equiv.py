@@ -219,8 +219,8 @@ def test_ssm_per_step_loop_matches_batched_slot_table(bs: int, draft: int):
 
 @pytest.mark.parametrize("draft", DRAFT_LENS)
 def test_batched_ssm_leaves_live_state_untouched(draft: int):
-    """The batched path writes only into the slot pool, so the plugin's
-    snapshot/restore of the live SSM state becomes unnecessary."""
+    """The batched path writes only into the slot pool; the live SSM state
+    stays untouched."""
     inp = _Inputs(3, draft)
     live_before = inp.live_ssm.clone()
     _ssm_batched(inp)

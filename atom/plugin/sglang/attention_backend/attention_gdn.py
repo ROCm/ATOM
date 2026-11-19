@@ -343,7 +343,8 @@ def track_mamba_radix_after_decode_graph(
 
 
 class SGLangGatedDeltaNet(GatedDeltaNet):
-    """Run batched ATOM GDN while filling SGLang's verify snapshots."""
+    """ATOM GDN under SGLang. TARGET_VERIFY runs ReplaySSM, or the batched path
+    with ``ATOM_ENABLE_REPLAYSSM=0``."""
 
     def forward(
         self,
@@ -649,14 +650,15 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
         `intermediate_ssm` as a flat `[slot * step]` pool via a 2D index table,
         so every per-step state lands where SGLang's
         `fused_mamba_state_scatter_with_mask` expects it. The live SSM state is
-        never written, so it needs no snapshot/restore.
+        only read.
 
         The conv update is folded into one wide-window call over SGLang's
         deduplicated sliding-window `intermediate_conv_window`.
 
-        Equivalence with the stepwise loop is covered bit-for-bit by
-        tests/plugin/test_gdn_target_verify_batched_equiv.py and
-        tests/plugin/test_sglang_gdn_verify_batched_ssm.py.
+        Equivalence with a per-step reference loop is checked bit-for-bit by
+        tests/plugin/test_gdn_target_verify_batched_equiv.py;
+        tests/plugin/test_sglang_gdn_verify_batched_ssm.py checks the plugin
+        contract (buffers, live state, one kernel call, pad rows).
         """
         query_all, key_all, value_all, g, beta = self._spec_conv_qkv(
             layer_cache=layer_cache,
@@ -786,7 +788,7 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
         with `view[s, t, d, w] = phys[s, d, t + w]` (see `MambaPool.__init__`
         and `conv_window_dedup_enabled` in SGLang's memory_pool.py). That
         physical row is exactly what ATOM's spec `causal_conv1d_update` writes,
-        so recovering it lets one call replace the whole per-step loop.
+        so recovering it lets one call write every step's window.
 
         Raises when the view is not that dedup layout. DFLASH target verify on
         ROCm requires the linear-chain deduplicated layout.
@@ -1019,9 +1021,10 @@ class SGLangGDNForwardContext:
     ) -> GDNAttentionMetadata | None:
         mode = forward_batch.forward_mode
         if mode.is_target_verify():
-            # SGLangGatedDeltaNet fills SGLang's transactional snapshots using
-            # ATOM's stepwise kernels. Keep the outer ATOM context active for
-            # MoE, norms and collectives without native GDN metadata.
+            # TARGET_VERIFY runs SGLangGatedDeltaNet's own conv + SSM verify
+            # (ReplaySSM, or the batched path with ATOM_ENABLE_REPLAYSSM=0) and
+            # needs no native GDN metadata. Keep the outer ATOM context active
+            # for MoE, norms and collectives.
             return None
 
         bs = forward_batch.batch_size
