@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from atom.model_engine.dp_sync_gate import DPSyncGate
+from atom.model_engine.dp_sync_gate import MAX_DP_SYNC_INTERVAL, DPSyncGate
 
 SOURCE = Path(__file__).resolve().parents[1] / "atom/model_engine/engine_core.py"
 
@@ -66,7 +66,7 @@ def _loop_methods(scope):
     return {name: scope[name] for name in names}
 
 
-def _run(intervals, work, commands=None, shutdown_at=32):
+def _run(intervals, work, commands=None, shutdown_at=32, startup_error=None):
     """A command enters on its specified round and is consumed on a sync round."""
     group = _Group(len(intervals))
     engines, failures = [], []
@@ -88,13 +88,22 @@ def _run(intervals, work, commands=None, shutdown_at=32):
             cleaned=False,
         )
 
+        def group_max_each(values, group, e=engine):
+            if startup_error is not None:
+                raise startup_error
+            values = group.exchange(e.rank, "bounds", e.tick, values)
+            e.events.append(("bounds", e.tick))
+            return tuple(values)
+
         def all_reduce(tensor, *, op, group, e=engine):
-            kind = "bounds" if e.tick == -1 else "state"
+            kind = "state"
             tensor.values = group.exchange(e.rank, kind, e.tick, tensor.values)
             e.events.append((kind, e.tick))
 
         scope = {
             "DPSyncGate": DPSyncGate,
+            "MAX_DP_SYNC_INTERVAL": MAX_DP_SYNC_INTERVAL,
+            "group_max_each": group_max_each,
             "envs": SimpleNamespace(
                 ATOM_DP_SYNC_INTERVAL=interval, ATOM_METRICS_UPDATE_INTERVAL_S=1e9
             ),
@@ -236,7 +245,9 @@ def test_mismatched_intervals_fail_on_all_ranks_before_state_or_forward(interval
     assert all(e.events == [("bounds", -1)] for e in engines)
 
 
-@pytest.mark.parametrize("intervals", [[1, None], [None, 8, 16, None]])
+@pytest.mark.parametrize(
+    "intervals", [[1, None], [None, 8, 16, None], [1, 17], [17, 17]]
+)
 def test_invalid_interval_fails_on_all_ranks_before_any_other_collective(intervals):
     engines, failures = _run(intervals, lambda r, t: True)
     assert len(failures) == len(intervals)
@@ -263,3 +274,16 @@ def test_shutdown_drains_existing_work_with_sync_on_every_remaining_round():
         # A locally latched shutdown becomes global at the next sync (round 8).
         assert list(range(8, 20)) == [t for t in syncs if 8 <= t <= 19]
         assert any(kind == "forward" and t == 17 for kind, t in engine.events)
+
+
+def test_a_lost_peer_at_startup_shuts_down_like_a_state_sync():
+    """The startup agreement failing (a dead peer) shuts the loop down as
+    `_sync_dp_state` does, instead of raising out of `busy_loop`."""
+    engines, failures = _run(
+        [1, 1], lambda r, t: False, startup_error=RuntimeError("peer lost")
+    )
+    assert not failures
+    assert all(e._shutting_down and e.cleaned for e in engines)
+    assert all(
+        kind not in ("bounds", "forward") for e in engines for kind, _ in e.events
+    )

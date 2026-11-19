@@ -636,20 +636,27 @@ binding, and MoRI's `gpu_per_node`.
 ### DP state sync interval
 
 `ATOM_DP_SYNC_INTERVAL=N` reduces CPU Gloo state synchronization to once per
-N paired engine rounds while the DP group has unfinished work. A rank with no
-local batch completes a dummy step alongside its peers. The default `1` keeps
-per-round synchronization; idle and held phases also synchronize every round.
+N paired engine rounds after a sync that found unfinished work in the DP
+group. It applies to every DP > 1 run, single-node included; pipeline parallel
+uses its own stage loops and does not read it. A rank with no local batch
+completes a dummy step alongside its peers. The default `1` keeps per-round
+synchronization.
 
 Set the same value on every node before starting the engines. One startup
 collective checks the minimum and maximum interval and any invalid input.
-Every rank raises on a mismatch, non-integer value or int64 overflow before
+Every rank raises on a mismatch, a non-integer value or a value above 16 before
 entering the busy loop. Restart to change the interval.
 
-Utility commands are applied on sync rounds. A command queued just after a
-sync can wait through the next N-1 paired rounds; this is a bound in engine
-rounds, not seconds, and includes the time to finish the current forward.
-Shutdown is observed on a sync round and still drains unfinished work before
-exit. Validate command latency and multi-node correctness before selecting N.
+The rounds after such a sync run paired without looking at the group's state,
+so once the group drains every rank still runs up to N-1 dummy rounds before
+the next sync sees it idle; only then do idle and held phases synchronize every
+round. Utility commands are applied on sync rounds, so a command queued just
+after a sync can wait through the next N-1 paired rounds. That includes
+`abort_request`: an aborted request keeps decoding and holding its KV until
+then. This is a bound in engine rounds, not seconds, and includes the time to
+finish the current forward. Shutdown is observed on a sync round and still
+drains unfinished work before exit. Validate command latency and multi-node
+correctness before selecting N.
 
 ### Ports
 

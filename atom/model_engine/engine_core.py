@@ -12,11 +12,12 @@ import torch
 import zmq
 
 from atom.config import Config
+from atom.distributed.group_agreement import group_max_each
 from atom.kv_transfer.disaggregation import KVOutputAggregator
 from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.async_proc import AsyncIOProcManager
-from atom.model_engine.dp_sync_gate import DPSyncGate
+from atom.model_engine.dp_sync_gate import MAX_DP_SYNC_INTERVAL, DPSyncGate
 from atom.model_engine.dynamic_chunking import (
     DYNAMIC_CHUNKING_POLL_STEPS,
     ChunkSizePredictor,
@@ -1213,25 +1214,28 @@ class DPEngineCoreProc(EngineCore):
 
         One MAX reduction gives both bounds. Every rank sees the same mismatch
         and raises, rather than pairing a state collective with a peer's model
-        collective on the first skipped round.
+        collective on the first skipped round. A peer lost here shuts the loop
+        down as `_sync_dp_state` does.
         """
         value = 0 if interval is None else interval
-        bounds = torch.tensor(
-            [value, -value, int(interval is None)], dtype=torch.int64, device="cpu"
-        )
-        torch.distributed.all_reduce(
-            bounds, op=torch.distributed.ReduceOp.MAX, group=self.dp_group
-        )
-        highest, lowest = bounds[0].item(), -bounds[1].item()
-        if bounds[2].item():
+        try:
+            highest, neg_lowest, invalid = group_max_each(
+                (value, -value, int(interval is None or value > MAX_DP_SYNC_INTERVAL)),
+                self.dp_group,
+            )
+        except RuntimeError as e:
+            logger.warning(f"{self.label}: DP sync interval agreement failed: {e}")
+            self._shutting_down = True
+            return 1
+        if invalid:
             raise ValueError(
-                "ATOM_DP_SYNC_INTERVAL must be an integer representable as int64 "
+                f"ATOM_DP_SYNC_INTERVAL must be an integer up to {MAX_DP_SYNC_INTERVAL} "
                 "on every DP rank; at least one rank has an invalid value"
             )
-        if highest != lowest:
+        if highest != -neg_lowest:
             raise ValueError(
                 "ATOM_DP_SYNC_INTERVAL must match on every DP rank; "
-                f"got values from {lowest} to {highest}"
+                f"got values from {-neg_lowest} to {highest}"
             )
         return value
 

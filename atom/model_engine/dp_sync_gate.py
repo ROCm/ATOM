@@ -1,14 +1,21 @@
-"""Which multi-node DP busy-loop rounds run the cross-DP state all_reduce."""
+"""Which DP (DP > 1) busy-loop rounds run the cross-DP state all_reduce."""
+
+# Largest ATOM_DP_SYNC_INTERVAL: every rank still runs up to N-1 dummy rounds
+# after the group drains, and commands, abort and shutdown wait as long.
+MAX_DP_SYNC_INTERVAL = 16
 
 
 class DPSyncGate:
-    """Skip the DP state all_reduce while the group has unfinished work.
+    """Skip the DP state all_reduce for the rounds after a sync that saw work.
 
     Every rank feeds it the same all_reduce results and runs the same number of
     busy rounds between syncs, so every rank syncs on the same round.
     Ranks with no local work still complete a paired dummy step. All ranks
-    must use the same interval.
-    ``interval == 1`` syncs every round.
+    must use the same interval, at most ``MAX_DP_SYNC_INTERVAL``.
+    ``interval == 1`` syncs every round. The rounds after such a sync run
+    paired, so once the group drains every rank still runs up to
+    ``interval - 1`` dummy rounds before the next sync sees it idle; utility
+    commands and shutdown wait for that sync too.
     """
 
     def __init__(self, interval: int) -> None:
