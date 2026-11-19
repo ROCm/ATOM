@@ -66,10 +66,11 @@ def raise_timeout_if_dp_spans_nodes(parallel_config) -> None:
         raise_default_group_timeout(envs.ATOM_MULTINODE_PG_TIMEOUT_S)
 
 
-def raise_timeout_if_tp_spans_nodes(config) -> None:
-    """Apply ATOM_MULTINODE_PG_TIMEOUT_S when the TP group has ranks on other
-    nodes (tp_multinode.py), as raise_timeout_if_dp_spans_nodes does for DP."""
-    if config.is_multinode_tp:
+def raise_timeout_if_model_spans_nodes(config) -> None:
+    """Apply ATOM_MULTINODE_PG_TIMEOUT_S when the TP group (tp_multinode.py) or
+    the pipeline (Config.is_multinode_pp) has ranks on other nodes, as
+    raise_timeout_if_dp_spans_nodes does for DP."""
+    if config.is_multinode_tp or config.is_multinode_pp:
         raise_default_group_timeout(envs.ATOM_MULTINODE_PG_TIMEOUT_S)
 
 
