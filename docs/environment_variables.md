@@ -144,6 +144,16 @@ cannot affect a server that does not use the feature.
 | **ATOM_FUSE_SHARED_EXPERT** | bool | 1 (true) | Fuse the shared expert into the routed MoE kernel, loaded as one more expert, where the quant config allows it. Under DP attention with MoRI EP, the fused path exists only for MXFP4 / NVFP4 routed experts: an FP8 MoE such as DeepSeek-V3 makes `FusedMoE` raise `NotImplementedError` unless this is `0`, which keeps the shared expert a separate MLP. vLLM likewise requires shared-expert fusion off with MoRI. |
 | **ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4** | bool | 0 (false) | Fuse an MXFP8 shared expert into MXFP4 routed experts (the Quark MXFP4 export of MiniMax-M3.1), so the MoE runs as one fused MoE with the shared expert as one more expert (129 experts, top-5). The shared expert is staged in MXFP8 while loading and re-quantized to MXFP4 after it, so it carries MXFP4 rounding error. Not supported with EPLB under all2all EP, with an `--online_quant_config` that re-quantizes the MoE, or across a weight reload. Off keeps the shared expert a separate MXFP8 MLP. Part of the compile cache key. |
 
+### Weight cache
+
+Experimental. `ATOM_PRELOAD=1` keeps a launch's loaded weights (and drafter) on the GPUs in a daemon, so a restart of the server maps them over CUDA IPC instead of reading the checkpoint. The daemon exits after an hour without a connected server; `python -m atom.model_loader.weight_cache status|stop [--force]` shows or stops this user's daemons (their sockets and logs are in `/tmp/atom_weight_cache_<uid>`). Not with PP, EPLB, multi-node DP or TP, or a custom runner (those launches fail). A load that leaves state the cache cannot share is loaded from disk.
+
+A server uses a daemon's weights when the cache key matches: the checkpoint, the drafter, the rank and parallel layout, the quantization config, and the launch options and environment variables listed in `atom/model_loader/weight_cache/key.py` (`_CONFIG_FIELDS`, `_ENV_VARS`). Nothing else is compared: after a change to weight-loading code (ATOM's or a kernel library's), or to a setting that is not on those lists, stop the daemon by hand, and add a setting to the list when loading starts to depend on it.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_PRELOAD** | str | unset | `1`: the API server starts a daemon with its own command line if there is none, maps its weights when the cache key matches, and restarts it once when it does not (e.g. another quantization config); if that daemon cannot be used either, it loads from disk. Outside the API server it loads from disk. `daemon`: this launch only loads the weights and serves them to `ATOM_PRELOAD=1` servers, no requests (what a server starts; set it by hand to load ahead of the first server). |
+
 ## Plugin mode
 
 | Variable | Type | Default | Description |

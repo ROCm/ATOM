@@ -42,10 +42,13 @@ logger = logging.getLogger("atom")
 ModelLoader = Callable[[Config, type, torch.device], nn.Module]
 
 
-def init_model_env(config: Config, rank: int) -> torch.device:
+def init_model_env(
+    config: Config, rank: int, *, dist_env=init_dist_env
+) -> torch.device:
     """Set up this process for building its rank's model: the current
     config, its device and its parallel groups (their ranks decide what a
-    rank loads). Returns the device."""
+    rank loads). Returns the device. ``dist_env`` builds the groups without
+    PP; a process that only loads may leave their device communicators out."""
     # Read just below (sp_is_enabled) and by model construction.
     set_current_atom_config(config)
     if sp_is_enabled():
@@ -119,7 +122,7 @@ def init_model_env(config: Config, rank: int) -> torch.device:
     else:
         # The group spans the devices that exist; apply_simulated_tp then
         # makes it *report* the logical width so layers shard that many ways.
-        init_dist_env(
+        dist_env(
             config.tp_world_size,
             rankID=rank,
             backend="nccl",
