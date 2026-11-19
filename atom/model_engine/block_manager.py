@@ -36,7 +36,7 @@ from atom.model_engine.prefix_hash import (
     prompt_fingerprint,
 )
 from atom.model_engine.sequence import Sequence
-from atom.model_engine.state_cache import StateCache, StateCheckpointCache
+from atom.model_engine.state_cache import KEEP_NONE, StateCache, StateCheckpointCache
 from atom.model_engine.state_pool import StateSlotPool
 from atom.model_engine.state_runtime import (
     DEFAULT_STATE_RUNTIME,
@@ -397,6 +397,7 @@ class BlockManager:
                 checkpoint_spec,
                 enabled=enabled,
                 readable_midstep=state_runtime.transfer.readable_midstep,
+                decode_keep=state_runtime.transfer.decode_keep,
             )
         # The rolling state class: per-request slots plus a content index over
         # the free ones. A checkpoint IS a free slot whose content is still
@@ -419,9 +420,10 @@ class BlockManager:
         self.midstep_grid = state_runtime.transfer.midstep_grid
         self.midstep_min_offset = state_runtime.transfer.midstep_min_offset
         if self.paged_state_checkpoints is not None:
-            # A PAGE midstep checkpoint is copied into a scratch slot from
-            # this pool, then stored from there, within the copy budget the
-            # runner's descriptor staging is sized to: one definition for both.
+            # A PAGE midstep checkpoint or decode image is built in a scratch
+            # slot from this pool, then stored from there, within the copy
+            # budget the runner's descriptor staging is sized to: one
+            # definition for both.
             self.paged_state_checkpoints.attach_midstep_scratch(
                 self.state,
                 checkpoint_copy_ops_per_batch(getattr(config, "max_num_seqs", 0)),
@@ -2489,6 +2491,7 @@ class BlockManager:
         next_forward_tokens: int | None = None,
         aimed: bool = True,
         replay_until: int | None = None,
+        snapshot_step: int = -1,
     ) -> None:
         """Register hashes for blocks finalized by the most recent step.
 
@@ -2516,6 +2519,8 @@ class BlockManager:
         replay has rebuilt the state whole there, so that may be checkpointed.
         Left unset it reads `seq.replay_until`, which under pipeline
         parallelism a later chunk's scheduling may already have moved.
+
+        `snapshot_step` reaches `StateCache.checkpoint`; see `hash_decode_blocks`.
         """
         if not self.enable_prefix_caching:
             return
@@ -2568,12 +2573,12 @@ class BlockManager:
             )
         pos = base + num_new_tokens
         kept = (
-            self.checkpointers_at(seq, pos, next_forward_tokens, aimed)
+            self.checkpointers_at(seq, pos, next_forward_tokens, aimed, snapshot_step)
             if pos > seq.scheduled_checkpoint_pos
             else []
         )
         for cache in kept:
-            cache.checkpoint(seq, end, h)
+            cache.checkpoint(seq, end, h, snapshot_step)
         if kept:
             seq.last_checkpoint_pos = pos
         # The midstep half of the same moment. Here rather than at each of the
@@ -2610,7 +2615,12 @@ class BlockManager:
         return True
 
     def hash_decode_blocks(
-        self, seq: Sequence, committed_kv_len: int, next_forward_tokens: int = 0
+        self,
+        seq: Sequence,
+        committed_kv_len: int,
+        next_forward_tokens: int = 0,
+        *,
+        snapshot_step: int,
     ) -> None:
         """Register hashes for generated blocks filled up to `committed_kv_len`.
 
@@ -2633,6 +2643,9 @@ class BlockManager:
         `next_forward_tokens` reaches `checkpointers_at`; see there. It
         defaults to "no next forward", i.e. hash but never checkpoint, so a
         caller opts into decode-point checkpointing rather than out of it.
+
+        `snapshot_step` is the step of the slot's last verify window that
+        `committed_kv_len` ends on, as the slot stands when the store runs.
         """
         if not self.enable_prefix_caching:
             return
@@ -2647,6 +2660,7 @@ class BlockManager:
                 # speculative one, so it is held to spacing rather than to the
                 # grid.
                 aimed=False,
+                snapshot_step=snapshot_step,
             )
 
     def cancel_state_fork(self, seq: Sequence) -> bool:
@@ -3302,6 +3316,7 @@ class BlockManager:
         pos: int,
         next_forward_tokens: int | None = None,
         aimed: bool = True,
+        snapshot_step: int = -1,
     ) -> list[StateCache]:
         """State classes that should keep a checkpoint at `pos`, in class order.
 
@@ -3316,12 +3331,13 @@ class BlockManager:
         `next_forward_tokens` is how many tokens the forward right after this
         one carries, and is what each class's `successor_room` is compared
         against. Unset means the prompt's remainder, the prefill answer; decode
-        passes one. Everything else follows from that one number — a class
+        passes 1 or 0. Everything else follows from that one number — a class
         needing a long hand-over (V4's ring, 131) simply never qualifies
         mid-generation, one that hands nothing over (a retaining SWA pool, 0)
         always does, one that cannot keep a checkpoint at all (`inf`) never
         does, and a request stopping on this step passes 0 and keeps nothing
-        that nothing will ever resume from.
+        that nothing will ever resume from. A decode boundary (`snapshot_step`
+        >= 0) is kept only by a class whose `decode_keep` is not `KEEP_NONE`.
 
         The position must be exact. A checkpoint holds state as of the forward's
         last token, so a forward that overshoots a rung is ahead of the hash it
@@ -3390,7 +3406,13 @@ class BlockManager:
             # aimed placements are both prompt positions, so nothing here is
             # reachable and generation keeps no checkpoints under -1.
             return []
-        elif pos % self.hash_block_size or pos - seq.last_checkpoint_pos < interval:
+        elif (
+            # A finishing step: the slot is freed, and a stop may have cut the
+            # end inside the window `snapshot_step` names.
+            next_forward_tokens == 0
+            or pos % self.hash_block_size
+            or pos - seq.last_checkpoint_pos < interval
+        ):
             return []
         if next_forward_tokens is None:
             next_forward_tokens = seq.num_prompt_tokens - pos
@@ -3412,6 +3434,7 @@ class BlockManager:
             if not (aimed and c.readable_midstep)
             and c.applies(seq)
             and next_forward_tokens >= c.successor_room
+            and (snapshot_step < 0 or c.decode_keep != KEEP_NONE)
         ]
 
     def publish_loaded_prefix(
