@@ -29,6 +29,11 @@ Epochs: one a launch, ``k2_allreduce_gfx1250``'s counters, so this launch
 keeps them equal with the other kernels sharing them; the flags carry the
 whole epoch, unique to the launch.
 
+Early gather (``ATOM_KIMI_MONO_TAIL_EARLY_GATHER``, on by default; a share a
+CTA, no split waves): the CTA gathers its lines before it issues the first
+up-weight slabs, so its gathers' loads do not queue behind them; it pushes
+them in the prologue as before.
+
 Split waves (``ATOM_KIMI_MONO_TAIL_SPLIT``): the CTA's lines go through LDS
 to waves [0, 4), which push them, two a thread, while waves [4, 8) poll and
 reduce them, two a thread, and store the reduced (or normalized) lines. A
@@ -193,6 +198,10 @@ class TailLayout:
 
 def tail_split() -> bool:
     return envs.ATOM_KIMI_MONO_TAIL_SPLIT
+
+
+def tail_early_gather() -> bool:
+    return envs.ATOM_KIMI_MONO_TAIL_EARLY_GATHER
 
 
 def tail_layout(
@@ -435,12 +444,13 @@ def _load_cm(c):
 
 
 @traced
-def _ar_push(c):
+def _ar_push(c, gathered=None):
     """This CTA's all-reduce lines (routed ones gathered from ``grouped``)
     pushed to every rank; returns a routed line's norm weights. With
     ``identity`` routes, route ``k`` of token ``t`` is row ``t * TOPK + k``
-    of ``grouped`` (the fused MoE's), its gathers issued at once."""
-    values, gains = _ar_gather(c)
+    of ``grouped`` (the fused MoE's), its gathers issued at once.
+    ``gathered``: ``_ar_gather``'s, done already."""
+    values, gains = _ar_gather(c) if gathered is None else gathered
     if const_expr(c["split"]):
         _split_push(c, values, gains)
         return gains
@@ -800,6 +810,7 @@ def build_k2_tail(
     profile: bool = False,
     split: bool | None = None,
     poll_bound: int | None = None,
+    early_gather: bool | None = None,
 ) -> K2TailKernel:
     """The gathering all-reduce, routed RMSNorm (``norm_weight`` [LATENT]
     BF16, ``eps``) and replicated finalize (``up_weight`` [HIDDEN, LATENT]
@@ -814,7 +825,9 @@ def build_k2_tail(
     ``ATOM_KIMI_MONO_TAIL_SPLIT``). ``poll_bound``: scratch builds only --
     every poll gives up past that many tries and marks
     ``flags[GAVE_UP_WORD]``; production polls are unbounded, since the
-    ranks' skew has no bound."""
+    ranks' skew has no bound. ``early_gather`` (default
+    ``ATOM_KIMI_MONO_TAIL_EARLY_GATHER``; a share a CTA, no split waves): the
+    lines gathered before the first up-weight slabs are issued."""
     ar_ctas = tail_ar_ctas(rows)
     if not 1 <= rows <= tail_max_rows():
         raise ValueError(f"the K2 tail takes 1..{tail_max_rows()} rows, got {rows}")
@@ -830,6 +843,9 @@ def build_k2_tail(
         raise ValueError(
             f"split waves take a share a CTA: up to {tail_line_rows()} rows"
         )
+    if early_gather is None:
+        early_gather = tail_early_gather()
+    early_gather = early_gather and rounds == 1 and not split
     layout = tail_layout(rows, depth, tokens, split)
     lines = allreduce7_lines(rows)
     bank_words = tp * lines * LINE_WORDS
@@ -838,6 +854,7 @@ def build_k2_tail(
         f"k3_k2_gfx1250_tail_tp{tp}_s{rows}_d{layout.depth}_t{layout.tokens}"
         + ("_id" if identity_routes else "")
         + ("_sw" if split else "")
+        + ("_eg" if early_gather else "")
         + ("" if poll_bound is None else f"_b{poll_bound}")
         + ("_profile" if profile else "")
         + fresh.suffix("tail")
@@ -937,6 +954,9 @@ def build_k2_tail(
             c["stage"] = words + AR_WORDS
             c["gains"] = floats + AR_WORDS + THREADS * LINE_WORDS
         bases = []
+        early = None
+        if const_expr(early_gather and fused is None):
+            early = _ar_gather(c)
 
         def prologue():
             if const_expr(fused is not None):
@@ -945,7 +965,7 @@ def build_k2_tail(
                 _ar_push(c)
                 _split_finish(c)
             elif const_expr(rounds == 1):
-                _ar_finish(c, _ar_push(c))
+                _ar_finish(c, _ar_push(c, early))
             else:
                 _ar_rounds(c, grid, rounds)
             _store_epochs(epochs, bid, tid, grid, epoch)

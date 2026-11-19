@@ -800,6 +800,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (k2_tail_gfx1250, the same bits) where the gathering all-reduce runs a
     # line a thread (up to 42 rows); 0 keeps the three launches.
     "ATOM_KIMI_MONO_TAIL": lambda: os.getenv("ATOM_KIMI_MONO_TAIL", "1") == "1",
+    # 1, the default: the K2 tail's CTAs gather their all-reduce lines before
+    # they issue their first finalize weight slabs, where a CTA takes one
+    # share (up to 42 rows; k2_tail_gfx1250, the same bits); 0 issues the
+    # slabs first.
+    "ATOM_KIMI_MONO_TAIL_EARLY_GATHER": lambda: (
+        os.getenv("ATOM_KIMI_MONO_TAIL_EARLY_GATHER", "1") == "1"
+    ),
     # The K2 tail's remote pushes on waves of their own, so the store drain
     # before its flag waits for no fabric ack (k2_tail_gfx1250, the same
     # bits); 0 keeps every wave pushing and reducing its own line.
