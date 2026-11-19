@@ -64,14 +64,8 @@ def _bm_with_events(**overrides) -> BlockManager:
     return BlockManager(cfg)
 
 
-def _dcp_bm_with_events(monkeypatch) -> BlockManager:
-    bm = _bm_with_events(decode_context_parallel_size=2)
-    monkeypatch.setattr(
-        bm,
-        "num_pool_blocks",
-        lambda seq_len: (seq_len + bm.hash_block_size - 1) // bm.hash_block_size,
-    )
-    return bm
+def _dcp_bm_with_events() -> BlockManager:
+    return _bm_with_events(decode_context_parallel_size=2)
 
 
 # ── schema / msgspec round-trip ───────────────────────────────────────────
@@ -411,8 +405,8 @@ class TestDCPBlockStoredGranularity:
         assert len(event.block_hashes) == expected_hashes
         assert len(event.token_ids) == expected_hashes * event.block_size
 
-    def test_hash_blocks_reports_hash_block_size(self, seq_factory, monkeypatch):
-        bm = _dcp_bm_with_events(monkeypatch)
+    def test_hash_blocks_reports_hash_block_size(self, seq_factory):
+        bm = _dcp_bm_with_events()
         seq = seq_factory(list(range(16)))
         bm.allocate(seq)
 
@@ -422,10 +416,8 @@ class TestDCPBlockStoredGranularity:
         self._assert_hash_block_aligned(event, expected_hashes=2)
         assert event.token_ids == list(range(16))
 
-    def test_publish_loaded_prefix_reports_hash_block_size(
-        self, seq_factory, monkeypatch
-    ):
-        bm = _dcp_bm_with_events(monkeypatch)
+    def test_publish_loaded_prefix_reports_hash_block_size(self, seq_factory):
+        bm = _dcp_bm_with_events()
         seq = seq_factory(list(range(8)))
         bm.allocate(seq)
 
@@ -435,13 +427,11 @@ class TestDCPBlockStoredGranularity:
         self._assert_hash_block_aligned(event, expected_hashes=1)
         assert event.token_ids == list(range(8))
 
-    def test_publish_loaded_prefix_offset_after_cached_prefix_dcp(
-        self, seq_factory, monkeypatch
-    ):
+    def test_publish_loaded_prefix_offset_after_cached_prefix_dcp(self, seq_factory):
         # Block-table entry 0 was hashed locally (8 tokens at hbs=8); the
         # offload load fills entry 1. Its event must start at token 8, in
         # hash-block units, and chain off the locally hashed block.
-        bm = _dcp_bm_with_events(monkeypatch)
+        bm = _dcp_bm_with_events()
         seq = seq_factory(list(range(16)))
         bm.allocate(seq)
         bm.hash_blocks(seq, 8)
@@ -455,8 +445,8 @@ class TestDCPBlockStoredGranularity:
         assert event.parent_block_hash == local.block_hashes[-1]
         assert event.token_ids == list(range(8, 16))
 
-    def test_record_remote_store_reports_hash_block_size(self, monkeypatch):
-        bm = _dcp_bm_with_events(monkeypatch)
+    def test_record_remote_store_reports_hash_block_size(self):
+        bm = _dcp_bm_with_events()
 
         bm.record_remote_store(
             block_hashes=[42, 43],

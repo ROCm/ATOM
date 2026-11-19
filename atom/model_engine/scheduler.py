@@ -1210,7 +1210,10 @@ class Scheduler:
                 resume, cached = tier_waiter
             else:
                 # The exact probe's answer; the walk is memoised across ticks.
-                cached_blocks = self._head_fit_blocks(seq)
+                if self.pd_admission is None and self._receive_reserve is None:
+                    cached_blocks = self.block_manager.can_allocate_memoized(seq)
+                else:
+                    cached_blocks = self._head_fit_blocks(seq)
                 if cached_blocks < 0:
                     break  # Phase 2 also stops at an allocation or reserve refusal.
                 if slots <= parked:
@@ -1405,7 +1408,10 @@ class Scheduler:
             else:
                 # Runs on every tick with prefill work, holds included: reuse
                 # the walk across ticks; the answer is the exact probe's.
-                cached_blocks = self.block_manager.can_allocate_memoized(seq)
+                if self.pd_admission is None and self._receive_reserve is None:
+                    cached_blocks = self.block_manager.can_allocate_memoized(seq)
+                else:
+                    cached_blocks = self._head_fit_blocks(seq)
                 if cached_blocks < 0:
                     break
                 # From where the forward will really start, as admission
@@ -1563,6 +1569,8 @@ class Scheduler:
             # an admission: it records nothing, and runs every tick, so the
             # walk is memoised across ticks. Phase 2 defers a receive that
             # leaves decode no room, so that counts as a refusal too.
+            if self.pd_admission is None and self._receive_reserve is None:
+                return self.block_manager.can_allocate_memoized(seq) >= 0
             return self._head_fit_blocks(seq) >= 0
         return False
 
@@ -3631,8 +3639,8 @@ class Scheduler:
         )
 
     def _head_fit_blocks(self, seq: Sequence) -> int:
-        """The DP readiness probes' fit: `can_allocate_memoized`, or -1 for a
-        receive its reserve defers. Only such a receive builds a probe."""
+        """With a decode reserve, the DP probes' and chunk-cost fit: as
+        `can_allocate_memoized`, or -1 for a receive the reserve defers."""
         if not self._receive_reserve_applies(seq):
             return self.block_manager.can_allocate_memoized(seq)
         probe = AdmissionProbe()
@@ -3642,8 +3650,8 @@ class Scheduler:
         return cached_blocks
 
     def _receive_leaves_decode_room(self, seq: Sequence, probe: AdmissionProbe) -> bool:
-        """Whether P/D receive `seq` leaves the held rows their decode reserve,
-        recording nothing. Phase 2 and the DP readiness probes all ask this."""
+        """Whether P/D receive `seq` leaves held rows their decode reserve, recording
+        nothing. The DP probes ask this, Phase 2 only without `pd_admission`."""
         if not self._receive_reserve_applies(seq):
             return True
         held = self._decode_rows()

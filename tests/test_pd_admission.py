@@ -217,7 +217,10 @@ def test_fraction_uses_physical_pool_bytes(build, fraction):
     sched, _ = build(options=options)
     # 64 blocks of 1024 bytes; the default fraction is 0.15.
     assert sched.pd_admission.max_bytes == int(64 * 1024 * (fraction or 0.15))
-    assert sched.pd_admission.reserve_tokens is None
+    assert (
+        sched.pd_admission.reserve.tokens
+        == sched.pd_admission.reserve.first_decode_tokens
+    )
 
 
 @pytest.mark.parametrize("chunked", [False, True])
@@ -229,7 +232,7 @@ def test_decode_reserve_keeps_room_for_running_requests(build, chunked):
     )
     # Setting one limit drops the default byte budget.
     assert sched.pd_admission.max_bytes is None
-    assert sched.pd_admission.reserve_tokens == 8
+    assert sched.pd_admission.reserve.tokens == 8
     a, b, c = request(), request(), request()
     sched.extend([a, b, c])
     batch, _ = sched.schedule()
@@ -384,7 +387,7 @@ def test_decode_reserve_counts_the_draft_lookahead_once(
     )
     bm = sched.block_manager
     assert bm.draft_lookahead_blocks(8) == 1
-    assert sched.pd_admission.first_decode_tokens == 8
+    assert sched.pd_admission.reserve.first_decode_tokens == 8
     a, b = request(), request(b_tokens)
     b.max_tokens = b_max_tokens
     sched.extend([a, b])
@@ -438,8 +441,8 @@ def test_decode_reserve_below_a_first_decode_rejected(
     with pytest.raises(ValueError, match="first decode"):
         reserve(first_decode_tokens - 1)
     sched, _ = reserve(first_decode_tokens)
-    assert sched.pd_admission.first_decode_tokens == first_decode_tokens
-    assert sched.pd_admission.reserve_tokens == first_decode_tokens
+    assert sched.pd_admission.reserve.first_decode_tokens == first_decode_tokens
+    assert sched.pd_admission.reserve.tokens == first_decode_tokens
 
 
 @pytest.mark.parametrize("chunked", [False, True])
@@ -941,7 +944,7 @@ def test_a_request_over_both_limits_counts_under_both(build):
             "num_reserved_decode_tokens": 8,
         }
     )
-    assert (sched.pd_admission.max_bytes, sched.pd_admission.reserve_tokens) == (
+    assert (sched.pd_admission.max_bytes, sched.pd_admission.reserve.tokens) == (
         1024,
         8,
     )
@@ -1211,6 +1214,56 @@ def test_a_deferred_receive_keeps_no_dp_rank_off_decode(build, options, chunked)
         assert a.id in batch.req_ids
         assert not b.block_table
     assert sched.total_preemptions == 0
+
+
+def _record_fits(sched, monkeypatch):
+    """The probe each `can_allocate_memoized` call gets: None is main's fit."""
+    fits, fit = [], sched.block_manager.can_allocate_memoized
+
+    def recorded(seq, probe=None):
+        fits.append(probe)
+        return fit(seq, probe)
+
+    monkeypatch.setattr(sched.block_manager, "can_allocate_memoized", recorded)
+    return fits
+
+
+@RESERVE_OWNERS
+def test_a_local_prefill_beside_a_reserve_is_probed_as_on_main(
+    build, options, monkeypatch
+):
+    # The reserve checks P/D receives only: where it defers a receive (the
+    # test above), a local prefill of the same size stays prefillable.
+    sched, request = build(options=options, num_kvcache_blocks=5)
+    sched.prefill_token_graphs = True
+    sched.set_prefill_delayer(_GroupDelayer())
+    a, b = request(), request()
+    sched.add(a)
+    sched.schedule()
+    sched._update_from_kv_xfer_finished(receive_success(a))
+    b.kv_transfer_params = None
+    sched.add(b)
+    fits = _record_fits(sched, monkeypatch)
+    assert sched._can_admit_head_prefill()
+    assert sched._probe_local_prefill_work()[0]
+    assert sched._estimate_prefill_chunk_cost() > 0
+    assert fits and all(probe is None for probe in fits)
+
+
+def test_a_moriio_receive_is_probed_as_on_main(build, monkeypatch):
+    # No reserve exists, so the DP probes and the chunk estimate make main's
+    # call and never reach `_head_fit_blocks`.
+    sched, request = build(options={"enabled": False}, backend="moriio")
+    assert sched.pd_admission is None and sched._receive_reserve is None
+    sched.add(request())
+    fits = _record_fits(sched, monkeypatch)
+    monkeypatch.setattr(
+        sched, "_head_fit_blocks", lambda seq: pytest.fail("not main's fit")
+    )
+    sched._can_admit_head_prefill()
+    sched._probe_local_prefill_work()
+    sched._estimate_prefill_chunk_cost()
+    assert fits and all(probe is None for probe in fits)
 
 
 def test_reserve_deferrals_are_exported_without_the_controller(build):

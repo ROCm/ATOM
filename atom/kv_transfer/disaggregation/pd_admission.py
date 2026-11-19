@@ -179,8 +179,6 @@ class PdAdmissionController:
         self._block_manager = block_manager
         # The configured growth per request; unset, the reserve keeps what a
         # first decode takes.
-        self.reserve_tokens = reserve_tokens
-        self.first_decode_tokens = first_decode_tokens
         self.reserve = DecodeGrowthReserve(
             block_manager,
             tokens=reserve_tokens or first_decode_tokens,
