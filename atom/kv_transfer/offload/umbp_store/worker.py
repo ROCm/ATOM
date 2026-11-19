@@ -69,7 +69,7 @@ class TransferSlotPool(_store_pool.TransferSlotPool):
 
 
 class UMBPStoreOffloadConnector(KVStoreOffloadConnector):
-    """Dense or M3 PAGE offload worker backed by a UMBP standalone server."""
+    """Dense, M3 or V4.1 replay PAGE offload worker backed by a UMBP standalone server."""
 
     LABEL = "UMBP offload"
     POOL_CLASS = TransferSlotPool
@@ -80,7 +80,7 @@ class UMBPStoreOffloadConnector(KVStoreOffloadConnector):
     # final fence). On the forward's stream each of those waits for every
     # forward kernel queued ahead of it, so during long prefills a save took
     # about a forward per window and the save queue fell past the source read
-    # deadline. UMBP runs (dense and M3 layouts; V4.1 is refused) have shown
+    # deadline. UMBP runs, including the separately frozen V4.1 restore smoke, have shown
     # no hang on these side streams, and a much shorter warm-up.
     STAGES_ON_FORWARD_STREAM = False
 

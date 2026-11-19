@@ -33,8 +33,8 @@ _MIB = 1 << 20
 NAMESPACE_PREFIX = "atomumbp1-"
 
 UMBP_LAYOUTS = StoreLayouts(
-    ("dense", "m3"),
-    refusal="the UMBP offload moves only the dense KV layout or M3 PAGE layout",
+    ("dense", "m3", "dsv41"),
+    refusal="the UMBP offload moves dense KV, M3 PAGE, or V4.1 replay PAGE layout",
 )
 
 
@@ -134,9 +134,10 @@ def parse_umbp_store_config(
 
 
 def check_engine_compatibility(cfg: UMBPStoreOffloadConfig, config: Any) -> None:
-    """Accept dense and M3 PAGE bytes; refuse stateful layouts and DCP.
+    """Accept dense, M3 and V4.1 replay PAGE bytes; refuse other state and DCP.
 
-    M3 uses complete PAGE regions, including its NSA index cache. Stateful
+    M3 uses complete PAGE regions, including its NSA index cache. V4.1
+    transfers PAGE regions and reconstructs request state by bounded replay. Other stateful
     layouts require a separate state tier, while a DCP rank's pages cover a
     virtual block that the chunk keys do not name.
 
