@@ -57,6 +57,8 @@ subtrees:
     entries:
       - file: hermes_agent_guide
         title: Hermes Agent with ATOM
+      - file: claude_code_guide
+        title: Claude Code with ATOM
 
   - caption: API reference
     entries:
