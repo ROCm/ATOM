@@ -511,11 +511,12 @@ def decode_core_message(frames: list):
         )
     if body == "ready":
         ready = envelope.ready
-        return EngineCoreRequestType.READY, (
-            {"max_pool_tokens": ready.max_pool_tokens}
-            if ready.HasField("max_pool_tokens")
-            else None
-        )
+        payload = {}
+        if ready.HasField("max_pool_tokens"):
+            payload["max_pool_tokens"] = ready.max_pool_tokens
+        if ready.weight_syncs_unavailable:
+            payload["weight_syncs_unavailable"] = dict(ready.weight_syncs_unavailable)
+        return EngineCoreRequestType.READY, payload or None
     if body == "prefill_backlog":
         backlog = envelope.prefill_backlog
         return EngineCoreRequestType.PREFILL_BACKLOG, (
@@ -967,12 +968,15 @@ def encode_ready(payload) -> list:
     envelope = pb.Envelope()
     envelope.ready.SetInParent()
     if payload is not None:
-        unknown = set(payload) - {"max_pool_tokens"}
+        unknown = set(payload) - {"max_pool_tokens", "weight_syncs_unavailable"}
         if unknown:
             # A new startup fact needs a Ready field, not a silent drop.
             raise ProtocolError(f"Ready has no field for {sorted(unknown)}")
         if payload.get("max_pool_tokens") is not None:
             envelope.ready.max_pool_tokens = payload["max_pool_tokens"]
+        envelope.ready.weight_syncs_unavailable.update(
+            payload.get("weight_syncs_unavailable") or {}
+        )
     return FrameWriter().frames(envelope)
 
 

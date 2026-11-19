@@ -45,7 +45,10 @@ impl FakeCore {
             _ctx: ctx,
         };
         fake.send(
-            pb::envelope::Body::Ready(pb::Ready { max_pool_tokens }),
+            pb::envelope::Body::Ready(pb::Ready {
+                max_pool_tokens,
+                ..Default::default()
+            }),
             vec![],
         );
         fake

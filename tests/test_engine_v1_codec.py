@@ -427,3 +427,27 @@ def test_paired_columns_of_unequal_length_are_refused():
     env.dp_reuse.reused_tokens.append(5)
     with pytest.raises(wire.ProtocolError):
         codec.decode_core_message(on_the_wire(wire.FrameWriter().frames(env)))
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        {"max_pool_tokens": 4096},
+        {"weight_syncs_unavailable": {"weight_reload": "a runner cannot reload"}},
+        {
+            "max_pool_tokens": 4096,
+            "weight_syncs_unavailable": {"weight_reload": "a runner cannot reload"},
+        },
+    ],
+    ids=repr,
+)
+def test_ready_carries_every_startup_fact(payload):
+    kind, decoded = codec.decode_core_message(on_the_wire(codec.encode_ready(payload)))
+    assert kind.name == "READY"
+    assert decoded == payload
+
+
+def test_ready_refuses_a_fact_it_has_no_field_for():
+    with pytest.raises(codec.ProtocolError):
+        codec.encode_ready({"max_pool_tokens": 1, "new_fact": 2})
