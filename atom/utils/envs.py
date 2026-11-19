@@ -1077,6 +1077,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #                  (config ②); kept for A/B and as a fallback.
     #   "default"   -> replicated full-vocab GEMM per DP rank (big GEMM, no comm);
     #                  explicit opt-out.
+    # Multi-node DP: while every rank is busy, run the cross-DP state
+    # all_reduce only every N engine rounds (1 = every round). Utility
+    # commands are applied only on rounds that sync.
+    "ATOM_DP_SYNC_INTERVAL": lambda: max(
+        1, int(os.getenv("ATOM_DP_SYNC_INTERVAL", "1"))
+    ),
     "ATOM_DP_LM_HEAD_MODE": lambda: os.getenv(
         "ATOM_DP_LM_HEAD_MODE", "all2all"
     ).lower(),

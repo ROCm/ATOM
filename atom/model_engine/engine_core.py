@@ -16,6 +16,7 @@ from atom.kv_transfer.disaggregation import KVOutputAggregator
 from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.async_proc import AsyncIOProcManager
+from atom.model_engine.dp_sync_gate import DPSyncGate
 from atom.model_engine.dynamic_chunking import (
     DYNAMIC_CHUNKING_POLL_STEPS,
     ChunkSizePredictor,
@@ -1117,9 +1118,15 @@ class DPEngineCoreProc(EngineCore):
         shutdown = False
         metrics_interval = envs.ATOM_METRICS_UPDATE_INTERVAL_S
         next_metrics_push = 0.0
+        gate = DPSyncGate(envs.ATOM_DP_SYNC_INTERVAL)
         try:
             while True:
-                self.utility_handler.process_queue(self.utility_queue, self)
+                sync_now = gate.should_sync()
+                if sync_now:
+                    # Utility commands can hold the engine (offload, weight
+                    # sync, pause). Applying them only on rounds that sync lets
+                    # every rank see a hold before its next forward.
+                    self.utility_handler.process_queue(self.utility_queue, self)
                 now = time.monotonic()
                 if now >= next_metrics_push:
                     next_metrics_push = now + metrics_interval
@@ -1137,9 +1144,18 @@ class DPEngineCoreProc(EngineCore):
 
                 # MAX-reduced: one held rank holds every rank of the group, so
                 # their forwards stay paired.
-                global_has_unfinished, global_shutdown, global_held = (
-                    self._sync_dp_state(local_unfinished, shutdown, local_held)
-                )
+                if sync_now:
+                    global_has_unfinished, global_shutdown, global_held = (
+                        self._sync_dp_state(local_unfinished, shutdown, local_held)
+                    )
+                    gate.synced(global_has_unfinished, global_shutdown, global_held)
+                else:
+                    # The last sync found every rank busy: stay paired.
+                    global_has_unfinished, global_shutdown, global_held = (
+                        True,
+                        False,
+                        False,
+                    )
 
                 if global_shutdown and not global_has_unfinished:
                     logger.info(
@@ -1174,6 +1190,7 @@ class DPEngineCoreProc(EngineCore):
                 # After the pair, so the idle rank's dummy counts too: that is
                 # what keeps every rank's step number equal. See `bump_step`.
                 self.scheduler.engine_stats.bump_step()
+                gate.busy_round_done()
         finally:
             try:
                 # Isolate the final publish so a publisher hiccup cannot skip
