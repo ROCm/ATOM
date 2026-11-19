@@ -100,9 +100,9 @@ the chat route's own code, then tokenizes the prompt as the engine does
 (`encode_prompt`). A request's `prompt_token_ids` come back as sent.
 
 Each endpoint makes the checks its inference route makes before it hands a
-request to the engine, with the route's code and in its order, and refuses what
-they refuse with the route's 400, in the same `{"error": ...}` form and logged
-as the route logs it. That includes:
+request to the engine, but for the two below, with the route's code and in its
+order, and refuses what they refuse with the route's 400, in the same
+`{"error": ...}` form and logged as the route logs it. That includes:
 
 - one for another model;
 - a chat with no messages, an untyped tool, a tool choice its reasoning mode
@@ -111,18 +111,27 @@ as the route logs it. That includes:
   without `logprobs`, `stream_options` without `stream`, or `return_token_ids`
   with `stream`;
 - a `max_tokens` below 1 or above the deployment's output cap;
+- chat `logprobs` on a tokenizer they cannot be read from: one whose decoder is
+  not ByteLevel, or that cleans up whitespace in decoding, as Llama-3's does;
 - a `response_format` the deployment cannot hold the output to: one sent with
   `stop` or `ignore_eos`, with tools its tool parser does not write as DSML, or
   under a framed reasoning dialect such as Kimi-K3's, and any on a deployment
   that cannot run a grammar (pipeline parallelism, P/D, rapidserve, relaxed MTP,
   synthetic acceptance, or speculative decoding with `logprobs`);
 - a prompt that does not fit `max_model_len` with the request's `max_tokens`,
-  or leaves no room for any output when `max_tokens` is left to the server, and
-  one larger than the KV cache can hold.
+  or leaves no room for any output when `max_tokens` is left to the server.
 
-Render prepares no grammar, so only a `response_format` whose grammar does not
-compile gets past it, to be refused by the chat route. Image input is not
-rendered yet and gets a 501; the `/beta` routes have no render endpoint.
+Render leaves two refusals to the route. It takes a prompt larger than the KV
+cache can hold: a worker sizes its cache from the memory free once its weights
+load, so the workers serving a model can differ in it, and a router may render
+a request on another worker than the one that serves it. And it prepares no
+grammar, so what preparing one refuses gets past it: a `response_format` whose
+grammar does not compile, and any on a deployment that cannot prepare grammars,
+such as one without the `atom[structured-output]` extra, with a tokenizer that
+cannot be serialized, or whose workers lack the preparation RPC, differ in
+their structured-output configuration, or run out of time preparing it. Image
+input is not rendered yet and gets a 501; the `/beta` routes have no render
+endpoint.
 
 ## Validation
 

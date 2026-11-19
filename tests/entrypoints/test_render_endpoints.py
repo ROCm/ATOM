@@ -87,8 +87,18 @@ def submitted(monkeypatch):
         "reasoning_dialect": None,
         "tool_call_parser_cls": None,
         "_request_logger": None,
+        # A ByteLevel tokenizer that cleans up whitespace in decoding, as
+        # Llama-3's does: chat logprobs cannot be read from it.
         "tokenizer": SimpleNamespace(
-            apply_chat_template=render, encode=tokenize, decode=lambda *a, **kw: ""
+            apply_chat_template=render,
+            encode=tokenize,
+            decode=lambda *a, **kw: "",
+            backend_tokenizer=SimpleNamespace(
+                decoder=SimpleNamespace(
+                    __getstate__=lambda: json.dumps({"type": "ByteLevel"})
+                )
+            ),
+            clean_up_tokenization_spaces=True,
         ),
         "engine": SimpleNamespace(
             config=SimpleNamespace(
@@ -185,6 +195,21 @@ REFUSED_CHATS = {
         "model": MODEL,
         "messages": [ASK],
         "top_logprobs": 2,
+    },
+    "logprobs_on_a_tokenizer_that_cleans_up_whitespace": {
+        "model": MODEL,
+        "messages": [ASK],
+        "logprobs": True,
+    },
+    # Refused for its logprobs, which the route checks before the schema.
+    "logprobs_on_that_tokenizer_with_an_unnamed_json_schema": {
+        "model": MODEL,
+        "messages": [ASK],
+        "logprobs": True,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"schema": {"type": "object"}},
+        },
     },
     "stream_options_without_stream": {
         "model": MODEL,
@@ -361,7 +386,7 @@ def test_completions_render_refuses_what_the_completions_endpoint_refuses(
         ("/v1/completions", {"model": MODEL, "prompt": "Once upon a time"}),
     ],
 )
-def test_render_refuses_a_prompt_the_kv_pool_cannot_hold(
+def test_render_leaves_a_prompt_the_kv_pool_cannot_hold_to_its_route(
     submitted, monkeypatch, path, body
 ):
     monkeypatch.setattr(
@@ -370,9 +395,11 @@ def test_render_refuses_a_prompt_the_kv_pool_cannot_hold(
     refused = post(path, body)
     assert refused.status_code == 400
     assert "KV cache holds at most 8 tokens" in refused.json()["error"]["message"]
-    rendered = post(f"{path}/render", body)
-    assert rendered.json() == refused.json()
     assert submitted == []
+    rendered = post(f"{path}/render", body)
+    assert rendered.status_code == 200, rendered.text
+    data = rendered.json()
+    assert len((data if path == "/v1/chat/completions" else data[0])["token_ids"]) > 8
 
 
 @pytest.mark.parametrize(
