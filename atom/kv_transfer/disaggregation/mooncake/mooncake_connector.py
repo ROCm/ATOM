@@ -953,15 +953,14 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         """Ask the workers to report an aborted request's send once none of its
         writes runs, and to refuse a later one.
 
-        Not under PP prefill: each stage writes its own layers and sees only
-        its own, so the claim waits for decode's release. Not for a chunked
+        Under PP prefill every stage is asked, and the head frees the shared
+        pages once each has reported (`_release_aborted`). Not for a chunked
         transfer: its source is retired by `pd_source_safe`, whose terminal
         timeout already frees one no decode reads.
         """
         params = seq.kv_transfer_params or {}
         if (
             self.is_producer
-            and self.pp_size == 1
             and not params.get("chunked_transfer")
             and str(seq.id) in self._awaiting_send
         ):
@@ -2695,6 +2694,8 @@ class MooncakeConnector(KVConnectorBase):
         report each one's send now unless a write of it is in flight."""
         with self._completion_lock:
             for transfer_id in transfer_ids:
+                if transfer_id in self._aborted_transfers:
+                    continue  # told twice: by prefill's abort and decode's
                 self._aborted_transfers[transfer_id] = None
                 if len(self._aborted_transfers) > ABORTED_TRANSFERS_MAX:
                     del self._aborted_transfers[next(iter(self._aborted_transfers))]
@@ -2703,13 +2704,22 @@ class MooncakeConnector(KVConnectorBase):
 
     def _release_aborted(self, transfer_id: TransferId) -> None:
         """Report an aborted request's send, unless this rank already did.
-        Caller holds ``_completion_lock``."""
+        Caller holds ``_completion_lock``.
+
+        Under PP prefill each stage writes only its own layers into decode, and
+        a stage that served its write already dropped its entry, so every stage
+        reports through the PP quorum (`pd_source_safe`), whether or not it
+        still holds one; the head frees the shared pages once all have."""
         with self._completed_prefills_lock:
             held = self._completed_prefills.pop(transfer_id, None) is not None
             self._kv_cache_ready_events.pop(transfer_id, None)
+            if self.pp_size > 1:
+                self._admission_results.add(
+                    ConnectorCompletion("pd_source_safe", transfer_id, True)
+                )
         with self._transfer_refcount_lock:
             self._transfer_refcount.pop(transfer_id, None)
-        if held:
+        if held and self.pp_size == 1:
             self.done_sending.add(transfer_id)
 
     def _record_release(self, transfer_id: TransferId, consumer_tp_size: int) -> None:

@@ -59,6 +59,7 @@ with stubbed_aiter():
         reason=_SKIP,
     ).MoRIIOConnectorScheduler
     from atom.model_engine.engine_core import EngineCore
+    from atom.model_engine.pp_engine_core import PPEngineCoreProc
 
 
 def _build(cls, is_producer, **extra):
@@ -325,7 +326,7 @@ def test_nonchunked_decode_waits_for_successful_publication(monkeypatch):
 # -- An abort between the prefill's finish and the decode's pull ------------
 
 
-def _producer_rank():
+def _producer_rank(pp_rank=0, pp_size=1):
     """A Mooncake producer rank holding only the state its send path reads."""
     rank = object.__new__(mc.MooncakeConnector)
     prefills_lock = threading.Lock()
@@ -333,6 +334,8 @@ def _producer_rank():
         is_producer=True,
         tp_rank=0,
         tp_size=1,
+        pp_rank=pp_rank,
+        pp_size=pp_size,
         request_id_to_transfer_id={},
         _completion_lock=threading.Lock(),
         _completed_prefills={},
@@ -508,7 +511,6 @@ def _chunked_mooncake():
 @pytest.mark.parametrize(
     "build, params",
     [
-        pytest.param(lambda: _mooncake(pp_size=2), {}, id="mooncake-pp"),
         pytest.param(
             _chunked_mooncake,
             {"chunked_transfer": True, "transfer_id": "x"},
@@ -518,9 +520,8 @@ def _chunked_mooncake():
     ],
 )
 def test_a_backend_that_cannot_see_every_transfer_keeps_an_aborted_claim(build, params):
-    """Under PP prefill a stage sees only its own writes; MoRIIO's producer
-    cannot see a consumer's read at all. A chunked transfer's source is
-    retired by its own `pd_source_safe` report."""
+    """MoRIIO's producer cannot see a consumer's read at all. A chunked
+    transfer's source is retired by its own `pd_source_safe` report."""
     sched = build()
     seq = _seq(do_remote_decode=True, **params)
     seq.leave_reason = "length"
@@ -551,6 +552,176 @@ def test_multi_hands_an_abort_to_its_producer_sub_as_work():
 
     assert meta.metas[0].reqs_not_processed == {seq.id}
     assert connector_metadata_has_work(meta)
+
+
+# -- The same abort under PP prefill ---------------------------------------
+#
+# Each stage writes only its own layers into decode, from pages that share the
+# head's page table, so the head frees them only once every stage has reported
+# that no write of them runs.
+
+
+class _Pipeline:
+    """The head's transport to its later stages, each one Mooncake producer
+    rank: a stage takes the metadata the head sends and reports at the head's
+    poll, and the last completes each batch with token 7."""
+
+    def __init__(self, ranks):
+        self.ranks = ranks  # stage 1 onwards
+        self._completions = deque()
+
+    def send_metadata(self, batch):
+        if batch.connector_meta_output is not None:
+            for rank in self.ranks:
+                rank.start_load_kv(batch.connector_meta_output)
+        if batch.req_ids:
+            sampled = ScheduledBatchOutput(
+                req_ids=list(batch.req_ids),
+                token_ids=[(7,)] * len(batch.req_ids),
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+            )
+            self._completions.append(
+                (tuple(batch.req_ids), sampled if batch.produces_output() else None)
+            )
+
+    def recv_completion(self, timeout_ms=None):
+        return self._completions.popleft() if self._completions else None
+
+    def recv_kv_status(self, timeout_ms=0):
+        reports = [(stage, rank.get_finished()) for stage, rank in self.stages()]
+        return [(stage, out) for stage, out in reports if not out.is_empty()]
+
+    def stages(self):
+        return enumerate(self.ranks, start=1)
+
+
+def _pp_prefill(stages=2):
+    """A PP prefill head over one Mooncake producer rank per stage."""
+    ranks = [_producer_rank(stage, stages) for stage in range(stages)]
+    core = PPEngineCoreProc.__new__(PPEngineCoreProc)
+    core.__dict__.update(
+        label="prefill",
+        is_head=True,
+        pp_size=stages,
+        pp_max_inflight=stages,
+        scheduler=Scheduler(MockConfig()),
+        kv_transfer_enabled=True,
+        runner_mgr=_Workers(ranks[0]),
+        pp_transport=_Pipeline(ranks[1:]),
+        output_queue=queue.Queue(),
+        stream_output_queue=queue.Queue(),
+        _pp_kv_aggregator=None,
+        _in_flight=deque(),
+        _pending_prefix_hash=deque(),
+        _defer_prefix_hash=False,
+        _dynamic_chunking_enabled=False,
+        _kv_progress_event=threading.Event(),
+    )
+    core.scheduler.kv_connector = _mooncake(pp_size=stages)
+    return core, ranks
+
+
+def _pp_step(core):
+    """One head step, its idle drain due."""
+    core._next_idle_kv_drain = 0.0
+    core._pp_head_step()
+
+
+def _pp_parked(core, ranks):
+    """A request prefilled through the pipeline and published to every stage."""
+    seq = Sequence(
+        [1, 2, 3, 4],
+        4,
+        sampling_params=SamplingParams(max_tokens=1),
+        kv_transfer_params={"do_remote_decode": True},
+    )
+    core.scheduler.add(seq)
+    _pp_step(core)
+    assert seq.id in core.scheduler.deferred_free_blocks
+    _pp_step(core)
+    assert all(seq.id in rank._completed_prefills for rank in ranks)
+    return seq
+
+
+def test_pp_prefill_reports_an_abort_before_any_write_once_every_stage_has():
+    core, ranks = _pp_prefill()
+    seq = _pp_parked(core, ranks)
+    sched = core.scheduler
+
+    assert sched.abort_request(seq.id) is True
+    _pp_step(core)
+
+    assert sched.deferred_free_blocks == {}
+    assert sched.is_finished()
+    assert not core.has_pending_kv_work()
+    assert all(_refused(rank, _write_request(seq)) for rank in ranks)
+
+
+def test_pp_prefill_frees_an_aborted_request_only_once_every_stage_wrote():
+    """Stage 1 is still writing its layers when the abort comes; stage 0 is
+    not. The shared pages wait for stage 1, and neither stage serves a later
+    write request."""
+    core, ranks = _pp_prefill()
+    seq = _pp_parked(core, ranks)
+    sched = core.scheduler
+    started, finish = threading.Event(), threading.Event()
+
+    def write(_request):
+        started.set()
+        finish.wait(5)
+        ranks[1]._drop_completed_prefill(seq.id)  # what a served PP write does
+
+    ranks[1]._execute_transfer = write
+    writer = threading.Thread(target=ranks[1]._serve_write, args=(_write_request(seq),))
+    writer.start()
+    assert started.wait(5), "stage 1 took the write before the abort"
+
+    assert sched.abort_request(seq.id) is True
+    _pp_step(core)
+    assert seq.id in sched.deferred_free_blocks, "freed under stage 1's write"
+    assert core.has_pending_kv_work()
+    later = dict(_write_request(seq), request_id="decode-2")
+    assert all(_refused(rank, later) for rank in ranks)
+
+    finish.set()
+    writer.join(5)
+    _pp_step(core)
+
+    assert sched.deferred_free_blocks == {}
+    assert sched.is_finished()
+    assert not core.has_pending_kv_work()
+
+
+def test_pp_prefill_frees_a_request_decode_ended_before_its_write(monkeypatch):
+    """Decode's notice reaches every rank of every stage (see
+    `test_every_rank_of_every_producer_stage_is_told`); each reports alike."""
+    core, ranks = _pp_prefill()
+    seq = _pp_parked(core, ranks)
+    notice = [b"decode", mc.MSG_ABORT, msgpack.dumps({"transfer_id": seq.id})]
+
+    for rank in ranks:
+        _listen(rank, monkeypatch, [notice])
+    _pp_step(core)
+
+    assert core.scheduler.deferred_free_blocks == {}
+    assert not core.has_pending_kv_work()
+
+
+def test_a_stage_told_twice_reports_once(monkeypatch):
+    """Prefill's abort and decode's notice may both reach a stage. A second
+    report would open a stage tally at the head that nothing completes."""
+    rank = _producer_rank(pp_rank=1, pp_size=2)
+    rank._completed_prefills[3] = {"block_ids": [1], "slot_index": -1}
+
+    rank._abort_transfers([3])
+    first = rank.get_finished().connector_completions
+    notice = [b"decode", mc.MSG_ABORT, msgpack.dumps({"transfer_id": 3})]
+    _listen(rank, monkeypatch, [notice])
+
+    assert [(c.channel, c.operation_id) for c in first] == [("pd_source_safe", 3)]
+    assert not rank.get_finished().connector_completions
 
 
 # -- Decode aborts a request before it asks for its write -------------------
