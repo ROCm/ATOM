@@ -3710,6 +3710,10 @@ class Config:
         # shared_experts() and how many experts it routes over (129 / top-5 vs
         # 128 / top-4), so it changes the compiled graph the same way.
         factors.append(bool(envs.ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4))
+        # ATOM_M3_FUSE_MXFP8_QUANT decides in Python whether the input norm hands
+        # qkv_proj MXFP8 rows (a different traced graph); the 2-stage switch is read
+        # inside the custom op and needs no key.
+        factors.append(bool(envs.ATOM_M3_FUSE_MXFP8_QUANT))
         # The sparse-attention indexer bakes max_model_len and max_num_seqs into
         # the graph as constants, so a cache built for a smaller max_model_len
         # faults on the first decode past the old width.

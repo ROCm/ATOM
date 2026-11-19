@@ -1118,6 +1118,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4": lambda: (
         os.getenv("ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4", "0") == "1"
     ),
+    # MiniMax-M3: the TP all-reduce + Gemma RMSNorm ahead of qkv_proj writes the MXFP8
+    # (E4M3 + E8M0 per 32) rows qkv_proj reads, instead of bf16 rows that qkv_proj
+    # quantizes in a separate launch (aiter custom all-reduce mx_scale mode). 0 disables.
+    "ATOM_M3_FUSE_MXFP8_QUANT": lambda: os.getenv("ATOM_M3_FUSE_MXFP8_QUANT", "1") == "1",
+    # ...also where the unquantized fused AR + RMSNorm takes its 2-stage kernel (above
+    # 458,752 B at TP4, i.e. > 37 rows): the production decode steps mono does not
+    # serve and prefill chunks within the custom all-reduce's size. Its RMSNorm sums
+    # the squares in the 2-stage order, so it is not bit-equal to the 1-stage one.
+    "ATOM_M3_FUSE_MXFP8_QUANT_2STAGE": lambda: os.getenv(
+        "ATOM_M3_FUSE_MXFP8_QUANT_2STAGE", "1"
+    )
+    == "1",
     # Gate/Up interleave mode for MoE weight preshuffle and kernel gate_mode.
     # "0" (default) = SEPARATED layout; "1" = INTERLEAVE layout. Always
     # INTERLEAVE on gfx1250: aiter's gfx1250 fused_moe takes no other layout.
