@@ -4,6 +4,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use bytes::Bytes;
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -167,6 +168,8 @@ pub struct IngressError {
     pub status: StatusCode,
     pub code: &'static str,
     pub message: String,
+    /// A worker's own answer, which the client gets as the worker sent it.
+    worker_answer: Option<(HeaderValue, Bytes)>,
 }
 impl From<crate::core::prepare_pool::PrepareError> for IngressError {
     fn from(error: crate::core::prepare_pool::PrepareError) -> Self {
@@ -184,6 +187,16 @@ impl IngressError {
             status,
             code,
             message: message.into(),
+            worker_answer: None,
+        }
+    }
+    /// A worker's `status` answer with `content_type` and `body`, for the client.
+    pub fn from_worker(status: StatusCode, content_type: HeaderValue, body: Bytes) -> Self {
+        Self {
+            status,
+            code: "worker_refused",
+            message: format!("a worker refused the request with {status}"),
+            worker_answer: Some((content_type, body)),
         }
     }
     pub fn invalid(message: impl Into<String>) -> Self {
@@ -204,7 +217,15 @@ impl IngressError {
         )
     }
     pub fn response(&self, path: &str) -> Response {
-        MeshLocalError::response(path, self.status, self.code, &self.message)
+        match &self.worker_answer {
+            Some((content_type, body)) => (
+                self.status,
+                [(http::header::CONTENT_TYPE, content_type.clone())],
+                body.clone(),
+            )
+                .into_response(),
+            None => MeshLocalError::response(path, self.status, self.code, &self.message),
+        }
     }
 
     pub fn placement(err: PlacementError, model_id: Option<&str>) -> Self {

@@ -269,20 +269,38 @@ workers, taken in turn, renders it to: `POST /v1/chat/completions/render`, which
 ATOM and vLLM serve, returns the prompt token IDs the worker's engine runs, so
 they match the blocks its KV events report, whatever template kwargs, reasoning
 controls or encoder the worker resolved. The worker gets the chat as the client
-sent it, with the headers the chat itself would get. When the render fails or
-takes longer than 2 s or half the time the request has left to be prepared, the
-router renders the chat itself, with its template and the request's
-`chat_template_kwargs` and `reasoning_effort`. A worker that answers 404 or 405
-is not asked again for a minute. `mesh_worker_chat_render_total{outcome}` counts
-renders as `rendered`, `unserved`, `failed` or `timed_out`. Under `--ext-proc`,
-the router renders chats itself.
+sent it, with the headers the chat itself would get. When the render is refused
+or fails, or takes longer than 2 s or half the time the request has left to be
+prepared, the router renders the chat itself, with its template and the
+request's `chat_template_kwargs` and `reasoning_effort`, and the worker that
+serves the chat answers it as it would without the render. A worker that answers
+404 or 405 is not asked again for a minute.
+`mesh_worker_chat_render_total{outcome}` counts renders as `rendered`,
+`refused`, `unserved`, `failed` or `timed_out`. Under `--ext-proc`, the router
+renders chats itself.
+
+The policy picks the worker that serves a chat by its rendered tokens, so the
+worker that renders it is usually another one; under PD it is a prefill worker.
+The workers of a model must therefore render its chats alike, with the same
+template and `--default-chat-template-kwargs`. A prompt long enough for ATOM's
+segment tokenizer to keep, 100K characters or more, is kept in the cache of the
+worker that rendered it, within its `ATOM_TOKENIZE_CACHE_MB`; the worker that
+serves the chat tokenizes it again unless it is the same one.
 
 Messages and Responses have no registered token-routing template, so under
 `prefix_hash` they return `501 token_routing_unsupported`. So do chats that no
 worker renders, for a model whose tokenizer llm-tokenizer renders with a built-in
 encoder chosen from `config.json`, not a chat template, such as DeepSeek V3.2 and
-V4 ([#3377](https://github.com/ROCm/ATOM/issues/3377)). Use a policy that does not
-need tokens, such as `cache_aware` or `round_robin`, for these models and APIs.
+V4 ([#3377](https://github.com/ROCm/ATOM/issues/3377)). Under `prefix_hash`,
+nothing else places such a chat: a worker's render of it may take all the time
+the request has left to be prepared, a 4xx other than 404, 405, 408 or 429 goes
+to the client as the worker sent it, which takes the model's workers to share
+their `max_model_len` and KV cache size as well, and a render that fails
+otherwise or runs out of time gets the chat `503 worker_render_unavailable`,
+which a retry may get past. `cache_aware` with `--kv-events` places such a chat
+by its text when its render gives no tokens within 2 s. Use a policy that does
+not need tokens, such as `cache_aware` or `round_robin`, for these models and
+APIs.
 
 ## Reliability
 

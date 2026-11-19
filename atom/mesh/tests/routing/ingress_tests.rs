@@ -1489,11 +1489,20 @@ async fn render_app_in(
     policy: crate::config::PolicyConfig,
     urls: &[&str],
 ) -> (PreparePoolRuntime, AppContext) {
-    let pool = PreparePoolRuntime::new(pool).unwrap();
     let config = crate::config::RouterConfig {
         policy,
         ..Default::default()
     };
+    render_app_with(pool, config, urls).await
+}
+
+/// `render_app_in` with the router configured as `config`.
+async fn render_app_with(
+    pool: PoolConfig,
+    config: crate::config::RouterConfig,
+    urls: &[&str],
+) -> (PreparePoolRuntime, AppContext) {
+    let pool = PreparePoolRuntime::new(pool).unwrap();
     let app = AppContext::from_config(config, 5, pool.handle())
         .await
         .unwrap();
@@ -1569,7 +1578,7 @@ async fn chats_place_by_the_tokens_their_worker_renders() {
 
 /// A chat its worker does not render is rendered by the router, as without the
 /// render route. A worker without the route goes unasked for a while; one whose
-/// render failed is asked again for the next chat.
+/// render failed, or that was too busy for it, is asked again for the next chat.
 #[tokio::test]
 async fn chats_a_worker_does_not_render_are_rendered_by_the_router() {
     let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
@@ -1595,6 +1604,8 @@ async fn chats_a_worker_does_not_render_are_rendered_by_the_router() {
         (http::StatusCode::METHOD_NOT_ALLOWED, "{}", false),
         (http::StatusCode::INTERNAL_SERVER_ERROR, RENDERED, true),
         (http::StatusCode::OK, r#"{"token_ids":"none"}"#, true),
+        (http::StatusCode::REQUEST_TIMEOUT, "{}", true),
+        (http::StatusCode::TOO_MANY_REQUESTS, "{}", true),
     ] {
         let worker = RenderWorker::start(status, reply).await;
         let (_pool, app) = render_app(prefix_hash(), &[&worker.url]).await;
@@ -1613,7 +1624,7 @@ async fn chats_a_worker_does_not_render_are_rendered_by_the_router() {
     let rendered = handle.render();
     for line in [
         r#"mesh_worker_chat_render_total{outcome="unserved"} 2"#,
-        r#"mesh_worker_chat_render_total{outcome="failed"} 4"#,
+        r#"mesh_worker_chat_render_total{outcome="failed"} 8"#,
     ] {
         assert!(rendered.contains(line), "missing {line} in\n{rendered}");
     }
@@ -1705,4 +1716,172 @@ async fn chats_the_router_cannot_render_go_by_their_worker_render() {
             assert_eq!(tokens.unwrap_err().code, "token_routing_unsupported");
         }
     }
+}
+
+/// A router whose `cache_aware` policy places chats by their KV events, and by
+/// their text when it has no tokens for them.
+fn cache_aware_kv_events() -> crate::config::RouterConfig {
+    crate::config::RouterConfig {
+        policy: crate::config::PolicyConfig::CacheAware {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.5,
+            eviction_interval_secs: 60,
+            max_tree_size: 1000,
+        },
+        kv_events: true,
+        ..Default::default()
+    }
+}
+
+/// A chat its worker's render refuses with a 4xx gets that answer only when
+/// nothing else places it. One the router renders, or places by its text, goes
+/// on to the worker that serves it, which may not be the one that refused it.
+#[tokio::test]
+async fn only_chats_placed_by_their_worker_render_get_its_refusal() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _recorder = metrics::set_default_local_recorder(&recorder);
+    const REFUSAL: &str = r#"{"error":{"message":"The prompt leaves no context space for output tokens","type":"invalid_request_error","code":400}}"#;
+    let worker = RenderWorker::start(http::StatusCode::BAD_REQUEST, REFUSAL).await;
+
+    let (_pool, app) = render_app(prefix_hash(), &[&worker.url]).await;
+    let request = parse_for_routing(&app, "/v1/chat/completions", &chat())
+        .await
+        .unwrap();
+    let own = routed_tokens(&app, request).await.unwrap().unwrap();
+    assert_ne!(own, [7, 8, 9]);
+
+    let (_pool, app) =
+        render_app_with(default_pool(), cache_aware_kv_events(), &[&worker.url]).await;
+    app.chats_without_template
+        .write()
+        .insert("hf-id".to_string());
+    let request = parse_for_routing(&app, "/v1/chat/completions", &chat())
+        .await
+        .unwrap();
+    assert_eq!(routed_tokens(&app, request).await.unwrap(), None);
+
+    let (_pool, app) = render_app(prefix_hash(), &[&worker.url]).await;
+    app.chats_without_template
+        .write()
+        .insert("hf-id".to_string());
+    let Err(error) = parse_for_routing(&app, "/v1/chat/completions", &chat()).await else {
+        panic!("a chat placed only by its refused render was routed");
+    };
+    let response = error.response("/v1/chat/completions");
+    assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response.headers()[http::header::CONTENT_TYPE],
+        "application/json"
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(body, REFUSAL);
+
+    assert_eq!(worker.calls(), 3);
+    let line = r#"mesh_worker_chat_render_total{outcome="refused"} 3"#;
+    let rendered = handle.render();
+    assert!(rendered.contains(line), "missing {line} in\n{rendered}");
+}
+
+/// A chat placed only by the tokens its worker renders, as its policy needs
+/// tokens the router cannot render, waits for its render as long as the
+/// request may be prepared, and gets a 503 when the render fails or runs out
+/// of time. One `cache_aware` places by its text goes by its text instead.
+#[tokio::test]
+async fn chats_placed_only_by_their_worker_render_wait_for_it() {
+    let late = RENDER_TIMEOUT + Duration::from_millis(500);
+    for (delay, status, prepare_timeout, failure) in [
+        (late, http::StatusCode::OK, Duration::from_secs(4), None),
+        (
+            Duration::ZERO,
+            http::StatusCode::INTERNAL_SERVER_ERROR,
+            Duration::from_secs(4),
+            Some("failed"),
+        ),
+        (
+            Duration::from_secs(10),
+            http::StatusCode::OK,
+            Duration::from_secs(1),
+            Some("timed out"),
+        ),
+    ] {
+        let worker = RenderWorker::answering_after(delay, status, RENDERED).await;
+        let pool = PoolConfig {
+            prepare_timeout,
+            ..default_pool()
+        };
+        let (_pool, app) = render_app_in(pool, prefix_hash(), &[&worker.url]).await;
+        app.chats_without_template
+            .write()
+            .insert("hf-id".to_string());
+        let request = parse_for_routing(&app, "/v1/chat/completions", &chat()).await;
+        match (request, failure) {
+            (Ok(mut request), None) => {
+                assert_eq!(request.routed.take().unwrap().1, Some(vec![7, 8, 9]));
+            }
+            (Err(error), Some(what)) => {
+                assert_eq!(error.status, http::StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(error.code, "worker_render_unavailable");
+                assert!(error.message.contains(what), "{}", error.message);
+            }
+            (request, _) => panic!("{status} after {delay:?}: {:?}", request.err()),
+        }
+        assert_eq!(worker.calls(), 1);
+    }
+
+    let worker = RenderWorker::start(http::StatusCode::INTERNAL_SERVER_ERROR, "{}").await;
+    let (_pool, app) =
+        render_app_with(default_pool(), cache_aware_kv_events(), &[&worker.url]).await;
+    app.chats_without_template
+        .write()
+        .insert("hf-id".to_string());
+    let request = parse_for_routing(&app, "/v1/chat/completions", &chat())
+        .await
+        .unwrap();
+    assert!(request.routed.is_none());
+    assert_eq!(worker.calls(), 1);
+}
+
+/// Under PD, chats render on prefill workers, not on decode workers.
+#[tokio::test]
+async fn pd_chats_render_on_prefill_workers() {
+    let prefill = RenderWorker::start(http::StatusCode::OK, RENDERED).await;
+    let decode = RenderWorker::start(http::StatusCode::OK, RENDERED).await;
+    let config = crate::config::RouterConfig {
+        policy: prefix_hash(),
+        mode: crate::config::RoutingMode::PrefillDecode {
+            prefill_urls: vec![],
+            decode_urls: vec![],
+            prefill_policy: None,
+            decode_policy: None,
+        },
+        ..Default::default()
+    };
+    let (_pool, app) = render_app_with(default_pool(), config, &[]).await;
+    for (url, worker_type) in [
+        (
+            &prefill.url,
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ),
+        (&decode.url, WorkerType::Decode),
+    ] {
+        app.worker_registry.register(Arc::new(
+            BasicWorkerBuilder::new(url.as_str())
+                .model_id("m")
+                .worker_type(worker_type)
+                .build(),
+        ));
+    }
+    for _ in 0..4 {
+        let mut request = parse_for_routing(&app, "/v1/chat/completions", &chat())
+            .await
+            .unwrap();
+        assert_eq!(request.routed.take().unwrap().1, Some(vec![7, 8, 9]));
+    }
+    assert_eq!((prefill.calls(), decode.calls()), (4, 0));
 }

@@ -32,7 +32,7 @@ use crate::{
         comm::error::{IngressError, MeshLocalError},
         prepare::{
             inference::{InferenceMetadata, InferenceRequest, ParsedInference},
-            worker_render::WorkerRenders,
+            worker_render::{RenderMiss, WorkerRenders, RENDER_TIMEOUT},
         },
     },
     server::AppState,
@@ -448,23 +448,41 @@ struct PendingRender {
     /// The chat's routing metadata, with its text.
     metadata: InferenceMetadata,
     worker: Arc<dyn Worker>,
+    fallback: RenderFallback,
+}
+
+/// How a chat is placed when its worker's render gives no tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenderFallback {
+    /// By the tokens the router renders it to, in the pool.
+    Router,
+    /// By its text.
+    Text,
+    /// It is not: its policies need tokens the router cannot render.
+    None,
 }
 
 impl PendingRender {
     /// The chat's routing preparation with the tokens `worker` renders `body`
-    /// to, or `None` when it does not render them in time; routing then
-    /// renders the chat in the pool.
+    /// to, or `None` when routing goes on without them. A chat that cannot be
+    /// placed without them gets the worker's refusal, or a 503 when the render
+    /// fails.
     async fn run(
         self,
         app: &AppContext,
         headers: &HeaderMap,
         body: &Bytes,
         deadline: Instant,
-    ) -> Option<RoutingPreparation> {
+    ) -> Result<Option<RoutingPreparation>, IngressError> {
         let started = Instant::now();
-        // Half the time left, so that the pool still has time to render a chat
-        // whose render is late.
-        let budget = deadline.saturating_duration_since(started) / 2;
+        let left = deadline.saturating_duration_since(started);
+        let budget = match self.fallback {
+            // Half the time left, so that the pool still has time to render a
+            // chat whose render is late.
+            RenderFallback::Router => (left / 2).min(RENDER_TIMEOUT),
+            RenderFallback::Text => left.min(RENDER_TIMEOUT),
+            RenderFallback::None => left,
+        };
         let rendered = app
             .worker_renders
             .render(
@@ -481,7 +499,27 @@ impl PendingRender {
             .as_ref()
             .map_or_else(|miss| miss.label(), |_| "rendered");
         metrics::counter!("mesh_worker_chat_render_total", "outcome" => outcome).increment(1);
-        rendered.ok().map(|tokens| (self.metadata, Some(tokens)))
+        match rendered {
+            Ok(tokens) => Ok(Some((self.metadata, Some(tokens)))),
+            // The worker that serves the chat answers it for itself: the
+            // render worker, usually another one, may refuse it for its own
+            // capacity.
+            Err(_) if self.fallback != RenderFallback::None => Ok(None),
+            Err(RenderMiss::Refused(answer)) => Err(answer),
+            Err(miss @ (RenderMiss::Failed | RenderMiss::TimedOut)) => {
+                let what = if matches!(miss, RenderMiss::TimedOut) {
+                    "timed out"
+                } else {
+                    "failed"
+                };
+                Err(IngressError::new(
+                    http::StatusCode::SERVICE_UNAVAILABLE,
+                    "worker_render_unavailable",
+                    format!("this model's chats are placed by the tokens a worker renders them to, and this one's render {what}; retry the request"),
+                ))
+            }
+            Err(RenderMiss::Unserved) => Ok(None),
+        }
     }
 }
 
@@ -558,7 +596,7 @@ impl InferenceEnvelope {
         if let Some(render) = request.render.take() {
             request.routed = render
                 .run(app, &request.headers, &request.body, deadline)
-                .await;
+                .await?;
         }
         Ok(request)
     }
@@ -764,9 +802,10 @@ impl IngressRouting {
 
     /// The worker to render `parsed`'s routing tokens on, if it is a chat
     /// without media whose policies use tokens: the next available worker for
-    /// its model that may serve `/v1/chat/completions/render`. `metadata` is
-    /// the chat's routing metadata without text. A worker renders with the
-    /// template kwargs it resolved, which the router's own render does not know.
+    /// its model, a prefill worker under PD, that may serve
+    /// `/v1/chat/completions/render`. `metadata` is the chat's routing metadata
+    /// without text. A worker renders with the template kwargs it resolved,
+    /// which the router's own render does not know.
     fn worker_render(
         &self,
         parsed: &ParsedInference,
@@ -776,16 +815,33 @@ impl IngressRouting {
             return Ok(None);
         }
         let (_, tokens) = self.admit(metadata)?;
-        if tokens == Tokens::Unused {
-            return Ok(None);
-        }
-        let Ok(workers) = self.candidates(metadata, false) else {
+        let fallback = match tokens {
+            Tokens::Unused => return Ok(None),
+            _ if self.renders_chats(metadata.model.as_deref()) => RenderFallback::Router,
+            Tokens::Wanted => RenderFallback::Text,
+            Tokens::Needed { .. } => RenderFallback::None,
+        };
+        let Ok(mut workers) = self.candidates(metadata, false) else {
             return Ok(None);
         };
+        workers.retain(|worker| !matches!(worker.worker_type(), WorkerType::Decode));
         Ok(self.renders.pick(&workers).map(|worker| PendingRender {
             metadata: parsed.metadata(),
             worker,
+            fallback,
         }))
+    }
+
+    /// Whether the router renders `model`'s chats itself: it has the model's
+    /// tokenizer, and llm-tokenizer renders them with their chat template.
+    fn renders_chats(&self, model: Option<&str>) -> bool {
+        model
+            .and_then(|model| {
+                self.tokenizer_registry
+                    .get_by_name(model)
+                    .or_else(|| self.tokenizer_registry.get_by_id(model))
+            })
+            .is_some_and(|entry| !self.chats_without_template.read().contains(&entry.id))
     }
 
     /// Validate the API and topology, then return whether the policy needs

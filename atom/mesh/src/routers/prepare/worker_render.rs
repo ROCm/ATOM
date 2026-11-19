@@ -19,11 +19,15 @@ use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use tracing::info;
 
-use crate::{core::Worker, routers::comm::header_utils};
+use crate::{
+    core::Worker,
+    routers::comm::{error::IngressError, header_utils},
+};
 
 pub(crate) const CHAT_RENDER_PATH: &str = "/v1/chat/completions/render";
-/// The longest the router waits for a worker's render before rendering the chat itself.
-const RENDER_TIMEOUT: Duration = Duration::from_secs(2);
+/// The longest the router waits for a worker's render of a chat it can place
+/// without it.
+pub(crate) const RENDER_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long a worker that serves no render route goes unasked.
 const UNSERVED_FOR: Duration = Duration::from_secs(60);
 
@@ -36,9 +40,12 @@ pub struct WorkerRenders {
     unserved: DashMap<String, Instant>,
 }
 
-/// Why a worker's render was not used, so that the router renders the chat itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Why a worker's render gave no routing tokens.
+#[derive(Debug)]
 pub(crate) enum RenderMiss {
+    /// The worker refused the chat with a 4xx, as its chat route does, in the
+    /// answer it sent.
+    Refused(IngressError),
     /// The worker has no render route, as backends before it do not.
     Unserved,
     /// The render failed, or its response had no token IDs.
@@ -48,8 +55,9 @@ pub(crate) enum RenderMiss {
 }
 
 impl RenderMiss {
-    pub(crate) fn label(self) -> &'static str {
+    pub(crate) fn label(&self) -> &'static str {
         match self {
+            Self::Refused(_) => "refused",
             Self::Unserved => "unserved",
             Self::Failed => "failed",
             Self::TimedOut => "timed_out",
@@ -106,7 +114,7 @@ impl WorkerRenders {
             .post(worker.endpoint_url(CHAT_RENDER_PATH))
             .headers(headers)
             .body(body)
-            .timeout(budget.min(RENDER_TIMEOUT))
+            .timeout(budget)
             .send()
             .await
             .map_err(miss)?;
@@ -121,6 +129,23 @@ impl WorkerRenders {
                 self.unserved
                     .insert(worker.base_url().to_owned(), Instant::now());
                 return Err(RenderMiss::Unserved);
+            }
+            // The worker is busy, not refusing the chat.
+            StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS => {
+                return Err(RenderMiss::Failed)
+            }
+            status if status.is_client_error() => {
+                let content_type = response
+                    .headers()
+                    .get(CONTENT_TYPE)
+                    .cloned()
+                    .unwrap_or_else(|| HeaderValue::from_static("application/json"));
+                let body = response.bytes().await.map_err(miss)?;
+                return Err(RenderMiss::Refused(IngressError::from_worker(
+                    status,
+                    content_type,
+                    body,
+                )));
             }
             _ => return Err(RenderMiss::Failed),
         }
