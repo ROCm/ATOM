@@ -205,6 +205,9 @@ class MoRIIOConnector(KVConnectorBase):
         # blocks, and the producer's digest of its source blocks.
         self._verify_page_dst: dict[ReqId, list[int]] = {}
         self._write_page_digests: dict[ReqId, list[Any]] = {}
+        # The reused prefix blocks a push must leave alone, and their
+        # per-region digests before it (`_note_kept_pages`).
+        self._verify_page_kept: dict[ReqId, tuple[list[int], list[int]]] = {}
 
         # Per-layer local metadata (populated in register_kv_caches)
         self.layer_name_to_local_kv_cache_metadata: dict[str, list[bytes]] = {}
@@ -976,6 +979,13 @@ class MoRIIOConnector(KVConnectorBase):
             rows = self._verify_rows_for(kept_ids, is_mla)
             self._verify_kept[req_id] = (rows, self._verify_digest(rows))
 
+    def _note_kept_pages(self, req_id: ReqId, kept_ids: list[int]) -> None:
+        """`_note_kept_prefix` over the fabric: every PAGE region of the
+        reused prefix blocks, digested per region."""
+        if kept_ids:
+            digests = page_region_digests(self._page_views, kept_ids)
+            self._verify_page_kept[req_id] = (kept_ids, digests)
+
     @staticmethod
     def _rejects_transfer_subset(req_id: ReqId, meta: ReqMeta) -> bool:
         """Whether the request asks for a subset neither direction implements.
@@ -1195,6 +1205,7 @@ class MoRIIOConnector(KVConnectorBase):
 
         if self._verify_kv and self.use_fabric:
             self._verify_page_dst[req_id] = dst
+            self._note_kept_pages(req_id, kept_ids)
             if self._state_tensors:
                 self._verify_state_before[req_id] = (
                     dst_slot,
@@ -1244,6 +1255,7 @@ class MoRIIOConnector(KVConnectorBase):
             logger.exception("req %s: could not ask the producer to push KV", req_id)
             if self.use_fabric:
                 self._verify_page_dst.pop(req_id, None)
+                self._verify_page_kept.pop(req_id, None)
             self._verify_rows.pop(req_id, None)
             self._verify_before.pop(req_id, None)
             self._verify_kept.pop(req_id, None)
@@ -1763,6 +1775,29 @@ class MoRIIOConnector(KVConnectorBase):
                 rows.numel(),
             )
         self._verify_kept_landed(req_id)
+
+    def _verify_page_kept_landed(self, req_id: ReqId) -> None:
+        """`_verify_kept_landed` over the fabric: report a PAGE region of a
+        reused prefix block the push wrote into."""
+        kept = self._verify_page_kept.pop(req_id, None)
+        if kept is None:
+            return
+        blocks, before = kept
+        after = page_region_digests(self._page_views, blocks)
+        if after != before:
+            logger.error(
+                "[moriio-verify] req %s: the %d reused prefix blocks changed in "
+                "%s -- the receive wrote into blocks it kept",
+                req_id,
+                len(blocks),
+                self._changed_regions(before, after),
+            )
+        else:
+            logger.info(
+                "[moriio-verify] req %s: %d reused prefix blocks unchanged",
+                req_id,
+                len(blocks),
+            )
 
     def _verify_kept_landed(self, req_id: ReqId) -> None:
         """Report a reused prefix block the receive wrote into."""
@@ -2810,6 +2845,7 @@ class MoRIIOConnector(KVConnectorBase):
             for req_id in done_recving:
                 if self.use_fabric:
                     self._verify_page_landed(req_id)
+                    self._verify_page_kept_landed(req_id)
                     self._verify_state_landed(req_id)
                     continue
                 self._verify_landed(req_id)
@@ -2817,6 +2853,7 @@ class MoRIIOConnector(KVConnectorBase):
             for req_id in failed_recving:
                 if self.use_fabric:
                     self._verify_page_dst.pop(req_id, None)
+                    self._verify_page_kept.pop(req_id, None)
                     with self._write_reports_lock:
                         self._write_page_digests.pop(req_id, None)
                 self._verify_rows.pop(req_id, None)

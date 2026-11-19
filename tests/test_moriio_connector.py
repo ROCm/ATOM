@@ -1134,6 +1134,79 @@ class WritePathTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"local blocks \[2\] appear more"):
             conn._page_batch([2, 3, 2], [4, 5, 6], remote, into_remote=False)
 
+    def fabric(self, conn, *, blocks: int = 8):
+        """`conn` over the fabric: two PAGE regions, the peer's at other offsets."""
+        conn.use_fabric = True
+        conn._page_regions = [(0, 16, "k"), (1000, 4, "k_scale")]
+        conn._page_views = [
+            self.torch.zeros((blocks, 1, 16), dtype=self.torch.uint8),
+            self.torch.zeros((blocks, 1, 4), dtype=self.torch.uint8),
+        ]
+        conn._verify_page_dst = {}
+        conn._verify_page_kept = {}
+        conn._write_page_digests = {}
+        conn._get_or_build_page_session = lambda engine_id: (
+            "S-page",
+            [(64, 16), (5000, 4)],
+        )
+        return conn
+
+    def test_a_fabric_push_moves_the_suffix_and_a_staged_transfer_slot(self):
+        # The consumer names only the blocks past its kept prefix (#3572).
+        consumer = self.fabric(self.make(producer=False))
+        meta = self.recv_meta([4, 5, 6], [10, 11, 12])
+        meta.num_computed_blocks = 2
+        consumer._request_write("d1", meta)
+        ((frames, _host, _port),) = consumer.sent
+        asked = self.msgpack.loads(frames[1])
+        self.assertEqual((asked["dst_block_ids"], asked["src_block_ids"]), ([6], [12]))
+
+        # The producer pushes those pages, and the state from transfer slot 5
+        # only once the copy into it landed (#3571).
+        conn = self.fabric(self.make_stateful(self.make(producer=True), slots=6))
+        conn._first_transfer_slot = 4
+        request = self.pending_push(conn, 5)
+        request["dst_block_ids"], request["src_block_ids"] = [6], [12]
+        conn._service_write_requests()
+        self.assertEqual((conn.writes, len(conn._pending_writes)), ([], 1))
+        conn._staged_sources[9] = (5, FakeEvent(done=True))
+        conn._service_write_requests()
+        self.assertEqual(
+            conn.writes,
+            [
+                (
+                    "S-page",
+                    [12 * 16, 1000 + 12 * 4],
+                    [64 + 6 * 16, 5000 + 6 * 4],
+                    [16, 4],
+                ),
+                ("S-k", [5 * 24], [5 * 24], [24]),
+                ("S-v", [5 * 128], [5 * 128], [128]),
+            ],
+        )
+
+    def test_fabric_verify_reports_a_push_into_the_kept_prefix(self):
+        conn = self.fabric(self.make(producer=False))
+        conn._verify_kv = True
+        meta = self.recv_meta([4, 5, 6], [10, 11, 12])
+        meta.num_computed_blocks = 2
+        conn._request_write("d1", meta)
+        self.assertEqual(conn._verify_page_dst["d1"], [6])
+        self.assertEqual(conn._verify_page_kept["d1"][0], [4, 5])
+        # The push lands in block 6 and leaves the kept blocks alone.
+        conn._page_views[0][6] = 9
+        with self.assertLogs("atom", "INFO") as logs:
+            conn._verify_page_kept_landed("d1")
+        self.assertIn("2 reused prefix blocks unchanged", logs.output[-1])
+
+        conn._request_write("d2", meta)
+        conn._page_views[1][5] = 7
+        with self.assertLogs("atom", "ERROR") as logs:
+            conn._verify_page_kept_landed("d2")
+        self.assertIn("the receive wrote into blocks it kept", logs.output[0])
+        self.assertIn("roles ['k_scale']", logs.output[0])
+        self.assertEqual(conn._verify_page_kept, {})
+
     def test_a_changed_source_reports_the_forwards_after_the_kv_ready_event(self):
         conn = self.make(producer=True)
         started = time.monotonic()

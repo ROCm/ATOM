@@ -286,5 +286,24 @@ class StateWiringTest(unittest.TestCase):
         self.assertIn("return fabric_state_pool()", self.source)
 
 
+class KeptPrefixWiringTest(unittest.TestCase):
+    """A receive that keeps the consumer's local prefix (ROCm/ATOM#3572) is
+    verified over the fabric as over RDMA: the kept PAGE blocks must not change."""
+
+    setUpClass = classmethod(ConnectorWiringTest.setUpClass.__func__)
+    segment = ConnectorWiringTest.segment
+
+    def test_the_kept_prefix_is_digested_before_the_ask_and_checked_after(self):
+        ask = self.segment("_request_write")
+        fabric_branch = ask[ask.index("if self._verify_kv and self.use_fabric:") :]
+        self.assertIn(
+            "self._note_kept_pages(req_id, kept_ids)",
+            fabric_branch[: fabric_branch.index("elif self._verify_kv:")],
+        )
+        finished = self.segment("get_finished")
+        self.assertIn("self._verify_page_kept_landed(req_id)", finished)
+        self.assertIn("self._verify_page_kept.pop(req_id, None)", finished)
+
+
 if __name__ == "__main__":
     unittest.main()
