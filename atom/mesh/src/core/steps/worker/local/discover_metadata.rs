@@ -270,13 +270,13 @@ async fn discover_http_sglang(url: &str, api_key: Option<&str>) -> HashMap<Strin
     let mut labels = HashMap::new();
 
     if let Ok(server_info) = get_server_info(url, api_key).await {
+        parallel_size_labels(&server_info, &mut labels);
         if let Some(model_path) = server_info.model_path.filter(|s| !s.is_empty()) {
             labels.insert("model_path".to_string(), model_path);
         }
         if let Some(served_model_name) = server_info.served_model_name.filter(|s| !s.is_empty()) {
             labels.insert("served_model_name".to_string(), served_model_name);
         }
-        parallel_size_labels(&server_info, &mut labels);
         if let Some(load_balance_method) = server_info.load_balance_method {
             labels.insert("load_balance_method".to_string(), load_balance_method);
         }
