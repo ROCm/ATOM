@@ -87,6 +87,7 @@ from atom.kv_transfer.disaggregation.transfer_plan import (
     build_transfer_plan,
 )
 from atom.kv_transfer.disaggregation.types import (
+    DRAFT_LAYOUT_WINDOW,
     INDEX_CACHE_FP4_PREFIX,
     INDEX_CACHE_ROLE,
     MLA_KV_ROLE,
@@ -96,6 +97,7 @@ from atom.kv_transfer.disaggregation.types import (
     KVTransferRegion,
     PageUnitSpec,
     ReqId,
+    ReqMeta,
     TransferId,
     pair_units,
     produced_no_handoff,
@@ -443,6 +445,7 @@ class MooncakeAgentMetadata(
     slot_base_addrs: list[int] | None = None
     slot_bps: list[int] | None = None
     num_slots: int = 0
+    draft_layout: str | None = None
 
 
 # ===================================================================
@@ -725,6 +728,11 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             self._reqs_need_recv[seq.id] = (seq, list(seq.block_table), slot_index)
             params["do_remote_prefill"] = False
             params["local_slot_index"] = slot_index
+            # A windowed draft's blocks the producer fills: this request's
+            # window, aligned with block_table like the producer's own.
+            params["local_draft_block_ids"] = list(
+                getattr(seq, "draft_block_table", ())
+            )
             # PD incremental: skip leading blocks already in the decode node's
             # prefix cache. Per-request state (including the SWA ring slot) is
             # not covered by a block-only delta, so it takes a full transfer.
@@ -834,6 +842,9 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             # The consumer's SWA ring slot; the producer keys the SWA region
             # transfer by it. Empty for backends with no SWA state.
             "remote_swa_block_ids": _swa_ring_ids(seq),
+            # A windowed draft's blocks, -1 below the prompt's window. Empty
+            # when the draft rides block_table.
+            "remote_draft_block_ids": list(getattr(seq, "draft_block_table", ())),
             "remote_engine_id": self.engine_id,
             **producer_endpoint(
                 host=self.host_ip,
@@ -1032,6 +1043,10 @@ class MooncakeConnector(KVConnectorBase):
     # ``__init__`` aborted before the matched-rail block; both must fall back to
     # the single shared ``transfer_engine`` instead of raising AttributeError.
     _rail_pool: RailEnginePool | None = None
+    # A draft's own KV pool as `register_kv_caches` found it: its layout and a
+    # windowed one's regions. Class-level, as `_rail_pool`: none by default.
+    _draft_layout: str | None = None
+    _draft_regions: tuple[KVTransferRegion, ...] = ()
 
     def __init__(self, config: Config) -> None:
         self.tp_rank = get_tp_group().rank_in_group
@@ -1497,6 +1512,13 @@ class MooncakeConnector(KVConnectorBase):
                     f"slot region TP segments {segments} do not cover its "
                     f"{unit_bytes}-byte unit"
                 )
+        self._draft_layout = tt.draft_layout
+        self._draft_regions = tuple(page.region for page in tt.draft_pages)
+        if self._draft_regions and self._has_slot_regions:
+            raise RuntimeError(
+                "a windowed draft KV pool is transferred on the block-only path; "
+                "this backend also has per-request slot regions"
+            )
 
         self.kv_caches_base_addr = [r.base_addr for r in tt.block_regions]
         self._per_block_bytes_list = [r.unit_bytes for r in tt.block_regions]
@@ -1559,7 +1581,10 @@ class MooncakeConnector(KVConnectorBase):
         reg_sizes: list[int] = []
 
         all_regions = (
-            list(tt.block_regions) + list(tt.swa_block_regions) + list(tt.slot_regions)
+            list(tt.block_regions)
+            + list(tt.swa_block_regions)
+            + list(tt.slot_regions)
+            + list(self._draft_regions)
         )
         if tt.staging_region is not None:
             all_regions.append(tt.staging_region)
@@ -1640,6 +1665,7 @@ class MooncakeConnector(KVConnectorBase):
                 slot_base_addrs=[b for b, _ in self._slot_regions],
                 slot_bps=[bps for _, bps in self._slot_regions],
                 num_slots=tt.num_slots,
+                draft_layout=self._draft_layout,
             )
         else:
             self._local_metadata = MooncakeAgentMetadata(
@@ -1648,6 +1674,7 @@ class MooncakeConnector(KVConnectorBase):
                 kv_caches_base_addr=self.kv_caches_base_addr,
                 num_blocks=tt.num_blocks,
                 block_len=self.block_len,
+                draft_layout=self._draft_layout,
             )
 
         logger.info(
@@ -1942,6 +1969,17 @@ class MooncakeConnector(KVConnectorBase):
                 with self._completion_lock:
                     self.failed_recving.add(req_id)
                 continue
+            if meta.chunked_transfer and self._draft_layout == DRAFT_LAYOUT_WINDOW:
+                # A chunked send moves draft rows by target block, chunk by
+                # chunk; this side's draft rows live in a pool of their own.
+                logger.error(
+                    "[CONSUMER] req %s: chunked P/D transfer does not carry a "
+                    "windowed draft KV pool (ATOM_DSPARK_DRAFT_KV_WINDOW); failing it",
+                    req_id,
+                )
+                with self._completion_lock:
+                    self.failed_recving.add(req_id)
+                continue
             if remote_tp_size != self.tp_size:
                 remote_tp_rank = self.tp_rank % remote_tp_size
             else:
@@ -1972,6 +2010,7 @@ class MooncakeConnector(KVConnectorBase):
 
             # Build the (stage-independent) write_request payload once.
             request_body = {
+                **self._draft_window_fields(meta, off),
                 "chunked_transfer": meta.chunked_transfer,
                 "prompt_digest": meta.prompt_digest,
                 "request_id": req_id,
@@ -2212,8 +2251,8 @@ class MooncakeConnector(KVConnectorBase):
         return True
 
     def _verify_producer(self, addr: str) -> None:
-        """Refuse a producer whose state slot is not the size of ours, once,
-        on first contact.
+        """Refuse a producer whose state slot is not the size of ours, or that
+        keeps a draft's KV another way, once, on first contact.
 
         Both sizes are fixed at startup (DeepSeek-V4.1's follows the DSpark
         config), so a mismatch is a deployment error; caught here it fails
@@ -2221,7 +2260,7 @@ class MooncakeConnector(KVConnectorBase):
         after its pages already moved. The producer re-checks per transfer
         for layouts this cannot map (pipeline-parallel producer stages).
         """
-        if not self._has_slot_regions:
+        if not self._has_slot_regions and self._draft_layout is None:
             return
         sock = self.zmq_context.socket(zmq.DEALER)
         try:
@@ -2239,6 +2278,17 @@ class MooncakeConnector(KVConnectorBase):
             meta = self._decoder.decode(sock.recv_multipart()[-1])
         finally:
             sock.close()
+        if self._draft_layout is not None and (
+            (meta.draft_layout == DRAFT_LAYOUT_WINDOW)
+            != (self._draft_layout == DRAFT_LAYOUT_WINDOW)
+        ):
+            raise RuntimeError(
+                f"Mooncake producer at {addr} keeps its draft KV as "
+                f"{meta.draft_layout!r}, this consumer as {self._draft_layout!r}; "
+                "set ATOM_DSPARK_DRAFT_KV_WINDOW the same on both"
+            )
+        if not self._has_slot_regions:
+            return
         mine = [bps for _, bps in self._slot_regions]
         theirs = list(meta.slot_bps or [])
         if not meta.has_slot_regions or len(theirs) != len(mine):
@@ -2702,6 +2752,10 @@ class MooncakeConnector(KVConnectorBase):
                     req_id,
                     kv_cache_ready_event,
                     engine=engine,
+                )
+            if transfer_ok:
+                transfer_ok = self._execute_draft_window_transfer(
+                    request_data, target, req_id, engine=engine
                 )
 
             if not transfer_ok:
@@ -3199,6 +3253,105 @@ class MooncakeConnector(KVConnectorBase):
         unit = self._dcp_token_unit(region_idx, bpb)
         run_src, run_dst, run_len = token_runs
         return src_base + run_src * unit, dst_base + run_dst * unit, run_len * unit
+
+    def _draft_window_fields(self, meta: ReqMeta, off: int) -> dict:
+        """A windowed draft's part of a write request: both sides' tables past the
+        locally cached prefix, aligned with the block ids, and this side's regions."""
+        if self._draft_layout != DRAFT_LAYOUT_WINDOW:
+            return {}
+        return {
+            "dst_draft_block_ids": meta.local_draft_block_ids[off:],
+            "src_draft_block_ids": meta.remote_draft_block_ids[off:],
+            "consumer_draft_regions": [asdict(r) for r in self._draft_regions],
+        }
+
+    def _execute_draft_window_transfer(
+        self, request_data: dict, target: str, req_id: str, *, engine=None
+    ) -> bool:
+        """RDMA a windowed draft pool's window: what the consumer's first block
+        pass reads below the prompt's end, and nothing of the rest.
+
+        Both sides' draft tables are aligned with their block ids and -1
+        outside their window, which is the same window for the same prompt; the
+        consumer's is what has to arrive. A block it needs that this side does
+        not hold fails the request rather than leave a row unwritten.
+        """
+        if self._draft_layout != DRAFT_LAYOUT_WINDOW:
+            return True
+        dst_ids = request_data.get("dst_draft_block_ids") or []
+        src_ids = request_data.get("src_draft_block_ids") or []
+        consumer_regions = [
+            KVTransferRegion(**r)
+            for r in request_data.get("consumer_draft_regions", [])
+        ]
+        if len(consumer_regions) != len(self._draft_regions):
+            raise RuntimeError(
+                f"req {req_id}: this producer has {len(self._draft_regions)} "
+                f"draft regions, the consumer {len(consumer_regions)}"
+            )
+        for src, dst in zip(self._draft_regions, consumer_regions):
+            if (src.semantic_role, src.unit_bytes) != (
+                dst.semantic_role,
+                dst.unit_bytes,
+            ):
+                raise RuntimeError(
+                    f"req {req_id}: draft region {src.semantic_role!r} of "
+                    f"{src.unit_bytes} B meets {dst.semantic_role!r} of "
+                    f"{dst.unit_bytes} B"
+                )
+        # The ids come over the wire: bound each by the units its side's
+        # regions hold before any address is formed from it.
+        src_units = min(
+            (r.total_bytes // r.unit_bytes for r in self._draft_regions), default=0
+        )
+        dst_units = min(
+            (r.total_bytes // r.unit_bytes for r in consumer_regions), default=0
+        )
+        pairs = []
+        for i, dst in enumerate(dst_ids):
+            if dst < 0:
+                continue
+            src = src_ids[i] if i < len(src_ids) else -1
+            if src < 0:
+                raise RuntimeError(
+                    f"req {req_id}: the consumer's draft window reaches block "
+                    f"{i} past its cached prefix, which this producer does not hold"
+                )
+            if src >= src_units or dst >= dst_units:
+                raise RuntimeError(
+                    f"req {req_id}: draft block pair {src} -> {dst} at {i} is "
+                    f"outside the pools ({src_units} producer, {dst_units} "
+                    "consumer blocks)"
+                )
+            pairs.append((src, dst))
+        src_addrs: list[int] = []
+        dst_addrs: list[int] = []
+        sizes: list[int] = []
+        for src_region, dst_region in zip(self._draft_regions, consumer_regions):
+            for src, dst in pairs:
+                src_addrs.append(src_region.unit_addr(src))
+                dst_addrs.append(dst_region.unit_addr(dst))
+                sizes.append(src_region.unit_bytes)
+        # `_rdma_write` splits into `_MAX_RDMA_ENTRIES_PER_BATCH` chunks itself.
+        if src_addrs and not self._rdma_write(
+            target,
+            src_addrs,
+            dst_addrs,
+            sizes,
+            req_id,
+            "draft",
+            engine=engine,
+            deadline=request_data.get("_deadline"),
+        ):
+            return False
+        logger.debug(
+            "[PRODUCER] draft window RDMA: req=%s, %d blocks x %d regions, %d B",
+            req_id,
+            len(pairs),
+            len(self._draft_regions),
+            len(pairs) * sum(r.unit_bytes for r in self._draft_regions),
+        )
+        return True
 
     def _execute_block_transfer(
         self,
