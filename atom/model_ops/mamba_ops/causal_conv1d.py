@@ -5,6 +5,8 @@
 # Adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/causal_conv1d/causal_conv1d_interface.py
 
 
+from functools import cache
+
 import torch
 import triton
 import triton.language as tl
@@ -15,8 +17,46 @@ from atom.utils import envs
 
 # Opt out before importing ATOM or capturing CUDA graphs.
 _KDA_CONV1D_FASTPATH_ENABLED = envs.ATOM_KDA_CONV1D_FASTPATH
+_KDA_CONV1D_GLUON_ENABLED = envs.ATOM_KDA_CONV1D_GLUON
 
 PAD_SLOT_ID = -1
+
+
+@cache
+def _get_kda_conv1d_gluon_kernel(device: torch.device, speculative: bool):
+    """Resolve an optional CDNA5 kernel once per device/mode, after opt-in."""
+    arch = getattr(torch.cuda.get_device_properties(device), "gcnArchName", "")
+    if arch.split(":")[0] != "gfx1250":
+        return None
+    try:
+        from triton.experimental.gluon.language.amd.cdna5 import buffer
+    except ImportError:
+        return None
+    if not all(
+        hasattr(buffer, name) for name in ("make_buffer_descriptor", "load", "store")
+    ):
+        return None
+    if speculative:
+        try:
+            from triton.experimental.gluon.language.amd.cdna5 import tdm
+        except ImportError:
+            return None
+        if not all(
+            hasattr(tdm, name)
+            for name in (
+                "make_tensor_descriptor",
+                "update_tensor_descriptor",
+                "async_load",
+                "async_wait",
+            )
+        ):
+            return None
+        from .kda_conv1d_gluon import kda_conv1d_gluon_tdm_kernel
+
+        return kda_conv1d_gluon_tdm_kernel
+    from .kda_conv1d_gluon_decode import kda_conv1d_gluon_decode_kernel
+
+    return kda_conv1d_gluon_decode_kernel
 
 
 @triton.jit
@@ -1444,6 +1484,15 @@ def causal_conv1d_update(
         else:
             _update_block_n = 256
             _update_options = {"num_warps": 4, "T_MODE": 0, "enable_fp_fusion": False}
+        if _KDA_CONV1D_GLUON_ENABLED and (
+            (_fast_spec and batch == 128)
+            or (_fast_decode and batch in (32, 128, 256, 512))
+        ):
+            _gluon_kernel = _get_kda_conv1d_gluon_kernel(x.device, _fast_spec)
+            if _gluon_kernel is not None:
+                _update_kernel = _gluon_kernel
+                _update_block_n = 256 if _fast_spec else 512
+                _update_options = {"num_warps": 4, "enable_fp_fusion": False}
 
     def grid(META):
         return (

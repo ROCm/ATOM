@@ -24,6 +24,7 @@ def _same_bytes(actual, expected):
 def run_update(monkeypatch):
     """Observe dispatch while forwarding unchanged to the real GPU kernels."""
     launches = []
+    monkeypatch.setattr(conv, "_KDA_CONV1D_GLUON_ENABLED", False)
 
     class RecordingKernel:
         def __init__(self, name, kernel):
@@ -48,6 +49,15 @@ def run_update(monkeypatch):
         "kda_conv1d_reuse_kernel",
         RecordingKernel("fast", fast.kda_conv1d_reuse_kernel),
     )
+    resolve_gluon = conv._get_kda_conv1d_gluon_kernel
+
+    def recording_gluon(device, speculative):
+        kernel = resolve_gluon(device, speculative)
+        if kernel is None:
+            return None
+        return RecordingKernel("gluon_tdm" if speculative else "gluon_decode", kernel)
+
+    monkeypatch.setattr(conv, "_get_kda_conv1d_gluon_kernel", recording_gluon)
 
     def run(call, enabled, expected):
         monkeypatch.setattr(conv, "_KDA_CONV1D_FASTPATH_ENABLED", enabled)
@@ -234,3 +244,45 @@ def test_unsupported_modes_keep_generic_dispatch(run_update, guard):
             call["initial_state_idx"]
         )
     _compare(run_update, case, expected="generic")
+
+
+@pytest.mark.parametrize(
+    "spec,batch,alias,ragged",
+    [
+        (False, 32, "inplace", False),
+        (False, 128, "fork", False),
+        (False, 256, "shared_read", False),
+        (False, 512, "inplace", False),
+        (True, 128, "inplace", False),
+        (True, 128, "fork", True),
+        (True, 128, "shared_read", True),
+    ],
+)
+def test_gluon_opt_in_matches_generic(
+    monkeypatch, run_update, spec, batch, alias, ragged
+):
+    device = torch.device("cuda", torch.cuda.current_device())
+    if conv._get_kda_conv1d_gluon_kernel(device, spec) is None:
+        pytest.skip("requires gfx1250 and the CDNA5 Gluon descriptor APIs")
+    lengths = [i % 6 for i in range(batch)] if ragged else [5 if spec else 1] * batch
+    case = _case(spec, lengths, alias)
+    # Keep the production row stride but shift the base by eight bytes.
+    fused = torch.randn(sum(lengths), 6284, device="cuda", dtype=torch.bfloat16)
+    case[0]["x"] = fused[:, 4:4612]
+    monkeypatch.setattr(conv, "_KDA_CONV1D_GLUON_ENABLED", True)
+    _compare(
+        run_update, case, expected="gluon_tdm" if spec else "gluon_decode", steps=3
+    )
+
+
+@pytest.mark.parametrize("spec", [False, True])
+def test_gluon_unsupported_batch_keeps_reuse(monkeypatch, run_update, spec):
+    monkeypatch.setattr(conv, "_KDA_CONV1D_GLUON_ENABLED", True)
+    _compare(run_update, _case(spec), expected="fast")
+
+
+@pytest.mark.parametrize("spec", [False, True])
+def test_gluon_unavailable_keeps_reuse(monkeypatch, run_update, spec):
+    monkeypatch.setattr(conv, "_KDA_CONV1D_GLUON_ENABLED", True)
+    monkeypatch.setattr(conv, "_get_kda_conv1d_gluon_kernel", lambda *_: None)
+    _compare(run_update, _case(spec, [5 if spec else 1] * 128), expected="fast")
