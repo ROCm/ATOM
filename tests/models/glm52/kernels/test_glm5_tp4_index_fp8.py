@@ -276,12 +276,25 @@ def _build_index_writer(tokens: int, page: int = PAGE):
     return launch
 
 
+def _skip_unless_gfx950():
+    """The writer is GLM-5.2 mono kernel code: a 64-lane wave and gfx950's
+    ``v_permlane{32,16}_swap`` (``xred``). The model serves gfx950 only
+    (``atom/models/glm52/mono/config.py``); compiled for another target the swap
+    fails LLVM's instruction selection, which aborts the process."""
+
+    from aiter.jit.utils.chip_info import get_gfx
+
+    if get_gfx() != "gfx950":
+        pytest.skip(f"the GLM-5.2 mono writer is gfx950 code, this GPU is {get_gfx()}")
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 def test_flydsl_writer_matches_oracle_bytes():
     """The kernel's own expressions, on the GPU, against the oracle's bytes."""
 
     pytest.importorskip("aiter", reason="the writer pulls buffer_ops out of the AITER runtime")
     pytest.importorskip("flydsl")
+    _skip_unless_gfx950()
     tokens = 128
     k, slots, blocks = _sample(tokens, seed=21)
     device = torch.device("cuda")
@@ -336,6 +349,7 @@ def test_flydsl_writer_matches_aiter_at_ue8m0_boundary():
 
     aiter = pytest.importorskip("aiter")
     pytest.importorskip("flydsl")
+    _skip_unless_gfx950()
     from aiter.ops.cache import indexer_k_quant_and_cache
 
     assert torch.finfo(aiter.dtypes.fp8).max == FP8_MAX, "this box is not OCP fp8"
