@@ -257,6 +257,7 @@ def _epilogue(
     in_row=False,
     pairs=TASK_ROWS // 64,
     activated=False,
+    situated=None,
 ):
     """One MXFP4 block (waves 2 ``pair``, + 1: 64 GUGU rows) of M tile
     ``tile``: AITER's SiTUv2, the block's E8M0 scale, its FP4 words at each
@@ -264,10 +265,12 @@ def _epilogue(
     tile, its token's: the lanes of a pick hold 16 intermediates each.
     ``in_row``: a pick's row ``INTER_ROW_WORDS`` wide with its codes past the
     FP4 words, stored at device scope for another CTA's down. ``activated``:
-    the waves left their ``_situ`` in ``red`` (8 a lane), not accumulators."""
+    the waves left their ``_situ`` in ``red`` (8 a lane), not accumulators.
+    ``situated``: the block's two halves' ``_situ``, this wave's own (no
+    ``red``)."""
     red = lds["red"]
-    logical = []
-    for half in range_constexpr(2):
+    logical = [] if situated is None else situated
+    for half in range_constexpr(0 if situated is not None else 2):
         slot = (2 * pair + half) * GFX1250.wave_size + lane
         if const_expr(activated):
             logical.append([fx.ptr_load(red + slot * 8 + e) for e in range(8)])
@@ -514,6 +517,17 @@ def _wmma16(weight, activation, accumulator, weight_scale, activation_scale):
             weight_scale,
             activation_scale,
         )
+    )
+
+
+def _past_picks(fragment, index, count, zero):
+    """``fragment`` (v8 i32), zeros in a lane whose pick ``index`` is past
+    ``count`` when ``zero``: a padding column's products are never stored."""
+    if not zero:
+        return fragment
+    live = index < count
+    return fx.Vector.from_elements(
+        [live.select(fragment[e], fx.Int32(0)) for e in range_constexpr(8)], fx.Int32
     )
 
 
@@ -924,6 +938,8 @@ def build_moe(
     rolled: bool | None = None,
     ring: int | None = None,
     resident: int | None = None,
+    wide: bool | None = None,
+    zero_pad: bool | None = None,
 ) -> MoeKernel:
     """The routed experts of ``rows`` tokens in one resident 256-CTA launch,
     with no grid barrier and no queue: every CTA works out the same static,
@@ -946,9 +962,30 @@ def build_moe(
     ``rolled`` (default ``ATOM_KIMI_MONO_ROLLED_MOE``): a task's K tiles, its
     M tiles' epilogues, a down tile's M tiles and the ring's first copies run
     as runtime loops, and a switch stages its picks' rows a round an
-    iteration, so a cold launch fetches one body of each."""
+    iteration, so a cold launch fetches one body of each.
+
+    ``wide`` (default ``ATOM_KIMI_MONO_FUSED_MOE_WIDE``), rolled: a task's
+    gate/up runs on three waves of 64 rows -- an MXFP4 block each, its two
+    32-row halves' WMMAs on every activation fragment it reads -- so each
+    fragment is read by half the waves, and a wave quantizes and stores its
+    own block: no ``red``, no barrier.
+
+    ``zero_pad`` (default ``ATOM_KIMI_MONO_FUSED_MOE_ZERO_PAD``): an M tile's
+    lanes past its expert's picks feed the WMMAs zeros, not the last pick's
+    activation -- at 40 rows an expert has 1-2 picks of a tile's 16, so most
+    of every activation operand is padding; the stored outputs are the same.
+
+    Served power-capped, the two together are 3% faster at 40 rows and 64:
+    the same work at less switching runs at a higher clock."""
     if rolled is None:
         rolled = envs.ATOM_KIMI_MONO_ROLLED_MOE
+    if wide is None:
+        wide = envs.ATOM_KIMI_MONO_FUSED_MOE_WIDE
+    wide = bool(wide) and rolled
+    if zero_pad is None:
+        zero_pad = envs.ATOM_KIMI_MONO_FUSED_MOE_ZERO_PAD
+    zero_pad = bool(zero_pad)
+    halves = 2 if wide else 1
     routes = rows * TOPK
     # Past 48 rows every token's latent and a ring of four do not fit: a
     # token's last K tiles are read from global memory (L2), the ring kept.
@@ -982,6 +1019,8 @@ def build_moe(
         f"k3_gfx1250_moe_s{rows}_p{publish_at}_u{up_units}"
         + (f"_r{ring}" if ring != RING else "")
         + (f"_k{resident}" if resident != k_tiles else "")
+        + ("_w" if wide else "")
+        + ("_z" if zero_pad else "")
         + ("_rl" if rolled else "")
         + ("_profile" if profile else "")
     )
@@ -1235,7 +1274,10 @@ def build_moe(
                 fx.ptr_load(picks + fx.min(m * 16 + lane % 16, count - 1)) // TOPK
                 for m in range(tiles)
             ]
-            accumulators = [fx.Vector.filled(16, 0.0, fx.Float32) for _ in range(tiles)]
+            # wide: half h's M tile m at h * tiles + m.
+            accumulators = [
+                fx.Vector.filled(16, 0.0, fx.Float32) for _ in range(halves * tiles)
+            ]
             if const_expr(rolled):
                 for k_tile in range(fx.Int32(0), fx.Int32(resident), unroll=1):
                     k_item = n * k_tiles + k_tile
@@ -1250,43 +1292,97 @@ def build_moe(
                     if k_item + ring - 1 < flat:
                         issue(k_item + ring - 1, (k_item + ring - 1) % ring)
                     k_stage = smem.stages.ptr + (k_item % ring) * (SLOT_BYTES // 4)
-                    if wave < UP_WAVES:
-                        k_scale = (
-                            smem.item_scales.ptr
-                            + (k_item % ring) * SCALE_WORDS
-                            + wave * STEPS * 32
-                            + lane
-                        )
-                        k_weights = [
-                            _weight_operand(k_stage, wave, lane, step)
-                            for step in range(STEPS)
-                        ]
-                        k_weight_scales = [
-                            fx.ptr_load(k_scale + step * 32) for step in range(STEPS)
-                        ]
-                        # A K tile's STEPS * 16 words hold one pad dword.
-                        k_latq = lds["latq"] + k_tile
-                        for m in range_constexpr(tiles):
-                            if m == 0 or m * 16 < count:
-                                for step in range_constexpr(STEPS):
-                                    accumulators[m] = _wmma(
-                                        k_weights[step],
-                                        _activation_fragment(
-                                            k_latq,
-                                            latq_words,
-                                            tokens[m],
-                                            k_tile * STEPS + step,
-                                            lane,
-                                        ),
-                                        accumulators[m],
-                                        k_weight_scales[step],
-                                        fx.ptr_load(
+                    if const_expr(wide):  # noqa: SIM102
+                        if wave < UP_ROWS // 64:
+                            w_scale = (
+                                smem.item_scales.ptr
+                                + (k_item % ring) * SCALE_WORDS
+                                + 2 * wave * STEPS * 32
+                                + lane
+                            )
+                            w_weights = [
+                                _weight_operand(k_stage, 2 * wave + h, lane, step)
+                                for h in range(2)
+                                for step in range(STEPS)
+                            ]
+                            w_weight_scales = [
+                                fx.ptr_load(w_scale + (h * STEPS + step) * 32)
+                                for h in range(2)
+                                for step in range(STEPS)
+                            ]
+                            w_latq = lds["latq"] + k_tile
+                            for m in range_constexpr(tiles):
+                                if m == 0 or m * 16 < count:
+                                    for step in range_constexpr(STEPS):
+                                        fragment = _past_picks(
+                                            _activation_fragment(
+                                                w_latq,
+                                                latq_words,
+                                                tokens[m],
+                                                k_tile * STEPS + step,
+                                                lane,
+                                            ),
+                                            m * 16 + lane % 16,
+                                            count,
+                                            zero_pad,
+                                        )
+                                        fragment_scale = fx.ptr_load(
                                             lds["latsc"]
                                             + tokens[m] * (LATENT_SCALES // 4)
                                             + k_tile * STEPS
                                             + step
-                                        ),
-                                    )
+                                        )
+                                        for h in range_constexpr(2):
+                                            accumulators[h * tiles + m] = _wmma(
+                                                w_weights[h * STEPS + step],
+                                                fragment,
+                                                accumulators[h * tiles + m],
+                                                w_weight_scales[h * STEPS + step],
+                                                fragment_scale,
+                                            )
+                    if const_expr(not wide):  # noqa: SIM102
+                        if wave < UP_WAVES:
+                            k_scale = (
+                                smem.item_scales.ptr
+                                + (k_item % ring) * SCALE_WORDS
+                                + wave * STEPS * 32
+                                + lane
+                            )
+                            k_weights = [
+                                _weight_operand(k_stage, wave, lane, step)
+                                for step in range(STEPS)
+                            ]
+                            k_weight_scales = [
+                                fx.ptr_load(k_scale + step * 32) for step in range(STEPS)
+                            ]
+                            # A K tile's STEPS * 16 words hold one pad dword.
+                            k_latq = lds["latq"] + k_tile
+                            for m in range_constexpr(tiles):
+                                if m == 0 or m * 16 < count:
+                                    for step in range_constexpr(STEPS):
+                                        accumulators[m] = _wmma(
+                                            k_weights[step],
+                                            _past_picks(
+                                                _activation_fragment(
+                                                    k_latq,
+                                                    latq_words,
+                                                    tokens[m],
+                                                    k_tile * STEPS + step,
+                                                    lane,
+                                                ),
+                                                m * 16 + lane % 16,
+                                                count,
+                                                zero_pad,
+                                            ),
+                                            accumulators[m],
+                                            k_weight_scales[step],
+                                            fx.ptr_load(
+                                                lds["latsc"]
+                                                + tokens[m] * (LATENT_SCALES // 4)
+                                                + k_tile * STEPS
+                                                + step
+                                            ),
+                                        )
             if const_expr(rolled and resident < k_tiles):
                 for g_tile in range(
                     fx.Int32(resident), fx.Int32(k_tiles), unroll=1
@@ -1305,40 +1401,92 @@ def build_moe(
                     if g_item + ring - 1 < flat:
                         issue(g_item + ring - 1, (g_item + ring - 1) % ring)
                     g_stage = smem.stages.ptr + (g_item % ring) * (SLOT_BYTES // 4)
-                    if wave < UP_WAVES:
-                        g_scale = (
-                            smem.item_scales.ptr
-                            + (g_item % ring) * SCALE_WORDS
-                            + wave * STEPS * 32
-                            + lane
-                        )
-                        g_weights = [
-                            _weight_operand(g_stage, wave, lane, step)
-                            for step in range(STEPS)
-                        ]
-                        g_weight_scales = [
-                            fx.ptr_load(g_scale + step * 32) for step in range(STEPS)
-                        ]
-                        for m in range_constexpr(tiles):
-                            if m == 0 or m * 16 < count:
-                                for step in range_constexpr(STEPS):
-                                    accumulators[m] = _wmma(
-                                        g_weights[step],
-                                        _latent_fragment(
-                                            latent,
-                                            tokens[m],
-                                            g_tile * STEPS + step,
-                                            lane,
-                                        ),
-                                        accumulators[m],
-                                        g_weight_scales[step],
-                                        fx.ptr_load(
+                    if const_expr(wide):  # noqa: SIM102
+                        if wave < UP_ROWS // 64:
+                            v_scale = (
+                                smem.item_scales.ptr
+                                + (g_item % ring) * SCALE_WORDS
+                                + 2 * wave * STEPS * 32
+                                + lane
+                            )
+                            v_weights = [
+                                _weight_operand(g_stage, 2 * wave + h, lane, step)
+                                for h in range(2)
+                                for step in range(STEPS)
+                            ]
+                            v_weight_scales = [
+                                fx.ptr_load(v_scale + (h * STEPS + step) * 32)
+                                for h in range(2)
+                                for step in range(STEPS)
+                            ]
+                            for m in range_constexpr(tiles):
+                                if m == 0 or m * 16 < count:
+                                    for step in range_constexpr(STEPS):
+                                        g_fragment = _past_picks(
+                                            _latent_fragment(
+                                                latent,
+                                                tokens[m],
+                                                g_tile * STEPS + step,
+                                                lane,
+                                            ),
+                                            m * 16 + lane % 16,
+                                            count,
+                                            zero_pad,
+                                        )
+                                        g_fragment_scale = fx.ptr_load(
                                             lds["latsc"]
                                             + tokens[m] * (LATENT_SCALES // 4)
                                             + g_tile * STEPS
                                             + step
-                                        ),
-                                    )
+                                        )
+                                        for h in range_constexpr(2):
+                                            accumulators[h * tiles + m] = _wmma(
+                                                v_weights[h * STEPS + step],
+                                                g_fragment,
+                                                accumulators[h * tiles + m],
+                                                v_weight_scales[h * STEPS + step],
+                                                g_fragment_scale,
+                                            )
+                    if const_expr(not wide):  # noqa: SIM102
+                        if wave < UP_WAVES:
+                            g_scale = (
+                                smem.item_scales.ptr
+                                + (g_item % ring) * SCALE_WORDS
+                                + wave * STEPS * 32
+                                + lane
+                            )
+                            g_weights = [
+                                _weight_operand(g_stage, wave, lane, step)
+                                for step in range(STEPS)
+                            ]
+                            g_weight_scales = [
+                                fx.ptr_load(g_scale + step * 32) for step in range(STEPS)
+                            ]
+                            for m in range_constexpr(tiles):
+                                if m == 0 or m * 16 < count:
+                                    for step in range_constexpr(STEPS):
+                                        accumulators[m] = _wmma(
+                                            g_weights[step],
+                                            _past_picks(
+                                                _latent_fragment(
+                                                    latent,
+                                                    tokens[m],
+                                                    g_tile * STEPS + step,
+                                                    lane,
+                                                ),
+                                                m * 16 + lane % 16,
+                                                count,
+                                                zero_pad,
+                                            ),
+                                            accumulators[m],
+                                            g_weight_scales[step],
+                                            fx.ptr_load(
+                                                lds["latsc"]
+                                                + tokens[m] * (LATENT_SCALES // 4)
+                                                + g_tile * STEPS
+                                                + step
+                                            ),
+                                        )
             for tile_k in range_constexpr(0 if rolled else k_tiles):
                 item = n * k_tiles + tile_k
                 before = clock()
@@ -1376,15 +1524,20 @@ def build_moe(
                                 k_step = tile_k * STEPS + step
                                 accumulators[m] = _wmma(
                                     weights[step],
-                                    _activation_fragment(
-                                        lds["latq"] + k_step * 16 // LATENT_PAD_EVERY,
-                                        latq_words,
-                                        tokens[m],
-                                        k_step,
-                                        lane,
-                                    )
-                                    if tile_k < resident
-                                    else _latent_fragment(latent, tokens[m], k_step, lane),
+                                    _past_picks(
+                                        _activation_fragment(
+                                            lds["latq"] + k_step * 16 // LATENT_PAD_EVERY,
+                                            latq_words,
+                                            tokens[m],
+                                            k_step,
+                                            lane,
+                                        )
+                                        if tile_k < resident
+                                        else _latent_fragment(latent, tokens[m], k_step, lane),
+                                        m * 16 + lane % 16,
+                                        count,
+                                        zero_pad,
+                                    ),
                                     accumulators[m],
                                     weight_scales[step],
                                     fx.ptr_load(
@@ -1394,7 +1547,39 @@ def build_moe(
                                     ),
                                 )
             before = clock()
-            if const_expr(rolled):
+            if const_expr(wide):
+                # Each wave its own block: its halves' SiTU, its scale and
+                # stores, no exchange.
+                up_tiles = fx.min((count + 15) // 16, tiles)
+                for up_m in range(fx.Int32(0), up_tiles, unroll=1):
+                    if wave < UP_ROWS // 64:
+                        situated = []
+                        for h in range_constexpr(2):
+                            chosen = [accumulators[h * tiles][e] for e in range(16)]
+                            for other in range_constexpr(1, tiles):
+                                chosen = [
+                                    (up_m == other).select(
+                                        accumulators[h * tiles + other][e], chosen[e]
+                                    )
+                                    for e in range(16)
+                                ]
+                            situated.append(_situ(chosen))
+                        _epilogue(
+                            lds,
+                            inter,
+                            0,
+                            picks,
+                            count,
+                            block,
+                            wave,
+                            up_m,
+                            lane,
+                            in_row=True,
+                            pairs=UP_ROWS // 64,
+                            activated=True,
+                            situated=situated,
+                        )
+            elif const_expr(rolled):
                 up_tiles = fx.min((count + 15) // 16, tiles)
                 for up_m in range(fx.Int32(0), up_tiles, unroll=1):
                     if wave < UP_WAVES:
@@ -1557,8 +1742,13 @@ def build_moe(
                     for step in range_constexpr(DOWN_STEPS):
                         down_acc = _wmma(
                             down_weights[step],
-                            _activation_fragment(
-                                rows_lds, INTER_LDS_WORDS, down_local, step, lane
+                            _past_picks(
+                                _activation_fragment(
+                                    rows_lds, INTER_LDS_WORDS, down_local, step, lane
+                                ),
+                                down_index,
+                                count,
+                                zero_pad,
                             ),
                             down_acc,
                             down_scales[step],
@@ -1594,8 +1784,13 @@ def build_moe(
                     for step in range_constexpr(DOWN_STEPS):
                         accumulator = _wmma(
                             _weight_operand(stage, wave, lane, step, GROUP_DOWN_BYTES),
-                            _activation_fragment(
-                                rows_lds, INTER_LDS_WORDS, local, step, lane
+                            _past_picks(
+                                _activation_fragment(
+                                    rows_lds, INTER_LDS_WORDS, local, step, lane
+                                ),
+                                index,
+                                count,
+                                zero_pad,
                             ),
                             accumulator,
                             fx.ptr_load(item_scale + step * 32),
