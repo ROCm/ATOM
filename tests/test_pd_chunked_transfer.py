@@ -1930,6 +1930,8 @@ def test_last_unadmitted_cancel_reaches_worker_despite_idle_throttle(
         dispatch(worker, request)
     assert p.abort_request(seq.id)
     core = EngineCore.__new__(EngineCore)
+    core._store_preconsume_ready = False
+    core._preconsume_closed_snapshot = False
     core._kv_progress_event = threading.Event()
     core.input_queue = queue.Queue()
     core.utility_queue = queue.Queue()
@@ -1943,7 +1945,7 @@ def test_last_unadmitted_cancel_reaches_worker_despite_idle_throttle(
         meta
     )
     core.runner_mgr.call_func_with_aggregation.side_effect = (
-        lambda _: worker.get_finished()
+        lambda _, **kwargs: worker.get_finished()
     )
     core._process_engine_step_inner()
     assert p.is_finished() and not seq.block_table
