@@ -3,8 +3,9 @@
 
 """MiniMax-M3 FP4 index cache and NVFP4 sparse KV kernels, against torch.
 
-gfx950 only: the e2m1 decode is a gfx950 instruction and the attention / fused
-top-k kernels are gfx950 Gluon. Elsewhere every test skips.
+gfx950 and gfx1250: gfx950 decodes e2m1 with its conversion instruction,
+gfx1250 with integer ops. The NVFP4 attention and the fused top-k are gfx950
+Gluon only. Elsewhere every test skips.
 
 - the store kernels against a torch quantizer (exact), K/V against the index path;
 - the per-row (request, causal length) maps;
@@ -20,14 +21,19 @@ import torch
 pytest.importorskip("triton", reason="the kernels are triton / gluon")
 
 
-def _gfx950() -> bool:
+def _gfx() -> str:
     if not torch.cuda.is_available():
-        return False
+        return ""
     props = torch.cuda.get_device_properties(0)
-    return getattr(props, "gcnArchName", "").startswith("gfx950")
+    return getattr(props, "gcnArchName", "").split(":")[0]
 
 
-pytestmark = pytest.mark.skipif(not _gfx950(), reason="needs a gfx950 GPU")
+pytestmark = pytest.mark.skipif(
+    _gfx() not in ("gfx950", "gfx1250"), reason="needs a gfx950 or gfx1250 GPU"
+)
+gfx950_only = pytest.mark.skipif(
+    _gfx() != "gfx950", reason="the attention and fused verify top-k are gfx950 Gluon"
+)
 
 DEV, D, PAGE = "cuda", 128, 128
 E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
@@ -197,6 +203,7 @@ def test_fp4_scorers_select_like_bf16():
     assert _same_sets(ref, got)
 
 
+@gfx950_only
 def test_nvfp4_attention_matches_dequantized_reference():
     from atom.model_ops.minimax_m3.sparse_attn_nvfp4 import (
         check_nvfp4_sparse_attention,
@@ -243,6 +250,7 @@ def test_nvfp4_attention_matches_dequantized_reference():
         assert err < 0.02, (r, float(err))
 
 
+@gfx950_only
 def test_attention_check_refuses_eight_q_heads():
     from atom.model_ops.minimax_m3.sparse_attn_nvfp4 import (
         check_nvfp4_sparse_attention,
@@ -258,6 +266,7 @@ def test_attention_check_refuses_eight_q_heads():
         )
 
 
+@gfx950_only
 @pytest.mark.parametrize("bs, ctx", [(3, 20000), (16, 186000)])
 def test_fused_verify_topk_matches_scorer(bs, ctx):
     from atom.model_ops.minimax_m3.index_topk import minimax_m3_index_topk_decode
@@ -297,6 +306,7 @@ def test_fused_verify_topk_matches_scorer(bs, ctx):
     assert not can_fuse_verify_topk(padded, cache, q_rows, topk, 1, PAGE, PAGE)
 
 
+@gfx950_only
 @pytest.mark.parametrize("seq_lens", [[2688] * 3, [2688, 5120, 4000, 129]])
 def test_fused_verify_topk_ties_match_scorer(seq_lens):
     """Tied scores at the selection cutoff: both paths keep the higher block ids.

@@ -1,5 +1,5 @@
 # Derived from SGLang (https://github.com/sgl-project/sglang), Apache-2.0; modified for ATOM.
-"""NVFP4 cache rows (MSA-v1 layout) and their gfx950 Triton loads.
+"""NVFP4 cache rows (MSA-v1 layout) and their Triton loads.
 
 A row is one head of one token: ``D // 2`` payload bytes (two e2m1 codes per
 byte, the even element in the low nibble) and ``D // 16`` E4M3 block scales,
@@ -14,6 +14,11 @@ import msgspec
 import torch
 import triton
 import triton.language as tl
+from aiter.jit.utils.chip_info import get_gfx
+
+# gfx950 converts a packed e2m1 byte in one instruction; elsewhere (gfx1250) the
+# codes are decoded with integer ops. Both give the same fp16 values.
+_HW_FP4_CVT = tl.constexpr(get_gfx() == "gfx950")
 
 
 class Nvfp4Cache(msgspec.Struct, frozen=True):
@@ -54,20 +59,36 @@ def _page_head_row_strides(buf: torch.Tensor) -> tuple[int, int, int]:
 
 
 @triton.jit
-def _fp4x2_to_f16(byte_i32):
-    """gfx950: one packed e2m1 byte -> (low, high) fp16 in one conversion.
+def _e2m1_to_f16(code):
+    """One e2m1 code (low 4 bits of an int32) -> fp16 bits, no conversion
+    instruction and no subnormal. Magnitude codes 2..7 are 2^(e-1) * (1 + m/2):
+    fp16 exponent e + 14, so the bits are (code << 9) + (14 << 10); code 1 is 0.5
+    (0x3800) and code 0 is 0. Bit 3 is the sign."""
+    mag = code & 7
+    bits = tl.where(mag >= 2, (mag << 9) + 0x3800, mag * 0x3800)
+    bits = bits | ((code & 8) << 12)
+    return bits.to(tl.int16).to(tl.float16, bitcast=True)
 
-    The instruction's f32 scale only contributes its exponent (E8M0), so the
-    E4M3 block scale is applied by the caller; 1.0 leaves the codes unscaled.
+
+@triton.jit
+def _fp4x2_to_f16(byte_i32):
+    """One packed e2m1 byte -> (low, high) fp16.
+
+    gfx950 does it in one conversion, whose f32 scale only contributes its
+    exponent (E8M0), so the E4M3 block scale is applied by the caller and 1.0
+    leaves the codes unscaled. Other archs decode the nibbles arithmetically.
     """
-    return tl.inline_asm_elementwise(
-        "v_cvt_scalef32_pk_f16_fp4 $0, $2, 1.0\n\tv_lshrrev_b32 $1, 16, $0",
-        "=&v,=&v,v",
-        [byte_i32],
-        dtype=(tl.float16, tl.float16),
-        is_pure=True,
-        pack=1,
-    )
+    if _HW_FP4_CVT:
+        return tl.inline_asm_elementwise(
+            "v_cvt_scalef32_pk_f16_fp4 $0, $2, 1.0\n\tv_lshrrev_b32 $1, 16, $0",
+            "=&v,=&v,v",
+            [byte_i32],
+            dtype=(tl.float16, tl.float16),
+            is_pure=True,
+            pack=1,
+        )
+    else:
+        return _e2m1_to_f16(byte_i32 & 15), _e2m1_to_f16((byte_i32 >> 4) & 15)
 
 
 @triton.jit
@@ -84,7 +105,7 @@ def nvfp4_load_even_odd(
     Byte ``j`` of a row holds elements ``2j`` (low nibble) and ``2j+1``, so the
     split needs no interleave; a dot over D is the sum of the even and odd dots.
     e2m1 times an E4M3 scale has at most 6 significant bits and stays in the fp16
-    normal range, so the dequantized values are exact. gfx950 only.
+    normal range, so the dequantized values are exact.
     """
     HALF: tl.constexpr = D // 2
     cols = tl.arange(0, HALF)

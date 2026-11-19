@@ -81,7 +81,14 @@ def _prefill_score_launch_config(dtype: torch.dtype) -> tuple[int, int]:
         getattr(torch, "float8_e5m2", None),
         getattr(torch, "float8_e5m2fnuz", None),
     )
-    return (4, 1) if dtype in fp8_dtypes else (8, SCORE_NUM_STAGES)
+    if dtype in fp8_dtypes:
+        return 4, 1
+    if dtype == torch.uint8:
+        # The FP4 index payload: its integer e2m1 decode at three stages builds
+        # to 512 VGPRs with 127 spilled (offline gfx1250 build); one stage is
+        # 320 and none spilled.
+        return 8, 1
+    return 8, SCORE_NUM_STAGES
 
 
 # Bounds on the decode score split, one per end of the batch range. MIN_BLOCKS
@@ -1419,7 +1426,11 @@ def minimax_m3_index_topk_decode(
         MAX_Q=max_query_len,
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
         IS_FP4=is_fp4,
-        num_stages=DECODE_SCORE_NUM_STAGES,
+        # The FP4 decode at DECODE_SCORE_NUM_STAGES builds to 667 VGPRs on
+        # gfx1250 (offline build, MAX_Q 8), at one stage 219.
+        num_stages=(
+            1 if is_fp4 and get_gfx() == "gfx1250" else DECODE_SCORE_NUM_STAGES
+        ),
     )
 
     _launch_select(
