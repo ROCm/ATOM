@@ -1098,13 +1098,15 @@ class ModelRunner:
             fused_shared_expert_load_fn = self.model.load_fused_expert_weights
         torch.set_default_device(None)
         load_start = time.perf_counter()
-        load_model(
+        loaded = load_model(
             self.model,
             config.model,
             config.hf_config,
             config.load_dummy,
             load_fused_expert_weights_fn=fused_shared_expert_load_fn,
         )
+        # The parameters the checkpoint wrote, by name; None if none was read.
+        self._checkpoint_param_names = None if config.load_dummy else frozenset(loaded)
         load_elapsed = time.perf_counter() - load_start
         logger.info(
             f"[{self.rank_name}] Model load done: {config.model} "
@@ -1588,17 +1590,18 @@ class ModelRunner:
             )
 
     def _init_forward_vars_ring(self):
-        """Build a ring of independent ``forward_vars`` copies, one per possible
-        in-flight pipeline microbatch.
+        """Build a ring of ``pp_size`` independent ``forward_vars`` copies.
 
-        The head launches up to ``pp_size`` forwards back-to-back without a GPU
-        sync, so a single reused ``forward_vars`` set would let microbatch N+1's
-        ``prepare_inputs`` overwrite staging buffers microbatch N's kernels are
-        still reading. Each in-flight slot gets its own buffer set; reuse of a
-        slot is gated by a per-slot CUDA event (see ``_advance_forward_vars`` /
-        ``_record_forward_vars_event``), bounding the CPU's GPU lead to the ring
-        size even when the head runs middle-chunk or DP-sync dummy batches
-        without a GPU sync.
+        The head launches up to ``pp_max_inflight`` forwards back-to-back
+        without a GPU sync (``pp_size`` unless ATOM_PP_MAX_INFLIGHT says
+        otherwise), so a single reused ``forward_vars`` set would let
+        microbatch N+1's ``prepare_inputs`` overwrite staging buffers
+        microbatch N's kernels are still reading. Each slot gets its own buffer
+        set; reuse of a slot is gated by a per-slot CUDA event (see
+        ``_advance_forward_vars`` / ``_record_forward_vars_event``), bounding
+        the CPU's GPU lead to the ring size even when more forwards are in
+        flight, or the head runs middle-chunk or DP-sync dummy batches without
+        a GPU sync.
 
         When ``pp_size == 1`` the ring is the single original dict and advance is
         a no-op, so behavior is unchanged.
@@ -1726,6 +1729,7 @@ class ModelRunner:
                 int(self.drafter.model.vocab_size),
                 config.torch_dtype,
                 self.device,
+                block=lossless.block_verify,
             )
         elif envs.ATOM_SPEC_LOSSLESS_SAMPLING:
             # Without a drafter there is no draft to sample, and a DSpark
@@ -4282,7 +4286,8 @@ class ModelRunner:
         # all-to-all. No-op unless the flag is on.
         from atom.distributed.indexer_cp import warmup_exchange
 
-        warmup_exchange(self.device)
+        full_q_len = self.drafter.mtp_k + 1 if hasattr(self, "drafter") else 1
+        warmup_exchange(self.device, self.config.max_num_seqs * full_q_len)
 
         tr_hybrid = self._tr_hybrid_active()
         if tr_hybrid:
@@ -4316,7 +4321,6 @@ class ModelRunner:
         #
         # Warn rather than raise so a misconfig (default cuda_graph_sizes=[512]
         # vs e.g. max_num_seqs=16) stays recoverable.
-        full_q_len = self.drafter.mtp_k + 1 if hasattr(self, "drafter") else 1
         max_seq_bs = self.config.max_num_seqs
         max_tok_bs = self.config.max_num_batched_tokens // full_q_len
         max_bs = max_schedulable_decode_bs(
@@ -4594,6 +4598,11 @@ class ModelRunner:
         # The captures and the calibration ran the model for real; take back
         # what they wrote into the cache before the first request is admitted.
         self.attn_metadata_builder.reset_cache_after_capture()
+
+        if self.config.dcp_config.comm_backend == "mailbox":
+            from atom.model_ops.dcp_ops import check_dcp_mailbox_launches
+
+            check_dcp_mailbox_launches()
 
         # How much GPU memory the CUDA graph capture consumed (pool = reserved
         # delta; the allocated delta is what the graphs pin live).
