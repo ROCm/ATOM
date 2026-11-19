@@ -222,7 +222,9 @@ ENV HSA_ENABLE_IPC_MODE_LEGACY=1
 
 # Build-time only (ARG, not ENV): wheels pip downloads during the build are not
 # left in /root/.cache/pip of a layer, while pip inside the shipped image keeps
-# its default cache. ARGs do not cross FROM, so atom_image declares it again.
+# its default cache. Stages built FROM base inherit it (the redeclaration in
+# atom_image is redundant but harmless); images built FROM the shipped image do
+# not, so the plugin Dockerfiles declare their own.
 ARG PIP_NO_CACHE_DIR=1
 
 # AITER's prebuilt and runtime-JIT modules must use the same pybind ABI.
@@ -574,10 +576,10 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
 # HIP hipify copies tests/*.cpp into the build tree but not headers such as
 # rdma_test_peers.h, so BUILD_UNIT_TESTS=ON fails. Upstream ROCm CI also sets
 # BUILD_UNIT_TESTS=OFF; examples are unused in this image.
-# Go builds the etcd wrapper (USE_ETCD=ON). MOONCAKE_GO_VERSION must be the
-# toolchain mooncake-common/etcd/go.mod declares at MOONCAKE_COMMIT;
-# GOTOOLCHAIN=local makes a mismatch fail the build instead of downloading
-# another toolchain. Only this RUN sets it: the image keeps Go's default. The
+# Go builds the etcd wrapper (USE_ETCD=ON). GOTOOLCHAIN=local stops Go from
+# downloading another toolchain; keep MOONCAKE_GO_VERSION equal to
+# mooncake-common/etcd/go.mod's `toolchain` line by hand when bumping
+# MOONCAKE_COMMIT. Only this RUN sets it: the image keeps Go's default. The
 # toolchain stays installed, and the module and build caches it fills here are
 # removed in this same RUN, so an in-container rebuild only re-downloads modules.
 RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
