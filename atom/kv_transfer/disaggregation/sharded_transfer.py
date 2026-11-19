@@ -257,11 +257,23 @@ def kv_heads_of_rank(rank: int, tp: int, total_heads: int) -> tuple[int, int]:
     raise ValueError(f"{total_heads} KV heads do not shard over TP {tp}")
 
 
+def head_run_widths(runs: tuple[int, ...], unit_bytes: int) -> tuple[int, ...]:
+    """Bytes one head takes in each run of `runs`: `(runs, heads)` splits the unit
+    evenly, `(runs, heads, w_0, ..., w_runs-1)` names each run's width."""
+    count, heads = runs[0], runs[1]
+    if len(runs) == 2:
+        width = unit_bytes // (count * heads) if count > 0 and heads > 0 else 0
+        return (width,) * count
+    if len(runs) != 2 + count:
+        raise ValueError(f"{runs}: expected one head width per run")
+    return tuple(runs[2:])
+
+
 def consumer_head_slices(
     src_bytes: int,
     dst_bytes: int,
-    src_runs: tuple[int, int] | None,
-    dst_runs: tuple[int, int] | None,
+    src_runs: tuple[int, ...] | None,
+    dst_runs: tuple[int, ...] | None,
     rank: int,
     tp: int,
     label: str,
@@ -275,26 +287,24 @@ def consumer_head_slices(
                 f"{dst_runs} of {dst_bytes} B on consumer rank {rank}/{tp}"
             )
         return np.array([[0, 0, src_bytes]], dtype=np.int64)
-    (runs, heads), (dst_run_count, dst_heads) = src_runs, dst_runs
+    (runs, heads), (dst_run_count, dst_heads) = src_runs[:2], dst_runs[:2]
     first, count = kv_heads_of_rank(rank, tp, heads)
-    width = src_bytes // (runs * heads) if runs > 0 else 0
+    widths = head_run_widths(tuple(src_runs), src_bytes) if runs > 0 else ()
+    dst_widths = (
+        head_run_widths(tuple(dst_runs), dst_bytes) if dst_run_count > 0 else ()
+    )
     if (
-        width <= 0
+        not widths
+        or min(widths) <= 0
         or (runs, count) != (dst_run_count, dst_heads)
-        or src_bytes != runs * heads * width
-        or dst_bytes != runs * count * width
+        or widths != dst_widths
+        or src_bytes != heads * sum(widths)
+        or dst_bytes != count * sum(widths)
     ):
         raise ValueError(
-            f"{label}: {runs}x{heads} heads in {src_bytes} B here do not cut "
-            f"into {dst_run_count}x{dst_heads} in {dst_bytes} B on consumer "
-            f"rank {rank}/{tp}"
+            f"{label}: {src_runs} heads in {src_bytes} B here do not cut "
+            f"into {dst_runs} in {dst_bytes} B on consumer rank {rank}/{tp}"
         )
-    run = np.arange(runs, dtype=np.int64)
-    return np.stack(
-        [
-            run * heads * width + first * width,
-            run * count * width,
-            np.full(runs, count * width, dtype=np.int64),
-        ],
-        axis=1,
-    )
+    w = np.asarray(widths, dtype=np.int64)
+    before = np.concatenate(([0], np.cumsum(w)[:-1]))
+    return np.stack([before * heads + first * w, before * count, count * w], axis=1)

@@ -20,12 +20,17 @@ from atom.kv_transfer.disaggregation.transfer_plan import (
 
 
 def reference_gather_units(source, indices, out, plan):
-    """``gather_units`` on host tensors: the strided gather is a GPU kernel."""
+    """``gather_units`` on host tensors: its non-whole-unit gathers are GPU kernels."""
     src = source.reshape(-1, plan.source_bytes)
     dst = out.view(indices.numel(), plan.unit_bytes)
-    for offset in range(0, plan.unit_bytes, plan.width):
-        first = plan.first + offset // plan.width * plan.src_stride
-        dst[:, offset : offset + plan.width] = src[indices, first : first + plan.width]
+    slices = plan.segments or [
+        (plan.first + i * plan.src_stride, plan.width)
+        for i in range(plan.unit_bytes // plan.width)
+    ]
+    at = 0
+    for first, size in slices:
+        dst[:, at : at + size] = src[indices, first : first + size]
+        at += size
 
 
 def execute_plan(plan, source, destination):
@@ -104,6 +109,40 @@ def test_tp_rank_owns_its_heads_of_each_page(rank, heads):
     assert torch.equal(destination[dst_ids], source[ids, :, head : head + 1, :])
     assert not destination[list(set(range(5)) - set(dst_ids))].any()
     assert plan.regions[0].target_region == 7  # explicit PP region mapping
+
+
+@pytest.mark.parametrize("rank", range(4))
+def test_named_run_widths_gather_into_one_target_page(rank):
+    # NVFP4-like page: runs of 8 B and 4 B per head (data, scales) for K then V.
+    widths = (8, 4, 8, 4)
+    heads = 4
+    source = (
+        torch.arange(5 * 24 * heads, dtype=torch.int64)
+        .remainder(251)
+        .to(torch.uint8)
+        .view(5, 24 * heads)
+    )
+    ids = [3, 0, 2]
+    destination = torch.zeros(5, 24, dtype=torch.uint8)
+    dst_ids = [4, 1, 3]
+    cuts = consumer_head_slices(
+        24 * heads, 24, (4, heads, *widths), (4, 1, *widths), rank, 4, "page"
+    )
+    gather = GatherLayout.from_slices(24 * heads, 24, cuts)
+    assert len(gather.segments) == 4
+    plan = page_transfer_plan(
+        [PlannedRegion(0, 7, destination.data_ptr(), gather)], ids, dst_ids
+    )
+    execute_plan(plan, source, destination)
+    want = []
+    before = 0
+    for w in widths:
+        want.append(
+            source[ids, before * heads + rank * w : before * heads + (rank + 1) * w]
+        )
+        before += w
+    assert torch.equal(destination[dst_ids], torch.cat(want, dim=1))
+    assert not destination[list(set(range(5)) - set(dst_ids))].any()
 
 
 def test_tp_replicated_units_can_also_be_partitioned_by_dcp():

@@ -5,9 +5,12 @@
 
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass
 
 import torch
+
+MAX_SEGMENTS = 4
 
 
 @dataclass(frozen=True)
@@ -25,8 +28,14 @@ class GatherLayout:
     first: int
     src_stride: int
     width: int
+    # `(src offset, bytes)` slices laid end to end, where one stride cannot
+    # describe them (NVFP4 pages: data and scale runs of different widths).
+    segments: tuple[tuple[int, int], ...] = ()
 
     def __post_init__(self):
+        if self.segments:
+            self._check_segments()
+            return
         if min(self.source_bytes, self.unit_bytes, self.src_stride, self.width) <= 0:
             raise ValueError("Invalid gather byte geometry")
         if (
@@ -52,22 +61,48 @@ class GatherLayout:
         if end > self.source_bytes:
             raise ValueError("Gather slices exceed the source unit")
 
+    def _check_segments(self) -> None:
+        if len(self.segments) > MAX_SEGMENTS:
+            raise ValueError(f"At most {MAX_SEGMENTS} gather segments")
+        if (
+            self.source_bytes % 4
+            or sum(size for _, size in self.segments) != self.unit_bytes
+            or any(
+                size <= 0
+                or offset < 0
+                or offset % 4
+                or size % 4
+                or offset + size > self.source_bytes
+                for offset, size in self.segments
+            )
+        ):
+            raise ValueError("Gather segments must tile the unit in 4-byte words")
+
     @classmethod
     def from_slices(cls, source_bytes: int, unit_bytes: int, slices) -> GatherLayout:
-        """The layout of ``[src offset, dst offset, bytes]`` rows, such as
-        ``consumer_head_slices`` cuts, that fill a unit in order at one stride."""
+        """The layout of ``[src offset, dst offset, bytes]`` rows that fill a unit in
+        order, such as ``consumer_head_slices`` cuts: one stride, else segments."""
         rows = [tuple(int(x) for x in row) for row in slices]
+        ends = list(itertools.accumulate(size for *_, size in rows))
+        if ends[-1] != unit_bytes or [dst for _, dst, _ in rows] != [0, *ends[:-1]]:
+            raise ValueError("Gather slices must fill the destination unit in order")
         first, _, width = rows[0]
         stride = rows[1][0] - first if len(rows) > 1 else source_bytes
-        if unit_bytes != width * len(rows) or any(
-            row != (first + i * stride, i * width, width) for i, row in enumerate(rows)
+        if all(
+            (src, size) == (first + i * stride, width)
+            for i, (src, _, size) in enumerate(rows)
         ):
-            raise ValueError("Nonuniform head runs need a physical layout adapter")
-        return cls(source_bytes, unit_bytes, first, stride, width)
+            return cls(source_bytes, unit_bytes, first, stride, width)
+        segments = tuple((src, size) for src, _, size in rows)
+        return cls(source_bytes, unit_bytes, first, source_bytes, width, segments)
 
     @property
     def whole_unit(self) -> bool:
-        return self.first == 0 and self.width == self.source_bytes == self.unit_bytes
+        return (
+            not self.segments
+            and self.first == 0
+            and self.width == self.source_bytes == self.unit_bytes
+        )
 
 
 def gather_units(
@@ -76,8 +111,8 @@ def gather_units(
     """Copy this rank's byte slices of the units ``indices`` names into ``out``.
 
     ``source`` and ``out`` are contiguous byte views, ``out`` exactly one unit
-    per index; a strided ``plan`` needs them on GPU. No dequantization or KV
-    format change.
+    per index; a strided or segment ``plan`` needs them on GPU. No dequantization
+    or KV format change.
     """
     if not indices.numel():
         return
@@ -88,6 +123,9 @@ def gather_units(
             indices,
             out=out.view(-1, plan.unit_bytes),
         )
+        return
+    if plan.segments:
+        _gather_segments(source, indices, out, plan)
         return
     # Imported here, so the whole-unit path runs without Triton.
     from atom.kv_transfer.disaggregation.gather_kernels import gather_strided_units
@@ -102,6 +140,37 @@ def gather_units(
         FIRST=plan.first // 4,
         STRIDE=plan.src_stride // 4,
         WIDTH=plan.width // 4,
+        BLOCK=256,
+        num_warps=1,
+    )
+
+
+def _gather_segments(
+    source: torch.Tensor, indices: torch.Tensor, out: torch.Tensor, plan: GatherLayout
+):
+    """``plan.segments`` of each indexed source unit, end to end in ``out``."""
+    from atom.kv_transfer.disaggregation.gather_kernels import gather_segment_units
+
+    starts = [offset // 4 for offset, _ in plan.segments]
+    ends = list(itertools.accumulate(size // 4 for _, size in plan.segments))
+    # Pad to four with empty segments, each ending where the last one does.
+    pad = MAX_SEGMENTS - len(starts)
+    starts += starts[-1:] * pad
+    ends += ends[-1:] * pad
+    words = plan.unit_bytes // 4
+    gather_segment_units[(indices.numel(), -(-words // 256))](
+        source.view(torch.int32),
+        indices,
+        out.view(torch.int32),
+        SRC_WORDS=plan.source_bytes // 4,
+        DST_WORDS=words,
+        O0=starts[0],
+        O1=starts[1],
+        O2=starts[2],
+        O3=starts[3],
+        E0=ends[0],
+        E1=ends[1],
+        E2=ends[2],
         BLOCK=256,
         num_warps=1,
     )

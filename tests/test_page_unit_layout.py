@@ -160,6 +160,33 @@ def test_each_rank_receives_exactly_its_own_heads(runs, heads, tp):
         assert np.array_equal(dst.reshape(runs, count, width), want)
 
 
+@pytest.mark.parametrize("heads, tp", [(4, 4), (4, 2), (2, 4)])
+def test_runs_of_named_widths_cut_each_ranks_heads(heads, tp):
+    # NVFP4-like page: K data, K scales, V data, V scales, each one width a head
+    widths = (8, 4, 8, 4)
+    src = (np.arange(heads * sum(widths)) % 251).astype(np.uint8)
+    for rank in range(tp):
+        first, count = kv_heads_of_rank(rank, tp, heads)
+        dst = np.full(count * sum(widths), 255, np.uint8)
+        cuts = consumer_head_slices(
+            src.size, dst.size, (4, heads, *widths), (4, count, *widths), rank, tp, "kv"
+        )
+        for s, d, n in cuts:
+            dst[d : d + n] = src[s : s + n]
+        want, at = [], 0
+        for w in widths:
+            want.append(src[at + first * w : at + (first + count) * w])
+            at += heads * w
+        assert np.array_equal(dst, np.concatenate(want))
+
+
+def test_named_widths_must_agree_on_both_ends():
+    with pytest.raises(ValueError, match="kv"):
+        consumer_head_slices(
+            4 * 24, 24, (4, 4, 8, 4, 8, 4), (4, 1, 4, 8, 4, 8), 0, 4, "kv"
+        )
+
+
 def test_a_unit_that_is_not_per_head_moves_whole():
     assert consumer_head_slices(18432, 18432, None, None, 3, 4, "index").tolist() == [
         [0, 0, 18432]
