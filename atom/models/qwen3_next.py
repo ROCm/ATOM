@@ -1103,6 +1103,17 @@ class Qwen3NextAttention(nn.Module):
         # gate + quant kernel (mx32_output_gate, excluded from fused_output_gate).
         fused_output_gate = self.fused_output_gate and not self.gate_in_attention
         attn_gate = {"output_gate": gate} if fused_output_gate else {}
+        # ATOM_FOLD_ATTN_GATE: the output gate and o_proj's 1x32 MXFP8 quant in the epilogue of the
+        # attention's split-KV reduce (no separate gate + quant launch)
+        from atom.model_ops import fold_attn_gate as _fag
+
+        fold_req = (
+            _fag.open_request(gate)
+            if self.mx32_output_gate and _fag.can_fold(self, gate, select_rows)
+            else None
+        )
+        if fold_req is not None:
+            attn_gate = {"output_gate": gate}
         if self.fuse_qk_norm_rope_cache:
             # Pass the packed [q, k, v] tensor (gate excluded) for smuggling
             # through vLLM's typed custom op which requires Tensor args.
@@ -1148,6 +1159,9 @@ class Qwen3NextAttention(nn.Module):
                 gate, select_rows, q, k, v, **attn_gate
             )
 
+        if fold_req is not None:
+            x_fp8, x_scale = _fag.finish(fold_req, attn_output)
+            return self.o_proj(x_fp8, x_scale=x_scale)
         if epilogue_done:
             # The attention gated (and selected) its output itself.
             return attn_output if self.skip_out_proj else self.o_proj(attn_output)
