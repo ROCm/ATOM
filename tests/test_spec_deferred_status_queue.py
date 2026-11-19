@@ -289,10 +289,11 @@ def test_the_non_deferred_branch_refuses_a_batch_carrying_drafts(is_mixed):
         batch.num_rejected = None
         batch.num_bonus = None
 
+    assert batch.is_mixed is is_mixed
     with pytest.raises(NotImplementedError, match="num_spec_step=3"):
         tokenIDProcessor.prepare_input_ids(
             processor,
-            _decode_batch(num_spec_step=3),
+            batch,
             4,
             processor.runner.h2d_groups["input_ids"],
         )
