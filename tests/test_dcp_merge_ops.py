@@ -84,6 +84,7 @@ try:
         _dcp_a2a_unpack_combine_kernel,
         _lse_pack_slots,
         correct_attn_out,
+        cp_lse_a2a,
         dcp_global_pos,
         dcp_local_index,
         dcp_owner_rank,
@@ -268,6 +269,102 @@ def test_non_power_of_two_world_size_is_rejected():
     lses = torch.randn(3, 2, 2, device=DEV)
     with pytest.raises(AssertionError, match="power of two"):
         correct_attn_out(out, lses, 0)
+
+
+# ───────────────────────────────────────────────────────── fused merge hook ──
+
+
+def _decode_tbo(monkeypatch, on):
+    """The global config cp_lse_a2a reads: decode TBO on or off."""
+    from atom.model_ops import dcp_ops
+
+    config = SimpleNamespace(enable_tbo_decode=on)
+    monkeypatch.setattr(dcp_ops, "get_current_atom_config", lambda: config)
+
+
+@needs_dcp_ops
+def test_cp_lse_a2a_takes_the_groups_fused_merge(monkeypatch):
+    """A group whose dcp_lse_merge takes the inputs serves the whole merge."""
+    _decode_tbo(monkeypatch, False)
+    calls = []
+
+    def merge(o, lse, owned_counts=None, return_lse=False):
+        calls.append((tuple(o.shape), lse.dtype, owned_counts, return_lse))
+        return "merged"
+
+    group = SimpleNamespace(world_size=8, dcp_lse_merge=merge)
+    o = torch.zeros(3, 96, 128, dtype=torch.bfloat16)
+    lse = torch.zeros(3, 96, dtype=torch.bfloat16)
+    assert cp_lse_a2a(o, lse, group, return_lse=True) == "merged"
+    # The LSE reaches it as fp32, whatever the caller passed.
+    assert calls == [((3, 96, 128), torch.float32, None, True)]
+
+
+def _same_shards_a2a(monkeypatch):
+    """all_to_all_single for a group whose every rank holds this rank's
+    partials, this rank being rank 0: every source sends it its chunk 0."""
+
+    def all_to_all_single(recv, send, group=None):
+        recv.copy_(send[0].expand_as(recv))
+
+    monkeypatch.setattr(torch.distributed, "all_to_all_single", all_to_all_single)
+
+
+def _two_rank_inputs():
+    """o [5, 8, 128] and lse [5, 8] of one rank; row 1 has no KV anywhere."""
+    gen = torch.Generator(device=DEV).manual_seed(0)
+    o = torch.randn((5, 8, 128), generator=gen, device=DEV).to(torch.bfloat16)
+    lse = torch.randn((5, 8), generator=gen, device=DEV)
+    lse[1] = float("-inf")
+    return o, lse
+
+
+@needs_gpu
+def test_cp_lse_a2a_merges_itself_when_the_group_declines(monkeypatch):
+    """dcp_lse_merge returning None: pack, all-to-all and combine run, and their
+    result comes back."""
+    _decode_tbo(monkeypatch, False)
+    _same_shards_a2a(monkeypatch)
+    calls = []
+
+    def decline(o, lse, owned_counts=None, return_lse=False):
+        # The group does not take these inputs: it returns None.
+        calls.append(tuple(o.shape))
+
+    group = SimpleNamespace(world_size=2, device_group=None, dcp_lse_merge=decline)
+    o, lse = _two_rank_inputs()
+    out, out_lse = cp_lse_a2a(o, lse, group, return_lse=True)
+    assert calls == [(5, 8, 128)]
+    # Two equal shards weigh 1/2 each: the merge is the shard itself and the
+    # LSE gains log 2. A row with no KV on any rank merges to 0 and -inf.
+    want, want_lse = o[:, :4].clone(), lse[:, :4] + np.log(2.0)
+    want[1] = 0
+    torch.testing.assert_close(out, want)
+    torch.testing.assert_close(out_lse, want_lse, rtol=1e-5, atol=1e-5)
+
+
+@needs_gpu
+@pytest.mark.parametrize("why", ["quant", "decode_tbo"])
+def test_cp_lse_a2a_does_not_ask_the_group(monkeypatch, why):
+    """The fused-quant combine, and decode TBO, take pack/all-to-all/combine
+    without asking the group: the fused merge does not quantize, and under
+    decode TBO two micro-batches could interleave on its scratch."""
+    _decode_tbo(monkeypatch, why == "decode_tbo")
+    _same_shards_a2a(monkeypatch)
+
+    def merge(*args, **kwargs):
+        raise AssertionError("dcp_lse_merge must not be called")
+
+    group = SimpleNamespace(world_size=2, device_group=None, dcp_lse_merge=merge)
+    o, lse = _two_rank_inputs()
+    if why == "quant":
+        out, scale = cp_lse_a2a(o, lse, group, quant_dtype=dtypes.fp8)
+        assert out.dtype == dtypes.fp8 and scale.shape == (5, 1)
+    else:
+        out = cp_lse_a2a(o, lse, group)
+        want = o[:, :4].clone()
+        want[1] = 0
+        torch.testing.assert_close(out, want)
 
 
 # ─────────────────────────────────────────────────────── get_dcp_local_seq_lens ──

@@ -21,6 +21,7 @@ Also here: the sparse indexer's DCP support -- the decode candidate exchange
 which all-gathers the step's KV rows instead and needs no merge.
 """
 
+import functools
 import logging
 from dataclasses import dataclass
 
@@ -29,6 +30,7 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.config import get_current_atom_config
 from atom.distributed.dcp_layout import (  # noqa: F401
     dcp_global_pos,
     dcp_local_index,
@@ -799,6 +801,14 @@ def _dcp_a2a_unpack_combine_quant_kernel(
     )
 
 
+@functools.cache
+def _log_fused_merge():
+    """Say once a process that cp_lse_a2a takes aiter's fused merge."""
+    logger.info(
+        "DCP merge: aiter's fused all-to-all + LSE combine (cp_group.dcp_lse_merge)"
+    )
+
+
 def cp_lse_a2a(
     cp_attn_out,
     cp_attn_lse,
@@ -807,14 +817,17 @@ def cp_lse_a2a(
     owned_counts=None,
     quant_dtype=None,
 ):
-    """A2A backend: pack -> one all-to-all -> local LSE combine.
+    """A2A backend: pack -> one all-to-all -> local LSE combine, or the group's
+    fused DCP merge (aiter's ``GroupCoordinator.dcp_lse_merge``, not this
+    module's ``dcp_lse_merge``) when it takes the inputs.
 
     Drop-in for ``cp_lse_ag_out_rs``: same inputs, same ``[B, H_local, D]``
     output, same head ownership.
 
     Args:
         cp_attn_out: ``[B, H, D]`` this rank's partial output over its KV shard.
-        cp_attn_lse: ``[B, H]`` matching log-sum-exp, fp32.
+        cp_attn_lse: ``[B, H]`` matching log-sum-exp; any float dtype, merged
+            in fp32.
         cp_group: DCP GroupCoordinator.
         return_lse: also return the merged ``[B, H_local]`` global LSE.
         owned_counts: optional true rank-local sparse-KV count per row. Empty
@@ -825,7 +838,8 @@ def cp_lse_a2a(
             otherwise need -- see ``_dcp_a2a_unpack_combine_quant_kernel``.
             ``scale is None`` in the return means the output came back
             UNQUANTIZED and the caller must quantize as before; that is the
-            single-rank shortcut below, not an error.
+            single-rank shortcut below, not an error. The fused merge does not
+            quantize, so this path never asks the group for it.
     """
     # Checked before the single-rank shortcut, not after: that path returns
     # early, so an assertion below it would let the one caller combination this
@@ -848,6 +862,26 @@ def cp_lse_a2a(
     )
     h_local = h_total // n_ranks
     h_rounded = triton.next_power_of_2(h_local)
+
+    # aiter's fused DCP merge, GroupCoordinator.dcp_lse_merge (ROCm/aiter#7801,
+    # gfx1250): the all-to-all and the LSE combine in one kernel over its custom
+    # all-reduce scratch, with no pack kernel, no copy-in and no combine kernel.
+    # It returns None for inputs it does not take, and the path below runs
+    # instead. Both are collectives, so every rank must choose the same way: the
+    # group's answer depends only on shapes, dtypes and strides, and the
+    # conditions here are the same on every rank. Not under decode TBO
+    # (--enable-tbo all): the kernel shares the custom all-reduce's LL scratch
+    # and epochs, which two micro-batches on two streams could interleave.
+    if quant_dtype is None and not get_current_atom_config().enable_tbo_decode:
+        merged = cp_group.dcp_lse_merge(
+            cp_attn_out,
+            cp_attn_lse.to(torch.float32),
+            owned_counts=owned_counts,
+            return_lse=return_lse,
+        )
+        if merged is not None:
+            _log_fused_merge()
+            return merged
 
     dtype = cp_attn_out.dtype
     pack = _lse_pack_slots(dtype)
