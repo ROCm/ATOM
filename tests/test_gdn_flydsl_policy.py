@@ -126,15 +126,22 @@ def test_policy_is_empty_without_hip_before_probing_the_arch(
 
 @pytest.mark.parametrize("stage", ["prefill", "decode"])
 @pytest.mark.parametrize("replayssm", [False, True])
-def test_invalid_backend_raises_whatever_the_gates(fly, monkeypatch, stage, replayssm):
+@pytest.mark.parametrize("hip", [True, False])
+@pytest.mark.parametrize("lossy_decode", [False, True])
+def test_invalid_backend_raises_whatever_the_gates(
+    fly, monkeypatch, stage, replayssm, hip, lossy_decode
+):
     monkeypatch.setenv(f"ATOM_GDN_{stage.upper()}_BACKEND", "bogus")
-    monkeypatch.setattr(fly, "ops", lambda: object())
+    if hip:
+        monkeypatch.setattr(fly, "ops", lambda: object())
+    else:
+        monkeypatch.setattr(fly.torch.version, "hip", None)
     monkeypatch.setattr(fly, "_validated_on_gfx942", lambda: True)
     with pytest.raises(ValueError, match=f"Invalid ATOM GDN {stage} backend"):
         fly.select_policy(
             allowed=True,
             replayssm=replayssm,
-            lossy_decode=False,
+            lossy_decode=lossy_decode,
             state=_state(),
             activation_dtype=torch.bfloat16,
         )

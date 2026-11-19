@@ -162,7 +162,7 @@ def _flydsl_prefill_metadata(
     policy = impls[0].gdn_flydsl_policy
     # Metadata is sometimes built before the KV bind on this step. Native gates
     # on `_flydsl_prefill_enabled`; if policy is still unset, still try — the
-    # helper returns None when the backend is Triton or AITER ops are missing.
+    # helper returns None when the backend is Triton or without HIP (ROCm).
     if policy is not None and not policy.prefill:
         return None
     num_seqs = int(query_start_loc.shape[0]) - 1
