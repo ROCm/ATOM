@@ -71,6 +71,47 @@ def test_replicated_finalize_covers_every_hidden_row_once(rows):
     assert kernel.abi.names == ("routed_normed", "shared", "up_weight", "output")
 
 
+@pytest.mark.parametrize(
+    ("rows", "front_paired", "oproj_paired", "finalize_paired"),
+    (
+        (5, True, True, True),
+        (30, True, True, True),
+        (31, False, True, True),
+        (42, False, True, True),
+        (43, False, False, True),
+        (46, False, False, True),
+        (47, False, False, False),
+        (64, False, False, False),
+    ),
+)
+def test_k2_gemvs_pair_their_slabs_where_four_token_slabs_fit(
+    monkeypatch, rows, front_paired, oproj_paired, finalize_paired
+):
+    from atom.models.kimi_k3.mono.kernels.stages import k2_finalize_tdm_gfx1250 as fin
+    from atom.models.kimi_k3.mono.kernels.stages import k2_oproj_ar_gfx1250 as oar
+
+    def names():
+        oproj_plan = Gfx1250KimiBuildPlan(
+            threads=256, blocks=256, lds_bytes=320 * 1024, tokens=rows, nblocks=1
+        )
+        return (
+            front.build_replicated_front(_plan(rows), fp8_shared=True).name,
+            oar.build_oproj_allreduce(oproj_plan, 8, 1536, oneshot=True).name,
+            fin.build_replicated_finalize(_plan(rows)).name,
+        )
+
+    paired = names()
+    assert ["_ps" in name for name in paired] == [
+        front_paired,
+        oproj_paired,
+        finalize_paired,
+    ]
+    monkeypatch.setenv("ATOM_KIMI_MONO_PAIRED_SLABS", "0")
+    assert not any("_ps" in name for name in names())
+    monkeypatch.setenv("ATOM_KIMI_MONO_PAIRED_SLABS", "oproj")
+    assert ["_ps" in name for name in names()] == [False, oproj_paired, False]
+
+
 def test_herd_candidates_feed_only_the_grouped_moe_finish():
     with pytest.raises(ValueError, match="HERD"):
         build_packed_finish(_plan(16), herd=True)

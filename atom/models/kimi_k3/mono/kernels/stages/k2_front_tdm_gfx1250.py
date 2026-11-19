@@ -28,6 +28,7 @@ from atom.models.kimi_k3.mono.kernels.stages import (
 )
 from atom.models.kimi_k3.mono.kernels.stages import gemv_tdm_gfx1250 as gemv_tdm
 from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import (
+    TDM_FP8_PAIR_DEPTH,
     TDM_SPLIT_TILE_WORDS,
     tdm_lds_words,
     tdm_split_lds_words,
@@ -140,11 +141,14 @@ def _front_tasks(
     x_cache_policy=0,
     wide=False,
     depth=gemv_tdm.DEPTH,
+    paired=False,
 ):
     """CTA ``pair``'s two projection tasks of ``x`` and their epilogue. The
     accumulators are reduced in the weight slabs' LDS, consumed by then (not
-    the token slabs', which a cluster peer's multicast may still be filling)."""
-    red = lds.gemv.ptr + tdm_lds_words(rows, 2)[0]
+    the token slabs', which a cluster peer's multicast may still be filling).
+    ``paired``: the projections walk K two slabs a step, the FP8 shared one
+    ``TDM_FP8_PAIR_DEPTH`` ahead."""
+    red = lds.gemv.ptr + tdm_lds_words(rows, 2, group=2 if paired else 1)[0]
     router_weight, latent_weight, shared_weight, shared_scale = weights
     router = pair < LATENT_PAIR0
     latent = (pair >= LATENT_PAIR0) & (pair < SHARED_PAIR0)
@@ -176,10 +180,11 @@ def _front_tasks(
                     lane,
                     wave,
                     w_scale=shared_scale,
-                    depth=gemv_tdm.FP8_DEPTH,
+                    depth=TDM_FP8_PAIR_DEPTH if paired else gemv_tdm.FP8_DEPTH,
                     prologue=prologue,
                     x_cache_policy=x_cache_policy,
                     wide=wide,
+                    paired=paired,
                 ),
                 red,
                 tiles,
@@ -203,6 +208,7 @@ def _front_tasks(
                     x_cache_policy=x_cache_policy,
                     wide=wide,
                     depth=depth,
+                    paired=paired,
                 ),
                 red,
                 tiles,
@@ -226,6 +232,7 @@ def _front_tasks(
                 x_cache_policy=x_cache_policy,
                 wide=wide,
                 depth=depth,
+                paired=paired,
             ),
             red,
             tiles,
@@ -484,6 +491,12 @@ def front_split_tasks(
     )
 
 
+def _front_words(rows: int, depth: int, paired: bool) -> int:
+    """The replicated front's GEMV LDS words: the BF16 plan, which the FP8
+    shared one fits in."""
+    return sum(tdm_lds_words(rows, 2, depth=depth, group=2 if paired else 1))
+
+
 def build_replicated_front(
     plan: Gfx1250KimiBuildPlan,
     fp8_shared: bool = False,
@@ -513,11 +526,19 @@ def build_replicated_front(
         raise ValueError(f"replicated K2 front needs {PAIRS} CTAs")
     rows = plan.tokens
     tiles = (rows + ROWS - 1) // ROWS
-    staged = sum(tdm_lds_words(rows, 2, depth=depth))
-    assert staged - tdm_lds_words(rows, 2)[0] >= 2 * tiles * ACCUMULATOR_WORDS
+    paired = wide and depth % 2 == 0 and "front" in gemv_tdm.paired_sites()
+    # Unpaired where four slabs ahead do not fit: two ahead is slower (32-40).
+    if paired and _front_words(rows, depth, True) + rows * 16 > plan.lds_bytes // 4:
+        paired = False
+    staged = _front_words(rows, depth, paired)
+    group = 2 if paired else 1
+    assert (
+        staged - tdm_lds_words(rows, 2, group=group)[0] >= 2 * tiles * ACCUMULATOR_WORDS
+    )
     # The FP8 shared slabs reuse the LDS planned for the BF16 ones, and the
     # shared CTAs start a cluster, so no cluster mixes the two pipelines.
-    assert sum(tdm_lds_words(rows, 2, True, gemv_tdm.FP8_DEPTH)) <= staged
+    fp8_depth = TDM_FP8_PAIR_DEPTH if paired else gemv_tdm.FP8_DEPTH
+    assert sum(tdm_lds_words(rows, 2, True, fp8_depth, group)) <= staged
     assert SHARED_PAIR0 % gemv_tdm.CLUSTER_LAUNCH["cluster"][0] == 0
 
     @fx.struct
@@ -531,6 +552,7 @@ def build_replicated_front(
         raise ValueError(f"replicated K2 front needs {lds_bytes(Lds)} B of LDS")
     name = (
         f"k3_k2_gfx1250_replicated_front{'_w' if wide else ''}_d{depth}"
+        f"{'_ps' if paired else ''}"
         f"_s{rows}{'_f8' if fp8_shared else ''}{gemv_tdm.cold_suffix()}"
         f"{tdm_timeline.suffix()}"
     )
@@ -575,6 +597,7 @@ def build_replicated_front(
                 fp8_shared,
                 wide=wide,
                 depth=depth,
+                paired=paired,
             )
         tdm_timeline.close_cta()
 
