@@ -599,6 +599,39 @@ impl RouterConfig {
         config
     }
 
+    /// Interval for `power_of_two`'s load sample. Uses the smallest configured
+    /// `load_check_interval_secs`. Without that policy, the startup check
+    /// interval remains, and the monitor does not fetch.
+    pub fn load_sample_interval_secs(&self) -> u64 {
+        let mut intervals = Vec::new();
+        let mut push = |policy: &PolicyConfig| {
+            if let PolicyConfig::PowerOfTwo {
+                load_check_interval_secs,
+            } = policy
+            {
+                intervals.push(*load_check_interval_secs);
+            }
+        };
+        push(&self.policy);
+        if let RoutingMode::PrefillDecode {
+            prefill_policy,
+            decode_policy,
+            ..
+        } = &self.mode
+        {
+            if let Some(policy) = prefill_policy {
+                push(policy);
+            }
+            if let Some(policy) = decode_policy {
+                push(policy);
+            }
+        }
+        intervals
+            .into_iter()
+            .min()
+            .unwrap_or(self.worker_startup_check_interval_secs)
+    }
+
     pub fn resolved_prepare_pool(&self) -> ConfigResult<PoolConfig> {
         let config = self.effective_prepare_pool();
         let workers = config.workers.unwrap_or_else(default_prepare_workers);
