@@ -17,6 +17,7 @@ from transformers import PretrainedConfig
 from typing_extensions import overload
 
 from atom.model_loader.weight_utils import local_model_dir
+from atom.models.pp_partition import even_partition
 
 T = TypeVar("T")
 logger = logging.getLogger(__name__)
@@ -65,21 +66,33 @@ class StageMissingLayer(nn.Module):
         return f"stage_name={self.stage_name!r}"
 
 
-def get_pp_indices(
-    num_hidden_layers: int, pp_rank: int, pp_size: int
-) -> tuple[int, int]:
-    """Try to evenly distribute layers across partitions.
+# Stage sizes a `Config` resolved (`ATOM_PP_LAYER_PARTITION`), by (layers,
+# stages). Installed where the config is built and wherever a copy of it is
+# unpickled, so every process that asks `get_pp_indices` -- scheduler, workers,
+# the P/D and offload connectors in either -- gets the same split.
+_installed_pp_partitions: dict[tuple[int, int], tuple[int, ...]] = {}
 
-    If the number of layers is not divisible by the number of partitions,
-    the remaining layers are evenly distributed across all but the last
-    partition. The last partition is excluded because it often contains an
-    additional norm layer and we are attempting to balance compute.
 
-    If `pp_size > 2` and the number of remaining layers is
-    `0 < x <= pp_size - 2` then the remaining layers are evenly distributed
-    across the middle partitions. The first and last partitions are excluded
-    because they contain the input and output embeddings respectively and we
-    are attempting to reduce maximum memory consumption across partitions.
+def install_pp_layer_partition(num_hidden_layers: int, partition) -> None:
+    """Make `get_pp_indices` split a ``num_hidden_layers``-layer model
+    ``len(partition)`` ways as ``partition`` in this process, unless
+    ``VLLM_PP_LAYER_PARTITION`` is set."""
+    partition = tuple(int(n) for n in partition)
+    if sum(partition) != num_hidden_layers or min(partition) < 1:
+        raise ValueError(
+            f"PP partition {list(partition)} does not split {num_hidden_layers} "
+            "layers into non-empty stages"
+        )
+    _installed_pp_partitions[(num_hidden_layers, len(partition))] = partition
+
+
+def pp_layer_partition(num_hidden_layers: int, pp_size: int) -> list[int]:
+    """Each PP stage's layer count.
+
+    ``VLLM_PP_LAYER_PARTITION`` if set; else what `install_pp_layer_partition`
+    installed for this model and PP size; else the even split
+    (`pp_partition.even_partition`): layers by count, any remainder on the
+    middle stages, as the first and last also hold the embedding and lm_head.
     """
     partition_list_str = os.getenv("VLLM_PP_LAYER_PARTITION", None)
     if partition_list_str is not None:
@@ -91,20 +104,27 @@ def get_pp_indices(
             raise ValueError(f"{len(partitions)=} does not match {pp_size=}.")
         if sum(partitions) != num_hidden_layers:
             raise ValueError(f"{sum(partitions)=} does not match {num_hidden_layers=}.")
-    else:
-        layers_per_partition = num_hidden_layers // pp_size
-        partitions = [layers_per_partition for _ in range(pp_size)]
+        return partitions
+    installed = _installed_pp_partitions.get((num_hidden_layers, pp_size))
+    if installed is not None:
+        return list(installed)
+    partitions = even_partition(num_hidden_layers, pp_size)
+    if num_hidden_layers % pp_size:
+        logger.info(
+            "Hidden layers were unevenly partitioned: [%s]. "
+            "This can be manually overridden using the "
+            "VLLM_PP_LAYER_PARTITION environment variable",
+            ",".join(str(p) for p in partitions),
+        )
+    return partitions
 
-        if remaining_layers := num_hidden_layers % pp_size:
-            for i in range(2, remaining_layers + 2):
-                partitions[-i] += 1
-            logger.info(
-                "Hidden layers were unevenly partitioned: [%s]. "
-                "This can be manually overridden using the "
-                "VLLM_PP_LAYER_PARTITION environment variable",
-                ",".join(str(p) for p in partitions),
-            )
 
+def get_pp_indices(
+    num_hidden_layers: int, pp_rank: int, pp_size: int
+) -> tuple[int, int]:
+    """Stage ``pp_rank``'s ``[start, end)`` slice of the layers, per
+    `pp_layer_partition`."""
+    partitions = pp_layer_partition(num_hidden_layers, pp_size)
     start_layer = sum(partitions[:pp_rank])
     end_layer = start_layer + partitions[pp_rank]
 

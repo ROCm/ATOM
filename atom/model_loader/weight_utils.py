@@ -135,6 +135,32 @@ def unquantized_layer_keys(model: str) -> frozenset[str]:
     return frozenset(plain - quantized)
 
 
+@functools.lru_cache(maxsize=4)
+def checkpoint_tensor_bytes(model: str) -> dict[str, int]:
+    """Bytes of each tensor the local checkpoint ``model`` stores, by name.
+    Read from the shard headers, without loading a tensor. Empty when ``model``
+    is not a local directory or holds no safetensors shards."""
+    model_dir = local_model_dir(model)
+    if not model_dir or not os.path.isdir(model_dir):
+        return {}
+    index = os.path.join(model_dir, "model.safetensors.index.json")
+    if os.path.exists(index):
+        with open(index) as f:
+            shards = sorted(set(json.load(f)["weight_map"].values()))
+    else:
+        shards = sorted(n for n in os.listdir(model_dir) if n.endswith(".safetensors"))
+    sizes: dict[str, int] = {}
+    for shard in shards:
+        with open(os.path.join(model_dir, shard), "rb") as f:
+            (header_size,) = struct.unpack("<Q", f.read(8))
+            header = json.loads(f.read(header_size))
+        for name, info in header.items():
+            if name != "__metadata__":
+                start, end = info["data_offsets"]
+                sizes[name] = end - start
+    return sizes
+
+
 def download_weights_from_hf(
     model_name_or_path: str,
     cache_dir: str | None,
