@@ -848,8 +848,11 @@ decodes finish or the long prefill ends; this policy does not rotate them.
 New-prompt admission also reserves the eligible running decodes' append-page
 demand. A new prompt that would consume those pages stays in the waiting
 queue, rather than forcing an older decode to discard its KV and recompute.
-The scheduler calculates token and page reservations once per tick and
-passes them to the delayer, pending/cost/head probes, and actual admission.
+When prefill work is pending, the scheduler snapshots running decodes once
+and passes their token and page reservations to the delayer,
+pending/cost/head probes, and actual admission. Each P/D receive promoted
+to first decode adds its demand to that reservation before the next prompt
+can be admitted; this does not rescan the running queue.
 This reservation does not allocate pages and includes speculative lookahead.
 It excludes requests already scheduled as prefill in the current step, while
 including completed prefills waiting for their first decode.

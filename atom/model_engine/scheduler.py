@@ -83,6 +83,7 @@ _DYNAMIC_CHUNKING_SUPPLY_WINDOW = 16
 class PrefillLimits(NamedTuple):
     tokens: int
     reserved_decode_blocks: int = 0
+    num_decodes: int = 0
 
 
 def defers_output(config, family=None) -> bool:
@@ -1571,7 +1572,7 @@ class Scheduler:
         return budget - max(reserve, 0)
 
     def _prefill_limits(self, scheduled_seqs=()) -> PrefillLimits:
-        """Snapshot before prefill admission; its decodes cannot change in Phase 1/2."""
+        """Reserve existing decodes; P/D promotions extend this before admission."""
         if not self.enable_mixed_prefill_decode:
             return PrefillLimits(self.max_num_batched_tokens)
         candidates = list(self._decode_candidates(scheduled_seqs))
@@ -1588,7 +1589,23 @@ class Scheduler:
             self.block_manager.append_blocks_needed(seq, width, self.draft_lookahead)
             for seq in candidates[:seats]
         )
-        return PrefillLimits(budget, blocks)
+        return PrefillLimits(budget, blocks, len(candidates))
+
+    def _reserve_promoted_decode(
+        self, limits: PrefillLimits, seq: Sequence
+    ) -> PrefillLimits:
+        """Charge a newly received P/D request before admitting the next prompt."""
+        width = self.decode_spec_width + 1
+        seats = max(
+            0, min(self.max_num_seqs - 1, (self.max_num_batched_tokens - 1) // width)
+        )
+        blocks = limits.reserved_decode_blocks
+        if limits.num_decodes < seats:
+            blocks += self.block_manager.append_blocks_needed(
+                seq, width, self.draft_lookahead
+            )
+        count = limits.num_decodes + 1
+        return PrefillLimits(self._budget_for_decodes(count), blocks, count)
 
     def _estimate_prefill_chunk_cost(self, limits=None) -> float:
         """Cost of the chunk this rank would prefill with its prefill budget
@@ -2521,7 +2538,12 @@ class Scheduler:
         num_scheduled_tokens: list[int] = []
         scheduled_spec_decode_tokens: dict[int, np.ndarray] = {}
 
-        limits = self._prefill_limits()
+        limits = (
+            self._prefill_limits()
+            if self.enable_mixed_prefill_decode
+            and (self.waiting or self._partial_prefill_count)
+            else PrefillLimits(self.max_num_batched_tokens)
+        )
         self._prioritize_ready_remote_kv_requests(limits=limits)
         self._park_ready_offload_partial_prefills()
         # Reclaim aborted heads even when decode protection vetoes Phase 2.
@@ -2791,6 +2813,9 @@ class Scheduler:
 
             if remote_ready_for_decode:
                 self._schedule_first_decode_after_remote_kv(seq)
+                if self.enable_mixed_prefill_decode:
+                    limits = self._reserve_promoted_decode(limits, seq)
+                    prefill_budget = limits.tokens
                 continue
 
             if offload_resume:
@@ -3198,69 +3223,131 @@ class Scheduler:
         if self._tick_cost_limit < math.inf:
             self._log_prefill_balance(total_tokens_num_prefill)
 
-        # This decides whether decode rows may join the scheduled prefills;
-        # the final batch shape is known only after the decode loop. Prefill-only
-        # and mixed batches share the settlement, snapshot and advance below.
-        admit_decode = num_seqs_prefill == 0 or self.enable_mixed_prefill_decode
+        if num_seqs_prefill > 0 and not self.enable_mixed_prefill_decode:
+            # A cursor, not a hit count: it starts at the prefix-cache hit and
+            # then advances by each finished chunk, so a chunked prompt logs the
+            # same req_id repeatedly with this climbing by the previous `new`.
+            # Logged as "done" so those repeats don't read as a growing hit.
+            num_cached_tokens_list = [
+                seq.num_cached_tokens for seq in scheduled_seqs.values()
+            ]
+            logger.info(
+                f"Scheduled prefill batch: {num_seqs_prefill} reqs, "
+                f"{total_tokens_num_prefill} new tokens "
+                f"(done: {num_cached_tokens_list}, new: {num_scheduled_tokens}), "
+                f"req_ids: {tuple(scheduled_seqs.keys())}"
+            )
+            self.prev_prompt = True
 
-        if group_prefill_tick and not scheduled_seqs:
+            connector_meta_output = None
+            if self.kv_connector is not None:
+                self._publish_state_loads()
+                self._publish_state_stores()
+                self._note_connector_scheduled_tokens(
+                    scheduled_seqs, num_scheduled_tokens
+                )
+                connector_meta_output = self.kv_connector.build_connector_meta()
+
+            # Freeze, per seq, whether this chunk is the last one this prefill
+            # owes. Uses the pre-advance offsets so it is correct whether or not
+            # schedule-time advancement runs below.
+            #
+            # Measured against `num_tokens`, for the same reason
+            # `next_token_ids` below is: a seq re-admitted after `preempt`
+            # re-forwards the tokens it had already generated, so its prefill
+            # runs past the prompt boundary. Ending it at `num_prompt_tokens`
+            # would call a middle chunk final and leave the rest of the context
+            # with no KV -- the sequence would then decode against blocks still
+            # holding the text of whichever request owned them last, and carry
+            # on writing that request's answer. Equal to `num_prompt_tokens` on
+            # a first admission, which is every seq that was never preempted.
+            is_final_chunk = [
+                (num_cached_tokens_list[i] + int(num_scheduled_tokens[i]))
+                >= seq.num_tokens
+                for i, seq in enumerate(scheduled_seqs.values())
+            ]
+            next_token_ids = None
+            if self.drafter_needs_next_token:
+                next_token_ids = []
+                for i, seq in enumerate(scheduled_seqs.values()):
+                    end = num_cached_tokens_list[i] + int(num_scheduled_tokens[i])
+                    next_token_ids.append(
+                        -1 if end >= seq.num_tokens else int(seq.token_ids[end])
+                    )
+
+            # Reserve midstep checkpoint destinations for the chunks just
+            # settled. Here rather than inside `_finalize_prefill_chunk`
+            # because a reservation takes a slot off the free list, and
+            # admission for this pass only finishes above — planning any
+            # earlier would let a checkpoint's destination compete with a
+            # request still to be let in. The batch below snapshots what this
+            # leaves on each seq.
+            for i, seq in enumerate(scheduled_seqs.values()):
+                start = num_cached_tokens_list[i]
+                self.block_manager.plan_midstep(
+                    seq, start, start + int(num_scheduled_tokens[i])
+                )
+            self._check_draft_writes_allocated(scheduled_seqs.values())
+
+            prefill_batch = ScheduledBatch(
+                seqs=scheduled_seqs,
+                num_scheduled_tokens=num_scheduled_tokens,
+                total_tokens_num=total_tokens_num_prefill,
+                total_tokens_num_prefill=total_tokens_num_prefill,
+                total_seqs_num=num_seqs_prefill,
+                total_seqs_num_prefill=num_seqs_prefill,
+                connector_meta_output=connector_meta_output,
+                num_cached_tokens=num_cached_tokens_list,
+                is_final_chunk=is_final_chunk,
+                next_token_ids=next_token_ids,
+                state_maintenance_ops=self.block_manager.take_state_maintenance_ops(),
+            )
+            self._consume_state_forks(scheduled_seqs)
+
+            if self.advance_on_schedule:
+                # Advance after batch build (so the batch keeps pre-advance
+                # offsets) so the next schedule() issues the following chunk.
+                self._advance_prefill_on_schedule(
+                    scheduled_seqs.values(), num_scheduled_tokens, is_final_chunk
+                )
+
+            return (prefill_batch, scheduled_seqs)
+
+        if group_prefill_tick and not num_seqs_prefill:
             # The group's prefill step, with no prefill of this rank's own: it
             # keeps its peers company on an idle step rather than decode, so
             # every rank's forward replays its token graph (`ForwardMode.decide`).
-            # A mixed step reaches here with its prefills already scheduled and
-            # decodes beside them. (Mixed is V4-only, whose builder records no
-            # token graphs, so `dummy_prefill` is never set beside it today.)
             return None
 
-        # --- Decode scheduling (also fall-through for mixed batches) ---
-        # Three queue states we must handle here when prefills were already
-        # scheduled this step:
-        #   1. Partial prefills resumed in Phase 1 are still in `running`
-        #      (Phase 1 didn't pop them) and are in `scheduled_seqs`.
-        #   2. New prefills admitted in Phase 2 were appended to the back of
-        #      `running` and are in `scheduled_seqs`.
-        #   3. Partial prefills *not* picked up this step (budget exhausted)
-        #      remain in `running` with `is_partial_prefill=True` and must
-        #      not be decoded — they can only advance via prefill.
-        # We `popleft` from `running` and route into `decode_scheduled` (real
-        # decodes this step) or `decode_carryover` (skipped / kept seqs).
+        # Keep prefill rows out of the decode queue, including its preemption
+        # victims. Ordinary decode executes the same per-row path as main.
+        mixed_order = ()
+        if num_seqs_prefill:
+            mixed_order = tuple(self.running)
+            self.running = deque(
+                seq for seq in self.running if seq.id not in scheduled_seqs
+            )
+        max_decode_seqs = self.max_num_seqs - num_seqs_prefill
+
+        # --- Decode scheduling ---
         num_seqs_decode = 0
-        # The max_num_batched_tokens guard below counts `num_batched_tokens`,
-        # not a decode-only tally: in a mixed step that variable already carries
-        # the prefill tokens scheduled this step, and they share the same budget.
-        # A decode-only counter is equivalent on a pure-decode step but lets a
-        # mixed step overshoot.
-        spec_width = self.decode_spec_width
+        num_decode_tokens = total_tokens_num_prefill
+        # anchor + drafts if verifying locally, anchor alone otherwise.
+        spec_width = self.mtp_k if self.use_spec else 0
         tokens_per_decode_seq = spec_width + 1
         num_new_tokens = spec_width + 1
         remote_kv_blocks: set[int] = set()
         remote_kv_seq_blocks: dict[int, list[int]] = {}
-        decode_carryover: list[Sequence] = []
-        decode_scheduled: list[Sequence] = []
         skipped_partial_prefills: list[Sequence] = []
         # Pipeline-parallel: seqs whose sampled token is still in flight cannot
         # be decoded yet. Re-queue them at the tail (like partial prefills) so
         # they are reconsidered once the head releases them post-postprocess.
         skipped_pp_inflight: list[Sequence] = []
-        mixed_order = tuple(self.running) if num_seqs_prefill and admit_decode else ()
         _pp_block = self._pp_inflight_token_block
-        # Seat count and token budget are shared with the prefill rows a mixed
-        # batch already placed, hence `num_seqs_prefill +` and the running
-        # `num_batched_tokens` (checked before each row, not once up front).
-        while (
-            admit_decode
-            and self.running
-            and num_seqs_prefill + num_seqs_decode < self.max_num_seqs
-        ):
-            # Before popleft, as on main: a full budget must leave the queue
-            # untouched, not first rotate leading partial / PP-inflight rows
-            # to the tail.
-            if num_batched_tokens + tokens_per_decode_seq > self.max_num_batched_tokens:
+        while self.running and num_seqs_decode < max_decode_seqs:
+            if num_decode_tokens + tokens_per_decode_seq > self.max_num_batched_tokens:
                 break
             seq = self.running.popleft()
-            if num_seqs_prefill and seq.id in scheduled_seqs:
-                decode_carryover.append(seq)
-                continue
             if seq.is_partial_prefill:
                 skipped_partial_prefills.append(seq)
                 continue
@@ -3272,10 +3359,7 @@ class Scheduler:
             while not self.block_manager.can_append(
                 seq, num_new_tokens, self.draft_lookahead
             ):
-                # Never a row already in this step's batch: a mixed step's
-                # prefills sit at the tail of `running`, where the scan starts,
-                # and preempting one frees its blocks while it stays scheduled.
-                if self._preempt_one_running(exclude=scheduled_seqs):
+                if self._preempt_one_running():
                     continue
                 if self.preempt(seq):
                     preempted_current = True
@@ -3289,7 +3373,7 @@ class Scheduler:
                 if self.use_spec and seq.spec_token_ids.size > 0:
                     scheduled_spec_decode_tokens[seq.id] = seq.spec_token_ids
                 num_seqs_decode += 1
-                num_batched_tokens += num_new_tokens
+                num_decode_tokens += num_new_tokens
                 # For PD first-decode: if T0 was injected, may_append is
                 # needed for the new position N. Without T0 injection,
                 # blocks were already allocated during prefill.
@@ -3323,28 +3407,94 @@ class Scheduler:
                 scheduled_seqs[seq.id] = seq
                 seq.type = SequenceType.DECODE
                 num_scheduled_tokens.append(num_new_tokens)
-                decode_scheduled.append(seq)
                 seq.is_first_decode = False
 
-        # Pure decode retains FCFS ordering and puts held rows at the tail.
-        if decode_carryover:
-            self.running.extendleft(reversed(decode_carryover))
-        if decode_scheduled:
-            self.running.extendleft(reversed(decode_scheduled))
+        total_tokens_num_decode = sum(num_scheduled_tokens)
 
+        if scheduled_seqs:
+            self.running.extendleft(reversed(scheduled_seqs.values()))
         if skipped_partial_prefills:
+            # Re-queue skipped partial prefills at the TAIL, not the head.
+            #
+            # A partial (chunked, prompt-not-done) prefill can land in this
+            # decode loop when the cross-DP PrefillDelayer vetoes prefill for a
+            # tick (Phase 1 skipped, so num_prefill==0 and the prefill-only
+            # early-return doesn't fire). Re-inserting it at the head pins it
+            # at running[0]; once it finishes prefill it becomes the batch's
+            # position-0 *deferred* seq, which pushes the fresh decode seqs to
+            # positions 1..N. TokenIDProcessor.prepare_input_ids then takes the
+            # [deferred | new] path and indexes the (compacted)
+            # scheduled_spec_decode_tokens array by those shifted positions —
+            # running off the end (IndexError: index N out of bounds size N).
+            #
+            # Appending at the tail keeps the partial out of position 0 (its
+            # prefill still resumes: Phase 1 scans all of `running`), so new
+            # decode seqs stay contiguous from position 0 and the safe
+            # [new | deferred] slice path is used.
             self.running.extend(skipped_partial_prefills)
         if skipped_pp_inflight:
             self.running.extend(skipped_pp_inflight)
-        if mixed_order:
-            # The decode pass must not move a new prefill ahead of an older
-            # partial. Remove preempted rows, retaining every survivor's order.
+
+        if num_seqs_prefill:
             retained = {seq.id for seq in self.running}
             self.running.clear()
             self.running.extend(seq for seq in mixed_order if seq.id in retained)
+            return self._build_mixed_batch(
+                scheduled_seqs,
+                num_scheduled_tokens,
+                num_seqs_prefill,
+                num_seqs_decode,
+                scheduled_spec_decode_tokens,
+                remote_kv_blocks,
+                remote_kv_seq_blocks,
+            )
 
-        # Even when all rows are held, return an empty batch for PP progress.
+        connector_meta_output = None
+        if self.kv_connector is not None:
+            self._publish_state_loads()
+            self._publish_state_stores()
+            self._note_connector_scheduled_tokens(scheduled_seqs, num_scheduled_tokens)
+            connector_meta_output = self.kv_connector.build_connector_meta()
 
+        self._check_draft_writes_allocated(scheduled_seqs.values())
+        decode_batch = ScheduledBatch(
+            seqs=scheduled_seqs,
+            num_scheduled_tokens=num_scheduled_tokens,
+            total_tokens_num=total_tokens_num_decode,
+            total_tokens_num_decode=total_tokens_num_decode,
+            total_seqs_num=num_seqs_prefill + num_seqs_decode,
+            total_seqs_num_prefill=num_seqs_prefill,
+            total_seqs_num_decode=num_seqs_decode,
+            connector_meta_output=connector_meta_output,
+            num_spec_step=self.mtp_k if self.use_spec else 0,
+            is_deferred_out=self.is_deferred_out,
+            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            remote_kv_block_ids=sorted(remote_kv_blocks) if remote_kv_blocks else [],
+            remote_kv_seq_blocks=remote_kv_seq_blocks,
+            # An empty batch cannot execute queued maintenance.
+            # For spills that is not merely wasted work: a drained spill is
+            # released only once its copy reaches a forward, so draining into a
+            # batch that is never forwarded strands every slot it drained.
+            state_maintenance_ops=(
+                self.block_manager.take_state_maintenance_ops()
+                if scheduled_seqs
+                else None
+            ),
+        )
+        self._consume_state_forks(scheduled_seqs)
+        return (decode_batch, scheduled_seqs)
+
+    def _build_mixed_batch(
+        self,
+        scheduled_seqs,
+        num_scheduled_tokens,
+        num_seqs_prefill,
+        num_seqs_decode,
+        scheduled_spec_decode_tokens,
+        remote_kv_blocks,
+        remote_kv_seq_blocks,
+    ) -> tuple[ScheduledBatch, dict[int, Sequence]]:
+        """Snapshot and settle a mixed-enabled tick carrying prefill rows."""
         # Recompute prefill/decode token totals from the per-row list. In
         # mixed batches prefill rows come first (Phase 1 + Phase 2 appended),
         # decode rows after, so the split is at `num_seqs_prefill`.
@@ -4933,11 +5083,11 @@ class Scheduler:
     def _is_preemptable(self, seq: Sequence) -> bool:
         return not self._connector_should_defer_free(seq)
 
-    def _preempt_one_running(self, exclude=()) -> bool:
-        """Preempt the last preemptable running sequence not in `exclude`."""
+    def _preempt_one_running(self) -> bool:
+        """Preempt the last preemptable running sequence."""
         for index in range(len(self.running) - 1, -1, -1):
             candidate = self.running[index]
-            if candidate.id in exclude or not self._is_preemptable(candidate):
+            if not self._is_preemptable(candidate):
                 continue
             del self.running[index]
             if self.preempt(candidate):
@@ -5054,9 +5204,9 @@ class Scheduler:
     ) -> tuple[list[bool], list[int] | None]:
         """Per-chunk bookkeeping every batch carrying prefill rows owes.
 
-        Both pure-prefill and mixed batches call this before the common batch
-        snapshot. The feature flag only controls decode admission; it cannot
-        suppress plan_midstep, final-chunk markers or schedule-time progress.
+        Mixed batches call this before their batch snapshot. Pure-prefill
+        batches retain the inline settlement in `_schedule`. Both paths owe
+        plan_midstep, final-chunk markers and schedule-time progress.
 
         All three lists are positionally aligned and cover the prefill rows
         only. A mixed batch's `scheduled_seqs` is `[prefill | decode]` (decode
