@@ -80,14 +80,40 @@ def test_unsupported_step_keeps_native_route(monkeypatch):
     assert raw.calls == [False]
 
 
-def test_default_off_and_fp8_keep_the_embedded_indexer(monkeypatch):
+def test_default_on_with_explicit_opt_out_and_fp8_fallback(monkeypatch):
     monkeypatch.delenv("ATOM_DSV41_MONO_INDEXER", raising=False)
-    assert not indexer_enabled(True)
+    assert indexer_enabled(True)
     monkeypatch.setenv("ATOM_DSV41_MONO_INDEXER", "1")
     assert indexer_enabled(True)
     assert not indexer_enabled(False)
     monkeypatch.setenv("ATOM_DSV41_MONO_INDEXER", "0")
     assert not indexer_enabled(True)
+
+
+def test_native_staging_is_joined_once_before_persistent_launch():
+    runner = module.MonoIndexer.__new__(module.MonoIndexer)
+    staged = SimpleNamespace(stage=Mock(), join=Mock())
+    runner.engram_staged = staged
+    runner._join_staging()
+    staged.join.assert_called_once()
+    assert runner.engram_staged is None
+    runner._join_staging()
+    staged.join.assert_called_once()
+
+
+def test_hi_fallback_does_not_enable_standalone_indexer(monkeypatch):
+    from atom.models.deepseek_v41.mono import dispatch
+
+    monkeypatch.setenv("ATOM_DSV41_MONO_INDEXER", "1")
+    raw = Model()
+    create = Mock(return_value=SimpleNamespace())
+    monkeypatch.setattr(dispatch, "V41MonoDecodeRunner", create)
+    wrapped = dispatch.MonoDecodeModel(
+        raw, None, 8192, True, 0, 2, standalone_indexer=False
+    )
+    assert wrapped.layer_rows_supported(40)
+    wrapped._mono._create()
+    create.assert_called_once_with(raw, None, 8192, True, standalone_indexer=False)
 
 
 def test_dp_attention_keeps_rank_local_indexer_work(monkeypatch):

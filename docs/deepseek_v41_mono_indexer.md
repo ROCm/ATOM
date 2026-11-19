@@ -1,10 +1,10 @@
 # DeepSeek-V4.1 Flash FP4 Mono indexer
 
-Set `ATOM_MONO_ENABLE=1 ATOM_DSV41_MONO_INDEXER=1` at process startup to opt
-in to a standalone persistent indexer on supported gfx950 deployments.
-`ATOM_DSV41_MONO_INDEXER` defaults to **0**, pending formal model accuracy
-qualification. Native decode and ordinary low-concurrency layer Mono share
-the indexer kernel. The DSpark HI route retains its existing implementation.
+The standalone persistent indexer is enabled by default on supported gfx950
+FP4 deployments: `ATOM_MONO_ENABLE=1 ATOM_DSV41_MONO_INDEXER=1`.
+Set `ATOM_DSV41_MONO_INDEXER=0` to retain the embedded/native indexer.
+Native decode and ordinary low-concurrency layer Mono share the indexer
+kernel. The DSpark HI route and its fallback retain their existing indexer.
 
 The kernel reads attention-normalized BF16 hidden rows and MXFP8 query
 latents, then fuses query projection, GPT-J tail RoPE, head-weight projection,
@@ -86,7 +86,9 @@ native scorer on identical quantized queries and head weights. Projection
 is checked separately. The native multi-row BF16 GEMM rounds partial sums
 while Mono accumulates FP32, so complete projection chains can move
 near-boundary TopK membership and greedy outputs need not be token-identical.
-This is why the route remains opt-in pending formal GSM8K.
+Formal GSM8K and long-context results must therefore compare answer accuracy
+against native, rather than require identical generated tokens. TP4 GSM8K
+qualification on c6f06f5f3 covered all 1,319 questions for each route.
 
 The tested aiter row-group scorer's long-context fast path mis-scores a
 partial final six-query group. Differential tests qualify those tails against
@@ -177,7 +179,7 @@ Validation:
 - After the complete model results were written, aiter IPCBuffer/CustomAllreduce destructors printed ignored PyTorch schema errors during interpreter shutdown; torchrun exited 0. The full log is retained.
 - Black, Ruff and git diff --check passed.
 
-BS1 reaches K3's earlier approximate 25.6%–38.1% FULL reference. BS8/16 and some qlen6 points remain below it; projection, TopK and TP/DCP cache geometry differ. Formal GSM8K and actual 8K/160K serving throughput remain unqualified, so the opt-in default stays 0.
+BS1 reaches K3's earlier approximate 25.6%–38.1% FULL reference. BS8/16 and some qlen6 points remain below it; projection, TopK and TP/DCP cache geometry differ. TP4 formal GSM8K and actual 8K/160K serving measurements are available in the PR qualification results. These results do not establish bitwise equivalence or qualify TP2/TP8 model accuracy.
 
 Run the paired retained-version benchmark with:
 

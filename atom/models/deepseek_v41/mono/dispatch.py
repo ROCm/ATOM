@@ -81,6 +81,8 @@ class MonoDecodeModel(nn.Module):
         index_fp4: bool,
         dp_ranks: int,
         tp_size: int = 1,
+        *,
+        standalone_indexer: bool = True,
     ) -> None:
         super().__init__()
         self.model = model
@@ -89,9 +91,16 @@ class MonoDecodeModel(nn.Module):
         self._dp_ranks = dp_ranks
         self._tp_size = tp_size
         self._index_fp4 = index_fp4
+        self._standalone_indexer = standalone_indexer
         # created on its first eligible step (``LazyRunner``)
         self._mono = LazyRunner(
-            lambda: V41MonoDecodeRunner(model, drafter, max_model_len, index_fp4),
+            lambda: V41MonoDecodeRunner(
+                model,
+                drafter,
+                max_model_len,
+                index_fp4,
+                standalone_indexer=standalone_indexer,
+            ),
             "V4.1 mono decode",
         )
 
@@ -116,6 +125,7 @@ class MonoDecodeModel(nn.Module):
             self._tp_size == 2
             and not self._dp_ranks
             and rows >= 40
+            and self._standalone_indexer
             and indexer_enabled(self._index_fp4)
         )
 

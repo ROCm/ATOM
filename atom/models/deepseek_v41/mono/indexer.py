@@ -95,6 +95,15 @@ class MonoIndexer:
             else None
         )
         self.active = False
+        self.engram_staged = None
+
+    def _join_staging(self):
+        # The native backbone starts this fork after the outer wrapper's
+        # begin_step. Join it immediately before the first all-CU launch.
+        if self.engram_staged is not None:
+            if getattr(self.engram_staged, "stage", None) is not None:
+                self.engram_staged.join()
+            self.engram_staged = None
 
     def _bind(self):
         props = torch.cuda.get_device_properties(torch.cuda.current_device())
@@ -450,6 +459,7 @@ class MonoIndexer:
                 "step_fence": int(world > 1 and spec.layer_id == min(self.weights)),
             }
         )
+        self._join_staging()
         _run_compiled(launcher, *args, torch.cuda.current_stream())
         indexer._publish(
             selected, self.candidates[:rows] if spec.produces_candidates else None, step
@@ -509,6 +519,7 @@ class MonoIndexerModel(nn.Module):
         if active:
             md = get_forward_context().attn_metadata
             self._mono.runner.begin_step(input_ids.numel(), md.cache, md.step)
+            self._mono.runner.engram_staged = getattr(md, "engram_embeddings", None)
             self._mono.runner.active = True
         try:
             if inputs_embeds is None:
@@ -517,6 +528,7 @@ class MonoIndexerModel(nn.Module):
         finally:
             if active:
                 self._mono.runner.active = False
+                self._mono.runner.engram_staged = None
 
     def __getattr__(self, name):
         try:

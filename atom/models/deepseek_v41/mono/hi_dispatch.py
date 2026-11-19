@@ -52,7 +52,14 @@ class HiDecodeModel(MonoDecodeModel):
     def __init__(
         self, model, drafter, max_model_len, index_fp4, dp_ranks, hook
     ) -> None:
-        super().__init__(model, drafter, max_model_len, index_fp4, dp_ranks)
+        super().__init__(
+            model,
+            drafter,
+            max_model_len,
+            index_fp4,
+            dp_ranks,
+            standalone_indexer=False,
+        )
         self._hi = hook
 
     def forward(self, input_ids, positions, inputs_embeds=None):

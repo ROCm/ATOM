@@ -670,9 +670,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # until ROCm/aiter#7967), any other keeps ATOM's mono path; "1": on, or an
     # error naming why not; "0": off.
     "ATOM_DSV41_MONO_HI": lambda: os.getenv("ATOM_DSV41_MONO_HI", "auto"),
-    # Ordinary gfx950 FP4 decode's independent indexer. Opt in while formal
-    # model accuracy is being qualified; the HI path owns its own indexer.
-    "ATOM_DSV41_MONO_INDEXER": lambda: os.getenv("ATOM_DSV41_MONO_INDEXER", "0") == "1",
+    # Ordinary gfx950 FP4 decode's independent indexer. Set 0 to retain the
+    # embedded/native indexer; the HI path owns its own indexer.
+    "ATOM_DSV41_MONO_INDEXER": lambda: os.getenv("ATOM_DSV41_MONO_INDEXER", "1") == "1",
     # Token-bucket TR graphs for prefill (`atom/utils/region_graph.py`): the
     # comma-separated token counts to record. A prefill longer than the largest
     # runs eagerly; empty records none. The default tops out at 3072 because

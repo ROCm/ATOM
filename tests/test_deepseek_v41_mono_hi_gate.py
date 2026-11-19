@@ -416,7 +416,7 @@ def test_hi_result_is_never_wrapped_by_the_standalone_indexer(
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_ordinary_route_imports_indexer_only_after_opt_in(
+def test_ordinary_route_defaults_on_and_accepts_opt_out(
     mi355x, served, monkeypatch, dispatch_module, enabled
 ):
     import types
@@ -432,10 +432,10 @@ def test_ordinary_route_imports_indexer_only_after_opt_in(
 
         stub.MonoIndexerModel = wrap
         monkeypatch.setitem(sys.modules, stub.__name__, stub)
-        monkeypatch.setenv("ATOM_DSV41_MONO_INDEXER", "1")
+        monkeypatch.delenv("ATOM_DSV41_MONO_INDEXER", raising=False)
     else:
         monkeypatch.setitem(sys.modules, "atom.models.deepseek_v41.mono.indexer", None)
-        monkeypatch.delenv("ATOM_DSV41_MONO_INDEXER", raising=False)
+        monkeypatch.setenv("ATOM_DSV41_MONO_INDEXER", "0")
     monkeypatch.setattr(dispatch, "config_refusal", lambda cfg: None)
     monkeypatch.setattr(dispatch, "dp_attention_ranks", lambda cfg: 0)
     monkeypatch.setattr(dispatch.hi_gate, "decide", lambda *a: False)
@@ -458,6 +458,7 @@ def test_a_model_the_hi_path_does_not_serve_falls_back(
     from atom.mono.runtime.consensus import MonoUnsupported
 
     dispatch = dispatch_module
+    monkeypatch.setenv("ATOM_DSV41_MONO_INDEXER", "0")
 
     def install_hi(*a, **k):
         raise MonoUnsupported("routed experts not in the gfx950 FlyDSL layout")
@@ -677,6 +678,7 @@ def test_a_refusal_on_another_rank_keeps_atoms_mono_path_here(
     rank on ATOM's mono decode, as every other rank, with one line naming the rank and its reason.
     """
     dispatch = sys.modules["atom.models.deepseek_v41.mono.dispatch"]
+    monkeypatch.setenv("ATOM_DSV41_MONO_INDEXER", "0")
     _, args, draft = _install_world(
         hi_dispatch_module, monkeypatch, others=("MonoUnsupported: shard", None, None)
     )

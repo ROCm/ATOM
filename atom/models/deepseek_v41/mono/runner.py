@@ -159,14 +159,23 @@ class V41MonoDecodeRunner:
     index_layout = "fp8"
     indexer_apart = False
 
-    def __init__(self, model, drafter, max_model_len: int, index_fp4: bool) -> None:
+    def __init__(
+        self,
+        model,
+        drafter,
+        max_model_len: int,
+        index_fp4: bool,
+        *,
+        standalone_indexer: bool = True,
+    ) -> None:
         # the indexer's widest bound: a ratio-1 layer sees every position. No
         # token's bound may exceed it (positions stay below max_model_len): its
         # selection would never reach a final level nor publish IRDY
         self.index_bound_max = ip.cdiv(max_model_len, ip.CHUNK) * ip.CHUNK
         self.index_fp4 = index_fp4
         self.indexer_apart = (
-            indexer_enabled(index_fp4)
+            standalone_indexer
+            and indexer_enabled(index_fp4)
             and not get_current_atom_config().enable_dp_attention
         )
         self.index_layout = (

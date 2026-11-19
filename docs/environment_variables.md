@@ -189,7 +189,7 @@ cannot affect a server that does not use the feature.
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_MONO_ENABLE** | bool | 1 (true) | Enable fused decode for supported GLM-5.2, Kimi-K3, MiniMax-M3, DeepSeek-V4.1, and Qwen3.8-Flash-Next deployments and step geometries. Unsupported configurations and forwards keep the production path; `0` disables every Mono runner. Qwen3.8-Flash-Next (Quark MXFP4, TP1, MTP3) runs either GDN verify (ReplaySSM by default, or classic with `ATOM_ENABLE_REPLAYSSM=0`); see `recipes/Qwen3.8-Flash-Next-Mono-Program.md`. |
-| **ATOM_DSV41_MONO_INDEXER** | bool | 0 (false) | Opt in to the standalone FP4 Mono indexer for ordinary DeepSeek-V4.1 Flash decode on eligible gfx950 TP2/4/8 deployments without DP attention. Native layers and ordinary layer Mono share query/head projection, quantization, scoring and exact TopK; long requests can distribute K across TP ranks. HI retains its own indexer. Disabled by default pending formal model accuracy qualification; see [the indexer guide](deepseek_v41_mono_indexer.md). |
+| **ATOM_DSV41_MONO_INDEXER** | bool | 1 (true) | Enable the standalone FP4 Mono indexer for ordinary DeepSeek-V4.1 Flash decode on eligible gfx950 TP2/4/8 deployments without DP attention. Native layers and ordinary layer Mono share query/head projection, quantization, scoring and exact TopK; long requests can distribute K across TP ranks. Set `0` to retain the embedded/native indexer. HI and its fallback retain their own indexers. See [the indexer guide](deepseek_v41_mono_indexer.md) for qualification and scope. |
 
 ### MiniMax-M3
 
