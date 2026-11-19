@@ -43,6 +43,10 @@ TDM_ROW_STRIDE = TDM_SLAB + LDS_PAD
 TDM_DEPTH = 3
 # An FP8 weight slab is half a BF16 one, so more of them fit in flight.
 TDM_FP8_DEPTH = 5
+# Paired slabs (``gemv_tdm.project(paired=True)``): two slabs a step, four
+# ahead, so a weight wave still keeps three copies in flight and the weight
+# stages stay TDM_FP8_DEPTH + 1.
+TDM_FP8_PAIR_DEPTH = 4
 # FP8's E8M0 scale words: one for each thread of the 256-thread CTA.
 TDM_FP8_SCALE_WORDS = 256
 # Every CTA of a TDM GEMV reads the same token slabs: launched in clusters of
@@ -58,20 +62,22 @@ def tdm_task_words(fp8: bool = False) -> int:
 
 
 def tdm_lds_words(
-    rows: int, tasks: int, fp8: bool = False, depth: int = TDM_DEPTH
+    rows: int, tasks: int, fp8: bool = False, depth: int = TDM_DEPTH, group: int = 1
 ) -> tuple[int, int]:
-    """``(token, weight)`` i32 LDS words of the TDM GEMV for one CTA."""
+    """``(token, weight)`` i32 LDS words of the TDM GEMV for one CTA, walking
+    K ``group`` slabs a step."""
 
     return (
-        2 * rows * TDM_ROW_STRIDE // 2,
-        (depth + 1) * tasks * tdm_task_words(fp8) + (TDM_FP8_SCALE_WORDS if fp8 else 0),
+        2 * group * rows * TDM_ROW_STRIDE // 2,
+        (depth + group) * tasks * tdm_task_words(fp8)
+        + (TDM_FP8_SCALE_WORDS if fp8 else 0),
     )
 
 
 def tdm_lds_bytes(
-    rows: int, tasks: int, fp8: bool = False, depth: int = TDM_DEPTH
+    rows: int, tasks: int, fp8: bool = False, depth: int = TDM_DEPTH, group: int = 1
 ) -> int:
-    return 4 * sum(tdm_lds_words(rows, tasks, fp8, depth))
+    return 4 * sum(tdm_lds_words(rows, tasks, fp8, depth, group))
 
 
 # Cluster split-K (``gemv_tdm_gfx1250.project_split``): a TDM cluster owns one

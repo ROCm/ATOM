@@ -163,9 +163,11 @@ def test_s48_lds_unions_are_tile_local_aligned_and_bounded(tokens):
 
 
 @pytest.mark.parametrize("tokens", (40, 48, 49, 58, 59, 60, 64))
-def test_k1_fp8_projection_fits_through_s64(tokens):
+def test_k1_fp8_projection_fits_through_s64(monkeypatch, tokens):
     """The BF16-sized projection region where it fits (every width <= 58,
-    unchanged), the FP8 TDM slabs alone past it."""
+    unchanged), the FP8 TDM slabs alone past it; one slab a step
+    (paired slabs: ``test_paired_slabs_by_default_where_four_token_buffers_fit``)."""
+    monkeypatch.setenv("ATOM_KIMI_MONO_K1_PAIRED_SLABS", "0")
     plan = _plan(tokens)
     k1 = declare_local(plan, qlen=1, fp8=True)
     assert k1.lds.arena.used_bytes <= 320 * 1024

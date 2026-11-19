@@ -39,6 +39,7 @@ from atom.models.kimi_k3.mono.kernels.execution_plan import Gfx1250KimiBuildPlan
 from atom.models.kimi_k3.mono.kernels.stages import gemv_tdm_gfx1250 as gemv_tdm
 from atom.models.kimi_k3.mono.kernels.stages import tdm_timeline
 from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import (
+    TDM_FP8_PAIR_DEPTH,
     TDM_SPLIT_GROUP,
     TDM_SPLIT_TILE_WORDS,
     tdm_split_out_word,
@@ -248,6 +249,7 @@ def build_resident_k1(
         envs.ATOM_KIMI_MONO_K1_HEAD_SPLIT,
         _gate_ilp(),
         envs.ATOM_KIMI_MONO_K1_WHOLE_HEADS,
+        declaration.lds.paired,
     )
     cached = _BUILDS.get(cache_key)
     if cached is not None:
@@ -325,6 +327,7 @@ def build_resident_k1(
         head_split,
         _gate_ilp(),
         *(("whole_heads",) if forced_heads else ()),
+        *(("paired",) if declaration.lds.paired else ()),
     )
     timeline = tdm_timeline.key()
     name = (
@@ -338,6 +341,7 @@ def build_resident_k1(
         f"{f'_hs{head_split}' if head_split != auto_split else ''}"
         f"{'' if _gate_ilp() else '_nogi'}"
         f"{'_wh' if forced_heads else ''}"
+        f"{'_ps' if declaration.lds.paired else ''}"
         f"{tdm_timeline.suffix()}"
     )
 
@@ -829,7 +833,13 @@ def build_resident_k1(
                     lane,
                     wave,
                     **(
-                        {"w_scale": w_in_scale, "depth": gemv_tdm.FP8_DEPTH}
+                        {
+                            "w_scale": w_in_scale,
+                            "depth": TDM_FP8_PAIR_DEPTH
+                            if declaration.lds.paired
+                            else gemv_tdm.FP8_DEPTH,
+                            "paired": declaration.lds.paired,
+                        }
                         if spec.fp8_projection
                         else {}
                     ),
