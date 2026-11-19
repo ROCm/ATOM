@@ -270,14 +270,10 @@ class Attention(nn.Module):
             config.num_attention_heads // tp_size,
             config.o_groups // tp_size,
         )
-        # AITER's fused kernel exists for gfx950 at D512, H16/32/64/128 per
-        # rank, and writes `wo_a`'s input in eight-head output groups.
-        # `_use_fused_attention` adds the per-forward conditions.
-        self.fused_attn = (
-            fused_attention_available()
-            and self.head_dim == 512
-            and self.heads in (16, 32, 64, 128)
-            and self.groups * 8 == self.heads
+        # ATOM consumes eight-head output groups; AITER owns kernel support.
+        # `_use_fused_attention` queries the actual forward's dtypes and RoPE.
+        self.fused_attn = self.groups * 8 == self.heads and fused_attention_available(
+            self.heads, self.head_dim
         )
         self.softmax_scale = self.head_dim**-0.5
         self.attn_sink = atom_parameter(torch.empty(self.heads, dtype=torch.float32))
@@ -457,20 +453,23 @@ class Attention(nn.Module):
 
     def _use_fused_attention(self, activation, cache, rope):
         """Whether this forward attends through `fused_sparse_attn_v41_paged_2src`:
-        the layer qualifies (`fused_attn`), the pool holds unpacked MXFP8 rows
-        and the residual activation and RoPE tables are BF16. Each table row
-        has 32 paired entries for 64 rotary dimensions. Native and vLLM
-        callers pass the residual `hidden` as `activation`.
-        A BF16 or packed pool, and every other case, keeps
-        the unfused path."""
+        the layer's output groups and cache layout qualify, and AITER supports
+        the actual dtypes and rotary dimension. Native and vLLM callers pass
+        the residual `hidden` as `activation`. Other cases keep the unfused path.
+        """
         return (
             self.fused_attn
             and cache.kv_fp8
             and not cache.packed
-            and activation.dtype == torch.bfloat16
-            and rope.cos_cache.dtype == torch.bfloat16
-            and rope.sin_cache.dtype == torch.bfloat16
-            and rope.cos_cache.shape[-1] == 32
+            and fused_attention_available(
+                self.heads,
+                self.head_dim,
+                q_dtype=activation.dtype,
+                cos_dtype=rope.cos_cache.dtype,
+                sin_dtype=rope.sin_cache.dtype,
+                rope_dim=rope.cos_cache.shape[-1] * 2,
+                device=activation.device,
+            )
         )
 
     def _use_a8w4_attention(self, query, cache):

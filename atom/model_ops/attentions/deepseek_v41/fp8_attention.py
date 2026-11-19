@@ -8,8 +8,10 @@ Legacy packed rows remain accepted by the standalone wrappers.
 """
 
 import torch
-from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.ops.fused_norm_rope_attn_rope_cast import fused_norm_rope_attn_rope_cast
+from aiter.ops.fused_norm_rope_attn_rope_cast import (
+    fused_norm_rope_attn_rope_cast,
+    is_fused_norm_rope_attn_rope_cast_supported,
+)
 from aiter.ops.mla_sparse_prefill import mla_sparse_prefill_v41
 
 from atom.model_ops.blockscale_kernels.quantization import FP8_DTYPE
@@ -17,15 +19,8 @@ from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src_reference
 from atom.utils.decorators import mark_trace
 
 
-def fused_attention_available():
-    """Return whether a usable GPU supports fusion; the AITER API is required."""
-    if not torch.cuda.is_available():
-        return False
-    try:
-        return get_gfx_runtime() == "gfx950"
-    except RuntimeError:
-        # Model inspection and meta construction can lack a usable device.
-        return False
+# Re-export the AITER predicate; the operator owns its capability rules.
+fused_attention_available = is_fused_norm_rope_attn_rope_cast_supported
 
 
 def _split(rows, dim, scale_dtype=torch.float8_e8m0fnu):

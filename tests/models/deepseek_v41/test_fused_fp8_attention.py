@@ -237,42 +237,17 @@ def assert_output(actual, expected):
     return metrics
 
 
-@pytest.mark.parametrize(
-    "gpu,arch,expected",
-    [
-        (False, None, False),
-        (True, "unavailable", False),
-        (True, "gfx942", False),
-        (True, "gfx950", True),
-    ],
-)
-def test_fused_architecture_probe(monkeypatch, gpu, arch, expected):
-    from atom.model_ops.attentions.deepseek_v41 import fp8_attention
+@pytest.mark.parametrize("supported", [False, True])
+def test_fused_support_query_is_owned_by_aiter(single_rank, monkeypatch, supported):
+    from atom.models.deepseek_v41 import attention
 
     calls = []
 
-    def probe():
-        calls.append(True)
-        if arch == "unavailable":
-            raise RuntimeError("No GPU architecture available")
-        assert gpu, "Do not probe architecture without a GPU"
-        return arch
+    def supports(*args, **kwargs):
+        calls.append((args, kwargs))
+        return supported
 
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: gpu)
-    monkeypatch.setattr(fp8_attention, "get_gfx_runtime", probe)
-    assert fused_attention_available() is expected
-    assert len(calls) == int(gpu)
-
-
-@pytest.mark.parametrize("gpu", [False, True])
-def test_attention_meta_constructor_without_architecture(single_rank, monkeypatch, gpu):
-    from atom.model_ops.attentions.deepseek_v41 import fp8_attention
-
-    def unavailable():
-        raise RuntimeError("No GPU architecture available")
-
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: gpu)
-    monkeypatch.setattr(fp8_attention, "get_gfx_runtime", unavailable)
+    monkeypatch.setattr(attention, "fused_attention_available", supports)
     config = SimpleNamespace(
         head_dim=512,
         hidden_size=256,
@@ -285,8 +260,34 @@ def test_attention_meta_constructor_without_architecture(single_rank, monkeypatc
     spec = LayerAttentionSpec(1, 0, AttentionMode.WINDOW, None, None)
     with torch.device("meta"):
         model = Attention(config, spec)
-    assert not model.fused_attn
+        activation = torch.empty(1, 2, 256, dtype=torch.float16)
+        rope = SimpleNamespace(
+            cos_cache=torch.empty(16, 48, dtype=torch.float32),
+            sin_cache=torch.empty(16, 48, dtype=torch.float16),
+        )
+    assert model.fused_attn is supported
+    assert calls == [((64, 512), {})]
     assert all(p.device.type == "meta" for p in model.parameters())
+    # A changed AITER answer must control dispatch, including future support
+    # for dtypes/rotary widths ATOM does not currently use.
+    model.fused_attn = True
+    cache = SimpleNamespace(kv_fp8=True, packed=False)
+    assert model._use_fused_attention(activation, cache, rope) is supported
+    assert calls[-1] == (
+        (64, 512),
+        dict(
+            q_dtype=torch.float16,
+            cos_dtype=torch.float32,
+            sin_dtype=torch.float16,
+            rope_dim=96,
+            device=activation.device,
+        ),
+    )
+    for kv_fp8, packed in ((False, False), (True, True)):
+        cache.kv_fp8, cache.packed = kv_fp8, packed
+        count = len(calls)
+        assert not model._use_fused_attention(activation, cache, rope)
+        assert len(calls) == count
 
 
 @torch.inference_mode()
