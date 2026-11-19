@@ -24,9 +24,6 @@ from atom.entrypoints.openai.tool_parser.registry import (
 
 logger = logging.getLogger("atom")
 
-engine: Any | None = None
-tokenizer: Any | None = None
-
 
 @dataclass(frozen=True)
 class StandaloneArgs:
@@ -83,36 +80,6 @@ def print_version(verbose: bool = False) -> None:
         print(version_fn())
     except Exception:  # noqa: BLE001 - a version banner must not fail the CLI
         print("Atomesh Python interface")
-
-
-def initialize_engine(args: argparse.Namespace) -> tuple[Any, Any]:
-    from atom.model_engine.arg_utils import EngineArgs
-    from atom.model_engine.llm_engine import load_tokenizer
-
-    global engine, tokenizer
-
-    logger.info("Loading tokenizer from %s...", args.model)
-    tokenizer = load_tokenizer(args.model, args.trust_remote_code)
-
-    logger.info("Initializing engine with model %s...", args.model)
-    engine_args = EngineArgs.from_cli_args(args)
-    engine = engine_args.create_engine(tokenizer=tokenizer)
-    return engine, tokenizer
-
-
-def initialize_standalone_service(
-    args: argparse.Namespace,
-    default_chat_template_kwargs: dict[str, Any],
-) -> Any:
-    from atom.entrypoints.atomesh.atom_standalone_service import AtomStandaloneService
-
-    return AtomStandaloneService(
-        engine=engine,
-        tokenizer=tokenizer,
-        model_name=args.model,
-        default_chat_template_kwargs=default_chat_template_kwargs,
-        tool_call_parser=getattr(args, "tool_call_parser", None),
-    )
 
 
 def split_standalone_mesh_args(raw_args: list[str]) -> tuple[list[str], list[str]]:
@@ -290,8 +257,9 @@ def main() -> None:
         if arg == "--version-verbose":
             print_version(verbose=True)
             return
-    # `python xxx mesh-only ...` starts mesh routing;
-    # other invocations default to ATOM standalone.
+    # `python xxx mesh-only ...` starts mesh routing; any other invocation
+    # asks for ATOM standalone, which refuses until its launcher writes an
+    # engine spec (see launch_atom_standalone).
     use_atom_standalone = "mesh-only" not in raw_args
     # Import the mesh_python module.
     atomesh_runner = import_atomesh_runner()

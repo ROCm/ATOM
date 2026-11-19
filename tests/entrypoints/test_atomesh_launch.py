@@ -61,9 +61,11 @@ def test_mesh_only_launches_with_keywords_launch_mesh_takes():
 def test_standalone_is_refused_before_it_loads_a_model():
     runner = _Runner()
     with (
-        mock.patch.object(atomesh_server, "initialize_engine") as initialize,
+        mock.patch(
+            "atom.model_engine.arg_utils.EngineArgs.create_engine"
+        ) as create_engine,
         pytest.raises(SystemExit, match="mesh-only"),
     ):
         atomesh_server.launch_atom_standalone(runner, ["--model", "m"])
-    initialize.assert_not_called()
+    create_engine.assert_not_called()
     assert runner.launches == []
