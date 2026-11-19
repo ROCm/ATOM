@@ -307,6 +307,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_USE_TRITON_MXFP4_BMM", "0") == "1"
     ),
     "ATOM_USE_TRITON_MLA": lambda: os.getenv("ATOM_USE_TRITON_MLA", "0") == "1",
+    # Keep MLA K/V absorb weights in BF16 instead of quantizing them to FP8.
+    "ATOM_MLA_ABSORB_BF16": lambda: os.getenv("ATOM_MLA_ABSORB_BF16", "0") == "1",
+    # Store BF16 K-up directly into q_out on supported gfx1250 decode paths.
+    "ATOM_MLA_ABSORB_BF16_FUSE_QOUT": lambda: (
+        os.getenv("ATOM_MLA_ABSORB_BF16_FUSE_QOUT", "1") == "1"
+    ),
     # Deprecated: use ATOM_MLA_KV_SHUFFLED. Only effective together with
     # ATOM_USE_TRITON_MLA=1.
     "ATOM_USE_TRITON_MLA_SHUFFLE_KV": lambda: (

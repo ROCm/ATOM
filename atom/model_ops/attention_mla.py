@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import inspect
 import logging
 from dataclasses import dataclass
 from functools import partial as functools_partial
@@ -34,6 +35,7 @@ except ImportError:
 from aiter.dist.parallel_state import get_dp_group, get_tensor_model_parallel_rank
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 from aiter.ops.triton.attention.mla import mla_decode_fwd as triton_mla_decode_fwd
+from aiter.ops.triton.fusions import fused_kv_cache as triton_fused_kv_cache
 from aiter.ops.triton.fusions.fused_kv_cache import (
     fused_qk_rope_cat_and_cache_mla as triton_fused_qk_rope_cat_and_cache_mla,
 )
@@ -498,18 +500,39 @@ def _mla_absorb_bf16_enabled() -> bool:
     SGLANG_MLA_ABSORB_BF16 (PR #31604): on the tight MLPerf DeepSeek-R1 accuracy
     gate the low-precision absorb bmm is decisive, and BF16 recovers the margin.
     Default off (unchanged FP8 behavior)."""
-    import os
-
-    return os.environ.get("ATOM_MLA_ABSORB_BF16", "0") == "1"
+    return envs.ATOM_MLA_ABSORB_BF16
 
 
 def _mla_absorb_bf16_fuse_qout_enabled() -> bool:
     """With BF16 absorb, have the K-up GEMM write q_nope straight into the fused
     rope kernel's q_out (skipping a BF16 round trip of the K-up result). Default
     on; ATOM_MLA_ABSORB_BF16_FUSE_QOUT=0 restores the separate q_nope buffer."""
-    import os
+    return envs.ATOM_MLA_ABSORB_BF16_FUSE_QOUT
 
-    return os.environ.get("ATOM_MLA_ABSORB_BF16_FUSE_QOUT", "1") == "1"
+
+def _mla_q_nope_prestored_supported() -> bool:
+    """Match aiter's gfx1250 prestored kernel requirements once per layer.
+
+    Older aiter builds can still use the ordinary shuffled rope/cache call.
+    Inspect the public signature through its torch-compile wrapper as well as
+    the kernel availability; an arch flag alone does not guarantee Gluon.
+    """
+    if (
+        getattr(triton_fused_kv_cache, "DEVICE_ARCH", None)
+        not in (
+            "gfx1250",
+            "gfx1250-strict",
+        )
+        or getattr(triton_fused_kv_cache, "gluon_qpe_htile_kernel", None) is None
+    ):
+        return False
+    try:
+        return (
+            "q_nope_prestored"
+            in inspect.signature(triton_fused_qk_rope_cat_and_cache_mla).parameters
+        )
+    except (TypeError, ValueError):
+        return False
 
 
 def _maybe_view_mxfp4_weight_for_gather(
@@ -770,6 +793,7 @@ class MLAAttention(nn.Module):
         self.use_seg_mla = (not self.use_triton_mla) and envs.ATOM_MLA_PAGE_SIZE > 1
         # Shuffled KV cache; the decode kernel follows use_triton_mla.
         self.kv_shuffled = bool(envs.ATOM_MLA_KV_SHUFFLED)
+        self._q_nope_prestored_supported = _mla_q_nope_prestored_supported()
         self.use_flydsl_gather_kv_b_proj = bool(envs.ATOM_USE_FLYDSL_GATHER_KV_B_PROJ)
         # Resolved on the first gather, when the weights and cache exist; see
         # `_kv_b_proj_gather`. None = not asked yet.
@@ -3258,24 +3282,29 @@ class MLAAttention(nn.Module):
             )
             # BF16 absorb + shuffled-KV fused rope: let the K-up GEMM store q_nope
             # (cast to the q dtype) straight into q_out[..., :kv_lora_rank], so
-            # the rope kernel skips the q_nope read/rewrite entirely. Below ~64
-            # tokens the strided fp8 store costs more than the saved round trip.
+            # the rope kernel skips the q_nope read/rewrite entirely. Retain the
+            # provisional M>=64 threshold pending an isolated GPU sweep; q_out
+            # can be BF16 or FP8, and the latter rounds through BF16 in Gluon.
             q_out_prestored = None
             if (
                 q.shape[0] >= 64
                 and kv_cache.numel() > 0
-                and _mla_absorb_bf16_fuse_qout_enabled()
                 and self.W_K_scale is None
+                and self.kv_shuffled
+                and self._q_nope_prestored_supported
+                and not context.is_prefill
+                and self.num_kv_heads == 1
+                and attn_metadata.slot_mapping.numel() == q.shape[0]
                 and not is_rocm_aiter_fp4bmm_enabled()
                 and not self.use_seg_mla
                 and not self._fused_q_head_pad
-                and self.kv_shuffled
                 and self.dcp_world_size <= 1
+                and _mla_absorb_bf16_fuse_qout_enabled()
             ):
                 q_out_prestored = torch.empty(
                     (
                         q.shape[0],
-                        self.qrep_num_heads if use_qrep else self.num_heads,
+                        self.num_heads,
                         self.kv_lora_rank + self.qk_rope_head_dim,
                     ),
                     dtype=attn_metadata.dtype_q,
@@ -3441,7 +3470,11 @@ class MLAAttention(nn.Module):
                         apply_scale=True,
                         q_out=q_out,
                         shuffled_kv_cache=True,
-                        q_nope_prestored=q_out_prestored is not None,
+                        **(
+                            {"q_nope_prestored": True}
+                            if q_out_prestored is not None
+                            else {}
+                        ),
                     )
                 elif self.use_seg_mla and self.dcp_world_size <= 1:
                     kv_cache_seg = self._seg_kv_cache_view(kv_cache)
