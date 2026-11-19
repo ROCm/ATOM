@@ -737,10 +737,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_KIMI_MONO_K1_GATE_ILP", "1"
     )
     == "1",
-    # 1, the default: Kimi-K3 gfx1250 mono K1 runs whole heads (split as
-    # HEAD_SPLIT) at every width, not 16-row chunk tasks where those fit one
-    # pass of the grid (at most two requests), rounding as the chunk tasks do
-    # (the same bits); 0 keeps the chunk tasks.
     # 1, the default: Kimi-K3 gfx1250 mono K1's FP8 in-projection walks K
     # two 512-column slabs a step (one barrier pair a step) where its tokens'
     # four buffers fit LDS (to 40 rows), the same bits; 0 one slab a step.
@@ -748,6 +744,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_KIMI_MONO_K1_PAIRED_SLABS", "1"
     )
     == "1",
+    # 1, the default: Kimi-K3 gfx1250 mono K1 runs whole heads (split as
+    # HEAD_SPLIT) at every width, not 16-row chunk tasks where those fit one
+    # pass of the grid (at most two requests), rounding as the chunk tasks do
+    # (the same bits); 0 keeps the chunk tasks.
     "ATOM_KIMI_MONO_K1_WHOLE_HEADS": lambda: os.getenv(
         "ATOM_KIMI_MONO_K1_WHOLE_HEADS", "1"
     )
