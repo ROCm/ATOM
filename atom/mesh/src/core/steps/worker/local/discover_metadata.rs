@@ -136,6 +136,12 @@ pub async fn get_server_info(url: &str, api_key: Option<&str>) -> Result<ServerI
 
 /// Get model id from OpenAI-compatible /v1/models endpoint.
 pub async fn get_openai_model_id(url: &str, api_key: Option<&str>) -> Result<String, String> {
+    let card = get_openai_model_card(url, api_key).await?;
+    Ok(card["id"].as_str().unwrap_or_default().to_string())
+}
+
+/// Get the first model card with a non-empty id from OpenAI-compatible /v1/models endpoint.
+async fn get_openai_model_card(url: &str, api_key: Option<&str>) -> Result<Value, String> {
     let base_url = url.trim_end_matches('/');
     let endpoint = format!("{}/v1/models", base_url);
 
@@ -165,12 +171,13 @@ pub async fn get_openai_model_id(url: &str, api_key: Option<&str>) -> Result<Str
     json.get("data")
         .and_then(|d| d.as_array())
         .and_then(|arr| {
-            arr.iter().find_map(|m| {
-                m.get("id")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string())
-            })
+            arr.iter()
+                .find(|m| {
+                    m.get("id")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|s| !s.is_empty())
+                })
+                .cloned()
         })
         .ok_or_else(|| format!("No model id in /v1/models response from {}", endpoint))
 }
@@ -302,11 +309,16 @@ async fn discover_http_sglang(url: &str, api_key: Option<&str>) -> HashMap<Strin
 async fn discover_http_openai(url: &str, api_key: Option<&str>) -> HashMap<String, String> {
     let mut labels = HashMap::new();
 
-    match get_openai_model_id(url, api_key).await {
-        Ok(id) if !id.is_empty() => {
-            labels.insert("model_path".to_string(), id);
+    // The id is the served model name, an alias under `--served-model-name`. vLLM's card
+    // also gives `root`, the path it loaded the model from; ATOM's card has no `root`.
+    match get_openai_model_card(url, api_key).await {
+        Ok(card) => {
+            for (field, label) in [("id", "served_model_name"), ("root", "model_path")] {
+                if let Some(value) = card[field].as_str().filter(|s| !s.is_empty()) {
+                    labels.insert(label.to_string(), value.to_string());
+                }
+            }
         }
-        Ok(_) => {}
         Err(e) => {
             warn!("/v1/models failed for {}: {}", url, e);
         }
