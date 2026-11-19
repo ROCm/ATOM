@@ -839,7 +839,27 @@ def select_ma(c, hb, ctr, G, ma, kp):
     return done
 
 
-O_MFL = O_MAP                            # (select_mf, group CTA 0) the 512-th's bin: keys [MF_CAP], columns [MF_CAP]
+O_MFR = (O_MAP + 63) // 64 * 64         # (select_mf, group CTA 0) the 512-th's bin as packed rank keys [MF_CAP] int64
+INT64_MIN = -(2 ** 63)
+
+
+@ASTRewriter.transform
+def rank_desc(sm, off, t, n, key, col):
+    """Thread t's rank among the n (<= THREADS) entries (key, col) of threads 0..n-1, by key desc (order_key: unsigned),
+    col asc: the count of entries before it. One packed int64 a thread ((key << 32 | ~col) ^ INT64_MIN: a signed
+    compare is the order), the rest of the 256 slots INT64_MIN (never before anything); each thread compares 8 entries
+    a load (LDS at sm + off, 64-byte aligned). The same ranks as the pairwise (key, col) rule (CPU: rank_check.py)."""
+    lo32 = fx.Int64(0xFFFFFFFF)
+    p = (((i64(key) & lo32) << fx.Int64(32)) | (i64(~col) & lo32)) ^ fx.Int64(INT64_MIN)
+    hx.lstore(sm + off + t * 8, (t < n).select(p, fx.Int64(INT64_MIN)))
+    gpu.barrier()
+    beats = I32(0)
+    for u in range(0, (n + 7) // 8 * 8, 8):
+        for h in range_constexpr(4):
+            vv = hx.lload(sm + off + (u + 2 * h) * 8, fx.Int64, 2)
+            for e in range_constexpr(2):
+                beats = beats + (vv[e] > p).select(I32(1), I32(0))
+    return beats
 
 
 @ASTRewriter.transform
@@ -964,16 +984,8 @@ def select_mf(c, ctr, G, mf, kp):
                     ea = lst + i64(fx.min(t, nb - 1)) * 8
                     ex = hx.gload(ea, I32, scope="agent")
                     ec = hx.gload(ea + 4, I32, scope="agent")
-                    hx.lstore(sm + O_MFL + t * 4, order_key(ex))
-                    hx.lstore(sm + O_MFL + MF_CAP * 4 + t * 4, ec)
-                    gpu.barrier()
+                    beats = rank_desc(sm, O_MFR, t, nb, order_key(ex), ec)
                     if t < nb:
-                        kt = order_key(ex)
-                        beats = I32(0)
-                        for u in range(0, nb):
-                            ku = hx.lload(sm + O_MFL + u * 4, I32)
-                            cu = hx.lload(sm + O_MFL + MF_CAP * 4 + u * 4, I32)
-                            beats = beats + (ult(kt, ku) | ((ku == kt) & (cu < ec))).select(I32(1), I32(0))
                         if beats < need:
                             _emit_any(c, I32(MODE_SEL), I32(0), I32(1) > I32(0), r, I32(0), q, k, I32(0), c["lvl"],
                                       c["lvl"], k - need + beats, I32(0), ec)
