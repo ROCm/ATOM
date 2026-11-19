@@ -9,10 +9,28 @@ from types import MethodType, SimpleNamespace
 import pytest
 import torch
 
-pytest.importorskip("triton")
-pytest.importorskip("aiter.ops.enum", exc_type=ImportError)
+qwen4_exp = qwen4_exp_mtp = sequence_parallel = None
 
-from atom.models import qwen4_exp, qwen4_exp_mtp
+
+@pytest.fixture(scope="module", autouse=True)
+def imported_models():
+    global qwen4_exp, qwen4_exp_mtp, sequence_parallel
+    if torch.cuda.is_available():
+        from atom.distributed import sequence_parallel as rows
+        from atom.models import qwen4_exp as target
+        from atom.models import qwen4_exp_mtp as draft
+
+        qwen4_exp, qwen4_exp_mtp, sequence_parallel = target, draft, rows
+        yield
+    else:
+        from aiter_stub import atom_without_aiter
+
+        with atom_without_aiter() as load:
+            qwen4_exp = load("atom.models.qwen4_exp")
+            qwen4_exp_mtp = load("atom.models.qwen4_exp_mtp")
+            sequence_parallel = load("atom.distributed.sequence_parallel")
+            yield
+    qwen4_exp = qwen4_exp_mtp = sequence_parallel = None
 
 
 class _Collectives:
@@ -50,10 +68,18 @@ def ranks(monkeypatch):
     """`ranks(world, fn)` runs `fn(rank)` on `world` simulated TP ranks; outside
     `ranks` the TP world size is 1."""
     local = threading.local()
-    monkeypatch.setattr(qwen4_exp, "get_tp_group", lambda: local.group)
+    monkeypatch.setattr(sequence_parallel, "get_tp_group", lambda: local.group)
     monkeypatch.setattr(qwen4_exp, "get_tensor_model_parallel_rank", lambda: local.rank)
     monkeypatch.setattr(
         qwen4_exp,
+        "get_tensor_model_parallel_world_size",
+        lambda: getattr(local, "world", 1),
+    )
+    monkeypatch.setattr(
+        sequence_parallel, "get_tensor_model_parallel_rank", lambda: local.rank
+    )
+    monkeypatch.setattr(
+        sequence_parallel,
         "get_tensor_model_parallel_world_size",
         lambda: getattr(local, "world", 1),
     )
