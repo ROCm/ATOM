@@ -135,8 +135,19 @@ def _direct_poll(requests):
 
 # A ``profile`` finish's stamps a CTA, in order: its start, its token's routes
 # stored (routing CTAs), every token's HERD candidates in and HERD's outputs
-# stored (the HERD CTA), its shared down's stores issued, its stores drained.
-PROFILE_STAMPS = ("start", "routed", "herd_in", "herd_done", "shared_done", "end")
+# stored (the HERD CTA), its shared down's stores issued, its stores drained;
+# a parallel-HERD routing CTA's every wave past its candidates' poll, and
+# its batch popularity counted.
+PROFILE_STAMPS = (
+    "start",
+    "routed",
+    "herd_in",
+    "herd_done",
+    "shared_done",
+    "end",
+    "herd_seen",
+    "herd_counted",
+)
 PROFILE_WORDS = 8
 
 

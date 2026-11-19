@@ -764,6 +764,8 @@ def stage_herd_token(c, rows, token):
     if const_expr("stamp" in c):
         c["stamp"]("herd_in")
     gpu.barrier()
+    if const_expr("stamp" in c):
+        c["stamp"]("herd_seen")
     for index in range_constexpr(rounds):
         at = tid + index * threads
         if at < candidates:
@@ -772,6 +774,8 @@ def stage_herd_token(c, rows, token):
             fx.ptr_store(fx.Int32(words[2 * index]).bitcast(fx.Float32), values_s + at)
             fx.atomic_add(popularity + expert, fx.Int32(1), syncscope="workgroup")
     gpu.barrier()
+    if const_expr("stamp" in c):
+        c["stamp"]("herd_counted")
     store_cm = c.get("store_cm", 0)
     drop_order = _herd_drop_wave if wave_drop else _herd_drop_scan
     if c["wave"] == 0:
