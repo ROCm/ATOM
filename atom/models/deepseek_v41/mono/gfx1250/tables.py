@@ -119,6 +119,10 @@ class StepTables:
             self.selecting = [
                 i for i in range(NL) if target[i].attn.indexer is not None
             ]
+            # (select_mf) the FULL layers' anchored-selection slots: Ly // 6, distinct and < topk.MF_SLOTS
+            full = [i for i in self.selecting if target[i].attn.spec.candidate_source is None
+                    and not target[i].attn.spec.produces_candidates]
+            assert sorted(i // 6 for i in full) == list(range(len(full))) and len(full) <= M.TK.MF_SLOTS, full
             self.isel = {i: z32((T + 1) * 512, -1) for i in self.selecting}
             self.irow = {i: z32((T + 1) * 512) for i in self.selecting}
             self.ilog = torch.zeros((T + 1) * ILW, dtype=torch.float32, device=dev)

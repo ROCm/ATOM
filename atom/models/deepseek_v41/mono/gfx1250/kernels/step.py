@@ -70,9 +70,11 @@ LCB = LY.LAYER_BYTES             # (+ 128..255: the TP1 / TP2 column-group count
 IDX_LEVELS = 3        # selection-tree capacity (the index capacity buffers.ILW); actual passes depend on the current bound
 MC_BYTES = (D.LAYERS + 4) * (4 * 8 * 256 * 4 + 8 * 8 * 4)   # mchist: [layers] ([4 rounds][8 rows][256] + [8 rows][8]) i32
 MA_OFF = MC_BYTES                 # then select_ma's histograms: topk.MA_SLOTS REINDEX slots of topk.MA_LAYER
-MC_ZERO = MA_OFF + TK.MA_SLOTS * TK.MA_LAYER   # (zeroed at the step's entry)
+MF_OFF = MA_OFF + TK.MA_SLOTS * TK.MA_LAYER   # then select_mf's: topk.MF_SLOTS FULL slots of topk.MF_LAYER
+MC_ZERO = MF_OFF + TK.MF_SLOTS * TK.MF_LAYER   # (zeroed at the step's entry)
 MA_KB = MC_ZERO                   # select_ma's kept slots (the anchors) [MA_SLOTS] x topk.MA_KEEP
-MC_BYTES = MA_KB + TK.MA_SLOTS * TK.MA_KEEP
+MF_KB = MA_KB + TK.MA_SLOTS * TK.MA_KEEP   # select_mf's kept slots (anchors, the bin lists) [MF_SLOTS] x topk.MF_KEEP
+MC_BYTES = MF_KB + TK.MF_SLOTS * TK.MF_KEEP
 IPF_KB = 32           # instruction prefetch (KB) before the fronts / the MoE
 FPF_SPLIT = True      # (front prefetch layout; the step build does not prefetch the front weights)
 

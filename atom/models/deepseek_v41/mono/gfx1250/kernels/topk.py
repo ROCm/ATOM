@@ -398,8 +398,8 @@ MC_LAYER = MC_HIST + MC_CTR
 
 def mc_g_long(TR):
     """CTAs a FULL row once the step's longest row has > MC_G_LONG_N keys: as many as the grid holds for TR rows (TR = 6:
-    42, 252 CTAs) -- a radix round's keys a CTA scale with the row (133K: 33K, 400K: 100K keys a row), its group count
-    does not."""
+    42, 252 CTAs) -- a radix round's keys a CTA scale with the row (layers 2 / 8 / 14, ratio 2: 133K 66K, 400K 200K keys a
+    row), its group count does not."""
     return max(MC_G, D.CTAS // TR)
 
 
@@ -672,6 +672,13 @@ O_MAL = O_MCH + 1024                     # LDS: the waves' (winners, j-bin) coun
 O_MAP = O_MAL + 4096                     # select_ma_prep's values (before the scorer: past the scorer's LDS) -- (n, lo,
 # -, -), then a thread's (real, pool row) of its 2 keys
 MA_X0 = 64                               # select_ma's row groups from CTA 64 (past the iquant CTAs: the prep in their wait)
+# (c1) the FULL layers' anchored selection (select_mf): a slot a FULL layer (2 / 8 / 14: Ly // 6, tables asserts)
+MF_SLOTS = 3
+MF_LAYER = MC_ROWS * 256 * 4             # zeroed a step: the anchored histograms [MC_ROWS][256]
+MF_CAP = 256                             # keys the 512-th's bin may hold (ranked by its group's CTA 0); more -> select_mc
+MF_KANC = 0                              # kept across steps (step.MF_KB, MF_KEEP bytes a FULL layer): the rows' anchors
+MF_KLIST = 64                            # then the 512-th's bin's (score, column) [MC_ROWS][MF_CAP] int2
+MF_KEEP = MF_KLIST + MC_ROWS * MF_CAP * 8
 
 
 def _ma_bin(x, lo, inv):
