@@ -596,6 +596,17 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
 
         return 0, False
 
+    def _prompt_block_ids(self, seq: Sequence, block_ids: list[int]) -> list[int]:
+        """The pages of `block_ids` that hold `seq`'s prompt, all D allocates.
+
+        P can hold more: MTP lookahead pages, and with deferred output the page
+        a finished prefill's one extra step takes when the prompt fills its
+        last page. D computes the first token's KV itself, and the send aborts
+        when it has more source pages than D has destinations.
+        """
+        page_tokens = self.block_size * self.dcp_size
+        return block_ids[: -(-seq.num_prompt_tokens // page_tokens)]
+
     def build_connector_meta(self) -> ConnectorMetadata:
         # Sweep even behind a capacity-blocked head, and on idle PP ticks.
         # Expiry queues the existing cancellation protocol; it never frees D's
@@ -623,12 +634,9 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             assert req.kv_transfer_params is not None
             req.kv_transfer_params["local_slot_index"] = slot_idx
             if req.kv_transfer_params.get("chunked_transfer"):
-                # MTP owns lookahead pages beyond the prompt on P. D reserves
-                # only prompt pages; keep the extra pages pinned on the sequence
-                # but leave them out of both initial and final transfer metadata.
-                page_tokens = self.block_size * self.dcp_size
-                prompt_blocks = (req.num_prompt_tokens + page_tokens - 1) // page_tokens
-                block_ids = block_ids[:prompt_blocks]
+                # Pages past the prompt stay pinned on the sequence, but out
+                # of both initial and final transfer metadata.
+                block_ids = self._prompt_block_ids(req, block_ids)
             meta.add_new_req_to_save(
                 request_id=req_id,
                 local_block_ids=block_ids,
@@ -807,16 +815,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
 
         prefill_block_ids = list(seq.block_table)
         if self.is_producer:
-            # The prompt's blocks only. With deferred output a seq is
-            # scheduled for one more step before its prefill's output
-            # finishes it, and that step's `may_append` can add blocks past
-            # the prompt: one whenever the prompt fills its last block. The
-            # consumer has no destination for them (it computes the first
-            # token's KV itself), and the send aborts on a count mismatch.
-            tokens_per_block = self.block_size * self.dcp_size
-            prefill_block_ids = prefill_block_ids[
-                : -(-seq.num_prompt_tokens // tokens_per_block)
-            ]
+            prefill_block_ids = self._prompt_block_ids(seq, prefill_block_ids)
 
         # Claim iff we will send: the same `do_remote_decode` gate that fills
         # `_reqs_need_save`.
