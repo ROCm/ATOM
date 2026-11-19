@@ -1320,9 +1320,11 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         # the page-128 indexer-key cache. None until the runner binds it.
         self.index_cache: torch.Tensor | None = None
         # `--index-cache-dtype fp4`: index_cache is the FP4 payload plane and
-        # index_scale its E4M3 scales; the fused cache write lands the step's
-        # model-dtype keys in index_stage (token-major, index_stage_slots = identity)
-        # and index_fp4_store quantizes them in (minimax_m3/index_fp4.py).
+        # index_scale its E4M3 scales. With NVFP4 K/V the fused cache write
+        # quantizes the key into them itself (aiter's NVFP4 index rows); with
+        # FP8/BF16 K/V it lands the step's model-dtype keys in index_stage
+        # (token-major, index_stage_slots = identity) and index_fp4_store
+        # quantizes them in (minimax_m3/index_fp4.py).
         self.index_scale: torch.Tensor | None = None
         self.index_stage: torch.Tensor | None = None
         self.index_stage_slots: torch.Tensor | None = None
@@ -1410,6 +1412,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             self.index_cache_dtype if self.index_cache_dtype == "fp8" else "auto"
         )
         index_fp4 = self.index_scale is not None
+        # NVFP4 K/V + FP4 index: one launch writes all three in the row layout.
+        index_fp4_fused = index_fp4 and self.kv_nvfp4
+        fused_index_scale = None
         fused_k_cache, fused_v_cache = k_cache, v_cache
         fused_kv_slot_mapping = slot_mapping
         if self.kv_nvfp4:
@@ -1421,7 +1426,12 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         else:
             # SHUFFLE page size (== ASM_PAGE_SIZE == 16)
             fused_kv_block_size = k_cache.shape[3]
-        if index_fp4:
+        if index_fp4_fused:
+            fused_index_cache = self.index_cache
+            fused_index_scale = self.index_scale
+            fused_index_cache_dtype = "nvfp4"
+            fused_index_slot_mapping = slot_mapping
+        elif index_fp4:
             fused_index_cache = _step_stage(self.index_stage, num_tokens, page_dim=1)
             fused_index_slot_mapping = self.index_stage_slots[:num_tokens]
         else:
@@ -1503,8 +1513,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             k_scale=fused_k_scale,
             v_scale=fused_v_scale,
             asm_layout=not self.kv_nvfp4,
+            **({} if fused_index_scale is None else {"index_scale": fused_index_scale}),
         )
-        if index_fp4:
+        if index_fp4 and not index_fp4_fused:
             from atom.model_ops.minimax_m3.index_fp4 import index_fp4_store
 
             index_fp4_store(

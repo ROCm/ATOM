@@ -12,7 +12,10 @@ pins the fused result bit for bit to the unfused one:
   ``nvfp4_page_table``'s own launch;
 - the K/V write: aiter's ``fused_qknorm_idxrqknorm`` quantizes K/V into the NVFP4
   pool (``kv_cache_dtype="nvfp4"`` with the scale planes) instead of writing them to
-  a BF16 staging buffer that ``kv_nvfp4_store`` quantizes.
+  a BF16 staging buffer that ``kv_nvfp4_store`` quantizes;
+- the FP4 index key write: the same aiter launch quantizes it into the FP4 index
+  planes (``index_cache_dtype="nvfp4"`` with ``index_scale``) instead of a BF16
+  staging buffer that ``index_fp4_store`` quantizes.
 
 The table tests are plain Triton: without a GPU they run on the CPU under
 ``TRITON_INTERPRET=1`` (``TRITON_INTERPRET=1 GPU_ARCHS=gfx1250 pytest ...``). The
@@ -291,4 +294,89 @@ def test_fused_nvfp4_write_equals_staging_then_store(index_dtype, tokens):
     assert torch.equal(q, ref_q) and torch.equal(iq, ref_iq)
     assert torch.equal(index.view(torch.uint8), ref_index.view(torch.uint8))
     for got, want in ((kp, rkp), (vp, rvp), (ks, rks), (vs, rvs)):
+        assert torch.equal(got, want)
+
+
+@writer_archs
+@pytest.mark.parametrize("tokens", [37, 2000])
+def test_fused_fp4_index_write_equals_staging_then_store(tokens):
+    """aiter's NVFP4 index rows (index_cache_dtype="nvfp4" + index_scale, strided
+    pool fields) in the NVFP4 K/V launch, against what attention_mha did before:
+    the index key "auto" into the token-major staging buffer, then index_fp4_store
+    at the real slots. Index planes bitwise -- zero- and subnormal-scale blocks
+    included -- and the K/V pool, q_out and the index query as the "auto"-index
+    call writes them."""
+    import aiter
+
+    from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
+    from atom.model_ops.minimax_m3.index_fp4 import index_fp4_store
+
+    heads, hkv, rot = 16, 1, 64
+    blocks = -(-tokens // PAGE) + 4
+    g = torch.Generator(device=DEV).manual_seed(17)
+    row = (heads + 3 * hkv + 1) * D
+    qkv = torch.randn(tokens, row, generator=g, device=DEV)
+    qkv = (
+        qkv.view(tokens, -1, D)
+        * torch.exp2(torch.randint(-6, 5, (tokens, row // D, 1), device=DEV))
+    ).view(tokens, row)
+    ik = slice((heads + 3 * hkv) * D, row)
+    qkv[3::7, ik] *= 1e-4  # index keys whose blocks quantize to zero / subnormal scales
+    qkv = qkv.to(torch.bfloat16)
+    w = [
+        torch.randn(D, generator=g, device=DEV).to(torch.bfloat16) * 0.3 + 1
+        for _ in range(4)
+    ]
+    cos_sin = torch.randn(8192, rot, generator=g, device=DEV).to(torch.bfloat16)
+    pos = torch.randint(0, 8192, (tokens,), device=DEV)
+    slots = torch.randperm(blocks * PAGE, device=DEV)[:tokens].to(torch.int64)
+    slots[2::29] = -1
+
+    def pool_views():
+        pool = MhaKvPool(
+            layers=2, block_size=PAGE, num_kv_heads=hkv, head_dim=D,
+            kv_dtype=torch.float8_e4m3fn, kv_format="nvfp4",
+        )  # fmt: skip
+        pool.allocate(blocks, torch.device(DEV))
+        (kp, vp), (ks, vs) = pool.kv_views(1), pool.scale_views(1)
+        for t in (kp, vp, ks, vs):
+            t.fill_(0x5A)
+        return kp, vp, ks, vs
+
+    def index_planes():
+        # Two fields of one entry-major region, as the pool binds them.
+        pay, sc = PAGE * D // 2, PAGE * D // 16
+        region = torch.full(
+            (blocks, pay + sc + 32), 0x5A, dtype=torch.uint8, device=DEV
+        )
+        return region[:, :pay].unflatten(1, (PAGE, D // 2)), region[
+            :, pay : pay + sc
+        ].unflatten(1, (PAGE, D // 16))
+
+    def fused(index, index_dtype, index_slots, index_scale=None):
+        kp, vp, ks, vs = pool_views()
+        q_out = torch.empty(tokens, heads * D, dtype=torch.bfloat16, device=DEV)
+        iq = torch.empty(tokens, hkv * D, dtype=torch.bfloat16, device=DEV)
+        aiter.fused_qknorm_idxrqknorm(
+            qkv.clone(), w[0], w[1], cos_sin, pos, heads, hkv, rot, 1e-6, w[2], w[3],
+            hkv, slots, kp, vp, index, PAGE, q_out, iq, index_slots,
+            kv_cache_dtype="nvfp4", index_cache_dtype=index_dtype,
+            k_scale=ks, v_scale=vs, asm_layout=False,
+            **({} if index_scale is None else {"index_scale": index_scale}),
+        )  # fmt: skip
+        return q_out, iq, (kp, vp, ks, vs)
+
+    # Before: the key "auto" into identity-slot staging, then index_fp4_store.
+    stage = torch.zeros(-(-tokens // PAGE) * PAGE, D, dtype=torch.bfloat16, device=DEV)
+    ident = torch.arange(stage.shape[0], dtype=torch.int64, device=DEV)
+    ref_q, ref_iq, ref_kv = fused(stage, "auto", ident[:tokens])
+    rp, rs = index_planes()
+    index_fp4_store(stage, slots, rp, rs)
+
+    ip, isc = index_planes()
+    q, iq, kv = fused(ip, "nvfp4", slots, isc)
+    torch.cuda.synchronize()
+    assert torch.equal(q, ref_q) and torch.equal(iq, ref_iq)
+    assert torch.equal(ip, rp) and torch.equal(isc, rs)
+    for got, want in zip(kv, ref_kv):
         assert torch.equal(got, want)

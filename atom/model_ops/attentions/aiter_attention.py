@@ -766,10 +766,18 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 module.impl.index_scale = pool.field_view(
                     "index_scale", row, torch.uint8, (-1, self.block_size, scale_bytes)
                 )
-                (
-                    module.impl.index_stage,
-                    module.impl.index_stage_slots,
-                ) = self._quant_stage("index", (self.block_size, spec.dim))
+                # With NVFP4 K/V the fused qk-norm/rope/cache write quantizes the
+                # index key into these planes too; only an FP8/BF16 K/V layer
+                # stages it for index_fp4_store.
+                kv_nvfp4 = any(
+                    isinstance(k, KvGeometry) and k.kv_format == "nvfp4"
+                    for k in self._module_kinds(module)
+                )
+                if not kv_nvfp4:
+                    (
+                        module.impl.index_stage,
+                        module.impl.index_stage_slots,
+                    ) = self._quant_stage("index", (self.block_size, spec.dim))
             else:
                 module.impl.index_cache = pool.field_view(
                     "index", row, spec.dtype, (-1, self.block_size, spec.dim)
