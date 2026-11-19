@@ -3,8 +3,10 @@
 
 import enum
 import fnmatch
+import functools
 import hashlib
 import importlib.util
+import inspect
 import logging
 import os
 import re
@@ -2016,6 +2018,21 @@ def resolve_draft_kv_dtype(target_dtype: str, *, own_pool: bool) -> str:
     return "bf16" if own_pool and target_dtype in FP4_CACHE_DTYPES else target_dtype
 
 
+@functools.cache
+def _aiter_nvfp4_scorer_takes_cp_shard() -> bool:
+    """Whether the installed aiter's NVFP4 decode index scorer takes the CP shard
+    (``cp_world`` / ``cp_rank``) the indexer-CP decode scores with. Asked once."""
+    try:
+        from aiter.ops import flydsl
+
+        params = inspect.signature(
+            flydsl.minimax_m3_index_score_nvfp4_flydsl
+        ).parameters
+    except (ImportError, AttributeError, ValueError, TypeError):
+        return False
+    return "cp_world" in params and "cp_rank" in params
+
+
 def indexer_cp_unsupported_reason(
     arches,
     tp_size: int,
@@ -2052,8 +2069,11 @@ def indexer_cp_unsupported_reason(
         # error. ``indexer_cp_enabled`` refuses them at runtime; this clears the
         # flag so nothing downstream (log line, compile hash) disagrees.
         return "plugin mode (the vLLM/SGLang bridges keep the TP indexer path)"
-    if nvfp4_caches:
-        return "the NVFP4 caches are not wired to the CP scorer"
+    if nvfp4_caches and not _aiter_nvfp4_scorer_takes_cp_shard():
+        return (
+            "aiter's NVFP4 index scorer lacks cp_world/cp_rank "
+            "(needs ROCm/aiter#8285)"
+        )
     if dcp_size > 1:
         return (
             "decode_context_parallel_size > 1 (KV-cache DCP owns the context "

@@ -17,6 +17,7 @@ from atom.model_ops.minimax_m3.index_topk import (
     flydsl_ops,
 )
 from atom.model_ops.minimax_m3.mxfp4_pages import page_views
+from atom.model_ops.minimax_m3.nvfp4_pages import index_page_views as nvfp4_page_views
 
 # A decode graph is captured for max_model_len, so a grid sized by the launch
 # width is mostly programs past every request. The grid is sized by the batch
@@ -221,7 +222,8 @@ def indexer_context_scores_mxfp4(
     sm_scale,
     index_scorer,
 ):
-    """`indexer_context_scores` over the MXFP4 index cache, by aiter's FlyDSL scorer.
+    """`indexer_context_scores` over the FP4 (MXFP4, or NVFP4 as ``index_scorer.nvfp4``
+    says) index cache, by aiter's FlyDSL scorer.
 
     ``index_scorer`` is the step's record of this rank's shard: the work map, the
     shard's block bound ``max_block`` it was built at, and the workspace the scores
@@ -246,6 +248,23 @@ def indexer_context_scores_mxfp4(
     scores = index_scorer.scores.logits(heads * tokens, local).view(
         heads, tokens, local
     )
+    if index_scorer.nvfp4:
+        # the TP decode's NVFP4 scorer and K rounding (its default), on the shard
+        k_data, k_scale = nvfp4_page_views(index_cache)
+        return flydsl_ops().minimax_m3_index_score_nvfp4_flydsl(
+            idx_q,
+            k_data,
+            k_scale,
+            block_table,
+            seq_lens,
+            max_query_len,
+            heads,
+            sm_scale,
+            local,
+            out=scores,
+            work_map=index_scorer.work_map,
+            **index_scorer.shard,
+        )
     k_data, k_scale = page_views(index_cache)
     return flydsl_ops().minimax_m3_index_score_flydsl(
         idx_q,
