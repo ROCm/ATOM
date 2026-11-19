@@ -38,7 +38,7 @@ import torch
 from torch import nn
 
 from atom.config import QuantizationConfig
-from atom.spec_decode.draft_kv import DraftKvPoolSpec
+from atom.spec_decode.draft_kv import DraftKvPoolSpec, DraftRuns
 from atom.utils import envs
 
 if TYPE_CHECKING:
@@ -495,6 +495,9 @@ class DSparkDraftModel(nn.Module):
     # A pool of the draft's own, outside the target's DCP group. None is the
     # generic pool, inside the group.
     kv_pool_spec: ClassVar[DraftKvPoolSpec | None] = None
+    # `(window, read_page)` when the block pass reads only a sliding window, each
+    # row from a page of `read_page` tokens; None when it reads the whole context.
+    kv_read_window: "tuple[int, int] | None" = None
 
     #: Does this flavor's block sampler hand ``draft_sampling`` to
     #: ``DSparkMarkovHead.sample_block``, so it draws from, and publishes, a
@@ -553,6 +556,7 @@ class DSparkDraftModel(nn.Module):
         allocated_pages,  # [>= scheduled_bs] host, pages each request holds
         scheduled_bs: int,
         entry_tokens: int,  # tokens one block table id spans, the slots' unit
+        runs: DraftRuns | None = None,  # a windowed pool's, read for `block_tables`
     ) -> None:
         """The per-step metadata only a non-MLA block attention reads, built
         outside the captured block from the proposer's paged block metadata."""

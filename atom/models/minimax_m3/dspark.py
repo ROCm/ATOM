@@ -82,6 +82,7 @@ from atom.models.dspark_draft import (
     linear_out,
 )
 from atom.models.minimax_m3.model import MiniMaxM3MLP
+from atom.spec_decode.draft_kv import DraftRuns
 from atom.utils.forward_context import get_forward_context
 
 if TYPE_CHECKING:
@@ -126,6 +127,7 @@ def _window_rows(
     start16: torch.Tensor,  # [rb * T] int64 scratch
     out_tables: torch.Tensor,  # [rb * T, P]
     out_lens: torch.Tensor,  # [rb * T]
+    first16_rows: torch.Tensor | None = None,  # [rb * T] each row's run start, page-16s
 ) -> None:
     """Each block row's page-16 table and length under the sliding window.
 
@@ -146,9 +148,40 @@ def _window_rows(
     else:
         start16.zero_()
     torch.index_select(ctx_eff, 0, row_req, out=out_lens)
+    if first16_rows is not None:
+        # A table starts at its run's first page: a row anchored below the run
+        # (a prefill chunk's, whose drafts are discarded) reads its run's first key.
+        torch.maximum(start16, first16_rows, out=start16)
     out_lens.sub_(start16, alpha=ASM_PAGE_SIZE)
+    if first16_rows is not None:
+        out_lens.clamp_(min=1)
+        start16.sub_(first16_rows)
     start16.add_(row_req, alpha=P)  # each row's first entry in the flat buffer
     torch.index_select(bt16_flat.unfold(0, P, 1), 0, start16, out=out_tables)
+
+
+def _window_slots(
+    runs: DraftRuns,
+    block_positions: torch.Tensor,  # [running_bs, T]
+    slots: torch.Tensor,  # [running_bs, T] int64, out
+    scheduled_bs: int,
+    entry_tokens: int,  # tokens one block id spans
+    col: torch.Tensor,  # [running_bs, T] int64 scratch
+    ids: torch.Tensor,  # [running_bs, T] scratch, the tables' dtype
+    off_run: torch.Tensor,  # [running_bs, T] bool scratch
+) -> None:
+    """The block's KV write slots in each request's run: its block less the run's
+    first is its column; a column off the run, or a pad row, writes nothing (-1)."""
+    width = runs.tables.shape[1]
+    torch.div(block_positions, entry_tokens, rounding_mode="floor", out=col)
+    col.sub_(runs.first.view(-1, 1))
+    torch.clamp(col, 0, width - 1, out=slots)
+    torch.ne(col, slots, out=off_run)
+    torch.gather(runs.tables, 1, slots, out=ids)
+    slots.copy_(ids).mul_(entry_tokens)
+    torch.remainder(block_positions, entry_tokens, out=col)
+    slots.add_(col).masked_fill_(off_run, -1)
+    slots[scheduled_bs:].fill_(-1)
 
 
 class M3DSparkAttention(nn.Module):
@@ -458,6 +491,12 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         self.max_num_seqs = atom_config.max_num_seqs
         self._bt16 = None
 
+    @property
+    def kv_read_window(self) -> "tuple[int, int] | None":
+        """Each block row reads its window from the page-16 holding its first
+        key (`_window_rows`); no window, the whole context."""
+        return (self.sliding_window, ASM_PAGE_SIZE) if self.sliding_window else None
+
     # ---- drafting entry points (called by the proposer) --------------------
 
     def _alloc_block_rows(self, P: int, T: int, device) -> None:
@@ -481,6 +520,11 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         )
         self._start16 = torch.zeros(max_bs * T, dtype=torch.int64, device=device)
         self._ctx_eff = torch.zeros(max_bs, dtype=torch.int32, device=device)
+        # A windowed pool's: each row's run start, and `_window_slots`' scratch.
+        self._first16_rows = torch.zeros(max_bs * T, dtype=torch.int32, device=device)
+        self._blk_col = torch.zeros(max_bs, T, dtype=torch.int64, device=device)
+        self._blk_ids = torch.zeros(max_bs, T, dtype=torch.int32, device=device)
+        self._off_run = torch.zeros(max_bs, T, dtype=torch.bool, device=device)
 
     def prepare_paged_block(
         self,
@@ -492,6 +536,7 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         allocated_pages,  # [>= scheduled_bs] host, pages each request holds
         scheduled_bs: int,
         entry_tokens: int,  # tokens one page id spans, the slots' unit
+        runs: DraftRuns | None = None,  # a windowed pool's, read for `block_tables`
     ) -> None:
         """Per-row paged decode tables for the block.
 
@@ -510,11 +555,25 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         neither written (slot -1) nor read (the row's context is capped at what
         is allocated): their draft rows simply miss a few of their own keys.
         """
+        if runs is not None:
+            # Positions stay absolute; only the column a block is found at moves.
+            block_tables, allocated_pages = runs.tables, runs.extent
         running_bs, T = block_positions.shape
         P = PAGES_PER_SPARSE_BLOCK * block_tables.shape[1]
         if self._bt16 is None or self._bt16.shape[1] != P:
             self._alloc_block_rows(P, T, block_tables.device)
 
+        if runs is not None:
+            _window_slots(
+                runs,
+                block_positions,
+                slots,
+                scheduled_bs,
+                entry_tokens,
+                self._blk_col[:running_bs],
+                self._blk_ids[:running_bs],
+                self._off_run[:running_bs],
+            )
         alloc = self._alloc_cap.apply(
             allocated_pages, scheduled_bs, block_positions, slots, entry_tokens
         )
@@ -528,6 +587,11 @@ class MiniMaxM3DSpark(DSparkDraftModel):
             bt16[scheduled_bs:, :PAGES_PER_SPARSE_BLOCK].copy_(self._sub_pages)
 
         rows = running_bs * T
+        first16_rows = None
+        if runs is not None:
+            first16_rows = self._first16_rows[:rows]
+            torch.index_select(runs.first, 0, self._row_req[:rows], out=first16_rows)
+            first16_rows.mul_(PAGES_PER_SPARSE_BLOCK)
         _window_rows(
             self._bt16_flat,
             ctx_eff,
@@ -538,6 +602,7 @@ class MiniMaxM3DSpark(DSparkDraftModel):
             self._start16[:rows],
             self._bt16_rows[:rows],
             self._ctx_rows[:rows],
+            first16_rows,
         )
         attn_metadata.dspark_bt16_rows = self._bt16_rows[:rows]
         attn_metadata.dspark_ctx_rows = self._ctx_rows[:rows]

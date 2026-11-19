@@ -61,7 +61,7 @@ from atom.models.dspark_draft import (
     linear_out,
 )
 from atom.models.qwen3 import Qwen3MLP
-from atom.spec_decode.draft_kv import DraftKvPoolSpec, draft_kv_dtype
+from atom.spec_decode.draft_kv import DraftKvPoolSpec, DraftRuns, draft_kv_dtype
 from atom.spec_decode.drafter import AuxCaptureSpec
 from atom.utils.forward_context import get_forward_context
 
@@ -402,6 +402,7 @@ class KimiK3DSparkGQA(DSparkDraftModel):
         allocated_pages,  # [>= scheduled_bs] host, blocks each request holds
         scheduled_bs: int,
         entry_tokens: int,  # tokens one block id spans, the slots' unit
+        runs: DraftRuns | None = None,  # None: no `kv_read_window`, so no runs
     ) -> None:
         """Keep the block inside the blocks each request was allocated.
 

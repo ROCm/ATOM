@@ -1,7 +1,9 @@
 import logging
 from dataclasses import dataclass
 from functools import partial
+from typing import NamedTuple
 
+import numpy as np
 import torch
 
 from atom.config import KVCacheTensor
@@ -88,6 +90,15 @@ class DraftKvPoolSpec:
         At DCP 1 an entry is one target block and no token is filtered, so
         the target's slots are the draft's, element for element."""
         return self.entry_tokens(config) != self.block_size(config)
+
+
+class DraftRuns(NamedTuple):
+    """Each request's run of held blocks in a windowed draft pool, which a block
+    pass reads in place of the target's block tables."""
+
+    tables: torch.Tensor  # [running_bs, W] the run's block ids, from `first` on
+    first: torch.Tensor  # [running_bs] the block each run starts at
+    extent: np.ndarray  # [running_bs] host: the block each run reaches
 
 
 def draft_kv_dtype(config) -> torch.dtype:
