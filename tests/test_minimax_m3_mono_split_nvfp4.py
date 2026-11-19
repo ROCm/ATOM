@@ -24,6 +24,8 @@ pytestmark = pytest.mark.skipif(
     reason="needs gfx950 and the vLLM reference tree (see the module doc)",
 )
 
+from aiter.ops.flydsl import sparse_pa_nvfp4_decode
+
 from atom.models.minimax_m3.mono.config import HEAD_DIM
 from atom.models.minimax_m3.mono.kernels.common import (
     KV_K_SCALE_AT,
@@ -38,13 +40,29 @@ SM_SCALE = HEAD_DIM**-0.5
 
 @pytest.fixture
 def ref(monkeypatch):
-    """vLLM's reference module; the import path and the module are put back after the
+    """vLLM's reference module; the import path and ``sys.modules`` (the modules
+    imported from the tree gone, the ones they replaced back) are put back after the
     test."""
     import importlib
 
-    monkeypatch.syspath_prepend(VLLM_REF)
-    monkeypatch.delitem(sys.modules, "minimax_m3_nvfp4_ref", raising=False)
-    return importlib.import_module("minimax_m3_nvfp4_ref")
+    modules = dict(sys.modules)
+    try:
+        monkeypatch.syspath_prepend(VLLM_REF)
+        sys.modules.pop("minimax_m3_nvfp4_ref", None)
+        yield importlib.import_module("minimax_m3_nvfp4_ref")
+    finally:
+        _restore_modules(modules, (os.path.abspath(VLLM_REF),))
+
+
+def _restore_modules(before, trees):
+    """Every module in ``sys.modules`` loaded from a directory of ``trees``: back to
+    ``before``'s, or gone."""
+    for name, mod in list(sys.modules.items()):
+        if (getattr(mod, "__file__", None) or "").startswith(trees):
+            if name in before:
+                sys.modules[name] = before[name]
+            else:
+                del sys.modules[name]
 
 
 def _case(ref, seed, n_logical, n_sel, tail, k_gs, v_gs, tokens=1):
@@ -139,7 +157,7 @@ def test_split_partitions_match_the_exact_reference(
     launch = build_split_nvfp4_kernel(SM_SCALE, N_SPLIT)
     launch(
         tbl.data_ptr(), q.data_ptr(), pages.data_ptr(), gs.data_ptr(),
-        sp_o.data_ptr(), sp_m.data_ptr(), sp_l.data_ptr(), 0,
+        sp_o.data_ptr(), sp_m.data_ptr(), sp_l.data_ptr(),
     )  # fmt: skip
     torch.cuda.synchronize()
     want = _reference(ref, pages, page_of, sel, q, n_keys, k_gs, v_gs)
@@ -153,11 +171,6 @@ def test_split_partitions_match_the_exact_reference(
 
 
 def test_merged_split_equals_aiter_sparse_pa_decode(ref):
-    try:
-        from aiter.ops.flydsl import sparse_pa_nvfp4_decode
-    except ImportError:
-        pytest.skip("this aiter has no sparse_pa_nvfp4_decode")
-
     n_logical, n_sel, tail, k_gs, v_gs = 40, 16, 77, 0.8, 1.3
     _ref, pages, page_of, sel, q, ctx, _ = _case(
         ref, 2, n_logical, n_sel, tail, k_gs, v_gs
@@ -169,7 +182,7 @@ def test_merged_split_equals_aiter_sparse_pa_decode(ref):
     sp_l = torch.zeros(N_SPLIT, H, device="cuda", dtype=torch.float32)
     build_split_nvfp4_kernel(SM_SCALE, N_SPLIT)(
         tbl.data_ptr(), q.data_ptr(), pages.data_ptr(), gs.data_ptr(),
-        sp_o.data_ptr(), sp_m.data_ptr(), sp_l.data_ptr(), 0,
+        sp_o.data_ptr(), sp_m.data_ptr(), sp_l.data_ptr(),
     )  # fmt: skip
     torch.cuda.synchronize()
     m, l, o = (

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""CPU proof for the index scorer's e4m3 table widen (``fp4_dword_e4m3x8_lut``): mono's
+"""CPU proof for the index scorer's e4m3 table widen (aiter's ``e4m3_table_words`` /
+``fp4_dword_to_e4m3``, the table filled at ``e4m3_to_f32`` of each scale byte): mono's
 original widen (``nvfp4_dword_e4m3x8``: cvt at scale 1.0, f32 multiply, clamp, e4m3
 convert) and the table + v_perm widen both equal e4m3_rn_satfinite(e2m1 * scale) for
 every e2m1 code at every nibble position and every positive e4m3 scale byte
@@ -52,7 +53,7 @@ def mono_widen(word, scale_byte):
 
 
 def scale_f32(byte):
-    """``e4m3_lut_row``'s scale (the f32 of an e4m3 byte)."""
+    """aiter's ``e4m3_to_f32``: the f32 of an e4m3 byte, in integer ops."""
     e, m = (byte >> 3) & 15, byte & 7
     if e == 0:
         return F32(m) * F32(2.0**-9)
@@ -74,7 +75,7 @@ def perm_b32(s0, s1, sel):
 
 
 def lut_widen(word, scale_byte):
-    """``fp4_dword_e4m3x8_lut``: eight e4m3 bytes, even elements first (as the
+    """``fp4_dword_to_e4m3``: eight e4m3 bytes, even elements first (as the
     kernel emits them), put back in element order."""
     t_lo, t_hi = table_words(scale_f32(scale_byte))
     ev = perm_b32(t_hi, t_lo, word & 0x07070707) | ((word << 4) & 0x80808080)

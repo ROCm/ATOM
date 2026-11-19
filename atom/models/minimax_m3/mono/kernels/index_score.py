@@ -27,6 +27,12 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.kernels_common import LOG2E
+from aiter.ops.flydsl.kernels.minimax_m3_index_score import (
+    LUT_ENTRIES,
+    e4m3_table_words,
+    e4m3_to_f32,
+    fp4_dword_to_e4m3,
+)
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T, as_ir_value
 
@@ -113,15 +119,12 @@ def nvfp4_dword_e4m3x8(word, scale_byte):
     return e4m3_dwords(prod)
 
 
-# aiter's per-scale e4m3 table (``fp4_dword_to_e4m3`` of its scorer): for each positive
-# e4m3 scale byte the 8 bytes e4m3_rn_satfinite(mag * scale), mag the e2m1 magnitudes
-# (equal to ``nvfp4_dword_e4m3x8`` for every code and scale byte 0x00..0x7E: exhaustive
-# check), 2 dwords an entry, in LDS: a K dword is then 2 v_perm_b32 + ~7 ALU, not ~33.
-LUT_ENTRIES = 128
-E2M1_MAGS = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
-SIGN8 = -0x7F7F7F80  # 0x80808080 as an i32: the sign bit of each fp8 byte of a dword
-MAG8 = 0x07070707  # the e2m1 magnitude bits of each nibble, spread one a byte
-EVEN_ODD = (0, 2, 4, 6, 1, 3, 5, 7)  # a dword's elements as ``fp4_dword_e4m3x8_lut``
+# aiter's per-scale e4m3 table (``e4m3_table_words`` / ``fp4_dword_to_e4m3`` of its
+# scorer): for each positive e4m3 scale byte the 8 bytes e4m3_rn_satfinite(mag * scale),
+# mag the e2m1 magnitudes (equal to ``nvfp4_dword_e4m3x8`` for every code and scale byte
+# 0x00..0x7E: exhaustive check), 2 dwords an entry, in LDS: a K dword is then 2
+# v_perm_b32 + ~7 ALU, not ~33.
+EVEN_ODD = (0, 2, 4, 6, 1, 3, 5, 7)  # a dword's elements as ``fp4_dword_to_e4m3``
 
 
 @fx.struct
@@ -137,22 +140,6 @@ def lut_lds(alloc):
     return alloc.allocate(LutSmem).peek().tab.ptr
 
 
-def e4m3_lut_row(scale_byte):
-    """The two dwords of the table entry of the scale byte ``scale_byte`` (0..127):
-    e4m3_rn_satfinite(mag * scale) for the 8 e2m1 magnitudes. The scale decodes at f32
-    exactly (``cvt_pk_f32_fp8``)."""
-    sc = fx.Vector(
-        rocdl.cvt_pk_f32_fp8(
-            res=fx.Vector.make_type(2, fx.Float32),
-            src=as_ir_value(fx.Int32(scale_byte)),
-            word_sel=False,
-        )
-    )[0]
-    return fx.Vector.from_elements(
-        e4m3_dwords([fx.Float32(m) * sc for m in E2M1_MAGS]), fx.Int32
-    )
-
-
 def e4m3_lut_entry(tab, scale_byte):
     """The (t_lo, t_hi) dwords of the table entry of ``scale_byte``'s low 7 bits."""
     t = fx.Vector(
@@ -161,18 +148,6 @@ def e4m3_lut_entry(tab, scale_byte):
         )
     )
     return t[0], t[1]
-
-
-def fp4_dword_e4m3x8_lut(word, t_lo, t_hi):
-    """Eight e2m1 of ``word`` -> e4m3 K by lookup in a scale's table entry: v_perm_b32
-    takes magnitudes 0..7 (selector bytes) from the 8 table bytes, four a dword; the
-    sign bit of each nibble is OR-ed in afterwards. Two dwords: the even elements
-    (0, 2, 4, 6), then the odd ones (``EVEN_ODD``; ``q_e4m3`` orders q the same way,
-    the MFMA sums over k in any order)."""
-    w = fx.Int32(word)
-    ev = rocdl.perm_b32(t_hi, t_lo, w & MAG8)
-    od = rocdl.perm_b32(t_hi, t_lo, (w >> 4) & MAG8)
-    return fx.Int32(ev) | ((w << 4) & SIGN8), fx.Int32(od) | (w & SIGN8)
 
 
 def q_e4m3(frags, order=range(8)):
@@ -385,7 +360,7 @@ def emit_index_scores(
                 ent = [e4m3_lut_entry(tab, sc), e4m3_lut_entry(tab, sc >> 8)]
                 words = []
                 for s in range_constexpr(4):
-                    words += fp4_dword_e4m3x8_lut(raw[5 * n + s], *ent[s // 2])
+                    words += fp4_dword_to_e4m3(raw[5 * n + s], *ent[s // 2])
                 out.append(fx.Vector.from_elements(words, fx.Int32))
             return out
         if const_expr(nvfp4):
@@ -444,7 +419,12 @@ def emit_index_scores(
         """Fill the CTA's table: thread s < LUT_ENTRIES makes the entry of scale byte
         s. The caller barriers before a lookup."""
         if tid < LUT_ENTRIES:
-            fx.ptr_store(e4m3_lut_row(tid), tab + tid * 2)
+            fx.ptr_store(
+                fx.Vector.from_elements(
+                    e4m3_table_words(e4m3_to_f32(fx.Int32(tid))), fx.Int32
+                ),
+                tab + tid * 2,
+            )
 
     def put(b, col, v):
         if (lane < 16) & (l16 < q_len):

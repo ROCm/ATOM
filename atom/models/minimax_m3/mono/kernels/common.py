@@ -21,7 +21,7 @@ from atom.model_ops.minimax_m3.nvfp4_pages import (
     head_regions,
     kv_page_bytes,
 )
-from atom.mono.device.mx import FP8_MAX
+from atom.mono.device.mx import FP8_MAX, fp4_pack2
 from atom.mono.device.ops import butterfly, hw_rcp, traced
 
 
@@ -139,18 +139,14 @@ def nvfp4_quant16(vals, gs):
         )
     )[0]
     quant = (sv != 0.0).select(fx.Float32(1.0) / (sv * gs), fx.Float32(0.0))
-    one = as_ir_value(fx.Float32(1.0))
     packed = fx.Int32(0)
     for pair in range_constexpr(2):
-        packed = fx.Int32(
-            rocdl.cvt_scalef32_pk_fp4_f32(
-                T.i32,
-                as_ir_value(packed),
-                as_ir_value(vals[2 * pair] * quant),
-                as_ir_value(vals[2 * pair + 1] * quant),
-                one,
-                pair,
-            )
+        packed = fp4_pack2(
+            packed,
+            vals[2 * pair] * quant,
+            vals[2 * pair + 1] * quant,
+            fx.Float32(1.0),
+            pair,
         )
     return code, packed
 
