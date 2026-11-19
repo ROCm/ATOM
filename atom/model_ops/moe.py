@@ -233,8 +233,16 @@ class FusedMoEParallelConfig:
     pcp_merge: bool = False
 
     @property
+    def exchanges_tokens(self) -> bool:
+        """Whether routed tokens actually cross ranks: expert parallelism over
+        more than one real DP rank. TP-only EP (one DP rank) reduces instead,
+        and simulated DP (``dp_logical_ratio`` > 1) has a finer expert map than
+        the launched process group, so neither exchanges tokens."""
+        return self.use_ep and self.dp_size > 1 and self.dp_logical_ratio == 1
+
+    @property
     def selected_all2all_backend(self) -> str | None:
-        if self.dp_size <= 1 or not self.use_ep or self.dp_logical_ratio != 1:
+        if not self.exchanges_tokens:
             return None
         if self.requested_all2all_backend == "none":
             return None
