@@ -58,7 +58,7 @@ pub(crate) fn completion_to_generate(c: &CompletionRequest) -> Result<GenerateRe
 
     let sampling_params = SamplingParams {
         temperature: c.temperature,
-        max_new_tokens: c.max_tokens,
+        max_new_tokens: max_new_tokens(c)?,
         top_p: c.top_p,
         top_k: c.top_k,
         frequency_penalty: c.frequency_penalty,
@@ -115,6 +115,22 @@ pub(crate) fn completion_to_generate(c: &CompletionRequest) -> Result<GenerateRe
         return_entropy: false,
         rid: None,
     })
+}
+
+/// The output cap: `max_completion_tokens` (which the typed request has no
+/// field for) over `max_tokens`, as `CompletionRequest.get_max_tokens` takes
+/// them.
+fn max_new_tokens(c: &CompletionRequest) -> Result<Option<u32>, String> {
+    match c.other.get("max_completion_tokens") {
+        None | Some(Value::Null) => Ok(c.max_tokens),
+        Some(v) => match v.as_i64() {
+            Some(n) if n >= 1 => u32::try_from(n)
+                .map(Some)
+                .map_err(|_| format!("max_completion_tokens is too large, got {n}")),
+            Some(n) => Err(format!("max_tokens must be at least 1, got {n}")),
+            None => Err("max_completion_tokens must be an integer".into()),
+        },
+    }
 }
 
 /// Convert a list of native `GenerateResponse`s into an OpenAI `CompletionResponse`.

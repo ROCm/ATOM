@@ -2,7 +2,8 @@
 //! Python API server refuses (sampling values `SamplingParams` rejects,
 //! `max_tokens` over the deployment's cap, an over-long context, a prompt the
 //! KV pool cannot hold, logprobs under forced acceptance) and what this
-//! server does not serve yet (top and streamed logprobs, streaming n > 1).
+//! server does not serve yet (top, input and streamed logprobs, streaming
+//! n > 1).
 
 use axum::response::Response;
 use http::HeaderMap;
@@ -69,6 +70,13 @@ impl AtomEngineRouter {
         }
         if logprobs && payload.logprob.top_logprobs_num > 0 {
             return Err(not_yet("top_logprobs"));
+        }
+        // The Core computes no prompt logprobs, nor a chosen token's.
+        if logprobs && payload.logprob.input_logprobs {
+            return Err(not_yet("input logprobs (logprob_start_len)"));
+        }
+        if logprobs && !payload.logprob.token_ids_logprob.is_empty() {
+            return Err(not_yet("token_ids_logprob"));
         }
         if logprobs && payload.stream {
             return Err(not_yet("streaming with logprobs"));
@@ -263,6 +271,17 @@ fn session_id(headers: Option<&HeaderMap>) -> Option<&str> {
         .find_map(|name| headers.get(*name)?.to_str().ok().filter(|v| !v.is_empty()))
 }
 
+fn bad_request(message: String) -> Response {
+    error::bad_request("invalid_request", message)
+}
+
+pub(super) fn not_yet(what: &str) -> Response {
+    error::bad_request(
+        "not_supported",
+        format!("{what} is not supported by the ATOM standalone server yet"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,6 +292,7 @@ mod tests {
             "tokenizer_path": "m",
             "max_model_len": max_model_len,
             "default_max_tokens": 8192,
+            "template_efforts": [],
             "max_output_tokens": cap,
         }))
         .unwrap()
