@@ -495,14 +495,18 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
 
 # [MC 3/4] CMake build with HIP support + system install
 # RDMA and HIP are auto-installed together. Multi-protocol support preserves
-# both protocols and excludes HIP IPC for cross-host transfers.
+# both protocols and excludes HIP IPC for cross-host transfers. Without
+# ENABLE_KV_EVENTS (libzmq, from dependencies.sh), the master takes
+# -enable_kv_events but publishes nothing.
 RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
-        echo "========== [MC 3/4] Build and install Mooncake (USE_HIP=ON USE_HIP_DMABUF=ON ENABLE_MULTI_PROTOCOL=ON) =========="; \
+        echo "========== [MC 3/4] Build and install Mooncake (USE_HIP=ON USE_HIP_DMABUF=ON ENABLE_MULTI_PROTOCOL=ON ENABLE_KV_EVENTS=ON) =========="; \
         mkdir -p /app/mooncake/build && cd /app/mooncake/build \
         && cmake .. -DUSE_HIP=ON -DUSE_HIP_DMABUF=ON -DUSE_ETCD=ON \
-             -DENABLE_MULTI_PROTOCOL=ON \
+             -DENABLE_MULTI_PROTOCOL=ON -DENABLE_KV_EVENTS=ON \
         && { grep -qx 'ENABLE_MULTI_PROTOCOL:BOOL=ON' CMakeCache.txt \
              || { echo "ERROR: Mooncake multi-protocol support is required for cross-host RDMA with HIP"; exit 1; }; } \
+        && { grep -qx 'ENABLE_KV_EVENTS:BOOL=ON' CMakeCache.txt \
+             || { echo "ERROR: Mooncake was not configured ENABLE_KV_EVENTS=ON"; exit 1; }; } \
         && make -j$(nproc) && make install \
         && ldconfig \
         && echo "--- Clean up build artifacts ---" \

@@ -543,7 +543,9 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
 # USE_HIP_DMABUF must compile into rdma_transport (rdma_context.cpp). Without
 # hsa-runtime64, CMake silently disables dma-buf and GPU MRs stay on ibv_reg_mr.
 # ATOM consumes the TransferEngine (`mooncake.engine`) for P->D, and Mooncake
-# Store only with INSTALL_MOONCAKE_STORE=1. The Store's Rust bindings stay off:
+# Store only with INSTALL_MOONCAKE_STORE=1, its master publishing KV events
+# (ENABLE_KV_EVENTS; libzmq, from dependencies.sh: without it the master takes
+# -enable_kv_events but publishes nothing). The Store's Rust bindings stay off:
 # nothing here loads them, and WITH_STORE_RUST=ON is a hard error without
 # WITH_STORE.
 # HIP hipify copies tests/*.cpp into the build tree but not headers such as
@@ -552,7 +554,7 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
 RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
         MC_WITH_STORE=OFF; \
         if [ "${INSTALL_MOONCAKE_STORE}" = "1" ]; then MC_WITH_STORE=ON; fi; \
-        echo "========== [MC 3/4] Build and install Mooncake (USE_HIP=ON USE_HIP_DMABUF=${USE_HIP_DMABUF} ENABLE_MULTI_PROTOCOL=ON WITH_STORE=${MC_WITH_STORE}) =========="; \
+        echo "========== [MC 3/4] Build and install Mooncake (USE_HIP=ON USE_HIP_DMABUF=${USE_HIP_DMABUF} ENABLE_MULTI_PROTOCOL=ON WITH_STORE=${MC_WITH_STORE} ENABLE_KV_EVENTS=${MC_WITH_STORE}) =========="; \
         HSA_PREFIXS="/opt/rocm"; \
         for cfg in /opt/rocm/lib/cmake/hsa-runtime64/hsa-runtime64Config.cmake \
                    /opt/rocm/lib64/cmake/hsa-runtime64/hsa-runtime64Config.cmake; do \
@@ -562,6 +564,7 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
         && cmake .. -DUSE_HIP=ON -DUSE_HIP_DMABUF=${USE_HIP_DMABUF} -DUSE_ETCD=ON \
              -DENABLE_MULTI_PROTOCOL=ON \
              -DWITH_TE=ON -DWITH_STORE=${MC_WITH_STORE} -DWITH_STORE_RUST=OFF \
+             -DENABLE_KV_EVENTS=${MC_WITH_STORE} \
              -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF \
              -DCMAKE_PREFIX_PATH="${HSA_PREFIXS}${CMAKE_PREFIX_PATH:+:${CMAKE_PREFIX_PATH}}" \
              > /tmp/mooncake-cmake.log 2>&1 \
@@ -571,6 +574,8 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
              || { echo "ERROR: Mooncake multi-protocol support is required for cross-host RDMA with HIP"; exit 1; }; } \
         && { grep -qx "WITH_STORE:BOOL=${MC_WITH_STORE}" CMakeCache.txt \
              || { echo "ERROR: Mooncake was not configured WITH_STORE=${MC_WITH_STORE}"; exit 1; }; } \
+        && { grep -qx "ENABLE_KV_EVENTS:BOOL=${MC_WITH_STORE}" CMakeCache.txt \
+             || { echo "ERROR: Mooncake was not configured ENABLE_KV_EVENTS=${MC_WITH_STORE}"; exit 1; }; } \
         && if [ "${USE_HIP_DMABUF}" = "ON" ]; then \
              grep -q "HIP dmabuf MR registration enabled" /tmp/mooncake-cmake.log \
                || { echo "ERROR: HIP dma-buf was not enabled (hsa-runtime64 missing?)"; \
