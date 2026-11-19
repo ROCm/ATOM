@@ -1364,6 +1364,51 @@ def test_a_landed_state_slot_is_scattered_before_the_request_is_done(monkeypatch
     assert "r1" in conn.done_recving
 
 
+def test_a_raised_scatter_returns_its_staging_row(monkeypatch):
+    """The twin of the gather side's failure arm.
+
+    The row is handed back however the scatter leaves, and it has to be quiet
+    first: a scatter that raised partway still has copies in flight. Losing
+    one row parks every later receive on the pool, which has no acquire
+    timeout.
+    """
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    order = []
+    scatter_stream = SimpleNamespace(
+        synchronize=lambda: order.append("synchronize"),
+    )
+    monkeypatch.setattr(mc.torch.cuda, "Stream", lambda device: scatter_stream)
+    monkeypatch.setattr(mc.torch.cuda, "stream", contextlib.nullcontext)
+
+    def _boom(*args):
+        order.append("scatter")
+        raise RuntimeError("scatter blew up")
+
+    conn = _make_connector(
+        _staging_slots=mc.SlotPool(),
+        _scatter_slot=_boom,
+        _mla_landing=None,
+        _cuda_device=3,
+        _recv_scatter_streams=threading.local(),
+    )
+    release = conn._staging_slots.release
+    conn._staging_slots.release = lambda idx: (
+        order.append(("release", idx)),
+        release(idx),
+    )
+    conn._pending_recv_expected["r1"] = 1
+    conn._pending_recv.add("r1")
+    conn._pending_recv_slots["r1"] = (7, 3)
+
+    with pytest.raises(RuntimeError, match="scatter blew up"):
+        conn._record_write_done("r1", 0, 0, 0)
+
+    assert order == ["scatter", "synchronize", ("release", 3)]
+    assert conn._staging_slots.free == [3]
+
+
 def test_failed_write_done_without_a_staging_row_is_a_noop():
     """Block-only transfers reserve no row; the failure path must not crash."""
     mc = pytest.importorskip(
