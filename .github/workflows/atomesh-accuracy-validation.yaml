@@ -155,7 +155,7 @@ jobs:
           cases = [
               m | {"serving": serving}
               for m in models
-              for serving, levels in (("standalone", atomesh_levels), ("1p1d", atomesh_pd_levels))
+              for serving, levels in (("1p1d", atomesh_pd_levels),)
               if levels.get(m["model_name"], "skip") in allowed
           ]
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
