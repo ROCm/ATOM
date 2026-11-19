@@ -138,9 +138,12 @@ class SingleStepRound(DecodeRound):
         bookkeeping of ``cache.commit_tentative`` here, as the hi path's ``PostVerify.committed``. Any other step (anchors
         not the launch's verdict, a launch that did not stage every request's candidates) -> ATOM's commit, which rewrites
         the same rows where the kernel wrote them."""
+        runner = self.model.single_runner
+        if runner is not None:
+            # the step's output copies are queued now (ModelRunner's postprocess): the held draft launch after them
+            runner.launch_draft()
         if self.device is not None:
             self.device.committed(metadata, anchors)
-        runner = self.model.single_runner
         if runner is None or not runner.committed_in_kernel(anchors):
             return False
         cache = metadata.cache

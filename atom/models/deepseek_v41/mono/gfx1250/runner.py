@@ -244,6 +244,14 @@ class SingleStepRunner(StepInputs):
         self._eng_rows = None
         self._eng_staged = None
         self._adv = self._adv_next = self._com = False
+        # the verify's outputs for the host: a 2-slot pair the kernel writes (sample.OUT_SLOT_*), the step's slot in sparam
+        # row OUT_SLOT_ROW word 7 (``_sampling``); the draft launch waits until the step's output copies are queued
+        # (``launch_draft``: SingleStepRound.committed, else draft_ids, else the next launch)
+        SPF = self.K["sample"]
+        if MAX_STEP_ROWS > SPF.OUT_SLOT_ROW:
+            raise MonoUnsupported("sparam row of the output slot is a served row")
+        self._out_slot = 1
+        self._draft_pending = None
         # each request's first position of the step (its preparation writes it): where the decode round's next step
         # advances from (``round.SingleStepRound``)
         self.first_positions = torch.zeros(
@@ -324,7 +332,22 @@ class SingleStepRunner(StepInputs):
             ]
         return ids
 
+    def launch_draft(self) -> None:
+        """The step's draft launch, held back by ``launch`` until the host queued the copies of the step's outputs
+        (ModelRunner's sampled-id and status D2H on its copy stream, ``verify_outputs``' copies): queued after the draft,
+        a copy stream that shares the main stream's hardware queue ran them -- and every later operation -- after the
+        draft (profiler, CT11: one rank, a whole request, +30 us a step between the draft's end and the next target)."""
+        p = self._draft_pending
+        if p is None:
+            return
+        self._draft_pending = None
+        p[0](*p[1])
+        if not torch.cuda.is_current_stream_capturing() and self.K["attention"].DSTAMP:
+            self._log_dstamps()
+
     def launch(self, input_ids, forward_context, batch=None) -> None:
+        self.launch_draft()   # (a step whose draft no hook launched: before this step's target, in stream order)
+        self._out_slot ^= 1
         # the previous step's STOP copy (done long before: its output D2H waited for it; never waited for while a graph
         # captures -- the check then runs at the next eager launch)
         if not torch.cuda.is_current_stream_capturing():
@@ -413,10 +436,7 @@ class SingleStepRunner(StepInputs):
             first()
         # the verdict is ready here (and the target launch's stamps); the draft launch follows on the same stream
         self._ev_verify.record()
-        launches[1](*args)
-        if not torch.cuda.is_current_stream_capturing():
-            if self.K["attention"].DSTAMP:
-                self._log_dstamps()
+        self._draft_pending = (launches[1], args)
         self._qrow = self._qrow_next
 
     def _englook(self, er) -> None:
@@ -502,39 +522,29 @@ class SingleStepRunner(StepInputs):
 
     def verify_outputs(self, bs: int):
         """``(output_token_ids [bs, 6] int32, -1 past the emitted tokens; verdict [3, bs] int32: accepted drafts,
-        rejected drafts, anchor row)`` -- the kernel's verify (tail), copied out of the scratch the next launch
-        rewrites: on a side stream right after the first launch, so the host's wait for them (the step's output D2H,
-        ``verify_ready``) overlaps the draft launch; the caller's stream waits for the copies.
+        rejected drafts, anchor row)`` -- the kernel's verify (tail), in place: the step's slot of the 2-slot pair the
+        verify writes (the next launch writes the other; the one after reuses this, by when the host received every copy
+        of it). Produced on the caller's stream: its readers there need no wait. The output stream waits for the target
+        launch (``verify_ready``: ModelRunner's output D2H), and takes the STOP word and the stamps.
         """
-        cur = torch.cuda.current_stream()
+        SPF = self.K["sample"]
+        sl = self._out_slot
+        ob = self.scratch["outsl"]
+        out = ob[sl * SPF.OUT_SLOT_BYTES : (sl + 1) * SPF.OUT_SLOT_BYTES].view(torch.int32).view(8, ROWS_PER_REQ)[:bs]
+        vo = 2 * SPF.OUT_SLOT_BYTES + sl * SPF.VER_SLOT_BYTES
+        verdict = ob[vo : vo + SPF.VER_SLOT_BYTES].view(torch.int32).view(3, 8)[:, :bs]
         with torch.cuda.stream(self._verify_stream):
             self._verify_stream.wait_event(self._ev_verify)
-            out = (
-                self.scratch["outtok"]
-                .view(torch.int32)[: 8 * ROWS_PER_REQ]
-                .view(8, ROWS_PER_REQ)[:bs]
-                .clone()
-            )
-            verdict = (
-                self.scratch["verdict"]
-                .view(torch.int32)[:24]
-                .view(3, 8)[:, :bs]
-                .clone()
-            )
             self.verify_ready.record()
-            # after the event: the output D2H does not wait for it; the next launch reads it
             self._stop_host.copy_(self._stop, non_blocking=True)
             a_, b_ = self._ts_words
             self._ts_host.copy_(self.scratch["tcom"].view(torch.int64)[a_:b_], non_blocking=True)
             self._ts_owed = True
             self._stop_ready.record()
-        out.record_stream(cur)
-        verdict.record_stream(cur)
-        cur.wait_event(self.verify_ready)
         # the anchors this launch's verify committed in the kernel (``committed_in_kernel``) and that its successor's
-        # preparation may advance from (``advances``): the copy's row, as the round hands them back
+        # preparation may advance from (``advances``): the slot's row, as the round hands them back
         self._verdict_anchors = verdict[2].data_ptr() if bs else None
-        self._verdict_ref = verdict  # (held: no other tensor takes its address while the pointer checks below use it)
+        self._verdict_ref = verdict
         return out, verdict
 
     def committed_in_kernel(self, anchors) -> bool:
@@ -563,4 +573,5 @@ class SingleStepRunner(StepInputs):
     def draft_ids(self, bs: int):
         """The next step's drafts [bs, 5] int64 (the kernel's Markov block sampling, mids64), as ``Drafter.propose``
         returns: a view (the next draft launch rewrites it, after the next step's preparation has read it)."""
+        self.launch_draft()
         return self.scratch["mids64"].view(torch.int64)[: 8 * 5].view(8, 5)[:bs]

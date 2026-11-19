@@ -411,6 +411,8 @@ class StepInputs:
         ints[:n, 7] = ((self._step_no * 0xC2B2AE35 + sc[3]) & 0x7FFFFFFF).astype(
             np.int32
         )
+        # the output slot of this launch (``SingleStepRunner.verify_outputs``; sample.OUT_SLOT_ROW: never a served row)
+        ints[self.K["sample"].OUT_SLOT_ROW, 7] = getattr(self, "_out_slot", 0)
         sim = getattr(self, "sim_acc", None)
         if sim is not None:
             # forced acceptance: each request's bonus row carries (SIM_MAGIC, nf, fr) -- it verifies no draft, so the

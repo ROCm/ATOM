@@ -52,6 +52,9 @@ U_IDX = 0x40000000
 SIM_MAGIC = 0x53494D41
 NEG = -3e38
 PRB = 2048                   # LDS: P1's row records (CPR x (m, s), then CPR x (mq, sq, dx, -)), past P0's q statistics
+OUT_SLOT_ROW = 47            # (outsl) the sparam row whose word 7 holds the step's output slot (0 / 1): past every served row
+OUT_SLOT_BYTES = 8 * (ND + 1) * 4     # outtok [8][6] i32 a slot (2 slots), then verdict [3][8] i32 a slot (2 slots)
+VER_SLOT_BYTES = 3 * 8 * 4
 RACE_OFF = 6144              # LDS: (keepall) the race's CTA winner (8 B) + 32 z(x_k) slots, before ZOFF
 ZOFF = 8192                  # LDS: this CTA's z = l / T chunk [PT][256] f32, then the q row's d * invTd chunk (read once in P0)
 
@@ -144,7 +147,7 @@ def _bf_max64(x):
 
 @ASTRewriter.transform
 def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank, tag0, sp, qlog, dids, prow, outtok,
-                  verdict, anc, qids=None, ctxp=None, com=None):
+                  verdict, anc, qids=None, ctxp=None, com=None, outsl=None):
     t = hx.opaque_v(t)
     b = hx.opaque_s(b)
     row = b // CPR
@@ -569,12 +572,20 @@ def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank,
         for p in range_constexpr(ND):
             tff = (f == p).select(tid[p], tff)
         tf = (tf < I32(0)).select(fx.max(tff, I32(0)), tf)
-        for p in range_constexpr(ND):
-            hx.gstore(outtok + i64(rr * (ND + 1) + p) * 4, (I32(p) < f).select(xs[p], (I32(p) == f).select(tf, I32(-1))))
-        hx.gstore(outtok + i64(rr * (ND + 1) + ND) * 4, (f == ND).select(tf, I32(-1)))
-        hx.gstore(verdict + i64(rr) * 4, f)
-        hx.gstore(verdict + i64(NREQ + rr) * 4, I32(ND) - f)
-        hx.gstore(verdict + i64(2 * NREQ + rr) * 4, r0 + f)
+        # outsl (when given): the host's copies -- outtok / verdict also into the step's slot of a 2-slot pair (slot
+        # word: sparam row OUT_SLOT_ROW, word 7, host-written a step), read in place by the host's consumers (no clone)
+        o_out, o_ver = [outtok], [verdict]
+        if fx.const_expr(outsl is not None):
+            sl_ = hx.gload(sp + i64(OUT_SLOT_ROW * SPW + 7) * 4, I32)
+            o_out.append(outsl + i64(sl_) * OUT_SLOT_BYTES)
+            o_ver.append(outsl + i64(2 * OUT_SLOT_BYTES) + i64(sl_) * VER_SLOT_BYTES)
+        for o_ in range_constexpr(len(o_out)):
+            for p in range_constexpr(ND):
+                hx.gstore(o_out[o_] + i64(rr * (ND + 1) + p) * 4, (I32(p) < f).select(xs[p], (I32(p) == f).select(tf, I32(-1))))
+            hx.gstore(o_out[o_] + i64(rr * (ND + 1) + ND) * 4, (f == ND).select(tf, I32(-1)))
+            hx.gstore(o_ver[o_] + i64(rr) * 4, f)
+            hx.gstore(o_ver[o_] + i64(NREQ + rr) * 4, I32(ND) - f)
+            hx.gstore(o_ver[o_] + i64(2 * NREQ + rr) * 4, r0 + f)
         hx.gstore(anc + i64(rr) * 4, tf)
         if fx.const_expr(com is not None):
             commit(com, rr, f)
