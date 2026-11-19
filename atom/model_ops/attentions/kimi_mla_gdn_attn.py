@@ -186,6 +186,17 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             tensors.slot_regions, tensors.num_slots = self.state_slot_regions()
             return tensors
 
+        if config.pipeline_parallel_size > 1 and pooled_path_enabled(
+            self._kpool_size()
+        ):
+            # A pooled indexer's tail keys (`kpool_tail_cache`) are no slot
+            # region, so a PP prefill would leave them behind.
+            raise NotImplementedError(
+                f"{model_type} disaggregated serving does not support pipeline "
+                "parallelism with a pooled sparse indexer (index_kpool="
+                f"{self._kpool_size()}): its kpool tail cache is not transferred."
+            )
+
         tensors.slot_regions, tensors.num_slots = self.state_slot_regions()
         tensors.slot_region_tp_segments = self._kda_slot_tp_segments(
             len(tensors.slot_regions)
