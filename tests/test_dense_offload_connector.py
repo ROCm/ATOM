@@ -1164,25 +1164,25 @@ def test_a_multi_connector_cancel_re_arms_honestly(monkeypatch):
     sched._min_load_tokens = 0
     calls = []
     sched._lookup_client = as_lookup_client(_counting_lookup(calls, 16))
-    moriio_matched = {"yes": False}
+    moriio_queued = {"yes": False}
 
     def moriio_match(_seq):
-        if moriio_matched["yes"]:
-            return 0, False
-        moriio_matched["yes"] = True
-        return 16, True
+        return (0, False) if moriio_queued["yes"] else (16, True)
 
     moriio = SimpleNamespace(
         get_num_new_matched_tokens=moriio_match,
         cancel_pending_load=lambda seq: None,
+        update_state_after_alloc=lambda seq: moriio_queued.update(yes=True),
     )
     multi = MultiConnectorScheduler.__new__(MultiConnectorScheduler)
     multi._connectors = [moriio, sched]
     multi._load_winner = {}
     seq = _load_seq(64, num_prompt_tokens=24)
 
-    for _ in range(5):
+    for step in range(5):
         assert multi.get_num_new_matched_tokens(seq) == (16, True)
+        if step == 0:
+            moriio.update_state_after_alloc(seq)
         sched.build_connector_meta()
 
     assert calls == ["64"]

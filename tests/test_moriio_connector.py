@@ -37,6 +37,66 @@ def load_function(path: Path, name: str, namespace: dict | None = None):
     raise AssertionError(f"{name} not found in {path}")
 
 
+def load_method(path: Path, cls: str, name: str, namespace: dict | None = None):
+    """Execute one method of a class we cannot import, as a plain function."""
+    source = path.read_text()
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.ClassDef) and node.name == cls:
+            for item in node.body:
+                if isinstance(item, ast.FunctionDef) and item.name == name:
+                    scope: dict = dict(namespace or {})
+                    module = ast.Module([item], [])
+                    exec(compile(module, str(path), "exec"), scope)  # noqa: S102
+                    return scope[name]
+    raise AssertionError(f"{cls}.{name} not found in {path}")
+
+
+class RemotePrefillLookupTest(unittest.TestCase):
+    """The consumer's lookup keeps answering until its receive is queued."""
+
+    @classmethod
+    def setUpClass(cls):
+        import logging
+
+        namespace = {"logger": logging.getLogger("atom")}
+        cls.lookup = staticmethod(
+            load_method(
+                CONNECTOR, "MoRIIOConnectorScheduler", "get_num_new_matched_tokens"
+            )
+        )
+        cls.after_alloc = staticmethod(
+            load_method(
+                CONNECTOR,
+                "MoRIIOConnectorScheduler",
+                "update_state_after_alloc",
+                namespace,
+            )
+        )
+
+    def test_a_held_back_request_is_still_a_remote_load(self):
+        import types
+
+        sched = types.SimpleNamespace(
+            is_producer=False,
+            transfer_id_to_request_id={},
+            request_id_to_transfer_id={},
+            _reqs_need_recv={},
+        )
+        seq = types.SimpleNamespace(
+            id=7,
+            prompt_token_ids=[1, 2, 3],
+            block_table=[4],
+            state_slot=-1,
+            kv_transfer_params={"do_remote_prefill": True, "transfer_id": 7},
+        )
+        # Held back after the first yes (a full running set), asked again.
+        self.assertEqual(self.lookup(sched, seq), (3, True))
+        self.assertEqual(self.lookup(sched, seq), (3, True))
+        self.after_alloc(sched, seq)
+        self.assertEqual(self.lookup(sched, seq), (0, False))
+        self.assertIn(7, sched._reqs_need_recv)
+
+
 class PortOffsetTest(unittest.TestCase):
     """Side-channel ports must not collide across DP ranks."""
 
@@ -1489,19 +1549,6 @@ class SchedulerSlotTest(unittest.TestCase):
         }
         fields.update(attrs)
         return types.SimpleNamespace(**fields)
-
-    def test_the_lookup_answers_until_the_receive_is_queued(self):
-        sched = self.make(producer=False)
-        seq = self.seq(
-            kv_transfer_params={"do_remote_prefill": True, "transfer_id": 7},
-            prompt_token_ids=[1, 2, 3],
-            state_slot=-1,
-        )
-        # Held back after the first yes (a full running set), asked again.
-        self.assertEqual(sched.get_num_new_matched_tokens(seq), (3, True))
-        self.assertEqual(sched.get_num_new_matched_tokens(seq), (3, True))
-        sched.update_state_after_alloc(seq)
-        self.assertEqual(sched.get_num_new_matched_tokens(seq), (0, False))
 
     def test_the_producer_publishes_its_state_slot(self):
         sched = self.make(producer=True)
