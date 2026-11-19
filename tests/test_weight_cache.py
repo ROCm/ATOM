@@ -58,10 +58,10 @@ def test_checkpoint_rewritten_in_place_changes_the_key(tmp_path):
     assert key._checkpoint_digest(str(tmp_path)) != a
 
 
-def _key(tmp_path, monkeypatch, **settings):
-    """The key of a toy launch with ``settings`` on its config."""
+def _key_config(tmp_path, **settings):
+    """A toy launch's config with ``settings`` on it."""
     (tmp_path / "config.json").write_text("{}")
-    config = SimpleNamespace(
+    return SimpleNamespace(
         model=str(tmp_path),
         hf_config=SimpleNamespace(to_dict=lambda: {"hidden_size": 8}),
         parallel_config=SimpleNamespace(data_parallel_size=1, data_parallel_rank=0),
@@ -73,7 +73,10 @@ def _key(tmp_path, monkeypatch, **settings):
         enable_expert_parallel=False,
         **settings,
     )
-    return key.compute_key(config, 0)
+
+
+def _key(tmp_path, monkeypatch, **settings):
+    return key.compute_key(_key_config(tmp_path, **settings), 0)
 
 
 def test_the_key_holds_the_listed_settings_only(tmp_path, monkeypatch):
@@ -88,6 +91,34 @@ def test_the_key_holds_the_listed_settings_only(tmp_path, monkeypatch):
     monkeypatch.setenv("ATOM_LOADER_NUM_THREADS", "8")  # how it loads, not what
     diffs = key._diff_key(base, _key(tmp_path, monkeypatch, moe_backend="standard"))
     assert diffs == ["env.ATOM_MOE_GU_ITLV: daemon=None client=1"]
+
+
+def test_a_setting_of_a_sub_config_is_in_the_key(tmp_path, monkeypatch):
+    # Project-before-merge: loading then keeps a tensor the other way lacks.
+    off, on = (
+        _key(
+            tmp_path,
+            monkeypatch,
+            dcp_config=SimpleNamespace(enable_project_before_merge=pbm),
+        )
+        for pbm in (False, True)
+    )
+    name = "options.dcp_config.enable_project_before_merge"
+    assert key._diff_key(off, on) == [f"{name}: daemon=False client=True"]
+
+
+def test_the_daemons_key_names_the_checkpoint_as_loading_left_it(tmp_path, monkeypatch):
+    daemon = gpu_stack_import("atom.model_loader.weight_cache.daemon")
+    config = _key_config(tmp_path)
+
+    def load(config, build, load):  # the first load of a hub model downloads it
+        (tmp_path / "model.safetensors").write_bytes(b"\0" * 16)
+        return SimpleNamespace(model=nn.Linear(1, 1))
+
+    monkeypatch.setattr(daemon, "_load_and_export", load)
+    loader = daemon._DaemonLoad(0)
+    loader(config, None, torch.device("cpu"))
+    assert loader.key == key.compute_key(config, 0)  # as a server sees it now
 
 
 def test_the_quantization_config_is_in_the_key(tmp_path, monkeypatch):
@@ -903,15 +934,30 @@ def test_write_into_shared_weights_is_caught_after_the_writer_left(cache_dir):
         server.close()
 
 
-def test_in_use_by_others(cache_dir):
+def test_a_daemon_about_to_be_stopped_takes_no_server(cache_dir):
     path = os.path.join(transport.socket_dir(), "gpu_use.sock")
-    assert preload._in_use_by_others(path, wait_s=0.2) is None  # not serving
+    assert preload._hold_unused(path, wait_s=0.2) == (None, None)  # not serving
     server = transport._Server(path, {"key": 1}, {}, "t")
     try:
         conn, _ = _get(path)
-        assert "1 other running server" in preload._in_use_by_others(path, wait_s=0.2)
+        hold, why = preload._hold_unused(path, wait_s=0.2)
+        assert hold is None and "1 other running server" in why
         conn.close()
-        _wait_for(lambda: preload._in_use_by_others(path, wait_s=0.2) is None, 5)
+        hold, why = preload._hold_unused(path, wait_s=5)  # once it has gone
+        assert why is None
+        # Held: a server that arrives before the stop is turned away...
+        late = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        late.connect(path)
+        transport._send(late, {"cmd": "get", "who": "late"})
+        assert "shutting down" in transport._recv(late)["error"]
+        late.close()
+        # ...and so is another launch that wants to stop it.
+        assert "being stopped" in preload._hold_unused(path, wait_s=0.2)[1]
+        hold.close()  # let go without stopping it: it serves again
+        _wait_for(lambda: not server.held, 5)
+        conn, payload = _get(path)
+        assert payload["key"] == 1
+        conn.close()
     finally:
         server.close()
 
@@ -1028,7 +1074,7 @@ def loop(client, monkeypatch):
         "socket_path": lambda device: "/nonexistent/gpu.sock",
         "_started_by_launch": lambda: None,
         "launch_recorded": lambda: True,
-        "_in_use_by_others": lambda path: None,
+        "_hold_unused": lambda path: (None, None),
         "exported_structure": lambda built, export: calls.built,
         "apply_export": lambda model, export, device: 0,
         "apply_process": lambda export, device: 0,
@@ -1116,7 +1162,11 @@ def test_a_daemon_that_vanished_is_not_no_daemon(client, tmp_path):
 
 def test_no_rank_stops_a_daemon_another_rank_must_keep(client, monkeypatch):
     monkeypatch.setattr(client, "daemon_alive", lambda path: False)
-    monkeypatch.setattr(client, "_in_use_by_others", lambda path: None)  # fine here...
+    hold = SimpleNamespace(closed=False)
+    hold.close = lambda: setattr(hold, "closed", True)
+    monkeypatch.setattr(
+        client, "_hold_unused", lambda path: (hold, None)
+    )  # fine here...
     monkeypatch.setattr(
         client, "group_agree", lambda ok, group: False
     )  # ...not elsewhere
@@ -1125,6 +1175,7 @@ def test_no_rank_stops_a_daemon_another_rank_must_keep(client, monkeypatch):
     )
     with pytest.raises(RuntimeError):
         client._stop_together(client._Rank("TP0", "/x.sock", None, None), [], False)
+    assert hold.closed  # let go: the daemon it keeps serves again
 
 
 def test_a_gpu_no_daemon_had_is_not_waited_for(client, monkeypatch):
@@ -1139,7 +1190,7 @@ def test_a_gpu_no_daemon_had_is_not_waited_for(client, monkeypatch):
 def test_a_daemon_an_aborted_launch_left_goes_with_ones_own(client, monkeypatch):
     # It took the GPUs before this launch's own daemon could: not a failure.
     stopped = []
-    monkeypatch.setattr(client, "_in_use_by_others", lambda path: None)
+    monkeypatch.setattr(client, "_hold_unused", lambda path: (None, None))
     monkeypatch.setattr(client, "_stop_and_reclaim", lambda *a: stopped.append(a[0]))
     monkeypatch.setattr(client, "_pid_running", lambda pid, created=None: False)
     client._stop_together(
@@ -1262,7 +1313,9 @@ def test_loads_from_disk_when_no_daemon_can_start(loop, client, monkeypatch):
 
 def test_leaves_a_daemon_other_servers_use(loop, client, monkeypatch):
     monkeypatch.setattr(
-        client, "_in_use_by_others", lambda path: "1 other running server(s) use it"
+        client,
+        "_hold_unused",
+        lambda path: (None, "1 other running server(s) use it"),
     )
     loop.probes = [(True, ["atom/model_loader/loader.py:load_model"])]
     with pytest.raises(RuntimeError, match="other running server"):

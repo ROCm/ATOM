@@ -191,6 +191,7 @@ class _Server:
         self.connects = 0  # connections so far
         self.checked = 0  # connections the last clean check covered
         self.stopping = False
+        self.held = False  # for whoever is about to stop this daemon (_hold)
         self.idle_since = time.monotonic()
         # Listening before it appears under its name: a client that sees the
         # path can connect.
@@ -207,7 +208,7 @@ class _Server:
         ).start()
 
     def _idle_for(self) -> float:
-        busy = self.clients or self.pending
+        busy = self.clients or self.pending or self.held
         return 0.0 if busy else time.monotonic() - self.idle_since
 
     def watch_idle(self, timeout_s: int, on_idle, all_serving) -> None:
@@ -308,11 +309,14 @@ class _Server:
                     },
                 )
                 return
+            if req.get("cmd") == "hold":
+                self._hold(conn)
+                return
             if req.get("cmd") != "get":
                 _send(conn, {"error": f"unknown command {req.get('cmd')!r}"})
                 return
             with self._lock:
-                stopping = self.stopping
+                stopping = self.stopping or self.held
                 if not stopping:
                     self.pending += 1
             if stopping:
@@ -329,6 +333,26 @@ class _Server:
             logger.warning(f"{_TAG} {self.label}: request from {peer} failed: {e}")
         finally:
             conn.close()
+
+    def _hold(self, conn: socket.socket) -> None:
+        """For whoever is about to stop this daemon: if no server has its
+        weights now, none gets them while this connection stays open. Found
+        and refused under one lock, so no server slips in between."""
+        with self._lock:
+            held = not (self.pending or self.stopping or self.held)
+            self.held = self.held or held
+            clients = self.pending
+        _send(conn, {"held": held, "clients": clients})
+        if not held:
+            return
+        try:
+            with contextlib.suppress(OSError):
+                while conn.recv(1 << 12):
+                    pass
+        finally:  # gone without stopping the daemon: servers may come again
+            with self._lock:
+                self.held = False
+                self.idle_since = time.monotonic()
 
     def _serve(self, conn: socket.socket, peer: str) -> None:
         changed = self._check()

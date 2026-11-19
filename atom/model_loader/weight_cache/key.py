@@ -33,6 +33,8 @@ _CONFIG_FIELDS = (
     "decode_context_parallel_size",
     "dcp_config.enable_query_replication",
     "dcp_config.indexer_dcp_only",
+    # Whether loading keeps a DCP-wide copy of the MLA value projection.
+    "dcp_config.enable_project_before_merge",
 )
 # The environment variables that do, under the same rule.
 _ENV_VARS = (
@@ -100,21 +102,14 @@ def _setting(config, name: str) -> str:
     return str(config)
 
 
-def compute_key(config, rank: int) -> dict:
-    """Which checkpoint, drafter and shard, and the listed settings."""
-    hf = config.hf_config
-    try:
-        hf_dict = hf.to_dict()
-    except Exception:  # noqa: BLE001
-        hf_dict = vars(hf)
+def checkpoints(config) -> dict:
+    """The model's and the drafter's files as they are now. (A hub id names
+    a cache snapshot, which the first load fills.)"""
     from atom.model_loader.weight_utils import local_model_dir
 
-    pc = config.parallel_config
-    model_dir = local_model_dir(config.model)  # a hub id names a cache snapshot
     spec = config.speculative_config
-    quant = getattr(config, "quant_config", None)
     return {
-        "checkpoint": _checkpoint_digest(model_dir),
+        "checkpoint": _checkpoint_digest(local_model_dir(config.model)),
         # The daemon holds this drafter's weights too.
         "draft": (
             {
@@ -125,6 +120,20 @@ def compute_key(config, rank: int) -> dict:
             if spec
             else None
         ),
+    }
+
+
+def compute_key(config, rank: int) -> dict:
+    """Which checkpoint, drafter and shard, and the listed settings."""
+    hf = config.hf_config
+    try:
+        hf_dict = hf.to_dict()
+    except Exception:  # noqa: BLE001
+        hf_dict = vars(hf)
+    pc = config.parallel_config
+    quant = getattr(config, "quant_config", None)
+    return {
+        **checkpoints(config),
         "hf_config": hashlib.sha256(_json(hf_dict).encode()).hexdigest(),
         "rank": rank,
         # The shard a rank holds depends on the whole layout (EP spans DP).

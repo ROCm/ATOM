@@ -39,6 +39,7 @@ from atom.model_loader.weight_cache.export import (
     snapshot,
 )
 from atom.model_loader.weight_cache.key import (
+    checkpoints,
     compute_key,
     exported_structure,
     structure,
@@ -287,6 +288,9 @@ class _DaemonLoad:
         )
         if config.speculative_config:
             self.draft = _load_draft(config, device, self.rec.model, self.rank)
+        # As a server finds the files: the first load of a hub model downloads
+        # them, after the key was taken.
+        self.key.update(checkpoints(config))
         return self.rec.model
 
 

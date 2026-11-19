@@ -10,7 +10,7 @@ import datetime
 import sys
 import time
 
-from atom.model_loader.weight_cache.preload import stop_daemon
+from atom.model_loader.weight_cache.preload import _hold_unused, stop_daemon
 from atom.model_loader.weight_cache.transport import (
     _ping,
     daemon_state,
@@ -76,13 +76,25 @@ def _stop(launches: dict, force: bool) -> int:
             )
             rc = 1
             continue
+        holds = []
         try:
+            if not force:
+                # Held, so no server takes the weights before the stop.
+                for path, _ in gpus:
+                    conn, why = _hold_unused(path, wait_s=0)
+                    holds.append(conn)
+                    if why:
+                        raise RuntimeError(f"{why}, or pass --force")
             for path, _ in gpus:
                 stop_daemon(path)  # the first one stops the whole launch
         except Exception as e:  # noqa: BLE001
             print(f"daemon pid {main_pid}: {e}")
             rc = 1
             continue
+        finally:
+            for conn in holds:
+                if conn is not None:
+                    conn.close()
         note = (
             f"; {servers} running server(s) keep its weights until they exit"
             if servers

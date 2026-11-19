@@ -10,6 +10,7 @@ import glob
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -17,7 +18,8 @@ import time
 import psutil
 
 from atom.model_loader.weight_cache.transport import (
-    _ping,
+    _recv,
+    _send,
     daemon_alive,
     daemon_state,
     socket_dir,
@@ -254,28 +256,40 @@ def stop_daemon(path: str, timeout_s: float = 180) -> int | None:
     return main
 
 
-def _in_use_by_others(path: str, wait_s: float = 5) -> str | None:
-    """Why this GPU's daemon must not be replaced (None: it may be)."""
+def _hold_unused(path: str, wait_s: float = 5):
+    """Before stopping this GPU's daemon. (connection, None): no server uses
+    it, and none gets its weights while the connection is open. (None, None):
+    no daemon serves here. (None, why): it must not be stopped."""
     deadline = time.monotonic() + wait_s
     while True:  # this server has just closed its own connection
+        others = None
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            others = _ping(path).get("clients", 0)
+            sock.settimeout(10)
+            sock.connect(path)
+            _send(sock, {"cmd": "hold"})
+            reply = _recv(sock)
+            if reply.get("held"):
+                sock.settimeout(None)
+                return sock, None
+            others = reply.get("clients") or None  # none: it is being stopped
         except FileNotFoundError:
-            return None  # not serving (yet): nobody can be connected
+            sock.close()
+            return None, None  # not serving (yet): nobody can be connected
         except ConnectionRefusedError:
             if not daemon_alive(path):
-                return None  # it has stopped serving and exited
-            others = None  # stopping: let it finish
+                sock.close()
+                return None, None  # it has stopped serving and exited
         except Exception as e:  # noqa: BLE001 - every rank must reach the agreement
-            return f"could not ask the daemon whether servers use it: {e!r}"
-        if others == 0:
-            return None
+            sock.close()
+            return None, f"could not ask the daemon whether servers use it: {e!r}"
+        sock.close()
         if time.monotonic() > deadline:
             break
         time.sleep(0.1)
     if others is None:
-        return "the daemon holds this GPU but does not answer"
-    return (
+        return None, "the daemon on this GPU is being stopped, or does not answer"
+    return None, (
         f"{others} other running server(s) use the daemon's weights on this GPU; they keep "
         "them in memory, so a new daemon would not fit. Stop them first"
     )

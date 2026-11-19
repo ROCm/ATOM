@@ -34,7 +34,7 @@ from atom.model_loader.weight_cache.key import (
     structure,
 )
 from atom.model_loader.weight_cache.preload import (
-    _in_use_by_others,
+    _hold_unused,
     _pid_running,
     _spawn_daemon,
     _started_by_launch,
@@ -269,19 +269,24 @@ def _stop_together(me: _Rank, why, held: bool, pid=None, started=None) -> None:
     any rank's. With ``started``, this launch's own, that one goes too,
     whichever holds the GPUs (an aborted launch may have left one starting,
     which then took them first). Returns once the memory is free."""
-    err = _in_use_by_others(me.path)
-    if not group_agree(err is None, me.group):
-        raise _fail(me.label, ([err] if err else []) + why, pid)
-    err = None
+    # Held from here: no server takes the weights between this check, the
+    # ranks' agreement and the stop. Let go, the daemon serves again.
+    hold, err = _hold_unused(me.path)
     try:
-        _stop_and_reclaim(me.path, me.device, held)
-        if started is not None and _is_running(started):
-            with contextlib.suppress(ProcessLookupError):  # another rank's did
-                os.kill(started["pid"], signal.SIGTERM)  # it never took a GPU
-    except Exception as e:  # noqa: BLE001 - every rank must reach the agreement
-        err = f"could not stop the daemon: {e}"
-    if not group_agree(err is None, me.group):
-        raise _fail(me.label, [err] if err else [], pid)
+        if not group_agree(err is None, me.group):
+            raise _fail(me.label, ([err] if err else []) + why, pid)
+        err = None
+        try:
+            _stop_and_reclaim(me.path, me.device, held)
+            if started is not None and _is_running(started):
+                with contextlib.suppress(ProcessLookupError):  # another rank's did
+                    os.kill(started["pid"], signal.SIGTERM)  # it never took a GPU
+        except Exception as e:  # noqa: BLE001 - every rank must reach the agreement
+            err = f"could not stop the daemon: {e}"
+        if not group_agree(err is None, me.group):
+            raise _fail(me.label, [err] if err else [], pid)
+    finally:
+        _close(hold)
 
 
 def _replace_daemon(me: _Rank, reasons, held, pid, started, present) -> dict | None:
