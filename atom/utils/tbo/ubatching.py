@@ -98,6 +98,54 @@ class DPSyncResult:
         return any(self.prefill_across_dp)
 
 
+def _gloo_all_gather(local: torch.Tensor, dp_size: int, dp_group) -> list:
+    gathered = [torch.empty_like(local) for _ in range(dp_size)]
+    torch.distributed.all_gather(gathered, local, group=dp_group)
+    return gathered
+
+
+# (n_fields, dp_size) -> (side stream, device src, device dst, pinned host dst)
+_DEVICE_SYNC_STATE: dict = {}
+_DEVICE_SYNC_CALLS = [0]
+
+
+def _device_all_gather(local: torch.Tensor, dp_size: int, dp_group) -> torch.Tensor:
+    """`local` from every DP rank as a [dp_size, n] CPU tensor, over the DP
+    device group on a side stream, so it does not queue behind compute."""
+    from aiter.dist.parallel_state import get_dp_group
+
+    n = local.numel()
+    state = _DEVICE_SYNC_STATE.get((n, dp_size))
+    if state is None:
+        dev = torch.device("cuda", torch.cuda.current_device())
+        state = (
+            torch.cuda.Stream(device=dev),
+            torch.empty(n, dtype=torch.int32, device=dev),
+            torch.empty(dp_size * n, dtype=torch.int32, device=dev),
+            torch.empty(dp_size * n, dtype=torch.int32, device="cpu", pin_memory=True),
+        )
+        _DEVICE_SYNC_STATE[(n, dp_size)] = state
+    stream, src, dst, host = state
+    with torch.cuda.stream(stream):
+        src.copy_(local)
+        torch.distributed.all_gather_into_tensor(
+            dst, src, group=get_dp_group().device_group
+        )
+        host.copy_(dst, non_blocking=True)
+    stream.synchronize()
+    out = host.view(dp_size, n).clone()
+    verify = envs.ATOM_DP_SYNC_VERIFY
+    if verify > 0:
+        _DEVICE_SYNC_CALLS[0] += 1
+        if _DEVICE_SYNC_CALLS[0] % verify == 0:
+            ref = torch.stack(_gloo_all_gather(local, dp_size, dp_group))
+            if not torch.equal(ref, out):
+                raise RuntimeError(
+                    f"DP sync mismatch: device {out.tolist()} vs gloo {ref.tolist()}"
+                )
+    return out
+
+
 def sync_dp_metadata(
     *,
     dp_group,
@@ -186,11 +234,13 @@ def sync_dp_metadata(
     # A group of one is its own row, with nothing to exchange.
     gathered = [local]
     if dp_size > 1:
-        gathered = [
-            torch.empty(n_fields, dtype=torch.int32, device="cpu")
-            for _ in range(dp_size)
-        ]
-        torch.distributed.all_gather(gathered, local, group=dp_group)
+        if (
+            envs.ATOM_DP_SYNC_BACKEND == "rccl"
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            gathered = list(_device_all_gather(local, dp_size, dp_group).unbind(0))
+        else:
+            gathered = _gloo_all_gather(local, dp_size, dp_group)
     sync = torch.stack(gathered, dim=1).numpy()  # [n_fields, dp_size]
 
     scheduled_tokens_per_dp_rank = sync[0]
