@@ -26,6 +26,7 @@ limitations](observability/README.md).
 | **ATOM_DP_RANK** | int | 0 | The rank ID for the current process in data parallelism. |
 | **ATOM_DP_RANK_LOCAL** | int | 0 | The local rank ID for the current process (used in SPMD mode). |
 | **ATOM_DP_SIZE** | int | 1 | Total number of data parallel ranks. |
+| **ATOM_DP_SYNC_INTERVAL** | int | 1 | Sync the DP engine state every N paired busy rounds while the group has unfinished work. Values below 1 use 1. All DP ranks must use the same value; a mismatch raises on every rank before the busy loop. Idle and held phases sync every round. Utility commands wait for the next sync round. |
 | **ATOM_DP_MASTER_IP** | str | 127.0.0.1 | Master IP address for DP ranks coordination. |
 | **ATOM_DP_MASTER_PORT** | int | 29500 | Master port for DP ranks coordination. |
 | **ATOM_MULTINODE_PG_TIMEOUT_S** | int | 7200 | When the DP group (`data_parallel_size_local < data_parallel_size`) or the TP group (`--tensor-parallel-size-local`) has ranks on other nodes, the floor, in seconds, for the timeout of process groups created without one, such as the default group and aiter's gloo and NCCL groups (torch's own defaults are 30 minutes for gloo, 10 for NCCL). It raises the defaults and never lowers them. |

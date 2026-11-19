@@ -2,10 +2,12 @@
 
 
 class DPSyncGate:
-    """Skip the DP state all_reduce between syncs that found every rank busy.
+    """Skip the DP state all_reduce while the group has unfinished work.
 
     Every rank feeds it the same all_reduce results and runs the same number of
     busy rounds between syncs, so every rank syncs on the same round.
+    Ranks with no local work still complete a paired dummy step. All ranks
+    must use the same interval.
     ``interval == 1`` syncs every round.
     """
 

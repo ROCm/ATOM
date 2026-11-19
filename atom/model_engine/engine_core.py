@@ -1118,8 +1118,10 @@ class DPEngineCoreProc(EngineCore):
         shutdown = False
         metrics_interval = envs.ATOM_METRICS_UPDATE_INTERVAL_S
         next_metrics_push = 0.0
-        gate = DPSyncGate(envs.ATOM_DP_SYNC_INTERVAL)
         try:
+            gate = DPSyncGate(
+                self._validate_dp_sync_interval(envs.ATOM_DP_SYNC_INTERVAL)
+            )
             while True:
                 sync_now = gate.should_sync()
                 if sync_now:
@@ -1150,7 +1152,8 @@ class DPEngineCoreProc(EngineCore):
                     )
                     gate.synced(global_has_unfinished, global_shutdown, global_held)
                 else:
-                    # The last sync found every rank busy: stay paired.
+                    # The last sync found unfinished work in the group: stay
+                    # paired, including a dummy on ranks with no local work.
                     global_has_unfinished, global_shutdown, global_held = (
                         True,
                         False,
@@ -1204,6 +1207,25 @@ class DPEngineCoreProc(EngineCore):
                 self.scheduler.close_kv_connector()
             finally:
                 tracing.shutdown()
+
+    def _validate_dp_sync_interval(self, interval: int) -> int:
+        """Reject different sync cadences before any rank enters the busy loop.
+
+        One MAX reduction gives both bounds. Every rank sees the same mismatch
+        and raises, rather than pairing a state collective with a peer's model
+        collective on the first skipped round.
+        """
+        bounds = torch.tensor([interval, -interval], dtype=torch.int64, device="cpu")
+        torch.distributed.all_reduce(
+            bounds, op=torch.distributed.ReduceOp.MAX, group=self.dp_group
+        )
+        highest, lowest = bounds[0].item(), -bounds[1].item()
+        if highest != lowest:
+            raise ValueError(
+                "ATOM_DP_SYNC_INTERVAL must match on every DP rank; "
+                f"got values from {lowest} to {highest}"
+            )
+        return interval
 
     def _execute_dummy_batch(self):
         fwd_out = self.runner_mgr.call_func("dummy_execution", wait_out=True)

@@ -633,6 +633,23 @@ the whole group. Conflating the two is the classic multi-node bug — global ran
 drive process groups and expert sharding, local ranks drive GPU index, NUMA
 binding, and MoRI's `gpu_per_node`.
 
+### DP state sync interval
+
+`ATOM_DP_SYNC_INTERVAL=N` reduces CPU Gloo state synchronization to once per
+N paired engine rounds while the DP group has unfinished work. A rank with no
+local batch completes a dummy step alongside its peers. The default `1` keeps
+per-round synchronization; idle and held phases also synchronize every round.
+
+Set the same value on every node before starting the engines. One startup
+collective checks the minimum and maximum interval, and every rank raises on
+a mismatch before entering the busy loop. Restart to change the interval.
+
+Utility commands are applied on sync rounds. A command queued just after a
+sync can wait through the next N-1 paired rounds; this is a bound in engine
+rounds, not seconds, and includes the time to finish the current forward.
+Shutdown is observed on a sync round and still drains unfinished work before
+exit. Validate command latency and multi-node correctness before selecting N.
+
 ### Ports
 
 Engine sockets are derived from the DP master port; both ends compute them
