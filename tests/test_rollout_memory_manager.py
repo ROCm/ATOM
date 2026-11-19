@@ -189,7 +189,6 @@ def test_release_kv_cache_unbinds_the_routed_experts_capture(monkeypatch):
 def test_wake_rebinds_a_new_routed_experts_capture(monkeypatch):
     """Wake's `allocate_kv_cache` binds a fresh capturer at the slept block
     count, and the MoE layer captures into it rather than the freed one."""
-    from atom.model_engine.model_runner import ModelRunner
     from atom.model_ops.fused_moe.routed_experts_capturer import (
         ROUTES_VIEW_ATTR,
         RoutedExpertsCapturer,
@@ -206,12 +205,22 @@ def test_wake_rebinds_a_new_routed_experts_capture(monkeypatch):
         device="cpu",
     )
     runner._get_models_with_kv = lambda: [runner.model]
-    runner._routed_experts_geometry = lambda: (2, 2)
-    runner._routed_experts_layers = lambda: [(moe, 1)]
-    # The part of `allocate_kv_cache` that binds the capture.
-    runner.allocate_kv_cache = lambda n: ModelRunner._bind_routed_experts_layers(
-        runner, n
-    )
+    allocated = []
+
+    def allocate_kv_cache(num_blocks):
+        # The part of `allocate_kv_cache` that binds the capture
+        # (`ModelRunner._bind_routed_experts_layers`).
+        allocated.append(num_blocks)
+        capturer = RoutedExpertsCapturer(
+            num_slots=num_blocks * runner.block_size,
+            num_layers=2,
+            top_k=2,
+            device=runner.device,
+        )
+        capturer.bind(moe, 1)
+        runner._routed_experts_capturer = capturer
+
+    runner.allocate_kv_cache = allocate_kv_cache
     monkeypatch.setattr(memory_manager, "set_kv_cache_data", lambda _value: None)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (0, 1))
@@ -223,6 +232,7 @@ def test_wake_rebinds_a_new_routed_experts_capture(monkeypatch):
     MemoryManagerMixin._release_kv_cache(runner)
     MemoryManagerMixin._resume_kv_cache(runner)
 
+    assert allocated == [7, 7]
     woken = runner._routed_experts_capturer
     assert isinstance(woken, RoutedExpertsCapturer) and woken is not slept
     assert woken.buffer.shape == slept.buffer.shape
