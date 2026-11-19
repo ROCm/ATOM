@@ -2762,11 +2762,166 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
         return views
 
 
+class A16W4MoEMethod(Mxfp4MoEMethod):
+    """Native MXFP4 experts over BF16 activations, with the existing TP loader."""
+
+    def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
+        super().__init__(quant_config, moe)
+        self.pad_align = 128
+        self.fp8_activations = False
+        self.is_guinterleave = False
+        self.static_input_scales = False
+        self.use_triton = False
+        self.use_triton_ep = False
+        self.use_triton_decode = False
+
+    def _process_weight_layout_after_loading(self, layer) -> None:
+        if layer.activation != ActivationType.Silu or not layer.swiglu_limit > 0:
+            raise RuntimeError("A16W4 requires clamped SiLU")
+        if layer.has_bias or layer.num_fused_shared_experts:
+            raise RuntimeError(
+                "A16W4 requires bias-free routed experts and separate shared experts"
+            )
+        if self.hidden_pad or self.hidden_size % 128:
+            raise RuntimeError(
+                "A16W4 requires an unpadded hidden dimension divisible by 128"
+            )
+        from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
+
+        logical = layer.intermediate_size_per_partition
+        physical = self.intermediate_size
+        if logical % 32:
+            raise ValueError(
+                "the logical intermediate dimension must align with the MXFP4 scale groups"
+            )
+        if layer.w13_weight.shape != (
+            self.num_experts,
+            2 * physical,
+            self.hidden_size // 2,
+        ):
+            raise RuntimeError("A16W4 gate/up loader produced an incompatible TP shard")
+        if layer.w2_weight.shape != (self.num_experts, self.hidden_size, physical // 2):
+            raise RuntimeError("A16W4 down loader produced an incompatible TP shard")
+        # The existing loader already writes gate and up into their physical halves.
+        # Padding bytes were zeroed at allocation; do not concatenate them again.
+        layer.w13_weight_scale.data[:, logical:physical].fill_(127)
+        layer.w13_weight_scale.data[:, physical + logical : 2 * physical].fill_(127)
+        layer.w2_weight_scale.data[:, :, logical // 32 :].fill_(127)
+        layer.w13_weight.data = shuffle_weight_a16w4(
+            layer.w13_weight.data.view(dtypes.fp4x2), 16, False
+        ).view(torch.uint8)
+        layer.w2_weight.data = shuffle_weight_a16w4(
+            layer.w2_weight.data.view(dtypes.fp4x2), 16, False
+        ).view(torch.uint8)
+        layer.w13_weight_scale.data = shuffle_scale_a16w4(
+            layer.w13_weight_scale.data.flatten(0, 1).view(dtypes.fp8_e8m0),
+            self.num_experts,
+            False,
+        ).view(torch.uint8)
+        layer.w2_weight_scale.data = shuffle_scale_a16w4(
+            layer.w2_weight_scale.data.flatten(0, 1).view(dtypes.fp8_e8m0),
+            self.num_experts,
+            False,
+        ).view(torch.uint8)
+        layer.w13_weight.is_shuffled = True
+        layer.w2_weight.is_shuffled = True
+        logger.info(
+            "A16W4MoEMethod: native MXFP4/BF16, E=%d hidden=%d logical_inter=%d physical_inter=%d",
+            self.num_experts,
+            self.hidden_size,
+            logical,
+            physical,
+        )
+
+    @mark_trace
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        global_num_experts: int = -1,
+        expert_map: torch.Tensor | None = None,
+        apply_router_weight_on_input: bool = False,
+        activation: ActivationType = ActivationType.Silu,
+        prefix: str = "",
+        x_scale: torch.Tensor | None = None,
+        scheduled_tokens_gpu: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if (
+            expert_map is not None
+            or apply_router_weight_on_input
+            or x_scale is not None
+        ):
+            raise RuntimeError(
+                "A16W4 does not support EP, input router weighting, or prequantized activations"
+            )
+        if activation != ActivationType.Silu or x.dtype != torch.bfloat16:
+            raise RuntimeError("A16W4 requires BF16 activations and SiLU")
+        from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import flydsl_a16w4_moe
+
+        from atom.model_ops.fused_moe.a16w4_routing import prepare_a16w4_routes
+
+        ids, weights = prepare_a16w4_routes(
+            topk_ids, topk_weights, self.num_experts, scheduled_tokens_gpu
+        )
+        return flydsl_a16w4_moe(
+            hidden_states=x.contiguous(),
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            topk_ids=ids,
+            topk_weights=weights,
+            swiglu_limit=layer.swiglu_limit,
+            logical_inter_dim=layer.intermediate_size_per_partition,
+            activation_bf16=False,
+            tiles=None,
+        )
+
+
 def _make_mxfp4_moe_method(
     quant_config: LayerQuantConfig, moe: FusedMoEConfig
 ) -> Mxfp4MoEMethod:
+    atom_config = get_current_atom_config()
+    if envs.ATOM_DSV41_A16W4_MOE:
+        # Fail-closed: only DSV41 TP4 with raw MXFP4 weights and compatible topology.
+        model_type = getattr(
+            getattr(atom_config, "hf_config", None), "model_type", None
+        )
+        if model_type not in ("deepseek_v41", "deepseek_v41_text"):
+            raise RuntimeError(
+                f"ATOM_DSV41_A16W4_MOE is not supported for model_type={model_type}"
+            )
+        if get_gfx() != "gfx942":
+            raise RuntimeError("ATOM_DSV41_A16W4_MOE requires gfx942")
+        if moe.moe_parallel_config.tp_size != 4:
+            raise RuntimeError(
+                f"ATOM_DSV41_A16W4_MOE requires TP4, got TP{moe.moe_parallel_config.tp_size}"
+            )
+        if (
+            moe.use_ep
+            or sp_is_enabled()
+            or atom_config.moe_backend == "mega"
+            or moe.moe_parallel_config.dp_size != 1
+            or atom_config.prefill_context_parallel_size != 1
+            or atom_config.enable_dp_attention
+            or atom_config.speculative_config is not None
+        ):
+            raise RuntimeError(
+                "ATOM_DSV41_A16W4_MOE supports only the standard TP path"
+            )
+        if getattr(atom_config, "eplb_enable", False) or envs.ATOM_MOE_GU_ITLV:
+            raise RuntimeError(
+                "ATOM_DSV41_A16W4_MOE does not support EPLB or interleaved communication fusion"
+            )
+        if atom_config.quant_config.online_quant:
+            raise RuntimeError(
+                "ATOM_DSV41_A16W4_MOE requires native MXFP4 experts, not online re-quantization"
+            )
+        return A16W4MoEMethod(quant_config, moe)
     # Under SP, `mega` runs SP MegaMoE over the native weights instead.
-    if get_current_atom_config().moe_backend == "mega" and not sp_is_enabled():
+    if atom_config.moe_backend == "mega" and not sp_is_enabled():
         return MegaMxfp4MoEMethod(quant_config, moe)
     return Mxfp4MoEMethod(quant_config, moe)
 

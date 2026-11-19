@@ -3722,6 +3722,8 @@ class Config:
         # shared_experts() and how many experts it routes over (129 / top-5 vs
         # 128 / top-4), so it changes the compiled graph the same way.
         factors.append(bool(envs.ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4))
+        if envs.ATOM_DSV41_A16W4_MOE:
+            factors.append("dsv41_a16w4_moe")
         # The sparse-attention indexer bakes max_model_len and max_num_seqs into
         # the graph as constants, so a cache built for a smaller max_model_len
         # faults on the first decode past the old width.

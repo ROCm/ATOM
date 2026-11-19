@@ -38,6 +38,7 @@ from atom.model_ops.utils import atom_parameter
 from atom.models.deepseek_v4 import DeepseekV4Args
 from atom.models.deepseek_v4 import MoE as V4MoE
 from atom.models.deepseek_v41.config import FP4PTPC_RECIPE
+from atom.utils import envs
 from atom.utils.forward_context import get_forward_context, pass_scheduled_tokens_gpu
 
 
@@ -62,7 +63,11 @@ class MoE(V4MoE):
     ):
         args = DeepseekV4Args.from_hf_config(config)
         args.quant_config = quant_config
-        args.moe_fp8_activations = True
+        if envs.ATOM_DSV41_A16W4_MOE and config.fp4ptpc:
+            raise ValueError(
+                "ATOM_DSV41_A16W4_MOE requires the native checkpoint, not FP4PTPC"
+            )
+        args.moe_fp8_activations = not envs.ATOM_DSV41_A16W4_MOE
         super().__init__(layer_id, args, prefix=prefix, alt_stream=alt_stream)
         if config.fp4ptpc and not self._fuse_shared_into_routed:
             # Standalone, the per-channel FP8 shared expert has no GEMM at TP4.
