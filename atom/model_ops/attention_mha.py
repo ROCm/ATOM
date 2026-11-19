@@ -1568,6 +1568,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         block_table,
         row_req,
         row_seq,
+        page_table,
+        plan_step_owner=None,
+        plan_cache_owner=None,
     ):
         from atom.model_ops.minimax_m3.sparse_attn_nvfp4 import (
             check_nvfp4_sparse_attention,
@@ -1590,6 +1593,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             row_req,
             row_seq,
             self.scale,
+            page_table=page_table,
+            plan_step_owner=plan_step_owner,
+            plan_cache_owner=plan_cache_owner,
         )
 
     def _fused_verify_topk(self, index_q, max_query_len: int) -> bool:
@@ -1730,6 +1736,14 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             prefill_md.max_seq_len,
         )
         cached_topk = self._load_cached_topk(sparse_metadata, topk_key)
+        if self.kv_nvfp4:
+            from atom.model_ops.minimax_m3.sparse_attn_nvfp4 import prefill_rows
+
+            row_req, row_seq = self._row_map(
+                prefill_md,
+                ("prefill", q.shape[0]),
+                lambda: prefill_rows(cu_seqlens_q, prefix_lens, q.shape[0]),
+            )
         if cached_topk is None:
             if index_q is None:
                 raise RuntimeError("MiniMax-M3 index cache miss on a skip-index layer")
@@ -1763,19 +1777,22 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             topk_idx, sparse_bt, sparse_ctx = (
                 selected if emit else (selected, None, None)
             )
+            if self.kv_nvfp4:
+                # gfx1250: the paged decode's compacted page-128 table, shared
+                # with the skip-index layers through the top-k cache.
+                from atom.model_ops.minimax_m3.sparse_attn_nvfp4 import (
+                    nvfp4_page_table,
+                )
+
+                sparse_bt, sparse_ctx = nvfp4_page_table(
+                    topk_idx, block_tables, row_req, row_seq
+                )
             self._store_cached_topk(
                 sparse_metadata, topk_key, (topk_idx, sparse_bt, sparse_ctx)
             )
         else:
             topk_idx, sparse_bt, sparse_ctx = cached_topk
         if self.kv_nvfp4:
-            from atom.model_ops.minimax_m3.sparse_attn_nvfp4 import prefill_rows
-
-            row_req, row_seq = self._row_map(
-                prefill_md,
-                ("prefill", q.shape[0]),
-                lambda: prefill_rows(cu_seqlens_q, prefix_lens, q.shape[0]),
-            )
             output = self._nvfp4_attention(
                 q,
                 k_cache,
@@ -1786,6 +1803,11 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 block_tables,
                 row_req,
                 row_seq,
+                (sparse_bt, sparse_ctx),
+                # As the FP8 path: one plan refresh a step while the tail
+                # block is forced; the plan and scratch live with the step.
+                plan_step_owner=prefill_md if self.local_blocks >= 1 else None,
+                plan_cache_owner=prefill_md,
             )
         else:
             output = torch.empty_like(q)
@@ -1970,6 +1992,17 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 topk_idx, sparse_bt, sparse_ctx = (
                     selected if emit else (selected, None, None)
                 )
+            if self.kv_nvfp4:
+                # gfx1250: the paged decode's compacted page-128 table (the CP
+                # merge's page-16 one is not it), shared with the skip-index
+                # layers through the top-k cache.
+                from atom.model_ops.minimax_m3.sparse_attn_nvfp4 import (
+                    nvfp4_page_table,
+                )
+
+                sparse_bt, sparse_ctx = nvfp4_page_table(
+                    topk_idx, decode_md.block_table, row_req, row_seq
+                )
             self._store_cached_topk(
                 sparse_metadata, topk_key, (topk_idx, sparse_bt, sparse_ctx)
             )
@@ -1986,6 +2019,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 decode_md.block_table,
                 row_req,
                 row_seq,
+                (sparse_bt, sparse_ctx),
+                # Once per step only when the tail block is forced (see sparse_attn).
+                plan_step_owner=decode_md if self.local_blocks >= 1 else None,
             )
         else:
             output = torch.empty_like(q)

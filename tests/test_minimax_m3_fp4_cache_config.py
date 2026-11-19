@@ -30,8 +30,10 @@ HEADS, KV_HEADS = 64, 4
         ("gfx950", True, False, 4, False, None),
         ("gfx950", True, True, 4, False, None),  # TP4: 16 q heads per kv head
         ("gfx950", True, True, 2, False, None),  # TP2: 32 / 2 = 16
-        ("gfx942", True, False, 4, False, "need gfx950"),
-        ("gfx942", False, True, 4, False, "need gfx950"),
+        ("gfx942", True, False, 4, False, "need gfx950 or gfx1250"),
+        ("gfx942", False, True, 4, False, "need gfx950 or gfx1250"),
+        ("gfx1250", True, True, 4, False, None),  # FlyDSL paged decode, unfused top-k
+        ("gfx1250", False, True, 8, False, "got 8 at TP8"),
         ("gfx950", False, True, 8, False, "got 8 at TP8"),  # kv heads replicate
         ("gfx950", True, False, 8, False, None),  # FP4 index alone has no head rule
         ("gfx950", False, True, 4, True, "top-k-reusing"),

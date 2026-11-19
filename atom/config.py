@@ -1941,9 +1941,11 @@ def m3_fp4_cache_unsupported_reason(
     """Why MiniMax-M3's FP4 index cache / NVFP4 sparse KV cannot run here, or None.
 
     Pure for the same reason as ``indexer_cp_unsupported_reason``. Both caches
-    decode e2m1 with a gfx950-only instruction. The NVFP4 attention kernel
-    serves 16 q heads per kv head on a rank (M3.1 at TP4: 16 / 1) and only layers
-    that run their own indexer: a layer reusing the previous top-k writes no
+    run on gfx950 (Gluon attention and fused verify top-k, hardware e2m1
+    decode) and gfx1250 (aiter's FlyDSL paged decode, unfused score + top-k,
+    integer e2m1 decode). The NVFP4 attention serves 16 q heads per kv head on a
+    rank (M3.1 at TP4: 16 / 1; the gfx950 kernel's shape, kept for both) and only
+    layers that run their own indexer: a layer reusing the previous top-k writes no
     NVFP4 K/V. The vLLM / SGLang plugin bridges bind their own caches and know
     neither layout, so a plugin deployment would silently keep FP8.
     """
@@ -1951,8 +1953,8 @@ def m3_fp4_cache_unsupported_reason(
         return None
     if plugin:
         return "FP4/NVFP4 MiniMax-M3 caches are not supported in plugin mode"
-    if gfx != "gfx950":
-        return f"FP4/NVFP4 MiniMax-M3 caches need gfx950, not {gfx}"
+    if gfx not in ("gfx950", "gfx1250"):
+        return f"FP4/NVFP4 MiniMax-M3 caches need gfx950 or gfx1250, not {gfx}"
     if kv_nvfp4:
         q_per_kv = (num_heads // tp_size) // max(1, num_kv_heads // tp_size)
         if q_per_kv != 16:

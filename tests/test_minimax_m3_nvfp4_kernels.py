@@ -3,9 +3,10 @@
 
 """MiniMax-M3 FP4 index cache and NVFP4 sparse KV kernels, against torch.
 
-gfx950 and gfx1250: gfx950 decodes e2m1 with its conversion instruction,
-gfx1250 with integer ops. The NVFP4 attention and the fused top-k are gfx950
-Gluon only. Elsewhere every test skips.
+gfx950 and gfx1250: gfx950 decodes e2m1 with its conversion instruction and runs
+the Gluon attention; gfx1250 decodes it with integer ops and runs aiter's FlyDSL
+paged decode over a compacted page table. The fused top-k is gfx950 Gluon only.
+Elsewhere every test skips.
 
 - the store kernels against a torch quantizer (exact), K/V against the index path;
 - the per-row (request, causal length) maps;
@@ -32,7 +33,10 @@ pytestmark = pytest.mark.skipif(
     _gfx() not in ("gfx950", "gfx1250"), reason="needs a gfx950 or gfx1250 GPU"
 )
 gfx950_only = pytest.mark.skipif(
-    _gfx() != "gfx950", reason="the attention and fused verify top-k are gfx950 Gluon"
+    _gfx() != "gfx950", reason="the fused verify top-k is gfx950 Gluon"
+)
+gfx1250_only = pytest.mark.skipif(
+    _gfx() != "gfx1250", reason="the compacted page table feeds gfx1250's paged decode"
 )
 
 DEV, D, PAGE = "cuda", 128, 128
@@ -203,7 +207,6 @@ def test_fp4_scorers_select_like_bf16():
     assert _same_sets(ref, got)
 
 
-@gfx950_only
 def test_nvfp4_attention_matches_dequantized_reference():
     from atom.model_ops.minimax_m3.sparse_attn_nvfp4 import (
         check_nvfp4_sparse_attention,
@@ -248,6 +251,43 @@ def test_nvfp4_attention_matches_dequantized_reference():
         ref = p @ vd[toks]
         err = (out[r].float() - ref).abs().max() / ref.abs().max()
         assert err < 0.02, (r, float(err))
+
+
+@gfx1250_only
+def test_page_table_compacts_causal_selection():
+    """Full blocks in selection order, the row's tail block last, blocks past
+    the row's last token dropped; per kv head, pages encoded p * Hkv + h."""
+    from atom.model_ops.minimax_m3.sparse_attn_nvfp4 import nvfp4_page_table
+
+    torch.manual_seed(8)
+    hkv, rows, topk, maxb = 2, 40, 16, 64
+    row_seq = torch.randint(0, maxb * PAGE, (rows,), device=DEV, dtype=torch.int32)
+    row_seq[:4] = torch.tensor([0, 1, PAGE, 3 * PAGE + 5], dtype=torch.int32)
+    row_req = torch.randint(0, 3, (rows,), device=DEV, dtype=torch.int32)
+    bt = torch.stack([torch.randperm(500, device=DEV)[:maxb] for _ in range(3)])
+    bt = bt.to(torch.int32)
+    idx = torch.full((hkv, rows, topk), -1, device=DEV, dtype=torch.int32)
+    for h in range(hkv):
+        for r in range(rows):
+            # Any blocks, some past the row: the indexer is causal, the table must be too.
+            sel = torch.randperm(maxb, device=DEV)[
+                : torch.randint(0, topk + 1, ()).item()
+            ]
+            idx[h, r, : sel.numel()] = sel.to(torch.int32)
+    table, ctx = nvfp4_page_table(idx, bt, row_req, row_seq)
+    for h in range(hkv):
+        for r in range(rows):
+            n = int(row_seq[r])
+            last = (n - 1) // PAGE if n else -1
+            sel = [b for b in idx[h, r].tolist() if 0 <= b <= last]
+            full = [b for b in sel if b < last]
+            order = full + [b for b in sel if b == last]
+            want_ctx = len(full) * PAGE + (n - last * PAGE if last in sel else 0)
+            pages = [int(bt[row_req[r], b]) * hkv + h for b in order]
+            got = table[r * hkv + h].tolist()
+            assert int(ctx[r * hkv + h]) == want_ctx, (h, r)
+            assert got[: len(pages)] == pages, (h, r)
+            assert all(p == 0 for p in got[len(pages) :]), (h, r)
 
 
 @gfx950_only
