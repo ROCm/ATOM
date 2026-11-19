@@ -162,8 +162,9 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         config = self.model_runner.config
         model_type = config.hf_config.model_type
 
-        # Mooncake moves the slot regions published below; MoRIIO registers the
-        # same pools itself, from the `per_request_state` tensors in kv_caches.
+        # Mooncake moves the slot regions published below; MoRIIO registers each
+        # layer's state and records from the `per_request_state` tensors in
+        # kv_caches, and the shared cursor from this builder's `replay_cursor()`.
         if connector not in ("mooncake", "moriio"):
             raise NotImplementedError(
                 f"{model_type} disaggregated serving requires the mooncake or "

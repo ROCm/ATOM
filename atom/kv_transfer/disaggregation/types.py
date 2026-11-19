@@ -376,14 +376,14 @@ class KVTransferTensors:
     # Number of TP workers whose complete PAGE layout is byte-identical.
     # ``1`` means no cross-rank deduplication is safe.
     tp_replication_factor: int = 1
-    # The attention metadata builder, published by `ModelRunner` after the tier
-    # is built inside `register_kv_caches` -- the one place builder and connector
-    # are both in scope. The kimi_k3 state tier reads its `state_runtime.
-    # checkpoint_spec.layout_id` to fold the state geometry into every key. Typed
-    # `object` because `types` must not import the model engine; None on every
-    # layout that has no state tier to name. Declared here rather than set as a
-    # loose runtime attribute so the field the connector reads is part of the
-    # contract, not an undocumented assignment two layers away.
+    # The attention metadata builder, published by `ModelRunner` before
+    # `register_kv_caches` -- the one place builder and connector are both in
+    # scope. The kimi_k3 state tier reads its `state_runtime.checkpoint_spec.
+    # layout_id` to fold the state geometry into every key, and MoRIIO its
+    # ReplaySSM cursor (`replay_cursor()`). Typed `object` because `types` must
+    # not import the model engine; None only on a layout built outside
+    # `ModelRunner`. Declared here rather than set as a loose runtime attribute
+    # so the field the connector reads is part of the contract.
     state_backend: object | None = None
     # Producer-side DSA index-page staging. The callback fills one pool slot
     # with compact destination pages and returns (base_addr, page_count).

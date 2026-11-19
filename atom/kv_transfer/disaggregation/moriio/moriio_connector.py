@@ -189,9 +189,9 @@ class MoRIIOConnector(KVConnectorBase):
         self.blocks_per_chunk: int | None = None
         self.num_k_chunks: int = 0
 
-        # Per-request state (`KVCacheTensor.per_request_state`), addressed by
-        # state slot rather than block: name -> (descriptor, bytes per slot,
-        # tensor). Never part of the block layout above.
+        # Per-request state, addressed by state slot rather than block: each
+        # `per_request_state` layer's tensors plus ReplaySSM's cursor (`REPLAY_CURSOR`,
+        # from the builder's `replay_cursor()`); name -> (descriptor, bytes/slot, tensor).
         self._state_tensors: dict[str, tuple[bytes, int, Any]] = {}
         self._num_state_slots = 0
         self._built_state_sessions: dict[str, list[tuple[Any, int]]] = {}
