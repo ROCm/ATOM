@@ -1387,8 +1387,6 @@ def minimax_m3_sparse_attn_decode_asm(
     num_kv_heads: int,
     sm_scale: float,
     output: torch.Tensor,  # [batch, num_heads, head_dim]
-    quantized_output: torch.Tensor | None = None,  # optional FP8, >= q's rows
-    output_scale: torch.Tensor | None = None,  # FP32 [rows, 1], with it
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
     sparse_bt: torch.Tensor | None = None,  # prebuilt (fused topk) -> skip build
@@ -1433,26 +1431,8 @@ def minimax_m3_sparse_attn_decode_asm(
         output,
         k_scale,
         v_scale,
-        quantized_output=quantized_output,
-        output_scale=output_scale,
         plan_step_owner=plan_step_owner,
     )
-
-
-@functools.cache
-def _fp8_output_plan_budget(device) -> int:
-    """The FlyDSL plan's workgroup budget for a sparse PA writing FP8: six per CU.
-
-    With aiter's default, two per CU, a call whose rows x split pass it gets
-    fewer partitions than the split asks for and a slower merge, which for an
-    FP8 output also quantizes in a launch of its own. One MI455X (256 CUs),
-    FP8 KV, 2048-token windows, us per call, default -> six per CU (median of
-    7, interleaved, CUDA graphs): decode rows 72 9.12 -> 6.08, 96 9.85 -> 8.12,
-    160 11.43 -> 8.35, 192 13.53 -> 10.52, 240 14.45 -> 11.11, 256 13.39 ->
-    12.73, 320 21.28 -> 14.23, 384 22.16 -> 14.84; prefill 300 rows 16.31 ->
-    15.61; within 1% at 1-64, 128 and 512 decode rows and 600 prefill rows.
-    """
-    return 6 * torch.cuda.get_device_properties(device).multi_processor_count
 
 
 @torch.no_grad()
@@ -1467,8 +1447,6 @@ def sparse_pa_per_row(
     output: torch.Tensor,  # [total_q, num_heads, head_dim]
     k_scale: torch.Tensor | None,
     v_scale: torch.Tensor | None,
-    quantized_output: torch.Tensor | None = None,
-    output_scale: torch.Tensor | None = None,
     plan_step_owner=None,
     plan_cache_owner=None,
 ) -> None:
@@ -1481,9 +1459,6 @@ def sparse_pa_per_row(
     Prefill was Gluon-only until the pa_fwd_asm "maskless-fp8 NaN at the
     256-token boundary" it was avoiding turned out not to reproduce: 32768 rows
     over every causal length 1..2048 give zero NaN and cos 0.9993 vs gluon.
-
-    ``quantized_output`` / ``output_scale``: the output as FP8 plus per-token
-    descales instead, from the PA only (`run_pa_decode`).
     """
     from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 
@@ -1498,19 +1473,13 @@ def sparse_pa_per_row(
     g = num_q_heads_total // num_kv_heads
     q_view = q.view(T * num_kv_heads, g, head_size)
     out_view = output.view(T * num_kv_heads, g, head_size)
-    if quantized_output is not None:
-        # One PA sequence must cover a token's whole row for its one descale;
-        # rows past q's (a padded batch) the PA writes inert (`run_pa_decode`).
-        if num_kv_heads != 1:
-            raise ValueError("a per-token FP8 output needs one KV head")
-        quantized_output = quantized_output.view(-1, g, head_size)
     # .view, not .reshape: the SHUFFLE slices are contiguous so this is always
     # zero-copy, and a copy would silently break the page-id encoding alignment.
     nph16, _hkv = k_cache.shape[0], k_cache.shape[1]
     k_cache_view = k_cache.view(nph16 * _hkv, 1, *k_cache.shape[2:])
     v_cache_view = v_cache.view(nph16 * _hkv, 1, *v_cache.shape[2:])
 
-    if quantized_output is None and _sparse_pa_ran_on_asm(
+    if _sparse_pa_ran_on_asm(
         q_view,
         k_cache_view,
         v_cache_view,
@@ -1525,9 +1494,6 @@ def sparse_pa_per_row(
     num_seqs = T * num_kv_heads
     num_kv_heads_view = 1
     max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads_view)
-    plan_workgroup_budget = None
-    if quantized_output is not None:
-        plan_workgroup_budget = _fp8_output_plan_budget(q.device)
     context_partition_size = 256
     # compute_type / scales follow the actual KV-cache dtype (this helper serves
     # both bf16 and fp8); the scale tensor collapses like the cache.
@@ -1558,13 +1524,109 @@ def sparse_pa_per_row(
         sinks=None,
         sliding_window=-1,
         ps=True,
-        quantized_output=quantized_output,
-        output_scale=output_scale,
         plan_step_owner=plan_step_owner,
         plan_cache_owner=plan_cache_owner,
         # Bounded topk window per row: keep the static split cap.
         plan_partition_cap=max_context_partition_num,
-        plan_workgroup_budget=plan_workgroup_budget,
+    )
+
+
+@functools.cache
+def _fp8_output_plan_budget(device) -> int:
+    """The FlyDSL plan's workgroup budget for a sparse PA writing FP8: six per CU.
+
+    With aiter's default, two per CU, a call whose rows x split pass it gets
+    fewer partitions than the split asks for and a slower merge, which for an
+    FP8 output also quantizes in a launch of its own. One MI455X (256 CUs),
+    FP8 KV, 2048-token windows, us per call, default -> six per CU (median of
+    7, interleaved, CUDA graphs): decode rows 72 9.12 -> 6.08, 96 9.85 -> 8.12,
+    160 11.43 -> 8.35, 192 13.53 -> 10.52, 240 14.45 -> 11.11, 256 13.39 ->
+    12.73, 320 21.28 -> 14.23, 384 22.16 -> 14.84; prefill 300 rows 16.31 ->
+    15.61; within 1% at 1-64, 128 and 512 decode rows and 600 prefill rows.
+    """
+    return 6 * torch.cuda.get_device_properties(device).multi_processor_count
+
+
+@torch.no_grad()
+def sparse_pa_fp8_per_row(
+    q: torch.Tensor,  # [rows, num_heads, head_dim==128], one KV head
+    k_cache: torch.Tensor,  # FP8 page-16 SHUFFLE [pages, 1, ...], as above
+    v_cache: torch.Tensor,
+    sparse_bt: torch.Tensor,  # [>= rows, topk*8] int32
+    sparse_ctx: torch.Tensor,  # [>= rows] int32
+    sm_scale: float,
+    output: torch.Tensor,  # [rows, num_heads, head_dim]: the layout, not written
+    k_scale: torch.Tensor | None,
+    v_scale: torch.Tensor | None,
+    quantized_output: torch.Tensor,  # OCP FP8, q's rows then any pad rows
+    output_scale: torch.Tensor,  # FP32 [quantized_output rows, 1]
+    plan_step_owner=None,
+    plan_cache_owner=None,
+) -> None:
+    """``sparse_pa_per_row`` writing o_proj's per-token FP8 input instead, in
+    FlyDSL's paged decode (aiter #7401): no BF16 store, and the pad rows past
+    q's written as FP8 zeros with a unit descale by the same launch.
+
+    Only for ``SparseMHAPagedAttentionImpl.supports_output_quant``: an FP8 KV,
+    one KV head (a token's row is then one PA sequence, which its one descale
+    covers) and a GPU without gluon, whose sparse PA is FlyDSL's on every call.
+    A separate entry so that every call without an FP8 output runs
+    ``sparse_pa_per_row`` -> ``run_pa_decode`` unchanged.
+    """
+    from aiter.ops.flydsl.pa_decode import pa_decode
+    from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
+
+    from atom.model_ops.base_attention import (
+        _flydsl_context_bound,
+        _flydsl_plan_scratch,
+        _flydsl_prepare_explicit_plan,
+    )
+
+    rows, group, head_dim = q.shape
+    bound = _flydsl_context_bound(None, sparse_bt, k_cache)
+    plan = _flydsl_prepare_explicit_plan(
+        q=q,
+        k_cache=k_cache,
+        context_lens=sparse_ctx,
+        num_seqs=rows,
+        query_length=1,
+        # the static split cap of `sparse_pa_per_row`, with the budget above
+        plan_partition_cap=get_recommended_splits(rows, 1),
+        plan_workgroup_budget=_fp8_output_plan_budget(q.device),
+        context_bound=bound,
+        existing_plan=None,
+        plan_step_owner=plan_step_owner,
+        plan_cache_owner=plan_cache_owner,
+    )
+    exp_sums, max_logits, tmp = _flydsl_plan_scratch(
+        plan, 1, group, head_dim, output.dtype, q.device, plan_cache_owner
+    )
+    if k_scale is not None:  # per-page scales, collapsed as the cache
+        k_scale = k_scale.view(-1, 1, k_scale.shape[-1], 1)
+        v_scale = v_scale.view(-1, 1, v_scale.shape[-1], 1)
+    pa_decode(
+        output,
+        q,
+        k_cache,
+        v_cache,
+        sparse_ctx[:rows],
+        sparse_bt[:rows],
+        sm_scale,
+        1,
+        context_partition_size=256,
+        compute_type=aiter.dtypes.fp8,
+        key_scale=k_scale,
+        value_scale=v_scale,
+        exp_sums=exp_sums,
+        max_logits=max_logits,
+        temporary_output=tmp,
+        sliding_window=0,
+        work_plan=plan,
+        max_context_length=bound,
+        quantized_output=quantized_output.view(-1, group, head_dim),
+        output_scale=output_scale,
+        store_output=False,
+        quantized_pad_rows=quantized_output.shape[0] - rows,
     )
 
 
@@ -1585,8 +1647,6 @@ def minimax_m3_sparse_attn_prefill_asm(
     num_kv_heads: int,
     sm_scale: float,
     output: torch.Tensor,  # [total_q, num_heads, head_dim]
-    quantized_output: torch.Tensor | None = None,  # optional FP8, >= q's rows
-    output_scale: torch.Tensor | None = None,  # FP32 [rows, 1], with it
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
     cu_seqlens_q: torch.Tensor | None = None,  # [batch+1] int32, for the fallback
@@ -1657,8 +1717,6 @@ def minimax_m3_sparse_attn_prefill_asm(
         output,
         k_scale,
         v_scale,
-        quantized_output=quantized_output,
-        output_scale=output_scale,
         plan_step_owner=plan_step_owner,
         plan_cache_owner=plan_cache_owner,
     )

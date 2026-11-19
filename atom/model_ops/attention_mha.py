@@ -1222,18 +1222,6 @@ class PagedAttentionImpl(nn.Module):
         output: torch.Tensor = None,
         **kwargs,
     ):
-        if kwargs:
-            # `unified_attention_fp8` alone passes any: the FP8 output pair,
-            # `quantized_output=` / `output_scale=`.
-            return self.forward_impl(
-                q=query,
-                k=key,
-                v=value,
-                position=position,
-                q_scale=q_scale,
-                qkv=qkv,
-                **kwargs,
-            )
         return self.forward_impl(
             q=query,
             k=key,
@@ -1821,17 +1809,33 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             )
         else:
             topk_idx, sparse_bt, sparse_ctx = cached_topk
-        # one output, its rows past the metadata's zero, written in place (as decode).
-        # With an FP8 output, `output` only fixes the layout; pa_decode writes the FP8
-        # rows (pad rows inert), but on plans aiter cannot fuse it still writes a
-        # BF16 intermediate and then runs the standalone quant.
+        # one output, its rows past the metadata's zero, written in place (as decode)
         fp4_kv = self.kv_cache_dtype == "fp4"
         output = torch.empty_like(q, dtype=v.dtype if fp4_kv else None)
-        if rows < q.shape[0] and quantized_output is None:
+        if rows < q.shape[0]:
             output[rows:].zero_()
-        if quantized_output is not None and self.kv_cache_dtype in ("fp4", "nvfp4"):
-            raise NotImplementedError("an FP4 KV's PA writes no FP8 output")
-        if self.kv_cache_dtype == "nvfp4":
+        if quantized_output is not None:
+            # the FP8 output (`supports_output_quant`: an FP8 KV); `output` only
+            # gives it the layout, and the PA writes its pad rows
+            from atom.model_ops.minimax_m3.sparse_attn import sparse_pa_fp8_per_row
+
+            sparse_pa_fp8_per_row(
+                q[:rows],
+                k_cache,
+                v_cache,
+                sparse_bt,
+                sparse_ctx,
+                self.scale,
+                output[:rows],
+                k_scale,
+                v_scale,
+                quantized_output,
+                output_scale,
+                plan_step_owner=prefill_md if self.local_blocks >= 1 else None,
+                plan_cache_owner=prefill_md,
+            )
+            output = quantized_output
+        elif self.kv_cache_dtype == "nvfp4":
             # every layer of the step has the same rows: built once, with the metadata
             row_req_id, row_kv_lens = prefill_md.nvfp4_row_info
             self._sparse_pa_nvfp4_prefill(
@@ -1872,8 +1876,6 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 self.num_kv_heads,
                 self.scale,
                 output[:rows],
-                quantized_output=quantized_output,
-                output_scale=output_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
                 cu_seqlens_q=cu_seqlens_q,
@@ -1883,8 +1885,6 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 plan_step_owner=prefill_md if self.local_blocks >= 1 else None,
                 plan_cache_owner=prefill_md,
             )
-        if quantized_output is not None:
-            output = quantized_output
         output = output.view(*q.shape)
         self._index_q = None
         self._index_q_cache_key_info = None
@@ -2074,17 +2074,32 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         else:
             topk_idx, sparse_bt, sparse_ctx = cached_topk
         # one output, its pad rows (past the metadata's) zero, written in place; the
-        # MXFP4 KV's q is e4m3, so its output takes the value dtype instead. With an
-        # FP8 output, `output` only fixes the layout; pa_decode writes the FP8 rows
-        # (pad rows inert), but on plans aiter cannot fuse it still writes a BF16
-        # intermediate and then runs the standalone quant.
+        # MXFP4 KV's q is e4m3, so its output takes the value dtype instead
         fp4_kv = self.kv_cache_dtype == "fp4"
         output = torch.empty_like(q, dtype=v.dtype if fp4_kv else None)
-        if rows < q.shape[0] and quantized_output is None:
+        if rows < q.shape[0]:
             output[rows:].zero_()
-        if quantized_output is not None and self.kv_cache_dtype in ("fp4", "nvfp4"):
-            raise NotImplementedError("an FP4 KV's PA writes no FP8 output")
-        if self.kv_cache_dtype == "nvfp4":
+        if quantized_output is not None:
+            # the FP8 output (`supports_output_quant`: an FP8 KV); `output` only
+            # gives it the layout, and the PA writes its pad rows
+            from atom.model_ops.minimax_m3.sparse_attn import sparse_pa_fp8_per_row
+
+            sparse_pa_fp8_per_row(
+                q[:rows],
+                k_cache,
+                v_cache,
+                sparse_bt,
+                sparse_ctx,
+                self.scale,
+                output[:rows],
+                k_scale,
+                v_scale,
+                quantized_output,
+                output_scale,
+                plan_step_owner=decode_md if self.local_blocks >= 1 else None,
+            )
+            output = quantized_output
+        elif self.kv_cache_dtype == "nvfp4":
             self._sparse_pa_nvfp4_decode(
                 q[:rows],
                 k_cache,
@@ -2122,8 +2137,6 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 self.num_kv_heads,
                 self.scale,
                 output[:rows],
-                quantized_output=quantized_output,
-                output_scale=output_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
                 sparse_bt=sparse_bt,
@@ -2133,7 +2146,5 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             )
         self._index_q = None
         self._index_q_cache_key_info = None
-        if quantized_output is not None:
-            output = quantized_output
         output = output.view(*q.shape)
         return output

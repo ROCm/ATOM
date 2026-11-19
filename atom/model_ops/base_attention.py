@@ -593,11 +593,6 @@ def run_pa_decode(
     q_scale: torch.Tensor | None,
     k_scale: torch.Tensor | None,
     v_scale: torch.Tensor | None,
-    # Pass these by name. Before the `*` on purpose: CPython fills a missing
-    # keyword-only default with a dict lookup, ~5 ns each on every call.
-    quantized_output: torch.Tensor | None = None,
-    output_scale: torch.Tensor | None = None,
-    plan_workgroup_budget: int | None = None,
     *,
     exp_sums: torch.Tensor | None = None,
     max_logits: torch.Tensor | None = None,
@@ -626,12 +621,6 @@ def run_pa_decode(
     ``exp_sums`` / ``max_logits`` / ``temporary_output`` are gluon scratch.
     Omitted, ``pa_decode_gluon`` sizes and allocates its own, so a FlyDSL
     call, which uses its plan's cached scratch, allocates none.
-
-    ``quantized_output`` / ``output_scale``: a FlyDSL-only output in place of
-    ``output`` (aiter #7401), OCP FP8 in the attention layout
-    plus contiguous FP32 ``[rows, 1]`` descales. ``output`` then only gives the
-    layout and is not written; rows of the pair past ``q``'s are written as
-    FP8 zeros with a unit descale.
     """
     flydsl_seqs = flydsl_decode_seqs(
         output=output,
@@ -727,7 +716,6 @@ def run_pa_decode(
             num_seqs=n,
             query_length=max_seqlen_q,
             plan_partition_cap=plan_partition_cap,
-            plan_workgroup_budget=plan_workgroup_budget,
             context_bound=context_bound,
             existing_plan=work_plan,
             plan_step_owner=plan_step_owner,
@@ -743,16 +731,6 @@ def run_pa_decode(
             plan_cache_owner=plan_cache_owner,
         )
 
-        if quantized_output is not None:
-            if output_scale is None:
-                raise ValueError("quantized_output and output_scale go together")
-            _flydsl_pa_decode = functools.partial(
-                _flydsl_pa_decode,
-                quantized_output=quantized_output,
-                output_scale=output_scale,
-                store_output=False,
-                quantized_pad_rows=quantized_output.shape[0] - q.shape[0],
-            )
         # Slice off ATOM's sequence-axis padding so the rectangle FlyDSL
         # requires holds. Views, no copy: dim 0 is the outermost axis of each.
         return _flydsl_pa_decode(
@@ -779,8 +757,6 @@ def run_pa_decode(
             max_context_length=context_bound,
         )
 
-    if quantized_output is not None:
-        raise RuntimeError("only FlyDSL's paged decode writes a quantized output")
     if not pa_decode_gluon_supports_arch():
         raise RuntimeError(
             "This GPU has no gluon paged decode: set ATOM_PA_FLYDSL=1"
@@ -1088,10 +1064,10 @@ def unified_attention_fp8(
         layer_name
     ]
     output = torch.empty(q.shape, device=q.device, dtype=dtypes.fp8)
-    self.impl.forward(
-        query=q,
-        key=k,
-        value=v,
+    self.impl.forward_impl(
+        q=q,
+        k=k,
+        v=v,
         position=positions,
         qkv=qkv,
         quantized_output=output,

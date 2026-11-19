@@ -51,7 +51,7 @@ def test_the_sparse_impl_writes_fp8_only_where_it_was_measured(
 
 @pytest.mark.parametrize("dummy", [True, False])
 def test_the_fp8_op_returns_what_the_impl_wrote(monkeypatch, dummy):
-    """`unified_attention_fp8` -> impl.forward: a dummy run writes inert rows;
+    """`unified_attention_fp8` -> impl.forward_impl: a dummy run writes inert rows;
     otherwise the backend gets the FP8 output and its descales."""
     seen = {}
 
@@ -159,68 +159,39 @@ def test_attention_turns_the_fp8_output_on(monkeypatch, sp, asked, impl_writes, 
     assert attn.per_token_fp8_out is want
 
 
-@pytest.mark.parametrize("fp8", [False, True])
-def test_sparse_rows_hand_the_pa_the_fp8_output(monkeypatch, fp8):
-    seen = {}
-    monkeypatch.setattr(base_attention, "run_pa_decode", lambda **kw: seen.update(kw))
-    monkeypatch.setattr(sparse_attn, "_sparse_pa_ran_on_asm", lambda *a: False)
-    monkeypatch.setattr(sparse_attn, "_fp8_output_plan_budget", lambda _: 1536)
-    rows, bucket = 72, 75  # a padded batch: the PA writes the last three inert
-    q = torch.randn(rows, 16, 128, dtype=torch.bfloat16)
-    out = torch.empty((bucket, 16, 128), dtype=torch.uint8)
-    quant = {"quantized_output": out, "output_scale": torch.empty(bucket, 1)}
-    sparse_attn.sparse_pa_per_row(
-        *(q, torch.empty((1, 1, 8, 16, 16), dtype=torch.uint8)),
-        torch.empty((1, 1, 1, 128, 16), dtype=torch.uint8),
-        *(torch.zeros((rows, 8), dtype=torch.int32), torch.ones(rows)),
-        *(1, 1.0, torch.empty_like(q), None, None),
-        **(quant if fp8 else {}),
-    )
-    assert seen["plan_workgroup_budget"] == (1536 if fp8 else None)
-    assert seen["plan_partition_cap"] == seen["max_context_partition_num"]
-    if fp8:
-        assert seen["quantized_output"].shape == (bucket, 16, 128)
-        assert seen["quantized_output"].data_ptr() == out.data_ptr()
-        with pytest.raises(ValueError, match="one KV head"):
-            sparse_attn.sparse_pa_per_row(
-                q, *(None,) * 4, 2, 1.0, q, None, None, **quant
-            )
-
-
-def test_run_pa_decode_hands_flydsl_the_fp8_output_alone(monkeypatch):
-    """No BF16 store, and the rows past q's written inert by the same launch."""
+def test_the_fp8_sparse_pa_hands_flydsl_the_fp8_output_alone(monkeypatch):
+    """One FlyDSL launch on the plan with the FP8 budget: no BF16 store, and the
+    rows past q's (a padded batch) written inert by the same launch."""
     import aiter.ops.flydsl.pa_decode as fly
+    import aiter.ops.triton.gluon.pa_decode_gluon as gluon
 
-    seen = {}
+    plans, seen = [], {}
     ba = base_attention
-    monkeypatch.setattr(ba, "flydsl_decode_seqs", lambda **kw: 5)
-    monkeypatch.setattr(ba, "_flydsl_context_bound", lambda *a: 2048)
-    monkeypatch.setattr(ba, "_flydsl_prepare_explicit_plan", lambda **kw: None)
+    monkeypatch.setattr(
+        ba, "_flydsl_prepare_explicit_plan", lambda **kw: plans.append(kw)
+    )
     monkeypatch.setattr(ba, "_flydsl_plan_scratch", lambda *a, **kw: (None,) * 3)
-    monkeypatch.setattr(fly, "pa_decode", lambda *a, **kw: seen.update(kw))
-
-    def m(*shape):
-        return torch.empty(shape, device="meta")
-
-    def call(**kw):
-        ba.run_pa_decode(
-            *(m(5, 16, 128), m(5, 16, 128), m(8, 1, 8, 16, 16), m(8, 1, 1, 128, 16)),
-            *(m(5), m(5, 8), 1.0, 1, 4, 256, torch.bfloat16, None, None, None),
-            **kw,
-        )
-
-    fp8, scale = m(8, 16, 128), m(8, 1)
-    call(quantized_output=fp8, output_scale=scale)
-    assert seen["quantized_output"] is fp8 and seen["output_scale"] is scale
+    monkeypatch.setattr(sparse_attn, "_fp8_output_plan_budget", lambda _: 1536)
+    monkeypatch.setattr(gluon, "get_recommended_splits", lambda n, h: (n, h))
+    monkeypatch.setattr(fly, "pa_decode", lambda *a, **kw: seen.update(kw, args=a))
+    rows, bucket = 72, 75
+    q = torch.empty((rows, 16, 128), dtype=torch.bfloat16)
+    bt = torch.zeros((bucket, 8), dtype=torch.int32)
+    fp8, scale = torch.empty((bucket, 16, 128), dtype=torch.uint8), torch.empty(
+        bucket, 1
+    )
+    sparse_attn.sparse_pa_fp8_per_row(
+        q, torch.empty((8, 1, 8, 16, 16)), torch.empty((8, 1, 1, 128, 16)),
+        bt, torch.ones(bucket, dtype=torch.int32), 1.0, torch.empty_like(q),
+        *(torch.ones(8, 1, 16),) * 2, fp8, scale,
+    )  # fmt: skip
+    (plan,) = plans
+    assert plan["plan_workgroup_budget"] == 1536 and plan["num_seqs"] == rows
+    assert plan["plan_partition_cap"] == (rows, 1)  # the static split count
+    assert seen["args"][4].shape == (rows,) and seen["args"][5].shape == (rows, 8)
+    assert seen["quantized_output"].data_ptr() == fp8.data_ptr()
+    assert seen["output_scale"] is scale and seen["key_scale"].shape == (8, 1, 16, 1)
     assert seen["store_output"] is False and seen["quantized_pad_rows"] == 3
-    seen.clear()
-    call()  # without the pair, FlyDSL gets the plain call
-    assert seen and "quantized_output" not in seen and "store_output" not in seen
-    with pytest.raises(ValueError, match="go together"):
-        call(quantized_output=fp8)
-    monkeypatch.setattr(ba, "flydsl_decode_seqs", lambda **kw: None)
-    with pytest.raises(RuntimeError, match="only FlyDSL"):
-        call(quantized_output=fp8, output_scale=scale)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
@@ -249,28 +220,29 @@ def test_fp8_output_is_bf16_pa_then_the_per_token_quant(monkeypatch, decode, row
     if decode:
         lens.fill_(window)
     bt = torch.randint(0, pages, (rows, window // 16), dtype=torch.int32, device=dev)
-    args = (q, k_cache, v_cache, bt, lens, 1, 128**-0.5)
     fp8 = torch.full((rows + pad, 16, 128), 0x7F, device=dev, dtype=torch.uint8)
     fp8 = fp8.view(dtypes.fp8)
     scale = torch.full((rows + pad, 1), float("nan"), device=dev)
-    # the FP8 output through the phase's entry point, as the impl calls it
-    phase = "decode" if decode else "prefill"
-    getattr(sparse_attn, f"minimax_m3_sparse_attn_{phase}_asm")(
-        q, k_cache, v_cache, *(None,) * (3 if decode else 5), 1, 128**-0.5,
-        torch.empty_like(q), fp8, scale, kv_scale, kv_scale,
-        sparse_bt=bt, sparse_ctx=lens,
+    # prefill keeps its plans on its step metadata, as the impl passes it
+    owner = None if decode else SimpleNamespace()
+    sparse_attn.sparse_pa_fp8_per_row(
+        q, k_cache, v_cache, bt, lens, 128**-0.5, torch.empty_like(q),
+        kv_scale, kv_scale, fp8, scale, plan_cache_owner=owner,
     )  # fmt: skip
 
     # the BF16 output of the same plan, then the quant o_proj would run
-    run = base_attention.run_pa_decode
+    prepare = base_attention._flydsl_prepare_explicit_plan
     budget = sparse_attn._fp8_output_plan_budget(q.device)
     monkeypatch.setattr(
         base_attention,
-        "run_pa_decode",
-        lambda **kw: run(**{**kw, "plan_workgroup_budget": budget}),
+        "_flydsl_prepare_explicit_plan",
+        lambda **kw: prepare(**kw, plan_workgroup_budget=budget),
     )
     bf16 = torch.empty_like(q)
-    sparse_attn.sparse_pa_per_row(*args, bf16, kv_scale, kv_scale)
+    sparse_attn.sparse_pa_per_row(
+        q, k_cache, v_cache, bt, lens, 1, 128**-0.5, bf16, kv_scale, kv_scale,
+        plan_cache_owner=owner,
+    )  # fmt: skip
     ref, ref_scale = torch.empty_like(fp8[:rows]), torch.empty_like(scale[:rows])
     dynamic_per_token_scaled_quant(ref.view(rows, -1), bf16.view(rows, -1), ref_scale)
     assert torch.equal(fp8[:rows].view(torch.uint8), ref.view(torch.uint8))
