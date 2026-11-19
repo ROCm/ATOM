@@ -978,3 +978,21 @@ def test_a_cold_prefill_uploads_the_block_tables_a_drafter_reads(has_drafter):
         stub, None, 4, has_cached=False
     )
     assert rows == (4 if has_drafter else None)
+
+
+@pytest.mark.parametrize("q", [1, 3])
+def test_mla_persistent_plan_spans_only_scheduled_requests(monkeypatch, q):
+    # running_tokens: this rank's own height while a DP peer prefills (the
+    # first two steps), the group's 4 * q on a unified step (the last two).
+    # Either way only the scheduled requests are planned, never the padding.
+    runner, builder = make_runner(monkeypatch, "mla", q=q, tbo=False)
+    planned = []
+    builder.set_mla_persistent_worker_buffers = (
+        lambda bs, *a, **kw: planned.append(bs) or {}
+    )
+    for count, running_tokens in ((1, q), (2, 2 * q), (2, 4 * q), (4, 4 * q)):
+        batch = decode_batch(count, q)
+        start_decode(runner, builder, batch, q)
+        builder.prepare_decode(batch, 4, running_tokens, q)
+        finish(runner)
+    assert planned == [1, 2, 2, 4]

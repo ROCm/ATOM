@@ -3583,9 +3583,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         )
 
         is_sparse_mtp = self.is_sparse and max_seqlen_q > 1
+        # scheduled_bs, not running_bs: a work item reads q[qo_start] and writes
+        # o[qo_start] unbounded, and the padded tail need not have rows -- while a
+        # DP peer prefills, running_tokens is this rank's own count. The cprr
+        # metadata kernel cannot take that tail either (num_qo_tiles=0 -> div-by-0).
         if is_sparse_mtp:
             ctx_mla_ps = self.set_mla_persistent_worker_buffers(
-                running_bs, max_seqlen_q
+                scheduled_bs, max_seqlen_q
             )
             # Plan the sparse per-token work over the REAL tokens only, as the
             # cprr branch below does for its requests. This plan is not the
@@ -3608,18 +3612,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # mask: build persistent metadata with is_cp_round_robin so the kernel
             # masks on global positions g(j)=j*W+r instead of local-causal trim.
             cp_round_robin = self.dcp_world_size > 1 and max_seqlen_q > 1
-            # For cprr, build metadata over the REAL requests (scheduled_bs), not
-            # the cudagraph-padded running_bs. The padded tail is 0-query, which the cprr
-            # metadata kernel mishandles (num_qo_tiles=0 -> div-by-zero; and its
-            # is_cp_round_robin "no trim" is overridden by the nhead=128 M-fold
-            # qk_batch_ratio branch). The persistent kernel is work_indptr-driven,
-            # so scheduled_bs metadata naturally skips the padding rows. A step
-            # that padded nothing reaches here with the two equal, and then this
-            # is a no-op -- but eager no longer implies that, since a DP-unified
-            # batch pads off the graph path too.
-            meta_bs = scheduled_bs if cp_round_robin else running_bs
             ctx_mla_ps = self.set_mla_persistent_worker_buffers(
-                meta_bs, max_seqlen_q, is_cp_round_robin=cp_round_robin
+                scheduled_bs, max_seqlen_q, is_cp_round_robin=cp_round_robin
             )
             # The plan lays each sequence's queries `max_seqlen_q` rows apart
             # (`uni_seqlen_qo`); planned off `cu_seqlens_q` instead, aiter's
