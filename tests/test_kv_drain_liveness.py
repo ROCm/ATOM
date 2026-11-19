@@ -68,8 +68,10 @@ class FakeRunnerMgr:
         self.polls = 0
         self.dispatched = []
 
-    def call_func_with_aggregation(self, name):
+    def call_func_with_aggregation(self, name, *, rearm=True, arm_only=False):
         assert name == "async_proc_aggregation"
+        assert rearm is True
+        assert arm_only is False
         self.polls += 1
         return self._outputs.pop(0) if self._outputs else KVConnectorOutput()
 
@@ -95,6 +97,7 @@ def _engine(*, enabled=True, deferred=None, connector=None, outputs=()):
     proc = EngineCore.__new__(EngineCore)
     proc.label = "test-engine"
     proc.kv_transfer_enabled = enabled
+    proc._preconsume_closed_snapshot = False
     proc._next_idle_kv_drain = 0.0
     proc.scheduler = FakeScheduler(deferred, connector)
     proc.runner_mgr = FakeRunnerMgr(outputs)
