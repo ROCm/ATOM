@@ -17,7 +17,8 @@ Mooncake Store's own part:
 
 * one PCI-local RDMA device per worker, and the Mooncake settings that would
   undo it (``_require_rdma_environment``);
-* every rank's object of a chunk is put in the chunk's Mooncake group;
+* every rank's object of a chunk is put in the chunk's Mooncake group, and
+  the draft objects of ``ATOM_MOONCAKE_STORE_DRAFT_WINDOW`` in none;
 * a slot returns to the pool only once no NIC access can still reach it:
   Mooncake gives up on a transfer without cancelling its RDMA work, so a slot
   whose call outlived its batch wait is quarantined for good (``_settle``);
@@ -54,6 +55,7 @@ from atom.kv_transfer.offload.mooncake_store.config import (
     StorePool,
     check_engine_compatibility,
     parse_mooncake_store_config,
+    store_draft_window,
 )
 from atom.kv_transfer.offload.mooncake_store.keys import (
     STORE_TAINT_KEY,
@@ -61,13 +63,17 @@ from atom.kv_transfer.offload.mooncake_store.keys import (
     probe_key,
     store_namespace,
 )
-from atom.kv_transfer.offload.mooncake_store.layouts import build_mooncake_codec
+from atom.kv_transfer.offload.mooncake_store.layouts import (
+    build_mooncake_codec,
+    build_mooncake_draft_codec,
+)
 from atom.kv_transfer.offload.mooncake_store.nic import requester_rdma_device
 from atom.kv_transfer.offload.mooncake_store.pool import Slot, TransferSlotPool
 from atom.kv_transfer.offload.mooncake_store.scheduler import (
     require_monotonic_clock_id,
 )
 from atom.kv_transfer.offload.mooncake_store.taint import TaintMarker
+from atom.spec_decode.draft_window_geometry import DraftReadWindow
 
 logger = logging.getLogger("atom")
 
@@ -139,6 +145,13 @@ class MooncakeStoreOffloadConnector(KVStoreOffloadConnector):
 
     def _store_namespace(self) -> str:
         return store_namespace(self._config, self.chunk_size)
+
+    @staticmethod
+    def _store_draft_window(config: Any) -> DraftReadWindow | None:
+        return store_draft_window(config)
+
+    def _build_draft_codec(self, transfer_tensors: Any, num_blocks: int | None) -> Any:
+        return build_mooncake_draft_codec(self._config, transfer_tensors, num_blocks)
 
     def _select_endpoint(self, device: torch.device) -> tuple[str | None, StorePool]:
         """This worker's RDMA device (None over tcp) and its Store pool."""
@@ -356,37 +369,69 @@ class MooncakeStoreOffloadConnector(KVStoreOffloadConnector):
             )
         return None
 
-    def _get_chunks(
+    def _put_draft_chunks(
         self,
         client: store_client.MooncakeStoreClient,
         keys: list[str],
         slots: list[Slot],
     ) -> tuple[list[int], float]:
-        """Per key the bytes read or Mooncake's code, and how long it took."""
+        """In no group: a draft object lives by its own lease."""
+        clock = store_client.CallClock()
+        codes = client.put(
+            keys,
+            [slot.ptr for slot in slots],
+            [self._draft_chunk_bytes] * len(slots),
+            tally="draft_",
+        )
+        return codes, clock.seconds()
+
+    def _get_chunks(
+        self,
+        client: store_client.MooncakeStoreClient,
+        keys: list[str],
+        slots: list[Slot],
+    ) -> tuple[list[int], float, int]:
+        """Per key the bytes read or Mooncake's code, how long it took, and the
+        size each object must have."""
         clock = store_client.CallClock()
         codes = client.get(
             keys,
             [slot.ptr for slot in slots],
             [self._chunk_bytes] * len(slots),
         )
-        return codes, clock.seconds()
+        return codes, clock.seconds(), self._chunk_bytes
+
+    def _get_draft_chunks(
+        self,
+        client: store_client.MooncakeStoreClient,
+        keys: list[str],
+        slots: list[Slot],
+    ) -> tuple[list[int], float, int]:
+        clock = store_client.CallClock()
+        codes = client.get(
+            keys,
+            [slot.ptr for slot in slots],
+            [self._draft_chunk_bytes] * len(slots),
+            tally="draft_",
+        )
+        return codes, clock.seconds(), self._draft_chunk_bytes
 
     def _get_failure(
         self,
         pool: TransferSlotPool,
         slots: list[Slot],
-        answer: tuple[list[int], float],
+        answer: tuple[list[int], float, int],
     ) -> str | None:
-        codes, call_seconds = answer
+        codes, call_seconds, nbytes = answer
         # An object of another size is another layout.
-        bad = [code for code in codes if code != self._chunk_bytes]
+        bad = [code for code in codes if code != nbytes]
         if not bad:
             return None
         self._settle(pool, slots, codes, call_seconds)
         return f"{len(bad)} of {len(codes)} chunks, first " + (
             store_client.describe(bad[0])
             if bad[0] < 0
-            else f"{bad[0]} bytes where {self._chunk_bytes} were expected"
+            else f"{bad[0]} bytes where {nbytes} were expected"
         )
 
     # -- slot settlement -----------------------------------------------------
