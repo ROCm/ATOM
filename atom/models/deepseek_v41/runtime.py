@@ -323,6 +323,12 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
         it (`Config.min_final_prefill_rows`)."""
         return self.replay
 
+    @property
+    def eplb_layer_end(self) -> int | None:
+        """EPLB balances on prefill load, and under replay only the layers
+        before the decoder run a prefill's every row: it places those."""
+        return self.decoder_start if self.replay else None
+
     def set_aux_hidden_state_rows(self, layer_ids, buffers):
         """DSpark's aux capture buffers, one per id in ``layer_ids`` -- the
         tensors its hooks write. A replay's decoder layers capture the tail's
@@ -390,8 +396,8 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
         none has its logits discarded. A rank finishing no prompt runs the
         decoder on its tail of padding while a DP peer runs it
         (`decoder_runs`): attention sees no request and writes no cache, so
-        the rows only feed the collectives. V4.1 rejects EPLB
-        (`validate_runtime_config`), so their routing reaches no expert-load
+        the rows only feed the collectives. EPLB places no decoder layer
+        (`eplb_layer_end`), so their routing reaches no expert-load
         statistics."""
         forward = get_forward_context()
         metadata = forward.attn_metadata
