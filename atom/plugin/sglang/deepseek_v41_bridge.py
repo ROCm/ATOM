@@ -1852,15 +1852,20 @@ def _install_prompt_rest_view_carrier() -> None:
 def install_deepseek_v41_proxy_pool_patch() -> None:
     """Make SGLang size and build the V4.1 proxy pool instead of its DSV4 pool,
     keep its own V4.1 decode-graph variants off the ATOM model, carry decode
-    batches' host request rows to the replay staging, and make the
-    scheduler's request broadcast poll instead of sleep."""
+    batches' host request rows to the replay staging, make the
+    scheduler's request broadcast poll instead of sleep, and pick all-greedy
+    tokens with native ATOM's top-1 kernel instead of torch.argmax."""
     import sglang.srt.mem_cache.deepseek_v4_memory_pool as dsv4_pool
 
+    from atom.plugin.sglang.patches.v41_greedy_sampler_patch import (
+        install_v41_greedy_sampler_patch,
+    )
     from atom.plugin.sglang.patches.v41_spin_broadcast_patch import (
         install_v41_spin_broadcast_patch,
     )
 
     install_v41_spin_broadcast_patch()
+    install_v41_greedy_sampler_patch()
     _install_pool_sizing_patch()
     _install_graph_variants_patch()
     _install_host_mirror_patch()
