@@ -16,12 +16,23 @@ least recently scheduled first out, twice `max_num_seqs` of them, so a running
 request, scheduled every step, is never the one recycled.
 """
 
+import os
 from collections import OrderedDict
 
 import numpy as np
 import torch
 import triton
 import triton.language as tl
+
+# ATOM_HOSTFAST_PRESENCE: stage a step's penalty rows in a reused pinned ring
+# instead of pinning a fresh concatenation every step, and gather the anchors
+# with the int32 row starts as they are (no int64 copy). Same bytes uploaded,
+# same tokens gathered.
+_HOSTFAST_PRESENCE = os.environ.get("ATOM_HOSTFAST_PRESENCE", "0") == "1"
+# As `spec_rejection._PINNED_RING`: every decode step waits on the previous
+# verify's host hand-off, so the GPU is never 8 penalized steps behind the host
+# and a slot's previous upload has long completed when it comes round again.
+_PINNED_RING = 8
 
 
 @triton.jit
@@ -198,7 +209,11 @@ class PresencePenaltyStep:
         if self._anchors_marked:
             return
         self._anchors_marked = True
-        anchors = torch.index_select(self.input_ids, 0, self.seq_start.long())
+        if _HOSTFAST_PRESENCE:
+            # index_select takes int32 indices; `seq_start` is int32.
+            anchors = torch.index_select(self.input_ids, 0, self.seq_start)
+        else:
+            anchors = torch.index_select(self.input_ids, 0, self.seq_start.long())
         self._mark(anchors.view(-1, 1))
 
     def apply(self, logits: torch.Tensor, vocab_start: int = 0) -> torch.Tensor:
@@ -260,6 +275,25 @@ class PresencePenaltyState:
         self.device = device
         self._slot_of: OrderedDict = OrderedDict()
         self._free = list(range(self.num_slots - 1, -1, -1))
+        self._pin_ring: list | None = None
+        self._pin_next = 0
+
+    def _pinned_staging(self, n: int):
+        """The next pinned int32 host buffer of the ring (and its numpy view),
+        at least ``n`` long."""
+        ring = self._pin_ring
+        if ring is None or ring[0][1].shape[0] < n:
+            # Rows a step: 3 per request + 2 per query token (<= max_extra + 1).
+            cap = max(n, 3 * self.num_slots + 2 * self.num_slots * (self.max_extra + 1))
+            ring = []
+            for _ in range(_PINNED_RING):
+                t = torch.empty(cap, dtype=torch.int32, pin_memory=True)
+                ring.append((t, t.numpy()))
+            self._pin_ring = ring
+            self._pin_next = 0
+        slot = ring[self._pin_next]
+        self._pin_next = (self._pin_next + 1) % _PINNED_RING
+        return slot
 
     def _slots_for(self, req_ids) -> np.ndarray:
         """Each request's slot, allocating (and clearing) those not yet seen;
@@ -308,18 +342,34 @@ class PresencePenaltyState:
         np.cumsum(q[:-1], out=seq_start[1:])
         row_seq = np.repeat(np.arange(len(q), dtype=np.int32), q)
         row_pos = np.arange(int(q.sum()), dtype=np.int32) - np.repeat(seq_start, q)
-        host = torch.from_numpy(
-            np.concatenate(
-                [
-                    slots,
-                    np.asarray(pens, dtype=np.float32).view(np.int32),
-                    seq_start,
-                    row_seq,
-                    row_pos,
-                ]
+        if _HOSTFAST_PRESENCE:
+            parts = (
+                slots,
+                np.asarray(pens, dtype=np.float32).view(np.int32),
+                seq_start,
+                row_seq,
+                row_pos,
             )
-        ).pin_memory()
-        dev = host.to(self.device, non_blocking=True)
+            total = sum(len(p) for p in parts)
+            host, host_np = self._pinned_staging(total)
+            o = 0
+            for p in parts:
+                host_np[o : o + len(p)] = p
+                o += len(p)
+            dev = host[:total].to(self.device, non_blocking=True)
+        else:
+            host = torch.from_numpy(
+                np.concatenate(
+                    [
+                        slots,
+                        np.asarray(pens, dtype=np.float32).view(np.int32),
+                        seq_start,
+                        row_seq,
+                        row_pos,
+                    ]
+                )
+            ).pin_memory()
+            dev = host.to(self.device, non_blocking=True)
         bs, n = len(q), len(row_seq)
         return PresencePenaltyStep(
             self,
