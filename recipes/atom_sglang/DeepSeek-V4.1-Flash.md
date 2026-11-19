@@ -17,7 +17,9 @@ ATOM both fail at the first MoE call (CUDA graph capture or warm-up). Until aite
 FlyDSL path is not taken, use the validated aiter: the #7820 head 7bec3c672 (aiter main 13b6e87ce plus #7820) with
 #8086's `gemm_a8w8_blockscale_group32_supported` added to `aiter/ops/gemm_op_a8w8.py` (on gfx942 it returns False and
 those linears take the BF16 fallback). aiter main ca7cfa1c3 with only that check deferred selects the same MoE kernels
-and gives the same acceptance, accuracy and speed (see Measured).
+and gives the same acceptance, accuracy and speed (see Measured). ROCm/aiter#8178, merged on 2026-11-18 as a53213dc4
+(the AITER PR 3102's recipe pins at 85999b8b4), moves that check after the gfx942 FlyDSL path; the plugin has not been
+run on it yet.
 
 ## Launching Server
 
@@ -174,7 +176,11 @@ validated aiter above, the launch above, 4 fresh plugin servers (2 with and 2 wi
 122.2 s); acceptance 49.43-49.58% at 32 and 49.19-49.63% at 64, accept length 3.46-3.48 (native 49.57% and 49.48%)
 on the same prompts (|z| <= 0.43 at 32 and <= 0.94 at 64); lm_eval GSM8K 3-shot 0.922-0.923 on every plugin server; radix-hit TTFT
 (4105-token prompt, 3840 tokens cached, 12 pairs per prompt set, 2 sets per server) 97-128 ms per set, 108 ms mean
-(native 105-107 ms); first-wave TTFT at 64 clients on a fresh server 1.34-1.39 s (native 1.45 s).
+(native 105-107 ms); first-wave TTFT at 64 clients on a fresh server 1.34-1.39 s (native 1.45 s). PR 3102 has since
+moved to 85999b8b4 (FP4PTPC review fixes: V4.1 now refuses an FP4PTPC layer whose shared expert did not fuse into the
+converted routed experts, and a draft whose routed experts are not converted; the plugin's gfx942 default converts
+them, for an FP4PTPC checkpoint only). On 85999b8b4 the plugin is checked by its unit tests only (CPU); the numbers
+in this recipe have not been re-measured on GPU there yet.
 
 TP4 MI308X, SGLang 0.5.22, DSpark block 5 + radix cache
 + overlap + decode / verify / draft CUDA graphs + prefill token graphs, real DSpark acceptance (49-50% on GSM8K, accept
