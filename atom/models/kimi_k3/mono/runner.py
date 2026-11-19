@@ -21,11 +21,9 @@ decides which is which; the two paths hand each other the same tensors. A
 full-attention layer still runs K2 for everything after its attention
 (``_pre_o_core``), unless ``bind_model`` left it on the production path.
 
-The block-residual buffer is the one place the mono loop cannot reuse
-``KimiDecoderLayer.forward``: ``AttnRes.maybe_close_block`` grows the candidates
-with ``torch.cat``, while the kernels write their block into a slot of a buffer
-sized for the whole stack. ``_fallback`` is that same forward with the ``cat``
-replaced by a slot copy, so a fallback layer's numerics are the original path's.
+The kernels write each block into a slot of a bank sized for the whole stack,
+as ``AttnRes.maybe_close_block`` does. ``_fallback`` runs the layer's submodules
+on that bank, so a fallback layer's numerics are the original path's.
 
 ATOM carries two pending adds between layers (an MoE layer defers its routed and
 its shared output separately); K2 all-reduces one MoE output, so a mono layer
@@ -569,8 +567,8 @@ class K3MonoDecodeRunner:
         have run, on this step's return rather than reimplementing it, so the
         two cannot drift apart. ``out`` is ``(prefix, add, add2)``; the layer's
         own return carries the block bank in a fourth slot, and mono keeps that
-        in ``blocks`` -- a fixed-size slot stack, not the forward's grown
-        ``cat``, so only the slots banked so far hold this step's data.
+        in ``blocks`` -- the same fixed-size bank the forward carries. Only
+        the slots banked so far hold this step's data.
         """
         if layer_id not in self.aux.layer_ids:
             return
@@ -578,8 +576,7 @@ class K3MonoDecodeRunner:
         self.aux.write(layer_id, tap)
 
     def _fallback(self, plan, positions, prefix, blocks, add, add2):
-        """``KimiDecoderLayer.forward`` with ``maybe_close_block``'s ``cat``
-        replaced by a slot copy."""
+        """``KimiDecoderLayer.forward`` rerun from its submodules."""
         layer, normed, prefix, before, write_idx = self._seam(
             plan, prefix, blocks, add, add2
         )

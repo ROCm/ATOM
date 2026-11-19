@@ -65,7 +65,6 @@ from atom.models.deepseek_v2 import (
 from atom.models.utils import (
     IntermediateTensors,
     PPMissingLayer,
-    make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
     pp_holds_embedding,
@@ -1723,6 +1722,9 @@ class KimiDecoderLayer(nn.Module):
             getattr(self, "mlp_res_norm", None),
             out_norm=self.post_attention_layernorm,
             enabled=self.use_attn_residuals,
+            # This site's window includes this layer's block close.
+            block_size=getattr(config, "attn_res_block_size", None),
+            layer_idx=layer_num + 1,
         )
 
     def _ffn(
@@ -1927,12 +1929,34 @@ class KimiLinearModel(nn.Module):
         else:
             self.norm = PPMissingLayer()
 
-        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states", "block_residual"], config.hidden_size
+    def make_empty_intermediate_tensors(
+        self, batch_size: int, dtype: torch.dtype, device: torch.device
+    ) -> IntermediateTensors:
+        hidden_states = torch.zeros(
+            (batch_size, self.config.hidden_size), dtype=dtype, device=device
+        )
+        block_residual = self.block_bank(hidden_states)
+        if block_residual is None:
+            block_residual = hidden_states.new_zeros(
+                batch_size, 0, self.config.hidden_size
+            )
+        else:
+            block_residual.zero_()
+        return IntermediateTensors(
+            {"hidden_states": hidden_states, "block_residual": block_residual}
         )
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
+
+    def block_bank(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        """A slot per attention-residual block, read after its block closes."""
+        block_size = getattr(self.config, "attn_res_block_size", None)
+        if block_size is None:
+            return None
+        tokens, hidden = hidden_states.shape
+        blocks = -(-self.config.num_hidden_layers // block_size)
+        return hidden_states.new_empty(tokens, blocks, hidden)
 
     def forward(
         self,
@@ -1947,13 +1971,7 @@ class KimiLinearModel(nn.Module):
                 if inputs_embeds is not None
                 else self.embed_tokens(input_ids)
             )
-            block_residual = (
-                hidden_states.new_zeros(
-                    hidden_states.shape[0], 0, hidden_states.shape[1]
-                )
-                if getattr(self.config, "attn_res_block_size", None) is not None
-                else None
-            )
+            block_residual = self.block_bank(hidden_states)
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
