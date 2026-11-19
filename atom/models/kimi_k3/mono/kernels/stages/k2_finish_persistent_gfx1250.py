@@ -135,8 +135,19 @@ def _direct_poll(requests):
 
 # A ``profile`` finish's stamps a CTA, in order: its start, its token's routes
 # stored (routing CTAs), every token's HERD candidates in and HERD's outputs
-# stored (the HERD CTA), its shared down's stores issued, its stores drained.
-PROFILE_STAMPS = ("start", "routed", "herd_in", "herd_done", "shared_done", "end")
+# stored (the HERD CTA), its shared down's stores issued, its stores drained;
+# a parallel-HERD routing CTA's every wave past its candidates' poll, and
+# its batch popularity counted.
+PROFILE_STAMPS = (
+    "start",
+    "routed",
+    "herd_in",
+    "herd_done",
+    "shared_done",
+    "end",
+    "herd_seen",
+    "herd_counted",
+)
 PROFILE_WORDS = 8
 
 
@@ -345,9 +356,18 @@ def build_packed_finish(
     # Without routed experts every token's activated row stays staged.
     staged_rows = WMMA_TOKEN_ROWS * (1 if include_routed else tiles)
     # With ``parallel_herd`` the CTAs ahead of the routing ones take every
-    # shared-down task, ``shared_slots`` at most a CTA.
-    shared_ctas = plan.blocks - rows if parallel_herd else plan.blocks
-    shared_slots = -(-SHARED_DOWN_TASKS // shared_ctas) if parallel_herd else 2
+    # shared-down task, ``shared_slots`` at most a CTA; so do they without
+    # HERD where two tasks a CTA cover them, a routing CTA's route and its
+    # shared down otherwise the launch's last to finish.
+    routes_apart = parallel_herd or (
+        replicated_front
+        and include_shared
+        and not include_routed
+        and not precompute_herd
+        and SHARED_DOWN_TASKS <= 2 * (plan.blocks - rows)
+    )
+    shared_ctas = plan.blocks - rows if routes_apart else plan.blocks
+    shared_slots = -(-SHARED_DOWN_TASKS // shared_ctas) if routes_apart else 2
     shared_accumulator_words = (
         WAVES * GFX1250.wave_size * gemv_gfx1250.ACCUMULATOR_ELEMENTS
         if include_routed
@@ -419,6 +439,7 @@ def build_packed_finish(
         f"{'_rf' if replicated_front else ''}{'_herd' if herd else ''}"
         f"{'_f8' if fp8_shared_down else ''}{'_hp' if precompute_herd else ''}"
         f"{'_ph' if parallel_herd else ''}"
+        f"{'_ra' if routes_apart and not parallel_herd else ''}"
         f"{'_nohwd' if parallel_herd and not wave_drop else ''}"
         f"{'_norsb' if rolled and not split_bound else ''}"
         f"{f'_pl{herd_poll_limit}' if herd_poll_limit is not None else ''}"
@@ -816,7 +837,7 @@ def build_packed_finish(
                     )
                 does_shared = bid != herd_cta
             tasks = [bid, second_task]
-            if const_expr(parallel_herd):
+            if const_expr(routes_apart):
                 does_shared = bid < shared_ctas
                 tasks = [bid + slot * shared_ctas for slot in range(shared_slots)]
             if does_shared:

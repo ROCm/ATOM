@@ -77,4 +77,5 @@ def test_herd_candidates_feed_only_the_grouped_moe_finish():
     kernel = build_packed_finish(
         _plan(16), include_routed=False, replicated_front=True, herd=True
     )
-    assert kernel.name.endswith("_rf_herd")
+    # its 16 routing CTAs leave the shared down to the other 240
+    assert kernel.name.endswith("_rf_herd_ra")

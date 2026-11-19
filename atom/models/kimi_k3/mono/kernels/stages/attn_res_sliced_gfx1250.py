@@ -32,6 +32,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.rocdl import cluster as hw_cluster
 from flydsl.expr.typing import Int32, Int64, T
 
+from atom.models.kimi_k3.mono.kernels.stages import tdm_timeline
 from atom.models.kimi_k3.mono.kernels.stages.attn_res_gfx1250 import _wave_sums
 from atom.models.kimi_k3.mono.kernels.stages.attn_res_sliced_layout import (
     ELEMENTS,
@@ -136,10 +137,14 @@ def _gram_partials(rows, busy, crossed):
     return [busy.select(_dot8(rows[c], rows[d]), fx.Float32(0.0)) for c, d in crossed]
 
 
-def _cluster_exchange():
+def _cluster_exchange(drained=None, passed=None):
     """Every wave's cluster-scope stores drained, then the cluster barrier."""
     rocdl.s_wait_storecnt(0)
+    if drained is not None:
+        tdm_timeline.stamp(drained)
     hw_cluster.cluster_barrier()
+    if passed is not None:
+        tdm_timeline.stamp(passed)
 
 
 @dataclass(frozen=True)
@@ -272,6 +277,7 @@ def emit_sliced_mix(
         if const_expr(gram):
             partials = partials + _gram_partials(rows, busy, crossed)
         partials = _wave_sums(partials)
+        tdm_timeline.stamp(tdm_timeline.MIX_SUMMED)
         if lane == 0:
             for k in range_constexpr(reductions):
                 fx.ptr_store(partials[k], lds["partial"] + wave * reductions + k)
@@ -297,7 +303,7 @@ def emit_sliced_mix(
                         theirs * record + k * cluster + rank,
                         cache_modifier=CM_CLUSTER,
                     )
-        _cluster_exchange()
+        _cluster_exchange(tdm_timeline.MIX_DRAINED, tdm_timeline.MIX_PASSED)
         # every slice's sums, in slice order: a thread a (token, item)
         for first in range_constexpr(0, passing * items, THREADS):
             index = tid + first
@@ -321,6 +327,7 @@ def emit_sliced_mix(
                         lds["cross"] + owner * max(crosses, 1) + item - candidates,
                     )
         gpu.barrier()
+        tdm_timeline.stamp(tdm_timeline.MIX_SCORED)
         scores = [
             fx.ptr_load(lds["scores"] + local * candidates + c)
             for c in range_constexpr(candidates)
@@ -373,12 +380,15 @@ def emit_sliced_mix(
                         theirs * record + msq_at + rank,
                         cache_modifier=CM_CLUSTER,
                     )
-            _cluster_exchange()
+            _cluster_exchange(
+                tdm_timeline.MIX_NORM_DRAINED, tdm_timeline.MIX_NORM_PASSED
+            )
             norm = _slices_sum(rsrc(scratch), token * record + msq_at, cluster)
             inverse = hw_rsq(norm * fx.Float32(1.0 / HIDDEN) + fx.Float32(out_eps))
             mixed = [m * inverse * g for m, g in zip(mixed, gains)]
         if live & busy:
             _store_eight(rsrc(out), element, mixed)
+        tdm_timeline.stamp(tdm_timeline.MIX_STORED)
 
 
 def build_attn_res_sliced(
@@ -409,7 +419,9 @@ def build_attn_res_sliced(
     name = (
         f"k3_gfx1250_attn_res_sliced_c{cluster}_b{count}_a{addends}"
         f"{'_n' if out_norm else ''}{'_g' if mix.gram else ''}"
+        f"{tdm_timeline.suffix()}"
     )
+    timeline = tdm_timeline.key()
 
     @fx.struct
     class Lds:
@@ -433,7 +445,15 @@ def build_attn_res_sliced(
         tokens: Int32,
         scratch: Int64,
     ):
-        lds = fx.SharedAllocator().allocate(Lds).peek()
+        _ = timeline
+        allocator = fx.SharedAllocator()
+        lds = allocator.allocate(Lds).peek()
+        tdm_timeline.open_cta(
+            fx.block_idx.x,
+            fx.Int32(fx.thread_idx.x) // GFX1250.wave_size,
+            timeline,
+            allocator,
+        )
         emit_sliced_mix(
             mix,
             {
@@ -456,6 +476,7 @@ def build_attn_res_sliced(
             prefix_out,
             scratch,
         )
+        tdm_timeline.close_cta()
 
     @flyc.jit
     def launch(
