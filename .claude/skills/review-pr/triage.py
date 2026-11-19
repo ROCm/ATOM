@@ -2849,38 +2849,12 @@ def _same_file(a, b):
     return a == b or a.endswith("/" + b) or b.endswith("/" + a)
 
 
-def _claim_tokens(text):
-    """-> {lower-cased word: the spelling it was found with}.
-
-    Lower case decides whether two sides share a word, because the stopword list is lower
-    case and matching against it was not -- `Prefill` missed `prefill` while `This` sailed
-    through. The original spelling is kept because that is the only thing that can tell an
-    identifier from an ordinary word: lower-casing first killed IDENT's ALL_CAPS branch
-    outright, so a reason whose only distinctive word was `KVCACHE` had no claimable token
-    at all. Pure numbers are out (a shared `1024` is not a shared subject), and so are the
-    words SKILL.md mandates on every finding.
-    """
-    out = {}
-    for w in re.findall(r"\b[\w]{4,}\b", _fold_punct(text)):
-        k = w.lower()
-        if k.isdigit() or k in _FIRE_STOPWORDS or k in _CLAIM_TEMPLATE_WORDS:
-            continue
-        out.setdefault(k, w)
-    return out
 
 
-# A rule id at the head of a finding, through whatever emphasis, tag or sub-type sits in
-# front of it. Read only through _rule_head, by both the caller that registers the claim
-# and the one that refuses to ship the id, so the two cannot disagree.
-RULE_ID_HEAD = re.compile(r"[*`_ ]*([A-Z]+\d+[a-z]?)(?:-[\w-]+)?[*`_]*\s*(?::|—|–|--)")
-# What can sit in front of the id: the `[verified]` tag SKILL.md requires, the emphasis
-# its own examples use, and either of those wrapped in the other. `_publish.first_clause`
-# strips the tag before publishing, so anything the tag hides still reaches the reader as
-# an id-led line -- the ATOM#3481 symptom with decoration in front of it.
 LEAD_NOISE = re.compile(r"^[\s*`_]+")
 LEAD_GROUP = re.compile(r"^[\[(]([^\])]{0,60})[\])]")
 BARE_ID = re.compile(r"^([A-Z]+\d+[a-z]?)(?:-[\w-]+)?(?:\s*[/,]\s*[A-Z]+\d+[a-z]?)*"
-                     r"[\s*`_]*(?::|—|–|--|-(?!\w))")
+                     r"(?:\s*\([^)]{0,40}\))?[\s*`_]*(?::|—|–|--|-(?!\w)|\s+(?=[a-z]))")
 
 
 def _rule_head(text):
@@ -2900,26 +2874,19 @@ def _rule_head(text):
         if not g:
             return None
         inner = g.group(1).strip(" *`_")
-        if inner in REFUSED_IDS:             # `[B1]` is the id itself, not a tag over it
-            return inner
+        first = re.split(r"[/,]", inner)[0].strip()
+        if inner in REFUSED_IDS or first in REFUSED_IDS:             # `[B1]` is the id itself, not a tag over it
+            return inner if inner in REFUSED_IDS else first
         rest = rest[g.end():]
     return None
 RULE_SET = frozenset(ALL_RULES.split())
 # Every id rules.md names, not only the derivable ones: SKILL.md:234 tells the worker
-# `If not -> 📝 HK3`, and HK3 lives in UNREACHABLE_BY_DESIGN, so the card shipped it.
+# ids like HK3 live in UNREACHABLE_BY_DESIGN rather than ALL_RULES, and shipped.
 REFUSED_IDS = RULE_SET | frozenset(UNREACHABLE_BY_DESIGN)
 # The in-card scan kept its own copy of CITATION's extension list and drifted from it:
 # no `rs|toml`, so a Rust-only finding read as citing nothing and skipped both the
 # UNANCHORED and the UNBACKED check. Derived from CITATION so they cannot diverge again.
 CITATION_BARE = CITATION.pattern.split("(?::(")[0]
-_CLAIM_TEMPLATE_WORDS = frozenset(
-    "author must reviewer should ask verified inferred finding findings".split())
-_FIRE_STOPWORDS = frozenset(
-    "this that with from into when which where there their then than only also "
-    "every each both same other another still never always would could should "
-    "under over past here more most less least line lines code file files "
-    "path paths rule fire fired because since while after before".split()
-)
 VALUE = re.compile(r"\b\d+\b|fp8|fp16|bf16|fp4|int8|int32|int64|e4m3|e5m2|gfx\d+|"
                    r"nullptr|None\b|2\^\d+", re.I)
 IDENT = re.compile(r"\b[a-z]+_[a-z_0-9]{2,}\b|\b[A-Z][A-Z0-9_]{3,}\b")
@@ -3207,9 +3174,13 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
             if paths and any(_same_file(pp, cp) for pp in paths for cp in cited_here):
                 claims.setdefault(rule, []).append(text[:40])
             elif not paths and fire_tokens.get(rule):
-                # The card has to name one of them. Matched as written, not folded: the
+                # The card has to name one of them, on identifier boundaries. As a plain
+                # substring a two-character symbol finds itself everywhere -- `tp` inside
+                # "output", `kv` inside "kv_cache", `ep` inside "step" -- and claims a
+                # FIRE the finding was never about. Matched as written, not folded: the
                 # reason chose the spelling when it chose the backticks.
-                if any(sym in text for sym in fire_tokens[rule]):
+                if any(re.search(rf"(?<![\w]){re.escape(sym)}(?![\w])", text)
+                       for sym in fire_tokens[rule]):
                     claims.setdefault(rule, []).append(text[:40])
     # A finding may report more than one rule, and often should: aiter#3165 fired B4 and
     # E5 on the same changed file and one accurate bullet covered both. Requiring N
@@ -3226,7 +3197,10 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
         if rule not in reported:
             problems.append(("UNREPORTED-FIRE", f"{rule}: {why}",
                              "adjudicated FIRE and absent from the card -- report it, or "
-                             "change the verdict, or append `-- not reported: <reason>`"))
+                             "change the verdict, or append `-- not reported: <reason>`. "
+                             "A reason that cites no file is matched by the symbols it "
+                             "puts in backticks, so give it one the card names -- editing "
+                             "the verdict line to add them is a fix, not a cheat"))
     for sev, text in findings:
         red = sev.startswith("\U0001F534")
         cited = [p for p in re.findall(

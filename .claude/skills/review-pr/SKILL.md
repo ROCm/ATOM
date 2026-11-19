@@ -264,7 +264,7 @@ Six failure categories — work all six in order. Severity: 🔴 block / ⚠️ 
 Format, one per rule id:
 
 ```
-<RULE-ID> FIRE|CLEAR|N/A — <the specific reason, naming file:line, symbol, or the condition>
+<RULE-ID> FIRE|CLEAR|N/A — <the reason: file:line, or a `backticked` symbol the card will name>
 ```
 
 `CLEAR` means you looked and it does not apply *to this diff*; it is a claim, and the

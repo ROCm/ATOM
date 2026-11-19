@@ -540,6 +540,33 @@ Validation (deterministic): N/A -- no runtime surface changed
      "A5 FIRE -- foo.py:3 guard missing
 B1 FIRE -- \`kv_scale\` dropped on reload" \
      "diff --git a/foo.py b/foo.py")" ""
+# ...named on identifier boundaries. As a plain substring a two-character symbol finds
+# itself everywhere: `tp` inside "output", `kv` inside "kv_cache", `ep` inside "step".
+t "a symbol inside a longer word does not claim its FIRE" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ foo.py:3 output tuned config missing. **Author must** add one.' \
+     "A5 FIRE -- foo.py:3 tuned config missing
+B1 FIRE -- \`tp\` is off by one" \
+     "diff --git a/foo.py b/foo.py" | grep -c UNREPORTED-FIRE)" "1"
+t "nor does one inside a longer identifier" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ foo.py:3 guard missing. **Author must** add one.
+📝 kv_cache is resized late. **Author must** fix it.' \
+     "A5 FIRE -- foo.py:3 guard missing
+B1 FIRE -- \`kv\` dropped on reload" \
+     "diff --git a/foo.py b/foo.py" | grep -c UNREPORTED-FIRE)" "1"
 # Without backticks the reason offers no handle, whatever its words look like. FP32,
 # MI355X, GSM8K, num_tokens and head_dim all used to pass as names.
 t "a reason that backticks nothing is not claimed by look-alike words" \
@@ -590,18 +617,86 @@ _head_forms() {  # -> how many of the decorated forms are refused
   python3 -c '
 import sys; sys.path.insert(0, sys.argv[1]); import triage
 forms = ["**[verified] B1:** x", "**[verified]** B1: x", "`[verified]` B1: x",
-         "[verified] [B1] x", "[verified] (B1): x", "A5/B1: x", "D4 - x"]
+         "[verified] [B1] x", "[verified] (B1): x", "A5/B1: x", "D4 - x",
+         "D4 violation in the quant path", "HK3 bug fix without test",
+         "B1 (silent bypass): x", "[B1/B2] x"]
 print(sum(1 for f in forms if triage._rule_head(f)))' "$S"
 }
-t "a rule id hidden behind a tag, emphasis or brackets is still refused" "$(_head_forms)" "7"
+t "a rule id hidden behind a tag, emphasis or brackets is still refused" "$(_head_forms)" "11"
 _head_passes() {  # -> how many ordinary openings are left alone
   python3 -c '
 import sys; sys.path.insert(0, sys.argv[1]); import triage
 forms = ["FP8: x", "MI300: x", "[verified] x.py:1 drops it", "The caller must hold it",
-         "[inferred] planner.rs:108 charges only on req.stream"]
+         "[inferred] planner.rs:108 charges only on req.stream",
+         "FP8 scale is wrong", "MI300 support is missing"]
 print(sum(1 for f in forms if triage._rule_head(f) is None))' "$S"
 }
-t "and an ordinary opening is left alone" "$(_head_passes)" "5"
+t "and an ordinary opening is left alone" "$(_head_passes)" "7"
+# One shared 4-letter word was far too loose. SKILL.md mandates "**Author must**" on
+# every finding, so `must` alone let any finding claim any path-less FIRE whose reason
+# used it -- silencing the UNREPORTED-FIRE that should have fired for the other rule.
+# rules.md taught the shape the gate now withholds: ~50 `→ ⚠️ A1:` templates reach the
+# worker through `expand`, so the model was being shown the opening it would be refused
+# for. Refusing the output while the examples teach it is the same instruction/gate
+# disagreement this PR is about, one level up.
+# The template rewrite stripped the only `HKn` from each Housekeeping row, and
+# `expand_rules` finds those rows by that id -- so any diff deriving an HK rule got
+# MISSING-RULE-TEXT, rc 1, and fetch.sh aborted the whole review. A `.sh` file, a
+# `# TODO`, an `ATOM_` env var or three top-level dirs is enough to trigger it, which
+# includes this PR. The ids live in the Check column now, where expand reads them and no
+# card ever quotes them.
+t "a diff deriving housekeeping rules still expands" \
+  "$(d=$(mktemp -d)
+     printf 'diff --git a/x.sh b/x.sh\n--- a/x.sh\n+++ b/x.sh\n@@ -0,0 +1,2 @@\n+# TODO fix\n+export ATOM_FOO=1\n' > "$d/pr.diff"
+     python3 "$S/triage.py" rules "$d/pr.diff" > "$d/rules.txt" 2>/dev/null
+     grep -qE 'HK[0-9]' "$d/rules.txt" || { echo NO-HK-DERIVED; exit; }
+     python3 "$S/triage.py" expand "$d/rules.txt" "$S/rules.md" >/dev/null 2>&1
+     echo $?)" "0"
+t "no rule template opens with an internal rule id" \
+  "$(python3 -c '
+import re, sys, pathlib
+sys.path.insert(0, sys.argv[1]); import triage
+s = pathlib.Path(sys.argv[1], "rules.md").read_text()
+print(len([m for m in re.findall(r"[\u26a0\ufe0f\U0001f4dd\U0001f534/]+\s*([A-Z]+\d+[a-z]?)[-\w\[\]]*\s*:", s)
+           if m in triage.RULE_SET]))' "$S")" "0"
+# A verdict writes the path it found; SKILL.md's own good examples write the basename.
+# Matching the verdict's exact string meant the form the skill teaches could not claim
+# the FIRE it was reporting.
+t "the basename form SKILL.md teaches can claim a path FIRE" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ x.py:1 drops the scale. **Author must** keep it.' \
+     "A5 FIRE -- atom/models/x.py:1 drops the scale" \
+     "diff --git a/atom/models/x.py b/atom/models/x.py")" ""
+# ...on a segment boundary. A bare endswith would let `scale.py` answer for
+# `atom/models/kv_scale.py`, which is a different file whose name merely ends the same way.
+t "a file whose name merely ends the same way does not" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ scale.py:1 drops it. **Author must** keep it.' \
+     "A5 FIRE -- atom/models/kv_scale.py:1 drops the scale" \
+     "diff --git a/scale.py b/scale.py" | grep -c UNREPORTED-FIRE)" "1"
+t "a same-named file elsewhere does not" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ other/x.py:1 drops the scale. **Author must** keep it.' \
+     "A5 FIRE -- atom/models/x.py:1 drops the scale" \
+     "diff --git a/other/x.py b/other/x.py" | grep -c UNREPORTED-FIRE)" "1"
 t "an id rules.md names but never derives is refused too" \
   "$(_card_kinds '## T
 
