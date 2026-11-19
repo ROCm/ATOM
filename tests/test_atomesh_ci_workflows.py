@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import yaml
@@ -80,7 +81,7 @@ def test_atomesh_accuracy_uses_required_heavy_ci_gate():
     assert "optional-results" not in evaluate_inputs
 
 
-def test_a_pull_request_checks_one_model_on_atomesh_standalone(tmp_path):
+def test_a_pull_request_checks_one_model_standalone_and_1p1d(tmp_path):
     jobs = _jobs("atomesh-accuracy-validation.yaml")
     assert jobs["atomesh-test"]["env"]["USE_ATOMESH_ENTRYPOINTS"] == 1
     load = next(s for s in jobs["load-test-models"]["steps"] if s.get("id") == "load")
@@ -95,7 +96,99 @@ def test_a_pull_request_checks_one_model_on_atomesh_standalone(tmp_path):
         timeout=30,
     )
     models = json.loads(output.read_text().split("models_json=", 1)[1])
-    assert [m["model_name"] for m in models] == ["gpt-oss-120b"]
+    assert [(m["model_name"], m["serving"]) for m in models] == [
+        ("gpt-oss-120b", "standalone"),
+        ("gpt-oss-120b", "1p1d"),
+    ]
+    accuracy = _steps(jobs["atomesh-test"])["Run ATOM accuracy test"]
+    assert accuracy["env"]["SERVING"] == "${{ matrix.serving }}"
+    assert 'launch="bash .github/scripts/atomesh_pd_accuracy.sh"' in accuracy["run"]
+
+
+def test_the_accuracy_scope_matches_the_push_paths():
+    workflow = _workflow("atomesh-accuracy-validation.yaml")
+    events = workflow.get("on", workflow.get(True))
+    gate_env = next(
+        step["env"]
+        for step in workflow["jobs"]["ci-gate"]["steps"]
+        if step.get("id") == "gate"
+    )
+    assert gate_env["CI_GATE_PATHS_INCLUDE"].split() == events["push"]["paths"]
+    assert ".github/scripts/atomesh_pd_accuracy.sh" in events["push"]["paths"]
+
+
+def _read_when_written(path, timeout=10):
+    deadline = time.monotonic() + timeout
+    while not (path.exists() and path.read_text()):
+        assert time.monotonic() < deadline, f"nothing written to {path}"
+        time.sleep(0.05)
+    return path.read_text()
+
+
+def test_the_1p1d_launcher_puts_the_router_in_front_of_both_servers(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    # The servers and the router print how they were started into their logs.
+    stubs = {
+        "python3": 'echo "GPUS=$HIP_VISIBLE_DEVICES ENTRY=$USE_ATOMESH_ENTRYPOINTS'
+        ' HOME=$HOME $*"',
+        "atomesh": 'echo "$*"',
+        "curl": "exit 0",
+    }
+    for name, body in stubs.items():
+        (bin_dir / name).write_text(f"#!/bin/sh\n{body}\n")
+        (bin_dir / name).chmod(0o755)
+    env = dict(
+        os.environ,
+        PATH=f"{bin_dir}:{os.environ['PATH']}",
+        TMPDIR=str(tmp_path),
+        ATOMESH_BINARY=str(bin_dir / "atomesh"),
+        ATOM_HOST_IP="10.0.0.5",
+        ATOM_SERVER_PORT="8000",
+        ATOM_SERVER_LOG=str(tmp_path / "atom_server.log"),
+    )
+    script = WORKFLOWS.parent / "scripts" / "atomesh_pd_accuracy.sh"
+    subprocess.run(
+        ["bash", str(script), "/models/m", "--kv_cache_dtype", "fp8"],
+        env=env,
+        check=True,
+        capture_output=True,
+        timeout=60,
+    )
+
+    prefill = _read_when_written(tmp_path / "atom_prefill.log")
+    decode = _read_when_written(tmp_path / "atom_decode.log")
+    router = _read_when_written(tmp_path / "atom_server.log")
+    for log, gpus, port, role, handshake_port in (
+        (prefill, "0", "8010", "kv_producer", "6301"),
+        (decode, "1", "8020", "kv_consumer", "6302"),
+    ):
+        assert log.startswith(f"GPUS={gpus} ENTRY=0 "), log
+        assert f"--model /models/m --server-port {port} --kv_cache_dtype fp8" in log
+        assert (
+            f'{{"kv_role":"{role}","kv_connector":"mooncake","proxy_ip":"10.0.0.5",'
+            f'"handshake_port":{handshake_port},"protocol":"tcp"}}'
+        ) in log
+    assert prefill.split()[2] != decode.split()[2]
+    assert router.split() == [
+        "launch",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+        "--pd-disaggregation",
+        "--prefill",
+        "http://10.0.0.5:8010",
+        "--decode",
+        "http://10.0.0.5:8020",
+        "--policy",
+        "random",
+        "--backend",
+        "atom",
+        "--log-level",
+        "info",
+        "--disable-circuit-breaker",
+    ]
 
 
 def test_atomesh_benchmark_uses_required_heavy_ci_gate():
