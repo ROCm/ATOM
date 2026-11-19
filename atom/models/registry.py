@@ -64,6 +64,11 @@ mono_decode_installers = {
     "MiniMaxM3SparseForConditionalGeneration": (
         "atom.models.minimax_m3.mono.dispatch.install_mono_decode"
     ),
+    "Qwen3_5MoeForConditionalGeneration": (
+        "atom.models.qwen3_5.mono.dispatch.install_mono_decode"
+    ),
+    # the text-only architecture of the same checkpoints
+    "Qwen3_5MoeForCausalLM": ("atom.models.qwen3_5.mono.dispatch.install_mono_decode"),
 }
 # Speculative methods each architecture serves under pipeline_parallel_size > 1
 # (its drafts verified per stage, its drafter's aux taps relayed across stages).

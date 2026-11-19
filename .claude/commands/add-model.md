@@ -33,7 +33,7 @@ class NewModelForCausalLM(nn.Module):
         return self.lm_head(hidden_states)
 ```
 
-Reference: `llama.py` (simple), `qwen3_5.py` (hybrid attention), `deepseek_v2.py` (MoE + MLA).
+Reference: `llama.py` (simple), `qwen3_5/model.py` (hybrid attention), `deepseek_v2.py` (MoE + MLA).
 
 ### 3. Register the Model
 

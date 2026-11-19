@@ -134,6 +134,9 @@ class Qwen3_5MTP(nn.Module):
         # Skip target model weights
         return None
 
+    # MRoPE draft steps replay CUDA graphs, as Qwen4ExpMTP
+    draft_graph_supports_mrope = True
+
     def __init__(self, atom_config: Config, prefix: str = ""):
         super().__init__()
         config = get_qwen3_5_text_config(atom_config)
