@@ -1156,7 +1156,7 @@ def test_a_multi_connector_cancel_re_arms_honestly(monkeypatch):
     `[moriio, lmcache_offload]` ordering the offload sub arms a load and has it
     taken away. The cancel does not forget the hit: the tier did not stop
     holding the prefix because another connector won this step. So when moriio
-    stops matching -- its `kv_async_tagged` is one-shot -- the offload sub
+    stops matching -- once its receive is queued -- the offload sub
     answers from what it already knows, and only the dispatch pays the tier.
     """
 
