@@ -327,6 +327,8 @@ start_router() {
 
 if [[ -n "${ATOMESH_C48_CASE:-}" ]]; then
   source "${ATOMESH_SCRIPT_DIR}/pd_c48_server.sh"
+elif [[ "${ATOMESH_PR5090_ROUTER_AB:-0}" == 1 ]]; then
+  source "${ATOMESH_SCRIPT_DIR}/pd_recipe_router_ab.sh"
 elif [[ "${ATOMESH_M31_MORIIO:-}" == 1 ]]; then
   source "${ATOMESH_SCRIPT_DIR}/pd_m31_moriio_server.sh"
 else

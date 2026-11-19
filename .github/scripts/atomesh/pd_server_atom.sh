@@ -61,7 +61,7 @@ DECODE_DP_BASE_PORT="${DECODE_DP_BASE_PORT:-29800}"
 ATOMESH_EXECUTION_PHASE="${ATOMESH_EXECUTION_PHASE:-combined}"
 ATOMESH_SERVICE_PORT_OFFSET="${ATOMESH_SERVICE_PORT_OFFSET:-0}"
 case "${ATOMESH_EXECUTION_PHASE}" in
-  combined|benchmark|eval) ;;
+  combined|benchmark|eval|baseline|atomesh) ;;
   *)
     echo "ERROR: unsupported ATOMESH_EXECUTION_PHASE=${ATOMESH_EXECUTION_PHASE}" >&2
     exit 2

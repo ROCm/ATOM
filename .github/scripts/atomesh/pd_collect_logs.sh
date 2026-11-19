@@ -8,5 +8,5 @@ if [[ ! -d "${log_root}" ]]; then
   exit 0
 fi
 mkdir -p "${result_dir}"
-tar --exclude='.cache' --exclude='.aiter' -C "${log_root}" -cf - . |
+tar --exclude='.cache' --exclude='.aiter' --exclude='client-venv' --exclude='hf-cache' -C "${log_root}" -cf - . |
   tar --no-same-owner --no-same-permissions -C "${result_dir}" -xf -

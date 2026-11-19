@@ -1,0 +1,162 @@
+{
+  "source": {
+    "repo": "SemiAnalysisAI/InferenceX",
+    "pr": 5090,
+    "sha": "a269a4299e3761d54b6fbc09f0ce31ca84129f29",
+    "recipe": "inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/minimaxm31flash/vllm/mi355x-fp4/agentx/disagg-mooncake-variants.yaml",
+    "variant": "override_c40",
+    "recipe_sha256": "fb1625c2b79748c4fb26c91dbdda5120f4e52f304dfd1f898b27e59bd0f796c2"
+  },
+  "image": "vllm/vllm-openai-rocm:minimax-m31-flash-75bc8cf1@sha256:f8e8ab239e5edb7c3070c5802fc7fc0cbb889513bf81183dfc98ce1c77e1dfe1",
+  "model": "amd/MiniMax-M3.1-Flash-Quark-MXFP4",
+  "roles": {
+    "prefill": {
+      "nodes": 1,
+      "workers": 1,
+      "gpus": 4,
+      "args": {
+        "served-model-name": "amd/MiniMax-M3.1-Flash-Quark-MXFP4",
+        "tensor-parallel-size": 4,
+        "gpu-memory-utilization": 0.85,
+        "language-model-only": true,
+        "trust-remote-code": true,
+        "reasoning-parser": "minimax_m3",
+        "tool-call-parser": "minimax_m3",
+        "enable-auto-tool-choice": true,
+        "block-size": 128,
+        "kv-cache-dtype": "nvfp4",
+        "attention-config": "{\"indexer_kv_dtype\":\"nvfp4\",\"indexer_decode_cp\":true}",
+        "moe-backend": "aiter",
+        "disable-hybrid-kv-cache-manager": true,
+        "enable-prefix-caching": true,
+        "max-model-len": 1048576,
+        "speculative-config": "{\"method\":\"dspark\",\"num_speculative_tokens\":7,\"attention_backend\":\"TRITON_ATTN\",\"kv_cache_dtype\":\"fp8\",\"draft_sample_method\":\"probabilistic\",\"rejection_sample_method\":\"block\"}",
+        "enable-batch-sharded-sampling": true,
+        "renderer-num-workers": 8,
+        "enable-prompt-tokens-details": true,
+        "disable-uvicorn-access-log": true,
+        "max-num-batched-tokens": 32768,
+        "enable-dbo": true,
+        "dbo-prefill-token-threshold": 16384,
+        "dbo-decode-token-threshold": 32768,
+        "compilation-config": "{\"max_cudagraph_capture_size\":2048}",
+        "kv-transfer-config": "{\"kv_connector\":\"MultiConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"connectors\":[{\"kv_connector\":\"MooncakeConnector\",\"kv_role\":\"kv_producer\",\"kv_connector_extra_config\":{\"mooncake_protocol\":\"rdma\",\"num_workers\":10}},{\"kv_connector\":\"SimpleCPUOffloadConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"cpu_bytes_to_use\":1349000000000,\"lazy_offload\":false,\"cpu_lru_eviction\":true}}]}}",
+        "max-num-seqs": 80
+      },
+      "env": {
+        "VLLM_ROCM_USE_AITER": "1",
+        "VLLM_ROCM_USE_AITER_MOE": "1",
+        "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS": "0",
+        "VLLM_USE_V2_MODEL_RUNNER": "1",
+        "VLLM_USE_BREAKABLE_CUDAGRAPH": "1",
+        "DEBUG_HIP_DYNAMIC_QUEUES": "0",
+        "DEBUG_HIP_IGNORE_STREAM_PRIORITY": "0",
+        "HIP_FORCE_DEV_KERNARG": "1",
+        "NCCL_DMABUF_ENABLE": "0",
+        "HSA_ENABLE_IPC_MODE_LEGACY": "1",
+        "PYTHONHASHSEED": "0",
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONUNBUFFERED": "1",
+        "AITER_LOG_LEVEL": "WARNING",
+        "VLLM_ENGINE_READY_TIMEOUT_S": "7200",
+        "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS": "1200",
+        "VLLM_HTTP_TIMEOUT_KEEP_ALIVE": "3600",
+        "MC_GID_INDEX": "@fabric.rdma-gid-index",
+        "MC_IB_TC": "@fabric.rdma-tc",
+        "MC_MAX_CONCURRENT_REG_MR": "1",
+        "VLLM_MOONCAKE_CONNECTOR_TIMEOUT": "600",
+        "HF_HOME": "/hf_hub_cache",
+        "HF_HUB_CACHE": "/hf_hub_cache/hub",
+        "MC_MAX_MR_SIZE": "1073741824"
+      }
+    },
+    "decode": {
+      "nodes": 1,
+      "workers": 2,
+      "gpus": 4,
+      "args": {
+        "served-model-name": "amd/MiniMax-M3.1-Flash-Quark-MXFP4",
+        "tensor-parallel-size": 4,
+        "gpu-memory-utilization": 0.85,
+        "language-model-only": true,
+        "trust-remote-code": true,
+        "reasoning-parser": "minimax_m3",
+        "tool-call-parser": "minimax_m3",
+        "enable-auto-tool-choice": true,
+        "block-size": 128,
+        "kv-cache-dtype": "nvfp4",
+        "attention-config": "{\"indexer_kv_dtype\":\"nvfp4\",\"indexer_decode_cp\":true}",
+        "moe-backend": "aiter",
+        "disable-hybrid-kv-cache-manager": true,
+        "enable-prefix-caching": true,
+        "max-model-len": 1048576,
+        "speculative-config": "{\"method\":\"dspark\",\"num_speculative_tokens\":7,\"attention_backend\":\"TRITON_ATTN\",\"kv_cache_dtype\":\"fp8\",\"draft_sample_method\":\"probabilistic\",\"rejection_sample_method\":\"block\"}",
+        "enable-batch-sharded-sampling": true,
+        "renderer-num-workers": 8,
+        "enable-prompt-tokens-details": true,
+        "disable-uvicorn-access-log": true,
+        "max-num-batched-tokens": 8192,
+        "kv-transfer-config": "{\"kv_connector\":\"MooncakeConnector\",\"kv_role\":\"kv_consumer\",\"kv_connector_extra_config\":{\"mooncake_protocol\":\"rdma\",\"num_workers\":10}}",
+        "max-num-seqs": 5,
+        "compilation-config": "{\"cudagraph_capture_sizes\":[8,16,24,32,40],\"max_cudagraph_capture_size\":40}"
+      },
+      "env": {
+        "VLLM_ROCM_USE_AITER": "1",
+        "VLLM_ROCM_USE_AITER_MOE": "1",
+        "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS": "0",
+        "VLLM_USE_V2_MODEL_RUNNER": "1",
+        "VLLM_USE_BREAKABLE_CUDAGRAPH": "1",
+        "DEBUG_HIP_DYNAMIC_QUEUES": "0",
+        "DEBUG_HIP_IGNORE_STREAM_PRIORITY": "0",
+        "HIP_FORCE_DEV_KERNARG": "1",
+        "NCCL_DMABUF_ENABLE": "0",
+        "HSA_ENABLE_IPC_MODE_LEGACY": "1",
+        "PYTHONHASHSEED": "0",
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONUNBUFFERED": "1",
+        "AITER_LOG_LEVEL": "WARNING",
+        "VLLM_ENGINE_READY_TIMEOUT_S": "7200",
+        "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS": "1200",
+        "VLLM_HTTP_TIMEOUT_KEEP_ALIVE": "3600",
+        "MC_GID_INDEX": "@fabric.rdma-gid-index",
+        "MC_IB_TC": "@fabric.rdma-tc",
+        "MC_MAX_CONCURRENT_REG_MR": "1",
+        "VLLM_MOONCAKE_CONNECTOR_TIMEOUT": "600",
+        "HF_HOME": "/hf_hub_cache",
+        "HF_HUB_CACHE": "/hf_hub_cache/hub",
+        "MC_MAX_MR_SIZE": "268435456"
+      }
+    }
+  },
+  "environment": {
+    "NCCL_SOCKET_IFNAME": "@fabric.socket-ifname",
+    "GLOO_SOCKET_IFNAME": "@fabric.socket-ifname",
+    "NCCL_IB_HCA": "@fabric.rdma-devices",
+    "NCCL_IB_GID_INDEX": "@fabric.rdma-gid-index"
+  },
+  "benchmark_env": {
+    "AIPERF_REQUIRED_SERVER_METRIC_PREFIX": "vllm:"
+  },
+  "concurrency": 40,
+  "duration": 3600,
+  "agentx_version": "1.0.14",
+  "dataset": "semianalysis_cc_traces_weka_062126",
+  "frontend": {
+    "type": "vllm-router",
+    "enable_multiple_frontends": false,
+    "args": {
+      "policy": "consistent_hash",
+      "prefill-policy": "consistent_hash",
+      "decode-policy": "consistent_hash"
+    }
+  },
+  "setup_script": "vllm-router.sh",
+  "router_images": {
+    "baseline": "vllm/vllm-router:v0.1.16@sha256:4c9c87a7a911fd7628cf38a4c2ab65107a797778d95fa2a4d63e19f91b732e7c",
+    "atomesh": "rocm/atom-dev:nightly_202611110332@sha256:19712185deac1eca8db5f21bc25ff2f9a3f44758bfd7cec8cc1c7889fbea097d"
+  },
+  "router_policy": {
+    "baseline": "consistent_hash",
+    "atomesh": "dp_sticky"
+  }
+}

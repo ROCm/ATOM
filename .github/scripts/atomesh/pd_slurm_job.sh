@@ -73,6 +73,9 @@ fi
 if [[ "${ATOMESH_ENV_ATOMESH_AGENTIC_TORCH_PROFILE:-0}" == "1" ]]; then
   EXECUTION_PHASES=(benchmark)
 fi
+if [[ "${ATOMESH_ENV_ATOMESH_PR5090_ROUTER_AB:-0}" == 1 ]]; then
+  EXECUTION_PHASES=(baseline atomesh)
+fi
 ATOMESH_RESTART_PORT_OFFSET="${ATOMESH_RESTART_PORT_OFFSET:-1000}"
 if [[ "${#EXECUTION_PHASES[@]}" -gt 1 && ! "${ATOMESH_RESTART_PORT_OFFSET}" =~ ^[1-9][0-9]*$ ]]; then
   echo "ERROR: ATOMESH_RESTART_PORT_OFFSET must be a positive integer" >&2
@@ -210,7 +213,7 @@ start_vllm_router() {
   docker pull "${image}" || return $?
   docker image inspect --format '{{json .RepoDigests}} {{json .Config.Labels}}' "${image}" > "${log_file}.image.json"
   docker run --rm --network none --entrypoint "${router_command[0]}" "${image}" --version > "${log_file}.version.txt" 2>&1 || return $?
-  echo "[router] ${container} port=${port} ${mode_args[*]} log=${log_file}"
+  echo "[router] ${container} port=${port} ${router_command[*]} log=${log_file}"
   docker run -d --name "${container}" \
     --user "$(id -u):$(id -g)" \
     --network host \
@@ -293,6 +296,25 @@ run_container_rank() {
     container_log="container-${execution_phase}.log"
   fi
   local container="atomesh-${ATOMESH_CELL_ID}-${JOB_ID}-${rank}${phase_suffix}"
+  local ATOMESH_VLLM_ROUTER_IMAGE="${ATOMESH_VLLM_ROUTER_IMAGE:-}"
+  local ATOMESH_ENV_ATOMESH_VLLM_ROUTER_BACKEND="${ATOMESH_ENV_ATOMESH_VLLM_ROUTER_BACKEND:-}"
+  local ROUTER_POLICY="${ROUTER_POLICY}"
+  if [[ "${ATOMESH_ENV_ATOMESH_PR5090_ROUTER_AB:-0}" == 1 ]]; then
+    local -a settings=()
+    mapfile -t settings < <(python3 - "${REPO_ROOT}/${ATOMESH_ENV_ATOMESH_PR5090_CONTRACT}" "${execution_phase}" <<'PYROUTER'
+import json, sys
+contract=json.load(open(sys.argv[1]))
+arm=sys.argv[2]
+print(contract['router_images'][arm])
+print(contract['router_policy'][arm])
+print('atomesh' if arm == 'atomesh' else 'vllm')
+PYROUTER
+    )
+    [[ "${#settings[@]}" == 3 ]] || { echo 'Invalid router arm configuration' >&2; return 2; }
+    ATOMESH_VLLM_ROUTER_IMAGE="${settings[0]}"
+    ROUTER_POLICY="${settings[1]}"
+    ATOMESH_ENV_ATOMESH_VLLM_ROUTER_BACKEND="${settings[2]}"
+  fi
   local rank_dir="${RUN_DIR}/rank-${rank}"
   local bin_dir="${RUN_DIR}/bin"
   local video_gid render_gid host_ionic nccl_socket_ifname
@@ -354,6 +376,9 @@ EOF
     docker pull "${DOCKER_IMAGE}" || return $?
   fi
 
+  if [[ "${ATOMESH_ENV_ATOMESH_PR5090_ROUTER_AB:-0}" == 1 ]]; then
+    docker image inspect --format '{{json .RepoDigests}} {{json .Config.Labels}}' "${DOCKER_IMAGE}" > "${rank_dir}/worker-image-${execution_phase}.json"
+  fi
   local mesh_binary="${ATOMESH_MESH_BINARY:-/app/ATOM/atom/mesh/target/release/atomesh}"
   local router_container="" mooncake_router_request=""
   if [[ "${rank}" -eq 0 && "${BACKEND}" == "atom" ]]; then
@@ -424,6 +449,10 @@ EOF
   if [[ -n "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" ]]; then
     source "${REPO_ROOT}/.github/scripts/atomesh/pd_c48_port_mount.sh"
     c48_append_port_mount "${REPO_ROOT}" || return $?
+  fi
+  if [[ "${ATOMESH_ENV_ATOMESH_PR5090_ROUTER_AB:-0}" == 1 ]]; then
+    mkdir -p "${RUN_DIR}/hf-cache/hub"
+    docker_args+=(-v "${RUN_DIR}/hf-cache:/hf_hub_cache")
   fi
   if [[ -d /shared_nfs ]]; then
     docker_args+=(-v /shared_nfs:/shared_nfs)
@@ -541,6 +570,12 @@ EOF
   set -e
   # Other ranks exit once the router stops answering.
   bounded_docker_rm "${router_container}"
+  if [[ "${ATOMESH_ENV_ATOMESH_PR5090_ROUTER_AB:-0}" == 1 ]]; then
+    bounded_docker_rm "${container}"
+    local remaining
+    remaining="$(docker ps -a --filter "name=^/${container}(-router)?$" --format '{{.Names}}')" || return 1
+    [[ -z "${remaining}" ]] || { echo "Arm containers remain: ${remaining}" >&2; return 1; }
+  fi
   echo "[logs] rank=${rank} phase=${execution_phase} exited rc=${docker_rc}"
   if [[ "${docker_rc}" -ne 0 ]]; then
     echo "[logs] last 16384 bytes of ${rank_dir}/${container_log}:" >&2
@@ -611,7 +646,7 @@ run_spur_job() {
     publish_rank_rc "${SPUR_NODE_RANK_FOR_CLEANUP}" "${rc}"
     local suffix name remove_rc child query_rc=0
     local -a removers=()
-    for suffix in "" "-benchmark" "-eval" "-router" "-benchmark-router" "-eval-router"; do
+    for suffix in "" "-benchmark" "-eval" "-router" "-benchmark-router" "-eval-router" "-baseline" "-atomesh" "-baseline-router" "-atomesh-router"; do
       name="atomesh-${ATOMESH_CELL_ID}-${JOB_ID}-${SPUR_NODE_RANK_FOR_CLEANUP}${suffix}"
       (
         remove_rc=0
@@ -682,6 +717,24 @@ EOF
     if [[ "${rc}" -ne 0 ]]; then
       echo "=== Spur rank ${node_rank} phase=${execution_phase} failed rc=${rc} ==="
       return "${rc}"
+    fi
+    if [[ "${ATOMESH_ENV_ATOMESH_PR5090_ROUTER_AB:-0}" == 1 ]]; then
+      printf '%s\n' "${ATOMESH_RUN_TOKEN}" > "${RUN_DIR}/ab-${execution_phase}-${node_rank}.done"
+      local barrier_deadline=$((SECONDS + 180)) peer all_done
+      while :; do
+        all_done=1
+        for (( peer=0; peer<NUM_NODES; peer++ )); do
+          [[ -f "${RUN_DIR}/ab-${execution_phase}-${peer}.done" ]] &&
+            [[ "$(< "${RUN_DIR}/ab-${execution_phase}-${peer}.done")" == "${ATOMESH_RUN_TOKEN}" ]] || all_done=0
+        done
+        [[ "${all_done}" == 1 ]] && break
+        local barrier_peer_rc=0
+        peer_state failed || barrier_peer_rc=$?
+        [[ "${barrier_peer_rc}" == 1 ]] || { echo "Peer failed during arm teardown" >&2; return 1; }
+        (( SECONDS < barrier_deadline )) || { echo "Arm teardown barrier timed out" >&2; return 1; }
+        sleep 2
+      done
+      sleep 10
     fi
   done
 
