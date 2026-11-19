@@ -18,9 +18,6 @@ use crate::{
     routers::comm::error,
 };
 
-/// The named efforts a template takes (`VALID_TEMPLATE_EFFORTS`).
-const TEMPLATE_EFFORTS: [&str; 3] = ["low", "high", "max"];
-
 /// A chat request ready for prepare, and whether it holds to the required
 /// tool-call channel.
 pub(super) struct ChatAdmission {
@@ -104,7 +101,11 @@ impl AtomEngineRouter {
             }
         }
         let required_tool_call = take_tool_choice(&mut request, &mut kwargs)?;
-        let controls = reasoning_controls(thinking, request.reasoning_effort.take())?;
+        let controls = reasoning_controls(
+            thinking,
+            request.reasoning_effort.take(),
+            &self.engine.model.template_efforts,
+        )?;
         apply_reasoning_controls(
             &mut kwargs,
             self.engine.model.reasoning_toggle.as_ref(),
@@ -196,10 +197,12 @@ fn take_tool_choice(
 
 /// `resolve_reasoning_controls` under `CHAT_REASONING_RULES`: whether
 /// reasoning is switched on or off (none: left to the template) and the
-/// effort to render.
+/// effort to render. A named effort is kept only if it is one of
+/// `template_efforts` (`VALID_TEMPLATE_EFFORTS`).
 fn reasoning_controls(
     thinking: Option<&Value>,
     reasoning_effort: Option<String>,
+    template_efforts: &[String],
 ) -> Result<(Option<bool>, Option<Value>), Response> {
     let thinking = match thinking {
         None | Some(Value::Null) => None,
@@ -220,7 +223,7 @@ fn reasoning_controls(
             _ => return Err(bad_effort()),
         },
         Some(Value::Bool(_)) => return Err(bad_effort()),
-        Some(Value::String(s)) if TEMPLATE_EFFORTS.contains(&s.as_str()) => Some(Value::String(s)),
+        Some(Value::String(s)) if template_efforts.contains(&s) => Some(Value::String(s)),
         _ => None,
     };
     Ok((enabled, effort))
@@ -358,8 +361,12 @@ mod tests {
         assert!(join_text_parts(&mut media).is_err());
     }
 
+    fn efforts() -> Vec<String> {
+        ["low", "high", "max"].map(String::from).to_vec()
+    }
+
     fn controls(thinking: Value, effort: Option<&str>) -> (Option<bool>, Option<Value>) {
-        reasoning_controls(Some(&thinking), effort.map(str::to_string)).unwrap()
+        reasoning_controls(Some(&thinking), effort.map(str::to_string), &efforts()).unwrap()
     }
 
     #[test]
@@ -386,9 +393,22 @@ mod tests {
             json!({"effort": 2.5}),
             json!({"effort": true}),
         ] {
-            assert!(reasoning_controls(Some(&bad), None).is_err(), "{bad}");
+            assert!(
+                reasoning_controls(Some(&bad), None, &efforts()).is_err(),
+                "{bad}"
+            );
         }
-        assert!(reasoning_controls(Some(&json!("on")), None).is_err());
+        assert!(reasoning_controls(Some(&json!("on")), None, &efforts()).is_err());
+        // The deployment's efforts, not a fixed list: "medium" where it has one.
+        let medium = vec!["medium".to_string()];
+        assert_eq!(
+            reasoning_controls(None, Some("medium".into()), &medium).unwrap(),
+            (None, Some(json!("medium")))
+        );
+        assert_eq!(
+            reasoning_controls(None, Some("max".into()), &medium).unwrap(),
+            (None, None)
+        );
     }
 
     #[test]

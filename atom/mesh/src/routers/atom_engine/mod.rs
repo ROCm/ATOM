@@ -105,6 +105,7 @@ impl AtomEngineRouter {
         body: &ChatCompletionRequest,
         extras: &RawExtras,
     ) -> Result<Response, Response> {
+        extras.refuse_unserved()?;
         let chat = self.chat_request(body, extras.thinking.as_ref())?;
         let admission = Admission {
             required_tool_call: chat.required_tool_call,
@@ -144,15 +145,26 @@ impl AtomEngineRouter {
     }
 
     /// `/v1/completions`, as the Python server serves it: the prompt gets the
-    /// tokenizer's special tokens (BOS), and `logprobs` is ignored.
+    /// tokenizer's special tokens (BOS), and what its `CompletionRequest`
+    /// does not declare is ignored -- `logprobs`, `echo`, `suffix`,
+    /// `best_of`, `logit_bias` and `stream_options` (`/beta/completions`
+    /// alone serves `echo` and `suffix`).
     async fn completion(
         &self,
         headers: Option<&HeaderMap>,
         body: &CompletionRequest,
         extras: &RawExtras,
     ) -> Result<Response, Response> {
-        chat::validate_stream_options(body.stream, body.stream_options.as_ref())?;
-        let mut generate = completion_to_generate(body).map_err(|msg| {
+        extras.refuse_unserved()?;
+        let body = CompletionRequest {
+            echo: false,
+            suffix: None,
+            best_of: None,
+            logit_bias: None,
+            stream_options: None,
+            ..body.clone()
+        };
+        let mut generate = completion_to_generate(&body).map_err(|msg| {
             // The adapter is the gRPC router's too, and says so.
             let msg = msg.replace("gRPC /v1/completions path", "ATOM standalone server");
             error::bad_request("completion_unsupported_field", msg)
@@ -379,16 +391,55 @@ struct RawExtras {
     thinking: Option<Value>,
     #[serde(default)]
     data_parallel_rank: Option<Value>,
+    /// The Python server's fields this one does not serve yet, held only to
+    /// be refused (`refuse_unserved`) rather than dropped.
+    #[serde(default)]
+    kv_transfer_params: Option<Value>,
+    #[serde(default)]
+    prompt_token_ids: Option<Value>,
+    #[serde(default)]
+    return_token_ids: Option<Value>,
 }
+
+/// The keys `RawExtras` reads, as they appear in a JSON body.
+const RAW_EXTRA_KEYS: [&[u8]; 5] = [
+    b"\"thinking\"",
+    b"\"data_parallel_rank\"",
+    b"\"kv_transfer_params\"",
+    b"\"prompt_token_ids\"",
+    b"\"return_token_ids\"",
+];
 
 impl RawExtras {
     fn read(body: &[u8]) -> Result<Self, Response> {
         let names = |key: &[u8]| memchr::memmem::find(body, key).is_some();
-        if !names(b"\"thinking\"") && !names(b"\"data_parallel_rank\"") {
+        if !RAW_EXTRA_KEYS.iter().any(|key| names(key)) {
             return Ok(Self::default());
         }
         serde_json::from_slice(body)
             .map_err(|e| error::bad_request("invalid_request", e.to_string()))
+    }
+
+    /// Refuse what the Python server would act on and this one cannot:
+    /// P/D's `kv_transfer_params` (standalone refuses a P/D worker at
+    /// startup), a pre-tokenized prompt, and echoed prompt ids.
+    fn refuse_unserved(&self) -> Result<(), Response> {
+        let set = |v: &Option<Value>| !matches!(v, None | Some(Value::Null));
+        let unserved = [
+            ("kv_transfer_params", set(&self.kv_transfer_params)),
+            ("prompt_token_ids", set(&self.prompt_token_ids)),
+            (
+                "return_token_ids",
+                !matches!(
+                    self.return_token_ids,
+                    None | Some(Value::Null | Value::Bool(false))
+                ),
+            ),
+        ];
+        match unserved.iter().find(|(_, set)| *set) {
+            Some((name, _)) => Err(request::not_yet(name)),
+            None => Ok(()),
+        }
     }
 
     fn rank(&self) -> Result<Option<usize>, Response> {
@@ -433,5 +484,33 @@ mod tests {
         assert!(negative.rank().is_err());
         let text = RawExtras::read(br#"{"data_parallel_rank": "1"}"#).unwrap();
         assert!(text.rank().is_err());
+    }
+
+    #[test]
+    fn what_the_python_server_would_act_on_is_refused_not_dropped() {
+        for body in [
+            &br#"{"kv_transfer_params": {"do_remote_decode": true}}"#[..],
+            br#"{"prompt_token_ids": [1, 2]}"#,
+            br#"{"return_token_ids": true}"#,
+        ] {
+            let extras = RawExtras::read(body).unwrap();
+            assert!(
+                extras.refuse_unserved().is_err(),
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
+        for body in [
+            &br#"{"model": "m"}"#[..],
+            br#"{"kv_transfer_params": null, "prompt_token_ids": null}"#,
+            br#"{"return_token_ids": false}"#,
+        ] {
+            let extras = RawExtras::read(body).unwrap();
+            assert!(
+                extras.refuse_unserved().is_ok(),
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
     }
 }

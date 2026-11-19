@@ -71,6 +71,7 @@ mod b_execute_chat {
                     request_id: "req-test".to_string(),
                     weight_version: None,
                     cached_tokens: 0,
+                    timing: None,
                 },
             }),
         ]
@@ -300,6 +301,7 @@ mod c_execute_generate {
                     request_id: "req-test".to_string(),
                     weight_version: None,
                     cached_tokens: 0,
+                    timing: None,
                 },
             }),
         ]
@@ -411,6 +413,7 @@ mod d_execute_for_responses {
                     request_id: "req-test".to_string(),
                     weight_version: None,
                     cached_tokens: 0,
+                    timing: None,
                 },
             }),
         ]
@@ -513,6 +516,7 @@ mod e_metrics_labels {
                 request_id: "req-test".to_string(),
                 weight_version: None,
                 cached_tokens: 0,
+                timing: None,
             },
         })]
     }
@@ -898,6 +902,32 @@ mod h_completion_adapter {
         .unwrap();
         let err = completion_to_generate(&req).unwrap_err();
         assert!(err.contains("logit_bias"), "error: {err}");
+    }
+
+    #[test]
+    fn test_max_completion_tokens_over_max_tokens() {
+        let cap = |extra: Value| {
+            let mut body = json!({"model": "m", "prompt": "hi"});
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let req: CompletionRequest = serde_json::from_value(body).unwrap();
+            completion_to_generate(&req).map(|gen| gen.sampling_params.unwrap().max_new_tokens)
+        };
+        assert_eq!(cap(json!({"max_tokens": 8})), Ok(Some(8)));
+        assert_eq!(cap(json!({"max_completion_tokens": 4})), Ok(Some(4)));
+        assert_eq!(
+            cap(json!({"max_tokens": 8, "max_completion_tokens": 4})),
+            Ok(Some(4))
+        );
+        assert_eq!(
+            cap(json!({"max_tokens": 8, "max_completion_tokens": null})),
+            Ok(Some(8))
+        );
+        let err = cap(json!({"max_completion_tokens": 0})).unwrap_err();
+        assert!(err.contains("at least 1"), "error: {err}");
+        let err = cap(json!({"max_completion_tokens": "4"})).unwrap_err();
+        assert!(err.contains("integer"), "error: {err}");
     }
 
     #[test]

@@ -101,7 +101,10 @@ fn a_malformed_message_or_an_out_of_bounds_ref_is_refused() {
 
 fn spec_json() -> serde_json::Value {
     json!({
-        "model": {"served_name": "m", "tokenizer_path": "/m", "default_max_tokens": 16},
+        "model": {
+            "served_name": "m", "tokenizer_path": "/m", "default_max_tokens": 16,
+            "template_efforts": ["low", "high", "max"],
+        },
         "balance": {"strategy": "least_tokens", "req_equiv": 512},
         "engines": [
             {"dp_rank": 0, "pid": 10, "input": "ipc:///i0", "control": "ipc:///c0", "output": "ipc:///o0"},

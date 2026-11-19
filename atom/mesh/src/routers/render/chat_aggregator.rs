@@ -23,7 +23,10 @@ use crate::{
                 generate_tool_call_id, get_history_tool_calls_count, parse_json_schema_response,
             },
         },
-        render::logprob_conversion::token_logprobs_to_chat,
+        render::{
+            atom_usage::{self, AtomUsage},
+            logprob_conversion::token_logprobs_to_chat,
+        },
         token_handle::{
             token_chunk::{FinishReason, MatchedStop, TokenChunk},
             token_handle::TokenHandle,
@@ -40,8 +43,12 @@ use crate::{
 };
 
 pub async fn process(stream: TokenHandle, ctx: ResponseContext) -> Response {
-    match process_typed(stream, ctx).await {
-        Ok(resp) => axum::Json(resp).into_response(),
+    match aggregate(stream, ctx).await {
+        Ok((resp, None)) => axum::Json(resp).into_response(),
+        Ok((resp, Some(atom))) => match atom.extend_response(&resp, atom_usage::CHAT) {
+            Ok(value) => axum::Json(value).into_response(),
+            Err(e) => error::internal_error("serialize_failed", e.to_string()),
+        },
         Err(resp) => resp,
     }
 }
@@ -50,6 +57,14 @@ pub async fn process_typed(
     stream: TokenHandle,
     ctx: ResponseContext,
 ) -> Result<ChatCompletionResponse, Response> {
+    aggregate(stream, ctx).await.map(|(resp, _)| resp)
+}
+
+/// The response, and ATOM's usage additions where the backend has them.
+async fn aggregate(
+    stream: TokenHandle,
+    ctx: ResponseContext,
+) -> Result<(ChatCompletionResponse, Option<AtomUsage>), Response> {
     let chat_request = match &ctx.original {
         ProtocolRequest::Chat(r) => Arc::clone(r),
         ProtocolRequest::Generate(_) => {
@@ -145,7 +160,7 @@ pub async fn process_typed(
     .maybe_system_fingerprint(weight_version)
     .build();
 
-    Ok(response)
+    Ok((response, AtomUsage::of_completes(&completes)))
 }
 
 async fn collect_completes(mut stream: TokenHandle) -> Result<Vec<TokenChunk>, Response> {
@@ -339,12 +354,14 @@ async fn parse_tool_calls(
     }
 }
 
+/// The siblings share one prompt: it is counted once (each sibling reports
+/// it), their outputs summed.
 fn build_usage(completes: &[TokenChunk]) -> Usage {
     let mut prompt = 0u32;
     let mut completion = 0u32;
     for c in completes {
         if let TokenChunk::Complete { usage, .. } = c {
-            prompt += usage.prompt_tokens;
+            prompt = prompt.max(usage.prompt_tokens);
             completion += usage.completion_tokens;
         }
     }
