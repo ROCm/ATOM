@@ -159,19 +159,10 @@ def test_a_config_with_nvfp4_kv_defaults_the_index_to_nvfp4(monkeypatch):
     assert cfg.index_cache_dtype == "nvfp4"
 
 
-@pytest.mark.parametrize("aiter_takes_shard", [True, False])
 @pytest.mark.parametrize("kv,index", [("nvfp4", "nvfp4"), ("nvfp4", None)])
-def test_nvfp4_caches_need_aiters_sharded_scorer(
-    monkeypatch, caplog, kv, index, aiter_takes_shard
-):
-    """The NVFP4 index scores its CP shard with aiter's NVFP4 scorer, as the MXFP4 one
-    does: the flag stays on when the installed aiter's scorer takes the shard, and is
-    cleared with a warning when it does not."""
-    from atom import config
-
-    monkeypatch.setattr(
-        config, "_aiter_nvfp4_scorer_takes_cp_shard", lambda: aiter_takes_shard
-    )
+def test_nvfp4_caches_keep_the_indexer_cp_flag(monkeypatch, caplog, kv, index):
+    """The NVFP4 index scores its CP shard with aiter's NVFP4 scorer, as the MXFP4
+    index does with its own, so the flag stays on."""
     with caplog.at_level("WARNING", logger="atom"):
         cfg = _m3(
             monkeypatch,
@@ -181,9 +172,8 @@ def test_nvfp4_caches_need_aiters_sharded_scorer(
             hf={**sparse_hf(), "num_key_value_heads": 4},
             dcp_config=DCPConfig(indexer_dcp_only=True),
         )
-    assert cfg.dcp_config.indexer_dcp_only is aiter_takes_shard
-    refused = "aiter's NVFP4 index scorer lacks cp_world/cp_rank" in caplog.text
-    assert refused is not aiter_takes_shard
+    assert cfg.dcp_config.indexer_dcp_only is True
+    assert "indexer_dcp_only disabled" not in caplog.text
 
 
 def test_nvfp4_index_is_refused_off_minimax_m3(monkeypatch):

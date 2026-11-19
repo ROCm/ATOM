@@ -13,7 +13,6 @@ import types
 import pytest
 import torch
 
-from atom.config import _aiter_nvfp4_scorer_takes_cp_shard
 from atom.model_ops.minimax_m3.nvfp4_pages import (
     INDEX_DATA_PAGE_BYTES,
     INDEX_PAGE_BYTES,
@@ -25,10 +24,6 @@ gfx950 = pytest.mark.skipif(
     or "gfx950" not in torch.cuda.get_device_properties(0).gcnArchName
     or not hasattr(aiter.ops, "flydsl"),
     reason="needs gfx950 and aiter's FlyDSL",
-)
-sharded_scorer = pytest.mark.skipif(
-    not _aiter_nvfp4_scorer_takes_cp_shard(),
-    reason="aiter's NVFP4 index scorer lacks cp_world/cp_rank",
 )
 
 WORLD, TOPK, DIM = 4, 16, 128
@@ -190,16 +185,9 @@ def test_the_cp_scorer_hands_aiter_the_shard(monkeypatch):
     assert args[4] is seq and args[5:] == (S, WORLD, 0.5, local)
     assert kwargs["work_map"] is wmap and kwargs["out"] is out
     assert (kwargs["cp_world"], kwargs["cp_rank"]) == (WORLD, rank)
-    if _aiter_nvfp4_scorer_takes_cp_shard():
-        from aiter.ops import flydsl
-
-        inspect.signature(flydsl.minimax_m3_index_score_nvfp4_flydsl).bind(
-            *args, **kwargs
-        )
 
 
 @gfx950
-@sharded_scorer
 @pytest.mark.parametrize("ties", ["none", "coarse"])
 @pytest.mark.parametrize(
     "batch,S,blocks",
