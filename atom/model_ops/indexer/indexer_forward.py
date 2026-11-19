@@ -353,21 +353,42 @@ def sparse_attn_indexer(
     # cannot be gathered again using the whole step's row split.
     exchange = (
         _exchange_stream(indexer_module, context.is_prefill)
-        if rows.passes is None
+        if indexer_module.exchange_stream is not None and rows.passes is None
         else None
     )
-    topk_indices = score_topk(
-        ((q_quant.unsqueeze(1), q_fp4_scale.unsqueeze(1)) if indexer_fp4 else q_quant),
-        weights_mqa,
-        _index_cache(indexer_module, kv_cache, attn_metadata, context.is_prefill),
-        rows,
-        topk=topk_tokens,
-        weight_scale=weights_scale,
-        stable=stable_topk,
-        out=topk_indices[: rows.out_rows],
-        request_local=not single_rank_prefill,
-        gather=exchange is None,
-    )
+    if exchange is None:
+        topk_indices = score_topk(
+            (
+                (q_quant.unsqueeze(1), q_fp4_scale.unsqueeze(1))
+                if indexer_fp4
+                else q_quant
+            ),
+            weights_mqa,
+            _index_cache(indexer_module, kv_cache, attn_metadata, context.is_prefill),
+            rows,
+            topk=topk_tokens,
+            weight_scale=weights_scale,
+            stable=stable_topk,
+            out=topk_indices[: rows.out_rows],
+            request_local=not single_rank_prefill,
+        )
+    else:
+        topk_indices = score_topk(
+            (
+                (q_quant.unsqueeze(1), q_fp4_scale.unsqueeze(1))
+                if indexer_fp4
+                else q_quant
+            ),
+            weights_mqa,
+            _index_cache(indexer_module, kv_cache, attn_metadata, context.is_prefill),
+            rows,
+            topk=topk_tokens,
+            weight_scale=weights_scale,
+            stable=stable_topk,
+            out=topk_indices[: rows.out_rows],
+            request_local=not single_rank_prefill,
+            gather=False,
+        )
     if not context.is_prefill:
         if attn_metadata.max_seqlen_q > 1:
             triton_gather_kv_indices_sparse(

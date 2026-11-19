@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""A DCP sparse prefill's one work plan a forward, patched per layer, against
-the per-layer rebuild it replaces, on aiter's persistent MLA kernel."""
+"""Native-plan reuse and folded-plan rebuild on aiter's persistent MLA kernel."""
 
 import pytest
 import torch
@@ -17,6 +16,7 @@ def test_patched_forward_plan_matches_per_layer_rebuild(monkeypatch, cache_dtype
 
     from aiter import dtypes, get_mla_metadata_info_v1, get_mla_metadata_v1
     from aiter.mla import mla_decode_fwd
+    from aiter.ops.attention import get_mla_decode_shape_support
 
     from atom.model_ops import attention_mla
     from atom.model_ops.attention_mla import MLAAttention
@@ -82,7 +82,19 @@ def test_patched_forward_plan_matches_per_layer_rebuild(monkeypatch, cache_dtype
     def no_layer_plan(*args, **kwargs):
         raise AssertionError("a prefill layer planned its own work")
 
-    monkeypatch.setattr(attention_mla, "get_mla_metadata_v1", no_layer_plan)
+    support = get_mla_decode_shape_support(
+        heads, 1, dtype, dtype, persistent=True, return_lse=True, page_size=1
+    )
+    layer_plans = []
+
+    def layer_plan(*args, **kwargs):
+        layer_plans.append(args[1].clone())
+        return get_mla_metadata_v1(*args, **kwargs)
+
+    reuse = support.supported is True and support.native
+    monkeypatch.setattr(
+        attention_mla, "get_mla_metadata_v1", no_layer_plan if reuse else layer_plan
+    )
     attn = MLAAttention.__new__(MLAAttention)
     torch.nn.Module.__init__(attn)
     for name, value in {
@@ -103,6 +115,7 @@ def test_patched_forward_plan_matches_per_layer_rebuild(monkeypatch, cache_dtype
         "dcp_sparse_prefill_nonps": False,
         "owns_sparse_indexer": True,
         "sparse_prefill_head_groups": None,
+        "_sparse_prefill_kv_granularity": topk,
     }.items():
         setattr(attn, name, value)
 
@@ -169,16 +182,20 @@ def test_patched_forward_plan_matches_per_layer_rebuild(monkeypatch, cache_dtype
             assert torch.equal(out, expected)
             assert torch.equal(lse, expected_lse)
 
+    assert len(layer_plans) == (0 if reuse else 2)
+
 
 @pytest.mark.parametrize("rows", [64, 257])
 @pytest.mark.parametrize("cache_dtype", ["bf16", "fp8"])
-def test_patch_stops_at_the_plans_last_item(cache_dtype, rows):
+@pytest.mark.parametrize("heads", [16, 96])
+def test_patch_stops_at_the_plans_last_item(cache_dtype, rows, heads):
     """A PCP replan's dummy query has no keys, and the planner gives such a
     row no work item when it lands on a nearly full CU. The patch rewrites
     the plan's items only, not one a row past its end."""
     from types import SimpleNamespace
 
     from aiter import dtypes, get_mla_metadata_info_v1
+    from aiter.ops.attention import get_mla_decode_shape_support
 
     from atom.model_ops.attentions.aiter_mla import AiterMLAMetadataBuilder
     from atom.model_ops.attentions.sparse_mla_head_groups import (
@@ -187,7 +204,12 @@ def test_patch_stops_at_the_plans_last_item(cache_dtype, rows):
     from atom.model_ops.sparse_mla_work_plan import patch_work_kv_ranges
 
     dtype = dtypes.fp8 if cache_dtype == "fp8" else torch.bfloat16
-    heads, topk = 96, 2048
+    support = get_mla_decode_shape_support(
+        heads, 1, dtype, dtype, persistent=True, return_lse=True, page_size=1
+    )
+    if support.supported is not True or not support.native:
+        pytest.skip("range patching requires a native, unfolded plan")
+    topk = 2048
     gen = torch.Generator(device="cuda").manual_seed(500 + rows)
     sizes = get_mla_metadata_info_v1(
         rows, 1, heads, dtype, dtype, is_sparse=True, fast_mode=True

@@ -430,6 +430,9 @@ The backends implement the same LSE-weighted sum, with floating-point
 differences from accumulation order. Packed `a2a`
 bit-preserves fp32 LSE in two 16-bit slots when its buffer is bf16/fp16.
 Head-major prefill instead sends LSE as plain fp32 in a separate all-to-all.
+It requires `ATOM_MLA_ABSORB_BF16=1`: the default FP8 `W_V_dcp` keeps the
+packed layout and its single collective. FP4 and fused output quantization
+also keep the packed layout.
 
 | Value | Pattern | Collectives |
 |-------|---------|-------------|
@@ -587,14 +590,16 @@ memory DCP frees on K3 is the MLA share only, not the whole attention footprint.
 **Query-head width depends on the dispatch path.** K3 has 96 query heads, so
 at `-tp 8` each rank owns 12 and DCP uses `12 × dcp` group-wide heads: 24 at
 dcp2, 48 at dcp4 and 96 at dcp8. Persistent decode rounds to a multiple of 16
-up to 128: 24 becomes 32, while 48 and 96 are retained. Native 96 is not a
-fold. Supported non-native widths such as 48 use the persistent fold, which
-rebuilds query/KV indptrs to preserve the round-robin position mapping.
+up to 128: 24 becomes 32, while 48 and 96 are retained. AITER selects a native
+kernel or a head fold based on the architecture and dtypes. A fold rebuilds
+query/KV indptrs to preserve the round-robin position mapping.
 Non-persistent decode uses its dtype-specific table (16/32/128 for bf16,
 16/128 for fp8), so its gathered 96 is padded to 128.
 
 Sparse prefill selects its width separately. The eligible persistent path
-uses 16/32/64/96/128, so it pads 48 to 64 and runs 96 natively. Beyond 128,
+queries AITER for native support at candidate multiples of 16, retaining
+conservative 16/128 padding if support is folded or unknown. BF16 96-head
+prefill keeps 128-head padding for its small-prefill head-group path. Beyond 128,
 DCP decode warns and passes the rounded width to aiter; sparse prefill also
 warns and returns a rounded, unverified width. These widths are outside the
 range validated for these ATOM DCP paths. Subsequent dispatch depends on the
@@ -616,23 +621,27 @@ the persistent work/reduce metadata after each full IndexShare layer compacts it
 rank-local top-k. Following shared layers reuse its indices, compact indptr and
 work plan.
 
-Persistent **sparse prefill** builds one work plan per forward at the selected
-prefill head width. Each owning layer patches the plan's KV ranges to its own
-compacted indices; shared layers reuse that plan. The eligible gfx950 FP8 gqa64
+Persistent **sparse prefill** builds a work plan at the selected prefill head
+width. An owning layer patches its KV ranges only when AITER confirms native,
+unfolded support for the actual query and KV dtypes at that width. Folded or
+unknown plans are rebuilt from that layer's compacted indices; shared layers
+reuse the preceding owner's plan. The eligible gfx950 FP8 gqa64
 non-persistent prefill path needs neither a work plan nor per-layer patches.
 
 The decode configuration described here is native, non-speculative serving
-with page size 1 and q_len=1. Sparse prefill uses per-token virtual q_len=1 rows. Unsupported paths (including gfx942 and plugin or
-speculative sparse DCP paths without the per-layer rebuild) remain
+with page size 1 and q_len=1. Sparse prefill uses per-token virtual q_len=1 rows.
+Paths without persistent LSE support or the required per-layer rebuild remain
 non-persistent and round a gathered 64 up to **128**.
 
 **Sparse prefill's persistent path is not fp8-only.** Unlike the fp8-and-fp8
 requirement above (which is specifically about decode's gqa=64 kernel), sparse
 *prefill*'s persistent mode has no KV-dtype gate at all:
 `mla_dcp_sparse_prefill_is_persistent()` checks backend support, DCP world size,
-per-layer metadata rebuild, and page size. A bf16-KV sparse DCP prefill that satisfies
-those reaches gqa=64 directly the same as fp8 does; only a prefill that fails
-one of those (e.g. gfx942, or DCP≤1) still pads to 128.
+per-layer metadata rebuild, and page size. Width selection additionally queries
+AITER with the query/KV dtypes: gfx942 BF16 can run persistently while folding
+its heads into 16-head pseudo-batches. Those plans require per-layer rebuilds.
+The native-plan check uses the actual tensors' width and dtypes before
+patching; small-prefill head groups instead rebuild their own descriptors.
 
 GLM-5.2 has 64 query heads: `-tp 8 -dcp 8` and `-tp 4 -dcp 4` both gather
 64 and avoid padding to 128. Decode uses the persistent gqa64 path. Eligible

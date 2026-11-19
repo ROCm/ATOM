@@ -513,7 +513,7 @@ def _dcp_a2a_pack_kernel(
 
 @triton.jit
 def _dcp_a2a_unpack_combine_kernel(
-    recv_ptr,  # [N, B, H_LOCAL, D + LSE_PACK]  N = source rank (KV shard)
+    recv_ptr,  # [N, B, H_LOCAL, D (+ LSE_PACK when packed)]
     out_ptr,  # [B, H_LOCAL, D]
     out_lse_ptr,  # [B, H_LOCAL] fp32, or unused
     recv_stride_n,
@@ -784,10 +784,7 @@ def cp_lse_a2a(
     ), "cp_lse_a2a: the fused-quant combine does not emit LSE"
 
     n_ranks = cp_group.world_size
-    if head_major and (n_ranks == 1 or quant_dtype is not None):
-        # shortcut: the fused-quant combine reads only the packed layout, so this
-        # input still pays the copy and the pack; extend it when a caller needs both.
-        cp_attn_out, head_major = cp_attn_out.transpose(0, 1), False
+    assert not head_major or (n_ranks > 1 and quant_dtype is None)
     if n_ranks == 1:
         if quant_dtype is not None:
             # Nothing to combine, so there is no kernel to fold the quant into.
@@ -817,15 +814,17 @@ def cp_lse_a2a(
         recv = torch.empty_like(send)
         recv_lse = torch.empty_like(send_lse)
         group = cp_group.device_group
-        torch.distributed.all_to_all_single(
-            recv.view(torch.uint8), send.view(torch.uint8), group=group
-        )
+        torch.distributed.all_to_all_single(recv, send, group=group)
         torch.distributed.all_to_all_single(recv_lse, send_lse, group=group)
         # [N, B, H_local] views of what arrived as [N, H_local, B].
         recv = recv.view(n_ranks, h_local, b, head_dim).transpose(1, 2)
         recv_lse = recv_lse.view(n_ranks, h_local, b).transpose(1, 2)
         out = torch.empty((b, h_local, head_dim), dtype=dtype, device=dev)
-        out_lse = torch.empty((b, h_local), dtype=torch.float32, device=dev)
+        out_lse = (
+            torch.empty((b, h_local), dtype=torch.float32, device=dev)
+            if return_lse
+            else None
+        )
         _dcp_a2a_unpack_combine_kernel[(b, h_local)](
             recv,
             out,
@@ -835,8 +834,8 @@ def cp_lse_a2a(
             recv.stride(2),
             out.stride(0),
             out.stride(1),
-            out_lse.stride(0),
-            out_lse.stride(1),
+            out_lse.stride(0) if return_lse else 0,
+            out_lse.stride(1) if return_lse else 0,
             n_ranks,
             HEAD_DIM=head_dim,
             LSE_PACK=1,
@@ -1117,16 +1116,16 @@ def dcp_lse_merge(
 
     ``backend="mailbox"`` takes aiter's mailbox combine in a graph capture
     when its workspace was prepared (``prepare_dcp_mailbox``) and the call
-    fits it, else all-to-all. Head-major input stays on all-to-all. Every
+    fits it, else all-to-all. Head-major input requires all-to-all. Every
     input to that choice is the same on every rank of the group.
     """
+    assert not head_major or backend == "a2a"
     if backend == "mailbox":
-        if not head_major:
-            merged = _dcp_mailbox_merge(
-                cp_attn_out, cp_attn_lse, cp_group, owned_counts, quant_dtype
-            )
-            if merged is not None:
-                return merged
+        merged = _dcp_mailbox_merge(
+            cp_attn_out, cp_attn_lse, cp_group, owned_counts, quant_dtype
+        )
+        if merged is not None:
+            return merged
         backend = "a2a"
     if backend == "a2a":
         return cp_lse_a2a(
@@ -1140,8 +1139,6 @@ def dcp_lse_merge(
     assert (
         quant_dtype is None
     ), "dcp_lse_merge: fused-quant combine is only implemented for backend=a2a"
-    if head_major:
-        cp_attn_out = cp_attn_out.transpose(0, 1)
     if owned_counts is not None:
         # AG+RS needs an explicit LSE mask before its AllGather.
         # Packed A2A folds the mask into its pack; head-major A2A masks its LSE.

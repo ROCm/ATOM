@@ -208,7 +208,8 @@ def test_projection_layout_follows_the_merge_that_can_use_it(
     assert torch.equal(result, expected.to(torch.bfloat16).reshape(tokens, -1))
 
 
-def test_head_major_mailbox_request_stays_on_a2a():
+@pytest.mark.parametrize("backend", ["mailbox", "ag_rs"])
+def test_head_major_rejects_non_a2a_backend(backend):
     path = Path(__file__).resolve().parents[1] / "atom/model_ops/dcp_ops.py"
     function = next(
         node
@@ -223,29 +224,15 @@ def test_head_major_mailbox_request_stays_on_a2a():
     # Equal H and T would pass a shape-only check while interchanging axes.
     output = torch.arange(4 * 4 * 8).reshape(4, 4, 8)
 
-    def a2a(out, lse, group, **kwargs):
-        assert out is output
-        assert kwargs["head_major"]
-        return "a2a"
-
-    namespace.update(
-        cp_lse_a2a=a2a,
-        _dcp_mailbox_merge=lambda *args: pytest.fail(
-            "mailbox received head-major axes"
-        ),
-    )
-    assert (
-        namespace["dcp_lse_merge"](
-            output, None, None, backend="mailbox", head_major=True
-        )
-        == "a2a"
-    )
+    with pytest.raises(AssertionError):
+        namespace["dcp_lse_merge"](output, None, None, backend=backend, head_major=True)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("mask_empty", [False, True])
+@pytest.mark.parametrize("return_lse", [False, True])
 def test_head_major_exchange_preserves_partials_and_fp32_lse(
-    monkeypatch, dtype, mask_empty
+    monkeypatch, dtype, mask_empty, return_lse
 ):
     """Exercise the real exchange wrapper; only the collective/kernel are CPU stand-ins."""
     path = Path(__file__).resolve().parents[1] / "atom/model_ops/dcp_ops.py"
@@ -282,11 +269,11 @@ def test_head_major_exchange_preserves_partials_and_fp32_lse(
         assert group is cp_group.device_group
         calls.append(send)
         if len(calls) == 1:
-            assert send.dtype == torch.uint8
-            expected = partials[0].transpose(0, 1).contiguous().view(torch.uint8)
-            assert torch.equal(send, expected)
+            assert send.dtype == dtype
+            expected = partials[0].transpose(0, 1).contiguous()
+            assert torch.equal(send.view(torch.uint8), expected.view(torch.uint8))
             peers = partials[:, :, :local_heads].transpose(1, 2).contiguous()
-            recv.copy_(peers.reshape(heads, tokens, width).view(torch.uint8))
+            recv.copy_(peers.reshape(heads, tokens, width))
         else:
             assert len(calls) == 2
             assert send.dtype == torch.float32 and send.shape == (heads, tokens)
@@ -299,30 +286,76 @@ def test_head_major_exchange_preserves_partials_and_fp32_lse(
             assert grid == (tokens, local_heads)
             return self.run
 
-        def run(self, recv, out, out_lse, *args, recv_lse_ptr, **kwargs):
+        def run(
+            self,
+            recv,
+            out,
+            out_lse,
+            recv_stride_n,
+            recv_stride_b,
+            recv_stride_h,
+            out_stride_b,
+            out_stride_h,
+            lse_stride_b,
+            lse_stride_h,
+            n_ranks,
+            *,
+            recv_lse_ptr,
+            recv_lse_stride_n,
+            recv_lse_stride_b,
+            recv_lse_stride_h,
+            WRITE_LSE,
+            **kwargs,
+        ):
             assert recv.dtype == dtype
-            assert torch.equal(
-                recv.view(torch.uint8), partials[:, :, :local_heads].view(torch.uint8)
+            assert n_ranks == ranks and WRITE_LSE == return_lse
+            received = torch.as_strided(
+                recv,
+                (ranks, tokens, local_heads, width),
+                (recv_stride_n, recv_stride_b, recv_stride_h, 1),
             )
-            received_lse = recv_lse_ptr.reshape(ranks, tokens, local_heads)
+            assert torch.equal(
+                received.view(torch.uint8),
+                partials[:, :, :local_heads].view(torch.uint8),
+            )
+            received_lse = torch.as_strided(
+                recv_lse_ptr,
+                (ranks, tokens, local_heads),
+                (recv_lse_stride_n, recv_lse_stride_b, recv_lse_stride_h),
+            )
             assert torch.equal(received_lse, expected_lse[:, :, :local_heads])
             weights = torch.softmax(received_lse.double(), dim=0).nan_to_num()
-            out.copy_((recv.double().nan_to_num() * weights[..., None]).sum(0))
-            out_lse.copy_(torch.logsumexp(received_lse, dim=0))
+            torch.as_strided(
+                out,
+                (tokens, local_heads, width),
+                (out_stride_b, out_stride_h, 1),
+            ).copy_((received.double().nan_to_num() * weights[..., None]).sum(0))
+            if WRITE_LSE:
+                torch.as_strided(
+                    out_lse,
+                    (tokens, local_heads),
+                    (lse_stride_b, lse_stride_h),
+                ).copy_(torch.logsumexp(received_lse, dim=0))
+            else:
+                assert out_lse is None
 
     cp_group = SimpleNamespace(world_size=ranks, device_group=group)
     monkeypatch.setattr(torch.distributed, "all_to_all_single", exchange)
     namespace["_dcp_a2a_unpack_combine_kernel"] = Combine()
-    out, out_lse = namespace["cp_lse_a2a"](
+    result = namespace["cp_lse_a2a"](
         partials[0].transpose(0, 1).contiguous(),
         lse[0],
         cp_group,
         owned_counts=counts[0] if mask_empty else None,
         head_major=True,
-        return_lse=True,
+        return_lse=return_lse,
     )
+    out, out_lse = result if return_lse else (result, None)
     assert len(calls) == 2
     expected_weights = torch.softmax(expected_lse.double(), dim=0).nan_to_num()
     expected = (partials.double().nan_to_num() * expected_weights[..., None]).sum(0)
     assert torch.equal(out, expected[:, :local_heads].to(dtype))
-    assert torch.equal(out_lse, torch.logsumexp(expected_lse, dim=0)[:, :local_heads])
+    if return_lse:
+        assert torch.equal(
+            out_lse, torch.logsumexp(expected_lse, dim=0)[:, :local_heads]
+        )

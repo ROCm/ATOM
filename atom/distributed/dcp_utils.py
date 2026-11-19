@@ -78,8 +78,8 @@ def dcp_persistent_supported(
 
     Asks aiter whether mla_decode_fwd has a persistent decode that returns the
     lse DCP's merge needs, for this call: gfx950's ASM kernels, and gfx1250's
-    PS1 ones when AITER_MLA_DECODE_PS1_FLYDSL=1 selects them. gfx942 has none
-    and falls back to the triton stage2 reduce. Cache the result once per
+    PS1 ones when AITER_MLA_DECODE_PS1_FLYDSL=1 selects them. gfx942 support
+    depends on the dtype and selected head plan. Cache the result once per
     ``__init__``; it is not for the forward pass.
     """
     import torch

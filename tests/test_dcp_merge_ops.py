@@ -69,11 +69,9 @@ try:
 
     from atom.config import QuantizationConfig
     from atom.model_ops.attention_mla import (
-        _MLA_DCP_KERNEL_WIDTHS,
         _MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT,
         _MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT_FP8,
         _MLA_DCP_SPARSE_PREFILL_WIDTHS,
-        _MLA_DCP_SPARSE_PREFILL_WIDTHS_PERSISTENT,
         MLAAttention,
         mla_dcp_kernel_num_heads,
         mla_dcp_sparse_prefill_num_heads,
@@ -1591,24 +1589,11 @@ def test_dcp_prefill_key_gather_ignores_padded_request_tables(monkeypatch, lengt
 
 
 def test_rebuild_sparse_dcp_persistent_metadata_call_sites_use_their_own_width():
-    """Pins gathered_num_heads at the decode call site, not just the function.
-
-    Decode and sparse prefill round the gathered query width through
-    different tables (mla_dcp_kernel_num_heads vs mla_dcp_sparse_prefill_
-    num_heads) and can disagree (e.g. num_heads=12, dcp=4 -> 48 vs 64).
-    Passing the wrong one plans persistent work descriptors for the wrong
-    nhead; nothing importable on the CPU gate would notice a regression
-    here, so read the call sites from source instead. Sparse prefill does
-    not rebuild: the metadata builder plans it once a forward.
-    """
+    """Decode and folded prefill rebuild with their own query widths."""
     tree = ast.parse(_ATTENTION_MLA_PATH.read_text(encoding="utf-8"))
 
     def _name(node):
-        if isinstance(node, ast.Name):
-            return node.id
-        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
-            return f"{node.value.id}.{node.attr}"
-        return None
+        return ast.unparse(node)
 
     by_enclosing_func = {}
     for func in ast.walk(tree):
@@ -1626,6 +1611,7 @@ def test_rebuild_sparse_dcp_persistent_metadata_call_sites_use_their_own_width()
 
     assert by_enclosing_func == {
         "_forward_decode": "self.dcp_kernel_num_heads",
+        "_forward_prefill_mla": "q.shape[1]",
     }, (
         "a _rebuild_sparse_dcp_persistent_metadata call site is passing the "
         f"wrong gathered_num_heads (7th positional arg): got {by_enclosing_func}"
@@ -1633,25 +1619,39 @@ def test_rebuild_sparse_dcp_persistent_metadata_call_sites_use_their_own_width()
 
 
 @needs_dcp_ops
-def test_dcp_kernel_and_sparse_prefill_num_heads_can_diverge():
-    """Demonstrates the gap the test above guards against is real, not just
-    hypothetical: at 12 heads x DCP4 the two width tables actually disagree.
-    At DCP8 both run aiter's native gqa96 kernel, unpadded.
-    """
+def test_dcp_kernel_and_sparse_prefill_num_heads_can_diverge(monkeypatch):
+    """Prefill uses queried native widths and retains BF16 small-head grouping."""
+    from types import SimpleNamespace
+
+    from atom.model_ops import attention_mla
+
+    monkeypatch.setattr(
+        attention_mla,
+        "get_mla_decode_shape_support",
+        lambda width, *a, **k: SimpleNamespace(
+            native=width in (16, 32, 64, 96, 128), supported=True
+        ),
+    )
     widths = {
         dcp: (
             mla_dcp_kernel_num_heads(12, dcp, kv_cache_dtype="bf16", persistent=True),
-            mla_dcp_sparse_prefill_num_heads(12, dcp, persistent=True),
+            mla_dcp_sparse_prefill_num_heads(
+                12,
+                dcp,
+                persistent=True,
+                dtype_q=torch.bfloat16,
+                dtype_kv=torch.bfloat16,
+            ),
         )
         for dcp in (4, 8)
     }
-    assert widths == {4: (48, 64), 8: (96, 96)}, (
-        "expected decode's and sparse prefill's width tables to disagree at "
-        f"DCP4 and agree on 96 at DCP8; got {widths} -- if DCP4 now agrees, "
-        "the case above no longer proves the two call sites must use their "
-        "own width, pick another num_heads/dcp pair that still diverges"
+    assert widths == {4: (48, 64), 8: (96, 128)}
+    assert (
+        mla_dcp_sparse_prefill_num_heads(
+            12, 8, persistent=False, dtype_q=torch.bfloat16, dtype_kv=torch.bfloat16
+        )
+        == 128
     )
-    assert mla_dcp_sparse_prefill_num_heads(12, 8, persistent=False) == 128
 
 
 # ──────────────── QREP wiring at the q_proj producers (CPU, source-level) ──
@@ -2134,7 +2134,7 @@ def test_decode_width_comes_from_the_matching_table(num_heads, dcp, dtype):
             num_heads, dcp, HEAD_WIDTH_MIN, kv_cache_dtype=dtype, persistent=persistent
         )
         if persistent:
-            allowed = _MLA_DCP_KERNEL_WIDTHS
+            allowed = range(16, 129, 16)
         else:
             allowed = (
                 _MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT_FP8
@@ -2154,24 +2154,19 @@ def test_decode_width_comes_from_the_matching_table(num_heads, dcp, dtype):
 def test_sparse_prefill_width_matches_its_own_persistence_predicate(
     num_heads, dcp, rebuild
 ):
-    """The pairing this whole file exists for.
-
-    The width must come from this call site's own table
-    (``_MLA_DCP_SPARSE_PREFILL_WIDTHS*``), not decode's -- reading decode's
-    answer here is exactly how a sparse prefill would get its width chosen
-    from the wrong table.
-    """
+    """Persistent prefill selects a queried native width or conservative padding."""
     persistent = mla_dcp_sparse_prefill_is_persistent(
         dcp, True, sparse_metadata_rebuild=rebuild
     )
     w = mla_dcp_sparse_prefill_num_heads(
-        num_heads, dcp, HEAD_WIDTH_MIN, persistent=persistent
+        num_heads,
+        dcp,
+        HEAD_WIDTH_MIN,
+        persistent=persistent,
+        dtype_q=torch.bfloat16,
+        dtype_kv=torch.bfloat16,
     )
-    allowed = (
-        _MLA_DCP_SPARSE_PREFILL_WIDTHS_PERSISTENT
-        if persistent
-        else _MLA_DCP_SPARSE_PREFILL_WIDTHS
-    )
+    allowed = range(16, 129, 16) if persistent else _MLA_DCP_SPARSE_PREFILL_WIDTHS
     gathered = max(num_heads * dcp, HEAD_WIDTH_MIN)
     if gathered <= allowed[-1]:
         assert w in allowed, f"persistent={persistent}: {w} not in {allowed}"
@@ -2320,18 +2315,37 @@ def test_decode_is_persistent_requires_platform_support():
 
 
 @needs_dcp_ops
-def test_sparse_prefill_persistent_table_would_allow_gqa64():
-    """The persistent row is wired up, not dead.
+def test_sparse_prefill_queries_native_gqa64(monkeypatch):
+    from types import SimpleNamespace
 
-    Guards against the table being present but unreachable -- if enabling
-    persistent sparse prefill still could not pick 64, the plumbing would be
-    pointless and the 64->128 padding would stay.
-    """
+    from atom.model_ops import attention_mla
+
+    monkeypatch.setattr(
+        attention_mla,
+        "get_mla_decode_shape_support",
+        lambda width, *a, **k: SimpleNamespace(native=width == 64, supported=True),
+    )
     assert (
-        mla_dcp_sparse_prefill_num_heads(8, 8, HEAD_WIDTH_MIN, persistent=True) == 64
+        mla_dcp_sparse_prefill_num_heads(
+            8,
+            8,
+            HEAD_WIDTH_MIN,
+            persistent=True,
+            dtype_q=torch.bfloat16,
+            dtype_kv=torch.bfloat16,
+        )
+        == 64
     ), "persistent sparse prefill should reach gqa=64, not pad past it"
     assert (
-        mla_dcp_sparse_prefill_num_heads(8, 8, HEAD_WIDTH_MIN, persistent=False) == 128
+        mla_dcp_sparse_prefill_num_heads(
+            8,
+            8,
+            HEAD_WIDTH_MIN,
+            persistent=False,
+            dtype_q=torch.bfloat16,
+            dtype_kv=torch.bfloat16,
+        )
+        == 128
     ), (
         "the non-persistent pad table still pads 64 to 128; only the "
         "non-persistent gqa64 kernel (mla_dcp_sparse_prefill_mode) runs at 64"

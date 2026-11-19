@@ -585,9 +585,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # gathered width, not the per-rank one. Pad it the same way the module
         # does (mla_dcp_decode_is_persistent picks the width set), so these
         # descriptors always describe the kernel that will actually run.
-        # Only where aiter runs DCP decode persistent (gfx942 lacks the lse
-        # persistent kernel and stays non-persistent, where this metadata is
-        # unused) does it scale by dcp; elsewhere it keeps the per-rank sizing.
+        # Only where aiter reports a persistent kernel with LSE does it scale
+        # by dcp; elsewhere it keeps the per-rank sizing.
         # Target layers only: min_query_heads is the DSpark draft's, and the
         # draft plans its own descriptors (DSparkProposer).
         dcp_persistent = (
@@ -650,6 +649,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             self.sparse_prefill_num_heads = mla_dcp_sparse_prefill_num_heads(
                 self.num_attention_heads,
                 self.dcp_world_size,
+                dtype_q=self.dtype_q,
+                dtype_kv=self.dtype_kv,
                 persistent=mla_dcp_sparse_prefill_is_persistent(
                     self.dcp_world_size,
                     dcp_persistent,
@@ -2234,8 +2235,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         query rows, into the ``prefix`` set's buffers; none for the
         non-persistent DCP sparse prefill, which reads no plan.
 
-        Under DCP the plan holds one work item a row: each owning layer points
-        it at its own keys (``patch_work_kv_ranges``)."""
+        Native DCP plans hold one work item a row: each owning layer points
+        it at its own keys. Folded plans are rebuilt by each owning layer."""
         if self.dcp_sparse_prefill_nonps:
             return
         var = self.model_runner.forward_vars
