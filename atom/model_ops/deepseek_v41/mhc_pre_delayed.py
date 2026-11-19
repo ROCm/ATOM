@@ -112,6 +112,7 @@ def pre_delayed(
     sublayer_output=None,
     post_mix=None,
     combination=None,
+    res_preshuffle=False,
 ):
     """One sublayer seam: optional post, the delayed pre, the input RMSNorm.
 
@@ -139,6 +140,7 @@ def pre_delayed(
         sublayer_output=sublayer_output,
         post_mix=post_mix,
         combination=combination,
+        res_preshuffle=res_preshuffle,
     )
     # Keep the guarded op's outputs flat and preserve the no-post input alias
     # outside it. Only the attention-facing wrapper groups the norm outputs.
@@ -200,6 +202,7 @@ def v41_mhc_pre_delayed(
     sublayer_output: torch.Tensor | None = None,
     post_mix: torch.Tensor | None = None,
     combination: torch.Tensor | None = None,
+    res_preshuffle: bool = False,
 ) -> list[torch.Tensor]:
     """The seam as one guarded op, so Dynamo treats the launches as opaque."""
     *outer, hc_mult, hidden = residual.shape
@@ -207,6 +210,8 @@ def v41_mhc_pre_delayed(
     with_post = sublayer_output is not None
     kernel = mhc_fused_post_pre_delayed_rmsnorm
     options = {}
+    if res_preshuffle and not w_preshuffle_bf16:
+        raise ValueError("A shuffled mHC residual requires the HIP backend")
     if fuse_quant and not w_preshuffle_bf16:
         raise ValueError("Fused mHC quantization requires the HIP backend")
     if fuse_quant and not fuse_quant_supported():
@@ -220,6 +225,8 @@ def v41_mhc_pre_delayed(
         options["out_dtype"] = "mxfp8" if fuse_quant else "bf16"
         if fuse_quant:
             options.update(_row_major_scale_options())
+        if res_preshuffle:
+            options["res_preshuffle"] = True
     new_residual, post, comb, normed, pre = kernel(
         residual.view(rows, hc_mult, hidden),
         hc_fn,
