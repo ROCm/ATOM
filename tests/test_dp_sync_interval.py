@@ -89,7 +89,7 @@ def _run(intervals, work, commands=None, shutdown_at=32):
         )
 
         def all_reduce(tensor, *, op, group, e=engine):
-            kind = "bounds" if len(tensor.values) == 2 else "state"
+            kind = "bounds" if e.tick == -1 else "state"
             tensor.values = group.exchange(e.rank, kind, e.tick, tensor.values)
             e.events.append((kind, e.tick))
 
@@ -115,7 +115,6 @@ def _run(intervals, work, commands=None, shutdown_at=32):
             setattr(engine, name, method.__get__(engine))
 
         def pull(e=engine):
-            e.tick += 1
             if (e.rank, e.tick) in commands:
                 e.pending.append(commands[e.rank, e.tick])
             return e.tick >= shutdown_at
@@ -136,6 +135,9 @@ def _run(intervals, work, commands=None, shutdown_at=32):
             e.events.append(("dummy" if dummy else "forward", e.tick))
 
         def process_step(e=engine, do_step=step):
+            # schedule() polls the delayer on locally idle ranks too, before
+            # deciding whether the forward will be real or dummy.
+            e.scheduler.prefill_delayer.should_allow_prefill()
             if not work(e.rank, e.tick):
                 return False
             do_step()
@@ -146,14 +148,20 @@ def _run(intervals, work, commands=None, shutdown_at=32):
             process_queue=process_queue, push_metrics=lambda: None
         )
         engine.scheduler = SimpleNamespace(
-            heartbeat_throughput=lambda now: None,
+            heartbeat_throughput=lambda now, e=engine: setattr(e, "tick", e.tick + 1),
             is_finished=lambda e=engine: not work(e.rank, e.tick),
             engine_stats=SimpleNamespace(
                 note_busy=lambda now: None,
                 note_idle=lambda now: None,
                 bump_step=lambda: None,
             ),
-            prefill_delayer=None,
+            prefill_delayer=SimpleNamespace(
+                should_allow_prefill=lambda e=engine: (
+                    group.exchange(e.rank, "prefill", e.tick, [1]),
+                    e.events.append(("prefill", e.tick)),
+                ),
+                notify_idle=lambda: None,
+            ),
             publish_kv_events=lambda: None,
             shutdown_kv_events=lambda e=engine: setattr(e, "cleaned", True),
             close_kv_connector=lambda: None,
@@ -191,6 +199,8 @@ def test_uneven_work_keeps_real_and_dummy_steps_paired(interval):
     assert all(x == steps[0] for x in steps)
     assert len(steps[0]) >= 20
     assert any(kind == "dummy" for kind, _ in engines[1].events)
+    for engine in engines:
+        assert [t for kind, t in engine.events if kind == "prefill"] == steps[0]
     syncs = [[t for kind, t in e.events if kind == "state"] for e in engines]
     assert all(x == syncs[0] for x in syncs)
     assert syncs[0][: 20 // interval] == list(range(0, 20, interval))[: 20 // interval]
@@ -226,9 +236,30 @@ def test_mismatched_intervals_fail_on_all_ranks_before_state_or_forward(interval
     assert all(e.events == [("bounds", -1)] for e in engines)
 
 
+@pytest.mark.parametrize("intervals", [[1, None], [None, 8, 16, None]])
+def test_invalid_interval_fails_on_all_ranks_before_any_other_collective(intervals):
+    engines, failures = _run(intervals, lambda r, t: True)
+    assert len(failures) == len(intervals)
+    assert all(
+        isinstance(exc, ValueError) and "invalid value" in str(exc)
+        for _, exc in failures
+    )
+    assert all(e.events == [("bounds", -1)] for e in engines)
+
+
 def test_idle_then_new_work_restarts_with_a_sync():
     engines, failures = _run([8] * 2, lambda r, t: 4 <= t < 10 or 20 <= t < 24)
     assert not failures
     for engine in engines:
         assert ("state", 4) in engine.events and ("forward", 4) in engine.events
         assert ("state", 20) in engine.events and ("forward", 20) in engine.events
+
+
+def test_shutdown_drains_existing_work_with_sync_on_every_remaining_round():
+    engines, failures = _run([8] * 2, lambda r, t: t < 18 + r, shutdown_at=3)
+    assert not failures
+    for engine in engines:
+        syncs = [t for kind, t in engine.events if kind == "state"]
+        # A locally latched shutdown becomes global at the next sync (round 8).
+        assert list(range(8, 20)) == [t for t in syncs if 8 <= t <= 19]
+        assert any(kind == "forward" and t == 17 for kind, t in engine.events)

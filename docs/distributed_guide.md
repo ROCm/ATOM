@@ -641,8 +641,9 @@ local batch completes a dummy step alongside its peers. The default `1` keeps
 per-round synchronization; idle and held phases also synchronize every round.
 
 Set the same value on every node before starting the engines. One startup
-collective checks the minimum and maximum interval, and every rank raises on
-a mismatch before entering the busy loop. Restart to change the interval.
+collective checks the minimum and maximum interval and any invalid input.
+Every rank raises on a mismatch, non-integer value or int64 overflow before
+entering the busy loop. Restart to change the interval.
 
 Utility commands are applied on sync rounds. A command queued just after a
 sync can wait through the next N-1 paired rounds; this is a bound in engine

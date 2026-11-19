@@ -146,6 +146,16 @@ def _finite_float_env(name: str, default: float, *, allow_zero: bool) -> float:
     return value
 
 
+def _dp_sync_interval_env() -> int | None:
+    """Keep invalid input representable until every DP rank validates it."""
+    try:
+        interval = max(1, int(os.getenv("ATOM_DP_SYNC_INTERVAL", "1")))
+    except ValueError:
+        return None
+    # Gloo's agreement payload is int64; do not overflow before the collective.
+    return interval if interval <= (1 << 63) - 1 else None
+
+
 environment_variables: dict[str, Callable[[], Any]] = {
     # Optional standalone OpenTelemetry tracing (read once per process).
     "ATOM_ENABLE_OTEL_TRACE": lambda: os.getenv("ATOM_ENABLE_OTEL_TRACE", "0").lower()
@@ -1080,9 +1090,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Multi-node DP: while the group has unfinished work, run the cross-DP state
     # all_reduce only every N engine rounds (1 = every round). Utility
     # commands are applied only on rounds that sync.
-    "ATOM_DP_SYNC_INTERVAL": lambda: max(
-        1, int(os.getenv("ATOM_DP_SYNC_INTERVAL", "1"))
-    ),
+    "ATOM_DP_SYNC_INTERVAL": _dp_sync_interval_env,
     "ATOM_DP_LM_HEAD_MODE": lambda: os.getenv(
         "ATOM_DP_LM_HEAD_MODE", "all2all"
     ).lower(),

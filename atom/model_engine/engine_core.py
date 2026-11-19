@@ -1208,24 +1208,32 @@ class DPEngineCoreProc(EngineCore):
             finally:
                 tracing.shutdown()
 
-    def _validate_dp_sync_interval(self, interval: int) -> int:
+    def _validate_dp_sync_interval(self, interval: int | None) -> int:
         """Reject different sync cadences before any rank enters the busy loop.
 
         One MAX reduction gives both bounds. Every rank sees the same mismatch
         and raises, rather than pairing a state collective with a peer's model
         collective on the first skipped round.
         """
-        bounds = torch.tensor([interval, -interval], dtype=torch.int64, device="cpu")
+        value = 0 if interval is None else interval
+        bounds = torch.tensor(
+            [value, -value, int(interval is None)], dtype=torch.int64, device="cpu"
+        )
         torch.distributed.all_reduce(
             bounds, op=torch.distributed.ReduceOp.MAX, group=self.dp_group
         )
         highest, lowest = bounds[0].item(), -bounds[1].item()
+        if bounds[2].item():
+            raise ValueError(
+                "ATOM_DP_SYNC_INTERVAL must be an integer representable as int64 "
+                "on every DP rank; at least one rank has an invalid value"
+            )
         if highest != lowest:
             raise ValueError(
                 "ATOM_DP_SYNC_INTERVAL must match on every DP rank; "
                 f"got values from {lowest} to {highest}"
             )
-        return interval
+        return value
 
     def _execute_dummy_batch(self):
         fwd_out = self.runner_mgr.call_func("dummy_execution", wait_out=True)
