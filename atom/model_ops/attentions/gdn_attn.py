@@ -43,9 +43,9 @@ from .aiter_attention import (
     _mtp_prepare_decode_metadata_kernel,
     kv_indices_generate_triton,
 )
-from .pool_layout.entry_arena import published_bytes_for
 from .pool_layout.layer_major_page_unit_geometry import (
     layer_major_page_unit_bases,
+    layer_major_page_unit_bytes,
     layer_major_page_unit_regions,
     layer_major_page_unit_segments,
     layer_major_page_unit_stream_sizes,
@@ -2021,11 +2021,7 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
 
     def _published_page_unit_bytes(self) -> int:
         """Bytes one block publishes; asked at sizing, before any pool exists."""
-        return sum(
-            published_bytes_for(group)
-            for pool in self._declare_kv_pools().values()
-            for group in pool.field_groups
-        )
+        return layer_major_page_unit_bytes(self._declare_kv_pools().values())
 
     def _page_unit_pools(self) -> list:
         """Pools holding the PAGE image, in published order. A builder that

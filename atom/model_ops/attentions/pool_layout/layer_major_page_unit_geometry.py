@@ -25,6 +25,8 @@ from collections.abc import Iterable
 import numpy as np
 import torch
 
+from .entry_arena import published_bytes_for
+
 
 def layer_major_page_unit_regions(pools: Iterable) -> tuple[np.ndarray, np.ndarray]:
     """Base address and per-block stride of every published region.
@@ -55,6 +57,14 @@ def layer_major_page_unit_regions(pools: Iterable) -> tuple[np.ndarray, np.ndarr
     if not bases:
         raise RuntimeError("GDN PAGE checkpoint found no PAGE regions")
     return np.array(bases, dtype=np.int64), np.array(sizes, dtype=np.int64)
+
+
+def layer_major_page_unit_bytes(pools: Iterable) -> int:
+    """Bytes one block publishes across ``pools``: the fields, without the
+    alignment gaps between them."""
+    return sum(
+        published_bytes_for(group) for pool in pools for group in pool.field_groups
+    )
 
 
 def layer_major_page_unit_bases(

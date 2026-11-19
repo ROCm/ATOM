@@ -18,10 +18,10 @@ from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
 from atom.model_ops.attentions.pool_layout.entry_arena import (
     EntryField,
     LayerMajorArena,
-    published_bytes_for,
 )
 from atom.model_ops.attentions.pool_layout.layer_major_page_unit_geometry import (
     layer_major_page_unit_bases,
+    layer_major_page_unit_bytes,
     layer_major_page_unit_regions,
     layer_major_page_unit_segments,
     layer_major_page_unit_stream_sizes,
@@ -35,12 +35,6 @@ def _published_bytes(*, layers, entry_tokens, kv_dtype, num_kv_heads=1, head_dim
     scale = torch.float32.itemsize if kv_dtype.itemsize == 1 else 0
     per_token = num_kv_heads * (head_dim * kv_dtype.itemsize + scale)
     return layers * 2 * entry_tokens * per_token
-
-
-def _sized_bytes(pool):
-    """What `GDNAttentionMetadataBuilder._published_page_unit_bytes` charges
-    for one pool."""
-    return sum(published_bytes_for(group) for group in pool.field_groups)
 
 
 def _builder_cls():
@@ -246,7 +240,12 @@ class TestMhaRegionsMatchThePublishedPages:
             layers=15, entry_tokens=16, kv_dtype=torch.bfloat16
         )
         _, sizes = layer_major_page_unit_regions([pool])
-        assert _sized_bytes(pool) == published == int(sizes.sum()) == pool.entry_bytes
+        assert (
+            layer_major_page_unit_bytes([pool])
+            == published
+            == int(sizes.sum())
+            == pool.entry_bytes
+        )
 
     def test_narrow_dtype_drops_alignment_padding(self):
         """fp8-width fields declare scales. Their group is padded to 256 B,
@@ -254,7 +253,7 @@ class TestMhaRegionsMatchThePublishedPages:
         pool = _pool(kv_dtype=torch.int8)
         published = _published_bytes(layers=15, entry_tokens=16, kv_dtype=torch.int8)
         _, sizes = layer_major_page_unit_regions([pool])
-        assert _sized_bytes(pool) == published == int(sizes.sum())
+        assert layer_major_page_unit_bytes([pool]) == published == int(sizes.sum())
         assert published < pool.entry_bytes
 
     def test_a_qsa_arena_block_round_trips_through_its_regions(self):
@@ -321,7 +320,7 @@ class TestMhaRegionsMatchThePublishedPages:
         regions = layer_major_page_unit_regions([pool])
         bases, sizes = regions
         assert (
-            _sized_bytes(pool)
+            layer_major_page_unit_bytes([pool])
             == int(sizes.sum())
             == _published_bytes(layers=2, entry_tokens=256, kv_dtype=torch.int8)
         )
