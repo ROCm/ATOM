@@ -1433,6 +1433,17 @@ class MLAAttention(nn.Module):
         backend = self.dcp_comm_backend
         if backend == "mailbox" and not decode:
             backend = "a2a"
+        if head_major:
+            return dcp_lse_merge(
+                o,
+                lse,
+                self.dcp_group,
+                backend,
+                ctx=ctx,
+                owned_counts=owned_counts,
+                quant_dtype=quant_dtype,
+                head_major=True,
+            )
         return dcp_lse_merge(
             o,
             lse,
@@ -1441,7 +1452,6 @@ class MLAAttention(nn.Module):
             ctx=ctx,
             owned_counts=owned_counts,
             quant_dtype=quant_dtype,
-            head_major=head_major,
         )
 
     def _dcp_fused_quant_dtype(self):
@@ -1503,33 +1513,50 @@ class MLAAttention(nn.Module):
             head_major
             and not decode
             and self.pbm_enabled
+            and self.W_V_dcp_scale is None
+            and not is_rocm_aiter_fp4bmm_enabled()
             and self.dcp_comm_backend in ("a2a", "mailbox")
             and fused_quant is None
         )
         if self.pbm_enabled:
-            o = self._v_up_proj(
-                o,
-                self.W_V_dcp,
-                self.W_V_dcp_scale,
-                num_heads=o.shape[1],
-                head_major=head_major,
-            )
-        # Only the BF16 BMM can supply the requested [H, B, V] storage; the
-        # FP8/FP4 outputs keep [B, H, V], where transposing would add a copy.
-        head_major = head_major and o.transpose(0, 1).is_contiguous()
-        if head_major:
-            o = o.transpose(0, 1)
+            if head_major:
+                o = self._v_up_proj(
+                    o,
+                    self.W_V_dcp,
+                    self.W_V_dcp_scale,
+                    num_heads=o.shape[1],
+                    head_major=True,
+                )
+            else:
+                o = self._v_up_proj(
+                    o,
+                    self.W_V_dcp,
+                    self.W_V_dcp_scale,
+                    num_heads=o.shape[1],
+                )
         # Only PBM hands the merge output straight to o_proj, so it is the only
         # path whose activation quant the combine can absorb. The fp32 merge is
         # a prefill-accuracy path and keeps its bf16 store.
-        if merge_in_fp32:
+        if head_major:
+            o = o.transpose(0, 1)
+            dtype = o.dtype
+            o = self._dcp_merge(
+                o.float() if merge_in_fp32 else o,
+                lse,
+                ctx=ctx,
+                owned_counts=owned_counts,
+                decode=decode,
+                head_major=True,
+            )
+            if merge_in_fp32:
+                o = o.to(dtype)
+        elif merge_in_fp32:
             dtype = o.dtype
             o = self._dcp_merge(
                 o.float(),
                 lse,
                 ctx=ctx,
                 owned_counts=owned_counts,
-                head_major=head_major,
                 decode=decode,
             ).to(dtype)
         else:
@@ -1539,7 +1566,6 @@ class MLAAttention(nn.Module):
                 ctx=ctx,
                 owned_counts=owned_counts,
                 quant_dtype=fused_quant,
-                head_major=head_major,
                 decode=decode,
             )
         if fused_quant is not None:

@@ -10,6 +10,8 @@ conversion otherwise. The `Indexer` module (models/deepseek_v2.py) owns the
 projections and calls this op.
 """
 
+from contextlib import nullcontext
+
 import torch
 from aiter import dtypes, indexer_k_quant_and_cache
 
@@ -421,7 +423,7 @@ def sparse_attn_indexer(
             exchange.wait_stream(torch.cuda.current_stream())
             # The op drops its last reference while the exchange still runs.
             topk_indices.record_stream(exchange)
-        with torch.cuda.stream(exchange):
+        with torch.cuda.stream(exchange) if exchange is not None else nullcontext():
             if exchange is not None:
                 _gather_split(topk_indices, rows.split)
             triton_filter_and_convert_dcp_index_prefill(

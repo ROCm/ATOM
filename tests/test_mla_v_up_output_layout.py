@@ -193,7 +193,7 @@ def test_projection_layout_follows_the_merge_that_can_use_it(
     seen = _stub_bmm(namespace, "bf16", weights, None)
 
     def merge(out, lse, **kwargs):
-        assert kwargs["head_major"] == heads_layout
+        assert kwargs.get("head_major", False) == heads_layout
         assert kwargs["decode"] == decode
         assert seen["output"].is_contiguous() == (not heads_layout)
         logical = out.transpose(0, 1) if heads_layout else out
@@ -226,6 +226,69 @@ def test_head_major_rejects_non_a2a_backend(backend):
 
     with pytest.raises(AssertionError):
         namespace["dcp_lse_merge"](output, None, None, backend=backend, head_major=True)
+
+
+@pytest.mark.parametrize("branch,collectives", [("fp8", 1), ("fp4", 1), ("bf16", 2)])
+def test_one_row_prefill_keeps_the_projection_transport(
+    projection, monkeypatch, branch, collectives
+):
+    attn, namespace = projection
+    attn.num_heads = 2
+    heads = 2 * attn.num_heads
+    x, weights = _inputs(1, heads, attn.kv_lora_rank, attn.v_head_dim)
+    scale = None if branch == "bf16" else torch.ones(heads)
+    attn.W_V = attn.W_V_dcp = weights
+    attn.W_V_scale = attn.W_V_dcp_scale = scale
+    attn.pbm_enabled, attn.dcp_comm_backend = True, "a2a"
+    attn._dcp_fused_quant_dtype = lambda: None
+    attn.o_proj = lambda value: value
+    _stub_bmm(namespace, branch, weights, scale)
+
+    path = Path(__file__).resolve().parents[1] / "atom/model_ops/dcp_ops.py"
+    functions = [
+        node
+        for node in ast.parse(path.read_text()).body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"cp_lse_a2a", "_lse_pack_slots"}
+    ]
+    transport = {
+        "torch": torch,
+        "triton": SimpleNamespace(next_power_of_2=lambda n: 1 << (n - 1).bit_length()),
+    }
+    exec(  # noqa: S102 - real transport wrapper, with collectives/kernels stubbed
+        compile(ast.Module(body=functions, type_ignores=[]), str(path), "exec"),
+        transport,
+    )
+    calls = []
+
+    def exchange(recv, send, *, group):
+        calls.append(send.shape)
+        recv.zero_()
+
+    class Kernel:
+        def __init__(self, output_index):
+            self.output_index = output_index
+
+        def __getitem__(self, grid):
+            return lambda *args, **kwargs: args[self.output_index].zero_()
+
+    transport.update(
+        _dcp_a2a_pack_kernel=Kernel(3),
+        _dcp_a2a_unpack_combine_kernel=Kernel(1),
+        _dcp_a2a_head_major_combine_kernel=Kernel(1),
+    )
+    monkeypatch.setattr(torch.distributed, "all_to_all_single", exchange)
+    cp_group = SimpleNamespace(world_size=2, device_group=object())
+
+    def merge(out, lse, **kwargs):
+        return transport["cp_lse_a2a"](
+            out, lse, cp_group, head_major=kwargs.get("head_major", False)
+        )
+
+    attn._dcp_merge = merge
+    result = attn._dcp_project_merge_out(x, torch.zeros(1, heads), head_major=True)
+    assert result.shape == (1, attn.num_heads * attn.v_head_dim)
+    assert len(calls) == collectives
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
@@ -341,7 +404,7 @@ def test_head_major_exchange_preserves_partials_and_fp32_lse(
 
     cp_group = SimpleNamespace(world_size=ranks, device_group=group)
     monkeypatch.setattr(torch.distributed, "all_to_all_single", exchange)
-    namespace["_dcp_a2a_unpack_combine_kernel"] = Combine()
+    namespace["_dcp_a2a_head_major_combine_kernel"] = Combine()
     result = namespace["cp_lse_a2a"](
         partials[0].transpose(0, 1).contiguous(),
         lse[0],

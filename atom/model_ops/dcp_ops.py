@@ -512,26 +512,21 @@ def _dcp_a2a_pack_kernel(
 
 
 @triton.jit
-def _dcp_a2a_unpack_combine_kernel(
-    recv_ptr,  # [N, B, H_LOCAL, D (+ LSE_PACK when packed)]
+def _dcp_a2a_combine(
+    base,
+    lse_ptr,
     out_ptr,  # [B, H_LOCAL, D]
     out_lse_ptr,  # [B, H_LOCAL] fp32, or unused
-    recv_stride_n,
-    recv_stride_b,
-    recv_stride_h,
+    b,
+    h,
+    valid,
     out_stride_b,
     out_stride_h,
     lse_stride_b,
     lse_stride_h,
-    N_RANKS,
     HEAD_DIM: tl.constexpr,
     LSE_PACK: tl.constexpr,
-    N_ROUNDED: tl.constexpr,
     WRITE_LSE: tl.constexpr,
-    recv_lse_ptr=None,  # [N, B, H_LOCAL] fp32 sent apart from recv, or packed in it
-    recv_lse_stride_n=0,
-    recv_lse_stride_b=0,
-    recv_lse_stride_h=0,
 ):
     """LSE-weighted combine along the KV-shard axis. One program per (token, head).
 
@@ -539,32 +534,6 @@ def _dcp_a2a_unpack_combine_kernel(
     ever relocated, never summed across. That is what makes the head split above
     free to be any partition.
     """
-    b = tl.program_id(axis=0).to(tl.int64)
-    h = tl.program_id(axis=1).to(tl.int64)
-
-    n = tl.arange(0, N_ROUNDED)
-    valid = n < N_RANKS
-    # The padding lanes are masked at every load, which is the documented Triton
-    # contract. They are also folded onto lane 0 here so no pointer is ever
-    # FORMED outside `recv` -- belt and braces, asked for in review, and free:
-    # the select folds into the address arithmetic.
-    n_safe = tl.where(valid, n, 0)
-    base = (
-        recv_ptr
-        + n_safe.to(tl.int64) * recv_stride_n
-        + b * recv_stride_b
-        + h * recv_stride_h
-    )
-    if recv_lse_ptr is None:
-        lse_ptr = base + HEAD_DIM
-    else:
-        lse_ptr = (
-            recv_lse_ptr
-            + n_safe.to(tl.int64) * recv_lse_stride_n
-            + b * recv_lse_stride_b
-            + h * recv_lse_stride_h
-        )
-
     if LSE_PACK == 1:
         lse = tl.load(lse_ptr, mask=valid, other=float("-inf"))
         lse = lse.to(tl.float32)
@@ -612,6 +581,100 @@ def _dcp_a2a_unpack_combine_kernel(
     tl.store(
         out_ptr + b * out_stride_b + h * out_stride_h + d,
         acc.to(out_ptr.dtype.element_ty),
+    )
+
+
+@triton.jit
+def _dcp_a2a_unpack_combine_kernel(
+    recv_ptr,
+    out_ptr,
+    out_lse_ptr,
+    recv_stride_n,
+    recv_stride_b,
+    recv_stride_h,
+    out_stride_b,
+    out_stride_h,
+    lse_stride_b,
+    lse_stride_h,
+    N_RANKS,
+    HEAD_DIM: tl.constexpr,
+    LSE_PACK: tl.constexpr,
+    N_ROUNDED: tl.constexpr,
+    WRITE_LSE: tl.constexpr,
+):
+    b = tl.program_id(axis=0).to(tl.int64)
+    h = tl.program_id(axis=1).to(tl.int64)
+    n = tl.arange(0, N_ROUNDED)
+    valid = n < N_RANKS
+    # Masked lanes still form addresses inside the allocation.
+    n_safe = tl.where(valid, n, 0).to(tl.int64)
+    base = recv_ptr + n_safe * recv_stride_n + b * recv_stride_b + h * recv_stride_h
+    _dcp_a2a_combine(
+        base,
+        base + HEAD_DIM,
+        out_ptr,
+        out_lse_ptr,
+        b,
+        h,
+        valid,
+        out_stride_b,
+        out_stride_h,
+        lse_stride_b,
+        lse_stride_h,
+        HEAD_DIM,
+        LSE_PACK,
+        WRITE_LSE,
+    )
+
+
+@triton.jit
+def _dcp_a2a_head_major_combine_kernel(
+    recv_ptr,
+    out_ptr,
+    out_lse_ptr,
+    recv_stride_n,
+    recv_stride_b,
+    recv_stride_h,
+    out_stride_b,
+    out_stride_h,
+    lse_stride_b,
+    lse_stride_h,
+    N_RANKS,
+    HEAD_DIM: tl.constexpr,
+    N_ROUNDED: tl.constexpr,
+    WRITE_LSE: tl.constexpr,
+    recv_lse_ptr,
+    recv_lse_stride_n,
+    recv_lse_stride_b,
+    recv_lse_stride_h,
+):
+    b = tl.program_id(axis=0).to(tl.int64)
+    h = tl.program_id(axis=1).to(tl.int64)
+    n = tl.arange(0, N_ROUNDED)
+    valid = n < N_RANKS
+    n_safe = tl.where(valid, n, 0).to(tl.int64)
+    base = recv_ptr + n_safe * recv_stride_n + b * recv_stride_b + h * recv_stride_h
+    lse_ptr = (
+        recv_lse_ptr
+        + n_safe * recv_lse_stride_n
+        + b * recv_lse_stride_b
+        + h * recv_lse_stride_h
+    )
+    _dcp_a2a_combine(
+        base,
+        lse_ptr,
+        out_ptr,
+        out_lse_ptr,
+        b,
+        h,
+        valid,
+        out_stride_b,
+        out_stride_h,
+        lse_stride_b,
+        lse_stride_h,
+        HEAD_DIM,
+        1,
+        WRITE_LSE,
     )
 
 
@@ -825,7 +888,7 @@ def cp_lse_a2a(
             if return_lse
             else None
         )
-        _dcp_a2a_unpack_combine_kernel[(b, h_local)](
+        _dcp_a2a_head_major_combine_kernel[(b, h_local)](
             recv,
             out,
             out_lse,
@@ -838,7 +901,6 @@ def cp_lse_a2a(
             out_lse.stride(1) if return_lse else 0,
             n_ranks,
             HEAD_DIM=head_dim,
-            LSE_PACK=1,
             N_ROUNDED=triton.next_power_of_2(n_ranks),
             WRITE_LSE=return_lse,
             recv_lse_ptr=recv_lse,
@@ -1128,13 +1190,21 @@ def dcp_lse_merge(
             return merged
         backend = "a2a"
     if backend == "a2a":
+        if head_major:
+            return cp_lse_a2a(
+                cp_attn_out,
+                cp_attn_lse,
+                cp_group,
+                owned_counts=owned_counts,
+                quant_dtype=quant_dtype,
+                head_major=True,
+            )
         return cp_lse_a2a(
             cp_attn_out,
             cp_attn_lse,
             cp_group,
             owned_counts=owned_counts,
             quant_dtype=quant_dtype,
-            head_major=head_major,
         )
     assert (
         quant_dtype is None
