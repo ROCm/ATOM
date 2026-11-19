@@ -683,6 +683,21 @@ class PagedAttentionImpl(nn.Module):
             return self._k4v4pt_rope_cache(
                 q, k, v, qkv, position, k_cache, v_cache, fwd_ctx
             )
+        # ATOM_FOLD_QKNORM_QKV: the qkv GEMM's epilogue already wrote the cache and Q (fp8) / K
+        pending = getattr(self, "_fold_pending", None)
+        if pending is not None:
+            self._fold_pending = None
+            self.per_token_quant = False
+            self._cache_format = "SHUFFLE"
+            return (
+                pending[0].view(-1, self.num_heads, self.head_dim),
+                pending[1].view(-1, self.num_kv_heads, self.head_dim),
+                v.reshape(-1, self.num_kv_heads, self.head_dim),
+                k_cache,
+                v_cache,
+                None,
+                None,
+            )
 
         if (
             self.rotary_emb is not None

@@ -1075,7 +1075,16 @@ class Qwen3NextAttention(nn.Module):
         """`select_rows` (the MTP drafter, ATOM_MTP_SELECT_ROWS_BEFORE_O_PROJ):
         every row attends (and writes its KV), and only these rows go on to the
         output gate and o_proj: the output has `len(select_rows)` rows."""
-        qkv = self.qkv_proj(hidden_states, x_scale=x_scale)
+        # ATOM_FOLD_QKNORM_QKV: the Q/K norm, MRoPE and KV write in the qkv GEMM's epilogue (decode)
+        from atom.model_ops.fold_qkv_qknorm import fold_enabled, try_fold_qkv
+
+        qkv = (
+            try_fold_qkv(self, positions, hidden_states, x_scale)
+            if fold_enabled()
+            else None
+        )
+        if qkv is None:
+            qkv = self.qkv_proj(hidden_states, x_scale=x_scale)
         gate = None
 
         if self.attn_output_gate:
