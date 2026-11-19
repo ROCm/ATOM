@@ -23,32 +23,23 @@ CONNECTOR = ROOT / "atom/kv_transfer/disaggregation/moriio/moriio_connector.py"
 COMMON = ROOT / "atom/kv_transfer/disaggregation/moriio/moriio_common.py"
 
 
-def load_function(path: Path, name: str, namespace: dict | None = None):
-    """Execute a single top-level function from a module we cannot import."""
-    source = path.read_text()
-    tree = ast.parse(source)
-    for node in tree.body:
+def load_function(
+    path: Path, name: str, namespace: dict | None = None, *, cls: str | None = None
+):
+    """Execute one top-level function, or one method of class `cls`, from a
+    module we cannot import, as a plain function."""
+    body = ast.parse(path.read_text()).body
+    if cls is not None:
+        classes = [n for n in body if isinstance(n, ast.ClassDef) and n.name == cls]
+        body = classes[0].body if classes else []
+    for node in body:
         if isinstance(node, ast.FunctionDef) and node.name == name:
             scope: dict = dict(namespace or {})
             # Our own source, lifted so the CPU lane can run it.
             code = compile(ast.Module([node], []), str(path), "exec")
             exec(code, scope)  # noqa: S102
             return scope[name]
-    raise AssertionError(f"{name} not found in {path}")
-
-
-def load_method(path: Path, cls: str, name: str, namespace: dict | None = None):
-    """Execute one method of a class we cannot import, as a plain function."""
-    source = path.read_text()
-    for node in ast.parse(source).body:
-        if isinstance(node, ast.ClassDef) and node.name == cls:
-            for item in node.body:
-                if isinstance(item, ast.FunctionDef) and item.name == name:
-                    scope: dict = dict(namespace or {})
-                    module = ast.Module([item], [])
-                    exec(compile(module, str(path), "exec"), scope)  # noqa: S102
-                    return scope[name]
-    raise AssertionError(f"{cls}.{name} not found in {path}")
+    raise AssertionError(f"{cls + '.' if cls else ''}{name} not found in {path}")
 
 
 class RemotePrefillLookupTest(unittest.TestCase):
@@ -59,17 +50,13 @@ class RemotePrefillLookupTest(unittest.TestCase):
         import logging
 
         namespace = {"logger": logging.getLogger("atom")}
+        scheduler = "MoRIIOConnectorScheduler"
         cls.lookup = staticmethod(
-            load_method(
-                CONNECTOR, "MoRIIOConnectorScheduler", "get_num_new_matched_tokens"
-            )
+            load_function(CONNECTOR, "get_num_new_matched_tokens", cls=scheduler)
         )
         cls.after_alloc = staticmethod(
-            load_method(
-                CONNECTOR,
-                "MoRIIOConnectorScheduler",
-                "update_state_after_alloc",
-                namespace,
+            load_function(
+                CONNECTOR, "update_state_after_alloc", namespace, cls=scheduler
             )
         )
 

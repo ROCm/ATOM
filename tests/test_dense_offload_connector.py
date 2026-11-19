@@ -1152,12 +1152,14 @@ def test_a_multi_connector_cancel_re_arms_honestly(monkeypatch):
     """Losing to another sub must not cost a fresh hash every step.
 
     `MultiConnectorScheduler` queries *every* sub on every scheduler pass and
-    cancels the pending load of everyone but the winner, so under the supported
-    `[moriio, lmcache_offload]` ordering the offload sub arms a load and has it
-    taken away. The cancel does not forget the hit: the tier did not stop
-    holding the prefix because another connector won this step. So when moriio
-    stops matching -- once its receive is queued -- the offload sub
+    cancels the pending load of everyone but the winner, so with a P/D sub
+    ahead of it (e.g. `[moriio, lmcache_offload]`) the offload sub arms a load
+    and has it taken away. The cancel does not forget the hit: the tier did not
+    stop holding the prefix because another connector won this step. So when
+    moriio stops matching -- once its receive is queued -- the offload sub
     answers from what it already knows, and only the dispatch pays the tier.
+    No shipped config reaches this today; `validate_multi_config` refuses a P/D
+    consumer with an offload tier, so this pins the composite's cancel contract.
     """
 
     sched = _scheduler(monkeypatch, "kv_consumer")
