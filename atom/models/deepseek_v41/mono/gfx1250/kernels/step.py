@@ -142,7 +142,7 @@ def cwith(c, **kw):
     return c.with_(**kw) if isinstance(c, LazyC) else dict(c, **kw)
 
 
-def entry_front(fp, sm, b, row, ne, topk, last=False, demb=None):
+def entry_front(fp, sm, b, row, ne, topk, last=False):
     """A segment entry's attention front (front CTAs): the block state (dR / dy / dpre / dpost / dcomb) through the
     attention front of layer-table row `row` (its a* weights) -> axn / x8 / xs / the gates; R kept in LDS (first)."""
     nof = fx.Int32(0) != fx.Int32(0)
@@ -156,8 +156,6 @@ def entry_front(fp, sm, b, row, ne, topk, last=False, demb=None):
               cands=fptr(fp, "cands"), npre=fptr(fp, "anpre"), npost=fptr(fp, "anpost"), ncomb=fptr(fp, "ancomb"),
               ids=fptr(fp, "ids"), wts=fptr(fp, "wts"), isffn=nof, xs32=fx.Int32(1) != fx.Int32(0), merge=nof,
               rk=sm + RKOFF, first=fx.Int32(1) != fx.Int32(0), last=(fx.Int32(1) != fx.Int32(0)) if last else nof, hdev=True, ne=ne, topk=topk)
-    if demb is not None:   # the draft entry: its block state built in front_A (FS.front_A, demb)
-        cu.update(demb=demb[0], aid=demb[1], emb=fptr(fp, "emb"), noise=fptr(fp, "noise"))
     FS.front_any(cu)
 
 
@@ -185,6 +183,15 @@ def gwait(base, b, t, n=16):
     if t == 0:
         hx.wait_count(lambda: base + i64(b % 16) * 4, n, 7)
     gpu.barrier()
+
+
+def dent_ap(fp, tep, lend):
+    """(pointer, tag) of the draft entry's owner flags (site F_AP): layer slot lend + 1 (NL + NDR + 1), which no layer
+    uses (the layers' F_AP writers post slots Ly + 1 <= NL + NDR) -- not slot NL, the target's last layer posts F_AP
+    NL for its head input (xh_out) -- so draft stage 0 waits for the entry's owners only."""
+    assert lend + 1 < hx.LAYER_SLOTS
+    return (fptr(fp, "plog") + i64(V3F0 + F_AP[0]) + i64(((lend + 1) % 2) * 4096),
+            hx.epoch32(tep, fx.Int32(lend + 1), F_AP[1]))
 
 
 def _ctxtab(fp, ndr):   # (plain python) the draft context table when the step has draft layers
@@ -325,16 +332,23 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
                     ST.target(tp, t, b, sm, TCNT, recv, rank, head_d=4, ctx=fptr(fp, "ctxtab"), T=TR, kv_fp4=kv_fp4)
                 # the draft context KV (main_proj .. ring) from the target loop's taps
                 # (the draft context KV runs inside the target sampling's exchanges: ST.target(ctx=...))
-                # the draft entry: the draft block's metadata from this step's verify, then draft stage 0's attention front
-                # (layer-table row NL + NDR; the block state built in the front)
+                # the draft entry: the draft block's metadata from this step's verify, then draft stage 0's attention post
+                # in the 160 column owners (as a layer's post for the next layer: FS.ffn_post_owner, the block state built
+                # from the anchors, the a* weights of layer-table row NL + NDR) -> aRout / x1 / x8 / xs / the row square
+                # sums and the owners' LL flags (site F_AP, layer slot NL + NDR + 1: dent_ap); draft stage 0 then runs as
+                # its later layers do (newA: its mix / Sinkhorn in its D window)
                 if b == 0:
                     CX.draft_meta(dict(t=t, verdict=ST.tptr(tp, "verdict"), rpos=fptr(fp, "rpos"), dgeom=fptr(fp, "dgeom"),
                                        kmeta_d=fptr(fp, "kmeta_d"), kvw_d=fptr(fp, "kvw_d"), rpos_d=fptr(fp, "rpos_d")),
                                   TRD // DSPARK_W, DSPARK_W)
-                # (no block-state stage / DRAFT_STATE handoff: the front builds the block rows from the anchors itself)
-                if b < FS.FRONT_CTAS:
-                    entry_front(fp, sm, b, NL + NDR, DRAFT_NE, DRAFT_TOPK, last=True,
-                                demb=((TRD, DSPARK_W), ST.tptr(tp, "anc")))   # (R -> aRout for the owners)
+                if b < FS.NOWN:
+                    to = hx.opaque_v(fx.thread_idx.x)
+                    dfl, dtg = dent_ap(fp, tep, NL + NDR)
+                    FS.ffn_post_owner(dict(t=to, b=b, w=to // 32, l=to % 32, sm=sm + FRONT_LDS_OFF, demb=DSPARK_W,
+                                           aid=ST.tptr(tp, "anc"), emb=fptr(fp, "emb"), noise=fptr(fp, "noise"),
+                                           Rout=fptr(fp, "aRout"), x1g=fptr(fp, "plog") + i64(X1A),
+                                           part2=fptr(fp, "plog") + i64(P2A), pflag=dfl, ptag=dtg,
+                                           anw=ltab(fp, NL + NDR, "anw")(), x8a=atab(fp, "x8")(), xsa=atab(fp, "xs")()), TRD)
                 handoff(TCNT + i64(LY.DRAFT_FRONT), t, False)
             for Ly in range((lo if split and not DRS else seg_lo), (hi if split and not DRS else seg_hi)):
                 # (fx-v3) every layer, target and draft: the contract-v3 body (layer_v3); the draft segment with its
@@ -446,6 +460,9 @@ def target_layer(E, Ly):
     if fx.const_expr(DRS):
         XHP = E["dh"]
     newA = Ly >= L0 + 1            # a segment's first layer: x from its entry front
+    if fx.const_expr(DRS):   # the draft entry posts as a layer would (dent_ap): every draft layer's x from owners
+        newA = fx.Int32(1) != fx.Int32(0)
+        Lp = (Ly == fx.Int32(L0)).select(fx.Int32(LEND), Ly - 1)   # (stage 0: the a* weights of the entry row NL + NDR)
     lastL = Ly >= LEND - 1
 
     def plog(off):
@@ -464,6 +481,8 @@ def target_layer(E, Ly):
     kvfl, kvtg = flag(F_KV, Ly)
     pfl, ptg = flag(F_P, Ly)
     apfl, aptg = flag(F_AP, Ly)
+    if fx.const_expr(DRS):   # (stage 0: the entry owners' flags, dent_ap)
+        apfl, aptg = flag(F_AP, (Ly == fx.Int32(L0)).select(fx.Int32(LEND + 1), Ly))
     apnfl, apntg = flag(F_AP, Ly + 1)
     wfl, wtg = flag(F_W, Ly)
     engfl, engtg = flag(F_ENG, Ly)

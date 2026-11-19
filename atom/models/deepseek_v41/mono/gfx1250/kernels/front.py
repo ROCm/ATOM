@@ -167,34 +167,13 @@ def front_A(c):
     tok = g * TG + w
     seg2 = l < 8
     cs = [l * 8, 256 + fx.min(l, I32(7)) * 8]
-    if fx.const_expr("demb" in c):
-        # the draft entry: its block rows 0 .. B W - 1 as draft_ctx.stage_block_state writes them, built here instead of
-        # read back -- R_h = the anchor token's embedding row (block position 0) or the noise row, y = 0, post = 0,
-        # comb = I, pre = (1, 0, 0, 0): the same values (bits), with no block-state stage / handoff before the front. The
-        # rows past B W read the block-state buffers as before (only the target entry writes them, in the target launch)
-        BW, W_ = c["demb"]
-        live = tok < I32(BW)
-        tg = fx.min(tok, I32(T - 1))
-        q = [live.select(F32(1.0 if j == 0 else 0.0), hx.gload(c["pre"] + i64(tg * 4 + j) * 4, F32)) for j in range(4)]
-        pp = [live.select(F32(0.0), hx.gload(c["post"] + i64(tg * 4 + j) * 4, F32)) for j in range(4)]
-        cm = [[live.select(F32(1.0 if h == j else 0.0), hx.gload(c["comb"] + i64(tg * 16 + h * 4 + j) * 4, F32))
-               for j in range(4)] for h in range(4)]
-        aid = hx.gload(c["aid"] + i64(fx.min(tok // W_, I32(BW // W_ - 1))) * 4, I32)
-        src = ((tok % W_) == 0).select(c["emb"] + i64(aid) * (H * 2), c["noise"])
-        v0 = [hx.gload(src + i64(c0 + cs[s_]) * 2, BF16, 8, align=16) for s_ in range(2)]
-        rg = [[hx.gload(c["R"] + i64((tg * 4 + h) * H + c0 + cs[s_]) * 2, BF16, 8, align=16) for s_ in range(2)] for h in range(4)]
-        yg = [hx.gload(c["y"] + i64(tg * H + c0 + cs[s_]) * 2, BF16, 8, align=16) for s_ in range(2)]
-        rv = [[fx.Vector.from_elements([live.select(v0[s_][e], rg[h][s_][e]) for e in range(8)], BF16) for s_ in range(2)]
-              for h in range(4)]
-        yv = [fx.Vector.from_elements([live.select(BF16(0.0), yg[s_][e]) for e in range(8)], BF16) for s_ in range(2)]
-    else:
-        q = [hx.gload(c["pre"] + i64(tok * 4 + j) * 4, F32) for j in range(4)]
-        pp = [hx.gload(c["post"] + i64(tok * 4 + j) * 4, F32) for j in range(4)]
-        cm = [[hx.gload(c["comb"] + i64(tok * 16 + h * 4 + j) * 4, F32) for j in range(4)] for h in range(4)]
-        rv = [[hx.lload(c["rk"] + ((w * 4 + h) * CP + cs[s_]) * 2, BF16, 8, align=16) for s_ in range(2)] for h in range(4)]
-        if c["first"]:   # layer 0: from global (the carried list is replaced)
-            rv = [[hx.gload(c["R"] + i64((tok * 4 + h) * H + c0 + cs[s_]) * 2, BF16, 8, align=16) for s_ in range(2)] for h in range(4)]
-        yv = [hx.gload(c["y"] + i64(tok * H + c0 + cs[s_]) * 2, BF16, 8, align=16) for s_ in range(2)]
+    q = [hx.gload(c["pre"] + i64(tok * 4 + j) * 4, F32) for j in range(4)]
+    pp = [hx.gload(c["post"] + i64(tok * 4 + j) * 4, F32) for j in range(4)]
+    cm = [[hx.gload(c["comb"] + i64(tok * 16 + h * 4 + j) * 4, F32) for j in range(4)] for h in range(4)]
+    rv = [[hx.lload(c["rk"] + ((w * 4 + h) * CP + cs[s_]) * 2, BF16, 8, align=16) for s_ in range(2)] for h in range(4)]
+    if c["first"]:   # layer 0: from global (the carried list is replaced)
+        rv = [[hx.gload(c["R"] + i64((tok * 4 + h) * H + c0 + cs[s_]) * 2, BF16, 8, align=16) for s_ in range(2)] for h in range(4)]
+    yv = [hx.gload(c["y"] + i64(tok * H + c0 + cs[s_]) * 2, BF16, 8, align=16) for s_ in range(2)]
     sched_barrier()   # every load issued before the math (in the whole-layer kernel the scheduler split them in two batches)
     # R'_j = bf16(post_j y + sum_h comb[h][j] R_h): rq[j][s_][e] (f32 of the bf16)
     rq = [[[None] * 8 for _ in range(2)] for _ in range(4)]
@@ -1073,22 +1052,41 @@ NOWN = 160              # the column owners
 RQO = 140000            # LDS: the owner's R'' [TR][4][20] f32 (past the router's LDS: the router CTAs run their mix after it)
 
 
+def _demb_col(c, r, cc):
+    """(plain: no control flow) the draft entry's block row r, col cc (f32): the anchor token's embedding at block
+    position r % W = 0, else the noise row (draft_ctx.stage_block_state's R_h)."""
+    aid = hx.gload(c["aid"] + i64(r // c["demb"]) * 4, I32)
+    src = ((r % c["demb"]) == 0).select(c["emb"] + i64(aid) * (H * 2), c["noise"])
+    return hx.gload(src + i64(cc) * 2, BF16).to(F32)
+
+
 @ASTRewriter.transform
 def ffn_post_owner(c, TR):
-    """c: t b w l sm (LDS scratch >= 6 KB), y, R, Rout, x1g, pre, post, comb, fnh, fnl, part2, cnt."""
+    """c: t b w l sm (LDS scratch >= 6 KB), y, R, Rout, x1g, pre, post, comb, fnh, fnl, part2, cnt (or, the draft entry:
+    demb (the block width W), aid, emb, noise in place of y / R / pre / post / comb)."""
     t, b, w, l, sm = c["t"], c["b"], c["w"], c["l"], c["sm"]
     col0 = b * OC
     live = t < TR * OC
     r = fx.min(t // OC, I32(TR - 1))
     cc = col0 + t % OC
-    if fx.const_expr("ylds" in c):   # (seam) y2 from recv_owner's LDS copy (this CTA's 32 cols)
-        x = hx.lload(c["ylds"] + (r * OC + t % OC) * 2, BF16).to(F32)
+    if fx.const_expr("demb" in c):
+        # the draft entry (no layer before it): row r's block state as draft_ctx.stage_block_state defines it -- R_h = the
+        # anchor token's embedding row (block position r % W = 0) or the noise row, y = 0, post = 0, comb = I, pre =
+        # (1, 0, 0, 0) -- built here, the rest as a layer's attention post (draft stage 0 then runs as its later layers)
+        x = F32(0.0)
+        f = [_demb_col(c, r, cc)] * 4
+        q = [F32(1.0 if j == 0 else 0.0) for j in range(4)]
+        pp = [F32(0.0)] * 4
+        cm = [[F32(1.0 if h == j else 0.0) for j in range(4)] for h in range(4)]
     else:
-        x = hx.gload(c["y"] + i64(r * H + cc) * 2, BF16).to(F32)
-    f = [hx.gload(c["R"] + i64((r * 4 + h) * H + cc) * 2, BF16).to(F32) for h in range(4)]
-    q = [hx.gload(c["pre"] + i64(r * 4 + j) * 4, F32) for j in range(4)]
-    pp = [hx.gload(c["post"] + i64(r * 4 + j) * 4, F32) for j in range(4)]
-    cm = [[hx.gload(c["comb"] + i64(r * 16 + h * 4 + j) * 4, F32) for j in range(4)] for h in range(4)]
+        if fx.const_expr("ylds" in c):   # (seam) y2 from recv_owner's LDS copy (this CTA's 32 cols)
+            x = hx.lload(c["ylds"] + (r * OC + t % OC) * 2, BF16).to(F32)
+        else:
+            x = hx.gload(c["y"] + i64(r * H + cc) * 2, BF16).to(F32)
+        f = [hx.gload(c["R"] + i64((r * 4 + h) * H + cc) * 2, BF16).to(F32) for h in range(4)]
+        q = [hx.gload(c["pre"] + i64(r * 4 + j) * 4, F32) for j in range(4)]
+        pp = [hx.gload(c["post"] + i64(r * 4 + j) * 4, F32) for j in range(4)]
+        cm = [[hx.gload(c["comb"] + i64(r * 16 + h * 4 + j) * 4, F32) for j in range(4)] for h in range(4)]
     if fx.const_expr("x8a" in c):   # (seam) the next layer's attention norm weight of this col
         anv = hx.gload(c["anw"] + i64(cc) * 2, BF16).to(F32)
     rq = [bf(fma(cm[3][j], f[3], fma(cm[2][j], f[2], fma(cm[1][j], f[1], fma(cm[0][j], f[0], pp[j] * x))))).to(F32) for j in range(4)]
