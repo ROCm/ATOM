@@ -326,7 +326,9 @@ fn rl_flags_parse_to_defaults_and_reject_zero() {
         assert!(error.contains("--rl-api-key"), "{missing:?}: {error}");
     }
     for flag in ["--rl-control-timeout-secs", "--rl-fanout-concurrency"] {
-        let error = args(&[flag, "0", "--rl-api-key", "k"]).unwrap_err().to_string();
+        let error = args(&[flag, "0", "--rl-api-key", "k"])
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("rl."), "{flag}: {error}");
     }
 }

@@ -133,21 +133,6 @@ pub fn collapse(workers: Vec<RlWorkerInfo>) -> Vec<(RlWorkerInfo, usize)> {
     rows
 }
 
-/// The worker's labels plus the keys a selector can match on; those keys
-/// shadow labels of the same name.
-pub fn merged_labels(info: &RlWorkerInfo) -> HashMap<String, String> {
-    let mut m = info.labels.clone();
-    m.insert("id".to_string(), info.id.clone());
-    m.insert("url".to_string(), info.url.clone());
-    m.insert("base_url".to_string(), info.base_url.clone());
-    m.insert("engine".to_string(), info.engine.clone());
-    m.insert("model".to_string(), info.model_id.clone());
-    m.insert("worker_type".to_string(), info.worker_type.clone());
-    m.insert("connection_mode".to_string(), info.connection_mode.clone());
-    m.insert("health".to_string(), info.health.clone());
-    m
-}
-
 /// One row of `GET /v1/rl/workers` for `info`, with `dp_ranks` collapsed into it.
 pub fn entry(info: &RlWorkerInfo, dp_ranks: usize) -> RlWorkerEntry {
     RlWorkerEntry {

@@ -1,9 +1,8 @@
 //! Wire types of `/v1/rl/*`, as SMG's RL protocol defines them.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 /// Version of the `/v1/rl` wire contract, reported by `GET /v1/rl/workers`.
 pub const RL_PROTOCOL_VERSION: u32 = 1;
@@ -70,46 +69,4 @@ pub struct RlWorkersResponse {
     pub protocol_version: u32,
     pub workers: Vec<RlWorkerEntry>,
     pub total: usize,
-}
-
-/// One completed engine call, whatever its HTTP status.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RlCallOutcome {
-    pub worker_id: String,
-    pub url: String,
-    /// The engine's HTTP status.
-    pub status: u16,
-    pub latency_ms: u64,
-    /// The engine's body: parsed JSON when it was JSON, otherwise text.
-    pub body: Value,
-    /// Set when the body was cut at the size cap.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub body_truncated: bool,
-}
-
-/// One fan-out target that did not succeed.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RlFailedCall {
-    pub worker_id: String,
-    pub url: String,
-    /// `upstream_error`, `upstream_unreachable`, `upstream_timeout` or
-    /// `no_control_endpoint`.
-    pub error: String,
-    pub message: String,
-    /// The engine's HTTP status, for `upstream_error`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status: Option<u16>,
-    /// The worker's connection mode, for `no_control_endpoint`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub connection_mode: Option<String>,
-}
-
-/// Body of a fan-out: HTTP 200 when `failed` is empty, 207 otherwise.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct RlFanoutResponse {
-    /// Every completed call by worker id, whatever its status.
-    pub results: BTreeMap<String, RlCallOutcome>,
-    pub failed: Vec<RlFailedCall>,
-    pub total: usize,
-    pub succeeded: usize,
 }
