@@ -221,6 +221,7 @@ def test_head_split_defaults_to_auto(monkeypatch):
 
 
 def test_whole_heads_replace_the_chunk_tasks_by_default(monkeypatch):
+    from atom.models.kimi_k3.mono.kernels.attention import kda_resident_gfx1250
     from atom.utils import envs
 
     monkeypatch.delenv("ATOM_KIMI_MONO_K1_WHOLE_HEADS", raising=False)
@@ -235,6 +236,8 @@ def test_whole_heads_replace_the_chunk_tasks_by_default(monkeypatch):
 
 
 def test_whole_heads_switch_off_keeps_the_chunk_tasks(monkeypatch):
+    from atom.models.kimi_k3.mono.kernels.attention import kda_resident_gfx1250
+
     monkeypatch.setenv("ATOM_KIMI_MONO_K1_WHOLE_HEADS", "0")
     assert kda_resident_gfx1250._whole_heads(5, 96, 256, False) == (False, False)
     assert kda_resident_gfx1250._whole_heads(5, 288, 256, False) == (True, False)
