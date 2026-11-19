@@ -892,7 +892,14 @@ class DSparkProposer(Drafter):
         # verification (Level B) is applied downstream by truncating each
         # request's scheduled spec tokens to ell_r, which frees batch capacity
         # instead of the no-op in-block masking of Level A.
-        self._set_verify_lengths(confidence, attn_metadata, scheduled_bs, self.mtp_k)
+        if self.verify_scheduler is not None and confidence is not None:
+            first = attn_metadata.num_prefill_seqs if attn_metadata.is_mixed else 0
+            with record_function(f"dspark_sched[bs={scheduled_bs - first}]"):
+                self._set_verify_lengths(
+                    confidence, attn_metadata, scheduled_bs, self.mtp_k
+                )
+        elif self.verify_scheduler is not None:
+            self.verify_scheduler.set_last_ell(None)
         return draft_token_ids
 
     def _set_verify_lengths(self, confidence, attn_metadata, scheduled_bs, width):
@@ -906,10 +913,9 @@ class DSparkProposer(Drafter):
         # keep full-width drafts until they produce a decode proposal.
         first = attn_metadata.num_prefill_seqs if attn_metadata.is_mixed else 0
         confidence = confidence[first:scheduled_bs, :width]
-        with record_function(f"dspark_sched[bs={confidence.shape[0]}]"):
-            self.verify_scheduler.set_last_ell(
-                self.verify_scheduler.compute_ell(confidence)
-            )
+        self.verify_scheduler.set_last_ell(
+            self.verify_scheduler.compute_ell(confidence)
+        )
 
     # ---- separate-draft-model path (Kimi-K3) --------------------------------
 

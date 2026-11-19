@@ -1560,48 +1560,60 @@ class Scheduler:
             and seq.id not in scheduled_seqs
         )
 
-    def _budget_for_decodes(self, n_decode):
+    def _budget_for_decodes(self, n_decode, reserved_blocks=0):
+        # A prompt owns its pages across chunks, but decode's append demand
+        # changes every tick. When it no longer fits, keep ALL prefills in the
+        # ordinary running queue so decode can preempt the newest request.
+        if reserved_blocks and not self.block_manager._has_page_units(reserved_blocks):
+            return 0
         budget = self.max_num_batched_tokens
         n_decode = min(n_decode, self.max_num_seqs)
         floor = max(1, budget // 8)
         reserve = min(n_decode * (self.decode_spec_width + 1), budget - floor)
         return budget - max(reserve, 0)
 
+    def _mixed_decode_seats(self):
+        """Maximum decodes beside a one-token, one-row prefill."""
+        return max(
+            0,
+            min(
+                self.max_num_seqs - 1,
+                (self.max_num_batched_tokens - 1) // (self.decode_spec_width + 1),
+            ),
+        )
+
     def _prefill_limits(self, scheduled_seqs=()) -> PrefillLimits:
         """Reserve existing decodes; P/D promotions extend this before admission."""
         if not self.enable_mixed_prefill_decode:
             return PrefillLimits(self.max_num_batched_tokens)
         candidates = list(self._decode_candidates(scheduled_seqs))
-        budget = self._budget_for_decodes(len(candidates))
         width = self.decode_spec_width + 1
         # Prefill may use less than its token budget. Protect every decode
         # that could join even a one-token, one-row prefill; the decode loop
         # can spend all remaining tokens. Without prefill, no pages are spent
         # on its admission and the ordinary decode checks govern the step.
-        seats = max(
-            0, min(self.max_num_seqs - 1, (self.max_num_batched_tokens - 1) // width)
-        )
+        seats = self._mixed_decode_seats()
         blocks = sum(
             self.block_manager.append_blocks_needed(seq, width, self.draft_lookahead)
             for seq in candidates[:seats]
         )
-        return PrefillLimits(budget, blocks, len(candidates))
+        return PrefillLimits(
+            self._budget_for_decodes(len(candidates), blocks), blocks, len(candidates)
+        )
 
     def _reserve_promoted_decode(
         self, limits: PrefillLimits, seq: Sequence
     ) -> PrefillLimits:
         """Charge a newly received P/D request before admitting the next prompt."""
         width = self.decode_spec_width + 1
-        seats = max(
-            0, min(self.max_num_seqs - 1, (self.max_num_batched_tokens - 1) // width)
-        )
+        seats = self._mixed_decode_seats()
         blocks = limits.reserved_decode_blocks
         if limits.num_decodes < seats:
             blocks += self.block_manager.append_blocks_needed(
                 seq, width, self.draft_lookahead
             )
         count = limits.num_decodes + 1
-        return PrefillLimits(self._budget_for_decodes(count), blocks, count)
+        return PrefillLimits(self._budget_for_decodes(count, blocks), blocks, count)
 
     def _estimate_prefill_chunk_cost(self, limits=None) -> float:
         """Cost of the chunk this rank would prefill with its prefill budget
@@ -1752,6 +1764,8 @@ class Scheduler:
         same checks the admission while-loop runs below.
         """
         limits = self._prefill_limits() if limits is None else limits
+        if not limits.tokens:
+            return False
         if self._partial_prefill_count > 0:
             return True
         if not self.waiting:
@@ -2537,7 +2551,12 @@ class Scheduler:
         limits = (
             self._prefill_limits()
             if self.enable_mixed_prefill_decode
-            and (self.waiting or self._partial_prefill_count)
+            and (
+                self._partial_prefill_count
+                or len(self.waiting) > self._num_parked_remote_kv
+                or self.finished_recving_kv_req_ids
+                or self.failed_recving_kv_req_ids
+            )
             else PrefillLimits(self.max_num_batched_tokens)
         )
         self._prioritize_ready_remote_kv_requests(limits=limits)
@@ -3315,8 +3334,10 @@ class Scheduler:
             # every rank's forward replays its token graph (`ForwardMode.decide`).
             return None
 
-        # Keep prefill rows out of the decode queue, including its preemption
-        # victims. Ordinary decode executes the same per-row path as main.
+        # The reservation allowed these prefills only while decode's append
+        # pages fit. A zero prefill budget leaves partials in the normal decode
+        # queue and its tail-first preemption policy. Scheduled prefill rows
+        # must not also be selected for decode in this step.
         mixed_order = ()
         if num_seqs_prefill:
             mixed_order = tuple(self.running)
@@ -3410,23 +3431,9 @@ class Scheduler:
         if scheduled_seqs:
             self.running.extendleft(reversed(scheduled_seqs.values()))
         if skipped_partial_prefills:
-            # Re-queue skipped partial prefills at the TAIL, not the head.
-            #
-            # A partial (chunked, prompt-not-done) prefill can land in this
-            # decode loop when the cross-DP PrefillDelayer vetoes prefill for a
-            # tick (Phase 1 skipped, so num_prefill==0 and the prefill-only
-            # early-return doesn't fire). Re-inserting it at the head pins it
-            # at running[0]; once it finishes prefill it becomes the batch's
-            # position-0 *deferred* seq, which pushes the fresh decode seqs to
-            # positions 1..N. TokenIDProcessor.prepare_input_ids then takes the
-            # [deferred | new] path and indexes the (compacted)
-            # scheduled_spec_decode_tokens array by those shifted positions —
-            # running off the end (IndexError: index N out of bounds size N).
-            #
-            # Appending at the tail keeps the partial out of position 0 (its
-            # prefill still resumes: Phase 1 scans all of `running`), so new
-            # decode seqs stay contiguous from position 0 and the safe
-            # [new | deferred] slice path is used.
+            # A decode-only tick requeues skipped partials at the tail, as on
+            # the default path. A mixed tick restores survivor order below;
+            # its batch layout independently puts prefill rows before decode.
             self.running.extend(skipped_partial_prefills)
         if skipped_pp_inflight:
             self.running.extend(skipped_pp_inflight)
@@ -5169,9 +5176,10 @@ class Scheduler:
     ) -> tuple[list[bool], list[int] | None]:
         """Per-chunk bookkeeping every batch carrying prefill rows owes.
 
-        Mixed batches call this before their batch snapshot. Pure-prefill
-        batches retain the inline settlement in `_schedule`. Both paths owe
-        plan_midstep, final-chunk markers and schedule-time progress.
+        With mixed scheduling enabled, both mixed and pure-prefill batches
+        call this before their snapshot. With the flag off, `_schedule` keeps
+        inline settlement. Both paths owe plan_midstep, final-chunk markers
+        and schedule-time progress.
 
         All three lists are positionally aligned and cover the prefill rows
         only. A mixed batch's `scheduled_seqs` is `[prefill | decode]` (decode

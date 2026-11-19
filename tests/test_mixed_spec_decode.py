@@ -39,6 +39,69 @@ N_P_TOKENS = sum(PREFILL_LENS)
 NUM_SCHEDULED = np.array(PREFILL_LENS + [K + 1] * N_D, dtype=np.int32)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU staging kernel")
+@pytest.mark.parametrize("speculative", [False, True])
+def test_idle_decode_keeps_padding_and_deferred_status_contract(
+    monkeypatch, speculative
+):
+    from atom.model_ops.attentions.deepseek_v4_attn import (
+        DeepseekV4AttentionMetadataBuilder,
+    )
+    from tests.test_h2d_runner_publication import runner_with_buffers
+
+    runner = runner_with_buffers(
+        monkeypatch,
+        speculative=speculative,
+        builder_cls=DeepseekV4AttentionMetadataBuilder,
+    )
+    runner.enforce_eager = False
+    runner.capture_sizes = [4, 2, 1]
+    processor = runner.tokenID_processor
+    processor.use_spec = speculative
+    processor.num_spec_tokens = K if speculative else 0
+    processor.prev_batch = SimpleNamespace(req_ids=[10], is_dummy_run=False)
+    processor.prev_token_ids = torch.tensor([42], dtype=torch.int32, device="cuda")
+    processor.num_rejected = np.array([2], dtype=np.int32)
+    processor.num_bonus = np.array([1], dtype=np.int32)
+    processor.prev_rejected_num = processor.num_rejected.copy()
+    processor.prev_bonus_num = processor.num_bonus.copy()
+    processor.pre_num_decode_token_per_seq = 1
+    batch = SimpleNamespace(
+        is_mixed=False,
+        is_dummy_run=True,
+        has_prefill=False,
+        req_ids=[],
+        total_tokens_num=0,
+        total_tokens_num_prefill=0,
+        total_tokens_num_decode=0,
+        total_seqs_num=0,
+        total_seqs_num_prefill=0,
+        total_seqs_num_decode=0,
+        num_spec_step=0,
+        scheduled_tokens=np.array([], dtype=np.int32),
+        num_scheduled_tokens=np.array([], dtype=np.int32),
+        num_rejected=np.array([], dtype=np.int32),
+        num_bonus=np.array([], dtype=np.int32),
+        produces_output=lambda: False,
+    )
+    runner._gate_staging_reuse()
+    processor.input_ids.gpu.fill_(77)
+    group = runner.h2d_groups["token_inputs"]
+    group.set_counts(
+        runner.attn_metadata_builder.prepare_query_metadata(
+            batch.num_scheduled_tokens, 0, 0
+        )
+    )
+    q = K + 1 if speculative else 1
+    ids = processor.prepare_input_ids(batch, q, group)
+    runner._mark_staging_h2d_enqueued()
+    assert ids.numel() == 0
+    assert processor.input_ids.gpu[:q].cpu().tolist() == [0] * q
+    assert processor.input_ids.gpu[q : q + 1].cpu().item() == 77
+    assert processor.carries_over
+    assert processor.num_rejected.size == processor.num_bonus.size == 0
+
+
 @pytest.mark.parametrize("prefill_rows", [0, 1, 4])
 @pytest.mark.parametrize("draft_width", [3, 7])
 @pytest.mark.parametrize("with_draft", [False, True])

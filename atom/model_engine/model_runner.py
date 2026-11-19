@@ -639,7 +639,7 @@ class tokenIDProcessor:
             if self.num_rejected is not None:
                 self.num_rejected[:total_reqs_prefill] = 0
                 self.num_bonus[:total_reqs_prefill] = 0
-        if not total_tokens_decode:
+        if total_reqs_prefill and not total_tokens_decode:
             return self._publish_input_ids(total_tokens, publication_group), None
 
         if not self.is_deferred_out:
