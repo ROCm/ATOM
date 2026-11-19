@@ -943,6 +943,12 @@ class ModelRunner:
 
         self.attn_backend = get_attn_backend(self.attn_family)
         self._setup_device_and_distributed(rank, config)
+        if os.environ.get("ATOM_HOSTFAST_TRITON", "0") == "1":
+            # Cached launchers for the decode step's hot Triton kernels
+            # (after the device is set: the wrapped modules are imported here).
+            from atom.utils import triton_fast_launch
+
+            triton_fast_launch.install_from_env()
 
         self.capture_sizes = [0]  # for eager fallback
         # The same ladder as an ASCENDING int32 array, which is what
