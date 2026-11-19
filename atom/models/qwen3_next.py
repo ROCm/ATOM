@@ -496,6 +496,32 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             return None
         geometry = topk_route_quant_decode_geometry(m, k, 8)
         mlp = self.shared_expert
+        if envs.ATOM_ROUTER_SHARED_V2 and geometry is not None:
+            # the decode rewrite of the same kernel (bitwise the same outputs), where it applies
+            try:
+                from aiter.ops.triton.gemm.fused.fused_gemm_a16w16_router_shared_expert_topk_v2 import (
+                    fused_gemm_a16w16_router_shared_expert_topk_v2,
+                    fused_gemm_a16w16_router_shared_expert_topk_v2_supported,
+                )
+            except ImportError:
+                fused_gemm_a16w16_router_shared_expert_topk_v2_supported = None
+            if (
+                fused_gemm_a16w16_router_shared_expert_topk_v2_supported is not None
+                and fused_gemm_a16w16_router_shared_expert_topk_v2_supported(
+                    hidden_states,
+                    w_router_padded,
+                    mlp.gate_up_proj.weight,
+                    mlp.down_proj.weight,
+                    n_router,
+                    geometry[0],
+                )
+            ):
+                fused_gemm_a16w16_router_shared_expert_topk = (
+                    fused_gemm_a16w16_router_shared_expert_topk_v2
+                )
+                fused_gemm_a16w16_router_shared_expert_topk_supported = (
+                    fused_gemm_a16w16_router_shared_expert_topk_v2_supported
+                )
         if geometry is None or not fused_gemm_a16w16_router_shared_expert_topk_supported(
             hidden_states,
             w_router_padded,

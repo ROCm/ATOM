@@ -573,6 +573,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FOLD_TOPK_ROUTER": lambda: (
         os.getenv("ATOM_FOLD_TOPK_ROUTER", "0") == "1"
     ),
+    # ATOM_ROUTER_SHARED_V2 (with ATOM_FOLD_TOPK_ROUTER): the folded router + shared
+    # expert + top-k kernel is aiter's decode rewrite
+    # (fused_gemm_a16w16_router_shared_expert_topk_v2): same outputs bit for bit,
+    # ~2 us less a layer on gfx1250. Falls back to the fold-1 kernel where unsupported.
+    "ATOM_ROUTER_SHARED_V2": lambda: (
+        os.getenv("ATOM_ROUTER_SHARED_V2", "0") == "1"
+    ),
     "ATOM_FUSED_ROUTER_SHARED_EXPERT_MAX_TOKENS": lambda: int(
         os.getenv("ATOM_FUSED_ROUTER_SHARED_EXPERT_MAX_TOKENS", "512")
     ),
