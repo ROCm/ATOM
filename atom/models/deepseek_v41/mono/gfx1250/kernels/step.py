@@ -558,8 +558,9 @@ def target_layer(E, Ly):
                             hx.stx_dev(ekv + i64(u) * 16, hx.gload(ekv + i64(ES.T * ES.EN * 2) + i64(u) * 16, fx.Int32, 4))
 
     # ---- kv, C (on A2 flags) -> kvflag / cflag
+    preC = AS.stage_C_pre(cwith(c, **v3a))   # (C's weights / RoPE in flight during the kv CTAs' kv rows too)
     stage_kv(cwith(c, **v3a))
-    stage_C(cwith(c, **v3a))
+    stage_C(cwith(c, **v3a, preC=preC))
 
     # ---- indexer layers: iq / iw / compressor GEMM, iquant / compressor rows, scorer + selection
     if fx.const_expr(not DRS):   # (c1 code size) the draft rows' lflags are 0: no index chain / KV_C handoff in the draft launch

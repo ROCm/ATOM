@@ -553,10 +553,14 @@ def cq_step(kq, i):
     return fx.min(kq + 4 * i, I32(NKQ - 1))
 
 
-@ASTRewriter.transform
-def stage_C(c):
+def stage_C_pre(c):
+    """stage C's loads that need no A2 (issued before its wait): this wave's wqb K steps (C_WIDE) and the epilogue's
+    RoPE cos / sin. Plain python (no control flow): its values go to stage_C as c["preC"]. The step issues it before
+    stage_kv, so the kv CTAs' (224 ..) weights are in flight during their kv rows (issued after them, their C ended
+    ~1 us after every other CTA's: the last cflag, which D waits for)."""
     t, b, w, l, MT = c["t"], c["b"], c["w"], c["l"], c["MT"]
-    if fx.const_expr(MT == 1 and C_WIDE):   # (contract 6.5) this wave's wqb K steps issued before the wait
+    preQ = None
+    if MT == 1 and C_WIDE:   # (contract 6.5) this wave's wqb K steps issued before the wait
         n0p = (b + (w // 4) * CTAS) * 16
         brp = c["wqb"] + i64(n0p + l % 16) * QL
         preQ = [(ld_op(brp, cq_step(w % 4, i) * 128, l),
@@ -568,6 +572,17 @@ def stage_C(c):
     n0_p = (b + (w // 3) * CTAS) * 16
     fi_p = fx.max((n0_p % HD + l % 16 - (HD - 64)) // 2, I32(0))
     rcs = [rope_cs(c, mi_p * 16 + (l // 16) * 8 + i, fi_p) for i in range(8)]
+    return preQ, rcs
+
+
+@ASTRewriter.transform
+def stage_C(c):
+    t, b, w, l, MT = c["t"], c["b"], c["w"], c["l"], c["MT"]
+    if fx.const_expr("preC" in c):
+        preQ, rcs = c["preC"]
+    else:
+        preQ, rcs = stage_C_pre(c)
+    mi_p = fx.min(w % 3, I32(MT - 1))
     if fx.const_expr("a2flag" in c):   # (v3 e3) the q blocks of A2 (wave 0: 2 flags a lane)
         hx.wait_flags(c["a2flag"], QL // 32, c["a2tag"], w, l, 8)
         gpu.barrier()
