@@ -360,7 +360,7 @@ def sparse_attn_indexer(
         out=topk_indices[: rows.out_rows],
         request_local=not single_rank_prefill,
     )
-    dcp_kv_plan = getattr(attn_metadata, "dcp_sparse_prefill_kv", None)
+    dcp_kv_plan = attn_metadata.dcp_sparse_prefill_kv
     if not context.is_prefill:
         if attn_metadata.max_seqlen_q > 1:
             triton_gather_kv_indices_sparse(
@@ -395,7 +395,7 @@ def sparse_attn_indexer(
             NUM_TOPK_TOKENS=topk_tokens,
             cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
         )
-    elif get_dcp_world_size() > 1 and dcp_kv_plan is None:
+    elif get_dcp_world_size() > 1:
         # Keep only the positions this rank owns, mapped through the
         # round-robin virtual-block layout and compacted to the front -- the
         # decode exchange's treatment, a query token for a request. Handed the

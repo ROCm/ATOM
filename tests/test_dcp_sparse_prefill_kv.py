@@ -289,7 +289,13 @@ def test_an_unknown_transport_is_refused(monkeypatch):
         b._resolve_dcp_sparse_prefill_mode("fp8")
 
 
-def _planner(monkeypatch, mode, max_tokens=1 << 20, dcp=4):
+@pytest.mark.parametrize("kw", [{"sparse": False}, {"dcp": 1}])
+def test_a_builder_without_a_dcp_sparse_prefill_ignores_the_value(monkeypatch, kw):
+    b = _resolver(monkeypatch, "KV", **kw)
+    assert b._resolve_dcp_sparse_prefill_mode("fp8") == "q"
+
+
+def _planner(monkeypatch, mode, max_tokens=1 << 20, dcp=4, heads=16):
     """The builder fields `_dcp_sparse_prefill_kv_plan` reads, with the real
     plan; records its warnings."""
     warned = []
@@ -299,6 +305,7 @@ def _planner(monkeypatch, mode, max_tokens=1 << 20, dcp=4):
     b._dcp_sparse_prefill_kv_max_tokens = max_tokens
     b._dcp_sparse_prefill_kv_fallback_warned = False
     b.dcp_world_size = dcp
+    b.num_attention_heads = heads
     b.model_runner = SimpleNamespace(block_size=16)
     b.device = torch.device(DEV)
     return b, warned
@@ -334,10 +341,13 @@ def test_a_step_takes_kv_by_its_mode_and_batch(monkeypatch, mode, batch, taken):
     assert warned == []
 
 
-@pytest.mark.parametrize("dcp,taken", [(4, True), (8, False)])
-def test_the_context_bound_is_tighter_at_dcp8(monkeypatch, dcp, taken):
-    """512K + 7K new tokens: under dcp4's 200K + 52 per token, over dcp8's 40."""
-    b, _ = _planner(monkeypatch, "auto", dcp=dcp)
+@pytest.mark.parametrize(
+    "dcp,heads,taken", [(4, 16, True), (8, 8, False), (4, 8, False)]
+)
+def test_the_context_bound_is_tighter_with_fewer_heads(monkeypatch, dcp, heads, taken):
+    """512K + 7K new tokens: under 200K + 52 per token at 16 heads a rank,
+    over 40 at 8 (TP8), whatever the DCP size."""
+    b, _ = _planner(monkeypatch, "auto", dcp=dcp, heads=heads)
     plan = b._dcp_sparse_prefill_kv_plan(_batch([524288], [7168]))
     assert (plan is not None) == taken
 
@@ -442,13 +452,28 @@ def test_a_kv_step_runs_the_dcp1_kernel_arguments(monkeypatch):
 
 # ------------------------------------------------------------- memory profile
 def test_the_kv_scratch_grows_with_the_cap_and_the_tokens():
-    args = {"local_heads": 16, "kv_lora_rank": 512, "rope_dim": 64}
+    args = {"local_heads": 16, "padded_heads": 16, "kv_lora_rank": 512, "rope_dim": 64}
     f = dcp_ops.dcp_sparse_prefill_kv_scratch_bytes
     base = f(1024, kv_itemsize=1, dcp_world_size=4, kv_max_rows=1 << 18, **args)
     assert f(1024, kv_itemsize=1, dcp_world_size=4, kv_max_rows=1 << 19, **args) > base
     assert f(4096, kv_itemsize=1, dcp_world_size=4, kv_max_rows=1 << 18, **args) > base
     # at least the gathered KV itself, 576 B a row
     assert base >= (1 << 18) * 576
+
+
+def test_the_kv_scratch_counts_the_padded_query_copy():
+    """TP8 GLM-5.2: 8 heads a rank padded to 16 copies the query."""
+    f = dcp_ops.dcp_sparse_prefill_kv_scratch_bytes
+    args = {
+        "kv_lora_rank": 512,
+        "rope_dim": 64,
+        "kv_itemsize": 1,
+        "dcp_world_size": 8,
+        "kv_max_rows": 1 << 18,
+    }
+    unpadded = f(4096, local_heads=16, padded_heads=16, **args)
+    padded = f(4096, local_heads=8, padded_heads=16, **args)
+    assert padded - unpadded >= 4096 * 16 * 576
 
 
 def _dummy_attention(monkeypatch, env, kv_cache_dtype, is_prefill, cap=1 << 14):
@@ -504,12 +529,12 @@ def test_a_dummy_prefill_profiles_the_kv_scratch(monkeypatch, env, dtype, held):
     when a step can take "kv"."""
     cap = 1 << 16
     a = _dummy_attention(monkeypatch, env, dtype, is_prefill=True, cap=cap)
-    kv = dcp_ops.dcp_sparse_prefill_kv_scratch_bytes(5, 16, 512, 64, 1, 4, cap)
+    kv = dcp_ops.dcp_sparse_prefill_kv_scratch_bytes(5, 16, 16, 512, 64, 1, 4, cap)
     assert (_profiled_peak(a, 5) >= kv) == held
 
 
 def test_a_dummy_decode_profiles_no_kv_scratch(monkeypatch):
     cap = 1 << 16
     a = _dummy_attention(monkeypatch, "auto", "fp8", is_prefill=False, cap=cap)
-    kv = dcp_ops.dcp_sparse_prefill_kv_scratch_bytes(5, 16, 512, 64, 1, 4, cap)
+    kv = dcp_ops.dcp_sparse_prefill_kv_scratch_bytes(5, 16, 16, 512, 64, 1, 4, cap)
     assert _profiled_peak(a, 5) < kv

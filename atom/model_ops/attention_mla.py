@@ -1508,7 +1508,7 @@ class MLAAttention(nn.Module):
         it the prefill gather fuses rank-to-token reordering with head
         padding, so attention receives its dispatch width directly.
         """
-        if getattr(attn_metadata, "dcp_sparse_prefill_kv", None) is not None:
+        if attn_metadata.dcp_sparse_prefill_kv is not None:
             # forward() turns QREP off for a "kv" step: its plan is per-rank heads.
             assert not use_qrep, "a DCP kv prefill got the group's query heads"
             return self._dcp_sparse_prefill_kv(q_out, kv_cache, attn_metadata)
@@ -1548,6 +1548,7 @@ class MLAAttention(nn.Module):
             return
         nbytes = dcp_sparse_prefill_kv_scratch_bytes(
             num_tokens,
+            self.num_heads,
             self.padded_num_heads,
             self.kv_lora_rank,
             self.qk_rope_head_dim,
@@ -3245,7 +3246,7 @@ class MLAAttention(nn.Module):
             ) and not (
                 # A "kv" prefill attends only this rank's heads.
                 context.is_prefill
-                and getattr(attn_metadata, "dcp_sparse_prefill_kv", None) is not None
+                and attn_metadata.dcp_sparse_prefill_kv is not None
             )
             q_nope, q_rope = self._q_proj_and_k_up_proj(
                 q, x_scale=q_scale, group=use_qrep

@@ -1859,16 +1859,16 @@ def triton_filter_and_convert_dcp_index_prefill(
 # "auto" takes "kv" while the step's context stays under
 # CONTEXT_BASE + context_per_new_token(dcp) * its new tokens: the gather grows
 # with the context, "q" with the new tokens. Fitted on GLM-5.2-FP8 fp8 KV with a
-# cached prefix + 64 / 1K / 16K new tokens, 32K-960K, at tp == dcp: k in
-# [48.5, 57) classifies all 18 tp4/dcp4 points, 40 all tp8/dcp8 ones (tp8
-# attends fewer heads a rank, so the gather weighs more). Other tp/dcp pairs
-# take the nearer measured one. A forced "kv" skips it; both stay under the
-# token cap.
+# cached prefix + 64 / 1K / 16K new tokens, 32K-960K: k in [48.5, 57)
+# classifies all 18 tp4/dcp4 points (16 heads a rank), 40 all tp8/dcp8 ones
+# (8 heads a rank). k follows the heads a rank attends, which "kv" pays for:
+# fewer heads, less attention for the gather to save. Other head counts take
+# the nearer measured one. A forced "kv" skips it; both stay under the cap.
 DCP_SPARSE_PREFILL_KV_CONTEXT_BASE = 200 * 1024
 
 
-def dcp_sparse_prefill_kv_context_per_new_token(dcp_world_size: int) -> int:
-    return 52 if dcp_world_size <= 4 else 40
+def dcp_sparse_prefill_kv_context_per_new_token(local_heads: int) -> int:
+    return 52 if local_heads >= 16 else 40
 
 
 def dcp_sparse_prefill_mode_env() -> str:
@@ -1900,6 +1900,7 @@ def dcp_sparse_prefill_kv_blocker(kv_cache_dtype: str, mla_page_size: int):
 def dcp_sparse_prefill_kv_scratch_bytes(
     num_tokens: int,
     local_heads: int,
+    padded_heads: int,
     kv_lora_rank: int,
     rope_dim: int,
     kv_itemsize: int,
@@ -1908,12 +1909,16 @@ def dcp_sparse_prefill_kv_scratch_bytes(
 ) -> int:
     """What a "kv" sparse prefill adds in one layer at the token cap, for the
     memory profile, whose dummy run skips the attention: this rank's rows, the
-    gathered KV and the per-rank output. The "q" transport's own buffers are
-    not profiled, as before this transport existed."""
+    gathered KV, the query padded to the kernel's heads (a copy, when it pads)
+    and the per-rank output. The "q" transport's own buffers are not profiled,
+    as before this transport existed."""
     d = kv_lora_rank + rope_dim
     local_rows = -(-kv_max_rows // dcp_world_size)
-    return (kv_max_rows + local_rows) * d * kv_itemsize + (
-        num_tokens * local_heads * kv_lora_rank * 2
+    padded_q = num_tokens * padded_heads * d * kv_itemsize
+    return (
+        (kv_max_rows + local_rows) * d * kv_itemsize
+        + (padded_q if padded_heads > local_heads else 0)
+        + num_tokens * padded_heads * kv_lora_rank * 2
     )
 
 

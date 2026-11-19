@@ -2282,9 +2282,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             dcp_sparse_prefill_mode_env,
         )
 
-        mode = dcp_sparse_prefill_mode_env()
         if not self.is_sparse or self.dcp_world_size <= 1:
             return "q"
+        mode = dcp_sparse_prefill_mode_env()
         blocker = dcp_sparse_prefill_kv_blocker(kv_cache_dtype, self.block_size)
         if blocker is not None and mode != "q":
             log = logger.warning if mode == "kv" else logger.info
@@ -2316,7 +2316,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 float("inf")
                 if mode == "kv"
                 else DCP_SPARSE_PREFILL_KV_CONTEXT_BASE
-                + dcp_sparse_prefill_kv_context_per_new_token(self.dcp_world_size)
+                + dcp_sparse_prefill_kv_context_per_new_token(self.num_attention_heads)
                 * int(np.sum(batch.seqlens_q))
             ),
             self.device,
