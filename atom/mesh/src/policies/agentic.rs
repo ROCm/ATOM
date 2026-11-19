@@ -46,7 +46,8 @@ impl Default for AgenticCost {
 pub struct Candidate {
     /// Index in the caller's worker list, preserved even after health filtering.
     pub worker_index: usize,
-    /// Leading prompt tokens the worker's GPU KV cache is estimated to hold.
+    /// Leading prompt tokens the worker's GPU KV cache is estimated to hold, with
+    /// those its engine will load from a store counted at the store's weight.
     /// `None` means unknown and receives no cache credit; `Some(0)` is a known
     /// miss. Both stay eligible.
     pub cached_tokens: Option<usize>,
@@ -256,6 +257,19 @@ impl LoadBalancingPolicy for AgenticPolicy {
             .zip(provider)
             .map(|(tokens, provider)| provider.match_workers(tokens, workers))
             .filter(|hits| healthy.iter().any(|&idx| hits[idx].is_some()));
+        let index_hits = match (index_hits, matchable.zip(provider)) {
+            (Some(device), Some((tokens, provider))) if provider.store_weight() > 0.0 => {
+                let weight = provider.store_weight();
+                let cached = provider.cached_tokens(tokens, workers, &device).await;
+                let credited = device.iter().zip(&cached).map(|(&device, &cached)| {
+                    let device = device?;
+                    let loaded = cached.map_or(0, |cached| cached.saturating_sub(device));
+                    Some(device + (weight * f64::from(loaded)).round() as u32)
+                });
+                Some(credited.collect::<Vec<_>>())
+            }
+            (hits, _) => hits,
+        };
         let tree = text.map(|_| self.tree(workers[healthy[0]].as_ref()));
         let (source, hits) = match (index_hits, text.zip(tree.as_deref())) {
             (Some(hits), _) => (
@@ -516,6 +530,61 @@ mod tests {
     async fn decide(p: &AgenticPolicy, w: &[Arc<dyn Worker>], i: &SelectWorkerInfo<'_>) -> Outcome {
         let (selected, d) = p.select_with_decision(w, i).await;
         (selected, d.branch, d.estimated_hit_ratio, d.prefill_tokens)
+    }
+
+    /// Each worker's device hit and what its engine reports cached once it loads from a
+    /// store (None when the store does not answer), and the weight of those loads.
+    #[derive(Debug)]
+    struct Stored(Vec<(u32, Option<u32>)>, f64);
+
+    #[async_trait]
+    impl PrefixMatchProvider for Stored {
+        fn match_workers(&self, _tokens: &[u32], _: &[Arc<dyn Worker>]) -> Vec<Option<u32>> {
+            self.0.iter().map(|&(device, _)| Some(device)).collect()
+        }
+
+        async fn cached_tokens(
+            &self,
+            _: &[u32],
+            _: &[Arc<dyn Worker>],
+            device: &[Option<u32>],
+        ) -> Vec<Option<u32>> {
+            assert_eq!(device, self.match_workers(&[], &[]));
+            self.0.iter().map(|&(_, cached)| cached).collect()
+        }
+
+        fn store_weight(&self) -> f64 {
+            self.1
+        }
+    }
+
+    #[tokio::test]
+    async fn tokens_a_worker_loads_from_its_store_count_at_the_store_weight() {
+        let workers = workers();
+        let tokens: Vec<u32> = (0..100).collect();
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        // a's device holds 40 of the 100 tokens; b's none, but its store 90.
+        for (weight, b_cached, want) in [
+            (0.0, Some(90), (Some(0), "hit", Some(0.4), Some(60))),
+            (1.0, Some(90), (Some(1), "hit", Some(0.9), Some(10))),
+            (0.5, Some(90), (Some(1), "hit", Some(0.45), Some(55))),
+            // A store that does not answer adds nothing.
+            (1.0, None, (Some(0), "hit", Some(0.4), Some(60))),
+        ] {
+            let policy = agentic(512, None);
+            policy.set_kv_events(Arc::new(Stored(
+                vec![(40, Some(40)), (0, b_cached)],
+                weight,
+            )));
+            assert_eq!(
+                decide(&policy, &workers, &info).await,
+                want,
+                "weight {weight}"
+            );
+        }
     }
 
     #[tokio::test]
