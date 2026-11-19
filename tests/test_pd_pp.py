@@ -2195,6 +2195,8 @@ def test_slot_transfer_gathers_index_pages_onto_the_dcp_plan(_no_cuda_stream):
     index_src = 1 << 20
     connector, request, writes = _sparse_pp_stage(mc, index_src)
     ready = object()
+    # The write's deadline bounds the staged gather too.
+    request["_deadline"] = deadline = time.monotonic() + 3600
 
     assert mc.MooncakeConnector._execute_block_slot_transfer(
         connector,
@@ -2217,7 +2219,7 @@ def test_slot_transfer_gathers_index_pages_onto_the_dcp_plan(_no_cuda_stream):
         "req-1",
         "gather",
         engine=None,
-        deadline=None,
+        deadline=deadline,
     )
     # DCP rank 1 of 2 owns the 32 odd tokens of the 64-token prompt.
     mla = [w for w in writes if 2 << 22 <= w[1] < 3 << 22]

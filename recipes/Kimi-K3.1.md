@@ -9,8 +9,8 @@ Native ATOM path for the original Kimi-K3.1 checkpoint
 - Routed expert matrices keep the checkpoint's MXFP4. Attention, the dense MLP
   and the latent MoE down/up matrices keep their BF16 weights; KDA recurrence
   controls, convolutions and output norms keep their FP32 storage.
-- MLA KV is BF16 (`--kv_cache_dtype bf16`). MLA K/V projections and the absorbed
-  BMM weights stay BF16.
+- MLA KV is BF16 (`--kv_cache_dtype bf16`; FP8 in the validated P/D topology
+  below). MLA K/V projections and the absorbed BMM weights stay BF16.
 - The DSA index cache must be FP8: pass `--index-cache-dtype fp8`. Left unset it
   follows the KV cache dtype (BF16), which the NoPE index writer does not
   support; `fp4` is rejected while the model is built. FP8 applies to the
@@ -49,10 +49,11 @@ Validated with AITER `main` at `dbaffe23ed` plus
   mode (bit-reproducible routed-expert output). Use AITER's normal merged
   tuning tables; pointing `AITER_CONFIG_FMOE` at a single CSV drops required
   shared entries.
-- PP x TP1 stages only (the P/D prefill below):
-  [ROCm/aiter#8297](https://github.com/ROCm/aiter/pull/8297), which reads
-  MXFP4 MoE weights past 4 GiB per expert. At TP1, K3.1's w1 is 9.9 GB and
-  its w2 4.9 GB; without it a TP1 stage's routed experts are wrong.
+- Any stage at TP <= 2, such as the P/D prefill below:
+  [ROCm/aiter#8297](https://github.com/ROCm/aiter/pull/8297). It re-bases
+  each expert of a stacked MXFP4 MoE weight larger than 4 GiB; K3.1's w1 is
+  9.9 GB at TP1 and 4.9 GB at TP2. Without it, experts that start past 4 GiB
+  read the wrong weights.
 
 After updating AITER, rebuild its JIT modules before starting the server: an
 existing `aiter/jit/module_*.so` is loaded without being compared to its
@@ -119,10 +120,11 @@ Only that configuration has been validated: TP8 with DCP8,
 on or off, and with the DSpark drafter and ReplaySSM above, plus the P/D
 topology in the next section.
 PCP is rejected while the model is built (the indexer's projections live in
-the fused q_a projection, and the PCP indexer projects k itself), and P/D over
-MoRIIO with PP > 1 at startup. Online quantization of the other layers, other
-PP or KV-transfer topologies, expert parallelism, DP attention, other
-speculative methods, plugins and TBO are untested. The vision wrapper is registered, but image
+the fused q_a projection, and the PCP indexer projects k itself). At startup,
+P/D rejects a PP decode (a kv_consumer with PP > 1) and a PP prefill over
+MoRIIO. Online quantization of the other layers, other PP or KV-transfer
+topologies, expert parallelism, DP attention, other speculative methods,
+plugins and TBO are untested. The vision wrapper is registered, but image
 inference has not been validated.
 
 ## P/D: PP prefill into a DCP decode
@@ -131,7 +133,8 @@ Validated over Mooncake on two MI355X nodes: a PP8 x TP1 prefill into a TP8 x
 DCP8 decode, with FP8 MLA KV (`--kv_cache_dtype fp8`; the index cache is FP8
 as always), block size 128, prefix caching, DSpark4 with ReplaySSM
 (`ATOM_ENABLE_REPLAYSSM=1`) and mono off (`ATOM_MONO_ENABLE=0`). The TP1
-stages need ROCm/aiter#8297 (see AITER requirements).
+stages need ROCm/aiter#8297 (see AITER requirements). The decode cannot use
+PP: a kv_consumer with PP > 1 is rejected at startup.
 
 ```bash
 # Prefill (producer)
