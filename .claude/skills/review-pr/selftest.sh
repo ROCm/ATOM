@@ -439,6 +439,35 @@ t "a card that softens BEYOND ONE PASS is refused" \
 t "a card carrying the measured coverage passes" \
   "$(_cov_gate "$_SMALL" 'Coverage: 5 files / 49 added lines -- within one review pass')" "ok"
 # The label alone, with nothing after the colon, is not a verdict.
+# check_prompts.py runs sixteen checks and only three are drift. run_one reported every
+# refusal as "prompts drifted" and sent the output that named the real one to /dev/null,
+# so the owner was told to regenerate files that were fine. aiter#8255's review aborted
+# that way on 2026-11-19 against prompts that matched SKILL.md verbatim.
+_flow_msg() {  # <python snippet that makes check_prompts fail> -> what run_one would say
+  r=$(mktemp -d); d="$r/.claude/skills/review-pr"
+  mkdir -p "$d" "$r/.github/workflows"
+  cp -r "$S"/. "$d/" 2>/dev/null
+  cp "$S/../../../.github/workflows/atom-review-bot.yml" "$r/.github/workflows/" 2>/dev/null
+  python3 -c "$1" "$d"
+  # The block run here is extracted from run_one.sh, not a copy of it: a test that
+  # reimplements the thing it guards passes whatever run_one.sh does.
+  blk=$(sed -n '/# >>> prompt-gate/,/# <<< prompt-gate/p' "$S/run_one.sh")
+  SKILL="$d" bash -c "fail(){ printf '%s\n' \"\$3\"; exit \"\$2\"; }
+$blk" 2>/dev/null
+}
+t "a drifted prompt is reported as drift" \
+  "$(_flow_msg '
+import pathlib,sys
+p = pathlib.Path(sys.argv[1], "prompts/worker.md")
+p.write_text(p.read_text().replace("**Output rules (strictly enforced):**", "**Output rules:**", 1))
+' | grep -c DRIFTED)" "1"
+t "and a refusal that is not drift is not called drift" \
+  "$(_flow_msg '
+import pathlib,sys
+p = pathlib.Path(sys.argv[1], "check_prompts.py")
+p.write_text(p.read_text().replace("def check_fail_classes():",
+    "def check_fail_classes():\n    print(\"\\u274c run budget fits the job cap: FORCED\"); return 1\n    # o", 1))
+' | grep -c DRIFTED)" "0"
 t "a coverage label with nothing after it is refused" \
   "$(_cov_gate "$_SMALL" 'Coverage:')" "EMPTY-COVERAGE"
 
