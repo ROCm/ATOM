@@ -25,6 +25,24 @@ from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
 
+# ATOM_MTP_DRAFT_SPAN_GRAPH (default off): the fused-glue propose (step-0 graph, advance, step graph, advance,
+# step graph, last-pass store) recorded as ONE graph per (running_bs, scheduled_bs, record rows), so the draft span
+# is one replay: no eager glue launches and no graph-launch boundaries between the passes. The passes inside are
+# the same forward + epilogue code the per-pass graphs record. Captured the second time a key is seen (the first
+# runs the per-pass path, warm); a replay redoes only the host half of the glue (shapes, metadata views,
+# max_seqlen_k) and copies the verdict's rejected counts / anchors into the recording's own buffers. Falls back to
+# the per-pass path on a dummy run, without step-0's or the mid-step's graph, a ragged verify, or where the glue's
+# metadata refresh would launch work (FlyDSL plan, 1024-token pages, kv_indices).
+import os as _os
+
+_SPAN_GRAPH = _os.environ.get("ATOM_MTP_DRAFT_SPAN_GRAPH", "0") == "1"
+
+
+def _eager_pass(graph: DraftGraph, running_bs: int, staged: dict):
+    """What `DraftGraph.run` replays (and the epilogue it leaves outside), run directly."""
+    out = graph._to_capture(running_bs, **staged)
+    return out if graph.capture_epilogue else graph._run_epilogue(out, running_bs, **staged)
+
 
 def _pcp_active_for_draft_model(draft_model: nn.Module) -> bool:
     # DeepSeek V2/DSA draft models share this sparse-MLA PCP gate.
@@ -1313,7 +1331,189 @@ class EagleProposer(Drafter):
         last_token_indices: torch.Tensor,
         staged0: dict | None = None,
     ) -> torch.Tensor:
+        args = (target_token_ids, target_positions, target_hidden_states, num_reject_tokens, next_token_ids,
+                last_token_indices)
+        if _SPAN_GRAPH:
+            out = self._span_graph_propose(args, staged0)
+            if out is not None:
+                return out
+        return self._propose_fused_glue_impl(*args, staged0=staged0)
+
+    # ---------------------------------------------------------------- ATOM_MTP_DRAFT_SPAN_GRAPH
+    def _span_key(self, args, staged0):
+        """(running_bs, scheduled_bs, record rows), or None where the span graph does not apply."""
+        forward_context = get_forward_context()
+        context = forward_context.context
+        target_token_ids = args[0]
+        q = self.mtp_k + 1
+        running_bs, scheduled_bs = context.running_bs, context.scheduled_bs
+        builder = self.runner.attn_metadata_builder
+        if (
+            context.is_dummy_run
+            or not self._step0_graphed(context, running_bs)
+            or self.step is None
+            or not self.step.is_captured(running_bs)
+            or target_token_ids.shape[0] != scheduled_bs * q
+            or envs.ATOM_PA_FLYDSL
+            or getattr(builder, "block_size", 0) == 1024
+            or not envs.ATOM_MTP_FUSED_RS_STORE
+            or envs.ATOM_MTP_DRAFT_RANK_CHECK
+            or (not envs.ATOM_MTP_SKIP_DRAFT_KV_INDICES or self._draft_kv_indices())
+            or forward_context.attn_metadata.slot_mapping is None
+        ):
+            return None
+        spec_rs = getattr(self, "spec_rs", None)
+        rec_bs = min(int(scheduled_bs), spec_rs.active_bs) if spec_rs is not None else -1
+        return (running_bs, scheduled_bs, rec_bs)
+
+    def _span_graph_propose(self, args, staged0):
+        key = self._span_key(args, staged0)
+        if key is None:
+            self._span_stats["fallback"] = self._span_stats.get("fallback", 0) + 1
+            return None
+        num_reject_tokens, last_token_indices = args[3], args[5]
+        ent = self._span_graphs.get(key)
+        if ent is not None:
+            if (staged0 is not None) != ent["staged0"]:
+                self._span_stats["moved"] = self._span_stats.get("moved", 0) + 1
+                return None
+            if staged0 is None:
+                self._span_stage0(args)
+            # the verdict's rejected counts and anchors into the recording's own copies (a producer that already
+            # wrote them there costs nothing)
+            for src, dst in ((num_reject_tokens, ent["reject"]), (last_token_indices, ent["anchors"])):
+                if src.data_ptr() != dst.data_ptr():
+                    dst.copy_(src)
+            self._span_host_half(args)
+            ent["graph"].replay()
+            self._span_stats["replay"] = self._span_stats.get("replay", 0) + 1
+            return ent["draft_ids"]
+        seen = self._span_seen.get(key, 0) + 1
+        self._span_seen[key] = seen
+        if seen < 2:
+            return None  # the per-pass path warms this key first
+        return self._span_capture(key, args, staged0)
+
+    @property
+    def _span_graphs(self) -> dict:
+        return self.__dict__.setdefault("_span_graphs_d", {})
+
+    @property
+    def _span_seen(self) -> dict:
+        return self.__dict__.setdefault("_span_seen_d", {})
+
+    @property
+    def _span_stats(self) -> dict:
+        return self.__dict__.setdefault("_span_stats_d", {})
+
+    def _span_stage0(self, args):
+        """Step 0's staging (outside the graph: it reads the verify's own buffers), as the impl would."""
+        from atom.spec_decode.eagle_fused_glue import stage_verify_step0
+
+        target_token_ids, target_positions, target_hidden_states, _, next_token_ids, last_token_indices = args
+        context = get_forward_context().context
+        running_bs, scheduled_bs = context.running_bs, context.scheduled_bs
+        return stage_verify_step0(
+            target_token_ids,
+            next_token_ids,
+            last_token_indices,
+            target_positions[0] if target_positions.ndim == 2 else target_positions,
+            target_hidden_states,
+            {
+                role: self.step0.buffer(role, running_bs)
+                for role in ("input_ids", "positions", "hidden_states", "last_token_indices")
+            },
+            scheduled_bs=scheduled_bs,
+            running_bs=running_bs,
+            query_width=self.mtp_k + 1,
+            max_bs=self.config.max_num_seqs,
+        )
+
+    def _span_host_half(self, args):
+        """Everything `_propose_fused_glue_impl` does on the host around its launches (a replay stands in for the
+        launches): the passes' forward-context shapes, step 0's metadata views, max_seqlen_k and the advances'
+        workinfos, leaving the host state where the per-pass path leaves it."""
+        forward_context = get_forward_context()
+        context = forward_context.context
+        attn_metadata = forward_context.attn_metadata
+        scheduled_bs, running_bs = context.scheduled_bs, context.running_bs
+        batch_info = self.runner.forward_vars["batch_info"].gpu
+        builder = self.runner.attn_metadata_builder
+        num_tokens = args[0].shape[0]
+        num_reject_tokens, last_token_indices = args[3], args[5]
+        q = self.mtp_k + 1
+        context.is_draft = True
+        attn_metadata.slot_mapping = attn_metadata.slot_mapping[:num_tokens]
+        for i in range(self.mtp_k):
+            self._publish_draft_shape(
+                forward_context,
+                scheduled_tokens=scheduled_bs if i else num_tokens,
+                running_tokens=running_bs if i else running_bs * q,
+                running_tokens_are_unified=True,
+                scheduled_tokens_gpu=batch_info[0:1] if i else batch_info[1:2],
+            )
+            if i == self.mtp_k - 1:
+                break
+            if i == 0:
+                self._enter_decode_metadata(
+                    scheduled_bs, running_bs, None, last_token_indices, num_reject_tokens, device_writes=False
+                )
+            attn_metadata.max_seqlen_k += 1
+            var = self.runner.forward_vars
+            workinfos = builder.finish_mtp_decode(running_bs, var["slot_mapping"].gpu[:running_bs])
+            if envs.ATOM_MTP_ADVANCE_TOKEN_SPLIT:
+                split = self._draft_token_split()
+                if split is not None:
+                    workinfos["gfx12_token_split_tiles"] = split.metadata()
+            for k, v in workinfos.items():
+                attn_metadata.__dict__[k] = v
+
+    def _span_capture(self, key, args, staged0):
+        from atom.utils.h2d import capturing
+
+        if staged0 is None:
+            staged0 = self._span_stage0(args)
+            had_staged0 = False
+        else:
+            had_staged0 = True
+        pool = self.__dict__.get("_span_pool")
+        if pool is None:
+            pool = self.__dict__["_span_pool"] = torch.cuda.graph_pool_handle()
+        # the recording reads the verdict from buffers of its own (the verdict's tensors move between steps)
+        reject, anchors = args[3].clone(), args[5].clone()
+        args = args[:3] + (reject, args[4], anchors)
+        graph = torch.cuda.CUDAGraph()
+        # as region_graph records: on the current stream, thread_local (the NCCL watchdog polls hipEventQuery)
+        cur = torch.cuda.current_stream()
+        # (a capture needs a side stream; torch.cuda.graph's own one when serving runs on the default stream)
+        cap_stream = None if cur == torch.cuda.default_stream() else cur
+        with capturing(), torch.cuda.graph(
+            graph, pool, stream=cap_stream, capture_error_mode="thread_local"
+        ):
+            draft_ids = self._propose_fused_glue_impl(*args, staged0=staged0, eager_passes=True)
+        graph.replay()
+        self._span_graphs[key] = dict(
+            graph=graph, draft_ids=draft_ids, reject=reject, anchors=anchors, staged0=had_staged0,
+        )
+        self._span_stats["capture"] = self._span_stats.get("capture", 0) + 1
+        logger.info("ATOM_MTP_DRAFT_SPAN_GRAPH: recorded the draft span at %s", key)
+        return draft_ids
+
+    def _propose_fused_glue_impl(
+        self,
+        target_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        num_reject_tokens: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        last_token_indices: torch.Tensor,
+        staged0: dict | None = None,
+        eager_passes: bool = False,
+    ) -> torch.Tensor:
         """`propose` with the eager work between passes fused (`eagle_fused_glue`).
+
+        ``eager_passes`` (ATOM_MTP_DRAFT_SPAN_GRAPH's capture): run the passes' recorded code directly instead of
+        replaying their graphs, so an enclosing capture records them.
 
         The passes, their labels, the forward-context shapes and every host
         field of the metadata are `propose`'s. What changes is how the device
@@ -1427,9 +1627,12 @@ class EagleProposer(Drafter):
                             target_hidden_states,
                             last_token_indices,
                         )
-                    out_hidden, out_ids = self.step0.run(
-                        running_bs, borrow=True, **staged0
-                    )
+                    if eager_passes:
+                        out_hidden, out_ids = _eager_pass(self.step0, running_bs, staged0)
+                    else:
+                        out_hidden, out_ids = self.step0.run(
+                            running_bs, borrow=True, **staged0
+                        )
                 elif i == 0:
                     # A model that selects rows itself returns only the
                     # sequences' last rows (ATOM_FUSED_MOE_TAIL_NORM).
@@ -1456,13 +1659,20 @@ class EagleProposer(Drafter):
                         ),
                     )
                 else:
-                    out_hidden, out_ids = self.step.run(
-                        running_bs,
-                        borrow=True,
-                        input_ids=step_ids,
-                        positions=step_positions,
-                        hidden_states=step_hidden,
-                    )
+                    if eager_passes:
+                        out_hidden, out_ids = _eager_pass(
+                            self.step,
+                            running_bs,
+                            dict(input_ids=step_ids, positions=step_positions, hidden_states=step_hidden),
+                        )
+                    else:
+                        out_hidden, out_ids = self.step.run(
+                            running_bs,
+                            borrow=True,
+                            input_ids=step_ids,
+                            positions=step_positions,
+                            hidden_states=step_hidden,
+                        )
                 records = None
                 if spec_rs is not None:
                     # ATOM_MTP_REJECTION_SAMPLING: this pass's q records, before
