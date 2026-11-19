@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tracing::debug;
 
-use super::policy_apply::{apply_policy, apply_policy_on_rank};
+use super::policy_apply::apply_policy;
 use super::traits::{PdPlanner, PolicySource, WorkerSource};
 use super::types::{PlacementError, PlacementPlan, Protocol, RequestDescriptor};
 use crate::core::{ConnectionMode, HashRing, Worker, WorkerType};
@@ -156,12 +156,11 @@ impl DefaultPlanner {
             Some(decode) => on_decode_rank(prefill_candidates, decode.as_ref()),
             None => prefill_candidates,
         };
-        let prefill = apply_policy_on_rank(
+        let prefill = apply_policy(
             &prefill_candidates,
             prefill_policy.as_ref(),
             req,
             hash_ring.clone(),
-            decode_first.as_ref().and_then(|decode| decode.dp_rank()),
         )
         .await?;
         let decode = match decode_first {

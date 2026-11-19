@@ -1,12 +1,16 @@
 //! Round-robin load balancing policy
 
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
+use std::{
+    sync::{
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
 use dashmap::DashMap;
+use xxhash_rust::xxh3::Xxh3;
 
 use super::{
     get_healthy_worker_indices, LoadBalancingPolicy, RouteDecision, SelectWorkerInfo,
@@ -14,20 +18,99 @@ use super::{
 };
 use crate::core::Worker;
 
+/// Least time between sweeps of the candidate sets.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// A candidate set's position, and the sweep generation it was last used in.
+#[derive(Debug)]
+struct Position {
+    next: AtomicUsize,
+    used: AtomicU64,
+}
+
 /// Round-robin selection policy
 ///
-/// Selects workers in sequential order, cycling through all healthy workers. Prefill
-/// candidates narrowed to the decode's DP rank cycle per rank: a single position would
-/// advance in step with a round-robin decode and skip workers.
-#[derive(Debug, Default)]
+/// Selects workers in sequential order, cycling through all healthy workers. Each set
+/// of candidates keeps its own position, so callers that offer different subsets (a
+/// pool's models, ext-proc's subsets, prefill narrowed to the decode's DP rank) do not
+/// skip workers by sharing one.
+///
+/// A new set starts at a random position. A new set seen [`SWEEP_INTERVAL`] or more
+/// after the last sweep drops the sets unused since it, so the map holds the sets used
+/// in the last interval or two, however many they are; dropping one costs nothing but
+/// its place in the cycle.
+#[derive(Debug)]
 pub struct RoundRobinPolicy {
-    counter: AtomicUsize,
-    rank_counters: DashMap<usize, AtomicUsize>,
+    positions: DashMap<u64, Position>,
+    generation: AtomicU64,
+    created: Instant,
+    swept_at_ms: AtomicU64,
+    sweep_interval: Duration,
+    sweeping: AtomicBool,
+}
+
+impl Default for RoundRobinPolicy {
+    fn default() -> Self {
+        Self::with_sweep_interval(SWEEP_INTERVAL)
+    }
 }
 
 impl RoundRobinPolicy {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn with_sweep_interval(sweep_interval: Duration) -> Self {
+        Self {
+            positions: DashMap::new(),
+            generation: AtomicU64::new(1),
+            created: Instant::now(),
+            swept_at_ms: AtomicU64::new(0),
+            sweep_interval,
+            sweeping: AtomicBool::new(false),
+        }
+    }
+
+    /// Takes the next position of the set `workers` form.
+    fn next_position(&self, workers: &[Arc<dyn Worker>]) -> usize {
+        let mut hasher = Xxh3::new();
+        for worker in workers {
+            hasher.update(worker.url().as_bytes());
+            hasher.update(&[0]);
+        }
+        let key = hasher.digest();
+        if let Some(position) = self.positions.get(&key) {
+            return self.take(&position);
+        }
+        self.sweep_if_due();
+        let position = self.positions.entry(key).or_insert_with(|| Position {
+            next: AtomicUsize::new(rand::random::<u32>() as usize),
+            used: AtomicU64::new(0),
+        });
+        self.take(&position)
+    }
+
+    fn take(&self, position: &Position) -> usize {
+        let generation = self.generation.load(Ordering::Relaxed);
+        if position.used.load(Ordering::Relaxed) != generation {
+            position.used.store(generation, Ordering::Relaxed);
+        }
+        position.next.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Drops the sets unused since the last sweep, once the sweep interval has passed.
+    fn sweep_if_due(&self) {
+        let now_ms = self.created.elapsed().as_millis() as u64;
+        let due_ms =
+            self.swept_at_ms.load(Ordering::Relaxed) + self.sweep_interval.as_millis() as u64;
+        if now_ms < due_ms || self.sweeping.swap(true, Ordering::Acquire) {
+            return;
+        }
+        self.swept_at_ms.store(now_ms, Ordering::Relaxed);
+        let ended = self.generation.fetch_add(1, Ordering::Relaxed);
+        self.positions
+            .retain(|_, position| position.used.load(Ordering::Relaxed) >= ended);
+        self.sweeping.store(false, Ordering::Release);
     }
 }
 
@@ -36,7 +119,7 @@ impl LoadBalancingPolicy for RoundRobinPolicy {
     async fn select_with_decision(
         &self,
         workers: &[Arc<dyn Worker>],
-        info: &SelectWorkerInfo<'_>,
+        _info: &SelectWorkerInfo<'_>,
     ) -> (Option<usize>, RouteDecision) {
         let healthy_indices = get_healthy_worker_indices(workers);
 
@@ -44,16 +127,7 @@ impl LoadBalancingPolicy for RoundRobinPolicy {
             return (None, RouteDecision::branch(NO_HEALTHY_WORKERS));
         }
 
-        // Get and increment counter atomically
-        let count = match info.decode_rank {
-            Some(rank) => self
-                .rank_counters
-                .entry(rank)
-                .or_default()
-                .fetch_add(1, Ordering::Relaxed),
-            None => self.counter.fetch_add(1, Ordering::Relaxed),
-        };
-        let selected_idx = count % healthy_indices.len();
+        let selected_idx = self.next_position(workers) % healthy_indices.len();
 
         (
             Some(healthy_indices[selected_idx]),
@@ -66,8 +140,7 @@ impl LoadBalancingPolicy for RoundRobinPolicy {
     }
 
     fn reset(&self) {
-        self.counter.store(0, Ordering::Relaxed);
-        self.rank_counters.clear();
+        self.positions.clear();
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -101,12 +174,87 @@ mod tests {
             ),
         ];
 
+        assert!(follows(&picks(&policy, &workers, 5).await, &[0, 1, 2]));
+    }
+
+    fn regular_workers(urls: impl IntoIterator<Item = String>) -> Vec<Arc<dyn Worker>> {
+        urls.into_iter()
+            .map(|url| {
+                let worker = BasicWorkerBuilder::new(url).worker_type(WorkerType::Regular);
+                Arc::new(worker.build()) as Arc<dyn Worker>
+            })
+            .collect()
+    }
+
+    fn pair(name: &str) -> Vec<Arc<dyn Worker>> {
+        regular_workers([
+            format!("http://{name}1:8000"),
+            format!("http://{name}2:8000"),
+        ])
+    }
+
+    async fn picks(policy: &RoundRobinPolicy, workers: &[Arc<dyn Worker>], n: usize) -> Vec<usize> {
         let info = SelectWorkerInfo::default();
-        assert_eq!(policy.select_worker(&workers, &info).await, Some(0));
-        assert_eq!(policy.select_worker(&workers, &info).await, Some(1));
-        assert_eq!(policy.select_worker(&workers, &info).await, Some(2));
-        assert_eq!(policy.select_worker(&workers, &info).await, Some(0));
-        assert_eq!(policy.select_worker(&workers, &info).await, Some(1));
+        let mut picks = Vec::new();
+        for _ in 0..n {
+            picks.push(policy.select_worker(workers, &info).await.unwrap());
+        }
+        picks
+    }
+
+    /// Whether `picks` walk `cycle` in order, from wherever they start.
+    fn follows(picks: &[usize], cycle: &[usize]) -> bool {
+        let Some(start) = cycle.iter().position(|&worker| worker == picks[0]) else {
+            return false;
+        };
+        (picks.iter().enumerate()).all(|(i, &worker)| worker == cycle[(start + i) % cycle.len()])
+    }
+
+    #[tokio::test]
+    async fn test_round_robin_keeps_a_position_per_candidate_set() {
+        let policy = RoundRobinPolicy::new();
+        let (a, b) = (pair("a"), pair("b"));
+
+        // Taking turns, each set still visits both of its workers.
+        let (mut from_a, mut from_b) = (Vec::new(), Vec::new());
+        for _ in 0..2 {
+            from_a.extend(picks(&policy, &a, 1).await);
+            from_b.extend(picks(&policy, &b, 1).await);
+        }
+        assert!(follows(&from_a, &[0, 1]) && follows(&from_b, &[0, 1]));
+    }
+
+    #[tokio::test]
+    async fn test_round_robin_drops_sets_unused_since_the_last_sweep() {
+        let policy = RoundRobinPolicy::with_sweep_interval(Duration::ZERO);
+        let kept = pair("kept");
+        let mut from_kept = picks(&policy, &kept, 1).await;
+        for i in 0..100 {
+            picks(
+                &policy,
+                &regular_workers([format!("http://once{i}:8000")]),
+                1,
+            )
+            .await;
+            from_kept.extend(picks(&policy, &kept, 1).await);
+            // The kept set, and the last two sets used once: each lasts one more sweep.
+            assert!(policy.positions.len() <= 3, "{}", policy.positions.len());
+        }
+        assert!(follows(&from_kept, &[0, 1]), "{from_kept:?}");
+    }
+
+    #[tokio::test]
+    async fn test_round_robin_keeps_every_set_used_within_the_interval() {
+        let policy = RoundRobinPolicy::new();
+        let sets: Vec<_> = (0..1000).map(|i| pair(&format!("s{i}-"))).collect();
+        let mut from = vec![Vec::new(); sets.len()];
+        for _ in 0..3 {
+            for (set, from) in sets.iter().zip(&mut from) {
+                from.extend(picks(&policy, set, 1).await);
+            }
+        }
+        assert!(from.iter().all(|from| follows(from, &[0, 1])));
+        assert_eq!(policy.positions.len(), sets.len());
     }
 
     #[tokio::test]
@@ -132,11 +280,7 @@ mod tests {
 
         workers[1].set_healthy(false);
 
-        let info = SelectWorkerInfo::default();
-        assert_eq!(policy.select_worker(&workers, &info).await, Some(0));
-        assert_eq!(policy.select_worker(&workers, &info).await, Some(2));
-        assert_eq!(policy.select_worker(&workers, &info).await, Some(0));
-        assert_eq!(policy.select_worker(&workers, &info).await, Some(2));
+        assert!(follows(&picks(&policy, &workers, 4).await, &[0, 2]));
     }
 
     #[tokio::test]
@@ -155,12 +299,10 @@ mod tests {
             ),
         ];
 
-        let info = SelectWorkerInfo::default();
-        assert_eq!(policy.select_worker(&workers, &info).await, Some(0));
-        assert_eq!(policy.select_worker(&workers, &info).await, Some(1));
-
+        assert!(follows(&picks(&policy, &workers, 2).await, &[0, 1]));
         policy.reset();
-        assert_eq!(policy.select_worker(&workers, &info).await, Some(0));
+        assert!(policy.positions.is_empty());
+        assert!(follows(&picks(&policy, &workers, 2).await, &[0, 1]));
     }
 
     #[tokio::test]

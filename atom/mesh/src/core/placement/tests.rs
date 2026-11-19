@@ -899,8 +899,8 @@ mod d_pd_planning {
         assert_eq!(shared.url(), "http://p2@0");
     }
 
-    /// Round-robin on both pools still reaches every prefill: the prefill position
-    /// advances per decode rank, not in step with the decode's.
+    /// Round-robin on both pools still reaches every prefill: each rank's prefill
+    /// candidates keep their own position instead of moving in step with the decode's.
     #[tokio::test]
     async fn test_idx2idx_round_robin_reaches_every_prefill() {
         let cluster = Idx2IdxCluster::new(Arc::new(RoundRobinPolicy::new()));

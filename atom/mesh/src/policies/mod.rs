@@ -202,9 +202,6 @@ pub struct SelectWorkerInfo<'a> {
     pub hash_ring: Option<Arc<HashRing>>,
     /// The request has media, so its tokens cannot match the KV event index.
     pub carries_media: bool,
-    /// The DP rank of the decode selected first, which the prefill candidates are
-    /// narrowed to (idx2idx).
-    pub decode_rank: Option<usize>,
 }
 
 #[cfg(test)]

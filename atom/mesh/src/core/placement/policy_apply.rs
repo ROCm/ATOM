@@ -11,17 +11,6 @@ pub async fn apply_policy(
     descriptor: &RequestDescriptor<'_>,
     hash_ring: Option<Arc<HashRing>>,
 ) -> Result<Arc<dyn Worker>, PlacementError> {
-    apply_policy_on_rank(candidates, policy, descriptor, hash_ring, None).await
-}
-
-/// [`apply_policy`] for prefill candidates narrowed to `decode_rank`.
-pub async fn apply_policy_on_rank(
-    candidates: &[Arc<dyn Worker>],
-    policy: &dyn LoadBalancingPolicy,
-    descriptor: &RequestDescriptor<'_>,
-    hash_ring: Option<Arc<HashRing>>,
-    decode_rank: Option<usize>,
-) -> Result<Arc<dyn Worker>, PlacementError> {
     if candidates.is_empty() {
         return Err(PlacementError::NoAvailableWorkers);
     }
@@ -31,7 +20,6 @@ pub async fn apply_policy_on_rank(
         headers: descriptor.headers,
         hash_ring,
         carries_media: descriptor.carries_media,
-        decode_rank,
     };
     let (idx, decision) = policy.select_with_decision(candidates, &info).await;
     let selected = idx.map(|idx| candidates[idx].clone());
