@@ -56,6 +56,7 @@ class MonoIndexer:
             else 0
         )
         self.local_scratch = None
+        self.full_scratch = None
         bind_agreed(self._bind, group)
         if self.world > 1:
             self.peers, self._finalizer = owned_peer_buffer(
@@ -81,6 +82,16 @@ class MonoIndexer:
                 "V4.1 local REINDEX",
             )
             if self.local_scratch is not None
+            else None
+        )
+        self.full_widths = (
+            WidthBuilds(
+                lambda rows: kernel.build_indexer(self._full_key(rows)),
+                lambda k: [(k, kernel.ABI)],
+                group,
+                "V4.1 FULL indexer",
+            )
+            if self.full_scratch is not None
             else None
         )
         self.active = False
@@ -153,6 +164,24 @@ class MonoIndexer:
             self.local_scratch = uncached_bytes(
                 kernel.scratch_bytes(kernel.reindex_build(self._key(s))), dev
             )
+        self.full_ratio = (
+            min(
+                (
+                    block.attn.indexer.spec.ratio
+                    for block in self.model.layers
+                    if block.attn.indexer is not None
+                    and block.attn.indexer.spec.candidate_source is None
+                    and not block.attn.indexer.spec.produces_candidates
+                ),
+                default=None,
+            )
+            if self.fp4
+            else None
+        )
+        if self.full_ratio is not None:
+            self.full_scratch = uncached_bytes(
+                kernel.scratch_bytes(self._full_key(s)), dev
+            )
         # Projection and scoring exchange these plain rows within one launch
         # across XCDs. As with the tagged scratch, keep them uncached: draining
         # the producer's stores alone does not invalidate a consumer's cache.
@@ -210,16 +239,26 @@ class MonoIndexer:
     def _build(self, rows):
         return kernel.build_indexer(self._key(rows))
 
+    def _full_key(self, rows):
+        return kernel.full_build(self._key(rows), self.full_ratio)
+
     def prepare(self, rows):
         return (
             0 < rows <= self.max_rows
             and self.widths.prepare(rows)
             and (self.local_widths is None or self.local_widths.prepare(rows))
+            and (self.full_widths is None or self.full_widths.prepare(rows))
         )
 
     def _launch_context(self, spec, rows):
         if self.local_widths is not None and spec.candidate_source is not None:
             return self.local_widths[rows], self.local_scratch
+        if (
+            self.full_widths is not None
+            and spec.candidate_source is None
+            and not spec.produces_candidates
+        ):
+            return self.full_widths[rows], self.full_scratch
         return self.widths[rows], self.scratch
 
     def begin_step(self, rows, cache, step):
@@ -240,6 +279,14 @@ class MonoIndexer:
                 self.local_scratch[off : off + n].view(torch.int32)
                 for name, (off, n) in local_layout.items()
                 if name in ("qdone", "qready", "isf", "irdy") or "ready" in name
+            )
+        if self.full_scratch is not None:
+            full_layout = kernel.scratch_layout(self._full_key(rows))
+            resets += tuple(
+                self.full_scratch[off : off + n].view(torch.int32)
+                for name, (off, n) in full_layout.items()
+                if name in ("qdone", "qready", "isf", "irdy", "ix_fenced")
+                or "ready" in name
             )
         write_step_meta(
             step,

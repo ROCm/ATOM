@@ -24,6 +24,7 @@ OTHER = {
     "timing": True,
     "radix_blocks": False,
     "split_segment": 16384,
+    "full_only": True,
 }
 
 
@@ -64,6 +65,41 @@ def test_reindex_build_keeps_projection_and_bounds_the_compressed_domain(bound):
         key, bound_max=min(bound, 18432), world=1, peer_offset=0, peer_plain=0
     )
     assert kernel.reindex_build(key) == expected
+
+
+@pytest.mark.parametrize("ratio", [1, 2])
+@pytest.mark.parametrize("bound", [8320, 163968, 262144, 524288])
+def test_full_build_bounds_keys_and_preserves_peer_fence_geometry(ratio, bound):
+    key = dataclasses.replace(
+        BASE, bound_max=bound, world=4, peer_offset=4096, peer_plain=1 << 24
+    )
+    full = kernel.full_build(key, ratio)
+    assert full == dataclasses.replace(
+        key,
+        bound_max=((bound + ratio * 128 - 1) // (ratio * 128)) * 128,
+        full_only=True,
+    )
+    layout = kernel.scratch_layout(full)
+    assert not any(name.startswith("iblk") for name in layout)
+    assert "ix_rowhist" not in layout and "ix_segment_ready" not in layout
+    assert kernel.scratch_bytes(full) < kernel.scratch_bytes(key)
+
+
+@pytest.mark.parametrize(
+    "world,rows", [(2, 1), (2, 48), (4, 12), (4, 16), (4, 48), (8, 1), (8, 48)]
+)
+def test_full_tp_binary_has_no_private_scratch(monkeypatch, world, rows):
+    monkeypatch.setenv("ARCH", "gfx950")
+    key = kernel.full_build(
+        dataclasses.replace(
+            BASE, tokens=rows, bound_max=163968, mfma=True, world=world
+        ),
+        2,
+    )
+    resources = launcher_resources(_compile(key))
+    assert resources and all(
+        r["scratch"] == 0 and r["lds"] <= 163840 for r in resources
+    )
 
 
 @pytest.mark.parametrize("name", sorted(OTHER))

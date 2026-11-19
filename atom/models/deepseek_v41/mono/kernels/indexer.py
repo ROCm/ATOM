@@ -101,6 +101,7 @@ class IndexerBuild:
     timing: bool = False
     radix_blocks: bool = True
     split_segment: int = 8192
+    full_only: bool = False
 
 
 ABI = KernelAbi((
@@ -114,20 +115,26 @@ ABI = KernelAbi((
 ))  # fmt: skip
 
 
+def _select_segment(key):
+    if key.full_only:
+        return min(8192, ip.cdiv(key.bound_max, 2048) * 2048)
+    return isp.row_segment(key.bound_max) if key.fp4 else ip.SEG
+
+
 def scratch_layout(key: IndexerBuild):
-    segment = isp.row_segment(key.bound_max) if key.fp4 else ip.SEG
+    segment = _select_segment(key)
     lists = {"isf": key.tokens * ip.chunks(key.bound_max), "irdy": key.tokens}
     if key.timing:
         lists["timing"] = BLOCKS * 16 // 2
     if key.world > 1:
-        lists["ix_root_ready"] = key.tokens * len(tp.KINDS)
+        lists["ix_root_ready"] = key.tokens * (1 if key.full_only else len(tp.KINDS))
         lists["ix_fenced"] = 1
-        if key.radix_blocks:
+        if key.radix_blocks and not key.full_only:
             lists["ix_rowhist"] = row_hist_words(key.tokens) // 2
             lists["ix_segment_ready"] = key.tokens * len(tp.KINDS) * BLOCKS * 2
             lists["ix_emitted_ready"] = key.tokens * len(tp.KINDS) * BLOCKS
             lists["ix_phase_ready"] = key.tokens * len(tp.KINDS) * 4 * 3
-    for kind in ip.KINDS:
+    for kind in (("sel",) if key.full_only else ip.KINDS):
         plan = (
             SelectionPlan(8192 if kind == "blk" else 4096)
             if key.world > 1
@@ -171,6 +178,22 @@ def reindex_build(key: IndexerBuild):
         world=1,
         peer_offset=0,
         peer_plain=0,
+    )
+
+
+def full_build(key: IndexerBuild, ratio: int):
+    """A Top512-only binary bounded by the FULL layers' compression ratio.
+
+    The caller uses the smallest ratio among its non-producing FULL layers.
+    Keep the original TP world and peer offsets so the scorer's walk plan and
+    the first layer's epoch fence agree with the normal request planner.
+    """
+    if not key.fp4 or ratio not in (1, 2):
+        raise ValueError("FULL indexer requires FP4 and compression ratio 1 or 2")
+    return replace(
+        key,
+        bound_max=ip.cdiv(key.bound_max, ratio * ip.CHUNK) * ip.CHUNK,
+        full_only=True,
     )
 
 
@@ -243,8 +266,9 @@ def _run_fp4_local(c, s, bid, bound_max):
     _stamp(c, 4)
     next_base = _tree(c, s, bid, "sel", bound_max)
     _stamp(c, 5)
-    if c["args"]["iprod"] != 0:
-        _tree(c, s, bid, "blk", bound_max, next_base)
+    if const_expr(not c.get("full_only", False)):  # noqa: SIM102
+        if c["args"]["iprod"] != 0:
+            _tree(c, s, bid, "blk", bound_max, next_base)
     _stamp(c, 6)
 
 
@@ -273,7 +297,7 @@ def _run_fp4_tp(c, key, peers, rank, ix_meta, step_fence):
         "world": key.world,
         "rank": rank,
         "tp_direct": False,
-        "select_seg": 4096,
+        "select_seg": 8192 if key.full_only else 4096,
         "block_select_seg": 8192,
         "list_storage_segment": 4096,
         "block_list_storage_segment": 8192,
@@ -308,26 +332,28 @@ def _run_fp4_tp(c, key, peers, rank, ix_meta, step_fence):
         {**co, "select_split": False}, s, co["bid"], "sel", key.bound_max, next_base
     )
     _stamp(co, 5)
-    if co["args"]["iprod"] != 0:
-        if const_expr(key.radix_blocks):
-            next_base = run_splits(co, "blk", next_base)
-            _tree(
-                {**co, "select_split": False},
-                s,
-                co["bid"],
-                "blk",
-                key.bound_max,
-                next_base,
-            )
-        else:
-            _tree(co, s, co["bid"], "blk", key.bound_max, next_base)
+    if const_expr(not key.full_only):  # noqa: SIM102
+        if co["args"]["iprod"] != 0:
+            if const_expr(key.radix_blocks):
+                next_base = run_splits(co, "blk", next_base)
+                _tree(
+                    {**co, "select_split": False},
+                    s,
+                    co["bid"],
+                    "blk",
+                    key.bound_max,
+                    next_base,
+                )
+            else:
+                _tree(co, s, co["bid"], "blk", key.bound_max, next_base)
     _stamp(co, 6)
     for t in range(co["bid"], s, BLOCKS):
         mode, owner, _first, _count = row_work(co, t)
         finish_row(co, t, "sel", mode, owner)
         _stamp(co, 7)
-        if co["args"]["iprod"] != 0:
-            finish_row({**co, "tp_direct": key.radix_blocks}, t, "blk", mode, owner)
+        if const_expr(not key.full_only):  # noqa: SIM102
+            if co["args"]["iprod"] != 0:
+                finish_row({**co, "tp_direct": key.radix_blocks}, t, "blk", mode, owner)
         _stamp(co, 8)
 
 
@@ -398,17 +424,20 @@ def build_indexer(key: IndexerBuild):
         raise ValueError("MFMA layout is an FP4 index plane")
     if key.world not in (1, 2, 4, 8) or (key.world > 1 and not key.fp4):
         raise ValueError("cross-TP V4.1 indexer requires FP4 and TP1/2/4/8")
+    if key.full_only and not key.fp4:
+        raise ValueError("FULL specialization requires FP4")
     layout = scratch_layout(key)
     keyed = key_tuple(key, SOURCES)
     rows = tile_rows(s)
     tiles = token_tiles(s)
     parts = 2 if s > 32 else 4
     split_weights = _split_weights(key)
-    plan = SelectionPlan(isp.row_segment(key.bound_max) if key.fp4 else ip.SEG)
+    plan = SelectionPlan(_select_segment(key))
     sel = lds_words(plan.SEG // THREADS, fast_hist=True)
     sel_keys, sel_hist, sel_buf = sel["keys"], sel["hist"], sel["buf"]
+    peer_topk = ip.TOPK if key.full_only else ip.TOPK_BLOCKS
     if key.world > 1:
-        sel_keys = max(sel_keys, key.world * ip.TOPK_BLOCKS)
+        sel_keys = max(sel_keys, key.world * peer_topk)
 
     @fx.struct
     class ProjectionLds:
@@ -423,11 +452,17 @@ def build_indexer(key: IndexerBuild):
         sk: fx.Array[fx.Int32, sel_keys, 16]
         sh: fx.Array[fx.Int32, sel_hist, 16]
         sb: fx.Array[fx.Int32, sel_buf, 16]
-        si: fx.Array[fx.Int32, key.world * ip.TOPK_BLOCKS if key.world > 1 else 1, 16]
+        si: fx.Array[fx.Int32, key.world * peer_topk if key.world > 1 else 1, 16]
         rs: fx.Array[fx.Int32, 4, 16]
         rc: fx.Array[fx.Int32, WAVES * 2, 16]
         rb: fx.Array[
-            fx.Int32, BLOCKS * 2 if key.world > 1 and key.radix_blocks else 1, 16
+            fx.Int32,
+            (
+                BLOCKS * 2
+                if key.world > 1 and key.radix_blocks and not key.full_only
+                else 1
+            ),
+            16,
         ]
 
     @fx.union
@@ -448,6 +483,7 @@ def build_indexer(key: IndexerBuild):
         timing=int(key.timing),
         splitseg=key.split_segment,
         radixblocks=int(key.radix_blocks),
+        full=int(key.full_only),
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -468,6 +504,9 @@ def build_indexer(key: IndexerBuild):
         storage = alloc.allocate(StageLds)
         pr, se = storage.project.peek(), storage.select.peek()
         mb = mailbox(layer, scratch, key.diag_off, layout)
+        if const_expr(key.full_only):
+            ilift = fx.Int32(0)
+            iprod = fx.Int32(0)
         c = {
             "S": s, "tid": tid, "bid": bid, "lane": tid % 64, "wave": tid // 64,
             "bound_max":key.bound_max,
@@ -483,6 +522,8 @@ def build_indexer(key: IndexerBuild):
             "fast_select": True,
             "compact_selected_rows": True,
             "list_ready": True,
+            "full_only": key.full_only,
+            "tight_select_width": key.full_only,
             "select_seg": plan.SEG,
             "query_ready": key.fp4,
             "query_parts": parts,

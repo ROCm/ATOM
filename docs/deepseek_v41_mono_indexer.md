@@ -58,6 +58,13 @@ query projection, GPT-J RoPE, Top512 and candidate blocks. Its TP partition
 operates on replicated caches; K3's DCP-sharded-cache timings are a different
 workload and are not an identical performance comparison.
 
+Non-producing FULL layers use a dedicated Top512-only binary and scratch arena.
+The build bounds the compressed key domain using the smallest FULL ratio,
+sizes local leaves up to 8K and rounds root input widths to per-thread quads.
+Owned FULL requests use 8K leaves. Candidate-block and REINDEX routes keep their
+original binaries; the K3 request ownership, K partition and ACK protocol remain
+the source of runtime work decisions.
+
 ## Admission and fallback
 
 Admission requires 256 gfx950 CUs, shuffled `(16,16)` MXFP8 query weights,
@@ -116,8 +123,9 @@ compile-only; this round does not use the reserved final two physical GPUs.
 
 Indexer measurements use real checkpoint projection weights with synthetic
 hidden/query/cache inputs, FP4 `mfma`, contexts 8192/163840, and
-FULL/candidate/REINDEX paths. Each point uses seven alternating
-native/local/automatic-Mono samples, 500 calls per sample in CUDA Graphs,
+FULL/candidate/REINDEX paths. The FULL optimization benchmark compares
+native, the baseline without FULL specialization, and optimized Mono in seven
+interleaved samples, 500 calls per sample in CUDA Graphs,
 CUDA Events, and the maximum TP-rank time. Report the median and spread;
 record loaded clocks and exclude concurrent model loading/builds/workloads.
 
@@ -135,49 +143,46 @@ real-model check uses supported level3/FULL CUDA Graphs. Formal GSM8K and
 actual 8K/160K whole-model serving performance remain to be qualified.
 
 
-## Current qualification results (2026-11-19)
+## Current FULL optimization qualification (2026-11-19)
 
-On g15 with the DeepSeek-V4.1-Flash checkpoint and unchanged aiter `b5b4bf978160b2d495e59b163e932fadc584675d`:
+The benchmark uses real checkpoint projection weights and synthetic inputs/cache, seven paired samples of 500 graph calls, and the maximum TP-rank event time. It compares native, the original selection path with FULL specialization disabled, and the optimized path. All comparisons use the same inputs in one process.
 
-- Final relevant regression: 451 passed, 18 subtests. CPU installation/import checks with real aiter/FlyDSL imports blocked: 124 passed, 2 skipped, 18 subtests.
-- Selected unit/GPU metadata/dispatch/build suite: 199 passed, 18 subtests.
-
-TP2 and TP4 each passed 12 integrated exact-selection cases and 63 same-graph request-mode changes for both the adaptive and forced cross-TP policy. Isolated root merge passed 48 cases and distributed radix passed 24, including ties/IEEE patterns and delayed consumers. Six TP2/4/8 long builds (rows1/48) have zero private scratch; TP8 is compile-only.
-
-Real TP4 checkpoint generation at supported level3/FULL CUDA Graph: 16 short and ~25.6K-prompt cases at BS1/8 completed. Both Mono routes checked live head-weight projections on all eight indexer layers with zero error markers. Each Mono route matched the first native run on 18/18 sequences; native repeat matched 17/18. This instrumented check is not GSM8K or a latency benchmark.
-
-TP4 main matrix: 48 points, 48 faster medians, 0 within +/-0.5%; latency reductions 3.55% to 43.29%. TP2 representative matrix: 18 points, 18 faster medians, 0 within +/-0.5%; latency reductions 7.90% to 44.29%.
-
-TP4 qlen1 latency reductions versus native:
-
-| Sequence BS | 8K FULL | 8K candidate | 8K REINDEX | 160K FULL | 160K candidate | 160K REINDEX |
+| Context | qlen | Sequence BS | Baseline μs | Optimized μs | Reduction vs baseline | Reduction vs native |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 14.33% | 30.60% | 17.35% | 17.63% | 43.29% | 16.38% |
-| 8 | 9.74% | 25.83% | 15.72% | 12.21% | 39.88% | 14.61% |
-| 16 | 5.51% | 21.53% | 7.85% | 10.15% | 42.43% | 6.83% |
-| 24 | 4.46% | 18.87% | 6.51% | 23.02% | 36.49% | 7.68% |
-| 32 | 5.14% | 18.18% | 3.55% | 23.76% | 40.49% | 4.19% |
-| 40 | 6.78% | 22.28% | 8.01% | 20.06% | 40.34% | 11.10% |
+| 8192 | 1 | 1 | 18.569 | 16.268 | 12.39% | 27.19% |
+| 163840 | 1 | 1 | 34.292 | 29.407 | 14.24% | 29.01% |
+| 8192 | 1 | 8 | 21.247 | 19.036 | 10.41% | 19.43% |
+| 163840 | 1 | 8 | 41.058 | 35.988 | 12.35% | 22.88% |
+| 8192 | 1 | 16 | 22.975 | 20.775 | 9.58% | 14.15% |
+| 163840 | 1 | 16 | 44.855 | 42.242 | 5.83% | 14.81% |
+| 8192 | 1 | 24 | 23.769 | 21.545 | 9.36% | 13.46% |
+| 163840 | 1 | 24 | 46.874 | 44.818 | 4.39% | 25.14% |
+| 8192 | 1 | 32 | 24.022 | 21.801 | 9.25% | 13.37% |
+| 163840 | 1 | 32 | 47.920 | 45.350 | 5.36% | 26.95% |
+| 8192 | 1 | 40 | 23.881 | 22.072 | 7.57% | 14.19% |
+| 163840 | 1 | 40 | 51.772 | 48.962 | 5.43% | 23.47% |
+| 8192 | 6 | 1 | 23.152 | 21.139 | 8.70% | 19.73% |
+| 163840 | 6 | 1 | 41.177 | 35.714 | 13.27% | 22.05% |
+| 8192 | 6 | 8 | 26.685 | 24.391 | 8.60% | 13.14% |
+| 163840 | 6 | 8 | 52.549 | 49.464 | 5.87% | 21.69% |
 
-TP4 qlen6 latency reductions (query rows = sequence BS x 6):
+All 48 TP4 main points, six TP4 qlen6/BS2 supplements, and 18 TP2 representative points have faster medians than native. All 504 paired samples are faster than native. Every measured baseline/optimized binary has zero private scratch. Candidate and REINDEX retain their original kernels; the unchanged 160K qlen6/BS2 REINDEX point measured 1.29% slower than the paired baseline, but 6.43% faster than native.
 
-| Sequence BS | 8K FULL | 8K candidate | 8K REINDEX | 160K FULL | 160K candidate | 160K REINDEX |
-|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 12.99% | 23.73% | 20.78% | 10.89% | 40.03% | 16.60% |
-| 8 | 5.17% | 19.39% | 7.13% | 17.04% | 33.73% | 7.29% |
+Validation:
 
-TP2 qlen1 representative points:
+- Final dispatch/build-key/resource suite: 55 passed, including TP2/4/8 FULL binaries with zero private scratch (TP8 compile-only).
+- Related CPU/GPU numerical and handoff regression: 473 passed, 18 subtests. CPU import checks with real aiter/FlyDSL blocked: 124 passed, 2 skipped, 18 subtests.
+- TP4 and TP2 each passed 12 real-weight exact-selection cases. TP4 adaptive and forced cross-TP same-graph mode changes each passed 63 transitions.
+- Real TP4 checkpoint, level3/FULL Graph: all 16 short/~25.6K prompt cases at BS1/8 completed. Both Mono routes checked all eight live head-weight projections with zero error markers. Native plus standalone indexer matched native on 18/18 generated sequences; ordinary layer Mono matched 17/18; native repeat matched 18/18. One long-prompt BS8 layer Mono sequence differed. Formal GSM8K remains unqualified; instrumented decode_ms is not a performance result.
+- After the complete model results were written, aiter IPCBuffer/CustomAllreduce destructors printed ignored PyTorch schema errors during interpreter shutdown; torchrun exited 0. The full log is retained.
+- Black, Ruff and git diff --check passed.
 
-| Sequence BS | 8K FULL | 8K candidate | 8K REINDEX | 160K FULL | 160K candidate | 160K REINDEX |
-|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 16.74% | 30.01% | 16.15% | 18.22% | 44.29% | 15.50% |
-| 8 | 9.70% | 27.65% | 16.14% | 13.53% | 39.64% | 14.51% |
-| 40 | 7.90% | 23.09% | 8.56% | 9.11% | 21.82% | 11.04% |
+BS1 reaches K3's earlier approximate 25.6%–38.1% FULL reference. BS8/16 and some qlen6 points remain below it; projection, TopK and TP/DCP cache geometry differ. Formal GSM8K and actual 8K/160K serving throughput remain unqualified, so the opt-in default stays 0.
 
-TP4 qlen6/BS2 supplements exercise actual K splitting at 160K for FULL/candidate; REINDEX remains local:
+Run the paired retained-version benchmark with:
 
-| Sequence BS | 8K FULL | 8K candidate | 8K REINDEX | 160K FULL | 160K candidate | 160K REINDEX |
-|---:|---:|---:|---:|---:|---:|---:|
-| 2 | 2.42% | 17.62% | 12.14% | 9.63% | 31.02% | 7.44% |
-
-K3's earlier 160K/DCP8 FULL reference was about 25.6%-38.1%. The low-batch FULL results here do not reach that reference. Different projection, TopK and TP/DCP cache geometry prevent an identical comparison. The adaptive local route removes the peer overhead measured at these small widths. Original pre-adaptive results and tuning attempts are archived separately.
+```bash
+V=tests/models/deepseek_v41/mono_indexer_validation
+HIP_VISIBLE_DEVICES=1,3,2,0 TP_POINTS=1:8192:1,1:163840:1,8:163840:1 \
+  torchrun --standalone --nproc-per-node=4 "$V/tp_full_optimization_benchmark.py"
+```

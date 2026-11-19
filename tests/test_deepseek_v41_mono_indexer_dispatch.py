@@ -118,6 +118,7 @@ def test_reindex_launches_local_binary_with_its_own_scratch():
     r = module.MonoIndexer.__new__(module.MonoIndexer)
     r.widths = {8: object()}
     r.local_widths = {8: object()}
+    r.full_widths = None
     r.scratch, r.local_scratch = object(), object()
     assert r._launch_context(SimpleNamespace(candidate_source=None), 8) == (
         r.widths[8],
@@ -134,6 +135,19 @@ def test_reindex_launches_local_binary_with_its_own_scratch():
     )
 
 
+def test_full_binary_is_separate_from_candidate_and_reindex_buffers():
+    r = module.MonoIndexer.__new__(module.MonoIndexer)
+    r.widths, r.local_widths, r.full_widths = ({8: object()} for _ in range(3))
+    r.scratch, r.local_scratch, r.full_scratch = object(), object(), object()
+    for source, produces, expected in (
+        (None, False, (r.full_widths[8], r.full_scratch)),
+        (None, True, (r.widths[8], r.scratch)),
+        (20, False, (r.local_widths[8], r.local_scratch)),
+    ):
+        spec = SimpleNamespace(candidate_source=source, produces_candidates=produces)
+        assert r._launch_context(spec, 8) == expected
+
+
 def test_layer_reset_preserves_candidate_data_and_separates_split_histograms():
     from atom.models.deepseek_v41.mono.kernels import indexer as kernel
     from atom.models.deepseek_v41.mono.runner import V41MonoDecodeRunner
@@ -146,6 +160,11 @@ def test_layer_reset_preserves_candidate_data_and_separates_split_histograms():
     r.local_index_scratch = torch.full(
         (kernel.scratch_bytes(local_key),), 7, dtype=torch.uint8
     )
+    r.indexer_full_ratio = 2
+    full_key = kernel.full_build(key, 2)
+    r.full_index_scratch = torch.full(
+        (kernel.scratch_bytes(full_key),), 7, dtype=torch.uint8
+    )
     resets, split_resets = r._index_reset_buffers(8)
     assert resets and len(split_resets) == 1
     assert (
@@ -153,7 +172,11 @@ def test_layer_reset_preserves_candidate_data_and_separates_split_histograms():
     )
     for flags in resets:
         flags.zero_()
-    for build, scratch in ((key, r.index_scratch), (local_key, r.local_index_scratch)):
+    for build, scratch in (
+        (key, r.index_scratch),
+        (local_key, r.local_index_scratch),
+        (full_key, r.full_index_scratch),
+    ):
         layout = kernel.scratch_layout(build)
         # Retained scores/IDs are overwritten by their producers, not cleared.
         for name in ("iq", "isel0"):

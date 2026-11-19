@@ -124,6 +124,7 @@ class RowsBuild:
     moe: object = None
     indexer: object = None
     indexer_local: object = None
+    indexer_full: object = None
 
 
 # the layers whose attention norm has other readers (the compressor, the indexer)
@@ -289,6 +290,20 @@ class V41MonoDecodeRunner:
             block.attn.indexer is not None and spec.candidate_source is not None
             for spec, block in zip(model.topology, model.layers)
         )
+        self.indexer_full_ratio = (
+            min(
+                (
+                    spec.ratio
+                    for spec, block in zip(model.topology, model.layers)
+                    if block.attn.indexer is not None
+                    and spec.candidate_source is None
+                    and not spec.produces_candidates
+                ),
+                default=None,
+            )
+            if self.index_fp4
+            else None
+        )
         self._allocate(model.config)
 
     def index_query(self):
@@ -436,6 +451,14 @@ class V41MonoDecodeRunner:
             if indexer is not None and getattr(self, "indexer_has_reindex", False)
             else None
         )
+        indexer_full = (
+            ki.build_indexer(
+                ki.full_build(self._indexer_key(s), self.indexer_full_ratio)
+            )
+            if indexer is not None
+            and getattr(self, "indexer_full_ratio", None) is not None
+            else None
+        )
         if self.split_k2:
             key_a, key_b = post_key.halves()
             return RowsBuild(
@@ -445,6 +468,7 @@ class V41MonoDecodeRunner:
                 moe=k2b.build_moe(key_b),
                 indexer=indexer,
                 indexer_local=indexer_local,
+                indexer_full=indexer_full,
             )
         return RowsBuild(
             keys,
@@ -452,6 +476,7 @@ class V41MonoDecodeRunner:
             layer_post=k2.build_layer_post(post_key),
             indexer=indexer,
             indexer_local=indexer_local,
+            indexer_full=indexer_full,
         )
 
     def _indexer_key(self, rows):
@@ -493,6 +518,8 @@ class V41MonoDecodeRunner:
             kernels.append((build.indexer, ki.ABI))
         if getattr(build, "indexer_local", None) is not None:
             kernels.append((build.indexer_local, ki.ABI))
+        if getattr(build, "indexer_full", None) is not None:
+            kernels.append((build.indexer_full, ki.ABI))
         if build.layer_post is not None:
             return kernels + [(build.layer_post, k2.ABI)]
         return kernels + [(build.attn_post, k2a.ABI), (build.moe, k2b.ABI)]
@@ -614,16 +641,32 @@ class V41MonoDecodeRunner:
             and getattr(self, "indexer_has_reindex", False)
             else None
         )
+        self.full_index_scratch = (
+            uncached_bytes(
+                ki.scratch_bytes(
+                    ki.full_build(self._indexer_key(s), self.indexer_full_ratio)
+                ),
+                dev,
+            )
+            if self.index_scratch is not None
+            and getattr(self, "indexer_full_ratio", None) is not None
+            else None
+        )
         self.ix_meta = torch.empty(s, 4, device=dev, dtype=torch.int32)
 
     def _index_reset_buffers(self, rows):
         """Only synchronization flags need clearing between indexer steps."""
         resets, split_resets = [], []
         key = self._indexer_key(rows)
-        for build, scratch in (
+        builds = [
             (key, self.index_scratch),
             (ki.reindex_build(key), self.local_index_scratch),
-        ):
+        ]
+        if getattr(self, "full_index_scratch", None) is not None:
+            builds.append(
+                (ki.full_build(key, self.indexer_full_ratio), self.full_index_scratch)
+            )
+        for build, scratch in builds:
             if scratch is None:
                 continue
             for name, (off, size) in ki.scratch_layout(build).items():
@@ -949,6 +992,16 @@ class V41MonoDecodeRunner:
             spec.candidate_source is not None
             and getattr(self.build, "indexer_local", None) is not None
         )
+        full = (
+            spec.candidate_source is None
+            and not spec.produces_candidates
+            and getattr(self.build, "indexer_full", None) is not None
+        )
+        scratch = (
+            self.local_index_scratch
+            if local
+            else self.full_index_scratch if full else self.index_scratch
+        )
         args = ki.ABI.pack(
             {
                 **selection,
@@ -970,7 +1023,7 @@ class V41MonoDecodeRunner:
                     else geometry.page_bytes // geometry.row_bytes
                 ),
                 "main_off": geometry.main_offset(spec.kv_owner),
-                "scratch": p(self.local_index_scratch if local else self.index_scratch),
+                "scratch": p(scratch),
                 "layer": spec.layer_id,
                 "peers": self.peers.addresses.data_ptr(),
                 "rank": self.rank,
@@ -979,7 +1032,11 @@ class V41MonoDecodeRunner:
                 "step_fence": 0,
             }
         )
-        launcher = self.build.indexer_local if local else self.build.indexer
+        launcher = (
+            self.build.indexer_local
+            if local
+            else self.build.indexer_full if full else self.build.indexer
+        )
         _run_compiled(launcher, *args, torch.cuda.current_stream())
 
     def _selection_args(self, spec, attn, cache, step) -> dict:

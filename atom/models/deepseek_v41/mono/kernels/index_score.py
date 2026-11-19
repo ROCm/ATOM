@@ -266,7 +266,9 @@ def stage_ilist(c, t, j, raw, kind, level, bound_max, max_chunks):
         max_inputs = isp.list_inputs(
             segment, ip.kind_bound(kind, bound_max), level, 0, k
         )
-        if max_inputs <= 2048:
+        if c.get("tight_select_width", False):
+            per_thread = ip.cdiv(max_inputs, THREADS * 4) * 4
+        elif max_inputs <= 2048:
             per_thread = 4
         elif max_inputs <= 8192:
             per_thread = 16
