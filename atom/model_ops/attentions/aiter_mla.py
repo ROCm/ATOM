@@ -49,6 +49,7 @@ from atom.model_ops.attention_mla import (
     _MLA_MIN_HEADS,
     _MLA_SPLIT_BUDGET_AUTO,
     MLAAttention,
+    mla_dcp_decode_query_lens,
     mla_dcp_kernel_num_heads,
     mla_dcp_persistent_width,
     mla_dcp_sparse_prefill_num_heads,
@@ -587,16 +588,24 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # gathered width, not the per-rank one. Pad it the same way the module
         # does (mla_dcp_decode_is_persistent picks the width set), so these
         # descriptors always describe the kernel that will actually run.
-        # Only where aiter runs DCP decode persistent (gfx942 lacks the lse
-        # persistent kernel and stays non-persistent, where this metadata is
-        # unused) does it scale by dcp; elsewhere it keeps the per-rank sizing.
+        # Only where aiter runs this call persistent does it scale by dcp; where
+        # it has no persistent kernel for it the width is None, this metadata is
+        # unused and a speculative verify is refused by the layer
+        # (MLAAttention._configure_dcp_decode_head_padding). Elsewhere it keeps
+        # the per-rank sizing.
         # Target layers only: min_query_heads is the DSpark draft's, and the
-        # draft plans its own descriptors (DSparkProposer).
+        # draft plans its own descriptors (DSparkProposer). Sparse / DSA layers
+        # decode and run MTP verify as per-token q_len=1 rows (no round-robin
+        # KV), so they plan that call, as their layers size it. Dense layers
+        # plan every query length they run, 1 to k + 1: the one-row MTP draft
+        # steps reuse this plan (prepare_mtp_decode).
+        query_lens = (1,) if self.is_sparse else mla_dcp_decode_query_lens(config)
         dcp_persistent = (
             mla_dcp_persistent_width(
                 self.num_attention_heads,
                 self.dcp_world_size,
                 kv_cache_dtype=config.kv_cache_dtype,
+                query_lens=query_lens,
             )
             is not None
         )
@@ -623,6 +632,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     dcp_persistent,
                     sparse_metadata_rebuild=self.sparse_dcp_metadata_rebuild,
                 ),
+                max_seqlen_q=max(query_lens),
+                query_lens=query_lens,
             )
         else:
             self.persistent_num_heads = self.padded_num_attention_heads
