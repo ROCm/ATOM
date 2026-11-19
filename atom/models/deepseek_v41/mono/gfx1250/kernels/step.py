@@ -757,8 +757,8 @@ def target_layer(E, Ly):
                     bpf = isrx.select((b - fx.Int32(TK.MA_X0) + fx.Int32(TK.MA_CTAS)) % fx.Int32(TK.MA_CTAS), b)
                 if (bpf < isrx.select(fx.Int32(TR * TK.MC_G), fx.Int32(TR * TK.mc_g_long(TR)))) | cs_["iprod"]:
                     iprefetch(24)
-                    if fx.const_expr(TR <= 6):   # (c1 FULL: select_mf ahead of select_mc, the selection reaches past 24 KB)
-                        if (isrx | cs_["iprod"]) == (fx.Int32(0) != fx.Int32(0)):
+                    if fx.const_expr(TR <= 6):   # (c1 FULL / layer 20: select_mf ahead, the selection past 24 KB)
+                        if isrx == (fx.Int32(0) != fx.Int32(0)):
                             iprefetch(32, 24)
                 if segw == (fx.Int32(0) != fx.Int32(0)):
                     handoff(lc + i64(LY.SCORE), t, True)
@@ -773,6 +773,24 @@ def target_layer(E, Ly):
                 sel_levels, blk_levels = TK.selection_levels(cs_, isrx)   # (2, or 3 past 8192 x 16 index rows)
                 lsel = (nmax > fx.Int32(TK.SEG)).select(sel_levels, fx.Int32(1))
                 npass = isrx.select(lsel, cs_["iprod"].select(sel_levels + blk_levels, lsel))
+                # (c1) select_mf, one instance for the FULL rows (gsel CTAs a row) and layer 20's top-512 (GS a row, its
+                # select_ord groups): the anchored first round; 0 -> select_mc / select_ord below
+                nfl = fx.Int32(0) != fx.Int32(0)
+                mfdone = fx.Int32(0)
+                # (MC_G CTAs a row once some row's n > MC_G_MIN_N: a radix round's keys over 4x the CTAs -- 83K -68,
+                # 30K -45 us a step; short rows keep MC_G_SHORT, where the round's group count over 32 CTAs costs
+                # more than their keys -- 2K +56 us with 32 CTAs always)
+                gsel = (nmax > fx.Int32(TK.MC_G_MIN_N)).select(fx.Int32(TK.MC_G), fx.Int32(TK.MC_G_SHORT))
+                # (FULL rows past MC_G_LONG_N keys: every CTA in a row group, topk.mc_g_long -- REINDEX keeps MC_G)
+                gsel = ((isrx == nfl) & (nmax > fx.Int32(TK.MC_G_LONG_N))).select(fx.Int32(TK.mc_g_long(TR)), gsel)
+                if fx.const_expr(TR <= 6 and L20_ORD):
+                    GS0 = max(1, min(TK.MC_G, (CTAS * 3 // 4) // TR))
+                    if (isrx == nfl) & ((cs_["iprod"] == nfl) | (b < TR * GS0)):
+                        mhm = fptr(fp, "mchist")   # (a slot Ly // 6: FULL 0..2, layer 20 3, see tables)
+                        mfdone = TK.select_mf(cwith(cs_, ts=None), mhm + i64(Ly) * TK.MC_LAYER + i64(TK.MC_HIST),
+                                              cs_["iprod"].select(fx.Int32(GS0), gsel),
+                                              mhm + i64(MF_OFF) + i64(Ly // 6) * TK.MF_LAYER,
+                                              mhm + i64(MF_KB) + i64(Ly // 6) * TK.MF_KEEP)
                 if fx.const_expr(L20_ORD and TR <= TK.MC_ROWS):
                     if cs_["iprod"]:   # (l20) the candidate layer: both selections in one pass, one handoff
                         # (topk.select_ord, by row groups of CTAs: the top-512 of the scores on TR x GS CTAs, the top-2048
@@ -790,9 +808,13 @@ def target_layer(E, Ly):
                             bd2 = fx.max(hx.gload(cs_["ibound"] + i64(r2) * 4, fx.Int32), fx.Int32(0))
                             q2 = fx.max(hx.gload(cs_["ibat"] + i64(r2) * 4, fx.Int32), fx.Int32(0))
                             if sl:
-                                TK.select_ord(cwith(cs_, ts=None), mh + i64(Ly) * TK.MC_LAYER, mh + i64(Ly) * TK.MC_LAYER + i64(TK.MC_HIST),
-                                              mh + i64(L20_OC_SLOT) * TK.MC_LAYER, r2, g2, GS, bd2, TK.KSEL, cs_["ilog"], cs_["ilw"],
-                                              TK.MODE_SEL, q2, ordered=L20_SEL_ORDERED)
+                                if mfdone == fx.Int32(0):   # (c1: select_mf's fallback, the anchor written)
+                                    anc20 = ((mh + i64(MF_KB + TK.MF_KANC) + i64(Ly // 6) * TK.MF_KEEP)
+                                             if TR <= 6 else None)
+                                    TK.select_ord(cwith(cs_, ts=None), mh + i64(Ly) * TK.MC_LAYER,
+                                                  mh + i64(Ly) * TK.MC_LAYER + i64(TK.MC_HIST),
+                                                  mh + i64(L20_OC_SLOT) * TK.MC_LAYER, r2, g2, GS, bd2, TK.KSEL, cs_["ilog"],
+                                                  cs_["ilw"], TK.MODE_SEL, q2, ordered=L20_SEL_ORDERED, anc=anc20)
                             else:
                                 TK.select_ord(cwith(cs_, ts=None), mh + i64(L20_BLK_SLOT) * TK.MC_LAYER,
                                               mh + i64(L20_BLK_SLOT) * TK.MC_LAYER + i64(TK.MC_HIST),
@@ -821,13 +843,6 @@ def target_layer(E, Ly):
                         handoff(lc + i64(LY.SELECT0) + i64(pi) * 4, t, True)
                 if cs_["iprod"] == (fx.Int32(0) != fx.Int32(0)):   # FULL / REINDEX: every row's top-512 by 8 or 32 CTAs a row (4 radix rounds, a group count each), one handoff
                     mh = fptr(fp, "mchist")
-                    # (MC_G CTAs a row once some row's n > MC_G_MIN_N: a radix round's keys over 4x the CTAs -- 83K -68,
-                    # 30K -45 us a step; short rows keep MC_G_SHORT, where the round's group count over 32 CTAs costs
-                    # more than their keys -- 2K +56 us with 32 CTAs always)
-                    gsel = (nmax > fx.Int32(TK.MC_G_MIN_N)).select(fx.Int32(TK.MC_G), fx.Int32(TK.MC_G_SHORT))
-                    # (FULL rows past MC_G_LONG_N keys: every CTA in a row group, topk.mc_g_long -- REINDEX keeps MC_G)
-                    gsel = ((isrx == (fx.Int32(0) != fx.Int32(0))) & (nmax > fx.Int32(TK.MC_G_LONG_N))).select(
-                        fx.Int32(TK.mc_g_long(TR)), gsel)
                     if fx.const_expr(TR <= 6):   # c1: REINDEX select_ma, FULL select_mf (anchored); 0 -> select_mc
                         mdone = fx.Int32(0)
                         mfk = mh + i64(MF_KB) + i64(Ly // 6) * TK.MF_KEEP   # (a FULL layer's slot: Ly // 6, see tables)
@@ -837,8 +852,7 @@ def target_layer(E, Ly):
                                                  mh + i64(MA_OFF) + i64((Ly >> 2) & 3) * TK.MA_LAYER,
                                                  mh + i64(MA_KB) + i64((Ly >> 2) & 3) * TK.MA_KEEP)
                         else:
-                            mdone = TK.select_mf(cwith(cs_, ts=None), mh + i64(Ly) * TK.MC_LAYER + i64(TK.MC_HIST), gsel,
-                                                 mh + i64(MF_OFF) + i64(Ly // 6) * TK.MF_LAYER, mfk)
+                            mdone = mfdone
                         if mdone == fx.Int32(0):
                             TK.select_mc(cwith(cs_, ts=None), mh + i64(Ly) * TK.MC_LAYER,
                                          mh + i64(Ly) * TK.MC_LAYER + i64(TK.MC_HIST), isrx, gsel,

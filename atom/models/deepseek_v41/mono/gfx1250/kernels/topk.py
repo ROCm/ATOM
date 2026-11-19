@@ -514,7 +514,7 @@ OC_BYTES = MC_ROWS * OC_ROW + MC_ROWS * 4
 
 
 @ASTRewriter.transform
-def select_ord(c, hb, ctr, oc, r, g, G, n, k, vals, vstride, mode, q, ordered=True):
+def select_ord(c, hb, ctr, oc, r, g, G, n, k, vals, vstride, mode, q, ordered=True, anc=None):
     """Row r's top k of its n values (vals + r vstride, f32 bits ordered by order_key) by the G CTAs of its group (this
     one: g), select_mc's radix rounds (hb [4 rounds][rows][256] / ctr [rows][8]: this instance's zeroed slot) to the k-th
     key, then the winners' positions in INDEX order (not select_mc's atomic arrival order): every CTA counts its chunk's
@@ -577,6 +577,9 @@ def select_ord(c, hb, ctr, oc, r, g, G, n, k, vals, vstride, mode, q, ordered=Tr
     st4 = hx.lload(sm + O_MC, I32, 4)
     big = n > I32(k)
     need = st4[2]
+    if fx.const_expr(anc is not None):   # (c1) the k-th score (its resolved prefix) -> select_mf's anchor
+        if (g == 0) & (t == 0) & big:
+            hx.gstore(anc + i64(r) * 4, _ma_key_f32(st4[0]))
     if fx.const_expr(not ordered):   # (select_mc's placement: positions in atomic arrival order, one coalesced pass)
         for i in range(i0 + t, i1, 256):
             pos = I32(-1)
