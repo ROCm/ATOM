@@ -24,10 +24,14 @@ depends on its batch peers (see ``_ATTN_RES_BF16_CONFIG``).
 
 from __future__ import annotations
 
+import functools
+
 import torch
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
+from triton.language import PropagateNan
 
+_PROPAGATE_NAN = gl.constexpr(PropagateNan.ALL)  # keep NaN through the FP8 clamp
 _NUM_WARPS = 4
 # Rows in flight ahead of the one being reduced. 1 leaves the TDM wait exposed
 # (one row of math does not cover a row's latency); 3 measured no better than 2.
@@ -66,10 +70,26 @@ def _attn_res_tdm_kernel(
     WRITE_PREF: gl.constexpr,
     OUT_NORM: gl.constexpr,
     QUANT: gl.constexpr,
+    E8M0_SCALE: gl.constexpr = False,
+    FP8_MAX: gl.constexpr = 0.0,
+    stride_ys_t=0,
+    stride_ys_g=0,
+    NUM_XCDS: gl.constexpr = 1,
 ):
     gl.static_assert(PREFETCH >= 1 and PREFETCH <= 3)
     layout: gl.constexpr = gl.BlockedLayout([8], [32], [NUM_WARPS], [0])
-    t = gl.program_id(0).to(gl.int64)
+    t = gl.program_id(0)
+    if NUM_XCDS > 1:
+        # Programs go to the XCDs round-robin. Give XCD x the x-th contiguous run of
+        # tokens instead, so a column-major scale line, which holds neighbouring
+        # tokens, is written from one XCD's L2 rather than from all of them.
+        G = gl.num_programs(0)
+        per = (G + NUM_XCDS - 1) // NUM_XCDS
+        tall = G % NUM_XCDS
+        tall += (tall == 0).to(gl.int32) * NUM_XCDS
+        xcd = t % NUM_XCDS
+        t = xcd * per + t // NUM_XCDS - (xcd - tall) * (xcd > tall).to(gl.int32)
+    t = t.to(gl.int64)
     o_d = gl.arange(0, BD, layout=layout)
     m_d = o_d < H
     sw = gl.amd.cdna5.buffer_load(sw_ptr, o_d, mask=m_d, other=0.0).to(gl.float32)
@@ -179,6 +199,26 @@ def _attn_res_tdm_kernel(
         inv = gl.where(scale > 0.0, 1.0 / scale, 0.0)
         b_o = gl.minimum(gl.maximum(b_o * inv, -fp8_max), fp8_max)
         gl.store(ys_ptr + t, scale)
+    if E8M0_SCALE:
+        # triton_e8m0_quant.fp8_e8m0_group_scale (Gluon cannot call it) on the bf16
+        # the unfused path stores
+        q = gl.reshape(b_o.to(ps_ptr.dtype.element_ty).to(gl.float32), [BD // 128, 128])
+        amax = gl.minimum(
+            gl.maximum(gl.max(gl.abs(q), axis=1), 1e-10), 448.0 * 2.0**119
+        )
+        bits = (amax * (1.0 / FP8_MAX)).to(gl.uint32, bitcast=True)
+        code = (bits >> 23) & 0xFF
+        code += ((code < 0xFF) & ((bits & 0x7FFFFF) != 0)).to(gl.uint32)
+        q = q * gl.expand_dims(((254 - code) << 23).to(gl.float32, bitcast=True), 1)
+        q = gl.maximum(q, -FP8_MAX, propagate_nan=_PROPAGATE_NAN)
+        q = gl.minimum(q, FP8_MAX, propagate_nan=_PROPAGATE_NAN)
+        b_o = gl.convert_layout(gl.reshape(q, [BD]), layout)
+        g = gl.max(gl.reshape(o_d, [BD // 128, 128]), axis=1) // 128
+        gl.store(
+            ys_ptr + t * stride_ys_t + g * stride_ys_g,
+            code.to(gl.uint8),
+            mask=g < H // 128,
+        )
     gl.amd.cdna5.buffer_store(
         b_o.to(y_ptr.dtype.element_ty), y_ptr + t * stride_yt, o_d, mask=m_d
     )
@@ -199,10 +239,19 @@ def attn_res_tdm_supported(block_residual: torch.Tensor) -> bool:
     )
 
 
+@functools.cache
+def _num_xcds() -> int:
+    from aiter.ops.triton.utils.device_info import get_num_xcds
+
+    return get_num_xcds()
+
+
 def launch_attn_res_tdm(
     br, ps, sw, y, y_scale, hs, hs2, pref, ow, eps, out_eps, fp8_max, flags
 ):
     T, B, H = br.shape
+    # Only column-major E8M0 scales (stride_ys_t == 1) share lines across tokens.
+    col_scales = flags.get("E8M0_SCALE", False) and flags.get("stride_ys_t") == 1
     _attn_res_tdm_kernel[(T,)](
         br,
         ps,
@@ -230,5 +279,6 @@ def launch_attn_res_tdm(
         _NUM_WARPS,
         _PREFETCH,
         num_warps=_NUM_WARPS,
+        NUM_XCDS=_num_xcds() if col_scales else 1,
         **flags,
     )

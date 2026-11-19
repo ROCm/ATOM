@@ -28,6 +28,7 @@ def modules():
 def runtime(modules, monkeypatch):
     # Plain namespaces are intentional: MagicMock would manufacture missing APIs.
     language = ModuleType("triton.experimental.gluon.language")
+    language.constexpr = lambda value: value  # ROCm/ATOM#3054's gl.constexpr
     language.amd = SimpleNamespace(
         cdna5=SimpleNamespace(
             buffer_load=Mock(),
