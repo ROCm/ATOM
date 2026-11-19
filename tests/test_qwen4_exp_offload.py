@@ -30,7 +30,6 @@ from atom.model_ops.attentions.qwen4_exp_attn import (
 )
 from atom.model_ops.fla_ops import gdn_flydsl
 from atom.plugin.vllm.kv_transfer.mp_page_layout import build_mp_transfer_tensors
-from atom.utils import envs
 
 
 def qsa_like_fields(block=4):
@@ -184,7 +183,7 @@ def test_ple_keeps_midstep_off_on_the_page_and_the_fork_path(
     `ATOM_GDN_STATE_MIDSTEP=1` a PLE build reads no state midstep, whether it
     copies PAGE images (an offload tier) or forks slots (none, the default).
     A build without PLE keeps the parent's answer on both."""
-    monkeypatch.setattr(envs, "ATOM_GDN_STATE_MIDSTEP", True)
+    monkeypatch.setenv("ATOM_GDN_STATE_MIDSTEP", "1")
     qwen4_exp_attn._log_ple_midstep_off.cache_clear()
     builder, cls = _builder()
     config = builder.model_runner.config
@@ -205,7 +204,7 @@ def test_ple_keeps_midstep_off_on_the_page_and_the_fork_path(
 
 
 def test_the_ple_midstep_warning_is_logged_once(monkeypatch, one_tp_rank, caplog):
-    monkeypatch.setattr(envs, "ATOM_GDN_STATE_MIDSTEP", True)
+    monkeypatch.setenv("ATOM_GDN_STATE_MIDSTEP", "1")
     qwen4_exp_attn._log_ple_midstep_off.cache_clear()
     with caplog.at_level(logging.WARNING, logger="atom"):
         for _ in range(3):
