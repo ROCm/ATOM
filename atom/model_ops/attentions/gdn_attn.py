@@ -697,6 +697,10 @@ class GDNStateMixin(PoolRowsMixin):
             entries_per_req=self.slots_per_req(),
         )
 
+    def replay_cursor(self) -> torch.Tensor | None:
+        """The runner's ReplaySSM cursor, `[num_slots]` int32; None without it."""
+        return self.model_runner.replayssm_write_pos if self.replayssm else None
+
     def slots_per_req(self) -> int:
         """Baseline GDN reserves one extra state slot per speculative token so
         a rejected draft can be rolled back by resuming from a different slot.

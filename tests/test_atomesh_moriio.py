@@ -258,7 +258,7 @@ class LowLatencyDecodeCellsTest(unittest.TestCase):
 
 
 class KimiK3MoriIOCellTest(unittest.TestCase):
-    """Kimi-K3's PD gsm8k cells, over MoRI IO, with nothing the connector refuses."""
+    """Kimi-K3's PD gsm8k cells, over MoRI IO, without speculative decoding."""
 
     @classmethod
     def setUpClass(cls):
@@ -280,7 +280,7 @@ class KimiK3MoriIOCellTest(unittest.TestCase):
             self.assertIsNone(env["prefill"].get("PREFILL_KV_TRANSFER_CONFIG"))
             self.assertIsNone(env["decode"].get("DECODE_KV_TRANSFER_CONFIG"))
 
-    def test_nothing_the_connector_refuses_is_on(self):
+    def test_no_speculative_decoding_or_prefix_caching(self):
         for cell in self.each_cell():
             for role in ("common", "prefill", "decode"):
                 self.assertEqual(cell["env"][role]["ATOM_ENABLE_REPLAYSSM"], "0")
