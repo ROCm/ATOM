@@ -41,7 +41,7 @@ from atom.model_ops.deepseek_v41.paged_scoring import (
     score_topk_quantized,
 )
 from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
-from atom.model_ops.indexer.layout import can_fuse_weights_proj
+from atom.model_ops.indexer.layout import _MAX_FUSED_PROJECT_ROWS, NATURAL
 from atom.model_ops.indexer.query import project_query_fp4
 from atom.model_ops.layernorm import (
     DualRMSNormBF16,
@@ -146,9 +146,10 @@ class Indexer(nn.Module):
         The query is left on the grid its reader rounds it to. The published
         model FP4-rounds both sides whatever it holds; the FP8 scorer quantizes
         the query itself, so rounding first would round twice, and on the FP4
-        plane one kernel rotates and quantizes it (`quantize_query_fp4`). `qr`
-        arrives quantized, so this GEMM reuses that pair rather than quantizing
-        the tensor a second time.
+        plane one kernel rotates and quantizes it (`quantize_query_fp4`, or
+        `project_query_fp4` on the gfx1250 NATURAL plane, which also folds in
+        the `weights_proj` projection). `qr` arrives quantized, so this GEMM
+        reuses that pair rather than quantizing the tensor a second time.
 
         Apart from `score` so that a compressor's join has somewhere to sit
         that is neither before this nor after the plane is read.
@@ -159,8 +160,16 @@ class Indexer(nn.Module):
         )
         if cache.geometry.index_fp4:
             units = cache.index_units[self.spec.kv_owner]
-            if can_fuse_weights_proj(
-                self.fuse_weights_proj, units.layout, query.shape[1]
+            rows = query.shape[1]
+            # Inlined (the `can_fuse_weights_proj` spec in indexer/layout.py,
+            # which the CPU test locks): a call + its frame here would cost
+            # ~0.2us on every FP4 indexer step, including the gfx950 MFMA and
+            # PRESHUFFLE layouts that never fuse. `fuse_weights_proj` is read
+            # once in `__init__`, not per step.
+            if (
+                self.fuse_weights_proj
+                and units.layout == NATURAL
+                and 0 < rows <= _MAX_FUSED_PROJECT_ROWS
             ):
                 # The query's RoPE + MXFP4 quant launch also projects the head
                 # weights, folding `weights_proj` into it rather than running it

@@ -2,8 +2,9 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """The index query as the scorer reads it: RoPE and quantization in one
-launch (aiter `rope_rotate_activation`), the rotated values never written
-back in bf16.
+launch (aiter `rope_rotate_activation`, or `q_rope_mxfp4_quant` on the gfx1250
+FP4 NATURAL plane, where the launch also projects the head weights), the
+rotated values never written back in bf16.
 
 FP8 quantizes each `(token, head)` row with one fp32 scale, which the scorer
 can only dequantize by folding it into that head's weight (`fold_query_scale`).
@@ -107,39 +108,6 @@ def fold_query_scale(
     )
 
 
-# gfx1250 FP4 indexer: the per-layer `weights_proj` GEMM folded into the query
-# RoPE/MXFP4-quant launch (aiter `q_rope_mxfp4_quant`). The gate itself
-# (`can_fuse_weights_proj`) lives in `.layout` so it imports without aiter.
-_INDEXER_COS_SIN_CACHE = "_dsv41_indexer_cos_sin_cache"
-
-
-def _indexer_cos_sin_cache(rope: torch.nn.Module) -> torch.Tensor:
-    """`[max_pos, rope_dim]`, the cos half then the sin half, as
-    `q_rope_mxfp4_quant` reads its table -- the `cos_cache`/`sin_cache` halves
-    `quantize_query` hands the HIP op, concatenated. Memoized on the rope
-    module as a non-persistent buffer so it is built once and freed with the
-    rope, not kept in a process-global keyed on a reused address."""
-    cos = rope.cos_cache.squeeze(-2).squeeze(-2)
-    cached = getattr(rope, _INDEXER_COS_SIN_CACHE, None)
-    expected = (*cos.shape[:-1], cos.shape[-1] * 2)
-    if (
-        cached is not None
-        and cached.device == cos.device
-        and cached.dtype == cos.dtype
-        and tuple(cached.shape) == expected
-    ):
-        return cached
-    sin = rope.sin_cache.squeeze(-2).squeeze(-2)
-    cos_sin = torch.cat((cos, sin), dim=-1).contiguous()
-    if torch.compiler.is_compiling():
-        return cos_sin
-    if _INDEXER_COS_SIN_CACHE in rope._buffers:
-        rope._buffers[_INDEXER_COS_SIN_CACHE] = cos_sin
-    else:
-        rope.register_buffer(_INDEXER_COS_SIN_CACHE, cos_sin, persistent=False)
-    return cos_sin
-
-
 def project_query_fp4(query, rope, positions, hidden, weights_proj_weight):
     """`((values, scales), weights)` for the FP4 NATURAL plane with the head
     weights projected inside the quant launch, folding the per-layer
@@ -149,13 +117,15 @@ def project_query_fp4(query, rope, positions, hidden, weights_proj_weight):
     bf16 projection `Indexer.project` returns, which `score_quantized` then
     folds `weights_scale` into (so no scale is applied here).
 
-    Caller gates on `can_fuse_weights_proj`."""
+    Caller gates on `can_fuse_weights_proj`; `rope.cos_sin_cache` is the
+    `[max_pos, rope_dim]` cos|sin table the model builds at construction for
+    the ropes that can fuse (`DecoderModel.__init__`)."""
     from aiter.ops.triton.rope.q_rope_mxfp4_quant import q_rope_mxfp4_quant
 
     q_fp4, q_scale, weights = q_rope_mxfp4_quant(
         query,
         positions,
-        _indexer_cos_sin_cache(rope),
+        rope.cos_sin_cache,
         weights_scale=1.0,
         hidden=hidden.contiguous(),
         weights_proj=weights_proj_weight,

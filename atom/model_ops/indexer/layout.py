@@ -10,10 +10,12 @@ NATURAL = "natural"
 MFMA = "mfma"
 
 # gfx1250 FP4 indexer: the per-layer weights_proj GEMM folded into the query
-# RoPE/MXFP4-quant launch (aiter q_rope_mxfp4_quant). Above this many rows the
-# standalone bf16 GEMM is the faster kernel (it is not launch-bound), matching
-# the vLLM reference's 128-row gate. Here, with the layout names, so the gate is
-# importable without the GPU kernels (and so testable off-GPU).
+# RoPE/MXFP4-quant launch (aiter q_rope_mxfp4_quant), for a step of at most this
+# many rows -- the fold targets the small, launch-bound decode and short-prefill
+# steps, matching the vLLM reference's 128-row gate; larger steps keep the
+# standalone bf16 GEMM, which is not launch-bound there. Here, with the layout
+# names, so the gate is importable without the GPU kernels (and testable
+# off-GPU).
 _MAX_FUSED_PROJECT_ROWS = 128
 
 

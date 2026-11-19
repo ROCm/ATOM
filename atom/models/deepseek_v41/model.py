@@ -9,6 +9,7 @@ import torch
 from aiter.dist.parallel_state import get_tp_group
 from torch import nn
 
+from atom.config import get_current_atom_config
 from atom.model_loader.weight_names import WeightsMapper
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.model_ops.deepseek_v41.mhc_pre_delayed import (
@@ -20,6 +21,7 @@ from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
 from atom.model_ops.embed_head import VocabParallelEmbedding
 from atom.model_ops.engram.device.layer import EngramOp
 from atom.model_ops.engram.device.staging import EngramStagedRows
+from atom.model_ops.indexer.layout import NATURAL
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.utils import atom_parameter
@@ -319,6 +321,21 @@ class DeepseekV41ForCausalLM(nn.Module):
             beta_fast=scaling["beta_fast"],
             beta_slow=scaling["beta_slow"],
         )
+        # gfx1250 FP4 indexer: the folded weights_proj quant kernel reads one
+        # [max_pos, rope_dim] cos|sin table. Build it here, once, so it is sized
+        # into the memory profile rather than allocated lazily mid-decode (after
+        # KV sizing). Both ropes feed indexer layers (global where spec.ratio,
+        # window otherwise), and only when the fold can run (NATURAL => gfx1250).
+        if (
+            envs.ATOM_DSV41_FUSE_WEIGHTS_PROJ
+            and get_current_atom_config().index_cache_layout == NATURAL
+        ):
+            for rope in (self.window_rope, self.global_rope):
+                rope.register_buffer(
+                    "cos_sin_cache",
+                    torch.cat((rope.cos_cache, rope.sin_cache), dim=-1).contiguous(),
+                    persistent=False,
+                )
 
     @property
     def model(self):
