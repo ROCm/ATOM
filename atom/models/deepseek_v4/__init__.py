@@ -2810,8 +2810,8 @@ class Expert(nn.Module):
         # Decided once here, from the configuration and the weight shape
         # alone: forward runs inside torch.compile regions, which cannot trace
         # the architecture query, and a compiled forward may be replayed for
-        # other row counts without re-checking guards, so forward never
-        # branches on the row count either (the op below does, at run time).
+        # other row counts without re-checking guards, so neither forward
+        # branches on the row count (the op below does, at run time).
         self.prefix = prefix
         self._gate_up_silu = self._gate_up_silu_applies()
         if self._gate_up_silu:
@@ -2820,6 +2820,9 @@ class Expert(nn.Module):
             get_current_atom_config().compilation_config.static_forward_context[
                 prefix
             ] = self
+            # Only a fused expert runs `_forward_gate_up_silu`; every other
+            # expert keeps the plain `forward`, with no per-call check.
+            self.forward = self._forward_gate_up_silu
 
     def _gate_up_silu_applies(self) -> bool:
         """Whether gate_up can run with the SwiGLU and the MXFP8 quant for w2
@@ -2889,6 +2892,23 @@ class Expert(nn.Module):
             x_fp8, weight, x_scale, self.gate_up_proj.weight_scale, self.swiglu_limit
         )
 
+    def _forward_gate_up_silu(
+        self,
+        x: torch.Tensor,  # [num_tokens, dim]
+        weights: torch.Tensor | None = None,  # [num_tokens, 1]  optional gate
+    ) -> torch.Tensor:  # [num_tokens, dim]
+        """`forward` of an expert that can take the fused gate_up (chosen in
+        `__init__`, so other experts run the plain `forward` unchanged). It
+        goes through a functional custom op that picks fused or unfused from
+        the runtime row count. A gated expert (`weights`) and rows that are
+        not 2-D BF16 take the plain `forward`."""
+        if weights is None and x.dim() == 2 and x.dtype == torch.bfloat16:
+            act, act_scale = torch.ops.aiter.v4_shared_gate_up_silu_quant(
+                x, self.gate_up_proj.weight, self.prefix
+            )
+            return self.w2(act, x_scale=act_scale)
+        return Expert.forward(self, x, weights)
+
     def forward(
         self,
         x: torch.Tensor,  # [num_tokens, dim]
@@ -2896,20 +2916,6 @@ class Expert(nn.Module):
     ) -> torch.Tensor:  # [num_tokens, dim]
 
         dtype = x.dtype
-        # The fused gate_up (`_gate_up_silu`, fixed at construction) goes
-        # through a functional custom op that picks fused or unfused from the
-        # runtime row count. A gated expert (`weights`) and rows that are not
-        # 2-D BF16 keep the path below.
-        if (
-            weights is None
-            and self._gate_up_silu
-            and x.dim() == 2
-            and x.dtype == torch.bfloat16
-        ):
-            act, act_scale = torch.ops.aiter.v4_shared_gate_up_silu_quant(
-                x, self.gate_up_proj.weight, self.prefix
-            )
-            return self.w2(act, x_scale=act_scale)
         # Single fused GEMM. Layout is [gate | up] concat on last dim — matches
         # aiter silu_and_mul's split([d, d], dim=-1) contract. The kernel does
         # silu/clamp/mul in fp32 internally regardless of input dtype, so we

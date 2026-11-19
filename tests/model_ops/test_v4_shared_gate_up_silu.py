@@ -3,14 +3,15 @@
 for w2 in its epilogue.
 
 Whether an expert may take it (`Expert._gate_up_silu`) is decided once at
-construction, from the configuration and the gate_up weight shape. Forward
-then branches on nothing that depends on the row count: it calls the
-functional op `torch.ops.aiter.v4_shared_gate_up_silu_quant`, whose eager body
+construction, from the configuration and the gate_up weight shape; only such
+an expert gets `_forward_gate_up_silu` as its forward, every other one keeps
+the plain forward unchanged. The fused forward branches on nothing that
+depends on the row count: it calls the functional op
+`torch.ops.aiter.v4_shared_gate_up_silu_quant`, whose eager body
 (`Expert.gate_up_silu_quant`) picks the fused kernel or the unfused chain from
 the real row count. The tests check what the body hands AITER and w2, that
-everything else keeps the unfused path, and that a fullgraph compile of
-`Expert.forward` traced once still makes the right choice for every later row
-count."""
+everything else keeps the unfused path, and that a fullgraph compile of the
+expert traced once still makes the right choice for every later row count."""
 
 import importlib
 import sys
@@ -89,6 +90,7 @@ def _expert(
     if expert._gate_up_silu:  # as Expert.__init__ registers it
         config = importlib.import_module("atom.config").get_current_atom_config()
         config.compilation_config.static_forward_context[prefix] = expert
+        expert.forward = expert._forward_gate_up_silu
     return expert
 
 
@@ -215,7 +217,8 @@ def test_other_rows_run_the_unfused_chain(
 def test_traced_forward_picks_per_runtime_rows(
     monkeypatch, atom_modules, flydsl, unfused, atom_config, cpu_op
 ):
-    """`Expert.forward` compiled once with fullgraph and dynamic shapes, then
+    """A fused expert called as a module (so through the forward chosen at
+    construction), compiled once with fullgraph and dynamic shapes, then
     replayed: the first (warmup-sized) row count runs the unfused chain and
     later ones still get their own kernel, all through one graph."""
     expert = _expert(monkeypatch, atom_modules)
@@ -230,9 +233,7 @@ def test_traced_forward_picks_per_runtime_rows(
         return gm.forward
 
     torch._dynamo.reset()
-    compiled = torch.compile(
-        expert.forward, fullgraph=True, dynamic=True, backend=backend
-    )
+    compiled = torch.compile(expert, fullgraph=True, dynamic=True, backend=backend)
     for m in (5000, 3, 1345, 4096):
         y = compiled(torch.zeros(m, DIM, dtype=torch.bfloat16))
         assert y.shape == (m, 1)
@@ -287,6 +288,8 @@ def test_ineligible_experts_keep_the_unfused_path(
     expert = _expert(monkeypatch, atom_modules, **change)
     assert not expert._gate_up_silu
     assert expert.prefix not in atom_config.compilation_config.static_forward_context
+    # It runs the plain forward (main's body), with no per-call check.
+    assert "forward" not in vars(expert)
 
 
 def test_other_inputs_keep_the_unfused_path(
@@ -339,6 +342,11 @@ def test_init_decides_and_registers(
     registry = atom_config.compilation_config.static_forward_context
     assert (registry.get("m.shared_experts") is expert) == fused
     assert ("supported_shape" in flydsl) == fused
+    # Only a fused expert gets the fused forward; the others keep the plain
+    # (main's) forward with no per-call check.
+    assert ("forward" in vars(expert)) == fused
+    if fused:
+        assert expert.forward == expert._forward_gate_up_silu
 
 
 @pytest.mark.parametrize("m", [0, 3, 5000])
