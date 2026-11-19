@@ -533,6 +533,8 @@ def _select_logical(
 class FusedMoEMethodBase(QuantizeMethodBase):
     # Set by a method that fixes OCP E4M3 bytes up to E4M3FNUZ after loading.
     need_normalize_e4m3fn_to_e4m3fnuz: bool = False
+    # Whether `apply` takes `out`, a destination for the experts' output.
+    apply_takes_out = False
 
     def __init__(self, moe: FusedMoEConfig):
         super().__init__()
@@ -1506,6 +1508,8 @@ def _herd_routing(layer: torch.nn.Module) -> bool:
 
 
 class Mxfp4MoEMethod(FusedMoEMethodBase):
+    apply_takes_out = True
+
     def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
         super().__init__(moe)
         self.quant_config = quant_config
@@ -2206,6 +2210,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         scheduled_tokens_gpu: torch.Tensor | None = None,
         shared_add: torch.Tensor | None = None,
         shared_ready: torch.cuda.Event | None = None,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # ATOM_USE_TRITON_MOE_DECODE splits the two kernels by phase: the weights
         # sit in the FlyDSL layout, so prefill falls through to the FlyDSL tail
@@ -2555,6 +2560,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 bias1=layer.w13_bias,
                 bias2=layer.w2_bias,
                 num_local_tokens=scheduled_tokens_gpu,
+                output=out,
                 **moe_extra_args,
             )
         # Only the mori v2 modular kernel takes a shared output
@@ -3577,16 +3583,23 @@ def moe_forward(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
     layer_name: str,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    """`out`: write the output there and return it."""
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
-    return self.forward_impl(hidden_states, router_logits)
+    if out is None:
+        return self.forward_impl(hidden_states, router_logits)
+    result = self.forward_impl(hidden_states, router_logits, out=out)
+    # A path that cannot write `out` itself returns its own tensor.
+    return out if result is out else out.copy_(result)
 
 
 def moe_forward_fake(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
     layer_name: str,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
@@ -3594,7 +3607,7 @@ def moe_forward_fake(
 moe_forward_op = direct_register_custom_op(
     op_name="moe_forward",
     op_func=moe_forward,
-    mutates_args=["hidden_states"],
+    mutates_args=["hidden_states", "out"],
     fake_impl=moe_forward_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
@@ -5516,13 +5529,19 @@ class FusedMoE(torch.nn.Module):
             router_logits.dtype
         )
 
-    def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        out: torch.Tensor | None = None,
+    ):
         # The custom op is an opaque boundary for torch.compile and for
         # TorchDispatchMode (FakeTensorMode, make_fx); eager calls skip it.
         return moe_forward_op(
             hidden_states,
             self._routing_logits(hidden_states, router_logits),
             self.layer_name,
+            out,
         )
 
     def combine_accepts_shared(self, rows: int) -> bool:
@@ -5612,6 +5631,7 @@ class FusedMoE(torch.nn.Module):
         gathered: bool = False,
         shared_add: torch.Tensor | None = None,
         shared_ready: torch.cuda.Event | None = None,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """The experts on the routed rows (`x_scale`: they are in the method's
         `routed_rows_wire` already), still on logical experts: placed on the
@@ -5624,7 +5644,8 @@ class FusedMoE(torch.nn.Module):
         all-reduces. Rows no gather moved are counted
         (`pass_scheduled_tokens_gpu`), and so are an SP gather's: its shards
         are contiguous, so the step's real rows lead. `shared_add` /
-        `shared_ready`: see `forward_maybe_comm_fused`."""
+        `shared_ready`: see `forward_maybe_comm_fused`. `out`: a destination of
+        `hidden_states`'s shape, which a method that takes one writes."""
         context = get_forward_context().context
         merge = self.moe_parallel_config.pcp_merge
         pcp = merge and not context.is_dummy_run
@@ -5680,6 +5701,11 @@ class FusedMoE(torch.nn.Module):
                 else None if gathered else pass_scheduled_tokens_gpu(topk_ids.shape[0])
             ),
             **shared_kwargs,
+            **(
+                {"out": out}
+                if out is not None and not split and self.quant_method.apply_takes_out
+                else {}
+            ),
         )
         if split:
             output = tbo_on_comm(pcp_reduce_scatter, output)
@@ -5786,8 +5812,11 @@ class FusedMoE(torch.nn.Module):
         router_logits: torch.Tensor,
         shared_add: torch.Tensor | None = None,
         shared_ready: torch.cuda.Event | None = None,
+        out: torch.Tensor | None = None,
     ):
-        """`shared_add` / `shared_ready`: see `forward_maybe_comm_fused`."""
+        """`shared_add` / `shared_ready`: see `forward_maybe_comm_fused`. `out`:
+        where the plain path may write its output (`moe_forward` copies any
+        other path's)."""
         assert self.quant_method is not None
 
         # Decided here, at run time: the row count is symbolic while compiling.
@@ -5827,6 +5856,7 @@ class FusedMoE(torch.nn.Module):
             gathered=dp_repeat > 1,
             shared_add=shared_add,
             shared_ready=shared_ready,
+            out=out if dp_repeat == 1 else None,
         )
 
         if dp_repeat > 1:
