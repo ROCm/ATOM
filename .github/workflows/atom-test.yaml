@@ -1,4 +1,4 @@
-name: DIAGNOSTIC Kimi-K3.1 row-tail isolation
+name: DIAGNOSTIC Kimi-K3.1 synchronized waves
 
 on:
   workflow_dispatch:
@@ -148,13 +148,14 @@ jobs:
           filtered = [m.copy() for m in models if m["model_name"] == "Kimi-K3.1-Pro"]
           assert len(filtered) == 1, "Diagnostic must select exactly Kimi-K3.1-Pro"
           filtered[0]["client_command"] = (
-              "lm_eval --model local-completions --model_args "
+              "timeout --signal=TERM --kill-after=5s 900s python3 "
+              ".github/scripts/k31_wave_lm_eval.py --model k31-wave-local-completions --model_args "
               "'model=${MODEL_PATH},base_url=http://localhost:8000/v1/completions,"
               "num_concurrent=65,max_retries=3,tokenized_requests=False,trust_remote_code=True' "
               "--tasks gsm8k --num_fewshot 3 --log_samples "
               "--output_path '${OUTPUT_PATH}'"
           )
-          filtered[0]["accuracy_timeout_minutes"] = 10
+          filtered[0]["accuracy_timeout_minutes"] = 15
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"models_json={json.dumps(filtered)}\n")
           print(f"Event={event} level={current}: {len(filtered)}/{len(models)} models")
@@ -278,7 +279,7 @@ jobs:
         include: ${{ fromJson(needs.load-test-models.outputs.models_json || '[{"runner":"ubuntu-latest","model_name":"skip"}]') }}
     if: ${{ needs.ci-gate.outputs.should_run == 'true' && needs.download_aiter_wheel.result == 'success' && needs.load-test-models.result == 'success' }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 75
+    timeout-minutes: 80
     permissions:
       actions: read
       contents: read
@@ -624,6 +625,7 @@ jobs:
           test "$revision" = d9e99b0792a5e93b78ea9bea62a68167e36ddd9e
           docker exec "$CONTAINER_NAME" sh -c 'cd /models/moonshotai/Kimi-K3.1-Pro && test -f config.json && test -f model.safetensors.index.json && { test -f .atom_download_complete || test -f .download-complete; }'
           docker exec "$CONTAINER_NAME" python3 -c 'import importlib.metadata as m; assert m.version("amd-aiter").endswith("+gd17ee8dfe"); assert m.version("lm_eval") == "0.4.13"'
+          docker exec "$CONTAINER_NAME" python3 .github/scripts/k31_wave_lm_eval.py --check-runtime
           printf '%s\n' "diagnostic_sha=$(git rev-parse HEAD)" "production_atom_tree=$(git rev-parse HEAD:atom)" "model_revision=$revision" > diagnostic-provenance.txt
           cat diagnostic-provenance.txt
 
@@ -682,7 +684,7 @@ jobs:
       
       - name: Run ATOM accuracy test
         # Admit a bounded launch/client window, leaving time to retain failures.
-        timeout-minutes: 37
+        timeout-minutes: 42
         env:
           MODEL_EXTRA_ARGS: ${{ matrix.extraArgs }}
           CLIENT_COMMAND: ${{ matrix.client_command || '' }}
@@ -704,7 +706,7 @@ jobs:
           fi
           # Point --draft-model at the copy "Download models" cached under
           # /models, so the launch does not download it from the Hub again.
-          launch_args="${MODEL_EXTRA_ARGS}"
+          launch_args="${MODEL_EXTRA_ARGS} --torch-profiler-dir /app/trace"
           if [ -n "${DRAFT_MODEL_ID:-}" ] && docker exec "$CONTAINER_NAME" test -f "${DRAFT_MODEL_DIR}/config.json"; then
             launch_args="${launch_args/--draft-model ${DRAFT_MODEL_ID}/--draft-model ${DRAFT_MODEL_DIR}}"
             launch_args="${launch_args/--draft-model=${DRAFT_MODEL_ID}/--draft-model=${DRAFT_MODEL_DIR}}"
@@ -718,6 +720,9 @@ jobs:
               -e ATOM_SERVER_READY_POLL_SECONDS=5 \
               -e ATOM_SERVER_READY_TIMEOUT_SECONDS=1320 \
               -e ATOM_SERVER_WARMUP_TIMEOUT_SECONDS=120 \
+              -e ATOM_PROFILER_RECORD_SHAPES=1 \
+              -e ATOM_PROFILER_WITH_STACK=1 \
+              -e ATOM_PROFILER_PROFILE_MEMORY=0 \
               -i "$CONTAINER_NAME" bash -l
           echo ""
           echo "========== Running accuracy test =========="
@@ -730,7 +735,7 @@ jobs:
             "$CONTAINER_NAME" bash -lc "
             .github/scripts/atom_test.sh accuracy $model_path
           " 2>&1 | tee atom_accuracy_output.txt
-      
+
       - name: Dump server log
         timeout-minutes: 2
         if: always()
@@ -834,6 +839,46 @@ jobs:
           echo "Accuracy Test Summary for ${{ matrix.model_name }} (threshold: ${threshold}, score: ${score}):" >> $GITHUB_STEP_SUMMARY
           awk '/\|Tasks\|Version\|/,/^$/ { if (NF > 0) print }' atom_accuracy_output.txt >> $GITHUB_STEP_SUMMARY
 
+      - name: Check main wave coverage and separate probe capture
+        timeout-minutes: 1
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          root = Path("k31-wave-diagnostic")
+          def read(name):
+              path = root / name
+              return json.loads(path.read_text()) if path.is_file() else {}
+          main = read("main-completed.json")
+          probe = read("probe.json")
+          errors = []
+          if main.get("status") != "completed":
+              errors.append("Main evaluation is incomplete; no main accuracy claim.")
+          else:
+              print("Completed main accuracy:", main["scores"])
+              if main.get("large_prefills", 0) < 40:
+                  errors.append("Main stress coverage is insufficient: fewer than 40 large prefills.")
+          if probe.get("status") != "captured" or read("probe-inconclusive.json"):
+              errors.append("Separate probe capture is inconclusive; this does not change saved main accuracy.")
+          traces = probe.get("rank_traces", {})
+          if set(traces) != {str(rank) for rank in range(8)}:
+              errors.append("Probe trace manifest is incomplete.")
+          else:
+              for rank, trace in traces.items():
+                  path = (root / trace["path"]).resolve()
+                  if not path.is_relative_to(root.resolve()) or not path.is_file() or not path.stat().st_size:
+                      errors.append(f"Missing or invalid saved trace for rank {rank}.")
+                      continue
+                  with path.open("rb") as stream:
+                      if hashlib.file_digest(stream, "sha256").hexdigest() != trace["sha256"]:
+                          errors.append(f"Saved trace checksum mismatch for rank {rank}.")
+          if errors:
+              raise SystemExit("DIAGNOSTIC INCONCLUSIVE: " + " ".join(errors))
+          print("Main stress and probe capture are complete; actual branch evidence still requires trace review.")
+          PY
+
       - name: Upload output
         timeout-minutes: 2
         if: always()
@@ -851,6 +896,7 @@ jobs:
           path: |
             accuracy_test_results/
             diagnostic-provenance.txt
+            k31-wave-diagnostic/
           if-no-files-found: ignore
 
       - name: Clean Up
