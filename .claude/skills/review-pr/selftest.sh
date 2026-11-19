@@ -508,14 +508,6 @@ Review: OK
 Validation (deterministic): N/A -- no runtime surface changed
 
 ⚠️ planner.rs:108 charges the prompt only when req.stream. **Author must** say so.'
-_CARD_TOKENS='## T
-
-**what**
-
-Review: OK
-Validation (deterministic): N/A -- no runtime surface changed
-
-⚠️ The prefill charge is skipped for non-streaming placements. **Author must** say so.'
 t "an A5: card against an A5 FIRE is refused for the id, not for tracing" \
   "$(_card_kinds "$_CARD_ID" "$_V_PATH" "$_DIFF")" "RULE-CODE-IN-CARD"
 t "the same card without the id traces by path" \
@@ -567,6 +559,19 @@ Validation (deterministic): N/A -- no runtime surface changed
      "A5 FIRE -- foo.py:3 guard missing
 B1 FIRE -- \`kv\` dropped on reload" \
      "diff --git a/foo.py b/foo.py" | grep -c UNREPORTED-FIRE)" "1"
+# A symbol end that is punctuation needs no word boundary. Requiring one before `.cuda()`
+# rejects `x.cuda()` because the preceding `x` is a word character.
+t "a punctuation-led symbol can be named as part of an expression" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+📝 x.cuda() runs before set_device. **Author must** move it.' \
+     "B1 FIRE -- \`.cuda()\` runs before set_device" \
+     "diff --git a/foo.py b/foo.py")" ""
 # Without backticks the reason offers no handle, whatever its words look like. FP32,
 # MI355X, GSM8K, num_tokens and head_dim all used to pass as names.
 t "a reason that backticks nothing is not claimed by look-alike words" \
@@ -608,8 +613,8 @@ Validation (deterministic): N/A -- no runtime surface changed
      "A5 FIRE -- foo.py:3 guard missing
 B1 FIRE -- \`kv_scale\` dropped on reload" \
      "diff --git a/foo.py b/foo.py" | grep -c UNREPORTED-FIRE)" "1"
-# SKILL.md:234 tells the worker `If not -> 📝 HK3`, and HK3 is UNREACHABLE_BY_DESIGN
-# rather than ALL_RULES, so the card shipped the id unrefused.
+# SKILL.md:111-113 notes that ids such as HK3 are not emitted by the current deriver;
+# HK3 is therefore UNREACHABLE_BY_DESIGN rather than ALL_RULES, but must still be refused.
 # `_publish.first_clause` strips the `[verified]` tag before publishing, so anything the
 # tag or the emphasis hides still reaches the reader as an id-led line. ATOM#3481 used
 # bold. Main refused none of these.
@@ -619,10 +624,13 @@ import sys; sys.path.insert(0, sys.argv[1]); import triage
 forms = ["**[verified] B1:** x", "**[verified]** B1: x", "`[verified]` B1: x",
          "[verified] [B1] x", "[verified] (B1): x", "A5/B1: x", "D4 - x",
          "D4 violation in the quant path", "HK3 bug fix without test",
-         "B1 (silent bypass): x", "[B1/B2] x"]
+         "B1 (silent bypass): x", "[B1/B2] x", "B1 The condition is wrong",
+         "B1 `foo.py:3` drops it", "B1.", "B1 = broken", "B1 → broken",
+         "B1+D4:", "B1 FIRE:", "`foo.py:3`: A5: broken",
+         "foo.py:3 A5: broken", "foo.py:3 (A5)", "[verified, A5] broken"]
 print(sum(1 for f in forms if triage._rule_head(f)))' "$S"
 }
-t "a rule id hidden behind a tag, emphasis or brackets is still refused" "$(_head_forms)" "11"
+t "a rule id hidden behind decoration or a citation is still refused" "$(_head_forms)" "22"
 _head_passes() {  # -> how many ordinary openings are left alone
   python3 -c '
 import sys; sys.path.insert(0, sys.argv[1]); import triage

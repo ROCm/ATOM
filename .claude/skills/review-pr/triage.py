@@ -2836,6 +2836,18 @@ def _claim_symbols(reason):
     return {m.strip() for m in CLAIM_SYMBOL.findall(reason) if m.strip()}
 
 
+def _mentions_symbol(text, symbol):
+    """Does text name symbol without embedding a word-character end in a word?
+
+    Punctuation is part of many useful symbols (`.cuda()`, `->data`, `::empty`). A
+    boundary on an end that is already punctuation would reject `x.cuda()` because the
+    character before `.cuda()` is `x`. Only word-character ends need word boundaries.
+    """
+    left = r"(?<!\w)" if re.match(r"\w", symbol[0]) else ""
+    right = r"(?!\w)" if re.match(r"\w", symbol[-1]) else ""
+    return re.search(left + re.escape(symbol) + right, text) is not None
+
+
 def _same_file(a, b):
     """Do these two citations name the same file?
 
@@ -2849,12 +2861,11 @@ def _same_file(a, b):
     return a == b or a.endswith("/" + b) or b.endswith("/" + a)
 
 
-
-
 LEAD_NOISE = re.compile(r"^[\s*`_]+")
 LEAD_GROUP = re.compile(r"^[\[(]([^\])]{0,60})[\])]")
 BARE_ID = re.compile(r"^([A-Z]+\d+[a-z]?)(?:-[\w-]+)?(?:\s*[/,]\s*[A-Z]+\d+[a-z]?)*"
-                     r"(?:\s*\([^)]{0,40}\))?[\s*`_]*(?::|—|–|--|-(?!\w)|\s+(?=[a-z]))")
+                     r"(?:\s*\([^)]{0,40}\))?[\s*`_]*"
+                     r"(?::|—|–|--|-(?!\w)|\s+(?=[a-z])|(?!\w))")
 
 
 def _rule_head(text):
@@ -2870,18 +2881,23 @@ def _rule_head(text):
         m = BARE_ID.match(rest)
         if m:
             return m.group(1) if m.group(1) in REFUSED_IDS else None
+        citation = CITATION.match(rest)
+        if citation:
+            rest = re.sub(r"^[\s*`_]*(?::)?\s*", "", rest[citation.end():])
+            continue
         g = LEAD_GROUP.match(rest)
         if not g:
             return None
         inner = g.group(1).strip(" *`_")
-        first = re.split(r"[/,]", inner)[0].strip()
-        if inner in REFUSED_IDS or first in REFUSED_IDS:             # `[B1]` is the id itself, not a tag over it
-            return inner if inner in REFUSED_IDS else first
+        members = [part.strip() for part in re.split(r"[/,]", inner)]
+        rid = next((part for part in members if part in REFUSED_IDS), None)
+        if rid:  # `[B1]` is the id itself, not a tag over it.
+            return rid
         rest = rest[g.end():]
     return None
 RULE_SET = frozenset(ALL_RULES.split())
-# Every id rules.md names, not only the derivable ones: SKILL.md:234 tells the worker
-# ids like HK3 live in UNREACHABLE_BY_DESIGN rather than ALL_RULES, and shipped.
+# Refuse every id rules.md names, not only the derivable ones. SKILL.md:111-113 notes
+# that ids such as HK3 live in UNREACHABLE_BY_DESIGN rather than ALL_RULES.
 REFUSED_IDS = RULE_SET | frozenset(UNREACHABLE_BY_DESIGN)
 # The in-card scan kept its own copy of CITATION's extension list and drifted from it:
 # no `rs|toml`, so a Rust-only finding read as citing nothing and skipped both the
@@ -3168,7 +3184,6 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
         # id was therefore something the card was forbidden to do, and every correctly
         # written card reported every fired rule as UNREPORTED-FIRE. A finding that names
         # a file the verdict cited is the same claim without the label.
-        folded = _fold_punct(text)
         cited_here = [c.lstrip("./") for c in re.findall(CITATION_BARE, text)]
         for rule, paths in fire_paths.items():
             if paths and any(_same_file(pp, cp) for pp in paths for cp in cited_here):
@@ -3179,8 +3194,7 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
                 # "output", `kv` inside "kv_cache", `ep` inside "step" -- and claims a
                 # FIRE the finding was never about. Matched as written, not folded: the
                 # reason chose the spelling when it chose the backticks.
-                if any(re.search(rf"(?<![\w]){re.escape(sym)}(?![\w])", text)
-                       for sym in fire_tokens[rule]):
+                if any(_mentions_symbol(text, sym) for sym in fire_tokens[rule]):
                     claims.setdefault(rule, []).append(text[:40])
     # A finding may report more than one rule, and often should: aiter#3165 fired B4 and
     # E5 on the same changed file and one accurate bullet covered both. Requiring N
