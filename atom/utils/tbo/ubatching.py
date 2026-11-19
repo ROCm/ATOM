@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -281,6 +282,28 @@ def sync_dp_metadata(
     tbo_fields = 9 if tbo_on else 5
     dspark_on = max_seqlen_q is not None
     n_fields = tbo_fields + (1 if dspark_on else 0)
+    if dp_size <= 1 and _HOSTFAST_DPSYNC:
+        # ATOM_HOSTFAST_DPSYNC: a group of one exchanges nothing, so build its
+        # one row straight in numpy -- the same int32 [n_fields, 1] array the
+        # torch path below stacks, without ~10 torch scalar writes and a stack.
+        row = [
+            scheduled_tokens,
+            scheduled_bs,
+            1 if is_prefill else 0,
+            1 if needs_eager else 0,
+            final_requests,
+        ]
+        if tbo_on:
+            row += [
+                1 if local_meets_min_tokens else 0,
+                1 if local_can_split else 0,
+                local_ub_tokens[0],
+                local_ub_tokens[1],
+            ]
+        if dspark_on:
+            row.append(max_seqlen_q)
+        sync = np.array(row, dtype=np.int32).reshape(n_fields, 1)
+        return _dp_sync_result(sync, dp_size, tbo_on, tbo_fields, dspark_on)
     local = torch.zeros(n_fields, dtype=torch.int32, device="cpu")
     local[0] = scheduled_tokens
     local[1] = scheduled_bs
@@ -304,7 +327,14 @@ def sync_dp_metadata(
         ]
         torch.distributed.all_gather(gathered, local, group=dp_group)
     sync = torch.stack(gathered, dim=1).numpy()  # [n_fields, dp_size]
+    return _dp_sync_result(sync, dp_size, tbo_on, tbo_fields, dspark_on)
 
+
+_HOSTFAST_DPSYNC = os.environ.get("ATOM_HOSTFAST_DPSYNC", "0") == "1"
+
+
+def _dp_sync_result(sync, dp_size, tbo_on, tbo_fields, dspark_on) -> DPSyncResult:
+    """`sync_dp_metadata`'s reading of the gathered ``[n_fields, dp_size]`` rows."""
     scheduled_tokens_per_dp_rank = sync[0]
     max_bs_across_dp = int(sync[1].max())
     any_rank_needs_eager = bool(sync[3].any())
