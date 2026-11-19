@@ -1264,7 +1264,8 @@ class MooncakeConnector(KVConnectorBase):
         self._completed_prefills_cv = threading.Condition(self._completed_prefills_lock)
         self._chunked_prefills: dict[ReqId, ChunkedPrefill] = {}
         self._chunked_local_ids: dict[ReqId, ReqId] = {}
-        self._retired_chunked_transfers: OrderedDict[ReqId, None] = OrderedDict()
+        # Retired transfer -> whether one of its readers had posted a write.
+        self._retired_chunked_transfers: OrderedDict[ReqId, bool] = OrderedDict()
         self._pending_chunked_requests: list[tuple[dict, float]] = []
         self._received_handoffs: dict[ReqId, PrefillHandoff] = {}
         self._pending_handoffs: dict[ReqId, dict] = {}
@@ -1892,7 +1893,9 @@ class MooncakeConnector(KVConnectorBase):
                             continue  # A rejected ID reuse cannot cancel its owner.
                         if state is None and meta.prefill_aborted:
                             # Cancellation before admission owns no source blocks.
-                            self._retire_chunked_transfer(meta.transfer_id)
+                            self._retire_chunked_transfer(
+                                meta.transfer_id, started_writes=False
+                            )
                             self._chunked_local_ids.pop(req_id, None)
                             continue
                         if state is None:
@@ -2323,7 +2326,9 @@ class MooncakeConnector(KVConnectorBase):
                         ConnectorCompletion("pd_source_safe", state.req_id, True)
                     )
                     state.cancel()  # Late holders of the object cannot acquire it.
-                    self._retire_chunked_transfer(transfer_id)
+                    self._retire_chunked_transfer(
+                        transfer_id, started_writes=state.started_writes
+                    )
                     del self._chunked_prefills[transfer_id]
                     self._chunked_local_ids.pop(state.req_id, None)
                     self._kv_cache_ready_events.pop(state.req_id, None)
@@ -2801,9 +2806,11 @@ class MooncakeConnector(KVConnectorBase):
             expected_readers=num_consumers_per_producer_rank,
         )
 
-    def _retire_chunked_transfer(self, transfer_id: TransferId) -> None:
+    def _retire_chunked_transfer(
+        self, transfer_id: TransferId, *, started_writes: bool
+    ) -> None:
         """Remember a terminal ID without retaining blocks; caller holds the lock."""
-        self._retired_chunked_transfers[transfer_id] = None
+        self._retired_chunked_transfers[transfer_id] = started_writes
         if len(self._retired_chunked_transfers) > CHUNKED_RETIRED_TRANSFER_LIMIT:
             self._retired_chunked_transfers.popitem(last=False)
 
@@ -2852,8 +2859,10 @@ class MooncakeConnector(KVConnectorBase):
             registered = set(self._chunked_local_ids.values())
             pending = []
             for data, queued_at in self._pending_chunked_requests:
-                if data["transfer_id"] in self._retired_chunked_transfers:
-                    failures.append(data)
+                wrote = self._retired_chunked_transfers.get(data["transfer_id"])
+                if wrote is not None:
+                    # A late duplicate of a reader that wrote keeps D's hold.
+                    failures.append((data, wrote))
                     continue
                 state = self._chunked_prefills.get(data["transfer_id"])
                 if state is None or not (state.num_ready_blocks or state.cancelled):
@@ -2865,21 +2874,25 @@ class MooncakeConnector(KVConnectorBase):
                     else:
                         # Only an orphan with no logical P request expires.
                         # Retire it before D can free the advertised allocation.
-                        self._retire_chunked_transfer(data["transfer_id"])
-                        failures.append(data)
+                        self._retire_chunked_transfer(
+                            data["transfer_id"], started_writes=False
+                        )
+                        failures.append((data, False))
                     continue
                 try:
                     acquired = self._acquire_chunked_reader(state, data)
                 except (RuntimeError, ValueError):
-                    failures.append(data)
+                    failures.append((data, False))  # Refused: it started no reader.
                 else:
                     if acquired:
                         submissions.append((data, state))
             self._pending_chunked_requests = pending
-        for data in failures:
-            # No send worker started these readers, so none of them wrote.
+        for data, started_writes in failures:
             self._send_executor.submit(
-                self._notify_transfer_result, data, success=False, started_writes=False
+                self._notify_transfer_result,
+                data,
+                success=False,
+                started_writes=started_writes,
             )
         for data, state in submissions:
             self._send_executor.submit(self._execute_chunked_transfer, data, state)
@@ -3001,7 +3014,8 @@ class MooncakeConnector(KVConnectorBase):
                 request_data, success=False, started_writes=started_writes
             )
         finally:
-            state.release()
+            # Kept past retirement: a late duplicate reports it (see the dispatcher).
+            state.release(started_writes=started_writes)
 
     def _consumer_region_map(
         self,

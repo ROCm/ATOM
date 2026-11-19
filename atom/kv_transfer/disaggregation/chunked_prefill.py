@@ -94,6 +94,7 @@ class ChunkedPrefill:
         self.expected_readers = 0  # Total consumers served by this P rank.
         self.completed_readers = 0  # Exited send tasks, including failures.
         self.claims: set[tuple] = set()  # Retain identities to deduplicate sends.
+        self.started_writes = False  # An exited reader had posted a write.
         self.updated = time.monotonic()
 
     @property
@@ -161,10 +162,11 @@ class ChunkedPrefill:
             self.claims.add(consumer_identity)
             return True
 
-    def release(self):
+    def release(self, *, started_writes):
         """Release a reader when its send task exits, on success or failure."""
         with self.cv:
             self.completed_readers += 1
+            self.started_writes |= started_writes
             self.cv.notify_all()
 
     def source_safe(self):
