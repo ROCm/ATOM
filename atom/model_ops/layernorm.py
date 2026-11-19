@@ -35,6 +35,13 @@ from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
 
+try:
+    from aiter.dist.communication_op import (
+        tensor_model_parallel_fused_allreduce_rmsnorm_mxfp8_quant,
+    )
+except ImportError:
+    tensor_model_parallel_fused_allreduce_rmsnorm_mxfp8_quant = None
+
 
 def silu(input: Tensor, inplace: bool = False) -> Tensor:
     r"""Apply the Sigmoid Linear Unit (SiLU) function, element-wise.
@@ -1080,6 +1087,36 @@ def fused_allreduce_gemma_rms_norm_quant(
         normed,
         quant_dtype=fp8,
     )
+    return out_fp8, scale_out, residual_out
+
+
+def fused_allreduce_gemma_rms_norm_mxfp8_quant(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    norm: GemmaRMSNorm,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return Gemma-normalized E4M3 values, E8M0 scales, and the residual."""
+    if get_tensor_model_parallel_world_size() > 1:
+        if tensor_model_parallel_fused_allreduce_rmsnorm_mxfp8_quant is None:
+            raise RuntimeError(
+                "ATOM_MINIMAX_M3_GLUON_AR_MXFP8 requires an aiter exposing "
+                "tensor_model_parallel_fused_allreduce_rmsnorm_mxfp8_quant"
+            )
+        out_fp8, residual_out, scale_out = (
+            tensor_model_parallel_fused_allreduce_rmsnorm_mxfp8_quant(
+                hidden_states.contiguous(),
+                residual,
+                norm.weight,
+                norm.variance_epsilon,
+                gemma_norm=True,
+            )
+        )
+        return out_fp8, scale_out, residual_out
+
+    from atom.model_ops.blockscale import quantize_fp8
+
+    normed, residual_out = norm(hidden_states, residual)
+    out_fp8, scale_out = quantize_fp8(normed)
     return out_fp8, scale_out, residual_out
 
 

@@ -749,6 +749,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_GLUON_FUSED_AR": lambda: (
         os.getenv("ATOM_ENABLE_GLUON_FUSED_AR", "1") == "1"
     ),
+    # MiniMax-M3 only: feed eligible native group-32 FP8 QKV and dense-MLP
+    # linears directly from aiter's fused TP4 all-reduce + Gemma RMSNorm +
+    # MXFP8 quantizer. Off by default until the model-level path is enabled
+    # deliberately; unsupported linears keep the existing BF16/per-token path.
+    "ATOM_MINIMAX_M3_GLUON_AR_MXFP8": lambda: _flag_env(
+        "ATOM_MINIMAX_M3_GLUON_AR_MXFP8"
+    ),
     # DSpark block sampling: replace the Markov head's
     #   bias = W1[x] @ W2.float().t() ; argmax(base_logits + bias)
     # with one fused Triton kernel (atom/model_ops/dspark_markov_argmax.py).
