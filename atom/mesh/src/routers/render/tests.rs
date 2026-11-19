@@ -73,6 +73,7 @@ mod b_chat_aggregator {
             request_id: "req-1".to_string(),
             weight_version: None,
             cached_tokens: 0,
+            timing: None,
         }
     }
 
@@ -194,6 +195,7 @@ mod b2_chat_aggregator_branches {
             request_id: "req".to_string(),
             weight_version: v.map(|s| s.to_string()),
             cached_tokens: 0,
+            timing: None,
         }
     }
 
@@ -497,7 +499,7 @@ mod b2_chat_aggregator_branches {
     }
 
     #[tokio::test]
-    async fn test_aggregator_multiple_completes_aggregates_usage() {
+    async fn test_aggregator_multiple_completes_count_the_prompt_once() {
         let mut req = ChatCompletionRequest::default();
         req.stream = false;
         req.stream_options = Some(StreamOptions {
@@ -510,8 +512,10 @@ mod b2_chat_aggregator_branches {
         let resp = chat_aggregator::process(stream, ctx_with(req)).await;
         let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
         let s = std::str::from_utf8(&body).unwrap();
-        assert!(s.contains("usage"));
-        assert!(s.contains("\"total_tokens\":10"));
+        // Each sibling reports the shared 3-token prompt; it counts once.
+        assert!(s.contains("\"prompt_tokens\":3"), "{s}");
+        assert!(s.contains("\"completion_tokens\":4"), "{s}");
+        assert!(s.contains("\"total_tokens\":7"), "{s}");
     }
 }
 
@@ -532,6 +536,7 @@ mod b3_chat_aggregator_typed {
             request_id: "req".to_string(),
             weight_version: Some("v1".to_string()),
             cached_tokens: 0,
+            timing: None,
         }
     }
 
@@ -693,6 +698,7 @@ mod c_chat_streaming {
             request_id: "req-1".to_string(),
             weight_version: None,
             cached_tokens: 0,
+            timing: None,
         }
     }
 
@@ -764,6 +770,7 @@ mod c1_chat_streaming_body_content {
             request_id: "req".to_string(),
             weight_version: None,
             cached_tokens: 0,
+            timing: None,
         }
     }
 
@@ -920,6 +927,7 @@ mod c2_chat_streaming_branches {
             request_id: "req".to_string(),
             weight_version: Some(v.to_string()),
             cached_tokens: 0,
+            timing: None,
         }
     }
 
@@ -928,6 +936,7 @@ mod c2_chat_streaming_branches {
             request_id: "req".to_string(),
             weight_version: None,
             cached_tokens: 0,
+            timing: None,
         }
     }
 
@@ -1296,6 +1305,7 @@ mod c3_chat_streaming_parsers {
             request_id: "req".to_string(),
             weight_version: None,
             cached_tokens: 0,
+            timing: None,
         }
     }
 
@@ -1492,6 +1502,7 @@ mod c4_chat_streaming_coverage {
             request_id: "req".to_string(),
             weight_version: None,
             cached_tokens: 0,
+            timing: None,
         }
     }
 
@@ -1500,6 +1511,7 @@ mod c4_chat_streaming_coverage {
             request_id: "req".to_string(),
             weight_version: Some(v.to_string()),
             cached_tokens: 0,
+            timing: None,
         }
     }
 
@@ -2651,6 +2663,7 @@ mod d_generate_aggregator {
             request_id: "req-1".to_string(),
             weight_version: None,
             cached_tokens: 0,
+            timing: None,
         }
     }
 
@@ -2721,6 +2734,7 @@ mod d2_generate_aggregator_branches {
             request_id: "req-1".to_string(),
             weight_version: Some("v7".to_string()),
             cached_tokens: 5,
+            timing: None,
         }
     }
 
@@ -3203,6 +3217,7 @@ mod e_generate_streaming {
             request_id: "req-1".to_string(),
             weight_version: None,
             cached_tokens: 0,
+            timing: None,
         }
     }
 
@@ -3261,6 +3276,7 @@ mod e1_generate_streaming_body_content {
             request_id: "req".to_string(),
             weight_version: Some("v1".to_string()),
             cached_tokens: 0,
+            timing: None,
         }
     }
 
@@ -3338,6 +3354,7 @@ mod e1_generate_streaming_body_content {
                 request_id: "req".to_string(),
                 weight_version: Some("v2".to_string()),
                 cached_tokens: 42,
+                timing: None,
             },
         })]);
         let resp = generate_streaming::process(stream, generate_ctx(), "regular");
@@ -3370,6 +3387,7 @@ mod e1_generate_streaming_body_content {
                 request_id: "req".to_string(),
                 weight_version: Some("wv_abc".to_string()),
                 cached_tokens: 0,
+                timing: None,
             },
         })]);
         let resp = generate_streaming::process(stream, generate_ctx(), "regular");
@@ -3401,6 +3419,7 @@ mod e2_generate_streaming_branches {
             request_id: "req".to_string(),
             weight_version: v.map(|s| s.to_string()),
             cached_tokens: 9,
+            timing: None,
         }
     }
 

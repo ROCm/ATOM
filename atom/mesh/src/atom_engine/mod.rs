@@ -15,7 +15,7 @@ pub(crate) mod test_support;
 mod tests;
 pub mod wire;
 
-pub use client::{EngineClient, Finished, SeqEvent, SeqFailure, SeqHandle, Submission};
+pub use client::{EngineClient, Finished, SeqEvent, SeqFailure, SeqHandle, SeqTimes, Submission};
 pub use link::Interrupted;
 pub use spec::{EngineSpec, ModelSpec, ReasoningToggle};
 
