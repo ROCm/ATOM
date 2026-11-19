@@ -151,7 +151,7 @@ jobs:
               "lm_eval --model local-completions --model_args "
               "'model=${MODEL_PATH},base_url=http://localhost:8000/v1/completions,"
               "num_concurrent=65,max_retries=3,tokenized_requests=False,trust_remote_code=True' "
-              "--tasks gsm8k --num_fewshot 3 --limit 128 --log_samples "
+              "--tasks gsm8k --num_fewshot 3 --log_samples "
               "--output_path '${OUTPUT_PATH}'"
           )
           filtered[0]["accuracy_timeout_minutes"] = 10
