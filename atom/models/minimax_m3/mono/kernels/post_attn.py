@@ -344,7 +344,8 @@ def build_post_attn_kernel(
         wave = tid // 64
         g4 = lane // 16
         l16 = lane % 16
-        lds = fx.SharedAllocator().allocate(Smem).peek()
+        smem = fx.SharedAllocator()
+        lds = smem.allocate(Smem).peek()
         xs = lds.x.ptr
         red = lds.red.ptr
         p8 = lds.p8.ptr
@@ -480,6 +481,7 @@ def build_post_attn_kernel(
                 index_nvfp4=index_nvfp4,
                 attn_mxfp8=attn_mxfp8,
                 xsc=xs + tokens * (HIDDEN // 4) if attn_mxfp8 else None,
+                alloc=smem,
             )  # fmt: skip
             gpu.barrier()
             k1_mbox = Mailbox(layer, diag, REGION_IDS)

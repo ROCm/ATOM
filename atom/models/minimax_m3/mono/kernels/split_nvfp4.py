@@ -4,7 +4,7 @@
 256-key partition x 16 heads a task, f16 MFMA over the exact dequantized products.
 
 The page (128 tokens, ``KV_PAGE_BYTES`` = 18432 B at one kv head) is aiter's
-``minimax_m3_sparse_pa_nvfp4`` one (``common.py`` here: ``nvfp4_k_store`` documents it),
+``sparse_pa_nvfp4`` one (``nvfp4_pages`` documents it),
 and a wave's work is that kernel's wave: 32 keys, the quarter ``q`` of a block,
 
   S^T = K Q^T   A = K tile (row r of tile st is key 8 (r // 4) + 4 st + r % 4 of the
@@ -31,7 +31,12 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int64, T, as_ir_value
 
 from atom.models.minimax_m3.mono.config import HEAD_DIM
-from atom.models.minimax_m3.mono.kernels.common import KV_PAGE_BYTES
+from atom.models.minimax_m3.mono.kernels.common import (
+    KV_K_SCALE_AT,
+    KV_PAGE_BYTES,
+    KV_V_DATA_AT,
+    KV_V_SCALE_AT,
+)
 from atom.models.minimax_m3.mono.kernels.stages.shared import NEG
 from atom.models.minimax_m3.mono.layout import N_SPLIT, O_K, SPLIT_KEYS, H
 from atom.mono.device.ops import (
@@ -48,9 +53,6 @@ from atom.mono.plan.execution import BLOCKS, THREADS, WAVES
 
 PPW = SPLIT_KEYS // WAVES // 16  # page-16 entries a wave
 KPW = SPLIT_KEYS // WAVES  # keys a wave (32)
-_K_SCALES = 8192  # a head's K scale region (Hkv = 1)
-_V_DATA = 9216
-_V_SCALES = 9216 + 8192
 _CURRENT_STREAM = fx.Stream(None)
 _V = fx.Vector
 
@@ -129,13 +131,13 @@ def load_quarter(r_page, w, n, g, cm=0):
     ks = fx.Int32(
         bo.buffer_load(
             r_page,
-            (_K_SCALES + ((w * 4 + g) * 16 + n) * 4) // 4,
+            (KV_K_SCALE_AT + ((w * 4 + g) * 16 + n) * 4) // 4,
             vec_width=1,
             dtype=T.i32,
             cache_modifier=cm,
         )
     )
-    vbase = (_V_DATA + ((w * 4 + g) * 128 + 8 * n) * 4) // 4
+    vbase = (KV_V_DATA_AT + ((w * 4 + g) * 128 + 8 * n) * 4) // 4
     vd = [
         _V(
             bo.buffer_load(
@@ -147,7 +149,7 @@ def load_quarter(r_page, w, n, g, cm=0):
     vs = _V(
         bo.buffer_load(
             r_page,
-            (_V_SCALES + (n // 2) * 128 + w * KPW + 8 * g) // 4,
+            (KV_V_SCALE_AT + (n // 2) * 128 + w * KPW + 8 * g) // 4,
             vec_width=2,
             dtype=T.i32,
             cache_modifier=cm,

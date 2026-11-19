@@ -89,9 +89,12 @@ if __name__ == "__main__":
             for it in (True, False):
                 check_build(s, ih, index_topk=it)
                 print(f"S={s} index heads={ih} index_topk={it}: contract holds")
-            check_build(s, ih, kv_nvfp4=True, index_nvfp4=True)
-            print(f"S={s} index heads={ih} nvfp4 K/V + index: contract holds")
-            for nv in (False, True):
+            # indexer context parallelism reads fp8 index caches only
+            nvfp4 = (False, True) if ih == 1 else (False,)
+            if ih == 1:
+                check_build(s, ih, kv_nvfp4=True, index_nvfp4=True)
+                print(f"S={s} index heads={ih} nvfp4 K/V + index: contract holds")
+            for nv in nvfp4:
                 check_build(s, ih, attn_mxfp8=True, kv_nvfp4=nv, index_nvfp4=nv)
                 print(f"S={s} index heads={ih} attn_mxfp8 nvfp4={nv}: contract holds")
                 check_build(s, ih, kv_nvfp4=nv, index_nvfp4=nv, fused_shared=True)

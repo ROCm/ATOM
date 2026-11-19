@@ -6,10 +6,10 @@ scores of ``build_index_score_kernel(nvfp4=True)`` against aiter's
 e4m3_rn_satfinite(e2m1 x scale), q e4m3 as vLLM's quantizer makes it) on the same pages, bit for bit, and
 the top-16 selection they feed.
 
-The reference trees are not part of this repo: set ``ATOM_NVFP4_AITER_KERNELS`` (the
-aiter ``aiter/ops/flydsl/kernels`` directory of the nvfp4 index scorer) and
-``ATOM_NVFP4_VLLM_REF`` (vLLM's ``tests/kernels/attention``, for its quantizer);
-the test skips without them."""
+The vLLM reference is not part of this repo: set ``ATOM_NVFP4_VLLM_REF`` (vLLM's
+``tests/kernels/attention``, for its quantizer); the test skips without it. The scorer is
+the installed aiter's, or the one in ``ATOM_NVFP4_AITER_KERNELS`` (an aiter
+``aiter/ops/flydsl/kernels`` directory) when that is set."""
 
 import os
 import sys
@@ -24,30 +24,36 @@ VLLM_REF = os.environ.get("ATOM_NVFP4_VLLM_REF")
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
     or "gfx950" not in torch.cuda.get_device_properties(0).gcnArchName
-    or not KERNELS
     or not VLLM_REF,
-    reason="needs gfx950 and the nvfp4 reference trees (see the module doc)",
+    reason="needs gfx950 and the vLLM nvfp4 reference (see the module doc)",
 )
 
+from atom.model_ops.minimax_m3.nvfp4_pages import INDEX_PAGE_BYTES
 from atom.models.minimax_m3.mono.config import HEAD_DIM, MAX_INDEX_BLOCKS, MAX_TOKENS
-from atom.models.minimax_m3.mono.kernels.index_score import (
-    NVFP4_PAGE_BYTES,
-    build_index_score_kernel,
-)
+from atom.models.minimax_m3.mono.kernels.index_score import build_index_score_kernel
 
 SM_SCALE = HEAD_DIM**-0.5
+SCORER = "aiter.ops.flydsl.kernels.minimax_m3_index_score"
 
 
-def _reference_modules():
+@pytest.fixture
+def refs(monkeypatch):
+    """(aiter's NVFP4 index scorer module, vLLM's reference module); the import path,
+    the kernels package's path and the modules imported from the trees are put back
+    after the test."""
+    import importlib
+
     import aiter.ops.flydsl.kernels as pkg
 
-    pkg.__path__.insert(0, KERNELS)
-    from aiter.ops.flydsl.kernels import minimax_m3_index_score as scorer
-
-    sys.path.insert(0, VLLM_REF)
-    import minimax_m3_nvfp4_ref as ref
-
-    return scorer, ref
+    if KERNELS:
+        monkeypatch.setattr(pkg, "__path__", [KERNELS, *pkg.__path__])
+        monkeypatch.delitem(sys.modules, SCORER, raising=False)
+        monkeypatch.setattr(pkg, SCORER.rsplit(".", 1)[1], None, raising=False)
+    monkeypatch.syspath_prepend(VLLM_REF)
+    monkeypatch.delitem(sys.modules, "minimax_m3_nvfp4_ref", raising=False)
+    return importlib.import_module(SCORER), importlib.import_module(
+        "minimax_m3_nvfp4_ref"
+    )
 
 
 def _pages(ref, blocks, seed):
@@ -58,7 +64,7 @@ def _pages(ref, blocks, seed):
     codes, scales = ref.quantize_nvfp4(keys.to(torch.bfloat16).float(), 1.0)
     codes = codes.to(torch.uint8).view(blocks, 128, HEAD_DIM)
     data = codes[..., 0::2] | (codes[..., 1::2] << 4)
-    pages = torch.empty(blocks, NVFP4_PAGE_BYTES, device="cuda", dtype=torch.uint8)
+    pages = torch.empty(blocks, INDEX_PAGE_BYTES, device="cuda", dtype=torch.uint8)
     pages[:, : 128 * 64] = data.reshape(blocks, -1)
     pages[:, 128 * 64 :] = scales.reshape(blocks, -1)
     return pages
@@ -75,9 +81,9 @@ def _pages(ref, blocks, seed):
     ],
 )
 def test_mono_block_scores_equal_the_aiter_nvfp4_scorer_bit_for_bit(
-    ctx, requests, q_len
+    refs, ctx, requests, q_len
 ):
-    scorer, ref = _reference_modules()
+    scorer, ref = refs
     tokens = requests * q_len
     n_blk = (ctx + 127) // 128
     total_blocks = requests * n_blk + 1
@@ -95,9 +101,9 @@ def test_mono_block_scores_equal_the_aiter_nvfp4_scorer_bit_for_bit(
     seq_tok = (seq[:, None] - back).reshape(-1).contiguous()
     bt_tok = block_table.repeat_interleave(q_len, dim=0).contiguous()
 
-    kd = torch.as_strided(pages, (total_blocks, 128, 64), (NVFP4_PAGE_BYTES, 64, 1))
+    kd = torch.as_strided(pages, (total_blocks, 128, 64), (INDEX_PAGE_BYTES, 64, 1))
     ks = torch.as_strided(
-        pages, (total_blocks, 128, 8), (NVFP4_PAGE_BYTES, 8, 1), 128 * 64
+        pages, (total_blocks, 128, 8), (INDEX_PAGE_BYTES, 8, 1), 128 * 64
     )
     iq8 = iq.float().clamp(-448, 448).to(torch.float8_e4m3fn)  # vLLM's index q
     want = scorer.score_flydsl_nvfp4(
@@ -172,8 +178,8 @@ def _row_store_launcher(n_tokens: int):
 
 
 @pytest.mark.parametrize("scale", [1.0, 1e-3, 40.0, 600.0])
-def test_the_index_k_row_store_is_vllms_writer_byte_for_byte(scale):
-    _, ref = _reference_modules()
+def test_the_index_k_row_store_is_vllms_writer_byte_for_byte(refs, scale):
+    _, ref = refs
     t, blocks = 61, 6
     g = torch.Generator(device="cuda").manual_seed(3)
     rows = (torch.randn(t, HEAD_DIM, device="cuda", generator=g) * scale).to(
@@ -185,7 +191,7 @@ def test_the_index_k_row_store_is_vllms_writer_byte_for_byte(scale):
     slots[7] = -1
     want = torch.zeros(blocks, 128, 72, device="cuda", dtype=torch.uint8)
     ref.insert_nvfp4_index(want, rows, slots)
-    got = torch.zeros(blocks, NVFP4_PAGE_BYTES, device="cuda", dtype=torch.uint8)
+    got = torch.zeros(blocks, INDEX_PAGE_BYTES, device="cuda", dtype=torch.uint8)
     _row_store_launcher(t)(rows.data_ptr(), slots.data_ptr(), got.data_ptr(), t)
     torch.cuda.synchronize()
     assert int((want != 0).sum()) > 1000  # not a vacuous comparison
@@ -247,8 +253,8 @@ def _kv_store_launcher(n_tokens: int):
 
 
 @pytest.mark.parametrize("k_scale, v_scale", [(1.0, 1.0), (0.37, 2.5), (8.0, 0.05)])
-def test_the_kv_row_stores_are_vllms_writer_byte_for_byte(k_scale, v_scale):
-    _, ref = _reference_modules()
+def test_the_kv_row_stores_are_vllms_writer_byte_for_byte(refs, k_scale, v_scale):
+    _, ref = refs
     t, blocks = 90, 3
     g = torch.Generator(device="cuda").manual_seed(4)
     k = torch.randn(t, 1, HEAD_DIM, device="cuda", generator=g).to(torch.bfloat16)
