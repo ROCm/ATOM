@@ -4723,13 +4723,18 @@ class MooncakeConnector(KVConnectorBase):
                 # hold every notification behind the in-flight decode step.
                 stream = self._recv_scatter_stream()
                 try:
-                    with torch.cuda.stream(stream):
-                        self._scatter_slot(compute_slot, pool_idx)
+                    try:
+                        with torch.cuda.stream(stream):
+                            self._scatter_slot(compute_slot, pool_idx)
+                    finally:
+                        # As on the gather side: the row goes back to the pool
+                        # below however this leaves, so it has to be quiet
+                        # first, and a scatter that raised partway still has
+                        # copies in flight.
+                        stream.synchronize()
                 finally:
-                    # As on the gather side: the row goes back to the pool
-                    # however this leaves, so it has to be quiet first, and a
-                    # scatter that raised partway still has copies in flight.
-                    stream.synchronize()
+                    # Nested so that a `synchronize` that itself raises -- where
+                    # HIP surfaces an earlier fault -- still returns the row.
                     self._staging_slots.release(pool_idx)
         dst_blocks = self._pending_recv_blocks.pop(req_id, None)
         if dst_blocks:
