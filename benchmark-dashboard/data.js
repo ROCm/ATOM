@@ -1,36 +1,8 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795125684396,
+  "lastUpdate": 1795128307958,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
-      {
-        "commit": {
-          "author": {
-            "name": "jasen",
-            "username": "Jasen2201",
-            "email": "38908462+Jasen2201@users.noreply.github.com"
-          },
-          "committer": {
-            "name": "jasen",
-            "username": "Jasen2201",
-            "email": "38908462+Jasen2201@users.noreply.github.com"
-          },
-          "id": "c127b008b2e429bf2334084e57ba1600c04d70b6",
-          "message": "ci(atomesh): sweep-only, re-extract crate sources when the node cache lost files\n\nOn g25 an extracted crate kept its .cargo-ok marker after its Cargo.toml\nwas removed from /tmp, so cargo failed with \"unable to get packages from\nsource\" and never re-extracted it. Drop registry/src and retry once.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
-          "timestamp": "2026-10-18T12:52:05Z",
-          "url": "https://github.com/ROCm/ATOM/commit/c127b008b2e429bf2334084e57ba1600c04d70b6"
-        },
-        "date": 1792361173291,
-        "tool": "customBiggerIsBetter",
-        "benches": [
-          {
-            "name": "Atomesh::Kimi-K3-MXFP4 mi355x_atomesh-atom_mxfp4_1p2d_tp8_dcp8_dspark4 1048576/1024 c=48 perf point",
-            "value": 69.6656,
-            "unit": "point",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39129295866 | docker_image=rocm/atom-dev:nightly_202610151507 | precision=MXFP4 | display_topology=1P2D-TP8-DCP8-DSPARK4 | perf_point=%7B%22backend%22%3A%22atomesh-atom%22%2C%22benchmark_kind%22%3A%22aiperf_agentic%22%2C%22cache_hit_rate%22%3A0.9683%2C%22cache_hit_tokens%22%3A871042048%2C%22cache_total_tokens%22%3A899511904%2C%22chart_group%22%3A%22atomesh-model-performance%22%2C%22chart_label%22%3A%22MI355X%20%28atomesh-atom%20MXFP4%29%22%2C%22client_bench%22%3A%22inferencemax%20bench%22%2C%22completed%22%3A5924%2C%22concurrency%22%3A48%2C%22config_label%22%3A%22mi355x_atomesh-atom_mxfp4_1p2d_tp8_dcp8_dspark4%22%2C%22decode_dcp%22%3A8%2C%22decode_dpa%22%3Afalse%2C%22decode_tp%22%3A8%2C%22decode_workers%22%3A2%2C%22disaggregated%22%3Atrue%2C%22duration%22%3A3621.1888%2C%22e2el_ms%22%3A12556.8716%2C%22e2el_p90%22%3A26344.8826%2C%22e2el_p99%22%3A86125.6155%2C%22hardware%22%3A%22mi355x%22%2C%22image%22%3A%22rocm%2Fatom-dev%3Anightly_202610151507%22%2C%22input_tput%22%3A248402.365%2C%22input_tput_per_gpu%22%3A10350.0985%2C%22interactivity%22%3A27.9722%2C%22interactivity_method%22%3A%22p90_e2e_normalized%22%2C%22interactivity_n_requests%22%3A5923%2C%22interactivity_p90_itl%22%3A86.4157%2C%22isl%22%3A1048576%2C%22itl_ms%22%3A9.4255%2C%22itl_p90%22%3A11.572%2C%22median_e2el_ms%22%3A7110.5935%2C%22median_itl_ms%22%3A9.3647%2C%22median_tpot_ms%22%3A9.3647%2C%22median_ttft_ms%22%3A1553.5965%2C%22model%22%3A%22Kimi-K3-MXFP4%22%2C%22num_decode_gpu%22%3A16%2C%22num_prefill_gpu%22%3A8%2C%22num_speculative_tokens%22%3A4%2C%22osl%22%3A1024%2C%22output_tput%22%3A1671.9749%2C%22output_tput_per_gpu%22%3A69.6656%2C%22precision%22%3A%22mxfp4%22%2C%22prefill_dcp%22%3A8%2C%22prefill_dpa%22%3Afalse%2C%22prefill_tp%22%3A8%2C%22prefill_workers%22%3A1%2C%22public_dataset%22%3A%22semianalysis_cc_traces_weka_062126%22%2C%22ratio%22%3A0.8%2C%22req_tput%22%3A1.5074%2C%22rocm%22%3A%22%22%2C%22run_id%22%3A%22pd-atom-Kimi-K3-MXFP4-1p2d-isl1048576-osl1024-conc48-0.8%22%2C%22run_url%22%3A%22https%3A%2F%2Fgithub.com%2FROCm%2FATOM%2Factions%2Fruns%2F39129295866%22%2C%22scenario%22%3A%22inferencex-agentx-mvp%22%2C%22slurm_job%22%3A%22%22%2C%22source%22%3A%22ATOMesh%22%2C%22speculative_method%22%3A%22dspark-4%22%2C%22total_gpu%22%3A24%2C%22total_tput%22%3A250074.3398%2C%22tpot_ms%22%3A9.4255%2C%22tpot_p90%22%3A11.572%2C%22tpot_p99%22%3A13.5002%2C%22tput_per_gpu%22%3A10419.7642%2C%22ttft_ms%22%3A2817.7716%2C%22ttft_p90%22%3A6411.6105%2C%22ttft_p99%22%3A17373.8944%7D"
-          }
-        ]
-      },
       {
         "commit": {
           "author": {
@@ -274384,6 +274356,64 @@ window.BENCHMARK_DATA = {
             "value": 0.8969,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44553072996 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611191609 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1494 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Ling Zhang",
+            "username": "ZLkanyo009",
+            "email": "69022634+ZLkanyo009@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "83d073f0be58451fb6de97372fee444983f4f274",
+          "message": "[Sgl Atom][perf] QSA FlyDSL prefill: read K/V in place through the slot table and select at the kernel width (#3450)\n\n* perf(sglang/qwen4-exp): QSA FlyDSL prefill reads K/V in place and selects at kernel width\n\nUnder SGLang (page 64) each QSA layer of an eager prefill took the aiter\nFlyDSL sparse attention through a host path that repeated per layer what\nis the same for the whole forward, and copied data the kernel can read\nwhere it is:\n\n- K/V: with a prefix, each layer index_selected the whole context's K and\n  V rows out of its paged pool. aiter's qsa_sparse_prefill reads a token\n  pool in place through a slot table (kv_slots) when every four-token\n  block of a request sits in four consecutive pool rows starting at a\n  multiple of four, which a page size divisible by four guarantees (the\n  bridge already requires the page to be divisible by the compress\n  ratio, 4). The bridge now emits the context rows as int32, the slot\n  table's type; the layer passes the pool and the table. aiter documents\n  the result as the same as for the packed rows.\n- Selection: each layer padded its selection with -1 to the kernel width\n  (a copy, also when the width already matched). The first layer of the\n  forward now allocates one kernel-width buffer filled with -1, and every\n  layer's selection writes its leading columns in place; the columns past\n  the selection are never written, so they stay -1.\n- Checks: the flag, the layer support check, the per-call checks, the\n  width and the per-request prefix lengths are made once per forward\n  (_FlyDSLPrefill, kept on the forward's QSA metadata, keyed by\n  everything they read from the layer and its inputs).\n\nNative ATOM, whose metadata has no FlyDSL layout, keeps its path.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* test(qwen4-exp): QSA FlyDSL prefill layout, in-place reads and kernel-width selection\n\n- One layout per forward (checks and prefix lengths made once), a new one\n  for another row count.\n- The kernel-width selection buffer reaches the kernel as is, -1 past the\n  selection, reused by a second layer.\n- With a prefix the pool and the bridge's int32 slot table go to the\n  kernel; int64 rows or a strided pool are gathered as before.\n- GPU: the real kernel on the slot table and the in-place selection gives\n  the same bits as gathered rows and a padded copy (hit, second chunk,\n  mixed unaligned prefixes, short, no prefix).\n- The bridge's context rows are int32 and contiguous.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* test(qwen4-exp): sharded QSA selection written into the kernel-width buffer\n\nThe sequence-parallel path expands the all-gathered groups itself; into a\ncolumn prefix of the kernel-width buffer it writes the same columns as\ninto a fresh tensor and leaves -1 past them (GPU).\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* perf(qwen4-exp): QSA FlyDSL prefill always reads K/V through the slot table\n\nReview of #3433. The bridge is the only producer of `context_slots`, always\nas int32, and already requires a page size divisible by the compress ratio,\nso `kv_slots` is passed whenever there are context rows; aiter validates the\nslot table itself. The gather branch and the hand copy of aiter's slot-table\nrule go away. So does the pad fallback: `forward` builds the layout before\nthe selection and writes it into the kernel-width buffer, which is what the\nkernel gets.\n\nThe layout is now looked up once per layer in `forward` (no second lookup in\n`_flydsl_attention`), computes the selection width itself (once per forward\ninstead of once per layer), reads `qsa.flydsl_prefill` directly, and no\nlonger keys on the index size, which is always int32. The metadata comment\nnow says what `for_tokens` does with the layout.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* test(qwen4-exp): run the QSA FlyDSL host cases in the CPU job\n\nThe CPU cases of `tests/test_qwen4_exp_qsa_flydsl_gate.py` were skipped by\nits module-level `importorskip(\"aiter.ops.enum\")`. They move to\n`tests/model_ops/test_qsa_flydsl_prefill_host.py`, which imports the model\ncode through `atom_without_aiter` and builds a real `Qwen4ExpQSAMetadata`\nper forward. The int64 / strided gather cases go with the branch they\ncovered. The gate module keeps the GPU cases; its bit-for-bit reference is\nnow the kernel called directly on gathered rows and a padded selection.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* test: stand in einops for model code imported without AITER\n\nThe CPU job installs no einops (ATOM does not depend on it), and\n`qwen4_exp_attn` reaches it through `gdn_attn` -> `attention_gdn`, so the new\nQSA host cases errored at setup there. `stubbed_external_kernel_modules` now\nserves it like aiter and triton, only where it is not installed, so a host\nwith einops keeps the real one.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* build: declare einops; drop its test stand-in\n\nReview of #3450. Model code imports einops at module level (`attention_gdn`,\n`fla_ops/chunk`, `qwen3_next`, `kimi_k3/model`, ...), but it was not a\ndeclared dependency, so the CPU job, which installs ATOM through pip, had\nnone. Declare it (the image ships 0.8.2) and drop the einops branch that\n844a4855f added to `tests/aiter_stub.py`, which is back to its earlier form.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* refactor(qwen4-exp): reference aiter's support query at the QSA mirrors\n\nReview of #3450. The FlyDSL selection widths and the 2**31-byte check\nmirror aiter's `qsa_sparse_prefill`; each mirror now points to\nROCm/aiter#8083, which exposes them as `qsa_sparse_prefill_widths()` and\n`qsa_sparse_prefill_supports_selection()`, and goes once it lands.\n\n`_FlyDSLPrefill` keeps its row count as `rows` instead of reading it back\nfrom the key, and its docstring says why the host lengths may stay out of\nthe key: the layout lives on one forward's metadata, which the bridge builds\nanew each forward, and a trimming `for_tokens` drops it.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* refactor(qwen4-exp): make the selection-width helper public for the QSA layout\n\nSelf-review of #3450. `qsa_attention` imported the private\n`_selection_widths` from `qwen4_exp/ops/qsa.py` to size the kernel-width\nselection buffer before selecting. It is now `qsa_selection_widths`; its two\ncallers in `ops/qsa.py` and the host test's spy follow, and nothing else\nused it.\n\n`_FlyDSLPrefill`'s docstring now names everything the layout reads from the\nforward's metadata and keeps out of the key (the host lengths, plus the block\ntable width and longest sequence behind the selection width), and the comment\nin `forward` no longer describes the code this PR replaced. No behavior\nchange.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* docs: ATOM_QSA_FLYDSL_ATTN reads prefixed K/V in place\n\nSelf-review of #3450. The variable's row still said prefixed chunks gather\ntheir requests' full-context K/V from the paged cache once per layer; with\nthis PR they read it in place through the bridge's slot table.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* qwen4_exp: QSA FlyDSL prefill asks aiter for its widths, selection limit and GPU\n\naiter.ops.qsa answers the selection widths, the selection byte limit and\nwhether the kernel runs on this GPU (ROCm/aiter#8083), so the layer and the\nSGLang bridge ask it instead of mirroring them: _FLYDSL_WIDTHS, the 2**31-byte\ncheck and the gfx942 check go.\n\n* qwen4_exp: name the QSA selection width; correct the 67-column test docstring\n\nThe selection's own width is selection_width, not columns. A 40-token context\nreaches 10 groups, rounded up to a power of two: 16, so 67 columns.\n\n* qwen4_exp: call aiter's qsa_sparse_prefill directly; document the #8083 query\n\naiter.ops.qsa is imported at module level now, so the lazy\n_flydsl_attention_op() wrapper has no reason left: qsa_sparse_prefill joins\nthat import and the layer calls it; the tests patch that name.\n\nThe ATOM_QSA_FLYDSL_ATTN row described the old mirrored rules (non-gfx942,\nfixed budgets, a padded selection's 2**31 bytes) and ROCm/aiter#6576. It now\nsays the layer falls back where aiter reports no widths, has none for the\nbudget, or rejects the selection, and that every import needs ROCm/aiter#8083.\n\n* qwen4_exp: ATOM_QSA_FLYDSL_ATTN names ROCm/aiter#8083; test the forward's selection wiring\n\nThe envs.py comment still said gfx942 and ROCm/aiter#6576. aiter reports where\nthe kernel runs (qsa_sparse_prefill_widths()), and qsa_attention imports its\nqueries at module level, so every import needs ROCm/aiter#8083, flag on or off.\n\ntest_forward_selects_into_the_kernel_buffer runs Qwen4ExpAttention.forward on\na prefill with spies for the selection ops and the kernel, whole and\nsequence-parallel: the layout is made, the selection is written into its\nkernel-width buffer (out=, out[:, :width] when sharded), and the kernel reads\nthat buffer.\n\n---------\n\nCo-authored-by: root <root@hjbog-srdc-16.amd.com>\nCo-authored-by: Cursor <cursoragent@cursor.com>",
+          "timestamp": "2026-11-19T15:17:12Z",
+          "url": "https://github.com/ROCm/ATOM/commit/83d073f0be58451fb6de97372fee444983f4f274"
+        },
+        "date": 1795128307193,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8 MTP TP4 accuracy (GSM8K)",
+            "value": 0.9568,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44562678036 | Threshold: 0.93 | Docker: rocm/atom-dev:vllm-v0.31.0-nightly_20261118 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9575 | fewshot: 20 | Model: /models/deepseek-ai/DeepSeek-V3.2"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8 PTPC TP4 accuracy (GSM8K)",
+            "value": 0.9477,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44562678036 | Threshold: 0.93 | Docker: rocm/atom-dev:vllm-v0.31.0-nightly_20261118 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9484 | fewshot: 20 | Model: /models/amd/DeepSeek-V3.2-mtp-ptpc"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8 TP4 accuracy (GSM8K)",
+            "value": 0.9515,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44562678036 | Threshold: 0.93 | Docker: rocm/atom-dev:vllm-v0.31.0-nightly_20261118 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9522 | fewshot: 20 | Model: /models/deepseek-ai/DeepSeek-V3.2"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8 TP8 accuracy (GSM8K)",
+            "value": 0.9515,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44562678036 | Threshold: 0.93 | Baseline: 0.956 | BaselineModel: deepseek-ai/DeepSeek-V3.2 | BaselineNote: 20-shot gsm8k reference from DeepSeek-V3.2 usage docs; nightly uses 20-shot to exercise sparse MLA. | Docker: rocm/atom-dev:vllm-v0.31.0-nightly_20261118 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.95 | fewshot: 20 | Model: /models/deepseek-ai/DeepSeek-V3.2"
+          },
+          {
+            "name": "ATOM-vLLM::MiniMax-M2.5 TP2 accuracy (GSM8K)",
+            "value": 0.9303,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44562678036 | Threshold: 0.92 | Docker: rocm/atom-dev:vllm-v0.31.0-nightly_20261118 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9272 | fewshot: 3 | Model: /models/MiniMaxAI/MiniMax-M2.5"
+          },
+          {
+            "name": "ATOM-vLLM::MiniMax-M2.5 TP4 accuracy (GSM8K)",
+            "value": 0.934,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44562678036 | Threshold: 0.92 | Docker: rocm/atom-dev:vllm-v0.31.0-nightly_20261118 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.934 | fewshot: 3 | Model: /models/MiniMaxAI/MiniMax-M2.5"
           }
         ]
       }
