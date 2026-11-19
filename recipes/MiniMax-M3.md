@@ -296,7 +296,7 @@ which ships the routed experts as MXFP4.
   MXFP4 MoE as is. With `ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4=1` (off by default) ATOM stages it at
   load, re-quantizes it MXFP8 → MXFP4 and writes it into the fused slot, so the original path's
   MoE runs as the tuned 129-expert / top-5 MXFP4 kernel (no `no tuned FlyDSL config` warning in
-  the log), on MXFP4 activations like the routed experts. Without it the shared expert runs as
+  the log). Without it the shared expert runs as
   its own MXFP8 MLP next to a 128-expert / top-4 MoE. The fusion needs MXFP4 routed experts in
   the checkpoint, kept as shipped (an `--online_quant_config` that re-quantizes the MoE is
   refused at load; the one below excludes it). The setting also picks mono decode's MoE kernel
@@ -312,9 +312,13 @@ which ships the routed experts as MXFP4.
   with its own MoE kernel, and they differ numerically:
   - With `ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4=1` (the command below), the shared expert is expert
     128 of the MXFP4 table. Mono runs every expert on MXFP8 activations (a8w4, the same mono
-    kernel as for `amd/MiniMax-M3-MXFP4`), where the original path quantizes them to MXFP4.
+    kernel as for `amd/MiniMax-M3-MXFP4`).
   - Without it, mono runs the routed experts on MXFP4 activations (a4w4) and the shared
-    expert on its own MXFP8 weights, which is the original path's quantization.
+    expert on its own MXFP8 weights.
+
+  Neither is the original path's MoE arithmetic: there, aiter's `fused_moe` picks the
+  activation dtype by token count (bf16 below a tuned bound, 256 tokens by default, so
+  every decode step; MXFP4 or MXFP8 above it).
 
   The log reads
   `MiniMax-M3 mono: attention linears ptpc FP8, shared expert fused (MXFP4, a8w4)` (or
