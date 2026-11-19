@@ -439,7 +439,9 @@ async fn pd_ingress_dispatches_next_request_while_prefill_body_is_blocked() {
 
 /// Through ingress, an ATOM PD router dispatches a text chat chunked when its prefill offers
 /// chunked transfer, but an `image_url` chat through the response relay: decode receives it
-/// only after prefill answers, with no `chunked_transfer` in its `kv_transfer_params`.
+/// only after prefill answers, with no `chunked_transfer` in its `kv_transfer_params`. The
+/// relay needs prefill's handoff: a prefill that answers an image chat with a null or absent
+/// `kv_transfer_params` gets the chat a 502 and decode never sees it.
 #[tokio::test]
 async fn atom_pd_ingress_relays_an_image_chat_without_chunked_transfer() {
     use crate::{
@@ -477,7 +479,26 @@ async fn atom_pd_ingress_relays_an_image_chat_without_chunked_transfer() {
     let router = PDRouter::new(&app).await.unwrap();
     let text = json!({"type": "text", "text": "Which color is this?"});
     let image = json!({"type": "image_url", "image_url": {"url": "https://x/red.png"}});
-    for (content, chunked) in [(json!([text]), true), (json!([text, image]), false)] {
+    let prompt_ids = json!([101, 102, 103, 104]);
+    // An ATOM multimodal prefill that hands off (ROCm/ATOM#3410) answers non-streaming with
+    // the prompt ids it expanded from the media, and a handoff carrying the media's cache seed
+    // and MRoPE offset, with which decode skips the media.
+    let handoff = json!({"do_remote_prefill": true, "do_remote_decode": false,
+        "remote_engine_id": "prefill-0", "remote_block_ids": [3, 4],
+        "cache_seed": 7, "mrope_position_delta": -2});
+    let with_handoff = json!({"choices": [], "prompt_token_ids": prompt_ids,
+        "kv_transfer_params": handoff});
+    // One that does not hand off answers `"kv_transfer_params": null`, as ATOM's prefill does;
+    // an answer without the field is refused alike.
+    let null_handoff = json!({"choices": [], "prompt_token_ids": prompt_ids,
+        "kv_transfer_params": null});
+    let absent_handoff = json!({"choices": [], "prompt_token_ids": prompt_ids});
+    for (content, prefill_answer) in [
+        (json!([text]), None),
+        (json!([text, image]), Some(with_handoff)),
+        (json!([text, image]), Some(null_handoff)),
+        (json!([text, image]), Some(absent_handoff)),
+    ] {
         let body = json!({"model": "pd-ingress-test",
             "messages": [{"role": "user", "content": content}]});
         let mut headers = HeaderMap::new();
@@ -494,7 +515,7 @@ async fn atom_pd_ingress_relays_an_image_chat_without_chunked_transfer() {
         let task = tokio::spawn(async move { router.route_inference(request, &app).await });
         let (prefill_body, prefill_reply) = prefill.next_request().await;
         let chunked_param = |body: &Value| body["kv_transfer_params"]["chunked_transfer"].clone();
-        if chunked {
+        let Some(prefill_answer) = prefill_answer else {
             assert_eq!(chunked_param(&prefill_body), json!(true));
             let (decode_body, decode_reply) = decode.next_request().await;
             assert_eq!(chunked_param(&decode_body), json!(true));
@@ -504,24 +525,42 @@ async fn atom_pd_ingress_relays_an_image_chat_without_chunked_transfer() {
             decode_reply
                 .send(axum::Json(json!({"choices": []})).into_response())
                 .unwrap();
-        } else {
-            assert_eq!(chunked_param(&prefill_body), Value::Null, "{prefill_body}");
-            // Decode waits for prefill's answer.
-            assert!(timeout(Duration::from_millis(100), decode.requests.recv())
-                .await
-                .is_err());
-            prefill_reply.send(prefill_response()).unwrap();
-            let (decode_body, decode_reply) = decode.next_request().await;
-            assert_eq!(decode_body["messages"], body["messages"]);
-            assert!(
-                decode_body["kv_transfer_params"].is_object(),
-                "{decode_body}"
+            let response = result(task).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            response.into_body().collect().await.unwrap();
+            continue;
+        };
+        assert_eq!(chunked_param(&prefill_body), Value::Null, "{prefill_body}");
+        assert_eq!(prefill_body["stream"], json!(false), "{prefill_body}");
+        // Decode waits for prefill's answer.
+        assert!(timeout(Duration::from_millis(100), decode.requests.recv())
+            .await
+            .is_err());
+        let handoff = prefill_answer["kv_transfer_params"].clone();
+        prefill_reply
+            .send(axum::Json(prefill_answer).into_response())
+            .unwrap();
+        if handoff.is_null() {
+            let response = result(task).await;
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            assert_eq!(
+                response.headers()["x-mesh-error-code"],
+                "prefill_missing_kv_transfer_params"
             );
-            assert_eq!(chunked_param(&decode_body), Value::Null, "{decode_body}");
-            decode_reply
-                .send(axum::Json(json!({"choices": []})).into_response())
-                .unwrap();
+            assert!(decode.requests.try_recv().is_err());
+            continue;
         }
+        let (decode_body, decode_reply) = decode.next_request().await;
+        assert_eq!(decode_body["messages"], body["messages"]);
+        let decode_kv = &decode_body["kv_transfer_params"];
+        for key in ["cache_seed", "mrope_position_delta", "remote_block_ids"] {
+            assert_eq!(decode_kv[key], handoff[key], "{key}: {decode_body}");
+        }
+        assert_eq!(decode_kv["prompt_token_ids"], prompt_ids, "{decode_body}");
+        assert_eq!(chunked_param(&decode_body), Value::Null, "{decode_body}");
+        decode_reply
+            .send(axum::Json(json!({"choices": []})).into_response())
+            .unwrap();
         let response = result(task).await;
         assert_eq!(response.status(), StatusCode::OK);
         response.into_body().collect().await.unwrap();

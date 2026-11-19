@@ -1174,9 +1174,10 @@ impl PDRouter {
         // P has completed its work; D's output stream must not keep P loaded.
         drop(prefill_guard);
 
+        // ATOM's prefill answers without a handoff as `"kv_transfer_params": null`.
         let mut kv_params = match prefill_body.get("kv_transfer_params").cloned() {
-            Some(v) => v,
-            None => {
+            Some(v) if !v.is_null() => v,
+            _ => {
                 error!(
                     "ATOM prefill {} request_id={} response missing kv_transfer_params",
                     prefill.url(),
