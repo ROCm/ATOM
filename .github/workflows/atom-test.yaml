@@ -1,31 +1,7 @@
-name: ATOM Test
+name: DIAGNOSTIC Kimi-K3.1 row-tail isolation
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]  # Triggers on PRs targeting `main`
-    types: [opened, synchronize, reopened, ready_for_review, labeled, closed]
-    # Do not use paths-ignore here. The required gate must be published for
-    # every PR; ci-gate below keeps the old path-ignore behavior for expensive
-    # jobs.
-  pull_request_review:
-    types: [submitted]
-  schedule:
-    # Nightly at 00:00 Beijing time (16:00 UTC)
-    - cron: '0 16 * * *'
   workflow_dispatch:
-    inputs:
-      aiter_branch:
-        description: 'ROCm/aiter branch to build inside the CI image'
-        required: false
-        default: 'main'
-        type: string
-      atom_base_image:
-        description: 'Docker image used as the ATOM test base image'
-        required: false
-        default: 'rocm/atom-dev:latest'
-        type: string
 
 concurrency:
   # Keep scheduled main runs from blocking push-triggered validation.
@@ -40,12 +16,12 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event_name != 'pull_request_review' }}
 
 env:
-  ATOM_BASE_IMAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.atom_base_image || 'rocm/atom-dev:latest' }}
+  ATOM_BASE_IMAGE: rocm/atom-dev@sha256:f3c2fcd6f2213401d275207dd6a7815ef00a9e6ff7bc610dd5e7e266cd55705e
   ATOM_PYTHON_TAG: "cp312"
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
-  # workflow_dispatch: inputs.aiter_branch; otherwise main (matches previous default-branch shallow clone)
-  AITER_GIT_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.aiter_branch || 'main' }}
+  # The diagnostic installs the pinned wheel; this unused fork-build ref is fixed.
+  AITER_GIT_REF: main
 
 jobs:
   ci-gate:
@@ -125,13 +101,20 @@ jobs:
     needs: [ci-gate, check-signal]
     name: Download aiter wheel
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
-      - name: Prefer latest main aiter wheel manifest and fallback to artifact
+      - name: Reuse the exact AITER wheel from the failed diagnostic reference
         timeout-minutes: 30
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AITER_WHEEL_DOWNLOAD_MODE: workflow_artifact
+          AITER_WORKFLOW_ARTIFACT_REPO: ROCm/ATOM
+          AITER_WORKFLOW_RUN_ID: '44525798366'
+          AITER_WORKFLOW_ARTIFACT_ID: '14529848356'
         run: bash .github/scripts/download_aiter_wheel.sh
 
       - name: Upload aiter wheel
@@ -162,7 +145,16 @@ jobs:
           current = level_map.get(event, "pr")
           allowed = {"pr": {"pr"}, "main": {"pr", "main"}, "nightly": {"pr", "main", "nightly"}}[current]
           models = json.load(open(".github/benchmark/models_accuracy.json", encoding="utf-8"))
-          filtered = [m for m in models if m.get("test_level", "nightly") in allowed]
+          filtered = [m.copy() for m in models if m["model_name"] == "Kimi-K3.1-Pro"]
+          assert len(filtered) == 1, "Diagnostic must select exactly Kimi-K3.1-Pro"
+          filtered[0]["client_command"] = (
+              "lm_eval --model local-completions --model_args "
+              "'model=${MODEL_PATH},base_url=http://localhost:8000/v1/completions,"
+              "num_concurrent=65,max_retries=3,tokenized_requests=False,trust_remote_code=True' "
+              "--tasks gsm8k --num_fewshot 3 --limit 128 --log_samples "
+              "--output_path '${OUTPUT_PATH}'"
+          )
+          filtered[0]["accuracy_timeout_minutes"] = 10
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"models_json={json.dumps(filtered)}\n")
           print(f"Event={event} level={current}: {len(filtered)}/{len(models)} models")
@@ -175,7 +167,7 @@ jobs:
 
   offline-smoke-test:
     needs: [ci-gate]
-    if: ${{ !cancelled() }}
+    if: ${{ false }} # This diagnostic measures only the selected Kimi case.
     # Not behind the approval/label gate: this runs on every PR, unlike the
     # accuracy matrix, which only opens on an approval or a ci:* label. It
     # needs `ci-gate` only so an approval run can take over the check from a
@@ -286,6 +278,7 @@ jobs:
         include: ${{ fromJson(needs.load-test-models.outputs.models_json || '[{"runner":"ubuntu-latest","model_name":"skip"}]') }}
     if: ${{ needs.ci-gate.outputs.should_run == 'true' && needs.download_aiter_wheel.result == 'success' && needs.load-test-models.result == 'success' }}
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 70
     permissions:
       actions: read
       contents: read
@@ -294,6 +287,10 @@ jobs:
       CONTAINER_NAME: atom_test_${{ strategy.job-index }}
 
     steps:
+      - name: Record diagnostic start
+        timeout-minutes: 1
+        run: echo "DIAGNOSTIC_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+
       # First, before any cleanup or image pull: fail fast on a host whose GPUs
       # cannot run the job.
       # - No rocm-smi on the host: a runner registered under this label without
@@ -341,6 +338,7 @@ jobs:
           echo "All $(printf '%s\n' "${rows}" | wc -l) GPUs on ${host} report temperature and power"
 
       - name: Prune stale Docker data on TW runners
+        timeout-minutes: 2
         if: matrix.runner == 'linux-atom-do-mi350x-8'
         run: |
           set -euo pipefail
@@ -378,6 +376,7 @@ jobs:
           df -h / "${docker_root}" || true
 
       - name: Kill all Docker containers and clean up workspace
+        timeout-minutes: 10
         if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8'
         run: |
           echo "=== Cleaning up containers on $(hostname) ==="
@@ -388,21 +387,26 @@ jobs:
           docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace rocm/atom-dev:latest bash -lc "ls -la /workspace/ && find /workspace -mindepth 1 -delete" || true
 
       - name: Show Docker containers
+        timeout-minutes: 1
         if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8'
         run: docker ps -a
 
       - name: Show ROCm memory usage
+        timeout-minutes: 1
         if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8'
         run: rocm-smi --showmemuse
 
       - name: Show ROCm GPU processes
+        timeout-minutes: 1
         if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8'
         run: rocm-smi --showpidgpus
 
       - name: Checkout ATOM repo
+        timeout-minutes: 2
         uses: actions/checkout@v6
       
       - name: Docker Login
+        timeout-minutes: 2
         if: ${{ !github.event.pull_request.head.repo.fork }}
         uses: ./.github/actions/docker-auth
         with:
@@ -477,7 +481,7 @@ jobs:
           EOF
 
       - name: Download aiter wheel
-        timeout-minutes: 30
+        timeout-minutes: 5
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           AITER_WHEEL_DOWNLOAD_MODE: workflow_artifact
@@ -486,10 +490,12 @@ jobs:
         run: bash .github/scripts/download_aiter_wheel.sh
 
       - name: Set HF token for predownload runner
+        timeout-minutes: 1
         if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8'
         run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> "$GITHUB_ENV"
 
       - name: Start CI container
+        timeout-minutes: 8
         uses: ./.github/actions/setup-gpu-container
         with:
           container-name: ${{ env.CONTAINER_NAME }}
@@ -502,30 +508,34 @@ jobs:
           network-host: "true"
 
       - name: Check shm size
+        timeout-minutes: 1
         run: |
           docker exec "$CONTAINER_NAME" df -h /dev/shm
 
       - name: GPU preflight check
         if: matrix.runner == 'linux-atom-do-mi350x-8'
-        timeout-minutes: 5
+        timeout-minutes: 3
         env:
           GPU_PREFLIGHT_ALLOCATION_MB: "8"
         run: bash .github/scripts/gpu_preflight_check.sh "$CONTAINER_NAME" docker
 
       - name: Collect GPU info (inside container)
+        timeout-minutes: 1
         id: gpu-info
         env:
           COLLECT_VERBOSE_GPU_INFO: ${{ matrix.runner == 'linux-atom-do-mi350x-8' && '1' || '0' }}
         run: bash .github/scripts/collect_gpu_info.sh "$CONTAINER_NAME" docker "${{ matrix.runner }}"
 
       - name: Install aiter from wheel
+        timeout-minutes: 3
         run: bash .github/scripts/install_aiter_wheel.sh
 
       - name: Install ATOM and dependencies
+        timeout-minutes: 4
         run: |
           docker exec "$CONTAINER_NAME" bash -lc "
             set -euo pipefail
-            pip install --timeout 60 --retries 10 -U 'lm-eval[api]'
+            pip install --timeout 60 --retries 10 'lm-eval[api]==0.4.13'
             pip install --timeout 60 --retries 10 hf_transfer
             pip install --timeout 60 --retries 10 --upgrade 'pybind11>=3.0.1'
 
@@ -542,6 +552,7 @@ jobs:
           "
 
       - name: Download models
+        if: ${{ false }} # Reuse the exact cached revision without refreshing it.
         timeout-minutes: 150
         run: |
           set -euo pipefail
@@ -605,6 +616,17 @@ jobs:
           MODEL_LOCK_POLL_INTERVAL: "30"
           MODEL_PROGRESS_INTERVAL: "60"
 
+      - name: Verify diagnostic source, model and AITER identity
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          revision="$(docker exec "$CONTAINER_NAME" cat /models/moonshotai/Kimi-K3.1-Pro/.hf-revision)"
+          test "$revision" = d9e99b0792a5e93b78ea9bea62a68167e36ddd9e
+          docker exec "$CONTAINER_NAME" sh -c 'cd /models/moonshotai/Kimi-K3.1-Pro && test -f config.json && test -f model.safetensors.index.json && { test -f .atom_download_complete || test -f .download-complete; }'
+          docker exec "$CONTAINER_NAME" python3 -c 'import importlib.metadata as m; assert m.version("amd-aiter").endswith("+gd17ee8dfe"); assert m.version("lm_eval") == "0.4.13"'
+          printf '%s\n' "diagnostic_sha=$(git rev-parse HEAD)" "production_atom_tree=$(git rev-parse HEAD:atom)" "model_revision=$revision" > diagnostic-provenance.txt
+          cat diagnostic-provenance.txt
+
       - name: Run ATOM simple inference
         # Skip simple inference; accuracy test already validates correctness
         if: false
@@ -659,9 +681,8 @@ jobs:
           fi
       
       - name: Run ATOM accuracy test
-        # The step also launches the server, so it gets at least an hour: a
-        # cold weight load off a network share alone can take 30 minutes.
-        timeout-minutes: ${{ matrix.accuracy_timeout_minutes > 60 && matrix.accuracy_timeout_minutes || 60 }}
+        # Admit a bounded launch/client window, leaving time to retain failures.
+        timeout-minutes: 32
         env:
           MODEL_EXTRA_ARGS: ${{ matrix.extraArgs }}
           CLIENT_COMMAND: ${{ matrix.client_command || '' }}
@@ -669,6 +690,11 @@ jobs:
           ATOM_DEBUG_DEVICE_MAPPING: ${{ matrix.runner == 'linux-atom-do-mi350x-8' && '1' || '0' }}
         run: |
           set -euo pipefail
+          elapsed=$(( $(date +%s) - DIAGNOSTIC_STARTED_AT ))
+          if [ "$elapsed" -gt 1080 ]; then
+            echo "Diagnostic setup exceeded its 18-minute admission budget; retaining logs without launching."
+            exit 1
+          fi
           echo ""
           echo "========== Launching ATOM server =========="
           if [ -n "${MODEL_HOST_ROOT:-}" ] && docker exec "$CONTAINER_NAME" test -d /models; then
@@ -687,7 +713,7 @@ jobs:
           # Pipe via stdin so container bash parses shell quoting in extraArgs
           # (e.g. single-quoted JSON in --default-chat-template-kwargs) naturally.
           echo ".github/scripts/atom_test.sh launch $model_path $launch_args" | \
-            docker exec \
+            timeout --signal=TERM --kill-after=15s 20m docker exec \
               -e ATOM_DEBUG_DEVICE_MAPPING="${ATOM_DEBUG_DEVICE_MAPPING}" \
               -i "$CONTAINER_NAME" bash -l
           echo ""
@@ -703,16 +729,19 @@ jobs:
           " 2>&1 | tee atom_accuracy_output.txt
       
       - name: Dump server log
+        timeout-minutes: 2
         if: always()
         run: |
           docker exec "$CONTAINER_NAME" cat /tmp/atom_server.log 2>/dev/null || true
 
       - name: Dump client log
+        timeout-minutes: 2
         if: always()
         run: |
           docker exec "$CONTAINER_NAME" cat /tmp/atom_client.log 2>/dev/null || true
 
       - name: Check accuracy test results
+        timeout-minutes: 1
         if: success()
         env:
           MODEL_NAME: ${{ matrix.model_name }}
@@ -746,6 +775,7 @@ jobs:
           fi
 
       - name: Check MTP acceptance rate
+        timeout-minutes: 1
         # Only gates models that declare mtp_accept_threshold in the catalog
         # (MTP/spec-decode entries); all other models skip this step.
         if: ${{ success() && matrix.mtp_accept_threshold != '' }}
@@ -783,6 +813,7 @@ jobs:
           echo "MTP acceptance gate PASSED."
 
       - name: Collect Test Summary
+        timeout-minutes: 1
         if: success()
         env:
           MODEL_NAME: ${{ matrix.model_name }}
@@ -801,6 +832,7 @@ jobs:
           awk '/\|Tasks\|Version\|/,/^$/ { if (NF > 0) print }' atom_accuracy_output.txt >> $GITHUB_STEP_SUMMARY
 
       - name: Upload output
+        timeout-minutes: 2
         if: always()
         uses: actions/upload-artifact@v7
         with:
@@ -808,26 +840,30 @@ jobs:
           path: atom_test_output.txt
 
       - name: Upload accuracy results
+        timeout-minutes: 3
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: accuracy-${{ matrix.model_name }}
-          path: accuracy_test_results/*.json
+          path: |
+            accuracy_test_results/
+            diagnostic-provenance.txt
           if-no-files-found: ignore
 
       - name: Clean Up
+        timeout-minutes: 3
         if: always()
         run: |
           # TODO: run a separate container for cleanup of the workspace due to permission issue to remove some pyc files under __pycache__ whose owners are root.
           # We should use non-root user to run the test to avoid this issue.
           set -x
           echo "========== Cleaning up workspace =========="
+          docker stop --time 10 "$CONTAINER_NAME" || true
+          docker rm -f "$CONTAINER_NAME" || true
           runner_label="${{ matrix.runner }}"
           if [[ "${runner_label}" == "linux-atom-do-mi350x-8" ]]; then
             docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace rocm/atom-dev:latest bash -lc "ls -la /workspace/ && find /workspace -mindepth 1 -delete" || true
           fi
-          docker stop "$CONTAINER_NAME" || true
-          docker rm "$CONTAINER_NAME" || true
           # Remove the pre-built image to free disk space on the runner
           docker rmi "rocm/atom-dev:pre-build-${{ env.GITHUB_COMMIT_SHA }}" || true
 
