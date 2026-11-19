@@ -465,3 +465,100 @@ class TestLmcacheMpNativeLayoutReadsThePageUnitImage:
             ]
         )
         torch.testing.assert_close(read, image, rtol=0, atol=0)
+
+
+class TestAStoreEntryIsAWholeImage:
+    """Under PP a unit is one entry of the stage's checkpoint store.
+
+    The same four methods answer for it, so the copy plan, the descriptor and
+    the CPU tier's views need no second path, and nothing reaches the KV rows.
+    """
+
+    ENTRIES = 5
+    ENTRY = 96  # an image rounded up to its entry
+    IMAGE = 90
+
+    def build(self, unit_bytes=ENTRY, image_bytes=IMAGE):
+        store = torch.zeros((self.ENTRIES, self.ENTRY), dtype=torch.uint8)
+        spec = SimpleNamespace(page_unit_bytes=unit_bytes, image_bytes=image_bytes)
+
+        def no_kv_rows(_name):
+            raise AssertionError("a store entry was addressed through the KV rows")
+
+        stub = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                state_checkpoint_cache=store,
+                block_size=4,
+                state_runtime=SimpleNamespace(checkpoint_spec=spec),
+            ),
+            kv_pool=SimpleNamespace(cache=SimpleNamespace(view=no_kv_rows)),
+            _page_unit_region_cache=None,
+        )
+        for name in (
+            "_page_unit_kv_cache",
+            "_page_unit_index_cache",
+            "_page_unit_regions",
+            "_page_unit_bases",
+            "_page_unit_stream_sizes",
+            "page_unit_views",
+        ):
+            method = getattr(PageUnitGeometryMixin, name)
+            setattr(stub, name, method.__get__(stub, type(stub)))
+        return stub, store
+
+    def test_a_unit_is_one_entry_and_its_view_stops_at_the_image(self):
+        stub, store = self.build()
+        base, stride = stub._page_unit_regions()
+        assert (base.tolist(), stride.tolist()) == ([store.data_ptr()], [self.ENTRY])
+        assert stub._page_unit_bases([[3, 0]]).tolist() == [
+            [store[3].data_ptr(), store[0].data_ptr()]
+        ]
+        assert stub._page_unit_stream_sizes(1).tolist() == [self.ENTRY]
+        (view,) = stub.page_unit_views([2])
+        assert view.data_ptr() == store[2].data_ptr()
+        assert view.numel() * view.element_size() == self.IMAGE
+
+    def test_an_id_past_the_store_is_refused(self):
+        stub, _ = self.build()
+        assert stub.page_unit_views([self.ENTRIES - 1])
+        with pytest.raises(IndexError, match=f"pool's {self.ENTRIES} logical"):
+            stub.page_unit_views([self.ENTRIES])
+
+    def test_a_spec_priced_for_another_unit_is_refused(self):
+        """A spec still priced for KV blocks must not address entries."""
+        stub, _ = self.build(unit_bytes=self.ENTRY * 2)
+        with pytest.raises(RuntimeError, match="checkpoint store entry"):
+            stub._page_unit_regions()
+
+    def test_an_image_round_trips_through_one_entry_and_no_other(self):
+        """The plan production cuts, run on the host: a slot's segments into
+        entry 2, then back into another slot."""
+        import ctypes
+
+        import numpy as np
+
+        from atom.model_ops.attentions.pool_layout.paged_state_copy import (
+            plan_segmented_copy,
+        )
+
+        stub, store = self.build()
+        segments = [30, 60]  # a slot's conv then SSM, as the source stream
+        slots = torch.zeros((2, self.IMAGE), dtype=torch.uint8)
+        slots[0] = torch.arange(1, self.IMAGE + 1, dtype=torch.uint8)
+        plan = plan_segmented_copy(segments, stub._page_unit_stream_sizes(1), 90)
+        for slot, forward in ((0, True), (1, False)):
+            bases = np.array(
+                [[slots[slot].data_ptr(), slots[slot].data_ptr() + segments[0]]],
+                dtype=np.int64,
+            )
+            desc = np.empty((plan.num_spans, 3), dtype=np.int64)
+            plan.write_descriptor(
+                desc, bases, stub._page_unit_bases([[2]]), forward=forward
+            )
+            for source, destination, nbytes in desc:
+                ctypes.memmove(int(destination), int(source), int(nbytes))
+
+        assert torch.equal(slots[1], slots[0])
+        assert torch.equal(store[2, : self.IMAGE], slots[0])
+        others = [row for row in range(self.ENTRIES) if row != 2]
+        assert int(store[others].sum()) == 0 and int(store[2, self.IMAGE :].sum()) == 0

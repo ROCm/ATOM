@@ -148,6 +148,28 @@ class PoolPlan:
             reserved_bytes={**self.reserved_bytes, self.paged_class: count * bytes_per},
         )
 
+    def with_entry_class(self, name: str, entries: int, entry_bytes: int) -> PoolPlan:
+        """Copy of the plan with one more class, sized by its caller.
+
+        For a class whose count comes from neither in-flight requests nor the
+        remainder: the caller takes its bytes out of the budget it plans the
+        rest with, and adds it here so the plan stays the one place every
+        entry count and every reserved byte is read from.
+        """
+        if name in self.entries:
+            raise ValueError(f"entry class {name!r} is already planned")
+        if entries < 0 or entry_bytes <= 0:
+            raise ValueError(
+                f"{name}: {entries} entries of {entry_bytes} B is not a pool"
+            )
+        return replace(
+            self,
+            entries={**self.entries, name: entries},
+            entry_bytes={**self.entry_bytes, name: entry_bytes},
+            reserved_bytes={**self.reserved_bytes, name: entries * entry_bytes},
+            entries_per_req={**self.entries_per_req, name: 0},
+        )
+
     @property
     def paged_entries(self) -> int:
         """Entries in the single PAGE class — the block count the scheduler

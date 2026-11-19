@@ -6,10 +6,12 @@
 from __future__ import annotations
 
 import logging
+import math
 from collections import OrderedDict, deque
 from collections.abc import Hashable, Iterator, Mapping
 from dataclasses import dataclass, replace
 from time import monotonic
+from typing import NamedTuple
 
 from atom.kv_transfer.disaggregation.types import StateStoreOperationId
 from atom.model_engine.block_pool import BlockPool
@@ -50,7 +52,8 @@ class PagedStateCheckpointSpec:
     # what the stages agreed on: the largest unit count any stage needs and
     # the bytes an op names (every stage's image, summed), which also splits
     # the stages' CPU state budget. 0 outside PP, where the image alone
-    # decides both. `layout_id` is then the stages' joint id.
+    # decides both. `layout_id` is then the stages' joint id. A unit in a
+    # checkpoint store is a whole image, so there the count agreed on is 1.
     pipeline_units: int = 0
     pipeline_op_bytes: int = 0
 
@@ -182,6 +185,87 @@ def checkpoint_copy_ops_per_batch(max_num_seqs: int) -> int:
     `build()` raise mid-serving.
     """
     return 2 * int(max_num_seqs or 0)
+
+
+#: A store entry starts on this boundary, so an image copy runs at the copy
+#: kernel's full access width. A Kimi-K3 image is a multiple of it already.
+CHECKPOINT_STORE_ALIGN = 256
+
+
+def checkpoint_store_entry_bytes(image_bytes: int) -> int:
+    """Bytes of the checkpoint-store entry that holds one image."""
+    if image_bytes <= 0:
+        raise ValueError(f"a {image_bytes} B checkpoint image needs no entry")
+    return -(-image_bytes // CHECKPOINT_STORE_ALIGN) * CHECKPOINT_STORE_ALIGN
+
+
+class PipelineCheckpointStage(NamedTuple):
+    """One PP stage's numbers for sizing the checkpoint store: what its paged
+    class could take (its KV budget less the STATE floor), one KV block with
+    every paged contributor (a drafter's rows on the last stage), its image,
+    and the settings it was launched with, so stages launched differently
+    refuse together instead of sizing different stores."""
+
+    budget_bytes: int
+    page_bytes: int
+    image_bytes: int
+    slots: int | None
+    kv_share: float
+
+
+def pipeline_kv_blocks(stages: list[PipelineCheckpointStage], images: int) -> int:
+    """KV blocks every stage can still back once its store holds `images`."""
+    return min(
+        (s.budget_bytes - images * checkpoint_store_entry_bytes(s.image_bytes))
+        // s.page_bytes
+        for s in stages
+    )
+
+
+def size_pipeline_checkpoint_store(
+    stages: list[PipelineCheckpointStage],
+) -> int | None:
+    """Images every PP stage's checkpoint store holds; None keeps KV blocks.
+
+    One count for all stages, since the head names one entry for an image and
+    every stage writes its part there, but a stage pays `count * its image`.
+
+    `slots` (ATOM_PP_STATE_CHECKPOINT_SLOTS) is the count when set: refused if
+    it leaves a stage no KV block, negative to keep the images in KV blocks.
+    Unset, the store may cost `kv_share` (ATOM_PP_STATE_CHECKPOINT_KV_SHARE)
+    of the KV blocks every stage could back without one, and takes as many
+    images as leave that many on every stage: a stage whose memory backs more
+    blocks than the binding one holds its images in that surplus first.
+    """
+    launched = {(s.slots, s.kv_share) for s in stages}
+    if len(launched) != 1:
+        raise ValueError(
+            "PP stages were launched with different checkpoint store settings "
+            "(ATOM_PP_STATE_CHECKPOINT_SLOTS, ATOM_PP_STATE_CHECKPOINT_KV_SHARE): "
+            f"{[(s.slots, s.kv_share) for s in stages]}"
+        )
+    slots, kv_share = launched.pop()
+    if slots is not None and slots < 0:
+        return None
+    entries = [checkpoint_store_entry_bytes(s.image_bytes) for s in stages]
+    if slots is None:
+        if not 0 <= kv_share < 1:
+            raise ValueError(
+                f"ATOM_PP_STATE_CHECKPOINT_KV_SHARE must be in [0, 1), got {kv_share}"
+            )
+        kept = max(1, math.ceil((1 - kv_share) * pipeline_kv_blocks(stages, 0)))
+        fits = [
+            (s.budget_bytes - kept * s.page_bytes) // e for s, e in zip(stages, entries)
+        ]
+        return max(0, min(fits))
+    most = [(s.budget_bytes - s.page_bytes) // e for s, e in zip(stages, entries)]
+    short = [i for i, stage_most in enumerate(most) if stage_most < slots]
+    if short:
+        raise ValueError(
+            f"ATOM_PP_STATE_CHECKPOINT_SLOTS={slots} leaves PP stages {short} "
+            f"without a KV block; the stages hold at most {max(0, min(most))} images"
+        )
+    return slots
 
 
 @dataclass(frozen=True)
