@@ -1760,7 +1760,9 @@ async fn only_chats_placed_by_their_worker_render_get_its_refusal() {
     let request = parse_for_routing(&app, "/v1/chat/completions", &chat())
         .await
         .unwrap();
-    assert_eq!(routed_tokens(&app, request).await.unwrap(), None);
+    // Not prepared by its text here: that warns of `m` for the whole process,
+    // and `wanted_tokens_fall_back_to_the_text` checks that `m` is not.
+    assert!(request.routed.is_none());
 
     let (_pool, app) = render_app(prefix_hash(), &[&worker.url]).await;
     app.chats_without_template
