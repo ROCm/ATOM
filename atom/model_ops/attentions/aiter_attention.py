@@ -666,8 +666,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         ``max_num_batched_tokens`` rows. Prefill chunks and decode steps are
         scheduled under it, warmup stays within it, and CUDA graph capture drops
         decode buckets above ``max_schedulable_decode_bs`` (which charges every
-        sequence ``mtp_k + 1`` rows). One buffer per ``name`` -- the K/V stage
-        and the index-key stage."""
+        sequence ``mtp_k + 1`` rows). One buffer per ``name``: the index-key
+        stage of an FP4 index (NVFP4 K/V is written into its pool directly)."""
         stages = getattr(self, "_quant_stages", None)
         if stages is None:
             stages = self._quant_stages = {}
@@ -795,20 +795,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
 
         k_cache, v_cache = pool.kv_views(row)
         if pool.kv_format == "nvfp4":
+            # The fused qk-norm/rope/cache write quantizes K/V straight into
+            # these planes: no staging buffer.
             module.k_scale, module.v_scale = pool.scale_views(row)
             module.impl.kv_nvfp4 = True
-            module.impl.kv_stage, module.impl.kv_stage_slots = self._quant_stage(
-                "kv", (2, self.block_size, geometry.num_kv_heads, geometry.head_dim)
-            )
-            impl = module.impl
-            if impl.index_cache is not None and impl.index_scale is None:
-                from atom.config import m3_nvfp4_stage_unsupported_reason
-
-                reason = m3_nvfp4_stage_unsupported_reason(
-                    impl.kv_stage.shape[0], impl.index_cache.shape[0]
-                )
-                if reason is not None:
-                    raise ValueError(reason)
         elif config.kv_cache_dtype == "fp8":
             module.k_scale, module.v_scale = pool.scale_views(row)
 

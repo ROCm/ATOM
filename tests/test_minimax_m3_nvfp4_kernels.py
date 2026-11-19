@@ -390,44 +390,6 @@ def test_fused_verify_topk_ties_match_scorer(seq_lens):
         assert got[q_rows - 1].sort().values.tolist() == list(range(5, 21))
 
 
-def test_step_staging_fits_a_small_fp8_index_pool():
-    """NVFP4 KV with an FP8 index: the writer checks the index pool against the KV
-    pages it is given, so it gets only the step's staging pages, not the whole
-    buffer (sized for max_num_batched_tokens), which the pool may be smaller than."""
-    import aiter
-
-    from atom.model_ops.attention_mha import _step_stage
-
-    torch.manual_seed(10)
-    T, heads, rot = 1, 16, 64
-    kv_stage = torch.zeros(4, 2, PAGE, 1, D, dtype=torch.bfloat16, device=DEV)
-    index_pool = torch.zeros(2, PAGE, D, dtype=torch.float8_e4m3fn, device=DEV)
-    qkv = torch.randn(T, (heads + 4) * D, dtype=torch.bfloat16, device=DEV)
-    w = [torch.randn(D, dtype=torch.bfloat16, device=DEV) * 0.1 for _ in range(4)]
-    cos_sin = torch.randn(4096, rot, dtype=torch.bfloat16, device=DEV)
-    pos = torch.zeros(T, dtype=torch.int64, device=DEV)
-    slots = torch.arange(T, dtype=torch.int64, device=DEV)
-
-    def write(stage):
-        q_out = torch.empty(T, heads * D, dtype=torch.bfloat16, device=DEV)
-        index_q = torch.empty(T, D, dtype=torch.bfloat16, device=DEV)
-        aiter.fused_qknorm_idxrqknorm(
-            qkv, w[0], w[1], cos_sin, pos, heads, 1, rot, 1e-6, w[2], w[3], 1,
-            slots, stage[:, 0], stage[:, 1], index_pool, PAGE, q_out, index_q,
-            slots, kv_cache_dtype="auto", index_cache_dtype="fp8",
-            k_scale=None, v_scale=None, asm_layout=False,
-        )  # fmt: skip
-
-    # AITER's host check (index_cache.numel() >= kv pages * 128 * 128) aborts the
-    # process on failure, so the whole buffer is checked by its arithmetic only.
-    assert index_pool.numel() < kv_stage.shape[0] * PAGE * D
-    step = _step_stage(kv_stage, T, page_dim=2)
-    assert step.shape[0] == 1
-    write(step)
-    torch.cuda.synchronize()
-    assert kv_stage[0, 0, 0].abs().sum() > 0  # the token's K landed in page 0
-
-
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_quant_stage_follows_the_model_dtype(dtype):
     """The fused writer stores the staged rows in qkv's dtype under "auto", so
@@ -451,30 +413,3 @@ def test_quant_stage_follows_the_model_dtype(dtype):
     # max_schedulable_decode_bs), so 64 seqs x 8 rows never reach the stage.
     assert stage.dtype == dtype and stage.shape == (3, PAGE, D)
     assert torch.equal(slots, torch.arange(384, device=slots.device))
-
-
-def test_nvfp4_stage_is_the_step_bound_not_the_seq_count():
-    """max_num_seqs 512 x 8 verify rows is 32 pages, but max_num_batched_tokens
-    1024 caps every step (and capture) at 8: a 16-page FP8 index pool fits."""
-    from types import SimpleNamespace
-
-    from atom.config import m3_nvfp4_stage_unsupported_reason
-    from atom.model_engine.model_runner import max_schedulable_decode_bs
-    from atom.model_ops.attentions.aiter_attention import AiterAttentionMetadataBuilder
-
-    builder = AiterAttentionMetadataBuilder.__new__(AiterAttentionMetadataBuilder)
-    builder.block_size = PAGE
-    builder.model_runner = SimpleNamespace(
-        config=SimpleNamespace(
-            max_num_batched_tokens=1024,
-            max_num_seqs=512,
-            speculative_config=SimpleNamespace(num_speculative_tokens=7),
-            torch_dtype=torch.bfloat16,
-        )
-    )
-    stage, _ = builder._quant_stage("kv", (2, PAGE, 1, D))
-    assert stage.shape[0] == 8
-    # The largest captured decode bucket fits the stage.
-    assert max_schedulable_decode_bs(512, 1024, 8) * 8 <= stage.shape[0] * PAGE
-    assert m3_nvfp4_stage_unsupported_reason(stage.shape[0], 16) is None
-    assert m3_nvfp4_stage_unsupported_reason(stage.shape[0], 7) is not None

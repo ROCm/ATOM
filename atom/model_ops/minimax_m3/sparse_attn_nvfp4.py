@@ -14,9 +14,11 @@ per-row (request, causal length) arguments.
 gfx950 runs the Gluon kernel of ``nvfp4_kernels.decode`` over the top-k ids.
 gfx1250 runs aiter's FlyDSL paged decode, the operator the FP8 sparse path
 runs there, with its NVFP4 K/V: like the FP8 path, every row (and kv head) is
-a length-1 sequence with its own compacted table of selected pages
-(``nvfp4_page_table``), and the plan's partitions merge in the kernel or the
-reducer. aiter decides which shapes it serves.
+a length-1 sequence with its own compacted table of selected pages, and the
+plan's partitions merge in the kernel or the reducer. The top-k selectors emit
+that table in the launch that selects (``emit_pages_per_block`` =
+``NVFP4_PAGES_PER_BLOCK``); ``nvfp4_page_table`` builds it for the selectors
+that do not. aiter decides which shapes it serves.
 """
 
 import functools
@@ -37,6 +39,12 @@ def _gluon_kernel() -> bool:
     CDNA4 MFMA and buffer loads); gfx1250 aiter's FlyDSL paged decode over
     ``nvfp4_page_table``."""
     return get_gfx_runtime() == "gfx950"
+
+
+def reads_page_table() -> bool:
+    """Whether the attention reads a page-128 table (gfx1250's paged decode),
+    which the selectors then emit, or only the top-k ids (gfx950's Gluon kernel)."""
+    return not _gluon_kernel()
 
 
 def check_nvfp4_sparse_attention(q, k_payload, k_scale, v_payload, v_scale, topk_idx):
@@ -234,10 +242,11 @@ def nvfp4_sparse_attention(
 ) -> torch.Tensor:
     """O ``[rows, num_heads, D]`` of every row over its top-k blocks.
 
-    ``page_table``: gfx1250, ``nvfp4_page_table`` of these arguments when the
-    caller already built it (it is shared by the sparse layers of a step);
-    built here otherwise. ``plan_step_owner`` / ``plan_cache_owner``: as for
-    the FP8 sparse path's ``sparse_pa_per_row``.
+    ``page_table``: gfx1250, ``nvfp4_page_table`` of these arguments (or the
+    selector's NVFP4 emission) when the caller already built it (it is shared
+    by the sparse layers of a step); built here otherwise.
+    ``plan_step_owner`` / ``plan_cache_owner``: as for the FP8 sparse path's
+    ``sparse_pa_per_row``.
     """
     if _gluon_kernel():
         from atom.model_ops.minimax_m3.nvfp4_kernels.decode import flash_decode_nvfp4

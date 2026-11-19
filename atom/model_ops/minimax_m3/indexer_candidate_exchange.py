@@ -19,6 +19,7 @@ import triton.language as tl
 
 from atom.model_ops.minimax_m3.index_topk import (
     DECODE_TOPK_NUM_WARPS,
+    PAGES_PER_SPARSE_BLOCK,
     _alloc_emit,
     _emit_sparse_block_table_row,
     _pack_score_key,
@@ -253,7 +254,14 @@ def local_candidate_keys(
 
 
 def merge_candidate_keys(
-    keys, block_table, seq_lens, topk, init_blocks, local_blocks, max_query_len
+    keys,
+    block_table,
+    seq_lens,
+    topk,
+    init_blocks,
+    local_blocks,
+    max_query_len,
+    pages_per_block=PAGES_PER_SPARSE_BLOCK,
 ):
     """Select the global top-k from gathered candidates for this rank's head.
 
@@ -261,6 +269,10 @@ def merge_candidate_keys(
     after the exchange, either already flattened to [tokens, world*topk] or in
     the [world, tokens, topk] layout the all-to-all writes. The 3D form is read
     with a stride rather than copied.
+
+    The emitted table is the page-16 one, or with ``pages_per_block`` =
+    ``NVFP4_PAGES_PER_BLOCK`` the NVFP4 pool's page-128 one
+    (``sparse_attn_nvfp4.nvfp4_page_table``).
     """
     if keys.dtype != torch.int64 or keys.ndim not in (2, 3):
         raise ValueError(
@@ -296,7 +308,9 @@ def merge_candidate_keys(
     ):
         raise ValueError("merge inputs must share a GPU")
     indices = torch.empty((1, tokens, topk), dtype=torch.int32, device=keys.device)
-    output, _ = _alloc_emit(tokens, 1, topk, block_table, True, keys.device)
+    output, _ = _alloc_emit(
+        tokens, 1, topk, block_table, True, keys.device, pages_per_block
+    )
     if tokens:
         _merge_topk[(tokens,)](
             keys,
@@ -312,7 +326,7 @@ def merge_candidate_keys(
             INIT_BLOCKS=init_blocks,
             LOCAL_KEEP=local_blocks,
             NUM_KV_HEADS=1,
-            PAGES_PER_BLOCK=8,
+            PAGES_PER_BLOCK=pages_per_block,
             KEYS_PER_SHARD=per_shard,
             SRC_STRIDE=src_stride,
             ROW_STRIDE=row_stride,
