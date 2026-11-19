@@ -500,7 +500,8 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         ]
 
     def _decode_image_is_conv_and_ssm(self) -> bool:
-        # The PLE windows count: `_build_decode_images` rebuilds them as well.
+        # `_build_decode_images` rebuilds the PLE windows too, so they are not
+        # another plane.
         return len(self._checkpoint_plane_shapes()) == 2 + len(self._ple_planes)
 
     def _build_decode_images(self, ops) -> None:
