@@ -393,6 +393,11 @@ def stage_score_grouped(c):
     early = c.get("early", I32(0) != I32(0))
     ncta = early.select(I32(CTAS - NCROW), I32(CTAS))
     vb = early.select((b >= CROW0).select(b - NCROW, b), b)
+    # the task index's CTA order starts past the iquant CTAs (c["niq"]: they start scoring last, past their iquant): the
+    # nt % ncta extra tasks go to the CTAs that score earliest, the iquant CTAs get the fewer (the same tasks, the same
+    # scores; layer 20 at 133K: CTAs 0..5's extra task was the SCORE wait's last arrival)
+    if fx.const_expr("niq" in c):
+        vb = (vb - I32(c["niq"]) + ncta) % ncta
     busy = early & (b >= CROW0) & (b < CROW0 + NCROW)
     nme = busy.select(I32(0), fx.max((nt - vb + (ncta - 1)) // ncta, I32(0)))
     newc = cmax - 16          # (B) tasks reaching a column >= this read keys the compressor rows write this step
