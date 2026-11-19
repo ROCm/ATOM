@@ -777,7 +777,7 @@ class BlockManager:
         """`num_pool_blocks` of each length in `seq_lens`, in one numpy pass."""
         lens = np.asarray(seq_lens, dtype=np.int64)
         if self.dcp_world_size > 1:
-            from atom.model_ops.dcp_ops import get_dcp_local_seq_lens
+            from atom.distributed.dcp_layout import get_dcp_local_seq_lens
 
             lens = get_dcp_local_seq_lens(
                 lens,

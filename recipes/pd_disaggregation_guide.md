@@ -59,11 +59,9 @@ one request may exceed the byte budget, so long prompts are not starved. The
 decode reserve covers every request D holds, running or parked for its KV,
 including one past its first forward, so it holds while any request runs on D;
 only an idle D admits below it. Falling below it defers admission only and never
-preempts. Both limits check Mooncake P/D receives only: a request parked for a
-tier or replay KV load through an offload connector is not checked, but the
-reserve keeps room for its decode. `pd_admission` needs D at PP=1, DCP=1, PCP=1,
-SP=1 and a single paged KV pool; without it the reserve still applies, at the
-first decode. Metrics are listed under `atom:pd_admission_*`
+preempts. Both limits check Mooncake P/D receives only. `pd_admission` needs D
+at PP=1, DCP=1, PCP=1, SP=1 and a single paged KV pool; without it the reserve
+still applies, at the first decode. Metrics are listed under `atom:pd_admission_*`
 in the [metrics guide](../docs/metrics_guide.md#scheduler).
 
 ## Prerequisites
