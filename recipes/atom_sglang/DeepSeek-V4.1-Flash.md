@@ -152,6 +152,30 @@ Measured (TP4 MI308X, DSpark block 5 + radix, recipe launch, 2026-11-18): radix-
 109.7 ms native ATOM; GSM8K 1319 prompts at concurrency 32 wall time 155.1 s pinned vs 153.9 s unpinned (-0.6%
 throughput) and 160.2 s native.
 
+## Decode step tail: greedy token pick and step-metadata copies
+
+Between two decode graphs the plugin now does two things the way native ATOM does, for DeepSeek-V4.1 only:
+
+- An all-greedy batch (every request at temperature 0, no logprobs, no sampling mask, `SGLANG_USE_AITER` unset) gets
+  its tokens from aiter `topk_select(k=1, tie="low")`, native's greedy sampler, instead of SGLang's `torch.argmax` over
+  the full fp32 vocabulary (on MI308X ~47 / 86 / 198 us for 1 / 2 / 4 rows against ~13 us). Same lowest-id tie rule,
+  ids returned as int64; SGLang's NaN check, logit preprocessing and TP token sync run around it, and every other
+  sampler call is SGLang's own. It is installed only on SGLang 0.5.22 with the expected `Sampler.forward` signature
+  (otherwise one log line and SGLang's path). DSpark verify and draft pick their tokens elsewhere, so with DSpark it
+  only picks each request's first token after prefill. Kill switch: `ATOM_SGLANG_V41_FAST_GREEDY=0`.
+- Step metadata goes to the GPU on native's packed transport (one pinned arena, one copy and one scatter per phase
+  group) instead of one copy per member: the 13 small copies of a decode step without speculation become 2. Every
+  destination receives the same bytes. Kill switch: `ATOM_SGLANG_V41_PACKED_H2D=0`.
+
+Measured on MI308X TP4 on 3102 at 483d8feae (aiter main 5385051a5 with #7361's check deferred and gfx942 tuned
+configs; 3 fresh sessions per arm in alternating order, paired 95% CI, 2026-11-19), not re-measured on 85999b8b4.
+Without speculation and radix (`--context-length 67584`), median ITL plugin minus native ATOM on 4096-token prompts
+goes from +57 us to -1 us [-17, +15] at concurrency 1 and from +144 us to +14 us [-5, +34] at 2; at 63488 tokens
++106 / +124 us remain, from aiter's indexer top-k on gfx942, not the plugin. With the launch above (DSpark K=5 + radix,
+forced accept length 3.47) the round time is unchanged within session noise (4096x1 -32 us [-485, +422], 4096x32
+-219 us [-827, +388]). Gates on the launch above: 3-shot GSM8K (1319 prompts, c32) acceptance 49.69% vs 49.45% before
+(native 49.43%), lm_eval 0.9212 vs 0.9265 before (McNemar p = 0.41), verify and draft graphs in every round.
+
 ## Prefill admission (`--min-free-slots-delay`, optional)
 
 On the two GSM8K workloads at concurrency 32 below, the default launch is within 4% of native ATOM's default scheduling
