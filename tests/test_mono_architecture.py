@@ -85,12 +85,14 @@ def test_gfx1250_wave_sum_uses_only_wave32_offsets(monkeypatch):
     assert seen == [(offset, GFX1250) for offset in (16, 8, 4, 2, 1)]
 
 
-def test_gfx1250_cross_row_reduction_avoids_permlane(monkeypatch):
+def test_gfx1250_swaps_rows_with_permlane16_and_shuffles_within_a_row(monkeypatch):
+    # the cross-row (offset 16) exchange is v_permlane16_swap; in-row offsets shuffle
+    assert GFX1250.native_permlane_exchange
     ops = _device_ops()
     value, partner = object(), object()
 
     def no_permlane(*_args):
-        pytest.fail("wave32 reduction must not emit the gfx950 permlane exchange")
+        pytest.fail("an in-row offset must not take the permlane exchange")
 
     monkeypatch.setattr(ops, "permlane_swap", no_permlane)
     monkeypatch.setattr(
@@ -98,12 +100,12 @@ def test_gfx1250_cross_row_reduction_avoids_permlane(monkeypatch):
         "xshfl",
         lambda got, offset, architecture: (
             partner
-            if (got, offset, architecture) == (value, 16, GFX1250)
+            if (got, offset, architecture) == (value, 8, GFX1250)
             else pytest.fail("unexpected shuffle")
         ),
     )
 
-    assert ops.xred(value, 16, lambda lhs, rhs: (lhs, rhs), GFX1250) == (
+    assert ops.xred(value, 8, lambda lhs, rhs: (lhs, rhs), GFX1250) == (
         value,
         partner,
     )
