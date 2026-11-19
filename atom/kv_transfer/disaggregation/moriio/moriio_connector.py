@@ -1975,6 +1975,9 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
         # Source-block ownership -- see `MooncakeConnectorScheduler` for why
         # the claim is taken in `request_finished` rather than at alloc.
         self._awaiting_send: set[str] = set()
+        # Consumer: each producer rank's handshake listener, once a request
+        # that will not move its KV was reported to it (`_release_unmoved`).
+        self._release_sockets: dict[str, zmq.Socket] = {}
 
         # Bidirectional transfer_id <-> request_id mapping
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
@@ -2101,6 +2104,54 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
             transfer_id = self.request_id_to_transfer_id.pop(seq.id, None)
             if transfer_id is not None:
                 self.transfer_id_to_request_id.pop(transfer_id, None)
+            params = getattr(seq, "kv_transfer_params", None) or {}
+            # Still set: it finished before `update_state_after_alloc` queued
+            # its read or push (aborted or rejected while it waited).
+            if params.get("do_remote_prefill"):
+                params["do_remote_prefill"] = False
+                self._release_unmoved(params)
+
+    def _release_unmoved(self, params: dict[str, Any]) -> None:
+        """Tell each producer rank holding a request's KV that this consumer
+        will neither read it nor ask for its push.
+
+        The producer's leg of the request is over, so no abort reaches it, and
+        it keeps the source blocks until it gets the done-notify a finished
+        read sends. No read or push of them was issued, so the scheduler sends
+        that notify now: the request has left the queues whose metadata would
+        reach a worker.
+        """
+        transfer_id = params.get("transfer_id")
+        meta = ConnectorMetadata._build_req_meta(None, [], params)
+        if None in (transfer_id, meta.remote_host, meta.remote_handshake_port):
+            return
+        tp_size = int(meta.tp_size or 0) or self.tp_size
+        for tp_rank in range(tp_size):
+            port = int(meta.remote_handshake_port) + get_port_offset(
+                int(meta.remote_dp_rank or 0), tp_rank, tp_size
+            )
+            addr = make_zmq_path("tcp", meta.remote_host, port)
+            try:
+                sock = self._release_sockets.get(addr)
+                if sock is None:
+                    sock = zmq.Context.instance().socket(zmq.DEALER)
+                    sock.setsockopt(zmq.LINGER, 0)
+                    # Queued, never blocking the step loop, while a producer
+                    # rank is unreachable.
+                    sock.setsockopt(zmq.SNDHWM, 0)
+                    sock.connect(addr)
+                    self._release_sockets[addr] = sock
+                sock.send_multipart(
+                    [MoRIIOConstants.POP_DONE_RECV, str(transfer_id).encode()]
+                )
+            except zmq.ZMQError:
+                # The claim then waits as it did before this notice.
+                logger.exception(
+                    "transfer %s: could not tell producer rank %s that its KV "
+                    "will not be moved",
+                    transfer_id,
+                    addr,
+                )
 
     def should_defer_free(self, seq: Sequence) -> bool:
         return str(seq.id) in self._awaiting_send
