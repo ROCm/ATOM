@@ -531,7 +531,6 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
 # [MC 2/4] Install dependencies (system packages + RDMA + submodules). The Go
 # that dependencies.sh installs is removed here and replaced in [MC 3/4] by the
 # toolchain the etcd wrapper's go.mod declares (MOONCAKE_GO_VERSION).
-ENV PATH="/usr/local/go/bin:${PATH}"
 RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
         echo "========== [MC 2/4] Install Mooncake dependencies =========="; \
         apt-get update && apt-get install -y --no-install-recommends \
@@ -573,16 +572,18 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
 # HIP hipify copies tests/*.cpp into the build tree but not headers such as
 # rdma_test_peers.h, so BUILD_UNIT_TESTS=ON fails. Upstream ROCm CI also sets
 # BUILD_UNIT_TESTS=OFF; examples are unused in this image.
-# Go builds the etcd wrapper (USE_ETCD=ON). GOTOOLCHAIN=local stops Go from
+# Go builds the etcd wrapper (USE_ETCD=ON), a shared library; nothing runs Go
+# at runtime, so the toolchain lives only in this RUN: it is installed here,
+# put on PATH here (CMake calls `go` by name), and removed at the end together
+# with the module and build caches it fills. GOTOOLCHAIN=local stops Go from
 # downloading another toolchain; keep MOONCAKE_GO_VERSION equal to
 # mooncake-common/etcd/go.mod's `toolchain` line by hand when bumping
-# MOONCAKE_COMMIT. Only this RUN sets it: the image keeps Go's default. The
-# toolchain stays installed, and the module and build caches it fills here are
-# removed in this same RUN, so an in-container rebuild only re-downloads modules.
+# MOONCAKE_COMMIT.
 RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
         { wget -q -O /tmp/go.tar.gz "https://go.dev/dl/go${MOONCAKE_GO_VERSION}.linux-amd64.tar.gz" \
           && echo "${MOONCAKE_GO_SHA256}  /tmp/go.tar.gz" | sha256sum -c - \
           && tar -C /usr/local -xzf /tmp/go.tar.gz && rm -f /tmp/go.tar.gz; } || exit 1; \
+        export PATH="/usr/local/go/bin:${PATH}"; \
         export GOTOOLCHAIN=local; \
         MC_WITH_STORE=OFF; \
         if [ "${INSTALL_MOONCAKE_STORE}" = "1" ]; then MC_WITH_STORE=ON; fi; \
@@ -630,7 +631,7 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
            fi \
         && echo "--- Clean up build artifacts ---" \
         && rm -rf /app/mooncake/build /app/mooncake/.git \
-                  /root/go /root/.cache/go-build; \
+                  /usr/local/go /root/go /root/.cache/go-build; \
     fi
 
 # Default to ibv_reg_mr; set MOONCAKE_DISABLE_HIP_DMABUF=0 at runtime to opt in
