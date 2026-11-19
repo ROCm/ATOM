@@ -7,13 +7,15 @@ Three backends combine the per-rank partial attention outputs into the global
 softmax, selected by ``DCPConfig.comm_backend``:
 
   * ``ag_rs``   -- AllGather LSE -> correct local output -> ReduceScatter (2 calls)
-  * ``a2a``     -- one all-to-all carrying output+LSE, combine locally (1 call)
+  * ``a2a``     -- packed output+LSE in one all-to-all, or head-major output
+                   and fp32 LSE/scales in separate all-to-alls; combine locally
   * ``mailbox`` -- small decode merges in aiter's FlyDSL mailbox combine, which
     stores straight into the owners' IPC-mapped memory (no collective call);
     everything else as ``a2a``
 
-They are mathematically equivalent but not bitwise identical; see the A2A
-section below for why one collective can replace two.
+Without payload quantization, the backends implement the same LSE-weighted
+sum with floating-point differences. Optional FP8 A2A payloads quantize the
+partials before the merge and introduce additional rounding error.
 
 Also here: the sparse indexer's DCP support -- the decode candidate exchange
 (fused into one aiter op) and the sparse-prefill owned-slot filter.
@@ -349,21 +351,22 @@ def cp_lse_ag_out_rs(cp_attn_out, cp_attn_lse, cp_group, ctx=None):
 # A2A sidesteps that by not asking the network to reduce at all. The all-to-all is
 # a pure permutation: it relocates data so that every partial for a given head
 # lands on the one rank that owns that head. The weighting and the sum then happen
-# in a local kernel, where arbitrary math is allowed. One collective instead of two.
+# in a local kernel, where arbitrary math is allowed. Packed A2A sends output
+# and LSE together in one collective. Head-major A2A instead sends the already
+# contiguous output and the fp32 LSE in separate collectives; FP8 payloads also
+# carry a per-(token, head) scale beside the LSE.
 #
-# Both backends compute the same thing::
+# With unquantized partials, both layouts implement the same weighted sum::
 #
 #     global_lse[b,h] = log sum_r exp(lse_r[b,h])
 #     out[b,h]        = sum_r exp(lse_r[b,h] - global_lse[b,h]) * o_r[b,h]
 #
-# They differ only in where the multiply and the sum happen, so results agree to
-# floating-point noise but are NOT bitwise identical (different summation order).
+# Floating-point accumulation order can change the result. FP8 payload mode
+# additionally quantizes each partial before applying the merge weights.
 #
-# Bytes are roughly the same as AG+RS: ReduceScatter and All-to-All both carry
-# scatter semantics, so each moves ~(N-1)/N of the full tensor. What A2A saves is
-# one collective's launch and synchronization -- which is worth measuring rather
-# than assuming, because the profiling in the DCP notes shows a large part of the
-# current ReduceScatter cost scales with row count rather than with bytes.
+# Packed A2A saves one collective launch and synchronization compared with AG+RS.
+# Head-major A2A uses two collectives but avoids packing the output. The optional
+# FP8 payload reduces output bytes at the cost of quantization and rounding.
 
 
 def _lse_pack_slots(dtype: torch.dtype) -> int:
@@ -1174,11 +1177,11 @@ def dcp_lse_merge(
 ):
     """Reconstruct the global softmax from the per-rank partials.
 
-    Dispatches to one of the backends above. All compute the same weighted
-    sum over KV shards and leave this rank owning the same head slice; they
-    differ only in how many collectives it takes (see the A2A section above for
-    why one all-to-all can replace AllGather-LSE + ReduceScatter). Equivalent
-    math, not bitwise identical.
+    Dispatches to one of the backends above, preserving this rank's head slice.
+    Unquantized partials use the same LSE-weighted sum with floating-point
+    differences. FP8 A2A payloads introduce additional rounding before the merge.
+    Packed A2A uses one collective; head-major A2A exchanges output and fp32
+    LSE/scales separately, as described in ``cp_lse_a2a``.
 
     ``owned_counts`` is the optional rank-local sparse-KV count per row. Empty
     prefill rows contain a dummy cache slot to keep persistent metadata valid;
@@ -1220,7 +1223,7 @@ def dcp_lse_merge(
     if head_major:
         cp_attn_out = cp_attn_out.transpose(0, 1)
     if owned_counts is not None:
-        # AG+RS has no existing kernel before its LSE AllGather. The default
+        # AG+RS needs an explicit LSE mask before its AllGather.
         # Packed A2A folds the mask into its pack; head-major A2A masks its LSE.
         cp_attn_lse = mask_empty_dcp_lse(cp_attn_lse, owned_counts)
     return cp_lse_ag_out_rs(cp_attn_out, cp_attn_lse, cp_group, ctx=ctx)

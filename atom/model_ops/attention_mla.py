@@ -290,17 +290,18 @@ def mla_min_query_heads(kv_cache_dtype: str, block_width: int) -> int:
 
 
 def mla_kernel_num_heads(num_heads: int) -> int:
-    """Round a query-head count up to a width ``mla_decode_fwd`` will dispatch.
+    """Round a query-head count up to the minimum kernel-head granularity.
 
-    aiter accepts nhead 16, and above that only multiples of 16 up to 128 (it
-    folds those onto the 16-head kernel); any other value aborts the dispatch.
+    This does not establish support for the rounded width: DCP callers apply
+    their route-specific dispatch tables and limits below.
     """
     if num_heads <= _MLA_MIN_HEADS:
         return _MLA_MIN_HEADS
     return -(-num_heads // _MLA_MIN_HEADS) * _MLA_MIN_HEADS
 
 
-# Gathered widths aiter serves with a dedicated kernel.
+# Shared width tuple; persistent decode also admits native 96 directly, and
+# persistent sparse prefill selects it from its own table below.
 _MLA_DCP_KERNEL_WIDTHS = (16, 32, 64, 128)
 
 # Widest gathered query aiter has any MLA decode dispatch for; past it
@@ -408,10 +409,9 @@ def mla_dcp_sparse_prefill_num_heads(
 ) -> int:
     """Width to pad the GATHERED query heads to for a DCP sparse prefill.
 
-    Sparse prefill all-gathers Q on the head dim too, so what dispatches is
-    ``num_heads * dcp_world_size``, not the per-rank count -- needs its own
-    table (``_MLA_DCP_SPARSE_PREFILL_WIDTHS``) since decode's widths don't
-    compute correctly here.
+    Sparse prefill uses the group-wide query heads, gathered or already
+    replicated: ``num_heads * dcp_world_size``, not the per-rank count. It needs
+    its own tables since decode's widths do not compute correctly here.
 
     ``persistent`` must come from ``mla_dcp_sparse_prefill_is_persistent``,
     not decode's predicate: they agree today, but this table is kept
@@ -1565,8 +1565,9 @@ class MLAAttention(nn.Module):
         it the prefill gather fuses rank-to-token reordering with head
         padding, so attention receives its dispatch width directly.
         """
-        # The indexer may still be exchanging the selection on its own stream;
-        # joined before the query gather, the next DCP collective.
+        # Join the indexer exchange before attention reads sparse_kv_indices,
+        # dcp_sparse_kv_indptr and dcp_owned_counts. This also precedes the query
+        # gather when QREP is off.
         if attn_metadata.index_exchange_done is not None:
             attn_metadata.index_exchange_done.wait()
             attn_metadata.index_exchange_done = None
