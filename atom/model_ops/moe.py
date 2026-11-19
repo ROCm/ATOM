@@ -931,10 +931,11 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
     """AITER IQ2R-v2 experts in the ``glm53-packed-v2`` (512-entry codebooks)
     or ``glm53-packed-v3`` (1,024-entry) layout.
 
-    The layouts cover GLM-5.3's 256 routed experts at TP4/TP8; the shared
-    expert stays block-FP8 and runs as an ordinary MLP outside the MoE. The
-    checkpoint holds full layers; each rank slices its share of the
-    intermediate dimension as it loads.
+    The layouts cover GLM-5.3's 256 routed experts at TP4/TP8. The shared
+    expert is stored block-FP8 and loaded as an ordinary MLP outside the MoE;
+    for small batches (decode) it runs inside the IQ2R launches instead, as
+    MXFP8 (``attach_shared_expert``). The checkpoint holds full layers; each
+    rank slices its share of the intermediate dimension as it loads.
     """
 
     def __init__(
@@ -1111,6 +1112,27 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
     ) -> FusedMoEQuantConfig | None:
         return None
 
+    @staticmethod
+    def fused_shared_tokens() -> int:
+        """Largest batch whose shared expert runs inside the IQ2R launches."""
+        from aiter.iq2r_glm53 import FUSED_SHARED_TOKENS
+
+        return FUSED_SHARED_TOKENS
+
+    def attach_shared_expert(
+        self,
+        layer: torch.nn.Module,
+        gate: torch.Tensor,
+        up: torch.Tensor,
+        down: torch.Tensor,
+    ) -> None:
+        """Pack this rank's shared expert (``gate``/``up`` [I, H], ``down`` [H, I])
+        to MXFP8 for the IQ2R launches; :meth:`apply` then adds it for batches
+        of at most :meth:`fused_shared_tokens` tokens."""
+        from aiter.iq2r_glm53 import iq2r_glm53_pack_shared
+
+        layer.iq2r_shared = iq2r_glm53_pack_shared(gate, up, down)
+
     @mark_trace(prefix="iq2r_moe", torch_compile=False)
     def apply(
         self,
@@ -1135,6 +1157,9 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
 
         from aiter.iq2r_glm53 import iq2r_glm53_moe_out
 
+        shared = getattr(layer, "iq2r_shared", None)
+        if x.shape[0] > self.fused_shared_tokens():
+            shared = None
         output = torch.empty_like(x)
         iq2r_glm53_moe_out(
             x,
@@ -1146,6 +1171,7 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
             topk_ids.to(torch.int32).contiguous(),
             output,
             self._glm53_workspace(x.device),
+            shared=shared,
         )
         return output
 
