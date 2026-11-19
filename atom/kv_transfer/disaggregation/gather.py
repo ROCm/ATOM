@@ -10,6 +10,8 @@ from dataclasses import dataclass
 
 import torch
 
+# A segment gather passes each segment's bounds to its kernel as constants; four fit
+# the widest named-run page, NVFP4 K/V (K data, K scales, V data, V scales).
 MAX_SEGMENTS = 4
 
 
@@ -63,7 +65,10 @@ class GatherLayout:
 
     def _check_segments(self) -> None:
         if len(self.segments) > MAX_SEGMENTS:
-            raise ValueError(f"At most {MAX_SEGMENTS} gather segments")
+            raise ValueError(
+                f"Gather segments {self.segments}: the segment kernel takes at "
+                f"most {MAX_SEGMENTS}"
+            )
         if (
             self.source_bytes % 4
             or sum(size for _, size in self.segments) != self.unit_bytes
@@ -76,7 +81,10 @@ class GatherLayout:
                 for offset, size in self.segments
             )
         ):
-            raise ValueError("Gather segments must tile the unit in 4-byte words")
+            raise ValueError(
+                f"Gather segments {self.segments} must tile a {self.unit_bytes} B "
+                f"unit in 4-byte words of a {self.source_bytes} B source unit"
+            )
 
     @classmethod
     def from_slices(cls, source_bytes: int, unit_bytes: int, slices) -> GatherLayout:

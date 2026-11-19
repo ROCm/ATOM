@@ -187,6 +187,13 @@ def test_named_widths_must_agree_on_both_ends():
         )
 
 
+def test_at_most_four_runs_name_their_widths():
+    # Each named run is one segment of the PAGE gather, which takes four.
+    runs = (5, 4, 8, 4, 8, 4, 4)
+    with pytest.raises(ValueError, match=r"kv: head runs \(5, 4, 8, 4, 8, 4, 4\)"):
+        consumer_head_slices(4 * 28, 28, runs, (5, 1, *runs[2:]), 0, 4, "kv")
+
+
 def test_a_unit_that_is_not_per_head_moves_whole():
     assert consumer_head_slices(18432, 18432, None, None, 3, 4, "index").tolist() == [
         [0, 0, 18432]

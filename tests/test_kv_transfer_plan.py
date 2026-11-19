@@ -145,6 +145,38 @@ def test_named_run_widths_gather_into_one_target_page(rank):
     assert not destination[list(set(range(5)) - set(dst_ids))].any()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton gather kernels")
+@pytest.mark.parametrize("rank", range(4))
+@pytest.mark.parametrize(
+    "widths",
+    [None, (64, 16), (8192, 1024, 8192, 1024)],
+    ids=["equal-runs", "two-named-runs", "nvfp4"],
+)
+def test_gather_kernels_match_the_host_reference(widths, rank):
+    # A TP1 page of four heads cut for each TP4 rank, as equal runs or named widths.
+    heads = 4
+    if widths is None:
+        src_runs, dst_runs, src_bytes = (8, heads), (8, 1), 8 * heads * 128
+    else:
+        src_runs = (len(widths), heads, *widths)
+        dst_runs, src_bytes = (len(widths), 1, *widths), heads * sum(widths)
+    cuts = consumer_head_slices(
+        src_bytes, src_bytes // heads, src_runs, dst_runs, rank, 4, "page"
+    )
+    layout = GatherLayout.from_slices(src_bytes, src_bytes // heads, cuts)
+    assert len(layout.segments) == (0 if widths is None else len(widths))
+    generator = torch.Generator().manual_seed(rank)
+    source = torch.randint(
+        0, 256, (6 * src_bytes,), dtype=torch.uint8, generator=generator
+    )
+    indices = torch.tensor([4, 0, 5, 2])
+    want = torch.empty(indices.numel() * layout.unit_bytes, dtype=torch.uint8)
+    reference_gather_units(source, indices, want, layout)
+    out = torch.empty_like(want, device="cuda")
+    gather_units(source.cuda(), indices.cuda(), out, layout)
+    assert torch.equal(out.cpu(), want)
+
+
 def test_tp_replicated_units_can_also_be_partitioned_by_dcp():
     # A replicated latent/auxiliary plane has no per-head TP axis, so DCP
     # alone selects its tokens: the topology names no TP size.
