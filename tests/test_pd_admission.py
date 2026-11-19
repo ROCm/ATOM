@@ -1221,6 +1221,22 @@ def test_a_deferred_receive_keeps_no_dp_rank_off_decode(build, options, chunked)
     assert sched.total_preemptions == 0
 
 
+@RESERVE_OWNERS
+def test_a_local_prefill_admitted_between_receives_counts_toward_the_reserve(
+    build, options
+):
+    # One Phase 2 pass over [receive A, local prefill L, receive B]: L runs
+    # from mid-pass, so B must leave A, L and itself room to grow.
+    sched, request = build(options=options, num_kvcache_blocks=8)
+    a, local, b = request(), request(), request()
+    local.kv_transfer_params = None
+    sched.extend([a, local, b])
+    batch, _ = sched.schedule()
+    assert set(batch.connector_meta_output.reqs_to_recv) == {a.id}
+    assert local.id in batch.req_ids
+    assert not b.block_table
+
+
 def _record_fits(sched, monkeypatch):
     """The probe each `can_allocate_memoized` call gets: None is main's fit."""
     fits, fit = [], sched.block_manager.can_allocate_memoized

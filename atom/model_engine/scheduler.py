@@ -670,25 +670,29 @@ class ScheduledBatchOutput:
 
 class _HeldGrowth:
     """The rows a P/D receive leaves decode room for, and their growth in blocks,
-    summed once a scheduling pass; Phase 2 adds each receive it parks."""
+    summed once a scheduling pass; Phase 2 adds each row it parks or runs."""
 
-    __slots__ = ("_scheduler", "blocks", "rows")
+    __slots__ = ("_ids", "_scheduler", "blocks", "rows")
 
     def __init__(self, scheduler: Scheduler):
         self._scheduler = scheduler
         self.rows: list[Sequence] | None = None
+        self._ids: set[int] = set()
         self.blocks = 0
 
     def get(self) -> tuple[list[Sequence], int]:
         if self.rows is None:
             scheduler = self._scheduler
             self.rows = list(scheduler._decode_rows())
+            self._ids = {s.id for s in self.rows}
             self.blocks = scheduler._decode_reserve().held_need(self.rows)
         return self.rows, self.blocks
 
     def add(self, seq: Sequence) -> None:
-        if self.rows is not None:
+        # Once, as `_decode_rows` lists it: a parked load that resumes is one row.
+        if self.rows is not None and seq.id not in self._ids:
             self.rows.append(seq)
+            self._ids.add(seq.id)
             self.blocks += self._scheduler._decode_reserve().need(seq)
 
 
@@ -716,6 +720,7 @@ class Scheduler:
     # on to keep what was running (see `preempt_running`).
     can_recompute_prompts = True
     pd_admission: PdAdmissionController | None = None
+    _receive_reserve: DecodeGrowthReserve | None = None
     receive_reserve_deferred: int = 0
 
     def __init__(
@@ -2670,6 +2675,8 @@ class Scheduler:
                     num_seqs_prefill,
                     num_batched_tokens,
                 )
+                if held_growth is not None:
+                    held_growth.add(seq)
                 self._uncount_inflight_load(seq)
                 continue
 
@@ -2933,6 +2940,8 @@ class Scheduler:
                 num_seqs_prefill,
                 num_batched_tokens,
             )
+            if held_growth is not None:
+                held_growth.add(seq)  # it runs now, so later receives leave it room
             # Commit only once the request is on the batch, so a requeue above
             # leaves the next sizing drawing the same arm.
             self._commit_calibration_arm()
@@ -6168,6 +6177,7 @@ class PrefillScheduler:
     can_recompute_prompts = False
     # P/D admission is decode-side Mooncake policy; this prefill side has none.
     pd_admission: PdAdmissionController | None = None
+    _receive_reserve: DecodeGrowthReserve | None = None
     receive_reserve_deferred: int = 0
 
     def __init__(self, config: Config, disagg_cu_shm_name: str = ""):

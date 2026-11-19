@@ -219,3 +219,14 @@ def test_schedule_records_prompt_throughput(seq_factory):
     assert sched.engine_stats.num_prompt_tokens == 4
     # Prefill produces no sampled tokens.
     assert sched.engine_stats.num_generation_tokens == 0
+
+
+def test_metrics_need_no_decode_reserve(prefill_scheduler):
+    """The shared-cache prefill scheduler has no decode reserve; collecting its
+    metrics on the engine loop's first push must not reach for one."""
+    from queue import Queue
+
+    from atom.model_engine.engine_utility import EngineUtilityHandler
+
+    handler = EngineUtilityHandler(None, Queue(), scheduler=prefill_scheduler)
+    assert "pd_admission" not in handler.collect_metrics()["scheduler_metrics"]
