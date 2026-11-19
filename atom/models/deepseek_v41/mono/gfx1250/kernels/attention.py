@@ -1254,15 +1254,15 @@ def stage_F3(c):
                 r = (l // 16) * 8 + i
                 s_ = (q[0][i] + q[1][i]) + (q[2][i] + q[3][i])
                 if fx.const_expr(i < TR):   # (c1 code size: rows i >= TR are never stored)
-                    if r < TR:
+                    if r < TR:   # (TP3's payload only: the f32 slice had no reader in global memory)
                         hx.lstore(sm + (r * OWC + nt * 16 + l % 16) * 4, s_)
-                        hx.gstore(c["out"] + i64(r * HID + n0 + l % 16) * 4, s_)
         gpu.barrier()
 
 
 @ASTRewriter.transform
 def tp3(c, region, tag):
-    """attention.tp_allreduce for the [r][32] slice of owner b < NOWN (16 bf16-pair words a row, 2 an LL pair)."""
+    """attention.tp_allreduce for the [r][32] slice of owner b < NOWN (16 bf16-pair words a row, 2 an LL pair); the sum's
+    bf16 pair words -> LDS c["ylds"] ([TR][32] bf16, the owner's FFN post), and to global c["ytgt"] only if given."""
     t, b, TR = c["t"], c["b"], c["TR"]
     TP_TG = 40960
     WPR = OWC // 2
@@ -1306,8 +1306,11 @@ def tp3(c, region, tag):
             wi = t * 2 + q
             col = b * OWC + 2 * (wi % WPR)
             if wi < NWD:
-                hx.gstore(c["tpout"] + i64(b * TPG * 3 + wi) * 4, wq)
-                hx.stx_dev(c["ytgt"] + (i64(wi // WPR) * HID + i64(col)) * 2, wq)
+                # the sum's only reader is this owner's FFN post (its 32 cols): an LDS [TR][32] bf16 copy, not a global
+                # y1 round trip (a device-scope store drained, then reloaded, on the layer's critical path)
+                hx.lstore(c["ylds"] + ((wi // WPR) * OWC + 2 * (wi % WPR)) * 2, wq)
+                if fx.const_expr("ytgt" in c):
+                    hx.stx_dev(c["ytgt"] + (i64(wi // WPR) * HID + i64(col)) * 2, wq)
 
 
 E4_CTA0 = 192   # wo_a CTAs 192..255 (D runs on 0..95)

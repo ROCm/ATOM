@@ -428,6 +428,8 @@ DNF = 999424             # the MoE's LL flags (UG groups -> down) + the shared a
 F_D, F_E, F_A2, F_C, F_KV, F_P, F_X, F_AP, F_W, F_ENG = ((0, 4), (8192, 5), (16384, 6), (24576, 7), (32768, 8),
                                                          (40960, 9), (49152, 10), (57344, 11), (65536, 12), (73728, 13))
 Y2L = 7168               # (seam) LDS past FLO: the owner's y2 [TR][32] bf16, recv_owner -> the owner's attention post
+                         # (and y1 [TR][32] bf16, tp3 -> the owner's FFN post: read at the post's start, long before y2;
+                         # F3's partials at LDS 8192.. are done, a barrier before tp3)
 # (free then: the post's sums end at 6144 + 128; the MoE's LDS of the CTA is dead after its push_row)
 # layer counters (bytes from the layer's counter base)
 ATT_POST, AMIX_POST, AMIX_L1, ASINK = 440, 444, 448, 452
@@ -917,7 +919,7 @@ def target_layer(E, Ly):
             hx.code_prefetch_near(hx.opaque_v(fx.thread_idx.x), b, fptr(fp, "cyc") + i64(S.CODE_END_OFF + 8), L0_MID_KB, pc=pc0)
     AS.stage_E4(cwith(c, **v3f, **v3e))   # (wo_a with the head sum in the CTA: no fold hop)
     AS.stage_F3(cwith(c, **v3f, NEF=64))
-    AS.tp3(cwith(c, ytgt=fptr(fp, "y1")), par * 2, 2 * Ly + 1)
+    AS.tp3(cwith(c, ylds=sm + FLO + Y2L), par * 2, 2 * Ly + 1)   # (the sum -> the owner's FFN post through LDS)
     hx.wait_storecnt0()
     gpu.barrier()
 
@@ -930,7 +932,7 @@ def target_layer(E, Ly):
             hx.wait_count(lc + i64(ASINK), 1, 15)
         gpu.barrier()
     if b < FS.NOWN:
-        FS.ffn_post_owner(dict(t=tq6, b=b, w=tq6 // 32, l=tq6 % 32, sm=sm + FLO, y=fptr(fp, "y1"),
+        FS.ffn_post_owner(dict(t=tq6, b=b, w=tq6 // 32, l=tq6 % 32, sm=sm + FLO, ylds=sm + FLO + Y2L,
                                R=fptr(fp, "aRout"), Rout=fptr(fp, "Rout"), x1g=plog(X1F),
                                pre=fptr(fp, "pre"), post=fptr(fp, "post"), comb=fptr(fp, "comb"),
                                fnh=ltab(fp, Ly, "fnh")(), fnl=ltab(fp, Ly, "fnl")(),
