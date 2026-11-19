@@ -2060,7 +2060,6 @@ def indexer_cp_unsupported_reason(
     dcp_size: int,
     enable_tbo: bool,
     plugin_mode: bool = False,
-    nvfp4_caches: bool = False,
 ) -> str | None:
     """Why MiniMax-M3 indexer-only context parallelism cannot run here, or None.
 
@@ -2088,8 +2087,6 @@ def indexer_cp_unsupported_reason(
         # error. ``indexer_cp_enabled`` refuses them at runtime; this clears the
         # flag so nothing downstream (log line, compile hash) disagrees.
         return "plugin mode (the vLLM/SGLang bridges keep the TP indexer path)"
-    if nvfp4_caches:
-        return "the NVFP4 caches are not wired to the CP scorer"
     if dcp_size > 1:
         return (
             "decode_context_parallel_size > 1 (KV-cache DCP owns the context "
@@ -3257,7 +3254,6 @@ class Config:
                 self.decode_context_parallel_size,
                 self.enable_tbo or self.enable_tbo_decode,
                 is_plugin_mode(),
-                "nvfp4" in (self.index_cache_dtype, self.kv_cache_dtype),
             )
             if indexer_cp_off is not None:
                 logger.warning(
