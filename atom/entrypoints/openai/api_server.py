@@ -2082,6 +2082,7 @@ async def _configure_structured_output(
     strict_schemas=None,
     kv_transfer=None,
     multimodal=False,
+    prepare=True,
 ):
     if schema is None and not strict_schemas:
         return
@@ -2101,6 +2102,7 @@ async def _configure_structured_output(
             relaxed_mtp=envs.ATOM_ENABLE_RELAXED_MTP,
             synthetic=synthetic_token_text is not None,
             strict_schemas=strict_schemas,
+            prepare=prepare,
         )
     except ValueError as exc:
         if schema is not None:
@@ -2108,6 +2110,51 @@ async def _configure_structured_output(
         # Only strict tools asked for the grammar, and the refusals are
         # worded for JSON Schema output: name what the client did ask for.
         raise ValueError(f"strict function tools: {exc}") from exc
+
+
+def _chat_sampling_params(
+    request: ChatCompletionRequest | BetaChatCompletionRequest, messages
+) -> tuple[int, SamplingParams]:
+    """The ``n`` and sampling parameters a chat runs with, checked as the chat
+    route and its render endpoint both check them."""
+    effective_n = _coerce_n(request.n, request.temperature)
+    _validate_return_token_ids(request.return_token_ids, request.stream)
+    sampling_params = _build_sampling_params(
+        temperature=request.temperature,
+        max_tokens=request.get_max_tokens(),
+        max_tokens_is_default=_max_tokens_is_default(request),
+        stop_strings=request.stop,
+        ignore_eos=request.ignore_eos,
+        top_k=request.top_k,
+        top_p=request.top_p,
+        n=effective_n,
+        logprobs=bool(request.logprobs),
+        top_logprobs=request.top_logprobs or 0,
+        required_channel=channel_for_request(
+            required_tool_channel, request.tool_choice, request_tools(request)
+        ),
+    )
+    if request.logprobs:
+        sampling_params.validate_logprob_options(
+            _get_engine_config(),
+            kv_transfer=request.kv_transfer_params,
+            multimodal=_has_multimodal_content(messages),
+            synthetic=synthetic_token_text is not None,
+        )
+    return effective_n, sampling_params
+
+
+def _prompt_reasoning_channel(prompt_or_tokens, template_kwargs) -> ReasoningChannel:
+    """The reasoning channel of a chat's prompt: the K3 template may open it in
+    text or token IDs."""
+    return reasoning_channel(
+        (
+            prompt_starts_in_reasoning(prompt_or_tokens)
+            if isinstance(prompt_or_tokens, str)
+            else prompt_tokens_start_in_reasoning(prompt_or_tokens, tokenizer.decode)
+        ),
+        template_kwargs=template_kwargs,
+    )
 
 
 @app.post("/v1/chat/completions")
@@ -2212,31 +2259,8 @@ async def _chat_completions(
         )
         logprob_codec = None
 
-        effective_n = _coerce_n(request.n, request.temperature)
-        _validate_return_token_ids(request.return_token_ids, request.stream)
-        sampling_params = _build_sampling_params(
-            temperature=request.temperature,
-            max_tokens=request.get_max_tokens(),
-            max_tokens_is_default=_max_tokens_is_default(request),
-            stop_strings=request.stop,
-            ignore_eos=request.ignore_eos,
-            top_k=request.top_k,
-            top_p=request.top_p,
-            n=effective_n,
-            logprobs=bool(request.logprobs),
-            top_logprobs=request.top_logprobs or 0,
-            required_channel=channel_for_request(
-                required_tool_channel, request.tool_choice, request_tools(request)
-            ),
-        )
-
+        effective_n, sampling_params = _chat_sampling_params(request, messages)
         if request.logprobs:
-            sampling_params.validate_logprob_options(
-                _get_engine_config(),
-                kv_transfer=request.kv_transfer_params,
-                multimodal=_has_multimodal_content(messages),
-                synthetic=synthetic_token_text is not None,
-            )
             logprob_codec = getattr(app.state, "logprob_codec", None)
             if logprob_codec is None or logprob_codec.tokenizer is not tokenizer:
                 logprob_codec = TokenBytes(tokenizer)
@@ -2307,17 +2331,7 @@ async def _chat_completions(
                 request, messages, merged_kwargs
             )
 
-        # The K3 template may open the reasoning channel in text or token IDs.
-        _reasoning = reasoning_channel(
-            (
-                prompt_starts_in_reasoning(prompt_or_tokens)
-                if isinstance(prompt_or_tokens, str)
-                else prompt_tokens_start_in_reasoning(
-                    prompt_or_tokens, tokenizer.decode
-                )
-            ),
-            template_kwargs=merged_kwargs,
-        )
+        _reasoning = _prompt_reasoning_channel(prompt_or_tokens, merged_kwargs)
         if assistant_prefix is not None:
             prompt_or_tokens, _reasoning = continue_prompt(
                 prompt_or_tokens, assistant_prefix, _reasoning
@@ -2545,23 +2559,43 @@ async def _chat_completions(
 async def chat_completions_render(request: ChatCompletionRequest):
     """The prompt token IDs /v1/chat/completions runs ``request`` with, without
     running the model: vLLM's render endpoint, for a router that places chats
-    by their prompt."""
+    by their prompt.
+
+    It refuses what the chat route refuses before generating, by the same
+    checks in the same order, but for a grammar that fails to compile: render
+    prepares none.
+    """
+    route = "chat_completions_render"
     validate_model(request.model)
+    _validate_chunked_receive(request.kv_transfer_params)
     try:
         messages, _, template_kwargs, _ = _check_chat(request, beta=False)
+        _, sampling_params = _chat_sampling_params(request, messages)
+        schema = schema_from_format(request.response_format)
         if _has_multimodal_content(messages):
-            raise ValueError("render does not take image input")
-        # Only to refuse what the chat route refuses: a malformed or unsafe
-        # response format.
-        schema_from_format(request.response_format)
+            raise HTTPException(
+                status_code=501, detail="render does not take image input"
+            )
         prompt = request.get_prompt_token_ids()
         if prompt is None:
             prompt = await _render_chat_template(request, messages, template_kwargs)
+        await _configure_structured_output(
+            sampling_params,
+            schema,
+            _prompt_reasoning_channel(prompt, template_kwargs),
+            tools=request.tools,
+            tool_choice=request.tool_choice,
+            kv_transfer=request.kv_transfer_params,
+            prepare=False,
+        )
         token_ids = await _engine_prompt_ids(prompt)
         _validate_prompt_fits(
-            len(token_ids), request.get_max_tokens(), _max_tokens_is_default(request)
+            len(token_ids),
+            sampling_params.max_tokens,
+            sampling_params.max_tokens_is_default,
         )
     except ValueError as e:
+        logger.error(f"Validation error in {route}: {e}")
         raise HTTPException(status_code=400, detail=str(e))
     return JSONResponse(
         content={
@@ -2674,6 +2708,30 @@ def _zero_token_stream(
     )
 
 
+def _completion_sampling_params(
+    request: CompletionRequest | BetaCompletionRequest, beta: bool
+) -> tuple[int, SamplingParams]:
+    """The ``n`` and sampling parameters a completion runs with, checked as the
+    completions route and its render endpoint both check them."""
+    effective_n = _coerce_n(request.n, request.temperature)
+    _validate_return_token_ids(request.return_token_ids, request.stream)
+    if beta:
+        _check_beta_completion(request)
+    sampling_params = _build_sampling_params(
+        temperature=request.temperature,
+        # 0 (only /beta takes it) is answered without the engine; the other
+        # parameters are checked all the same.
+        max_tokens=max(request.get_max_tokens(), 1),
+        max_tokens_is_default=_max_tokens_is_default(request),
+        stop_strings=request.stop,
+        ignore_eos=request.ignore_eos,
+        top_k=request.top_k,
+        top_p=request.top_p,
+        n=effective_n,
+    )
+    return effective_n, sampling_params
+
+
 async def _completions(
     request: CompletionRequest | BetaCompletionRequest, raw_request: Request
 ):
@@ -2686,23 +2744,8 @@ async def _completions(
     _validate_chunked_receive(request.kv_transfer_params)
 
     try:
-        effective_n = _coerce_n(request.n, request.temperature)
-        _validate_return_token_ids(request.return_token_ids, request.stream)
-        if beta:
-            _check_beta_completion(request)
+        effective_n, sampling_params = _completion_sampling_params(request, beta)
         max_tokens = request.get_max_tokens()
-        sampling_params = _build_sampling_params(
-            temperature=request.temperature,
-            # 0 (only /beta takes it) is answered without the engine, below;
-            # the other parameters are checked all the same.
-            max_tokens=max(max_tokens, 1),
-            max_tokens_is_default=_max_tokens_is_default(request),
-            stop_strings=request.stop,
-            ignore_eos=request.ignore_eos,
-            top_k=request.top_k,
-            top_p=request.top_p,
-            n=effective_n,
-        )
         echo, include_usage, usage_on_finish = "", False, False
         if beta:
             include_usage = bool((request.stream_options or {}).get("include_usage"))
@@ -2857,14 +2900,24 @@ async def _completions(
 @app.post("/v1/completions/render")
 async def completions_render(request: CompletionRequest):
     """The prompt token IDs /v1/completions runs ``request`` with, as vLLM's
-    render endpoint lists them, one item per prompt; ATOM takes one prompt."""
+    render endpoint lists them, one item per prompt; ATOM takes one prompt.
+
+    It refuses what the completions route refuses before generating, by the
+    same checks in the same order.
+    """
+    route = "completions_render"
     validate_model(request.model)
+    _validate_chunked_receive(request.kv_transfer_params)
     try:
+        _, sampling_params = _completion_sampling_params(request, beta=False)
         token_ids = await _engine_prompt_ids(request.get_prompt_or_tokens())
         _validate_prompt_fits(
-            len(token_ids), request.get_max_tokens(), _max_tokens_is_default(request)
+            len(token_ids),
+            sampling_params.max_tokens,
+            sampling_params.max_tokens_is_default,
         )
     except ValueError as e:
+        logger.error(f"Validation error in {route}: {e}")
         raise HTTPException(status_code=400, detail=str(e))
     return JSONResponse(
         content=[

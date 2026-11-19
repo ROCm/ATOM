@@ -12,6 +12,7 @@ import pytest
 
 from atom.entrypoints.openai import api_server
 from atom.entrypoints.openai.chat_encoder_adapters import build_message_encoder_adapter
+from atom.entrypoints.openai.reasoning_dialects import DIALECTS
 from atom.model_engine.segment_tokenizer import PrefixEncoding
 
 MODEL = "served-model"
@@ -190,6 +191,32 @@ REFUSED_CHATS = {
         "messages": [ASK],
         "stream_options": {"include_usage": True},
     },
+    "return_token_ids_while_streaming": {
+        "model": MODEL,
+        "messages": [ASK],
+        "return_token_ids": True,
+        "stream": True,
+    },
+    "no_output_tokens": {"model": MODEL, "messages": [ASK], "max_tokens": 0},
+    # Above the deployment's output cap, which is max_model_len here: refused
+    # for the cap, not for the prompt it leaves no room for.
+    "max_tokens_above_the_output_cap": {
+        "model": MODEL,
+        "messages": [ASK],
+        "max_tokens": 8193,
+    },
+    "json_output_with_stop_strings": {
+        "model": MODEL,
+        "messages": [ASK],
+        "response_format": {"type": "json_object"},
+        "stop": ["}"],
+    },
+    "json_output_with_tools_and_no_dsml_parser": {
+        "model": MODEL,
+        "messages": [ASK],
+        "response_format": {"type": "json_object"},
+        "tools": [TOOL],
+    },
     "too_long_for_its_max_tokens": {
         "model": MODEL,
         "messages": [ASK],
@@ -212,11 +239,56 @@ def test_chat_render_refuses_what_the_chat_endpoint_refuses(submitted, body):
     assert submitted == []
 
 
-def test_chat_render_refuses_image_input(submitted):
+def test_chat_render_refuses_json_output_a_framed_reasoning_dialect_cannot_hold(
+    submitted, monkeypatch
+):
+    monkeypatch.setattr(api_server, "reasoning_dialect", DIALECTS[0])
+    body = {
+        "model": MODEL,
+        "messages": [ASK],
+        "response_format": {"type": "json_object"},
+    }
+    refused = post("/v1/chat/completions", body)
+    assert refused.status_code == 400
+    assert "framed reasoning channels" in refused.json()["error"]["message"]
+    rendered = post("/v1/chat/completions/render", body)
+    assert rendered.json() == refused.json()
+    assert submitted == []
+
+
+def test_chat_render_prepares_no_grammar_for_json_output(submitted, monkeypatch):
+    prepared = []
+    monkeypatch.setattr(
+        api_server.engine,
+        "prepare_structured_request",
+        lambda *args: prepared.append(args),
+        raising=False,
+    )
+    generate = api_server.generate_async
+
+    async def answer_json(*args, **kwargs):
+        async for output in generate(*args, **kwargs):
+            yield {**output, "text": "{}"}
+
+    monkeypatch.setattr(api_server, "generate_async", answer_json)
+    body = {
+        "model": MODEL,
+        "messages": [ASK],
+        "response_format": {"type": "json_object"},
+    }
+    rendered = post("/v1/chat/completions/render", body)
+    assert rendered.status_code == 200, rendered.text
+    assert prepared == []
+    assert post("/v1/chat/completions", body).status_code == 200
+    assert len(prepared) == 1
+    assert rendered.json()["token_ids"] == run_ids(submitted[0])
+
+
+def test_chat_render_cannot_render_image_input(submitted):
     image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}
     body = {"model": MODEL, "messages": [{"role": "user", "content": [image]}]}
     response = post("/v1/chat/completions/render", body)
-    assert response.status_code == 400
+    assert response.status_code == 501
     assert response.json()["error"]["message"] == "render does not take image input"
 
 
@@ -253,6 +325,18 @@ def test_completions_render_is_the_prompt_the_completions_endpoint_runs(
 REFUSED_PROMPTS = {
     "no_prompt": {"model": MODEL},
     "another_model": {"model": "another-model", "prompt": "Hi"},
+    "return_token_ids_while_streaming": {
+        "model": MODEL,
+        "prompt": "Hi",
+        "return_token_ids": True,
+        "stream": True,
+    },
+    "no_output_tokens": {"model": MODEL, "prompt": "Hi", "max_tokens": 0},
+    "max_tokens_above_the_output_cap": {
+        "model": MODEL,
+        "prompt": "Hi",
+        "max_tokens": 8193,
+    },
     "too_long_for_its_max_tokens": {"model": MODEL, "prompt": "Hi", "max_tokens": 8192},
     "too_long_for_any_output": {"model": MODEL, "prompt": "x" * 8192},
 }
@@ -289,6 +373,29 @@ def test_render_refuses_a_prompt_the_kv_pool_cannot_hold(
     rendered = post(f"{path}/render", body)
     assert rendered.json() == refused.json()
     assert submitted == []
+
+
+@pytest.mark.parametrize(
+    "path, body, route",
+    [
+        (
+            "/v1/chat/completions/render",
+            REFUSED_CHATS["return_token_ids_while_streaming"],
+            "chat_completions_render",
+        ),
+        (
+            "/v1/completions/render",
+            REFUSED_PROMPTS["return_token_ids_while_streaming"],
+            "completions_render",
+        ),
+    ],
+)
+def test_render_logs_a_refusal_as_its_inference_route_does(
+    submitted, caplog, path, body, route
+):
+    with caplog.at_level("ERROR", logger="atom"):
+        assert post(path, body).status_code == 400
+    assert f"Validation error in {route}: return_token_ids" in caplog.text
 
 
 def test_render_reports_the_ids_of_a_prefix_encoding(submitted, monkeypatch):
