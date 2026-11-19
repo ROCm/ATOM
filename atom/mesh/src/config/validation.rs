@@ -40,6 +40,11 @@ impl ConfigValidator {
         if !rl.enabled {
             return Ok(());
         }
+        if rl.api_key.as_deref().map_or(true, |k| k.trim().is_empty()) {
+            return Err(ConfigError::MissingRequired {
+                field: "rl.api_key (--rl-api-key, required with --enable-rl)".to_string(),
+            });
+        }
         for (field, value) in [
             ("rl.control_timeout_secs", rl.control_timeout_secs),
             ("rl.fanout_concurrency", rl.fanout_concurrency as u64),

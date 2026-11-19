@@ -256,6 +256,15 @@ async fn fetch_grpc_metadata(
     }
 }
 
+/// `tp_size` and `dp_size` from a /server_info answer, as labels.
+fn parallel_size_labels(info: &ServerInfo, labels: &mut HashMap<String, String>) {
+    for (key, size) in [("tp_size", info.tp_size), ("dp_size", info.dp_size)] {
+        if let Some(size) = size {
+            labels.insert(key.to_string(), size.to_string());
+        }
+    }
+}
+
 /// Discover HTTP metadata from an sglang backend via /server_info + /model_info.
 async fn discover_http_sglang(url: &str, api_key: Option<&str>) -> HashMap<String, String> {
     let mut labels = HashMap::new();
@@ -267,12 +276,7 @@ async fn discover_http_sglang(url: &str, api_key: Option<&str>) -> HashMap<Strin
         if let Some(served_model_name) = server_info.served_model_name.filter(|s| !s.is_empty()) {
             labels.insert("served_model_name".to_string(), served_model_name);
         }
-        if let Some(tp_size) = server_info.tp_size {
-            labels.insert("tp_size".to_string(), tp_size.to_string());
-        }
-        if let Some(dp_size) = server_info.dp_size {
-            labels.insert("dp_size".to_string(), dp_size.to_string());
-        }
+        parallel_size_labels(&server_info, &mut labels);
         if let Some(load_balance_method) = server_info.load_balance_method {
             labels.insert("load_balance_method".to_string(), load_balance_method);
         }
@@ -315,6 +319,20 @@ async fn discover_http_openai(url: &str, api_key: Option<&str>) -> HashMap<Strin
     labels
 }
 
+/// An ATOM worker's `tp_size` and `dp_size` from its /server_info, as labels,
+/// so the RL control plane can report its rank layout.
+async fn discover_http_atom_parallel_sizes(
+    url: &str,
+    api_key: Option<&str>,
+) -> HashMap<String, String> {
+    let mut labels = HashMap::new();
+    match get_server_info(url, api_key).await {
+        Ok(info) => parallel_size_labels(&info, &mut labels),
+        Err(e) => warn!("/server_info failed for {}: {}", url, e),
+    }
+    labels
+}
+
 /// Step 2a: Discover metadata from worker.
 pub struct DiscoverMetadataStep;
 
@@ -337,19 +355,23 @@ impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
 
         let (discovered_labels, detected_runtime) = match connection_mode {
             ConnectionMode::Http => {
-                let backend = context
+                let (backend, rl_enabled) = context
                     .data
                     .app_context
                     .as_ref()
-                    .map(|ctx| ctx.router_config.backend)
+                    .map(|ctx| (ctx.router_config.backend, ctx.router_config.rl.enabled))
                     .unwrap_or_default();
+                let (url, api_key) = (&config.url, config.api_key.as_deref());
 
                 let labels = match backend {
-                    BackendType::Sglang => {
-                        discover_http_sglang(&config.url, config.api_key.as_deref()).await
-                    }
-                    BackendType::Vllm | BackendType::Atom => {
-                        discover_http_openai(&config.url, config.api_key.as_deref()).await
+                    BackendType::Sglang => discover_http_sglang(url, api_key).await,
+                    BackendType::Vllm => discover_http_openai(url, api_key).await,
+                    BackendType::Atom => {
+                        let mut labels = discover_http_openai(url, api_key).await;
+                        if rl_enabled {
+                            labels.extend(discover_http_atom_parallel_sizes(url, api_key).await);
+                        }
+                        labels
                     }
                 };
 

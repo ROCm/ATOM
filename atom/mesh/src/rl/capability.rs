@@ -28,17 +28,6 @@ fn static_for(engine: &str) -> RlCapabilities {
             sleep_wake: true,
             reports_weight_version: false,
         },
-        // ATOM holds running requests while paused and cannot abort them; it
-        // refits from disk or from a trainer's NCCL group.
-        "atom" => RlCapabilities {
-            source: RlCapabilitySource::Static,
-            pause_modes: strings(&["keep"]),
-            update_from: strings(&["disk", "distributed"]),
-            abort: false,
-            flush_cache: true,
-            sleep_wake: false,
-            reports_weight_version: true,
-        },
         _ => RlCapabilities {
             source: RlCapabilitySource::Static,
             pause_modes: Vec::new(),
@@ -61,10 +50,15 @@ fn list_label(labels: &HashMap<String, String>, key: &str) -> Option<Vec<String>
     })
 }
 
+/// `true/false`, `1/0`, `yes/no` or `on/off`, any case; `None` for any other
+/// value, which keeps the static default.
 fn bool_label(labels: &HashMap<String, String>, key: &str) -> Option<bool> {
-    labels
-        .get(key)
-        .map(|v| v.trim().eq_ignore_ascii_case("true"))
+    let v = labels.get(key)?.trim().to_ascii_lowercase();
+    match v.as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }
 
 /// The static row for `engine`, with any `rl.*` label overrides applied.

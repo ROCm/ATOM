@@ -16,11 +16,7 @@ use super::{
 };
 use crate::{
     config::BackendType,
-    core::{
-        worker::{RuntimeType, WorkerType},
-        worker_registry::WorkerId,
-        ConnectionMode, Worker,
-    },
+    core::{worker_registry::WorkerId, ConnectionMode, Worker},
     server::AppState,
 };
 
@@ -68,18 +64,7 @@ impl RlWorkerInfo {
                 "http",
                 Some(worker.base_url().to_string()),
             ),
-            ConnectionMode::Grpc { .. } => {
-                let engine = match metadata.runtime_type {
-                    RuntimeType::Sglang => "sglang",
-                    RuntimeType::Vllm => "vllm",
-                };
-                (engine.to_string(), "grpc", None)
-            }
-        };
-        let worker_type = match worker.worker_type() {
-            WorkerType::Regular => "regular",
-            WorkerType::Prefill { .. } => "prefill",
-            WorkerType::Decode => "decode",
+            ConnectionMode::Grpc { .. } => (metadata.runtime_type.to_string(), "grpc", None),
         };
         Self {
             id: id.as_str().to_string(),
@@ -87,7 +72,7 @@ impl RlWorkerInfo {
             base_url: worker.base_url().to_string(),
             engine,
             model_id: worker.model_id().to_string(),
-            worker_type: worker_type.to_string(),
+            worker_type: worker.worker_type().as_metric_label().to_string(),
             connection_mode: connection_mode.to_string(),
             health: if worker.is_healthy() {
                 "ready"

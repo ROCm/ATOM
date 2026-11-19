@@ -445,7 +445,7 @@ pub fn build_app(
         );
 
     let rl_routes = if app_state.context.router_config.rl.enabled {
-        crate::rl::router()
+        crate::rl::router(&app_state.context.router_config.rl)
     } else {
         Router::new()
     };

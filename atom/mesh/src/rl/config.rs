@@ -10,6 +10,10 @@ pub struct RlConfig {
     /// Mount the RL control plane under /v1/rl.
     #[arg(id = "enable_rl", long = "enable-rl")]
     pub enabled: bool,
+    /// Bearer token every /v1/rl request must carry as
+    /// `Authorization: Bearer <token>`; required with --enable-rl.
+    #[arg(id = "rl_api_key", long = "rl-api-key")]
+    pub api_key: Option<String>,
     /// Total timeout of one engine control call (a refit can take minutes).
     #[arg(
         id = "rl_control_timeout_secs",
@@ -30,6 +34,7 @@ impl Default for RlConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            api_key: None,
             control_timeout_secs: 600,
             fanout_concurrency: 32,
         }
