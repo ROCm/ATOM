@@ -1146,7 +1146,7 @@ class GDNStateMixin(PoolRowsMixin):
                 f"state caches disagree on slot count: {cache.shape[1]} != "
                 f"{num_slots}; one slot index has to address all of them"
             )
-            slot_bytes = cache[0, 0].numel() * cache.element_size()
+            slot_bytes = math.prod(cache.shape[2:]) * cache.element_size()
             layer_bytes = num_slots * slot_bytes
             for layer in range(cache.shape[0]):
                 regions.append(
@@ -1571,9 +1571,9 @@ class GDNStateMixin(PoolRowsMixin):
         md.replayssm_max_query_len = self.replayssm_max_query_len
 
         if is_prefill:
-            # A prefill (re)initialises the checkpoint wholesale via
-            # `chunk_gated_delta_rule` and writes NO records, so the next
-            # forward must fold none.  Parking the cursor at -1 rather than 0
+            # A prefill (re)initialises the checkpoint wholesale via the
+            # chunked prefill (Triton or FlyDSL) and writes NO records, so the
+            # next forward must fold none.  Parking the cursor at -1 rather than 0
             # is what says that: `num_bonus` is 0 on the first decode after a
             # prefill, so the commit below would otherwise advance 0 -> 1 and
             # fold record 0 -- which this generation never wrote, and which on

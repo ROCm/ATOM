@@ -16,6 +16,7 @@ from flydsl.expr.typing import T
 from atom.mono.device.ops import CM_DEV, CM_SYS, bf16_pair, memrealtime, rsrc, traced
 from atom.mono.plan.layout import DIAG_WORDS
 from atom.mono.plan.trace import Space, note
+from atom.mono.polling import POLL_SLEEP_UNITS
 
 POLL_MAX = 12  # mailbox specs polled per batch (bounds live registers)
 
@@ -26,7 +27,7 @@ def _spin(load_all, pending):
     loop keeps the loads from being hoisted."""
     v = load_all()
     while pending(v):
-        rocdl.s_sleep(1)
+        rocdl.s_sleep(POLL_SLEEP_UNITS)
         v = load_all()
     return v
 
@@ -52,7 +53,7 @@ def _spin_bounded(load_all, pending, diag, region_id, index, tag):
     v = load_all()
     late = fx.Int32(0)
     while pending(v) & (late == 0):
-        rocdl.s_sleep(1)
+        rocdl.s_sleep(POLL_SLEEP_UNITS)
         v = load_all()
         late = (memrealtime() - t0 > DIAG_TICKS).select(fx.Int32(1), fx.Int32(0))
     if late != 0:
