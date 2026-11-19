@@ -113,7 +113,7 @@ A new prefill is scheduled only when the earliest waiting request has waited lon
 
 ### Preemption
 
-When a decode step cannot extend a sequence's KV cache, the scheduler scans the running queue from the tail for a preemptable request. Connector-pinned requests are skipped. If no queued victim can release space, the current decode may preempt itself. With mixed scheduling, prefill admission and continuation first check the decode page reservation; insufficient capacity skips prefill for that tick, keeping partial prompts in this same victim queue.
+When a decode step cannot extend a sequence's KV cache, the scheduler scans the running queue from the tail for a preemptable request. Connector-pinned requests are skipped. If no queued victim can release space, the current decode may preempt itself. With mixed scheduling, settled KV owners still waiting for admission are considered first, from the waiting tail: an offload resume or completed P/D receive must not escape reclamation because it has not joined running. In-flight transfers and protected owners remain excluded. Prefill admission and continuation preserve the decode page reservation; insufficient capacity skips their execution without blocking transfer completion.
 
 ```python
 def preempt(self, seq: Sequence) -> bool:
@@ -845,24 +845,30 @@ one eighth of the token budget for prefill progress. At high decode load,
 decode admission follows FCFS order. Tail requests may wait until earlier
 decodes finish or the long prefill ends; this policy does not rotate them.
 
-New-prompt admission also reserves the eligible running decodes' append-page
-demand. A new prompt that would consume those pages stays in the waiting
-queue, rather than forcing an older decode to discard its KV and recompute.
-When prefill work is pending, the scheduler snapshots running decodes once
-and passes their token and page reservations to the delayer,
-pending/cost/head probes, and actual admission. Each P/D receive promoted
-to first decode adds its demand to that reservation before the next prompt
-can be admitted; this does not rescan the running queue.
-This reservation does not allocate pages and includes speculative lookahead.
-It covers the current tick, not a prompt's lifetime. Each subsequent chunk
-rechecks the running decodes' current append demand. If available page capacity
-(including reclaimable checkpoints) cannot cover it, the prefill token budget
-is zero for both continuation and new admission, and for the corresponding
-probes. The tick then follows ordinary decode scheduling: a newer partial
-prompt remains eligible for tail-first preemption instead of displacing an
-older decode. The one-eighth token floor applies only when this KV check passes.
-It excludes requests already scheduled as prefill in the current step, while
-including completed prefills waiting for their first decode.
+Mixed scheduling separates transfer completion from prefill execution. Before
+selecting any chunk, it resolves ready P/D receives and adds their first-decode
+demand to the existing decodes' reservation, even when the prefill budget is
+zero. Requests that have no running slot retain their KV ownership and remain
+eligible for pressure reclamation once their transfer is complete. Offload
+completion instead makes a suffix prefill eligible; it does not skip that
+prefill. Parked-transfer counts describe lifecycle accounting, not the presence
+of admissible prefill work.
+
+The scheduler snapshots existing decodes once, extends the snapshot for those
+P/D promotions, and finalizes the budget before early loads, the delayer,
+pending/cost/head probes, or actual admission. Partial prefills are excluded
+from decode demand; completed prefills awaiting first decode are included.
+New admission preserves the reserved append pages, including speculative
+lookahead. This reservation does not allocate pages and covers only the current
+tick. Each subsequent chunk therefore checks the current demand again.
+
+If available page capacity, including reclaimable checkpoints, cannot cover
+that demand, the prefill budget is zero. Continuation and new admission skip
+chunk sizing and execution; transfer completion and decode scheduling continue.
+Pressure reclamation considers settled waiting owners as well as running
+requests. Reclaiming an offload resume also clears its parked accounting,
+early-load entry and completed-load flags before readmission. The one-eighth
+prefill token floor applies only when the page-capacity check passes.
 
 ### Attention execution
 
