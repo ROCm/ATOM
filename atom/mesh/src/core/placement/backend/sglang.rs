@@ -34,7 +34,6 @@ impl BackendAdapter for SglangAdapter {
         &self,
         prefill: &dyn Worker,
         _decode: &dyn Worker,
-        _carries_media: bool,
     ) -> Result<PairCtx, AdapterError> {
         Ok(Box::new(SglangPairCtx {
             bootstrap_host: prefill.bootstrap_host().to_string(),

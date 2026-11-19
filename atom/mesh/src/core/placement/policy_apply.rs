@@ -19,19 +19,13 @@ pub async fn apply_policy(
         tokens: descriptor.tokens,
         headers: descriptor.headers,
         hash_ring,
-        carries_media: descriptor.carries_media,
+        carries_media: descriptor.carries_media(),
     };
     let (idx, decision) = policy.select_with_decision(candidates, &info).await;
     let selected = idx.map(|idx| candidates[idx].clone());
     // The planner passes the candidates of one pool.
     let pool = candidates[0].worker_type().as_metric_label();
-    record_decision(
-        pool,
-        policy.name(),
-        selected.as_ref(),
-        decision,
-        descriptor.media_count,
-    );
+    record_decision(pool, policy.name(), selected.as_ref(), decision);
     selected.ok_or(PlacementError::PolicyReturnedNone)
 }
 
@@ -42,7 +36,6 @@ fn record_decision(
     policy: &'static str,
     selected: Option<&Arc<dyn Worker>>,
     decision: RouteDecision,
-    media_count: usize,
 ) {
     MeshMetrics::record_route_branch(pool, policy, decision.branch);
     if let Some(worker) = selected {
@@ -62,7 +55,6 @@ fn record_decision(
         selected,
         decision.branch,
         decision.match_ratio,
-        media_count,
     );
     route_trace::record_estimate(pool, selected, decision.estimated_hit_ratio);
 }

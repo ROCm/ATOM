@@ -19,20 +19,9 @@ fn health_filter(pool: Vec<Arc<dyn Worker>>) -> Vec<Arc<dyn Worker>> {
 
 /// Records a selection that has no candidate in `pool`. The policy never runs,
 /// so it cannot report the failure itself.
-fn report_no_candidates(
-    pool: &'static str,
-    policy: &dyn LoadBalancingPolicy,
-    req: &RequestDescriptor<'_>,
-) {
+fn report_no_candidates(pool: &'static str, policy: &dyn LoadBalancingPolicy) {
     MeshMetrics::record_route_branch(pool, policy.name(), NO_HEALTHY_WORKERS);
-    route_trace::record_selection(
-        pool,
-        policy.name(),
-        None,
-        NO_HEALTHY_WORKERS,
-        None,
-        req.media_count,
-    );
+    route_trace::record_selection(pool, policy.name(), None, NO_HEALTHY_WORKERS, None);
 }
 
 pub struct DefaultPlanner {
@@ -64,7 +53,7 @@ impl DefaultPlanner {
         let candidates = health_filter(regular_pool_raw);
         let policy = self.policies.regular_policy(req.model_id);
         if candidates.is_empty() {
-            report_no_candidates(metrics_labels::WORKER_REGULAR, policy.as_ref(), req);
+            report_no_candidates(metrics_labels::WORKER_REGULAR, policy.as_ref());
             return Err(PlacementError::NoAvailableWorkers);
         }
 
@@ -87,12 +76,12 @@ impl DefaultPlanner {
         let decode_policy = self.policies.decode_policy();
         let prefill_candidates = health_filter(prefill_pool_raw);
         if prefill_candidates.is_empty() {
-            report_no_candidates(metrics_labels::WORKER_PREFILL, prefill_policy.as_ref(), req);
+            report_no_candidates(metrics_labels::WORKER_PREFILL, prefill_policy.as_ref());
             return Err(PlacementError::NoAvailableWorkers);
         }
         let decode_candidates = health_filter(decode_pool_raw);
         if decode_candidates.is_empty() {
-            report_no_candidates(metrics_labels::WORKER_DECODE, decode_policy.as_ref(), req);
+            report_no_candidates(metrics_labels::WORKER_DECODE, decode_policy.as_ref());
             return Err(PlacementError::NoAvailableWorkers);
         }
 
@@ -127,6 +116,7 @@ impl DefaultPlanner {
 #[async_trait]
 impl PdPlanner for DefaultPlanner {
     async fn plan(&self, req: &RequestDescriptor<'_>) -> Result<PlacementPlan, PlacementError> {
+        route_trace::record_media_count(req.media_count);
         let conn_mode = self.connection_mode(req);
 
         if let Some(m) = req.model_id {
@@ -171,14 +161,12 @@ impl PdPlanner for DefaultPlanner {
             report_no_candidates(
                 metrics_labels::WORKER_PREFILL,
                 self.policies.prefill_policy().as_ref(),
-                req,
             );
             Err(PlacementError::NoPrefillWorkers)
         } else if !prefill_pool.is_empty() && decode_pool.is_empty() {
             report_no_candidates(
                 metrics_labels::WORKER_DECODE,
                 self.policies.decode_policy().as_ref(),
-                req,
             );
             Err(PlacementError::NoDecodeWorkers)
         } else {

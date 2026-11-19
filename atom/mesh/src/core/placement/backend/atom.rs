@@ -121,8 +121,16 @@ impl BackendAdapter for AtomAdapter {
     fn prepare_pair(
         &self,
         prefill: &dyn Worker,
+        decode: &dyn Worker,
+    ) -> Result<PairCtx, AdapterError> {
+        self.prepare_pair_with_media(prefill, decode, 0)
+    }
+
+    fn prepare_pair_with_media(
+        &self,
+        prefill: &dyn Worker,
         _decode: &dyn Worker,
-        carries_media: bool,
+        media_count: usize,
     ) -> Result<PairCtx, AdapterError> {
         Ok(Box::new(AtomPairCtx {
             transfer_id: format!("xfer-{}", Uuid::new_v4()),
@@ -130,7 +138,7 @@ impl BackendAdapter for AtomAdapter {
             prefill_dp_size: prefill.dp_size().unwrap_or(1),
             prefill_dp_rank: prefill.dp_rank(),
             decode_dp_rank: _decode.dp_rank(),
-            carries_media,
+            carries_media: media_count > 0,
         }))
     }
 
@@ -216,7 +224,7 @@ mod tests {
     fn transfer_params(body: Value) -> (Value, Value) {
         let route = "/v1/chat/completions";
         let parsed = ParsedInference::parse(route, body.to_string().as_bytes()).unwrap();
-        let carries_media = parsed.metadata_with_text(false).carries_media;
+        let media_count = parsed.metadata_with_text(false).media_count;
         let prefill = make_prefill_http("http://p:8000", "m", Some(8998));
         let decode = make_decode_http("http://d:8000", "m");
         let mut info = AtomPrefillInfo::default();
@@ -226,7 +234,7 @@ mod tests {
             .insert(prefill.url().to_string(), template);
         let adapter = AtomAdapter::new(Arc::new(info));
         let ctx = adapter
-            .prepare_pair(prefill.as_ref(), decode.as_ref(), carries_media)
+            .prepare_pair_with_media(prefill.as_ref(), decode.as_ref(), media_count)
             .unwrap();
         let (mut prefill_body, mut decode_body) = (body.clone(), body);
         adapter

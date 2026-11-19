@@ -18,12 +18,14 @@ pub struct InferenceMetadata {
     pub stream: bool,
     pub return_logprob: bool,
     /// See [`ParsedInference::media_count`]; set by `ParsedInference` only.
-    pub carries_media: bool,
-    /// See [`ParsedInference::media_count`]; set by `ParsedInference` only.
     pub media_count: usize,
 }
 
 impl InferenceMetadata {
+    pub fn carries_media(&self) -> bool {
+        self.media_count > 0
+    }
+
     /// Execution needs only protocol facts; routing text can be released after placement.
     pub fn execution_metadata(&self) -> Self {
         Self {
@@ -33,7 +35,6 @@ impl InferenceMetadata {
             batch_size: self.batch_size,
             stream: self.stream,
             return_logprob: self.return_logprob,
-            carries_media: self.carries_media,
             media_count: self.media_count,
         }
     }
@@ -65,15 +66,15 @@ impl InferenceRequest for ChatCompletionRequest {
             batch_size: self.n.filter(|n| *n > 1).map(|n| n as usize),
             stream: self.is_stream(),
             return_logprob: self.logprobs,
-            carries_media: false,
             media_count: 0,
         }
     }
 }
 /// The routing copy of a chat with media, which token routing templates.
 pub(crate) struct RoutingChat {
-    /// The chat with digests in place of its media.
-    pub chat: ChatCompletionRequest,
+    /// The chat's messages with digests in place of their media; the template
+    /// takes the rest of the chat from the client's request.
+    pub messages: Vec<ChatMessage>,
     /// For ATOM backends: one digest of all the chat's media, which goes before
     /// the routing text and before the templated prompt. ATOM keys every KV
     /// block of a media prompt by all its media, so two prompts that differ only
@@ -83,58 +84,94 @@ pub(crate) struct RoutingChat {
     pub front: Option<String>,
 }
 
-/// A routing copy of `request` with each image and video replaced in place by
-/// a text digest of its URL, or `None` when it has no media. Routing text and
-/// template tokens otherwise drop media or render it as an identity-free
-/// placeholder, so requests differing only in media would share a prefix the
-/// engine's media-keyed prefix cache never shares.
-fn with_media_digests(request: &ChatCompletionRequest) -> Option<ChatCompletionRequest> {
-    media_parts(request).next()?;
-    let mut routed = request.clone();
-    for message in &mut routed.messages {
-        let content = match message {
-            ChatMessage::System { content, .. }
-            | ChatMessage::User { content, .. }
-            | ChatMessage::Tool { content, .. }
-            | ChatMessage::Developer { content, .. } => content,
-            ChatMessage::Assistant {
-                content: Some(content),
-                ..
-            } => content,
-            ChatMessage::Assistant { content: None, .. } | ChatMessage::Function { .. } => continue,
-        };
-        let MessageContent::Parts(parts) = content else {
-            continue;
-        };
-        for part in parts {
-            if let Some((kind, url)) = media_url(part) {
-                *part = ContentPart::Text {
-                    text: media_digest(kind, url),
-                };
-            }
-        }
+/// A message's content; `None` for a function message and an assistant without one.
+fn content(message: &ChatMessage) -> Option<&MessageContent> {
+    match message {
+        ChatMessage::System { content, .. }
+        | ChatMessage::User { content, .. }
+        | ChatMessage::Tool { content, .. }
+        | ChatMessage::Developer { content, .. } => Some(content),
+        ChatMessage::Assistant { content, .. } => content.as_ref(),
+        ChatMessage::Function { .. } => None,
     }
-    Some(routed)
 }
 
-/// The image and video parts of a chat's messages.
-fn media_parts(request: &ChatCompletionRequest) -> impl Iterator<Item = &ContentPart> {
+/// A routing copy of `request`'s messages with each image and video replaced in
+/// place by a text digest of its URL. Routing text and template tokens
+/// otherwise drop media or render it as an identity-free placeholder, so
+/// requests differing only in media would share a prefix the engine's
+/// media-keyed prefix cache never shares.
+fn with_media_digests(request: &ChatCompletionRequest) -> Vec<ChatMessage> {
+    request.messages.iter().map(digested).collect()
+}
+
+/// A copy of `message` with digests in place of its media, which it never copies.
+fn digested(message: &ChatMessage) -> ChatMessage {
+    let digest = |content: &MessageContent| match content {
+        MessageContent::Parts(parts) => MessageContent::Parts(
+            parts
+                .iter()
+                .map(|part| match media_url(part) {
+                    Some((kind, url)) => ContentPart::Text {
+                        text: media_digest(kind, url),
+                    },
+                    None => part.clone(),
+                })
+                .collect(),
+        ),
+        MessageContent::Text(_) => content.clone(),
+    };
+    match message {
+        ChatMessage::System { content, name } => ChatMessage::System {
+            content: digest(content),
+            name: name.clone(),
+        },
+        ChatMessage::User { content, name } => ChatMessage::User {
+            content: digest(content),
+            name: name.clone(),
+        },
+        ChatMessage::Tool {
+            content,
+            tool_call_id,
+        } => ChatMessage::Tool {
+            content: digest(content),
+            tool_call_id: tool_call_id.clone(),
+        },
+        ChatMessage::Developer {
+            content,
+            tools,
+            name,
+        } => ChatMessage::Developer {
+            content: digest(content),
+            tools: tools.clone(),
+            name: name.clone(),
+        },
+        ChatMessage::Assistant {
+            content,
+            name,
+            tool_calls,
+            reasoning_content,
+        } => ChatMessage::Assistant {
+            content: content.as_ref().map(digest),
+            name: name.clone(),
+            tool_calls: tool_calls.clone(),
+            reasoning_content: reasoning_content.clone(),
+        },
+        ChatMessage::Function { .. } => message.clone(),
+    }
+}
+
+/// The kind and URL of each image and video part of a chat's messages.
+fn media_parts(request: &ChatCompletionRequest) -> impl Iterator<Item = (&'static str, &str)> {
     request
         .messages
         .iter()
-        .filter_map(|message| match message {
-            ChatMessage::System { content, .. }
-            | ChatMessage::User { content, .. }
-            | ChatMessage::Tool { content, .. }
-            | ChatMessage::Developer { content, .. } => Some(content),
-            ChatMessage::Assistant { content, .. } => content.as_ref(),
-            ChatMessage::Function { .. } => None,
-        })
+        .filter_map(content)
         .flat_map(|content| match content {
             MessageContent::Parts(parts) => parts.as_slice(),
             MessageContent::Text(_) => &[],
         })
-        .filter(|part| !matches!(part, ContentPart::Text { .. }))
+        .filter_map(media_url)
 }
 
 /// A media part's kind and URL; `None` for text.
@@ -149,7 +186,7 @@ fn media_url(part: &ContentPart) -> Option<(&'static str, &str)> {
 /// One digest of all of a chat's media, in order.
 fn all_media_digest(request: &ChatCompletionRequest) -> String {
     let mut hasher = xxhash_rust::xxh3::Xxh3::new();
-    for (kind, url) in media_parts(request).filter_map(media_url) {
+    for (kind, url) in media_parts(request) {
         hasher.update(kind.as_bytes());
         hasher.update(&(url.len() as u64).to_le_bytes());
         hasher.update(url.as_bytes());
@@ -187,7 +224,6 @@ impl InferenceRequest for CompletionRequest {
             batch_size,
             stream: self.is_stream(),
             return_logprob: self.logprobs.is_some(),
-            carries_media: false,
             media_count: 0,
         }
     }
@@ -212,7 +248,6 @@ impl InferenceRequest for GenerateRequest {
             batch_size,
             stream: self.is_stream(),
             return_logprob: self.return_logprob.unwrap_or(false),
-            carries_media: false,
             media_count: 0,
         }
     }
@@ -229,8 +264,9 @@ impl ParsedInference {
     /// Every ingress parses here, so an empty model is rejected for all routers.
     pub fn parse(path: &str, bytes: &[u8]) -> Result<Self, String> {
         let parsed = Self::parse_body(path, bytes)?;
+        // Reads the model only, so the media are left uncounted.
         if parsed
-            .metadata_with_text(false)
+            .metadata_of(0, false)
             .model
             .is_some_and(|model| model.trim().is_empty())
         {
@@ -413,23 +449,31 @@ impl ParsedInference {
     }
 
     /// Routing metadata with its text and, for a chat with media, its
-    /// [`RoutingChat`], built once for both. With `front_digest` (ATOM
-    /// backends), the routing text starts with [`RoutingChat::front`].
+    /// [`RoutingChat`], built once for both. `media_count` is this request's
+    /// [`Self::media_count`], counted once by the caller. With `front_digest`
+    /// (ATOM backends), the routing text starts with [`RoutingChat::front`].
     pub(crate) fn routing_metadata(
         &self,
+        media_count: usize,
         front_digest: bool,
     ) -> (InferenceMetadata, Option<RoutingChat>) {
-        let routed = self.chat().and_then(|chat| {
-            Some(RoutingChat {
-                chat: with_media_digests(chat)?,
-                front: front_digest.then(|| all_media_digest(chat)),
-            })
-        });
-        let mut metadata = self.metadata_of(routed.as_ref().map(|routed| &routed.chat), true);
-        if let Some(front) = routed.as_ref().and_then(|routed| routed.front.as_deref()) {
-            metadata.text.insert_str(0, front);
-        }
-        (metadata, routed)
+        let Some(chat) = self.chat().filter(|_| media_count > 0) else {
+            return (self.metadata_of(media_count, true), None);
+        };
+        let mut metadata = self.metadata_of(media_count, false);
+        let front = front_digest.then(|| all_media_digest(chat));
+        // The routing text reads only the messages.
+        let messages_only = ChatCompletionRequest {
+            messages: with_media_digests(chat),
+            ..Default::default()
+        };
+        metadata.text =
+            front.clone().unwrap_or_default() + &messages_only.extract_text_for_routing();
+        let routed = RoutingChat {
+            messages: messages_only.messages,
+            front,
+        };
+        (metadata, Some(routed))
     }
 
     pub fn chat(&self) -> Option<&ChatCompletionRequest> {
@@ -460,26 +504,21 @@ impl Serialize for RoutingView<'_> {
 impl InferenceRequest for ParsedInference {
     /// The routing metadata vLLM and SGLang backends get.
     fn metadata(&self) -> InferenceMetadata {
-        self.routing_metadata(false).0
+        self.routing_metadata(self.media_count(), false).0
     }
     fn metadata_with_text(&self, include_text: bool) -> InferenceMetadata {
         if include_text {
             self.metadata()
         } else {
-            self.metadata_of(None, false)
+            self.metadata_of(self.media_count(), false)
         }
     }
 }
 
 impl ParsedInference {
-    /// `digested` stands in for a chat's text.
-    fn metadata_of(
-        &self,
-        digested: Option<&ChatCompletionRequest>,
-        include_text: bool,
-    ) -> InferenceMetadata {
+    fn metadata_of(&self, media_count: usize, include_text: bool) -> InferenceMetadata {
         let mut metadata = match self {
-            Self::Chat(r) => digested.unwrap_or(r).metadata_with_text(include_text),
+            Self::Chat(r) => r.metadata_with_text(include_text),
             Self::Completion(r) => r.metadata_with_text(include_text),
             Self::Generate(r) => r.metadata_with_text(include_text),
             Self::Messages(body) | Self::Responses(body) => {
@@ -513,13 +552,11 @@ impl ParsedInference {
                     batch_size: None,
                     stream: body["stream"].as_bool().unwrap_or(false),
                     return_logprob: false,
-                    carries_media: false,
                     media_count: 0,
                 }
             }
         };
-        metadata.media_count = self.media_count();
-        metadata.carries_media = metadata.media_count > 0;
+        metadata.media_count = media_count;
         metadata
     }
 }
@@ -601,7 +638,6 @@ mod tests {
     fn text_only_chat_routing_text_is_unchanged() {
         let body = r#"{"model":"m","messages":[{"role":"system","content":"sys"},{"role":"user","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]},{"role":"assistant","content":"c","reasoning_content":"r"}]}"#;
         let request: ChatCompletionRequest = serde_json::from_str(body).unwrap();
-        assert!(with_media_digests(&request).is_none());
         assert_eq!(chat_routing_text(body), request.extract_text_for_routing());
     }
 
@@ -634,6 +670,46 @@ mod tests {
             r#""type":"video_url","video_url""#,
         );
         assert_ne!(chat_routing_text(&image), chat_routing_text(&video));
+    }
+
+    /// The digested copy is the chat's messages with each media part's text
+    /// digest in its place, every other field of every role kept.
+    #[test]
+    fn media_digests_keep_every_message_field_but_the_media() {
+        let image = |url: &str| serde_json::json!({"type": "image_url", "image_url": {"url": url, "detail": "high"}});
+        let messages = serde_json::json!([
+            {"role": "system", "content": "sys", "name": "s"},
+            {"role": "developer", "name": "d", "content": [{"type": "text", "text": "dev"}],
+             "tools": [{"type": "function", "function": {"name": "f", "parameters": {}}}]},
+            {"role": "user", "name": "u", "content": [{"type": "text", "text": "look"}, image("https://x/a.png")]},
+            {"role": "assistant", "name": "a", "reasoning_content": "r",
+             "content": [{"type": "video_url", "video_url": {"url": "https://x/v.mp4"}}],
+             "tool_calls": [{"id": "c", "type": "function", "function": {"name": "f", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c", "content": [image("https://x/b.png")]},
+            {"role": "function", "name": "f", "content": "out"},
+        ]);
+        let mut expected = messages.clone();
+        for message in expected.as_array_mut().unwrap() {
+            let Some(parts) = message["content"].as_array_mut() else {
+                continue;
+            };
+            for part in parts {
+                for kind in ["image", "video"] {
+                    if let Some(url) = part[format!("{kind}_url")]["url"].as_str() {
+                        let text = media_digest(kind, url);
+                        *part = serde_json::json!({"type": "text", "text": text});
+                    }
+                }
+            }
+        }
+        let chat = |messages| -> ChatCompletionRequest {
+            serde_json::from_value(serde_json::json!({"model": "m", "messages": messages})).unwrap()
+        };
+        let digested = with_media_digests(&chat(messages));
+        assert_eq!(
+            serde_json::to_value(digested).unwrap(),
+            serde_json::to_value(chat(expected).messages).unwrap()
+        );
     }
 
     #[test]
@@ -695,7 +771,7 @@ mod tests {
         ] {
             let parsed = ParsedInference::parse(route, body.as_bytes()).unwrap();
             assert_eq!(parsed.media_count() > 0, media, "{body}");
-            assert_eq!(parsed.metadata_with_text(false).carries_media, media);
+            assert_eq!(parsed.metadata_with_text(false).carries_media(), media);
         }
     }
 

@@ -34,6 +34,15 @@ pub fn process_chat_messages(
     request: &ChatCompletionRequest,
     tokenizer: &dyn Tokenizer,
 ) -> Result<ProcessedMessages, String> {
+    process_chat_messages_as(request, &request.messages, tokenizer)
+}
+
+/// [`process_chat_messages`] with `messages` in place of the request's own.
+pub(crate) fn process_chat_messages_as(
+    request: &ChatCompletionRequest,
+    messages: &[ChatMessage],
+    tokenizer: &dyn Tokenizer,
+) -> Result<ProcessedMessages, String> {
     let hf_tokenizer = tokenizer
         .as_any()
         .downcast_ref::<HuggingFaceTokenizer>()
@@ -56,7 +65,7 @@ pub fn process_chat_messages(
     };
 
     let content_format = hf_tokenizer.chat_template_content_format();
-    let mut transformed_messages = process_content_format(&request.messages, content_format)?;
+    let mut transformed_messages = process_content_format(messages, content_format)?;
 
     process_tool_call_arguments(&mut transformed_messages)?;
 

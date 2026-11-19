@@ -19,9 +19,14 @@ pub struct RequestDescriptor<'a> {
     pub tokens: Option<&'a [u32]>,
     pub headers: Option<&'a HeaderMap>,
     pub stream: bool,
-    pub carries_media: bool,
-    /// Media items in the request, for the route trace.
+    /// Media items in the request, as ingress counted them.
     pub media_count: usize,
+}
+
+impl RequestDescriptor<'_> {
+    pub fn carries_media(&self) -> bool {
+        self.media_count > 0
+    }
 }
 
 #[derive(Debug)]

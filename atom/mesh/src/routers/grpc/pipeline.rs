@@ -251,7 +251,6 @@ impl Pipeline {
             stream: resp_ctx.original.is_streaming(),
             // Image routing keys are HTTP chat only: this path routes on
             // the text and tokens alone.
-            carries_media: false,
             media_count: 0,
         };
         self.planner

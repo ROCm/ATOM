@@ -284,7 +284,6 @@ struct PDRequestContext<'a> {
     return_logprob: bool,
     request_text: Option<&'a str>,
     tokens: Option<&'a [u32]>,
-    carries_media: bool,
     media_count: usize,
     model_id: Option<&'a str>,
     headers: Option<Arc<HeaderMap>>,
@@ -299,7 +298,6 @@ impl<'a> PDRequestContext<'a> {
             return_logprob: metadata.return_logprob,
             request_text: Some(&metadata.text),
             tokens: None,
-            carries_media: metadata.carries_media,
             media_count: metadata.media_count,
             model_id: metadata.model.as_deref().filter(|model| !model.is_empty()),
             headers: headers.cloned().map(Arc::new),
@@ -796,7 +794,6 @@ impl PDRouter {
             tokens: context.tokens,
             headers: context.headers.as_deref(),
             stream: context.is_stream,
-            carries_media: context.carries_media,
             media_count: context.media_count,
         };
         let plan = planner
@@ -815,9 +812,11 @@ impl PDRouter {
     ) -> Response {
         let prefill = placement.prefill.clone();
         let decode = placement.decode.clone();
-        let pair =
-            self.adapter
-                .prepare_pair(prefill.as_ref(), decode.as_ref(), context.carries_media);
+        let pair = self.adapter.prepare_pair_with_media(
+            prefill.as_ref(),
+            decode.as_ref(),
+            context.media_count,
+        );
         let ctx = match pair {
             Ok(ctx) => ctx,
             Err(error) => return Self::handle_serialization_error(error),
@@ -2315,7 +2314,6 @@ mod tests {
                 return_logprob: false,
                 request_text: None,
                 tokens: None,
-                carries_media: false,
                 media_count: 0,
                 model_id: None,
                 headers: None,
@@ -3073,7 +3071,6 @@ mod tests {
             return_logprob: false,
             request_text: None,
             tokens: None,
-            carries_media: false,
             media_count: 0,
             model_id: Some("m"),
             headers: Some(Arc::new(headers)),

@@ -12,13 +12,22 @@ use crate::core::Worker;
 pub type PairCtx = Box<dyn Any + Send + Sync>;
 
 pub trait BackendAdapter: Send + Sync {
-    /// `carries_media`: the request has media, as ingress found it.
     fn prepare_pair(
         &self,
         prefill: &dyn Worker,
         decode: &dyn Worker,
-        carries_media: bool,
     ) -> Result<PairCtx, AdapterError>;
+
+    /// [`Self::prepare_pair`] for a request with `media_count` media items, as
+    /// ingress counted them, for a backend whose transfer depends on media.
+    fn prepare_pair_with_media(
+        &self,
+        prefill: &dyn Worker,
+        decode: &dyn Worker,
+        _media_count: usize,
+    ) -> Result<PairCtx, AdapterError> {
+        self.prepare_pair(prefill, decode)
+    }
 
     fn inject_prefill_fields(&self, body: &mut Value, ctx: &PairCtx) -> Result<(), AdapterError>;
 

@@ -584,8 +584,7 @@ mod c_regular_planning {
                 tokens: Some(&[1u32, 2, 3]),
                 headers: None,
                 stream: false,
-                carries_media: false,
-                media_count: 0,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -618,8 +617,7 @@ mod c_regular_planning {
                 tokens: None,
                 headers: None,
                 stream: false,
-                carries_media: false,
-                media_count: 0,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -643,8 +641,7 @@ mod c_regular_planning {
                 tokens: None,
                 headers: None,
                 stream: false,
-                carries_media: false,
-                media_count: 0,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -783,8 +780,7 @@ mod d_pd_planning {
                 tokens: None,
                 headers: None,
                 stream: false,
-                carries_media: false,
-                media_count: 0,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -898,8 +894,7 @@ mod d_pd_planning {
                 tokens: None,
                 headers: None,
                 stream: false,
-                carries_media: false,
-                media_count: 0,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1093,7 +1088,7 @@ mod e_adapter {
         let decode = make_decode_http("http://decode-1:8000", "m");
         let adapter = SglangAdapter;
         let ctx = adapter
-            .prepare_pair(prefill.as_ref(), decode.as_ref(), false)
+            .prepare_pair(prefill.as_ref(), decode.as_ref())
             .expect("prepare_pair");
         (adapter, ctx)
     }
@@ -1116,7 +1111,7 @@ mod e_adapter {
         let decode = make_decode_http("http://decode-2:8000", "m");
         let adapter = SglangAdapter;
         let ctx = adapter
-            .prepare_pair(prefill.as_ref(), decode.as_ref(), false)
+            .prepare_pair(prefill.as_ref(), decode.as_ref())
             .unwrap();
         let mut body = json!({});
         adapter.inject_prefill_fields(&mut body, &ctx).unwrap();
@@ -1206,7 +1201,7 @@ mod e_adapter {
         let decode = make_decode_http("http://decode:8000", "m");
         let adapter = VllmAdapter::new(vllm_info_with(prefill_url, dp_rank));
         let ctx = adapter
-            .prepare_pair(prefill.as_ref(), decode.as_ref(), false)
+            .prepare_pair(prefill.as_ref(), decode.as_ref())
             .expect("prepare_pair");
         (adapter, ctx)
     }
@@ -1283,7 +1278,7 @@ mod e_adapter {
         let decode = make_decode_http("http://decode:8000", "m");
         let adapter = VllmAdapter::new(vllm_info_with("http://other:8000", 0));
         let err = adapter
-            .prepare_pair(prefill.as_ref(), decode.as_ref(), false)
+            .prepare_pair(prefill.as_ref(), decode.as_ref())
             .unwrap_err();
         assert_eq!(
             err,
@@ -1340,7 +1335,7 @@ mod e_adapter {
         let decode = make_decode_http("http://decode:8000", "m");
         let adapter = VllmAdapter::new(vllm_info_with("http://p:8000", 7));
         let err = adapter
-            .prepare_pair(prefill.as_ref(), decode.as_ref(), false)
+            .prepare_pair(prefill.as_ref(), decode.as_ref())
             .unwrap_err();
         assert_eq!(
             err,
@@ -1426,7 +1421,7 @@ mod f_atom_adapter {
         let decode = make_decode_http("http://decode:8000", "m");
         let adapter = AtomAdapter::new(atom_info_with(prefill_url, tp_size));
         let ctx = adapter
-            .prepare_pair(prefill.as_ref(), decode.as_ref(), false)
+            .prepare_pair(prefill.as_ref(), decode.as_ref())
             .expect("prepare_pair");
         (adapter, ctx)
     }
@@ -2006,7 +2001,7 @@ mod h_integration {
 
         let adapter = SglangAdapter;
         let ctx = adapter
-            .prepare_pair(p.as_ref(), d.as_ref(), false)
+            .prepare_pair(p.as_ref(), d.as_ref())
             .expect("prepare");
         let mut prefill_body = json!({"prompt": "hello"});
         let mut decode_body = prefill_body.clone();
@@ -2067,7 +2062,7 @@ mod h_integration {
         });
         let adapter = VllmAdapter::new(info);
         let ctx = adapter
-            .prepare_pair(p.as_ref(), d.as_ref(), false)
+            .prepare_pair(p.as_ref(), d.as_ref())
             .expect("prepare");
 
         let mut prefill_body = json!({"prompt": "hi"});
@@ -2122,7 +2117,7 @@ mod h_integration {
         };
 
         let adapter = SglangAdapter;
-        let ctx = adapter.prepare_pair(p.as_ref(), d.as_ref(), false).unwrap();
+        let ctx = adapter.prepare_pair(p.as_ref(), d.as_ref()).unwrap();
         let mut body = json!({"prompt": ["a", "b", "c"]});
         adapter
             .inject_batch_prefill_fields(&mut body, &ctx, 3)
@@ -2161,8 +2156,7 @@ mod h_integration {
             tokens: Some(&tokens),
             headers: Some(&headers),
             stream: false,
-            carries_media: false,
-            media_count: 0,
+            ..Default::default()
         };
 
         for _ in 0..2 {

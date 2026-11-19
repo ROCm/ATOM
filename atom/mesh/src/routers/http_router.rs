@@ -460,7 +460,6 @@ impl RouterTrait for Router {
             tokens: tokens.as_deref(),
             headers: Some(&request.headers),
             stream: metadata.stream,
-            carries_media: metadata.carries_media,
             media_count: metadata.media_count,
         };
         let policy = self.policies.regular_policy(metadata.model.as_deref());
