@@ -552,6 +552,7 @@ def _kda_layer(model, calls):
         num_local_heads=KDA_HEADS,
         local_proj_size=width,
         fuse_f_a_quant=False,
+        quant_f_a_strided=False,
         conv_weight=None,
         in_proj=lambda x, x_scale=None: nn.functional.linear(x, w_in),
         f_b_proj=lambda x: nn.functional.linear(x, w_f),

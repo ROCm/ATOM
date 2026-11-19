@@ -1293,6 +1293,16 @@ class KimiKDAAttention(nn.Module):
         self.fuse_f_a_quant = (
             f_b_type == QuantType.per_Token and f_b_dtype == dtypes.fp8
         )
+        # Under 128x128 block FP8 with E8M0 scales (checked at forward: online quant
+        # sets f_b_proj's scale dtype after loading) the per-group quant kernel reads
+        # the slice's row stride itself, so the gather folds into f_b_proj's
+        # activation quant: one kernel instead of a copy and a quant, and only the
+        # quantized result is written.
+        self.quant_f_a_strided = (
+            not self.fuse_f_a_quant
+            and f_b_type == QuantType.per_1x128
+            and f_b_dtype == dtypes.fp8
+        )
 
     def get_streaming_deferred_modules(self) -> tuple[nn.Module, ...]:
         """Children that must remain unquantized until KDA fuses their weights."""
@@ -1784,6 +1794,16 @@ class KimiKDAAttention(nn.Module):
             from atom.model_ops.kimi_k3 import strided_per_token_quant
 
             f_a, f_a_scale = strided_per_token_quant(f_a_view, dtypes.fp8)
+            gate = self.f_b_proj(f_a, x_scale=f_a_scale)
+        elif self.quant_f_a_strided and self.f_b_proj.blockscale_e8m0_scale:
+            from atom.model_ops.linear import per_1x128_e8m0_quant
+
+            f_a, f_a_scale = per_1x128_e8m0_quant(
+                f_a_view,
+                quant_dtype=self.f_b_proj.params_dtype,
+                transpose_scale=envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE,
+                scale=getattr(self.f_b_proj, "input_scale", None),
+            )
             gate = self.f_b_proj(f_a, x_scale=f_a_scale)
         else:
             # Not .contiguous(): it returns a one-row view as is (size-1 dims
