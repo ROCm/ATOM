@@ -23,6 +23,7 @@ use super::workflow_data::TokenizerWorkflowData;
 use crate::{
     app_context::AppContext,
     config::TokenizerCacheConfig,
+    routers::prepare::fast_tokenizer::{with_fastokens, FastTokenizer},
     tokenizer::{
         cache::{CacheConfig, CachedTokenizer},
         chat_template::ChatTemplateParams,
@@ -106,6 +107,7 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
         let chat_template = config.chat_template_path.clone();
         let cache_config = config.cache_config.clone();
         let chats_without_template = app_context.chats_without_template.clone();
+        let fastokens = app_context.router_config.fastokens.clone();
 
         // Load the tokenizer using the registry's load method
         // This handles: validation, deduplication, and loading
@@ -118,6 +120,7 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
                 let chat_template = chat_template.clone();
                 let cache_cfg = cache_config.clone();
                 let chats_without_template = chats_without_template.clone();
+                let fastokens = fastokens.clone();
                 async move {
                     // Load base tokenizer
                     let base_tokenizer = factory::create_tokenizer_async_with_chat_template(
@@ -126,6 +129,8 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
                     )
                     .await
                     .map_err(|e| format!("Failed to load tokenizer: {}", e))?;
+                    let base_tokenizer =
+                        with_fastokens(base_tokenizer, &name, &source, &fastokens).await?;
                     probe_chat_render(
                         &chats_without_template,
                         &id,
@@ -134,6 +139,10 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
                         chat_template.as_deref(),
                     )
                     .await;
+                    // fastokens has a cache of its own, `--fastokens-segment-cache-mb`.
+                    if base_tokenizer.as_any().is::<FastTokenizer>() {
+                        return Ok(base_tokenizer);
+                    }
 
                     // Wrap with caching layer if configured
                     let tokenizer: Arc<dyn Tokenizer> = match cache_cfg {
@@ -316,9 +325,13 @@ mod tests {
 
     use super::*;
     use crate::{
+        config::RouterConfig,
         routers::{
             comm::tokenize::remove_tokenizer,
-            test_mocks::{app_context::app_context, tokenizer::hf_tokenizer_path},
+            test_mocks::{
+                app_context::{app_context, app_context_with_router_config},
+                tokenizer::{byte_level_tokenizer_dir, hf_tokenizer_path, BYTE_LEVEL_MERGES},
+            },
         },
         tokenizer::{registry::TokenizerRegistry, HuggingFaceTokenizer},
     };
@@ -381,6 +394,68 @@ mod tests {
         assert!(!marked(&jinja));
         remove_tokenizer(&context, &deepseek).await;
         assert!(!marked(&deepseek));
+    }
+
+    /// A model `--fastokens-models` lists encodes with fastokens, which leaves the
+    /// tokenizer cache out; one fastokens cannot load keeps HuggingFace, or fails
+    /// to register under `--fastokens-strict`.
+    #[tokio::test]
+    async fn test_registration_encodes_listed_models_with_fastokens() {
+        async fn register(
+            context: &Arc<AppContext>,
+            source: &str,
+        ) -> Result<Arc<dyn Tokenizer>, WorkflowError> {
+            let id = TokenizerRegistry::generate_id();
+            let config = TokenizerConfigRequest {
+                id: id.clone(),
+                name: id.clone(),
+                source: source.to_string(),
+                chat_template_path: None,
+                cache_config: Some(TokenizerCacheConfig {
+                    enable_l0: true,
+                    l0_max_entries: 16,
+                    enable_l1: false,
+                    l1_max_memory: 0,
+                }),
+                fail_on_duplicate: true,
+            };
+            let mut workflow = WorkflowContext::new(
+                WorkflowInstanceId::new(),
+                create_tokenizer_workflow_data(config, context.clone()),
+            );
+            LoadTokenizerStep.execute(&mut workflow).await?;
+            Ok(context.tokenizer_registry.get_by_id(&id).unwrap().tokenizer)
+        }
+
+        let byte_level = byte_level_tokenizer_dir(BYTE_LEVEL_MERGES, true, json!({}));
+        let byte_level = byte_level.path().to_str().unwrap();
+        let mut config = RouterConfig::default();
+        let context = app_context_with_router_config(config.clone());
+        let unlisted = register(&context, byte_level).await.unwrap();
+        assert!(unlisted.as_any().is::<CachedTokenizer>());
+
+        config.fastokens.models = vec![byte_level.to_string()];
+        let context = app_context_with_router_config(config.clone());
+        let fast = register(&context, byte_level).await.unwrap();
+        assert!(fast.as_any().is::<FastTokenizer>());
+        assert_eq!(
+            fast.encode("the weather", true).unwrap().token_ids(),
+            unlisted.encode("the weather", true).unwrap().token_ids()
+        );
+
+        // The fixture's `Whitespace` pre-tokenizer is not one fastokens has.
+        config.fastokens.models = vec!["*".to_string()];
+        let context = app_context_with_router_config(config.clone());
+        let kept = register(&context, hf_tokenizer_path()).await.unwrap();
+        assert!(kept.as_any().is::<CachedTokenizer>());
+        config.fastokens.strict = true;
+        let context = app_context_with_router_config(config);
+        let error = register(&context, hf_tokenizer_path()).await.err().unwrap();
+        assert!(
+            error.to_string().contains("fastokens cannot encode"),
+            "{error}"
+        );
+        assert!(context.tokenizer_registry.list().is_empty());
     }
 
     #[test]

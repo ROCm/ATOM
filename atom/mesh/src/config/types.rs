@@ -60,6 +60,8 @@ pub struct RouterConfig {
     pub ext_proc: crate::ext_proc::ExtProcConfig,
     #[serde(default)]
     pub prepare_pool: PreparePoolConfig,
+    #[serde(default)]
+    pub fastokens: FastokensConfig,
     pub mode: RoutingMode,
     #[serde(default)]
     pub backend: BackendType,
@@ -166,6 +168,56 @@ impl Default for PreparePoolConfig {
             prepare_timeout_ms: DEFAULT_PREPARE_TIMEOUT_MS,
             max_tokenize_bytes: None,
         }
+    }
+}
+
+/// Default `--fastokens-max-tokenize-bytes`, unless `--prepare-max-tokenize-bytes`
+/// is larger.
+pub const DEFAULT_FASTOKENS_MAX_TOKENIZE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Encoding prompts with fastokens rather than HuggingFace `tokenizers`.
+#[derive(Debug, Clone, Default, clap::Args, Serialize, Deserialize, PartialEq, Eq)]
+#[command(next_help_heading = "Tokenization")]
+#[serde(default)]
+pub struct FastokensConfig {
+    /// Models whose prompts encode with fastokens, by the name or source their
+    /// tokenizer registers under, or `*` for every model. Decoding and chat
+    /// templates stay with HuggingFace, and so does a model whose prompts
+    /// fastokens does not encode as HuggingFace does.
+    #[arg(
+        id = "fastokens_models",
+        long = "fastokens-models",
+        num_args = 1..,
+        value_delimiter = ','
+    )]
+    pub models: Vec<String>,
+    /// Fail to register such a model's tokenizer instead of keeping HuggingFace.
+    #[arg(id = "fastokens_strict", long = "fastokens-strict")]
+    pub strict: bool,
+    /// Tokenization byte limit for those models (default: 64 MiB, or
+    /// --prepare-max-tokenize-bytes when larger).
+    #[arg(
+        id = "fastokens_max_tokenize_bytes",
+        long = "fastokens-max-tokenize-bytes"
+    )]
+    pub max_tokenize_bytes: Option<usize>,
+    /// fastokens' segment cache per tokenizer, in MiB; 0 turns it off (default:
+    /// FASTOKENS_SEGMENT_CACHE, unset by default).
+    #[arg(id = "fastokens_segment_cache_mb", long = "fastokens-segment-cache-mb")]
+    pub segment_cache_mb: Option<usize>,
+}
+
+impl FastokensConfig {
+    /// Whether the tokenizer registered as `name` from `source` encodes with fastokens.
+    pub fn covers(&self, name: &str, source: &str) -> bool {
+        self.models
+            .iter()
+            .any(|model| model == "*" || model == name || model == source)
+    }
+
+    pub fn segment_cache_bytes(&self) -> Option<usize> {
+        self.segment_cache_mb
+            .map(|mb| mb.saturating_mul(1024 * 1024))
     }
 }
 
@@ -444,6 +496,7 @@ impl Default for RouterConfig {
             #[cfg(feature = "ext-proc")]
             ext_proc: Default::default(),
             prepare_pool: PreparePoolConfig::default(),
+            fastokens: FastokensConfig::default(),
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
             },
@@ -536,6 +589,13 @@ impl RouterConfig {
         self.effective_prepare_pool()
             .max_tokenize_bytes
             .unwrap_or(DEFAULT_MAX_TOKENIZE_BYTES)
+    }
+
+    /// The tokenization byte limit for the models fastokens encodes.
+    pub fn resolved_fastokens_max_tokenize_bytes(&self) -> usize {
+        self.fastokens.max_tokenize_bytes.unwrap_or_else(|| {
+            DEFAULT_FASTOKENS_MAX_TOKENIZE_BYTES.max(self.resolved_max_tokenize_bytes())
+        })
     }
 
     /// Create a new configuration with mode and policy

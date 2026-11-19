@@ -162,6 +162,102 @@ async fn chats_rendered_without_their_template_are_not_tokenized() {
         }
     }
 }
+
+fn prefix_hash() -> crate::config::PolicyConfig {
+    crate::config::PolicyConfig::PrefixHash {
+        prefix_token_count: 4,
+        load_factor: 1.25,
+    }
+}
+
+/// A byte-level tokenizer twice: as HuggingFace loads it, and encoding with fastokens.
+fn huggingface_and_fastokens(
+    chat_template: &str,
+) -> (
+    tempfile::TempDir,
+    Arc<dyn crate::tokenizer::traits::Tokenizer>,
+    Arc<dyn crate::tokenizer::traits::Tokenizer>,
+) {
+    use crate::routers::test_mocks::tokenizer::{byte_level_tokenizer_dir, BYTE_LEVEL_MERGES};
+    let config = json!({"chat_template": chat_template});
+    let dir = byte_level_tokenizer_dir(BYTE_LEVEL_MERGES, false, config);
+    let path = dir.path().join("tokenizer.json");
+    let hf = crate::tokenizer::factory::create_tokenizer(path.to_str().unwrap()).unwrap();
+    let fast = crate::routers::prepare::fast_tokenizer::FastTokenizer::new(hf.clone(), &path, None);
+    (dir, hf, Arc::new(fast.unwrap()))
+}
+
+/// Models fastokens encodes tokenize up to a limit of their own, and render their
+/// chats with the HuggingFace template.
+#[tokio::test]
+async fn fastokens_models_tokenize_up_to_their_own_limit() {
+    let mut config = crate::config::RouterConfig {
+        policy: prefix_hash(),
+        ..Default::default()
+    };
+    config.prepare_pool.max_tokenize_bytes = Some(16);
+    config.fastokens.max_tokenize_bytes = Some(1024);
+    let _pool = PreparePoolRuntime::new(default_pool()).unwrap();
+    let app = AppContext::from_config(config, 5, _pool.handle())
+        .await
+        .unwrap();
+    let template =
+        "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}";
+    let (_dir, hf, fast) = huggingface_and_fastokens(template);
+    for (model, tokenizer) in [("hf", hf.clone()), ("fast", fast)] {
+        app.tokenizer_registry
+            .load(&TokenizerRegistry::generate_id(), model, model, || async {
+                Ok(tokenizer)
+            })
+            .await
+            .unwrap();
+    }
+    let prompt = "the weather in 2026 is fine";
+    for (route, body, text) in [
+        (
+            "/v1/completions",
+            json!({"prompt": prompt}),
+            prompt.to_string(),
+        ),
+        (
+            "/v1/chat/completions",
+            json!({"messages": [{"role": "user", "content": prompt}]}),
+            format!("<|im_start|>user\n{prompt}<|im_end|>\n"),
+        ),
+    ] {
+        for model in ["hf", "fast"] {
+            let mut body = body.clone();
+            body["model"] = json!(model);
+            let parsed =
+                ParsedInference::parse(route, &serde_json::to_vec(&body).unwrap()).unwrap();
+            let routing = IngressRouting::new(&app);
+            let result = app
+                .prepare_pool
+                .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
+                    routing.prepare(&parsed, ctx)
+                })
+                .await
+                .unwrap()
+                .wait()
+                .await
+                .unwrap();
+            if model == "hf" {
+                assert_eq!(
+                    result.unwrap_err().code,
+                    "tokenizer_input_too_large",
+                    "{route}"
+                );
+            } else {
+                let tokens = result.unwrap().1.unwrap();
+                assert_eq!(
+                    tokens,
+                    hf.encode(&text, false).unwrap().token_ids(),
+                    "{route}"
+                );
+            }
+        }
+    }
+}
 fn json_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -883,6 +979,7 @@ async fn tokenize_endpoint_limits_the_total_prompt_bytes() {
     let pool = PreparePoolRuntime::new(default_pool()).unwrap();
     let mut config = crate::config::RouterConfig::default();
     config.prepare_pool.max_tokenize_bytes = Some(11);
+    config.fastokens.max_tokenize_bytes = Some(20);
     let context = Arc::new(
         AppContext::from_config(config, 5, pool.handle())
             .await
@@ -895,16 +992,38 @@ async fn tokenize_endpoint_limits_the_total_prompt_bytes() {
         .load("limited", "m", "mock", || async { Ok(tokenizer) })
         .await
         .unwrap();
-    for (prompt, status) in [
-        (json!("hello world"), http::StatusCode::OK),
-        (json!(["hello", "world!"]), http::StatusCode::OK),
-        (json!("hello world!"), http::StatusCode::PAYLOAD_TOO_LARGE),
+    let (_dir, _, fast) = huggingface_and_fastokens("");
+    context
+        .tokenizer_registry
+        .load("fast", "fast", "fast", || async { Ok(fast) })
+        .await
+        .unwrap();
+    for (model, prompt, status) in [
+        ("m", json!("hello world"), http::StatusCode::OK),
+        ("m", json!(["hello", "world!"]), http::StatusCode::OK),
         (
+            "m",
+            json!("hello world!"),
+            http::StatusCode::PAYLOAD_TOO_LARGE,
+        ),
+        (
+            "m",
             json!(["hello", "world!!"]),
             http::StatusCode::PAYLOAD_TOO_LARGE,
         ),
+        // Models fastokens encodes have a limit of their own.
+        (
+            "fast",
+            json!(["hello world", "again!!!!"]),
+            http::StatusCode::OK,
+        ),
+        (
+            "fast",
+            json!("hello world, again!!!"),
+            http::StatusCode::PAYLOAD_TOO_LARGE,
+        ),
     ] {
-        let request = json_request("/v1/tokenize", json!({"model": "m", "prompt": prompt}));
+        let request = json_request("/v1/tokenize", json!({"model": model, "prompt": prompt}));
         let response = crate::routers::comm::tokenize::tokenize(&context, request).await;
         assert_eq!(response.status(), status, "{prompt}");
         if status == http::StatusCode::PAYLOAD_TOO_LARGE {
