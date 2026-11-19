@@ -1400,25 +1400,14 @@ class MooncakeConnector(KVConnectorBase):
         block/slot reaches; that degenerate case is logged and left unaligned.
         """
         mc = self._MAX_RDMA_CHUNK_BYTES
-        sizes: list[int] = []
-        offset = 0
-        while offset < total_bytes:
-            remaining = total_bytes - offset
-            chunk = min(mc, remaining)
-            if chunk < remaining and unit_bytes > 0:
-                aligned = chunk - (chunk % unit_bytes)
-                if aligned > 0:
-                    chunk = aligned
-                else:
-                    logger.warning(
-                        "RDMA unit_bytes=%d exceeds max chunk %d; a block will "
-                        "straddle an MR boundary and its transfer may fail",
-                        unit_bytes,
-                        mc,
-                    )
-            sizes.append(chunk)
-            offset += chunk
-        return sizes
+        if total_bytes > mc and unit_bytes > mc:
+            logger.warning(
+                "RDMA unit_bytes=%d exceeds max chunk %d; a block will "
+                "straddle an MR boundary and its transfer may fail",
+                unit_bytes,
+                mc,
+            )
+        return KVTransferRegion.chunk_sizes(total_bytes, unit_bytes, mc)
 
     @classmethod
     def kv_budget_reserve_bytes(cls, config) -> int:
@@ -3398,7 +3387,8 @@ class MooncakeConnector(KVConnectorBase):
                 )
             # Wait only for this request's prefill writes; unrelated GPU work
             # can continue on other streams while the staging stream is blocked.
-            self._send_worker_stream().wait_event(kv_cache_ready_event)
+            stream = self._send_worker_stream()
+            stream.wait_event(kv_cache_ready_event)
             for dst_start in range(
                 0, len(dst_block_ids), self._index_staging_chunk_pages
             ):
@@ -3408,7 +3398,10 @@ class MooncakeConnector(KVConnectorBase):
                 chunk_plan = sharded_plan.slice_pages(
                     dst_start, dst_start + len(dst_chunk)
                 )
-                gather_indices = self._prepare_sharded_index(chunk_plan)
+                # On the gathers' stream: the uploads wait for this request's ready
+                # event, not the forward, and the gathers run after the index kernels.
+                with torch.cuda.stream(stream):
+                    gather_indices = self._prepare_sharded_index(chunk_plan)
 
                 for region_idx, dst_base, bpb in staged_regions:
                     if not self._execute_staged_index_layer_chunk(

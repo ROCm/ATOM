@@ -25,20 +25,32 @@ from atom.mono.runtime.compile import trace
 
 TOKENS = 4  # one request: the token and its 3 MTP drafts
 INDEX_HEADS = TP
+WIDE_TOKENS = 8  # the expert-grouped MoE
 
 
 @pytest.fixture(scope="module")
 def traces():
     with pytest.MonkeyPatch.context() as patch:
         patch.setenv("ARCH", "gfx950")
+        fused = contract.build_layer(TOKENS, INDEX_HEADS, fused_shared=True)
+        fused_wide = contract.build_layer(WIDE_TOKENS, 1, fused_shared=True)
         return {
             "layer": trace(contract.build_layer(TOKENS, INDEX_HEADS), K4_ABI),
+            "fused": trace(fused, K4_ABI),
+            "fused_wide": trace(fused_wide, K4_ABI),
             "dense": trace(contract.build_dense(TOKENS), DENSE_POST_ABI),
         }
 
 
 def test_the_layer_kernel_holds(traces):
     check(traces["layer"], mailbox_regions(TOKENS, INDEX_HEADS, True, True))
+
+
+def test_the_fused_shared_expert_layer_kernels_hold(traces):
+    """The shared expert fused into the routed tables (every expert a8w4): the
+    narrow and the expert-grouped MoE."""
+    check(traces["fused"], mailbox_regions(TOKENS, INDEX_HEADS, True, True, True))
+    check(traces["fused_wide"], mailbox_regions(WIDE_TOKENS, 1, True, True, True))
 
 
 def test_the_dense_layer_kernel_holds(traces):

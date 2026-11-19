@@ -96,6 +96,10 @@ def test_startup_snapshots_runtime_layout_for_scheduler_and_worker(
     assert worker.index_cache_layout == expected
     assert offcfg.build_page_namespace(worker, cfg, 4) == scheduler_namespace
     assert worker.compute_hash() == compile_hash
+    # FP4PTPC traces other GEMMs than the native checkpoint.
+    worker.hf_config.fp4ptpc = True
+    assert worker.compute_hash() != compile_hash
+    worker.hf_config.fp4ptpc = False
     worker.index_cache_layout = "natural" if expected != "natural" else "mfma"
     assert offcfg.build_page_namespace(worker, cfg, 4) != scheduler_namespace
     assert worker.compute_hash() != compile_hash

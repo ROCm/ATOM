@@ -159,8 +159,8 @@ def test_flag_off_builds_no_stream(cuda, monkeypatch):
     assert cuda == []
 
 
-def _init_call_lines(name):
-    """Lines in `ModelRunner.__init__` that call `name`, outermost first."""
+def _init_calls():
+    """`(line, callee name)` for every call in `ModelRunner.__init__`."""
     module = ast.parse(MODEL_RUNNER.read_text())
     owner = next(
         node
@@ -172,15 +172,15 @@ def _init_call_lines(name):
         for node in owner.body
         if isinstance(node, ast.FunctionDef) and node.name == "__init__"
     )
-    lines = []
+    calls = []
     for node in ast.walk(init):
         if not isinstance(node, ast.Call):
             continue
         f = node.func
-        called = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", None)
-        if called == name:
-            lines.append(node.lineno)
-    return sorted(lines)
+        name = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", None)
+        if name:
+            calls.append((node.lineno, name))
+    return calls
 
 
 def test_the_thread_switches_streams_only_once_the_weights_are_loaded():
@@ -190,15 +190,24 @@ def test_the_thread_switches_streams_only_once_the_weights_are_loaded():
     `process_weights_after_loading` racing the copies, for silently wrong
     weights. `enter_compute_stream` drains the device before it switches, so
     the ordering is the call's position in `__init__`.
-    """
-    switch = _init_call_lines("enter_compute_stream")
-    assert len(switch) == 1, "one switch, or this test checks the wrong one"
-    loads = _init_call_lines("_build_and_load_model") + _init_call_lines("load_model")
-    assert loads, "no model load found in __init__; has it been renamed?"
 
-    assert switch[0] > max(loads), (
-        f"enter_compute_stream at line {switch[0]} runs before a model load at "
-        f"{sorted(loads)}; the loader threads' copies are unordered against it"
+    Matched by name shape rather than exact names: the loading entry points
+    have already been restructured once under this branch, and a rename that
+    left this test matching nothing would retire it silently.
+    """
+    calls = _init_calls()
+    switch = [line for line, name in calls if name == "enter_compute_stream"]
+    assert len(switch) == 1, "one switch, or this test checks the wrong one"
+    loads = {
+        name: line
+        for line, name in calls
+        if "load" in name.lower() or name == "get_model"
+    }
+    assert loads, "no model load found in __init__; have they been renamed?"
+
+    assert switch[0] > max(loads.values()), (
+        f"enter_compute_stream at line {switch[0]} runs before a weight load "
+        f"({loads}); the loader threads' copies are unordered against it"
     )
 
 
