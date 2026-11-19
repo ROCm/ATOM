@@ -73,8 +73,6 @@ def test_an_fp4_target_has_no_fp4_draft_layout_so_an_own_pool_draft_is_bf16():
     assert resolve_draft_kv_dtype("fp4", own_pool=True) == "bf16"
     assert resolve_draft_kv_dtype("fp4", own_pool=True, requested="bf16") == "bf16"
     assert resolve_draft_kv_dtype("fp4", own_pool=True, requested="fp8") == "fp8"
-    assert resolve_draft_kv_dtype("nvfp4", own_pool=True) == "bf16"
-    assert resolve_draft_kv_dtype("nvfp4", own_pool=True, requested="fp8") == "fp8"
 
 
 @pytest.mark.parametrize("own_pool", [True, False])

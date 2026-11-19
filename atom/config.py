@@ -3322,24 +3322,10 @@ class Config:
                 own_pool=draft_owns_kv_pool(self),
                 requested=spec.kv_cache_dtype,
             )
-            # MiniMax-M3's lmcache_offload PAGE layout appends an own-pool draft's
-            # pages after the target's as bytes of their own, and the PAGE
-            # namespace hashes the whole speculative_config, draft KV dtype
-            # included, so a draft of another dtype never shares a key with the
-            # target's. Other offload layouts and P/D connectors are not verified.
-            draft_dtype_offload_ok = (
-                draft_owns_kv_pool(self)
-                and is_m3
-                and isinstance(self.kv_transfer_config, dict)
-                and self.kv_transfer_config.get("kv_connector") == "lmcache_offload"
-            )
-            if (
-                spec.draft_kv_dtype != self.kv_cache_dtype
-                and self.kv_transfer_config
-                and not draft_dtype_offload_ok
-            ):
-                # These move pages under the target's KV dtype alone. The flag has
-                # no fp4 / nvfp4 to match an FP4 target with.
+            if spec.draft_kv_dtype != self.kv_cache_dtype and self.kv_transfer_config:
+                # The offload namespace keys the target's KV dtype alone, so a
+                # draft page of another dtype would share a key with the target's.
+                # The flag has no fp4 / nvfp4 to match an FP4 target with.
                 hint = (
                     ""
                     if self.kv_cache_dtype in FP4_CACHE_DTYPES

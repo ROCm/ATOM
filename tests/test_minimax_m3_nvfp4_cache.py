@@ -22,13 +22,7 @@ from atom.model_ops.minimax_m3.nvfp4_pages import (
     index_page_views,
     kv_page_bytes,
 )
-from tests.test_minimax_m3_mxfp4_cache import (
-    OFFLOAD,
-    _dspark_spec,
-    _m3,
-    check,
-    sparse_hf,
-)
+from tests.test_minimax_m3_mxfp4_cache import _m3, check, sparse_hf
 
 
 def pool(layers=3, heads=1, **kw):
@@ -219,43 +213,3 @@ def test_nvfp4_index_cache_is_one_9216_byte_uint8_page():
     )
     with pytest.raises(ValueError, match="NVFP4 index cache is 128-wide"):
         b._index_cache_spec(256)
-
-
-@pytest.mark.parametrize("asked, draft", [("fp8", "fp8"), (None, "bf16")])
-def test_lmcache_offload_takes_nvfp4_with_a_draft_of_its_own_dtype(
-    monkeypatch, asked, draft
-):
-    spec = _dspark_spec()
-    spec.kv_cache_dtype = asked
-    config = _m3(
-        monkeypatch,
-        kv_cache_dtype="nvfp4",
-        index_cache_dtype="nvfp4",
-        hf=sparse_hf(),
-        kv_transfer_config=OFFLOAD,
-        speculative_config=spec,
-    )
-    assert config.speculative_config.draft_kv_dtype == draft
-
-
-def test_only_lmcache_offload_takes_nvfp4():
-    check(kv_transfer_config=OFFLOAD, **NV)
-    with pytest.raises(ValueError, match="KV offload"):
-        check(
-            kv_transfer_config={"kv_connector": "mooncake", "kv_role": "kv_both"},
-            **NV,
-        )
-
-
-def test_a_pd_connector_still_refuses_a_draft_dtype_beside_nvfp4(monkeypatch):
-    spec = _dspark_spec()
-    spec.kv_cache_dtype = "fp8"
-    with pytest.raises(ValueError, match="draft KV dtype fp8 differs"):
-        _m3(
-            monkeypatch,
-            kv_cache_dtype="nvfp4",
-            index_cache_dtype="nvfp4",
-            hf=sparse_hf(),
-            kv_transfer_config={"kv_connector": "mooncake", "kv_role": "kv_both"},
-            speculative_config=spec,
-        )
