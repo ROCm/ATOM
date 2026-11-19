@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from atom.utils import CpuGpuBuffer
-from atom.utils.h2d import PublicationError
+from atom.utils.h2d import PublicationError, capturing
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_H2D_GPU_TESTS") != "1", reason="set RUN_H2D_GPU_TESTS=1"
@@ -289,6 +289,7 @@ def test_capture_preparation_uses_checked_state_sources(monkeypatch, replay):
     before = builder.non_spec_state_indices_tensor.cpu.clone()
     with (
         torch.cuda.graph(torch.cuda.CUDAGraph()),
+        capturing(),
         pytest.raises(PublicationError, match="before actual graph capture"),
     ):
         builder._prepare_state_indices_for_capture(2)

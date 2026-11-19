@@ -10,9 +10,34 @@ from __future__ import annotations
 
 import operator
 import threading
+from contextlib import contextmanager
 from functools import wraps
 
 import torch
+
+# Graph captures in progress. _check_active runs on every publication and reads
+# this instead of torch.cuda.is_current_stream_capturing() (~8 us a call in a
+# serving process). Captures must be made through region_graph, which counts
+# every capture it starts, or inside capturing().
+_CAPTURING = [0]
+
+
+def capture_started() -> None:
+    _CAPTURING[0] += 1
+
+
+def capture_ended() -> None:
+    _CAPTURING[0] -= 1
+
+
+@contextmanager
+def capturing():
+    """Mark a graph capture made outside region_graph."""
+    capture_started()
+    try:
+        yield
+    finally:
+        capture_ended()
 
 
 class PublicationError(RuntimeError):
@@ -187,7 +212,7 @@ class PublicationOwner:
         if self.device.type == "cuda":
             if torch.cuda.current_device() != self.device.index:
                 raise PublicationError("publication on the wrong device")
-            if torch.cuda.is_current_stream_capturing():
+            if _CAPTURING[0]:
                 raise PublicationError("publish metadata before actual graph capture")
             if self._get_current_stream is not None:
                 same_stream = (

@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from atom.utils import CpuGpuBuffer
-from atom.utils.h2d import PublicationError
+from atom.utils.h2d import PublicationError, capturing
 from atom.utils.tbo import decode_ubatch_request_ranges
 
 pytestmark = pytest.mark.skipif(
@@ -481,7 +481,11 @@ def test_qsa_capture_rejected_before_raw_source_write(monkeypatch):
     before = runner.forward_vars["qsa_token_to_req"].cpu.clone()
     # Preflight must fail before a host fill even for an empty publication.
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph), pytest.raises(PublicationError, match="capture"):
+    with (
+        torch.cuda.graph(graph),
+        capturing(),
+        pytest.raises(PublicationError, match="capture"),
+    ):
         builder._build_qsa_metadata(None, 0, 0, np.array([], dtype=np.int64), 0)
     assert torch.equal(before, runner.forward_vars["qsa_token_to_req"].cpu)
     finish(runner)

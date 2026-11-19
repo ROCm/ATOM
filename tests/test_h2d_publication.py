@@ -12,7 +12,12 @@ import pytest
 import torch
 
 from atom.utils import CpuGpuBuffer
-from atom.utils.h2d import PublicationError, PublicationOwner, PublicationRegistry
+from atom.utils.h2d import (
+    PublicationError,
+    PublicationOwner,
+    PublicationRegistry,
+    capturing,
+)
 
 
 def buffer(*shape, dtype=torch.int32, device="cpu"):
@@ -408,7 +413,7 @@ def test_publish_before_graph_replay_and_reject_actual_capture():
     output = torch.empty_like(a.gpu)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    with torch.cuda.graph(graph), capturing():
         output.copy_(a.gpu)
         with pytest.raises(PublicationError, match="actual graph capture"):
             group.publish((None, None))
@@ -651,7 +656,7 @@ def test_capture_and_other_thread_reject_without_consuming_publication(fast, bac
     output = torch.empty_like(buffers[0].gpu)
     graph = torch.cuda.CUDAGraph()
     torch.cuda.synchronize()
-    with torch.cuda.graph(graph):
+    with torch.cuda.graph(graph), capturing():
         output.copy_(buffers[0].gpu)
         with pytest.raises(PublicationError, match="actual graph capture"):
             group.publish((8, 8))

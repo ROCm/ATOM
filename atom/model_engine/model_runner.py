@@ -2822,6 +2822,8 @@ class ModelRunner:
         total_tokens_num = batch.total_tokens_num
         assert total_tokens_num > 0
 
+        # Before the step's GPU wait (in prepare_input_ids): needs no status.
+        self._presence_step = self._begin_presence_step(batch, None)
         token_group = self.h2d_groups.get("token_inputs")
         spec_decode_indices = None
         temperatures, top_ks, top_ps, all_greedy, needs_independent_noise = (
@@ -2870,7 +2872,8 @@ class ModelRunner:
                 forward_context.context.draft_anchor_overrides = (
                     self.drafter.anchors_to_gpu(batch.next_token_ids)
                 )
-        self._presence_step = self._begin_presence_step(batch, input_ids)
+        if self._presence_step is not None:
+            self._presence_step.input_ids = input_ids
         return (
             input_ids,
             temperatures,

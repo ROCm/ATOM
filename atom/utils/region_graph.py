@@ -44,6 +44,7 @@ import torch
 from atom.distributed.nccl_watchdog import drain_nccl_works
 from atom.utils import forward_context, weak_ref_tensor, weak_ref_tensors
 from atom.utils.graph_holders import register_graph_holder
+from atom.utils.h2d import capture_ended, capture_started, capturing
 
 __all__ = [
     "ReqGraph",
@@ -154,6 +155,7 @@ class _Recorder:
     def begin(self):
         self._graph = torch.cuda.CUDAGraph()
         self._graph.capture_begin(pool=self._pool, capture_error_mode="thread_local")
+        capture_started()
 
     def end(self):
         graph, self._graph = self._graph, None
@@ -161,13 +163,19 @@ class _Recorder:
             # Two breaks back to back leave an empty segment; it replays as
             # nothing, so it is not worth the warning.
             warnings.filterwarnings("ignore", "The CUDA Graph is empty")
-            graph.capture_end()
+            try:
+                graph.capture_end()
+            finally:
+                capture_ended()
         self._steps.append(_SegmentReplay(graph))
 
     def abort(self):
         if self._graph is not None:
             graph, self._graph = self._graph, None
-            graph.capture_end()
+            try:
+                graph.capture_end()
+            finally:
+                capture_ended()
 
     def eager(self, fn, args, kwargs, stream, live):
         self.end()
@@ -334,11 +342,14 @@ def _record_whole(fn: Callable, *args, pool=None, **kwargs) -> tuple[_Segments, 
     # thread_local, as `_Recorder.begin` captures: "global" invalidates a
     # capture when any thread makes an unsafe HIP call, and the NCCL watchdog
     # polls `hipEventQuery` every ~100 ms.
-    with torch.cuda.graph(
-        graph,
-        pool,
-        stream=torch.cuda.current_stream(),
-        capture_error_mode="thread_local",
+    with (
+        capturing(),
+        torch.cuda.graph(
+            graph,
+            pool,
+            stream=torch.cuda.current_stream(),
+            capture_error_mode="thread_local",
+        ),
     ):
         output = fn(*args, **kwargs)
     weak = output if output is None else weak_ref_tensors(output)
