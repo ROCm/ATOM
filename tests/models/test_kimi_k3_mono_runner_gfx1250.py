@@ -125,6 +125,32 @@ def test_resident_resource_hazards_include_explicit_spills(monkeypatch):
     )
 
 
+MOE = "k3_gfx1250_moe_s50_p3_u15_w_z"
+
+
+@pytest.mark.parametrize(
+    "name, scratch, vgpr_spill, expected",
+    [
+        (MOE, 0, 0, ()),
+        (MOE, 16, 0, ("16B private segment", "8 sgpr spill")),
+        (MOE, 0, 1, ("1 vgpr spill", "8 sgpr spill")),
+        ("k3_k1_gfx1250_resident_s50_l5", 0, 0, ("8 sgpr spill",)),
+    ],
+)
+def test_only_the_fused_moe_tolerates_lane_sgpr_spills(
+    monkeypatch, name, scratch, vgpr_spill, expected
+):
+    resource = {
+        "name": name,
+        "scratch": scratch,
+        "vgpr_spill": vgpr_spill,
+        "sgpr_spill": 8,
+        "lds": 1024,
+    }
+    monkeypatch.setattr(runner_module, "launcher_resources", lambda _l: [resource])
+    assert runner_module._resident_hazards(object()) == expected
+
+
 def test_gfx1250_uses_native_routed_k2_with_production_seam():
     source = (
         Path(__file__).parents[2] / "atom/models/kimi_k3/mono/runner_gfx1250.py"

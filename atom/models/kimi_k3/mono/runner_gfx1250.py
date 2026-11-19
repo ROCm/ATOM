@@ -192,6 +192,12 @@ def _plain_routed_norm(norm) -> bool:
     )
 
 
+# Kernels whose SGPR spills alone are no hazard: without scratch or VGPR spills they
+# land in VGPR lanes (the fused MoE holds ~190 of its VGPRs), a few lane moves, where
+# the grouped MoE a hazard swaps in costs 7-10 us a layer past 48 rows.
+_SGPR_SPILL_TOLERANT = ("k3_gfx1250_moe_s",)
+
+
 def _resident_hazards(launcher: object) -> tuple[str, ...]:
     hazards = []
     lds_limit = GFX1250.max_workgroup_lds_bytes
@@ -199,9 +205,14 @@ def _resident_hazards(launcher: object) -> tuple[str, ...]:
     for resource in launcher_resources(launcher):
         if resource["scratch"]:
             hazards.append(f"{resource['scratch']}B private segment")
+        lanes = (
+            str(resource.get("name") or "").startswith(_SGPR_SPILL_TOLERANT)
+            and not resource["scratch"]
+            and not resource["vgpr_spill"]
+        )
         for kind in ("vgpr_spill", "sgpr_spill"):
             count = resource[kind]
-            if count:
+            if count and not (lanes and kind == "sgpr_spill"):
                 hazards.append(f"{count} {kind.replace('_', ' ')}")
         if resource["lds"] > lds_limit:
             hazards.append(f"{resource['lds']}B LDS")
