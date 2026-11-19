@@ -2071,7 +2071,8 @@ def test_multi_token_decode_without_a_kernel_refuses(monkeypatch):
         _no_shape("gfx1250", ["planner rejects 9 rows"]),
     )
     with pytest.raises(
-        ValueError, match=r"16 gathered query heads x 9 rows .*planner rejects 9 rows"
+        ValueError,
+        match=r"16 gathered query heads at query lengths \(9,\) .*q=9: planner rejects",
     ):
         mla_dcp_kernel_num_heads(
             8, 2, 16, kv_cache_dtype="fp8", persistent=True, max_seqlen_q=9
@@ -2103,7 +2104,9 @@ def test_speculative_dcp_decode_refuses_without_a_persistent_kernel(monkeypatch)
         layer._configure_dcp_decode_head_padding(2)
 
 
-def _spec_dcp_layer(monkeypatch, *, causal=True, sparse=False, decode_query_len=0, k=4):
+def _spec_dcp_layer(
+    monkeypatch, *, causal=True, sparse=False, decode_query_len=0, k=4, num_heads=8
+):
     """A bare MLAAttention under speculative decode with k drafted tokens
     (verify q = k + 1)."""
     spec = SimpleNamespace(num_speculative_tokens=k)
@@ -2116,7 +2119,7 @@ def _spec_dcp_layer(monkeypatch, *, causal=True, sparse=False, decode_query_len=
         attention_mla_module, "mla_dcp_decode_shape_support", _no_shape()
     )
     layer = object.__new__(attention_mla_module.MLAAttention)
-    layer.num_heads, layer.min_query_heads, layer.kv_cache_dtype = 8, 16, "fp8"
+    layer.num_heads, layer.min_query_heads, layer.kv_cache_dtype = num_heads, 16, "fp8"
     layer.causal_decode, layer.is_sparse_mla = causal, sparse
     layer.decode_query_len = decode_query_len
     return layer
@@ -2154,10 +2157,12 @@ def test_persistent_width_is_none_when_aiter_names_no_width(monkeypatch):
         )
         is None
     )
-    width, max_seqlen_q, causal = attention_mla_module.mla_dcp_layers_persistent_width(
-        [_spec_dcp_layer(monkeypatch)], 8, 2, 16, kv_cache_dtype="fp8"
+    assert (
+        attention_mla_module.mla_dcp_layers_persistent_width(
+            [_spec_dcp_layer(monkeypatch)], 8, 2, 16, kv_cache_dtype="fp8"
+        )
+        is None
     )
-    assert (width, max_seqlen_q, causal) == (None, 5, True)
 
 
 @needs_dcp_ops
@@ -2174,8 +2179,9 @@ def test_speculative_dcp_decode_refuses_when_aiter_names_no_width(monkeypatch):
     )
     with pytest.raises(
         ValueError,
-        match=r"persistent round-robin MLA decode for 16 gathered query heads x 5 "
-        r"rows .*aiter on gfx942: no persistent decode kernel",
+        match=r"persistent round-robin MLA decode for 16 gathered query heads at "
+        r"every query length the layer decodes \(1, 5\) .*aiter on gfx942: q=1: "
+        r"no persistent decode kernel",
     ) as err:
         layer._configure_dcp_decode_head_padding(2)
     assert "num_speculative_tokens" not in str(err.value)
@@ -2219,10 +2225,10 @@ def test_draft_builder_plans_the_width_its_layers_pad_to(monkeypatch, rules, k):
     monkeypatch.setenv("ATOM_MLA_PAGE_SIZE", "1")
     layer = _spec_dcp_layer(monkeypatch, causal=False, decode_query_len=k, k=k)
     layer._configure_dcp_decode_head_padding(8)
-    width, max_seqlen_q, causal = attention_mla_module.mla_dcp_layers_persistent_width(
+    width = attention_mla_module.mla_dcp_layers_persistent_width(
         [layer], layer.num_heads, 8, layer.min_query_heads, kv_cache_dtype="fp8"
     )
-    assert (max_seqlen_q, causal) == (k, False)
+    assert attention_mla_module._layer_dcp_decode_query_lens(layer) == (k,)
     assert width == layer.dcp_kernel_num_heads == 64
     # What the plugin's builder planned before: the target's causal verify.
     assert (
@@ -2235,6 +2241,147 @@ def test_draft_builder_plans_the_width_its_layers_pad_to(monkeypatch, rules, k):
         )
         == 96
     )
+
+
+def _aiter_rules(names, runs):
+    """Faithful stand-ins for aiter's two answers the width logic reads:
+    ``names[(heads, q)]`` is get_mla_decode_num_heads' width for a call of
+    ``q`` > 1 rows at ``heads`` gathered heads (None: no width), and ``runs``
+    says whether a width runs persistent at ``q`` rows with the LSE the DCP
+    merge needs (dcp_persistent_supported)."""
+
+    def get_mla_decode_num_heads(heads, q, *_args, **_kwargs):
+        return names[(heads, q)]
+
+    def dcp_persistent_supported(width, _kv, _dcp, q, _causal):
+        return runs(width, q)
+
+    return get_mla_decode_num_heads, dcp_persistent_supported
+
+
+def _use_aiter_rules(monkeypatch, names, runs):
+    get_heads, supported = _aiter_rules(names, runs)
+    monkeypatch.setattr(attention_mla_module, "get_mla_decode_num_heads", get_heads)
+    monkeypatch.setattr(attention_mla_module, "dcp_persistent_supported", supported)
+    monkeypatch.setenv("ATOM_MLA_PAGE_SIZE", "1")
+
+
+@pytest.mark.parametrize(
+    "plugin,k,expected",
+    [(False, 0, (1,)), (False, 3, (1, 4)), (True, 3, (1, 2, 3, 4))],
+    ids=["no_spec", "native_mtp", "plugin"],
+)
+def test_dense_layer_decodes_at_every_length(monkeypatch, plugin, k, expected):
+    """A dense causal layer under speculative decode runs the verify's k + 1
+    and the one-row draft steps; under the vLLM plugin, every length up to
+    k + 1 (decode batches carry requests verifying fewer drafted tokens)."""
+    monkeypatch.setattr(attention_mla_module, "is_plugin_mode", lambda: plugin)
+    spec = SimpleNamespace(num_speculative_tokens=k) if k else None
+    config = SimpleNamespace(speculative_config=spec)
+    assert attention_mla_module.mla_dcp_decode_query_lens(config) == expected
+
+
+@needs_dcp_ops
+@pytest.mark.parametrize("num_heads,gathered", [(16, 128), (8, 64)], ids=["128", "64"])
+def test_mtp_dcp_refuses_where_the_draft_steps_one_row_has_no_lse(
+    monkeypatch, num_heads, gathered
+):
+    """The trigger: gfx950 fp8 with aiter's experimental HK route, dense MLA,
+    MTP k=2, DCP8. aiter names a round-robin width for the 3-row verify, but at
+    one row the gathered width routes to HK, which writes no final LSE, so the
+    draft steps would merge garbage. The width is decided over both lengths:
+    not persistent, and the verify is refused -- never persistent at one row
+    on a route without LSE."""
+    _use_aiter_rules(
+        monkeypatch,
+        names={(gathered, 3): gathered},
+        runs=lambda width, q: q > 1,
+    )
+    layer = _spec_dcp_layer(monkeypatch, k=2, num_heads=num_heads)
+    # The verify alone (what was asked before) would have been persistent.
+    assert (
+        attention_mla_module.mla_dcp_persistent_width(
+            num_heads, 8, 16, kv_cache_dtype="fp8", query_lens=(3,)
+        )
+        == gathered
+    )
+    assert (
+        attention_mla_module.mla_dcp_persistent_width(
+            num_heads, 8, 16, kv_cache_dtype="fp8", query_lens=(1, 3)
+        )
+        is None
+    )
+    with pytest.raises(
+        ValueError, match=r"every query length the layer decodes \(1, 3\)"
+    ):
+        layer._configure_dcp_decode_head_padding(8)
+
+
+@needs_dcp_ops
+def test_mtp_dcp_stays_persistent_where_every_length_shares_a_width(monkeypatch):
+    """96 gathered heads that run at one row and at the 5-row verify: one
+    persistent width for both, no refusal."""
+    _use_aiter_rules(monkeypatch, names={(96, 5): 96}, runs=lambda width, q: True)
+    layer = _spec_dcp_layer(monkeypatch, k=4, num_heads=12)
+    layer._configure_dcp_decode_head_padding(8)
+    assert layer.dcp_persistent_supported is True
+    assert layer.dcp_kernel_num_heads == 96
+
+
+@needs_dcp_ops
+@pytest.mark.parametrize(
+    "wide_runs_at_one_row,expected", [(True, 96), (False, None)], ids=["runs", "not"]
+)
+def test_widest_width_must_run_at_every_length(
+    monkeypatch, wide_runs_at_one_row, expected
+):
+    """aiter's widths need not nest: 64 gathered heads take 64 at one row and
+    96 at the 5-row verify. The layer pads to 96 at both only if 96 runs at
+    one row too (the shape query is asked there); otherwise no width."""
+    _use_aiter_rules(
+        monkeypatch,
+        names={(64, 5): 96},
+        runs=lambda width, q: q > 1 or width == 64 or wide_runs_at_one_row,
+    )
+    assert (
+        attention_mla_module.mla_dcp_persistent_width(
+            8, 8, 16, kv_cache_dtype="fp8", query_lens=(1, 5)
+        )
+        == expected
+    )
+
+
+@needs_dcp_ops
+@pytest.mark.parametrize(
+    "gfx,spec,dcp,refused",
+    [
+        ("gfx1250", True, 2, True),
+        ("gfx942", True, 2, True),
+        ("gfx950", True, 2, False),
+        ("gfx1250", False, 2, False),
+        ("gfx1250", True, 1, False),
+    ],
+    ids=["gfx1250", "gfx942", "gfx950", "no_spec", "dcp1"],
+)
+def test_sparse_speculative_dcp_is_gfx950_only(monkeypatch, gfx, spec, dcp, refused):
+    """Sparse / DSA layers never reach the round-robin refusal (they decode at
+    q_len=1); speculative decode + DCP on them is validated on gfx950 only."""
+    _use_aiter_rules(monkeypatch, names={}, runs=lambda width, q: True)
+    layer = _spec_dcp_layer(monkeypatch, sparse=True)
+    if not spec:
+        monkeypatch.setattr(
+            attention_mla_module,
+            "get_current_atom_config",
+            lambda: SimpleNamespace(
+                speculative_config=None, max_num_batched_tokens=16384
+            ),
+        )
+    monkeypatch.setattr(attention_mla_module, "get_gfx", lambda: gfx)
+    if refused:
+        with pytest.raises(ValueError, match="validated on gfx950 only"):
+            layer._configure_dcp_decode_head_padding(dcp)
+    else:
+        layer._configure_dcp_decode_head_padding(dcp)
 
 
 @needs_dcp_ops
@@ -2254,6 +2401,8 @@ def test_speculative_dcp_refusal_skips(monkeypatch, causal, sparse, dcp):
     layer = _spec_dcp_layer(
         monkeypatch, causal=causal, sparse=sparse, decode_query_len=4
     )
+    # sparse / DSA + speculative decode + DCP is gfx950-only (see the gate test)
+    monkeypatch.setattr(attention_mla_module, "get_gfx", lambda: "gfx950")
     layer._configure_dcp_decode_head_padding(dcp)
     if sparse:
         assert calls == [], "a sparse layer sizes its q_len=1 call"

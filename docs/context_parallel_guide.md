@@ -283,9 +283,10 @@ existing TP ranks, so `world = tp` and `tp` must be divisible by `dcp`.
 - **Composes with**: prefix caching and chunked prefill (both supported under
   DCP); `--kv-cache-dtype fp8` (per-tensor scale); **speculative decode** —
   **MTP** (`--method mtp`, `num_speculative_tokens` 1–3) on both dense MLA
-  and sparse / DSA, and **DSpark** (`--method dspark`) on Kimi-K3; both need
-  the persistent round-robin decode (gfx950, or gfx1250 with
-  `AITER_MLA_DECODE_PS1_FLYDSL=1`).
+  and sparse / DSA, and **DSpark** (`--method dspark`) on Kimi-K3. Dense MLA
+  and DSpark need a persistent decode aiter serves at every query length the
+  layer runs (gfx950, or gfx1250 with `AITER_MLA_DECODE_PS1_FLYDSL=1`, where
+  128 gathered heads is refused); sparse / DSA is gfx950-only.
 - **Little benefit / avoid**: short-context, KV-memory-plentiful workloads —
   DCP adds per-step decode communication (Q all-gather + output reduce-scatter)
   that isn't worth it when KV memory isn't the constraint.
@@ -515,10 +516,13 @@ Tips:
 - `-tp 8 -dcp 1` (or omitting `-dcp`) disables DCP and serves as the baseline.
 - `--kv_cache_dtype fp8` further lowers KV memory; DCP uses a per-tensor scale
   (per-token / per-group fp8 layouts are not yet supported).
-- **MTP under DCP needs the persistent round-robin decode** (gfx950, or gfx1250
-  with `AITER_MLA_DECODE_PS1_FLYDSL=1`) and works with both bf16 and fp8 KV
-  cache for `num_speculative_tokens` 1–3 — see
-  [DCP + Speculative Decode](#dcp--speculative-decode-mtp--dspark).
+- **MTP under DCP needs a persistent decode aiter serves at every query length
+  the layer runs** (the verify's k + 1 and the one-row draft steps): gfx950, or
+  gfx1250 with `AITER_MLA_DECODE_PS1_FLYDSL=1` below 128 gathered heads (PS1
+  takes 128 heads at one query row only, so e.g. DeepSeek-R1 at `-tp 8 -dcp 8`
+  is refused there). Sparse / DSA layers with MTP under DCP are gfx950-only.
+  Dense MLA works with both bf16 and fp8 KV cache for `num_speculative_tokens`
+  1–3 — see [DCP + Speculative Decode](#dcp--speculative-decode-mtp--dspark).
 
 ## How it works
 
@@ -647,7 +651,7 @@ sharded index cache, so there is no intra-block mask to place.
 
 | | Supported |
 |---|---|
-| GPU arch | gfx950 (`cprr` kernel), or gfx1250 with `AITER_MLA_DECODE_PS1_FLYDSL=1` (PS1 kernel, which takes `g_kv_indptr`); both persistent-only, and gfx942 has no such kernel. Needs `ATOM_MLA_PAGE_SIZE <= 1` |
+| GPU arch | Dense MLA: gfx950 (`cprr` kernel), or gfx1250 with `AITER_MLA_DECODE_PS1_FLYDSL=1` (PS1 kernel, which takes `g_kv_indptr`); both persistent-only, and gfx942 has no such kernel. The width must run at every query length the layer decodes (the verify's k + 1 and the one-row draft steps), so on gfx1250, where PS1 takes 128 heads at one row only, 128 gathered heads (e.g. DeepSeek-R1 at `-tp 8 -dcp 8`) is refused. Needs `ATOM_MLA_PAGE_SIZE <= 1`. Sparse / DSA: gfx950 only |
 | Method | `--method mtp` (dense MLA: `num_speculative_tokens` 1, 2, or 3 validated above; sparse / DSA has no runtime bound and the [GLM-5.2 recipe](../recipes/Agentic-GLM-5.2.md) runs it at 4 and 5 — see the Model row) |
 | KV cache dtype | **bf16 and fp8** both work for all of `num_speculative_tokens` 1/2/3 (dense MLA) |
 | DCP size | dcp2 / dcp4 / dcp8 all validated (`tp8`, dense MLA) |
@@ -665,11 +669,14 @@ python -m atom.entrypoints.openai_server \
 Plugin path (`vllm serve`): add `--speculative-config '{"method":"mtp","num_speculative_tokens":3}'`.
 
 > **Not on gfx942.** Speculative decode + DCP raises at model construction
-> wherever aiter has no persistent round-robin decode for the layer's gathered
-> head width and verify length (`MLAAttention._configure_dcp_decode_head_padding`).
-> On gfx942 the non-persistent decode fallback ignores the `cprr` masking and
-> would silently produce wrong output, so it is rejected rather than run —
-> disable either DCP or speculative decode there.
+> wherever aiter has no persistent decode for the layer's gathered head width at
+> every query length it runs — the verify's k + 1 and the one-row draft steps
+> (`MLAAttention._configure_dcp_decode_head_padding`). On gfx942 the
+> non-persistent decode fallback ignores the `cprr` masking and would silently
+> produce wrong output, so it is rejected rather than run; on gfx1250 the same
+> refusal covers 128 gathered heads. Sparse / DSA layers never take `cprr` and
+> are refused off gfx950, where this path is not validated. Disable either DCP
+> or speculative decode there.
 
 Accuracy: gsm8k (DeepSeek-R1, tp8, 5-shot) matches the non-speculative DCP
 baseline (≈0.95) across bf16/fp8 and `num_speculative_tokens` 1/2/3.
@@ -726,9 +733,9 @@ MLA rows; see the [recipe](../recipes/DSpark.md)).
 | Kimi-K3 KDA layers | Not sharded — the KDA recurrent state is per-request, not paged, so DCP frees only the MLA share of attention memory |
 | Kimi-K3 gathered head width | One query row: padded to a natively dispatched MLA width (16 / 32 / 64 / 128), and past 128 it falls back to the folded kernel with a warning. More than one (speculative decode): the width aiter names for the call (96 included); where aiter names none, speculative decode + DCP refuses at model construction. Lower `-dcp` or raise `-tp` |
 | gathered head width 64 | Native sparse / DSA prefill (bf16 or fp8 KV) and q_len=1 decode (fp8 KV) rebuild persistent metadata, where aiter runs DCP decode persistent (validated on gfx950), per full IndexShare layer and run gqa64 directly; unsupported non-persistent paths still pad to 128 — see [Sparse DCP persistent attention and gqa=64](#sparse-dcp-persistent-attention-and-gqa64) |
-| speculative decode (MTP), dense MLA | Supported on gfx950 (bf16/fp8, `num_speculative_tokens` 1–3); gfx1250 takes the same persistent PS1 path with `AITER_MLA_DECODE_PS1_FLYDSL=1` but is not validated; raises at model construction where aiter has no persistent kernel for the call (gfx942) |
+| speculative decode (MTP), dense MLA | Supported on gfx950 (bf16/fp8, `num_speculative_tokens` 1–3); gfx1250 takes the same persistent PS1 path with `AITER_MLA_DECODE_PS1_FLYDSL=1` but is not validated; raises at model construction where aiter has no persistent kernel at every query length the layer runs (gfx942; gfx1250 at 128 gathered heads, e.g. DeepSeek-R1 `-tp 8 -dcp 8`) |
 | speculative decode (DSpark), Kimi-K3 | Supported on gfx950, and on gfx1250 with `AITER_MLA_DECODE_PS1_FLYDSL=1` (TP8 + DCP8 on two MI455X nodes, needs ROCm/aiter#8181; with ROCm/aiter#7913 the 64-head draft runs unpadded); validated at `tp8 -dcp 8` with `num_speculative_tokens 2` (Inferact MLA draft) and 5 (RadixArk DSpark GQA draft, which runs outside the DCP group); on gfx1250 validated at `tp8 -dcp 8` with `num_speculative_tokens 4` |
-| speculative decode (MTP), sparse / DSA | Supported on gfx950 (gfx1250 not validated); validated on GLM-5.2-FP8 at fp8 KV, `num_speculative_tokens=3`, dcp8 |
+| speculative decode (MTP), sparse / DSA | gfx950 only: refused at model construction on other archs, where it is not validated; validated on GLM-5.2-FP8 at fp8 KV, `num_speculative_tokens=3`, dcp8 |
 | vllm-atom plugin | Validated for dense MLA only; the sparse / DSA and Kimi-K3 plugin paths are not yet verified |
 | DCP + PCP | Independent dimensions (different phases); combined use not validated here |
 

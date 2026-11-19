@@ -32,6 +32,7 @@ except ImportError:
     concat_and_cache_mla_seg = None
     fused_qk_rope_concat_and_cache_mla_seg = None
 from aiter.dist.parallel_state import get_dp_group, get_tensor_model_parallel_rank
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 from aiter.ops.attention import get_mla_decode_num_heads
 from aiter.ops.triton.attention.mla import mla_decode_fwd as triton_mla_decode_fwd
@@ -86,6 +87,7 @@ from atom.model_ops.utils import (
     get_and_maybe_dequant_weights,
     quant_fp8_per_tensor,
 )
+from atom.plugin import is_plugin_mode
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
 from atom.utils.forward_context import (
@@ -316,25 +318,57 @@ def mla_dcp_decode_query_len(atom_config) -> int:
     return spec_config.num_speculative_tokens + 1
 
 
-def _layer_dcp_decode_query_len(layer) -> int:
-    """Query rows per sequence ``layer``'s DCP decode hands ``mla_decode_fwd``.
+def mla_dcp_decode_query_lens(atom_config) -> tuple[int, ...]:
+    """Every query length a dense causal layer's DCP decode runs at. Without
+    speculative decode, 1. With k drafted tokens, the verify's k + 1 and 1: the
+    MTP draft steps after the first run one row per sequence on layers of the
+    same kind (``deepseek_mtp`` builds ``DeepseekV2DecoderLayer``), on the
+    target's persistent work plan (``prepare_mtp_decode``). Under the vLLM
+    plugin, every length from 1 to k + 1: a decode batch also carries requests
+    verifying fewer drafted tokens. The layer and the metadata builders size
+    the gathered width from this one set, so they agree on it.
+    """
+    verify = mla_dcp_decode_query_len(atom_config)
+    if verify == 1:
+        return (1,)
+    if is_plugin_mode():
+        return tuple(range(1, verify + 1))
+    return (1, verify)
+
+
+def _layer_dcp_decode_query_lens(layer) -> tuple[int, ...]:
+    """Every query length ``layer``'s DCP decode hands ``mla_decode_fwd``.
 
     Sparse / DSA layers decode, and run MTP verify, as per-token q_len=1 rows
     without round-robin KV. The DSpark draft's non-causal block runs at its
-    block width T (``decode_query_len``), not ``k + 1``. Every other layer runs
-    the target's verify, ``mla_dcp_decode_query_len``.
+    block width T (``decode_query_len``) only. Every other layer runs
+    ``mla_dcp_decode_query_lens``.
     """
     if layer.is_sparse_mla:
-        return 1
+        return (1,)
     if not layer.causal_decode and layer.decode_query_len:
-        return layer.decode_query_len
-    return mla_dcp_decode_query_len(get_current_atom_config())
+        return (layer.decode_query_len,)
+    return mla_dcp_decode_query_lens(get_current_atom_config())
 
 
-def _aiter_reasons(support) -> str:
-    """aiter's own explanation of a shape it does not serve, for an error."""
-    reasons = "; ".join(support.reasons) or "no reason given"
-    return f"aiter on {support.arch}: {reasons}"
+def _aiter_reasons(
+    gathered: int,
+    query_lens: tuple[int, ...],
+    kv_cache_dtype: str,
+    dcp_world_size: int,
+    causal: bool,
+) -> str:
+    """aiter's own explanation, per query length, of the call it does not serve
+    at ``gathered`` heads, for an error."""
+    arch, parts = "?", []
+    for q in sorted(set(query_lens)):
+        support = mla_dcp_decode_shape_support(
+            gathered, kv_cache_dtype, dcp_world_size, q, causal
+        )
+        arch = support.arch
+        if support.reasons:
+            parts.append(f"q={q}: " + "; ".join(support.reasons))
+    return f"aiter on {arch}: {' | '.join(parts) or 'no reason given'}"
 
 
 def _persistent_multi_token_num_heads(
@@ -359,6 +393,45 @@ def _persistent_multi_token_num_heads(
     )
 
 
+def _persistent_width(
+    gathered: int,
+    query_lens: tuple[int, ...],
+    kv_cache_dtype: str,
+    dcp_world_size: int,
+    causal: bool,
+) -> int | None:
+    """One width a persistent DCP decode can pad ``gathered`` heads to at every
+    length in ``query_lens``, or None.
+
+    A one-row decode takes the gathered width as-is (a dedicated kernel or a
+    fold); a longer one takes the width aiter names for that call
+    (``_persistent_multi_token_num_heads``). The widest of those is the
+    candidate, and it has to run at every length: aiter's widths need not nest,
+    so the shape query (``dcp_persistent_supported``) is asked wherever aiter
+    did not name exactly that width for that length -- always at one row, whose
+    route must also write the LSE the DCP merge reads.
+    """
+    named = {}
+    for q in sorted(set(query_lens)):
+        width = (
+            gathered
+            if q == 1
+            else _persistent_multi_token_num_heads(
+                gathered, q, kv_cache_dtype, dcp_world_size, causal
+            )
+        )
+        if width is None:
+            return None
+        named[q] = width
+    width = max(named.values())
+    for q, named_width in named.items():
+        if (q == 1 or named_width != width) and not dcp_persistent_supported(
+            width, kv_cache_dtype, dcp_world_size, q, causal
+        ):
+            return None
+    return width
+
+
 _MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT = (16, 32, 128)
 _MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT_FP8 = (16, 128)
 _MLA_DCP_SPARSE_PREFILL_WIDTHS = (16, 128)
@@ -381,6 +454,7 @@ def mla_dcp_kernel_num_heads(
     persistent: bool,
     max_seqlen_q: int = 1,
     causal: bool = True,
+    query_lens: tuple[int, ...] | None = None,
 ) -> int:
     """Width to gather the query heads to for a DCP decode.
 
@@ -395,27 +469,27 @@ def mla_dcp_kernel_num_heads(
     for both dtypes there (fp8 aborts on it, bf16 silently miscomputes it), and
     fp8 lacks a gqa=32 kernel on top of that while bf16 does not.
 
-    ``max_seqlen_q``: query rows per sequence of this layer's decode call
-    (``_layer_dcp_decode_query_len``). Past one, a persistent decode takes the
-    width aiter names for the call ``causal`` selects
-    (``_persistent_multi_token_num_heads``), on every arch. Whether aiter names
-    one is ``mla_dcp_persistent_width``'s answer; asking for a persistent width
-    where it named none is a caller error and raises.
+    ``query_lens``: every query length this layer's decode runs at
+    (``_layer_dcp_decode_query_lens``; ``(max_seqlen_q,)`` when omitted). Past
+    one row, a persistent decode takes one width that runs at all of them
+    (``_persistent_width``), on every arch. Whether there is one is
+    ``mla_dcp_persistent_width``'s answer; asking for a persistent width where
+    there is none is a caller error and raises.
     """
     gathered = mla_kernel_num_heads(max(num_heads * dcp_world_size, min_kernel_heads))
-    if persistent and max_seqlen_q > 1:
-        width = _persistent_multi_token_num_heads(
-            gathered, max_seqlen_q, kv_cache_dtype, dcp_world_size, causal
+    query_lens = tuple(query_lens or (max_seqlen_q,))
+    if persistent and max(query_lens) > 1:
+        width = _persistent_width(
+            gathered, query_lens, kv_cache_dtype, dcp_world_size, causal
         )
         if width is None:
-            support = mla_dcp_decode_shape_support(
-                gathered, kv_cache_dtype, dcp_world_size, max_seqlen_q, causal
+            reasons = _aiter_reasons(
+                gathered, query_lens, kv_cache_dtype, dcp_world_size, causal
             )
             raise ValueError(
                 f"No persistent MLA decode takes {gathered} gathered query heads "
-                f"x {max_seqlen_q} rows ({kv_cache_dtype} KV; "
-                f"{_aiter_reasons(support)}); mla_dcp_persistent_width is None "
-                "for this call."
+                f"at query lengths {query_lens} ({kv_cache_dtype} KV; {reasons}); "
+                "mla_dcp_persistent_width is None for this call."
             )
         return width
     if persistent:
@@ -450,39 +524,26 @@ def mla_dcp_persistent_width(
     kv_cache_dtype: str,
     max_seqlen_q: int = 1,
     causal: bool = True,
+    query_lens: tuple[int, ...] | None = None,
 ) -> int | None:
-    """Gathered width a persistent DCP decode runs at, or None when DCP is off
-    or aiter has no persistent kernel for the call: none named for a decode of
-    more than one row (``get_mla_decode_num_heads``), or none at the width
-    (``dcp_persistent_supported``). None keeps the callers non-persistent, and a
-    speculative verify is then refused where the layer pads its queries
+    """Gathered width a persistent DCP decode runs at, at every query length in
+    ``query_lens`` (``(max_seqlen_q,)`` when omitted), or None when DCP is off
+    or aiter has no persistent kernel for one of those calls: no width named
+    for a decode of more than one row (``get_mla_decode_num_heads``), or none
+    at the width (``dcp_persistent_supported``; see ``_persistent_width``). None
+    keeps the callers non-persistent, and a speculative verify is then refused
+    where the layer pads its queries
     (``MLAAttention._configure_dcp_decode_head_padding``).
     """
     if dcp_world_size <= 1:
         return None
-    if max_seqlen_q > 1:
-        width = _persistent_multi_token_num_heads(
-            mla_kernel_num_heads(max(num_heads * dcp_world_size, min_kernel_heads)),
-            max_seqlen_q,
-            kv_cache_dtype,
-            dcp_world_size,
-            causal,
-        )
-        if width is None:
-            return None
-    else:
-        width = mla_dcp_kernel_num_heads(
-            num_heads,
-            dcp_world_size,
-            min_kernel_heads,
-            kv_cache_dtype=kv_cache_dtype,
-            persistent=True,
-        )
-    if not dcp_persistent_supported(
-        width, kv_cache_dtype, dcp_world_size, max_seqlen_q, causal
-    ):
-        return None
-    return width
+    return _persistent_width(
+        mla_kernel_num_heads(max(num_heads * dcp_world_size, min_kernel_heads)),
+        tuple(query_lens or (max_seqlen_q,)),
+        kv_cache_dtype,
+        dcp_world_size,
+        causal,
+    )
 
 
 def mla_dcp_layers_persistent_width(
@@ -492,36 +553,36 @@ def mla_dcp_layers_persistent_width(
     min_kernel_heads: int = _MLA_MIN_HEADS,
     *,
     kv_cache_dtype: str,
-) -> tuple[int | None, int, bool]:
-    """``(width, max_seqlen_q, causal)`` a metadata builder plans the persistent
-    DCP decode of ``layers`` at: the call the layers make, at the width they pad
-    their queries to for it (``_configure_dcp_decode_head_padding``) -- the
-    DSpark draft's non-causal block at its block width T, a dense target layer's
-    verify at k + 1 (causal), sparse / DSA layers at 1. ``width`` is
-    ``mla_dcp_persistent_width``'s. A builder without layers, or over layers
-    whose calls differ, plans the target's verify.
+) -> int | None:
+    """Width a metadata builder plans the persistent DCP decode of ``layers``
+    at: the calls the layers make, at the width they pad their queries to for
+    them (``_configure_dcp_decode_head_padding``) -- the DSpark draft's
+    non-causal block at its block width T, a dense layer at every query length
+    it runs (``mla_dcp_decode_query_lens``, causal), sparse / DSA layers at 1.
+    ``mla_dcp_persistent_width``'s answer. A builder without layers, or over
+    layers whose calls differ, plans the target's.
     """
     calls = {
-        (_layer_dcp_decode_query_len(layer), layer.causal_decode) for layer in layers
+        (_layer_dcp_decode_query_lens(layer), layer.causal_decode) for layer in layers
     }
     if len(calls) == 1:
-        max_seqlen_q, causal = calls.pop()
+        query_lens, causal = calls.pop()
     else:
         if calls:
             logger.warning(
                 "MLA metadata builder spans layers whose DCP decode calls differ "
-                f"{sorted(calls)}; planning the target's verify."
+                f"{sorted(calls)}; planning the target's."
             )
-        max_seqlen_q, causal = mla_dcp_decode_query_len(get_current_atom_config()), True
-    width = mla_dcp_persistent_width(
+        query_lens = mla_dcp_decode_query_lens(get_current_atom_config())
+        causal = True
+    return mla_dcp_persistent_width(
         num_heads,
         dcp_world_size,
         min_kernel_heads,
         kv_cache_dtype=kv_cache_dtype,
-        max_seqlen_q=max_seqlen_q,
         causal=causal,
+        query_lens=query_lens,
     )
-    return width, max_seqlen_q, causal
 
 
 def mla_dcp_sparse_prefill_num_heads(
@@ -1102,17 +1163,34 @@ class MLAAttention(nn.Module):
         The vLLM plugin initializes its process groups independently from the
         native ATOM config, so it calls this again with vLLM's DCP size.
         """
-        # Whether aiter runs this layer's DCP decode persistent, at the width
-        # the persistent path gathers to, for the call this layer makes.
-        max_seqlen_q = _layer_dcp_decode_query_len(self)
+        # Sparse / DSA layers decode and verify as q_len=1 rows, so the
+        # round-robin refusal below never reaches them; speculative decode + DCP
+        # on them is validated on gfx950 only, so refuse it elsewhere.
+        if (
+            self.is_sparse_mla
+            and dcp_world_size > 1
+            and get_gfx() != "gfx950"
+            and get_current_atom_config().speculative_config is not None
+        ):
+            raise ValueError(
+                "Speculative decode + DCP on sparse / DSA MLA layers is validated "
+                f"on gfx950 only (got {get_gfx()}). Disable DCP or speculative "
+                "decode."
+            )
+        # Whether aiter runs this layer's DCP decode persistent, at one width
+        # the persistent path gathers to for every call this layer makes: a
+        # dense layer under MTP decodes the verify's k + 1 rows and one-row draft
+        # steps on the same width.
+        query_lens = _layer_dcp_decode_query_lens(self)
+        max_seqlen_q = max(query_lens)
         self.dcp_persistent_supported = (
             mla_dcp_persistent_width(
                 self.num_heads,
                 dcp_world_size,
                 self.min_query_heads,
                 kv_cache_dtype=self.kv_cache_dtype,
-                max_seqlen_q=max_seqlen_q,
                 causal=self.causal_decode,
+                query_lens=query_lens,
             )
             is not None
         )
@@ -1130,15 +1208,15 @@ class MLAAttention(nn.Module):
             gathered = mla_kernel_num_heads(
                 max(self.num_heads * dcp_world_size, self.min_query_heads)
             )
-            support = mla_dcp_decode_shape_support(
-                gathered, self.kv_cache_dtype, dcp_world_size, max_seqlen_q
+            reasons = _aiter_reasons(
+                gathered, query_lens, self.kv_cache_dtype, dcp_world_size, True
             )
             raise ValueError(
                 "Speculative decode + DCP needs the persistent round-robin MLA "
-                f"decode for {gathered} gathered query heads x {max_seqlen_q} rows "
-                f"({self.kv_cache_dtype} KV; {_aiter_reasons(support)}) and "
-                f"ATOM_MLA_PAGE_SIZE <= 1 (got {envs.ATOM_MLA_PAGE_SIZE}). "
-                "Disable DCP or speculative decode."
+                f"decode for {gathered} gathered query heads at every query length "
+                f"the layer decodes {query_lens} ({self.kv_cache_dtype} KV; "
+                f"{reasons}) and ATOM_MLA_PAGE_SIZE <= 1 (got "
+                f"{envs.ATOM_MLA_PAGE_SIZE}). Disable DCP or speculative decode."
             )
         # DCP decode all-gathers Q on the head dim, so the width reaching
         # mla_decode_fwd is the gathered num_heads * dcp rounded up to a
@@ -1163,6 +1241,7 @@ class MLAAttention(nn.Module):
                 ),
                 max_seqlen_q=max_seqlen_q,
                 causal=self.causal_decode,
+                query_lens=query_lens,
             )
             self.dcp_head_pad = (
                 self.dcp_kernel_num_heads - self.num_heads * dcp_world_size

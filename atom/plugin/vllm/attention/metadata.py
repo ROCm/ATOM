@@ -1380,18 +1380,16 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         # These descriptors are only ever handed to the kernel on the
         # persistent path (`if use_persistent_metadata` in build()), so the
         # width they must describe is the persistent one whatever the step
-        # later decides -- for the call these layers make, as they pad their
-        # queries for it: a DSpark draft's group decodes its non-causal block at
-        # T rows, the target verifies k + 1 causal rows, and aiter can name a
-        # different width for each.
-        dcp_persistent_width, self.dcp_decode_query_len, self.dcp_decode_causal = (
-            mla_dcp_layers_persistent_width(
-                [layer for layer in mla_layers if isinstance(layer, MLAAttention)],
-                self.num_attention_heads,
-                dcp_size,
-                self.min_query_heads,
-                kv_cache_dtype=config.cache_config.cache_dtype,
-            )
+        # later decides -- for the calls these layers make, as they pad their
+        # queries for them: a DSpark draft's group decodes its non-causal block
+        # at T rows, the target every causal length from 1 to k + 1, and aiter
+        # can name a different width for each.
+        dcp_persistent_width = mla_dcp_layers_persistent_width(
+            [layer for layer in mla_layers if isinstance(layer, MLAAttention)],
+            self.num_attention_heads,
+            dcp_size,
+            self.min_query_heads,
+            kv_cache_dtype=config.cache_config.cache_dtype,
         )
         self.dcp_persistent_supported = dcp_persistent_width is not None
         self.persistent_num_heads = (
@@ -1781,8 +1779,8 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
             assert use_persistent_metadata and dcp_tot_seq_lens_device is not None, (
                 f"causal decode of query length {max_qo_len} under DCP"
                 f"{self.dcp_world_size} needs the persistent round-robin kernel "
-                "(a width aiter serves persistent for this query length), "
-                "ATOM_MLA_PAGE_SIZE <= 1 and DP == 1"
+                "(a width aiter serves persistent for this query length) "
+                "and DP == 1"
             )
             g_kv_indptr = self._g_kv_indptr_buf[: num_reqs + 1]
             # [0] stays 0 (zero-init, never written). cumsum promotes to int64,

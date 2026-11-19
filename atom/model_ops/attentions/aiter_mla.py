@@ -47,7 +47,7 @@ from atom.model_ops.attention_mla import (
     _MLA_MIN_HEADS,
     _MLA_SPLIT_BUDGET_AUTO,
     MLAAttention,
-    mla_dcp_decode_query_len,
+    mla_dcp_decode_query_lens,
     mla_dcp_kernel_num_heads,
     mla_dcp_persistent_width,
     mla_dcp_sparse_prefill_num_heads,
@@ -594,14 +594,16 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # Target layers only: min_query_heads is the DSpark draft's, and the
         # draft plans its own descriptors (DSparkProposer). Sparse / DSA layers
         # decode and run MTP verify as per-token q_len=1 rows (no round-robin
-        # KV), so they plan that call, as their layers size it.
-        max_seqlen_q = 1 if self.is_sparse else mla_dcp_decode_query_len(config)
+        # KV), so they plan that call, as their layers size it. Dense layers
+        # plan every query length they run: the verify's k + 1 and the one-row
+        # MTP draft steps, which reuse this plan (prepare_mtp_decode).
+        query_lens = (1,) if self.is_sparse else mla_dcp_decode_query_lens(config)
         dcp_persistent = (
             mla_dcp_persistent_width(
                 self.num_attention_heads,
                 self.dcp_world_size,
                 kv_cache_dtype=config.kv_cache_dtype,
-                max_seqlen_q=max_seqlen_q,
+                query_lens=query_lens,
             )
             is not None
         )
@@ -622,7 +624,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     dcp_persistent,
                     sparse_metadata_rebuild=self.sparse_dcp_metadata_rebuild,
                 ),
-                max_seqlen_q=max_seqlen_q,
+                max_seqlen_q=max(query_lens),
+                query_lens=query_lens,
             )
         else:
             self.persistent_num_heads = self.padded_num_attention_heads
