@@ -313,6 +313,23 @@ fn moriio_metadata(prefill: &Value) -> Value {
         "remote_block_ids": [[1,2], [], [3]], "extension": {"keep":true}})
 }
 
+#[tokio::test]
+async fn moriio_batch_requests_are_rejected_before_dispatch() {
+    let mut p = IngressBackend::start(WorkerType::Prefill {
+        bootstrap_port: None,
+    })
+    .await;
+    let mut d = IngressBackend::start(WorkerType::Decode).await;
+    let task = dispatch_moriio(&p, &d, json!({"n": 2}), "/v1/chat/completions");
+    let response = result(task).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    drop(response);
+    assert!(p.requests.try_recv().is_err());
+    assert!(d.requests.try_recv().is_err());
+    wait_load(&p.worker, 0).await;
+    wait_load(&d.worker, 0).await;
+}
+
 fn dispatch_moriio(
     p: &IngressBackend,
     d: &IngressBackend,

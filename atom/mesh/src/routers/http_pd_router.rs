@@ -38,7 +38,7 @@ use crate::{
             planner::DefaultPlanner,
             registry_adapters::{PolicyRegistryAdapter, WorkerRegistryAdapter},
             traits::PdPlanner,
-            types::{PlacementPlan, Protocol, RequestDescriptor},
+            types::{AdapterError, PlacementPlan, Protocol, RequestDescriptor},
         },
         RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry, UNKNOWN_MODEL_ID,
     },
@@ -860,7 +860,12 @@ impl PDRouter {
             BackendType::Vllm | BackendType::Atom => {
                 let mut decode_body = body.clone();
                 if let Err(error) = self.adapter.inject_prefill_fields(&mut body, &ctx) {
-                    return Self::handle_serialization_error(error);
+                    return match error {
+                        AdapterError::UnsupportedTopology(reason) => {
+                            error::bad_request("unsupported_moriio_request", reason)
+                        }
+                        other => Self::handle_serialization_error(other),
+                    };
                 }
                 if let Err(error) = self.adapter.inject_decode_fields(&mut decode_body, &ctx) {
                     return Self::handle_serialization_error(error);
