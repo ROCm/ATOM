@@ -513,6 +513,8 @@ class BlockPool:
             self._reused.discard(source)
             self._reused.add(destination)
         dst.ref_count, dst.hash, dst.token_ids = src.ref_count, src.hash, src.token_ids
+        dst.draft_rows_missing = src.draft_rows_missing
+        src.draft_rows_missing = False
         if src.hash != -1 and self._hash_to_block_id.get(src.hash) == source:
             self._hash_to_block_id[src.hash] = destination
             self.index_version += 1

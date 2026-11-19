@@ -18,6 +18,9 @@ class Block:
         # checked against the tokens it claims to stand for. See `update` for
         # why the type is pinned.
         self.token_ids: array.array = array.array("i")
+        # A tier load left this block's draft rows unwritten; see
+        # `atom/spec_decode/draft_window_geometry.py`.
+        self.draft_rows_missing = False
 
     def update(self, hash: int, token_ids: array.array):
         # Pinned rather than accepted as either: a list here fails twice and
@@ -36,6 +39,8 @@ class Block:
         self.ref_count = 1
         self.hash = -1
         self.token_ids = array.array("i")
+        # Fresh content: the forward that fills it writes every draft row.
+        self.draft_rows_missing = False
 
 
 # Name of the sub-pool sizing class backing the per-request state slots

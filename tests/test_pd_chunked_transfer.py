@@ -2296,3 +2296,202 @@ def test_a_withdrawn_producer_admission_dispatches_no_source_blocks(
     assert set(meta.reqs_to_save) == {first.id}
     assert str(withdrawn.id) not in producer._awaiting_send
     assert not withdrawn.block_table
+
+
+# ── a split producer's draft rows boundary (ATOM_MOONCAKE_STORE_DRAFT_WINDOW) ──
+
+
+def _finished_producer(monkeypatch, seq_factory, *, split):
+    from conftest import MockConfig
+
+    from atom.model_engine.block_manager import BlockManager
+
+    if split:
+        monkeypatch.setenv("ATOM_MOONCAKE_STORE_DRAFT_WINDOW", "1")
+    connector = scheduler_connector(monkeypatch, True)
+    manager = BlockManager(MockConfig(num_kvcache_blocks=16, kv_cache_block_size=4))
+    connector.bind_block_manager(manager)
+    seq = seq_factory(
+        list(range(24)),
+        kv_transfer_params={
+            "chunked_transfer": True,
+            "do_remote_decode": True,
+            "transfer_id": "split",
+        },
+    )
+    manager.allocate(seq)
+    # A Store load left blocks 0-1 without draft rows.
+    manager.mark_draft_rows_missing(seq, 0, 8)
+    connector.update_state_after_alloc(seq)
+    seq.append_token(42)
+    seq.prefill_completed = True
+    connector.request_finished(seq)
+    return seq.kv_transfer_params["prefill_handoff"]
+
+
+def test_handoff_carries_the_draft_rows_boundary(monkeypatch, seq_factory):
+    handoff = _finished_producer(monkeypatch, seq_factory, split=True)
+    assert handoff["draft_rows_from"] == 8
+    assert PrefillHandoff.from_wire(21, handoff).draft_rows_from == 8
+    for bad in (-1, "8", 8.0):
+        with pytest.raises(ValueError, match="draft rows boundary"):
+            PrefillHandoff.from_wire(21, {**handoff, "draft_rows_from": bad})
+    # The consumer keeps V where `register_received_prefix` reads it.
+    sched = mc.MooncakeConnectorScheduler.__new__(mc.MooncakeConnectorScheduler)
+    seq = SimpleNamespace(kv_transfer_params={})
+    sched._chunked_receiving = {21: seq}
+    sched.process_pd_completions(
+        KVConnectorOutput(
+            finished_recving={21},
+            received_handoffs={21: PrefillHandoff.from_wire(21, handoff)},
+        )
+    )
+    assert seq.kv_transfer_params["draft_rows_from"] == 8
+
+
+def test_an_unsplit_producer_hands_off_no_boundary(monkeypatch, seq_factory):
+    monkeypatch.delenv("ATOM_MOONCAKE_STORE_DRAFT_WINDOW", raising=False)
+    handoff = _finished_producer(monkeypatch, seq_factory, split=False)
+    assert "draft_rows_from" not in handoff
+    assert PrefillHandoff.from_wire(21, handoff).draft_rows_from is None
+
+
+def test_the_boundary_is_applied_before_the_received_prefix_is_registered(
+    monkeypatch, seq_factory
+):
+    from conftest import MockConfig
+
+    from atom.model_engine.scheduler import Scheduler
+    from atom.spec_decode.draft_window_geometry import DraftReadWindow
+
+    sched = Scheduler(MockConfig(num_kvcache_blocks=16, enable_prefix_caching=True))
+    sched.block_manager.draft_read_window = DraftReadWindow(window=8, read_page=2)
+    connector = sched.kv_connector = scheduler_connector(monkeypatch, False)
+    seq = seq_factory(
+        list(range(24)),
+        kv_transfer_params={
+            "chunked_transfer": True,
+            "do_remote_prefill": True,
+            "transfer_id": "split",
+        },
+    )
+    sched.block_manager.allocate(seq)
+    connector.update_state_after_alloc(seq)
+    sched._update_from_kv_xfer_finished(
+        KVConnectorOutput(
+            finished_recving={seq.id},
+            received_handoffs={seq.id: PrefillHandoff(seq.id, 42, (), 0, 8)},
+        )
+    )
+    assert sched._update_waiting_for_remote_kv(seq)
+    marks = [
+        sched.block_manager.kv.block(block).draft_rows_missing
+        for block in seq.block_table
+    ]
+    assert marks == [True, True, False, False, False, False]
+
+
+def test_split_producer_refuses_a_consumer_without_draft_marks():
+    for marks in (False, True):
+        c, state, req, _, _ = producer()
+        c._draft_rows_split = True
+        if marks:
+            req.update(draft_row_marks=True, consumer_hit_blocks=0)
+        publish(state, 10)
+        state.finish({"first_token_id": 42, "draft_rows_from": 0})
+        dispatch(c, req)
+        if marks:
+            c._notify_transfer_result.assert_called_once_with(req, success=True)
+        else:
+            assert c.transfer_engine.writes.empty()
+            c._notify_transfer_result.assert_called_once_with(req, success=False)
+    # Unchunked, the refusal comes before any write too.
+    c, _, req, _, _ = producer()
+    c._draft_rows_split = True
+    req["chunked_transfer"] = False
+    c._execute_transfer(req)
+    assert c.transfer_engine.writes.empty()
+    c._notify_transfer_result.assert_called_once_with(req, success=False)
+    # A non-chunked consumer echoes V; one that did not get it is refused too.
+    marked = {"draft_row_marks": True, "consumer_hit_blocks": 0}
+    assert "did not get" in c._draft_row_fence(marked)
+    assert c._draft_row_fence({**marked, "draft_rows_from": 0}) is None
+    c._draft_rows_split = False
+    assert c._draft_row_fence({}) is None
+
+
+def test_split_producer_never_writes_over_the_consumers_cached_blocks():
+    # Other requests on the decode read its cached blocks, which no mark can
+    # cover in time: a full transfer over them would hand them missing rows.
+    c, state, req, _, _ = producer()
+    c._draft_rows_split = True
+    req.update(draft_row_marks=True, consumer_hit_blocks=2, num_computed_blocks=0)
+    publish(state, 10)
+    state.finish({"first_token_id": 42, "draft_rows_from": 0})
+    dispatch(c, req)
+    assert c.transfer_engine.writes.empty()
+    c._notify_transfer_result.assert_called_once_with(req, success=False)
+    marked = {"draft_row_marks": True, "chunked_transfer": True}
+    full = {**marked, "consumer_hit_blocks": 2, "num_computed_blocks": 0}
+    assert "writes over 2 blocks" in c._draft_row_fence(full)
+    # An incremental transfer starts at the hit, and a consumer that does not
+    # say what its prefix cache holds is refused.
+    assert c._draft_row_fence({**full, "num_computed_blocks": 2}) is None
+    assert "did not say" in c._draft_row_fence(marked)
+    c._draft_rows_split = False
+    assert c._draft_row_fence(full) is None
+
+
+@pytest.mark.parametrize("incremental", [True, False])
+def test_consumer_write_request_says_it_marks_draft_rows(
+    monkeypatch, seq_factory, incremental
+):
+    import msgpack
+
+    sched = scheduler_connector(monkeypatch, False)
+    seq = seq_factory(
+        list(range(10)),
+        kv_transfer_params={
+            "do_remote_prefill": True,
+            "transfer_id": "xfer-b",
+            "remote_host": "127.0.0.1",
+            "remote_handshake_port": 6301,
+            "remote_tp_size": 1,
+            "remote_block_ids": [5, 1, 8],
+            # A producer page the consumer cannot pair falls back to a full
+            # transfer, which writes over its cached block too.
+            "block_size": 4 if incremental else 8,
+            "dcp_size": 1,
+            "draft_rows_from": 4,
+        },
+    )
+    seq.block_table = [2, 9, 4]
+    seq.num_cached_tokens = 4  # the decode's own prefix cache holds block 0
+    sched.update_state_after_alloc(seq)
+    c = consumer(1)
+    c.tp_size = c.dcp_size = 1
+    c.tp_rank = c.dp_rank = c.dcp_rank = 0
+    c.dcp_interleave_size = 1
+    c.local_ip = "127.0.0.1"
+    c.rpc_port = 777
+    c.ib_device = None
+    c._notification_port = 778
+    c._num_local_layers = 1
+    c._block_regions = [(100, 4)]
+    c._block_region_roles = [None]
+    c._unit_layout = None
+    c.kv_caches_base_addr = [100]
+    c._draft_row_marks = True
+    c._send_on_socket = MagicMock()
+    c.start_load_kv(sched.build_connector_meta())
+    post_write_requests(c, monkeypatch)
+    [call] = c._send_on_socket.call_args_list
+    request = msgpack.loads(call.args[1][1])
+    assert request["draft_row_marks"] is True
+    assert request["draft_rows_from"] == 4
+    assert request["consumer_hit_blocks"] == 1
+    assert request["num_computed_blocks"] == (1 if incremental else 0)
+    producer_side = mc.MooncakeConnector.__new__(mc.MooncakeConnector)
+    producer_side._draft_rows_split = True
+    refusal = producer_side._draft_row_fence(request)
+    assert (refusal is None) == incremental
