@@ -2130,11 +2130,23 @@ def test_a_tp_split_the_state_cannot_take_is_refused(
     assert not nic.mem[_DST_MLA[0] : _DST_SLOT[0]].any()
 
 
-def test_dcp_index_staging_waits_for_request_ready_event():
+def test_dcp_index_staging_waits_for_request_ready_event(monkeypatch):
     mc = pytest.importorskip(
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
     )
+    from contextlib import contextmanager
+
     from atom.kv_transfer.disaggregation.types import INDEX_CACHE_ROLE, MLA_KV_ROLE
+
+    current = []
+
+    @contextmanager
+    def on_stream(stream):
+        current.append(stream)
+        yield
+        current.pop()
+
+    monkeypatch.setattr(mc.torch.cuda, "stream", on_stream)
 
     connector = object.__new__(mc.MooncakeConnector)
     connector.dcp_size = 1
@@ -2151,7 +2163,10 @@ def test_dcp_index_staging_waits_for_request_ready_event():
     connector._consumer_region_map = lambda *_args, **_kwargs: [0, 1]
     connector._index_staging_chunk_pages = 256
     gather_indices = object()
-    connector._prepare_sharded_index = MagicMock(return_value=gather_indices)
+    prepared_on = []
+    connector._prepare_sharded_index = lambda _plan: (
+        prepared_on.append(list(current)) or gather_indices
+    )
     connector._gather_sharded_index = MagicMock()
     staging_stream = MagicMock()
     connector._send_worker_stream = MagicMock(return_value=staging_stream)
@@ -2179,6 +2194,8 @@ def test_dcp_index_staging_waits_for_request_ready_event():
         engine=ready_event,
     )
     staging_stream.wait_event.assert_called_once_with(ready_event)
+    # The gathers read these indices on the staging stream, so it builds them.
+    assert prepared_on == [[staging_stream]]
     connector._execute_staged_index_layer_chunk.assert_called_once_with(
         "consumer:1234",
         1,

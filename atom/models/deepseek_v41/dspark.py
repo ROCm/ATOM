@@ -48,14 +48,22 @@ from atom.spec_decode.drafter import AuxCaptureSpec
 from atom.utils import envs
 
 from .attention import Attention
-from .config import build_attention_topology
-from .layers import native_quant_config
+from .config import FP4PTPC_RECIPE, build_attention_topology
+from .layers import (
+    converted_linear_spec,
+    native_quant_config,
+    routed_experts_are_ptpc,
+)
 from .model import Block, DeepseekV41ForCausalLM
 
 logger = logging.getLogger("atom")
 
 
 class DraftAttention(Attention):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._wkv_shard = None  # built by `wkv_shard` on first use
+
     def context_keys(self, kv_normed, positions, rope, *, packed=False):
         """The context row alone, for a caller with no query to rotate with it.
 
@@ -70,18 +78,20 @@ class DraftAttention(Attention):
     @property
     def wkv_shard(self):
         """`wqkv_a` narrowed to the KV rows, for the fused context-KV GEMM."""
-        view = self.__dict__.get("_wkv_shard")
-        if view is None:
-            view = self._wkv_shard = self.wqkv_a.shard_view(1)
-        return view
+        if self._wkv_shard is None:
+            # A view of `wqkv_a`, not a submodule: kept out of `_modules`.
+            object.__setattr__(self, "_wkv_shard", self.wqkv_a.shard_view(1))
+        return self._wkv_shard
 
     def project_context(self, hidden, positions, rope, *, packed=False):
-        """Target keys alone; the query half is computed and dropped.
-
-        As V4's draft does, and only on the unfused path -- when the stages
-        fuse, `write_context_kv` reads `wkv_shard` and no query is projected.
+        """Target keys alone, only on the unfused path -- when the stages
+        fuse, `write_context_kv` reads `wkv_shard`. A BF16 `wqkv_a` projects
+        only the KV rows; an FP8 one computes the query half and drops it.
         """
-        _, kv_pre = self.project_qkv(hidden)
+        if self.wqkv_a.runs_bf16:
+            kv_pre = self.wkv_shard(hidden)
+        else:
+            _, kv_pre = self.project_qkv(hidden)
         return self.context_keys(self.kv_norm(kv_pre), positions, rope, packed=packed)
 
     def forward(self, hidden, hidden_scale, context_kv, step, rope, *, hidden_fp8=None):
@@ -226,10 +236,25 @@ class DeepseekV41DSpark(DSparkDraftModel):
         draft = copy(args)
         draft.n_routed_experts = args.dspark_n_routed_experts
         draft.num_experts_per_tok = args.dspark_num_experts_per_tok
+        # An FP4PTPC checkpoint converts only the backbone's linears; the
+        # draft's stay native.
+        draft.fp4ptpc = False
+        # Same rules as the backbone.
         self.moe_quant_config = make_v4_quant_config(
-            draft, online_quant_config=getattr(config, "online_quant_config", None)
+            draft,
+            online_quant_config=getattr(config, "online_quant_config", None),
+            shared_expert_spec=converted_linear_spec(draft),
+            online_routed_experts=True,
         )
+        # Read by the loader's shared-expert rename (`_fuse_shared_expert`).
+        self.quant_config = self.moe_quant_config
         topology = build_attention_topology(args)[args.num_hidden_layers :]
+        if args.fp4ptpc and not all(
+            routed_experts_are_ptpc(self.moe_quant_config, f"mtp.{i}.ffn.experts")
+            for i in range(len(topology))
+        ):
+            # The draft's FP4 experts run only converted, as the backbone's.
+            raise ValueError(f"mtp: {FP4PTPC_RECIPE}")
         # The backbone's, handed down: the two models never run at once, so a
         # stream of its own would buy nothing. Absent when built offline,
         # which is also where nothing is fast enough to care.
@@ -342,14 +367,18 @@ class DeepseekV41DSpark(DSparkDraftModel):
     def _project_taps(self, taps):
         """`main_proj(concat(taps))` as `[1, N, hidden]`, before the norm.
 
-        `main_proj` quantizes its input with `quantize_fp8`; the taps are
-        quantized where they lie instead, to the same fp8 rows and scales,
+        An FP8 `main_proj` quantizes its input with `quantize_fp8`; the taps
+        are quantized where they lie instead, to the same fp8 rows and scales,
         minus the concatenated copy. `quantize_fp8_taps` joins them itself for
         a shape its kernel does not take, and passes a single joined block
-        (a PP relay) through as it is.
+        (a PP relay) through as it is. A BF16 `main_proj` (no group32 FP8
+        GEMM) takes the joined taps unquantized.
         """
+        main_proj = self.mtp[0].main_proj
+        if main_proj.runs_bf16:
+            return main_proj(self.concat_taps(taps).unsqueeze(0))
         x, x_scale = quantize_fp8_taps(taps)
-        return self.mtp[0].main_proj(x.unsqueeze(0), x_scale=x_scale.unsqueeze(0))
+        return main_proj(x.unsqueeze(0), x_scale=x_scale.unsqueeze(0))
 
     def _main_norm_quant(self):
         """The fused norm built in ``__init__``."""
@@ -503,7 +532,14 @@ class DeepseekV41DSpark(DSparkDraftModel):
             for s in shards
         }
         (group_rows, _, width, preshuffled), *others = layouts
-        if others or group_rows is None or any(s.bias is not None for s in shards):
+        # BF16 shards have no FP8 weights to fuse: per-stage path.
+        bf16 = any(s.runs_bf16 for s in shards)
+        if (
+            others
+            or group_rows is None
+            or bf16
+            or any(s.bias is not None for s in shards)
+        ):
             fused = None
         else:
             fused = (

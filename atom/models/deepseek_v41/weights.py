@@ -102,6 +102,15 @@ def checkpoint_schema(config) -> dict[str, WeightSpec]:
             raise ValueError(f"Duplicate checkpoint parameter {name}")
         specs[name] = WeightSpec(name, tuple(shape), dtype, **kwargs)
 
+    def per_channel_linear(name, n, k, **kwargs):
+        """An FP4PTPC-converted linear: FP8 with one F32 scale an output row.
+        The scale follows the rows, so it shards with a column-parallel weight
+        only."""
+        add(name + ".weight", (n, k), "F8_E4M3", **kwargs)
+        if kwargs.get("tp_axis") == 1:
+            kwargs = {**kwargs, "tp_axis": None}
+        add(name + ".weight_scale", (n, 1), "F32", **kwargs)
+
     def linear(name, n, k, *, quantized=True, fp4=False, **kwargs):
         block = (1, 32) if fp4 else (32, 32)
         add(
@@ -120,6 +129,9 @@ def checkpoint_schema(config) -> dict[str, WeightSpec]:
                 **kwargs,
             )
 
+    # The format of a backbone linear the FP4PTPC conversion covers
+    # (`layers.converted_linear_spec`).
+    backbone_linear = per_channel_linear if config.fp4ptpc else linear
     d, h, hd = config.hidden_size, config.num_attention_heads, config.head_dim
     hc, mid = config.hc_mult, config.moe_intermediate_size
     for name in ("embed", "head"):
@@ -132,6 +144,8 @@ def checkpoint_schema(config) -> dict[str, WeightSpec]:
             layer.layer_id - config.num_hidden_layers if draft else layer.layer_id
         )
         prefix = f"{'mtp' if draft else 'layers'}.{layer_id}"
+        # The draft's linears stay native in an FP4PTPC checkpoint.
+        converted = linear if draft else backbone_linear
         for sublayer in ("attn", "ffn"):
             add(f"{prefix}.{sublayer}_norm.weight", (d,), scope=scope)
             mixes = hc * (hc + 2)
@@ -145,9 +159,9 @@ def checkpoint_schema(config) -> dict[str, WeightSpec]:
         add(attn + ".attn_sink", (h,), "F32", scope=scope, tp_axis=0)
         add(attn + ".q_norm.weight", (config.q_lora_rank,), scope=scope)
         add(attn + ".kv_norm.weight", (hd,), scope=scope)
-        linear(attn + ".wq_a", config.q_lora_rank, d, scope=scope)
-        linear(attn + ".wq_b", h * hd, config.q_lora_rank, scope=scope, tp_axis=0)
-        linear(attn + ".wkv", hd, d, scope=scope)
+        converted(attn + ".wq_a", config.q_lora_rank, d, scope=scope)
+        converted(attn + ".wq_b", h * hd, config.q_lora_rank, scope=scope, tp_axis=0)
+        converted(attn + ".wkv", hd, d, scope=scope)
         linear(
             attn + ".wo_a",
             config.o_groups * config.o_lora_rank,
@@ -156,7 +170,7 @@ def checkpoint_schema(config) -> dict[str, WeightSpec]:
             tp_axis=0,
             dequantize=True,
         )
-        linear(
+        converted(
             attn + ".wo_b",
             d,
             config.o_groups * config.o_lora_rank,
@@ -179,7 +193,7 @@ def checkpoint_schema(config) -> dict[str, WeightSpec]:
         if layer.mode in (AttentionMode.FULL, AttentionMode.REINDEX):
             # Replicate the small indexer: scores must reduce all its heads
             # before top-k, without a context-sized all-reduce on every layer.
-            linear(
+            converted(
                 attn + ".indexer.wq_b",
                 config.index_n_heads * config.index_head_dim,
                 config.q_lora_rank,
@@ -218,7 +232,7 @@ def checkpoint_schema(config) -> dict[str, WeightSpec]:
             ("w3", mid, d, 0),
             ("w2", d, mid, 1),
         ):
-            linear(f"{ffn}.shared_experts.{proj}", n, k, scope=scope, tp_axis=axis)
+            converted(f"{ffn}.shared_experts.{proj}", n, k, scope=scope, tp_axis=axis)
         if draft:
             if layer_id == config.num_nextn_predict_layers - 1:
                 r = config.dspark_markov_rank
@@ -268,7 +282,7 @@ def checkpoint_schema(config) -> dict[str, WeightSpec]:
             scope="engram_table",
             block=(1, 32),
         )
-        linear(prefix + ".wkv", (hc + 1) * d, engram_dim)
+        backbone_linear(prefix + ".wkv", (hc + 1) * d, engram_dim)
         for name in ("k_weight", "q_weight"):
             add(prefix + "." + name, (hc, d))
     vision = config._multimodal_config.vision_config
