@@ -34,6 +34,7 @@ from atom.models.kimi_k3.mono.kernels.execution_plan import (
 from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import (
     TDM_CLUSTER,
     TDM_FP8_DEPTH,
+    TDM_FP8_PAIR_DEPTH,
     TDM_SPLIT_MAX_TASKS,
     tdm_lds_bytes,
     tdm_split_lds_words,
@@ -43,6 +44,7 @@ from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import (
 from atom.models.kimi_k3.mono.kernels.token_tiling import TokenTile
 from atom.mono.plan.architecture import GFX1250
 from atom.mono.plan.layout import pair_layout
+from atom.utils import envs
 
 TIMELINE_POINTS = 15
 HIDDEN = 7168
@@ -202,6 +204,9 @@ class K1RoleLdsPlan:
     # and slab stages, or None and 0.
     split_format: str | None = None
     split_stages: int = 0
+    # The FP8 in-projection walks K two slabs a step
+    # (ATOM_KIMI_MONO_K1_PAIRED_SLABS, where its LDS fits).
+    paired: bool = False
 
     @property
     def smem(self) -> LdsRegion:
@@ -564,6 +569,14 @@ def role_lds_plan(
             tile_rows * xrow * 2,
             tdm_lds_bytes(plan.tokens, PROJECTION_TASKS_PER_CTA, True, TDM_FP8_DEPTH),
         )
+    paired = False
+    if fp8 and split is None and envs.ATOM_KIMI_MONO_K1_PAIRED_SLABS:
+        need = tdm_lds_bytes(
+            plan.tokens, PROJECTION_TASKS_PER_CTA, True, TDM_FP8_PAIR_DEPTH, group=2
+        )
+        if smem_bytes + max(projection_bytes, need) + accumulator_bytes <= plan.lds_bytes:
+            projection_bytes = max(projection_bytes, need)
+            paired = True
     split_stages = 0
     if split is not None:
         split_projection_ctas(plan.blocks)
@@ -624,7 +637,9 @@ def role_lds_plan(
         LdsRegion("role", smem_bytes, role_bytes),
     )
     arena = KimiLdsPlan(plan.lds_bytes, regions, (slabs,))
-    return K1RoleLdsPlan(arena, smem_fields, variants, xrow, split, split_stages)
+    return K1RoleLdsPlan(
+        arena, smem_fields, variants, xrow, split, split_stages, paired
+    )
 
 
 def role_lds_type_spec(layout: K1RoleLdsPlan) -> K1LdsTypeSpec:

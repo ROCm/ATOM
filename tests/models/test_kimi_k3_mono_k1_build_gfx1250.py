@@ -270,6 +270,45 @@ def test_replay_lds_appends_to_the_recurrence_only():
 
 
 @pytest.mark.parametrize(
+    ("rows", "qlen", "paired"),
+    ((5, 5, True), (16, 8, True), (40, 5, True), (64, 8, False)),
+)
+def test_paired_slabs_by_default_where_four_token_buffers_fit(
+    monkeypatch, rows, qlen, paired
+):
+    from atom.models.kimi_k3.mono.kernels.stages import gemv_layout
+
+    monkeypatch.delenv("ATOM_KIMI_MONO_K1_PAIRED_SLABS", raising=False)
+    lds = builder.role_lds_plan(
+        _plan(rows), qlen=qlen, fp8=True, replay_cap=16, replay_window=qlen
+    )
+    assert lds.paired is paired
+    projection = dict(
+        (field.name, field.bytes) for field in lds.variant("projection").fields
+    )
+    need = gemv_layout.tdm_lds_bytes(
+        rows, 2, True, gemv_layout.TDM_FP8_PAIR_DEPTH, group=2
+    )
+    assert (projection["xl"] >= need) is paired
+    # BF16 in-projections walk one slab a step
+    if rows <= 58:
+        assert not builder.role_lds_plan(_plan(rows), qlen=qlen).paired
+
+
+def test_paired_slabs_switch_off_walks_one_slab_a_step(monkeypatch):
+    monkeypatch.setenv("ATOM_KIMI_MONO_K1_PAIRED_SLABS", "0")
+    assert not builder.role_lds_plan(_plan(5), qlen=5, fp8=True).paired
+
+
+def test_paired_slabs_keep_the_weight_stages_and_double_the_token_buffers():
+    from atom.models.kimi_k3.mono.kernels.stages import gemv_layout as gl
+
+    single = gl.tdm_lds_words(8, 2, True, gl.TDM_FP8_DEPTH)
+    paired = gl.tdm_lds_words(8, 2, True, gl.TDM_FP8_PAIR_DEPTH, group=2)
+    assert paired == (2 * single[0], single[1])
+
+
+@pytest.mark.parametrize(
     ("cap", "window", "message"),
     (
         (16, 4, "window"),  # narrower than the query
