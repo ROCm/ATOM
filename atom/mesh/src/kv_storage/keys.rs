@@ -70,9 +70,9 @@ fn push_hex(to: &mut String, bytes: &[u8]) {
 mod tests {
     use super::*;
 
-    // From ATOM's keys.py: chunk_hash_chain(range(n), n).hex(), and the chain of
-    // tokens (i * 7919) % 150000 for i in 0..53 in chunks of 16, and its chunk_keys at
-    // rank 0 of 8.
+    // From ATOM's keys.py, which tests/test_mooncake_store_offload.py asserts too:
+    // chunk_hash_chain(range(n), n).hex(), and the chain of tokens (i * 7919) % 150000
+    // for i in 0..53 in chunks of 16, and its chunk_keys at rank 0 of 8.
     #[test]
     fn digests_are_atoms() {
         for (chunk_tokens, want) in [
