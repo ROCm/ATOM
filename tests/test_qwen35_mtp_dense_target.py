@@ -10,6 +10,10 @@ has no expert count. The loader still asks every model that has
 on a MoE target.
 """
 
+import importlib.util
+import sys
+from unittest.mock import MagicMock
+
 import pytest
 import torch
 from aiter_stub import atom_under_stubs
@@ -57,8 +61,19 @@ DENSE_DRAFTER_PARAMS = [
 
 @pytest.fixture(scope="module")
 def Qwen3_5MTP():
+    # `qwen3_next` imports einops at module scope for its forward, which no
+    # test here runs; the CPU runner does not install it. A stand-in serves the
+    # import only when einops is absent, and goes once the module is bound.
+    stand_in = importlib.util.find_spec("einops") is None
     with atom_under_stubs() as load:
-        yield load("atom.models.qwen3_5_mtp").Qwen3_5MTP
+        if stand_in:
+            sys.modules["einops"] = MagicMock(name="einops")
+        try:
+            module = load("atom.models.qwen3_5_mtp")
+        finally:
+            if stand_in:
+                sys.modules.pop("einops", None)
+        yield module.Qwen3_5MTP
 
 
 def _drafter(cls, config, param_names=()):
