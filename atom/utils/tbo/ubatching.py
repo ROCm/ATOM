@@ -104,7 +104,8 @@ def _gloo_all_gather(local: torch.Tensor, dp_size: int, dp_group) -> list:
     return gathered
 
 
-# (n_fields, dp_size) -> (side stream, device src, device dst, pinned host dst)
+# (n_fields, dp_size, device) -> (device group, side stream, src, dst, host)
+# Called by the worker's scheduling thread; each call finishes before reuse.
 _DEVICE_SYNC_STATE: dict = {}
 _DEVICE_SYNC_CALLS = [0]
 
@@ -114,23 +115,31 @@ def _device_all_gather(local: torch.Tensor, dp_size: int, dp_group) -> torch.Ten
     device group on a side stream, so it does not queue behind compute."""
     from aiter.dist.parallel_state import get_dp_group
 
+    dp = get_dp_group()
+    if dp.cpu_group is not dp_group or dp.world_size != dp_size:
+        raise RuntimeError("DP sync CPU and device groups must describe the same ranks")
+    device_group = dp.device_group
     n = local.numel()
-    state = _DEVICE_SYNC_STATE.get((n, dp_size))
-    if state is None:
-        dev = torch.device("cuda", torch.cuda.current_device())
-        state = (
-            torch.cuda.Stream(device=dev),
-            torch.empty(n, dtype=torch.int32, device=dev),
-            torch.empty(dp_size * n, dtype=torch.int32, device=dev),
-            torch.empty(dp_size * n, dtype=torch.int32, device="cpu", pin_memory=True),
-        )
-        _DEVICE_SYNC_STATE[(n, dp_size)] = state
-    stream, src, dst, host = state
+    dev = torch.device("cuda", torch.cuda.current_device())
+    key = (n, dp_size, dev.index)
+    state = _DEVICE_SYNC_STATE.get(key)
+    if state is None or state[0] is not device_group:
+        stream = torch.cuda.Stream(device=dev)
+        # Even empty buffers can reuse allocator memory with pending work on
+        # their allocation stream. Allocate on the stream that uses them so
+        # no compute-stream wait is needed for this CPU-produced metadata.
+        with torch.cuda.stream(stream):
+            src = torch.empty(n, dtype=torch.int32, device=dev)
+            dst = torch.empty(dp_size * n, dtype=torch.int32, device=dev)
+            host = torch.empty(
+                dp_size * n, dtype=torch.int32, device="cpu", pin_memory=True
+            )
+        state = (device_group, stream, src, dst, host)
+        _DEVICE_SYNC_STATE[key] = state
+    _, stream, src, dst, host = state
     with torch.cuda.stream(stream):
         src.copy_(local)
-        torch.distributed.all_gather_into_tensor(
-            dst, src, group=get_dp_group().device_group
-        )
+        torch.distributed.all_gather_into_tensor(dst, src, group=device_group)
         host.copy_(dst, non_blocking=True)
     stream.synchronize()
     out = host.view(dp_size, n).clone()
