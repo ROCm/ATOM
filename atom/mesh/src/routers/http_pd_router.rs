@@ -433,6 +433,8 @@ impl PDRouter {
             prefill_policy,
             decode_policy,
             prefill_tokens,
+            prefill_load,
+            decode_load,
         } = plan
         else {
             return Err(error::internal_error(
@@ -459,11 +461,17 @@ impl PDRouter {
                 policy,
             );
         }
+        let prefill_guard = match prefill_load {
+            Some(reservation) => WorkerLoadGuard::adopt(reservation),
+            None => WorkerLoadGuard::new(prefill.clone(), headers),
+        }
+        .with_prefill_tokens(prefill_tokens);
+        let decode_guard = match decode_load {
+            Some(reservation) => WorkerLoadGuard::adopt(reservation),
+            None => WorkerLoadGuard::new(decode.clone(), headers),
+        };
         Ok(Arc::new(ReservedPair {
-            load: parking_lot::Mutex::new(Some([
-                WorkerLoadGuard::new(prefill.clone(), headers).with_prefill_tokens(prefill_tokens),
-                WorkerLoadGuard::new(decode.clone(), headers),
-            ])),
+            load: parking_lot::Mutex::new(Some([prefill_guard, decode_guard])),
             canceled: tokio::sync::watch::channel(false).0,
             prefill,
             decode,
@@ -1662,14 +1670,21 @@ impl PDRouter {
         // Poll the upstream only when the downstream asks for data. Dropping the
         // response also drops the upstream, including while it is idle.
         let stream = futures_util::stream::unfold(
-            (Box::pin(stream), false, prefill_logprobs, decode_url),
-            move |(mut stream, finished, prefill_logprobs, decode_url)| async move {
+            (
+                Box::pin(stream),
+                false,
+                prefill_logprobs,
+                decode_url,
+                decode_guard,
+            ),
+            move |(mut stream, finished, prefill_logprobs, decode_url, mut decode_guard)| async move {
                 if finished {
                     return None;
                 }
                 let result = stream.next().await?;
                 let (result, finished) = match result {
                     Ok(chunk) => {
+                        decode_guard.observe_output_chunk(&chunk);
                         let finished = memmem::find(&chunk, b"data: [DONE]").is_some();
                         let chunk = if return_logprob && prefill_logprobs.is_some() {
                             Self::merge_streaming_logprobs(prefill_logprobs.clone(), &chunk)
@@ -1686,7 +1701,10 @@ impl PDRouter {
                         (Err(error), true)
                     }
                 };
-                Some((result, (stream, finished, prefill_logprobs, decode_url)))
+                Some((
+                    result,
+                    (stream, finished, prefill_logprobs, decode_url, decode_guard),
+                ))
             },
         );
         let body = Body::from_stream(stream);
@@ -1698,8 +1716,9 @@ impl PDRouter {
         response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
         *response.headers_mut() = response_headers;
 
-        // Transfer the existing reservation instead of incrementing load again.
-        crate::core::AttachedBody::wrap_response(response, decode_guard)
+        // The stream owns the decode guard, so it stays charged until the body
+        // is dropped and releases on the way out.
+        response
     }
 
     // Helper to process non-streaming decode response with logprob merging
@@ -2327,6 +2346,8 @@ mod tests {
                         prefill_policy: "round_robin",
                         decode_policy: "round_robin",
                         prefill_tokens: 0,
+                        prefill_load: None,
+                        decode_load: None,
                     },
                     None,
                 )
@@ -2468,6 +2489,8 @@ mod tests {
                     prefill_policy: "round_robin",
                     decode_policy: "round_robin",
                     prefill_tokens: 0,
+                    prefill_load: None,
+                    decode_load: None,
                 },
                 None,
             )
@@ -2709,6 +2732,8 @@ mod tests {
                     prefill_policy: "round_robin",
                     decode_policy: "round_robin",
                     prefill_tokens: 7,
+                    prefill_load: None,
+                    decode_load: None,
                 },
                 None,
             )
@@ -2795,6 +2820,8 @@ mod tests {
                         prefill_policy: "dp_sticky",
                         decode_policy: "round_robin",
                         prefill_tokens: 0,
+                        prefill_load: None,
+                        decode_load: None,
                     },
                     Some(&headers),
                 )

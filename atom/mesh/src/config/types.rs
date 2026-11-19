@@ -402,6 +402,16 @@ pub enum PolicyConfig {
         #[serde(default = "default_agentic_max_tree_size")]
         max_tree_size: usize,
     },
+
+    /// Lowest outstanding decode cost at `url@rank`: reserved KV tokens plus
+    /// one request-equivalent per in-flight request.
+    #[serde(rename = "least_load")]
+    LeastLoad {
+        /// Cost of one in-flight request, in tokens. Same default as `agentic`
+        /// and the engine's `ATOM_DP_LB_REQ_EQUIV`.
+        #[serde(default = "default_request_token_equivalent")]
+        request_token_equivalent: u64,
+    },
 }
 
 fn default_request_token_equivalent() -> u64 {
@@ -436,6 +446,7 @@ impl PolicyConfig {
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::PrefixHash { .. } => "prefix_hash",
             PolicyConfig::Agentic { .. } => "agentic",
+            PolicyConfig::LeastLoad { .. } => "least_load",
         }
     }
 }

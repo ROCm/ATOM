@@ -92,7 +92,10 @@ impl ConfigValidator {
 
     fn validate_policy(policy: &PolicyConfig) -> ConfigResult<()> {
         match policy {
-            PolicyConfig::Random | PolicyConfig::RoundRobin | PolicyConfig::DpSticky => {}
+            PolicyConfig::Random
+            | PolicyConfig::RoundRobin
+            | PolicyConfig::DpSticky
+            | PolicyConfig::LeastLoad { .. } => {}
             PolicyConfig::Agentic {
                 request_token_equivalent: _,
                 eviction_interval_secs,
@@ -392,6 +395,22 @@ impl ConfigValidator {
                                 .to_string(),
                     });
                 }
+
+                // least_load's reservation is decode KV. On prefill it would rank
+                // the wrong pool.
+                if let PolicyConfig::LeastLoad { .. } =
+                    config.mode.get_prefill_policy(&config.policy)
+                {
+                    return Err(ConfigError::IncompatibleConfig {
+                        reason: "least_load places PD decode only; set --prefill-policy to another policy"
+                            .to_string(),
+                    });
+                }
+            } else if let PolicyConfig::LeastLoad { .. } = &config.policy {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "least_load places PD decode only; set --pd-disaggregation and --decode-policy least_load"
+                        .to_string(),
+                });
             }
         }
 
@@ -714,6 +733,54 @@ mod tests {
         let error = pd(agentic.clone(), None, None).unwrap_err().to_string();
         assert!(error.contains("agentic places prefill only"), "{error}");
         assert!(pd(PolicyConfig::Random, None, Some(agentic)).is_err());
+    }
+
+    #[test]
+    fn test_validate_least_load_places_pd_decode_only() {
+        let least_load = PolicyConfig::LeastLoad {
+            request_token_equivalent: 512,
+        };
+        let regular = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            least_load.clone(),
+        );
+        let error = ConfigValidator::validate(&regular).unwrap_err().to_string();
+        assert!(
+            error.contains("least_load places PD decode only"),
+            "{error}"
+        );
+
+        let pd = |main: PolicyConfig, prefill, decode| {
+            ConfigValidator::validate(&RouterConfig::new(
+                RoutingMode::PrefillDecode {
+                    prefill_urls: vec![("http://prefill1:8000".to_string(), None)],
+                    decode_urls: vec!["http://decode1:8000".to_string()],
+                    prefill_policy: prefill,
+                    decode_policy: decode,
+                },
+                main,
+            ))
+        };
+        assert!(pd(
+            PolicyConfig::Random,
+            Some(PolicyConfig::DpSticky),
+            Some(least_load.clone())
+        )
+        .is_ok());
+        let prefill_error = pd(PolicyConfig::Random, Some(least_load.clone()), None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            prefill_error.contains("set --prefill-policy"),
+            "{prefill_error}"
+        );
+        let fallback_error = pd(least_load, None, None).unwrap_err().to_string();
+        assert!(
+            fallback_error.contains("set --prefill-policy"),
+            "{fallback_error}"
+        );
     }
 
     #[test]

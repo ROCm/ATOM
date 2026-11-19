@@ -188,6 +188,8 @@ impl DefaultPlanner {
 
         Ok(PlacementPlan::Pair {
             prefill_tokens: prefill_tokens(&prefill, req),
+            prefill_load: prefill.load_reservation,
+            decode_load: decode.load_reservation,
             prefill: prefill.worker,
             decode: decode.worker,
             prefill_policy: prefill_policy.name(),

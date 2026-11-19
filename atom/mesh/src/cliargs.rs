@@ -233,7 +233,7 @@ pub struct CliArgs {
     #[arg(
         long,
         default_value = "cache_aware",
-        value_parser = ["random", "round_robin", "dp_sticky", "cache_aware", "power_of_two", "prefix_hash", "agentic"],
+        value_parser = ["random", "round_robin", "dp_sticky", "cache_aware", "power_of_two", "prefix_hash", "agentic", "least_load"],
         help_heading = "Routing Policy"
     )]
     pub policy: String,
@@ -298,7 +298,7 @@ pub struct CliArgs {
     /// Specific policy for prefill nodes in PD mode
     #[arg(
         long,
-        value_parser = ["random", "round_robin", "dp_sticky", "cache_aware", "power_of_two", "prefix_hash", "agentic"],
+        value_parser = ["random", "round_robin", "dp_sticky", "cache_aware", "power_of_two", "prefix_hash", "agentic", "least_load"],
         help_heading = "PD Disaggregation"
     )]
     pub prefill_policy: Option<String>,
@@ -306,7 +306,7 @@ pub struct CliArgs {
     /// Specific policy for decode nodes in PD mode
     #[arg(
         long,
-        value_parser = ["random", "round_robin", "dp_sticky", "cache_aware", "power_of_two", "prefix_hash", "agentic"],
+        value_parser = ["random", "round_robin", "dp_sticky", "cache_aware", "power_of_two", "prefix_hash", "agentic", "least_load"],
         help_heading = "PD Disaggregation"
     )]
     pub decode_policy: Option<String>,
@@ -573,6 +573,9 @@ impl CliArgs {
                 request_token_equivalent: self.agentic_request_token_equivalent,
                 eviction_interval_secs: self.eviction_interval,
                 max_tree_size: self.max_tree_size,
+            },
+            "least_load" => PolicyConfig::LeastLoad {
+                request_token_equivalent: self.agentic_request_token_equivalent,
             },
             _ => PolicyConfig::RoundRobin,
         }
