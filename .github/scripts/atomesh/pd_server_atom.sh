@@ -1044,6 +1044,9 @@ purge_lmcache_disk() {
 #    each prefill stage its GPU's NIC and, under one shared master, refuses one
 #    an owner uses: owners and requesters sharing NICs stall concurrent reads.
 #  - MOONCAKE_STORE_MASTER_NUMA (default 1): the NUMA node the masters run on.
+#  - MOONCAKE_STORE_EVICTION_HIGH_WATERMARK (default 0.90) and
+#    MOONCAKE_STORE_EVICTION_RATIO (default 0.05): a master evicts the ratio
+#    of its pool, least recently used first, once the watermark is in use.
 #  - MOONCAKE_STORE_POOLS=per_nic (default shared), for owners that must share
 #    the stages' NICs: one master per owner NIC, every owner on exactly one
 #    NIC, and each stage reads its own NIC's pool (mooncake_store.pools).
@@ -1342,8 +1345,8 @@ kv_transfer_offload_connector() {
 # Store setting that is not one of its kind, before anything starts. The
 # helpers and bash arithmetic would misread it later: a compaction timeout of 0
 # skips the compaction, and a wait timeout bash cannot add aborts the wait
-# without stopping what it waited for. Kinds: positive_integer, integer (>= 0)
-# and positive (a decimal).
+# without stopping what it waited for. Kinds: positive_integer, integer (>= 0),
+# positive (a decimal) and fraction (a decimal in (0, 1)).
 require_mooncake_store_number() {
   local name="$1" value valid=0
   value="$(mooncake_setting "$1" "$2")"
@@ -1351,6 +1354,7 @@ require_mooncake_store_number() {
     positive_integer) [[ "${value}" =~ ^[0-9]{1,15}$ ]] && ((10#${value} > 0)) && valid=1 ;;
     integer) [[ "${value}" =~ ^[0-9]{1,15}$ ]] && valid=1 ;;
     positive) [[ "${value}" =~ ^[0-9]{1,15}([.][0-9]+)?$ && "${value}" =~ [1-9] ]] && valid=1 ;;
+    fraction) [[ "${value}" =~ ^0?[.][0-9]+$ && "${value}" =~ [1-9] ]] && valid=1 ;;
   esac
   if ((!valid)); then
     echo "[mooncake-store][FAIL] ${name}=${value} is not a ${3//_/ } number" >&2
@@ -1416,6 +1420,8 @@ check_mooncake_store_settings() {
   require_mooncake_store_number MOONCAKE_STORE_COMPACT_TIMEOUT 600 positive
   require_mooncake_store_number MOONCAKE_STORE_WAIT_TIMEOUT 1200 positive_integer
   require_mooncake_store_number MOONCAKE_STORE_MASTER_NUMA 1 integer
+  require_mooncake_store_number MOONCAKE_STORE_EVICTION_HIGH_WATERMARK 0.90 fraction
+  require_mooncake_store_number MOONCAKE_STORE_EVICTION_RATIO 0.05 fraction
   plan_mooncake_store_owners
   plan_mooncake_store_pools
   check_mooncake_store_ports
@@ -1894,7 +1900,8 @@ start_mooncake_store() {
       --http_metadata_server_port="$(mooncake_pool_port "${ATOMESH_MOONCAKE_METADATA_PORT}" "${pool}")"
       --metrics_port="$(mooncake_pool_port "${ATOMESH_MOONCAKE_METRICS_PORT}" "${pool}")"
       --default_kv_lease_ttl=10000
-      --eviction_high_watermark_ratio=0.90 --eviction_ratio=0.05
+      --eviction_high_watermark_ratio="$(mooncake_setting MOONCAKE_STORE_EVICTION_HIGH_WATERMARK 0.90)"
+      --eviction_ratio="$(mooncake_setting MOONCAKE_STORE_EVICTION_RATIO 0.05)"
       --allocation_strategy=random --memory_allocator=offset --client_ttl=10
     )
     dump_launch_info "MOONCAKE_MASTER" "${store_env[@]}" "${cmd[@]}"
