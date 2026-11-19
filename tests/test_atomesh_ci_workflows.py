@@ -149,6 +149,23 @@ def test_atomesh_benchmark_uses_required_heavy_ci_gate():
     )
 
 
+def test_a_push_to_main_runs_the_benchmark_smoke():
+    jobs = _jobs("atomesh-benchmark.yaml")
+    matrix_env = next(
+        step["env"]
+        for step in jobs["load-config"]["steps"]
+        if step.get("id") == "matrix"
+    )
+    assert github_expressions(matrix_env["SUITE"], "push") == "smoke"
+    assert "|| github.event_name == 'push'" in jobs["run-model-benchmark"]["if"]
+    gate_inputs = next(
+        step["with"]
+        for step in jobs["atomesh-benchmark-gate"]["steps"]
+        if step.get("uses") == "./.github/actions/evaluate-test-gate"
+    )
+    assert "|| github.event_name == 'push' ||" in gate_inputs["required-results"]
+
+
 def test_atomesh_heavy_gate_concurrency_groups_separate_non_approval_reviews():
     cases = [
         ("atomesh-accuracy-validation.yaml", "Atomesh Accuracy Validation"),
@@ -216,18 +233,37 @@ def test_every_pull_request_publishes_the_atomesh_unit_test_gate():
     )
 
 
+def test_the_unit_test_scope_matches_the_push_paths():
+    workflow = _workflow("atomesh-mocker-benchmark.yaml")
+    events = workflow.get("on", workflow.get(True))
+    scope = workflow["jobs"]["unit-test-scope"]["steps"][0]
+    assert scope["env"]["PATHS_INCLUDE"].split() == events["push"]["paths"]
+
+
 def test_the_unit_test_scope_follows_the_changed_files(tmp_path):
     scope = _jobs("atomesh-mocker-benchmark.yaml")["unit-test-scope"]["steps"][0]
     gh = tmp_path / "gh"
-    gh.write_text('#!/bin/sh\nprintf "%s\\n" $CHANGED_FILES\n')
-    gh.chmod(0o755)
-    cases = (
-        ("1", "false", "docs/a.md atom/mesh/src/lib.rs", "true"),
-        ("1", "false", "docs/a.md atom/model_engine/a.py", "false"),
-        ("1", "true", "atom/mesh/src/lib.rs", "false"),
-        ("", "false", "", "true"),
+    # Answers the step's two gh api calls through the step's own --jq.
+    gh.write_text(
+        "#!/bin/sh\n"
+        'case "$*" in */files*) body="$FILES_JSON" ;; *) body="$PULL_JSON" ;; esac\n'
+        'while [ "$1" != "--jq" ]; do shift; done\n'
+        'printf "%s" "$body" | jq -r "$2"\n'
     )
-    for pr_number, is_draft, changed_files, should_run in cases:
+    gh.chmod(0o755)
+    mesh = {"filename": "atom/mesh/src/lib.rs"}
+    moved_out = {
+        "filename": "atom/router/lib.rs",
+        "previous_filename": mesh["filename"],
+    }
+    cases = (
+        ("1", False, [{"filename": "docs/a.md"}, mesh], "true"),
+        ("1", False, [{"filename": "atom/model_engine/a.py"}], "false"),
+        ("1", False, [moved_out], "true"),
+        ("1", True, [mesh], "false"),
+        ("", False, [], "true"),
+    )
+    for pr_number, draft, files, should_run in cases:
         output = tmp_path / "output"
         output.write_text("")
         env = {
@@ -236,12 +272,12 @@ def test_the_unit_test_scope_follows_the_changed_files(tmp_path):
             "GITHUB_REPOSITORY": "ROCm/ATOM",
             "PATHS_INCLUDE": scope["env"]["PATHS_INCLUDE"],
             "PR_NUMBER": pr_number,
-            "IS_DRAFT": is_draft,
-            "CHANGED_FILES": changed_files,
+            "PULL_JSON": json.dumps({"draft": draft}),
+            "FILES_JSON": json.dumps(files),
         }
         subprocess.run(["bash", "-c", scope["run"]], env=env, check=True, timeout=10)
         lines = output.read_text().splitlines()
-        assert f"should_run={should_run}" in lines, (pr_number, is_draft, changed_files)
+        assert f"should_run={should_run}" in lines, (pr_number, draft, files)
 
 
 def _steps(job):

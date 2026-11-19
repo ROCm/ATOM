@@ -31,7 +31,7 @@ jobs:
               "",
               "**Path scope:**",
               "- Native ATOM, vLLM, and SGLang use ignore lists: docs/markdown and unrelated plugin or Mesh paths are skipped",
-              "- ATOMesh uses an include list: Mesh code, ATOMesh scripts/workflows/catalogs, OpenAI entrypoints, and Slurm helpers",
+              "- ATOMesh uses an include list: Mesh code and the ATOMesh accuracy workflow, its model catalog and dashboard script. ATOMesh benchmarks run after merge or on dispatch, not on PRs",
               "- Relevant path alone does not start expensive jobs; approval still opens the automatic path-scoped gate",
               "",
               "| Label | Tests |",

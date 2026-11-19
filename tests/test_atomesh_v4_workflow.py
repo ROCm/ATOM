@@ -50,6 +50,14 @@ class V4WorkflowTest(unittest.TestCase):
         cells = self.matrix()
         self.assertTrue(all(cell["model"] != MODEL for cell in cells))
 
+    def test_push_smoke_is_v4_1p1d_over_mooncake(self):
+        cells = self.matrix(SUITE="smoke")
+        self.assertEqual([cell["name"] for cell in cells], ["ds-v4-1p1d-tp8-smoke"])
+        self.assertEqual(cells[0]["topology"], "1p1d")
+        self.assertEqual(
+            cells[0]["env"]["common"].get("KV_CONNECTOR", "mooncake"), "mooncake"
+        )
+
     def test_manual_weekly_case_selection_preserves_256_threshold(self):
         cells = self.matrix(
             event="workflow_dispatch",

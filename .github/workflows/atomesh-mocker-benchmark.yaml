@@ -59,7 +59,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          IS_DRAFT: ${{ github.event.pull_request.draft }}
           # The push trigger's paths; keep the two lists the same.
           PATHS_INCLUDE: |
             atom/mesh/**
@@ -74,11 +73,13 @@ jobs:
           should_run=false
           if [ -z "${PR_NUMBER}" ]; then
             should_run=true reason=non-pull-request-event
-          elif [ "${IS_DRAFT}" = "true" ]; then
+          # Not the event's draft flag: a re-run keeps the payload it started with.
+          elif [ "$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '.draft')" = "true" ]; then
             reason=draft-pull-request
           else
             reason=paths-not-included
-            files="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" --jq '.[].filename')"
+            # A file renamed out of a path still changes that path.
+            files="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" --jq '.[] | .filename, (.previous_filename // empty)')"
             while IFS= read -r pattern; do
               while IFS= read -r file; do
                 # Unquoted, the pattern is a glob, and its * matches across /.

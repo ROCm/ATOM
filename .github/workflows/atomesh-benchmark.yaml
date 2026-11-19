@@ -403,7 +403,7 @@ jobs:
       - name: Build benchmark matrix
         id: matrix
         env:
-          SUITE: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && 'nightly' || (github.event_name == 'workflow_dispatch' && inputs.suite || 'smoke') }}
+          SUITE: ${{ github.event_name == 'schedule' && 'nightly' || (github.event_name == 'workflow_dispatch' && inputs.suite || 'smoke') }}
           RUN_ALL_MODELS: ${{ github.event_name == 'workflow_dispatch' && inputs.run_all_models || github.event_name != 'workflow_dispatch' }}
           MODEL_NAMES: ${{ github.event_name == 'workflow_dispatch' && inputs.model_names || '' }}
           CASE_NAMES: ${{ github.event_name == 'workflow_dispatch' && inputs.case_names || '' }}
@@ -1526,14 +1526,16 @@ jobs:
 
   run-model-benchmark:
     # Not on pull requests: their merge checks are the ATOMesh unit tests and
-    # the standalone accuracy run. To benchmark a PR branch, dispatch this
-    # workflow on it.
+    # the standalone accuracy run. Each push to main runs the smoke suite
+    # (DeepSeek-V4 1P1D over Mooncake). To run it on a PR branch, dispatch
+    # this workflow with suite=smoke and case_names=ds-v4-1p1d-tp8-smoke.
     name: ${{ matrix.group.name }}
     needs: [ci-gate, load-config]
     if: >-
       needs.load-config.outputs.has_matrix == 'true'
       && (
         github.event_name == 'schedule'
+        || github.event_name == 'push'
         || (github.event_name == 'workflow_dispatch' && inputs.run_model_benchmark)
       )
     strategy:
@@ -1834,7 +1836,7 @@ jobs:
             summarize-results=${{ needs.summarize-results.result }}
           required-results: |
             load-config=${{ needs.load-config.result }}
-            run-model-benchmark=${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_model_benchmark)) && needs.run-model-benchmark.result || 'success' }}
+            run-model-benchmark=${{ (github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.run_model_benchmark)) && needs.run-model-benchmark.result || 'success' }}
 
   dashboard:
     concurrency:
