@@ -32,6 +32,9 @@ _DEFAULT_BACKEND = "moriio"
 
 # Backends with a remote peer. The rest of the registry is local storage.
 PD_TRANSFER_BACKENDS = frozenset({"moriio", "mooncake"})
+# ATOM_MOONCAKE_STORE_DRAFT_WINDOW: the tier that splits the draft rows, the P/D
+# connector that hands on where they end, and the composite of the two.
+_DRAFT_WINDOW_BACKENDS = frozenset({"mooncake_store", "mooncake", "multi"})
 
 
 def resolve_pd_backend(kv_transfer_config: dict | None) -> str | None:
@@ -461,6 +464,15 @@ class KVConnectorFactory:
         )
 
         entry = cls._registry[backend_name]
+        if (
+            envs.ATOM_MOONCAKE_STORE_DRAFT_WINDOW
+            and backend_name not in _DRAFT_WINDOW_BACKENDS
+        ):
+            raise ValueError(
+                "ATOM_MOONCAKE_STORE_DRAFT_WINDOW splits the mooncake_store "
+                "layout, and only the mooncake P/D connector tells a decode which "
+                f"blocks lack draft rows; {backend_name} would ignore it"
+            )
 
         if role == "worker":
             mod = importlib.import_module(entry["worker_module"])
