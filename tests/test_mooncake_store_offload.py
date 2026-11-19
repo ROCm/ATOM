@@ -731,6 +731,17 @@ def test_config_refuses_bad_settings(overrides, match):
         ({"rdma0": {"metadata": METADATA}}, r"pools\['rdma0'\]\.master"),
         ({"rdma0": {"master": "nohost", "metadata": METADATA}}, "host:port"),
         ({"rdma0": {"master": MASTER, "metadata": ""}}, "metadata must be"),
+        (
+            {
+                "rdma0": {
+                    "master": MASTER,
+                    "metadata": METADATA,
+                    "kv_events": "tcp://10.0.0.1:26070",
+                },
+                "rdma1": {"master": MASTER, "metadata": METADATA},
+            },
+            r"pools\['rdma1'\]\.kv_events differs",
+        ),
     ],
 )
 def test_config_refuses_a_bad_pool_table(pools, match):
@@ -2244,6 +2255,8 @@ def test_the_scheduler_relays_the_store_tier_with_its_kv_events(cluster):
     scheduler.bind_block_manager(
         SimpleNamespace(kv_events_enabled=True, record_events=recorded.extend)
     )
+    # A later pipeline stage binds one too, but never builds metadata.
+    assert scheduler._store_tier is None
     key = f"{scheduler._namespace}/w0of1/{_DIGESTS[0]}"
     batch = msgspec.msgpack.encode([0, [_master_event("stored", key)], 0])
     try:

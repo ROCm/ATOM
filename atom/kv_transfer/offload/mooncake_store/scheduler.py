@@ -417,6 +417,9 @@ class MooncakeStoreOffloadScheduler(KVStoreOffloadScheduler):
             "mooncake_store"
         )
         self._world = world
+        # The masters whose store tier this scheduler relays; see
+        # `build_connector_meta`.
+        self._store_tier_endpoints: list[str] = []
         self._store_tier: StoreTierRelay | None = None
 
     def bind_block_manager(self, block_manager) -> None:
@@ -425,7 +428,7 @@ class MooncakeStoreOffloadScheduler(KVStoreOffloadScheduler):
         # pool's: a chunk's ranks may be in different pools.
         pools = self._store_cfg.store_masters()
         endpoints = [pool.kv_events for pool in pools if pool.kv_events]
-        if self._store_tier is not None or not endpoints:
+        if not endpoints:
             return
         if not block_manager.kv_events_enabled or len(endpoints) < len(pools):
             logger.warning(
@@ -437,14 +440,18 @@ class MooncakeStoreOffloadScheduler(KVStoreOffloadScheduler):
                 ),
             )
             return
-        tier = StoreTier(self._namespace, self._world, self._store_cfg.chunk_tokens)
-        self._store_tier = StoreTierRelay(endpoints, tier)
-        logger.info(
-            "Mooncake Store offload: relaying the store tier from %s",
-            ",".join(endpoints),
-        )
+        self._store_tier_endpoints = endpoints
 
     def build_connector_meta(self):
+        # Every pipeline stage binds a block manager, but only the head builds
+        # metadata and publishes KV events, so the relay starts here.
+        if self._store_tier is None and self._store_tier_endpoints:
+            tier = StoreTier(self._namespace, self._world, self._store_cfg.chunk_tokens)
+            self._store_tier = StoreTierRelay(self._store_tier_endpoints, tier)
+            logger.info(
+                "Mooncake Store offload: relaying the store tier from %s",
+                ",".join(self._store_tier_endpoints),
+            )
         if self._store_tier is not None:
             self._block_manager.record_events(self._store_tier.drain())
         return super().build_connector_meta()

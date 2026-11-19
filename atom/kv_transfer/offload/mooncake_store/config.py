@@ -279,6 +279,14 @@ def _pools(value: Any) -> dict[str, StorePool]:
             _text(f"{name}.metadata", pool.get("metadata")),
             _endpoint(f"{name}.kv_events", pool.get("kv_events")),
         )
+    # A master publishes on one endpoint, whichever NIC reaches it.
+    kv_events: dict[str, str | None] = {}
+    for device, pool in pools.items():
+        if kv_events.setdefault(pool.master, pool.kv_events) != pool.kv_events:
+            raise ValueError(
+                f"mooncake_store.pools[{device!r}].kv_events differs from that of "
+                f"another pool of master {pool.master}"
+            )
     return pools
 
 
