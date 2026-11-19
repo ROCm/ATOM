@@ -7,14 +7,15 @@ K3's chunk kernel keeps no state inside a forward, so its prefill appends each
 interior checkpoint's head -- the row's tokens before the checkpoint, from the
 row's initial state -- to the same varlen call as one more sequence. With that,
 the prompt-end checkpoint no longer cuts a prefill in two. These tests pin the
-index lists that build the call from the scheduler's reservations and, where
-the model module imports, what the forward writes from them.
+index lists that build the call from the scheduler's reservations and what
+the forward writes from them.
 """
 
 from types import SimpleNamespace
 
 import pytest
 import torch
+from aiter_stub import atom_without_aiter
 from test_state_checkpoint import (
     BLOCK,
     PAGED_COPY_SPEC,
@@ -126,30 +127,24 @@ class TestAnchorInsideAPrefill:
         }
 
 
-# ── the forward, where the model module imports ──────────────────────────────
+@pytest.fixture(scope="module")
+def k3_modules():
+    with atom_without_aiter() as load:
+        yield SimpleNamespace(
+            builder=load("atom.model_ops.attentions.kimi_mla_gdn_attn"),
+            model=load("atom.models.kimi_k3.model"),
+        )
 
 
-def k3_module():
-    return pytest.importorskip(
-        "atom.models.kimi_k3.model",
-        reason="the K3 model module imports aiter at load",
-        exc_type=ImportError,
-    )
-
-
-def test_the_state_pool_lends_scratch_only_where_it_is_borrowed():
+def test_the_state_pool_lends_scratch_only_where_it_is_borrowed(k3_modules):
     """One slot per request; the scratch on top is for the checkpoints that
     two steps hold at once, and only where K3's forward writes them."""
-    K3 = pytest.importorskip(
-        "atom.model_ops.attentions.kimi_mla_gdn_attn",
-        reason="the K3 builder's module imports aiter at load",
-        exc_type=ImportError,
-    )
+    K3 = k3_modules.builder
     from test_kda_layout_id import builder
 
     def extra(**kw):
         b = object.__new__(K3.KimiAiterMLAGDNMetadataBuilder)
-        b.model_runner = builder(**kw).model_runner
+        b.model_runner = builder(K3._KimiMLAGDNCommon, **kw).model_runner
         b.num_state_layers = lambda: 1
         b._state_shape_for_runner = lambda: ((3, 8), (1, 2, 2))
         b._state_dtypes = lambda: (torch.bfloat16, torch.float32)
@@ -162,13 +157,9 @@ def test_the_state_pool_lends_scratch_only_where_it_is_borrowed():
     assert extra(pp=2) == extra(model_type="glm5_next_text") == 0
 
 
-def test_the_builder_hands_the_forward_its_rows():
+def test_the_builder_hands_the_forward_its_rows(k3_modules):
     """`kda_cu` joins the int32 query starts the KDA call is cut by."""
-    K3 = pytest.importorskip(
-        "atom.model_ops.attentions.kimi_mla_gdn_attn",
-        reason="the K3 builder's module imports aiter at load",
-        exc_type=ImportError,
-    )
+    K3 = k3_modules.builder
     from test_kda_layout_id import builder
 
     bm = anchor_only_bm()
@@ -181,7 +172,7 @@ def test_the_builder_hands_the_forward_its_rows():
         num_cached_tokens=[0],
     )
     b = object.__new__(K3.KimiAiterMLAGDNMetadataBuilder)
-    b.model_runner = builder().model_runner
+    b.model_runner = builder(K3._KimiMLAGDNCommon).model_runner
     b.model_runner.mamba_k_cache = torch.empty(1, 64)
     b.device = "cpu"
 
@@ -192,12 +183,10 @@ def test_the_builder_hands_the_forward_its_rows():
     assert got["kda_tokens"].dtype == got["head_slots"].dtype == torch.int64
 
 
-def test_finish_prefill_keeps_kda_targets_out_of_gdn_chunk_snapshots(monkeypatch):
-    K3 = pytest.importorskip(
-        "atom.model_ops.attentions.kimi_mla_gdn_attn",
-        reason="the K3 builder imports aiter at load",
-        exc_type=ImportError,
-    )
+def test_finish_prefill_keeps_kda_targets_out_of_gdn_chunk_snapshots(
+    monkeypatch, k3_modules
+):
+    K3 = k3_modules.builder
     from test_kda_layout_id import builder
 
     bm = anchor_only_bm()
@@ -210,7 +199,7 @@ def test_finish_prefill_keeps_kda_targets_out_of_gdn_chunk_snapshots(monkeypatch
         num_cached_tokens=[0],
     )
     b = object.__new__(K3.KimiAiterMLAGDNMetadataBuilder)
-    b.model_runner = builder().model_runner
+    b.model_runner = builder(K3._KimiMLAGDNCommon).model_runner
     b.model_runner.mamba_k_cache = torch.empty(1, 64)
     b.device = "cpu"
     meta = SimpleNamespace(non_spec_query_start_loc=torch.tensor([0, 44]))
@@ -227,8 +216,8 @@ def test_finish_prefill_keeps_kda_targets_out_of_gdn_chunk_snapshots(monkeypatch
     assert not hasattr(meta, "ssm_chunk_offsets")
 
 
-def test_the_forward_writes_heads_ends_and_conv_windows():
-    attn = k3_module().KimiKDAAttention
+def test_the_forward_writes_heads_ends_and_conv_windows(k3_modules):
+    attn = k3_modules.model.KimiKDAAttention
     ckpt = {
         "slots": torch.tensor([4, 5]),
         "conv_tokens": torch.tensor([[1, 2, 3], [5, 6, 7]]),
@@ -252,10 +241,10 @@ def test_the_forward_writes_heads_ends_and_conv_windows():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashKDA needs a GPU")
-def test_a_head_ends_on_the_state_a_forward_ending_there_would():
+def test_a_head_ends_on_the_state_a_forward_ending_there_would(k3_modules):
     """Row 1's checkpoint off FlashKDA's 32-token chunk grid, behind a row
     resuming from a state, the way a mixed step lays them out."""
-    attn = k3_module().KimiKDAAttention
+    attn = k3_modules.model.KimiKDAAttention
     torch.manual_seed(0)
     heads, dim, lens, at = 4, 128, [300, 1100], 1001
     t = sum(lens)

@@ -17,15 +17,8 @@ from __future__ import annotations
 from contextlib import contextmanager
 from types import SimpleNamespace
 
-import pytest
 import torch
-
-K3 = pytest.importorskip(
-    "atom.model_ops.attentions.kimi_mla_gdn_attn",
-    reason="the K3 builder's module imports aiter at load",
-    exc_type=ImportError,
-)
-Builder = K3._KimiMLAGDNCommon
+from aiter_stub import atom_without_aiter
 
 SHAPE_K = (3, 4608)
 SHAPE_V = (12, 128, 128)
@@ -35,6 +28,7 @@ TP = 8
 
 
 def builder(
+    builder_cls,
     shape_k=SHAPE_K,
     shape_v=SHAPE_V,
     dt_k=DT_K,
@@ -60,7 +54,7 @@ def builder(
         _state_dtypes=lambda: (dt_k, dt_v),
     )
     for name in ("_uses_paged_checkpoints", "_reads_midstep", "_conv_state_len"):
-        setattr(stub, name, getattr(Builder, name).__get__(stub, type(stub)))
+        setattr(stub, name, getattr(builder_cls, name).__get__(stub, type(stub)))
     return stub
 
 
@@ -72,17 +66,19 @@ def tp_world(size: int):
     other test files stub `aiter` into `sys.modules`, so the import path is not
     reliably the one this module bound at load, but the name it bound is.
     """
-    original = K3.get_tp_group
-    K3.get_tp_group = lambda: SimpleNamespace(world_size=size)
-    try:
-        yield
-    finally:
-        K3.get_tp_group = original
+    with atom_without_aiter() as load:
+        K3 = load("atom.model_ops.attentions.kimi_mla_gdn_attn")
+        original = K3.get_tp_group
+        K3.get_tp_group = lambda: SimpleNamespace(world_size=size)
+        try:
+            yield K3._KimiMLAGDNCommon
+        finally:
+            K3.get_tp_group = original
 
 
 def layout_of(**kwargs) -> str:
-    with tp_world(kwargs.pop("tp", TP)):
-        return Builder.state_transfer(builder(**kwargs)).paged_layout_id
+    with tp_world(kwargs.pop("tp", TP)) as Builder:
+        return Builder.state_transfer(builder(Builder, **kwargs)).paged_layout_id
 
 
 class TestTheIdNamesItsVersionAndItsRule:
@@ -143,34 +139,34 @@ class TestPagedCheckpointsAreRefusedWhereSizingWouldRaise:
     def test_pipeline_parallelism_copies(self):
         """The stages agree on one unit geometry, so a checkpoint is a PAGE
         image under PP too rather than a slot competing with admissions."""
-        with tp_world(TP):
-            transfer = Builder.state_transfer(builder(pp=2))
+        with tp_world(TP) as Builder:
+            transfer = Builder.state_transfer(builder(Builder, pp=2))
         assert transfer.copies and not transfer.forks
         assert Builder.paged_checkpoints_span_pipeline
 
     def test_rapidserve_falls_back_to_fork(self):
-        with tp_world(TP):
-            transfer = Builder.state_transfer(builder(rapidserve=True))
+        with tp_world(TP) as Builder:
+            transfer = Builder.state_transfer(builder(Builder, rapidserve=True))
         assert transfer.forks and not transfer.copies
 
     def test_the_ordinary_case_copies(self):
-        with tp_world(TP):
-            transfer = Builder.state_transfer(builder())
+        with tp_world(TP) as Builder:
+            transfer = Builder.state_transfer(builder(Builder))
         assert transfer.copies and not transfer.forks
 
     def test_k3_writes_a_checkpoint_inside_a_prefill(self):
         """KDA's chunk kernel returns only the final state, so K3's forward
         re-runs an interior checkpoint's head, which ends on any token; the
         conv window still needs `conv_kernel - 1` of the forward's tokens."""
-        with tp_world(TP):
-            transfer = Builder.state_transfer(builder())
+        with tp_world(TP) as Builder:
+            transfer = Builder.state_transfer(builder(Builder))
         assert transfer.readable_midstep
         assert (transfer.midstep_grid, transfer.midstep_min_offset) == (1, 3)
 
     def test_nothing_else_writes_one(self):
         """Not under PP, where the scratch slot's hand-back is unchecked;
         GLM-5.3 shares the builder but not the forward that writes it."""
-        with tp_world(TP):
-            assert not Builder.state_transfer(builder(pp=2)).readable_midstep
-            glm = builder(model_type="glm5_next_text")
+        with tp_world(TP) as Builder:
+            assert not Builder.state_transfer(builder(Builder, pp=2)).readable_midstep
+            glm = builder(Builder, model_type="glm5_next_text")
             assert not Builder.state_transfer(glm).readable_midstep
