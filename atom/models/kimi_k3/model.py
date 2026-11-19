@@ -27,6 +27,7 @@ from aiter.ops.triton.attention.kda_gating import (
 from aiter.ops.triton.attention.kda_gating import (
     supports as aiter_kda_gating_supports,
 )
+from aiter.tuned_gemm import tgemm
 from einops import rearrange
 from torch import nn
 
@@ -273,6 +274,10 @@ _RMS_FUSABLE_QUANT_TYPES = (
     QuantType.per_1x128,
     QuantType.per_Token,
 )
+
+# From this many tokens an unquantized KDA in_proj runs as two GEMMs, so aiter's
+# tuned asm kernel serves the tile-aligned [q | k | v | g] rows (its M=8192 row).
+_KDA_IN_PROJ_SPLIT_MIN_TOKENS = 8192
 
 
 def _is_e8m0_blockscale(
@@ -1977,30 +1982,39 @@ class KimiKDAAttention(nn.Module):
         # (computed here so it rides the same GEMM instead of a separate one
         # after the recurrence). in_proj's weight was grown in
         # process_weights_after_loading to the fused [q | k | v | g | b | f_a],
-        # so this single unquantized call emits all six; f_b_proj stays a
+        # so in_proj emits all six (in two GEMMs on a long prefill); f_b_proj stays a
         # separate GEMM because it consumes f_a's output, not hidden_states.
         lp = self.local_proj_size
         nlh = self.num_local_heads
         hd = self.head_dim
-        fused_in = self.in_proj(hidden_states, x_scale=hidden_states_scale)
+        if (
+            hidden_states.shape[0] >= _KDA_IN_PROJ_SPLIT_MIN_TOKENS
+            and self.in_proj.quant_type == QuantType.No
+        ):
+            w = self.in_proj.weight
+            qkvg = tgemm.mm(hidden_states, w[: 4 * lp])
+            tail = tgemm.mm(hidden_states, w[4 * lp :])
+        else:
+            fused_in = self.in_proj(hidden_states, x_scale=hidden_states_scale)
+            qkvg, tail = fused_in[..., : 4 * lp], fused_in[..., 4 * lp :]
         # No .contiguous() needed: mixed_qkv is a column slice (feature stride 1,
-        # row stride N_fused). Both causal-conv consumers read the token stride
+        # row stride N). Both causal-conv consumers read the token stride
         # from the tensor itself — causal_conv1d_fn uses x.stride(1) after
         # transpose (channel-last: stride(0)==1), and causal_conv1d_update only
         # requires x.stride(1)==1 (feature-contiguous, which the slice preserves).
-        mixed_qkv = fused_in[..., : 3 * lp]
-        out_gate = fused_in[..., 3 * lp : 4 * lp]
+        mixed_qkv = qkvg[..., : 3 * lp]
+        out_gate = qkvg[..., 3 * lp :]
         # beta is widened to fp32 inside _run_kda (see the note there): the KDA
         # delta-rule write strength must stay fp32 for accuracy.
-        beta = fused_in[..., 4 * lp : 4 * lp + nlh]
+        beta = tail[..., :nlh]
         # f_a feeds a second GEMM (f_b_proj) and is a column slice of the fused
-        # output, so it needs a unit row stride rather than the fused N_fused one.
+        # output, so it needs a unit row stride rather than the output's N.
         # Under a per-token FP8 f_b_proj that copy would be followed by a quant
         # of the same [T, head_dim]; strided_per_token_quant does the gather AND the
         # quant in one kernel, so only the quantized result is ever written.
         # Otherwise the plain contiguous copy runs and f_b_proj quantizes (or
         # not) exactly as before.
-        f_a_view = fused_in[..., 4 * lp + nlh : 4 * lp + nlh + hd]
+        f_a_view = tail[..., nlh : nlh + hd]
         if self.fuse_f_a_quant:
             from atom.model_ops.kimi_k3 import strided_per_token_quant
 
