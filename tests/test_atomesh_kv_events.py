@@ -37,6 +37,7 @@ class KvEventsCellsTest(unittest.TestCase):
             ATOMESH_LOG_ROOT="/logs",
             ATOMESH_NODE_POOL="pit2-p03-g13,pit2-p03-g27",
             ATOMESH_1P1D_NODES="",
+            ATOMESH_2P1D_NODES="",
             ATOMESH_PD_RANK_MAPPING_POLICY="none",
         )
         with tempfile.TemporaryDirectory() as directory:
@@ -128,25 +129,26 @@ start_prefill prefill-rank-0 "${SERVER_PORT}"
         )
 
     def test_cells_route_cache_aware_by_the_prefill_events(self):
+        events = [
+            cell for cell in self.cells if cell["service"]["router"].get("kv_events")
+        ]
         self.assertEqual(
+            {(cell["display_topology"], tuple(cell["concurrency"])) for cell in events},
             {
-                (cell["display_topology"], tuple(cell["concurrency"]))
-                for cell in self.cells
-            },
-            {
-                (f"1P1D-CPP4-DCP4-TP1-TP4-{tier}-KVEV", (concurrency,))
-                for tier, concurrencies in (
-                    ("MCSTORE", (56, 72, 96)),
-                    ("LMCACHE", (56, 72)),
+                (f"{pd}-CPP4-DCP4-TP1-TP4-{tier}-KVEV", (concurrency,))
+                for pd, tier, concurrencies in (
+                    ("1P1D", "MCSTORE", (56, 72, 96)),
+                    ("1P1D", "LMCACHE", (56, 72)),
+                    ("2P1D", "MCSTORE", (72,)),
                 )
                 for concurrency in concurrencies
             },
         )
-        for cell in self.cells:
+        for cell in events:
             with self.subTest(cell=cell["name"]):
-                self.assertTrue(cell["service"]["router"]["kv_events"])
                 args = self.router_args(cell, ROUTER_KV_EVENTS="true")
                 self.assertEqual(args[args.index("--policy") + 1], "cache_aware")
+                self.assertEqual(args.count("--prefill-policy"), 1)
                 self.assertEqual(args.count("--kv-events"), 1)
                 self.assertEqual(args[args.index("--mooncake-admin-port") + 1], "26090")
                 self.assertEqual(
@@ -155,6 +157,45 @@ start_prefill prefill-rank-0 "${SERVER_PORT}"
                 self.assertEqual(
                     args[args.index("--prepare-prefix-cache-mb") + 1], "4096"
                 )
+
+    def test_2p1d_controls_place_a_turn_by_session_or_in_turn(self):
+        cells = {
+            cell["display_topology"].rsplit("-", 1)[1]: cell
+            for cell in self.cells
+            if cell["display_topology"].startswith("2P1D-")
+        }
+        self.assertEqual(set(cells), {"KVEV", "STICKY", "RR"})
+
+        def setup(cell):
+            setup = {k: v for k, v in cell.items() if k not in ("id", "name")}
+            del setup["display_topology"], setup["service"]["router"]
+            return setup
+
+        for control, policy, prefill_policy in (
+            ("STICKY", "random", "dp_sticky"),
+            ("RR", "round_robin", "round_robin"),
+        ):
+            cell = cells[control]
+            with self.subTest(cell=cell["name"]):
+                self.assertEqual(
+                    setup(json.loads(json.dumps(cell))),
+                    setup(json.loads(json.dumps(cells["KVEV"]))),
+                )
+                self.assertEqual(cell["num_nodes"], 3)
+                router = cell["service"]["router"]
+                args = self.router_args(
+                    cell, ROUTER_PREFILL_POLICY=router.get("prefill_policy", "")
+                )
+                self.assertEqual(args[args.index("--policy") + 1], policy)
+                self.assertEqual(
+                    [
+                        args[i + 1]
+                        for i, arg in enumerate(args)
+                        if arg == "--prefill-policy"
+                    ],
+                    [prefill_policy],
+                )
+                self.assertNotIn("--kv-events", args)
 
     def test_submit_exports_the_switch(self):
         source = (SCRIPTS / "pd_submit.sh").read_text()
@@ -247,7 +288,7 @@ start_mooncake_page_cache_dropper
             for cell in self.cells
             if cell["env"]["prefill"].get("MOONCAKE_STORE") == "1"
         ]
-        self.assertEqual(len(stores), 3)
+        self.assertEqual(len(stores), 6)
         for cell in stores:
             with self.subTest(cell=cell["name"]):
                 drop_for = cell["env"]["prefill"]["MOONCAKE_STORE_PAGE_CACHE_DROP_FOR"]

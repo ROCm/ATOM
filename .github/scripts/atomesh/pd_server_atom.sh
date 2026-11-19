@@ -2212,10 +2212,16 @@ start_router() {
     fi
     router_dp_aware_args=(--dp-aware)
   elif is_agentic_multi_prefill; then
-    # Pin the session to one prefill. Decode keeps ROUTER_POLICY: a single
-    # decode has nothing to stick, and --dp-aware is only for ranks that share
-    # one endpoint.
-    router_prefill_policy_args=(--prefill-policy dp_sticky)
+    # Pin the session to one prefill, unless the case places it by cache
+    # (cache_aware sets --prefill-policy itself) or names a prefill policy
+    # (router.prefill_policy). Decode keeps ROUTER_POLICY: a single decode has
+    # nothing to stick, and --dp-aware is only for ranks that share one
+    # endpoint.
+    if [[ -n "${ROUTER_PREFILL_POLICY:-}" ]]; then
+      router_prefill_policy_args=(--prefill-policy "${ROUTER_PREFILL_POLICY}")
+    elif [[ "${router_policy}" != "cache_aware" ]]; then
+      router_prefill_policy_args=(--prefill-policy dp_sticky)
+    fi
   elif [[ "${#router_rank_mapping_args[@]}" -gt 0 ]]; then
     router_dp_aware_args=(--dp-aware)
   fi
