@@ -17,6 +17,7 @@ mod prefix_hash;
 mod random;
 mod registry;
 mod round_robin;
+mod session_affinity;
 pub mod tree;
 pub(crate) mod utils;
 pub use cache_aware::CacheAwarePolicy;
