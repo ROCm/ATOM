@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import inspect
 import logging
 from dataclasses import dataclass
 from functools import partial as functools_partial
@@ -35,9 +34,11 @@ except ImportError:
 from aiter.dist.parallel_state import get_dp_group, get_tensor_model_parallel_rank
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 from aiter.ops.triton.attention.mla import mla_decode_fwd as triton_mla_decode_fwd
-from aiter.ops.triton.fusions import fused_kv_cache as triton_fused_kv_cache
 from aiter.ops.triton.fusions.fused_kv_cache import (
     fused_qk_rope_cat_and_cache_mla as triton_fused_qk_rope_cat_and_cache_mla,
+)
+from aiter.ops.triton.fusions.fused_kv_cache import (
+    q_nope_prestored_supported,
 )
 from aiter.ops.triton.gather_kv_b_proj import gather_kv_b_proj
 from aiter.ops.triton.kv_cache import cat_and_cache_mla as triton_cat_and_cache_mla
@@ -505,31 +506,6 @@ def _mla_absorb_bf16_fuse_qout_enabled() -> bool:
     return envs.ATOM_MLA_ABSORB_BF16_FUSE_QOUT
 
 
-def _mla_q_nope_prestored_supported() -> bool:
-    """Match aiter's gfx1250 prestored kernel requirements once per layer.
-
-    Older aiter builds can still use the ordinary shuffled rope/cache call.
-    Inspect the public signature through its torch-compile wrapper as well as
-    the kernel availability; an arch flag alone does not guarantee Gluon.
-    """
-    if (
-        getattr(triton_fused_kv_cache, "DEVICE_ARCH", None)
-        not in (
-            "gfx1250",
-            "gfx1250-strict",
-        )
-        or getattr(triton_fused_kv_cache, "gluon_qpe_htile_kernel", None) is None
-    ):
-        return False
-    try:
-        return (
-            "q_nope_prestored"
-            in inspect.signature(triton_fused_qk_rope_cat_and_cache_mla).parameters
-        )
-    except (TypeError, ValueError):
-        return False
-
-
 def _maybe_view_mxfp4_weight_for_gather(
     kv_b_proj: nn.Module, weight: torch.Tensor
 ) -> torch.Tensor:
@@ -788,7 +764,8 @@ class MLAAttention(nn.Module):
         self.use_seg_mla = (not self.use_triton_mla) and envs.ATOM_MLA_PAGE_SIZE > 1
         # Shuffled KV cache; the decode kernel follows use_triton_mla.
         self.kv_shuffled = bool(envs.ATOM_MLA_KV_SHUFFLED)
-        self._q_nope_prestored_supported = _mla_q_nope_prestored_supported()
+        # aiter owns which archs take q_nope already written into q_out.
+        self._q_nope_prestored_supported = q_nope_prestored_supported()
         self.use_flydsl_gather_kv_b_proj = bool(envs.ATOM_USE_FLYDSL_GATHER_KV_B_PROJ)
         # Resolved on the first gather, when the weights and cache exist; see
         # `_kv_b_proj_gather`. None = not asked yet.
