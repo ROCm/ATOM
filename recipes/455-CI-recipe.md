@@ -533,7 +533,7 @@ HF_HUB_OFFLINE=0 lm_eval --model local-completions \
 - 并行：TP1；MTP，每步 3 个草稿 token，草稿层的 MoE 专家在线量化成 MXFP4；FP8 KV cache，BF16 index cache，block 16；开 prefix cache
 - MODEL_PATH：`/models/Qwen3.8-Flash-Next-Quark-MXFP4`（[`amd/Qwen3.8-Flash-Next-Quark-MXFP4`](https://huggingface.co/amd/Qwen3.8-Flash-Next-Quark-MXFP4) @ `b71e28afcd4b43add751159862235035613a58ab`）；PORT：`8000`。仓库里带 MTP 层（`mtp.layers.0.*`），`--method mtp` 不用另配草稿模型
 
-**main 上还缺 [ROCm/ATOM#3225](https://github.com/ROCm/ATOM/pull/3225) + [ROCm/aiter#7847](https://github.com/ROCm/aiter/pull/7847)**（登记在 [`455-CI/pending_fixes.csv`](455-CI/pending_fixes.csv)）：ATOM#3225 是 gfx1250 上跑 Qwen3.8 需要的修复，aiter#7847 是 gfx1250 的性能调优。合入前在 main 上可能跑不起来或性能偏低，跑挂时按指南 §3.7 用这组 PR 作说法。
+**main 上还缺 [ROCm/aiter#8295](https://github.com/ROCm/aiter/pull/8295)**（登记在 [`455-CI/pending_fixes.csv`](455-CI/pending_fixes.csv)）。gfx1250 上跑 Qwen3.8 需要的修复 [ROCm/ATOM#3225](https://github.com/ROCm/ATOM/pull/3225) 和性能调优 [ROCm/aiter#7847](https://github.com/ROCm/aiter/pull/7847) 已在 2026-11-16、11-17 合入 main。aiter#7847 的调优表里有 17 行 gfx1250 BF16 GEMM 走 hipBLASLt（`libtype=torch`），同一张卡上有别的队列在跑时（ATOM 每一步的 D2H 拷贝就是），这个 hipBLASLt kernel 会用错操作数：GPU page fault，地址很小（2026-11-18 的 `0x4e2000`），或者结果里整块 16 行是错的。aiter#8295 把这 17 行换成 Triton，Triton 在这些形状上也快 2.5–11 倍（8K/1K c64 吞吐 +10.9%）。合入前在 main 上可能出这个 fault，跑挂时按指南 §3.7 用这个 PR 作说法。
 
 命令由 Qwen3.8 的开发同事提供（2026-11-13），按 455-CI 的规矩改了四处，其余参数原样：
 - 去掉 `PYTHONPATH=/workspace/ATOM`：那是开发机上的 ATOM checkout，455-CI 只用镜像里 `/app/ATOM` 的 main；
