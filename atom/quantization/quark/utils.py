@@ -565,7 +565,8 @@ def dequant_weight_online(
     - ``per_Tensor``: per-tensor FP8, one scalar scale per output partition.
     - ``per_Token`` (ptpc_fp8): per-output-channel FP8, scale ``(N, 1)``.
     - ``per_1x128``: DeepSeek-style 128x128 block FP8.
-    - ``per_1x32``: MXFP8 or MXFP4 (1x32 E8M0 shared scale).
+    - ``per_1x32``: MXFP8, or MXFP4 for MoE experts (1x32 E8M0 shared scale); a
+      Linear refuses an MXFP4 source before it gets here.
 
     :param weight: The quantized (or float, for ``No``) weight tensor.
     :param weight_scale: The source weight scale (``None`` for ``No``).

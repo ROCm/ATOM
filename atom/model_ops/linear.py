@@ -965,7 +965,7 @@ class LinearBase(nn.Module):
             self.native_a8_group_rows = layer_quant_config.weight_block_size[0]
             # No group32 FP8 GEMM here: dequantized to BF16 at load.
             self.runs_bf16 = (
-                native_group32_runs_bf16() and params_dtype == torch.float8_e4m3fn
+                params_dtype == torch.float8_e4m3fn and native_group32_runs_bf16()
             )
             if self.input_size % 32 or any(
                 size % self.native_a8_group_rows for size in self.output_partition_sizes

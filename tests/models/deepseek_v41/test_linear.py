@@ -47,6 +47,30 @@ def _online_quant_config(block_rows=1):
     )
 
 
+def test_a_native_w4a8_linear_does_not_ask_for_the_group32_gemm(
+    linear_modules, monkeypatch
+):
+    """Only an FP8 weight can fall back to BF16, so only it asks AITER."""
+    from aiter import QuantType
+
+    linear, group = linear_modules
+    group.world_size = 1
+
+    def asked():
+        raise AssertionError("an FP4 linear asked for the group32 FP8 GEMM")
+
+    monkeypatch.setattr(linear, "native_group32_runs_bf16", asked)
+    spec = LayerQuantConfig(
+        quant_type=QuantType.per_1x32,
+        quant_dtype=torch.float4_e2m1fn_x2,
+        weight_block_size=(1, 32),
+        activation_dtype=torch.float8_e4m3fn,
+    )
+    config = SimpleNamespace(get_layer_quant_config=lambda _: spec, online_quant=False)
+    module = linear.ReplicatedLinear(64, 32, quant_config=config)
+    assert module.native_a8_group_rows == 1 and not module.runs_bf16
+
+
 def test_an_mxfp4_linear_is_not_an_online_quant_source(linear_modules):
     """Only MoE experts convert from MXFP4."""
     from aiter import QuantType, dtypes
