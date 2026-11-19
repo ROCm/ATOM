@@ -297,6 +297,7 @@ def test_real_engine_dispatch_keeps_tracing_when_metrics_returns_early(
         core._pending_prefix_hash = deque()
         core._defer_prefix_hash = False
         core.pp_size = pp_size
+        core.pp_max_inflight = pp_size
         completions = deque()
         core.pp_transport = SimpleNamespace(
             send_metadata=lambda batch: None,
@@ -391,6 +392,7 @@ def test_engine_initializes_tracing_before_ready(monkeypatch):
         is_multinode_tp=False,
         pcp_group_size=1,
         runner_qualname="unused",
+        weight_sync_runner=False,
         enforce_eager=True,
         disagg_is_decode=False,
         pipeline_parallel_size=1,
