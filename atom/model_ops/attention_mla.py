@@ -72,7 +72,11 @@ from atom.model_ops.dcp_ops import dcp_all_gather_prefill_query_heads
 from atom.model_ops.indexer.schedule import skips_index_topk
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import use_triton_gemm
-from atom.model_ops.mla_fused import gfx_arch, kup_qpe_fusion_ok
+from atom.model_ops.mla_fused import (
+    gfx_arch,
+    kup_qpe_fusion_ok,
+    kup_qpe_unavailable_reason,
+)
 from atom.model_ops.triton_fused_mla_ctx_kv import fused_mla_ctx_norm_rope_cache
 from atom.model_ops.triton_fused_qkv_quant import (
     fused_kv_per_tensor_quant,
@@ -803,6 +807,16 @@ class MLAAttention(nn.Module):
         # get_rope builds -- anything else (M-RoPE, partial rotary, full-width
         # freqs) indexes the cache differently.
         rope = self.rotary_emb
+        # Resolve the opt-in once. The default path pays only a boolean branch
+        # in forward: no env lookup, arch query, cache view or shape gate.
+        self._kup_qpe_enabled = envs.ATOM_MLA_FUSED_KUP_QPE
+        self._kup_qpe_arch = gfx_arch() if self._kup_qpe_enabled else ""
+        self._kup_qpe_unavailable = (
+            kup_qpe_unavailable_reason()
+            if self._kup_qpe_enabled
+            and self._kup_qpe_arch in ("gfx1250", "gfx1250-strict")
+            else None
+        )
         self._ctx_kv_fusion_enabled = (
             envs.ATOM_DSPARK_FUSED_CTX_KV
             and not self.use_seg_mla
@@ -3049,6 +3063,7 @@ class MLAAttention(nn.Module):
     # path (it is what moves the rope cache to the device), so logging only the
     # very first call would report a fusion that is in fact running.
     _ctx_kv_fusion_logged: ClassVar[set[bool]] = set()
+    _kup_qpe_logged: ClassVar[set[bool]] = set()
 
     def write_context_kv_latent(
         self,
@@ -3266,26 +3281,48 @@ class MLAAttention(nn.Module):
                     dtype=attn_metadata.dtype_q,
                     device=q.device,
                 )
-            kv_view = (
-                self._shuffled_kv_view(kv_cache)
-                if q_out_prestored is not None
-                else None
-            )
-            fused_kup_qpe = kup_qpe_fusion_ok(
-                enabled=envs.ATOM_MLA_FUSED_KUP_QPE,
-                arch=gfx_arch(),
-                is_prefill=context.is_prefill,
-                use_qrep=use_qrep,
-                dcp_world_size=self.dcp_world_size,
-                q_out=q_out_prestored,
-                num_tokens=q.shape[0],
-                slot_mapping=attn_metadata.slot_mapping,
-                w_k=self.W_K,
-                cos_cache=self.rotary_emb.cos_cache,
-                rope_dim=self.qk_rope_head_dim,
-                kv_cache=kv_view,
-                k_scale=self._k_scale,
-            )
+            fused_kup_qpe = False
+            if self._kup_qpe_enabled:
+                kv_view = (
+                    self._shuffled_kv_view(kv_cache)
+                    if q_out_prestored is not None
+                    else None
+                )
+                fused_kup_qpe = self._kup_qpe_unavailable is None and kup_qpe_fusion_ok(
+                    enabled=True,
+                    arch=self._kup_qpe_arch,
+                    is_prefill=context.is_prefill,
+                    use_qrep=use_qrep,
+                    dcp_world_size=self.dcp_world_size,
+                    q_out=q_out_prestored,
+                    num_tokens=q.shape[0],
+                    slot_mapping=attn_metadata.slot_mapping,
+                    w_k=self.W_K,
+                    cos_cache=self.rotary_emb.cos_cache,
+                    sin_cache=self.rotary_emb.sin_cache,
+                    positions=positions,
+                    rope_dim=self.qk_rope_head_dim,
+                    kv_cache=kv_view,
+                    k_scale=self._k_scale,
+                )
+                # Log both the first fallback and later activation (e.g. after
+                # RoPE caches move to the GPU), once each per process.
+                if fused_kup_qpe not in MLAAttention._kup_qpe_logged:
+                    MLAAttention._kup_qpe_logged.add(fused_kup_qpe)
+                    logger.info(
+                        "MLA K-up/q_pe fusion: %s (ATOM_MLA_FUSED_KUP_QPE=1, "
+                        "arch=%s, M=%d, W_K=%s): %s",
+                        "FUSED" if fused_kup_qpe else "two-kernel fallback",
+                        self._kup_qpe_arch,
+                        q.shape[0],
+                        tuple(self.W_K.shape),
+                        self._kup_qpe_unavailable
+                        or (
+                            "eligible"
+                            if fused_kup_qpe
+                            else "unsupported decode/shape/dtype/cache"
+                        ),
+                    )
             if fused_kup_qpe:
                 # Writes all of q_out and the KV cache; the rope/cache call below
                 # is skipped.

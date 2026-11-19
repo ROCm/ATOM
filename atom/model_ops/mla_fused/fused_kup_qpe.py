@@ -6,7 +6,7 @@ Replaces, bit for bit, the pair
   batched_gemm_bf16(q_nope, W_K, YQ=q_out[..., :L].transpose(0, 1))
   fused_qk_rope_cat_and_cache_mla(..., q_out=q_out, shuffled_kv_cache=True,
                                   q_nope_prestored=True)
-on pure decode. One CTA owns (head, half of L, slice of M) and streams M tiles:
+on pure decode. One CTA owns (head, 256 columns of L, slice of M) and streams M tiles:
 W_K's slice stays in LDS, A / q_pe tiles are double-buffered TDM loads, the fp8
 q_nope tile and the roped q_pe tile leave through TDM stores, and each CTA writes
 one KV token per tile. Same arithmetic as the production kernels: one WMMA K
@@ -21,32 +21,13 @@ leaves A(i), P(i) landed and S(i-2), SQ(i-2) drained.
 import torch
 import triton.experimental.gluon.language as gl
 from aiter.ops.triton._gluon_kernels.gfx1250.fusions.fused_kv_cache import (
+    _freq_from_shared_1d,
+    _freq_from_shared_2d,
     _rope_pe,
     _rope_pe_2d,
+    _store_mla_kv_cache,
 )
 from triton.experimental import gluon
-
-
-@gluon.jit
-def _expand_freq(
-    f, IS_NEOX: gl.constexpr, T: gl.constexpr, R: gl.constexpr, OUT: gl.constexpr
-):
-    j = gl.join(f, f)
-    if IS_NEOX:
-        out = gl.reshape(gl.permute(j, [0, 2, 1]), [T, R])
-    else:
-        out = gl.reshape(j, [T, R])
-    return gl.convert_layout(out, OUT)
-
-
-@gluon.jit
-def _expand_freq_1d(f, IS_NEOX: gl.constexpr, R: gl.constexpr, OUT: gl.constexpr):
-    j = gl.join(f, f)
-    if IS_NEOX:
-        out = gl.reshape(gl.permute(j, [1, 0]), [R])
-    else:
-        out = gl.reshape(j, [R])
-    return gl.convert_layout(out, OUT)
 
 
 @gluon.jit
@@ -60,23 +41,15 @@ def _kv_idx_load(
     R: gl.constexpr,
     num_warps: gl.constexpr,
 ):
-    # Per-lane copies (no readfirstlane, so no wait on a load issued this tile).
-    LN1: gl.constexpr = gl.BlockedLayout(
-        [L // (32 * num_warps)], [32], [num_warps], [0]
-    )
+    # The aiter cache-store helper takes one uniform slot per CTA.
     LH1: gl.constexpr = gl.BlockedLayout([1], [32], [num_warps], [0])
-    LP1: gl.constexpr = gl.BlockedLayout([2], [32], [num_warps], [0])
     tc = gl.minimum(t, M - 1).to(gl.int64)
-    zn = gl.zeros([L], gl.int64, layout=LN1)
-    zp = gl.zeros([R], gl.int64, layout=LP1)
     zh = gl.zeros([R // 2], gl.int64, layout=LH1)
     valid = t < M
-    slot_n = gl.load(slot_mapping_ptr + tc + zn).to(gl.int64)
-    slot_p = gl.load(slot_mapping_ptr + tc + zp).to(gl.int64)
-    slot_n = gl.where(valid, slot_n, -1)
-    slot_p = gl.where(valid, slot_p, -1)
+    slot = gl.load(slot_mapping_ptr + tc).to(gl.int64)
+    slot = gl.where(valid, slot, -1)
     pos = gl.load(pos_ptr + tc * pos_stride_b + zh).to(gl.int64)
-    return slot_n, slot_p, pos
+    return slot, slot, pos
 
 
 @gluon.jit
@@ -124,9 +97,16 @@ def _kv_values(
     num_warps: gl.constexpr,
 ):
     LP1: gl.constexpr = gl.BlockedLayout([2], [32], [num_warps], [0])
+    LH1: gl.constexpr = gl.BlockedLayout([1], [32], [num_warps], [0])
+    SH: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
+    cf_buf = gl.allocate_shared_memory(c.dtype, [R // 2], SH)
+    sf_buf = gl.allocate_shared_memory(s.dtype, [R // 2], SH)
+    cf_buf.store(c)
+    sf_buf.store(s)
+    gl.barrier()
     dp = gl.arange(0, R, layout=LP1)
-    cf = _expand_freq_1d(c, IS_NEOX, R, LP1)
-    sf = _expand_freq_1d(s, IS_NEOX, R, LP1)
+    cf = _freq_from_shared_1d(cf_buf, True, IS_NEOX, R, LP1, LH1)
+    sf = _freq_from_shared_1d(sf_buf, True, IS_NEOX, R, LP1, LH1)
     k_pe = _rope_pe(k_pe, cf, sf, dp, IS_NEOX, R, R // 2)
     kn8 = (k_nope.to(gl.float32) * k_scale_rcprl).to(kv_cache_ptr.dtype.element_ty)
     kp8 = (k_pe.to(gl.float32) * k_scale_rcprl).to(kv_cache_ptr.dtype.element_ty)
@@ -146,33 +126,36 @@ def _kv_put(
     BLOCK_SIZE: gl.constexpr,
     num_warps: gl.constexpr,
 ):
-    # Shuffled (16x16-tiled) MLA page, same offsets as aiter _store_mla_kv_cache.
+    # The shared aiter helper owns the shuffled layout and fp8 K_WIDTH. Never
+    # form a pointer for sentinel slots, including padded graph-replay rows.
     LN1: gl.constexpr = gl.BlockedLayout(
         [L // (32 * num_warps)], [32], [num_warps], [0]
     )
     LP1: gl.constexpr = gl.BlockedLayout([2], [32], [num_warps], [0])
-    K_WIDTH: gl.constexpr = 16
     dn = gl.arange(0, L, layout=LN1)
     dp = gl.arange(0, R, layout=LP1)
-    blk_n = slot_n % BLOCK_SIZE
-    blk_p = slot_p % BLOCK_SIZE
-    off_n = (
-        (slot_n // BLOCK_SIZE) * kv_cache_stride_b
-        + (blk_n // 16) * L * 16
-        + (blk_n % 16) * K_WIDTH
-        + (dn // K_WIDTH) * K_WIDTH * 16
-        + dn % K_WIDTH
-    )
-    off_p = (
-        (slot_p // BLOCK_SIZE) * kv_cache_stride_b
-        + BLOCK_SIZE * L
-        + (blk_p // 16) * R * 16
-        + (blk_p % 16) * K_WIDTH
-        + (dp // K_WIDTH) * K_WIDTH * 16
-        + dp % K_WIDTH
-    )
-    gl.store(kv_cache_ptr + off_n, kn8, mask=slot_n >= 0)
-    gl.store(kv_cache_ptr + off_p, kp8, mask=slot_p >= 0)
+    if slot_n >= 0:
+        _store_mla_kv_cache(
+            kv_cache_ptr,
+            slot_n // BLOCK_SIZE,
+            0,
+            slot_p % BLOCK_SIZE,
+            dn,
+            dp,
+            kv_cache_stride_b,
+            0,
+            1,
+            kn8,
+            kp8,
+            L,
+            R,
+            BLOCK_SIZE,
+            True,
+            0,
+            0,
+            LN1,
+            LP1,
+        )
 
 
 @gluon.jit
@@ -279,6 +262,10 @@ def _kup_qpe_persistent_kernel(
     n_local = gl.maximum(t1 - t0, 0)
     r0 = t0 * BLOCK_M
     r_end = gl.minimum(M, t1 * BLOCK_M)
+    # Empty M partitions still own KV tokens. Keep their descriptors valid
+    # while leaving the GEMM loop empty: no 0-row shape or one-past-end base.
+    r_base = gl.minimum(r0, M - 1)
+    desc_rows = gl.maximum(r_end - r0, 1)
 
     SHARED_LAYOUT_C: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[BLOCK_N, 16]], [BLOCK_M, BLOCK_N], [1, 0]
@@ -306,8 +293,8 @@ def _kup_qpe_persistent_kernel(
     )
 
     a_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=a_ptr + head * stride_ab + r0.to(gl.int64) * stride_am,
-        shape=(r_end - r0, BLOCK_K),
+        base=a_ptr + head * stride_ab + r_base.to(gl.int64) * stride_am,
+        shape=(desc_rows, BLOCK_K),
         strides=(stride_am, 1),
         block_shape=(BLOCK_M, BLOCK_K),
         layout=SHARED_LAYOUT_A,
@@ -327,8 +314,8 @@ def _kup_qpe_persistent_kernel(
         layout=SHARED_LAYOUT_C,
     )
     p_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=qpe_ptr + head * stride_qpe_h + r0.to(gl.int64) * stride_qpe_m,
-        shape=(r_end - r0, R),
+        base=qpe_ptr + head * stride_qpe_h + r_base.to(gl.int64) * stride_qpe_m,
+        shape=(desc_rows, R),
         strides=(stride_qpe_m, 1),
         block_shape=(HALF_M, R),
         layout=SHARED_LAYOUT_P,
@@ -360,6 +347,12 @@ def _kup_qpe_persistent_kernel(
         [1, 8], [32 // (R // 8), R // 8], [num_warps, 1], [1, 0]
     )
     dq = gl.arange(0, R, layout=gl.SliceLayout(0, LQ))
+    LF: gl.constexpr = gl.BlockedLayout(
+        [1, 4], [32 // (R // 8), R // 8], [num_warps, 1], [1, 0]
+    )
+    SH_F: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+    cf_buf = gl.allocate_shared_memory(cos_ptr.dtype.element_ty, [HALF_M, R // 2], SH_F)
+    sf_buf = gl.allocate_shared_memory(sin_ptr.dtype.element_ty, [HALF_M, R // 2], SH_F)
 
     # q_pe: positions two tiles ahead, cos/sin one tile ahead.
     pq0 = _qpe_pos_load(
@@ -393,8 +386,11 @@ def _kup_qpe_persistent_kernel(
             w_buf.permute([1, 0]), OPERAND_LAYOUT_B
         )
         qpe = p_buf.index(slot).load(LQ)
-        cf = _expand_freq(cq, IS_NEOX, HALF_M, R, LQ)
-        sf = _expand_freq(sq, IS_NEOX, HALF_M, R, LQ)
+        cf_buf.store(cq)
+        sf_buf.store(sq)
+        gl.barrier()
+        cf = _freq_from_shared_2d(cf_buf, True, IS_NEOX, HALF_M, R, LQ, LF)
+        sf = _freq_from_shared_2d(sf_buf, True, IS_NEOX, HALF_M, R, LQ, LF)
         qr = _rope_pe_2d(qpe, cf, sf, dq, IS_NEOX, HALF_M, R, R // 2)
         q_buf.index(slot).store(qr.to(c_ptr.type.element_ty))
         acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
@@ -490,9 +486,27 @@ def kup_qpe_fused(
     num_warps: int = 4,
     num_xcds: int = 8,
 ) -> torch.Tensor:
+    # Load-bearing gfx1250 LDS budget (bytes before padding): W=2*256*P,
+    # double A=4*64*P, double C=2*64*256, double P/Q=6*HALF_M*R,
+    # q freqs=2*HALF_M*R, KV freqs=2*R. The gate caps this at 224 KiB,
+    # reserving 32 KiB for padding under gfx1250's 256 KiB/CTA limit.
+    # The gate restricts P to {32,64,128}, L to {256,512,1024} and R<=256;
+    # do not relax those or the fixed launch geometry without compiler/GPU QA.
+    assert (m_split, block_m, block_n, num_warps) == (2, 64, 256, 4)
     H, M, P = q_nope.shape
     L = w_k.shape[1]
     R = q_pe.shape[-1]
+    assert M > 0 and L in (256, 512, 1024) and P in (32, 64, 128)
+    assert R in (32, 64, 128, 256)
+    half_m = block_m // (L // block_n)
+    lds_bytes = (
+        2 * block_n * P
+        + 4 * block_m * P
+        + 2 * block_m * block_n
+        + 8 * half_m * R
+        + 2 * R
+    )
+    assert lds_bytes <= 224 * 1024
     if cos.dim() == 4:
         cos = cos.squeeze(1).squeeze(1)
         sin = sin.squeeze(1).squeeze(1)

@@ -4,12 +4,14 @@
 * ATOM_MLA_FUSED_KUP_QPE: K-up GEMM + q_pe RoPE + KV-cache write in one kernel
   (fused_kup_qpe.kup_qpe_fused).
 
-Bit-exact with the path it replaces. The gate below only uses attributes and
-shapes, so it imports without the GPU stack; the kernel is imported lazily by
-the caller.
+The gate below only uses attributes and shapes, so it imports without the GPU
+stack; the kernel is imported lazily by the caller. GPU byte comparisons are
+required when changing the kernel or its supported shapes.
 """
 
 import functools
+import importlib
+import importlib.util
 
 import torch
 
@@ -18,12 +20,45 @@ _GFX1250 = ("gfx1250", "gfx1250-strict")
 
 @functools.cache
 def gfx_arch() -> str:
-    try:
-        from aiter.jit.utils.chip_info import get_gfx_runtime
+    from aiter.jit.utils.chip_info import get_gfx_runtime
 
-        return get_gfx_runtime()
-    except Exception:  # noqa: BLE001 - no GPU stack means no gfx1250
-        return ""
+    return get_gfx_runtime()
+
+
+@functools.cache
+def kup_qpe_unavailable_reason() -> str | None:
+    """Check optional Gluon modules/symbols once, before importing our kernel.
+
+    Called only after the normal aiter arch query succeeds on gfx1250. Missing
+    optional helpers decline fusion; errors inside installed modules propagate.
+    This avoids both a decode-time private-symbol ImportError and swallowing a
+    broken runtime probe for the lifetime of the process.
+    """
+    modules = {
+        "triton.experimental.gluon": ("jit",),
+        "aiter.ops.triton._gluon_kernels.gfx1250.fusions.fused_kv_cache": (
+            "_rope_pe",
+            "_rope_pe_2d",
+            "_freq_from_shared_1d",
+            "_freq_from_shared_2d",
+            "_store_mla_kv_cache",
+        ),
+        "aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16": (
+            "create_shared_layouts",
+            "create_wmma_layouts",
+        ),
+    }
+    for name, symbols in modules.items():
+        # Walk the package chain so find_spec never imports a missing parent.
+        parts = name.split(".")
+        for i in range(1, len(parts) + 1):
+            if importlib.util.find_spec(".".join(parts[:i])) is None:
+                return f"missing {name}"
+        module = importlib.import_module(name)
+        for symbol in symbols:
+            if not hasattr(module, symbol):
+                return f"missing {name}.{symbol}"
+    return None
 
 
 def _is_fp8(t: torch.Tensor) -> bool:
@@ -42,6 +77,8 @@ def kup_qpe_fusion_ok(
     slot_mapping: torch.Tensor,
     w_k: torch.Tensor,
     cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    positions: torch.Tensor,
     rope_dim: int,
     kv_cache: torch.Tensor | None,
     k_scale,
@@ -57,23 +94,64 @@ def kup_qpe_fusion_ok(
         return False
     if slot_mapping.dim() != 1 or slot_mapping.shape[0] != num_tokens:
         return False
+    if (
+        positions.dim() != 1
+        or positions.shape[0] != num_tokens
+        or positions.dtype not in (torch.int32, torch.int64)
+    ):
+        return False
     if not (_is_fp8(q_out) and kv_cache.dtype == q_out.dtype):
         return False
     if w_k.dtype != torch.bfloat16 or w_k.dim() != 3:
         return False
     num_heads, kv_lora_rank, nope_dim = w_k.shape
-    if kv_lora_rank % 256 or nope_dim % 32 or nope_dim > 128:
+    # arange and the WMMA / q_pe partition require power-of-two tiles. With
+    # BLOCK_N=256 this bounds NSPLIT_N to {1, 2, 4} and HALF_M to {64, 32, 16}.
+    if (
+        num_heads <= 0
+        or kv_lora_rank not in (256, 512, 1024)
+        or nope_dim not in (32, 64, 128)
+    ):
+        return False
+    if w_k.stride(2) != 1:
         return False
     if rope_dim not in (32, 64, 128, 256):
+        return False
+    half_m = 64 // (kv_lora_rank // 256)
+    lds_bytes = (
+        2 * 256 * nope_dim
+        + 4 * 64 * nope_dim
+        + 2 * 64 * 256
+        + 8 * half_m * rope_dim
+        + 2 * rope_dim
+    )
+    # Leave 32 KiB for padded shared layouts. In particular L=256, P=128,
+    # R=256 exceeds the 256 KiB limit even before padding.
+    if lds_bytes > 224 * 1024:
         return False
     cos = cos_cache
     while cos.dim() > 2 and cos.shape[1] == 1:
         cos = cos.squeeze(1)
-    if cos.shape[-1] * 2 != rope_dim or cos.stride(-1) != 1:
+    if cos.dim() != 2 or cos.shape[0] == 0:
+        return False
+    if (
+        cos.shape[-1] * 2 != rope_dim
+        or cos.stride(-1) != 1
+        or cos.dtype != torch.bfloat16
+    ):
+        return False
+    sin = sin_cache
+    while sin.dim() > 2 and sin.shape[1] == 1:
+        sin = sin.squeeze(1)
+    if sin.shape != cos.shape or sin.stride() != cos.stride() or sin.dtype != cos.dtype:
         return False
     if kv_cache.dim() != 4 or kv_cache.shape[1] != 1:
         return False
-    if kv_cache.shape[2] % 16 or kv_cache.shape[3] != kv_lora_rank + rope_dim:
+    if (
+        kv_cache.shape[2] <= 0
+        or kv_cache.shape[2] % 16
+        or kv_cache.shape[3] != kv_lora_rank + rope_dim
+    ):
         return False
     if kv_cache.stride(3) != 1:
         return False
@@ -81,8 +159,17 @@ def kup_qpe_fusion_ok(
         return False
     if q_out.stride(2) != 1 or num_tokens * q_out.stride(0) >= 2**31:
         return False
+    if slot_mapping.dtype not in (torch.int32, torch.int64):
+        return False
+    if any(
+        t.device != q_out.device
+        for t in (w_k, cos_cache, sin_cache, positions, kv_cache, slot_mapping)
+    ):
+        return False
     if k_scale is not None and not (
         isinstance(k_scale, torch.Tensor) and k_scale.numel() == 1
     ):
+        return False
+    if isinstance(k_scale, torch.Tensor) and k_scale.device != q_out.device:
         return False
     return num_tokens > 0
