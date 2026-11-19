@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+package atom.inference.v1;
+
+// Token path between ATOMesh and an ATOM engine.
+// The engine does not render, tokenize, or detokenize.
+service AtomInference {
+  rpc Generate(TokenGenerateRequest) returns (stream TokenGenerateEvent);
+  rpc AbortRequests(AbortRequests) returns (AbortResponse);
+}
+
+message TokenGenerateRequest {
+  string request_id = 1;
+  string model = 2;
+  repeated uint32 token_ids = 3;
+  // Opaque SamplingParams JSON. Mesh forwards it and only rewrites max_tokens
+  // on the prefill leg.
+  string sampling_params_json = 4;
+  bool stream = 5;
+  string kv_transfer_params_json = 6;
+  optional uint32 data_parallel_rank = 7;
+  string session_id = 8;
+  optional uint32 max_tokens = 9;
+}
+
+message TokenGenerateEvent {
+  repeated uint32 token_ids = 1;
+  string finish_reason = 2;
+  string kv_transfer_params_json = 3;
+  string error_json = 4;
+  Usage usage = 5;
+}
+
+message Usage {
+  uint32 prompt_tokens = 1;
+  uint32 completion_tokens = 2;
+  uint32 cached_tokens = 3;
+}
+
+message AbortRequests {
+  repeated string request_ids = 1;
+}
+
+message AbortResponse {}

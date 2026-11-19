@@ -268,7 +268,7 @@ impl CacheAwarePolicy {
     fn select_worker_min_load(
         &self,
         workers: &[Arc<dyn Worker>],
-        request_text: &Option<&str>,
+        route_key: &str,
         healthy_indices: &[usize],
         model_id: &str,
         max_load: usize,
@@ -293,8 +293,10 @@ impl CacheAwarePolicy {
         // Use shortest queue when imbalanced.
         let min_load_idx = least_loaded(workers, healthy_indices)?;
 
-        // Even in imbalanced mode, update the tree to maintain cache state
-        if let Some(text) = request_text {
+        // Even in imbalanced mode, update the tree to maintain cache state.
+        // An empty key is inserted only when the caller passed empty text, so a
+        // token-only request does not share that bucket.
+        if !route_key.is_empty() {
             // Get the tree reference without locking the entire HashMap
             // DashMap only locks the specific shard containing this key
             let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
@@ -302,7 +304,7 @@ impl CacheAwarePolicy {
             if let Some(tree) = tree {
                 let worker_url = workers[min_load_idx].url();
                 // Now we can work with the tree without holding the HashMap lock
-                tree.insert(text, worker_url);
+                tree.insert(route_key, worker_url);
             } else {
                 debug!(
                     "Warning: No tree found for model '{}', skipping cache update",
@@ -387,6 +389,17 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         // Keying the tree by pool as well keeps prefill and decode caches
         // separate -- see tree_key_for_worker.
         let model_id = tree_key_for_worker(workers[healthy_indices[0]].as_ref());
+        // Token path has ids and no prompt text. Key the tree by block hashes
+        // so prefix matching stays on tokens and does not fall back to text.
+        // A request that also has text keeps the text key.
+        let token_key = if request_text.is_none() {
+            info.tokens
+                .filter(|tokens| !tokens.is_empty() && !info.carries_media)
+                .map(super::block_hash::token_block_key)
+        } else {
+            None
+        };
+        let route_key = request_text.unwrap_or(token_key.as_deref().unwrap_or(""));
 
         // Get current load statistics - compute min/max in single pass without allocation
         let (min_load, max_load) = workers.iter().fold((usize::MAX, 0usize), |(min, max), w| {
@@ -402,7 +415,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         if is_imbalanced {
             let selected = self.select_worker_min_load(
                 workers,
-                &request_text,
+                route_key,
                 &healthy_indices,
                 &model_id,
                 max_load,
@@ -420,7 +433,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         }
 
         // Use cache-aware routing when balanced
-        let text = request_text.unwrap_or("");
+        let text = route_key;
 
         // Get the tree reference without locking the entire HashMap
         // DashMap only locks the specific shard containing this key
@@ -1031,5 +1044,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(idx, 0);
+    }
+
+    #[tokio::test]
+    async fn token_ids_without_text_stick_to_one_worker() {
+        let workers: Vec<Arc<dyn Worker>> = (0..4)
+            .map(|i| {
+                Arc::new(
+                    BasicWorkerBuilder::new(format!("http://w{i}:8000"))
+                        .worker_type(WorkerType::Regular)
+                        .model_id("m")
+                        .build(),
+                ) as Arc<dyn Worker>
+            })
+            .collect();
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        policy.init_workers(&workers);
+        let mut tokens = vec![7u32; super::super::block_hash::TOKEN_BLOCK_SIZE];
+        tokens.extend_from_slice(&[1, 2, 3]);
+        let info = SelectWorkerInfo {
+            request_text: None,
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        let first = policy.select_worker(&workers, &info).await.unwrap();
+        for _ in 0..6 {
+            assert_eq!(policy.select_worker(&workers, &info).await, Some(first));
+        }
     }
 }

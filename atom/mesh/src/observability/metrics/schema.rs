@@ -263,6 +263,9 @@ pub mod names {
     pub const MANUAL_POLICY_CACHE_ENTRIES: &str = "mesh_manual_policy_cache_entries";
     pub const MANUAL_POLICY_BRANCH_TOTAL: &str = "mesh_manual_policy_branch_total";
     pub const PREFIX_HASH_POLICY_BRANCH_TOTAL: &str = "mesh_prefix_hash_policy_branch_total";
+    pub const TOKEN_REQUESTS_TOTAL: &str = "mesh_token_requests_total";
+    pub const TOKEN_FORWARD_SECONDS: &str = "mesh_token_forward_seconds";
+    pub const TOKEN_ABORTS_TOTAL: &str = "mesh_token_aborts_total";
     pub const WORKER_ROUTING_KEYS_ACTIVE: &str = "mesh_worker_routing_keys_active";
 
     pub const ROUTE_BRANCH_TOTAL: &str = "mesh_route_branch_total";
@@ -468,6 +471,24 @@ pub const METRIC_INVENTORY: &[MetricSpec] = &[
         name: names::PREFIX_HASH_POLICY_BRANCH_TOTAL,
         kind: MetricKind::Counter,
         help: "Deprecated, use mesh_route_branch_total{policy=\"prefix_hash\"}. Prefix hash policy execution branches by branch",
+        status: MetricStatus::Active,
+    },
+    MetricSpec {
+        name: names::TOKEN_REQUESTS_TOTAL,
+        kind: MetricKind::Counter,
+        help: "Token-path requests by mode and result",
+        status: MetricStatus::Active,
+    },
+    MetricSpec {
+        name: names::TOKEN_FORWARD_SECONDS,
+        kind: MetricKind::Histogram,
+        help: "Seconds from dispatch, or the previous token event, until this event is forwarded",
+        status: MetricStatus::Active,
+    },
+    MetricSpec {
+        name: names::TOKEN_ABORTS_TOTAL,
+        kind: MetricKind::Counter,
+        help: "Token-path aborts by reason",
         status: MetricStatus::Active,
     },
     MetricSpec {

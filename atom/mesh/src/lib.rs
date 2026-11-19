@@ -4,6 +4,7 @@ pub mod atom_engine;
 pub mod cliargs;
 pub mod config;
 pub mod core;
+pub mod entrypoints;
 #[cfg(feature = "ext-proc")]
 pub mod ext_proc;
 pub mod kv_events;
@@ -18,5 +19,6 @@ pub use reasoning_parser;
 pub mod routers;
 pub mod server;
 pub use llm_tokenizer as tokenizer;
+pub mod token_path;
 pub mod tool_parser;
 pub mod version;

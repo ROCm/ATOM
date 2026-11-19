@@ -449,6 +449,31 @@ impl MeshMetrics {
         .increment(1);
     }
 
+    /// `mode` is `regular` or `pd` on success, and `token` when routing fails.
+    /// `result` is `ok` or `error`.
+    pub fn record_token_request(mode: &'static str, result: &'static str) {
+        counter!(
+            names::TOKEN_REQUESTS_TOTAL,
+            "mode" => mode,
+            "result" => result
+        )
+        .increment(1);
+    }
+
+    /// Seconds since dispatch for the first event, then since the previous event.
+    pub fn record_token_forward(delay: Duration) {
+        histogram!(names::TOKEN_FORWARD_SECONDS).record(delay.as_secs_f64());
+    }
+
+    /// `reason` is `client_disconnect` or `explicit`.
+    pub fn record_token_abort(reason: &'static str) {
+        counter!(
+            names::TOKEN_ABORTS_TOTAL,
+            "reason" => reason
+        )
+        .increment(1);
+    }
+
     /// Record the branch a routing policy took for one selection.
     pub fn record_route_branch(pool: &'static str, policy: &'static str, branch: &'static str) {
         counter!(

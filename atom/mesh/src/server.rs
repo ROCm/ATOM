@@ -383,6 +383,14 @@ pub fn build_app(
         EndpointSpec::ALL
             .iter()
             .fold(Router::new(), |router, spec| spec.register(router))
+            .route(
+                "/inference/v1/generate",
+                post(crate::entrypoints::http::generate),
+            )
+            .route(
+                "/inference/v1/abort_requests",
+                post(crate::entrypoints::http::abort_requests),
+            )
     };
     let protected_routes = inference_routes
         .route("/v1/conversations", post(v1_conversations_create))

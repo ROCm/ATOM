@@ -68,6 +68,8 @@ pub struct AppContext {
     pub worker_service: Arc<WorkerService>,
     pub inflight_tracker: Arc<InFlightRequestTracker>,
     pub atom_standalone_runtime: Option<Arc<AtomStandaloneRuntime>>,
+    /// Shared token path. Generate and abort must see the same in-flight table.
+    pub token_router: Arc<crate::token_path::TokenRouter>,
     /// Set with `kv_events` in the router config.
     pub kv_event_monitor: Option<Arc<KvEventMonitor>>,
     /// Set with `kv_events` in the router config.
@@ -280,12 +282,20 @@ impl AppContextBuilder {
         }
         let kv_storage = (router_config.kv_events)
             .then(|| Arc::new(StorageSources::new(router_config.mooncake_admin_port)));
+        let client = self.client.ok_or(AppContextBuildError("client"))?;
+        let token_router = Arc::new(crate::token_path::TokenRouter::from_parts(
+            worker_registry.clone(),
+            policy_registry.clone(),
+            client.clone(),
+            router_config.atom_pd_rank_mapping_policy,
+            router_config.backend,
+        ));
         Ok(AppContext {
             prepare_pool: self
                 .prepare_pool
                 .ok_or(AppContextBuildError("prepare_pool"))?,
             admission,
-            client: self.client.ok_or(AppContextBuildError("client"))?,
+            client,
             router_config,
             rate_limiter: self.rate_limiter,
             tokenizer_registry: self
@@ -316,6 +326,7 @@ impl AppContextBuilder {
             worker_service,
             inflight_tracker: InFlightRequestTracker::new(),
             atom_standalone_runtime: self.atom_standalone_runtime,
+            token_router,
             kv_event_monitor,
             kv_storage,
         })
