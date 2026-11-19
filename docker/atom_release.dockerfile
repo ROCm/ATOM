@@ -714,7 +714,14 @@ ARG LMCACHE_WHEEL_SHA256=68c0f6870c82497b4a1fef5c365960119bedfe66715a410457ae45e
 # is set only by the rocm10-base stage and inherited through the image, so it
 # tells the two apart. Collapse this back to one path once a matching wheel
 # exists.
-ARG LMCACHE_TAG=v0.4.5
+# v0.4.5 pins -std=c++17 on most of its extensions. torch 2.14's ATen headers
+# use C++20 requires-clauses to separate overloads that differ only in return
+# type (TensorBase.h: symint::sizes), so c++17 compiles them as a redefinition
+# and the build dies in torch's own header. From v0.5.0 the ROCm build profile
+# passes no -std at all and inherits torch's default, which is c++20
+# (cpp_extension.py: common_cflags). v0.5.6 also matches the wheel the ROCm 7
+# line installs (0.5.6.dev139), so the two paths stop drifting apart.
+ARG LMCACHE_TAG=v0.5.6
 RUN --mount=type=bind,from=lmcache_wheel,target=/tmp/lmcache-wheel \
     if [ -z "${ROCM_HOME}" ]; then \
       echo "========== [ATOM] Install LMCache ROCm torch 2.10 wheel ==========" && \
