@@ -703,6 +703,15 @@ class _SequenceParallel:
             _pad_rows(x.contiguous(), self.pad), use_custom=False, dim=0
         )
 
+    @staticmethod
+    def allowed_for_model(atom_config: Config) -> bool:
+        plugin = atom_config.plugin_config
+        if torch.version.hip is None or plugin is None or not plugin.is_rtpllm:
+            return True
+        from rtp_llm.ops import RoleType
+
+        return plugin.rtpllm_parallelism_config.role_type == RoleType.PDFUSION
+
     @classmethod
     def maybe(cls, num_tokens: int) -> "_SequenceParallel | None":
         """Sharding for a forward of `num_tokens`, or None to stay replicated:
@@ -966,6 +975,7 @@ class Qwen4ExpModel(nn.Module):
         self.config = config
         self.hc_count = int(config.hc_count)
         self.return_hc_state = atom_config.speculative_config is not None
+        self.allow_sequence_parallel = _SequenceParallel.allowed_for_model(atom_config)
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size, config.hidden_size
@@ -1016,7 +1026,11 @@ class Qwen4ExpModel(nn.Module):
         only does above `HC_QUANT_ROWS_MAX`. Sharding only above it keeps the
         two paths on the same quantization, whatever the env threshold. With
         no layer after the last PLE layer there is nothing to shard."""
-        if self.sp_start_layer >= self.end_layer or num_tokens <= HC_QUANT_ROWS_MAX:
+        if (
+            not self.allow_sequence_parallel
+            or self.sp_start_layer >= self.end_layer
+            or num_tokens <= HC_QUANT_ROWS_MAX
+        ):
             return None
         return _SequenceParallel.maybe(num_tokens)
 

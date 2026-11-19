@@ -149,6 +149,8 @@ def test_qwen4_exp_prefix_hook_preserves_real_ple_forward_and_final_state():
             state_indices_out=torch.tensor([2], device="cuda", dtype=torch.int32),
             has_initial_state=torch.tensor([False], device="cuda"),
             num_accepted_tokens=None,
+            ngram_indices_in=None,
+            ngram_indices_out=None,
             rtp_checkpoint_targets=(
                 {
                     "rows": torch.tensor([0], device="cuda", dtype=torch.int32),
@@ -161,6 +163,8 @@ def test_qwen4_exp_prefix_hook_preserves_real_ple_forward_and_final_state():
         )
 
     plain_metadata, plugin_metadata = make_metadata(False), make_metadata(True)
+    targets = plugin_metadata.rtp_checkpoint_targets
+    plugin_metadata.rtp_checkpoint_targets = {"conv": targets, "ngram": targets}
     plain_output = baseline.forward_with_state(hidden, ids, plain_metadata)
     plugin_output = plugin.forward_with_state(hidden, ids, plugin_metadata)
     torch.testing.assert_close(plugin_output, plain_output, rtol=0, atol=0)
@@ -384,15 +388,17 @@ def test_qwen4_exp_rtp_gdn_fp32_state_uses_full_byte_region(
             is_mtp=mtp_draft,
         ),
         kv_cache=SimpleNamespace(
-            get_layer_cache=lambda _: SimpleNamespace(kv_cache_base=raw)
+            get_layer_cache_groups=lambda _: [SimpleNamespace(kv_cache_base=raw)],
+            get_layer_cache=lambda _, tag: SimpleNamespace(kv_cache_base=raw),
         ),
     )
-    cache = RTPQwen4ExpContext._build_kv_cache_tensors(runtime, ({3: layer}, {}, {}))[
+    runtime._rtp_layer_maps = ({3: layer}, {}, {})
+    cache = RTPQwen4ExpContext._build_kv_cache_tensors(runtime, runtime._rtp_layer_maps)[
         "layer_3"
     ]
     assert cache.v_cache.dtype == torch.float32
     assert cache.k_cache.dtype == torch.bfloat16
-    vk_layout = decode_enabled and not (mtp_target or mtp_draft)
+    vk_layout = decode_enabled and not mtp_draft and (not mtp_target or bool(torch.version.hip))
     assert cache.v_cache.stride()[1:] == (
         (k_dim * v_dim, 1, k_dim) if vk_layout else (k_dim * v_dim, v_dim, 1)
     )
@@ -411,8 +417,10 @@ def test_qwen4_exp_graph_uses_device_block_tables_only():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 @pytest.mark.parametrize("draft_steps", [1, 2, 3])
 @pytest.mark.parametrize("second_has_initial", [False, True])
+@pytest.mark.parametrize("history", [1, 3])
+@pytest.mark.parametrize("alias_final", [False, True])
 def test_qwen4_exp_ple_candidate_snapshots_match_prefix_reruns(
-    monkeypatch, draft_steps, second_has_initial
+    monkeypatch, draft_steps, second_has_initial, alias_final, history
 ):
     from dataclasses import replace
 
@@ -429,11 +437,13 @@ def test_qwen4_exp_ple_candidate_snapshots_match_prefix_reruns(
         dtype=torch.int32,
     )
     write_slots[:, 0] = torch.tensor([9, 19], device=device, dtype=torch.int32)
+    if alias_final:
+        write_slots = write_slots.flip(1)
     ngram_initial = torch.arange(32 * 3, device=device, dtype=torch.int64).reshape(
         32, 3
     )
-    conv_initial = torch.arange(32 * 4, device=device, dtype=torch.float32).reshape(
-        32, 4, 1
+    conv_initial = torch.arange(32 * 4 * history, device=device, dtype=torch.float32).reshape(
+        32, 4, history
     )
 
     def make_metadata():
@@ -449,13 +459,16 @@ def test_qwen4_exp_ple_candidate_snapshots_match_prefix_reruns(
             ),
             conv_state=conv_initial.clone(),
         )
+        result.ngram_indices_in = result.state_indices_in
+        result.ngram_indices_out = result.state_indices_out
+        result.rtp_ngram_spec_state_indices = write_slots
         result.rtp_spec_state_indices = write_slots
         return result
 
     class PLE:
         ple_embedding = SimpleNamespace(ngram_size=4, eos_token_id=0)
         norm_conv = None
-        conv_state_len = 1
+        conv_state_len = history
 
         def gated_memory(self, hidden, ids, starts, context):
             return hidden.unsqueeze(1)
@@ -463,7 +476,7 @@ def test_qwen4_exp_ple_candidate_snapshots_match_prefix_reruns(
         def _apply_norm(self, norm, value):
             return value
 
-        def _short_conv(self, normalized, starts, state, src, dst, has, accepted):
+        def _short_conv(self, normalized, starts, state, src, dst, has, accepted, *, update_state=True):
             return dilated_causal_conv1d(
                 normalized,
                 torch.ones((4, 2), device=device),
@@ -472,8 +485,9 @@ def test_qwen4_exp_ple_candidate_snapshots_match_prefix_reruns(
                 src,
                 dst,
                 has,
-                1,
+                history,
                 accepted,
+                update_state=update_state,
             )
 
         def forward_with_state(self, hidden, ids, meta):
@@ -506,7 +520,7 @@ def test_qwen4_exp_ple_candidate_snapshots_match_prefix_reruns(
     expected = hidden + layer.ple.forward_with_state(hidden, ids, reference)
     for prefix_len in range(width - 1, 0, -1):
         prefix_metadata = replace(
-            reference,
+            make_metadata(),
             query_start_loc=torch.arange(
                 0, (2 + 1) * prefix_len, prefix_len, device=device, dtype=torch.int32
             ),
@@ -519,6 +533,10 @@ def test_qwen4_exp_ple_candidate_snapshots_match_prefix_reruns(
             ids.reshape(2, width)[:, :prefix_len].reshape(-1).contiguous(),
             prefix_metadata,
         )
+
+        slots = prefix_metadata.state_indices_out
+        reference.conv_state[slots.long()] = prefix_metadata.conv_state[slots.long()]
+        reference.ngram_state[slots.long()] = prefix_metadata.ngram_state[slots.long()]
 
     actual = make_metadata()
     monkeypatch.setattr(
@@ -872,9 +890,7 @@ def test_qwen4_exp_plugin_config_and_registration(tmp_path, monkeypatch):
     config.attn_config.tokens_per_block = 64
     kv_cache_config = SimpleNamespace(seq_size_per_block=64, reuse_cache=True)
     ATOMQwen4Exp._apply_kv_cache_config(config, kv_cache_config)
-    qsa_bytes = (64 + 16) * 128 * 2
-    ple_bytes = (3 - 1) * 8 + (2560 * 4) * ((4 - 1) * 3) * 2
-    assert config.auxiliary_paged_cache_bytes_per_block == qsa_bytes + ple_bytes
+    assert config.auxiliary_paged_cache_bytes_per_block == 0
     assert kv_cache_config.reuse_cache is True
     assert config.atom_qwen4_exp_prefix_cache_enabled is True
 
@@ -899,7 +915,7 @@ def test_qwen4_exp_plugin_config_and_registration(tmp_path, monkeypatch):
     ATOMQwen4ExpMTP._apply_kv_cache_config(
         draft, SimpleNamespace(seq_size_per_block=64, reuse_cache=True)
     )
-    assert draft.auxiliary_paged_cache_bytes_per_block == qsa_bytes
+    assert draft.auxiliary_paged_cache_bytes_per_block == 0
 
     text_config["rope_parameters"].update(
         {"mrope_section": [11, 11, 10], "mrope_interleaved": True}
@@ -958,6 +974,7 @@ def test_qwen4_exp_mtp_graph_keeps_capture_cap_separate_from_request_capacity(
     ):
         torch.nn.Module.__init__(self)
         self.model = torch.nn.Module()
+        self.parallelism_config = parallelism_config
         self._cg_max_num_tokens = 4
 
     monkeypatch.setattr(
@@ -1447,7 +1464,7 @@ def test_qwen4_exp_graph_prewarms_qsa_caches_before_capture(monkeypatch):
         ),
     )
     calls = []
-    qsa = SimpleNamespace(is_qsa_attention=True)
+    qsa = SimpleNamespace(is_qsa_attention=True, rope_position_cache=None)
     runtime.__dict__["model"] = object()
     runtime._rtp_layer_maps = ({}, {7: qsa}, {})
     runtime._rtp_forward_context_cls = SimpleNamespace(
@@ -1695,16 +1712,17 @@ def test_qwen4_exp_decode_state_reads_previous_block_at_boundary():
     assert output_slots.tolist() == [11, 21]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="prefill metadata uses GPU kernels")
 def test_qwen4_exp_prefill_reads_prefix_block_when_continuing_across_boundary():
     # A cached prefix ends exactly at the block boundary. One new token must
     # read block 10's state and write block 11, including for PLE consumers.
     attn_inputs = SimpleNamespace(
         is_prefill=True,
         is_cuda_graph=False,
-        input_lengths=torch.tensor([1], dtype=torch.int32),
-        prefix_lengths=torch.tensor([64], dtype=torch.int32),
-        cu_seqlens=torch.tensor([0, 1], dtype=torch.int32),
-        kv_cache_kernel_block_id_device=torch.tensor([[10, 11]], dtype=torch.int32),
+        input_lengths=torch.tensor([1], device="cuda", dtype=torch.int32),
+        prefix_lengths=torch.tensor([64], device="cuda", dtype=torch.int32),
+        cu_seqlens=torch.tensor([0, 1], device="cuda", dtype=torch.int32),
+        kv_cache_kernel_block_id_device=torch.tensor([[10, 11]], device="cuda", dtype=torch.int32),
     )
     metadata = RTPQwen4ExpContext._build_gdn_metadata(
         attn_inputs, seq_size_per_block=64, num_tokens=1
@@ -1734,6 +1752,21 @@ def test_qwen4_exp_decode_rejects_invalid_state_mapping(
         )
 
 
+def qsa_runtime(raw, block_size, index_dim=8, ratio=4):
+    def cache(layer, tag):
+        return SimpleNamespace(kv_cache_base=pools[tag], kv_scale_base=None)
+    pages = raw.shape[0]
+    pools = {
+        "full": raw,
+        "indexer_kv": raw.new_zeros((pages, block_size // ratio * index_dim * 2), dtype=torch.uint8),
+        "indexer_state": raw.new_zeros((pages, 2 * ratio * index_dim), dtype=torch.float32),
+    }
+    return SimpleNamespace(
+        kv_cache=SimpleNamespace(get_layer_cache=cache),
+        _rtp_model_config=SimpleNamespace(is_mtp=False, mm_model_config=SimpleNamespace(is_multimodal=False)),
+    )
+
+
 def test_qwen4_exp_qsa_cache_binding_reuses_paged_kv_storage(monkeypatch):
     class FakeQSA:
         layer_num = 3
@@ -1741,16 +1774,12 @@ def test_qwen4_exp_qsa_cache_binding_reuses_paged_kv_storage(monkeypatch):
         head_dim = 4
         indexer = SimpleNamespace(index_head_dim=8, compress_ratio=4)
 
-        def bind_caches(self, *caches):
+        def bind_caches(self, *caches, **kwargs):
             self.caches = caches
 
     module = FakeQSA()
     raw = torch.arange(2 * 2 * 2 * 64 * 4, dtype=torch.bfloat16).reshape(2, 2, 2, 64, 4)
-    runtime = SimpleNamespace(
-        kv_cache=SimpleNamespace(
-            get_layer_cache=lambda layer_num: SimpleNamespace(kv_cache_base=raw)
-        )
-    )
+    runtime = qsa_runtime(raw, 64)
     monkeypatch.setattr(qwen4_exp_context, "Qwen4ExpAttention", FakeQSA)
     from rtp_llm.models_py.modules.factory.attention import common
 
@@ -1763,7 +1792,7 @@ def test_qwen4_exp_qsa_cache_binding_reuses_paged_kv_storage(monkeypatch):
     assert key.shape == value.shape == (2, 64, 2, 4)
     assert key.stride(1) == value.stride(1) == 2 * 4
     assert key.stride(2) == value.stride(2) == 4
-    assert index_cache.shape == (2, 64, 1, 8)
+    assert index_cache.shape == (2, 8, 1, 8)
     assert compressed_cache.shape == (2, 16, 1, 8)
     assert not index_cache.any()
     assert not compressed_cache.any()
@@ -1771,69 +1800,6 @@ def test_qwen4_exp_qsa_cache_binding_reuses_paged_kv_storage(monkeypatch):
     caches = module.caches
     RTPQwen4ExpContext._bind_qsa_caches(runtime, [module], block_size=64)
     assert module.caches is caches
-
-
-def test_qwen4_exp_prefix_copy_follows_full_and_linear_tags():
-    qsa = SimpleNamespace(
-        is_qsa_attention=True,
-        raw_key_cache=torch.arange(12).reshape(3, 4).clone(),
-        compressed_key_cache=torch.arange(12, 24).reshape(3, 4).clone(),
-        rope_position_cache=torch.arange(24, 36).reshape(3, 4).clone(),
-    )
-    ple_ngram = torch.arange(9).reshape(3, 3).clone()
-    ple_conv = torch.arange(18).reshape(3, 2, 3).clone()
-    runtime = SimpleNamespace(
-        _rtp_layer_maps=({0: object()}, {1: qsa}, {}),
-        _rtp_forward_context_cls=SimpleNamespace(
-            _bind_qsa_caches=lambda *args: None,
-            _bind_ple_caches=lambda *args: None,
-        ),
-        kv_cache=SimpleNamespace(get_seq_size_per_block=lambda tag: 64),
-        model=object(),
-        _rtp_ple_ngram=ple_ngram,
-        _rtp_ple_conv=ple_conv,
-    )
-    original = [
-        tensor.clone()
-        for tensor in (
-            qsa.raw_key_cache,
-            qsa.compressed_key_cache,
-            qsa.rope_position_cache,
-            ple_ngram,
-            ple_conv,
-        )
-    ]
-    _ATOMQwen4ExpRuntime.copy_plugin_cache_blocks(
-        runtime,
-        torch.tensor([[1, 0, 2], [0, 1, 2]], dtype=torch.int32),
-        ["linear", "full"],
-    )
-    for tensor, before in zip(
-        (
-            qsa.raw_key_cache,
-            qsa.compressed_key_cache,
-            qsa.rope_position_cache,
-            ple_ngram,
-            ple_conv,
-        ),
-        original,
-    ):
-        source = 1 if tensor is ple_ngram or tensor is ple_conv else 0
-        torch.testing.assert_close(tensor[2], before[source])
-    with pytest.raises(ValueError, match="out-of-range"):
-        _ATOMQwen4ExpRuntime.copy_plugin_cache_blocks(
-            runtime,
-            torch.tensor([[1, 0, 5]], dtype=torch.int32),
-            ["linear", "full"],
-        )
-    before_invalid = ple_ngram.clone()
-    with pytest.raises(ValueError, match="out-of-range"):
-        _ATOMQwen4ExpRuntime.copy_plugin_cache_blocks(
-            runtime,
-            torch.tensor([[0, 0, 1], [0, 1, 99]], dtype=torch.int32),
-            ["linear", "full"],
-        )
-    torch.testing.assert_close(ple_ngram, before_invalid)
 
 
 def test_qwen4_exp_prefix_prefill_targets_interior_blocks():
@@ -1918,6 +1884,8 @@ def test_qwen4_exp_prefix_ple_checkpoints_match_token_windows():
             "offs": torch.tensor([64, 128], device="cuda", dtype=torch.int32),
         },
     )
+    targets = metadata.rtp_checkpoint_targets
+    metadata.rtp_checkpoint_targets = {"conv": targets, "ngram": targets}
     write_ple_checkpoints(ids, normalized, metadata, history_width=2, conv_state_len=9)
     for slot, end in ((0, 64), (1, 128)):
         torch.testing.assert_close(ngram[slot], ids[end - 2 : end])
@@ -1946,7 +1914,7 @@ def test_qwen4_exp_qsa_two_kv_heads_cache_write_and_read():
         head_dim = 16
         indexer = SimpleNamespace(index_head_dim=8, compress_ratio=4)
 
-        def bind_caches(self, *caches):
+        def bind_caches(self, *caches, **kwargs):
             self.caches = caches
 
     module = FakeQSA()
@@ -1957,11 +1925,7 @@ def test_qwen4_exp_qsa_two_kv_heads_cache_write_and_read():
         device="cuda",
         dtype=torch.bfloat16,
     )
-    runtime = SimpleNamespace(
-        kv_cache=SimpleNamespace(
-            get_layer_cache=lambda _: SimpleNamespace(kv_cache_base=raw)
-        )
-    )
+    runtime = qsa_runtime(raw, block_size)
     RTPQwen4ExpContext._bind_qsa_caches(runtime, [module], block_size)
     key_cache, value_cache, _, _ = module.caches
     keys = (
@@ -2045,14 +2009,10 @@ def test_qwen4_exp_qsa_rejects_invalid_ratio_and_dtype():
 
     module = FakeQSA()
     raw = torch.empty(2, dtype=torch.bfloat16)
-    runtime = SimpleNamespace(
-        kv_cache=SimpleNamespace(
-            get_layer_cache=lambda _: SimpleNamespace(kv_cache_base=raw)
-        )
-    )
+    runtime = qsa_runtime(raw, 64)
     with pytest.raises(ValueError, match="compression ratio"):
         RTPQwen4ExpContext._bind_qsa_caches(runtime, [module], block_size=36)
-    raw = torch.empty(2, dtype=torch.float16)
+    runtime = qsa_runtime(torch.empty(2, dtype=torch.float16), 64)
     with pytest.raises(ValueError, match="BF16"):
         RTPQwen4ExpContext._bind_qsa_caches(runtime, [module], block_size=64)
 
@@ -2079,16 +2039,19 @@ def test_qwen4_exp_qsa_uses_physical_table_when_kernel_pages_are_smaller():
     assert recovered.tolist() == physical.tolist()
 
 
-def test_qwen4_exp_ple_uses_actual_gdn_cache_layer():
-    raw = torch.empty(3, 1, dtype=torch.bfloat16)
-    seen = []
+def ple_runtime():
+    pools = {
+        "ple_ngram_ctx": torch.empty((3, 1), dtype=torch.int64),
+        "ple_conv_state": torch.empty((3, 12), dtype=torch.bfloat16),
+    }
+    def cache(layer, tag):
+        assert layer == 0  # PLE lives on layer 0; the GDN layer is 5.
+        return SimpleNamespace(kv_cache_base=pools[tag])
+    return SimpleNamespace(kv_cache=SimpleNamespace(get_layer_cache=cache)), pools
 
-    def get_layer_cache(layer):
-        seen.append(layer)
-        assert layer == 5
-        return SimpleNamespace(kv_cache_base=raw)
 
-    runtime = SimpleNamespace(kv_cache=SimpleNamespace(get_layer_cache=get_layer_cache))
+def test_qwen4_exp_ple_binds_native_tagged_pools():
+    runtime, pools = ple_runtime()
     ple = SimpleNamespace(
         hc_hidden_size=4,
         conv_state_len=3,
@@ -2108,21 +2071,18 @@ def test_qwen4_exp_ple_uses_actual_gdn_cache_layer():
         ),
         plugin_metadata=SimpleNamespace(rtp_cu_seqlens_q=torch.tensor([0, 1])),
     )
-    md = RTPQwen4ExpContext._ple_metadata(runtime, model, attn_metadata, {5: object()})
-    assert seen == [5]
+    RTPQwen4ExpContext._bind_ple_caches(runtime, model, {5: object()})
+    md = RTPQwen4ExpContext._ple_metadata(runtime, attn_metadata, attn_metadata.gdn_metadata, attn_metadata.gdn_metadata)
+    assert md.ngram_state.data_ptr() == pools["ple_ngram_ctx"].data_ptr()
+    assert md.conv_state.data_ptr() == pools["ple_conv_state"].data_ptr()
     assert md.ngram_state.shape == (3, 1)
     assert md.conv_state.shape == (3, 4, 3)
 
 
 def test_qwen4_exp_ple_graph_uses_selected_forward_buffers(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    raw = torch.empty(3, 1, dtype=torch.bfloat16)
-    runtime = SimpleNamespace(
-        kv_cache=SimpleNamespace(
-            get_layer_cache=lambda _: SimpleNamespace(kv_cache_base=raw)
-        ),
-        _cg_meta_bufs={"qwen4_has_initial": torch.empty(1, dtype=torch.bool)},
-    )
+    runtime, _ = ple_runtime()
+    runtime._cg_meta_bufs = {"qwen4_has_initial": torch.empty(1, dtype=torch.bool)}
     ple = SimpleNamespace(
         hc_hidden_size=4,
         conv_state_len=3,
@@ -2150,17 +2110,13 @@ def test_qwen4_exp_ple_graph_uses_selected_forward_buffers(monkeypatch):
             rtp_cu_seqlens_q=torch.tensor([0, 1, 2]), cg_bufs=selected
         ),
     )
-    md = RTPQwen4ExpContext._ple_metadata(runtime, model, attn_metadata, {5: object()})
+    md = RTPQwen4ExpContext._ple_metadata(runtime, attn_metadata, attn_metadata.gdn_metadata, attn_metadata.gdn_metadata)
     assert md.has_initial_state.data_ptr() == selected["qwen4_has_initial"].data_ptr()
     assert md.has_initial_state.tolist() == [True, False]
 
 
 def test_qwen4_exp_ple_rebind_requires_prewarm_before_graph_capture(monkeypatch):
-    raw = torch.empty(3, 1, dtype=torch.bfloat16)
-    layer_cache = SimpleNamespace(kv_cache_base=raw)
-    runtime = SimpleNamespace(
-        kv_cache=SimpleNamespace(get_layer_cache=lambda _: layer_cache)
-    )
+    runtime, pools = ple_runtime()
     ple = SimpleNamespace(
         hc_hidden_size=4,
         conv_state_len=3,
@@ -2179,7 +2135,7 @@ def test_qwen4_exp_ple_rebind_requires_prewarm_before_graph_capture(monkeypatch)
     assert runtime._rtp_ple_ngram is ngram
     assert runtime._rtp_ple_conv is conv
 
-    layer_cache.kv_cache_base = torch.empty_like(raw)
+    pools["ple_conv_state"] = torch.empty_like(pools["ple_conv_state"])
     with pytest.raises(RuntimeError, match="bound before Graph capture"):
         RTPQwen4ExpContext._bind_ple_caches(runtime, model, {5: object()})
 
@@ -2261,6 +2217,7 @@ def test_qwen4_exp_graph_state_and_qsa_slots_handle_boundary_and_padding():
         *table.stride(),
         2,
         64,
+        64,
         4,
         128,
     )
@@ -2286,6 +2243,7 @@ def test_qwen4_exp_mtp_graph_qsa_slots_use_request_rows():
         4,
         *table.stride(),
         3,
+        16,
         16,
         4,
         128,
@@ -2358,6 +2316,7 @@ def test_qwen4_exp_mtp_draft_decode_graph_uses_one_row_per_request(
         4,
         *table.stride(),
         2,
+        16,
         16,
         4,
         128,

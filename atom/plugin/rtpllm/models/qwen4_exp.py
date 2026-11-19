@@ -6,12 +6,19 @@ import inspect
 import json
 import logging
 import os
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import torch
 from rtp_llm.config.model_config import ModelConfig, ssm_state_dtype_str_to_data_type
-from rtp_llm.models.hybrid_kv_cache import build_hybrid_kv_cache_spec_descs
-from rtp_llm.ops import HybridAttentionType, KVCacheSpecType
+from rtp_llm.models.qwen4_exp.qwen4_exp_kv_cache import build_qwen4_exp_kv_cache_spec_descs
+from rtp_llm.ops import (
+    CacheTailPolicyDesc,
+    DataType,
+    HybridAttentionType,
+    LinearStateLayout,
+    KVCacheSpecType,
+)
 from rtp_llm.ops.compute_ops import PyModelOutputs
 from rtp_llm.utils.model_weight import W
 
@@ -22,6 +29,11 @@ from atom.plugin.rtpllm.models.qwen3_5 import (
 )
 
 logger = logging.getLogger("atom.plugin.rtpllm.models")
+
+# The GDN state is much larger than QSA/PLE state. One checkpoint per 1024
+# prompt tokens lets the prefix cache serve common 6K/7K prefixes without
+# retaining every 64-token state page of a long request.
+GDN_PREFIX_CHECKPOINT_STRIDE_BLOCKS = 16
 
 
 class _Qwen4ExpAttnPyObj(_ATOMAttnPyObj):
@@ -66,54 +78,16 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
                 raise ValueError("Qwen4Exp MTP requires positive request capacity")
             self._rtp_mtp_request_capacity = max_batch
         self._atom_attn_pyobj = _Qwen4ExpAttnPyObj(self)
+        from atom.plugin.rtpllm.utils.replay_hybrid import install_runtime
 
-    def copy_plugin_cache_blocks(self, mapping: torch.Tensor, tags: list[str]) -> None:
-        """Mirror RTP's tagged block relocations into QSA and PLE side pools.
+        install_runtime(self)
 
-        RTP invokes this before eager forward *and* graph replay. A prefix hit
-        keeps the same physical block; only copy-on-write relocations appear
-        in ``mapping``. The RTP-owned KV/GDN pools are copied separately.
-        """
-        if mapping.device.type != "cpu" or mapping.ndim != 2 or mapping.shape[1] != 3:
-            raise ValueError("plugin cache copy requires a CPU int32 [N,3] mapping")
-        if mapping.dtype != torch.int32:
-            raise ValueError("plugin cache copy requires int32 block IDs")
-        if not mapping.numel():
-            return
-        side_pools: dict[str, list[torch.Tensor]] = {"full": [], "linear": []}
-        qsa_layers = [
-            module
-            for module in self._rtp_layer_maps[1].values()
-            if getattr(module, "is_qsa_attention", False)
-        ]
-        if qsa_layers:
-            self._rtp_forward_context_cls._bind_qsa_caches(
-                self, qsa_layers, int(self.kv_cache.get_seq_size_per_block("full"))
-            )
-            for module in qsa_layers:
-                side_pools["full"].extend(
-                    (module.raw_key_cache, module.compressed_key_cache)
-                )
-                if module.rope_position_cache is not None:
-                    side_pools["full"].append(module.rope_position_cache)
-        self._rtp_forward_context_cls._bind_ple_caches(
-            self, self.model, self._rtp_layer_maps[0]
-        )
-        if hasattr(self, "_rtp_ple_ngram"):
-            side_pools["linear"].extend((self._rtp_ple_ngram, self._rtp_ple_conv))
-        copies = mapping.tolist()
-        # Validate the entire mapping before touching any side pool. RTP may
-        # chain copies, so the second pass must still preserve row order.
-        for row, src, dst in copies:
-            if row < 0 or row >= len(tags):
-                raise ValueError(f"plugin cache copy has invalid tag row {row}")
-            for pool in side_pools.get(tags[row], ()):
-                if src < 0 or dst < 0 or src >= pool.shape[0] or dst >= pool.shape[0]:
-                    raise ValueError("plugin cache copy has out-of-range block ID")
-        for row, src, dst in copies:
-            for pool in side_pools.get(tags[row], ()):
-                if src != dst:
-                    pool[dst].copy_(pool[src])
+    def initialize(self, init_resource) -> bool:
+        initialized = super().initialize(init_resource)
+        if initialized and self.kv_cache is not None:
+            from atom.plugin.rtpllm.utils.linear_double_buffer import initialize_runtime
+            initialize_runtime(self)
+        return initialized
 
     def prepare_fmha_impl(self, inputs, is_cuda_graph: bool = False):
         tagged = inputs.attention_inputs
@@ -183,8 +157,12 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
             for name, dtype in (
                 ("qsa_positions_i64", torch.int64),
                 ("qsa_slots_i64", torch.int64),
+                ("qsa_index_slots_i64", torch.int64),
+                ("qsa_raw_slots_i64", torch.int64),
                 ("qwen4_has_initial", torch.bool),
                 ("qsa_compressed_slots", torch.int64),
+                ("qsa_index_compressed_slots", torch.int64),
+                ("qsa_raw_compressed_slots", torch.int64),
             ):
                 graph_buffers[name] = torch.empty(
                     num_tokens, device=device, dtype=dtype
@@ -198,6 +176,37 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
                 max_physical_blocks,
                 device=device,
                 dtype=torch.int32,
+            )
+            graph_buffers["index_physical_block_table_i32"] = torch.empty_like(
+                graph_buffers["physical_block_table_i32"]
+            )
+            graph_buffers["raw_physical_block_table_i32"] = torch.empty_like(
+                graph_buffers["physical_block_table_i32"]
+            )
+            state_requests = graph_buffers["block_table_i32"].shape[0]
+            graph_buffers["qsa_state_read_slots_i32"] = torch.empty(
+                state_requests, mtp_tokens_per_request, device=device, dtype=torch.int32
+            )
+            graph_buffers["qsa_state_write_slots_i32"] = torch.empty_like(
+                graph_buffers["qsa_state_read_slots_i32"]
+            )
+            graph_buffers["qsa_state_invalid_live_rows"] = torch.empty(
+                (state_requests + 127) // 128, device=device, dtype=torch.int32
+            )
+            if any(module.rope_position_cache is not None for module in qsa_layers):
+                for name in (
+                    "raw_physical_block_table_i32",
+                    "qsa_raw_slots_i64",
+                    "qsa_state_read_slots_i32",
+                    "qsa_state_write_slots_i32",
+                    "qsa_state_invalid_live_rows",
+                ):
+                    graph_buffers["position_" + name] = torch.empty_like(graph_buffers[name])
+            graph_buffers["ple_previous_state_slots_i32"] = torch.empty(
+                max_batch, device=device, dtype=torch.int32
+            )
+            graph_buffers["ple_ngram_previous_state_slots_i32"] = torch.empty(
+                max_batch, device=device, dtype=torch.int32
             )
 
         # The same draft runtime is wrapped by both the Q-token draft-prefill
@@ -262,7 +271,23 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
             mtp_buffers["target_accepted_tokens"] = torch.ones(
                 max_batch, device=device, dtype=torch.int32
             )
+            # Each state pool captures a kernel that writes target-verify
+            # read/write page IDs. Keep its output separate from the linear
+            # state and every other pool: their physical page IDs diverge
+            # after prefix reuse.
+            for tag in ("ple_conv_state", "ple_ngram_ctx"):
+                mtp_buffers[f"{tag}_target_read_slots_i32"] = torch.empty_like(
+                    mtp_buffers["target_read_slots_i32"]
+                )
+                mtp_buffers[f"{tag}_target_write_slots_i32"] = torch.empty_like(
+                    mtp_buffers["target_write_slots_i32"]
+                )
+                mtp_buffers[f"{tag}_target_invalid_live_rows"] = torch.empty_like(
+                    mtp_buffers["target_invalid_live_rows"]
+                )
         self._cg_mtp_meta_bufs = mtp_buffers
+        from atom.plugin.rtpllm.utils.split_ssm_storage import warm_buffers
+        warm_buffers(self)
 
     def _graph_buffers_for_inputs(self, attn_inputs):
         if getattr(attn_inputs, "is_target_verify", False) or (
@@ -277,6 +302,43 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
                 raise RuntimeError("Qwen4Exp MTP Graph buffers were not prewarmed")
             return buffers
         return getattr(self, "_cg_meta_bufs", None)
+
+    @contextmanager
+    def _publish_pd_cache_layers(self, tagged):
+        """Publish completed layers while later prefill layers are computing."""
+        publications = {}
+        if isinstance(tagged, dict):
+            for tag, attn_inputs in tagged.items():
+                plan = getattr(attn_inputs, "cache_store_inputs", None)
+                if plan is None:
+                    continue
+                writer = getattr(attn_inputs, "cache_store_writer", None)
+                if writer is None:
+                    raise RuntimeError(f"Qwen4Exp PD cache writer missing for {tag}")
+                publications[tag] = (plan, writer)
+
+        handles = []
+        try:
+            if publications:
+                for layer_idx, layer in enumerate(self.model.model.layers):
+
+                    def publish(_module, _inputs, _output, layer_idx=layer_idx):
+                        # write() records an event on the current compute stream
+                        # and retains the cache pages until transfer completes.
+                        # The layer has queued all QSA/GDN/PLE state updates here.
+                        for cache in self.kv_cache.get_layer_cache_groups(layer_idx):
+                            publication = publications.get(str(cache.tag))
+                            if publication is not None:
+                                plan, writer = publication
+                                writer.write(plan, cache)
+
+                    handles.append(layer.register_forward_hook(publish))
+            yield
+        finally:
+            # Do not leave request plans or hooks on decode/graph forwards,
+            # including when a layer or cache publication raises.
+            for handle in handles:
+                handle.remove()
 
     def forward(self, inputs, fmha_impl=None):
         tagged = inputs.attention_inputs
@@ -302,7 +364,10 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
             inputs.attention_inputs.is_cuda_graph = True
         from atom.config import use_custom_atom_config
 
-        with use_custom_atom_config(self.model.atom_config):
+        with (
+            use_custom_atom_config(self.model.atom_config),
+            self._publish_pd_cache_layers(tagged),
+        ):
             if bool(
                 getattr(
                     getattr(
@@ -664,14 +729,41 @@ class ATOMQwen4Exp(ATOMQwen35Moe):
 
     @classmethod
     def _post_build_model_config(cls, model_config: ModelConfig) -> None:
-        model_config.kv_cache_spec_descs = build_hybrid_kv_cache_spec_descs(
-            model_config.hybrid_attention_config.hybrid_attention_types,
-            KVCacheSpecType.MHA,
+        with open(os.path.join(model_config.ckpt_path, "config.json"), encoding="utf-8") as file:
+            text = json.load(file)["text_config"]
+        block = int(model_config.attn_config.tokens_per_block)
+        ratio = int(text["indexer_compress_ratio"])
+        index_dim = int(text["indexer_head_dim"])
+        if block <= 0 or ratio <= 0 or block % ratio:
+            raise ValueError("Qwen4Exp index cache needs ratio-aligned block size")
+        descs = build_qwen4_exp_kv_cache_spec_descs(
+            model_config,
+            [] if model_config.is_mtp else [i - 1 for i in text.get("ple_layer_ids", [])],
+            int(text.get("ple_conv_kernel_size", 0)),
+            int(text.get("ngram_size", 0)),
+            index_dim,
+            ratio,
         )
+        # The GDN state packs FP32 recurrence data into BF16 byte storage.
+        # Global FP8 KV mode applies to MHA pages only.
+        for layer in descs:
+            for desc in layer:
+                if desc.cache_type == KVCacheSpecType.LINEAR:
+                    desc.dtype = DataType.TYPE_BF16
+                    if (
+                        torch.version.hip
+                        and not model_config.is_mtp
+                        and os.getenv("ROLE_TYPE", "PDFUSION") in ("PREFILL", "DECODE", "PDFUSION")
+                    ):
+                        desc.linear_state_layout = LinearStateLayout.SPLIT_EXPORT
+                    tail = desc.tail or CacheTailPolicyDesc()
+                    tail.prefix_checkpoint_stride_blocks = GDN_PREFIX_CHECKPOINT_STRIDE_BLOCKS
+                    desc.tail = tail
+        model_config.kv_cache_spec_descs = descs
 
     @classmethod
     def _apply_kv_cache_config(cls, model_config: ModelConfig, kv_cache_config) -> None:
-        """Budget QSA/PLE side state before RTP sizes its paged cache pools."""
+        """Validate native QSA/PLE cache geometry before RTP sizes its pools."""
         with open(
             os.path.join(model_config.ckpt_path, "config.json"), encoding="utf-8"
         ) as file:
@@ -689,7 +781,6 @@ class ATOMQwen4Exp(ATOMQwen35Moe):
         )
         if len(layer_types) != model_config.num_layers:
             raise ValueError("Qwen4Exp QSA layer count differs from RTP model layers")
-        full_layers = sum(layer == "full_attention" for layer in layer_types)
         if block_size <= 0 or ratio <= 0 or block_size % ratio or index_dim <= 0:
             raise ValueError(
                 "Qwen4Exp QSA cache requires positive, ratio-aligned block geometry"
@@ -698,46 +789,12 @@ class ATOMQwen4Exp(ATOMQwen35Moe):
             kv_cache_config, "multi_task_prompt_str", None
         ):
             raise ValueError("Qwen4Exp RTP plugin does not support cached task prompts")
-        # RTP's plugin block-copy callback must accompany reuse_cache so QSA/PLE
-        # side pools follow copy-on-write relocations.
         model_config.atom_qwen4_exp_prefix_cache_enabled = bool(
             kv_cache_config.reuse_cache
         )
 
-        # _bind_qsa_caches allocates both BF16 arrays for *every* FULL block
-        # on this rank: [block, 1, dim] and [block/ratio, 1, dim].
-        qsa_bytes = full_layers * (block_size + block_size // ratio) * index_dim * 2
-
-        # _ple_metadata allocates one n-gram and one convolution window for
-        # every LINEAR state slot. Both pools are also outside RTP's KV pool.
-        ple_layer_ids = [] if model_config.is_mtp else text.get("ple_layer_ids", [])
-        if len(ple_layer_ids) > 1:
-            raise ValueError("Qwen4Exp RTP plugin currently supports one PLE layer")
-        ple_bytes = 0
-        if ple_layer_ids:
-            ngram_size = int(text["ngram_size"])
-            conv_state_len = (int(text["ple_conv_kernel_size"]) - 1) * ngram_size
-            hc_hidden_size = int(text["hidden_size"]) * int(text["hc_count"])
-            if ngram_size < 2 or conv_state_len < 0 or hc_hidden_size <= 0:
-                raise ValueError("Qwen4Exp PLE cache geometry is invalid")
-            ple_bytes = (ngram_size - 1) * 8 + (
-                hc_hidden_size
-                * conv_state_len
-                * torch.empty((), dtype=model_config.compute_dtype).element_size()
-            )
-        # QSA needs the three-axis RoPE position of every image token when
-        # compressing index keys. This side cache follows RTP's physical blocks.
-        rope_bytes = (
-            full_layers
-            * block_size
-            * 3
-            * torch.empty((), dtype=torch.int64).element_size()
-            if model_config.mm_model_config.is_multimodal
-            else 0
-        )
-        model_config.auxiliary_paged_cache_bytes_per_block = (
-            qsa_bytes + ple_bytes + rope_bytes
-        )
+        # Side state is now allocated and budgeted by RTP's tagged pools.
+        model_config.auxiliary_paged_cache_bytes_per_block = 0
 
     def _create_python_model(self):
         from atom.model_loader.loader import WeightsMapper, load_model_in_plugin_mode
@@ -803,7 +860,6 @@ class ATOMQwen4Exp(ATOMQwen35Moe):
             max_generate_batch_size=self.max_generate_batch_size,
             fmha_config=self.fmha_config,
             py_hw_kernel_config=self.hw_kernel_config,
-            device_resource_config=self.device_resource_config,
             atom_model=atom_model,
         )
         logger.info("Created ATOM Qwen4Exp runtime for RTP plugin mode")
@@ -812,6 +868,41 @@ class ATOMQwen4Exp(ATOMQwen35Moe):
 
 class _ATOMQwen4ExpMTPRuntime(_ATOMQwen4ExpRuntime):
     """Bridge RTP's flat HC hand-off to ATOM's reusable QSA draft layer."""
+
+    @property
+    def supports_mtp_draft_loop_graph(self):
+        # The native loop advances and restores both logical lengths and
+        # token-major T/H/W MRoPE positions using captured device operations.
+        return bool(torch.version.hip)
+
+    def prepare_mtp_draft_graph_step(self, inputs, fmha_impl):
+        # The C++ loop advances the canonical device length. ATOM forward
+        # rebuilds positions, RoPE, QSA/PLE slots and context lengths from it
+        # using capture-safe device ops, unlike the native model's RoPE planner.
+        tagged = inputs.attention_inputs
+        groups = tuple(tagged.values()) if isinstance(tagged, dict) else (tagged,)
+        anchor = groups[0]
+        lengths = anchor.sequence_lengths_plus_1_device
+        if (not torch.version.hip or not anchor.is_cuda_graph
+                or anchor.is_prefill or anchor.is_target_verify
+                or not lengths.is_cuda or lengths.numel() != inputs.input_ids.numel()
+                or any(g.sequence_lengths_plus_1_device.data_ptr() != lengths.data_ptr()
+                       for g in groups)):
+            raise RuntimeError("ATOM MTP loop requires shared single-token decode device lengths")
+        positions = inputs.combo_position_ids
+        if bool(getattr(getattr(self._rtp_model_config, "mm_model_config", None),
+                        "is_multimodal", False)):
+            if (positions is None or not positions.is_cuda
+                    or positions.numel() != 3 * inputs.input_ids.numel()
+                    or any(g.combo_position_ids.data_ptr() != positions.data_ptr()
+                           for g in groups)):
+                raise RuntimeError("MTP loop graph requires shared device T/H/W positions")
+        if self._graph_buffers_for_inputs(anchor) is None:
+            raise RuntimeError("ATOM MTP loop requires prewarmed metadata buffers")
+
+    def cuda_graph_draft_prefill_uses_request_lanes(self) -> bool:
+        # RTP captures only active request lanes for each draft-prefill key.
+        return True
 
     @staticmethod
     def _draft_vision_embeddings(input_ids, embed_tokens, is_multimodal):
@@ -924,6 +1015,20 @@ class _ATOMQwen4ExpMTPRuntime(_ATOMQwen4ExpRuntime):
                 hc = self.model(
                     input_ids, rope_positions + 1, hc_input, inputs_embeds=draft_embeds
                 )
+        # The one-layer MTP draft has its own cache model ID. The decode
+        # worker loads these pages independently from the target-model pages.
+        draft_inputs_by_tag = tagged if isinstance(tagged, dict) else {"full": tagged}
+        for tag, draft_inputs in draft_inputs_by_tag.items():
+            plan = getattr(draft_inputs, "cache_store_inputs", None)
+            if plan is None:
+                continue
+            writer = getattr(draft_inputs, "cache_store_writer", None)
+            if writer is None:
+                raise RuntimeError(f"Qwen4Exp MTP PD cache writer is missing for {tag}")
+            for layer_idx in range(len(self.model.model.layers)):
+                for cache in self.kv_cache.get_layer_cache_groups(layer_idx):
+                    if str(cache.tag) == tag:
+                        writer.write(plan, cache)
         hc = hc.flatten(1)
         mixed = self.model._head_input(hc)
         return PyModelOutputs(mixed, hc)
@@ -1008,7 +1113,6 @@ class ATOMQwen4ExpMTP(ATOMQwen4Exp):
             max_generate_batch_size=self.max_generate_batch_size,
             fmha_config=self.fmha_config,
             py_hw_kernel_config=self.hw_kernel_config,
-            device_resource_config=self.device_resource_config,
             atom_model=atom_model,
         )
         logger.info("Created ATOM Qwen4Exp MTP runtime for RTP plugin mode")

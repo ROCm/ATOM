@@ -484,6 +484,7 @@ def _conv(
     D: tl.constexpr,
     SS0: tl.constexpr,
     SS1: tl.constexpr,
+    SS2: tl.constexpr,
     IS: tl.constexpr,
     OS: tl.constexpr,
     SPEC: tl.constexpr,
@@ -514,7 +515,7 @@ def _conv(
         x = tl.load(X + pos * C + c, valid & (pos >= start), 0).to(tl.float32)
         s_pos = (K - 1) * D + pos - start
         s = tl.load(
-            S + src * SS0 + c * SS1 + offset + s_pos,
+            S + src * SS0 + c * SS1 + (offset + s_pos) * SS2,
             valid & has & (pos < start) & (s_pos >= 0),
             0,
         ).to(tl.float32)
@@ -540,6 +541,7 @@ def _update(
     CAPACITY: tl.constexpr,
     SS0: tl.constexpr,
     SS1: tl.constexpr,
+    SS2: tl.constexpr,
     IS: tl.constexpr,
     OS: tl.constexpr,
     SPEC: tl.constexpr,
@@ -558,14 +560,14 @@ def _update(
     x = tl.load(X + pos * C + c[:, None], valid & (pos >= start) & (pos < end), 0)
     old_pos = L + pos - start
     old = tl.load(
-        S + src * SS0 + c[:, None] * SS1 + offset + old_pos,
+        S + src * SS0 + c[:, None] * SS1 + (offset + old_pos) * SS2,
         valid & has & (pos < start) & (old_pos >= 0),
         0,
     )
     # Each program owns whole histories for its channels: all old entries
     # are loaded before stores, including when src == dst.
     value = tl.where(pos >= start, x, old)
-    tl.store(S + dst * SS0 + c[:, None] * SS1 + j[None, :], value, valid)
+    tl.store(S + dst * SS0 + c[:, None] * SS1 + j[None, :] * SS2, value, valid)
 
 
 def dilated_causal_conv1d(
@@ -578,6 +580,8 @@ def dilated_causal_conv1d(
     has_initial_state: torch.Tensor,
     dilation: int,
     num_accepted_tokens: torch.Tensor | None = None,
+    *,
+    update_state: bool = True,
 ) -> torch.Tensor:
     """SiLU(conv(inputs)), updating only valid, nonempty destination slots.
 
@@ -594,8 +598,8 @@ def dilated_causal_conv1d(
     requests = state_indices_out.numel()
     if inputs.ndim != 2 or inputs.shape[1] != channels or dilation < 1:
         raise ValueError("invalid dilated convolution input geometry")
-    if state.shape[1] != channels or state.shape[2] < history or state.stride(2) != 1:
-        raise ValueError("state must contain a contiguous history per channel")
+    if state.shape[1] != channels or state.shape[2] < history:
+        raise ValueError("state has invalid channel/history dimensions")
     if query_start_loc.numel() != requests + 1:
         raise ValueError("query_start_loc must have requests + 1 entries")
     inputs, weight = inputs.contiguous(), weight.contiguous()
@@ -617,6 +621,7 @@ def dilated_causal_conv1d(
         dilation,
         state.stride(0),
         state.stride(1),
+        state.stride(2),
         state_indices_in.stride(0),
         state_indices_out.stride(0),
         num_accepted_tokens is not None,
@@ -624,7 +629,7 @@ def dilated_causal_conv1d(
         128,
         enable_fp_fusion=False,
     )
-    if history and requests:
+    if update_state and history and requests:
         _update[(requests, triton.cdiv(channels, 32))](
             inputs,
             state,
@@ -638,6 +643,7 @@ def dilated_causal_conv1d(
             capacity,
             state.stride(0),
             state.stride(1),
+            state.stride(2),
             state_indices_in.stride(0),
             state_indices_out.stride(0),
             num_accepted_tokens is not None,

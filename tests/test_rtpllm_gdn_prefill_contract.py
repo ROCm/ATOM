@@ -90,6 +90,8 @@ def test_shared_ple_forward_calls_optional_checkpoint_writer(monkeypatch):
     metadata = SimpleNamespace(
         query_start_loc=None,
         ngram_state=None,
+        ngram_indices_in=None,
+        ngram_indices_out=None,
         state_indices_in=None,
         state_indices_out=None,
         has_initial_state=None,

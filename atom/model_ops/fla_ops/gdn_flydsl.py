@@ -349,3 +349,21 @@ def decode(q, k, v, a, b, state, A_log, dt_bias, reads, writes, out=None):
         need_shuffle_state=False,
     )
     return output.transpose(0, 1), state
+
+
+def mtp_rtp(q, k, v, a, b, state, A_log, dt_bias, reads, writes, out):
+    from aiter.ops.flydsl.linear_attention_kernels import flydsl_gdr_mtp_rtp
+    batch, width = writes.shape
+    if q.shape[1] != batch * width:
+        raise ValueError("FlyDSL MTP requires fixed-length candidate chains")
+    if state.stride(-2) != 1:
+        raise ValueError("FlyDSL MTP state must use physical VK storage")
+    query = q.reshape(batch, width, *q.shape[-2:])
+    key = k.reshape(batch, width, *k.shape[-2:])
+    value = v.reshape(batch, width, *v.shape[-2:])
+    output = out.reshape(batch, width, *v.shape[-2:])
+    flydsl_gdr_mtp_rtp(query, key, value, a.reshape(batch, width, -1),
+                       b.reshape(batch, width, -1), dt_bias, A_log,
+                       state.transpose(-1, -2), output, (reads if reads.ndim == 1 else reads[:, 0].contiguous()),
+                       writes, use_qk_l2norm=True)
+    return out.unsqueeze(0), None

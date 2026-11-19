@@ -33,7 +33,12 @@ def test_rtpllm_wrapper_registers_qwen35_moe_override():
 
     fake_atom_glm_mod.ATOMGlm5Moe = _FakeATOMGlm5Moe
 
+    qwen4 = MagicMock()
     fake_modules = {
+        "rtp_llm.openai.renderer_factory_register": MagicMock(),
+        "rtp_llm.openai.renderers.qwen35_renderer": MagicMock(),
+        "atom.plugin.rtpllm.models.qwen4_exp_vision": MagicMock(),
+        "atom.plugin.rtpllm.models.qwen4_exp": qwen4,
         "rtp_llm": _package("rtp_llm"),
         "rtp_llm.models": _package("rtp_llm.models"),
         "rtp_llm.model_factory_register": fake_register_mod,
@@ -57,6 +62,8 @@ def test_rtpllm_wrapper_registers_qwen35_moe_override():
             [
                 call("atom_qwen35_moe", _FakeATOMQwen35Moe, []),
                 call("atom_glm5_moe", _FakeATOMGlm5Moe, []),
+                call("atom_qwen4_exp", qwen4.ATOMQwen4Exp, []),
+                call("atom_qwen4_exp_mtp", qwen4.ATOMQwen4ExpMTP, []),
             ],
             any_order=False,
         )

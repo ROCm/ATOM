@@ -59,6 +59,7 @@ from atom.model_ops.qwen4_exp.ops.qsa import (
     qsa_compress_groups,
     qsa_expand_block_indices,
     qsa_select_paged_groups,
+    qsa_compress_state_ring,
     qsa_select_paged_tokens,
     qsa_sparse_paged_gqa,
     qsa_store_quantized_rows,
@@ -481,35 +482,65 @@ class Qwen4ExpAttention(nn.Module):
         depends only on its own query, so the result is the same.
         """
         index_q, raw_key = self.indexer.project_qk(hidden_states, positions)
-        qsa_store_rows(self.raw_key_cache, qsa.slot_mapping, raw_key)
-        if self.rope_position_cache is not None:
-            qsa_store_rows(
-                self.rope_position_cache,
-                qsa.slot_mapping,
-                canonical_rope_positions(positions[..., : hidden_states.shape[0]]),
-            )
-
-        pooled, first_positions = qsa_compress_groups(
-            self.raw_key_cache,
-            qsa.block_tables,
-            qsa.token_to_req,
-            qsa.logical_positions,
-            qsa.compressed_slot_mapping,
-            self.indexer.compress_ratio,
-            position_cache=self.rope_position_cache,
-            # Draft RoPE is one ahead of its logical cache slots.
-            rope_position_offset=int(get_forward_context().context.is_draft),
+        index_slots = (
+            qsa.raw_index_slot_mapping
+            if qsa.raw_index_slot_mapping is not None
+            else qsa.slot_mapping
         )
+        compressed_slots = (
+            qsa.index_compressed_slot_mapping
+            if qsa.index_compressed_slot_mapping is not None
+            else qsa.compressed_slot_mapping
+        )
+        raw_blocks = (
+            qsa.raw_index_block_tables
+            if qsa.raw_index_block_tables is not None
+            else qsa.block_tables
+        )
+        index_blocks = qsa.index_block_tables if qsa.index_block_tables is not None else qsa.block_tables
+        if qsa.raw_index_slot_mapping is not None and self.raw_key_cache.dtype == torch.float32:
+            pooled, first_positions = qsa_compress_state_ring(
+                raw_key, self.raw_key_cache, raw_blocks, index_slots,
+                qsa.token_to_req, qsa.logical_positions, compressed_slots,
+                self.indexer.compress_ratio, qsa.state_page_size,
+                rope_position_offset=int(get_forward_context().context.is_draft),
+                state_read_pages=qsa.state_read_pages,
+                state_candidate_pages=qsa.state_candidate_pages,
+                positions=(
+                    canonical_rope_positions(positions[..., : hidden_states.shape[0]])
+                    if self.rope_position_cache is not None else None
+                ),
+                position_cache=self.rope_position_cache,
+                position_table=qsa.position_block_tables,
+                position_slots=qsa.position_slot_mapping,
+                position_read_pages=qsa.position_read_pages,
+                position_candidate_pages=qsa.position_candidate_pages,
+            )
+        else:
+            qsa_store_rows(self.raw_key_cache, index_slots, raw_key)
+            if self.rope_position_cache is not None:
+                qsa_store_rows(
+                    self.rope_position_cache,
+                    index_slots,
+                    canonical_rope_positions(positions[..., : hidden_states.shape[0]]),
+                )
+            pooled, first_positions = qsa_compress_groups(
+                self.raw_key_cache, raw_blocks, qsa.token_to_req,
+                qsa.logical_positions, compressed_slots,
+                self.indexer.compress_ratio,
+                position_cache=self.rope_position_cache,
+                rope_position_offset=int(get_forward_context().context.is_draft),
+            )
         normalized = self.indexer.normalize_compressed_keys(pooled, first_positions)
         if self.compressed_key_scale is None:
             qsa_store_rows(
-                self.compressed_key_cache, qsa.compressed_slot_mapping, normalized
+                self.compressed_key_cache, compressed_slots, normalized
             )
         else:
             qsa_store_quantized_rows(
                 self.compressed_key_cache,
                 self.compressed_key_scale,
-                qsa.compressed_slot_mapping,
+                compressed_slots,
                 normalized,
             )
 
@@ -518,7 +549,7 @@ class Qwen4ExpAttention(nn.Module):
             return qsa_select_paged_tokens(
                 index_q,
                 self.compressed_key_cache,
-                qsa.block_tables,
+                index_blocks,
                 qsa.token_to_req,
                 qsa.logical_positions,
                 qsa.seq_lens,
@@ -532,7 +563,7 @@ class Qwen4ExpAttention(nn.Module):
         groups, width = qsa_select_paged_groups(
             index_q[local],
             self.compressed_key_cache,
-            qsa.block_tables,
+            index_blocks,
             qsa.token_to_req[local],
             qsa.logical_positions[local],
             qsa.seq_lens,
@@ -646,8 +677,13 @@ class Qwen4ExpAttention(nn.Module):
         if qsa.context_slots is None:
             k, v = key.contiguous(), value.contiguous()
         else:
-            k = self.k_cache.flatten(0, 1).index_select(0, qsa.context_slots)
-            v = self.v_cache.flatten(0, 1).index_select(0, qsa.context_slots)
+            # Native RTP pages interleave K and V. Flattening those strided
+            # cache views would materialize the entire pool for each prefill.
+            page_size = self.k_cache.shape[1]
+            pages = qsa.context_slots // page_size
+            offsets = qsa.context_slots % page_size
+            k = self.k_cache[pages, offsets]
+            v = self.v_cache[pages, offsets]
         # The expansion drops columns no row can reach (short contexts select
         # every complete block, then the tail, left-aligned), so padding with -1
         # keeps each row's layout. The kernel does not validate it: a malformed
@@ -687,6 +723,12 @@ class Qwen4ExpAttention(nn.Module):
             block_tables=torch.arange(pages, device=device, dtype=torch.int32)[None],
             seq_lens=torch.tensor([tokens], device=device, dtype=torch.int32),
             max_seq_len=tokens,
+            # Serving metadata gained these optional native cache mappings.
+            # Synthetic profiling does not own paged RTP cache regions.
+            raw_index_slot_mapping=None,
+            index_compressed_slot_mapping=None,
+            raw_index_block_tables=None,
+            index_block_tables=None,
         )
         names = (
             "k_cache",

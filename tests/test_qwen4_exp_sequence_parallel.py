@@ -146,6 +146,7 @@ def _model(num_layers, ple_layer, return_hc_state, embed, hc=4):
         hc_count=hc,
         return_hc_state=return_hc_state,
         get_input_embeddings=lambda ids: embed[ids],
+        allow_sequence_parallel=True,
         start_layer=0,
         end_layer=num_layers,
         layers=layers,
@@ -224,7 +225,7 @@ def test_sp_gates(ranks, monkeypatch, env, tokens, target_shards, drafter_shards
     quantizes, so it follows the env threshold alone."""
     monkeypatch.setenv("ATOM_QWEN4_EXP_SP_MIN_TOKENS", env)
     assert qwen4_exp.HC_QUANT_ROWS_MAX == 1024
-    target = SimpleNamespace(sp_start_layer=2, end_layer=48)
+    target = SimpleNamespace(allow_sequence_parallel=True, sp_start_layer=2, end_layer=48)
     target_gate = MethodType(qwen4_exp.Qwen4ExpModel._sequence_parallel, target)
     drafter_gate = qwen4_exp._SequenceParallel.maybe
     results = ranks(2, lambda rank: (target_gate(tokens), drafter_gate(tokens)))
@@ -241,6 +242,7 @@ class _DraftLayer:
     rank's share of the sum, as the real ones do before the all-reduce or
     reduce-scatter."""
 
+    fused_hc = False
     layer_type = "full_attention"
     ple = None
 
@@ -291,6 +293,7 @@ def _drafter(weights, rank, world, tokens, seen):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6)
 
     return SimpleNamespace(
+        allow_sequence_parallel=True,
         hidden_size=weights["mlp"].shape[0],
         hc_count=weights["mix"].shape[0],
         embed_tokens=lambda ids: weights["embed"][ids],
@@ -449,7 +452,9 @@ def test_select_tokens_row_sharded_matches_replicated(
         lengths = torch.zeros(2, dtype=torch.int32, device=device)
         for r, s, n in chunks:
             lengths[r] = s + n
-        qsa = SimpleNamespace(
+        from atom.model_ops.attentions.qwen4_exp_attn import Qwen4ExpQSAMetadata
+
+        qsa = Qwen4ExpQSAMetadata(
             block_tables=tables,
             token_to_req=requests,
             logical_positions=logical,

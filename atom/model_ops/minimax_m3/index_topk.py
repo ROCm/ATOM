@@ -1412,14 +1412,20 @@ def _topk_index_packed_kernel(
 # costs a separate selection pass. That buffer is ~1.3 MB at the 100k/conc-50
 # serving point against 1.3 GB of index K, so it is not the trade it looks like.
 # ---------------------------------------------------------------------------
+def _decode_index_score_tiled_kernel_heuristic_0(args):
+    return triton.next_power_of_2(args['head_dim'])
+
+
+def _decode_index_score_tiled_kernel_heuristic_1(args):
+    return max(16, triton.next_power_of_2(args['NUM_IDX_HEADS'] * args['MAX_Q']))
+
+
 @triton.heuristics(
     {
-        "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
+        "BLOCK_SIZE_D": _decode_index_score_tiled_kernel_heuristic_0,
         # tl.dot wants a real N; a request with one row and one head would
         # otherwise ask for a 1-wide matmul.
-        "BLOCK_SIZE_N": lambda args: max(
-            16, triton.next_power_of_2(args["NUM_IDX_HEADS"] * args["MAX_Q"])
-        ),
+        "BLOCK_SIZE_N": _decode_index_score_tiled_kernel_heuristic_1,
     }
 )
 @triton.jit

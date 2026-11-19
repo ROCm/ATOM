@@ -57,6 +57,7 @@ def _write_ple_conv_candidates(
     HISTORY: tl.constexpr,
     STATE_SLOT_STRIDE: tl.constexpr,
     STATE_CHANNEL_STRIDE: tl.constexpr,
+    STATE_HISTORY_STRIDE: tl.constexpr,
     IN_STRIDE: tl.constexpr,
     SLOT_ROW_STRIDE: tl.constexpr,
     SLOT_COL_STRIDE: tl.constexpr,
@@ -68,20 +69,19 @@ def _write_ple_conv_candidates(
     j = tl.arange(0, BLOCK_HISTORY)
     src = tl.load(In + req * IN_STRIDE)
     has = tl.load(Has + req) & (src >= 0)
-    for reverse in tl.static_range(1, QUERY):
-        prefix = QUERY - reverse
+    # A candidate slot may also contain the committed input history.
+    # Read this request/channel tile once before publishing any candidates.
+    prior = tl.load(
+        State + src * STATE_SLOT_STRIDE + c[:, None] * STATE_CHANNEL_STRIDE
+        + j[None, :] * STATE_HISTORY_STRIDE,
+        has & (c[:, None] < CHANNELS) & (j[None, :] < HISTORY), 0,
+    )
+    for prefix in tl.static_range(1, QUERY + 1):
         dst = tl.load(Slots + req * SLOT_ROW_STRIDE + (prefix - 1) * SLOT_COL_STRIDE)
         position = prefix - HISTORY + j[None, :]
         valid = (dst >= 0) & (c[:, None] < CHANNELS) & (j[None, :] < HISTORY)
-        old = tl.load(
-            State
-            + src * STATE_SLOT_STRIDE
-            + c[:, None] * STATE_CHANNEL_STRIDE
-            + HISTORY
-            + position,
-            valid & has & (position < 0),
-            0,
-        )
+        old_index = tl.broadcast_to((prefix + j[None, :]) % BLOCK_HISTORY, (BLOCK_CHANNELS, BLOCK_HISTORY))
+        old = tl.gather(prior, old_index, axis=1)
         token = tl.load(
             Inputs + (req * QUERY + position) * CHANNELS + c[:, None],
             valid & (position >= 0),
@@ -91,7 +91,7 @@ def _write_ple_conv_candidates(
             State
             + dst * STATE_SLOT_STRIDE
             + c[:, None] * STATE_CHANNEL_STRIDE
-            + j[None, :],
+            + j[None, :] * STATE_HISTORY_STRIDE,
             tl.where(position >= 0, token, old),
             valid,
         )
@@ -152,6 +152,9 @@ def _rtp_apply_ple(self: Qwen4ExpDecoderLayer, hidden_states, input_ids):
     spec_slots = getattr(ple_metadata, "rtp_spec_state_indices", None)
     if spec_slots is None:
         return Qwen4ExpDecoderLayer._apply_ple(self, hidden_states, input_ids)
+    ngram_spec_slots = getattr(ple_metadata, "rtp_ngram_spec_state_indices", None)
+    if ngram_spec_slots is None or ngram_spec_slots.shape != spec_slots.shape:
+        raise ValueError("Qwen4Exp RTP MTP ngram candidate slots are missing")
 
     # The input block can alias the first output block. Compute the full
     # contribution once, then write shorter snapshots in descending order so
@@ -170,8 +173,8 @@ def _rtp_apply_ple(self: Qwen4ExpDecoderLayer, hidden_states, input_ids):
         input_ids,
         ple_metadata.query_start_loc,
         ple_metadata.ngram_state,
-        ple_metadata.state_indices_in,
-        ple_metadata.state_indices_out,
+        ple_metadata.ngram_indices_in,
+        ple_metadata.ngram_indices_out,
         ple_metadata.has_initial_state,
         ple.ple_embedding.eos_token_id,
         history_width=width,
@@ -189,17 +192,18 @@ def _rtp_apply_ple(self: Qwen4ExpDecoderLayer, hidden_states, input_ids):
         ple_metadata.state_indices_out,
         ple_metadata.has_initial_state,
         ple_metadata.num_accepted_tokens,
+        update_state=False,
     )
     if batch_size:
         _write_ple_ngram_candidates[(batch_size,)](
             input_ids,
             ngram_context,
             ple_metadata.ngram_state,
-            spec_slots,
+            ngram_spec_slots,
             ple_metadata.ngram_state.stride(0),
             ple_metadata.ngram_state.stride(1),
-            spec_slots.stride(0),
-            spec_slots.stride(1),
+            ngram_spec_slots.stride(0),
+            ngram_spec_slots.stride(1),
             query_len,
             width,
             triton.next_power_of_2(width),
@@ -218,6 +222,7 @@ def _rtp_apply_ple(self: Qwen4ExpDecoderLayer, hidden_states, input_ids):
             history,
             ple_metadata.conv_state.stride(0),
             ple_metadata.conv_state.stride(1),
+            ple_metadata.conv_state.stride(2),
             ple_metadata.state_indices_in.stride(0),
             spec_slots.stride(0),
             spec_slots.stride(1),

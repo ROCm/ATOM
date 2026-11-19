@@ -95,7 +95,6 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
         atom_model: Any,
         fmha_config=None,
         py_hw_kernel_config=None,
-        device_resource_config=None,
     ) -> None:
         super().__init__(
             model_config,
@@ -104,7 +103,6 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
             max_generate_batch_size=max_generate_batch_size,
             fmha_config=fmha_config,
             py_hw_kernel_config=py_hw_kernel_config,
-            device_resource_config=device_resource_config,
         )
         self.model = atom_model
         first_param = next(self.model.parameters(), None)
@@ -832,7 +830,6 @@ class ATOMQwen35Moe(BaseModel):
             max_generate_batch_size=self.max_generate_batch_size,
             fmha_config=self.fmha_config,
             py_hw_kernel_config=self.hw_kernel_config,
-            device_resource_config=self.device_resource_config,
             atom_model=atom_model,
         )
         logger.info("Created ATOM qwen3.5-moe runtime for rtp-llm plugin mode")

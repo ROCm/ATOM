@@ -623,6 +623,8 @@ class Qwen4ExpPLELayer(nn.Module):
         state_indices_out: torch.Tensor,
         has_initial_state: torch.Tensor,
         num_accepted_tokens: torch.Tensor | None = None,
+        *,
+        update_state: bool = True,
     ) -> torch.Tensor:
         """One flat varlen path for prefill, decode and graph padding."""
         return dilated_causal_conv1d(
@@ -635,6 +637,7 @@ class Qwen4ExpPLELayer(nn.Module):
             has_initial_state,
             self.short_conv_dilation,
             num_accepted_tokens,
+            update_state=update_state,
         )
 
     def gated_memory(
@@ -704,8 +707,8 @@ class Qwen4ExpPLELayer(nn.Module):
             input_ids,
             metadata.query_start_loc,
             metadata.ngram_state,
-            metadata.state_indices_in,
-            metadata.state_indices_out,
+            metadata.ngram_indices_in if metadata.ngram_indices_in is not None else metadata.state_indices_in,
+            metadata.ngram_indices_out if metadata.ngram_indices_out is not None else metadata.state_indices_out,
             metadata.has_initial_state,
             self.ple_embedding.eos_token_id,
             history_width=self.ple_embedding.ngram_size - 1,

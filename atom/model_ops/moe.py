@@ -1223,6 +1223,16 @@ def rocm_aiter_fused_moe_impl(
     activation_ = ActivationType(activation)
     quant_type_ = QuantType(quant_type)
 
+    from atom.model_ops.qwen38_moe_dispatch import maybe_small_decode
+
+    candidate = maybe_small_decode(
+        hidden_states, w1, w2, topk_weight, topk_ids, expert_mask,
+        activation_, quant_type_, doweight_stage1, w1_scale, w2_scale,
+        a1_scale, a2_scale, swiglu_limit, gate_mode, scheduled_tokens_gpu,
+    )
+    if candidate is not None:
+        return candidate
+
     return fused_moe(
         hidden_states,
         w1,

@@ -137,10 +137,13 @@ def _qsa_store_rows_fp8_kernel(
     scale_ptr,
     slots_ptr,
     values_ptr,
+    stride_cache_page,
     stride_cache_slot,
     stride_cache_head,
+    stride_scale_page,
     stride_scale_slot,
     stride_scale_head,
+    page_size,
     stride_value_row,
     stride_value_head,
     second_cache_ptr,
@@ -165,8 +168,10 @@ def _qsa_store_rows_fp8_kernel(
     if not valid:
         return
     slot = slot.to(tl.int64)
-    cache_offset = slot * stride_cache_slot + head * stride_cache_head + dims
-    scale_offset = slot * stride_scale_slot + head * stride_scale_head
+    page = slot // page_size
+    row_in_page = slot % page_size
+    cache_offset = page * stride_cache_page + row_in_page * stride_cache_slot + head * stride_cache_head + dims
+    scale_offset = page * stride_scale_page + row_in_page * stride_scale_slot + head * stride_scale_head
     x = tl.load(
         values_ptr + row * stride_value_row + head * stride_value_head + dims,
         mask=dims < HEAD_DIM,
@@ -279,8 +284,6 @@ def qsa_store_quantized_rows(
         raise ValueError("slots or heads disagree with the cache")
     if values.stride(-1) != 1 or cache.stride(-1) != 1:
         raise ValueError("quantized QSA rows must be contiguous in the head dim")
-    flat = cache.view(cache.shape[0] * cache.shape[1], heads, cache.shape[3])
-    flat_scale = scale.view(scale.shape[0] * scale.shape[1], *scale.shape[2:])
     if fmt == _FMT_FP8:
         if cache.shape[3] != head_dim:
             raise ValueError("values and FP8 cache disagree on head_dim")
@@ -293,23 +296,26 @@ def qsa_store_quantized_rows(
         ):
             raise ValueError("the second FP8 tensor must mirror the first")
         _qsa_store_rows_fp8_kernel[(rows, heads)](
-            flat,
-            flat_scale,
+            cache,
+            scale,
             slots,
             values,
-            flat.stride(0),
-            flat.stride(1),
-            flat_scale.stride(0),
-            flat_scale.stride(1),
+            cache.stride(0),
+            cache.stride(1),
+            cache.stride(2),
+            scale.stride(0),
+            scale.stride(1),
+            scale.stride(2),
+            cache.shape[1],
             values.stride(0),
             values.stride(1),
-            second_cache if second else flat,
-            second_scale if second else flat_scale,
+            second_cache if second else cache,
+            second_scale if second else scale,
             second_values if second else values,
             second_values.stride(0) if second else 0,
             second_values.stride(1) if second else 0,
             rows,
-            flat.shape[0],
+            cache.shape[0] * cache.shape[1],
             HEAD_DIM=head_dim,
             BLOCK_D=triton.next_power_of_2(head_dim),
             FP8_MAX_C=FP8_MAX,
@@ -317,6 +323,8 @@ def qsa_store_quantized_rows(
             num_warps=4,
         )
         return
+    flat = cache.view(cache.shape[0] * cache.shape[1], heads, cache.shape[3])
+    flat_scale = scale.view(scale.shape[0] * scale.shape[1], *scale.shape[2:])
     if second_cache is not None:
         raise ValueError("only the FP8 writer takes a second tensor")
     if cache.shape[3] * 2 != head_dim or head_dim % FP4_GROUP:
@@ -670,7 +678,8 @@ def _qsa_store_rows_kernel(
     cache_ptr,
     slots_ptr,
     values_ptr,
-    stride_cache_slot,
+    stride_cache_page,
+    stride_cache_token,
     stride_cache_head,
     stride_cache_dim,
     stride_value_row,
@@ -678,6 +687,7 @@ def _qsa_store_rows_kernel(
     stride_value_dim,
     num_rows,
     num_slots,
+    PAGE_SIZE: tl.constexpr,
     NUM_HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -703,7 +713,8 @@ def _qsa_store_rows_kernel(
         cache_ptr
         # A physical slot times the per-slot stride overflows int32 well
         # inside a normal pool size, so widen before multiplying.
-        + slot.to(tl.int64) * stride_cache_slot
+        + (slot.to(tl.int64) // PAGE_SIZE) * stride_cache_page
+        + (slot % PAGE_SIZE) * stride_cache_token
         + head * stride_cache_head
         + dims * stride_cache_dim,
         values,
@@ -734,20 +745,21 @@ def qsa_store_rows(
     if slots.shape[0] < rows:
         raise ValueError("slot mapping is shorter than the value rows")
 
-    flat = cache.view(cache.shape[0] * cache.shape[1], cache.shape[2], cache.shape[3])
     head_dim = values.shape[2]
     _qsa_store_rows_kernel[(rows, values.shape[1])](
-        flat,
+        cache,
         slots,
         values,
-        flat.stride(0),
-        flat.stride(1),
-        flat.stride(2),
+        cache.stride(0),
+        cache.stride(1),
+        cache.stride(2),
+        cache.stride(3),
         values.stride(0),
         values.stride(1),
         values.stride(2),
         rows,
-        flat.shape[0],
+        cache.shape[0] * cache.shape[1],
+        PAGE_SIZE=cache.shape[1],
         NUM_HEADS=values.shape[1],
         HEAD_DIM=head_dim,
         BLOCK_D=triton.next_power_of_2(head_dim),
@@ -951,6 +963,326 @@ def qsa_compress_groups(
         ROPE_POSITION_OFFSET=0 if load_positions else rope_position_offset,
         num_warps=4,
     )
+    return pooled, first_positions
+
+
+@triton.jit
+def _qsa_compress_state_ring_kernel(
+    raw_ptr,
+    state_ptr,
+    table_ptr,
+    read_pages_ptr,
+    request_ptr,
+    position_ptr,
+    compressed_ptr,
+    pooled_ptr,
+    first_ptr,
+    coordinates_ptr,
+    position_cache_ptr,
+    position_table_ptr,
+    position_read_pages_ptr,
+    coordinate_stride_row,
+    coordinate_stride_axis,
+    pos_cache_stride_page,
+    pos_cache_stride_row,
+    pos_table_stride_request,
+    pos_table_stride_page,
+    pos_table_width,
+    pos_pages,
+    read_pages_stride,
+    position_read_pages_stride,
+    raw_stride_row,
+    raw_stride_dim,
+    state_stride_page,
+    state_stride_row,
+    table_stride_request,
+    table_stride_page,
+    pooled_stride_row,
+    first_stride_row,
+    rows,
+    pages,
+    TABLE_WIDTH: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    RING_ROWS: tl.constexpr,
+    RATIO: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    ROPE_OFFSET: tl.constexpr,
+    SPEC: tl.constexpr,
+    HAS_COORDINATES: tl.constexpr,
+):
+    row = tl.program_id(0)
+    dims = tl.arange(0, BLOCK_D)
+    request = tl.load(request_ptr + row)
+    end = tl.load(position_ptr + row)
+    slot = tl.load(compressed_ptr + row)
+    valid = (row < rows) & (slot >= 0) & (end >= RATIO - 1)
+    first = end - RATIO + 1
+    accumulator = tl.zeros((BLOCK_D,), tl.float32)
+    if valid:
+        for offset in tl.static_range(RATIO):
+            source_pos = first + offset
+            source_row = row - (RATIO - 1 - offset)
+            in_batch = source_row >= 0
+            if in_batch:
+                source_request = tl.load(request_ptr + source_row)
+                source_logical = tl.load(position_ptr + source_row)
+                in_batch = (source_request == request) & (source_logical == source_pos)
+            value = tl.zeros((BLOCK_D,), tl.float32)
+            if in_batch:
+                value = tl.load(
+                    raw_ptr + source_row * raw_stride_row + dims * raw_stride_dim,
+                    dims < HEAD_DIM, 0,
+                ).to(tl.float32)
+            else:
+                if SPEC:
+                    page = tl.load(read_pages_ptr + request * read_pages_stride)
+                else:
+                    logical_page = source_pos // PAGE_SIZE
+                    page = tl.load(
+                        table_ptr + request * table_stride_request
+                        + tl.minimum(logical_page, TABLE_WIDTH - 1) * table_stride_page,
+                        logical_page < TABLE_WIDTH, -1,
+                    )
+                value = tl.load(
+                    state_ptr + tl.maximum(page, 0).to(tl.int64) * state_stride_page
+                    + (source_pos % RING_ROWS) * state_stride_row + dims,
+                    (page >= 0) & (page < pages) & (dims < HEAD_DIM), 0,
+                ).to(tl.float32)
+            accumulator += value
+    tl.store(pooled_ptr + row * pooled_stride_row + dims,
+             accumulator / RATIO, (row < rows) & (dims < HEAD_DIM))
+    axis = tl.arange(0, 4)
+    if HAS_COORDINATES:
+        coordinates = tl.full((4,), 0, tl.int64)
+        if valid:
+            source_row = row - RATIO + 1
+            in_batch = source_row >= 0
+            if in_batch:
+                in_batch = ((tl.load(request_ptr + source_row) == request)
+                            & (tl.load(position_ptr + source_row) == first))
+            if in_batch:
+                coordinates = tl.load(
+                    coordinates_ptr + source_row * coordinate_stride_row
+                    + axis * coordinate_stride_axis, axis < 3, 0,
+                ).to(tl.int64)
+            else:
+                if SPEC:
+                    pos_page = tl.load(position_read_pages_ptr + request * position_read_pages_stride)
+                else:
+                    logical_page = first // PAGE_SIZE
+                    pos_page = tl.load(
+                        position_table_ptr + request * pos_table_stride_request
+                        + logical_page * pos_table_stride_page,
+                        logical_page < pos_table_width, -1,
+                    )
+                coordinates = tl.load(
+                    position_cache_ptr + tl.maximum(pos_page, 0).to(tl.int64)
+                    * pos_cache_stride_page + (first % RING_ROWS)
+                    * pos_cache_stride_row + axis,
+                    (pos_page > 0) & (pos_page < pos_pages) & (axis < 3), 0,
+                ).to(tl.int64)
+        tl.store(first_ptr + row * first_stride_row + axis, coordinates, axis < 3)
+    else:
+        tl.store(first_ptr + row * first_stride_row + axis,
+                 tl.where(valid, first + ROPE_OFFSET, 0), axis < 3)
+
+
+@triton.jit
+def _qsa_commit_state_ring_kernel(
+    state_ptr,
+    slots_ptr,
+    raw_ptr,
+    request_ptr,
+    position_ptr,
+    state_stride_page,
+    state_stride_row,
+    raw_stride_row,
+    raw_stride_dim,
+    rows,
+    RING_ROWS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    row = tl.program_id(0)
+    slot = tl.load(slots_ptr + row)
+    request = tl.load(request_ptr + row)
+    position = tl.load(position_ptr + row)
+    live = (row < rows) & (slot >= 0) & (position >= 0)
+    # A long prefill writes only the final occurrence of each ring offset in
+    # each logical page. Every slot therefore has exactly one writer.
+    later = row + RING_ROWS
+    if later < rows:
+        later_request = tl.load(request_ptr + later)
+        later_position = tl.load(position_ptr + later)
+        if (later_request == request) & (later_position == position + RING_ROWS):
+            later_slot = tl.load(slots_ptr + later)
+            if later_slot == slot:
+                live = False
+    if live:
+        dims = tl.arange(0, BLOCK_D)
+        value = tl.load(raw_ptr + row * raw_stride_row + dims * raw_stride_dim,
+                        dims < HEAD_DIM, 0)
+        page = slot // RING_ROWS
+        offset = slot % RING_ROWS
+        tl.store(state_ptr + page.to(tl.int64) * state_stride_page
+                 + offset * state_stride_row + dims, value, dims < HEAD_DIM)
+
+
+@triton.jit
+def _qsa_commit_spec_state_ring_kernel(
+    state_ptr,
+    source_ptr,
+    candidate_pages_ptr,
+    raw_ptr,
+    position_ptr,
+    state_stride_page,
+    state_stride_row,
+    candidate_stride_request,
+    candidate_stride_step,
+    source_stride_request,
+    source_stride_row,
+    raw_stride_row,
+    raw_stride_dim,
+    QUERY: tl.constexpr,
+    RING_ROWS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    request = tl.program_id(0)
+    candidate = tl.program_id(1)
+    page = tl.load(candidate_pages_ptr + request * candidate_stride_request + candidate * candidate_stride_step)
+    end = tl.load(position_ptr + request * QUERY + candidate)
+    start = tl.load(position_ptr + request * QUERY)
+    ring = tl.arange(0, RING_ROWS)
+    positions = end - RING_ROWS + 1 + ring
+    dims = tl.arange(0, BLOCK_D)
+    from_batch = positions >= start
+    raw_rows = request * QUERY + positions - start
+    current = tl.load(
+        raw_ptr + raw_rows[:, None] * raw_stride_row + dims[None, :] * raw_stride_dim,
+        (page > 0) & (end >= 0) & from_batch[:, None] & (dims[None, :] < HEAD_DIM),
+        0,
+    )
+    previous = tl.load(
+        source_ptr + request * source_stride_request
+        + (positions % RING_ROWS)[:, None] * source_stride_row + dims[None, :],
+        (page > 0) & (end >= 0) & (~from_batch)[:, None]
+        & (positions[:, None] >= 0) & (dims[None, :] < HEAD_DIM),
+        0,
+    )
+    tl.store(
+        state_ptr + page.to(tl.int64) * state_stride_page
+        + (positions % RING_ROWS)[:, None] * state_stride_row + dims[None, :],
+        tl.where(from_batch[:, None], current, previous),
+        (page > 0) & (end >= 0) & (positions[:, None] >= 0)
+        & (dims[None, :] < HEAD_DIM),
+    )
+
+
+def qsa_compress_state_ring(
+    raw_keys: torch.Tensor,
+    state_cache: torch.Tensor,
+    state_table: torch.Tensor,
+    state_slots: torch.Tensor,
+    token_to_request: torch.Tensor,
+    logical_positions: torch.Tensor,
+    compressed_slots: torch.Tensor,
+    compress_ratio: int,
+    page_size: int,
+    rope_position_offset: int = 0,
+    state_read_pages: torch.Tensor | None = None,
+    state_candidate_pages: torch.Tensor | None = None,
+    *,
+    positions: torch.Tensor | None = None,
+    position_cache: torch.Tensor | None = None,
+    position_table: torch.Tensor | None = None,
+    position_slots: torch.Tensor | None = None,
+    position_read_pages: torch.Tensor | None = None,
+    position_candidate_pages: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Read incomplete groups from the native FP32 state ring, then commit it."""
+    if raw_keys.ndim != 3 or raw_keys.shape[1] != 1:
+        raise ValueError("QSA raw keys must be [rows, 1, head_dim]")
+    if state_cache.ndim != 4 or state_cache.dtype != torch.float32:
+        raise ValueError("QSA indexer_state must be a FP32 paged ring")
+    rows, _, head_dim = raw_keys.shape
+    ring_rows = int(state_cache.shape[1])
+    if ring_rows < compress_ratio or ring_rows % compress_ratio:
+        raise ValueError("QSA state ring must contain complete compression groups")
+    pooled = torch.empty_like(raw_keys)
+    first_positions = torch.empty((rows, 3), dtype=torch.int64, device=raw_keys.device)
+    speculative = state_candidate_pages is not None
+    if speculative:
+        if state_read_pages is None or state_candidate_pages.ndim != 2:
+            raise ValueError("QSA target verify needs source and candidate state pages")
+        requests, query_len = state_candidate_pages.shape
+        if rows != requests * query_len or state_read_pages.numel() != requests:
+            raise ValueError("QSA target state pages do not match verify tokens")
+    has_coordinates = position_cache is not None
+    if has_coordinates and (
+        positions is None or positions.shape != (rows, 1, 3)
+        or position_table is None or position_slots is None
+        or position_cache.shape[1:] != (ring_rows, 1, 3)
+        or position_cache.stride(-1) != 1
+        or (speculative and (position_read_pages is None
+                             or position_candidate_pages is None))
+    ):
+        raise ValueError("QSA MRoPE state needs coordinates and its own page mappings")
+    if rows:
+        _qsa_compress_state_ring_kernel[(rows,)](
+            raw_keys, state_cache, state_table,
+            state_read_pages if speculative else state_table,
+            token_to_request,
+            logical_positions, compressed_slots, pooled, first_positions,
+            positions if has_coordinates else raw_keys,
+            position_cache if has_coordinates else state_cache,
+            position_table if has_coordinates else state_table,
+            position_read_pages if has_coordinates and speculative else state_table,
+            positions.stride(0) if has_coordinates else 0,
+            positions.stride(2) if has_coordinates else 0,
+            position_cache.stride(0) if has_coordinates else 0,
+            position_cache.stride(1) if has_coordinates else 0,
+            position_table.stride(0) if has_coordinates else 0,
+            position_table.stride(1) if has_coordinates else 0,
+            position_table.shape[1] if has_coordinates else 0,
+            position_cache.shape[0] if has_coordinates else 0,
+            state_read_pages.stride(0) if speculative else 0,
+            position_read_pages.stride(0) if has_coordinates and speculative else 0,
+            raw_keys.stride(0), raw_keys.stride(2),
+            state_cache.stride(0), state_cache.stride(1),
+            state_table.stride(0), state_table.stride(1),
+            pooled.stride(0), first_positions.stride(0), rows,
+            state_cache.shape[0], TABLE_WIDTH=_table_width_bucket(state_table.shape[1]),
+            PAGE_SIZE=page_size, RING_ROWS=ring_rows, RATIO=compress_ratio,
+            HEAD_DIM=head_dim, BLOCK_D=triton.next_power_of_2(head_dim),
+            ROPE_OFFSET=rope_position_offset, SPEC=speculative,
+            HAS_COORDINATES=has_coordinates, num_warps=4,
+        )
+        def commit(values, cache, slots, read_pages, candidate_pages):
+            width = values.shape[-1]
+            if speculative:
+                source = cache.index_select(0, read_pages.to(torch.int64))
+                _qsa_commit_spec_state_ring_kernel[(requests, query_len)](
+                    cache, source, candidate_pages, values,
+                    logical_positions, cache.stride(0), cache.stride(1),
+                    candidate_pages.stride(0), candidate_pages.stride(1),
+                    source.stride(0), source.stride(1), values.stride(0),
+                    values.stride(2), query_len, ring_rows, width,
+                    triton.next_power_of_2(width), num_warps=4,
+                )
+            else:
+                _qsa_commit_state_ring_kernel[(rows,)](
+                    cache, slots, values, token_to_request,
+                    logical_positions, cache.stride(0), cache.stride(1),
+                    values.stride(0), values.stride(2), rows,
+                    RING_ROWS=ring_rows, HEAD_DIM=width,
+                    BLOCK_D=triton.next_power_of_2(width), num_warps=4,
+                )
+
+        commit(raw_keys, state_cache, state_slots, state_read_pages, state_candidate_pages)
+        if has_coordinates:
+            commit(positions, position_cache, position_slots, position_read_pages, position_candidate_pages)
     return pooled, first_positions
 
 
