@@ -176,3 +176,37 @@ def test_a_rolled_fused_moe_is_a_build_of_its_own(rows, rolled):
     kernel = build_moe(rows, rolled=rolled)
     assert kernel.name.startswith(f"k3_gfx1250_moe_s{rows}_")
     assert kernel.name.endswith("_rl") == rolled
+
+
+@pytest.mark.parametrize("rows", (1, 16, 40, 48, 56, 64))
+def test_the_fused_moe_runs_wide_on_zeroed_padding_by_default(rows, monkeypatch):
+    from atom.models.kimi_k3.mono.kernels.stages.moe_tdm_gfx1250 import build_moe
+
+    monkeypatch.delenv("ATOM_KIMI_MONO_FUSED_MOE_WIDE", raising=False)
+    monkeypatch.delenv("ATOM_KIMI_MONO_FUSED_MOE_ZERO_PAD", raising=False)
+    monkeypatch.delenv("ATOM_KIMI_MONO_ROLLED_MOE", raising=False)
+    name = build_moe(rows).name
+    assert name.endswith("_w_z_rl")
+    assert name == build_moe(rows, wide=True, zero_pad=True).name
+
+
+@pytest.mark.parametrize("wide", ("0", "1"))
+@pytest.mark.parametrize("zero_pad", ("0", "1"))
+def test_the_fused_moe_switches_turn_wide_and_zeroed_padding_off(
+    wide, zero_pad, monkeypatch
+):
+    from atom.models.kimi_k3.mono.kernels.stages.moe_tdm_gfx1250 import build_moe
+
+    monkeypatch.setenv("ATOM_KIMI_MONO_FUSED_MOE_WIDE", wide)
+    monkeypatch.setenv("ATOM_KIMI_MONO_FUSED_MOE_ZERO_PAD", zero_pad)
+    name = build_moe(40).name
+    assert ("_w_" in name) == (wide == "1")
+    assert ("_z_" in name) == (zero_pad == "1")
+
+
+def test_an_unrolled_fused_moe_zeroes_padding_on_six_waves():
+    from atom.models.kimi_k3.mono.kernels.stages.moe_tdm_gfx1250 import build_moe
+
+    name = build_moe(40, rolled=False, wide=True, zero_pad=True).name
+    assert "_w" not in name
+    assert name.endswith("_z")

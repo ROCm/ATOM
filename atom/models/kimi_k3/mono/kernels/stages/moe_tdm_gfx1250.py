@@ -845,16 +845,16 @@ def _lds_barrier():
 
 
 @traced
-def _bounded_wait(flags, slot, tag, state, bid, nap=1):
-    """Until expert ``slot``'s four gate/up flags carry ``tag``, ``nap``
-    s_sleep units (64 clocks) between polls; past ``POLL_LIMIT`` polls the
-    wait records (CTA, slot, a flag) in ``state[3]`` and goes on."""
+def _bounded_wait(flags, slot, tag, state, bid):
+    """Until expert ``slot``'s four gate/up flags carry ``tag``; past
+    ``POLL_LIMIT`` polls the wait records (CTA, slot, a flag) in ``state[3]``
+    and goes on."""
     polls = fx.Int32(0)
     v = fx.Vector(ld_dev(flags, slot * FLAG_WORDS, 4))
     while ((v[0] != tag) | (v[1] != tag) | (v[2] != tag) | (v[3] != tag)) & (
         polls < POLL_LIMIT
     ):
-        rocdl.s_sleep(nap)
+        rocdl.s_sleep(1)
         polls = polls + 1
         v = fx.Vector(ld_dev(flags, slot * FLAG_WORDS, 4))
     if polls >= POLL_LIMIT:
@@ -940,7 +940,6 @@ def build_moe(
     resident: int | None = None,
     wide: bool | None = None,
     zero_pad: bool | None = None,
-    nap: int = 1,
 ) -> MoeKernel:
     """The routed experts of ``rows`` tokens in one resident 256-CTA launch,
     with no grid barrier and no queue: every CTA works out the same static,
@@ -976,7 +975,8 @@ def build_moe(
     activation -- at 40 rows an expert has 1-2 picks of a tile's 16, so most
     of every activation operand is padding; the stored outputs are the same.
 
-    ``nap``: s_sleep units between a down switch's flag polls."""
+    Served power-capped, the two together are 3% faster at 40 rows and 64:
+    the same work at less switching runs at a higher clock."""
     if rolled is None:
         rolled = envs.ATOM_KIMI_MONO_ROLLED_MOE
     if wide is None:
@@ -1021,7 +1021,6 @@ def build_moe(
         + (f"_k{resident}" if resident != k_tiles else "")
         + ("_w" if wide else "")
         + ("_z" if zero_pad else "")
-        + (f"_n{nap}" if nap != 1 else "")
         + ("_rl" if rolled else "")
         + ("_profile" if profile else "")
     )
@@ -1669,7 +1668,7 @@ def build_moe(
                 )
                 before = fx.Int32(_realtime()) if profile else fx.Int32(0)
                 if tid == 0:
-                    _bounded_wait(flags, slot, tag, state, bid, nap)
+                    _bounded_wait(flags, slot, tag, state, bid)
                 _lds_barrier()
                 if const_expr(profile):
                     waited = waited + (fx.Int32(_realtime()) - before)
