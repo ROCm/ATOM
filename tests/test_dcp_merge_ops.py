@@ -1253,7 +1253,10 @@ def test_sparse_prefill_nonps_runs_one_split(dcp):
 
 
 @pytest.mark.parametrize("nonps, plans", [(True, 0), (False, 1)])
-def test_pcp_reindex_builds_work_plan_only_when_read(monkeypatch, nonps, plans):
+@pytest.mark.parametrize("padded_heads,prefill_heads", [(64, 64), (128, 96)])
+def test_pcp_reindex_builds_work_plan_only_when_read(
+    monkeypatch, nonps, plans, padded_heads, prefill_heads
+):
     """Under PCP the owned-query reindex rebuilds the sparse-prefill work plan;
     the non-persistent kernel reads none, so it must not be built or attached."""
     try:
@@ -1272,7 +1275,8 @@ def test_pcp_reindex_builds_work_plan_only_when_read(monkeypatch, nonps, plans):
         index_topk=2048,
         dcp_sparse_prefill_nonps=nonps,
         dcp_world_size=1,
-        padded_num_attention_heads=64,
+        padded_num_attention_heads=padded_heads,
+        sparse_prefill_num_heads=prefill_heads,
         block_size=1,
         dtype_q=None,
         dtype_kv=None,
@@ -1298,6 +1302,8 @@ def test_pcp_reindex_builds_work_plan_only_when_read(monkeypatch, nonps, plans):
         builder, md, 4, np.array([1, 2, 3, 4]), ""
     )
     assert len(built) == plans
+    if plans:
+        assert built[0][3] == prefill_heads
     assert hasattr(md, "sparse_prefill_work_meta_data") == bool(plans)
     assert md.sparse_cu_seqlens_q.tolist() == [0, 1, 2]  # rank 0 owns q0, q2
 

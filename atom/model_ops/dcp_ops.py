@@ -799,7 +799,10 @@ def cp_lse_a2a(
     head_major=False,
     payload_dtype=None,
 ):
-    """A2A backend: pack -> one all-to-all -> local LSE combine.
+    """A2A backend: exchange partial outputs and LSE, then combine locally.
+
+    Packed output and LSE share one all-to-all; head-major output uses a
+    separate all-to-all for its LSE and optional quantization scale.
 
     Drop-in for ``cp_lse_ag_out_rs``: same inputs, same ``[B, H_local, D]``
     output, same head ownership.
@@ -1218,7 +1221,7 @@ def dcp_lse_merge(
         cp_attn_out = cp_attn_out.transpose(0, 1)
     if owned_counts is not None:
         # AG+RS has no existing kernel before its LSE AllGather. The default
-        # A2A path above fuses this mask and remains launch-free.
+        # Packed A2A folds the mask into its pack; head-major A2A masks its LSE.
         cp_attn_lse = mask_empty_dcp_lse(cp_attn_lse, owned_counts)
     return cp_lse_ag_out_rs(cp_attn_out, cp_attn_lse, cp_group, ctx=ctx)
 

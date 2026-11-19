@@ -2723,7 +2723,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self._sparse_prefill_work_plan(
             attn_metadata,
             prefix,
-            self.padded_num_attention_heads,
+            self.sparse_prefill_num_heads,
             var["sparse_kv_last_page_lens"].gpu[:n_owned],
         )
 

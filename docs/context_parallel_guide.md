@@ -433,12 +433,13 @@ LSE through two 16-bit halves of a bf16 buffer).
 | Value | Pattern | Collectives |
 |-------|---------|-------------|
 | `auto` (default) | `mailbox` on gfx950 with DCP > 1 when decode TBO and plugin mode are off, `a2a` otherwise; the choice is logged at startup | |
-| `a2a` | one all-to-all with the LSE packed alongside the output, combine done locally | **1** |
+| `a2a` | packed output and LSE share one all-to-all; head-major prefill exchanges output and LSE/scales separately, then combines locally | 1 packed / 2 head-major |
 | `ag_rs` | AllGather LSE + local correct + ReduceScatter output | 2 |
 | `mailbox` | decode only: aiter's FlyDSL `dcp_lse_combine`, one launch that stores each owner's rows and LSEs into its IPC-mapped mailbox and combines them there | **0** (no collective launch) |
 
-Byte counts are about the same; what `a2a` saves is one collective's launch and
-sync.
+Packed `a2a` saves one collective launch and synchronization compared with
+`ag_rs`. Head-major prefill instead avoids packing the output and sends its
+LSE and optional FP8 payload scale separately.
 
 `mailbox` needs aiter `78a14ae5d` or later (aiter PR #6972 and #7943) and
 FlyDSL >= 0.5.0. That is required, not detected: an aiter without
@@ -605,17 +606,19 @@ With an **fp8 Q and an fp8 KV cache**, aiter serves gqa=64 only from the
 **persistent** decode kernel and aborts the process otherwise (`asm_mla.cu`:
 *"fp8/fp8 with gqa_ratio=64 only supports persistent mode"*).
 
-Native sparse MLA / DSA attention under DCP handles this, where aiter runs DCP
+Native sparse MLA / DSA **decode** under DCP handles this, where aiter runs DCP
 decode persistent (`dcp_persistent_supported`; validated on gfx950), by rebuilding
-the persistent work/reduce metadata after every **full IndexShare layer**
-compacts its rank-local top-k. The rebuild consumes that layer's
-`dcp_sparse_kv_indptr`; following shared layers reuse the same indices, compact
-indptr, and work plan. This makes the persistent descriptors and the actual
-sparse regions agree without rebuilding metadata on shared layers.
+the persistent work/reduce metadata after each full IndexShare layer compacts its
+rank-local top-k. Following shared layers reuse its indices, compact indptr and
+work plan.
 
-The implementation is scoped to native, non-speculative serving with page size
-1: decode is q_len=1, while sparse prefill is represented as per-token
-virtual q_len=1 rows. Unsupported paths (including gfx942 and plugin or
+Persistent **sparse prefill** builds one work plan per forward at the selected
+prefill head width. Each owning layer patches the plan's KV ranges to its own
+compacted indices; shared layers reuse that plan. The eligible gfx950 FP8 gqa64
+non-persistent prefill path needs neither a work plan nor per-layer patches.
+
+The decode configuration described here is native, non-speculative serving
+with page size 1 and q_len=1. Sparse prefill uses per-token virtual q_len=1 rows. Unsupported paths (including gfx942 and plugin or
 speculative sparse DCP paths without the per-layer rebuild) remain
 non-persistent and round a gathered 64 up to **128**.
 
@@ -627,10 +630,10 @@ metadata rebuild, and page size. A bf16-KV sparse DCP prefill that satisfies
 those reaches gqa=64 directly the same as fp8 does; only a prefill that fails
 one of those (e.g. gfx942, or DCP≤1) still pads to 128.
 
-**GLM-5.2 is the model that benefits**: 64 query heads at `-tp 8` is 8 per
-rank, so `-dcp 8` gathers exactly 64 and now dispatches the native persistent
-gqa64 kernel instead of padding to 128. `-tp 4 -dcp 4` has the same gathered
-width and uses the same persistent gqa64 path.
+GLM-5.2 has 64 query heads: `-tp 8 -dcp 8` and `-tp 4 -dcp 4` both gather
+64 and avoid padding to 128. Decode uses the persistent gqa64 path. Eligible
+FP8 sparse prefill uses the native non-persistent gqa64 kernel by default;
+other eligible sparse-prefill calls use the persistent path.
 
 **Validated** (native ATOM, MI355 gfx950, GLM-5.2-MXFP4, fp8 KV, no
 speculative decode): both `-tp 8 -dcp 8` and `-tp 4 -dcp 4` complete CUDA graph
@@ -747,8 +750,8 @@ MLA rows; see the [recipe](../recipes/DSpark.md)).
 | fp8 KV cache | Supported, **per-tensor scale only** (per-token / per-group not supported) |
 | prefix caching / chunked prefill | Supported (dense and sparse / DSA). On **Kimi-K3** the validated configuration has prefix caching **off**, per its recipe |
 | Kimi-K3 KDA layers | Not sharded — the KDA recurrent state is per-request, not paged, so DCP frees only the MLA share of attention memory |
-| Kimi-K3 gathered head width | Padded to a natively dispatched MLA width (16 / 32 / 64 / 128); past 128 it falls back to the folded kernel with a warning — lower `-dcp` or raise `-tp` |
-| gathered head width 64 | Native sparse / DSA prefill (bf16 or fp8 KV) and q_len=1 decode (fp8 KV) rebuild persistent metadata, where aiter runs DCP decode persistent (validated on gfx950), per full IndexShare layer and run gqa64 directly; unsupported non-persistent paths still pad to 128 — see [Sparse DCP persistent attention and gqa=64](#sparse-dcp-persistent-attention-and-gqa64) |
+| Kimi-K3 gathered head width | Eligible persistent sparse prefill uses native 96 heads at TP8/DCP8. Decode and other prefill routes use their own width tables; widths beyond the native table use the folded kernel. |
+| gathered head width 64 | Eligible decode rebuilds persistent metadata per full IndexShare layer. Persistent sparse prefill plans once per forward and patches per owner; eligible FP8 non-persistent prefill needs no plan. See [Sparse DCP persistent attention and gqa=64](#sparse-dcp-persistent-attention-and-gqa64). |
 | speculative decode (MTP), dense MLA | Supported on **gfx950 only** (bf16/fp8, `num_speculative_tokens` 1–3); raises at startup on gfx942 |
 | speculative decode (DSpark), Kimi-K3 | Supported on gfx950; validated at `tp8 -dcp 8` with `num_speculative_tokens 2` (Inferact MLA draft) and 5 (RadixArk DSpark GQA draft, which runs outside the DCP group) |
 | speculative decode (MTP), sparse / DSA | Supported on **gfx950 only**; validated on GLM-5.2-FP8 at fp8 KV, `num_speculative_tokens=3`, dcp8 |

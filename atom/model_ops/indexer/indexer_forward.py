@@ -438,7 +438,7 @@ def _exchange_stream(indexer, is_prefill):
     """The stream a DCP prefill's top-k exchange (the all-gather and the owner
     filter) runs on, beside the q path, or None to run it in order: an indexer
     the model gave no stream, decode, graph capture and TBO."""
-    stream = getattr(indexer, "exchange_stream", None)
+    stream = indexer.exchange_stream
     if (
         stream is None
         or not is_prefill

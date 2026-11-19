@@ -9,11 +9,11 @@ reads back to write ``q_out[..., :kv_lora_rank]`` as ``cast(x * (1/q_scale))``.
 This kernel keeps the fp32 accumulator and applies that epilogue itself, so the
 intermediate is never written.
 
-AITER's batched_gemm_bf16 supports a strided FP8 output, but no output scale
-or finite-range clamp (aiter 0d894387bbbf, ops/triton/gemm/batched/
-batched_gemm_bf16.py). Its fused BMM/RoPE/cache op instead requires FP8
-weights. Neither preserves this BF16 absorb with arbitrary q_scale; replacing
-this adapter requires that scaled, saturating epilogue in AITER first.
+AITER's ``fused_bf16_bmm_cat_quant_pad_mla`` already supplies the BF16 absorb,
+query scaling and finite-range FP8 clamp. It requires BF16 ``q_pe`` and writes
+the RoPE slice, which this path has already written with
+``fused_qk_rope_concat_and_cache_mla``. Reusing it here needs a NoPE-only mode
+that preserves the prewritten RoPE slice on gfx950.
 
 Numerics: the two-kernel path rounds the accumulator to bf16 before the FP8
 cast, this one does not, and the fp32 reduction order differs. Both only move a
@@ -21,6 +21,9 @@ value across an e4m3 rounding boundary, so the stored code differs by at most
 one e4m3 step. The clamp to the finite FP8 range is the HIP pack's; Triton's
 cast saturates by itself on gfx950 but not on gfx942.
 """
+
+# shortcut: preserve the RoPE slice until AITER provides NoPE-only output.
+# https://github.com/ROCm/aiter/issues/8254
 
 import torch
 import triton

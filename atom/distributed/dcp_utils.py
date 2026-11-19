@@ -168,7 +168,8 @@ def mla_dcp_sparse_prefill_uses_nonps(
 
     Applies with fp8 q/KV, 64 gathered heads, gfx950 and page_size 1 (gfx1250's
     non-persistent decode takes only 64-token pages). It needs
-    no work metadata, so the per-layer `get_mla_metadata_v1` rebuild is skipped.
+    no persistent work plan, so forward planning and per-layer plan patches
+    are both skipped.
     Every prefill token of a step is one q row, so a step budget above
     NONPS_MAX_Q_ROWS stays on the persistent path.
     """
