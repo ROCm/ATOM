@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import functools
 import logging
+import threading
 import time
+from collections import OrderedDict
 from typing import Any
 
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
@@ -38,6 +40,7 @@ from atom.kv_transfer.offload.mooncake_store.config import (
     StorePool,
     check_engine_compatibility,
     parse_mooncake_store_config,
+    store_draft_window,
 )
 from atom.kv_transfer.offload.mooncake_store.keys import (
     DIGEST_BYTES,
@@ -45,10 +48,13 @@ from atom.kv_transfer.offload.mooncake_store.keys import (
     chain_seed,
     chunk_digest,
     chunk_hash_chain,
+    draft_key_prefix,
+    draft_ranks,
     rank_key_prefix,
     store_namespace,
 )
 from atom.model_engine.sequence import SequenceStatus
+from atom.spec_decode.draft_window_geometry import DraftReadWindow
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -74,6 +80,9 @@ _LOOKUP_STATS_INTERVAL_S = 60.0
 _LOOKUP_REUSE_S = 1.0
 # Store lookups an arrival batch may queue at once (`offer_lookups`).
 _MAX_OFFERS_PER_BATCH = 64
+# Uncut hits kept for loads not decided yet (`_StoreLookup.take_uncut_hit`);
+# those of requests that never reach the decision go oldest first.
+_MAX_UNCUT_HITS = 4096
 # After a failed save the base retries, no save is emitted for this long,
 # doubled for each further such failure in a row up to `_SAVE_RETRY_MAX_S`. A
 # stored save ends the pause and starts the doubling over, whenever it reports.
@@ -144,6 +153,12 @@ def prompt_chunk_hashes(seq: Any, chunk_tokens: int) -> bytes:
     return hashes
 
 
+def first_draft_chunk(window: DraftReadWindow, num_prompt: int, chunk: int) -> int:
+    """d0: the first chunk holding draft rows any reader of an `num_prompt`-token
+    prompt reads; the split layout stores draft objects from it on."""
+    return window.first_read_token(num_prompt) // int(chunk)
+
+
 class _PoolLookups:
     """One Store pool as the scheduler's lookups reach it.
 
@@ -200,11 +215,16 @@ class _StoreLookup(LookupClient):
         namespace: str,
         world: int,
         chunk_tokens: int,
+        draft_window: DraftReadWindow | None = None,
+        draft_ranks: range = range(0),
     ) -> None:
         self._cfg = cfg
         self._namespace = namespace
         self._world = int(world)
         self._chunk_tokens = int(chunk_tokens)
+        # The split layout's draft objects (`ATOM_MOONCAKE_STORE_DRAFT_WINDOW`).
+        self._draft_window = draft_window
+        self._draft_ranks = draft_ranks if draft_window is not None else range(0)
         # Exact while every server on these pools puts each rank on the same
         # NIC; see the offload README for what a different placement costs.
         self._pools = [_PoolLookups(pool) for pool in cfg.store_masters()]
@@ -223,7 +243,81 @@ class _StoreLookup(LookupClient):
         self.lookups = 0
         self.uneven_lookups = 0
         self.stranded_objects = 0
+        # Draft keys asked; chunks whose draft object some rank lacks inside a
+        # hit's read window; lookups that window cut at d0 or at a hole past it.
+        self.draft_keys = 0
+        self.draft_missing = 0
+        self.draft_cuts_at_d0 = 0
+        self.draft_cuts_above_d0 = 0
+        # Tokens the cuts made requests prefill, counted as their loads are
+        # decided (`MooncakeStoreOffloadScheduler._count_draft_cut_cost`).
+        self.draft_cut_recompute_tokens = 0
+        # Lookup id -> the hit the window cut, until its load is decided.
+        self._uncut_hits: OrderedDict[str, int] = OrderedDict()
+        self._uncut_lock = threading.Lock()
         self._next_stats_at = time.monotonic() + _LOOKUP_STATS_INTERVAL_S
+
+    def _draft_range(self, seq: Any, chunks: int) -> range:
+        """Chunks `[d0, d1)` whose draft objects a load of `seq` may read: no load
+        takes the prompt's last token (`load_math.loadable_hit`)."""
+        if self._draft_window is None:
+            return range(0)
+        num_prompt = int(seq.num_prompt_tokens)
+        first = first_draft_chunk(self._draft_window, num_prompt, self._chunk_tokens)
+        return range(first, min(chunks, (num_prompt - 1) // self._chunk_tokens))
+
+    def _draft_keys(self, hashes: bytes, chunks: range) -> list[str]:
+        """Every draft rank's keys of `chunks`, rank-major."""
+        digests = [chunk_digest(hashes, index).hex() for index in chunks]
+        keys = []
+        for rank in self._draft_ranks:
+            prefix = draft_key_prefix(self._namespace, rank, self._world)
+            keys += [prefix + digest for digest in digests]
+        return keys
+
+    def _draft_cut(
+        self, draft: range, hit_chunks: int, codes: list[int | None]
+    ) -> int | None:
+        """`hit_chunks` cut at the first chunk of `[d0, hit)` whose draft object
+        some draft rank lacks; None when keys no pool answered decide the cut."""
+        held = bound = hit_chunks
+        missing = 0
+        for index in range(draft.start, min(hit_chunks, draft.stop)):
+            column = codes[index - draft.start :: len(draft)]
+            absent = 0 in column
+            missing += absent
+            if held == hit_chunks and any(code != 1 for code in column):
+                held = index
+            if absent and bound == hit_chunks:
+                bound = index
+        if held != bound:
+            return None
+        self.draft_missing += missing
+        if held == draft.start < hit_chunks:
+            self.draft_cuts_at_d0 += 1
+        elif held < hit_chunks:
+            self.draft_cuts_above_d0 += 1
+        return held
+
+    def _remember_uncut_hit(self, lookup_id: str | None, hit: int | None) -> None:
+        """Keep the hit the window cut from `lookup_id`'s answer; None forgets
+        the one an earlier answer of it left."""
+        if lookup_id is None:
+            return
+        with self._uncut_lock:
+            if hit is None:
+                self._uncut_hits.pop(lookup_id, None)
+                return
+            self._uncut_hits[lookup_id] = int(hit)
+            self._uncut_hits.move_to_end(lookup_id)
+            while len(self._uncut_hits) > _MAX_UNCUT_HITS:
+                self._uncut_hits.popitem(last=False)
+
+    def take_uncut_hit(self, lookup_id: str) -> int | None:
+        """The hit the window cut from `lookup_id`'s last answer, once; None
+        when it cut nothing."""
+        with self._uncut_lock:
+            return self._uncut_hits.pop(lookup_id, None)
 
     def lookup(self, seq: Any, lookup_id: str | None = None) -> int | None:
         """Tokens of ``seq``'s prompt prefix the Store holds on every rank.
@@ -246,6 +340,8 @@ class _StoreLookup(LookupClient):
         for rank in range(self._world):
             prefix = rank_key_prefix(self._namespace, rank, self._world)
             keys += [prefix + digest for digest in digests]
+        draft = self._draft_range(seq, chunks)
+        keys += self._draft_keys(hashes, draft)
         merged = self._ask(keys)
         if merged is None:
             return None
@@ -268,7 +364,33 @@ class _StoreLookup(LookupClient):
                 min(bound),
             )
             return None
-        self._count_lookup(sum(present - hit_chunks for present in held))
+        stranded = sum(present - hit_chunks for present in held)
+        if draft:
+            cut = self._draft_cut(draft, hit_chunks, merged[self._world * chunks :])
+            if cut is None:
+                logger.debug(
+                    "[OFFLOAD-LOOKUP] lookup_id=%s chunks=%d: draft keys no pool "
+                    "answered decide the hit; no answer",
+                    lookup_id,
+                    chunks,
+                )
+                return None
+            self.draft_keys += len(draft) * len(self._draft_ranks)
+            if cut < hit_chunks:
+                logger.debug(
+                    "[OFFLOAD-LOOKUP] lookup_id=%s draft window cut: d0=%d cut=%d "
+                    "hit=%d (chunks)",
+                    lookup_id,
+                    draft.start,
+                    cut,
+                    hit_chunks,
+                )
+            self._remember_uncut_hit(
+                lookup_id,
+                hit_chunks * self._chunk_tokens if cut < hit_chunks else None,
+            )
+            hit_chunks = cut
+        self._count_lookup(stranded)
         hit = hit_chunks * self._chunk_tokens
         logger.debug(
             "[OFFLOAD-LOOKUP] lookup_id=%s chunks=%d keys=%d hit=%d elapsed_ms=%.2f",
@@ -300,6 +422,10 @@ class _StoreLookup(LookupClient):
         for rank in range(self._world):
             prefix = rank_key_prefix(self._namespace, rank, self._world)
             keys += [prefix + digest for digest in digests]
+        if self._draft_window is not None:
+            # And the draft objects the load reads, `[max(start, d0), end)`.
+            d0 = self._draft_range(seq, last).start
+            keys += self._draft_keys(hashes, range(max(first, d0), last))
         answers = [a for a in self._exists_on(pools, keys) if a is not None]
         return sum(1 for codes in zip(*answers) if 1 in codes)
 
@@ -467,8 +593,17 @@ class _StoreLookup(LookupClient):
         if now < self._next_stats_at:
             return
         self._next_stats_at = now + _LOOKUP_STATS_INTERVAL_S
+        draft = (
+            ""
+            if self._draft_window is None
+            else f" draft_keys={self.draft_keys} draft_missing={self.draft_missing}"
+            f" draft_cuts_at_d0={self.draft_cuts_at_d0}"
+            f" draft_cuts_above_d0={self.draft_cuts_above_d0}"
+            f" draft_cut_recompute_tokens={self.draft_cut_recompute_tokens}"
+        )
         logger.info(
-            "[OFFLOAD-LOOKUP-STATS] lookups=%d uneven_lookups=%d stranded_objects=%d",
+            "[OFFLOAD-LOOKUP-STATS] lookups=%d uneven_lookups=%d stranded_objects=%d"
+            + draft,
             self.lookups,
             self.uneven_lookups,
             self.stranded_objects,
@@ -506,19 +641,26 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
         namespace = store_namespace(config, cfg.chunk_tokens)
         self._store_cfg = cfg
         self._namespace = namespace
+        # The split layout's draft read window; None stores the draft rows whole.
+        self._draft_window = store_draft_window(config)
         # time.monotonic() of each request's last lookup; see `_ensure_lookup_pin`.
         self._looked_up_at: dict[str, float] = {}
         # Failed saves since the last stored one, and when saves may resume.
         self._failed_saves_in_a_row = 0
         self._saves_paused_until = 0.0
+        # Answers the lookups and keeps their draft window counters.
+        self._store_lookup = _StoreLookup(
+            cfg,
+            namespace=namespace,
+            world=world,
+            chunk_tokens=cfg.chunk_tokens,
+            draft_window=self._draft_window,
+            draft_ranks=draft_ranks(config),
+        )
         super().__init__(
             config,
             chunk_size=cfg.chunk_tokens,
-            lookup_client=AsyncStoreLookup(
-                _StoreLookup(
-                    cfg, namespace=namespace, world=world, chunk_tokens=cfg.chunk_tokens
-                )
-            ),
+            lookup_client=AsyncStoreLookup(self._store_lookup),
         )
         # The Store reads whole chunks into fresh blocks, so an HBM hit that
         # ends inside a chunk is lowered to the chunk floor
@@ -539,13 +681,19 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
         )
         logger.info(
             "Mooncake Store offload scheduler: namespace=%s world=%d chunk=%d "
-            "masters=%s max_pending_saves=%s abandon_timeout=%.0fs",
+            "masters=%s max_pending_saves=%s abandon_timeout=%.0fs%s",
             namespace,
             world,
             cfg.chunk_tokens,
             ",".join(pool.master for pool in cfg.store_masters()),
             self._max_pending_saves,
             cfg.save_abandon_timeout_s,
+            (
+                ""
+                if self._draft_window is None
+                else f" draft_window={self._draft_window.window}"
+                f" draft_ranks={list(draft_ranks(config))}"
+            ),
         )
 
     def offer_lookups(self, seqs):
@@ -706,6 +854,36 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
             chunk_hashes=hashes[: (aligned // self.chunk_size) * DIGEST_BYTES],
             dispatched_at=time.monotonic(),
             dispatch_clock=monotonic_clock_id(),
+            draft_chunks=self._save_draft_chunks(seq, saved, aligned, block_ids),
+        )
+
+    def _save_draft_chunks(
+        self, seq: Any, saved: int, aligned: int, block_ids: list[int]
+    ) -> tuple[int, int] | None:
+        """The draft objects a save of `[saved, aligned)` puts: the highest run of
+        the prompt's read window `[d0, C)` it covers whose blocks have draft rows."""
+        if self._draft_window is None:
+            return None
+        chunk = self.chunk_size
+        first = max(
+            saved // chunk,
+            first_draft_chunk(self._draft_window, seq.num_prompt_tokens, chunk),
+        )
+        end = start = aligned // chunk
+        while start > first and not self._draft_rows_missing_in(block_ids, start - 1):
+            start -= 1
+        return (start, end) if start < end else None
+
+    def _draft_rows_missing_in(self, block_ids: list[int], index: int) -> bool:
+        """Whether a block of chunk `index` lacks draft rows; True for a block the
+        scheduler cannot see (no block manager, or past the table)."""
+        manager = self._block_manager
+        per_chunk = self.chunk_size // self.virtual_block_size
+        blocks = block_ids[index * per_chunk : (index + 1) * per_chunk]
+        return (
+            manager is None
+            or len(blocks) < per_chunk
+            or any(manager.draft_rows_missing(int(block)) for block in blocks)
         )
 
     def _build_load_request(
@@ -715,15 +893,58 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
         load_operation: LoadOperationId,
         transfer_end: int,
     ) -> LMCacheReqMeta:
-        """Load ``[hbm, transfer_end)``: the digests of ``[0, transfer_end)``."""
+        """Load ``[hbm, transfer_end)``: the digests of ``[0, transfer_end)``.
+
+        Under the split layout the draft objects of ``[max(hbm, d0), transfer_end)``
+        too; the blocks below them get no draft rows (``offload_draft_start_tokens``).
+        """
         hashes = prompt_chunk_hashes(seq, self.chunk_size)
-        return LMCacheReqMeta(
+        request = LMCacheReqMeta(
             req_id=seq.id,
             token_ids=[],
             block_ids=list(seq.block_table),
             load_spec=load_spec,
             load_operation=load_operation,
             chunk_hashes=hashes[: (transfer_end // self.chunk_size) * DIGEST_BYTES],
+        )
+        if self._draft_window is not None:
+            chunk = self.chunk_size
+            first = max(
+                int(load_spec.hbm_cached_tokens) // chunk,
+                first_draft_chunk(self._draft_window, seq.num_prompt_tokens, chunk),
+            )
+            end = int(transfer_end) // chunk
+            if first < end:
+                request.draft_chunks = (first, end)
+            seq.offload_draft_start_tokens = min(first, end) * chunk
+            self._count_draft_cut_cost(
+                seq, load_spec.hbm_cached_tokens, load_spec.lmcache_cached_tokens
+            )
+        return request
+
+    def update_state_after_alloc(self, seq: Any) -> None:
+        super().update_state_after_alloc(seq)
+        if str(seq.id) not in self._load_specs:
+            # No load follows (a hit cut to 0, or under HBM): decided here.
+            self._count_draft_cut_cost(seq, int(seq.num_cached_tokens), 0)
+
+    def _mark_load_skip(
+        self, seq: Any, reason: str, hbm: int, lmc: int, need: int, chunk: int
+    ) -> None:
+        super()._mark_load_skip(seq, reason, hbm, lmc, need, chunk)
+        self._count_draft_cut_cost(seq, hbm, lmc)
+
+    def _count_draft_cut_cost(self, seq: Any, hbm: int, hit: int) -> None:
+        """Once `seq`'s load is decided at `hit` over an HBM prefix of `hbm`: the
+        tokens it prefills that the hit the window cut would have loaded."""
+        if self._draft_window is None:
+            return
+        uncut = self._store_lookup.take_uncut_hit(str(seq.id))
+        if uncut is None:
+            return
+        uncut = self._loadable_hit(uncut, int(seq.num_prompt_tokens))
+        self._store_lookup.draft_cut_recompute_tokens += max(
+            0, uncut - max(int(hbm), int(hit))
         )
 
     def save_abandon_timeout_s(self) -> float:
@@ -738,6 +959,7 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
 
 __all__ = [
     "MooncakeStoreOffloadScheduler",
+    "first_draft_chunk",
     "monotonic_clock_id",
     "prompt_chunk_hashes",
     "require_monotonic_clock_id",

@@ -85,6 +85,7 @@ from atom.model_engine.arg_utils import (
     compose_kv_offload_config,
     kv_offload_connector_config,
 )
+from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceStatus
 from atom.sampling_params import SamplingParams
@@ -4258,3 +4259,368 @@ def test_pool_strided_view_preserves_alignment_gaps(cluster):
     assert pool.strided_view(list(reversed(slots))) is None
     pool.release(slots)
     pool.close()
+
+
+# --- the split layout's draft objects (ATOM_MOONCAKE_STORE_DRAFT_WINDOW) -------
+
+# The test draft reads 32 keys back, through the M3 draft's 16-token pages.
+DRAFT_WINDOW = 32
+DRAFT_BLOCK_BYTES = 6
+DRAFT_CHUNK_BYTES = DRAFT_BLOCK_BYTES * CHUNK // BLOCK
+# A 69-token prompt: 8 full chunks; its readers read draft rows from 32 (d0 = 4)
+# and a load takes at most 8 chunks (d1 = 8).
+DRAFT_PROMPT = 69
+
+
+def _draft_config(*, pp=2, tp=1, window=DRAFT_WINDOW, **fields):
+    """An M3 server whose DSpark draft rides the target's blocks."""
+    config = _config(pp=pp, tp=tp, **fields)
+    config.hf_config.model_type = "minimax_m3"
+    config.speculative_config = SimpleNamespace(
+        method="dspark",
+        draft_model_hf_config=SimpleNamespace(
+            architectures=["DSparkMiniMaxDraftModel"],
+            model_type="minimax_m3",
+            sliding_window=window,
+        ),
+    )
+    return config
+
+
+@pytest.fixture
+def draft_window(monkeypatch):
+    monkeypatch.setenv("ATOM_MOONCAKE_STORE_DRAFT_WINDOW", "1")
+    monkeypatch.delenv("ATOM_DSPARK_DRAFT_KV_WINDOW", raising=False)
+
+
+def _draft_key(hashes, index, *, rank=1, world=2, namespace=NAMESPACE):
+    [key] = keys.draft_chunk_keys(namespace, rank, world, hashes, index, index + 1)
+    return key
+
+
+def test_draft_window_namespace_and_keys(cluster, monkeypatch):
+    config = _draft_config(pp=4)
+    unsplit = keys.store_namespace(config, CHUNK)
+    assert mooncake_codec_id(config) == "m3-page-regions"
+    monkeypatch.setenv("ATOM_MOONCAKE_STORE_DRAFT_WINDOW", "1")
+    split = keys.store_namespace(config, CHUNK)
+    assert mooncake_codec_id(config) == "m3-page-regions-draft-window-v1"
+    assert split != unsplit  # every rank's keys move: no key names today's bytes
+    hashes = _hashes(64)
+    others = [keys.STORE_TAINT_KEY]
+    for rank in range(4):
+        others += keys.chunk_keys(split, rank, 4, hashes, 0, 8)
+        others.append(keys.probe_key(split, rank, "nonce"))
+    others += keys.chunk_group_ids(split, hashes, 0, 8)
+    drafts = keys.draft_chunk_keys(split, 3, 4, hashes, 0, 8)
+    assert drafts[0] == f"{split}/draft/w3of4/{keys.chunk_digest(hashes, 0).hex()}"
+    for draft in drafts:
+        for other in others:
+            assert not draft.startswith(other) and not other.startswith(draft)
+    # The draft's rows live on the last PP stage, every TP rank of it.
+    assert keys.draft_ranks(_draft_config(pp=4)) == range(3, 4)
+    assert keys.draft_ranks(_draft_config(pp=2, tp=2)) == range(2, 4)
+    assert keys.draft_ranks(_draft_config(pp=1, tp=4)) == range(4)
+
+
+def _first_key_read(window: int, page: int, position: int) -> int:
+    """The first key a block row at `position` reads, in `_window_rows`' own
+    arithmetic: the page holding `position - window + 1`."""
+    return max(0, position - (window - 1)) // page * page
+
+
+def test_draft_window_matches_the_block_pass_reads():
+    from atom.kv_transfer.offload.load_math import loadable_hit
+    from atom.kv_transfer.offload.mooncake_store.scheduler import first_draft_chunk
+    from atom.spec_decode.draft_window_geometry import DraftReadWindow
+
+    window, page, chunk, rows = 4096, 16, 256, 8
+    geometry = DraftReadWindow(window=window, read_page=page)
+    previous = 0
+    for num_prompt in range(1, 3 * window + 301):
+        first = geometry.first_read_token(num_prompt)
+        d0 = first_draft_chunk(geometry, num_prompt, chunk)
+        d1 = (num_prompt - 1) // chunk
+        # The lowest key any row at the prompt's end or later reads.
+        reads = [
+            _first_key_read(window, page, p)
+            for p in range(num_prompt, num_prompt + rows)
+        ]
+        assert first == min(reads), num_prompt
+        assert chunk * d0 <= first, num_prompt
+        assert d1 - d0 <= window // chunk, num_prompt
+        # Every load of a chunk-aligned hit reads its draft rows from [256 d0, P).
+        hit = loadable_hit(chunk * (num_prompt // chunk), num_prompt, chunk)
+        assert hit <= chunk * d1
+        # A longer prompt's window starts no lower: a saved window covers it.
+        assert d0 >= previous, num_prompt
+        previous = d0
+    # Past one window, a full chunk (r != 255) starts the window 16 chunks back.
+    assert first_draft_chunk(geometry, 256 * 40, chunk) == 40 - 16
+    assert first_draft_chunk(geometry, 256 * 40 + 255, chunk) == 40 - 15
+    assert first_draft_chunk(geometry, window - 1, chunk) == 0
+
+
+def _draft_prompt_objects(cluster, namespace, hashes, *, target=range(8), draft=()):
+    objects = cluster.objects.setdefault(MASTER, {})
+    for rank in range(2):
+        for index in range(8):
+            key = _key(hashes, index, rank=rank, world=2, namespace=namespace)
+            if index in target:
+                objects[key] = bytes(CHUNK_BYTES)
+            else:
+                objects.pop(key, None)
+    for index in range(8):
+        key = _draft_key(hashes, index, namespace=namespace)
+        if index in draft:
+            objects[key] = bytes(DRAFT_CHUNK_BYTES)
+        else:
+            objects.pop(key, None)
+
+
+def test_lookup_cuts_at_the_first_missing_draft_chunk(cluster, draft_window):
+    scheduler = MooncakeStoreOffloadScheduler(_draft_config(pp=2))
+    lookup = scheduler._lookup_client
+    namespace = scheduler._namespace
+    hashes = prompt_chunk_hashes(_seq(0, DRAFT_PROMPT), CHUNK)
+
+    def hit(**objects):
+        _draft_prompt_objects(cluster, namespace, hashes, **objects)
+        return _completed_lookup(lookup, _seq(0, DRAFT_PROMPT))
+
+    backend = lookup.backend
+    assert hit(draft=range(4, 8)) == 8 * CHUNK
+    assert hit(draft=[5, 6, 7]) == 4 * CHUNK  # missing at d0: target-only below it
+    assert hit(draft=[4, 5, 7]) == 6 * CHUNK  # missing mid-window
+    # The hit each cut dropped waits, once, for its request's load decision.
+    assert backend.take_uncut_hit("0") == 8 * CHUNK
+    assert backend.take_uncut_hit("0") is None
+    # A hit below the window needs no draft object.
+    assert hit(target=[0, 1, 2, 4, 5, 6, 7], draft=()) == 3 * CHUNK
+    assert (backend.draft_cuts_at_d0, backend.draft_cuts_above_d0) == (1, 1)
+    assert backend.draft_missing == 1 + 1
+    assert backend.draft_keys == 4 * 4
+
+    # A draft key no pool answered decides the cut only before a known miss.
+    [store] = cluster.stores
+    _draft_prompt_objects(cluster, namespace, hashes, draft=[4, 5, 7])
+    store.exist_codes = {_draft_key(hashes, 5, namespace=namespace): -900}
+    backend._pools[0].paused_until = 0.0
+    assert _completed_lookup(lookup, _seq(0, DRAFT_PROMPT)) is None
+    store.exist_codes = {_draft_key(hashes, 7, namespace=namespace): -900}
+    backend._pools[0].paused_until = 0.0
+    assert _completed_lookup(lookup, _seq(0, DRAFT_PROMPT)) == 6 * CHUNK
+
+
+def test_lookup_finds_a_draft_object_in_any_pool(cluster, draft_window):
+    pools = {
+        "rdma0": {"master": "10.0.0.1:26051", "metadata": METADATA},
+        "rdma1": {"master": "10.0.0.1:26151", "metadata": METADATA},
+    }
+    extra = _extra(master=None, metadata=None, protocol="rdma", pools=pools)
+    scheduler = MooncakeStoreOffloadScheduler(_draft_config(pp=2, extra=extra))
+    namespace = scheduler._namespace
+    hashes = prompt_chunk_hashes(_seq(0, DRAFT_PROMPT), CHUNK)
+    _draft_prompt_objects(cluster, namespace, hashes, draft=range(4, 8))
+    # The draft rank writes through the other NIC: chunk 6 lives there.
+    other = cluster.objects.setdefault("10.0.0.1:26151", {})
+    key = _draft_key(hashes, 6, namespace=namespace)
+    other[key] = cluster.objects[MASTER].pop(key)
+    lookup = scheduler._lookup_client
+    assert _completed_lookup(lookup, _seq(0, DRAFT_PROMPT)) == 8 * CHUNK
+    del other[key]
+    assert _completed_lookup(lookup, _seq(0, DRAFT_PROMPT)) == 6 * CHUNK
+
+
+def test_lookup_asks_the_window_in_the_same_call(cluster, draft_window):
+    scheduler = MooncakeStoreOffloadScheduler(_draft_config(pp=2))
+    namespace = scheduler._namespace
+    hashes = prompt_chunk_hashes(_seq(0, DRAFT_PROMPT), CHUNK)
+    _draft_prompt_objects(cluster, namespace, hashes, draft=range(4, 8))
+    assert _completed_lookup(scheduler._lookup_client, _seq(0, DRAFT_PROMPT)) == 64
+    [store] = cluster.stores
+    [asked] = [call[1] for call in store.calls if call[0] == "exists"]
+    # The taint marker, every rank's 8 chunks, then the draft rank's [d0, d1).
+    assert len(asked) == 1 + 2 * 8 + 4
+    assert asked[-4:] == [
+        _draft_key(hashes, index, namespace=namespace) for index in range(4, 8)
+    ]
+
+
+def test_renew_renews_the_draft_keys_the_load_reads(cluster, draft_window):
+    scheduler = MooncakeStoreOffloadScheduler(_draft_config(pp=2))
+    namespace = scheduler._namespace
+    hashes = prompt_chunk_hashes(_seq(0, DRAFT_PROMPT), CHUNK)
+    _draft_prompt_objects(cluster, namespace, hashes, draft=range(4, 8))
+    held = scheduler._lookup_client.renew(_seq(0, DRAFT_PROMPT), 2 * CHUNK, 8 * CHUNK)
+    [store] = cluster.stores
+    [asked] = [call[1] for call in store.calls if call[0] == "exists"]
+    # Target chunks [2, 8) of both ranks, and the draft objects [max(2, d0), 8).
+    assert asked[1:] == [
+        *(
+            _key(hashes, i, rank=r, world=2, namespace=namespace)
+            for r in range(2)
+            for i in range(2, 8)
+        ),
+        *(_draft_key(hashes, i, namespace=namespace) for i in range(4, 8)),
+    ]
+    assert held == 2 * 6 + 4
+
+
+def test_save_request_carries_only_unmarked_window_chunks(cluster, draft_window):
+    scheduler = MooncakeStoreOffloadScheduler(_draft_config(pp=2))
+    manager = BlockManager(
+        MockConfig(
+            num_kvcache_blocks=64, kv_cache_block_size=BLOCK, enable_prefix_caching=True
+        )
+    )
+    scheduler.bind_block_manager(manager)
+    seq = Sequence(list(range(DRAFT_PROMPT)), BLOCK, sampling_params=SamplingParams())
+    manager.allocate(seq)
+    table = list(seq.block_table)
+
+    def draft_chunks(saved, aligned=8 * CHUNK, block_ids=table):
+        operation = SaveOperationId(seq.id, 0)
+        return scheduler._build_save_request(
+            seq, saved, aligned, operation, block_ids, False
+        ).draft_chunks
+
+    assert draft_chunks(0) == (4, 8)  # the window [d0, C)
+    assert draft_chunks(6 * CHUNK) == (6, 8)  # clipped to what this save covers
+    assert draft_chunks(0, aligned=4 * CHUNK) is None  # below the window
+    # A block a load left without draft rows: only the run above it is stored.
+    manager.kv.block(table[11]).draft_rows_missing = True
+    assert draft_chunks(0) == (6, 8)
+    manager.kv.block(table[15]).draft_rows_missing = True
+    assert draft_chunks(0) is None
+    # A late save reacquires canonical blocks, a marked copy among them.
+    manager.kv.block(table[11]).draft_rows_missing = False
+    manager.kv.block(table[15]).draft_rows_missing = False
+    manager.hash_blocks(seq, 8 * CHUNK)
+    other = Sequence(list(range(DRAFT_PROMPT)), BLOCK, sampling_params=SamplingParams())
+    manager.allocate(other)
+    manager.kv.block(other.block_table[13]).draft_rows_missing = True
+    manager.publish_loaded_prefix(other, 0, 8 * CHUNK)
+    manager.kv.publish(
+        other.block_table[13],
+        manager.kv.block(table[13]).hash,
+        manager.kv.block(table[13]).token_ids,
+    )
+    block_ids, available, claimed = manager.acquire_offload_prefix(seq, 0, 8 * CHUNK)
+    assert available == 8 * CHUNK and block_ids[13] == other.block_table[13]
+    assert draft_chunks(0, block_ids=block_ids) == (7, 8)
+    manager.free_leased_blocks(claimed)
+    # Without the block manager no mark can be read: no draft object is stored.
+    scheduler._block_manager = None
+    assert draft_chunks(0) is None
+
+
+def test_load_request_names_the_draft_start(cluster, draft_window):
+    scheduler = MooncakeStoreOffloadScheduler(_draft_config(pp=2))
+    seq = _seq(0, DRAFT_PROMPT, offload_draft_start_tokens=None)
+    operation = LoadOperationId(seq.id, 0)
+
+    def load(hbm, end=8 * CHUNK):
+        spec = LoadSpec(hbm_cached_tokens=hbm, lmcache_cached_tokens=end, can_load=True)
+        request = scheduler._build_load_request(seq, spec, operation, end)
+        return request.draft_chunks, seq.offload_draft_start_tokens
+
+    assert load(0) == ((4, 8), 4 * CHUNK)
+    assert load(6 * CHUNK) == ((6, 8), 6 * CHUNK)
+    # A load ending below the window writes no draft row at all.
+    assert load(0, end=3 * CHUNK) == (None, 3 * CHUNK)
+
+
+def test_a_cut_counts_only_what_its_request_then_prefills(cluster, draft_window):
+    scheduler = MooncakeStoreOffloadScheduler(_draft_config(pp=2))
+    lookups = scheduler._store_lookup
+    seq = _seq(0, DRAFT_PROMPT, offload_draft_start_tokens=None)
+    hashes = prompt_chunk_hashes(seq, CHUNK)
+    operation = LoadOperationId(seq.id, 0)
+
+    def looked_up(draft):
+        _draft_prompt_objects(cluster, scheduler._namespace, hashes, draft=draft)
+        return _completed_lookup(scheduler._lookup_client, seq)
+
+    # Chunk 6's draft object is missing: the hit drops from 8 chunks to 6.
+    assert looked_up([4, 5, 7]) == 6 * CHUNK
+    spec = LoadSpec(
+        hbm_cached_tokens=2 * CHUNK, lmcache_cached_tokens=6 * CHUNK, can_load=True
+    )
+    scheduler._build_load_request(seq, spec, operation, 6 * CHUNK)
+    assert lookups.draft_cut_recompute_tokens == 2 * CHUNK  # chunks 6-7
+    scheduler._build_load_request(seq, spec, operation, 6 * CHUNK)
+    assert lookups.draft_cut_recompute_tokens == 2 * CHUNK  # once per answer
+    # HBM reaches past the cut, so no load runs and only chunk 7 is prefilled.
+    assert looked_up([4, 5, 7]) == 6 * CHUNK
+    scheduler._mark_load_skip(
+        seq, "hbm_satisfies_after_alloc", 7 * CHUNK, 6 * CHUNK, -CHUNK, CHUNK
+    )
+    assert lookups.draft_cut_recompute_tokens == 3 * CHUNK
+    # A later answer the window did not cut forgets the earlier cut.
+    assert looked_up([4, 5, 7]) == 6 * CHUNK
+    assert looked_up(range(4, 8)) == 8 * CHUNK
+    scheduler._mark_load_skip(seq, "too_small", 0, 8 * CHUNK, 8 * CHUNK, CHUNK)
+    assert lookups.draft_cut_recompute_tokens == 3 * CHUNK
+
+    # A window from chunk 0 can cut the hit to nothing: no load is planned, so
+    # admission decides it, against the HBM hit it found.
+    short = _seq(1, 30, offset=500)
+    short_hashes = prompt_chunk_hashes(short, CHUNK)
+    namespace, objects = scheduler._namespace, cluster.objects[MASTER]
+    for index in range(3):
+        for rank in range(2):
+            key = _key(short_hashes, index, rank=rank, world=2, namespace=namespace)
+            objects[key] = bytes(CHUNK_BYTES)
+        if index:
+            key = _draft_key(short_hashes, index, namespace=namespace)
+            objects[key] = bytes(DRAFT_CHUNK_BYTES)
+    assert _completed_lookup(scheduler._lookup_client, short) == 0
+    short.num_cached_tokens = CHUNK
+    scheduler.update_state_after_alloc(short)
+    assert lookups.draft_cut_recompute_tokens == 3 * CHUNK + 2 * CHUNK
+
+
+def test_draft_window_refusals(cluster, monkeypatch):
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+    from atom.kv_transfer.offload.mooncake_store.config import store_draft_window
+
+    cfg = parse_mooncake_store_config(_extra())
+    assert store_draft_window(_draft_config()) is None  # off: nothing refused
+    monkeypatch.setenv("ATOM_MOONCAKE_STORE_DRAFT_WINDOW", "1")
+    monkeypatch.delenv("ATOM_DSPARK_DRAFT_KV_WINDOW", raising=False)
+    window = store_draft_window(_draft_config())
+    assert (window.window, window.read_page) == (DRAFT_WINDOW, 16)
+    check_engine_compatibility(cfg, _draft_config())
+
+    no_draft = _draft_config()
+    no_draft.speculative_config = None
+    unwindowed = _draft_config(window=0)
+    other_draft = _draft_config()
+    other_draft.speculative_config.draft_model_hf_config.architectures = ["Other"]
+    dense = _draft_config()
+    dense.hf_config.model_type = "glm_moe_dsa"
+    for config, match in (
+        (no_draft, "needs a DSpark draft"),
+        (unwindowed, "needs a DSpark draft"),
+        (other_draft, "needs a DSpark draft"),
+        (dense, "M3 PAGE layout only"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            check_engine_compatibility(cfg, config)
+    monkeypatch.setenv("ATOM_DSPARK_DRAFT_KV_WINDOW", "1")
+    with pytest.raises(ValueError, match="exclusive"):
+        check_engine_compatibility(cfg, _draft_config())
+    monkeypatch.delenv("ATOM_DSPARK_DRAFT_KV_WINDOW")
+    # Another offload tier would store the draft rows whole; another P/D
+    # connector (MoRIIO) never tells a decode which blocks lack them.
+    moriio = {"kv_connector": "moriio", "kv_role": "kv_producer"}
+    for transfer in (
+        {"kv_connector": "lmcache_offload", "kv_role": "offload"},
+        moriio,
+        {"kv_connector": "multi", "connectors": [moriio, _config().kv_transfer_config]},
+    ):
+        other = _draft_config()
+        other.kv_transfer_config = transfer
+        with pytest.raises(ValueError, match="only the mooncake P/D connector"):
+            KVConnectorFactory.create_connector(other, role="scheduler")

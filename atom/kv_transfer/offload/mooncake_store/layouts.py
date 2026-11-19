@@ -12,6 +12,7 @@ here; Triton stays lazy inside the DSV4 codec.
 from __future__ import annotations
 
 from collections.abc import Callable
+from copy import copy
 from dataclasses import dataclass
 from typing import Any
 
@@ -20,12 +21,18 @@ from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload.capabilities import replays_state
 from atom.kv_transfer.offload.dense.kv_byte_codec import DenseKVByteCodec
 from atom.kv_transfer.offload.page_codec import pure_page_codec
+from atom.utils import envs
 
 # Bumped when the dense codec's per-chunk byte layout changes.
 DENSE_CODEC_ID = "dense-opaque-block-v1"
 # V4.1 stores PAGE regions only; request state is rebuilt by replay, so its
 # objects must not share a namespace with dense or M3 bytes.
 REPLAY_PAGE_CODEC_ID = "v41-replay-page-v1"
+# M3 with ATOM_MOONCAKE_STORE_DRAFT_WINDOW: target objects without the draft's
+# regions, and draft objects of their own for each prompt's read window.
+DRAFT_WINDOW_M3_CODEC_ID = "m3-page-regions-draft-window-v1"
+# The `PageUnitSpec.namespace` of a draft's own PAGE regions.
+DRAFT_PAGE_NAMESPACE = "draft"
 
 CodecBuilder = Callable[[Any, Any, int | None, bool], Any]
 
@@ -43,6 +50,8 @@ def _dense_codec_id() -> str:
 
 
 def _m3_codec_id() -> str:
+    if envs.ATOM_MOONCAKE_STORE_DRAFT_WINDOW:
+        return DRAFT_WINDOW_M3_CODEC_ID
     return m3_codec.M3_CODEC_ID
 
 
@@ -63,12 +72,30 @@ def _build_dense(
     )
 
 
+def split_draft_pages(transfer_tensors: Any) -> tuple[Any, Any | None]:
+    """Copies of `transfer_tensors` with the target's PAGE regions and with the
+    draft's, each in publication order; the draft's is None when it has none."""
+    pages = list(transfer_tensors.pages)
+    is_draft = [
+        getattr(page.unit_spec, "namespace", None) == DRAFT_PAGE_NAMESPACE
+        for page in pages
+    ]
+    if not any(is_draft):
+        return transfer_tensors, None
+    target, draft = copy(transfer_tensors), copy(transfer_tensors)
+    target.pages = [page for page, own in zip(pages, is_draft) if not own]
+    draft.pages = [page for page, own in zip(pages, is_draft) if own]
+    return target, draft
+
+
 def _build_m3(
     _kv_caches: Any,
     transfer_tensors: Any,
     num_blocks: int | None,
     _permit_per_request_state: bool,
 ) -> Any:
+    if envs.ATOM_MOONCAKE_STORE_DRAFT_WINDOW:
+        transfer_tensors = split_draft_pages(transfer_tensors)[0]
     return pure_page_codec(transfer_tensors, num_blocks)
 
 
@@ -126,3 +153,16 @@ def build_mooncake_codec(
         num_blocks,
         permit_per_request_state,
     )
+
+
+def build_mooncake_draft_codec(
+    config: Any, transfer_tensors: Any, num_blocks: int | None
+) -> Any | None:
+    """The codec of this rank's draft objects under the split M3 layout; None
+    when it is off or this rank holds no draft regions."""
+    if not envs.ATOM_MOONCAKE_STORE_DRAFT_WINDOW:
+        return None
+    if offcfg.select_offload_layout(config) != "m3":
+        return None
+    draft = split_draft_pages(transfer_tensors)[1]
+    return None if draft is None else pure_page_codec(draft, num_blocks)
