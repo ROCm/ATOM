@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 """Import ATOM modules without a GPU AITER build: `stubbed_aiter` for engine
 modules that bind a few `aiter.dist` names, `atom_under_stubs` /
-`atom_without_aiter` for model code that needs AITER's enums and Triton."""
+`atom_without_aiter` for model code that needs AITER's enums and Triton, and
+`einops_where_missing` for model code that imports einops."""
 
 import importlib
 import importlib.abc
@@ -329,3 +330,19 @@ def atom_without_aiter():
     else:
         with atom_under_stubs() as load:
             yield load
+
+
+@contextmanager
+def einops_where_missing():
+    """A stand-in `einops` where it is not installed (the CPU job), for model
+    modules that import it at the top."""
+    if "einops" in sys.modules or importlib.util.find_spec("einops") is not None:
+        yield
+        return
+    stand_in = types.ModuleType("einops")
+    stand_in.rearrange = MagicMock(name="einops.rearrange")
+    sys.modules["einops"] = stand_in
+    try:
+        yield
+    finally:
+        sys.modules.pop("einops", None)
