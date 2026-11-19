@@ -342,10 +342,11 @@ class _Server:
             held = not (self.pending or self.stopping or self.held)
             self.held = self.held or held
             clients = self.pending
-        _send(conn, {"held": held, "clients": clients})
         if not held:
+            _send(conn, {"held": False, "clients": clients})
             return
         try:
+            _send(conn, {"held": True, "clients": clients})  # the holder may be gone
             with contextlib.suppress(OSError):
                 while conn.recv(1 << 12):
                     pass

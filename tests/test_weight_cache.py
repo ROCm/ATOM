@@ -121,6 +121,19 @@ def test_the_daemons_key_names_the_checkpoint_as_loading_left_it(tmp_path, monke
     assert loader.key == key.compute_key(config, 0)  # as a server sees it now
 
 
+@pytest.mark.parametrize(
+    "name",
+    ["ATOM_USE_TRITON_MOE_DECODE", "ATOM_USE_UNIFIED_ATTN", "ATOM_FORCE_ATTN_TRITON"],
+)
+def test_a_backend_switch_loading_goes_by_is_in_the_key(tmp_path, monkeypatch, name):
+    # They decide the layout experts are kept in, and the dtype of a sink.
+    monkeypatch.setenv(name, "1")
+    on = _key(tmp_path, monkeypatch)
+    monkeypatch.setenv(name, "0")
+    off = _key(tmp_path, monkeypatch)
+    assert key._diff_key(on, off) == [f"env.{name}: daemon=1 client=0"]
+
+
 def test_the_quantization_config_is_in_the_key(tmp_path, monkeypatch):
     quant = [SimpleNamespace(compute_hash=lambda h=h: h) for h in ("fp8", "online")]
     a, b = (_key(tmp_path, monkeypatch, quant_config=q) for q in quant)
@@ -956,6 +969,31 @@ def test_a_daemon_about_to_be_stopped_takes_no_server(cache_dir):
         hold.close()  # let go without stopping it: it serves again
         _wait_for(lambda: not server.held, 5)
         conn, payload = _get(path)
+        assert payload["key"] == 1
+        conn.close()
+    finally:
+        server.close()
+
+
+def test_a_hold_whose_holder_went_before_the_reply_is_let_go(cache_dir, monkeypatch):
+    path = os.path.join(transport.socket_dir(), "gpu_gone.sock")
+    server = transport._Server(path, {"key": 1}, {}, "t")
+    send = transport._send
+
+    def reply_fails(conn, obj):
+        if isinstance(obj, dict) and obj.get("held"):
+            raise BrokenPipeError("the holder is gone")
+        send(conn, obj)
+
+    monkeypatch.setattr(transport, "_send", reply_fails)
+    try:
+        holder = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        holder.connect(path)
+        send(holder, {"cmd": "hold"})
+        assert holder.recv(16) == b""  # the daemon gave the request up
+        holder.close()
+        assert not server.held
+        conn, payload = _get(path)  # so it serves, and can be held again
         assert payload["key"] == 1
         conn.close()
     finally:
