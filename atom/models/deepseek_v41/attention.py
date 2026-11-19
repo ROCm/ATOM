@@ -41,7 +41,8 @@ from atom.model_ops.deepseek_v41.paged_scoring import (
     score_topk_quantized,
 )
 from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
-from atom.model_ops.indexer.query import can_fuse_weights_proj, project_query_fp4
+from atom.model_ops.indexer.layout import can_fuse_weights_proj
+from atom.model_ops.indexer.query import project_query_fp4
 from atom.model_ops.layernorm import (
     DualRMSNormBF16,
     DualRMSNormMXFP8,

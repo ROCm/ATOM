@@ -9,6 +9,23 @@ NATURAL = "natural"
 # gfx950 OPUS: MFMA-permuted scales, distinct from FlyDSL's preshuffle.
 MFMA = "mfma"
 
+# gfx1250 FP4 indexer: the per-layer weights_proj GEMM folded into the query
+# RoPE/MXFP4-quant launch (aiter q_rope_mxfp4_quant). Above this many rows the
+# standalone bf16 GEMM is the faster kernel (it is not launch-bound), matching
+# the vLLM reference's 128-row gate. Here, with the layout names, so the gate is
+# importable without the GPU kernels (and so testable off-GPU).
+_MAX_FUSED_PROJECT_ROWS = 128
+
+
+def can_fuse_weights_proj(enabled: bool, layout: str, rows: int) -> bool:
+    """ATOM's policy for folding the `weights_proj` GEMM into the query-quant
+    launch: the fuse flag on, the gfx1250-only FP4 NATURAL plane (the other
+    layouts have no such kernel), and a row count the aiter projection serves
+    better than the standalone GEMM. The tensor shapes are fixed by the one
+    V4.1 caller and re-validated by aiter, which raises on a bad one; a False
+    here just keeps the always-correct separate GEMM."""
+    return enabled and layout == NATURAL and 0 < rows <= _MAX_FUSED_PROJECT_ROWS
+
 
 def fp4_cache_byte(row, packed_col):
     """OPUS gfx950: [group, 32-dim chunk, row, 16 packed bytes]."""

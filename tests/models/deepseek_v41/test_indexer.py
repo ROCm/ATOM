@@ -904,8 +904,12 @@ def test_can_fuse_weights_proj_is_the_fuse_flag_and_the_natural_plane(
     """The gate is pure ATOM policy -- the flag, the NATURAL plane and the
     128-row window -- with tensor shapes left to aiter. It decides only whether
     to fold the projection into the quant launch, never correctness."""
-    from atom.model_ops.indexer.layout import MFMA, NATURAL, PRESHUFFLE
-    from atom.model_ops.indexer.query import can_fuse_weights_proj
+    from atom.model_ops.indexer.layout import (
+        MFMA,
+        NATURAL,
+        PRESHUFFLE,
+        can_fuse_weights_proj,
+    )
 
     # The string literals above are the real layout tags.
     assert {MFMA, NATURAL, PRESHUFFLE} == {"mfma", "natural", "preshuffle"}
