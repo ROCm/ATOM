@@ -129,9 +129,11 @@ grammar, so what preparing one refuses gets past it: a `response_format` whose
 grammar does not compile, and any on a deployment that cannot prepare grammars,
 such as one without the `atom[structured-output]` extra, with a tokenizer that
 cannot be serialized, or whose workers lack the preparation RPC, differ in
-their structured-output configuration, or run out of time preparing it. Image
-input is not rendered yet and gets a 501; the `/beta` routes have no render
-endpoint.
+their structured-output configuration, or run out of time preparing it. Without
+the extra, a schema that uses `pattern` or `patternProperties`, directly or
+through a `$ref`, still fails render with the route's 500: checking its
+expressions needs `re2`. Image input is not rendered yet and gets a 501; the
+`/beta` routes have no render endpoint.
 
 ## Validation
 
