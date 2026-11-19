@@ -303,9 +303,15 @@ which ships the routed experts as MXFP4.
 - **Image input.** With the checkpoint's `vision_config`, ATOM runs the vision tower natively
   and scatters the image embeddings over the image tokens; send images as `image_url` content
   parts to `/v1/chat/completions`. Text-only requests take the same path.
-- **Mono decode is not used.** The MiniMax-M3 mono kernels assume dense layers 0–2; the log
-  reads `MiniMax-M3 mono decode off: DSpark speculative decoding` (with DSpark) or
-  `... off: layers 0..2 must be dense full-attention layers` (without).
+- **Mono decode.** Decode steps of up to 16 rows (a DSpark verify is 8 rows a request, so up
+  to 2 requests) run on the MiniMax-M3 mono kernels from layer 3 on; layers 0–2, sparse
+  attention in M3.1, run on the original modules. Both shared-expert layouts are served, each
+  with its own MoE kernel: with `ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4=1` (the command below) the
+  shared expert is expert 128 of the MXFP4 table and every expert runs on MXFP8 activations
+  (a8w4, the kernel `amd/MiniMax-M3-MXFP4` runs on); without it the routed experts run on
+  MXFP4 activations (a4w4) and the shared expert on its own MXFP8 weights. The log reads
+  `MiniMax-M3 mono: attention linears ptpc FP8, shared expert fused (MXFP4, a8w4)` (or
+  `... shared expert MXFP8 MLP`); `ATOM_MONO_ENABLE=0` turns mono off.
 
 **Environment.** Measured on 4xMI355X in `rocm/atom-dev:minimax-m31-flash`
 (`rocm/atom-dev:nightly_202610181506` with these MiniMax-M3.1 changes):
@@ -443,7 +449,8 @@ How ATOM runs it:
   target). Each target forward writes the context K/V rows for the tokens it processed; the
   block attends that context plus its own K/V.
 - The target layers' outputs are tapped with forward hooks (all-reduced across TP, plus the
-  residual). This is why mono decode, which replaces those layers, is off under DSpark.
+  residual). Mono decode, which replaces those layers, writes the same taps from its own
+  layer outputs, so it serves DSpark too (fixed blocks: not `confidence_schedule` or ragged).
 - The context is each tapped layer's output before the final norm, as the checkpoint was trained:
   feeding the last tap through the target's final norm instead (the NeMo recipe's post-norm
   feature) dropped GSM8K acceptance from 51% to 39%.
