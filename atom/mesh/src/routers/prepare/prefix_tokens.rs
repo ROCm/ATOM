@@ -13,14 +13,17 @@
 //! finds it.
 //!
 //! This is the conversation level of ATOM's `SegmentTokenizer`
-//! (`atom/model_engine/segment_tokenizer.py`), with its conditions for a cut
-//! right after an added token to be exact. The first reuses within the byte
-//! limit, or `VERIFY_BYTES` when that is larger, are also compared with a plain
-//! encode, special tokens included, and a difference turns the cache off for
-//! good. A longer one is not: its plain encode is what the cache keeps off the
-//! request path, and whether a cut is exact depends on the tokenizer, not on
-//! the prompt's length. The ids only place requests, so an unchecked one can
-//! cost a cache miss on the engine, never a wrong answer.
+//! (`atom/model_engine/segment_tokenizer.py`). Whether a cut right after an
+//! added token is exact is checked as in its `segment_split.py`, plus a
+//! refusal of a tokenizer that truncates or pads, except that a pre-tokenizer
+//! is refused only when it marks the start of the whole input and not that of
+//! each text between added tokens. The first reuses within the byte limit, or
+//! `VERIFY_BYTES` when that is larger, are also compared with a plain encode,
+//! special tokens included, and a difference turns the cache off for good. A
+//! longer one is not: its plain encode is what the cache keeps off the request
+//! path, and whether a cut is exact depends on the tokenizer, not on the
+//! prompt's length. The ids only place requests, so an unchecked one can cost
+//! a cache miss on the engine, never a wrong answer.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -281,6 +284,11 @@ impl PrefixTokens {
     /// A few placements of added tokens, cut after each token and encoded in
     /// two parts, give the ids of encoding them whole, which special tokens
     /// wrap in `head` and `tail`. At least one cut must be checked.
+    ///
+    /// The probes cut a prompt only before its own continuation: that a cached
+    /// prefix stays exact before a new continuation rests on
+    /// `Description::check`, and so does a normalizer that composes across a
+    /// cut, for which `cuts` finds no cut to compare.
     fn probe(&self, tokenizer: &dyn Tokenizer) -> Result<(), String> {
         let mut tokens: Vec<(&u32, &String)> = self.added.iter().collect();
         tokens.sort_unstable();
@@ -302,7 +310,7 @@ impl PrefixTokens {
                 format!("a{token}a b"),
                 format!("{token} x\n{token}"),
                 format!(" y {token}\t1 2"),
-                // A normalizer could compose across a cut.
+                // Combining marks beside the token.
                 format!("e\u{301}{token}\u{301}e"),
             ] {
                 let whole = encode(&probe, false)?;
@@ -667,10 +675,10 @@ impl Description {
     /// differ from the prompt encoded whole. The tokenizer extracts added
     /// tokens before anything else and encodes the text between them on its
     /// own, unless a token takes in its neighbours' whitespace, the
-    /// pre-tokenizer treats the start of its input specially, the normalizer
-    /// changes text a normalized token is matched in, the model samples, the
-    /// tokenizer truncates or pads what it encodes, or what follows a cut can
-    /// change what is extracted before it.
+    /// pre-tokenizer marks the start of the whole input but not that of the
+    /// text after a cut, the normalizer changes text a normalized token is
+    /// matched in, the model samples, the tokenizer truncates or pads what it
+    /// encodes, or what follows a cut can change what is extracted before it.
     fn check(&self) -> Result<(), String> {
         let tokens = &self.added_tokens;
         if tokens.is_empty() {
@@ -694,7 +702,7 @@ impl Description {
             return Err("normalized added tokens are matched after the normalizer runs".into());
         }
         if offset_sensitive(&self.pre_tokenizer) {
-            return Err("the pre-tokenizer treats the start of its input specially".into());
+            return Err("the pre-tokenizer marks only the start of the whole input".into());
         }
         let contents: Vec<&str> = tokens.iter().map(|t| t.content.as_str()).collect();
         if !cuts_are_stable(&contents, &normalized) {
@@ -712,15 +720,17 @@ fn normalizer_is_identity(normalizer: &Value) -> bool {
                 .is_some_and(|n| n.is_empty()))
 }
 
+/// Whether the pre-tokenizer marks the start of the whole input but not that of
+/// each text between added tokens, as Metaspace's `first` scheme does. Its
+/// `always` scheme and ByteLevel's `add_prefix_space` prepend to each of those
+/// texts, so the text after a cut is marked whether it is encoded on its own
+/// or not.
 fn offset_sensitive(pre_tokenizer: &Value) -> bool {
     match pre_tokenizer["type"].as_str() {
         Some("Sequence") => pre_tokenizer["pretokenizers"]
             .as_array()
             .is_some_and(|p| p.iter().any(offset_sensitive)),
-        Some("Metaspace") => {
-            pre_tokenizer["prepend_scheme"].as_str().unwrap_or("always") != "never"
-        }
-        Some("ByteLevel") => pre_tokenizer["add_prefix_space"].as_bool().unwrap_or(true),
+        Some("Metaspace") => pre_tokenizer["prepend_scheme"] == "first",
         _ => false,
     }
 }
@@ -827,6 +837,9 @@ pub(crate) mod tests {
     use super::*;
 
     const WORDS: [&str; 6] = ["alpha", "beta", "gamma", "delta", "x", "1"];
+    /// The probes' other words. Each word is in the vocabulary marked by a
+    /// Metaspace pre-tokenizer too, so a probe can tell a marked word.
+    const PROBE_WORDS: [&str; 4] = ["a", "b", "y", "2"];
     const ADDED: [&str; 6] = [
         "<s>",
         "<unk>",
@@ -839,11 +852,16 @@ pub(crate) mod tests {
     /// A word-level tokenizer with chat tokens, which wraps prompts in `<s>`.
     pub(crate) fn description() -> Value {
         let added: Vec<&str> = ADDED.into_iter().chain(["</think>"]).collect();
+        let words = WORDS.into_iter().chain(PROBE_WORDS);
+        let marked = words.clone().map(|word| format!("\u{2581}{word}"));
         let vocab: serde_json::Map<String, Value> = added
             .iter()
-            .chain(WORDS.iter())
+            .copied()
+            .chain(words)
+            .map(str::to_string)
+            .chain(marked)
             .enumerate()
-            .map(|(id, token)| (token.to_string(), json!(id)))
+            .map(|(id, token)| (token, json!(id)))
             .collect();
         let added_tokens: Vec<Value> = added
             .iter()
@@ -1164,16 +1182,23 @@ pub(crate) mod tests {
         })
         .is_err());
         for (pre_tokenizer, sensitive) in [
-            (json!({"type": "Metaspace", "replacement": "_"}), true),
+            (json!({"type": "Metaspace", "replacement": "_"}), false),
             (
                 json!({"type": "Metaspace", "prepend_scheme": "never"}),
                 false,
             ),
-            (json!({"type": "ByteLevel", "add_prefix_space": true}), true),
+            (
+                json!({"type": "Metaspace", "prepend_scheme": "first"}),
+                true,
+            ),
+            (
+                json!({"type": "ByteLevel", "add_prefix_space": true}),
+                false,
+            ),
             (
                 json!({"type": "Sequence", "pretokenizers": [{"type": "Whitespace"},
-                    {"type": "ByteLevel", "add_prefix_space": false}]}),
-                false,
+                    {"type": "Metaspace", "prepend_scheme": "first"}]}),
+                true,
             ),
         ] {
             assert_eq!(
@@ -1187,13 +1212,37 @@ pub(crate) mod tests {
         assert!(!cuts_are_stable(&["ab", "bc"], &normalized));
         assert!(cuts_are_stable(&["ab", "cd"], &normalized));
 
-        // A pre-tokenizer that prepends a space to its input changes the ids
-        // after a cut, and the cache stays off.
-        let mut metaspace = description();
-        metaspace["pre_tokenizer"] = json!({"type": "Metaspace", "replacement": "\u{2581}",
-            "prepend_scheme": "always", "split": true});
-        let (_dir, entry) = entry(&metaspace);
-        assert!(PrefixTokens::for_entry(&entry, 1 << 30).is_err());
+        // A pre-tokenizer that marks each text between added tokens marks the
+        // text after a cut either way; one that marks only the start of the
+        // whole input keeps the cache off.
+        let (_dir, always) = entry(&metaspace("always"));
+        assert!(PrefixTokens::for_entry(&always, 1 << 30).is_ok());
+        let (_dir, first) = entry(&metaspace("first"));
+        assert_eq!(
+            PrefixTokens::for_entry(&first, 1 << 30).err().as_deref(),
+            Some("the pre-tokenizer marks only the start of the whole input")
+        );
+    }
+
+    fn metaspace(prepend_scheme: &str) -> Value {
+        let mut description = description();
+        description["pre_tokenizer"] = json!({"type": "Metaspace", "replacement": "\u{2581}",
+            "prepend_scheme": prepend_scheme, "split": true});
+        description
+    }
+
+    #[test]
+    fn the_probes_catch_a_mark_on_the_start_of_the_whole_input() {
+        let (_dir, plain) = entry(&description());
+        let mut tokens = PrefixTokens::for_entry(&plain, 1 << 30).unwrap();
+        tokens.added = HashMap::from([(3, "<|user|>".to_string())]);
+        // `check` refuses this pre-tokenizer before any probe. After the cut,
+        // `a b` encoded on its own is `▁a ▁b`, and `a ▁b` in the whole prompt.
+        let (_dir, first) = entry(&metaspace("first"));
+        assert_eq!(
+            tokens.probe(first.tokenizer.as_ref()).err().as_deref(),
+            Some("cutting after \"<|user|>\" changes the ids")
+        );
     }
 
     #[test]
