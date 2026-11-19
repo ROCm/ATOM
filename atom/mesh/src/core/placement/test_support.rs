@@ -475,7 +475,6 @@ mod fixture_smoke_tests {
             headers: Some(&hm),
             hash_ring: None,
             carries_media: false,
-            decode_rank: None,
         };
         let _ = policy.select_worker(&workers, &info).await;
         let calls = policy.calls();
