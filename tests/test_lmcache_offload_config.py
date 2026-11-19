@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from atom.config import SpeculativeConfig
 from atom.kv_transfer.offload import config as offcfg
 
 
@@ -148,6 +149,68 @@ def test_page_namespace_tells_mxfp4_kv_pages_from_fp8_ones():
     config = _config()
     config.kv_cache_dtype = "fp4"
     assert offcfg.build_page_namespace(config, _lmcache_config(), 4) != plain
+
+
+class _Spec(SimpleNamespace):
+    """A speculative config that answers the DSpark queries as the real one does."""
+
+    use_dspark = SpeculativeConfig.use_dspark
+    use_dspark_with_draft = SpeculativeConfig.use_dspark_with_draft
+
+
+def test_page_namespace_names_a_windowed_draft_and_only_that(monkeypatch):
+    """A DSpark draft that keeps only its window takes its rows out of every
+    PAGE unit, so the unit is different bytes; with the switch off, or with a
+    draft that has no window, the namespace is the one it always was."""
+    config = _config()
+    config.speculative_config = _Spec(
+        method="dspark",
+        num_speculative_tokens=7,
+        draft_model_hf_config=SimpleNamespace(
+            sliding_window=4096, dspark_with_draft=True
+        ),
+    )
+    riding = offcfg.build_page_namespace(config, _lmcache_config(), 4)
+    monkeypatch.setenv("ATOM_DSPARK_DRAFT_KV_WINDOW", "1")
+    windowed = offcfg.build_page_namespace(config, _lmcache_config(), 4)
+    assert windowed != riding
+    # A DSpark draft found from its checkpoint, with the method left empty or
+    # eagle3, builds the same windowed pool, so the switch names it too.
+    config.speculative_config.draft_model_hf_config.dspark_block_size = 8
+    for method in ("", "eagle3"):
+        config.speculative_config.method = method
+        on = offcfg.build_page_namespace(config, _lmcache_config(), 4)
+        monkeypatch.delenv("ATOM_DSPARK_DRAFT_KV_WINDOW")
+        assert offcfg.build_page_namespace(config, _lmcache_config(), 4) != on
+        monkeypatch.setenv("ATOM_DSPARK_DRAFT_KV_WINDOW", "1")
+    # A V4 DSpark draft rides inside its target and owns no pool: its window
+    # moves nothing, so the switch names nothing either.
+    config.speculative_config.draft_model_hf_config.dspark_with_draft = False
+    inline = offcfg.build_page_namespace(config, _lmcache_config(), 4)
+    monkeypatch.delenv("ATOM_DSPARK_DRAFT_KV_WINDOW")
+    assert offcfg.build_page_namespace(config, _lmcache_config(), 4) == inline
+    monkeypatch.setenv("ATOM_DSPARK_DRAFT_KV_WINDOW", "1")
+    config.speculative_config.draft_model_hf_config.dspark_with_draft = True
+    config.speculative_config.method = "dspark"
+    config.speculative_config.draft_model_hf_config.sliding_window = 0
+    no_window = offcfg.build_page_namespace(config, _lmcache_config(), 4)
+    monkeypatch.delenv("ATOM_DSPARK_DRAFT_KV_WINDOW")
+    assert offcfg.build_page_namespace(config, _lmcache_config(), 4) == no_window
+
+
+def test_the_windowed_draft_switch_leaves_a_plugin_namespace_alone(monkeypatch):
+    """Under a plugin the framework owns the draft, and its speculative config
+    (vLLM's, as the offload shim forwards it) has none of ATOM's queries."""
+    from atom.plugin import prepare
+
+    monkeypatch.setattr(prepare, "_CURRENT_FRAMEWORK", "vllm")
+    config = _config()
+    config.speculative_config = SimpleNamespace(
+        method="dspark", model="/d", num_speculative_tokens=3
+    )
+    riding = offcfg.build_page_namespace(config, _lmcache_config(), 4)
+    monkeypatch.setenv("ATOM_DSPARK_DRAFT_KV_WINDOW", "1")
+    assert offcfg.build_page_namespace(config, _lmcache_config(), 4) == riding
 
 
 def test_page_namespace_changes_when_code_layout_version_changes():

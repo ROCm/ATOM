@@ -354,6 +354,26 @@ def snapshot_kv_encoding(hf: object) -> str:
     return json.dumps(fields, sort_keys=True, default=str)
 
 
+def _draft_kv_window(config) -> int:
+    """The window a DSpark draft keeps its KV to under
+    `ATOM_DSPARK_DRAFT_KV_WINDOW` (`spec_decode/draft_kv.py`), 0 otherwise."""
+    from atom.plugin import is_plugin_mode
+    from atom.utils import envs
+
+    # Only a separate DSpark draft builds a pool of its own, whatever its method;
+    # under a plugin the framework owns the draft and its speculative config.
+    spec = getattr(config, "speculative_config", None)
+    if (
+        not envs.ATOM_DSPARK_DRAFT_KV_WINDOW
+        or spec is None
+        or is_plugin_mode()
+        or not spec.use_dspark_with_draft()
+    ):
+        return 0
+    draft = spec.draft_model_hf_config
+    return int(getattr(draft, "sliding_window", 0) or 0)
+
+
 def build_page_namespace(
     config,
     cfg,
@@ -423,6 +443,11 @@ def build_page_namespace(
         or _stable_hf_geometry(hf),
         "speculative_config": speculative,
     }
+    # A windowed draft's PAGE units carry none of its rows; named only when set,
+    # so every other namespace is the one it was.
+    draft_window = _draft_kv_window(config)
+    if draft_window:
+        document["draft_kv_window"] = draft_window
     # Snapshot at startup, before scheduler/worker config copies diverge.
     # Needed even for PAGE-only offload, which has no checkpoint layout_id.
     index_layout = getattr(config, "index_cache_layout", None)

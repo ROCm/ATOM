@@ -593,6 +593,7 @@ def test_dspark_proposer_hands_the_model_its_own_stripe(monkeypatch):
     full = [b[:n] for b in bufs]
     drafter = SimpleNamespace(
         model=model,
+        runner=SimpleNamespace(),  # no `draft_kv_builder`: every row is written
         _captures_aux=True,
         _aux_buffers=bufs,
         _relayed_aux=None,

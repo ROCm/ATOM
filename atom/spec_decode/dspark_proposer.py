@@ -460,7 +460,7 @@ class DSparkProposer(Drafter):
         # latent binds into the target's pool and answers None. ModelRunner
         # keys its draft-pool allocation and per-module binding off the
         # presence of this attribute, so None simply never sets it.
-        builder = draft_kv_builder(self.runner, draft_hf, model)
+        builder = draft_kv_builder(self.runner, draft_hf, model, spec_tokens=self.mtp_k)
         if builder is not None:
             self.runner.draft_kv_builder = builder
         return model
@@ -755,7 +755,21 @@ class DSparkProposer(Drafter):
         if taps is None:
             return
         spec = self.model.kv_pool_spec
-        if spec is not None and spec.needs_own_ctx_slots(self.config):
+        draft_pool = getattr(self.runner, "draft_kv_builder", None)
+        kept = (
+            None
+            if draft_pool is None
+            else draft_pool.kept_context(forward_context.attn_metadata, num_rows)
+        )
+        if kept is not None:
+            # A windowed pool writes only the rows inside its runs, at their slots.
+            rows, slot_mapping = kept
+            if not slot_mapping.shape[0]:
+                return
+            if rows is not None:
+                taps = [t.index_select(0, rows) for t in taps]
+                positions = positions.index_select(0, rows)
+        elif spec is not None and spec.needs_own_ctx_slots(self.config):
             ctx_slots = self.runner.forward_vars.get("draft_ctx_slots")
             if ctx_slots is None:
                 raise RuntimeError(
@@ -1059,7 +1073,8 @@ class DSparkProposer(Drafter):
         attn_metadata.max_seqlen_k = max_seqlen_k
         if not self.model.block_attention_is_mla:
             # A non-MLA block read builds what it reads itself, so no CSR or
-            # MLA plan is built.
+            # MLA plan is built. A windowed draft pool hands over its own runs.
+            draft_pool = getattr(self.runner, "draft_kv_builder", None)
             self.model.prepare_paged_block(
                 attn_metadata,
                 block_tables,
@@ -1069,6 +1084,7 @@ class DSparkProposer(Drafter):
                 block_table_state(self.runner.forward_vars["block_tables"]).lengths,
                 scheduled_bs,
                 entry_tokens,
+                draft_pool.block_runs(running_bs) if draft_pool is not None else None,
             )
             return
         # `kv_indptr` is a cumsum of these, and it must not promise more

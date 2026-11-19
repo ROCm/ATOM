@@ -1,4 +1,5 @@
 import logging
+import math
 from dataclasses import dataclass
 from functools import partial
 from typing import NamedTuple
@@ -7,14 +8,24 @@ import numpy as np
 import torch
 
 from atom.config import KVCacheTensor
+from atom.model_engine.draft_window import DRAFT_WINDOW_CLASS, DraftWindowGeometry
 from atom.model_ops.attentions.pool_layout.pool_rows import PoolRowsMixin
-from atom.model_ops.attentions.pool_layout.sub_pool_spec import SubPoolSpec, page_pool
+from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
+    SubPoolSpec,
+    page_pool,
+    state_pool,
+)
+from atom.utils import CpuGpuBuffer, envs
 
 logger = logging.getLogger("atom")
 
 # This pool's one row space. Named, not a geometry: `make_kv_pool` already
 # settled the draft's geometry, and there is only ever the one.
 DRAFT_KV_ROWS = "draft_kv"
+
+# Blocks a forward's window table holds past `blocks_per_req`, for how far the
+# scheduler runs ahead of the finalized tokens; a longer run is refused, not cut.
+_WINDOW_TABLE_SLACK = 2
 
 
 # The methods whose proposer calls `draft_kv_builder`; the others (MTP, ngram) run
@@ -110,7 +121,7 @@ def draft_kv_dtype(config) -> torch.dtype:
     return dtypes.d_dtypes[config.kv_cache_dtype]
 
 
-def draft_kv_builder(model_runner, draft_hf, model):
+def draft_kv_builder(model_runner, draft_hf, model, *, spec_tokens: int = 0):
     """The KV builder a draft needs of its own, or None if it needs none.
 
     A draft is not an attention flavor; it is a model that has one. So the
@@ -123,7 +134,8 @@ def draft_kv_builder(model_runner, draft_hf, model):
     flavor is a table entry and a `make_kv_pool` on that backend.
 
     `model` is the built draft; its `kv_pool_spec` (None, or undeclared as on
-    Eagle3, is the generic pool) adds to the pool's kwargs.
+    Eagle3, is the generic pool) adds to the pool's kwargs. Its `kv_read_window`
+    sizes a windowed pool under `ATOM_DSPARK_DRAFT_KV_WINDOW`.
     """
     spec = getattr(model, "kv_pool_spec", None)
     if spec is not None and spec.kv_scale != 1.0:
@@ -166,8 +178,86 @@ def draft_kv_builder(model_runner, draft_hf, model):
     # say, and this runs from the proposer's `__init__` -- `build_drafter`
     # still running, `runner.drafter` not yet set, nothing to walk.
     return DraftKvBuilder(
-        model_runner, make_pool, block_size=block_size, kv_scale=kv_scale
+        model_runner,
+        make_pool,
+        block_size=block_size,
+        kv_scale=kv_scale,
+        window=draft_window_geometry(
+            model_runner.config, getattr(model, "kv_read_window", None), spec_tokens
+        ),
     )
+
+
+def draft_window_geometry(
+    config, read_window, spec_tokens: int
+) -> DraftWindowGeometry | None:
+    """The window a draft's pool is sized to, or None to ride the target's ids."""
+    if read_window is None or not envs.ATOM_DSPARK_DRAFT_KV_WINDOW:
+        return None
+    window, read_page = read_window
+    if not window:
+        return None
+    refuse_unsupported_draft_window(config)
+    return DraftWindowGeometry(
+        window=int(window),
+        read_page=int(read_page),
+        block_size=config.kv_cache_block_size,
+        spec_tokens=int(spec_tokens),
+    )
+
+
+def refuse_unsupported_draft_window(config) -> None:
+    """Refuse, at startup, the deployments a windowed draft pool does not run in:
+    each moves or reads draft rows by the target's block ids, or splits them."""
+    # The factory's own walk and names: an omitted `kv_connector` is MoRI-IO and
+    # names fold case. None is a malformed `multi`, which its build refuses.
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    why = None
+    if config.pipeline_parallel_size > 1:
+        why = "pipeline parallelism (the head schedules a pool its last stage sizes)"
+    elif config.prefill_context_parallel_size > 1:
+        why = "prefill context parallelism (a rank holds a stripe of the context rows)"
+    elif config.enable_rapidserve:
+        why = "RapidServe (the decode side imports a pool laid out by block id)"
+    for name, leaf in KVConnectorFactory.leaf_connectors(config) or ():
+        if why is not None:
+            break
+        if name == "moriio":
+            why = "the MoRI-IO connector (it transfers draft rows by target block)"
+        elif leaf.kv_transfer_config.get("enable_chunked_transfer"):
+            why = "chunked P/D transfer (it sends draft rows chunk by chunk)"
+    if why is not None:
+        raise ValueError(
+            f"ATOM_DSPARK_DRAFT_KV_WINDOW=1 does not support {why}; unset it to "
+            "keep the draft's KV in the target's block ids"
+        )
+
+
+def draft_context_slots(
+    positions: np.ndarray,
+    seqlens: np.ndarray,
+    first: np.ndarray,
+    extent: np.ndarray,
+    tables: np.ndarray,
+    block_size: int,
+    *,
+    rows_out: np.ndarray,
+    slots_out: np.ndarray,
+) -> int:
+    """The context rows a windowed draft writes, and where: row `j` of request
+    `r` is kept when its block is in `[first[r], extent[r])`. Returns the count.
+    """
+    req = np.repeat(np.arange(len(seqlens)), seqlens)
+    col = positions // block_size - first[req]
+    rows = np.flatnonzero((col >= 0) & (col < (extent - first)[req]))
+    ids = tables[req[rows], col[rows]].astype(np.int64)
+    # A held run has no hole in it; were one there, its rows go nowhere.
+    rows, ids = rows[ids >= 0], ids[ids >= 0]
+    n = len(rows)
+    rows_out[:n] = rows
+    slots_out[:n] = ids * block_size + positions[rows] % block_size
+    return n
 
 
 class DraftKvBuilder(PoolRowsMixin):
@@ -190,7 +280,13 @@ class DraftKvBuilder(PoolRowsMixin):
     `kv_scale` is the per-tensor scale the draft's `kv_pool_spec` declares;
     None, for a draft that declares no spec, binds the pool's own fp8 scale
     planes instead.
+
+    With a `window`, a Pool.STATE pool of its own ids (`DraftWindowPool`'s)
+    instead, whose runs each forward stages (`prepare_step`).
     """
+
+    # Class-level so a builder made without `__init__` rides the target's ids.
+    window: DraftWindowGeometry | None = None
 
     def __init__(
         self,
@@ -198,8 +294,10 @@ class DraftKvBuilder(PoolRowsMixin):
         make_pool,
         block_size: int | None = None,
         kv_scale: float | None = None,
+        window: DraftWindowGeometry | None = None,
     ):
         self.model_runner = model_runner
+        self.window = window
         self._make_pool = make_pool
         self._block_size = block_size
         self._kv_scale = kv_scale
@@ -251,16 +349,38 @@ class DraftKvBuilder(PoolRowsMixin):
 
     def sub_pool_specs(self) -> list[SubPoolSpec]:
         """`page_pool` puts the draft in the target's entry class, so the two
-        contributions sum into one per-block cost instead of a second pool."""
-        return [page_pool(self.kv_pool.entry_bytes)]
+        contributions sum into one per-block cost instead of a second pool.
+
+        A windowed pool is a STATE class instead: a window per request in
+        flight, plus finished requests' windows kept for prefix hits.
+        """
+        if self.window is None:
+            return [page_pool(self.kv_pool.entry_bytes)]
+        per_req = self.window.blocks_per_req
+        # Rounded up, so a fraction of a window per slot still keeps one.
+        cached = math.ceil(
+            envs.ATOM_DSPARK_DRAFT_KV_WINDOW_CACHE
+            * self.model_runner.config.max_num_seqs
+        )
+        return [
+            state_pool(
+                DRAFT_WINDOW_CLASS,
+                self.kv_pool.entry_bytes,
+                entries_per_req=per_req,
+                extra_entries=cached * per_req,
+            )
+        ]
 
     def paged_pool_bytes(self, blocks: int) -> int:
         """The draft's share of the runner's one paged allocation.
 
         The same `entry_bytes` `sub_pool_specs` adds to the target's, so the
         draft's region is exactly what the block budget already charged for
-        it -- which is what "riding the target's block ids" costs.
+        it -- which is what "riding the target's block ids" costs. A windowed
+        pool takes none of it: it is sized at its own count.
         """
+        if self.window is not None:
+            return 0
         return self.kv_pool.pool_bytes(blocks)
 
     def allocate_kv_cache_tensors(self, *, blocks: int, buf) -> dict:
@@ -269,7 +389,8 @@ class DraftKvBuilder(PoolRowsMixin):
         readers.
 
         One entry per scheduler block, the count the target was built at --
-        that is what riding the target's block ids means.
+        that is what riding the target's block ids means. A windowed pool is
+        built at its own class's count, in memory of its own.
         """
         runner = self.model_runner
         pool = self.kv_pool
@@ -286,14 +407,31 @@ class DraftKvBuilder(PoolRowsMixin):
                 "entry per scheduler block and indexed by the target's block "
                 "tables, so all three are one number"
             )
-        self.num_blocks = blocks
-        pool.allocate(blocks, runner.device, buf=buf)
+        if self.window is None:
+            self.num_blocks = blocks
+            pool.allocate(blocks, runner.device, buf=buf)
+            logger.info(
+                "Allocated draft KV pool: %d blocks, %d B per block entry, "
+                "%d B of the paged allocation",
+                blocks,
+                pool.entry_bytes,
+                pool.pool_bytes(blocks),
+            )
+            return {}
+        self.num_blocks = runner.pool_plan.entries[DRAFT_WINDOW_CLASS]
+        pool.allocate(self.num_blocks, runner.device)
+        gib = 1 << 30
         logger.info(
-            "Allocated draft KV pool: %d blocks, %d B per block entry, "
-            "%d B of the paged allocation",
+            "Allocated windowed draft KV pool: %d blocks (%d per request for a "
+            "%d-token window, %d cached past the running requests), %.2f GiB; "
+            "one draft block per target block would be %d blocks, %.2f GiB",
+            self.num_blocks,
+            self.window.blocks_per_req,
+            self.window.window,
+            self.num_blocks - runner.config.max_num_seqs * self.window.blocks_per_req,
+            pool.pool_bytes(self.num_blocks) / gib,
             blocks,
-            pool.entry_bytes,
-            pool.pool_bytes(blocks),
+            pool.pool_bytes(blocks) / gib,
         )
         return {}
 
@@ -356,24 +494,177 @@ class DraftKvBuilder(PoolRowsMixin):
         )
 
     def get_kv_transfer_tensors(self):
-        from atom.kv_transfer.disaggregation.types import KVTransferTensors
+        """The draft's regions and how it keeps them: riding the target's ids,
+        more PAGE units of its blocks; windowed, `draft_pages` on ids of its own."""
+        from atom.kv_transfer.disaggregation.types import (
+            DRAFT_LAYOUT_FULL,
+            DRAFT_LAYOUT_WINDOW,
+            KVTransferTensors,
+        )
 
         pool, rows = self.kv_pool, self.pool_rows[DRAFT_KV_ROWS]
         modules = sorted(rows, key=rows.get)
+        # Described by its pool like the target's, under a namespace of its own.
+        pages = pool.transfer_pages(
+            "draft",
+            "draft",
+            [m.layer_num for m in modules],
+            # Each binding declares the page it reads its cache in.
+            [
+                pool.block_size if m.page_tokens is None else m.page_tokens
+                for m in modules
+            ],
+        )
+        # A paged MHA/GQA draft is a per-rank shard. Appending it to an
+        # otherwise replicated target must disable whole-object collapse.
+        if self.window is None:
+            return KVTransferTensors(
+                pages=pages, tp_replication_factor=1, draft_layout=DRAFT_LAYOUT_FULL
+            )
+        for page in pages:
+            region = page.region
+            if region.total_bytes != region.unit_bytes * self.num_blocks:
+                raise ValueError(
+                    f"draft region {region.semantic_role} holds "
+                    f"{region.total_bytes} B, not {self.num_blocks} blocks of "
+                    f"{region.unit_bytes} B"
+                )
         return KVTransferTensors(
-            # Described by its pool like the target's, under a namespace of its
-            # own: its rows sit in the same block ids.
-            pages=pool.transfer_pages(
-                "draft",
-                "draft",
-                [m.layer_num for m in modules],
-                # Each binding declares the page it reads its cache in.
-                [
-                    pool.block_size if m.page_tokens is None else m.page_tokens
-                    for m in modules
-                ],
-            ),
-            # A paged MHA/GQA draft is a per-rank shard. Appending it to an
-            # otherwise replicated target must disable whole-object collapse.
             tp_replication_factor=1,
+            draft_layout=DRAFT_LAYOUT_WINDOW,
+            draft_pages=pages,
+        )
+
+    # ------------------------- windowed step staging ------------------------- #
+    def step_buffers(self) -> dict[str, CpuGpuBuffer]:
+        """The per-forward staging a windowed pool reads, for `forward_vars`."""
+        if self.window is None:
+            return {}
+        runner = self.model_runner
+        max_bs = runner.config.max_num_seqs
+        tokens = runner.config.max_num_batched_tokens
+        pinned = torch.device(runner.device).type != "cpu"
+        i32 = {"dtype": torch.int32, "device": runner.device, "pin_memory": pinned}
+        i64 = {"dtype": torch.int64, "device": runner.device, "pin_memory": pinned}
+        return {
+            # Each request's held run of draft block ids, from its first block.
+            "draft_window_tables": CpuGpuBuffer(
+                max_bs, self.window.blocks_per_req + _WINDOW_TABLE_SLACK, **i32
+            ),
+            "draft_window_first": CpuGpuBuffer(max_bs, **i32),
+            # The block each run reaches, read on the host only.
+            "draft_window_extent": CpuGpuBuffer(max_bs, **i32),
+            "draft_context_rows": CpuGpuBuffer(tokens, **i64),
+            "draft_context_slots": CpuGpuBuffer(tokens, **i64),
+        }
+
+    def prepare_step(
+        self,
+        batch,
+        attn_metadata,
+        *,
+        positions: np.ndarray,
+        seqlens: np.ndarray,
+        running_bs: int,
+        decode: bool,
+    ) -> None:
+        """Stage this forward's runs, and on its own `attn_metadata` the context
+        rows inside them; a pad row reads one page of block 0 and writes nothing."""
+        if self.window is None:
+            return
+        var = self.model_runner.forward_vars
+        tables = var["draft_window_tables"]
+        first = var["draft_window_first"]
+        extent = var["draft_window_extent"]
+        tables.np[:running_bs] = 0
+        first.np[:running_bs] = 0
+        extent.np[:running_bs] = 1
+        attn_metadata.draft_context = (
+            var["draft_context_rows"].gpu[:0],
+            var["draft_context_slots"].gpu[:0],
+            False,
+        )
+        windows = getattr(batch, "draft_windows", None)
+        bs = len(seqlens)
+        if windows is not None and bs:
+            starts, lengths, ids = windows
+            starts, lengths = starts[:bs], lengths[:bs]
+            width = tables.np.shape[1]
+            if lengths.max(initial=0) > width:
+                row = int(lengths.argmax())
+                raise RuntimeError(
+                    f"request row {row} holds {int(lengths[row])} draft window "
+                    f"blocks, more than the {width} a forward's table has; the "
+                    "scheduler ran further ahead of the finalized tokens than "
+                    "`DraftWindowGeometry.scheduled_slack` allows for"
+                )
+            # One scatter for the whole batch: row `req[j]`, column `col[j]`.
+            ends = np.cumsum(lengths)
+            req = np.repeat(np.arange(bs), lengths)
+            col = np.arange(int(ends[-1])) - np.repeat(ends - lengths, lengths)
+            tables.np[req, col] = ids[: len(req)]
+            first.np[:bs] = starts
+            extent.np[:bs] = starts + lengths
+            if decode:
+                self._check_decode_reads(positions, seqlens, first.np[:bs])
+            n = draft_context_slots(
+                positions,
+                seqlens,
+                first.np[:bs],
+                extent.np[:bs],
+                tables.np[:bs],
+                self.window.block_size,
+                rows_out=var["draft_context_rows"].np,
+                slots_out=var["draft_context_slots"].np,
+            )
+            if n:
+                attn_metadata.draft_context = (
+                    var["draft_context_rows"].copy_to_gpu(n),
+                    var["draft_context_slots"].copy_to_gpu(n),
+                    n == len(positions),
+                )
+        tables.copy_to_gpu(running_bs)
+        first.copy_to_gpu(running_bs)
+
+    def _check_decode_reads(
+        self, positions: np.ndarray, seqlens: np.ndarray, first: np.ndarray
+    ) -> None:
+        """Refuse a decode whose block pass could read below a request's run,
+        where the window table holds another request's rows."""
+        geo = self.window
+        starts = positions[np.cumsum(seqlens) - seqlens]
+        read = np.maximum(0, starts + 2 - geo.window)
+        need = (read - read % geo.read_page) // geo.block_size
+        bad = np.flatnonzero(first > need)
+        if len(bad):
+            row = int(bad[0])
+            raise RuntimeError(
+                f"request row {row} holds draft blocks from {int(first[row])} "
+                f"on, but its block pass anchored at or past position "
+                f"{int(starts[row])} reads block {int(need[row])}"
+            )
+
+    def kept_context(self, attn_metadata, num_rows: int):
+        """`(rows, slots)` of the context rows a forward of `num_rows` writes into a
+        windowed pool, `rows` None when it is all of them; None when the pool rides."""
+        if self.window is None:
+            return None
+        staged = getattr(attn_metadata, "draft_context", None)
+        if staged is None:
+            raise RuntimeError(
+                "this forward staged no draft window (`DraftKvBuilder.prepare_step`)"
+            )
+        rows, slots, all_scheduled = staged
+        return (None if all_scheduled and len(slots) == num_rows else rows), slots
+
+    def block_runs(self, running_bs: int) -> DraftRuns | None:
+        """The runs a block pass at `running_bs` rows reads, or None when the
+        pool rides the target's ids."""
+        if self.window is None:
+            return None
+        var = self.model_runner.forward_vars
+        return DraftRuns(
+            var["draft_window_tables"].gpu[:running_bs],
+            var["draft_window_first"].gpu[:running_bs],
+            var["draft_window_extent"].np[:running_bs],
         )

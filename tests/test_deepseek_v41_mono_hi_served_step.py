@@ -31,6 +31,7 @@ def _context(monkeypatch, module, service):
 
 def _proposer(module, writes):
     p = module.DSparkProposer.__new__(module.DSparkProposer)
+    p.runner = SimpleNamespace()  # no `draft_kv_builder`: every row is written
     p.model = SimpleNamespace(
         # Each tap's shape, so a proposer that joined the taps first fails.
         write_context_kv=lambda taps, positions, slots: writes.append(
