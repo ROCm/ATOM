@@ -16,8 +16,15 @@ for s in fetch.sh triage.py render.sh run_one.sh _lib.py _gates.py _collect.py _
   chk "$s present" "[ -f '$S/$s' ]" "missing $S/$s"
 done
 
-echo "[prompt drift]"
-if python3 "$S/check_prompts.py" >/dev/null 2>&1; then echo "  ✅ prompts match SKILL.md verbatim"; ok=$((ok+1)); else echo "  ❌ prompts drifted from SKILL.md — re-copy the quoted sections"; bad=$((bad+1)); fi
+echo "[check_prompts]"
+# Two of check_prompts' sixteen checks are drift; naming them all "drift" sends the reader
+# to regenerate files that were never the problem. Print what it said.
+if _cp="$(python3 "$S/check_prompts.py" 2>&1)"; then echo "  ✅ check_prompts.py passes (prompts verbatim, guards wired)"; ok=$((ok+1));
+else
+  echo "  ❌ check_prompts.py refused:"
+  printf '%s\n' "$_cp" | grep '^❌' | sed 's/^/     /' || printf '%s\n' "$_cp" | tail -3 | sed 's/^/     /'
+  bad=$((bad+1))
+fi
 
 echo "[tooling guards]"
 st=$(bash "$S/selftest.sh" 2>&1); st_rc=$?
