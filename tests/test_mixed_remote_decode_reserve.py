@@ -72,7 +72,8 @@ def test_promoted_remote_decodes_keep_their_append_pages(prefix, width, receives
 
 
 @pytest.mark.parametrize("mixed", [False, True])
-def test_pure_decode_skips_prefill_reservation(monkeypatch, mixed):
+@pytest.mark.parametrize("receiving", [False, True])
+def test_pure_decode_skips_prefill_reservation(monkeypatch, mixed, receiving):
     sched = Scheduler(MockConfig(enable_mixed_prefill_decode=mixed))
     seq = Sequence([3] * 4, block_size=4)
     assert sched.block_manager.allocate(seq, 0)
@@ -81,6 +82,13 @@ def test_pure_decode_skips_prefill_reservation(monkeypatch, mixed):
     seq.type = SequenceType.DECODE
     seq.status = SequenceStatus.RUNNING
     sched.running.append(seq)
+    if receiving:
+        sched.kv_connector = _ConnectorNamespace(is_producer=False, is_offload=False)
+        remote = Sequence([9] * 4, block_size=4)
+        sched.add(remote)
+        assert sched.block_manager.allocate(remote, 0)
+        remote.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+        sched._count_inflight_load(remote)
     reserve = Mock(
         side_effect=AssertionError("pure decode has no prefill to reserve for")
     )

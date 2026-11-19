@@ -113,7 +113,7 @@ A new prefill is scheduled only when the earliest waiting request has waited lon
 
 ### Preemption
 
-When a decode step cannot extend a sequence's KV cache (no free blocks), the scheduler preempts the **last** running sequence:
+When a decode step cannot extend a sequence's KV cache, the scheduler scans the running queue from the tail for a preemptable request. Connector-pinned requests are skipped. If no queued victim can release space, the current decode may preempt itself. With mixed scheduling, prefill admission and continuation first check the decode page reservation; insufficient capacity skips prefill for that tick, keeping partial prompts in this same victim queue.
 
 ```python
 def preempt(self, seq: Sequence) -> bool:
@@ -854,6 +854,13 @@ pending/cost/head probes, and actual admission. Each P/D receive promoted
 to first decode adds its demand to that reservation before the next prompt
 can be admitted; this does not rescan the running queue.
 This reservation does not allocate pages and includes speculative lookahead.
+It covers the current tick, not a prompt's lifetime. Each subsequent chunk
+rechecks the running decodes' current append demand. If available page capacity
+(including reclaimable checkpoints) cannot cover it, the prefill token budget
+is zero for both continuation and new admission, and for the corresponding
+probes. The tick then follows ordinary decode scheduling: a newer partial
+prompt remains eligible for tail-first preemption instead of displacing an
+older decode. The one-eighth token floor applies only when this KV check passes.
 It excludes requests already scheduled as prefill in the current step, while
 including completed prefills waiting for their first decode.
 
