@@ -107,6 +107,9 @@ class Indexer(nn.Module):
             quant_config=converted_linear_config(config),
         )
         self.weights_proj = ReplicatedLinear(config.hidden_size, self.heads, bias=False)
+        # Read the fuse flag once: `project` runs it under `@eager_region`, so
+        # an `os.getenv` there would cost ~1.5us every step.
+        self.fuse_weights_proj = envs.ATOM_DSV41_FUSE_WEIGHTS_PROJ
         if spec.mode == AttentionMode.FULL:
             self.wk = ReplicatedLinear(config.head_dim, self.head_dim, bias=False)
             self.k_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
@@ -156,12 +159,13 @@ class Indexer(nn.Module):
         if cache.geometry.index_fp4:
             units = cache.index_units[self.spec.kv_owner]
             if can_fuse_weights_proj(
-                units.layout, query[0], hidden[0], self.weights_proj.weight, rope
+                self.fuse_weights_proj, units.layout, query.shape[1]
             ):
-                # One launch rotates + MXFP4-quantizes the query AND projects
-                # the head weights, so weights_proj is not a separate GEMM.
-                # The scorer still folds `weights_scale` (see score_quantized),
-                # so the fused weights stay raw (weights_scale=1.0 here).
+                # The query's RoPE + MXFP4 quant launch also projects the head
+                # weights, folding `weights_proj` into it rather than running it
+                # as a separate GEMM. The scorer still folds `weights_scale`
+                # (see score_quantized), so the fused weights stay raw
+                # (weights_scale=1.0 here).
                 return project_query_fp4(
                     query[0], rope, positions, hidden[0], self.weights_proj.weight
                 )

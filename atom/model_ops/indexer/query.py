@@ -15,7 +15,6 @@ from aiter import dtypes, rope_rotate_activation
 from aiter.ops.quant import dynamic_per_token_scaled_quant
 
 from atom.model_ops.v4_kernels import scale_indexer_weights
-from atom.utils import envs
 
 from .layout import MFMA, NATURAL, PRESHUFFLE
 
@@ -109,88 +108,70 @@ def fold_query_scale(
 
 
 # gfx1250 FP4 indexer: the per-layer `weights_proj` GEMM folded into the query
-# RoPE/MXFP4-quant launch (aiter `q_rope_mxfp4_quant`). Above this many decode
-# rows the standalone bf16 GEMM is the faster kernel (it is not launch-bound),
-# matching the vLLM reference's 128-row gate; the aiter projection K-loop also
-# tiles the hidden width by _PROJECT_BLOCK_K, which must divide it.
+# RoPE/MXFP4-quant launch (aiter `q_rope_mxfp4_quant`). Above this many rows the
+# standalone bf16 GEMM is the faster kernel (it is not launch-bound), matching
+# the vLLM reference's 128-row gate.
 _MAX_FUSED_PROJECT_ROWS = 128
-_PROJECT_BLOCK_K = 256
 
-# `[max_pos, rope_dim]` cos|sin tables, built once per rope buffer set rather
-# than concatenated every decode step, keyed on the source tables' identity.
-_cos_sin_cache: dict = {}
+_INDEXER_COS_SIN_CACHE = "_dsv41_indexer_cos_sin_cache"
 
 
-def _gfx1250() -> bool:
-    try:
-        from aiter.jit.utils.chip_info import get_gfx_runtime
+def can_fuse_weights_proj(enabled: bool, layout: str, rows: int) -> bool:
+    """ATOM's policy for folding the `weights_proj` GEMM into the query-quant
+    launch: the fuse flag on, the gfx1250-only FP4 NATURAL plane (the other
+    layouts have no such kernel), and a row count the aiter projection serves
+    better than the standalone GEMM. The tensor shapes are fixed by the one
+    V4.1 caller and re-validated by aiter, which raises on a bad one; a False
+    here just keeps the always-correct separate GEMM."""
+    return enabled and layout == NATURAL and 0 < rows <= _MAX_FUSED_PROJECT_ROWS
 
-        return get_gfx_runtime() == "gfx1250"
-    except Exception:
-        return False
 
-
-def _combined_cos_sin(cos_cache: torch.Tensor, sin_cache: torch.Tensor):
+def _indexer_cos_sin_cache(rope: torch.nn.Module) -> torch.Tensor:
     """`[max_pos, rope_dim]`, the cos half then the sin half, as
-    `q_rope_mxfp4_quant` reads its table -- the same `cos_cache`/`sin_cache`
-    halves `quantize_query` hands the HIP op, concatenated."""
-    key = (cos_cache.data_ptr(), sin_cache.data_ptr(), str(cos_cache.device))
-    hit = _cos_sin_cache.get(key)
-    if hit is None:
-        hit = torch.cat((cos_cache, sin_cache), dim=-1).contiguous()
-        _cos_sin_cache[key] = hit
-    return hit
-
-
-def can_fuse_weights_proj(layout, query, hidden, weights_proj_weight, rope) -> bool:
-    """Whether `project_query_fp4` can fold the `weights_proj` GEMM into the
-    query-quant launch for this step: the gfx1250 FP4 NATURAL plane, at most
-    128 decode rows, a unit-stride query, a 2-D hidden one row per query row,
-    and a plain bf16/fp16 projection `[heads, hidden]` whose width the K-loop
-    tiles evenly. Any unmet precondition falls back to the separate GEMM, which
-    is always correct."""
-    return (
-        envs.ATOM_DSV41_FUSE_WEIGHTS_PROJ
-        and layout == NATURAL
-        and query.ndim == 3
-        and query.stride(-1) == 1
-        and 0 < query.shape[0] <= _MAX_FUSED_PROJECT_ROWS
-        and hidden.ndim == 2
-        and hidden.shape[0] == query.shape[0]
-        and hidden.stride(-1) == 1
-        and hidden.dtype in (torch.bfloat16, torch.float16)
-        and weights_proj_weight.ndim == 2
-        and weights_proj_weight.dtype in (torch.bfloat16, torch.float16)
-        and weights_proj_weight.stride(-1) == 1
-        and weights_proj_weight.shape[0] == query.shape[1]
-        and weights_proj_weight.shape[1] == hidden.shape[1]
-        and weights_proj_weight.shape[1] % _PROJECT_BLOCK_K == 0
-        and hasattr(rope, "cos_cache")
-        and hasattr(rope, "sin_cache")
-        and _gfx1250()
-    )
+    `q_rope_mxfp4_quant` reads its table -- the `cos_cache`/`sin_cache` halves
+    `quantize_query` hands the HIP op, concatenated. Memoized on the rope
+    module as a non-persistent buffer so it is built once and freed with the
+    rope, not kept in a process-global keyed on a reused address."""
+    cos = rope.cos_cache.squeeze(-2).squeeze(-2)
+    cached = getattr(rope, _INDEXER_COS_SIN_CACHE, None)
+    expected = (*cos.shape[:-1], cos.shape[-1] * 2)
+    if (
+        cached is not None
+        and cached.device == cos.device
+        and cached.dtype == cos.dtype
+        and tuple(cached.shape) == expected
+    ):
+        return cached
+    sin = rope.sin_cache.squeeze(-2).squeeze(-2)
+    cos_sin = torch.cat((cos, sin), dim=-1).contiguous()
+    if torch.compiler.is_compiling():
+        return cos_sin
+    if _INDEXER_COS_SIN_CACHE in rope._buffers:
+        rope._buffers[_INDEXER_COS_SIN_CACHE] = cos_sin
+    else:
+        rope.register_buffer(_INDEXER_COS_SIN_CACHE, cos_sin, persistent=False)
+    return cos_sin
 
 
 def project_query_fp4(query, rope, positions, hidden, weights_proj_weight):
     """`((values, scales), weights)` for the FP4 NATURAL plane with the head
-    weights projected inside the quant launch, so the per-layer `weights_proj`
-    GEMM is not its own launch. `query` is [rows, heads, dim], `hidden` [rows,
+    weights projected inside the quant launch, folding the per-layer
+    `weights_proj` GEMM into it. `query` is [rows, heads, dim], `hidden` [rows,
     hidden], `weights_proj_weight` [heads, hidden]. `(values, scales)` match
     `quantize_query`'s NATURAL FP4 branch; `weights` [rows, heads] is the raw
     bf16 projection `Indexer.project` returns, which `score_quantized` then
     folds `weights_scale` into (so no scale is applied here).
 
-    Caller guards the shapes with `can_fuse_weights_proj`."""
+    Caller gates on `can_fuse_weights_proj`."""
     from aiter.ops.triton.rope.q_rope_mxfp4_quant import q_rope_mxfp4_quant
 
     q_fp4, q_scale, weights = q_rope_mxfp4_quant(
         query,
         positions,
-        _combined_cos_sin(rope.cos_cache, rope.sin_cache),
+        _indexer_cos_sin_cache(rope),
         weights_scale=1.0,
         hidden=hidden.contiguous(),
         weights_proj=weights_proj_weight,
-        proj_block_k=_PROJECT_BLOCK_K,
     )
     # The OPUS FP4 MQA scorer reads BF16 head weights, as the baseline
     # `weights_proj` GEMM emits; the aiter op returns them f32, so round back

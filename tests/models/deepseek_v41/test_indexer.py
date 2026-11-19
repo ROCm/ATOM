@@ -881,3 +881,32 @@ def test_scorer_runs_in_its_workspace_and_selects_the_same_rows():
     for got, want in zip(actual, expected):
         torch.testing.assert_close(got, want, rtol=0, atol=0)
     assert observed == [space.logits(1, 1).data_ptr()]
+
+
+@pytest.mark.parametrize(
+    "enabled,layout,rows,expected",
+    [
+        # Folds: the fuse flag, the gfx1250 FP4 NATURAL plane, 1..128 rows.
+        (True, "natural", 1, True),
+        (True, "natural", 48, True),
+        (True, "natural", 128, True),
+        # Falls back to the standalone GEMM, which is always correct.
+        (True, "natural", 129, False),  # above the 128-row gate
+        (True, "natural", 0, False),  # an empty step
+        (False, "natural", 48, False),  # fuse flag off
+        (True, "mfma", 48, False),  # gfx950 OPUS plane, no such kernel
+        (True, "preshuffle", 48, False),  # FlyDSL plane, no such kernel
+    ],
+)
+def test_can_fuse_weights_proj_is_the_fuse_flag_and_the_natural_plane(
+    enabled, layout, rows, expected
+):
+    """The gate is pure ATOM policy -- the flag, the NATURAL plane and the
+    128-row window -- with tensor shapes left to aiter. It decides only whether
+    to fold the projection into the quant launch, never correctness."""
+    from atom.model_ops.indexer.layout import MFMA, NATURAL, PRESHUFFLE
+    from atom.model_ops.indexer.query import can_fuse_weights_proj
+
+    # The string literals above are the real layout tags.
+    assert {MFMA, NATURAL, PRESHUFFLE} == {"mfma", "natural", "preshuffle"}
+    assert can_fuse_weights_proj(enabled, layout, rows) is expected
