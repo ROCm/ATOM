@@ -720,9 +720,9 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
     @property
     def supports_token_graph(self) -> bool:
         """Every launch outside the model's eager regions -- the KDA recurrence
-        and MLA attention -- is sized by the token count alone, so a prefill
-        may pad to a recorded token-graph bucket; the regions run its scheduled
-        rows (`region_graph.padded_prefill_rows`).
+        and the MLA prefill core -- is sized by the token count alone, so a
+        prefill may pad to a recorded token-graph bucket; those regions run the
+        step's own rows (`_kda_recurrence`, `attention_mla._mla_prefill_core`).
 
         Not under DP: a decoding or idle rank would replay the prefill
         recording (`ForwardMode._pad_to_token_graph`), whose regions serve a
@@ -730,15 +730,16 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         into the prefill split (`MLAAttention.split_prefill_recording`, which
         Kimi-K3 sets) and each can take it
         (`MLAAttention.prefill_split_supported`: no sparse layer, PCP or
-        ``ATOM_USE_TRITON_GEMM``). Any other layer runs as one region, which
-        would cut the step's rows out of an FP8 q scale whose bytes are
-        column-major; a sparse layer's DSA indexer is besides no eager region
-        and returns on the recording's dummy step, so a replay would attend
-        with a stale top-k. A model sharing this builder that opted nothing in
-        (GLM-5.3-Flash, whose MLA layers are all sparse) therefore records
-        none, and nor does Kimi-K3.1. A drafter's layers, numbered past the
-        target's (`layer_offset`), do not count: the recording runs the target
-        alone."""
+        ``ATOM_USE_TRITON_GEMM``). Any other layer would run as one region,
+        which cannot serve a padded bucket: its metadata describes the step's
+        rows, and cutting its inputs to them would cut an FP8 q scale whose
+        bytes are column-major. A sparse layer's DSA indexer is besides no
+        eager region and returns on the recording's dummy step, so a replay
+        would attend with a stale top-k. So no model on this builder with a
+        sparse MLA layer records: Kimi-K3.1, whose layers opt in but all carry
+        a DSA indexer, and GLM-5.3-Flash, whose layers are all sparse and opt
+        nothing in. A drafter's layers, numbered past the target's
+        (`layer_offset`), do not count: the recording runs the target alone."""
         config = self.model_runner.config
         if config.parallel_config.data_parallel_size != 1:
             return False

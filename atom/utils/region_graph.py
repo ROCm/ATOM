@@ -52,9 +52,9 @@ __all__ = [
     "forks",
     "graph_pool",
     "join_stream",
-    "on_scheduled_rows",
     "on_scheduled_rows_into",
     "padded_prefill_rows",
+    "prefill_token_graph_capture",
     "token_graph",
 ]
 
@@ -295,10 +295,9 @@ def padded_prefill_rows(rows: int) -> int | None:
     (`ForwardMode.prefill_token_graph`) whose region is handed ``rows`` -- the
     bucket -- or None when nothing past the scheduled rows was padded.
 
-    A region whose launches follow the requests (attention, a recurrence)
-    attends those rows alone, as the eager step would, and hands the bucket
-    back with zeros past them (`on_scheduled_rows`): its metadata describes
-    the scheduled rows, not the bucket."""
+    A region whose launches follow the requests attends those rows alone, as
+    the eager step would (`on_scheduled_rows_into`): its metadata describes the
+    scheduled rows, not the bucket."""
     context = getattr(forward_context.get_forward_context(), "context", None)
     if context is None or not context.is_prefill:
         return None
@@ -306,31 +305,26 @@ def padded_prefill_rows(rows: int) -> int | None:
     return scheduled if 0 < scheduled < rows else None
 
 
-def on_scheduled_rows(fn: Callable[..., torch.Tensor], rows: int | None, *args):
-    """``fn(*args)`` on the first ``rows`` rows of each tensor argument whose
-    leading dim is the bucket, its result raised back to the bucket with zero
-    rows past ``rows``; ``fn(*args)`` itself when ``rows`` is None
-    (`padded_prefill_rows`)."""
-    if rows is None:
-        return fn(*args)
-    height = next(a.shape[0] for a in args if isinstance(a, torch.Tensor))
-    result = fn(
-        *(
-            a[:rows] if isinstance(a, torch.Tensor) and a.shape[0] == height else a
-            for a in args
-        )
+def prefill_token_graph_capture() -> bool:
+    """Whether this forward records a prefill token-graph bucket, or is the
+    warmup forward before it: the capture's dummy prefill, run under
+    `in_hipgraph` but not recorded. A layer that records its prefill split
+    around a region (the MLA head, the KDA projections) takes the split on
+    both, so the warmup runs what the recording captures."""
+    fwd_ctx = forward_context.get_forward_context()
+    context = fwd_ctx.context
+    if context is None or not context.is_prefill:
+        return False
+    return fwd_ctx.tr_graph == "record" or (
+        fwd_ctx.in_hipgraph and context.is_dummy_run
     )
-    padded = result.new_empty((height, *result.shape[1:]))
-    padded[:rows].copy_(result)
-    padded[rows:].zero_()
-    return padded
 
 
 def on_scheduled_rows_into(fn: Callable[..., Any], out: torch.Tensor, *args):
     """``fn(out, *args)``, which writes its rows of ``out`` in place, then
     ``out``. On a padded prefill (`padded_prefill_rows`) ``out`` and the
-    tensor arguments of its height are cut to the scheduled rows; unlike
-    `on_scheduled_rows` nothing is allocated, copied or zero-filled."""
+    tensor arguments of its height are cut to the scheduled rows; nothing is
+    allocated, copied or zero-filled."""
     height = out.shape[0]
     rows = padded_prefill_rows(height)
     if rows is None:
