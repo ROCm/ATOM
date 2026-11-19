@@ -32,7 +32,7 @@ jobs:
       - name: Install test deps
         run: python3 -m pip install --quiet pytest jsonschema
 
-      - name: Prompts have not drifted from SKILL.md
+      - name: check_prompts passes
         run: python3 .claude/skills/review-pr/check_prompts.py
 
       - name: MAPPING.md matches the deriver

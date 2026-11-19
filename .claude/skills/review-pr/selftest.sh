@@ -439,6 +439,9 @@ t "a card that softens BEYOND ONE PASS is refused" \
 t "a card carrying the measured coverage passes" \
   "$(_cov_gate "$_SMALL" 'Coverage: 5 files / 49 added lines -- within one review pass')" "ok"
 # The label alone, with nothing after the colon, is not a verdict.
+t "a coverage label with nothing after it is refused" \
+  "$(_cov_gate "$_SMALL" 'Coverage:')" "EMPTY-COVERAGE"
+
 # check_prompts.py runs sixteen checks and only two are drift. run_one reported every
 # refusal as "prompts drifted" and sent the output that named the real one to /dev/null,
 # so the owner was told to regenerate files that were fine. aiter#8255's review aborted
@@ -457,9 +460,10 @@ _flow_msg() {  # <python snippet that makes check_prompts fail> -> what run_one 
   SKILL="$d" bash -c "set -euo pipefail
 fail(){ printf '%s\n' \"\$3\"; exit \"\$2\"; }
 $blk" 2>/dev/null
+  rm -rf "$r"
 }
-# A crash prints a traceback and no ❌ at all. An empty reason is the very thing this
-# block exists to remove, so it falls back to the last line check_prompts did print.
+# These stand-ins model an early crash, before any ❌ was printed. An empty reason is the
+# very thing this block exists to remove, so it falls back to the last output line.
 _flow_raw() {  # <python body for a stand-in check_prompts> -> what run_one would say
   d=$(mktemp -d); printf '%s\n' "$1" > "$d/check_prompts.py"
   blk=$(sed -n '/# >>> prompt-gate/,/# <<< prompt-gate/p' "$S/run_one.sh")
@@ -468,6 +472,7 @@ _flow_raw() {  # <python body for a stand-in check_prompts> -> what run_one woul
   SKILL="$d" bash -c "set -euo pipefail
 fail(){ printf '%s\n' \"\$3\"; exit \"\$2\"; }
 $blk" 2>/dev/null
+  rm -rf "$d"
 }
 # The two harnesses above hand-copy run_one.sh's shell options. If run_one gains or loses
 # one, they silently go on testing a shell that no longer exists -- which is how the grep
@@ -493,9 +498,7 @@ import pathlib,sys
 p = pathlib.Path(sys.argv[1], "check_prompts.py")
 p.write_text(p.read_text().replace("def check_fail_classes():",
     "def check_fail_classes():\n    print(\"\\u274c run budget fits the job cap: FORCED\"); return 1\n    # o", 1))
-' | grep -c DRIFTED)" "0"
-t "a coverage label with nothing after it is refused" \
-  "$(_cov_gate "$_SMALL" 'Coverage:')" "EMPTY-COVERAGE"
+' | awk '/refused: ❌ run budget fits the job cap: FORCED/{n++} tolower($0)~/drift/{d++} END{print n+0 ":" d+0}')" "1:0"
 
 # `[diff-too-large]` (GitHub refusing a diff over 20000 lines) writes no coverage line,
 # so the card has to supply one and it has to say BEYOND ONE PASS.
@@ -627,7 +630,7 @@ _drift_outside_a_repo() {
   ( cd /tmp && python3 "$t/.claude/skills/review-pr/check_prompts.py" >/dev/null 2>&1; echo $? )
   rm -rf "$t"
 }
-t "the drift check runs outside a git checkout" "$(_drift_outside_a_repo)" "0"
+t "check_prompts runs outside a git checkout" "$(_drift_outside_a_repo)" "0"
 
 
 # ATOM_AGENT_TIMEOUT and ATOM_RUN_BUDGET are coupled and nothing else enforces it. A review

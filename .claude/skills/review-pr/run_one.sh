@@ -157,8 +157,8 @@ _cp_out="$(python3 "$SKILL/check_prompts.py" 2>&1)" || {
   # unreachable and the run dies with no classified status at all, which is the failure
   # this block was written to end.
   _why="$(printf '%s' "$_cp_out" | grep -m3 '^❌' | tr '\n' ';' | sed 's/;$//' || true)"
-  # A crash prints a traceback and no ❌ at all, and an empty reason is the problem this
-  # block exists to remove. Fall back to the last line it did print.
+  # A crash before any check prints a traceback and no ❌. If a later crash follows a
+  # reported check failure, keep that ❌ as the reason; otherwise use the last output line.
   [ -n "$_why" ] || _why="$(printf '%s' "$_cp_out" | grep -v '^$' | tail -1 || true)"
   fail flow 4 "check_prompts.py refused: ${_why:-no output; run it by hand}"
 }
