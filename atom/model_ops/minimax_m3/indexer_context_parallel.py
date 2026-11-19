@@ -212,7 +212,7 @@ def indexer_context_scores(
     return scores
 
 
-def indexer_context_scores_mxfp4(
+def indexer_context_scores_fp4(
     idx_q,
     index_cache,
     block_table,
@@ -234,7 +234,7 @@ def indexer_context_scores_mxfp4(
     """
     if index_scorer.work_map is None:
         raise ValueError(
-            "the MXFP4 index decode needs the step's index_scorer "
+            "the FP4 index decode needs the step's index_scorer "
             "(a work map and the score workspace)"
         )
     local = index_scorer.max_block

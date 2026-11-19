@@ -2,7 +2,7 @@
 """Indexer-only CP over MiniMax-M3's MXFP4 index cache.
 
 Each CP rank scores every index head over its 1/P of the blocks with aiter's MXFP4
-decode scorer (`indexer_context_scores_mxfp4`), keeps its shard's top-k, and the
+decode scorer (`indexer_context_scores_fp4`), keeps its shard's top-k, and the
 rank owning head h merges every shard's head-h candidates. The tests that launch no
 kernel pin the wiring: the shard's map, bound and workspace, what the scorer is
 handed, which scorer the CP decode runs, the page geometry its merge emits, and that
@@ -122,7 +122,7 @@ def test_the_decode_metadata_builds_the_shards_map(monkeypatch):
 
 
 def _cp_scorer(monkeypatch):
-    """`indexer_context_scores_mxfp4` with aiter's scorer doubled; returns it and
+    """`indexer_context_scores_fp4` with aiter's scorer doubled; returns it and
     what the double was handed."""
     from atom.model_ops.minimax_m3 import indexer_context_parallel as icp
 
@@ -138,7 +138,7 @@ def _cp_scorer(monkeypatch):
         lambda: types.SimpleNamespace(minimax_m3_index_score_flydsl=scorer),
     )
     monkeypatch.setattr(icp, "page_views", lambda cache: ("data", "scale"))
-    return icp.indexer_context_scores_mxfp4, seen
+    return icp.indexer_context_scores_fp4, seen
 
 
 def test_the_cp_scorer_writes_the_shard_into_the_workspace(monkeypatch):
@@ -221,7 +221,7 @@ def test_the_cp_decode_runs_the_index_caches_scorer_and_the_kvs_geometry(
 
     scores = types.SimpleNamespace(shape=(WORLD, 2, 3))
     monkeypatch.setattr(icp, "indexer_context_scores", double("triton", scores))
-    monkeypatch.setattr(icp, "indexer_context_scores_mxfp4", double("mxfp4", scores))
+    monkeypatch.setattr(icp, "indexer_context_scores_fp4", double("mxfp4", scores))
     monkeypatch.setattr(exchange, "local_candidate_keys", double("local", "keys"))
     monkeypatch.setattr(indexer_cp, "exchange_candidates", double("exchange", "all"))
     monkeypatch.setattr(exchange, "merge_candidate_keys", double("merge", (1, 2, 3)))
@@ -331,7 +331,7 @@ def test_the_installed_aiter_takes_the_shards_calls(monkeypatch):
     ).index_scorer
     table = torch.zeros(2, BOUND, dtype=torch.int32)
     q = torch.zeros(2, WORLD, DIM)
-    icp.indexer_context_scores_mxfp4(q, "cache", table, seq, 128, 1, SM_SCALE, step)
+    icp.indexer_context_scores_fp4(q, "cache", table, seq, 128, 1, SM_SCALE, step)
     assert bound.keys() == {
         capacity,
         "minimax_m3_index_score_work_map",
@@ -420,11 +420,11 @@ def cp_shard_keys(cache, table, seq, q, S, rank, forced):
         local_candidate_keys,
     )
     from atom.model_ops.minimax_m3.indexer_context_parallel import (
-        indexer_context_scores_mxfp4,
+        indexer_context_scores_fp4,
     )
 
     record = _step_record(table, seq, S, (WORLD, rank))
-    scores = indexer_context_scores_mxfp4(
+    scores = indexer_context_scores_fp4(
         q, cache, table, seq, int(seq.max()), S, SM_SCALE, record
     )
     return local_candidate_keys(

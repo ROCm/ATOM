@@ -130,11 +130,11 @@ def tp_scores(cache, table, seq, q, S, head):
 
 def cp_scores(cache, table, seq, q, S, rank):
     from atom.model_ops.minimax_m3.indexer_context_parallel import (
-        indexer_context_scores_mxfp4,
+        indexer_context_scores_fp4,
     )
 
     md = _step(table, seq, S, (WORLD, rank))
-    return indexer_context_scores_mxfp4(
+    return indexer_context_scores_fp4(
         q, cache, table, seq, table.shape[1] * 128, S, SM_SCALE, md.index_scorer
     ).clone()
 
@@ -180,7 +180,7 @@ def test_the_cp_scorer_hands_aiter_the_shard(monkeypatch):
     q = torch.zeros(rows, WORLD, DIM)
     table = torch.zeros(batch, WORLD * local, dtype=torch.int32)
     seq = torch.ones(batch, dtype=torch.int32)
-    out = icp.indexer_context_scores_mxfp4(
+    out = icp.indexer_context_scores_fp4(
         q, "cache", table, seq, WORLD * local * 128, S, 0.5, record
     )
     assert out.shape == (WORLD, rows, local)
