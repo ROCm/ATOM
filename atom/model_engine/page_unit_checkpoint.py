@@ -1324,8 +1324,9 @@ class PagedStateCheckpointCoordinator:
             if build:
                 scratch = self._scratch.pop()
                 self._scratch_issued.append(scratch)
+                # A slot per verify step, or one for all of them (ReplaySSM).
                 slots = seq.state_slots
-                step_slot = slots[step] if step < len(slots) else src_slot
+                step_slot = slots[step] if len(slots) > 1 else src_slot
                 op = replace(op, step=step, scratch_slot=scratch, step_slot=step_slot)
             self._store_ops.append(op)
             self.checkpoints_kept += 1

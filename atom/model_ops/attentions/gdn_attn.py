@@ -649,10 +649,15 @@ class GDNStateMixin(PoolRowsMixin):
         until its builder rebuilds them too."""
         if not (self.replayssm or self.num_spec):
             return KEEP_SETTLED
-        if len(self._checkpoint_plane_shapes()) == 2:
+        if self._decode_image_is_conv_and_ssm():
             return KEEP_SNAPSHOT
         _log_no_decode_checkpoints()
         return KEEP_NONE
+
+    def _decode_image_is_conv_and_ssm(self) -> bool:
+        """Whether the image holds no other plane. Every PP stage must answer
+        alike: the head files and sizes scratch for all of them."""
+        return len(self._checkpoint_plane_shapes()) == 2
 
     def num_state_layers(self) -> int:
         """Layers holding a recurrent state, one slot each.
