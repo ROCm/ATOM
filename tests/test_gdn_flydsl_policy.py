@@ -58,16 +58,16 @@ def _state():
 
 
 @pytest.mark.parametrize("allowed", [False, True])
-@pytest.mark.parametrize("missing_ops", [False, True])
+@pytest.mark.parametrize("no_hip", [False, True])
 @pytest.mark.parametrize("prefill_backend", ["auto", "flydsl", "triton"])
 @pytest.mark.parametrize("replayssm", [False, True])
 @pytest.mark.parametrize("gfx942", [False, True])
 def test_policy_keeps_prefill_and_drops_decode_under_replayssm(
-    fly, monkeypatch, allowed, missing_ops, prefill_backend, replayssm, gfx942
+    fly, monkeypatch, allowed, no_hip, prefill_backend, replayssm, gfx942
 ):
     backends = {"prefill": prefill_backend, "decode": "auto"}
     monkeypatch.setattr(fly, "backend", backends.__getitem__)
-    monkeypatch.setattr(fly, "ops", lambda: None if missing_ops else object())
+    monkeypatch.setattr(fly, "ops", lambda: None if no_hip else object())
     monkeypatch.setattr(fly, "_validated_on_gfx942", lambda: gfx942)
     policy = fly.select_policy(
         allowed=allowed,
@@ -76,7 +76,7 @@ def test_policy_keeps_prefill_and_drops_decode_under_replayssm(
         state=_state(),
         activation_dtype=torch.bfloat16,
     )
-    available = allowed and not missing_ops
+    available = allowed and not no_hip
     assert policy.prefill == (
         available and prefill_backend != "triton" and (gfx942 or not replayssm)
     )
@@ -124,9 +124,27 @@ def test_policy_is_empty_without_hip_before_probing_the_arch(
     assert policy == fly.GDNFlyDSLPolicy()
 
 
-def test_ops_raises_on_hip_when_an_aiter_symbol_is_missing(fly, monkeypatch):
+AITER_OPS = {
+    "aiter.ops.flydsl.linear_attention_kernels": ["flydsl_gdr_decode"],
+    "aiter.ops.flydsl.linear_attention_prefill_kernels": [
+        "chunk_gated_delta_rule_fwd_h_flydsl_opt",
+        "gdn_prepare_flydsl_supported",
+        "gdn_prepare_fwd_flydsl",
+    ],
+    "aiter.ops.prefill_batch_metadata": ["build_gated_delta_rule_prefill_metadata"],
+}
+
+
+@pytest.mark.parametrize("missing", list(AITER_OPS))
+def test_ops_raises_on_hip_when_an_aiter_symbol_is_missing(fly, monkeypatch, missing):
     monkeypatch.setattr(fly.torch.version, "hip", "6.4")
-    monkeypatch.setitem(sys.modules, "aiter.ops.flydsl.linear_attention_kernels", None)
+    for name, symbols in AITER_OPS.items():
+        stub = None
+        if name != missing:
+            stub = types.ModuleType(name)
+            for symbol in symbols:
+                setattr(stub, symbol, object())
+        monkeypatch.setitem(sys.modules, name, stub)
     with pytest.raises(ImportError):
         fly.ops()
 

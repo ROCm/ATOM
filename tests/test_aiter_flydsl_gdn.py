@@ -384,11 +384,11 @@ def test_unsupported_device_decode_fallback(monkeypatch):
     torch.testing.assert_close(vk, state, rtol=0.008, atol=2e-6)
 
 
-@pytest.mark.parametrize("missing_ops", [False, True])
+@pytest.mark.parametrize("no_hip", [False, True])
 @pytest.mark.parametrize("lossy_decode", [False, True])
-def test_policy_dependencies_and_lossy(monkeypatch, missing_ops, lossy_decode):
+def test_policy_dependencies_and_lossy(monkeypatch, no_hip, lossy_decode):
     monkeypatch.setattr(fly, "backend", lambda stage: "auto")
-    monkeypatch.setattr(fly, "ops", lambda: None if missing_ops else object())
+    monkeypatch.setattr(fly, "ops", lambda: None if no_hip else object())
     monkeypatch.setattr(fly, "_validated_on_gfx942", lambda: True)
     policy = fly.select_policy(
         allowed=True,
@@ -397,8 +397,8 @@ def test_policy_dependencies_and_lossy(monkeypatch, missing_ops, lossy_decode):
         state=torch.empty(1, 24, 128, 128, device="cuda", dtype=torch.bfloat16),
         activation_dtype=torch.bfloat16,
     )
-    assert policy.prefill == (not missing_ops)
-    assert policy.decode == (not missing_ops and not lossy_decode)
+    assert policy.prefill == (not no_hip)
+    assert policy.decode == (not no_hip and not lossy_decode)
 
 
 @pytest.mark.parametrize("mode", ["replayssm", "unsupported", "disabled", "flydsl"])

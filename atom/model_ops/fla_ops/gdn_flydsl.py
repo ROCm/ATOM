@@ -1,7 +1,9 @@
-"""Optional AITER FlyDSL GDN for the standalone Qwen4Exp backend.
+"""AITER FlyDSL GDN kernels for Qwen3.8-Flash-Next, and the policy that picks them.
 
-ATOM exposes logical KV state views backed by VK storage. No per-token state
-packing, pool-wide transpose, or device-to-host synchronization is required.
+Used by native ATOM and the SGLang and RTP-LLM plugins. Decode updates the pool
+in place through a logical KV view of VK storage; prefill gathers its initial
+states into FP32 VK in one launch. No per-token state packing, pool-wide
+transpose, or device-to-host synchronization is required.
 """
 
 import functools
@@ -21,7 +23,11 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class GDNFlyDSLPolicy:
-    """Resolved at cache binding; decode and physical VK layout are inseparable."""
+    """Which GDN stages run FlyDSL for a layer; `decode` needs VK state storage.
+
+    Native ATOM and the SGLang plugin resolve it once, when the state is bound;
+    the RTP-LLM plugin resolves it on every forward.
+    """
 
     prefill: bool = False
     decode: bool = False
@@ -311,26 +317,23 @@ def decode(q, k, v, a, b, state, A_log, dt_bias, reads, writes, out=None):
     """Fused gating/normalization/recurrence, zero-copy logical KV state view.
 
     `out`, a contiguous `[batch, hv, 128]` buffer, receives the result
-    directly when the kernel writes every row itself.
+    directly.
     """
     if not decode_supported(q, k, v, a, b, state, A_log, dt_bias, reads, writes):
         raise ValueError("Unsupported AITER FlyDSL decode inputs")
     _log_dispatch("decode (zero-copy VK state)")
     batch, hv = v.shape[1:3]
-    fn = ops()[0]
-    writes_all_rows = getattr(fn, "zeroes_invalid_output", False)
+    # The kernel writes every row, zeroing the negative-index padding rows.
     if (
         out is not None
-        and writes_all_rows
         and out.is_contiguous()
         and out.shape == (batch, hv, 128)
         and out.dtype == q.dtype
     ):
         output = out.view(batch, 1, hv, 128)
     else:
-        allocate = torch.empty if writes_all_rows else torch.zeros
-        output = allocate((batch, 1, hv, 128), device=q.device, dtype=q.dtype)
-    fn(
+        output = torch.empty((batch, 1, hv, 128), device=q.device, dtype=q.dtype)
+    ops()[0](
         query=q.transpose(0, 1),
         key=k.transpose(0, 1),
         value=v.transpose(0, 1),
