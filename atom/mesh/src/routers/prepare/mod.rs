@@ -18,6 +18,7 @@ use crate::{
     tokenizer::{registry::TokenizerRegistry, traits::Tokenizer},
 };
 
+pub(crate) mod chat_controls;
 pub(crate) mod chat_template;
 pub(crate) mod fast_tokenizer;
 pub mod generation_payload;

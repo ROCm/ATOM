@@ -363,6 +363,7 @@ pub async fn remove_tokenizer(context: &Arc<AppContext>, tokenizer_id: &str) -> 
     if let Some(entry) = removed {
         crate::routers::prepare::thread_tokenizer::release_copies(&entry.id);
         context.chats_without_template.write().remove(&entry.id);
+        context.chat_controls.write().remove(&entry.id);
         debug!("Removed tokenizer '{}' (id: {})", entry.name, entry.id);
         (
             StatusCode::OK,
