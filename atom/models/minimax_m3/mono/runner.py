@@ -201,14 +201,19 @@ class MonoDecodeRunner:
         compiler keeps a 36 B frame of two SGPR spill slots that no instruction touches, and any
         schedule change flips it) is rebuilt unchanged except for the machine scheduler's
         register-pressure trackers (``LEAN_LLVM_OPTIONS``), scratch-free at every width 1..16
-        (same arithmetic: only the instruction order moves)."""
+        (same arithmetic: only the instruction order moves). None when only the dense kernels
+        spilled: there is no leaner build of those."""
         lean = dict(built)
-        for kind, launch in built.items():
-            if isinstance(kind, bool) and launch in spilled:
-                n = self._width_of[id(built)]
-                lean[kind] = self._build_k4(n, index_topk=kind)
-                lean[kind].compile_hints["llvm_options"] = LEAN_LLVM_OPTIONS
-        return lean
+        n = self._width_of[id(built)]
+        rebuilt = [
+            kind
+            for kind, launch in built.items()
+            if isinstance(kind, bool) and launch in spilled
+        ]
+        for kind in rebuilt:
+            lean[kind] = self._build_k4(n, index_topk=kind)
+            lean[kind].compile_hints["llvm_options"] = LEAN_LLVM_OPTIONS
+        return lean if rebuilt else None
 
     @staticmethod
     def _layer_kernels(kernels: dict) -> list:
@@ -268,7 +273,8 @@ class MonoDecodeRunner:
         self.nvfp4 = impl.kv_cache_dtype == "nvfp4"
         if self.nvfp4 and heads.count > 1:
             raise MonoUnsupported("indexer context parallelism with NVFP4 caches")
-        kv = get_forward_context().kv_cache_data[f"layer_{self.sparse[0].layer_id}"]
+        kv_data = get_forward_context().kv_cache_data
+        kv = kv_data[f"layer_{self.sparse[0].layer_id}"]
         pools = [t for t in (kv.k_cache, kv.v_cache) if t is not None]
         if max(t.numel() * t.element_size() for t in pools) > 1 << 32:
             raise MonoUnsupported("KV cache over 4 GiB a layer (32-bit buffer offsets)")
@@ -276,6 +282,14 @@ class MonoDecodeRunner:
             lw.attn_impl.kv_cache_dtype != impl.kv_cache_dtype for lw in self.sparse
         ):
             raise MonoUnsupported("KV cache dtype differs between layers")
+        if self.nvfp4:
+            # the pool's page view is both K and V; the kernels step pages by KV_PAGE_BYTES
+            for lw in self.sparse:
+                pages = kv_data[f"layer_{lw.layer_id}"].k_cache
+                if pages.stride() != (KV_PAGE_BYTES, 1) or pages.dtype != torch.uint8:
+                    raise MonoUnsupported(
+                        f"NVFP4 KV pages {pages.dtype} {tuple(pages.shape)} {pages.stride()}"
+                    )
         # the checkpoint's MXFP8 1x32 attention linears (native quantization) or the
         # ptpc-FP8 requantization: every layer alike (the K1 / K4 builds read one kind)
         self.attn_mxfp8 = self.sparse[0].attn_mxfp8
@@ -563,13 +577,7 @@ class MonoDecodeRunner:
         stream = torch.cuda.current_stream()
         kv = fwd.kv_cache_data[f"layer_{lw.layer_id}"]
         if self.nvfp4:
-            # the pool's page view is both K and V; the kernels step pages by KV_PAGE_BYTES
-            pages = kv.k_cache
-            if pages.stride() != (KV_PAGE_BYTES, 1) or pages.dtype != torch.uint8:
-                raise MonoUnsupported(
-                    f"NVFP4 KV pages {pages.dtype} {tuple(pages.shape)} {pages.stride()}"
-                )
-            k16 = v16 = pages
+            k16 = v16 = kv.k_cache
             ks16, vs16 = lw.attn_impl.nvfp4_k_scale, lw.attn_impl.nvfp4_v_scale
         else:
             k16, v16, ks16, vs16 = to_page16_shuffle(

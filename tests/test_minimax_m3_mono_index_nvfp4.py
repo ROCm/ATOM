@@ -39,21 +39,37 @@ SCORER = "aiter.ops.flydsl.kernels.minimax_m3_index_score"
 @pytest.fixture
 def refs(monkeypatch):
     """(aiter's NVFP4 index scorer module, vLLM's reference module); the import path,
-    the kernels package's path and the modules imported from the trees are put back
-    after the test."""
+    the kernels package's path and ``sys.modules`` (the modules imported from the
+    trees gone, the ones they replaced back) are put back after the test."""
     import importlib
 
     import aiter.ops.flydsl.kernels as pkg
 
-    if KERNELS:
-        monkeypatch.setattr(pkg, "__path__", [KERNELS, *pkg.__path__])
-        monkeypatch.delitem(sys.modules, SCORER, raising=False)
-        monkeypatch.setattr(pkg, SCORER.rsplit(".", 1)[1], None, raising=False)
-    monkeypatch.syspath_prepend(VLLM_REF)
-    monkeypatch.delitem(sys.modules, "minimax_m3_nvfp4_ref", raising=False)
-    return importlib.import_module(SCORER), importlib.import_module(
-        "minimax_m3_nvfp4_ref"
-    )
+    modules = dict(sys.modules)
+    trees = tuple(os.path.abspath(t) for t in (KERNELS, VLLM_REF) if t)
+    try:
+        if KERNELS:
+            monkeypatch.setattr(pkg, "__path__", [KERNELS, *pkg.__path__])
+            monkeypatch.setattr(pkg, SCORER.rsplit(".", 1)[1], None, raising=False)
+            sys.modules.pop(SCORER, None)
+        monkeypatch.syspath_prepend(VLLM_REF)
+        sys.modules.pop("minimax_m3_nvfp4_ref", None)
+        yield importlib.import_module(SCORER), importlib.import_module(
+            "minimax_m3_nvfp4_ref"
+        )
+    finally:
+        _restore_modules(modules, trees)
+
+
+def _restore_modules(before, trees):
+    """Every module in ``sys.modules`` loaded from a directory of ``trees``: back to
+    ``before``'s, or gone."""
+    for name, mod in list(sys.modules.items()):
+        if (getattr(mod, "__file__", None) or "").startswith(trees):
+            if name in before:
+                sys.modules[name] = before[name]
+            else:
+                del sys.modules[name]
 
 
 def _pages(ref, blocks, seed):

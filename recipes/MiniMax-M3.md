@@ -317,8 +317,9 @@ which ships the routed experts as MXFP4.
     expert on its own MXFP8 weights.
 
   Neither is the original path's MoE arithmetic: there, aiter's `fused_moe` picks the
-  activation dtype by token count (bf16 below a tuned bound, 256 tokens by default, so
-  every decode step; MXFP4 or MXFP8 above it).
+  activation dtype by token count: bf16 below `GPTOSS_SWIGLU_MXFP4_BF16_BOUND` (256 tokens by
+  default, so every decode step), MXFP4 from it; MXFP8 instead only with `ATOM_MOE_GU_ITLV=1`
+  (gate / up interleaved: bf16 below `AITER_BF16_FP8_MOE_BOUND`, also 256).
 
   The log reads
   `MiniMax-M3 mono: attention linears ptpc FP8, shared expert fused (MXFP4, a8w4)` (or

@@ -13,8 +13,6 @@ N_ROUTED of 129, ``fused_shared``), every expert a8w4 (MXFP8 xn and mid), the sl
 """
 
 import argparse
-import os
-import sys
 
 import pytest
 import torch
@@ -27,7 +25,6 @@ pytestmark = pytest.mark.skipif(
     reason="needs gfx950",
 )
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import test_minimax_m3_mono_k4_mxfp8 as K4T
 import test_minimax_m3_mono_moe_a4w4 as Q4
 from aiter import dtypes

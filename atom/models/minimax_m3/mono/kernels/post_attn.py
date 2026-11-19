@@ -20,20 +20,26 @@ S = 1..MAX_TOKENS tokens (each token's stage tasks side by side); for one token:
             -> acc = bf16(sum) + h   (h_mid = bf16(acc), mailbox ``a`` = acc)
     router: gemma RMSNorm(acc) in the fused all-reduce's reduction order -> bf16
             gate GEMV -> logits; publishes its slice of the normalized input
-            (MXFP4 for the routed experts, MXFP8 for the shared one)
+            (MXFP4 for the routed experts, MXFP8 for the shared one;
+            ``fused_shared``: MXFP8 alone)
     moe   : sigmoid + bias top-4 -> a4w4 up/gate (MXFP4 xn x MXFP4 weights on
             aiter's shuffled layout) -> swiglu -> mid (bf16-rounded); the
             unfused MXFP8 shared expert's up/gate runs beside them;
             the CTA's down task reuses that routing, its weights prefetched
             under the up/gate GEMV: route-weighted down GEMV on the MXFP4 mids
             (+ the shared expert's MXFP8 one) -> push bf16 partial rows ->
-            rank-ordered sum -> ar_out = bf16(sum)
+            rank-ordered sum -> ar_out = bf16(sum). ``fused_shared``: the
+            shared expert is the MXFP4 tables' expert ``SHARED_EXPERT``, a
+            fifth slot, and every slot runs a8w4 (MXFP8 xn and mids x MXFP4
+            weights)
 
 From ``WIDE_FROM`` tokens the MoE groups its work by expert (``wide_moe``): the
 router tasks publish xn as plain words, each up / gate task pair runs one distinct
 expert's 32 rows for every token routed to it (a B column per token) and publishes
-MXFP4 mid rows and their codes, and a down task sums over the step's (expert,
-token) mids. From ``AG_RS_FROM`` tokens both all-reduces are a reduce-scatter to
+mid rows and their codes (MXFP4 ``mid4p`` / ``mids4p``, the shared expert's pairs
+after the grouped loop MXFP8 ``mid8p`` / ``midsp``; ``fused_shared``: every slot's
+MXFP8 ``mid8f`` / ``midsf``), and a down task sums over the step's (expert, token)
+mids. From ``AG_RS_FROM`` tokens both all-reduces are a reduce-scatter to
 the row group's owner rank, which sums in rank order and all-gathers the result.
 
 The next layer's K1 takes (ar_out, h_mid) exactly as the original path's fused
@@ -614,7 +620,8 @@ def build_post_attn_kernel(
         UGW_ITERS = (
             2 * ((U_MAX * UG_PAIRS + G - 1) // G)
             if fused_shared
-            else 2 * ((U_MAX - 1) * UG_PAIRS + UG_SHARED_UNITS * UG_PAIRS + G - 1) // G
+            else 2
+            * (((U_MAX - 1) * UG_PAIRS + UG_SHARED_UNITS * UG_PAIRS + G - 1) // G)
         )
         # (expert, chunk) units whose weights are in flight
         DN_DEPTH = 12 if fused_shared else 20
