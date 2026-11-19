@@ -249,50 +249,64 @@ def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank,
     hx.lstore(sm + t * 4, F32(0.0))
     gpu.barrier()
     lo1 = M - F32(R)
-    sc1 = F32(NB / R)
-    for kk in range(PT):
-        z = hx.lload(sm + ZOFF + (kk * 256 + t) * 4, F32)
-        if z >= lo1:
-            bi = fx.min(I32((z - lo1) * sc1), I32(NB - 1))
-            hx.latomic_add_f32(sm + bi * 4, expf(z - M))
-    gpu.barrier()
-    if act:
-        hx.gstore(rec1 + (i64(row * CPR + c) * NB + i64(t)) * 4, hx.lload(sm + t * 4, F32))
-    handoff(cnt + i64(4), t, NCT)
-    # P2: crossing bin b1; sub-histogram inside it
-    target = topp * Z
-    hs = F32(0.0)
-    for q in range_constexpr(CPR):
-        hs = hs + hx.gload(rec1 + (i64(row * CPR + q) * NB + i64(t)) * 4, F32)
-    hx.lstore(sm + t * 4, hs)
-    gpu.barrier()
-    xchg_hist(recv, rank, 1, row, c, t, sm, tag0 + 1, mid=_ctxmid(ctxp, 1))
-    suffix_scan(sm, t)
-    b1, rem1 = crossing(sm, t, target)
-    hx.lstore(sm + t * 4, F32(0.0))
-    gpu.barrier()
-    lo2 = lo1 + F32(b1) * F32(R / NB)
-    sc2 = F32(NB * NB / R)
-    for kk in range(PT):
-        z = hx.lload(sm + ZOFF + (kk * 256 + t) * 4, F32)
-        if (b1 >= 0) & (z >= lo2):
-            bi = fx.min(I32((z - lo2) * sc2), I32(NB - 1))
-            if (z < lo2 + F32(R / NB)) | (b1 == NB - 1):
+    # P1 / P2 find the top-p threshold th. A row that is greedy (or a forced-acceptance argmax row) or has top_p >= 1
+    # keeps every id: th = -inf whatever they give (top_p 1: the target p Z is above the mass of [M - R, M) unless the
+    # whole row lies within R of M -- then the two passes cut the lowest sub-bin, here nothing is cut, ATOM's top_p 1).
+    # When every row of the step is such a row (sparam: the same on every rank, a uniform branch, as anyprob), the two
+    # passes, their handoffs and their exchanges are skipped (T = 0, and T > 0 at the default top_p 1).
+    nucl = I32(0)
+    for r_ in range_constexpr(ROWS):
+        sr_ = sp + i64(r_) * (SPW * 4)
+        bon_ = sp + i64((r_ // (ND + 1)) * (ND + 1) + ND) * (SPW * 4)
+        sim_ = (hx.gload(bon_ + i64(20), I32) == I32(SIM_MAGIC)) & (I32(r_ % (ND + 1)) < I32(ND))
+        keep_ = (hx.gload(sr_ + i64(12), I32) != I32(0)) | sim_ | (hx.gload(sr_ + i64(4), F32) >= F32(1.0))
+        nucl = nucl + keep_.select(I32(0), I32(1))
+    th = F32(NEG)
+    if nucl > I32(0):
+        sc1 = F32(NB / R)
+        for kk in range(PT):
+            z = hx.lload(sm + ZOFF + (kk * 256 + t) * 4, F32)
+            if z >= lo1:
+                bi = fx.min(I32((z - lo1) * sc1), I32(NB - 1))
                 hx.latomic_add_f32(sm + bi * 4, expf(z - M))
-    gpu.barrier()
-    if act:
-        hx.gstore(rec2 + (i64(row * CPR + c) * NB + i64(t)) * 4, hx.lload(sm + t * 4, F32))
-    handoff(cnt + i64(8), t, NCT)
-    # P3: threshold, Gumbel-max over the kept set; + the nucleus mass and z(x_k)
-    hs = F32(0.0)
-    for q in range_constexpr(CPR):
-        hs = hs + hx.gload(rec2 + (i64(row * CPR + q) * NB + i64(t)) * 4, F32)
-    hx.lstore(sm + t * 4, hs)
-    gpu.barrier()
-    xchg_hist(recv, rank, 2, row, c, t, sm, tag0 + 2, mid=_ctxmid(ctxp, 2))
-    suffix_scan(sm, t)
-    b2, rem2 = crossing(sm, t, rem1)
-    th = (b1 < 0).select(F32(NEG), lo2 + F32(fx.max(b2, I32(0))) * F32(R / (NB * NB)))
+        gpu.barrier()
+        if act:
+            hx.gstore(rec1 + (i64(row * CPR + c) * NB + i64(t)) * 4, hx.lload(sm + t * 4, F32))
+        handoff(cnt + i64(4), t, NCT)
+        # P2: crossing bin b1; sub-histogram inside it
+        target = topp * Z
+        hs = F32(0.0)
+        for q in range_constexpr(CPR):
+            hs = hs + hx.gload(rec1 + (i64(row * CPR + q) * NB + i64(t)) * 4, F32)
+        hx.lstore(sm + t * 4, hs)
+        gpu.barrier()
+        xchg_hist(recv, rank, 1, row, c, t, sm, tag0 + 1, mid=_ctxmid(ctxp, 1))
+        suffix_scan(sm, t)
+        b1, rem1 = crossing(sm, t, target)
+        hx.lstore(sm + t * 4, F32(0.0))
+        gpu.barrier()
+        lo2 = lo1 + F32(b1) * F32(R / NB)
+        sc2 = F32(NB * NB / R)
+        for kk in range(PT):
+            z = hx.lload(sm + ZOFF + (kk * 256 + t) * 4, F32)
+            if (b1 >= 0) & (z >= lo2):
+                bi = fx.min(I32((z - lo2) * sc2), I32(NB - 1))
+                if (z < lo2 + F32(R / NB)) | (b1 == NB - 1):
+                    hx.latomic_add_f32(sm + bi * 4, expf(z - M))
+        gpu.barrier()
+        if act:
+            hx.gstore(rec2 + (i64(row * CPR + c) * NB + i64(t)) * 4, hx.lload(sm + t * 4, F32))
+        handoff(cnt + i64(8), t, NCT)
+        # P3: threshold, Gumbel-max over the kept set; + the nucleus mass and z(x_k)
+        hs = F32(0.0)
+        for q in range_constexpr(CPR):
+            hs = hs + hx.gload(rec2 + (i64(row * CPR + q) * NB + i64(t)) * 4, F32)
+        hx.lstore(sm + t * 4, hs)
+        gpu.barrier()
+        xchg_hist(recv, rank, 2, row, c, t, sm, tag0 + 2, mid=_ctxmid(ctxp, 2))
+        suffix_scan(sm, t)
+        b2, rem2 = crossing(sm, t, rem1)
+        th = (b1 < 0).select(F32(NEG), lo2 + F32(fx.max(b2, I32(0))) * F32(R / (NB * NB)))
     th = greedy.select(F32(NEG), th)
     if t == 0:
         hx.lstore(sm + 2048, I64MIN())
