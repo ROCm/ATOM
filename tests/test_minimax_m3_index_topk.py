@@ -1044,3 +1044,24 @@ def test_chunks_scored_into_one_stale_workspace_select_as_fresh_buffers(cache, p
         torch.cuda.synchronize()
         for fresh, reused in zip(want, got):
             assert torch.equal(fresh, reused)
+
+
+@gpu
+def test_a_chunk_scored_into_the_workspace_allocates_no_score_buffer():
+    """The per-chunk growth itself: a wider second chunk must not allocate its scores."""
+    from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
+
+    heads, chunk, prefix = 2, 256, m._AITER_MIN_WIDTH * SPARSE_BLOCK_SIZE
+    width = -(-(prefix + 2 * chunk) // SPARSE_BLOCK_SIZE)
+    ws = LogitsWorkspace(heads * chunk * width, "cuda")
+    first, second = (
+        _inputs([chunk], [prefix + i * chunk], heads, "cuda") for i in (0, 1)
+    )
+    m.minimax_m3_index_topk(**first, score_workspace=ws)  # compiles outside the window
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    m.minimax_m3_index_topk(**second, score_workspace=ws)
+    torch.cuda.synchronize()
+    # a fresh score buffer alone is heads * chunk * width fp32
+    assert torch.cuda.max_memory_allocated() - before < heads * chunk * width * 4

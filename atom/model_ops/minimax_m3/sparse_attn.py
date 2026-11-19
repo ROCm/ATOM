@@ -79,7 +79,7 @@ class MiniMaxM3SparsePrefillMetadata:
     None unless the KV cache is NVFP4 (``make_sparse_prefill_metadata(nvfp4_kv=True)``)."""
     score_workspace: LogitsWorkspace | None = None
     """Where the bf16 / FP8 index scorer writes; None on an FP4 index (its record's) and
-    in the bridges, which allocate per step."""
+    in the vLLM / SGLang bridges, whose scorer allocates per layer call."""
 
 
 @dataclass

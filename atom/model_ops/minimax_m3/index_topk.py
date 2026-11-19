@@ -45,6 +45,7 @@ PREFILL_TOPK_NUM_WARPS = _prefill_policy.PREFILL_TOPK_NUM_WARPS
 from atom.model_ops.minimax_m3.geometry import SPARSE_BLOCK_SIZE
 from atom.model_ops.minimax_m3.mxfp4_pages import page_views
 from atom.model_ops.minimax_m3.nvfp4_pages import index_page_views as nvfp4_page_views
+from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
 
 
 @functools.cache
@@ -1530,7 +1531,7 @@ def minimax_m3_index_topk(
     n_valid_column_per_row: torch.Tensor | None = None,
     pages_per_block: int = PAGES_PER_SPARSE_BLOCK,
     index_scorer=None,
-    score_workspace=None,
+    score_workspace: LogitsWorkspace | None = None,
 ):
     """Index block-score + top-k selection. block_size_q == 1 (per-token).
 
@@ -1652,7 +1653,7 @@ def _triton_prefill_score(
     max_query_len,
     max_block,
     sm_scale,
-    out=None,
+    out: LogitsWorkspace | None = None,
 ):
     total_q, num_idx_heads, head_dim = idx_q.shape
     batch = cu_seqlens_q.shape[0] - 1

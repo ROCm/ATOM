@@ -50,25 +50,21 @@ def _shard(cp_world: int, cp_rank: int) -> dict:
     return {"cp_world": cp_world, "cp_rank": cp_rank}
 
 
-def prefill_score_capacity(
-    config, *, max_bs: int, max_qlen: int, num_idx_heads: int
-) -> int:
-    """fp32 block scores of the widest prefill step: one row per (index head, query
-    token) of a chunk or a verify step, over the model length's blocks."""
-    rows = max(max_bs * max_qlen, config.max_num_batched_tokens)
-    return num_idx_heads * rows * -(-config.max_model_len // SPARSE_BLOCK_SIZE)
+def prefill_score_capacity(config, *, num_idx_heads: int) -> int:
+    """fp32 block scores of the widest prefill chunk: one row per (index head, query
+    token) of `max_num_batched_tokens`, over the model length's blocks."""
+    blocks = -(-config.max_model_len // SPARSE_BLOCK_SIZE)
+    return num_idx_heads * config.max_num_batched_tokens * blocks
 
 
 def allocate_prefill_scores(
-    config, device, *, max_bs: int, max_qlen: int, num_idx_heads: int
+    config, device, *, index_scorers: dict[str, IndexScoreBuffers], num_idx_heads: int
 ) -> LogitsWorkspace | None:
     """The bf16 / FP8 index caches' prefill score workspace, sized from the
-    configuration; None on an FP4 index cache, whose record holds its own."""
-    if config.index_cache_dtype in FP4_CACHE_DTYPES:
+    configuration; None when an FP4 record (``"" in index_scorers``) holds its own."""
+    if "" in index_scorers:
         return None
-    capacity = prefill_score_capacity(
-        config, max_bs=max_bs, max_qlen=max_qlen, num_idx_heads=num_idx_heads
-    )
+    capacity = prefill_score_capacity(config, num_idx_heads=num_idx_heads)
     return LogitsWorkspace(capacity, device)
 
 
@@ -126,9 +122,7 @@ def allocate_index_scorers(
         return torch.empty((rows, 2), dtype=torch.int32, device=device)
 
     capacity = max(
-        prefill_score_capacity(
-            config, max_bs=max_bs, max_qlen=max_qlen, num_idx_heads=num_idx_heads
-        ),
+        prefill_score_capacity(config, num_idx_heads=num_idx_heads),
         decode_heads * max_bs * max_qlen * decode_block,
     )
     scorers = {

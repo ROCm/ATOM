@@ -305,12 +305,12 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             if self._has_sparse_attention
             else {}
         )
+        # bf16 / FP8 index caches only: an FP4 record scores into its own workspace
         self._prefill_score_workspace = (
             allocate_prefill_scores(
                 self.model_runner.config,
                 self.device,
-                max_bs=self.max_bs,
-                max_qlen=max_qlen,
+                index_scorers=self._index_scorers,
                 num_idx_heads=self._num_idx_heads,
             )
             if self._has_sparse_attention
