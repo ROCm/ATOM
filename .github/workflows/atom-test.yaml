@@ -551,10 +551,46 @@ jobs:
               echo "Model download failed for '${{ matrix.model_path }}'. Aborting."
               exit 1
             fi
+
+            # A speculative-decoding case also needs its draft checkpoint. Left
+            # as a Hub id, the server fetches it on every launch into the
+            # throwaway container's HF cache, and that fetch goes through
+            # hf-xet, which intermittently stalls: the same ~5 GiB file took
+            # 5s on most runs and 118s, 250s and 836s on others, all of it
+            # spent silently inside "Waiting for ATOM server to be ready".
+            # Cache it under /models next to the target instead, so the launch
+            # reads a local directory and never touches the network.
+            draft_id="$(printf '%s\n' "${MODEL_EXTRA_ARGS}" | sed -nE 's/.*--draft-model[ =]+([^ ]+).*/\1/p')"
+            if [[ "${draft_id}" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
+              draft_dir="/models/${draft_id}"
+              echo "draft model '${draft_id}' found in extraArgs, checking cache and lock-protected download for ${draft_dir}"
+              # Xet is off for this one download: over plain HTTP the file
+              # lands in ~30s every time, which is what a one-off cache fill
+              # wants. A stall here would otherwise sit until the timeout.
+              if docker exec \
+                -e HF_TOKEN="${HF_TOKEN:-}" \
+                -e HF_HUB_DISABLE_XET=1 \
+                -e MODEL_ID="${draft_id}" \
+                -e TARGET_DIR="${draft_dir}" \
+                -e MODEL_DOWNLOAD_TIMEOUT="${DRAFT_MODEL_DOWNLOAD_TIMEOUT}" \
+                -e MODEL_LOCK_WAIT_SECONDS="${MODEL_LOCK_WAIT_SECONDS}" \
+                -e MODEL_LOCK_POLL_INTERVAL="${MODEL_LOCK_POLL_INTERVAL}" \
+                -e MODEL_PROGRESS_INTERVAL="${MODEL_PROGRESS_INTERVAL}" \
+                "$CONTAINER_NAME" bash -lc 'bash /workspace/.github/scripts/download_model_with_lock.sh "$MODEL_ID" "$TARGET_DIR"'; then
+                echo "DRAFT_MODEL_ID=${draft_id}" >> "$GITHUB_ENV"
+                echo "DRAFT_MODEL_DIR=${draft_dir}" >> "$GITHUB_ENV"
+              else
+                # Not fatal: the server can still fetch the draft itself, as it
+                # did before this cache existed.
+                echo "::warning::Could not cache draft model '${draft_id}' under ${draft_dir}; the server will download it at launch."
+              fi
+            fi
           else
             echo "container /models directory not found, skipping model download"
           fi
         env:
+          MODEL_EXTRA_ARGS: ${{ matrix.extraArgs }}
+          DRAFT_MODEL_DOWNLOAD_TIMEOUT: "10m"
           MODEL_DOWNLOAD_TIMEOUT: "30m"
           MODEL_LOCK_WAIT_SECONDS: "1800"
           MODEL_LOCK_POLL_INTERVAL: "30"
@@ -631,9 +667,17 @@ jobs:
           else
             model_path="${{ matrix.model_path }}"
           fi
+          # Point --draft-model at the copy "Download models" cached under
+          # /models, so the launch does not download it from the Hub again.
+          launch_args="${MODEL_EXTRA_ARGS}"
+          if [ -n "${DRAFT_MODEL_ID:-}" ] && docker exec "$CONTAINER_NAME" test -f "${DRAFT_MODEL_DIR}/config.json"; then
+            launch_args="${launch_args/--draft-model ${DRAFT_MODEL_ID}/--draft-model ${DRAFT_MODEL_DIR}}"
+            launch_args="${launch_args/--draft-model=${DRAFT_MODEL_ID}/--draft-model=${DRAFT_MODEL_DIR}}"
+            echo "Using cached draft model: ${DRAFT_MODEL_DIR}"
+          fi
           # Pipe via stdin so container bash parses shell quoting in extraArgs
           # (e.g. single-quoted JSON in --default-chat-template-kwargs) naturally.
-          echo ".github/scripts/atom_test.sh launch $model_path $MODEL_EXTRA_ARGS" | \
+          echo ".github/scripts/atom_test.sh launch $model_path $launch_args" | \
             docker exec \
               -e ATOM_DEBUG_DEVICE_MAPPING="${ATOM_DEBUG_DEVICE_MAPPING}" \
               -i "$CONTAINER_NAME" bash -l

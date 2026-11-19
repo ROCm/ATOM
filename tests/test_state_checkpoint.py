@@ -3222,7 +3222,9 @@ class TestPromptEndAnchorTemplateMargin:
 
     The setting mirrors Qwen3.5 AgentX: block 16, PAGE copy checkpoints, no
     ladder (`interval -1`) and no demand rung, so the anchor is the only
-    checkpoint a prompt leaves.
+    checkpoint a prompt leaves. The exception is the LMCache chunk grid
+    section, which turns the demand rung on: what it pins is which demands
+    survive once the anchor is floored.
     """
 
     BLOCK = 16
@@ -3246,8 +3248,9 @@ class TestPromptEndAnchorTemplateMargin:
         monkeypatch.delenv("ATOM_STATE_CHECKPOINT_END_MARGIN", raising=False)
         self._next_token = iter(range(1000, 10**7))
         self._monkeypatch = monkeypatch
+        self.forwards = 0
 
-    def _bm(self, margin=None, block=None, runtime=PAGED_COPY_RUNTIME):
+    def _bm(self, margin=None, block=None, runtime=PAGED_COPY_RUNTIME, interval=-1):
         if margin is not None:
             self._monkeypatch.setenv("ATOM_STATE_CHECKPOINT_END_MARGIN", str(margin))
         return make_block_manager(
@@ -3257,7 +3260,7 @@ class TestPromptEndAnchorTemplateMargin:
                 max_num_batched_tokens=4096,
                 max_model_len=4096,
                 pool_entries={"state": 8},
-                state_checkpoint_interval_tokens=-1,
+                state_checkpoint_interval_tokens=interval,
                 state_checkpoint_demand=False,
             ),
             state_runtime=runtime,
@@ -3296,6 +3299,7 @@ class TestPromptEndAnchorTemplateMargin:
             seq.num_cached_tokens = start + chunk
             bm.take_state_maintenance_ops()
             bm.complete_previous_state_batch()
+            self.forwards += 1
         bm.deallocate(seq)
         return resumed, anchor
 
@@ -3372,6 +3376,189 @@ class TestPromptEndAnchorTemplateMargin:
             )
             bm.can_allocate(seq)
             assert seq.checkpoint_end_pos == 6 * self.BLOCK, margin  # (131-32)//16*16
+
+    # ── The LMCache chunk grid (demand rung on) ─────────────────────────────
+
+    CHUNK = 4 * BLOCK
+
+    def _grid_bm(self, interval=-1):
+        self._monkeypatch.setenv("ATOM_STATE_CHECKPOINT_DEMAND", "1")
+        bm = self._bm(interval=interval)
+        # As in `_joint_bm`: the LMCache config is not importable here.
+        bm._joint_chunk_tokens = self.CHUNK
+        return bm
+
+    def _demand_cuts(self, bm):
+        return bm.checkpoint_funnel()["chunks_cut_for_demand"]
+
+    def _dropped(self, bm):
+        return bm.checkpoint_funnel()["demands_dropped_at_grid_hit"]
+
+    def test_the_next_turn_cuts_no_demand_above_the_floored_anchor(self):
+        """The anchor is floored so the joint load, which needs the whole chunk
+        covering it, can restore it from the CPU tier. The next turn resumes
+        there, under one chunk below the prompt end, and does not cut a demand
+        at the unfloored position its KV reaches."""
+        bm = self._grid_bm()
+        t1 = self._prompt([], 7 * self.BLOCK + 5)
+        _, anchor = self._run_turn(bm, t1)
+        resumed, _ = self._run_turn(bm, t1 + self._fresh(80))
+        assert (anchor, resumed, self._demand_cuts(bm)) == (self.CHUNK, self.CHUNK, 0)
+        assert self._dropped(bm) == 1
+
+    def test_a_deferred_next_turn_is_dropped_once_however_often_it_asks(self):
+        """Counted once per seq, as the other two demand counters are, and not
+        at all for a replayed hit, which wants no demand whatever the floor."""
+        bm = self._grid_bm()
+        t1 = self._prompt([], 7 * self.BLOCK + 5)
+        self._run_turn(bm, t1)
+        nxt = Sequence(t1 + self._fresh(80), self.BLOCK, has_per_req_cache=True)
+        for _ in range(5):
+            assert bm.can_allocate(nxt) >= 0
+        assert self._dropped(bm) == 1, "counted per attempt"
+        self._monkeypatch.setattr(bm, "state_replay_tokens", 8)
+        replayed = Sequence(t1 + self._fresh(80), self.BLOCK, has_per_req_cache=True)
+        assert bm.can_allocate(replayed) >= 0 and replayed.replays_hit
+        assert self._dropped(bm) == 1, "a replayed hit counted"
+
+    def _conversation(self, bm, turns=6):
+        """`turns` turns, each resending the last verbatim and going on."""
+        prompt = self._prompt([], 7 * self.BLOCK + 5)
+        for turn in range(turns):
+            if turn:
+                history = prompt + self._fresh(37) + [self.IM_END, self.NL]
+                prompt = self._prompt(history, len(history) + 43)
+            self._run_turn(bm, prompt)
+
+    @pytest.mark.parametrize("interval", [-1, CHUNK], ids=["no_ladder", "ladder_chunk"])
+    def test_a_conversation_takes_two_forwards_a_turn(self, interval):
+        """One cut at the floored anchor and the rest of the prompt: 12 forwards
+        over six turns, with or without a ladder on the chunk grid. Main cuts a
+        demand on four of the five later turns (16 forwards)."""
+        bm = self._grid_bm(interval=interval)
+        self._conversation(bm)
+        assert (self.forwards, self._demand_cuts(bm)) == (12, 0)
+
+    @pytest.mark.parametrize("extra", range(0, CHUNK, BLOCK), ids=lambda e: f"+{e}")
+    def test_the_next_turn_resumes_under_one_chunk_below_the_prompt_end(self, extra):
+        """The price of the floor: the next turn resumes on the chunk grid, up
+        to one chunk below where its KV reaches, and recomputes the gap inside
+        the forward it runs anyway."""
+        bm = self._grid_bm()
+        t1 = self._prompt([], 5 * self.BLOCK + 5 + extra)
+        self._run_turn(bm, t1)
+        self.forwards = 0
+        resumed, _ = self._run_turn(bm, t1 + self._fresh(80))
+        reach = (len(t1) // self.BLOCK) * self.BLOCK
+        assert resumed % self.CHUNK == 0
+        assert 0 <= reach - resumed < self.CHUNK, (reach, resumed)
+        assert (self.forwards, self._demand_cuts(bm)) == (2, 0)
+
+    def test_the_floored_anchor_still_resumes_from_the_cpu_tier(self):
+        """Once the prompt has left HBM, the joint load restores the floored
+        anchor: the chunk covering it is a whole one LMCache stored."""
+        bm = self._grid_bm()
+        t1 = self._prompt([], 7 * self.BLOCK + 5)
+        seq = Sequence(t1, self.BLOCK, has_per_req_cache=True)
+        bm.allocate(seq, bm.can_allocate(seq))
+        anchor = seq.checkpoint_end_pos
+        bm.hash_blocks(seq, anchor)
+        seq.num_cached_tokens = anchor
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        h = bm._chain_to(seq, [], anchor // self.BLOCK)[-1]
+        assert bm.paged_state_checkpoints.contains(h), "precondition: kept"
+        victim = seq.block_table[1]
+        bm.deallocate(seq)
+        TestPagedCopyCheckpoint._break_the_kv_chain_at(bm, victim)
+        bm.paged_state_checkpoints.unindex(h)
+        index = TestPagedCopyCheckpoint._TierIndex(h)
+        bm.state_offload = index
+        bm.paged_state_checkpoints.attach_offload(index)
+
+        nxt = Sequence(t1 + self._fresh(80), self.BLOCK, has_per_req_cache=True)
+        # LMCache holds t1's whole chunks; its partial last chunk is keyed by
+        # tokens the next turn does not resend.
+        nxt.offload_joint.kv_prefix_tokens = (len(t1) // self.CHUNK) * self.CHUNK
+        bm.can_allocate(nxt)
+        assert (anchor, bm.state_tier_boundaries) == (self.CHUNK, 1), bm.joint_skips
+        assert nxt.offload_joint.boundary_tokens == anchor
+
+    def test_a_fork_just_above_a_grid_rung_loses_its_demand(self):
+        """What the drop gives up. Prompts share a 6-block prefix and fork
+        after it; the first one's anchor floors to 4 blocks, inside the shared
+        part. The second resumes there, and its demand at the fork, 2 blocks
+        up, is dropped, so every later fork resumes 2 blocks short of it and
+        recomputes them (while the prefix is in HBM: past it, the off-grid
+        demand would be out of reach anyway). Nothing more is cut."""
+        bm = self._grid_bm()
+        shared = self._fresh(6 * self.BLOCK)
+        forks = [shared + self._fresh(self.BLOCK + 5) for _ in range(3)]
+        _, anchor = self._run_turn(bm, forks[0])
+        resumed = [self._run_turn(bm, f)[0] for f in forks[1:]]
+        assert anchor == self.CHUNK
+        assert resumed == [self.CHUNK, self.CHUNK]
+        assert (self._demand_cuts(bm), self._dropped(bm)) == (0, 2)
+
+    def test_a_short_shared_header_keeps_its_demand(self):
+        """A hit at 0 is no floored anchor (one under a chunk stays put), so a
+        fork under one chunk in still gets its rung."""
+        bm = self._grid_bm()
+        header = self._fresh(3 * self.BLOCK)
+        forks = [header + self._fresh(4 * self.BLOCK + 5) for _ in range(3)]
+        self._run_turn(bm, forks[0])
+        resumed = [self._run_turn(bm, f)[0] for f in forks[1:]]
+        assert resumed == [0, 3 * self.BLOCK]
+        assert (self._demand_cuts(bm), self._dropped(bm)) == (1, 0)
+
+    def _forks_one_chunk_up(self, bm):
+        """Forks a whole chunk above the floored anchor (8 blocks, anchor 4)."""
+        first = self._fresh(8 * self.BLOCK)
+        self._run_turn(bm, first)
+        return [first + self._fresh(self.BLOCK + 5) for _ in range(2)]
+
+    def _forks_above_an_offgrid_hit(self, bm):
+        """Forks under one chunk above a hit off the chunk grid: a short
+        header's rung at 3 blocks, and the fork's own floor at 4."""
+        header = self._fresh(3 * self.BLOCK)
+        for _ in range(2):
+            self._run_turn(bm, header + self._fresh(4 * self.BLOCK + 5))
+        p3 = header + self._fresh(5 * self.BLOCK + 5)
+        self._run_turn(bm, p3)
+        return [p3[: 5 * self.BLOCK] + self._fresh(self.BLOCK + 5) for _ in range(2)]
+
+    def _forks_below_an_offgrid_hit(self, bm):
+        """Forks two blocks above a hit off the chunk grid: a short header's
+        rung at 1 block, with the fork's own floor, 0, below it."""
+        header = self._fresh(self.BLOCK)
+        for _ in range(2):
+            self._run_turn(bm, header + self._fresh(3 * self.BLOCK + 5))
+        p3 = header + self._fresh(4 * self.BLOCK + 5)
+        self._run_turn(bm, p3)
+        return [p3[: 3 * self.BLOCK] + self._fresh(self.BLOCK + 5) for _ in range(2)]
+
+    @pytest.mark.parametrize(
+        "forks, resumed, dropped",
+        [
+            (_forks_one_chunk_up, [CHUNK, 2 * CHUNK], 0),
+            (_forks_above_an_offgrid_hit, [3 * BLOCK, CHUNK], 1),
+            (_forks_below_an_offgrid_hit, [BLOCK, 3 * BLOCK], 0),
+        ],
+        ids=["one_chunk_up", "offgrid_hit", "floor_below_offgrid_hit"],
+    )
+    def test_a_demand_outside_the_dropped_shape_keeps_its_rung(
+        self, forks, resumed, dropped
+    ):
+        """Only a demand under one chunk above a nonzero hit on the chunk grid
+        is dropped. One a whole chunk up, or above a hit off the grid, still
+        cuts its rung, and the second fork resumes there; in `offgrid_hit` that
+        new rung is on the grid, so the second fork's own demand is dropped."""
+        bm = self._grid_bm()
+        prompts = forks(self, bm)
+        cuts, before = self._demand_cuts(bm), self._dropped(bm)
+        assert [self._run_turn(bm, p)[0] for p in prompts] == resumed
+        assert self._demand_cuts(bm) - cuts == 1
+        assert self._dropped(bm) - before == dropped
 
     # ── The margin's range (review of #2589) ────────────────────────────────
 
