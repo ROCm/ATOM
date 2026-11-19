@@ -1289,7 +1289,10 @@ def causal_conv1d_update(
             for example: conv_state_indices = [pad_slot_id, 1 ,20 ,pad_slot_id]
             in this case, the kernel will not process entries at
             indices 0 and 3
-    out: (batch, dim) or (batch, dim, seqlen) or (num_tokens, dim), same shape as `x`
+    Returns (query, key, value): the conv output split along dim, shaped
+    (num_tokens, k_dim_size), (num_tokens, k_dim_size) and
+    (num_tokens, v_dim_size) with num_tokens = x.shape[0]. Rows of padded
+    entries are left unwritten.
     """
     if validate_data:
         assert pad_slot_id is not None

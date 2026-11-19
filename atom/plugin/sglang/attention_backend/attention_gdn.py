@@ -795,13 +795,12 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
         """
         if window_view.ndim != 4:
             raise RuntimeError(
-                "ATOM GDN batched TARGET_VERIFY requires a rank-4 "
-                "intermediate_conv_window."
+                "ATOM GDN TARGET_VERIFY requires a rank-4 intermediate_conv_window."
             )
         num_slots, draft, dim, win = window_view.shape
         if draft != draft_token_num:
             raise RuntimeError(
-                "ATOM GDN batched TARGET_VERIFY received an incompatible "
+                "ATOM GDN TARGET_VERIFY received an incompatible "
                 f"draft dimension: expected {draft_token_num}, got {draft}."
             )
         shared_win = draft + win - 1
@@ -815,7 +814,7 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
             or stride_slot != dim * shared_win
         ):
             raise RuntimeError(
-                "ATOM GDN batched TARGET_VERIFY requires SGLang's "
+                "ATOM GDN TARGET_VERIFY requires SGLang's "
                 "deduplicated sliding-window intermediate_conv_window "
                 f"(shape={tuple(window_view.shape)} "
                 f"stride={tuple(window_view.stride())})."

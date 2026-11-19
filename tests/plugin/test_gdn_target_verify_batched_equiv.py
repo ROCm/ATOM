@@ -260,7 +260,8 @@ def test_ssm_equivalence_detects_missing_live_state_seed():
 # Conv
 # --------------------------------------------------------------------------
 def _conv_per_step_loop(inp: _Inputs):
-    """Plugin behaviour today: one narrow-window update per draft step."""
+    """Removed production path (one narrow-window update per draft step), retained
+    as a test-only numerical reference."""
     conv = inp.live_conv.clone()
     qkv = torch.zeros(inp.bs, inp.draft, CONV_DIM, device="cuda", dtype=torch.bfloat16)
     windows = torch.zeros(
