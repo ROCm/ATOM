@@ -3,7 +3,6 @@
 """Qwen3.8 offload: QSA pages are the checkpoint destination, PLE rides along."""
 
 import logging
-from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -14,7 +13,7 @@ pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
 
 from atom.kv_transfer.disaggregation.page_region import page_region
 from atom.kv_transfer.disaggregation.types import KVTransferTensors
-from atom.model_ops.attentions import gdn_attn
+from atom.model_ops.attentions import gdn_attn, qwen4_exp_attn
 from atom.model_ops.attentions.gdn_attn import (
     LINEAR_STATE_ROWS,
     GDNAttentionMetadataBuilder,
@@ -31,6 +30,7 @@ from atom.model_ops.attentions.qwen4_exp_attn import (
 )
 from atom.model_ops.fla_ops import gdn_flydsl
 from atom.plugin.vllm.kv_transfer.mp_page_layout import build_mp_transfer_tensors
+from atom.utils import envs
 
 
 def qsa_like_fields(block=4):
@@ -78,6 +78,7 @@ def _builder():
                 model_type="qwen4_exp_text",
                 num_attention_heads=2,
                 ple_layer_ids=[2],
+                linear_conv_kernel_dim=4,
                 ngram_size=3,
                 ple_conv_kernel_size=4,
                 hidden_size=8,
@@ -174,25 +175,43 @@ def test_layout_id_names_ple_and_forks_under_pipeline_parallel(one_tp_rank):
     assert not cls.state_transfer(builder).copies
 
 
-def test_ple_turns_a_midstep_readable_transfer_off_and_says_so(
-    monkeypatch, one_tp_rank, caplog
+@pytest.mark.parametrize("ple", [True, False])
+@pytest.mark.parametrize("pages", [True, False])
+def test_ple_keeps_midstep_off_on_the_page_and_the_fork_path(
+    monkeypatch, one_tp_rank, caplog, pages, ple
 ):
-    """The PLE windows are snapshotted only where a forward ends."""
+    """The PLE windows are snapshotted only where a forward ends, so under
+    `ATOM_GDN_STATE_MIDSTEP=1` a PLE build reads no state midstep, whether it
+    copies PAGE images (an offload tier) or forks slots (none, the default).
+    A build without PLE keeps the parent's answer on both."""
+    monkeypatch.setattr(envs, "ATOM_GDN_STATE_MIDSTEP", True)
+    qwen4_exp_attn._log_ple_midstep_off.cache_clear()
     builder, cls = _builder()
-    parent = GDNAttentionMetadataBuilder.state_transfer(builder)
-    readable = replace(
-        parent, readable_midstep=True, midstep_grid=64, midstep_min_offset=64
-    )
-    monkeypatch.setattr(
-        GDNAttentionMetadataBuilder, "state_transfer", lambda self: readable
-    )
+    config = builder.model_runner.config
+    if not pages:
+        config.kv_transfer_config = None
+    if not ple:
+        config.hf_config.ple_layer_ids = []
     with caplog.at_level(logging.WARNING, logger="atom"):
         transfer = cls.state_transfer(builder)
-    assert "ATOM_GDN_STATE_MIDSTEP=1 does not apply" in caplog.text
-    assert not transfer.readable_midstep
-    assert (transfer.midstep_grid, transfer.midstep_min_offset) == (0, 0)
-    assert transfer.copies == readable.copies
-    assert transfer.paged_layout_id.startswith(readable.paged_layout_id + ":")
+    assert transfer.copies == pages
+    assert transfer.readable_midstep == (not ple)
+    assert (transfer.midstep_grid, transfer.midstep_min_offset) == (
+        (0, 0) if ple else (64, 3)
+    )
+    assert ("ATOM_GDN_STATE_MIDSTEP=1 does not apply" in caplog.text) == ple
+    if pages:
+        assert (":ple_conv=" in transfer.paged_layout_id) == ple
+
+
+def test_the_ple_midstep_warning_is_logged_once(monkeypatch, one_tp_rank, caplog):
+    monkeypatch.setattr(envs, "ATOM_GDN_STATE_MIDSTEP", True)
+    qwen4_exp_attn._log_ple_midstep_off.cache_clear()
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        for _ in range(3):
+            builder, cls = _builder()
+            cls.state_transfer(builder)
+    assert caplog.text.count("ATOM_GDN_STATE_MIDSTEP=1 does not apply") == 1
 
 
 @pytest.mark.parametrize(

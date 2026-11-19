@@ -524,8 +524,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_STATE_CHECKPOINT_CHECK_BLOCKS", "0") == "1"
     ),
     # Set to 1 to read Qwen GDN state checkpoints out of the chunk kernel's
-    # interior states instead of cutting prefill chunks onto them. PAGE path
-    # only (Qwen3-Next / Qwen3.5); see `PagedStateCheckpointCoordinator`.
+    # interior states instead of cutting prefill chunks onto them, on both the
+    # PAGE and the fork-slot path; see `PagedStateCheckpointCoordinator`. Not
+    # Qwen3.8, whose PLE windows are checkpointed only where a forward ends.
     "ATOM_GDN_STATE_MIDSTEP": lambda: os.getenv("ATOM_GDN_STATE_MIDSTEP", "0") == "1",
     # Set to 0 to keep Qwen3.5's GDN input projection as two layers
     # (`in_proj_qkvz` + `in_proj_ba`) when the checkpoint quantizes them with

@@ -26,7 +26,7 @@ block table entry directly addresses a page in both main and index-key caches.
 import logging
 import math
 from dataclasses import dataclass, field, replace
-from functools import cached_property
+from functools import cache, cached_property
 from typing import Any, NamedTuple
 
 import numpy as np
@@ -76,6 +76,14 @@ from .token_layout.batch_ids import build_batch_ids
 PLE_STATE_SLOT_CLASS = STATE_SLOT_CLASS
 
 logger = logging.getLogger("atom")
+
+
+@cache
+def _log_ple_midstep_off() -> None:
+    logger.warning(
+        "ATOM_GDN_STATE_MIDSTEP=1 does not apply to Qwen3.8: its PLE windows "
+        "are checkpointed only where a forward ends"
+    )
 
 
 class _PlePlane(NamedTuple):
@@ -457,27 +465,24 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
 
     def state_transfer(self) -> StateTransfer:
         transfer = super().state_transfer()
+        planes = self._ple_planes
+        if planes and transfer.readable_midstep:
+            # Nothing snapshots the PLE windows inside a forward, so prefill
+            # stays cut onto rungs, on the fork path as on the PAGE one.
+            _log_ple_midstep_off()
+            transfer = replace(
+                transfer, readable_midstep=False, midstep_grid=0, midstep_min_offset=0
+            )
         if not transfer.copies:
             return transfer
         # What the parent's id cannot see: the PAGE fields, the SSM's physical
         # order and the PLE planes.
-        planes = self._ple_planes
         layout_id = qsa_paged_layout_id(
             transfer.paged_layout_id,
             self._ssm_storage,
             [(f.name, f.shape, f.dtype) for f in self._qsa_fields()],
             [(p.tag, p.shape, p.dtype) for p in planes],
         )
-        if planes and transfer.readable_midstep:
-            # Nothing snapshots the PLE windows inside a forward, so prefill
-            # stays cut onto rungs.
-            logger.warning(
-                "ATOM_GDN_STATE_MIDSTEP=1 does not apply to Qwen3.8: its PLE "
-                "windows are checkpointed only where a forward ends"
-            )
-            transfer = replace(
-                transfer, readable_midstep=False, midstep_grid=0, midstep_min_offset=0
-            )
         return replace(transfer, paged_layout_id=layout_id)
 
     def _checkpoint_plane_shapes(self) -> list[tuple[int, int]]:
