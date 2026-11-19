@@ -4063,8 +4063,8 @@ class MooncakeConnector(KVConnectorBase):
                 return False
 
         if blocks_only:
-            # A chunk's pages restart at 0, which a staged gather cannot address;
-            # the chunked path refuses a DCP consumer, so nothing is staged here.
+            # Unreachable: the chunked path refuses a slot transfer to a DCP
+            # consumer (`has_slot_regions` with `consumer_dcp_size > 1`).
             if staged_index_regions:
                 raise RuntimeError(
                     "staged DSA index regions in a chunked slot transfer"

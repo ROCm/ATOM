@@ -49,6 +49,10 @@ Validated with AITER `main` at `dbaffe23ed` plus
   mode (bit-reproducible routed-expert output). Use AITER's normal merged
   tuning tables; pointing `AITER_CONFIG_FMOE` at a single CSV drops required
   shared entries.
+- PP x TP1 stages only (the P/D prefill below):
+  [ROCm/aiter#8297](https://github.com/ROCm/aiter/pull/8297), which reads
+  MXFP4 MoE weights past 4 GiB per expert. At TP1, K3.1's w1 is 9.9 GB and
+  its w2 4.9 GB; without it a TP1 stage's routed experts are wrong.
 
 After updating AITER, rebuild its JIT modules before starting the server: an
 existing `aiter/jit/module_*.so` is loaded without being compared to its
@@ -112,16 +116,56 @@ With DSpark (pinned acceptance length 4.59) and ReplaySSM, concurrency 1 / 4 /
 
 Only that configuration has been validated: TP8 with DCP8,
 `--kv_cache_dtype bf16`, `--index-cache-dtype fp8`, CUDA graphs on, with mono
-on or off, and with the DSpark drafter and ReplaySSM above.
-P/D over Mooncake with a PP prefill is validated too: a PP8 x TP1 prefill
-into a TP8 x DCP8 decode, two nodes, with DSpark4. Every transferred MLA row,
-DSA index page and KDA state matched the prefill's bytes on each decode rank,
-and prompts of 3.6K to 72K tokens retrieved the code hidden in them. The TP1
-prefill stages need ROCm/aiter#8297, since K3.1's MXFP4 MoE weights pass
-4 GiB at TP1.
+on or off, and with the DSpark drafter and ReplaySSM above, plus the P/D
+topology in the next section.
 PCP is rejected while the model is built (the indexer's projections live in
-the fused q_a projection, and the PCP indexer projects k itself). Nothing
-else is rejected at startup, but online quantization of the other layers,
-other PP or KV-transfer topologies, expert parallelism, DP attention, other
+the fused q_a projection, and the PCP indexer projects k itself), and P/D over
+MoRIIO with PP > 1 at startup. Online quantization of the other layers, other
+PP or KV-transfer topologies, expert parallelism, DP attention, other
 speculative methods, plugins and TBO are untested. The vision wrapper is registered, but image
 inference has not been validated.
+
+## P/D: PP prefill into a DCP decode
+
+Validated over Mooncake on two MI355X nodes: a PP8 x TP1 prefill into a TP8 x
+DCP8 decode, with FP8 MLA KV (`--kv_cache_dtype fp8`; the index cache is FP8
+as always), block size 128, prefix caching, DSpark4 with ReplaySSM
+(`ATOM_ENABLE_REPLAYSSM=1`) and mono off (`ATOM_MONO_ENABLE=0`). The TP1
+stages need ROCm/aiter#8297 (see AITER requirements).
+
+```bash
+# Prefill (producer)
+python -m atom.entrypoints.openai_server \
+  --model /data/Kimi-K3.1-Pro --trust-remote-code \
+  -tp 1 --pipeline-parallel-size 8 --enforce-eager \
+  --kv_cache_dtype fp8 --block-size 128 --enable_prefix_caching \
+  --state-checkpoint-interval-tokens -1 --max-num-batched-tokens 8192 \
+  --method dspark --draft-model /data/Kimi-K3.1-Pro-DSpark-preview \
+  --num-speculative-tokens 4 --server-port 8010 \
+  --kv-transfer-config '{"kv_connector":"mooncake","kv_role":"kv_producer",
+    "proxy_ip":"<prefill IP>","handshake_port":6301,"protocol":"rdma"}'
+
+# Decode (consumer)
+python -m atom.entrypoints.openai_server \
+  --model /data/Kimi-K3.1-Pro --trust-remote-code \
+  -tp 8 --decode-context-parallel-size 8 \
+  --kv_cache_dtype fp8 --block-size 128 --enable_prefix_caching \
+  --state-checkpoint-interval-tokens -1 --max-num-batched-tokens 2048 \
+  --method dspark --draft-model /data/Kimi-K3.1-Pro-DSpark-preview \
+  --num-speculative-tokens 4 --server-port 8020 \
+  --kv-transfer-config '{"kv_connector":"mooncake","kv_role":"kv_consumer",
+    "proxy_ip":"<decode IP>","handshake_port":6401,"protocol":"rdma"}'
+
+# Router
+atomesh launch --port 8000 --pd-disaggregation --backend atom \
+  --prefill http://<prefill IP>:8010 --decode http://<decode IP>:8020
+```
+
+What was checked, on each of the eight decode ranks:
+
+- Every transferred PAGE region, the MLA rows and the DSA index pages,
+  matched the bytes rebuilt from the prefill's (4 requests of 3.6K to 72K
+  tokens; 29 MLA and 24 index regions a rank). The KDA state moves as slot
+  regions and was not byte-checked.
+- 8 of 8 prompts of 3.6K to 72K tokens retrieved the code hidden in them, so
+  the decode's indexer picked its keys from the transferred index cache.

@@ -501,6 +501,33 @@ def test_a_pp_stage_keeps_the_base_placement_of_its_index_regions():
     assert slots == [3, 4, 5, 9, 10, 11]
 
 
+def test_an_unpooled_sparse_pp_stage_is_placed_end_to_end(monkeypatch):
+    """K3.1's path through `get_kv_transfer_tensors`: an index-holding PP stage
+    is not refused, and its index region keeps the base's placement."""
+
+    def mla_and_index(self):
+        tensors = KVTransferTensors(
+            pages=[
+                PageRegion(KVTransferRegion(0x1000, 64 * self.BLOCKS, 64)),
+                PageRegion(KVTransferRegion(0x9000, 16 * self.BLOCKS, 16)),
+            ],
+            slot_regions=[],
+        )
+        tensors.set_block_count(self.BLOCKS)
+        # The base's own MLA placement (9) is replaced; its index region (4) is kept.
+        tensors.block_region_consumer_indices = [9, 4]
+        return tensors
+
+    monkeypatch.setattr(_MLABase, "get_kv_transfer_tensors", mla_and_index)
+    builder = kimi_builder({"kv_connector": "mooncake"}, pp_size=2)
+    builder.model_runner.has_mla_indexer = True  # index_kpool unset: 1
+
+    tensors = builder.get_kv_transfer_tensors()
+
+    assert tensors.block_region_consumer_indices == [1, 4]
+    assert tensors.slot_region_consumer_indices == [3, 4, 5, 9, 10, 11]
+
+
 def test_a_sparse_pp_stage_refuses_a_region_count_it_did_not_place():
     builder = kimi_builder({"kv_connector": "mooncake"}, pp_size=2)
 
