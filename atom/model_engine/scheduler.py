@@ -1645,21 +1645,36 @@ class Scheduler:
         """
         cap = self.max_num_batched_tokens
         total = 0
+        if max_seqs is not None and max_seqs <= 0:
+            return 0
+        for num_new_tokens in itertools.islice(self._waiting_new_tokens(), max_seqs):
+            total += num_new_tokens
+            if total >= cap:
+                return cap
+        return total
+
+    def _waiting_new_tokens(self):
+        """New tokens of waiting prefills eligible for the queue fill signal."""
         for seq in self._waiting_prefills():
-            if max_seqs is not None and max_seqs <= 0:
-                break
             num_new_tokens = self.pending_prefill_tokens(seq)
             if (
                 not self.enable_chunked_prefill
                 and num_new_tokens > self.max_num_batched_tokens
             ):
                 continue
-            total += max(0, num_new_tokens)
+            yield max(0, num_new_tokens)
+
+    def _waiting_new_token_counts(self, free_slots: int) -> tuple[int, int]:
+        """Backlog and slot-limited fill signals from one capped queue scan."""
+        cap = self.max_num_batched_tokens
+        total = slot_total = 0
+        for i, tokens in enumerate(self._waiting_new_tokens()):
+            total += tokens
+            if i < free_slots:
+                slot_total += tokens
             if total >= cap:
-                return cap
-            if max_seqs is not None:
-                max_seqs -= 1
-        return total
+                return cap, min(slot_total, cap)
+        return total, slot_total
 
     def _partial_prefill_remaining_tokens(self) -> int:
         """Sum of remaining (not-yet-computed) tokens across mid-chunked-prefill
@@ -2286,6 +2301,11 @@ class Scheduler:
             running_decode_batch = max(
                 0, len(self.running) - self._partial_prefill_count
             )
+            # A parked remote-KV seq holds a slot too.
+            free_slots = max(
+                0, self.max_num_seqs - len(self.running) - self._num_parked_remote_kv
+            )
+            partial_tokens = ramp_waiting_tokens = 0
             protects_decode = self.prefill_delayer.protects_decode(running_decode_batch)
             if protects_decode or (
                 self._local_prefill_coalescing and not running_decode_batch
@@ -2302,9 +2322,15 @@ class Scheduler:
                 prefillable, pending_tokens = self._local_prefill_pending_work()
             else:
                 prefillable = self._can_admit_head_prefill()
+                partial_tokens = self._partial_prefill_remaining_tokens()
+                if self.prefill_delayer.ramp_active:
+                    waiting_tokens, ramp_waiting_tokens = (
+                        self._waiting_new_token_counts(free_slots)
+                    )
+                else:
+                    waiting_tokens = self._waiting_new_token_count()
                 pending_tokens = min(
-                    self._waiting_new_token_count()
-                    + self._partial_prefill_remaining_tokens(),
+                    waiting_tokens + partial_tokens,
                     self.max_num_batched_tokens,
                 )
             # DP prefill cost balancing: this rank's chunk cost rides the same
@@ -2318,17 +2344,19 @@ class Scheduler:
                 else 0.0
             )
             waiting_requests = len(self.waiting) + self._partial_prefill_count
-            # Seq slots a FIRE can fill: a parked remote-KV seq holds one too.
-            free_slots = max(
-                0, self.max_num_seqs - len(self.running) - self._num_parked_remote_kv
-            )
-            # Prefill ramp: target_fill of a chunk is ready from the waiting heads
-            # that fit the free seq slots, so delaying it only leaves slots empty.
+            if (
+                prefillable
+                and self.prefill_delayer.ramp_active
+                and (protects_decode or self._local_prefill_coalescing)
+            ):
+                partial_tokens = self._partial_prefill_remaining_tokens()
+                ramp_waiting_tokens = self._waiting_new_token_count(max_seqs=free_slots)
+            # Ramp fill includes resumable partials and waiting heads that fit
+            # free slots. Reuse the coalescer scan on the default DP path.
             full_chunk = (
                 prefillable
                 and self.prefill_delayer.ramp_active
-                and self._partial_prefill_remaining_tokens()
-                + self._waiting_new_token_count(max_seqs=free_slots)
+                and partial_tokens + ramp_waiting_tokens
                 >= self.prefill_delayer.target_fill * self.max_num_batched_tokens
             )
             decision = self.prefill_delayer.should_allow_prefill(

@@ -414,8 +414,9 @@ class PrefillDelayer:
             prefill_decode_interval = 0
         self.prefill_decode_interval = prefill_decode_interval
         # Initial ramp: while every rank can fill target_fill of a prefill chunk
-        # from waiting requests that fit its free seq slots, release at once,
-        # ahead of the decode interval, the coalescer and the adaptive rule.
+        # from resumable partials plus waiting requests that fit its free seq
+        # slots, release at once ahead of the decode interval, coalescer and
+        # adaptive rule.
         self.prefill_ramp = bool(prefill_ramp)
 
         # `_FIXED_SLOTS`-slot SUM-reduce buffer (gloo-safe). Encoding:
@@ -435,9 +436,9 @@ class PrefillDelayer:
         #                                head cannot be admitted)
         #   slot 10 = unreachable flag  (SUM → n_unreachable; no prefill and no
         #                                decode completion within the hold)
-        #   slot 11 = full_chunk flag   (SUM → n_full; waiting requests that fit
-        #                                the free seq slots fill target_fill of
-        #                                a prefill chunk)
+        #   slot 11 = full_chunk flag   (SUM → n_full; resumable partials plus
+        #                                waiting requests that fit the free seq
+        #                                slots fill target_fill of a chunk)
         # With exchange_prefill_costs (DP prefill cost balancing), dp_size more:
         #   slot `_FIXED_SLOTS` + r = rank r's prefill chunk cost (one-hot, SUM
         #                → every rank's cost), read back as rank_prefill_costs

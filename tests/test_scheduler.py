@@ -1569,6 +1569,26 @@ class TestWaitingNewTokenCount:
         )
         assert sched._waiting_new_token_count() == 18
 
+    @pytest.mark.parametrize("free_slots", [0, 1, 2, 3, 4])
+    @pytest.mark.parametrize("cap", [8, 16, 1000])
+    def test_dual_counts_preserve_backlog_and_slot_limit(
+        self, seq_factory, free_slots, cap
+    ):
+        sched = self._sched()
+        sched.max_num_batched_tokens = cap
+        remote = seq_factory(list(range(10)))
+        remote.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+        cached = seq_factory(list(range(8)))
+        cached.num_cached_tokens = 8
+        sched.waiting = deque(
+            [cached, remote, seq_factory(list(range(6))), seq_factory(list(range(5)))]
+        )
+        # A fully cached head still takes a slot; an in-flight head does not.
+        assert sched._waiting_new_token_counts(free_slots) == (
+            min(cap, 11),
+            min(cap, sum([0, 6, 5][:free_slots])),
+        )
+
     def test_max_seqs_counts_only_free_slots(self, seq_factory):
         sched = self._sched()
         remote = seq_factory(list(range(10)))
@@ -1869,7 +1889,7 @@ class _RampDelayer:
         return False
 
     def should_allow_prefill(self, prefillable, pending_tokens, **kwargs):
-        self.reports.append(kwargs)
+        self.reports.append({"pending_tokens": pending_tokens, **kwargs})
         return PrefillDecision(allow=False, prefillable_ranks=int(prefillable))
 
 
@@ -1924,6 +1944,27 @@ class TestInitialRampFullChunk:
         report = self._report(sched, _RampDelayer())
         assert report["full_chunk"] is False
         assert report["admittable_requests"] == 1
+
+    def test_default_dp_reuses_queue_and_partial_counts(self, seq_factory):
+        sched = self._sched()
+        for start in (10, 30, 50):
+            sched.add(seq_factory(list(range(start, start + 20))))
+        sched._num_parked_remote_kv = 3
+        with (
+            mock.patch.object(
+                sched, "_waiting_new_tokens", wraps=sched._waiting_new_tokens
+            ) as waiting_scan,
+            mock.patch.object(
+                sched,
+                "_partial_prefill_remaining_tokens",
+                wraps=sched._partial_prefill_remaining_tokens,
+            ) as partial_count,
+        ):
+            report = self._report(sched, _RampDelayer())
+        assert waiting_scan.call_count == partial_count.call_count == 1
+        # Backlog still feeds the coalescer; only the first prompt fits a slot.
+        assert report["pending_tokens"] == 60
+        assert report["full_chunk"] is False
 
 
 class TestOldestWaitingPrefillAge:
