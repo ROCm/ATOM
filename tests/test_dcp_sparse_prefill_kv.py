@@ -21,12 +21,14 @@ import pytest
 import torch
 from conftest import gpu_stack_import
 
+# Before the imports: gpu_stack_import skips per test, not per module, so on the
+# CPU-only runner it would fail collection here.
+if not torch.cuda.is_available():
+    pytest.skip("Triton kernels need a GPU", allow_module_level=True)
+
 dcp_ops = gpu_stack_import("atom.model_ops.dcp_ops")
 aiter_mla = gpu_stack_import("atom.model_ops.attentions.aiter_mla")
 attention_mla = gpu_stack_import("atom.model_ops.attention_mla")
-
-if not torch.cuda.is_available():
-    pytest.skip("Triton kernels need a GPU", allow_module_level=True)
 
 from atom.distributed.dcp_utils import mla_dcp_sparse_prefill_kv_splits
 from atom.model_ops.attentions.sparse_mla_head_groups import (
