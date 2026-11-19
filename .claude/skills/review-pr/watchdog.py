@@ -86,15 +86,17 @@ class GitHub:
     def jobs(self, repo, run_id):
         return self._get("/repos/%s/actions/runs/%s/jobs?per_page=%d" % (repo, run_id, PAGE))["jobs"]
 
-    def in_progress_runs(self, repo, workflow=None):
+    def in_progress_runs(self, repo, workflow):
         """Every in_progress run, not just the first page.
 
         A batch of reviews queues up as a long list of in_progress runs and the API returns the
         newest first -- so the one actually holding the runner is last, and a single page would
         miss exactly it.
 
-        Without `workflow` this is every workflow in the repo, which is what box_busy needs:
-        the box is busy whoever is using it.
+        `workflow` has no default on purpose. box_busy wants every workflow in the repo --
+        the box is busy whoever is using it -- and queue_gate wants only this one, because
+        it is counting reviews. When that was a default, widening it for box_busy silently
+        widened queue_gate's survey too.
         """
         where = ("/actions/workflows/%s/runs" % workflow) if workflow else "/actions/runs"
         out, page = [], 1
@@ -123,7 +125,7 @@ def box_busy(api, repo, own_run_id):
     aiter#8255 spent 2026-11-18 that way. Asking about the label instead of about ourselves
     costs one wider query and removes the reason for the ban.
     """
-    for run in api.in_progress_runs(repo):
+    for run in api.in_progress_runs(repo, None):          # any workflow: it is one box
         if run["id"] == own_run_id:
             continue
         if any(j["status"] == "in_progress" and RUNNER_LABEL in (j.get("labels") or [])

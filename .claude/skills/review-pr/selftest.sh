@@ -464,7 +464,9 @@ _ledger_rc() {  # <rules.txt content, or MISSING> -> exit code of the ledger gat
   [ "$1" = MISSING ] || printf '%s\n' "$1" > "$d/rules.txt"
   : > "$d/verdicts.txt"
   python3 "$S/triage.py" ledger "$d/rules.txt" "$d/verdicts.txt" >/dev/null 2>&1
-  echo $?
+  rc=$?
+  rm -rf "$d"
+  echo $rc
 }
 t "a missing rules.txt is refused by the ledger gate, before this one" \
   "$(_ledger_rc MISSING)" "1"
@@ -598,7 +600,9 @@ import pathlib, re, sys
 p = pathlib.Path(sys.argv[1], "watchdog.py")
 p.write_text(re.sub(r"^RUNNER_LABEL = .[^\"]+.$", "RUNNER_LABEL = \"%s\"" % sys.argv[2],
                     p.read_text(), count=1, flags=re.M))' "$d" "$1"
-  python3 "$d/check_prompts.py" 2>&1 | grep -c "is not the review job.s label"
+  out=$(python3 "$d/check_prompts.py" 2>&1 | grep -c "is not the review job.s label")
+  rm -rf "$r"
+  printf '%s\n' "$out"
 }
 t "a watchdog watching the wrong label is refused" "$(_label_gate wrong-box)" "1"
 t "and the right one is not" "$(_label_gate atom-bot)" "0"

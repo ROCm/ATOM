@@ -36,7 +36,8 @@ def load(src):
 
 def drive(mod, scn):
     """Run watchdog.run() once; return everything it did."""
-    rec = {"polls": 0, "posts": [], "notices": [], "warnings": [], "errors": [], "rc": None}
+    rec = {"polls": 0, "posts": [], "notices": [], "warnings": [], "errors": [],
+           "scopes": set(), "rc": None}
 
     class Fake(mod.GitHub):
         def _get(self, path):
@@ -54,6 +55,10 @@ def drive(mod, scn):
                         [{"name": "review", "status": st,
                           "labels": ["self-hosted", "atom-bot"]}]}
             if "/runs" in u.path:
+                # The two scopes are different endpoints, and the fake has to tell them
+                # apart: answering both from one list let box_busy be narrowed back to this
+                # workflow with every test still green.
+                rec["scopes"].add("workflow" if "/workflows/" in u.path else "repo")
                 live = scn.get("live_runs", [])
                 live = live(rec["polls"]) if callable(live) else live
                 per, page = int(q["per_page"][0]), int(q["page"][0])
@@ -118,6 +123,17 @@ CASES = [
          (r["rc"] == 0, "failed the job for normal queueing behind the single runner"),
          (any("busy" in m for m in r["notices"]), "left no trace of why it went quiet"),
          (r["polls"] > 1, "stopped watching the moment it saw the box busy"),
+     ]),
+
+    # ...and it must ask the repo-wide endpoint to find out. Narrowing this back to the
+    # review workflow is the bug this PR fixes, and nothing else would notice.
+    ("asks about the whole box, not just its own workflow",
+     {"self_status": QUEUED_FOREVER,
+      "live_runs": [{"id": 333}],
+      "other_jobs": {333: [{"name": "nightly-bench", "status": "in_progress",
+                            "labels": ["self-hosted", "atom-bot"]}]}},
+     lambda r: [
+         ("repo" in r["scopes"], "only ever queried its own workflow's runs"),
      ]),
 
     # The box is busy whoever is using it. Counting only this workflow's runs made a healthy
