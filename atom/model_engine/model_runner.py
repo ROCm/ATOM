@@ -561,9 +561,11 @@ class tokenIDProcessor:
 
         ``defer_spec_status``: the attention builder advances this step from
         the previous verdict on the device
-        (`AttentionMetadataBuilder.consumes_device_verdict`), so the step is
-        built as if no draft had been rejected (zero counts) and the wait is
-        owed until after the target's launch (`take_deferred_spec_status`).
+        (`AttentionMetadataBuilder.consumes_device_verdict`), or the step is a
+        prefill, which carries no request over and so reads no status before
+        `postprocess`. The step is built as if no draft had been rejected
+        (zero counts) and the wait is owed until after the target's launch
+        (`take_deferred_spec_status`).
         """
         bs = batch.total_seqs_num
         self.batch_info.np[:] = (
@@ -2979,11 +2981,15 @@ class ModelRunner:
                 lens, cu[1:], token_group
             )
         # A builder that advances this step from the previous verdict on the
-        # device builds it without that verify's host-side status: its wait
-        # follows the target's launch (`forward`).
-        self.spec_status_deferred = self.attn_metadata_builder.consumes_device_verdict(
+        # device builds it without that verify's host-side status, and a
+        # prefill carries no request over, so nothing before its launch reads
+        # that status (only `postprocess` reports it): either way the wait
+        # follows the target's launch (`forward`). The builder is asked every
+        # step, a prefill's included.
+        consumes_verdict = self.attn_metadata_builder.consumes_device_verdict(
             batch, forward_mode.max_seqlen_q
         )
+        self.spec_status_deferred = consumes_verdict or batch.has_prefill
         # No GPU consumer runs between these host producers and this
         # upload. Token assembly publishes before launching its kernel.
         input_ids = self.tokenID_processor.prepare_input_ids(
