@@ -503,8 +503,8 @@ def select_mc(c, hb, ctr, isrx, G, anc=None, x0=None):
         if g == 0:   # padding past min(n, k)
             for pp in range(fx.min(n, k) + t, k, 256):
                 _emit_any(c, mode, I32(0), I32(1) > I32(0), r, I32(0), q, k, I32(0), c["lvl"], c["lvl"], pp, I32(0), I32(-1))
-        if fx.const_expr(anc is not None):   # REINDEX: the 512-th score (its resolved prefix) -> select_ma's anchor
-            if isrx & (g == 0) & (t == 0) & (n > k):
+        if fx.const_expr(anc is not None):   # c1: the 512-th score (its resolved prefix) -> the select_ma / mf anchor
+            if (g == 0) & (t == 0) & (n > k):
                 hx.gstore(anc + i64(r) * 4, _ma_key_f32(st4[0]))
 
 
@@ -835,5 +835,149 @@ def select_ma(c, hb, ctr, G, ma, kp):
                 _ma_put(c, r, k - need + m0, lf[0], lf[1])
             if mb_ & (m1 < need):
                 _ma_put(c, r, k - need + m1, lf[2], lf[3])
+        gpu.barrier()   # (select_mc rewrites O_MC when this returns 0)
+    return done
+
+
+O_MFL = O_MAP                            # (select_mf, group CTA 0) the 512-th's bin: keys [MF_CAP], columns [MF_CAP]
+
+
+@ASTRewriter.transform
+def select_mf(c, ctr, G, mf, kp):
+    """A FULL layer's rows (c1): select_mc's row groups (G CTAs a row, CTA g: keys [g CH, (g + 1) CH)), the first radix
+    round replaced by 254 linear bins over [a - MA_S, a + MA_S), a = the row's previous 512-th (kp, kept across steps;
+    bin 0 / 255 take the keys below / above): one group count finds the 512-th's bin j; the keys above it take their
+    positions (one device atomic a CTA for its winners | j-bin keys, then an LDS one a wave), the bin's keys (<= MF_CAP)
+    go to the row's list (kp + MF_KLIST), counted (ctr[r][7]); the group's CTA 0 ranks them (score desc, column asc),
+    writes the first `need` and the 512-th (the next anchor). The same set as select_mc (ties: a legal choice). Returns
+    1 when its picks are written, 0 (uniform in a group) when select_mc must run: j = 0 / 255 or > MF_CAP keys in bin j
+    (TDUMPF 133K / 400K, layers 2 / 8 / 14: 0 of 12096 rows). mf: the layer's zeroed histograms [MC_ROWS][256]."""
+    t, b, sm, TR = c["t"], c["b"], c["sm"], c["TR"]
+    lane = t % 32
+    wave = t // 32
+    k = I32(KSEL)
+    r = fx.min(b // G, I32(TR - 1))
+    g = b % G
+    done = I32(0)
+    if b < TR * G:
+        if t == 0:
+            bd0 = hx.gload(c["ibound"] + i64(r) * 4, I32)
+            hx.lstore(sm + O_MC, fx.Vector.from_elements([I32(0), I32(0), k, fx.max(bd0, I32(0))], I32))
+            hx.lstore(sm + O_MAL + 72, fx.Vector.from_elements([I32(0), I32(0)], I32))
+        hx.lstore(sm + O_MCH + t * 4, I32(0))
+        gpu.barrier()
+        n = hx.lload(sm + O_MC + 12, I32)
+        CH = (n + (G - 1)) // G
+        i0 = g * CH
+        i1 = fx.min(i0 + CH, n)
+        rowp = c["ilog"] + i64(r) * i64(c["ilw"]) * 4
+        lo = hx.gload(kp + i64(MF_KANC) + i64(r) * 4, F32) - F32(MA_S)
+        inv = F32(254.0 / (2.0 * MA_S))
+        if n > k:
+            for i in range(i0 + t, i1, 256):   # pass 1: this CTA's keys -> its LDS bins
+                hx.latomic_add_i32(sm + O_MCH + _ma_bin(hx.gload(rowp + i64(i) * 4, I32), lo, inv) * 4, I32(1))
+            gpu.barrier()
+            lad = mf + i64(r * 256) * 4
+            hv = hx.lload(sm + O_MCH + t * 4, I32)   # (kept: this CTA's count of bin t)
+            if hv != 0:
+                hx.atomic_add(lad + i64(t) * 4, hv)
+            hx.wait_storecnt0()
+            gpu.barrier()
+            if t == 0:
+                hx.atomic_add(ctr + i64((r * 8 + 6) * 4), 1)
+                hx.wait_count(ctr + i64((r * 8 + 6) * 4), G, 8, acq=False)   # (the bins below: agent-scope loads)
+            gpu.barrier()
+            if t < 32:   # wave 0: the bin of the 512-th key (select_ma's scan)
+                cs = [hx.gload(lad + i64(255 - 8 * lane - qq) * 4, I32, scope="agent") for qq in range(8)]
+                s4 = cs[0]
+                for qq in range_constexpr(1, 8):
+                    s4 = s4 + cs[qq]
+                before = wave_incl_scan(s4, lane) - s4
+                found = I32(-1)
+                mb = I32(-1)
+                for qq in range_constexpr(8):
+                    hit = (before < k) & (k <= before + cs[qq])
+                    found = hit.select(((255 - 8 * lane - qq) << 16) | (k - before), found)
+                    mb = hit.select(cs[qq], mb)
+                    before = before + cs[qq]
+                found = wave_max(found)
+                mb = wave_max(mb)
+                if lane == 0:
+                    hx.lstore(sm + O_MC, fx.Vector.from_elements([found >> 16, mb, found & 0xFFFF, n], I32))
+            gpu.barrier()
+            st4 = hx.lload(sm + O_MC, I32, 4)
+            j = st4[0]
+            nb = st4[1]
+            need = st4[2]
+            if (j >= 1) & (j <= 254) & (nb <= I32(MF_CAP)):
+                done = I32(1)
+                # this CTA's winners (bins > j) and j-bin keys, from its LDS bins: one device atomic -> its bases
+                ws = wave_incl_scan((t > j).select(hv, I32(0)), lane)
+                ms = wave_incl_scan((t == j).select(hv, I32(0)), lane)
+                if lane == 31:
+                    hx.lstore(sm + O_MAL + wave * 8, fx.Vector.from_elements([ws, ms], I32))
+                gpu.barrier()
+                if t == 0:
+                    wtot = I32(0)
+                    mtot = I32(0)
+                    for wv in range_constexpr(WAVES):
+                        pr = hx.lload(sm + O_MAL + wv * 8, I32, 2)
+                        wtot = wtot + pr[0]
+                        mtot = mtot + pr[1]
+                    hx.lstore(sm + O_MAL + 64, hx.atomic_add(ctr + i64(r * 32), wtot | (mtot << 16)))
+                gpu.barrier()
+                bs = hx.lload(sm + O_MAL + 64, I32)
+                wb0 = bs & 0xFFFF
+                mb0 = (bs >> 16) & 0xFFFF
+                q = fx.max(hx.gload(c["ibat"] + i64(r) * 4, I32), I32(0))
+                lst = kp + i64(MF_KLIST) + i64(r * MF_CAP) * 8
+                for base in range(i0, i1, 256):   # pass 2: the winners' positions, the j-bin keys -> the row's list
+                    i = base + t
+                    ok = i < i1
+                    x = hx.gload(rowp + i64(fx.min(i, i1 - 1)) * 4, I32)
+                    bn = _ma_bin(x, lo, inv)
+                    isw = ok & (bn > j)
+                    ism = ok & (bn == j)
+                    bw = _ballot(isw)
+                    bm = _ballot(ism)
+                    wbase = I32(0)
+                    mbase = I32(0)
+                    if (lane == 0) & (bw != 0):
+                        wbase = hx.latomic_add_i32_rtn(sm + O_MAL + 72, _popc(bw))
+                    if (lane == 0) & (bm != 0):
+                        mbase = hx.latomic_add_i32_rtn(sm + O_MAL + 76, _popc(bm))
+                    wbase = hx.lane_gather(wbase, I32(0))
+                    mbase = hx.lane_gather(mbase, I32(0))
+                    if isw:
+                        _emit_any(c, I32(MODE_SEL), I32(0), I32(1) > I32(0), r, I32(0), q, k, I32(0), c["lvl"], c["lvl"],
+                                  wb0 + wbase + _ma_mbcnt(bw), I32(0), i)
+                    if ism:
+                        hx.gstore(lst + i64(mb0 + mbase + _ma_mbcnt(bm)) * 8, fx.Vector.from_elements([x, i], I32))
+                hx.wait_storecnt0()
+                gpu.barrier()
+                if t == 0:
+                    hx.atomic_add(ctr + i64((r * 8 + 7) * 4), 1)
+                if g == 0:   # the group's CTA 0: the bin's keys, ranked
+                    if t == 0:
+                        hx.wait_count(ctr + i64((r * 8 + 7) * 4), G, 8, acq=False)   # (the list: agent-scope loads)
+                    gpu.barrier()
+                    ea = lst + i64(fx.min(t, nb - 1)) * 8
+                    ex = hx.gload(ea, I32, scope="agent")
+                    ec = hx.gload(ea + 4, I32, scope="agent")
+                    hx.lstore(sm + O_MFL + t * 4, order_key(ex))
+                    hx.lstore(sm + O_MFL + MF_CAP * 4 + t * 4, ec)
+                    gpu.barrier()
+                    if t < nb:
+                        kt = order_key(ex)
+                        beats = I32(0)
+                        for u in range(0, nb):
+                            ku = hx.lload(sm + O_MFL + u * 4, I32)
+                            cu = hx.lload(sm + O_MFL + MF_CAP * 4 + u * 4, I32)
+                            beats = beats + (ult(kt, ku) | ((ku == kt) & (cu < ec))).select(I32(1), I32(0))
+                        if beats < need:
+                            _emit_any(c, I32(MODE_SEL), I32(0), I32(1) > I32(0), r, I32(0), q, k, I32(0), c["lvl"],
+                                      c["lvl"], k - need + beats, I32(0), ec)
+                        if beats == need - 1:   # the 512-th: the row's next anchor
+                            hx.gstore(kp + i64(MF_KANC) + i64(r) * 4, ex.bitcast(F32))
         gpu.barrier()   # (select_mc rewrites O_MC when this returns 0)
     return done

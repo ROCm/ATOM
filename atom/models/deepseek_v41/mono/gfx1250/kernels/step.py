@@ -221,10 +221,10 @@ def atab(fp, name, off=None):
     return f
 
 
-def iprefetch(kb):
-    """Instruction prefetch of the next `kb` KB of code (s_prefetch_inst_pc_rel, 4 KB a request), issued before a
-    handoff so the stage after it starts warm (the layer loop is larger than the instruction cache)."""
-    for off in range(0, kb * 1024, 4096):
+def iprefetch(kb, kb0=0):
+    """Instruction prefetch of the next `kb` KB of code (from `kb0` KB on; s_prefetch_inst_pc_rel, 4 KB a request),
+    issued before a handoff so the stage after it starts warm (the layer loop is larger than the instruction cache)."""
+    for off in range(kb0 * 1024, kb * 1024, 4096):
         llvm.inline_asm(None, [], f"s_prefetch_inst_pc_rel {off}, null, 31", "", has_side_effects=True)
 
 
@@ -757,6 +757,9 @@ def target_layer(E, Ly):
                     bpf = isrx.select((b - fx.Int32(TK.MA_X0) + fx.Int32(TK.MA_CTAS)) % fx.Int32(TK.MA_CTAS), b)
                 if (bpf < isrx.select(fx.Int32(TR * TK.MC_G), fx.Int32(TR * TK.mc_g_long(TR)))) | cs_["iprod"]:
                     iprefetch(24)
+                    if fx.const_expr(TR <= 6):   # (c1 FULL: select_mf ahead of select_mc, the selection reaches past 24 KB)
+                        if (isrx | cs_["iprod"]) == (fx.Int32(0) != fx.Int32(0)):
+                            iprefetch(32, 24)
                 if segw == (fx.Int32(0) != fx.Int32(0)):
                     handoff(lc + i64(LY.SCORE), t, True)
                 # (the selection tree's levels past the first only when a row has more than one level-0 list: every row's
@@ -825,17 +828,22 @@ def target_layer(E, Ly):
                     # (FULL rows past MC_G_LONG_N keys: every CTA in a row group, topk.mc_g_long -- REINDEX keeps MC_G)
                     gsel = ((isrx == (fx.Int32(0) != fx.Int32(0))) & (nmax > fx.Int32(TK.MC_G_LONG_N))).select(
                         fx.Int32(TK.mc_g_long(TR)), gsel)
-                    if fx.const_expr(TR <= 6):   # c1 REINDEX: select_ma (the anchored first round); 0 -> select_mc
+                    if fx.const_expr(TR <= 6):   # c1: REINDEX select_ma, FULL select_mf (anchored); 0 -> select_mc
                         mdone = fx.Int32(0)
+                        mfk = mh + i64(MF_KB) + i64(Ly // 6) * TK.MF_KEEP   # (a FULL layer's slot: Ly // 6, see tables)
                         if isrx:
                             mdone = TK.select_ma(cwith(cs_, ts=None), mh + i64(Ly) * TK.MC_LAYER,
                                                  mh + i64(Ly) * TK.MC_LAYER + i64(TK.MC_HIST), gsel,
                                                  mh + i64(MA_OFF) + i64((Ly >> 2) & 3) * TK.MA_LAYER,
                                                  mh + i64(MA_KB) + i64((Ly >> 2) & 3) * TK.MA_KEEP)
+                        else:
+                            mdone = TK.select_mf(cwith(cs_, ts=None), mh + i64(Ly) * TK.MC_LAYER + i64(TK.MC_HIST), gsel,
+                                                 mh + i64(MF_OFF) + i64(Ly // 6) * TK.MF_LAYER, mfk)
                         if mdone == fx.Int32(0):
                             TK.select_mc(cwith(cs_, ts=None), mh + i64(Ly) * TK.MC_LAYER,
                                          mh + i64(Ly) * TK.MC_LAYER + i64(TK.MC_HIST), isrx, gsel,
-                                         anc=mh + i64(MA_KB + TK.MA_KANC) + i64((Ly >> 2) & 3) * TK.MA_KEEP,
+                                         anc=isrx.select(mh + i64(MA_KB + TK.MA_KANC) + i64((Ly >> 2) & 3) * TK.MA_KEEP,
+                                                         mfk + i64(TK.MF_KANC)),
                                          x0=isrx.select(fx.Int32(TK.MA_X0), fx.Int32(0)))
                     else:
                         TK.select_mc(cwith(cs_, ts=None), mh + i64(Ly) * TK.MC_LAYER,
