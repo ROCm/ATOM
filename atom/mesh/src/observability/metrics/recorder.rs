@@ -437,6 +437,16 @@ impl MeshMetrics {
         gauge!(names::MANUAL_POLICY_CACHE_ENTRIES).set(count as f64);
     }
 
+    /// Set the number of bindings a session table holds.
+    pub fn set_session_affinity_entries(scope: &'static str, entries: usize) {
+        gauge!(names::SESSION_AFFINITY_ENTRIES, "scope" => scope).set(entries as f64);
+    }
+
+    /// Record bindings dropped because a session table was full.
+    pub fn record_session_affinity_evictions(scope: &'static str, evicted: usize) {
+        counter!(names::SESSION_AFFINITY_EVICTED_TOTAL, "scope" => scope).increment(evicted as u64);
+    }
+
     /// Record prefix hash policy execution branch for routing decisions.
     #[deprecated(
         note = "Use record_route_branch: mesh_route_branch_total{policy=\"prefix_hash\"} counts the same branches by pool."
