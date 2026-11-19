@@ -43,8 +43,9 @@ from atom.kv_transfer.disaggregation.page_region import page_region
 from atom.kv_transfer.disaggregation.types import KVTransferTensors
 from atom.model_ops.qwen4_exp.qsa_cache_rules import QSA_SIDE_PLANES
 
-# Fixed and total: every movable plane a ``KVCacheTensor`` can carry on the
-# attention leg. A plane added to that dataclass and not added here would be
+# Every movable plane a ``KVCacheTensor`` field can carry on the attention leg.
+# The other source is ``extra_planes``, published after these and limited to
+# ``QSA_SIDE_PLANES``. A plane added to that dataclass and not added here would be
 # left behind by the save and restored as whatever the previous occupant of the
 # block wrote -- a wrong answer with nothing logged -- so the builder checks
 # this list against the dataclass's own fields rather than trusting it.
