@@ -867,15 +867,21 @@ class KimiFullAttention(nn.Module):
             a_scheme[0] in _RMS_FUSABLE_QUANT_TYPES and a_scheme == g_scheme
         )
         self.input_quant_prefix = f"{prefix}.fused_qkv_a_proj"
+        # Otherwise (attn_res emits bf16) quantize once for both consumers.
+        self.share_input_quant = (
+            a_scheme == g_scheme
+            and a_scheme[0] in (QuantType.per_1x128, QuantType.per_Token)
+            and a_scheme[1] == dtypes.fp8
+        )
         # Fuse sigmoid(g_proj) * attn_out + activation quant into one triton kernel
         # when o_proj runs FP8 in a scheme the fused kernel emits: per-token
-        # (ptpc_fp8) or per-1x128 block.
+        # (ptpc_fp8) or per-1x128 block (FP32 or E8M0 scales).
         o_type, o_dtype = effective_layer_quant(quant_config, f"{prefix}.o_proj")
-        self.fuse_sigmoid_mul_quant = (
-            o_dtype == dtypes.fp8
-            and o_type in (QuantType.per_Token, QuantType.per_1x128)
-            and not _is_e8m0_blockscale(quant_config, o_type)
+        self.fuse_sigmoid_mul_quant = o_dtype == dtypes.fp8 and o_type in (
+            QuantType.per_Token,
+            QuantType.per_1x128,
         )
+        self.o_proj_e8m0_scale = _is_e8m0_blockscale(quant_config, o_type)
         # .value, like qknorm_quant_type_value above: comparing the pybind11
         # QuantType inside forward() graph-breaks Dynamo.
         self.o_proj_quant_type_value = (
@@ -897,9 +903,20 @@ class KimiFullAttention(nn.Module):
         hidden_states_scale = None
         if isinstance(hidden_states, tuple):
             hidden_states, hidden_states_scale = hidden_states
+        # The indexer keeps the bf16 hidden_states.
+        proj_input = hidden_states
+        if (
+            hidden_states_scale is None
+            and self.share_input_quant
+            and self.fused_qkv_a_proj.native_a8_group_rows is None
+            and self.g_proj.native_a8_group_rows is None
+        ):
+            proj_input, hidden_states_scale = self.fused_qkv_a_proj.quantize_input(
+                hidden_states
+            )
 
         projected = torch.split(
-            self.fused_qkv_a_proj(hidden_states, hidden_states_scale),
+            self.fused_qkv_a_proj(proj_input, hidden_states_scale),
             self.projection_split_sizes,
             dim=-1,
         )
@@ -941,7 +958,7 @@ class KimiFullAttention(nn.Module):
                 projected_k_weights=(projected[3], projected[4]),
             )
         attn_out = self.attn(q, kv, k_rope, positions, q_scale=q_scale)
-        gate = self.g_proj(hidden_states, hidden_states_scale)
+        gate = self.g_proj(proj_input, hidden_states_scale)
         # BF16 output gating uses the shared fused sigmoid/mul. When o_proj
         # runs FP8, the same helper also folds in its activation quantization.
         attn_out, attn_scale = fused_sigmoid_mul_maybe_quant(
@@ -949,8 +966,14 @@ class KimiFullAttention(nn.Module):
             gate,
             quant=self.fuse_sigmoid_mul_quant,
             quant_type_value=self.o_proj_quant_type_value,
+            e8m0_scale=self.o_proj_e8m0_scale,
         )
         return attn_out, attn_scale
+
+    def input_scale_consumers(self) -> list[nn.Module]:
+        """The GEMMs that read input_layernorm's quantized output and scale:
+        every Linear that ``forward`` hands ``hidden_states_scale`` to."""
+        return [self.fused_qkv_a_proj, self.g_proj]
 
     def forward(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
@@ -1268,6 +1291,11 @@ class KimiKDAAttention(nn.Module):
             # K-first and decode reads it transposed.
             state_v_first=True,
         )
+
+    def input_scale_consumers(self) -> list[nn.Module]:
+        """The GEMMs that read input_layernorm's quantized output and scale:
+        every Linear that ``forward`` hands ``hidden_states_scale`` to."""
+        return [self.in_proj]
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # hidden_states is a (fp8, scale) tuple when input_layernorm fused the
@@ -1722,6 +1750,13 @@ class KimiDecoderLayer(nn.Module):
             out_norm=self.post_attention_layernorm,
             enabled=self.use_attn_residuals,
         )
+        from atom.model_ops.kimi_k3.x_scale_layout import share_x_scale_layout
+
+        share_x_scale_layout(
+            self.input_layernorm, self.self_attn.input_scale_consumers()
+        )
+        if self.fuse_ffn_norm_quant:
+            share_x_scale_layout(self.post_attention_layernorm, [self.mlp.gate_up_proj])
 
     def _ffn(
         self, hidden_states: torch.Tensor
