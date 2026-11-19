@@ -23,7 +23,7 @@ class V4WorkflowTest(unittest.TestCase):
     def matrix(self, event="push", **overrides):
         env = {
             "GITHUB_EVENT_NAME": event,
-            "SUITE": "nightly",
+            "SUITE": "smoke",
             "RUN_ALL_MODELS": "true",
             "MODEL_NAMES": "",
             "CASE_NAMES": "",
@@ -46,12 +46,12 @@ class V4WorkflowTest(unittest.TestCase):
         self.assertIn("has_matrix=true", output)
         return cells
 
-    def test_push_excludes_v4_weekly(self):
-        cells = self.matrix()
+    def test_nightly_excludes_v4_weekly(self):
+        cells = self.matrix(event="workflow_dispatch", SUITE="nightly")
         self.assertTrue(all(cell["model"] != MODEL for cell in cells))
 
     def test_push_smoke_is_v4_1p1d_over_mooncake(self):
-        cells = self.matrix(SUITE="smoke")
+        cells = self.matrix()
         self.assertEqual([cell["name"] for cell in cells], ["ds-v4-1p1d-tp8-smoke"])
         self.assertEqual(cells[0]["topology"], "1p1d")
         self.assertEqual(
