@@ -1,7 +1,9 @@
-"""Python-owned ATOM standalone serving logic.
+"""Python-owned ATOM standalone serving logic, no longer launched.
 
-This adapter keeps OpenAI-compatible request semantics in Python so the Rust
-standalone router only needs to bridge requests and responses.
+This adapter kept OpenAI-compatible request semantics in Python for the Rust
+standalone router, which has been removed: the Rust frontend now serves
+standalone itself as the client of the EngineCores, and `server.py` does not
+build this service. It stays until that switch-over lands.
 """
 
 from __future__ import annotations
