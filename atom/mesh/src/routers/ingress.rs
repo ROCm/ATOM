@@ -503,7 +503,7 @@ impl PendingRender {
             Ok(tokens) => Ok(Some((self.metadata, Some(tokens)))),
             // The worker that serves the chat answers it for itself: the
             // render worker, usually another one, may refuse it for its own
-            // capacity.
+            // configuration, such as its `max_model_len`.
             Err(_) if self.fallback != RenderFallback::None => Ok(None),
             Err(RenderMiss::Refused(answer)) => Err(answer),
             Err(miss @ (RenderMiss::Failed | RenderMiss::TimedOut)) => {

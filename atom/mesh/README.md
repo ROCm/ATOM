@@ -295,10 +295,12 @@ V4 ([#3377](https://github.com/ROCm/ATOM/issues/3377)). Under `prefix_hash`,
 nothing else places such a chat: a worker's render of it may take all the time
 the request has left to be prepared, a 4xx other than 404, 405, 408 or 429 goes
 to the client as the worker sent it, which takes the model's workers to share
-their `max_model_len` and KV cache size as well, and a render that fails
-otherwise or runs out of time gets the chat `503 worker_render_unavailable`,
-which a retry may get past. `cache_aware` with `--kv-events` places such a chat
-by its text when its render gives no tokens within 2 s. Use a policy that does
+their `max_model_len` as well, and a render that fails otherwise or runs out of
+time gets the chat `503 worker_render_unavailable`, which a retry may get past.
+ATOM's render does not refuse a prompt larger than the KV cache, which each
+worker sizes for itself: the worker that serves the chat refuses it.
+`cache_aware` with `--kv-events` places such a chat by its text when its render
+gives no tokens within 2 s. Use a policy that does
 not need tokens, such as `cache_aware` or `round_robin`, for these models and
 APIs.
 
