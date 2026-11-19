@@ -29,7 +29,9 @@ use crate::{
         },
     },
     routers::{
+        comm::error,
         prepare::response_context::ResponseContext,
+        render::atom_usage::{self, AtomUsage},
         token_handle::{
             token_chunk::{FinishReason, TokenChunk, Usage as ChunkUsage},
             token_handle::TokenHandle,
@@ -126,6 +128,7 @@ impl CompletionRender {
     pub async fn aggregate(self, mut handle: TokenHandle, ctx: ResponseContext) -> Response {
         let mut decoder = ctx.stop_decoder;
         let mut choices = Vec::new();
+        let mut metas = Vec::new();
         let (mut prompt_tokens, mut completion_tokens) = (0, 0);
         while let Some(item) = handle.next().await {
             match item {
@@ -133,6 +136,7 @@ impl CompletionRender {
                     token_ids,
                     finish_reason,
                     usage,
+                    meta,
                     ..
                 }) => {
                     decoder.reset();
@@ -147,15 +151,17 @@ impl CompletionRender {
                         finish_reason: Some(openai_finish_reason(&finish_reason).into()),
                         matched_stop: None,
                     });
-                    prompt_tokens += usage.prompt_tokens;
+                    // Every sibling reports the one prompt: counted once.
+                    prompt_tokens = prompt_tokens.max(usage.prompt_tokens);
                     completion_tokens += usage.completion_tokens;
+                    metas.push(meta);
                 }
                 Ok(TokenChunk::Partial { .. }) => {}
                 Err(e) => return e.into_response(),
             }
         }
         handle.mark_completed();
-        Json(CompletionResponse {
+        let response = CompletionResponse {
             id: self.id,
             object: "text_completion".into(),
             created: self.created,
@@ -168,8 +174,14 @@ impl CompletionRender {
                 completion_tokens_details: None,
             }),
             system_fingerprint: None,
-        })
-        .into_response()
+        };
+        match AtomUsage::of(&metas) {
+            None => Json(response).into_response(),
+            Some(atom) => match atom.extend_response(&response, atom_usage::COMPLETION) {
+                Ok(value) => Json(value).into_response(),
+                Err(e) => error::internal_error("serialize_failed", e.to_string()),
+            },
+        }
     }
 
     /// Send the last delta and why it ended; false once the client is gone.

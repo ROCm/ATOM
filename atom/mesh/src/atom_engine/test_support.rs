@@ -147,6 +147,7 @@ pub(crate) fn model_spec(served_name: &str, tokenizer_path: &str) -> ModelSpec {
         model_card: Default::default(),
         required_channel: None,
         reasoning_toggle: None,
+        template_efforts: vec!["low".into(), "high".into(), "max".into()],
     }
 }
 
