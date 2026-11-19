@@ -11,9 +11,16 @@ from dataclasses import dataclass
 import pytest
 import torch
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="requires gfx1250 GPU"
-)
+
+def _tdm_gpu():
+    if not torch.cuda.is_available():
+        return False
+    from aiter.ops.triton.utils._triton import arch_info
+
+    return arch_info.is_tdm_avail()
+
+
+pytestmark = pytest.mark.skipif(not _tdm_gpu(), reason="requires a TDM GPU")
 
 
 @dataclass(frozen=True)
@@ -28,14 +35,9 @@ class Case:
     neox: bool = True
     amplitude: float = 1.0
     padded_heads: int = 0
-    fnuz: bool = False
 
 
 def exercise_case(case, *, replay=False):
-    from atom.model_ops.mla_fused import gfx_arch, kup_qpe_unavailable_reason
-
-    assert gfx_arch() in ("gfx1250", "gfx1250-strict"), "requires gfx1250"
-    assert kup_qpe_unavailable_reason() is None
     from aiter.ops.triton.fusions.fused_kv_cache import fused_qk_rope_cat_and_cache_mla
     from aiter.ops.triton.gemm.batched.batched_gemm_bf16 import batched_gemm_bf16
 
@@ -44,7 +46,7 @@ def exercise_case(case, *, replay=False):
     c = case
     torch.manual_seed(3498)
     device = "cuda"
-    dtype = torch.float8_e4m3fnuz if c.fnuz else torch.float8_e4m3fn
+    dtype = torch.float8_e4m3fn
     # Real q projection views and fused KV projection views are strided.
     q = (
         torch.randn(c.m, c.h, c.p + c.r, device=device, dtype=torch.bfloat16)
@@ -189,7 +191,6 @@ def test_graph_replay_bytes(m):
         Case(m=65, amplitude=100),
         Case(m=1512, amplitude=100),
         Case(m=65, padded_heads=2),
-        Case(m=65, fnuz=True),
         Case(m=128, bs=16),
         Case(m=128, bs=128),
         Case(m=65, h=1),

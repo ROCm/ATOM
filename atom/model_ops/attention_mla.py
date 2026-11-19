@@ -42,6 +42,7 @@ from aiter.ops.triton.fusions.fused_kv_cache import (
 )
 from aiter.ops.triton.gather_kv_b_proj import gather_kv_b_proj
 from aiter.ops.triton.kv_cache import cat_and_cache_mla as triton_cat_and_cache_mla
+from aiter.ops.triton.utils._triton import arch_info
 from torch import nn
 
 from atom.config import (
@@ -75,11 +76,7 @@ from atom.model_ops.dcp_ops import dcp_all_gather_prefill_query_heads
 from atom.model_ops.indexer.schedule import skips_index_topk
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import use_triton_gemm
-from atom.model_ops.mla_fused import (
-    gfx_arch,
-    kup_qpe_fusion_ok,
-    kup_qpe_unavailable_reason,
-)
+from atom.model_ops.mla_fused import kup_qpe_fusion_ok
 from atom.model_ops.triton_fused_mla_ctx_kv import fused_mla_ctx_norm_rope_cache
 from atom.model_ops.triton_fused_qkv_quant import (
     fused_kv_per_tensor_quant,
@@ -809,15 +806,15 @@ class MLAAttention(nn.Module):
         # freqs) indexes the cache differently.
         rope = self.rotary_emb
         # Resolve the opt-in once. The default path pays only a boolean branch
-        # in forward: no env lookup, arch query, cache view or shape gate.
-        self._kup_qpe_enabled = envs.ATOM_MLA_FUSED_KUP_QPE
-        self._kup_qpe_arch = gfx_arch() if self._kup_qpe_enabled else ""
-        self._kup_qpe_unavailable = (
-            kup_qpe_unavailable_reason()
-            if self._kup_qpe_enabled
-            and self._kup_qpe_arch in ("gfx1250", "gfx1250-strict")
-            else None
-        )
+        # in forward: no env lookup, arch query, cache view or shape gate. The
+        # kernel loads and stores through TDM.
+        self._kup_qpe_enabled = envs.ATOM_MLA_FUSED_KUP_QPE and arch_info.is_tdm_avail()
+        if envs.ATOM_MLA_FUSED_KUP_QPE and not self._kup_qpe_enabled:
+            logger.info(
+                "MLA K-up/q_pe fusion: two-kernel fallback "
+                "(ATOM_MLA_FUSED_KUP_QPE=1): no TDM on %s",
+                arch_info.get_arch(),
+            )
         self._ctx_kv_fusion_enabled = (
             envs.ATOM_DSPARK_FUSED_CTX_KV
             and not self.use_seg_mla
@@ -3294,9 +3291,8 @@ class MLAAttention(nn.Module):
                     if q_out_prestored is not None
                     else None
                 )
-                fused_kup_qpe = self._kup_qpe_unavailable is None and kup_qpe_fusion_ok(
+                fused_kup_qpe = kup_qpe_fusion_ok(
                     enabled=True,
-                    arch=self._kup_qpe_arch,
                     is_prefill=context.is_prefill,
                     use_qrep=use_qrep,
                     dcp_world_size=self.dcp_world_size,
@@ -3315,19 +3311,22 @@ class MLAAttention(nn.Module):
                 # RoPE caches move to the GPU), once each per process.
                 if fused_kup_qpe not in MLAAttention._kup_qpe_logged:
                     MLAAttention._kup_qpe_logged.add(fused_kup_qpe)
+                    if fused_kup_qpe:
+                        reason = "eligible"
+                    elif q_out_prestored is None:
+                        # The prestored q_out gate declined: BF16 absorb with
+                        # ATOM_MLA_ABSORB_BF16_FUSE_QOUT, shuffled KV, decode
+                        # and aiter's q_nope_prestored_supported() are needed.
+                        reason = "no prestored q_out (ATOM_MLA_ABSORB_BF16_FUSE_QOUT)"
+                    else:
+                        reason = "unsupported decode/shape/dtype/cache"
                     logger.info(
                         "MLA K-up/q_pe fusion: %s (ATOM_MLA_FUSED_KUP_QPE=1, "
-                        "arch=%s, M=%d, W_K=%s): %s",
+                        "M=%d, W_K=%s): %s",
                         "FUSED" if fused_kup_qpe else "two-kernel fallback",
-                        self._kup_qpe_arch,
                         q.shape[0],
                         tuple(self.W_K.shape),
-                        self._kup_qpe_unavailable
-                        or (
-                            "eligible"
-                            if fused_kup_qpe
-                            else "unsupported decode/shape/dtype/cache"
-                        ),
+                        reason,
                     )
             if fused_kup_qpe:
                 # Writes all of q_out and the KV cache; the rope/cache call below

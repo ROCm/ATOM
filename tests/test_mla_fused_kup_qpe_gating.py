@@ -34,7 +34,6 @@ def test_flag_uses_standard_bool_parser(monkeypatch, value):
 def _kup_args(**over):
     args = {
         "enabled": True,
-        "arch": "gfx1250",
         "is_prefill": False,
         "use_qrep": False,
         "dcp_world_size": 1,
@@ -58,15 +57,12 @@ def _kup_args(**over):
 def test_kup_qpe_eligible():
     assert kup_qpe_fusion_ok(**_kup_args())
     assert kup_qpe_fusion_ok(**_kup_args(k_scale=None))
-    assert kup_qpe_fusion_ok(**_kup_args(arch="gfx1250-strict"))
 
 
 @pytest.mark.parametrize(
     "over",
     [
         {"enabled": False},
-        {"arch": "gfx950"},
-        {"arch": ""},
         {"is_prefill": True},
         {"use_qrep": True},
         {"dcp_world_size": 2},
@@ -217,36 +213,6 @@ def test_q_out_int32_limit_falls_back():
         (M, H, L + R), (2**31 // M + 1, L + R, 1), dtype=FP8, device="meta"
     )
     assert not kup_qpe_fusion_ok(**args)
-
-
-def test_private_helper_preflight(monkeypatch):
-    from atom.model_ops import mla_fused
-
-    mla_fused.kup_qpe_unavailable_reason.cache_clear()
-    with monkeypatch.context() as patch:
-        patch.setattr(mla_fused.importlib.util, "find_spec", lambda name: object())
-        patch.setattr(
-            mla_fused.importlib,
-            "import_module",
-            lambda name: SimpleNamespace(jit=object()),
-        )
-        assert "_rope_pe" in mla_fused.kup_qpe_unavailable_reason()
-    mla_fused.kup_qpe_unavailable_reason.cache_clear()
-
-
-def test_private_helper_preflight_does_not_hide_runtime_error(monkeypatch):
-    from atom.model_ops import mla_fused
-
-    def broken(name):
-        raise RuntimeError("broken installed runtime")
-
-    mla_fused.kup_qpe_unavailable_reason.cache_clear()
-    with monkeypatch.context() as patch:
-        patch.setattr(mla_fused.importlib.util, "find_spec", lambda name: object())
-        patch.setattr(mla_fused.importlib, "import_module", broken)
-        with pytest.raises(RuntimeError, match="broken installed runtime"):
-            mla_fused.kup_qpe_unavailable_reason()
-    mla_fused.kup_qpe_unavailable_reason.cache_clear()
 
 
 @pytest.mark.parametrize("m", [64, 65, 128, 512])

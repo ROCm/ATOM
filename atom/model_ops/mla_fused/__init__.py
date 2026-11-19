@@ -5,60 +5,12 @@
   (fused_kup_qpe.kup_qpe_fused).
 
 The gate below only uses attributes and shapes, so it imports without the GPU
-stack; the kernel is imported lazily by the caller. GPU byte comparisons are
-required when changing the kernel or its supported shapes.
+stack; the kernel is imported lazily by the caller and needs a TDM arch
+(aiter `arch_info.is_tdm_avail()`, checked once by the caller). GPU byte
+comparisons are required when changing the kernel or its supported shapes.
 """
 
-import functools
-import importlib
-import importlib.util
-
 import torch
-
-_GFX1250 = ("gfx1250", "gfx1250-strict")
-
-
-@functools.cache
-def gfx_arch() -> str:
-    from aiter.jit.utils.chip_info import get_gfx_runtime
-
-    return get_gfx_runtime()
-
-
-@functools.cache
-def kup_qpe_unavailable_reason() -> str | None:
-    """Check optional Gluon modules/symbols once, before importing our kernel.
-
-    Called only after the normal aiter arch query succeeds on gfx1250. Missing
-    optional helpers decline fusion; errors inside installed modules propagate.
-    This avoids both a decode-time private-symbol ImportError and swallowing a
-    broken runtime probe for the lifetime of the process.
-    """
-    modules = {
-        "triton.experimental.gluon": ("jit",),
-        "aiter.ops.triton._gluon_kernels.gfx1250.fusions.fused_kv_cache": (
-            "_rope_pe",
-            "_rope_pe_2d",
-            "_freq_from_shared_1d",
-            "_freq_from_shared_2d",
-            "_store_mla_kv_cache",
-        ),
-        "aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16": (
-            "create_shared_layouts",
-            "create_wmma_layouts",
-        ),
-    }
-    for name, symbols in modules.items():
-        # Walk the package chain so find_spec never imports a missing parent.
-        parts = name.split(".")
-        for i in range(1, len(parts) + 1):
-            if importlib.util.find_spec(".".join(parts[:i])) is None:
-                return f"missing {name}"
-        module = importlib.import_module(name)
-        for symbol in symbols:
-            if not hasattr(module, symbol):
-                return f"missing {name}.{symbol}"
-    return None
 
 
 def _is_fp8(t: torch.Tensor) -> bool:
@@ -68,7 +20,6 @@ def _is_fp8(t: torch.Tensor) -> bool:
 def kup_qpe_fusion_ok(
     *,
     enabled: bool,
-    arch: str,
     is_prefill: bool,
     use_qrep: bool,
     dcp_world_size: int,
@@ -84,8 +35,9 @@ def kup_qpe_fusion_ok(
     k_scale,
 ) -> bool:
     """q_out is the prestored q_out of the BF16-absorb + shuffled-KV path (None
-    when that path is off); kv_cache is the shuffled (blocks, 1, bs, d) view."""
-    if not enabled or arch not in _GFX1250:
+    when that path is off); kv_cache is the shuffled (blocks, 1, bs, d) view.
+    `enabled` is the flag on a TDM arch, resolved once at layer init."""
+    if not enabled:
         return False
     # Pure decode only: no prefill (so no PCP), no DCP / query replication.
     if is_prefill or use_qrep or dcp_world_size > 1:
