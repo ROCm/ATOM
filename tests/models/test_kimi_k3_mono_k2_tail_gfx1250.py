@@ -130,6 +130,7 @@ def test_split_lds_holds_the_lines_and_gains_inside_the_token_slabs(rows):
 
 
 def test_split_and_bounded_builds_are_named_apart(monkeypatch):
+    monkeypatch.setenv("ATOM_KIMI_MONO_TAIL_EARLY_GATHER", "0")
     plain = tail.build_k2_tail(4, 20, 1e-5, identity_routes=True, split=False)
     split = tail.build_k2_tail(4, 20, 1e-5, identity_routes=True, split=True)
     bounded = tail.build_k2_tail(4, 20, 1e-5, split=True, poll_bound=1 << 22)
@@ -165,3 +166,29 @@ def test_split_switch_defaults_off(monkeypatch):
     assert envs.ATOM_KIMI_MONO_TAIL_SPLIT is False
     monkeypatch.setenv("ATOM_KIMI_MONO_TAIL_SPLIT", "1")
     assert envs.ATOM_KIMI_MONO_TAIL_SPLIT is True
+
+
+def test_early_gather_builds_apart_and_only_a_share_a_cta(monkeypatch):
+    monkeypatch.delenv("ATOM_KIMI_MONO_TAIL_EARLY_GATHER", raising=False)
+    early = tail.build_k2_tail(4, 20, 1e-5, identity_routes=True)
+    plain = tail.build_k2_tail(4, 20, 1e-5, identity_routes=True, early_gather=False)
+    assert "_eg" not in plain.name and early.name == plain.name + "_eg"
+    assert early.grid == plain.grid and early.abi is plain.abi
+    monkeypatch.setenv("ATOM_KIMI_MONO_TAIL_EARLY_GATHER", "0")
+    assert tail.build_k2_tail(4, 20, 1e-5, identity_routes=True).name == plain.name
+    monkeypatch.delenv("ATOM_KIMI_MONO_TAIL_EARLY_GATHER")
+    # split waves gather on their own path; past one round the shares' lines
+    # are gathered together as before
+    split = tail.build_k2_tail(4, 20, 1e-5, identity_routes=True, split=True)
+    assert "_eg" not in split.name
+    wide = tail.tail_line_rows() + 1
+    assert "_eg" not in tail.build_k2_tail(4, wide, 1e-5, identity_routes=True).name
+
+
+def test_early_gather_switch_defaults_on(monkeypatch):
+    from atom.utils import envs
+
+    monkeypatch.delenv("ATOM_KIMI_MONO_TAIL_EARLY_GATHER", raising=False)
+    assert envs.ATOM_KIMI_MONO_TAIL_EARLY_GATHER is True
+    monkeypatch.setenv("ATOM_KIMI_MONO_TAIL_EARLY_GATHER", "0")
+    assert envs.ATOM_KIMI_MONO_TAIL_EARLY_GATHER is False
