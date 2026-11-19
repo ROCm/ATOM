@@ -131,6 +131,31 @@ def get_pp_indices(
     return (start_layer, end_layer)
 
 
+def agree_pp_layer_partition(num_hidden_layers: int) -> None:
+    """Refuse to build when this process's PP group splits the layers
+    differently on some stage. Every stage computes the split itself, from its
+    own copy of the config and environment; stages that disagree build
+    overlapping or missing layers, and the P/D transfer and offload keys
+    address the wrong ones. Collective over the PP group: every stage raises
+    together, none is left waiting."""
+    import torch.distributed as dist
+    from aiter.dist.parallel_state import get_pp_group
+
+    pp = get_pp_group()
+    if pp.world_size <= 1:
+        return
+    mine = pp_layer_partition(num_hidden_layers, pp.world_size)
+    stages: list = [None] * pp.world_size
+    dist.all_gather_object(stages, mine, group=pp.cpu_group)
+    if any(stage != mine for stage in stages):
+        raise RuntimeError(
+            f"PP stages split the {num_hidden_layers} layers differently: "
+            + ", ".join(f"stage {i} {s}" for i, s in enumerate(stages))
+            + ". Give every node the same VLLM_PP_LAYER_PARTITION / "
+            "ATOM_PP_LAYER_PARTITION settings and GPUs"
+        )
+
+
 def make_layers(
     num_hidden_layers: int,
     layer_fn: LayerFn,

@@ -14,6 +14,7 @@ import pickle
 import struct
 import subprocess
 import sys
+import types
 from types import SimpleNamespace
 from unittest import mock
 
@@ -683,6 +684,46 @@ def test_a_spawned_process_splits_as_the_resolving_one():
     install_pp_layer_partition(K3_LAYERS, BALANCED)
     expected = [get_pp_indices(K3_LAYERS, r, 8) for r in range(8)]
     assert out.strip().splitlines()[-1] == str(expected)
+
+
+def fake_pp_group(monkeypatch, world_size):
+    group = SimpleNamespace(world_size=world_size, cpu_group=object())
+    ps = types.ModuleType("aiter.dist.parallel_state")
+    ps.get_pp_group = lambda: group
+    for name, module in (
+        ("aiter", types.ModuleType("aiter")),
+        ("aiter.dist", types.ModuleType("aiter.dist")),
+        ("aiter.dist.parallel_state", ps),
+    ):
+        monkeypatch.setitem(sys.modules, name, module)
+    return group
+
+
+def test_stages_that_agree_build(monkeypatch):
+    fake_pp_group(monkeypatch, 8)
+    install_pp_layer_partition(K3_LAYERS, BALANCED)
+
+    def gather(out, mine, group):
+        out[:] = [list(mine)] * len(out)
+
+    with mock.patch("torch.distributed.all_gather_object", side_effect=gather):
+        model_utils.agree_pp_layer_partition(K3_LAYERS)
+
+
+def test_stages_that_disagree_refuse_together(monkeypatch):
+    fake_pp_group(monkeypatch, 8)
+    install_pp_layer_partition(K3_LAYERS, BALANCED)
+
+    def gather(out, mine, group):
+        # stage 5 runs on a node that resolved the even split
+        out[:] = [list(mine)] * len(out)
+        out[5] = list(EVEN_8)
+
+    with (
+        mock.patch("torch.distributed.all_gather_object", side_effect=gather),
+        pytest.raises(RuntimeError, match="split the 93 layers differently"),
+    ):
+        model_utils.agree_pp_layer_partition(K3_LAYERS)
 
 
 def test_compile_cache_key_follows_the_resolved_split():
