@@ -474,6 +474,10 @@ A finding that stops at "likely / probably the root cause" without an evidence c
 
 Do NOT use rule codes (B1, D4, A1…) in output — they are internal labels only.
 
+**When the action is "run something", ask for ONE run.** Name the smallest run that would
+change the verdict and the result that settles it; offer "or name the existing run that covers this".
+A same-node A/B is one run, a third arm or extra metrics a matrix. Cost, not hedging: a real BLOCK still blocks.
+
 Examples of good findings:
 - `🔴 deepseek_v2.py:1245 changes torch.zeros → torch.empty, but the old comment explicitly says "trailing pad must be zero for asm reader" and the new comment claims "never read" — if padding IS read, every quantized token in the batch gets corrupted output silently. **Author must** cite the asm spec or a test proving padding is not read.`
 - `⚠️ PR claims 1.3–1.5x speedup but the benchmark starts after shuffle_weight() completes — users pay that cost on every cold start. **Author must** re-run with shuffle_weight included in the timing window and confirm the speedup holds.`
@@ -493,7 +497,7 @@ When a human reviewer (valarLip or others) catches something real that this skil
 1. Add to Step 5 with the real PR number as evidence
 2. Commit: `review-pr: add R[NAME] from ATOM#[NNN] — [one line]`
 
-**Nothing new goes in this file.** SKILL.md is budgeted at 500 lines and holds
+**Nothing new goes in this file.** SKILL.md is budgeted at 505 lines and holds
 only the prose every review needs, with no code fence over 30 lines.
 Conditional content goes in `rules.md` and reaches the reviewer through
 `triage.py expand`; executable content goes in a script and gets called.

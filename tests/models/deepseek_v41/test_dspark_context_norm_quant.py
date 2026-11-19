@@ -68,6 +68,9 @@ def _main_proj(x, x_scale):
     return values.sum(-2).to(torch.bfloat16)
 
 
+_main_proj.runs_bf16 = False  # an FP8 `main_proj`
+
+
 def _draft(seed):
     gen = torch.Generator(device=DEV).manual_seed(seed)
     norm = RMSNorm(HIDDEN, EPS).to(device=DEV, dtype=torch.bfloat16)
