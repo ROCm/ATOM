@@ -3329,24 +3329,23 @@ class Config:
                 own_pool=draft_owns_kv_pool(self),
                 requested=spec.kv_cache_dtype,
             )
-            # MiniMax-M3's lmcache_offload PAGE layout appends an own-pool draft's
-            # pages after the target's as bytes of their own, and the PAGE
-            # namespace hashes the whole speculative_config, draft KV dtype
-            # included, so a draft of another dtype never shares a key with the
-            # target's. Other offload layouts and P/D connectors are not verified.
-            draft_dtype_offload_ok = (
-                draft_owns_kv_pool(self)
-                and is_m3
-                and isinstance(self.kv_transfer_config, dict)
-                and self.kv_transfer_config.get("kv_connector") == "lmcache_offload"
+            from atom.models.minimax_m3.config import (
+                NVFP4_PAGE_CONNECTORS,
+                nvfp4_pages_move,
             )
+
+            # An NVFP4 MiniMax-M3 target's own-pool draft moves with its pages:
+            # they follow the target's as bytes of their own, and the PAGE
+            # namespace hashes the draft KV dtype, so they never share a key.
             if (
                 spec.draft_kv_dtype != self.kv_cache_dtype
                 and self.kv_transfer_config
-                and not draft_dtype_offload_ok
+                and not (is_m3 and draft_owns_kv_pool(self) and nvfp4_pages_move(self))
             ):
-                # These move pages under the target's KV dtype alone. The flag has
-                # no fp4 / nvfp4 to match an FP4 target with.
+                # Not verified: no other KV connector or offload path (save,
+                # restore, P/D transfer) has run with a draft whose dtype differs
+                # from the target's. The flag has no fp4 / nvfp4 to match an FP4
+                # target with.
                 hint = (
                     ""
                     if self.kv_cache_dtype in FP4_CACHE_DTYPES
@@ -3356,7 +3355,9 @@ class Config:
                 raise ValueError(
                     f"draft KV dtype {spec.draft_kv_dtype} differs from the "
                     f"target's {self.kv_cache_dtype}: not supported with KV "
-                    f"offload or --kv-transfer-config{hint}"
+                    "offload or --kv-transfer-config, except a MiniMax-M3 own-pool "
+                    "draft beside an NVFP4 KV under "
+                    f"{', '.join(sorted(NVFP4_PAGE_CONNECTORS))}{hint}"
                 )
         if is_m3:
             from atom.models.minimax_m3.config import validate_runtime_config
