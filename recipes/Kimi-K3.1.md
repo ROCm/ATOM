@@ -113,9 +113,15 @@ With DSpark (pinned acceptance length 4.59) and ReplaySSM, concurrency 1 / 4 /
 Only that configuration has been validated: TP8 with DCP8,
 `--kv_cache_dtype bf16`, `--index-cache-dtype fp8`, CUDA graphs on, with mono
 on or off, and with the DSpark drafter and ReplaySSM above.
+P/D over Mooncake with a PP prefill is validated too: a PP8 x TP1 prefill
+into a TP8 x DCP8 decode, two nodes, with DSpark4. Every transferred MLA row,
+DSA index page and KDA state matched the prefill's bytes on each decode rank,
+and prompts of 3.6K to 72K tokens retrieved the code hidden in them. The TP1
+prefill stages need ROCm/aiter#8297, since K3.1's MXFP4 MoE weights pass
+4 GiB at TP1.
 PCP is rejected while the model is built (the indexer's projections live in
 the fused q_a projection, and the PCP indexer projects k itself). Nothing
 else is rejected at startup, but online quantization of the other layers,
-PP, expert parallelism, DP attention, other speculative methods, plugins,
-TBO and KV transfer are untested. The vision wrapper is registered, but image
+other PP or KV-transfer topologies, expert parallelism, DP attention, other
+speculative methods, plugins and TBO are untested. The vision wrapper is registered, but image
 inference has not been validated.

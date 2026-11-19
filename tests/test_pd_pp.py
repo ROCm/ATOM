@@ -1111,8 +1111,8 @@ def _make_transfer_connector(prefill_data, captured):
     conn.done_sending = set()
     conn._wait_for_prefill_data = lambda _transfer_id: dict(prefill_data)
     conn._execute_block_slot_transfer = (
-        lambda request, target, src, dst, data, req_id, *, engine=None, **_: (
-            captured.append((request, target, src, dst, data, req_id, engine))
+        lambda request, target, src, dst, data, req_id, *, engine=None, **kw: (
+            captured.append((request, target, src, dst, data, req_id, engine, kw))
         )
         or True
     )
@@ -1155,6 +1155,22 @@ def test_tp_transfer_uses_final_source_slot_after_checkpoint_move():
     # The slot path takes the engine `_execute_transfer` picked, so #2276's
     # matched-rail routing reaches it too.
     assert captured[0][6] is conn.transfer_engine
+
+
+def test_slot_transfer_gets_the_prefill_kv_ready_event():
+    """The staged index gather waits on this event; `_execute_transfer` must
+    hand the slot path the one recorded for the prefill."""
+    captured = []
+    conn = _make_transfer_connector(
+        {"block_ids": [3], "slot_index": 7, "swa_block_ids": [7]}, captured
+    )
+    ready = object()
+    conn._kv_cache_ready_events["prefill-1"] = ready
+
+    conn._execute_transfer(_stateful_write_request())
+
+    assert len(captured) == 1
+    assert captured[0][7]["kv_cache_ready_event"] is ready
 
 
 @pytest.mark.parametrize("invalid_slot", [-1, None, "invalid"])
