@@ -659,10 +659,11 @@ class CoreManager:
 
             try:
                 # No visible-device mask is published here. Device placement is
-                # owned by ModelRunner._setup_device_and_distributed, which
-                # selects an ABSOLUTE cuda:{local_dp_rank*tp_size+rank}. Masking
-                # the child as well would renumber its devices and compound the
-                # two offsets -- see set_device_control_env_var's docstring.
+                # owned by ModelRunner._setup_device_and_distributed (by default
+                # init_model_env in model_setup.py; the rollout runner overrides
+                # it), which selects an ABSOLUTE cuda:{local_dp_rank*tp_size+rank}.
+                # Masking the child as well would renumber its devices and compound
+                # the two offsets -- see set_device_control_env_var's docstring.
                 for info, local_dp_rank in zip(processes_info, local_dp_ranks):
                     dp_rank = info["dp_rank"]
                     logger.info(

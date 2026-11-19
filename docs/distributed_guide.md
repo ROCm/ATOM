@@ -37,7 +37,7 @@ ATOM provides parallel linear layer classes in `atom/model_ops/linear.py`:
 
 ### Process Group Initialization
 
-In `ModelRunner.__init__()`, the distributed environment is set up via AITER:
+In `init_model_env()` (`atom/model_engine/model_setup.py`, called from `ModelRunner.__init__()`), the distributed environment is set up via AITER:
 
 ```python
 from aiter import init_dist_env
@@ -141,14 +141,14 @@ When a DP rank has no real work but other ranks do, it executes dummy batches to
 
 ### Device assignment
 
-When DP is enabled on a single node, each DP rank uses a different set of GPUs. The device mapping in `ModelRunner.__init__()` is:
+When DP is enabled on a single node, each DP rank uses a different set of GPUs. `init_model_env()` (`atom/model_engine/model_setup.py`) takes the device from `local_device_index()` (`atom/config.py`):
 
 ```python
-local_device_rank = dp_rank_local * config.tensor_parallel_size + rank
+local_device_rank = local_device_index(config, rank)
 device = torch.device(f"cuda:{local_device_rank}")
 ```
 
-For example, with DP=2 and TP=4:
+With DP and TP only, that is `dp_rank_local * tensor_parallel_size + rank`. For example, with DP=2 and TP=4:
 - DP rank 0: GPUs 0, 1, 2, 3
 - DP rank 1: GPUs 4, 5, 6, 7
 
@@ -567,7 +567,8 @@ This means each GPU runs an independent attention computation (no TP AllReduce f
 | `atom/utils/envs.py` | `ATOM_DP_*` environment variables (lazy evaluation) |
 | `atom/model_engine/engine_core.py` | `EngineCore`, `DPEngineCoreProc` (DP busy loop, sync, dummy batches) |
 | `atom/model_engine/engine_core_mgr.py` | `CoreManager` (multi-process DP orchestration, ZMQ IPC) |
-| `atom/model_engine/model_runner.py` | `ModelRunner` (`init_dist_env`, device assignment, `DPMetadata` usage) |
+| `atom/model_engine/model_setup.py` | `init_model_env` (`init_dist_env`, device assignment) |
+| `atom/model_engine/model_runner.py` | `ModelRunner` (`DPMetadata` usage) |
 | `atom/model_engine/arg_utils.py` | `EngineArgs` CLI argument definitions |
 | `atom/utils/distributed/utils.py` | `stateless_init_torch_distributed_process_group()` (Gloo PG creation) |
 | `atom/utils/forward_context.py` | `DPMetadata`, `ForwardContext` (per-step DP token metadata) |
