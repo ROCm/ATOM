@@ -48,13 +48,15 @@ class RoutedExpertsPatch(NamedTuple):
     ``[starts[j], starts[j] + offsets[j+1] - offsets[j])``. Segments apply in
     order, so a prefix-hit segment precedes the same request's step segment.
     ``rows`` is the device gather until the token copy moves it to the host;
-    the scheduler receives it as a numpy array.
+    the scheduler receives it as a numpy array. ``epochs[j]`` is the request's
+    ``Sequence.routed_epoch`` when the step was scheduled; None means all 0.
     """
 
     req_ids: np.ndarray
     starts: np.ndarray
     offsets: np.ndarray
     rows: np.ndarray | torch.Tensor
+    epochs: np.ndarray | None = None
 
 
 def merge_routed_patches(patches: list[RoutedExpertsPatch]) -> RoutedExpertsPatch:
@@ -65,11 +67,20 @@ def merge_routed_patches(patches: list[RoutedExpertsPatch]) -> RoutedExpertsPatc
     offsets = [patches[0].offsets]
     for p in patches[1:]:
         offsets.append(p.offsets[1:] + offsets[-1][-1])
+    epochs = None
+    if any(p.epochs is not None for p in patches):
+        epochs = np.concatenate(
+            [
+                np.zeros(len(p.req_ids), np.int64) if p.epochs is None else p.epochs
+                for p in patches
+            ]
+        )
     return RoutedExpertsPatch(
         np.concatenate([p.req_ids for p in patches]),
         np.concatenate([p.starts for p in patches]),
         np.concatenate(offsets),
         np.concatenate([np.asarray(p.rows) for p in patches]),
+        epochs,
     )
 
 
@@ -85,7 +96,7 @@ def is_fused_moe_module(module: Any) -> bool:
     # An undecorated FusedMoE's base is nn.Module, which every module matches.
     types: tuple[type, ...] = (FusedMoE,) + tuple(
         b
-        for b in getattr(FusedMoE, "__bases__", ())
+        for b in FusedMoE.__bases__
         if isinstance(b, type) and b is not torch.nn.Module
     )
     return isinstance(module, types)
@@ -140,7 +151,7 @@ def current_slot_mapping() -> torch.Tensor:
     pick, and a forward without slots would silently drop its routes; both
     raise instead.
     """
-    md = getattr(get_forward_context(), "attn_metadata", None)
+    md = get_forward_context().attn_metadata
     slots = None if isinstance(md, dict) else getattr(md, "slot_mapping", None)
     if isinstance(slots, torch.Tensor):
         return slots
@@ -217,13 +228,15 @@ class RoutedExpertsCapturer:
         lens: AbcSequence[int],
         *,
         prefix: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = None,
+        epochs: AbcSequence[int] | None = None,
     ) -> RoutedExpertsPatch | None:
         """This step's rows in batch token order, still on the device.
 
         Request ``i`` forwarded ``lens[i]`` tokens from position ``starts[i]``.
         ``prefix`` is ``(req_ids, starts, lens, slots)`` for cached prefixes no
-        earlier step returned; their rows go first. Returns None when the step
-        forwarded nothing.
+        earlier step returned; their rows go first. ``epochs[i]`` tags request
+        ``i``'s segments (None: all 0). Returns None when the step forwarded
+        nothing.
 
         The gather runs on the current stream: ``slot_mapping`` is the reused
         staging buffer, and the next forward rewrites it in order after this
@@ -236,6 +249,8 @@ class RoutedExpertsCapturer:
             return None
         req_ids = np.asarray(req_ids, dtype=np.int64)
         starts = np.asarray(starts, dtype=np.int64)
+        if epochs is not None:
+            epochs = np.asarray(epochs, dtype=np.int64)
         if int(slots.shape[0]) < total:
             raise RuntimeError(
                 f"routed-expert capture: the step forwarded {total} tokens but "
@@ -250,13 +265,17 @@ class RoutedExpertsCapturer:
                 p_at = p_at.pin_memory()
             p_at = p_at.to(rows_at.device, rows_at.dtype, non_blocking=True)
             rows_at = torch.cat([p_at, rows_at])
+            if epochs is not None:
+                by_req = dict(zip(req_ids.tolist(), epochs.tolist()))
+                p_epochs = [by_req[r] for r in np.asarray(p_req).tolist()]
+                epochs = np.concatenate([np.asarray(p_epochs, np.int64), epochs])
             req_ids = np.concatenate([p_req, req_ids])
             starts = np.concatenate([p_starts, starts])
             lens = np.concatenate([p_lens, lens])
         rows = self.buffer[rows_at].to(dtype=torch.int16)
         offsets = np.zeros(len(lens) + 1, dtype=np.int64)
         np.cumsum(lens, out=offsets[1:])
-        return RoutedExpertsPatch(req_ids, starts, offsets, rows)
+        return RoutedExpertsPatch(req_ids, starts, offsets, rows, epochs)
 
 
 def maybe_capture_routed_experts(layer: Any, topk_ids: torch.Tensor) -> None:
@@ -271,7 +290,7 @@ def maybe_capture_routed_experts(layer: Any, topk_ids: torch.Tensor) -> None:
     view = getattr(layer, ROUTES_VIEW_ATTR, None)
     if view is None or topk_ids is None:
         return
-    name = getattr(layer, "prefix", type(layer).__name__)
+    name = layer.prefix
     slots = current_slot_mapping()
     n = int(topk_ids.shape[0])
     if int(slots.shape[0]) != n:

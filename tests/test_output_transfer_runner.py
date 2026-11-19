@@ -102,7 +102,7 @@ def test_postprocess_submits_prefill_or_final_broadcast_counts(
         forward_done_event=mock.Mock(),
         _served=None,
         structured_output=None,
-        _gather_routed_experts_step=lambda _batch: None,
+        _return_routed_experts=False,
     )
     with pytest.raises(StatusSubmitted):
         runner_module.ModelRunner.postprocess(
@@ -357,6 +357,7 @@ def test_output_capacity_follows_server_limit_and_warmup_floor(max_num_seqs):
         ),
         attn_family=SimpleNamespace(has_recurrent_state=False),
         device="cuda",
+        _return_routed_experts=False,
     )
     with (
         mock.patch.object(runner_module, "CpuGpuBuffer"),
@@ -402,6 +403,15 @@ def cpu_processor(monkeypatch):
     processor.num_spec_tokens = 2
     processor.clean()
     return processor
+
+
+@pytest.fixture
+def r3_processor(cpu_processor):
+    """`cpu_processor` built with routed-expert replay on, as `__init__` sets
+    the flag before its `clean()`."""
+    cpu_processor.return_routed_experts = True
+    cpu_processor.clean()
+    return cpu_processor
 
 
 def _record_alive_at(event, refs):
@@ -511,10 +521,25 @@ def _gpu_patch(req_id, start, values):
     )
 
 
-def test_routes_ride_the_token_copy_and_its_wait(cpu_processor):
+def test_send_does_no_route_work_with_replay_off(cpu_processor):
+    """With R3 off the entry keeps main's (ids, logprobs) sources and no route
+    list exists, so each step's send costs what it did before R3."""
+    processor = cpu_processor
+    processor.send_to_cpu_async(
+        _FakeGpuTensor(torch.tensor([3], dtype=torch.int32)),
+        processor.token_ids_cpu,
+        mock.Mock(),
+    )
+    _, _, sources = processor.token_ids_cpu[0]
+    assert isinstance(sources, tuple) and len(sources) == 2
+    assert not hasattr(processor, "routed_experts_cpu")
+    assert not hasattr(processor, "_held_routed_experts")
+
+
+def test_routes_ride_the_token_copy_and_its_wait(r3_processor):
     """A step's routes are a third payload of its token entry: one copy_done
     covers them, and the entry holds their GPU source until it is waited on."""
-    processor = cpu_processor
+    processor = r3_processor
     ids = _FakeGpuTensor(torch.tensor([3], dtype=torch.int32))
     routes = _gpu_patch(7, 0, [5, 6])
     refs = [weakref.ref(routes.rows)]
@@ -538,12 +563,12 @@ def test_routes_ride_the_token_copy_and_its_wait(cpu_processor):
     assert processor.recv_routed_experts() is None
 
 
-def test_middle_chunk_routes_ride_the_next_copy_not_the_pending_one(cpu_processor):
+def test_middle_chunk_routes_ride_the_next_copy_not_the_pending_one(r3_processor):
     """An output-less middle chunk queues no copy and touches no pending entry
     (whose copy_done would then wait on the chunk's whole forward). Its rows
     ride the next send, ahead of that step's own, under that send's one
     copy_done."""
-    processor = cpu_processor
+    processor = r3_processor
     pending_done = mock.Mock()
     processor.send_to_cpu_async(
         _FakeGpuTensor(torch.tensor([3], dtype=torch.int32)),
@@ -583,10 +608,10 @@ def test_middle_chunk_routes_ride_the_next_copy_not_the_pending_one(cpu_processo
     assert got.rows[:, 0, 0].tolist() == [2, 2, 3, 9]
 
 
-def test_middle_chunk_before_any_output_waits_for_the_first_copy(cpu_processor):
+def test_middle_chunk_before_any_output_waits_for_the_first_copy(r3_processor):
     """Before the first output no entry is pending, and none is made up: the
     rows wait on the device for the first send."""
-    processor = cpu_processor
+    processor = r3_processor
     processor.add_held_routed_experts(_gpu_patch(9, 0, [4]))
     assert processor.token_ids_cpu == []
     assert processor.recv_async_output(processor.token_ids_cpu).numel() == 0
@@ -600,9 +625,9 @@ def test_middle_chunk_before_any_output_waits_for_the_first_copy(cpu_processor):
     assert processor.recv_routed_experts().rows[:, 0, 0].tolist() == [4]
 
 
-def test_clean_drops_held_routes(cpu_processor):
+def test_clean_drops_held_routes(r3_processor):
     """Sleep's `clean()` drops the routes with the batch they belong to."""
-    processor = cpu_processor
+    processor = r3_processor
     processor.add_held_routed_experts(_gpu_patch(9, 0, [4]))
     processor.clean()
     processor.send_to_cpu_async(

@@ -510,7 +510,7 @@ def _select_logical(
     routed-expert replay. Every `select_experts` routes here except
     `Mxfp4MoEMethod`'s HERD step, which replay turns off, and Qwen4-Exp's
     single-token experts, which capture their own ids."""
-    topk_weights, topk_ids = FusedMoE.select_experts(
+    topk = FusedMoE.select_experts(
         hidden_states=x,
         router_logits=router_logits,
         use_grouped_topk=layer.use_grouped_topk,
@@ -527,8 +527,8 @@ def _select_logical(
         routed_scaling_factor=layer.routed_scaling_factor,
     )
     if routed_experts_capturer.CAPTURE_ROUTED_EXPERTS:
-        maybe_capture_routed_experts(layer, topk_ids)
-    return topk_weights, topk_ids
+        maybe_capture_routed_experts(layer, topk[1])
+    return topk
 
 
 class FusedMoEMethodBase(QuantizeMethodBase):

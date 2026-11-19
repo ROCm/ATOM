@@ -2235,6 +2235,12 @@ def check_return_routed_experts(config: "Config") -> None:
             "prefill/decode disaggregation; decode skips KV allocation and "
             "never initializes the process-local capture buffer"
         )
+    if config.fake_eplb:
+        raise ValueError(
+            "enable_return_routed_experts does not support --fake-eplb: it "
+            "replaces the router logits with balanced ones, so the captured "
+            "routes would not be the model's"
+        )
 
 
 @dataclass
@@ -2332,12 +2338,8 @@ class Config:
     index_cache_layout: str | None = None
     enable_prefix_caching: bool = True
     # Return per-request MoE routes from generate() as int16
-    # [seq_len - 1, num_layers, top_k]. Scatter is CUDA-graph-safe (device
-    # write inside fused MoE). Refused here: DCP/PCP/PP != 1, plugin mode, KV
-    # transfer / offload, RapidServe P/D. Refused after weight load: a model
-    # without FusedMoE, an attention backend without per-token slots
-    # (DeepSeek-V4 / V4.1). Mono decode turns off for models whose kernels
-    # route in-kernel. Prefix cache stays on.
+    # [seq_len - 1, num_layers, top_k]. Configurations that could return
+    # incomplete routes are refused (`check_return_routed_experts`).
     enable_return_routed_experts: bool = False
     enable_chunked_prefill: bool = True
     enable_log_stats: bool = True

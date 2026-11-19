@@ -85,7 +85,7 @@ def routed_experts_refusal(atom_config) -> tuple[bool, str]:
     in-kernel: they never write the routed-expert capture, so it would
     return ``-1`` rows for those layers."""
     return (
-        not getattr(atom_config, "enable_return_routed_experts", False),
+        not atom_config.enable_return_routed_experts,
         "routed-expert capture",
     )
 

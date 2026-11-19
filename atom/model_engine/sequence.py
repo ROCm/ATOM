@@ -265,14 +265,14 @@ class Sequence:
 
     # Routed-expert replay state. Class defaults, assigned on an instance only
     # by the R3 paths, so with R3 off none of it is in a pickled sequence.
-    # MoE routes gathered from KV slots: int16 [seq_len-1, layers, top_k].
-    # One growable buffer (capacity doubles) so deferred overlapping
-    # patches are a slice write, not an O(steps) chunk-list walk.
+    # MoE routes: int16 [seq_len-1, layers, top_k], in a buffer whose capacity
+    # doubles as it grows; a patch is written at its absolute position.
     # `_routed_expert_rows` is the live length; the tail is unused.
     _routed_expert_buf: np.ndarray | None = None
     _routed_expert_rows: int = 0
-    # Positions some scheduled forward already returns routes for; a
-    # prefix-cache hit past it must have its rows read from the cache.
+    # Positions some scheduled forward already returns routes for since the
+    # last preemption; a prefix-cache hit past it has its rows read from the
+    # cache.
     routed_forwarded_end: int = 0
     # First position whose routes a scheduled forward still owes (its patch
     # not yet received), or None. A request finishing early can be that
@@ -282,6 +282,9 @@ class Sequence:
     # device, waiting for the next step's copy (`add_held_routed_experts`),
     # or None. They stay owed one output past that step.
     routed_held_from: int | None = None
+    # Preemptions so far. A patch segment scheduled under an older epoch is
+    # from a forward the resumed request no longer owes, and is dropped.
+    routed_epoch: int = 0
 
     def __init__(
         self,
@@ -644,10 +647,15 @@ class Sequence:
         """int16 [rows, layers, top_k], or None if no patch ever arrived.
 
         A view of the live rows, read-only once ``finish_routed_experts`` has
-        run. A finished request has ``num_tokens - 1`` rows, except one that
-        finished (aborted, a structured-output or logprob error) while a
-        scheduled forward still owed it routes: it holds the rows up to
-        ``routed_owed_from``, as that forward's patch never reaches it.
+        run. A finished request has ``num_tokens - 1`` rows, except:
+
+        - one that finished from ``running`` (aborted, a structured-output or
+          logprob error) while a scheduled forward still owed it routes: it
+          holds the rows up to ``routed_owed_from``, as that forward's patch
+          never reaches it;
+        - one finished from ``waiting`` (``_finish_rejected_waiting``): it
+          keeps the rows it had, unchecked -- short if it was preempted before
+          they arrived, ``None`` if it was never scheduled.
         """
         buf = self._routed_expert_buf
         # Zero rows is still [0, layers, top_k]; only a request no patch ever

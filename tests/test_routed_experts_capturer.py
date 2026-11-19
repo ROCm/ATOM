@@ -58,7 +58,10 @@ def _forward(slots):
 
 def _capture(capturer, layer_id, ids, slots, top_k=None):
     """What a FusedMoE bound to ``layer_id`` does in a forward over ``slots``."""
-    layer = SimpleNamespace(top_k=capturer.top_k if top_k is None else top_k)
+    layer = SimpleNamespace(
+        prefix=f"model.layers.{layer_id}.mlp.experts",
+        top_k=capturer.top_k if top_k is None else top_k,
+    )
     capturer.bind(layer, layer_id)
     with _forward(slots):
         maybe_capture_routed_experts(layer, ids)
@@ -80,6 +83,7 @@ def _r3_config(**overrides):
         "sequence_parallel_size": 1,
         "kv_transfer_config": {},
         "enable_rapidserve": False,
+        "fake_eplb": False,
         "plugin_config": None,
     }
     return SimpleNamespace(**{**base, **overrides})
@@ -94,6 +98,7 @@ def _r3_config(**overrides):
         ({"sequence_parallel_size": 2}, "sequence_parallel_size"),
         ({"kv_transfer_config": {"kv_connector": "moriio"}}, "KV transfer"),
         ({"enable_rapidserve": True}, "never initializes"),
+        ({"fake_eplb": True}, "fake-eplb"),
         ({"plugin_config": SimpleNamespace(is_plugin_mode=True)}, "plugin mode"),
     ],
 )
@@ -143,6 +148,7 @@ def test_only_tp_rank0_binds_the_capture_buffer(rank, monkeypatch):
     monkeypatch.setattr(mr, "fused_moe_modules", lambda model: moes)
     runner = mr.ModelRunner.__new__(mr.ModelRunner)
     runner.model = object()
+    runner._return_routed_experts = True
     runner._routed_experts_geo = (3, 2)
     runner._routed_experts_capturer = None
     runner.rank = rank
@@ -171,6 +177,7 @@ def test_kv_cross_check_expects_only_the_rows_a_rank_allocates(rank, monkeypatch
     monkeypatch.setattr(mr, "fused_moe_modules", lambda model: moes)
     runner = mr.ModelRunner.__new__(mr.ModelRunner)
     runner.model = object()
+    runner._return_routed_experts = True
     runner._routed_experts_geo = (3, 2)
     runner._routed_experts_capturer = None
     runner.rank = rank
@@ -310,6 +317,25 @@ def test_prefix_hit_segment_reads_cached_slots():
     np.testing.assert_array_equal(new[:, 0, :], [[5, 6]])
 
 
+def test_gather_step_tags_every_segment_with_its_requests_epoch():
+    """A cached-prefix segment carries the epoch of the request it belongs to,
+    not of the batch position it lands at; untagged steps carry None."""
+    device = _device()
+    capturer = RoutedExpertsCapturer(num_slots=32, num_layers=1, top_k=2, device=device)
+    slots = torch.tensor([4, 5], device=device)
+    _capture(capturer, 0, torch.zeros((2, 2), dtype=torch.int32, device=device), slots)
+    prefix = (np.array([2]), np.array([0]), np.array([2]), np.array([0, 1]))
+
+    tagged = _store_take(
+        capturer, slots, [1, 2], [7, 2], [1, 1], prefix=prefix, epochs=[0, 3]
+    )
+    np.testing.assert_array_equal(tagged.req_ids, [2, 1, 2])
+    np.testing.assert_array_equal(tagged.epochs, [3, 0, 3])
+
+    untagged = _store_take(capturer, slots, [1, 2], [7, 2], [1, 1], prefix=prefix)
+    assert untagged.epochs is None
+
+
 @pytest.mark.parametrize("capture", [True, False])
 def test_select_logical_captures_its_routing(monkeypatch, capture):
     """`_select_logical` captures the ids it returns: FusedMoE and the
@@ -364,7 +390,7 @@ def test_maybe_capture_skips_an_unbound_layer():
 def test_moe_hook_writes_its_layer_at_this_forwards_slots():
     device = _device()
     capturer = RoutedExpertsCapturer(num_slots=8, num_layers=2, top_k=2, device=device)
-    layer = SimpleNamespace(top_k=2)
+    layer = SimpleNamespace(prefix="model.layers.1.mlp.experts", top_k=2)
     capturer.bind(layer, 1)
     with _forward(torch.tensor([3], device=device)):
         maybe_capture_routed_experts(
@@ -855,6 +881,14 @@ def test_merge_routed_patches_keeps_segment_order_and_offsets():
     alone = merge_routed_patches([a])
     assert isinstance(alone.rows, np.ndarray)
     np.testing.assert_array_equal(alone.rows, a.rows.numpy())
+    assert merged.epochs is None
+
+
+def test_merge_routed_patches_keeps_epochs_and_zero_fills_untagged_steps():
+    held = _host_patch(1, 0, 2, 5)
+    resumed = _host_patch(1, 0, 3, 6)._replace(epochs=np.array([1]))
+    merged = merge_routed_patches([held, resumed])
+    np.testing.assert_array_equal(merged.epochs, [0, 1])
 
 
 def test_incremental_decode_payload_smaller_than_full_history():
@@ -902,6 +936,7 @@ def test_qwen4_exp_single_token_moe_captures_its_routes(
     monkeypatch.setattr(q4, "moe_decode_single_token", kernel)
     n = 5
     experts = SimpleNamespace(
+        prefix="model.layers.1.mlp.experts",
         w13_weight=torch.zeros((n, 2)),
         w13_weight_scale=torch.zeros((n, 2)),
         w2_weight=torch.zeros((n, 2)),

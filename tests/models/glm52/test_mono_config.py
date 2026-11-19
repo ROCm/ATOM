@@ -166,6 +166,13 @@ def test_served_deployment_accepts_every_admitted_query_length(
     assert config_refusal(atom_config) is None
 
 
+def test_routed_expert_capture_is_refused():
+    # The layer kernel routes in-kernel and never writes the capture.
+    atom_config = _served_tp4_fp8_mtp4_config()
+    atom_config.enable_return_routed_experts = True
+    assert config_refusal(atom_config) == "routed-expert capture"
+
+
 @pytest.mark.parametrize("num_speculative_tokens", [1, 2])
 def test_mtp1_and_mtp2_are_still_refused(num_speculative_tokens):
     # MTP1 (query length 2) and MTP2 (query length 3) are absent from

@@ -343,9 +343,9 @@ class MemoryManagerMixin:
         ):
             if hasattr(self, attr) and getattr(self, attr) is not None:
                 delattr(self, attr)
-        # The MoE layers' views were cleared with the pool's above. Left live,
-        # the capture buffer makes wake's get_num_blocks() treat it as
-        # overhead and allocate_kv_cache create a second one.
+        # The MoE layers' views were cleared with the pool's above; dropping
+        # the runner's reference frees the capture buffer while asleep. Wake's
+        # allocate_kv_cache binds a fresh one.
         self._routed_experts_capturer = None
         torch.cuda.empty_cache()
         logger.info(f"{self.label}: KV cache released (GPU memory freed)")
