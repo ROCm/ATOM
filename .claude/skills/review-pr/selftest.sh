@@ -657,6 +657,44 @@ Validation (deterministic): N/A -- no runtime surface changed
      "A5 FIRE -- foo.py:3 guard missing
 B1 FIRE -- KVCACHE size not updated" \
      "diff --git a/foo.py b/foo.py")" ""
+# A verdict writes the path it found; SKILL.md's own good examples write the basename.
+# Matching the verdict's exact string meant the form the skill teaches could not claim
+# the FIRE it was reporting.
+t "the basename form SKILL.md teaches can claim a path FIRE" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ x.py:1 drops the scale. **Author must** keep it.' \
+     "A5 FIRE -- atom/models/x.py:1 drops the scale" \
+     "diff --git a/atom/models/x.py b/atom/models/x.py")" ""
+# ...on a segment boundary. A bare endswith would let `scale.py` answer for
+# `atom/models/kv_scale.py`, which is a different file whose name merely ends the same way.
+t "a file whose name merely ends the same way does not" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ scale.py:1 drops it. **Author must** keep it.' \
+     "A5 FIRE -- atom/models/kv_scale.py:1 drops the scale" \
+     "diff --git a/scale.py b/scale.py" | grep -c UNREPORTED-FIRE)" "1"
+t "a same-named file elsewhere does not" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ other/x.py:1 drops the scale. **Author must** keep it.' \
+     "A5 FIRE -- atom/models/x.py:1 drops the scale" \
+     "diff --git a/other/x.py b/other/x.py" | grep -c UNREPORTED-FIRE)" "1"
 # ...but GEMM, BF16, CUDA and TODO have that shape too and name nothing. An unrelated
 # card line saying `BF16 GEMM` must not claim `B1 FIRE -- GEMM output cast ...`.
 t "a generic ALL-CAPS word is not an identifier" \
@@ -708,6 +746,16 @@ Review: OK
 Validation (deterministic): N/A -- no runtime surface changed
 
 ⚠️ [verified] A5: planner.rs:108 charges only on req.stream. **Author must** say so.' \
+     "$_V_PATH" "$_DIFF" | grep -c RULE-CODE-IN-CARD)" "1"
+t "so is one behind an en dash" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ A5 – planner.rs:108 charges only on req.stream. **Author must** say so.' \
      "$_V_PATH" "$_DIFF" | grep -c RULE-CODE-IN-CARD)" "1"
 t "so is one behind a double dash" \
   "$(_card_kinds '## T

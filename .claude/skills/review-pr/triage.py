@@ -2844,6 +2844,19 @@ def _is_claim_identifier(word):
         and not VALUE.fullmatch(word)
 
 
+def _same_file(a, b):
+    """Do these two citations name the same file?
+
+    A verdict reason writes the path it found (`atom/models/x.py:1`); SKILL.md's own good
+    examples write the basename (`x.py:1`). Matching the verdict's exact string meant the
+    form the skill teaches could not claim the FIRE it was reporting, and the card was
+    left with a fatal UNREPORTED-FIRE. Compared on segment boundaries, so `other/x.py`
+    still does not answer for `atom/models/x.py`.
+    """
+    a, b = a.lstrip("./"), b.lstrip("./")
+    return a == b or a.endswith("/" + b) or b.endswith("/" + a)
+
+
 def _claim_tokens(text):
     """-> {lower-cased word: the spelling it was found with}.
 
@@ -3180,8 +3193,9 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
         # written card reported every fired rule as UNREPORTED-FIRE. A finding that names
         # a file the verdict cited is the same claim without the label.
         folded = _fold_punct(text)
+        cited_here = [c.lstrip("./") for c in re.findall(CITATION_BARE, text)]
         for rule, paths in fire_paths.items():
-            if paths and any(pp in text for pp in paths):
+            if paths and any(_same_file(pp, cp) for pp in paths for cp in cited_here):
                 claims.setdefault(rule, []).append(text[:40])
             elif not paths and fire_tokens.get(rule):
                 # A verdict reason may name only a symbol or a condition (SKILL.md's
