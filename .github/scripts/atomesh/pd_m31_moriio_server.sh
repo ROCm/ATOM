@@ -117,7 +117,9 @@ for name in ("vllm", "torch", "mori", "mooncake-transfer-engine-rocm"):
         versions[name]=importlib.metadata.version(name)
     except importlib.metadata.PackageNotFoundError:
         versions[name]=None
-pathlib.Path(sys.argv[1]).write_text(json.dumps({"source_overlay":False,"vllm_file":vllm.__file__,"distributions":versions,"mooncake_connector_file":str(path),"mooncake_connector_sha256":hashlib.sha256(path.read_bytes()).hexdigest()},indent=2))
+mori=pathlib.Path(vllm.__file__).parent / "distributed/kv_transfer/kv_connector/v1/moriio"
+mori_hashes={file.name:hashlib.sha256(file.read_bytes()).hexdigest() for file in mori.glob("moriio_*.py")}
+pathlib.Path(sys.argv[1]).write_text(json.dumps({"source_overlay":False,"vllm_file":vllm.__file__,"distributions":versions,"mooncake_connector_file":str(path),"mooncake_connector_sha256":hashlib.sha256(path.read_bytes()).hexdigest(),"mori_source_sha256":mori_hashes},indent=2))
 PY
 else
   m31_overlay || exit $?
