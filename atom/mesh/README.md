@@ -168,8 +168,14 @@ served differently:
   parallelism, RapidServe, and the `share_cache` / `prefix_spread` DP
   placements.
 - Per request: `response_format` json_object / json_schema, `top_logprobs`,
-  streamed logprobs, chat logprobs, streaming with `n > 1`, multimodal input,
-  `/v1/messages` and `/v1/responses` (501).
+  streamed logprobs, chat logprobs, `/generate`'s input logprobs and
+  `token_ids_logprob`, streaming with `n > 1`, `kv_transfer_params`,
+  `prompt_token_ids`, `return_token_ids`, multimodal input, `/v1/messages`
+  and `/v1/responses` (501).
+
+`/v1/completions` ignores, as the Python server's does, the fields its request
+does not declare: `echo`, `suffix`, `best_of`, `logit_bias` and
+`stream_options`.
 - Not exposed yet: ATOM's `/metrics`, `/server_info` tp/dp, `/kv_transfer_info`,
   profiling and debug routes.
 
