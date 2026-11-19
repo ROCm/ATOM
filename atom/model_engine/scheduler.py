@@ -3570,10 +3570,20 @@ class Scheduler:
 
     def _query_connector_prefill_match(self, seq: Sequence, *, skip: bool) -> bool:
         """Ask the connector whether this prefill should park for remote KV."""
-        if skip or self.kv_connector is None:
+        if self.kv_connector is None:
+            return False
+        # Re-decided every pass, skipped ones included: a seq whose receive
+        # finished must not carry its yes into a later recompute.
+        seq.state_from_peer = False
+        if skip:
             return False
         ext_tokens, needs_remote_load = self.kv_connector.get_num_new_matched_tokens(
             seq
+        )
+        # Before `can_allocate`: the load's owner says whether this receive
+        # skips the local prefix and brings the state whole.
+        seq.state_from_peer = bool(
+            needs_remote_load and self.kv_connector.receives_suffix_and_state(seq)
         )
         # Keep the lookup's answer, not just the park flag: `can_allocate` runs
         # next and a hybrid's two legs have to be aimed at one boundary, for
@@ -4048,9 +4058,9 @@ class Scheduler:
         # under DCP, and is what EngineStats uses, so the user-visible number
         # and the internal hit rate cannot disagree.
         #
-        # Guard: PD decode consumer inherits hit from prefill node;
-        # don't clobber with the local hit (always 0 on consumer).
-        if not seq.prefix_cache_hit_tokens:
+        # Guard: PD decode consumer inherits hit from prefill node; don't
+        # clobber it with the consumer's local hit, which only skips a transfer.
+        if "prefix_cache_hit_tokens" not in (seq.kv_transfer_params or {}):
             # The gated HBM hit, not the chunk floor `allocate` may have
             # lowered `num_cached_tokens` to. `[floor, hbm)` is refilled
             # from CPU but was already resident; recording the floor makes
