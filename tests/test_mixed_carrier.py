@@ -305,6 +305,7 @@ def test_runner_builds_the_banks_before_warmup(monkeypatch, mixed):
     from unittest.mock import Mock
 
     from atom.model_engine import model_runner as mr
+    from atom.model_engine import model_setup
     from atom.model_ops.attentions.deepseek_v4_attn import (
         DeepseekV4AttentionMetadataBuilder as Builder,
     )
@@ -351,8 +352,8 @@ def test_runner_builds_the_banks_before_warmup(monkeypatch, mixed):
     monkeypatch.setattr(mr, "init_exit_handler", lambda _: None)
     monkeypatch.setattr(mr, "tokenIDProcessor", lambda *a: None)
     monkeypatch.setattr(mr, "sampler_from_config", lambda _: None)
-    monkeypatch.setattr(mr, "support_model_arch_dict", {"test": "test"})
-    monkeypatch.setattr(mr, "resolve_obj_by_qualname", lambda _: object)
+    monkeypatch.setattr(model_setup, "support_model_arch_dict", {"test": "test"})
+    monkeypatch.setattr(model_setup, "resolve_obj_by_qualname", lambda _: object)
     monkeypatch.setattr(mr, "sp_is_enabled", lambda: False)
     monkeypatch.setattr(mr, "mono_decode_installers", {})
     monkeypatch.setattr(mr.PPAuxRelay, "build", lambda *a: None)
@@ -369,8 +370,8 @@ def test_runner_builds_the_banks_before_warmup(monkeypatch, mixed):
         def _setup_device_and_distributed(self, *args):
             self.device = torch.device("cpu")
 
-        def _build_and_load_model(self, _):
-            self.model = torch.nn.Identity()
+        def _build_and_load_model(self, config, model_class, device):
+            return torch.nn.Identity()
 
         def allocate_forward_vars(self):
             self.forward_vars = {"mtp_k": 0}
