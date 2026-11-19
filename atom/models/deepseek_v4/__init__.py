@@ -2855,21 +2855,25 @@ class Expert(nn.Module):
         it sees the real row count): w2's quantized input, `(act [m, inter]
         e4m3, act_scale [m, inter / 32] E8M0)`, i.e. `quantize_fp8` of
         `silu_and_mul(gate_up(x), L)`. Row counts AITER's kernel table covers
-        run the gate_up GEMM with the SwiGLU and the quant in its epilogue;
-        the others run gate_up, silu_and_mul and quantize_fp8, the values w2
-        would compute from the bf16 activation itself."""
-        from aiter.ops.flydsl.batched_gemm_a8w8_gfx1250 import (
-            gate_up_silu_kernel_for,
-            run_gate_up_silu_mxfp8_32_gfx1250,
-        )
+        (`gate_up_silu_kernel_for`) run AITER's functional op
+        `gate_up_silu_mxfp8_32`, the gate_up GEMM with the SwiGLU and the
+        quant in its epilogue; the others (and m = 0) run gate_up,
+        silu_and_mul and quantize_fp8, the values w2 would compute from the
+        bf16 activation itself.
+
+        The fused epilogue matches that chain up to one e4m3 step (AITER's
+        exp / rcp can land a value on the other side of a rounding midpoint),
+        so the same token's w2 input can differ by one step between a forward
+        whose row count takes the fused kernel and one that does not."""
+        from aiter.ops.batched_gemm_op_a8w8 import gate_up_silu_mxfp8_32
+        from aiter.ops.flydsl.batched_gemm_a8w8_gfx1250 import gate_up_silu_kernel_for
 
         from atom.model_ops.blockscale import quantize_fp8
 
         weight = self.gate_up_proj.weight
         m = x.shape[0]
         n2, k = weight.shape
-        name = gate_up_silu_kernel_for(m, n2, k)
-        if name is None:
+        if gate_up_silu_kernel_for(m, n2, k) is None:
             combined = self.gate_up_proj(x)
             out = torch.empty(
                 (m, combined.shape[-1] // 2), dtype=x.dtype, device=x.device
@@ -2877,21 +2881,10 @@ class Expert(nn.Module):
             aiter_silu_and_mul(out, combined, self.swiglu_limit)
             return quantize_fp8(out)
         x_fp8, x_scale = quantize_fp8(x)
-        act = torch.empty((m, n2 // 2), dtype=torch.float8_e4m3fn, device=x.device)
-        act_scale = torch.empty(
-            (m, n2 // 64), dtype=torch.float8_e8m0fnu, device=x.device
+        # The op picks the same tile from m that gate_up_silu_kernel_for named.
+        return gate_up_silu_mxfp8_32(
+            x_fp8, weight, x_scale, self.gate_up_proj.weight_scale, self.swiglu_limit
         )
-        run_gate_up_silu_mxfp8_32_gfx1250(
-            x_fp8,
-            weight,
-            x_scale,
-            self.gate_up_proj.weight_scale,
-            act,
-            act_scale,
-            self.swiglu_limit,
-            kernel_name=name,
-        )
-        return act, act_scale
 
     def forward(
         self,

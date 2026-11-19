@@ -94,10 +94,11 @@ def _expert(
 
 @pytest.fixture
 def flydsl(monkeypatch, atom_modules):
-    """AITER's gate_up module as the expert sees it: tiles up to 4096 rows,
-    the launch records its arguments and fills the outputs."""
+    """AITER as the expert sees it: tiles up to 4096 rows; the functional op
+    records its arguments and returns filled outputs."""
     calls = {"supported": True, "runs": [], "shapes": []}
     module = ModuleType("aiter.ops.flydsl.batched_gemm_a8w8_gfx1250")
+    op_module = ModuleType("aiter.ops.batched_gemm_op_a8w8")
 
     def supported(n2, k):
         calls["supported_shape"] = (n2, k)
@@ -107,16 +108,20 @@ def flydsl(monkeypatch, atom_modules):
         calls["shapes"].append((m, n2, k))
         return None if m > 4096 else f"tile{min(m, 4096)}"
 
-    def run(xq, wq, xs, ws, out, out_scale, limit, kernel_name=None):
-        calls["runs"].append((xq, wq, xs, ws, out, out_scale, limit, kernel_name))
-        out.view(torch.uint8).fill_(1)
-        out_scale.view(torch.uint8).fill_(2)
-        return out
+    def gate_up_silu_mxfp8_32(xq, wq, xs, ws, limit):
+        m, inter = xq.shape[0], wq.shape[0] // 2
+        act = torch.full((m, inter), 1, dtype=torch.uint8).view(torch.float8_e4m3fn)
+        act_scale = torch.full((m, inter // 32), 2, dtype=torch.uint8).view(
+            torch.float8_e8m0fnu
+        )
+        calls["runs"].append((xq, wq, xs, ws, limit, act, act_scale))
+        return act, act_scale
 
     module.gate_up_silu_supported = supported
     module.gate_up_silu_kernel_for = kernel_for
-    module.run_gate_up_silu_mxfp8_32_gfx1250 = run
+    op_module.gate_up_silu_mxfp8_32 = gate_up_silu_mxfp8_32
     monkeypatch.setitem(sys.modules, module.__name__, module)
+    monkeypatch.setitem(sys.modules, op_module.__name__, op_module)
     v4 = atom_modules.deepseek_v4
     monkeypatch.setattr(v4, "get_gfx_runtime", lambda: "gfx1250")
     blockscale = importlib.import_module("atom.model_ops.blockscale")
@@ -173,15 +178,16 @@ def test_fused_rows_feed_w2_the_epilogue_quant(
     assert expert._gate_up_silu and flydsl["supported_shape"] == (2 * INTER, DIM)
     x = torch.zeros(3, DIM, dtype=torch.bfloat16)
     act, act_scale = expert.gate_up_silu_quant(x)
-    _xq, wq, _xs, ws, out, out_scale, limit, name = flydsl["runs"][-1]
-    assert flydsl["quantized"] == [x]
+    xq, wq, xs, ws, limit, out, out_scale = flydsl["runs"][-1]
+    assert flydsl["quantized"] == [x] and xq.shape == (3, DIM)
+    assert xs.shape == (3, DIM // 32)
     assert wq is expert.gate_up_proj.weight
     assert ws is expert.gate_up_proj.weight_scale
     assert act is out and act_scale is out_scale
     assert act.shape == (3, INTER) and act.dtype == torch.float8_e4m3fn
     assert act_scale.shape == (3, INTER // 32)
     assert act_scale.dtype == torch.float8_e8m0fnu
-    assert limit == 10.0 and name == "tile3"
+    assert limit == 10.0
     assert flydsl["shapes"][-1] == (3, 2 * INTER, DIM)
 
 
@@ -229,7 +235,8 @@ def test_traced_forward_picks_per_runtime_rows(
             # The quantize_fp8 stand-in: codes 3, scale bytes 4.
             assert torch.all(y == 3 * INTER + 4 * (INTER // 32))
         else:
-            assert flydsl["runs"][-1][-1] == f"tile{m}"
+            assert flydsl["runs"][-1][0].shape[0] == m
+            assert flydsl["shapes"][-1] == (m, 2 * INTER, DIM)
             # The launch stand-in: codes 1, scale bytes 2.
             assert torch.all(y == INTER + 2 * (INTER // 32))
     assert len(graphs) == 1
