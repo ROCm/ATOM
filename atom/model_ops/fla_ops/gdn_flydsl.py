@@ -43,16 +43,15 @@ def select_policy(*, allowed, replayssm, lossy_decode, state, activation_dtype):
         lossy_decode=lossy_decode,
         slot_shape=tuple(state.shape[1:]),
         dtype=state.dtype,
-        device=state.device,
         activation_dtype=activation_dtype,
     )
 
 
 def select_policy_for_slot(
-    *, allowed, replayssm, lossy_decode, slot_shape, dtype, device, activation_dtype
+    *, allowed, replayssm, lossy_decode, slot_shape, dtype, activation_dtype
 ):
-    """`select_policy` for a state pool described by one slot's shape, its
-    dtype and device, which is all of it the choice reads."""
+    """`select_policy` for a state pool described by one slot's shape and its
+    dtype, which is all of it the choice reads."""
     if not allowed:
         return GDNFlyDSLPolicy()
     # The ReplaySSM pool does not rule prefill out (prefill reads and writes the

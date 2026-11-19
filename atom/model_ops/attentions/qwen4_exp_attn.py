@@ -199,7 +199,7 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
     @cached_property
     def _gdn_flydsl_policies(self) -> dict:
         """Each GDN layer's FlyDSL policy, decided once from the SSM state's
-        slot shape, dtype and device: the layout id spells the storage order
+        slot shape and dtype: the layout id spells the storage order
         before any state is allocated, and the binding follows the same value.
         """
         _, shape_v = self._state_shape_for_runner()
@@ -211,7 +211,6 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
                 lossy_decode=envs.ATOM_ENABLE_GDN_DECODE_LOSSY_FAST,
                 slot_shape=tuple(shape_v),
                 dtype=dtype_v,
-                device=self.device,
                 activation_dtype=module.impl.dt_bias.dtype,
             )
             for module in self.pool_rows.get(LINEAR_STATE_ROWS, {})

@@ -275,7 +275,7 @@ def _flydsl_builder(monkeypatch, *, replayssm=False):
     from atom.model_ops.fla_ops import gdn_flydsl
 
     monkeypatch.setattr(gdn_flydsl, "ops", lambda: object())
-    monkeypatch.setattr(gdn_flydsl, "decode_device_supported", lambda device: True)
+    monkeypatch.setattr(gdn_flydsl, "_validated_on_gfx942", lambda: True)
     gdn_flydsl.backend.cache_clear()
     builder, cls = _builder()
     del builder._ssm_storage
