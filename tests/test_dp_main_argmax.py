@@ -1,9 +1,10 @@
-"""CPU checks for the opt-in DP main argmax path, with external kernels stubbed.
+"""CPU checks for the DP greedy argmax head, with external kernels stubbed.
 
 The real head exchange and runner methods run without AITER or a GPU. The
 exchange's pack boundary uses a CPU reference; test_lm_head_argmax.py covers
-the actual Triton kernel separately. Constraint/fallback and sampler-bypass
-coverage lives in test_token_constraint_wiring.py.
+the actual Triton kernel separately. The group's verdict is in
+test_dp_sync_layout.py and test_forward_mode.py, the sampler bypass in
+test_token_constraint_wiring.py.
 """
 
 import types
@@ -115,29 +116,36 @@ def test_dp_argmax_matches_lowest_id_of_full_row(monkeypatch, local_rows):
         assert got.to(torch.int32).tolist() == ref[start : start + local_rows].tolist()
 
 
-# ------------------------------------------------------------ head gating ---
-class _Ctx(types.SimpleNamespace):
-    pass
-
-
+# ----------------------------------------------------------- head choice ---
 @pytest.mark.parametrize(
-    "plugin, mode, ctx, dp_meta, expect",
+    "mode, ctx, dp_meta, greedy, expect",
     [
-        (False, "allgather", {}, True, True),
-        (False, "all2all", {}, True, True),
-        (True, "allgather", {}, True, False),
-        (False, "default", {}, True, False),
-        (False, "allgather", {"is_prefill": True}, True, False),
-        (False, "allgather", {"is_draft": True}, True, False),
-        (False, "allgather", {"running_tokens_are_unified": False}, True, False),
-        (False, "allgather", {}, False, False),
+        ("all2all", {}, True, True, "argmax"),
+        ("allgather", {}, True, True, "argmax"),
+        ("all2all", {}, True, False, "all2all"),
+        ("allgather", {}, True, False, "allgather"),
+        ("default", {}, True, True, None),
+        ("all2all", {"is_draft": True}, True, True, None),
+        ("all2all", {"running_tokens_are_unified": False}, True, True, None),
+        ("all2all", {}, False, True, None),
     ],
 )
-def test_dp_argmax_token_gate(monkeypatch, plugin, mode, ctx, dp_meta, expect):
-    c = _Ctx(is_prefill=False, is_draft=False, running_tokens_are_unified=True)
+def test_forward_takes_the_groups_exchange(
+    monkeypatch, mode, ctx, dp_meta, greedy, expect
+):
+    """The head exchanges ids on a step the group runs greedily
+    (`Context.dp_all_greedy`), logits on any other sharded step, and runs
+    the replicated GEMM where the step does not shard."""
+    c = types.SimpleNamespace(
+        is_prefill=False,
+        is_draft=False,
+        running_tokens_are_unified=True,
+        dp_all_greedy=greedy,
+    )
     for k, v in ctx.items():
         setattr(c, k, v)
-    monkeypatch.setattr(eh, "is_plugin_mode", lambda: plugin)
+    monkeypatch.setattr(eh, "is_plugin_mode", lambda: False)
+    monkeypatch.setattr(eh, "sp_is_enabled", lambda: False)
     monkeypatch.setattr(eh, "envs", types.SimpleNamespace(ATOM_DP_LM_HEAD_MODE=mode))
     monkeypatch.setattr(
         eh, "get_dp_group", lambda: types.SimpleNamespace(world_size=DP)
@@ -146,84 +154,56 @@ def test_dp_argmax_token_gate(monkeypatch, plugin, mode, ctx, dp_meta, expect):
         eh,
         "get_forward_context",
         lambda: types.SimpleNamespace(
-            context=c, dp_metadata=object() if dp_meta else None
+            context=c, attn_metadata=None, dp_metadata=object() if dp_meta else None
         ),
+    )
+    replicated = torch.zeros(2, 8)
+    monkeypatch.setattr(
+        eh, "tgemm", types.SimpleNamespace(mm=lambda *a, **k: replicated)
     )
     head = eh.ParallelLMHead.__new__(eh.ParallelLMHead)
     torch.nn.Module.__init__(head)
     head.tp_size, head.num_embeddings = 1, DP * VSHARD
+    head.weight, head.bias = None, None
     calls = []
-    head._dp_sharded_logits = lambda x, m: calls.append(m) or torch.zeros(2)
-    out = head.dp_argmax_token(torch.zeros(2, 4))
-    assert (out is not None) is expect
-    assert calls == (["argmax"] if expect else [])
+
+    def sharded(x, m):
+        calls.append(m)
+        return torch.tensor([5.0, 7.0]) if m == "argmax" else torch.ones(2, 8)
+
+    head._dp_sharded_logits = sharded
+    out = head(torch.zeros(2, 4))
+    assert calls == ([expect] if expect else [])
+    if expect == "argmax":
+        assert out.dtype == torch.int32 and out.tolist() == [5, 7]
+    elif expect is None:
+        assert out is replicated
 
 
-# --------------------------------------------------------- runner wiring ---
-class _Head:
-    def __init__(self, ids):
-        self.ids, self.local_rows = ids, []
-
-    def dp_argmax_token(self, x):
-        return self.ids
-
-    def local_logits(self, x):
-        self.local_rows.append(x.shape[0])
-        return torch.ones(x.shape[0], 8, dtype=torch.bfloat16)
-
-
-def _runner(head=None, compute_head=None):
-    runner = object.__new__(mr.ModelRunner)
-    runner.compute_head = compute_head
-    runner.dp_argmax_head = head
-    runner.compute_logits_calls = 0
-
-    def compute_logits(x):
-        runner.compute_logits_calls += 1
-        return torch.zeros(x.shape[0], 8, dtype=torch.bfloat16)
-
-    runner.model = types.SimpleNamespace(compute_logits=compute_logits)
-    return runner
-
-
-def _batch(n=3):
+# --------------------------------------------------------------- voting ---
+def _batch(temperatures=(0.0, 0.0), logprobs=False, structured=None, channel=None):
     return types.SimpleNamespace(
-        temperatures=np.zeros(n, np.float32),
-        any_logprobs=False,
-        structured_requests={},
-        required_channel=None,
+        temperatures=np.asarray(temperatures, np.float32),
+        any_logprobs=logprobs,
+        structured_requests=structured or {},
+        required_channel=channel,
     )
 
 
-def test_head_output_takes_ids_only_with_logits():
-    ids = torch.tensor([5.0, 7.0, 1.0])
-    r = _runner(_Head(ids))
-    assert r._head_output(torch.zeros(3, 4)) is ids
-    assert r.compute_logits_calls == 0
-    assert r._head_output(torch.zeros(3, 4), logits=False) is None
-    r = _runner(_Head(None))
-    assert r._head_output(torch.zeros(3, 4)).shape == (3, 8)
-    assert r.compute_logits_calls == 1
-    r = _runner(None)
-    assert r._head_output(torch.zeros(3, 4)).shape == (3, 8)
-
-
-def test_step_head_without_batch_uses_local_logits():
-    ids = torch.tensor([5.0, 7.0, 1.0])
-    head = _Head(ids)
-    r = _runner(head)
-    out = r._step_head(ids, torch.zeros(4, 4), None)
-    assert out.dim() == 2 and out.shape == (3, 8)
-    assert head.local_rows == [3]
-    assert r.compute_logits_calls == 0
-
-
-def test_step_head_logits_untouched():
-    logits = torch.zeros(3, 8)
-    r = _runner(_Head(None))
-    assert r._step_head(logits, torch.zeros(3, 4), _batch(3)) is logits
-    r._step_head(None, torch.zeros(3, 4), _batch(3))
-    assert r.compute_logits_calls == 1
-    ids = torch.tensor([5.0, 7.0, 1.0])
-    off = _runner(None)  # flag off: a 1-D head is not taken for ids
-    assert off._step_head(ids, torch.zeros(3, 4), _batch(3)) is ids
+@pytest.mark.parametrize(
+    "batch, vote",
+    [
+        (_batch(), True),
+        (_batch(temperatures=()), True),  # an idle rank's empty batch
+        (_batch(temperatures=(0.0, 0.7)), False),
+        (_batch(logprobs=True), False),
+        (_batch(structured={10: object()}), False),
+        (_batch(channel=object()), False),
+    ],
+)
+def test_a_rank_votes_greedy_only_for_plain_greedy_rows(batch, vote):
+    runner = object.__new__(mr.ModelRunner)
+    runner.dp_argmax_head = object()
+    assert runner._dp_greedy_vote(batch) is vote
+    runner.dp_argmax_head = None
+    assert runner._dp_greedy_vote(batch) is None

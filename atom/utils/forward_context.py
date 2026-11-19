@@ -197,6 +197,11 @@ class ForwardMode:
     # A PCP prefill's request groups, one a micro-batch of `ubatch_slices`,
     # each striped and reindexed on its own. None unless a PCP prefill splits.
     pcp_groups: "tuple[PcpBalGroup, ...] | None" = None
+    # Every rank decodes only greedy rows, with no logprobs or
+    # constraints (`ModelRunner._dp_greedy_vote`): a DP-sharded LM head
+    # exchanges the greedy ids instead of the logits, and the sampler is
+    # skipped.
+    dp_all_greedy: bool = False
 
     @property
     def decode_ubatch_slices(self) -> "tuple[UBatchSlice, ...] | None":
@@ -222,6 +227,7 @@ class ForwardMode:
         graph_shapes: Container[tuple[int, int]] | None = None,
         tbo_decode: bool = False,
         tbo_decode_graphs: bool = False,
+        dp_greedy_vote: bool | None = None,
     ) -> "ForwardMode":
         """Run the step's DP collective and settle its shape from the result.
 
@@ -230,6 +236,9 @@ class ForwardMode:
         ``tbo_decode_graphs``: every decode bucket that splits
         (`decode_bucket_splits`) was recorded as a TBO graph, so a decode the
         group splits replays like any other.
+
+        ``dp_greedy_vote``: this rank's vote for `dp_all_greedy`, None where
+        no rank takes it (`ModelRunner._dp_greedy_vote`).
 
         ``running_tokens_per_dp_rank`` is the caller's [dp_size] buffer, which
         every step settles in place from the group's scheduled tokens.
@@ -264,6 +273,7 @@ class ForwardMode:
             # Only a block drafter needs the group to agree on it; every other
             # flavor keeps its own and the extra wire row is not sent.
             max_seqlen_q=max_seqlen_q if is_block_drafter else None,
+            greedy=dp_greedy_vote,
         )
         # The group's query length, taken BEFORE the rows are read off it: a
         # rank still on its local q settles on a different `running_tokens`
@@ -380,6 +390,7 @@ class ForwardMode:
             token_graph=bool(token_graph) or (decode_recorded and graphable),
             prefill_token_graph=bool(token_graph),
             req_graphs=req_graphs,
+            dp_all_greedy=unified and not is_prefill and sync.all_greedy_across_dp,
         )
 
     @staticmethod
@@ -573,6 +584,9 @@ class Context:
     # `ForwardMode.decide`; None only on a capture context, which declares its
     # shape rather than reading one.
     forward_mode: ForwardMode | None = None
+    # `ForwardMode.dp_all_greedy`, here because a capture context records
+    # both answers with no `forward_mode`: the LM head exchanges greedy ids.
+    dp_all_greedy: bool = False
     # Optional flat token ids for the current forward. Read by callbacks
     # invoked inside Dynamo-opaque custom ops (e.g. V4 MoE hash routing)
     # that need the token ids but cannot receive them as a function arg
@@ -623,6 +637,7 @@ class Context:
         running_tokens_are_unified: bool = True,
         running_tokens_across_dp: tuple[int, ...] | None = None,
         forward_mode: ForwardMode | None = None,
+        dp_all_greedy: bool = False,
         input_ids: torch.Tensor | None = None,
         ubatch_token_offset: int = 0,
         ubatch_token_order: torch.Tensor | None = None,
@@ -642,6 +657,7 @@ class Context:
         self.running_tokens_are_unified = running_tokens_are_unified
         self.running_tokens_across_dp = running_tokens_across_dp
         self.forward_mode = forward_mode
+        self.dp_all_greedy = dp_all_greedy
         self.input_ids = input_ids
         self.ubatch_token_offset = ubatch_token_offset
         self.ubatch_token_order = ubatch_token_order

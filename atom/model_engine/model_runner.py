@@ -171,6 +171,10 @@ from atom.utils.tbo.ubatch_wrapper import UBatchWrapper
 
 logger = logging.getLogger("atom")
 
+# The `ReqGraph` phase a decode bucket is recorded under a second time, with
+# the LM head exchanging greedy ids (`Context.dp_all_greedy`).
+DP_GREEDY_PHASE = "dp_greedy"
+
 
 def max_schedulable_decode_bs(
     max_num_seqs: int, max_num_batched_tokens: int, full_q_len: int
@@ -812,7 +816,8 @@ class ModelRunner:
     # logits; whether this step deferred the previous verify's status past
     # the target's launch (`prepare_model`).
     compute_head: Callable | None = None
-    # The LM head whose greedy ids a decode step takes (`_head_output`).
+    # The LM head that exchanges greedy ids instead of logits on a step the
+    # whole DP group decodes greedily (`ForwardMode.dp_all_greedy`).
     dp_argmax_head: "ParallelLMHead | None" = None
     spec_status_deferred = False
 
@@ -1089,25 +1094,37 @@ class ModelRunner:
             )
 
     def _init_dp_argmax_head(self):
-        self.dp_argmax_head = None
-        if not envs.ATOM_DP_MAIN_ARGMAX:
-            return
-
+        """The model's one LM head where its logits are its head output
+        (`compute_head` is None), no decode verifies drafts, and it shards
+        the vocab over the DP group."""
         from atom.model_ops.embed_head import ParallelLMHead
 
         heads = [m for m in self.model.modules() if isinstance(m, ParallelLMHead)]
+        self.dp_argmax_head = None
         if (
             self.compute_head is None
-            and getattr(self, "drafter", None) is None
+            and not self.config.speculative_config
+            and self.config.parallel_config.data_parallel_size > 1
             and len(heads) == 1
-            # Subclasses such as V4's ParallelHead need the preprocessing in
-            # model.compute_logits before projecting the residual to logits.
-            and type(heads[0]) is ParallelLMHead
+            and heads[0].dp_shards_vocab()
         ):
             self.dp_argmax_head = heads[0]
         logger.info(
-            "ATOM_DP_MAIN_ARGMAX: on=%s (needs one base ParallelLMHead, no drafter)",
+            "DP greedy argmax head: %s (needs no compute_head, no speculative "
+            "decoding and one DP-sharded ParallelLMHead)",
             self.dp_argmax_head is not None,
+        )
+
+    def _dp_greedy_vote(self, batch) -> bool | None:
+        """This rank's vote for a DP greedy step (`ForwardMode.dp_all_greedy`):
+        every row greedy, without logprobs or constraints. None casts no
+        vote: no head takes it."""
+        if self.dp_argmax_head is None:
+            return None
+        return bool(
+            (batch.temperatures == 0).all()
+            and not batch.any_logprobs
+            and not has_constraints(batch)
         )
 
     def poll_forward_metrics(self):
@@ -2821,6 +2838,7 @@ class ModelRunner:
             running_tokens=running_tokens,
             running_tokens_are_unified=running_tokens_are_unified,
             forward_mode=forward_mode,
+            dp_all_greedy=forward_mode.dp_all_greedy,
             scheduled_tokens_gpu=self.forward_vars["batch_info"].gpu[1:2],
         )
 
@@ -2980,6 +2998,7 @@ class ModelRunner:
             graph_shapes=self._producer_graph_shapes(),
             tbo_decode=self.config.enable_tbo_decode,
             tbo_decode_graphs=self.tbo_decode_graphs,
+            dp_greedy_vote=self._dp_greedy_vote(batch),
         )
         forward_mode = self._cut_ubatches(forward_mode, batch)
         # Stash the DP-wide prefill OR for the EPLB prefill gate; reused free by
@@ -3441,8 +3460,11 @@ class ModelRunner:
                     running_bs, forward_context.attn_metadata.max_seqlen_q
                 )
                 # The head output the capture recorded (`_head_output`), or
-                # None.
-                head = self.req_graph.replay(key=graph_key)
+                # None; greedy ids on a DP greedy step.
+                head = self.req_graph.replay(
+                    key=graph_key,
+                    phase=DP_GREEDY_PHASE if context.dp_all_greedy else None,
+                )
                 hidden_states = self.forward_vars["outputs"][:running_tokens]
                 # Drafter aux buffers (if any) refresh on replay: their in-place
                 # copy ops were captured into the graph.
@@ -3462,8 +3484,6 @@ class ModelRunner:
         with `logits`, the logits. A decode graph's capture records it
         (`capture_cudagraph`), the logits at TP 1."""
         head = None if self.compute_head is None else self.compute_head(hidden_states)
-        if head is None and logits and self.dp_argmax_head is not None:
-            head = self.dp_argmax_head.dp_argmax_token(hidden_states)
         if head is None and logits:
             head = self.model.compute_logits(hidden_states)
         return head
@@ -3474,22 +3494,6 @@ class ModelRunner:
         where they stand for the step (`_head_ids_serve`), else the logits."""
         if isinstance(head, tuple) and self._head_ids_serve(head, batch):
             return head
-        if (
-            self.dp_argmax_head is not None
-            and isinstance(head, torch.Tensor)
-            and head.dim() == 1
-        ):
-            # `dp_argmax_token`'s ids stand for a greedy step reading nothing
-            # else; any other takes logits with no collective, as its DP
-            # peers may be taking their ids.
-            if (
-                batch is not None
-                and (batch.temperatures == 0).all()
-                and not batch.any_logprobs
-                and not has_constraints(batch)
-            ):
-                return head.to(torch.int32)
-            return self.dp_argmax_head.local_logits(hidden_states[: head.shape[0]])
         if head is None or isinstance(head, tuple):
             return self.model.compute_logits(hidden_states)
         return head
@@ -3600,8 +3604,11 @@ class ModelRunner:
             # after either and the pad rows divide `[running_bs, V]` by
             # `[scheduled_bs, 1]`.
             logits = logits[:bs]
-            if self.dp_argmax_head is not None and logits.dim() == 1:
-                # Greedy ids from the DP argmax head (`_step_head`).
+            if (
+                self.dp_argmax_head is not None
+                and get_forward_context().context.dp_all_greedy
+            ):
+                # The head exchanged the group's greedy ids, not logits.
                 sampled_tokens = logits
             else:
                 sampled_tokens = self.sampler(
@@ -4602,6 +4609,17 @@ class ModelRunner:
                         self.req_graph.record(
                             full_forward, key=request_bucket(bs, max_q_len)
                         )
+                        if self.dp_argmax_head is not None:
+                            # The bucket again with the head exchanging greedy
+                            # ids, which a DP greedy step replays.
+                            context.dp_all_greedy = True
+                            self._head_output(outputs[:running_tokens])
+                            self.req_graph.record(
+                                full_forward,
+                                key=request_bucket(bs, max_q_len),
+                                phase=DP_GREEDY_PHASE,
+                            )
+                            context.dp_all_greedy = False
                     torch.cuda.synchronize()
                     # After the sync: the warmup forward's kernels must have
                     # completed before the window closes, or they spill into the

@@ -267,6 +267,10 @@ class ParallelLMHead(VocabParallelEmbedding):
                 # Under Ulysses SP, x is this rank's token shard.
                 x = sp_gather_rows(x, last_indices)
             if self._can_use_dp_sharded_head(context):
+                if context.dp_all_greedy:
+                    # The group's greedy ids, int32 [rows], from the same GEMM.
+                    ids = self._dp_sharded_logits(x, "argmax")
+                    return ids.to(torch.int32)
                 return self._dp_sharded_logits(x, envs.ATOM_DP_LM_HEAD_MODE)
             if sp_is_enabled() and not self.num_embeddings % get_pcp_group().world_size:
                 return self._sp_sharded_logits(x)
@@ -377,6 +381,17 @@ class ParallelLMHead(VocabParallelEmbedding):
     # change needed for this prototype (the full weight still costs VRAM; a real
     # rollout should shard it at load time).
     # ------------------------------------------------------------------
+    def dp_shards_vocab(self) -> bool:
+        """Static: a sharded mode is on, pure DP, and the vocab splits evenly
+        over a >1 DP group."""
+        dp_group = get_dp_group()
+        return (
+            envs.ATOM_DP_LM_HEAD_MODE in ("allgather", "all2all")
+            and self.tp_size == 1
+            and dp_group.world_size > 1
+            and self.num_embeddings % dp_group.world_size == 0
+        )
+
     def _can_use_dp_sharded_head(self, context) -> bool:
         """Whether this step may run the DP-sharded LM head (pure-DP decode only).
 
@@ -389,14 +404,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         question: a prefilling peer drives it False on every rank, so no rank
         can answer True here while another answers False.
         """
-        dp_group = get_dp_group()
-        # Static: enabled, pure DP, vocab evenly shardable over a >1 DP group.
-        if (
-            envs.ATOM_DP_LM_HEAD_MODE not in ("allgather", "all2all")
-            or self.tp_size != 1
-            or dp_group.world_size <= 1
-            or self.num_embeddings % dp_group.world_size != 0
-        ):
+        if not self.dp_shards_vocab():
             return False
         # Per-step: all ranks at one height. `is_draft` is its own question,
         # not shorthand for the flag below -- a drafter states uniformity per
@@ -420,9 +428,10 @@ class ParallelLMHead(VocabParallelEmbedding):
 
         - ``"argmax"``: reduce each shard to a packed ``(max, global_id)`` and
           all-gather only ``[Σrows, 2]``, then pick the winner -> ``[local_rows]``
-          ids, still packed as fp32 (drafting; the caller narrows into its own).
+          ids, still packed as fp32 (drafting, or a decode the DP group runs
+          greedily; the caller narrows into its own).
         - ``"all2all"`` / ``"allgather"``: exchange full-vocab logits ->
-          ``[local_rows, vocab]`` (the decode head).
+          ``[local_rows, vocab]`` (any other decode).
         """
         dp_group = get_dp_group()
         dp_size = dp_group.world_size
@@ -514,16 +523,3 @@ class ParallelLMHead(VocabParallelEmbedding):
         return (
             dp_group.world_size > 1 and self.num_embeddings % dp_group.world_size == 0
         )
-
-    def dp_argmax_token(self, x: torch.Tensor) -> torch.Tensor | None:
-        """``x``'s greedy ids, fp32 ``[rows]``, on a step that runs the
-        DP-sharded head (same GEMM, lowest id on ties); else None."""
-        if is_plugin_mode() or not self._can_use_dp_sharded_head(
-            get_forward_context().context
-        ):
-            return None
-        return self._dp_sharded_logits(x, "argmax")
-
-    def local_logits(self, x: torch.Tensor) -> torch.Tensor:
-        """Full-vocab logits from the replicated TP-1 weight, no collective."""
-        return tgemm.mm(x, self.weight, self.bias)

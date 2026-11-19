@@ -698,3 +698,32 @@ def test_eager_or_prefill_tbo_does_not_replay_a_split_recording():
     )
     assert prefill.tbo_collective_active and not prefill.req_graphs
     assert _split_bs(prefill) is None
+
+
+@pytest.mark.parametrize(
+    "vote, peer_vote, peer_prefill, expect",
+    [
+        (True, 1, False, True),
+        (True, 0, False, False),
+        (False, 1, False, False),
+        (True, 1, True, False),
+        (None, None, False, False),
+    ],
+)
+def test_the_group_runs_greedy_ids_only_on_a_decode_every_rank_votes_for(
+    monkeypatch, vote, peer_vote, peer_prefill, expect
+):
+    """`dp_all_greedy` is the group's: a peer sampling, or prefilling, keeps
+    every rank on the logits exchange; no vote, no verdict."""
+
+    def fake_all_gather(out_list, local, group=None):
+        out_list[0].copy_(local)
+        peer = local.clone()
+        peer[2] = 1 if peer_prefill else 0
+        if peer_vote is not None:
+            peer[-1] = peer_vote
+        out_list[1].copy_(peer)
+
+    monkeypatch.setattr(torch.distributed, "all_gather", fake_all_gather)
+    mode = _decide(_batch(seqs=8), dp_size=2, dp_group=object(), dp_greedy_vote=vote)
+    assert mode.dp_all_greedy is expect

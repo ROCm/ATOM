@@ -149,39 +149,6 @@ def test_head_ids_serve_only_unconstrained_verifies(monkeypatch, rule, served):
     assert runner._head_ids_serve(head, batch) is served
 
 
-@pytest.mark.parametrize(
-    "rule,greedy,logprobs,served",
-    [
-        ({}, True, False, True),
-        (GRAMMAR, True, False, False),
-        (CHANNEL, True, False, False),
-        ({}, False, False, False),
-        ({}, True, True, False),
-    ],
-)
-def test_dp_argmax_ids_serve_only_unconstrained_greedy_steps(
-    rule, greedy, logprobs, served
-):
-    runner = object.__new__(mod.ModelRunner)
-    logits = torch.eye(4)[:2]
-    local_logits = mock.Mock(return_value=logits)
-    runner.dp_argmax_head = SimpleNamespace(local_logits=local_logits)
-    batch = _batch(
-        temperatures=np.full(2, 0.0 if greedy else 0.7), any_logprobs=logprobs, **rule
-    )
-    ids = torch.tensor([3.0, 1.0])
-    hidden = torch.zeros(3, 4)
-    output = runner._step_head(ids, hidden, batch)
-    if served:
-        assert output.dtype == torch.int32
-        torch.testing.assert_close(output, ids.to(torch.int32))
-        local_logits.assert_not_called()
-    else:
-        assert output is logits
-        local_logits.assert_called_once()
-        torch.testing.assert_close(local_logits.call_args.args[0], hidden[:2])
-
-
 # -- error delivery ----------------------------------------------------------
 
 
@@ -214,66 +181,6 @@ def _postprocess(runner, batch):
         )
 
 
-def test_dp_argmax_postprocess_skips_sampler_without_constraints(monkeypatch):
-    runner = _postprocess_runner({10: (3,), 11: (1,)}, None)
-    runner.dp_argmax_head = object()
-    runner.sampler = mock.Mock(side_effect=AssertionError("ids must skip the sampler"))
-    prepare = mock.Mock(return_value=({10: (3,), 11: (1,)}, None))
-    runner.tokenID_processor.prepare_sampled_ids = prepare
-    monkeypatch.setattr(
-        mod, "get_forward_context", lambda: SimpleNamespace(spec_decode_metadata=None)
-    )
-    output = runner.postprocess(
-        _batch(),
-        torch.tensor([3, 1, 2], dtype=torch.int32),
-        torch.zeros(2),
-        None,
-        None,
-        True,
-        None,
-    )
-    runner.sampler.assert_not_called()
-    torch.testing.assert_close(
-        prepare.call_args.args[1], torch.tensor([3, 1], dtype=torch.int32)
-    )
-    assert output.token_ids == [(3,), (1,)]
-
-
-@pytest.mark.parametrize("rule", [GRAMMAR, CHANNEL])
-def test_dp_argmax_fallback_applies_constraints_once_before_sampling(monkeypatch, rule):
-    masks = mock.Mock(side_effect=lambda logits: logits[:, 3].fill_(-float("inf")))
-
-    def grammar_mask(logits, batch, metadata):
-        masks(logits)
-        return {}
-
-    def channel_mask(runner, batch, logits, metadata, target):
-        masks(logits)
-
-    grammar = SimpleNamespace(vocab_size=4, errors={}, apply=grammar_mask)
-    runner = _postprocess_runner({10: (2,), 11: (2,)}, grammar)
-    logits = torch.tensor([[0.0, 1.0, 2.0, 9.0], [0.0, 1.0, 2.0, 9.0]])
-    runner.dp_argmax_head = SimpleNamespace(local_logits=mock.Mock(return_value=logits))
-    batch = _batch(temperatures=np.zeros(2), **rule)
-    head = runner._step_head(torch.tensor([3.0, 3.0]), torch.zeros(2, 4), batch)
-    monkeypatch.setattr(boundary, "apply_required_channel", channel_mask)
-    monkeypatch.setattr(
-        mod, "get_forward_context", lambda: SimpleNamespace(spec_decode_metadata=None)
-    )
-
-    def sample(masked, *args, **kwargs):
-        masks.assert_called_once()
-        assert torch.isneginf(masked[:, 3]).all()
-        return masked.argmax(-1)
-
-    runner.sampler = mock.Mock(side_effect=sample)
-    output = runner.postprocess(batch, head, torch.zeros(2), None, None, True, None)
-    runner.dp_argmax_head.local_logits.assert_called_once()
-    runner.sampler.assert_called_once()
-    masks.assert_called_once()
-    assert output.token_ids == [(2,), (2,)]
-
-
 def test_grammar_errors_are_delivered_with_the_step_output():
     grammar = SimpleNamespace(errors={10: "grammar said no"})
     runner = _postprocess_runner({10: (4,), 11: (5,)}, grammar)
@@ -286,6 +193,32 @@ def test_no_grammar_means_no_errors():
     assert boundary.constraint_errors(SimpleNamespace(structured_output=None)) is None
     runner = _postprocess_runner({10: (4,), 11: (5,)}, None)
     assert not _postprocess(runner, _batch()).constraint_errors
+
+
+@pytest.mark.parametrize("dp_all_greedy", [True, False])
+def test_a_dp_greedy_step_takes_the_heads_ids_without_the_sampler(
+    monkeypatch, dp_all_greedy
+):
+    """On a step the DP group runs greedily (`Context.dp_all_greedy`)
+    the head output is the ids; on any other the sampler reads logits."""
+    runner = _postprocess_runner({10: (3,), 11: (1,)}, None)
+    runner.dp_argmax_head = object()
+    runner.sampler = mock.Mock(return_value=torch.tensor([3, 1], dtype=torch.int32))
+    prepare = mock.Mock(return_value=({10: (3,), 11: (1,)}, None))
+    runner.tokenID_processor.prepare_sampled_ids = prepare
+    if dp_all_greedy:
+        head = torch.tensor([3, 1, 2], dtype=torch.int32)
+    else:
+        head = torch.eye(4)[[3, 1, 2]]
+    fc = SimpleNamespace(
+        spec_decode_metadata=None,
+        context=SimpleNamespace(dp_all_greedy=dp_all_greedy),
+    )
+    monkeypatch.setattr(mod, "get_forward_context", lambda: fc)
+    out = runner.postprocess(_batch(), head, torch.zeros(2), None, None, True, None)
+    assert runner.sampler.called is not dp_all_greedy
+    assert prepare.call_args.args[1].tolist() == [3, 1]
+    assert out.token_ids == [(3,), (1,)]
 
 
 # -- RapidServe prefill ------------------------------------------------------
