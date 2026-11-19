@@ -225,6 +225,21 @@ def _attn_res_tdm_module():
 
         if get_arch() != "gfx1250":
             return None
+        from triton.experimental.gluon import language as gl
+
+        # Gluon can import on Triton versions without the CDNA5/TDM APIs.
+        # Probe before importing the kernel: names in its JIT body are only
+        # resolved at compilation, too late for this import-time fallback.
+        cdna5 = getattr(getattr(gl, "amd", None), "cdna5", None)
+        tdm = getattr(cdna5, "tdm", None)
+        if not all(
+            callable(getattr(cdna5, name, None))
+            for name in ("buffer_load", "buffer_store")
+        ) or not all(
+            callable(getattr(tdm, name, None))
+            for name in ("make_tensor_descriptor", "async_load", "async_wait")
+        ):
+            return None
         from atom.model_ops.kimi_k3 import attention_residual_gluon
     except ImportError:
         return None

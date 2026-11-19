@@ -1,5 +1,7 @@
 """gfx1250 Gluon TDM attn-res kernel against the Triton kernel it replaces."""
 
+from unittest.mock import Mock
+
 import pytest
 import torch
 
@@ -48,17 +50,21 @@ def gluon_tdm(monkeypatch):
         lambda: True,
     )
     attn_res._attn_res_tdm_module.cache_clear()
-    if attn_res._attn_res_tdm_module() is None:
-        pytest.skip("Gluon TDM attn-res needs gfx1250")
+    try:
+        module = attn_res._attn_res_tdm_module()
+        if module is None:
+            pytest.skip("Gluon TDM attn-res needs gfx1250")
+        yield module
+    finally:
+        attn_res._attn_res_tdm_module.cache_clear()
 
 
 # B=1..3 cover the prefetch pipeline's tail (fewer rows than are kept in flight).
 @pytest.mark.parametrize("blocks", [1, 2, 3, 8])
 @pytest.mark.parametrize("add_count", [0, 1, 2])
 @pytest.mark.parametrize("quant", [False, True])
-@pytest.mark.usefixtures("gluon_tdm")
 @torch.inference_mode()
-def test_gluon_tdm_matches_triton(monkeypatch, blocks, add_count, quant):
+def test_gluon_tdm_matches_triton(monkeypatch, gluon_tdm, blocks, add_count, quant):
     prefix, block, score_weight, norm_weight, adds = _inputs(
         301, blocks, add_count, 20261029 + 10 * blocks + add_count
     )
@@ -70,8 +76,20 @@ def test_gluon_tdm_matches_triton(monkeypatch, blocks, add_count, quant):
         "quant_dtype": torch.float8_e4m3fn if quant else None,
     }
     args = (prefix, block, score_weight, 1e-5)
+    tdm_launch = Mock(wraps=gluon_tdm.launch_attn_res_tdm)
+    triton_launch = Mock(wraps=attn_res._launch_attn_res_triton)
+    monkeypatch.setattr(gluon_tdm, "launch_attn_res_tdm", tdm_launch)
+    monkeypatch.setattr(attn_res, "_launch_attn_res_triton", triton_launch)
+
     gluon = _run(True, monkeypatch, *args, **kwargs)
+    tdm_launch.assert_called_once()
+    triton_launch.assert_not_called()
+
+    tdm_launch.reset_mock()
     triton = _run(False, monkeypatch, *args, **kwargs)
+    triton_launch.assert_called_once()
+    tdm_launch.assert_not_called()
+
     # The folded prefix is the same BF16 sum on both paths.
     assert torch.equal(gluon[-1], triton[-1])
     if quant:
