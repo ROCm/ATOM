@@ -799,7 +799,7 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
     def _do_load_req(self, req: LMCacheReqMeta) -> None:
         ls = req.load_spec
         assert ls is not None
-        self._pin_in_place_stream()
+        self._pin_in_place_stream(side=envs.ATOM_MOONCAKE_STORE_LOAD_SIDE_STREAM)
         hbm = int(ls.hbm_cached_tokens)
         lmc = int(ls.lmcache_cached_tokens)
         t_total0 = time.perf_counter()
@@ -1211,11 +1211,12 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
             self._in_place_tls.stream = stream
         return stream
 
-    def _pin_in_place_stream(self) -> None:
+    def _pin_in_place_stream(self, *, side: bool = False) -> None:
         """Pin the stream this thread's coming load or save stages on: the
         forward's, as it is now. A runner that picks a stream per forward may
-        move on during the transfer; the switch happens between transfers."""
-        self._in_place_tls.pinned = self._forward_stream
+        move on during the transfer; the switch happens between transfers.
+        With `side`, the thread's own stream (experiment: loads off the forward)."""
+        self._in_place_tls.pinned = None if side else self._forward_stream
 
     def _copy_in_place(
         self,
