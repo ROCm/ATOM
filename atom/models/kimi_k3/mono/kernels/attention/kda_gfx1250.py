@@ -495,12 +495,14 @@ def kda_head_norm(c, request, head):
                 )
             )
         )
-        output = (
-            fx.ptr_load(c["ol"] + token * HEAD_DIM + row)
-            * inverse
-            * weight
-            / (fx.Float32(1.0) + hw_exp2(-_f32_of(gates[round_index]) * LOG2E))
+        denominator = fx.Float32(1.0) + hw_exp2(
+            -_f32_of(gates[round_index]) * LOG2E
         )
+        normed = fx.ptr_load(c["ol"] + token * HEAD_DIM + row) * inverse * weight
+        if const_expr(c.get("chunk_rounding", False)):
+            output = normed * (fx.Float32(1.0) / denominator)
+        else:
+            output = normed / denominator
         if tid + threads * round_index < outputs:
             bo.buffer_store(
                 output.to(fx.BFloat16),
@@ -1302,10 +1304,11 @@ def kda_head(c, request, head, share=None):
             value = fx.Float32(0.0)
             for tap in range_constexpr(4):
                 value = value + weights[tap] * sequence[token + tap]
-            output = _bf16_round(
-                value
-                / (fx.Float32(1.0) + hw_exp2(-value * LOG2E))
-            )
+            denominator = fx.Float32(1.0) + hw_exp2(-value * LOG2E)
+            if const_expr(c.get("chunk_rounding", False)):
+                output = _bf16_round(value * (fx.Float32(1.0) / denominator))
+            else:
+                output = _bf16_round(value / denominator)
             if raw < channels:
                 if part < 2:
                     fx.ptr_store(

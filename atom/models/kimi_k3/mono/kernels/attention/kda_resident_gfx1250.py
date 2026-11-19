@@ -963,6 +963,9 @@ def build_resident_k1(
             "head_preload": _head_preload(),
             "head_split": head_split,
             "gate_ilp": _gate_ilp(),
+            # forced whole heads stand in for the chunk tasks: their SiLU and
+            # output gate as the chunk tasks round them
+            "chunk_rounding": forced_heads,
             "red": smem.red.ptr,
             "tls": smem.tls.ptr,
             "fa": recurrence.fa.ptr,

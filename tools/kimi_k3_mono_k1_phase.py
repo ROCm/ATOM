@@ -26,12 +26,18 @@ import kimi_k3_mono_k1_replay_check as rc  # noqa: E402
 from atom.models.kimi_k3.mono.kernels.execution_plan import (  # noqa: E402
     Gfx1250KimiBuildPlan,
 )
+from atom.models.kimi_k3.mono.kernels.attention.kda_builder_gfx1250 import (  # noqa: E402
+    REPLAY_TABLE,
+)
 from atom.models.kimi_k3.mono.kernels.stages import tdm_timeline as tl  # noqa: E402
+from atom.mono.runtime.compile import launcher_resources  # noqa: E402
 
 WIDTHS = [int(r) for r in os.environ.get("ROWS", "8,40").split(",")]
 COPIES = int(os.environ.get("COPIES", "8"))
 LAUNCHES = int(os.environ.get("LAUNCHES", "8"))
 TIMELINE = os.environ.get("TL", "1") == "1"
+REPLAY = os.environ.get("REPLAY") == "1"
+HREC = int(os.environ.get("H", "5"))
 dev, QLEN = rc.dev, rc.QLEN
 weights = [rc.w_in] + [rc.w_in.clone() for _ in range(COPIES - 1)]
 
@@ -58,14 +64,34 @@ def inputs(rows):
     prefix = rc.bf16(rows, rc.HIDDEN)
     conv = rc.bf16(slots, 3 * rc.PROJ, rc.SL, scale=0.5)
     rs = torch.randn((slots, rc.NH, rc.HD, rc.HD), generator=rc.gen, device=dev) * 0.05
-    st = (torch.arange(req * QLEN, device=dev, dtype=torch.int32) + req).view(req, QLEN)
-    st[:, 0] = torch.arange(req, device=dev, dtype=torch.int32)
     acc = torch.full((req,), QLEN, device=dev, dtype=torch.int32)
-    return prefix, conv, rs, st, acc
+    if not REPLAY:
+        st = (torch.arange(req * QLEN, device=dev, dtype=torch.int32) + req).view(req, QLEN)
+        st[:, 0] = torch.arange(req, device=dev, dtype=torch.int32)
+        return [prefix, conv, rs, st, acc, None]
+    # ReplaySSM (kimi_k3_mono_k1_replay_bench's): one checkpoint a request,
+    # H committed records replayed every launch
+    slot_idx = torch.arange(req, device=dev, dtype=torch.int32)
+    st = torch.full((req, QLEN), -1, dtype=torch.int32, device=dev)
+    st[:, 0] = slot_idx
+    bufs = [rc.bf16(slots, rc.NH, rc.CAP, rc.HD, scale=0.05),
+            rc.bf16(slots, rc.NH, rc.CAP, rc.HD, scale=0.05),
+            -torch.rand((slots, rc.NH, rc.CAP, rc.HD), generator=rc.gen, device=dev) * 0.1]
+    write_pos = torch.full((slots,), HREC, dtype=torch.int32, device=dev)
+    named = {"slot_idx": slot_idx, "write_pos": write_pos,
+             "rbuf_k": bufs[0], "rbuf_u": bufs[1], "rbuf_g": bufs[2]}
+    table = torch.tensor([named[n].data_ptr() for n in REPLAY_TABLE],
+                         dtype=torch.int64, device=dev)
+    return [prefix, conv, rs, st, acc, table, named]
+
+
+def resources(k1):
+    return [{k: r[k] for k in ("vgpr", "sgpr", "vgpr_spill", "sgpr_spill", "scratch", "lds") if k in r}
+            for r in launcher_resources(k1.entrypoint.launcher)]
 
 
 def graph_for(k1, held, rows):
-    prefix, conv, rs, st, acc = held
+    prefix, conv, rs, st, acc, table = held[:6]
     blk1 = torch.zeros(rows, 1, rc.HIDDEN, dtype=torch.bfloat16, device=dev)
     core = torch.zeros((rows, rc.PROJ), dtype=torch.bfloat16, device=dev)
     runtimes = [
@@ -77,7 +103,7 @@ def graph_for(k1, held, rows):
             cs_dim=conv.stride(1), cs_tok=conv.stride(2), a_log=rc.a_log,
             dt_bias=rc.dt_bias, on_w=rc.on_w, rstate=rs, rs_seq=rs.stride(0),
             st_idx=st, st_stride=st.stride(0), num_acc=acc, core_out=core,
-            core_q=None, core_scale=None, replay=None)
+            core_q=None, core_scale=None, replay=table)
         for i in range(LAUNCHES)
     ]
     k1(runtimes[0], stream=torch.cuda.current_stream())
@@ -143,8 +169,13 @@ class Clock:
 
             amdsmi.amdsmi_init()
             handle = amdsmi.amdsmi_get_processor_handles()[int(os.environ["SMI_GPU"])]
-            self._read = lambda: amdsmi.amdsmi_get_clock_info(
-                handle, amdsmi.AmdSmiClkType.GFX)["clk"]
+            def read():
+                power = amdsmi.amdsmi_get_power_info(handle)
+                watts = next((power[k] for k in ("current_socket_power", "socket_power",
+                              "average_socket_power") if isinstance(power.get(k), (int, float))), None)
+                return amdsmi.amdsmi_get_clock_info(handle, amdsmi.AmdSmiClkType.GFX)["clk"], watts
+
+            self._read = read
         except Exception:
             self._read = None
 
@@ -166,8 +197,14 @@ class Clock:
     def stop(self):
         self._run = False
         self._thread.join()
-        s = sorted(self.samples)
-        return {"mhz_med": s[len(s) // 2], "mhz_min": s[0], "mhz_max": s[-1]} if s else {}
+        if not self.samples:
+            return {}
+        mhz = sorted(m for m, _ in self.samples)
+        watts = sorted(w for _, w in self.samples if w is not None)
+        out = {"mhz_med": mhz[len(mhz) // 2], "mhz_min": mhz[0], "mhz_max": mhz[-1]}
+        if watts:
+            out["w_med"] = watts[len(watts) // 2]
+        return out
 
 
 def sustained_us(g, seconds, clock=None):
@@ -206,10 +243,10 @@ def abba(switch):
         graphs, names, held = {}, {}, []
         for value in ("0", "1"):
             os.environ[switch] = value
-            k1 = plan.make_k1_local_runner(rc.spec(rows, False)).prepare(dev)
+            k1 = plan.make_k1_local_runner(rc.spec(rows, REPLAY)).prepare(dev)
             h = list(inputs(rows))
             graphs[value] = graph_for(k1, h, rows)
-            names[value] = k1.entrypoint.name
+            names[value] = (k1.entrypoint.name, resources(k1))
             held.append((k1, h))
         times, clocks = {"0": [], "1": []}, {"0": [], "1": []}
         for i in range(rounds):
@@ -217,7 +254,7 @@ def abba(switch):
                 if seconds:
                     us, mhz = sustained_us(graphs[value], seconds, clock)
                     times[value].append(us)
-                    clocks[value].append(mhz.get("mhz_med"))
+                    clocks[value].append((mhz.get("mhz_med"), mhz.get("w_med")))
                 else:
                     times[value].append(time_us(graphs[value]))
         print(json.dumps({"rows": rows, "qlen": QLEN, "switch": switch, "names": names,
@@ -235,19 +272,20 @@ def main():
         plan = Gfx1250KimiBuildPlan(threads=256, blocks=256, lds_bytes=320 * 1024,
                                     tokens=rows, nblocks=1)
         tl.disable()
-        k1 = plan.make_k1_local_runner(rc.spec(rows, False)).prepare(dev)
+        k1 = plan.make_k1_local_runner(rc.spec(rows, REPLAY)).prepare(dev)
         if os.environ.get("OUT"):
-            prefix, conv, rs, st, acc = inputs(rows)
-            core, _ = rc.k1_run(k1, prefix, conv, rs, st, acc)
+            prefix, conv, rs, st, acc, table, *_ = inputs(rows)
+            core, _ = rc.k1_run(k1, prefix, conv, rs, st, acc, table)
             torch.cuda.synchronize()
             torch.save([t.cpu() for t in (core, rs, conv)], f"{os.environ['OUT']}_{rows}.pt")
         held = list(inputs(rows))
         us = time_us(graph_for(k1, held, rows))
-        report = {"rows": rows, "qlen": QLEN, "us": us, "name": k1.entrypoint.name}
+        report = {"rows": rows, "qlen": QLEN, "us": us, "name": k1.entrypoint.name,
+                  "resources": resources(k1)}
         if TIMELINE:
             buf = torch.zeros(tl.buffer_words(LAUNCHES), dtype=torch.int32, device=dev)
             tl.enable(buf.data_ptr(), LAUNCHES)
-            k1t = plan.make_k1_local_runner(rc.spec(rows, False)).prepare(dev)
+            k1t = plan.make_k1_local_runner(rc.spec(rows, REPLAY)).prepare(dev)
             tl.disable()
             held_t = list(inputs(rows))
             g = graph_for(k1t, held_t, rows)
