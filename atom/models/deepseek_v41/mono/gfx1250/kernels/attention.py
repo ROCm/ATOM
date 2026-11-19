@@ -1143,54 +1143,61 @@ def stage_F_cluster(c):
             hx.lstore(sm + (r * 20 + (cc - kq * 20)) * 4, s)
 
 
-# ------------------------------------------------------------------ TP push-then-reduce (tagged b128, all-reduce)
+# ------------------------------------------------------------------ TP push-then-reduce (LL words, all-reduce)
 @ASTRewriter.transform
 def tp_allreduce(c, region, tag):
-    """This CTA's 20 cols x TR rows (fp32 in LDS [r][20]) -> bf16 pairs, 3 pairs + tag a 16-byte word, pushed
-    nontemporally to every peer's receive region (region * 4 + src); the 3 peers' words polled together and summed ->
-    tpout and (device scope) row-major bf16 [row][5120] at ytgt (the next front's input y)."""
+    """This CTA's 20 cols x TR rows (fp32 in LDS [r][20]) -> bf16 pairs, 2 pairs a thread as one 16-byte LL pair
+    {d0, tag, d1, tag} (hx.put2: two 8-byte SCOPE_SYS stores, each half self-tagged -- no reliance on an untorn 16-byte
+    access, which no document guarantees) to every peer's receive region (region * 4 + src); the 3 peers' halves peeked
+    together (8-byte SCOPE_SYS loads, each checked on its own tag) and summed -> tpout and (device scope) row-major bf16
+    [row][5120] at ytgt (the next front's input y)."""
     t, b, TR = c["t"], c["b"], c["TR"]
     TP_TG = 40960
-    TPG = (TR * 10 + 2) // 3   # ceil: TR * 10 words need not be a multiple of 3 (draft rows 5 a request)
+    TPG = (TR * 10 + 2) // 3   # (tpout's layout: TPG * 3 words a CTA)
     NWD = TR * 10
+    TPG2 = (NWD + 1) // 2      # (LL words: 2 bf16-pair words a thread)
     rank = c["rank"]
-    if t < TPG:
+    if t < TPG2:
         lo, hi, wv = [], [], []
-        for k in range_constexpr(3):
-            wi = t * 3 + k
+        for k in range_constexpr(2):
+            wi = fx.min(t * 2 + k, I32(NWD - 1))
             lo.append(hx.lload(c["sm"] + ((wi // 10) * 20 + 2 * (wi % 10)) * 4, F32))
             hi.append(hx.lload(c["sm"] + ((wi // 10) * 20 + 2 * (wi % 10) + 1) * 4, F32))
             wv.append(lo[k].to(BF16).bitcast(fx.Int16).to(I32) & 0xFFFF | (hi[k].to(BF16).bitcast(fx.Int16).to(I32) << 16))
-        v = fx.Vector.from_elements([wv[0], wv[1], wv[2], I32(tag)], I32)
         for o in range_constexpr(4):
             if o != rank:
-                hx.gstore(c["recv"][o] + (i64((region * 4) * TP_TG) + i64(rank * TP_TG) + i64(b * TPG + t)) * 16, v, nt=True)
-        # the 3 peers' tags polled together (3 loads in flight an iteration), then the 3 words loaded together
-        sl = [lo[k].to(BF16).to(F32) for k in range(3)]
-        sh = [hi[k].to(BF16).to(F32) for k in range(3)]
-        gps = [c["recv"][rank] + (i64((region * 4) * TP_TG) + i64(o * TP_TG) + i64(b * TPG + t)) * 16 for o in range(4) if o != rank]
+                hx.put2(c["recv"][o] + (i64((region * 4) * TP_TG) + i64(rank * TP_TG) + i64(b * TPG2 + t)) * 16, wv[0], wv[1], tag)
+        sl = [lo[k].to(BF16).to(F32) for k in range(2)]
+        sh = [hi[k].to(BF16).to(F32) for k in range(2)]
+        gps = [c["recv"][rank] + (i64((region * 4) * TP_TG) + i64(o * TP_TG) + i64(b * TPG2 + t)) * 16 for o in range(4) if o != rank]
         t0 = hx.clock()
-        bad_ = ((hx.gload(gps[0] + i64(12), I32, nt=True) != tag) | (hx.gload(gps[1] + i64(12), I32, nt=True) != tag) | (hx.gload(gps[2] + i64(12), I32, nt=True) != tag)).select(I32(1), I32(0))
+        pg = [hx.peek(gp + i64(8 * h)) for gp in gps for h in range(2)]
+        bad_ = I32(0)
+        for k in range_constexpr(6):
+            bad_ = bad_ | (pg[k][1] != tag).select(I32(1), I32(0))
         st_ = I32(0)
         while (bad_ != 0) & (hx.clock() - t0 < fx.Int64(hx.POLL_TICKS)) & (st_ == fx.Int32(0)):
             hx.s_sleep(0)
             st_ = hx._stop_due(st_, t0)
-            bad_ = ((hx.gload(gps[0] + i64(12), I32, nt=True) != tag) | (hx.gload(gps[1] + i64(12), I32, nt=True) != tag) | (hx.gload(gps[2] + i64(12), I32, nt=True) != tag)).select(I32(1), I32(0))
+            pg = [hx.peek(gp + i64(8 * h)) for gp in gps for h in range(2)]
+            bad_ = I32(0)
+            for k in range_constexpr(6):
+                bad_ = bad_ | (pg[k][1] != tag).select(I32(1), I32(0))
         hx._stop_mark((bad_ != 0) & (st_ == fx.Int32(0)))
-        gots = [hx.gload(gp, I32, 4, nt=True) for gp in gps]
-        for got in gots:
-            for q in range_constexpr(3):
-                sl[q] = sl[q] + (got[q] << 16).bitcast(F32)
-                sh[q] = sh[q] + (got[q] & I32(-65536)).bitcast(F32)
-        for q in range_constexpr(3):
+        for o in range_constexpr(3):
+            for q in range_constexpr(2):
+                sl[q] = sl[q] + (pg[o * 2 + q][0] << 16).bitcast(F32)
+                sh[q] = sh[q] + (pg[o * 2 + q][0] & I32(-65536)).bitcast(F32)
+        for q in range_constexpr(2):
             wq = sl[q].to(BF16).bitcast(fx.Int16).to(I32) & 0xFFFF | (sh[q].to(BF16).bitcast(fx.Int16).to(I32) << 16)
-            hx.gstore(c["tpout"] + i64(b * TPG * 3 + t * 3 + q) * 4, wq)
-            wi = t * 3 + q
+            wi = t * 2 + q
             col = (b // 4) * 80 + (b % 4) * 20 + 2 * (wi % 10)
-            if fx.const_expr(NWD % 3 == 0 or q == 0):
+            if fx.const_expr(NWD % 2 == 0 or q == 0):
+                hx.gstore(c["tpout"] + i64(b * TPG * 3 + wi) * 4, wq)
                 hx.stx_dev(c["ytgt"] + (i64(wi // 10) * HID + i64(col)) * 2, wq)
             else:
-                if wi < NWD:   # the last thread's padding words: no row
+                if wi < NWD:   # the last thread's padding word: no row
+                    hx.gstore(c["tpout"] + i64(b * TPG * 3 + wi) * 4, wq)
                     hx.stx_dev(c["ytgt"] + (i64(wi // 10) * HID + i64(col)) * 2, wq)
 
 
@@ -1204,7 +1211,7 @@ def tp_allreduce(c, region, tag):
 # F3   wo_b: CTA b < NOWN = 160 owns hidden cols 32 b .. 32 b + 31 over the full K = 2048: wave w = (N tile, K quarter),
 #      weights in VGPRs before the wait for the 32 fold flags; the quarters summed ((q0 + q1) + (q2 + q3)) -> f32 [r][32]
 #      at LDS 0 (the TP payload) and `out`.
-# TP3  the TP all-reduce of that [r][32] slice (tagged 16-byte pushes, as attention.tp_allreduce, 16 words a row).
+# TP3  the TP all-reduce of that [r][32] slice (LL pairs {d0, tag, d1, tag}, as attention.tp_allreduce, 16 words a row).
 
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
@@ -1255,46 +1262,51 @@ def stage_F3(c):
 
 @ASTRewriter.transform
 def tp3(c, region, tag):
-    """attention.tp_allreduce for the [r][32] slice of owner b < NOWN (16 bf16-pair words a row, 3 a 16-byte push)."""
+    """attention.tp_allreduce for the [r][32] slice of owner b < NOWN (16 bf16-pair words a row, 2 an LL pair)."""
     t, b, TR = c["t"], c["b"], c["TR"]
     TP_TG = 40960
     WPR = OWC // 2
     NWD = TR * WPR
-    TPG = (NWD + 2) // 3
+    TPG = (NWD + 2) // 3       # (tpout's layout: TPG * 3 words a CTA)
+    TPG2 = (NWD + 1) // 2      # (LL words: 2 bf16-pair words a thread)
     rank = c["rank"]
-    if (b < NOWN) & (t < TPG):
+    if (b < NOWN) & (t < TPG2):
         lo, hi, wv = [], [], []
-        for k in range_constexpr(3):
-            wi = fx.min(t * 3 + k, I32(NWD - 1))
+        for k in range_constexpr(2):
+            wi = fx.min(t * 2 + k, I32(NWD - 1))
             lo.append(hx.lload(c["sm"] + ((wi // WPR) * OWC + 2 * (wi % WPR)) * 4, F32))
             hi.append(hx.lload(c["sm"] + ((wi // WPR) * OWC + 2 * (wi % WPR) + 1) * 4, F32))
             wv.append(lo[k].to(BF16).bitcast(fx.Int16).to(I32) & 0xFFFF | (hi[k].to(BF16).bitcast(fx.Int16).to(I32) << 16))
-        v = fx.Vector.from_elements([wv[0], wv[1], wv[2], I32(tag)], I32)
         for o in range_constexpr(4):
             if o != rank:
-                hx.gstore(c["recv"][o] + (i64((region * 4) * TP_TG) + i64(rank * TP_TG) + i64(b * TPG + t)) * 16, v, nt=True)
-        sl = [lo[k].to(BF16).to(F32) for k in range(3)]
-        sh = [hi[k].to(BF16).to(F32) for k in range(3)]
-        gps = [c["recv"][rank] + (i64((region * 4) * TP_TG) + i64(o * TP_TG) + i64(b * TPG + t)) * 16 for o in range(4) if o != rank]
+                hx.put2(c["recv"][o] + (i64((region * 4) * TP_TG) + i64(rank * TP_TG) + i64(b * TPG2 + t)) * 16, wv[0], wv[1], tag)
+        sl = [lo[k].to(BF16).to(F32) for k in range(2)]
+        sh = [hi[k].to(BF16).to(F32) for k in range(2)]
+        gps = [c["recv"][rank] + (i64((region * 4) * TP_TG) + i64(o * TP_TG) + i64(b * TPG2 + t)) * 16 for o in range(4) if o != rank]
         t0 = hx.clock()
-        bad_ = ((hx.gload(gps[0] + i64(12), I32, nt=True) != tag) | (hx.gload(gps[1] + i64(12), I32, nt=True) != tag) | (hx.gload(gps[2] + i64(12), I32, nt=True) != tag)).select(I32(1), I32(0))
+        pg = [hx.peek(gp + i64(8 * h)) for gp in gps for h in range(2)]
+        bad_ = I32(0)
+        for k in range_constexpr(6):
+            bad_ = bad_ | (pg[k][1] != tag).select(I32(1), I32(0))
         st_ = I32(0)
         while (bad_ != 0) & (hx.clock() - t0 < fx.Int64(hx.POLL_TICKS)) & (st_ == fx.Int32(0)):
             hx.s_sleep(0)
             st_ = hx._stop_due(st_, t0)
-            bad_ = ((hx.gload(gps[0] + i64(12), I32, nt=True) != tag) | (hx.gload(gps[1] + i64(12), I32, nt=True) != tag) | (hx.gload(gps[2] + i64(12), I32, nt=True) != tag)).select(I32(1), I32(0))
+            pg = [hx.peek(gp + i64(8 * h)) for gp in gps for h in range(2)]
+            bad_ = I32(0)
+            for k in range_constexpr(6):
+                bad_ = bad_ | (pg[k][1] != tag).select(I32(1), I32(0))
         hx._stop_mark((bad_ != 0) & (st_ == fx.Int32(0)))
-        gots = [hx.gload(gp, I32, 4, nt=True) for gp in gps]
-        for got in gots:
-            for q in range_constexpr(3):
-                sl[q] = sl[q] + (got[q] << 16).bitcast(F32)
-                sh[q] = sh[q] + (got[q] & I32(-65536)).bitcast(F32)
-        for q in range_constexpr(3):
+        for o in range_constexpr(3):
+            for q in range_constexpr(2):
+                sl[q] = sl[q] + (pg[o * 2 + q][0] << 16).bitcast(F32)
+                sh[q] = sh[q] + (pg[o * 2 + q][0] & I32(-65536)).bitcast(F32)
+        for q in range_constexpr(2):
             wq = sl[q].to(BF16).bitcast(fx.Int16).to(I32) & 0xFFFF | (sh[q].to(BF16).bitcast(fx.Int16).to(I32) << 16)
-            wi = t * 3 + q
+            wi = t * 2 + q
             col = b * OWC + 2 * (wi % WPR)
             if wi < NWD:
-                hx.gstore(c["tpout"] + i64(b * TPG * 3 + t * 3 + q) * 4, wq)
+                hx.gstore(c["tpout"] + i64(b * TPG * 3 + wi) * 4, wq)
                 hx.stx_dev(c["ytgt"] + (i64(wi // WPR) * HID + i64(col)) * 2, wq)
 
 
