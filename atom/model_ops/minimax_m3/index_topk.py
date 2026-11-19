@@ -28,7 +28,14 @@ import triton
 import triton.language as tl
 from aiter.jit.utils.chip_info import get_gfx
 
-from atom.model_ops.minimax_m3.nvfp4_kernels.nvfp4 import nvfp4_load_even_odd
+from atom.model_ops.minimax_m3.nvfp4_kernels.nvfp4 import (
+    NVFP4_SCALED_DOT,
+    nvfp4_load_even_odd,
+    nvfp4_load_packed,
+    nvfp4_query_e4m3,
+    nvfp4_scaled_dot,
+    nvfp4_split_query,
+)
 
 try:
     # aiter's chunk-narrowing per-row selector: same forced-block pins and tie
@@ -66,6 +73,26 @@ SCORE_NUM_STAGES = 3
 DECODE_SCORE_NUM_STAGES = 3
 
 
+def _check_fp4_index(payload: torch.Tensor, scale: torch.Tensor, head_dim: int):
+    """The FP4 index planes the scorers read: rows contiguous (their strides are
+    compile-time constants there), head_dim 128, pages 16 B aligned."""
+    if not (
+        head_dim == 128
+        and payload.dtype == torch.uint8
+        and scale.dtype == torch.uint8
+        and payload.shape[1:] == (SPARSE_BLOCK_SIZE, head_dim // 2)
+        and scale.shape == (payload.shape[0], SPARSE_BLOCK_SIZE, head_dim // 16)
+        and payload.stride()[1:] == (head_dim // 2, 1)
+        and scale.stride()[1:] == (head_dim // 16, 1)
+        and payload.stride(0) % 16 == 0
+        and scale.stride(0) % 16 == 0
+    ):
+        raise ValueError(
+            "FP4 index cache must be uint8 [pages, 128, 64] + [pages, 128, 8] "
+            "with contiguous rows and 16 B aligned pages"
+        )
+
+
 @functools.cache
 def _prefill_score_launch_config(dtype: torch.dtype) -> tuple[int, int]:
     """Return (warps, stages) without changing the tuned gfx950 path."""
@@ -84,9 +111,9 @@ def _prefill_score_launch_config(dtype: torch.dtype) -> tuple[int, int]:
     if dtype in fp8_dtypes:
         return 4, 1
     if dtype == torch.uint8:
-        # The FP4 index payload: its integer e2m1 decode at three stages builds
-        # to 512 VGPRs with 127 spilled (offline gfx1250 build); one stage is
-        # 320 and none spilled.
+        # The FP4 index payload, read through the scaled WMMA
+        # (nvfp4_scaled_dot): one stage, deeper pipelining only holds more
+        # tiles in registers.
         return 8, 1
     return 8, SCORE_NUM_STAGES
 
@@ -478,7 +505,12 @@ def _index_block_score_kernel(
         mask=(_q_ptrs_0[:, None] < (q_len)),
         other=0.0,
     )
-    if IS_FP4:
+    if IS_FP4 and NVFP4_SCALED_DOT:
+        # gfx1250: the packed rows go to the scaled WMMA against the query in
+        # E4M3 (the FP8 cache's prefill rounds its query the same way).
+        q_e = nvfp4_query_e4m3(q)
+        q_o = q_e
+    elif IS_FP4:
         # Even / odd head dims as fp16, matching the FP4 cache's de-interleaved
         # load: the score is the even-dim dot plus the odd-dim dot.
         h2 = tl.arange(0, head_dim // 2) * 2
@@ -522,7 +554,17 @@ def _index_block_score_kernel(
         # we don't need masked load for K, because KV cache ensures
         # allocation is multiple of BLOCK_SIZE_K.
         # for tokens beyond seqlen, they will be masked in qk later.
-        if IS_FP4:
+        if IS_FP4 and NVFP4_SCALED_DOT:
+            payload, kscale = nvfp4_load_packed(
+                ik_cache_ptr,
+                iks_ptr,
+                page * stride_ik_blk,
+                page * stride_iks_blk,
+                off_k,
+                head_dim,
+            )
+            qk = nvfp4_scaled_dot(q_e, None, None, payload, kscale) * sm_scale_log2e
+        elif IS_FP4:
             k_e, k_o = nvfp4_load_even_odd(
                 ik_cache_ptr,
                 iks_ptr,
@@ -1152,7 +1194,11 @@ def _decode_index_score_tiled_kernel(
         mask=d_mask[:, None] & n_valid[None, :],
         other=0.0,
     )
-    if IS_FP4:
+    if IS_FP4 and NVFP4_SCALED_DOT:
+        # gfx1250: the packed rows to the scaled WMMA, the query ([N, D]) in two
+        # E4M3 terms; the score transposed back.
+        q_hi, q_lo, q_lo_scale = nvfp4_split_query(tl.trans(q))
+    elif IS_FP4:
         # [D/2, N] even / odd head dims as fp16 (see the prefill scorer).
         h2 = tl.arange(0, BLOCK_SIZE_D // 2) * 2
         q_base = q_ptr + row[None, :] * stride_q_n + head[None, :] * stride_q_h
@@ -1173,7 +1219,21 @@ def _decode_index_score_tiled_kernel(
 
     for blk in tl.range(chunk_start, chunk_end):
         page = tl.load(bt_row + blk).to(tl.int64)
-        if IS_FP4:
+        if IS_FP4 and NVFP4_SCALED_DOT:
+            # FP4 is gated on head_dim == BLOCK_SIZE_D == 128 (no d mask needed).
+            payload, kscale = nvfp4_load_packed(
+                ik_cache_ptr,
+                iks_ptr,
+                page * stride_ik_blk,
+                page * stride_iks_blk,
+                off_k,
+                BLOCK_SIZE_D,
+            )
+            qk = (
+                tl.trans(nvfp4_scaled_dot(q_hi, q_lo, q_lo_scale, payload, kscale))
+                * sm_scale_log2e
+            )
+        elif IS_FP4:
             # FP4 is gated on head_dim == BLOCK_SIZE_D == 128 (no d mask needed).
             k_e, k_o = nvfp4_load_even_odd(
                 ik_cache_ptr,
@@ -1295,6 +1355,8 @@ def minimax_m3_index_topk(
     )
     is_fp4 = index_kv_scale is not None
     iks = index_kv_scale if is_fp4 else index_kv_cache
+    if is_fp4:
+        _check_fp4_index(index_kv_cache, index_kv_scale, head_dim)
     _index_block_score_kernel[grid_score](
         idx_q,
         index_kv_cache,
@@ -1448,6 +1510,8 @@ def minimax_m3_index_topk_decode(
     num_score_chunks = _decode_score_chunks(batch, max_block)
     is_fp4 = index_kv_scale is not None
     iks = index_kv_scale if is_fp4 else index_kv_cache
+    if is_fp4:
+        _check_fp4_index(index_kv_cache, index_kv_scale, head_dim)
     _decode_index_score_tiled_kernel[(num_score_chunks, batch)](
         idx_q,
         index_kv_cache,
@@ -1474,8 +1538,8 @@ def minimax_m3_index_topk_decode(
         MAX_Q=max_query_len,
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
         IS_FP4=is_fp4,
-        # The FP4 decode at DECODE_SCORE_NUM_STAGES builds to 667 VGPRs on
-        # gfx1250 (offline build, MAX_Q 8), at one stage 219.
+        # FP4 on gfx1250 at one stage: deeper pipelining only holds more tiles
+        # in registers.
         num_stages=(
             1 if is_fp4 and get_gfx() == "gfx1250" else DECODE_SCORE_NUM_STAGES
         ),

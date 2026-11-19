@@ -1893,6 +1893,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             self.indexer_cp_world,
             max_query_len,
             self.scale,
+            index_scale=self.index_scale,
         )
         # Forced blocks are pinned in BOTH passes on purpose: one that lost its
         # owner shard's top-k would never arrive at the merge to be pinned.

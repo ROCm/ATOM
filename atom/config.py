@@ -1967,6 +1967,24 @@ def m3_fp4_cache_unsupported_reason(
     return None
 
 
+def indexer_cp_fp4_index_unsupported_reason(gfx: str) -> str | None:
+    """Why the MiniMax-M3 indexer-CP scorer cannot read the FP4 index cache here,
+    or None.
+
+    The CP context scorer reads FP4 index rows through gfx1250's scaled WMMA
+    (``nvfp4_scaled_dot``), the read of the gfx1250 TP decode scorer, so its
+    selection is theirs. gfx950's TP scorers read the rows as even / odd halves
+    (and score with the fused verify top-k under NVFP4 K/V), which the CP scorer
+    does not model.
+    """
+    if gfx != "gfx1250":
+        return (
+            "--index-cache-dtype fp4 with the CP scorer is gfx1250-only "
+            f"(scaled-WMMA FP4 reads), not {gfx}"
+        )
+    return None
+
+
 def indexer_cp_unsupported_reason(
     arches,
     tp_size: int,
@@ -2708,10 +2726,9 @@ class Config:
                 is_plugin_mode(),
             )
             if indexer_cp_off is None and self.index_cache_dtype == "fp4":
-                # The CP context scorer reads FP8/BF16 index keys only.
-                indexer_cp_off = (
-                    "--index-cache-dtype fp4 is not supported by the CP scorer"
-                )
+                from aiter.jit.utils.chip_info import get_gfx
+
+                indexer_cp_off = indexer_cp_fp4_index_unsupported_reason(get_gfx())
             if indexer_cp_off is not None:
                 logger.warning(
                     "dcp_config.indexer_dcp_only disabled: %s.", indexer_cp_off

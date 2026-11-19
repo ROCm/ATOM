@@ -200,7 +200,12 @@ def test_fp4_scorers_select_like_bf16():
     bt2 = torch.arange(64, device=DEV, dtype=torch.int32).view(2, 32)
     q2 = torch.randn(1000, 1, D, device=DEV, dtype=torch.bfloat16)
     kw2 = dict(max_query_len=700, max_seq_len=4000, sm_scale=D**-0.5, **common)
-    ref = minimax_m3_index_topk(q2, bf16, bt2, cu, seq2, seq2 - qlens, **kw2)[0]
+    # gfx1250's FP4 prefill reads through the scaled WMMA against the E4M3 query
+    # (as the FP8 cache's prefill rounds it): the BF16 reference gets that query.
+    q2_ref = (
+        q2.to(torch.float8_e4m3fn).to(torch.bfloat16) if _gfx() == "gfx1250" else q2
+    )
+    ref = minimax_m3_index_topk(q2_ref, bf16, bt2, cu, seq2, seq2 - qlens, **kw2)[0]
     got = minimax_m3_index_topk(
         q2, payload, bt2, cu, seq2, seq2 - qlens, index_kv_scale=scale, **kw2
     )[0]

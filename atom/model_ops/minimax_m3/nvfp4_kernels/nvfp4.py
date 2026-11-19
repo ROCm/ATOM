@@ -122,3 +122,88 @@ def nvfp4_load_even_odd(
     even, odd = _fp4x2_to_f16(packed.to(tl.int32))
     scale = scale_bytes.to(tl.float8e4nv, bitcast=True).to(tl.float16)
     return even * scale, odd * scale
+
+
+# ---------------------------------------------------------------------------
+# The scaled-WMMA read (gfx1250): the packed rows go to the matrix core as they
+# are -- e2m1 codes with their E4M3 per-16 scales, one
+# v_wmma_scale16_f32_16x16x128_f8f6f4 over the whole 128-dim key -- so nothing
+# is decoded in registers. The other operand must be an f8f6f4 format: the
+# query in E4M3.
+# ---------------------------------------------------------------------------
+# Whether the FP4 index scorers read through the scaled WMMA (gfx1250).
+NVFP4_SCALED_DOT = tl.constexpr(get_gfx() == "gfx1250")
+# E8M0 2^-4: the scale of the query's low part (`nvfp4_split_query`).
+_Q_LO_E8M0 = tl.constexpr(127 - 4)
+# E4M3's largest finite value: the query is clamped to it before rounding.
+_E4M3_MAX = tl.constexpr(448.0)
+
+
+@triton.jit
+def nvfp4_load_packed(
+    payload_ptr,
+    scale_ptr,
+    payload_page_off,
+    scale_page_off,
+    rows,
+    D: tl.constexpr,
+):
+    """Rows ``rows`` of one page as stored: payload uint8 ``[n, D // 2]`` (code
+    2j in the low nibble of byte j) and E4M3 scales ``[n, D // 16]``."""
+    HALF: tl.constexpr = D // 2
+    G: tl.constexpr = D // 16
+    payload = tl.load(
+        payload_ptr
+        + payload_page_off
+        + rows[:, None] * HALF
+        + tl.arange(0, HALF)[None, :]
+    )
+    scale = tl.load(
+        scale_ptr + scale_page_off + rows[:, None] * G + tl.arange(0, G)[None, :]
+    )
+    return payload, scale.to(tl.float8e4nv, bitcast=True)
+
+
+@triton.jit
+def nvfp4_split_query(q):
+    """The query ``[N, D]`` as two E4M3 terms, q ~= hi + lo * 2^-4: hi = e4m3(q),
+    lo = e4m3((q - hi) * 2^4). Together about 8 significant bits (bf16 has 8),
+    so a two-term scaled dot scores nearly as the bf16 query does; q is clamped
+    to E4M3's range first (an index query is far inside it). Returns (hi, lo,
+    lo's E8M0 scale ``[N, D // 16]``)."""
+    N: tl.constexpr = q.shape[0]
+    D: tl.constexpr = q.shape[1]
+    hi = nvfp4_query_e4m3(q)
+    q32 = tl.clamp(q.to(tl.float32), -_E4M3_MAX, _E4M3_MAX)
+    lo = ((q32 - hi.to(tl.float32)) * 16.0).to(tl.float8e4nv)
+    lo_scale = tl.full((N, D // 16), _Q_LO_E8M0, tl.uint8)
+    return hi, lo, lo_scale
+
+
+@triton.jit
+def nvfp4_query_e4m3(q):
+    """The query rounded to E4M3 (clamped to its range first)."""
+    return tl.clamp(q.to(tl.float32), -_E4M3_MAX, _E4M3_MAX).to(tl.float8e4nv)
+
+
+@triton.jit
+def nvfp4_scaled_dot(q_hi, q_lo, q_lo_scale, payload, scale):
+    """``[N, n]`` fp32 = (hi + lo * 2^-4) . dequant(rows)^T, the rows exact: two
+    scaled dots into one accumulator, hi first. ``q_lo`` None: hi alone (the
+    prefill read, whose FP8 twin rounds the query to E4M3 the same way)."""
+    k = tl.trans(payload)
+    acc = tl.dot_scaled(q_hi, None, "e4m3", k, scale, "e2m1")
+    if q_lo is not None:
+        acc = tl.dot_scaled(q_lo, q_lo_scale, "e4m3", k, scale, "e2m1", acc=acc)
+    return acc
+
+
+@triton.jit
+def nvfp4_block_max(dot, block_start, offs, cutoff, scale):
+    """``[N]`` max over one block's key positions ``block_start + offs`` of
+    ``dot`` ``[N, len(offs)]``, causal (position < the row's ``cutoff``), times
+    ``scale`` > 0 -- after the max: rounding is monotone, so max(x) * s rounds to
+    max(x * s), the same bits as scaling every product, one multiply a row
+    instead of one an element."""
+    dot = tl.where((block_start + offs)[None, :] < cutoff[:, None], dot, float("-inf"))
+    return tl.max(dot, axis=1) * scale

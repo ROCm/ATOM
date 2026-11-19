@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from atom.config import (
+    indexer_cp_fp4_index_unsupported_reason,
     m3_fp4_cache_unsupported_reason,
     m3_reuses_index_topk,
 )
@@ -46,6 +47,17 @@ def test_refusal(gfx, index_fp4, kv_nvfp4, tp, reuses_topk, refused):
         assert reason is None
     else:
         assert refused in reason
+
+
+@pytest.mark.parametrize(
+    "gfx, refused", [("gfx1250", False), ("gfx950", True), ("gfx942", True)]
+)
+def test_indexer_cp_reads_the_fp4_index_on_gfx1250_only(gfx, refused):
+    # The CP scorer reads FP4 rows through the scaled WMMA, the gfx1250 TP read.
+    reason = indexer_cp_fp4_index_unsupported_reason(gfx)
+    assert (reason is not None) is refused
+    if refused:
+        assert gfx in reason and "gfx1250" in reason
 
 
 @pytest.mark.parametrize("index_fp4, kv_nvfp4", [(True, False), (False, True)])
