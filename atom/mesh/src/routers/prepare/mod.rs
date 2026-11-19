@@ -21,6 +21,7 @@ use crate::{
 pub(crate) mod chat_template;
 pub mod generation_payload;
 pub(crate) mod parser_factory_lookup;
+pub(crate) mod prefix_tokens;
 pub mod response_context;
 pub(crate) mod stop_decoder_builder;
 pub(crate) mod thread_tokenizer;
