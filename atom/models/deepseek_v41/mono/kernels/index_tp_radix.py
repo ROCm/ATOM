@@ -59,12 +59,6 @@ def histogram_pairs(rows, world):
     return len(tp.KINDS) * rows * DEFAULT_RADIX.passes * world * DEFAULT_RADIX.bins
 
 
-def row_hist_words(rows):
-    return (
-        len(tp.KINDS) * rows * DEFAULT_RADIX.passes * k3.ROW_COPIES * DEFAULT_RADIX.bins
-    )
-
-
 @traced
 def run_splits(c, kind, base=0):
     """Choose a segment size that keeps every participating CTA resident."""

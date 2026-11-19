@@ -167,15 +167,19 @@ class V41MonoDecodeRunner:
         index_fp4: bool,
         *,
         standalone_indexer: bool = True,
+        indexer_workspace=None,
     ) -> None:
         # the indexer's widest bound: a ratio-1 layer sees every position. No
         # token's bound may exceed it (positions stay below max_model_len): its
         # selection would never reach a final level nor publish IRDY
         self.index_bound_max = ip.cdiv(max_model_len, ip.CHUNK) * ip.CHUNK
         self.index_fp4 = index_fp4
+        self.indexer_workspace = indexer_workspace
         self.indexer_apart = (
             standalone_indexer
-            and indexer_enabled(index_fp4)
+            and indexer_enabled(
+                index_fp4, get_current_atom_config().tensor_parallel_size
+            )
             and not get_current_atom_config().enable_dp_attention
         )
         self.index_layout = (
@@ -457,15 +461,14 @@ class V41MonoDecodeRunner:
         )
         indexer_local = (
             ki.build_indexer(ki.reindex_build(self._indexer_key(s)))
-            if indexer is not None and getattr(self, "indexer_has_reindex", False)
+            if indexer is not None and self.indexer_has_reindex
             else None
         )
         indexer_full = (
             ki.build_indexer(
                 ki.full_build(self._indexer_key(s), self.indexer_full_ratio)
             )
-            if indexer is not None
-            and getattr(self, "indexer_full_ratio", None) is not None
+            if indexer is not None and self.indexer_full_ratio is not None
             else None
         )
         if self.split_k2:
@@ -525,9 +528,9 @@ class V41MonoDecodeRunner:
         kernels = [(launcher, k1.ABI) for launcher in build.launchers.values()]
         if build.indexer is not None:
             kernels.append((build.indexer, ki.ABI))
-        if getattr(build, "indexer_local", None) is not None:
+        if build.indexer_local is not None:
             kernels.append((build.indexer_local, ki.ABI))
-        if getattr(build, "indexer_full", None) is not None:
+        if build.indexer_full is not None:
             kernels.append((build.indexer_full, ki.ABI))
         if build.layer_post is not None:
             return kernels + [(build.layer_post, k2.ABI)]
@@ -579,12 +582,19 @@ class V41MonoDecodeRunner:
         # and each selection's bound this step (its pool rows and the candidate
         # blocks live in the peer buffer: ``_place_index_outputs``)
         width = self.index_bound_max
-        self.ilog = torch.empty(s, width, device=dev, dtype=f32)
-        self.ibmax = torch.empty(s, ip.blocks(width), device=dev, dtype=f32)
-        self.isel = {
-            layer: torch.empty(s, ip.TOPK, device=dev, dtype=torch.int32)
-            for layer in self.selecting
-        }
+        workspace = self.indexer_workspace
+        if workspace is None:
+            self.ilog = torch.empty(s, width, device=dev, dtype=f32)
+            self.ibmax = torch.empty(s, ip.blocks(width), device=dev, dtype=f32)
+            self.isel = {
+                layer: torch.empty(s, ip.TOPK, device=dev, dtype=torch.int32)
+                for layer in self.selecting
+            }
+        else:
+            self.ilog, self.ibmax = workspace.ilog[:s], workspace.ibmax[:s]
+            self.isel = {
+                layer: workspace.selected[layer][:s] for layer in self.selecting
+            }
         self.no_bound = torch.zeros(s, device=dev, dtype=torch.int32)
         # the FP4 score stage's FULL-layer tasks a ratio, each step's written
         # by ``write_step_meta``
@@ -616,7 +626,13 @@ class V41MonoDecodeRunner:
             self.iq = torch.empty(s, heads, dim, device=dev, dtype=torch.float8_e4m3fn)
             self.iq_scale = torch.empty(s, heads, device=dev, dtype=f32)
         self.iw = torch.empty(s, heads, device=dev, dtype=f32)
-        if self.indexer_apart:
+        if self.indexer_apart and workspace is not None:
+            self.iq, self.iq_scale, self.iw = (
+                workspace.iq[:s],
+                workspace.iqs[:s],
+                workspace.iw[:s],
+            )
+        elif self.indexer_apart:
             # The standalone launch hands these rows between XCDs before the
             # launch completes; use the same uncached memory as its mailboxes.
             self.iq = uncached_bytes(s * heads * dim // 2, dev).view(s, heads, dim // 2)
@@ -637,30 +653,34 @@ class V41MonoDecodeRunner:
             self.diag_off = nbytes
             nbytes += DIAG_BYTES
         self.scratch = uncached_bytes(nbytes, dev)
-        self.index_scratch = (
-            uncached_bytes(ki.scratch_bytes(self._indexer_key(s)), dev)
-            if self.indexer_apart and self.index_bound_max
-            else None
-        )
-        self.local_index_scratch = (
-            uncached_bytes(
-                ki.scratch_bytes(ki.reindex_build(self._indexer_key(s))), dev
+        if workspace is not None:
+            self.index_scratch = workspace.scratch
+            self.local_index_scratch = workspace.local_scratch
+            self.full_index_scratch = workspace.full_scratch
+        else:
+            self.index_scratch = (
+                uncached_bytes(ki.scratch_bytes(self._indexer_key(s)), dev)
+                if self.indexer_apart and self.index_bound_max
+                else None
             )
-            if self.index_scratch is not None
-            and getattr(self, "indexer_has_reindex", False)
-            else None
-        )
-        self.full_index_scratch = (
-            uncached_bytes(
-                ki.scratch_bytes(
-                    ki.full_build(self._indexer_key(s), self.indexer_full_ratio)
-                ),
-                dev,
+            self.local_index_scratch = (
+                uncached_bytes(
+                    ki.scratch_bytes(ki.reindex_build(self._indexer_key(s))), dev
+                )
+                if self.index_scratch is not None and self.indexer_has_reindex
+                else None
             )
-            if self.index_scratch is not None
-            and getattr(self, "indexer_full_ratio", None) is not None
-            else None
-        )
+            self.full_index_scratch = (
+                uncached_bytes(
+                    ki.scratch_bytes(
+                        ki.full_build(self._indexer_key(s), self.indexer_full_ratio)
+                    ),
+                    dev,
+                )
+                if self.index_scratch is not None
+                and self.indexer_full_ratio is not None
+                else None
+            )
         self.ix_meta = torch.empty(s, 4, device=dev, dtype=torch.int32)
 
     def _index_reset_buffers(self, rows):
@@ -671,7 +691,7 @@ class V41MonoDecodeRunner:
             (key, self.index_scratch),
             (ki.reindex_build(key), self.local_index_scratch),
         ]
-        if getattr(self, "full_index_scratch", None) is not None:
+        if self.full_index_scratch is not None:
             builds.append(
                 (ki.full_build(key, self.indexer_full_ratio), self.full_index_scratch)
             )
@@ -719,7 +739,7 @@ class V41MonoDecodeRunner:
             index_resets,
             ix_meta=self.ix_meta if self._indexer_key(rows).world > 1 else None,
             tp_world=self._indexer_key(rows).world,
-            tp_rank=self.rank,
+            tp_rank=self.rank if self._indexer_key(rows).world > 1 else 0,
             split_reset_buffers=split_index_resets,
         )
         state = SinglePassHCState.from_embeddings(hidden, model.config.hc_mult)
@@ -998,13 +1018,12 @@ class V41MonoDecodeRunner:
         selection.pop("iact")
         geometry = cache.geometry
         local = (
-            spec.candidate_source is not None
-            and getattr(self.build, "indexer_local", None) is not None
+            spec.candidate_source is not None and self.build.indexer_local is not None
         )
         full = (
             spec.candidate_source is None
             and not spec.produces_candidates
-            and getattr(self.build, "indexer_full", None) is not None
+            and self.build.indexer_full is not None
         )
         scratch = (
             self.local_index_scratch

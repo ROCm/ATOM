@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from atom.models.deepseek_v41.mono import index_plan as ip
 from atom.mono.dsa_indexer.selection_plan import (
     DEFAULT_RADIX,
+    ROW_COPIES,
     SHORT_VERIFY_CTX,
     split_request_keys,
 )
@@ -141,3 +142,7 @@ def reference_work(bounds, batch_ids, world, rank, *, force_local=False):
             RowWork(kind, request % world, first, count, needs_scores(bound, count))
         )
     return work
+
+
+def row_hist_words(rows):
+    return len(KINDS) * rows * DEFAULT_RADIX.passes * ROW_COPIES * DEFAULT_RADIX.bins

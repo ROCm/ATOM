@@ -79,15 +79,8 @@ class IndexerBinding:
             qlen=qlen,
             score_blocks=2 * BLOCKS if dual else BLOCKS,
             short_gemm=self.short_gemm,
-            short_decode=(
-                self.replicated
-                and self.world == 8
-                and qlen == 1
-                and rows <= kix.MAX_LEGACY_TOKENS
-                and self.max_ctx <= SPLIT_MIN
-                and self.shape.fp4
-                and self.shape.q_lora == 1536
-                and not self.shape.rope_dim
+            short_decode=kix.short_decode_enabled(
+                self.shape, rows, self.world, self.max_ctx, self.replicated, qlen
             ),
         )
 

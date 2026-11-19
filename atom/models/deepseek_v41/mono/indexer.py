@@ -11,11 +11,14 @@ import logging
 
 import torch
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
-from torch import nn
 
 from atom.model_ops.deepseek_v41.index_plane import FP4_MFMA
 from atom.models.deepseek_v41.mono import index_plan as ip
 from atom.models.deepseek_v41.mono import index_tp_plan as tp
+from atom.models.deepseek_v41.mono.indexer_dispatch import (
+    MonoIndexerModel,  # noqa: F401 - public compatibility export
+    step_supported,  # noqa: F401 - public compatibility export
+)
 from atom.models.deepseek_v41.mono.kernels import indexer as kernel
 from atom.models.deepseek_v41.mono.kernels.index_query import QS_BYTES
 from atom.models.deepseek_v41.mono.step_meta import KMETA, write_step_meta
@@ -23,11 +26,9 @@ from atom.mono.plan.execution import BLOCKS
 from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
 from atom.mono.runtime.lifecycle import owned_peer_buffer
 from atom.mono.runtime.mailboxes import StepMailboxes
-from atom.mono.runtime.route import LazyRunner
 from atom.mono.runtime.step_begin import FENCE_BYTES
 from atom.mono.runtime.uncached import uncached_bytes
 from atom.mono.runtime.widths import WidthBuilds
-from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
 
@@ -36,8 +37,17 @@ class MonoIndexer:
     max_rows = kernel.MAX_ROWS
 
     def __init__(
-        self, model, max_model_len, fp4, layout, group=None, *, replicated=True
+        self,
+        model,
+        max_model_len,
+        fp4,
+        layout,
+        group=None,
+        *,
+        replicated=True,
+        workspace=None,
     ):
+        self.workspace = workspace
         self.model, self.fp4 = model, fp4
         self.layout = layout if fp4 else "fp8"
         self.bound_max = ip.cdiv(max_model_len, ip.CHUNK) * ip.CHUNK
@@ -164,15 +174,20 @@ class MonoIndexer:
         ):
             raise MonoUnsupported("V4.1 indexer RoPE must be on this rank's GPU")
         s, width = self.max_rows, self.bound_max
-        self.scratch = uncached_bytes(kernel.scratch_bytes(self._key(s)), dev)
-        if self.fp4 and any(
-            block.attn.indexer is not None
-            and block.attn.indexer.spec.candidate_source is not None
-            for block in self.model.layers
-        ):
-            self.local_scratch = uncached_bytes(
-                kernel.scratch_bytes(kernel.reindex_build(self._key(s))), dev
-            )
+        workspace = self.workspace
+        if workspace is not None:
+            self.scratch = workspace.scratch
+            self.local_scratch = workspace.local_scratch
+        else:
+            self.scratch = uncached_bytes(kernel.scratch_bytes(self._key(s)), dev)
+            if self.fp4 and any(
+                block.attn.indexer is not None
+                and block.attn.indexer.spec.candidate_source is not None
+                for block in self.model.layers
+            ):
+                self.local_scratch = uncached_bytes(
+                    kernel.scratch_bytes(kernel.reindex_build(self._key(s))), dev
+                )
         self.full_ratio = (
             min(
                 (
@@ -187,32 +202,46 @@ class MonoIndexer:
             if self.fp4
             else None
         )
-        if self.full_ratio is not None:
+        if workspace is not None:
+            self.full_scratch = workspace.full_scratch
+        elif self.full_ratio is not None:
             self.full_scratch = uncached_bytes(
                 kernel.scratch_bytes(self._full_key(s)), dev
             )
         # Projection and scoring exchange these plain rows within one launch
         # across XCDs. As with the tagged scratch, keep them uncached: draining
         # the producer's stores alone does not invalidate a consumer's cache.
-        self.iq = (
-            uncached_bytes(s * ip.HEADS * ip.DIM // (2 if self.fp4 else 1), dev)
-            .view(torch.uint8 if self.fp4 else torch.float8_e4m3fn)
-            .view(s, ip.HEADS, ip.DIM // (2 if self.fp4 else 1))
-        )
-        self.iqs = (
-            uncached_bytes(s * (QS_BYTES if self.fp4 else ip.HEADS * 4), dev)
-            .view(torch.uint8 if self.fp4 else torch.float32)
-            .view(s, QS_BYTES if self.fp4 else ip.HEADS)
-        )
-        self.iw = (
-            uncached_bytes(s * ip.HEADS * 4, dev).view(torch.float32).view(s, ip.HEADS)
-        )
-        self.ilog = torch.empty(s, width, device=dev, dtype=torch.float32)
-        self.ibmax = torch.empty(s, ip.blocks(width), device=dev, dtype=torch.float32)
-        self.selected = {
-            i: torch.empty(s, ip.TOPK, device=dev, dtype=torch.int32)
-            for i in self.weights
-        }
+        if workspace is not None:
+            self.iq, self.iqs, self.iw = workspace.iq, workspace.iqs, workspace.iw
+            self.ilog, self.ibmax, self.selected = (
+                workspace.ilog,
+                workspace.ibmax,
+                workspace.selected,
+            )
+        else:
+            self.iq = (
+                uncached_bytes(s * ip.HEADS * ip.DIM // (2 if self.fp4 else 1), dev)
+                .view(torch.uint8 if self.fp4 else torch.float8_e4m3fn)
+                .view(s, ip.HEADS, ip.DIM // (2 if self.fp4 else 1))
+            )
+            self.iqs = (
+                uncached_bytes(s * (QS_BYTES if self.fp4 else ip.HEADS * 4), dev)
+                .view(torch.uint8 if self.fp4 else torch.float32)
+                .view(s, QS_BYTES if self.fp4 else ip.HEADS)
+            )
+            self.iw = (
+                uncached_bytes(s * ip.HEADS * 4, dev)
+                .view(torch.float32)
+                .view(s, ip.HEADS)
+            )
+            self.ilog = torch.empty(s, width, device=dev, dtype=torch.float32)
+            self.ibmax = torch.empty(
+                s, ip.blocks(width), device=dev, dtype=torch.float32
+            )
+            self.selected = {
+                i: torch.empty(s, ip.TOPK, device=dev, dtype=torch.int32)
+                for i in self.weights
+            }
         self.irow = torch.empty(s, ip.TOPK, device=dev, dtype=torch.int32)
         self.candidates = torch.empty(s, ip.TOPK_BLOCKS, device=dev, dtype=torch.int32)
         self.ring_rel = torch.empty(s, device=dev, dtype=torch.int32)
@@ -465,73 +494,3 @@ class MonoIndexer:
             selected, self.candidates[:rows] if spec.produces_candidates else None, step
         )
         return True
-
-
-def step_supported(input_ids, inputs_embeds):
-    rows = input_ids.numel()
-    fwd = get_forward_context()
-    step = getattr(fwd.attn_metadata, "step", None)
-    return (
-        inputs_embeds is None
-        and 0 < rows <= kernel.MAX_ROWS
-        and fwd.context is not None
-        and not fwd.context.is_prefill
-        and fwd.ubatch_slices is None
-        and step is not None
-        and step.decode
-        and step.running_tokens == rows
-        and getattr(fwd.attn_metadata, "image_mask", None) is None
-    )
-
-
-class MonoIndexerModel(nn.Module):
-    """Activate the native layer hook for one supported decode forward."""
-
-    def __init__(self, wrapped, raw, config):
-        super().__init__()
-        from aiter.dist.parallel_state import get_tp_group
-
-        self.model = wrapped
-        self._mono = LazyRunner(
-            lambda: MonoIndexer(
-                raw,
-                config.max_model_len,
-                config.index_cache_dtype == "fp4",
-                config.index_cache_layout,
-                get_tp_group().cpu_group,
-                replicated=not getattr(config, "enable_dp_attention", False),
-            ),
-            "V4.1 Mono indexer",
-        )
-        for block in raw.layers:
-            if block.attn.indexer is not None:
-                block.attn.indexer._mono = self._mono
-
-    def forward(self, input_ids, positions, inputs_embeds=None):
-        # The layer runner owns its standalone launch and buffers. Preparing
-        # the native hook here would allocate and clear an unused second set.
-        uses_layer = getattr(self.model, "uses_layer_mono", None)
-        if uses_layer is not None and uses_layer(input_ids, inputs_embeds):
-            return self.model(input_ids, positions)
-        active = step_supported(input_ids, inputs_embeds) and self._mono.ready(
-            input_ids.numel()
-        )
-        if active:
-            md = get_forward_context().attn_metadata
-            self._mono.runner.begin_step(input_ids.numel(), md.cache, md.step)
-            self._mono.runner.engram_staged = getattr(md, "engram_embeddings", None)
-            self._mono.runner.active = True
-        try:
-            if inputs_embeds is None:
-                return self.model(input_ids, positions)
-            return self.model(input_ids, positions, inputs_embeds=inputs_embeds)
-        finally:
-            if active:
-                self._mono.runner.active = False
-                self._mono.runner.engram_staged = None
-
-    def __getattr__(self, name):
-        try:
-            return super().__getattr__(name)
-        except AttributeError:
-            return getattr(self.model, name)

@@ -1,7 +1,8 @@
 # DeepSeek-V4.1 Flash FP4 Mono indexer
 
 The standalone persistent indexer is enabled by default on supported gfx950
-FP4 deployments: `ATOM_MONO_ENABLE=1 ATOM_DSV41_MONO_INDEXER=1`.
+FP4 TP2/TP4 deployments. TP8 requires explicit `ATOM_DSV41_MONO_INDEXER=1`
+until TP8 GPU and answer-accuracy qualification is available.
 Set `ATOM_DSV41_MONO_INDEXER=0` to retain the embedded/native indexer.
 Native decode and ordinary low-concurrency layer Mono share the indexer
 kernel. The DSpark HI route and its fallback retain their existing indexer.
@@ -19,8 +20,12 @@ Ordinary layer Mono exports normalized hidden rows and query latents from
 K1, runs compression and the standalone indexer, then passes its selected
 physical rows to K2. Token-parallel K1 gathers each rank's query latents
 before the independent launch. The native hook activates for one supported
-decode forward. It avoids preparing an unused second buffer set when the
-ordinary layer runner serves that forward.
+decode forward. Both paths share one 64-row workspace for logits, block
+maxima, projection outputs, selections and indexer scratch. The layer path
+uses its first 48 rows. The workspace is allocated at model installation,
+before warmup and KV sizing, so its PyTorch and uncached allocations reduce
+the measured KV budget. A layer-served forward does not prepare the native
+runner; retained candidate data is never cleared by the other path.
 
 ## TP work and selection
 
@@ -52,7 +57,10 @@ and output buffers. This avoids the larger FULL/candidate selector's resource
 footprint. Only synchronization flag regions are reset between steps;
 split radix histograms are cleared conditionally when splitting can occur.
 
-The inherited K3 qlen1/8K short-decode optimization remains in this branch.
+The inherited K3 qlen1/8K short-decode optimization remains in this branch,
+behind the default-off `ATOM_MONO_K3_SHORT_DECODE=1` switch. The switch only
+changes eligible K3 TP8 replicated FP4 qlen1 builds; DSV4.1 routing does not
+read it. K3 GPU and numeric qualification is a separate open item.
 DSV4.1 adapts its scheduling and lifetime rules to Flash's shuffled MXFP8
 query projection, GPT-J RoPE, Top512 and candidate blocks. Its TP partition
 operates on replicated caches; K3's DCP-sharded-cache timings are a different

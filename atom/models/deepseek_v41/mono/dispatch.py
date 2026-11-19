@@ -83,6 +83,7 @@ class MonoDecodeModel(nn.Module):
         tp_size: int = 1,
         *,
         standalone_indexer: bool = True,
+        indexer_workspace=None,
     ) -> None:
         super().__init__()
         self.model = model
@@ -100,6 +101,7 @@ class MonoDecodeModel(nn.Module):
                 max_model_len,
                 index_fp4,
                 standalone_indexer=standalone_indexer,
+                indexer_workspace=indexer_workspace,
             ),
             "V4.1 mono decode",
         )
@@ -126,7 +128,7 @@ class MonoDecodeModel(nn.Module):
             and not self._dp_ranks
             and rows >= 40
             and self._standalone_indexer
-            and indexer_enabled(self._index_fp4)
+            and indexer_enabled(self._index_fp4, self._tp_size)
         )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -229,6 +231,19 @@ def _install_layer_decode(
             hi_gate.log_once(logging.INFO, "V4.1 mono hi off: %s", why)
     if drafter is not None and hasattr(drafter.model, "block_backbone"):
         drafter.model = MonoDraftModel(drafter.model, dp_ranks)
+    standalone = (
+        indexer_enabled(
+            atom_config.index_cache_dtype == "fp4", atom_config.tensor_parallel_size
+        )
+        and not dp_ranks
+    )
+    workspace = None
+    if standalone:
+        from atom.models.deepseek_v41.mono.indexer_workspace import IndexerWorkspace
+
+        workspace = IndexerWorkspace(
+            model, atom_config.max_model_len, atom_config.tensor_parallel_size
+        )
     wrapped = MonoDecodeModel(
         model,
         drafter,
@@ -236,11 +251,12 @@ def _install_layer_decode(
         atom_config.index_cache_dtype == "fp4",
         dp_ranks,
         atom_config.tensor_parallel_size,
+        indexer_workspace=workspace,
     )
     # Only the ordinary gfx950 route owns this hook. HI and gfx1250 return
-    # above, and disabled/refused deployments never import the GPU indexer.
-    if indexer_enabled(atom_config.index_cache_dtype == "fp4") and not dp_ranks:
-        from atom.models.deepseek_v41.mono.indexer import MonoIndexerModel
+    # above. This branch installs the ordinary native-layer indexer hook.
+    if standalone:
+        from atom.models.deepseek_v41.mono.indexer_dispatch import MonoIndexerModel
 
-        return MonoIndexerModel(wrapped, model, atom_config)
+        return MonoIndexerModel(wrapped, model, atom_config, workspace=workspace)
     return wrapped

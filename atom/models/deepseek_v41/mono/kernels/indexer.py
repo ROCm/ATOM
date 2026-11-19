@@ -8,8 +8,6 @@ rounding, the candidate-block tree and lifting REINDEX columns to real rows.
 Each TP rank holds the replicated indexer and writes its own selection.
 """
 
-from dataclasses import dataclass, replace
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
@@ -18,6 +16,18 @@ from flydsl.expr.typing import Int32, Int64, T
 
 from atom.models.deepseek_v41.mono import index_plan as ip
 from atom.models.deepseek_v41.mono import index_tp_plan as tp
+from atom.models.deepseek_v41.mono.indexer_build import (
+    ABI,
+    MAX_ROWS,
+    IndexerBuild,
+    _select_segment,
+    _split_weights,
+    full_build,  # noqa: F401 - public compatibility export
+    reindex_build,  # noqa: F401 - public compatibility export
+    scratch_bytes,  # noqa: F401 - public compatibility export
+    scratch_layout,
+    selection_keys,
+)
 from atom.models.deepseek_v41.mono.kernels import index_select_plan as isp
 from atom.models.deepseek_v41.mono.kernels.attn_pre import (
     HIDDEN,
@@ -36,7 +46,6 @@ from atom.models.deepseek_v41.mono.kernels.index_project_group import (
     project_group,
 )
 from atom.models.deepseek_v41.mono.kernels.index_query import (
-    IDX_ROWS,
     IW_TASKS,
     stage_iquant,
     stage_iw,
@@ -48,7 +57,6 @@ from atom.models.deepseek_v41.mono.kernels.index_score import (
 from atom.models.deepseek_v41.mono.kernels.index_score_fp4 import run_scores4
 from atom.models.deepseek_v41.mono.kernels.index_select_plan import SelectionPlan
 from atom.models.deepseek_v41.mono.kernels.index_tp_radix import (
-    row_hist_words,
     run_splits,
 )
 from atom.models.deepseek_v41.mono.kernels.index_tp_select import finish_row
@@ -80,121 +88,9 @@ from atom.mono.device.sync import publish, shift, sreg
 from atom.mono.plan.arith import pick
 from atom.mono.plan.build_key import key_tuple
 from atom.mono.plan.execution import BLOCKS, THREADS, WAVES, first_task
-from atom.mono.plan.layout import pair_layout
-from atom.mono.runtime.abi import KernelAbi
 from atom.mono.runtime.step_begin import EPOCH, FENCE_BYTES, _fence, _ld64
 
-MAX_ROWS = 64
 _CURRENT_STREAM = fx.Stream(None)
-
-
-@dataclass(frozen=True)
-class IndexerBuild:
-    tokens: int
-    bound_max: int
-    fp4: bool = True
-    mfma: bool = True
-    diag_off: int = -1
-    world: int = 1
-    peer_offset: int = 0
-    peer_plain: int = 0
-    timing: bool = False
-    radix_blocks: bool = True
-    split_segment: int = 8192
-    full_only: bool = False
-
-
-ABI = KernelAbi((
-    "hidden", "qr", "qr_scale", "iq_w", "iq_ws", "iw_w", "pos", "cos", "sin",
-    "iq", "iqs", "iw", "plane", "pscale", "iplan", "itab", "itab_stride",
-    "itab_len", "ibatch", "ishift", "ibound", "ilog", "lstride", "isel",
-    "icand", "ilift", "iprod", "ibmax", "bstride", "icout", "irow",
-    "kmeta", "table", "rows_per_page", "page_rows", "main_off", "scratch", "layer",
-    "peers", "rank", "ix_meta",
-    "step_state", "step_fence",
-))  # fmt: skip
-
-
-def _select_segment(key):
-    if key.full_only:
-        return min(8192, ip.cdiv(key.bound_max, 2048) * 2048)
-    return isp.row_segment(key.bound_max) if key.fp4 else ip.SEG
-
-
-def scratch_layout(key: IndexerBuild):
-    segment = _select_segment(key)
-    lists = {"isf": key.tokens * ip.chunks(key.bound_max), "irdy": key.tokens}
-    if key.timing:
-        lists["timing"] = BLOCKS * 16 // 2
-    if key.world > 1:
-        lists["ix_root_ready"] = key.tokens * (1 if key.full_only else len(tp.KINDS))
-        lists["ix_fenced"] = 1
-        if key.radix_blocks and not key.full_only:
-            lists["ix_rowhist"] = row_hist_words(key.tokens) // 2
-            lists["ix_segment_ready"] = key.tokens * len(tp.KINDS) * BLOCKS * 2
-            lists["ix_emitted_ready"] = key.tokens * len(tp.KINDS) * BLOCKS
-            lists["ix_phase_ready"] = key.tokens * len(tp.KINDS) * 4 * 3
-    for kind in (("sel",) if key.full_only else ip.KINDS):
-        plan = (
-            SelectionPlan(8192 if kind == "blk" else 4096)
-            if key.world > 1
-            else SelectionPlan(isp.segment_for(segment, kind))
-        )
-        for level in range(plan.top_level(kind, key.bound_max)):
-            slots = plan.list_slots(kind, level, key.bound_max)
-            lists[f"i{kind}{level}"] = key.tokens * slots * ip.KINDS[kind] * 2
-            lists[f"i{kind}ready{level}"] = key.tokens * slots
-    return pair_layout(
-        {
-            "iq": key.tokens * IDX_ROWS // 2,
-            "iw": key.tokens * ip.HEADS,
-            "qdone": BLOCKS,
-            "qready": key.tokens * ip.HEADS * (2 if key.tokens > 32 else 4),
-            "iwready": key.tokens * ip.HEADS if _split_weights(key) else 1,
-            **lists,
-        }.items()
-    )
-
-
-def _split_weights(key):
-    # Three 16-row query tiles use 192 CTAs. The remaining 64 can compute
-    # two head-weight tiles while the query projections are still running.
-    return key.fp4 and 32 < key.tokens <= 48
-
-
-def scratch_bytes(key: IndexerBuild):
-    return max(o + n for o, n in scratch_layout(key).values())
-
-
-def reindex_build(key: IndexerBuild):
-    """A local binary for the at-most-16K compressed REINDEX key domain.
-
-    Keep the existing 18K leaf above the 16K boundary. A separate binary
-    avoids carrying the TP merge's register footprint through this local path.
-    """
-    return replace(
-        key,
-        bound_max=min(key.bound_max, 18432),
-        world=1,
-        peer_offset=0,
-        peer_plain=0,
-    )
-
-
-def full_build(key: IndexerBuild, ratio: int):
-    """A Top512-only binary bounded by the FULL layers' compression ratio.
-
-    The caller uses the smallest ratio among its non-producing FULL layers.
-    Keep the original TP world and peer offsets so the scorer's walk plan and
-    the first layer's epoch fence agree with the normal request planner.
-    """
-    if not key.fp4 or ratio not in (1, 2):
-        raise ValueError("FULL indexer requires FP4 and compression ratio 1 or 2")
-    return replace(
-        key,
-        bound_max=ip.cdiv(key.bound_max, ratio * ip.CHUNK) * ip.CHUNK,
-        full_only=True,
-    )
 
 
 def _tree(c, s, bid, kind, bound_max, base=0):
@@ -436,8 +332,7 @@ def build_indexer(key: IndexerBuild):
     sel = lds_words(plan.SEG // THREADS, fast_hist=True)
     sel_keys, sel_hist, sel_buf = sel["keys"], sel["hist"], sel["buf"]
     peer_topk = ip.TOPK if key.full_only else ip.TOPK_BLOCKS
-    if key.world > 1:
-        sel_keys = max(sel_keys, key.world * peer_topk)
+    sel_keys = selection_keys(key)
 
     @fx.struct
     class ProjectionLds:

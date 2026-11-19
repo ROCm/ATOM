@@ -7,7 +7,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="gfx950 required")
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or "gfx950" not in getattr(torch.cuda.get_device_properties(0), "gcnArchName", ""),
+    reason="gfx950 required",
+)
 
 
 def make_case(
@@ -399,4 +403,13 @@ def test_mono_indexer_mixed_selection_depths(ratio, layout, candidate):
     """Small and large requests share dispatch while retaining separate trees."""
     test_standalone_mono_matches_native_and_graph(
         17, 163840, ratio, layout, candidate, False, 1, mixed=True
+    )
+
+
+@pytest.mark.parametrize(
+    "rows,context,ratio", [(1, 1024, 1), (8, 1024, 1), (8, 2048, 2)]
+)
+def test_short_full_selection_keeps_fp4_score_staging_in_bounds(rows, context, ratio):
+    test_standalone_mono_matches_native_and_graph(
+        rows, context, ratio, "mfma", False, False, 1
     )

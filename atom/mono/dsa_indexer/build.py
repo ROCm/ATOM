@@ -14,6 +14,7 @@ from atom.mono.dsa_indexer.plan import (
 )
 from atom.mono.plan.build_key import kernel_symbol
 from atom.mono.plan.execution import BLOCKS
+from atom.utils import envs
 
 MAX_LEGACY_TOKENS = 64
 MAX_TOKENS = BLOCKS
@@ -244,4 +245,18 @@ def dual_score_resources_fit(resources: list[dict]) -> bool:
     return bool(resources) and all(
         r["vgpr"] <= 128 and r["lds"] <= 80 * 1024 and r["scratch"] == 0
         for r in resources
+    )
+
+
+def short_decode_enabled(shape, rows, world, max_ctx, replicated, qlen):
+    return (
+        envs.ATOM_MONO_K3_SHORT_DECODE
+        and replicated
+        and world == 8
+        and qlen == 1
+        and 0 < rows <= MAX_LEGACY_TOKENS
+        and max_ctx <= isel.SPLIT_MIN
+        and shape.fp4
+        and shape.q_lora == 1536
+        and not shape.rope_dim
     )

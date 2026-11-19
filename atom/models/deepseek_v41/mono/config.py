@@ -32,9 +32,13 @@ ATTENTION_KEYS_MAX = 64 * 16
 INDEXER_SHAPE = (ip.TOPK, ip.TOPK_BLOCKS, ip.BLOCK_ROWS, ip.HEADS, ip.DIM)
 
 
-def indexer_enabled(index_fp4):
-    """FP4 standalone indexer, including the low-concurrency layer path."""
-    return index_fp4 and envs.ATOM_DSV41_MONO_INDEXER
+def indexer_enabled(index_fp4, tp_size):
+    """FP4 standalone indexer: TP2/4 default on, TP8 explicit opt-in."""
+    return (
+        index_fp4
+        and envs.ATOM_DSV41_MONO_INDEXER
+        and (tp_size != 8 or envs.is_set("ATOM_DSV41_MONO_INDEXER"))
+    )
 
 
 def config_refusal(atom_config) -> str | None:

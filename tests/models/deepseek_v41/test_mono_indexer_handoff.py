@@ -6,7 +6,11 @@ import time
 import pytest
 import torch
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or "gfx950" not in getattr(torch.cuda.get_device_properties(0), "gcnArchName", ""),
+    reason="gfx950 required",
+)
 
 
 def _build_waiter():

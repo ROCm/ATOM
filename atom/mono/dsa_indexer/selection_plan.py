@@ -4,6 +4,8 @@
 
 from dataclasses import dataclass
 
+ROW_COPIES = 4
+
 from atom.mono.dsa_indexer.plan import SCORE_KEYS
 from atom.mono.plan.execution import THREADS, WAVES
 

@@ -406,7 +406,9 @@ def test_hi_result_is_never_wrapped_by_the_standalone_indexer(
     monkeypatch.setitem(sys.modules, stub.__name__, stub)
     # A CPU-only deployment cannot import this GPU module. This also catches
     # accidentally wrapping HiDecodeModel, which subclasses MonoDecodeModel.
-    monkeypatch.setitem(sys.modules, "atom.models.deepseek_v41.mono.indexer", None)
+    monkeypatch.setitem(
+        sys.modules, "atom.models.deepseek_v41.mono.indexer_dispatch", None
+    )
     monkeypatch.setenv("ATOM_DSV41_MONO_INDEXER", "1")
     monkeypatch.setenv("ATOM_DSV41_MONO_HI", mode)
     monkeypatch.setattr(dispatch, "config_refusal", lambda cfg: None)
@@ -424,23 +426,28 @@ def test_ordinary_route_defaults_on_and_accepts_opt_out(
     dispatch = dispatch_module
     calls = []
     if enabled:
-        stub = types.ModuleType("atom.models.deepseek_v41.mono.indexer")
+        stub = types.ModuleType("atom.models.deepseek_v41.mono.indexer_dispatch")
 
-        def wrap(*args):
+        def wrap(*args, **kwargs):
             calls.append(args)
             return "independent indexer"
 
         stub.MonoIndexerModel = wrap
         monkeypatch.setitem(sys.modules, stub.__name__, stub)
+        workspace = types.ModuleType("atom.models.deepseek_v41.mono.indexer_workspace")
+        workspace.IndexerWorkspace = lambda *args: "shared workspace"
+        monkeypatch.setitem(sys.modules, workspace.__name__, workspace)
         monkeypatch.delenv("ATOM_DSV41_MONO_INDEXER", raising=False)
     else:
-        monkeypatch.setitem(sys.modules, "atom.models.deepseek_v41.mono.indexer", None)
+        monkeypatch.setitem(
+            sys.modules, "atom.models.deepseek_v41.mono.indexer_dispatch", None
+        )
         monkeypatch.setenv("ATOM_DSV41_MONO_INDEXER", "0")
     monkeypatch.setattr(dispatch, "config_refusal", lambda cfg: None)
     monkeypatch.setattr(dispatch, "dp_attention_ranks", lambda cfg: 0)
     monkeypatch.setattr(dispatch.hi_gate, "decide", lambda *a: False)
     # Installation must not use isinstance with the replaceable constructor.
-    monkeypatch.setattr(dispatch, "MonoDecodeModel", lambda *a: "atom mono")
+    monkeypatch.setattr(dispatch, "MonoDecodeModel", lambda *a, **k: "atom mono")
     got = dispatch.install_mono_decode("model", served, None)
     assert got == ("independent indexer" if enabled else "atom mono")
     assert calls == ([("atom mono", "model", served)] if enabled else [])
@@ -470,7 +477,7 @@ def test_a_model_the_hi_path_does_not_serve_falls_back(
     monkeypatch.setattr(dispatch, "config_refusal", lambda cfg: None)
     monkeypatch.setattr(dispatch, "dp_attention_ranks", lambda cfg: 0)
     monkeypatch.setattr(dispatch.hi_gate, "decide", lambda *a: True)
-    monkeypatch.setattr(dispatch, "MonoDecodeModel", lambda *a: "atom mono")
+    monkeypatch.setattr(dispatch, "MonoDecodeModel", lambda *a, **k: "atom mono")
     if mode == "1":
         with pytest.raises(MonoUnsupported, match="FlyDSL layout"):
             dispatch.install_mono_decode("model", served, None, metadata_builder=None)
@@ -685,7 +692,7 @@ def test_a_refusal_on_another_rank_keeps_atoms_mono_path_here(
     monkeypatch.setattr(dispatch, "config_refusal", lambda cfg: None)
     monkeypatch.setattr(dispatch, "dp_attention_ranks", lambda cfg: 0)
     monkeypatch.setattr(dispatch.hi_gate, "decide", lambda *a: True)
-    monkeypatch.setattr(dispatch, "MonoDecodeModel", lambda *a: "atom mono")
+    monkeypatch.setattr(dispatch, "MonoDecodeModel", lambda *a, **k: "atom mono")
     monkeypatch.setattr(
         dispatch, "MonoDraftModel", lambda m, dp: ("atom mono draft", m)
     )
@@ -699,3 +706,22 @@ def test_a_refusal_on_another_rank_keeps_atoms_mono_path_here(
     assert [r.getMessage() for r in caplog.records] == [
         "V4.1 mono hi off: refused at install: rank 0: MonoUnsupported: shard"
     ]
+
+
+def test_hi_fallback_constructor_keeps_embedded_indexer(
+    monkeypatch, hi_dispatch_module
+):
+    from unittest.mock import Mock
+
+    from torch import nn
+
+    dispatch = sys.modules["atom.models.deepseek_v41.mono.dispatch"]
+    create = Mock()
+    monkeypatch.setattr(dispatch, "V41MonoDecodeRunner", create)
+    monkeypatch.setenv("ATOM_DSV41_MONO_INDEXER", "1")
+    raw = nn.Module()
+    wrapped = hi_dispatch_module.HiDecodeModel(raw, None, 8192, True, 0, object())
+    wrapped._mono._create()
+    create.assert_called_once_with(
+        raw, None, 8192, True, standalone_indexer=False, indexer_workspace=None
+    )
