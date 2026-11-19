@@ -228,7 +228,6 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
                 activation_dtype=module.impl.dt_bias.dtype,
             )
             for module in self.pool_rows.get(LINEAR_STATE_ROWS, {})
-            if hasattr(module, "base_linear_attention")
         }
 
     @cached_property
