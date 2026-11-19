@@ -4722,10 +4722,15 @@ class MooncakeConnector(KVConnectorBase):
                 # unless the runner moved off it, and synchronizing that would
                 # hold every notification behind the in-flight decode step.
                 stream = self._recv_scatter_stream()
-                with torch.cuda.stream(stream):
-                    self._scatter_slot(compute_slot, pool_idx)
-                stream.synchronize()
-                self._staging_slots.release(pool_idx)
+                try:
+                    with torch.cuda.stream(stream):
+                        self._scatter_slot(compute_slot, pool_idx)
+                finally:
+                    # As on the gather side: the row goes back to the pool
+                    # however this leaves, so it has to be quiet first, and a
+                    # scatter that raised partway still has copies in flight.
+                    stream.synchronize()
+                    self._staging_slots.release(pool_idx)
         dst_blocks = self._pending_recv_blocks.pop(req_id, None)
         if dst_blocks:
             with self._fence_lock:
