@@ -45,6 +45,18 @@ PY
 }
 
 if [ "$TYPE" == "launch" ]; then
+  launch_start_seconds=$SECONDS
+  ready_timeout_seconds="${ATOM_SERVER_READY_TIMEOUT_SECONDS:-2700}"
+  retry_interval="${ATOM_SERVER_READY_POLL_SECONDS:-60}"
+  warmup_timeout_seconds="${ATOM_SERVER_WARMUP_TIMEOUT_SECONDS:-1500}"
+  warmup_interval="${ATOM_SERVER_READY_POLL_SECONDS:-30}"
+  for phase_budget_value in "$ready_timeout_seconds" "$retry_interval" "$warmup_timeout_seconds"; do
+    if ! [[ "$phase_budget_value" =~ ^[1-9][0-9]*$ ]]; then
+      echo "ERROR: server readiness timing values must be positive integers"
+      exit 2
+    fi
+  done
+  unset ATOM_SERVER_READY_TIMEOUT_SECONDS ATOM_SERVER_READY_POLL_SECONDS ATOM_SERVER_WARMUP_TIMEOUT_SECONDS
   echo ""
   echo "========== Launching ATOM server =========="
   # Clear stale compile cache to avoid NameError from outdated generated code
@@ -89,27 +101,38 @@ if [ "$TYPE" == "launch" ]; then
 
   echo ""
   echo "========== Waiting for ATOM server to start =========="
-  # Phase 1: Wait for HTTP server to be up via /health endpoint (45 min max)
-  max_retries=45
-  retry_interval=60
+  # Phase 1: preserve the default 45-minute allowance when changing poll cadence.
+  max_retries=$(( (ready_timeout_seconds + retry_interval - 1) / retry_interval ))
+  ready_deadline=$((launch_start_seconds + ready_timeout_seconds))
   server_up=false
-  for ((i=1; i<=max_retries; i++)); do
+  for ((i=1; i<=max_retries && SECONDS<ready_deadline; i++)); do
       if ! kill -0 $atom_server_pid 2>/dev/null; then
           echo "ATOM server process exited unexpectedly."
           echo "Last 50 lines of server log:"
           tail -50 "$ATOM_SERVER_LOG" 2>/dev/null || true
           exit 1
       fi
-      if curl -sf "http://localhost:${ATOM_SERVER_PORT}/health" -o /dev/null; then
+      ready_remaining=$((ready_deadline - SECONDS))
+      [ "$ready_remaining" -gt 0 ] || break
+      probe_timeout=$((ready_remaining < 2 ? ready_remaining : 2))
+      if curl -sf "http://localhost:${ATOM_SERVER_PORT}/health" -o /dev/null --max-time "$probe_timeout"; then
           echo "ATOM server HTTP endpoint is up."
           server_up=true
           break
       fi
       echo "Waiting for ATOM server to be ready... ($i/$max_retries)"
-      sleep $retry_interval
+      ready_remaining=$((ready_deadline - SECONDS))
+      pause_seconds=$((ready_remaining < retry_interval ? ready_remaining : retry_interval))
+      if [ "$pause_seconds" -gt 0 ]; then sleep "$pause_seconds"; fi
   done
+  # Catch readiness at the last poll boundary; the outer launch budget reserves this grace.
+  if [ "$server_up" = false ] && kill -0 "$atom_server_pid" 2>/dev/null && \
+      curl -sf "http://localhost:${ATOM_SERVER_PORT}/health" -o /dev/null --max-time 2; then
+      echo "ATOM server HTTP endpoint is up at the final readiness check."
+      server_up=true
+  fi
   if [ "$server_up" = false ]; then
-      echo "ATOM server did not start after $((max_retries * retry_interval)) seconds."
+      echo "ATOM server did not start within ${ready_timeout_seconds} seconds and the final readiness check."
       kill $atom_server_pid
       exit 1
   fi
@@ -118,28 +141,33 @@ if [ "$TYPE" == "launch" ]; then
   # (CUDA graph capture, JIT compilation, etc. may still be in progress after /health returns OK)
   echo "========== Warming up ATOM server =========="
   warmup_retries=10
-  warmup_interval=30
+  warmup_deadline=$((SECONDS + warmup_timeout_seconds))
   warmup_done=false
-  for ((i=1; i<=warmup_retries; i++)); do
+  for ((i=1; i<=warmup_retries && SECONDS<warmup_deadline; i++)); do
       if ! kill -0 $atom_server_pid 2>/dev/null; then
           echo "ATOM server process exited unexpectedly during warmup."
           echo "Last 50 lines of server log:"
           tail -50 "$ATOM_SERVER_LOG" 2>/dev/null || true
           exit 1
       fi
+      warmup_remaining=$((warmup_deadline - SECONDS))
+      [ "$warmup_remaining" -gt 0 ] || break
+      warmup_probe_timeout=$((warmup_remaining < 120 ? warmup_remaining : 120))
       if curl -sf "http://localhost:${ATOM_SERVER_PORT}/v1/completions" \
           -H "Content-Type: application/json" \
           -d '{"model":"'"$MODEL_PATH"'","prompt":"hi","max_tokens":1}' \
-          -o /dev/null --max-time 120; then
+          -o /dev/null --max-time "$warmup_probe_timeout"; then
           echo "ATOM server warmup completed successfully."
           warmup_done=true
           break
       fi
       echo "Warmup attempt $i/$warmup_retries failed, retrying in ${warmup_interval}s..."
-      sleep $warmup_interval
+      warmup_remaining=$((warmup_deadline - SECONDS))
+      pause_seconds=$((warmup_remaining < warmup_interval ? warmup_remaining : warmup_interval))
+      if [ "$pause_seconds" -gt 0 ]; then sleep "$pause_seconds"; fi
   done
   if [ "$warmup_done" = false ]; then
-      echo "ATOM server warmup failed after $((warmup_retries * warmup_interval)) seconds."
+      echo "ATOM server warmup did not complete within ${warmup_timeout_seconds} seconds."
       kill $atom_server_pid
       exit 1
   fi
