@@ -734,7 +734,9 @@ def target_layer(E, Ly):
                 # for their own segments' counts -- no SCORE handoff: a segment's selection starts as its scores land
                 grp = fx.Int32(0) != fx.Int32(0)
                 nchk = fx.Int32(0)
-                cs_ = cwith(cs_, segcnt=fptr(fp, "mchist") + i64(Ly) * TK.MC_LAYER)
+                # (with L20_ORD no reader: the scorer gets no segcnt -- no store wait + barrier + atomic a task on layer 20)
+                if fx.const_expr(not (L20_ORD and TR <= TK.MC_ROWS)):
+                    cs_ = cwith(cs_, segcnt=fptr(fp, "mchist") + i64(Ly) * TK.MC_LAYER)
                 if fx.const_expr(TR <= 6):   # (c1: one request) long FULL contexts score each key tile once for every row
                     lg = hx.opaque_v(fx.thread_idx.x) % 32   # (short contexts keep the per-row tasks: more CTAs in parallel)
                     bmx = TK.wave_max((lg < TR).select(hx.gload(cs_["ibound"] + i64(fx.min(lg, fx.Int32(TR - 1))) * 4, fx.Int32), fx.Int32(0)))
@@ -747,6 +749,8 @@ def target_layer(E, Ly):
                 else:
                     SC.stage_score_any(cs_, isrx)
                 segw = cs_["iprod"] & grp
+                if fx.const_expr(L20_ORD and TR <= TK.MC_ROWS):   # (the selection tree below: traced, never run)
+                    cs_ = cwith(cs_, segcnt=fptr(fp, "mchist") + i64(Ly) * TK.MC_LAYER)
                 if fx.const_expr(L20_ORD and TR <= TK.MC_ROWS):   # (l20) the ordered multi-CTA selection reads whole rows: SCORE
                     segw = fx.Int32(0) != fx.Int32(0)
                 # the selecting CTAs (select_mc: b < TR x MC_G, long FULL rows TR x mc_g_long; layer 20's select_ord: up to

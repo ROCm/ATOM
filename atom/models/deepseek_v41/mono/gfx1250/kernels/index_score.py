@@ -389,16 +389,19 @@ def stage_score_grouped(c):
     cmax = TK.wave_max((ln < TR).select(hx.lload(osr + fx.min(ln, I32(TR - 1)) * 4, I32), I32(0)))
     bmax = TK.wave_max((ln < TR).select(hx.lload(osr + (64 + fx.min(ln, I32(TR - 1))) * 4, I32), I32(0)))
     nt = IP.score_tasks(cmax, I32(CHUNK))
-    # (B) `early`: the tasks over the CTAs outside the compressor rows' (still writing this step's keys)
+    # (B) `early`: the tasks over the CTAs outside the compressor rows' (still writing this step's keys). The live plan
+    # rows are the first ones (prep.fill_step_plans: in order, one a target row at most), so only CTAs CROW0 .. + TR
+    # write keys; CROW0 + TR .. + T score too (c1: 250 CTAs, not 208 -- 42 CTAs sat idle over the score loop, probe 11-19)
+    NCR = min(TR, NCROW)
     early = c.get("early", I32(0) != I32(0))
-    ncta = early.select(I32(CTAS - NCROW), I32(CTAS))
-    vb = early.select((b >= CROW0).select(b - NCROW, b), b)
+    ncta = early.select(I32(CTAS - NCR), I32(CTAS))
+    vb = early.select((b >= CROW0).select(b - NCR, b), b)
     # the task index's CTA order starts past the iquant CTAs (c["niq"]: they start scoring last, past their iquant): the
     # nt % ncta extra tasks go to the CTAs that score earliest, the iquant CTAs get the fewer (the same tasks, the same
     # scores; layer 20 at 133K: CTAs 0..5's extra task was the SCORE wait's last arrival)
     if fx.const_expr("niq" in c):
         vb = (vb - I32(c["niq"]) + ncta) % ncta
-    busy = early & (b >= CROW0) & (b < CROW0 + NCROW)
+    busy = early & (b >= CROW0) & (b < CROW0 + NCR)
     nme = busy.select(I32(0), fx.max((nt - vb + (ncta - 1)) // ncta, I32(0)))
     newc = cmax - 16          # (B) tasks reaching a column >= this read keys the compressor rows write this step
     iprod = c["iprod"]
