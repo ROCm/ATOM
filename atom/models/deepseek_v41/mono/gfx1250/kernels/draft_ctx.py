@@ -261,12 +261,12 @@ def stage_tap1(c, T, j, src):
         hx.gstore(c["auxs"] + i64(r) * (KA // 32) + i64(g), code.to(fx.Int8))
 
 
-def _gemv_part_m(c, a8, as_, K, w8, ws, n0, T, k0, nk, MT):
+def _gemv_part_m(c, a8, as_, K, w8, ws, n0, T, k0, nk, MT, depth=4):
     """_gemv_part for all MT row tiles at once: each weight operand loaded once, MT WMMAs (acc list)."""
     l = c["l"]
     ras = [fx.min(mi * 16 + l % 16, I32(T - 1)) for mi in range(MT)]
     brow = w8 + i64(n0 + l % 16) * K
-    D = min(4, nk)   # K steps in flight
+    D = min(depth, nk)   # K steps in flight (the WMMAs still accumulate in K order)
     accs = [fx.Vector.filled(8, 0.0, F32) for _ in range(MT)]
 
     def fa(i, mi):
@@ -401,6 +401,7 @@ CX_TILES = H // 16 // TPR                     # 80 N tiles a rank
 CX_TMAX = 8                                   # rows a step (c1: 6)
 CX_SRC = CX_TILES * CX_TMAX * 3 * 16          # 30720 bytes a source slot
 CX_OFF = 16 * 40960 * 16 + (512 << 10)        # bytes into a receive half (tail.SOFF + 512 KB)
+CX_DEPTH = 6                                  # K steps in flight a wave (latency-bound: 4 took 5.1-5.6 us a tile)
 CX_STAGE = 8192                               # LDS bytes: a tile's [T][16] bf16, past _lds_sum_out's partials
 
 
@@ -471,7 +472,10 @@ def _lds_sum_push(c, accs, MT, T, tile, tl):
         v = fx.Vector.from_elements([wd[0], wd[1], wd[2], c["cxtag"]], I32)
         for o in range_constexpr(TPR):
             hx.gstore(_cx_unit(c["recv"][o], c["rank"], tl, T, rr, j), v, nt=True)
-    gpu.barrier()
+    # (no barrier here: its store drain waited ~3.5 us for the pushes to land before the next tile. The consumer
+    # validates each 16-byte unit by its own tag, the receive half is re-zeroed only after its owner polled every unit,
+    # the partials were read before the barrier above and the staging is read and next written by wave 0 alone; the drain
+    # moves to the next barrier -- the next tile's, or stage_hnorm's -- by then long landed)
 
 
 @ASTRewriter.transform
@@ -485,7 +489,7 @@ def stage_proj_tp(c, T, nc):
         tl = b + kk * nc
         if tl < CX_TILES:
             tile = c["rank"] * CX_TILES + tl
-            accs = _gemv_part_m(c, c["aux8"], c["auxs"], KA, c["mpw"], c["mps"], tile * 16, T, w * KS, KS, MT)
+            accs = _gemv_part_m(c, c["aux8"], c["auxs"], KA, c["mpw"], c["mps"], tile * 16, T, w * KS, KS, MT, depth=CX_DEPTH)
             _lds_sum_push(c, accs, MT, T, tile, tl)
 
 
@@ -500,7 +504,7 @@ def stage_proj_nc(c, T, nc):
     for kk in range_constexpr((NTL + nc - 1) // nc):
         tile = b + kk * nc
         if tile < NTL:
-            accs = _gemv_part_m(c, c["aux8"], c["auxs"], KA, c["mpw"], c["mps"], tile * 16, T, w * KS, KS, MT)
+            accs = _gemv_part_m(c, c["aux8"], c["auxs"], KA, c["mpw"], c["mps"], tile * 16, T, w * KS, KS, MT, depth=CX_DEPTH)
             _lds_sum_out(c, accs, MT, WAVES, T, tile * 16, False)
 
 
