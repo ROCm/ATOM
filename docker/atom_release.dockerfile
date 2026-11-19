@@ -438,22 +438,19 @@ else:
         print("torch_utils.py already carries the torch.Stream branch (upstream fix landed)")
 PY
 
-# The prebuild leaves its ninja intermediates under aiter/jit/build: object
-# files, plus a second copy of every linked module (aiter.jit.core copies
-# build/<md>/build/<md>.so to aiter/jit/<md>.so). Runtime loads aiter/jit/*.so
-# and a cold JIT build writes into its own build/<md>, so neither is read; the
-# only cost is that a forced rebuild of a prebuilt module is no longer
-# incremental. Generated sources and JIT metadata (compiled_kids_opus.json)
-# stay. Only byte-identical copies are removed.
+# The prebuild leaves a ninja build directory, aiter/jit/build/<md>/build, for
+# every module: object files, build.ninja, and a second copy of the linked
+# module (aiter.jit.core copies build/<md>/build/<md>.so to aiter/jit/<md>.so).
+# Runtime loads aiter/jit/*.so and a JIT build recreates build/<md>/build, so
+# nothing reads it; the only cost is that a forced rebuild of a prebuilt module
+# is no longer incremental. Generated sources (build/<md>/blob) and JIT
+# metadata (build/compiled_kids_opus.json) stay.
 RUN cd /app/aiter-test/aiter/jit && \
     if [ ! -d build ]; then \
         echo "aiter/jit/build does not exist (PREBUILD_KERNELS=${PREBUILD_KERNELS}); nothing to clean up"; \
     else \
         echo "aiter/jit/build before cleanup: $(du -sh build | cut -f1)" && \
-        find build -name '*.o' -type f -delete && \
-        find build -path '*/build/*.so' -type f | while read -r so; do \
-            if cmp -s "${so}" "$(basename "${so}")"; then rm -f "${so}"; fi; \
-        done && \
+        rm -rf build/*/build && \
         echo "aiter/jit/build after cleanup: $(du -sh build | cut -f1)"; \
     fi
 
