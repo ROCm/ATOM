@@ -377,6 +377,9 @@ message Ready {
   // The longest prompt this Core's KV pool can hold, in tokens; absent when
   // the Core does not own the pool (the prefill half of a disaggregated pair).
   optional uint64 max_pool_tokens = 1;
+  // Each weight-sync feature this Core's runners cannot take, with the
+  // reason (`ask_what_runners_cannot_take`); empty when it takes them all.
+  map<string, string> weight_syncs_unavailable = 2;
 }
 
 // A finished sequence, as much of it as a client reads.
