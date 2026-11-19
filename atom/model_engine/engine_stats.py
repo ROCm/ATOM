@@ -691,6 +691,14 @@ class EngineStats:
             f"evicted: {p['blocks_evicted']}, retired: {p['blocks_retired']} | "
             f"state: {p['slots_used']}/{p['slots_total']} used, "
             f"{p['slots_held']} checkpointed, {p['slots_vacant']} vacant"
+            + (
+                f" | transfer: {p['transfer_slots_used']}/"
+                f"{p['transfer_slots_total']} used, "
+                f"{p['transfer_slot_moves']} moved, "
+                f"{p['transfer_slots_full']} found full"
+                if p.get("transfer_slots_total")
+                else ""
+            )
         )
         # The state pool's own losses, which `blocks_evicted` cannot express:
         # a checkpoint can die without any block dying (`evicted`, the pool ran
