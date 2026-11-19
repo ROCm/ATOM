@@ -737,6 +737,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_KIMI_MONO_K1_GATE_ILP", "1"
     )
     == "1",
+    # Kimi-K3 gfx1250 mono: K1's whole-head recurrence over a step's query
+    # tokens as one chunk (the projections and outputs of the starting state
+    # reduced side by side, the tokens' interactions solved per row) instead
+    # of token by token; the same values in another fp32 order. "auto", the
+    # default, under ReplaySSM (no per-token states: where it wins); 1 also
+    # DSpark's per-token states, 0 never.
+    "ATOM_KIMI_MONO_K1_CHUNK_RECUR": lambda: os.getenv(
+        "ATOM_KIMI_MONO_K1_CHUNK_RECUR", "auto"
+    ),
     # 1, the default: Kimi-K3 gfx1250 mono K1 runs whole heads (split as
     # HEAD_SPLIT) at every width, not 16-row chunk tasks where those fit one
     # pass of the grid (at most two requests), rounding as the chunk tasks do

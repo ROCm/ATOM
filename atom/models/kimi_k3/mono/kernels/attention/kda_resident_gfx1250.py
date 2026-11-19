@@ -195,6 +195,15 @@ def _gate_ilp() -> bool:
     return envs.ATOM_KIMI_MONO_K1_GATE_ILP
 
 
+def _chunk_recur(qlen: int, replay: bool) -> bool:
+    """Whole heads' recurrence as one chunk of the step's tokens: "auto"
+    under ReplaySSM (no per-token states to advance), where it wins."""
+    mode = envs.ATOM_KIMI_MONO_K1_CHUNK_RECUR
+    if qlen == 1 or mode == "0":
+        return False
+    return mode == "1" or replay
+
+
 def _whole_heads(qlen: int, tasks: int, blocks: int, replay: bool) -> tuple[bool, bool]:
     """(whole heads, forced): whole (split) heads at plain decode, past one
     pass of the grid's chunk tasks and under ReplaySSM; elsewhere too with
@@ -250,6 +259,7 @@ def build_resident_k1(
         envs.ATOM_KIMI_MONO_K1_HEAD_SPLIT,
         _gate_ilp(),
         envs.ATOM_KIMI_MONO_K1_WHOLE_HEADS,
+        envs.ATOM_KIMI_MONO_K1_CHUNK_RECUR,
     )
     cached = _BUILDS.get(cache_key)
     if cached is not None:
@@ -285,6 +295,7 @@ def build_resident_k1(
     head_split = (
         _head_split((s // qlen) * HEADS, declaration.blocks) if whole_heads else 1
     )
+    chunk_recur = whole_heads and _chunk_recur(qlen, spec.replay_cap > 0)
     auto_split = (
         _auto_head_split((s // qlen) * HEADS, declaration.blocks) if whole_heads else 1
     )
@@ -326,6 +337,7 @@ def build_resident_k1(
         head_split,
         _gate_ilp(),
         *(("whole_heads",) if forced_heads else ()),
+        *(("chunk_recur",) if chunk_recur else ()),
     )
     timeline = tdm_timeline.key()
     name = (
@@ -339,6 +351,7 @@ def build_resident_k1(
         f"{f'_hs{head_split}' if head_split != auto_split else ''}"
         f"{'' if _gate_ilp() else '_nogi'}"
         f"{'_wh' if forced_heads else ''}"
+        f"{'_cr' if chunk_recur else ''}"
         f"{tdm_timeline.suffix()}"
     )
 
@@ -973,6 +986,7 @@ def build_resident_k1(
             "head_preload": _head_preload(),
             "head_split": head_split,
             "gate_ilp": _gate_ilp(),
+            "chunk_recur": chunk_recur,
             # forced whole heads stand in for the chunk tasks: their SiLU and
             # output gate as the chunk tasks round them
             "chunk_rounding": forced_heads,

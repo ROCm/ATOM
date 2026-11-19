@@ -13,7 +13,12 @@ core_out and conv state must match the replay's bit for bit.
 
 Run on one gfx1250 GPU:
   ROWS=40,20 QLEN=5 STEPS=6 python tools/kimi_k3_mono_k1_replay_check.py
-SPLIT sets ATOM_KIMI_MONO_K1_HEAD_SPLIT for every build (default auto)."""
+SPLIT sets ATOM_KIMI_MONO_K1_HEAD_SPLIT for every build (default auto).
+
+CHUNK=1 builds the chunked head recurrence (ATOM_KIMI_MONO_K1_CHUNK_RECUR)
+and, each step, also runs the sequential one on the same inputs: the replay
+build (core_out, conv, checkpoints, records) and the plain one with a state
+slot per token (core_out and every token's state), as "seq_*"."""
 
 import json
 import os
@@ -48,6 +53,7 @@ STEPS = int(os.environ.get("STEPS", "6"))
 CAP = int(os.environ.get("CAP", "16"))
 WINDOW = int(os.environ.get("WINDOW", "5"))
 SPLIT = os.environ.get("SPLIT", "auto")
+CHUNK = os.environ.get("CHUNK", "0") == "1"
 SENTINEL_STEP = 3  # request 0 re-prefilled before it: its cursor back to -1
 FUSED, PROJ, NH, HD, LB = 6284, 1536, 12, 128, -5.0
 SL = WINDOW + 2  # the conv window: width - 1 + the verify window's drafts
@@ -217,14 +223,42 @@ def production(proj, conv, ckpt, bufs, write_pos, slot_idx, num_acc, req):
     return normed.reshape(T, PROJ)
 
 
+def replay_table(slot_idx, wp, bufs):
+    return torch.tensor(
+        [
+            {
+                "slot_idx": slot_idx,
+                "write_pos": wp,
+                "rbuf_k": bufs[0],
+                "rbuf_u": bufs[1],
+                "rbuf_g": bufs[2],
+            }[name].data_ptr()
+            for name in REPLAY_TABLE
+        ],
+        dtype=torch.int64,
+        device=dev,
+    )
+
+
+def builds(plan, rows, chunk):
+    os.environ["ATOM_KIMI_MONO_K1_CHUNK_RECUR"] = "1" if chunk else "0"
+    return (
+        plan.make_k1_local_runner(spec(rows, True)).prepare(dev),
+        plan.make_k1_local_runner(spec(rows, False)).prepare(dev),
+    )
+
+
 def check(rows):
     req = rows // QLEN
     plan = Gfx1250KimiBuildPlan(
         threads=256, blocks=256, lds_bytes=320 * 1024, tokens=rows, nblocks=1
     )
-    replay_k1 = plan.make_k1_local_runner(spec(rows, True)).prepare(dev)
-    plain_k1 = plan.make_k1_local_runner(spec(rows, False)).prepare(dev)
+    replay_k1, plain_k1 = builds(plan, rows, CHUNK)
     names = {"replay": replay_k1.entrypoint.name, "plain": plain_k1.entrypoint.name}
+    if CHUNK:
+        seq_replay, seq_plain = builds(plan, rows, False)
+        names["seq_replay"] = seq_replay.entrypoint.name
+        names["seq_plain"] = seq_plain.entrypoint.name
     print("built", rows, names, flush=True)
     slots = req + 3
     # the requests' checkpoint slots, not in request order
@@ -248,20 +282,7 @@ def check(rows):
             "wp": torch.full((slots,), -1, dtype=torch.int32, device=dev),
         }
     m = sides["mono"]
-    table = torch.tensor(
-        [
-            {
-                "slot_idx": slot_idx,
-                "write_pos": m["wp"],
-                "rbuf_k": m["bufs"][0],
-                "rbuf_u": m["bufs"][1],
-                "rbuf_g": m["bufs"][2],
-            }[name].data_ptr()
-            for name in REPLAY_TABLE
-        ],
-        dtype=torch.int64,
-        device=dev,
-    )
+    table = replay_table(slot_idx, m["wp"], m["bufs"])
     # K1's slot table under ReplaySSM: column 0 (the conv's) the checkpoint
     st = torch.full((req, QLEN), -1, dtype=torch.int32, device=dev)
     st[:, 0] = slot_idx
@@ -297,6 +318,37 @@ def check(rows):
             p_core, _ = k1_run(plain_k1, prefix, p_conv, p_rs, p_st, num_acc)
         ckpt_before = m["ckpt"].clone()
         bufs_before = [b.clone() for b in m["bufs"]]
+        if CHUNK:
+            seq = {
+                "conv": m["conv"].clone(),
+                "ckpt": ckpt_before.clone(),
+                "bufs": [b.clone() for b in bufs_before],
+                "wp": m["wp"].clone(),
+            }
+            seq_core, _ = k1_run(
+                seq_replay,
+                prefix,
+                seq["conv"],
+                seq["ckpt"],
+                st,
+                num_acc,
+                replay_table(slot_idx, seq["wp"], seq["bufs"]),
+            )
+            # plain DSpark: every token's state in its own slot
+            token_st = torch.arange(req * QLEN, dtype=torch.int32, device=dev)
+            token_st = token_st.view(req, QLEN) + slots
+            token_st[:, 0] = slot_idx
+            rs0 = torch.zeros(
+                (slots + req * QLEN, NH, HD, HD), dtype=torch.float32, device=dev
+            )
+            rs0[:slots] = ckpt_before
+            plain_out = {}
+            for side, k1 in (("chunk", plain_k1), ("seq", seq_plain)):
+                rs_side, conv_side = rs0.clone(), m["conv"].clone()
+                core_side, _ = k1_run(
+                    k1, prefix, conv_side, rs_side, token_st.clone(), num_acc
+                )
+                plain_out[side] = (core_side, rs_side)
         core, proj = k1_run(replay_k1, prefix, m["conv"], m["ckpt"], st, num_acc, table)
         p = sides["prod"]
         core_p = production(
@@ -362,6 +414,21 @@ def check(rows):
                         [round(v, 3) for v in p["conv"][slot, ch].float().tolist()],
                         flush=True,
                     )
+        if CHUNK:
+            report["seq_core_out"] = diff(core, seq_core)
+            report["seq_conv"] = diff(m["conv"][idx], seq["conv"][idx])
+            report["seq_ckpt"] = diff(m["ckpt"][idx], seq["ckpt"][idx])
+            for name, b in zip("kug", range(3)):
+                mine = m["bufs"][b][idx].permute(0, 2, 1, 3)[written]
+                ref = seq["bufs"][b][idx].permute(0, 2, 1, 3)[written]
+                report[f"seq_rec_{name}"] = diff(mine, ref)
+            used = token_st.flatten().long()
+            report["seq_plain_core_out"] = diff(
+                plain_out["chunk"][0], plain_out["seq"][0]
+            )
+            report["seq_plain_states"] = diff(
+                plain_out["chunk"][1][used], plain_out["seq"][1][used]
+            )
         if step == 0:
             report["vs_plain_core_out"] = diff(core, p_core)
             report["vs_plain_conv"] = diff(m["conv"][idx], p_conv[idx])

@@ -49,6 +49,7 @@ from atom.mono.device.ops import (
     bf_lo,
     butterfly,
     hw_exp2,
+    hw_rcp,
     hw_rsq,
     lane_all_gather,
     lane_reduce_scatter,
@@ -67,6 +68,10 @@ HEADS = 12
 HEAD_DIM = GATE_K
 STATE_CHUNKS = 8
 LANE_OFFSETS = (16, 8, 4, 2, 1)
+# the least log cumulative decay (qlen tokens at the gates' lower bound) the
+# chunked recurrence divides by: past e^-60 it multiplies the decays out
+CHUNK_MIN_LOG_DECAY = -60.0
+CHUNK_SUM_GROUP = 16
 VALUE_CHUNK = 16
 NPROJ = 6288
 SEAM_COLUMNS = 128
@@ -629,6 +634,237 @@ def kda_recur_head(c, k, request, head):
                 fx.ptr_store(square_sum, c["head_onrm"] + token * STATE_CHUNKS + wave)
         token = token + fx.Int32(1)
     gpu.barrier()
+
+
+@traced
+def kda_recur_head_chunk(c, k, request, head):
+    """``kda_recur_head``'s step as one chunk of its L tokens: with
+    D_tj = a_(j+1) .. a_t (a column's decays past token j; D_t its all), every
+    token's projection and output of the starting state S_0 (S_0 (k_t D_t),
+    S_0 (q_t D_t)) reduced side by side, the tokens' interactions
+    M_tj = k_t . (k_j D_tj) (j < t) and P_tj = q_t . (k_j D_tj) (j <= t), the
+    same for every row, then each lane's row solved forward:
+    v'_t = beta_t (v_t - S_0 (k_t D_t) - sum_j M_tj v'_j) and
+    o_t = S_0 (q_t D_t) + sum_j P_tj v'_j. DSpark's states still follow token
+    by token, S_t = a_t S_(t-1) + v'_t k_t, with no reduction between them;
+    ReplaySSM stores none (its records are the v'), so it runs none. The same
+    values in another fp32 order."""
+
+    L, lane, wave = c["L"], c["lane"], c["wave"]
+    replayed = bool(c.get("cap", 0))
+    live = k["slot0"] >= 0
+    column = lane * 4
+    rows = c.get("head_rows", ROWS)
+    row0 = c["head_row0"] if const_expr("head_row0" in c) else wave * ROWS
+    state = [
+        live.select(k["state"][row][element], fx.Float32(0.0))
+        for row in range(rows)
+        for element in range(4)
+    ]
+    if const_expr(replayed):
+        state = replay_rows(c, state, k["replay"]["h_rec"], (row0, rows))
+        if k["replay"]["flush"] & live:
+            # the records folded: the checkpoint moves to here
+            replay_checkpoint_store(c, k, head, state, row0, rows)
+    q = [_load4(c["qkl"], 2 * t, column) for t in range(L)]
+    key = [_load4(c["qkl"], 2 * t + 1, column) for t in range(L)]
+    decay = [_load4(c["decay"], t, column) for t in range(L)]
+    beta = [fx.ptr_load(c["beta"] + t) for t in range(L)]
+    cumulative = []
+    running = None
+    for t in range_constexpr(L):
+        running = (
+            list(decay[t])
+            if running is None
+            else [running[e] * decay[t][e] for e in range(4)]
+        )
+        cumulative.append(running)
+    key_t = [[key[t][e] * cumulative[t][e] for e in range(4)] for t in range(L)]
+    query_t = [[q[t][e] * cumulative[t][e] for e in range(4)] for t in range(L)]
+    pairs = [(t, j) for t in range(L) for j in range(t)]
+    diagonal = [(t, j) for t in range(L) for j in range(t + 1)]
+    if const_expr(c["lb"] * L >= CHUNK_MIN_LOG_DECAY):
+        # D_tj = G_t / G_j: the gates' bound keeps G_j's reciprocal finite
+        key_j = [
+            [key[j][e] * hw_rcp(cumulative[j][e]) for e in range(4)]
+            for j in range(L)
+        ]
+        partials = [_dot4(key_t[t], key_j[j]) for t, j in pairs] + [
+            _dot4(query_t[t], key_j[j]) for t, j in diagonal
+        ]
+    else:
+        span = {}
+        for t in range_constexpr(L):
+            span[(t, t)] = None
+            for j in range_constexpr(t):
+                previous = span[(t - 1, j)] if j < t - 1 else None
+                span[(t, j)] = (
+                    list(decay[t])
+                    if previous is None
+                    else [previous[e] * decay[t][e] for e in range(4)]
+                )
+        partials = [_span_dot(key[t], key[j], span[(t, j)]) for t, j in pairs] + [
+            _span_dot(q[t], key[j], span[(t, j)]) for t, j in diagonal
+        ]
+    interactions = _wave_sums(c, partials)
+    m = dict(zip(pairs, interactions[: len(pairs)]))
+    p = dict(zip(diagonal, interactions[len(pairs) :]))
+    # S_0's projections and outputs: a lane one row's (the same row for all)
+    projected = []
+    queried = []
+    my_row = None
+    for t in range_constexpr(L):
+        kp, my_row = lane_reduce_scatter(
+            [_dot4(state[4 * r : 4 * r + 4], key_t[t]) for r in range(rows)],
+            LANE_OFFSETS,
+            lane,
+            architecture=GFX1250,
+        )
+        qp, _ = lane_reduce_scatter(
+            [_dot4(state[4 * r : 4 * r + 4], query_t[t]) for r in range(rows)],
+            LANE_OFFSETS,
+            lane,
+            architecture=GFX1250,
+        )
+        projected.append(kp)
+        queried.append(qp)
+    values = []
+    outputs = []
+    for t in range_constexpr(L):
+        correction = projected[t]
+        for j in range_constexpr(t):
+            correction = correction + m[(t, j)] * values[j]
+        values.append(
+            (fx.ptr_load(c["vloc"] + t * HEAD_DIM + row0 + my_row) - correction)
+            * beta[t]
+        )
+        output = queried[t]
+        for j in range_constexpr(t + 1):
+            output = output + p[(t, j)] * values[j]
+        outputs.append(live.select(_bf16_round(output), fx.Float32(0.0)))
+    if const_expr(replayed):
+        _chunk_u_stores(c, k, values, my_row, live, row0, rows)
+    else:
+        for t in range_constexpr(L):
+            row_values = lane_all_gather(
+                values[t], rows, LANE_OFFSETS, lane, architecture=GFX1250
+            )
+            state = [
+                state[4 * r + e] * decay[t][e] + row_values[r] * key[t][e]
+                for r in range(rows)
+                for e in range(4)
+            ]
+            _chunk_state_store(c, head, t, state, live, row0, rows)
+    _chunk_output_stores(c, outputs, my_row, row0, rows)
+    if const_expr(rows == ROWS):
+        _chunk_norm_sums(c, outputs)
+    gpu.barrier()
+
+
+def chunk_interaction_words(qlen: int) -> int:
+    """A wave's ``fa`` words for the chunked recurrence's interactions (qlen^2
+    of them: M's strictly lower and P's lower triangle), whole 16-sum groups."""
+    return -(-qlen * qlen // CHUNK_SUM_GROUP) * CHUNK_SUM_GROUP
+
+
+def _wave_sums(c, vs):
+    """Every lane all of ``vs``' sums over the wave: reduce-scattered 16 at a
+    time (a lane pair one sum: the lane masks the token recurrence's
+    reductions already hold, past SGPRs the resident loop keeps full), through
+    the wave's words of ``fa`` (the gates read it before the recurrence, the
+    next task writes it past its closing barrier)."""
+    lane = c["lane"]
+    size = GFX1250.wave_size
+    padded = chunk_interaction_words(c["L"])
+    assert len(vs) <= padded
+    assert padded * (c["matrix_threads"] // size) <= c["L"] * GATE_K, c["L"]
+    # the wave's words from the lane's thread index: an SGPR base would be
+    # hoisted out of the resident loop
+    base = c["fa"] + (c["tid"] - lane) // size * padded
+    count = len(vs)
+    vs = vs + [fx.Float32(0.0)] * (padded - count)
+    for group in range_constexpr(padded // CHUNK_SUM_GROUP):
+        total, index = lane_reduce_scatter(
+            vs[group * CHUNK_SUM_GROUP : (group + 1) * CHUNK_SUM_GROUP],
+            LANE_OFFSETS,
+            lane,
+            architecture=GFX1250,
+        )
+        # both lanes of the pair: the same word, the same bits
+        fx.ptr_store(total, base + group * CHUNK_SUM_GROUP + index)
+    return [fx.ptr_load(base + index) for index in range(count)]
+
+
+def _load4(base, token, column):
+    return [fx.ptr_load(base + token * GATE_K + column + e) for e in range(4)]
+
+
+def _dot4(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3]
+
+
+def _span_dot(a, b, span):
+    return _dot4(a, b if span is None else [b[e] * span[e] for e in range(4)])
+
+
+@traced
+def _chunk_u_stores(c, k, values, row, live, row0, rows):
+    """The tokens' u records (bf16, ``replay_u_store``'s), a row's from one of
+    its lanes, the outputs' lanes: one guarded block for every token."""
+    if live & (c["lane"] % (GFX1250.wave_size // rows) == 0):
+        destination = rsrc(k["rec"]["u"])
+        at = k["replay"]["rbase"] * HEAD_DIM + row0 + row
+        for token in range_constexpr(len(values)):
+            bo.buffer_store(
+                fx.Float32(values[token]).to(fx.BFloat16),
+                destination,
+                at + token * HEAD_DIM,
+            )
+
+
+@traced
+def _chunk_output_stores(c, outputs, row, row0, rows):
+    """The tokens' outputs of a lane's row to ``ol``, one guarded block."""
+    if c["lane"] % (GFX1250.wave_size // rows) == 0:
+        for token in range_constexpr(len(outputs)):
+            fx.ptr_store(outputs[token], c["ol"] + token * HEAD_DIM + row0 + row)
+
+
+@traced
+def _chunk_state_store(c, head, token, state, live, row0, rows):
+    """Token ``token``'s state in its DSpark slot, as ``kda_recur_head``."""
+    args = c["args"]
+    slot = uniform(fx.ptr_load(c["slots"] + token))
+    if (slot >= 0) & live:
+        destination = rsrc(
+            args["rstate"] + fx.Int64(slot) * fx.Int64(args["rs_seq"]) * 4
+        )
+        for row in range_constexpr(rows):
+            bo.buffer_store(
+                fx.Vector.from_elements(state[4 * row : 4 * row + 4], fx.Float32),
+                destination,
+                (head * GATE_K + row0 + row) * GATE_K + c["lane"] * 4,
+            )
+
+
+@traced
+def _chunk_norm_sums(c, outputs):
+    """The wave's output norm sums of every token (``kda_recur_head``'s
+    ``head_onrm`` words): a row's square from one of its lanes, summed over
+    the wave, stored by lane 0."""
+    lane, L = c["lane"], c["L"]
+    owner = lane % (GFX1250.wave_size // ROWS) == 0
+    sums = [
+        butterfly(
+            owner.select(o * o, fx.Float32(0.0)), LANE_OFFSETS, architecture=GFX1250
+        )
+        for o in outputs
+    ]
+    if lane == 0:
+        for token in range_constexpr(L):
+            fx.ptr_store(
+                sums[token], c["head_onrm"] + token * STATE_CHUNKS + c["wave"]
+            )
 
 
 def _head_state_loads(c, slot, head):
@@ -1342,7 +1578,10 @@ def kda_head(c, request, head, share=None):
     metadata["replay"] = replay
     metadata["rec"] = records
     c["head_onrm"] = c["head_onrm_lds"]
-    kda_recur_head(c, metadata, request, head)
+    if const_expr(c.get("chunk_recur", False) and c["L"] > 1):
+        kda_recur_head_chunk(c, metadata, request, head)
+    else:
+        kda_recur_head(c, metadata, request, head)
     tdm_timeline.stamp(tdm_timeline.HEAD_RECUR)
     if const_expr(split > 1):
         _head_norm_exchange(c, request, head, share)

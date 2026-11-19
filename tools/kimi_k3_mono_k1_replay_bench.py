@@ -8,6 +8,10 @@ each step's records written; ``H`` committed records (non-flush: h + 2 window
 <= cache_len, else a flush that folds them into the checkpoint first). The
 step's K1 never moves the cursor, so every launch replays the same h.
 
+CHUNK_AB=1 times the chunked head recurrence (ATOM_KIMI_MONO_K1_CHUNK_RECUR)
+against the sequential one instead, each arm off and on at every cursor: ABBA
+rounds seq / chunk / chunk / seq, then the sustained arms the same way.
+
 Run on one gfx1250 GPU: ROWS=40 H=0,5,6,8,11 python tools/kimi_k3_mono_k1_replay_bench.py"""
 
 import json
@@ -31,6 +35,7 @@ RUNS = int(os.environ.get("RUNS", "8"))
 # seconds each arm replays back to back after the bursts (0: none), at cursor
 SUSTAIN = float(os.environ.get("SUSTAIN", "0"))
 SUSTAIN_H = int(os.environ.get("SUSTAIN_H", "4"))
+CHUNK_AB = os.environ.get("CHUNK_AB", "0") == "1"
 dev, gen = rc.dev, rc.gen
 QLEN, CAP, WINDOW = rc.QLEN, rc.CAP, rc.WINDOW
 
@@ -62,10 +67,16 @@ def main():
     plan = Gfx1250KimiBuildPlan(
         threads=256, blocks=256, lds_bytes=320 * 1024, tokens=ROWS, nblocks=1
     )
-    kernels = {
-        "off": plan.make_k1_local_runner(rc.spec(ROWS, False)).prepare(dev),
-        "on": plan.make_k1_local_runner(rc.spec(ROWS, True)).prepare(dev),
-    }
+    if CHUNK_AB:
+        kernels = {}
+        for arm, chunk in (("seq", False), ("chunk", True)):
+            on_k1, off_k1 = rc.builds(plan, ROWS, chunk)
+            kernels[f"off_{arm}"], kernels[f"on_{arm}"] = off_k1, on_k1
+    else:
+        kernels = {
+            "off": plan.make_k1_local_runner(rc.spec(ROWS, False)).prepare(dev),
+            "on": plan.make_k1_local_runner(rc.spec(ROWS, True)).prepare(dev),
+        }
     prefix = rc.bf16(ROWS, rc.HIDDEN)
     slots = req * QLEN + req
     conv = rc.bf16(slots, 3 * rc.PROJ, rc.SL, scale=0.5)
@@ -138,6 +149,9 @@ def main():
         held.append((blk1, core, runtime))
         return lambda: k1(runtime, stream=torch.cuda.current_stream())
 
+    if CHUNK_AB:
+        chunk_ab(kernels, launcher, st_off, st_on, table, write_pos)
+        return
     graphs = {"off": graph(launcher(kernels["off"], st_off, None))}
     on = graph(launcher(kernels["on"], st_on, table))
     times = {"off": []}
@@ -188,6 +202,69 @@ def main():
         "sustained_h": SUSTAIN_H if SUSTAIN > 0 else None,
     }
     print(json.dumps(report), flush=True)
+
+
+def sustain(g):
+    start, end = torch.cuda.Event(True), torch.cuda.Event(True)
+    launches, began = 0, time.monotonic()
+    start.record()
+    while time.monotonic() - began < SUSTAIN:
+        for _ in range(50):
+            g.replay()
+        launches += 50 * REPS
+        torch.cuda.synchronize()
+    end.record()
+    torch.cuda.synchronize()
+    return round(start.elapsed_time(end) * 1000 / launches, 2)
+
+
+def chunk_ab(kernels, launcher, st_off, st_on, table, write_pos):
+    graphs = {
+        name: graph(
+            launcher(k1, st_off, None)
+            if name.startswith("off")
+            else launcher(k1, st_on, table)
+        )
+        for name, k1 in kernels.items()
+    }
+    cases = [("off", None)] + [("on", h) for h in HS]
+    times = {}
+
+    def timed(kind, h, arm):
+        if h is not None:
+            write_pos.fill_(h)
+            torch.cuda.synchronize()
+        label = f"{kind}{'' if h is None else f'_h{h}'}_{arm}"
+        times.setdefault(label, []).append(time_us(graphs[f"{kind}_{arm}"]))
+
+    for _ in range(RUNS):
+        for kind, h in cases:
+            for arm in ("seq", "chunk", "chunk", "seq"):
+                timed(kind, h, arm)
+    sustained = {}
+    if SUSTAIN > 0:
+        for kind in ("off", "on"):
+            write_pos.fill_(SUSTAIN_H)
+            torch.cuda.synchronize()
+            for arm in ("seq", "chunk", "chunk", "seq"):
+                sustained.setdefault(f"{kind}_{arm}", []).append(
+                    sustain(graphs[f"{kind}_{arm}"])
+                )
+    print(
+        json.dumps(
+            {
+                "rows": ROWS,
+                "names": {t: k.entrypoint.name for t, k in kernels.items()},
+                "median_us": {
+                    t: round(sorted(v)[len(v) // 2], 2) for t, v in times.items()
+                },
+                "min_us": {t: round(min(v), 2) for t, v in times.items()},
+                "sustained_us": sustained,
+                "sustained_h": SUSTAIN_H if SUSTAIN > 0 else None,
+            }
+        ),
+        flush=True,
+    )
 
 
 if __name__ == "__main__":
