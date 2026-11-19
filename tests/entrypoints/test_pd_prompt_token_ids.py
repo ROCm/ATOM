@@ -23,6 +23,7 @@ from atom.entrypoints.openai.protocol import (
 from atom.model_engine.multimodal_runtime import multimodal_cache_seed
 from atom.model_engine.sequence import Sequence, SequenceStatus
 from atom.sampling_params import SamplingParams
+from conftest import gpu_stack_import
 
 PROMPT_IDS = [101, 102, 103, 104]
 
@@ -328,6 +329,7 @@ def test_generate_async_reads_prompt_ids_from_local_sequence(
                 finished=True,
                 finish_reason="eos",
                 num_cached_tokens=0,
+                kv_transfer_params_output=None,
             )
         )
         return seq
@@ -747,16 +749,41 @@ class TestMultimodalPD:
         assert d_seq.kv_transfer_params["remote_block_ids"] == [3, 4]
         assert d_seq.cache_seed == p_seq.cache_seed == pd_engine.media_seed
         assert d_seq.mrope_position_delta == p_seq.mrope_position_delta == -2
+        assert d_seq.media_on_prefill_instance
+        assert not p_seq.media_on_prefill_instance
 
-    def test_decode_without_cache_seed_keeps_the_text_seed(self, pd_engine):
+    def test_decode_without_cache_seed_preprocesses_the_media(self, pd_engine):
+        # As from a prefill instance that hands off no cache seed.
         kv = {"do_remote_prefill": True, "prompt_token_ids": PROMPT_IDS}
         (decode,) = _post_chat(
             [{"model": "m", "messages": IMAGE_MESSAGES, "kv_transfer_params": kv}]
         )
         assert decode.status_code == 200, decode.text
         (seq,) = pd_engine.seqs
-        assert pd_engine.prepared == [] and seq.cache_seed == -1
-        assert seq.mrope_position_delta == 0
+        assert len(pd_engine.prepared) == 1 and seq.multimodal_data is not None
+        assert seq.cache_seed == pd_engine.media_seed
+        assert seq.mrope_position_delta == -2
+        assert not seq.media_on_prefill_instance
+
+    @pytest.mark.parametrize(
+        "key,value",
+        [
+            ("cache_seed", "9"),
+            ("cache_seed", 9.0),
+            ("cache_seed", True),
+            ("cache_seed", None),
+            ("mrope_position_delta", -2.5),
+            ("mrope_position_delta", "-2"),
+        ],
+    )
+    def test_non_integer_handoff_key_is_400_before_enqueue(self, pd_engine, key, value):
+        kv = {"do_remote_prefill": True, "prompt_token_ids": PROMPT_IDS, key: value}
+        (decode,) = _post_chat(
+            [{"model": "m", "messages": IMAGE_MESSAGES, "kv_transfer_params": kv}]
+        )
+        assert decode.status_code == 400, decode.text
+        assert key in decode.text
+        assert pd_engine.seqs == [] and pd_engine.prepared == []
 
     def test_prefill_without_handoff_returns_no_kv_params(self, pd_engine):
         (response,) = _post_chat([{"model": "m", "messages": IMAGE_MESSAGES}])
@@ -799,6 +826,41 @@ def test_preempted_decode_fails_only_without_media(scheduler, seq_factory, image
     else:
         assert seq.status == SequenceStatus.WAITING
         assert list(scheduler.waiting) == [seq] and not scheduler.take_rejected()
+
+
+def _decode_batch_of_handed_off_seq(scheduler, seq_factory):
+    """Schedule a media-less decode leg past its first step; return its
+    decode batch."""
+    kv = {"do_remote_prefill": False, "cache_seed": 9, "mrope_position_delta": -2}
+    seq = seq_factory(list(PROMPT_IDS), kv_transfer_params=kv)
+    assert seq.mrope_positions is None
+    scheduler.add(seq)
+    scheduler.schedule()
+    seq.append_token(5)
+    batch, _ = scheduler.schedule()
+    return seq, batch
+
+
+def test_handed_off_mrope_delta_reaches_the_batch(scheduler, seq_factory):
+    seq, batch = _decode_batch_of_handed_off_seq(scheduler, seq_factory)
+    assert batch.mrope_position_deltas == {seq.id: -2}
+
+
+def test_handed_off_mrope_delta_offsets_decode_positions(scheduler, seq_factory):
+    backends = gpu_stack_import("atom.model_ops.attentions.backends")
+    _, batch = _decode_batch_of_handed_off_seq(scheduler, seq_factory)
+    # The decode-position builder over CPU planes in place of its H2D staging.
+    planes = np.full((3, 1), -1, dtype=np.int64)
+    builder = SimpleNamespace(
+        model_runner=SimpleNamespace(use_mrope=True),
+        _mrope_cpu_view=lambda n: planes[:, :n],
+        _stage_mrope=lambda n, _group: planes[:, :n],
+    )
+    positions = backends.CommonAttentionBuilder._build_mrope_decode_positions(
+        builder, batch, np.asarray(batch.context_lens), None
+    )
+    # The sampled token sits at index 4; P's delta moves it to position 2.
+    assert positions.tolist() == [[2], [2], [2]]
 
 
 @pytest.mark.parametrize("stream", [False, True])
