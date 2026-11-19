@@ -607,8 +607,8 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
     ) -> torch.Tensor:
         """`[bs, draft]` table into the flat `intermediate_ssm` slot pool.
 
-        Cached per shape and filled in place: CUDA graph replay requires the
-        tensor address to stay put across iterations.
+        Built once per shape and never mutated. `_verify_batched_ssm` hands the
+        kernel a pad-masked copy, not this table.
         """
         cache = getattr(self, "_spec_slot_table_cache", None)
         if cache is None:

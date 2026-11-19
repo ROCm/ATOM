@@ -1,4 +1,4 @@
-"""Differential tests for the default batched GDN target-verify path.
+"""Differential tests for the batched GDN target-verify path.
 
 The production SGLang plugin folds the whole draft block into one conv update
 and one SSM recurrent call. These tests retain the removed per-draft-step

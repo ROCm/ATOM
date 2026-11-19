@@ -1,7 +1,10 @@
-"""End-to-end coverage for the default batched DFLASH verify path.
+"""End-to-end coverage for the batched (non-ReplaySSM) DFLASH verify path.
+
+With MTP, TARGET_VERIFY goes through ReplaySSM by default; this path runs only
+with ``ATOM_ENABLE_REPLAYSSM=0``. Every test here forces ReplaySSM off.
 
 ``test_gdn_target_verify_batched_equiv.py`` compares the two *kernel call
-patterns in isolation. This module drives the real, always-batched
+patterns in isolation. This module drives the real
 ``SGLangGatedDeltaNet.forward()`` TARGET_VERIFY path and asserts the plugin's
 observable contract:
 
@@ -27,6 +30,12 @@ from atom.plugin.sglang.runtime import bind_current_forward_batch
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="GDN kernels require a GPU"
 )
+
+
+@pytest.fixture(autouse=True)
+def _replayssm_off(monkeypatch):
+    monkeypatch.setenv("ATOM_ENABLE_REPLAYSSM", "0")
+
 
 # Qwen3.5-397B per-rank GDN shape at TP8.
 NUM_K_HEADS = 16
@@ -246,7 +255,6 @@ def test_pad_rows_zeroed_and_real_rows_unchanged(monkeypatch, draft, flydsl_deco
     """
     import atom.plugin.sglang.attention_backend.attention_gdn as gdn_mod
 
-    monkeypatch.setattr(gdn_mod, "replayssm_enabled", lambda: False)
     real_slots = [5, 2, 9, 17]
     padded_slots = [5, -1, 9, -1]
     bs = len(padded_slots)
@@ -274,6 +282,10 @@ def test_pad_rows_zeroed_and_real_rows_unchanged(monkeypatch, draft, flydsl_deco
     assert torch.equal(
         padded["intermediate_ssm"][real_rows], reference["intermediate_ssm"][real_rows]
     )
+    # Step 0 holds the host seed ssm_states[-1]; the kernel must not write the
+    # pad rows' later steps.
+    pad_steps = padded["intermediate_ssm"][pad_rows][:, 1:]
+    assert torch.equal(pad_steps, torch.zeros_like(pad_steps))
     torch.testing.assert_close(padded["ssm_live"], padded["ssm_before"], rtol=0, atol=0)
 
 
