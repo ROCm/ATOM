@@ -529,8 +529,9 @@ impl RouterConfig {
             .unwrap_or(DEFAULT_MAX_TOKENIZE_BYTES)
     }
 
-    /// Whether P/D planners select decode first and prefill on the decode's DP rank:
-    /// the ATOM backend with idx2idx rank mapping.
+    /// Whether the HTTP PD router's and ext-proc's planners select decode first and
+    /// prefill on the decode's DP rank: the ATOM backend with idx2idx rank mapping. gRPC
+    /// PD does not map ranks.
     pub fn prefill_on_decode_rank(&self) -> bool {
         matches!(self.backend, BackendType::Atom)
             && matches!(

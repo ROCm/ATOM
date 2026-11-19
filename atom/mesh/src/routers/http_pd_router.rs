@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, LazyLock},
     time::{Duration, Instant},
 };
 
@@ -11,6 +11,7 @@ use axum::{
     http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
+use dashmap::DashSet;
 use futures_util::StreamExt;
 
 #[cfg(test)]
@@ -34,7 +35,7 @@ use crate::{
                 vllm::{VllmAdapter, VllmPrefillInfo},
                 BackendAdapter, PairCtx,
             },
-            planner::{idx2idx_rank, DefaultPlanner},
+            planner::{idx2idx, DefaultPlanner, Idx2Idx},
             registry_adapters::{PolicyRegistryAdapter, WorkerRegistryAdapter},
             traits::PdPlanner,
             types::{PlacementPlan, Protocol, RequestDescriptor},
@@ -499,15 +500,29 @@ impl PDRouter {
         prefill: Arc<dyn Worker>,
         decode: &Arc<dyn Worker>,
     ) -> Arc<dyn Worker> {
-        let Some(decode_dp_rank) = idx2idx_rank(prefill.as_ref(), decode.as_ref()) else {
-            debug!(
-                "ATOM PD rank mapping policy=idx2idx keeps prefill={} prefill_dp_size={:?} decode={} decode_dp_rank={:?}",
-                prefill.url(),
-                prefill.dp_size(),
-                decode.url(),
-                decode.dp_rank()
-            );
-            return prefill;
+        let decode_dp_rank = match idx2idx(prefill.as_ref(), decode.as_ref()) {
+            Idx2Idx::Move(rank) => rank,
+            Idx2Idx::Keep => {
+                debug!(
+                    "ATOM PD rank mapping policy=idx2idx keeps prefill={} decode={}",
+                    prefill.url(),
+                    decode.url()
+                );
+                return prefill;
+            }
+            Idx2Idx::OutOfRange { rank, size } => {
+                // A deployment fault rather than a request's: warn once per prefill.
+                static WARNED: LazyLock<DashSet<String>> = LazyLock::new(DashSet::new);
+                if WARNED.insert(prefill.base_url().to_string()) {
+                    warn!(
+                        "ATOM PD rank mapping policy=idx2idx: decode rank {} is outside prefill {} dp_size {}, so its ranks are not mapped; check the prefill and decode DP sizes",
+                        rank,
+                        prefill.base_url(),
+                        size
+                    );
+                }
+                return prefill;
+            }
         };
 
         let mapped_url = format!("{}@{}", prefill.base_url(), decode_dp_rank);
