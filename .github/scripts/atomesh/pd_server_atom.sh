@@ -1064,9 +1064,9 @@ purge_lmcache_disk() {
 #    pages its NICs refuse to register.
 #  - MOONCAKE_STORE_WAIT_TIMEOUT (default 1200 s) bounds each wait for the
 #    Store once this node has compacted: for every pool to count its owners,
-#    and on a decode node for the prefill node's masters. A wait on the other
+#    and on a decode node for the prefill node's masters. A wait on another
 #    node's part also allows for that node's compaction, which its Store waits
-#    for: 2 x MOONCAKE_STORE_COMPACT_TIMEOUT, one per NUMA node.
+#    for: MOONCAKE_STORE_COMPACT_TIMEOUT per NUMA node its owners pin.
 # Every Mooncake process runs with MC_NUM_QP_PER_EP=1, the decode workers' P->D
 # transfer engine included (peers with different QP counts cannot connect).
 # The launcher owns the workers' ATOM_KV_OFFLOAD and
@@ -1202,18 +1202,27 @@ plan_mooncake_store_owners() {
     mooncake_owner_plan_numa mooncake_owner_plan_gib mooncake_owner_plan_devices
 }
 
-# The nodes that start MOONCAKE_STORE_DECODE_OWNERS, each once: every decode
+# mooncake_node_starts_decode_owners <rank>: whether that node's decode workers
+# start MOONCAKE_STORE_DECODE_OWNERS; a packed prefill's node has its own owners.
+mooncake_node_starts_decode_owners() {
+  [[ "${ATOMESH_PD_WORKER_LAYOUT:-multi_node}" != "packed_nodes" \
+    || "$1" != "${prefill_nodes[0]:-0}" ]]
+}
+
+# How many nodes start MOONCAKE_STORE_DECODE_OWNERS, each once: every decode
 # node under multi_node, each node with decode workers only under packed_nodes.
-mooncake_decode_owner_nodes() {
+mooncake_decode_owner_node_count() {
   local node
-  local -A decode_only=()
+  local -A owner_nodes=()
   case "${ATOMESH_PD_WORKER_LAYOUT:-multi_node}" in
     multi_node) echo $(( ${yD:-1} * ${DECODE_NODES_PER_WORKER:-1} )) ;;
     packed_nodes)
       for node in ${decode_nodes[@]+"${decode_nodes[@]}"}; do
-        [[ "${node}" == "${prefill_nodes[0]:-0}" ]] || decode_only[${node}]=1
+        if mooncake_node_starts_decode_owners "${node}"; then
+          owner_nodes[${node}]=1
+        fi
       done
-      echo "${#decode_only[@]}"
+      echo "${#owner_nodes[@]}"
       ;;
     *) echo 0 ;;
   esac
@@ -1227,9 +1236,9 @@ plan_mooncake_store_pools() {
   local -a numa=() gib=() devices=()
   parse_mooncake_owner_spec MOONCAKE_STORE_OWNERS numa gib devices
   if [[ -n "$(mooncake_setting MOONCAKE_STORE_DECODE_OWNERS)" ]]; then
-    local node nodes
-    nodes="$(mooncake_decode_owner_nodes)"
-    for ((node = 0; node < nodes; node++)); do
+    local node node_count
+    node_count="$(mooncake_decode_owner_node_count)"
+    for ((node = 0; node < node_count; node++)); do
       parse_mooncake_owner_spec MOONCAKE_STORE_DECODE_OWNERS numa gib devices
     done
   fi
@@ -1389,11 +1398,11 @@ check_mooncake_store_settings() {
   require_mooncake_qp_per_endpoint
   refuse_mooncake_nic_auto_discovery
   local layout="${ATOMESH_PD_WORKER_LAYOUT:-multi_node}" num_prefill="${xP:-1}"
-  local decode_owner_nodes
-  decode_owner_nodes="$(mooncake_decode_owner_nodes)"
+  local decode_owner_node_count
+  decode_owner_node_count="$(mooncake_decode_owner_node_count)"
   if [[ -n "$(mooncake_setting MOONCAKE_STORE_DECODE_OWNERS)" ]] \
-    && [[ "${num_prefill}" != "1" || "${decode_owner_nodes}" == "0" ]]; then
-    echo "[mooncake-store][FAIL] MOONCAKE_STORE_DECODE_OWNERS needs the decode on nodes of its own (pd_worker_layout multi_node or packed_nodes, here ${layout}, with ${decode_owner_nodes} such node(s)) and one prefill worker (here ${num_prefill}), whose node's masters they join" >&2
+    && [[ "${num_prefill}" != "1" || "${decode_owner_node_count}" == "0" ]]; then
+    echo "[mooncake-store][FAIL] MOONCAKE_STORE_DECODE_OWNERS needs the decode on nodes of its own (pd_worker_layout multi_node or packed_nodes, here ${layout}, with ${decode_owner_node_count} such node(s)) and one prefill worker (here ${num_prefill}), whose node's masters they join" >&2
     exit 2
   fi
   # This shell starts one Store, planned for its first prefill worker's GPUs;
@@ -1931,20 +1940,17 @@ start_mooncake_store() {
   echo "[wait][OK] mooncake-store masters=${host_ip}:${ATOMESH_MOONCAKE_MASTER_PORT}+100/pool pools=${mooncake_pool_devices[*]:-shared} metrics=http://${host_ip}:${ATOMESH_MOONCAKE_METRICS_PORT}/metrics"
 }
 
-# On a decode node (mooncake_decode_owner_nodes): starts
+# On a node that starts them (mooncake_node_starts_decode_owners): starts
 # MOONCAKE_STORE_DECODE_OWNERS on this node's memory, joining the prefill
 # node's masters, before the decode workers load. Waits until every pool counts
 # the owners of all nodes, as the prefill node does before its workers start.
 start_mooncake_store_decode_owners() {
   mooncake_store_requested || return 0
   [[ -n "$(mooncake_setting MOONCAKE_STORE_DECODE_OWNERS)" ]] || return 0
-  # Packed nodes start decode workers on the prefill's node too, and several
-  # on the others: each such node's first one starts the owners.
-  if [[ "${ATOMESH_PD_WORKER_LAYOUT:-multi_node}" == "packed_nodes" ]]; then
-    [[ "${NODE_RANK}" != "${prefill_nodes[0]:-0}" ]] || return 0
-    [[ -z "${mooncake_store_decode_owners_started:-}" ]] || return 0
-    mooncake_store_decode_owners_started=1
-  fi
+  # Once per node, at its first decode worker: a packed node can run several.
+  mooncake_node_starts_decode_owners "${NODE_RANK}" || return 0
+  [[ -z "${mooncake_store_decode_owners_started:-}" ]] || return 0
+  mooncake_store_decode_owners_started=1
   plan_mooncake_store_pools
   plan_mooncake_store_owners MOONCAKE_STORE_DECODE_OWNERS
   check_mooncake_owner_devices
@@ -1954,15 +1960,15 @@ start_mooncake_store_decode_owners() {
   mooncake_store_logs=()
   mooncake_store_names=()
   mooncake_store_master_count=0
-  local timeout
-  timeout="$(mooncake_store_wait_timeout)"
   # The prefill node starts its masters only once it has compacted its memory.
   wait_for_mooncake_store "prefill-node masters" \
     "$(mooncake_store_cross_node_timeout MOONCAKE_STORE_OWNERS)" \
     mooncake_masters_ready "${NODE0_ADDR}"
   start_mooncake_store_owners "${NODE0_ADDR}"
   echo "[wait] mooncake-store decode owners=${#mooncake_owner_plan_numa[@]} joining ${NODE0_ADDR}"
-  wait_for_mooncake_store "owners" "${timeout}" \
+  # Another decode node mounts its owners only once it has compacted, too.
+  wait_for_mooncake_store "owners" \
+    "$(mooncake_store_cross_node_timeout MOONCAKE_STORE_DECODE_OWNERS)" \
     mooncake_store_capacity_reaches "${NODE0_ADDR}"
   report_mooncake_store_owners
   echo "[wait][OK] mooncake-store decode owners mounted on ${NODE0_ADDR}'s pools ${mooncake_pool_devices[*]:-shared}"

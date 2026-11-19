@@ -614,8 +614,9 @@ done
         for env in (
             {"ATOMESH_PD_WORKER_LAYOUT": "single_node", "xP": "1"},
             {"ATOMESH_PD_WORKER_LAYOUT": "multi_node", "xP": "2"},
-            # Several decode workers on one node would each start them.
+            # Only multi_node and packed_nodes count the nodes that start them.
             {"ATOMESH_PD_WORKER_LAYOUT": "decode_single_node", "xP": "1"},
+            {"ATOMESH_PD_WORKER_LAYOUT": "prefill_single_node", "xP": "1"},
         ):
             with self.subTest(env=env):
                 result = self.run_shell(
@@ -867,6 +868,42 @@ stop_mooncake_store
         self.assertEqual(len(self.store_calls("mooncake_client")), 2)
         for pid in self.stub_pids():
             self.assertFalse(self.alive(pid), pid)
+
+    def test_a_decode_node_allows_for_the_other_decode_nodes_compaction(self):
+        # The other decode node mounts its owners 5 s after this one: past the
+        # 2 s wait, inside the 10 s allowed for its one NUMA node.
+        port = self.master_port
+        (self.root / "segments").write_text(f"{port} {8 * GIB}\n")
+        result = self.run_shell(
+            f"""
+setsid python3 /scripts/numa_exec.py 0 mooncake_master --rpc_port={port} \
+  >/dev/null 2>&1 &
+(
+  for _ in $(seq 150); do
+    [[ "$(wc -l < "${{STUB_DIR}}/segments")" -ge 2 ]] && break
+    sleep 0.2
+  done
+  sleep 5
+  echo "{port} {8 * GIB}" >> "${{STUB_DIR}}/segments"
+) >/dev/null 2>&1 &
+start_mooncake_store_decode_owners
+stop_mooncake_store
+""",
+            NODE_RANK="1",
+            NODE0_ADDR=HOST,
+            host_ip="127.0.0.2",
+            ATOMESH_PD_WORKER_LAYOUT="multi_node",
+            xP="1",
+            yD="2",
+            MOONCAKE_STORE="0",
+            ATOMESH_PREFILL_ENV_MOONCAKE_STORE="1",
+            ATOMESH_PREFILL_ENV_MOONCAKE_STORE_OWNERS="0:8:rdma0",
+            ATOMESH_PREFILL_ENV_MOONCAKE_STORE_DECODE_OWNERS="0:8:rdma1",
+            ATOMESH_PREFILL_ENV_MOONCAKE_STORE_WAIT_TIMEOUT="2",
+            ATOMESH_PREFILL_ENV_MOONCAKE_STORE_COMPACT_TIMEOUT="10",
+        )
+        self.assertIn("decode owners mounted", result.stdout)
+        self.assertEqual(len(self.store_calls("mooncake_client")), 1)
 
     def test_the_prefill_node_stops_waiting_once_the_decode_node_failed(self):
         # The decode node's owners failed to mount and its launcher exited 1:
