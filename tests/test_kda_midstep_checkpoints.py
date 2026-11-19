@@ -144,7 +144,10 @@ def test_the_state_pool_lends_scratch_only_where_it_is_borrowed(k3_modules):
 
     def extra(**kw):
         b = object.__new__(K3.KimiAiterMLAGDNMetadataBuilder)
-        b.model_runner = builder(K3._KimiMLAGDNCommon, **kw).model_runner
+        inputs = builder(K3._KimiMLAGDNCommon, **kw)
+        b.model_runner = inputs.model_runner
+        b.num_spec, b.replayssm = inputs.num_spec, inputs.replayssm
+        b._kpool_size = inputs._kpool_size
         b.num_state_layers = lambda: 1
         b._state_shape_for_runner = lambda: ((3, 8), (1, 2, 2))
         b._state_dtypes = lambda: (torch.bfloat16, torch.float32)
@@ -155,6 +158,18 @@ def test_the_state_pool_lends_scratch_only_where_it_is_borrowed(k3_modules):
 
     assert extra() == K3.MIDSTEP_SCRATCH_SLOTS > 0
     assert extra(pp=2) == extra(model_type="glm5_next_text") == 0
+
+    from atom.model_ops.attentions.gdn_attn import DECODE_SNAPSHOT_SCRATCH_SLOTS
+
+    # Midstep and decode images borrow from the same pool; keep both budgets.
+    assert extra(replayssm=True, interval=32) == (
+        K3.MIDSTEP_SCRATCH_SLOTS + DECODE_SNAPSHOT_SCRATCH_SLOTS
+    )
+    assert extra(replayssm=True, interval=32, pp=2) == DECODE_SNAPSHOT_SCRATCH_SLOTS
+    assert extra(replayssm=True, interval=-1) == K3.MIDSTEP_SCRATCH_SLOTS
+    assert extra(replayssm=True, interval=32, prefix_caching=False) == (
+        K3.MIDSTEP_SCRATCH_SLOTS
+    )
 
 
 def test_the_builder_hands_the_forward_its_rows(k3_modules):

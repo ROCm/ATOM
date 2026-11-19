@@ -440,9 +440,10 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             ":carry=all"
         )
         if not self._reads_midstep():
-            return StateTransfer.copy(layout_id)
+            return StateTransfer.copy(layout_id, decode_keep=self._decode_keep())
         return StateTransfer.copy(
             layout_id,
+            decode_keep=self._decode_keep(),
             readable_midstep=True,
             midstep_grid=1,
             midstep_min_offset=self._conv_state_len(),
@@ -555,6 +556,11 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
                 "kpool tail bytes do not form an equal per-layer checkpoint plane"
             )
         return total // layers, layers
+
+    def _decode_image_is_conv_and_ssm(self) -> bool:
+        # By the model's kpool, not this stage's planes: under PP only the
+        # stages with indexer layers hold a tail.
+        return self._kpool_size() <= 1
 
     def _checkpoint_plane_shapes(self) -> list[tuple[int, int]]:
         """KDA planes plus the partial kpool keys needed to resume exactly."""

@@ -17,6 +17,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from types import SimpleNamespace
 
+import pytest
 import torch
 from aiter_stub import atom_without_aiter
 
@@ -38,22 +39,44 @@ def builder(
     pp=1,
     rapidserve=False,
     model_type="kimi_linear",
+    replayssm=False,
+    kpool=1,
+    kpool_tail=None,
+    prefix_caching=True,
+    interval=-1,
 ):
+    """`kpool` is the model's (GLM-5.3 pools indexer keys); `kpool_tail` says
+    whether this PP stage holds indexer layers, and with them the tail plane."""
     config = SimpleNamespace(
         pipeline_parallel_size=pp,
         enable_rapidserve=rapidserve,
         hf_config=SimpleNamespace(linear_conv_kernel_dim=4),
+        enable_prefix_caching=prefix_caching,
+        state_checkpoint_interval_tokens=interval,
     )
+    if kpool_tail is None:
+        kpool_tail = kpool > 1
+    tail = (256, 3) if kpool_tail else None
     stub = SimpleNamespace(
         model_runner=SimpleNamespace(
             config=config, hf_text_config=SimpleNamespace(model_type=model_type)
         ),
         num_state_layers=lambda: layers,
         num_spec=num_spec,
+        replayssm=replayssm,
         _state_shape_for_runner=lambda: (shape_k, shape_v),
         _state_dtypes=lambda: (dt_k, dt_v),
+        _kpool_size=lambda: kpool,
+        _kpool_tail_plane_shape=lambda: tail,
+        _checkpoint_plane_shapes=lambda: [(1, layers)] * 2 + [tail] * bool(tail),
     )
-    for name in ("_uses_paged_checkpoints", "_reads_midstep", "_conv_state_len"):
+    for name in (
+        "_uses_paged_checkpoints",
+        "_reads_midstep",
+        "_conv_state_len",
+        "_decode_keep",
+        "_decode_image_is_conv_and_ssm",
+    ):
         setattr(stub, name, getattr(builder_cls, name).__get__(stub, type(stub)))
     return stub
 
@@ -170,3 +193,35 @@ class TestPagedCheckpointsAreRefusedWhereSizingWouldRaise:
             assert not Builder.state_transfer(builder(Builder, pp=2)).readable_midstep
             glm = builder(Builder, model_type="glm5_next_text")
             assert not Builder.state_transfer(glm).readable_midstep
+
+    @pytest.mark.parametrize(
+        "replayssm, num_spec, kpool, keep",
+        [
+            (True, 2, 1, "snapshot"),
+            (True, 0, 1, "snapshot"),
+            (False, 2, 1, "snapshot"),
+            (False, 0, 1, "settled"),
+            (True, 2, 4, "none"),
+            (False, 0, 4, "settled"),
+        ],
+    )
+    def test_a_decode_boundary_keeps_what_the_slot_can_give(
+        self, replayssm, num_spec, kpool, keep
+    ):
+        """Under MTP or ReplaySSM the slot is ahead of a decode boundary, and
+        the image is rebuilt only where it is conv and SSM alone."""
+        with tp_world(TP) as Builder:
+            transfer = Builder.state_transfer(
+                builder(Builder, replayssm=replayssm, num_spec=num_spec, kpool=kpool)
+            )
+        assert transfer.decode_keep == keep
+
+    @pytest.mark.parametrize("kpool_tail", [True, False])
+    def test_every_pp_stage_of_a_kpool_model_keeps_none(self, kpool_tail):
+        """A stage with no indexer layer holds no tail plane, but the head
+        files and sizes scratch for every stage, so it answers as they do."""
+        with tp_world(TP) as Builder:
+            transfer = Builder.state_transfer(
+                builder(Builder, replayssm=True, pp=2, kpool=4, kpool_tail=kpool_tail)
+            )
+        assert transfer.decode_keep == "none"

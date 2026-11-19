@@ -443,6 +443,8 @@ class KimiSparseMoeBlock(nn.Module):
         # shared branch exists and an alt_stream was threaded in. TBO already
         # provides its own overlap, so the two are mutually exclusive.
         self._use_dual_stream = False
+        self._dual_stream_token_threshold = envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
+        self._dual_stream_decode_token_threshold = self._dual_stream_token_threshold
         if self.shared_experts is not None and self.alt_stream is not None:
             tbo_active = get_current_atom_config().enable_tbo
             if envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0 and not tbo_active:

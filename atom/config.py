@@ -468,15 +468,26 @@ class QuantizationConfig:
             return LayerQuantConfig(quant_dtype=self.torch_dtype)
 
         # 2. Pattern match
+        spec = self._pattern_spec(layer_name, layer_pattern_specs)
+        if spec is not None:
+            return spec
+
+        # 3. Global default
+        return global_spec
+
+    def online_pattern_spec(self, layer_name: str) -> LayerQuantConfig | None:
+        """The spec of the online layer pattern that matches *layer_name*, if any."""
+        return self._pattern_spec(layer_name, self.online_layer_pattern_specs)
+
+    @staticmethod
+    def _pattern_spec(layer_name, layer_pattern_specs):
         for pattern, spec in layer_pattern_specs:
             if "*" not in pattern:
                 if layer_name in pattern:
                     return spec
             elif fnmatch.fnmatch(layer_name, pattern):
                 return spec
-
-        # 3. Global default
-        return global_spec
+        return None
 
     # -- convenience properties (delegate to global_spec) ---------------------
 
@@ -1990,22 +2001,30 @@ def qrep_for_step(
     return qrep_enabled and not use_seg_mla and (not is_prefill or prefill_qrep)
 
 
+# The FP4 cache dtypes: "fp4" is MXFP4 (e2m1 + e8m0 per 32), "nvfp4" is NVFP4
+# (e2m1 + e4m3 per 16).
+FP4_CACHE_DTYPES = ("fp4", "nvfp4")
+
+
 def _check_fp4_kv(kv_cache_dtype: str, *, is_m3: bool, is_v41: bool) -> None:
-    """``--kv-cache-dtype fp4`` is MiniMax-M3.1's to ask for and DeepSeek-V4.1's own;
-    refused for every other model. The guard admits the MiniMax-M3 architecture and
+    """``--kv-cache-dtype fp4`` (MXFP4) is MiniMax-M3.1's to ask for and DeepSeek-V4.1's
+    own, and ``nvfp4`` is MiniMax-M3's alone; each is refused for every other model.
+    The guard admits the MiniMax-M3 architecture and
     ``minimax_m3.config.validate_runtime_config`` then refuses what is not M3.1
     (a model with dense attention layers)."""
     if kv_cache_dtype == "fp4" and not (is_m3 or is_v41):
         raise ValueError(
             "--kv-cache-dtype fp4 is supported by MiniMax-M3.1 and DeepSeek-V4.1 only"
         )
+    if kv_cache_dtype == "nvfp4" and not is_m3:
+        raise ValueError("--kv-cache-dtype nvfp4 is supported by MiniMax-M3 only")
 
 
 def resolve_draft_kv_dtype(target_dtype: str, *, own_pool: bool) -> str:
     """The KV dtype of a speculative draft's pages: the target's, except bf16 for a
-    draft with a pool of its own (``own_pool``) under an fp4 target, which has no
+    draft with a pool of its own (``own_pool``) under an FP4 target, which has no
     draft layout. A draft in the target's pool has the target's dtype."""
-    return "bf16" if own_pool and target_dtype == "fp4" else target_dtype
+    return "bf16" if own_pool and target_dtype in FP4_CACHE_DTYPES else target_dtype
 
 
 def indexer_cp_unsupported_reason(
@@ -2016,6 +2035,7 @@ def indexer_cp_unsupported_reason(
     dcp_size: int,
     enable_tbo: bool,
     plugin_mode: bool = False,
+    nvfp4_caches: bool = False,
 ) -> str | None:
     """Why MiniMax-M3 indexer-only context parallelism cannot run here, or None.
 
@@ -2043,6 +2063,8 @@ def indexer_cp_unsupported_reason(
         # error. ``indexer_cp_enabled`` refuses them at runtime; this clears the
         # flag so nothing downstream (log line, compile hash) disagrees.
         return "plugin mode (the vLLM/SGLang bridges keep the TP indexer path)"
+    if nvfp4_caches:
+        return "the NVFP4 caches are not wired to the CP scorer"
     if dcp_size > 1:
         return (
             "decode_context_parallel_size > 1 (KV-cache DCP owns the context "
@@ -2376,6 +2398,10 @@ class Config:
     # from all2all backend/mode: Mega owns dispatch, both GEMMs, and combine.
     moe_backend: str = "standard"
     runner_qualname: str = "atom.model_engine.model_runner.ModelRunner"
+    # The runners take weight syncs and say which they cannot
+    # (`get_worker_capabilities`), as RLHFModelRunner does: EngineCore asks
+    # them once, at startup. Set by AsyncLLMEngine.
+    weight_sync_runner: bool = False
     # EPLB master switch + sub-config
     eplb_enable: bool = False
     eplb_config: EPLBConfig = field(default_factory=EPLBConfig)
@@ -2534,8 +2560,9 @@ class Config:
         `busy_loop` outright (`pp_engine_core.py`), so `bump_step` is never
         reached and the line would go silent after announcing a logging mode.
         RapidServe and P/D are a scope choice: `PrefillEngineCore` and
-        `DecodeEngineCore` inherit the base loop and override only
-        `_process_engine_step`, so the counter would in fact advance there --
+        `DecodeEngineCore` inherit the base loop and override only a step
+        method, `_process_engine_step` and `_process_engine_step_inner`
+        respectively, so the counter would in fact advance there --
         it is simply untested, and a step number nobody has lined up across a
         disaggregated pair is worth less than the clock. Degrade rather than
         raise: a stale flag in a shared launch script must not stop a server
@@ -3205,6 +3232,7 @@ class Config:
                 self.decode_context_parallel_size,
                 self.enable_tbo or self.enable_tbo_decode,
                 is_plugin_mode(),
+                "nvfp4" in (self.index_cache_dtype, self.kv_cache_dtype),
             )
             if indexer_cp_off is not None:
                 logger.warning(
@@ -3246,11 +3274,15 @@ class Config:
                 # load. Overriding it here would accept the flag and ignore it.
                 self.index_cache_dtype = "fp8"
             else:
-                # M3's fp4 KV needs the fp4 index (the MXFP4 attention reads the
+                # M3's FP4 KV needs the matching FP4 index (the FP4 attention reads the
                 # selector's rows, which only that scorer sizes to match), which is
                 # what following the KV dtype gives; an explicit other index dtype
                 # is refused by `validate_runtime_config`.
                 self.index_cache_dtype = self.kv_cache_dtype
+        if self.index_cache_dtype == "nvfp4" and not is_m3:
+            raise ValueError(
+                "--index-cache-dtype nvfp4 is supported by MiniMax-M3 only"
+            )
         if self.speculative_config is not None:
             from atom.spec_decode.draft_kv import draft_owns_kv_pool
 

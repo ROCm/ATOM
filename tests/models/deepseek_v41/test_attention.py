@@ -526,17 +526,25 @@ def test_compressor_project_hands_back_strided_halves(single_rank):
         assert half.untyped_storage().data_ptr() == values.untyped_storage().data_ptr()
 
 
-def test_draft_context_kv_fusion_sees_the_kv_half(single_rank, small_config):
+@pytest.mark.parametrize("bf16", [False, True])
+def test_draft_context_kv_fusion_sees_the_kv_half(
+    single_rank, small_config, monkeypatch, bf16
+):
     """The fused context-KV GEMM reads a shard of `wqkv_a`, not a `wkv` layer.
 
     It concatenates one projection per stage and declines when a stage cannot
     supply one. Nothing else asserts that a real attention module supplies it,
     so a rename on the model side turns the fusion off and only costs speed --
-    the per-stage fallback it falls back to is numerically identical.
+    the per-stage fallback it falls back to is numerically identical. A BF16
+    shard (no group32 FP8 GEMM) has no FP8 weight to fuse: per stage.
     """
-    from atom.models.deepseek_v41.config import build_attention_topology
-    from atom.models.deepseek_v41.dspark import DraftAttention
+    from types import SimpleNamespace
 
+    from atom.model_ops import linear
+    from atom.models.deepseek_v41.config import build_attention_topology
+    from atom.models.deepseek_v41.dspark import DeepseekV41DSpark, DraftAttention
+
+    monkeypatch.setattr(linear, "native_group32_runs_bf16", lambda: bf16)
     spec = build_attention_topology(small_config)[1]
     attention = DraftAttention(small_config, spec)
     shard = attention.wkv_shard
@@ -552,4 +560,79 @@ def test_draft_context_kv_fusion_sees_the_kv_half(single_rank, small_config):
     assert torch.equal(
         shard.weight_scale.view(torch.uint8),
         attention.wqkv_a.weight_scale.view(torch.uint8)[rows // group :],
+    )
+    assert shard.runs_bf16 is bf16
+    draft = object.__new__(DeepseekV41DSpark)
+    torch.nn.Module.__init__(draft)
+    draft.mtp = [SimpleNamespace(attn=attention)]
+    assert (draft._context_kv_fusion() is None) is bf16
+
+
+@pytest.mark.parametrize("fp4ptpc", [False, True])
+def test_q_leaves_its_norm_in_the_format_its_readers_take(
+    single_rank, small_config, fp4ptpc
+):
+    """`wq_b` and `indexer.wq_b` share one spec and one Q: per-token FP8 for an
+    FP4PTPC checkpoint's per-channel GEMMs; for native group32 ones MXFP8, or
+    BF16 where those run in BF16."""
+    from aiter import QuantType
+
+    from atom.model_ops.layernorm import (
+        DualRMSNormBF16,
+        DualRMSNormMXFP8,
+        DualRMSNormPerToken,
+    )
+    from atom.model_ops.linear import native_group32_runs_bf16
+    from atom.models.deepseek_v41.attention import Attention
+    from atom.models.deepseek_v41.config import build_attention_topology
+
+    small_config.fp4ptpc = fp4ptpc
+    spec = build_attention_topology(small_config)[1]
+    attention = Attention(small_config, spec)
+    native = DualRMSNormBF16 if native_group32_runs_bf16() else DualRMSNormMXFP8
+    assert type(attention.qk_norm) is (DualRMSNormPerToken if fp4ptpc else native)
+    readers = [attention.wq_b]
+    if attention.indexer is not None:
+        readers.append(attention.indexer.wq_b)
+    for reader in readers:
+        assert (reader.quant_type == QuantType.per_Token) == fp4ptpc
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="inverse RoPE is Triton")
+def test_bf16_wo_a_projects_like_a_grouped_einsum(
+    single_rank, small_config, monkeypatch
+):
+    """`_project_out` where `wo_a` runs in BF16 (no group32 FP8 GEMM): inverse
+    RoPE, then each group's heads through its `wo_a` rows, written through the
+    strided view into `wo_b`'s input; against the CPU rotation and an einsum."""
+    from atom.model_ops import linear
+    from atom.models.deepseek_v41.attention import Attention
+    from atom.models.deepseek_v41.config import build_attention_topology
+
+    monkeypatch.setattr(linear, "native_group32_runs_bf16", lambda: True)
+    small_config.o_groups = 2
+    attention = Attention(small_config, build_attention_topology(small_config)[1])
+    assert attention.wo_a.runs_bf16 and attention.groups == 2
+    groups, o_rank = attention.groups, attention.o_rank
+    rows, heads, head_dim = 5, attention.heads, attention.head_dim
+    torch.manual_seed(31)
+    output = torch.randn(rows, heads, head_dim, dtype=torch.bfloat16)
+    positions = torch.tensor([0, 1, 7, 19, 31])
+    weight = torch.randn(groups * o_rank, heads * head_dim // groups).bfloat16()
+    rope = RotaryEmbedding(64, 32, base=10000, original_length=0, factor=16)
+    rotated = rope(output[None].clone(), positions, inverse=True)[0].float()
+    expected = torch.einsum(
+        "rgk,gok->rgo",
+        rotated.view(rows, groups, -1),
+        weight.float().view(groups, o_rank, -1),
+    ).reshape(rows, -1)
+
+    attention.wo_a.weight = torch.nn.Parameter(weight.cuda(), requires_grad=False)
+    attention.wo_b = torch.nn.Identity()
+    actual = attention._project_out(output.cuda(), rope.cuda(), positions.cuda())
+    torch.testing.assert_close(
+        actual.float().cpu(),
+        expected,
+        rtol=2**-6,
+        atol=2**-6 * expected.abs().max().item(),
     )
