@@ -126,6 +126,10 @@ def init_model_env(config: Config, rank: int) -> torch.device:
             # spans nodes has a global rank past its node's GPUs.
             local_rank=local_device_rank,
         )
+        # Before anything is built from the split.
+        from atom.models.utils import agree_pp_layer_partition
+
+        agree_pp_layer_partition(config.hf_config.num_hidden_layers)
     else:
         # The group spans the devices that exist; apply_simulated_tp then
         # makes it *report* the logical width so layers shard that many ways.
