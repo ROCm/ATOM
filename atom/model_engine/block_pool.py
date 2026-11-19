@@ -7,6 +7,7 @@ from collections.abc import Callable, Hashable, Iterable
 from dataclasses import dataclass
 from heapq import heapify, heappop, heappush
 from itertools import islice
+from time import monotonic
 
 from atom.model_engine.kv_block import Block
 
@@ -53,6 +54,11 @@ class BlockPool:
     One queue for both would evict a cached block while a vacant one waited
     behind it, purely on release order.
 
+    Both cached containers map a block to the `monotonic()` time it was
+    released, so the PAGE checkpoint store can weigh the next cached block
+    against its coldest image (`oldest_reusable_free`) instead of always
+    spending the cached block first.
+
     `_cached` is an insertion-ordered mapping rather than a queue because
     `claim` takes a *named* block off the free list on every prefix hit: left
     in place, its entry would put the block back at its old position when it is
@@ -82,7 +88,7 @@ class BlockPool:
             raise ValueError("protected_ratio must be between 0 and 1")
         self.cache_policy = cache_policy
         self.protected_ratio = protected_ratio
-        self._protected: OrderedDict[int, None] = OrderedDict()
+        self._protected: OrderedDict[int, float] = OrderedDict()
         self._reused: set[int] = set()
         # `max_blocks` is how far `extend` may go, and so how many Block
         # objects exist. It is the pool's share of a fixed plane rather than
@@ -106,7 +112,7 @@ class BlockPool:
         # presence in a container — is what makes an id free. `pop` skips the
         # stale entries.
         self._vacant: list[int] = list(range(num_blocks))
-        self._cached: OrderedDict[int, None] = OrderedDict()
+        self._cached: OrderedDict[int, float] = OrderedDict()
         self._free: set[int] = set(range(num_blocks))
         self._used: set[int] = set()
         # Raw PAGE units reserved by multi-unit objects such as state checkpoints.
@@ -160,6 +166,19 @@ class BlockPool:
         before `blocks_evicted` can start moving.
         """
         return len(self._cached) + len(self._protected)
+
+    def oldest_reusable_free(self) -> float | None:
+        """Release time of the cached block `_take_free` spends next, or None.
+
+        Vacant blocks go before it, so this is what the first allocation past
+        the vacant ones destroys. Stale entries are skipped, as `_take_free`
+        skips them.
+        """
+        for container in (self._cached, self._protected):
+            for block_id, released in container.items():
+                if block_id in self._free and self.blocks[block_id].hash != -1:
+                    return released
+        return None
 
     def eviction_stats(self) -> dict[str, int]:
         """Content this pool destroyed, and the headroom it has left.
@@ -365,10 +384,10 @@ class BlockPool:
         self._free.add(block_id)
         if block.hash != -1:
             if block_id in self._reused:
-                self._protected[block_id] = None
+                self._protected[block_id] = monotonic()
                 self._trim_protected()
             else:
-                self._cached[block_id] = None
+                self._cached[block_id] = monotonic()
             return
         heappush(self._vacant, block_id)
         # Stale entries are skipped, not removed, so the heap can outgrow the
@@ -382,9 +401,9 @@ class BlockPool:
         # Bound protection so new prefixes can compete for cache space.
         limit = int(self.num_blocks * self.protected_ratio)
         while len(self._protected) > limit:
-            block_id, _ = self._protected.popitem(last=False)
+            block_id, released = self._protected.popitem(last=False)
             self._reused.discard(block_id)
-            self._cached[block_id] = None
+            self._cached[block_id] = released
 
     def reserve_units(self, count: int, owner: Hashable) -> list[int] | None:
         """Reserve arbitrary PAGE-sized units for raw storage."""
