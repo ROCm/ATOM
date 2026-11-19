@@ -237,7 +237,7 @@ def test_runtime_guard_with_live_steps_and_aux_hooks(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires ROCm mHC")
 @pytest.mark.parametrize("mode", ["pre", "post_pre"])
 @pytest.mark.parametrize("backend", ["triton", "hip", "hip_quant", "asm"])
-def test_mhc_guard_outputs_and_input_alias(mode, backend, monkeypatch):
+def test_mhc_guard_outputs_and_input_alias(mode, backend, monkeypatch, request):
     from atom.model_ops.deepseek_v41 import mhc_pre_delayed as mhc
 
     # Pin the backend: on gfx942 `auto` sends post seams to the ASM seam, so
@@ -245,7 +245,10 @@ def test_mhc_guard_outputs_and_input_alias(mode, backend, monkeypatch):
     monkeypatch.setenv(
         "ATOM_DSV41_MHC_BACKEND", "triton" if backend == "triton" else "auto"
     )
-    mhc.use_asm_seam.cache_clear()  # the env is pinned per case
+    # The env is pinned per case; clear before and after so no result cached
+    # under this case's env reaches a later test in the session.
+    mhc.use_asm_seam.cache_clear()
+    request.addfinalizer(mhc.use_asm_seam.cache_clear)
     device = "cuda"
     rows, hc, hidden = 6, 4, 5120
     residual = torch.randn(1, rows, hc, hidden, device=device, dtype=torch.bfloat16)

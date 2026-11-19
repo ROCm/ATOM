@@ -31,7 +31,7 @@ def mhc():
     ],
 )
 def test_v41_mhc_pre_delayed_selects_backend(
-    env, with_post, supported, expected, monkeypatch, mhc
+    env, with_post, supported, expected, monkeypatch, request, mhc
 ):
     """Which seam kernel v41_mhc_pre_delayed picks for each backend/support case."""
     monkeypatch.setenv("ATOM_DSV41_MHC_BACKEND", env)
@@ -40,7 +40,10 @@ def test_v41_mhc_pre_delayed_selects_backend(
         "mhc_fused_post_pre_delayed_asm_supported",
         lambda hidden, hc_mult: supported,
     )
-    mhc.use_asm_seam.cache_clear()  # env and support are patched per case
+    # Env and support are patched per case; clear before and after so no
+    # result cached under the patches reaches a later test in the session.
+    mhc.use_asm_seam.cache_clear()
+    request.addfinalizer(mhc.use_asm_seam.cache_clear)
     rows, hc, hidden = 2, 4, 5120
     calls = []
 
