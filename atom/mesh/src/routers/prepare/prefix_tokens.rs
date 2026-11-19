@@ -83,7 +83,8 @@ impl PrefixTokens {
     }
 
     /// A few placements of added tokens, cut after each token and encoded in
-    /// two parts, give the ids of encoding them whole.
+    /// two parts, give the ids of encoding them whole, which special tokens
+    /// wrap in `head` and `tail`. At least one cut must be checked.
     fn probe(&self, tokenizer: &dyn Tokenizer) -> Result<(), String> {
         let mut tokens: Vec<(&u32, &String)> = self.added.iter().collect();
         tokens.sort_unstable();
@@ -97,7 +98,9 @@ impl PrefixTokens {
         .flatten()
         .map(|(_, t)| t.as_str())
         .collect();
-        let encode = |text: &str| tokenizer.encode(text, false).map_err(|e| e.to_string());
+        let encode =
+            |text: &str, special: bool| tokenizer.encode(text, special).map_err(|e| e.to_string());
+        let mut checked = 0;
         for token in picks {
             for probe in [
                 format!("a{token}a b"),
@@ -106,17 +109,26 @@ impl PrefixTokens {
                 // A normalizer could compose across a cut.
                 format!("e\u{301}{token}\u{301}e"),
             ] {
-                let whole = encode(&probe)?;
+                let whole = encode(&probe, false)?;
                 let ids = whole.token_ids();
+                if encode(&probe, true)?.token_ids()
+                    != [&self.head[..], ids, &self.tail[..]].concat()
+                {
+                    return Err(format!("special tokens wrap {probe:?} unlike \"a\""));
+                }
                 for cut in self.cuts(&probe, &whole, Cut::default()) {
-                    let before = encode(&probe[..cut.bytes])?;
-                    let after = encode(&probe[cut.bytes..])?;
+                    let before = encode(&probe[..cut.bytes], false)?;
+                    let after = encode(&probe[cut.bytes..], false)?;
                     if ids[..cut.ids] != *before.token_ids() || ids[cut.ids..] != *after.token_ids()
                     {
                         return Err(format!("cutting after {token:?} changes the ids"));
                     }
+                    checked += 1;
                 }
             }
+        }
+        if checked == 0 {
+            return Err("no probe has an added token to cut after".into());
         }
         Ok(())
     }
@@ -325,7 +337,7 @@ pub(crate) mod tests {
     #[test]
     fn a_prompt_is_cut_after_each_added_token() {
         let (_dir, entry) = entry(&description());
-        let tokens = PrefixTokens::for_entry(&entry).unwrap();
+        let mut tokens = PrefixTokens::for_entry(&entry).unwrap();
         assert_eq!(tokens.head, [0]);
         assert!(tokens.tail.is_empty());
         let prompt = "<|user|> alpha<|assistant|><think>";
@@ -337,6 +349,17 @@ pub(crate) mod tests {
                 Cut { bytes: 27, ids: 3 },
                 Cut { bytes: 34, ids: 4 },
             ]
+        );
+
+        // The probes check the special tokens too, and a cut at least.
+        let tokenizer = entry.tokenizer.as_ref();
+        tokens.head.clear();
+        assert!(tokens.probe(tokenizer).is_err());
+        tokens.head = vec![0];
+        tokens.added = HashMap::from([(99, "<|tool|>".to_string())]);
+        assert_eq!(
+            tokens.probe(tokenizer).err().as_deref(),
+            Some("no probe has an added token to cut after")
         );
     }
 
