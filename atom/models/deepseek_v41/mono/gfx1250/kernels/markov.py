@@ -42,6 +42,7 @@ LX = 16 * ES                      # LDS: x_{k-1} ids [8] i32
 LB = LX + 64                      # LDS: per-request CTA best [8] i64
 LP = LB + 64                      # LDS: per-source maxima [4][8] i64
 LDS = LP + 4 * NREQ * 8
+MBZ = 16384                       # (M1) LDS: the rows' base logits of every position [TB][256][8] f32 (40 KB)
 F32, I32, BF16 = fx.Float32, fx.Int32, fx.BFloat16
 
 
@@ -79,9 +80,23 @@ def markov_once(base, anchors, w1, w2s, ids_out, emb_out, best, cnt, recv, rank,
             np_ = np_ + (hx.gload(sp + i64(q * (TB + 1) * SPW * 4 + 12), I32) == I32(0)).select(I32(1), I32(0))
         anyprob = np_ > I32(0)
     gpu.barrier()
+    # (M1) every load of the rounds that does not depend on x, once: this wave's W2 tile, the rows' base logits of every
+    # position (TB x 8 a lane) and the rows' temperature / noise words (the same values the rounds read: bit-identical)
+    a = [hx.gload(wrow + i64(ks * 64), BF16, 16) for ks in range(RK // 32)]
+    rq = fx.min(l % 16, I32(NREQ - 1))
+    for kk in range_constexpr(TB):   # -> LDS (past the sampler's own words): [TB][256 lanes][8] f32
+        bzk = [hx.gload(base + (i64(rq * TB + kk) * VR + i64(tile * 16 + (l // 16) * 8 + i)) * 4, F32) for i in range(8)]
+        hx.lstore(sm + MBZ + ((kk * 256 + t) * 8) * 4, fx.Vector.from_elements(bzk, F32))
+    gq = I32(0) != I32(0)
+    itd = F32(1.0)
+    sd = I32(0)
+    if fx.const_expr(sp is not None):
+        spb = sp + i64(rq * (TB + 1)) * (SPW * 4)
+        gq = hx.gload(spb + i64(12), I32) != I32(0)
+        itd = hx.gload(spb + i64(16), F32)
+        sd = hx.gload(spb + i64(28), I32) ^ I32(SEED_D)
     for k in range(TB):
-        # stage W1[x_{k-1}] rows; prefetch this wave's W2 tile meanwhile
-        a = [hx.gload(wrow + i64(ks * 64), BF16, 16) for ks in range(RK // 32)]
+        # stage W1[x_{k-1}] rows (the W2 tile: loaded before the rounds)
         req = t // 32
         x = hx.lload(sm + LX + req * 4, I32)
         hx.lstore(sm + req * ES + (t % 32) * 16, hx.gload(w1 + (i64(x) * RK + i64((t % 32) * 8)) * 2, BF16, 8))
@@ -92,16 +107,8 @@ def markov_once(base, anchors, w1, w2s, ids_out, emb_out, best, cnt, recv, rank,
         for ks in range_constexpr(RK // 32):
             bv = hx.lload(sm + (l % 16) * ES + (ks * 32 + (l // 16) * 16) * 2, BF16, 16)
             acc = hx.wmma_bf16(a[ks], bv, acc)
-        rq = fx.min(l % 16, I32(NREQ - 1))
-        if fx.const_expr(sp is not None):   # this request's draft temperature / noise (row rq * 6 of the step's sp)
-            spb = sp + i64(rq * (TB + 1)) * (SPW * 4)
-            gq = hx.gload(spb + i64(12), I32) != I32(0)
-            itd = hx.gload(spb + i64(16), F32)
-            sd = hx.gload(spb + i64(28), I32) ^ I32(SEED_D)
-        zs = []
-        for i in range_constexpr(8):
-            j = tile * 16 + (l // 16) * 8 + i
-            zs.append(acc[i] + hx.gload(base + (i64(rq * TB + k) * VR + i64(j)) * 4, F32))
+        bzv = hx.lload(sm + MBZ + ((k * 256 + t) * 8) * 4, F32, 8)   # (M1: the base logits, landed before the rounds)
+        zs = [acc[i] + bzv[i] for i in range(8)]
         bl = I64MIN()
         for i in range_constexpr(8):   # greedy: argmax of z
             gj = tile * 16 + (l // 16) * 8 + i + rank * VR
@@ -177,6 +184,6 @@ def build(rank, rep=1):
                recv0: Int64, recv1: Int64, recv2: Int64, recv3: Int64, sp: Int64, qlog: Int64, tagbase: fx.Int32,
                stream: fx.Stream = fx.Stream(None)):
         mk(base, anchors, w1, w2s, ids_out, emb_out, best, cnt, recv0, recv1, recv2, recv3, sp, qlog, tagbase).launch(
-            grid=(256,), block=(256,), smem=LDS, stream=stream)
+            grid=(256,), block=(256,), smem=MBZ + TB * 256 * 8 * 4, stream=stream)
 
     return launch
