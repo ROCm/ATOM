@@ -19,7 +19,7 @@ python -m atom.entrypoints.openai_server \
   --trust-remote-code
 ```
 
-- `<N>` is the context length you will declare to Claude Code in Step 2. Claude Code's system prompt and tool definitions are large (about 14K tokens per request with GLM-5.2's tokenizer), so use a model with a long context; check `usage.input_tokens` on the first turn to see how much of `<N>` the fixed prompt already takes.
+- `<N>` is the context length Step 2 sizes Claude Code's window from. Claude Code's system prompt and tool definitions alone take about 14K tokens per request (GLM-5.2's tokenizer), so use 128K or more; at 32K, reading six 3K-token files was enough to make compaction thrash. Check `usage.input_tokens` on the first turn to see what the fixed prompt takes with your model.
 - Prefix caching is on by default (`--enable_prefix_caching`). Leave it on: Claude Code resends the same system prompt, tool definitions and history on every turn, so a warm turn only prefills the new tokens.
 - The tool-call parser is picked from the model's chat template (`--tool-call-parser auto`). Check the startup log: `Tool-call format: <name>` means a parser was found; `No known tool-call format ...` means tool calls would come back as plain text, and Claude Code cannot work, so pass `--tool-call-parser` explicitly.
 - ATOM does not authenticate requests. Keep it bound to localhost as above, or put it behind a firewall if you bind `0.0.0.0`.
@@ -39,9 +39,9 @@ export ANTHROPIC_MODEL=<model-id-from-step-1>
 export ANTHROPIC_DEFAULT_OPUS_MODEL=$ANTHROPIC_MODEL
 export ANTHROPIC_DEFAULT_SONNET_MODEL=$ANTHROPIC_MODEL
 export ANTHROPIC_DEFAULT_HAIKU_MODEL=$ANTHROPIC_MODEL
-export CLAUDE_CODE_MAX_OUTPUT_TOKENS=16384
-export CLAUDE_CODE_MAX_CONTEXT_TOKENS=$((<N> - 16384))
-export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1
+export CLAUDE_CODE_MAX_OUTPUT_TOKENS=16384      # 4096 when <N> is 32K
+export CLAUDE_CODE_MAX_CONTEXT_TOKENS=$(( <N> - CLAUDE_CODE_MAX_OUTPUT_TOKENS ))
+export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1  # until #3588
 
 claude
 ```
@@ -51,8 +51,10 @@ What each setting is for:
 - `ANTHROPIC_BASE_URL` has no `/v1` suffix; Claude Code appends `/v1/messages` itself.
 - `ANTHROPIC_AUTH_TOKEN` can be any value. Set it anyway: without a credential, Claude Code sends your claude.ai login token to the server at `ANTHROPIC_BASE_URL`.
 - ATOM serves one model and returns 400 for any other model name. The `ANTHROPIC_DEFAULT_*_MODEL` variables make the `opus` / `sonnet` / `haiku` aliases, subagents that name an alias, and background tasks resolve to the served model.
-- **Context window.** Claude Code does not recognize the served model ID, so it assumes a 1M-token window and a 32000-token `max_tokens`, and compacts the conversation only as it approaches that window. ATOM cannot hold that: once prompt plus `max_tokens` exceeds `--max-model-len`, it either rejects the request with an error Claude Code does not recognize as "prompt too long", or silently cuts the end of the prompt, which drops the latest turn. Declaring `CLAUDE_CODE_MAX_CONTEXT_TOKENS` as `<N>` minus the output budget makes Claude Code compact before either happens. This only works when the served model ID does not start with `claude-`; use `--served-model-name` if it does.
-- `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` stops Claude Code sending `role: "system"` entries in the middle of `messages` and other pre-release fields. ATOM accepts those entries without error but does not render their block content correctly, so the model would see garbled reminders.
+- **Context window.** Claude Code does not recognize the served model ID, so it assumes a 1M-token window and a 32000-token `max_tokens`, and compacts the conversation only as it approaches that window. `CLAUDE_CODE_MAX_CONTEXT_TOKENS` declares the real window so that it compacts in time. This only works when the served model ID does not start with `claude-`; use `--served-model-name` if it does. Size it as above:
+  - **Leave room for the output budget.** The fixed prompt plus `CLAUDE_CODE_MAX_OUTPUT_TOKENS` must fit inside the declared window, or Claude Code refuses every request with "Prompt is too long" before sending it.
+  - **Requests can still overrun it.** ATOM does not serve `/v1/messages/count_tokens`, so Claude Code estimates token counts from characters, and its compaction request carries the whole conversation. In testing at `<N>` = 32768 (a declared window of 28672), requests reached ATOM at up to 38.7K tokens, and a smaller declared window did not prevent this. Until #3588, ATOM silently cuts the end of such a prompt. That drops the latest turn, or, for a compaction request, the instruction to summarize, and in testing the compaction then failed. With #3588 it returns a 400 that Claude Code recovers from by compacting. A large `<N>` keeps this rare.
+- `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` stops Claude Code sending `role: "system"` entries in the middle of `messages` and other pre-release fields. Until #3588, ATOM accepts those entries without error but renders their block content as a Python repr, so the model would see garbled reminders. Drop the variable once #3588 is in your build.
 
 ## Checking prompt caching
 
@@ -71,7 +73,7 @@ curl -s http://localhost:8000/v1/messages \
 
 ## Notes
 
-- ATOM does not serve `/v1/messages/count_tokens`. Claude Code falls back to a character-based estimate, so `/context` shows approximate counts.
+- ATOM does not serve `/v1/messages/count_tokens` (the server log shows it as a 404). Claude Code falls back to a character-based estimate, so `/context` shows approximate counts and requests can overrun the declared window.
 - Claude Code prints `[claude-code:unrecognized_model]` for the served model ID. This is a diagnostic, not an error.
 
 ## Troubleshooting
