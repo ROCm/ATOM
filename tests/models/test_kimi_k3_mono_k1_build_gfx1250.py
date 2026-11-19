@@ -220,6 +220,26 @@ def test_head_split_defaults_to_auto(monkeypatch):
     assert envs.ATOM_KIMI_MONO_K1_HEAD_SPLIT == "auto"
 
 
+def test_whole_heads_replace_the_chunk_tasks_by_default(monkeypatch):
+    from atom.utils import envs
+
+    monkeypatch.delenv("ATOM_KIMI_MONO_K1_WHOLE_HEADS", raising=False)
+    assert envs.ATOM_KIMI_MONO_K1_WHOLE_HEADS
+    # one or two requests' chunk tasks fit the grid: forced whole heads
+    assert kda_resident_gfx1250._whole_heads(5, 96, 256, False) == (True, True)
+    assert kda_resident_gfx1250._whole_heads(8, 192, 256, False) == (True, True)
+    # past one pass, plain decode and ReplaySSM: whole heads anyway
+    assert kda_resident_gfx1250._whole_heads(5, 288, 256, False) == (True, False)
+    assert kda_resident_gfx1250._whole_heads(1, 96, 256, False) == (True, False)
+    assert kda_resident_gfx1250._whole_heads(5, 96, 256, True) == (True, False)
+
+
+def test_whole_heads_switch_off_keeps_the_chunk_tasks(monkeypatch):
+    monkeypatch.setenv("ATOM_KIMI_MONO_K1_WHOLE_HEADS", "0")
+    assert kda_resident_gfx1250._whole_heads(5, 96, 256, False) == (False, False)
+    assert kda_resident_gfx1250._whole_heads(5, 288, 256, False) == (True, False)
+
+
 def test_head_split_refuses_other_counts(monkeypatch):
     from atom.models.kimi_k3.mono.kernels.attention import kda_resident_gfx1250
 

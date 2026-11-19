@@ -195,6 +195,15 @@ def _gate_ilp() -> bool:
     return envs.ATOM_KIMI_MONO_K1_GATE_ILP
 
 
+def _whole_heads(qlen: int, tasks: int, blocks: int, replay: bool) -> tuple[bool, bool]:
+    """(whole heads, forced): whole (split) heads at plain decode, past one
+    pass of the grid's chunk tasks and under ReplaySSM; elsewhere too with
+    ATOM_KIMI_MONO_K1_WHOLE_HEADS (the default), "forced"."""
+    whole = qlen == 1 or tasks > blocks or replay
+    forced = not whole and envs.ATOM_KIMI_MONO_K1_WHOLE_HEADS
+    return whole or forced, forced
+
+
 def _auto_head_split(heads: int, blocks: int) -> int:
     """The most of 4, 2 CTAs a head whose parts all fit the grid at once."""
     return next((count for count in (4, 2) if heads * count <= blocks), 1)
@@ -268,9 +277,9 @@ def build_resident_k1(
     task_count = (s // qlen) * HEADS * STATE_CHUNKS
     # ReplaySSM rebuilds a state's rows in the CTAs that advance them: whole
     # heads (or their parts) alone
-    whole_heads = qlen == 1 or task_count > declaration.blocks or spec.replay_cap > 0
-    forced_heads = not whole_heads and envs.ATOM_KIMI_MONO_K1_WHOLE_HEADS
-    whole_heads = whole_heads or forced_heads
+    whole_heads, forced_heads = _whole_heads(
+        qlen, task_count, declaration.blocks, spec.replay_cap > 0
+    )
     head_split = (
         _head_split((s // qlen) * HEADS, declaration.blocks) if whole_heads else 1
     )
