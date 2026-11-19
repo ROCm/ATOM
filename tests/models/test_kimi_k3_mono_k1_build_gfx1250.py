@@ -404,3 +404,15 @@ def test_chunk_form_matches_the_token_recurrence(qlen):
     torch.testing.assert_close(torch.stack(chunk_values), torch.stack(values))
     torch.testing.assert_close(torch.stack(chunk_outputs), torch.stack(outputs))
     torch.testing.assert_close(last, state)
+
+
+@pytest.mark.parametrize(
+    "requests, split",
+    [(1, 4), (2, 2), (3, 4), (4, 4), (5, 4), (6, 2), (10, 2), (11, 1)],
+)
+def test_replay_auto_split_stops_at_two_for_two_requests(requests, split):
+    from atom.models.kimi_k3.mono.kernels.attention import kda_resident_gfx1250 as kr
+
+    auto = kr._auto_head_split(requests * kr.HEADS, 256)
+    assert kr._replay_auto_split(auto, requests) == split
+

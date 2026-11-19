@@ -18,7 +18,11 @@ SPLIT sets ATOM_KIMI_MONO_K1_HEAD_SPLIT for every build (default auto).
 CHUNK=1 builds the chunked head recurrence (ATOM_KIMI_MONO_K1_CHUNK_RECUR)
 and, each step, also runs the sequential one on the same inputs: the replay
 build (core_out, conv, checkpoints, records) and the plain one with a state
-slot per token (core_out and every token's state), as "seq_*"."""
+slot per token (core_out and every token's state), as "seq_*".
+
+REF_SPLIT=n builds those references at head split n instead (the serving
+recurrence, ATOM_KIMI_MONO_K1_CHUNK_RECUR's default, both sides), as "ref_*":
+a head split must not change a bit."""
 
 import json
 import os
@@ -54,6 +58,9 @@ CAP = int(os.environ.get("CAP", "16"))
 WINDOW = int(os.environ.get("WINDOW", "5"))
 SPLIT = os.environ.get("SPLIT", "auto")
 CHUNK = os.environ.get("CHUNK", "0") == "1"
+REF_SPLIT = os.environ.get("REF_SPLIT")
+REFERENCE = CHUNK or REF_SPLIT is not None
+REF = "ref" if REF_SPLIT is not None else "seq"
 SENTINEL_STEP = 3  # request 0 re-prefilled before it: its cursor back to -1
 FUSED, PROJ, NH, HD, LB = 6284, 1536, 12, 128, -5.0
 SL = WINDOW + 2  # the conv window: width - 1 + the verify window's drafts
@@ -240,8 +247,14 @@ def replay_table(slot_idx, wp, bufs):
     )
 
 
-def builds(plan, rows, chunk):
-    os.environ["ATOM_KIMI_MONO_K1_CHUNK_RECUR"] = "1" if chunk else "0"
+def builds(plan, rows, chunk, split=SPLIT):
+    """K1's replay and plain builds; ``chunk`` None: the recurrence's default."""
+    os.environ["ATOM_KIMI_MONO_K1_CHUNK_RECUR"] = {
+        True: "1",
+        False: "0",
+        None: "auto",
+    }[chunk]
+    os.environ["ATOM_KIMI_MONO_K1_HEAD_SPLIT"] = split
     return (
         plan.make_k1_local_runner(spec(rows, True)).prepare(dev),
         plan.make_k1_local_runner(spec(rows, False)).prepare(dev),
@@ -253,12 +266,17 @@ def check(rows):
     plan = Gfx1250KimiBuildPlan(
         threads=256, blocks=256, lds_bytes=320 * 1024, tokens=rows, nblocks=1
     )
-    replay_k1, plain_k1 = builds(plan, rows, CHUNK)
+    chunk = None if REF_SPLIT is not None else CHUNK
+    replay_k1, plain_k1 = builds(plan, rows, chunk)
     names = {"replay": replay_k1.entrypoint.name, "plain": plain_k1.entrypoint.name}
-    if CHUNK:
-        seq_replay, seq_plain = builds(plan, rows, False)
-        names["seq_replay"] = seq_replay.entrypoint.name
-        names["seq_plain"] = seq_plain.entrypoint.name
+    if REFERENCE:
+        seq_replay, seq_plain = (
+            builds(plan, rows, None, REF_SPLIT)
+            if REF_SPLIT is not None
+            else builds(plan, rows, False)
+        )
+        names[f"{REF}_replay"] = seq_replay.entrypoint.name
+        names[f"{REF}_plain"] = seq_plain.entrypoint.name
     print("built", rows, names, flush=True)
     slots = req + 3
     # the requests' checkpoint slots, not in request order
@@ -318,7 +336,7 @@ def check(rows):
             p_core, _ = k1_run(plain_k1, prefix, p_conv, p_rs, p_st, num_acc)
         ckpt_before = m["ckpt"].clone()
         bufs_before = [b.clone() for b in m["bufs"]]
-        if CHUNK:
+        if REFERENCE:
             seq = {
                 "conv": m["conv"].clone(),
                 "ckpt": ckpt_before.clone(),
@@ -414,19 +432,19 @@ def check(rows):
                         [round(v, 3) for v in p["conv"][slot, ch].float().tolist()],
                         flush=True,
                     )
-        if CHUNK:
-            report["seq_core_out"] = diff(core, seq_core)
-            report["seq_conv"] = diff(m["conv"][idx], seq["conv"][idx])
-            report["seq_ckpt"] = diff(m["ckpt"][idx], seq["ckpt"][idx])
+        if REFERENCE:
+            report[f"{REF}_core_out"] = diff(core, seq_core)
+            report[f"{REF}_conv"] = diff(m["conv"][idx], seq["conv"][idx])
+            report[f"{REF}_ckpt"] = diff(m["ckpt"][idx], seq["ckpt"][idx])
             for name, b in zip("kug", range(3)):
                 mine = m["bufs"][b][idx].permute(0, 2, 1, 3)[written]
                 ref = seq["bufs"][b][idx].permute(0, 2, 1, 3)[written]
-                report[f"seq_rec_{name}"] = diff(mine, ref)
+                report[f"{REF}_rec_{name}"] = diff(mine, ref)
             used = token_st.flatten().long()
-            report["seq_plain_core_out"] = diff(
+            report[f"{REF}_plain_core_out"] = diff(
                 plain_out["chunk"][0], plain_out["seq"][0]
             )
-            report["seq_plain_states"] = diff(
+            report[f"{REF}_plain_states"] = diff(
                 plain_out["chunk"][1][used], plain_out["seq"][1][used]
             )
         if step == 0:
