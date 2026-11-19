@@ -45,6 +45,7 @@ import time
 import uuid
 from collections import Counter
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -62,16 +63,22 @@ from atom.kv_transfer.offload.mooncake_store import client as store_client
 from atom.kv_transfer.offload.mooncake_store.config import (
     check_engine_compatibility,
     parse_mooncake_store_config,
+    store_draft_window,
 )
 from atom.kv_transfer.offload.mooncake_store.keys import (
     DIGEST_BYTES,
     STORE_TAINT_KEY,
     chunk_group_ids,
     chunk_keys,
+    draft_chunk_keys,
+    draft_ranks,
     probe_key,
     store_namespace,
 )
-from atom.kv_transfer.offload.mooncake_store.layouts import build_mooncake_codec
+from atom.kv_transfer.offload.mooncake_store.layouts import (
+    build_mooncake_codec,
+    build_mooncake_draft_codec,
+)
 from atom.kv_transfer.offload.mooncake_store.nic import requester_rdma_device
 from atom.kv_transfer.offload.mooncake_store.pool import (
     Slot,
@@ -160,6 +167,21 @@ def _head_first_windows(start: int, end: int, size: int) -> list[range]:
     return [range(low, min(end, low + size)) for low in range(start, end, size)]
 
 
+@dataclass
+class _DraftTransfer:
+    """What one save or load moved of the split layout's draft objects, and the
+    time it spent; the target fields of a PROF line leave this phase out."""
+
+    chunks: int = 0
+    nbytes: int = 0
+    # Packs and restores include the fence behind the forward's stream.
+    pack_ms: float = 0.0
+    put_ms: float = 0.0
+    get_ms: float = 0.0
+    unpack_ms: float = 0.0
+    status: str = "ok"
+
+
 class MooncakeStoreOffloadConnector(DenseOffloadConnector):
     """Offload worker (dense KV, M3 PAGE, or V4.1 replay PAGEs) whose tier is a
     Mooncake Store, reached directly."""
@@ -177,6 +199,11 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         self._namespace: str | None = None
         self._world = 1
         self._chunk_bytes = 0
+        # The split layout's draft objects: this rank's codec and object size
+        # when it holds the draft's regions, else None and 0.
+        self._draft_window = store_draft_window(config)
+        self._draft_codec: Any = None
+        self._draft_chunk_bytes = 0
         self._stats_lock = threading.Lock()
         # Whether one-run windows are copied in place; see `register_kv_caches`.
         self._in_place = False
@@ -266,6 +293,7 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
             num_blocks,
             permit_per_request_state=self._permit_per_request_state,
         )
+        self._register_draft_codec(transfer_tensors, num_blocks, rank)
         cfg = self._store_cfg
         namespace = store_namespace(self._config, self.chunk_size)
         device = self._codec.device
@@ -342,7 +370,7 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
             "Mooncake Store offload worker rank=%d world=%d: namespace=%s nic=%s "
             "master=%s bytes_per_block=%d chunk=%d chunk_bytes=%d "
             "pool=%s save_slots=%d load_slots=%d gpu_staging_buffer_bytes=%d "
-            "save=%s load=%s save_workers=%d load_workers=%d",
+            "save=%s load=%s save_workers=%d load_workers=%d%s",
             rank,
             world,
             namespace,
@@ -359,7 +387,40 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
             self._do_load,
             self.save_workers,
             self.load_workers,
+            (
+                ""
+                if self._draft_window is None
+                else f" draft_chunk_bytes={self._draft_chunk_bytes}"
+            ),
         )
+
+    def _register_draft_codec(
+        self, transfer_tensors: Any, num_blocks: int | None, rank: int
+    ) -> None:
+        """Build this rank's draft codec under the split layout; refuse a rank
+        whose draft regions do not match its place in `draft_ranks`."""
+        if self._draft_window is None:
+            return
+        codec = build_mooncake_draft_codec(self._config, transfer_tensors, num_blocks)
+        if (codec is not None) != (rank in draft_ranks(self._config)):
+            raise ValueError(
+                f"ATOM_MOONCAKE_STORE_DRAFT_WINDOW: rank {rank} "
+                f"{'holds' if codec is not None else 'lacks'} draft KV regions, but "
+                "the draft's objects are keyed on the last PP stage's ranks"
+            )
+        if codec is None:
+            return
+        # One draft object goes through one transfer slot, sized for a target one.
+        if codec.bytes_per_block > self._codec.bytes_per_block:
+            raise ValueError(
+                "ATOM_MOONCAKE_STORE_DRAFT_WINDOW: the draft's "
+                f"{codec.bytes_per_block} bytes per block exceed the target's "
+                f"{self._codec.bytes_per_block}, whose objects size the transfer slots"
+            )
+        self._draft_codec = codec
+        self._draft_chunk_bytes = (
+            self.chunk_size // self.virtual_block_size
+        ) * codec.bytes_per_block
 
     def _probe_store(
         self,
@@ -575,16 +636,20 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
             return
         pool, client, gpu_connector = self._registered()
         deadline = self._source_read_deadline(req)
+        # The draft objects first: a chunk is source-safe once both packs ran.
+        draft = _DraftTransfer()
+        failure, detail = self._save_draft_chunks(
+            req, self._draft_chunks_of(req, start, end), deadline, producer_event, draft
+        )
         windows = _tail_first_windows(
             start, end, pool.window("save", self.save_workers)
         )
         # The lowest chunk handed to the GPU so far; [start, read_from) is unread.
         read_from = end
-        failure = detail = None
         windows_run = stored_bytes = in_place_windows = 0
         pack_ms = put_ms = 0.0
         t_store0 = time.perf_counter()
-        for window in windows:
+        for window in windows if failure is None else ():
             try:
                 slots = pool.acquire("save", len(window))
             except SlotPoolExhausted as exc:
@@ -685,7 +750,8 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
             logger.info(
                 "[OFFLOAD-SAVE-PROF] rank=%s req=%s toks=%d skip=%d chunks=%d "
                 "windows=%d in_place_windows=%d total_bytes=%d producer_fenced=%d "
-                "pack_ms=%.2f put_ms=%.2f store_ms=%.2f total_ms=%.2f status=%s",
+                "pack_ms=%.2f put_ms=%.2f store_ms=%.2f total_ms=%.2f status=%s"
+                + self._draft_prof(draft, put=True),
                 self._rank,
                 req.req_id,
                 end * chunk,
@@ -851,6 +917,11 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
             # Both paths synchronized before returning: the slots are idle.
             pool.release(slots)
             loaded_chunks += len(window)
+        draft = _DraftTransfer()
+        if failure is None:
+            failure, detail = self._load_draft_chunks(
+                req, self._draft_chunks_of(req, first, end), draft
+            )
         if failure is None:
             # And once after the last get: a mark placed while a get ran is
             # one the look before it missed, and that get may have read what
@@ -875,7 +946,7 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
                 "[OFFLOAD-LOAD-PROF] rank=%s req=%s hbm=%d lmc=%d retrieved=%d "
                 "status=%s chunks=%d windows=%d in_place_windows=%d total_bytes=%d "
                 "get_ms=%.2f unpack_ms=%.2f retrieve_ms=%.2f total_ms=%.2f "
-                "effective_gbps=%.2f",
+                "effective_gbps=%.2f" + self._draft_prof(draft, put=False),
                 self._rank,
                 req.req_id,
                 hbm,
@@ -900,6 +971,231 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
             else:
                 self._failed_load.add(self._load_completion_id(req))
                 self._record_load_error_blocks(req)
+
+    # -- the split layout's draft objects -----------------------------------
+    def _draft_chunks_of(self, req: LMCacheReqMeta, start: int, end: int) -> range:
+        """The draft objects of `req` this rank moves, within chunks `[start, end)`."""
+        if self._draft_codec is None or req.draft_chunks is None:
+            return range(0)
+        first, last = req.draft_chunks
+        return range(max(int(first), start), min(int(last), end))
+
+    def _draft_keys(self, req: LMCacheReqMeta, window: range) -> list[str]:
+        return draft_chunk_keys(
+            self._namespace,
+            self._rank,
+            self._world,
+            req.chunk_hashes,
+            window.start,
+            window.stop,
+        )
+
+    def _save_draft_chunks(
+        self,
+        req: LMCacheReqMeta,
+        chunks: range,
+        deadline: float | None,
+        producer_event: Any,
+        draft: _DraftTransfer,
+    ) -> tuple[str | None, str | None]:
+        """Pack and put the draft objects of `chunks`, ungrouped. Only a missed
+        source read deadline fails the save; a draft not stored costs a lookup cut."""
+        if not chunks:
+            return None, None
+        pool, client, _ = self._registered()
+        nbytes = self._draft_chunk_bytes
+        size = pool.window("save", self.save_workers)
+        for window in _tail_first_windows(chunks.start, chunks.stop, size):
+            try:
+                slots = pool.acquire("save", len(window))
+            except SlotPoolExhausted:
+                draft.status = "pool_exhausted"
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                pool.release(slots)
+                return "source_read_deadline", (
+                    f"queued past {self._source_read_window_s:.0f}s, after which "
+                    "the scheduler may reclaim the source blocks"
+                )
+            t_pack0 = time.perf_counter()
+            try:
+                self._copy_draft_chunks(
+                    slots,
+                    window,
+                    req.block_ids,
+                    pack=True,
+                    producer_event=producer_event,
+                )
+            except BaseException:
+                self._release_once_device_idle(pool, slots)
+                raise
+            draft.pack_ms += (time.perf_counter() - t_pack0) * 1000
+            t_put0 = time.perf_counter()
+            clock = store_client.CallClock()
+            try:
+                codes = client.put(
+                    self._draft_keys(req, window),
+                    [slot.ptr for slot in slots],
+                    [nbytes] * len(slots),
+                    tally="draft_",
+                )
+            except store_client.CallRefused:
+                pool.release(slots)
+                draft.status = "put_refused"
+                break
+            except Exception as exc:  # noqa: BLE001  # counted below
+                pool.quarantine(slots, reason="a draft put raised")
+                self._distrust_store(f"a draft put raised {exc!r}")
+                draft.status = "put_raised"
+                break
+            draft.put_ms += (time.perf_counter() - t_put0) * 1000
+            call_seconds = clock.seconds()
+            unsettled = self._settle(pool, slots, codes, call_seconds)
+            if unsettled:
+                self._distrust_store(
+                    f"a draft put gave up on {unsettled} of {len(slots)} chunks "
+                    f"after {call_seconds:.0f}s"
+                )
+            stored = sum(1 for code in codes if code == 0)
+            draft.chunks += stored
+            draft.nbytes += stored * nbytes
+            if stored < len(codes):
+                draft.status = "put_failed"
+                break
+        if draft.status != "ok":
+            self._warn_rate_limited(
+                f"save:draft_{draft.status}",
+                "Mooncake Store offload: req=%s stored %d of %d draft objects (%s); "
+                "a lookup cuts a later hit where one is missing",
+                req.req_id,
+                draft.chunks,
+                len(chunks),
+                draft.status,
+            )
+        return None, None
+
+    def _load_draft_chunks(
+        self, req: LMCacheReqMeta, chunks: range, draft: _DraftTransfer
+    ) -> tuple[str | None, str | None]:
+        """Get and restore the draft objects of `chunks`, all or nothing."""
+        if not chunks:
+            return None, None
+        pool, client, _ = self._registered()
+        nbytes = self._draft_chunk_bytes
+        size = pool.window("load", self.load_workers)
+        for window in _head_first_windows(chunks.start, chunks.stop, size):
+            refusal = self._load_refusal(client)
+            if refusal is not None:
+                return "store_distrusted", refusal
+            try:
+                slots = pool.acquire("load", len(window))
+            except SlotPoolExhausted as exc:
+                return "pool_exhausted", str(exc)
+            t_get0 = time.perf_counter()
+            clock = store_client.CallClock()
+            try:
+                codes = client.get(
+                    self._draft_keys(req, window),
+                    [slot.ptr for slot in slots],
+                    [nbytes] * len(slots),
+                    tally="draft_",
+                )
+            except store_client.CallRefused as exc:
+                pool.release(slots)
+                return "draft_get_refused", str(exc)
+            except Exception as exc:  # noqa: BLE001  # reported by the caller
+                pool.quarantine(slots, reason="a draft get raised")
+                return "draft_get_raised", repr(exc)
+            draft.get_ms += (time.perf_counter() - t_get0) * 1000
+            # An object of another size is another layout.
+            bad = [code for code in codes if code != nbytes]
+            if bad:
+                self._settle(pool, slots, codes, clock.seconds())
+                return "draft_get_failed", (
+                    f"{len(bad)} of {len(codes)} draft chunks, first "
+                    + (
+                        store_client.describe(bad[0])
+                        if bad[0] < 0
+                        else f"{bad[0]} bytes where {nbytes} were expected"
+                    )
+                )
+            t_unpack0 = time.perf_counter()
+            try:
+                self._copy_draft_chunks(slots, window, req.block_ids, pack=False)
+            except BaseException:
+                self._release_once_device_idle(pool, slots)
+                raise
+            draft.unpack_ms += (time.perf_counter() - t_unpack0) * 1000
+            pool.release(slots)
+            draft.chunks += len(window)
+            draft.nbytes += nbytes * len(window)
+        return None, None
+
+    def _copy_draft_chunks(
+        self,
+        slots: list[Slot],
+        window: range,
+        block_ids: list[int],
+        *,
+        pack: bool,
+        producer_event: Any = None,
+    ) -> None:
+        """Pack `window`'s draft rows into the head of each slot, or restore them;
+        a run of slots restores in one launch at the pool's slot stride."""
+        codec = self._draft_codec
+        chunk = self.chunk_size
+        per_chunk = chunk // self.virtual_block_size
+        stream = self._in_place_stream()
+        if producer_event is not None:
+            stream.wait_event(producer_event)
+        offsets = range(len(window))
+        groups = self._gpu_connector._ranges_to_block_ids(
+            [offset * chunk for offset in offsets],
+            [(offset + 1) * chunk for offset in offsets],
+            block_ids=block_ids[window.start * per_chunk : window.stop * per_chunk],
+        )
+        strided = not pack and getattr(codec, "supports_strided_restore", False)
+        run = self._pool.strided_view(slots) if strided else None
+        if run is not None:
+            owner = codec.prepare_block_id_groups(
+                [groups], device=codec.device, stream=stream
+            )
+            codec.chunk_major_strided_buffer_to_gpu_prepared(
+                run,
+                owner,
+                0,
+                stream=stream,
+                items_per_chunk=per_chunk,
+                chunk_stride_bytes=self._pool.slot_stride,
+            )
+        else:
+            owner = codec.prepare_block_id_groups(
+                groups, device=codec.device, stream=stream
+            )
+            copy = (
+                codec.gpu_to_chunk_major_device_buffer_prepared
+                if pack
+                else codec.chunk_major_device_buffer_to_gpu_prepared
+            )
+            for index, slot in enumerate(slots):
+                copy(
+                    slot.tensor[: self._draft_chunk_bytes], owner, index, stream=stream
+                )
+        atom_lmcache_staging.fence_submitted_work(stream)
+
+    def _draft_prof(self, draft: _DraftTransfer, *, put: bool) -> str:
+        """The draft fields a PROF line of a draft rank appends."""
+        if self._draft_codec is None:
+            return ""
+        fields = f" draft_chunks={draft.chunks} draft_bytes={draft.nbytes}"
+        if put:
+            return fields + (
+                f" draft_pack_ms={draft.pack_ms:.2f} draft_put_ms={draft.put_ms:.2f}"
+                f" draft_status={draft.status}"
+            )
+        return fields + (
+            f" draft_get_ms={draft.get_ms:.2f} draft_unpack_ms={draft.unpack_ms:.2f}"
+        )
 
     # -- in-place copies ---------------------------------------------------
     def _in_place_stream(self) -> torch.cuda.Stream:
@@ -1136,10 +1432,23 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         failures = ",".join(
             f"{name}x{count}" for name, count in sorted(stats["failures"].items())
         )
+        draft = ""
+        if self._draft_codec is not None:
+            draft = " " + " ".join(
+                f"draft_{name}={counts.get(f'draft_{op}', 0)}"
+                for name, op in (
+                    ("puts", "put_calls"),
+                    ("put_keys", "put_keys"),
+                    ("put_bytes", "put_bytes"),
+                    ("gets", "get_calls"),
+                    ("get_keys", "get_keys"),
+                    ("get_bytes", "get_bytes"),
+                )
+            )
         logger.info(
             "[OFFLOAD-STORE-STATS] rank=%s puts=%d put_keys=%d put_bytes=%d "
             "gets=%d get_keys=%d get_bytes=%d failures=%s "
-            "quarantined_slots=save:%d,load:%d",
+            "quarantined_slots=save:%d,load:%d" + draft,
             self._rank,
             counts.get("put_calls", 0),
             counts.get("put_keys", 0),

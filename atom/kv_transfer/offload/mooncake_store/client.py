@@ -261,11 +261,13 @@ class MooncakeStoreClient:
         sizes: list[int],
         *,
         group_ids: list[str] | None = None,
+        tally: str = "",
     ) -> list[int]:
         """Store each buffer under its key; per key 0 or a negative code.
 
         ``group_ids`` puts each key in that Mooncake group, which the master
         evicts whole. A key that already exists keeps the group it was put in.
+        ``tally`` prefixes the op this call is counted under in `stats`.
 
         Raises:
             CallRefused: Before ``batch_put_from`` was called (duplicate keys,
@@ -285,11 +287,14 @@ class MooncakeStoreClient:
         codes = [int(code) for code in self._store.batch_put_from(*args)]
         self._check_length("batch_put_from", codes, keys)
         stored = sum(int(s) for s, code in zip(sizes, codes) if code == 0)
-        self._count("put", keys, stored, codes, failed=lambda code: code != 0)
+        self._count(f"{tally}put", keys, stored, codes, failed=lambda code: code != 0)
         return codes
 
-    def get(self, keys: list[str], ptrs: list[int], sizes: list[int]) -> list[int]:
+    def get(
+        self, keys: list[str], ptrs: list[int], sizes: list[int], *, tally: str = ""
+    ) -> list[int]:
         """Read each object into its buffer; per key its size or a negative code.
+        ``tally`` prefixes the op this call is counted under in `stats`.
 
         Raises:
             CallRefused: Before ``batch_get_into`` was called (duplicate
@@ -306,7 +311,7 @@ class MooncakeStoreClient:
         ]
         self._check_length("batch_get_into", codes, keys)
         read = sum(code for code in codes if code > 0)
-        self._count("get", keys, read, codes, failed=lambda code: code < 0)
+        self._count(f"{tally}get", keys, read, codes, failed=lambda code: code < 0)
         return codes
 
     def put_marker(self, key: str, nbytes: int, *, replicas: int) -> int:
