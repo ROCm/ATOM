@@ -165,6 +165,12 @@ def s_sleep(n=1):
     rocdl.s_sleep(n)
 
 
+def acquire_se():
+    """Agent acquire on gfx1250 (GFX12.5 model, no MTYPE NC): global_inv scope:SCOPE_SE (drops the WGP$'s clean lines) +
+    s_wait_loadcnt 0. One wave a CTA suffices: a work-group's waves run in one WGP and share its WGP$."""
+    llvm.inline_asm(None, [], "global_inv scope:SCOPE_SE\ns_wait_loadcnt 0x0", "~{memory}", has_side_effects=True)
+
+
 def wait_storecnt0():
     llvm.inline_asm(None, [], "s_wait_storecnt 0x0", "", has_side_effects=True)
 
@@ -566,7 +572,8 @@ def wait_count(addr, n, site):
 @_ASTR.transform
 def handoff(cnt, t, hdev, n=256, site=None):
     """Device-wide handoff of n CTAs on counter cnt (thread t). hdev: the stages' exchange stores are device-scope ->
-    every wave waits its stores, no fences; else release / acquire fences around the count."""
+    every wave waits its stores, no fences; else every wave waits its stores (the agent release: gfx1250 has no MTYPE NC,
+    so no global_wb) and t0 acquires for the CTA after the count (acquire_se)."""
     if fx.const_expr(hdev):
         wait_storecnt0()
         gpu.barrier()
@@ -574,13 +581,13 @@ def handoff(cnt, t, hdev, n=256, site=None):
             atomic_add(cnt, 1)
             wait_count(cnt, n, 4 if site is None else site)
         gpu.barrier()
-    else:
+    else:   # (GFX12.5) release = every wave's s_wait_storecnt 0 (no global_wb); acquire = t0's SE invalidate
+        wait_storecnt0()
         gpu.barrier()
         if t == 0:
-            fence_release("agent")
             atomic_add(cnt, 1)
             wait_count(cnt, n, 5 if site is None else site)
-            fence_acquire("agent")
+            acquire_se()
         gpu.barrier()
 
 
