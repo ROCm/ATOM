@@ -2,7 +2,7 @@
 
 High-performance model routing gateway for **PD (Prefill–Decode) disaggregated** LLM serving. It routes inference across heterogeneous worker fleets with cache-aware load balancing, a gRPC pipeline that keeps tokenization in Rust, and built-in reliability primitives.
 
-Atomesh can also run in an **ATOM standalone** mode. In this mode, Python owns the ATOM engine, tokenizer, and OpenAI-compatible serving semantics, while Atomesh provides the HTTP server, request routing, lifecycle management, observability, and PyO3 bridge. This allows the same Atomesh serving layer to support both distributed worker routing and a single-process ATOM deployment path.
+An **ATOM standalone** mode, in which Atomesh serves a single ATOM deployment as the client of its EngineCores, is being brought up and is not available yet; see [ATOM standalone](#atom-standalone).
 
 ## Features
 
@@ -137,28 +137,26 @@ image must provide `protoc` either way, for `smg-grpc-client`.
 
 ### ATOM standalone
 
-ATOM standalone mode starts the ATOM engine and tokenizer in Python, while Rust
-Mesh provides the HTTP server, lifecycle handling, observability, and PyO3
-request bridge. Enable the Atomesh entrypoint through
-`USE_ATOMESH_ENTRYPOINTS=1`:
+Not available yet. The Rust frontend will serve standalone itself, as the one
+client of the ATOM EngineCores, once the Python launcher writes the engine spec
+it starts from. Until then the Atomesh entrypoint refuses standalone at startup,
+before it loads a model:
 
 ```bash
-USE_ATOMESH_ENTRYPOINTS=1 python -m atom.entrypoints.openai_server \
-  --model /path/to/model \
-  --host 0.0.0.0 \
-  --port 30000
+# Exits with "ATOM standalone is unavailable ..."
+USE_ATOMESH_ENTRYPOINTS=1 python -m atom.entrypoints.openai_server --model /path/to/model
 ```
 
-Do not pass `mesh-only` for standalone mode. The `mesh-only` subcommand is only
-used when the Python entrypoint should run Atomesh as a router for external
-workers.
+Meanwhile, serve a model with the classic entrypoint
+(`python -m atom.entrypoints.openai_server` without `USE_ATOMESH_ENTRYPOINTS`),
+or use `mesh-only` below to route across such servers.
 
 
 ### Regular HTTP routing
 
 Routing mode can be started through either the Rust binary or the Python
-entrypoint. For the Python entrypoint, `mesh-only` selects Atomesh routing;
-without `mesh-only`, it defaults to ATOM standalone mode.
+entrypoint. For the Python entrypoint, pass `mesh-only`; without it the
+entrypoint asks for ATOM standalone, which is not available yet.
 
 ```bash
 ./target/release/atomesh launch \
