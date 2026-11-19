@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import threading
 from collections import OrderedDict
+from time import perf_counter
 from typing import Any
 
 import torch
@@ -115,30 +116,49 @@ class StateByteCodec:
             torch.uint8,
         )
 
-    def put(self, h: int, unit_ids, on_source_released=None) -> bool:
+    def put(self, h: int, unit_ids, on_source_released=None, prof=None) -> bool:
+        """Store one image; with `prof` (a dict, OFFLOAD_PROFILE only), record
+        each phase's milliseconds into it for `StateOffloadTier`'s profile."""
         # Bound state independently of KV while retaining the shared allocator.
         # Only stores serialize; a load holds its MemoryObj reference while
         # unpacking, so removing its cache entry cannot free live bytes.
         if self._storage is None:
             return False
         if self._max_entries is None:
-            return self._put(h, unit_ids, on_source_released)
+            return self._put_profiled(h, unit_ids, on_source_released, prof)
         key = self.key(h)
+        t_lock = perf_counter()
         with self._store_lock:
+            if prof is not None:
+                prof["lock_ms"] = (perf_counter() - t_lock) * 1e3
+                t_evict = perf_counter()
+                evicted = 0
             with self._cache_lock:
                 if key not in self._cache_keys:
                     while len(self._cache_keys) >= self._max_entries:
                         old = next(iter(self._cache_keys))
                         self._storage.remove(old)
                         del self._cache_keys[old]
-            ok = self._put(h, unit_ids, on_source_released)
+                        if prof is not None:
+                            evicted += 1
+            if prof is not None:
+                prof["evict_ms"] = (perf_counter() - t_evict) * 1e3
+                prof["evict_n"] = evicted
+            ok = self._put_profiled(h, unit_ids, on_source_released, prof)
             if ok:
                 with self._cache_lock:
                     self._cache_keys.pop(key, None)
                     self._cache_keys[key] = None
             return ok
 
-    def _put(self, h: int, unit_ids, on_source_released=None) -> bool:
+    def _put_profiled(self, h, unit_ids, on_source_released, prof) -> bool:
+        # `prof` only when profiling, so `_put` keeps its three-argument shape
+        # for callers and test doubles that never profile.
+        if prof is None:
+            return self._put(h, unit_ids, on_source_released)
+        return self._put(h, unit_ids, on_source_released, prof=prof)
+
+    def _put(self, h: int, unit_ids, on_source_released=None, prof=None) -> bool:
         """Store one checkpoint image. False when nothing was stored.
 
         Reads PAGE units where `get` writes an Active Slot; safe because the
@@ -160,8 +180,11 @@ class StateByteCodec:
         # Computed before the allocation: `key` can raise (see the `signed`
         # note), and a raise from inside the `batched_put` argument list would
         # strand the MemoryObj the same way a throwing `pack` used to.
+        t_alloc = perf_counter()
         key = self.key(h)
         obj = self._allocate(self.entry_bytes)
+        if prof is not None:
+            prof["alloc_ms"] = (perf_counter() - t_alloc) * 1e3
         if obj is None:
             return False
         # `batched_put` discharges the reference it is handed, but only in its
@@ -183,17 +206,26 @@ class StateByteCodec:
         # and shrinking the CPU pool one entry per failure. `get` guards its own
         # reference with `finally` for the same reason.
         try:
+            t_pack = perf_counter()
+            # `prof` reaches `pack` only when profiling (see `_put_profiled`).
+            pack_kw = {} if prof is None else {"prof": prof}
             segments = getattr(self._backend, "page_unit_segments", None)
             if callable(segments):
                 ptrs, sizes = segments(unit_ids)
-                self._staged.pack_segments(ptrs, sizes, obj)
+                self._staged.pack_segments(ptrs, sizes, obj, **pack_kw)
             else:
-                self._staged.pack(self._backend.page_unit_views(unit_ids), obj)
+                self._staged.pack(
+                    self._backend.page_unit_views(unit_ids), obj, **pack_kw
+                )
             # Source first: `pack` has synchronized the stream that reads the
             # units, so nothing on the device touches them from here.
             if on_source_released is not None:
                 on_source_released()
+            t_put = perf_counter()
             self._storage.batched_put([key], [obj])
+            if prof is not None:
+                prof["pack_ms"] = (t_put - t_pack) * 1e3
+                prof["put_ms"] = (perf_counter() - t_put) * 1e3
         except Exception:
             obj.ref_count_down()
             raise

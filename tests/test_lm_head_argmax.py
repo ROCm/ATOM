@@ -96,3 +96,61 @@ def test_ar_gather_ties_and_negative_maxima():
     logits[2, 63] = 1.0
     out = _ar_gather_argmax(logits, 4)
     assert out.tolist() == [20, 3, 63]
+
+
+@pytest.mark.parametrize("rows", [1, 16, 64])
+def test_argmax_epilogue_head_picks_the_full_vocab_argmax(rows, monkeypatch):
+    """ATOM_LM_HEAD_ARGMAX_EPILOGUE: `compute_argmax_token` of rank 1 of 4 takes
+    its pack image from the GEMM epilogue; the all-reduce (stubbed with the other
+    ranks' images from their logits) and the pick then give the full argmax."""
+    from aiter.ops.triton.gemm.basic.gemm_a16w16 import _is_gluon_available
+    from aiter.tuned_gemm import tgemm
+
+    from atom.model_ops import embed_head
+
+    if not _is_gluon_available():
+        pytest.skip("gfx1250 gluon GEMM")
+    world, rank, shard, k = 4, 1, 62080, 2048
+    gen = torch.Generator(device="cuda").manual_seed(rows)
+    w = torch.randn(
+        (world * shard, k), generator=gen, dtype=torch.float32, device="cuda"
+    )
+    w = (w * 0.02).to(torch.bfloat16)
+    w[[7, shard + 9, 3 * shard]] = w[40] * 10  # ties across ranks and in rank 1
+    x = torch.randn((rows, k), generator=gen, dtype=torch.float32, device="cuda")
+    x = x.to(torch.bfloat16)
+    others = sum(
+        lm_head_argmax_units(
+            tgemm.mm(x, w[r * shard : (r + 1) * shard]), r * shard, r, world
+        )
+        for r in range(world)
+        if r != rank
+    )
+    called = []
+
+    def epilogue(*args):
+        called.append(True)
+        return embed_head.__dict__["_epilogue_impl"](*args)
+
+    monkeypatch.setitem(
+        embed_head.__dict__, "_epilogue_impl", embed_head.gemm_a16w16_argmax_units
+    )
+    monkeypatch.setattr(embed_head, "gemm_a16w16_argmax_units", epilogue)
+    monkeypatch.setattr(
+        embed_head, "tensor_model_parallel_all_reduce", lambda u: u + others
+    )
+    monkeypatch.setenv("ATOM_LM_HEAD_ARGMAX_EPILOGUE", "1")
+    monkeypatch.setenv("ATOM_ARGMAX_HEAD_AR_GATHER", "1")
+    monkeypatch.setenv("ATOM_DP_DRAFT_ARGMAX", "0")
+    head = object.__new__(embed_head.ParallelLMHead)
+    torch.nn.Module.__init__(head)
+    head.tp_size, head.tp_rank, head.vocab_start_idx = world, rank, rank * shard
+    head.weight = torch.nn.Parameter(
+        w[rank * shard : (rank + 1) * shard], requires_grad=False
+    )
+    head.bias = None
+    head._argmax_exchange = None
+    out = torch.empty(rows, dtype=torch.int32, device="cuda")
+    head.compute_argmax_token(x, out=out)
+    assert called, "the epilogue path did not run"
+    assert torch.equal(out, torch.argmax(tgemm.mm(x, w), dim=-1).to(torch.int32))

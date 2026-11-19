@@ -27,6 +27,8 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.utils import envs
+
 
 @triton.jit
 def _copy_checkpoints_kernel(
@@ -122,6 +124,101 @@ def _copy_checkpoints_kernel(
             )
 
 
+@triton.jit
+def _copy_checkpoints_loop_kernel(
+    h,
+    ssm_dst,
+    x,
+    conv_dst,
+    rows,
+    slots,
+    offs,
+    is_end,
+    runtime_slots,
+    chunk_offsets,
+    cu_seqlens,
+    n_targets,
+    stride_x_t,
+    stride_cd_s,
+    stride_cd_d,
+    stride_cd_l,
+    HKV: tl.constexpr,
+    D: tl.constexpr,
+    STATE_LEN: tl.constexpr,
+    CHUNK: tl.constexpr,
+    BLOCK: tl.constexpr,
+    NBLK_SSM: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    TARGETS: tl.constexpr,
+    STATE_VK: tl.constexpr = False,
+    SSM_FROM_H: tl.constexpr = True,
+    H_VK: tl.constexpr = False,
+):
+    """`_copy_checkpoints_kernel` with one program a block, looping over the targets.
+
+    The whole target table is read in one vector load, so a step without targets
+    (padding only) costs one load a program instead of one program a padded target.
+    """
+    i_blk = tl.program_id(0)
+    t_idx = tl.arange(0, TARGETS)
+    t_mask = t_idx < n_targets
+    slot_v = tl.load(slots + t_idx, mask=t_mask, other=-1)
+    row_v = tl.load(rows + t_idx, mask=t_mask, other=0)
+    off_v = tl.load(offs + t_idx, mask=t_mask, other=0)
+    end_v = tl.load(is_end + t_idx, mask=t_mask, other=0)
+    run_v = tl.load(runtime_slots + t_idx, mask=t_mask, other=0)
+    # targets past the last valid one are skipped without a single iteration
+    n_live = tl.max(tl.where(slot_v >= 0, t_idx + 1, 0), 0)
+    for t in range(n_live):
+        sel = t_idx == t
+        slot = tl.sum(tl.where(sel, slot_v, 0), 0).to(tl.int64)
+        if slot >= 0:
+            row = tl.sum(tl.where(sel, row_v, 0), 0).to(tl.int64)
+            off = tl.sum(tl.where(sel, off_v, 0), 0).to(tl.int64)
+            if i_blk < NBLK_SSM:
+                idx = i_blk * BLOCK + tl.arange(0, BLOCK)
+                mask = idx < HKV
+                h_idx = idx
+                if STATE_VK != H_VK:
+                    INNER: tl.constexpr = K if STATE_VK else V
+                    h_idx = (
+                        idx // (K * V) * (K * V)
+                        + (idx % INNER) * (K * V // INNER)
+                        + (idx % (K * V)) // INNER
+                    )
+                if tl.sum(tl.where(sel, end_v, 0), 0) != 0:
+                    src_slot = tl.sum(tl.where(sel, run_v, 0), 0).to(tl.int64)
+                    sv = tl.load(ssm_dst + src_slot * HKV + idx, mask=mask, other=0.0)
+                    tl.store(ssm_dst + slot * HKV + idx, sv, mask=mask)
+                elif SSM_FROM_H:
+                    src = tl.load(chunk_offsets + row).to(tl.int64) + off // CHUNK
+                    hv = tl.load(h + src * HKV + h_idx, mask=mask, other=0.0)
+                    tl.store(
+                        ssm_dst + slot * HKV + idx,
+                        hv.to(ssm_dst.dtype.element_ty),
+                        mask=mask,
+                    )
+            else:
+                end = tl.load(cu_seqlens + row).to(tl.int64) + off
+                d = (i_blk - NBLK_SSM) * BLOCK + tl.arange(0, BLOCK)
+                dmask = d < D
+                for j in tl.static_range(STATE_LEN):
+                    cv = tl.load(
+                        x + (end - STATE_LEN + j) * stride_x_t + d,
+                        mask=dmask,
+                        other=0.0,
+                    )
+                    tl.store(
+                        conv_dst
+                        + slot * stride_cd_s
+                        + d * stride_cd_d
+                        + j * stride_cd_l,
+                        cv.to(conv_dst.dtype.element_ty),
+                        mask=dmask,
+                    )
+
+
 def write_state_checkpoints(
     h: torch.Tensor,
     ssm_state: torch.Tensor,
@@ -179,6 +276,42 @@ def write_state_checkpoints(
     d, state_len = conv_state.shape[1], conv_state_len
     assert 0 < state_len <= conv_state.shape[2], "conv window wider than the pool"
     assert x.stride(-1) == 1, "conv input must be contiguous along the feature dim"
+    if envs.ATOM_GDN_CKPT_COPY_LOOP:
+        # One program a block of the state / conv window, each looping over the targets.
+        BLOCK = 2048
+        nblk_ssm = triton.cdiv(hkv, BLOCK)
+        _copy_checkpoints_loop_kernel[(nblk_ssm + triton.cdiv(d, BLOCK),)](
+            h,
+            ssm_state,
+            x,
+            conv_state,
+            rows,
+            slots,
+            offs,
+            is_end,
+            runtime_slots,
+            chunk_offsets,
+            cu_seqlens,
+            n,
+            x.stride(0),
+            conv_state.stride(0),
+            conv_state.stride(1),
+            conv_state.stride(2),
+            HKV=hkv,
+            D=d,
+            STATE_LEN=state_len,
+            CHUNK=chunk_size,
+            BLOCK=BLOCK,
+            NBLK_SSM=nblk_ssm,
+            K=ssm_state.shape[-2],
+            V=ssm_state.shape[-1],
+            TARGETS=triton.next_power_of_2(n),
+            STATE_VK=ssm_state.stride(-2) == 1,
+            H_VK=h.stride(-2) == 1,
+            SSM_FROM_H=ssm_from_h,
+            num_warps=8,
+        )
+        return
     BLOCK = 1024
     nblk_ssm = triton.cdiv(hkv, BLOCK)
     grid = (n, nblk_ssm + triton.cdiv(d, BLOCK))

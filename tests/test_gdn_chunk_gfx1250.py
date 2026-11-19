@@ -327,6 +327,63 @@ def test_decay_rows_match_gates(block_n, buffers, paired, path, monkeypatch):
         assert torch.equal(a, b)
 
 
+@pytest.mark.parametrize("path", ["slots", "plan"])
+@pytest.mark.parametrize("pool_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("block_n,buffers", [(32, 4), (32, 3), (64, 3), (128, 2)])
+def test_walk_codegen_flags_bitwise(block_n, buffers, pool_dtype, path, monkeypatch):
+    """ATOM_GDN_CHUNK_H_CKPT_AHEAD (checkpoint slot read a chunk ahead) and
+    ATOM_GDN_CHUNK_H_H0_SELECT (initial state zeroed by a select) are bitwise the walk without
+    them: h, v_new, final states by slot and checkpoints, cold sequences, partial last chunks."""
+    _force_tile(block_n, buffers, monkeypatch)
+    lens = [1, 2, 3, 17, 63, 64, 65, 127, 128, 129, 1000, 3000]
+    _, k, v, _, _, _, cu, pool, slots, _ = _inputs(lens, 32, 16, seed=3)
+    pool = pool.to(pool_dtype)
+    k = torch.nn.functional.normalize(k.float(), dim=-1).to(torch.bfloat16)
+    gen = torch.Generator(device=DEV).manual_seed(7)
+    rows = torch.randn(k.shape[1], 64, device=DEV, generator=gen).to(torch.bfloat16)
+    gating = (
+        rows[:, :32],
+        rows[:, 32:],
+        torch.rand(32, device=DEV, generator=gen),
+        torch.randn(32, device=DEV, generator=gen),
+    )
+    kw, nt = {}, prepare_chunk_indices(cu, 64).shape[0]
+    if path == "plan":
+        kw["plan"], cu = _plan(cu, slots)
+        rows_ckpt = kw["plan"].nt64_max
+    else:
+        kw["state_slots"] = slots
+        rows_ckpt = nt
+    g, decay, w, u, _, _ = fused_kkt.fused_kkt_inverse_gfx1250(
+        k, v, cu, kw.get("plan"), gating, True
+    )
+    used = set(slots[0].tolist()) | set(slots[1].tolist())
+    free = [s for s in range(pool.shape[0]) if s not in used]
+    table = torch.full((rows_ckpt,), -1, dtype=torch.int32, device=DEV)
+    for i, chunk in enumerate(range(0, nt, 3)[: len(free)]):
+        table[chunk] = free[i]
+    res = []
+    for flag in ("0", "1"):
+        monkeypatch.setenv("ATOM_GDN_CHUNK_H_CKPT_AHEAD", flag)
+        monkeypatch.setenv("ATOM_GDN_CHUNK_H_H0_SELECT", flag)
+        p = pool.clone()
+        h, v_new, _ = chunk_gated_delta_rule_fwd_h(
+            k=k,
+            w=w,
+            u=u,
+            g=g,
+            decay=decay,
+            initial_state=p,
+            output_final_state=True,
+            cu_seqlens=cu,
+            checkpoint_slots=(p, table),
+            **kw,
+        )
+        res.append((h[:, :nt], v_new, p))
+    for a, b in zip(*res):
+        assert torch.equal(a, b)
+
+
 def test_fused_gating_path_decay_flag(monkeypatch):
     """The layer's path (gates computed in the fused KKT kernel): ATOM_GDN_CHUNK_H_DECAY hands its
     decay rows to chunk_h, with bitwise the same output, chunk states and final states as without.

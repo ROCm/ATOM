@@ -315,6 +315,13 @@ def _gfx1250_fused_qk_norm_mrope_cache_k4v8() -> bool:
 
 
 @functools.cache
+def _gfx1250_fused_qk_norm_mrope_cache_num_tokens() -> bool:
+    """Whether aiter's cache kernel takes ``num_tokens`` (compute only the first rows)."""
+    op = _gfx1250_aiter_op("fused_qk_norm_mrope_cache")
+    return op is not None and "num_tokens" in inspect.signature(op).parameters
+
+
+@functools.cache
 def _gfx1250_fused_qk_norm_mrope_cache_fp8() -> bool:
     """Whether aiter's kernel also writes an fp8 cache (its ``kv_scale`` argument)."""
     op = _gfx1250_aiter_op("fused_qk_norm_mrope_cache")
@@ -363,9 +370,13 @@ def try_fused_qk_norm_mrope_cache(
     v_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
     kv_scale: float | None = None,
+    num_tokens: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """The Q/K Gemma RMSNorm, the Qwen3.5 MRoPE and the K/V write into the SHUFFLE
     KV cache in one aiter Gluon kernel on gfx1250.
+
+    ``num_tokens``: compute only the first rows (a graph bucket's pad rows, which no
+    sequence owns, are left unwritten in the outputs), where aiter supports it.
 
     For an fp8 cache pass its per-tensor ``kv_scale``: K and V are stored scaled and
     clamped, and Q comes back in fp8 (clamped, unscaled), ready for unified attention.
@@ -418,6 +429,13 @@ def try_fused_qk_norm_mrope_cache(
         v_cache,
         slot_mapping,
         **({"kv_scale": kv_scale} if fp8 else {}),
+        **(
+            {"num_tokens": num_tokens}
+            if num_tokens is not None
+            and num_tokens < q.shape[0]
+            and _gfx1250_fused_qk_norm_mrope_cache_num_tokens()
+            else {}
+        ),
     )
 
 

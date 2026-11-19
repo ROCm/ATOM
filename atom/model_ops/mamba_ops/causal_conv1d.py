@@ -16,8 +16,11 @@ from atom.model_ops.mamba_ops.causal_conv1d_persistent import (
     PERSISTENT_CONFIG,
     _causal_conv1d_persistent_kernel,
 )
+from atom.utils import envs
 
 PAD_SLOT_ID = -1
+# `_causal_conv1d_fwd_rows_v2_kernel`'s occupancy hint (tests / sweeps may override)
+_ROWS_V2_WAVES_PER_EU = 5
 
 
 @triton.jit()
@@ -212,6 +215,259 @@ def _causal_conv1d_fwd_rows_kernel(
         slot_out = tl.load(cache_indices_ptr + idx_seq * stride_cache_indices).to(
             tl.int64
         )
+        tl.debug_barrier()
+        tl.store(
+            conv_states_ptr
+            + slot_out * stride_istate_seq
+            + (idx_feats * stride_istate_dim)[None, :]
+            + (idx_state * stride_istate_token)[:, None],
+            new_state,
+            mask=mask_state[:, None] & mask_feats[None, :],
+        )
+
+
+@triton.jit()
+def _causal_conv1d_fwd_rows_v2_kernel(
+    x_ptr,
+    w_ptr,
+    bias_ptr,
+    conv_states_ptr,
+    cache_indices_ptr,
+    cache_indices_in_ptr,
+    has_initial_states_ptr,
+    query_start_loc_ptr,
+    batch_ptr,
+    token_chunk_offset_ptr,
+    query_ptr,
+    key_ptr,
+    value_ptr,
+    eps,
+    dim: tl.constexpr,
+    k_dim_size: tl.constexpr,
+    num_cache_lines: tl.constexpr,
+    stride_x_token: tl.constexpr,
+    stride_w_dim: tl.constexpr,
+    stride_w_width: tl.constexpr,
+    stride_istate_seq: tl.constexpr,
+    stride_istate_dim: tl.constexpr,
+    stride_istate_token: tl.constexpr,
+    stride_cache_indices: tl.constexpr,
+    query_token_stride: tl.constexpr,
+    key_token_stride: tl.constexpr,
+    value_token_stride: tl.constexpr,
+    pad_slot_id: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    KERNEL_WIDTH: tl.constexpr,
+    SILU_ACTIVATION: tl.constexpr,
+    USE_PAD_SLOT: tl.constexpr,
+    NP2_STATELEN: tl.constexpr,
+    QK_L2NORM: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    PACKED_META: tl.constexpr = False,
+):
+    """`_causal_conv1d_fwd_rows_kernel` (the same arithmetic, bitwise) with every
+    load issued before the first use and no branch between the loads.
+
+    The rows kernel is latency-bound: it waits for one scalar load after
+    another (program table, read slot, token range, flags), then for each of
+    its 8 rows in turn (the branches of a row keep the next row's load behind
+    the store), then reloads the final-state rows: about a dozen dependent
+    memory round trips. Here:
+    (1) the program's table entries, the weights;
+    (2) the sequence's scalars (its token range, slots, initial-state flag) --
+        or nothing with PACKED_META, where batch_ptr is a [programs, 8] int32
+        table (sequence, chunk, first token, end token, read slot, write slot,
+        has-initial-state, 0) read in (1);
+    (3) the window, the initial state, the 8 rows and, for a first chunk, the
+        sequence's last state_len rows (the final state is stored from them).
+    Pad programs (sequence pad_slot_id, or a pad read slot) do not return
+    early -- a branch lets the compiler sink the loads after it -- but have no
+    rows and store nothing. q / k and v programs run separate copies of the
+    row loop, so no branch sits between rows."""
+    state_len: tl.constexpr = KERNEL_WIDTH - 1
+    tl.static_assert(KERNEL_WIDTH == 4)
+    block_start = tl.program_id(1) * BLOCK_N
+    idx_feats = block_start + tl.arange(0, BLOCK_N)
+    mask_feats = idx_feats < dim
+    if PACKED_META:
+        meta = batch_ptr + tl.program_id(0) * 8
+        idx_seq = tl.load(meta).to(tl.int64)
+        chunk_offset = tl.load(meta + 1)
+        sequence_start_index = tl.load(meta + 2).to(tl.int64)
+        sequence_end_index = tl.load(meta + 3).to(tl.int64)
+        slot_in = tl.load(meta + 4).to(tl.int64)
+        slot_out = tl.load(meta + 5).to(tl.int64)
+        has_init = tl.load(meta + 6) != 0
+    else:
+        idx_seq = tl.load(batch_ptr + tl.program_id(0)).to(tl.int64)
+        chunk_offset = tl.load(token_chunk_offset_ptr + tl.program_id(0))
+        # a pad program reads sequence 0's entries and is masked off below
+        idx_c = tl.maximum(idx_seq, 0)
+        sequence_start_index = tl.load(query_start_loc_ptr + idx_c).to(tl.int64)
+        sequence_end_index = tl.load(query_start_loc_ptr + idx_c + 1).to(tl.int64)
+        slot_in = tl.load(cache_indices_in_ptr + idx_c * stride_cache_indices).to(
+            tl.int64
+        )
+        slot_out = tl.load(cache_indices_ptr + idx_c * stride_cache_indices).to(
+            tl.int64
+        )
+        has_init = tl.load(has_initial_states_ptr + idx_c).to(tl.int1)
+    # The weights: no dependence on the table entries (round trip 1).
+    w0 = tl.load(w_ptr + idx_feats * stride_w_dim, mask=mask_feats, other=0.0)
+    w1 = tl.load(
+        w_ptr + idx_feats * stride_w_dim + stride_w_width, mask=mask_feats, other=0.0
+    )
+    w2 = tl.load(
+        w_ptr + idx_feats * stride_w_dim + 2 * stride_w_width,
+        mask=mask_feats,
+        other=0.0,
+    )
+    w3 = tl.load(
+        w_ptr + idx_feats * stride_w_dim + 3 * stride_w_width,
+        mask=mask_feats,
+        other=0.0,
+    )
+    if HAS_BIAS:
+        acc0 = tl.load(bias_ptr + idx_feats, mask=mask_feats, other=0.0).to(tl.float32)
+    else:
+        acc0 = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    live = idx_seq != pad_slot_id
+    if USE_PAD_SLOT:
+        live = live & (slot_in != pad_slot_id)
+    # A pad program has no rows: every load and store below is masked off. Its chunk entry may be
+    # anything (compute_causal_conv1d_metadata fills -1), so it is taken as 0: no negative rows.
+    chunk_offset = tl.where(live, chunk_offset, 0)
+    seqlen = tl.where(live, sequence_end_index - sequence_start_index, 0)
+    first = chunk_offset == 0
+    first_live = first & live
+    load_init_state = first_live & has_init
+    state_in_base = (
+        conv_states_ptr + slot_in * stride_istate_seq + idx_feats * stride_istate_dim
+    )
+    x_base = x_ptr + sequence_start_index * stride_x_token + idx_feats
+    token_offset = chunk_offset * BLOCK_M
+    # The window before the chunk: the tokens before it, or (first chunk) the
+    # initial state -- one load a row from either address, no select after.
+    mask_prev = mask_feats & (~first) & live
+    mask_init = mask_feats & load_init_state
+    col0 = tl.load(
+        tl.where(first, state_in_base, x_base + (token_offset - 3) * stride_x_token),
+        mask=tl.where(first, mask_init, mask_prev),
+        other=0.0,
+    )
+    col1 = tl.load(
+        tl.where(
+            first,
+            state_in_base + stride_istate_token,
+            x_base + (token_offset - 2) * stride_x_token,
+        ),
+        mask=tl.where(first, mask_init, mask_prev),
+        other=0.0,
+    )
+    col2 = tl.load(
+        tl.where(
+            first,
+            state_in_base + 2 * stride_istate_token,
+            x_base + (token_offset - 1) * stride_x_token,
+        ),
+        mask=tl.where(first, mask_init, mask_prev),
+        other=0.0,
+    )
+    x_rows = ()
+    for r in tl.static_range(BLOCK_M):
+        x_rows += (
+            tl.load(
+                x_base + (token_offset + r) * stride_x_token,
+                mask=mask_feats & (token_offset + r < seqlen),
+                other=0.0,
+            ),
+        )
+    # The new state (first chunk only): the last state_len inputs of the
+    # sequence, or (a sequence shorter than that) the tail of the initial state.
+    idx_state = tl.arange(0, NP2_STATELEN)
+    mask_state = idx_state < state_len
+    state_src = seqlen - state_len + idx_state
+    state_in_x = state_src >= 0
+    keep_old = (
+        mask_state & (state_src < 0) & load_init_state & (slot_in < num_cache_lines)
+    )
+    new_state = tl.load(
+        tl.where(
+            state_in_x[:, None],
+            x_base[None, :] + (state_src * stride_x_token)[:, None],
+            state_in_base[None, :]
+            + ((state_src + state_len) * stride_istate_token)[:, None],
+        ),
+        mask=tl.where(
+            state_in_x[:, None],
+            (mask_state & first_live)[:, None] & mask_feats[None, :],
+            keep_old[:, None] & mask_feats[None, :],
+        ),
+        other=0.0,
+    )
+    w0 = w0.to(tl.float32)
+    w1 = w1.to(tl.float32)
+    w2 = w2.to(tl.float32)
+    w3 = w3.to(tl.float32)
+    heads: tl.constexpr = BLOCK_N // HEAD_DIM
+    is_qk = block_start < 2 * k_dim_size
+    if is_qk:
+        # q or k: the output and its row stride, without a branch per row
+        is_q = block_start < k_dim_size
+        out_base = tl.where(
+            is_q, query_ptr + idx_feats, key_ptr + (idx_feats - k_dim_size)
+        )
+        out_stride = tl.where(is_q, query_token_stride, key_token_stride)
+        for r in tl.static_range(BLOCK_M):
+            row = token_offset + r
+            x_r = x_rows[r]
+            acc = tl.fma(col0.to(tl.float32), w0, acc0)
+            acc = tl.fma(col1.to(tl.float32), w1, acc)
+            acc = tl.fma(col2.to(tl.float32), w2, acc)
+            acc = tl.fma(x_r.to(tl.float32), w3, acc)
+            col0 = col1
+            col1 = col2
+            col2 = x_r
+            if SILU_ACTIVATION:
+                acc = libdevice.fast_dividef(acc, 1.0 + libdevice.fast_expf(-acc))
+            if QK_L2NORM:
+                y = tl.reshape(
+                    acc.to(query_ptr.dtype.element_ty).to(tl.float32),
+                    (heads, HEAD_DIM),
+                )
+                rstd = tl.rsqrt(tl.sum(y * y, axis=1) + eps)
+                acc = tl.reshape(y * rstd[:, None], (BLOCK_N,))
+            tl.store(
+                out_base + (sequence_start_index + row) * out_stride,
+                acc,
+                mask=mask_feats & (row < seqlen),
+            )
+    else:
+        v_base = value_ptr + (idx_feats - 2 * k_dim_size)
+        for r in tl.static_range(BLOCK_M):
+            row = token_offset + r
+            x_r = x_rows[r]
+            acc = tl.fma(col0.to(tl.float32), w0, acc0)
+            acc = tl.fma(col1.to(tl.float32), w1, acc)
+            acc = tl.fma(col2.to(tl.float32), w2, acc)
+            acc = tl.fma(x_r.to(tl.float32), w3, acc)
+            col0 = col1
+            col1 = col2
+            col2 = x_r
+            if SILU_ACTIVATION:
+                acc = libdevice.fast_dividef(acc, 1.0 + libdevice.fast_expf(-acc))
+            tl.store(
+                v_base + (sequence_start_index + row) * value_token_stride,
+                acc,
+                mask=mask_feats & (row < seqlen),
+            )
+
+    # The first chunk stores the new state after every read of the initial
+    # state (the read and write slots may be equal): the barrier waits for
+    # the loads.
+    if first_live:
         tl.debug_barrier()
         tl.store(
             conv_states_ptr
@@ -939,7 +1195,7 @@ def causal_conv1d_fn(
         and stride_x_dim == 1
     ):
         use_persistent = (
-            cu_seqlen >= 4096
+            cu_seqlen >= envs.ATOM_GDN_CONV_PERSISTENT_MIN_TOKENS
             and k_dim_size == 2048
             and v_dim_size == 4096
             and x.dtype == torch.bfloat16
@@ -961,7 +1217,16 @@ def causal_conv1d_fn(
                 batch_ptr = nums_dict[BLOCK_M]["batch_ptr"]
                 token_chunk_offset_ptr = nums_dict[BLOCK_M]["token_chunk_offset_ptr"]
         else:
-            kernel = _causal_conv1d_fwd_rows_kernel
+            packed = (
+                nums_dict[BLOCK_M].get("prog_meta")
+                if metadata is not None and envs.ATOM_GDN_CONV_ROWS_V2
+                else None
+            )
+            kernel = (
+                _causal_conv1d_fwd_rows_v2_kernel
+                if envs.ATOM_GDN_CONV_ROWS_V2
+                else _causal_conv1d_fwd_rows_kernel
+            )
             launch_config = {
                 "BLOCK_M": BLOCK_M,
                 "BLOCK_N": rows_block_n,
@@ -983,6 +1248,13 @@ def causal_conv1d_fn(
             },
             args,
         )
+        if kernel is _causal_conv1d_fwd_rows_v2_kernel:
+            # all 8 rows in flight take ~190 VGPRs: 5 waves a SIMD without spills
+            launch_config = dict(launch_config, waves_per_eu=_ROWS_V2_WAVES_PER_EU)
+            if packed is not None:
+                # one table entry a program carries every scalar the program needs
+                batch_ptr = packed
+                launch_config["PACKED_META"] = True
         kernel[(programs, dim // rows_block_n)](
             x_ptr=x,
             w_ptr=weight,

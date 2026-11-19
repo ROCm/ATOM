@@ -292,7 +292,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # `num_local_tokens * topk` multiply it launches in every MoE layer. Needs
     # an aiter whose fused_moe takes `num_valid_routes`; off, nothing passes it.
     # Schedule and dispatch the next step's prefill while a pure decode forward is
-    # still in flight (EngineCore._early_prefill_ok gates it), and let a pure
+    # still in flight (EngineCore._early_prefill_ok gates it: a lone engine or an
+    # independent DP rank, ATOM_DP_INDEPENDENT), and let a pure
     # prefill take the previous step's speculative status after its launch
     # instead of before it. Hides the prefill schedule() and the dispatch behind
     # the decode on the GPU.
@@ -472,6 +473,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # topk_softmax for bf16 [T, 256] logits, renormalized, no shared columns. Same
     # ids and weights, ~1.5 us less a MoE layer.
     "ATOM_MOE_TRITON_TOPK": lambda: os.getenv("ATOM_MOE_TRITON_TOPK", "0") == "1",
+    # MoE routing on gfx1250 TP decode (<= 128 rows): leave the top-k to aiter's
+    # grouped MoE, which computes it with the routing metadata and the MXFP4
+    # activation quant in one launch instead of three (topkGatingSoftmax,
+    # moe_route_psum_fused, moe_fused_quant_preshuffle_routeks). Bit-identical
+    # ids, weights and expert inputs; ~7 us less a MoE layer.
+    "ATOM_MOE_FUSED_TOPK_ROUTE_QUANT": lambda: (
+        os.getenv("ATOM_MOE_FUSED_TOPK_ROUTE_QUANT", "0") == "1"
+    ),
     "ATOM_FUSED_SIGMOID_GATE": lambda: (
         os.getenv("ATOM_FUSED_SIGMOID_GATE", "0") == "1"
     ),
@@ -494,6 +503,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FUSED_MOE_TAIL_NORM": lambda: (
         os.getenv("ATOM_FUSED_MOE_TAIL_NORM", "0") == "1"
     ),
+    # With ATOM_FUSED_MOE_TAIL_NORM, TP1 on aiter's gfx1250 grouped MoE (no EP
+    # scatter): the routed experts' top-k gather-reduce runs in the tail norm's
+    # kernel too (moe_tail_norm.moe_gather_tail_rmsnorm): one program a token
+    # loads its MoE2 rows, weights and sums them, adds sigmoid(gate) * shared
+    # and the residual and normalizes, bitwise moe_gather_reduce + the tail
+    # kernel. The shared expert still runs between MoE2 and this kernel.
+    # Eager / CUDA graphs only. Off by default.
+    "ATOM_MOE_GATHER_TAIL_NORM": lambda: (
+        os.getenv("ATOM_MOE_GATHER_TAIL_NORM", "0") == "1"
+    ),
+    # With ATOM_MOE_GATHER_TAIL_NORM, on gfx1250 at prefill sizes (>= 8192
+    # output rows, moe_gather_tail_gluon.PIPE_MIN_ROWS): the fused gather + tail
+    # runs as a software-pipelined Gluon kernel instead -- two programs a CU,
+    # each a run of tokens, its route map read up front into LDS and every
+    # token's MoE2 / shared / residual rows TDM-loaded one token ahead. Bitwise
+    # the one-token kernel (and so moe_gather_reduce + the tail kernel); fewer
+    # rows keep the one-token kernel. Off by default.
+    "ATOM_MOE_GATHER_TAIL_NORM_PIPE": lambda: (
+        os.getenv("ATOM_MOE_GATHER_TAIL_NORM_PIPE", "0") == "1"
+    ),
     # With ATOM_FUSED_MOE_TAIL_NORM, under mori EP on aiter's MegaMoEGfx1250
     # (bf16 combine wire): the gated shared-expert add, the residual add and the
     # next RMSNorm run inside aiter's one-kernel combine (its cross-device wait
@@ -502,6 +531,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Eager / CUDA graphs only (torch.compile keeps the tail kernel). Off by
     # default; needs an aiter whose MegaMoEGfx1250.forward takes combine_tail.
     "ATOM_MEGA_COMBINE_TAIL": lambda: (os.getenv("ATOM_MEGA_COMBINE_TAIL", "0") == "1"),
+    # Qwen3.5 MoE TP4 decode on gfx1250: the sparse MoE block (router, top-k,
+    # MXFP4 experts, shared expert, gated add), the all-reduce, the residual add
+    # and the next RMSNorm in one FlyDSL kernel
+    # (atom/model_ops/qwen_mono_moe/integration.py) for decode steps of up to
+    # 128 rows; others run the native chain. Off by default.
+    "ATOM_QWEN_MONO_MOE": lambda: (os.getenv("ATOM_QWEN_MONO_MOE", "0") == "1"),
     # Steps above this many rows a rank keep the separate tail kernel: aiter's
     # one-kernel combine reduces with plain buffer loads, which from ~1-4k rows
     # on lose the tail's saving to the TDM reduce they replace (4-GPU EP on
@@ -520,6 +555,123 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "ATOM_SHARED_EXPERT_GATED_GEMM": lambda: (
         os.getenv("ATOM_SHARED_EXPERT_GATED_GEMM", "0") == "1"
+    ),
+    # Qwen3-Next / Qwen3.5 sparse MoE block at TP1 (gfx1250): the router GEMM
+    # and the whole bf16 shared expert (gate_up, SiLU-and-mul, down) in one
+    # aiter gluon kernel, before the routed experts, on steps of up to
+    # ATOM_FUSED_ROUTER_SHARED_EXPERT_MAX_TOKENS rows (larger steps keep the
+    # separate GEMMs). Interleaves gate_up's rows as ATOM_SHARED_EXPERT_GATED_GEMM
+    # does. Bitwise the separate GEMMs. Off by default.
+    "ATOM_FUSED_ROUTER_SHARED_EXPERT": lambda: (
+        os.getenv("ATOM_FUSED_ROUTER_SHARED_EXPERT", "0") == "1"
+    ),
+    # ATOM_FOLD_TOPK_ROUTER (with ATOM_FUSED_ROUTER_SHARED_EXPERT and
+    # ATOM_MOE_FUSED_TOPK_ROUTE_QUANT): at decode sizes (<= 16 rows) the router +
+    # shared expert kernel also computes the MoE top-k, routing and MXFP4
+    # activation quant (aiter's fused_gemm_a16w16_router_shared_expert_topk), so
+    # the grouped MoE skips its moe_topk_route_quant launch. Bitwise the same.
+    "ATOM_FOLD_TOPK_ROUTER": lambda: (
+        os.getenv("ATOM_FOLD_TOPK_ROUTER", "0") == "1"
+    ),
+    # ATOM_ROUTER_SHARED_V2 (with ATOM_FOLD_TOPK_ROUTER): the folded router + shared
+    # expert + top-k kernel is aiter's decode rewrite
+    # (fused_gemm_a16w16_router_shared_expert_topk_v2): same outputs bit for bit,
+    # ~2 us less a layer on gfx1250. Falls back to the fold-1 kernel where unsupported.
+    "ATOM_ROUTER_SHARED_V2": lambda: (
+        os.getenv("ATOM_ROUTER_SHARED_V2", "0") == "1"
+    ),
+    "ATOM_FUSED_ROUTER_SHARED_EXPERT_MAX_TOKENS": lambda: int(
+        os.getenv("ATOM_FUSED_ROUTER_SHARED_EXPERT_MAX_TOKENS", "512")
+    ),
+    # With ATOM_FUSED_ROUTER_SHARED_EXPERT, steps of at least
+    # ATOM_FUSED_ROUTER_SHARED_EXPERT_PREFILL_MIN_TOKENS rows above the decode
+    # kernel's limit (prefill) run the router and the shared expert's gate_up
+    # as one GEMM over both weights (SiLU-and-mul epilogue on the gate_up
+    # tiles), then the down GEMM. Bitwise the separate GEMMs. On by default
+    # with the fused flag; 0 keeps the separate GEMMs at those sizes.
+    "ATOM_FUSED_ROUTER_SHARED_EXPERT_PREFILL": lambda: (
+        os.getenv("ATOM_FUSED_ROUTER_SHARED_EXPERT_PREFILL", "1") == "1"
+    ),
+    "ATOM_FUSED_ROUTER_SHARED_EXPERT_PREFILL_MIN_TOKENS": lambda: int(
+        os.getenv("ATOM_FUSED_ROUTER_SHARED_EXPERT_PREFILL_MIN_TOKENS", "513")
+    ),
+    # Qwen3-Next / Qwen3.5 sparse MoE block at TP1 (gfx1250), steps of
+    # ATOM_QWEN_SHARED_EXPERT_SIDE_STREAM_MIN_TOKENS to _MAX_TOKENS rows: the
+    # router GEMM alone on the main stream, the bf16 shared expert (gate_up +
+    # SiLU-and-mul, down) on a side stream beside the routed experts, joined
+    # before the norm that sums them. From _LATE_MIN_TOKENS rows the side
+    # stream forks after the routing / activation-quant launch (beside the
+    # expert GEMMs only) instead of right after the router. Bitwise the fused
+    # router + shared kernel and the separate GEMMs. Takes precedence over
+    # ATOM_FUSED_ROUTER_SHARED_EXPERT in its row range. Off by default.
+    "ATOM_QWEN_SHARED_EXPERT_SIDE_STREAM": lambda: (
+        os.getenv("ATOM_QWEN_SHARED_EXPERT_SIDE_STREAM", "0") == "1"
+    ),
+    "ATOM_QWEN_SHARED_EXPERT_SIDE_STREAM_MIN_TOKENS": lambda: int(
+        os.getenv("ATOM_QWEN_SHARED_EXPERT_SIDE_STREAM_MIN_TOKENS", "129")
+    ),
+    "ATOM_QWEN_SHARED_EXPERT_SIDE_STREAM_MAX_TOKENS": lambda: int(
+        os.getenv("ATOM_QWEN_SHARED_EXPERT_SIDE_STREAM_MAX_TOKENS", "65536")
+    ),
+    "ATOM_QWEN_SHARED_EXPERT_SIDE_STREAM_LATE_MIN_TOKENS": lambda: int(
+        os.getenv("ATOM_QWEN_SHARED_EXPERT_SIDE_STREAM_LATE_MIN_TOKENS", "3072")
+    ),
+    # Qwen3.5 MTP drafter at TP > 1: the target's all-reduce fusions. o_proj, its
+    # all-reduce and post_attention_layernorm run as aiter's gfx1250 GEMM +
+    # all-reduce + RMSNorm (TP4, up to 128 rows; else the GEMM, then the fused
+    # all-reduce + RMSNorm), and the MoE output's all-reduce runs in the final
+    # norm's kernel. The input norm stays a plain norm: its input, the fc output,
+    # is replicated. Off by default.
+    "ATOM_MTP_FUSE_ALLREDUCE_NORM": lambda: _flag_env("ATOM_MTP_FUSE_ALLREDUCE_NORM"),
+    # The MTP drafter's MoE block in the fused TP4 MoE-half kernel (as
+    # ATOM_QWEN_MONO_MOE for the target); needs ATOM_MTP_FUSE_ALLREDUCE_NORM.
+    "ATOM_MTP_MONO_MOE": lambda: _flag_env("ATOM_MTP_MONO_MOE"),
+    # With ATOM_MTP_SELECT_ROWS_BEFORE_MOE: the drafter keeps its step-0 rows (one
+    # a sequence) before o_proj instead of after post_attention_layernorm, both
+    # row-wise: o_proj, its all-reduce and the norm run on those rows, the
+    # attention output gate gathers them in its own launch, and the residual
+    # rows are gathered by the GEMM + all-reduce + RMSNorm kernel (or one
+    # index_select without it), replacing the two index_selects. Off by default.
+    "ATOM_MTP_SELECT_ROWS_BEFORE_O_PROJ": lambda: _flag_env(
+        "ATOM_MTP_SELECT_ROWS_BEFORE_O_PROJ"
+    ),
+    # Qwen3.5 MTP drafter: the attention output gate `o * sigmoid(gate)` (and the
+    # step-0 row selection of ATOM_MTP_SELECT_ROWS_BEFORE_O_PROJ) in the epilogue
+    # of aiter's unified-attention reduce_segments, bitwise the separate kernel.
+    # Unified-attention decode only (else the separate kernel); eager / CUDA
+    # graphs (the drafter is not torch.compiled). Off by default.
+    "ATOM_MTP_ATTN_GATE_IN_REDUCE": lambda: _flag_env("ATOM_MTP_ATTN_GATE_IN_REDUCE"),
+    # gfx1250 unified-attention decode / spec-decode verify: the split-KV reduce
+    # after the 3D kernel through aiter's reduce_segments_split_gluon
+    # (unified_attention(split_reduce=True)) instead of the Triton reduce_segments,
+    # for the token split's 128-256-segment grid (AITER_GFX12_TOKEN_SPLIT). Not
+    # bitwise (another fp32 summation order). No-op on an aiter without it. Off by
+    # default.
+    "ATOM_UA_SPLIT_REDUCE": lambda: _flag_env("ATOM_UA_SPLIT_REDUCE"),
+    # With aiter's gfx1250 token split (AITER_GFX12_TOKEN_SPLIT=1) on unified
+    # attention: a decode forward's tiles per segment, computed once on the host
+    # by the attention builder from the context lengths it uploads and published
+    # with them, instead of a gfx12_token_split_tiles launch before every layer's
+    # attention. The same int32. Every target layer and the MTP draft's step 0
+    # (the same lengths) read it; the draft's later passes take theirs from
+    # ATOM_MTP_ADVANCE_TOKEN_SPLIT. Off by default.
+    "ATOM_UA_DECODE_TOKEN_SPLIT": lambda: _flag_env("ATOM_UA_DECODE_TOKEN_SPLIT"),
+    # With ATOM_UA_SPLIT_REDUCE: aiter's reduce_segments_split_oneshot_gluon
+    # (unified_attention(split_reduce_oneshot=True)) in its place, bitwise the same
+    # output: every load (the live segments' partials by TDM, the statistics, the
+    # output gate) in flight at once instead of a chain of dependent round trips.
+    # No-op on an aiter without it. Off by default.
+    "ATOM_UA_SPLIT_REDUCE_ONESHOT": lambda: _flag_env("ATOM_UA_SPLIT_REDUCE_ONESHOT"),
+    # With ATOM_FUSED_MOE_TAIL_NORM at TP > 1 (gfx1250, TP4): a sparse MoE block
+    # whose next norm all-reduces (the Qwen3.5 MTP drafter's final norm with
+    # ATOM_MTP_FUSE_ALLREDUCE_NORM) leaves `routed + sigmoid(gate) * shared` to
+    # that norm, which computes it while it reads its input in aiter's Gluon
+    # all-reduce + RMSNorm kernel: one launch fewer, bitwise. The drafter only;
+    # ATOM_FUSED_MOE_TAIL_AR_NORM_TARGET also does it for the target's layers.
+    # Off by default.
+    "ATOM_FUSED_MOE_TAIL_AR_NORM": lambda: _flag_env("ATOM_FUSED_MOE_TAIL_AR_NORM"),
+    "ATOM_FUSED_MOE_TAIL_AR_NORM_TARGET": lambda: _flag_env(
+        "ATOM_FUSED_MOE_TAIL_AR_NORM_TARGET"
     ),
     "ATOM_MEGA_COMBINE_TAIL_MAX_TOKENS": lambda: int(
         os.getenv("ATOM_MEGA_COMBINE_TAIL_MAX_TOKENS", "1024")
@@ -623,6 +775,72 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # per-chunk factors exp(g_last - g_i) and exp(g_last); chunk_h reads them
     # instead of the gates. Bit-identical outputs. On by default; 0 = chunk_h reads the gates.
     "ATOM_GDN_CHUNK_H_DECAY": lambda: os.getenv("ATOM_GDN_CHUNK_H_DECAY", "1") == "1",
+    # gfx1250 GDN prefill state walk (chunk_h) in a token graph. The plan's sequence capacity
+    # picks the 128-wide value tile, which leaves most CUs idle at one sequence. 2 (default) =
+    # the kernel picks 32 wide while the step's workgroups fit the CUs (1-2 sequences) and 128
+    # otherwise; 1 = always 32 wide (faster for one long plus short sequences, slower for 3+
+    # similar ones); 0 = the capacity's tile. Same outputs bitwise.
+    "ATOM_GDN_CHUNK_H_PLAN_TILE": lambda: int(
+        os.getenv("ATOM_GDN_CHUNK_H_PLAN_TILE", "2")
+    ),
+    # gfx1250 GDN prefill state walk (chunk_h) with exact checkpoints: each chunk's checkpoint slot
+    # is read a chunk ahead (a vector register), not at the chunk, where every chunk of the walk
+    # waited for the load. Same outputs bitwise. On by default; 0 = read at the chunk.
+    "ATOM_GDN_CHUNK_H_CKPT_AHEAD": lambda: os.getenv("ATOM_GDN_CHUNK_H_CKPT_AHEAD", "1")
+    == "1",
+    # gfx1250 GDN prefill state walk (chunk_h): the initial state loads unconditionally and a
+    # select zeroes a cold sequence's, instead of a load masked by the sequence's flag (which
+    # compiles to a branch per element: 2.7 KB of code, ~1.2 us of the prologue). Same outputs
+    # bitwise. On by default; 0 = the masked load.
+    "ATOM_GDN_CHUNK_H_H0_SELECT": lambda: os.getenv("ATOM_GDN_CHUNK_H_H0_SELECT", "1")
+    == "1",
+    # GDN state checkpoint copy: one program a block of the state looping over the step's
+    # targets (one vector read of the table) instead of one program a (target, block) pair,
+    # most of them padding. Same bytes written. On by default; 0 = the per-target grid.
+    "ATOM_GDN_CKPT_COPY_LOOP": lambda: os.getenv("ATOM_GDN_CKPT_COPY_LOOP", "1") == "1",
+    # gfx1250 GDN prefill fused KKT kernel, launches of at most this many 64-token chunks
+    # (the plan capacity; 40 = the 1536-token bucket): V loads into its own LDS tile with K
+    # at the start, and the grid runs head-fastest (live chunks dispatch first, a key head's
+    # two value heads on one XCD). Larger launches keep the chunk-fastest grid and the V load
+    # after the W store. Same outputs bitwise. 0 = never.
+    "ATOM_GDN_KKT_SMALL_MAX_CHUNKS": lambda: int(
+        os.getenv("ATOM_GDN_KKT_SMALL_MAX_CHUNKS", "40")
+    ),
+    # gfx1250: Triton / Gluon kernels whose name matches this regular expression get an
+    # instruction prefetch prologue (utils/gfx1250_inst_prefetch.py): the kernel's whole code is
+    # requested into the instruction cache at its start. In a layer the kernels evict each other's
+    # code and a cold cache costs ~0.4-0.5 us per KB of straight-line code. Same outputs bitwise.
+    # "" = off.
+    "ATOM_INST_PREFETCH_KERNELS": lambda: os.getenv("ATOM_INST_PREFETCH_KERNELS", ""),
+    # GDN prefill causal conv1d: token rows (the graph bucket) from which the persistent TDM
+    # kernel runs instead of the rows kernel. It rounds differently (its SiLU and the
+    # unrounded q / k norm input), so lowering this changes those buckets' bits; 2048 makes
+    # the 2048 / 3072 buckets' conv 3-5 us faster. Default 4096 (as before).
+    "ATOM_GDN_CONV_PERSISTENT_MIN_TOKENS": lambda: int(
+        os.getenv("ATOM_GDN_CONV_PERSISTENT_MIN_TOKENS", "4096")
+    ),
+    # GDN prefill causal conv1d (buckets below ATOM_GDN_CONV_PERSISTENT_MIN_TOKENS):
+    # `_causal_conv1d_fwd_rows_v2_kernel`, every load issued before the first use and no
+    # branch between them (the rows kernel waits on about a dozen dependent memory round
+    # trips: one scalar table load after another, each of its 8 rows in turn, then the
+    # final-state rows again). Same outputs bitwise. In the GDN layer chain (instruction
+    # prefetch on) 455 tokens 7.9 -> 5.5 us, 1024 9.8 -> 8.0, 3000 18.9 -> 15.9. 0 = the rows
+    # kernel.
+    "ATOM_GDN_CONV_ROWS_V2": lambda: os.getenv("ATOM_GDN_CONV_ROWS_V2", "1") == "1",
+    # With ATOM_GDN_CONV_ROWS_V2: the GDN metadata builder also uploads the rows kernel's
+    # program table packed, [programs, 8] int32 (sequence, chunk, first token, end token,
+    # read slot, write slot, has-initial-state, 0) from host data, so a program reads every
+    # scalar in one round trip instead of two (another 0.3-0.7 us a layer). 0 = the kernel
+    # reads the sequence's entries itself.
+    "ATOM_GDN_CONV_PACKED_META": lambda: (
+        os.getenv("ATOM_GDN_CONV_PACKED_META", "1") == "1"
+    ),
+    # A8K4V8 attention prefill padded to a token-graph bucket (attention runs eagerly): the fused
+    # Q/K norm + MRoPE + KV-cache write computes only the scheduled rows (aiter `num_tokens`), not
+    # the bucket's pad rows, which nothing reads (the attention takes q[:scheduled]). 0 = all rows.
+    "ATOM_QK_NORM_ROPE_SCHEDULED_ROWS": lambda: (
+        os.getenv("ATOM_QK_NORM_ROPE_SCHEDULED_ROWS", "0") == "1"
+    ),
     # Both zeroings above in one Triton launch each (`pool_layout/zero_spans.py`)
     # instead of an `index_fill_` per pool field -- per field AND per layer once
     # a pool passes 2 GiB, each writing a byte a lane. The same bytes zeroed,
@@ -995,6 +1213,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_API_OFFLOAD_PREPROCESS": lambda: (
         os.getenv("ATOM_API_OFFLOAD_PREPROCESS", "0") == "1"
     ),
+    # With ATOM_API_OFFLOAD_PREPROCESS: host memory (MB) each tokenize worker
+    # keeps for a `segment_tokenizer.SegmentTokenizer`, and chat completions
+    # carrying a session header (X-Session-ID and the like) go to the worker
+    # that session hashes to, so a conversation's next turn re-encodes only
+    # what it added. 0 (default): every worker encodes whole prompts and any
+    # worker takes any request.
+    "ATOM_API_OFFLOAD_TOKENIZE_CACHE_MB": lambda: int(
+        os.getenv("ATOM_API_OFFLOAD_TOKENIZE_CACHE_MB", "0")
+    ),
     # Cheaper SSE streaming of chat completions on the API event loop: the stream
     # detokenizer decodes through the Rust tokenizer directly once a startup
     # probe shows it returns what `tokenizer.decode` does, and every SSE event
@@ -1254,6 +1481,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of the custom all-gather, and pick the winner in one kernel. Three
     # launches instead of six; token-identical.
     "ATOM_ARGMAX_HEAD_AR_GATHER": lambda: _flag_env("ATOM_ARGMAX_HEAD_AR_GATHER", "0"),
+    # With ATOM_ARGMAX_HEAD_AR_GATHER on gfx1250: the per-rank argmax pack image
+    # comes out of the LM-head GEMM's epilogue (aiter gemm_a16w16_argmax_units)
+    # -- the logits are never written and the separate argmax kernel goes. The
+    # same GEMM tiles and bf16 logits, so the same draft ids, ties included.
+    "ATOM_LM_HEAD_ARGMAX_EPILOGUE": lambda: _flag_env(
+        "ATOM_LM_HEAD_ARGMAX_EPILOGUE", "0"
+    ),
+    # TP4 greedy argmax head on gfx1250: the GEMM's per-tile argmax keys (as
+    # ATOM_LM_HEAD_ARGMAX_EPILOGUE), then one aiter kernel that reduces them,
+    # exchanges the (max, token) packs over its own IPC inboxes and picks the
+    # winner (argmax_exchange_pick): two launches for the head instead of four.
+    # Token-identical, ties included. Its inboxes are made with the LM head.
+    "ATOM_LM_HEAD_ARGMAX_EXCHANGE": lambda: _flag_env(
+        "ATOM_LM_HEAD_ARGMAX_EXCHANGE", "0"
+    ),
     # GDN-hybrid MTP: each draft step's context_lens fix-up and kv_indptr rebuild
     # (GDNAttentionMetadataBuilder.prepare_mtp_decode) in one Triton launch
     # instead of up to seven eager ones. Integer math, so the same result.
@@ -1267,12 +1509,105 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_MTP_FUSED_EMBED_PRE_FC_NORM": lambda: _flag_env(
         "ATOM_MTP_FUSED_EMBED_PRE_FC_NORM", "0"
     ),
+    # Qwen3.5 MTP: the pre-fc norms and the fc in one aiter kernel
+    # (fused_rmsnorm_gemm_a16w16) on a pass of up to 32 rows. norm_e(embed) is
+    # a table normed once at load by the norm kernel itself (+1 GB a rank, the
+    # size of the replicated embedding), gathered by id; norm_h(hidden) runs in
+    # the GEMM's prologue with the norm kernel's rstd. Bitwise the same as the
+    # norm kernel + fc GEMM. Needs ATOM_QWEN35_MTP_REPLICATED_EMBED (or TP 1)
+    # and the replicated bf16 fc (ATOM_MTP_REPLICATED_FC or TP 1); a wider pass
+    # keeps the unfused path.
+    "ATOM_MTP_FUSED_FC_NORM": lambda: _flag_env("ATOM_MTP_FUSED_FC_NORM", "0"),
     # GDN-hybrid MTP (Qwen3.5 / Next): EagleProposer's eager glue between its
     # draft passes fused -- step 0's staging in one launch on a uniform verify
     # batch, and each later pass's metadata advance + input staging + draft id
     # export in one launch plus the kv_indices generation (57 launches a
     # decode step at mtp_k=3 down to 6). Same metadata and inputs, bit for bit.
     "ATOM_MTP_FUSED_DRAFT_GLUE": lambda: _flag_env("ATOM_MTP_FUSED_DRAFT_GLUE", "0"),
+    # With ATOM_MTP_FUSED_DRAFT_GLUE and aiter's gfx1250 token split
+    # (AITER_GFX12_TOKEN_SPLIT=1): the advance kernel also writes the next pass's
+    # attention tiles per segment, which the pass's unified attention then reads
+    # instead of launching gfx12_token_split_tiles. The same int32.
+    "ATOM_MTP_ADVANCE_TOKEN_SPLIT": lambda: _flag_env(
+        "ATOM_MTP_ADVANCE_TOKEN_SPLIT", "0"
+    ),
+    # MTP verify: the work after sampling in one kernel (verify_epilogue.py) --
+    # the rejection, the presence marks, the next-anchor gather, and, for the
+    # drafter, step 0's staging (with ATOM_MTP_FUSED_DRAFT_GLUE on a uniform
+    # graphed verify) and the draft presence reset
+    # (ATOM_MTP_DRAFT_PRESENCE_PENALTY). Replaces ~10 eager launches between the
+    # sampler and the first draft pass. Same tokens and state, bit for bit.
+    "ATOM_MTP_FUSED_VERIFY_EPILOGUE": lambda: _flag_env(
+        "ATOM_MTP_FUSED_VERIFY_EPILOGUE", "0"
+    ),
+    # With ATOM_MTP_FUSED_VERIFY_EPILOGUE: the epilogue also writes the output
+    # rows and the [accepted, rejected] status straight into pinned host slots
+    # and flags them (system-scope release); the host polls the flag instead of
+    # an event record, two side-stream D2H copies and their completion events
+    # (output_transfer.HostHandoffRing). Not on a step with logprobs.
+    "ATOM_MTP_VERIFY_HOST_HANDOFF": lambda: _flag_env(
+        "ATOM_MTP_VERIFY_HOST_HANDOFF", "0"
+    ),
+    # The verifier's presence penalty on the draft's argmax too (TP1 LM head): a
+    # draft row loses the request's presence_penalty on every token it has emitted
+    # and on the drafts before it in this step, as its verify row will, so the
+    # draft stops proposing the tokens the penalized target turns down. Changes
+    # only the proposals: the output distribution is the verifier's either way.
+    "ATOM_MTP_DRAFT_PRESENCE_PENALTY": lambda: _flag_env(
+        "ATOM_MTP_DRAFT_PRESENCE_PENALTY", "0"
+    ),
+    # Speculative rejection sampling (model_ops/spec_rejection.py, TP1 draft LM
+    # head): the draft passes draw their tokens from the draft head's
+    # distribution q with the verify's sampler (aiter topk_topp_sample: top
+    # ATOM_MTP_RS_DRAFT_TOPK logits, the request's temperature and top-p, the draft
+    # presence penalty in its kernel) and keep its record of q; a verify row
+    # accepts its draft with min(1, p/q) and otherwise draws from max(0, p - q),
+    # p the official sampler's own distribution. Exact like the default rule
+    # (draft = argmax, kept when the target's own sample equals it); more drafts
+    # stand when q is close to p. Verify steps the fused sampler does not serve,
+    # or with top_k not an int <= ATOM_MTP_RS_MAX_TOPK (at most 64), keep the
+    # default rule (still exact with sampled drafts).
+    # With ATOM_MTP_REJECTION_SAMPLING and ATOM_MTP_FUSED_DRAFT_GLUE: each draft
+    # pass's record store (two index_copy_) runs inside the advance kernel, and
+    # the last pass's store and draft id export in one launch. The same int32
+    # copies; 7 launches a step at mtp_k=3 down to 1.
+    "ATOM_MTP_FUSED_RS_STORE": lambda: _flag_env("ATOM_MTP_FUSED_RS_STORE", "0"),
+    # GDN speculative decode: the metadata builder's padding after the ReplaySSM
+    # commit (state index / mask / accepted-count fills and the query prefix
+    # copy + broadcast: 5 launches and a memcpy a step) in one Triton launch.
+    # The same values.
+    "ATOM_GDN_FUSED_DECODE_PAD": lambda: _flag_env("ATOM_GDN_FUSED_DECODE_PAD", "0"),
+    # With ATOM_MTP_REJECTION_SAMPLING: the draft sampler's uniforms from a
+    # Philox kernel with a device counter instead of torch's generator, so the
+    # recorded draft passes hold no torch RNG and their replays skip its two
+    # seed / offset fills. Different (equally uniform) draws.
+    "ATOM_MTP_DRAFT_DEVICE_RNG": lambda: _flag_env("ATOM_MTP_DRAFT_DEVICE_RNG", "0"),
+    "ATOM_MTP_REJECTION_SAMPLING": lambda: _flag_env(
+        "ATOM_MTP_REJECTION_SAMPLING", "0"
+    ),
+    "ATOM_MTP_RS_DRAFT_TOPK": lambda: int(os.getenv("ATOM_MTP_RS_DRAFT_TOPK", "20")),
+    "ATOM_MTP_RS_MAX_TOPK": lambda: int(os.getenv("ATOM_MTP_RS_MAX_TOPK", "64")),
+    # The MTP draft passes' LM head from a 128x128-block FP8 (e8m0 scales) copy of
+    # the head (TP1): half the bytes a pass. The verify rows keep the bf16 head, so
+    # only how often drafts are accepted can change, not the output distribution.
+    "ATOM_MTP_DRAFT_LM_HEAD_FP8": lambda: _flag_env("ATOM_MTP_DRAFT_LM_HEAD_FP8", "0"),
+    # The MTP draft layer's attention over its last N positions only (0: full).
+    # A mask, the KV cache is unchanged; the verify keeps full attention.
+    "ATOM_MTP_DRAFT_ATTN_WINDOW": lambda: int(
+        os.getenv("ATOM_MTP_DRAFT_ATTN_WINDOW", "0")
+    ),
+    # Diagnostics: a directory; each engine appends one JSON line per finished
+    # request to spec_steps_<pid>.jsonl there (prompt length, the prompt's first
+    # 64 / last 16 ids, the completion ids, and the tokens each step emitted,
+    # negative for a step that verified no drafts). For offline studies of
+    # drafting policies against the realized MTP outcomes. Off when empty.
+    "ATOM_SPEC_STEP_LOG": lambda: os.getenv("ATOM_SPEC_STEP_LOG", ""),
+    # With ATOM_MTP_FUSED_DRAFT_GLUE: skip the per-pass kv_indices generation
+    # where no draft attention reads kv_indices (page sizes other than 256 / 1024,
+    # whose persistent ASM decode is its only reader). kv_indptr is still written.
+    "ATOM_MTP_SKIP_DRAFT_KV_INDICES": lambda: _flag_env(
+        "ATOM_MTP_SKIP_DRAFT_KV_INDICES", "0"
+    ),
     # Debug: all-gather each step's draft ids over TP after propose and log any
     # rank disagreement. Syncs the host every decode step -- validation only.
     "ATOM_MTP_DRAFT_RANK_CHECK": lambda: (
@@ -1348,6 +1683,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tie (the radix top-k's tie order is not fixed).
     "ATOM_FUSED_TOPK_TOPP_SAMPLE": lambda: (
         os.getenv("ATOM_FUSED_TOPK_TOPP_SAMPLE", "0") == "1"
+    ),
+    # With ATOM_FUSED_TOPK_TOPP_SAMPLE: aiter's Gluon stats and select kernels
+    # (gfx1250, gluon_select) and the uniform made in the kernel (Philox keyed
+    # by the CUDA seed, a counter a call and the row) in place of torch.rand.
+    "ATOM_SAMPLER_GLUON_SELECT": lambda: (
+        os.getenv("ATOM_SAMPLER_GLUON_SELECT", "0") == "1"
     ),
     # --- Atomesh ---
     # Build atomesh when installing ATOM from source.

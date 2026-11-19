@@ -660,6 +660,7 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
     from aiter import dtypes
     from lmcache.v1.metadata import LMCacheMetadata
 
+    from atom.model_ops.attentions.mha_kv_pool import KV_CACHE_DTYPE_K4V8
     from atom.models.utils import get_pp_indices
 
     hf = config.hf_config
@@ -691,7 +692,14 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
     worker_id = _strict_integer("LMCache worker id", worker_id)
     if worker_id >= world_size:
         raise ValueError("LMCache worker id must be within the world")
-    kv_dtype = dtypes.d_dtypes[config.kv_cache_dtype]
+    # Bookkeeping only: ATOMRawBytesLMCacheMetadata allocates uint8 by the codec's
+    # bytes per block, and the namespace carries the kv_cache_dtype string. Resolve
+    # it as the pool does, so "fp8_k4v8" (NVFP4 K with inline scales, fp8 V) names
+    # its V dtype instead of missing from aiter's table.
+    if config.kv_cache_dtype == KV_CACHE_DTYPE_K4V8:
+        kv_dtype = dtypes.fp8
+    else:
+        kv_dtype = dtypes.d_dtypes[config.kv_cache_dtype]
     model_name = build_page_namespace(config, cfg, world_size)
 
     # MLA (DeepSeek R1/V3, Kimi) stores a single replicated per-layer latent

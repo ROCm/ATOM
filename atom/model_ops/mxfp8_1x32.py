@@ -238,6 +238,38 @@ def mx32_quant_groups(y):
 
 
 @triton.jit
+def mx32_e4m3_bits(v):
+    """fp32 v, |v| <= 448 (finite) -> its e4m3fn byte, RNE (uint8): the
+    hardware conversion's bits, in integer / fp32 arithmetic. A kernel with an
+    fp8 conversion sets the MODE register at entry (s_setreg), which LLVM treats
+    as a memory clobber: its uniform loads then stop being scalar loads (a
+    kernel that waits on an index load before its row loads gets slower)."""
+    bits = v.to(tl.uint32, bitcast=True)
+    sign = (bits >> 24) & 0x80
+    mag = bits & 0x7FFFFFFF
+    # Normal (|v| >= 2^-6): round the fp32 mantissa to 3 bits, RNE, the carry
+    # running into the exponent; rebias 127 -> 7.
+    nrm = ((mag + 0x7FFFF + ((mag >> 20) & 1)) >> 20) - (120 << 3)
+    # Subnormal (|v| < 2^-6): |v| / 2^-9 rounded to an integer, RNE (2^23 trick:
+    # exact for 0 <= x < 2^22); 8 is the smallest normal, encoded alike.
+    a = mag.to(tl.float32, bitcast=True)
+    sub = ((a * 512.0 + 8388608.0) - 8388608.0).to(tl.uint32)
+    code = tl.where(mag < 0x3C800000, sub, nrm)  # 0x3C800000: 2^-6
+    return (code | sign).to(tl.uint8)
+
+
+@triton.jit
+def mx32_quant_groups_bits(y):
+    """`mx32_quant_groups` with the fp8 codes as bytes (`mx32_e4m3_bits`):
+    y [G, 32] fp32 -> (uint8 e4m3 codes [G, 32], e8m0 bytes [G])."""
+    amax = tl.max(tl.abs(y), axis=1)
+    amax = tl.minimum(tl.maximum(amax, 1e-10), 448.0 * 6.646139978924579e35)  # 2^119
+    e, inv = mx32_e8m0(amax)
+    v = tl.minimum(tl.maximum(y * inv[:, None], -448.0), 448.0)
+    return mx32_e4m3_bits(v), e.to(tl.uint8)
+
+
+@triton.jit
 def _mx32_fill_kernel(q_ptr, s_ptr, start, M, K: tl.constexpr, N32K4: tl.constexpr):
     """Rows [start, M): what quantizing a zero row gives (fp8 0, byte 85); rows [M, pad32(M)) of an
     n32k4 buffer: 0x7F."""
