@@ -672,8 +672,9 @@ O_MAL = O_MCH + 1024                     # LDS: the waves' (winners, j-bin) coun
 O_MAP = O_MAL + 4096                     # select_ma_prep's values (before the scorer: past the scorer's LDS) -- (n, lo,
 # -, -), then a thread's (real, pool row) of its 2 keys
 MA_X0 = 64                               # select_ma's row groups from CTA 64 (past the iquant CTAs: the prep in their wait)
-# (c1) the FULL layers' anchored selection (select_mf): a slot a FULL layer (2 / 8 / 14: Ly // 6, tables asserts)
-MF_SLOTS = 3
+# (c1) the anchored selection (select_mf): a slot a FULL layer (2 / 8 / 14: Ly // 6) and the candidate layer's top-512
+# (20: Ly // 6 = 3), tables asserts
+MF_SLOTS = 4
 MF_LAYER = MC_ROWS * 256 * 4             # zeroed a step: the anchored histograms [MC_ROWS][256]
 MF_CAP = 256                             # keys the 512-th's bin may hold (ranked by its group's CTA 0); more -> select_mc
 MF_KANC = 0                              # kept across steps (step.MF_KB, MF_KEEP bytes a FULL layer): the rows' anchors
