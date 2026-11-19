@@ -479,6 +479,37 @@ def linear_forward(
     lead = x.shape[:-1]
     x2 = x.reshape(-1, k)
     m = x2.shape[0]
+    if out is None and "_pn_residual" in layer.__dict__:
+        # ATOM_FOLD_POSTNORM: residual add + per-tile sums of squares in the epilogue
+        from atom.model_ops import fold_postnorm
+
+        res = fold_postnorm.linear_wants(layer, m)
+        if res is not None and x_scale is not None and otype == torch.bfloat16:
+            from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import (
+                gemm_afp8wfp8_preshuffle,
+                residual_ssq_tiles,
+            )
+
+            y = torch.empty((m, n), dtype=otype, device=x.device)
+            ssq = torch.empty(
+                (m, residual_ssq_tiles(m, n)), dtype=torch.float32, device=x.device
+            )
+            xs = gemm_scale_view(x_scale.reshape(-1), m, k)
+            gemm_afp8wfp8_preshuffle(
+                x2,
+                layer.weight,
+                xs,
+                layer.mx1x32_w_scale,
+                dtype=otype,
+                y=y,
+                scale_layout="n32k4",
+                x_scale_group_size=GROUP,
+                w_scale_block_size=(1, GROUP),
+                residual=res.view(m, n),
+                ssq=ssq,
+            )
+            layer.__dict__["_pn_ssq"] = ssq
+            return y.view(*lead, n)
     if out is not None:
         y = out.view(m, n)
         mx1x32_gemm_into_output(x2, x_scale, layer.weight, layer.mx1x32_w_scale, y)

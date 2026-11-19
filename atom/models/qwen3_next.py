@@ -463,7 +463,11 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         )
 
     def _fold_topk_router(
-        self, hidden_states: torch.Tensor, w_router_padded: torch.Tensor, n_router: int
+        self,
+        hidden_states: torch.Tensor,
+        w_router_padded: torch.Tensor,
+        n_router: int,
+        prenorm=None,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         """ATOM_FOLD_TOPK_ROUTER: (router logits, shared expert output) from the
         router + shared expert kernel that also computes this block's MoE top-k,
@@ -522,6 +526,29 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 fused_gemm_a16w16_router_shared_expert_topk_supported = (
                     fused_gemm_a16w16_router_shared_expert_topk_v2_supported
                 )
+        prenorm_kw = {}
+        w_gate_up = mlp.gate_up_proj.weight
+        if prenorm is not None:
+            # ATOM_FOLD_POSTNORM: only the v2 kernel's narrow variant takes the norm
+            from atom.model_ops import fold_postnorm
+
+            if (
+                fused_gemm_a16w16_router_shared_expert_topk.__name__
+                != "fused_gemm_a16w16_router_shared_expert_topk_v2"
+                or m > 16
+            ):
+                return None
+            pw = fold_postnorm.prescaled(self, prenorm.norm)
+            if pw is None:
+                return None
+            w_router_padded, w_gate_up = pw
+            prenorm_kw = {
+                "prenorm": (
+                    prenorm.ssq,
+                    prenorm.norm.weight,
+                    prenorm.norm.variance_epsilon,
+                )
+            }
         if geometry is None or not fused_gemm_a16w16_router_shared_expert_topk_supported(
             hidden_states,
             w_router_padded,
@@ -535,16 +562,49 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         logits, shared, routed = fused_gemm_a16w16_router_shared_expert_topk(
             hidden_states,
             w_router_padded,
-            mlp.gate_up_proj.weight,
+            w_gate_up,
             mlp.down_proj.weight,
             n_router,
             align_m=geometry[0],
             contiguous_m=geometry[1],
             wmma_rep=geometry[2],
             num_valid_rows=nvr,
+            **prenorm_kw,
         )
-        set_prepared_routing(logits, geometry, routed, nvr)
+        set_prepared_routing(logits, geometry, routed, nvr, required=prenorm is not None)
         return logits, shared
+
+    def _prenorm_forward(self, pn) -> MoEGatedSum | None:
+        """ATOM_FOLD_POSTNORM: `single_stream_moe_forward` on the un-normalized residual sum `pn.x`, the norm
+        applied inside the fold D v2 router kernel; None where that kernel cannot take it (the caller then
+        materializes the norm)."""
+        x = pn.x
+        if (
+            getattr(self, "fhmoe", False)
+            or self._shared_side_stream_mode(x) is not None
+            or self.is_rocm_aiter_fusion_shared_expert_enabled
+            or not self.defer_gated_sum
+            or not envs.ATOM_FUSED_ROUTER_SHARED_EXPERT
+            or not self._router_shared_operands_ok(x)
+        ):
+            return None
+        fused = self._fold_topk_router(
+            x, self._router_weight_padded(), self.gate.weight.shape[0], prenorm=pn
+        )
+        if fused is None:
+            return None
+        from atom.model_ops import fold_postnorm
+
+        fold_postnorm._stats["folded"] += 1
+        logits, shared_output = fused
+        router_logits = logits[:, : self.n_routed_experts]
+        # x is not the experts' input: the routing prepared above (MXFP4 rows of the normalized x) must be the
+        # one consumed (try_defer_topk_route_quant raises otherwise)
+        if self.defer_gather and not torch.compiler.is_compiling():
+            routed_output = self._experts_deferred_gather(x, router_logits)
+        else:
+            routed_output = self.experts(hidden_states=x, router_logits=router_logits)
+        return MoEGatedSum(routed_output, shared_output, logits[:, self.n_routed_experts :])
 
     def combine_tail_forward(
         self, hidden_states: torch.Tensor, residual: torch.Tensor
@@ -777,6 +837,13 @@ class Qwen3NextSparseMoeBlock(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, residual: torch.Tensor | None = None
     ) -> torch.Tensor:
+        from atom.model_ops import fold_postnorm
+
+        if isinstance(hidden_states, fold_postnorm.PreNormed):
+            out = self._prenorm_forward(hidden_states)
+            if out is not None:
+                return out
+            hidden_states = hidden_states.materialize()
         # NOTE: hidden_states can have either 1D or 2D shape.
         orig_shape = hidden_states.shape
         _num_tokens, hidden_dim = hidden_states.shape
@@ -1565,6 +1632,49 @@ class Qwen3NextDecoderLayer(nn.Module):
                 )
             )
 
+    def _fold_postnorm_proj(self, hidden_states, residual, select_rows):
+        """ATOM_FOLD_POSTNORM: the projection (GDN out_proj / attention o_proj) to ask for the residual + ssq
+        epilogue on this call, or None."""
+        from atom.model_ops import fold_postnorm
+
+        if (
+            not fold_postnorm.ENABLED
+            or self.fuse_gemm_ar
+            or self.layer_scale
+            or not isinstance(self.mlp, Qwen3NextSparseMoeBlock)
+            or getattr(self.mlp, "shared_expert", None) is None
+            or "mtp" in getattr(self.mlp, "prefix", "")  # the verifier only (not the MTP drafter's layer)
+            or not isinstance(self.post_attention_layernorm, GemmaRMSNorm)
+            or getattr(self.mlp, "combine_tail_norm", None) is not None
+            or getattr(self.mlp, "mono_norm", None) is not None
+            or not envs.ATOM_FOLD_TOPK_ROUTER
+            or not envs.ATOM_ROUTER_SHARED_V2
+            or torch.compiler.is_compiling()
+        ):
+            return None
+        # the pre-scaled router / gate_up weights must exist before a graph captures the fold: built on the
+        # first eager call of any size (the startup dummy / warmup runs), never inside a capture
+        if fold_postnorm.prescaled(self.mlp, self.post_attention_layernorm) is None:
+            return None
+        if (
+            residual is None
+            or select_rows is not None
+            or residual.dim() != 2
+            or residual.shape[0] > fold_postnorm.MAX_ROWS
+        ):
+            return None
+        if self.layer_type == "linear_attention":
+            proj = getattr(self.linear_attn, "out_proj", None)
+        elif self.layer_type == "full_attention":
+            if getattr(self.self_attn, "skip_out_proj", False):
+                return None
+            proj = getattr(self.self_attn, "o_proj", None)
+        else:
+            return None
+        if proj is None or not mxfp8_1x32.takes_mx32(proj):
+            return None
+        return proj
+
     def _input_norm_mx32(self, hidden_states, residual):
         """ATOM_MXFP8_1X32 with its fused act quant: the MoE-tail RMSNorm writing this layer's
         first projection's (qkv_proj / fused GDN in_proj) 1x32 MXFP8 input --
@@ -1643,6 +1753,11 @@ class Qwen3NextDecoderLayer(nn.Module):
             else:
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
+        pn_proj = self._fold_postnorm_proj(hidden_states, residual, select_rows)
+        if pn_proj is not None:
+            from atom.model_ops import fold_postnorm
+
+            fold_postnorm.request(pn_proj, residual)
         if self.layer_type == "linear_attention":
             hidden_states = self.linear_attn(
                 hidden_states=(
@@ -1675,8 +1790,19 @@ class Qwen3NextDecoderLayer(nn.Module):
                     self.attn_layer_scale.to(hidden_states.dtype) + 1
                 )
 
+        pn_ssq = None
+        if pn_proj is not None:
+            from atom.model_ops import fold_postnorm
+
+            pn_ssq = fold_postnorm.take(pn_proj)
         # Fully Connected
-        if self.fuse_gemm_ar:
+        if pn_ssq is not None:
+            # ATOM_FOLD_POSTNORM: the projection added the residual; the norm goes to the MoE block's router
+            residual = hidden_states
+            hidden_states = fold_postnorm.PreNormed(
+                hidden_states, pn_ssq, self.post_attention_layernorm
+            )
+        elif self.fuse_gemm_ar:
             hidden_states, residual = gluon_gemm_allreduce_gemma_rmsnorm(
                 hidden_states.contiguous(),
                 self.gemm_ar_proj.weight,

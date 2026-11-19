@@ -106,6 +106,10 @@ def fused_gdn_gating(
     return g, beta_output
 
 
+def _skip_pad_fill() -> bool:
+    return __import__("os").environ.get("ATOM_MX32_SKIP_PAD_FILL", "0") == "1"
+
+
 class GatedDeltaNet(nn.Module):
     def __init__(
         self,
@@ -255,7 +259,10 @@ class GatedDeltaNet(nn.Module):
                 out_scale_rows=rows,
             ):
                 mx.note("fused: GDN verify (GDN out_proj input, spec decode)")
-                mx.fill_rows(out2, out_scale, n)
+                if not (n == rows and _skip_pad_fill()):
+                    # (ATOM_MX32_SKIP_PAD_FILL: with every row written, only the n32k4 pad rows' scales are
+                    # left, and they only reach the out_proj's pad output rows, which it never stores)
+                    mx.fill_rows(out2, out_scale, n)
                 return out
         tmp = torch.empty(out.shape, dtype=torch.bfloat16, device=out.device)
         if (
