@@ -270,8 +270,10 @@ In a decode round of 4 long requests it cuts the draft step from 1.85 to 1.46 ms
 requests draft the same tokens up to numerics. Measured on MI308X TP4 (DSpark K=5 + radix, temperature 0, a fresh
 server per session, 4 sessions each way): on 4k-token prompts with 512 output tokens a decode round is 2.7% shorter at
 c1, 1.6% at c8 and 1.0% at c32, which leaves the plugin's round 0.7% / 1.6% / 0.1% above native ATOM's instead of
-3.4% / 3.3% / 1.1%; GSM8K 1319 c32 wall time, acceptance (z = -0.04 against native) and lm_eval GSM8K are unchanged
-within session noise.
+3.4% / 3.3% / 1.1%. On GSM8K (1319 prompts, real acceptance, 6 fresh sessions each way, measured on 3102 at
+483d8feae) the greedy draft shortens wall time by 1.05% (95% CI 0.08-2.03%) at concurrency 32, 152.7 s against 154.3 s,
+and by 1.28% (0.18-2.38%) at 64, 109.5 s against 110.9 s; acceptance (49.47% with it, 49.43% without, native 49.43%)
+and lm_eval GSM8K 3-shot (0.9200 and 0.9218, difference -0.19%, CI -0.93% to +0.54%) are unchanged.
 
 Sampled requests (temperature > 0) are not covered by these numbers: with the flag, a sampled request's draft is still
 the argmax and is accepted with the target's probability of that token (native's rule) instead of SGLang's rejection
