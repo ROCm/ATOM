@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.model_ops.qwen4_exp.qsa_cache_rules import (
     QSA_DRAFT_ROWS,
     QSA_ROWS,
@@ -102,8 +103,6 @@ def test_kv_transfers_that_drop_the_state_are_refused(
 @pytest.mark.parametrize("reads", [True, False])
 def test_qwen38_runs_any_tier_that_declares_it_reads_page_images(monkeypatch, reads):
     """The knowledge lives on the registration, not in a Qwen3.8 list."""
-    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
-
     name = "page_image_tier_under_test"
     monkeypatch.setitem(KVConnectorFactory._registry, name, {})
     monkeypatch.setitem(KVConnectorFactory._aliases, name, name)
