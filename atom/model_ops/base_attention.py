@@ -593,12 +593,15 @@ def run_pa_decode(
     q_scale: torch.Tensor | None,
     k_scale: torch.Tensor | None,
     v_scale: torch.Tensor | None,
+    # Pass these by name. Before the `*` on purpose: CPython fills a missing
+    # keyword-only default with a dict lookup, ~5 ns each on every call.
+    quantized_output: torch.Tensor | None = None,
+    output_scale: torch.Tensor | None = None,
+    plan_workgroup_budget: int | None = None,
     *,
     exp_sums: torch.Tensor | None = None,
     max_logits: torch.Tensor | None = None,
     temporary_output: torch.Tensor | None = None,
-    quantized_output: torch.Tensor | None = None,
-    output_scale: torch.Tensor | None = None,
     alibi_slopes: torch.Tensor | None = None,
     sinks: torch.Tensor | None = None,
     sliding_window: int = -1,
@@ -608,7 +611,6 @@ def run_pa_decode(
     plan_step_owner=None,
     plan_cache_owner=None,
     plan_partition_cap: int | None = None,
-    plan_workgroup_budget: int | None = None,
 ):
     """Run the AITER paged-attention decode kernel.
 
@@ -631,8 +633,6 @@ def run_pa_decode(
     layout and is not written; rows of the pair past ``q``'s are written as
     FP8 zeros with a unit descale.
     """
-    if (quantized_output is None) != (output_scale is None):
-        raise ValueError("quantized_output and output_scale go together")
     flydsl_seqs = flydsl_decode_seqs(
         output=output,
         q=q,
@@ -743,16 +743,18 @@ def run_pa_decode(
             plan_cache_owner=plan_cache_owner,
         )
 
+        if quantized_output is not None:
+            if output_scale is None:
+                raise ValueError("quantized_output and output_scale go together")
+            _flydsl_pa_decode = functools.partial(
+                _flydsl_pa_decode,
+                quantized_output=quantized_output,
+                output_scale=output_scale,
+                store_output=False,
+                quantized_pad_rows=quantized_output.shape[0] - q.shape[0],
+            )
         # Slice off ATOM's sequence-axis padding so the rectangle FlyDSL
         # requires holds. Views, no copy: dim 0 is the outermost axis of each.
-        quant = {}
-        if quantized_output is not None:
-            quant = {
-                "quantized_output": quantized_output,
-                "output_scale": output_scale,
-                "store_output": False,
-                "quantized_pad_rows": quantized_output.shape[0] - q.shape[0],
-            }
         return _flydsl_pa_decode(
             output,
             q,
@@ -775,7 +777,6 @@ def run_pa_decode(
             sliding_window=0,
             work_plan=work_plan,
             max_context_length=context_bound,
-            **quant,
         )
 
     if quantized_output is not None:

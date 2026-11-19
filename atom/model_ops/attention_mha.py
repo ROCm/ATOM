@@ -258,17 +258,14 @@ class PagedAttentionImpl(nn.Module):
         )
 
         attn_impl = self.dispatch_backend(fwd_ctx, q, k, v)
-        # The FP8 output (`unified_attention_fp8`): only an impl with
-        # `supports_output_quant` gets one, and hands it to its backends.
-        quant = {}
-        if quantized_output is not None:
-            quant = {
-                "quantized_output": quantized_output.view(
-                    -1, self.num_heads, self.head_dim
-                ),
-                "output_scale": output_scale,
-            }
-        o = attn_impl(q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx, **quant)
+        if quantized_output is None:
+            o = attn_impl(q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx)
+        else:
+            # The FP8 output (`unified_attention_fp8`): only an impl with
+            # `supports_output_quant` gets one, and hands it to its backends.
+            args = (q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx)
+            out = quantized_output.view(-1, self.num_heads, self.head_dim)
+            o = attn_impl(*args, quantized_output=out, output_scale=output_scale)
 
         o = o.view(-1, self.num_heads * self.head_dim)
 
@@ -1223,10 +1220,20 @@ class PagedAttentionImpl(nn.Module):
         q_scale: torch.Tensor | None = None,
         qkv: torch.Tensor = None,
         output: torch.Tensor = None,
-        quantized_output: torch.Tensor | None = None,
-        output_scale: torch.Tensor | None = None,
         **kwargs,
     ):
+        if kwargs:
+            # `unified_attention_fp8` alone passes any: the FP8 output pair,
+            # `quantized_output=` / `output_scale=`.
+            return self.forward_impl(
+                q=query,
+                k=key,
+                v=value,
+                position=position,
+                q_scale=q_scale,
+                qkv=qkv,
+                **kwargs,
+            )
         return self.forward_impl(
             q=query,
             k=key,
@@ -1234,8 +1241,6 @@ class PagedAttentionImpl(nn.Module):
             position=position,
             q_scale=q_scale,
             qkv=qkv,
-            quantized_output=quantized_output,
-            output_scale=output_scale,
         )
 
 
@@ -1248,9 +1253,11 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
     """MiniMax-M3 sparse attention as a first-class ``PagedAttentionImpl``.
 
     Plugged into the standard ``Attention`` layer via ``impl_cls=`` so it reuses
-    the generic per-layer custom op (``unified_attention_with_output_base``) for
-    its torch.compile boundary, and the standard ``AiterAttentionMetadataBuilder``
-    for KV-cache allocation/binding. Only two framework hooks are overridden:
+    the generic per-layer custom op (``unified_attention_with_output_base``, or
+    ``unified_attention_fp8`` when ``supports_output_quant`` turns on the FP8
+    output) for its torch.compile boundary, and the standard
+    ``AiterAttentionMetadataBuilder`` for KV-cache allocation/binding. Only two
+    framework hooks are overridden:
 
     * :meth:`rope_cache` — MiniMax-M3 fused qk-norm + rope + page-16 SHUFFLE
       KV-insert + indexer-key insert (``aiter.fused_qknorm_idxrqknorm`` /
@@ -1616,7 +1623,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         v: torch.Tensor,
     ):
         """Return the MiniMax-M3 sparse backend callable matching the parent
-        contract ``fn(q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx)``.
+        contract ``fn(q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx)``,
+        plus the optional ``quantized_output=`` / ``output_scale=`` keywords
+        ``forward_impl`` adds only when the layer takes the FP8 output.
 
         Prefill and decode both: select per-(token/request) top-k index blocks
         (fusing the page-16 sparse block-table emit), then run the selected

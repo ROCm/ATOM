@@ -56,7 +56,10 @@ def test_the_fp8_op_returns_what_the_impl_wrote(monkeypatch, dummy):
     seen = {}
 
     def backend(q, k, v, k_cache, v_cache, k_scale, v_scale, ctx, **kw):
+        seen.clear()
         seen.update(kw)
+        if not kw:
+            return q
         kw["output_scale"].fill_(2.0)
         return kw["quantized_output"].fill_(1.0)
 
@@ -79,6 +82,9 @@ def test_the_fp8_op_returns_what_the_impl_wrote(monkeypatch, dummy):
     want = 0.0 if dummy else 1.0
     assert (out.float() == want).all() and (scale == want + 1).all()
     assert dummy or seen["quantized_output"].shape == (3, 2, 4)
+    # without the pair (every other layer) the backend gets the plain call
+    impl.forward(query=q, key=kv, value=kv)
+    assert dummy or seen == {}
 
 
 @pytest.mark.parametrize("sp", [False, True])
@@ -207,6 +213,9 @@ def test_run_pa_decode_hands_flydsl_the_fp8_output_alone(monkeypatch):
     call(quantized_output=fp8, output_scale=scale)
     assert seen["quantized_output"] is fp8 and seen["output_scale"] is scale
     assert seen["store_output"] is False and seen["quantized_pad_rows"] == 3
+    seen.clear()
+    call()  # without the pair, FlyDSL gets the plain call
+    assert seen and "quantized_output" not in seen and "store_output" not in seen
     with pytest.raises(ValueError, match="go together"):
         call(quantized_output=fp8)
     monkeypatch.setattr(ba, "flydsl_decode_seqs", lambda **kw: None)
