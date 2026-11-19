@@ -90,7 +90,11 @@ from atom.utils.forward_context import (
     get_forward_context,
     pass_scheduled_tokens_gpu,
 )
-from atom.utils.region_graph import eager_region, on_scheduled_rows_into
+from atom.utils.region_graph import (
+    eager_region,
+    on_scheduled_rows_into,
+    prefill_token_graph_capture,
+)
 
 # Cap on the KV-split budget: aiter cuts the KV walk into
 # `min(num_clusters, cap * batch_size)` parts, and a negative cap means uncapped
@@ -3221,18 +3225,13 @@ class MLAAttention(nn.Module):
 
     def records_prefill_split(self) -> bool:
         """Whether this forward runs `forward_prefill_split`: a prefill
-        token-graph recording, or the capture's warmup forward before it."""
-        if not self.split_prefill_recording:
-            return False
-        fwd_ctx = get_forward_context()
-        context = fwd_ctx.context
-        if context is None or not context.is_prefill:
-            return False
-        recording = fwd_ctx.tr_graph == "record"
-        # The warmup forward: the capture's synthetic dummy prefill, which
-        # runs under `in_hipgraph` but is not recorded.
-        warmup = fwd_ctx.in_hipgraph and context.is_dummy_run
-        return (recording or warmup) and self.prefill_split_supported()
+        token-graph recording, or the capture's warmup forward before it
+        (`prefill_token_graph_capture`, which a KDA layer's split reads too)."""
+        return (
+            self.split_prefill_recording
+            and prefill_token_graph_capture()
+            and self.prefill_split_supported()
+        )
 
     def prefill_split_supported(self) -> bool:
         """Dense, no ``o_proj`` inside, no PCP group of more than one rank (a

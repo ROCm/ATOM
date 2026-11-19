@@ -78,7 +78,7 @@ from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
 from atom.utils.region_graph import (
     eager_region,
-    on_scheduled_rows_into,
+    prefill_token_graph_capture,
     token_graph,
 )
 
@@ -1015,11 +1015,15 @@ def kda_attention_with_output(
     A prefill token-graph recording breaks only around the recurrence
     (`_kda_recurrence`): the projections, the gated norm and ``o_proj`` with
     its all-reduce are sized by the bucket alone, so they land in the graph.
-    Every other forward runs the mixer as one region (`_kda_mixer`).
+    The capture's warmup forward runs the same split, as an MLA layer's does
+    (`prefill_token_graph_capture`), so they first run at the bucket's shape
+    outside the capture. Any other forward a graph records runs the mixer as
+    one region (`_kda_mixer`); a forward none records calls it.
     """
     fwd_ctx = get_forward_context()
-    context = fwd_ctx.context
-    if fwd_ctx.tr_graph == "record" and context is not None and context.is_prefill:
+    if fwd_ctx.tr_graph is None and not fwd_ctx.in_hipgraph:
+        return _kda(hidden_states, hidden_states_scale, layer_name)
+    if prefill_token_graph_capture():
         self = get_current_atom_config().compilation_config.static_forward_context[
             layer_name
         ]
@@ -1027,17 +1031,19 @@ def kda_attention_with_output(
     return _kda_mixer(hidden_states, hidden_states_scale, layer_name)
 
 
-@eager_region()
-def _kda_mixer(
+def _kda(
     hidden_states: torch.Tensor,
     hidden_states_scale: torch.Tensor | None,
     layer_name: str,
 ) -> torch.Tensor:
-    """The whole KDA mixer as one TR-graph break."""
     self = get_current_atom_config().compilation_config.static_forward_context[
         layer_name
     ]
     return self._forward_impl(hidden_states, hidden_states_scale)
+
+
+# The whole KDA mixer as one TR-graph break.
+_kda_mixer = eager_region()(_kda)
 
 
 @eager_region()
@@ -1055,9 +1061,8 @@ def _kda_recurrence(
     self = get_current_atom_config().compilation_config.static_forward_context[
         layer_name
     ]
-    return on_scheduled_rows_into(
-        self._prefill_recurrence_rows, out, mixed_qkv, gate, beta
-    )
+    self._prefill_recurrence_rows(out, mixed_qkv, gate, beta)
+    return out
 
 
 class KimiKDAAttention(nn.Module):
@@ -1721,10 +1726,12 @@ class KimiKDAAttention(nn.Module):
         gate: torch.Tensor,
         beta: torch.Tensor,
     ) -> None:
-        """`_prefill_recurrence` for `_kda_recurrence`, on ``[T, ...]`` inputs
-        and the live step's state, into ``out``. The recording's dummy prefill
-        leaves it alone, as `MLAAttention._prefill_attend` does; a live step
-        without KDA metadata is a bug, not a step to skip."""
+        """`_prefill_recurrence` for `_kda_recurrence`, on the first
+        ``num_actual_tokens`` rows of ``[T, ...]`` inputs -- the rows its
+        metadata describes, as `_forward_impl` cuts them -- and the live step's
+        state, into those rows of ``out``. The recording's dummy prefill leaves
+        it alone, as `MLAAttention._prefill_attend` does; a live step without
+        KDA metadata is a bug, not a step to skip."""
         fwd_ctx = get_forward_context()
         if fwd_ctx.context.is_dummy_run:
             return
@@ -1999,7 +2006,10 @@ class KimiDecoderLayer(nn.Module):
         return mixed
 
 
-@token_graph
+# Per phase: a prefill recording splits the MLA and KDA layers around their
+# regions, a decode one (TR_HYBRID) runs each as one region, and a decode
+# bucket is recorded first at the shapes a prefill bucket of its rows has.
+@token_graph(per_phase=True)
 @support_torch_compile
 class KimiLinearModel(nn.Module):
     def __init__(self, atom_config: Config, prefix: str = ""):

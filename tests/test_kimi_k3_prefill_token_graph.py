@@ -17,54 +17,18 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 import torch._dynamo  # before Triton may be faked below
-from aiter_stub import atom_without_aiter, stubbed_aiter
-from conftest import gpu_stack_import
+from aiter_stub import atom_without_aiter
 from torch import nn
 
-# Without AITER (the CPU runner) attention_mla's AITER imports, and Triton where
-# it is missing, are faked; the kernels these tests reach are references here.
-_FAKE_AITER = (
-    "aiter.jit",
-    "aiter.jit.utils",
-    "aiter.jit.utils.torch_guard",
-    "aiter.mla",
-    "aiter.ops",
-    "aiter.ops.gated_rmsnorm_fp8_group_quant",
-    "aiter.ops.quant",
-    "aiter.ops.shuffle",
-    "aiter.ops.triton",
-    "aiter.ops.triton.attention",
-    "aiter.ops.triton.attention.mla",
-    "aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant",
-    "aiter.ops.triton.fused_add_rmsnorm_pad",
-    "aiter.ops.triton.fusions",
-    "aiter.ops.triton.fusions.fused_kv_cache",
-    "aiter.ops.triton.gemm",
-    "aiter.ops.triton.gemm.batched",
-    "aiter.ops.triton.gemm.batched.batched_gemm_bf16",
-    "aiter.ops.triton.gather_kv_b_proj",
-    "aiter.ops.triton.gluon",
-    "aiter.ops.triton.gluon.pa_decode_gluon",
-    "aiter.ops.triton.kv_cache",
-    "aiter.ops.triton.quant",
-    "aiter.ops.triton.quant.fused_mxfp8_quant",
-    "aiter.tuned_gemm",
-    "aiter.utility",
-    "aiter.utility.fp4_utils",
-)
+# Imported for real, so every module the stand-ins load below, the Kimi model's
+# included, reads the forward context a test sets.
+from atom.utils import forward_context
 
-
-def _imports():
-    if importlib.util.find_spec("aiter") is not None:
-        return contextlib.nullcontext()
-    no_triton = importlib.util.find_spec("triton") is None
-    return stubbed_aiter(*_FAKE_AITER, *(("triton", "triton.language") * no_triton))
-
-
-with _imports():
-    from atom.model_ops import attention_mla as mla
-    from atom.model_ops import base_attention as base
-    from atom.utils import forward_context
+# Without AITER (the CPU runner) attention_mla's AITER and Triton imports are
+# stand-ins; the kernels these tests reach are references here.
+with atom_without_aiter() as _load:
+    mla = _load("atom.model_ops.attention_mla")
+    base = _load("atom.model_ops.base_attention")
 
 HEADS, NOPE, ROPE, V_DIM, LORA = 2, 8, 4, 8, 6
 
@@ -93,8 +57,8 @@ def step(monkeypatch):
 
 @contextlib.contextmanager
 def _einops():
-    """The Kimi builder imports the GDN mixer, which imports einops; the CPU
-    runner has none, and nothing here calls it."""
+    """The Kimi model and builder import einops, which the CPU runner does not
+    have; only the KDA layer's reshapes are called here (`_rearrange`)."""
     if importlib.util.find_spec("einops") is not None:
         yield
         return
@@ -105,6 +69,12 @@ def _einops():
         yield
     finally:
         sys.modules.pop("einops", None)
+
+
+def _kimi_model():
+    """`atom.models.kimi_k3.model`, against AITER stand-ins on the CPU runner."""
+    with _einops(), atom_without_aiter() as load:
+        return load("atom.models.kimi_k3.model")
 
 
 def test_kimi_records_prefill_token_graphs_without_dp_while_its_layers_split(
@@ -194,17 +164,19 @@ def test_the_capture_step_is_a_request_less_dummy_prefill_of_the_bucket():
 
 
 @pytest.mark.parametrize(
-    "use_mla, tr_graph, taken",
+    "use_mla, tr_graph, in_hipgraph, taken",
     [
-        (True, "record", "split"),
-        (True, None, "region"),  # an eager prefill
-        (False, "record", "region"),
+        (True, "record", True, "split"),
+        (False, "record", True, "region"),
+        (True, "replay", False, "region"),  # a forward under a replaying step
+        (True, None, False, "call"),  # an eager prefill: no graph records it
+        (False, None, False, "call"),
     ],
 )
 def test_the_attention_op_takes_the_split_its_impl_asks_for(
-    monkeypatch, step, use_mla, tr_graph, taken
+    monkeypatch, step, use_mla, tr_graph, in_hipgraph, taken
 ):
-    step.tr_graph = tr_graph
+    step.tr_graph, step.in_hipgraph = tr_graph, in_hipgraph
     step.context = SimpleNamespace(is_prefill=True, is_dummy_run=False)
     monkeypatch.setattr(
         mla.MLAAttention, "forward_prefill_split", lambda self, *a: ("split", a)
@@ -217,36 +189,81 @@ def test_the_attention_op_takes_the_split_its_impl_asks_for(
         lambda: SimpleNamespace(compilation_config=compilation),
     )
     monkeypatch.setattr(base, "_attention_region", lambda *args: ("region", args))
+    monkeypatch.setattr(base, "_attention", lambda *args: ("call", args))
     q, k, v, positions = (torch.zeros(4, 2) for _ in range(4))
     kind, args = base.unified_attention_with_output_base(
         q, None, k, v, positions, "layer", use_mla, None
     )
     assert kind == taken
     expected = (q, None, k, v, positions, "layer")
-    if taken == "region":
+    if taken != "split":
         expected += (use_mla, None)
     assert len(args) == len(expected)
     assert all(a is e for a, e in zip(args, expected))
 
 
-@pytest.mark.parametrize(
-    "tr_graph, in_hipgraph, prefill, dummy, split",
-    [
-        ("record", True, True, True, True),  # the recording
-        (None, True, True, True, True),  # the warmup forward before it
-        ("replay", False, True, False, False),  # a replayed step
-        (None, False, True, False, False),  # an eager prefill
-        (None, False, True, True, False),  # a dummy prefill outside capture
-        ("record", True, False, True, False),  # a decode recording
-        (None, True, False, False, False),  # decode graph capture
-    ],
-)
+# (tr_graph, in_hipgraph, prefill, dummy, split): a forward, and whether a
+# layer that records a prefill split takes it there.
+_FORWARDS = [
+    ("record", True, True, True, True),  # the recording
+    (None, True, True, True, True),  # the warmup forward before it
+    ("replay", False, True, False, False),  # a replayed step
+    (None, False, True, False, False),  # an eager prefill
+    (None, False, True, True, False),  # a dummy prefill outside capture
+    ("record", True, False, True, False),  # a decode recording
+    (None, True, False, False, False),  # decode graph capture
+]
+
+
+@pytest.mark.parametrize("tr_graph, in_hipgraph, prefill, dummy, split", _FORWARDS)
 def test_the_split_runs_on_a_prefill_token_graph_capture_alone(
     step, tr_graph, in_hipgraph, prefill, dummy, split
 ):
     step.tr_graph, step.in_hipgraph = tr_graph, in_hipgraph
     step.context = SimpleNamespace(is_prefill=prefill, is_dummy_run=dummy)
     assert _mla_impl().records_prefill_split() is split
+
+
+@pytest.mark.parametrize("tr_graph, in_hipgraph, prefill, dummy, split", _FORWARDS)
+def test_a_kda_layer_splits_on_the_forwards_an_mla_layer_does(
+    monkeypatch, step, tr_graph, in_hipgraph, prefill, dummy, split
+):
+    """Its warmup forward included, so the projections first run at the
+    bucket's shape outside the capture. Any other forward a graph records
+    runs the mixer as one region; one that none records calls it."""
+    model = _kimi_model()
+    layer = SimpleNamespace(_forward_prefill_split=lambda *args: "split")
+    compilation = SimpleNamespace(static_forward_context={"kda": layer})
+    monkeypatch.setattr(
+        model,
+        "get_current_atom_config",
+        lambda: SimpleNamespace(compilation_config=compilation),
+    )
+    monkeypatch.setattr(model, "_kda", lambda *args: "call")
+    monkeypatch.setattr(model, "_kda_mixer", lambda *args: "region")
+    step.tr_graph, step.in_hipgraph = tr_graph, in_hipgraph
+    step.context = SimpleNamespace(is_prefill=prefill, is_dummy_run=dummy)
+    eager = tr_graph is None and not in_hipgraph
+    taken = "split" if split else "call" if eager else "region"
+    assert model.kda_attention_with_output(torch.zeros(2, 4), None, "kda") == taken
+
+
+def test_kimi_records_its_prefill_buckets_apart_from_its_decode_ones(monkeypatch):
+    """Under TR_HYBRID a decode bucket is recorded first, at the shapes a
+    prefill bucket of its rows has. Shared, the prefill pass would count that
+    recording, and a padded prefill would replay a decode forward, whose
+    whole-mixer KDA region returns the step's rows rather than the bucket's
+    (`token_graph(per_phase=True)`)."""
+    model = _kimi_model()
+    per_phase = []
+
+    def run(owner, forward, args, kwargs, phased=False):
+        per_phase.append(phased)
+
+    monkeypatch.setitem(model.token_graph.__globals__, "_run_token_graph", run)
+    rows = torch.zeros(4, dtype=torch.long)
+    object.__new__(model.KimiLinearModel)(rows, rows)
+    assert per_phase == [True]
 
 
 @pytest.mark.parametrize(
@@ -525,6 +542,17 @@ def test_an_fp8_split_needs_the_steps_row_count(monkeypatch, kernels):
 KDA_HEADS, KDA_DIM, HIDDEN = 2, 4, 16
 
 
+def _rearrange(x, pattern, **sizes):
+    """The einops reshapes the KDA layer makes, where einops is missing."""
+    if pattern == "t (h d) -> 1 t h d":
+        return x.unflatten(-1, (-1, sizes["d"]))[None]
+    if pattern == "t (h d) -> t h d":
+        return x.unflatten(-1, (-1, sizes["d"]))
+    if pattern == "t h d -> t (h d)":
+        return x.flatten(-2)
+    raise NotImplementedError(pattern)
+
+
 def _kda_layer(model, calls):
     """A KDA layer of linear projections whose recurrence (the one kernel,
     `_prefill_recurrence`) is a causal reference that logs its inputs."""
@@ -585,6 +613,8 @@ def _kda_step(monkeypatch, model, layer, rows, metadata, dummy=False):
         "get_current_atom_config",
         lambda: SimpleNamespace(compilation_config=compilation),
     )
+    if importlib.util.find_spec("einops") is None:
+        monkeypatch.setattr(model, "rearrange", _rearrange)
 
 
 def _kda_metadata(rows):
@@ -602,7 +632,7 @@ def _kda_metadata(rows):
 
 @pytest.mark.parametrize("bucket", [5, 8])
 def test_a_padded_kda_split_writes_the_rows_forward_impl_computes(monkeypatch, bucket):
-    model = gpu_stack_import("atom.models.kimi_k3.model")
+    model = _kimi_model()
     rows = 5
     torch.manual_seed(4)
     hidden = torch.randn(bucket, HIDDEN)
@@ -628,7 +658,7 @@ def test_a_padded_kda_split_writes_the_rows_forward_impl_computes(monkeypatch, b
 
 
 def test_the_kda_recordings_dummy_step_leaves_the_output_alone(monkeypatch):
-    model = gpu_stack_import("atom.models.kimi_k3.model")
+    model = _kimi_model()
     calls = []
     layer = _kda_layer(model, calls)
     _kda_step(monkeypatch, model, layer, 8, None, dummy=True)
@@ -641,7 +671,7 @@ def test_the_kda_recordings_dummy_step_leaves_the_output_alone(monkeypatch):
 def test_a_live_kda_replay_without_metadata_fails_loudly(monkeypatch):
     """Only the recording's dummy step may skip the recurrence; a live step
     with no KDA metadata must not hand back zeros as its output."""
-    model = gpu_stack_import("atom.models.kimi_k3.model")
+    model = _kimi_model()
     calls = []
     layer = _kda_layer(model, calls)
     _kda_step(monkeypatch, model, layer, 5, None)
