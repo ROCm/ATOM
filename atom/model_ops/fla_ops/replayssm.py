@@ -44,6 +44,7 @@ from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from atom.utils import envs
 
 from .op import exp
+from .replayssm_dispatch import try_aiter_replayssm
 
 __all__ = [
     "PAD_SLOT_ID",
@@ -1852,6 +1853,29 @@ def replayssm_sigmoid_gating_delta_rule(
     """
     assert q.shape[0] == 1, "varlen layout expected (B == 1)"
     seed_forked_slots(ckpt, fork_slots)
+    result = try_aiter_replayssm(
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        ckpt,
+        buf_k,
+        buf_u,
+        buf_g,
+        write_pos,
+        slot_idx,
+        cu_seqlens,
+        max_query_len,
+        o=o,
+        scale=scale,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        lower_bound=lower_bound,
+    )
+    if result is not None:
+        return result
     _, T_tot, H, K = q.shape
     HV, V = v.shape[2], v.shape[3]
     if envs.ATOM_REPLAYSSM_KDA_HIP:
