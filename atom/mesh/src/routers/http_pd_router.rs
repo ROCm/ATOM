@@ -2751,7 +2751,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_session_worker_change_follows_the_mapped_prefill_rank() {
-        use crate::policies::{DpStickyPolicy, LoadBalancingPolicy, SelectWorkerInfo};
+        use crate::policies::{LoadBalancingPolicy, SelectWorkerInfo, SessionAffinityPolicy};
 
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
@@ -2759,7 +2759,8 @@ mod tests {
         let mut router = create_test_pd_router();
         router.backend = BackendType::Atom;
         router.atom_pd_rank_mapping_policy = AtomPdRankMappingPolicy::Idx2Idx;
-        let prefill_policy: Arc<dyn LoadBalancingPolicy> = Arc::new(DpStickyPolicy::new());
+        let prefill_policy: Arc<dyn LoadBalancingPolicy> =
+            Arc::new(SessionAffinityPolicy::dp_sticky());
         router
             .policy_registry
             .set_prefill_policy(prefill_policy.clone());
@@ -2841,14 +2842,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_a_transport_error_releases_the_session_binding() {
-        use crate::policies::{DpStickyPolicy, LoadBalancingPolicy, SelectWorkerInfo};
+        use crate::policies::{LoadBalancingPolicy, SelectWorkerInfo, SessionAffinityPolicy};
 
         let closed = {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             format!("http://{}", listener.local_addr().unwrap())
         };
         let router = create_test_pd_router();
-        let decode_policy: Arc<dyn LoadBalancingPolicy> = Arc::new(DpStickyPolicy::new());
+        let decode_policy: Arc<dyn LoadBalancingPolicy> =
+            Arc::new(SessionAffinityPolicy::dp_sticky());
         router
             .policy_registry
             .set_decode_policy(decode_policy.clone());
@@ -2878,7 +2880,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_idx2idx_prefill_failure_releases_the_decode_binding() {
-        use crate::policies::{DpStickyPolicy, LoadBalancingPolicy, SelectWorkerInfo};
+        use crate::policies::{LoadBalancingPolicy, SelectWorkerInfo, SessionAffinityPolicy};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -2906,7 +2908,8 @@ mod tests {
             let mut router = create_test_pd_router();
             router.backend = BackendType::Atom;
             router.atom_pd_rank_mapping_policy = mapping;
-            let decode_policy: Arc<dyn LoadBalancingPolicy> = Arc::new(DpStickyPolicy::new());
+            let decode_policy: Arc<dyn LoadBalancingPolicy> =
+                Arc::new(SessionAffinityPolicy::dp_sticky());
             router
                 .policy_registry
                 .set_decode_policy(decode_policy.clone());
