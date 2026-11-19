@@ -2319,6 +2319,9 @@ class KimiDecoderLayer(nn.Module):
             getattr(self, "mlp_res_norm", None),
             out_norm=self.post_attention_layernorm,
             enabled=self.use_attn_residuals,
+            # after this layer's close: the next layer's attention site's slots
+            block_size=getattr(config, "attn_res_block_size", None),
+            layer_idx=layer_num + 1,
         )
 
     def _ffn(
@@ -2530,6 +2533,15 @@ class KimiLinearModel(nn.Module):
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    def block_bank(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        """A slot per attention-residual block, read only after its block closes."""
+        block_size = getattr(self.config, "attn_res_block_size", None)
+        if block_size is None:
+            return None
+        tokens, hidden = hidden_states.shape
+        blocks = -(-self.config.num_hidden_layers // block_size)
+        return hidden_states.new_empty(tokens, blocks, hidden)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -2543,13 +2555,7 @@ class KimiLinearModel(nn.Module):
                 if inputs_embeds is not None
                 else self.embed_tokens(input_ids)
             )
-            block_residual = (
-                hidden_states.new_zeros(
-                    hidden_states.shape[0], 0, hidden_states.shape[1]
-                )
-                if getattr(self.config, "attn_res_block_size", None) is not None
-                else None
-            )
+            block_residual = self.block_bank(hidden_states)
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
