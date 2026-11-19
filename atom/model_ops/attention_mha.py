@@ -679,12 +679,13 @@ class PagedAttentionImpl(nn.Module):
 
         from atom.model_ops.layernorm import GemmaRMSNorm
 
-        if self.k4v4pt:
+        # ATOM_FOLD_QKNORM_QKV: the qkv GEMM's epilogue already wrote the cache and Q (fp8) / K
+        # (A8K4V8, or A8K4V4PT with ATOM_FOLD_QKNORM_QKV_FP4PT: the fp4pt V too)
+        pending = getattr(self, "_fold_pending", None)
+        if pending is None and self.k4v4pt:
             return self._k4v4pt_rope_cache(
                 q, k, v, qkv, position, k_cache, v_cache, fwd_ctx
             )
-        # ATOM_FOLD_QKNORM_QKV: the qkv GEMM's epilogue already wrote the cache and Q (fp8) / K
-        pending = getattr(self, "_fold_pending", None)
         if pending is not None:
             self._fold_pending = None
             self.per_token_quant = False
