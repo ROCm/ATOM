@@ -1364,27 +1364,34 @@ def test_a_landed_state_slot_is_scattered_before_the_request_is_done(monkeypatch
     assert "r1" in conn.done_recving
 
 
-def test_a_raised_scatter_returns_its_staging_row(monkeypatch):
+@pytest.mark.parametrize("raiser", ["scatter", "synchronize"])
+def test_a_raised_scatter_returns_its_staging_row(monkeypatch, raiser):
     """The twin of the gather side's failure arm.
 
     The row is handed back however the scatter leaves, and it has to be quiet
     first: a scatter that raised partway still has copies in flight. Losing
     one row parks every later receive on the pool, which has no acquire
-    timeout.
+    timeout. `synchronize` is where HIP surfaces an earlier fault, so it
+    raising is the likeliest way here, not the unlikeliest.
     """
     mc = pytest.importorskip(
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
     )
     order = []
-    scatter_stream = SimpleNamespace(
-        synchronize=lambda: order.append("synchronize"),
-    )
+
+    def _sync():
+        order.append("synchronize")
+        if raiser == "synchronize":
+            raise RuntimeError("scatter blew up")
+
+    scatter_stream = SimpleNamespace(synchronize=_sync)
     monkeypatch.setattr(mc.torch.cuda, "Stream", lambda device: scatter_stream)
     monkeypatch.setattr(mc.torch.cuda, "stream", contextlib.nullcontext)
 
     def _boom(*args):
         order.append("scatter")
-        raise RuntimeError("scatter blew up")
+        if raiser == "scatter":
+            raise RuntimeError("scatter blew up")
 
     conn = _make_connector(
         _staging_slots=mc.SlotPool(),
