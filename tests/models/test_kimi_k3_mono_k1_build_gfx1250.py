@@ -322,13 +322,15 @@ def test_replay_spec_refuses_an_inconsistent_window(cap, window, message):
         spec.validate(_plan(40))
 
 
-def test_chunk_recurrence_defaults_to_replay_builds(monkeypatch):
+def test_chunk_recurrence_defaults_off_auto_takes_replay_builds(monkeypatch):
     from atom.models.kimi_k3.mono.kernels.attention import kda_resident_gfx1250
     from atom.utils import envs
 
     monkeypatch.delenv("ATOM_KIMI_MONO_K1_CHUNK_RECUR", raising=False)
-    assert envs.ATOM_KIMI_MONO_K1_CHUNK_RECUR == "auto"
+    assert envs.ATOM_KIMI_MONO_K1_CHUNK_RECUR == "0"
     chunk = kda_resident_gfx1250._chunk_recur
+    assert not chunk(8, True) and not chunk(5, True) and not chunk(8, False)
+    monkeypatch.setenv("ATOM_KIMI_MONO_K1_CHUNK_RECUR", "auto")
     assert chunk(8, True) and chunk(5, True)
     assert not chunk(8, False) and not chunk(5, False)
     assert not chunk(1, True)

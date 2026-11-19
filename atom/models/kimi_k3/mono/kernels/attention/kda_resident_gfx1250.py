@@ -198,7 +198,8 @@ def _gate_ilp() -> bool:
 
 def _chunk_recur(qlen: int, replay: bool) -> bool:
     """Whole heads' recurrence as one chunk of the step's tokens: "auto"
-    under ReplaySSM (no per-token states to advance), where it wins."""
+    under ReplaySSM (no per-token states to advance), 1 always, 0 (the
+    default) never."""
     mode = envs.ATOM_KIMI_MONO_K1_CHUNK_RECUR
     if qlen == 1 or mode == "0":
         return False

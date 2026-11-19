@@ -249,11 +249,10 @@ def replay_table(slot_idx, wp, bufs):
 
 def builds(plan, rows, chunk, split=SPLIT):
     """K1's replay and plain builds; ``chunk`` None: the recurrence's default."""
-    os.environ["ATOM_KIMI_MONO_K1_CHUNK_RECUR"] = {
-        True: "1",
-        False: "0",
-        None: "auto",
-    }[chunk]
+    if chunk is None:
+        os.environ.pop("ATOM_KIMI_MONO_K1_CHUNK_RECUR", None)
+    else:
+        os.environ["ATOM_KIMI_MONO_K1_CHUNK_RECUR"] = "1" if chunk else "0"
     os.environ["ATOM_KIMI_MONO_K1_HEAD_SPLIT"] = split
     return (
         plan.make_k1_local_runner(spec(rows, True)).prepare(dev),
