@@ -2,7 +2,7 @@
 """Indexer-only CP over MiniMax-M3's MXFP4 index cache.
 
 Each CP rank scores every index head over its 1/P of the blocks with aiter's MXFP4
-decode scorer (`indexer_context_scores_mxfp4`), keeps its shard's top-k, and the
+decode scorer (`indexer_context_scores_fp4`), keeps its shard's top-k, and the
 rank owning head h merges every shard's head-h candidates. The tests that launch no
 kernel pin the wiring: the shard's map, bound and workspace, what the scorer is
 handed, which scorer the CP decode runs, the page geometry its merge emits, and that
@@ -122,8 +122,9 @@ def test_the_decode_metadata_builds_the_shards_map(monkeypatch):
 
 
 def _cp_scorer(monkeypatch):
-    """`indexer_context_scores_mxfp4` with aiter's scorer doubled; returns it and
+    """`indexer_context_scores_fp4` with aiter's scorer doubled; returns it and
     what the double was handed."""
+    from atom.model_ops.minimax_m3 import index_topk
     from atom.model_ops.minimax_m3 import indexer_context_parallel as icp
 
     seen = {}
@@ -132,13 +133,15 @@ def _cp_scorer(monkeypatch):
         seen.update(args=args, **kwargs)
         return kwargs["out"]
 
-    monkeypatch.setattr(
-        icp,
-        "flydsl_ops",
-        lambda: types.SimpleNamespace(minimax_m3_index_score_flydsl=scorer),
+    ops = types.SimpleNamespace(
+        minimax_m3_index_score_prefill_fp4_flydsl=None,
+        minimax_m3_index_score_fp4_flydsl=None,
+        minimax_m3_index_score_flydsl=scorer,
     )
-    monkeypatch.setattr(icp, "page_views", lambda cache: ("data", "scale"))
-    return icp.indexer_context_scores_mxfp4, seen
+    monkeypatch.setattr(index_topk, "flydsl_ops", lambda: ops)
+    monkeypatch.setattr(icp, "flydsl_ops", lambda: ops)
+    monkeypatch.setattr(index_topk, "page_views", lambda cache: ("data", "scale"))
+    return icp.indexer_context_scores_fp4, seen
 
 
 def test_the_cp_scorer_writes_the_shard_into_the_workspace(monkeypatch):
@@ -196,15 +199,17 @@ def test_the_cp_scorer_refuses_what_it_cannot_score(monkeypatch):
 
 @pytest.mark.parametrize("mailbox", [False, True])
 @pytest.mark.parametrize(
-    "index_dtype,kv_dtype", [("fp4", "fp4"), ("fp4", "fp8"), ("fp8", "fp8")]
+    "index_dtype,kv_dtype",
+    [("fp4", "fp4"), ("fp4", "fp8"), ("fp8", "fp8"), ("nvfp4", "nvfp4")],
 )
 def test_the_cp_decode_runs_the_index_caches_scorer_and_the_kvs_geometry(
     monkeypatch, index_dtype, kv_dtype, mailbox
 ):
-    """The MXFP4 index scores with the step's record, any other index cache with the
+    """An FP4 index scores with the step's record, any other index cache with the
     Triton scorer; the merge emits the KV's page geometry, as the TP selector does
-    (one page-128 page a block for the MXFP4 KV, the page-16 defaults otherwise),
-    and so does the fused mailbox kernel when a mailbox is open."""
+    (one page-128 page a block for the MXFP4 KV, the page-16 defaults otherwise, no
+    sparse block table for the NVFP4 KV), and so does the fused mailbox kernel when
+    a mailbox is open."""
     from atom.distributed import indexer_cp
     from atom.model_ops import attention_mha
     from atom.model_ops.minimax_m3 import indexer_candidate_exchange as exchange
@@ -221,7 +226,7 @@ def test_the_cp_decode_runs_the_index_caches_scorer_and_the_kvs_geometry(
 
     scores = types.SimpleNamespace(shape=(WORLD, 2, 3))
     monkeypatch.setattr(icp, "indexer_context_scores", double("triton", scores))
-    monkeypatch.setattr(icp, "indexer_context_scores_mxfp4", double("mxfp4", scores))
+    monkeypatch.setattr(icp, "indexer_context_scores_fp4", double("mxfp4", scores))
     monkeypatch.setattr(exchange, "local_candidate_keys", double("local", "keys"))
     monkeypatch.setattr(indexer_cp, "exchange_candidates", double("exchange", "all"))
     monkeypatch.setattr(exchange, "merge_candidate_keys", double("merge", (1, 2, 3)))
@@ -247,10 +252,11 @@ def test_the_cp_decode_runs_the_index_caches_scorer_and_the_kvs_geometry(
         "q", table, "seq", 1000, 2, index_scorer=impl._index_scorer(md)
     )
     assert got == (1, 2, 3)
-    scorer = "mxfp4" if index_dtype == "fp4" else "triton"
+    scorer = "mxfp4" if index_dtype in ("fp4", "nvfp4") else "triton"
+    select_kw = {**page_kw, "emit_sparse_block_table": kv_dtype != "nvfp4"}
     if mailbox:
         assert [c[0] for c in calls] == [scorer, "fused"]
-        assert calls[1][1][9] is box and calls[1][2] == page_kw
+        assert calls[1][1][9] is box and calls[1][2] == select_kw
         return
     assert [c[0] for c in calls] == [scorer, "local", "exchange", "merge"]
     args = calls[0][1]
@@ -262,7 +268,7 @@ def test_the_cp_decode_runs_the_index_caches_scorer_and_the_kvs_geometry(
     # the merge reads the exchanged keys with the KV's page geometry; the local
     # top-k knows the global block count, off the table
     assert calls[1][1] == (scores, "seq", TOPK, 1, WORLD, 2, 9, 0, 1)
-    assert calls[3][1][0] == "all" and calls[3][2] == page_kw
+    assert calls[3][1][0] == "all" and calls[3][2] == select_kw
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -285,8 +291,8 @@ def test_the_installed_aiter_takes_the_shards_calls(monkeypatch):
     than at the first MXFP4 CP decode. The scorer's `k_scale` needs aiter#7060, the
     PR that added the MXFP4 scorer itself; its `cp_world` / `cp_rank` are older."""
     flydsl = pytest.importorskip("aiter.ops.flydsl")
+    from atom.model_ops.minimax_m3 import index_topk, sparse_attn
     from atom.model_ops.minimax_m3 import indexer_context_parallel as icp
-    from atom.model_ops.minimax_m3 import sparse_attn
     from atom.model_ops.minimax_m3.index_buffers import allocate_index_scorers
 
     bound = {}
@@ -315,7 +321,7 @@ def test_the_installed_aiter_takes_the_shards_calls(monkeypatch):
         sparse_attn, "build_n_valid_column_per_row", lambda *a, **k: None
     )
     monkeypatch.setattr(icp, "flydsl_ops", lambda: ops)
-    monkeypatch.setattr(icp, "page_views", lambda cache: ("data", "scale"))
+    monkeypatch.setattr(index_topk, "page_views", lambda cache: ("data", "scale"))
 
     seq = torch.ones(2, dtype=torch.int32)
     record = allocate_index_scorers(
@@ -331,7 +337,7 @@ def test_the_installed_aiter_takes_the_shards_calls(monkeypatch):
     ).index_scorer
     table = torch.zeros(2, BOUND, dtype=torch.int32)
     q = torch.zeros(2, WORLD, DIM)
-    icp.indexer_context_scores_mxfp4(q, "cache", table, seq, 128, 1, SM_SCALE, step)
+    icp.indexer_context_scores_fp4(q, "cache", table, seq, 128, 1, SM_SCALE, step)
     assert bound.keys() == {
         capacity,
         "minimax_m3_index_score_work_map",
@@ -420,11 +426,11 @@ def cp_shard_keys(cache, table, seq, q, S, rank, forced):
         local_candidate_keys,
     )
     from atom.model_ops.minimax_m3.indexer_context_parallel import (
-        indexer_context_scores_mxfp4,
+        indexer_context_scores_fp4,
     )
 
     record = _step_record(table, seq, S, (WORLD, rank))
-    scores = indexer_context_scores_mxfp4(
+    scores = indexer_context_scores_fp4(
         q, cache, table, seq, int(seq.max()), S, SM_SCALE, record
     )
     return local_candidate_keys(
