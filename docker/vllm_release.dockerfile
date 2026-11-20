@@ -191,6 +191,6 @@ RUN echo "========== [OOT 2/7] Verify base packages (atom/aiter/mori) ==========
 
 RUN echo "========== [vLLM-ATOM] Final transformers version ==========" && \
     "${VENV_PYTHON}" -c "import transformers; print(f'transformers.__version__ = {transformers.__version__}')" && \
-    "${VENV_PYTHON}" -m pip show transformers || true
+    { "${VENV_PYTHON}" -m pip show transformers || true; }
 
 CMD ["/bin/bash"]
