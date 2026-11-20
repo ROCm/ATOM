@@ -1014,8 +1014,6 @@ def _mla_token_graph_forward(impl, q, q_scale, k, v, positions):
         and impl.is_sparse_mla
         and not is_plugin_mode()
         and layout.layer_num == impl.layer_num
-        and q.dtype == layout.dtype == torch.bfloat16
-        and q_scale is None
         and context is not None
         and context.is_prefill
         and not context.is_dummy_run
@@ -1023,6 +1021,14 @@ def _mla_token_graph_forward(impl, q, q_scale, k, v, positions):
         and mode.prefill_token_graph
         and 0 < context.scheduled_tokens < q.shape[0]
     ):
+        if (
+            q.dtype != layout.dtype
+            or layout.dtype != torch.bfloat16
+            or q_scale is not None
+        ):
+            raise ValueError(
+                "MLA input disagrees with its bound token-graph query layout"
+            )
         rows = context.scheduled_tokens
         metadata = fwd_ctx.attn_metadata
         slots = metadata.slot_mapping

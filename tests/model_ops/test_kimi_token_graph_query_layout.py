@@ -342,8 +342,10 @@ def test_receiver_requires_target_binding_before_using_declared_layout(runtime):
 def test_receiver_preserves_non_sliceable_or_unpadded_calls(runtime, case):
     runtime.bind(runtime.make())
     if case == "scale":
+        runtime.ctx.context.forward_mode.prefill_token_graph = False
         runtime.args[1] = torch.ones(1, 8)
     elif case == "dtype":
+        runtime.ctx.context.forward_mode.prefill_token_graph = False
         runtime.args[0] = runtime.args[0].float()
     elif case == "eager":
         runtime.ctx.context.forward_mode.prefill_token_graph = False
@@ -361,6 +363,20 @@ def test_receiver_preserves_non_sliceable_or_unpadded_calls(runtime, case):
     assert runtime.seen[-1][4] is slots
     assert runtime.seen[-1][6] is runtime.args[1]
     assert out.dtype == runtime.args[0].dtype
+
+
+@pytest.mark.parametrize("case", ["scale", "dtype"])
+def test_bound_padded_query_refuses_changed_runtime_layout(runtime, case):
+    runtime.bind(runtime.make())
+    if case == "scale":
+        runtime.args[1] = torch.ones(1, 8)
+    else:
+        runtime.args[0] = runtime.args[0].float()
+    slots = runtime.ctx.attn_metadata.slot_mapping
+    with pytest.raises(ValueError, match="bound token-graph query layout"):
+        runtime.call(*runtime.args)
+    assert not runtime.seen
+    assert runtime.ctx.attn_metadata.slot_mapping is slots
 
 
 def test_slots_are_restored_on_failure_and_next_live_step(runtime):
