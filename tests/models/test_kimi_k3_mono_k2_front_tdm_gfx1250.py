@@ -1,0 +1,80 @@
+import pytest
+
+from atom.models.kimi_k3.mono.kernels.execution_plan import Gfx1250KimiBuildPlan
+from atom.models.kimi_k3.mono.kernels.stages import k2_front_tdm_gfx1250 as front
+from atom.models.kimi_k3.mono.kernels.stages.k2_finish_persistent_gfx1250 import (
+    build_packed_finish,
+)
+from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import tdm_lds_bytes
+
+
+def _plan(rows):
+    return Gfx1250KimiBuildPlan(
+        threads=256, blocks=256, lds_bytes=320 * 1024, tokens=rows, nblocks=4
+    )
+
+
+def test_task_pairs_never_straddle_two_weights():
+    assert front.ROUTER_TASKS % 2 == 0
+    assert (front.ROUTER_TASKS + front.LATENT_TASKS) % 2 == 0
+    assert front.SHARED_TASKS % 2 == 0
+    assert front.PAIRS == 188
+
+
+@pytest.mark.parametrize("rows", (1, 16, 17, 40, 48))
+def test_replicated_front_is_one_launch_of_one_cta_per_task_pair(rows):
+    kernel = front.build_replicated_front(_plan(rows))
+    assert kernel.grid == (front.PAIRS,)
+    assert kernel.block == (256,)
+    assert kernel.launch_count == 1
+    assert kernel.name.endswith(f"_s{rows}")
+    assert kernel.abi.names[0] == "x"
+    assert "router_logits" in kernel.abi.names
+    assert tdm_lds_bytes(rows, 2) <= 320 * 1024
+
+
+@pytest.mark.parametrize("rows", (1, 40, 48))
+def test_fp8_shared_front_takes_the_block_scales(rows):
+    kernel = front.build_replicated_front(_plan(rows), fp8_shared=True)
+    assert kernel.name.endswith(f"_s{rows}_f8")
+    names = kernel.abi.names
+    assert names.index("shared_scale") == names.index("shared_weight") + 1
+
+
+@pytest.mark.parametrize("rows", (1, 10, 20, 40, 48))
+@pytest.mark.parametrize("fp4_latent", (False, True))
+def test_split_front_fits_every_row_count(rows, fp4_latent):
+    assert front.split_front_fits(_plan(rows), True, fp4_latent=fp4_latent)
+
+
+def test_mxfp4_latent_front_refuses_a_grid_without_its_clusters():
+    plan = Gfx1250KimiBuildPlan(
+        threads=256, blocks=front.SPLIT_CTAS - 4, lds_bytes=320 * 1024, tokens=16
+    )
+    assert not front.split_front_fits(plan, fp4_latent=True)
+    with pytest.raises(ValueError, match="MXFP4"):
+        front.build_replicated_front(plan, fp4_latent=True)
+    assert front.REPLICATED_FRONT_FP4_ABI.names[-1] == "latent_scale"
+
+
+def test_replicated_front_feeds_only_the_grouped_moe_finish():
+    with pytest.raises(ValueError, match="grouped-MoE"):
+        build_packed_finish(_plan(16), replicated_front=True)
+
+
+@pytest.mark.parametrize("rows", (1, 16, 40, 48))
+def test_replicated_finalize_covers_every_hidden_row_once(rows):
+    from atom.models.kimi_k3.mono.kernels.stages import k2_finalize_tdm_gfx1250 as fin
+
+    kernel = fin.build_replicated_finalize(_plan(rows))
+    assert kernel.grid == (fin.PAIRS,) == (7168 // 32,)
+    assert kernel.abi.names == ("routed_normed", "shared", "up_weight", "output")
+
+
+def test_herd_candidates_feed_only_the_grouped_moe_finish():
+    with pytest.raises(ValueError, match="HERD"):
+        build_packed_finish(_plan(16), herd=True)
+    kernel = build_packed_finish(
+        _plan(16), include_routed=False, replicated_front=True, herd=True
+    )
+    assert kernel.name.endswith("_rf_herd")

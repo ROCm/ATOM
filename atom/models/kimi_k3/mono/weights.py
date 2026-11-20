@@ -27,9 +27,11 @@ Three groups are the exception, and each says why:
 What is *not* copied is everything large: the expert planes (1.2 GB and 616 MB a
 layer) and their E8M0 scales are read exactly where ``FusedMoE`` left them.
 ``moe_shuffle_scale`` on gfx950 is ``aiter.ops.shuffle.shuffle_scale``, whose
-permutation is the one ``atom.mono.device.mx.scale_index`` indexes a byte of --
-the same layout the MoE kernel's scale readers were written for. That holds only
-for the non-interleaved gate/up layout, so ``is_guinterleave`` is checked.
+permutation is the one ``atom.mono.device.mx.scale_index`` indexes a byte of.
+
+The gfx1250 K2 path requires AITER's native n32k4 scales and binds both
+separated GGUU and production interleaved GUGU gate/up layouts zero-copy. The
+FP4 payload is likewise never repacked here.
 """
 
 import logging
@@ -47,12 +49,21 @@ from atom.models.kimi_k3.mono.config import (
     Dims,
     layer_block,
 )
+from atom.models.kimi_k3.mono.expert_scales import (
+    KimiExpertScaleHandles,
+    bind_expert_scale,
+)
+from atom.models.kimi_k3.mono.kernels.stages.moe_expert_layout import (
+    ExpertScaleLayout,
+    ExpertScaleSpec,
+)
 from atom.models.kimi_k3.mono.layouts import (
     SCALE_GROUP_ALIGN,
     SCALE_ROW_ALIGN,
     unshuffle_scale,
     unshuffle_weight,
 )
+from atom.mono.plan.architecture import GFX1250, Architecture
 from atom.mono.runtime.consensus import MonoUnsupported
 
 logger = logging.getLogger("atom")
@@ -105,6 +116,38 @@ def _plain_bf16(module, name: str, shape: tuple[int, ...]) -> torch.Tensor:
     return w.data
 
 
+def _block_fp8(module, name: str, shape: tuple[int, int]):
+    """ATOM's online per_1x128 FP8 linear as gfx1250's TDM GEMV reads it, in
+    place: ``(weight, scale)``, the weight in AITER's 16x16 preshuffle with its
+    rows zero-padded to 128, the scale its ``[rows / 128, cols / 128]`` E8M0
+    block scales."""
+    rows, cols = shape
+    padded = -(-rows // 128) * 128
+    w = _param(module, name)
+    scale = getattr(module, "weight_scale", None)
+    _need(w.dtype == torch.float8_e4m3fn, f"{name} is {w.dtype}, expected FP8")
+    _need(
+        scale is not None and scale.dtype == torch.float8_e8m0fnu,
+        f"{name}: the kernels read E8M0 block scales "
+        "(ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE=1)",
+    )
+    _need(
+        getattr(w, "is_shuffled", False),
+        f"{name}: the kernels read the preshuffled weight "
+        "(ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=1)",
+    )
+    _need(
+        tuple(w.shape) == (padded, cols),
+        f"{name} is {tuple(w.shape)}, expected {(padded, cols)}",
+    )
+    _need(
+        tuple(scale.shape) == (padded // 128, cols // 128),
+        f"{name} scale is {tuple(scale.shape)}, expected a 128x128 block scale",
+    )
+    _need(w.is_contiguous() and scale.is_contiguous(), f"{name} not contiguous")
+    return w.data, scale.data
+
+
 def _vec(param, n: int, name: str, dtype: torch.dtype = BF16) -> torch.Tensor:
     t = getattr(param, "data", param)
     _need(t.numel() == n, f"{name} has {t.numel()} elements, expected {n}")
@@ -120,16 +163,15 @@ def _as_f32(param, n: int, name: str) -> torch.Tensor:
     return t.reshape(-1).float().contiguous()
 
 
-def _mxfp4_to_bf16(module, name: str, shape: tuple[int, ...]) -> torch.Tensor:
-    """A preshuffled MXFP4 linear as bf16 ``shape``: both AITER shuffles undone
-    (``layouts``), then the E2M1 values scaled by their E8M0 group scale. A bf16
-    checkpoint has no scale and is already what the kernels read."""
-    from atom.model_ops.quant_v4 import dequant_fp4_e2m1
-
+def _mxfp4_planes(module, name: str, shape: tuple[int, int]):
+    """A preshuffled MXFP4 linear as row-major planes: ``(packed, scale)``,
+    ``[rows, cols / 2]`` E2M1 pairs (low nibble first) and ``[rows, cols / 32]``
+    E8M0 bytes, both AITER shuffles undone (``layouts``). None for a bf16
+    checkpoint, which has no scale."""
     w = _param(module, name)
     scale = getattr(module, "weight_scale", None)
     if scale is None and w.dtype == BF16:
-        return _plain_bf16(module, name, shape)
+        return None
     rows, cols = shape
     _need(scale is not None, f"{name}: no weight_scale")
     _need(w.element_size() == 1, f"{name} is {w.dtype}, expected packed FP4")
@@ -158,6 +200,19 @@ def _mxfp4_to_bf16(module, name: str, shape: tuple[int, ...]) -> torch.Tensor:
             f"expected {rows * groups}",
         )
         plane = scale.data.reshape(rows, groups)
+    return packed.contiguous(), plane.view(torch.uint8).contiguous()
+
+
+def _mxfp4_to_bf16(module, name: str, shape: tuple[int, ...]) -> torch.Tensor:
+    """A preshuffled MXFP4 linear as bf16 ``shape``: ``_mxfp4_planes``, then the
+    E2M1 values scaled by their E8M0 group scale. A bf16 checkpoint is already
+    what the kernels read."""
+    from atom.model_ops.quant_v4 import dequant_fp4_e2m1
+
+    planes = _mxfp4_planes(module, name, shape)
+    if planes is None:
+        return _plain_bf16(module, name, shape)
+    packed, plane = planes
     return dequant_fp4_e2m1(
         packed.view(torch.int8), plane.view(torch.float8_e8m0fnu), MX_GROUP, BF16
     )
@@ -184,6 +239,7 @@ class KdaLayer:
     write_idx: int  # the block this layer writes, or -1
     seam: AttnRes
     w_in: torch.Tensor
+    w_in_scale: torch.Tensor | None  # E8M0 block scales of an FP8 ``w_in``
     w_fb: torch.Tensor
     conv_w: torch.Tensor
     a_log: torch.Tensor
@@ -213,7 +269,48 @@ class MoeLayer:
     w13s: torch.Tensor
     w2: torch.Tensor
     w2s: torch.Tensor
+    gu_interleave: bool
     ln_eps: float
+
+
+@dataclass(frozen=True)
+class RoutedMoeLayer:
+    """K2 tensors needed by the routed path; shared experts stay quantized."""
+
+    layer_id: int
+    blocks: int
+    write_idx: int
+    seam: AttnRes
+    w_gate: torch.Tensor
+    bias: torch.Tensor
+    w_ld: torch.Tensor
+    ln_w: torch.Tensor
+    w_up: torch.Tensor
+    w13: torch.Tensor
+    w13s: torch.Tensor
+    w2: torch.Tensor
+    w2s: torch.Tensor
+    gu_interleave: bool
+    ln_eps: float
+
+
+@dataclass(frozen=True)
+class ExternalMoeLayer(RoutedMoeLayer):
+    """gfx1250 K2 around external collectives; o_proj remains a model op."""
+
+    w_sgu: torch.Tensor
+    w_sd: torch.Tensor
+    # The model's whole routed up-projection when it is plain BF16 (read in
+    # place); None when only the dequantized rank band ``w_up`` exists.
+    w_up_full: torch.Tensor | None = None
+    # E8M0 block scales of an online per_1x128 FP8 ``w_sgu`` / ``w_sd``, or
+    # None (BF16).
+    w_sgu_scale: torch.Tensor | None = None
+    w_sd_scale: torch.Tensor | None = None
+    # The latent down-projection's MXFP4 planes (``_mxfp4_planes``) where the
+    # split-K front reads them (ATOM_KIMI_MONO_SPLITK=front), else None.
+    w_ld_fp4: torch.Tensor | None = None
+    w_ld_scale: torch.Tensor | None = None
 
 
 def _seam(site, name: str) -> AttnRes:
@@ -231,8 +328,9 @@ def _seam(site, name: str) -> AttnRes:
     )
 
 
-def bind_kda(layer, layer_id: int, dims: Dims) -> KdaLayer:
-    """One KDA layer's K1 tensors."""
+def bind_kda(layer, layer_id: int, dims: Dims, fp8_in_proj: bool = False) -> KdaLayer:
+    """One KDA layer's K1 tensors. ``fp8_in_proj``: the K1 reads an online
+    per_1x128 FP8 in_proj as it is; otherwise in_proj must stay BF16."""
     attn = layer.self_attn
     name = f"layer {layer_id}"
     _need(layer.is_linear_attn, f"{name}: not a KDA layer")
@@ -248,13 +346,20 @@ def bind_kda(layer, layer_id: int, dims: Dims) -> KdaLayer:
     lower = attn._kda_gate_lower_bound
     _need(lower is not None, f"{name}: no KDA gate lower bound")
     blocks, write_idx = layer_block(layer_id)
+    in_proj = f"{name} in_proj"
+    w_in, w_in_scale = (
+        _block_fp8(attn.in_proj, in_proj, (dims.fused, HIDDEN))
+        if fp8_in_proj and _param(attn.in_proj, in_proj).dtype != BF16
+        else (_plain_bf16(attn.in_proj, in_proj, (dims.fused, HIDDEN)), None)
+    )
     return KdaLayer(
         layer_id=layer_id,
         blocks=blocks,
         write_idx=write_idx,
         seam=_seam(layer.self_attention_attn_res, f"{name} attn seam"),
         # [q | k | v | g | beta | f_a]; the kernels' offsets follow this order
-        w_in=_plain_bf16(attn.in_proj, f"{name} in_proj", (dims.fused, HIDDEN)),
+        w_in=w_in,
+        w_in_scale=w_in_scale,
         w_fb=_plain_bf16(attn.f_b_proj, f"{name} f_b_proj", (dims.proj, HEAD_DIM)),
         conv_w=_as_f32(attn.conv_weight, dims.qkv * 4, f"{name} conv_weight").view(
             dims.qkv, 4
@@ -274,10 +379,10 @@ def _experts(moe, layer_id: int, dims: Dims):
     method = experts.quant_method
     name = f"layer {layer_id} experts"
     _need(experts.top_k == TOPK, f"{name}: top-{experts.top_k}")
+    gu_interleave = bool(getattr(method, "is_guinterleave", True))
     _need(
-        not getattr(method, "is_guinterleave", True),
-        f"{name}: gate/up interleaved (ATOM_MOE_GU_ITLV); the scale readers "
-        "follow shuffle_scale's plain layout",
+        not gu_interleave or getattr(method, "is_gfx1250", False),
+        f"{name}: gate/up interleaving requires the gfx1250 K2 reader",
     )
     _need(
         not getattr(method, "fp8_activations", False),
@@ -314,14 +419,225 @@ def _experts(moe, layer_id: int, dims: Dims):
         ("w13_scale", s13, EXPERTS * 2 * inter, LATENT // MX_GROUP),
         ("w2_scale", s2, EXPERTS * LATENT, inter // MX_GROUP),
     ):
-        pad_rows = -(-rows // SCALE_ROW_ALIGN) * SCALE_ROW_ALIGN
-        pad_groups = -(-groups // SCALE_GROUP_ALIGN) * SCALE_GROUP_ALIGN
+        if getattr(method, "is_gfx1250", False):
+            expected = rows * groups
+        else:
+            pad_rows = -(-rows // SCALE_ROW_ALIGN) * SCALE_ROW_ALIGN
+            pad_groups = -(-groups // SCALE_GROUP_ALIGN) * SCALE_GROUP_ALIGN
+            expected = pad_rows * pad_groups
         got = t.numel() * t.element_size()
         _need(
-            got == pad_rows * pad_groups,
-            f"{name}: {plane} is {got} B, expected {pad_rows} x {pad_groups}",
+            got == expected,
+            f"{name}: {plane} is {got} B, expected {expected}",
         )
     return w13.data, s13.data, w2.data, s2.data
+
+
+def bind_k2_expert_scales(
+    moe,
+    layer_id: int,
+    dims: Dims,
+    rank: int,
+    architecture: Architecture,
+) -> KimiExpertScaleHandles:
+    """Bind the explicit gfx1250 K2 scale arguments.
+
+    This is deliberately separate from ``_experts``: the production gfx950
+    binder continues to return AITER's existing tensors byte-for-byte.
+    The gfx1250 runner calls this function and passes the returned handles to
+    its K2 declaration.
+    """
+
+    if architecture is not GFX1250:
+        raise ValueError(
+            "bind_k2_expert_scales is the architecture-explicit gfx1250 path"
+        )
+    experts = moe.experts
+    method = experts.quant_method
+    name = f"layer {layer_id} experts"
+    _need(hasattr(method, "is_gfx1250"), f"{name}: no source scale-layout metadata")
+    _need(
+        method.is_gfx1250,
+        f"{name}: gfx1250 mono requires native n32k4 expert scales",
+    )
+    source_layout = ExpertScaleLayout.GFX1250_N32K4
+
+    w13_spec = ExpertScaleSpec(
+        "w13_scale",
+        EXPERTS,
+        2 * dims.inter,
+        LATENT,
+        rank,
+        dims.tp,
+    )
+    w2_spec = ExpertScaleSpec(
+        "w2_scale",
+        EXPERTS,
+        LATENT,
+        dims.inter,
+        rank,
+        dims.tp,
+    )
+    handles = KimiExpertScaleHandles(
+        architecture,
+        bind_expert_scale(
+            experts.w13_weight_scale,
+            spec=w13_spec,
+            source_layout=source_layout,
+            architecture=architecture,
+        ),
+        bind_expert_scale(
+            experts.w2_weight_scale,
+            spec=w2_spec,
+            source_layout=source_layout,
+            architecture=architecture,
+        ),
+    )
+    handles.validate()
+    return handles
+
+
+def bind_routed_moe(
+    layer,
+    layer_id: int,
+    dims: Dims,
+    rank: int,
+    architecture: Architecture | None = None,
+) -> RoutedMoeLayer:
+    """Bind the routed K2 path without touching quantized shared projections."""
+
+    name = f"layer {layer_id}"
+    moe = getattr(layer, "block_sparse_moe", None)
+    _need(moe is not None, f"{name}: not a MoE layer")
+    _need(moe.use_latent_moe, f"{name}: not a latent MoE")
+    _need(moe.routed_expert_norm is not None, f"{name}: no routed norm")
+    gate = _param(moe.gate, f"{name} gate")
+    _need(
+        gate.dtype == BF16 and tuple(gate.shape) == (EXPERTS, HIDDEN),
+        f"{name}: gate is {gate.dtype} {tuple(gate.shape)}",
+    )
+    w13, s13, w2, s2 = _experts(moe, layer_id, dims)
+    if architecture is GFX1250:
+        scales = bind_k2_expert_scales(
+            moe, layer_id, dims, rank, architecture
+        ).kernel_arguments()
+        s13, s2 = scales["w13s"], scales["w2s"]
+    gu_interleave = bool(
+        getattr(
+            getattr(getattr(moe, "experts", None), "quant_method", None),
+            "is_guinterleave",
+            False,
+        )
+    )
+    w_up = _mxfp4_to_bf16(
+        moe.routed_expert_up_proj,
+        f"{name} routed_expert_up_proj",
+        (HIDDEN, LATENT),
+    )
+    return RoutedMoeLayer(
+        layer_id=layer_id,
+        blocks=layer_block(layer_id)[0],
+        write_idx=layer_block(layer_id)[1],
+        seam=_seam(layer.mlp_attn_res, f"{name} mlp seam"),
+        w_gate=gate.data,
+        bias=_as_f32(
+            moe.gate.e_score_correction_bias,
+            EXPERTS,
+            f"{name} gate bias",
+        ),
+        w_ld=_mxfp4_to_bf16(
+            moe.routed_expert_down_proj,
+            f"{name} routed_expert_down_proj",
+            (LATENT, HIDDEN),
+        ),
+        ln_w=_vec(
+            moe.routed_expert_norm.weight,
+            LATENT,
+            f"{name} routed_expert_norm",
+        ),
+        w_up=w_up.narrow(0, rank * dims.up_n, dims.up_n).clone(),
+        w13=w13,
+        w13s=s13,
+        w2=w2,
+        w2s=s2,
+        gu_interleave=gu_interleave,
+        ln_eps=_eps(moe.routed_expert_norm, f"{name} routed_expert_norm"),
+    )
+
+
+def bind_external_moe(
+    layer,
+    layer_id: int,
+    dims: Dims,
+    rank: int,
+    architecture: Architecture,
+    fp8_shared: bool = False,
+    fp4_latent: bool = False,
+) -> ExternalMoeLayer:
+    """Bind native K2 local stages while leaving o_proj on its quantized path.
+    ``fp8_shared``: K2 reads an online per_1x128 FP8 shared gate/up and down
+    as they are; otherwise they must stay BF16. ``fp4_latent``: an MXFP4
+    latent down-projection's planes too (``ExternalMoeLayer.w_ld_fp4``)."""
+
+    routed = bind_routed_moe(
+        layer,
+        layer_id,
+        dims,
+        rank,
+        architecture,
+    )
+    name = f"layer {layer_id}"
+    shared = layer.block_sparse_moe.shared_experts
+    _need(shared is not None, f"{name}: no shared experts")
+    up = _param(layer.block_sparse_moe.routed_expert_up_proj, f"{name} routed up")
+    whole_up = (
+        up.dtype == BF16
+        and not getattr(up, "is_shuffled", False)
+        and tuple(up.shape) == (HIDDEN, LATENT)
+        and up.is_contiguous()
+    )
+
+    def linear(module, what, shape):
+        if fp8_shared and _param(module, what).dtype != BF16:
+            return _block_fp8(module, what, shape)
+        return _plain_bf16(module, what, shape), None
+
+    w_sgu, w_sgu_scale = linear(
+        shared.gate_up_proj,
+        f"{name} shared gate_up_proj",
+        (2 * dims.sh_inter, HIDDEN),
+    )
+    w_sd, w_sd_scale = linear(
+        shared.down_proj, f"{name} shared down_proj", (HIDDEN, dims.sh_inter)
+    )
+    planes = (
+        _mxfp4_planes(
+            layer.block_sparse_moe.routed_expert_down_proj,
+            f"{name} routed_expert_down_proj",
+            (LATENT, HIDDEN),
+        )
+        if fp4_latent
+        else None
+    )
+    w_ld_fp4, w_ld_scale = planes if planes is not None else (None, None)
+    return ExternalMoeLayer(
+        **routed.__dict__,
+        w_up_full=up.data if whole_up else None,
+        w_sgu=w_sgu,
+        w_sgu_scale=w_sgu_scale,
+        w_sd=w_sd,
+        w_sd_scale=w_sd_scale,
+        w_ld_fp4=w_ld_fp4,
+        w_ld_scale=w_ld_scale,
+    )
+
+
+def bind_fp8_o_proj(layer, layer_id: int, dims: Dims):
+    """A KDA layer's o_proj as gfx1250's in-kernel o_proj reads it:
+    ``(weight, scale)``, ``_block_fp8``'s per_1x128 FP8 layout."""
+    return _block_fp8(
+        layer.self_attn.o_proj, f"layer {layer_id} o_proj", (HIDDEN, dims.proj)
+    )
 
 
 def bind_moe(layer, layer_id: int, dims: Dims, rank: int) -> MoeLayer:
@@ -332,51 +648,18 @@ def bind_moe(layer, layer_id: int, dims: Dims, rank: int) -> MoeLayer:
     _need(moe.use_latent_moe, f"{name}: not a latent MoE")
     _need(moe.shared_experts is not None, f"{name}: no shared experts")
     _need(moe.routed_expert_norm is not None, f"{name}: no routed norm")
-    # No dual-stream refusal. `_use_dual_stream` is a static config flag that
-    # only selects a branch inside `KimiSparseMoeBlock.forward`, and a mono
-    # layer never calls that module at all -- K2 computes the latent MoE from
-    # the tensors bound here. The alt stream cannot contend with the kernel
-    # either: `dual_stream_moe_forward` joins before it returns
-    # (`current_stream.wait_stream(alt_stream)`, deepseek_v2.py), so a
-    # production layer's shared-expert work is complete before the next layer
-    # launches anything. Refusing on it disarmed mono in the DEFAULT
-    # environment -- K3 has shared experts and an alt stream, and
-    # ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD defaults to 1024 -- which cost three
-    # GSM8K runs that scored the production path while reporting "mono".
-    gate = _param(moe.gate, f"{name} gate")
-    _need(
-        gate.dtype == BF16 and tuple(gate.shape) == (EXPERTS, HIDDEN),
-        f"{name}: gate is {gate.dtype} {tuple(gate.shape)}",
-    )
-    w13, s13, w2, s2 = _experts(moe, layer_id, dims)
-    # the up-projection is replicated in the model; the kernel's stage computes
-    # this rank's row band of it and the ranks' bands are summed into the
-    # layer's output, so only the band is bound.
-    #
-    # `.clone()`, not `.contiguous()`: a row `narrow` of a row-major tensor is
-    # already contiguous, so `contiguous()` hands back the SAME view and the
-    # whole dequantized 7168x3584 plane stays referenced by it -- 49 MiB held
-    # per layer per rank to keep the 6.1 MiB band, which is memory the lazy
-    # bind does not have and so turns mono off. `_mxfp4_to_bf16` returns a
-    # fresh contiguous tensor, so cloning the band copies once and frees it.
-    w_up = _mxfp4_to_bf16(
-        moe.routed_expert_up_proj, f"{name} routed_expert_up_proj", (HIDDEN, LATENT)
-    )
+    routed = bind_routed_moe(layer, layer_id, dims, rank)
     return MoeLayer(
-        layer_id=layer_id,
-        blocks=layer_block(layer_id)[0],
-        write_idx=layer_block(layer_id)[1],
-        seam=_seam(layer.mlp_attn_res, f"{name} mlp seam"),
+        layer_id=routed.layer_id,
+        blocks=routed.blocks,
+        write_idx=routed.write_idx,
+        seam=routed.seam,
         w_o=_plain_bf16(layer.self_attn.o_proj, f"{name} o_proj", (HIDDEN, dims.proj)),
-        w_gate=gate.data,
-        bias=_as_f32(moe.gate.e_score_correction_bias, EXPERTS, f"{name} gate bias"),
-        w_ld=_mxfp4_to_bf16(
-            moe.routed_expert_down_proj,
-            f"{name} routed_expert_down_proj",
-            (LATENT, HIDDEN),
-        ),
-        ln_w=_vec(moe.routed_expert_norm.weight, LATENT, f"{name} routed_expert_norm"),
-        w_up=w_up.narrow(0, rank * dims.up_n, dims.up_n).clone(),
+        w_gate=routed.w_gate,
+        bias=routed.bias,
+        w_ld=routed.w_ld,
+        ln_w=routed.ln_w,
+        w_up=routed.w_up,
         w_sgu=_plain_bf16(
             moe.shared_experts.gate_up_proj,
             f"{name} shared gate_up_proj",
@@ -387,11 +670,12 @@ def bind_moe(layer, layer_id: int, dims: Dims, rank: int) -> MoeLayer:
             f"{name} shared down_proj",
             (HIDDEN, dims.sh_inter),
         ),
-        w13=w13,
-        w13s=s13,
-        w2=w2,
-        w2s=s2,
-        ln_eps=_eps(moe.routed_expert_norm, f"{name} routed_expert_norm"),
+        w13=routed.w13,
+        w13s=routed.w13s,
+        w2=routed.w2,
+        w2s=routed.w2s,
+        gu_interleave=routed.gu_interleave,
+        ln_eps=routed.ln_eps,
     )
 
 
@@ -415,8 +699,15 @@ class LayerPlan:
         production path (``bind_model``)."""
         return self.kda is None and self.moe is not None
 
+    @property
+    def k1_only(self) -> bool:
+        """K1 alone; projection, MoE and their collectives stay production."""
+        return self.kda is not None and self.moe is None
 
-def bind_model(model, dims: Dims, rank: int) -> list[LayerPlan]:
+
+def bind_model(
+    model, dims: Dims, rank: int, *, bind_k2: bool = True, fp8_in_proj: bool = False
+) -> list[LayerPlan]:
     """Every decoder layer, in order.
 
     A layer takes K1 and K2 only when it is a KDA layer with a MoE FFN and at
@@ -437,6 +728,9 @@ def bind_model(model, dims: Dims, rank: int) -> list[LayerPlan]:
         has_ffn = hasattr(layer, "block_sparse_moe") and blocks >= 1
         takes = bool(getattr(layer, "is_linear_attn", False)) and has_ffn
         if not takes and has_ffn:
+            if not bind_k2:
+                plans.append(LayerPlan(layer_id, None, None))
+                continue
             # One layer's refusal leaves that layer on the production path; it
             # must not take the KDA layers' mono down with it.
             try:
@@ -458,12 +752,12 @@ def bind_model(model, dims: Dims, rank: int) -> list[LayerPlan]:
         plans.append(
             LayerPlan(
                 layer_id,
-                bind_kda(layer, layer_id, dims),
-                bind_moe(layer, layer_id, dims, rank),
+                bind_kda(layer, layer_id, dims, fp8_in_proj),
+                bind_moe(layer, layer_id, dims, rank) if bind_k2 else None,
             )
         )
     _need(
-        any(p.mono for p in plans),
+        any(p.mono if bind_k2 else p.k1_only for p in plans),
         f"no layer takes the kernels ({len(layers)} layers, block size "
         f"{ATTN_RES_BLOCK})",
     )

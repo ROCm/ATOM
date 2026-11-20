@@ -307,3 +307,31 @@ def test_bind_moe_binds_a_bf16_latent_checkpoint_without_dequantizing(monkeypatc
     assert torch.equal(bound.w_up, band)
     assert bound.w_up.data_ptr() != band.data_ptr()
     assert bound.w_up.untyped_storage().nbytes() == dims.up_n * LATENT * 2
+
+
+def _block_fp8_module(rows, cols, shuffled=True, scale_dtype=torch.float8_e8m0fnu):
+    weight = torch.nn.Parameter(
+        torch.zeros((rows, cols), dtype=torch.float8_e4m3fn), requires_grad=False
+    )
+    weight.is_shuffled = shuffled
+    scale = torch.zeros((rows // 128, cols // 128), dtype=scale_dtype)
+    return types.SimpleNamespace(weight=weight, weight_scale=scale)
+
+
+def test_block_fp8_in_proj_is_read_in_place():
+    """K1 reads ATOM's online per_1x128 FP8 in_proj as the GEMM holds it: 6284
+    rows padded to 6400, preshuffled, E8M0 block scales. Anything else is
+    refused rather than read through the wrong layout or scale."""
+    from atom.models.kimi_k3.mono.weights import _block_fp8
+
+    module = _block_fp8_module(6400, HIDDEN)
+    weight, scale = _block_fp8(module, "in_proj", (6284, HIDDEN))
+    assert weight.data_ptr() == module.weight.data_ptr()
+    assert scale.data_ptr() == module.weight_scale.data_ptr()
+    for bad, why in (
+        (_block_fp8_module(6400, HIDDEN, shuffled=False), "preshuffled"),
+        (_block_fp8_module(6400, HIDDEN, scale_dtype=torch.float32), "E8M0"),
+        (_block_fp8_module(6528, HIDDEN), "expected"),
+    ):
+        with pytest.raises(MonoUnsupported, match=why):
+            _block_fp8(bad, "in_proj", (6284, HIDDEN))

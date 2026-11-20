@@ -38,6 +38,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, replace
 
 import torch
+import triton
 from aiter.dist.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -45,6 +46,11 @@ from aiter.dist.parallel_state import (
 )
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
+from atom.model_ops.kimi_k3.attention_residual import (
+    _ATTN_RES_BF16_CONFIG,
+    _attn_res_fused_kernel,
+)
+from atom.model_ops.layernorm import rmsnorm2d_fwd_
 from atom.models.kimi_k3.mono.config import (
     MAX_ROWS,
     Dims,
@@ -116,6 +122,86 @@ class WidthBuild:
         )
 
 
+def _mix_bf16(site, prefix, blocks, add, add2):
+    """``apply_attn_res``'s unquantized mix of ``site``, reading ``blocks`` (a
+    slice of the runner's ``[T, blocks, H]`` buffer) in place: the op's wrapper
+    copies a non-contiguous block residual first, which its kernel, indexing
+    ``[T, B]`` by stride, does not need."""
+    if add2 is not None and add is None:
+        raise ValueError("add_hidden2 requires add_hidden")
+    if blocks.stride(-1) != 1 or prefix.dtype != torch.bfloat16:
+        raise MonoUnsupported(
+            f"AttnRes blocks stride {blocks.stride()} prefix {prefix.dtype}"
+        )
+    if site.score_weight is None:
+        site.process_weights_after_loading()
+    tokens, count, hidden = blocks.shape
+    sw = site.score_weight.contiguous()
+    ow = sw if site.out_norm is None else site.out_norm.weight.contiguous()
+    ps = prefix.contiguous()
+    y = torch.empty((tokens, hidden), device=ps.device, dtype=ps.dtype)
+    y_scale = torch.empty((1,), device=ps.device, dtype=torch.float32)
+    hs = ps if add is None else add.contiguous()
+    hs2 = ps if add2 is None else add2.contiguous()
+    pref = ps if add is None else torch.empty_like(ps)
+    warps, stages, tile = _ATTN_RES_BF16_CONFIG
+    _attn_res_fused_kernel[(tokens,)](
+        blocks,
+        ps,
+        sw,
+        y,
+        y_scale,
+        hs,
+        hs2,
+        pref,
+        ow,
+        count,
+        count + 1,
+        hidden,
+        float(site.eps),
+        float(site.out_eps),
+        1.0,
+        1.0,
+        blocks.stride(0),
+        blocks.stride(1),
+        ps.stride(0),
+        y.stride(0),
+        hs.stride(0),
+        hs2.stride(0),
+        pref.stride(0),
+        BL=tile,
+        BD=triton.next_power_of_2(hidden),
+        num_stages=stages,
+        num_warps=warps,
+        DO_ADD=add is not None,
+        DO_ADD2=add2 is not None,
+        WRITE_PREF=add is not None,
+        OUT_NORM=site.out_norm is not None,
+        QUANT=False,
+    )
+    return y, (prefix if add is None else pref)
+
+
+def _bf16_attn_res(site, prefix, blocks, add, add2):
+    """``AttnRes.forward`` with no quant folded into its out_norm, mixing
+    ``blocks`` in place (``_mix_bf16``). Where that out_norm fuses a
+    block-scale FP8 in_proj's quant, ``forward`` returns a ``(quantized,
+    scale)`` pair on both of its branches -- the mix as well as the
+    nothing-to-mix one -- while K1 reads the bf16 normed row."""
+    if prefix is None:
+        prefix, add, add2 = add, add2, None
+    if site.enabled and blocks.shape[1] > 0:
+        return _mix_bf16(site, prefix, blocks, add, add2)
+    if site.out_quant_dtype is None:
+        return site(prefix, blocks, add, add2)
+    if add is not None:
+        prefix = prefix + add
+        if add2 is not None:
+            prefix = prefix + add2
+    norm = site.out_norm
+    return rmsnorm2d_fwd_(prefix, norm.weight, norm.eps, norm.dim), prefix
+
+
 def ix_peer_offset(max_rows: int) -> int:
     """Where the DSA indexer's regions start in the peer buffer it shares with
     K2: past every K2 width's (up to ``max_rows``). A rank already in the next
@@ -153,6 +239,9 @@ class K3MonoDecodeRunner:
     refusal every rank agrees on before anything collective."""
 
     max_rows = MAX_ROWS
+    bind_k2 = True
+    # Whether K1 reads an online per_1x128 FP8 in_proj (else in_proj stays BF16).
+    fp8_in_proj = False
 
     def __init__(self, model, drafter=None, metadata_builder=None) -> None:
         group = get_tp_group().cpu_group
@@ -193,7 +282,13 @@ class K3MonoDecodeRunner:
         self.dims = Dims(self.tp)
         self.debug = envs.ATOM_MONO_DEBUG
         self.inner = inner_model(model)
-        self.plans = bind_model(self.inner, self.dims, self.rank)
+        self.plans = bind_model(
+            self.inner,
+            self.dims,
+            self.rank,
+            bind_k2=self.bind_k2,
+            fp8_in_proj=self.fp8_in_proj,
+        )
         self.num_blocks = num_blocks(len(self.inner.layers))
         # a DSpark drafter taps hidden states; a plain-decode deployment has none
         self.aux = (
@@ -201,7 +296,7 @@ class K3MonoDecodeRunner:
             if drafter is None
             else bind_aux_taps(drafter, self.inner.config.hidden_size)
         )
-        first = next(p for p in self.plans if p.mono)
+        first = next(p for p in self.plans if p.kda is not None)
         self.device = first.kda.w_in.device
         self.state_len = self._state_len()
         self.replay_cap = self._replay_cap()
@@ -254,7 +349,7 @@ class K3MonoDecodeRunner:
         """
         lens = set()
         for plan in self.plans:
-            if not plan.mono:
+            if plan.kda is None:
                 continue
             lens.add(self._conv_state(plan.layer_id).size(-1))
             self._recurrent_state(plan.layer_id)
@@ -273,7 +368,7 @@ class K3MonoDecodeRunner:
         k and u bf16, the log gates fp32."""
         caps = set()
         for plan in self.plans:
-            if not plan.mono:
+            if plan.kda is None:
                 continue
             cache = get_forward_context().kv_cache_data[f"layer_{plan.layer_id}"]
             bufs = [getattr(cache, f"replay_buf_{n}", None) for n in "kug"]
@@ -400,7 +495,7 @@ class K3MonoDecodeRunner:
                 **k1.gemv_staging(rows),
             )
             for p in self.plans
-            if p.mono
+            if p.kda is not None
         }
         for key in set(keys.values()):
             if k1.lds_refusal(key):
@@ -546,13 +641,17 @@ class K3MonoDecodeRunner:
             )
         return core, prefix
 
-    def _seam(self, plan, prefix, blocks, add, add2):
-        """The layer's attention-side AttnRes seam, on the blocks behind it."""
+    def _seam(self, plan, prefix, blocks, add, add2, bf16=False):
+        """The layer's attention-side AttnRes seam, on the blocks behind it.
+        ``bf16``: the normed row as K1 reads it, never the ``(quantized,
+        scale)`` pair a block-scale FP8 in_proj's out_norm folds in."""
         layer = self.inner.layers[plan.layer_id]
         before, write_idx = layer_block(plan.layer_id)
-        normed, prefix = layer.self_attention_attn_res(
-            prefix, blocks[:, :before], add, add2
-        )
+        site = layer.self_attention_attn_res
+        if bf16:
+            normed, prefix = _bf16_attn_res(site, prefix, blocks[:, :before], add, add2)
+        else:
+            normed, prefix = site(prefix, blocks[:, :before], add, add2)
         return layer, normed, prefix, before, write_idx
 
     def _write_aux(self, layer_id: int, out: tuple, blocks) -> None:
@@ -671,7 +770,7 @@ class K3MonoDecodeRunner:
                     f"layer {layer_id}: a ReplaySSM buffer moved under a graph "
                     "capture; K1's pointer table was written for the old one"
                 )
-            table = torch.tensor(ptrs, dtype=torch.int64, device=self.scratch.device)
+            table = torch.tensor(ptrs, dtype=torch.int64, device=self.device)
             self._replay_tables[layer_id] = (table, ptrs)
         return table.data_ptr()
 
