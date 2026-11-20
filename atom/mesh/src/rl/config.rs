@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 /// Default `--rl-control-timeout-secs`.
 pub const DEFAULT_RL_CONTROL_TIMEOUT_SECS: u64 = 600;
 
+/// Default `--rl-fanout-concurrency`.
+pub const DEFAULT_RL_FANOUT_CONCURRENCY: usize = 32;
+
 /// Configuration for the `/v1/rl` routes. Inert unless `enabled`.
 #[derive(Debug, Clone, PartialEq, Eq, clap::Args, Serialize, Deserialize)]
 #[command(next_help_heading = "RL Control Plane")]
@@ -28,7 +31,7 @@ pub struct RlConfig {
     #[arg(
         id = "rl_fanout_concurrency",
         long = "rl-fanout-concurrency",
-        default_value_t = 32
+        default_value_t = DEFAULT_RL_FANOUT_CONCURRENCY
     )]
     pub fanout_concurrency: usize,
 }
@@ -39,7 +42,7 @@ impl Default for RlConfig {
             enabled: false,
             api_key: None,
             control_timeout_secs: DEFAULT_RL_CONTROL_TIMEOUT_SECS,
-            fanout_concurrency: 32,
+            fanout_concurrency: DEFAULT_RL_FANOUT_CONCURRENCY,
         }
     }
 }
