@@ -153,6 +153,158 @@ def test_stacked_loader_preserves_shared_slot_and_zero_pads(tp, rank):
     assert (layer.w2_weight[3] == -7).all()
 
 
+@pytest.mark.parametrize("fused_shared", [False, True])
+def test_mtp_shared_name_rewrite_follows_constructed_layout(fused_shared):
+    from atom.model_loader.weight_names import CheckpointNameRewriter
+    from atom.models.qwen4_exp_mtp import Qwen4ExpMTP
+
+    model = Qwen4ExpMTP.__new__(Qwen4ExpMTP)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(num_experts=512)
+    model.fused_shared_experts = int(fused_shared)
+    model.disable_fused_shared_loading = not fused_shared
+
+    def target_policy(*_):
+        raise AssertionError("Draft names must follow its constructed layout")
+
+    rewriter = CheckpointNameRewriter(
+        weights_mapping=model.weights_mapping,
+        mtp_remap=model.remap_mtp_weight_name,
+        spec_decode=True,
+        n_routed_experts=512,
+        fuse_shared_expert=target_policy,
+        disable_fused_shared_loading=model.disable_fused_shared_loading,
+    )
+    expert = "experts.512" if fused_shared else "shared_expert"
+    for proj in ("gate_proj", "up_proj", "down_proj"):
+        assert rewriter.rewrite(f"mtp.layers.0.mlp.shared_expert.{proj}.weight") == (
+            f"model.layers.0.mlp.{expert}.{proj}.weight"
+        )
+    assert rewriter.rewrite("mtp.layers.0.mlp.shared_expert_gate.weight") == (
+        "model.layers.0.mlp.shared_expert_gate.weight"
+    )
+    assert rewriter.rewrite("model.layers.0.mlp.shared_expert.gate_proj.weight") is None
+
+
+@pytest.mark.parametrize("tp", [2, 4])
+@pytest.mark.parametrize("target_shared_bf16", [False, True])
+def test_bf16_mtp_loads_shared_slot_using_draft_policy(
+    monkeypatch, tmp_path, tp, target_shared_bf16
+):
+    """The BF16 draft can fuse even when the FP8 target must keep shared separate."""
+    from functools import partial
+
+    from safetensors.torch import save_file
+
+    from atom.config import QuantizationConfig
+    from atom.model_loader.loading_core import load_weights_into_model
+    from atom.model_loader.weight_iterator import safetensors_weights_iterator
+    from atom.model_ops import topK
+    from atom.models import qwen4_exp_mtp
+
+    target_config = QuantizationConfig()
+    target_config.quant_method = "compressed-tensors"
+    target_config.global_spec = LayerQuantConfig(
+        quant_dtype=dtypes.fp8, quant_type=QuantType.per_Token
+    )
+    target_config.exclude_layers = [r"re:^mtp\."]
+    if target_shared_bf16:
+        target_config.exclude_layers.append(r"re:^model\.layers\.0\.mlp\.shared_expert")
+    target_policy = qwen4_exp._Qwen4ExpQuantizationConfig(target_config)
+    draft_policy = qwen4_exp_mtp._UnquantizedMTPQuantizationConfig(target_config)
+    monkeypatch.setattr(
+        topK,
+        "get_current_atom_config",
+        lambda: SimpleNamespace(
+            parallel_config=SimpleNamespace(data_parallel_size=1),
+            moe_all2all_backend="none",
+        ),
+    )
+    can_fuse = topK.is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config
+    assert can_fuse(
+        target_policy, "model.layers.0.mlp.shared_expert", "model.layers.0.mlp.experts"
+    ) is (not target_shared_bf16)
+
+    # Keep construction CPU-only while using the real MTP model's fusion flags,
+    # checkpoint rewriter, stacked loader and per-expert BF16 weight loader.
+    routed, hidden, rank = 512, 8, tp - 1
+    experts, method = _layer("bf16", tp, rank, experts=routed + 1, hidden=hidden)
+    # A dropped shared weight must fail even if an empty TP2 buffer reuses
+    # storage that a previous test populated with the expected values.
+    experts.w13_weight.data[routed].zero_()
+    experts.w2_weight.data[routed].zero_()
+    experts.quant_method = method
+    experts.layer_quant_config = LayerQuantConfig(quant_dtype=torch.bfloat16)
+    experts.w13_weight.weight_loader = experts.weight_loader
+    experts.w2_weight.weight_loader = experts.weight_loader
+    qwen4_exp.install_stacked_expert_loaders(experts)
+
+    block = torch.nn.Module()
+    block.mlp = torch.nn.Module()
+    block.mlp.experts = experts
+    block.mlp.fuse_shared = can_fuse(
+        draft_policy, "mtp.layers.0.mlp.shared_expert", "mtp.layers.0.mlp.experts"
+    )
+    predictor = torch.nn.Module()
+    predictor.layers = torch.nn.ModuleList([block])
+    monkeypatch.setattr(
+        qwen4_exp_mtp, "Qwen4ExpMultiTokenPredictor", lambda _: predictor
+    )
+    monkeypatch.setattr(
+        qwen4_exp_mtp, "ParallelLMHead", lambda *_args, **_kw: torch.nn.Identity()
+    )
+    hf = SimpleNamespace(
+        num_experts=routed, num_hidden_layers=48, hidden_size=hidden, vocab_size=32
+    )
+    model = qwen4_exp_mtp.Qwen4ExpMTP(SimpleNamespace(hf_config=hf))
+    assert model.fused_shared_experts == 1
+    assert model.disable_fused_shared_loading is False
+
+    gate = (torch.arange(640 * hidden).reshape(640, hidden) % 7 + 1).to(torch.bfloat16)
+    up = -gate - 1
+    down = (torch.arange(hidden * 640).reshape(hidden, 640) % 11 + 1).to(torch.bfloat16)
+    prefix = "mtp.layers.0.mlp"
+    weights = {
+        f"{prefix}.experts.gate_up_proj": torch.full(
+            (routed, 1280, hidden), 5, dtype=torch.bfloat16
+        ),
+        f"{prefix}.experts.down_proj": torch.full(
+            (routed, hidden, 640), 6, dtype=torch.bfloat16
+        ),
+        f"{prefix}.shared_expert.gate_proj.weight": gate,
+        f"{prefix}.shared_expert.up_proj.weight": up,
+        f"{prefix}.shared_expert.down_proj.weight": down,
+    }
+    save_file(weights, tmp_path / "model.safetensors")
+    monkeypatch.setenv("ATOM_LOADER_NUM_THREADS", "1")
+    loaded = load_weights_into_model(
+        model=model,
+        model_name_or_path=str(tmp_path),
+        hf_config=hf,
+        spec_decode=True,
+        default_weight_loader=lambda param, weight: param.data.copy_(weight),
+        fuse_shared_expert=partial(can_fuse, target_policy),
+        is_rank0=lambda: True,
+        weights_iterator=safetensors_weights_iterator,
+    )
+    assert loaded == {
+        "model.layers.0.mlp.experts.w13_weight",
+        "model.layers.0.mlp.experts.w2_weight",
+    }
+    logical, physical = 640 // tp, experts.w2_weight.shape[-1]
+    shard = slice(rank * logical, (rank + 1) * logical)
+    expected13 = torch.zeros((2 * physical, hidden), dtype=torch.bfloat16)
+    expected13[:logical] = gate[shard]
+    expected13[physical : physical + logical] = up[shard]
+    expected2 = torch.zeros((hidden, physical), dtype=torch.bfloat16)
+    expected2[:, :logical] = down[:, shard]
+    torch.testing.assert_close(experts.w13_weight[routed], expected13, rtol=0, atol=0)
+    torch.testing.assert_close(experts.w2_weight[routed], expected2, rtol=0, atol=0)
+    assert (experts.w13_weight[:routed, :logical] == 5).all()
+    assert (experts.w13_weight[:routed, physical : physical + logical] == 5).all()
+    assert (experts.w2_weight[:routed, :, :logical] == 6).all()
+
+
 @pytest.mark.parametrize("tp", [2, 4])
 @pytest.mark.parametrize("mode", ["bf16", "fp8"])
 def test_preshuffle_preserves_final_parameter_markers_and_padding(tp, mode):

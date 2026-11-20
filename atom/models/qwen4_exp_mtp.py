@@ -195,7 +195,17 @@ class Qwen4ExpMTP(nn.Module):
     def remap_mtp_weight_name(self, name: str) -> str | None:
         if not name.startswith("mtp."):
             return None
-        return "model." + name[len("mtp.") :]
+        name = "model." + name[len("mtp.") :]
+        if self.fused_shared_experts:
+            # The constructed draft owns this decision. After mtp -> model,
+            # the generic rewriter would consult the target's quant policy,
+            # which can keep its shared expert separate from FP8 routed ones.
+            name = name.replace(
+                ".mlp.shared_expert.",
+                f".mlp.experts.{self.config.num_experts}.",
+                1,
+            )
+        return name
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_tokens(input_ids)
