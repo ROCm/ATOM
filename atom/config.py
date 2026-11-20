@@ -2333,6 +2333,8 @@ class Config:
     stop_token_ids: list[int] = field(default_factory=list)
     kv_cache_block_size: int = 16
     num_kvcache_blocks: int = -1
+    # A MoRIIO producer's state transfer slots, sized by the runner.
+    state_transfer_slots: int = field(default=0, init=False)
     kv_cache_dtype: str = "bf16"
     index_cache_dtype: str | None = None
     # FP4 physical layout, resolved before config is sent to scheduler/workers.
