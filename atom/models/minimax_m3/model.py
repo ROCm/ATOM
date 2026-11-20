@@ -44,7 +44,7 @@ from atom.model_ops.linear import (
 from atom.model_ops.minimax_m3.sparse_attn import (
     SPARSE_BLOCK_SIZE,
 )
-from atom.model_ops.moe import FusedMoE
+from atom.model_ops.moe import FusedMoE, Mxfp4MoEMethod
 from atom.model_ops.swiglu_oai import swiglu_oai_split
 from atom.model_ops.utils import atom_parameter
 from atom.models.minimax_m3.mono.dispatch import MonoDecode
@@ -357,20 +357,39 @@ class MiniMaxM3MoE(nn.Module):
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
             )
+        # The shared gate_up's input is `quantize_fp8(hidden_states)` when it
+        # is a native group-32 FP8/W4A8 linear; the MXFP4 experts' A1 quant can
+        # write those bytes in its own pass (ATOM_MINIMAX_M3_MOE_QUANT_SHARED).
+        self.shared_input_from_moe_quant = (
+            envs.ATOM_MINIMAX_M3_MOE_QUANT_SHARED
+            and self.shared_experts is not None
+            and self.shared_experts.gate_up_proj.native_a8_group_rows is not None
+            and isinstance(self.experts.quant_method, Mxfp4MoEMethod)
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, orig_shape[-1])
         router_logits = self.gate(hidden_states)
 
-        routed_output = self.experts(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-        )
+        shared_x = shared_x_scale = None
+        if self.shared_input_from_moe_quant:
+            routed_output, shared_x, shared_x_scale = (
+                self.experts.forward_with_mxfp8_copy(hidden_states, router_logits)
+            )
+        else:
+            routed_output = self.experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+            )
         if not self.fuse_shared_experts and self.routed_scaling_factor != 1.0:
             routed_output = routed_output * self.routed_scaling_factor
 
-        if self.shared_experts is not None:
+        if shared_x is not None:
+            routed_output = routed_output + self.shared_experts(
+                shared_x, x_scale=shared_x_scale
+            )
+        elif self.shared_experts is not None:
             routed_output = routed_output + self.shared_experts(hidden_states)
 
         return routed_output.view(orig_shape)
