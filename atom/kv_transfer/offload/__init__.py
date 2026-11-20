@@ -50,6 +50,7 @@ def register_backends(factory) -> None:
         aliases=("LMCacheOffloadConnector", "LMCacheConnectorV1"),
         requires_pd_staging=False,
         offload=True,
+        reads_page_images=True,
         # The dense codec ignores the region map; every other layout reads it.
         # Which one applies comes from the model, so the registration says so.
         reads_block_regions=offload_layout_reads_block_regions,
@@ -64,6 +65,7 @@ def register_backends(factory) -> None:
         aliases=("LMCacheMPConnector",),
         requires_pd_staging=False,
         offload=True,
+        reads_page_images=True,
         # One LMCache server for every DP rank.
         shared_tier=True,
         chunk_tokens="atom.kv_transfer.offload.config:lmcache_chunk_tokens",
