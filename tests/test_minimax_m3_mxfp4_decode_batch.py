@@ -19,10 +19,11 @@ def mod():
     return aiter_attention
 
 
+@pytest.mark.parametrize("prefill_rows", [40, 200])  # under / over max_bs * max_qlen
 @pytest.mark.parametrize("max_bs", [16, 15])
 @pytest.mark.parametrize("tbo_decode", [False, True])
 def test_the_scorer_buffers_are_one_workspace_and_a_map_per_decode_ubatch(
-    monkeypatch, tbo_decode, max_bs
+    monkeypatch, tbo_decode, max_bs, prefill_rows
 ):
     pytest.importorskip("aiter")
     from atom.model_ops.minimax_m3.index_buffers import allocate_index_scorers
@@ -33,7 +34,7 @@ def test_the_scorer_buffers_are_one_workspace_and_a_map_per_decode_ubatch(
         lambda *args: capacity_args.append(args) or 100,
         raising=False,
     )
-    bound, prefill_rows, max_qlen = 64, 40, 8  # max_qlen: speculative; TBO runs q=1
+    bound, max_qlen = 64, 8  # max_qlen: speculative; TBO runs q=1
     config = types.SimpleNamespace(
         max_model_len=bound * 128,
         max_num_batched_tokens=prefill_rows,
@@ -45,8 +46,9 @@ def test_the_scorer_buffers_are_one_workspace_and_a_map_per_decode_ubatch(
         config, "cpu", max_bs=max_bs, max_qlen=max_qlen, num_idx_heads=HEADS
     )
     main = scorers[""]
-    # one workspace for every layer, as tall as the larger of decode rows / a chunk
-    cap = HEADS * max(max_bs * max_qlen, prefill_rows) * bound
+    # one workspace for every layer: a chunk's scores or a decode step's, the larger
+    decode = HEADS * max_bs * max_qlen * bound
+    cap = max(HEADS * prefill_rows * bound, decode)
     assert main.scores.capacity == cap and main.max_block == bound
     assert capacity_args[0] == (max_bs, bound, max_qlen, HEADS)
     if not tbo_decode:  # `enable_tbo` alone is the prefill split: no decode ubatch
@@ -127,7 +129,7 @@ def test_the_sparse_attention_runs_only_the_rows_the_metadata_covers(
         prefill=types.SimpleNamespace(
             cu_seqlens_q=torch.arange(batch + 1, dtype=torch.int32) * mq,
             seq_lens=seq, context_lens=seq, block_table=table, max_query_len=mq,
-            max_seq_len=100, qo_indptr=cover,
+            max_seq_len=100, qo_indptr=cover, score_workspace=None,
         ),
     )  # fmt: skip
     ctx = types.SimpleNamespace(
