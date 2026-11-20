@@ -110,6 +110,10 @@ class KvLayout(Protocol):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """One layer's `(k, v)`, aliasing the pool."""
 
+    def head_runs(self, field: str, num_kv_heads: int) -> tuple[int, ...] | None:
+        """`field`'s head runs for a P/D head cut, `(runs, heads, w_0, ...)`; None
+        for the page-token runs `(entry_tokens // page, heads)`."""
+
 
 @dataclass(frozen=True)
 class ShuffleLayout:
@@ -163,6 +167,9 @@ class ShuffleLayout:
             pool.field_view("k", layer, self.kv_dtype, (-1, nh, hd // x, bs, x)),
             pool.field_view("v", layer, self.kv_dtype, (-1, nh, bs // x, hd, x)),
         )
+
+    def head_runs(self, field, num_kv_heads):
+        return None
 
 
 class MhaKvPool:
@@ -411,9 +418,11 @@ class MhaKvPool:
                 runs = None
                 if name in per_head:
                     page = self.block_size if page_tokens is None else page_tokens[row]
-                    if self.entry_tokens % page:
-                        raise ValueError(f"{page}-token pages do not tile {name}")
-                    runs = (self.entry_tokens // page, self.num_kv_heads)
+                    runs = self.layout.head_runs(name, self.num_kv_heads)
+                    if runs is None:
+                        if self.entry_tokens % page:
+                            raise ValueError(f"{page}-token pages do not tile {name}")
+                        runs = (self.entry_tokens // page, self.num_kv_heads)
                     layer = layers[row]
                     dim, dtype = (
                         (self.head_dim, self.kv_dtype)

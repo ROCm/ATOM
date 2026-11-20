@@ -350,9 +350,9 @@ class PageRegion:
 
     region: KVTransferRegion
     view: Any = None
-    # `(runs, heads)`: the unit is `runs` equal runs, each holding this rank's
-    # `heads` KV heads one after another. None: not per head (replicated).
-    head_major_runs: tuple[int, int] | None = None
+    # `(runs, heads[, w_0, ...])`: `runs` runs of this rank's `heads` heads, w_i B/head
+    # in run i or all equal; at most 4 named, one gather segment each. None: replicated.
+    head_major_runs: tuple[int, ...] | None = None
     unit_spec: PageUnitSpec | None = None
 
 
