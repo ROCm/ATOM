@@ -82,18 +82,27 @@ class ConnectorSourceTest(unittest.TestCase):
 
     def test_every_port_offset_call_passes_a_size(self):
         tree = ast.parse(self.source)
-        calls = [
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "get_port_offset"
-        ]
-        # Side channel, read notify, early-failure notify, handshake, write
-        # request, write report.
-        self.assertEqual(len(calls), 6)
+
+        def calls_to(name):
+            return [
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == name
+            ]
+
+        # Read notify, early-failure notify, handshake, write report.
+        calls = calls_to("get_port_offset")
+        self.assertEqual(len(calls), 4)
         for call in calls:
             self.assertEqual(len(call.args), 3, ast.unparse(call))
+        # Side channel and write request, which also place a PP stage: the TP
+        # size strides the DP ranks, and the stage count strides the stages.
+        staged = calls_to("side_channel_port_offset")
+        self.assertEqual(len(staged), 2)
+        for call in staged:
+            self.assertGreaterEqual(len(call.args), 5, ast.unparse(call))
 
     def test_a_short_remote_list_is_caught_before_the_pairing(self):
         body = self.segment("_read_blocks")
@@ -645,6 +654,17 @@ class WritePathTest(unittest.TestCase):
         conn._first_transfer_slot = 0
         conn._staged_sources = {}
         conn._config = None
+        # One stage, no DCP, pairing PAGE regions by position.
+        conn.pp_rank = 0
+        conn.pp_size = 1
+        conn.dcp_size = 1
+        conn.dcp_rank = 0
+        conn.dcp_interleave = 1
+        conn._pushes_done = {}
+        conn._write_reports_expected = {}
+        conn._write_report_counts = {}
+        conn._page_consumer_indices = None
+        conn._state_tp_split = {}
 
         conn.sent = []
         conn.writes = []
@@ -709,9 +729,9 @@ class WritePathTest(unittest.TestCase):
         conn.remote_moriio_metadata = {
             "engine": types.SimpleNamespace(num_state_slots=slots)
         }
-        conn._get_or_build_state_sessions = lambda engine_id: [
-            ("S-k", conv),
-            ("S-v", ssm),
+        conn._get_or_build_state_sessions = lambda engine_id, parts=1: [
+            ("kda.k", "S-k", conv),
+            ("kda.v", "S-v", ssm),
         ]
         return conn
 
@@ -967,7 +987,7 @@ class WritePathTest(unittest.TestCase):
         try:
             conn._write_requests.put(self.push_request())
             conn._write_wakeup.set()
-            self.wait_for(lambda: 9 in conn._sending_writes)
+            self.wait_for(lambda: (9, 0, 1) in conn._sending_writes)
             self.assertEqual(conn.sent, [])
             statuses[0].state = "ok"
             self.wait_for(lambda: conn.sent)
@@ -994,7 +1014,7 @@ class WritePathTest(unittest.TestCase):
 
         event.done = True
         conn._service_write_requests()
-        self.assertIn(9, conn._sending_writes)
+        self.assertIn((9, 0, 1), conn._sending_writes)
         # Another consumer rank may still ask for this transfer.
         self.assertIs(conn._kv_ready_events[9], event)
 
@@ -1016,7 +1036,7 @@ class WritePathTest(unittest.TestCase):
             conn.record_kv_cache_ready([9])
         conn._kv_ready_events[9].done = True
         conn._service_write_requests()
-        self.assertIn(9, conn._sending_writes)
+        self.assertIn((9, 0, 1), conn._sending_writes)
 
     def test_a_push_whose_prefill_never_reports_fails_after_the_write_timeout(self):
         conn = self.make(producer=True)
@@ -1068,9 +1088,9 @@ class WritePathTest(unittest.TestCase):
         conn = self.make(producer=True)
         conn._diag_post_ready = True
         started = time.monotonic()
-        conn._write_ids = {9: None}
+        conn._write_ids = {(9, 0, 1): None}
         conn._sending_writes = {
-            9: (
+            (9, 0, 1): (
                 [],
                 {
                     "transfer_id": 9,
@@ -1101,7 +1121,7 @@ class WritePathTest(unittest.TestCase):
 
         producer = self.make(producer=True)
         producer._sending_writes = {
-            9: ([], {"transfer_id": 9, "src_block_ids": [4, 5]})
+            (9, 0, 1): ([], {"transfer_id": 9, "src_block_ids": [4, 5]})
         }
         producer._pending_writes = [({"transfer_id": 3, "src_block_ids": [7]}, 0.0)]
         self.assertEqual(
@@ -1261,7 +1281,7 @@ class WritePathTest(unittest.TestCase):
         conn._write_requests.put(self.push_request())
 
         conn._service_write_requests()
-        self.assertIn(9, conn._sending_writes)
+        self.assertIn((9, 0, 1), conn._sending_writes)
         self.assertEqual(conn.done_sending, set())
         self.assertEqual(conn.sent, [])
 
@@ -1343,7 +1363,7 @@ class WritePathTest(unittest.TestCase):
 
         self.assertIsNone(conn._write_target_ready(request))
         self.assertIsNone(conn._write_target_ready(request))
-        self.assertEqual(submitted, [("10.0.0.2", 7400, 8, "10.0.0.2:7400_dp0", 0)])
+        self.assertEqual(submitted, [("10.0.0.2", 7400, 8, "10.0.0.2:7400_dp0", 0, 1)])
 
         future.set_result({"agent"})
         self.assertTrue(conn._write_target_ready(request))
@@ -1393,6 +1413,133 @@ class WritePathTest(unittest.TestCase):
         self.assertEqual(conn._write_reports, {})
         # late's WRITE_REQ may never have arrived, so the producer is told.
         self.assertEqual(len(conn.notified), 1)
+
+    def test_a_pp_consumer_asks_every_producer_stage(self):
+        """A PP8 x TP1 producer is one connector per stage: rank 1 of a TP8
+        consumer asks each stage on its node, at the stage's port (stage s of
+        TP1 listens s above the base), naming its own TP rank."""
+        conn = self.make(producer=False)
+        hosts = ["10.0.0.1"] * 4 + ["10.0.0.9"] * 4
+        meta = self.recv_meta([4, 5], [10, 11, 12])
+        meta.tp_size, meta.remote_pp_size, meta.remote_pp_hosts = 1, 8, hosts
+        conn._request_write("d1", meta)
+
+        self.assertEqual(
+            [(host, port) for _, host, port in conn.sent],
+            [(hosts[stage], 7301 + stage) for stage in range(8)],
+        )
+        requests = [self.msgpack.loads(frames[1]) for frames, _, _ in conn.sent]
+        self.assertEqual({r["decode_tp_rank"] for r in requests}, {1})
+        self.assertEqual(requests[0]["dst_block_ids"], [4, 5])
+        self.assertEqual(conn._write_reports_expected, {"d1": 8})
+        self.assertIn("d1", conn._awaiting_write)
+
+    def test_a_receive_from_every_stage_completes_once_all_report(self):
+        conn = self.make(producer=False)
+        conn._write_reports_expected = {"d1": 3, "d2": 2}
+        conn._record_write_report("d1", True)
+        conn._record_write_report("d1", True)
+        conn._record_write_report("d2", True)
+        conn._record_write_report("d2", False)
+        # d2 failed in one stage, so the whole receive fails.
+        self.assertEqual(conn._write_reports, {"d2": False})
+        conn._record_write_report("d1", True)
+        self.assertEqual(conn._write_reports, {"d2": False, "d1": True})
+        self.assertEqual(conn._write_reports_expected, {})
+        self.assertEqual(conn._write_report_counts, {})
+
+    def test_a_dcp_consumer_takes_whole_blocks_from_a_producer_without_dcp(self):
+        """Producer block j is rank j % 8's local block j // 8 when the
+        consumer interleaves whole blocks over DCP 8."""
+        conn = self.make(producer=False)
+        conn.dcp_size, conn.dcp_rank = 8, 3
+        conn.dcp_interleave = conn.kv_cache_block_size
+        meta = self.recv_meta([40, 41, 42], [])
+        meta.remote_dcp_size = 1
+        src, dst = conn._block_pairs("d1", meta, list(range(100, 120)), [40, 41, 42], 0)
+        self.assertEqual((src, dst), ([103, 111, 119], [40, 41, 42]))
+        # Past the producer's last block this rank's share of a virtual block is
+        # empty, and its block is left alone.
+        src, dst = conn._block_pairs("d1", meta, list(range(100, 110)), [40, 41], 0)
+        self.assertEqual((src, dst), ([103], [40]))
+        # A reused prefix of one virtual block skips the producer's first eight.
+        src, dst = conn._block_pairs("d1", meta, list(range(100, 120)), [40, 41, 42], 1)
+        self.assertEqual((src, dst), ([111, 119], [41, 42]))
+        # At equal DCP the blocks pair block for block past the reused ones.
+        meta.remote_dcp_size = 8
+        self.assertEqual(
+            conn._block_pairs("d1", meta, [7, 8, 9], [1, 2], 1), ([8, 9], [2])
+        )
+
+    def test_a_token_interleaved_consumer_is_refused_a_producer_without_dcp(self):
+        conn = self.make(producer=False)
+        conn.dcp_size, conn.dcp_rank, conn.dcp_interleave = 8, 3, 1
+        meta = self.recv_meta([40], list(range(100, 108)))
+        meta.remote_dcp_size = 1
+        with self.assertRaises(ValueError):
+            conn._block_pairs("d1", meta, list(range(100, 108)), [40], 0)
+        # And the receive fails before asking anyone.
+        conn._request_write("d1", meta)
+        self.assertEqual(conn.sent, [])
+        self.assertIn("d1", conn._failed_before_read)
+
+    def test_a_tp1_stage_frees_its_source_after_every_consumer_rank(self):
+        """One TP1 stage serves all 8 ranks of a TP8 consumer from the same
+        source blocks; they go with the last push, and each rank hears back on
+        its own port."""
+        conn = self.make(producer=True)
+        conn.tp_rank, conn.tp_size = 0, 1
+        conn._write_target_ready = lambda request: True
+        conn._write_blocks = lambda request, engine_id: [FakeStatus("ok")]
+        for rank in range(7):
+            conn._write_requests.put(self.push_request(decode_tp_rank=rank))
+        conn._service_write_requests()
+        self.assertEqual(conn.done_sending, set())
+        self.assertEqual(sorted(port for _, _, port in conn.sent), [7400 + r for r in range(7)])
+        conn._write_requests.put(self.push_request(decode_tp_rank=7))
+        conn._service_write_requests()
+        self.assertEqual(conn.done_sending, {9})
+        self.assertEqual(conn._pushes_done, {})
+        self.assertEqual(len(conn._write_ids), 8)
+
+    def test_a_consumer_at_eight_times_the_tp_takes_its_share_of_every_run(self):
+        """Rank 5 of 8 takes the sixth eighth of each run of a slot: six conv
+        runs of 8 bytes and one SSM run of 128."""
+        conn = self.make(producer=True)
+        conn.tp_rank, conn.tp_size = 0, 1
+        self.make_stateful(conn, conv=48, ssm=128)
+        conn._state_tp_split = {"kda.k": (8,) * 6, "kda.v": (128,)}
+        writes = conn._state_writes(
+            self.push_request(decode_tp_rank=5, src_slot_index=2, dst_slot_index=3),
+            "engine",
+        )
+        conv, ssm = writes
+        self.assertEqual(conv[0], "S-k")
+        self.assertEqual(conv[1], [1] * 6)
+        self.assertEqual(conv[2], [2 * 48 + run * 8 + 5 for run in range(6)])
+        self.assertEqual(conv[3], [3 * 6 + run for run in range(6)])
+        self.assertEqual(ssm[1:], ([16], [2 * 128 + 5 * 16], [3 * 16]))
+
+    def test_a_pp_stage_writes_its_regions_into_the_consumers_layers(self):
+        import types
+
+        conn = self.make(producer=True)
+        conn._page_desc = b"ours"
+        conn._page_regions = [(0, 8, "mla"), (100, 8, "mla")]
+        conn._page_consumer_indices = [1, 3]
+        conn.remote_moriio_metadata = {
+            "engine": types.SimpleNamespace(
+                page_desc=b"theirs",
+                page_regions=[[0, 8, "mla"], [50, 8, "mla"], [90, 8, "mla"], [130, 8, "mla"]],
+            )
+        }
+        conn.moriio_wrapper.build_session = lambda ours, theirs: "S"
+        conn.moriio_wrapper.get_unpack_memory_metadata = lambda desc: desc
+        with mock.patch.object(
+            self.connector_module, "desc_fabric_info", lambda desc: (True, 1)
+        ):
+            session, regions = conn._get_or_build_page_session("engine")
+        self.assertEqual((session, regions), ("S", [(50, 8), (130, 8)]))
 
     def test_a_failed_push_is_reported_only_once_no_write_is_in_flight(self):
         conn = self.make(producer=True)
@@ -1799,14 +1946,14 @@ class WritePathTest(unittest.TestCase):
         conn.remote_moriio_metadata = {
             "engine": self.types.SimpleNamespace(num_state_slots=6)
         }
-        conn._get_or_build_state_sessions = lambda engine_id: [
-            (f"S-{name}", slot_bytes)
+        conn._get_or_build_state_sessions = lambda engine_id, parts=1: [
+            (name, f"S-{name}", slot_bytes)
             for name, (_d, slot_bytes, _t) in conn._state_tensors.items()
         ]
         writes = conn._state_writes(
             self.push_request(src_slot_index=2, dst_slot_index=5), "engine"
         )
-        self.assertIn((f"S-{cursor_name}", 4, 8, 20), writes)
+        self.assertIn((f"S-{cursor_name}", [4], [8], [20]), writes)
         self.assertEqual(len(writes), len(conn._state_tensors))
 
         before = conn._state_digest(2)
@@ -1904,7 +2051,7 @@ class WritePathTest(unittest.TestCase):
         conn._first_transfer_slot = 4
         self.pending_push(conn, 2)
         conn._service_write_requests()
-        self.assertIn(9, conn._sending_writes)
+        self.assertIn((9, 0, 1), conn._sending_writes)
 
     def test_a_transfer_slot_is_pushed_only_once_its_copy_landed(self):
         conn = self.make_stateful(self.make(producer=True), slots=6)
@@ -1922,7 +2069,7 @@ class WritePathTest(unittest.TestCase):
         landed.done = True
         conn._service_write_requests()
         self.assertEqual(conn._pending_writes, [])
-        self.assertIn(9, conn._sending_writes)
+        self.assertIn((9, 0, 1), conn._sending_writes)
         self.assertIn(("S-v", [640], [640], [128]), conn.writes)
 
     def test_a_push_from_a_slot_it_was_not_staged_into_fails(self):
@@ -2040,7 +2187,10 @@ class WritePathTest(unittest.TestCase):
         sessions = conn._get_or_build_state_sessions("engine")
         self.assertEqual(
             sessions,
-            [((b"k-ours", b"k-theirs"), 24), ((b"v-ours", b"v-theirs"), 128)],
+            [
+                ("kda.k", (b"k-ours", b"k-theirs"), 24),
+                ("kda.v", (b"v-ours", b"v-theirs"), 128),
+            ],
         )
         # Built once per consumer.
         conn.moriio_wrapper.build_session = None
@@ -2100,6 +2250,9 @@ class SchedulerSlotTest(unittest.TestCase):
         sched.base_handshake_port = 7300
         sched.tp_size = 8
         sched.dp_rank = 0
+        sched.dcp_size = 1
+        sched.pp_size = 1
+        sched.pp_stage_hosts = []
         sched._reqs_need_recv = {}
         sched._awaiting_send = set()
         sched.hash_block_size = 4
