@@ -289,9 +289,7 @@ class BlockManager:
         self._event_log: list[KVCacheEvent] | None = (
             [] if self._events_enabled else None
         )
-        # The compressed KV blocks. Same class the sliding window uses for its
-        # own index space — hash eviction has to happen at the same moment in
-        # both or a prefix hit could be honoured by one pool and not the other.
+        # The paged KV blocks: one pool, indexed by prefix hash.
         self.kv = BlockPool(
             num_blocks,
             on_evict=self._record_evicted,
@@ -956,19 +954,13 @@ class BlockManager:
     ) -> int:
         """Rightmost boundary every Pool.STATE class can resume from.
 
-        Each class answers "the rightmost boundary <= X that I accept", and no
-        class is monotone in another's answer, so they cannot be applied in
-        series: the largest SWA-complete boundary need not carry a state
-        checkpoint, and walking back to one that does can land on a boundary
-        whose trailing SWA window is gone. `allocate` then calls
-        `swa.claim_cached` for a hash the SWA pool never promised — which is
-        exactly the guarantee that method's docstring asks the caller for.
-
-        So run to a fixpoint: keep passing the candidate around the classes
-        until a full round changes nothing. Every answer is <= its input, so
-        each round either terminates or strictly decreases; 0 is absorbing.
-        Classes that do not apply are the identity, so a build with one class
-        settles on the first round.
+        Each class answers "the rightmost boundary <= X that I accept", and one
+        class need not be monotone in another's answer, so they cannot be
+        applied in series. Run to a fixpoint instead: keep passing the candidate
+        around the classes until a full round changes nothing. Every answer is
+        <= its input, so each round either terminates or strictly decreases; 0
+        is absorbing. `state_caches` holds the state checkpoint cache alone
+        today, so this settles on the first round.
 
         `assume_checkpointed` passes straight through to every class, giving the
         joint counterfactual: not "the answer minus one class's gate" but "the
@@ -1269,30 +1261,27 @@ class BlockManager:
             return 0
         # Step 1: compressed prefix (CSA/HCA/indexer share the block hash and
         # read the WHOLE history, so this stays a full front-to-back chained
-        # match). Record each block's hash for the SWA scan below.
+        # match). Record each block's hash for the state gate below.
         walk = walk_of(seq)
         if block_hashes is None:
             block_hashes = walk.hashes  # read, never extended, below
         else:
             block_hashes += walk.hashes
         compressed_hit = len(walk.hashes)
-        # Step 2: SWA only needs the trailing window before the boundary to be
-        # present (SWA is local). Scan right-to-left within the compressed prefix
-        # for the largest boundary whose window is SWA-cached (vLLM
-        # SlidingWindowManager; simple-hybrid one pass). Reduces compressed_hit
-        # → num_cached_blocks so we never reuse a block whose in-window SWA is
-        # gone (#1417), while out-of-window front blocks (SWA-freed) don't block
-        # the hit —
-        # plus step 3, the per-request state: neither the SSM recurrent state nor
-        # the V4 compressor ring can be rebuilt from cached blocks — the cache
-        # holds the compressor's output, the state is its rolling input window —
-        # so a boundary is only resumable where somebody checkpointed the state.
-        # `_gated_hit` settles the two gates jointly; neither can be applied to
-        # the other's answer.
-        resumable = self._gated_hit(seq, compressed_hit, block_hashes)
-        # A checkpoint far below the compressed hit loses to a bounded replay,
-        # which keeps the whole hit and rebuilds the state at its end.
-        num_cached_blocks = self._replay_hit(seq, compressed_hit, resumable)
+        # Step 2, the per-request state: neither the SSM recurrent state nor the
+        # V4 compressor ring can be rebuilt from cached blocks -- the cache holds
+        # the compressor's output, the state is its rolling input window -- so a
+        # boundary is only resumable where somebody checkpointed the state
+        # (`_gated_hit`). A P/D receive whose producer pushes the state whole
+        # resumes nothing, so its hash hit stands.
+        if seq.state_from_peer:
+            # Nothing resumes from the prefix: the producer pushes the state.
+            resumable = num_cached_blocks = compressed_hit
+        else:
+            resumable = self._gated_hit(seq, compressed_hit, block_hashes)
+            # A checkpoint far below the compressed hit loses to a bounded
+            # replay, which keeps the whole hit and rebuilds the state at its end.
+            num_cached_blocks = self._replay_hit(seq, compressed_hit, resumable)
         # Instrumentation: the pre-gate hit, so EngineStats can separate reuse
         # the gates declined (compressed_hit - num_cached_blocks) from reuse
         # lost to compressed eviction (everything above compressed_hit).
@@ -1516,7 +1505,8 @@ class BlockManager:
         cost, with the walk memoised per seq. The same `_evaluate`, so state
         room, the gates, the replay, checkpoint demand/end, the used hit blocks
         and the fit are re-asked on every call, and the answer is the exact
-        probe's.
+        probe's. One exception: before a P/D receive's first lookup sets
+        `seq.state_from_peer`, planning sees the gated hit that admission lifts.
 
         The walk is reused while nothing it read moved: no `watched` hash was
         evicted or remapped to another block (`_note_index_change`; more than
@@ -1645,8 +1635,11 @@ class BlockManager:
 
         The joint boundary when there is one (above the HBM hit by
         construction), else the HBM hit's last block. A replay rebuilds the
-        state instead of restoring it, so it resumes from none.
+        state instead of restoring it, and a P/D producer pushes it whole, so
+        either resumes from none.
         """
+        if seq.state_from_peer:
+            return -1
         if joint_hash != -1:
             return joint_hash
         return -1 if self.tier_resume_replays(seq) else hit_hash
@@ -1676,8 +1669,7 @@ class BlockManager:
           - the hit can be lowered at all: no joint boundary, and a request
             state that is rebuilt by replay (or none);
           - every cache class still accepts the lowered boundary -- the same
-            SWA-window and state gates `can_allocate` applied to the original,
-            so a lowered hit never claims a block whose window is gone;
+            state gate `can_allocate` applied to the original;
           - the pool can give the extra fresh blocks.
         Otherwise leaves `probe` untouched and returns False.
         """
@@ -3333,8 +3325,7 @@ class BlockManager:
         against. Unset means the prompt's remainder, the prefill answer; decode
         passes 1 or 0. Everything else follows from that one number — a class
         needing a long hand-over (V4's ring, 131) simply never qualifies
-        mid-generation, one that hands nothing over (a retaining SWA pool, 0)
-        always does, one that cannot keep a checkpoint at all (`inf`) never
+        mid-generation, one that cannot keep a checkpoint at all (`inf`) never
         does, and a request stopping on this step passes 0 and keeps nothing
         that nothing will ever resume from. A decode boundary (`snapshot_step`
         >= 0) is kept only by a class whose `decode_keep` is not `KEEP_NONE`.

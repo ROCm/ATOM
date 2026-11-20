@@ -528,6 +528,9 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         # Opt into the scheduler's offload suffix-prefill path if any sub is the
         # offload backend (Scheduler._is_offload_connector reads this).
         self.is_offload = any(c.is_offload for c in self._connectors)
+        self.may_receive_suffix_and_state = any(
+            c.may_receive_suffix_and_state for c in self._connectors
+        )
         self.enable_chunked_transfer = any(
             getattr(c, "enable_chunked_transfer", False) and c.is_producer
             for c in self._connectors
@@ -631,6 +634,12 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             and self._connectors[0].supports_pd_admission
             and all(c.is_offload for c in self._connectors[1:])
         )
+
+    def receives_suffix_and_state(self, seq) -> bool:
+        # The leg that won this request's lookup moves it; an offload leg never
+        # brings the state.
+        winner = self._load_winner.get(seq.id)
+        return winner is not None and winner.receives_suffix_and_state(seq)
 
     def pd_receive_block_offset(self, seq, num_blocks, num_cached_blocks):
         winner = self._load_winner.get(seq.id)
