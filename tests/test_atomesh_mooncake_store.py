@@ -626,13 +626,27 @@ done
                     **env,
                 )
                 self.assertIn("needs the decode on nodes of its own", result.stderr)
+        # A prefill worker's second node starts masters no decode owner joins.
         for n_decode in ("1", "2"):
+            with self.subTest(prefill_nodes_per_worker="2", n_decode=n_decode):
+                result = self.run_shell(
+                    "check_mooncake_store_settings\n",
+                    expect_rc=2,
+                    **decode_owners,
+                    ATOMESH_PD_WORKER_LAYOUT="multi_node",
+                    xP="1",
+                    yD=n_decode,
+                    PREFILL_NODES_PER_WORKER="2",
+                )
+                self.assertIn("prefill nodes_per_worker, here 2", result.stderr)
+        for n_decode, decode_nodes_per_worker in (("1", "1"), ("2", "1"), ("1", "2")):
             self.run_shell(
                 "check_mooncake_store_settings\n",
                 **decode_owners,
                 ATOMESH_PD_WORKER_LAYOUT="multi_node",
                 xP="1",
                 yD=n_decode,
+                DECODE_NODES_PER_WORKER=decode_nodes_per_worker,
             )
         # Packed nodes: the decode-only node is every node but the prefill's.
         for placement, n_prefill, n_decode in (
