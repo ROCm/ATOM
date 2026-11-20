@@ -1234,3 +1234,378 @@ def test_block_writes_and_reads_stay_inside_the_allocated_blocks():
     draft.prepare_paged_block(None, None, pos, slots, ctx, [1, 2], 2, vblock)
     assert slots.tolist() == [[10, 11, -1], [20, 21, 22], [-1, -1, -1]]
     assert ctx.tolist() == [vblock, 8, 1 + T]
+
+
+# --------------------------------------------------------------------------
+# ATOM_K3_DRAFT_QKROPE: q/k norm, rope and the pool write as one aiter call
+# --------------------------------------------------------------------------
+
+_HQ, _HKV, _D = 4, 2, 64
+
+
+class _Rope:
+    """The draft's rope as the layer reads it: aiter's cos / sin tables and its
+    style. Called only by the unfused chain, which `calls` records."""
+
+    is_neox_style = True
+
+    def __init__(self, torch):
+        self.cos_cache = torch.rand(64, 1, 1, _D // 2).to(torch.bfloat16)
+        self.sin_cache = torch.rand(64, 1, 1, _D // 2).to(torch.bfloat16)
+        self.calls = []
+
+    def __call__(self, positions, q, k=None):
+        self.calls.append("rope")
+        return q if k is None else (q, k)
+
+
+class _BlockRead:
+    """The block read: built for one pool dtype, and records the q it reads."""
+
+    def __init__(self, kv_dtype):
+        self.kv_dtype = kv_dtype
+        self.q = None
+
+    def check_cache(self, k_cache, v_cache):
+        assert k_cache.dtype == v_cache.dtype == self.kv_dtype
+
+    def __call__(self, q, k_cache, v_cache, block_tables, kv_lens, k_ds, v_ds):
+        self.q = q
+        return q
+
+
+def _gqa_layer(monkeypatch, kv_dtype, flag="1", layer_num=0):
+    """A real `KimiK3DSparkGQAAttention` at a toy width, built as the draft
+    builds it. Its projections hand back the packed rows they are given, and
+    its block read records what it reads."""
+    torch = pytest.importorskip("torch")
+    from atom.config import SpeculativeConfig
+
+    mod = gpu_stack_import("atom.models.kimi_k3_dspark_gqa")
+    group = types.SimpleNamespace(rank_in_group=0, world_size=1)
+    monkeypatch.setattr(
+        gpu_stack_import("atom.model_ops.linear"), "get_tp_group", lambda: group
+    )
+    monkeypatch.setattr(
+        gpu_stack_import("atom.model_ops.layernorm"),
+        "get_tensor_model_parallel_world_size",
+        lambda: 1,
+    )
+    rope = _Rope(torch)
+    monkeypatch.setattr(mod, "get_rope", lambda *a, **k: rope)
+    monkeypatch.setenv("ATOM_K3_DRAFT_QKROPE", flag)
+    hf = _radixark_cfg(
+        hidden_size=_HQ * _D, num_attention_heads=_HQ, num_key_value_heads=_HKV
+    )
+    SpeculativeConfig.hf_config_override(hf, model_path=None)
+    attn = mod.KimiK3DSparkGQAAttention(hf, layer_num)
+    read = _BlockRead(kv_dtype)
+    attn.use_block_read(read)
+    attn.projected = []
+
+    def project(x):
+        attn.projected.append(x.clone())
+        return attn.projected[-1]
+
+    monkeypatch.setattr(attn.qkv_proj, "forward", project)
+    monkeypatch.setattr(attn.o_proj, "forward", lambda o: o)
+    return mod, attn, read, rope
+
+
+def _bind(attn, kv_dtype):
+    """Bind a FLASH pool as `DraftKvBuilder` does: check, then the views and
+    the draft's one shared unit scale."""
+    import torch
+
+    k_cache = torch.zeros(4, 16, _HKV, _D).to(kv_dtype)
+    v_cache = torch.zeros_like(k_cache)
+    attn.kv.check_cache(k_cache, v_cache)
+    attn.kv.k_scale = attn.kv.v_scale = torch.ones(1)
+    attn.kv.k_cache, attn.kv.v_cache = k_cache, v_cache
+
+
+def _record_fused(monkeypatch, mod):
+    """Stand in for aiter's op, bound against its real signature. q comes back
+    as 7s, the op's in-place output, so the read can be traced to it."""
+    import inspect
+
+    real = inspect.signature(mod.fused_qk_rope_reshape_and_cache)
+    calls = []
+
+    def fused(*args, **kwargs):
+        bound = real.bind(*args, **kwargs)
+        bound.apply_defaults()
+        calls.append(bound.arguments)
+        if bound.arguments["q_out"] is not None:
+            bound.arguments["q_out"].fill_(7)
+
+    monkeypatch.setattr(mod, "fused_qk_rope_reshape_and_cache", fused)
+    return calls
+
+
+def _record_chain(monkeypatch, mod, attn, rope):
+    """The unfused launches, recorded in order."""
+    seen = rope.calls
+
+    def qk_norm(q, k):
+        seen.append("qk_norm")
+        return q, k
+
+    def k_norm(k):
+        seen.append("k_norm")
+        return k
+
+    monkeypatch.setattr(attn, "qk_norm", qk_norm)
+    monkeypatch.setattr(attn.k_norm, "forward", k_norm)
+    monkeypatch.setattr(
+        mod.aiter, "reshape_and_cache_flash", lambda *a: seen.append("cache")
+    )
+    return seen
+
+
+def _block_pass(monkeypatch, mod, attn, n=5):
+    """One block pass over `n` packed q | k | v rows, with a slot mapping
+    padded past `n`, as the captured graph's is."""
+    import torch
+
+    width = (_HQ + 2 * _HKV) * _D
+    meta = types.SimpleNamespace(
+        slot_mapping=torch.arange(n + 3) * 2,
+        block_tables=torch.zeros(1, 1, dtype=torch.int32),
+        context_lens=torch.full((1,), n, dtype=torch.int32),
+    )
+    monkeypatch.setattr(
+        mod,
+        "get_forward_context",
+        lambda: types.SimpleNamespace(attn_metadata=meta),
+    )
+    positions = torch.arange(n) + 3
+    out = attn.forward(positions, torch.randn(n, width).to(torch.bfloat16))
+    return meta, positions, out
+
+
+@pytest.mark.parametrize("fp8", [True, False])
+def test_gqa_fused_qk_rope_block_pass_is_one_aiter_call(monkeypatch, fp8):
+    """Flag on, pool bound: one `fused_qk_rope_reshape_and_cache` in place on
+    the projection's own q | k | v rows, with the layer's norm weights, the
+    rope's tables and the pool's scale, and the read takes the q it wrote."""
+    torch = pytest.importorskip("torch")
+    kv_dtype = torch.float8_e4m3fn if fp8 else torch.bfloat16
+    mod, attn, read, rope = _gqa_layer(monkeypatch, kv_dtype)
+    assert attn.fused_qk_rope
+    _bind(attn, kv_dtype)
+    calls = _record_fused(monkeypatch, mod)
+    chain = _record_chain(monkeypatch, mod, attn, rope)
+    n = 5
+    meta, positions, _ = _block_pass(monkeypatch, mod, attn, n)
+
+    assert not chain
+    (c,) = calls
+    rows = attn.projected[-1]
+    q_bytes, kv_bytes = _HQ * _D * 2, _HKV * _D * 2
+    assert c["q"].shape == (n, _HQ, _D) and c["q"].data_ptr() == rows.data_ptr()
+    assert c["k"].shape == (n, _HKV, _D)
+    assert c["k"].data_ptr() == rows.data_ptr() + q_bytes
+    assert c["v"].data_ptr() == rows.data_ptr() + q_bytes + kv_bytes
+    assert c["q_out"] is c["q"] and c["k_out"] is c["k"]
+    assert read.q.data_ptr() == rows.data_ptr() and bool((read.q == 7).all())
+    assert c["slot_mapping"].tolist() == meta.slot_mapping[:n].tolist()
+    assert c["pos"] is positions
+    assert c["key_cache"] is attn.kv.k_cache and c["value_cache"] is attn.kv.v_cache
+    assert c["k_scale"] is attn.kv.k_scale and c["v_scale"] is attn.kv.v_scale
+    assert c["cos"] is rope.cos_cache and c["sin"] is rope.sin_cache
+    assert c["is_neox"] is True and c["flash_layout"] is True
+    assert c["upcast_operand"] is True and c["output_zeros"] is False
+    assert c["apply_scale"] is fp8 and c["saturate_fp8"] is fp8
+    assert c["q_norm_weight"] is attn.q_norm.weight
+    assert c["k_norm_weight"] is attn.k_norm.weight
+    assert c["norm_eps"] == attn.k_norm.eps == attn.q_norm.eps
+
+
+def test_gqa_fused_qk_rope_context_write_caches_k_without_a_query(monkeypatch):
+    """The context write passes its k | v projection alone: no q, no q norm."""
+    torch = pytest.importorskip("torch")
+    mod, attn, _, rope = _gqa_layer(monkeypatch, torch.float8_e4m3fn)
+    _bind(attn, torch.float8_e4m3fn)
+    calls = _record_fused(monkeypatch, mod)
+    chain = _record_chain(monkeypatch, mod, attn, rope)
+    projected = []
+
+    def mm(x, w, bias):
+        assert w.shape[0] == 2 * _HKV * _D and bias is None
+        projected.append(torch.randn(x.shape[0], w.shape[0]).to(torch.bfloat16))
+        return projected[-1]
+
+    monkeypatch.setattr(mod.tgemm, "mm", mm)
+    positions, slots = torch.arange(6), torch.arange(6) + 9
+    attn.write_context_kv(torch.zeros(6, _HQ * _D), positions, slots)
+
+    assert not chain
+    (c,) = calls
+    assert c["q"] is None and c["q_out"] is None and c["q_norm_weight"] is None
+    assert c["k_norm_weight"] is attn.k_norm.weight
+    assert c["k"].data_ptr() == projected[0].data_ptr()
+    assert c["v"].data_ptr() == projected[0].data_ptr() + _HKV * _D * 2
+    assert c["pos"] is positions and c["slot_mapping"].tolist() == slots.tolist()
+    assert c["apply_scale"] is True and c["saturate_fp8"] is True
+
+
+def test_gqa_fused_qk_rope_off_keeps_the_unfused_launches(monkeypatch):
+    """ATOM_K3_DRAFT_QKROPE=0: both passes run the unfused launches."""
+    torch = pytest.importorskip("torch")
+    mod, attn, read, rope = _gqa_layer(monkeypatch, torch.bfloat16, flag="0")
+    assert not attn.fused_qk_rope
+    _bind(attn, torch.bfloat16)
+    calls = _record_fused(monkeypatch, mod)
+    chain = _record_chain(monkeypatch, mod, attn, rope)
+    _block_pass(monkeypatch, mod, attn)
+    monkeypatch.setattr(
+        mod.tgemm, "mm", lambda x, w, b: torch.zeros(x.shape[0], w.shape[0])
+    )
+    attn.write_context_kv(torch.zeros(3, _HQ * _D), torch.arange(3), torch.arange(3))
+    assert not calls
+    assert chain == ["qk_norm", "rope", "cache", "k_norm", "rope", "cache"]
+    assert read.q is not None
+
+
+def test_gqa_fused_qk_rope_warmup_without_a_pool_keeps_the_chain(monkeypatch):
+    """Warmup runs before the pool is bound: the unfused norm and rope, and a
+    zero output with no write and no read."""
+    torch = pytest.importorskip("torch")
+    mod, attn, read, rope = _gqa_layer(monkeypatch, torch.bfloat16)
+    assert attn.fused_qk_rope and not attn.kv.bound
+    calls = _record_fused(monkeypatch, mod)
+    chain = _record_chain(monkeypatch, mod, attn, rope)
+    _, _, out = _block_pass(monkeypatch, mod, attn)
+    assert not calls and chain == ["qk_norm", "rope"]
+    assert read.q is None and not out.any()
+
+
+def test_gqa_fused_qk_rope_is_inert_on_a_fnuz_pool_and_says_so_once(
+    monkeypatch, caplog
+):
+    """gfx942's fnuz fp8 pool is not one the fused write is validated on: every
+    layer keeps the unfused launches, decided when it gets its read, and the
+    log says so once, not once a layer."""
+    import logging
+
+    torch = pytest.importorskip("torch")
+    mod = gpu_stack_import("atom.models.kimi_k3_dspark_gqa")
+    mod._fused_qk_rope_takes.cache_clear()
+    monkeypatch.setattr(mod, "_fused_qk_rope_takes", mod._fused_qk_rope_takes)
+    caplog.set_level(logging.INFO, logger="atom")
+    for layer in range(3):
+        _, attn, _, _ = _gqa_layer(monkeypatch, torch.float8_e4m3fnuz, layer_num=layer)
+        assert not attn.fused_qk_rope
+    inert = [r for r in caplog.records if "ATOM_K3_DRAFT_QKROPE is inert" in r.message]
+    assert len(inert) == 1
+    mod._fused_qk_rope_takes.cache_clear()
+
+
+def _gpu_qkrope_ab(monkeypatch, n, kv_dtype):
+    """The block pass and the context write through the real layer at
+    Kimi-K3's per-rank TP8 heads (8 q, 2 kv, head 64), with the real aiter
+    launches, for ATOM_K3_DRAFT_QKROPE=1 and =0. Returns, per flag, the q the
+    read took and the K / V pools after each pass."""
+    import torch
+
+    from atom.config import SpeculativeConfig
+
+    mod = gpu_stack_import("atom.models.kimi_k3_dspark_gqa")
+    group = types.SimpleNamespace(rank_in_group=0, world_size=1)
+    monkeypatch.setattr(
+        gpu_stack_import("atom.model_ops.linear"), "get_tp_group", lambda: group
+    )
+    monkeypatch.setattr(
+        gpu_stack_import("atom.model_ops.layernorm"),
+        "get_tensor_model_parallel_world_size",
+        lambda: 1,
+    )
+    hq, hkv, d, dev = 8, 2, 64, torch.device("cuda")
+    hf = _radixark_cfg(
+        hidden_size=hq * d, num_attention_heads=hq, num_key_value_heads=hkv
+    )
+    SpeculativeConfig.hf_config_override(hf, model_path=None)
+    gen = torch.Generator(device=dev).manual_seed(0)
+    qkv = (torch.randn(n, (hq + 2 * hkv) * d, device=dev, generator=gen) * 2).to(
+        torch.bfloat16
+    )
+    ctx = torch.randn(n, hq * d, device=dev, generator=gen).to(torch.bfloat16)
+    q_w = (torch.rand(d, device=dev, generator=gen) + 0.5).to(torch.bfloat16)
+    k_w = (torch.rand(d, device=dev, generator=gen) + 0.5).to(torch.bfloat16)
+    w_qkv = torch.randn((hq + 2 * hkv) * d, hq * d, device=dev, generator=gen)
+    positions = torch.randint(0, 200000, (n,), device=dev, generator=gen)
+    slots = torch.randperm(64 * 16, device=dev, generator=gen)[:n]
+    meta = types.SimpleNamespace(
+        slot_mapping=slots,
+        block_tables=torch.zeros(1, 1, dtype=torch.int32, device=dev),
+        context_lens=torch.full((1,), n, dtype=torch.int32, device=dev),
+    )
+    monkeypatch.setattr(
+        mod, "get_forward_context", lambda: types.SimpleNamespace(attn_metadata=meta)
+    )
+    out = {}
+    for flag in ("1", "0"):
+        monkeypatch.setenv("ATOM_K3_DRAFT_QKROPE", flag)
+        default_dtype = torch.get_default_dtype()
+        torch.set_default_dtype(torch.bfloat16)
+        try:
+            with dev:
+                attn = mod.KimiK3DSparkGQAAttention(hf, 0)
+        finally:
+            torch.set_default_dtype(default_dtype)
+        read = _BlockRead(kv_dtype)
+        attn.use_block_read(read)
+        assert attn.fused_qk_rope is (flag == "1")
+        with torch.no_grad():
+            attn.q_norm.weight.copy_(q_w)
+            attn.k_norm.weight.copy_(k_w)
+            attn.qkv_proj.weight.copy_(w_qkv)
+        monkeypatch.setattr(attn.qkv_proj, "forward", lambda x: x.clone())
+        monkeypatch.setattr(attn.o_proj, "forward", lambda o: o)
+        k_cache = torch.zeros(64, 16, hkv, d, device=dev).to(kv_dtype)
+        v_cache = torch.zeros_like(k_cache)
+        attn.kv.check_cache(k_cache, v_cache)
+        attn.kv.k_scale = attn.kv.v_scale = torch.ones(1, device=dev)
+        attn.kv.k_cache, attn.kv.v_cache = k_cache, v_cache
+        attn.forward(positions, qkv)
+        block = (read.q.clone(), k_cache.clone(), v_cache.clone())
+        k_cache.zero_(), v_cache.zero_()
+        attn.write_context_kv(ctx, positions, slots)
+        out[flag] = block + (k_cache.clone(), v_cache.clone())
+    torch.cuda.synchronize()
+    return out
+
+
+@pytest.mark.parametrize("n", [24, 512])
+@pytest.mark.parametrize("fp8", [True, False])
+def test_gqa_fused_qk_rope_matches_the_unfused_launches_on_gpu(monkeypatch, n, fp8):
+    """On a GPU, `_gpu_qkrope_ab`: flag on against off. The fp32 sum of squares
+    may round otherwise: a normed value one bf16 ulp off, which the rope
+    carries into q and k, and a k element an fp8 (or bf16) step off. v is
+    copied and must match exactly. Opt in with RUN_QKROPE_GPU_TESTS=1."""
+    import os
+
+    torch = pytest.importorskip("torch")
+    if os.environ.get("RUN_QKROPE_GPU_TESTS") != "1" or not torch.cuda.is_available():
+        pytest.skip(
+            "GPU A/B against the unfused aiter launches: RUN_QKROPE_GPU_TESTS=1"
+        )
+    kv_dtype = torch.float8_e4m3fn if fp8 else torch.bfloat16
+    out = _gpu_qkrope_ab(monkeypatch, n, kv_dtype)
+    d = 64
+
+    def close(got, want, step):
+        """Mostly exact; a value that moved, moved at most `step` of its
+        head's largest magnitude."""
+        a, b = got.float().reshape(-1, d), want.float().reshape(-1, d)
+        assert float((a == b).float().mean()) >= 0.99
+        bound = b.abs().amax(-1, keepdim=True) * step
+        assert bool(((a - b).abs() <= bound).all())
+
+    on, off = out["1"], out["0"]
+    close(on[0], off[0], 2**-6)  # q
+    close(on[1], off[1], 2**-3)  # K, block pass
+    close(on[3], off[3], 2**-3)  # K, context write
+    for got, want in ((on[2], off[2]), (on[4], off[4])):  # V, both passes
+        assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
