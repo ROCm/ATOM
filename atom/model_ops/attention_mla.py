@@ -1549,9 +1549,11 @@ class MLAAttention(nn.Module):
         ):
             return
         config = get_current_atom_config()
+        # The rows a step can gather grow with its tokens, which a real step
+        # takes up to the batch budget, more than a short dummy prefill.
         kv_rows = dcp_sparse_prefill_kv_profile_rows(
             mode,
-            num_tokens,
+            max(num_tokens, config.max_num_batched_tokens),
             self.num_heads,
             config.max_num_seqs,
             config.kv_cache_block_size,

@@ -222,6 +222,9 @@ def _builder(monkeypatch, plan, nonps):
     b.model_runner = SimpleNamespace(
         forward_vars={f"sparse_prefill_{n}": n for n in PERSISTENT_WORK_BUFFERS}
     )
+    b._sparse_prefill_work_views = lambda prefix, heads: {
+        n: n for n in PERSISTENT_WORK_BUFFERS
+    }
     b._dcp_sparse_prefill_kv_plan = lambda batch: seen.append("plan") or plan
     monkeypatch.setattr(
         aiter_mla, "get_mla_metadata_v1", lambda *a, **k: seen.append(a[3])
@@ -323,6 +326,62 @@ def test_the_work_buffers_fit_a_kv_steps_plan(mode):
         )
         for (g, _), (w, _) in zip(got, want):
             assert _numel(g) >= _numel(w)
+
+
+def _viewer(prefix_tokens):
+    b = _work_sizer("auto", 48, 128)
+    b._sparse_prefill_work_rows = {}
+    b.max_num_batched_tokens = prefix_tokens[""]
+    b._ubatch_tokens = lambda: prefix_tokens["ub0_"]
+    var = {}
+    for prefix, tokens in prefix_tokens.items():
+        for name, (size, dtype) in zip(
+            aiter_mla.PERSISTENT_WORK_BUFFERS, b._sparse_prefill_work_info(tokens)
+        ):
+            var[f"{prefix}sparse_prefill_{name}"] = torch.empty(size, dtype=dtype)
+    b.model_runner = SimpleNamespace(forward_vars=var)
+    return b
+
+
+@pytest.mark.parametrize("prefix", ["", "ub0_"])
+@pytest.mark.parametrize("heads", [128, 48])
+def test_a_step_plans_into_its_own_widths_buffers(prefix, heads):
+    """aiter sizes its reduce grid and fp32 partials by the buffers a plan is
+    given, so each step sees the buffers its width alone would have, not the
+    max over both."""
+    tokens = {"": 4096, "ub0_": 2048}
+    b = _viewer(tokens)
+    work = b._sparse_prefill_work_views(prefix, heads)
+    want = aiter_mla.get_mla_metadata_info_v1(
+        tokens[prefix],
+        1,
+        heads,
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fn,
+        is_sparse=True,
+        fast_mode=True,
+    )
+    for name, (size, _) in zip(aiter_mla.PERSISTENT_WORK_BUFFERS, want):
+        assert tuple(work[name].shape) == tuple(np.atleast_1d(size))
+
+
+@pytest.mark.parametrize("kv", [False, True])
+def test_a_kv_capable_step_passes_its_widths_buffers(kv):
+    b = _viewer({"": 4096, "ub0_": 2048})
+    b.dcp_world_size = 2
+    b._dcp_sparse_prefill_kv_plan = lambda batch: object() if kv else None
+    seen = {}
+    b._sparse_prefill_work_plan = lambda md, prefix, heads, lens, **k: seen.update(
+        heads=heads, work=k["work"]
+    )
+    md = SimpleNamespace(sparse_kv_last_page_lens=None)
+    b._dcp_sparse_prefill_step(None, md, "")
+    heads = 48 if kv else 128
+    assert seen["heads"] == heads
+    want = b._sparse_prefill_work_views("", heads)
+    assert {n: t.shape for n, t in seen["work"].items()} == {
+        n: t.shape for n, t in want.items()
+    }
 
 
 def test_a_q_builder_sizes_the_work_buffers_as_before():
@@ -564,26 +623,44 @@ def test_the_kv_scratch_counts_the_padded_query_copy():
     assert padded - unpadded == 4096 * 16 * 576
 
 
-@pytest.mark.parametrize(
-    "mode,tokens,heads,want",
-    [
-        ("kv", 2048, 16, 1 << 20),
-        # 200K + 52 * 2048 + min(2048, 256) requests * 16 * 4 padding
-        ("auto", 2048, 16, 200 * 1024 + 52 * 2048 + 256 * 16 * 4),
-        ("auto", 64, 8, 200 * 1024 + 40 * 64 + 64 * 16 * 4),
-        ("auto", 16384, 16, 1 << 20),
-    ],
-)
-def test_auto_profiles_the_rows_it_can_gather(mode, tokens, heads, want):
-    """A forced "kv" may gather the cap; "auto" no more than its context bound
-    plus each request's padding to whole local blocks."""
-    got = dcp_ops.dcp_sparse_prefill_kv_profile_rows(
-        mode, tokens, heads, 256, 16, 4, 1 << 20
+def test_a_forced_kv_profiles_the_cap():
+    cap = 1 << 20
+    assert (
+        dcp_ops.dcp_sparse_prefill_kv_profile_rows("kv", 64, 16, 256, 16, 4, cap) == cap
     )
-    assert got == want
 
 
-def _dummy_attention(monkeypatch, env, kv_cache_dtype, is_prefill, cap=1 << 14):
+@pytest.mark.parametrize("tokens", [1, 64, 2048, 16384])
+@pytest.mark.parametrize("heads", [8, 16])
+@pytest.mark.parametrize("many", [False, True])
+def test_auto_profiles_every_row_it_can_gather(tokens, heads, many):
+    """The rows "auto" admits for a step of ``tokens`` new tokens fit what the
+    profile holds: the context bound filled to the last row, by as many
+    requests as the step can have, each a row past whole local blocks."""
+    cap, dcp, block, max_num_seqs = 1 << 20, 4, 16, 256
+    n = min(tokens, max_num_seqs) if many else 1
+    bound = (
+        dcp_ops.DCP_SPARSE_PREFILL_KV_CONTEXT_BASE
+        + dcp_ops.dcp_sparse_prefill_kv_context_per_new_token(heads) * tokens
+    )
+    stride = block * dcp
+    context = np.full(n, (bound // n - 1) // stride * stride + 1, dtype=np.int64)
+    context[-1] += bound - context.sum()
+    tables = [np.arange(cap // block, dtype=np.int32)] * n
+    plan = dcp_ops.dcp_sparse_prefill_kv_plan(
+        context, tables, dcp, block, cap, bound, DEV
+    )
+    held = dcp_ops.dcp_sparse_prefill_kv_profile_rows(
+        "auto", tokens, heads, max_num_seqs, block, dcp, cap
+    )
+    rows = dcp_ops.dcp_sparse_prefill_kv_rows(context, dcp, block) * dcp
+    assert (plan is not None) == (rows <= cap)
+    assert min(rows, cap) <= held <= cap
+
+
+def _dummy_attention(
+    monkeypatch, env, kv_cache_dtype, is_prefill, cap=1 << 14, batch_tokens=5
+):
     """A dcp4 sparse `MLAAttention` reaching `forward_impl`'s dummy branch."""
     monkeypatch.setenv("ATOM_DCP_SPARSE_PREFILL", env)
     monkeypatch.setenv("ATOM_DCP_SPARSE_PREFILL_KV_MAX_TOKENS", str(cap))
@@ -604,6 +681,7 @@ def _dummy_attention(monkeypatch, env, kv_cache_dtype, is_prefill, cap=1 << 14):
             hf_config=SimpleNamespace(hidden_size=8),
             torch_dtype=torch.bfloat16,
             max_num_seqs=256,
+            max_num_batched_tokens=batch_tokens,
             kv_cache_block_size=16,
         ),
     )
@@ -651,6 +729,20 @@ def test_a_dummy_prefill_under_auto_holds_less_than_the_cap(monkeypatch):
     held = dcp_ops.dcp_sparse_prefill_kv_scratch_bytes(5, 16, 16, 512, 64, 1, 4, rows)
     at_cap = dcp_ops.dcp_sparse_prefill_kv_scratch_bytes(5, 16, 16, 512, 64, 1, 4, cap)
     assert held <= _profiled_peak(a, 5) < at_cap
+
+
+def test_a_short_dummy_prefill_holds_the_rows_of_a_full_batch(monkeypatch):
+    """A dummy prefill shorter than the batch budget still holds the rows a
+    step at the budget can gather."""
+    cap, budget = 1 << 20, 8192
+    a = _dummy_attention(
+        monkeypatch, "auto", "fp8", is_prefill=True, cap=cap, batch_tokens=budget
+    )
+    rows = dcp_ops.dcp_sparse_prefill_kv_profile_rows(
+        "auto", budget, 16, 256, 16, 4, cap
+    )
+    held = dcp_ops.dcp_sparse_prefill_kv_scratch_bytes(5, 16, 16, 512, 64, 1, 4, rows)
+    assert _profiled_peak(a, 5) >= held
 
 
 def test_a_dummy_decode_profiles_no_kv_scratch(monkeypatch):

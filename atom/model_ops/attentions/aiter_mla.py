@@ -604,6 +604,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             and dcp_persistent
             and self.block_size == 1
         )
+        self._sparse_prefill_work_rows = {}
         self._dcp_sparse_prefill_mode = self._resolve_dcp_sparse_prefill_mode(
             config.kv_cache_dtype
         )
@@ -2214,38 +2215,63 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         ]
         attn_metadata.dcp_owned_counts = self._dcp_owned_counts_gpu[first_token:]
 
-    def _sparse_prefill_work_info(self, tokens):
-        """Sizes of the sparse prefill work buffers for ``tokens`` query rows.
-        A DCP "kv" step plans with this rank's padded heads, which can need
-        more tiles a token than the gathered width (48 vs 128), so size for
-        both when "kv" can be taken."""
+    def _sparse_prefill_work_widths(self):
+        """Head widths a sparse prefill plans with. A DCP "kv" step plans with
+        this rank's padded heads, which can need more tiles a token than the
+        gathered width (48 vs 128)."""
         widths = [self.sparse_prefill_num_heads]
         if (
             self._dcp_sparse_prefill_mode != "q"
             and self.padded_num_attention_heads != self.sparse_prefill_num_heads
         ):
             widths.append(self.padded_num_attention_heads)
+        return widths
+
+    def _sparse_prefill_work_info(self, tokens, heads=None):
+        """Sizes of the sparse prefill work buffers for ``tokens`` query rows:
+        for a ``heads`` plan, or by default the max over every width."""
         infos = [
             get_mla_metadata_info_v1(
                 tokens,
                 1,  # sparse prefill treats each query token as q_len=1
-                heads,
+                width,
                 self.dtype_q,
                 self.dtype_kv,
                 is_sparse=True,
                 fast_mode=True,
             )
-            for heads in widths
+            for width in ([heads] if heads else self._sparse_prefill_work_widths())
         ]
         if len(infos) == 1:
             return infos[0]
         return tuple(
             (
-                (tuple(map(max, a, b)) if isinstance(a, tuple) else max(a, b)),
+                (tuple(map(max, a, b)) if isinstance(a, (tuple, list)) else max(a, b)),
                 dtype,
             )
             for (a, dtype), (b, _) in zip(*infos)
         )
+
+    def _sparse_prefill_work_views(self, prefix, heads):
+        """The ``prefix`` work buffers as a ``heads`` plan alone would size
+        them. aiter sizes its reduce grid and fp32 partials by the buffers it
+        is given, so a step must not see the max over both widths."""
+        var = self.model_runner.forward_vars
+        work = {
+            name: var[f"{prefix}sparse_prefill_{name}"]
+            for name in PERSISTENT_WORK_BUFFERS
+        }
+        if len(self._sparse_prefill_work_widths()) == 1:
+            return work
+        key = (prefix, heads)
+        rows = self._sparse_prefill_work_rows.get(key)
+        if rows is None:
+            tokens = self._ubatch_tokens() if prefix else self.max_num_batched_tokens
+            rows = self._sparse_prefill_work_rows[key] = tuple(
+                size[0] if isinstance(size, (tuple, list)) else size
+                for size, _ in self._sparse_prefill_work_info(tokens, heads)
+            )
+        return {name: work[name][:n] for name, n in zip(PERSISTENT_WORK_BUFFERS, rows)}
 
     def _sparse_prefill_work_plan(
         self,
@@ -2254,18 +2280,21 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         num_heads: int,
         last_page_lens: torch.Tensor,
         local_heads: bool = False,
+        work: dict | None = None,
     ) -> None:
         """The persistent sparse prefill's work plan over ``attn_metadata``'s
         query rows, into the ``prefix`` set's buffers; none for the
         non-persistent DCP sparse prefill, which reads no plan. ``local_heads``:
-        a DCP "kv" prefill, which runs the dcp=1 kernel."""
+        a DCP "kv" prefill, which runs the dcp=1 kernel. ``work``: views of
+        those buffers to plan into instead."""
         if self.dcp_sparse_prefill_nonps and not local_heads:
             return
-        var = self.model_runner.forward_vars
-        work = {
-            name: var[f"{prefix}sparse_prefill_{name}"]
-            for name in PERSISTENT_WORK_BUFFERS
-        }
+        if work is None:
+            var = self.model_runner.forward_vars
+            work = {
+                name: var[f"{prefix}sparse_prefill_{name}"]
+                for name in PERSISTENT_WORK_BUFFERS
+            }
         get_mla_metadata_v1(
             attn_metadata.sparse_cu_seqlens_q,
             attn_metadata.sparse_kv_indptr,
@@ -2362,16 +2391,18 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         top-k, as without DCP, so it takes the dcp=1 plan."""
         kv_plan = self._dcp_sparse_prefill_kv_plan(batch)
         attn_metadata.dcp_sparse_prefill_kv = kv_plan
+        heads = (
+            self.padded_num_attention_heads
+            if kv_plan is not None
+            else self.sparse_prefill_num_heads
+        )
         self._sparse_prefill_work_plan(
             attn_metadata,
             prefix,
-            (
-                self.padded_num_attention_heads
-                if kv_plan is not None
-                else self.sparse_prefill_num_heads
-            ),
+            heads,
             attn_metadata.sparse_kv_last_page_lens,
             local_heads=kv_plan is not None,
+            work=self._sparse_prefill_work_views(prefix, heads),
         )
 
     def _finish_prefill_batch(self, batch, attn_metadata, prefix=""):

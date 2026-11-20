@@ -1857,9 +1857,10 @@ def triton_filter_and_convert_dcp_index_prefill(
 
 
 # "auto" takes "kv" while the step's context stays under
-# CONTEXT_BASE + context_per_new_token(dcp) * its new tokens: the gather grows
-# with the context, "q" with the new tokens. Fitted on GLM-5.2-FP8 fp8 KV with a
-# cached prefix + 64 / 1K / 16K new tokens, 32K-960K: k in [48.5, 57)
+# CONTEXT_BASE + context_per_new_token(heads a rank) * its new tokens: the
+# gather grows with the context, "q" with the new tokens. Fitted on
+# GLM-5.2-FP8 fp8 KV with a cached prefix + 64 / 1K / 16K new tokens,
+# 32K-960K: k in [48.5, 57)
 # classifies all 18 tp4/dcp4 points (16 heads a rank), 40 all tp8/dcp8 ones
 # (8 heads a rank). k follows the heads a rank attends, which "kv" pays for:
 # fewer heads, less attention for the gather to save. 16 or more heads a rank
