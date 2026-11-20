@@ -1463,6 +1463,17 @@ class Nvfp4MoEMethod(FusedMoEMethodBase):
         )
 
 
+def _mxfp8_1x32(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """[R, K] -> (fp8 e4m3 [R, K], e8m0 [R, K / 32]): one power-of-two scale a
+    32-element block along K, the smallest that keeps the block within +-448."""
+    rows, k = w.shape
+    blocks = w.float().view(rows, k // 32, 32)
+    amax = blocks.abs().amax(-1).clamp_min(2.0**-120)
+    exp = torch.ceil(torch.log2(amax / 448.0)).clamp(-127, 127)
+    q = (blocks / torch.exp2(exp)[..., None]).clamp(-448.0, 448.0)
+    return q.to(dtypes.fp8).view(rows, k), (exp + 127).to(torch.uint8)
+
+
 class Mxfp4MoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
         super().__init__(moe)
@@ -1741,6 +1752,99 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
 
         self._process_weight_layout_after_loading(layer)
+        # ATOM_QWEN_FHMOE: the sparse block handed this layer its shared expert
+        # (its hooks ran before this one); build the FHMoE operands from it.
+        if getattr(layer, "fhmoe_shared_mlp", None) is not None:
+            self._fhmoe_prepare(layer)
+
+    def _fhmoe_prepare(self, layer) -> None:
+        """aiter FHMoE (gfx1250): the shared expert as expert E of E + 1, its
+        weights MXFP8 (1x32 e8m0) in the routed preshuffle. The routed weights
+        grow by that never-read row: the parameters become views of the first E
+        rows of (E + 1)-row buffers, so the routed path is unchanged."""
+        from types import SimpleNamespace
+
+        from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
+
+        mlp = layer.fhmoe_shared_mlp
+        experts = layer.w13_weight.shape[0]
+
+        def grow(param):
+            t = param.data
+            flat = t.reshape(experts, -1)
+            big = torch.empty(
+                (experts + 1, flat.shape[1]), dtype=t.dtype, device=t.device
+            )
+            big[:experts].copy_(flat)
+            big[experts:].copy_(flat[:1])
+            param.data = big[:experts].view(t.shape)
+            full = (
+                big.view((experts + 1,) + tuple(t.shape[1:]))
+                if t.shape[0] == experts
+                else big.view(-1)
+            )
+            for k, v in vars(param).items():
+                if isinstance(v, (bool, int, str)):
+                    try:
+                        setattr(full, k, v)
+                    except (AttributeError, TypeError):
+                        pass  # a read-only tensor attribute
+            return full
+
+        w13, w2 = grow(layer.w13_weight), grow(layer.w2_weight)
+        s13, s2 = grow(layer.w13_weight_scale), grow(layer.w2_weight_scale)
+        gu = mlp.gate_up_proj.weight.data  # [gate; up] rows, [2I, D]
+        dn = mlp.down_proj.weight.data  # [D, I]
+        assert gu.dtype == torch.bfloat16 and dn.dtype == torch.bfloat16
+        two_i, d = gu.shape
+        if getattr(mlp, "gated_gate_up", False):
+            # ATOM_SHARED_EXPERT_GATED_GEMM interleaved the rows g0, u0, g1, ...
+            gu = gu.view(two_i // 2, 2, d).transpose(0, 1).reshape(two_i, d)
+        assert two_i == w13.shape[1] and dn.shape == (d, two_i // 2)
+        q1, r1 = _mxfp8_1x32(gu)
+        q2, r2 = _mxfp8_1x32(dn)
+        layer.fhmoe = SimpleNamespace(
+            w13=w13,
+            w2=w2,
+            s13=s13,
+            s2=s2,
+            sw1=moe_shuffle_weight(
+                q1.view(1, two_i, d), experts_cnt=1, is_guinterleave=True, gate_up=True
+            ),
+            sw2=moe_shuffle_weight(q2.view(1, d, two_i // 2), experts_cnt=1),
+            ss1=moe_shuffle_scale(
+                r1.view(1, two_i, d // 32),
+                experts_cnt=1,
+                is_guinterleave=True,
+                gate_up=True,
+            ),
+            ss2=moe_shuffle_scale(r2.view(1, d, two_i // 64), experts_cnt=1),
+            shared_id=experts,
+        )
+
+    def apply_fhmoe(self, layer, x, topk_weights, topk_ids, scheduled_tokens_gpu):
+        """The routed experts and the shared expert (route id E, its weight the
+        sigmoid gate) in one aiter FHMoE grouped MoE."""
+        fh = layer.fhmoe
+        return fused_moe(
+            x,
+            fh.w13,
+            fh.w2,
+            topk_weights,
+            topk_ids,
+            activation=ActivationType.Silu,
+            quant_type=self.quant_type,
+            w1_scale=fh.s13,
+            w2_scale=fh.s2,
+            gate_mode=GateMode.INTERLEAVE.value,
+            swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
+            num_local_tokens=scheduled_tokens_gpu,
+            shared_w1=fh.sw1,
+            shared_w2=fh.sw2,
+            shared_w1_scale=fh.ss1,
+            shared_w2_scale=fh.ss2,
+            shared_expert_id=fh.shared_id,
+        )
 
     def _process_weight_layout_after_loading(self, layer) -> None:
         is_silu = (

@@ -198,6 +198,8 @@ class SpecRejectionSampling:
         self.record_tok = torch.full((self.num_slots, self.mtp_k), -1, **i32)
         self.dbg_scratch = torch.zeros(self.max_rows, self.DW, **i32)
         self.tok_scratch = torch.zeros(self.max_rows, **i32)
+        # ATOM_MTP_DRAFT_VOCAB: the draws as draft-logit columns (`sample_draft`).
+        self.col_scratch = torch.zeros(self.max_rows, **i32)
         self.u_draft = torch.zeros(self.max_rows, **f32)
         # ATOM_MTP_DRAFT_DEVICE_RNG: the draws' Philox counter (int64) and seed.
         self._rng_state = torch.zeros(1, dtype=torch.int64, device=device)
@@ -313,25 +315,31 @@ class SpecRejectionSampling:
     def _presence_args(self, draft_presence):
         """aiter's in-kernel presence penalty over the draft passes' buffers
         (`DraftPresencePenalty`): the request's marked tokens and this step's
-        earlier drafts, as `DraftPresencePenalty.apply` penalizes them."""
+        earlier drafts, as `DraftPresencePenalty.apply` penalizes them (over a
+        draft vocabulary's columns once `DraftPresencePenalty.set_vocab` ran)."""
         if draft_presence is None:
             return None
-        if self._presence is None or self._presence[0] is not draft_presence:
-            dp = draft_presence
+        dp = draft_presence
+        if (
+            self._presence is None
+            or self._presence[0] is not dp
+            or self._presence[1] is not dp.draft_mask
+        ):
             self._presence = (
                 dp,
+                dp.draft_mask,
                 {
                     "input_ids": dp.ctx,
                     "row_seq": dp.row_seq,
                     "row_pos": dp.pos,
                     "seq_start": dp.seq_start,
-                    "slots": dp.slots,
+                    "slots": dp.draft_slots,
                     "penalties": dp.penalties,
-                    "mask": dp.state.mask,
+                    "mask": dp.draft_mask,
                     "max_extra": dp.state.max_extra,
                 },
             )
-        return self._presence[1]
+        return self._presence[2]
 
     def lmhead_stats_args(self, rows: int, vocab: int, out: torch.Tensor, draft_presence=None):
         """ATOM_MTP_DRAFT_LMHEAD_STATS: (temperatures, presence, rng_state) for
@@ -366,14 +374,23 @@ class SpecRejectionSampling:
         out: torch.Tensor,
         draft_presence=None,
         stats: torch.Tensor | None = None,
+        vocab=None,
     ) -> torch.Tensor:
         """Each draft row's token, drawn from its q by the verify's sampler, into
         ``out``; the sampler's records into the scratch. ``stats``: the LM
-        head's records (lmhead_stats_args), in place of the stats kernel."""
+        head's records (lmhead_stats_args), in place of the stats kernel (full
+        vocabulary only). With a draft vocabulary (``draft_vocab.DraftVocab``;
+        ``logits`` over its columns) the draws land as columns in ``col_scratch``
+        (`draft_columns`, what the draft presence state records), and the token
+        and the record's k columns are mapped to vocabulary ids (two gathers), so
+        the verify, the record store and the next pass read vocabulary ids either
+        way."""
         from aiter.ops.triton.fusions import topk_topp_sample as tts
 
         rows = logits.shape[0]
         assert rows <= self.max_rows, f"{rows} draft rows > {self.max_rows}"
+        tok = self.tok_scratch[:rows]
+        drawn = tok if vocab is None else self.col_scratch[:rows]
         u = self.u_draft[:rows]
         from atom.utils import envs
 
@@ -381,6 +398,7 @@ class SpecRejectionSampling:
         self.recorded_presence = False
         if (
             _FUSED_SELECT
+            and vocab is None  # its early return writes ids, not a draft vocabulary's columns
             and envs.ATOM_MTP_DRAFT_DEVICE_RNG
             and gluon_ok
             and out.is_contiguous()
@@ -425,15 +443,23 @@ class SpecRejectionSampling:
             self.row_topp,
             uniform=u,
             eps=_EPS,
-            out=self.tok_scratch[:rows],
+            out=drawn,
             debug=self.dbg_scratch[:rows],
             presence=self._presence_args(draft_presence),
             gluon_select=tts.topk_topp_sample_gluon_select_supported(
                 logits, self.draft_k
             ),
         )
-        out.view(-1).copy_(self.tok_scratch[:rows])
+        if vocab is not None:
+            vocab.to_vocab(drawn, out=tok)
+            vocab.map_cols_(self.dbg_scratch[:rows, : self.draft_k])
+        out.view(-1).copy_(tok)
         return out
+
+    def draft_columns(self, rows: int) -> torch.Tensor:
+        """The last `sample_draft` over a draft vocabulary: its ``[rows]`` draws as
+        draft-logit columns."""
+        return self.col_scratch[:rows]
 
     # ---- verify (eager) -----------------------------------------------------
     def applies(self, logits, top_ks, top_ps) -> bool:
@@ -508,10 +534,17 @@ class SpecRejectionSampling:
         )
         return out_v, tokens[n_v:]
 
-    def warm(self, vocab: int, top_k: int | None = None, draft_presence=None) -> None:
-        """Compile the draft draw and the verify (the verify at ``top_k``, the
-        draft top-k by default, with a scalar and a per-request top-p) before
-        serving and before the draft passes are recorded."""
+    def warm(
+        self,
+        vocab: int,
+        top_k: int | None = None,
+        draft_presence=None,
+        draft_vocab=None,
+    ) -> None:
+        """Compile the draft draw (over ``draft_vocab``'s columns when given) and
+        the verify (the verify at ``top_k``, the draft top-k by default, with a
+        scalar and a per-request top-p) before serving and before the draft passes
+        are recorded."""
         from types import SimpleNamespace
 
         dev = self.device
@@ -519,7 +552,13 @@ class SpecRejectionSampling:
         logits = torch.zeros(S + 1, vocab, dtype=torch.bfloat16, device=dev)
         out = torch.zeros(1, dtype=torch.int32, device=dev)
         self.active_bs = 1
-        self.sample_draft(logits[:1], out, draft_presence)
+        if draft_vocab is None:
+            self.sample_draft(logits[:1], out, draft_presence)
+        else:
+            draft_logits = torch.zeros(
+                1, draft_vocab.size, dtype=torch.bfloat16, device=dev
+            )
+            self.sample_draft(draft_logits, out, draft_presence, vocab=draft_vocab)
         meta = SimpleNamespace(
             cu_num_draft_tokens=torch.full((1,), S, dtype=torch.int32, device=dev),
             target_logits_indices=torch.arange(S, dtype=torch.int64, device=dev),

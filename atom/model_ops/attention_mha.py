@@ -17,6 +17,7 @@ from atom.config import get_current_atom_config
 from atom.model_ops.attn_output_epilogue import (
     current_attention_output_epilogue,
     unified_attention_takes_output_epilogue,
+    unified_attention_takes_output_mx32,
     unified_attention_takes_split_reduce,
     unified_attention_takes_split_reduce_oneshot,
 )
@@ -1016,6 +1017,28 @@ class PagedAttentionImpl(nn.Module):
         req = current_attention_output_epilogue()
         if (
             req is not None
+            and req.mx32
+            and o.dtype == torch.bfloat16
+            and (
+                req.gate is None
+                or (req.gate.dtype == o.dtype and req.gate.shape[0] == o.shape[0])
+            )
+            and (o.shape[-2] * o.shape[-1]) % 128 == 0
+            and unified_attention_takes_output_mx32()
+        ):
+            # ATOM_UA_REDUCE_GATE_MX32: the gate and o_proj's 1x32 MXFP8 input in
+            # the reduce; `o` is then only the bf16 scratch the call is given.
+            from atom.model_ops import mxfp8_1x32
+
+            req.mx32_out = mxfp8_1x32.alloc(
+                o.shape[0], o.shape[-2] * o.shape[-1], o.device
+            )
+            mxfp8_1x32.note("fused: attention reduce + output gate (o_proj input)")
+            epilogue = {"output_gate": req.gate, "output_mx32": req.mx32_out}
+            req.applied = True
+        elif (
+            req is not None
+            and not req.mx32
             and o.dtype == torch.bfloat16
             and (req.gate is None or req.gate.dtype == o.dtype)
             and unified_attention_takes_output_epilogue()

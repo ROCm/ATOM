@@ -269,7 +269,23 @@ def _hook_globals(G):
         output_gate=None,
         output_rows=None,
         oneshot=False,
+        output_mx32=None,
     ):
+        if output_mx32 is not None:
+            # ATOM_UA_REDUCE_GATE_MX32's request (aiter's own output_mx32 reduce): pass it through
+            return orig(
+                params,
+                segm_output,
+                segm_max,
+                segm_expsum,
+                NUM_SEGMENTS,
+                TILE_SIZE,
+                segm_tiles=segm_tiles,
+                output_gate=output_gate,
+                output_rows=output_rows,
+                oneshot=oneshot,
+                output_mx32=output_mx32,
+            )
         req = _current()
         if (
             req is not None
@@ -341,6 +357,7 @@ def _hook_globals(G):
             output_gate=output_gate,
             output_rows=output_rows,
             oneshot=oneshot,
+            output_mx32=output_mx32,
         )
 
     G["_reduce_segments_split_gfx1250"] = _reduce_segments_split_gfx1250
