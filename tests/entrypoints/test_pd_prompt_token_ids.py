@@ -25,6 +25,7 @@ from atom.entrypoints.openai.protocol import (
 from atom.model_engine.multimodal_runtime import multimodal_cache_seed
 from atom.model_engine.sequence import Sequence, SequenceStatus
 from atom.sampling_params import SamplingParams
+from tests.test_scheduler import _ConnectorNamespace
 
 PROMPT_IDS = [101, 102, 103, 104]
 
@@ -842,11 +843,8 @@ IMAGE_DECODE_KV = {
 
 def _pd_connector(scheduler, **methods):
     """A P/D consumer's connector, answering the scheduler with `methods`."""
-    scheduler.kv_connector = SimpleNamespace(
-        is_producer=False,
-        is_offload=False,
-        build_connector_meta=lambda: None,
-        **methods,
+    scheduler.kv_connector = _ConnectorNamespace(
+        is_producer=False, is_offload=False, **methods
     )
 
 
@@ -893,22 +891,38 @@ def _image_decode_on_way_in(way_in, scheduler, seq_factory):
         )
     elif way_in == "offload_resume":
         # The receive settled as an offload load the scheduler resumes.
-        scheduler.kv_connector = SimpleNamespace(
-            is_offload=True,
-            build_connector_meta=lambda: None,
-            cancel_pending_load=lambda _seq: None,
-        )
+        scheduler.kv_connector = _ConnectorNamespace(is_offload=True)
         bm = scheduler.block_manager
         assert bm.allocate(seq, bm.can_allocate(seq))
         seq.num_cached_tokens = 2
         seq.offload_loaded = True
     scheduler.add(seq)
+    if way_in == "early_loaded":
+        # An offload tier loads its prefix ahead of admission; it lands.
+        scheduler.kv_connector = _ConnectorNamespace(
+            is_offload=True,
+            supports_early_load=True,
+            lookup_ready=lambda _seq: True,
+            get_num_new_matched_tokens=lambda _seq: (len(PROMPT_IDS), True),
+            should_park_for_load_after_alloc=lambda _seq: True,
+        )
+        scheduler.config.offload_min_load_tokens = 0
+        scheduler.schedule()
+        assert seq.id in scheduler._early_load.entries
+        scheduler.finished_recving_kv_req_ids.append(seq.id)
     return seq
 
 
 @pytest.mark.parametrize(
     "way_in",
-    ["no_connector", "requeued", "declined_after_alloc", "offload_resume", "preempted"],
+    [
+        "no_connector",
+        "requeued",
+        "declined_after_alloc",
+        "offload_resume",
+        "early_loaded",
+        "preempted",
+    ],
 )
 def test_media_dropped_leg_is_never_prefilled_locally(scheduler, seq_factory, way_in):
     seq = _image_decode_on_way_in(way_in, scheduler, seq_factory)
