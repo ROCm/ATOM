@@ -21,8 +21,10 @@ use data_connector::{
 use mesh::{
     app_context::AppContext,
     config::{RouterConfig, RoutingMode},
-    core::{prepare_pool::PreparePoolRuntime, Job, LoadMonitor, WorkerRegistry},
-    middleware::TokenBucket,
+    core::{
+        prepare_pool::PreparePoolRuntime, token_bucket::TokenBucket, Job, LoadMonitor,
+        WorkerRegistry,
+    },
     policies::PolicyRegistry,
     protocols::common::{Function, Tool},
     reasoning_parser::ParserFactory as ReasoningParserFactory,

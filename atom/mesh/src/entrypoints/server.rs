@@ -30,7 +30,7 @@ use crate::{
         worker_manager::WorkerManager,
         Job,
     },
-    middleware,
+    entrypoints::middleware,
     observability::{
         logging::{self, LoggingConfig},
         metrics::{self, MetricsRouteFactory, PrometheusConfig},
@@ -404,7 +404,7 @@ pub fn build_app(
         .route("/v1/tokenize", post(v1_tokenize))
         .route("/v1/detokenize", post(v1_detokenize))
         .route_layer(axum::middleware::from_fn_with_state(
-            app_state.clone(),
+            app_state.context.admission.clone(),
             middleware::concurrency_limit_middleware,
         ));
 

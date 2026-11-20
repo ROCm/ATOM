@@ -20,8 +20,8 @@ use crate::{
     app_context::AppContext,
     config::RoutingMode,
     core::{ConnectionMode, WorkerRegistry},
+    entrypoints::server::ServerConfig,
     routers::RouterTrait,
-    server::ServerConfig,
 };
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -289,6 +289,35 @@ impl RouterTrait for RouterManager {
             router.get_model_info(req).await
         } else {
             (StatusCode::SERVICE_UNAVAILABLE, "No routers available").into_response()
+        }
+    }
+
+    async fn route_tokens(
+        &self,
+        request: crate::entrypoints::backend::TokenRequest,
+    ) -> Result<crate::entrypoints::backend::TokenStream, crate::entrypoints::backend::BackendError>
+    {
+        match self.select_router_for_request(request.headers.as_ref(), request.model.as_deref()) {
+            Some(router) => router.route_tokens(request).await,
+            None => Err(crate::entrypoints::backend::BackendError::new(
+                StatusCode::NOT_FOUND,
+                "model_not_found",
+                "model not found or no router available",
+            )),
+        }
+    }
+
+    async fn abort_tokens(
+        &self,
+        request_id: &str,
+    ) -> Result<(), crate::entrypoints::backend::BackendError> {
+        match self.select_router_for_request(None, None) {
+            Some(router) => router.abort_tokens(request_id).await,
+            None => Err(crate::entrypoints::backend::BackendError::new(
+                StatusCode::NOT_FOUND,
+                "model_not_found",
+                "no router available to abort the request",
+            )),
         }
     }
 

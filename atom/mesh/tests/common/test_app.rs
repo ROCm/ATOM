@@ -7,11 +7,12 @@ use data_connector::{
 use mesh::{
     app_context::AppContext,
     config::RouterConfig,
-    core::{prepare_pool::PreparePoolRuntime, LoadMonitor, WorkerRegistry},
-    middleware::TokenBucket,
+    core::{
+        prepare_pool::PreparePoolRuntime, token_bucket::TokenBucket, LoadMonitor, WorkerRegistry,
+    },
     policies::PolicyRegistry,
     routers::RouterTrait,
-    server::{build_app, AppState},
+    entrypoints::server::{build_app, AppState},
     tokenizer::registry::TokenizerRegistry,
 };
 use reqwest::Client;
