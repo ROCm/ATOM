@@ -26,10 +26,12 @@ def _edge_rows(gate_up: torch.Tensor) -> None:
     gate[7] = -45.0
 
 
-def _mxfp8_input(rows: int) -> torch.Tensor:
-    # MiniMax-M3 has shared_intermediate_size=3072; TP4 gives I=768 per rank.
+def _mxfp8_input(rows: int, intermediate: int = 768) -> torch.Tensor:
+    # Shared I=768 and dense I=3072 are both per-rank MiniMax-M3 TP4 shapes.
     torch.manual_seed(1702 + rows)
-    gate_up = torch.randn(rows, 2 * 768, device="cuda", dtype=torch.float32) * 3
+    gate_up = (
+        torch.randn(rows, 2 * intermediate, device="cuda", dtype=torch.float32) * 3
+    )
     if rows >= 8:
         _edge_rows(gate_up)
     return gate_up.to(torch.bfloat16)
@@ -62,6 +64,17 @@ def test_swiglu_mxfp8_is_bitwise_split_group32_quant(rows: int) -> None:
     from atom.model_ops.swiglu_oai import swiglu_oai_split, swiglu_oai_split_mxfp8
 
     gate_up = _mxfp8_input(rows)
+    expected = quantize_fp8(swiglu_oai_split(gate_up, 1.702, 1.0, 7.0))
+    actual = swiglu_oai_split_mxfp8(gate_up, 1.702, 1.0, 7.0)
+    _assert_bitwise_mxfp8(actual, expected)
+
+
+@pytest.mark.parametrize("rows", [1, 32, 256])
+def test_dense_swiglu_mxfp8_is_bitwise_split_group32_quant(rows: int) -> None:
+    from atom.model_ops.blockscale import quantize_fp8
+    from atom.model_ops.swiglu_oai import swiglu_oai_split, swiglu_oai_split_mxfp8
+
+    gate_up = _mxfp8_input(rows, intermediate=3072)
     expected = quantize_fp8(swiglu_oai_split(gate_up, 1.702, 1.0, 7.0))
     actual = swiglu_oai_split_mxfp8(gate_up, 1.702, 1.0, 7.0)
     _assert_bitwise_mxfp8(actual, expected)

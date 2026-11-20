@@ -58,10 +58,10 @@ def test_hash_changes_with_kv_cache_dtype():
     assert _hash(kv_cache_dtype="bf16") != _hash()
 
 
-def test_hash_changes_with_minimax_m3_shared_swiglu_mxfp8(monkeypatch):
-    monkeypatch.setenv("ATOM_MINIMAX_M3_SHARED_SWIGLU_MXFP8", "0")
+def test_hash_changes_with_minimax_m3_swiglu_mxfp8(monkeypatch):
+    monkeypatch.setenv("ATOM_MINIMAX_M3_SWIGLU_MXFP8", "0")
     disabled = _hash()
-    monkeypatch.setenv("ATOM_MINIMAX_M3_SHARED_SWIGLU_MXFP8", "1")
+    monkeypatch.setenv("ATOM_MINIMAX_M3_SWIGLU_MXFP8", "1")
     assert _hash() != disabled
 
 

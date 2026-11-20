@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""CPU contracts for MiniMax-M3 shared SwiGLU-OAI MXFP8 fusion."""
+"""CPU contracts for MiniMax-M3 SwiGLU-OAI MXFP8 fusion."""
 
 from types import SimpleNamespace
 
@@ -84,7 +84,7 @@ def _mlp(*, enabled: bool, native_group_rows: int | None = 1) -> SimpleNamespace
         swiglu_alpha=1.702,
         swiglu_beta=1.0,
         swiglu_limit=7.0,
-        fuse_shared_swiglu_mxfp8=enabled,
+        fuse_swiglu_mxfp8=enabled,
     )
 
 
@@ -145,12 +145,12 @@ def test_native_down_projection_contract_is_conservative() -> None:
 
 
 @pytest.mark.parametrize(("value", "enabled"), [("0", False), ("1", True)])
-def test_only_shared_expert_construction_reads_fusion_flag(
+def test_shared_expert_construction_reads_common_fusion_flag(
     monkeypatch: pytest.MonkeyPatch,
     value: str,
     enabled: bool,
 ) -> None:
-    monkeypatch.setenv("ATOM_MINIMAX_M3_SHARED_SWIGLU_MXFP8", value)
+    monkeypatch.setenv("ATOM_MINIMAX_M3_SWIGLU_MXFP8", value)
     monkeypatch.setattr(m3_model, "get_tensor_model_parallel_world_size", lambda: 1)
     monkeypatch.setattr(m3_model, "ReplicatedLinear", lambda *args, **kwargs: object())
     monkeypatch.setattr(
@@ -178,4 +178,33 @@ def test_only_shared_expert_construction_reads_fusion_flag(
 
     m3_model.MiniMaxM3MoE(config, layer_id=0)
 
-    assert mlp_calls[0]["fuse_shared_swiglu_mxfp8"] is enabled
+    assert mlp_calls[0]["fuse_swiglu_mxfp8"] is enabled
+
+
+@pytest.mark.parametrize(("value", "enabled"), [("0", False), ("1", True)])
+def test_dense_mlp_construction_reads_common_fusion_flag(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+    enabled: bool,
+) -> None:
+    monkeypatch.setenv("ATOM_MINIMAX_M3_SWIGLU_MXFP8", value)
+    monkeypatch.setattr(m3_model, "_sparse_attention_layer_ids", lambda _: set())
+    monkeypatch.setattr(m3_model, "MiniMaxM3Attention", lambda **kwargs: object())
+    monkeypatch.setattr(m3_model, "GemmaRMSNorm", lambda *args, **kwargs: object())
+    mlp_calls: list[dict[str, object]] = []
+
+    def dense_mlp(**kwargs: object) -> object:
+        mlp_calls.append(kwargs)
+        return object()
+
+    monkeypatch.setattr(m3_model, "MiniMaxM3MLP", dense_mlp)
+    config = SimpleNamespace(
+        hidden_size=64,
+        dense_intermediate_size=3072,
+        moe_layer_freq=[0],
+        rms_norm_eps=1e-6,
+    )
+
+    m3_model.MiniMaxM3DecoderLayer(config, prefix="", layer_num=0)
+
+    assert mlp_calls[0]["fuse_swiglu_mxfp8"] is enabled
