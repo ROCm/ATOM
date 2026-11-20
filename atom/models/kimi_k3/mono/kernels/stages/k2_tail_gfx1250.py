@@ -29,7 +29,7 @@ Epochs: one a launch, ``k2_allreduce_gfx1250``'s counters, so this launch
 keeps them equal with the other kernels sharing them; the flags carry the
 whole epoch, unique to the launch.
 
-Early gather (``ATOM_KIMI_MONO_TAIL_EARLY_GATHER``, on by default; a share a
+Early gather (``ATOM_KIMI_MONO_TAIL_EARLY_GATHER``, off by default; a share a
 CTA, no split waves): the CTA gathers its lines before it issues the first
 up-weight slabs, so its gathers' loads do not queue behind them; it pushes
 them in the prologue as before.

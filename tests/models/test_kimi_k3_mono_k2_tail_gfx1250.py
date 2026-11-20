@@ -170,13 +170,12 @@ def test_split_switch_defaults_off(monkeypatch):
 
 def test_early_gather_builds_apart_and_only_a_share_a_cta(monkeypatch):
     monkeypatch.delenv("ATOM_KIMI_MONO_TAIL_EARLY_GATHER", raising=False)
-    early = tail.build_k2_tail(4, 20, 1e-5, identity_routes=True)
-    plain = tail.build_k2_tail(4, 20, 1e-5, identity_routes=True, early_gather=False)
+    plain = tail.build_k2_tail(4, 20, 1e-5, identity_routes=True)
+    early = tail.build_k2_tail(4, 20, 1e-5, identity_routes=True, early_gather=True)
     assert "_eg" not in plain.name and early.name == plain.name + "_eg"
     assert early.grid == plain.grid and early.abi is plain.abi
-    monkeypatch.setenv("ATOM_KIMI_MONO_TAIL_EARLY_GATHER", "0")
-    assert tail.build_k2_tail(4, 20, 1e-5, identity_routes=True).name == plain.name
-    monkeypatch.delenv("ATOM_KIMI_MONO_TAIL_EARLY_GATHER")
+    monkeypatch.setenv("ATOM_KIMI_MONO_TAIL_EARLY_GATHER", "1")
+    assert tail.build_k2_tail(4, 20, 1e-5, identity_routes=True).name == early.name
     # split waves gather on their own path; past one round the shares' lines
     # are gathered together as before
     split = tail.build_k2_tail(4, 20, 1e-5, identity_routes=True, split=True)
@@ -185,10 +184,10 @@ def test_early_gather_builds_apart_and_only_a_share_a_cta(monkeypatch):
     assert "_eg" not in tail.build_k2_tail(4, wide, 1e-5, identity_routes=True).name
 
 
-def test_early_gather_switch_defaults_on(monkeypatch):
+def test_early_gather_switch_defaults_off(monkeypatch):
     from atom.utils import envs
 
     monkeypatch.delenv("ATOM_KIMI_MONO_TAIL_EARLY_GATHER", raising=False)
-    assert envs.ATOM_KIMI_MONO_TAIL_EARLY_GATHER is True
-    monkeypatch.setenv("ATOM_KIMI_MONO_TAIL_EARLY_GATHER", "0")
     assert envs.ATOM_KIMI_MONO_TAIL_EARLY_GATHER is False
+    monkeypatch.setenv("ATOM_KIMI_MONO_TAIL_EARLY_GATHER", "1")
+    assert envs.ATOM_KIMI_MONO_TAIL_EARLY_GATHER is True
