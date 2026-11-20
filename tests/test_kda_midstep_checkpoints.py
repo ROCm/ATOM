@@ -350,7 +350,7 @@ def cpu_checkpoint_writer(monkeypatch, k3_modules):
 
 
 def test_the_forward_writes_heads_ends_and_conv_windows(cpu_checkpoint_writer):
-    mixed_qkv = torch.arange(8.0).repeat(2, 1).T  # token t holds t
+    mixed_qkv = torch.arange(8.0)[:, None].repeat(1, 3)[:, :2]  # padded rows
     conv_state = torch.zeros(6, 2, 4)  # [slots, D, kernel - 1 + num_spec]
     ssm_state = torch.zeros(6, 1, 1, 1)
     ssm_state[0] = 9.0

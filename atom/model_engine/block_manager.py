@@ -3108,7 +3108,7 @@ class BlockManager:
     def align_midstep_chunk(self, seq: Sequence, start: int, chunk: int) -> int:
         """`chunk` shortened so a non-final prefill chunk ends on a block boundary.
 
-        A readable class needs no cut onto its rungs, so the budget alone ends
+        A readable class normally needs no rung cut, so the budget alone ends
         a chunk -- anywhere. The next chunk would then start off the block
         grid, every position on *its* grid would be off it too, and
         `midstep_positions` would have to drop them all: for a prompt longer
@@ -3129,10 +3129,9 @@ class BlockManager:
     ) -> int:
         """Reserve destinations and return the forward's end after any anchor cut.
 
-        Called once the chunk `(start, end]` is settled and before the batch is
-        built, which is the only window where both are true: the positions are
-        known, and the free list can still be committed against without racing
-        an admission later in the same scheduling pass.
+        Called after admission and before the batch is built: `(start, end]`
+        gives the proposed positions and reservations cannot race a later
+        admission. `cut_floor` protects indivisible or replayed token spans.
 
         Overwrites rather than accumulates. A reservation is good for exactly
         one forward, so a second plan for the same seq means the first forward

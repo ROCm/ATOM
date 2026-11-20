@@ -294,9 +294,9 @@ def midstep_target_ok(
 ) -> bool:
     """Whether a forward over `(start, end]` can snapshot the state at `pos`.
 
-    Interior positions must sit on the forward's own grid, `start + grid*k`:
-    that is where the chunk kernel left a state in `h`, and a position between
-    two of them reads the earlier one while being filed under the later hash.
+    Interior positions must sit on the backend's grid, `start + grid*k`.
+    GDN's chunk snapshots use grid 64; Kimi KDA's head re-runs use grid 1.
+    Filing an earlier grid position under a later hash would pair wrong state.
     `end` is always readable, from the runtime slot the forward leaves behind.
 
     `min_offset` tokens of this forward must precede `pos`, because the conv
@@ -311,7 +311,7 @@ def snap_midstep_position(pos: int, start: int, end: int, grid: int) -> int:
     """`pos` moved back onto the grid of a forward over `(start, end]`.
 
     `end` stays where it is: the runtime slot holds it exactly. Anything else
-    goes back to the last state the chunk kernel materialized at or before it,
+    goes back to the last interior position the backend can produce,
     which costs the next resume at most `grid - 1` tokens of recompute.
     """
     if pos == end:

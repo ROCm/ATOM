@@ -3903,9 +3903,8 @@ class Scheduler:
         if target:
             chunk = target - start
         else:
-            # A readable class is never cut onto a rung; keep the next
-            # chunk's start on the block grid instead, or every snapshot
-            # position in it is off the grid too.
+            # Keep the next chunk on the block grid for interior snapshots.
+            # Post-admission planning handles PAGE anchors without scratch.
             chunk = bm.align_midstep_chunk(seq, start, chunk)
         on_rung = bool(target)
         # `cancel_state_fork` runs only when the first two hold, and returning
