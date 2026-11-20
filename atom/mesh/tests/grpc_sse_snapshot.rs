@@ -94,6 +94,7 @@ fn meta() -> WorkerMeta {
         request_id: REQUEST_ID.to_string(),
         weight_version: None,
         cached_tokens: 0,
+        timing: None,
     }
 }
 

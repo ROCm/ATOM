@@ -13,6 +13,7 @@ use std::{
         Arc,
     },
     task::{Context, Poll},
+    time::Instant,
 };
 
 use dashmap::DashMap;
@@ -22,7 +23,7 @@ use tokio::sync::mpsc;
 
 use crate::routers::token_handle::{
     engine_error::EngineError,
-    token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta},
+    token_chunk::{FinishReason, SeqTiming, TokenChunk, Usage, WorkerMeta},
     token_handle::TokenSource,
 };
 
@@ -181,29 +182,43 @@ pub(crate) struct SeqEventSource {
     admission: Admission,
     request_id: String,
     prompt_tokens: u32,
-    /// Each sibling's tokens so far, and its finish once it has one.
-    siblings: Vec<(Vec<u32>, Option<SeqFinish>)>,
+    /// When the request was handed over: its timing runs from here.
+    started_at: Instant,
+    siblings: Vec<Sibling>,
     /// The next sibling whose `Complete` is due.
     next_complete: usize,
     ready: VecDeque<TokenChunk>,
     done: bool,
 }
 
+/// One of a request's sequences, as far as its steps have come.
+#[derive(Default)]
+struct Sibling {
+    output: Vec<u32>,
+    finish: Option<SeqFinish>,
+    first_token_at: Option<Instant>,
+    last_token_at: Option<Instant>,
+    finished_at: Option<Instant>,
+}
+
 impl SeqEventSource {
-    /// `siblings` is how many sequences the backend made of the request.
+    /// `siblings` is how many sequences the backend made of the request,
+    /// handed over at `started_at`.
     pub(crate) fn new(
         events: mpsc::UnboundedReceiver<SeqEvent>,
         admission: Admission,
         request_id: String,
         prompt_tokens: u32,
         siblings: usize,
+        started_at: Instant,
     ) -> Self {
         Self {
             events,
             admission,
             request_id,
             prompt_tokens,
-            siblings: (0..siblings.max(1)).map(|_| (Vec::new(), None)).collect(),
+            started_at,
+            siblings: (0..siblings.max(1)).map(|_| Sibling::default()).collect(),
             next_complete: 0,
             ready: VecDeque::new(),
             done: false,
@@ -216,7 +231,12 @@ impl SeqEventSource {
         let Some(sibling) = self.siblings.get_mut(index as usize) else {
             return;
         };
-        sibling.0.extend_from_slice(&token_ids);
+        let now = Instant::now();
+        if !token_ids.is_empty() {
+            sibling.first_token_at.get_or_insert(now);
+            sibling.last_token_at = Some(now);
+        }
+        sibling.output.extend_from_slice(&token_ids);
         if streamed && !token_ids.is_empty() {
             self.ready.push_back(TokenChunk::Partial {
                 token_ids,
@@ -224,10 +244,14 @@ impl SeqEventSource {
             });
         }
         if finish.is_some() {
-            sibling.1 = finish;
+            sibling.finish = finish;
+            sibling.finished_at = Some(now);
         }
-        while let Some((_, Some(_))) = self.siblings.get(self.next_complete) {
-            let (output, finish) = std::mem::take(&mut self.siblings[self.next_complete]);
+        while let Some(Sibling {
+            finish: Some(_), ..
+        }) = self.siblings.get(self.next_complete)
+        {
+            let sibling = std::mem::take(&mut self.siblings[self.next_complete]);
             // The siblings share one prompt and the renders sum what each
             // reports, so only the first reports it.
             let prompt_tokens = if self.next_complete == 0 {
@@ -235,11 +259,7 @@ impl SeqEventSource {
             } else {
                 0
             };
-            let finish = finish.unwrap_or(SeqFinish {
-                reason: None,
-                cached_tokens: 0,
-            });
-            let complete = self.complete(output, finish, prompt_tokens);
+            let complete = self.complete(sibling, prompt_tokens);
             self.ready.push_back(complete);
             self.next_complete += 1;
         }
@@ -249,10 +269,15 @@ impl SeqEventSource {
         }
     }
 
-    fn complete(&self, output: Vec<u32>, finish: SeqFinish, prompt_tokens: u32) -> TokenChunk {
-        let completion_tokens = output.len() as u32;
+    fn complete(&self, sibling: Sibling, prompt_tokens: u32) -> TokenChunk {
+        let timing = self.timing(&sibling);
+        let finish = sibling.finish.unwrap_or(SeqFinish {
+            reason: None,
+            cached_tokens: 0,
+        });
+        let completion_tokens = sibling.output.len() as u32;
         TokenChunk::Complete {
-            token_ids: output,
+            token_ids: sibling.output,
             finish_reason: finish_reason(finish.reason.as_deref()),
             matched_stop: None,
             usage: Usage {
@@ -266,7 +291,25 @@ impl SeqEventSource {
                 request_id: self.request_id.clone(),
                 weight_version: None,
                 cached_tokens: finish.cached_tokens,
+                timing: Some(timing),
             },
+        }
+    }
+
+    /// As `api_server.py` times a sequence: to its first token, per output
+    /// token after the first, and end to end.
+    fn timing(&self, sibling: &Sibling) -> SeqTiming {
+        let since = |at: Instant| at.duration_since(self.started_at).as_secs_f64();
+        let tokens = sibling.output.len();
+        SeqTiming {
+            ttft: sibling.first_token_at.map_or(0.0, since),
+            tpot: match (sibling.first_token_at, sibling.last_token_at) {
+                (Some(first), Some(last)) if tokens > 1 => {
+                    last.duration_since(first).as_secs_f64() / (tokens - 1) as f64
+                }
+                _ => 0.0,
+            },
+            latency: sibling.finished_at.map_or(0.0, since),
         }
     }
 }
@@ -345,7 +388,8 @@ mod tests {
         let (key, events) = registry.register();
         let admission = Admission::new(key, Arc::clone(&registry), aborter.clone());
         assert!(!submitted(&admission.stage()));
-        let mut source = SeqEventSource::new(events, admission, "req-1".into(), 4, 1);
+        let mut source =
+            SeqEventSource::new(events, admission, "req-1".into(), 4, 1, Instant::now());
 
         registry.deliver(
             key,
@@ -388,7 +432,8 @@ mod tests {
         let (key, events) = registry.register();
         let admission = Admission::new(key, Arc::clone(&registry), aborter.clone());
         assert!(!submitted(&admission.stage()));
-        let mut source = SeqEventSource::new(events, admission, "req-n".into(), 4, 2);
+        let mut source =
+            SeqEventSource::new(events, admission, "req-n".into(), 4, 2, Instant::now());
 
         let finish = || {
             Some(SeqFinish {

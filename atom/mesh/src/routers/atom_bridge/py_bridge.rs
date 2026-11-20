@@ -212,6 +212,7 @@ impl Dispatcher for BridgeDispatcher {
         _placement: &PlacementPlan,
         payload: &mut GenerationPayload,
     ) -> Result<TokenHandle, EngineError> {
+        let started_at = std::time::Instant::now();
         let request = BridgeRequest::from_payload(payload, &RequestExtras::current())
             .map_err(EngineError::RequestBuildFailed)?;
         let (key, events) = self.registry.register();
@@ -240,6 +241,7 @@ impl Dispatcher for BridgeDispatcher {
             request_id,
             prompt_tokens,
             siblings,
+            started_at,
         )))
     }
 }

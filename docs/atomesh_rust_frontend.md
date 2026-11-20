@@ -132,7 +132,10 @@ mesh's gRPC routing already runs.
 * Reasoning read from a prompt that opened it; a non-streamed reply over the
   parser's 64 KiB buffer is split rather than refused.
 * Models with a Python chat template (DeepSeek-V4, Kimi-K3).
-* Usage with `cached_tokens` (the engine's prefix-cache hit).
+* Usage with `cached_tokens` (the engine's prefix-cache hit); a chat's also
+  with `prompt_tokens_details.cached_tokens` and, not streamed, `ttft_s` /
+  `tpot_s` / `latency_s` (`num_choices` past one), timed as `api_server.py`
+  times them (`render/atom_usage.rs`).
 * Client disconnect aborts the request.
 
 Refused with a 400 until they are built: streaming with `n > 1`, logprobs,
@@ -156,7 +159,7 @@ submit; `reasoning/kimi_k3.rs` the K3 channels; the rest end to end on a GPU.
 
 | Phase | Work |
 |---|---|
-| P1 | `/health` and `/metrics` with the engine's state and series (`get_metrics_statistics`, same metric names); `/start_profile`, `/stop_profile`, `/debug/mtp_stats`, `/debug/cache_stats` through the bridge; wait for the tokenizer before reporting ready; `ttft_s` / `tpot_s` / `latency_s` in `usage` (`render/atom_usage.rs` on `mesh-engine-v1-switch`); ATOM's reasoning controls as `_chat_completions` resolves them (`thinking`, `reasoning_effort`) |
+| P1 | `/health` and `/metrics` with the engine's state and series (`get_metrics_statistics`, same metric names); `/start_profile`, `/stop_profile`, `/debug/mtp_stats`, `/debug/cache_stats` through the bridge; wait for the tokenizer before reporting ready; `ttft_s` / `tpot_s` / `latency_s` in a completion's `usage` (its render is the generate one, re-wrapped); ATOM's reasoning controls as `_chat_completions` resolves them (`thinking`, `reasoning_effort`) |
 | P2 | logprobs and streaming `n > 1` (the streamed chat render writes one choice); structured output (`json_schema` to `SamplingParams`); OpenAI error bodies as the OpenAI server writes them; batching submits (one GIL entry for many requests) if admission shows up in profiles |
 | P3 | `/v1/messages` (Anthropic), `/v1/responses` checked against the OpenAI server, FIM and prefix completion |
 | P4 | multimodal (images to `preprocess_fanout(multimodal_data=...)`), `kv_transfer_params` for P/D |
