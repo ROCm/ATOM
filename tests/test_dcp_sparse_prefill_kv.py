@@ -381,11 +381,13 @@ def _sized_for(buffers, tokens, heads):
     )
 
 
+@pytest.mark.parametrize("local,gathered", [(48, 128), (16, 48)])
 @pytest.mark.parametrize("kv", [False, True])
-def test_a_step_publishes_its_widths_buffers(monkeypatch, kv):
+def test_a_step_publishes_its_widths_buffers(monkeypatch, kv, local, gathered):
     """The attention reads the work buffers off the metadata, and sizes its
-    fp32 partials and reduce grid by them."""
-    b = _viewer({"": 4096, "ub0_": 2048})
+    fp32 partials and reduce grid by them. 48 heads take more tiles than 128
+    or 16, so each width pair leaves one of its steps on a slice."""
+    b = _viewer({"": 4096, "ub0_": 2048}, local, gathered)
     b.dcp_world_size = 2
     b.dcp_sparse_prefill_nonps = False
     b.block_size = 1
@@ -396,7 +398,9 @@ def test_a_step_publishes_its_widths_buffers(monkeypatch, kv):
     )
     b._dcp_sparse_prefill_step(None, md, "")
     assert _sized_for(
-        lambda name: getattr(md, f"sparse_prefill_{name}"), 4096, 48 if kv else 128
+        lambda name: getattr(md, f"sparse_prefill_{name}"),
+        4096,
+        local if kv else gathered,
     )
 
 
@@ -408,6 +412,13 @@ def test_steps_alternating_widths_each_see_their_own():
         assert _sized_for(work.__getitem__, tokens[prefix], heads)
 
 
+def test_shared_views_are_read_only():
+    """Every step gets the same cached views, so a consumer must not edit them."""
+    work = _viewer({"": 4096, "ub0_": 2048})._sparse_prefill_work_views("", 48)
+    with pytest.raises(TypeError):
+        work["work_indptr"] = None
+
+
 def test_widths_of_one_size_see_the_whole_buffers():
     """GLM-5.2's 16 heads a rank take the tiles its 64 gathered do."""
     b = _viewer({"": 4096, "ub0_": 2048}, local=16, gathered=64)
@@ -415,20 +426,9 @@ def test_widths_of_one_size_see_the_whole_buffers():
     for heads in (16, 64):
         work = b._sparse_prefill_work_views("", heads)
         for name in aiter_mla.PERSISTENT_WORK_BUFFERS:
-            assert work[name] is var[f"sparse_prefill_{name}"]
-
-
-def test_views_follow_reallocated_buffers():
-    b = _viewer({"": 4096, "ub0_": 2048})
-    var = b.model_runner.forward_vars
-    b._sparse_prefill_work_views("", 48)
-    for name in aiter_mla.PERSISTENT_WORK_BUFFERS:
-        key = f"sparse_prefill_{name}"
-        var[key] = torch.empty_like(var[key])
-    work = b._sparse_prefill_work_views("", 48)
-    for name in aiter_mla.PERSISTENT_WORK_BUFFERS:
-        base = var[f"sparse_prefill_{name}"]
-        assert work[name].data_ptr() == base.data_ptr()
+            base = var[f"sparse_prefill_{name}"]
+            assert work[name].shape == base.shape
+            assert work[name].data_ptr() == base.data_ptr()
 
 
 def test_a_q_builder_sizes_the_work_buffers_as_before():

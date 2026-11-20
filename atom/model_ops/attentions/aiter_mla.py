@@ -5,6 +5,7 @@ import functools
 import inspect
 import logging
 from dataclasses import dataclass
+from types import MappingProxyType
 
 import numpy as np
 import torch
@@ -2255,12 +2256,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
     def _sparse_prefill_work_views(self, prefix, heads):
         """The ``prefix`` work buffers as a ``heads`` plan alone would size
         them. aiter sizes its reduce grid and fp32 partials by the buffers it
-        is given, so a step must not see the max over both widths."""
-        var = self.model_runner.forward_vars
-        first = var[f"{prefix}sparse_prefill_work_meta_data"]
+        is given, so a step must not see the max over both widths. Built once
+        per (prefix, heads) and shared by every step, hence read-only."""
         cached = self._sparse_prefill_work_view_cache.get((prefix, heads))
-        if cached is not None and cached[0] is first:
-            return cached[1]
+        if cached is not None:
+            return cached
+        var = self.model_runner.forward_vars
         work = {
             name: var[f"{prefix}sparse_prefill_{name}"]
             for name in PERSISTENT_WORK_BUFFERS
@@ -2272,7 +2273,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 rows = size[0] if isinstance(size, (tuple, list)) else size
                 if rows < work[name].shape[0]:
                     work[name] = work[name][:rows]
-        self._sparse_prefill_work_view_cache[(prefix, heads)] = (first, work)
+        work = MappingProxyType(work)
+        self._sparse_prefill_work_view_cache[(prefix, heads)] = work
         return work
 
     def _sparse_prefill_work_plan(
