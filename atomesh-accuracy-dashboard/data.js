@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795111923339,
+  "lastUpdate": 1795193448127,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -5170,6 +5170,40 @@ window.BENCHMARK_DATA = {
             "value": 0.8939,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44563377144 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611191609 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1645 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "lirui",
+            "username": "lirui927",
+            "email": "Rui.Li@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "fb1304722a9f79cd16e7383b8b504ccb29851d77",
+          "message": "perf(minimax-m3): consume sparse PA prequant output (#2949)\n\n* perf(minimax-m3): let the sparse PA write o_proj's per-token FP8 input\n\nMiniMax-M3's sparse attention wrote a BF16 output, which a per-token FP8\no_proj then quantized in a launch of its own. With ROCm/aiter#7401, FlyDSL's\npa_decode writes the FP8 rows and their FP32 descales itself.\n\n`Attention.per_token_fp8_out`, which already hands o_proj an `(out, scale)`\npair under Ulysses SP, now also covers an impl whose kernel writes that pair\n(`supports_output_quant`, False on the base impl), through the new op\n`unified_attention_fp8`. The sparse impl sets it on a GPU without gluon (its\nsparse PA is FlyDSL's on every call), over an FP8 KV cache and with one KV\nhead per rank. The PA skips the BF16 store and writes rows past the queries\nas FP8 zeros with a unit descale. The plan stays as it was; aiter picks the\nfused epilogue where that plan allows and quantizes after the merge\nelsewhere, with the same bytes.\n\nNeeds aiter with #7401: ATOM calls its kwargs without probing for them.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* perf(minimax-m3): give the FP8-output sparse PA a plan budget of six workgroups per CU\n\nWith aiter's default budget, two workgroups per CU, a sparse PA call whose\nrows x split pass it gets fewer partitions than the split asks for and a\nslower merge, which for the FP8 output also quantizes in a launch of its own.\nSix per CU keeps the split. One MI455X, FP8 KV, 2048-token windows, us per\ncall (median of 7, interleaved, CUDA graphs), default -> six per CU:\ndecode rows 72 9.12 -> 6.08, 96 9.85 -> 8.12, 160 11.43 -> 8.35,\n240 14.45 -> 11.11, 384 22.16 -> 14.84; within 1% at 1-64 and 128 rows.\n\nThis replaces the earlier forced plans (one partition per prefill row, one\ncluster of eight per decode row up to 240 rows): those were 18-23% slower\nthan aiter's own plan at 1-16 decode rows.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* fix(minimax-m3): correct the FP8-output comments; tighten the pad-row tests\n\nThe sparse prefill/decode comments said the FP8 path writes no BF16. The\nBF16 `output` is still allocated and only fixes the layout; on plans aiter\ncannot fuse, pa_decode writes a BF16 intermediate and then runs the\nstandalone quant. Say so.\n\nTests: the FP8 case of the row-rule test fills `quantized_output` with a\nsentinel, so the zero pad rows must come from the PA call. The GPU bitwise\ntest runs the FP8 output through the decode/prefill entry points, so the\nprefill pad rows are checked on the GPU too.\n\n`_attention_fp8_fake` is now `attention_fp8_fake`: two ops share it.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* docs(minimax-m3): name the FP8-output budget and the tested entry points\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* test(minimax-m3): pin the gate that turns the FP8 attention output on\n\nBuild Attention.__init__ with a stub impl and check per_token_fp8_out:\nwithout SP it follows the caller's request and the impl's\nsupports_output_quant; under SP it follows the head exchange and ignores\nthe impl. Reverting the gate to the SP-only formula fails this test.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* perf(minimax-m3): keep the feature-off attention calls as on main\n\nA layer without the FP8 output now makes exactly the calls it made before:\n- PagedAttentionImpl.forward passes the FP8 output pair to forward_impl only\n  through its **kwargs, and forward_impl keeps the plain 8-argument backend\n  call when there is no pair.\n- run_pa_decode checks the pair inside its FlyDSL branch and binds it there,\n  so the FlyDSL call keeps its plain argument list; the guard refusing an FP8\n  output before gluon stays. Its three new parameters sit before the `*`:\n  a missing keyword-only default costs CPython a dict lookup on every call.\n\nDocs: the FP8-output sparse PA is native ATOM only, without Ulysses SP; the\nvLLM/SGLang bridges never take it. Docstrings name `unified_attention_fp8`\nand the optional pair in the dispatch_backend contract. Tests pin that the\nbackend and FlyDSL get no extra kwargs without the pair.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* perf(minimax-m3): give the FP8 attention output entries of its own\n\nWithout an FP8 output, every call now runs main's code:\n`PagedAttentionImpl.forward`, `run_pa_decode`, `sparse_pa_per_row` and both\nsparse asm wrappers are main's again.\n\n- `unified_attention_fp8` calls `impl.forward_impl` with the pair directly,\n  so `forward` needs no `if kwargs:`.\n- The sparse PA writing FP8 is `sparse_pa_fp8_per_row`, FlyDSL only: it\n  plans with the FP8 budget and calls aiter's `pa_decode` with the pair, as\n  the MXFP4 sparse PA calls FlyDSL itself. `_sparse_decode` /\n  `_sparse_prefill` branch once on the pair and otherwise call the asm\n  wrapper as on main. `run_pa_decode` loses its three slots, the FlyDSL-side\n  bind and the gluon-side guard (dead: the pair exists only on GPUs without\n  gluon).\n- Drop the FP4-KV `NotImplementedError` (the gate admits an FP8 KV only)\n  and ATOM's pair check (aiter validates the pair).\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* perf(minimax-m3): read the FP8 plan budget after the captured-plan return; run the tests on CPU CI\n\n- `_flydsl_prepare_explicit_plan` reads the workgroup budget after the\n  `existing_plan` early return, so a captured dense plan pays nothing for it.\n- `_sparse_decode` / `_sparse_prefill` branch on the FP8 output first: it\n  gets `torch.empty_like(q[:rows])` as its layout, and the BF16 output and\n  its pad-row memset are allocated only on the other branches, as before.\n- `sparse_pa_fp8_per_row`: say when aiter fuses the quant into the PA launch\n  and when it stores BF16, then quantizes and fills the pad rows after.\n- docs: the FP8 budget's larger decode-plan scratch.\n- tests: load the modules under `atom_without_aiter` so the CPU CI lane runs\n  the file; a sentinel FP8 buffer for the dummy run; the call-site walks cover\n  `sparse_pa_fp8_per_row` in decode and prefill.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: lirui927 <ruili@amd.com>\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-20T14:40:00Z",
+          "url": "https://github.com/ROCm/ATOM/commit/fb1304722a9f79cd16e7383b8b504ccb29851d77"
+        },
+        "date": 1795193447260,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.95,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44770843897 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202611201604 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9431 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8984,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44770843897 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611201604 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1789 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
