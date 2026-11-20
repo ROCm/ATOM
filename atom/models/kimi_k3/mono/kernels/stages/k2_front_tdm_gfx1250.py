@@ -142,13 +142,25 @@ def _front_tasks(
     wide=False,
     depth=gemv_tdm.DEPTH,
     paired=False,
+    pipe=None,
+    fp8_depth=None,
 ):
     """CTA ``pair``'s two projection tasks of ``x`` and their epilogue. The
     accumulators are reduced in the weight slabs' LDS, consumed by then (not
     the token slabs', which a cluster peer's multicast may still be filling).
     ``paired``: the projections walk K two slabs a step, the FP8 shared one
-    ``TDM_FP8_PAIR_DEPTH`` ahead."""
-    red = lds.gemv.ptr + tdm_lds_words(rows, 2, group=2 if paired else 1)[0]
+    ``fp8_depth`` ahead (None: ``TDM_FP8_PAIR_DEPTH``, unpaired
+    ``FP8_DEPTH``). ``pipe``: ``gemv_tdm.project``'s late, token_steps and
+    early_scales (None: its defaults)."""
+    if fp8_depth is None:
+        fp8_depth = TDM_FP8_PAIR_DEPTH if paired else gemv_tdm.FP8_DEPTH
+    pipe = pipe or {}
+    red = (
+        lds.gemv.ptr
+        + tdm_lds_words(
+            rows, 2, group=2 if paired else 1, token_steps=pipe.get("token_steps", 2)
+        )[0]
+    )
     router_weight, latent_weight, shared_weight, shared_scale = weights
     router = pair < LATENT_PAIR0
     latent = (pair >= LATENT_PAIR0) & (pair < SHARED_PAIR0)
@@ -180,11 +192,12 @@ def _front_tasks(
                     lane,
                     wave,
                     w_scale=shared_scale,
-                    depth=TDM_FP8_PAIR_DEPTH if paired else gemv_tdm.FP8_DEPTH,
+                    depth=fp8_depth,
                     prologue=prologue,
                     x_cache_policy=x_cache_policy,
                     wide=wide,
                     paired=paired,
+                    **pipe,
                 ),
                 red,
                 tiles,
@@ -209,6 +222,7 @@ def _front_tasks(
                     wide=wide,
                     depth=depth,
                     paired=paired,
+                    **pipe,
                 ),
                 red,
                 tiles,
@@ -233,6 +247,7 @@ def _front_tasks(
                 wide=wide,
                 depth=depth,
                 paired=paired,
+                **pipe,
             ),
             red,
             tiles,
@@ -491,10 +506,60 @@ def front_split_tasks(
     )
 
 
-def _front_words(rows: int, depth: int, paired: bool) -> int:
+def _front_words(rows: int, depth: int, paired: bool, token_steps: int = 2) -> int:
     """The replicated front's GEMV LDS words: the BF16 plan, which the FP8
     shared one fits in."""
-    return sum(tdm_lds_words(rows, 2, depth=depth, group=2 if paired else 1))
+    return sum(
+        tdm_lds_words(
+            rows, 2, depth=depth, group=2 if paired else 1, token_steps=token_steps
+        )
+    )
+
+
+# Late copies (``gemv_tdm.project(late)``), three steps of tokens: (paired,
+# BF16 depth, FP8 depth), the first whose LDS fits the width. A late weight
+# copy is issued a barrier later, so it runs a slab (unpaired) or two
+# (paired) deeper for the same copies in flight; a wave still keeps three.
+_LATE_PLANS = (
+    (True, 6, 6),
+    (True, 4, 6),
+    (False, 5, 6),
+    (False, 4, 6),
+    (False, 3, 6),
+    (False, 2, 5),
+)
+
+
+def front_pipe(rows: int, pairable: bool, lds_bytes: int, sites=None):
+    """The late pipeline's plan for ``ATOM_KIMI_MONO_FRONT_PIPE``'s
+    ``sites`` (None: the env's) at ``rows``: ``{paired, depth, fp8_depth,
+    late, token_steps}`` from ``_LATE_PLANS`` (paired ones only if
+    ``pairable``; "up": none), or {} without "late" or a plan that fits
+    ``lds_bytes`` beside the group rows; "early" adds ``early_scales``."""
+    sites = envs.ATOM_KIMI_MONO_FRONT_PIPE if sites is None else sites
+    pipe = {}
+    if "late" in sites:
+        for paired, depth, fp8_depth in _LATE_PLANS:
+            if paired and (not pairable or "up" in sites):
+                continue
+            if _front_words(rows, depth, paired, 3) + rows * 16 <= lds_bytes // 4:
+                pipe = {
+                    "paired": paired,
+                    "depth": depth,
+                    "fp8_depth": fp8_depth,
+                    "late": True,
+                    "token_steps": 3,
+                }
+                break
+    if "early" in sites:
+        pipe["early_scales"] = True
+    return pipe
+
+
+def _pipe_suffix(pipe) -> str:
+    return ("_late" if pipe.get("late") else "") + (
+        "_es" if pipe.get("early_scales") else ""
+    )
 
 
 def build_replicated_front(
@@ -504,12 +569,14 @@ def build_replicated_front(
     depth: int = 4,
     fp4_latent: bool = False,
     split: bool | None = None,
+    pipe_sites=None,
 ) -> K2ReplicatedFrontKernel:
     """``fp8_shared``: the shared gate/up is ATOM's online per_1x128 FP8 with
     its E8M0 block scales in ``shared_scale``. ``split`` (default: "front" in
     ATOM_KIMI_MONO_SPLITK): split K over each cluster where the LDS holds it.
     ``fp4_latent`` (split only): the latent weight is MXFP4, its E8M0 plane
-    the launcher's ``latent_scale``."""
+    the launcher's ``latent_scale``. ``pipe_sites``: ``front_pipe``'s (None:
+    ATOM_KIMI_MONO_FRONT_PIPE)."""
     if split is None:
         split = "front" in envs.ATOM_KIMI_MONO_SPLITK
     if split or fp4_latent:
@@ -526,19 +593,29 @@ def build_replicated_front(
         raise ValueError(f"replicated K2 front needs {PAIRS} CTAs")
     rows = plan.tokens
     tiles = (rows + ROWS - 1) // ROWS
-    paired = wide and depth % 2 == 0 and "front" in gemv_tdm.paired_sites()
+    pairable = wide and depth % 2 == 0 and "front" in gemv_tdm.paired_sites()
+    paired = pairable
     # Unpaired where four slabs ahead do not fit: two ahead is slower (32-40).
     if paired and _front_words(rows, depth, True) + rows * 16 > plan.lds_bytes // 4:
         paired = False
-    staged = _front_words(rows, depth, paired)
+    pipe = front_pipe(rows, pairable, plan.lds_bytes, pipe_sites)
+    paired = pipe.pop("paired", paired)
+    depth = pipe.pop("depth", depth)
+    fp8_depth = pipe.pop(
+        "fp8_depth", TDM_FP8_PAIR_DEPTH if paired else gemv_tdm.FP8_DEPTH
+    )
+    token_steps = pipe.get("token_steps", 2)
+    staged = _front_words(rows, depth, paired, token_steps)
     group = 2 if paired else 1
     assert (
-        staged - tdm_lds_words(rows, 2, group=group)[0] >= 2 * tiles * ACCUMULATOR_WORDS
+        staged - tdm_lds_words(rows, 2, group=group, token_steps=token_steps)[0]
+        >= 2 * tiles * ACCUMULATOR_WORDS
     )
     # The FP8 shared slabs reuse the LDS planned for the BF16 ones, and the
     # shared CTAs start a cluster, so no cluster mixes the two pipelines.
-    fp8_depth = TDM_FP8_PAIR_DEPTH if paired else gemv_tdm.FP8_DEPTH
-    assert sum(tdm_lds_words(rows, 2, True, fp8_depth, group)) <= staged
+    assert (
+        sum(tdm_lds_words(rows, 2, True, fp8_depth, group, token_steps)) <= staged
+    )
     assert SHARED_PAIR0 % gemv_tdm.CLUSTER_LAUNCH["cluster"][0] == 0
 
     @fx.struct
@@ -552,7 +629,8 @@ def build_replicated_front(
         raise ValueError(f"replicated K2 front needs {lds_bytes(Lds)} B of LDS")
     name = (
         f"k3_k2_gfx1250_replicated_front{'_w' if wide else ''}_d{depth}"
-        f"{'_ps' if paired else ''}"
+        f"{'_ps' if paired else ''}{_pipe_suffix(pipe)}"
+        f"{f'_f{fp8_depth}' if pipe.get('late') else ''}"
         f"_s{rows}{'_f8' if fp8_shared else ''}{gemv_tdm.cold_suffix()}"
         f"{tdm_timeline.suffix()}"
     )
@@ -598,6 +676,8 @@ def build_replicated_front(
                 wide=wide,
                 depth=depth,
                 paired=paired,
+                pipe=pipe,
+                fp8_depth=fp8_depth,
             )
         tdm_timeline.close_cta()
 

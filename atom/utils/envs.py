@@ -754,6 +754,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ).split(",")
         if site not in ("", "0")
     ),
+    # Kimi-K3 gfx1250 mono: the replicated K2 front's slab pipeline (the same
+    # bits), a comma list: "late" issues a step's copies past its one barrier
+    # (gemv_tdm.project(late)); "t3" (with late) keeps three steps of tokens
+    # where LDS holds them; "early" stages the shared FP8 scales behind the
+    # first copies. Empty, the default, keeps the current pipeline.
+    "ATOM_KIMI_MONO_FRONT_PIPE": lambda: frozenset(
+        site
+        for site in os.getenv("ATOM_KIMI_MONO_FRONT_PIPE", "").split(",")
+        if site not in ("", "0")
+    ),
     # Kimi-K3 gfx1250 mono: K1's whole-head recurrence over a step's query
     # tokens as one chunk (the projections and outputs of the starting state
     # reduced side by side, the tokens' interactions solved per row) instead

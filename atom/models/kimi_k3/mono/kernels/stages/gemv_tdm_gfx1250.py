@@ -370,6 +370,9 @@ def project(
     wide: bool = True,
     token_buffers: int = 2,
     paired: bool = False,
+    late: bool = False,
+    token_steps: int = 2,
+    early_scales: bool | None = None,
 ):
     """``x[rows, k] @ w[task_rows[i]:+16, k]^T`` for each task, as v8 f32 WMMA
     accumulators ``[task][16-token tile]``. ``w`` has ``w_rows`` rows of ``k``
@@ -394,7 +397,15 @@ def project(
     ``paired`` (rolled): two slabs a step, ``depth`` slabs ahead -- one
     barrier pair a step, four token slabs resident
     (``tdm_lds_words(group=2)``); each accumulator sums the slabs in the same
-    order. An odd last slab takes a step of its own."""
+    order. An odd last slab takes a step of its own.
+
+    ``late`` (rolled, ``prologue`` None, K a whole number of steps): a step's
+    copies are issued past its one barrier, into the buffers the step before
+    read, instead of ahead of a barrier of their own (``_project_late``);
+    ``token_steps`` steps of tokens resident (``tdm_lds_words``), so a token
+    copy is issued that many steps less one ahead. ``early_scales``: the FP8
+    scales staged behind the first copies (None: ``ATOM_KIMI_MONO_TDM_COLD``
+    "early"). The same WMMAs in the same order: the same sums."""
 
     if k % SLAB:
         raise ValueError(f"TDM GEMV needs K divisible by {SLAB}, got {k}")
@@ -404,6 +415,35 @@ def project(
         raise ValueError(f"FP8 TDM GEMV holds one slab's scales a lane, K={k}")
     tasks = len(task_rows)
     rolled = _ROLLED_UNROLL and wide and token_buffers == 2 and 1 + 2 * tasks <= WAVES
+    group = 2 if paired else 1
+    if late:
+        if not (rolled and prologue is None and slabs % group == 0):
+            raise ValueError(
+                "late TDM GEMV copies need the rolled loop, no prologue and"
+                " whole steps"
+            )
+        if not 2 <= token_steps <= 3 or depth < group:
+            raise ValueError(f"late TDM GEMV: {token_steps} token steps, depth {depth}")
+        return _project_late(
+            lds,
+            x,
+            x_stride,
+            rows,
+            w,
+            w_rows,
+            k,
+            task_rows,
+            lane,
+            wave,
+            w_scale,
+            depth,
+            x_cache_policy,
+            group,
+            token_steps,
+            "early" in _COLD if early_scales is None else early_scales,
+        )
+    if token_steps != 2:
+        raise ValueError("only the late TDM GEMV keeps more token steps")
     if paired and not (rolled and slabs >= 2 and depth % 2 == 0):
         raise ValueError(
             "paired TDM GEMV slabs need the rolled loop, two slabs and even depth"
@@ -424,7 +464,8 @@ def project(
             depth,
             prologue,
             x_cache_policy,
-            2 if paired else 1,
+            group,
+            early_scales,
         )
     tiles = (rows + ROWS - 1) // ROWS
     token_words = rows * ROW_STRIDE // 2
@@ -705,6 +746,7 @@ def _project_rolled(
     prologue,
     x_cache_policy,
     group=1,
+    early_scales=None,
 ):
     """``project`` (wide) with its slab loop a runtime loop, ``group`` slabs
     a step. Wave 0 copies
@@ -738,7 +780,7 @@ def _project_rolled(
 
     # "early": the scales' load (and its wait, for the LDS store) behind the
     # first copies; they are first read past the slab-0 barrier either way.
-    early = "early" in _COLD
+    early = "early" in _COLD if early_scales is None else early_scales
     if const_expr(fp8 and not early):
         stage_scales()
 
@@ -912,6 +954,268 @@ def _project_rolled(
         ] + list(activations[tiles - 1])
     accs = _rolled_last_tile(accs, pend, tasks, tiles)
     tdm_timeline.slab(fx.Int32(slabs - 1), tdm_timeline.C)
+    tdm_timeline.stamp(tdm_timeline.PROJECT_DONE)
+    return [[accs[tk * tiles + tl] for tl in range(tiles)] for tk in range(tasks)]
+
+
+@traced
+def _late_tail(slab, slabs, ahead):
+    """``s_wait_tensorcnt(ahead)``, then every count down to the number of
+    this wave's slabs (``slab + 2``, ``slab + 4`` ..) left in flight."""
+    rocdl.s_wait_tensorcnt(ahead)
+    for count in range_constexpr(ahead - 1, -1, -1):
+        if slab + 2 * (count + 1) >= slabs:
+            rocdl.s_wait_tensorcnt(count)
+
+
+@traced
+def _late_waits(role, s, steps, slabs, tasks, depth, group, token_steps):
+    """Step ``s``'s waits before its barrier: wave 0 for the step's tokens
+    (the next ``token_steps - 2`` steps' may stay in flight), a weight wave
+    for its slab of the step (its later ones issued so far may)."""
+    if role == 0:
+        ahead = token_steps - 2
+        rocdl.s_wait_tensorcnt(group * ahead)
+        for count in range_constexpr(ahead - 1, -1, -1):
+            if s + count + 1 >= steps:
+                rocdl.s_wait_tensorcnt(group * count)
+    if (role > 0) & (role < 1 + 2 * tasks):
+        if const_expr(group == 2):
+            _late_tail(2 * s + ((role + 1) & 1), slabs, (depth - 2) // 2)
+        else:
+            if ((role + s) & 1) == 1:
+                _late_tail(s, slabs, (depth - 1) // 2)
+
+
+@traced
+def _late_issue(
+    role, s, steps, slabs, tasks, depth, group, token_steps, issue_tokens, issue_weight
+):
+    """Step ``s``'s copies past its barrier, each into a buffer step ``s - 1``
+    read: wave 0 the tokens of step ``s + token_steps - 1``, wave ``1 + 2 t +
+    (j & 1)`` task ``t``'s slab ``j`` (``depth`` past the step's)."""
+    if role == 0:
+        if s + token_steps - 1 < steps:
+            for g in range_constexpr(group):
+                issue_tokens(s + token_steps - 1, g)
+    if (role > 0) & (role < 1 + 2 * tasks):
+        if const_expr(group == 2):
+            slab = 2 * s + ((role + 1) & 1) + depth
+            if slab < slabs:
+                issue_weight(slab)
+        else:
+            if (((role + s + depth) & 1) == 1) & (s + depth < slabs):
+                issue_weight(s + depth)
+
+
+@traced
+def _project_late(
+    lds,
+    x,
+    x_stride,
+    rows,
+    w,
+    w_rows,
+    k,
+    task_rows,
+    lane,
+    wave,
+    w_scale,
+    depth,
+    x_cache_policy,
+    group,
+    token_steps,
+    early_scales,
+):
+    """``_project_rolled`` with one barrier a step: a step waits for its
+    copies, passes the (cluster) barrier, which also frees the buffers the
+    step before read, then issues the copies refilling them and multiplies.
+    The copies leave the waits' critical path and a step drops a barrier
+    phase; wave 0 copies the tokens ``token_steps - 1`` steps ahead, waves
+    ``1 + 2 t`` and ``2 + 2 t`` task ``t``'s even and odd slabs ``depth``
+    ahead, as there."""
+    slabs = k // SLAB
+    steps = slabs // group
+    fp8 = w_scale is not None
+    tasks = len(task_rows)
+    tiles = (rows + ROWS - 1) // ROWS
+    x_words, _ = tdm_lds_words(rows, tasks, fp8, group=group, token_steps=token_steps)
+    token_words = rows * ROW_STRIDE // 2
+    task_words = tdm_task_words(fp8)
+    stages = depth + group
+    scales = lds + x_words + stages * tasks * task_words
+    tdm_timeline.stamp(tdm_timeline.GEMV_START)
+
+    def stage_scales():
+        row = task_rows[0]
+        for t in range_constexpr(1, tasks):
+            row = (wave == t).select(task_rows[t], row)
+        word = bo.buffer_load(
+            rsrc(w_scale),
+            row // 128 * (k // 512) + fx.min(lane, slabs - 1),
+            vec_width=1,
+            dtype=T.i32,
+        )
+        fx.ptr_store(fx.Int32(word), scales + wave * GFX1250.wave_size + lane)
+
+    if const_expr(fp8 and not early_scales):
+        stage_scales()
+
+    role = _uniform(wave)
+    task = fx.min(fx.max(role - 1, 0) // 2, tasks - 1)
+    task_row = task_rows[0]
+    for t in range_constexpr(1, tasks):
+        task_row = (task == t).select(task_rows[t], task_row)
+    task_row = _uniform(task_row)
+
+    def issue_tokens(step, g):
+        load_rows(
+            x + (fx.Int64(step) * group + g) * fx.Int64(SLAB * 2),
+            x_stride,
+            lds + ((step % token_steps) * group + g) * token_words,
+            rows,
+            rows,
+            _CLUSTER_MASK,
+            cache_policy=x_cache_policy,
+            whole=True,
+        )
+
+    def issue_weight(slab):
+        destination = lds + x_words + ((slab % stages) * tasks + task) * task_words
+        if const_expr(fp8):
+            load_rows(
+                w
+                + fx.Int64(task_row) * fx.Int64(k)
+                + fx.Int64(slab) * fx.Int64(SLAB * ROWS),
+                SLAB,
+                destination,
+                WAVES,
+                WAVES,
+                padded=False,
+                cache_policy=_WEIGHT_CACHE_POLICY,
+                whole=True,
+                uniform=True,
+            )
+        else:
+            load_rows(
+                w
+                + fx.Int64(task_row) * fx.Int64(k * 2)
+                + fx.Int64(slab) * fx.Int64(SLAB * 2),
+                k,
+                destination,
+                fx.Int32(w_rows) - task_row,
+                ROWS,
+                cache_policy=_WEIGHT_CACHE_POLICY,
+                whole=True,
+                uniform=True,
+            )
+
+    def first_tokens():
+        for step in range_constexpr(min(token_steps - 1, steps)):
+            for g in range_constexpr(group):
+                issue_tokens(fx.Int32(step), g)
+
+    _on_wave(role, 0, first_tokens)
+    for first in range_constexpr(min(depth, slabs)):
+        _on_wave(
+            role,
+            fx.Int32(1) + 2 * task + first % 2,
+            lambda first=first: issue_weight(fx.Int32(first)),
+        )
+    if const_expr(fp8 and early_scales):
+        stage_scales()
+    tdm_timeline.stamp(tdm_timeline.ISSUED)
+    accs = [
+        fx.Vector.filled(ACCUMULATOR_ELEMENTS, 0.0, fx.Float32)
+        for _ in range(tasks * tiles)
+    ]
+    pend = [
+        fx.Vector.filled(OPERAND_ELEMENTS, 0.0, fx.BFloat16)
+        for _ in range((tasks + 1) * WAVE_STEPS)
+    ]
+
+    def operands(slab, buffer):
+        weights = [
+            (
+                _fp8_operand(
+                    lds + x_words + ((slab % stages) * tasks + tk) * task_words,
+                    wave,
+                    lane,
+                    (
+                        fx.ptr_load(scales + tk * GFX1250.wave_size + slab)
+                        >> (wave // (128 // WAVE_COLUMNS) * 8)
+                    )
+                    & 0xFF,
+                )
+                if fp8
+                else _operand(
+                    lds + x_words + ((slab % stages) * tasks + tk) * task_words,
+                    lane % ROWS,
+                    wave,
+                    lane,
+                )
+            )
+            for tk in range(tasks)
+        ]
+        slab_tokens = lds + buffer * token_words
+        activations = [
+            _operand(
+                slab_tokens,
+                tl * ROWS + fx.min(lane % ROWS, min(ROWS, rows - tl * ROWS) - 1),
+                wave,
+                lane,
+            )
+            for tl in range(tiles)
+        ]
+        return weights, activations
+
+    def multiply(accs, weights, activations, count):
+        for tl in range_constexpr(count):
+            for tk in range_constexpr(tasks):
+                acc = accs[tk * tiles + tl]
+                for st in range_constexpr(WAVE_STEPS):
+                    acc = mma_bf16(weights[tk][st], activations[tl][st], acc, GFX1250)
+                accs[tk * tiles + tl] = acc
+        return accs
+
+    for s in range(fx.Int32(0), fx.Int32(steps), unroll=_ROLLED_UNROLL):
+        if s > 0:
+            tdm_timeline.slab(s - 1, tdm_timeline.C)
+        _late_waits(role, s, steps, slabs, tasks, depth, group, token_steps)
+        tdm_timeline.slab(s, tdm_timeline.TOKEN)
+        if const_expr(TDM_CLUSTER > 1):
+            cluster.cluster_barrier()
+        else:
+            gpu.barrier()
+        tdm_timeline.slab(s, tdm_timeline.B)
+        loaded = [
+            operands(s * group + g, (s % token_steps) * group + g) for g in range(group)
+        ]
+        _late_issue(
+            role,
+            s,
+            steps,
+            slabs,
+            tasks,
+            depth,
+            group,
+            token_steps,
+            issue_tokens,
+            issue_weight,
+        )
+        tdm_timeline.slab(s, tdm_timeline.A)
+        updated = _rolled_last_tile(accs, pend, tasks, tiles)
+        for g in range_constexpr(group):
+            slab_weights, activations = loaded[g]
+            updated = multiply(
+                updated, slab_weights, activations, tiles - (g == group - 1)
+            )
+        pend = [
+            slab_weights[tk][st] for tk in range(tasks) for st in range(WAVE_STEPS)
+        ] + list(activations[tiles - 1])
+        accs = updated
+    accs = _rolled_last_tile(accs, pend, tasks, tiles)
+    tdm_timeline.slab(fx.Int32(steps - 1), tdm_timeline.C)
     tdm_timeline.stamp(tdm_timeline.PROJECT_DONE)
     return [[accs[tk * tiles + tl] for tl in range(tiles)] for tk in range(tasks)]
 
