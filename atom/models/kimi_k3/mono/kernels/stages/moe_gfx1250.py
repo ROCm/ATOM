@@ -991,7 +991,6 @@ def stage_herd_token_local(c, rows, token, survivors):
         while stale(words):
             rocdl.s_sleep(space)
             words = load_tags()
-        tdm_timeline.stamp(tdm_timeline.LITE_HERD_POLLED, wave_role=1)
         for index in range_constexpr(rounds):
             at = poller + index * pollers
             if (at < candidates) & others(at):

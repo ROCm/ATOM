@@ -55,9 +55,10 @@ SPLIT_LOOPED, SPLIT_EXCHANGED = 116, 117
 # The lite finish (``k2_finish_persistent_gfx1250``: no slabs, its points in
 # the slab words). A routing CTA: its scores' lane maxima in LDS, its bound,
 # its survivors in their slots, ranked, its routes' stores issued, every
-# wave past them; a parallel-HERD one's candidates seen fresh (wave 0), by
-# every wave, the batch popularity counted, its drop found, its HERD routes'
-# stores issued, and wave 0's candidate polls (a count, not a stamp). A
+# wave past them; a parallel-HERD one's candidates seen fresh (wave 0, which
+# polls none with ATOM_KIMI_MONO_HERD_OWN_LOCAL), by every wave, the batch
+# popularity counted, its drop found, its HERD routes' stores issued, and
+# wave 0's candidate polls (a count, not a stamp). A
 # shared-down CTA: its weights' loads issued, its rows staged, its WMMAs'
 # accumulators in LDS, its sums' stores issued.
 LITE_SCORED, LITE_BOUND, LITE_SLOTTED, LITE_RANKED = 8, 9, 10, 11
