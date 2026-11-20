@@ -2049,6 +2049,41 @@ def test_an_aborted_parked_load_frees_its_blocks_when_it_reports(
     assert not offload.has_pending_work()
 
 
+def test_an_abort_after_preempt_waits_for_the_second_load(
+    cluster, store_engine, make_worker
+):
+    # Restored, preempted, its HBM prefix evicted, parked for a second Store
+    # load, then aborted before that load reports: the worker is still
+    # writing into its blocks, whatever the first load left in its flags.
+    engine, offload = store_engine.engine, store_engine.offload
+    worker, _ = make_worker(namespace=offload._namespace)
+    _store_chunks(cluster, _hashes(40), range(5))
+    seq = Sequence(list(range(41)), BLOCK, sampling_params=SamplingParams())
+    engine.add(seq)
+    for load in (1, 2):
+        _await_store_lookup(offload, seq)
+        batch, _ = engine.schedule()
+        [request] = [r for r in batch.connector_meta_output.requests if r.load_spec]
+        assert seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+        if load == 2:
+            break
+        worker._do_load_req(request)
+        engine._update_from_kv_xfer_finished(worker.get_finished())
+        engine.schedule()  # the suffix
+        assert seq.offload_loaded
+        engine.running.remove(seq)
+        assert engine.preempt(seq)
+        engine.block_manager.clear_cache()
+    free = engine.block_manager.kv.num_free
+    assert engine.abort_request(seq.id)
+    assert seq.id in engine.deferred_free_blocks
+    assert engine.block_manager.kv.num_free == free
+    worker._do_load_req(request)
+    engine._update_from_kv_xfer_finished(worker.get_finished())
+    assert seq.id not in engine.deferred_free_blocks
+    assert engine._num_parked_remote_kv == 0
+
+
 def test_a_loaded_prefix_is_published_and_the_suffix_hashes_onto_it(
     cluster, store_engine, make_worker, caplog
 ):

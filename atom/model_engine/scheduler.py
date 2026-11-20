@@ -4024,8 +4024,9 @@ class Scheduler:
     ) -> bool | None:
         """Admission's allocation (Phase 2 and early load): commit the probe,
         allocate keeping `num_cached_blocks` of HBM hit, and the draft round's
-        lookahead. None, with nothing committed, when the state offload holds
-        the admission for a verdict on the image it would load
+        lookahead. A fresh allocation also resets the restore fields an earlier
+        tier load left on `seq`. None, with nothing committed, when the state
+        offload holds the admission for a verdict on the image it would load
         (`record_allocation(defer_unverified=True)`); retry a pass later. False,
         with the seq deallocated, when `allocate` refused."""
         if not self.block_manager.record_allocation(
@@ -4035,6 +4036,20 @@ class Scheduler:
         if not self.block_manager.allocate(seq, num_cached_blocks):
             self.block_manager.deallocate(seq)
             return False
+        # A fresh allocation starts from nothing restored. An earlier tier load
+        # (restore, then preempt; or a failed load that re-parked) leaves these
+        # behind: a stale `offload_loaded_tokens` makes the wake mark rows the
+        # new load never filled as cached, and a stale `offload_loaded` (set by
+        # the wake) / `offload_load_failed` (set by the failure path) makes an
+        # abort free the blocks the new load is still writing into. Reset before
+        # the connector is told of the allocation, which may set the token
+        # fields again. Only a connector's load sets them (planned by the
+        # connector, woken or failed by the scheduler), so no connector means
+        # nothing to reset.
+        if self.kv_connector is not None:
+            seq.offload_loaded = seq.offload_load_failed = False
+            seq.offload_loaded_tokens = 0
+            seq.offload_load_start_tokens = None
         self._allocate_prefill_draft_lookahead(seq)
         return True
 
@@ -5742,7 +5757,7 @@ class Scheduler:
         if self._connector_flag("is_offload"):
             for i, queued in enumerate(self.waiting):
                 if queued.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
-                    continue  # in flight, even if an earlier load left its flags
+                    continue  # in flight
                 if not self._is_offload_prefill_resume(queued):
                     break
                 pos = i + 1
