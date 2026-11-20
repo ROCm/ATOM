@@ -1196,8 +1196,8 @@ class CoreManager:
         """The `prefix_spread` or `share_cache` router, or None.
 
         None for another strategy, and when there is nothing to route: one
-        DP rank, pipeline parallelism (requests enter at stage 0), and, for
-        `share_cache`, RapidServe. The strategy has no effect there, so its
+        DP rank, pipeline parallelism (requests enter at stage 0), and
+        RapidServe. The strategy has no effect there, so its
         requirements are not enforced.
         """
         strategy = self._dp_lb_strategy

@@ -14,6 +14,7 @@ import torch
 from aiter import QuantType, dtypes
 
 from atom.model_ops.linear import weight_is_stored_preshuffled
+from atom.model_ops.minimax_m3.nvfp4_pages import INDEX_PAGE_BYTES
 from atom.models.minimax_m3.mono.config import (
     DENSE_INTER,
     HEAD_DIM,
@@ -59,6 +60,77 @@ def _ptpc_fp8(
         f"{name}: scale",
     )
     return w.data, s.data.view(rows)
+
+
+def _mxfp8(
+    linear, rows: int, cols: int, name: str
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Weight + per-1x32 E8M0 scale of a native MXFP8 linear: the checkpoint's
+    bytes, never requantized; the weight 16x16-preshuffled, the scales row-major."""
+    w, s = linear.weight, linear.weight_scale
+    _need(
+        linear.quant_type.value == QuantType.per_1x32.value,
+        f"{name}: not per-1x32",
+    )
+    # only the native loader keeps the scales row-major; a generic 1x32 one shuffles them
+    _need(
+        linear.native_a8_group_rows is not None,
+        f"{name}: not the checkpoint's native 1x32 layout",
+    )
+    _need(
+        w.dtype == dtypes.fp8 and tuple(w.shape) == (rows, cols) and w.is_contiguous(),
+        f"{name}: weight {w.dtype} {tuple(w.shape)}",
+    )
+    _need(
+        weight_is_stored_preshuffled(
+            linear.quant_type,
+            linear.params_dtype,
+            native_group_rows=linear.native_a8_group_rows,
+        ),
+        f"{name}: not preshuffled",
+    )
+    _need(not linear.is_output_padded, f"{name}: output padded")
+    _need(
+        s is not None
+        and s.dtype in (torch.uint8, dtypes.fp8_e8m0)
+        and s.numel() == rows * cols // 32
+        and s.is_contiguous(),
+        f"{name}: scale {None if s is None else (s.dtype, tuple(s.shape))}",
+    )
+    return w.data, s.data
+
+
+def _attn_gemm(
+    linear, rows: int, cols: int, name: str
+) -> tuple[torch.Tensor, torch.Tensor, bool]:
+    """An attention linear's (weight, scale, native MXFP8?): the ptpc-FP8 requantization
+    (``_ptpc_fp8``: f32 scale a row, per-token activation quant) or the checkpoint's own
+    MXFP8 1x32 (``_mxfp8``: E8M0 scale a 32-block, per-32 activation quant), both over
+    the same (16, 16)-preshuffled fp8 weight."""
+    if linear.quant_type.value == QuantType.per_1x32.value:
+        return (*_mxfp8(linear, rows, cols, name), True)
+    return (*_ptpc_fp8(linear, rows, cols, name), False)
+
+
+def _shared_expert(moe, layer_id: int) -> tuple:
+    """(w13s, s13s, w2s, s2s, experts of the routed tables) of a MoE block's shared
+    expert: fused into the MXFP4 tables as expert N_ROUTED (the 129-expert table of
+    an MXFP4 shared expert, or of ``ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4``), no weights
+    of its own; or an MXFP8 MLP of its own beside the 128 routed experts."""
+    experts = moe.experts
+    if experts.num_fused_shared_experts:
+        _need(
+            moe.fuse_shared_experts and experts.num_fused_shared_experts == 1,
+            f"layer {layer_id}: {experts.num_fused_shared_experts} fused shared experts",
+        )
+        return None, None, None, None, N_ROUTED + 1
+    _need(moe.shared_experts is not None, f"layer {layer_id}: no shared expert")
+    sh = moe.shared_experts
+    w13s, s13s = _mxfp8(
+        sh.gate_up_proj, 2 * INTER, HIDDEN, f"layer {layer_id} shared gate_up"
+    )
+    w2s, s2s = _mxfp8(sh.down_proj, HIDDEN, INTER, f"layer {layer_id} shared down_proj")
+    return w13s, s13s, w2s, s2s, N_ROUTED
 
 
 def _bf16_vec(t: torch.Tensor, n: int, name: str) -> torch.Tensor:
@@ -109,6 +181,17 @@ class SparseMoeLayer:
     s13: torch.Tensor
     w2: torch.Tensor
     s2: torch.Tensor
+    # the shared expert is expert N_ROUTED of ``w13`` / ``w2`` (MXFP4, the fused
+    # 129-expert table); else an MXFP8 MLP of its own, gate | up rows in one weight
+    # (``w13s`` .. ``s2s``), ``w13`` / ``w2`` holding the 128 routed experts only
+    fused_shared: bool
+    w13s: torch.Tensor | None
+    s13s: torch.Tensor | None
+    w2s: torch.Tensor | None
+    s2s: torch.Tensor | None
+    # qkv_proj / o_proj are the checkpoint's MXFP8 1x32 (``s_qkv`` / ``s_o``: E8M0
+    # ``[rows, K / 32]``), not the ptpc-FP8 requantization (f32 ``[rows]``)
+    attn_mxfp8: bool = False
 
     @staticmethod
     def from_layer(layer, layer_id: int, heads: IndexHeads) -> "SparseMoeLayer":
@@ -131,26 +214,46 @@ class SparseMoeLayer:
         )
         impl = attn.attn.impl
         _need(
-            impl.kv_cache_dtype == "fp8" and impl.index_cache is not None,
+            impl.kv_cache_dtype in ("fp8", "nvfp4") and impl.index_cache is not None,
             f"layer {layer_id}: caches",
         )
-        _need(
-            impl.index_cache.dtype == dtypes.fp8,
-            f"layer {layer_id}: index cache {impl.index_cache.dtype}",
-        )
-        w_qkv, s_qkv = _ptpc_fp8(
+        if impl.kv_cache_dtype == "nvfp4":
+            # single-buffer pages: the kernels address page b at b * page bytes, so a
+            # layer's pool view must be dense; the f32 global K / V scales are tensors
+            _need(
+                impl.index_cache_dtype == "nvfp4"
+                and impl.index_cache.dtype == torch.uint8
+                and impl.index_cache.dim() == 2
+                and impl.index_cache.shape[1] == INDEX_PAGE_BYTES
+                and impl.index_cache.stride() == (INDEX_PAGE_BYTES, 1),
+                f"layer {layer_id}: index cache {impl.index_cache.dtype} "
+                f"{tuple(impl.index_cache.shape)} {impl.index_cache.stride()}",
+            )
+            for name in ("nvfp4_k_scale", "nvfp4_v_scale"):
+                t = getattr(impl, name)
+                _need(
+                    t is not None and t.dtype == torch.float32 and t.numel() == 1,
+                    f"layer {layer_id}: {name}",
+                )
+        else:
+            _need(
+                impl.index_cache.dtype == dtypes.fp8,
+                f"layer {layer_id}: index cache {impl.index_cache.dtype}",
+            )
+        w_qkv, s_qkv, mx_qkv = _attn_gemm(
             attn.qkv_proj, heads.rows, HIDDEN, f"layer {layer_id} qkv_proj"
         )
-        w_o, s_o = _ptpc_fp8(attn.o_proj, HIDDEN, O_K, f"layer {layer_id} o_proj")
+        w_o, s_o, mx_o = _attn_gemm(
+            attn.o_proj, HIDDEN, O_K, f"layer {layer_id} o_proj"
+        )
+        _need(
+            mx_qkv == mx_o, f"layer {layer_id}: qkv_proj / o_proj quantized differently"
+        )
 
         moe = layer.block_sparse_moe
         experts = moe.experts
         qm = experts.quant_method
-        E = N_ROUTED + 1
-        _need(
-            moe.fuse_shared_experts and experts.num_fused_shared_experts == 1,
-            f"layer {layer_id}: shared expert",
-        )
+        w13s, s13s, w2s, s2s, n_experts = _shared_expert(moe, layer_id)
         _need(
             experts.top_k == TOP_K and not getattr(qm, "is_guinterleave", True),
             f"layer {layer_id}: moe layout",
@@ -166,14 +269,14 @@ class SparseMoeLayer:
             f"layer {layer_id}: shuffle",
         )
         _need(
-            w13.numel() * w13.element_size() == E * 2 * INTER * HIDDEN // 2
-            and w2.numel() * w2.element_size() == E * HIDDEN * INTER // 2,
+            w13.numel() * w13.element_size() == n_experts * 2 * INTER * HIDDEN // 2
+            and w2.numel() * w2.element_size() == n_experts * HIDDEN * INTER // 2,
             f"layer {layer_id}: expert weight bytes",
         )
         s13, s2 = experts.w13_weight_scale, experts.w2_weight_scale
         _need(
-            s13.numel() == E * 2 * INTER * HIDDEN // 32
-            and s2.numel() == E * HIDDEN * INTER // 32,
+            s13.numel() == n_experts * 2 * INTER * HIDDEN // 32
+            and s2.numel() == n_experts * HIDDEN * INTER // 32,
             f"layer {layer_id}: expert scale bytes",
         )
         gate = moe.gate.weight
@@ -213,6 +316,12 @@ class SparseMoeLayer:
             s13=s13.data,
             w2=w2.data,
             s2=s2.data,
+            fused_shared=n_experts == N_ROUTED + 1,
+            w13s=w13s,
+            s13s=s13s,
+            w2s=w2s,
+            s2s=s2s,
+            attn_mxfp8=mx_qkv,
         )
 
 
