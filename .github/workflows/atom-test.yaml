@@ -1011,12 +1011,12 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$STAGE1_ROOT/src/baseline" "$STAGE1_ROOT/src/candidate" "$STAGE1_ROOT/results"
-          git archive cbf1617468110a81e720a00021c5d3c5e14ce232 | tar -x -C "$STAGE1_ROOT/src/baseline"
-          git archive 487589602564bf2b737a3579ed9f907f2075935e | tar -x -C "$STAGE1_ROOT/src/candidate"
+          git archive fb1304722a9f79cd16e7383b8b504ccb29851d77 | tar -x -C "$STAGE1_ROOT/src/baseline"
+          git archive 05ce5a39e10fcf3605fbd798870a0a5ab2fe1107 | tar -x -C "$STAGE1_ROOT/src/candidate"
           mapfile -t wheels < <(find "$STAGE1_ROOT/wheels" -name '*.whl')
           test "${#wheels[@]}" = 1
           echo "8813b5f9b81d5e499b728d59dfffbfb736109b052986ea87c10b9f7bbaa420ef  ${wheels[0]}" | sha256sum -c -
-          git show -s --format='%H %P' cbf1617468110a81e720a00021c5d3c5e14ce232 487589602564bf2b737a3579ed9f907f2075935e > "$STAGE1_ROOT/results/source.txt"
+          git show -s --format='%H %P' fb1304722a9f79cd16e7383b8b504ccb29851d77 05ce5a39e10fcf3605fbd798870a0a5ab2fe1107 > "$STAGE1_ROOT/results/source.txt"
           container_minutes=$(( (STAGE1_STARTED + 600 - $(date +%s)) / 60 - 3 ))
           test "$container_minutes" -ge 1
           echo "container_minutes=$container_minutes" >> "$GITHUB_OUTPUT"

@@ -11,11 +11,11 @@ import os
 import re
 from pathlib import Path
 
-BASE = "cbf1617468110a81e720a00021c5d3c5e14ce232"
-CANDIDATE = "487589602564bf2b737a3579ed9f907f2075935e"
+BASE = "fb1304722a9f79cd16e7383b8b504ccb29851d77"
+CANDIDATE = "05ce5a39e10fcf3605fbd798870a0a5ab2fe1107"
 TREES = {
-    "baseline": "b3baa7322aea030abf5232b3b4d5cf43e4ecbfea",
-    "candidate": "c35e5980cc35b4e7f45138c3e2742fa516ff8c93",
+    "baseline": "89b9807886ba635ff254dde89c5b8af15df29f3c",
+    "candidate": "35db1231c2ec0c1b9628446fd396f36233ab6a50",
 }
 TARGET = "/models/moonshotai/Kimi-K3.1-Pro"
 DRAFT = "/models/Inferact/Kimi-K3.1-DSpark"
