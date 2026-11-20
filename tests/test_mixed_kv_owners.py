@@ -85,6 +85,100 @@ def resume(sched, *, length=64, cached=32, failed=False):
     return seq
 
 
+def partial(sched):
+    seq = Sequence([55] * 32, block_size=16)
+    assert sched.block_manager.allocate(seq, 0)
+    sched.block_manager.may_append(seq, 0, lookahead=sched.draft_lookahead)
+    seq.num_cached_tokens = 16
+    seq.is_partial_prefill = True
+    seq.status = SequenceStatus.RUNNING
+    sched.running.append(seq)
+    sched._partial_prefill_count += 1
+    return seq
+
+
+@pytest.mark.parametrize("width", [1, 8])
+@pytest.mark.parametrize("prefix", [False, True])
+@pytest.mark.parametrize("offload", [False, True])
+@pytest.mark.parametrize("waiter_newer", [False, True])
+def test_pressure_compares_waiting_and_running_owner_age(
+    width, prefix, offload, waiter_newer
+):
+    extra = int(width > 1)
+    pages = 4 + extra + (1 + extra if offload else 0)
+    sched = scheduler(pages=pages, width=width, prefix=prefix, offload=offload)
+    older = decode(sched, width=width)
+    waiting = resume(sched, length=32, cached=16) if offload else receive(sched)
+    prompt = partial(sched)
+    # Arrival order, not request-ID order or the current queue, defines age.
+    older.arrive_time = 1.0
+    waiting.arrive_time = 3.0 if waiter_newer else 2.0
+    prompt.arrive_time = 2.0 if waiter_newer else 3.0
+    sched.max_num_seqs = 2
+    assert sched.block_manager.kv.num_free == 0
+    original = {s.id: list(s.block_table) for s in (older, waiting, prompt)}
+
+    batch, _ = sched.schedule()
+
+    victim, retained = (waiting, prompt) if waiter_newer else (prompt, waiting)
+    assert older.id in batch.req_ids
+    assert not victim.block_table
+    assert list(retained.block_table) == original[retained.id]
+    assert list(older.block_table[:1]) == original[older.id]
+    assert sched.total_preemptions == 1
+
+
+def test_older_waiting_owner_survives_younger_current_decode():
+    sched = scheduler(pages=3, offload=True)
+    waiting = resume(sched, length=32, cached=16)
+    current = decode(sched)
+    waiting.arrive_time, current.arrive_time = 1.0, 2.0
+    sched.max_num_seqs = 1
+    original = list(waiting.block_table)
+
+    sched.schedule()
+
+    assert list(waiting.block_table) == original
+    assert not current.block_table
+    assert sched._num_parked_remote_kv == 1
+
+
+def test_waiting_reclaim_uses_age_after_queue_prioritization():
+    sched = scheduler(pages=5, offload=True)
+    older = decode(sched)
+    first = resume(sched, length=32, cached=16)
+    second = resume(sched, length=32, cached=16)
+    older.arrive_time, first.arrive_time, second.arrive_time = 1.0, 2.0, 3.0
+    # Completion prioritization can move the newest owner ahead of an older one.
+    sched.waiting.rotate(1)
+    original = list(first.block_table)
+
+    sched.schedule()
+
+    assert list(first.block_table) == original
+    assert not second.block_table
+
+
+def test_zero_budget_ticks_preserve_older_partial_until_decode_growth():
+    outcomes = []
+    for mixed in (False, True):
+        sched = scheduler(mixed, pages=4)
+        prompt = partial(sched)
+        first = decode(sched, length=8)
+        second = decode(sched, length=17)
+        prompt.arrive_time, first.arrive_time, second.arrive_time = 1.0, 2.0, 3.0
+        original = list(prompt.block_table)
+        for tick in range(12):
+            batch, scheduled = sched.schedule()
+            if mixed and tick == 0:
+                assert batch.total_seqs_num_prefill == 0
+                assert list(sched.running) == [prompt, first]
+            assert list(prompt.block_table[: len(original)]) == original
+            _finish_step(sched, batch, scheduled, 1)
+        outcomes.append([seq.id == prompt.id for seq in sched.running])
+    assert outcomes[0] == outcomes[1] == [True]
+
+
 @pytest.mark.parametrize("width", [1, 8])
 @pytest.mark.parametrize("parked", ["settled", "aborted"])
 def test_parked_count_does_not_hide_admissible_prefill(width, parked):

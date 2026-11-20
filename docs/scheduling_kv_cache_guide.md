@@ -113,7 +113,7 @@ A new prefill is scheduled only when the earliest waiting request has waited lon
 
 ### Preemption
 
-When a decode step cannot extend a sequence's KV cache, the scheduler scans the running queue from the tail for a preemptable request. Connector-pinned requests are skipped. If no queued victim can release space, the current decode may preempt itself. With mixed scheduling, settled KV owners still waiting for admission are considered first, from the waiting tail: an offload resume or completed P/D receive must not escape reclamation because it has not joined running. Under mixed scheduling, in-flight transfers and protected waiting owners remain excluded. Prefill admission and continuation preserve the decode page reservation; insufficient capacity skips their execution without blocking transfer completion.
+When a decode step cannot extend a sequence's KV cache, the scheduler scans the running queue from the tail for a preemptable request. Connector-pinned requests are skipped. If no queued victim can release space, the current decode may preempt itself. With mixed scheduling, a settled waiting KV owner is considered before a running victim only when it arrived no earlier than that victim. Waiting owners are ordered by arrival time, with waiting-tail order breaking ties. If there is no running victim, the comparison uses the current decode before it preempts itself. In-flight transfers and protected waiting owners remain excluded. Mixed prefill admission and continuation preserve the decode page reservation; insufficient capacity skips their execution without blocking transfer completion or changing surviving requests' queue order.
 
 ```python
 def preempt(self, seq: Sequence) -> bool:
@@ -833,8 +833,10 @@ def num_tokens(self, value):
 The feature requires chunked prefill and supports DSpark.
 Other attention families, chunked prefill off, M-RoPE, TBO (including decode
 TBO), PCP, DCP, EPLB, TR_HYBRID graph modes, speculative methods other than
-DSpark, `ATOM_SPEC_LOSSLESS_SAMPLING`, and speculative decoding with pipeline
-parallelism are rejected at startup.
+DSpark, and speculative decoding with pipeline parallelism are rejected at
+startup. A lossless draft that would otherwise arm is also rejected with mixed
+scheduling. Merely setting `ATOM_SPEC_LOSSLESS_SAMPLING` does not reject a model
+that keeps greedy drafting or has no drafter; its existing fallback remains.
 Expert parallelism alone does not enable EPLB.
 
 ### Scheduling
@@ -867,7 +869,9 @@ If available page capacity, including reclaimable checkpoints, cannot cover
 that demand, the prefill budget is zero. Continuation and new admission skip
 chunk sizing and execution; transfer completion and decode scheduling continue.
 Pressure reclamation considers settled waiting owners as well as running
-requests. Reclaiming an offload resume also clears its parked accounting,
+requests, comparing arrival time before reclaiming a waiting owner ahead of a
+running victim. Skipping a partial prefill preserves its position for subsequent
+ticks. Reclaiming an offload resume also clears its parked accounting,
 early-load entry and completed-load flags before readmission. The one-eighth
 prefill token floor applies only when the page-capacity check passes.
 

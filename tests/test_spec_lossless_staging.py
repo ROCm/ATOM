@@ -76,6 +76,7 @@ def proposer(
             "kv_transfer_config": {},
             "enable_rapidserve": False,
             "disagg_is_decode": False,
+            "enable_mixed_prefill_decode": False,
             **config,
         },
     )

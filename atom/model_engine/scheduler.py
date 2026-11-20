@@ -3332,8 +3332,12 @@ class Scheduler:
         # preserved its append pages. Prefill rows must not also decode. Unselected
         # owners in running AND waiting remain available to pressure preemption.
         mixed_order = ()
-        if num_seqs_prefill:
+        if self.enable_mixed_prefill_decode and (
+            num_seqs_prefill or self._partial_prefill_count
+        ):
+            # A zero-budget tick skips prefill execution, not its queue position.
             mixed_order = tuple(self.running)
+        if num_seqs_prefill:
             self.running = deque(
                 seq for seq in self.running if seq.id not in scheduled_seqs
             )
@@ -3369,7 +3373,7 @@ class Scheduler:
             while not self.block_manager.can_append(
                 seq, num_new_tokens, self.draft_lookahead
             ):
-                if self._preempt_one_running():
+                if self._preempt_one_running(seq):
                     continue
                 if self.preempt(seq):
                     preempted_current = True
@@ -3424,20 +3428,20 @@ class Scheduler:
         if scheduled_seqs:
             self.running.extendleft(reversed(scheduled_seqs.values()))
         if skipped_partial_prefills:
-            # A decode-only tick requeues skipped partials at the tail, as on
-            # the default path. A mixed tick restores survivor order below;
-            # its batch layout independently puts prefill rows before decode.
+            # The default path retains its tail requeue. Mixed scheduling
+            # restores survivor order even when no prefill could run this tick.
             self.running.extend(skipped_partial_prefills)
         if skipped_pp_inflight:
             self.running.extend(skipped_pp_inflight)
 
-        if num_seqs_prefill:
+        if mixed_order:
             retained = {seq.id for seq in self.running}
             original = {seq.id for seq in mixed_order}
             promoted = [seq for seq in self.running if seq.id not in original]
             self.running.clear()
             self.running.extend(seq for seq in mixed_order if seq.id in retained)
             self.running.extend(promoted)
+        if num_seqs_prefill:
             return self._build_mixed_batch(
                 scheduled_seqs,
                 num_scheduled_tokens,
@@ -5080,28 +5084,35 @@ class Scheduler:
     def _is_preemptable(self, seq: Sequence) -> bool:
         return not self._connector_should_defer_free(seq)
 
-    def _preempt_one_running(self) -> bool:
-        """Reclaim a tail KV owner; include settled waiters when mixed is enabled."""
-        # Waiting owners would join behind the current running rows on
-        # admission. Their queue placement must not shield settled KV from
-        # pressure. This scan runs only on allocation failure, not per row.
-        if self.enable_mixed_prefill_decode and self._preempt_waiting_kv_owner():
-            return True
+    def _preempt_one_running(self, current: Sequence | None = None) -> bool:
+        """Reclaim a running tail or a newer settled waiting KV owner."""
         for index in range(len(self.running) - 1, -1, -1):
             candidate = self.running[index]
             if not self._is_preemptable(candidate):
                 continue
+            if self.enable_mixed_prefill_decode and self._preempt_waiting_kv_owner(
+                candidate
+            ):
+                return True
             del self.running[index]
             if self.preempt(candidate):
                 return True
             self.running.insert(index, candidate)
-        return False
+        # With no running victim, compare against the decode that would
+        # otherwise preempt itself. An older waiting owner must survive it.
+        return self.enable_mixed_prefill_decode and self._preempt_waiting_kv_owner(
+            current
+        )
 
-    def _preempt_waiting_kv_owner(self) -> bool:
-        """Reclaim the newest settled waiting owner before a running decode."""
+    def _preempt_waiting_kv_owner(self, candidate: Sequence | None) -> bool:
+        """Reclaim a settled waiter only before an equally old or older victim."""
         offload = self._connector_flag("is_offload")
-        for index in range(len(self.waiting) - 1, -1, -1):
-            seq = self.waiting[index]
+        # Completion prioritization can reorder waiting. Arrival time still
+        # defines age; equal timestamps retain the waiting-tail preference.
+        owners = sorted(self.waiting, key=lambda seq: seq.arrive_time)
+        for seq in reversed(owners):
+            if candidate is not None and seq.arrive_time < candidate.arrive_time:
+                break
             settled = seq.status == SequenceStatus.WAITING and (
                 offload and self._is_offload_prefill_resume(seq)
             )
@@ -5117,6 +5128,7 @@ class Scheduler:
                 or not self._is_preemptable(seq)
             ):
                 continue
+            index = self.waiting.index(seq)
             del self.waiting[index]
             if received:
                 # Preserve the producer's real T0 and let preempt strip only
