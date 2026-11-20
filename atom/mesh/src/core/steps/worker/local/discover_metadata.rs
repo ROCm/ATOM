@@ -283,6 +283,9 @@ async fn discover_http_sglang(url: &str, api_key: Option<&str>) -> HashMap<Strin
         if let Some(disaggregation_mode) = server_info.disaggregation_mode {
             labels.insert("disaggregation_mode".to_string(), disaggregation_mode);
         }
+        if let Some(version) = server_info.version.filter(|s| !s.is_empty()) {
+            labels.insert("version".to_string(), version);
+        }
     }
 
     if let Ok(model_info) = get_model_info(url, api_key).await {

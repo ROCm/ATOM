@@ -191,6 +191,22 @@ async fn rl_workers_reports_sglang_with_its_capability_row() {
 }
 
 #[tokio::test]
+async fn rl_workers_reports_the_sglang_engine_version() {
+    // No sizes set: the mock answers /get_server_info, which carries `version`.
+    let mut worker = mock_worker();
+    let url = worker.start().await.unwrap();
+    let ctx = AppTestContext::new_with_config(rl_config(BackendType::Sglang, false), vec![]).await;
+    let app = ctx.create_app().await;
+    register(&ctx, &app, &url, json!({}), 1).await;
+
+    let row = &rl_workers(&app).await["workers"][0];
+    assert_eq!(row["engine_version"], "0.3.0");
+
+    ctx.shutdown().await;
+    worker.stop().await;
+}
+
+#[tokio::test]
 async fn rl_workers_collapses_dp_ranks_into_one_row() {
     let mut worker = mock_worker();
     let url = worker.start().await.unwrap();
