@@ -25,8 +25,16 @@ from atom.entrypoints.atomesh.engine_spec import (
     default_reasoning_parser,
     tool_call_format,
 )
+from atom.utils.gc_utils import (
+    freeze_gc_heap,
+    maybe_attach_gc_debug_callback,
+    tune_gc,
+)
 
 logger = logging.getLogger("atom")
+
+engine: Any | None = None
+tokenizer: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -292,9 +300,8 @@ def main() -> None:
         if arg == "--version-verbose":
             print_version(verbose=True)
             return
-    # `python xxx mesh-only ...` starts mesh routing; any other invocation
-    # asks for ATOM standalone, which refuses until its launcher writes an
-    # engine spec (see launch_atom_standalone).
+    # `python xxx mesh-only ...` starts mesh routing;
+    # other invocations default to ATOM standalone.
     use_atom_standalone = "mesh-only" not in raw_args
     # Import the mesh_python module.
     atomesh_runner = import_atomesh_runner()

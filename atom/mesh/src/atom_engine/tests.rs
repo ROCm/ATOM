@@ -807,7 +807,9 @@ async fn python_core_messages_drive_the_client() {
     };
     assert_eq!(
         top.entries[0].value.as_ref().unwrap().kind,
-        Some(pb::value::Kind::IntListValue(pb::IntList { items: vec![3, 1, 2] }))
+        Some(pb::value::Kind::IntListValue(pb::IntList {
+            items: vec![3, 1, 2]
+        }))
     );
     let (mut value, mut maps) = (params, 0);
     while let Some(pb::value::Kind::MapValue(map)) = &value.kind {

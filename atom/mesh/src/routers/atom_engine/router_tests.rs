@@ -558,3 +558,111 @@ async fn what_the_core_cannot_serve_is_refused_not_dropped() {
     )
     .is_none());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn requests_the_python_server_refuses_are_refused() {
+    let served = Served::start(1).await;
+    let tool =
+        |name: &str| json!({"type": "function", "function": {"name": name, "parameters": {}}});
+    let chats = [
+        (
+            json!({"stream_options": {"include_usage": true}}),
+            "stream_options requires stream=true",
+        ),
+        (
+            json!({"tools": [tool("get"), tool("put"), tool("get")]}),
+            "duplicate tool name: get",
+        ),
+        (
+            json!({"tools": [{"type": "retrieval", "function": {"name": "get", "parameters": {}}}]}),
+            "tools[0].type must be 'function'",
+        ),
+    ];
+    for (extra, refusal) in chats {
+        let request = chat(user_hello(extra));
+        let (status, body) = json_body(served.router.route_chat(None, &request, None).await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.to_string().contains(refusal), "{body}");
+    }
+    assert!(FakeCore::recv_on(
+        &served.cores[0].input,
+        std::time::Duration::from_millis(200)
+    )
+    .is_none());
+}
+
+/// The reply of a prompt that opened `<think>` starts inside reasoning: what
+/// precedes `</think>` is reasoning, streamed or not.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_prompt_that_opens_reasoning_leaves_the_reply_inside_it() {
+    fn think_then_answer(core: &FakeCore, spec: &pb::RequestSpec) {
+        core.stream(&[(spec.seq_id, &[HELLO, THINK_END, WORLD], Some("eos"))]);
+    }
+
+    let mut served = Served::thinking().await;
+    let core = answer_each(std::mem::take(&mut served.cores), think_then_answer);
+    let response = served
+        .router
+        .route_chat(None, &chat(user_hello(json!({}))), None)
+        .await;
+    drop(core.into_iter().next().unwrap().join().unwrap());
+    let (status, body) = json_body(response).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let message = &body["choices"][0]["message"];
+    assert_eq!(
+        message["reasoning_content"].as_str().map(str::trim),
+        Some("hello")
+    );
+    assert_eq!(message["content"], "world");
+
+    let mut served = Served::thinking().await;
+    let core = answer_each(std::mem::take(&mut served.cores), think_then_answer);
+    let response = served
+        .router
+        .route_chat(None, &chat(user_hello(json!({"stream": true}))), None)
+        .await;
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    drop(core.into_iter().next().unwrap().join().unwrap());
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    let deltas: Vec<Value> = text
+        .split("\n\n")
+        .filter_map(|e| e.strip_prefix("data: "))
+        .filter(|e| *e != "[DONE]")
+        .map(|e| serde_json::from_str::<Value>(e).unwrap()["choices"][0]["delta"].clone())
+        .collect();
+    let joined =
+        |field: &str| -> String { deltas.iter().filter_map(|d| d[field].as_str()).collect() };
+    assert_eq!(joined("reasoning_content").trim(), "hello", "{text}");
+    assert_eq!(joined("content").trim(), "world", "{text}");
+}
+
+/// A non-streamed reply longer than the reasoning parser's 64 KiB buffer is
+/// split, not refused with a 500.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_long_non_streamed_reply_is_split_into_reasoning_and_content() {
+    const WORDS: usize = 20_000;
+    fn think_long(core: &FakeCore, spec: &pb::RequestSpec) {
+        let mut ids = vec![HELLO; WORDS];
+        ids.extend([THINK_END, WORLD]);
+        core.stream(&[(spec.seq_id, &ids, Some("eos"))]);
+    }
+
+    let mut served = Served::thinking().await;
+    let core = answer_each(std::mem::take(&mut served.cores), think_long);
+    let response = served
+        .router
+        .route_chat(
+            None,
+            &chat(user_hello(json!({"max_tokens": WORDS + 2}))),
+            None,
+        )
+        .await;
+    drop(core.into_iter().next().unwrap().join().unwrap());
+    let (status, body) = json_body(response).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let message = &body["choices"][0]["message"];
+    let reasoning = message["reasoning_content"].as_str().unwrap();
+    assert!(reasoning.len() > 65536, "{}", reasoning.len());
+    assert_eq!(reasoning.split_whitespace().count(), WORDS);
+    assert_eq!(message["content"], "world");
+}

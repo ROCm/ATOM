@@ -76,21 +76,23 @@ def test_requests_alike_but_for_max_tokens_share_one_decoded_params():
     assert (first.max_tokens, second.max_tokens) == (10, 20)
 
 
-def admission_context():
-    config = type(
-        "C",
-        (),
-        {
-            "kv_cache_block_size": 16,
-            "speculative_config": None,
-            "hf_config": type("H", (), {"model_type": "llama"})(),
-        },
-    )()
-    return codec.AdmissionContext(config)
+def core_context(**config):
+    """A Core's `AdmissionContext` over a minimal config; `config` overrides."""
+    fields = {
+        "kv_cache_block_size": 16,
+        "speculative_config": None,
+        "enable_dp_attention": False,
+        "hf_config": SimpleNamespace(model_type="llama"),
+        "end_token_ids": (2,),
+        "kv_transfer_config": None,
+        "enable_rapidserve": False,
+        **config,
+    }
+    return codec.AdmissionContext(SimpleNamespace(**fields))
 
 
 def test_the_sequence_gets_its_own_max_tokens():
-    context = admission_context()
+    context = core_context()
     for cap in (10, 20):
         seq = codec.build_sequence(submitted(SamplingParams(max_tokens=cap)), context)
         assert seq.max_tokens == cap
@@ -98,11 +100,63 @@ def test_the_sequence_gets_its_own_max_tokens():
 
 def test_the_share_cache_estimate_reaches_the_sequence():
     spec = submitted(SamplingParams(), dp_est_cached_tokens=48)
-    seq = codec.build_sequence(spec, admission_context())
+    seq = codec.build_sequence(spec, core_context())
     assert seq.dp_est_cached_tokens == 48
     # Absent, as from a client that does not route by prefix: none.
-    seq = codec.build_sequence(submitted(SamplingParams()), admission_context())
+    seq = codec.build_sequence(submitted(SamplingParams()), core_context())
     assert seq.dp_est_cached_tokens == 0
+
+
+CHANNEL = RequiredChannel(after=(5, 6), opening=(7, 8), opens_at=1, end_ids=(9,))
+
+
+@pytest.mark.parametrize(
+    "params, ingress, config, refusal",
+    [
+        (
+            SamplingParams(logprobs=True),
+            {"kv_transfer_params": {"do_remote_decode": True}},
+            {},
+            "P/D transfer",
+        ),
+        (SamplingParams(logprobs=True), {}, {"enable_rapidserve": True}, "RapidServe"),
+        (
+            SamplingParams(json_schema="{}", required_channel=CHANNEL),
+            {},
+            {},
+            "both a structured-output grammar",
+        ),
+        (
+            SamplingParams(json_schema="{}", ignore_eos=True),
+            {},
+            {},
+            "ignore_eos",
+        ),
+    ],
+    ids=["logprobs-pd", "logprobs-rapidserve", "grammar-and-channel", "grammar-eos"],
+)
+def test_the_core_refuses_what_the_frontend_refuses(params, ingress, config, refusal):
+    """A client other than this repo's frontend is held to the same admission."""
+    spec = submitted(params, **ingress)
+    with pytest.raises(ValueError, match=refusal):
+        codec.build_sequence(spec, core_context(**config))
+
+
+def test_the_core_holds_every_required_request_to_its_one_channel():
+    context = core_context()
+    first = codec.build_sequence(
+        submitted(SamplingParams(required_channel=CHANNEL)), context
+    )
+    # Held back on the Core's own end ids too.
+    assert first.required_channel == replace(CHANNEL, end_ids=(2, 9))
+    # A client that held it back already sends the held one.
+    again = codec.build_sequence(
+        submitted(SamplingParams(required_channel=first.required_channel)), context
+    )
+    assert again.required_channel is first.required_channel
+    other = replace(CHANNEL, after=(4, 6))
+    with pytest.raises(ValueError, match="another channel"):
+        codec.build_sequence(submitted(SamplingParams(required_channel=other)), context)
 
 
 def test_absent_sampling_values_take_the_defaults_not_none():
