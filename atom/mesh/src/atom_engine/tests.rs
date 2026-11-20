@@ -107,7 +107,10 @@ fn a_malformed_message_or_an_out_of_bounds_ref_is_refused() {
 
 fn spec_json() -> serde_json::Value {
     json!({
-        "model": {"served_name": "m", "tokenizer_path": "/m", "default_max_tokens": 16},
+        "model": {
+            "served_name": "m", "tokenizer_path": "/m", "default_max_tokens": 16,
+            "template_efforts": ["low", "high", "max"],
+        },
         "balance": {"strategy": "least_tokens", "req_equiv": 512},
         "engines": [
             {"dp_rank": 0, "pid": 10, "input": "ipc:///i0", "control": "ipc:///c0", "output": "ipc:///o0"},
@@ -186,6 +189,7 @@ fn a_link_handshakes_and_routes_input_and_control_to_their_core() {
     let spec = core_spec(&dir, std::process::id());
     let ready = pb::envelope::Body::Ready(pb::Ready {
         max_pool_tokens: Some(4096),
+        ..Default::default()
     });
     let core = fake_core(spec.clone(), ready);
 
@@ -783,7 +787,8 @@ async fn python_core_messages_drive_the_client() {
     assert!(matches!(
         decode("core_ready"),
         pb::envelope::Body::Ready(pb::Ready {
-            max_pool_tokens: Some(4096)
+            max_pool_tokens: Some(4096),
+            ..
         })
     ));
     assert!(matches!(
@@ -802,7 +807,9 @@ async fn python_core_messages_drive_the_client() {
     };
     assert_eq!(
         top.entries[0].value.as_ref().unwrap().kind,
-        Some(pb::value::Kind::IntListValue(pb::IntList { items: vec![3, 1, 2] }))
+        Some(pb::value::Kind::IntListValue(pb::IntList {
+            items: vec![3, 1, 2]
+        }))
     );
     let (mut value, mut maps) = (params, 0);
     while let Some(pb::value::Kind::MapValue(map)) = &value.kind {
@@ -848,4 +855,43 @@ async fn python_core_messages_drive_the_client() {
         next_event(&mut handles[0]).await,
         SeqEvent::Failed(SeqFailure::Invalid(reason)) if reason == "bad"
     ));
+}
+
+#[test]
+fn the_spec_python_writes_parses() {
+    // Written by tests/entrypoints/test_engine_spec.py (`build_engine_spec`).
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/engine_v1/engine_spec.json");
+    let json = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let spec = EngineSpec::from_json(&json).unwrap();
+    let model = &spec.model;
+    assert_eq!(model.served_name, "served");
+    assert_eq!(model.tokenizer_path, "/models/m");
+    assert_eq!(model.chat_template.as_deref(), Some("/t/chat.jinja"));
+    assert_eq!(model.default_chat_template_kwargs["k"], json!(1));
+    assert_eq!(
+        (model.max_model_len, model.max_output_tokens),
+        (Some(4096), Some(2048))
+    );
+    assert_eq!(model.model_card["context_window"], json!(2048));
+    assert!(!model.synthetic_acceptance);
+    let channel = model.required_channel.as_ref().unwrap();
+    assert_eq!(
+        (channel.after.as_slice(), channel.opening.as_slice()),
+        (&[1][..], &[2][..])
+    );
+    assert_eq!(
+        (channel.opens_at, channel.end_ids.as_slice()),
+        (1, &[3, 7, 9][..])
+    );
+    let toggle = model.reasoning_toggle.as_ref().unwrap();
+    assert_eq!(
+        (toggle.name.as_str(), &toggle.off, &toggle.on),
+        ("enable_thinking", &json!(false), &json!(true))
+    );
+    assert_eq!(spec.balance.strategy, BalanceStrategy::LeastRequests);
+    assert_eq!(spec.engines.len(), 2);
+    let core = &spec.engines[1];
+    assert_eq!((core.dp_rank, core.pid), (1, 101));
+    assert_eq!(core.input, "ipc:///tmp/core-1-input");
 }

@@ -56,6 +56,16 @@ pub struct Finished {
     pub prompt_tokens: u32,
     pub cached_tokens: u32,
     pub leave_reason: String,
+    pub times: SeqTimes,
+}
+
+/// When a sequence was submitted, gave its first and last tokens, and ended.
+#[derive(Debug, Clone, Copy)]
+pub struct SeqTimes {
+    pub submitted: Instant,
+    pub first_token: Option<Instant>,
+    pub last_token: Option<Instant>,
+    pub ended: Instant,
 }
 
 #[derive(Debug)]
@@ -116,7 +126,21 @@ struct Slot {
     /// `Completion`'s own `num_cached_tokens` is the KV computed, not the hit.
     cached_tokens: u32,
     tokens: Vec<u32>,
+    submitted: Instant,
+    first_token: Option<Instant>,
+    last_token: Option<Instant>,
     events: mpsc::UnboundedSender<SeqEvent>,
+}
+
+impl Slot {
+    fn times(&self) -> SeqTimes {
+        SeqTimes {
+            submitted: self.submitted,
+            first_token: self.first_token,
+            last_token: self.last_token,
+            ended: Instant::now(),
+        }
+    }
 }
 
 impl EngineClient {
@@ -221,6 +245,7 @@ impl EngineClient {
         }
         let n = sub.n.max(1);
         let first = shared.next_seq_id.fetch_add(n as u64, Ordering::Relaxed);
+        let submitted = Instant::now();
         let seq_ids: Vec<u64> = (first..first + n as u64).collect();
 
         // Placed and registered under one lock, which `core_lost` also takes:
@@ -251,6 +276,9 @@ impl EngineClient {
                     prompt_tokens: sub.prompt.len() as u32,
                     cached_tokens: 0,
                     tokens: Vec::new(),
+                    submitted,
+                    first_token: None,
+                    last_token: None,
                     events: tx,
                 };
                 shared.seqs.insert(seq_id, slot);
@@ -461,6 +489,7 @@ impl Shared {
                             prompt_tokens: item.num_prompt_tokens,
                             cached_tokens: slot.cached_tokens,
                             leave_reason: item.leave_reason.clone(),
+                            times: slot.times(),
                         }),
                         Err(e) => {
                             error!(
@@ -530,6 +559,11 @@ impl Shared {
                 slot.cached_tokens = cached as u32;
             }
             let tokens: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
+            if !tokens.is_empty() {
+                let now = Instant::now();
+                slot.first_token.get_or_insert(now);
+                slot.last_token = Some(now);
+            }
             slot.tokens.extend_from_slice(&tokens);
             if slot.stream {
                 let _ = slot.events.send(SeqEvent::Tokens(tokens));
@@ -547,6 +581,7 @@ impl Shared {
                     prompt_tokens: slot.prompt_tokens,
                     cached_tokens: slot.cached_tokens,
                     leave_reason,
+                    times: slot.times(),
                 })
             });
         }

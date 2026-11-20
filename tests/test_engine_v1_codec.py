@@ -98,6 +98,15 @@ def test_the_sequence_gets_its_own_max_tokens():
         assert seq.max_tokens == cap
 
 
+def test_the_share_cache_estimate_reaches_the_sequence():
+    spec = submitted(SamplingParams(), dp_est_cached_tokens=48)
+    seq = codec.build_sequence(spec, core_context())
+    assert seq.dp_est_cached_tokens == 48
+    # Absent, as from a client that does not route by prefix: none.
+    seq = codec.build_sequence(submitted(SamplingParams()), core_context())
+    assert seq.dp_est_cached_tokens == 0
+
+
 CHANNEL = RequiredChannel(after=(5, 6), opening=(7, 8), opens_at=1, end_ids=(9,))
 
 
@@ -381,6 +390,7 @@ def test_a_completion_carries_what_a_client_reads():
     seq.leave_reason = "eos"
     seq.arrive_time, seq.first_token_time, seq.leave_time = 1.0, 1.5, 2.0
     seq.kv_transfer_params_output = {"blocks": [1, 2]}
+    seq.prefill_completed = True
     _, [done] = codec.decode_core_message(on_the_wire(codec.encode_completions([seq])))
     for name in (
         "return_logprobs",
@@ -394,6 +404,7 @@ def test_a_completion_carries_what_a_client_reads():
         "external_request_id",
         "parent_request_id",
         "sibling_index",
+        "prefill_completed",
     ):
         assert getattr(done, name) == getattr(seq, name), name
     assert done.id == 9
@@ -441,3 +452,56 @@ def test_one_bad_request_is_rejected_alone():
     [(seq_id, reason, code)] = failures
     assert (seq_id, code) == (1, codec.REJECT_INVALID)
     assert "missing frame 9" in reason
+
+
+def test_share_cache_messages_cross_both_ways():
+    kind, updates, failures = codec.decode_client_message(
+        on_the_wire(codec.encode_dp_prefix_credit([(3, 16), (0, 0)]))
+    )
+    assert (kind, updates, failures) == (
+        codec.EngineCoreRequestType.DP_PREFIX_CREDIT,
+        [(3, 16), (0, 0)],
+        [],
+    )
+    for applied in ((), [(3, 16)]):
+        kind, report = codec.decode_core_message(
+            on_the_wire(codec.encode_prefill_backlog((5, 4096, applied)))
+        )
+        assert kind == codec.EngineCoreRequestType.PREFILL_BACKLOG
+        assert report == (5, 4096, list(applied))
+    kind, reports = codec.decode_core_message(
+        on_the_wire(codec.encode_dp_reuse([(7, 32), (8, 0)]))
+    )
+    assert (kind, reports) == (codec.EngineCoreRequestType.DP_REUSE, [(7, 32), (8, 0)])
+
+
+def test_paired_columns_of_unequal_length_are_refused():
+    env = pb.Envelope()
+    env.dp_reuse.seq_ids.extend([1, 2])
+    env.dp_reuse.reused_tokens.append(5)
+    with pytest.raises(wire.ProtocolError):
+        codec.decode_core_message(on_the_wire(wire.FrameWriter().frames(env)))
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        {"max_pool_tokens": 4096},
+        {"weight_syncs_unavailable": {"weight_reload": "a runner cannot reload"}},
+        {
+            "max_pool_tokens": 4096,
+            "weight_syncs_unavailable": {"weight_reload": "a runner cannot reload"},
+        },
+    ],
+    ids=repr,
+)
+def test_ready_carries_every_startup_fact(payload):
+    kind, decoded = codec.decode_core_message(on_the_wire(codec.encode_ready(payload)))
+    assert kind.name == "READY"
+    assert decoded == payload
+
+
+def test_ready_refuses_a_fact_it_has_no_field_for():
+    with pytest.raises(codec.ProtocolError):
+        codec.encode_ready({"max_pool_tokens": 1, "new_fact": 2})

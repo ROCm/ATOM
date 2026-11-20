@@ -47,6 +47,9 @@ pub struct ModelSpec {
     /// probed it; none where the template has no switch.
     #[serde(default)]
     pub reasoning_toggle: Option<ReasoningToggle>,
+    /// The named reasoning efforts a template takes (`VALID_TEMPLATE_EFFORTS`);
+    /// a request's other names are dropped, as the Python server drops them.
+    pub template_efforts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

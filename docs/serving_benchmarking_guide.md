@@ -471,10 +471,11 @@ recovered by scrape time. Neither costs a timer: `asyncio.wait_for` measured
 This exists because the symptom that started this work was ten minutes of
 silence with every metric looking healthy.
 
-All of this lives in `openai_server`: `AtomMetricsExporter` is constructed
-only there. The atomesh entrypoint does not serve standalone yet (it refuses at
-startup until the Rust frontend's engine spec lands), and when it does, its
-streams leave through the Rust frontend, which builds no `FrameWait`.
+The atomesh standalone entrypoint has none of it. Its streams are rendered
+by the Rust runtime (`atom/mesh/src/routers/atom_engine`), which builds no
+`FrameWait`; and `AtomMetricsExporter` is constructed only by the Python
+api_server, so that deployment exposes no ATOM `/metrics` at all. A stalled
+atomesh stream is therefore invisible rather than reported as zero.
 
 Measured at the frame and not at `StreamOutputCollector.get`, which is where it
 started and which cannot see the thing it was built for. The collector is where

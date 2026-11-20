@@ -121,6 +121,27 @@ impl Served {
     }
 }
 
+impl Served {
+    /// `body` POSTed to `path` the way the server takes it: parsed by the
+    /// ingress, then `route_inference`, which reads the raw body's extras.
+    async fn post(&self, path: &str, body: Value) -> Response {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/json"),
+        );
+        let request = crate::routers::ingress::InferenceEnvelope::parse(
+            path.parse().unwrap(),
+            headers,
+            body.to_string().into(),
+            &self.router.ctx,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{path}: {e:?}"));
+        self.router.route_inference(request, &self.router.ctx).await
+    }
+}
+
 /// A Core that has answered, with the submission it received: its sequences
 /// and data frames.
 type Answered = (FakeCore, Vec<pb::RequestSpec>, Vec<Vec<u8>>);
@@ -386,6 +407,159 @@ async fn health_follows_the_cores() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_completion_ignores_what_python_v1_does_not_declare() {
+    let mut served = Served::start(1).await;
+    let core = answer_each(std::mem::take(&mut served.cores), hello_world);
+    let response = served
+        .post(
+            "/v1/completions",
+            json!({
+                "model": MODEL, "prompt": "hello",
+                "max_tokens": 8, "max_completion_tokens": 4,
+                "echo": true, "suffix": "world", "best_of": 3,
+                "logit_bias": {"1": -100.0}, "stream_options": {"include_usage": true},
+            }),
+        )
+        .await;
+    let (_, specs, _) = core.into_iter().next().unwrap().join().unwrap();
+
+    let (status, body) = json_body(response).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // No echoed prompt, no suffix: the completion alone.
+    assert_eq!(body["choices"][0]["text"], "hello world");
+    // `max_completion_tokens` over `max_tokens`, as `get_max_tokens` takes it.
+    let sampling = specs[0].sampling.as_ref().unwrap();
+    assert_eq!(sampling.max_tokens, Some(4));
+    // ATOM's timing, and no cache hit: completions do not report one.
+    let usage = &body["usage"];
+    assert!(usage["ttft_s"].as_f64().unwrap() >= 0.0, "{usage}");
+    assert!(usage["latency_s"].as_f64().unwrap() >= usage["ttft_s"].as_f64().unwrap());
+    assert!(usage.get("prompt_tokens_details").is_none(), "{usage}");
+    assert!(usage.get("num_choices").is_none(), "{usage}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn chat_usage_carries_the_cache_hit_and_timing() {
+    let mut served = Served::start(2).await;
+    let cores = answer_each(std::mem::take(&mut served.cores), hello_world);
+    let response = served
+        .post(
+            "/v1/chat/completions",
+            user_hello(json!({"n": 2, "temperature": 1.0})),
+        )
+        .await;
+    cores.into_iter().for_each(|c| drop(c.join().unwrap()));
+
+    let (status, body) = json_body(response).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let usage = &body["usage"];
+    assert_eq!(usage["prompt_tokens"], 5, "{usage}");
+    assert_eq!(usage["completion_tokens"], 4, "{usage}");
+    assert_eq!(
+        usage["prompt_tokens_details"]["cached_tokens"], 3,
+        "{usage}"
+    );
+    assert_eq!(usage["num_choices"], 2, "{usage}");
+    for field in ["ttft_s", "tpot_s", "latency_s"] {
+        assert!(usage[field].as_f64().is_some(), "{field}: {usage}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_streamed_chats_usage_carries_the_cache_hit() {
+    let mut served = Served::start(1).await;
+    let core = answer_each(std::mem::take(&mut served.cores), hello_world);
+    let response = served
+        .post(
+            "/v1/chat/completions",
+            user_hello(json!({"stream": true, "stream_options": {"include_usage": true}})),
+        )
+        .await;
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    core.into_iter().for_each(|c| drop(c.join().unwrap()));
+
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    let usage = text
+        .split("\n\n")
+        .filter_map(|e| e.strip_prefix("data: "))
+        .filter_map(|e| serde_json::from_str::<Value>(e).ok())
+        .find_map(|c| c.get("usage").filter(|u| !u.is_null()).cloned())
+        .unwrap_or_else(|| panic!("no usage chunk: {text}"));
+    assert_eq!(usage["prompt_tokens"], 5, "{usage}");
+    assert_eq!(
+        usage["prompt_tokens_details"]["cached_tokens"], 3,
+        "{usage}"
+    );
+    assert!(usage.get("ttft_s").is_none(), "{usage}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn every_generate_sibling_reports_its_prompt() {
+    let mut served = Served::start(2).await;
+    let cores = answer_each(std::mem::take(&mut served.cores), hello_world);
+    let response = served
+        .post(
+            "/generate",
+            json!({
+                "model": MODEL, "input_ids": [HELLO, WORLD],
+                "sampling_params": {"n": 2, "temperature": 1.0},
+            }),
+        )
+        .await;
+    cores.into_iter().for_each(|c| drop(c.join().unwrap()));
+
+    let (status, body) = json_body(response).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let siblings = body.as_array().unwrap();
+    assert_eq!(siblings.len(), 2, "{body}");
+    for sibling in siblings {
+        assert_eq!(sibling["meta_info"]["prompt_tokens"], 2, "{body}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn what_the_core_cannot_serve_is_refused_not_dropped() {
+    let served = Served::start(1).await;
+    let refusals = [
+        (
+            "/generate",
+            json!({"model": MODEL, "input_ids": [HELLO], "return_logprob": true, "logprob_start_len": 0}),
+            "input logprobs",
+        ),
+        (
+            "/generate",
+            json!({"model": MODEL, "input_ids": [HELLO], "return_logprob": true, "token_ids_logprob": [WORLD]}),
+            "token_ids_logprob",
+        ),
+        (
+            "/v1/chat/completions",
+            user_hello(json!({"kv_transfer_params": {"do_remote_decode": true}})),
+            "kv_transfer_params",
+        ),
+        (
+            "/v1/completions",
+            json!({"model": MODEL, "prompt": "hello", "prompt_token_ids": [HELLO]}),
+            "prompt_token_ids",
+        ),
+        (
+            "/v1/completions",
+            json!({"model": MODEL, "prompt": "hello", "return_token_ids": true}),
+            "return_token_ids",
+        ),
+    ];
+    for (path, request, refusal) in refusals {
+        let (status, body) = json_body(served.post(path, request).await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
+        assert!(body.to_string().contains(refusal), "{path}: {body}");
+    }
+    assert!(FakeCore::recv_on(
+        &served.cores[0].input,
+        std::time::Duration::from_millis(200)
+    )
+    .is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn requests_the_python_server_refuses_are_refused() {
     let served = Served::start(1).await;
     let tool =
@@ -410,25 +584,6 @@ async fn requests_the_python_server_refuses_are_refused() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert!(body.to_string().contains(refusal), "{body}");
     }
-    let completion = serde_json::from_value(json!({
-        "model": MODEL,
-        "prompt": "hello",
-        "stream_options": {"include_usage": true},
-    }))
-    .unwrap();
-    let (status, body) = json_body(
-        served
-            .router
-            .route_completion(None, &completion, None)
-            .await,
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert!(
-        body.to_string()
-            .contains("stream_options requires stream=true"),
-        "{body}"
-    );
     assert!(FakeCore::recv_on(
         &served.cores[0].input,
         std::time::Duration::from_millis(200)

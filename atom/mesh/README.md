@@ -2,7 +2,7 @@
 
 High-performance model routing gateway for **PD (Prefill–Decode) disaggregated** LLM serving. It routes inference across heterogeneous worker fleets with cache-aware load balancing, a gRPC pipeline that keeps tokenization in Rust, and built-in reliability primitives.
 
-An **ATOM standalone** mode, in which Atomesh serves a single ATOM deployment as the client of its EngineCores, is being brought up and is not available yet; see [ATOM standalone](#atom-standalone).
+Atomesh can also run in an **ATOM standalone** mode. In this mode Python parses the arguments, decides what needs ATOM's own machinery (chat template, reasoning dialect and switch, tool-call format) and spawns and reaps the EngineCores; the Rust runtime (`src/atom_engine`, `src/routers/atom_engine`) is the EngineCores' only client, speaking the engine_v1 protocol (`atom/model_engine/zmq_protocol/engine_v1.proto`) to them over ZMQ, and does all request handling: templating, tokenization, DP placement, detokenization, parsers and HTTP.
 
 ## Features
 
@@ -137,26 +137,58 @@ image must provide `protoc` either way, for `smg-grpc-client`.
 
 ### ATOM standalone
 
-Not available yet. The Rust frontend will serve standalone itself, as the one
-client of the ATOM EngineCores, once the Python launcher writes the engine spec
-it starts from. Until then the Atomesh entrypoint refuses standalone at startup,
-before it loads a model:
+ATOM standalone mode starts the EngineCores from Python and serves them from
+Rust, which is their only client. Enable it through
+`USE_ATOMESH_ENTRYPOINTS=1`:
 
 ```bash
-# Exits with "ATOM standalone is unavailable ..."
-USE_ATOMESH_ENTRYPOINTS=1 python -m atom.entrypoints.openai_server --model /path/to/model
+USE_ATOMESH_ENTRYPOINTS=1 python -m atom.entrypoints.openai_server \
+  --model /path/to/model \
+  --host 0.0.0.0 \
+  --port 30000
 ```
 
-Meanwhile, serve a model with the classic entrypoint
-(`python -m atom.entrypoints.openai_server` without `USE_ATOMESH_ENTRYPOINTS`),
-or use `mesh-only` below to route across such servers.
+Do not pass `mesh-only` for standalone mode. The `mesh-only` subcommand is only
+used when the Python entrypoint should run Atomesh as a router for external
+workers.
+
+`--tool-call-parser` takes ATOM's format names (`qwen`, `glm`, `kimi`,
+`kimi_k3`, `minimax`, `dsml`, `dsml_v41`) or any of the router's own; unset, the
+format is read off the chat template as the Python server reads it.
+`--chat-template` and `--served-model-name` behave as in the Python server.
+
+#### Limitations
+
+What the standalone server does not serve yet is refused, never silently
+served differently:
+
+- At startup: models with a custom message encoder, reasoning dialects other
+  than `<think>...</think>` (unless `--reasoning-parser` is given), P/D
+  (prefill/decode) workers, pipeline parallelism, multi-node data or tensor
+  parallelism, RapidServe, and the `share_cache` / `prefix_spread` DP
+  placements.
+- Per request: `response_format` json_object / json_schema, `top_logprobs`,
+  streamed logprobs, chat logprobs, `/generate`'s input logprobs and
+  `token_ids_logprob`, streaming with `n > 1`, `kv_transfer_params`,
+  `prompt_token_ids`, `return_token_ids`, multimodal input, `/v1/messages`
+  and `/v1/responses` (501).
+
+`/v1/completions` ignores, as the Python server's does, the fields its request
+does not declare: `echo`, `suffix`, `best_of`, `logit_bias` and
+`stream_options`.
+- Not exposed yet: ATOM's `/metrics`, `/server_info` tp/dp, `/kv_transfer_info`,
+  profiling and debug routes.
+
+Losing an EngineCore shuts the whole server down (in-flight requests on it end
+with 503) so that an orchestrator restarts it; use the Python api_server
+(`USE_ATOMESH_ENTRYPOINTS=0`) for any of the above.
 
 
 ### Regular HTTP routing
 
 Routing mode can be started through either the Rust binary or the Python
-entrypoint. For the Python entrypoint, pass `mesh-only`; without it the
-entrypoint asks for ATOM standalone, which is not available yet.
+entrypoint. For the Python entrypoint, `mesh-only` selects Atomesh routing;
+without `mesh-only`, it defaults to ATOM standalone mode.
 
 ```bash
 ./target/release/atomesh launch \
