@@ -63,17 +63,24 @@ class RemotePrefillLookupTest(unittest.TestCase):
     def test_a_held_back_request_is_still_a_remote_load(self):
         import types
 
+        # The consumer's mode and paging too, which a kept-prefix receive reads.
         sched = types.SimpleNamespace(
             is_producer=False,
             transfer_id_to_request_id={},
             request_id_to_transfer_id={},
             _reqs_need_recv={},
+            transfer_mode="write",
+            block_size=4,
+            dcp_size=1,
+            hash_block_size=4,
+            _same_page_geometry=lambda params: True,
         )
         seq = types.SimpleNamespace(
             id=7,
             prompt_token_ids=[1, 2, 3],
             block_table=[4],
             state_slot=-1,
+            num_cached_tokens=0,
             kv_transfer_params={"do_remote_prefill": True, "transfer_id": 7},
         )
         # Held back after the first yes (a full running set), asked again.
