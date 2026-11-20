@@ -12,10 +12,10 @@ import re
 from pathlib import Path
 
 BASE = "cbf1617468110a81e720a00021c5d3c5e14ce232"
-CANDIDATE = "53439e155826090189ee83275ece09d1fcb4d1f8"
+CANDIDATE = "487589602564bf2b737a3579ed9f907f2075935e"
 TREES = {
     "baseline": "b3baa7322aea030abf5232b3b4d5cf43e4ecbfea",
-    "candidate": "f9390df273587c9afb286e851209e40403bd480a",
+    "candidate": "c35e5980cc35b4e7f45138c3e2742fa516ff8c93",
 }
 TARGET = "/models/moonshotai/Kimi-K3.1-Pro"
 DRAFT = "/models/Inferact/Kimi-K3.1-DSpark"

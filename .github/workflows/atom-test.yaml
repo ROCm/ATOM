@@ -950,7 +950,7 @@ jobs:
           import kda_stage1_probe as p
           def git(*args):
               return subprocess.check_output(['git', *args]).decode().strip()
-          pr = '4265d0e495ae8898593463a1543caf70333a8e6d'
+          pr = '41b4f9be4c1818bbf4e6aec58b2dfa717b266864'
           common = '5effb67d4164961c1a33b7946c2a4b5bad8d225a'
           assert git('merge-base', p.BASE, pr) == common
           assert git('rev-parse', p.CANDIDATE + '^1') == p.BASE
@@ -1012,11 +1012,11 @@ jobs:
           set -euo pipefail
           mkdir -p "$STAGE1_ROOT/src/baseline" "$STAGE1_ROOT/src/candidate" "$STAGE1_ROOT/results"
           git archive cbf1617468110a81e720a00021c5d3c5e14ce232 | tar -x -C "$STAGE1_ROOT/src/baseline"
-          git archive 53439e155826090189ee83275ece09d1fcb4d1f8 | tar -x -C "$STAGE1_ROOT/src/candidate"
+          git archive 487589602564bf2b737a3579ed9f907f2075935e | tar -x -C "$STAGE1_ROOT/src/candidate"
           mapfile -t wheels < <(find "$STAGE1_ROOT/wheels" -name '*.whl')
           test "${#wheels[@]}" = 1
           echo "8813b5f9b81d5e499b728d59dfffbfb736109b052986ea87c10b9f7bbaa420ef  ${wheels[0]}" | sha256sum -c -
-          git show -s --format='%H %P' cbf1617468110a81e720a00021c5d3c5e14ce232 53439e155826090189ee83275ece09d1fcb4d1f8 > "$STAGE1_ROOT/results/source.txt"
+          git show -s --format='%H %P' cbf1617468110a81e720a00021c5d3c5e14ce232 487589602564bf2b737a3579ed9f907f2075935e > "$STAGE1_ROOT/results/source.txt"
           container_minutes=$(( (STAGE1_STARTED + 600 - $(date +%s)) / 60 - 3 ))
           test "$container_minutes" -ge 1
           echo "container_minutes=$container_minutes" >> "$GITHUB_OUTPUT"
