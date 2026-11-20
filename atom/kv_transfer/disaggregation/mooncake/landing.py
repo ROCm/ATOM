@@ -644,11 +644,12 @@ class LandingReceiver:
                     "[PD-LANDING] write-done nonce mismatch for req %s", req_id
                 )
                 return True
+            if not success and started_writes:
+                # Kept even if the stage checks below drop this report.
+                request.failed_after_write = True
             stage = request.stages.get(pp_rank)
             if stage is None or stage.done:
                 return True
-            if not success and started_writes:
-                request.failed_after_write = True
             # Every check runs before the stage ends, so none can leave it
             # ended with the request unsettled.
             if landed_slots is not None and not (

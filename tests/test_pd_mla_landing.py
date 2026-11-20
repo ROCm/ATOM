@@ -669,6 +669,21 @@ def test_a_failure_is_held_only_if_a_failed_stage_started_writing(reports, held)
     assert dest.held == {"r": held}
 
 
+@pytest.mark.parametrize("first_success", [True, False])
+def test_a_dropped_duplicate_failure_counts_toward_the_hold_only(first_success):
+    dest = _Dest()
+    dest.recv.advertise("stage0", 2)
+    dest.recv.advertise("stage1", 2)
+    dest.recv.begin("r", 5, [1], {0: "stage0", 1: "stage1"})
+    assert dest.recv.stage_done("r", 0, 5, first_success, [], started_writes=False)
+    # Stage 0 already reported: dropped, but its write claim is kept.
+    assert dest.recv.stage_done("r", 0, 5, False, [])
+    assert dest.recv.stage_done("r", 1, 5, True, [])
+    assert dest.finished == [("r", not first_success)]
+    if not first_success:
+        assert dest.held == {"r": True}
+
+
 def test_an_expired_request_is_dropped_once_its_silent_stage_is_given_up():
     dest = _Dest()
     s0 = dest.recv.advertise("stage0", 1)["slots"]
