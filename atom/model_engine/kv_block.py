@@ -42,3 +42,8 @@ class Block:
 # (GDN/Mamba recurrent state, the DeepSeek-V4 compressor ring). Owned next to
 # the block/slot machinery that consumes the count, not in the sizing layer.
 STATE_SLOT_CLASS = "state"
+
+# The class holding PAGE-copy state checkpoint images when they do not borrow
+# KV blocks: under pipeline parallelism, one entry per image, whose bytes are
+# each stage's own image (`ModelRunner._plan_pipeline_checkpoint_store`).
+STATE_CHECKPOINT_CLASS = "state_checkpoint"

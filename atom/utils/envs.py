@@ -74,14 +74,28 @@ def _optional_int_env(name: str, *, min_value: int | None = None) -> int | None:
     return value
 
 
+def _pp_layer_partition_mode() -> str:
+    """``ATOM_PP_LAYER_PARTITION``: unset or empty is "even". A typo raises,
+    because silently keeping the even split looks like the mode not helping."""
+    from atom.models.pp_partition import EVEN, PARTITION_MODES
+
+    mode = os.getenv("ATOM_PP_LAYER_PARTITION", "").strip().lower() or EVEN
+    if mode not in PARTITION_MODES:
+        raise ValueError(
+            f"ATOM_PP_LAYER_PARTITION must be one of {PARTITION_MODES}, got {mode!r}"
+        )
+    return mode
+
+
 def _non_negative_or_none(value: int | None) -> int | None:
     """A negative value clamps to 0; None stays None."""
     return None if value is None else max(0, value)
 
 
-def _int_env(name: str, default: int) -> int:
-    """Unset or empty reads as ``default``; anything else must be an integer."""
-    value = _optional_int_env(name)
+def _int_env(name: str, default: int, *, min_value: int | None = None) -> int:
+    """Unset or empty reads as ``default``; anything else must be an integer
+    (of at least ``min_value``)."""
+    value = _optional_int_env(name, min_value=min_value)
     return default if value is None else value
 
 
@@ -218,7 +232,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_BASE_PORT": lambda: int(os.getenv("ATOM_DP_BASE_PORT", "0")),
     # Floor for the gloo and NCCL timeouts of groups a rank creates without one
     # (aiter's groups; torch's own defaults are 30 and 10 minutes) when its DP
-    # or TP group spans nodes, in seconds.
+    # or TP group or its pipeline spans nodes, in seconds.
     "ATOM_MULTINODE_PG_TIMEOUT_S": lambda: int(
         os.getenv("ATOM_MULTINODE_PG_TIMEOUT_S", "7200")
     ),
@@ -522,6 +536,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # request holds more than two blocks per state checkpoint group (diagnostic).
     "ATOM_STATE_CHECKPOINT_CHECK_BLOCKS": lambda: (
         os.getenv("ATOM_STATE_CHECKPOINT_CHECK_BLOCKS", "0") == "1"
+    ),
+    # Kimi-K3 under PP: how many state checkpoint images the per-stage store
+    # holds, every stage the same count at its own image size. Unset sizes it
+    # from ATOM_PP_STATE_CHECKPOINT_KV_SHARE; negative keeps the images in KV
+    # blocks, where each takes the largest stage's block count on every stage.
+    "ATOM_PP_STATE_CHECKPOINT_SLOTS": lambda: _optional_int_env(
+        "ATOM_PP_STATE_CHECKPOINT_SLOTS"
+    ),
+    # Kimi-K3 under PP, ATOM_PP_STATE_CHECKPOINT_SLOTS unset: the share of the
+    # KV blocks the checkpoint store may cost, in [0, 1).
+    "ATOM_PP_STATE_CHECKPOINT_KV_SHARE": lambda: _finite_float_env(
+        "ATOM_PP_STATE_CHECKPOINT_KV_SHARE", 0.5, allow_zero=True
     ),
     # Set to 1 to read Qwen GDN state checkpoints out of the chunk kernel's
     # interior states instead of cutting prefill chunks onto them. PAGE path
@@ -850,7 +876,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # How long the nodes of a TP group that spans nodes wait for each other at
     # startup: a remote node for the engine's endpoints, the engine for every
     # remote rank to subscribe to its broadcast queue, a rank on the
-    # model-runner store. Process groups take ATOM_MULTINODE_PG_TIMEOUT_S.
+    # model-runner store. The store wait also applies to a pipeline that spans
+    # nodes. Process groups take ATOM_MULTINODE_PG_TIMEOUT_S.
     "ATOM_MULTINODE_TP_TIMEOUT_S": lambda: _positive_float_env(
         "ATOM_MULTINODE_TP_TIMEOUT_S", "1800"
     ),
@@ -1375,6 +1402,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PP_MAX_INFLIGHT": lambda: (
         _optional_int_env("ATOM_PP_MAX_INFLIGHT", min_value=0) or 0
     ),
+    # How the layers split across PP stages when VLLM_PP_LAYER_PARTITION (an
+    # explicit list, which always wins) is unset: "even" (default) by count;
+    # "kv_balanced" for the largest KV pool every stage can page, which the
+    # drafter's KV on the last stage of a hybrid caps under "even". See
+    # atom/models/pp_partition.py.
+    "ATOM_PP_LAYER_PARTITION": lambda: _pp_layer_partition_mode(),
+    # kv_balanced: layers a stage may hold above the even split's largest
+    # stage, i.e. how much compute balance it may trade for pool. 0 keeps the
+    # even split's slowest stage.
+    "ATOM_PP_PARTITION_MAX_EXTRA_LAYERS": lambda: _int_env(
+        "ATOM_PP_PARTITION_MAX_EXTRA_LAYERS", 1, min_value=0
+    ),
     # Engram: read the n-gram tables with a device kernel over UVA instead of
     # gathering them on the host. Each rank's shard stays in host memory,
     # page-locked (see ATOM_ENGRAM_UVA_COPY for how), not copied to HBM; the
@@ -1565,7 +1604,8 @@ def __getattr__(name: str):
 # FLA_COMPILER_MODE, FLA_CI_ENV,
 #   FLA_GDN_FIX_BT, FLA_USE_CUDA_GRAPH,
 #   FLA_TRIL_PRECISION             — FLA ops library
-# VLLM_PP_LAYER_PARTITION         — vLLM legacy (still active in models/utils.py)
+# VLLM_PP_LAYER_PARTITION         — vLLM legacy (still active in models/utils.py);
+#                                   wins over ATOM_PP_LAYER_PARTITION
 # VLLM_USE_MODELSCOPE             — vLLM legacy (benchmarks)
 # LMCACHE_EC_PIN_TIMEOUT_SEC      — LMCache library's own source-pin timeout;
 #                                   read in kv_transfer/offload/_offload_common.py

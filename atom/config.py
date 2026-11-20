@@ -1081,10 +1081,15 @@ class ParallelConfig:
     DCP does not increase world_size; it reuses TP GPUs."""
     pipeline_parallel_rank: int = 0
     """Pipeline stage index of this EngineCore (0 = first stage). Each PP stage
-    runs as an independent EngineCore process; this identifies which stage."""
+    runs as an independent EngineCore process; this identifies which stage.
+    Like `data_parallel_rank`, a node's own config holds the first stage the
+    node runs (--pipeline-parallel-rank) until CoreManager sets each stage's
+    copy to that stage."""
     pp_meta_addrs: list = field(default_factory=list)
     """ZMQ endpoints (len == pp_size) where each downstream stage receives the
-    scheduled batch from the head. Populated by CoreManager for pp_size > 1."""
+    scheduled batch from the head. Populated by CoreManager for pp_size > 1.
+    When the pipeline spans nodes each stage's copy is its own view: the
+    endpoint it binds as tcp://0.0.0.0:port, the others at their node's IP."""
     pp_token_addr: str = ""
     """ZMQ endpoint where the head receives sampled tokens back from the last
     stage. Populated by CoreManager for pp_size > 1."""
@@ -1116,6 +1121,17 @@ class ParallelConfig:
     tensor_parallel_rank: int = 0
     """First TP rank this node runs. The node that runs rank 0 also runs the
     engine and the API server; the others run only their workers."""
+
+    pipeline_parallel_size_local: int | None = None
+    """PP stages (EngineCores) this node runs, from `pipeline_parallel_rank` on.
+    None means all of them, the single-node case. Set it below
+    pipeline_parallel_size to spread one pipeline over several nodes: the node
+    that runs stage 0 also runs the API server and binds every engine socket;
+    the others run only their stages (see CoreManager)."""
+    pipeline_parallel_node_ips: list[str] = field(default_factory=list)
+    """IP of each node of a pipeline that spans nodes, in stage order (node k
+    runs stages k * pipeline_parallel_size_local onwards). A stage receives the
+    head's batches on its own node; the head connects there."""
 
     @property
     def is_multinode_dp(self) -> bool:
@@ -2226,6 +2242,35 @@ def _hf_architecture_factor(hf_config) -> tuple:
     return (_hf_config_fields(hf_config), _hf_config_fields(text_config))
 
 
+def _pp_stage_factor(config) -> tuple[int, int, int, int] | None:
+    """``(pp_size, pp_rank, start_layer, end_layer)`` of this PP stage, or
+    None without pipeline parallelism, so those keys stay as they were.
+
+    A stage traces only its own slice of the model: ``make_layers`` builds
+    layers ``[start_layer, end_layer)`` from ``get_pp_indices``, which follows
+    ``VLLM_PP_LAYER_PARTITION``, and only the first stage embeds and only the
+    last applies the final norm. Every stage otherwise shares one key (only
+    the ``rank_<device>`` directory below it differs), so a new split or
+    pp_size reloads what the same device compiled for its old slice: a stage
+    moved from 11 to 13 layers failed its warmup inside the cached artifact
+    with ``too many values to unpack (expected 6)``.
+    """
+    pp_size = getattr(config, "pipeline_parallel_size", 1)
+    if pp_size <= 1:
+        return None
+    from atom.models.utils import get_pp_indices
+
+    pp_rank = config.parallel_config.pipeline_parallel_rank
+    # The layer count the model splits: its text config, which is the config
+    # itself once get_hf_config has flattened a multimodal checkpoint.
+    hf_config = config.hf_config
+    text_config = getattr(hf_config, "text_config", None) or hf_config
+    start_layer, end_layer = get_pp_indices(
+        text_config.num_hidden_layers, pp_rank, pp_size
+    )
+    return pp_size, pp_rank, start_layer, end_layer
+
+
 def _check_mono_poll_sleep_units() -> None:
     """Reject a bad ATOM_MONO_POLL_SLEEP_UNITS (importing ``atom.mono.polling``
     raises) before the workers, which read the same environment, spawn; warn
@@ -2301,6 +2346,11 @@ class Config:
     decode_context_parallel_size: int = 1
     dcp_config: DCPConfig = field(default_factory=DCPConfig)
     pipeline_parallel_size: int = 1
+    # Stage sizes ATOM_PP_LAYER_PARTITION=kv_balanced picked; None when the
+    # split is VLLM_PP_LAYER_PARTITION's or the even one. Resolved once, in
+    # __post_init__, and installed for `get_pp_indices` there and wherever this
+    # config is unpickled (`__setstate__`), so every process uses this split.
+    pp_layer_partition: tuple[int, ...] | None = field(default=None, init=False)
     prefill_context_parallel_size: int = 1
     # Ulysses shards tokens and exchanges them for heads around attention.
     # Its workers form AITER's PCP process group; see `pcp_group_size`.
@@ -2562,6 +2612,121 @@ class Config:
                 "tensor parallelism across nodes needs --data-parallel-master-ip "
                 "set to the address of the node that runs TP rank 0, and the "
                 "same nonzero --data-parallel-base-port on every node"
+            )
+
+    def _pp_node_slice(self) -> tuple[int | None, int]:
+        """`(pipeline_parallel_size_local, pipeline_parallel_rank)` for this node.
+
+        As for `_tp_node_slice`: in plugin mode `parallel_config` may be the
+        host's own object, which has neither field, and a pipeline across
+        nodes is a native-server feature, so a plugin run is the single-node
+        case: all stages from stage 0.
+        """
+        if self.plugin_config is not None:
+            return None, 0
+        pc = self.parallel_config
+        return pc.pipeline_parallel_size_local, pc.pipeline_parallel_rank
+
+    @property
+    def pp_size_local(self) -> int:
+        """PP stages (EngineCores) on this node: fewer than
+        `pipeline_parallel_size` when the pipeline spans nodes."""
+        local, _ = self._pp_node_slice()
+        return self.pipeline_parallel_size if local is None else local
+
+    @property
+    def is_multinode_pp(self) -> bool:
+        """Whether the pipeline's stages run on more than one node.
+
+        Read from the sizes alone, so a stage's copy of the config answers as
+        its node's does: there `pipeline_parallel_rank` is the stage itself.
+        """
+        return self.pp_size_local < self.pipeline_parallel_size
+
+    @property
+    def pp_stage_ips(self) -> list[str]:
+        """The IP of each stage's node, in stage order, when the pipeline spans
+        nodes (node k runs stages k * pp_size_local onwards); empty on one
+        node."""
+        if not self.is_multinode_pp:
+            return []
+        ips, local = self.parallel_config.pipeline_parallel_node_ips, self.pp_size_local
+        return [ips[stage // local] for stage in range(self.pipeline_parallel_size)]
+
+    def _check_multinode_pp(self) -> None:
+        if self._pp_node_slice() == (None, 0):
+            return
+        pc = self.parallel_config
+        local, start = self.pp_size_local, pc.pipeline_parallel_rank
+        pp = self.pipeline_parallel_size
+        if local < 1 or pp % local or start % local or not 0 <= start < pp:
+            raise ValueError(
+                f"--pipeline-parallel-size-local {local} and --pipeline-parallel-rank "
+                f"{start} must cut -pp {pp} into whole, equal per-node slices"
+            )
+        if not self.is_multinode_pp:
+            return
+        unsupported = [
+            name
+            for name, used in (
+                ("data parallelism", pc.data_parallel_size > 1),
+                ("--enable-dp-attention", self.enable_dp_attention),
+                ("prefill context parallelism", self.prefill_context_parallel_size > 1),
+                ("--fake-eplb", self.fake_eplb),
+                ("RapidServe", self.enable_rapidserve),
+            )
+            if used
+        ]
+        if unsupported:
+            raise ValueError(
+                "pipeline parallelism across nodes does not support "
+                + ", ".join(unsupported)
+            )
+        if pc.data_parallel_base_port == 0 or pc.data_parallel_master_ip in (
+            "127.0.0.1",
+            "localhost",
+        ):
+            raise ValueError(
+                "pipeline parallelism across nodes needs --data-parallel-master-ip "
+                "set to the address of the node that runs stage 0, and the same "
+                "nonzero --data-parallel-base-port on every node"
+            )
+        # The stage channels bind 0.0.0.0 (InternodePPChannelPlan), so IPv4.
+        ips = pc.pipeline_parallel_node_ips
+        if len(ips) != pp // local or any(
+            ip in ("", "127.0.0.1", "localhost", "0.0.0.0") or ":" in ip for ip in ips
+        ):
+            raise ValueError(
+                f"pipeline parallelism across nodes needs "
+                f"--pipeline-parallel-node-ips with the IPv4 address of each of "
+                f"its {pp // local} nodes, in stage order, the same on every "
+                f"node; got {ips}"
+            )
+
+    def _check_multinode_pp_offload(self) -> None:
+        """Refuse a KV offload tier when the pipeline spans nodes.
+
+        Each assumes that every stage runs on the head's host. An LMCache
+        tier's scheduler asks every worker's lookup server, which listens on
+        an ipc:// path of its own host. A store-backed tier times a save from
+        the head's CLOCK_MONOTONIC, which a worker on another host cannot
+        read, so that worker's saves read nothing. Called once
+        `kv_transfer_config` is parsed.
+        """
+        if not self.is_multinode_pp:
+            return
+        offload = sorted(
+            {
+                name
+                for name, _ in KVConnectorFactory.leaf_connectors(self) or ()
+                if KVConnectorFactory.is_offload_backend(name)
+            }
+        )
+        if offload:
+            raise ValueError(
+                "pipeline parallelism across nodes does not support a KV offload "
+                f"tier ({', '.join(offload)}): its lookups and saves assume every "
+                "stage runs on the head's host"
             )
 
     @property
@@ -2880,6 +3045,7 @@ class Config:
 
         assert 1 <= self.tensor_parallel_size <= 8
         self._check_multinode_tp()
+        self._check_multinode_pp()
         if self.decode_context_parallel_size > 1:
             assert self.tensor_parallel_size % self.decode_context_parallel_size == 0, (
                 f"tp_size ({self.tensor_parallel_size}) must be divisible by "
@@ -2977,6 +3143,7 @@ class Config:
             # Refuse a composite the engine cannot run now, not when a worker
             # builds it after the weights are loaded.
             validate_multi_config(self.kv_transfer_config)
+        self._check_multinode_pp_offload()
         if self.sequence_parallel_size > 1:
             self._init_sequence_parallel()
         # transformers 5+ exposes rope_parameters; <5 often only rope_scaling + rope_theta.
@@ -3410,6 +3577,26 @@ class Config:
 
             self.state_replay_tokens = state_replay_tokens(self)
 
+        # Last: it reads the draft's KV dtype and the block size settled above.
+        from atom.models.pp_partition import resolve_pp_layer_partition
+
+        self.pp_layer_partition = resolve_pp_layer_partition(self)
+        self._install_pp_layer_partition()
+
+    def __setstate__(self, state: dict) -> None:
+        # Every process that gets this config by pickle -- the per-stage
+        # EngineCores, their workers, TP ranks on another node -- splits the
+        # layers as the process that resolved it did.
+        self.__dict__.update(state)
+        self._install_pp_layer_partition()
+
+    def _install_pp_layer_partition(self) -> None:
+        partition = self.__dict__.get("pp_layer_partition")
+        if partition is not None:
+            from atom.models.utils import install_pp_layer_partition
+
+            install_pp_layer_partition(self.hf_config.num_hidden_layers, partition)
+
     def _check_kv_cache_dtype(self) -> None:
         """Validate FP4 support and report performance guidance before sizing."""
         if self.kv_cache_dtype != "fp4":
@@ -3769,6 +3956,10 @@ class Config:
         if self.sequence_parallel_size > 1:
             # SP and PCP use the same rank dimension but different head shapes.
             factors.append(("sp", self.sequence_parallel_size))
+        # Each PP stage compiles only the layers it serves (_pp_stage_factor).
+        pp_stage = _pp_stage_factor(self)
+        if pp_stage is not None:
+            factors.append(("pp", *pp_stage))
         # MiniMax-M3 indexer-only CP changes the FUSED QKV OUTPUT WIDTH: index_q
         # is this rank's one head under TP and all `sparse_num_index_heads` of
         # them under CP (minimax_m3/model.py, linear.py), so the traced graph and the
@@ -3838,6 +4029,11 @@ class Config:
                 spec.draft_kv_dtype,
             )
         )
+        # A resolved PP split decides which layers each stage traces, so a
+        # stage must not load the artifact of another split's stage.
+        pp_layer_partition = getattr(self, "pp_layer_partition", None)
+        if pp_layer_partition is not None:
+            factors.append(("pp_layer_partition", tuple(pp_layer_partition)))
         architecture_factor = _hf_architecture_factor(self.hf_config)
         factors.append(architecture_factor)
         # hf_config also carries values ATOM writes itself (rope_parameters,
@@ -3861,11 +4057,28 @@ def local_device_index(config: Config, rank: int) -> int:
     spans nodes has its ranks from `tp_rank_start` on this node.
     """
     pc = config.parallel_config
+    # A pipeline that spans nodes runs `pp_size_local` consecutive stages per
+    # node, starting at a multiple of it, so a stage's place on its node is its
+    # index modulo that. On one node that is the stage index itself.
+    pp_local = config.pp_size_local
     engine_index = (
         pc.data_parallel_rank_local or 0
-    ) * config.pipeline_parallel_size + pc.pipeline_parallel_rank
+    ) * pp_local + pc.pipeline_parallel_rank % pp_local
     stage_span = config.tp_world_size * config.pcp_group_size
     return engine_index * stage_span + rank - config.tp_rank_start
+
+
+def worker_global_rank(config: Config, rank: int) -> int:
+    """Global torch.distributed rank of worker ``rank`` (0..tp*pcp-1) of its
+    stage, in the DPxPPxPCPxTP layout. Unlike `local_device_index`, the same
+    on every node: stage s of a pipeline that spans nodes is rank s * tp * pcp
+    onwards wherever it runs."""
+    pc = config.parallel_config
+    stage_span = config.tp_world_size * config.pcp_group_size
+    return (
+        pc.data_parallel_rank * config.pipeline_parallel_size
+        + pc.pipeline_parallel_rank
+    ) * stage_span + rank
 
 
 _current_atom_config: Config | None = None

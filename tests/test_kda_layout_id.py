@@ -20,6 +20,14 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from atom.model_engine.kv_block import STATE_SLOT_CLASS
+from atom.model_engine.state_runtime import StateTransfer
+from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
+    page_pool,
+    plan_pools,
+    state_pool,
+)
+
 K3 = pytest.importorskip(
     "atom.model_ops.attentions.kimi_mla_gdn_attn",
     reason="the K3 builder's module imports aiter at load",
@@ -207,3 +215,179 @@ class TestPagedCheckpointsAreRefusedWhereSizingWouldRaise:
                 builder(replayssm=True, pp=2, kpool=4, kpool_tail=kpool_tail)
             )
         assert transfer.decode_keep == "none"
+
+
+# ── PP: every stage keeps its images in a store of its own ─────────────────
+
+GIB = 1 << 30
+MLA_ROW = 128 * 576
+KDA_IMAGE = 6_807_552
+KDA_SLOT = 8_380_416
+# MLA rows, KDA layers and logged available_for_kv (GiB) per stage of the
+# measured PP8 x TP1 run, VLLM_PP_LAYER_PARTITION=13,13,13,13,13,12,12,4; the
+# last stage holds the drafter's 5 MLA rows.
+PP8_STAGES = list(
+    zip(
+        (3, 3, 3, 4, 3, 3, 3, 7),
+        (10, 10, 10, 9, 10, 9, 9, 2),
+        (137.32, 137.37, 157.57, 138.30, 138.54, 152.46, 153.11, 276.36),
+    )
+)
+PP8_ENTRIES = [kda * KDA_IMAGE for _, kda, _ in PP8_STAGES]
+
+
+class _Contributed(Exception):
+    pass
+
+
+def on_every_stage(monkeypatch, call, stages):
+    """`call(rank)` on every PP stage, each gather answered with what every
+    stage put in, the way the group's `all_gather_object` would."""
+    import torch.distributed as dist
+
+    put = [None] * stages
+
+    def collect(rank):
+        def gather(out, obj, group=None):
+            put[rank] = obj
+            raise _Contributed
+
+        return gather
+
+    for rank in range(stages):
+        monkeypatch.setattr(dist, "all_gather_object", collect(rank))
+        with pytest.raises(_Contributed):
+            call(rank)
+    monkeypatch.setattr(
+        dist,
+        "all_gather_object",
+        lambda out, obj, group=None: out.__setitem__(slice(None), put),
+    )
+    return [call(rank) for rank in range(stages)]
+
+
+class TestEveryPPStageKeepsItsOwnImages:
+    """`ModelRunner` sizes a checkpoint store on every stage, one count for all
+    of them and each entry that stage's own image, and the stages then agree
+    on one entry an image rather than the largest stage's KV blocks."""
+
+    @pytest.fixture
+    def mr(self, monkeypatch):
+        mr = pytest.importorskip(
+            "atom.model_engine.model_runner",
+            reason="the runner's module imports aiter at load",
+            exc_type=ImportError,
+        )
+        import torch.distributed as dist
+
+        monkeypatch.delenv("ATOM_PP_STATE_CHECKPOINT_SLOTS", raising=False)
+        monkeypatch.delenv("ATOM_PP_STATE_CHECKPOINT_KV_SHARE", raising=False)
+        monkeypatch.setattr(dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(
+            mr, "get_pp_group", lambda: SimpleNamespace(world_size=8, cpu_group=None)
+        )
+        return mr
+
+    def stage(self, mr, rank, pp=8, prefix_caching=True, stateless_rank=-1):
+        rows, kda, gib = PP8_STAGES[rank]
+        kda = 0 if rank == stateless_rank else kda
+        specs = [page_pool(rows * MLA_ROW)]
+        if kda:
+            specs.append(
+                state_pool(STATE_SLOT_CLASS, kda * KDA_SLOT, entries_per_req=1)
+            )
+        available = int(gib * GIB)
+        stub = SimpleNamespace(
+            config=SimpleNamespace(
+                pipeline_parallel_size=pp,
+                enable_prefix_caching=prefix_caching,
+                state_checkpoint_interval_tokens=8192,
+            ),
+            attn_metadata_builder=SimpleNamespace(
+                paged_checkpoints_span_pipeline=True,
+                state_transfer=lambda: StateTransfer.copy("kda"),
+                checkpoint_image_bytes=lambda: kda * KDA_IMAGE,
+                sub_pool_specs=lambda: specs,
+            ),
+            plan=plan_pools(specs, available, 64),
+            available=available,
+            transfer=StateTransfer.copy("kda"),
+            slot_bytes=kda * KDA_SLOT,
+        )
+        for name in (
+            "_plan_pipeline_checkpoint_store",
+            "_local_checkpoint_image_bytes",
+            "_local_checkpoint_spec",
+            "_agree_pipeline_checkpoint_spec",
+        ):
+            method = getattr(mr.ModelRunner, name)
+            setattr(stub, name, method.__get__(stub, type(stub)))
+        return stub
+
+    def stores(self, mr, monkeypatch, **kwargs):
+        stubs = [self.stage(mr, rank, **kwargs) for rank in range(8)]
+        return stubs, on_every_stage(
+            monkeypatch,
+            lambda r: stubs[r]._plan_pipeline_checkpoint_store(
+                stubs[r].plan, stubs[r].available
+            ),
+            8,
+        )
+
+    def test_every_stage_holds_one_count_at_its_own_image(self, mr, monkeypatch):
+        _, stores = self.stores(mr, monkeypatch)
+        assert stores == [(1172, entry) for entry in PP8_ENTRIES]
+
+    def test_the_stages_agree_on_one_entry_an_image(self, mr, monkeypatch):
+        stubs, stores = self.stores(mr, monkeypatch)
+        in_store = on_every_stage(
+            monkeypatch,
+            lambda r: stubs[r]._agree_pipeline_checkpoint_spec(
+                stubs[r]._local_checkpoint_spec(
+                    stubs[r].transfer, stubs[r].slot_bytes, stores[r][1]
+                )
+            ),
+            8,
+        )
+        in_blocks = on_every_stage(
+            monkeypatch,
+            lambda r: stubs[r]._agree_pipeline_checkpoint_spec(
+                stubs[r]._local_checkpoint_spec(stubs[r].transfer, stubs[r].slot_bytes)
+            ),
+            8,
+        )
+
+        assert {spec.units_per_checkpoint for spec in in_store} == {1}
+        assert [spec.page_unit_bytes for spec in in_store] == PP8_ENTRIES
+        assert {spec.units_per_checkpoint for spec in in_blocks} == {308}
+        assert {spec.op_bytes for spec in in_store + in_blocks} == {sum(PP8_ENTRIES)}
+        # One joint id per layout, and the two layouts never read each other.
+        assert len({spec.layout_id for spec in in_store}) == 1
+        assert in_store[0].layout_id != in_blocks[0].layout_id
+
+    def test_without_pp_nothing_is_planned_or_gathered(self, mr, monkeypatch):
+        """No store and no gather (no group exists to answer one): the spec
+        is the KV-block one it always was."""
+        stub = self.stage(mr, 0, pp=1)
+        assert stub._plan_pipeline_checkpoint_store(stub.plan, stub.available) is None
+        spec = stub._local_checkpoint_spec(stub.transfer, stub.slot_bytes)
+        assert (spec.page_unit_bytes, spec.units_per_checkpoint) == (3 * MLA_ROW, 308)
+
+    @pytest.mark.parametrize(
+        "kwargs, slots, expected",
+        [
+            # Prefix caching off: the layout stays, the store holds none.
+            ({"prefix_caching": False}, None, [(0, e) for e in PP8_ENTRIES]),
+            # A negative count keeps the images in KV blocks.
+            ({}, "-1", [None] * 8),
+            # Every stage still gathers, so none is left waiting, then all skip
+            # the store: `_agree_pipeline_checkpoint_spec` names the stage.
+            ({"stateless_rank": 7}, None, [None] * 8),
+        ],
+    )
+    def test_where_no_store_holds_images(
+        self, mr, monkeypatch, kwargs, slots, expected
+    ):
+        if slots is not None:
+            monkeypatch.setenv("ATOM_PP_STATE_CHECKPOINT_SLOTS", slots)
+        assert self.stores(mr, monkeypatch, **kwargs)[1] == expected

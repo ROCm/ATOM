@@ -402,6 +402,29 @@ def test_chunked_transfer_discovery_advertises_pp_and_page_geometry(
         }
 
 
+def test_chunked_transfer_discovery_names_each_stages_node_across_nodes(monkeypatch):
+    # A pipeline across nodes: a consumer reaches each stage on its own node.
+    hosts = ["10.0.0.1", "10.0.0.1", "10.0.0.2", "10.0.0.2"]
+    config = SimpleNamespace(
+        kv_transfer_config={
+            "kv_connector": "mooncake",
+            "kv_role": "kv_producer",
+            "enable_chunked_transfer": True,
+        },
+        tensor_parallel_size=1,
+        pipeline_parallel_size=4,
+        pp_stage_ips=hosts,
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        kv_cache_block_size=64,
+        decode_context_parallel_size=1,
+    )
+    monkeypatch.setattr(api_server, "engine", SimpleNamespace(config=config))
+    monkeypatch.setattr("atom.utils.network.get_ip", lambda: "10.0.0.1")
+    info = asyncio.run(api_server.kv_transfer_info())
+    assert info["chunked_transfer"]["remote_pp_size"] == 4
+    assert info["chunked_transfer"]["remote_pp_hosts"] == hosts
+
+
 class TestChunkedAdmissionTopology:
     @pytest.mark.parametrize(
         "endpoint", ["chat/completions", "completions", "messages", "responses"]
