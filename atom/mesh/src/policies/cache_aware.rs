@@ -336,11 +336,16 @@ impl CacheAwarePolicy {
             .filter(|tokens| !tokens.is_empty() && !info.carries_media)?;
         let provider = self.kv_events.get()?;
         let hits = provider.match_workers(tokens, workers);
-        let cached = provider.cached_tokens(tokens, workers, &hits).await;
         let weight = provider.store_weight();
+        let stored = if weight > 0.0 {
+            Some(provider.cached_tokens(tokens, workers, &hits).await)
+        } else {
+            None
+        };
+        let cached = |idx: usize| stored.as_ref().map_or(hits[idx], |stored| stored[idx]);
         let score = |idx: usize| {
             let device = hits[idx]?;
-            let loaded = cached[idx].map_or(0, |cached| cached.saturating_sub(device));
+            let loaded = cached(idx).map_or(0, |cached| cached.saturating_sub(device));
             Some(f64::from(device) + weight * f64::from(loaded))
         };
         let (idx, score) = healthy_indices
@@ -362,7 +367,7 @@ impl CacheAwarePolicy {
         }
         self.routed(info, workers[idx].as_ref());
         workers[idx].increment_processed();
-        let estimate = cached[idx].map(|cached| f64::from(cached) / tokens.len() as f64);
+        let estimate = cached(idx).map(|cached| f64::from(cached) / tokens.len() as f64);
         let decision = RouteDecision {
             match_ratio: Some(match_rate),
             estimated_hit_ratio: estimate,
@@ -975,6 +980,7 @@ mod tests {
             _: &[Arc<dyn Worker>],
             device: &[Option<u32>],
         ) -> Vec<Option<u32>> {
+            assert!(self.1 > 0.0, "a store asked at weight 0");
             assert_eq!(device, self.match_workers(&[], &[]));
             self.0.iter().map(|&(_, cached)| cached).collect()
         }
@@ -998,11 +1004,8 @@ mod tests {
         // w1's device cache holds 60 of the 100 tokens; w2's none, but its store 90.
         let stored = |weight| Stored(vec![(60, Some(60)), (0, Some(90))], weight);
         for (stored, want) in [
-            // Stores not asked: the device caches alone.
-            (
-                Stored(vec![(60, Some(60)), (0, Some(0))], 0.0),
-                Some((0, 0.6, Some(0.6))),
-            ),
+            // At weight 0 the store is not asked: the device caches alone.
+            (stored(0.0), Some((0, 0.6, Some(0.6)))),
             // A loaded token weighing 1 is worth one on the device, and 0.5 half of it.
             (stored(1.0), Some((1, 0.9, Some(0.9)))),
             (stored(0.5), Some((0, 0.6, Some(0.6)))),

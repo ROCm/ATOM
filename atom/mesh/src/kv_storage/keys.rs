@@ -43,19 +43,28 @@ pub fn chain_check(chunk_tokens: u32) -> String {
     check
 }
 
-/// The key of each chunk of `chain` at rank 0 of `world`: one key per chunk, where ATOM's
-/// own lookup asks every rank and takes the shortest run. The master evicts a chunk's
-/// objects of every rank together, so the two agree except on a chunk still being
-/// written, or whose put failed, at another rank, which counts as stored here.
-pub fn rank0_keys(namespace: &str, world: u32, chain: &[[u8; DIGEST_BYTES]]) -> Vec<String> {
-    let prefix = format!("{namespace}/w0of{world}/");
-    let key = |digest: &[u8; DIGEST_BYTES]| {
-        let mut key = String::with_capacity(prefix.len() + 2 * DIGEST_BYTES);
-        key.push_str(&prefix);
-        push_hex(&mut key, digest);
-        key
-    };
-    chain.iter().map(key).collect()
+/// The key of each chunk of `chain` at ranks `0..ranks` of `world`, rank by rank, as ATOM's
+/// lookup asks every rank and takes the shortest run. A store of one pool evicts a chunk's
+/// objects of every rank together, so rank 0's keys alone agree with it except on a chunk
+/// still being written, or whose put failed, at another rank, which counts as stored. Of
+/// several pools, each holds, evicts and is tainted for the ranks that write to it alone.
+pub fn rank_keys(
+    namespace: &str,
+    world: u32,
+    ranks: u32,
+    chain: &[[u8; DIGEST_BYTES]],
+) -> Vec<String> {
+    let mut keys = Vec::with_capacity(chain.len() * ranks as usize);
+    for rank in 0..ranks {
+        let prefix = format!("{namespace}/w{rank}of{world}/");
+        for digest in chain {
+            let mut key = String::with_capacity(prefix.len() + 2 * DIGEST_BYTES);
+            key.push_str(&prefix);
+            push_hex(&mut key, digest);
+            keys.push(key);
+        }
+    }
+    keys
 }
 
 fn push_hex(to: &mut String, bytes: &[u8]) {
@@ -85,15 +94,15 @@ mod tests {
         assert_eq!(chain_check(0), "");
         let tokens: Vec<u32> = (0..53).map(|i| (i * 7919) % 150_000).collect();
         let namespace = "atomkv1-0123456789abcdef01234567";
-        assert_eq!(
-            rank0_keys(namespace, 8, &chunk_chain(&tokens, 16)),
-            [
-                "48a73da894d8d0ef643123150b31991e",
-                "a53c74ba1da5cce48218d8a3729dc7a1",
-                "bdff5c9bb8a712526c9ad1e28caa2a8e",
-            ]
-            .map(|digest| format!("{namespace}/w0of8/{digest}"))
-        );
+        let chain = chunk_chain(&tokens, 16);
+        let digests = [
+            "48a73da894d8d0ef643123150b31991e",
+            "a53c74ba1da5cce48218d8a3729dc7a1",
+            "bdff5c9bb8a712526c9ad1e28caa2a8e",
+        ];
+        let at = |rank: u32| digests.map(|digest| format!("{namespace}/w{rank}of8/{digest}"));
+        assert_eq!(rank_keys(namespace, 8, 1, &chain), at(0));
+        assert_eq!(rank_keys(namespace, 8, 2, &chain), [at(0), at(1)].concat());
     }
 
     /// `cargo test --release --lib kv_storage::keys::tests::bench -- --ignored --nocapture`;
@@ -109,9 +118,10 @@ mod tests {
             .collect();
         let samples = (0..size("KV_BENCH_SAMPLES", 2000)).map(|_| {
             let started = std::time::Instant::now();
-            let keys = rank0_keys(
+            let keys = rank_keys(
                 "atomkv1-0123456789abcdef01234567",
                 8,
+                1,
                 &chunk_chain(&tokens, 256),
             );
             assert_eq!(keys.len(), tokens.len() / 256);

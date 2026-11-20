@@ -426,16 +426,24 @@ fn stored(hashes: &[u64], tokens: &[u32]) -> Bytes {
 /// With `cache_aware`, a request whose tokens a worker's device cache holds goes to that
 /// worker, whatever the tree learned: its `input_ids`, or its prompt or chat encoded with
 /// the special tokens, as ATOM stores the blocks. One with media is placed by its text.
-/// What the engine will load of the request from the store the worker reads, which counts
-/// with `--kv-storage-weight`, is asked of the store by ATOM's keys. The store is tainted,
-/// so it holds nothing and only the device cache can place a request.
+/// What the engine will load of the request from the store the worker reads counts at
+/// `--kv-storage-weight`, asked of the store by ATOM's keys, and is not asked at 0. The
+/// store is tainted, so it holds nothing and only the device cache can place a request,
+/// until the end.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cache_aware_places_requests_by_the_kv_event_index() {
+    for weight in [1.0, 0.0] {
+        places_requests_by_the_kv_event_index(weight).await;
+    }
+}
+
+async fn places_requests_by_the_kv_event_index(weight: f64) {
     let mut publisher = PubSocket::new();
     let bound = publisher.bind("tcp://127.0.0.1:0").await.unwrap();
     let port = bound.to_string().rsplit_once(':').unwrap().1.to_string();
     let asked = Arc::new(Mutex::new(Vec::new()));
-    let admin_port = mooncake_admin(Arc::new(AtomicBool::new(true)), asked.clone()).await;
+    let tainted = Arc::new(AtomicBool::new(true));
+    let admin_port = mooncake_admin(tainted.clone(), asked.clone()).await;
     // ATOM's chain_check of chunks of 2 tokens.
     let offload = json!({"backend": "mooncake_store", "masters": ["127.0.0.1:50051"],
         "namespace": "atomkv1-0123456789abcdef01234567", "chunk_tokens": 2, "world": 1,
@@ -460,7 +468,7 @@ async fn cache_aware_places_requests_by_the_kv_event_index() {
     config.kv_events = true;
     config.mooncake_admin_port = admin_port;
     config.kv_storage_deadline_ms = 1000;
-    config.kv_storage_weight = 1.0;
+    config.kv_storage_weight = weight;
     let ctx = AppTestContext::new_with_config(config, vec![]).await;
     let dir = tempfile::tempdir().unwrap();
     let tokenizer = bos_tokenizer(dir.path());
@@ -474,6 +482,9 @@ async fn cache_aware_places_requests_by_the_kv_event_index() {
         .unwrap();
     let app = ctx.create_app().await;
     let request = json!({"input_ids": (100..112).collect::<Vec<u32>>(),
+        "sampling_params": {"max_new_tokens": 1}});
+    // No device cache will hold it.
+    let cold = json!({"input_ids": (200..212).collect::<Vec<u32>>(),
         "sampling_params": {"max_new_tokens": 1}});
     let text = "a b c d e f g h i";
     let requests = [
@@ -493,6 +504,7 @@ async fn cache_aware_places_requests_by_the_kv_event_index() {
     for (uri, body) in &requests {
         assert_eq!(served_by(&app, uri, body).await, workers[1].2);
     }
+    assert_eq!(served_by(&app, "/generate", &cold).await, workers[1].2);
     register(&app, &workers[0].1, 2).await;
     let joined = |sources: &Value| sources[0]["batches"].as_u64() > Some(0);
     sources_once(&app, Some(&mut publisher), joined).await;
@@ -507,25 +519,33 @@ async fn cache_aware_places_requests_by_the_kv_event_index() {
     for _ in 0..4 {
         assert_eq!(served_by(&app, "/generate", &request).await, workers[0].2);
     }
-    // The store is asked for the rest, but for the last token: ATOM's keys of the
-    // request's 6 chunks at rank 0, from its keys.py, and the taint key.
-    let keys = [
-        "27fbf4f34f6a83d0823cd5a524cc26b6",
-        "860ba8237adce06b477e78dfcfbe4447",
-        "a9c694a6f9bf83bb6f8c266825c47f11",
-        "efc6ab4b75dd5218bf3cf487ceda7892",
-        "1a78819b1adf2af3bfee604892da6a74",
-        "ca1e63585d9dcb9c4a86979ef86a8d7a",
-    ]
-    .map(|digest| format!("atomkv1-0123456789abcdef01234567/w0of1/{digest}"));
-    let keys = format!("{},atomkv/store-tainted", keys.join(","));
     let asked = asked.lock().unwrap().clone();
-    assert!(
-        !asked.is_empty() && asked.iter().all(|asked| *asked == keys),
-        "{asked:?}"
-    );
     let (_, stores) = call(&app, "GET", "/kv_storage/sources", None).await;
-    assert!(stores[0]["last_lookup_us"].is_u64(), "{stores}");
+    if weight > 0.0 {
+        // The store is asked for the whole prompt, from its first token: ATOM's keys of
+        // the request's 6 chunks at rank 0, from its keys.py, and the taint key.
+        let keys = [
+            "27fbf4f34f6a83d0823cd5a524cc26b6",
+            "860ba8237adce06b477e78dfcfbe4447",
+            "a9c694a6f9bf83bb6f8c266825c47f11",
+            "efc6ab4b75dd5218bf3cf487ceda7892",
+            "1a78819b1adf2af3bfee604892da6a74",
+            "ca1e63585d9dcb9c4a86979ef86a8d7a",
+        ]
+        .map(|digest| format!("atomkv1-0123456789abcdef01234567/w0of1/{digest}"));
+        let keys = format!("{},atomkv/store-tainted", keys.join(","));
+        assert!(
+            !asked.is_empty() && asked.iter().all(|asked| *asked == keys),
+            "{asked:?}"
+        );
+        assert!(stores[0]["last_lookup_us"].is_u64(), "{stores}");
+    } else {
+        assert!(
+            asked.iter().all(|asked| !asked.contains("/w0of1/")),
+            "{asked:?}"
+        );
+        assert!(stores[0]["last_lookup_us"].is_null(), "{stores}");
+    }
     assert_eq!(stores[0]["breaker_open"], false);
     // `<s>` and a to g: two of the text's three blocks, as ATOM encodes it.
     publish(
@@ -538,6 +558,15 @@ async fn cache_aware_places_requests_by_the_kv_event_index() {
     for (uri, body) in &requests[1..] {
         assert_eq!(served_by(&app, uri, body).await, workers[0].2, "{uri}");
     }
+    // Once the store holds every chunk, the engine would load 10 of the 12 tokens: above
+    // 0, that places the request the tree has on the other worker.
+    tainted.store(false, Ordering::Relaxed);
+    let placed = if weight > 0.0 { 0 } else { 1 };
+    assert_eq!(
+        served_by(&app, "/generate", &cold).await,
+        workers[placed].2,
+        "{weight}"
+    );
     ctx.shutdown().await;
     for (mut worker, _, _) in workers {
         worker.stop().await;

@@ -1,5 +1,6 @@
 //! A prompt looked up on the request path in the store its workers read: ATOM's keys of
-//! its chunks, asked of every pool within a deadline, and what each worker's engine loads
+//! its chunks, at every rank when the store has several pools, asked of every pool within
+//! a deadline, and what each worker's engine loads
 //! of the prefix the store holds. A source that keeps failing is skipped for a while, and
 //! so are the lookups past a cap on the requests in flight to its pools.
 
@@ -159,10 +160,16 @@ impl Read {
         }
         let chunk = self.report.chunk_tokens;
         let pools = self.admins.len().max(1);
+        // Of one pool, rank 0's keys tell what every rank holds; see `keys::rank_keys`.
+        let ranks = if pools > 1 {
+            self.report.world.max(1)
+        } else {
+            1
+        };
         let chunks = (tokens.len().checked_div(chunk as usize).unwrap_or(0))
             .min(MAX_CHUNKS)
-            .min(MAX_REQUESTS / pools * mooncake::BATCH_KEYS);
-        let requests = chunks.div_ceil(mooncake::BATCH_KEYS) * self.admins.len();
+            .min(MAX_REQUESTS / pools * mooncake::BATCH_KEYS / ranks as usize);
+        let requests = (chunks * ranks as usize).div_ceil(mooncake::BATCH_KEYS) * self.admins.len();
         let Some(_flight) = Flight::board(&self.lookups.in_flight, requests) else {
             return Err("overloaded");
         };
@@ -170,11 +177,11 @@ impl Read {
             return Err("breaker_open");
         }
         let chain = keys::chunk_chain(&tokens[..chunks * chunk as usize], chunk as usize);
-        let keys = keys::rank0_keys(&self.report.namespace, self.report.world, &chain);
+        let keys = keys::rank_keys(&self.report.namespace, self.report.world, ranks, &chain);
         let started = Instant::now();
         let asked = mooncake::query_pools(client, &self.admins, &keys);
         let held = match tokio::time::timeout(self.deadline, asked).await {
-            Ok(states) => held_chunks(&states).ok_or("error"),
+            Ok(states) => held_chunks(&states, ranks as usize).ok_or("error"),
             Err(_) => Err("timeout"),
         };
         let took = started.elapsed();
@@ -186,14 +193,22 @@ impl Read {
     }
 }
 
-/// The chunks from the start that some pool holds, unless no pool answered for the
-/// first one after them, which might be held too.
-fn held_chunks(states: &[KeyState]) -> Option<u32> {
-    let held = states.iter().take_while(|state| state.is_held()).count();
-    match states.get(held) {
-        Some(KeyState::Unknown) => None,
-        _ => u32::try_from(held).ok(),
+/// The chunks from the start that some pool holds at every rank, `states` holding each of
+/// `ranks` ranks' keys in turn, as ATOM's lookup takes the shortest run; None when keys no
+/// pool answered might make it longer.
+fn held_chunks(states: &[KeyState], ranks: usize) -> Option<u32> {
+    let chunks = (states.len() / ranks.max(1)).max(1);
+    let shortest = |stop: fn(&KeyState) -> bool| {
+        let run = |keys: &[KeyState]| keys.iter().position(stop).unwrap_or(keys.len());
+        states.chunks(chunks).map(run).min().unwrap_or(0)
+    };
+    // Counting an unanswered key as absent, and as held.
+    let held = shortest(|state| !state.is_held());
+    let bound = shortest(|state| *state == KeyState::Absent);
+    if held != bound {
+        return None;
     }
+    u32::try_from(held).ok()
 }
 
 /// What ATOM's scheduler can load of a store's `hit` for a prompt of `prompt` tokens:
@@ -222,7 +237,7 @@ fn load_tokens(device: u32, loadable: u32, chunk: u32, min_load: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashMap,
+        collections::{HashMap, HashSet},
         sync::atomic::{AtomicBool, AtomicU64},
     };
 
@@ -272,7 +287,18 @@ mod tests {
             (&[Memory, Unknown, Memory], None),
             (&[], Some(0)),
         ] {
-            assert_eq!(held_chunks(states), want, "{states:?}");
+            assert_eq!(held_chunks(states, 1), want, "{states:?}");
+        }
+        // Of two ranks, the shorter run, unless a key no pool answered might lengthen it.
+        for (states, want) in [
+            (
+                &[Memory, Memory, Memory, Memory, Absent, Memory][..],
+                Some(1),
+            ),
+            (&[Memory, Unknown, Memory, Absent, Memory, Memory], Some(0)),
+            (&[Memory, Unknown, Memory, Memory], None),
+        ] {
+            assert_eq!(held_chunks(states, 2), want, "{states:?}");
         }
     }
 
@@ -442,10 +468,11 @@ mod tests {
         let prompt: Vec<u32> = (0..64).collect();
         let workers = [
             ("http://a:8000", 0),
-            ("http://b:8000", 40),
+            ("http://b:8000", 48),
             ("http://c:8000", 10),
         ];
-        // Each reader loads past its own device cache; c reads no store.
+        // The store is asked for a, the reader with the least on its device: a loads its
+        // 48 tokens, while b already holds them and loads nothing; c reads no store.
         admin.held.store(3, Ordering::Relaxed);
         let cached = sources.cached_tokens(&prompt, &workers).await;
         assert_eq!(cached, [Some(48), Some(48), Some(10)]);
@@ -453,6 +480,72 @@ mod tests {
         admin.fail.store(true, Ordering::Relaxed);
         let cached = sources.cached_tokens(&prompt, &workers).await;
         assert_eq!(cached, [None, None, Some(10)]);
+    }
+
+    /// The admin service of a pool that holds `held`, and the taint key when `tainted`.
+    async fn pool(held: Vec<String>, tainted: bool) -> String {
+        let taint = tainted.then(|| keys::TAINT_KEY.to_string());
+        let held: HashSet<String> = held.into_iter().chain(taint).collect();
+        let answer = move |Query(query): Query<HashMap<String, String>>| {
+            let replicas = |key: &str| match held.contains(key) {
+                true => json!({"ok": true, "values": [{}]}),
+                false => json!({"ok": false, "error": "OBJECT_NOT_FOUND"}),
+            };
+            let data: Map<String, serde_json::Value> = (query["keys"].split(','))
+                .map(|key| (key.to_string(), replicas(key)))
+                .collect();
+            async move { Json(json!({"success": true, "data": data})) }
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let service = Router::new().route("/batch_query_keys", get(answer));
+        tokio::spawn(async move { axum::serve(listener, service).await });
+        url
+    }
+
+    /// The tokens of `prompt` the store of pools `admins` holds, for ranks of 2 in chunks
+    /// of 16.
+    async fn held_of_two_ranks(admins: Vec<String>, prompt: &[u32]) -> Option<u32> {
+        let read = Read {
+            id: "atom-mooncake-01234567".into(),
+            report: OffloadReport {
+                namespace: "atomkv1-0123456789abcdef01234567".into(),
+                chunk_tokens: 16,
+                world: 2,
+                min_load_tokens: 16,
+                ..Default::default()
+            },
+            admins,
+            readable: true,
+            lookups: Arc::default(),
+            deadline: Duration::from_millis(500),
+        };
+        read.held(&reqwest::Client::new(), prompt, 0).await
+    }
+
+    #[tokio::test]
+    async fn a_store_of_several_pools_holds_the_shortest_run_of_any_rank() {
+        // As ATOM's per-NIC pools: rank r writes to pool r, which holds, evicts and is
+        // tainted on its own.
+        let prompt: Vec<u32> = (0..96).collect();
+        let chain = keys::chunk_chain(&prompt, 16);
+        let mut rank0 = keys::rank_keys("atomkv1-0123456789abcdef01234567", 2, 2, &chain);
+        let rank1 = rank0.split_off(6);
+        let two = |rank1: Vec<String>, tainted| {
+            futures::future::join_all([pool(rank0.clone(), false), pool(rank1, tainted)])
+        };
+        let held = held_of_two_ranks(two(rank1.clone(), false).await, &prompt).await;
+        assert_eq!(held, Some(96));
+        // Pool 1 has evicted chunk 1 of rank 1: the engine loads chunk 0 alone.
+        let evicted = [&rank1[..1], &rank1[2..]].concat();
+        let held = held_of_two_ranks(two(evicted, false).await, &prompt).await;
+        assert_eq!(held, Some(16));
+        // Pool 1 is tainted: the engine loads nothing.
+        let held = held_of_two_ranks(two(rank1, true).await, &prompt).await;
+        assert_eq!(held, Some(0));
+        // A store of one pool is asked for rank 0's keys alone.
+        let one = vec![pool(rank0, false).await];
+        assert_eq!(held_of_two_ranks(one, &prompt).await, Some(96));
     }
 
     #[tokio::test]
