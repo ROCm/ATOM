@@ -295,9 +295,12 @@ def _torch_attn_res(
     out_eps=1e-6,
     add_hidden2=None,
     quant_dtype=None,
+    num_blocks=None,
 ):
     """Attention residual and output RMS norm in FP32 torch."""
     assert quant_dtype is None
+    if num_blocks is not None:
+        block_residual = block_residual[:, :num_blocks]
     ps = prefix.float()
     for add in (add_hidden, add_hidden2):
         if add is not None:
@@ -458,15 +461,14 @@ def test_row_sharded_layer_sums_to_the_base(logged, monkeypatch, tokens, layer_n
             ("all_gather", chunk),
         ]
         residual, routed, shared, bank = got
-        assert not routed.any() and not shared.any()
-        assert len({t.data_ptr() for t in (residual, routed, shared)}) == 3
+        assert routed is None and shared is None
         assert torch.equal(bank, want[3])
         # The row-sharded sum rounds to BF16 twice, the reference once.
         exact = sum(t.float() for t in want[:3])
         bound = 3 * 2**-8 * sum(t.float().abs() for t in want[:3])
         assert ((residual.float() - exact).abs() <= bound).all()
         assert torch.equal(kimi.KimiDecoderLayer.aux_hidden_state(got), residual)
-        cloned = tuple(x.clone() for x in got)
+        cloned = tuple(x.clone() if isinstance(x, torch.Tensor) else x for x in got)
         assert torch.equal(kimi.KimiDecoderLayer.aux_hidden_state(cloned), residual)
 
 
@@ -560,7 +562,7 @@ def test_constructor_limits_row_dispatch(
     assert block.row_shardable is eligible and block._use_dispatch_op is eligible
 
 
-def test_mono_fallback_uses_post_attention_reduction():
+def test_mono_fallback_preserves_typed_forward_outputs():
     path = Path(kimi.__file__).parent / "mono/runner.py"
     fn = next(
         n
@@ -571,19 +573,23 @@ def test_mono_fallback_uses_post_attention_reduction():
     exec(  # noqa: S102 - execute only the checked-in fallback method
         compile(ast.Module(body=[fn], type_ignores=[]), str(path), "exec"), namespace
     )
-    prefix, normed, bank = (
+    prefix, columns, bank = (
         torch.ones(2, 4),
-        torch.full((2, 4), 2.0),
+        torch.full((2, 2), 2.0),
         torch.zeros(2, 1, 4),
     )
-    layer = SimpleNamespace(
-        is_linear_attn=True,
-        self_attn=lambda x: x + 1,
-        _post_attention=lambda *args: args,
+    pending = kimi.ColumnTail(columns, "gather", 2)
+    calls = []
+
+    def forward(*args):
+        calls.append(args)
+        return prefix, pending, None, bank
+
+    runner = SimpleNamespace(
+        inner=SimpleNamespace(layers=[SimpleNamespace(forward=forward)])
     )
-    runner = SimpleNamespace(_seam=lambda *a: (layer, normed, prefix, 1, -1))
-    partial, residual, blocks = namespace["_fallback"](
-        runner, None, None, prefix, bank, None, None
+    residual, add, add2 = namespace["_fallback"](
+        runner, SimpleNamespace(layer_id=0), None, prefix, bank, None, None
     )
-    assert torch.equal(partial, normed + 1) and residual is prefix
-    assert torch.equal(blocks, bank)
+    assert len(calls) == 1 and calls[0][1] is prefix and calls[0][2] is bank
+    assert residual is prefix and add is pending and add2 is None

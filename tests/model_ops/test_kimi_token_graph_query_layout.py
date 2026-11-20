@@ -21,7 +21,16 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def _load(path, names, namespace, methods=None):
     tree = ast.parse((ROOT / path).read_text(encoding="utf-8"))
-    body = [node for node in tree.body if getattr(node, "name", None) in names]
+    body = [
+        node
+        for node in tree.body
+        if getattr(node, "name", None) in names
+        or isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id in names
+            for target in node.targets
+        )
+    ]
     if methods is not None:
         for node in body:
             if isinstance(node, ast.ClassDef):
@@ -61,6 +70,7 @@ def runtime(monkeypatch):
         ),
     )
     context["_forward_context"] = ctx
+    ctx.tr_graph = "replay"
     graph = {
         "torch": torch,
         "NamedTuple": NamedTuple,
@@ -81,6 +91,13 @@ def runtime(monkeypatch):
         def __init__(self, layer_num, sparse):
             super().__init__()
             self.layer_num, self.is_sparse_mla = layer_num, sparse
+            self.split_prefill_recording = False
+
+        def prefill_split_supported(self):
+            return not self.is_sparse_mla
+
+        def records_prefill_split(self):
+            return False
 
         def forward(self, query, k_nope, k_rope, positions, q_scale):
             slots = ctx.attn_metadata.slot_mapping
@@ -186,7 +203,12 @@ def runtime(monkeypatch):
     }
     _load(
         "atom/model_ops/base_attention.py",
-        {"_mla_token_graph_forward", "unified_attention_with_output_base"},
+        {
+            "_mla_token_graph_forward",
+            "unified_attention_with_output_base",
+            "_attention",
+            "_attention_region",
+        },
         receiver,
     )
     builder_ns = {
@@ -202,7 +224,7 @@ def runtime(monkeypatch):
         "atom/model_ops/attentions/kimi_mla_gdn_attn.py",
         {"_KimiMLAGDNCommon"},
         builder_ns,
-        {"build_kv_cache_tensor"},
+        {"build_kv_cache_tensor", "supports_token_graph"},
     )
 
     def make(layer=0):
@@ -225,6 +247,7 @@ def runtime(monkeypatch):
         builder.kv_pool = SimpleNamespace(
             entry_dim=4, layer=lambda *args: torch.zeros(2, 4)
         )
+        case.builder = builder
         with monkeypatch.context() as patch:
             patch.setitem(
                 sys.modules,
@@ -243,7 +266,7 @@ def runtime(monkeypatch):
         True,
         None,
     ]
-    return SimpleNamespace(
+    case = SimpleNamespace(
         make=make,
         bind=bind,
         mode=mode,
@@ -253,7 +276,9 @@ def runtime(monkeypatch):
         call=receiver["unified_attention_with_output_base"],
         seen=seen,
         layout=layout,
+        receiver=receiver,
     )
+    return case
 
 
 @pytest.mark.parametrize("layer", [0, 2], ids=["first-stage", "later-stage"])
@@ -334,6 +359,34 @@ def test_receiver_requires_target_binding_before_using_declared_layout(runtime):
     runtime.call(*runtime.args)
     assert runtime.seen[-1][:4] == (8, 8, 8, 8)
     assert runtime.seen[-1][4] is slots
+
+
+def test_prefill_graph_gate_accepts_bound_native_sparse_queries(runtime):
+    runtime.bind(runtime.make())
+    assert runtime.builder.supports_token_graph
+
+
+@pytest.mark.parametrize("reason", ["quantized", "draft", "plugin", "dp", "pcp"])
+def test_prefill_graph_gate_keeps_unsupported_sparse_queries_eager(runtime, reason):
+    runtime.mode.quantized = reason == "quantized"
+    runtime.mode.plugin = reason == "plugin"
+    if reason == "dp":
+        runtime.config.parallel_config.data_parallel_size = 2
+    if reason == "pcp":
+        runtime.config.prefill_context_parallel_size = 2
+    runtime.bind(runtime.make(4 if reason == "draft" else 0))
+    assert not runtime.builder.supports_token_graph
+
+
+def test_plain_attention_does_not_enter_the_token_graph_helper(runtime):
+    runtime.bind(runtime.make())
+    runtime.ctx.tr_graph = None
+    runtime.ctx.context.forward_mode.prefill_token_graph = False
+    runtime.receiver["_mla_token_graph_forward"] = lambda *args: pytest.fail(
+        "plain call entered graph helper"
+    )
+    runtime.call(*runtime.args)
+    assert runtime.seen[-1][:4] == (8, 8, 8, 8)
 
 
 @pytest.mark.parametrize(

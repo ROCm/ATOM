@@ -2,6 +2,8 @@
 """An active count reaches each existing attention-residual op and launch."""
 
 import inspect
+import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -112,3 +114,66 @@ def test_active_count_must_fit_bank(ops, count):
         ops._apply_attn_res_impl(
             torch.ones(2, 8), torch.ones(2, 3, 8), torch.ones(8), 1e-6, num_blocks=count
         )
+
+
+@pytest.mark.parametrize("quant", [False, True])
+@pytest.mark.parametrize("count", [1, 2])
+def test_columns_and_active_count_reach_the_same_kernel(monkeypatch, ops, quant, count):
+    owner = object.__new__(ops.PeerColumnGather)
+    owner.rank, owner.world, owner.rows, owner.cols = 0, 2, 2, 2
+    owner.closed = False
+    owner.scratch = torch.zeros(16, dtype=torch.int64)
+    owner.epochs = torch.zeros(2, dtype=torch.int32)
+    owner.buffer = SimpleNamespace(addresses=torch.zeros(2, dtype=torch.int64))
+    config = SimpleNamespace(
+        compilation_config=SimpleNamespace(static_forward_context={"gather": owner})
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "atom.config",
+        SimpleNamespace(get_current_atom_config=lambda: config),
+    )
+    prefix = torch.ones(2, 4, dtype=torch.bfloat16)
+    columns = torch.full((2, 2), 2, dtype=torch.bfloat16)
+    bank = torch.full((2, 4, 4), float("nan"), dtype=torch.bfloat16)
+    bank[:, :count].fill_(3)
+    launches = []
+
+    class Kernel:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                launches.append((args, kwargs))
+                assert args[0] is bank and args[9] == count
+                assert kwargs["GATHER"] and not kwargs["DO_ADD"]
+                assert kwargs["share_ptr"] is columns
+                settled = prefix + torch.cat([columns, columns], dim=-1)
+                mixed = settled + args[0][:, : args[9]].sum(dim=1)
+                args[3].copy_(mixed)
+                args[4].fill_(1)
+                args[7].copy_(settled)
+
+            return launch
+
+    monkeypatch.setattr(ops, "_attn_res_fused_kernel", Kernel(), raising=False)
+    suffix = "_add_quant" if quant else "_add"
+    monkeypatch.setattr(
+        torch.ops.aiter,
+        "kimi_k3_apply_attn_res" + suffix,
+        getattr(ops, "_apply_attn_res" + suffix + "_op"),
+    )
+    mixed, settled = ops.apply_attn_res(
+        prefix,
+        bank,
+        torch.ones(4),
+        1e-6,
+        ops.ColumnTail(columns, "gather", 2),
+        torch.ones(4),
+        1e-6,
+        None,
+        torch.float8_e4m3fn if quant else None,
+        count,
+    )
+    expected = torch.full_like(prefix, 3 + 3 * count)
+    output = mixed[0] if quant else mixed
+    torch.testing.assert_close(output.float(), expected.to(output.dtype).float())
+    assert len(launches) == 1 and torch.equal(settled, torch.full_like(prefix, 3))

@@ -85,6 +85,7 @@ from atom.models.utils import (
 from atom.plugin import is_plugin_mode
 from atom.quant_spec import effective_layer_quant
 from atom.utils import envs, mark_spliting_op
+from atom.utils.custom_register import eager_direct_call
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
 from atom.utils.region_graph import (
@@ -706,7 +707,7 @@ class KimiSparseMoeBlock(nn.Module):
         return self._split_op_pair(self.split_moe_forward(hidden_states))
 
     def takes_row_tail(self, num_tokens: int) -> bool:
-        """Row-shard with TP outside capture/TBO, above the stream threshold
+        """Row-shard with TP outside graph warmup/capture and TBO, above the stream threshold
         and at least the row floor. Attention residual uses the same gate."""
         from atom.utils.tbo.ubatching import tbo_active
 
@@ -714,6 +715,7 @@ class KimiSparseMoeBlock(nn.Module):
             self.tp_size > 1
             and num_tokens > envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
             and num_tokens >= envs.ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS
+            and not get_forward_context().in_hipgraph
             and not torch.cuda.is_current_stream_capturing()
             and not tbo_active()
         )
@@ -2023,35 +2025,43 @@ class KimiKDAAttention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """The mixer's input projections, ``[T, ...]`` each and sized by the
         rows alone: ``(mixed_qkv, out_gate, beta, gate)``."""
-        # Single fused in-proj GEMM producing [q | k | v | g]; slice out each
-        # part. `out_gate` is the KDA output gate `_project_out`'s o_norm
-        # consumes (computed here so it rides the same GEMM instead of a
-        # separate one after the recurrence). in_proj's weight was grown in
-        # process_weights_after_loading to the fused [q | k | v | g | b | f_a],
-        # so this single unquantized call emits all six; f_b_proj stays a
-        # separate GEMM because it consumes f_a's output, not hidden_states.
+        # Use the loaded projection's large-row split on recorded buckets too.
+        # `out_gate` feeds _project_out's norm; f_b remains a separate GEMM
+        # because it consumes f_a's output, not hidden_states.
         lp = self.local_proj_size
         nlh = self.num_local_heads
         hd = self.head_dim
-        fused_in = self.in_proj(hidden_states, x_scale=hidden_states_scale)
+        if (
+            self._split_in_proj
+            and hidden_states.shape[0] >= _KDA_IN_PROJ_SPLIT_MIN_TOKENS
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states_scale is None
+            and hidden_states.is_contiguous()
+        ):
+            weight = self.in_proj.weight
+            qkvg = tgemm.mm(hidden_states, weight[: 4 * lp])
+            tail = tgemm.mm(hidden_states, weight[4 * lp :])
+        else:
+            fused_in = self.in_proj(hidden_states, x_scale=hidden_states_scale)
+            qkvg, tail = fused_in[..., : 4 * lp], fused_in[..., 4 * lp :]
         # No .contiguous() needed: mixed_qkv is a column slice (feature stride 1,
-        # row stride N_fused). Both causal-conv consumers read the token stride
+        # the projection's row stride). Both causal-conv consumers read the token stride
         # from the tensor itself — causal_conv1d_fn uses x.stride(1) after
         # transpose (channel-last: stride(0)==1), and causal_conv1d_update only
         # requires x.stride(1)==1 (feature-contiguous, which the slice preserves).
-        mixed_qkv = fused_in[..., : 3 * lp]
-        out_gate = fused_in[..., 3 * lp : 4 * lp]
+        mixed_qkv = qkvg[..., : 3 * lp]
+        out_gate = qkvg[..., 3 * lp :]
         # beta is widened to fp32 inside _run_kda (see the note there): the KDA
         # delta-rule write strength must stay fp32 for accuracy.
-        beta = fused_in[..., 4 * lp : 4 * lp + nlh]
+        beta = tail[..., :nlh]
         # f_a feeds a second GEMM (f_b_proj) and is a column slice of the fused
-        # output, so it needs a unit row stride rather than the fused N_fused one.
+        # output, so it needs packed rows rather than the projection's row stride.
         # Under a per-token FP8 f_b_proj that copy would be followed by a quant
         # of the same [T, head_dim]; strided_per_token_quant does the gather AND the
         # quant in one kernel, so only the quantized result is ever written.
         # Otherwise the plain contiguous copy runs and f_b_proj quantizes (or
         # not) exactly as before.
-        f_a_view = fused_in[..., 4 * lp + nlh : 4 * lp + nlh + hd]
+        f_a_view = tail[..., nlh : nlh + hd]
         if self.fuse_f_a_quant:
             from atom.model_ops.kimi_k3 import strided_per_token_quant
 
@@ -2319,7 +2329,7 @@ class KimiDecoderLayer(nn.Module):
 
     def _ffn(
         self, hidden_states: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor | ColumnTail, torch.Tensor | None]:
         """Run the FFN, returning split MoE branches or its row-tail sum and zero.
 
         The next apply_attn_res folds a returned second tensor into its prefix
@@ -2334,7 +2344,7 @@ class KimiDecoderLayer(nn.Module):
         attn_out: torch.Tensor,
         prefix_sum: torch.Tensor | None,
         block_residual: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor | ColumnTail, torch.Tensor | None]:
         """mlp_attn_res and the FFN on the reduced attention output; returns
         ``(prefix_sum, ffn_out, shared)``."""
         hidden_states, prefix_sum = self.mlp_attn_res(
@@ -2348,10 +2358,17 @@ class KimiDecoderLayer(nn.Module):
         attn_out: torch.Tensor,
         prefix_sum: torch.Tensor | None,
         block_residual: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor | ColumnTail | None, torch.Tensor | None]:
         """`_mlp` on the attention's output, which is o_proj's partial sum
         on a `post_attention_op` layer."""
         if self.post_attention_op:
+            moe = self.block_sparse_moe
+            if moe.column_gather_name and moe._can_defer_column_tail(attn_out):
+                # The typed pending value must stay outside a tensor-only op.
+                reduced = torch.ops.aiter.tbo_all_reduce(attn_out)
+                return self._mlp(reduced, prefix_sum, block_residual)
+            if not is_plugin_mode() and eager_direct_call(attn_out):
+                return self._post_attention_parts(attn_out, prefix_sum, block_residual)
             return torch.ops.aiter.kimi_k3_post_attention_forward(
                 attn_out, prefix_sum, block_residual, self.layer_name
             )
@@ -2363,12 +2380,25 @@ class KimiDecoderLayer(nn.Module):
         prefix_sum: torch.Tensor | None,
         block_residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Reduce o_proj's partial and run residual/MoE, locally on sharded steps.
+        """Tensor-only boundary: materialize columns and absent addends."""
+        prefix, first, second = self._post_attention_parts(
+            attn_partial, prefix_sum, block_residual
+        )
+        first = materialize_column_output(first)
+        second = materialize_column_output(second)
+        return (
+            prefix,
+            torch.zeros_like(prefix) if first is None else first,
+            torch.zeros_like(prefix) if second is None else second,
+        )
 
-        Sharded steps gather the normalized MoE input, then its tail gathers
-        the whole residual. Both addends are real zeros so auxiliary readers
-        and compiler-created clones can load them without pointer markers.
-        """
+    def _post_attention_parts(
+        self,
+        attn_partial: torch.Tensor,
+        prefix_sum: torch.Tensor | None,
+        block_residual: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | ColumnTail | None, torch.Tensor | None]:
+        """A completed residual needs no pending addend on native eager calls."""
         moe = self.block_sparse_moe
         if not moe.takes_row_tail(attn_partial.shape[0]):
             attn_out = tensor_model_parallel_all_reduce(attn_partial)
@@ -2378,14 +2408,13 @@ class KimiDecoderLayer(nn.Module):
         rows = SequenceParallel(
             attn_partial.shape[0], moe.tp_size, get_tensor_model_parallel_rank()
         )
-        window = self.mlp_attn_res.window(block_residual)
         hidden_rows, prefix_rows = self.mlp_attn_res(
             None if prefix_sum is None else rows.shard(prefix_sum),
-            None if window is None else rows.shard(window),
+            None if block_residual is None else rows.shard(block_residual),
             rows.scatter(attn_partial),
         )
         residual = moe.row_sharded_moe(rows.gather(hidden_rows), rows, prefix_rows)
-        return residual, torch.zeros_like(residual), torch.zeros_like(residual)
+        return residual, None, None
 
     def forward(
         self,

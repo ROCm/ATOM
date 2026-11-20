@@ -1094,8 +1094,6 @@ def _attention(
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
     if use_mla:
-        if getattr(self.impl, "token_graph_query_layout", None) is not None:
-            return _mla_token_graph_forward(self.impl, q, q_scale, k, v, positions)
         return self.impl.forward(
             query=q,
             k_nope=k,
@@ -1119,8 +1117,21 @@ def _attention(
         )
 
 
-# The attention as one break in a recorded forward.
-_attention_region = eager_region()(_attention)
+# Keep the plain eager call free of token-graph layout checks.
+@eager_region()
+def _attention_region(q, q_scale, k, v, positions, layer_name, use_mla, qkv):
+    if use_mla:
+        impl = (
+            get_current_atom_config()
+            .compilation_config.static_forward_context[layer_name]
+            .impl
+        )
+        if getattr(impl, "token_graph_query_layout", None) is not None:
+            return _mla_token_graph_forward(impl, q, q_scale, k, v, positions)
+        return impl.forward(
+            query=q, k_nope=k, k_rope=v, positions=positions, q_scale=q_scale
+        )
+    return _attention(q, q_scale, k, v, positions, layer_name, use_mla, qkv)
 
 
 def linear_attention_with_output_base_fake(

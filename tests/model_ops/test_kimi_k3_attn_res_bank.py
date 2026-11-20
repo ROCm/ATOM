@@ -211,7 +211,7 @@ def test_pp_placeholders_hold_only_the_incoming_prefix(
     monkeypatch.setattr(kimi, "_normalize_kimi_config", lambda config: None)
     monkeypatch.setattr(kimi, "pp_holds_embedding", lambda config: False)
     monkeypatch.setattr(
-        kimi, "get_pp_group", lambda: SimpleNamespace(is_last_rank=False)
+        kimi, "get_pp_group", lambda: SimpleNamespace(is_last_rank=False, world_size=2)
     )
     monkeypatch.setattr(
         kimi, "make_layers", lambda *args, **kwargs: (start, start, nn.ModuleList())
@@ -227,6 +227,7 @@ def test_pp_placeholders_hold_only_the_incoming_prefix(
         SimpleNamespace(
             hf_config=config,
             quant_config=None,
+            enable_tbo=False,
             compilation_config=SimpleNamespace(level=CompilationLevel.NO_COMPILATION),
         )
     )
@@ -291,8 +292,13 @@ def test_new_bank_slot_copy_stays_in_one_dynamo_graph(modules):
 
 def _model_stage(monkeypatch, modules, layers, config, start, end, model_class=None):
     kimi = modules.kimi
-    group = SimpleNamespace(is_first_rank=start == 0, is_last_rank=end == LAYERS)
+    group = SimpleNamespace(
+        is_first_rank=start == 0,
+        is_last_rank=end == LAYERS,
+        world_size=1 if start == 0 and end == LAYERS else 2,
+    )
     monkeypatch.setattr(kimi, "get_pp_group", lambda: group)
+    monkeypatch.setattr(kimi, "get_tensor_model_parallel_world_size", lambda: 1)
     monkeypatch.setattr(kimi, "pp_holds_embedding", lambda config: group.is_first_rank)
     monkeypatch.setattr(kimi, "_normalize_kimi_config", lambda config: None)
     monkeypatch.setattr(
@@ -307,6 +313,7 @@ def _model_stage(monkeypatch, modules, layers, config, start, end, model_class=N
         SimpleNamespace(
             hf_config=config,
             quant_config=None,
+            enable_tbo=False,
             compilation_config=SimpleNamespace(level=CompilationLevel.NO_COMPILATION),
         )
     )
