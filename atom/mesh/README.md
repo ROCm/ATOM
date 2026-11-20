@@ -256,7 +256,9 @@ The selector is a comma-separated AND of `k=v`, `k!=v`, `k in (a,b)` and
 `selector_required`, a malformed one 400 `invalid_selector` with the byte
 `offset`, and one matching no worker 400 `no_workers_match`; none sends a
 call. A fan-out lists each worker that did not answer 2xx under `failed`,
-with its error code.
+with its error code. It answers once every call has finished, in one body
+holding every outcome, so that body holds at most one capped engine body per
+targeted worker; there is no cap on the total.
 
 Every `/v1/rl` request must carry `Authorization: Bearer <token>` matching
 `--rl-api-key`; any other request answers 401 `unauthorized`. `--enable-rl`
