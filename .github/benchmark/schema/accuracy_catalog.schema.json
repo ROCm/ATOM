@@ -47,6 +47,7 @@
       "lm_eval_extra_model_args": { "type": "string" },
       "lm_eval_batch_size": { "type": "integer", "minimum": 1 },
       "lm_eval_gen_kwargs": { "type": "string" },
+      "lm_eval_limit": { "type": "integer", "minimum": 1 },
       "_baseline_note": { "type": "string" }
     }
   }
