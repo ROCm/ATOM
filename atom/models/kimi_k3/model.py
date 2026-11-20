@@ -19,6 +19,7 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from aiter.tuned_gemm import tgemm
 from einops import rearrange
 from torch import nn
 
@@ -311,11 +312,15 @@ class KimiMLP(nn.Module):
             x, x_scale = x
         return self.act_and_down_proj(self.gate_up_proj(x, x_scale))
 
-    def act_and_down_proj(self, gate_up: torch.Tensor) -> torch.Tensor:
+    def act_and_down_proj(
+        self, gate_up: torch.Tensor, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
         # act_fn always returns (activation, scale): (fp8, scale) when it fused the
         # down_proj activation quant, else (bf16, None) so down_proj self-quantizes.
         act, act_scale = self.act_fn(gate_up)
-        return self.down_proj(act, x_scale=act_scale)
+        if out is None:
+            return self.down_proj(act, x_scale=act_scale)
+        return self.down_proj(act, x_scale=act_scale, out=out)
 
 
 class MergedBF16Linears(nn.Module):
@@ -682,9 +687,12 @@ class KimiSparseMoeBlock(nn.Module):
             and hidden_states.dtype == torch.bfloat16
         ):
             gate_up, router_logits, routed_input = self.front_proj(hidden_states)
-            # aiter's fused MoE takes its tuned kernels only on contiguous input.
+            if self.tp_size > 1 and self.shared_experts.down_proj.supports_out():
+                return self._one_reduce_split(
+                    hidden_states, gate_up, router_logits, routed_input
+                )
             routed_output = self.routed_expert_forward(
-                hidden_states, router_logits, routed_input.contiguous()
+                hidden_states, router_logits, routed_input
             )
             shared_output = self.shared_experts.act_and_down_proj(gate_up)
             if self.tp_size > 1:
@@ -718,6 +726,35 @@ class KimiSparseMoeBlock(nn.Module):
         if self.tp_size > 1:
             routed_output = tensor_model_parallel_all_reduce(routed_output)
         return routed_output, None
+
+    def _one_reduce_split(
+        self,
+        hidden_states: torch.Tensor,
+        gate_up: torch.Tensor,
+        router_logits: torch.Tensor,
+        routed_input: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reduce contiguous latent/shared blocks together, before routed norm."""
+        latent_numel = routed_input.numel()
+        partials = hidden_states.new_empty(latent_numel + hidden_states.numel())
+        self.experts(
+            routed_input,
+            router_logits,
+            out=partials[:latent_numel].view_as(routed_input),
+        )
+        self.shared_experts.act_and_down_proj(
+            gate_up, out=partials[latent_numel:].view_as(hidden_states)
+        )
+        reduced = tensor_model_parallel_all_reduce(partials)
+        return self._finish_latent_tail(
+            reduced[:latent_numel].view_as(routed_input),
+            reduced[latent_numel:].view_as(hidden_states),
+        )
+
+    def _finish_latent_tail(
+        self, latent: torch.Tensor, shared: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._apply_routed_norm_and_up_proj(latent), shared
 
     def dual_stream_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Summed dual-stream dispatch target, for callers that cannot defer."""

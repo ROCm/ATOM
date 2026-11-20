@@ -21,6 +21,7 @@ def modules():
             linear=load("atom.model_ops.linear"),
             loader=load("atom.model_loader.loader"),
             dispatch=load("atom.model_ops.module_dispatch_ops"),
+            moe=load("atom.model_ops.moe"),
         )
 
 
@@ -29,8 +30,8 @@ class _Kernel(nn.Module):
         super().__init__()
         self.fn = lambda x: x
 
-    def forward(self, *args):
-        return self.fn(*args)
+    def forward(self, *args, **kwargs):
+        return self.fn(*args, **kwargs)
 
 
 @pytest.fixture
@@ -56,9 +57,10 @@ def make_block(modules, monkeypatch):
     monkeypatch.setattr(kimi, "tensor_model_parallel_all_reduce", lambda x: x * 2)
     seen, gemms = {}, []
 
-    def mm(x, weight, bias=None, otype=None, **kwargs):
+    def mm(x, weight, bias=None, otype=None, out=None, **kwargs):
         gemms.append(weight)
-        return F.linear(x.double(), weight.double(), bias).to(otype or x.dtype)
+        value = F.linear(x.double(), weight.double(), bias).to(otype or x.dtype)
+        return value if out is None else out.copy_(value)
 
     def situ(x, beta, linear_beta, quant=False):
         seen["gate_up"] = x
@@ -66,17 +68,18 @@ def make_block(modules, monkeypatch):
         return gate - up, None
 
     for module in (kimi, modules.linear):
-        monkeypatch.setattr(module, "tgemm", SimpleNamespace(mm=mm))
+        if hasattr(module, "tgemm"):
+            monkeypatch.setattr(module, "tgemm", SimpleNamespace(mm=mm))
     monkeypatch.setattr(modules.ops, "situ_and_mul_maybe_quant", situ)
 
-    def make(tp=1, shared=2, latent=8):
+    def make(tp=1, shared=2, latent=8, experts=6):
         group = SimpleNamespace(rank_in_group=0, world_size=tp, rank=0)
         monkeypatch.setattr(modules.linear, "get_tp_group", lambda: group)
         monkeypatch.setattr(kimi, "get_tensor_model_parallel_world_size", lambda: tp)
         hf = SimpleNamespace(
             hidden_size=16,
             num_hidden_layers=1,
-            num_experts=6,
+            num_experts=experts,
             num_experts_per_token=2,
             routed_expert_hidden_size=latent,
             moe_intermediate_size=8,
@@ -102,9 +105,10 @@ def make_block(modules, monkeypatch):
                 weight = weight.repeat(1, tp)
             checkpoint[name] = weight
 
-        def experts(x, logits):
+        def experts(x, logits, out=None):
             seen["routed_input"], seen["router_logits"] = x, logits
-            return x + logits.sum(-1, keepdim=True)
+            value = x + logits.sum(-1, keepdim=True)
+            return value if out is None else out.copy_(value)
 
         moe.experts.fn = experts
         monkeypatch.setattr(
@@ -170,7 +174,10 @@ def test_loaded_front_feeds_real_consumers(make_block, tp, plugin, tokens):
     assert sum(w is merged for w in after) == 1
     for key in want_seen:
         torch.testing.assert_close(seen[key], want_seen[key], rtol=0, atol=0)
-    assert seen["routed_input"].is_contiguous()
+    assert (
+        seen["routed_input"].untyped_storage().data_ptr()
+        == seen["gate_up"].untyped_storage().data_ptr()
+    )
     for got, expected in zip(actual, want):
         torch.testing.assert_close(got, expected, rtol=0, atol=0)
     moe.front_proj.process_weights_after_loading()
@@ -270,23 +277,18 @@ def test_other_moe_configurations_keep_original_path(make_block, shared, latent)
             torch.testing.assert_close(got, expected, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("method", ["row_sharded_moe", "_dual_stream_split"])
-def test_separate_consumers_keep_reading_merged_storage(
-    make_block, monkeypatch, method
-):
+def test_dual_stream_consumer_keeps_reading_merged_storage(make_block, monkeypatch):
     block = make_block(tp=8)
     stream = SimpleNamespace(wait_stream=lambda other: None)
     block.moe.alt_stream = stream
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
     monkeypatch.setattr(torch.cuda, "stream", lambda other: nullcontext())
     monkeypatch.setattr(torch.Tensor, "record_stream", lambda self, other: None)
-    rows = SimpleNamespace(scatter=lambda x: x * 2, gather=lambda x: x)
     x = torch.ones(5, 16).bfloat16()
 
     def run():
         block.gemms.clear()
-        args = (x, rows) if method == "row_sharded_moe" else (x,)
-        return getattr(block.moe, method)(*args)
+        return block.moe._dual_stream_split(x)
 
     want = run()
     block.load()
