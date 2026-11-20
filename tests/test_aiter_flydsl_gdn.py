@@ -322,9 +322,6 @@ def test_qwen_backend_binds_zero_copy_vk_state(
     )
     builder = object.__new__(Qwen4ExpMetadataBuilder)
     builder.replayssm = replayssm
-    builder.model_runner = SimpleNamespace(
-        config=SimpleNamespace(kv_transfer_config=None)
-    )
     from atom.utils import envs
 
     monkeypatch.setattr(envs, "ATOM_ENABLE_GDN_DECODE_LOSSY_FAST", False)
@@ -467,9 +464,6 @@ def test_cache_policy_forward_dispatch(monkeypatch, mode):
         setattr(attention, name, value)
     builder = object.__new__(Qwen4ExpMetadataBuilder)
     builder.replayssm = mode == "replayssm"
-    builder.model_runner = SimpleNamespace(
-        config=SimpleNamespace(kv_transfer_config=None)
-    )
     monkeypatch.setattr(envs, "ATOM_ENABLE_GDN_DECODE_LOSSY_FAST", False)
     monkeypatch.setattr(
         fly, "backend", lambda stage: "triton" if mode == "disabled" else "auto"
@@ -701,9 +695,6 @@ def test_replayssm_prefill_layer_dispatch_matches_triton(monkeypatch, keep):
         )
         builder = object.__new__(Qwen4ExpMetadataBuilder)
         builder.replayssm = True
-        builder.model_runner = SimpleNamespace(
-            config=SimpleNamespace(kv_transfer_config=None)
-        )
         layer = _GdnLayer(attention)
         _with_one_gdn_layer(builder, layer, pool)
         bound = builder.build_kv_cache_tensor(layer)

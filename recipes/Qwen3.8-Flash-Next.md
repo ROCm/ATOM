@@ -90,7 +90,8 @@ and draft share the embedding and output head.
   a checkpoint of the GDN and PLE state.
   With MTP, a decode-step checkpoint is stored as the image of its verify
   step.
-  P/D connectors are rejected: they would move the pages without the state.
+  P/D connectors and `mooncake_store` are rejected: they do not carry the
+  required state image.
 - This example covers FP8 with TP1. Pure TP2 is not currently validated;
   it can fail MoE warmup on gfx950 due to an MoE dispatch limitation.
 - Video inference and long-context accuracy have not been validated.

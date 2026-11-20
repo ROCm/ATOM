@@ -591,7 +591,7 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             torch._foreach_copy_(destinations, sources)
 
     def build_kv_cache_tensor(self, module):
-        """Bind a QSA layer's arena views, including its optional side planes."""
+        """Bind GDN state or QSA arena views, including QSA side planes."""
         if not getattr(module, "is_qsa_attention", False):
             return self._build_gdn_cache_tensor(module)
 

@@ -8,7 +8,9 @@ over an MLA cache ``(rows, blocks, block_size, entry)`` and only
 ``_KimiMLAGDNCommon`` mixes it in. A layer-major pool -- ``MhaKvPool`` or a
 ``LayerMajorArena`` -- publishes one contiguous region per field per layer, with
 alignment padding that is not a region. The geometry functions read
-``region_tensors``; sizing reads the pools' ``field_groups`` before allocation.
+``region_tensors``. ``layer_major_page_unit_bytes`` sizes ``MhaKvPool.field_groups``
+before allocation; Qwen3.8 sizes its arena with
+``published_bytes_for(_qsa_fields())``.
 These are free functions rather than methods on ``self.model_runner``.
 
 ``GDNAttentionMetadataBuilder`` is the caller, the same role
