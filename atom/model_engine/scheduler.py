@@ -1008,6 +1008,9 @@ class Scheduler:
         # prefill for a rank whose waiting requests are all mid-copy.
         self._early_pool_copy = envs.ATOM_POOL_EARLY_COPY
         self._pool_copy_holds_prefill = envs.ATOM_POOL_COPY_HOLDS_PREFILL
+        # The delayer's pending tokens count a waiting request past its prefix
+        # hit in this rank's pool (`_waiting_new_token_count`).
+        self._pool_probed_pending = envs.ATOM_POOL_PROBED_PENDING
         # Set by `_can_admit_head_prefill`: it found nothing to admit, and only
         # because the requests it reached are mid-copy.
         self._prefill_arriving = False
@@ -1678,11 +1681,24 @@ class Scheduler:
         `num_cached_tokens` discount is best-effort:
         an un-admitted seq has not been probed against the prefix cache yet, so
         this is an upper bound on new tokens for cache-hit prompts.
+
+        With a pool the ranks share (`_pool_probed_pending`) that bound is
+        replaced by the admission probe's hit: there every cross-rank hit is an
+        HBM hit of a request not admitted yet, so the upper bound would count
+        each waiting request at its whole prompt and report a full budget on
+        every rank with anything waiting.
         """
         cap = self.max_num_batched_tokens
+        bm = self.block_manager
+        probed = self._pool_probed_pending and bm.copies_shared_prefixes
         total = 0
         for seq in self._waiting_prefills():
-            num_new_tokens = self.pending_prefill_tokens(seq)
+            if probed:
+                if bm.shared_prefix_in_flight(seq):
+                    continue  # parked by Phase 2 until its copy lands
+                num_new_tokens = self._probed_pending_prefill_tokens(seq)
+            else:
+                num_new_tokens = self.pending_prefill_tokens(seq)
             if (
                 not self.enable_chunked_prefill
                 and num_new_tokens > self.max_num_batched_tokens
@@ -1692,6 +1708,20 @@ class Scheduler:
             if total >= cap:
                 return cap
         return total
+
+    def _probed_pending_prefill_tokens(self, seq: Sequence) -> int:
+        """`pending_prefill_tokens` of a waiting request, with one not admitted
+        yet counted past its prefix hit in this rank's pool: the admission
+        probe, memoised across ticks. A request the pool cannot take now keeps
+        the upper bound."""
+        pending = self.pending_prefill_tokens(seq)
+        if seq.block_table:
+            return pending
+        bm = self.block_manager
+        hit_blocks = bm.can_allocate_memoized(seq)
+        if hit_blocks <= 0:
+            return pending
+        return max(0, pending - hit_blocks * bm.hash_block_size)
 
     def _partial_prefill_remaining_tokens(self) -> int:
         """Sum of remaining (not-yet-computed) tokens across mid-chunked-prefill

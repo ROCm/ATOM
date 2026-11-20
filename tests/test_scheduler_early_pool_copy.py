@@ -143,6 +143,32 @@ def test_group_stops_holding_for_a_copy_that_does_not_land(monkeypatch, seq_fact
     assert held == [True, True, False, False]
 
 
+@pytest.mark.parametrize("probed", [0, 1])
+def test_pending_tokens_count_a_waiting_request_past_its_prefix_hit(
+    monkeypatch, seq_factory, probed
+):
+    sched, delayer, pool, _ = _make(
+        monkeypatch, seq_factory, n=0, ATOM_POOL_PROBED_PENDING=probed
+    )
+    bm = sched.block_manager
+    block = bm.hash_block_size
+    landed, mid_copy = (seq_factory(list(range(4 * block))) for _ in range(2))
+    for seq in (landed, mid_copy):
+        sched.add(seq)
+    sched.schedule()  # HOLD: both copies start
+    pool.in_flight.discard(landed.id)
+    # Three of the landed request's four blocks are in this rank's pool now.
+    monkeypatch.setattr(bm, "can_allocate_memoized", lambda seq: 3)
+
+    sched.schedule()
+
+    # Probed: one block to compute, and nothing yet for the one mid-copy. The
+    # upper bound counts both whole prompts, up to the budget.
+    assert delayer.seen[-1]["pending_tokens"] == (
+        block if probed else min(8 * block, sched.max_num_batched_tokens)
+    )
+
+
 def test_hold_can_be_switched_off_and_the_rank_then_counts_as_blocked(
     monkeypatch, seq_factory
 ):

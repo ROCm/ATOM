@@ -1472,6 +1472,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_POOL_COPY_HOLDS_PREFILL": lambda: (
         os.getenv("ATOM_POOL_COPY_HOLDS_PREFILL", "1") == "1"
     ),
+    # A pool the DP ranks share: the prefill delayer's pending tokens count a
+    # waiting request past its prefix hit in this rank's pool (the admission
+    # probe), not at its whole prompt. Fuller prefill forwards, later first
+    # tokens. Off: the upper bound every other configuration uses.
+    "ATOM_POOL_PROBED_PENDING": lambda: (
+        os.getenv("ATOM_POOL_PROBED_PENDING", "0") == "1"
+    ),
     # Minimum external-tier hit worth loading, in tokens. None when unset: each
     # tier then uses its own default (`KVConnectorFactory.resolve_min_load_tokens`).
     "OFFLOAD_MIN_LOAD_TOKENS": lambda: _non_negative_or_none(
