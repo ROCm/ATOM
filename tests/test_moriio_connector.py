@@ -1719,6 +1719,59 @@ class MergeContiguousBlocksTest(unittest.TestCase):
         self.assertEqual(self.merge([], [], []), ([], [], []))
 
 
+class PagesOutsideKVTest(unittest.TestCase):
+    """Which per-layer pools register as regions, on the CPU lane."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.outside = staticmethod(
+            load_function(CONNECTOR, "_pages_outside_kv", {"Any": object})
+        )
+
+    @staticmethod
+    def cache(k, v, **extra):
+        import types
+
+        def tensor(addr):
+            return (
+                None if addr is None else types.SimpleNamespace(data_ptr=lambda: addr)
+            )
+
+        return types.SimpleNamespace(k_cache=tensor(k), v_cache=tensor(v), **extra)
+
+    @staticmethod
+    def tensors(*addrs):
+        import types
+
+        return types.SimpleNamespace(
+            block_regions=tuple(types.SimpleNamespace(base_addr=a) for a in addrs)
+        )
+
+    def test_mha_with_scale_and_index_planes_moves_as_regions(self):
+        caches = {"l0": self.cache(100, 200), "l1": self.cache(300, 400)}
+        self.assertTrue(self.outside(caches, self.tensors(100, 200, 300, 400, 500)))
+
+    def test_mha_whose_pages_are_its_k_and_v_keeps_the_block_path(self):
+        caches = {"l0": self.cache(100, 200), "l1": self.cache(300, 400)}
+        self.assertFalse(self.outside(caches, self.tensors(100, 200, 300, 400)))
+
+    def test_mla_keeps_the_block_path(self):
+        caches = {"l0": self.cache(100, None)}
+        self.assertFalse(self.outside(caches, self.tensors(100, 500)))
+
+    def test_per_request_state_keeps_its_path(self):
+        caches = {
+            "l0": self.cache(100, 200),
+            "s0": self.cache(600, 700, per_request_state=True),
+        }
+        self.assertFalse(self.outside(caches, self.tensors(100, 200, 500)))
+
+    def test_no_published_pages_keeps_the_block_path(self):
+        caches = {"l0": self.cache(100, 200)}
+        self.assertFalse(self.outside(caches, None))
+        self.assertFalse(self.outside(caches, self.tensors()))
+
+
 class RegionPlanTest(unittest.TestCase):
     """Pair local and remote regions on the CPU lane."""
 

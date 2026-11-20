@@ -322,7 +322,13 @@ SPUR_NIGHTLY = "10 16 * * *"
 SPUR_MORIIO = "10 4 * * *"
 # atomesh-benchmark.yaml's model root for the Spur lane.
 SPUR_MODEL_ROOT = "/data/junyyang/models"
-MORIIO_MODELS = ("DeepSeek-V3", "DeepSeek-V4-Pro", "Kimi-K2.5-MXFP4", "Kimi-K3-MXFP4")
+MORIIO_MODELS = (
+    "DeepSeek-V3",
+    "DeepSeek-V4-Pro",
+    "Kimi-K2.5-MXFP4",
+    "Kimi-K3-MXFP4",
+    "MiniMax-M3-MXFP8",
+)
 
 
 def is_moriio(cell: dict) -> bool:

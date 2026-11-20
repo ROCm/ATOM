@@ -274,8 +274,8 @@ class MoRIIOConnector(KVConnectorBase):
         # Transfer ID mapping (worker side)
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
 
-        # Region mode (backends that publish KVTransferTensors and no
-        # per-layer block caches, e.g. DeepSeek-V4). None until registered.
+        # Region mode (backends whose storage is only fully described by their
+        # KVTransferTensors, e.g. DeepSeek-V4, MiniMax-M3). None until registered.
         self._regions: list[_Region] | None = None
         self._region_sessions: dict[EngineId, dict[tuple[int, int, int], Any]] = {}
 
@@ -298,11 +298,14 @@ class MoRIIOConnector(KVConnectorBase):
         ``self.num_k_chunks`` marks the K/V boundary.
 
         A backend with no per-layer block caches (DeepSeek-V4) publishes its
-        storage only as ``transfer_tensors`` regions; those are registered
-        instead, see :meth:`_register_regions`.
+        storage only as ``transfer_tensors`` regions, and one whose PAGE regions
+        reach beyond its K and V (MiniMax-M3) would lose the rest; both are
+        registered as regions instead, see :meth:`_register_regions`.
         """
         self.kv_caches = kv_caches
-        if all(getattr(c, "per_request_state", False) for c in kv_caches.values()):
+        if all(
+            getattr(c, "per_request_state", False) for c in kv_caches.values()
+        ) or _pages_outside_kv(kv_caches, transfer_tensors):
             self._start_handshake_listener(self._register_regions(transfer_tensors))
             return
         cache_tensor = None
@@ -2388,6 +2391,23 @@ class _PostFailed:
 
 
 _POST_FAILED = _PostFailed()
+
+
+def _pages_outside_kv(kv_caches: dict[str, Any], transfer_tensors: Any) -> bool:
+    """Whether an MHA pool publishes PAGE regions its layers' K and V miss.
+
+    MiniMax-M3's fp8 pool keeps per-token K/V scales and indexer keys beside
+    each layer's K and V; moving K and V alone leaves decode reading its own
+    stale planes. MLA pools and per-request state keep their own paths.
+    """
+    if transfer_tensors is None or not transfer_tensors.block_regions:
+        return False
+    kv_addrs = set()
+    for cache in kv_caches.values():
+        if getattr(cache, "per_request_state", False) or cache.v_cache is None:
+            return False
+        kv_addrs.update((cache.k_cache.data_ptr(), cache.v_cache.data_ptr()))
+    return any(r.base_addr not in kv_addrs for r in transfer_tensors.block_regions)
 
 
 def _zmq_ctx(socket_type: int, addr: str):
