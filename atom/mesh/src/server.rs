@@ -42,7 +42,6 @@ use crate::{
     },
     routers::{
         atom_bridge::AtomBridgeRuntime,
-        atom_standalone::AtomStandaloneRuntime,
         comm::{conversations, parse, tokenize},
         ingress::EndpointSpec,
         router_manager::RouterManager,
@@ -364,7 +363,6 @@ pub struct ServerConfig {
     pub request_id_headers: Option<Vec<String>>,
     pub shutdown_grace_period_secs: u64,
     pub tls: Option<ServerTlsConfig>,
-    pub atom_standalone_runtime: Option<Arc<AtomStandaloneRuntime>>,
     pub atom_bridge_runtime: Option<Arc<AtomBridgeRuntime>>,
 }
 
@@ -562,7 +560,6 @@ async fn serve_with_prepare_pool(
         )
         .await?
         .prepare_pool(prepare_pool)
-        .atom_standalone_runtime(config.atom_standalone_runtime.clone())
         .atom_bridge_runtime(config.atom_bridge_runtime.clone())
         .build()
         .map_err(|e| e.to_string())?,

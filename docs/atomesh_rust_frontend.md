@@ -1,20 +1,21 @@
 # ATOM standalone with a Rust frontend
 
-`--frontend rust` serves ATOM's OpenAI API from the mesh router (Rust) and
-stops at **LLMEngine**: Rust renders the chat template, tokenizes,
+ATOM standalone (`USE_ATOMESH_ENTRYPOINTS=1`) serves ATOM's OpenAI API from
+the mesh router (Rust) and stops at **LLMEngine**: Rust renders the chat template, tokenizes,
 detokenizes, runs the reasoning and tool-call parsers and writes the SSE;
 Python takes the prompt's token ids into `LLMEngine.io_processor` and
 `CoreManager` exactly as the OpenAI server does, and hands each engine step's
 tokens back. LLMEngine, CoreManager and the EngineCores are unchanged.
 
 ```bash
-python -m atom.entrypoints.atomesh.server \
-    --model <model> --kv-cache-dtype fp8 -tp 8 --port 8000 \
-    --frontend rust            # default: python (AtomStandaloneService)
+USE_ATOMESH_ENTRYPOINTS=1 python -m atom.entrypoints.openai_server \
+    --model <model> --kv-cache-dtype fp8 -tp 8 --port 8000
 ```
 
-This page is the plan for that frontend (scheme A in the design discussion),
-what is implemented now, and what is left.
+It replaces the Python standalone service (`AtomStandaloneService`), which
+served the API in Python behind the same HTTP server. This page is the plan
+for the frontend (scheme A in the design discussion), what is implemented
+now, and what is left.
 
 ## Why
 
@@ -82,17 +83,30 @@ the bottleneck.
   added unless `--model-path` / `--tokenizer-path` is given) under the served
   model name, and prepares every request for it whatever `model` the client
   sent, as the OpenAI server does.
+* **Parsers as ATOM picks them.** The launcher reads the tool-call format and
+  the reasoning dialect off the model as ATOM's server does and hands the
+  router the same choice (`--tool-call-parser`, `--reasoning-parser`, in the
+  router's names: `MESH_TOOL_CALL_PARSERS`), unless the launch named one. A
+  prompt that ends by opening a channel (`<think>`, K3's think or response)
+  has the parser read that opener first (`ResponseContext.prompt_opener`).
+* **Python templates.** A model whose chat template the router cannot render
+  -- a Python message encoder (DeepSeek-V4), or a tokenizer whose template is
+  code (Kimi-K3) -- has each chat prompt rendered by `TokenBridge.render_chat`
+  (ATOM's `apply_chat_template`, encoded as the engine encodes a prompt); the
+  router then runs the rest. `src/reasoning` adds the `kimi_k3` reasoning
+  parser the `reasoning-parser` crate lacks.
 
 ### Code
 
 | Where | What |
 |---|---|
-| `atom/entrypoints/atomesh/token_bridge.py` | `TokenBridge`: `submit`, `abort`, `is_healthy`, the step flush |
-| `atom/entrypoints/atomesh/server.py` | `--frontend {python,rust}`; builds the bridge and hands it to `launch_mesh` |
+| `atom/entrypoints/atomesh/token_bridge.py` | `TokenBridge`: `submit`, `abort`, `is_healthy`, `render_chat`, the step flush; `ChatRenderer` |
+| `atom/entrypoints/atomesh/server.py` | builds the bridge, picks the router's parsers, hands both to `launch_mesh` |
 | `atom/mesh/src/routers/atom_bridge/mod.rs` | `AtomBridgeRouter` (`RouterTrait`), `AtomBridgeRuntime`, the one-engine planner |
 | `atom/mesh/src/routers/atom_bridge/events.rs` | backend-neutral: `EventRegistry`, `SeqEventSource` (events -> `TokenChunk`), `Admission` |
 | `atom/mesh/src/routers/atom_bridge/py_bridge.rs` | `StepSink` (PyO3), `BridgeDispatcher`, what a request may carry (`BridgeRequest`) |
-| `atom/mesh/src/python.rs` | `launch_mesh(token_bridge=..., served_model_name=...)`, exports `StepSink` |
+| `atom/mesh/src/python.rs` | `launch_mesh(token_bridge=..., served_model_name=..., default_chat_template_kwargs=...)`, exports `StepSink` |
+| `atom/mesh/src/reasoning/` | reasoning parsers the `reasoning-parser` crate lacks (`kimi_k3`) |
 
 The router is the gRPC router's pipeline (`routers/grpc/pipeline.rs`) with
 its `Dispatcher` and planner injected, so prepare and render are the code the
@@ -100,51 +114,66 @@ mesh's gRPC routing already runs.
 
 ## Status
 
-### Implemented (P0)
+### Implemented
 
 * `/v1/chat/completions`, `/v1/completions`, `/generate`, streaming and not.
 * `/v1/models`, `/get_model_info`, `/get_server_info`; `/health_generate`
   reports `CoreManager.is_healthy()`.
 * Sampling: `temperature`, `top_p`, `top_k`, `max_tokens`, `stop`,
-  `ignore_eos`. Penalties and `min_p` are ignored, as the OpenAI server
-  ignores them.
+  `ignore_eos`, `n` (not streamed; greedy sampling collapses it to 1, as on
+  the OpenAI server). Penalties and `min_p` are ignored, as the OpenAI
+  server ignores them.
+* `data_parallel_rank` in the body, `--default-chat-template-kwargs` under a
+  request's `chat_template_kwargs`.
+* `tool_choice`: `required`, a named function and `allowed_tools` are read
+  with the model's own tool parser, as the Python standalone service read
+  them; `required` holds the output to the format's tool-call channel where
+  it has one (Kimi-K3's `required_channel`).
+* Reasoning read from a prompt that opened it; a non-streamed reply over the
+  parser's 64 KiB buffer is split rather than refused.
+* Models with a Python chat template (DeepSeek-V4, Kimi-K3).
 * Usage with `cached_tokens` (the engine's prefix-cache hit).
 * Client disconnect aborts the request.
 
-Refused with a 400 until they are built: `n > 1`, logprobs, `stop_token_ids`,
-`tool_choice` that constrains the output (`required` or a named function),
-structured output (`response_format` `json_object` / `json_schema`, `regex`,
-`ebnf`, `json_schema`), `return_hidden_states`, and an empty prompt. The
-structured-output refusal sits in the router, not the bridge: the shared
-prepare step drops those fields before a payload exists, so passing them
-through would answer unconstrained without saying so.
+Refused with a 400 until they are built: streaming with `n > 1`, logprobs,
+`stop_token_ids`, structured output (`response_format` `json_object` /
+`json_schema`, `regex`, `ebnf`, `json_schema`), `return_hidden_states`, and
+an empty prompt. The structured-output refusal sits in the router, not the
+bridge: the shared prepare step drops those fields before a payload exists,
+so passing them through would answer unconstrained without saying so.
+
+Checked: GSM8K (3-shot, `local-completions`) on Qwen3-30B-A3B, TP 1, against
+the Python standalone service on the same build: 0.6876 / 0.8901
+(flexible / strict) against 0.6808 / 0.8825. DeepSeek-V4 and Kimi-K3 are
+checked on CPU only so far (the rendered prompt and its opener, the K3
+reasoning and tool parsers on synthetic replies); they still need a GPU run.
 
 Tests: `events.rs` checks a request's steps becoming its `TokenChunk`
-stream and the abort on either side of the submit; the rest is checked end to
-end on a GPU (GSM8K through `--frontend rust`).
+stream, siblings in index order, and the abort on either side of the
+submit; `reasoning/kimi_k3.rs` the K3 channels; the rest end to end on a GPU.
 
 ### Not yet
 
 | Phase | Work |
 |---|---|
-| P1 | `/health` and `/metrics` with the engine's state and series (`get_metrics_statistics`, same metric names); `/start_profile`, `/stop_profile`, `/debug/mtp_stats`, `/debug/cache_stats` through the bridge; wait for the tokenizer before reporting ready; ATOM's chat semantics from `mesh-engine-v1-switch` (`atom_engine/chat.rs`, `request.rs`, `render/atom_usage.rs`: reasoning controls as `_chat_completions` resolves them, `ttft_s` / `tpot_s` / `latency_s` in `usage`) |
-| P2 | logprobs and streaming `n > 1` (siblings carry an index through the sink); structured output and `tool_choice="required"` (`json_schema`, `required_channel` to `SamplingParams`); `--default-chat-template-kwargs`; OpenAI error bodies as the OpenAI server writes them; batching submits (one GIL entry for many requests) if admission shows up in profiles |
+| P1 | `/health` and `/metrics` with the engine's state and series (`get_metrics_statistics`, same metric names); `/start_profile`, `/stop_profile`, `/debug/mtp_stats`, `/debug/cache_stats` through the bridge; wait for the tokenizer before reporting ready; `ttft_s` / `tpot_s` / `latency_s` in `usage` (`render/atom_usage.rs` on `mesh-engine-v1-switch`); ATOM's reasoning controls as `_chat_completions` resolves them (`thinking`, `reasoning_effort`) |
+| P2 | logprobs and streaming `n > 1` (the streamed chat render writes one choice); structured output (`json_schema` to `SamplingParams`); OpenAI error bodies as the OpenAI server writes them; batching submits (one GIL entry for many requests) if admission shows up in profiles |
 | P3 | `/v1/messages` (Anthropic), `/v1/responses` checked against the OpenAI server, FIM and prefix completion |
-| P4 | multimodal (images to `preprocess_fanout(multimodal_data=...)`), models with a custom message encoder (DeepSeek-V4.1 after #3597; others ported or rendered in Python), `kv_transfer_params` for P/D; then make `rust` the default |
+| P4 | multimodal (images to `preprocess_fanout(multimodal_data=...)`), `kv_transfer_params` for P/D |
 
-Before `rust` becomes the default, each model is checked against the OpenAI
-server: the prompt tokens (`atom/mesh/scripts/atom_token_parity.py`, #3596),
-the SSE and JSON of every endpoint, GSM8K, and a concurrency sweep.
+Each model served this way is checked against the OpenAI server: the prompt
+tokens (`atom/mesh/scripts/atom_token_parity.py`, #3596), the SSE and JSON of
+every endpoint, GSM8K, and a concurrency sweep.
 
-### Known differences from the Python frontend
+### Known differences from the Python standalone service
 
-* Chat rendering and parsing are the mesh's (`routers/prepare`,
-  `reasoning_parser`, `tool_parser`), not ATOM's Python ones; a model whose
-  template or parser differs between the two can render or parse
-  differently. DeepSeek-V4.1's reasoning controls are covered by #3597.
-* `--tool-call-parser` takes the mesh router's names here; ATOM-only names
-  (`dsml`, `kimi_k3`, ...) reach the router, which reads the model's format
-  itself.
+* Chat rendering (Jinja models) and all output parsing are the mesh's
+  (`routers/prepare`, `reasoning_parser`, `tool_parser`), not ATOM's Python
+  ones; a model whose template or parser differs between the two can render
+  or parse differently.
+* Streaming with `n > 1` is refused; the Python service streamed it.
+* `/v1/completions` requires `model` in the body, as the mesh's typed
+  request does.
 * `/health` is the router's liveness, not the engine's (P1).
 
 ## Moving to B

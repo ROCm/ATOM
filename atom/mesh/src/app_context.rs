@@ -24,8 +24,7 @@ use crate::{
     policies::PolicyRegistry,
     reasoning_parser::ParserFactory as ReasoningParserFactory,
     routers::{
-        atom_bridge::AtomBridgeRuntime, atom_standalone::AtomStandaloneRuntime,
-        prepare::fast_tokenizer::TokenizeLimits,
+        atom_bridge::AtomBridgeRuntime, prepare::fast_tokenizer::TokenizeLimits,
         router_manager::RouterManager,
     },
     tokenizer::registry::TokenizerRegistry,
@@ -73,7 +72,6 @@ pub struct AppContext {
     pub workflow_engines: Arc<OnceLock<WorkflowEngines>>,
     pub worker_service: Arc<WorkerService>,
     pub inflight_tracker: Arc<InFlightRequestTracker>,
-    pub atom_standalone_runtime: Option<Arc<AtomStandaloneRuntime>>,
     /// ATOM standalone with the OpenAI API served by Rust (`--frontend rust`).
     pub atom_bridge_runtime: Option<Arc<AtomBridgeRuntime>>,
     /// Set with `kv_events` in the router config.
@@ -107,7 +105,6 @@ pub struct AppContextBuilder {
     load_monitor: Option<Arc<LoadMonitor>>,
     worker_job_queue: Option<Arc<OnceLock<Arc<JobQueue>>>>,
     workflow_engines: Option<Arc<OnceLock<WorkflowEngines>>>,
-    atom_standalone_runtime: Option<Arc<AtomStandaloneRuntime>>,
     atom_bridge_runtime: Option<Arc<AtomBridgeRuntime>>,
 }
 
@@ -149,7 +146,6 @@ impl AppContextBuilder {
             load_monitor: None,
             worker_job_queue: None,
             workflow_engines: None,
-            atom_standalone_runtime: None,
             atom_bridge_runtime: None,
         }
     }
@@ -244,11 +240,6 @@ impl AppContextBuilder {
         self
     }
 
-    pub fn atom_standalone_runtime(mut self, runtime: Option<Arc<AtomStandaloneRuntime>>) -> Self {
-        self.atom_standalone_runtime = runtime;
-        self
-    }
-
     pub fn atom_bridge_runtime(mut self, runtime: Option<Arc<AtomBridgeRuntime>>) -> Self {
         self.atom_bridge_runtime = runtime;
         self
@@ -332,7 +323,6 @@ impl AppContextBuilder {
                 .ok_or(AppContextBuildError("workflow_engines"))?,
             worker_service,
             inflight_tracker: InFlightRequestTracker::new(),
-            atom_standalone_runtime: self.atom_standalone_runtime,
             atom_bridge_runtime: self.atom_bridge_runtime,
             kv_event_monitor,
             kv_storage,

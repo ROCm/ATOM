@@ -71,8 +71,9 @@ class ChatRenderer:
     def __init__(self, tokenizer: Any, model: str) -> None:
         self.tokenizer = tokenizer
         self.encoder = load_custom_message_encoder(model)
-        template = getattr(tokenizer, "chat_template", None)
-        self.needed = self.encoder is not None or not isinstance(template, (str, dict))
+        # A Jinja template (one string, or named variants) is the router's
+        # to render; an encoder, or a template that is code, is not.
+        self.needed = self.encoder is not None or not chat_template_source(tokenizer)
         if not self.needed:
             return
         source = chat_template_source(tokenizer, self.encoder)

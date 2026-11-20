@@ -16,7 +16,6 @@ use crate::protocols::{
 };
 
 pub mod atom_bridge;
-pub mod atom_standalone;
 pub mod comm;
 pub mod factory;
 pub mod grpc;
