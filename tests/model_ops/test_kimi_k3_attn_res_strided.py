@@ -37,7 +37,7 @@ def _inputs(tokens, seed):
     }
 
 
-def _call(x, block_residual, adds, out_norm, quant):
+def _call(x, block_residual, adds, out_norm, quant, num_blocks=None):
     return _apply_attn_res_impl(
         x["prefix"],
         block_residual,
@@ -47,6 +47,7 @@ def _call(x, block_residual, adds, out_norm, quant):
         out_norm_weight=x["out_norm"] if out_norm else None,
         add_hidden2=x["adds"][1] if adds == 2 else None,
         quant_dtype=dtypes.fp8 if quant else None,
+        num_blocks=num_blocks,
     )
 
 
@@ -78,6 +79,7 @@ def test_bank_slice_matches_its_copy(tokens, adds, out_norm, quant):
         assert view.is_contiguous() == (blocks == BANK or tokens == 1)
         want = _call(x, view.contiguous(), adds, out_norm, quant)
         _assert_bitwise(_call(x, view, adds, out_norm, quant), want, f"{blocks} blocks")
+        _assert_bitwise(_call(x, x["bank"], adds, out_norm, quant, blocks), want)
 
 
 @pytest.mark.parametrize("tokens", [1, 16])
