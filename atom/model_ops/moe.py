@@ -100,6 +100,7 @@ from atom.quant_spec import (
     should_stream_online_quant,
     validate_nvfp4_global_scales,
     validate_nvfp4_online_target,
+    will_online_requant,
 )
 from atom.quantization.quark.utils import (
     dequant_moe_weight_online,
@@ -822,11 +823,19 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
         stream_online_quant = getattr(layer, "_stream_online_quant", False)
         weight_device = "meta" if stream_online_quant else None
 
+        # Padding belongs to the runtime method, not a temporary source for
+        # online conversion. Check the layer policy even with streaming off;
+        # excluded BF16 layers (including MTP) still need runtime padding.
+        pad_align = self.pad_align
+        quant_config = getattr(layer, "quant_config", None)
+        if quant_config is not None and will_online_requant(
+            quant_config, layer.prefix, QuantType.No, params_dtype
+        ):
+            pad_align = 1
+
         logical_intermediate = intermediate_size_per_partition
         intermediate_size_per_partition = (
-            (logical_intermediate + self.pad_align - 1)
-            // self.pad_align
-            * self.pad_align
+            (logical_intermediate + pad_align - 1) // pad_align * pad_align
         )
         # Keep layer.intermediate_size_per_partition logical for checkpoint
         # sharding. AITER computes the physical width, including these zeros;
