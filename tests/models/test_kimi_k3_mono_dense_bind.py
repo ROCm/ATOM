@@ -5,9 +5,9 @@
 
 The kernels read a dense weight one of two ways: plain bf16, or the production
 per-token FP8 plane in place (E4M3 in AITER's (16, 16) preshuffle, rows padded
-to 16, an fp32 scale a padded row). Anything else the weight's records describe
-would be indexed as one of those and read wrong, with no error, so ``_dense``
-has to refuse it at bind.
+to the GEMM's 128-row tile, an fp32 scale a padded row). Anything else the
+weight's records describe would be indexed as one of those and read wrong, with
+no error, so ``_dense`` has to refuse it at bind.
 The binder compares quant types by name, so these run without AITER. So do the
 checks of the kernels' FP8 addresses (``preshuffle``, ``kda_plan``) against the
 preshuffle written out, which is itself checked against K3's unshuffle, and
@@ -28,7 +28,7 @@ from atom.mono.runtime.consensus import MonoUnsupported
 
 FP8 = torch.float8_e4m3fn
 SHAPE = (200, 256)
-PADDED = 208
+PADDED = 256
 # AITER's QuantType as the binder reads it
 PER_TOKEN = SimpleNamespace(name="per_Token")
 PER_1X128 = SimpleNamespace(name="per_1x128")
@@ -61,7 +61,7 @@ def test_bf16_binds_without_a_scale():
 @pytest.mark.parametrize("padded", [False, True])
 def test_per_token_fp8_binds_in_place(padded):
     # ATOM records the logical rows of a plane it padded to the GEMM's tile;
-    # one already a multiple of 16 rows is held as is
+    # one already a multiple of 128 rows is held as is
     record = {"is_output_padded": True, "_output_size_before_padding": SHAPE[0]}
     module = fp8_linear(**(record if padded else {}))
     w, scale = W._dense(module, "proj", SHAPE if padded else (PADDED, SHAPE[1]))

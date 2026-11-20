@@ -119,7 +119,7 @@ def test_a_failing_bind_moe_on_a_full_attention_layer_falls_back_alone(
 
     def flaky(layer, lid, dims, rank):
         if lid == 3:
-            raise MonoUnsupported("o_proj is quantized")
+            raise MonoUnsupported("o_proj must use per-token FP8")
         return real(layer, lid, dims, rank)
 
     monkeypatch.setattr(stub_binds, "bind_moe", flaky)
