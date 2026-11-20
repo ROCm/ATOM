@@ -1,13 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Encode and decode every CoreManager <-> EngineCore message.
+"""Encode and decode the CoreManager <-> EngineCore messages engine_v1 carries.
 
-Client side: `encode_submit` / `encode_abort` / `encode_utility` /
+Client side: `encode_submit` / `encode_abort` / `encode_command` /
 `encode_shutdown`, and `decode_core_message` for what comes back.
 
 Core side: `decode_client_message`, `build_sequence` to turn a decoded
 request into the `Sequence` the scheduler has always received, and an
-`encode_*` for every kind of item the Core puts on its output queue.
+`encode_*` for each of the Core's replies: completions, stream steps,
+rejections, readiness, metrics, utility / admin replies and its stop.
+
+Not carried yet: the DP prefix-routing messages (`PREFILL_BACKLOG`,
+`DP_REUSE`, `DP_PREFIX_CREDIT`) and the `Sequence` fields they feed
+(`dp_est_cached_tokens`, `prefill_completed`).
 
 Decoded kinds are `EngineCoreRequestType` members, so the dispatch on both
 ends reads as it did when the payloads were pickled.
@@ -16,7 +21,7 @@ ends reads as it did when the payloads were pickled.
 import array
 import logging
 import pickle
-from dataclasses import fields
+from dataclasses import fields, replace
 from functools import cache, lru_cache
 from itertools import chain
 
@@ -39,7 +44,10 @@ from atom.model_engine.zmq_protocol.wire import (
     encode_value,
 )
 from atom.observability import tracing
-from atom.sampling_params import RequiredChannel, SamplingParams
+from atom.sampling_params import EngineChannel, RequiredChannel, SamplingParams
+from atom.structured_output import is_structured
+from atom.structured_output.validation import validate_execution_options
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -394,6 +402,19 @@ def _decode_completion(msg, reader: FrameReader) -> CompletionResult:
     )
 
 
+def _decode_completion_alone(msg, reader: FrameReader) -> CompletionResult:
+    """`_decode_completion`, or, when this one item does not decode, a
+    rejected result for it: the batch's other sequences still finish."""
+    try:
+        return _decode_completion(msg, reader)
+    except Exception as exc:  # reported on its own sequence
+        logger.exception("seq %s's completion does not decode", msg.seq_id)
+        return CompletionResult(
+            id=msg.seq_id,
+            leave_reason=f"{REJECTED_REASON}: {type(exc).__name__}: {exc}",
+        )
+
+
 def _decode_stream(msg, reader: FrameReader) -> list[tuple[int, RequestOutput]]:
     counts = list(msg.token_counts)
     tokens = list(msg.tokens)
@@ -450,7 +471,8 @@ def decode_core_message(frames: list):
     body = envelope.WhichOneof("body")
     if body == "completions":
         return EngineCoreRequestType.ADD, [
-            _decode_completion(item, reader) for item in envelope.completions.items
+            _decode_completion_alone(item, reader)
+            for item in envelope.completions.items
         ]
     if body == "stream":
         return EngineCoreRequestType.STREAM, _decode_stream(envelope.stream, reader)
@@ -611,7 +633,7 @@ class AdmissionContext:
     """
 
     def __init__(self, config):
-        speculative = getattr(config, "speculative_config", None)
+        speculative = config.speculative_config
         self.config = config
         self.block_size = config.kv_cache_block_size
         self.num_draft_tokens = (
@@ -621,17 +643,47 @@ class AdmissionContext:
             config.hf_config.model_type in PER_REQ_CACHE_MODEL_TYPES
         )
         self.validate_request = getattr(config.hf_config, "validate_request", None)
-        self.enable_dp_attention = bool(getattr(config, "enable_dp_attention", False))
+        self.enable_dp_attention = config.enable_dp_attention
+        # This Core's own: its engine loop holds one channel.
+        self.engine_channel = EngineChannel(config)
 
 
 def build_sequence(spec: AdmissionSpec, context: AdmissionContext):
     """The `Sequence` the client would have built for `spec`.
 
-    Raises what the frontend would have raised building it, plus what the
-    model's own request validation refuses.
+    Refuses what the frontend refuses against the engine's config, so a client
+    that is not this repo's frontend is held to it too: logprob options, a
+    structured request's execution options and its exclusion of a required
+    channel, a required channel other than the one this Core holds, and what
+    the model's own request validation refuses. A structured request's grammar
+    is the client's to have compiled (`LLMEngine.prepare_structured_request`).
     """
     kwargs = dict(spec.kwargs)
     multimodal_data = kwargs["multimodal_data"]
+    params = kwargs["sampling_params"]
+    kv_transfer = kwargs["kv_transfer_params"]
+    multimodal = multimodal_data is not None
+    params.validate_logprob_options(
+        context.config, kv_transfer=kv_transfer, multimodal=multimodal
+    )
+    if is_structured(params):
+        if params.required_channel is not None:
+            raise ValueError(
+                "A request cannot carry both a structured-output grammar "
+                "(json_schema or structured_tool_format) and a required_channel"
+            )
+        validate_execution_options(
+            context.config,
+            params,
+            kv_transfer=kv_transfer,
+            multimodal=multimodal,
+            relaxed_mtp=envs.ATOM_ENABLE_RELAXED_MTP,
+        )
+    if params.required_channel is not None:
+        kwargs["sampling_params"] = replace(
+            params,
+            required_channel=context.engine_channel.hold(params.required_channel),
+        )
     if context.validate_request is not None:
         context.validate_request(
             num_draft_tokens=context.num_draft_tokens,
@@ -712,7 +764,15 @@ def encode_completions(seqs) -> list:
     envelope = pb.Envelope()
     envelope.completions.SetInParent()
     for seq in seqs:
-        _encode_completion(seq, envelope.completions.items.add(), writer)
+        msg = envelope.completions.items.add()
+        try:
+            _encode_completion(seq, msg, writer)
+        except Exception as exc:  # one item must not drop the whole batch
+            # Its tokens and params go; the sequence still ends, rejected.
+            logger.exception("seq %s's completion does not encode", seq.id)
+            msg.Clear()
+            msg.seq_id = seq.id
+            msg.leave_reason = f"{REJECTED_REASON}: {type(exc).__name__}: {exc}"
     return writer.frames(envelope)
 
 

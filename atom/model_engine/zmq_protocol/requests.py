@@ -25,6 +25,11 @@ def prompt_token_array(tokens) -> array.array:
     if isinstance(tokens, array.array) and tokens.typecode == "i":
         return tokens
     if isinstance(tokens, np.ndarray):
+        # As `array("i", ...)` below refuses one: an id past int32 would wrap.
+        if tokens.dtype != np.int32 and tokens.size:
+            int32 = np.iinfo(np.int32)
+            if tokens.min() < int32.min or tokens.max() > int32.max:
+                raise OverflowError("a token id does not fit in int32")
         out = array.array("i")
         out.frombytes(
             memoryview(np.ascontiguousarray(tokens, dtype=np.int32)).cast("B")

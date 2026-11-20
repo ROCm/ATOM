@@ -33,7 +33,12 @@ from atom.model_engine.scheduler import (
     Scheduler,
 )
 from atom.model_engine.sequence import SequenceType
-from atom.sampling_params import UNCONSTRAINED, RequiredChannel, SamplingParams
+from atom.sampling_params import (
+    UNCONSTRAINED,
+    EngineChannel,
+    RequiredChannel,
+    SamplingParams,
+)
 
 # Kimi-K3's ids for its control tokens and the words between them, as its
 # tokenizer encodes them (checked against /share_nfs/models/moonshotai/Kimi-K3).
@@ -121,7 +126,7 @@ def _engine_io():
     io.has_per_req_cache = False
     io.segment_tokenizer = None
     io.requests = {}
-    io._format_channel = io._required_channel = None
+    io.engine_channel = EngineChannel(io.config)
     return io
 
 
