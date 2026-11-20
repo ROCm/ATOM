@@ -22,8 +22,8 @@ pub use error::RlError;
 
 use crate::server::AppState;
 
-/// The `/v1/rl` routes, each requiring `Authorization: Bearer <api_key>`.
-/// With no `api_key` every request is refused.
+/// The `/v1/rl` routes, each requiring `Authorization: Bearer <api_key>`
+/// (scheme in any case). With no `api_key` every request is refused.
 pub fn router(config: &RlConfig) -> Router<Arc<AppState>> {
     let token: Arc<str> = config.api_key.as_deref().unwrap_or_default().into();
     Router::new()
@@ -37,8 +37,9 @@ async fn require_bearer(State(token): State<Arc<str>>, request: Request, next: N
         .headers()
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .unwrap_or_default();
+        .and_then(|v| v.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .map_or("", |(_, token)| token);
     if token.is_empty() || !constant_time_eq(presented.as_bytes(), token.as_bytes()) {
         return RlError::Unauthorized.into_response();
     }

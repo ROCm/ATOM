@@ -28,24 +28,24 @@ use crate::common::{
 const RL_KEY: &str = "rl-test-key";
 
 async fn call(app: &Router, method: &str, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
-    call_as(app, method, uri, body, Some(RL_KEY)).await
+    call_as(app, method, uri, body, Some(&format!("Bearer {RL_KEY}"))).await
 }
 
-/// `call` with `Authorization: Bearer <bearer>`, or no such header.
+/// `call` with `Authorization: <authorization>`, or no such header.
 async fn call_as(
     app: &Router,
     method: &str,
     uri: &str,
     body: Option<Value>,
-    bearer: Option<&str>,
+    authorization: Option<&str>,
 ) -> (StatusCode, Value) {
     let body = body.map_or_else(Body::empty, |body| Body::from(body.to_string()));
     let mut request = Request::builder()
         .method(method)
         .uri(uri)
         .header(CONTENT_TYPE, "application/json");
-    if let Some(bearer) = bearer {
-        request = request.header(AUTHORIZATION, format!("Bearer {bearer}"));
+    if let Some(authorization) = authorization {
+        request = request.header(AUTHORIZATION, authorization);
     }
     let request = request.body(body).unwrap();
     let response = app.clone().oneshot(request).await.unwrap();
@@ -256,15 +256,26 @@ async fn rl_off_mounts_no_route() {
 async fn rl_routes_require_the_bearer_token() {
     let ctx = AppTestContext::new_with_config(rl_config(BackendType::Atom, false), vec![]).await;
     let app = ctx.create_app().await;
+    let refused = [
+        None,
+        Some("Bearer "),
+        Some("Bearer wrong"),
+        Some("Bearer rl-test-ke"),
+        Some(RL_KEY),
+        Some("Basic rl-test-key"),
+    ];
     for uri in ["/v1/rl/workers", "/v1/rl/workers/nope"] {
-        for bearer in [None, Some(""), Some("wrong"), Some("rl-test-ke")] {
-            let (status, body) = call_as(&app, "GET", uri, None, bearer).await;
-            assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri} {bearer:?}");
-            assert_eq!(body["error"], "unauthorized", "{uri} {bearer:?}");
+        for authorization in refused {
+            let (status, body) = call_as(&app, "GET", uri, None, authorization).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri} {authorization:?}");
+            assert_eq!(body["error"], "unauthorized", "{uri} {authorization:?}");
         }
     }
-    let (status, _) = call(&app, "GET", "/v1/rl/workers", None).await;
-    assert_eq!(status, StatusCode::OK);
+    for scheme in ["Bearer", "bearer", "BEARER"] {
+        let authorization = format!("{scheme} {RL_KEY}");
+        let (status, _) = call_as(&app, "GET", "/v1/rl/workers", None, Some(&authorization)).await;
+        assert_eq!(status, StatusCode::OK, "{authorization}");
+    }
     ctx.shutdown().await;
 }
 
@@ -274,9 +285,9 @@ async fn rl_routes_without_a_configured_key_refuse_every_request() {
     config.rl.api_key = None;
     let ctx = AppTestContext::new_with_config(config, vec![]).await;
     let app = ctx.create_app().await;
-    for bearer in [None, Some("")] {
-        let (status, _) = call_as(&app, "GET", "/v1/rl/workers", None, bearer).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "{bearer:?}");
+    for authorization in [None, Some("Bearer ")] {
+        let (status, _) = call_as(&app, "GET", "/v1/rl/workers", None, authorization).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{authorization:?}");
     }
     ctx.shutdown().await;
 }
