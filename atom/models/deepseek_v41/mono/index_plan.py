@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Every per-step decision of which mailbox cells the indexer writes and reads,
 defined once (DESIGN_v3 4.9, I3).
 
@@ -72,19 +73,19 @@ def chunk_written(bound, ch):
     return scored(bound) & (ch * CHUNK < bound)
 
 
-def segments(bound):
-    """Select segments of a token: segment s covers columns [SEG s, SEG (s + 1))."""
-    return cdiv(imax(bound, 0), SEG)
+def segments(bound, seg=SEG):
+    """Select segments of a token: segment s covers columns [seg s, seg (s + 1))."""
+    return cdiv(imax(bound, 0), seg)
 
 
-def seg_len(bound, s):
+def seg_len(bound, s, seg=SEG):
     """Columns in segment s."""
-    return imax(imin(bound - s * SEG, SEG), 0)
+    return imax(imin(bound - s * seg, seg), 0)
 
 
-def seg_chunks(bound, s):
-    """The chunk flags segment s polls: [CHUNKS_PER_SEG s, + this)."""
-    return sel(scored(bound), cdiv(seg_len(bound, s), CHUNK), 0)
+def seg_chunks(bound, s, seg=SEG):
+    """The chunk flags segment s polls: [seg // CHUNK s, + this)."""
+    return sel(scored(bound), cdiv(seg_len(bound, s, seg), CHUNK), 0)
 
 
 def winners(n, k):
@@ -92,65 +93,82 @@ def winners(n, k):
     return imin(imax(n, 0), k)
 
 
-# The selection is a tree. Level 0: segment s of SEG values -> its top-k list.
-# Level l > 0: list j merges the level l - 1 lists [FAN j, FAN (j + 1)), FAN =
-# SEG // k, laid end to end: every list but a level's last holds exactly k
-# valid entries (its inputs held >= k), so the merged input is dense and in
+# The selection is a tree. Level 0: segment s of ``seg`` values -> its top-k
+# list. Level l > 0: list j merges the level l - 1 lists [FAN j, FAN (j + 1)),
+# FAN = seg // k, laid end to end: every list but a level's last holds exactly
+# k valid entries (its inputs held >= k), so the merged input is dense and in
 # index order. A global winner is in its own list's top-k (fewer than k beat it
 # there), so each level keeps every winner. The tree ends at a level of one list.
+# ``seg`` is SEG but for a REINDEX row (REINDEX_SEG): its at most REINDEX_CHUNKS
+# x CHUNK columns as four lists and one merge, each a quarter of SEG's keys.
+
+# a REINDEX row's segment
+REINDEX_SEG = 4096
 
 
-def fan(k):
-    return SEG // k
+def fan(k, seg=SEG):
+    return seg // k
 
 
-def lists(bound, level, k):
+def lists(bound, level, k, seg=SEG):
     """Lists at ``level`` (static unroll: callers loop over levels in Python)."""
-    n = segments(bound)
+    n = segments(bound, seg)
     for _ in range(level):
-        n = cdiv(n, fan(k))
+        n = cdiv(n, fan(k, seg))
     return n
 
 
-def list_inputs(bound, level, j, k):
+def list_inputs(bound, level, j, k, seg=SEG):
     """Values list j of ``level`` ranks: a segment's columns at level 0, else the
     valid entries of the lists it merges."""
     if level == 0:
-        return seg_len(bound, j)
-    below = lists(bound, level - 1, k)
-    first = j * fan(k)
-    count = imin(below - first, fan(k))
+        return seg_len(bound, j, seg)
+    below = lists(bound, level - 1, k, seg)
+    first = j * fan(k, seg)
+    count = imin(below - first, fan(k, seg))
     last = first + count - 1
-    return i32(imax(count - 1, 0) * k + list_valid(bound, level - 1, last, k))
+    return i32(imax(count - 1, 0) * k + list_valid(bound, level - 1, last, k, seg))
 
 
-def list_valid(bound, level, j, k):
+def list_valid(bound, level, j, k, seg=SEG):
     """Valid entries of list j at ``level``."""
-    return winners(list_inputs(bound, level, j, k), k)
+    return winners(list_inputs(bound, level, j, k, seg), k)
 
 
-def levels(bound_max, k):
+def levels(bound_max, k, seg=SEG):
     """Merge levels a build needs for bounds up to ``bound_max`` (Python ints):
     the depth at which one list remains."""
-    level, n = 0, segments(bound_max)
+    level, n = 0, segments(bound_max, seg)
     while n > 1:
-        n = cdiv(n, fan(k))
+        n = cdiv(n, fan(k, seg))
         level += 1
     return level
 
 
-def is_final(bound, level, k):
+def per_thread(level, bound_max, k, threads, seg=SEG):
+    """Values a thread holds in a ``level`` list of a build for bounds up to
+    ``bound_max`` (Python ints): a segment at level 0, else the most the list
+    can merge (min(lists below, FAN) x k), over ``threads`` in whole quads. A
+    select's cost follows its per-thread capacity, not its inputs."""
+    if level == 0:
+        most = seg
+    else:
+        most = min(lists(bound_max, level - 1, k, seg), fan(k, seg)) * k
+    return cdiv(cdiv(most, threads), 4) * 4
+
+
+def is_final(bound, level, k, seg=SEG):
     """Is ``level``'s list the token's answer (one list or none): the selection
     publishes IRDY from it."""
-    return lists(bound, level, k) <= 1
+    return lists(bound, level, k, seg) <= 1
 
 
-def final_level(bound, depth, k):
+def final_level(bound, depth, k, seg=SEG):
     """The level whose single list is the token's answer: the first that
     ``is_final`` (a token below the build's maximum ends early)."""
     at = depth
     for level in range(depth, -1, -1):
-        at = sel(is_final(bound, level, k), level, at)
+        at = sel(is_final(bound, level, k, seg), level, at)
     return at
 
 
@@ -309,13 +327,13 @@ def task_writes(bound, ch0, width, m):
     return (m < width) & chunk_written(bound, ch0 + m)
 
 
-def list_count(bound, level, k):
+def list_count(bound, level, k, seg=SEG):
     """Lists a token runs at ``level``: level 0 always one (so a token that sees
     nothing still emits its -1s), a higher level only while the one below had
     more than one."""
     if level == 0:
-        return imax(lists(bound, 0, k), 1)
-    return sel(lists(bound, level - 1, k) > 1, lists(bound, level, k), 0)
+        return imax(lists(bound, 0, k, seg), 1)
+    return sel(lists(bound, level - 1, k, seg) > 1, lists(bound, level, k, seg), 0)
 
 
 def kind_bound(kind, bound):
@@ -324,11 +342,40 @@ def kind_bound(kind, bound):
     return bound if kind == "sel" else blocks(bound)
 
 
-def top_level(kind, bound_max):
+def top_level(kind, bound_max, seg=SEG):
     """A ``kind`` selection tree's last level for bounds up to ``bound_max``."""
-    return levels(kind_bound(kind, bound_max), KINDS[kind])
+    return levels(kind_bound(kind, bound_max), KINDS[kind], seg)
 
 
-def list_slots(kind, level, bound_max):
-    """Lists a token can have at ``level`` (a region's per-token size)."""
-    return lists(kind_bound(kind, bound_max), level, KINDS[kind])
+def list_slots(kind, level, bound_max, seg=SEG):
+    """Lists a token can have at ``level`` of one tree."""
+    return lists(kind_bound(kind, bound_max), level, KINDS[kind], seg)
+
+
+def reindex_bound(bound_max):
+    """A REINDEX row's columns at most, in a build for bounds up to
+    ``bound_max``: its candidate blocks' rows."""
+    return min(bound_max, REINDEX_CHUNKS * CHUNK)
+
+
+def trees(kind, bound_max):
+    """The (bound, seg) of each ``kind`` tree a build for bounds up to
+    ``bound_max`` runs: the columns', and for the selection a REINDEX row's."""
+    if kind == "blk":
+        return ((bound_max, SEG),)
+    return ((bound_max, SEG), (reindex_bound(bound_max), REINDEX_SEG))
+
+
+def region_levels(kind, bound_max):
+    """Levels with a ``kind`` region: those below some tree's top level."""
+    return max(top_level(kind, b, s) for b, s in trees(kind, bound_max))
+
+
+def region_slots(kind, level, bound_max):
+    """Lists a token's ``level`` region holds: the most of the trees that put
+    lists at that level (a tree's top level puts none)."""
+    return max(
+        list_slots(kind, level, b, s)
+        for b, s in trees(kind, bound_max)
+        if level < top_level(kind, b, s)
+    )

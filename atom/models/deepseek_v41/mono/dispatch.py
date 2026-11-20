@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Which V4.1 forwards take the mono path.
 
 ``install_mono_decode`` wraps the loaded model, the way the TBO
@@ -72,6 +73,14 @@ def step_supported(input_ids: torch.Tensor, inputs_embeds, dp_ranks: int = 0) ->
 class MonoDecodeModel(nn.Module):
     """The loaded V4.1 runtime model, with its supported steps routed to mono."""
 
+    # its head's ids are greedy picks: a sampled step takes the logits
+    # (``ModelRunner._head_ids_serve``)
+    head_samples = False
+    # and the same on every TP rank: the LM head launch picks each row's id
+    # over every rank's vocab shard, every rank reducing the ranks' bests
+    # alike (``kernels.lm_head``), so the runner broadcasts none
+    head_ids_agree = True
+
     def __init__(
         self,
         model: nn.Module,
@@ -79,6 +88,7 @@ class MonoDecodeModel(nn.Module):
         max_model_len: int,
         index_fp4: bool,
         dp_ranks: int,
+        outputs=None,
     ) -> None:
         super().__init__()
         self.model = model
@@ -87,18 +97,52 @@ class MonoDecodeModel(nn.Module):
         self._dp_ranks = dp_ranks
         # created on its first eligible step (``LazyRunner``)
         self._mono = LazyRunner(
-            lambda: V41MonoDecodeRunner(model, drafter, max_model_len, index_fp4),
+            lambda: V41MonoDecodeRunner(
+                model, drafter, max_model_len, index_fp4, outputs
+            ),
             "V4.1 mono decode",
         )
+        self._served = False
 
     def forward(self, input_ids, positions, inputs_embeds=None):
-        if step_supported(
+        # the forward ran on the mono kernels: its head may too
+        # (``compute_head`` follows its forward, recorded with it or not)
+        self._served = step_supported(
             input_ids, inputs_embeds, self._dp_ranks
-        ) and self._mono.ready(input_ids.numel()):
+        ) and self._mono.ready(input_ids.numel())
+        if self._served:
             return self._mono.runner.forward(input_ids, positions)
         if inputs_embeds is None:
             return self.model(input_ids, positions)
         return self.model(input_ids, positions, inputs_embeds=inputs_embeds)
+
+    def compute_head(self, hidden_states: torch.Tensor):
+        """The head output of the forward that just ran
+        (``ModelRunner._head_output``, recorded with a captured one): on a step
+        the mono kernels served, the final norm and LM head in one launch
+        (``head_launch``): a verify step's greedy (output ids, verdict), else
+        its logits; else None (the runner computes them)."""
+        if not self._served:
+            return None
+        return self._mono.runner.head(hidden_states)
+
+    def write_context(self, taps, positions) -> bool:
+        """The draft's context KV of the target step that just ran, in one
+        launch (``V41MonoDecodeRunner.write_context``), True if it ran: only
+        when the mono kernels served that step (the decision ``forward``
+        took, taken again: a replayed graph does not call it), whose step
+        begin zeroed the launch's mailboxes."""
+        fwd = get_forward_context()
+        if fwd.context is None or fwd.context.is_dummy_run:
+            return False
+        metadata = fwd.attn_metadata
+        rows = metadata.step.running_tokens
+        ids = positions[:rows]
+        if not (step_supported(ids, None, self._dp_ranks) and self._mono.ready(rows)):
+            return False
+        return self._mono.runner.write_context(
+            [tap[:rows] for tap in taps], ids, metadata.cache, metadata.step
+        )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.model.compute_logits(hidden_states)
@@ -132,18 +176,52 @@ class MonoDraftModel(nn.Module):
             else MAX_REQUESTS
         )
         self._mono = LazyRunner(lambda: DraftMonoRunner(draft), "V4.1 mono draft")
+        # the last block's backbone ran on the mono kernels: its head may too
+        # (a pass's head follows its backbone, recorded or not)
+        self._served = False
+        # the target's mono context write (``MonoDecodeModel.write_context``),
+        # set at install; None: the draft's own
+        self.context_writer = None
+
+    def write_context_kv(self, taps, positions, slot_mapping=None, **kw):
+        """The target step's context KV into the draft's windows: on the
+        target's mono launch where it serves, else the draft's own."""
+        writer = self.context_writer
+        if writer is not None and not kw and writer(taps, positions):
+            return
+        self.model.write_context_kv(taps, positions, slot_mapping, **kw)
 
     def block_backbone(self, input_ids, positions, num_draft):
         width = self.model.block_size if num_draft is None else num_draft
         requests = input_ids.numel()
-        if (
+        self._served = (
             self.model.draft_kv_dtype != "fp8"
             and 0 < requests <= self._max_requests
             and width == self.model.block_size
             and self._mono.ready(requests * width)
-        ):
+        )
+        if self._served:
             return self._mono.runner.backbone(input_ids, positions)
         return self.model.block_backbone(input_ids, positions, num_draft)
+
+    def head_and_sample(self, out, anchor_ids, num_draft, *, greedy=False):
+        """The block's ids and confidences: after a mono backbone (``out`` its
+        last stage's state) the tail, the LM head, the greedy Markov sampler
+        and the confidence head in one launch (``DraftMonoRunner.head``; a
+        confidence head it does not compute, on its collapsed and ``W1``
+        rows); else, and where the block samples (``draft_sampling`` without
+        ``greedy``), the model's own."""
+        if self._served:
+            runner = self._mono.runner
+            samples = self.model.draft_sampling is not None and not greedy
+            got = None if samples else runner.head(anchor_ids)
+            if got is not None:
+                ids, embeds, hidden, conf = got
+                if conf is None:
+                    conf = self.model.mtp[-1].confidence_head(hidden, embeds)
+                return ids, conf
+            out = runner.normed_rows(out, anchor_ids.numel())
+        return self.model.head_and_sample(out, anchor_ids, num_draft, greedy=greedy)
 
     def __getattr__(self, name: str):
         try:
@@ -190,12 +268,23 @@ def install_mono_decode(
             if hi_gate.mode() == "1":
                 raise
             hi_gate.log_once(logging.INFO, "V4.1 mono hi off: %s", why)
+    draft = None
     if drafter is not None and hasattr(drafter.model, "block_backbone"):
-        drafter.model = MonoDraftModel(drafter.model, dp_ranks)
-    return MonoDecodeModel(
+        draft = drafter.model = MonoDraftModel(drafter.model, dp_ranks)
+    decoder = MonoDecodeModel(
         model,
         drafter,
         atom_config.max_model_len,
         atom_config.index_cache_dtype == "fp4",
         dp_ranks,
+        # the forward's output buffer (one slot: mono refuses pipeline
+        # parallel, whose forward_vars ring would swap it)
+        (
+            None
+            if metadata_builder is None
+            else metadata_builder.model_runner.forward_vars["outputs"]
+        ),
     )
+    if draft is not None:
+        draft.context_writer = decoder.write_context
+    return decoder

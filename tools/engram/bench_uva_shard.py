@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Time and measure page-locking one rank's Engram UVA shard, as the server does.
 
 Loads the checkpoint's Engram tables (the same shared read-only mapping the
@@ -117,7 +119,7 @@ def main():
     seconds = time.perf_counter() - t0
     after = memory()
 
-    from atom.model_ops.engram.device.uva import uva_gather_into
+    from atom.model_ops.engram.device.uva import UvaGather
 
     rng = np.random.default_rng(args.rank)
     gathers, exact = [], True
@@ -131,8 +133,9 @@ def main():
             args.tokens, local, cfg.head_dim, dtype=torch.bfloat16, device="cuda"
         )
         kw = {"head_start": head_start, "local_heads": local, "total_heads": heads}
+        gather = UvaGather([table], torch.device("cuda"))
         for _ in range(20):
-            uva_gather_into(table, ids, out, **kw)
+            gather(ids[None], out[None], **kw)
         # The rows the host path gathers for the same ids (this rank's heads).
         local_ids = ids[:, head_start : head_start + local].cpu().numpy()
         want = table.gather(local_ids, out_dtype=torch.bfloat16)
@@ -140,7 +143,7 @@ def main():
         start_ev, end_ev = torch.cuda.Event(True), torch.cuda.Event(True)
         start_ev.record()
         for _ in range(200):
-            uva_gather_into(table, ids, out, **kw)
+            gather(ids[None], out[None], **kw)
         end_ev.record()
         torch.cuda.synchronize()
         gathers.append(start_ev.elapsed_time(end_ev) / 200)

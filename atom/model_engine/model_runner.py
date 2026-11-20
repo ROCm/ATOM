@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2024-2025 ATOM Project Contributors
 
 import ctypes
 import dataclasses
@@ -208,11 +209,14 @@ def _draft_lossless(runner):
     return None if drafter is None else drafter.lossless
 
 
-def _needs_id_sync(is_deferred_out: bool, has_drafter: bool) -> bool:
+def _needs_id_sync(
+    is_deferred_out: bool, has_drafter: bool, ids_agree: bool = False
+) -> bool:
     """Whether sampled ids feed the next forward on device (deferred-out or a
-    drafter), so they must agree across a group. Shared by the PCP and TP
-    broadcasts so the two conditions cannot drift."""
-    return is_deferred_out or has_drafter
+    drafter), so they must agree across a group, and do not already
+    (``ids_agree``: every rank of the group holds the same ids). Shared by the
+    PCP and TP broadcasts so the two conditions cannot drift."""
+    return not ids_agree and (is_deferred_out or has_drafter)
 
 
 class TokenLocations(NamedTuple):
@@ -350,12 +354,31 @@ class tokenIDProcessor:
     def recv_spec_status(self) -> tuple[np.ndarray | None, np.ndarray | None]:
         return self.spec_status_queue.receive() or (None, None)
 
+    def _map_spec_status(self) -> None:
+        """The previous step's rejected / bonus counts, onto this batch's
+        carried-over requests (prev_idx -> curr_idx)."""
+        locs = self._status_locs
+        if (
+            locs is None
+            or not len(locs.deferred_curr)
+            or self.prev_rejected_num is None
+        ):
+            return
+        self.num_rejected[locs.deferred_curr] = self.prev_rejected_num[
+            locs.deferred_prev
+        ]
+        self.num_bonus[locs.deferred_curr] = self.prev_bonus_num[locs.deferred_prev]
+
     def take_deferred_spec_status(self) -> None:
-        """After the target's launch: the status `prepare_input_ids` deferred
-        (`defer_spec_status`), what `postprocess` reports."""
+        """The status `prepare_input_ids` deferred (`defer_spec_status`), mapped
+        onto this batch: what `postprocess` reports and `verify_ctx_lens`
+        reads. Taken after the target's launch, or by a builder before it
+        publishes (`AttentionMetadataBuilder.settles_spec_status`); a no-op
+        once taken."""
         if self.spec_status_owed:
             self.spec_status_owed = False
             self.prev_rejected_num, self.prev_bonus_num = self.recv_spec_status()
+            self._map_spec_status()
 
     def _wait_for_pending_copies(self) -> None:
         """Wait for every queued D2H before its entry (and source) is dropped."""
@@ -392,6 +415,8 @@ class tokenIDProcessor:
         )
         self.num_rejected: np.ndarray | None = None
         self.num_bonus: np.ndarray | None = None
+        # where this batch's carried-over requests stood in the previous one
+        self._status_locs = None
         # The previous verify's status this step deferred
         # (`prepare_input_ids`' `defer_spec_status`), owed until
         # `take_deferred_spec_status`.
@@ -585,18 +610,11 @@ class tokenIDProcessor:
                 self.spec_status_owed = True
             else:
                 self.prev_rejected_num, self.prev_bonus_num = self.recv_spec_status()
+        self._status_locs = locs
         if locs is not None:
-            # Map the previous step's rejected/bonus counts onto this batch's
-            # order (prev_idx -> curr_idx) for the carried-over sequences.
             self.num_rejected = batch.num_rejected
             self.num_bonus = batch.num_bonus
-            if len(locs.deferred_curr) > 0 and self.prev_rejected_num is not None:
-                self.num_rejected[locs.deferred_curr] = self.prev_rejected_num[
-                    locs.deferred_prev
-                ]
-                self.num_bonus[locs.deferred_curr] = self.prev_bonus_num[
-                    locs.deferred_prev
-                ]
+            self._map_spec_status()
         return input_ids
 
     def _stage_input_ids(
@@ -2874,11 +2892,15 @@ class ModelRunner:
             spec_decode_indices = self.drafter.prepare_spec_decode_indices(
                 lens, cu[1:], token_group
             )
-        # A builder that advances this step from the previous verdict on the
-        # device builds it without that verify's host-side status: its wait
-        # follows the target's launch (`forward`).
-        self.spec_status_deferred = self.attn_metadata_builder.consumes_device_verdict(
-            batch, forward_mode.max_seqlen_q
+        # A step built without the previous verify's host-side status takes it
+        # after the target's launch (`forward`): a prefill (its rows are new
+        # requests', none the status counts), or a decode whose builder
+        # advances from the previous verdict on the device.
+        self.spec_status_deferred = (
+            forward_mode.is_prefill
+            or self.attn_metadata_builder.consumes_device_verdict(
+                batch, forward_mode.max_seqlen_q
+            )
         )
         # No GPU consumer runs between these host producers and this
         # upload. Token assembly publishes before launching its kernel.
@@ -2886,7 +2908,10 @@ class ModelRunner:
             batch,
             forward_mode.max_seqlen_q,
             token_group,
-            defer_spec_status=self.spec_status_deferred,
+            defer_spec_status=self.spec_status_deferred
+            or self.attn_metadata_builder.settles_spec_status(
+                batch, forward_mode.max_seqlen_q
+            ),
         )
         self.prepare_inputs(
             batch,
@@ -2894,6 +2919,10 @@ class ModelRunner:
             forward_mode=forward_mode,
             spec_decode_indices=spec_decode_indices,
         )
+        if not self.spec_status_deferred:
+            # Whatever the builder left owed is taken before the launch, last:
+            # the preparation above overlaps the wait.
+            self.attn_metadata_builder.take_spec_status(self.tokenID_processor)
 
         # Stage scheduler anchor overrides while this forward's staging window
         # is still open. This pinned mirror is reused, so copying it later from
@@ -3349,7 +3378,8 @@ class ModelRunner:
         but each row's pick (no logprobs, structured output or required
         channel; exact or forced acceptance; no prefill context parallelism),
         every request verifying the full draft span the verdict is laid out
-        for, and its rows all greedy or all sampled from temperature and top-p
+        for, and its rows all greedy or (a model whose head samples, the
+        default ``head_samples``) all sampled from temperature and top-p
         alone. ATOM's verify of such a sampled step is sample-and-match; a
         head that gives ids draws each such row from the (T, top_p) its
         model's builder published with the step."""
@@ -3376,6 +3406,10 @@ class ModelRunner:
         temperatures = batch.temperatures[:bs]
         if not temperatures.any():
             return True
+        # a head whose ids are greedy picks (``head_samples`` False) stands for
+        # a greedy step only
+        if not getattr(self.model, "head_samples", True):
+            return False
         noise = getattr(batch, "needs_independent_noise", None)
         return bool(
             (temperatures > SAMPLER_EPS).all()
@@ -3544,15 +3578,18 @@ class ModelRunner:
             )
 
         # Drafter input must agree across TP ranks. Ids only: the verdict is
-        # deterministic on TP ranks' bit-identical inputs.
-        # (An overridden step's ids are identical on every TP rank, and the
-        # broadcast would wait for the work it queued after them.)
-        if (
-            get_tp_group().world_size > 1
-            and self._served is None
-            and _needs_id_sync(
-                self.tokenID_processor.is_deferred_out, hasattr(self, "drafter")
-            )
+        # deterministic on TP ranks' bit-identical inputs. An overridden
+        # step's ids are identical on every TP rank (and the broadcast would
+        # wait for the work it queued after them), and so are a model head's
+        # whose model says so (``head_ids_agree``: picked over every rank's
+        # vocab shard alike).
+        tp_ids_agree = self._served is not None or (
+            isinstance(logits, tuple) and getattr(self.model, "head_ids_agree", False)
+        )
+        if get_tp_group().world_size > 1 and _needs_id_sync(
+            self.tokenID_processor.is_deferred_out,
+            hasattr(self, "drafter"),
+            tp_ids_agree,
         ):
             sampled_tokens = get_tp_group().broadcast(sampled_tokens, src=0)
 

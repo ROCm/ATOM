@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """``ATOM_DSV41_MONO_HI`` (``mono/hi_gate.py``): "auto" (the default) serves exactly the supported deployment and
 leaves every other on ATOM's mono path, with one info line; "1" refuses loudly; "0" is off. The decision reads the
 configuration, the environment and the device properties only: no hi module is imported.
@@ -523,7 +524,8 @@ def _install_world(hi_dispatch, monkeypatch, *, local=None, others=(None, None, 
     drafter = SimpleNamespace(model=draft)
     builder = SimpleNamespace(
         engram=SimpleNamespace(mapping=None, host=None),
-        model_runner=None,
+        # ATOM's mono path takes the forward's output buffer from it
+        model_runner=SimpleNamespace(forward_vars={"outputs": None}),
         use_decode_round=lambda rnd: log.append("use round"),
     )
     cfg = SimpleNamespace(max_model_len=4096, index_cache_dtype="fp4")
@@ -636,17 +638,20 @@ def test_a_refusal_on_another_rank_keeps_atoms_mono_path_here(
     monkeypatch.setattr(dispatch, "config_refusal", lambda cfg: None)
     monkeypatch.setattr(dispatch, "dp_attention_ranks", lambda cfg: 0)
     monkeypatch.setattr(dispatch.hi_gate, "decide", lambda *a: True)
-    monkeypatch.setattr(dispatch, "MonoDecodeModel", lambda *a: "atom mono")
+    decoder = SimpleNamespace(write_context="atom mono context write")
+    monkeypatch.setattr(dispatch, "MonoDecodeModel", lambda *a: decoder)
     monkeypatch.setattr(
-        dispatch, "MonoDraftModel", lambda m, dp: ("atom mono draft", m)
+        dispatch, "MonoDraftModel", lambda m, dp: SimpleNamespace(model=m)
     )
     model, cfg, drafter, builder, _ = args
     with caplog.at_level(logging.INFO, logger="atom"):
         got = dispatch.install_mono_decode(
             model, cfg, drafter, metadata_builder=builder
         )
-    assert got == "atom mono"
-    assert drafter.model == ("atom mono draft", draft)
+    assert got is decoder
+    # the draft wrapped, its context written on the target's mono launch
+    assert drafter.model.model is draft
+    assert drafter.model.context_writer == decoder.write_context
     assert [r.getMessage() for r in caplog.records] == [
         "V4.1 mono hi off: refused at install: rank 0: MonoUnsupported: shard"
     ]

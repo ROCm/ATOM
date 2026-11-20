@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Retry spacing shared by the gfx950 tagged-mailbox implementations.
 
 The value is read once, at import, from ``ATOM_MONO_POLL_SLEEP_UNITS`` (unset
-or empty: 16), so it is a plain Python constant in every kernel build. Spawned
-workers inherit the environment. It is not in this file's bytes, so every
+or empty: ``DEFAULT``), so it is a plain Python constant in every kernel build.
+Spawned workers inherit the environment: ``Config`` sets it to ``COPY_SAFE``
+before they spawn when a KV transfer or offload connector runs copies beside
+the Mono kernels and the variable is unset. It is not in this file's bytes, so every
 source digest that hashes this file also hashes ``CACHE_TAG``: builds with
 different values never share a JIT cache entry.
 
@@ -15,7 +18,10 @@ it without an import cycle.
 import os
 
 ENV = "ATOM_MONO_POLL_SLEEP_UNITS"
-DEFAULT = 16
+# without concurrent KV copies (the evidence below is about them only)
+DEFAULT = 4
+# beside concurrent KV copies (offload or P/D connectors)
+COPY_SAFE = 16
 # s_sleep's immediate is 16 bits, but gfx9 / CDNA (gfx950 included) sleeps for
 # about 64 * SIMM16[6:0] clocks: the assembler takes 128 and the wave sleeps as
 # for 0. 0 is no backoff at all. So only 1..127 mean what they say.
@@ -46,16 +52,14 @@ def _units(raw):
 #   1: 0/6 pass; 4: 0/6 (every run hung, rounds 2-22);
 #   8: 128 rounds 44/44, but 1024 rounds 3/4 (one hang at round 583);
 #   16: 128 rounds 44/44, 1024 rounds 12/12.
-# 128-round runs cannot tell 8 from 16. TPOT cost was measured at 16 only
-# (+0.5% on V4.1); 8 was not measured. A pass is not proof of safety.
-# To lower the default, rerun `--mode side --repeats 1024` (timeout >= 300s) on
+# 128-round runs cannot tell 8 from 16. A pass is not proof of safety.
+# To lower COPY_SAFE, rerun `--mode side --repeats 1024` (timeout >= 300s) on
 # several GPUs, at least 12 runs per value alongside 16 in the same batch; 128
 # rounds is not enough. Any hang rejects the value.
 #
 # Override: ATOM_MONO_POLL_SLEEP_UNITS=N. N=1 restores main's instructions
 # exactly (`s_sleep 1` in sync.py / step_begin.py, `s_nop 0` in spin_pause and
-# the V4 helpers' poll), for a regression on a deployment with no concurrent
-# KV copies (no offload or P/D connector). Below 16 beside such copies, 1 and 4
+# the V4 helpers' poll). Below COPY_SAFE beside concurrent KV copies, 1 and 4
 # hung and 8 hung once (above); `Config` warns once at startup.
 POLL_SLEEP_UNITS = _units(os.environ.get(ENV))
 # `spin_pause` and the V4 helpers' poll: main had `s_nop 0` there

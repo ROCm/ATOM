@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2024-2025 ATOM Project Contributors
 
 """Centralized environment variable definitions for ATOM.
 
@@ -666,9 +667,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # of the step (mono/runner.py finish_step) instead of the GPU hanging. Use
     # with --enforce-eager.
     "ATOM_MONO_DEBUG": lambda: os.getenv("ATOM_MONO_DEBUG", "0") == "1",
-    # gfx950 mono mailbox retry spacing in s_sleep units (1..127, unset: 16).
-    # Read and checked by atom/mono/polling.py at import, which needs no ATOM
-    # import; 1 restores the pre-backoff polling (ROCm/ATOM#3369).
+    # gfx950 mono mailbox retry spacing in s_sleep units (1..127, unset: 4; 16
+    # beside a KV transfer or offload connector, set by Config). Read and
+    # checked by atom/mono/polling.py at import, which needs no ATOM import; 1
+    # restores the pre-backoff polling (ROCm/ATOM#3369).
     "ATOM_MONO_POLL_SLEEP_UNITS": lambda: os.getenv("ATOM_MONO_POLL_SLEEP_UNITS"),
     # DeepSeek-V4.1: how many of an attention layer's branches leave the main
     # stream. 0 none; 1 the compressor, on the MoE's `alt_stream`, waited at

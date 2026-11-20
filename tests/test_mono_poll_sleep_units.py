@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""ATOM_MONO_POLL_SLEEP_UNITS: the gfx950 Mono mailbox retry spacing (16 unless
-set; 1 is main's polling, ROCm/ATOM#3369). Plain Python: no GPU, no FlyDSL."""
+# Copyright (c) 2026 ATOM Project Contributors
+"""ATOM_MONO_POLL_SLEEP_UNITS: the gfx950 Mono mailbox retry spacing (4 unless
+set, 16 beside a KV transfer or offload connector; 1 is main's polling,
+ROCm/ATOM#3369). Plain Python: no GPU, no FlyDSL."""
 
 import json
 import logging
@@ -11,11 +13,12 @@ import sys
 
 import pytest
 
+from atom.config import _resolve_mono_poll_sleep_units
 from atom.mono import polling
 
 
 @pytest.mark.parametrize(
-    "raw, units", [(None, 16), ("", 16), (" ", 16), ("1", 1), ("8", 8), ("127", 127)]
+    "raw, units", [(None, 4), ("", 4), (" ", 4), ("1", 1), ("16", 16), ("127", 127)]
 )
 def test_units(raw, units):
     assert polling._units(raw) == units
@@ -57,18 +60,18 @@ def _constants(value):
     return json.loads(out.strip().splitlines()[-1])
 
 
-def test_the_default_is_16_and_1_is_main():
-    unset, sixteen, one, eight = (_constants(v) for v in (None, "16", "1", "8"))
-    assert unset == sixteen
-    assert unset[:3] == [16, "s_sleep 16", False]
+def test_the_default_is_4_and_1_is_main():
+    unset, four, one, sixteen = (_constants(v) for v in (None, "4", "1", "16"))
+    assert unset == four
+    assert unset[:3] == [4, "s_sleep 4", False]
     # main: s_sleep 1 in sync / step_begin, s_nop 0 in spin_pause and helpers.poll
     assert one[:3] == [1, "s_nop 0", True]
-    assert eight[:3] == [8, "s_sleep 8", False]
+    assert sixteen[:3] == [16, "s_sleep 16", False]
     # every digest that hashes polling.py tells the values apart ...
     for i in (3, 4):
-        assert len({unset[i], one[i], eight[i]}) == 3
+        assert len({unset[i], one[i], sixteen[i]}) == 3
     # ... and one that does not is left alone
-    assert unset[5] == one[5] == eight[5]
+    assert unset[5] == one[5] == sixteen[5]
 
 
 def test_a_bad_value_fails_the_import():
@@ -76,14 +79,28 @@ def test_a_bad_value_fails_the_import():
     assert code != 0 and f"{polling.ENV}='128'" in err
 
 
-@pytest.mark.parametrize(
-    "units, warns", [(1, True), (15, True), (16, False), (32, False)]
-)
-def test_config_warns_below_the_default(units, warns, monkeypatch, caplog):
-    from atom.config import _check_mono_poll_sleep_units
+@pytest.mark.parametrize("kv_copies, units", [(False, None), (True, "16")])
+def test_config_defaults_beside_kv_copies(kv_copies, units, monkeypatch):
 
+    # set first: teardown then restores the original state, removing what the
+    # resolver writes (a bare delenv of an unset name records nothing)
+    monkeypatch.setenv(polling.ENV, "4")
+    monkeypatch.delenv(polling.ENV)
+    _resolve_mono_poll_sleep_units(kv_copies)
+    assert os.environ.get(polling.ENV) == units
+
+
+@pytest.mark.parametrize(
+    "kv_copies, units, warns",
+    [(True, 1, True), (True, 15, True), (True, 16, False), (True, 32, False),
+     (False, 1, False)],
+)  # fmt: skip
+def test_config_warns_below_copy_safe(kv_copies, units, warns, monkeypatch, caplog):
+
+    monkeypatch.setenv(polling.ENV, str(units))
     monkeypatch.setattr(polling, "POLL_SLEEP_UNITS", units)
     with caplog.at_level(logging.WARNING, logger="atom"):
-        _check_mono_poll_sleep_units()
+        _resolve_mono_poll_sleep_units(kv_copies)
     hits = [r for r in caplog.records if polling.ENV in r.getMessage()]
     assert len(hits) == (1 if warns else 0)
+    assert os.environ[polling.ENV] == str(units)

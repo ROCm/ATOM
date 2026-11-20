@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2024-2025 ATOM Project Contributors
 
 import enum
 import fnmatch
@@ -2226,22 +2227,30 @@ def _hf_architecture_factor(hf_config) -> tuple:
     return (_hf_config_fields(hf_config), _hf_config_fields(text_config))
 
 
-def _check_mono_poll_sleep_units() -> None:
-    """Reject a bad ATOM_MONO_POLL_SLEEP_UNITS (importing ``atom.mono.polling``
-    raises) before the workers, which read the same environment, spawn; warn
-    once when it is below the default."""
+def _resolve_mono_poll_sleep_units(kv_copies: bool) -> None:
+    """The Mono mailbox retry spacing of this deployment, fixed before the
+    workers (which read the same environment) spawn: ``polling.COPY_SAFE``
+    where a KV transfer or offload connector copies beside the Mono kernels
+    (``kv_copies``) and ATOM_MONO_POLL_SLEEP_UNITS is unset, else as set or
+    ``polling.DEFAULT``. A bad value is rejected (importing
+    ``atom.mono.polling`` raises); one below ``COPY_SAFE`` beside such copies
+    is warned about once."""
     from atom.mono import polling
 
-    if polling.POLL_SLEEP_UNITS < polling.DEFAULT:
+    if not kv_copies:
+        return
+    if not os.environ.get(polling.ENV, "").strip():
+        os.environ[polling.ENV] = str(polling.COPY_SAFE)
+        return
+    if polling.POLL_SLEEP_UNITS < polling.COPY_SAFE:
         logger.warning(
-            "%s=%d: Mono mailbox polls back off less than the default %d. "
-            "Values below %d hung beside concurrent KV copies (offload or P/D "
-            "connectors) in the reproducer (ROCm/ATOM#3369); use it only on a "
-            "deployment without them.",
+            "%s=%d beside a KV transfer or offload connector: Mono mailbox "
+            "polls back off less than %d, and values below %d hung beside "
+            "concurrent KV copies in the reproducer (ROCm/ATOM#3369).",
             polling.ENV,
             polling.POLL_SLEEP_UNITS,
-            polling.DEFAULT,
-            polling.DEFAULT,
+            polling.COPY_SAFE,
+            polling.COPY_SAFE,
         )
 
 
@@ -2804,7 +2813,6 @@ class Config:
             raise ValueError("sequence_parallel_size must be at least 1")
         if envs.ATOM_DSV41_A8W4_ATTN not in ("auto", "off"):
             raise ValueError("ATOM_DSV41_A8W4_ATTN must be auto or off")
-        _check_mono_poll_sleep_units()
         self.moe_all2all_backend = (
             str(self.moe_all2all_backend or "auto").strip().lower()
         )
@@ -2977,6 +2985,9 @@ class Config:
             # Refuse a composite the engine cannot run now, not when a worker
             # builds it after the weights are loaded.
             validate_multi_config(self.kv_transfer_config)
+        # after the CLI's JSON string ("{}" when unset) is parsed: the string
+        # itself is truthy
+        _resolve_mono_poll_sleep_units(bool(self.kv_transfer_config))
         if self.sequence_parallel_size > 1:
             self._init_sequence_parallel()
         # transformers 5+ exposes rope_parameters; <5 often only rope_scaling + rope_theta.

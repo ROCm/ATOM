@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Single-Pass mHC math; incoming pre-mix belongs to the previous sublayer."""
 
 from dataclasses import dataclass
@@ -82,6 +84,14 @@ def collapse_streams(residual, pre_mix):
     return out
 
 
+def initial_pre_mix(rows_shape, hc_mult: int, device) -> torch.Tensor:
+    """The embedding's pre gates, ``rows_shape + (hc_mult,)`` fp32: 1 on the
+    first stream, 0 on the others."""
+    pre_mix = torch.zeros((*rows_shape, hc_mult), dtype=torch.float32, device=device)
+    pre_mix[..., 0] = 1
+    return pre_mix
+
+
 @dataclass(frozen=True)
 class SinglePassHCState:
     """The residual between two sublayers, and the post step one of them owes.
@@ -100,16 +110,17 @@ class SinglePassHCState:
     combination: torch.Tensor | None = None
 
     @classmethod
-    def from_embeddings(cls, hidden: torch.Tensor, hc_mult: int):
+    def from_embeddings(cls, hidden: torch.Tensor, hc_mult: int, pre_mix=None):
+        """Every stream the embedding, the first stream's pre gate 1.
+        ``pre_mix``: those gates already in place (``initial_pre_mix``), read
+        only by the first layer: no fill a step."""
         residual = (
             hidden.unsqueeze(-2)
             .expand(*hidden.shape[:-1], hc_mult, hidden.shape[-1])
             .contiguous()
         )
-        pre_mix = torch.zeros(
-            (*hidden.shape[:-1], hc_mult), dtype=torch.float32, device=hidden.device
-        )
-        pre_mix[..., 0] = 1
+        if pre_mix is None:
+            pre_mix = initial_pre_mix(hidden.shape[:-1], hc_mult, hidden.device)
         return cls(residual, pre_mix)
 
     def settle(self):

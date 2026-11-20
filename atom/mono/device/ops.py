@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Device-side primitives of the mono kernels: wave reductions and shuffles, the
 approximate hardware math, bf16 / fp8 packing, buffer resources, the
 execution-model constants and the kernel symbol naming.
@@ -100,6 +101,11 @@ def readlane(v, src_lane):
     return r.bitcast(fx.Float32) if isinstance(v, fx.Float32) else r
 
 
+def readlane64(v, src_lane):
+    """Lane ``src_lane``'s 64-bit value of v (wave-uniform)."""
+    return fx.Int64(rocdl.readlane(T.i64, fx.Int64(v), fx.Int32(src_lane)))
+
+
 def memrealtime():
     """s_memrealtime: the 100 MHz device clock (no FlyDSL wrapper)."""
     return fx.Int64(llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.memrealtime", [], [], []))
@@ -159,6 +165,25 @@ def hw_exp2(x):
 def hw_log2(x):
     """v_log_f32 (no libm denormal fixup: the caller keeps x normal)."""
     return _hw_f32("llvm.amdgcn.log.f32", x)
+
+
+def rms_rstd(total, n: int, eps: float):
+    """aiter's RMSNorm rstd (``rmsnorm2d_fwd``'s HIP kernel, built with
+    -ffast-math) of a row whose squares sum to ``total`` over ``n`` columns:
+    the mean as ``total`` times the reciprocal of ``n`` (its v_rcp_f32 of a
+    runtime ``n``, the correctly rounded 1/n at the widths a mono norm takes,
+    512 and 5120), ``eps`` added in f64, then v_rsq_f32."""
+    mean = fx.Float32(total) * fx.Float32(1.0 / n)
+    return hw_rsq(fx.Float32(fx.Float64(mean) + fx.Float64(eps)))
+
+
+LOG2E = 1.4426950408889634
+
+
+def exp_f32(x):
+    """``tl.exp``: exp2(x log2(e)) through ``llvm.exp2.f32``, its denormal
+    range kept (``hw_exp2`` is the bare v_exp_f32)."""
+    return _hw_f32("llvm.exp2.f32", fx.Float32(x) * fx.Float32(LOG2E))
 
 
 def div_rn(x, d, r):
@@ -326,6 +351,17 @@ def _xpartner(v, off, lane):
         return xshfl(v, off)
     a, b = permlane_swap(off, v, v)
     return ((lane & off) != 0).select(a, b)
+
+
+def wave_prefix_dpp(v):
+    """Inclusive prefix sum of an Int32 over the wave's 64 lanes in lane order:
+    DPP row shifts within 16-lane rows, then the row broadcasts 15 and 31 (gfx9;
+    six DPP adds, no exchange and select a step as ``wave_incl_scan``)."""
+    v = fx.Int32(v)
+    for n in (1, 2, 4, 8):
+        v = v + fx.Int32(update_dpp_i32(fx.Int32(0), v, 0x110 + n, 0xF, 0xF, False))
+    v = v + fx.Int32(update_dpp_i32(fx.Int32(0), v, 0x142, 0xA, 0xF, False))
+    return v + fx.Int32(update_dpp_i32(fx.Int32(0), v, 0x143, 0xC, 0xF, False))
 
 
 def wave_incl_scan(v, lane, lanes=64):

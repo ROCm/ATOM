@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """The tagged mailbox: hand-offs between the CTAs of one GPU (device scope) and
 between GPUs (system scope), every address a named region (``Addr``) recorded
 when the kernel is traced (``atom.mono.plan``)."""
@@ -14,7 +15,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from atom.mono.device.ops import CM_DEV, CM_SYS, bf16_pair, memrealtime, rsrc, traced
-from atom.mono.plan.layout import DIAG_WORDS
+from atom.mono.plan.layout import DIAG_WORDS, NUMA_RUN, dual_word
 from atom.mono.plan.trace import Space, note
 from atom.mono.polling import POLL_SLEEP_UNITS
 
@@ -90,11 +91,20 @@ class Addr:
     region: str
     space: Space
     value: object
+    # a dual region's (``dreg``): the word offset of the copy this CTA reads
+    copy: object = None
 
 
 def sreg(base, offset, region):
     """Scratch region ``region`` at byte ``offset`` of ``base``."""
     return Addr(region, Space.SCRATCH, base + fx.Int64(offset))
+
+
+def dreg(base, offset, region, copy):
+    """Scratch region ``region`` kept in two copies (``plan.layout.dual_layout``)
+    at byte ``offset`` of ``base``: a put writes both, a poll reads the one at
+    word offset ``copy`` (``device.numa.local_copy``)."""
+    return Addr(region, Space.SCRATCH, base + fx.Int64(offset), copy)
 
 
 def preg(base, offset, region):
@@ -104,11 +114,20 @@ def preg(base, offset, region):
 
 def shift(a, delta):
     """``a`` moved by ``delta`` bytes (a traced or Python integer), same region."""
+    assert (
+        a.copy is None
+    ), f"{a.region}: a dual region's copies are laid out from its start"
     return Addr(a.region, a.space, a.value + delta)
 
 
 # the store / load cache policy of a hand-off in each space
 _SCOPE_CM = {Space.SCRATCH: CM_DEV, Space.PEER: CM_SYS}
+
+
+def _pair_word(a, i):
+    """Pair i's first word in the copy of region ``a`` this CTA reads."""
+    w = fx.Int32(i) * 2
+    return w if a.copy is None else dual_word(w) + a.copy
 
 
 def _noted(a, kind):
@@ -135,26 +154,27 @@ class Mailbox:
         self.diag = diag
         self.region_ids = region_ids or {}
 
+    def _store(self, a, w, vec):
+        """``vec`` at word ``w`` of region ``a``: a dual region's both copies,
+        each a 16-byte-aligned store inside one run."""
+        r, cm = rsrc(_noted(a, "put")), _SCOPE_CM[a.space]
+        if const_expr(a.copy is None):
+            bo.buffer_store(vec, r, w, cache_modifier=cm)
+        else:
+            at = dual_word(w)
+            bo.buffer_store(vec, r, at, cache_modifier=cm)
+            bo.buffer_store(vec, r, at + NUMA_RUN // 4, cache_modifier=cm)
+
     def put(self, a, i, v):
         bits = v.bitcast(fx.Int32) if isinstance(v, fx.Float32) else fx.Int32(v)
-        bo.buffer_store(
-            fx.Vector.from_elements([bits, self.tag], fx.Int32),
-            rsrc(_noted(a, "put")),
-            i * 2,
-            cache_modifier=_SCOPE_CM[a.space],
-        )
+        self._store(a, i * 2, fx.Vector.from_elements([bits, self.tag], fx.Int32))
 
     def put_bf(self, a, i, vs):
         """Elements i .. i+len(vs) (2 or 4, i aligned) as packed bf16 pairs, one store."""
         words = []
         for j in range_constexpr(len(vs) // 2):
             words += [bf16_pair(vs[2 * j], vs[2 * j + 1]).bitcast(fx.Int32), self.tag]
-        bo.buffer_store(
-            fx.Vector.from_elements(words, fx.Int32),
-            rsrc(_noted(a, "put")),
-            i,
-            cache_modifier=_SCOPE_CM[a.space],
-        )
+        self._store(a, i, fx.Vector.from_elements(words, fx.Int32))
 
     def put_words(self, a, i, words):
         """Raw 32-bit words (1 or 2) at pairs i.. as (word, tag). Integer payloads
@@ -163,12 +183,7 @@ class Mailbox:
         vals = []
         for w in words:
             vals += [fx.Int32(w), self.tag]
-        bo.buffer_store(
-            fx.Vector.from_elements(vals, fx.Int32),
-            rsrc(_noted(a, "put")),
-            i * 2,
-            cache_modifier=_SCOPE_CM[a.space],
-        )
+        self._store(a, i * 2, fx.Vector.from_elements(vals, fx.Int32))
 
     def spin(self, a, index, load_all, pending):
         """Re-issue ``load_all`` until ``pending`` clears: a wait in region
@@ -196,11 +211,11 @@ class Mailbox:
 
         def load_all():
             words = []
-            for b, cm, (_, i, n) in zip(bases, cms, specs):
+            for b, cm, (a, i, n) in zip(bases, cms, specs):
                 w = fx.Vector(
                     bo.buffer_load(
                         rsrc(b),
-                        fx.Int32(i) * 2,
+                        _pair_word(a, i),
                         vec_width=2 * n,
                         dtype=T.i32,
                         cache_modifier=cm,

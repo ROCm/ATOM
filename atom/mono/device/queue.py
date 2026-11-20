@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """A launch's work queues: an i32 count a queue, zeroed at the step's start,
 that CTAs take the next task from by an atomic add -- a CTA its earlier work
 delayed takes fewer, where a fixed placement gave every CTA the same count.
@@ -37,7 +38,10 @@ def take(queue):
 @traced
 def take_shared(queue, slot, tid):
     """``take`` for the whole CTA: thread 0 takes, every thread reads it from
-    LDS ``slot`` past a barrier."""
+    LDS ``slot`` past a barrier. A barrier first: every thread has read the
+    slot's previous take (two takes in a row would let thread 0 overwrite it
+    under a slow reader)."""
+    gpu.barrier()
     if tid == 0:
         fx.ptr_store(fx.Int32(take(queue)), slot)
     gpu.barrier()

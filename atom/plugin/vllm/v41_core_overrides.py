@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """ATOM's four V4.1 classes, as this frontend needs them.
 
 The metadata builder, the CSA2 cache, attention and the Engram staging each
@@ -35,9 +37,7 @@ from atom.model_ops.attentions.deepseek_v41.packed_attention import (
     packed_decode,
     packed_prefill,
 )
-from atom.model_ops.engram.device.hashing import engram_snapshot_indices
 from atom.model_ops.engram.device.staging import EngramStaging
-from atom.model_ops.engram.device.uva import uva_gather_into
 from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src
 from atom.utils.region_graph import join_stream
 
@@ -809,7 +809,7 @@ class VllmEngramStaging(EngramStaging):
         if not getattr(self, "_vllm_prefetch_joined", False):
             self._await_layer(self.done[layer])
         if host._tp_group is not None and self.collective is None:
-            out = self.flat[layer][:width]
+            out = self._rows(width)[host.layer_ids.index(layer)]
             out = host._tp_group.all_gather(out, use_custom=True, dim=1)
             out = out[:, : host.embed_width]
             host.buffers[layer].gpu[:width].copy_(out)
@@ -834,32 +834,7 @@ def _prefetch(self, width):
     # neither order the inputs nor join the graph capture.
     self.stream.wait_stream(compute)
     with torch.cuda.stream(self.stream):
-        for layer in host.layer_ids:
-            ids = engram_snapshot_indices(
-                self.uva.hash_tables,
-                layer,
-                self.snapshot[:width],
-                self.uva.row_ids[:width],
-            )
-            table = host.prefetcher._tables[layer]
-            uva_gather_into(
-                table,
-                ids,
-                self.flat[layer][:width].view(width, host.local_heads, table.head_dim),
-                head_start=host.head_start,
-                local_heads=host.local_heads,
-                total_heads=host.total_heads,
-            )
-            if self.collective is not None:
-                out = self.gathered[layer][:width]
-                self.collective.all_gather_unreg(
-                    self.flat[layer][:width], out=out, dim=1
-                )
-                if self.gathered[layer] is not host.buffers[layer].gpu:
-                    host.buffers[layer].gpu[:width].copy_(out[:, : host.embed_width])
-            elif host._tp_group is None:
-                host.buffers[layer].gpu[:width].copy_(self.flat[layer][:width])
-            self.done[layer].record(self.stream)
+        self._lookup(width)
 
 
 def _await_layer(self, event) -> None:

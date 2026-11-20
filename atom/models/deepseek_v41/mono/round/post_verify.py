@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """A served verify step's verdict and Engram cursor commit inside the target graph (the V4.1 mono hi hook,
 ``ATOM_DSV41_MONO_HI``): the forward's head output.
 
@@ -39,6 +40,7 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.model_ops.verdict import verdict_row
 from atom.models.deepseek_v41.mono.hi_bridge import REQ_LIVE
 
 logger = logging.getLogger("atom")
@@ -61,38 +63,11 @@ def _post_verify_kernel(
     seed = seed_base + tl.load(step_ptr).to(tl.int64)
     if b == 0:
         tl.store(used_seed_ptr, seed)
-    if b == 0:
-        start = 0
-    else:
-        start = tl.load(cu_ptr + b - 1)
-    n = tl.load(cu_ptr + b) - start
-    p = tl.arange(0, SP)
-    live = p < n
-    vrow = tl.load(target_idx_ptr + start + p, mask=live, other=0)
-    target = tl.load(head_ids_ptr + vrow, mask=live, other=0).to(tl.int32)
-    draft = tl.load(input_ids_ptr + vrow + 1, mask=live, other=0).to(tl.int32)
-    if SYNTHETIC:
-        u = tl.rand(seed, start + p)
-        ok = u < tl.load(cond_rates_ptr + p, mask=live, other=0.0)
-        kept = draft  # a forced accept emits the draft
-    else:
-        ok = draft == target
-        kept = target
-    # the first rejected row, n if none
-    k = tl.min(tl.where(live & (ok == 0), p, n), axis=0)
-    rejected = k < n
-    brow = tl.load(bonus_idx_ptr + b)
-    bonus = tl.load(head_ids_ptr + brow).to(tl.int32)
-    INVALID: tl.constexpr = -1
-    row = tl.where(p < n, tl.where(p < k, kept, tl.where(p == k, target, INVALID)),
-                   tl.where((p == n) & (rejected == 0), bonus, INVALID))  # fmt: skip
-    tl.store(out_ptr + b * (num_spec_steps + 1) + p, row, mask=p < num_spec_steps + 1)
-    accepted = tl.where(rejected, k, n)
-    anchor = brow - n + accepted
-    nreq = tl.num_programs(0)
-    tl.store(verdict_ptr + b, accepted)
-    tl.store(verdict_ptr + nreq + b, num_spec_steps - accepted)
-    tl.store(verdict_ptr + 2 * nreq + b, anchor)
+    anchor = verdict_row(
+        out_ptr, verdict_ptr, cu_ptr, input_ids_ptr, target_idx_ptr, bonus_idx_ptr,
+        head_ids_ptr, cond_rates_ptr, seed, b, tl.num_programs(0), num_spec_steps,
+        SP=SP, SYNTHETIC=SYNTHETIC,
+    )  # fmt: skip
     cols = tl.arange(0, BLOCK)
     keep = cols < WIDTH
     prefix = anchor - tl.load(starts_ptr + b)

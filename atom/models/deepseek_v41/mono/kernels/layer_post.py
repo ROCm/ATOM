@@ -1,14 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """K2 ``layer_post``: K2a (``attn_post``) and K2b (``moe``) of one layer in one
 launch -- the attention output to the MoE's reduced output.
 
 K2b's stages follow K2a's on every CTA. A K2a launch ended at its norm and K2b
 started over from x (``ffn_normed``); here the norm's CTAs publish each token's
 row instead (device-scope stores, the load counter drained, then the token's
-flag in XRDY), and xq and the router wait for it and read it at device scope:
-the buffer is every layer's, so a plain load could hit this XCD's L2 copy of
-the previous layer's.
+flag in XRDY), and xq waits for it and reads it at device scope: the buffer
+is every layer's, so a plain load could hit this XCD's L2 copy of the
+previous layer's. Where its tasks fit past the seam's CTAs
+(``RouteShape.router_reads_seam``) the router does not wait for the norm: it
+normalizes its own K part from the seam's LIN (``seam_dot_norm``).
 
 A token-parallel launch (``tok_par``) has each rank's norm publish its own
 tokens' rows here and push them to every other rank's XG (peer buffer); a
@@ -46,6 +49,7 @@ from atom.models.deepseek_v41.mono.kernels.attn_post import (
     run_attn_post,
     run_gates,
 )
+from atom.models.deepseek_v41.mono.kernels.attn_pre import shard_seam
 from atom.models.deepseek_v41.mono.kernels.debug import mailbox
 from atom.models.deepseek_v41.mono.kernels.dims import Dims
 from atom.models.deepseek_v41.mono.kernels.index_score import await_candidates
@@ -110,6 +114,21 @@ class LayerPostBuild:
     moe_tp: int = 1
     # the pool's rows are MXFP8 (``AttnPostBuild.kv_fp8``)
     kv_fp8: bool = False
+    # the regions kept in two copies (``AttnPostBuild.numa``), K2a's and K2b's
+    numa: str = ""
+    numa_word: int = 0
+    # the residual column-sharded (``attn_pre.shard_seam``): seam F folds this
+    # rank's columns, the MoE output reduce-scattered to its column owners
+    shard: bool = False
+    # the attention's keys include a selection (``AttnPostBuild.attn_sel``)
+    attn_sel: bool = True
+    # a request's rows one block each row sees whole (``AttnPostBuild.block_rows``)
+    block_rows: int = 0
+
+    def __post_init__(self):
+        assert not (
+            self.shard and (self.tok_par or self.dp_ranks > 1)
+        ), "a seam is sharded by columns or rows"
 
     @property
     def dp_ranks(self) -> int:
@@ -133,6 +152,10 @@ class LayerPostBuild:
             diag_off=self.diag_off,
             tok_par=self.tok_par,
             kv_fp8=self.kv_fp8,
+            numa=self.numa,
+            numa_word=self.numa_word,
+            attn_sel=self.attn_sel,
+            block_rows=self.block_rows,
         )
         moe_diag = self.diag_off - moe_base(key_a) if self.diag_off >= 0 else -1
         key_b = MoeBuild(
@@ -145,6 +168,10 @@ class LayerPostBuild:
             ug_groups=self.ug_groups,
             ep=self.ep,
             dp_attention=self.moe_tp > 1,
+            numa=self.numa,
+            numa_word=self.numa_word,
+            after_seam=not self.tok_par and self.moe_tp == 1,
+            own_routes=self.tok_par,
         )
         return key_a, key_b
 
@@ -186,6 +213,17 @@ def publish_x(ca, cb, t):
     """Token t's ``normed`` row, written at device scope by this CTA's norm, is
     readable by every CTA: the stores drained, then its flag."""
     publish(cb["put"], cb["xrdy"], t, 1, ca["tid"] == 0)
+
+
+def seam_dot_norm(ca) -> dict:
+    """What K2b's router normalizes its own K part from (``router_x_normed``):
+    K2a's seam LIN and LSSQ, polled at K2a's tag, and the FFN norm weight."""
+    return {
+        "poll": ca["poll"],
+        "lin": ca["lin"],
+        "lssq": ca["lssq"],
+        "w": ca["args"]["attn_w"],
+    }
 
 
 # a row's bf16 pairs two at a time: a 16-byte store of (word, tag) x 2
@@ -274,7 +312,7 @@ def build_layer_post(key: LayerPostBuild):
     name = kernel_symbol(
         "v41_layer_post", s=s, e=rs.experts, k=rs.topk, tl=int(timeline),
         ix=int(key.index_bound_max > 0), i4=int(key.index_fp4),
-        im=int(key.index_mfma), tpar=int(key.tok_par),
+        im=int(key.index_mfma), tpar=int(key.tok_par), sh=int(key.shard),
         **({"ep": key.ep} if key.ep > 1 else {}),
         **({"mtp": key.moe_tp} if key.moe_tp > 1 else {}),
     )  # fmt: skip
@@ -339,9 +377,12 @@ def build_layer_post(key: LayerPostBuild):
         cb = moe_context(
             sm, rs, lds_b, mailbox(moe_layer, scratch, key.diag_off, layout),
             bases, layout_b, scratch,
-            args_b, rank, sym,
+            args_b, rank, sym, key_b.numa, key_b.numa_word,
         )  # fmt: skip
         cb["x_cm"], cb["x_ready"] = CM_DEV, True
+        if const_expr(key.shard):
+            shard_seam(ca, ca["peer"], bases, sym, key.tp, "pmixgf")
+            cb["shard_f"] = True
         if const_expr(dpa):
             # one peer layout for both halves: the launch's MoE rows
             ca["peer"] = cb["peer"]
@@ -354,6 +395,8 @@ def build_layer_post(key: LayerPostBuild):
             after_norm = lambda t: publish_x_tok_par(ca, cb, t)
         else:
             after_norm = lambda t: publish_x(ca, cb, t)
+        if const_expr(rs.router_reads_seam):
+            cb["dot_norm"] = seam_dot_norm(ca)
         tls = stamps.tls.ptr
         stamp_begin(timeline, tls, tid, TL_POINTS)
         # the FFN gate, the next layer's, after the stages the MoE waits on

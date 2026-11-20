@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """A rank's share of V4.1's widths: every constant a kernel derives from the
 deployment, in one place (a build key's ``tp`` and ``ep`` pick it).
 
@@ -17,8 +18,30 @@ from atom.mono.plan.shard import Shard, Tiles, cdiv, padded
 HIDDEN = 5120
 HC = 4  # hyper-connection streams
 Q_RANK, KV_DIM = 1280, 512  # the q latent, the window row
-# a KV row in an FP8 pool (``kv_fp8``): E4M3 values, then an E8M0 scale a 32
+# a KV row in an FP8 pool (``kv_fp8``): its E4M3 values in the data plane, its
+# E8M0 scales (one a 32 columns) in the scale plane
 KV_FP8_ROW_BYTES = KV_DIM + KV_DIM // 32
+
+
+# ``kvrow``'s row kinds a step row: its window row, then (a compressing layer)
+# the compressed entry it completes
+KVROW_KINDS = 2
+
+
+def kvrow_bytes(rows: int, kv_fp8: bool) -> int:
+    """The layer kernel's ``kvrow`` for a step of ``rows`` rows, laid out as the
+    pool's planes: row j < rows the step's window row j, row rows + j the
+    compressed entry step row j completes (a compressing layer); BF16 rows,
+    or an FP8 pool's E4M3 rows and then, from ``kvrow_scale0``, their scale
+    rows."""
+    return KVROW_KINDS * rows * (KV_FP8_ROW_BYTES if kv_fp8 else 2 * KV_DIM)
+
+
+def kvrow_scale0(rows: int) -> int:
+    """An FP8 ``kvrow``'s scale plane (``kvrow_bytes``): its byte offset."""
+    return KVROW_KINDS * rows * KV_DIM
+
+
 Q_HEADS = 64  # attention query heads
 O_GROUPS = 8  # wo_a groups
 O_RANK = 1024  # wo_a output rows a group

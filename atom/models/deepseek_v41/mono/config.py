@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """The deployments V4.1 mono serves, and why any other is refused."""
 
 from atom.models.deepseek_v41.mono import index_plan as ip
@@ -25,9 +26,9 @@ MAX_ROWS = 48
 MAX_MOE_ROWS = 96
 # the DSpark draft's blocks a pass at most
 MAX_REQUESTS = 8
-# a token's keys at most: the original decode's 64 splits of one 16-key tile
-# each, which the mono attention reproduces split by split
-ATTENTION_KEYS_MAX = 64 * 16
+# a token's keys at most: the window and the selection (128 + 512), every key's
+# value slice in a merge task's LDS at once (``kernels.attention``)
+ATTENTION_KEYS_MAX = 640
 # (top-k, candidate blocks, rows a block, index heads, index head dim)
 INDEXER_SHAPE = (ip.TOPK, ip.TOPK_BLOCKS, ip.BLOCK_ROWS, ip.HEADS, ip.DIM)
 

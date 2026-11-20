@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Unit tests for the engram host path.
 
 The load-bearing test is `test_head_vocab_sizes_match_checkpoint`: the derived
@@ -2088,7 +2091,7 @@ def test_a_shared_read_only_mapping_is_read_by_the_uva_kernel(
 
     pytest.importorskip("triton")
     from atom.model_ops.engram import host_memory
-    from atom.model_ops.engram.device.uva import uva_gather_into
+    from atom.model_ops.engram.device.uva import UvaGather
 
     monkeypatch.setattr(host_memory, "_host_allocator", _REAL_HOST_ALLOCATOR)
     monkeypatch.setenv("ATOM_ENGRAM_UVA_COPY", copy)
@@ -2104,12 +2107,20 @@ def test_a_shared_read_only_mapping_is_read_by_the_uva_kernel(
     assert table.enable_uva(shared=True) is True
     in_place = table.registered_shard()[0].data_ptr() == tensor.data_ptr()
     assert in_place == (copy == "0")
-    ids = torch.tensor([[0], [rows - 1], [77]], device="cuda")
-    out = torch.empty(3, 1, width, dtype=torch.bfloat16, device="cuda")
-    uva_gather_into(table, ids, out, head_start=0, local_heads=1, total_heads=1)
+    # a second table, other rows: one launch reads each layer from its own
+    second = torch.randn(rows, width).to(torch.bfloat16)
+    other = HostEmbeddingTable(second.clone(), rows, width)
+    assert other.enable_uva(shared=True) is True
+    ids = torch.tensor([[[0], [rows - 1], [77]], [[5], [77], [0]]], device="cuda")
+    out = torch.empty(2, 3, 1, width, dtype=torch.bfloat16, device="cuda")
+    gather = UvaGather([table, other], torch.device("cuda"))
+    gather(ids, out, head_start=0, local_heads=1, total_heads=1)
     torch.cuda.synchronize()
-    assert torch.equal(out.cpu(), expected[[0, rows - 1, 77]].view(3, 1, width))
+    assert torch.equal(out[0].cpu(), expected[[0, rows - 1, 77]].view(3, 1, width))
+    assert torch.equal(out[1].cpu(), second[[5, 77, 0]].view(3, 1, width))
+    del gather
     table.disable_uva()
+    other.disable_uva()
 
 
 def _dp_runtime(monkeypatch, dp_world_size):
