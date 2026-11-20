@@ -11,7 +11,6 @@ from dataclasses import dataclass
 import numpy as np
 
 from atom.distributed.dcp_layout import dcp_global_pos
-from atom.kv_transfer.disaggregation.gather import MAX_SEGMENTS
 
 
 def coalesce_contiguous(
@@ -258,28 +257,11 @@ def kv_heads_of_rank(rank: int, tp: int, total_heads: int) -> tuple[int, int]:
     raise ValueError(f"{total_heads} KV heads do not shard over TP {tp}")
 
 
-def head_run_widths(
-    runs: tuple[int, ...], unit_bytes: int, label: str
-) -> tuple[int, ...]:
-    """Bytes one head takes in each run of `runs`: `(runs, heads)` splits the unit
-    evenly, `(runs, heads, w_0, ..., w_runs-1)` names each run's width."""
-    count, heads = runs[0], runs[1]
-    if len(runs) == 2:
-        width = unit_bytes // (count * heads) if count > 0 and heads > 0 else 0
-        return (width,) * count
-    if len(runs) != 2 + count or count > MAX_SEGMENTS:
-        raise ValueError(
-            f"{label}: head runs {runs} must name one width per run, for at most "
-            f"{MAX_SEGMENTS} runs (one PAGE gather segment each)"
-        )
-    return tuple(runs[2:])
-
-
 def consumer_head_slices(
     src_bytes: int,
     dst_bytes: int,
-    src_runs: tuple[int, ...] | None,
-    dst_runs: tuple[int, ...] | None,
+    src_runs: tuple[int, tuple[int, ...]] | None,
+    dst_runs: tuple[int, tuple[int, ...]] | None,
     rank: int,
     tp: int,
     label: str,
@@ -293,21 +275,19 @@ def consumer_head_slices(
                 f"{dst_runs} of {dst_bytes} B on consumer rank {rank}/{tp}"
             )
         return np.array([[0, 0, src_bytes]], dtype=np.int64)
-    (runs, heads), (dst_run_count, dst_heads) = src_runs[:2], dst_runs[:2]
+    (heads, widths), (dst_heads, dst_widths) = src_runs, dst_runs
     first, count = kv_heads_of_rank(rank, tp, heads)
-    widths = head_run_widths(src_runs, src_bytes, label)
-    dst_widths = head_run_widths(dst_runs, dst_bytes, label)
     if (
         not widths
         or min(widths) <= 0
-        or (runs, count) != (dst_run_count, dst_heads)
-        or widths != dst_widths
+        or (count, widths) != (dst_heads, dst_widths)
         or src_bytes != heads * sum(widths)
         or dst_bytes != count * sum(widths)
     ):
         raise ValueError(
-            f"{label}: {src_runs} heads in {src_bytes} B here do not cut "
-            f"into {dst_runs} in {dst_bytes} B on consumer rank {rank}/{tp}"
+            f"{label}: {heads} heads of runs {widths} B in {src_bytes} B here do "
+            f"not cut into {dst_heads} of runs {dst_widths} B in {dst_bytes} B on "
+            f"consumer rank {rank}/{tp}"
         )
     w = np.asarray(widths, dtype=np.int64)
     before = np.cumsum(w) - w

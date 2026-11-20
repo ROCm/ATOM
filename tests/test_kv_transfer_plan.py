@@ -98,7 +98,9 @@ def test_tp_rank_owns_its_heads_of_each_page(rank, heads):
     ids = [3, 0, 2]
     destination = torch.zeros(5, 8, 1, 4, dtype=torch.uint8)
     dst_ids = [4, 1, 3]
-    cuts = consumer_head_slices(32 * heads, 32, (8, heads), (8, 1), rank, 4, "page")
+    cuts = consumer_head_slices(
+        32 * heads, 32, (heads, (4,) * 8), (1, (4,) * 8), rank, 4, "page"
+    )
     gather = GatherLayout.from_slices(32 * heads, 32, cuts)
     plan = page_transfer_plan(
         [PlannedRegion(0, 7, destination.data_ptr(), gather)], ids, dst_ids
@@ -126,7 +128,7 @@ def test_named_run_widths_gather_into_one_target_page(rank):
     destination = torch.zeros(5, 24, dtype=torch.uint8)
     dst_ids = [4, 1, 3]
     cuts = consumer_head_slices(
-        24 * heads, 24, (4, heads, *widths), (4, 1, *widths), rank, 4, "page"
+        24 * heads, 24, (heads, widths), (1, widths), rank, 4, "page"
     )
     gather = GatherLayout.from_slices(24 * heads, 24, cuts)
     assert len(gather.segments) == 4
@@ -156,10 +158,14 @@ def test_gather_kernels_match_the_host_reference(widths, rank):
     # A TP1 page of four heads cut for each TP4 rank, as equal runs or named widths.
     heads = 4
     if widths is None:
-        src_runs, dst_runs, src_bytes = (8, heads), (8, 1), 8 * heads * 128
+        src_runs, dst_runs, src_bytes = (
+            (heads, (128,) * 8),
+            (1, (128,) * 8),
+            8 * heads * 128,
+        )
     else:
-        src_runs = (len(widths), heads, *widths)
-        dst_runs, src_bytes = (len(widths), 1, *widths), heads * sum(widths)
+        src_runs, dst_runs = (heads, widths), (1, widths)
+        src_bytes = heads * sum(widths)
     cuts = consumer_head_slices(
         src_bytes, src_bytes // heads, src_runs, dst_runs, rank, 4, "page"
     )
