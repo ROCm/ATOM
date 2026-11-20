@@ -3,7 +3,7 @@
 How to reproduce the numbers below: the exact code, the settings, the run, and how each number is computed.
 They are 10-minute measurement points, not official results (see [What these numbers are](#what-these-numbers-are)).
 
-## 2026-11-19: decode folds, early spec-decode metadata, fp4pt V from c64
+## 2026-11-19: decode folds, early spec-decode metadata, fp4pt V from c64, dense graph sizes at c256 / c384
 
 `agentic_20261119.env` on top of `agentic_20261101.env` and `agentic_20261107.env`. Code: `alizaidy/gfx1250-qwen-support`
 with ROCm/ATOM#3537 and #3606 and ROCm/aiter#8248, #8249, #8250, #8330 (post-norm fold) and #8331 (unified-attention
@@ -18,6 +18,18 @@ Per concurrency (decode interval and extras as in the 11-17 image's `points.tsv`
 | 32 | `fp8_k4v8` | 24 | `ATOM_PREFILL_DELAYER_STALL_TICKS=1 ATOM_GDN_PREFILL_IN_GRAPH=1` | |
 | 64 | `fp8_k4v4pt` | 8 | same | `ATOM_FOLD_QKNORM_QKV_FP4PT=1 ATOM_FOLD_QKNORM_QKV_MAX_M=48 AITER_GFX12_TOKEN_SPLIT_MIN_TILES_FP4PT=8 AITER_GFX12_TOKEN_SPLIT_PROGRAMS=512` |
 | 128 | `fp8_k4v4pt` | 8 | same | same |
+| 256 | `fp8_k4v4pt` | 8 | `ATOM_GDN_PREFILL_IN_GRAPH=1` | same, plus `CAPS` below |
+| 384 | `fp8_k4v4pt` | 8 | same | same, plus `CAPS` below |
+
+CUDA-graph capture sizes at c256 / c384 (`serve_ep.sh` reads `CAPS`; the list must end at the point's max_num_seqs,
+80 at c256 and 120 at c384, which `run_ep.sh` sets from the concurrency). The default list jumps 16, 24, 32, 40, 48, so
+the c256 / c384 batches (bs 13-26 / 26-42 a rank) pad up to 7 sequences a step; this list pads at most 1 below 32 and 3
+below 64:
+
+```
+c256: CAPS=[1,2,3,4,5,6,7,8,10,12,14,16,18,20,22,24,26,28,30,32,36,40,44,48,52,56,60,64,80]
+c384: CAPS=[1,2,3,4,5,6,7,8,10,12,14,16,18,20,22,24,26,28,30,32,36,40,44,48,52,56,60,64,80,96,112,120]
+```
 
 `BLOCK_SIZE=128` everywhere. c32 stays on k4v8: fp4pt was 1.4% slower there (MTP acceptance 73.2-73.6% vs 74.0%,
 prefill ~5% slower, and no bandwidth win at bs 1-2).
@@ -27,6 +39,13 @@ prefill ~5% slower, and no bandwidth win at bs 1-2).
 | 32 | 1078.2 | 1175.7 | 1222.1 (mean of 1244.5 / 1199.7) | +13.3% | 0.5614 / 0.5558 / 0.5550 / 0.5640 |
 | 64 | 957.6 | 1034.0 | 1095.4 (mean of 1098.0 / 1091.1 / 1097.0) | +14.4% | 0.5676 / 0.5593 / 0.5612 |
 | 128 | 711.4 | 776.1 | 798.5 | +12.2% | 0.5627 / 0.5646 |
+
+c256 and c384 (stock here = the image's set plus `AITER_UA_FP4PT_NO_SPECIALIZE=1`):
+
+| concurrency | stock e2e | stock tok/s | + this date's flags | + dense `CAPS` (final) | final tok/s | final vs stock | final accuracy |
+|---|---:|---:|---:|---:|---:|---:|---|
+| 256 | 479.4 | 39,935 | 501.3 | 522.3 | 41,442 | +9.0% e2e, +3.8% tok/s | 0.5608 |
+| 384 | 361.0 | 53,056 | not run | 386.9 | 54,860 | +7.2% e2e, +3.4% tok/s | 0.5619 |
 
 Notes:
 - At c64 each step stacks: the 11-18 PRs +8.0%, the post-norm fold + early metadata +3.4%, the fp4pt split +2.7%.
@@ -39,6 +58,10 @@ Notes:
 - Without `AITER_UA_FP4PT_NO_SPECIALIZE=1`, any change in the KV pool size (a new server, other flags, another rank)
   recompiles the unified-attention prefill kernels on first use: ~7 s stalls, TTFT p99.9 7-9 s, 15-20% lower e2e.
   On a brand-new Triton cache the first server still compiles each kernel configuration once: warm up first.
+- c256 / c384: a rank runs bs 13-26 / 26-42 (52-168 verify rows), past the 48-row limit of the router and qkv folds;
+  the flags still cut bs 17-40 steps by 290-470 us through the parts with no row limit. Prefill is ~24% of rank time
+  at c256, and the ~18-step cadence (interval 8 + the delayer's 10-step hold) is at its optimum there.
+  `ATOM_EARLY_PREFILL_SCHEDULE=1` (+0.7%) and `ATOM_API_STREAM_FAST=1` (+0.8%) were within noise at c256 and are off.
 - The post-norm fold applies up to 16 verify rows (bs 4); at c128 most passes have 20-48 rows, so the 11-19 flags
   add only +0.3% to +2.9% there.
 
