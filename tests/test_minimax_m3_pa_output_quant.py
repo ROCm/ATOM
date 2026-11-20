@@ -3,8 +3,10 @@
 
 """CPU contracts for MiniMax-M3 sparse PA -> prequantized o_proj."""
 
+import importlib
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from atom.model_ops import base_attention
@@ -59,6 +61,7 @@ def _sparse_layer(*, fused: bool, o_proj_per_token_fp8: bool = True):
         index_q_size=2,
         idx_head_dim=2,
         sparse_pa_output_quant_supported=fused,
+        sparse_pa_mxfp8_out=False,
     )
 
 
@@ -342,3 +345,109 @@ def test_fp8_prefill_rows_stay_direct(monkeypatch):
     captured = _decode_rows(monkeypatch, 128)
     assert captured["plan_partition_cap"] == 1
     assert captured["plan_workgroup_budget"] is None
+
+
+# --- ATOM_MINIMAX_M3_PA_MXFP8_OUT: the NVFP4 attention writes o_proj's MXFP8 input
+
+
+class _MxAttention(_QuantAttention):
+    def __init__(self, kv_nvfp4: bool):
+        super().__init__()
+        self.impl = SimpleNamespace(kv_nvfp4=kv_nvfp4)
+        self.quant_kwargs = []
+
+    def forward_quantized(self, q, k, v, positions, qkv=None, mxfp8=False):
+        self.quant_kwargs.append({"mxfp8": mxfp8})
+        return super().forward_quantized(q, k, v, positions, qkv)
+
+
+def _mx_layer(*, enabled=True, kv_nvfp4=True, native_a8=1):
+    layer = _sparse_layer(fused=False)
+    layer.attn = _MxAttention(kv_nvfp4)
+    layer.o_proj.native_a8_group_rows = native_a8
+    layer.sparse_pa_mxfp8_out = enabled
+    return layer
+
+
+def test_mxfp8_out_hands_the_attention_fp8_and_scales_to_o_proj():
+    layer = _mx_layer()
+    MiniMaxM3SparseAttention.forward(layer, torch.arange(3), torch.randn(3, 12))
+    assert layer.attn.quant_kwargs == [{"mxfp8": True}]
+    assert not layer.attn.plain_calls
+    values, scale = layer.o_proj.calls[0]
+    assert values.dtype == torch.uint8 and scale is not None
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"enabled": False}, {"kv_nvfp4": False}, {"native_a8": None}],
+    ids=["flag-off", "fp8-kv", "o_proj-not-native-a8"],
+)
+def test_mxfp8_out_keeps_the_bf16_path_otherwise(kwargs):
+    layer = _mx_layer(**kwargs)
+    MiniMaxM3SparseAttention.forward(layer, torch.arange(3), torch.randn(3, 12))
+    assert not layer.attn.quant_kwargs
+    assert len(layer.attn.plain_calls) == 1
+    assert layer.o_proj.calls[0][1] is None
+
+
+def _nvfp4_flydsl_call(monkeypatch, rows, bucket, scale_dtype, direct):
+    from atom.model_ops.minimax_m3 import sparse_attn_nvfp4
+
+    captured = {}
+    monkeypatch.setattr(
+        importlib.import_module("aiter.ops.flydsl.pa_decode"),
+        "pa_decode",
+        lambda *a, **kw: captured.update(kw, args=a),
+    )
+    monkeypatch.setattr(
+        "aiter.ops.triton.gluon.pa_decode_gluon.get_recommended_splits",
+        lambda *_: 3,
+    )
+    monkeypatch.setattr(
+        base_attention,
+        "_flydsl_prepare_explicit_plan",
+        lambda **kw: captured.setdefault("plan", kw),
+    )
+    monkeypatch.setattr(
+        base_attention, "_flydsl_plan_scratch", lambda *a, **kw: (None, None, None)
+    )
+    monkeypatch.setattr(sparse_attn, "_cluster_resident_rows", lambda _: 240)
+    q = torch.randn(rows, 16, 128, dtype=torch.bfloat16)
+    pages = 4
+    payload = torch.zeros(pages, 1, 128, 64, dtype=torch.uint8)
+    scales = torch.zeros(pages, 1, 128, 8, dtype=torch.uint8)
+    width = 16 * 128 // 32 if scale_dtype == torch.float8_e8m0fnu else 1
+    sparse_attn_nvfp4._flydsl_attention(
+        q, payload, scales, payload, scales,
+        torch.zeros(rows, 1, dtype=torch.int32), torch.ones(rows, dtype=torch.int32),
+        128**-0.5, None, None,
+        quantized_output=torch.empty(bucket, 16 * 128, dtype=torch.uint8),
+        output_scale=torch.empty(bucket, width, dtype=scale_dtype),
+        quantized_direct=direct,
+    )  # fmt: skip
+    return captured
+
+
+@pytest.mark.parametrize("direct", [True, False], ids=["prefill", "decode"])
+def test_mxfp8_out_keeps_the_bf16_split(monkeypatch, direct):
+    """The MXFP8 output takes any output mode, so the attention keeps the BF16
+    call's plan (and hence its BF16 values, which the split path quantized); the
+    per-token output re-splits (direct prefill, cluster-of-8 decode)."""
+    mx = _nvfp4_flydsl_call(monkeypatch, 64, 70, torch.float8_e8m0fnu, direct)
+    assert mx["plan"]["plan_partition_cap"] == 3
+    assert mx["plan"]["plan_workgroup_budget"] is None
+    assert mx["store_output"] is False
+    assert mx["quantized_pad_rows"] == 6
+    assert mx["output_scale"].shape == (70, 64)
+    token = _nvfp4_flydsl_call(monkeypatch, 64, 70, torch.float32, direct)
+    assert token["plan"]["plan_partition_cap"] == (1 if direct else 8)
+
+
+def test_fill_unit_scale_writes_e8m0_one_and_fp32_one():
+    e8m0 = torch.zeros(2, 4, dtype=torch.uint8).view(torch.float8_e8m0fnu)
+    base_attention.fill_unit_scale(e8m0)
+    assert (e8m0.view(torch.uint8) == 127).all()
+    fp32 = torch.zeros(2, 1)
+    base_attention.fill_unit_scale(fp32)
+    assert (fp32 == 1).all()

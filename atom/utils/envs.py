@@ -664,6 +664,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_MINIMAX_M3_MOE_QUANT_SHARED": lambda: _flag_env(
         "ATOM_MINIMAX_M3_MOE_QUANT_SHARED"
     ),
+    # MiniMax-M3 NVFP4 sparse layers on gfx1250 with a native MXFP8 o_proj: the
+    # paged attention writes o_proj's MXFP8 input (E4M3 + E8M0 per 32) instead
+    # of its BF16 output, which o_proj then quantized itself. Opt-in for A/B.
+    "ATOM_MINIMAX_M3_PA_MXFP8_OUT": lambda: _flag_env("ATOM_MINIMAX_M3_PA_MXFP8_OUT"),
     # Token-bucket TR graphs for prefill (`atom/utils/region_graph.py`): the
     # comma-separated token counts to record. A prefill longer than the largest
     # runs eagerly; empty records none. The default tops out at 3072 because

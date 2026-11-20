@@ -288,8 +288,10 @@ class PagedAttentionImpl(nn.Module):
             # Release qkv's unreduced split-K partials: nothing reads this output.
             claim_qkv_splitk_partials(qkv)
             if quantized_output is not None:
+                from atom.model_ops.base_attention import fill_unit_scale
+
                 quantized_output.zero_()
-                output_scale.fill_(1.0)
+                fill_unit_scale(output_scale)
                 return quantized_output
             o = torch.empty_like(q) if output is None else output
             return o

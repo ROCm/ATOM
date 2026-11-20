@@ -1176,6 +1176,15 @@ def unified_attention_with_output_base(
     )
 
 
+def fill_unit_scale(scale: torch.Tensor) -> None:
+    """Fill a quantized output's scales with 1.0: FP32 per-token descales, or
+    E8M0 MXFP8 scales (byte 127)."""
+    if scale.dtype == torch.float8_e8m0fnu:
+        scale.view(torch.uint8).fill_(127)
+    else:
+        scale.fill_(1.0)
+
+
 def unified_attention_with_output_quant_base_fake(
     q: torch.Tensor,
     q_scale: torch.Tensor | None,
@@ -1258,7 +1267,7 @@ def unified_attention_with_output_quant_base(
     )
     if rows is not None and not pad_in_attention:
         quantized_output[rows:].zero_()
-        output_scale[rows:].fill_(1.0)
+        fill_unit_scale(output_scale[rows:])
 
 
 def linear_attention_with_output_base_fake(

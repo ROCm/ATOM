@@ -162,12 +162,14 @@ def _flydsl_attention(
     """aiter's FlyDSL paged decode over the NVFP4 cache, one length-1 sequence a
     (row, kv head), planned and scratch-cached like the FP8 sparse path's.
 
-    ``quantized_output`` / ``output_scale``: o_proj's per-token FP8 input and
-    descales, written by the attention's epilogue instead of the BF16 output
-    (one kv head a rank; rows past q's are a padded token bucket's, written
-    inert), split as ``sparse_attn.sparse_pa_per_row`` splits the FP8 path's:
-    prefill rows (``quantized_direct``) one task a row, decode rows a cluster
-    of eight."""
+    ``quantized_output`` / ``output_scale``: o_proj's FP8 input, written by the
+    attention's epilogue instead of the BF16 output (one kv head a rank; rows
+    past q's are a padded token bucket's, written inert). FP32 ``[rows, 1]``
+    per-token descales are split as ``sparse_attn.sparse_pa_per_row`` splits the
+    FP8 path's: prefill rows (``quantized_direct``) one task a row, decode rows
+    a cluster of eight. E8M0 ``[rows, heads * D // 32]`` MXFP8 scales keep the
+    BF16 output's split: aiter writes them in every output mode, bit for bit the
+    BF16 output quantized as o_proj's ``quantize_fp8`` would."""
     from aiter.ops.flydsl.pa_decode import pa_decode
     from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 
@@ -197,8 +199,10 @@ def _flydsl_attention(
         }
     if seqs == 0:
         if quantized_output is not None:
+            from atom.model_ops.base_attention import fill_unit_scale
+
             quantized_output.zero_()
-            output_scale.fill_(1.0)
+            fill_unit_scale(output_scale)
         return output
     # (row, kv head) -> sequence, as the FP8 path collapses them; zero-copy
     # (.view raises rather than copy, which would break the page encoding).
@@ -213,7 +217,7 @@ def _flydsl_attention(
     # The FP8 sparse path's split: a bounded top-k window per row.
     partitions = get_recommended_splits(seqs, 1)
     workgroup_budget = None
-    if quantized_output is not None:
+    if quantized_output is not None and output_scale.dtype == torch.float32:
         # The FP8 epilogue is in the one-task (direct) and cluster-of-8 output
         # modes; any other mode the plan picks quantizes after the BF16 output
         # inside aiter (`sparse_pa_per_row` explains the choice).

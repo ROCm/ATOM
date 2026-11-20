@@ -174,13 +174,18 @@ class Attention(BaseAttention):
         positions: torch.Tensor = None,
         q_scale: torch.Tensor | None = None,
         qkv: torch.Tensor = None,
+        mxfp8: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return OCP-FP8 attention rows and FP32 ``[tokens, 1]`` descales."""
+        """Return OCP-FP8 attention rows and FP32 ``[tokens, 1]`` descales, or
+        with ``mxfp8`` E8M0 scales ``[tokens, heads * head_dim // 32]`` (one per
+        32 consecutive values, row-major: a native MXFP8 GEMM's activation)."""
         if self.use_mla or not getattr(self.impl, "supports_output_quant", False):
             raise RuntimeError("this attention implementation cannot quantize output")
         quantized_output = torch.empty_like(query, dtype=dtypes.fp8)
         output_scale = torch.empty(
-            (query.shape[0], 1), dtype=torch.float32, device=query.device
+            (query.shape[0], query.shape[-1] // 32 if mxfp8 else 1),
+            dtype=torch.float8_e8m0fnu if mxfp8 else torch.float32,
+            device=query.device,
         )
         torch.ops.aiter.unified_attention_with_output_quant_base(
             query,

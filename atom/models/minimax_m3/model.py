@@ -48,6 +48,9 @@ from atom.model_ops.linear import (
 from atom.model_ops.minimax_m3.sparse_attn import (
     SPARSE_BLOCK_SIZE,
 )
+from atom.model_ops.minimax_m3.sparse_attn_nvfp4 import (
+    reads_page_table as nvfp4_reads_page_table,
+)
 from atom.model_ops.moe import FusedMoE, Mxfp4MoEMethod
 from atom.model_ops.swiglu_oai import (
     swiglu_oai_mxfp8_supported,
@@ -136,6 +139,15 @@ def _linear_consumes_per_token_fp8(linear: nn.Module) -> bool:
         quant_type_value == QuantType.per_Token.value
         and getattr(linear, "params_dtype", None) == dtypes.fp8
     )
+
+
+def _sparse_pa_writes_mxfp8(attn: nn.Module, o_proj: nn.Module) -> bool:
+    """Whether the sparse attention writes o_proj's MXFP8 input: its K/V are
+    NVFP4, which gfx1250 attends through aiter's paged decode (the caller checks
+    the arch), and o_proj is a native group-32 A8 GEMM, whose own input quant
+    (``quantize_fp8``) it replaces bit for bit. ``kv_nvfp4`` is bound with the
+    KV cache, after construction, so forward checks it."""
+    return attn.impl.kv_nvfp4 and o_proj.native_a8_group_rows is not None
 
 
 def _rope_cache_claims_splitk_partials(attn: nn.Module) -> bool:
@@ -701,6 +713,11 @@ class MiniMaxM3SparseAttention(nn.Module):
             and callable(getattr(self.attn, "forward_quantized", None))
             and _flydsl_output_quant_api()
         )
+        # Opt-in: the NVFP4 sparse attention writes o_proj's MXFP8 input. Only
+        # gfx1250's NVFP4 attention (aiter's paged decode) has that output.
+        self.sparse_pa_mxfp8_out = (
+            envs.ATOM_MINIMAX_M3_PA_MXFP8_OUT and nvfp4_reads_page_table()
+        )
 
     def forward(
         self,
@@ -721,6 +738,11 @@ class MiniMaxM3SparseAttention(nn.Module):
             ],
             dim=-1,
         )
+        if self.sparse_pa_mxfp8_out and _sparse_pa_writes_mxfp8(self.attn, self.o_proj):
+            attn_output, attn_scale = self.attn.forward_quantized(
+                q, k, v, positions, qkv=qkv, mxfp8=True
+            )
+            return self.o_proj(attn_output, x_scale=attn_scale)
         if self.sparse_pa_output_quant_supported and _linear_consumes_per_token_fp8(
             self.o_proj
         ):
