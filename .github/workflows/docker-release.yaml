@@ -270,7 +270,14 @@ jobs:
           } >> "${GITHUB_ENV}"
 
       - name: Build Docker image
-        timeout-minutes: 180
+        # 180 was sized for the ROCm 7 line, which started from a ready-made
+        # rocm/pytorch image. The ROCm 10 line assembles the SDK from wheels
+        # (~4 GB) and builds AITER from source for both arches, which alone ran
+        # 114 min locally; an uncached build timed out at 180. Only the first
+        # build pays it: every version is pinned now, so the rocm10-base and
+        # build_aiter layers are cache-stable and a daily run re-does just the
+        # atom_image stage, which is what CACHEBUST invalidates.
+        timeout-minutes: 300
         run: |
           ATOM_COMMIT="${{ inputs.atom_commit || env.ATOM_COMMIT }}"
           if [ "${ATOM_COMMIT}" = "HEAD" ]; then
