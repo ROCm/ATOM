@@ -113,7 +113,8 @@ def project_query_fp4(query, rope, positions, hidden, weights_proj_weight):
     weights projected inside the quant launch, folding the per-layer
     `weights_proj` GEMM into it. `query` is [rows, heads, dim], `hidden` [rows,
     hidden], `weights_proj_weight` [heads, hidden]. `(values, scales)` match
-    `quantize_query`'s NATURAL FP4 branch; `weights` [rows, heads] is the raw
+    `quantize_query_fp4`'s NATURAL output, which rounds the rotated values to
+    the query dtype (`round_rope=True`); `weights` [rows, heads] is the raw
     bf16 projection `Indexer.project` returns, which `score_quantized` then
     folds `weights_scale` into (so no scale is applied here).
 
