@@ -160,9 +160,11 @@ def _flydsl_prefill_metadata(
     if not impls:
         return None
     policy = impls[0].gdn_flydsl_policy
-    # Metadata is sometimes built before the KV bind on this step. Native gates
-    # on `_flydsl_prefill_enabled`; if policy is still unset, still try — the
-    # helper returns None when the backend is Triton or without HIP (ROCm).
+    # `build` binds the policy first (`_build_kv_cache_tensors` ->
+    # `_ensure_flydsl_policy`); None means no bind ran (e.g. a direct
+    # `_build_gdn_metadata` call). Native gates on `_flydsl_prefill_enabled`;
+    # with no policy, still try — the helper returns None when the backend is
+    # Triton or without HIP (ROCm).
     if policy is not None and not policy.prefill:
         return None
     num_seqs = int(query_start_loc.shape[0]) - 1
