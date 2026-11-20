@@ -47,6 +47,11 @@ HEAD_GATE_MMA, HEAD_GATE_SYNC = 104, 105
 # passed, the scores staged, the output stores issued.
 MIX_SUMMED, MIX_DRAINED, MIX_PASSED, MIX_SCORED = 106, 107, 108, 109
 MIX_NORM_DRAINED, MIX_NORM_PASSED, MIX_STORED = 110, 111, 112
+# The MLA front (``mla_front_gfx1250``): a norm wave's row landed whole, its
+# rstd, its stores issued; inside ``gemv_tdm.project_split`` (whose slabs
+# stamp B), the K loop done and the cluster exchange's barrier passed.
+NORM_POLLED, NORM_REDUCED, NORM_STORED = 113, 114, 115
+SPLIT_LOOPED, SPLIT_EXCHANGED = 116, 117
 POINTS = {
     "hw_id": HW_ID,
     "entry": ENTRY,
@@ -75,6 +80,11 @@ POINTS = {
     "mix_norm_drained": MIX_NORM_DRAINED,
     "mix_norm_passed": MIX_NORM_PASSED,
     "mix_stored": MIX_STORED,
+    "norm_polled": NORM_POLLED,
+    "norm_reduced": NORM_REDUCED,
+    "norm_stored": NORM_STORED,
+    "split_looped": SPLIT_LOOPED,
+    "split_exchanged": SPLIT_EXCHANGED,
 }
 
 _config: tuple[int, int] | None = None

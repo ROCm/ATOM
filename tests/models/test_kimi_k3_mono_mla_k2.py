@@ -302,11 +302,14 @@ def test_forward_pre_o_is_forward_without_o_proj():
     core = torch.ones(2, 4)
     seen = {}
 
-    def gated_core(positions, hidden, quantize=True):
+    def gated_core(positions, hidden, quantize=True, front=None):
         seen["quantize"] = quantize
+        seen["front"] = front
         return core, None
 
     fake = SimpleNamespace(_gated_core=gated_core)
     assert KimiFullAttention.forward_pre_o(fake, None, None) is core
     # the bf16 core even under an FP8 o_proj: the mono K2 quantizes it, if at all
     assert seen["quantize"] is False
+    # the attention's own projections unless the mono MLA front hands them in
+    assert seen["front"] is None

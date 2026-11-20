@@ -632,6 +632,105 @@ def bind_external_moe(
     )
 
 
+@dataclass(frozen=True)
+class MlaFrontLayer:
+    """What the gfx1250 MLA front (``mla_front_gfx1250``) reads for one
+    full-attention layer: fused_qkv_a_proj and this rank's g_proj rows in
+    ``_block_fp8``'s layout, the q_a / kv_a norm weights. ``q_dtype``: the
+    FP8 q_b_proj's activation quant writes (the front quantizes q for it), or
+    None (it hands q_b_proj BF16 q, which quantizes it itself)."""
+
+    layer_id: int
+    w_a: torch.Tensor
+    s_a: torch.Tensor
+    w_g: torch.Tensor
+    s_g: torch.Tensor
+    q_norm: torch.Tensor
+    kv_norm: torch.Tensor
+    q_eps: float
+    kv_eps: float
+    q_dtype: torch.dtype | None
+
+    @property
+    def gate_rows(self) -> int:
+        return self.w_g.size(0)
+
+    @property
+    def key(self) -> tuple[int, float, float]:
+        """What its build bakes in."""
+        return self.gate_rows, self.q_eps, self.kv_eps
+
+
+def _q_b_activation_quant(q_b_proj) -> torch.dtype | None:
+    """The FP8 dtype ``LinearBase.forward`` quantizes q_b_proj's input to with
+    ``per_1x128_e8m0_quant`` in its transposed (preshuffle GEMM) layout, the
+    one the front writes; None for any other activation path."""
+    from aiter import QuantType, dtypes
+
+    from atom.utils import envs
+
+    takes = (
+        getattr(q_b_proj, "native_a8_group_rows", None) is None
+        and q_b_proj.quant_type.value == QuantType.per_1x128.value
+        and q_b_proj.params_dtype == dtypes.fp8
+        and bool(getattr(q_b_proj, "blockscale_e8m0_scale", False))
+        and envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
+    )
+    return q_b_proj.params_dtype if takes else None
+
+
+def bind_mla_front(layer, layer_id: int, dims: Dims) -> MlaFrontLayer:
+    """One full-attention layer's MLA front tensors, read in place. Refused
+    where the production path would compute anything else from the same
+    input: a DSA layer (its indexer reads the projections), an input or q
+    norm that folds a quant, projection widths or layouts other than the
+    front's."""
+    from atom.models.kimi_k3.mono.kernels.stages import mla_front_layout as lay
+
+    attn = layer.self_attn
+    name = f"layer {layer_id}"
+    _need(not getattr(layer, "is_linear_attn", True), f"{name}: not full attention")
+    _need(getattr(attn, "indexer", None) is None, f"{name}: a DSA indexer layer")
+    _need(
+        list(getattr(attn, "projection_split_sizes", ()))
+        == [lay.Q_LORA, lay.KV_LORA, lay.ROPE],
+        f"{name}: projection widths {getattr(attn, 'projection_split_sizes', None)}",
+    )
+    _need(
+        not getattr(attn, "fuse_qknorm_quant", True),
+        f"{name}: the q norm folds q_b_proj's quant",
+    )
+    _need(
+        layer.self_attention_attn_res.out_quant_dtype is None,
+        f"{name}: the input norm folds a quant; the front reads the BF16 row",
+    )
+    gate_rows = attn.num_heads * attn.v_head_dim // dims.tp
+    for module, what in (
+        (attn.fused_qkv_a_proj, "fused_qkv_a_proj"),
+        (attn.g_proj, "g_proj"),
+    ):
+        _need(getattr(module, "bias", None) is None, f"{name} {what} has a bias")
+    w_a, s_a = _block_fp8(
+        attn.fused_qkv_a_proj, f"{name} fused_qkv_a_proj", (lay.QKV_A_ROWS, HIDDEN)
+    )
+    w_g, s_g = _block_fp8(attn.g_proj, f"{name} g_proj", (gate_rows, HIDDEN))
+    _need(gate_rows % lay.GROUP_ROWS == 0, f"{name}: {gate_rows} gate rows")
+    return MlaFrontLayer(
+        layer_id=layer_id,
+        w_a=w_a,
+        s_a=s_a,
+        w_g=w_g,
+        s_g=s_g,
+        q_norm=_vec(attn.q_a_layernorm.weight, lay.Q_LORA, f"{name} q_a_layernorm"),
+        kv_norm=_vec(
+            attn.kv_a_layernorm.weight, lay.KV_LORA, f"{name} kv_a_layernorm"
+        ),
+        q_eps=_eps(attn.q_a_layernorm, f"{name} q_a_layernorm"),
+        kv_eps=_eps(attn.kv_a_layernorm, f"{name} kv_a_layernorm"),
+        q_dtype=_q_b_activation_quant(attn.q_b_proj),
+    )
+
+
 def bind_fp8_o_proj(layer, layer_id: int, dims: Dims):
     """A KDA layer's o_proj as gfx1250's in-kernel o_proj reads it:
     ``(weight, scale)``, ``_block_fp8``'s per_1x128 FP8 layout."""

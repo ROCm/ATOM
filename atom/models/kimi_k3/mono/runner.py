@@ -615,7 +615,7 @@ class K3MonoDecodeRunner:
         self._write_aux(plan.layer_id, out, blocks)
         return out
 
-    def _pre_o_core(self, plan, positions, prefix, blocks, add, add2):
+    def _pre_o_core(self, plan, positions, prefix, blocks, add, add2, project=None):
         """A full-attention layer that runs K2: the production
         attention up to ``o_proj``'s input, to be handed to K2 in place of K1's.
 
@@ -623,9 +623,16 @@ class K3MonoDecodeRunner:
         the same candidates K2's MLP seam does and nothing is banked here. The
         seam's ``prefix`` is a fresh tensor (the previous layer always hands an
         FFN output, so it takes the ``add`` branch), which K2 updates in place
-        exactly as it does on a KDA layer."""
+        exactly as it does on a KDA layer.
+
+        ``project``: the normed row -> the attention's projected inputs
+        (``KimiFullAttention._gated_core``'s ``front``), in place of its own
+        projections."""
         layer, normed, prefix, _, _ = self._seam(plan, prefix, blocks, add, add2)
-        core = layer.self_attn.forward_pre_o(positions, normed)
+        if project is None:
+            core = layer.self_attn.forward_pre_o(positions, normed)
+        else:
+            core = layer.self_attn.forward_pre_o(positions, normed, project(normed))
         rows = prefix.size(0)
         if (
             core.dim() != 2

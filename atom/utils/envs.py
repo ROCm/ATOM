@@ -818,6 +818,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KIMI_MONO_TAIL_EARLY_GATHER": lambda: (
         os.getenv("ATOM_KIMI_MONO_TAIL_EARLY_GATHER", "0") == "1"
     ),
+    # 1: Kimi-K3 gfx1250 mono runs a full-attention layer's projections of its
+    # normed input -- fused_qkv_a_proj, the q_a / kv_a RMSNorms, q_b_proj's
+    # activation quant and g_proj -- as one resident launch
+    # (mla_front_gfx1250: BF16 activations, the GEMVs' f32 sums in another
+    # order, the norms and the quant AITER's bits) before the production
+    # attention. 0, the default, keeps the production projections.
+    "ATOM_KIMI_MONO_MLA_FRONT": lambda: (
+        os.getenv("ATOM_KIMI_MONO_MLA_FRONT", "0") == "1"
+    ),
     # The K2 tail's remote pushes on waves of their own, so the store drain
     # before its flag waits for no fabric ack (k2_tail_gfx1250, the same
     # bits); 0 keeps every wave pushing and reducing its own line.

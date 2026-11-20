@@ -170,6 +170,20 @@ def opaque_pointer(value):
     )
 
 
+def _pinned(value):
+    """A wave-uniform i32 through an asm copy with side effects: its load
+    completes before any later barrier or wait, wherever its uses are."""
+    return fx.Int32(
+        llvm.inline_asm(
+            T.i32,
+            [as_ir_value(fx.Int32(value))],
+            "s_mov_b32 $0, $1",
+            "=s,s",
+            has_side_effects=True,
+        )
+    )
+
+
 def apply_preload(launch) -> None:
     """``ATOM_KIMI_MONO_TDM_COLD=preload``: ``launch``'s kernel arguments
     preloaded into SGPRs at dispatch (as many as fit), so the first copies
@@ -1208,6 +1222,7 @@ def project_split(
         if const_expr(not resident):
             _split_weight_wait(role, s, slabs, stages)
         gpu.barrier()
+        tdm_timeline.slab(s, tdm_timeline.B)
         stage = weights + (s % stages) * (tasks * task_words)
         block = rank * (2 * slabs) + 2 * s + wave // 4
         if const_expr(fmt == "fp8"):
@@ -1271,10 +1286,166 @@ def project_split(
                 group_count,
                 lambda slab: issue_weight(slab, group_row, group),
             )
+    _split_exchange(
+        lds, accs, tasks, tiles, rows, rank, owners, tid, lane, wave, scratch, out, cta0
+    )
 
+
+@traced
+def project_split_resident_fp8(
+    lds,
+    x,
+    x_stride,
+    rows,
+    w,
+    k,
+    group_row,
+    lane,
+    wave,
+    scratch,
+    out,
+    w_scale,
+    x_cache_policy=0,
+    cta0=0,
+):
+    """``project_split`` of one FP8 group, ``resident``, with its copies a
+    slab a wave and its slab loop unrolled: wave ``s`` copies slab ``s``'s
+    weights, then its tokens, and reads its E8M0 byte of every slab with
+    scalar loads behind them (landed before any wait); slab ``s`` is
+    multiplied once wave ``s``'s copies land, a barrier a slab. The same
+    WMMAs in the same order and the same exchange (``_split_exchange``; owners
+    polling their peers' sums at SE scope instead of the drain and cluster
+    barrier was slower): the sums are ``project_split``'s, bit for bit.
+    ``out`` as there (the CTA owns task ``rank`` of the group)."""
+    if cta0 % TDM_CLUSTER:
+        raise ValueError(f"split-K CTAs start a cluster, not at {cta0}")
+    slabs = tdm_split_slabs(k)
+    if slabs > WAVES:
+        raise ValueError(f"a slab a wave: {slabs} slabs, {WAVES} waves")
+    tasks = TDM_SPLIT_GROUP
+    tiles = (rows + ROWS - 1) // ROWS
+    token_words = rows * TDM_SPLIT_ROW_STRIDE // 2
+    task_words = tdm_split_task_words("fp8")
+    weights = lds + slabs * token_words
+    rank = _uniform(rocdl.cluster_workgroup_id_x())
+    column0 = rank * (slabs * SPLIT_SLAB)
+    role = _uniform(wave)
+    tid = wave * GFX1250.wave_size + lane
+    row = _uniform(group_row)
+
+    def issue(slab):
+        load_rows(
+            w
+            + fx.Int64(row) * fx.Int64(k)
+            + fx.Int64(rank * slabs + slab) * fx.Int64(SPLIT_SLAB * ROWS),
+            ROWS * k // 2,
+            weights + slab * tasks * task_words,
+            TDM_SPLIT_GROUP,
+            TDM_SPLIT_GROUP,
+            padded=False,
+            cache_policy=_WEIGHT_CACHE_POLICY,
+            whole=True,
+            uniform=True,
+            width=SPLIT_SLAB * ROWS // 2,
+        )
+        load_rows(
+            x + fx.Int64(column0 + slab * SPLIT_SLAB) * fx.Int64(2),
+            x_stride,
+            lds + slab * token_words,
+            rows,
+            rows,
+            cache_policy=x_cache_policy,
+            whole=True,
+            width=SPLIT_SLAB,
+            slab=SPLIT_SLAB,
+        )
+
+    for slab in range_constexpr(slabs):
+        _on_wave(role, slab, lambda slab=slab: issue(slab))
+    scale_row = row // 128 * (k // 512)
+    words = []
+    for s in range_constexpr(slabs):
+        block = rank * (2 * slabs) + 2 * s + role // 4
+        words.append(
+            fx.Int32(
+                bo.buffer_load(
+                    rsrc(w_scale),
+                    scale_row + block // 4,
+                    vec_width=1,
+                    dtype=T.i32,
+                    is_scalar=True,
+                )
+            )
+        )
+    # Landed here, behind the copies: LLVM would sink each load to its slab,
+    # past the barrier, one memory round trip a slab.
+    exponents = [
+        (_pinned(word) >> ((rank * (2 * slabs) + 2 * s + role // 4) % 4 * 8)) & 0xFF
+        for s, word in enumerate(words)
+    ]
+    accs = [
+        fx.Vector.filled(ACCUMULATOR_ELEMENTS, 0.0, fx.Float32)
+        for _ in range(tasks * tiles)
+    ]
+    for s in range_constexpr(slabs):
+        # slab s's copies are wave s's two, so the slabs multiply as they
+        # land rather than past the last one
+        _on_wave(role, s, lambda: rocdl.s_wait_tensorcnt(0))
+        tdm_timeline.slab(s, tdm_timeline.WEIGHT, s)
+        gpu.barrier()
+        tdm_timeline.slab(s, tdm_timeline.B)
+        stage = weights + s * tasks * task_words
+        slab_weights = [
+            _fp8_operand(stage + t * task_words, wave, lane, exponents[s], 1)[0]
+            for t in range(tasks)
+        ]
+        slab_tokens = lds + s * token_words
+        activations = [
+            _operand(
+                slab_tokens,
+                tl * ROWS + fx.min(lane % ROWS, min(ROWS, rows - tl * ROWS) - 1),
+                wave,
+                lane,
+                TDM_SPLIT_ROW_STRIDE,
+                SPLIT_WAVE_COLUMNS,
+            )[0]
+            for tl in range(tiles)
+        ]
+        accs = [
+            mma_bf16(slab_weights[t], activations[tl], accs[t * tiles + tl], GFX1250)
+            for t in range(tasks)
+            for tl in range(tiles)
+        ]
+    _split_exchange(
+        lds,
+        accs,
+        tasks,
+        tiles,
+        rows,
+        rank,
+        [lambda r: r],
+        tid,
+        lane,
+        wave,
+        scratch,
+        out,
+        cta0,
+    )
+
+
+@traced
+def _split_exchange(
+    lds, accs, tasks, tiles, rows, rank, owners, tid, lane, wave, scratch, out, cta0
+):
+    """``project_split``'s reduction past its slab loop: every wave's
+    accumulators summed in wave order, the tasks other CTAs own sent to
+    ``scratch`` at SE scope, one cluster barrier, then each owned task's
+    partials summed in CTA order into ``out``."""
+    group_count = len(owners)
     # Every wave's accumulators over the slab buffers, then a lane of a wave
     # sums one task's tile over the waves.
     gpu.barrier()
+    tdm_timeline.stamp(tdm_timeline.SPLIT_LOOPED)
     for t in range_constexpr(tasks):
         for tl in range_constexpr(tiles):
             fx.ptr_store(
@@ -1332,6 +1503,7 @@ def project_split(
                     )
     rocdl.s_wait_storecnt(0)
     cluster.cluster_barrier()
+    tdm_timeline.stamp(tdm_timeline.SPLIT_EXCHANGED)
 
     items = group_count * tiles * GFX1250.wave_size
     for round_index in range_constexpr((items + THREADS - 1) // THREADS):

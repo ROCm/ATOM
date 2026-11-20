@@ -68,6 +68,8 @@ from atom.models.kimi_k3.mono.kernels.stages import (
     attn_res_gfx1250,
     attn_res_sliced_gfx1250,
     attn_res_sliced_layout,
+    mla_front_gfx1250,
+    mla_front_layout,
 )
 from atom.models.kimi_k3.mono.kernels.stages.k2_allreduce_gfx1250 import (
     GATHER_ALLREDUCE_ABI,
@@ -119,7 +121,11 @@ from atom.models.kimi_k3.mono.runner import (
     state_slots,
 )
 from atom.models.kimi_k3.mono.symm_peers import SymmPeers, map_symm_peers
-from atom.models.kimi_k3.mono.weights import bind_external_moe, bind_fp8_o_proj
+from atom.models.kimi_k3.mono.weights import (
+    bind_external_moe,
+    bind_fp8_o_proj,
+    bind_mla_front,
+)
 from atom.mono.plan.architecture import GFX1250
 from atom.mono.runtime.abi import KernelAbi
 from atom.mono.runtime.compile import compile_kernels, launcher_resources
@@ -240,6 +246,7 @@ def _lean_width(
         {layer: replacements.get(layer, runner) for layer, runner in built.k1.items()},
         built.k2,
         built.oproj,
+        built.mla_front,
     )
 
 
@@ -322,6 +329,9 @@ class Gfx1250WidthBuild:
     k2: dict[int, Gfx1250RoutedK2Build]
     # o_proj and its all-reduce in one kernel, every KDA layer's
     oproj: object | None = None
+    # the full-attention layers' MLA fronts (ATOM_KIMI_MONO_MLA_FRONT), by
+    # ``MlaFrontLayer.key``; a key without one runs the production projections
+    mla_front: dict | None = None
 
     def kernels(self) -> list[tuple[object, KernelAbi]]:
         """All local launchers, for compile-time scratch validation."""
@@ -344,6 +354,9 @@ class Gfx1250WidthBuild:
                 pairs.append((fused_moe.launcher, fused_moe.abi))
         if self.oproj is not None:
             pairs.append((self.oproj.launcher, self.oproj.abi))
+        for front in (self.mla_front or {}).values():
+            if front is not None:
+                pairs.append((front.launcher, front.abi))
 
         unique = {}
         for launcher, abi in pairs:
@@ -591,6 +604,44 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                 logger.info(
                     "Kimi-K3 mono: layer %d keeps AITER's o_proj (%s)", layer_id, e
                 )
+        self._bind_mla_fronts()
+
+    def _bind_mla_fronts(self) -> None:
+        """The full-attention layers running K2 whose projections the MLA
+        front takes (ATOM_KIMI_MONO_MLA_FRONT); a layer it cannot read keeps
+        the production projections, alone. One hand-off buffer and one
+        exchange scratch serve every width (``mla_front_gfx1250``)."""
+        self.mla_fronts = {}
+        if not envs.ATOM_KIMI_MONO_MLA_FRONT:
+            return
+        for layer_id in sorted(self.ffn_layers):
+            try:
+                self.mla_fronts[layer_id] = bind_mla_front(
+                    self.inner.layers[layer_id], layer_id, self.dims
+                )
+            except MonoUnsupported as e:
+                logger.warning(
+                    "Kimi-K3 mono: layer %d keeps its production projections (%s)",
+                    layer_id,
+                    e,
+                )
+        logger.info(
+            "Kimi-K3 gfx1250 mono: %d full-attention layers run the MLA front",
+            len(self.mla_fronts),
+        )
+        if self.mla_fronts:
+            gate_rows = max(front.gate_rows for front in self.mla_fronts.values())
+            self.mla_qkv = torch.full(
+                (mla_front_layout.qkv_words(self.max_rows),),
+                mla_front_layout.UNWRITTEN - (1 << 32),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self.mla_partials = torch.empty(
+                mla_front_layout.partial_bytes(self.max_rows, gate_rows),
+                dtype=torch.uint8,
+                device=self.device,
+            )
 
     def _allocate(self) -> None:
         self.ones = torch.ones(self.max_rows, dtype=torch.int32, device=self.device)
@@ -737,7 +788,97 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             if self.oproj_peers is not None
             else None
         )
-        return Gfx1250WidthBuild(k1_by_layer, k2_by_layer, oproj)
+        return Gfx1250WidthBuild(
+            k1_by_layer, k2_by_layer, oproj, self._mla_fronts_for(rows)
+        )
+
+    def _mla_fronts_for(self, rows: int) -> dict | None:
+        """The width's MLA front a ``MlaFrontLayer.key``, None where it does
+        not build or compiles with a resident hazard (``_resident_hazards``):
+        those layers run the production projections at this width. The front
+        is rank-local, as the projections it replaces are, so a rank's choice
+        commits no peer."""
+        fronts = getattr(self, "mla_fronts", None)
+        if not fronts:
+            return None
+        built = {}
+        for key in sorted({front.key for front in fronts.values()}):
+            gate_rows, q_eps, kv_eps = key
+            try:
+                kernel = mla_front_gfx1250.build_mla_front(
+                    rows, gate_rows, q_eps, kv_eps
+                )
+                (launcher,) = compile_kernels([(kernel.launcher, kernel.abi)])
+                hazards = _resident_hazards(launcher)
+            except ValueError as why:
+                kernel, hazards = None, (str(why),)
+            if hazards:
+                logger.warning(
+                    "Kimi-K3 gfx1250 mono: %d rows run the production MLA "
+                    "projections (%s)",
+                    rows,
+                    ", ".join(hazards),
+                )
+                kernel = None
+            built[key] = kernel
+        return built
+
+    def _mla_projection(self, build, layer_id: int):
+        """The full-attention layer's MLA front at this width, as
+        ``_pre_o_core``'s ``project``, or None (the production projections)."""
+        front = getattr(self, "mla_fronts", {}).get(layer_id)
+        kernels = getattr(build, "mla_front", None)
+        kernel = None if front is None or not kernels else kernels.get(front.key)
+        if kernel is None:
+            return None
+        return lambda normed: self._mla_front(kernel, front, normed)
+
+    def _mla_front(self, kernel, front, x):
+        """The MLA front on the normed rows ``x``: ``(q, q_scale, kv, k_rope,
+        gate)``, ``KimiFullAttention._gated_core``'s ``front``. q is FP8 with
+        its transposed E8M0 scales where q_b_proj takes those, else BF16."""
+        lay = mla_front_layout
+        if (
+            not isinstance(x, torch.Tensor)
+            or x.dtype != torch.bfloat16
+            or x.dim() != 2
+            or x.size(1) != HIDDEN
+            or not x.is_contiguous()
+        ):
+            raise MonoUnsupported(
+                f"layer {front.layer_id}: the MLA front reads a contiguous "
+                f"[rows, {HIDDEN}] BF16 row, got {getattr(x, 'shape', type(x))}"
+            )
+        rows = x.size(0)
+        kv = x.new_empty(rows, lay.KV_LORA)
+        k_rope = x.new_empty(rows, lay.ROPE)
+        gate = x.new_empty(rows, front.gate_rows)
+        q = q_fp8 = q_scale = None
+        if front.q_dtype is None:
+            q = x.new_empty(rows, lay.Q_LORA)
+        else:
+            q_fp8 = torch.empty(
+                (rows, lay.Q_LORA), dtype=front.q_dtype, device=x.device
+            )
+            q_scale = torch.empty(
+                (rows, lay.Q_GROUPS), dtype=dtypes.fp8_e8m0, device=x.device
+            )
+
+        def p(t):
+            return 0 if t is None else t.data_ptr()
+
+        args = mla_front_gfx1250.MLA_FRONT_ABI.pack({
+            "x": p(x), "w_a": p(front.w_a), "s_a": p(front.s_a),
+            "w_g": p(front.w_g), "s_g": p(front.s_g),
+            "q_norm": p(front.q_norm), "kv_norm": p(front.kv_norm),
+            "qkv_c": p(self.mla_qkv), "q": p(q), "q_fp8": p(q_fp8),
+            "q_scale": p(q_scale), "kv": p(kv), "k_rope": p(k_rope),
+            "gate": p(gate), "partials": p(self.mla_partials), "qkv_seen": 0,
+        })  # fmt: skip
+        kernel.launcher(*args, stream=torch.cuda.current_stream())
+        if q is None:
+            return q_fp8, q_scale, kv, k_rope, gate
+        return q, None, kv, k_rope, gate
 
     def _k2_or_production(self, rows: int, build, what: str, kernels=None):
         """``build()``, or None past ``k2_fallback_past`` rows where it
@@ -1034,11 +1175,18 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         else:
             if plan.layer_id in self.ffn_layers:
                 # A full-attention layer: its attention on the production path
-                # up to o_proj's input, then the same o_proj and K2.
+                # up to o_proj's input (its projections the MLA front's where
+                # built), then the same o_proj and K2.
                 layer = self.inner.layers[plan.layer_id]
-                core, prefix = self._pre_o_core(
-                    plan, positions, prefix, blocks, add, add2
-                )
+                project = self._mla_projection(build, plan.layer_id)
+                if project is None:
+                    core, prefix = self._pre_o_core(
+                        plan, positions, prefix, blocks, add, add2
+                    )
+                else:
+                    core, prefix = self._pre_o_core(
+                        plan, positions, prefix, blocks, add, add2, project
+                    )
                 core = core[: prefix.size(0)]
             else:
                 layer, normed, prefix, _, write_idx = self._seam(
