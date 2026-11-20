@@ -1941,9 +1941,11 @@ def m3_fp4_cache_unsupported_reason(
     """Why MiniMax-M3's FP4 index cache / NVFP4 sparse KV cannot run here, or None.
 
     Pure for the same reason as ``indexer_cp_unsupported_reason``. Both caches
-    decode e2m1 with a gfx950-only instruction. The NVFP4 attention kernel
-    serves 16 q heads per kv head on a rank (M3.1 at TP4: 16 / 1) and only layers
-    that run their own indexer: a layer reusing the previous top-k writes no
+    run on gfx950 (Gluon attention and fused verify top-k, hardware e2m1
+    decode) and gfx1250 (aiter's FlyDSL paged decode, unfused score + top-k,
+    integer e2m1 decode). The NVFP4 attention serves 16 q heads per kv head on a
+    rank (M3.1 at TP4: 16 / 1; the gfx950 kernel's shape, kept for both) and only
+    layers that run their own indexer: a layer reusing the previous top-k writes no
     NVFP4 K/V. The vLLM / SGLang plugin bridges bind their own caches and know
     neither layout, so a plugin deployment would silently keep FP8.
     """
@@ -1951,8 +1953,8 @@ def m3_fp4_cache_unsupported_reason(
         return None
     if plugin:
         return "FP4/NVFP4 MiniMax-M3 caches are not supported in plugin mode"
-    if gfx != "gfx950":
-        return f"FP4/NVFP4 MiniMax-M3 caches need gfx950, not {gfx}"
+    if gfx not in ("gfx950", "gfx1250"):
+        return f"FP4/NVFP4 MiniMax-M3 caches need gfx950 or gfx1250, not {gfx}"
     if kv_nvfp4:
         q_per_kv = (num_heads // tp_size) // max(1, num_kv_heads // tp_size)
         if q_per_kv != 16:
@@ -1965,26 +1967,22 @@ def m3_fp4_cache_unsupported_reason(
     return None
 
 
-def m3_nvfp4_stage_unsupported_reason(stage_pages: int, index_pages: int) -> str | None:
-    """Why NVFP4 sparse KV cannot run with this persistent (FP8 / BF16) index
-    pool, or None.
+def indexer_cp_fp4_index_unsupported_reason(gfx: str) -> str | None:
+    """Why the MiniMax-M3 indexer-CP scorer cannot read the FP4 index cache here,
+    or None.
 
-    The NVFP4 K/V is written through a token-major staging buffer of
-    ``stage_pages`` 128-token pages, sized for the largest step a forward can
-    run (max_num_batched_tokens rows, which also bounds every captured decode
-    bucket). AITER's page-128 writer checks the index cache against the KV
-    pages it is given, and a captured bucket can run more rows than the pool
-    holds, so the pool must hold the largest step. An FP4 index is staged too
-    and is not coupled this way.
+    The CP context scorer reads FP4 index rows through gfx1250's scaled WMMA
+    (``nvfp4_scaled_dot``), the read of the gfx1250 TP decode scorer, so its
+    selection is theirs. gfx950's TP scorers read the rows as even / odd halves
+    (and score with the fused verify top-k under NVFP4 K/V), which the CP scorer
+    does not model.
     """
-    if index_pages >= stage_pages:
-        return None
-    return (
-        f"ATOM_M3_SPARSE_KV_NVFP4 with an FP8/BF16 index cache needs the KV pool "
-        f"to hold one full step: {index_pages} pages < {stage_pages} staging "
-        "pages. Lower --max-num-batched-tokens / --max-num-seqs, give the KV "
-        "cache more memory, or use --index-cache-dtype fp4."
-    )
+    if gfx != "gfx1250":
+        return (
+            "--index-cache-dtype fp4 with the CP scorer is gfx1250-only "
+            f"(scaled-WMMA FP4 reads), not {gfx}"
+        )
+    return None
 
 
 def indexer_cp_unsupported_reason(
@@ -2728,10 +2726,9 @@ class Config:
                 is_plugin_mode(),
             )
             if indexer_cp_off is None and self.index_cache_dtype == "fp4":
-                # The CP context scorer reads FP8/BF16 index keys only.
-                indexer_cp_off = (
-                    "--index-cache-dtype fp4 is not supported by the CP scorer"
-                )
+                from aiter.jit.utils.chip_info import get_gfx
+
+                indexer_cp_off = indexer_cp_fp4_index_unsupported_reason(get_gfx())
             if indexer_cp_off is not None:
                 logger.warning(
                     "dcp_config.indexer_dcp_only disabled: %s.", indexer_cp_off

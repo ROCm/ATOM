@@ -59,6 +59,9 @@ def _inputs(batch, max_seq_len, max_query_len, cache_dtype, seed):
 
     Pages are a random permutation rather than identity so a kernel that indexes
     the block table by position instead of by page id fails here.
+
+    ``cache_dtype="fp4"``: the FP4 index cache, ``cache`` a (payload, scale)
+    pair written by ``index_fp4_store`` from random keys.
     """
     torch.manual_seed(seed)
     blocks = (max_seq_len + BLOCK - 1) // BLOCK
@@ -66,7 +69,25 @@ def _inputs(batch, max_seq_len, max_query_len, cache_dtype, seed):
     idx_q = torch.randn(tokens, WORLD, BLOCK, device="cuda", dtype=torch.bfloat16)
     pages = torch.randperm(batch * blocks, device="cuda")[: batch * blocks]
     block_table = pages.to(torch.int32).view(batch, blocks).contiguous()
-    cache = torch.randn(batch * blocks, BLOCK, BLOCK, device="cuda").to(cache_dtype)
+    if cache_dtype == "fp4":
+        from atom.model_ops.minimax_m3.index_fp4 import index_fp4_store
+
+        keys = torch.randn(batch * blocks * BLOCK, BLOCK, device="cuda")
+        payload = torch.zeros(
+            batch * blocks, BLOCK, BLOCK // 2, dtype=torch.uint8, device="cuda"
+        )
+        scale = torch.zeros(
+            batch * blocks, BLOCK, BLOCK // 16, dtype=torch.uint8, device="cuda"
+        )
+        index_fp4_store(
+            keys.to(torch.bfloat16),
+            torch.arange(keys.shape[0], device="cuda"),
+            payload,
+            scale,
+        )
+        cache = (payload, scale)
+    else:
+        cache = torch.randn(batch * blocks, BLOCK, BLOCK, device="cuda").to(cache_dtype)
     # Every request must hold at least one full query window, and the shortest
     # lengths are the interesting ones: they leave the high shards empty.
     lens = torch.randint(
@@ -77,8 +98,14 @@ def _inputs(batch, max_seq_len, max_query_len, cache_dtype, seed):
     return idx_q, cache, block_table, lens, blocks
 
 
+def _split(cache):
+    """(index cache, FP4 scales or None)."""
+    return cache if isinstance(cache, tuple) else (cache, None)
+
+
 def _tp_reference(idx_q, cache, block_table, lens, max_seq_len, topk, init, local, q):
     """What each TP rank computes today: its own head, ``num_kv_heads=1``."""
+    cache, scale = _split(cache)
     return [
         minimax_m3_index_topk_decode(
             idx_q[:, h : h + 1],
@@ -93,6 +120,7 @@ def _tp_reference(idx_q, cache, block_table, lens, max_seq_len, topk, init, loca
             SCALE,
             emit_sparse_block_table=True,
             max_query_len=q,
+            index_kv_scale=scale,
         )
         for h in range(WORLD)
     ]
@@ -101,10 +129,20 @@ def _tp_reference(idx_q, cache, block_table, lens, max_seq_len, topk, init, loca
 def _cp_candidates(idx_q, cache, block_table, lens, max_seq_len, topk, init, local, q):
     """Every shard's packed candidate keys, [rank][heads, tokens, topk]."""
     blocks = (max_seq_len + BLOCK - 1) // BLOCK
+    cache, scale = _split(cache)
     return [
         local_candidate_keys(
             indexer_context_scores(
-                idx_q, cache, block_table, lens, max_seq_len, r, WORLD, q, SCALE
+                idx_q,
+                cache,
+                block_table,
+                lens,
+                max_seq_len,
+                r,
+                WORLD,
+                q,
+                SCALE,
+                index_scale=scale,
             ),
             lens,
             topk,
@@ -296,3 +334,28 @@ def test_both_transports_deliver_the_same_tensor():
         a2a = _exchange(keys, head, "all_to_all")
         gathered = _exchange(keys, head, "all_gather")
         assert torch.equal(a2a, gathered), f"transports disagree for head {head}"
+
+
+@needs_gpu
+@pytest.mark.parametrize("max_query_len", [1, 4, 8])
+@pytest.mark.parametrize("max_seq_len", [128, 4096, 196608])
+def test_parity_holds_on_an_fp4_index_cache(max_query_len, max_seq_len):
+    """``--index-cache-dtype fp4`` (gfx1250): the CP context scorer and the TP decode
+    scorer read the FP4 rows the same way -- packed, through the scaled WMMA against
+    the query's two E4M3 terms -- so the selection must be identical, as for BF16.
+    ``max_query_len=8`` is MTP8 (DSpark K=7)."""
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    if get_gfx_runtime() != "gfx1250":
+        pytest.skip("the CP scorer reads FP4 index rows on gfx1250 only")
+    _assert_chain_matches_tp(
+        batch=8,
+        max_seq_len=max_seq_len,
+        q=max_query_len,
+        topk=16,
+        init=1,
+        local=2,
+        transport="all_to_all",
+        seed=41,
+        cache_dtype="fp4",
+    )

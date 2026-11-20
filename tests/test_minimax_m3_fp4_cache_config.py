@@ -12,8 +12,8 @@ import pytest
 import torch
 
 from atom.config import (
+    indexer_cp_fp4_index_unsupported_reason,
     m3_fp4_cache_unsupported_reason,
-    m3_nvfp4_stage_unsupported_reason,
     m3_reuses_index_topk,
 )
 from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
@@ -30,8 +30,10 @@ HEADS, KV_HEADS = 64, 4
         ("gfx950", True, False, 4, False, None),
         ("gfx950", True, True, 4, False, None),  # TP4: 16 q heads per kv head
         ("gfx950", True, True, 2, False, None),  # TP2: 32 / 2 = 16
-        ("gfx942", True, False, 4, False, "need gfx950"),
-        ("gfx942", False, True, 4, False, "need gfx950"),
+        ("gfx942", True, False, 4, False, "need gfx950 or gfx1250"),
+        ("gfx942", False, True, 4, False, "need gfx950 or gfx1250"),
+        ("gfx1250", True, True, 4, False, None),  # FlyDSL paged decode, unfused top-k
+        ("gfx1250", False, True, 8, False, "got 8 at TP8"),
         ("gfx950", False, True, 8, False, "got 8 at TP8"),  # kv heads replicate
         ("gfx950", True, False, 8, False, None),  # FP4 index alone has no head rule
         ("gfx950", False, True, 4, True, "top-k-reusing"),
@@ -45,6 +47,17 @@ def test_refusal(gfx, index_fp4, kv_nvfp4, tp, reuses_topk, refused):
         assert reason is None
     else:
         assert refused in reason
+
+
+@pytest.mark.parametrize(
+    "gfx, refused", [("gfx1250", False), ("gfx950", True), ("gfx942", True)]
+)
+def test_indexer_cp_reads_the_fp4_index_on_gfx1250_only(gfx, refused):
+    # The CP scorer reads FP4 rows through the scaled WMMA, the gfx1250 TP read.
+    reason = indexer_cp_fp4_index_unsupported_reason(gfx)
+    assert (reason is not None) is refused
+    if refused:
+        assert gfx in reason and "gfx1250" in reason
 
 
 @pytest.mark.parametrize("index_fp4, kv_nvfp4", [(True, False), (False, True)])
@@ -116,27 +129,6 @@ def test_reuses_index_topk_follows_the_model_rule(fields, reuses):
     cfg = SimpleNamespace(**SPARSE, **fields)
     assert m3_reuses_index_topk(cfg) is reuses
     assert reuses is any(should_skip_index_topk(cfg, layer)[0] for layer in range(6))
-
-
-@pytest.mark.parametrize(
-    "stage_pages, index_pages, refused",
-    [
-        (2, 1, True),  # a 256-row capture bucket over a one-page pool
-        (128, 127, True),
-        (128, 128, False),
-        (128, 57011, False),  # M3.1 TP4 at --gpu-memory-utilization 0.9
-    ],
-)
-def test_nvfp4_staging_must_fit_a_persistent_index_pool(
-    stage_pages, index_pages, refused
-):
-    """AITER's page-128 writer checks the index cache against the KV staging
-    pages it is given, and graph capture runs buckets larger than the pool, so
-    a pool smaller than the staging buffer is refused at bind time."""
-    reason = m3_nvfp4_stage_unsupported_reason(stage_pages, index_pages)
-    assert (reason is not None) is refused
-    if refused:
-        assert "--index-cache-dtype fp4" in reason
 
 
 def test_nvfp4_pool_fields_and_views():

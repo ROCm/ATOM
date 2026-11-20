@@ -28,7 +28,14 @@ import triton
 import triton.language as tl
 from aiter.jit.utils.chip_info import get_gfx
 
-from atom.model_ops.minimax_m3.nvfp4_kernels.nvfp4 import nvfp4_load_even_odd
+from atom.model_ops.minimax_m3.nvfp4_kernels.nvfp4 import (
+    NVFP4_SCALED_DOT,
+    nvfp4_load_even_odd,
+    nvfp4_load_packed,
+    nvfp4_query_e4m3,
+    nvfp4_scaled_dot,
+    nvfp4_split_query,
+)
 
 try:
     # aiter's chunk-narrowing per-row selector: same forced-block pins and tie
@@ -66,6 +73,26 @@ SCORE_NUM_STAGES = 3
 DECODE_SCORE_NUM_STAGES = 3
 
 
+def _check_fp4_index(payload: torch.Tensor, scale: torch.Tensor, head_dim: int):
+    """The FP4 index planes the scorers read: rows contiguous (their strides are
+    compile-time constants there), head_dim 128, pages 16 B aligned."""
+    if not (
+        head_dim == 128
+        and payload.dtype == torch.uint8
+        and scale.dtype == torch.uint8
+        and payload.shape[1:] == (SPARSE_BLOCK_SIZE, head_dim // 2)
+        and scale.shape == (payload.shape[0], SPARSE_BLOCK_SIZE, head_dim // 16)
+        and payload.stride()[1:] == (head_dim // 2, 1)
+        and scale.stride()[1:] == (head_dim // 16, 1)
+        and payload.stride(0) % 16 == 0
+        and scale.stride(0) % 16 == 0
+    ):
+        raise ValueError(
+            "FP4 index cache must be uint8 [pages, 128, 64] + [pages, 128, 8] "
+            "with contiguous rows and 16 B aligned pages"
+        )
+
+
 @functools.cache
 def _prefill_score_launch_config(dtype: torch.dtype) -> tuple[int, int]:
     """Return (warps, stages) without changing the tuned gfx950 path."""
@@ -81,7 +108,14 @@ def _prefill_score_launch_config(dtype: torch.dtype) -> tuple[int, int]:
         getattr(torch, "float8_e5m2", None),
         getattr(torch, "float8_e5m2fnuz", None),
     )
-    return (4, 1) if dtype in fp8_dtypes else (8, SCORE_NUM_STAGES)
+    if dtype in fp8_dtypes:
+        return 4, 1
+    if dtype == torch.uint8:
+        # The FP4 index payload, read through the scaled WMMA
+        # (nvfp4_scaled_dot): one stage, deeper pipelining only holds more
+        # tiles in registers.
+        return 8, 1
+    return 8, SCORE_NUM_STAGES
 
 
 # Bounds on the decode score split, one per end of the batch range. MIN_BLOCKS
@@ -103,6 +137,9 @@ DECODE_SCORE_MIN_BLOCKS = 3
 # (`SPARSE_BLOCK_SIZE // ASM_PAGE_SIZE`); `tests/test_minimax_m3_page_geometry.py`
 # asserts that rather than leaving it to a comment.
 PAGES_PER_SPARSE_BLOCK = 8
+# Pages per logical 128-block of the NVFP4 sparse KV pool (page 128): the
+# emitted table is then the FlyDSL paged decode's page-128 table.
+NVFP4_PAGES_PER_BLOCK = 1
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +153,11 @@ PAGES_PER_SPARSE_BLOCK = 8
 # KV cache view [num_phys16*NUM_KV_HEADS, 1, ...], which is also why the 8 pages
 # of one 128-block are NUM_KV_HEADS apart rather than adjacent. NUM_KV_HEADS ==
 # 1 reduces to the original per-token emit.
+#
+# pages_per_block == block_page_stride == 1 emits the page-128 table of the
+# NVFP4 sparse KV pool instead (one page a block, `NVFP4_PAGES_PER_BLOCK`):
+# exactly `sparse_attn_nvfp4.nvfp4_page_table`, a row at or below length 0
+# included (length 0, no page).
 # ---------------------------------------------------------------------------
 @triton.jit
 def _emit_sparse_block_table_row(
@@ -141,6 +183,11 @@ def _emit_sparse_block_table_row(
     # The selector already caps selection at self_blk; the upper bound is
     # defensive, and keeps an out-of-range id from indexing the block table.
     bt_valid = (bt_blk >= 0) & (bt_blk <= self_blk)
+    if pages_per_block == 1:
+        # The NVFP4 table: a row before its request's first token (a graph pad
+        # request shorter than the verify window) selects nothing, whatever
+        # its list holds.
+        bt_valid = bt_valid & (causal_len > 0)
     bt_is_tail = bt_valid & (bt_blk == self_blk)
     bt_is_full = bt_valid & (bt_blk < self_blk)
     bt_n_full = tl.sum(bt_is_full.to(tl.int32), axis=0)
@@ -180,6 +227,9 @@ def _emit_sparse_block_table_row(
     bt_ctx = tl.where(
         bt_has_tail, bt_ctx, tl.minimum(bt_n_valid * block_size, causal_len)
     )
+    if pages_per_block == 1:
+        # ... and attends nothing.
+        bt_ctx = tl.maximum(bt_ctx, 0)
     tl.store(sctx_ptr, bt_ctx)
 
 
@@ -455,7 +505,12 @@ def _index_block_score_kernel(
         mask=(_q_ptrs_0[:, None] < (q_len)),
         other=0.0,
     )
-    if IS_FP4:
+    if IS_FP4 and NVFP4_SCALED_DOT:
+        # gfx1250: the packed rows go to the scaled WMMA against the query in
+        # E4M3 (the FP8 cache's prefill rounds its query the same way).
+        q_e = nvfp4_query_e4m3(q)
+        q_o = q_e
+    elif IS_FP4:
         # Even / odd head dims as fp16, matching the FP4 cache's de-interleaved
         # load: the score is the even-dim dot plus the odd-dim dot.
         h2 = tl.arange(0, head_dim // 2) * 2
@@ -499,7 +554,17 @@ def _index_block_score_kernel(
         # we don't need masked load for K, because KV cache ensures
         # allocation is multiple of BLOCK_SIZE_K.
         # for tokens beyond seqlen, they will be masked in qk later.
-        if IS_FP4:
+        if IS_FP4 and NVFP4_SCALED_DOT:
+            payload, kscale = nvfp4_load_packed(
+                ik_cache_ptr,
+                iks_ptr,
+                page * stride_ik_blk,
+                page * stride_iks_blk,
+                off_k,
+                head_dim,
+            )
+            qk = nvfp4_scaled_dot(q_e, None, None, payload, kscale) * sm_scale_log2e
+        elif IS_FP4:
             k_e, k_o = nvfp4_load_even_odd(
                 ik_cache_ptr,
                 iks_ptr,
@@ -725,8 +790,17 @@ def _require_packable(max_block: int) -> None:
         )
 
 
-def _alloc_emit(total_q, num_idx_heads, topk, block_table, emit, device):
-    """Buffers for the fused page-16 emit, as (what to return, what to pass).
+def _alloc_emit(
+    total_q,
+    num_idx_heads,
+    topk,
+    block_table,
+    emit,
+    device,
+    pages_per_block=PAGES_PER_SPARSE_BLOCK,
+):
+    """Buffers for the fused page-16 emit (``pages_per_block`` pages a block:
+    1 for the NVFP4 page-128 table), as (what to return, what to pass).
 
     One row per (query token, kv-head): the ASM/gluon path collapses kv-head
     into the row dim, so the rows are total_q * num_idx_heads and the page ids
@@ -743,7 +817,7 @@ def _alloc_emit(total_q, num_idx_heads, topk, block_table, emit, device):
         return None, (dummy, dummy, 0, 0)
     rows = total_q * num_idx_heads
     sparse_bt = torch.empty(
-        (rows, topk * PAGES_PER_SPARSE_BLOCK), dtype=torch.int32, device=device
+        (rows, topk * pages_per_block), dtype=torch.int32, device=device
     )
     sparse_ctx = torch.empty((rows,), dtype=torch.int32, device=device)
     args = (sparse_bt, sparse_ctx, block_table.stride(0), sparse_bt.stride(0))
@@ -827,6 +901,7 @@ def _launch_select(
     emit,
     block_page_stride,
     n_valid_column_per_row=None,
+    pages_per_block=PAGES_PER_SPARSE_BLOCK,
 ):
     """The one selection pass, launched the same way by both phases.
 
@@ -863,7 +938,7 @@ def _launch_select(
                 SPARSE_BLOCK_SIZE,
                 NUM_KV_HEADS=num_idx_heads,
                 DECODE_MAX_Q=decode_max_q,
-                pages_per_block=PAGES_PER_SPARSE_BLOCK,
+                pages_per_block=pages_per_block,
                 # Not PAGES_PER_SPARSE_BLOCK: a caller whose cache packs
                 # several planes into one block has a stride wider than the
                 # pages a block fills. Hard-coding the two to the same constant
@@ -902,7 +977,7 @@ def _launch_select(
         NUM_KV_HEADS=num_idx_heads,
         DECODE_MAX_Q=decode_max_q,
         BLOCK_SIZE_K=block_size_k,
-        pages_per_block=PAGES_PER_SPARSE_BLOCK,
+        pages_per_block=pages_per_block,
         block_page_stride=block_page_stride,
         EMIT_SPARSE_BT=emit,
         num_warps=num_warps,
@@ -1119,7 +1194,11 @@ def _decode_index_score_tiled_kernel(
         mask=d_mask[:, None] & n_valid[None, :],
         other=0.0,
     )
-    if IS_FP4:
+    if IS_FP4 and NVFP4_SCALED_DOT:
+        # gfx1250: the packed rows to the scaled WMMA, the query ([N, D]) in two
+        # E4M3 terms; the score transposed back.
+        q_hi, q_lo, q_lo_scale = nvfp4_split_query(tl.trans(q))
+    elif IS_FP4:
         # [D/2, N] even / odd head dims as fp16 (see the prefill scorer).
         h2 = tl.arange(0, BLOCK_SIZE_D // 2) * 2
         q_base = q_ptr + row[None, :] * stride_q_n + head[None, :] * stride_q_h
@@ -1140,7 +1219,21 @@ def _decode_index_score_tiled_kernel(
 
     for blk in tl.range(chunk_start, chunk_end):
         page = tl.load(bt_row + blk).to(tl.int64)
-        if IS_FP4:
+        if IS_FP4 and NVFP4_SCALED_DOT:
+            # FP4 is gated on head_dim == BLOCK_SIZE_D == 128 (no d mask needed).
+            payload, kscale = nvfp4_load_packed(
+                ik_cache_ptr,
+                iks_ptr,
+                page * stride_ik_blk,
+                page * stride_iks_blk,
+                off_k,
+                BLOCK_SIZE_D,
+            )
+            qk = (
+                tl.trans(nvfp4_scaled_dot(q_hi, q_lo, q_lo_scale, payload, kscale))
+                * sm_scale_log2e
+            )
+        elif IS_FP4:
             # FP4 is gated on head_dim == BLOCK_SIZE_D == 128 (no d mask needed).
             k_e, k_o = nvfp4_load_even_odd(
                 ik_cache_ptr,
@@ -1199,6 +1292,7 @@ def minimax_m3_index_topk(
     block_page_stride: int = PAGES_PER_SPARSE_BLOCK,
     n_valid_column_per_row: torch.Tensor | None = None,
     index_kv_scale: torch.Tensor | None = None,
+    emit_pages_per_block: int = PAGES_PER_SPARSE_BLOCK,
 ):
     """Index block-score + top-k selection. block_size_q == 1 (per-token).
 
@@ -1228,6 +1322,11 @@ def minimax_m3_index_topk(
     selector eligible -- the row width decides whether it is actually cheaper
     (`_aiter_selector_wins`); omitted, the Triton one runs, which derives the
     same bound in registers.
+    ``emit_pages_per_block`` (with ``block_page_stride``) =
+    ``NVFP4_PAGES_PER_BLOCK`` emits the NVFP4 pool's page-128 table
+    ``[total_q * num_kv_heads, topk]`` instead, the one
+    ``sparse_attn_nvfp4.nvfp4_page_table`` builds. Rows past
+    ``cu_seqlens_q[-1]`` are not written, as for the page-16 table.
     """
     total_q, num_idx_heads, head_dim = idx_q.shape
     assert (
@@ -1256,6 +1355,8 @@ def minimax_m3_index_topk(
     )
     is_fp4 = index_kv_scale is not None
     iks = index_kv_scale if is_fp4 else index_kv_cache
+    if is_fp4:
+        _check_fp4_index(index_kv_cache, index_kv_scale, head_dim)
     _index_block_score_kernel[grid_score](
         idx_q,
         index_kv_cache,
@@ -1292,7 +1393,13 @@ def minimax_m3_index_topk(
         (num_idx_heads, total_q, topk), dtype=torch.int32, device=idx_q.device
     )
     emit_out, emit_args = _alloc_emit(
-        total_q, num_idx_heads, topk, block_table, emit_sparse_block_table, idx_q.device
+        total_q,
+        num_idx_heads,
+        topk,
+        block_table,
+        emit_sparse_block_table,
+        idx_q.device,
+        emit_pages_per_block,
     )
     _launch_select(
         score,
@@ -1313,6 +1420,7 @@ def minimax_m3_index_topk(
         emit=emit_sparse_block_table,
         block_page_stride=block_page_stride,
         n_valid_column_per_row=n_valid_column_per_row,
+        pages_per_block=emit_pages_per_block,
     )
     return (topk_idx, *emit_out) if emit_out else topk_idx
 
@@ -1334,6 +1442,7 @@ def minimax_m3_index_topk_decode(
     block_page_stride: int = PAGES_PER_SPARSE_BLOCK,
     n_valid_column_per_row: torch.Tensor | None = None,
     index_kv_scale: torch.Tensor | None = None,
+    emit_pages_per_block: int = PAGES_PER_SPARSE_BLOCK,
 ):
     """Decode index block-score + top-k, both split-K (cudagraph-safe).
 
@@ -1362,6 +1471,8 @@ def minimax_m3_index_topk_decode(
     selector eligible -- the row width decides whether it is actually cheaper
     (`_aiter_selector_wins`); omitted, the Triton one runs, which derives the
     same bound in registers.
+    ``emit_pages_per_block``: as in :func:`minimax_m3_index_topk`; rows past
+    ``len(seq_lens) * max_query_len`` are not written.
     """
     total_q, num_idx_heads, head_dim = idx_q.shape
     assert (
@@ -1382,7 +1493,13 @@ def minimax_m3_index_topk_decode(
         (num_idx_heads, total_q, topk), dtype=torch.int32, device=idx_q.device
     )
     emit_out, emit_args = _alloc_emit(
-        total_q, num_idx_heads, topk, block_table, emit_sparse_block_table, idx_q.device
+        total_q,
+        num_idx_heads,
+        topk,
+        block_table,
+        emit_sparse_block_table,
+        idx_q.device,
+        emit_pages_per_block,
     )
 
     score = torch.empty(
@@ -1393,6 +1510,8 @@ def minimax_m3_index_topk_decode(
     num_score_chunks = _decode_score_chunks(batch, max_block)
     is_fp4 = index_kv_scale is not None
     iks = index_kv_scale if is_fp4 else index_kv_cache
+    if is_fp4:
+        _check_fp4_index(index_kv_cache, index_kv_scale, head_dim)
     _decode_index_score_tiled_kernel[(num_score_chunks, batch)](
         idx_q,
         index_kv_cache,
@@ -1419,7 +1538,11 @@ def minimax_m3_index_topk_decode(
         MAX_Q=max_query_len,
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
         IS_FP4=is_fp4,
-        num_stages=DECODE_SCORE_NUM_STAGES,
+        # FP4 on gfx1250 at one stage: deeper pipelining only holds more tiles
+        # in registers.
+        num_stages=(
+            1 if is_fp4 and get_gfx() == "gfx1250" else DECODE_SCORE_NUM_STAGES
+        ),
     )
 
     _launch_select(
@@ -1441,5 +1564,6 @@ def minimax_m3_index_topk_decode(
         emit=emit_sparse_block_table,
         block_page_stride=block_page_stride,
         n_valid_column_per_row=n_valid_column_per_row,
+        pages_per_block=emit_pages_per_block,
     )
     return (topk_idx, *emit_out) if emit_out else topk_idx
