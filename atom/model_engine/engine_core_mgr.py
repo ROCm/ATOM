@@ -1228,18 +1228,18 @@ class CoreManager:
                 "and ATOM_FRONTEND_PREFIX_HASH=1 (the frontend prompt hash chain)"
             )
         tier = KVConnectorFactory.offload_tier(config)
-        if strategy == "prefix_spread":
-            if not tier.loads:
-                # No offload tier, but a pool the ranks share: a moved request
-                # copies its prefix from another rank's pool instead of
-                # recomputing it.
-                sharing = KVConnectorFactory.pool_sharing(config)
-                if sharing and sharing.get("loads"):
-                    from atom.kv_transfer.offload.tier import OffloadTierProfile
+        if not tier.loads:
+            # No offload tier, but a pool the ranks share: a request placed
+            # away from its prefix copies it from another rank's pool instead
+            # of recomputing it.
+            sharing = KVConnectorFactory.pool_sharing(config)
+            if sharing and sharing.get("loads"):
+                from atom.kv_transfer.offload.tier import OffloadTierProfile
 
-                    tier = OffloadTierProfile(
-                        loads=True, min_load_tokens=0, load_chunk_tokens=1
-                    )
+                tier = OffloadTierProfile(
+                    loads=True, min_load_tokens=0, load_chunk_tokens=1
+                )
+        if strategy == "prefix_spread":
             return PrefixSpreadRouter(
                 envs.ATOM_DP_PREFIX_IDLE_TOKENS, tier, config.max_num_seqs
             )
