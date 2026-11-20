@@ -104,14 +104,15 @@ every rank computes the SAME FIRE/HOLD from the reduced values:
 
 Initial ramp
 ------------
-With ``prefill_ramp`` (``ATOM_PREFILL_INITIAL_RAMP``) the ramp starts armed and
-fires on every decision while every rank can fill ``target_fill`` of a prefill
-chunk from resumable partials plus the waiting requests that fit its free seq
-slots, and KV is below the high watermark: the same as a decode interval of 0
-(and no coalescing or adaptive wait) until the seq slots or the KV fill. One
-rank that cannot fill ``target_fill`` of a chunk, e.g. a drained rank or a
-saturated one with no free seq slot, ends the ramp for the whole group once the
-group has decode. It stays off until the group has no decode
+With ``prefill_ramp`` (``ATOM_PREFILL_INITIAL_RAMP``) and a positive decode
+interval or the adaptive policy, the only rules that hold prefill back, the ramp
+starts armed and fires on every decision while every rank fills
+``target_fill`` of a prefill chunk (``full_chunk``: a free seq slot, a waiting
+request, and admission's own probe of resumable partials plus slot-fitting
+waiting requests) and KV is below the high watermark: the same as a decode
+interval of 0 (and no adaptive wait) until the seq slots or the KV fill. One
+rank that cannot, e.g. a drained rank or a saturated one with no free seq slot,
+ends the ramp for the whole group once the group has decode. It stays off until the group has no decode
 (``G_running_dec == 0``), which re-arms it.
 
 Why SUM (not MAX)
@@ -415,9 +416,11 @@ class PrefillDelayer:
         self.prefill_decode_interval = prefill_decode_interval
         # Initial ramp: while every rank can fill target_fill of a prefill chunk
         # from resumable partials plus waiting requests that fit its free seq
-        # slots, release at once ahead of the decode interval, coalescer and
-        # adaptive rule.
-        self.prefill_ramp = bool(prefill_ramp)
+        # slots, release at once ahead of the decode interval and adaptive rule.
+        # Only those two ever hold prefill back, so only they arm it.
+        self.prefill_ramp = bool(prefill_ramp) and (
+            prefill_decode_interval > 0 or admit_policy == "adaptive"
+        )
 
         # `_FIXED_SLOTS`-slot SUM-reduce buffer (gloo-safe). Encoding:
         #   slot 0 = prefillable        (SUM → n_prefillable)
@@ -569,7 +572,6 @@ class PrefillDelayer:
             self.is_local
             and not self._first
             and running_decode_batch > 0
-            and not self.ramp_active
             and (
                 self._decode_interval_remaining > 0
                 or (
@@ -685,7 +687,8 @@ class PrefillDelayer:
         self._reduce_buf[8] = int(arrived_requests)
         self._reduce_buf[9] = 1 if blocked else 0
         self._reduce_buf[10] = 1 if unreachable else 0
-        self._reduce_buf[11] = 1 if prefillable and full_chunk else 0
+        if self.prefill_ramp:
+            self._reduce_buf[11] = 1 if prefillable and full_chunk else 0
         if self._cost_slots:
             self._reduce_buf[_FIXED_SLOTS : self._gate_at] = 0
             self._reduce_buf[_FIXED_SLOTS + self._rank] = int(prefill_cost)

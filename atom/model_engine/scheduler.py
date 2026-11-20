@@ -1347,16 +1347,38 @@ class Scheduler:
         room = max(room, self._balance_min_tokens - batched_tokens)
         return max(min(room, cap_room), 0)
 
-    def _estimate_prefill_chunk_cost(self) -> float:
-        return self._estimate_prefill_chunk(0)[0]
+    def _ramp_full_chunk(
+        self,
+        prefillable: bool,
+        running_decode_batch: int,
+        free_slots: int,
+        probed_tokens: int | None,
+    ) -> bool:
+        """The initial ramp's signal for this rank: a fresh request waits for a
+        free seq slot, and admission's own probe (`_probe_local_prefill_work`:
+        checkpoint holds, atomic heads, in-flight prefixes and parking included)
+        fills target_fill of a prefill chunk. A resumable partial alone does
+        not: that is one long prompt, not empty slots. ``probed_tokens`` is the
+        probe's count where this tick already ran it. A local delayer with no
+        decode fires anyway, so it skips the probe."""
+        delayer = self.prefill_delayer
+        if (
+            not prefillable
+            or not delayer.ramp_active
+            or free_slots == 0
+            or (delayer.is_local and not running_decode_batch)
+            or next(self._waiting_prefills(), None) is None
+        ):
+            return False
+        if probed_tokens is None:
+            probed_tokens = self._local_prefill_pending_work()[1]
+        return probed_tokens >= delayer.target_fill * self.max_num_batched_tokens
 
-    def _estimate_prefill_chunk(self, slots: int) -> tuple[float, int]:
+    def _estimate_prefill_chunk_cost(self) -> float:
         """Cost of the chunk this rank would prefill with the whole batch
         budget: resumable partials first, then the head of `waiting`, probing
         the prefix cache without recording (`can_allocate_memoized`). An
-        estimate -- the real admission may park or skip some of these seqs.
-        Also the chunk's tokens from the partials and the first `slots`
-        waiting heads: the initial ramp's fill."""
+        estimate -- the real admission may park or skip some of these seqs."""
         token_cap = self.max_num_batched_tokens
         tokens, cost = 0, 0.0
         if self._partial_prefill_count > 0:
@@ -1374,12 +1396,10 @@ class Scheduler:
                     )
                 k = min(remaining, token_cap - tokens)
                 if k <= 0:
-                    return cost, tokens
+                    return cost
                 cost += self._chunk_cost(seq.num_cached_tokens, k)
                 tokens += k
-        slot_tokens = tokens
-        heads = itertools.islice(self._waiting_prefills(), self.max_num_seqs)
-        for i, seq in enumerate(heads):
+        for seq in itertools.islice(self._waiting_prefills(), self.max_num_seqs):
             if tokens >= token_cap:
                 break
             tier_waiter = self._tier_waiter_resume(seq)
@@ -1399,9 +1419,7 @@ class Scheduler:
             if k > 0:
                 cost += self._chunk_cost(start, k)
                 tokens += k
-                if i < slots:
-                    slot_tokens += k
-        return cost, slot_tokens
+        return cost
 
     def _balance_prefill_step(self, own: float) -> None:
         """Set this prefill step's cost target from every DP rank's chunk cost.
@@ -2299,12 +2317,8 @@ class Scheduler:
             running_decode_batch = max(
                 0, len(self.running) - self._partial_prefill_count
             )
-            # Seq slots a fresh admission fills; a parked remote-KV load holds
-            # back only another remote load, as admission does.
-            free_slots = max(0, self.max_num_seqs - len(self.running))
-            # The tokens the ramp could prefill this tick: probed against the
-            # prefix cache, so a mostly cached prompt is not a full chunk.
-            ramp_tokens = None
+            # The tokens admission's probe counts this tick, where it ran.
+            probed_tokens = None
             protects_decode = self.prefill_delayer.protects_decode(running_decode_batch)
             if protects_decode or (
                 self._local_prefill_coalescing and not running_decode_batch
@@ -2319,7 +2333,7 @@ class Scheduler:
                 pending_tokens = 0
             elif self._local_prefill_coalescing:
                 prefillable, pending_tokens = self._local_prefill_pending_work()
-                ramp_tokens = pending_tokens
+                probed_tokens = pending_tokens
             else:
                 prefillable = self._can_admit_head_prefill()
                 pending_tokens = min(
@@ -2332,20 +2346,13 @@ class Scheduler:
             # skipped inside the decode-protection window: whether the delayer
             # holds there depends on every rank's decode load, known only after
             # the reduce (with no decode anywhere it fires through that window).
-            prefill_cost = 0.0
-            if self.cost_balance and prefillable:
-                prefill_cost, slot_tokens = self._estimate_prefill_chunk(free_slots)
-                if ramp_tokens is None:
-                    ramp_tokens = slot_tokens
+            prefill_cost = (
+                self._estimate_prefill_chunk_cost()
+                if self.cost_balance and prefillable
+                else 0.0
+            )
             waiting_requests = len(self.waiting) + self._partial_prefill_count
-            full_chunk = False
-            if prefillable and self.prefill_delayer.ramp_active:
-                if ramp_tokens is None:
-                    ramp_tokens = self._local_prefill_pending_work()[1]
-                full_chunk = (
-                    ramp_tokens
-                    >= self.prefill_delayer.target_fill * self.max_num_batched_tokens
-                )
+            free_slots = max(0, self.max_num_seqs - len(self.running))
             decision = self.prefill_delayer.should_allow_prefill(
                 prefillable=prefillable,
                 pending_tokens=pending_tokens,
@@ -2353,7 +2360,12 @@ class Scheduler:
                 # which are NOT decode load — counting them would defeat the
                 # coalescer's "no decode → fire" fast path.
                 running_decode_batch=running_decode_batch,
-                kv_usage=0.0 if protects_decode else self._kv_usage(),
+                # The ramp ends on high KV, protection window or not.
+                kv_usage=(
+                    0.0
+                    if protects_decode and not self.prefill_delayer.ramp_active
+                    else self._kv_usage()
+                ),
                 has_partial=self._partial_prefill_count > 0,
                 oldest_waiting_age_ms=(
                     self._oldest_waiting_prefill_age_ms()
@@ -2374,7 +2386,9 @@ class Scheduler:
                 # decode batch -- partials plus waiting heads up to free slots
                 admittable_requests=self._partial_prefill_count
                 + min(len(self.waiting), free_slots),
-                full_chunk=full_chunk,
+                full_chunk=self._ramp_full_chunk(
+                    prefillable, running_decode_batch, free_slots, probed_tokens
+                ),
             )
         else:
             decision = PrefillDecision(allow=True, prefillable_ranks=0)

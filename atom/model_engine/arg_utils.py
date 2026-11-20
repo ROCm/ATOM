@@ -776,11 +776,11 @@ class EngineArgs:
             "'adaptive' fires once the held requests' accumulated cost reaches "
             "the fixed prefill cost times the decode batch, fitted from measured "
             "step times; on DP=1, PP=1 it enables the delayer as a positive "
-            "interval does. The default-on ATOM_PREFILL_INITIAL_RAMP releases "
-            "full chunks from resumable partials and slot-fitting waiting "
-            "requests ahead of either policy until a rank cannot fill or KV "
-            "reaches the high watermark, overriding a positive interval and "
-            "adaptive; set it to 0 to keep them exact.",
+            "interval does. With a positive interval or 'adaptive', "
+            "ATOM_PREFILL_INITIAL_RAMP (on by default) releases full chunks "
+            "while every rank has a free seq slot and a waiting request, until "
+            "a rank cannot fill or KV reaches the high watermark, and re-arms "
+            "once the group has no decode; set it to 0 to keep them exact.",
         )
         parser.add_argument(
             "--mark-trace",

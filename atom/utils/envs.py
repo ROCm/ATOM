@@ -1314,14 +1314,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PREFILL_DECODE_INTERVAL": lambda: int(
         os.getenv("ATOM_PREFILL_DECODE_INTERVAL", "0")
     ),
-    # Initial ramp (on by default, "0" disables), whatever the admit policy: while
-    # every DP rank can fill target_fill of a prefill chunk from resumable
-    # partials plus waiting requests that fit its free seq slots (probed against
-    # the prefix cache), prefill is released at once, ahead of the decode
-    # interval, coalescer and adaptive rule, so the batch fills with
-    # back-to-back full prefills; it ends when a rank cannot (or KV runs high)
-    # and re-arms once the group has no decode. It changes a decision only with
-    # a positive decode interval or the adaptive policy, and overrides them.
+    # Initial ramp, armed only with a positive ATOM_PREFILL_DECODE_INTERVAL or the
+    # adaptive admit policy (on there by default, "0" disables): while every DP
+    # rank has a free seq slot, a waiting request, and work that fills
+    # target_fill of a prefill chunk by admission's own probe, prefill is
+    # released at once, ahead of the interval and the adaptive rule. It ends when
+    # a rank cannot (or KV runs high) and re-arms once the group has no decode.
     "ATOM_PREFILL_INITIAL_RAMP": lambda: (
         os.getenv("ATOM_PREFILL_INITIAL_RAMP", "1").lower() in ("1", "true")
     ),

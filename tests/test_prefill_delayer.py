@@ -654,7 +654,8 @@ class TestPrefillDecodeInterval:
         # protection.
         assert call(d, running_decode_batch=50, **full) is True
         assert d._stat_fire_ramp == 1
-        assert d.ramp_active and not d.protects_decode(50)
+        # The interval it armed protects decode; the ramp still decides first.
+        assert d.ramp_active and d.protects_decode(50)
         d.notify_prefill_executed()
         # The free slots no longer fill a chunk: the ramp ends, the interval holds.
         for _ in range(3):
@@ -689,16 +690,21 @@ class TestPrefillDecodeInterval:
         assert call(d, running_decode_batch=50, **full) is True
         assert d._stat_fire_ramp == 2
 
-    def test_ramp_fires_ahead_of_the_coalescer(self):
-        # No decode interval: the ramp releases even where the coalescer would
-        # hold (pending below its fill target).
-        d = make_delayer(prefill_ramp=True, target_fill=0.9)
-        assert call(d, pending_tokens=MAX_BATCHED, full_chunk=True) is True
-        assert call(d, pending_tokens=1, full_chunk=True) is True
-        assert d._stat_fire_ramp == 1
-        # Ramp over: the same tick holds under the coalescer's fill target.
-        assert call(d, pending_tokens=1) is False
-        assert not d.ramp_active and d._stat_fire_ramp == 1
+    @pytest.mark.parametrize(
+        "kw, armed",
+        [
+            ({}, False),
+            ({"prefill_decode_interval": 3}, True),
+            ({"admit_policy": "adaptive"}, True),
+        ],
+    )
+    def test_ramp_arms_only_with_an_interval_or_adaptive(self, kw, armed):
+        # Interval 0 with the interval policy holds nothing back: no ramp, and
+        # its reduce slot stays 0.
+        d = make_delayer(prefill_ramp=True, **kw)
+        assert d.prefill_ramp is armed and d.ramp_active is armed
+        call(d, pending_tokens=MAX_BATCHED, full_chunk=True)
+        assert d._reduce_buf[FULL_CHUNK] == int(armed)
 
     def test_ramp_needs_every_rank_full(self):
         d = make_delayer(dp_size=2, prefill_decode_interval=3, prefill_ramp=True)

@@ -2,7 +2,6 @@
 # Tests for atom/model_engine/scheduler.py — public API only
 
 
-import contextlib
 import logging
 import time
 from collections import deque
@@ -22,7 +21,7 @@ from atom.kv_transfer.disaggregation.types import (
 from atom.kv_transfer.offload._offload_common import OffloadSchedulerMixin
 from atom.model_engine.early_load import EarlyLoadState
 from atom.model_engine.engine_stats import EngineStats
-from atom.model_engine.prefill_delayer import PrefillDecision
+from atom.model_engine.prefill_delayer import PrefillDecision, PrefillDelayer
 from atom.model_engine.scheduler import (
     ScheduledBatch,
     ScheduledBatchOutput,
@@ -1858,13 +1857,16 @@ class _RampDelayer:
         return False
 
     def should_allow_prefill(self, prefillable, pending_tokens, **kwargs):
-        self.reports.append({"pending_tokens": pending_tokens, **kwargs})
+        self.reports.append(
+            {"prefillable": prefillable, "pending_tokens": pending_tokens, **kwargs}
+        )
         return PrefillDecision(allow=False, prefillable_ranks=int(prefillable))
 
 
 class _ProtectingRampDelayer(_RampDelayer):
-    """In its decode-protection window: the scheduler only checks prefill
-    exists, so the ramp probes its fill itself."""
+    """In its decode-protection window (the decode interval a ramp FIRE arms):
+    the scheduler only checks prefill exists, as on main, and the ramp probes
+    its fill itself."""
 
     def protects_decode(self, running_decode_batch):
         return True
@@ -1878,8 +1880,9 @@ class _LocalRampDelayer(_RampDelayer):
 
 
 class TestInitialRampFullChunk:
-    """`full_chunk`: resumable partials plus the waiting prompts that fit the
-    free seq slots reach target_fill (0.5) of the 64-token chunk, 32 tokens."""
+    """`full_chunk`: a fresh request waits for a free seq slot, and admission's
+    own probe of the resumable partials plus the waiting prompts that fit the
+    free seq slots reaches target_fill (0.5) of the 64-token chunk, 32 tokens."""
 
     def _sched(self):
         return Scheduler(
@@ -1890,6 +1893,16 @@ class TestInitialRampFullChunk:
         sched.set_prefill_delayer(delayer)
         sched.schedule()
         return delayer.reports[-1]
+
+    def _partial(self, sched, seq_factory, tokens):
+        """A seq mid-chunked-prefill with ``tokens - 8`` tokens left."""
+        part = seq_factory(list(range(100, 100 + tokens)))
+        sched.add(part)
+        sched.schedule()
+        part.num_cached_tokens = 8
+        part.is_partial_prefill = True
+        sched._partial_prefill_count = 1
+        return part
 
     def test_waiting_prompts_reach_target_fill(self, seq_factory):
         sched = self._sched()
@@ -1906,43 +1919,60 @@ class TestInitialRampFullChunk:
 
     def test_partial_counts_toward_target_fill(self, seq_factory):
         sched = self._sched()
-        part = seq_factory(list(range(100, 124)))
-        sched.add(part)
-        sched.schedule()
-        # Mid-chunked-prefill with 16 tokens left; it holds one of the 4 slots.
-        part.num_cached_tokens = 8
-        part.is_partial_prefill = True
-        sched._partial_prefill_count = 1
+        self._partial(sched, seq_factory, 24)  # 16 tokens left, one slot
         sched.add(seq_factory(list(range(10, 30))))
         report = self._report(sched, _RampDelayer())
         assert report["full_chunk"] is True  # 16 + 20 >= 32
         assert report["admittable_requests"] == 2
 
-    def test_parked_remote_kv_leaves_fresh_slots(self, seq_factory):
+    def test_a_partial_alone_is_not_a_full_chunk(self, seq_factory):
+        """One long prompt's remaining chunks fill a chunk every tick, but no
+        request waits for a slot: the ramp is for empty slots, not for it."""
         sched = self._sched()
-        sched.cost_balance = True
+        self._partial(sched, seq_factory, 120)
+        report = self._report(sched, _RampDelayer())
+        assert report["prefillable"] and report["full_chunk"] is False
+
+    def test_no_free_slot_is_not_a_full_chunk(self, seq_factory):
+        sched = self._sched()
+        for start in (10, 30, 50, 70):
+            sched.add(seq_factory(list(range(start, start + 4))))
+        sched.schedule()  # the 4 slots are running
+        sched.add(seq_factory(list(range(200, 240))))
+        assert self._report(sched, _RampDelayer())["full_chunk"] is False
+
+    @pytest.mark.parametrize("cost_balance", [False, True])
+    def test_a_checkpoint_held_partial_is_not_fill(self, seq_factory, cost_balance):
+        """Admission skips a held partial this tick, so the probe does too,
+        with or without the DP cost estimate."""
+        sched = self._sched()
+        sched.cost_balance = cost_balance
+        part = self._partial(sched, seq_factory, 120)
+        sched._checkpoint_holds[part.id] = object()
+        sched.add(seq_factory(list(range(10, 30))))
+        assert self._report(sched, _RampDelayer())["full_chunk"] is False  # 20
+
+    def test_parked_remote_kv_reserves_slots(self, seq_factory):
+        """With 3 of the 4 slots parked for remote-KV loads, admission's probe
+        counts only the first fresh prompt, as admission would admit it."""
+        sched = self._sched()
         sched.add(seq_factory(list(range(10, 30))))
         sched.add(seq_factory(list(range(30, 50))))
-        # Parked remote-KV loads hold back only another remote load: both
-        # fresh prompts still fit the 4 seq slots, as admission sees them.
         sched._num_parked_remote_kv = 3
         report = self._report(sched, _RampDelayer())
-        assert report["full_chunk"] is True  # 20 + 20 >= 32
-        assert report["admittable_requests"] == 2
+        assert report["full_chunk"] is False  # 20 < 32
 
-    def test_default_dp_scans_the_queue_once(self, seq_factory):
+    def test_default_dp_scans_the_backlog_once(self, seq_factory):
         sched = self._sched()
         for start in (10, 30, 50):
             sched.add(seq_factory(list(range(start, start + 20))))
-        sched._num_parked_remote_kv = 3
         with mock.patch.object(
             sched, "_waiting_new_token_count", wraps=sched._waiting_new_token_count
         ) as waiting_scan:
             report = self._report(sched, _RampDelayer())
         assert waiting_scan.call_count == 1
-        # Backlog still feeds the coalescer; only the first prompt fits a slot.
-        assert report["pending_tokens"] == 60
-        assert report["full_chunk"] is False
+        assert report["pending_tokens"] == 60  # the coalescer's backlog
+        assert report["full_chunk"] is True
 
     def _cached_head(self, sched, seq_factory):
         """A 20-token prompt whose first 16 tokens hit the prefix cache, ahead
@@ -1966,49 +1996,16 @@ class TestInitialRampFullChunk:
         assert report["full_chunk"] is False
         assert report["pending_tokens"] == 40  # the coalescer keeps its bound
 
-    def test_decode_protection_window_probes_the_fill(self, seq_factory):
+    def test_protection_window_keeps_mains_existence_check(self, seq_factory):
         sched = self._sched()
         with self._cached_head(sched, seq_factory):
             report = self._report(sched, _ProtectingRampDelayer())
-        assert report["full_chunk"] is False
+        assert report["prefillable"] is True and report["full_chunk"] is False
         sched = self._sched()
         sched.add(seq_factory(list(range(10, 30))))
         sched.add(seq_factory(list(range(30, 50))))
-        assert self._report(sched, _ProtectingRampDelayer())["full_chunk"] is True
-
-    @pytest.mark.parametrize("cached", [False, True])
-    def test_cost_balance_carries_the_fill(self, seq_factory, cached):
-        """The DP cost estimate already probes each head: the ramp reads its
-        token count and runs no probe of its own."""
-        sched = self._sched()
-        sched.cost_balance = True
-        if cached:
-            patch = self._cached_head(sched, seq_factory)
-        else:
-            sched.add(seq_factory(list(range(10, 30))))
-            sched.add(seq_factory(list(range(30, 50))))
-            patch = contextlib.nullcontext()
-        with (
-            patch,
-            mock.patch.object(
-                sched,
-                "_local_prefill_pending_work",
-                side_effect=AssertionError("the cost estimate carries the fill"),
-            ),
-        ):
-            report = self._report(sched, _RampDelayer())
-        assert report["full_chunk"] is (not cached)
-        assert report["prefill_cost"] > 0
-
-    def test_cost_balance_fill_counts_only_free_slots(self, seq_factory):
-        sched = self._sched()
-        sched.cost_balance = True
-        sched.add(seq_factory(list(range(10, 30))))
-        sched.add(seq_factory(list(range(30, 50))))
-        sched._num_parked_remote_kv = 3
-        cost, fill = sched._estimate_prefill_chunk(1)
-        assert fill == 20
-        assert cost == sched._estimate_prefill_chunk_cost()
+        report = self._report(sched, _ProtectingRampDelayer())
+        assert report["prefillable"] is True and report["full_chunk"] is True
 
     def test_local_coalescer_reuses_its_probe(self, seq_factory):
         sched = self._sched()
@@ -2026,6 +2023,88 @@ class TestInitialRampFullChunk:
         assert probe.call_count == 1
         assert report["pending_tokens"] == 24
         assert report["full_chunk"] is False
+
+    @pytest.mark.parametrize("delayer", ["local_no_decode", "ramp_off"])
+    def test_no_probe_where_the_ramp_cannot_fire(self, seq_factory, delayer):
+        """A local delayer with no decode fires anyway; a delayer out of its
+        ramp ignores the flag: neither pays for the probe."""
+        sched = self._sched()
+        sched.add(seq_factory(list(range(10, 30))))
+        sched.add(seq_factory(list(range(30, 50))))
+        d = _LocalRampDelayer() if delayer == "local_no_decode" else _RampDelayer()
+        d.ramp_active = delayer != "ramp_off"
+        with mock.patch.object(
+            sched,
+            "_local_prefill_pending_work",
+            side_effect=AssertionError("no probe"),
+        ):
+            assert self._report(sched, d)["full_chunk"] is False
+
+
+class TestInitialRampWithTheDelayer:
+    """The real delayer (DP 1, decode interval 2) and the real scheduler, with
+    the engine's prefill report, from startup."""
+
+    def _pair(self, ramp):
+        sched = Scheduler(
+            MockConfig(num_kvcache_blocks=200, max_model_len=512, max_num_seqs=4)
+        )
+        delayer = PrefillDelayer(
+            dp_size=1,
+            cpu_group=None,
+            max_num_batched_tokens=sched.max_num_batched_tokens,
+            target_fill=0.5,
+            prefill_decode_interval=2,
+            prefill_ramp=ramp,
+        )
+        sched.set_prefill_delayer(delayer)
+        return sched, delayer
+
+    def _run(self, sched, ticks):
+        """Each tick's prefilled tokens (0 for a decode), reporting a prefill
+        forward to the delayer as `EngineCore` does."""
+        kinds = []
+        for _ in range(ticks):
+            batch, seqs = sched.schedule()
+            kinds.append(batch.total_tokens_num_prefill)
+            if batch.total_seqs_num_prefill:
+                sched.prefill_delayer.notify_prefill_executed(
+                    batch.total_tokens_num_prefill
+                )
+            _step(sched, batch, list(seqs))
+        return kinds
+
+    def _decoding(self, sched, seq_factory, start):
+        seq = seq_factory(
+            list(range(start, start + 8)), sampling_params=SamplingParams(max_tokens=64)
+        )
+        sched.add(seq)
+        return seq
+
+    @pytest.mark.parametrize("ramp", [True, False])
+    def test_the_ramp_fills_empty_slots_back_to_back(self, seq_factory, ramp):
+        """A burst at startup: three 32-token prompts, each a full chunk while a
+        slot is free. The first tick (no decode yet) prefills two; the ramp
+        prefills the third on the next tick, where the interval would hold."""
+        sched, delayer = self._pair(ramp)
+        for start in (100, 140, 180):
+            sched.add(seq_factory(list(range(start, start + 32))))
+        kinds = self._run(sched, 2)
+        assert kinds[0] == 64
+        assert kinds[1] == (32 if ramp else 0)
+        assert delayer._stat_fire_ramp == int(ramp)
+
+    def test_a_long_prompt_alone_lets_decode_run(self, seq_factory):
+        """A short prompt and a 256-token one at startup. The ramp admits the
+        waiting long prompt's first chunk; then only its partial is left. It
+        fills a chunk every tick, but no request waits for a slot, so the ramp
+        ends and the interval lets the short request decode."""
+        sched, delayer = self._pair(True)
+        self._decoding(sched, seq_factory, 10)
+        sched.add(seq_factory(list(range(100, 356))))
+        kinds = self._run(sched, 3)
+        assert kinds == [8, 64, 0]
+        assert not delayer.ramp_active and delayer._stat_fire_ramp == 1
 
 
 class TestOldestWaitingPrefillAge:
