@@ -849,7 +849,8 @@ pub(crate) mod tests {
         "<think>",
     ];
 
-    /// A word-level tokenizer with chat tokens, which wraps prompts in `<s>`.
+    /// A word-level tokenizer with chat tokens; `entry` adds a config that
+    /// wraps prompts in `<s>`.
     pub(crate) fn description() -> Value {
         let added: Vec<&str> = ADDED.into_iter().chain(["</think>"]).collect();
         let words = WORDS.into_iter().chain(PROBE_WORDS);
