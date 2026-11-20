@@ -54,8 +54,7 @@ def server(monkeypatch):
     def encode(text, **_kw):
         return [0] * (LONG_PROMPT_TOKENS if text == "<long prompt>" else 2)
 
-    # Only what the engine does: count what it is handed. Any cut is the
-    # production code's (`_prepare_prompt`).
+    # Only what the engine does: count what it is handed.
     async def fake_generate_async(prompt, _sampling, _request_id, **kwargs):
         calls.generate.append((prompt, kwargs))
         output = {
@@ -110,6 +109,17 @@ def _messages(**kwargs):
         model="m", messages=[AnthropicMessage(role="user", content="hi")], **kwargs
     )
     return asyncio.run(api_server.anthropic_messages(request, None))
+
+
+def _post(path, body):
+    async def post():
+        transport = httpx.ASGITransport(app=api_server.app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as client:
+            return await client.post(path, json=body)
+
+    return asyncio.run(post())
 
 
 def _responses(body):
@@ -239,6 +249,51 @@ class TestNotCut:
         assert error["message"].startswith("This model's maximum context length")
 
     @pytest.mark.parametrize(
+        "path, body",
+        [
+            ("/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]}),
+            ("/v1/completions", {"prompt": "<long prompt>"}),
+        ],
+    )
+    def test_chat_and_completions_refuse_with_openais_context_code(
+        self, server, monkeypatch, path, body
+    ):
+        async def refuse(*_a, **_kw):
+            # What admission raises for an over-long request.
+            api_server._validate_context_length(8000, 4096, MAX_CTX)
+            yield {}
+
+        monkeypatch.setattr(api_server, "generate_async", refuse)
+        reply = _post(path, {"model": "m", "max_tokens": 4096, **body})
+        assert reply.status_code == 400
+        error = reply.json()["error"]
+        assert error["code"] == "context_length_exceeded"
+        assert error["message"].startswith("This model's maximum context length")
+
+    @pytest.mark.parametrize(
+        "path, body",
+        [
+            ("/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]}),
+            ("/v1/responses", {"input": "hi"}),
+        ],
+    )
+    def test_any_other_value_error_keeps_code_400(
+        self, server, monkeypatch, path, body
+    ):
+        async def refuse(*_a, **_kw):
+            raise ValueError("bad request")
+            yield {}
+
+        monkeypatch.setattr(api_server, "generate_async", refuse)
+        reply = _post(path, {"model": "m", "max_tokens": 16, **body})
+        assert reply.status_code == 400
+        assert reply.json()["error"] == {
+            "message": "bad request",
+            "type": "invalid_request_error",
+            "code": 400,
+        }
+
+    @pytest.mark.parametrize(
         "prompt_tokens, max_tokens, message",
         [
             # The prompt fits, its output does not: Claude Code lowers max_tokens.
@@ -290,15 +345,17 @@ class TestNotCut:
         )
 
     @staticmethod
-    def _with_mid_system(server, monkeypatch, template):
+    def _with_mid_system(server, monkeypatch, template, **request_kw):
         monkeypatch.setattr(api_server, "apply_chat_template", template)
-        request = AnthropicMessagesRequest(
-            model="m",
-            max_tokens=16,
-            messages=[
+        messages = request_kw.pop(
+            "messages",
+            [
                 AnthropicMessage(role="user", content="hi"),
                 AnthropicMessage(role="system", content="reminder"),
             ],
+        )
+        request = AnthropicMessagesRequest(
+            model="m", max_tokens=16, messages=messages, **request_kw
         )
         return asyncio.run(api_server.anthropic_messages(request, None))
 
@@ -325,7 +382,31 @@ class TestNotCut:
 
         reply = self._with_mid_system(server, monkeypatch, fail)
         # Not the retry-on-fold 400: folding would fail the same way.
-        assert "Unexpected role" not in json.loads(reply.body)["error"]["message"]
+        assert reply.status_code == 500
+        assert json.loads(reply.body)["error"]["message"] == (
+            "Tool names may not contain '::'."
+        )
+
+    def test_a_template_with_no_system_role_is_not_blamed_on_a_mid_one(
+        self, server, monkeypatch
+    ):
+        # Gemma style: no system message at all. With only the top-level system
+        # prompt there is nothing mid-conversation to fold, so the original
+        # error comes back.
+        def no_system(_tok, _enc, messages, **_kw):
+            if any(m.role == "system" for m in messages):
+                raise TemplateError("System role not supported")
+            return "<rendered prompt>"
+
+        reply = self._with_mid_system(
+            server,
+            monkeypatch,
+            no_system,
+            system="top",
+            messages=[AnthropicMessage(role="user", content="hi")],
+        )
+        assert reply.status_code == 500
+        assert json.loads(reply.body)["error"]["message"] == "System role not supported"
 
     def test_a_failing_re_render_keeps_the_original_error(self, server, monkeypatch):
         def refuse_then_raise(_tok, _enc, messages, **_kw):
@@ -334,9 +415,10 @@ class TestNotCut:
             raise ValueError("something unrelated")
 
         reply = self._with_mid_system(server, monkeypatch, refuse_then_raise)
-        message = json.loads(reply.body)["error"]["message"]
-        assert "something unrelated" not in message
-        assert "Unexpected role" not in message
+        assert reply.status_code == 500
+        assert json.loads(reply.body)["error"]["message"] == (
+            "System message must be at the beginning."
+        )
 
 
 class TestStructuredResponsesSeeding:
