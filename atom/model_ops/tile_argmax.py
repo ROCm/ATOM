@@ -28,6 +28,21 @@ def argmax_lowest_id(key, ids, mask, sentinel):
 
 
 @triton.jit
+def max_of_tiles(part_max_ptr, row, stride, num_tiles, BLOCK_TILE):
+    """One row's tile maxima, stored ``stride`` apart for ``num_tiles`` tiles
+    (``-inf`` past them), and their max: the row max the softmax combine and
+    a folded reduction (`sparse_q_select`) both take, so they agree bit for
+    bit."""
+    offs_tile = tl.arange(0, BLOCK_TILE)
+    maxes = tl.load(
+        part_max_ptr + offs_tile * stride + row,
+        mask=offs_tile < num_tiles,
+        other=float("-inf"),
+    )
+    return maxes, tl.max(maxes, axis=0)
+
+
+@triton.jit
 def argmax_of_tiles(part_val_ptr, part_idx_ptr, row, num_rows, num_tiles, BLOCK_TILE):
     """One row's ``(max, lowest id)`` from its tiles' pairs, stored
     ``[num_tiles, num_rows]``, picking among tiles that tie as

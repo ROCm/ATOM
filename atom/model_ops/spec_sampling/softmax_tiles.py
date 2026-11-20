@@ -15,7 +15,7 @@ op uses it too) is also the verify's per-tile raw argmax.
 import triton
 import triton.language as tl
 
-from atom.model_ops.tile_argmax import argmax_of_tiles
+from atom.model_ops.tile_argmax import argmax_of_tiles, max_of_tiles
 
 
 @triton.jit
@@ -80,10 +80,7 @@ def softmax_combine_kernel(
     row = tl.program_id(0)
     offs_tile = tl.arange(0, BLOCK_TILE)
     tile_mask = offs_tile < num_tiles
-    maxes = tl.load(
-        part_max_ptr + offs_tile * num_rows + row, mask=tile_mask, other=float("-inf")
-    )
-    global_max = tl.max(maxes, axis=0)
+    maxes, global_max = max_of_tiles(part_max_ptr, row, num_rows, num_tiles, BLOCK_TILE)
     tl.store(row_max_ptr + row, global_max)
     if WITH_INV_Z:
         sums = tl.load(

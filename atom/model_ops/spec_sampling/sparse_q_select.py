@@ -11,10 +11,11 @@ The cut is by level, the gap below the row max in 1/8 nats, not by exact value:
 the boundary level's lowest ids fill n = min(K, top-k, ids within 19 nats).
 That only moves acceptance: the draft samples from what is stored.
 Launches: histogram (which first reduces the row max from stage 1's tile
-maxima; past 16 rows, whole vocab or TP, a separate combine does, and a
-separate cut launch makes the cut), compact (which first makes the row's cut from the histogram tables),
+maxima), compact (which first makes the row's cut from the histogram tables),
 finalize (normalize, the exponential race over the stored entries, and the
-row's raw argmax from stage 1's tile pairs). Each folded reduction reads the
+row's raw argmax from stage 1's tile pairs). Past 16 rows, whole vocab or
+TP, the softmax combine reduces the row max and raw argmax and a cut launch
+makes the cut, as their own launches. Each folded reduction reads the
 same per-tile inputs in the same fixed order a separate launch did, so the
 result does not change with the fold. Both histogram and compact level through
 `_q_level`.
@@ -31,7 +32,7 @@ import triton.language as tl
 from atom.model_ops.sampler import SAMPLER_EPS
 from atom.model_ops.spec_sampling.sampling_scratch import Region
 from atom.model_ops.spec_sampling.softmax_tiles import race_key, softmax_combine_kernel
-from atom.model_ops.tile_argmax import argmax_lowest_id, argmax_of_tiles
+from atom.model_ops.tile_argmax import argmax_lowest_id, argmax_of_tiles, max_of_tiles
 
 # Histogram and compact tile V identically (the cut hands each tile a slot range).
 _Q_BLOCK_V = 4096
@@ -110,13 +111,9 @@ def _dspark_q_histogram(
     ):
         return
     if REDUCE_ROW_MAX:
-        offs_part = tl.arange(0, BLOCK_PARTS)
-        maxes = tl.load(
-            part_max_ptr + offs_part * part_stride + row,
-            mask=offs_part < num_parts,
-            other=float("-inf"),
+        _, row_max = max_of_tiles(
+            part_max_ptr, row, part_stride, num_parts, BLOCK_PARTS
         )
-        row_max = tl.max(maxes, axis=0)
         if tile == 0:
             tl.store(row_max_ptr + row, row_max)
     else:
@@ -418,7 +415,9 @@ def _dspark_q_finalize(
 
     ``probs.div_(noise).argmax()`` over the stored entries, lowest id on a tie.
     A greedy row, or one with nothing stored or no positive race key, drafts
-    its logits' lowest-id raw argmax (reduced here from stage 1's tile pairs)
+    its logits' lowest-id raw argmax (with ``ARGMAX_FROM_PARTS``, up to 16
+    rows, reduced here from stage 1's tile pairs; past that, the combine's
+    ``row_argmax``)
     and, if it has a destination, stores the exact delta on it: the id is not a
     draw from any softmax, and the accept rule must see the distribution it
     actually came from.
@@ -614,8 +613,9 @@ def select_and_draw_q(
 
     ``part_max`` / ``part_amax_val`` / ``part_amax_idx`` are stage 1's
     ``[tiles, B]`` partials (each tile's max score, and its raw max and
-    lowest id), which the histogram and finalize reduce; ``row_max`` is the
-    row max's scratch; ``scratch`` is carved from `q_select_scratch`.
+    lowest id), which the histogram and finalize reduce up to `_FOLD_ROWS`
+    rows and the softmax combine past that; ``row_max`` is the row max's
+    scratch; ``scratch`` is carved from `q_select_scratch`.
     Arguments are as `dspark_markov_sample` documents them, which checks them.
     """
     num_rows = q_row_base.shape[0]

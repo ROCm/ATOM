@@ -9,8 +9,8 @@ the stored set, so truncation costs acceptance, never exactness (`Q_WIDTH`).
 Four launches per position: GEMV + 1/T into the fp32 ``s`` scratch with tile
 partials; then histogram, compact and finalize (`sparse_q_select`), which
 reduce the row max, the cut and the raw argmax from those partials and tables
-themselves (finalize normalizes over the stored set). Past 16 rows the whole
-vocab keeps the softmax combine and the cut as their own launches (six).
+themselves (finalize normalizes over the stored set). Past 16 rows, whole vocab
+or TP, the softmax combine and the cut run as their own launches (six).
 Fixed-order reductions, no atomics: TP ranks must store and draw alike.
 CUDA-graph safe: seed, row bases and filters are device tensors; position and
 noise offset are static host ints; no data-dependent grid.
@@ -187,7 +187,8 @@ class SampleScratch(NamedTuple):
     part_max: torch.Tensor  # [gemv tiles, B] fp32, each tile's max of s
     part_amax_val: torch.Tensor  # [gemv tiles, B] fp32, raw max
     part_amax_idx: torch.Tensor  # [gemv tiles, B] int32, its lowest id
-    row_max: torch.Tensor  # [B] fp32, from the histogram for the compaction
+    # [B] fp32, from the histogram up to 16 rows, the combine past that
+    row_max: torch.Tensor
     select: QSelectScratch
 
 
@@ -393,7 +394,8 @@ class SampleTPScratch(NamedTuple):
     # [gemv tiles, 3, B] fp32: each tile's max of s, raw max and lowest id
     # (int32 bits), tile-major so that one gather is the whole row's tiles.
     parts: torch.Tensor
-    row_max: torch.Tensor  # [B] fp32, from the histogram for the compaction
+    # [B] fp32, from the histogram up to 16 rows, the combine past that
+    row_max: torch.Tensor
     select: QSelectTPScratch
 
 
