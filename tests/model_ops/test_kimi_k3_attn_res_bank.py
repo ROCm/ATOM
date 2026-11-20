@@ -317,6 +317,8 @@ def _model_stage(monkeypatch, modules, layers, config, start, end, model_class=N
             compilation_config=SimpleNamespace(level=CompilationLevel.NO_COMPILATION),
         )
     )
+    assert isinstance(model._column_gather_setup, kimi._ColumnGatherSetup)
+    assert list(model.children())[-1] is model._column_gather_setup
     if group.is_last_rank:
         model.output_attn_res.score_weight = torch.ones(HIDDEN)
     return model

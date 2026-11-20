@@ -836,10 +836,34 @@ class KimiSparseMoeBlock(nn.Module):
             columns_only=columns_only,
         )
 
+    def _column_tail_producer_supported(self) -> bool:
+        """Whether the settled producer can emit columns, independent of a step."""
+        if (
+            self.tp_size != 8
+            or self.hidden_dim != 7168
+            or self.moe_hidden_size != 3584
+            or self.front_proj is None
+            or self.front_proj.merged_weight is None
+            or self.shared_experts is None
+            or not self.shared_experts.down_proj.supports_out()
+            or self.routed_expert_norm is None
+        ):
+            return False
+        weight, norm = self.routed_expert_up_proj.weight, self.routed_expert_norm
+        return (
+            not self.fuse_routed_norm_quant
+            and not self.fuse_routed_triton_mxfp4_quant
+            and weight.shape == (7168, 3584)
+            and norm.weight.shape == (3584,)
+            and weight.dtype == norm.weight.dtype == torch.bfloat16
+            and weight.device == norm.weight.device
+            and weight.stride(-1) == norm.weight.stride(-1) == 1
+        )
+
     def _column_tail_eligible(self, tokens, dtype, device) -> bool:
         from atom.plugin import is_plugin_mode
 
-        if self.tp_size != 8:
+        if not self._column_tail_producer_supported():
             return False
         ctx = get_forward_context().context
         if (
@@ -857,21 +881,10 @@ class KimiSparseMoeBlock(nn.Module):
         comm = getattr(tp_group.device_communicator, "ca_comm", None)
         if comm is None or comm.disabled:
             return False
-        weight, norm = self.routed_expert_up_proj.weight, self.routed_expert_norm
         return (
-            norm is not None
-            and not self.fuse_routed_norm_quant
-            and not self.fuse_routed_triton_mxfp4_quant
-            and 1 <= tokens <= 64
+            1 <= tokens <= 64
             and dtype == torch.bfloat16
-            and weight.shape == (7168, 3584)
-            and norm.weight.shape == (3584,)
-            and all(
-                tensor.dtype == dtype
-                and tensor.device == device
-                and tensor.stride(-1) == 1
-                for tensor in (weight, norm.weight)
-            )
+            and self.routed_expert_up_proj.weight.device == device
         )
 
     def _can_column_tail(self, latent: torch.Tensor, shared: torch.Tensor) -> bool:
@@ -887,10 +900,7 @@ class KimiSparseMoeBlock(nn.Module):
 
     def _can_defer_column_tail(self, hidden_states: torch.Tensor) -> bool:
         return (
-            self.front_proj is not None
-            and self.front_proj.merged_weight is not None
-            and self.shared_experts.down_proj.supports_out()
-            and hidden_states.ndim == 2
+            hidden_states.ndim == 2
             and hidden_states.shape[1] == 7168
             and hidden_states.stride(1) == 1
             and self._column_tail_eligible(
@@ -2547,6 +2557,17 @@ def _aux_from_next_residual(output: tuple, _site: nn.Module) -> torch.Tensor | N
     return KimiDecoderLayer.aux_hidden_state((prefix, first, second, bank))
 
 
+class _ColumnGatherSetup(nn.Module):
+    """Run peer setup after the producer's child weight hooks have finished."""
+
+    def __init__(self, initialize: Callable[[], None]):
+        super().__init__()
+        self.initialize = initialize
+
+    def process_weights_after_loading(self) -> None:
+        self.initialize()
+
+
 # Per phase: a prefill recording splits the MLA and KDA layers around their
 # regions, a decode one (TR_HYBRID) runs each as one region, and a decode
 # bucket is recorded first at the shapes a prefill bucket of its rows has.
@@ -2586,7 +2607,8 @@ class KimiLinearModel(nn.Module):
             prefix=f"{prefix}.layers",
             layer_num_offset=0,
         )
-        self._init_column_gather(atom_config, prefix)
+        self._column_gather = None
+        self._column_gather_blocks = []
         use_attn_residuals = getattr(config, "attn_res_block_size", None) is not None
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(
@@ -2617,6 +2639,11 @@ class KimiLinearModel(nn.Module):
         else:
             self.norm = PPMissingLayer()
 
+        # The loader visits parents first. Register this last, after front merges.
+        self._column_gather_setup = _ColumnGatherSetup(
+            lambda: self._init_column_gather(atom_config, prefix)
+        )
+
     def make_empty_intermediate_tensors(
         self, batch_size: int, dtype: torch.dtype, device: torch.device
     ) -> IntermediateTensors:
@@ -2637,6 +2664,8 @@ class KimiLinearModel(nn.Module):
         from atom.mono.runtime.consensus import MonoUnsupported
         from atom.plugin import is_plugin_mode
 
+        if getattr(self, "_column_gather", None) is not None:
+            return
         self._column_gather = None
         self._column_gather_blocks = []
         if (
@@ -2655,10 +2684,7 @@ class KimiLinearModel(nn.Module):
             moe = getattr(layer, "block_sparse_moe", None)
             if (
                 moe is not None
-                and moe.front_proj is not None
-                and moe.hidden_dim == 7168
-                and moe.moe_hidden_size == 3584
-                and moe.routed_expert_norm is not None
+                and moe._column_tail_producer_supported()
                 and following.self_attention_attn_res.enabled
             ):
                 self._column_gather_blocks.append(moe)
