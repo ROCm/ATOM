@@ -655,12 +655,17 @@ class FakeCudart:
 def scaled_table() -> HostEmbeddingTable:
     """A table whose values and scales are two separate registrations.
 
-    The scales live in their own large (page-aligned) allocation: two small
-    tensors can share a page, and a shared page is registered only once.
+    Separate allocations may share boundary pages. Put the scale view on an
+    interior page so page deduplication cannot bypass the scripted refusal.
     """
     codes = torch.full((1 << 20,), 127, dtype=torch.uint8)  # 2**0 == 1.0
-    scale = codes[:8].view(torch.float8_e8m0fnu).view(4, 2)
-    return HostEmbeddingTable(torch.ones(4, 8), num_rows=4, head_dim=8, scale=scale)
+    page = _host_memory._PAGE
+    scale = codes[page : page + 8].view(torch.float8_e8m0fnu).view(4, 2)
+    values = torch.ones(4, 8)
+    values_lo, values_hi = _host_memory._page_span(values)
+    scales_lo, scales_hi = _host_memory._page_span(scale)
+    assert values_hi <= scales_lo or scales_hi <= values_lo
+    return HostEmbeddingTable(values, num_rows=4, head_dim=8, scale=scale)
 
 
 def test_refused_scale_registration_gives_back_the_values_it_pinned(monkeypatch):

@@ -214,11 +214,6 @@ def layer_block(layer_id: int) -> tuple[int, int]:
     )
 
 
-def num_blocks(layers: int) -> int:
-    """The block-residual buffer's width for a model of ``layers`` layers."""
-    return -(-layers // ATTN_RES_BLOCK)
-
-
 def config_refusal(atom_config) -> str | None:
     """Why this deployment cannot use K3 mono decode, or None."""
     hf = getattr(atom_config.hf_config, "text_config", atom_config.hf_config)

@@ -1748,7 +1748,7 @@ class KimiDecoderLayer(nn.Module):
             getattr(self, "self_attention_res_norm", None),
             out_norm=self.input_layernorm,
             enabled=self.use_attn_residuals,
-            # Only this site banks the running prefix as a candidate.
+            # Only this site calls maybe_close_block to bank the running prefix.
             block_size=getattr(config, "attn_res_block_size", None),
             layer_idx=layer_num,
         )
@@ -1757,7 +1757,7 @@ class KimiDecoderLayer(nn.Module):
             getattr(self, "mlp_res_norm", None),
             out_norm=self.post_attention_layernorm,
             enabled=self.use_attn_residuals,
-            # This site's window includes this layer's block close.
+            # Shift the read bound to include this layer's block close.
             block_size=getattr(config, "attn_res_block_size", None),
             layer_idx=layer_num + 1,
         )
@@ -1875,19 +1875,14 @@ class KimiDecoderLayer(nn.Module):
         prefix_sum, pending_add, pending_add2, block_residual = output
         if prefix_sum is None:
             return None
-        own, res = self.self_attention_attn_res, next_layer.self_attention_attn_res
-        num_blocks = own.layer_idx // own.block_size + 1
-        if block_residual is None or block_residual.shape[1] < num_blocks:
-            raise RuntimeError(
-                f"aggregate of target layer {self.layer_idx}: expected a bank "
-                f"of >= {num_blocks} blocks, got "
-                f"{None if block_residual is None else tuple(block_residual.shape)}"
-            )
+        res = next_layer.self_attention_attn_res
+        if block_residual is None:
+            raise RuntimeError("aggregate expected a bank")
         from atom.model_ops.kimi_k3 import apply_attn_res
 
         mixed, _ = apply_attn_res(
             prefix_sum,
-            block_residual[:, :num_blocks],
+            res.window(block_residual),
             res.score_weight,
             res.eps,
             pending_add,
@@ -1970,13 +1965,11 @@ class KimiLinearModel(nn.Module):
         hidden_states = torch.zeros(
             (batch_size, self.config.hidden_size), dtype=dtype, device=device
         )
-        block_residual = self.block_bank(hidden_states)
-        if block_residual is None:
-            block_residual = hidden_states.new_zeros(
-                batch_size, 0, self.config.hidden_size
-            )
-        else:
-            block_residual.zero_()
+        block_size = getattr(self.config, "attn_res_block_size", None)
+        blocks = 0 if block_size is None else -(-self.start_layer // block_size)
+        block_residual = hidden_states.new_zeros(
+            batch_size, blocks, self.config.hidden_size
+        )
         return IntermediateTensors(
             {"hidden_states": hidden_states, "block_residual": block_residual}
         )
@@ -1984,14 +1977,31 @@ class KimiLinearModel(nn.Module):
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
-    def block_bank(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
-        """A slot per attention-residual block, read after its block closes."""
+    def block_bank(
+        self, hidden_states: torch.Tensor, received_blocks: torch.Tensor | None = None
+    ) -> torch.Tensor | None:
+        """Allocate writable capacity, restoring a preceding PP stage's prefix."""
         block_size = getattr(self.config, "attn_res_block_size", None)
         if block_size is None:
             return None
+        if self.start_layer > 0 and received_blocks is None:
+            raise ValueError("received block prefix is missing for this PP stage")
         tokens, hidden = hidden_states.shape
         blocks = -(-self.config.num_hidden_layers // block_size)
-        return hidden_states.new_empty(tokens, blocks, hidden)
+        bank = hidden_states.new_empty(tokens, blocks, hidden)
+        if received_blocks is not None:
+            written = -(-self.start_layer // block_size)
+            if received_blocks.shape != (tokens, written, hidden):
+                raise ValueError("received block prefix does not match this PP stage")
+            bank[:, :written].copy_(received_blocks)
+        return bank
+
+    def block_bank_prefix(self, bank: torch.Tensor | None) -> torch.Tensor | None:
+        """Only initialized slots cross PP; keep the wire tensor contiguous."""
+        if bank is None:
+            return None
+        block_size = self.config.attn_res_block_size
+        return bank[:, : -(-self.end_layer // block_size)].contiguous()
 
     def forward(
         self,
@@ -2010,7 +2020,9 @@ class KimiLinearModel(nn.Module):
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
-            block_residual = intermediate_tensors["block_residual"]
+            block_residual = self.block_bank(
+                hidden_states, intermediate_tensors["block_residual"]
+            )
 
         # Each layer hands its FFN output back unapplied (pending_add), and an MoE
         # layer hands its shared-expert output back separately (pending_add2); the
@@ -2031,7 +2043,10 @@ class KimiLinearModel(nn.Module):
             if pending_add2 is not None:
                 hidden_states = hidden_states + pending_add2
             return IntermediateTensors(
-                {"hidden_states": hidden_states, "block_residual": block_residual}
+                {
+                    "hidden_states": hidden_states,
+                    "block_residual": self.block_bank_prefix(block_residual),
+                }
             )
         hidden_states, _ = self.output_attn_res(
             hidden_states, block_residual, pending_add, pending_add2

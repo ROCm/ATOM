@@ -448,7 +448,9 @@ class KimiLinearModelVllm(kimi_k3_base.KimiLinearModel):
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
-            block_residual = intermediate_tensors["block_residual"]
+            block_residual = self.block_bank(
+                hidden_states, intermediate_tensors["block_residual"]
+            )
 
         aux_hidden_states: list[torch.Tensor] = []
         pending_add = pending_add2 = None
@@ -472,7 +474,10 @@ class KimiLinearModelVllm(kimi_k3_base.KimiLinearModel):
                 hidden_states, pending_add, pending_add2, block_residual
             )
             return IntermediateTensors(
-                {"hidden_states": hidden_states, "block_residual": block_residual}
+                {
+                    "hidden_states": hidden_states,
+                    "block_residual": self.block_bank_prefix(block_residual),
+                }
             )
 
         if self.end_layer in self.aux_hidden_state_layers:
