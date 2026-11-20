@@ -479,6 +479,16 @@ jobs:
           launch=".github/scripts/atom_test.sh launch"
           if [ "$SERVING" = "1p1d" ]; then
             launch="bash .github/scripts/atomesh_pd_accuracy.sh"
+            # Stream each side's log into this step as it is written, each line
+            # prefixed with its side. The streams stop when the step exits.
+            stream() {
+              docker exec "$CONTAINER_NAME" sh -c \
+                "tail -n +1 -F /tmp/$2 2>/dev/null | sed -u 's/^/[$1] /'" &
+            }
+            stream prefill atom_prefill.log
+            stream decode atom_decode.log
+            stream router atom_server.log
+            trap 'kill $(jobs -p) 2>/dev/null || true' EXIT
           fi
           # Pipe via stdin so container bash parses shell quoting in extraArgs
           # (e.g. single-quoted JSON in --default-chat-template-kwargs) naturally.
@@ -497,16 +507,10 @@ jobs:
           " 2>&1 | tee atom_accuracy_output.txt
       
       - name: Dump server log
-        if: always()
+        # A 1P1D case streams its logs while it runs.
+        if: always() && matrix.serving != '1p1d'
         run: |
           docker exec "$CONTAINER_NAME" cat /tmp/atom_server.log 2>/dev/null || true
-          # In a 1P1D case the log above is the router's; the servers log here.
-          for log in /tmp/atom_prefill.log /tmp/atom_decode.log; do
-            if docker exec "$CONTAINER_NAME" test -f "$log" 2>/dev/null; then
-              echo "========== $log =========="
-              docker exec "$CONTAINER_NAME" cat "$log" || true
-            fi
-          done
 
       - name: Dump client log
         if: always()

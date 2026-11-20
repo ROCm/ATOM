@@ -120,8 +120,18 @@ def test_a_pull_request_checks_one_model_standalone_and_1p1d(tmp_path):
     assert (
         'if [ "$SERVING" = "1p1d" ]; then\n'
         '  launch="bash .github/scripts/atomesh_pd_accuracy.sh"\n'
-        "fi\n"
     ) in accuracy["run"]
+    # A 1P1D case streams each side's log while it runs, not after it.
+    for side, log in (
+        ("prefill", "atom_prefill.log"),
+        ("decode", "atom_decode.log"),
+        ("router", "atom_server.log"),
+    ):
+        assert f"\n  stream {side} {log}\n" in accuracy["run"]
+    assert (
+        "\n  trap 'kill $(jobs -p) 2>/dev/null || true' EXIT\nfi\n" in accuracy["run"]
+    )
+    assert steps["Dump server log"]["if"] == "always() && matrix.serving != '1p1d'"
     # The gate holds a 1P1D case to its model's threshold.
     check = steps["Check accuracy test results"]
     assert check["env"]["MODEL_NAME"] == "${{ matrix.model_name }}"
