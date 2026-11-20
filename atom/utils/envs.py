@@ -776,6 +776,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Set to "0" to force the per-op chain if a regression is suspected. That
     # chain is the eligibility fallback above, not debug code, so it stays
     # reachable (and runs the first write of every layer) either way.
+    # Fuse local draft embedding gather, indices, and block-state copies.
+    # Default off until the full-server comparison is qualified.
+    "ATOM_DSPARK_FUSED_PROLOGUE": lambda: (
+        os.getenv("ATOM_DSPARK_FUSED_PROLOGUE", "0") == "1"
+    ),
     "ATOM_DSPARK_FUSED_CTX_KV": lambda: (
         os.getenv("ATOM_DSPARK_FUSED_CTX_KV", "1") == "1"
     ),
