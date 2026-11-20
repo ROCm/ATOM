@@ -271,7 +271,7 @@ class Attention(nn.Module):
             config.o_groups // tp_size,
         )
         # ATOM consumes eight-head output groups; AITER owns kernel support.
-        # `_use_fused_attention` queries the actual forward's dtypes and RoPE.
+        # `_use_fused_attention` checks wq_b's BF16 Q and the forward's RoPE.
         self.fused_attn = self.groups * 8 == self.heads and fused_attention_available(
             self.heads, self.head_dim
         )
@@ -454,8 +454,8 @@ class Attention(nn.Module):
     def _use_fused_attention(self, activation, cache, rope):
         """Whether this forward attends through `fused_sparse_attn_v41_paged_2src`:
         the layer's output groups and cache layout qualify, and AITER supports
-        the actual dtypes and rotary dimension. Native and vLLM callers pass
-        the residual `hidden` as `activation`. Other cases keep the unfused path.
+        wq_b's BF16 output and the RoPE metadata. The normed layer input
+        `activation` supplies the device. Other cases keep the unfused path.
         """
         return (
             self.fused_attn
@@ -464,10 +464,10 @@ class Attention(nn.Module):
             and fused_attention_available(
                 self.heads,
                 self.head_dim,
-                q_dtype=activation.dtype,
+                q_dtype=torch.bfloat16,
                 cos_dtype=rope.cos_cache.dtype,
                 sin_dtype=rope.sin_cache.dtype,
-                rope_dim=rope.cos_cache.shape[-1] * 2,
+                rope_dim=rope.rope_dim,
                 device=activation.device,
             )
         )

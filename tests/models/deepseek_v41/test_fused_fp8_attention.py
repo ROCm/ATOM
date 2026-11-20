@@ -264,19 +264,20 @@ def test_fused_support_query_is_owned_by_aiter(single_rank, monkeypatch, support
         rope = SimpleNamespace(
             cos_cache=torch.empty(16, 48, dtype=torch.float32),
             sin_cache=torch.empty(16, 48, dtype=torch.float16),
+            rope_dim=96,
         )
     assert model.fused_attn is supported
     assert calls == [((64, 512), {})]
     assert all(p.device.type == "meta" for p in model.parameters())
     # A changed AITER answer must control dispatch, including future support
-    # for dtypes/rotary widths ATOM does not currently use.
+    # for RoPE cache dtypes/rotary widths ATOM does not currently use.
     model.fused_attn = True
     cache = SimpleNamespace(kv_fp8=True, packed=False)
     assert model._use_fused_attention(activation, cache, rope) is supported
     assert calls[-1] == (
         (64, 512),
         {
-            "q_dtype": torch.float16,
+            "q_dtype": torch.bfloat16,
             "cos_dtype": torch.float32,
             "sin_dtype": torch.float16,
             "rope_dim": 96,
@@ -632,16 +633,19 @@ def test_fused_attention_conditions(fused_factory, heads):
     case = fused_factory(heads)
     model, cache, rope = case.model, case.cache, case.rope
     for rows in (1, 127, 128):
-        query = torch.empty(1, rows, heads, 512, device="cuda", dtype=torch.bfloat16)
-        assert model._use_fused_attention(query, cache, rope)
-    assert not model._use_fused_attention(query.half(), cache, rope)
+        activation = torch.empty(
+            1, rows, case.config.hidden_size, device="cuda", dtype=torch.bfloat16
+        )
+        assert model._use_fused_attention(activation, cache, rope)
+    # wq_b produces BF16 Q; the normed input only supplies the device here.
+    assert model._use_fused_attention(activation.half(), cache, rope)
     for field in ("kv_fp8", "packed"):
         original = getattr(cache, field)
         setattr(cache, field, field == "packed")
-        assert not model._use_fused_attention(query, cache, rope)
+        assert not model._use_fused_attention(activation, cache, rope)
         setattr(cache, field, original)
     model.fused_attn = False
-    assert not model._use_fused_attention(query, cache, rope)
+    assert not model._use_fused_attention(activation, cache, rope)
     groups = SimpleNamespace(**{**vars(case.config), "o_groups": heads // 4})
     assert not Attention(groups, model.spec).fused_attn
 
