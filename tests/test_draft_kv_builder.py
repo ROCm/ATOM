@@ -424,7 +424,11 @@ def test_an_eagle3_draft_attention_is_built_at_the_dtype_of_its_pool(
     assert seen == {"dtype": pool_dtype} and p.config.kv_cache_dtype == target
 
 
-def _gqa_draft(blocks, device="cpu"):
+# The pool dtypes the DSpark GQA draft runs: bf16, and fp8 as production does.
+_GQA_KV_DTYPES = [torch.bfloat16, torch.float8_e4m3fn, torch.float8_e4m3fnuz]
+
+
+def _gqa_draft(blocks, device="cpu", kv_dtype=torch.bfloat16):
     """A flash pool with the DSpark GQA draft's declared unit scale, and its
     builder; returns the builder and the draft's paged layers, numbered from 1."""
     pool = MhaKvPool(
@@ -432,7 +436,7 @@ def _gqa_draft(blocks, device="cpu"):
         block_size=128,
         num_kv_heads=2,
         head_dim=64,
-        kv_dtype=torch.bfloat16,
+        kv_dtype=kv_dtype,
         flash_layout=True,
     )
     pool.allocate(blocks, device)
@@ -462,23 +466,29 @@ def test_gqa_draft_layers_share_one_bound_unit_scale_tensor():
     assert all(m.k_scale is scale and m.v_scale is scale for m in layers)
 
 
-def test_a_per_tensor_scale_stays_off_the_blockwise_kv_cache_data():
+@pytest.mark.parametrize("kv_dtype", _GQA_KV_DTYPES)
+def test_a_per_tensor_scale_stays_off_the_blockwise_kv_cache_data(kv_dtype):
     """The shared unit scale is the layers' own binding, not per-block data:
     the entries published to `kv_cache_data` carry the draft's K/V only, so a
-    block-wise walker such as the LMCache offload codec accepts them."""
+    block-wise walker such as the LMCache offload codec accepts them and moves
+    exactly the draft's K and V bytes per block."""
     from atom.kv_transfer.offload.dense.kv_byte_codec import DenseKVByteCodec
 
-    builder, layers = _gqa_draft(4)
+    blocks = 4
+    builder, layers = _gqa_draft(blocks, kv_dtype=kv_dtype)
     entries = {f"layer_{m.layer_num}": builder.build_kv_cache_tensor(m) for m in layers}
 
     assert all(e.k_scale is None and e.v_scale is None for e in entries.values())
     assert all(m.k_scale.numel() == 1 for m in layers)  # the binding keeps it
-    codec = DenseKVByteCodec(entries, num_blocks=4)
-    assert codec.bytes_per_block > 0
+    codec = DenseKVByteCodec(entries, num_blocks=blocks)
+    assert codec.bytes_per_block * blocks == sum(
+        t.nbytes for e in entries.values() for t in (e.k_cache, e.v_cache)
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="fused GPU staging")
-def test_an_offload_round_trip_restores_the_draft_rows_at_new_block_ids():
+@pytest.mark.parametrize("kv_dtype", _GQA_KV_DTYPES)
+def test_an_offload_round_trip_restores_the_draft_rows_at_new_block_ids(kv_dtype):
     """What an LMCache tier save and a later tier load do to the draft's pool:
     the codec gathers some blocks into a staging buffer and scatters it back
     into other block ids. The draft's K/V rows come back byte for byte, beside
@@ -488,7 +498,7 @@ def test_an_offload_round_trip_restores_the_draft_rows_at_new_block_ids():
     from atom.kv_transfer.offload.dense.kv_byte_codec import DenseKVByteCodec
 
     blocks = 6
-    builder, layers = _gqa_draft(blocks, "cuda")
+    builder, layers = _gqa_draft(blocks, "cuda", kv_dtype)
     entries = {
         # A target layer's block-major cache, as the target builder publishes it.
         "layer_0": KVCacheTensor(
@@ -497,14 +507,15 @@ def test_an_offload_round_trip_restores_the_draft_rows_at_new_block_ids():
     }
     for m in layers:
         entries[f"layer_{m.layer_num}"] = builder.build_kv_cache_tensor(m)
+    # As bytes: the codec moves bytes, and fp8 has no fill or compare of its own.
     caches = [
-        t
+        t.view(torch.uint8)
         for e in entries.values()
         for t in (e.k_cache, e.v_cache)
         if t is not None and t.numel()
     ]
     for t in caches:
-        t.copy_(torch.randn(t.shape, device="cuda").to(t.dtype))
+        t.copy_(torch.randint(0, 256, t.shape, dtype=torch.uint8, device="cuda"))
     before = [t.clone() for t in caches]
 
     codec = DenseKVByteCodec(entries, num_blocks=blocks)
@@ -513,7 +524,7 @@ def test_an_offload_round_trip_restores_the_draft_rows_at_new_block_ids():
         len(saved) * codec.bytes_per_block, dtype=torch.uint8, device="cuda"
     )
     codec.gpu_to_chunk_major_device_buffer(buf, [saved])
-    sentinel = 7.0  # not zero, so a stray write of zeros shows too
+    sentinel = 0x5A  # not zero, so a stray write of zeros shows too
     for t in caches:
         t.fill_(sentinel)
     codec.chunk_major_device_buffer_to_gpu(buf, [restored])
