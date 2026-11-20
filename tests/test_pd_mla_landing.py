@@ -1474,7 +1474,13 @@ def test_an_unreadable_write_done_does_not_stop_the_listener(monkeypatch):
     dest = _Dest()
     dest.recv.advertise("stage0", 1)
     dest.recv.begin("r", 5, [1], {0: "stage0"})
-    done = {"request_id": "r", "pp_rank": 0, "write_nonce": 5, "landed_slots": []}
+    done = {
+        "request_id": "r",
+        "pp_rank": 0,
+        "write_nonce": 5,
+        "started_writes": True,
+        "landed_slots": [],
+    }
     no_request_id = dict(done)
     del no_request_id["request_id"]
     payloads = [

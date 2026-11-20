@@ -4400,8 +4400,7 @@ class MooncakeConnector(KVConnectorBase):
                                 data.get("tp_rank", 0),
                                 data.get("write_nonce", 0),
                                 success=data.get("success", True),
-                                # A producer without the field may have written.
-                                started_writes=data.get("started_writes", True),
+                                started_writes=data["started_writes"],
                                 landed_slots=data.get("landed_slots"),
                                 handoff=data.get("prefill_handoff"),
                             )

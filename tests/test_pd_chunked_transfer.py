@@ -454,26 +454,20 @@ def test_a_dropped_duplicate_failure_counts_toward_the_hold_only(monkeypatch, fi
     assert not c._pending_recv_failed and not c.failed_recving
 
 
-@pytest.mark.parametrize("started_writes", [False, True, None])
+@pytest.mark.parametrize("started_writes", [False, True])
 def test_write_done_tells_the_listener_whether_a_failed_rank_wrote(
     monkeypatch, started_writes
 ):
     from contextlib import nullcontext
 
-    import msgpack
-
     monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
     p, _, request, _, _ = producer()
     sent = []
     p._send_on_socket = lambda _addr, parts, repeat=1: sent.append(parts)
-    kwargs = {} if started_writes is None else {"started_writes": started_writes}
-    mc.MooncakeConnector._notify_transfer_result(p, request, success=False, **kwargs)
+    mc.MooncakeConnector._notify_transfer_result(
+        p, request, success=False, started_writes=started_writes
+    )
     ((msg_type, payload),) = sent
-    if started_writes is None:
-        # A producer that predates the field: its failure keeps the hold.
-        data = msgpack.loads(payload)
-        assert data.pop("started_writes") is True
-        payload = msgpack.dumps(data)
 
     class StopListener(BaseException):
         pass
@@ -498,8 +492,8 @@ def test_write_done_tells_the_listener_whether_a_failed_rank_wrote(
     )
     with pytest.raises(StopListener):
         d._notification_listener()
-    assert d.failed_recving == (set() if started_writes is not False else {21})
-    assert bool(d._held_failures) is (started_writes is not False)
+    assert d.failed_recving == (set() if started_writes else {21})
+    assert bool(d._held_failures) is started_writes
 
 
 def test_source_release_requires_every_tp_rank_of_every_pp_stage():
