@@ -82,6 +82,7 @@ class TokenBridge:
             sampling,
             stream_callback=self._callback(key),
             parent_request_id=params.get("request_id"),
+            data_parallel_rank=params.get("data_parallel_rank"),
             dp_session_id=params.get("dp_session_id"),
         )
         try:

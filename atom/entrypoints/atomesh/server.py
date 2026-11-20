@@ -296,6 +296,9 @@ def launch_atom_standalone(atomesh_runner: Any, raw_args: list[str]) -> None:
         frontend = {
             "token_bridge": initialize_token_bridge(atomesh_runner),
             "served_model_name": served_model_name(standalone_args.engine_args),
+            "default_chat_template_kwargs": json.dumps(
+                standalone_args.default_chat_template_kwargs
+            ),
         }
     else:
         frontend = {

@@ -60,7 +60,8 @@ impl PyServerConfig {
     server_config,
     standalone_service = None,
     token_bridge = None,
-    served_model_name = None
+    served_model_name = None,
+    default_chat_template_kwargs = None
 ))]
 pub fn launch_mesh(
     py: Python<'_>,
@@ -68,6 +69,7 @@ pub fn launch_mesh(
     standalone_service: Option<Py<PyAny>>,
     token_bridge: Option<Bound<'_, PyAny>>,
     served_model_name: Option<String>,
+    default_chat_template_kwargs: Option<String>,
 ) -> PyResult<()> {
     if standalone_service.is_some() && token_bridge.is_some() {
         return Err(PyRuntimeError::new_err(
@@ -85,7 +87,11 @@ pub fn launch_mesh(
             let name = served_model_name.ok_or_else(|| {
                 PyRuntimeError::new_err("token_bridge requires served_model_name")
             })?;
-            Some(Arc::new(AtomBridgeRuntime::from_bridge(bridge, name)?))
+            Some(Arc::new(AtomBridgeRuntime::from_bridge(
+                bridge,
+                name,
+                default_chat_template_kwargs.as_deref(),
+            )?))
         }
         None => None,
     };

@@ -24,7 +24,7 @@ use axum::{
     Json,
 };
 use pyo3::prelude::*;
-use serde_json::json;
+use serde_json::{json, Map, Value};
 
 use self::{events::EventRegistry, py_bridge::BridgeDispatcher};
 use crate::{
@@ -42,7 +42,7 @@ use crate::{
         generate::GenerateRequest,
     },
     routers::{
-        comm::error,
+        comm::error::{self, IngressError},
         grpc::{
             completion_adapter::{
                 completion_to_generate, wrap_generate_response_as_completion,
@@ -50,6 +50,8 @@ use crate::{
             },
             pipeline::Pipeline,
         },
+        ingress::InferenceEnvelope,
+        prepare::inference::ParsedInference,
         RouterTrait,
     },
 };
@@ -61,19 +63,80 @@ pub struct AtomBridgeRuntime {
     pub(crate) bridge: Arc<Py<PyAny>>,
     pub(crate) registry: Arc<EventRegistry>,
     pub served_model_name: String,
+    /// `--default-chat-template-kwargs`: under every chat request's own.
+    pub(crate) default_chat_template_kwargs: Map<String, Value>,
 }
 
 impl AtomBridgeRuntime {
-    /// `bridge.sink` must be the `StepSink` the bridge pushes into.
-    pub fn from_bridge(bridge: Bound<'_, PyAny>, served_model_name: String) -> PyResult<Self> {
+    /// `bridge.sink` must be the `StepSink` the bridge pushes into;
+    /// `default_chat_template_kwargs` is a JSON object, or empty.
+    pub fn from_bridge(
+        bridge: Bound<'_, PyAny>,
+        served_model_name: String,
+        default_chat_template_kwargs: Option<&str>,
+    ) -> PyResult<Self> {
         let sink = bridge.getattr("sink")?;
         let sink: PyRef<'_, py_bridge::StepSink> = sink.extract()?;
         let registry = Arc::clone(&sink.registry);
+        let default_chat_template_kwargs = match default_chat_template_kwargs {
+            None | Some("") => Map::new(),
+            Some(raw) => serde_json::from_str(raw).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "default_chat_template_kwargs must be a JSON object: {e}"
+                ))
+            })?,
+        };
         Ok(Self {
             bridge: Arc::new(bridge.unbind()),
             registry,
             served_model_name,
+            default_chat_template_kwargs,
         })
+    }
+}
+
+tokio::task_local! {
+    /// What a request carries besides its typed body, for the dispatcher.
+    /// Set around each request's pipeline, which dispatches on the same task.
+    pub(crate) static REQUEST_EXTRAS: RequestExtras;
+}
+
+/// Request fields the typed chat and completion bodies drop.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RequestExtras {
+    /// The DP rank a router pinned the request to; CoreManager checks it.
+    pub data_parallel_rank: Option<i64>,
+}
+
+impl RequestExtras {
+    pub(crate) fn current() -> Self {
+        REQUEST_EXTRAS.try_with(Clone::clone).unwrap_or_default()
+    }
+
+    fn read(request: &InferenceEnvelope) -> Result<Self, Response> {
+        let raw = match &request.parsed {
+            ParsedInference::Generate(body) => {
+                return Ok(Self {
+                    data_parallel_rank: body.data_parallel_rank.map(i64::from),
+                });
+            }
+            _ if memchr::memmem::find(&request.body, b"\"data_parallel_rank\"").is_none() => {
+                return Ok(Self::default());
+            }
+            _ => serde_json::from_slice::<Map<String, Value>>(&request.body)
+                .map_err(|e| error::bad_request("invalid_request", e.to_string()))?,
+        };
+        let data_parallel_rank = match raw.get("data_parallel_rank") {
+            None | Some(Value::Null) => None,
+            Some(Value::Number(n)) if n.as_i64().is_some_and(|r| r >= 0) => n.as_i64(),
+            Some(other) => {
+                return Err(error::bad_request(
+                    "invalid_request",
+                    format!("data_parallel_rank must be a non-negative integer, got {other}"),
+                ))
+            }
+        };
+        Ok(Self { data_parallel_rank })
     }
 }
 
@@ -185,6 +248,42 @@ impl RouterTrait for AtomBridgeRouter {
         }
     }
 
+    /// The typed routes, each inside its `RequestExtras`.
+    async fn route_inference(
+        &self,
+        request: InferenceEnvelope,
+        _app: &Arc<AppContext>,
+    ) -> Response {
+        let extras = match RequestExtras::read(&request) {
+            Ok(extras) => extras,
+            Err(response) => return response,
+        };
+        let (uri, headers, parsed, metadata) = request.into_native_parts();
+        let headers = Some(&headers);
+        let model = metadata.model.as_deref();
+        REQUEST_EXTRAS
+            .scope(extras, async move {
+                match parsed {
+                    ParsedInference::Chat(body) => self.route_chat(headers, &body, model).await,
+                    ParsedInference::Completion(body) => {
+                        self.route_completion(headers, &body, model).await
+                    }
+                    ParsedInference::Generate(body) => {
+                        self.route_generate(headers, &body, model).await
+                    }
+                    ParsedInference::Messages(_) | ParsedInference::Responses(_) => {
+                        IngressError::new(
+                            StatusCode::NOT_IMPLEMENTED,
+                            "unsupported_api",
+                            "not served by the ATOM Rust frontend yet",
+                        )
+                        .response(uri.path())
+                    }
+                }
+            })
+            .await
+    }
+
     async fn health_generate(&self, _req: Request<Body>) -> Response {
         match self.call_bridge("is_healthy").await {
             Ok(true) => (StatusCode::OK, "OK").into_response(),
@@ -226,9 +325,19 @@ impl RouterTrait for AtomBridgeRouter {
         if chat_wants_structured_output(body) {
             return structured_output_refused();
         }
+        let mut body = body.clone();
+        let defaults = &self.runtime.default_chat_template_kwargs;
+        if !defaults.is_empty() {
+            let kwargs = body
+                .chat_template_kwargs
+                .get_or_insert_with(Default::default);
+            for (key, value) in defaults {
+                kwargs.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+        }
         self.pipeline
             .execute_chat(
-                Arc::new(body.clone()),
+                Arc::new(body),
                 headers.cloned(),
                 self.model_id(),
                 Arc::clone(&self.app_context),

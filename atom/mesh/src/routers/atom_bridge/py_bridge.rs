@@ -14,8 +14,11 @@ use pyo3::{
 };
 use tracing::{debug, warn};
 
-use super::events::{
-    submitted, Aborter, Admission, EventRegistry, SeqEvent, SeqEventSource, SeqFinish, Stage,
+use super::{
+    events::{
+        submitted, Aborter, Admission, EventRegistry, SeqEvent, SeqEventSource, SeqFinish, Stage,
+    },
+    RequestExtras,
 };
 use crate::{
     core::placement::types::PlacementPlan,
@@ -78,10 +81,14 @@ pub(crate) struct BridgeRequest {
     pub max_tokens: Option<i32>,
     pub stop: Vec<String>,
     pub ignore_eos: bool,
+    pub data_parallel_rank: Option<i64>,
 }
 
 impl BridgeRequest {
-    pub(crate) fn from_payload(payload: &GenerationPayload) -> Result<Self, String> {
+    pub(crate) fn from_payload(
+        payload: &GenerationPayload,
+        extras: &RequestExtras,
+    ) -> Result<Self, String> {
         if payload.token_ids.is_empty() {
             return Err("the prompt is empty".to_string());
         }
@@ -123,6 +130,7 @@ impl BridgeRequest {
             max_tokens: payload.sampling.max_new_tokens,
             stop,
             ignore_eos: payload.sampling.ignore_eos,
+            data_parallel_rank: extras.data_parallel_rank,
         })
     }
 
@@ -135,6 +143,7 @@ impl BridgeRequest {
         params.set_item("max_tokens", self.max_tokens)?;
         params.set_item("stop", PyList::new(py, &self.stop)?)?;
         params.set_item("ignore_eos", self.ignore_eos)?;
+        params.set_item("data_parallel_rank", self.data_parallel_rank)?;
         Ok(params)
     }
 }
@@ -185,8 +194,8 @@ impl Dispatcher for BridgeDispatcher {
         _placement: &PlacementPlan,
         payload: &mut GenerationPayload,
     ) -> Result<TokenHandle, EngineError> {
-        let request =
-            BridgeRequest::from_payload(payload).map_err(EngineError::RequestBuildFailed)?;
+        let request = BridgeRequest::from_payload(payload, &RequestExtras::current())
+            .map_err(EngineError::RequestBuildFailed)?;
         let (key, events) = self.registry.register();
         let admission = Admission::new(
             key,
