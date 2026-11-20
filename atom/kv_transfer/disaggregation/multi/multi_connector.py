@@ -72,6 +72,9 @@ from atom.kv_transfer.disaggregation.types import (
 
 logger = logging.getLogger("atom")
 
+# Offload tiers that run only without a P/D transport beside them.
+_OFFLOAD_WITHOUT_PD = frozenset({"umbp_store"})
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -134,6 +137,24 @@ def validate_multi_config(kv_transfer_config: dict) -> list:
             + ", ".join(consumers + offload_subs)
             + "): a received prefill would be prefilled again on the decode "
             "instance. Run the decode instance with the P/D connector alone."
+        )
+    # An offload tier not built to run beside a P/D transport: with the
+    # consumer refused above, that is a P/D producer (prefill instance).
+    solo = [name for name in offload_subs if name in _OFFLOAD_WITHOUT_PD]
+    transports = [
+        sub["kv_connector"]
+        for sub in subs
+        if not KVConnectorFactory.is_offload_backend(
+            KVConnectorFactory.canonical_name(sub["kv_connector"])
+        )
+    ]
+    if solo and transports:
+        raise ValueError(
+            "multi does not support "
+            + ", ".join(solo)
+            + " beside a P/D connector ("
+            + ", ".join(transports)
+            + "): that offload tier runs on an aggregated instance only."
         )
     return subs
 
