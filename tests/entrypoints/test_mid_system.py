@@ -20,6 +20,7 @@ from atom.entrypoints.openai.chat_encoders import template_takes_mid_system
 from atom.entrypoints.openai.serving_anthropic import (
     AnthropicMessage,
     AnthropicMessagesRequest,
+    anthropic_to_openai_messages,
     fold_mid_system,
 )
 
@@ -182,6 +183,29 @@ class TestFold:
         image = {"type": "image_url", "image_url": {"url": "data:,"}}
         out = fold_mid_system([_assistant("b"), _sys("r"), _user([image])])
         assert out[1]["content"] == [{"type": "text", "text": "r"}, image]
+
+
+def test_tool_results_come_before_the_text_beside_them():
+    # Claude Code puts reminder text after the tool_result in one user message;
+    # text first left a user turn between the call and its result.
+    messages = anthropic_to_openai_messages(
+        [
+            AnthropicMessage(role="user", content="a"),
+            AnthropicMessage(
+                role="assistant",
+                content=[{"type": "tool_use", "id": "t1", "name": "f", "input": {}}],
+            ),
+            AnthropicMessage(
+                role="user",
+                content=[
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "out"},
+                    {"type": "text", "text": "reminder"},
+                ],
+            ),
+        ]
+    )
+    assert [m["role"] for m in messages] == ["user", "assistant", "tool", "user"]
+    assert messages[-1]["content"] == "reminder"
 
 
 @pytest.fixture

@@ -290,11 +290,15 @@ def anthropic_to_openai_messages(
                                     ),
                                 }
                             )
+                # Tool results first: they answer the call just before them,
+                # and Anthropic puts them first in the message too. Text after
+                # them (Claude Code adds reminders there) went first, leaving
+                # a user turn between a tool call and its result.
+                result.extend(tool_results)
                 if _has_image(content):
                     result.append({"role": "user", "content": _parts(content)})
                 elif text_parts:
                     result.append({"role": "user", "content": "\n".join(text_parts)})
-                result.extend(tool_results)
         elif role == "system":
             # Mid-conversation system messages (Claude Code sends reminders
             # this way). str() of a block list put its Python repr in the prompt.
