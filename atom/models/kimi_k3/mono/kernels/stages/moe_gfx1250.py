@@ -14,6 +14,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from atom.models.kimi_k3.mono.config import MAX_ROWS
+from atom.models.kimi_k3.mono.kernels.stages import tdm_timeline
 from atom.models.kimi_k3.mono.kernels.stages.moe_layout import (
     EXPERTS,
     LATENT,
@@ -63,6 +64,22 @@ def _wave_inclusive_scan32(value, lane):
         inclusive = inclusive + ((lane & offset) != 0).select(peer, fx.Int32(0))
         block = block + peer
     return inclusive
+
+
+def lds_barrier():
+    """A workgroup barrier for LDS alone: this wave's LDS traffic drained,
+    then signal and wait. ``gpu.barrier``'s workgroup fence also waits out
+    every global store first (s_wait_storecnt 0). As side-effecting asm it
+    keeps the compiler's memory ops on their side."""
+    from flydsl._mlir.dialects import llvm
+
+    llvm.inline_asm(
+        None,
+        [],
+        "s_wait_dscnt 0x0\n s_barrier_signal -1\n s_barrier_wait -1",
+        "",
+        has_side_effects=True,
+    )
 
 
 @traced
@@ -431,13 +448,18 @@ def stage_route_cta(c, token, front_payload_words=0):
     give its lane maxima and the same bound. Each score at or above the bound
     takes an LDS slot (in any order); a survivor's rank is the count of
     survivors before it by key, then expert id (ids are distinct, so the ranks
-    are the sorted order), and the top ``width`` land at their ranks."""
+    are the sorted order), and the top ``width`` land at their ranks.
+
+    ``c["own_candidates"]``: the stage ends at the ranks (returning the
+    survivors' count), and ``stage_herd_token_local`` places and stores the
+    candidates on wave 0 (``_route_cta_place``) while the other waves poll."""
 
     tid, lane, wave = c["tid"], c["lane"], c["wave"]
     threads = c["threads"]
     waves = threads // WAVE
     lds = c["route_lds"]
     split_bound = c.get("split_bound", False)
+    own = c.get("own_candidates", False)
     contiguous = "contiguous_logits" in c and c["contiguous_logits"]
     width = TOPK + 1 if "herd" in c and c["herd"] else TOPK
     per_thread = (EXPERTS + threads - 1) // threads
@@ -475,6 +497,7 @@ def stage_route_cta(c, token, front_payload_words=0):
         if tid < WAVE:
             fx.ptr_store(fx.Int32(0), lds["top_experts"] + tid)
     gpu.barrier()
+    tdm_timeline.stamp(tdm_timeline.LITE_SCORED)
     # Every wave takes the bound itself: ``stage_route``'s lane maxima, sorted.
     lane_max = fx.Uint32(fx.ptr_load(lds["maxima"] + lane))
     for other_wave in range_constexpr(1, waves):
@@ -495,6 +518,7 @@ def stage_route_cta(c, token, front_payload_words=0):
         at_bound = _ballot32(max_rank == width - 1)
         bound_lane = _popcount32((at_bound & (~at_bound + fx.Uint32(1))) - fx.Uint32(1))
         bound = fx.Uint32(readlane(fx.Int32(lane_max), bound_lane))
+    tdm_timeline.stamp(tdm_timeline.LITE_BOUND)
     # A wave's survivors take consecutive slots from one LDS atomic.
     kept = _count_tree([score >= bound for score in scores])
     inclusive = _wave_inclusive_scan32(kept, lane)
@@ -511,6 +535,7 @@ def stage_route_cta(c, token, front_payload_words=0):
             fx.ptr_store(fx.Int32(0), lds["ahead"] + slot)
         slot = slot + (scores[index] >= bound).select(fx.Int32(1), fx.Int32(0))
     gpu.barrier()
+    tdm_timeline.stamp(tdm_timeline.LITE_SLOTTED)
     survivors = uniform(fx.ptr_load(lds["count"]))
     # A survivor's rank, the count of survivors before it, summed over the
     # waves: each compares every survivor with every waves-th one.
@@ -535,53 +560,74 @@ def stage_route_cta(c, token, front_payload_words=0):
         if (first + lane < survivors) & (ahead > 0):
             fx.atomic_add(lds["ahead"] + entry, ahead, syncscope="workgroup")
     gpu.barrier()
+    tdm_timeline.stamp(tdm_timeline.LITE_RANKED)
+    if const_expr(own):
+        return survivors
     if wave == 0:
-        # The top ``width`` to their ranks: a wave's LDS accesses are in order.
-        for first in range(fx.Int32(0), survivors, fx.Int32(WAVE), unroll=1):
-            entry = fx.min(first + lane, survivors - 1)
-            entry_rank = fx.ptr_load(lds["ahead"] + entry)
-            if (first + lane < survivors) & (entry_rank < width):
-                fx.ptr_store(
-                    fx.ptr_load(lds["experts"] + entry), lds["top_experts"] + entry_rank
-                )
-                fx.ptr_store(
-                    fx.ptr_load(lds["sigmoids"] + entry),
-                    lds["top_sigmoids"] + entry_rank,
-                )
-        rank = lane
-        top = fx.min(lane, width - 1)
-        my_expert = fx.ptr_load(lds["top_experts"] + top)
-        my_sigmoid = fx.ptr_load(lds["top_sigmoids"] + top)
-        total = fx.Float32(0.0)
-        for item in range_constexpr(TOPK):
-            total = total + fx.ptr_load(lds["top_sigmoids"] + item)
-        inverse = fx.Float32(1.0) / total
-        if lane < width:
-            expert = fx.min(fx.max(my_expert, 0), fx.Int32(EXPERTS - 1))
-            if const_expr(width != TOPK):
-                c["put"](c["route"], token * width + rank, expert)
-                c["put"](c["route_weights"], token * width + rank, my_sigmoid)
-                if const_expr("herd_candidates" in c):
-                    pairs, tag = c["herd_candidates"]
-                    bo.buffer_store(
-                        fx.Vector.from_elements(
-                            [my_sigmoid.bitcast(fx.Int32), tag | expert], fx.Int32
-                        ),
-                        rsrc(pairs),
-                        (token * width + rank) * 2,
-                        cache_modifier=CM_DEV,
-                    )
-            elif const_expr("route_weights" in c):
-                c["put"](c["route"], token * TOPK + rank, expert)
-                c["put"](c["route_weights"], token * TOPK + rank, my_sigmoid * inverse)
-            else:
-                c["put"](c["route"], token * 2 * TOPK + rank, expert)
-                c["put"](
-                    c["route"],
-                    token * 2 * TOPK + TOPK + rank,
-                    my_sigmoid * inverse,
-                )
+        _route_cta_place(c, token, survivors)
+    tdm_timeline.stamp(tdm_timeline.LITE_ROUTES_ISSUED)
     gpu.barrier()
+    tdm_timeline.stamp(tdm_timeline.LITE_ROUTED)
+
+
+@traced
+def _route_cta_place(c, token, survivors):
+    """``stage_route_cta``'s last step, on wave 0: the top ``width`` to their
+    ranks, then their stores. Returns the lane's (expert, sigmoid) as stored
+    -- lane ``r`` the rank-``r`` candidate, lanes past ``width`` the last
+    one's."""
+    lane = c["lane"]
+    lds = c["route_lds"]
+    width = TOPK + 1 if "herd" in c and c["herd"] else TOPK
+    # read here: a method called in a branch makes ``c`` its traced state
+    candidates_cm = c.get("candidates_cm", CM_DEV)
+    # The top ``width`` to their ranks: a wave's LDS accesses are in order.
+    for first in range(fx.Int32(0), survivors, fx.Int32(WAVE), unroll=1):
+        entry = fx.min(first + lane, survivors - 1)
+        entry_rank = fx.ptr_load(lds["ahead"] + entry)
+        if (first + lane < survivors) & (entry_rank < width):
+            fx.ptr_store(
+                fx.ptr_load(lds["experts"] + entry), lds["top_experts"] + entry_rank
+            )
+            fx.ptr_store(
+                fx.ptr_load(lds["sigmoids"] + entry),
+                lds["top_sigmoids"] + entry_rank,
+            )
+    rank = lane
+    top = fx.min(lane, width - 1)
+    my_expert = fx.ptr_load(lds["top_experts"] + top)
+    my_sigmoid = fx.ptr_load(lds["top_sigmoids"] + top)
+    total = fx.Float32(0.0)
+    for item in range_constexpr(TOPK):
+        total = total + fx.ptr_load(lds["top_sigmoids"] + item)
+    inverse = fx.Float32(1.0) / total
+    clamped = fx.min(fx.max(my_expert, 0), fx.Int32(EXPERTS - 1))
+    if lane < width:
+        expert = fx.min(fx.max(my_expert, 0), fx.Int32(EXPERTS - 1))
+        if const_expr(width != TOPK):
+            c["put"](c["route"], token * width + rank, expert)
+            c["put"](c["route_weights"], token * width + rank, my_sigmoid)
+            if const_expr("herd_candidates" in c):
+                pairs, tag = c["herd_candidates"]
+                bo.buffer_store(
+                    fx.Vector.from_elements(
+                        [my_sigmoid.bitcast(fx.Int32), tag | expert], fx.Int32
+                    ),
+                    rsrc(pairs),
+                    (token * width + rank) * 2,
+                    cache_modifier=candidates_cm,
+                )
+        elif const_expr("route_weights" in c):
+            c["put"](c["route"], token * TOPK + rank, expert)
+            c["put"](c["route_weights"], token * TOPK + rank, my_sigmoid * inverse)
+        else:
+            c["put"](c["route"], token * 2 * TOPK + rank, expert)
+            c["put"](
+                c["route"],
+                token * 2 * TOPK + TOPK + rank,
+                my_sigmoid * inverse,
+            )
+    return clamped, my_sigmoid
 
 
 # A HERD candidate's tag word: the launch's tag over the expert id's bits.
@@ -751,7 +797,14 @@ def stage_herd_token(c, rows, token):
 
     limit = c.get("poll_limit")
     words = load_pairs()
-    if const_expr(limit is None):
+    if const_expr(limit is None and tdm_timeline.active()):
+        polls = fx.Int32(0)
+        while stale(words):
+            rocdl.s_sleep(1)
+            polls = polls + 1
+            words = load_pairs()
+        tdm_timeline.record(tdm_timeline.LITE_HERD_POLLS, uniform(polls))
+    elif const_expr(limit is None):
         while stale(words):
             rocdl.s_sleep(1)
             words = load_pairs()
@@ -763,7 +816,9 @@ def stage_herd_token(c, rows, token):
             words = load_pairs()
     if const_expr("stamp" in c):
         c["stamp"]("herd_in")
+    tdm_timeline.stamp(tdm_timeline.LITE_HERD_POLLED)
     gpu.barrier()
+    tdm_timeline.stamp(tdm_timeline.LITE_HERD_SEEN)
     if const_expr("stamp" in c):
         c["stamp"]("herd_seen")
     for index in range_constexpr(rounds):
@@ -774,6 +829,7 @@ def stage_herd_token(c, rows, token):
             fx.ptr_store(fx.Int32(words[2 * index]).bitcast(fx.Float32), values_s + at)
             fx.atomic_add(popularity + expert, fx.Int32(1), syncscope="workgroup")
     gpu.barrier()
+    tdm_timeline.stamp(tdm_timeline.LITE_HERD_COUNTED)
     if const_expr("stamp" in c):
         c["stamp"]("herd_counted")
     store_cm = c.get("store_cm", 0)
@@ -792,6 +848,7 @@ def stage_herd_token(c, rows, token):
         live = lane < kp1
         kept_sum, place, kept = drop_order(c, my_id, my_value, my_pop, lane, live, kp1)
         scale = c["routed_scaling_factor"] / fx.max(kept_sum, fx.Float32(1e-20))
+        tdm_timeline.stamp(tdm_timeline.LITE_HERD_DROPPED)
         if kept:
             bo.buffer_store(
                 my_id, rsrc(c["topk_ids"]), token * TOPK + place, cache_modifier=store_cm
@@ -802,6 +859,145 @@ def stage_herd_token(c, rows, token):
                 token * TOPK + place,
                 cache_modifier=store_cm,
             )
+        tdm_timeline.stamp(tdm_timeline.LITE_HERD_STORED)
+
+
+@traced
+def _herd_prepare(own_id, own_value, lane, kp1, routed_scaling_factor):
+    """``stage_herd_token_local``'s work before the candidates are in, on wave
+    0's own candidates (lane j candidate j): lane d's scale were candidate d
+    dropped -- ``_herd_drop_wave``'s kept sum, its adds in candidate order --
+    and lane j's rank among the live candidates by (value, id) and by id."""
+    kept_sum = fx.Float32(0.0)
+    by_value = fx.Int32(0)
+    by_id = fx.Int32(0)
+    for k in range(fx.Int32(0), fx.Int32(kp1), unroll=1):
+        k_id = readlane(own_id, k)
+        k_value = readlane(own_value, k)
+        kept_sum = kept_sum + (k != lane).select(k_value, fx.Float32(0.0))
+        before = (k_value < own_value) | ((k_value == own_value) & (k_id < own_id))
+        by_value = by_value + before.select(fx.Int32(1), fx.Int32(0))
+        by_id = by_id + (k_id < own_id).select(fx.Int32(1), fx.Int32(0))
+    scale = routed_scaling_factor / fx.max(kept_sum, fx.Float32(1e-20))
+    return scale, by_value, by_id
+
+
+@traced
+def stage_herd_token_local(c, rows, token, survivors):
+    """``stage_route_cta``'s last step and ``stage_herd_token``'s routes, bit
+    for bit, after ``stage_route_cta`` with ``own_candidates`` (its ranks in
+    LDS, ``survivors`` of them): wave 0 places and stores the token's
+    candidates (``_route_cta_place``, ``c["route_c"]`` its context) and keeps
+    them in its registers, while the other waves zero the batch popularity
+    (``c["popularity"]``, LDS the placement leaves alone) and poll the other
+    tokens' candidates; wave 0 prepares every drop's scale and the ranks
+    (``_herd_prepare``) meanwhile, and once the popularity is counted the
+    drop is the least (popularity, rank by value and id) --
+    ``_herd_drop_wave``'s arg-min -- and a kept candidate's place its rank by
+    id less one if the dropped id is below its own. No barrier waits for a
+    store: the CTA's stores are in flight to its end. ``c["poll_space"]``:
+    the s_sleep units between polls."""
+
+    tid, threads, lane, wave = c["tid"], c["threads"], c["lane"], c["wave"]
+    popularity = c["popularity"]
+    space = c.get("poll_space", 1)
+    kp1 = TOPK + 1
+    candidates = rows * kp1
+    first_own = token * kp1
+    pairs, tag = c["candidates"]
+    pollers = threads - WAVE
+    rounds = (candidates + pollers - 1) // pollers
+    poller = tid - WAVE
+    tag_bits = fx.Int32(-(1 << _HERD_EXPERT_BITS))
+    store_cm = c.get("store_cm", 0)
+
+    def others(at):
+        return (at < first_own) | (at >= first_own + kp1)
+
+    exchange_cm = c.get("exchange_cm", CM_DEV)
+
+    def load_tags():
+        # A candidate's tag | expert word.
+        return fx.Vector.from_elements(
+            [
+                bo.buffer_load(
+                    rsrc(pairs),
+                    fx.min(poller + index * pollers, candidates - 1) * 2 + 1,
+                    vec_width=1,
+                    dtype=T.i32,
+                    cache_modifier=exchange_cm,
+                )
+                for index in range_constexpr(rounds)
+            ],
+            fx.Int32,
+        )
+
+    if wave == 0:
+        own_id, own_value = _route_cta_place(c["route_c"], token, survivors)
+        tdm_timeline.stamp(tdm_timeline.LITE_ROUTES_ISSUED)
+        # the popularity zeroed
+        lds_barrier()
+        prepared = _herd_prepare(
+            own_id, own_value, lane, kp1, c["routed_scaling_factor"]
+        )
+        live = lane < kp1
+        if live:
+            fx.atomic_add(popularity + own_id, fx.Int32(1), syncscope="workgroup")
+        # every candidate counted
+        lds_barrier()
+        tdm_timeline.stamp(tdm_timeline.LITE_HERD_COUNTED)
+        key = live.select(
+            (fx.ptr_load(popularity + own_id) << 5) | prepared[1],
+            fx.Int32(0x7FFFFFFF),
+        )
+        least = butterfly(key, (16, 8, 4, 2, 1), fx.min, architecture=GFX1250)
+        at_least = _ballot32(key == least)
+        drop = _popcount32((at_least & (~at_least + fx.Uint32(1))) - fx.Uint32(1))
+        drop_id = readlane(own_id, drop)
+        drop_scale = readlane(prepared[0], drop)
+        place = prepared[2] - (drop_id < own_id).select(fx.Int32(1), fx.Int32(0))
+        tdm_timeline.stamp(tdm_timeline.LITE_HERD_DROPPED)
+        if live & (lane != drop):
+            bo.buffer_store(
+                own_id, rsrc(c["topk_ids"]), token * TOPK + place, cache_modifier=store_cm
+            )
+            bo.buffer_store(
+                own_value * drop_scale,
+                rsrc(c["topk_weights"]),
+                token * TOPK + place,
+                cache_modifier=store_cm,
+            )
+        tdm_timeline.stamp(tdm_timeline.LITE_HERD_STORED)
+    else:
+        words = load_tags()
+        for index in range_constexpr((EXPERTS + pollers - 1) // pollers):
+            expert = poller + index * pollers
+            if expert < EXPERTS:
+                fx.ptr_store(fx.Int32(0), popularity + expert)
+        polled = [
+            others(fx.min(poller + index * pollers, candidates - 1))
+            for index in range_constexpr(rounds)
+        ]
+
+        def stale(words):
+            late = None
+            for index in range_constexpr(rounds):
+                mismatch = ((fx.Int32(words[index]) & tag_bits) != tag) & polled[index]
+                late = mismatch if late is None else late | mismatch
+            return late
+
+        # the popularity zeroed
+        lds_barrier()
+        while stale(words):
+            rocdl.s_sleep(space)
+            words = load_tags()
+        for index in range_constexpr(rounds):
+            at = poller + index * pollers
+            if (at < candidates) & others(at):
+                expert = fx.Int32(words[index]) & ((1 << _HERD_EXPERT_BITS) - 1)
+                fx.atomic_add(popularity + expert, fx.Int32(1), syncscope="workgroup")
+        # every candidate counted
+        lds_barrier()
 
 
 @traced

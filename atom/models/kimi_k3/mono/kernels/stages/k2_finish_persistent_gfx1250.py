@@ -35,9 +35,11 @@ from atom.models.kimi_k3.mono.kernels.stages import (
 )
 from atom.models.kimi_k3.mono.kernels.stages import (
     gemv_gfx1250,
+    gemv_tdm_gfx1250,
     moe_expert_gfx1250,
     moe_gfx1250,
     moe_tail_gfx1250,
+    tdm_timeline,
 )
 from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import LDS_PAD
 from atom.models.kimi_k3.mono.kernels.token_tiling import WMMA_TOKEN_ROWS
@@ -49,6 +51,8 @@ from atom.utils import envs
 
 THREADS = 256
 WAVES = 8
+# gfx12 cache policy SCOPE field (bits 4:3): one shader engine, an XCD here
+SCOPE_SE = 1 << 3
 TP = SUPPORTED_TP[0]
 LOCAL_LATENT = LATENT // TP
 FINISH_REQUIRED_LDS_BYTES = 113_664
@@ -123,6 +127,20 @@ class K2FinishKernel:
     # its LDS union and kernel body, for a launch that runs it as a part
     lds: object = None
     body: object = None
+
+
+def routing_ctas(rows: int, blocks: int, route_xcd: bool) -> tuple[list, list]:
+    """A routes-apart finish's CTA of each token, and the shared-down CTAs in
+    their task order: the last ``rows`` CTAs route, or with ``route_xcd``
+    CTA 8 k routes token k (``XCDS`` CTAs a round over the XCDs); CTA b
+    takes shared-down index ``b`` less the routing CTAs before it."""
+    if not route_xcd:
+        return list(range(blocks - rows, blocks)), list(range(blocks - rows))
+    xcds = gemv_tdm_gfx1250.XCDS
+    routing = [xcds * k for k in range(rows)]
+    shared = [b for b in range(blocks) if b % xcds or b // xcds >= rows]
+    assert all(b - min(-(-b // xcds), rows) == i for i, b in enumerate(shared))
+    return routing, shared
 
 
 def _direct_poll(requests):
@@ -431,6 +449,27 @@ def build_packed_finish(
 
     wave_drop = parallel_herd and envs.ATOM_KIMI_MONO_HERD_WAVE_DROP
     split_bound = rolled and envs.ATOM_KIMI_MONO_ROUTE_SPLIT_BOUND
+    # A routing CTA keeps its own candidates (stage_route_cta's) for its HERD.
+    may_own = rolled and parallel_herd and herd_poll_limit is None
+    own_local = may_own and envs.ATOM_KIMI_MONO_HERD_OWN_LOCAL
+    poll_space = envs.ATOM_KIMI_MONO_HERD_POLL_SPACE
+    # Up to an XCD's CTAs of rows, token k's own-candidates routing CTA is
+    # CTA 8 k, on the first XCD (CTAs go round-robin over them), the others
+    # the shared down's in order: the routing CTAs start among the first
+    # dispatched, and their exchange stays in that XCD's L2 (SE scope).
+    xcds = gemv_tdm_gfx1250.XCDS
+    may_route_xcd = own_local and rows <= plan.blocks // xcds
+    route_xcd = may_route_xcd and envs.ATOM_KIMI_MONO_LITE_ROUTE_XCD
+    exchange_cm = SCOPE_SE if route_xcd else CM_DEV
+    may_widen = rolled and include_shared and not include_routed
+    wide_stores = may_widen and envs.ATOM_KIMI_MONO_LITE_SD_WIDE
+    # The shared down's rows loaded ahead of its weights.
+    rows_first = (
+        include_shared
+        and not include_routed
+        and replicated_front
+        and envs.ATOM_KIMI_MONO_LITE_SD_ROWS_FIRST
+    )
     name = (
         f"k3_k2_gfx1250_persistent_finish_s{rows}_b{plan.blocks}"
         f"{'_rl' if rolled else ''}"
@@ -442,9 +481,16 @@ def build_packed_finish(
         f"{'_ra' if routes_apart and not parallel_herd else ''}"
         f"{'_nohwd' if parallel_herd and not wave_drop else ''}"
         f"{'_norsb' if rolled and not split_bound else ''}"
+        f"{'_nohol' if may_own and not own_local else ''}"
+        f"{f'_ps{poll_space}' if own_local and poll_space != 1 else ''}"
+        f"{'_norx' if may_route_xcd and not route_xcd else ''}"
+        f"{'_nosw' if may_widen and not wide_stores else ''}"
+        f"{'_srf' if rows_first else ''}"
         f"{f'_pl{herd_poll_limit}' if herd_poll_limit is not None else ''}"
         f"{'_profile' if profile else ''}"
+        f"{tdm_timeline.suffix()}"
     )
+    timeline = tdm_timeline.key()
     # After a replicated front there is no gathered latent to unpack.
     unpack = not (rolled and replicated_front)
     if replicated_front:
@@ -626,6 +672,11 @@ def build_packed_finish(
         # Without routed experts nothing below waits on a grid barrier, so
         # routing takes the CTAs with the fewest shared-down tasks.
         route_token = bid if include_routed else bid - (plan.blocks - rows)
+        shared_index = bid
+        if const_expr(route_xcd):
+            # ``routing_ctas``' placement
+            route_token = (bid % xcds == 0).select(bid // xcds, fx.Int32(rows))
+            shared_index = bid - fx.min((bid + xcds - 1) // xcds, fx.Int32(rows))
         launch_word = herd_at["launch"][0] // 4
         candidates = scratch + fx.Int64(herd_at["candidates"][0])
         launch = fx.Int32(
@@ -697,17 +748,18 @@ def build_packed_finish(
             # One CTA owns one token.  The old candidate serialized all rows
             # through CTA 0 even though routing has no cross-token reduction.
             if const_expr(rolled):
-                moe_gfx1250.stage_route_cta(
-                    {
-                        **context,
-                        "threads": THREADS,
-                        "route_lds": {
-                            name: getattr(route_role, name).ptr for name in route_lds_words
-                        },
-                        "split_bound": split_bound,
+                route_c = {
+                    **context,
+                    "candidates_cm": exchange_cm,
+                    "threads": THREADS,
+                    "route_lds": {
+                        name: getattr(route_role, name).ptr for name in route_lds_words
                     },
-                    route_token,
-                    payload.local_bytes // 4,
+                    "split_bound": split_bound,
+                    "own_candidates": own_local,
+                }
+                survivors = moe_gfx1250.stage_route_cta(
+                    route_c, route_token, payload.local_bytes // 4
                 )
             else:
                 moe_gfx1250.stage_route(
@@ -724,15 +776,31 @@ def build_packed_finish(
                 # The token's own HERD, past every token's candidates; the
                 # first token's CTA moves the launch counter on (every routing
                 # CTA has read it: its candidates carry its tag).
-                moe_gfx1250.stage_herd_token(
-                    {
-                        **herd_context(moe_gfx1250.herd_tag(launch)),
-                        "poll_limit": herd_poll_limit,
-                        "wave_drop": wave_drop,
-                    },
-                    rows,
-                    route_token,
-                )
+                if const_expr(own_local):
+                    # The batch popularity in the routing's score keys, which
+                    # its placement leaves alone.
+                    moe_gfx1250.stage_herd_token_local(
+                        {
+                            **herd_context(moe_gfx1250.herd_tag(launch)),
+                            "route_c": route_c,
+                            "popularity": route_role.keys.ptr,
+                            "poll_space": poll_space,
+                            "exchange_cm": exchange_cm,
+                        },
+                        rows,
+                        route_token,
+                        survivors,
+                    )
+                else:
+                    moe_gfx1250.stage_herd_token(
+                        {
+                            **herd_context(moe_gfx1250.herd_tag(launch)),
+                            "poll_limit": herd_poll_limit,
+                            "wave_drop": wave_drop,
+                        },
+                        rows,
+                        route_token,
+                    )
                 stamp("herd_done")
                 if (route_token == 0) & (tid == 0):
                     bo.buffer_store(launch + 1, rsrc(scratch), launch_word)
@@ -840,7 +908,24 @@ def build_packed_finish(
             if const_expr(routes_apart):
                 does_shared = bid < shared_ctas
                 tasks = [bid + slot * shared_ctas for slot in range(shared_slots)]
+            if const_expr(route_xcd):
+                does_shared = route_token >= rows
+                tasks = [
+                    shared_index + slot * shared_ctas for slot in range(shared_slots)
+                ]
             if does_shared:
+                staging = {
+                    "S": rows,
+                    "tid": tid,
+                    "threads": THREADS,
+                    "tail": {"gemv_rows": shared_down.rows.ptr},
+                }
+                if const_expr(rows_first):
+                    # The rows' loads first: in order, they land, and are
+                    # stored, before the weights from HBM.
+                    hidden_words = moe_tail_gfx1250.hidden_rows_issue(
+                        staging, shared_hidden
+                    )
                 # Every task's weights are in flight before the rows are staged.
                 operands = [
                     (
@@ -865,17 +950,15 @@ def build_packed_finish(
                     )
                     for task in tasks
                 ]
-                staging = {
-                    "S": rows,
-                    "tid": tid,
-                    "threads": THREADS,
-                    "tail": {"gemv_rows": shared_down.rows.ptr},
-                }
-                if const_expr(replicated_front):
+                tdm_timeline.stamp(tdm_timeline.LITE_SD_ISSUED)
+                if const_expr(rows_first):
+                    moe_tail_gfx1250.hidden_rows_land(staging, hidden_words)
+                elif const_expr(replicated_front):
                     # The replicated front already activated the shared columns.
                     moe_tail_gfx1250.stage_hidden_rows(staging, shared_hidden)
                 else:
                     moe_tail_gfx1250.stage_activated_rows(staging, shared_gate_up)
+                tdm_timeline.stamp(tdm_timeline.LITE_SD_STAGED)
                 moe_tail_gfx1250.sdown_tasks(
                     {
                         "S": rows,
@@ -886,6 +969,7 @@ def build_packed_finish(
                         "tail": {"gemv_accumulator": shared_down.accumulator.ptr},
                         "shared_partial": shared_partial,
                         "store_cm": _out_cm(fused),
+                        "wide_stores": wide_stores,
                     },
                     tasks,
                     operands,
@@ -1199,9 +1283,17 @@ def build_packed_finish(
         shared_partial: Int64,
         scratch: Int64,
     ):
-        _ = sources
+        _ = sources, timeline
+        allocator = fx.SharedAllocator()
+        role = allocator.allocate(RoleLds)
+        tdm_timeline.open_cta(
+            fx.Int32(fx.block_idx.x),
+            fx.Int32(fx.thread_idx.x) // GFX1250.wave_size,
+            timeline,
+            allocator,
+        )
         body(
-            fx.SharedAllocator().allocate(RoleLds),
+            role,
             front_gathered,
             router_bias,
             shared_gate_up,
@@ -1226,6 +1318,8 @@ def build_packed_finish(
             shared_partial,
             scratch,
         )
+        tdm_timeline.stores_done()
+        tdm_timeline.close_cta()
 
     @flyc.jit
     def launch(
