@@ -85,6 +85,7 @@ def call(
     kv_usage=0.5,
     has_partial=False,
     oldest_waiting_age_ms=0.0,
+    prefill_budget=MAX_BATCHED,
     reduce=_noop_all_reduce,
     **kw,
 ):
@@ -96,6 +97,7 @@ def call(
             kv_usage=kv_usage,
             has_partial=has_partial,
             oldest_waiting_age_ms=oldest_waiting_age_ms,
+            prefill_budget=prefill_budget,
             **kw,
         ).allow
 

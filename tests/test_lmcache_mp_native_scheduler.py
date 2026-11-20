@@ -1126,7 +1126,7 @@ def test_engine_head_probe_keeps_a_woken_replay(monkeypatch):
         "_gated_hit",
         lambda _seq, compressed_hit, _hashes, **_kw: compressed_hit,
     )
-    assert engine._can_admit_head_prefill()
+    assert engine._can_admit_head_prefill(limits=engine._prefill_limits())
     assert seq.replays_hit
     batch, scheduled = engine.schedule()
     assert scheduled[seq.id] is seq
@@ -1139,7 +1139,10 @@ def test_engine_estimates_a_woken_replay_from_its_forward_start(monkeypatch):
     replay below the reach, as admission does."""
     engine, _, _, seq = replaying_engine(monkeypatch)
     _woken(engine, seq)
-    assert engine._local_prefill_pending_work() == (True, 40 - (32 - _REPLAY))
+    assert engine._local_prefill_pending_work(limits=engine._prefill_limits()) == (
+        True,
+        40 - (32 - _REPLAY),
+    )
     starts = []
     real_cost = engine._chunk_cost
     monkeypatch.setattr(
@@ -1147,7 +1150,7 @@ def test_engine_estimates_a_woken_replay_from_its_forward_start(monkeypatch):
         "_chunk_cost",
         lambda start, k: starts.append(start) or real_cost(start, k),
     )
-    engine._estimate_prefill_chunk_cost()
+    engine._estimate_prefill_chunk_cost(limits=engine._prefill_limits())
     assert starts == [32 - _REPLAY]
 
 

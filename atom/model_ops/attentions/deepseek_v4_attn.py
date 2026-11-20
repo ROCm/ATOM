@@ -1322,7 +1322,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         `_page_unit_region_cache` is deliberately not in it: half of what it
         holds comes from pools this method's caller does not own, so being on
         the list would make it look covered when it is not. It keys on its own
-        addresses instead.
+        addresses instead. Temporary profiling also clears that key explicitly
+        on exit because serving allocations can reuse scratch addresses.
         """
         self._slot_view_cache = None
         self._checkpoint_range_cache = None
@@ -1407,9 +1408,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         be an invariant this cache cannot check and the next reader cannot
         see. The key is the two planes and the one or two indexer pools, so
         finding out costs four `data_ptr()`s against a copy path measured in
-        milliseconds, and the
-        failure it removes is a scatter into whatever the allocator handed
-        that address range to next.
+        milliseconds. An address change invalidates the cached regions.
+        Temporary profiling clears the key on exit as well: an allocator can reuse a scratch
+        address with a different per-layer stride for the serving pool.
         """
         planes = self._kv_planes()
         pools = [pool for pool, _ in self._indexer_page_pools()]
@@ -2704,13 +2705,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 )
             }
             variables = {**forward_vars, **private}
-            owner = groups = None
-            if runner.h2d_groups is not None:
-                # Binding a shared buffer again would steal it from the live
-                # slot's owner. Only the clones belong to this publication slot.
-                owner, groups = runner.build_h2d_slot(
-                    private, torch.cuda.Event(), partial=True
-                )
+            # Binding a shared buffer again would steal it from the live
+            # slot's owner. Only the clones belong to this publication slot.
+            owner, groups = runner.build_h2d_slot(
+                private, torch.cuda.Event(), partial=True
+            )
             banks[slot] = (variables, owner, groups)
         self._mixed_prefill_banks = banks
 
@@ -2725,16 +2724,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             runner.h2d_groups,
         )
         runner.forward_vars = variables
-        if owner is not None:
-            runner.h2d_owner, runner.h2d_groups = owner, groups
+        runner.h2d_owner, runner.h2d_groups = owner, groups
         try:
             yield variables
         finally:
             # Restore even on error so a failed mixed build can't leave the
             # runner pointed at the bank.
             runner.forward_vars = saved[0]
-            if owner is not None:
-                runner.h2d_owner, runner.h2d_groups = saved[1], saved[2]
+            runner.h2d_owner, runner.h2d_groups = saved[1], saved[2]
 
     @contextmanager
     def mixed_prefill_bank_active(self, batch: ScheduledBatch):
@@ -2752,8 +2749,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         are written here, from the same `num_scheduled_tokens`.
         """
         _, owner, _ = self._get_mixed_prefill_bank()
-        if owner is not None:
-            owner.begin()
+        owner.begin()
         try:
             with self.mixed_prefill_bank_selected() as variables:
                 n_p_seqs = batch.total_seqs_num_prefill
@@ -2764,12 +2760,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 )
                 yield variables
         except BaseException:
-            if owner is not None:
-                owner.fail()
+            owner.fail()
             raise
         else:
-            if owner is not None:
-                owner.finish()
+            owner.finish()
 
     def prepare_mixed(self, batch, running_bs, running_tokens, ubatch_slices=None):
         """Build each segment once with independent metadata publication."""

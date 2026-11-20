@@ -273,6 +273,70 @@ def test_verify_spans_put_prefill_rows_at_one_sample_each():
     assert cu_end.tolist() == [1, 2, 6, 10]  # ends at the 10 logit rows
 
 
+@pytest.mark.parametrize(
+    "phase,verify",
+    [
+        ("prefill", False),
+        ("decode", False),
+        ("decode", True),
+        ("mixed", False),
+        ("mixed", True),
+    ],
+)
+def test_prepare_inputs_uses_the_prepared_spec_indices(monkeypatch, phase, verify):
+    from atom.model_engine import model_runner as module
+
+    runner = object.__new__(module.ModelRunner)
+    runner.config = SimpleNamespace(speculative_config=object() if verify else None)
+    runner.forward_vars = {"batch_info": SimpleNamespace(gpu=torch.zeros(3))}
+    runner.running_tokens_per_dp_rank = None
+    ids = torch.arange(6)
+    metadata = SimpleNamespace(sampled_token_indices=torch.tensor([2, 3, 4, 5]))
+    runner.attn_metadata_builder = SimpleNamespace(
+        build=lambda **kw: (metadata, ids),
+        prepare_model_inputs=lambda *args: None,
+    )
+    calls = []
+    spec_metadata = object()
+
+    def calc_spec_decode_metadata(sampled_ids, indices):
+        calls.append((sampled_ids, indices))
+        return spec_metadata
+
+    if verify:
+        runner.drafter = SimpleNamespace(
+            calc_spec_decode_metadata=calc_spec_decode_metadata
+        )
+    captured = {}
+    monkeypatch.setattr(module, "set_forward_context", lambda **kw: captured.update(kw))
+    batch = SimpleNamespace(
+        is_mixed=phase == "mixed", total_tokens_num=6, is_dummy_run=phase == "prefill"
+    )
+    mode = SimpleNamespace(
+        is_prefill=phase != "decode",
+        sync=SimpleNamespace(ub_tokens_across_dp=None),
+        running_tokens_are_unified=True,
+        running_bs=2,
+        running_tokens=6,
+        max_seqlen_q=3,
+        ubatch_slices=None,
+        pcp_groups=None,
+        scheduled_bs=2,
+    )
+    indices = (np.array([0, 2]), 2) if verify else None
+    runner.prepare_inputs(batch, ids, mode, spec_decode_indices=indices)
+
+    assert captured["attn_metadata"] is metadata
+    assert captured["context"].is_prefill == mode.is_prefill
+    assert captured["spec_decode_metadata"] is (spec_metadata if verify else None)
+    if verify:
+        assert len(calls) == 1 and calls[0][1] is indices
+        expected = ids[metadata.sampled_token_indices] if phase == "mixed" else ids
+        torch.testing.assert_close(calls[0][0], expected)
+    else:
+        assert not calls
+
+
 def test_verify_spans_skip_pure_prefill_and_idle_ranks():
     from atom.model_engine.model_runner import ModelRunner
 

@@ -628,7 +628,7 @@ class tokenIDProcessor:
         total_tokens_prefill = batch.total_tokens_num_prefill
         total_tokens_decode = batch.total_tokens_num_decode
         total_reqs_prefill = batch.total_seqs_num_prefill
-        is_mixed = batch.is_mixed
+        is_mixed = total_reqs_prefill > 0 and batch.is_mixed
 
         # Both paths stage the whole batch once. Only decode rows may gather
         # last step's GPU outputs; prefill tokens always keep the scheduler's
@@ -2656,11 +2656,10 @@ class ModelRunner:
     ) -> tuple[np.ndarray, np.ndarray] | None:
         """Sample counts and cumulative ends in logit-row space."""
         n_p = batch.total_seqs_num_prefill
-        is_mixed = batch.is_mixed
         # A mixed step verifies its decode rows as a pure decode would, so it
         # asks `_verifies_drafts` the decode question; pure prefill samples
         # without verification.
-        if not self._verifies_drafts(batch, is_prefill=n_p > 0 and not is_mixed):
+        if not self._verifies_drafts(batch, is_prefill=n_p > 0 and not batch.is_mixed):
             return None
         if n_p == 0:
             _, lens, cu = self.attn_metadata_builder.decode_spans(batch)
@@ -2704,8 +2703,7 @@ class ModelRunner:
             ubatch_slices=forward_mode.ubatch_slices,
             pcp_groups=forward_mode.pcp_groups,
         )
-        spans = self._verify_spans(batch)
-        if spans is not None:
+        if spec_decode_indices is not None:
             sampled_ids = (
                 input_ids[attn_metadata.sampled_token_indices]
                 if is_mixed
@@ -2921,8 +2919,8 @@ class ModelRunner:
             )
         )
         spec_group = self.h2d_groups.get("spec_decode")
-        spans = self._verify_spans(batch)
-        if spec_group is not None and spans is not None:
+        spans = self._verify_spans(batch) if spec_group is not None else None
+        if spans is not None:
             lens, cu_end = spans
             spec_decode_indices = self.drafter.prepare_spec_decode_indices(
                 lens, cu_end, token_group
@@ -5156,26 +5154,10 @@ class RapidServeModelRunner(ModelRunner):
             )
         self._back_paged_pools(num_kvcache_blocks, buf=self.kv_cache)
 
-        models_to_bind = [("target", self.model)]
-        if self.config.speculative_config and hasattr(self, "drafter"):
-            models_to_bind.append(("draft", self.drafter.model))
-
         kv_cache_data = {}
-        for model_name, model in models_to_bind:
-            for module in model.modules():
-                # Same dispatch as the allocating path's loop: a draft with a
-                # pool of its own binds through its own builder, and its pool
-                # is now a region of the same imported buffer.
-                bound = None
-                if model_name == "draft" and hasattr(self, "draft_kv_builder"):
-                    bound = self.draft_kv_builder.build_kv_cache_tensor(module)
-                if bound is None:
-                    bound = self.attn_metadata_builder.build_kv_cache_tensor(module)
-                if bound is not None:
-                    # The same key the allocating path uses. Keyed by the walk's
-                    # ordinal here until now, which agreed with it only while
-                    # the first bound module was layer 0.
-                    kv_cache_data[f"layer_{module.layer_num}"] = bound
+        for module, bound in kv_cache_bindings(self):
+            if bound is not None:
+                kv_cache_data[f"layer_{module.layer_num}"] = bound
 
         from atom.utils.forward_context import set_kv_cache_data
 

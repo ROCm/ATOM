@@ -563,7 +563,8 @@ class PrefillDelayer:
         arrived_requests: int = 0,
         next_completion_steps: int | None = None,
         admittable_requests: int | None = None,
-        prefill_budget: int | None = None,
+        *,
+        prefill_budget: int,
     ) -> PrefillDecision:
         """Whether this rank may admit new prefills this tick (FIRE), and how
         many ranks have prefill to admit.
@@ -658,8 +659,6 @@ class PrefillDelayer:
         self._reduce_np[9] = 1 if blocked else 0
         self._reduce_np[10] = 1 if unreachable else 0
         self._reduce_np[11] = 1 if self._prefill_only_since_last_decision else 0
-        if prefill_budget is None:
-            prefill_budget = self.max_num_batched_tokens
         self._reduce_np[12] = int(prefill_budget) if prefillable else 0
         if self._cost_slots:
             self._reduce_np[_FIXED_SLOTS : self._gate_at] = 0

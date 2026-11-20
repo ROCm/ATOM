@@ -1690,7 +1690,7 @@ class Indexer(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Stubs — implementations land in tasks #5-#8
+# Attention execution
 # ---------------------------------------------------------------------------
 
 
@@ -1698,26 +1698,20 @@ _NULL_SPAN = nullcontext()
 
 
 @contextmanager
-def _segment_forward_context(fc, ctx, seg_md, *, is_prefill: bool, input_ids):
-    """Select segment metadata, phase and input IDs, restoring them on exit.
+def _segment_forward_context(fc, ctx, seg_md, *, is_prefill: bool):
+    """Select segment metadata and phase, restoring them on exit.
 
     Other context fields describe the whole batch. Segment operations must
     size their work from the supplied tensors and metadata."""
     saved_md = fc.attn_metadata
     saved_is_prefill = ctx.is_prefill
-    saved_input_ids = ctx.input_ids
     fc.attn_metadata = seg_md
     ctx.is_prefill = is_prefill
-    if input_ids is not None:
-        # Keep ctx.input_ids segment-consistent for anything downstream reads
-        # off it (e.g. the hash-MoE `_hash_topk`).
-        ctx.input_ids = input_ids
     try:
         yield
     finally:
         fc.attn_metadata = saved_md
         ctx.is_prefill = saved_is_prefill
-        ctx.input_ids = saved_input_ids
 
 
 def _mixed_span(tag: str):
@@ -2374,7 +2368,7 @@ class DeepseekV4Attention(nn.Module):
         # compress_plans=None and each half's plans live on its own
         # sub-metadata, so `_attn_mixed` launches them per segment.
         attn_md = cast("AttentionMetaData_DSV4", fc.attn_metadata)
-        is_mixed = attn_md.is_mixed
+        is_mixed = fc.context.is_prefill and attn_md.is_mixed
         if not is_mixed:
             self._launch_compressors(x)
         q, kv_pre, qr, qr_scale, *_ = self._attn_pre(
@@ -2411,10 +2405,6 @@ class DeepseekV4Attention(nn.Module):
         ctx = fc.context
         n_p = attn_md.num_prefill_tokens
         n_d = x.size(0) - n_p
-        # Only `input_ids` is still read here -- each segment slices it. The
-        # metadata/is_prefill swap and its restore belong to
-        # `_segment_forward_context`, per segment.
-        saved_input_ids = ctx.input_ids
         # q_norm scales can be column-major or padded/shuffled. Their apparent
         # first dimension is not a token axis: project before splitting them.
         idx_q_quant = idx_weights = idx_q_scale = None
@@ -2442,7 +2432,6 @@ class DeepseekV4Attention(nn.Module):
                     ctx,
                     seg_md,
                     is_prefill=is_prefill,
-                    input_ids=None if saved_input_ids is None else saved_input_ids[sl],
                 ),
                 _mixed_span(f"mixed_seg[{tag}] n={hi - lo}"),
             ):

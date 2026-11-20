@@ -946,7 +946,10 @@ def test_the_fill_probe_sizes_a_waiting_request_as_admission_will():
     sched.add(_make_seq(10000))
     _with_census(sched)
 
-    assert sched._local_prefill_pending_work() == (True, 256)
+    assert sched._local_prefill_pending_work(limits=sched._prefill_limits()) == (
+        True,
+        256,
+    )
     assert not sched._dynamic_chunking_counts
     batch, _ = sched.schedule()
     assert batch.total_tokens_num == 256
@@ -1338,7 +1341,7 @@ def _prefill_ids(sched):
 
 def test_held_seq_is_skipped_by_both_prefill_scans():
     sched, seq, _, _ = _held_after_first_chunk()
-    pending, _ = sched._local_prefill_pending_work()
+    pending, _ = sched._local_prefill_pending_work(limits=sched._prefill_limits())
     assert not pending, "the probe counted a held chunk as pending work"
     assert seq.id not in _prefill_ids(sched)
     assert seq.id in sched._checkpoint_holds

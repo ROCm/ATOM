@@ -3743,6 +3743,7 @@ class Config:
         if not self.enable_mixed_prefill_decode:
             return
 
+        from atom.kv_transfer.disaggregation.pd_producer import disaggregated_kv_role
         from atom.utils import get_hf_text_config
         from atom.utils.selector import Family, attn_family
 
@@ -3754,6 +3755,16 @@ class Config:
         rope_parameters = getattr(hf, "rope_parameters", None) or {}
         # (is this config affected, what it is, why it cannot run mixed)
         refusals = [
+            (
+                self.enable_rapidserve,
+                "RapidServe",
+                "its separate prefill/decode schedulers do not form mixed batches",
+            ),
+            (
+                disaggregated_kv_role(self) == "kv_producer",
+                "P/D kv_producer",
+                "a prefill-only producer cannot use mixed scheduling or its memory profile",
+            ),
             (
                 self.enable_tbo or self.enable_tbo_decode,
                 "TBO",
@@ -3789,7 +3800,7 @@ class Config:
             ),
             # Speculative decoding runs mixed only as V4 + DSpark: a prefill row
             # verifies as a 0-draft spec row and the V4 decode half is the
-            # unmodified, spec-shaped `prepare_decode`. See
+            # spec-shaped `prepare_decode` with decode-local rejection counts. See
             # docs/scheduling_kv_cache_guide.md#mixed-prefill-and-decode-on-deepseek-v4.
             (
                 spec is not None and spec_method != "dspark",
@@ -3858,7 +3869,7 @@ class Config:
                 + ". Drop the flag, or the feature it conflicts with."
             )
 
-        # The scheduler keeps at least 1/8 of the token budget for prefill.
+        # When decode append pages fit, keep 1/8 of the token budget for prefill.
         # FCFS decode tails can wait for the entire long prefill.
         if spec is not None and spec.num_speculative_tokens:
             full_reserve = self.max_num_seqs * (spec.num_speculative_tokens + 1)
@@ -3870,7 +3881,8 @@ class Config:
                     "--enable-mixed-prefill-decode with %d speculative tokens: a "
                     "full decode set (max_num_seqs=%d) needs %d tokens with "
                     "--max-num-batched-tokens=%d. The scheduler reserves at "
-                    "least 1/8 of that budget for prefill, so some decodes "
+                    "least 1/8 of that budget for prefill when decode append "
+                    "pages fit, so some decodes "
                     "at the FCFS tail may wait until preceding decodes finish "
                     "or the long prefill ends.",
                     spec.num_speculative_tokens,

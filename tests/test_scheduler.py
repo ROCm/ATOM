@@ -23,6 +23,7 @@ from atom.model_engine.early_load import EarlyLoadState
 from atom.model_engine.engine_stats import EngineStats
 from atom.model_engine.prefill_delayer import PrefillDecision
 from atom.model_engine.scheduler import (
+    PrefillLimits,
     ScheduledBatch,
     ScheduledBatchOutput,
     Scheduler,
@@ -1078,7 +1079,9 @@ class TestSchedule:
         sched.failed_recving_kv_req_ids = []
         sched.kv_connector = None  # P/D: resolved at admission
 
-        sched._prioritize_ready_remote_kv_requests()
+        sched._prioritize_ready_remote_kv_requests(
+            limits=PrefillLimits(tokens=8, reserved_decode_blocks=0, num_decodes=0)
+        )
 
         assert [seq.id for seq in sched.waiting] == [2, 1, 3]
 
@@ -1228,7 +1231,7 @@ class TestSchedule:
 
         assert sched.preempt(victim)
         assert list(sched.waiting) == [victim, *loads]
-        assert sched._can_admit_head_prefill()
+        assert sched._can_admit_head_prefill(limits=sched._prefill_limits())
 
     def test_preempt_goes_behind_the_last_resume_of_the_leading_run(self):
         sched = self._offload_sched(12)
@@ -1260,7 +1263,7 @@ class TestSchedule:
 
         assert sched.preempt(victim)
         assert list(sched.waiting) == [victim, *reloads]
-        assert sched._can_admit_head_prefill()
+        assert sched._can_admit_head_prefill(limits=sched._prefill_limits())
 
     def test_parked_partial_prefills_queue_behind_a_settled_resume(self):
         """Four partial prefills parked for their loads must not push a settled
@@ -1281,9 +1284,9 @@ class TestSchedule:
 
         assert list(sched.waiting) == [resume, *partials]
         for _ in range(2):  # event-free ticks leave the order alone
-            sched._prioritize_ready_remote_kv_requests()
+            sched._prioritize_ready_remote_kv_requests(limits=sched._prefill_limits())
             assert next(iter(sched.waiting)) is resume
-            assert sched._can_admit_head_prefill()
+            assert sched._can_admit_head_prefill(limits=sched._prefill_limits())
 
     def test_an_idle_tick_leaves_the_waiting_queue_alone(self):
         """Without a finished or failed id nothing is scanned, however long the
@@ -1301,12 +1304,12 @@ class TestSchedule:
             "_is_offload_prefill_resume",
             wraps=sched._is_offload_prefill_resume,
         ) as scan:
-            sched._prioritize_ready_remote_kv_requests()
+            sched._prioritize_ready_remote_kv_requests(limits=sched._prefill_limits())
             assert scan.call_count == 0
             assert list(sched.waiting) == [fresh[0], early, fresh[1], late]
 
             sched.finished_recving_kv_req_ids.append(late.id)
-            sched._prioritize_ready_remote_kv_requests()
+            sched._prioritize_ready_remote_kv_requests(limits=sched._prefill_limits())
             assert scan.call_count == 4
 
         assert list(sched.waiting) == [early, late, fresh[0], fresh[1]]
@@ -1320,7 +1323,7 @@ class TestSchedule:
         sched.waiting.extend([lost, fresh, resume])
         sched.failed_recving_kv_req_ids.append(lost.id)
 
-        sched._prioritize_ready_remote_kv_requests()
+        sched._prioritize_ready_remote_kv_requests(limits=sched._prefill_limits())
 
         assert lost.status == SequenceStatus.WAITING and lost.offload_load_failed
         assert list(sched.waiting) == [resume, lost, fresh]
@@ -1333,7 +1336,7 @@ class TestSchedule:
         sched.failed_recving_kv_req_ids.append(failed.id)
         assert not sched.finished_recving_kv_req_ids
 
-        sched._prioritize_ready_remote_kv_requests()
+        sched._prioritize_ready_remote_kv_requests(limits=sched._prefill_limits())
 
         assert failed.offload_load_failed
         assert list(sched.waiting) == [failed, fresh]
@@ -1757,7 +1760,10 @@ def test_probe_scans_past_long_cached_prompts(seq_factory):
     _cache_prefix(sched, seq_factory)
     for tail in ([600, 601, 602, 603], [700, 701, 702, 703]):
         sched.add(seq_factory(_PREFIX + tail))
-    assert sched._local_prefill_pending_work() == (True, 8)
+    assert sched._local_prefill_pending_work(limits=sched._prefill_limits()) == (
+        True,
+        8,
+    )
     batch, _ = sched.schedule()
     assert batch.total_tokens_num_prefill == 8
 
@@ -1769,7 +1775,10 @@ def test_probe_stops_once_the_budget_is_filled(seq_factory, monkeypatch):
         sched.add(seq_factory(_PREFIX + [600 + 16 * i + j for j in range(16)]))
     fits = _count_fits(sched, monkeypatch)
     # Scanning on would report the same; the stop saves the third fit.
-    assert sched._local_prefill_pending_work() == (True, 32)
+    assert sched._local_prefill_pending_work(limits=sched._prefill_limits()) == (
+        True,
+        32,
+    )
     assert len(fits) == 2
     batch, _ = sched.schedule()
     assert batch.total_tokens_num_prefill == 32
@@ -1782,7 +1791,10 @@ def test_probe_stops_once_the_slots_are_used(seq_factory, monkeypatch):
         sched.add(seq_factory(_PREFIX + [600 + 4 * i + j for j in range(4)]))
     fits = _count_fits(sched, monkeypatch)
     # Scanning on would report the same; the stop saves the other fits.
-    assert sched._local_prefill_pending_work() == (True, 4)
+    assert sched._local_prefill_pending_work(limits=sched._prefill_limits()) == (
+        True,
+        4,
+    )
     assert len(fits) == 1
     batch, _ = sched.schedule()
     assert batch.total_tokens_num_prefill == 4
@@ -1830,7 +1842,10 @@ def test_probe_stops_at_a_seq_waiting_for_an_inflight_prefix():
 
     # The scan stops at the consumer: only the producer's next chunk counts,
     # not a full budget. Admission still admits the request behind it.
-    assert sched._local_prefill_pending_work() == (True, 16)
+    assert sched._local_prefill_pending_work(limits=sched._prefill_limits()) == (
+        True,
+        16,
+    )
     assert sched._inflight_prefix_wait == {}  # the probe starts no deadline
     batch, _ = sched.schedule()
     assert batch.num_scheduled_tokens[0] == 16
@@ -2451,7 +2466,7 @@ class TestProducerPreemptability:
         assert scheduler._is_preemptable(seq) is False
 
         published.clear()
-        assert scheduler._preempt_one_running() is True
+        assert scheduler._preempt_one_running(seq) is True
         assert seq.status == SequenceStatus.WAITING
 
 
@@ -4091,7 +4106,10 @@ def test_coalescing_ready_resume_consumes_one_slot(
         sched._num_parked_remote_kv,
         [(q.status, list(q.block_table), q.num_cached_tokens) for q in sched.waiting],
     )
-    assert sched._local_prefill_pending_work() == (True, resumes * 8 + 16)
+    assert sched._local_prefill_pending_work(limits=sched._prefill_limits()) == (
+        True,
+        resumes * 8 + 16,
+    )
     assert (
         sched._num_parked_remote_kv,
         [(q.status, list(q.block_table), q.num_cached_tokens) for q in sched.waiting],
@@ -4113,7 +4131,10 @@ def test_coalescing_keeps_inflight_load_slot_reserved(seq_factory):
     sched._count_inflight_load(inflight)
     fresh = seq_factory([3000] * 16)
     sched.waiting.extend([ready, inflight, fresh])
-    assert sched._local_prefill_pending_work() == (True, 8)
+    assert sched._local_prefill_pending_work(limits=sched._prefill_limits()) == (
+        True,
+        8,
+    )
     assert sched._num_parked_remote_kv == 2
     assert inflight.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
 
