@@ -898,19 +898,66 @@ def test_scorer_runs_in_its_workspace_and_selects_the_same_rows():
         (True, "preshuffle", 48, False),  # FlyDSL plane, no such kernel
     ],
 )
-def test_can_fuse_weights_proj_is_the_fuse_flag_and_the_natural_plane(
-    enabled, layout, rows, expected
+def test_indexer_project_fuses_only_the_natural_plane(
+    monkeypatch, enabled, layout, rows, expected
 ):
-    """The gate is pure ATOM policy -- the flag, the NATURAL plane and the
-    128-row window -- with tensor shapes left to aiter. It decides only whether
-    to fold the projection into the quant launch, never correctness."""
-    from atom.model_ops.indexer.layout import (
-        MFMA,
-        NATURAL,
-        PRESHUFFLE,
-        can_fuse_weights_proj,
+    """The gate that `Indexer.project` actually runs: the fuse flag, the
+    NATURAL plane and 1..128 rows. Other FP4 steps keep `quantize_query_fp4`
+    plus the standalone GEMM. CPU only — both launches are patched."""
+    from types import SimpleNamespace
+
+    from aiter_stub import atom_without_aiter
+    from torch import nn
+
+    with atom_without_aiter() as load:
+        attention = load("atom.models.deepseek_v41.attention")
+        layout_tags = load("atom.model_ops.indexer.layout")
+
+    assert {layout_tags.MFMA, layout_tags.NATURAL, layout_tags.PRESHUFFLE} == {
+        "mfma",
+        "natural",
+        "preshuffle",
+    }
+
+    branch = {}
+
+    def fused(*args):
+        branch["name"] = "fused"
+        return "fused"
+
+    def quant(*args, **kwargs):
+        branch["name"] = "quant"
+        branch["layout"] = kwargs["layout"]
+        return "quant"
+
+    monkeypatch.setattr(attention, "project_query_fp4", fused)
+    monkeypatch.setattr(attention, "quantize_query_fp4", quant)
+
+    indexer = attention.Indexer.__new__(attention.Indexer)
+    nn.Module.__init__(indexer)
+    indexer.heads, indexer.head_dim = 4, 8
+    indexer.fuse_weights_proj = enabled
+    indexer.spec = SimpleNamespace(kv_owner=0)
+    indexer.wq_b = lambda qr, x_scale=None: torch.zeros(
+        1, rows, indexer.heads * indexer.head_dim
     )
 
-    # The string literals above are the real layout tags.
-    assert {MFMA, NATURAL, PRESHUFFLE} == {"mfma", "natural", "preshuffle"}
-    assert can_fuse_weights_proj(enabled, layout, rows) is expected
+    class Weights:
+        weight = "proj"
+
+        def __call__(self, hidden):
+            return ("standalone",)
+
+    indexer.weights_proj = Weights()
+    cache = SimpleNamespace(
+        geometry=SimpleNamespace(index_fp4=True),
+        index_units={0: SimpleNamespace(layout=layout)},
+        rope_positions=lambda step: "positions",
+    )
+    got = indexer.project(torch.zeros(1, rows, 4), None, None, cache, None, "rope")
+    if expected:
+        assert branch == {"name": "fused"}
+        assert got == "fused"
+    else:
+        assert branch == {"name": "quant", "layout": layout}
+        assert got == ("quant", "standalone")

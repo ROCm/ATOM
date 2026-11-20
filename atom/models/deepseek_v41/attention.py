@@ -160,16 +160,13 @@ class Indexer(nn.Module):
         )
         if cache.geometry.index_fp4:
             units = cache.index_units[self.spec.kv_owner]
-            rows = query.shape[1]
-            # Inlined (the `can_fuse_weights_proj` spec in indexer/layout.py,
-            # which the CPU test locks): a call + its frame here would cost
-            # ~0.2us on every FP4 indexer step, including the gfx950 MFMA and
-            # PRESHUFFLE layouts that never fuse. `fuse_weights_proj` is read
-            # once in `__init__`, not per step.
+            # `query.shape` is read only after the layout test. MFMA and
+            # PRESHUFFLE never fuse, and that Size read is measurable on every
+            # FP4 step. `fuse_weights_proj` is set once in `__init__`.
             if (
                 self.fuse_weights_proj
                 and units.layout == NATURAL
-                and 0 < rows <= _MAX_FUSED_PROJECT_ROWS
+                and 0 < query.shape[1] <= _MAX_FUSED_PROJECT_ROWS
             ):
                 # The query's RoPE + MXFP4 quant launch also projects the head
                 # weights, folding `weights_proj` into it rather than running it

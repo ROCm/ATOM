@@ -324,18 +324,20 @@ class DeepseekV41ForCausalLM(nn.Module):
         # gfx1250 FP4 indexer: the folded weights_proj quant kernel reads one
         # [max_pos, rope_dim] cos|sin table. Build it here, once, so it is sized
         # into the memory profile rather than allocated lazily mid-decode (after
-        # KV sizing). Both ropes feed indexer layers (global where spec.ratio,
-        # window otherwise), and only when the fold can run (NATURAL => gfx1250).
+        # KV sizing). An Indexer exists only on FULL/REINDEX layers, which are
+        # never ratio 0, and those layers take global_rope. Window layers do
+        # not. Only when the fold can run (NATURAL => gfx1250).
         if (
             envs.ATOM_DSV41_FUSE_WEIGHTS_PROJ
             and get_current_atom_config().index_cache_layout == NATURAL
         ):
-            for rope in (self.window_rope, self.global_rope):
-                rope.register_buffer(
-                    "cos_sin_cache",
-                    torch.cat((rope.cos_cache, rope.sin_cache), dim=-1).contiguous(),
-                    persistent=False,
-                )
+            self.global_rope.register_buffer(
+                "cos_sin_cache",
+                torch.cat(
+                    (self.global_rope.cos_cache, self.global_rope.sin_cache), dim=-1
+                ).contiguous(),
+                persistent=False,
+            )
 
     @property
     def model(self):

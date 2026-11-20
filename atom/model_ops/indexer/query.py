@@ -117,9 +117,9 @@ def project_query_fp4(query, rope, positions, hidden, weights_proj_weight):
     bf16 projection `Indexer.project` returns, which `score_quantized` then
     folds `weights_scale` into (so no scale is applied here).
 
-    Caller gates on `can_fuse_weights_proj`; `rope.cos_sin_cache` is the
-    `[max_pos, rope_dim]` cos|sin table the model builds at construction for
-    the ropes that can fuse (`DecoderModel.__init__`)."""
+    `Indexer.project` decides whether to call this. `rope.cos_sin_cache` is
+    the `[max_pos, rope_dim]` cos|sin table `DeepseekV41ForCausalLM.__init__`
+    builds for `global_rope` only, the rope an indexer layer receives."""
     from aiter.ops.triton.rope.q_rope_mxfp4_quant import q_rope_mxfp4_quant
 
     q_fp4, q_scale, weights = q_rope_mxfp4_quant(
