@@ -1124,6 +1124,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4": lambda: (
         os.getenv("ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4", "0") == "1"
     ),
+    # Fuse MiniMax-M3's separate shared-expert SwiGLU-OAI with the native
+    # group32 MXFP8 activation quant consumed by its unchanged down projection.
+    # Default-off; unsupported architectures and layouts keep the split path.
+    "ATOM_MINIMAX_M3_SHARED_SWIGLU_MXFP8": lambda: _flag_env(
+        "ATOM_MINIMAX_M3_SHARED_SWIGLU_MXFP8"
+    ),
     # Gate/Up interleave mode for MoE weight preshuffle and kernel gate_mode.
     # "0" (default) = SEPARATED layout; "1" = INTERLEAVE layout. Always
     # INTERLEAVE on gfx1250: aiter's gfx1250 fused_moe takes no other layout.
