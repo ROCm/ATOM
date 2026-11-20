@@ -227,3 +227,54 @@ def test_fp4_wide_tile_groups_its_stores_on_a_long_row(q_len, blocks, want_group
     assert config.store_group == want_group
     # The grouped loop reads its pages one at a time, as the tile was tuned.
     assert not config.prefetch_pages
+
+
+@pytest.mark.parametrize(
+    "q_len, blocks, batch",
+    [
+        (6705, 4058, 7),  # the c64 AgentX batched prefills measured
+        (13623, 4487, 3),
+        (9105, 1702, 4),
+        (4272, 5649, 5),
+        (4471, 2911, 2),
+        (3760, 2896, 4),
+    ],
+)
+def test_fp4_batched_prefill_takes_the_wide_grouped_launch(q_len, blocks, batch):
+    from atom.model_ops.minimax_m3.prefill_policy import (
+        FP4_BATCHED_PREFILL_SCORE_CONFIG,
+    )
+
+    fp4 = prefill_score_config("gfx1250", False, q_len, blocks, batch, 1, 256, fp4=True)
+    assert fp4 == FP4_BATCHED_PREFILL_SCORE_CONFIG
+    assert (fp4.block_size_q, fp4.chunk_blocks, fp4.num_warps) == (256, 64, 8)
+    assert (fp4.store_group, fp4.post_reduce_scale, fp4.num_stages) == (4, True, 1)
+    # FP8 and the other archs keep their buckets.
+    fp8 = prefill_score_config("gfx1250", True, q_len, blocks, batch, 1, 256)
+    assert fp8 != FP4_BATCHED_PREFILL_SCORE_CONFIG
+    assert (
+        prefill_score_config("gfx950", False, q_len, blocks, batch, 1, 256, fp4=True)
+        is DEFAULT_PREFILL_SCORE_CONFIG
+    )
+
+
+@pytest.mark.parametrize(
+    "q_len, blocks, batch",
+    [
+        (5979, 4015, 1),  # one request: its own (wide) bucket
+        (4272, 1023, 5),  # under the block bound
+        (1024, 4058, 3),  # 12 wide query tiles over the batch: under the bound
+        (256, 640, 2),
+    ],
+)
+def test_fp4_small_or_single_prefill_keeps_its_bucket(q_len, blocks, batch):
+    from atom.model_ops.minimax_m3.prefill_policy import (
+        FP4_BATCHED_PREFILL_SCORE_CONFIG,
+        _gfx1250_prefill_score_config,
+    )
+
+    fp4 = prefill_score_config("gfx1250", False, q_len, blocks, batch, 1, 256, fp4=True)
+    bucket = _gfx1250_prefill_score_config(q_len, blocks, batch, 1, 256)
+    assert fp4.block_size_q == bucket.block_size_q
+    assert fp4.chunk_blocks == bucket.chunk_blocks
+    assert batch == 1 or fp4 != FP4_BATCHED_PREFILL_SCORE_CONFIG

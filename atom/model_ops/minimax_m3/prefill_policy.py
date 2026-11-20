@@ -117,6 +117,8 @@ def prefill_score_config(
     """
     if arch != "gfx1250" or not (is_fp8 or fp4):
         return DEFAULT_PREFILL_SCORE_CONFIG
+    if fp4 and _fp4_batched_wide(max_query_len, max_block, batch):
+        return FP4_BATCHED_PREFILL_SCORE_CONFIG
     config = _gfx1250_prefill_score_config(
         max_query_len, max_block, batch, heads, compute_units
     )
@@ -143,6 +145,47 @@ def prefill_score_config(
 
 # Stages of every tuned FP4 prefill specialization (see `prefill_score_config`).
 FP4_PREFILL_SCORE_NUM_STAGES = 1
+# FP4, several requests in one prefill forward (AgentX at concurrency 64 batches
+# 2-7 of them, contexts 50K-720K): the FP8 buckets hand most of these the
+# default launch -- Q128, a chunk of ~1000 blocks, a store a block, the scale on
+# every product -- and the rest the Q64 grouped one at a chunk of 200-560. The
+# wide tile with grouped stores at a fixed 64-block chunk beats both. MI455X,
+# score + top-k a layer, us (the bucket's launch -> this one), same selection:
+#
+#     requests  query tokens  longest context   bucket          us
+#     7         32667         519K              default         2048 -> 944
+#     3         30506         574K              default         2103 -> 1008
+#     4         32732         218K              default         1475 -> 636
+#     5         15256         723K              Q64 grouped     1006 -> 530
+#     2         8602          373K              Q64 grouped      418 -> 344
+#     4         13478         371K              Q64 grouped      432 -> 460
+#
+# The chunk is what moves it: at the default's ~1000 blocks every tile gives
+# 600-700 TFLOP/s, at 64 the wide tile gives 1250-1350. Applied from the
+# smallest shape measured -- a 1024-block bound and 16 wide query tiles over
+# the batch; smaller batches keep their bucket.
+FP4_BATCHED_PREFILL_SCORE_CONFIG = PrefillScoreConfig(
+    block_size_q=256,
+    chunk_blocks=64,
+    num_warps=8,
+    num_stages=1,
+    store_group=4,
+    prefetch_pages=False,
+    post_reduce_scale=True,
+)
+FP4_BATCHED_MIN_BLOCKS = 1024
+FP4_BATCHED_MIN_QUERY_TILES = 16
+
+
+def _fp4_batched_wide(max_query_len: int, max_block: int, batch: int) -> bool:
+    return (
+        batch > 1
+        and max_block >= FP4_BATCHED_MIN_BLOCKS
+        and batch * _cdiv(max_query_len, FP4_BATCHED_PREFILL_SCORE_CONFIG.block_size_q)
+        >= FP4_BATCHED_MIN_QUERY_TILES
+    )
+
+
 # The FP4 wide (Q256) tile's grouped store: blocks a store, and the launch
 # bound from which it pays (see `prefill_score_config`).
 FP4_WIDE_SCORE_BLOCK_SIZE_Q = 256
