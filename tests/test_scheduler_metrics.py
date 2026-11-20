@@ -138,11 +138,8 @@ def test_engine_receipt_includes_time_buffered_before_scheduler_admission(
 
     from aiter_stub import stubbed_aiter
 
-    from atom.model_engine.zmq_protocol.codec import (
-        AdmissionContext,
-        encode_shutdown,
-        encode_submit,
-    )
+    from atom.model_engine.admission import AdmissionContext
+    from atom.model_engine.zmq_protocol.codec import encode_shutdown, encode_submit
     from atom.model_engine.zmq_protocol.requests import IngressRequest
     from atom.sampling_params import SamplingParams
 

@@ -17,14 +17,10 @@ from unittest.mock import MagicMock
 import pytest
 from aiter_stub import stubbed_aiter
 
+from atom.model_engine.admission import AdmissionContext, build_sequence
 from atom.model_engine.sequence import Sequence
-from atom.model_engine.zmq_protocol.codec import (
-    AdmissionContext,
-    build_sequence,
-    decode_client_message,
-    encode_submit,
-)
-from atom.model_engine.zmq_protocol.requests import IngressRequest
+from atom.model_engine.zmq_protocol.codec import decode_client_message, encode_submit
+from atom.model_engine.zmq_protocol.requests import CompletionResult, IngressRequest
 from atom.sampling_params import SamplingParams
 
 # ``atom.model_engine.llm_engine`` imports aiter through CoreManager on real
@@ -195,3 +191,16 @@ def test_speculative_logprobs_are_admitted(n):
     seqs = proc.preprocess_fanout("hello", SamplingParams(n=n, logprobs=True))
     assert len(seqs) == n
     assert all(s.return_logprobs for s in _engine_seqs(seqs))
+
+
+def test_a_rejected_request_reports_the_prompt_the_frontend_sent():
+    """The Core refused it before building a sequence, so its result carries
+    only why; the frontend fills in what it knows of the request."""
+    proc = _make_processor()
+    proc._internal_to_external, proc._external_to_internal = {}, {}
+    [req] = proc.preprocess_fanout("hello", SamplingParams())
+    result = CompletionResult(id=req.id, leave_reason="rejected: bad", rejected=True)
+    out = proc.postprocess([result])[req.id]
+    assert out["finish_reason"] == "rejected: bad"
+    assert out["num_tokens_input"] == req.num_prompt_tokens == 5
+    assert not proc.requests

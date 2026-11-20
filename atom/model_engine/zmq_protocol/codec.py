@@ -5,14 +5,14 @@
 Client side: `encode_submit` / `encode_abort` / `encode_command` /
 `encode_shutdown`, and `decode_core_message` for what comes back.
 
-Core side: `decode_client_message`, `build_sequence` to turn a decoded
-request into the `Sequence` the scheduler has always received, and an
-`encode_*` for each of the Core's replies: completions, stream steps,
-rejections, readiness, metrics, utility / admin replies and its stop.
+Core side: `decode_client_message`, which decodes a request into the
+`AdmissionSpec` `atom.model_engine.admission.build_sequence` turns into a
+`Sequence`, and an `encode_*` for each of the Core's replies: completions,
+stream steps, rejections, readiness, metrics, utility / admin replies, the
+DP prefix-routing reports and its stop.
 
-Not carried yet: the DP prefix-routing messages (`PREFILL_BACKLOG`,
-`DP_REUSE`, `DP_PREFIX_CREDIT`) and the `Sequence` fields they feed
-(`dp_est_cached_tokens`, `prefill_completed`).
+This module only translates; what a request must pass to be admitted is
+`atom.model_engine.admission`'s.
 
 Decoded kinds are `EngineCoreRequestType` members, so the dispatch on both
 ends reads as it did when the payloads were pickled.
@@ -21,7 +21,7 @@ ends reads as it did when the payloads were pickled.
 import array
 import logging
 import pickle
-from dataclasses import fields, replace
+from dataclasses import fields
 from functools import cache, lru_cache
 from itertools import chain
 
@@ -30,7 +30,6 @@ import numpy as np
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.prefix_hash import ShippedChain
 from atom.model_engine.request import RequestOutput
-from atom.model_engine.sequence import PER_REQ_CACHE_MODEL_TYPES, Sequence
 from atom.model_engine.zmq_protocol import engine_v1_pb2 as pb
 from atom.model_engine.zmq_protocol.requests import CompletionResult, IngressRequest
 from atom.model_engine.zmq_protocol.wire import (
@@ -44,10 +43,7 @@ from atom.model_engine.zmq_protocol.wire import (
     encode_value,
 )
 from atom.observability import tracing
-from atom.sampling_params import EngineChannel, RequiredChannel, SamplingParams
-from atom.structured_output import is_structured
-from atom.structured_output.validation import validate_execution_options
-from atom.utils import envs
+from atom.sampling_params import RequiredChannel, SamplingParams
 
 logger = logging.getLogger("atom")
 
@@ -93,7 +89,8 @@ if tuple(f.name for f in fields(RequestOutput)) != STREAM_FIELDS:
         "update engine_v1.proto (StreamBatch) and codec.encode/_decode_stream"
     )
 
-# A rejected admission's leave_reason starts with this.
+# A rejected request's leave_reason starts with this; its `CompletionResult`
+# also says `rejected`.
 REJECTED_REASON = "rejected"
 
 # Why a request was rejected (RejectedRequest.Code).
@@ -280,7 +277,7 @@ def encode_submit(requests: list[IngressRequest], *, max_tokens=None) -> list:
             req.kv_transfer_params, spec, "kv_transfer_params", writer
         )
         encode_optional_value(req.multimodal_data, spec, "multimodal_data", writer)
-        if req.cache_seed is not None:
+        if req.cache_seed != -1:  # a text prompt's, as on `Sequence`
             spec.cache_seed = req.cache_seed
         encode_optional_value(req.mrope_positions, spec, "mrope_positions", writer)
         spec.mrope_position_delta = req.mrope_position_delta
@@ -426,6 +423,7 @@ def _decode_completion_alone(msg, reader: FrameReader) -> CompletionResult:
         return CompletionResult(
             id=msg.seq_id,
             leave_reason=f"{REJECTED_REASON}: {type(exc).__name__}: {exc}",
+            rejected=True,
         )
 
 
@@ -476,8 +474,8 @@ def _decode_stream(msg, reader: FrameReader) -> list[tuple[int, RequestOutput]]:
 def decode_core_message(frames: list):
     """`(kind, data)` for one message from an EngineCore.
 
-    ADD carries finished sequences as `CompletionResult`s, a rejected admission
-    included (its `leave_reason` starts with "rejected"); STREAM carries
+    ADD carries finished sequences as `CompletionResult`s, a rejected request
+    included (`rejected`, with a `leave_reason` that says why); STREAM carries
     `(seq_id, RequestOutput)` pairs; SHUTDOWN means the Core is gone.
     """
     envelope = decode_envelope(frames)
@@ -493,7 +491,9 @@ def decode_core_message(frames: list):
     if body == "rejected":
         return EngineCoreRequestType.ADD, [
             CompletionResult(
-                id=item.seq_id, leave_reason=f"{REJECTED_REASON}: {item.reason}"
+                id=item.seq_id,
+                leave_reason=f"{REJECTED_REASON}: {item.reason}",
+                rejected=True,
             )
             for item in envelope.rejected.items
         ]
@@ -666,114 +666,6 @@ def decode_client_message(frames: list):
     if body == "shutdown":
         return EngineCoreRequestType.SHUTDOWN, None, []
     raise ProtocolError(f"unexpected message from a client: {body}")
-
-
-class AdmissionContext:
-    """How a Core turns a decoded request into its `Sequence`.
-
-    Holds what the Core derives from its own config -- the client used to
-    derive the same from its copy of it -- and fills in what a client may
-    leave out (the REQUESTS section of engine_v1.proto). Built once per Core,
-    at startup.
-    """
-
-    def __init__(self, config):
-        speculative = config.speculative_config
-        self.config = config
-        self.block_size = config.kv_cache_block_size
-        self.num_draft_tokens = (
-            speculative.num_speculative_tokens if speculative is not None else 0
-        )
-        self.has_per_req_cache = (
-            config.hf_config.model_type in PER_REQ_CACHE_MODEL_TYPES
-        )
-        self.validate_request = getattr(config.hf_config, "validate_request", None)
-        self.enable_dp_attention = config.enable_dp_attention
-        # This Core's own: its engine loop holds one channel.
-        self.engine_channel = EngineChannel(config)
-
-
-def build_sequence(spec: AdmissionSpec, context: AdmissionContext):
-    """The `Sequence` the client would have built for `spec`.
-
-    Refuses what the frontend refuses against the engine's config, so a client
-    that is not this repo's frontend is held to it too: logprob options, a
-    structured request's execution options and its exclusion of a required
-    channel, a required channel other than the one this Core holds, and what
-    the model's own request validation refuses. A structured request's grammar
-    is the client's to have compiled (`LLMEngine.prepare_structured_request`).
-    """
-    kwargs = dict(spec.kwargs)
-    multimodal_data = kwargs["multimodal_data"]
-    params = kwargs["sampling_params"]
-    kv_transfer = kwargs["kv_transfer_params"]
-    multimodal = multimodal_data is not None
-    params.validate_logprob_options(
-        context.config, kv_transfer=kv_transfer, multimodal=multimodal
-    )
-    if is_structured(params):
-        if params.required_channel is not None:
-            raise ValueError(
-                "A request cannot carry both a structured-output grammar "
-                "(json_schema or structured_tool_format) and a required_channel"
-            )
-        validate_execution_options(
-            context.config,
-            params,
-            kv_transfer=kv_transfer,
-            multimodal=multimodal,
-            relaxed_mtp=envs.ATOM_ENABLE_RELAXED_MTP,
-        )
-    if params.required_channel is not None:
-        kwargs["sampling_params"] = replace(
-            params,
-            required_channel=context.engine_channel.hold(params.required_channel),
-        )
-    if context.validate_request is not None:
-        context.validate_request(
-            num_draft_tokens=context.num_draft_tokens,
-            multimodal_data=multimodal_data,
-            enable_dp_attention=context.enable_dp_attention,
-        )
-    if multimodal_data is not None and kwargs["mrope_positions"] is None:
-        # A client that cannot run the model's MRoPE code leaves them out.
-        from atom.multimodal.registry import get_mrope_input_positions
-
-        (
-            kwargs["mrope_positions"],
-            kwargs["mrope_position_delta"],
-        ) = get_mrope_input_positions(
-            context.config, list(kwargs["token_ids"]), multimodal_data
-        )
-    # The client hashed the media already; hand the seed to the constructor
-    # the way it reads one, then take it back out, so the sequence's
-    # multimodal_data is the dict the client sent.
-    lend_seed = (
-        spec.cache_seed is not None
-        and multimodal_data is not None
-        and "cache_seed" not in multimodal_data
-    )
-    if lend_seed:
-        multimodal_data["cache_seed"] = spec.cache_seed
-    try:
-        seq = Sequence(
-            block_size=context.block_size,
-            num_draft_tokens=context.num_draft_tokens,
-            has_per_req_cache=context.has_per_req_cache,
-            id=spec.seq_id,
-            **kwargs,
-        )
-    finally:
-        if lend_seed:
-            del multimodal_data["cache_seed"]
-    seq.max_tokens = spec.max_tokens
-    seq.arrive_time = spec.arrive_time
-    seq.dp_est_cached_tokens = spec.dp_est_cached_tokens
-    # The BlockManager checks a shipped chain before it trusts it.
-    seq.prompt_hash_chain = spec.prompt_hash_chain
-    if spec.trace is not None:
-        tracing.adopt_context(seq, *spec.trace)
-    return seq
 
 
 def rejection_code(exc: BaseException) -> int:
