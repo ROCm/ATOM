@@ -2,6 +2,8 @@
 //! `POST /workers` in the real registry: SMG's rows with `--enable-rl`, nothing
 //! without it.
 
+use std::collections::HashMap;
+
 use axum::{
     body::Body,
     extract::Request,
@@ -246,6 +248,41 @@ async fn rl_workers_collapses_dp_ranks_into_one_row() {
     worker.stop().await;
 }
 
+/// Registers `url` on a router with `--backend <backend>` and RL off, and
+/// returns the labels discovery gave it.
+async fn rl_off_labels(backend: BackendType, url: &str) -> HashMap<String, String> {
+    let mut config = rl_config(backend, false);
+    config.rl.enabled = false;
+    let ctx = AppTestContext::new_with_config(config, vec![]).await;
+    let app = ctx.create_app().await;
+    register(&ctx, &app, url, json!({}), 1).await;
+    let labels = ctx.app_context.worker_registry.get_all()[0]
+        .metadata()
+        .labels
+        .clone();
+    ctx.shutdown().await;
+    labels
+}
+
+#[tokio::test]
+async fn rl_off_discovery_adds_no_rl_labels() {
+    let mut worker = mock_worker();
+    let url = worker.start().await.unwrap();
+
+    // No sizes set: the mock answers /get_server_info, which carries `version`.
+    let labels = rl_off_labels(BackendType::Sglang, &url).await;
+    assert_eq!(labels["model_path"], "mock-model-path", "{labels:?}");
+    assert!(!labels.contains_key("version"), "{labels:?}");
+
+    worker.set_tp_size(4).await;
+    worker.set_dp_size(2).await;
+    let labels = rl_off_labels(BackendType::Atom, &url).await;
+    assert!(!labels.contains_key("tp_size"), "{labels:?}");
+    assert!(!labels.contains_key("dp_size"), "{labels:?}");
+
+    worker.stop().await;
+}
+
 #[tokio::test]
 async fn rl_worker_unknown_id_is_404_worker_not_found() {
     let ctx = AppTestContext::new_with_config(rl_config(BackendType::Atom, false), vec![]).await;
@@ -277,6 +314,7 @@ async fn rl_routes_require_the_bearer_token() {
         Some("Bearer "),
         Some("Bearer wrong"),
         Some("Bearer rl-test-ke"),
+        Some("Bearer rl-test-kez"),
         Some(RL_KEY),
         Some("Basic rl-test-key"),
     ];
@@ -351,4 +389,12 @@ fn rl_flags_parse_to_defaults_and_require_the_key() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("rl.control_timeout_secs"), "{error}");
+    for key in ["secret-key ", " secret-key", "secret-key\t"] {
+        let error = args(&["--rl-api-key", key]).unwrap_err().to_string();
+        assert!(error.contains("--rl-api-key"), "{key:?}: {error}");
+        assert!(
+            !error.contains("secret-key"),
+            "the key is not echoed: {error}"
+        );
+    }
 }

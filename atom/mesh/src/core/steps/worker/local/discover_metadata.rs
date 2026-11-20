@@ -266,7 +266,12 @@ fn parallel_size_labels(info: &ServerInfo, labels: &mut HashMap<String, String>)
 }
 
 /// Discover HTTP metadata from an sglang backend via /server_info + /model_info.
-async fn discover_http_sglang(url: &str, api_key: Option<&str>) -> HashMap<String, String> {
+/// The engine `version` is read only for the RL control plane (`rl_enabled`).
+async fn discover_http_sglang(
+    url: &str,
+    api_key: Option<&str>,
+    rl_enabled: bool,
+) -> HashMap<String, String> {
     let mut labels = HashMap::new();
 
     if let Ok(server_info) = get_server_info(url, api_key).await {
@@ -283,7 +288,7 @@ async fn discover_http_sglang(url: &str, api_key: Option<&str>) -> HashMap<Strin
         if let Some(disaggregation_mode) = server_info.disaggregation_mode {
             labels.insert("disaggregation_mode".to_string(), disaggregation_mode);
         }
-        if let Some(version) = server_info.version.filter(|s| !s.is_empty()) {
+        if let Some(version) = server_info.version.filter(|s| rl_enabled && !s.is_empty()) {
             labels.insert("version".to_string(), version);
         }
     }
@@ -367,7 +372,7 @@ impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
                 let (url, api_key) = (&config.url, config.api_key.as_deref());
 
                 let labels = match backend {
-                    BackendType::Sglang => discover_http_sglang(url, api_key).await,
+                    BackendType::Sglang => discover_http_sglang(url, api_key, rl_enabled).await,
                     BackendType::Vllm => discover_http_openai(url, api_key).await,
                     BackendType::Atom => {
                         let mut labels = discover_http_openai(url, api_key).await;
