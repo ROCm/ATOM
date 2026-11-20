@@ -125,11 +125,7 @@ pub enum Backend {
 
 impl std::fmt::Display for Backend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Backend::Sglang => write!(f, "sglang"),
-            Backend::Vllm => write!(f, "vllm"),
-            Backend::Atom => write!(f, "atom"),
-        }
+        f.write_str(BackendType::from(*self).as_str())
     }
 }
 

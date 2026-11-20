@@ -41,3 +41,43 @@ fn rl_flag_label_with_an_unknown_value_keeps_the_static_default() {
         assert_eq!(caps, default, "{value:?}");
     }
 }
+
+#[test]
+fn rl_list_labels_trim_items_and_drop_empty_ones() {
+    let caps = capabilities_for(
+        "atom",
+        &labels(&[
+            ("rl.pause_modes", " abort , ,in_place,"),
+            ("rl.update_from", "disk,, tensor "),
+        ]),
+    );
+    assert_eq!(caps.pause_modes, ["abort", "in_place"]);
+    assert_eq!(caps.update_from, ["disk", "tensor"]);
+    assert_eq!(caps.source, RlCapabilitySource::Label);
+
+    let caps = capabilities_for("sglang", &labels(&[("rl.update_from", " , ")]));
+    assert!(
+        caps.update_from.is_empty(),
+        "an all-empty list clears the row"
+    );
+    assert_eq!(caps.source, RlCapabilitySource::Label);
+}
+
+#[test]
+fn rl_sleep_wake_and_reports_weight_version_labels_override_the_row() {
+    let caps = capabilities_for(
+        "sglang",
+        &labels(&[
+            ("rl.sleep_wake", "false"),
+            ("rl.reports_weight_version", "off"),
+        ]),
+    );
+    assert!(!caps.sleep_wake && !caps.reports_weight_version);
+    assert_eq!(caps.source, RlCapabilitySource::Label);
+
+    let caps = capabilities_for(
+        "atom",
+        &labels(&[("rl.sleep_wake", "yes"), ("rl.reports_weight_version", "1")]),
+    );
+    assert!(caps.sleep_wake && caps.reports_weight_version);
+}
