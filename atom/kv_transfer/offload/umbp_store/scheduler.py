@@ -214,7 +214,7 @@ class UMBPStoreOffloadScheduler(KVStoreOffloadScheduler):
     LABEL = "UMBP offload"
 
     def __init__(self, config: Any) -> None:
-        kvc = getattr(config, "kv_transfer_config", {}) or {}
+        kvc = config.kv_transfer_config or {}
         validated_kv_role(kvc)
         cfg = parse_umbp_store_config(kvc)
         check_engine_compatibility(cfg, config)

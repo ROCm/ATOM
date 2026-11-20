@@ -170,6 +170,7 @@ prompt's tokens, and the HBM prefix cache hashes with xxhash.
 | `umbp_store.load_pool_mib` | 1024 | HBM load staging per worker, MiB. |
 | `umbp_store.save_pool_mib` | 256 | HBM save staging per worker, MiB. |
 | `umbp_store.save_abandon_timeout_s` | 300 | Seconds before the engine reclaims the source blocks of a save that never reported. |
+| `max_pending_saves` | unbounded | Optional cap on saves in flight across requests (one per request at most either way); unprefixed, as for `mooncake_store`. `OFFLOAD_MAX_PENDING_SAVES` sets it too. |
 
 An unknown `umbp_store.*` key is an error.
 
@@ -177,9 +178,11 @@ Like `mooncake_store`, `umbp_store` loads only hits of at least 512 tokens
 (two chunks); the global default for other tiers is 8192. The existing
 `OFFLOAD_MIN_LOAD_TOKENS` setting overrides it.
 
-One server serves one node. With DP over several nodes each node's ranks reach
+One server serves one node. A tensor-parallel group over several nodes is
+refused at startup, and with DP over several nodes each node's ranks reach
 only their own server, so shared-prefix DP routing (`--dp-load-balance
-share_cache` / `prefix_spread`) is refused across nodes.
+share_cache` / `prefix_spread`) is refused across nodes; on one node it is
+supported.
 
 ## 4. Check that it works
 

@@ -1,10 +1,11 @@
 # MiniMax-M3 — TP4 with a Mori UMBP CPU tier
 
 MiniMax-M3 (MXFP4) on one node, TP4 + EAGLE3, with the KV offload tier served
-by a Mori UMBP standalone server through `umbp_store`. This is the
+by a Mori UMBP standalone server through `umbp_store`. It starts from the
 [MiniMax-M3-Agentic-InferenceX.md](MiniMax-M3-Agentic-InferenceX.md)
-configuration with the LMCache CPU tier replaced by UMBP. Read that recipe for
-what each server flag does.
+configuration, with the LMCache CPU tier replaced by UMBP; the other
+differences from that recipe's command are listed under step 2. Read that
+recipe for what each server flag does.
 
 Like the LMCache tier there, the CPU tier pays at **high concurrency** (40 and
 48 on the AgentX ladder), where the working set outgrows the HBM prefix cache.
@@ -85,7 +86,6 @@ env \
   AITER_FLYDSL_STAGE2_FP8=1 \
   ATOM_FORCE_ATTN_TRITON=1 \
   ATOM_PA_FLYDSL=1 \
-  ATOM_PA_FLYDSL_PLAN=1 \
   ATOM_M3_INDEXER_CP=1 \
   ATOM_PREFIX_CACHE_POLICY=slru \
   ATOM_PREFIX_CACHE_PROTECTED_RATIO=0.5 \
@@ -107,15 +107,27 @@ env \
   > server_c${CONC}.log 2>&1 &
 ```
 
-What differs from the LMCache variant:
+What differs from the InferenceX recipe's command with its LMCache tier:
 
-- no `LMCACHE_*` variables, and no `PYTHONHASHSEED=0`: the UMBP keys are
-  blake2b chain hashes and the HBM prefix cache hashes with xxhash, so no hash
-  depends on Python's seed (the in-process LMCache tier is what needs it);
-- `--kv-transfer-config` names `umbp_store` and the server address;
-- the UMBP server from step 1 must be running.
+- the offload tier: `--kv-transfer-config` names `umbp_store` and the server
+  address, and the UMBP server from step 1 must be running. No `LMCACHE_*`
+  variables and no `PYTHONHASHSEED=0`: the UMBP keys are blake2b chain hashes
+  and the HBM prefix cache hashes with xxhash, so no hash depends on Python's
+  seed (the in-process LMCache tier is what needs it). The SLRU HBM
+  prefix-cache policy (`ATOM_PREFIX_CACHE_POLICY=slru`,
+  `ATOM_PREFIX_CACHE_PROTECTED_RATIO=0.5`) stays;
+- added environment: `AITER_SITUV2_A4W4=1`, `AITER_FLYDSL_STAGE2_FP8=1`,
+  `ATOM_M3_INDEXER_CP=1` (which that recipe adds from CONC 15) and
+  `PYTHONNOUSERSITE=1`;
+- not set: `AITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0` and
+  `ATOM_GC_THRESHOLD=20000,50,50`;
+- added flags: `--index-cache-dtype fp8` and the explicit
+  `--cudagraph-capture-sizes` list (optional there);
+- not set: `--attn-prefill-chunk-size 16384`;
+- forced acceptance as `--spec-decode-acceptance-length 2.78` instead of
+  `--spec-decode-acceptance-rate 0.5933` (the same acceptance).
 
-Everything else is the same; the SLRU HBM prefix-cache policy stays.
+This is the configuration the UMBP and LMCache A/B runs used.
 
 - `--spec-decode-acceptance-length 2.78` (equivalently
   `--spec-decode-acceptance-rate 0.5933`) is for throughput runs only: outputs

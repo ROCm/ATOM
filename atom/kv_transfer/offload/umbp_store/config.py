@@ -144,18 +144,28 @@ def parse_umbp_store_config(
 
 
 def check_engine_compatibility(cfg: UMBPStoreOffloadConfig, config: Any) -> None:
-    """Accept dense and M3 PAGE bytes; refuse stateful layouts and DCP.
+    """Accept dense and M3 PAGE bytes; refuse stateful layouts, DCP and a TP
+    group over several nodes.
 
     M3 uses complete PAGE regions, including its NSA index cache. Stateful
     layouts require a separate state tier, while a DCP rank's pages cover a
-    virtual block that the chunk keys do not name.
+    virtual block that the chunk keys do not name. One server serves one
+    node: with TP over several nodes each node's ranks would put to their own
+    server while the scheduler asks only its own for every rank's keys, so
+    every lookup would miss.
 
     Raises:
         ValueError: The model uses neither dense nor M3 PAGE layout, DCP > 1,
-            or the chunk is not a whole number of KV blocks.
+            TP spans nodes, or the chunk is not a whole number of KV blocks.
     """
     UMBP_LAYOUTS.require(offcfg.select_offload_layout(config))
-    dcp = int(getattr(config, "decode_context_parallel_size", 1) or 1)
+    if config.is_multinode_tp:
+        raise ValueError(
+            "the UMBP offload serves one node: a tensor-parallel group over "
+            "several nodes is not supported (each node's ranks reach only "
+            "that node's UMBP standalone server)"
+        )
+    dcp = int(config.decode_context_parallel_size or 1)
     if dcp > 1:
         raise ValueError(
             "the UMBP offload does not support decode context parallelism "

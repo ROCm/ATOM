@@ -46,6 +46,10 @@ _LOOKUP_BATCH_KEYS = 8192
 _RETAINED_CLIENTS: list[Any] = []
 
 
+class MoriTooOld(RuntimeError):
+    """The installed Mori lacks a field this connector sets."""
+
+
 def _new_umbp_client(
     address: str, startup_timeout_ms: int, lookup_timeout_ms: int
 ) -> Any:
@@ -63,7 +67,13 @@ def _new_umbp_client(
     process.startup_timeout_ms = int(startup_timeout_ms)
     # A lookup runs on the scheduler thread: a server that does not answer
     # must not stop it. Mori's default, 0, waits for ever.
-    process.lookup_timeout_ms = int(lookup_timeout_ms)
+    try:
+        process.lookup_timeout_ms = int(lookup_timeout_ms)
+    except AttributeError as exc:
+        raise MoriTooOld(
+            "this Mori has no UMBPStandaloneProcessConfig.lookup_timeout_ms "
+            "(ROCm/mori#949); the UMBP offload needs a Mori that includes it"
+        ) from exc
     config = UMBPConfig()
     config.standalone_process = process
     return UMBPClient(config)
@@ -90,6 +100,8 @@ class UMBPStoreClient:
             self._client = _new_umbp_client(
                 address, startup_timeout_ms, lookup_timeout_ms
             )
+        except MoriTooOld:
+            raise
         except Exception as exc:
             raise RuntimeError(
                 f"UMBP client could not connect to the standalone server at "

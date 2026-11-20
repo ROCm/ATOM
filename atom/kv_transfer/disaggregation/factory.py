@@ -100,7 +100,8 @@ class KVConnectorFactory:
     _offload: ClassVar[dict[str, bool]] = {}
     _min_load_tokens: ClassVar[dict[str, int | None]] = {}
     # Whether a backend's tier is one store every DP rank reads (an LMCache MP
-    # server, Mooncake Store), not one per rank. Absent means per rank.
+    # server, Mooncake Store, a node's UMBP standalone server), not one per
+    # rank. Absent means per rank.
     _shared_tier: ClassVar[dict[str, bool]] = {}
     # A backend's transfer granularity, read off its connector config alone:
     # "module:function" taking the leaf's `kv_transfer_config`. Absent means 1.
@@ -275,7 +276,7 @@ class KVConnectorFactory:
                                 "Mooncake Store pool; mooncake_store.pools addresses "
                                 "distinct master/metadata pairs"
                             )
-                if name == "umbp_store" and config.is_multinode_dp:
+                if name == "umbp_store" and config.parallel_config.is_multinode_dp:
                     # Each node's ranks reach only that node's UMBP server: a
                     # prefix held on another node would be credited and miss.
                     raise ValueError(
@@ -384,10 +385,10 @@ class KVConnectorFactory:
         new backend declares it where it is written rather than by editing a
         table here, and the default refuses. A backend whose answer depends on
         the model registers a predicate of the config instead of a bool.
-        `lmcache_offload` and `mooncake_store` do: only the dense codec ignores
-        the regions, and the PAGE layouts (hybrid, m3, kimi_k3, V4.1) source
-        their bytes from them. `multi` is whatever it wraps: each entry of
-        `connectors` is a full transfer config, and
+        `lmcache_offload`, `mooncake_store` and `umbp_store` do: only the dense
+        codec ignores the regions, and the PAGE layouts (hybrid, m3, kimi_k3,
+        V4.1) source their bytes from them. `multi` is whatever it wraps: each
+        entry of `connectors` is a full transfer config, and
         `MultiConnector.register_kv_caches` forwards the same tensors to every
         sub, so one region reader settles it.
         """
