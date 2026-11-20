@@ -70,6 +70,14 @@ def mla_dcp_decode_call(
     }
 
 
+def mla_cache_dtype(kv_cache_dtype: str):
+    """Concrete native MLA query/cache dtype for its normalized API selector."""
+    import torch
+    from aiter import dtypes
+
+    return dtypes.fp8 if kv_cache_dtype.startswith("fp8") else torch.bfloat16
+
+
 def dcp_persistent_supported(
     num_heads: int, kv_cache_dtype: str, dcp_world_size: int
 ) -> bool:
@@ -78,15 +86,13 @@ def dcp_persistent_supported(
 
     Asks aiter whether mla_decode_fwd has a persistent decode that returns the
     lse DCP's merge needs, for this call: gfx950's ASM kernels, and gfx1250's
-    PS1 ones when AITER_MLA_DECODE_PS1_FLYDSL=1 selects them. gfx942 has none
-    and falls back to the triton stage2 reduce. Cache the result once per
+    PS1 ones when AITER_MLA_DECODE_PS1_FLYDSL=1 selects them. gfx942 support
+    depends on the dtype and selected head plan. Cache the result once per
     ``__init__``; it is not for the forward pass.
     """
-    import torch
-    from aiter import dtypes
     from aiter.ops.attention import MlaBackend, get_mla_decode_shape_support
 
-    dtype = dtypes.fp8 if kv_cache_dtype.startswith("fp8") else torch.bfloat16
+    dtype = mla_cache_dtype(kv_cache_dtype)
     support = get_mla_decode_shape_support(
         num_heads,
         1,
@@ -168,7 +174,8 @@ def mla_dcp_sparse_prefill_uses_nonps(
 
     Applies with fp8 q/KV, 64 gathered heads, gfx950 and page_size 1 (gfx1250's
     non-persistent decode takes only 64-token pages). It needs
-    no work metadata, so the per-layer `get_mla_metadata_v1` rebuild is skipped.
+    no persistent work plan, so forward planning and per-layer plan patches
+    are both skipped.
     Every prefill token of a step is one q row, so a step budget above
     NONPS_MAX_Q_ROWS stays on the persistent path.
     """
