@@ -334,17 +334,23 @@ class MooncakeStoreOffloadConnector(KVStoreOffloadConnector):
         run: range,
         keys: list[str],
         slots: list[Slot],
+        *,
+        draft: bool = False,
     ) -> tuple[list[int], float]:
-        """Per key Mooncake's code, and how long the call took."""
-        group_ids = chunk_group_ids(
-            self._namespace, req.chunk_hashes, run.start, run.stop
-        )
+        """Per key Mooncake's code, and how long the call took. A draft object
+        goes in no group: it lives by its own lease."""
+        group_ids = None
+        if not draft:
+            group_ids = chunk_group_ids(
+                self._namespace, req.chunk_hashes, run.start, run.stop
+            )
         clock = store_client.CallClock()
         codes = client.put(
             keys,
             [slot.ptr for slot in slots],
-            [self._chunk_bytes] * len(slots),
+            [self._draft_chunk_bytes if draft else self._chunk_bytes] * len(slots),
             group_ids=group_ids,
+            tally="draft_" if draft else "",
         )
         return codes, clock.seconds()
 
@@ -369,52 +375,25 @@ class MooncakeStoreOffloadConnector(KVStoreOffloadConnector):
             )
         return None
 
-    def _put_draft_chunks(
-        self,
-        client: store_client.MooncakeStoreClient,
-        keys: list[str],
-        slots: list[Slot],
-    ) -> tuple[list[int], float]:
-        """In no group: a draft object lives by its own lease."""
-        clock = store_client.CallClock()
-        codes = client.put(
-            keys,
-            [slot.ptr for slot in slots],
-            [self._draft_chunk_bytes] * len(slots),
-            tally="draft_",
-        )
-        return codes, clock.seconds()
-
     def _get_chunks(
         self,
         client: store_client.MooncakeStoreClient,
         keys: list[str],
         slots: list[Slot],
+        *,
+        draft: bool = False,
     ) -> tuple[list[int], float, int]:
         """Per key the bytes read or Mooncake's code, how long it took, and the
         size each object must have."""
+        nbytes = self._draft_chunk_bytes if draft else self._chunk_bytes
         clock = store_client.CallClock()
         codes = client.get(
             keys,
             [slot.ptr for slot in slots],
-            [self._chunk_bytes] * len(slots),
+            [nbytes] * len(slots),
+            tally="draft_" if draft else "",
         )
-        return codes, clock.seconds(), self._chunk_bytes
-
-    def _get_draft_chunks(
-        self,
-        client: store_client.MooncakeStoreClient,
-        keys: list[str],
-        slots: list[Slot],
-    ) -> tuple[list[int], float, int]:
-        clock = store_client.CallClock()
-        codes = client.get(
-            keys,
-            [slot.ptr for slot in slots],
-            [self._draft_chunk_bytes] * len(slots),
-            tally="draft_",
-        )
-        return codes, clock.seconds(), self._draft_chunk_bytes
+        return codes, clock.seconds(), nbytes
 
     def _get_failure(
         self,
