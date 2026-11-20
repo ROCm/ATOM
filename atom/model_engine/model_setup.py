@@ -138,9 +138,7 @@ def init_model_env(
             decode_context_parallel_size=getattr(
                 config, "decode_context_parallel_size", 1
             ),
-            # Passed only by the process that asks for none, so servers run
-            # on an aiter without the option.
-            **({} if device_communicators else {"device_communicators": False}),
+            device_communicators=device_communicators,
         )
         apply_simulated_tp(config)
     return device

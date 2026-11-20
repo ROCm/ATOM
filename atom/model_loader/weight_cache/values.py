@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Values: what pickles by value, process-independent renderings and
-fingerprints, tensor content digests, and the walk over a model's state."""
+fingerprints, tensor content checksums, and the walk over a model's state."""
 
 from __future__ import annotations
 
@@ -197,11 +197,11 @@ def _json(v: Any) -> str:
     return json.dumps(_norm(v), sort_keys=True, default=str)
 
 
-_DIGEST_CHUNK = 1 << 24
-_DIGEST_WEIGHTS: dict[str, torch.Tensor] = {}
+_CHECKSUM_CHUNK = 1 << 24
+_CHECKSUM_WEIGHTS: dict[str, torch.Tensor] = {}
 
 
-def _digest_sums(t: torch.Tensor):
+def _weighted_sums(t: torch.Tensor):
     """(bytes, s1, s2) of a tensor's raw bytes with the sums left on its
     device, or a fixed string for meta and empty tensors."""
     if t.is_meta:
@@ -220,29 +220,29 @@ def _digest_sums(t: torch.Tensor):
                 x = flat.view(dt)
                 break
     key = str(x.device)
-    w = _DIGEST_WEIGHTS.get(key)
+    w = _CHECKSUM_WEIGHTS.get(key)
     if w is None:
         w = (
-            torch.arange(1, _DIGEST_CHUNK + 1, device=x.device, dtype=torch.int64)
+            torch.arange(1, _CHECKSUM_CHUNK + 1, device=x.device, dtype=torch.int64)
             % 2147483629
         )
-        _DIGEST_WEIGHTS[key] = w
+        _CHECKSUM_WEIGHTS[key] = w
     s1 = s2 = 0
-    for k, i in enumerate(range(0, x.numel(), _DIGEST_CHUNK)):
-        c = x[i : i + _DIGEST_CHUNK]
+    for k, i in enumerate(range(0, x.numel(), _CHECKSUM_CHUNK)):
+        c = x[i : i + _CHECKSUM_CHUNK]
         if c.dtype != torch.int64:
             c = c.to(torch.int64)
         s1 = s1 + c.sum()
         # Weighted by the position in the chunk and by the chunk, so data
-        # moved between chunks changes the digest too.
+        # moved between chunks changes the checksum too.
         s2 = s2 + (c * w[: c.numel()]).sum() * (k + 1)
     return n, s1, s2
 
 
-def _digests(tensors) -> list[str]:
+def _checksums(tensors) -> list[str]:
     """Content checksums (two position-weighted wrapping sums over the raw
     bytes), with one host sync per device."""
-    sums = [_digest_sums(t) for t in tensors]
+    sums = [_weighted_sums(t) for t in tensors]
     out = [s if isinstance(s, str) else "" for s in sums]
     by_device: dict = {}
     for i, s in enumerate(sums):
@@ -256,13 +256,13 @@ def _digests(tensors) -> list[str]:
     return out
 
 
-def _digest(t: torch.Tensor) -> str:
-    return _digests([t])[0]
+def _checksum(t: torch.Tensor) -> str:
+    return _checksums([t])[0]
 
 
-def release_digest_buffers() -> None:
-    """Drop the digest weights (128 MiB per device); the caller empties the cache."""
-    _DIGEST_WEIGHTS.clear()
+def release_checksum_buffers() -> None:
+    """Drop the checksum weights (128 MiB per device); the caller empties the cache."""
+    _CHECKSUM_WEIGHTS.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -291,10 +291,7 @@ def _recursable(v: Any) -> bool:
 
 def config_objects(config) -> list[tuple[str, Any]]:
     """(path, object) for the config and the config objects under it."""
-    roots = [("config", config)]
-    hf = getattr(config, "hf_config", None)
-    if hf is not None:
-        roots.append(("hf_config", hf))
+    roots = [("config", config), ("hf_config", config.hf_config)]
     out, seen = [], set()
     while roots:
         path, obj = roots.pop()
@@ -389,7 +386,7 @@ def _fp(v: Any, depth: int = 0, *, content: bool = True):
             tuple(v.shape),
             tuple(v.stride()),
             str(v.dtype),
-            _digest(v),
+            _checksum(v),
         )
     if _is_plain(v):
         return ("V", _json(v))

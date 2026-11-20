@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""The cache key: the checkpoint, the shard a rank holds, the quantization
-config, and the launch options and environment variables listed here as
-changing what loading produces. Nothing else is looked at: after a change to
-loading code, or to a setting that is not listed, stop the daemon by hand
+"""The cache key: the checkpoint and the drafter's, the model's HF config, the
+shard a rank holds, the quantization config, and the launch options and
+environment variables listed here as changing what loading produces. Nothing
+else is looked at: after a change to loading code, or to a setting that is
+not listed, stop the daemon by hand
 (``python -m atom.model_loader.weight_cache stop``)."""
 
 from __future__ import annotations
@@ -16,20 +17,22 @@ from torch import nn
 
 from atom.model_loader.weight_cache.values import _fp, _json
 from atom.model_loader.weight_iterator import _MAX_SAFETENSORS_HEADER_BYTES
+from atom.model_loader.weight_utils import local_model_dir
 
-# Launch options (Config fields) that change the loaded weights. The cache
-# does not find these by itself: a server whose setting is missing here gets
-# another launch's weights without a word, so add one when loading starts to
-# depend on it. What only picks a kernel or sizes a cache does not belong,
-# unless an object loading creates reads it: a server gets that object as the
-# daemon built it.
+# Launch options (Config fields) that change the loaded weights, or decide
+# whether loading changes an object. The cache does not find these by itself:
+# a server whose setting is missing here gets another launch's weights without
+# a word, so add one when loading starts to depend on it. What only picks a
+# kernel or sizes a cache does not belong, unless an object loading creates
+# reads it: a server gets that object as the daemon built it.
 _CONFIG_FIELDS = (
     "load_dummy",
     # Which MoE implementation, and whether the shared expert is fused in.
     "moe_backend",
     "moe_all2all_backend",
     "moe_ep_flatten_tp_across_dp",
-    "sequence_parallel_size",
+    # Whether the MoE fuses its communication, which fixes the experts' layout.
+    "enable_tbo",
     # How wide experts and attention projections are sharded.
     "dp_logical_size",
     "decode_context_parallel_size",
@@ -54,6 +57,7 @@ _ENV_VARS = (
     "ATOM_USE_TRITON_GEMM",
     "ATOM_USE_TRITON_MOE",
     "ATOM_USE_TRITON_MOE_DECODE",
+    "AITER_DISABLE_COMM_FUSED_MOE",
     # What attention makes of its weights after loading.
     "ATOM_FORCE_ATTN_TRITON",
     "ATOM_USE_UNIFIED_ATTN",
@@ -64,6 +68,9 @@ _ENV_VARS = (
     "ATOM_USE_TRITON_MXFP4_BMM",
     # Whether each rank holds the whole vocabulary embedding.
     "ATOM_REPLICATE_VOCAB_EMBED",
+    # Whether loading realigns a fused norm's quantization to the layer after.
+    "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION",
+    "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT",
     # Read by the MoE method online quantization swaps in while loading.
     "AITER_FLYDSL_USE_HERD",
     "ATOM_MORI_FP4_DISPATCH",
@@ -108,16 +115,24 @@ def _checkpoint_digest(model_path: str) -> str:
 
 def _setting(config, name: str) -> str:
     for part in name.split("."):
-        config = getattr(config, part, None)
+        config = getattr(config, part)
     return str(config)
 
 
-def checkpoints(config) -> dict:
-    """The model's and the drafter's files as they are now. (A hub id names
-    a cache snapshot, which the first load fills.)"""
-    from atom.model_loader.weight_utils import local_model_dir
-
+def compute_key(config, rank: int) -> dict:
+    """Which checkpoint, drafter and shard, and the listed settings. Taken
+    before a load, by the daemon and by a server alike: files that change
+    under the daemon's load leave it a key no server's files give. (So does
+    the first load of a hub id, which downloads them: that launch loads from
+    disk, the next one finds the daemon it starts.)"""
+    hf = config.hf_config
+    try:
+        hf_dict = hf.to_dict()
+    except Exception:  # noqa: BLE001
+        hf_dict = vars(hf)
+    pc = config.parallel_config
     spec = config.speculative_config
+    quant = config.quant_config
     return {
         "checkpoint": _checkpoint_digest(local_model_dir(config.model)),
         # The daemon holds this drafter's weights too.
@@ -130,20 +145,6 @@ def checkpoints(config) -> dict:
             if spec
             else None
         ),
-    }
-
-
-def compute_key(config, rank: int) -> dict:
-    """Which checkpoint, drafter and shard, and the listed settings."""
-    hf = config.hf_config
-    try:
-        hf_dict = hf.to_dict()
-    except Exception:  # noqa: BLE001
-        hf_dict = vars(hf)
-    pc = config.parallel_config
-    quant = getattr(config, "quant_config", None)
-    return {
-        **checkpoints(config),
         "hf_config": hashlib.sha256(_json(hf_dict).encode()).hexdigest(),
         "rank": rank,
         # The shard a rank holds depends on the whole layout (EP spans DP).

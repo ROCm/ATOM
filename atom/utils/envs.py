@@ -57,10 +57,13 @@ def _preload_mode() -> str:
     """ATOM_PRELOAD: "off", "server" (1: take the weights from a weight cache
     daemon) or "daemon" (be one)."""
     raw = os.getenv("ATOM_PRELOAD", "").strip().lower()
-    modes = {"": "off", "0": "off", "1": "server", "daemon": "daemon"}
-    if raw not in modes:
-        raise ValueError(f"ATOM_PRELOAD must be 1 or daemon, not {raw!r}")
-    return modes[raw]
+    if raw == "daemon":
+        return "daemon"
+    if raw in ("", "0", "false", "no", "off"):  # as _flag_env reads a flag
+        return "off"
+    if raw in ("1", "true", "yes", "on"):
+        return "server"
+    raise ValueError(f"ATOM_PRELOAD must be 1, 0 or daemon, not {raw!r}")
 
 
 def _profiler_detail_env(name: str) -> bool:
@@ -933,6 +936,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # --- Model Loading ---
     # Weight cache (docs/environment_variables.md): off, server or daemon.
     "ATOM_PRELOAD": _preload_mode,
+    # The launch's name, set by its API server for its own processes.
+    "ATOM_PRELOAD_LAUNCH": lambda: os.getenv("ATOM_PRELOAD_LAUNCH"),
     "ATOM_DISABLE_MMAP": lambda: (
         os.getenv("ATOM_DISABLE_MMAP", "false").lower() == "true"
     ),

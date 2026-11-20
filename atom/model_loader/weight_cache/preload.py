@@ -7,7 +7,6 @@ from __future__ import annotations
 import atexit
 import contextlib
 import glob
-import hashlib
 import json
 import os
 import signal
@@ -26,6 +25,7 @@ from atom.model_loader.weight_cache.transport import (
     socket_dir,
 )
 from atom.model_loader.weight_cache.values import _TAG, _Miss, logger
+from atom.utils import envs
 
 # Set by the API server for its processes (record_launch): the launch's name.
 _LAUNCH_ENV = "ATOM_PRELOAD_LAUNCH"
@@ -98,32 +98,69 @@ def _prune_logs(d: str, keep: int = 9) -> None:
 
 def _launch_file() -> str | None:
     """Where this launch's API server saved its command line, if it did."""
-    launch = os.environ.get(_LAUNCH_ENV)
+    launch = envs.ATOM_PRELOAD_LAUNCH
     return os.path.join(socket_dir(), f"launch_{launch}.json") if launch else None
+
+
+def unsupported(config) -> list[str]:
+    """What in a launch the cache does not serve. Servers map the daemon's
+    weights: nothing may write them in place (EPLB, RLHF updates, RapidServe's
+    own sharing), and a daemon serves the GPUs of its own node. A daemon has no
+    device communicators (sequence parallelism builds on them), a server
+    builds without its weights (--fake-eplb makes a tensor from one), and
+    streaming online quantization swaps parameters the daemon's diff holds."""
+    default_runner = "atom.model_engine.model_runner.ModelRunner"
+    streams = envs.ATOM_ONLINE_QUANT_STREAMING and config.online_quant_config
+    checks = (
+        (config.runner_qualname, config.runner_qualname != default_runner),
+        ("EPLB", config.eplb_enable),
+        ("--fake-eplb", config.fake_eplb),
+        ("streaming online quantization", bool(streams)),
+        ("pipeline parallelism", config.pipeline_parallel_size > 1),
+        ("sequence parallelism", config.sequence_parallel_size > 1),
+        ("data parallelism across nodes", config.parallel_config.is_multinode_dp),
+        ("tensor parallelism across nodes", config.is_multinode_tp),
+    )
+    return [name for name, used in checks if used]
+
+
+def _off(why: str) -> None:
+    """This launch goes without the cache: the processes it starts from here
+    on find no launch."""
+    os.environ.pop(_LAUNCH_ENV, None)
+    logger.warning(
+        f"{_TAG} ATOM_PRELOAD is off for this launch, which loads from disk: {why}"
+    )
 
 
 def record_launch() -> None:
     """Called by the API server (ATOM_PRELOAD=1) before it starts any
     process: name the launch for them, and save its command line and
-    environment, to start a daemon with. Where that cannot be saved, the
-    launch goes without the cache."""
+    environment, to start a daemon with."""
+    if os.getpid() == 1:
+        # Its exit stops the container, and the daemon in it.
+        _off(
+            "this server is its container's PID 1, so no daemon would outlive "
+            "it. Give the container a long-lived command and start the server "
+            "inside it"
+        )
+        return
     try:
         _record_launch()
     except OSError as e:
-        os.environ.pop(_LAUNCH_ENV, None)
-        logger.warning(
-            f"{_TAG} ATOM_PRELOAD is off for this launch, which loads from disk: {e}"
-        )
+        _off(str(e))
+
+
+def check_launch(config) -> None:
+    """Called by the engine with the launch's Config, before any runner
+    starts: a launch the cache does not serve goes without it."""
+    why = unsupported(config) if launch_recorded() else []
+    if why:
+        _off("the weight cache does not support " + ", ".join(why))
 
 
 def _record_launch() -> None:
     os.environ[_LAUNCH_ENV] = f"{os.getpid()}_{time.time()!r}"
-    if os.getpid() == 1:
-        logger.warning(
-            f"{_TAG} ATOM_PRELOAD: this server is its container's PID 1, so the "
-            "container (and the daemon in it) stops when the server does; run "
-            "the server under another init process to keep the daemon"
-        )
     d = socket_dir()
     for old in glob.glob(os.path.join(d, "launch_*.json")):
         with contextlib.suppress(ValueError, IndexError):
@@ -266,29 +303,6 @@ def stop_daemon(path: str, timeout_s: float = 180) -> int | None:
             )
         time.sleep(0.5)
     return main
-
-
-def _uncacheable_file(key: dict) -> str:
-    digest = hashlib.sha256(json.dumps(key, sort_keys=True, default=str).encode())
-    return os.path.join(socket_dir(), f"uncacheable_{digest.hexdigest()[:16]}")
-
-
-def mark_uncacheable(key: dict, why: list[str]) -> None:
-    """A load with this key left state the cache cannot share. Launches skip
-    the daemon for it from now on, until `stop` (after a change to loading
-    code, as for everything the key does not see)."""
-    with contextlib.suppress(OSError), open(_uncacheable_file(key), "w") as f:
-        json.dump(why[:10], f)
-
-
-def uncacheable(key: dict) -> bool:
-    return os.path.exists(_uncacheable_file(key))
-
-
-def forget_uncacheable() -> int:
-    marks = glob.glob(os.path.join(socket_dir(), "uncacheable_*"))
-    _remove(*marks)
-    return len(marks)
 
 
 def _hold_unused(path: str, wait_s: float = 5):

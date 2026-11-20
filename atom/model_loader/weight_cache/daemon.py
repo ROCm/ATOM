@@ -29,8 +29,8 @@ from atom.model_engine.model_setup import (
     init_model_env,
     load_weights,
 )
+from atom.model_loader import loader
 from atom.model_loader.weight_cache.export import (
-    _skip_prepare_finalize,
     build_export,
     leave_out,
     process_export,
@@ -39,11 +39,11 @@ from atom.model_loader.weight_cache.export import (
     snapshot,
 )
 from atom.model_loader.weight_cache.key import (
-    checkpoints,
     compute_key,
     exported_structure,
     structure,
 )
+from atom.model_loader.weight_cache.preload import unsupported
 from atom.model_loader.weight_cache.transport import (
     _DaemonLock,
     _Server,
@@ -53,7 +53,7 @@ from atom.model_loader.weight_cache.transport import (
 from atom.model_loader.weight_cache.values import (
     _TAG,
     logger,
-    release_digest_buffers,
+    release_checksum_buffers,
 )
 from atom.utils import get_hf_text_config, worker_process_name
 
@@ -73,6 +73,11 @@ def run_daemon(engine_args) -> None:
 
     # The Config a server's runners get.
     config, _ = prepare_config(engine_args.model, **engine_args._get_engine_kwargs())
+    if unsupported(config):
+        raise ValueError(
+            "the weight cache (ATOM_PRELOAD) does not support "
+            + ", ".join(unsupported(config))
+        )
     engines = layout_engines(config)
     # The processes' rendezvous, as the engine's CoreManager hosts it.
     pc = config.parallel_config
@@ -168,7 +173,9 @@ def _serve_rank(rank: int, config, ready, index: int, all_serving) -> None:
         log=_log_file(),
         idle_timeout_s=_IDLE_TIMEOUT_S,
     )
-    # Loading does without device communicators (several GiB per GPU).
+    # Loading does without device communicators (several GiB per GPU), and
+    # leaves MoE communication setup to the servers that take the weights.
+    loader.MOE_PREPARE_FINALIZE = False
     device = init_model_env(config, rank, device_communicators=False)
     server, pool = _load_and_serve(config, rank, device, path, lock, t0)
     # Flags: a handler that takes a lock could land inside its holder.
@@ -222,8 +229,7 @@ def _load_and_export(config, build, load) -> SimpleNamespace:
     rec.built, before = structure(rec.model), snapshot(rec.model, config)
     # Around the load only: what constructing does, clients do.
     states = [process_snapshot(config)]
-    with _skip_prepare_finalize():
-        rec.loaded = load(rec.model)
+    rec.loaded = load(rec.model)
     states.append(process_snapshot(config))
     rec.export = build_export(rec.model, before, snapshot(rec.model))
     rec.process = process_export(states)
@@ -249,9 +255,6 @@ class _DaemonLoad:
         )
         if config.speculative_config:
             self.draft = _load_draft(config, device, self.rec.model, self.rank)
-        # As a server finds the files: the first load of a hub model downloads
-        # them, after the key was taken.
-        self.key.update(checkpoints(config))
         return self.rec.model
 
 
@@ -380,9 +383,9 @@ def _release_other_memory(views: dict, device, label: str) -> torch.cuda.MemPool
     if torch.distributed.is_initialized():
         with contextlib.suppress(Exception):
             torch.distributed.destroy_process_group()
-    release_digest_buffers()
+    release_checksum_buffers()
     gc.collect()
-    # The daemon runs nothing on the GPU but digests of what it exports,
+    # The daemon runs nothing on the GPU but checksums of what it exports,
     # so every other storage still alive (tensors the clients build for
     # themselves, such as RoPE tables, wherever they are held) can go.
     shared = {v.untyped_storage().data_ptr() for v in views.values()}

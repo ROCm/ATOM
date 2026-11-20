@@ -4781,7 +4781,7 @@ class RapidServeModelRunner(ModelRunner):
         # bytes (avoids the transient 2x-weights peak that OOMs at TP=4);
         # import_model_weight_ipc_handles() materializes params from prefill,
         # and RoPE caches are recomputed locally.
-        from atom.model_loader.weight_cache.export import params_on_meta
+        from atom.model_loader.weight_utils import params_on_meta
 
         with params_on_meta():
             return build_model(config, model_class, device)

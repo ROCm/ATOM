@@ -23,19 +23,18 @@ import torch
 
 from atom.model_loader.weight_cache.values import (
     _TAG,
-    _digests,
+    _checksums,
     logger,
-    release_digest_buffers,
+    release_checksum_buffers,
 )
 
 _MAX_MESSAGE = 1 << 30
-# Sockets, locks and daemon logs: under the user's runtime directory, which
-# nobody else can create first; /tmp where there is none (in a container).
-# Not /dev/shm: containers started with --ipc=host share it (and are all
-# root), and IPC handles do not cross containers anyway.
-_DIR = os.path.join(
-    os.environ.get("XDG_RUNTIME_DIR") or "/tmp", f"atom_weight_cache_{os.getuid()}"
-)
+# Sockets, locks and daemon logs. One place whatever shell a server or `stop`
+# runs in, and one that outlives a login: not $XDG_RUNTIME_DIR, which some
+# shells lack and which goes at logout while the daemon stays. Not /dev/shm:
+# containers started with --ipc=host share it (and are all root), and IPC
+# handles do not cross containers anyway.
+_DIR = f"/tmp/atom_weight_cache_{os.getuid()}"
 
 
 def socket_dir() -> str:
@@ -51,8 +50,7 @@ def socket_dir() -> str:
 
 def gpu_identity(device: torch.device) -> str:
     p = torch.cuda.get_device_properties(device)
-    pci = f"{getattr(p, 'pci_domain_id', 0):04x}:{getattr(p, 'pci_bus_id', 0):02x}:{getattr(p, 'pci_device_id', 0):02x}"
-    return f"{getattr(p, 'uuid', '')}|{pci}"
+    return f"{p.uuid}|{p.pci_domain_id:04x}:{p.pci_bus_id:02x}:{p.pci_device_id:02x}"
 
 
 def socket_path(device: torch.device) -> str:
@@ -172,7 +170,7 @@ class _Server:
     """Serves the payload on the GPU's socket.
 
     A connected client could write into the shared storages, so they are
-    checked against their export digests before a hand-out: in the
+    checked against their export checksums before a hand-out: in the
     background once the last client has gone, on the spot if another one is
     still connected."""
 
@@ -181,10 +179,10 @@ class _Server:
         self._payload_bytes = pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
         self.views = views
         t0 = time.perf_counter()
-        self.digests = dict(zip(views, _digests(views.values())))
-        self._release_digest_memory()
+        self.checksums = dict(zip(views, _checksums(views.values())))
+        self._release_checksum_memory()
         logger.info(
-            f"{_TAG} {label}: digested {len(views)} shared storages in {time.perf_counter() - t0:.2f}s"
+            f"{_TAG} {label}: checksummed {len(views)} shared storages in {time.perf_counter() - t0:.2f}s"
         )
         self.poisoned: list[int] = []
         self._check_lock = threading.Lock()
@@ -211,7 +209,7 @@ class _Server:
         ).start()
 
     def _idle_for(self) -> float:
-        busy = self.clients or self.pending or self.held
+        busy = self.pending or self.held  # a connected server's request is pending
         return 0.0 if busy else time.monotonic() - self.idle_since
 
     def watch_idle(self, timeout_s: int, on_idle, all_serving) -> None:
@@ -244,8 +242,8 @@ class _Server:
         with contextlib.suppress(OSError):
             self.sock.close()
 
-    def _release_digest_memory(self) -> None:
-        release_digest_buffers()
+    def _release_checksum_memory(self) -> None:
+        release_checksum_buffers()
         with contextlib.suppress(Exception):
             torch.cuda.empty_cache()
 
@@ -262,10 +260,10 @@ class _Server:
             on_gpu = device is not None and device.type == "cuda"
             try:
                 with torch.cuda.device(device) if on_gpu else contextlib.nullcontext():
-                    now = _digests(self.views.values())
+                    now = _checksums(self.views.values())
             finally:
-                self._release_digest_memory()
-            changed = [k for k, d in zip(self.views, now) if d != self.digests[k]]
+                self._release_checksum_memory()
+            changed = [k for k, d in zip(self.views, now) if d != self.checksums[k]]
             if changed:
                 self.poisoned = changed
             elif connected == 0:
@@ -330,7 +328,7 @@ class _Server:
             finally:
                 with self._lock:
                     self.pending -= 1
-                    if not self.clients and not self.pending:
+                    if not self.pending:
                         self.idle_since = time.monotonic()
         except Exception as e:  # noqa: BLE001 - one bad client must not stop serving
             logger.warning(f"{_TAG} {self.label}: request from {peer} failed: {e}")

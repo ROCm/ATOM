@@ -92,6 +92,10 @@ class LLMEngine:
 
     def __init__(self, model, tokenizer=None, **kwargs):
         config, self.tokenizer = prepare_config(model, tokenizer, **kwargs)
+        if envs.ATOM_PRELOAD == "server":
+            from atom.model_loader.weight_cache.preload import check_launch
+
+            check_launch(config)  # before the runners start
         self.config = config
         self.data_parallel_size = config.parallel_config.data_parallel_size
         self.io_processor = InputOutputProcessor(

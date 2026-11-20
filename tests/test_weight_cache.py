@@ -28,6 +28,7 @@ from conftest import gpu_stack_import
 from torch import nn
 
 import atom.model_loader.weight_cache.__main__ as cli
+from atom.model_loader import weight_utils
 from atom.model_loader.weight_cache import (
     export,
     key,
@@ -61,17 +62,26 @@ def test_checkpoint_rewritten_in_place_changes_the_key(tmp_path):
 def _key_config(tmp_path, **settings):
     """A toy launch's config with ``settings`` on it."""
     (tmp_path / "config.json").write_text("{}")
+    listed = dict.fromkeys(n for n in key._CONFIG_FIELDS if "." not in n)
+    dcp = {n.split(".")[1]: False for n in key._CONFIG_FIELDS if "." in n}
     return SimpleNamespace(
-        model=str(tmp_path),
-        hf_config=SimpleNamespace(to_dict=lambda: {"hidden_size": 8}),
-        parallel_config=SimpleNamespace(data_parallel_size=1, data_parallel_rank=0),
-        speculative_config=None,
-        tensor_parallel_size=1,
-        tp_world_size=1,
-        pcp_group_size=1,
-        enable_dp_attention=False,
-        enable_expert_parallel=False,
-        **settings,
+        **{
+            **listed,
+            "model": str(tmp_path),
+            "hf_config": SimpleNamespace(to_dict=lambda: {"hidden_size": 8}),
+            "parallel_config": SimpleNamespace(
+                data_parallel_size=1, data_parallel_rank=0
+            ),
+            "speculative_config": None,
+            "quant_config": None,
+            "tensor_parallel_size": 1,
+            "tp_world_size": 1,
+            "pcp_group_size": 1,
+            "enable_dp_attention": False,
+            "enable_expert_parallel": False,
+            "dcp_config": SimpleNamespace(**dcp),
+            **settings,
+        }
     )
 
 
@@ -99,7 +109,11 @@ def test_a_setting_of_a_sub_config_is_in_the_key(tmp_path, monkeypatch):
         _key(
             tmp_path,
             monkeypatch,
-            dcp_config=SimpleNamespace(enable_project_before_merge=pbm),
+            dcp_config=SimpleNamespace(
+                enable_query_replication=False,
+                indexer_dcp_only=False,
+                enable_project_before_merge=pbm,
+            ),
         )
         for pbm in (False, True)
     )
@@ -107,18 +121,27 @@ def test_a_setting_of_a_sub_config_is_in_the_key(tmp_path, monkeypatch):
     assert key._diff_key(off, on) == [f"{name}: daemon=False client=True"]
 
 
-def test_the_daemons_key_names_the_checkpoint_as_loading_left_it(tmp_path, monkeypatch):
+def test_the_daemons_key_names_the_files_it_found_before_loading(tmp_path, monkeypatch):
     daemon = gpu_stack_import("atom.model_loader.weight_cache.daemon")
     config = _key_config(tmp_path)
+    shard = tmp_path / "model.safetensors"
+    shard.write_bytes(b"\0" * 16)
+    before = key.compute_key(config, 0)
 
-    def load(config, build, load):  # the first load of a hub model downloads it
-        (tmp_path / "model.safetensors").write_bytes(b"\0" * 16)
+    def load(config, build, load):
+        shard.write_bytes(b"\1" * 16)  # rewritten under the load
         return SimpleNamespace(model=nn.Linear(1, 1))
 
     monkeypatch.setattr(daemon, "_load_and_export", load)
     loader = daemon._DaemonLoad(0)
     loader(config, None, torch.device("cpu"))
-    assert loader.key == key.compute_key(config, 0)  # as a server sees it now
+    # No server's files give this key, so none takes these weights for them.
+    assert loader.key == before != key.compute_key(config, 0)
+
+
+def test_what_decides_fused_moe_communication_is_in_the_key(tmp_path, monkeypatch):
+    off, on = (_key(tmp_path, monkeypatch, enable_tbo=tbo) for tbo in (False, True))
+    assert key._diff_key(off, on) == ["options.enable_tbo: daemon=False client=True"]
 
 
 @pytest.mark.parametrize(
@@ -128,12 +151,16 @@ def test_the_daemons_key_names_the_checkpoint_as_loading_left_it(tmp_path, monke
         "ATOM_USE_TRITON_MOE_DECODE",
         "ATOM_USE_UNIFIED_ATTN",
         "ATOM_FORCE_ATTN_TRITON",
+        "AITER_DISABLE_COMM_FUSED_MOE",
         # Read by the MoE method online quantization creates while loading,
         # which a server gets as the daemon built it.
         "AITER_FLYDSL_USE_HERD",
         "ATOM_MORI_FP4_DISPATCH",
         "ATOM_MORI_V2",
         "ATOM_USE_TRITON_MOE_A4W4",
+        # Whether loading realigns a fused norm's quantization.
+        "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION",
+        "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT",
     ],
 )
 def test_a_backend_switch_loading_goes_by_is_in_the_key(tmp_path, monkeypatch, name):
@@ -151,7 +178,7 @@ def test_the_quantization_config_is_in_the_key(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# Values, digests, key filters
+# Values, checksums, key filters
 # --------------------------------------------------------------------------
 
 
@@ -200,20 +227,20 @@ def test_values_that_differ_do_not_render_alike():
     assert values.safe_fp(boom, 1) != values.safe_fp(boom, 1)
 
 
-def test_digest_sees_reorder():
+def test_checksum_sees_reorder():
     t = torch.arange(1000, dtype=torch.float32)
     u = t.clone()
     u[[3, 7]] = u[[7, 3]]
-    assert values._digest(t) == values._digest(t.clone()) != values._digest(u)
+    assert values._checksum(t) == values._checksum(t.clone()) != values._checksum(u)
 
 
-def test_digest_sees_data_moved_between_chunks(monkeypatch):
-    monkeypatch.setattr(values, "_DIGEST_CHUNK", 8)
-    monkeypatch.setattr(values, "_DIGEST_WEIGHTS", {})
+def test_checksum_sees_data_moved_between_chunks(monkeypatch):
+    monkeypatch.setattr(values, "_CHECKSUM_CHUNK", 8)
+    monkeypatch.setattr(values, "_CHECKSUM_WEIGHTS", {})
     t = torch.arange(16, dtype=torch.int64)
     u = t.clone()
     u[[1, 9]] = u[[9, 1]]  # the same position in two chunks
-    assert values._digests([t, u])[0] != values._digests([u])[0]
+    assert values._checksums([t, u])[0] != values._checksums([u])[0]
 
 
 def test_norm_uses_compute_hash():
@@ -283,7 +310,7 @@ def test_export_import_reproduces_the_load(toy_packages):
     built, exp = _export(daemon, Toy.fake_load)
     assert exp["unshippable"] == []
     assert "scratch" in exp["plan"][""]["buffers"]  # written in place
-    with export.params_on_meta():
+    with weight_utils.params_on_meta():
         client = Toy()
     assert key._diff_key(built, key.structure(client)) == []
     export.apply_export(client, exp, torch.device("cpu"))
@@ -307,7 +334,7 @@ def test_none_and_tensors_loading_sets_on_parameters_travel(toy_packages):
 
     _, exp = _export(Toy(), load)
     assert exp["unshippable"] == []
-    with export.params_on_meta():
+    with weight_utils.params_on_meta():
         client = Toy()
     export.apply_export(client, exp, torch.device("cpu"))
     assert "bias" in client.child._parameters and client.child.bias is None
@@ -319,7 +346,7 @@ def test_a_parameter_slot_loading_registers_empty_travels():
         m.register_parameter("extra", None)
 
     _, exp = _export(nn.Linear(2, 2), load)
-    with export.params_on_meta():
+    with weight_utils.params_on_meta():
         client = nn.Linear(2, 2)
     export.apply_export(client, exp, torch.device("cpu"))
     assert "extra" in client._parameters and client.extra is None
@@ -342,7 +369,7 @@ def test_a_parameter_registered_empty_is_filled_by_loading():
         m.bias = nn.Parameter(torch.full((2,), 5.0), requires_grad=False)
 
     _, exp = _export(nn.Linear(2, 2, bias=False), load)
-    with export.params_on_meta():
+    with weight_utils.params_on_meta():
         client = nn.Linear(2, 2, bias=False)
     export.apply_export(client, exp, torch.device("cpu"))
     assert torch.equal(client.bias, torch.full((2,), 5.0))
@@ -400,7 +427,7 @@ def test_an_immutable_record_loading_replaces_travels_as_a_value(toy_packages):
 
     _, exp = _export(build(), load)
     assert exp["unshippable"] == []
-    with export.params_on_meta():
+    with weight_utils.params_on_meta():
         client = build()
     shared = client.spec  # other layers may hold the same record
     export.apply_export(client, exp, torch.device("cpu"))
@@ -420,7 +447,7 @@ def test_an_object_loading_creates_travels_with_what_it_refers_to(toy_packages):
     _, exp = _export(Toy(), load)
     assert exp["unshippable"] == []
     exp["plan"] = pickle.loads(pickle.dumps(exp["plan"]))  # as sent
-    with export.params_on_meta():
+    with weight_utils.params_on_meta():
         client = Toy()
     export.apply_export(client, exp, torch.device("cpu"))
     assert type(client.method) is Method and client.method.state is client.q
@@ -437,7 +464,7 @@ def test_an_object_loading_creates_stays_one_object(toy_packages):
 
     _, exp = _export(Toy(), load)
     exp["plan"] = pickle.loads(pickle.dumps(exp["plan"]))
-    with export.params_on_meta():
+    with weight_utils.params_on_meta():
         client = Toy()
     export.apply_export(client, exp, torch.device("cpu"))
     assert client.also[0] is client.method
@@ -451,7 +478,7 @@ def test_what_was_not_sent_is_not_referred_to(toy_packages):
 
     _, exp = _export(Toy(), load)
     assert exp["unshippable"] == []
-    with export.params_on_meta():
+    with weight_utils.params_on_meta():
         client = Toy()
     export.apply_export(client, exp, torch.device("cpu"))
     assert client.also is client.method and not hasattr(client.w, "hooks")
@@ -459,6 +486,7 @@ def test_what_was_not_sent_is_not_referred_to(toy_packages):
 
 def test_an_object_of_the_config_is_not_copied(toy_packages):
     config, model = QuantState(), Toy()  # the config: held outside the model
+    config.hf_config = None
     before = export.snapshot(model, config)
     model.settings = config  # loading hangs it on the model
     exp = export.build_export(model, before, export.snapshot(model))
@@ -492,27 +520,33 @@ def test_an_object_held_where_no_path_leads_is_not_copied(toy_packages):
     assert any(u.startswith("<root>.picked: ") for u in exp["unshippable"])
 
 
-def test_prepare_finalize_is_skipped_on_methods_loading_creates():
+@pytest.mark.parametrize("serves", [True, False])
+def test_a_process_that_only_loads_leaves_moe_communication_setup(
+    monkeypatch, tmp_path, serves
+):
+    loader = gpu_stack_import("atom.model_loader.loader")
     FusedMoEMethodBase = gpu_stack_import("atom.model_ops.moe").FusedMoEMethodBase
+    ran = []
 
     class Method(FusedMoEMethodBase):
+        def __init__(self):
+            pass
+
+        def process_weights_after_loading(self, layer):
+            pass
+
+        apply = create_weights = get_fused_moe_quant_config = None
+
         def init_prepare_finalize(self, layer):
-            raise AssertionError("ran in the daemon")
+            ran.append(layer)
 
-    class Left(Method):
-        pass
-
-    class Right(Method):
-        pass
-
-    class Swapped(Left, Right):  # reached through both parents
-        def init_prepare_finalize(self, layer):
-            raise AssertionError("ran in the daemon")
-
-    with export._skip_prepare_finalize():
-        Swapped.init_prepare_finalize(None, None)
-    with pytest.raises(AssertionError):  # and put back afterwards
-        Swapped.init_prepare_finalize(None, None)
+    model = nn.Module()
+    model.experts = nn.Module()
+    model.experts.quant_method = Method()
+    monkeypatch.setattr(loader, "MOE_PREPARE_FINALIZE", serves)  # a daemon: off
+    hf_config = SimpleNamespace(num_hidden_layers=1)
+    loader.load_model(model, str(tmp_path), hf_config, load_dummy="empty")
+    assert ran == ([model.experts] if serves else [])
 
 
 class Tied(nn.Module):
@@ -531,7 +565,7 @@ def test_tied_parameters_stay_tied_unless_loading_untied_them(untie):
 
     daemon = Tied()
     _, exp = _export(daemon, load)
-    with export.params_on_meta():
+    with weight_utils.params_on_meta():
         client = Tied()
     export.apply_export(client, exp, torch.device("cpu"))
     assert torch.equal(client.a.weight, daemon.a.weight)
@@ -545,7 +579,7 @@ def test_host_tensors_keep_their_aliasing(toy_packages):
         m.tail = m.absorbed[2:]
 
     _, exp = _export(Toy(), load)
-    with export.params_on_meta():
+    with weight_utils.params_on_meta():
         client = Toy()
     export.apply_export(client, exp, torch.device("cpu"))
     client.absorbed[3] = -1.0
@@ -667,7 +701,7 @@ def test_process_state_loading_changes_travels_or_is_refused(monkeypatch):
 
 def test_module_tree_change_is_seen():
     built = key.structure(Toy())
-    with export.params_on_meta():
+    with weight_utils.params_on_meta():
         client = Toy()
     client.extra = nn.Linear(2, 2)  # a constructor now builds another submodule
     assert key._diff_key(built, key.structure(client))
@@ -682,7 +716,7 @@ def test_params_on_meta_keeps_the_constructor_object():
             p.loader = "set after registration"  # like set_weight_attrs
             self.held = p
 
-    with export.params_on_meta():
+    with weight_utils.params_on_meta():
         m = M()
     assert m.p.is_meta and m.p is m.held and m.p.loader == "set after registration"
 
@@ -1047,7 +1081,7 @@ _NO_PID = (1 << 22) + 1  # above any pid_max: a fake that can never be signalled
 
 @pytest.fixture
 def client():
-    """The client module; importing it needs the GPU stack (aiter)."""
+    """The client module."""
     return gpu_stack_import("atom.model_loader.weight_cache.client")
 
 
@@ -1098,7 +1132,7 @@ def loop(client, monkeypatch):
         },
     }
 
-    def probe(me, started, held, own_key):
+    def probe(me, started, held, key):
         present, reasons = calls.probes.pop(0)
         if not present:
             return None, None, [], client._NONE
@@ -1129,7 +1163,6 @@ def loop(client, monkeypatch):
         ),
         "build_model": lambda config, model_class, device: model_class(config),
         "compute_key": lambda config, rank: {"rank": rank},
-        "uncacheable": lambda key: False,
         "exported_structure": lambda built, export: calls.built,
         "apply_export": lambda model, export, device: 0,
         "apply_process": lambda export, device: 0,
@@ -1283,11 +1316,15 @@ def test_a_daemon_that_is_its_containers_init_is_not_stopped(monkeypatch):
         preload.stop_daemon("/x.sock")
 
 
-def test_preload_takes_1_or_daemon_only(monkeypatch):
+def test_preload_reads_on_and_off_as_a_flag_does(monkeypatch):
     for value, mode in (
         ("", "off"),
         ("0", "off"),
+        ("false", "off"),
+        ("no", "off"),
+        (" Off ", "off"),
         ("1", "server"),
+        ("true", "server"),
         ("daemon", "daemon"),
     ):
         monkeypatch.setenv("ATOM_PRELOAD", value)
@@ -1295,16 +1332,6 @@ def test_preload_takes_1_or_daemon_only(monkeypatch):
     monkeypatch.setenv("ATOM_PRELOAD", "deamon")
     with pytest.raises(ValueError, match="ATOM_PRELOAD"):
         _ = envs.ATOM_PRELOAD
-
-
-def test_uncacheable_loads_are_remembered_until_stop(cache_dir, capsys):
-    key_a, key_b = {"rank": 0, "quant": "a"}, {"rank": 0, "quant": "b"}
-    assert not preload.uncacheable(key_a)
-    preload.mark_uncacheable(key_a, ["layers.0._stream_lock: a lock"])
-    assert preload.uncacheable(key_a) and not preload.uncacheable(key_b)
-    assert cli.main(["stop"]) == 0
-    assert "forgot" in capsys.readouterr().out
-    assert not preload.uncacheable(key_a)
 
 
 def test_a_launch_that_cannot_be_recorded_goes_without_the_cache(
@@ -1360,6 +1387,17 @@ def test_loads_from_disk_when_its_own_daemon_does_not_fit(loop, client, monkeypa
     assert config.compilation_config.static_forward_context == {"other": 1}
 
 
+def test_another_launchs_daemon_that_does_not_fit_is_replaced(
+    loop, client, monkeypatch
+):
+    # E.g. it loaded under a setting the key does not list.
+    built = iter([{"layers.0": "another layer"}])
+    monkeypatch.setattr(client, "exported_structure", lambda b, e: next(built, {}))
+    loop.probes = [(True, []), (True, [])]
+    assert isinstance(_from_cache(client), _Model)
+    assert loop.stopped == loop.spawned == 1
+
+
 def test_loads_from_disk_when_the_model_cannot_be_built_on_meta(
     loop, client, monkeypatch
 ):
@@ -1387,18 +1425,6 @@ def test_loads_from_disk_when_no_daemon_can_start(loop, client, monkeypatch):
     assert _from_cache(client) is None
 
 
-def test_a_load_found_uncacheable_starts_no_daemon(loop, client, monkeypatch):
-    # An earlier launch's daemon held state the cache cannot share.
-    monkeypatch.setattr(client, "uncacheable", lambda key: True)
-    loop.probes = [(False, [])]
-    assert _from_cache(client) is None  # a disk load, at once
-    assert loop.spawned == loop.stopped == 0
-    # A daemon of another launch on these GPUs is stopped for the disk load.
-    loop.probes = [(True, ["options.moe_backend: daemon=standard client=mega"])]
-    assert _from_cache(client) is None
-    assert loop.spawned == 0 and loop.stopped == 1
-
-
 def test_drafter_state_that_cannot_be_applied_loads_from_disk(
     loop, client, monkeypatch
 ):
@@ -1415,6 +1441,24 @@ def test_drafter_state_that_cannot_be_applied_loads_from_disk(
     assert client.load_drafter_from_cache(config, cpu, None, target, rank=0) is None
 
 
+def test_ranks_agree_before_the_drafters_moe_setup(loop, client, monkeypatch):
+    monkeypatch.setattr(client, "construct_drafter", lambda c, d, r: _Drafter(c))
+    loop.probes = [(True, [])]
+    config = _config()
+    target = _from_cache(client, config)
+    order = []
+    for name, step in (("apply_process", "state"), ("_run_prepare_finalize", "moe")):
+        monkeypatch.setattr(client, name, lambda *a, step=step: order.append(step) or 0)
+    monkeypatch.setattr(
+        client, "group_agree", lambda ok, group: order.append("agree") or ok
+    )
+    client.load_drafter_from_cache(config, torch.device("cpu"), None, target, rank=0)
+    # The setup is a collective: a rank whose state failed must keep the
+    # others out of it.
+    at = order.index("state")
+    assert order[at : at + 3] == ["state", "agree", "moe"]
+
+
 def test_leaves_a_daemon_other_servers_use(loop, client, monkeypatch):
     monkeypatch.setattr(
         client,
@@ -1425,3 +1469,113 @@ def test_leaves_a_daemon_other_servers_use(loop, client, monkeypatch):
     with pytest.raises(RuntimeError, match="other running server"):
         _from_cache(client)
     assert loop.stopped == loop.spawned == 0
+
+
+def test_a_server_that_is_its_containers_init_goes_without_the_cache(
+    cache_dir, monkeypatch
+):
+    # Its exit stops the container, and the daemon in it.
+    monkeypatch.setattr(os, "getpid", lambda: 1)
+    preload.record_launch()
+    assert not preload.launch_recorded()
+
+
+def _launch_config(**settings):
+    config = SimpleNamespace(
+        runner_qualname="atom.model_engine.model_runner.ModelRunner",
+        eplb_enable=False,
+        fake_eplb=False,
+        online_quant_config=None,
+        pipeline_parallel_size=1,
+        sequence_parallel_size=1,
+        parallel_config=SimpleNamespace(is_multinode_dp=False),
+        is_multinode_tp=False,
+    )
+    vars(config).update(settings)
+    return config
+
+
+def test_a_launch_the_cache_does_not_serve_goes_without_it(cache_dir):
+    preload.record_launch()
+    preload.check_launch(_launch_config())
+    assert preload.launch_recorded()
+    preload.check_launch(_launch_config(sequence_parallel_size=2, fake_eplb=True))
+    assert not preload.launch_recorded()  # its runners load from disk
+    assert preload.unsupported(_launch_config(eplb_enable=True)) == ["EPLB"]
+
+
+def test_streaming_online_quantization_goes_without_the_cache(monkeypatch):
+    # It swaps parameters, which the daemon's diff of the load holds on to.
+    quant = _launch_config(online_quant_config={"global_quant_config": "ptpc_fp8"})
+    assert preload.unsupported(quant) == []
+    monkeypatch.setenv("ATOM_ONLINE_QUANT_STREAMING", "1")
+    assert preload.unsupported(quant) == ["streaming online quantization"]
+    assert preload.unsupported(_launch_config()) == []  # nothing to stream
+
+
+def test_a_process_outside_the_launch_is_not_checked(cache_dir):
+    # E.g. a plugin host with ATOM_PRELOAD in its environment: no launch, and
+    # a config the check could not even read.
+    preload.check_launch(SimpleNamespace())
+
+
+def test_the_daemons_progress_bar_is_read_from_its_log(client, tmp_path):
+    log = tmp_path / "daemon.log"
+    bar = "Loading safetensors shards[/m]: %3d%%|###  | %d/160 [00:01<00:02, 5.9it/s]"
+    drawn = "\r".join(bar % (p, p) for p in (0, 12, 47))
+    log.write_bytes(drawn.encode() + b"[atom 00:00:01] another process\n")
+    assert client._load_bar(str(log)) == bar % (47, 47)  # the last one, alone
+    assert client._load_bar(None) == ""  # a daemon started by hand
+    assert client._load_bar(str(tmp_path / "none.log")) == ""
+
+
+def test_rank_0_draws_the_daemons_bar_while_it_waits(client, monkeypatch, capsys):
+    bars = iter(["bar  10%|#  | 1/10 [a]", "bar 100%|###| 10/10 [b]"])
+    monkeypatch.setattr(client, "_load_bar", lambda log: next(bars, ""))
+    monkeypatch.setattr(client, "daemon_alive", lambda path: True)  # loading
+    monkeypatch.setattr(client, "daemon_state", lambda path: {"log": "daemon.log"})
+    waits = iter([1, 1, 0])  # two looks at the log, then it serves
+    monkeypatch.setattr(client, "group_max", lambda value, group: next(waits))
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    me = client._Rank("TP0", "/nonexistent/gpu.sock", torch.device("cpu"), None)
+    assert client._wait_together(me, None) is True
+    # As a disk load's own bar: redrawn in place, a new line once it is full.
+    assert capsys.readouterr().err == (
+        "\r[weight-cache] daemon: bar  10%|#  | 1/10 [a]"
+        "\r[weight-cache] daemon: bar 100%|###| 10/10 [b]\n"
+    )
+
+
+def test_a_markov_head_built_ahead_of_its_weights_arms_lossless_sampling(monkeypatch):
+    lossless = gpu_stack_import("atom.spec_decode.dspark_lossless")
+    asked = []
+
+    def supported(w1, w2):
+        asked.extend([w1, w2])
+
+    monkeypatch.setattr(lossless, "markov_weights_unsupported", supported)
+    monkeypatch.setattr(lossless, "AITER_TOPK_TOPP_AVAILABLE", True)
+    monkeypatch.setattr(lossless, "get_pcp_world_size", lambda: 1)
+    meta = [torch.empty(8, 4, dtype=torch.bfloat16, device="meta") for _ in range(2)]
+    head = SimpleNamespace(
+        markov_w1=SimpleNamespace(weight=meta[0]),
+        markov_w2=SimpleNamespace(weight=meta[1]),
+    )
+    drafter = SimpleNamespace(
+        config=SimpleNamespace(
+            kv_transfer_config={},
+            enable_rapidserve=False,
+            disagg_is_decode=False,
+            pipeline_parallel_size=1,
+        ),
+        draft_tokens_per_seq=5,
+        mtp_k=5,
+        device=torch.device("cpu"),
+        model=SimpleNamespace(markov_head=head),
+    )
+    assert lossless.lossless_unsupported_reason(drafter) is None
+    # A server builds its drafter on meta and maps the weights onto its
+    # device: the question is put for weights like them there.
+    assert [(w.device, w.dtype, w.shape[1:]) for w in asked] == [
+        (drafter.device, torch.bfloat16, torch.Size([4]))
+    ] * 2

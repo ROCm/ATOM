@@ -2845,31 +2845,6 @@ class Config:
                 "atom.model_engine.model_runner.RapidServeModelRunner"
             )
 
-        # Weight cache servers map the daemon's weights: nothing may write them
-        # in place (EPLB, RLHF updates, RapidServe's own sharing), and a daemon
-        # serves the GPUs of its own node.
-        if envs.ATOM_PRELOAD != "off":
-            default_runner = "atom.model_engine.model_runner.ModelRunner"
-            unsupported = [
-                name
-                for name, used in (
-                    (self.runner_qualname, self.runner_qualname != default_runner),
-                    ("EPLB", self.eplb_enable),
-                    ("pipeline parallelism", self.pipeline_parallel_size > 1),
-                    (
-                        "data parallelism across nodes",
-                        self.parallel_config.is_multinode_dp,
-                    ),
-                    ("tensor parallelism across nodes", self.is_multinode_tp),
-                )
-                if used
-            ]
-            if unsupported:
-                raise ValueError(
-                    "the weight cache (ATOM_PRELOAD) does not support "
-                    + ", ".join(unsupported)
-                )
-
         assert 1 <= self.tensor_parallel_size <= 8
         self._check_multinode_tp()
         if self.decode_context_parallel_size > 1:

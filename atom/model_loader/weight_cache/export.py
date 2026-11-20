@@ -33,6 +33,7 @@ from atom.model_loader.weight_cache.values import (
     config_objects,
     safe_fp,
 )
+from atom.model_loader.weight_utils import swap_param
 
 _DEEP_DEPTH = 6  # how far below a module the fingerprints of unwalked objects go
 _STATE = ("atom", "aiter")  # the packages whose globals process_snapshot covers
@@ -493,45 +494,6 @@ def share_storages(views: dict) -> dict:
     return {key: v.untyped_storage()._share_cuda_() for key, v in views.items()}
 
 
-def _swap_param(old, new: nn.Parameter, attrs: dict) -> bool:
-    """Move ``new``'s data into ``old``, keeping the Parameter object other
-    references hold, with attributes ``attrs``. False: it cannot be swapped
-    (another type, or extra references to its data)."""
-    if type(old) is not nn.Parameter:
-        return False
-    try:
-        torch.utils.swap_tensors(old, new)
-    except Exception:  # noqa: BLE001 - the caller installs ``new`` instead
-        return False
-    old.__dict__.clear()
-    old.__dict__.update(attrs)
-    return True
-
-
-@contextlib.contextmanager
-def params_on_meta():
-    """Build a model with every Parameter on the meta device; buffers are
-    built normally. Each Parameter stays the object the constructor holds, so
-    attributes set on it later (set_weight_attrs) land."""
-    orig = nn.Module.register_parameter
-
-    def register_parameter(self, name, param):
-        orig(self, name, param)
-        p = self._parameters.get(name)
-        if p is None or p.is_meta:
-            return
-        meta = nn.Parameter(p.detach().to("meta"), requires_grad=p.requires_grad)
-        if not _swap_param(p, meta, dict(vars(p))):
-            meta.__dict__.update(vars(p))
-            self._parameters[name] = meta
-
-    nn.Module.register_parameter = register_parameter
-    try:
-        yield
-    finally:
-        nn.Module.register_parameter = orig
-
-
 def _install_param(obj, k: str, t: torch.Tensor, meta: dict, unpack, filled: dict):
     """Put ``t`` into parameter ``k``, swapping it into the Parameter object
     the model was built with (other references see it). ``filled``: objects
@@ -547,7 +509,7 @@ def _install_param(obj, k: str, t: torch.Tensor, meta: dict, unpack, filled: dic
     keep = {} if built is None or meta["replaced"] else vars(built)
     attrs = {**keep, **pattrs}
     new = nn.Parameter(t, requires_grad=meta["grad"])
-    if not tied and _swap_param(built, new, attrs):
+    if not tied and swap_param(built, new, attrs):
         filled[id(built)] = where
         return
     new.__dict__.update(attrs)
@@ -664,26 +626,6 @@ def _leftover_meta(model: nn.Module) -> list[str]:
     for path, _, _, k, v in _entries(model):
         check(f"{path}.{k}", v)
     return left
-
-
-@contextlib.contextmanager
-def _skip_prepare_finalize():
-    """The daemon never serves: leave MoE comm/kernel setup to the client.
-    On the classes, as loading may give a layer a new method object."""
-    from atom.model_ops.moe import FusedMoEMethodBase
-
-    patched, classes = {}, [FusedMoEMethodBase]
-    while classes:
-        cls = classes.pop()
-        classes += cls.__subclasses__()
-        if "init_prepare_finalize" in vars(cls) and cls not in patched:
-            patched[cls] = cls.init_prepare_finalize
-            cls.init_prepare_finalize = lambda self, layer: None
-    try:
-        yield
-    finally:
-        for cls, orig in patched.items():
-            cls.init_prepare_finalize = orig
 
 
 def _run_prepare_finalize(model: nn.Module) -> int:
