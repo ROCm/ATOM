@@ -113,7 +113,7 @@ A new prefill is scheduled only when the earliest waiting request has waited lon
 
 ### Preemption
 
-When a decode step cannot extend a sequence's KV cache, the scheduler scans the running queue from the tail for a preemptable request. Connector-pinned requests are skipped. If no queued victim can release space, the current decode may preempt itself. With mixed scheduling, settled KV owners still waiting for admission are considered first, from the waiting tail: an offload resume or completed P/D receive must not escape reclamation because it has not joined running. In-flight transfers and protected owners remain excluded. Prefill admission and continuation preserve the decode page reservation; insufficient capacity skips their execution without blocking transfer completion.
+When a decode step cannot extend a sequence's KV cache, the scheduler scans the running queue from the tail for a preemptable request. Connector-pinned requests are skipped. If no queued victim can release space, the current decode may preempt itself. With mixed scheduling, settled KV owners still waiting for admission are considered first, from the waiting tail: an offload resume or completed P/D receive must not escape reclamation because it has not joined running. Under mixed scheduling, in-flight transfers and protected waiting owners remain excluded. Prefill admission and continuation preserve the decode page reservation; insufficient capacity skips their execution without blocking transfer completion.
 
 ```python
 def preempt(self, seq: Sequence) -> bool:
@@ -831,9 +831,10 @@ def num_tokens(self, value):
 
 `--enable-mixed-prefill-decode` packs a batch as `[prefill | decode]`.
 The feature requires chunked prefill and supports DSpark.
-TBO, PCP, DCP, EPLB, TR_HYBRID graph modes, other speculative methods,
-`ATOM_SPEC_LOSSLESS_SAMPLING`, and speculative decoding with pipeline parallelism
-are rejected at startup.
+Other attention families, chunked prefill off, M-RoPE, TBO (including decode
+TBO), PCP, DCP, EPLB, TR_HYBRID graph modes, speculative methods other than
+DSpark, `ATOM_SPEC_LOSSLESS_SAMPLING`, and speculative decoding with pipeline
+parallelism are rejected at startup.
 Expert parallelism alone does not enable EPLB.
 
 ### Scheduling

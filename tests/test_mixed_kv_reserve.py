@@ -177,6 +177,7 @@ def test_profile_budgets_reserved_peak_and_releases_scratch(
             memory["allocated"] = 80
 
     def forward(batch):
+        assert runner.gpu_forward_metrics is None
         observed.append(memory["reserved"])
         if confidence:
             verify._ell_map = {42: 1}
@@ -188,6 +189,7 @@ def test_profile_budgets_reserved_peak_and_releases_scratch(
 
     runner = SimpleNamespace(
         config=config,
+        gpu_forward_metrics=object(),
         max_bs=4,
         block_size=16,
         warmup_max_tokens=lambda: 64,
@@ -216,6 +218,7 @@ def test_profile_budgets_reserved_peak_and_releases_scratch(
         cuda, "mem_get_info", lambda: (1000 - memory["reserved"] - 7, 1000)
     )
 
+    original_metrics = runner.gpu_forward_metrics
     if fail_unsplit:
         with pytest.raises(RuntimeError, match="unsplit forward failed"):
             mixed_profile.profile_mixed_memory(runner)
@@ -223,6 +226,7 @@ def test_profile_budgets_reserved_peak_and_releases_scratch(
         # Include the unsplit reserved peak, excluding the temporary pool.
         assert mixed_profile.profile_mixed_memory(runner) == (80 + (140 - 100), 7)
     assert not pool_open
+    assert runner.gpu_forward_metrics is original_metrics
     assert observed
     assert verify._ell_pending == []
     assert verify.ell_by_req == {}

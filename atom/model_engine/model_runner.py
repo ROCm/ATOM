@@ -62,6 +62,7 @@ from atom.kv_transfer.disaggregation import (
 from atom.metrics.gpu import GPUForwardMetrics, record_gpu_forward
 from atom.model_engine.dynamic_chunking_worker import DynamicChunkingWorker
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
+from atom.model_engine.kv_cache_binding import kv_cache_bindings
 from atom.model_engine.mixed_profile import profile_mixed_memory
 from atom.model_engine.model_setup import (
     build_model,
@@ -411,15 +412,16 @@ class tokenIDProcessor:
         """
         # Idle DP steps run only padding, while the previous step's status
         # may still be present. There are no request contexts to correct.
-        if len(context_lens) == 0:
+        num_contexts = len(context_lens)
+        if not num_contexts:
             return context_lens
         rejected = self.num_rejected if num_rejected is None else num_rejected
         if rejected is None:
             return context_lens
-        if len(rejected) != len(context_lens):
+        if len(rejected) != num_contexts:
             raise ValueError("num_rejected is not aligned with decode rows")
         shift = rejected if self.is_deferred_out else 1
-        return context_lens - np.asarray(shift, dtype=context_lens.dtype)
+        return np.subtract(context_lens, shift, dtype=context_lens.dtype)
 
     @staticmethod
     def _batch_process_token_ids(token_ids: list) -> list[tuple[int, ...]]:
@@ -509,7 +511,7 @@ class tokenIDProcessor:
     ) -> TokenLocations:
         """Map decode-local rows to the previous output-producing batch."""
         prev_req_ids = self.prev_batch.req_ids
-        cur_req_ids = batch.req_ids[row_offset:]
+        cur_req_ids = batch.req_ids[row_offset:] if row_offset else batch.req_ids
         num_prev = len(prev_req_ids)
         num_cur = len(cur_req_ids)
 
@@ -743,7 +745,11 @@ class tokenIDProcessor:
             if gbs is not None:
                 fill_to = max(fill_to, int(gbs) * tokens_per_seq)
         fill_deferred_decode_ids(
-            self.input_ids.gpu[total_tokens_prefill:],
+            (
+                self.input_ids.gpu[total_tokens_prefill:]
+                if total_tokens_prefill
+                else self.input_ids.gpu
+            ),
             self.runner.forward_vars["cu_seqlens_q"].gpu[: bs + 1],
             self.decode_src.gpu[:bs],
             self.prev_token_ids,
@@ -2361,38 +2367,11 @@ class ModelRunner:
         # models with only one type of attention, but not support multi-type of attention models.
         # We need to support it by kv_cache_group in the future.
 
-        # Prepare list of models to bind KV cache
-        models_to_bind = [("target", self.model)]
-        if self.config.speculative_config and hasattr(self, "drafter"):
-            models_to_bind.append(("draft", self.drafter.model))
-
-        # Keyed by each module's own global layer_num, which is what it looks
-        # up at forward time (`kv_cache_data[f"layer_{self.layer_num}"]`). The
-        # walk's ordinal used to be passed down and stood in for this, for a
-        # pool row and for an index-map key; under PP it is none of the three.
-        kv_cache_data = {}
-        for model_name, model in models_to_bind:
-            logger.info("Binding KV cache for the %s model", model_name)
-            for module in model.modules():
-                # A draft that owns an independent KV pool binds through its
-                # sibling builder first; for unrecognized modules it returns
-                # None and we fall through to the target builder.
-                kv_cache_tensor = None
-                if model_name == "draft" and hasattr(self, "draft_kv_builder"):
-                    kv_cache_tensor = self.draft_kv_builder.build_kv_cache_tensor(
-                        module
-                    )
-                # Per-attention-type binding is owned by the attention
-                # metadata builder; ModelRunner only walks modules and
-                # collects the resulting KVCacheTensor entries. The builder
-                # returns None for modules it does not recognize (so a
-                # sibling module like nn.LayerNorm is silently skipped).
-                if kv_cache_tensor is None:
-                    kv_cache_tensor = self.attn_metadata_builder.build_kv_cache_tensor(
-                        module
-                    )
-                if kv_cache_tensor is not None:
-                    kv_cache_data[f"layer_{module.layer_num}"] = kv_cache_tensor
+        kv_cache_data = {
+            f"layer_{module.layer_num}": tensor
+            for module, tensor in kv_cache_bindings(self)
+            if tensor is not None
+        }
 
         transfer_tensors = self.attn_metadata_builder.get_kv_transfer_tensors()
         if transfer_tensors is not None:
@@ -2566,16 +2545,13 @@ class ModelRunner:
         tp = getattr(self, "tokenID_processor", None)
         prev_b = getattr(tp, "prev_batch", None) if tp is not None else None
         row0 = batch.total_seqs_num_prefill
-        cur_req = list(batch.req_ids[row0 : row0 + scheduled_bs])
+        cur_req = batch.req_ids[row0:] if row0 else batch.req_ids
         prev_req = (
-            list(
-                prev_b.req_ids[
-                    (
-                        prev_b.total_seqs_num_prefill
-                        if self.config.enable_mixed_prefill_decode
-                        else 0
-                    ) :
-                ]
+            (
+                prev_b.req_ids[prev_b.total_seqs_num_prefill :]
+                if self.config.enable_mixed_prefill_decode
+                and prev_b.total_seqs_num_prefill
+                else prev_b.req_ids
             )
             if prev_b is not None and not prev_b.is_dummy_run
             else None
@@ -2591,7 +2567,8 @@ class ModelRunner:
         # Positional, which is what the `prev_req == cur_req` guard buys: entry
         # i is request i's own count from the step that produced it, before
         # `prepare_input_ids` remaps the deferred rows.
-        nb = batch.num_bonus[row0 : row0 + scheduled_bs]
+        nb = batch.num_bonus[row0:] if row0 else batch.num_bonus
+        decode_nst = old_nst[row0:] if row0 else old_nst
 
         from atom.spec_decode.dspark_scheduler import (
             quantize_to_bucket,
@@ -2607,12 +2584,12 @@ class ModelRunner:
             (by_req.get(rid) for rid in cur_req),
             full_q,
             nb,
-            old_nst[row0 : row0 + scheduled_bs],
+            decode_nst,
         )
         if new_len is None:
             return  # stay rectangular
 
-        if not (new_len < old_nst[row0 : row0 + scheduled_bs]).any():
+        if not (new_len < decode_nst).any():
             return  # nothing to shrink this step -> Phase-1 layout
 
         # q_eff, and the replay-shape feasibility check, BEFORE anything on the

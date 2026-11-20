@@ -63,6 +63,7 @@ from atom.distributed.pcp_utils import (
     pcp_pad_len,
 )
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
+from atom.model_engine.kv_cache_binding import kv_cache_bindings
 from atom.model_engine.page_unit_checkpoint import (
     CheckpointRestoreOp,
     CheckpointStoreOp,
@@ -604,7 +605,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
     )
 
-    capture_owns_cu_seqlens_q = True
     block_size = 256
 
     # Set by a subclass that rotates an index key at its compression group's
@@ -1636,23 +1636,23 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 setattr(runner, name, value)
             del pools, value
             self.warmup_per_req_cache()
-            models = [runner.model]
-            if hasattr(runner, "drafter"):
-                models.append(runner.drafter.model)
-            for model in models:
-                for module in model.modules():
-                    before = dict(module.__dict__)
-                    # Assigning an existing registered buffer changes the
-                    # _buffers mapping, not module.__dict__. Keep both axes
-                    # so no warmup placeholder retains the temporary pool.
-                    buffers = dict(module._buffers)
-                    self.build_kv_cache_tensor(module)
+
+            @contextmanager
+            def preserve_binding(module):
+                before = dict(module.__dict__)
+                buffers = dict(module._buffers)
+                try:
+                    yield
+                finally:
                     changes = {
                         name: before.get(name, missing)
                         for name, value in module.__dict__.items()
                         if value is not before.get(name, missing)
                     }
                     saved_modules.append((module, changes, buffers))
+
+            for _ in kv_cache_bindings(runner, preserve_binding):
+                pass
             yield
         finally:
             torch.cuda.synchronize()

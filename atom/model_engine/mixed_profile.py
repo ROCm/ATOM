@@ -12,6 +12,7 @@ import torch
 
 from atom.model_engine.block_manager import draft_kv_lookahead
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
+from atom.model_engine.mixed_budget import decode_seats, prefill_floor
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.sequence import Sequence, SequenceType
 
@@ -41,13 +42,13 @@ def mixed_profile_shapes(
     """Cover prefill-heavy, balanced and decode-heavy token layouts."""
     if max_seqs < 2 or token_budget <= width:
         return []
-    floor = max(1, token_budget // 8)
+    floor = prefill_floor(token_budget)
     decodes = {
         1,
         min(max_seqs - 1, max(1, token_budget // (2 * width))),
-        min(max_seqs - 1, (token_budget - floor) // width),
+        decode_seats(token_budget, max_seqs, width, prefill=floor),
         # A short prefill leaves its unused token budget to more decode rows.
-        min(max_seqs - 1, (token_budget - 1) // width),
+        decode_seats(token_budget, max_seqs, width),
     }
     return [
         (min(token_budget - n * width, (max_seqs - n) * max_model_len), n, width)
@@ -169,6 +170,8 @@ def profile_mixed_memory(runner) -> tuple[int, int]:
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         fixed = torch.cuda.memory_allocated()
+        metrics = runner.gpu_forward_metrics
+        runner.gpu_forward_metrics = None
         try:
             for long_context in (False, True):
                 for prefill, n_decode, q in shapes:
@@ -209,6 +212,7 @@ def profile_mixed_memory(runner) -> tuple[int, int]:
                     )
                     del batch
         finally:
+            runner.gpu_forward_metrics = metrics
             # Profiling uses synthetic request IDs. Drain their copies before
             # dropping the confidence generations the first real decode reads.
             torch.cuda.synchronize()

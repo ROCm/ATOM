@@ -379,24 +379,18 @@ def resize_decode_tokens(batch, new_lens: np.ndarray) -> None:
     row0 = batch.total_seqs_num_prefill
     token0 = batch.total_tokens_num_prefill
     old_lens = batch.num_scheduled_tokens[row0:]
-    new_lens = np.asarray(new_lens, dtype=old_lens.dtype)
-    if (
-        new_lens.shape != old_lens.shape
-        or np.any(new_lens < 1)
-        or np.any(new_lens > old_lens)
-    ):
-        raise ValueError("decode shrink must keep each row within its scheduled span")
+    # Both callers have already bounded each row by its scheduled span.
     sched = np.asarray(batch.scheduled_tokens)
     total_new = int(new_lens.sum())
     new_sched = np.empty(token0 + total_new, dtype=sched.dtype)
     new_sched[:token0] = sched[:token0]
     old_start = new_start = token0
-    for old_len, new_len in zip(old_lens, new_lens):
+    for old_len, new_len in zip(old_lens.tolist(), new_lens.tolist()):
         new_sched[new_start : new_start + new_len] = sched[
             old_start : old_start + new_len
         ]
-        old_start += int(old_len)
-        new_start += int(new_len)
+        old_start += old_len
+        new_start += new_len
     nst = batch.num_scheduled_tokens.copy()
     nst[row0:] = new_lens
     batch.scheduled_tokens = new_sched

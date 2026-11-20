@@ -216,6 +216,65 @@ def test_prefill_delay_does_not_block_receive_completion(monkeypatch):
 
 
 @pytest.mark.parametrize("width", [1, 8])
+def test_promoted_decodes_reduce_prefill_token_budget(width):
+    sched = scheduler(pages=100, width=width)
+    older = decode(sched, width=width)
+    incoming = receive(sched)
+    prompt = Sequence([55] * 64, block_size=16)
+    sched.add(prompt)
+    batch, _ = sched.schedule()
+    assert batch.req_ids == [prompt.id, older.id, incoming.id]
+    assert batch.total_tokens_num_prefill == 32 - 2 * width
+    assert batch.num_scheduled_tokens.tolist() == [32 - 2 * width, width, width]
+
+
+@pytest.mark.parametrize("width", [1, 8])
+def test_receive_promotion_respects_running_capacity(width):
+    sched = scheduler(pages=100, width=width)
+    older = decode(sched, width=width)
+    first, second = receive(sched), receive(sched, token=23)
+    sched.max_num_seqs = 2
+    batch, _ = sched.schedule()
+    assert batch.req_ids == [older.id, first.id]
+    assert list(sched.running) == [older, first]
+    assert list(sched.waiting) == [second]
+    assert second.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+    assert second.token_ids.count(42) == 0
+
+
+def test_mixed_restore_keeps_receive_promoted_during_refused_reclaim(monkeypatch):
+    sched = scheduler(pages=100)
+    older = decode(sched)
+    prompt = Sequence([55] * 8, block_size=16)
+    assert sched.block_manager.allocate(prompt, 0)
+    prompt.num_cached_tokens = 4
+    prompt.is_partial_prefill = True
+    prompt.status = SequenceStatus.RUNNING
+    sched.running.append(prompt)
+    sched._partial_prefill_count = 1
+    incoming = receive(sched)
+    sched.max_num_seqs = 2
+    monkeypatch.setattr(
+        sched.kv_connector,
+        "should_defer_free",
+        lambda s: s is incoming and s.status == SequenceStatus.RUNNING,
+    )
+    can_append = sched.block_manager.can_append
+
+    def append_after_reclaim(seq, *args):
+        if seq is older and incoming.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
+            return False
+        return can_append(seq, *args)
+
+    monkeypatch.setattr(sched.block_manager, "can_append", append_after_reclaim)
+    batch, _ = sched.schedule()
+    assert batch.is_mixed
+    assert incoming in sched.running
+    assert incoming not in sched.waiting
+    assert incoming.token_ids.count(42) == 1
+
+
+@pytest.mark.parametrize("width", [1, 8])
 def test_refused_receive_reclaim_retains_initialized_decode(width, monkeypatch):
     sched = scheduler(pages=2, width=width)
     older = decode(sched, width=width)

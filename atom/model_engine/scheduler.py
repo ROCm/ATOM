@@ -50,6 +50,7 @@ from atom.model_engine.dynamic_chunking import (
 )
 from atom.model_engine.early_load import EarlyLoadState
 from atom.model_engine.engine_stats import EngineStats
+from atom.model_engine.mixed_budget import decode_seats, prefill_floor
 from atom.model_engine.multimodal_runtime import prefill_media_payload
 from atom.model_engine.prefill_delayer import PrefillDecision
 from atom.model_engine.request import RequestOutput
@@ -892,6 +893,7 @@ class Scheduler:
         self.prefill_token_graphs = prefill_token_graphs
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
+        self._unreserved_prefill_limits = PrefillLimits(self.max_num_batched_tokens)
         # DP prefill cost balancing, on whenever DP attention runs more than
         # one rank: every rank estimates the cost of its chunk at the whole
         # batch budget; the ranks then aim at one cost target, a costlier rank
@@ -1550,14 +1552,13 @@ class Scheduler:
     def decode_spec_width(self) -> int:
         return self.mtp_k if self.use_spec else 0
 
-    def _decode_candidates(self, scheduled_seqs=()):
+    def _decode_candidates(self):
         """Running rows eligible for decode in this step, in scheduling order."""
         return (
             seq
             for seq in self.running
             if not seq.is_partial_prefill
             and seq.id not in self._pp_inflight_token_block
-            and seq.id not in scheduled_seqs
         )
 
     def _budget_for_decodes(self, n_decode, reserved_blocks=0):
@@ -1567,25 +1568,21 @@ class Scheduler:
             return 0
         budget = self.max_num_batched_tokens
         n_decode = min(n_decode, self.max_num_seqs)
-        floor = max(1, budget // 8)
+        floor = prefill_floor(budget)
         reserve = min(n_decode * (self.decode_spec_width + 1), budget - floor)
         return budget - max(reserve, 0)
 
     def _mixed_decode_seats(self):
         """Maximum decodes beside a one-token, one-row prefill."""
-        return max(
-            0,
-            min(
-                self.max_num_seqs - 1,
-                (self.max_num_batched_tokens - 1) // (self.decode_spec_width + 1),
-            ),
+        return decode_seats(
+            self.max_num_batched_tokens, self.max_num_seqs, self.decode_spec_width + 1
         )
 
-    def _prefill_limits(self, scheduled_seqs=()) -> PrefillLimits:
+    def _prefill_limits(self) -> PrefillLimits:
         """Reserve existing decodes; P/D promotions extend this before admission."""
         if not self.enable_mixed_prefill_decode:
-            return PrefillLimits(self.max_num_batched_tokens)
-        candidates = list(self._decode_candidates(scheduled_seqs))
+            return self._unreserved_prefill_limits
+        candidates = list(self._decode_candidates())
         width = self.decode_spec_width + 1
         # Prefill may use less than its token budget. Protect every decode
         # that could join even a one-token, one-row prefill; the decode loop
@@ -1603,19 +1600,12 @@ class Scheduler:
     def _promote_mixed_remote_decodes(self, limits: PrefillLimits) -> PrefillLimits:
         """Promote ready P/D receives with running slots before selecting prefill.
 
-        Promotion does not spend prefill tokens. A receive that cannot yet join
-        running still owns KV and remains a possible pressure victim.
+        Promotion executes no prefill, but its decode reserve reduces the prefill
+        budget. A receive without a running slot remains a possible KV victim.
         """
-        if self._connector_flag("is_offload") or not (
-            self.finished_recving_kv_req_ids or self.failed_recving_kv_req_ids
-        ):
+        if self._connector_flag("is_offload") or not self.finished_recving_kv_req_ids:
             return limits
-        ready = {
-            str(req_id)
-            for req_id in itertools.chain(
-                self.finished_recving_kv_req_ids, self.failed_recving_kv_req_ids
-            )
-        }
+        ready = {str(req_id) for req_id in self.finished_recving_kv_req_ids}
         count = limits.num_decodes
         blocks = limits.reserved_decode_blocks
         seats = self._mixed_decode_seats()
@@ -2559,8 +2549,8 @@ class Scheduler:
     def _schedule(self) -> tuple[ScheduledBatch, dict[int, Sequence]] | None:
         """Select the next batch of sequences for a forward pass.
 
-        Tries prefill first; if no new prefills are ready, falls back to
-        decoding already-running sequences.
+        Select prefill chunks first. Mixed scheduling fills the remaining batch
+        with decodes; otherwise a prefill batch returns before decode selection.
         """
         self._schedule_tick += 1
         # Sources borrowed by the previous batch: its forward has been issued,
@@ -2587,7 +2577,7 @@ class Scheduler:
                 or self.finished_recving_kv_req_ids
                 or self.failed_recving_kv_req_ids
             )
-            else PrefillLimits(self.max_num_batched_tokens)
+            else self._unreserved_prefill_limits
         )
         self._prioritize_ready_remote_kv_requests(limits=limits)
         self._park_ready_offload_partial_prefills()
@@ -2625,7 +2615,7 @@ class Scheduler:
         # every tick on every rank for lockstep — hence before the early-return.
         if self.prefill_delayer is not None:
             # pending = fresh waiting new-tokens + resumable partials' remaining,
-            # capped at the batch budget: the coalescer's accumulation signal.
+            # capped at this tick's prefill budget: the accumulation signal.
             running_decode_batch = max(
                 0, len(self.running) - self._partial_prefill_count
             )
@@ -3020,8 +3010,8 @@ class Scheduler:
                 prefix_waiters.append(seq)
                 continue
             atomic_prefill = self._requires_atomic_prefill(seq)
-            # decode-first reservation: prefill spends only prefill_budget
-            # (= max_num_batched_tokens - reserved in-flight decode tokens).
+            # The decode reserve leaves a 1/8 prefill floor when pages fit;
+            # insufficient decode page capacity instead sets the budget to zero.
             budget_remaining = self._prefill_room(
                 num_batched_tokens, start, prefill_budget
             )
@@ -3299,45 +3289,9 @@ class Scheduler:
                 )
                 connector_meta_output = self.kv_connector.build_connector_meta()
 
-            # Freeze, per seq, whether this chunk is the last one this prefill
-            # owes. Uses the pre-advance offsets so it is correct whether or not
-            # schedule-time advancement runs below.
-            #
-            # Measured against `num_tokens`, for the same reason
-            # `next_token_ids` below is: a seq re-admitted after `preempt`
-            # re-forwards the tokens it had already generated, so its prefill
-            # runs past the prompt boundary. Ending it at `num_prompt_tokens`
-            # would call a middle chunk final and leave the rest of the context
-            # with no KV -- the sequence would then decode against blocks still
-            # holding the text of whichever request owned them last, and carry
-            # on writing that request's answer. Equal to `num_prompt_tokens` on
-            # a first admission, which is every seq that was never preempted.
-            is_final_chunk = [
-                (num_cached_tokens_list[i] + int(num_scheduled_tokens[i]))
-                >= seq.num_tokens
-                for i, seq in enumerate(scheduled_seqs.values())
-            ]
-            next_token_ids = None
-            if self.drafter_needs_next_token:
-                next_token_ids = []
-                for i, seq in enumerate(scheduled_seqs.values()):
-                    end = num_cached_tokens_list[i] + int(num_scheduled_tokens[i])
-                    next_token_ids.append(
-                        -1 if end >= seq.num_tokens else int(seq.token_ids[end])
-                    )
-
-            # Reserve midstep checkpoint destinations for the chunks just
-            # settled. Here rather than inside `_finalize_prefill_chunk`
-            # because a reservation takes a slot off the free list, and
-            # admission for this pass only finishes above — planning any
-            # earlier would let a checkpoint's destination compete with a
-            # request still to be let in. The batch below snapshots what this
-            # leaves on each seq.
-            for i, seq in enumerate(scheduled_seqs.values()):
-                start = num_cached_tokens_list[i]
-                self.block_manager.plan_midstep(
-                    seq, start, start + int(num_scheduled_tokens[i])
-                )
+            is_final_chunk, next_token_ids = self._settle_prefill_chunks(
+                scheduled_seqs.values(), num_scheduled_tokens, num_cached_tokens_list
+            )
             self._check_draft_writes_allocated(scheduled_seqs.values())
 
             prefill_batch = ScheduledBatch(
@@ -3475,8 +3429,11 @@ class Scheduler:
 
         if num_seqs_prefill:
             retained = {seq.id for seq in self.running}
+            original = {seq.id for seq in mixed_order}
+            promoted = [seq for seq in self.running if seq.id not in original]
             self.running.clear()
             self.running.extend(seq for seq in mixed_order if seq.id in retained)
+            self.running.extend(promoted)
             return self._build_mixed_batch(
                 scheduled_seqs,
                 num_scheduled_tokens,
@@ -4009,11 +3966,9 @@ class Scheduler:
             return self._probe_hbm_prefix(seq, limits=limits)
         return probe
 
-    def _probe_hbm_prefix(
-        self, seq: Sequence, scheduled_seqs=(), *, limits=None
-    ) -> AdmissionProbe:
+    def _probe_hbm_prefix(self, seq: Sequence, *, limits=None) -> AdmissionProbe:
         """Probe the same reserved KV fit used by the delayer and cost estimator."""
-        limits = self._prefill_limits(scheduled_seqs) if limits is None else limits
+        limits = self._prefill_limits() if limits is None else limits
         probe = AdmissionProbe()
         probe.num_cached_blocks = self.block_manager.can_allocate(
             seq,
@@ -5091,7 +5046,7 @@ class Scheduler:
         return not self._connector_should_defer_free(seq)
 
     def _preempt_one_running(self) -> bool:
-        """Reclaim a tail KV owner, including settled waiters on mixed ticks."""
+        """Reclaim a tail KV owner; include settled waiters when mixed is enabled."""
         # Waiting owners would join behind the current running rows on
         # admission. Their queue placement must not shield settled KV from
         # pressure. This scan runs only on allocation failure, not per row.
@@ -5258,16 +5213,14 @@ class Scheduler:
 
     def _settle_prefill_chunks(
         self,
-        prefill_seqs: list[Sequence],
+        prefill_seqs: Iterable[Sequence],
         num_scheduled_tokens: list[int],
         num_cached_tokens: list[int],
     ) -> tuple[list[bool], list[int] | None]:
         """Per-chunk bookkeeping every batch carrying prefill rows owes.
 
-        With mixed scheduling enabled, both mixed and pure-prefill batches
-        call this before their snapshot. With the flag off, `_schedule` keeps
-        inline settlement. Both paths owe plan_midstep, final-chunk markers
-        and schedule-time progress.
+        Both pure and mixed batches call this after admission and before
+        snapshotting final-chunk markers and checkpoint destinations.
 
         All three lists are positionally aligned and cover the prefill rows
         only. A mixed batch's `scheduled_seqs` is `[prefill | decode]` (decode
@@ -5356,9 +5309,11 @@ class Scheduler:
         """
         final = batch.is_final_chunk
         n_prefill = batch.total_seqs_num_prefill
-        for i, req_id in enumerate(batch.req_ids):
-            if i >= n_prefill or (final is not None and final[i]):
-                yield req_id
+        if final is not None:
+            for i in range(n_prefill):
+                if final[i]:
+                    yield batch.req_ids[i]
+        yield from batch.req_ids[n_prefill:] if n_prefill else batch.req_ids
 
     def mark_pp_inflight(self, batch: ScheduledBatch) -> None:
         """Head: block re-scheduling of seqs whose token is now in flight.

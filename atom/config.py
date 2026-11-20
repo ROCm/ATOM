@@ -19,6 +19,7 @@ from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.kv_transfer.disaggregation.multi.multi_connector import validate_multi_config
 from atom.model_engine.capabilities import pcp_group_size_of
+from atom.model_engine.mixed_budget import prefill_floor
 from atom.model_engine.prefill_delayer import PREFILL_ADMIT_POLICIES
 from atom.model_loader.weight_utils import (
     checkpoint_layer_key,
@@ -3773,8 +3774,8 @@ class Config:
         # FCFS decode tails can wait for the entire long prefill.
         if spec is not None and spec.num_speculative_tokens:
             full_reserve = self.max_num_seqs * (spec.num_speculative_tokens + 1)
-            decode_budget = self.max_num_batched_tokens - max(
-                1, self.max_num_batched_tokens // 8
+            decode_budget = self.max_num_batched_tokens - prefill_floor(
+                self.max_num_batched_tokens
             )
             if full_reserve > decode_budget:
                 logger.warning(

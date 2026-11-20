@@ -425,7 +425,7 @@
     "accuracy_threshold": 0.93,
     "accuracy_baseline": 0.95,
     "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4-Pro",
-    "_baseline_note": "Mixed prefill/decode without TBO. Local full GSM8K, 1319 examples, 3-shot, concurrency 1000 at 9eacf99647f9 on MI355X: mixed on 1258/1319 (0.9538), mixed off 1261/1319 (0.9560). Mixed scheduler steps were observed. Threshold follows the existing V4 target baseline; this is a nightly accuracy entry."
+    "_baseline_note": "Mixed prefill/decode without TBO. Threshold follows the existing V4 target baseline. This nightly entry is not exercised by the default PR accuracy jobs; current-head mixed-on validation and its source/configuration are recorded in the PR. Historical mixed on/off scores from earlier branch revisions do not establish equivalence for this head."
   },
   {
     "model_name": "GLM-5.3-Flash-kpool-16shot",
@@ -477,6 +477,6 @@
     "accuracy_threshold": 0.93,
     "accuracy_baseline": 0.95,
     "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4-Pro",
-    "_baseline_note": "DSpark mixed prefill/decode without TBO. Local full GSM8K, 1319 examples, 3-shot, concurrency 1000 at 9eacf99647f9 on MI355X: mixed on 1255/1319 (0.9515), mixed off 1261/1319 (0.9560). Mixed scheduler steps were observed. Threshold follows the existing V4 target baseline; this is a nightly accuracy entry."
+    "_baseline_note": "Mixed prefill/decode without TBO. Threshold follows the existing V4 target baseline. This nightly entry is not exercised by the default PR accuracy jobs; current-head mixed-on validation and its source/configuration are recorded in the PR. Historical mixed on/off scores from earlier branch revisions do not establish equivalence for this head."
   }
 ]

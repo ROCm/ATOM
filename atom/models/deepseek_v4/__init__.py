@@ -1675,13 +1675,6 @@ class Indexer(nn.Module):
 
 _NULL_SPAN = nullcontext()
 
-# `torch.autograd._profiler_enabled` is private but is the only cheap way to ask.
-# If a future torch drops it, omit these optional spans rather than adding
-# profiling overhead to every mixed step.
-_profiler_enabled = getattr(torch.autograd, "_profiler_enabled", None) or (
-    lambda: False
-)
-
 
 @contextmanager
 def _segment_forward_context(fc, ctx, seg_md, *, is_prefill: bool, input_ids):
@@ -1709,7 +1702,7 @@ def _segment_forward_context(fc, ctx, seg_md, *, is_prefill: bool, input_ids):
 def _mixed_span(tag: str):
     """Create a span only while profiling. Called inside the opaque attention op,
     so the predicate is evaluated at runtime rather than captured by Dynamo."""
-    if _profiler_enabled():
+    if torch.autograd._profiler_enabled():
         return torch.profiler.record_function(tag)
     return _NULL_SPAN
 

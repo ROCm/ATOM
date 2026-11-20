@@ -5,7 +5,15 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+from aiter_stub import atom_without_aiter
 from conftest import MockConfig
+
+
+@pytest.fixture
+def runner_module():
+    with atom_without_aiter() as load:
+        yield load("atom.model_engine.model_runner")
+
 
 from atom.model_engine.block_manager import AdmissionProbe, BlockManager
 from atom.model_engine.scheduler import Scheduler
@@ -200,8 +208,9 @@ def test_mixed_off_does_not_scan_decode_candidates_or_snapshot_running(prefill):
 
 
 @pytest.mark.parametrize("paged_state", [False, True])
-def test_mixed_profile_is_not_charged_to_graph_pools(monkeypatch, caplog, paged_state):
-    runner_module = pytest.importorskip("atom.model_engine.model_runner")
+def test_mixed_profile_is_not_charged_to_graph_pools(
+    monkeypatch, caplog, paged_state, runner_module
+):
     import torch
 
     from atom.model_engine.kv_block import STATE_SLOT_CLASS

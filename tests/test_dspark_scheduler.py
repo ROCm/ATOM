@@ -1107,15 +1107,3 @@ def test_q_bucket_preserves_prefill_and_uses_decode_rows_bonus_counts():
     assert (batch.total_tokens_num_prefill, batch.total_tokens_num_decode) == (3, 4)
     assert batch.total_tokens_num == 7
     assert batch.scheduled_spec_decode_tokens.tolist() == [[0], [3], [6]]
-
-
-@pytest.mark.parametrize("new_lens", [[0, 2], [2, 5], [2]])
-def test_decode_resize_rejects_invalid_spans_without_mutation(new_lens):
-    from atom.spec_decode.dspark_scheduler import resize_decode_tokens
-
-    batch = _decode_batch(width=4, num_spec_step=3)
-    batch.num_scheduled_tokens = np.array([4, 4], dtype=np.int32)
-    batch.scheduled_tokens = np.arange(8)
-    with pytest.raises(ValueError, match="scheduled span"):
-        resize_decode_tokens(batch, np.array(new_lens))
-    assert batch.scheduled_tokens.tolist() == list(range(8))
