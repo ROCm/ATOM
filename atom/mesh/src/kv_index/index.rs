@@ -276,6 +276,38 @@ impl PrefixIndex {
             .collect()
     }
 
+    /// The leading blocks of `prefix` the lanes of each of `groups` hold between them, in
+    /// their order: a block counts for a group while any of its lanes holds it. One walk,
+    /// which stops when no group is left.
+    pub(super) fn find_shared(&self, prefix: &[PrefixHash], groups: &[u64]) -> Vec<u32> {
+        let mut depth: Vec<u32> = groups.iter().map(|_| prefix.len() as u32).collect();
+        let mut open: Vec<usize> = (0..groups.len()).collect();
+        let mut walk = Walk::new(self);
+        for &hash in prefix.iter().take(PREFETCH) {
+            walk.prefetch(hash);
+        }
+        for (i, &hash) in prefix.iter().enumerate() {
+            if open.is_empty() {
+                break;
+            }
+            if i % YIELD_BLOCKS == 0 {
+                walk.yield_to_writer();
+            }
+            if let Some(&ahead) = prefix.get(i + PREFETCH) {
+                walk.prefetch(ahead);
+            }
+            let held = walk.get(hash);
+            open.retain(|&group| {
+                let holds = held & groups[group] != 0;
+                if !holds {
+                    depth[group] = i as u32;
+                }
+                holds
+            });
+        }
+        depth
+    }
+
     /// Prefixes, blocks held over all lanes, and slot bytes.
     #[cfg(test)]
     pub(super) fn stats(&self) -> (usize, u32, usize) {

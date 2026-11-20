@@ -104,6 +104,8 @@ Defaults are the CLI defaults.
 | | `imbalanced` | The max minus min load exceeds `--balance-abs-threshold` (64) and the max exceeds `--balance-rel-threshold` (1.5) times the min: the least-loaded worker, without a tree lookup. | |
 | | `stale_tenant` | Affinity, but that worker is gone or unhealthy: it leaves the tree and the first healthy worker is used. | |
 | | `no_tree` | No tree for the model and pool: a random healthy worker. | |
+| | `kv_affinity` | With `--kv-events`: the worker whose device cache holds the largest share of the prompt, above the threshold, then the least loaded. | ratio |
+| | `kv_shared` | The same, where that worker's share counts what its engine will copy in from the device pools of its share group, at `--kv-share-weight` (0.9) per token. | ratio |
 | `prefix_hash` | `ring_hit` | The hash ring owner of the first `--prefix-token-count` (256) tokens, when its load is at most `--prefix-hash-load-factor` (1.25) times the average load including this request. | |
 | | `load_balance_walk` | The owner is over that bound: the least-loaded worker within it, or the owner if none is. | |
 | | `fallback_least_load` | No ring, or the owner is not healthy: the least-loaded worker. | |
@@ -197,7 +199,9 @@ match ratio only when it picked the worker holding the best match, which covers
 every `affinity` decision and any `relocate` that happened to pick it. With
 `--kv-events`, its `kv_affinity` decisions estimate the selection from the KV
 event index, short of the block of the prompt's last token, which the engine
-always computes. With `--kv-storage-weight`, they add what the engine will load
+always computes. `kv_shared` decisions add what the engine will copy in from
+the device pools of its share group, which it reports cached as well. With
+`--kv-storage-weight`, they add what the engine will load
 from the Mooncake Store the worker reads, by ATOM's load rule. The
 router drops the estimate when it sends the prompt to a different worker than
 the policy chose, such as another DP rank under

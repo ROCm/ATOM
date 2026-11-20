@@ -60,9 +60,11 @@
 
     With --kv-events, a request the router can tokenize goes to the worker whose
     device cache, as its KV events show, holds the largest share of its tokens,
-    if that share is above cache_threshold. With --kv-storage-weight above 0, a
-    worker's share also counts the tokens its engine will load from the Mooncake
-    Store it reads, at that weight each. The tree places all other requests:
+    if that share is above cache_threshold. A worker's share also counts the
+    tokens its engine will copy in from the device pools of its share group
+    (ATOM's umbp_pool), at --kv-share-weight each, and with --kv-storage-weight
+    above 0, those it will load from the Mooncake Store it reads, at that weight
+    each. The tree places all other requests:
     those at or below the threshold, those with media, those under imbalanced
     load, and those whose candidates have no indexed events.
 */
@@ -321,9 +323,10 @@ impl CacheAwarePolicy {
 
     /// The tree's affinity branch, with the match rate of the KV event index: the share of
     /// the request's tokens a worker's device cache holds, each token its engine will then
-    /// load from a store counted at the store's weight; the highest first, then the lower
-    /// load. None leaves the request to the tree: it has no tokens or has media, or no
-    /// candidate's match rate is above `cache_threshold`.
+    /// copy in from its share group or load from a store counted at that one's weight; the
+    /// highest first, then the lower load. `kv_shared` where the worker counts copies. None
+    /// leaves the request to the tree: it has no tokens or has media, or no candidate's
+    /// match rate is above `cache_threshold`.
     async fn select_by_kv_events(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -336,12 +339,23 @@ impl CacheAwarePolicy {
             .filter(|tokens| !tokens.is_empty() && !info.carries_media)?;
         let provider = self.kv_events.get()?;
         let hits = provider.match_workers(tokens, workers);
-        let cached = provider.cached_tokens(tokens, workers, &hits).await;
-        let weight = provider.store_weight();
+        let shared = provider.shared_tokens(tokens, workers, &hits);
+        let cached = provider.cached_tokens(tokens, workers, &shared).await;
+        let (share_weight, store_weight) = (provider.share_weight(), provider.store_weight());
+        let copied = |idx: usize| {
+            shared[idx]
+                .zip(hits[idx])
+                .map_or(0, |(s, d)| s.saturating_sub(d))
+        };
         let score = |idx: usize| {
             let device = hits[idx]?;
-            let loaded = cached[idx].map_or(0, |cached| cached.saturating_sub(device));
-            Some(f64::from(device) + weight * f64::from(loaded))
+            let copied = copied(idx);
+            let loaded = cached[idx].map_or(0, |cached| cached.saturating_sub(device + copied));
+            Some(
+                f64::from(device)
+                    + share_weight * f64::from(copied)
+                    + store_weight * f64::from(loaded),
+            )
         };
         let (idx, score) = healthy_indices
             .iter()
@@ -363,10 +377,15 @@ impl CacheAwarePolicy {
         self.routed(info, workers[idx].as_ref());
         workers[idx].increment_processed();
         let estimate = cached[idx].map(|cached| f64::from(cached) / tokens.len() as f64);
+        let branch = if copied(idx) > 0 {
+            "kv_shared"
+        } else {
+            "kv_affinity"
+        };
         let decision = RouteDecision {
             match_ratio: Some(match_rate),
             estimated_hit_ratio: estimate,
-            ..RouteDecision::branch("kv_affinity")
+            ..RouteDecision::branch(branch)
         };
         Some((Some(idx), decision))
     }
@@ -1024,6 +1043,68 @@ mod tests {
             let got = (decision.branch == "kv_affinity").then(|| {
                 let match_rate = decision.match_ratio.unwrap();
                 (selected.unwrap(), match_rate, decision.estimated_hit_ratio)
+            });
+            assert_eq!(got, want);
+        }
+    }
+
+    /// Each worker's device hit and what its device cache will hold once its engine copies
+    /// in from its share group, and the weight of those copies.
+    #[derive(Debug)]
+    struct Shared(Vec<(u32, u32)>, f64);
+
+    #[async_trait]
+    impl PrefixMatchProvider for Shared {
+        fn match_workers(&self, _tokens: &[u32], _: &[Arc<dyn Worker>]) -> Vec<Option<u32>> {
+            self.0.iter().map(|&(device, _)| Some(device)).collect()
+        }
+
+        fn shared_tokens(
+            &self,
+            _: &[u32],
+            _: &[Arc<dyn Worker>],
+            device: &[Option<u32>],
+        ) -> Vec<Option<u32>> {
+            assert_eq!(device, self.match_workers(&[], &[]));
+            self.0.iter().map(|&(_, shared)| Some(shared)).collect()
+        }
+
+        fn share_weight(&self) -> f64 {
+            self.1
+        }
+    }
+
+    #[tokio::test]
+    async fn the_kv_match_rate_weighs_what_the_engine_copies_from_its_share_group() {
+        let workers: Vec<Arc<dyn Worker>> = ["http://w1:8000", "http://w2:8000"]
+            .into_iter()
+            .map(|url| Arc::new(BasicWorkerBuilder::new(url).build()) as Arc<dyn Worker>)
+            .collect();
+        let tokens: Vec<u32> = (0..100).collect();
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        // w1's device cache holds 60 of the 100 tokens; w2's 20, and its share group 80.
+        let shared = |weight| Shared(vec![(60, 60), (20, 80)], weight);
+        for (shared, want) in [
+            // w2's 20 + 0.9 * 60 beats w1's 60, and its engine reports the copies cached.
+            (shared(0.9), Some((1, "kv_shared", 0.74, Some(0.8)))),
+            (shared(0.5), Some((0, "kv_affinity", 0.6, Some(0.6)))),
+            // At most cache_threshold of the prompt, the tree places it.
+            (Shared(vec![(10, 10), (0, 40)], 0.9), None),
+        ] {
+            let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+                eviction_interval_secs: 0,
+                ..Default::default()
+            });
+            policy.init_workers(&workers);
+            policy.set_kv_events(Arc::new(shared));
+            let (selected, decision) = policy.select_with_decision(&workers, &info).await;
+            let got = decision.branch.starts_with("kv_").then(|| {
+                let match_rate = decision.match_ratio.unwrap();
+                let estimate = decision.estimated_hit_ratio;
+                (selected.unwrap(), decision.branch, match_rate, estimate)
             });
             assert_eq!(got, want);
         }

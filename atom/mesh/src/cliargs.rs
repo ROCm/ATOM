@@ -290,6 +290,12 @@ pub struct CliArgs {
     #[arg(long, default_value_t = 0.0, value_parser = parse_fraction, help_heading = "Routing Policy")]
     pub kv_storage_weight: f64,
 
+    /// With --kv-events, what a token a worker's engine will copy in from the device pool of
+    /// another rank of its share group (ATOM's umbp_pool) counts for in cache_aware's match
+    /// rate (0 to 1), against one its own device cache holds; 0 ignores share groups
+    #[arg(long, default_value_t = 0.9, value_parser = parse_fraction, help_heading = "Routing Policy")]
+    pub kv_share_weight: f64,
+
     // ==================== PD Disaggregation ====================
     /// Enable PD (Prefill-Decode) disaggregated mode
     #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
@@ -706,6 +712,7 @@ impl CliArgs {
             .mooncake_admin_port(self.mooncake_admin_port)
             .kv_storage_deadline_ms(self.kv_storage_deadline_ms)
             .kv_storage_weight(self.kv_storage_weight)
+            .kv_share_weight(self.kv_share_weight)
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
             .build()
@@ -912,6 +919,7 @@ impl Default for CliArgs {
             mooncake_admin_port: 9003,
             kv_storage_deadline_ms: 3,
             kv_storage_weight: 0.0,
+            kv_share_weight: 0.9,
             pd_disaggregation: false,
             decode: Vec::new(),
             prefill_policy: None,

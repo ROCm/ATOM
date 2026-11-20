@@ -13,7 +13,7 @@ use xxhash_rust::xxh3::xxh3_64_with_seed;
 use super::{
     hash,
     index::{HolderTable, Op, PrefixIndex},
-    match_lanes, HolderId, Lane, Partition, PrefixHash,
+    match_groups, match_lanes, HolderId, Lane, Partition, PrefixHash,
 };
 use crate::kv_events::{
     model::{DropReason, EngineHash, KvEvent, StoredBlock},
@@ -80,7 +80,8 @@ fn apply(
 
 /// Random stores, evictions anywhere in a chain and clears over three holders sharing
 /// prefixes; after every step each holder's match of every sequence equals the reference,
-/// and once every holder clears, the index is empty again.
+/// as does each group's, which some sequences reach only across its holders. Once every
+/// holder clears, the index is empty again.
 #[test]
 fn index_matches_the_naive_reference() {
     const HOLDERS: usize = 3;
@@ -101,7 +102,8 @@ fn index_matches_the_naive_reference() {
         // The token prefixes each holder holds.
         let mut held = vec![HashSet::<Vec<u32>>::new(); HOLDERS];
         let holders: Vec<HolderId> = (0..HOLDERS as u8).map(HolderId).collect();
-        let mut deepest = 0;
+        let groups = [0b011, 0b110, 0b111, 0b100];
+        let (mut deepest, mut across) = (0, 0);
         for _ in 0..2000 {
             let h = rng.below(HOLDERS);
             let seq = &seqs[rng.below(seqs.len())];
@@ -145,7 +147,8 @@ fn index_matches_the_naive_reference() {
             };
             apply(&index, &mut tables[h], holders[h], &event).unwrap();
             for seq in &seqs {
-                let found = index.find_matches(&hash::prefix_hashes(seq, bs as u32), &holders);
+                let prefix = hash::prefix_hashes(seq, bs as u32);
+                let found = index.find_matches(&prefix, &holders);
                 for (h, held) in held.iter().enumerate() {
                     let expected = (1..=BLOCKS)
                         .take_while(|&b| held.contains(&seq[..b * bs]))
@@ -153,9 +156,21 @@ fn index_matches_the_naive_reference() {
                     assert_eq!(found[h], expected as u32, "block size {bs}, holder {h}");
                     deepest = deepest.max(found[h]);
                 }
+                let shared = index.find_shared(&prefix, &groups);
+                for (g, &lanes) in groups.iter().enumerate() {
+                    let members = || (0..HOLDERS).filter(|h| lanes >> h & 1 == 1);
+                    let expected = (1..=BLOCKS)
+                        .take_while(|&b| members().any(|h| held[h].contains(&seq[..b * bs])))
+                        .count();
+                    assert_eq!(
+                        shared[g], expected as u32,
+                        "block size {bs}, group {lanes:b}"
+                    );
+                    across += usize::from(members().all(|h| found[h] < shared[g]));
+                }
             }
         }
-        assert!(deepest > 1, "{deepest}");
+        assert!(deepest > 1 && across > 0, "{deepest}, {across}");
         let blocks: usize = held.iter().map(HashSet::len).sum();
         assert_eq!(index.stats().1 as usize, blocks);
         for (h, table) in tables.iter_mut().enumerate() {
@@ -389,6 +404,43 @@ async fn predictions_go_on_where_the_events_end() {
         .unzip();
     let want = [Some(16), Some(12), Some(8), Some(4)];
     assert_eq!(match_lanes(&seq, &events, &predicted), want);
+}
+
+/// A share group holds a block while any of its ranks does, each group walked in the
+/// partition of its ranks; a group without ranks holds nothing.
+#[tokio::test]
+async fn a_group_holds_what_any_of_its_ranks_holds() {
+    let (ttl, runtime) = (Duration::from_secs(120), tokio::runtime::Handle::current());
+    let (fours, eights) = (
+        Partition::start(4, ttl, &runtime),
+        Partition::start(8, ttl, &runtime),
+    );
+    let status = Arc::new(Mutex::new(SourceStatus::default()));
+    let seq: Vec<u32> = (0..17).collect();
+    let store = |lane: Lane, block_size: u32, blocks: &[usize]| {
+        let prefix = hash::prefix_hashes(&seq[..16], block_size);
+        let mut ops = blocks.iter().map(|&b| Op::Store(prefix[b])).collect();
+        lane.0.index.apply(lane.1, &mut ops);
+        lane
+    };
+    let holders: Vec<_> = (0..3)
+        .map(|_| fours.hold(status.clone()).unwrap())
+        .collect();
+    // Of the four blocks, rank 0 holds the first two, rank 1 the first and the third, and
+    // rank 2 the last one alone.
+    let ranks: Vec<Lane> = (holders.iter().zip([&[0, 1][..], &[0, 2], &[3]]))
+        .map(|(holder, blocks)| store(holder.lane(), 4, blocks))
+        .collect();
+    let held = eights.hold(status.clone()).unwrap();
+    let other = store(held.lane(), 8, &[0, 1]);
+    let groups = [
+        vec![ranks[0].clone(), ranks[1].clone()],
+        vec![ranks[0].clone(), ranks[2].clone()],
+        vec![ranks[1].clone()],
+        vec![other],
+        vec![],
+    ];
+    assert_eq!(match_groups(&seq, &groups), [12, 8, 4, 16, 0]);
 }
 
 fn resident_bytes() -> u64 {

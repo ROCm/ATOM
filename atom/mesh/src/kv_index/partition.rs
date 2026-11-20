@@ -365,10 +365,7 @@ pub(crate) fn match_lanes(
             .map(|j| (j, [here(events, j), here(predicted, j)]))
             .filter(|(_, lanes)| lanes != &[None, None])
             .unzip();
-        // The engine computes the block of the prompt's last token, so it never reports
-        // that block as cached.
-        let reusable = &tokens[..tokens.len().saturating_sub(1)];
-        let prefix = hash::prefix_hashes(reusable, partition.block_size);
+        let prefix = reusable_prefix(tokens, partition.block_size);
         let found = if lanes.iter().all(|[_, predicted]| predicted.is_none()) {
             let holders: Vec<_> = lanes.iter().filter_map(|[events, _]| *events).collect();
             partition.index.find_matches(&prefix, &holders)
@@ -380,6 +377,42 @@ pub(crate) fn match_lanes(
         }
     }
     hits
+}
+
+/// The leading tokens of `tokens` the ranks of each share group hold between them, in the
+/// order of `groups`, each the lanes of a group's ranks in one partition: a block counts
+/// while any of them holds it. One hashing and one walk per partition.
+pub(crate) fn match_groups(tokens: &[u32], groups: &[Vec<Lane>]) -> Vec<u32> {
+    let mut hits = vec![0; groups.len()];
+    let mut walked: Vec<&Arc<Partition>> = Vec::new();
+    for (partition, _) in groups.iter().filter_map(|lanes| lanes.first()) {
+        if walked.iter().any(|walked| Arc::ptr_eq(walked, partition)) {
+            continue;
+        }
+        walked.push(partition);
+        let (at, masks): (Vec<usize>, Vec<u64>) = (groups.iter().enumerate())
+            .filter(|(_, lanes)| {
+                lanes
+                    .first()
+                    .is_some_and(|(p, _)| Arc::ptr_eq(p, partition))
+            })
+            .map(|(g, lanes)| (g, lanes.iter().fold(0, |mask, (_, id)| mask | 1 << id.0)))
+            .unzip();
+        let prefix = reusable_prefix(tokens, partition.block_size);
+        for (g, blocks) in at
+            .into_iter()
+            .zip(partition.index.find_shared(&prefix, &masks))
+        {
+            hits[g] = blocks * partition.block_size;
+        }
+    }
+    hits
+}
+
+/// The prefix hashes of the blocks of `tokens` an engine may report cached: it computes the
+/// block of the prompt's last token, so it never reports that block as cached.
+fn reusable_prefix(tokens: &[u32], block_size: u32) -> Vec<PrefixHash> {
+    hash::prefix_hashes(&tokens[..tokens.len().saturating_sub(1)], block_size)
 }
 
 #[cfg(test)]
