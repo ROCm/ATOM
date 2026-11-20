@@ -76,6 +76,7 @@ def test_per_token_fp8_binds_in_place(padded):
         (fp8_linear(native_a8_group_rows=128), SHAPE, "native-a8"),
         (fp8_linear(rows=SHAPE[0]), SHAPE, "padded to 16"),
         (fp8_linear(rows=192), SHAPE, "weight shape"),
+        (fp8_linear(k=192), (SHAPE[0], 192), "multiple of 128"),
         (
             fp8_linear(is_output_padded=True, _output_size_before_padding=SHAPE[0] + 1),
             SHAPE,

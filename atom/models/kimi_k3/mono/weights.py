@@ -136,7 +136,7 @@ def _dense(module, name: str, shape: tuple[int, ...]):
     )
     _need(w.shape[0] % 16 == 0, f"{name} is {tuple(w.shape)}: rows not padded to 16")
     # the binders' constant K: the GEMVs walk it in 128-wide chunks
-    assert k % 128 == 0, f"{name}: K {k} not a multiple of 128"
+    _need(k % 128 == 0, f"{name}: K {k} not a multiple of 128")
     _need(w.is_contiguous(), f"{name} not contiguous")
     return w, sc
 
