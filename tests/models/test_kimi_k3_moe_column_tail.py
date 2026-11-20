@@ -47,6 +47,12 @@ def block(modules, monkeypatch):
     monkeypatch.setenv("ATOM_USE_CUSTOM_ALL_GATHER", "1")
     block = SimpleNamespace(
         tp_size=8,
+        hidden_dim=7168,
+        moe_hidden_size=3584,
+        front_proj=SimpleNamespace(merged_weight=object()),
+        shared_experts=SimpleNamespace(
+            down_proj=SimpleNamespace(supports_out=lambda: True)
+        ),
         fuse_routed_norm_quant=False,
         fuse_routed_triton_mxfp4_quant=False,
         routed_expert_up_proj=SimpleNamespace(
@@ -62,7 +68,12 @@ def block(modules, monkeypatch):
         comm=comm,
         tp_group=group,
     )
-    for name in ("_column_tail_eligible", "_can_column_tail", "_finish_latent_tail"):
+    for name in (
+        "_column_tail_producer_supported",
+        "_column_tail_eligible",
+        "_can_column_tail",
+        "_finish_latent_tail",
+    ):
         setattr(block, name, MethodType(getattr(model.KimiSparseMoeBlock, name), block))
     return block
 

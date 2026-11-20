@@ -29,6 +29,9 @@ def modules():
             runner=load("atom.model_engine.model_runner"),
             peer_memory=load("atom.mono.runtime.peer_memory"),
             simulated_tp=load("atom.distributed.simulated_tp"),
+            linear=load("atom.model_ops.linear"),
+            layernorm=load("atom.model_ops.layernorm"),
+            loader=load("atom.model_loader.loader"),
         )
 
 
@@ -425,6 +428,7 @@ def test_exchange_binds_only_safe_local_consumers(modules, monkeypatch, fallback
             routed_expert_norm=object(),
             prefix=f"layer{i}",
             column_gather_name="",
+            _column_tail_producer_supported=lambda: True,
         )
         for i in range(3)
     ]
@@ -482,6 +486,141 @@ def test_exchange_binds_only_safe_local_consumers(modules, monkeypatch, fallback
     else:
         assert not calls and all(not block.column_gather_name for block in blocks)
     assert blocks[-1].column_gather_name == ""
+
+
+@pytest.fixture
+def allocation_model(modules, monkeypatch):
+    """Real linears/norm/front merger; meta storage avoids allocating model weights."""
+
+    class Experts(nn.Module):
+        def __init__(self, **kwargs):
+            super().__init__()
+
+    group = SimpleNamespace(
+        rank=0,
+        rank_in_group=0,
+        world_size=8,
+        cpu_group=object(),
+        device_communicator=SimpleNamespace(ca_comm=SimpleNamespace(disabled=False)),
+    )
+    config = SimpleNamespace(
+        enable_tbo=False,
+        torch_dtype=torch.bfloat16,
+        compilation_config=SimpleNamespace(static_forward_context={}),
+    )
+    for module in (modules.model, modules.linear):
+        monkeypatch.setattr(module, "get_tp_group", lambda: group)
+        monkeypatch.setattr(module, "get_current_atom_config", lambda: config)
+    for module in (modules.model, modules.layernorm):
+        monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 8)
+    monkeypatch.setattr(modules.model, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        modules.model, "get_pp_group", lambda: SimpleNamespace(world_size=1)
+    )
+    monkeypatch.setattr(modules.model, "FusedMoE", Experts)
+    monkeypatch.setattr(modules.plugin, "is_plugin_mode", lambda: False)
+    monkeypatch.setenv("ATOM_USE_CUSTOM_ALL_GATHER", "1")
+    monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "0")
+    monkeypatch.setenv("ATOM_LOADER_NUM_THREADS", "1")
+    monkeypatch.setattr(
+        modules.loader, "safetensors_weights_iterator", lambda *a, **kw: iter(())
+    )
+    hf = SimpleNamespace(
+        hidden_size=7168,
+        num_experts=256,
+        num_experts_per_token=16,
+        routed_expert_hidden_size=3584,
+        moe_intermediate_size=3072,
+        num_shared_experts=2,
+        moe_renormalize=True,
+        moe_router_activation_func="sigmoid",
+        latent_moe_use_norm=True,
+        rms_norm_eps=1e-6,
+        hidden_act="situ",
+        num_hidden_layers=2,
+    )
+    previous_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.bfloat16)
+        with torch.device("meta"):
+            moe = modules.model.KimiSparseMoeBlock(
+                hf, prefix="layers.0.block_sparse_moe"
+            )
+    finally:
+        torch.set_default_dtype(previous_dtype)
+    target = nn.Module()
+    layer, following = nn.Module(), nn.Module()
+    layer.block_sparse_moe = moe
+    following.self_attention_attn_res = nn.Identity()
+    following.self_attention_attn_res.enabled = True
+    target.layers = nn.ModuleList([layer, following])
+    target.start_layer, target.end_layer = 0, 2
+    target._column_gather, target._column_gather_blocks = None, []
+    target._init_column_gather = MethodType(
+        modules.model.KimiLinearModel._init_column_gather, target
+    )
+    allocations = []
+
+    def allocate(*args):
+        allocations.append(args)
+        return SimpleNamespace(close=lambda: None)
+
+    monkeypatch.setattr(modules.ops, "PeerColumnGather", allocate)
+    return SimpleNamespace(
+        model=target, moe=moe, config=config, hf=hf, allocations=allocations
+    )
+
+
+@pytest.mark.parametrize(
+    "unsupported", ["front_quant", "norm_quant", "down_output", "up_dtype"]
+)
+def test_binding_rejects_unsupported_real_producer(
+    allocation_model, modules, unsupported
+):
+    state = allocation_model
+    moe = state.moe
+    if unsupported == "front_quant":
+        moe.gate.quant_type = modules.model.QuantType.per_Token
+    elif unsupported == "norm_quant":
+        moe.fuse_routed_norm_quant = True
+    elif unsupported == "down_output":
+        moe.shared_experts.down_proj.quant_type = modules.model.QuantType.per_Token
+    else:
+        moe.routed_expert_up_proj.weight.data = moe.routed_expert_up_proj.weight.float()
+    moe.front_proj.process_weights_after_loading()
+    state.model._init_column_gather(state.config, "model")
+    assert not state.allocations
+    assert moe.column_gather_name == ""
+
+
+def test_loader_binds_after_front_merge_without_reading_a_step(
+    allocation_model, modules, monkeypatch
+):
+    state = allocation_model
+    assert state.moe.front_proj.merged_weight is None
+    state.model._column_gather_setup = modules.model._ColumnGatherSetup(
+        lambda: state.model._init_column_gather(state.config, "model")
+    )
+    monkeypatch.setattr(
+        modules.model,
+        "get_forward_context",
+        lambda: pytest.fail("post-load binding inspected a forward step"),
+    )
+    modules.loader.load_model(state.model, "unused", state.hf, load_dummy="empty")
+    assert state.moe.front_proj.merged_weight is not None
+    assert len(state.allocations) == 1
+    assert state.moe.column_gather_name == "model.column_gather"
+    state.model._column_gather_setup.process_weights_after_loading()
+    assert len(state.allocations) == 1
+    context = SimpleNamespace(is_prefill=True)
+    monkeypatch.setattr(
+        modules.model, "get_forward_context", lambda: SimpleNamespace(context=context)
+    )
+    prefill = torch.empty((128, 7168), dtype=torch.bfloat16, device="meta")
+    assert not state.moe._can_defer_column_tail(prefill)
+    context.is_prefill = False
+    decode = torch.empty((2, 7168), dtype=torch.bfloat16, device="meta")
+    assert state.moe._can_defer_column_tail(decode)
 
 
 def _gpu_mix_inputs(tokens, banks, hidden=7168):
