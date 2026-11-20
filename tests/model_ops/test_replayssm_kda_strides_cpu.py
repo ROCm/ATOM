@@ -73,6 +73,7 @@ class TestKdaStrides(unittest.TestCase):
                         "seed_forked_slots": lambda *args: None,
                         "flush_threshold_ok": lambda cap, length: cap >= 2 * length,
                         "_replay_dot_mode": lambda dtype: "ieee",
+                        "_flush_arrivals": lambda ckpt: object(),
                         "_replayssm_kda_fwd_kernel": Kernel(),
                     }
                     run = production_function(
