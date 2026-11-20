@@ -55,6 +55,33 @@ def production_function(name, namespace):
 
 
 class TestKdaStrides(unittest.TestCase):
+    def test_arrivals_are_owned_by_the_checkpoint_pool(self):
+        capturing = False
+        torch = SimpleNamespace(
+            int32=np.int32,
+            zeros=lambda size, **kw: np.zeros(size, dtype=kw["dtype"]),
+            cuda=SimpleNamespace(is_current_stream_capturing=lambda: capturing),
+        )
+        run = production_function(
+            "_flush_arrivals", {"torch": torch, "_FLUSH_ARRIVALS": {}}
+        )
+
+        def pool(ptr):
+            return SimpleNamespace(
+                device="cuda:0", shape=(8, 12, 128, 128), data_ptr=lambda: ptr
+            )
+
+        first, second = run(pool(100)), run(pool(200))
+        self.assertIsNot(first, second)
+        self.assertEqual([x.shape for x in (first, second)], [(96,), (96,)])
+        self.assertFalse(first.any() or second.any())
+        first[0] = 1
+        self.assertEqual(second[0], 0)
+        capturing = True
+        self.assertIs(run(pool(100)), first)
+        with self.assertRaisesRegex(RuntimeError, "eagerly"):
+            run(pool(300))
+
     def test_flush_wait_for_supported_targets(self):
         for arch, expected in (
             ("gfx942", "s_waitcnt vmcnt(0)"),

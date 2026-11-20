@@ -407,17 +407,11 @@ def _replay_dot(
 def _owns_kg_records(
     flush_arrivals, slot, i_hv, HV: tl.constexpr, do_flush, WAIT: tl.constexpr
 ):
-    """Whether this program stores the step's k / g records.
+    """Whether this slice may overwrite the head's k/g records.
 
-    k and g do not depend on the V split, so one program of the head stores
-    them. Off a flush that is the first: the step appends past every row its
-    siblings replay. A flush appends at row 0, inside those rows, so the store
-    goes to the last program of the head to count itself in, and it puts the
-    count back to 0 for the next flush. Call it after this program's own loads
-    of the records: the wait and the barrier land every warp's loads before the
-    count, and the store depends on the count, so it needs no acquire. A
-    release would order the loads as well, but it writes back L2 in every
-    program.
+    Append-only steps use the first slice; flushes use the last arrival.
+    Wait for all warp loads before the barrier and count. The record
+    stores depend on the count; release atomics would add L2 writeback.
     """
     owns = tl.program_id(0) == 0
     if do_flush:
@@ -433,8 +427,8 @@ def _owns_kg_records(
 
 
 #: Zeroed `_owns_kg_records` counts, one per checkpoint slot and head, keyed by
-#: device and size. Never freed: a captured graph keeps the address.
-_FLUSH_ARRIVALS: dict[tuple[torch.device, int], torch.Tensor] = {}
+#: device, checkpoint address and size. Kept alive for captured graphs.
+_FLUSH_ARRIVALS: dict[tuple[torch.device, int, int], torch.Tensor] = {}
 
 
 def _flush_wait() -> str:
@@ -446,7 +440,8 @@ def _flush_wait() -> str:
 
 
 def _flush_arrivals(ckpt: torch.Tensor) -> torch.Tensor:
-    key = (ckpt.device, ckpt.shape[0] * ckpt.shape[1])
+    count = ckpt.shape[0] * ckpt.shape[1]
+    key = (ckpt.device, ckpt.data_ptr(), count)
     arrivals = _FLUSH_ARRIVALS.get(key)
     if arrivals is None:
         # A zeroing recorded into a graph does not run until its replay.
@@ -455,7 +450,7 @@ def _flush_arrivals(ckpt: torch.Tensor) -> torch.Tensor:
                 "replayssm: first call for this checkpoint pool is inside a CUDA "
                 "graph capture; run the step eagerly once before capturing it"
             )
-        arrivals = torch.zeros(key[1], dtype=torch.int32, device=ckpt.device)
+        arrivals = torch.zeros(count, dtype=torch.int32, device=ckpt.device)
         _FLUSH_ARRIVALS[key] = arrivals
     return arrivals
 
