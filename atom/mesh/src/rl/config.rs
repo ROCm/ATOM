@@ -2,6 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Default `--rl-control-timeout-secs`.
+pub const DEFAULT_RL_CONTROL_TIMEOUT_SECS: u64 = 600;
+
 /// Configuration for the `/v1/rl` routes. Inert unless `enabled`.
 #[derive(Debug, Clone, PartialEq, Eq, clap::Args, Serialize, Deserialize)]
 #[command(next_help_heading = "RL Control Plane")]
@@ -18,7 +21,7 @@ pub struct RlConfig {
     #[arg(
         id = "rl_control_timeout_secs",
         long = "rl-control-timeout-secs",
-        default_value_t = 600
+        default_value_t = DEFAULT_RL_CONTROL_TIMEOUT_SECS
     )]
     pub control_timeout_secs: u64,
     /// Engine control calls in flight at once during a fan-out.
@@ -35,7 +38,7 @@ impl Default for RlConfig {
         Self {
             enabled: false,
             api_key: None,
-            control_timeout_secs: 600,
+            control_timeout_secs: DEFAULT_RL_CONTROL_TIMEOUT_SECS,
             fanout_concurrency: 32,
         }
     }
