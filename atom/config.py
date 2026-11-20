@@ -1406,6 +1406,10 @@ class SpeculativeConfig:
     # probability that the first i+1 draft tokens are all accepted), filled in by
     # __post_init__. None => real draft/target rejection sampling.
     synthetic_acceptance_rates: list[float] | None = None
+    # The draft's KV dtype as the user asked for it (--spec-decode-kv-cache-dtype):
+    # None = not asked, else "bf16" / "fp8". Never rewritten; the dtype the draft
+    # will use is `draft_kv_dtype`.
+    kv_cache_dtype: str | None = None
     # The draft's KV dtype: None until `Config` settles it (`resolve_draft_kv_dtype`,
     # once the target's dtype is known); every reader (the draft's pool, its
     # attention, the calibration identity, the compile hash) reads this one.
@@ -2020,11 +2024,32 @@ def _check_fp4_kv(kv_cache_dtype: str, *, is_m3: bool, is_v41: bool) -> None:
         raise ValueError("--kv-cache-dtype nvfp4 is supported by MiniMax-M3 only")
 
 
-def resolve_draft_kv_dtype(target_dtype: str, *, own_pool: bool) -> str:
-    """The KV dtype of a speculative draft's pages: the target's, except bf16 for a
-    draft with a pool of its own (``own_pool``) under an FP4 target, which has no
-    draft layout. A draft in the target's pool has the target's dtype."""
-    return "bf16" if own_pool and target_dtype in FP4_CACHE_DTYPES else target_dtype
+def resolve_draft_kv_dtype(
+    target_dtype: str, *, own_pool: bool, requested: str | None = None
+) -> str:
+    """The KV dtype of a speculative draft's pages.
+
+    A draft with a pool of its own (``own_pool``) takes the dtype it ``requested``
+    (``--spec-decode-kv-cache-dtype``), else the target's, except bf16 under an FP4
+    target (fp4 / nvfp4), which has no draft layout. A draft in the target's pool has the
+    target's dtype and cannot request another.
+    """
+    # argparse restricts the flag; a Python caller can pass anything
+    if requested not in (None, "bf16", "fp8"):
+        raise ValueError(
+            f"speculative kv_cache_dtype must be 'bf16' or 'fp8', got {requested!r}"
+        )
+    if not own_pool:
+        if requested is not None and requested != target_dtype:
+            raise ValueError(
+                f"--spec-decode-kv-cache-dtype {requested} differs from "
+                f"--kv-cache-dtype {target_dtype}, but this draft caches in the "
+                "target's KV pool and cannot have its own dtype"
+            )
+        return target_dtype
+    if requested is not None:
+        return requested
+    return "bf16" if target_dtype in FP4_CACHE_DTYPES else target_dtype
 
 
 def indexer_cp_unsupported_reason(
@@ -2035,7 +2060,6 @@ def indexer_cp_unsupported_reason(
     dcp_size: int,
     enable_tbo: bool,
     plugin_mode: bool = False,
-    nvfp4_caches: bool = False,
 ) -> str | None:
     """Why MiniMax-M3 indexer-only context parallelism cannot run here, or None.
 
@@ -2063,8 +2087,6 @@ def indexer_cp_unsupported_reason(
         # error. ``indexer_cp_enabled`` refuses them at runtime; this clears the
         # flag so nothing downstream (log line, compile hash) disagrees.
         return "plugin mode (the vLLM/SGLang bridges keep the TP indexer path)"
-    if nvfp4_caches:
-        return "the NVFP4 caches are not wired to the CP scorer"
     if dcp_size > 1:
         return (
             "decode_context_parallel_size > 1 (KV-cache DCP owns the context "
@@ -3232,7 +3254,6 @@ class Config:
                 self.decode_context_parallel_size,
                 self.enable_tbo or self.enable_tbo_decode,
                 is_plugin_mode(),
-                "nvfp4" in (self.index_cache_dtype, self.kv_cache_dtype),
             )
             if indexer_cp_off is not None:
                 logger.warning(
@@ -3287,12 +3308,42 @@ class Config:
             from atom.spec_decode.draft_kv import draft_owns_kv_pool
 
             spec = self.speculative_config
+            if (
+                spec.kv_cache_dtype is not None
+                and spec.method == "dspark"
+                and self.hf_config.model_type == "deepseek_v41_text"
+            ):
+                # V4.1's draft reads windows from the target's pool and its attention
+                # takes its dtype from DSparkConfig, never from this flag.
+                raise ValueError(
+                    "--spec-decode-kv-cache-dtype does not apply to a DeepSeek-V4.1 "
+                    "DSpark draft, which caches in the target's KV pool. Its attention "
+                    'dtype is --dspark-config \'{"draft_kv_dtype":"fp8"}\' '
+                    "(default auto: BF16 drafting; fp8 needs an FP8 or FP4 target)"
+                )
             # The one place the draft's pool and dtype are settled: everything
             # downstream (the draft builder, the proposer, the calibration identity)
             # reads `spec.draft_kv_dtype`.
             spec.draft_kv_dtype = resolve_draft_kv_dtype(
-                self.kv_cache_dtype, own_pool=draft_owns_kv_pool(self)
+                self.kv_cache_dtype,
+                own_pool=draft_owns_kv_pool(self),
+                requested=spec.kv_cache_dtype,
             )
+            if spec.draft_kv_dtype != self.kv_cache_dtype and self.kv_transfer_config:
+                # Not verified: no KV connector or offload path (save, restore,
+                # P/D transfer) has run with a draft whose dtype differs from the
+                # target's. The flag has no fp4 / nvfp4 to match an FP4 target with.
+                hint = (
+                    ""
+                    if self.kv_cache_dtype in FP4_CACHE_DTYPES
+                    else ". Pass --spec-decode-kv-cache-dtype "
+                    f"{self.kv_cache_dtype} to match the target"
+                )
+                raise ValueError(
+                    f"draft KV dtype {spec.draft_kv_dtype} differs from the "
+                    f"target's {self.kv_cache_dtype}: not supported with KV "
+                    f"offload or --kv-transfer-config{hint}"
+                )
         if is_m3:
             from atom.models.minimax_m3.config import validate_runtime_config
 

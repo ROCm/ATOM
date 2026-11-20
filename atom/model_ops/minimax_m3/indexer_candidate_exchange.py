@@ -497,6 +497,7 @@ def merge_candidate_keys(
     max_query_len,
     pages_per_block=PAGES_PER_SPARSE_BLOCK,
     block_page_stride=PAGES_PER_SPARSE_BLOCK,
+    emit_sparse_block_table=True,
 ):
     """Select the global top-k from gathered candidates for this rank's head.
 
@@ -507,7 +508,9 @@ def merge_candidate_keys(
 
     ``pages_per_block`` / ``block_page_stride`` shape the emitted sparse block
     table as for the native selector: the page-16 SHUFFLE cache by default, one
-    page-128 page a block (1, 1) for the MXFP4 KV.
+    page-128 page a block (1, 1) for the MXFP4 KV. Without
+    ``emit_sparse_block_table`` (the NVFP4 KV, which reads the logical block
+    ids) only the indices are returned, as from the native selector.
     """
     if keys.dtype != torch.int64 or keys.ndim not in (2, 3):
         raise ValueError(
@@ -537,8 +540,14 @@ def merge_candidate_keys(
         keys.device,
     )
     indices = torch.empty((1, tokens, topk), dtype=torch.int32, device=keys.device)
-    output, _ = _alloc_emit(
-        tokens, 1, topk, block_table, True, keys.device, pages_per_block
+    output, emit = _alloc_emit(
+        tokens,
+        1,
+        topk,
+        block_table,
+        emit_sparse_block_table,
+        keys.device,
+        pages_per_block,
     )
     if tokens:
         block_t = _topk_block_t(topk)
@@ -547,10 +556,10 @@ def merge_candidate_keys(
             indices,
             seq_lens,
             block_table,
-            output[0],
-            output[1],
+            emit[0],
+            emit[1],
             TABLE_STRIDE=block_table.stride(0),
-            SBT_STRIDE=output[0].stride(0),
+            SBT_STRIDE=emit[3],
             QUERY_LEN=max_query_len,
             TOPK=topk,
             INIT_BLOCKS=init_blocks,
@@ -568,10 +577,10 @@ def merge_candidate_keys(
             # the sparse_bt row is only topk*pages_per_block wide. A padded
             # BLOCK_SIZE_T writes past the row into the next allocation.
             BLOCK_SIZE_T=block_t,
-            EMIT=True,
+            EMIT=emit_sparse_block_table,
             num_warps=DECODE_TOPK_NUM_WARPS,
         )
-    return indices, *output
+    return indices if output is None else (indices, *output)
 
 
 # A mailbox word carries its tag above the packed score key. The tag is never
@@ -621,6 +630,7 @@ def _select_exchange_merge(
     SBT_STRIDE: tl.constexpr,
     PAGES_PER_BLOCK: tl.constexpr,
     BLOCK_PAGE_STRIDE: tl.constexpr,
+    EMIT: tl.constexpr,
 ):
     """_local_topk, the exchange and _merge_topk in one launch.
 
@@ -710,7 +720,7 @@ def _select_exchange_merge(
             PAGES_PER_BLOCK=PAGES_PER_BLOCK,
             BLOCK_PAGE_STRIDE=BLOCK_PAGE_STRIDE,
             BLOCK_SIZE_T=BLOCK_SIZE_T,
-            EMIT=True,
+            EMIT=EMIT,
         )
 
 
@@ -727,6 +737,7 @@ def select_exchanged_candidates(
     mailbox,
     pages_per_block=PAGES_PER_SPARSE_BLOCK,
     block_page_stride=PAGES_PER_SPARSE_BLOCK,
+    emit_sparse_block_table=True,
 ):
     """``local_candidate_keys``, the exchange and ``merge_candidate_keys`` in one
     launch, through ``mailbox`` (an ``indexer_cp.CandidateMailbox`` that
@@ -765,8 +776,14 @@ def select_exchanged_candidates(
             "the mailbox exchange needs one head a rank and room for the call"
         )
     indices = torch.empty((1, tokens, topk), dtype=torch.int32, device=scores.device)
-    output, _ = _alloc_emit(
-        tokens, 1, topk, block_table, True, scores.device, pages_per_block
+    output, emit = _alloc_emit(
+        tokens,
+        1,
+        topk,
+        block_table,
+        emit_sparse_block_table,
+        scores.device,
+        pages_per_block,
     )
     if tokens:
         block_k, block_w, block_t = _topk_tiles(topk, local)
@@ -778,8 +795,8 @@ def select_exchanged_candidates(
             mailbox.recv_calls,
             indices,
             block_table,
-            output[0],
-            output[1],
+            emit[0],
+            emit[1],
             QUERY_LEN=max_query_len,
             LOCAL_BLOCKS=local,
             GLOBAL_BLOCKS=global_blocks,
@@ -797,9 +814,10 @@ def select_exchanged_candidates(
             MAX_ROWS=mailbox.max_rows,
             SLOT_KEYS=mailbox.MAX_TOPK,
             TABLE_STRIDE=block_table.stride(0),
-            SBT_STRIDE=output[0].stride(0),
+            SBT_STRIDE=emit[3],
             PAGES_PER_BLOCK=pages_per_block,
             BLOCK_PAGE_STRIDE=block_page_stride,
+            EMIT=emit_sparse_block_table,
             num_warps=DECODE_TOPK_NUM_WARPS,
         )
-    return indices, *output
+    return indices if output is None else (indices, *output)
