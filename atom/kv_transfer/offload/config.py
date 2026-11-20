@@ -748,7 +748,6 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
     are only used for key/shape bookkeeping (we override the byte layout in the
     codec), but we fill them faithfully from hf_config so logging/keys are sane.
     """
-    from aiter import dtypes
     from lmcache.v1.metadata import LMCacheMetadata
 
     from atom.models.utils import get_pp_indices
@@ -782,7 +781,9 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
     worker_id = _strict_integer("LMCache worker id", worker_id)
     if worker_id >= world_size:
         raise ValueError("LMCache worker id must be within the world")
-    kv_dtype = dtypes.d_dtypes[config.kv_cache_dtype]
+    from atom.config import kv_cache_torch_dtype
+
+    kv_dtype = kv_cache_torch_dtype(config.kv_cache_dtype)
     model_name = build_page_namespace(config, cfg, world_size)
 
     # MLA (DeepSeek R1/V3, Kimi) stores a single replicated per-layer latent

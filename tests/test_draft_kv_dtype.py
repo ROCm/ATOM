@@ -73,6 +73,8 @@ def test_an_fp4_target_has_no_fp4_draft_layout_so_an_own_pool_draft_is_bf16():
     assert resolve_draft_kv_dtype("fp4", own_pool=True) == "bf16"
     assert resolve_draft_kv_dtype("fp4", own_pool=True, requested="bf16") == "bf16"
     assert resolve_draft_kv_dtype("fp4", own_pool=True, requested="fp8") == "fp8"
+    assert resolve_draft_kv_dtype("nvfp4", own_pool=True) == "bf16"
+    assert resolve_draft_kv_dtype("nvfp4", own_pool=True, requested="fp8") == "fp8"
 
 
 @pytest.mark.parametrize("own_pool", [True, False])
@@ -170,12 +172,13 @@ def test_a_draft_dtype_beside_the_targets_is_refused_with_offload(monkeypatch):
     with pytest.raises(
         ValueError,
         match="draft KV dtype fp8 differs.*--spec-decode-kv-cache-dtype bf16",
-    ):
+    ) as refused:
         _llama(
             monkeypatch,
             kv_transfer_config=OFFLOAD,
             speculative_config=_dspark_spec(kv_cache_dtype="fp8"),
         )
+    assert "MiniMax" not in str(refused.value)  # the M3 exception is not its remedy
     # the remedy it names works
     spec = _dspark_spec(kv_cache_dtype="bf16")
     _llama(monkeypatch, kv_transfer_config=OFFLOAD, speculative_config=spec)
