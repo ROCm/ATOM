@@ -168,6 +168,12 @@ class AttnRes(nn.Module):
         and the fallback gets it from calling that same out_norm.
         """
         if prefix_sum is None:
+            from atom.model_ops.kimi_k3.attention_residual import (
+                materialize_column_output,
+            )
+
+            add_hidden = materialize_column_output(add_hidden)
+            add_hidden2 = materialize_column_output(add_hidden2)
             prefix_sum, add_hidden, add_hidden2 = add_hidden, add_hidden2, None
         assert prefix_sum is not None
 
@@ -192,6 +198,10 @@ class AttnRes(nn.Module):
 
         # Nothing to mix (residuals off, or no candidates yet). Apply by hand
         # what the kernel would otherwise have folded into its load and store.
+        from atom.model_ops.kimi_k3.attention_residual import materialize_column_output
+
+        add_hidden = materialize_column_output(add_hidden)
+        add_hidden2 = materialize_column_output(add_hidden2)
         if add_hidden is not None:
             prefix_sum = prefix_sum + add_hidden
             if add_hidden2 is not None:
