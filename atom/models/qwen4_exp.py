@@ -9,11 +9,11 @@ from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
-    get_tp_group,
 )
 from torch import nn
 
 from atom.config import Config
+from atom.distributed.sequence_parallel import SequenceParallel as _SequenceParallel
 from atom.model_ops.base_attention import LinearAttention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.linear import (
@@ -51,7 +51,6 @@ from atom.models.utils import (
     maybe_prefix,
 )
 from atom.quant_spec import LayerQuantConfig
-from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 
@@ -656,71 +655,6 @@ class Qwen4ExpLinearAttention(nn.Module):
             return self.out_proj(x, x_scale=x_scale)
         core_attn_out = self.norm(core_attn_out, z)
         return self.out_proj(core_attn_out)
-
-
-def _pad_rows(x: torch.Tensor, missing: int) -> torch.Tensor:
-    """`x` with `missing` zero rows appended on dim 0, for any rank."""
-    if not missing:
-        return x
-    return nn.functional.pad(x, (0, 0) * (x.dim() - 1) + (0, missing))
-
-
-class _SequenceParallel:
-    """Token sharding of the HC residual streams across the TP ranks.
-
-    The four-stream residual and its hyper-connections (grouped norm, two
-    low-rank GEMMs, gated mean) are per-token and replicated under plain TP,
-    so every rank repeats the same work on all tokens. Sharding the tokens
-    splits that work TP ways; the sub-layers still see every token through an
-    all-gather of their 2560-wide input, and their partial sums come back by
-    reduce-scatter, which together move the same bytes as the all-reduce they
-    replace. Rows are padded to a multiple of the TP size; padded rows are
-    zero streams and are dropped on gather.
-    """
-
-    def __init__(self, num_tokens: int, tp_size: int, tp_rank: int) -> None:
-        self.num_tokens = num_tokens
-        self.chunk = -(-num_tokens // tp_size)
-        self.pad = self.chunk * tp_size - num_tokens
-        self.start = tp_rank * self.chunk
-        self.group = get_tp_group()
-
-    def shard(self, x: torch.Tensor) -> torch.Tensor:
-        """Replicated `[T, ...]` -> this rank's rows (a view unless padded).
-
-        Only the local rows are padded, never the whole replicated tensor."""
-        rows = x[self.start : self.start + self.chunk]
-        return _pad_rows(rows, self.chunk - rows.shape[0])
-
-    def gather(self, x: torch.Tensor) -> torch.Tensor:
-        """This rank's rows -> all `[T, ...]` rows."""
-        out = self.group.all_gather(x.contiguous(), use_custom=False, dim=0)
-        return out[: self.num_tokens] if self.pad else out
-
-    def scatter(self, x: torch.Tensor) -> torch.Tensor:
-        """Per-rank partial sums over all `[T, ...]` rows -> summed local rows."""
-        return self.group.reduce_scatter_tensor(
-            _pad_rows(x.contiguous(), self.pad), use_custom=False, dim=0
-        )
-
-    @classmethod
-    def maybe(cls, num_tokens: int) -> "_SequenceParallel | None":
-        """Sharding for a forward of `num_tokens`, or None to stay replicated:
-        no TP, below `ATOM_QWEN4_EXP_SP_MIN_TOKENS`, or under graph capture.
-        The target model adds its own fused-quant floor
-        (`Qwen4ExpModel._sequence_parallel`); the MTP drafter, whose unfused
-        hyper-connections never quantize, uses this gate as is."""
-        min_tokens = envs.ATOM_QWEN4_EXP_SP_MIN_TOKENS
-        if (
-            min_tokens <= 0
-            or num_tokens < min_tokens
-            or torch.cuda.is_current_stream_capturing()
-        ):
-            return None
-        tp_size = get_tensor_model_parallel_world_size()
-        if tp_size == 1:
-            return None
-        return cls(num_tokens, tp_size, get_tensor_model_parallel_rank())
 
 
 class Qwen4ExpDecoderLayer(nn.Module):
