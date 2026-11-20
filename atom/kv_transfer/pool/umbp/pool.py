@@ -163,6 +163,9 @@ class UmbpL1Pool(KVBlockPool):
         self.max_blocks = num_blocks
         self._on_evict = on_evict
         self._on_remap = on_remap
+        # Told (block id, hash, tokens) before UMBP's grant destroys indexed
+        # content, while the block still holds it (`UmbpBlockPool` keeps it).
+        self.on_reclaim: Callable[[int, int, array.array], None] | None = None
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self._hash_to_block_id: dict[int, int] = {}
         self.index_version = 0
@@ -286,6 +289,8 @@ class UmbpL1Pool(KVBlockPool):
         gone = -1
         if self._indexed(block_id):
             gone = block.hash
+            if self.on_reclaim is not None:
+                self.on_reclaim(block_id, gone, block.token_ids)
             del self._hash_to_block_id[gone]
             self.index_version += 1
             self.blocks_evicted += 1
@@ -769,6 +774,13 @@ class UmbpBlockPool(KVBlockPool):
 
     Always the pool the `umbp_pool` connector provides; at a share ratio of 1
     `offset` is 0 and every call goes to the UMBP part.
+
+    `placement` "private": fresh content goes to the private part first, and
+    content it is about to lose moves into the UMBP part. "shared": the UMBP
+    part first, so other ranks see what was just computed, and content UMBP
+    reclaims from this pool moves into the private part. "write_through": the
+    private part first, and every block published there is also copied into a
+    UMBP block; nothing is demoted or kept.
     """
 
     def __init__(
@@ -776,10 +788,16 @@ class UmbpBlockPool(KVBlockPool):
         private: BlockPool,
         umbp: UmbpL1Pool,
         offset: int,
+        placement: str = "private",
     ):
         self.private = private
         self.umbp = umbp
         self.offset = offset
+        self.shared_first = placement == "shared" and offset > 0
+        self.write_through = placement == "write_through" and offset > 0
+        self.blocks_written_through = 0
+        if self.shared_first:
+            umbp.on_reclaim = self._keep
         self.num_blocks = offset + umbp.num_blocks
         self.max_blocks = self.num_blocks
         # Private -> UMBP copies the batch being built has to run first.
@@ -788,6 +806,10 @@ class UmbpBlockPool(KVBlockPool):
         # those whose batch was taken and awaits its postprocess.
         self._unissued: list[tuple[int, int, array.array]] = []
         self._issued: list[tuple[int, int, array.array]] = []
+        # The same for UMBP blocks kept in private blocks (shared first).
+        self._kept_unissued: list[tuple[int, int, array.array]] = []
+        self._kept_issued: list[tuple[int, int, array.array]] = []
+        self.blocks_kept = 0
         self._version = 0
         self.blocks_demoted = 0
         self.demotions_dropped = 0
@@ -802,8 +824,15 @@ class UmbpBlockPool(KVBlockPool):
         included: losing a private copy then is a move, not an eviction."""
         if self.private.lookup(h) != -1 or self.umbp.lookup(h) != -1:
             return True
-        return any(e[1] == h for e in self._unissued) or any(
-            e[1] == h for e in self._issued
+        return any(
+            e[1] == h
+            for moves in (
+                self._unissued,
+                self._issued,
+                self._kept_unissued,
+                self._kept_issued,
+            )
+            for e in moves
         )
 
     @property
@@ -877,6 +906,8 @@ class UmbpBlockPool(KVBlockPool):
         stats.update({f"umbp_{k}": v for k, v in umbp.items()})
         stats["blocks_fetched"] = umbp.get("blocks_fetched", 0)
         stats["blocks_demoted"] = self.blocks_demoted
+        stats["blocks_kept"] = self.blocks_kept
+        stats["blocks_written_through"] = self.blocks_written_through
         stats["demotions_dropped"] = self.demotions_dropped
         return stats
 
@@ -912,6 +943,22 @@ class UmbpBlockPool(KVBlockPool):
             self.umbp.publish(block_id - self.offset, h, token_ids)
         else:
             self.private.publish(block_id, h, token_ids)
+            if self.write_through:
+                self._write_through(block_id, h, token_ids)
+
+    def _write_through(self, block_id: int, h: int, token_ids: array.array) -> None:
+        """Copy private block `block_id` (content `h`) into a UMBP block."""
+        if self.umbp.lookup(h) != -1 or any(e[1] == h for e in self._unissued):
+            return
+        try:
+            slot = self.umbp.pop()
+        except AssertionError:  # every UMBP block is held: skip this one
+            self.demotions_dropped += 1
+            return
+        self.umbp.allocate(slot)
+        self._copies.append((block_id, slot + self.offset))
+        self._unissued.append((slot, h, array.array("i", token_ids)))
+        self.blocks_written_through += 1
 
     def clear_index(self) -> None:
         self.private.clear_index()
@@ -920,6 +967,9 @@ class UmbpBlockPool(KVBlockPool):
 
     # ---------------------------- allocation ------------------------------- #
     def prepare(self, count: int) -> None:
+        if self.shared_first:
+            self.umbp.prepare(count)
+            return
         # Private blocks need no preparing; ask the UMBP part only for what
         # the private part cannot cover.
         short = count - self.private.num_free
@@ -927,6 +977,11 @@ class UmbpBlockPool(KVBlockPool):
             self.umbp.prepare(short)
 
     def pop(self) -> int:
+        if self.shared_first:
+            try:
+                return self.umbp.pop() + self.offset
+            except AssertionError:  # every UMBP block is held
+                pass
         if self.private.num_free:
             return self.private.pop()
         return self.umbp.pop() + self.offset
@@ -935,7 +990,12 @@ class UmbpBlockPool(KVBlockPool):
         if self._is_umbp(block_id):
             return self.umbp.allocate(block_id - self.offset)
         block = self.private.block(block_id)
-        if block.hash != -1 and self.private.lookup(block.hash) == block_id:
+        if (
+            not self.shared_first
+            and not self.write_through
+            and block.hash != -1
+            and self.private.lookup(block.hash) == block_id
+        ):
             self._demote(block_id, block.hash, block.token_ids)
         return self.private.allocate(block_id)
 
@@ -952,31 +1012,58 @@ class UmbpBlockPool(KVBlockPool):
         self._unissued.append((slot, h, array.array("i", token_ids)))
         self.blocks_demoted += 1
 
+    def _keep(self, slot: int, h: int, token_ids: array.array) -> None:
+        """UMBP is reclaiming UMBP block `slot`: keep its content `h` in a
+        private block, for this rank alone (shared first)."""
+        if self.private.lookup(h) != -1 or not self.private.num_free:
+            return
+        block_id = self.private.pop()
+        self.private.allocate(block_id)
+        self._copies.append((slot + self.offset, block_id))
+        self._kept_unissued.append((block_id, h, array.array("i", token_ids)))
+        self.blocks_kept += 1
+
     def take_block_copies(self) -> tuple[tuple[int, int], ...]:
         """The copies the batch being built runs before its forward."""
         copies = tuple(self._copies)
         self._copies.clear()
         self._issued.extend(self._unissued)
         self._unissued.clear()
+        self._kept_issued.extend(self._kept_unissued)
+        self._kept_unissued.clear()
         return copies
 
     def settle(self) -> None:
-        """Publish demoted blocks whose copy has been issued (postprocess)."""
-        if not self._issued:
+        """Publish moved blocks whose copy has been issued (postprocess)."""
+        if not self._issued and not self._kept_issued:
             return
         for slot, h, token_ids in self._issued:
-            if self.lookup(h) == -1:
+            # A demoted block: unless it was computed again meanwhile. A
+            # written-through one: its private copy stays, so only UMBP's
+            # part decides.
+            if self.umbp.lookup(h) == -1 and (
+                self.write_through or self.private.lookup(h) == -1
+            ):
                 self.umbp.publish(slot, h, token_ids)
             self.umbp.free(slot)
         self._issued.clear()
+        for block_id, h, token_ids in self._kept_issued:
+            if self.lookup(h) == -1:
+                self.private.publish(block_id, h, token_ids)
+            self.private.free(block_id)
+        self._kept_issued.clear()
         self._version += 1
-        if self.blocks_demoted // 1024 != self._logged_demoted // 1024:
-            self._logged_demoted = self.blocks_demoted
+        moved = self.blocks_demoted + self.blocks_kept + self.blocks_written_through
+        if moved // 1024 != self._logged_demoted // 1024:
+            self._logged_demoted = moved
             logger.info(
                 "KV pool: %d blocks demoted into the UMBP part, %d dropped "
-                "(UMBP part full of held blocks)",
+                "(UMBP part full of held blocks), %d kept in the private part, "
+                "%d written through",
                 self.blocks_demoted,
                 self.demotions_dropped,
+                self.blocks_kept,
+                self.blocks_written_through,
             )
 
     def claim(self, block_id: int) -> Block:
@@ -1077,11 +1164,13 @@ def make_umbp_block_pool(
         on_evict=evicted,
         on_remap=on_remap,
     )
-    pool = UmbpBlockPool(private, umbp, offset)
+    pool = UmbpBlockPool(private, umbp, offset, settings.placement)
     logger.info(
-        "KV pool: %d private blocks, %d managed by UMBP (share ratio %.2f)",
+        "KV pool: %d private blocks, %d managed by UMBP (share ratio %.2f, "
+        "%s first)",
         offset,
         num_blocks - offset,
         ratio,
+        settings.placement,
     )
     return pool

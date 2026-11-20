@@ -20,6 +20,15 @@ Example::
                  (0, 1]. This process always allocates the pool; UMBP adopts
                  that fraction of its blocks and the rest stays private. 1
                  (default): every block is UMBP's.
+`placement`      below a share ratio of 1, where fresh content goes. "private"
+                 (default): the private part first; content it is about to
+                 lose moves into UMBP's part, where other ranks can load it.
+                 "shared": UMBP's part first, so other ranks can load what was
+                 just computed; content UMBP is about to reclaim from this
+                 pool moves into the private part, for this rank alone.
+                 "write_through": the private part first, and every block
+                 computed there is also copied into UMBP's part, where other
+                 ranks can load it; nothing moves when either part evicts.
 `session_migrate_margin`
                  with session affinity, move a session off a rank running this
                  fraction of the mean more requests than the mean (its history
@@ -42,6 +51,7 @@ class UmbpPoolSettings:
     group: str = ""
     fetch: bool = True
     share_ratio: float = 1.0
+    placement: str = "private"
     session_migrate_margin: float | None = None
 
     @classmethod
@@ -58,6 +68,12 @@ class UmbpPoolSettings:
         ratio = float(extra.get("share_ratio", 1.0))
         if not 0 < ratio <= 1:
             raise ValueError(f"umbp_pool share_ratio={ratio}: a share in (0, 1]")
+        placement = str(extra.get("placement", "private") or "private").lower()
+        if placement not in ("private", "shared", "write_through"):
+            raise ValueError(
+                f"umbp_pool placement={placement!r}: "
+                "'private', 'shared' or 'write_through'"
+            )
         margin = extra.get("session_migrate_margin")
         if margin is not None:
             margin = float(margin)
@@ -72,5 +88,6 @@ class UmbpPoolSettings:
             group=str(extra.get("group", "") or ""),
             fetch=bool(fetch),
             share_ratio=ratio,
+            placement=placement,
             session_migrate_margin=margin,
         )

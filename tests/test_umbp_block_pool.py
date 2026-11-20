@@ -19,7 +19,9 @@ from atom.kv_transfer.pool.umbp.pool import (
 from atom.kv_transfer.pool.umbp.settings import UmbpPoolSettings
 
 
-def make_split(client, name, private_blocks, shared_blocks, evicted=None):
+def make_split(
+    client, name, private_blocks, shared_blocks, evicted=None, placement="private"
+):
     """A pool built the way `make_umbp_block_pool` builds one."""
     original = umbp_pool.make_umbp_l1_pool
 
@@ -30,6 +32,7 @@ def make_split(client, name, private_blocks, shared_blocks, evicted=None):
     settings = UmbpPoolSettings(
         address="unix:///unused",
         share_ratio=shared_blocks / (private_blocks + shared_blocks),
+        placement=placement,
     )
     try:
         return make_umbp_block_pool(
@@ -180,3 +183,55 @@ def test_a_share_ratio_of_one_sends_every_call_to_umbp(l1):
     # Nothing to demote from: allocating never records a copy.
     pool.allocate(pool.pop())
     assert pool.take_block_copies() == ()
+
+
+def test_shared_first_puts_fresh_content_where_other_ranks_see_it(l1):
+    a = make_split(l1, "a", 2, 2, placement="shared")
+    b = make_pool(l1, "b", 4)
+    block_id = fill(a, 11)
+    assert block_id >= 2  # the UMBP part
+    settle(a.umbp)
+    assert b.fetch([11], lambda i: toks(11)) == 1
+
+
+def test_shared_first_keeps_reclaimed_content_privately(l1):
+    evicted = []
+    pool = make_split(l1, "a", 2, 2, evicted, placement="shared")
+    fill(pool, 11)
+    fill(pool, 12)
+    # The UMBP part is full of cached content: the next grant reclaims 11.
+    block_id = pool.pop()
+    assert block_id >= 2
+    pool.allocate(block_id)
+    copies = pool.take_block_copies()
+    assert len(copies) == 1
+    src, dst = copies[0]
+    assert src >= 2 and dst < 2
+    assert evicted == []  # moved, not lost
+    pool.settle()
+    assert pool.lookup(11) == dst
+    assert pool.blocks_kept == 1
+    # Private content never moves back: allocating private blocks demotes nothing.
+    assert pool.blocks_demoted == 0
+
+
+def test_write_through_copies_each_published_private_block_into_umbp(l1):
+    evicted = []
+    a = make_split(l1, "a", 2, 4, evicted, placement="write_through")
+    b = make_pool(l1, "b", 4)
+    block_id = fill(a, 11)
+    assert block_id < 2  # the private part first
+    copies = a.take_block_copies()
+    assert len(copies) == 1 and copies[0][0] == block_id and copies[0][1] >= 2
+    a.settle()
+    assert a.lookup(11) == block_id  # the private copy serves this rank
+    assert a.umbp.lookup(11) == copies[0][1] - 2
+    settle(a.umbp)
+    assert b.fetch([11], lambda i: toks(11)) == 1  # and other ranks load it
+    # Losing the private block moves nothing and reports no eviction.
+    fill(a, 12)
+    a.take_block_copies()
+    a.settle()
+    a.allocate(a.pop())  # private part full: evicts 11 (LRU) without a copy
+    assert a.take_block_copies() == ()
+    assert evicted == [] and a.lookup(11) >= 2
