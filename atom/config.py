@@ -78,7 +78,7 @@ class KVCacheTensor:
     # ``(role, plane)`` in stored byte order. A layer's configuration and
     # cache formats determine its optional planes, so a position alone does
     # not identify a plane.
-    extra_planes: tuple[tuple[str, torch.Tensor], ...] = ()
+    extra_planes: tuple[tuple[str, torch.Tensor], ...] = field(default=(), init=False)
     # ReplaySSM record buffers for linear-attention layers: this layer's slice
     # of the (k, u, g) pools.  None for every other attention type.  Carried
     # here because the layer-id -> linear-attn-index mapping already lives in

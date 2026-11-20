@@ -1865,10 +1865,7 @@ GDN_PAGE_CHECKPOINT_MODEL_TYPES = frozenset(
 def paged_checkpoints_deployable(config) -> bool:
     """False under pipeline parallelism or RapidServe (`_uses_paged_checkpoints`)."""
 
-    return not (
-        int(getattr(config, "pipeline_parallel_size", 1) or 1) > 1
-        or getattr(config, "enable_rapidserve", False)
-    )
+    return not (config.pipeline_parallel_size > 1 or config.enable_rapidserve)
 
 
 def draft_kv_write_slots(

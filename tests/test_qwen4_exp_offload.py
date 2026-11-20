@@ -111,21 +111,6 @@ def test_ple_bytes_join_the_gdn_image():
     assert sum(view.numel() * view.element_size() for view in views) == 80 + 320 + 24
 
 
-def test_ple_planes_are_all_allocated_or_none():
-    builder, cls = _builder()
-    assert cls._ple_tensors(builder) == []
-    conv = builder.model_runner.ple_conv_state = torch.zeros(
-        4, 16, 10, dtype=torch.bfloat16
-    )
-    with pytest.raises(RuntimeError, match=r"\['ple_ngram_state'\]"):
-        cls._ple_tensors(builder)
-    ngram = builder.model_runner.ple_ngram_state = torch.zeros(4, 3, dtype=torch.int64)
-    assert [t.data_ptr() for t in cls._ple_tensors(builder)] == [
-        conv.data_ptr(),
-        ngram.data_ptr(),
-    ]
-
-
 def test_decode_image_steps_the_ple_windows_back_to_the_verify_step():
     """A verify leaves each PLE window `history + num_spec` wide; the image of
     step `s` is the history-wide window starting `s` columns in. Like the GDN

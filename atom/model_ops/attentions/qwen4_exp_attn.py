@@ -328,7 +328,7 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
     def _ple_planes(self) -> list[_PlePlane]:
         """One PLE slot's tensors, in checkpoint order; empty without PLE."""
         hf = self.model_runner.config.hf_config
-        if not getattr(hf, "ple_layer_ids", None):
+        if not hf.ple_layer_ids:
             return []
         state_len = (int(hf.ple_conv_kernel_size) - 1) * int(hf.ngram_size)
         channels = int(hf.hidden_size) * int(hf.hc_count)
@@ -489,17 +489,8 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         ]
 
     def _ple_tensors(self) -> list[torch.Tensor]:
-        """The runner's PLE tensors in `_ple_planes` order; empty before allocation."""
-        states = [getattr(self.model_runner, p.name, None) for p in self._ple_planes]
-        missing = [p.name for p, s in zip(self._ple_planes, states) if s is None]
-        if len(missing) == len(states):
-            return []
-        if missing:
-            raise RuntimeError(
-                f"PLE planes {missing} are not allocated but the others are; "
-                "the state image needs all of them or none"
-            )
-        return states
+        """The runner's allocated PLE tensors in `_ple_planes` order."""
+        return [getattr(self.model_runner, p.name) for p in self._ple_planes]
 
     def _checkpoint_plane_tensors(self) -> list[torch.Tensor]:
         # GDN planes are `(layers, slots, ...)`. PLE is allocated `(slots, ...)`.
@@ -620,16 +611,17 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             v_scale_cache=v_scale,
             compressed_key_scale=extras["index_compressed_scale"],
         )
-        return KVCacheTensor(
+        cache = KVCacheTensor(
             layer_num=module.layer_num,
             k_cache=key,
             v_cache=value,
             k_scale=k_scale,
             v_scale=v_scale,
-            extra_planes=tuple(
-                (role, plane) for role, plane in extras.items() if plane is not None
-            ),
         )
+        cache.extra_planes = tuple(
+            (role, plane) for role, plane in extras.items() if plane is not None
+        )
+        return cache
 
     # ------------------------------------------------------------------ #
     # Per-forward metadata                                                #

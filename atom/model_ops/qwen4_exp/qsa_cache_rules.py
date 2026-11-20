@@ -42,7 +42,7 @@ def normalize_qsa_cache_formats(atom_config) -> tuple[str, str]:
 
     An unset index dtype follows the KV cache's, as `Config` resolves it.
     """
-    kv = getattr(atom_config, "kv_cache_dtype", "bf16") or "bf16"
+    kv = atom_config.kv_cache_dtype or "bf16"
     kv = "bf16" if kv in ("auto", "bfloat16") else kv
     index = getattr(atom_config, "index_cache_dtype", None) or kv
     return kv, "bf16" if index in ("auto", "bfloat16") else index
@@ -88,7 +88,7 @@ def qsa_caches_rope_positions(config) -> bool:
 
 def qsa_page_segments(config) -> dict:
     """What besides the namespace's own fields changes the PAGE segment set."""
-    spec = getattr(config, "speculative_config", None)
+    spec = config.speculative_config
     draft = getattr(spec, "method", None) == "mtp" and qsa_draft_rows(
         qsa_cache_formats(config)
     )
