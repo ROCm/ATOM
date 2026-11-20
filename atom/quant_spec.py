@@ -228,6 +228,9 @@ def should_stream_online_quant(
 
     if not envs.ATOM_ONLINE_QUANT_STREAMING:
         return False
+    # MXFP4 sources convert in the post-load pass, which gathers w2.
+    if source_quant_dtype == d_dtypes.get("fp4x2"):
+        return False
     # can_dequant_weight_online recognizes only torch dtypes; NVFP4 is decoded
     # by its own source decoder, `dequantize_nvfp4`.
     if source_quant_dtype != NVFP4_DTYPE and not can_dequant_weight_online(
@@ -256,6 +259,32 @@ def fuses_mxfp8_shared_into_mxfp4(
         and shared.quant_dtype == d_dtypes.get("fp8")
         and routed.quant_type == QuantType.per_1x32
         and routed.quant_dtype == d_dtypes.get("fp4x2")
+    )
+
+
+def fuses_ptpc_shared_into_online_ptpc(
+    quant_config, routed_prefix: str, shared: LayerQuantConfig, routed: LayerQuantConfig
+) -> bool:
+    """Whether a per-channel FP8 shared expert is fused into routed experts that
+    online quantization makes per-channel FP8 (V4.1 FP4PTPC): FusedMoE stages it
+    while loading and copies it into its slot after the online quant.
+    """
+    # Same-format routed experts fuse without staging; an unquantized source has
+    # no weight-scale params to stage the scales through, and streamed routed
+    # buffers are still on meta when the staging is built.
+    source = (quant_config, routed_prefix, routed.quant_type, routed.quant_dtype)
+    if (
+        shared.quant_type != QuantType.per_Token
+        or routed.quant_type in (QuantType.per_Token, QuantType.No)
+        or not will_online_requant(*source)
+        or should_stream_online_quant(*source)
+    ):
+        return False
+    online = quant_config.get_layer_quant_config(routed_prefix, use_online_quant=True)
+    return (shared.quant_type, shared.quant_dtype, shared.is_dynamic) == (
+        online.quant_type,
+        online.quant_dtype,
+        online.is_dynamic,
     )
 
 

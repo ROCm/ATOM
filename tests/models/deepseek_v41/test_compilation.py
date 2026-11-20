@@ -236,10 +236,19 @@ def test_runtime_guard_with_live_steps_and_aux_hooks(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires ROCm mHC")
 @pytest.mark.parametrize("mode", ["pre", "post_pre"])
-@pytest.mark.parametrize("backend", ["triton", "hip", "hip_quant"])
-def test_mhc_guard_outputs_and_input_alias(mode, backend):
+@pytest.mark.parametrize("backend", ["triton", "hip", "hip_quant", "asm"])
+def test_mhc_guard_outputs_and_input_alias(mode, backend, monkeypatch, request):
     from atom.model_ops.deepseek_v41 import mhc_pre_delayed as mhc
 
+    # Pin the backend: on gfx942 `auto` sends post seams to the ASM seam, so
+    # `triton` must force Triton, and an exported `triton` must not skip `asm`.
+    monkeypatch.setenv(
+        "ATOM_DSV41_MHC_BACKEND", "triton" if backend == "triton" else "auto"
+    )
+    # The env is pinned per case; clear before and after so no result cached
+    # under this case's env reaches a later test in the session.
+    mhc.use_asm_seam.cache_clear()
+    request.addfinalizer(mhc.use_asm_seam.cache_clear)
     device = "cuda"
     rows, hc, hidden = 6, 4, 5120
     residual = torch.randn(1, rows, hc, hidden, device=device, dtype=torch.bfloat16)
@@ -255,7 +264,11 @@ def test_mhc_guard_outputs_and_input_alias(mode, backend):
         "post_mult": 2.0,
         "norm_eps": 1e-6,
     }
-    if backend != "triton":
+    if backend == "asm" and mode == "pre":
+        pytest.skip("seams without a post never take the ASM seam")
+    if backend == "asm" and not mhc.use_asm_seam(hc, hidden):
+        pytest.skip("AITER's ASM seam does not run here")
+    if backend in ("hip", "hip_quant"):
         arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
         if arch not in ("gfx950", "gfx1250"):
             pytest.skip("ATOM HIP Mega-MHC requires gfx950 or gfx1250")
@@ -300,6 +313,37 @@ def test_mhc_guard_outputs_and_input_alias(mode, backend):
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         else:
             assert all(torch.isfinite(out).all() for out in outputs)
+        if backend == "asm":
+            import aiter
+
+            r, post_mix, comb = (
+                kwargs[k].view(rows, *kwargs[k].shape[2:])
+                for k in ("sublayer_output", "post_mix", "combination")
+            )
+            seam = aiter.mhc_fused_post_pre_delayed(
+                residual[0],
+                fn,
+                scale,
+                base,
+                kwargs["rms_eps"],
+                kwargs["hc_eps"],
+                kwargs["hc_eps"],
+                kwargs["post_mult"],
+                kwargs["sinkhorn_iters"],
+                pre[0],
+                r,
+                post_mix,
+                comb,
+            )
+            expected = (
+                seam[0],
+                aiter.rms_norm(seam[3], norm, kwargs["norm_eps"]),
+                seam[4],
+                seam[1].view(rows, hc),
+                seam[2],
+            )
+            for actual, want in zip(outputs, expected):
+                assert torch.equal(actual[0], want)
         torch.library.opcheck(
             torch.ops.aiter.v41_mhc_pre_delayed.default,
             args,

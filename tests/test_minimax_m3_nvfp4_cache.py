@@ -160,9 +160,9 @@ def test_a_config_with_nvfp4_kv_defaults_the_index_to_nvfp4(monkeypatch):
 
 
 @pytest.mark.parametrize("kv,index", [("nvfp4", "nvfp4"), ("nvfp4", None)])
-def test_nvfp4_caches_clear_the_indexer_cp_flag(monkeypatch, caplog, kv, index):
-    """The NVFP4 index scorer takes no CP shard, so the flag is cleared with a warning
-    (the MXFP4 index keeps it)."""
+def test_nvfp4_caches_keep_the_indexer_cp_flag(monkeypatch, caplog, kv, index):
+    """The NVFP4 index scores its CP shard with aiter's NVFP4 scorer, as the MXFP4
+    index does with its own, so the flag stays on."""
     with caplog.at_level("WARNING", logger="atom"):
         cfg = _m3(
             monkeypatch,
@@ -172,8 +172,8 @@ def test_nvfp4_caches_clear_the_indexer_cp_flag(monkeypatch, caplog, kv, index):
             hf={**sparse_hf(), "num_key_value_heads": 4},
             dcp_config=DCPConfig(indexer_dcp_only=True),
         )
-    assert cfg.dcp_config.indexer_dcp_only is False
-    assert "NVFP4 caches are not wired to the CP scorer" in caplog.text
+    assert cfg.dcp_config.indexer_dcp_only is True
+    assert "indexer_dcp_only disabled" not in caplog.text
 
 
 def test_nvfp4_index_is_refused_off_minimax_m3(monkeypatch):

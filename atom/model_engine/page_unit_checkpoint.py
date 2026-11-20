@@ -14,6 +14,7 @@ from time import monotonic
 from atom.kv_transfer.disaggregation.types import StateStoreOperationId
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.sequence import Sequence
+from atom.model_engine.state_cache import KEEP_SETTLED, KEEP_SNAPSHOT
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import page_entry_bytes
 
 _CHANGE_LOG_LIMIT = 4096
@@ -191,6 +192,12 @@ class CheckpointStoreOp:
     unit_ids: tuple[int, ...]
     total_bytes: int
     layout_id: str
+    # A decode boundary's verify step, the scratch slot the backend builds the
+    # image of that step in, and the slot a verify left that step's state in
+    # when it leaves one per step; -1 for a slot that already holds it whole.
+    step: int = -1
+    scratch_slot: int = -1
+    step_slot: int = -1
 
 
 @dataclass(frozen=True)
@@ -1006,9 +1013,11 @@ class PagedStateCheckpointCoordinator:
         enabled: bool,
         offload=None,
         readable_midstep: bool = False,
+        decode_keep: str = KEEP_SETTLED,
     ) -> None:
         self.enabled = enabled
         self.readable_midstep = bool(readable_midstep)
+        self.decode_keep = decode_keep
         # The state pool scratch slots are borrowed from, and how many stores
         # one batch's copy descriptor has room for. Set by
         # `attach_midstep_scratch`; a readable coordinator without them
@@ -1033,10 +1042,12 @@ class PagedStateCheckpointCoordinator:
         # one overwrite the earlier before either was stored. Re-reaching the
         # *same* hash still collapses, which is what the hash in the key is
         # for -- that is one boundary reached twice, not two boundaries.
-        self._pending: dict[tuple[int, int], tuple[Sequence, int]] = {}
+        # `(seq, hash, step, forwards)`: `CheckpointStoreOp.step`, and the
+        # `Sequence.num_forwards` at which the slot holds the boundary.
+        self._pending: dict[tuple[int, int], tuple[Sequence, int, int, int]] = {}
         # Boundaries whose forward is in the batch being built, held back from
         # that batch's drain; see `checkpoint_when_scheduled`.
-        self._staged: dict[tuple[int, int], tuple[Sequence, int]] = {}
+        self._staged: dict[tuple[int, int], tuple[Sequence, int, int, int]] = {}
         self._store_ops: list[CheckpointStoreOp] = []
         # External loads write temporary PAGE images before a runner gathers
         # them into an Active Slot. Owners include a transfer generation, so a
@@ -1165,7 +1176,9 @@ class PagedStateCheckpointCoordinator:
         self.offload.want_touch(h)
         return True
 
-    def checkpoint(self, seq: Sequence, boundary_blocks: int, h: int) -> None:
+    def checkpoint(
+        self, seq: Sequence, boundary_blocks: int, h: int, step: int = -1
+    ) -> None:
         """File a boundary to be stored, keyed by hash rather than by seq.
 
         Every boundary a seq reaches survives, not just its last: an anchor and
@@ -1200,7 +1213,7 @@ class PagedStateCheckpointCoordinator:
         del boundary_blocks
         if self.applies(seq) and seq.state_slot >= 0:
             self._supersede(id(seq))
-            self._pending[(id(seq), h)] = (seq, h)
+            self._pending[(id(seq), h)] = (seq, h, step, seq.num_forwards)
 
     def checkpoint_when_scheduled(self, seq: Sequence, h: int) -> None:
         """File a boundary whose forward is in the batch being built.
@@ -1214,7 +1227,7 @@ class PagedStateCheckpointCoordinator:
         retire, the chunk after the boundary has been issued and written it.
         """
         if self.applies(seq) and seq.state_slot >= 0:
-            self._staged[(id(seq), h)] = (seq, h)
+            self._staged[(id(seq), h)] = (seq, h, -1, seq.num_forwards + 1)
 
     def _supersede(self, seq_id: int) -> None:
         """Drop this seq's earlier pending boundaries; the slot has moved on.
@@ -1255,17 +1268,33 @@ class PagedStateCheckpointCoordinator:
         self,
     ) -> tuple[tuple[CheckpointStoreOp, ...], tuple[CheckpointRestoreOp, ...]]:
         pending, self._pending = self._pending, {}
-        for seq, h in pending.values():
+        for seq, h, step, forwards in pending.values():
             # Safe to read now because `checkpoint` keeps at most one pending
             # boundary per seq: this slot holds the state as of that boundary
-            # and no other. See `_supersede`.
+            # (of its verify `step`, for a decode one) and no other. See
+            # `_supersede`.
             src_slot = seq.state_slot
             if src_slot < 0 or self.store.contains_or_pending(h):
+                continue
+            if seq.num_forwards != forwards:
+                # A forward was scheduled since: the slot has moved past it.
+                self.checkpoints_dropped += 1
+                continue
+            build = step >= 0 and self.decode_keep == KEEP_SNAPSHOT
+            if build and not self._scratch.has_free():
+                self.checkpoints_dropped += 1
                 continue
             op = self.store.begin_store(h, src_slot)
             if op is None:
                 self.checkpoints_dropped += 1
                 continue
+            if build:
+                scratch = self._scratch.pop()
+                self._scratch_issued.append(scratch)
+                # A slot per verify step, or one for all of them (ReplaySSM).
+                slots = seq.state_slots
+                step_slot = slots[step] if len(slots) > 1 else src_slot
+                op = replace(op, step=step, scratch_slot=scratch, step_slot=step_slot)
             self._store_ops.append(op)
             self.checkpoints_kept += 1
         restores = self.store.take_restore_ops()
@@ -1413,7 +1442,7 @@ class PagedStateCheckpointCoordinator:
         # same boundary. All of them lose it together.
         stale = 0
         for filed in (self._pending, self._staged):
-            keys = [key for key, (_, filed_h) in filed.items() if filed_h == h]
+            keys = [key for key, (_, filed_h, *_) in filed.items() if filed_h == h]
             for key in keys:
                 del filed[key]
             stale += len(keys)

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from torch import nn
 
 aiter = pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
 pytestmark = pytest.mark.skipif(
@@ -15,7 +16,9 @@ pytestmark = pytest.mark.skipif(
 
 from aiter import QuantType, dtypes
 
+import atom.model_ops.moe as moe_mod
 from atom.model_ops.moe import FusedMoE
+from atom.quant_spec import LayerQuantConfig
 from atom.quantization.quark.utils import (
     dequant_moe_weight_online,
     dequant_weight_online,
@@ -218,6 +221,8 @@ def test_batched_path_matches_expertwise_fp8_targets(monkeypatch, target_quant_t
 
     layer = SimpleNamespace(
         local_num_experts=experts,
+        intermediate_size_per_partition=intermediate,
+        hidden_size=hidden,
         w13_weight=SimpleNamespace(data=target_w13),
         w2_weight=SimpleNamespace(data=target_w2),
         w13_weight_scale=SimpleNamespace(data=target_w13_scale),
@@ -353,6 +358,8 @@ def test_batched_path_preserves_target_padding(monkeypatch):
     )
     layer = SimpleNamespace(
         local_num_experts=experts,
+        intermediate_size_per_partition=intermediate,
+        hidden_size=hidden,
         w13_weight=SimpleNamespace(data=target_w13),
         w2_weight=SimpleNamespace(data=target_w2),
         w13_weight_scale=SimpleNamespace(data=target_w13_scale),
@@ -440,3 +447,158 @@ def test_batched_path_preserves_target_padding(monkeypatch):
     )
     assert target_w2_bytes[:, hidden:].count_nonzero().item() == 0
     assert target_w2_bytes[:, :hidden, intermediate // 2 :].count_nonzero().item() == 0
+
+
+def test_batched_path_trims_the_source_intermediate_padding(monkeypatch):
+    """An MXFP4 source pads the intermediate rows; each converted half (and
+    w2's columns) is the unpadded rows' quantization."""
+    torch.manual_seed(12)
+    monkeypatch.setenv("ATOM_ONLINE_QUANT_MOE_EXPERT_BATCH_SIZE", "2")
+    experts, inter, padded, hidden = 3, 192, 256, 256
+    old_w13 = torch.randn(
+        experts, 2 * padded, hidden, dtype=torch.bfloat16, device="cuda"
+    )
+    old_w2 = torch.randn(experts, hidden, padded, dtype=torch.bfloat16, device="cuda")
+    w13 = torch.empty(experts, 2 * inter, hidden, dtype=dtypes.fp8, device="cuda")
+    w2 = torch.empty(experts, hidden, inter, dtype=dtypes.fp8, device="cuda")
+    w13_s = torch.zeros(experts, 2 * inter, dtype=torch.float32, device="cuda")
+    w2_s = torch.zeros(experts, hidden, dtype=torch.float32, device="cuda")
+    layer = SimpleNamespace(
+        local_num_experts=experts,
+        intermediate_size_per_partition=inter,
+        hidden_size=hidden,
+        w13_weight=SimpleNamespace(data=w13),
+        w2_weight=SimpleNamespace(data=w2),
+        w13_weight_scale=SimpleNamespace(data=w13_s),
+        w2_weight_scale=SimpleNamespace(data=w2_s),
+    )
+    FusedMoE._online_quant_row_local_batched(
+        layer,
+        old_w13_data=old_w13,
+        old_w2_data=old_w2,
+        old_w13_scale=None,
+        old_w2_scale=None,
+        source_quant_type=QuantType.No,
+        source_quant_dtype=torch.bfloat16,
+        online_quant_type=QuantType.per_Token,
+        online_quant_dtype=dtypes.fp8,
+    )
+
+    def quant(x):
+        q, s = quant_weight_online(
+            x.contiguous(),
+            online_quant_type=QuantType.per_Token,
+            online_quant_dtype=dtypes.fp8,
+        )
+        return q.view(torch.uint8), s.squeeze(-1)
+
+    for e in range(experts):
+        for rows, src in (
+            (slice(0, inter), old_w13[e, :inter]),
+            (slice(inter, 2 * inter), old_w13[e, padded : padded + inter]),
+        ):
+            q, s = quant(src)
+            assert torch.equal(w13[e, rows].view(torch.uint8), q)
+            assert torch.equal(w13_s[e, rows], s)
+        q, s = quant(old_w2[e, :, :inter])
+        assert torch.equal(w2[e].view(torch.uint8), q)
+        assert torch.equal(w2_s[e], s)
+
+
+def test_per_expert_path_trims_the_source_intermediate_padding(monkeypatch):
+    """A per-token target at TP 2 gathers w2, so the conversion runs the
+    per-expert loop: it quantizes an MXFP4 source's unpadded w1/w3 rows and w2
+    columns."""
+    torch.manual_seed(13)
+    experts, inter, padded, hidden = 2, 64, 128, 64
+    source = LayerQuantConfig(quant_type=QuantType.per_1x32, quant_dtype=dtypes.fp4x2)
+    target = LayerQuantConfig(quant_type=QuantType.per_Token, quant_dtype=dtypes.fp8)
+
+    def mxfp4(rows, cols):
+        bytes_ = torch.randint(0, 256, (experts, rows, cols // 2), dtype=torch.uint8)
+        scale = torch.randint(120, 131, (experts, rows, cols // 32), dtype=torch.uint8)
+        return bytes_.view(dtypes.fp4x2), scale.view(dtypes.fp8_e8m0)
+
+    w13, w13_s = mxfp4(2 * padded, hidden)
+    w2, w2_s = mxfp4(hidden, padded)
+
+    class Target:
+        def create_weights(self, layer, **_kwargs):
+            pass  # the stubbed loaders below take the quantized tensors
+
+    monkeypatch.setattr(moe_mod, "Fp8MoEMethod", lambda *_a, **_k: Target())
+    quantized = []
+    monkeypatch.setattr(
+        moe_mod,
+        "quant_weight_online",
+        lambda w, **_k: quantized.append(w.clone()) or (w, None),
+    )
+    monkeypatch.setattr(
+        moe_mod, "get_tp_group", lambda: SimpleNamespace(all_gather=lambda x, dim: x)
+    )
+    layer = SimpleNamespace(
+        online_quant=True,
+        quant_config=SimpleNamespace(get_layer_quant_config=lambda *_a, **_k: target),
+        layer_name="model.layers.0.ffn.experts",
+        layer_quant_config=source,
+        source_is_nvfp4=False,
+        params_dtype=dtypes.fp4x2,
+        quant_method=SimpleNamespace(
+            hidden_pad=0,
+            intermediate_pad=padded - inter,
+            need_normalize_e4m3fn_to_e4m3fnuz=False,
+        ),
+        w13_bias=None,
+        has_bias=False,
+        moe_config=SimpleNamespace(),
+        moe_quant_params={"params_dtype": dtypes.fp4x2},
+        _stream_online_quant=False,
+        local_num_experts=experts,
+        intermediate_size_per_partition=inter,
+        hidden_size=hidden,
+        use_ep=False,
+        tp_size=2,
+        tp_rank=0,
+        w13_weight=nn.Parameter(w13, requires_grad=False),
+        w2_weight=nn.Parameter(w2, requires_grad=False),
+        w13_weight_scale=nn.Parameter(w13_s, requires_grad=False),
+        w2_weight_scale=nn.Parameter(w2_s, requires_grad=False),
+        _copy_quant_storage=FusedMoE._copy_quant_storage,
+        _load_model_weight_or_group_weight_scale=lambda **_k: None,
+        _load_quant_weight_scale=lambda **_k: None,
+    )
+    FusedMoE._online_quant(layer)
+
+    assert len(quantized) == 3 * experts
+    for e in range(experts):
+        full13 = dequant_weight_online(
+            w13[e], w13_s[e], source.quant_type, source.quant_dtype
+        )
+        full2 = dequant_weight_online(
+            w2[e], w2_s[e], source.quant_type, source.quant_dtype
+        )
+        w1, w3, w2_q = quantized[3 * e : 3 * e + 3]
+        assert torch.equal(w1, full13[:inter])
+        assert torch.equal(w3, full13[padded : padded + inter])
+        assert torch.equal(w2_q, full2[:, :inter])
+
+
+@pytest.mark.parametrize(("hidden_pad", "bias"), [(64, None), (0, torch.zeros(1))])
+def test_mxfp4_source_with_hidden_padding_or_bias_is_refused(hidden_pad, bias):
+    """The converted experts carry neither an MXFP4 source's hidden padding nor
+    its expert bias, which their consumers keep."""
+    target = LayerQuantConfig(quant_type=QuantType.per_Token, quant_dtype=dtypes.fp8)
+    layer = SimpleNamespace(
+        online_quant=True,
+        quant_config=SimpleNamespace(get_layer_quant_config=lambda *_a, **_k: target),
+        layer_name="model.layers.0.ffn.experts",
+        layer_quant_config=LayerQuantConfig(
+            quant_type=QuantType.per_1x32, quant_dtype=dtypes.fp4x2
+        ),
+        source_is_nvfp4=False,
+        params_dtype=dtypes.fp4x2,
+        quant_method=SimpleNamespace(hidden_pad=hidden_pad),
+        w13_bias=bias,
+    )
+    with pytest.raises(NotImplementedError, match="hidden padding or expert bias"):
+        FusedMoE._online_quant(layer)
