@@ -18,7 +18,7 @@ use super::{
 };
 use crate::core::Worker;
 
-const NO_SESSION: &str = "no_session";
+pub(crate) const NO_SESSION: &str = "no_session";
 const LEAST_SESSIONS: &str = "least_sessions";
 
 /// `dp_sticky`'s placement: the healthy worker with the fewest live sessions,
@@ -67,6 +67,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        config::SessionAffinityConfig,
         core::{BasicWorkerBuilder, DPAwareWorkerBuilder, WorkerType},
         policies::SessionAffinityPolicy,
     };
@@ -102,7 +103,9 @@ mod tests {
     fn expire(policy: &SessionAffinityPolicy, session: &str) {
         policy.set_last_access(
             session,
-            Instant::now() - Duration::from_secs(120 * 60) - Duration::from_secs(1),
+            Instant::now()
+                - Duration::from_secs(SessionAffinityConfig::default().ttl_secs)
+                - Duration::from_secs(1),
         );
     }
 

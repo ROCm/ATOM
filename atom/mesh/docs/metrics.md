@@ -66,6 +66,8 @@ skipped after a failed prefill adds none.
 | `mesh_route_branch_total` | Counter, decisions | `pool`, `policy`, `branch` (see [Branches](#branches)) | Every selection, including one in a pool without candidates. |
 | `mesh_route_prefix_match_ratio` | Histogram, ratio 0 to 1 | `pool`, `policy` | `cache_aware` branches `affinity` and `relocate`. |
 | `mesh_route_selected_worker_active_requests` | Histogram, active requests | `pool`, `policy`, `branch` | Every selection that picks a worker, before the router adds the request (see [below](#selected-workers-active-requests)). |
+| `mesh_session_affinity_entries` | Gauge, bindings | `scope` | A session table is swept or evicts (see [session affinity](#session-affinity)). |
+| `mesh_session_affinity_evicted_total` | Counter, bindings | `scope` | A new session finds its table over `--session-affinity-max-entries`. |
 | `mesh_session_worker_change_total` | Counter, requests | `pool`, `reason`: `rebind`, `expired`, `rank_mapping` | A `dp_sticky` session request is sent to a different worker (URL and DP rank) than the session's previous request (see [below](#worker-changes)). |
 | `mesh_selected_dp_rank_total` | Counter, dispatches | `pool`, `worker` (base URL), `dp_rank` (rank or `none`) | HTTP routers send a request, after DP rank mapping (see [below](#dp-ranks)). |
 | `mesh_route_cache_tokens_total` | Counter, tokens | `pool` (`regular` or `prefill`), `kind`: `prompt`, `cached` | HTTP routers; the response reported cached tokens. Any policy (see [below](#router-estimate-and-engine-reported-cached-tokens)). |
@@ -109,7 +111,7 @@ Defaults are the CLI defaults.
 | | `fallback_least_load` | No ring, or the owner is not healthy: the least-loaded worker. | |
 | | `no_tokens` | The request has no tokens: no worker. | |
 | `dp_sticky` | `hit`, `new`, `rebind`, `expired` | See [session affinity](#session-affinity). | |
-| | `no_session` | No `x-session-id` header: the least-loaded worker. | |
+| | `no_session` | No session key: the least-loaded worker. | |
 
 ## Reading the values
 
@@ -140,12 +142,17 @@ workers, and on `affinity` that cache hits queue behind other requests.
 
 ### Session affinity
 
-`dp_sticky` pins a session, identified by a non-empty `x-session-id` header,
-to a worker (URL and DP rank) in router memory:
+`dp_sticky` pins a session to a worker (URL and DP rank) in router memory. The
+session key is the first non-empty header of `--session-id-headers`
+(`x-dynamo-session-id`, `x-session-id`, `x-smg-routing-key`,
+`x-session-affinity`); an empty list, or `grpc://` workers, key on
+`x-session-id` only, without parent groups. A request without a key goes to
+the least-loaded worker (`no_session`). Its branches:
 
 - `hit`: the pinned worker is healthy and its circuit breaker admits requests;
-- `new`: first request of the session; it goes to the worker with the fewest
-  live sessions, ties broken by load;
+- `new`: first request of the session; it goes to the worker holding the
+  fewest bindings, ties broken by load. An idle binding still counts until the
+  next sweep drops it;
 - `rebind`: the pinned worker is unhealthy, removed or circuit-open, or the
   session's last request to it failed with a server error or got no response
   (a retry included), so the session is placed again like a new one, away
@@ -154,12 +161,19 @@ to a worker (URL and DP rank) in router memory:
   HTTP and PD routing a body that breaks after a successful status is not a
   failure; ext_proc also reports an upstream reset or timeout after the
   response started;
-- `expired`: the session was idle for more than 120 minutes and is reassigned.
+- `expired`: the session was idle for more than `--session-affinity-ttl-secs`
+  (120 minutes) and is placed again.
 
 With N turns per session and stable workers, the hit rate approaches
 (N - 1) / N. `rebind` points at worker churn or failing requests; a router
-restart makes every session `new` again. Each pool that runs `dp_sticky`
-records its own branches.
+restart makes every session `new` again. Each pool that runs `dp_sticky` keeps
+its own table. Idle bindings are dropped every 30 seconds, so a session that
+returns after that counts as `new`, not `expired`, and its move to another
+worker is not counted in `mesh_session_worker_change_total`. Past
+`--session-affinity-max-entries` bindings (1,000,000), a new session drops
+idle bindings, then the least recently used tenth of the table; a steadily
+rising `mesh_session_affinity_evicted_total` means the key is not stable per
+session.
 
 ### Worker changes
 
@@ -232,7 +246,7 @@ sum by (pool, policy, branch) (rate(mesh_route_branch_total[5m]))
 ```
 
 Session affinity hit rate, over the `dp_sticky` decisions of requests with a
-session ID:
+session key:
 
 ```promql
 sum by (pool) (rate(mesh_route_branch_total{policy="dp_sticky",branch="hit"}[5m]))
