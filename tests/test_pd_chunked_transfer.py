@@ -1083,12 +1083,13 @@ def test_duplicate_cancelled_request_waits_for_original_rdma():
     )
 
 
+@pytest.mark.parametrize("evicted", [False, True])
 @pytest.mark.parametrize("wrote", [False, True])
-def test_a_duplicate_after_retirement_reports_whether_its_reader_wrote(
-    monkeypatch, wrote
+def test_a_duplicate_after_retirement_is_held_unless_p_knows_no_reader_wrote(
+    monkeypatch, wrote, evicted
 ):
     # The reader's failure report is lost and a duplicate of its request comes
-    # after the source retired: it must keep D's hold if that reader wrote.
+    # after the source retired, or after its retirement record was evicted.
     monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
     p, state, request, _, _ = producer()
     if wrote:
@@ -1103,14 +1104,46 @@ def test_a_duplicate_after_retirement_reports_whether_its_reader_wrote(
     )
     assert p.get_finished().connector_completions  # the source retired
     assert p._retired_chunked_transfers == {"xfer-a": wrote}
+    if evicted:
+        monkeypatch.setattr(mc, "CHUNKED_RETIRED_TRANSFER_LIMIT", 1)
+        monkeypatch.setattr(mc, "PREFILL_LOOKUP_TIMEOUT", 0)
+        p._retire_chunked_transfer("xfer-b", started_writes=False)
+        assert "xfer-a" not in p._retired_chunked_transfers
     d = consumer(1)
     p._notify_transfer_result.side_effect = lambda data, **report: (
         d._record_write_done(data["request_id"], 0, 0, data["write_nonce"], **report)
     )
     dispatch(p, request.copy())
     assert p._notify_transfer_result.call_count == 2
-    assert bool(d._held_failures) is wrote
-    assert d.failed_recving == (set() if wrote else {21})
+    held = wrote or evicted
+    assert bool(d._held_failures) is held
+    assert d.failed_recving == (set() if held else {21})
+
+
+@pytest.mark.parametrize("registered", [False, True])
+def test_a_cancel_before_admission_is_unwritten_only_if_registered_here(registered):
+    # Unregistered, it may be a source that retired and whose record was evicted.
+    p, _, request, _, _ = producer()
+    meta = ConnectorMetadata()
+    if registered:
+        meta.chunked_admissions[9] = "xfer-z"
+    meta.add_new_req_to_save(
+        9,
+        [3],
+        {
+            "transfer_id": "xfer-z",
+            "chunked_transfer": True,
+            "num_prompt_tokens": 4,
+            "prefill_aborted": True,
+        },
+    )
+    p.start_load_kv(meta)
+    assert p._retired_chunked_transfers["xfer-z"] is not registered
+    late = dict(request, transfer_id="xfer-z")
+    dispatch(p, late)
+    p._notify_transfer_result.assert_called_once_with(
+        late, success=False, started_writes=not registered
+    )
 
 
 @pytest.mark.parametrize("aborted", [False, True])
@@ -1199,10 +1232,11 @@ def test_idle_write_listener_expires_unadmitted_chunk_request(monkeypatch):
         p._send_executor = pool
         with pytest.raises(StopListener):
             p._write_listener()
+    # P cannot tell it from a source whose record was evicted: counts as written.
     p._notify_transfer_result.assert_called_once_with(
-        request, success=False, started_writes=False
+        request, success=False, started_writes=True
     )
-    assert request["transfer_id"] in p._retired_chunked_transfers
+    assert p._retired_chunked_transfers[request["transfer_id"]] is True
     assert not p._pending_chunked_requests
 
 

@@ -1264,7 +1264,7 @@ class MooncakeConnector(KVConnectorBase):
         self._completed_prefills_cv = threading.Condition(self._completed_prefills_lock)
         self._chunked_prefills: dict[ReqId, ChunkedPrefill] = {}
         self._chunked_local_ids: dict[ReqId, ReqId] = {}
-        # Retired transfer -> whether one of its readers had posted a write.
+        # Retired transfer -> whether a reader may have posted a write.
         self._retired_chunked_transfers: OrderedDict[ReqId, bool] = OrderedDict()
         self._pending_chunked_requests: list[tuple[dict, float]] = []
         self._received_handoffs: dict[ReqId, PrefillHandoff] = {}
@@ -1891,10 +1891,14 @@ class MooncakeConnector(KVConnectorBase):
                             continue  # A rejected ID reuse cannot cancel its owner.
                         if state is None and meta.prefill_aborted:
                             # Cancellation before admission owns no source blocks.
-                            self._retire_chunked_transfer(
-                                meta.transfer_id, started_writes=False
+                            # Registered here, it provably never had one; else unknown.
+                            registered = (
+                                self._chunked_local_ids.pop(req_id, None)
+                                == meta.transfer_id
                             )
-                            self._chunked_local_ids.pop(req_id, None)
+                            self._retire_chunked_transfer(
+                                meta.transfer_id, started_writes=not registered
+                            )
                             continue
                         if state is None:
                             state = ChunkedPrefill(
@@ -2860,7 +2864,8 @@ class MooncakeConnector(KVConnectorBase):
             for data, queued_at in self._pending_chunked_requests:
                 wrote = self._retired_chunked_transfers.get(data["transfer_id"])
                 if wrote is not None:
-                    # A late duplicate of a reader that wrote keeps D's hold.
+                    # Any request for a retired source, e.g. another D rank's
+                    # first, reports whether any reader of the source wrote.
                     failures.append((data, wrote))
                     continue
                 state = self._chunked_prefills.get(data["transfer_id"])
@@ -2874,9 +2879,11 @@ class MooncakeConnector(KVConnectorBase):
                         # Only an orphan with no logical P request expires.
                         # Retire it before D can free the advertised allocation.
                         self._retire_chunked_transfer(
-                            data["transfer_id"], started_writes=False
+                            data["transfer_id"], started_writes=True
                         )
-                        failures.append((data, False))
+                        # A source whose retirement record was evicted looks
+                        # the same, so an unknown history counts as written.
+                        failures.append((data, True))
                     continue
                 try:
                     acquired = self._acquire_chunked_reader(state, data)
@@ -3013,7 +3020,7 @@ class MooncakeConnector(KVConnectorBase):
                 request_data, success=False, started_writes=started_writes
             )
         finally:
-            # Kept past retirement: a late duplicate reports it (see the dispatcher).
+            # Kept past retirement for every later request to this source.
             state.release(started_writes=started_writes)
 
     def _consumer_region_map(
