@@ -698,7 +698,9 @@ def _nvfp4_moe_layer(
         layer_quant_config=source,
         source_is_nvfp4=True,
         params_dtype=NVFP4_DTYPE,
-        quant_method=SimpleNamespace(intermediate_pad=0),
+        quant_method=SimpleNamespace(
+            intermediate_pad=0, need_normalize_e4m3fn_to_e4m3fnuz=False
+        ),
         moe_config=SimpleNamespace(),
         moe_quant_params={"params_dtype": NVFP4_DTYPE},
         _stream_online_quant=False,

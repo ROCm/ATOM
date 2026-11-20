@@ -455,9 +455,9 @@ class DSparkProposer(Drafter):
         )
         from atom.spec_decode.draft_kv import draft_kv_builder
 
-        # Whether this draft needs a pool of its own is answered by the backend
-        # its own config resolves to -- a draft whose rows are the target's
-        # latent binds into the target's pool and answers None. ModelRunner
+        # Whether this draft needs a pool of its own is decided by its attention
+        # family (`selector.DRAFT_POOL_FAMILIES`) -- a draft whose rows are the
+        # target's latent binds into the target's pool and answers None. ModelRunner
         # keys its draft-pool allocation and per-module binding off the
         # presence of this attribute, so None simply never sets it.
         builder = draft_kv_builder(self.runner, draft_hf, model)

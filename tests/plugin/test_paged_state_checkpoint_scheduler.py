@@ -391,10 +391,10 @@ def _native_keeps(n_answer, *, abort_after=None):
     assert isinstance(coord, PagedStateCheckpointCoordinator)
     keeps = []
 
-    def checkpoint(seq, boundary_blocks, h):
+    def checkpoint(seq, boundary_blocks, h, step=-1):
         keeps.append(int(boundary_blocks) * BLOCK)
         return PagedStateCheckpointCoordinator.checkpoint(
-            coord, seq, boundary_blocks, h
+            coord, seq, boundary_blocks, h, step
         )
 
     coord.checkpoint = checkpoint
@@ -408,7 +408,9 @@ def _native_keeps(n_answer, *, abort_after=None):
         seq.append_token(100 + j)
         bm.may_append(seq)
         last = j == n_answer - 1
-        bm.hash_decode_blocks(seq, len(seq), next_forward_tokens=0 if last else 1)
+        bm.hash_decode_blocks(
+            seq, len(seq), next_forward_tokens=0 if last else 1, snapshot_step=0
+        )
         seq.num_cached_tokens = len(seq) - 1
         bm.take_state_maintenance_ops()
         bm.complete_previous_state_batch()
@@ -452,21 +454,18 @@ def _plugin_keeps_512(s, n_answer, *, abort_after=None, max_steps=3000):
         (2000, 510, False, False),
         (2000, 511, True, True),
         (2000, 512, True, True),
-        # Engine scheduling, not placement: max_tokens ends one token short of
-        # the forward that reaches 512. Native's deferred output forwards the
-        # last token once more and keeps 512 there; vLLM schedules no forward
-        # past max_tokens, so that state is never computed for the plugin.
-        (511, None, True, False),
+        # max_tokens ends one token short of the forward that reaches 512: the
+        # step that would keep it is the last one, which keeps nothing.
+        (511, None, False, False),
     ],
 )
 def test_request_end_around_the_decode_keep_matches_native(
     adapter, tmp_path, n_answer, abort_after, native, plugin
 ):
-    """Native keeps a decode checkpoint on a request's last step as well: a PAGE
-    (copy) checkpoint's successor_room is 0, and the scheduler passes
-    next_forward_tokens=0 there. An aborted seq skips the postprocess that would
-    hash and keep. The plugin publishes a pending decode keep exactly when its
-    boundary hash exists, which gives the same decisions."""
+    """Native keeps no decode checkpoint on a request's last step (the scheduler
+    passes next_forward_tokens=0 there), and an aborted seq skips the
+    postprocess that would hash and keep. The plugin publishes a pending decode
+    keep exactly when its boundary hash exists, which gives the same decisions."""
     assert (512 in _native_keeps(n_answer, abort_after=abort_after)) is native
     s = _scheduler(adapter, tmp_path)
     assert _plugin_keeps_512(s, n_answer, abort_after=abort_after) is plugin
@@ -927,10 +926,10 @@ def _native_mtp_keeps(prompt, gens):
     coord = bm.paged_state_checkpoints
     keeps = []
 
-    def checkpoint(seq, boundary_blocks, h):
+    def checkpoint(seq, boundary_blocks, h, step=-1):
         keeps.append(int(boundary_blocks) * BLOCK)
         return PagedStateCheckpointCoordinator.checkpoint(
-            coord, seq, boundary_blocks, h
+            coord, seq, boundary_blocks, h, step
         )
 
     coord.checkpoint = checkpoint
@@ -945,7 +944,9 @@ def _native_mtp_keeps(prompt, gens):
             tok += 1
             seq.append_token(tok)
             bm.may_append(seq)
-        bm.hash_decode_blocks(seq, len(seq) - 1, next_forward_tokens=1)
+        bm.hash_decode_blocks(
+            seq, len(seq) - 1, next_forward_tokens=1, snapshot_step=gen - 1
+        )
         bm.take_state_maintenance_ops()
         bm.complete_previous_state_batch()
     bm.deallocate(seq)

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import logging
+from collections import OrderedDict
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -106,9 +107,8 @@ def _ensure_flydsl_policy(state: torch.Tensor):
         return policy
     from atom.model_ops.fla_ops.gdn_flydsl import GDNFlyDSLPolicy, select_policy
 
-    # ReplaySSM addresses the same contiguous checkpoint Triton prefill
-    # writes. FlyDSL's VK view is a different layout; Native keeps both
-    # stages off once the ring is on.
+    # Under ReplaySSM the ring addresses the raw contiguous checkpoint, so
+    # `select_policy` keeps decode (and its VK view) off; prefill runs only on gfx942.
     policy = select_policy(
         allowed=True,
         replayssm=replayssm_enabled(),
@@ -123,11 +123,14 @@ def _ensure_flydsl_policy(state: torch.Tensor):
     return policy
 
 
-# (lengths, cu_seqlens data_ptr, tensor version) -> schedule.
+# (lengths, cu_seqlens data_ptr, tensor version) -> schedule, oldest first.
 # AITER binds the schedule to that exact offset tensor. Reuse only when the
 # same buffer is unchanged (CUDA-graph replay). A new eager batch rebuilds
 # from the host length list and does not read query_start_loc back to the host.
-_PREFILL_SCHEDULES: dict[tuple, object] = {}
+# Every schedule pins its offset tensor and a fresh eager batch never hits, so
+# keep only the most recent few, like FLA's `tensor_cache`.
+_PREFILL_SCHEDULES: OrderedDict[tuple, object] = OrderedDict()
+_PREFILL_SCHEDULES_MAX = 8
 
 
 def _host_prefill_lengths(forward_batch: Any, num_seqs: int) -> tuple[int, ...] | None:
@@ -181,6 +184,7 @@ def _flydsl_prefill_metadata(
     key = (lengths, int(query_start_loc.data_ptr()), int(query_start_loc._version))
     cached = _PREFILL_SCHEDULES.get(key)
     if cached is not None:
+        _PREFILL_SCHEDULES.move_to_end(key)
         return cached
     if capturing:
         # AITER refuses to build a schedule on the capturing stream. The eager
@@ -191,6 +195,8 @@ def _flydsl_prefill_metadata(
     metadata = build_prefill_metadata(lengths, query_start_loc)
     if metadata is not None:
         _PREFILL_SCHEDULES[key] = metadata
+        while len(_PREFILL_SCHEDULES) > _PREFILL_SCHEDULES_MAX:
+            _PREFILL_SCHEDULES.popitem(last=False)
     return metadata
 
 
@@ -530,7 +536,7 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
     ) -> None:
         """Verify the draft window through Native ReplaySSM.
 
-        The live checkpoint is the contiguous pool Triton prefill writes.
+        The live checkpoint is the contiguous pool the prefill writes.
         The kernel appends records and does not publish a per-step SSM
         snapshot; ``update_mamba_state_after_mtp_verify`` advances the cursor
         once the accept length is known, scatters the conv window, and
@@ -574,7 +580,9 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
                     "int32 view during CUDA graph capture."
                 )
             slot_idx = slot_idx.to(dtype=torch.int32).contiguous()
-        block_output = replayssm_gated_delta_rule(
+        # Every verify row is a spec row, so the kernel writes the layer's
+        # output in place, as Native does for a pure spec-decode batch.
+        replayssm_gated_delta_rule(
             q=query,
             k=key,
             v=value,
@@ -591,9 +599,7 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
             use_qk_l2norm_in_kernel=True,
             is_kda=False,
             route=envs.ATOM_REPLAYSSM_ROUTE,
-        )
-        output_blocks.copy_(
-            block_output.view(bs, draft_token_num, *output_blocks.shape[2:])
+            o=output_blocks.view(bs * draft_token_num, *output_blocks.shape[2:]),
         )
 
     def _spec_ssm_slot_table(
@@ -727,12 +733,11 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
         conv_phys = self._spec_conv_window_phys(
             layer_cache.intermediate_conv_window[0], draft_token_num
         )
-        # One wide-window spec call. ATOM writes
-        # [history2..historyM, draft1..draftN] -- exactly the physical row
-        # behind SGLang's dedup view, so every per-step window materialises
-        # for free and the live conv state is only read, never written.
-        state_len = conv_states.shape[-1]
-        conv_phys[:bs, :, :state_len] = conv_states[cache_indices]
+        # One wide-window spec call. It reads the history from the live conv
+        # state and writes [history2..historyM, draft1..draftN] -- exactly the
+        # physical row behind SGLang's dedup view, so every per-step window
+        # materialises for free and the live conv state is only read, never
+        # written.
         query_all, key_all, value_all = causal_conv1d_update(
             mixed_blocks.reshape(num_tokens, -1),
             conv_phys,
@@ -742,6 +747,8 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
             self.conv1d.bias,
             self.activation,
             conv_state_indices=self._spec_conv_slot_table(bs, mixed_blocks.device),
+            conv_state_indices_in=cache_indices.view(bs, 1),
+            conv_state_in=conv_states,
             num_accepted_tokens=self._spec_conv_accepted(bs, mixed_blocks.device),
             query_start_loc=self._spec_cu_seqlens(
                 bs, draft_token_num, mixed_blocks.device
@@ -830,7 +837,7 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
     def _spec_conv_accepted(self, bs: int, device: torch.device) -> torch.Tensor:
         """`num_accepted_tokens` of all ones: the conv kernel reads its initial
         history from column `num_accepted_tokens - 1`, and verify always starts
-        from the committed live state seeded at column 0."""
+        from the committed live state at column 0."""
         cache = getattr(self, "_spec_conv_accepted_cache", None)
         if cache is None:
             cache = {}
@@ -1102,8 +1109,8 @@ class SGLangGDNForwardContext:
             )
             # GatedDeltaNet's prefill reads these once-per-step fields (#2534)
             # instead of casting per layer. The native builder fills them; a
-            # None here makes the non-FlyDSL prefill (e.g. ReplaySSM under MTP)
-            # and the state write-back fail. Read and write slots are the same.
+            # None here makes the Triton prefill and the state write-back
+            # fail. Read and write slots are the same.
             idx_i64 = idx.long()
             no_initial_state = None if has_initial_state is None else ~has_initial_state
             return GDNAttentionMetadata(
