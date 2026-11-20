@@ -3488,7 +3488,29 @@ class ModelRunner:
             bonus_logits_indices = spec_decode_metadata.bonus_logits_indices
             target_logits_indices = spec_decode_metadata.target_logits_indices
 
-            if constraints is None:
+            # ATOM_SPEC_VERIFY_ARGMAX_ONCE: an all-greedy verify needs each
+            # row's argmax and nothing else of the logits, so it is taken once
+            # over the step's rows where they lie; the bonus and the target
+            # picks are rows of that result. The path below copies the rows
+            # into two tensors first and reduces each.
+            ids_only_ok = getattr(self.rejection_sampler, "ids_only_ok", None)
+            argmax_once = (
+                envs.ATOM_SPEC_VERIFY_ARGMAX_ONCE
+                and all_greedy
+                and constraints is None
+                and ids_only_ok is not None
+                and ids_only_ok()
+            )
+            if argmax_once:
+                row_ids = self.sampler(
+                    logits=logits if logits.is_contiguous() else logits.contiguous(),
+                    temperatures=temperatures,
+                    top_ks=top_ks,
+                    top_ps=top_ps,
+                    all_greedy=True,
+                )
+                bonus_logits = target_logits = None
+            elif constraints is None:
                 bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
                 target_logits = torch.index_select(logits, 0, target_logits_indices)
             else:
@@ -3510,20 +3532,28 @@ class ModelRunner:
                 )
                 if target_token_ids.numel() and get_tp_group().world_size > 1:
                     target_token_ids = get_tp_group().broadcast(target_token_ids, src=0)
-            bonus_token_ids = self.sampler(
-                logits=bonus_logits,
-                temperatures=temperatures,
-                top_ks=top_ks,
-                top_ps=top_ps,
-                all_greedy=all_greedy,
-                needs_independent_noise=needs_independent_noise or not all_greedy,
-            )
+            if argmax_once:
+                # The accept kernel reads its rows of `row_ids` itself.
+                bonus_token_ids = None
+                verify_ids = {"row_ids": row_ids}
+            else:
+                # Nothing more than the call below always made.
+                verify_ids = {}
+                bonus_token_ids = self.sampler(
+                    logits=bonus_logits,
+                    temperatures=temperatures,
+                    top_ks=top_ks,
+                    top_ps=top_ps,
+                    all_greedy=all_greedy,
+                    needs_independent_noise=needs_independent_noise or not all_greedy,
+                )
             sampled_tokens, verdict = self.rejection_sampler.forward(
                 spec_decode_metadata,
                 target_logits,
                 bonus_token_ids,
                 target_token_ids=target_token_ids,
                 ratio=ratio,
+                **verify_ids,
             )
             # PCP ranks decode redundantly but not bit-identically, so their
             # accept counts can differ: take rank 0's verdict. Ids are synced

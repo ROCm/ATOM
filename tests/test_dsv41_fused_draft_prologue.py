@@ -43,8 +43,15 @@ class PrologueRoutingTest(unittest.TestCase):
         self.assertFalse(guard(SimpleNamespace(embed=None)))
 
     def test_flag_defaults_to_off(self):
-        text = (ROOT / "atom/utils/envs.py").read_text()
-        self.assertIn('os.getenv("ATOM_DSPARK_FUSED_PROLOGUE", "0") == "1"', text)
+        import os
+        from unittest.mock import patch
+
+        from atom.utils import envs
+
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(envs.ATOM_DSPARK_FUSED_PROLOGUE)
+        with patch.dict(os.environ, {"ATOM_DSPARK_FUSED_PROLOGUE": "1"}, clear=True):
+            self.assertTrue(envs.ATOM_DSPARK_FUSED_PROLOGUE)
 
     def test_state_is_optional_and_both_call_paths_remain(self):
         tree = ast.parse(MODEL.read_text())
