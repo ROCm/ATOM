@@ -52,6 +52,8 @@ MIX_NORM_DRAINED, MIX_NORM_PASSED, MIX_STORED = 110, 111, 112
 # stamp B), the K loop done and the cluster exchange's barrier passed.
 NORM_POLLED, NORM_REDUCED, NORM_STORED = 113, 114, 115
 SPLIT_LOOPED, SPLIT_EXCHANGED = 116, 117
+# The replicated front's epilogue: its row sums issued, their barrier passed.
+EPI_SUMS, EPI_BARRIER = 118, 119
 POINTS = {
     "hw_id": HW_ID,
     "entry": ENTRY,
@@ -85,6 +87,8 @@ POINTS = {
     "norm_stored": NORM_STORED,
     "split_looped": SPLIT_LOOPED,
     "split_exchanged": SPLIT_EXCHANGED,
+    "epi_sums": EPI_SUMS,
+    "epi_barrier": EPI_BARRIER,
 }
 
 _config: tuple[int, int] | None = None

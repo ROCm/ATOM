@@ -39,7 +39,16 @@ from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import (
     tdm_split_stages,
 )
 from atom.models.kimi_k3.mono.sources import SOURCES
-from atom.mono.device.ops import bf_hi, bf_lo, butterfly, lds_bytes, rsrc, traced
+from atom.mono.device.ops import (
+    bf_hi,
+    bf_lo,
+    butterfly,
+    lds_bytes,
+    rsrc,
+    traced,
+    xred,
+    xshfl,
+)
 from atom.mono.plan.architecture import GFX1250
 from atom.mono.runtime.abi import KernelAbi
 from atom.utils import envs
@@ -155,6 +164,9 @@ def _front_tasks(
     if fp8_depth is None:
         fp8_depth = TDM_FP8_PAIR_DEPTH if paired else gemv_tdm.FP8_DEPTH
     pipe = pipe or {}
+    gemv_pipe = {
+        k: v for k, v in pipe.items() if k in ("late", "token_steps", "early_scales")
+    }
     red = (
         lds.gemv.ptr
         + tdm_lds_words(
@@ -197,7 +209,7 @@ def _front_tasks(
                     x_cache_policy=x_cache_policy,
                     wide=wide,
                     paired=paired,
-                    **pipe,
+                    **gemv_pipe,
                 ),
                 red,
                 tiles,
@@ -222,7 +234,7 @@ def _front_tasks(
                     wide=wide,
                     depth=depth,
                     paired=paired,
-                    **pipe,
+                    **gemv_pipe,
                 ),
                 red,
                 tiles,
@@ -247,7 +259,7 @@ def _front_tasks(
                 wide=wide,
                 depth=depth,
                 paired=paired,
-                **pipe,
+                **gemv_pipe,
             ),
             red,
             tiles,
@@ -256,21 +268,37 @@ def _front_tasks(
         )
     gpu.barrier()
     tdm_timeline.stamp(tdm_timeline.STAGED)
-    _front_epilogue(
-        lds,
-        outputs,
-        router,
-        latent,
-        pair >= SHARED_PAIR0,
-        row0,
-        shared_column0,
-        lambda task, tile: red + (2 * tile + task) * ACCUMULATOR_WORDS,
-        WAVES,
-        None,
-        tid,
-        rows,
-        tiles,
-    )
+    if const_expr(pipe.get("fused")):
+        _front_epilogue_fused(
+            outputs,
+            router,
+            latent,
+            pair >= SHARED_PAIR0,
+            row0,
+            shared_column0,
+            lambda task, tile: red + (2 * tile + task) * ACCUMULATOR_WORDS,
+            tid,
+            rows,
+            tiles,
+            pipe.get("diag", frozenset()),
+        )
+    else:
+        _front_epilogue(
+            lds,
+            outputs,
+            router,
+            latent,
+            pair >= SHARED_PAIR0,
+            row0,
+            shared_column0,
+            lambda task, tile: red + (2 * tile + task) * ACCUMULATOR_WORDS,
+            WAVES,
+            None,
+            tid,
+            rows,
+            tiles,
+            pipe.get("diag", frozenset()),
+        )
     tdm_timeline.stamp(tdm_timeline.STORES_ISSUED)
     tdm_timeline.stores_done()
 
@@ -290,6 +318,7 @@ def _front_epilogue(
     tid,
     rows,
     tiles,
+    diag=frozenset(),
 ):
     """The two projected tasks' epilogue: router logits, the latent's FP4
     group or the shared gate/up's activation. ``slot_of(task, tile)``: the
@@ -322,7 +351,10 @@ def _front_epilogue(
                 bo.buffer_store(high, rsrc(router_logits), token * EXPERTS + row + 1)
             else:
                 fx.ptr_store(packed, lds.group.ptr + token * 16 + task * 8 + row_pair)
+    tdm_timeline.stamp(tdm_timeline.EPI_SUMS)
     gpu.barrier()
+    tdm_timeline.stamp(tdm_timeline.EPI_BARRIER)
+    cm = _diag_cm(diag)
     if shared:
         for round_index in range_constexpr((rows * 8 + THREADS - 1) // THREADS):
             work = tid + THREADS * round_index
@@ -356,16 +388,152 @@ def _front_epilogue(
         code = moe_gfx1250._e8m0_roundup(maximum)
         reciprocal_scale = ((fx.Int32(254) - code) << 23).bitcast(fx.Float32)
         group = row0 // 32
-        bo.buffer_store(
-            moe_gfx1250._pack_bf16_words(words, reciprocal_scale),
-            rsrc(latent_fp4),
-            token * (LATENT // 8) + group * 4 + packed_word,
-        )
-        if packed_word == 0:
+        if const_expr("xf" not in diag):
             bo.buffer_store(
-                fx.Int8(code),
-                rsrc(latent_scales),
-                token * (LATENT // 32) + group,
+                moe_gfx1250._pack_bf16_words(words, reciprocal_scale),
+                rsrc(latent_fp4),
+                token * (LATENT // 8) + group * 4 + packed_word,
+                cache_modifier=cm,
+            )
+        if const_expr("xs" not in diag):
+            if packed_word == 0:
+                bo.buffer_store(
+                    fx.Int8(code),
+                    rsrc(latent_scales),
+                    token * (LATENT // 32) + group,
+                    cache_modifier=cm,
+                )
+
+
+def _or(a, b):
+    return a | b
+
+
+def _diag_cm(diag):
+    for d in diag:
+        if d.startswith("cm"):
+            return int(d[2:])
+    return 0
+
+
+@traced
+def _front_epilogue_fused(
+    outputs,
+    router,
+    latent,
+    shared,
+    row0,
+    shared_column0,
+    slot_of,
+    tid,
+    rows,
+    tiles,
+    diag=frozenset(),
+):
+    """``_front_epilogue`` without its second barrier: a round reduces one
+    tile, a token's 16 BF16 pairs (the first task's eight, then the
+    second's) in 16 lanes of one wave, so the latent group's maximum, its
+    FP4 dwords and the shared gate/up pairs cross lanes, not LDS. The same
+    sums, maxima (the integer one over a packed word's four lanes, then the
+    float one over the group's words, in ``_front_epilogue``'s lane order),
+    codes and activations: the same bits."""
+    router_logits, latent_fp4, latent_scales, shared_hidden = outputs
+    local_token = tid // ROWS
+    column_pair = tid % ROWS
+    task = column_pair // 8
+    row_pair = tid % 8
+    group = row0 // 32
+    # every tile's sums first, so their LDS reads are in flight together
+    sums = [
+        (
+            _row_sum(slot_of(task, tile), 2 * row_pair, local_token),
+            _row_sum(slot_of(task, tile), 2 * row_pair + 1, local_token),
+        )
+        for tile in range(tiles)
+    ]
+    tokens = [tile * ROWS + local_token for tile in range(tiles)]
+    live = [local_token < min(ROWS, rows - tile * ROWS) for tile in range(tiles)]
+    packed = [
+        fx.Vector.from_elements([low, high], fx.Float32)
+        .to(fx.BFloat16)
+        .bitcast(fx.Int32)[0]
+        for low, high in sums
+    ]
+    if router:
+        logits = rsrc(router_logits, rows * EXPERTS * 4)
+        for tile in range_constexpr(tiles):
+            bo.buffer_store(
+                fx.Vector.from_elements(list(sums[tile]), fx.Float32),
+                logits,
+                tokens[tile] * EXPERTS + row0 + task * ROWS + 2 * row_pair,
+                mask=live[tile],
+            )
+    if latent:
+        fp4 = rsrc(latent_fp4, rows * LATENT // 2)
+        scales = rsrc(latent_scales, rows * LATENT // 32)
+        bits = [fx.max(p & 0x7FFF, (p >> 16) & 0x7FFF) for p in packed]
+        for off in (1, 2):
+            bits = [xred(b, off, fx.max, GFX1250) for b in bits]
+        maxima = [(b << 16).bitcast(fx.Float32) for b in bits]
+        for off in (8, 4):
+            maxima = [xred(m, off, fx.max, GFX1250) for m in maxima]
+        codes = [moe_gfx1250._e8m0_roundup(m) for m in maxima]
+        words = []
+        for tile in range_constexpr(tiles):
+            reciprocal_scale = ((fx.Int32(254) - codes[tile]) << 23).bitcast(
+                fx.Float32
+            )
+            pair = fx.Vector.from_elements([packed[tile]], fx.Int32).bitcast(
+                fx.BFloat16
+            )
+            nibbles = [
+                fx.Int32(
+                    moe_gfx1250._emit_f32_to_e2m1(
+                        fx.Float32(pair[half]) * reciprocal_scale
+                    )
+                )
+                for half in range_constexpr(2)
+            ]
+            words.append((nibbles[0] | (nibbles[1] << 4)) << (column_pair % 4 * 8))
+        for off in (1, 2):
+            words = [xred(w, off, _or, GFX1250) for w in words]
+        for tile in range_constexpr(tiles):
+            bo.buffer_store(
+                fx.Int8(codes[tile]),
+                scales,
+                (
+                    group * rows + tokens[tile]
+                    if const_expr("st" in diag)
+                    else tokens[tile] * (LATENT // 32) + group
+                ),
+                mask=live[tile] & (column_pair == 0),
+                cache_modifier=_diag_cm(diag),
+            )
+            bo.buffer_store(
+                words[tile],
+                fp4,
+                tokens[tile] * (LATENT // 8) + group * 4 + column_pair // 4,
+                mask=live[tile] & (column_pair % 4 == 0),
+                cache_modifier=_diag_cm(diag),
+            )
+    if shared:
+        hidden = rsrc(shared_hidden, rows * SHARED_COLUMNS * 2)
+        ups = [xshfl(p, 8, GFX1250) for p in packed]
+        for tile in range_constexpr(tiles):
+            p, up = packed[tile], ups[tile]
+            bo.buffer_store(
+                fx.Vector.from_elements(
+                    [
+                        moe_expert_gfx1250._situ(bf_lo(p), bf_lo(up)),
+                        moe_expert_gfx1250._situ(bf_hi(p), bf_hi(up)),
+                    ],
+                    fx.Float32,
+                )
+                .to(fx.BFloat16)
+                .bitcast(fx.Int32)[0],
+                hidden,
+                (tokens[tile] * SHARED_COLUMNS + shared_column0) // 2 + row_pair,
+                mask=live[tile] & (task == 0),
             )
 
 
@@ -520,13 +688,12 @@ def _front_words(rows: int, depth: int, paired: bool, token_steps: int = 2) -> i
 # BF16 depth, FP8 depth), the first whose LDS fits the width. A late weight
 # copy is issued a barrier later, so it runs a slab (unpaired) or two
 # (paired) deeper for the same copies in flight; a wave still keeps three.
+# Shallower plans starve their copies (paired four ahead at 16 rows, three
+# or two ahead past 50 rows ran slower than the default pipeline).
 _LATE_PLANS = (
     (True, 6, 6),
-    (True, 4, 6),
     (False, 5, 6),
     (False, 4, 6),
-    (False, 3, 6),
-    (False, 2, 5),
 )
 
 
@@ -553,12 +720,22 @@ def front_pipe(rows: int, pairable: bool, lds_bytes: int, sites=None):
                 break
     if "early" in sites:
         pipe["early_scales"] = True
+    if "epi" in sites:
+        pipe["fused"] = True
+    diag = frozenset(
+        s for s in sites if s in ("xs", "xf", "st") or s.startswith("cm")
+    )
+    if diag:
+        pipe["diag"] = diag
     return pipe
 
 
 def _pipe_suffix(pipe) -> str:
-    return ("_late" if pipe.get("late") else "") + (
-        "_es" if pipe.get("early_scales") else ""
+    return (
+        ("_late" if pipe.get("late") else "")
+        + ("_es" if pipe.get("early_scales") else "")
+        + ("_fe" if pipe.get("fused") else "")
+        + "".join(f"_{d}" for d in sorted(pipe.get("diag", ())))
     )
 
 
