@@ -477,3 +477,109 @@ def test_qwen3_5_real_processor_spans_survive_every_prefix_hit():
             torch.float32,
         )
         torch.testing.assert_close(actual, expected[cached:], rtol=0, atol=0)
+
+
+class LeasedRunners:
+    """One stage's runners: `release_multimodal_requests` reaches a real cache."""
+
+    def __init__(self, *seqs):
+        self.cache = VisionEmbeddingCache()
+        for seq in seqs:
+            data = {**payload(seq.cache_seed), "cache_seed": seq.cache_seed}
+            self.cache.acquire(seq.id, data, lambda d: d["pixel_values"] + 100)
+        assert len(self.cache.leases) == len(seqs)
+
+    def call_func(self, name, *args, **kwargs):
+        if name == "release_multimodal_requests":
+            self.cache.release(args[0])
+        elif name == "prefill_forward":
+            return [0] * len(args[0].req_ids)
+
+
+def leased_seq(seed):
+    seq = Sequence([1] * 20, 4, multimodal_data=payload(seed))
+    assert seq.cache_seed == seed
+    return seq
+
+
+def pp_head(scheduler, runners):
+    with stubbed_aiter():
+        from atom.model_engine.pp_engine_core import PPEngineCoreProc
+    from collections import deque
+    from queue import Queue
+    from unittest.mock import MagicMock
+
+    head = PPEngineCoreProc.__new__(PPEngineCoreProc)
+    head.scheduler = scheduler
+    head.runner_mgr = runners
+    head.output_queue = Queue()
+    head.stream_output_queue = Queue()
+    head._in_flight = deque()
+    head.pp_max_inflight = 2
+    head._defer_prefix_hash = False
+    head._pending_prefix_hash = deque()
+    head.pp_transport = MagicMock()
+    head._advance_idle_kv_transfer = lambda dispatch_new=True: None
+    head._poll_kv_transfer_progress = lambda: None
+    head._poll_dynamic_chunking_calibration = lambda: None
+    return head
+
+
+def test_pp_head_releases_the_vision_lease_of_a_rejected_seq():
+    # The first PP stage holds the vision rows. A seq the scheduler rejects
+    # finishes there without a forward, so its lease must be dropped too.
+    seq = leased_seq(11)
+    runners = LeasedRunners(seq)
+    scheduler = SimpleNamespace(schedule=lambda: None, take_rejected=lambda: [seq])
+    head = pp_head(scheduler, runners)
+    head.pp_transport.recv_completion.return_value = None
+    head._pp_head_step()
+    assert head.output_queue.get_nowait() == [seq]
+    assert not runners.cache.leases and not runners.cache.entries
+
+
+def test_pp_head_releases_the_vision_lease_when_the_last_stage_finishes_a_seq():
+    seq, other = leased_seq(12), leased_seq(13)
+    runners = LeasedRunners(seq, other)
+    batch = SimpleNamespace(req_ids=[seq.id, other.id])
+    out = SimpleNamespace(req_ids=[seq.id, other.id])
+    scheduler = SimpleNamespace(
+        release_pp_inflight=lambda batch: None,
+        postprocess=lambda seqs, fwd_out, **kwargs: [seq],
+    )
+    head = pp_head(scheduler, runners)
+    head._in_flight.append((batch, {seq.id: seq, other.id: other}, True))
+    head.pp_transport.recv_completion.side_effect = [(batch.req_ids, out), None]
+    head._collect_pp_completions(0)
+    assert head.output_queue.get_nowait() == [seq]
+    # Only the finished seq lets go; the one still decoding keeps its rows.
+    assert runners.cache.leases == {other.id: 13}
+
+
+def test_pd_prefill_instance_releases_the_vision_lease_after_its_prefill():
+    with stubbed_aiter():
+        from atom.model_engine.engine_core import PrefillEngineCore
+    from unittest.mock import MagicMock
+
+    seq = leased_seq(14)
+    runners = LeasedRunners(seq)
+    batch = SimpleNamespace(
+        req_ids=[seq.id],
+        num_scheduled_tokens=[20],
+        total_seqs_num=1,
+        total_tokens_num=20,
+    )
+    scheduler = SimpleNamespace(
+        has_requests=lambda: True,
+        schedule=lambda: (batch, {seq.id: seq}),
+        running=[seq],
+        metrics=MagicMock(),
+    )
+    core = PrefillEngineCore.__new__(PrefillEngineCore)
+    core.scheduler = scheduler
+    core.runner_mgr = runners
+    core._p2d_sock = MagicMock()
+    core._apply_pending_assignments = lambda: None
+    assert core._process_engine_step()
+    assert seq.status == SequenceStatus.FINISHED and not scheduler.running
+    assert not runners.cache.leases and not runners.cache.entries
