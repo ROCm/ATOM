@@ -68,6 +68,8 @@ from atom.models.kimi_k3.mono.kernels.stages import (
     attn_res_gfx1250,
     attn_res_sliced_gfx1250,
     attn_res_sliced_layout,
+    mla_absorb_gfx1250,
+    mla_absorb_layout,
     mla_front_gfx1250,
     mla_front_layout,
 )
@@ -124,6 +126,7 @@ from atom.models.kimi_k3.mono.symm_peers import SymmPeers, map_symm_peers
 from atom.models.kimi_k3.mono.weights import (
     bind_external_moe,
     bind_fp8_o_proj,
+    bind_mla_absorb,
     bind_mla_front,
 )
 from atom.mono.plan.architecture import GFX1250
@@ -247,6 +250,7 @@ def _lean_width(
         built.k2,
         built.oproj,
         built.mla_front,
+        built.mla_absorb,
     )
 
 
@@ -332,6 +336,9 @@ class Gfx1250WidthBuild:
     # the full-attention layers' MLA fronts (ATOM_KIMI_MONO_MLA_FRONT), by
     # ``MlaFrontLayer.key``; a key without one runs the production projections
     mla_front: dict | None = None
+    # their MLA absorbs (ATOM_KIMI_MONO_MLA_ABSORB), by ``MlaAbsorbLayer.key``;
+    # a key without one runs production's q_b_proj, W_UK and rope + cache
+    mla_absorb: dict | None = None
 
     def kernels(self) -> list[tuple[object, KernelAbi]]:
         """All local launchers, for compile-time scratch validation."""
@@ -357,6 +364,9 @@ class Gfx1250WidthBuild:
         for front in (self.mla_front or {}).values():
             if front is not None:
                 pairs.append((front.launcher, front.abi))
+        for absorb in (self.mla_absorb or {}).values():
+            if absorb is not None:
+                pairs.append((absorb.launcher, absorb.abi))
 
         unique = {}
         for launcher, abi in pairs:
@@ -642,6 +652,39 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                 dtype=torch.uint8,
                 device=self.device,
             )
+        self._bind_mla_absorbs()
+
+    def _bind_mla_absorbs(self) -> None:
+        """The layers with a front whose q_b_proj, W_UK absorb and rope +
+        cache write the MLA absorb takes (ATOM_KIMI_MONO_MLA_ABSORB); a layer
+        it cannot read keeps them, alone. One q exchange buffer serves every
+        width (``mla_absorb_gfx1250``)."""
+        self.mla_absorbs = {}
+        if not envs.ATOM_KIMI_MONO_MLA_ABSORB:
+            return
+        for layer_id, front in sorted(self.mla_fronts.items()):
+            try:
+                self.mla_absorbs[layer_id] = bind_mla_absorb(
+                    self.inner.layers[layer_id], layer_id, front
+                )
+            except MonoUnsupported as e:
+                logger.warning(
+                    "Kimi-K3 mono: layer %d keeps its production q_b_proj, W_UK "
+                    "and rope + cache (%s)",
+                    layer_id,
+                    e,
+                )
+        logger.info(
+            "Kimi-K3 gfx1250 mono: %d full-attention layers run the MLA absorb",
+            len(self.mla_absorbs),
+        )
+        if self.mla_absorbs:
+            heads = max(absorb.heads for absorb in self.mla_absorbs.values())
+            self.mla_q = torch.empty(
+                (mla_absorb_layout.q_words(self.max_rows, heads),),
+                dtype=torch.int32,
+                device=self.device,
+            )
 
     def _allocate(self) -> None:
         self.ones = torch.ones(self.max_rows, dtype=torch.int32, device=self.device)
@@ -789,7 +832,11 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             else None
         )
         return Gfx1250WidthBuild(
-            k1_by_layer, k2_by_layer, oproj, self._mla_fronts_for(rows)
+            k1_by_layer,
+            k2_by_layer,
+            oproj,
+            self._mla_fronts_for(rows),
+            self._mla_absorbs_for(rows),
         )
 
     def _mla_fronts_for(self, rows: int) -> dict | None:
@@ -823,20 +870,61 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             built[key] = kernel
         return built
 
+    def _mla_absorbs_for(self, rows: int) -> dict | None:
+        """The width's MLA absorb a ``MlaAbsorbLayer.key``, None where it does
+        not build or compiles with a resident hazard: those layers run
+        production's q_b_proj, W_UK and rope + cache at this width. Rank-local
+        like the front (the DCP group's heads are replicated under QREP)."""
+        absorbs = getattr(self, "mla_absorbs", None)
+        if not absorbs:
+            return None
+        built = {}
+        for key in sorted({absorb.key for absorb in absorbs.values()}):
+            heads, out_heads, compute_all = key
+            try:
+                kernel = mla_absorb_gfx1250.build_mla_absorb(
+                    rows, heads, out_heads, compute_all
+                )
+                (launcher,) = compile_kernels([(kernel.launcher, kernel.abi)])
+                hazards = _resident_hazards(launcher)
+            except ValueError as why:
+                kernel, hazards = None, (str(why),)
+            if hazards:
+                logger.warning(
+                    "Kimi-K3 gfx1250 mono: %d rows run production's q_b_proj, "
+                    "W_UK and rope + cache (%s)",
+                    rows,
+                    ", ".join(hazards),
+                )
+                kernel = None
+            built[key] = kernel
+        return built
+
     def _mla_projection(self, build, layer_id: int):
-        """The full-attention layer's MLA front at this width, as
-        ``_pre_o_core``'s ``project``, or None (the production projections)."""
+        """The full-attention layer's MLA front at this width (with its absorb
+        where built), as ``_pre_o_core``'s ``project``, or None (the
+        production projections)."""
         front = getattr(self, "mla_fronts", {}).get(layer_id)
         kernels = getattr(build, "mla_front", None)
         kernel = None if front is None or not kernels else kernels.get(front.key)
         if kernel is None:
             return None
-        return lambda normed: self._mla_front(kernel, front, normed)
+        absorb = getattr(self, "mla_absorbs", {}).get(layer_id)
+        absorbs = getattr(build, "mla_absorb", None)
+        absorb_kernel = None if absorb is None or not absorbs else absorbs.get(absorb.key)
+        if absorb_kernel is None:
+            return lambda normed: self._mla_front(kernel, front, normed)
+        return lambda normed: self._mla_front(
+            kernel, front, normed, (absorb_kernel, absorb)
+        )
 
-    def _mla_front(self, kernel, front, x):
+    def _mla_front(self, kernel, front, x, absorb=None):
         """The MLA front on the normed rows ``x``: ``(q, q_scale, kv, k_rope,
         gate)``, ``KimiFullAttention._gated_core``'s ``front``. q is FP8 with
-        its transposed E8M0 scales where q_b_proj takes those, else BF16."""
+        its transposed E8M0 scales where q_b_proj takes those, else BF16.
+        ``absorb``: ``(kernel, MlaAbsorbLayer)``; where the step admits it
+        (``_mla_absorb``) the absorb runs right behind and its q_out is the
+        sixth element."""
         lay = mla_front_layout
         if (
             not isinstance(x, torch.Tensor)
@@ -877,8 +965,76 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         })  # fmt: skip
         kernel.launcher(*args, stream=torch.cuda.current_stream())
         if q is None:
+            if absorb is not None:
+                q_out = self._mla_absorb(*absorb, q_fp8, q_scale, kv, k_rope)
+                if q_out is not None:
+                    return q_fp8, q_scale, kv, k_rope, gate, q_out
             return q_fp8, q_scale, kv, k_rope, gate
         return q, None, kv, k_rope, gate
+
+    def _mla_absorb_refusal(self, absorb, rows: int):
+        """Why this step's decode branch is not the absorb's (None: it is):
+        a dummy or prefill step, a slot mapping or KV cache it does not read,
+        a q dtype other than FP8. Else ``(slots, cache)``."""
+        forward = get_forward_context()
+        if forward.context.is_dummy_run or forward.context.is_prefill:
+            return "not a decode step", None
+        metadata = forward.attn_metadata
+        slots = getattr(metadata, "slot_mapping", None)
+        if (
+            not isinstance(slots, torch.Tensor)
+            or slots.dtype != torch.int64
+            or slots.dim() != 1
+            or slots.numel() != rows
+            or not slots.is_contiguous()
+        ):
+            return f"a slot mapping of {getattr(slots, 'shape', None)}", None
+        if getattr(metadata, "dtype_q", None) != dtypes.fp8:
+            return f"q_out as {getattr(metadata, 'dtype_q', None)}", None
+        cache = forward.kv_cache_data[f"layer_{absorb.attention.layer_num}"].k_cache
+        lay = mla_absorb_layout
+        if (
+            cache.dtype != dtypes.fp8
+            or cache.dim() != 3
+            or cache.size(0) == 0
+            or tuple(cache.shape[1:]) != (1, lay.ENTRY)
+            or cache.stride(2) != 1
+        ):
+            return f"a KV cache of {cache.dtype} {tuple(cache.shape)}", None
+        return None, (slots, cache)
+
+    def _mla_absorb(self, kernel, absorb, q_fp8, q_scale, kv, k_rope):
+        """The MLA absorb behind the front: the attention's q_out and the
+        step's KV-cache entries, or None (nothing written) where the step's
+        decode branch is not the absorb's (``_mla_absorb_refusal``)."""
+        rows = q_fp8.size(0)
+        why, found = self._mla_absorb_refusal(absorb, rows)
+        if why is not None:
+            refused = self.__dict__.setdefault("_mla_absorb_refused", set())
+            if why not in refused:
+                refused.add(why)
+                logger.warning(
+                    "Kimi-K3 gfx1250 mono: production's q_b_proj, W_UK and "
+                    "rope + cache for %s",
+                    why,
+                )
+            return None
+        slots, cache = found
+        q_out = torch.empty(
+            (rows, absorb.out_heads, mla_absorb_layout.ENTRY),
+            dtype=dtypes.fp8,
+            device=q_fp8.device,
+        )
+        p = torch.Tensor.data_ptr
+        args = mla_absorb_gfx1250.MLA_ABSORB_ABI.pack({
+            "q_fp8": p(q_fp8), "q_scale": p(q_scale), "w_qb": p(absorb.w_qb),
+            "s_qb": p(absorb.s_qb), "w_uk": p(absorb.w_uk), "s_uk": p(absorb.s_uk),
+            "kv": p(kv), "k_rope": p(k_rope), "slots": p(slots),
+            "kv_cache": p(cache), "kv_stride": cache.stride(0), "q_out": p(q_out),
+            "q": p(self.mla_q), "ql_nope": 0,
+        })  # fmt: skip
+        kernel.launcher(*args, stream=torch.cuda.current_stream())
+        return q_out
 
     def _k2_or_production(self, rows: int, build, what: str, kernels=None):
         """``build()``, or None past ``k2_fallback_past`` rows where it

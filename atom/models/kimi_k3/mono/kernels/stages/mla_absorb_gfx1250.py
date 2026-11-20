@@ -11,16 +11,19 @@ three tasks over one K quarter, its FP8 weight quarters copied to LDS by the
 TDM (online per_1x128 FP8, AITER's gfx1250 preshuffle, E8M0 128x128 block
 scales) and its token rows -- the FP8 q with its per-token E8M0 group codes
 (``per_1x128_e8m0_quant``'s transposed layout) -- loaded straight to
-registers; both dequantized exactly to BF16, f32 WMMA. The four quarters'
-sums are added in order in LDS and rounded to BF16: ``q``, swapped through
-``q`` (``[rows, heads, 192]``, production's q_b output) at SE scope past one
-cluster barrier.
+registers, the token loads ahead of the W_UK weights' (a wave's loads retire
+in order). The scaled FP8 WMMA (16x16x128, E8M0 codes on both operands) runs
+a quarter's three scale groups into one f32 accumulator; the four quarters'
+sums are added in order in LDS and rounded to BF16 -- q_b_proj's GEMM
+(``gemm_a8w8_blockscale_bpreshuffle``) bit for bit -- and swapped through
+``q`` (``[rows, heads, 192]``, production's q) at SE scope past one cluster
+barrier; each CTA stages its two heads' nope rows in LDS once.
 
 Then each wave absorbs two 16-row tasks of its head's ``W_UK`` (FP8, one
 per-tensor scale, loaded to registers at the start) over the head's 128 nope
 values as the gluon ``batched_gemm_a16w8`` does it: the FP8 weights widened
-to BF16, four K32 WMMAs chained from zero, ``bf16(acc * scale)``. q_out's
-nope part is that saturated to E4M3 (``fused_qk_rope_concat_and_cache_mla``:
+to BF16, four K32 WMMAs chained from zero, ``bf16(acc * scale)``, its bits.
+q_out's nope part is that saturated to E4M3 (``fused_qk_rope_concat_and_cache_mla``:
 ``v_med3_f32`` to +-448, ``v_cvt_pk_fp8_f32``), its rope part the q rope rows
 through the NoPE rotary embedding (``cos`` 1, ``sin`` 0, NeoX pairs: ``x - y *
 0`` / ``x + y * 0``) converted without the clamp. The CTAs past the heads'
@@ -41,6 +44,7 @@ from flydsl.expr.typing import Int64, T
 
 from atom.models.kimi_k3.mono.kernels.stages import gemv_tdm_gfx1250 as gemv_tdm
 from atom.models.kimi_k3.mono.kernels.stages import mla_absorb_layout as lay
+from atom.models.kimi_k3.mono.kernels.stages import tdm_timeline
 from atom.models.kimi_k3.mono.kernels.stages.gemv_gfx1250 import fp8x8_to_bf16
 from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import ROWS, TDM_CLUSTER
 from atom.models.kimi_k3.mono.sources import SOURCES
@@ -61,6 +65,10 @@ QUARTER_BYTES = QUARTER_STEPS * CHUNK_BYTES
 QUARTER_WORDS = QUARTER_BYTES // 4
 UK_STEPS = lay.NOPE // 32
 E8M0_ONE = 127
+QUANT_BYTES = lay.QUANT_GROUP
+# a q nope row in LDS: 128 BF16 in 16-byte pieces, padded by one piece
+NOPE_PIECES = lay.NOPE * 2 // 16
+NOPE_PITCH = (NOPE_PIECES + 1) * 4
 
 MLA_ABSORB_ABI = KernelAbi(
     (
@@ -132,6 +140,26 @@ def _fp8_operand(pieces, exponent):
         converted = fp8x8_to_bf16(fx.Vector.from_elements(piece, fx.Int32), exponent)
         elements.extend(converted[i] for i in range_constexpr(8))
     return fx.Vector.from_elements(elements, fx.BFloat16)
+
+
+def _mma_fp8(a, b, acc, a_code, b_code):
+    """``acc`` plus a 16x16x128 E4M3 product, each operand times its E8M0
+    code's power of two (the code in each of the four 32-wide blocks' bytes):
+    the scaled WMMA, a v16 operand a lane holding 16 bytes of each 32-byte K
+    chunk (lane / 16 picks the half), AITER's gfx1250 FP8 preshuffle as it
+    lies."""
+    return fx.Vector(
+        rocdl.wmma_scale_f32_16x16x128_f8f6f4(
+            T.vec(ACC, T.f32),
+            a.ir_value(),
+            b.ir_value(),
+            acc.ir_value(),
+            fx.Int32(a_code).ir_value(),
+            fx.Int32(b_code).ir_value(),
+            fmtA=0,
+            fmtB=0,
+        )
+    )
 
 
 def _bf16_operand(pieces):
@@ -210,7 +238,10 @@ def _slot(slots, token):
 @traced
 def _project(c, lds, lane, wave):
     """Phase 1: this wave's K quarter of its head's three q_b tasks, summed
-    over the quarters in LDS; then this CTA's q rows to ``q`` at SE scope."""
+    over the quarters in LDS; then this CTA's q rows to ``q`` at SE scope.
+    Its loads go out in the order they are waited for (a wave's loads retire
+    in order): the weight copies, the token rows, then phase 2's W_UK
+    weights, which it returns."""
     rows, heads, tiles = c["rows"], c["heads"], c["tiles"]
     rank, head0 = c["rank"], c["head0"]
     job, quarter = wave // lay.K_QUARTERS, wave % lay.K_QUARTERS
@@ -252,15 +283,15 @@ def _project(c, lds, lane, wave):
         for t in range(lay.HEAD_TASKS)
     ]
     lane_group = lane // ROWS
-    pieces = []
+    tokens = []
     x_codes = []
     for tile in range_constexpr(tiles):
         token = fx.min(fx.Int32(tile * ROWS) + lane % ROWS, fx.Int32(rows - 1))
-        row = token * (lay.Q_LORA // 4) + (quarter * lay.K_QUARTER + lane_group * 8) // 4
-        pieces.append(
+        row = token * (lay.Q_LORA // 4) + (quarter * lay.K_QUARTER + lane_group * 16) // 4
+        tokens.append(
             [
-                [_words(c["q_fp8"], row + (32 * s + 16 * half) // 4, 2) for half in range(2)]
-                for s in range(QUARTER_STEPS)
+                [_words(c["q_fp8"], row + (QUANT_BYTES * g + 32 * k) // 4, 4) for k in range(4)]
+                for g in range(lay.QUARTER_GROUPS)
             ]
         )
         x_codes.append(
@@ -274,31 +305,38 @@ def _project(c, lds, lane, wave):
                 for g in range(lay.QUARTER_GROUPS)
             ]
         )
+    uk = _uk_weights(c, lane, wave)
+    tdm_timeline.stamp(tdm_timeline.ISSUED)
     rocdl.s_wait_tensorcnt(0)
+    tdm_timeline.slab(0, tdm_timeline.WEIGHT)
     accs = [
         [fx.Vector.filled(ACC, 0.0, fx.Float32) for _ in range(tiles)]
         for _ in range(lay.HEAD_TASKS)
     ]
     weight_row = lane % ROWS
-    for s in range_constexpr(QUARTER_STEPS):
-        group = s // 4
+    for g in range_constexpr(lay.QUARTER_GROUPS):
         a = []
         for t in range_constexpr(lay.HEAD_TASKS):
-            chunk = []
-            for half in range_constexpr(2):
-                byte = ((s * 2 + half) * ROWS + weight_row) * 16 + lane_group * 8
+            words = []
+            for k in range_constexpr(4):
+                byte = (((4 * g + k) * 2 + lane_group) * ROWS + weight_row) * 16
                 raw = fx.Vector(
                     fx.ptr_load(
                         weights[t] + byte // 4,
-                        result_type=fx.Vector.make_type(2, fx.Int32),
+                        result_type=fx.Vector.make_type(4, fx.Int32),
                     )
                 )
-                chunk.append([fx.Int32(raw[0]), fx.Int32(raw[1])])
-            a.append(_fp8_operand(chunk, w_codes[t][group]))
+                words.extend(fx.Int32(raw[i]) for i in range_constexpr(4))
+            a.append(fx.Vector.from_elements(words, fx.Int32))
         for tile in range_constexpr(tiles):
-            b = _fp8_operand(pieces[tile][s], x_codes[tile][group])
+            b = fx.Vector.from_elements(
+                [w for piece in tokens[tile][g] for w in piece], fx.Int32
+            )
             for t in range_constexpr(lay.HEAD_TASKS):
-                accs[t][tile] = mma_bf16(a[t], b, accs[t][tile], GFX1250)
+                accs[t][tile] = _mma_fp8(
+                    a[t], b, accs[t][tile], w_codes[t][g], x_codes[tile][g]
+                )
+    tdm_timeline.stamp(tdm_timeline.SPLIT_LOOPED)
     sums = lds + lay.HEADS_PER_CLUSTER * lay.HEAD_TASKS * lay.K_QUARTERS * QUARTER_WORDS
     for t in range_constexpr(lay.HEAD_TASKS):
         for tile in range_constexpr(tiles):
@@ -346,14 +384,44 @@ def _project(c, lds, lane, wave):
                 ((token * heads + head0 + pair) * lay.HEAD + in_head) // 2,
                 SCOPE_SE,
             )
+    tdm_timeline.stamp(tdm_timeline.PROJECT_DONE)
     rocdl.s_wait_storecnt(0)
     cluster.cluster_barrier()
+    tdm_timeline.stamp(tdm_timeline.SPLIT_EXCHANGED)
+    return uk
 
 
 @traced
-def _absorb(c, uk, lane, wave):
+def _stage_nope(c, lds, tid):
+    """The CTA's two heads' q nope rows from ``q`` (SE scope) into LDS, a
+    16-byte piece a thread a round, rows ``NOPE_PITCH`` words apart (a WMMA
+    operand's 16 rows on distinct banks); one copy for the head's four
+    waves."""
+    rows, heads, head0 = c["rows"], c["heads"], c["head0"]
+    pieces = lay.HEADS_PER_CLUSTER * rows * NOPE_PIECES
+    for round_index in range_constexpr(-(-pieces // THREADS)):
+        item = tid + THREADS * round_index
+        if item < pieces:
+            piece = item % NOPE_PIECES
+            token = item // NOPE_PIECES % rows
+            pair = item // (NOPE_PIECES * rows)
+            words = _words(
+                c["q"],
+                ((token * heads + head0 + pair) * lay.HEAD) // 2 + piece * 4,
+                4,
+                SCOPE_SE,
+            )
+            fx.ptr_store(
+                fx.Vector.from_elements(words, fx.Int32),
+                lds + (pair * rows + token) * NOPE_PITCH + piece * 4,
+            )
+    gpu.barrier()
+
+
+@traced
+def _absorb(c, uk, lds, lane, wave):
     """Phase 2: this wave's two W_UK tasks of its head over the head's q nope
-    rows (from ``q``), q_out's nope bytes (and the ``ql_nope`` tap)."""
+    rows (staged in LDS), q_out's nope bytes (and the ``ql_nope`` tap)."""
     rows, heads, tiles = c["rows"], c["heads"], c["tiles"]
     rank, head0 = c["rank"], c["head0"]
     job, quarter = wave // lay.K_QUARTERS, wave % lay.K_QUARTERS
@@ -366,18 +434,25 @@ def _absorb(c, uk, lane, wave):
     weights = [
         [_fp8_operand(uk[u][s], one) for s in range(UK_STEPS)] for u in range(lay.UK_TASKS)
     ]
+    operands = []
     for tile in range_constexpr(tiles):
         token = fx.min(fx.Int32(tile * ROWS) + lane % ROWS, fx.Int32(rows - 1))
-        row = (token * heads + head) * lay.HEAD // 2
-        b = [
-            _bf16_operand(
-                [
-                    _words(c["q"], row + (32 * s + 16 * half + lane_group * 8) // 2, 4, SCOPE_SE)
-                    for half in range(2)
-                ]
-            )
-            for s in range(UK_STEPS)
-        ]
+        row = lds + (job * rows + token) * NOPE_PITCH
+        steps = []
+        for s in range_constexpr(UK_STEPS):
+            halves = []
+            for half in range_constexpr(2):
+                raw = fx.Vector(
+                    fx.ptr_load(
+                        row + (32 * s + 16 * half + lane_group * 8) // 2,
+                        result_type=fx.Vector.make_type(4, fx.Int32),
+                    )
+                )
+                halves.append([fx.Int32(raw[i]) for i in range_constexpr(4)])
+            steps.append(halves)
+        operands.append(steps)
+    for tile in range_constexpr(tiles):
+        b = [_bf16_operand(operands[tile][s]) for s in range(UK_STEPS)]
         out_token = tile * ROWS + lane % ROWS
         live = out_token < rows
         high = fx.Int32(0)
@@ -506,8 +581,10 @@ def build_mla_absorb(
         f"k3_mla_absorb_gfx1250_s{rows}_h{heads}"
         + (f"_o{plan.out_heads}" if plan.out_heads != heads else "")
         + ("" if compute_all else "_slot")
+        + tdm_timeline.suffix()
     )
     sources = SOURCES
+    timeline = tdm_timeline.key()
 
     @fx.struct
     class Lds:
@@ -530,7 +607,7 @@ def build_mla_absorb(
         q: Int64,
         ql_nope: Int64,
     ):
-        _ = sources
+        _ = sources, timeline
         tid = fx.Int32(fx.thread_idx.x)
         bid = fx.Int32(fx.block_idx.x)
         lane = tid % LANES
@@ -561,13 +638,16 @@ def build_mla_absorb(
         }
         allocator = fx.SharedAllocator()
         lds = allocator.allocate(Lds).peek()
+        tdm_timeline.open_cta(bid, wave, timeline, allocator)
         if bid < head_ctas:
-            uk = _uk_weights(c, lane, wave)
-            _project(c, lds.words.ptr, lane, wave)
-            _absorb(c, uk, lane, wave)
+            uk = _project(c, lds.words.ptr, lane, wave)
+            _stage_nope(c, lds.words.ptr, tid)
+            _absorb(c, uk, lds.words.ptr, lane, wave)
+            tdm_timeline.stamp(tdm_timeline.STORES_ISSUED)
             _rope(c, tid)
         else:
             _cache(c, bid - head_ctas, tid)
+        tdm_timeline.close_cta()
 
     @flyc.jit
     def launch(
@@ -587,7 +667,7 @@ def build_mla_absorb(
         ql_nope: Int64,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
-        _ = sources
+        _ = sources, timeline
         kernel(
             q_fp8,
             q_scale,

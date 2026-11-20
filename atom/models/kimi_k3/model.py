@@ -898,7 +898,11 @@ class KimiFullAttention(nn.Module):
         ``hidden_states`` (the mono MLA front, ``mla_front_gfx1250``): q
         normalized (and quantized for ``q_b_proj`` where ``q_scale`` is not
         None), kv normalized, the raw rope rows and g_proj's rows. The
-        projections, the q_a / kv_a norms and g_proj are then skipped."""
+        projections, the q_a / kv_a norms and g_proj are then skipped. A sixth
+        element, the attention's ``q_out`` (the mono MLA absorb,
+        ``mla_absorb_gfx1250``, which also wrote the step's KV-cache entries),
+        skips q_b_proj, the W_UK absorb and the rope + cache write too: the
+        attention decodes from it (``MLAAttention.forward_decode_q_out``)."""
         # deepseek_v2 pattern: one _fuse_rmsnorm_quant kernel does q_a norm +
         # kv_a norm (+ q-activation quant), then q's scale is forwarded into the
         # MLA module (q_proj consumes it).
@@ -910,10 +914,13 @@ class KimiFullAttention(nn.Module):
         if isinstance(hidden_states, tuple):
             hidden_states, hidden_states_scale = hidden_states
 
+        q_out = None
         if front is not None:
             if self.indexer is not None:
                 raise ValueError("a DSA layer's indexer reads its own projections")
-            q, q_scale, kv, k_rope, gate = front
+            q, q_scale, kv, k_rope, gate = front[:5]
+            if len(front) > 5:
+                q_out = front[5]
         else:
             projected = torch.split(
                 self.fused_qkv_a_proj(hidden_states, hidden_states_scale),
@@ -957,7 +964,10 @@ class KimiFullAttention(nn.Module):
                 positions,
                 projected_k_weights=(projected[3], projected[4]),
             )
-        attn_out = self.attn(q, kv, k_rope, positions, q_scale=q_scale)
+        if q_out is None:
+            attn_out = self.attn(q, kv, k_rope, positions, q_scale=q_scale)
+        else:
+            attn_out = self.attn.impl.forward_decode_q_out(q_out)
         if front is None:
             gate = self.g_proj(hidden_states, hidden_states_scale)
         # BF16 output gating uses the shared fused sigmoid/mul. When o_proj

@@ -827,6 +827,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KIMI_MONO_MLA_FRONT": lambda: (
         os.getenv("ATOM_KIMI_MONO_MLA_FRONT", "0") == "1"
     ),
+    # 1 (with ATOM_KIMI_MONO_MLA_FRONT=1): the MLA front is followed by a
+    # second resident launch (mla_absorb_gfx1250) doing the decode branch's
+    # q_b_proj, W_UK absorb and fused_qk_rope_concat_and_cache_mla -- the
+    # attention's q_out and the step's KV-cache entries, production's bits --
+    # and the attention decodes from that q_out. 0, the default, keeps them.
+    "ATOM_KIMI_MONO_MLA_ABSORB": lambda: (
+        os.getenv("ATOM_KIMI_MONO_MLA_ABSORB", "0") == "1"
+    ),
     # The K2 tail's remote pushes on waves of their own, so the store drain
     # before its flag waits for no fabric ack (k2_tail_gfx1250, the same
     # bits); 0 keeps every wave pushing and reducing its own line.

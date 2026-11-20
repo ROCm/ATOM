@@ -3370,6 +3370,31 @@ class MLAAttention(nn.Module):
 
         return output
 
+    def forward_decode_q_out(self, q_out: torch.Tensor) -> torch.Tensor:
+        """``forward_impl``'s dense decode from its ``q_out`` on: the caller
+        has produced q_out and written the step's KV-cache entries exactly as
+        ``_q_proj_and_k_up_proj`` and ``fused_qk_rope_concat_and_cache_mla``
+        do (the Kimi-K3 mono MLA absorb, ``mla_absorb_gfx1250``) -- for the
+        DCP group's heads under QREP, else this rank's, padded where
+        ``_fused_q_head_pad`` folds the pad in."""
+        forward_context: ForwardContext = get_forward_context()
+        attn_metadata = forward_context.attn_metadata
+        kv_cache = forward_context.kv_cache_data[f"layer_{self.layer_num}"].k_cache
+        if self.dcp_world_size > 1:
+            use_qrep = qrep_for_step(
+                self.qrep_enabled,
+                self.use_seg_mla,
+                False,
+                envs.ATOM_DCP_PREFILL_QREP,
+            )
+            return self._dcp_decode(q_out, kv_cache, attn_metadata, use_qrep)
+        return self._forward_decode(
+            q_out,
+            kv_cache,
+            attn_metadata,
+            q_prepadded=self._fused_q_head_pad,
+        )
+
     def forward(
         self,
         query: torch.Tensor,  # query in unified attn

@@ -731,6 +731,111 @@ def bind_mla_front(layer, layer_id: int, dims: Dims) -> MlaFrontLayer:
     )
 
 
+@dataclass(frozen=True)
+class MlaAbsorbLayer:
+    """What the gfx1250 MLA absorb (``mla_absorb_gfx1250``) reads for one
+    full-attention layer, behind its front: q_b_proj in ``_block_fp8``'s
+    layout, the absorb's FP8 ``W_UK`` and scale, and the decode branch's
+    q_out shape -- ``heads`` projected (the DCP group's under QREP, else this
+    rank's), ``out_heads`` (more when the zero head pad is folded into
+    q_out), ``compute_all`` (DCP: every token's q_out; else a token without a
+    KV slot keeps zeros). ``attention``: the layer's ``MLAAttention``, which
+    runs the decode from the absorb's q_out."""
+
+    layer_id: int
+    w_qb: torch.Tensor
+    s_qb: torch.Tensor
+    w_uk: torch.Tensor
+    s_uk: torch.Tensor
+    heads: int
+    out_heads: int
+    compute_all: bool
+    attention: object
+
+    @property
+    def key(self) -> tuple[int, int, bool]:
+        """What its build bakes in."""
+        return self.heads, self.out_heads, self.compute_all
+
+
+def bind_mla_absorb(layer, layer_id: int, front: MlaFrontLayer) -> MlaAbsorbLayer:
+    """One full-attention layer's MLA absorb tensors, read in place. Refused
+    where the decode branch of ``MLAAttention.forward_impl`` would compute
+    anything else: a front handing q_b_proj BF16 q, a sparse layer, the
+    segmented or shuffled KV cache, a KV cache or q not FP8, static scales
+    other than 1, a rotary embedding other than the NoPE identity, the BF16
+    or FP4 absorb, other widths."""
+    from atom.model_ops import attention_mla
+    from atom.model_ops.rotary_embedding import NoPositionalRotaryEmbedding
+    from atom.models.kimi_k3.mono.kernels.stages import mla_absorb_layout as lay
+
+    name = f"layer {layer_id}"
+    attn = layer.self_attn
+    impl = getattr(getattr(attn, "attn", None), "impl", None)
+    _need(front.q_dtype is not None, f"{name}: the front hands q_b_proj BF16 q")
+    _need(
+        callable(getattr(impl, "forward_decode_q_out", None)),
+        f"{name}: not an MLAAttention",
+    )
+    _need(not impl.is_sparse_mla, f"{name}: sparse MLA")
+    _need(not impl.use_seg_mla, f"{name}: the segmented KV cache")
+    _need(not impl.kv_shuffled, f"{name}: the shuffled KV cache")
+    _need(impl.kv_cache_dtype == "fp8", f"{name}: the KV cache is not FP8")
+    _need(
+        float(impl._k_scale) == 1.0 and float(impl._q_scale) == 1.0,
+        f"{name}: static q / k scales other than 1",
+    )
+    rope = impl.rotary_emb
+    _need(
+        isinstance(rope, NoPositionalRotaryEmbedding)
+        and rope.rotary_dim == lay.ROPE
+        and rope.is_neox_style,
+        f"{name}: a rotary embedding other than the NoPE identity",
+    )
+    _need(
+        (impl.q_lora_rank, impl.kv_lora_rank, impl.qk_nope_head_dim)
+        == (lay.Q_LORA, lay.KV_LORA, lay.NOPE)
+        and impl.qk_rope_head_dim == lay.ROPE,
+        f"{name}: MLA widths",
+    )
+    _need(not attention_mla.is_rocm_aiter_fp4bmm_enabled(), f"{name}: the FP4 absorb")
+    if impl.qrep_enabled:
+        w_uk, s_uk, heads = impl.W_K_qrep, impl.W_K_qrep_scale, impl.qrep_num_heads
+    else:
+        w_uk, s_uk, heads = impl.W_K, impl.W_K_scale, impl.num_heads
+    _need(s_uk is not None, f"{name}: the BF16 absorb (ATOM_MLA_ABSORB_BF16)")
+    _need(heads % lay.HEADS_PER_CLUSTER == 0, f"{name}: {heads} query heads")
+    _need(
+        w_uk.dtype == torch.float8_e4m3fn
+        and tuple(w_uk.shape) == (heads, lay.KV_LORA, lay.NOPE)
+        and w_uk.is_contiguous(),
+        f"{name}: W_UK is {w_uk.dtype} {tuple(w_uk.shape)}",
+    )
+    _need(
+        s_uk.dtype == torch.float32
+        and s_uk.numel() == 1
+        and s_uk.device == w_uk.device,
+        f"{name}: W_UK's scale is not one f32 beside it",
+    )
+    w_qb, s_qb = _block_fp8(attn.q_b_proj, f"{name} q_b_proj", (heads * lay.HEAD, lay.Q_LORA))
+    if impl.dcp_world_size > 1:
+        out_heads, compute_all = heads, True
+    else:
+        out_heads = impl.padded_num_heads if impl._fused_q_head_pad else heads
+        compute_all = False
+    return MlaAbsorbLayer(
+        layer_id=layer_id,
+        w_qb=w_qb,
+        s_qb=s_qb,
+        w_uk=w_uk,
+        s_uk=s_uk,
+        heads=heads,
+        out_heads=out_heads,
+        compute_all=compute_all,
+        attention=impl,
+    )
+
+
 def bind_fp8_o_proj(layer, layer_id: int, dims: Dims):
     """A KDA layer's o_proj as gfx1250's in-kernel o_proj reads it:
     ``(weight, scale)``, ``_block_fp8``'s per_1x128 FP8 layout."""
