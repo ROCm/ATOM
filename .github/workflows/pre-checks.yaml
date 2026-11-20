@@ -112,6 +112,8 @@ jobs:
         run: |
           # Install after the general suite: Triton changes optional test discovery.
           pip3 install triton
+          # A broken install fails here instead of skipping the module.
+          python3 -c "import triton"
           python3 -m pytest tests/test_mla_prefill_k_cat.py -q --junitxml=mla-k-copy-report.xml
       - name: Upload JUnit report
         if: ${{ !cancelled() }}

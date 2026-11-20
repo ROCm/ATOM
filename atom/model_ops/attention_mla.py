@@ -77,7 +77,7 @@ from atom.model_ops.triton_fused_qkv_quant import (
     fused_kv_per_tensor_quant,
     fused_qkv_per_tensor_quant,
 )
-from atom.model_ops.triton_mla_prefill_k_cat import _cat_prefill_k
+from atom.model_ops.triton_mla_prefill_k_cat import cat_prefill_k
 from atom.model_ops.utils import (
     dynamic_per_batched_tensor_quant,
     get_and_maybe_dequant_weights,
@@ -1167,10 +1167,17 @@ class MLAAttention(nn.Module):
             )
 
     def _prepare_prefill_k(self, k_nope, k_rope):
-        """Keep K split for FP8 quantization; materialize it for BF16 attention."""
+        """Keep K split for FP8 quantization; materialize it for BF16 attention.
+
+        A zero rope pad is sliced off before flash-attention (`_drop_rope_pad`),
+        so K is ``k_nope`` itself: the strided view is what `_drop_rope_pad`
+        hands flash-attention anyway, which takes the row pitch from the stride.
+        """
         if self._flydsl_fp8_mha_ok:
             return k_nope, None if self.rope_is_zero_pad else k_rope
-        return _cat_prefill_k(k_nope, k_rope), None
+        if self.rope_is_zero_pad:
+            return k_nope, None
+        return cat_prefill_k(k_nope, k_rope), None
 
     def _flash_attn_prefill(
         self,

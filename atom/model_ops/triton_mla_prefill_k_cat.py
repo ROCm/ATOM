@@ -40,11 +40,14 @@ def _prefill_k_cat_kernel(
     )
 
 
-# Initial settings from the MI455X (gfx1250) DSR1 MLPerf BF16 K benchmark:
-# 128 local heads, nope=128, rope=64, strided kv_b_proj views. These are
-# provisional defaults; compare with the existing copy helper before choosing
-# the final implementation, and retune for other architectures/head layouts.
-_PREFILL_K_CAT_MIN_TOKENS = 1024
+# Measured on MI455X (gfx1250), BF16 DSR1 K (nope=128, rope=64) from strided
+# kv_b_proj views, against the two-copy fallback below. 128 heads: the kernel
+# ties it at 512 tokens and wins from 1024 (-36%) to 10240 (-72%). 16 heads:
+# the fallback wins at 1024 tokens, they tie at 4096, the kernel wins at 10240.
+# Both cross near 65536 token-heads. In the sweep of head blocks 4..64 and 1..4
+# warps, head block 16 with one warp was fastest at 10240 tokens and within
+# noise of the others below that.
+_PREFILL_K_CAT_MIN_TOKEN_HEADS = 65536
 _PREFILL_K_CAT_HEAD_BLOCK = 16
 _PREFILL_K_CAT_NUM_WARPS = 1
 
@@ -54,8 +57,7 @@ def _prefill_k_cat_supported(k_nope: torch.Tensor, k_rope: torch.Tensor) -> bool
         k_nope.is_cuda
         and k_nope.dim() == 3
         and k_rope.dim() == 3
-        and k_nope.shape[0] >= _PREFILL_K_CAT_MIN_TOKENS
-        and k_nope.shape[1] > 0
+        and k_nope.shape[0] * k_nope.shape[1] >= _PREFILL_K_CAT_MIN_TOKEN_HEADS
         and k_nope.shape[-1] > 0
         and k_rope.shape[-1] > 0
         and k_rope.shape[:2] == (k_nope.shape[0], 1)
@@ -68,35 +70,48 @@ def _prefill_k_cat_supported(k_nope: torch.Tensor, k_rope: torch.Tensor) -> bool
     )
 
 
-def _cat_prefill_k(k_nope: torch.Tensor, k_rope: torch.Tensor) -> torch.Tensor:
-    """``torch.cat((k_nope, k_rope.expand(...)), -1)`` as one vectorized copy.
+def cat_prefill_k(k_nope: torch.Tensor, k_rope: torch.Tensor) -> torch.Tensor:
+    """K for MLA prefill attention: ``k_nope`` [T, H, nope] followed by
+    ``k_rope`` [T, 1, rope] broadcast over the heads, in one new contiguous
+    [T, H, nope + rope] tensor. The bytes are those of ``torch.cat``.
 
-    The kernel takes k_nope [T, H, nope] and k_rope [T, 1, rope], with unit
-    last strides, matching devices/dtypes and power-of-two feature widths.
-    It returns the same bytes in one contiguous [T, H, nope + rope] allocation.
-    Small batches and unsupported layouts use torch.cat with expanded RoPE.
+    One Triton copy from ``_PREFILL_K_CAT_MIN_TOKEN_HEADS`` token-heads on a
+    CUDA device, with unit last strides, one dtype and power-of-two widths.
+    Everything else (fewer token-heads, CPU tensors, other layouts) writes the
+    two slices of the new tensor with two copies, which is faster than
+    ``torch.cat`` of an expanded ``k_rope``.
     """
-    if not _prefill_k_cat_supported(k_nope, k_rope):
-        return torch.cat((k_nope, k_rope.expand((*k_nope.shape[:-1], -1))), dim=-1)
-    tokens, heads, nope_dim = k_nope.shape
-    rope_dim = k_rope.shape[-1]
+    if _prefill_k_cat_supported(k_nope, k_rope):
+        tokens, heads, nope_dim = k_nope.shape
+        rope_dim = k_rope.shape[-1]
+        k = torch.empty(
+            (tokens, heads, nope_dim + rope_dim),
+            dtype=k_nope.dtype,
+            device=k_nope.device,
+        )
+        head_block = min(_PREFILL_K_CAT_HEAD_BLOCK, triton.next_power_of_2(heads))
+        _prefill_k_cat_kernel[(tokens, triton.cdiv(heads, head_block))](
+            k,
+            k_nope,
+            k_rope,
+            k.stride(0),
+            k.stride(1),
+            k_nope.stride(0),
+            k_nope.stride(1),
+            k_rope.stride(0),
+            heads,
+            NOPE_DIM=nope_dim,
+            ROPE_DIM=rope_dim,
+            HEAD_BLOCK=head_block,
+            num_warps=_PREFILL_K_CAT_NUM_WARPS,
+        )
+        return k
+    nope_dim = k_nope.shape[-1]
     k = torch.empty(
-        (tokens, heads, nope_dim + rope_dim), dtype=k_nope.dtype, device=k_nope.device
+        (*k_nope.shape[:-1], nope_dim + k_rope.shape[-1]),
+        dtype=k_nope.dtype,
+        device=k_nope.device,
     )
-    head_block = min(_PREFILL_K_CAT_HEAD_BLOCK, triton.next_power_of_2(heads))
-    _prefill_k_cat_kernel[(tokens, triton.cdiv(heads, head_block))](
-        k,
-        k_nope,
-        k_rope,
-        k.stride(0),
-        k.stride(1),
-        k_nope.stride(0),
-        k_nope.stride(1),
-        k_rope.stride(0),
-        heads,
-        NOPE_DIM=nope_dim,
-        ROPE_DIM=rope_dim,
-        HEAD_BLOCK=head_block,
-        num_warps=_PREFILL_K_CAT_NUM_WARPS,
-    )
+    k[..., :nope_dim] = k_nope
+    k[..., nope_dim:] = k_rope
     return k

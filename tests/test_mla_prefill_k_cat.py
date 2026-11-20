@@ -47,7 +47,7 @@ def _load_methods(path, class_name, names, scope):
         ],
         type_ignores=[],
     )
-    # Only repository-owned method ASTs are executed; no PR text or external input.
+    # Only repository-owned method ASTs are executed.
     exec(  # noqa: S102
         compile(ast.fix_missing_locations(module), str(path), "exec"), scope
     )
@@ -59,7 +59,7 @@ def _load_methods(path, class_name, names, scope):
 mla = ModuleType("mla_dispatch_probe")
 mla.__dict__.update(
     torch=torch,
-    _cat_prefill_k=kcat._cat_prefill_k,
+    cat_prefill_k=kcat.cat_prefill_k,
     use_triton_gemm=lambda: False,
     flash_attn_varlen_func=None,
     fused_gemm_afp4wfp4_preshuffle_split_cat=None,
@@ -163,7 +163,7 @@ def test_kernel_bitwise_equals_cat(kernel_on_cpu, tokens, heads, nope, rope):
         return
     k_nope, _, k_rope = _inputs(tokens, heads, nope=nope, v=128, rope=rope)
     assert not k_nope.is_contiguous()
-    _assert_same(kcat._cat_prefill_k(k_nope, k_rope), _ref(k_nope, k_rope))
+    _assert_same(kcat.cat_prefill_k(k_nope, k_rope), _ref(k_nope, k_rope))
 
 
 @pytest.mark.parametrize("head_block", [1, 4, 32, 64])
@@ -175,7 +175,7 @@ def test_kernel_head_block_independent(kernel_on_cpu, monkeypatch, head_block):
         return
     monkeypatch.setattr(kcat, "_PREFILL_K_CAT_HEAD_BLOCK", head_block)
     k_nope, _, k_rope = _inputs(9, 48, seed=head_block)
-    _assert_same(kcat._cat_prefill_k(k_nope, k_rope), _ref(k_nope, k_rope))
+    _assert_same(kcat.cat_prefill_k(k_nope, k_rope), _ref(k_nope, k_rope))
 
 
 def test_kernel_contiguous_and_expanded_rope(kernel_on_cpu):
@@ -184,15 +184,20 @@ def test_kernel_contiguous_and_expanded_rope(kernel_on_cpu):
         return
     k_nope = torch.randn(6, 8, 128).to(torch.bfloat16)
     k_rope = torch.randn(1, 1, 64).to(torch.bfloat16).expand(6, 1, 64)
-    _assert_same(kcat._cat_prefill_k(k_nope, k_rope), _ref(k_nope, k_rope))
+    _assert_same(kcat.cat_prefill_k(k_nope, k_rope), _ref(k_nope, k_rope))
 
 
 def test_supported_gate(monkeypatch):
     monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: True))
-    k_nope, _, k_rope = _inputs(kcat._PREFILL_K_CAT_MIN_TOKENS, 16)
+    tokens = kcat._PREFILL_K_CAT_MIN_TOKEN_HEADS // 16
+    k_nope, _, k_rope = _inputs(tokens, 16)
     ok = kcat._prefill_k_cat_supported
     assert ok(k_nope, k_rope)
+    # The gate counts token-heads: fewer tokens, or fewer heads, decline.
     assert not ok(k_nope[:-1], k_rope[:-1])
+    assert not ok(k_nope[:, :8], k_rope)
+    wide, _, wide_rope = _inputs(tokens // 8, 128)
+    assert ok(wide, wide_rope)
     assert not ok(k_nope[:0], k_rope[:0])
     assert not ok(k_nope[:, :0], k_rope)
     assert not ok(k_nope[..., :0], k_rope)
@@ -206,12 +211,12 @@ def test_supported_gate(monkeypatch):
     assert not ok(k_nope, k_rope.transpose(0, 2).contiguous().transpose(0, 2))
 
 
-def test_cpu_falls_back_to_cat():
+def test_fallback_two_copies_equal_cat():
     k_nope, _, k_rope = _inputs(5, 16)
     assert not kcat._prefill_k_cat_supported(k_nope, k_rope)
-    _assert_same(kcat._cat_prefill_k(k_nope, k_rope), _ref(k_nope, k_rope))
+    _assert_same(kcat.cat_prefill_k(k_nope, k_rope), _ref(k_nope, k_rope))
     wide = k_rope.expand(-1, 16, -1)
-    _assert_same(kcat._cat_prefill_k(k_nope, wide), _ref(k_nope, wide))
+    _assert_same(kcat.cat_prefill_k(k_nope, wide), _ref(k_nope, wide))
 
 
 class _KvB:
@@ -248,6 +253,15 @@ def _impl(fp8_ok, heads, kv=None):
     ):
         setattr(impl, name, MethodType(getattr(mla.MLAAttention, name), impl))
     return impl
+
+
+def test_prepare_prefill_k_zero_rope_pad_is_k_nope():
+    # The pad lanes are sliced off before attention: no copy is made.
+    k_nope, _, k_rope = _inputs(3, 16)
+    impl = _impl(False, 16)
+    impl.rope_is_zero_pad = True
+    k, rope = impl._prepare_prefill_k(k_nope, torch.zeros_like(k_rope))
+    assert k is k_nope and rope is None
 
 
 def test_prepare_prefill_k_fp8_split_unchanged():
