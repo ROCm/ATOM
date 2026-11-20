@@ -139,6 +139,9 @@ stages need ROCm/aiter#8297 (see AITER requirements). The decode cannot use
 PP: a kv_consumer with PP > 1 is rejected at startup.
 
 ```bash
+# On both nodes: the validated run had mono off and ReplaySSM on.
+export AITER_LOG_LEVEL=WARNING ATOM_MONO_ENABLE=0 ATOM_ENABLE_REPLAYSSM=1
+
 # Prefill (producer)
 python -m atom.entrypoints.openai_server \
   --model /data/Kimi-K3.1-Pro --trust-remote-code \
