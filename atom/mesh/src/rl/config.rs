@@ -15,4 +15,3 @@ pub struct RlConfig {
     #[arg(id = "rl_api_key", long = "rl-api-key")]
     pub api_key: Option<String>,
 }
-
