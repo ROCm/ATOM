@@ -2628,7 +2628,8 @@ models:
             wait_server_timeout: 7200
           run_eval: false
 
-        # Hosts the Store restore check (bin/evict_needle_pd.py) at light load: fp8 draft, draft window.
+        # Hosts the Store restore check (bin/evict_needle_pd.py) at light load: fp8 draft, draft window,
+        # real DSpark acceptance (no golden AL, so answers are checked).
         - name: m31v-nvfp4-1p1d-pp4-tp4-dspark7-fp8draft-mcstore-needlehost-c4
           topology: 1p1d
           display_topology: 1P1D-PP4-TP4-DSPARK7-NVFP4-MCSTORE-DRAFTWIN-PRVAL
@@ -2645,7 +2646,6 @@ models:
           server:
             common_args:
               max_num_seqs: 240
-              spec_decode_acceptance_length: 4.04
           env:
             common: *m31v_common_env
             prefill: *m31v_prefill_env
@@ -2672,7 +2672,6 @@ models:
           server:
             common_args:
               max_num_seqs: 240
-              spec_decode_acceptance_length: 4.04
               extra_args: "--index-cache-dtype nvfp4"
           env:
             common: *m31v_common_env
