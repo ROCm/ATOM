@@ -11,22 +11,44 @@ from atom.config import FP4_CACHE_DTYPES
 # LMCache offload moves both as opaque per-block bytes.
 NVFP4_PAGE_CONNECTORS = frozenset({"lmcache_offload"})
 
+# A draft whose KV dtype differs from the target's has been verified (save and restore)
+# only as a DSpark draft under these, whatever NVFP4_PAGE_CONNECTORS grows to take.
+DRAFT_DTYPE_CONNECTORS = frozenset({"lmcache_offload"})
 
-def _connectors_move_nvfp4_pages(config) -> bool:
-    """Whether every configured transport can move NVFP4 pages."""
+
+def _leaves_within(config, names) -> bool:
+    """Whether every configured transport, ``multi`` expanded, is one of ``names``."""
     from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 
     try:
         leaves = KVConnectorFactory.leaf_connectors(config)
     except ValueError:  # an unknown connector: refused by the caller
         return False
-    return bool(leaves) and all(name in NVFP4_PAGE_CONNECTORS for name, _ in leaves)
+    return bool(leaves) and all(name in names for name, _ in leaves)
+
+
+def _connectors_move_nvfp4_pages(config) -> bool:
+    """Whether every configured transport can move NVFP4 pages."""
+    return _leaves_within(config, NVFP4_PAGE_CONNECTORS)
 
 
 def nvfp4_pages_move(config) -> bool:
-    """Whether this config's NVFP4 KV and index pages -- and an own-pool draft's
-    beside them, whatever its dtype -- move under every transport it runs."""
+    """Whether this config's NVFP4 KV and index pages move under every transport it
+    runs."""
     return config.kv_cache_dtype == "nvfp4" and _connectors_move_nvfp4_pages(config)
+
+
+def draft_dtype_moves(config) -> bool:
+    """Whether an own-pool draft may keep a KV dtype other than the target's under this
+    config's transports: a DSpark draft beside an NVFP4 KV, every transport in
+    ``DRAFT_DTYPE_CONNECTORS``."""
+    spec = config.speculative_config
+    return (
+        config.kv_cache_dtype == "nvfp4"
+        and spec is not None
+        and spec.method == "dspark"
+        and _leaves_within(config, DRAFT_DTYPE_CONNECTORS)
+    )
 
 
 def _fp4_kv_refusal(config) -> str | None:

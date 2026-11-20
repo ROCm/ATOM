@@ -3330,17 +3330,18 @@ class Config:
                 requested=spec.kv_cache_dtype,
             )
             from atom.models.minimax_m3.config import (
-                NVFP4_PAGE_CONNECTORS,
-                nvfp4_pages_move,
+                DRAFT_DTYPE_CONNECTORS,
+                draft_dtype_moves,
             )
 
-            # An NVFP4 MiniMax-M3 target's own-pool draft moves with its pages:
+            # A MiniMax-M3 DSpark draft beside an NVFP4 KV moves with its pages:
             # they follow the target's as bytes of their own, and the PAGE
-            # namespace hashes the draft KV dtype, so they never share a key.
+            # namespace hashes the draft KV dtype, so a store written with
+            # another draft dtype is never read back.
             if (
                 spec.draft_kv_dtype != self.kv_cache_dtype
                 and self.kv_transfer_config
-                and not (is_m3 and draft_owns_kv_pool(self) and nvfp4_pages_move(self))
+                and not (is_m3 and draft_owns_kv_pool(self) and draft_dtype_moves(self))
             ):
                 # Not verified: no other KV connector or offload path (save,
                 # restore, P/D transfer) has run with a draft whose dtype differs
@@ -3352,12 +3353,16 @@ class Config:
                     else ". Pass --spec-decode-kv-cache-dtype "
                     f"{self.kv_cache_dtype} to match the target"
                 )
+                exception = (
+                    ", except a MiniMax-M3 DSpark draft beside an NVFP4 KV under "
+                    + ", ".join(sorted(DRAFT_DTYPE_CONNECTORS))
+                    if is_m3
+                    else ""
+                )
                 raise ValueError(
                     f"draft KV dtype {spec.draft_kv_dtype} differs from the "
                     f"target's {self.kv_cache_dtype}: not supported with KV "
-                    "offload or --kv-transfer-config, except a MiniMax-M3 own-pool "
-                    "draft beside an NVFP4 KV under "
-                    f"{', '.join(sorted(NVFP4_PAGE_CONNECTORS))}{hint}"
+                    f"offload or --kv-transfer-config{exception}{hint}"
                 )
         if is_m3:
             from atom.models.minimax_m3.config import validate_runtime_config
