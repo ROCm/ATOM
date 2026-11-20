@@ -1384,9 +1384,8 @@ models:
               LMCACHE_MAX_LOCAL_CPU_SIZE: "192"
 
       # gsm8k-only PD cell over MoRI IO, prefill and decode on a node each. No
-      # DSpark, so it needs no draft model and has no ReplaySSM record buffers,
-      # which the MoRIIO connector refuses: it moves the MLA KV by block and the
-      # KDA recurrent state by slot.
+      # DSpark, so it needs no draft model. The connector moves the MLA KV by
+      # block and the KDA recurrent state by slot.
       accuracy:
         - name: kimi-k3-mxfp4-1p1d-tp8-moriio-gsm8k
           topology: 1p1d_tp8_moriio
@@ -1419,7 +1418,7 @@ models:
               KV_CONNECTOR: moriio
               # MoRI IO moves the KDA state only when prefill pushes it.
               ATOM_MORIIO_MODE: write
-              # The connector refuses ReplaySSM buffers; pinned, not inherited.
+              # No DSpark, so no ReplaySSM records; pinned, not inherited.
               ATOM_ENABLE_REPLAYSSM: "0"
           benchmark:
             # A cold read of the weights from NFS plus online FP8 quantization

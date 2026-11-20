@@ -317,6 +317,11 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         """
         return {}
 
+    def replay_cursor(self) -> "torch.Tensor | None":
+        """ReplaySSM's per-slot record cursor, shared by every linear-attention
+        layer; None for a backend without ReplaySSM records."""
+        return None
+
     def state_transfer(self) -> StateTransfer:
         """How this backend hands one request's state to another slot.
 

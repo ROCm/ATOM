@@ -2359,9 +2359,9 @@ class ModelRunner:
 
         transfer_tensors = self.attn_metadata_builder.get_kv_transfer_tensors()
         if transfer_tensors is not None:
-            # The tier is built inside `register_kv_caches` and needs
-            # `state_entry_views` to name the bytes it packs. This is the only
-            # place the builder and the connector are both in scope.
+            # The state tier (built inside `register_kv_caches`) needs the
+            # builder's `state_entry_views`, and MoRIIO its `replay_cursor()`.
+            # This is the only place the builder and the connector are both in scope.
             transfer_tensors.state_backend = self.attn_metadata_builder
         if hasattr(self, "draft_kv_builder") and transfer_tensors is not None:
             transfer_tensors.merge_pages(
