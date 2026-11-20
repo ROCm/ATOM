@@ -95,6 +95,9 @@ class KVConnectorFactory:
     # data and e8m0 scale). Absent means no: the P/D backends parse one region
     # per role and layer.
     _copies_whole_block_regions: ClassVar[dict[str, bool]] = {}
+    # Whether a backend moves NVFP4 KV and index pages (`topology_moves_nvfp4_pages`).
+    # Absent means no.
+    _moves_nvfp4_pages: ClassVar[dict[str, bool]] = {}
     # Whether a backend is a KV offload tier, whose scheduler half rewrites the
     # completion sets it is handed (`process_completions`). Absent means no.
     _offload: ClassVar[dict[str, bool]] = {}
@@ -125,6 +128,7 @@ class KVConnectorFactory:
         shared_tier: bool = False,
         chunk_tokens: str | None = None,
         lowers_hbm_hit_to_chunk: bool = False,
+        moves_nvfp4_pages: bool = False,
     ) -> None:
         """Register a KV connector backend.
 
@@ -149,6 +153,8 @@ class KVConnectorFactory:
                 (`offload_tier`).
             lowers_hbm_hit_to_chunk: Admission may reload an unaligned HBM tail
                 from the preceding transfer chunk, rather than recompute it.
+            moves_nvfp4_pages: The backend moves NVFP4 KV and index pages: by the
+                head runs their layout declares, or whole.
         """
         cls._registry[name] = {
             "worker_module": worker_module,
@@ -181,6 +187,7 @@ class KVConnectorFactory:
         cls._min_load_tokens[name] = min_load_tokens
         cls._shared_tier[name] = bool(shared_tier)
         cls._lowers_hbm_hit_to_chunk[name] = bool(lowers_hbm_hit_to_chunk)
+        cls._moves_nvfp4_pages[name] = bool(moves_nvfp4_pages)
         if chunk_tokens:
             cls._chunk_tokens[name] = chunk_tokens
 
@@ -413,6 +420,20 @@ class KVConnectorFactory:
         )
 
     @classmethod
+    def topology_moves_nvfp4_pages(cls, config: Any) -> bool:
+        """Does every transport `config` runs declare `moves_nvfp4_pages`? False when
+        it runs none or the topology cannot be parsed."""
+        leaves = cls.leaf_connectors(config)
+        return bool(leaves) and all(
+            cls._moves_nvfp4_pages.get(name, False) for name, _ in leaves
+        )
+
+    @classmethod
+    def nvfp4_page_connectors(cls) -> tuple[str, ...]:
+        """The registered backends that declare `moves_nvfp4_pages`, sorted."""
+        return tuple(sorted(n for n, moves in cls._moves_nvfp4_pages.items() if moves))
+
+    @classmethod
     def _leaf_reads_block_regions(cls, connector: str, config: Any) -> bool:
         declared = cls._reads_block_regions.get(connector, True)
         if isinstance(declared, bool):
@@ -498,6 +519,9 @@ KVConnectorFactory.register(
     worker_class="MooncakeConnector",
     scheduler_module="atom.kv_transfer.disaggregation.mooncake.mooncake_connector",
     scheduler_class="MooncakeConnectorScheduler",
+    # Cuts an NVFP4 KV page by the head runs `Nvfp4KvLayout.head_runs` declares; the
+    # index page has no head axis and moves whole.
+    moves_nvfp4_pages=True,
 )
 
 # Composite backend: fans out to several sub-connectors listed under
