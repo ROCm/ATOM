@@ -5,72 +5,36 @@
 
 from __future__ import annotations
 
-import itertools
+import functools
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 
-# A segment gather passes each segment's bounds to its kernel as constants; four fit
-# the widest named-run page, NVFP4 K/V (K data, K scales, V data, V scales).
-MAX_SEGMENTS = 4
+from atom.kv_transfer.disaggregation.sharded_transfer import coalesce_contiguous
+
+# A gather program copies one table row of at most this many words, its BLOCK.
+_PIECE_WORDS = 256
 
 
 @dataclass(frozen=True)
 class GatherLayout:
-    """One source unit's strided slices covering a complete destination unit.
+    """The ``(src offset, bytes)`` segments of a source unit that, laid end to
+    end, make one destination unit.
 
     Units may be contiguous token rows or physical PAGEs. Ownership is supplied
-    separately as the source index tensor; this describes only physical bytes.
-    ``first``, ``src_stride`` and ``width`` describe strided slices, such as one
-    rank's heads of a PAGE.
+    separately as the source index tensor; this describes only physical bytes,
+    such as one rank's heads of a PAGE.
     """
 
     source_bytes: int
     unit_bytes: int
-    first: int
-    src_stride: int
-    width: int
-    # `(src offset, bytes)` slices laid end to end, where one stride cannot
-    # describe them (NVFP4 pages: data and scale runs of different widths).
-    segments: tuple[tuple[int, int], ...] = ()
+    segments: tuple[tuple[int, int], ...]
 
     def __post_init__(self):
-        if self.segments:
-            self._check_segments()
-            return
-        if min(self.source_bytes, self.unit_bytes, self.src_stride, self.width) <= 0:
-            raise ValueError("Invalid gather byte geometry")
         if (
-            self.first < 0
-            or any(
-                x % 4
-                for x in (
-                    self.source_bytes,
-                    self.unit_bytes,
-                    self.first,
-                    self.src_stride,
-                    self.width,
-                )
-            )
-            or self.unit_bytes % self.width
-        ):
-            raise ValueError("Gather slices must cover aligned 4-byte units")
-        end = (
-            self.first
-            + (self.unit_bytes // self.width - 1) * self.src_stride
-            + self.width
-        )
-        if end > self.source_bytes:
-            raise ValueError("Gather slices exceed the source unit")
-
-    def _check_segments(self) -> None:
-        if len(self.segments) > MAX_SEGMENTS:
-            raise ValueError(
-                f"Gather segments {self.segments}: the segment kernel takes at "
-                f"most {MAX_SEGMENTS}"
-            )
-        if (
-            self.source_bytes % 4
+            not self.segments
+            or self.source_bytes % 4
             or sum(size for _, size in self.segments) != self.unit_bytes
             or any(
                 size <= 0
@@ -88,29 +52,23 @@ class GatherLayout:
 
     @classmethod
     def from_slices(cls, source_bytes: int, unit_bytes: int, slices) -> GatherLayout:
-        """The layout of ``[src offset, dst offset, bytes]`` rows that fill a unit in
-        order, such as ``consumer_head_slices`` cuts: one stride, else segments."""
-        rows = [tuple(int(x) for x in row) for row in slices]
-        ends = list(itertools.accumulate(size for *_, size in rows))
-        if ends[-1] != unit_bytes or [dst for _, dst, _ in rows] != [0, *ends[:-1]]:
-            raise ValueError("Gather slices must fill the destination unit in order")
-        first, _, width = rows[0]
-        stride = rows[1][0] - first if len(rows) > 1 else source_bytes
-        if all(
-            (src, size) == (first + i * stride, width)
-            for i, (src, _, size) in enumerate(rows)
+        """The segments of ``[src offset, dst offset, bytes]`` rows that fill a unit
+        in order, such as ``consumer_head_slices`` cuts; source-adjacent rows merge."""
+        src, dst, size = np.asarray(slices, dtype=np.int64).reshape(-1, 3).T
+        if (
+            not size.size
+            or size.sum() != unit_bytes
+            or (dst != size.cumsum() - size).any()
         ):
-            return cls(source_bytes, unit_bytes, first, stride, width)
-        segments = tuple((src, size) for src, _, size in rows)
-        return cls(source_bytes, unit_bytes, first, source_bytes, width, segments)
+            raise ValueError(
+                f"{size.size} gather slices must fill a {unit_bytes} B unit in order"
+            )
+        src, _, size = coalesce_contiguous(src, dst, size)
+        return cls(source_bytes, unit_bytes, tuple(zip(src.tolist(), size.tolist())))
 
     @property
     def whole_unit(self) -> bool:
-        return (
-            not self.segments
-            and self.first == 0
-            and self.width == self.source_bytes == self.unit_bytes
-        )
+        return self.segments == ((0, self.source_bytes),)
 
 
 def gather_units(
@@ -119,8 +77,8 @@ def gather_units(
     """Copy this rank's byte slices of the units ``indices`` names into ``out``.
 
     ``source`` and ``out`` are contiguous byte views, ``out`` exactly one unit
-    per index; a strided or segment ``plan`` needs them on GPU. No dequantization
-    or KV format change.
+    per index; a plan that is not the whole unit needs them on GPU. No
+    dequantization or KV format change.
     """
     if not indices.numel():
         return
@@ -133,45 +91,36 @@ def gather_units(
         )
         return
     # Imported here, so the whole-unit path runs without Triton.
-    from atom.kv_transfer.disaggregation import gather_kernels
+    from atom.kv_transfer.disaggregation.gather_kernels import gather_unit_pieces
 
-    if plan.segments:
-        kernel, constants = gather_kernels.gather_segment_units, _segment_bounds(plan)
-    else:
-        kernel = gather_kernels.gather_strided_units
-        constants = {
-            "FIRST": plan.first // 4,
-            "STRIDE": plan.src_stride // 4,
-            "WIDTH": plan.width // 4,
-        }
-    words = plan.unit_bytes // 4
-    kernel[(indices.numel(), -(-words // 256))](
+    pieces = _device_pieces(plan, source.device)
+    gather_unit_pieces[(indices.numel(), pieces.shape[0])](
         source.view(torch.int32),
         indices,
         out.view(torch.int32),
-        SRC_WORDS=plan.source_bytes // 4,
-        DST_WORDS=words,
-        BLOCK=256,
+        pieces,
+        plan.source_bytes // 4,
+        plan.unit_bytes // 4,
+        BLOCK=_PIECE_WORDS,
         num_warps=1,
-        **constants,
     )
 
 
-def _segment_bounds(plan: GatherLayout) -> dict[str, int]:
-    """``gather_segment_units``' word bounds: where each segment starts in the source
-    unit (``O0``-``O3``) and ends in the destination (``E0``-``E2``)."""
-    starts = [offset // 4 for offset, _ in plan.segments]
-    ends = list(itertools.accumulate(size // 4 for _, size in plan.segments))
-    # Pad to four with empty segments, each ending where the last one does.
-    pad = MAX_SEGMENTS - len(starts)
-    starts += starts[-1:] * pad
-    ends += ends[-1:] * pad
-    return {
-        "O0": starts[0],
-        "O1": starts[1],
-        "O2": starts[2],
-        "O3": starts[3],
-        "E0": ends[0],
-        "E1": ends[1],
-        "E2": ends[2],
-    }
+def _pieces(plan: GatherLayout) -> np.ndarray:
+    """``plan.segments`` as int32 ``[src word, dst word, words]`` rows of at most
+    ``_PIECE_WORDS`` words, one gather program each."""
+    rows, at = [], 0
+    for offset, size in plan.segments:
+        words = size // 4
+        for start in range(0, words, _PIECE_WORDS):
+            rows.append(
+                (offset // 4 + start, at + start, min(_PIECE_WORDS, words - start))
+            )
+        at += words
+    return np.array(rows, dtype=np.int32)
+
+
+@functools.cache
+def _device_pieces(plan: GatherLayout, device: torch.device) -> torch.Tensor:
+    # A blocking copy, so the table is whole before any worker's stream reads it.
+    return torch.from_numpy(_pieces(plan)).to(device)

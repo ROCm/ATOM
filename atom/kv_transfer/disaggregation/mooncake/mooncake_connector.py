@@ -982,8 +982,9 @@ class _UnitPlan:
     """Where a producer's PAGE regions land on one consumer rank."""
 
     cmap: list[int]
-    # Per region, when cutting heads: (consumer block bytes, slice rows).
-    cuts: list[tuple[int, np.ndarray]] | None
+    # Per region, when cutting heads: (consumer block bytes, slice rows, their
+    # staged gather).
+    cuts: list[tuple[int, np.ndarray, GatherLayout]] | None
     num_consumer_regions: int = 0
 
 
@@ -3212,15 +3213,13 @@ class MooncakeConnector(KVConnectorBase):
                 f"DCP; got producer TP {self.tp_size} DCP {self.dcp_size}, "
                 f"consumer TP {tp} DCP {dcp}"
             )
-        cuts = [
-            (
-                widths[c],
-                consumer_head_slices(
-                    ours[i][1], widths[c], ours[i][0], runs[c], rank, tp, str(specs[c])
-                ),
+        cuts = []
+        for i, c in enumerate(cmap):
+            rows = consumer_head_slices(
+                ours[i][1], widths[c], ours[i][0], runs[c], rank, tp, str(specs[c])
             )
-            for i, c in enumerate(cmap)
-        ]
+            gather = GatherLayout.from_slices(ours[i][1], widths[c], rows)
+            cuts.append((widths[c], rows, gather))
         return _UnitPlan(cmap, cuts, len(specs))
 
     def _consumer_dcp_plan(
@@ -3373,7 +3372,7 @@ class MooncakeConnector(KVConnectorBase):
             role = self._block_region_roles[region_idx]
             if plan.cuts is not None:
                 # Write this consumer's heads of every head-major run.
-                dst_bpb, cuts = plan.cuts[region_idx]
+                dst_bpb, cuts, _ = plan.cuts[region_idx]
                 src = source_blocks[:, None] * bpb + cuts[:, 0]
                 dst = destination_blocks[:, None] * dst_bpb + cuts[:, 1]
                 if not batch.add(
@@ -3490,15 +3489,8 @@ class MooncakeConnector(KVConnectorBase):
         return self._check_staging_sources(
             page_transfer_plan(
                 [
-                    PlannedRegion(
-                        region,
-                        consumer,
-                        bases[consumer],
-                        GatherLayout.from_slices(
-                            self._per_block_bytes_list[region], dst_bytes, rows
-                        ),
-                    )
-                    for region, (consumer, (dst_bytes, rows)) in enumerate(
+                    PlannedRegion(region, consumer, bases[consumer], gather)
+                    for region, (consumer, (_, _, gather)) in enumerate(
                         zip(plan.cmap, plan.cuts)
                     )
                 ],

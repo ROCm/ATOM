@@ -3,11 +3,16 @@
 
 import ctypes
 
+import numpy as np
 import pytest
 import torch
 
-from atom.kv_transfer.disaggregation.gather import GatherLayout, gather_units
-from atom.kv_transfer.disaggregation.sharded_transfer import consumer_head_slices
+from atom.kv_transfer.disaggregation.gather import GatherLayout, _pieces, gather_units
+from atom.kv_transfer.disaggregation.sharded_transfer import (
+    coalesce_contiguous,
+    consumer_head_slices,
+    kv_heads_of_rank,
+)
 from atom.kv_transfer.disaggregation.transfer_plan import (
     PAGE_UNITS,
     TOKEN_UNITS,
@@ -23,12 +28,8 @@ def reference_gather_units(source, indices, out, plan):
     """``gather_units`` on host tensors: its non-whole-unit gathers are GPU kernels."""
     src = source.reshape(-1, plan.source_bytes)
     dst = out.view(indices.numel(), plan.unit_bytes)
-    slices = plan.segments or [
-        (plan.first + i * plan.src_stride, plan.width)
-        for i in range(plan.unit_bytes // plan.width)
-    ]
     at = 0
-    for first, size in slices:
+    for first, size in plan.segments:
         dst[:, at : at + size] = src[indices, first : first + size]
         at += size
 
@@ -102,12 +103,14 @@ def test_tp_rank_owns_its_heads_of_each_page(rank, heads):
         32 * heads, 32, (heads, (4,) * 8), (1, (4,) * 8), rank, 4, "page"
     )
     gather = GatherLayout.from_slices(32 * heads, 32, cuts)
+    head = rank * heads // 4
+    # Equal runs are segments too: one per run, `heads` 4 B heads apart.
+    assert gather.segments == tuple((r * heads * 4 + head * 4, 4) for r in range(8))
     plan = page_transfer_plan(
         [PlannedRegion(0, 7, destination.data_ptr(), gather)], ids, dst_ids
     )
     assert plan.wire_layout == PAGE_UNITS
     execute_plan(plan, source, destination)
-    head = rank * heads // 4
     assert torch.equal(destination[dst_ids], source[ids, :, head : head + 1, :])
     assert not destination[list(set(range(5)) - set(dst_ids))].any()
     assert plan.regions[0].target_region == 7  # explicit PP region mapping
@@ -147,40 +150,77 @@ def test_named_run_widths_gather_into_one_target_page(rank):
     assert not destination[list(set(range(5)) - set(dst_ids))].any()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton gather kernels")
-@pytest.mark.parametrize("rank", range(4))
-@pytest.mark.parametrize(
-    "widths",
-    [None, (64, 16), (8192, 1024, 8192, 1024)],
-    ids=["equal-runs", "two-named-runs", "nvfp4"],
-)
-def test_gather_kernels_match_the_host_reference(widths, rank):
-    # A TP1 page of four heads cut for each TP4 rank, as equal runs or named widths.
-    heads = 4
-    if widths is None:
-        src_runs, dst_runs, src_bytes = (
-            (heads, (128,) * 8),
-            (1, (128,) * 8),
-            8 * heads * 128,
-        )
-    else:
-        src_runs, dst_runs = (heads, widths), (1, widths)
-        src_bytes = heads * sum(widths)
+def test_a_contiguous_cut_gathers_the_whole_unit():
+    # One KV head replicated to every TP4 rank: each rank's cut is the whole page.
     cuts = consumer_head_slices(
-        src_bytes, src_bytes // heads, src_runs, dst_runs, rank, 4, "page"
+        24, 24, (1, (8, 4, 8, 4)), (1, (8, 4, 8, 4)), 2, 4, "kv"
     )
-    layout = GatherLayout.from_slices(src_bytes, src_bytes // heads, cuts)
-    assert len(layout.segments) == (0 if widths is None else len(widths))
-    generator = torch.Generator().manual_seed(rank)
-    source = torch.randint(
-        0, 256, (6 * src_bytes,), dtype=torch.uint8, generator=generator
-    )
-    indices = torch.tensor([4, 0, 5, 2])
-    want = torch.empty(indices.numel() * layout.unit_bytes, dtype=torch.uint8)
-    reference_gather_units(source, indices, want, layout)
-    out = torch.empty_like(want, device="cuda")
-    gather_units(source.cuda(), indices.cuda(), out, layout)
-    assert torch.equal(out.cpu(), want)
+    assert len(cuts) == 4
+    layout = GatherLayout.from_slices(24, 24, cuts)
+    assert layout.segments == ((0, 24),) and layout.whole_unit
+    source = torch.arange(3 * 24, dtype=torch.uint8)
+    out = torch.empty(2 * 24, dtype=torch.uint8)
+    gather_units(source, torch.tensor([2, 0]), out, layout)  # index_select, no Triton
+    assert torch.equal(out, source.view(3, 24)[[2, 0]].reshape(-1))
+    # Two of four heads in one run: the rank's heads merge into one segment.
+    cuts = consumer_head_slices(64, 32, (4, (16,)), (2, (16,)), 1, 2, "kv")
+    assert GatherLayout.from_slices(64, 32, cuts).segments == ((32, 32),)
+
+
+@pytest.mark.parametrize("slices", [[], np.empty((0, 3), dtype=np.int64)])
+def test_an_empty_cut_is_refused(slices):
+    with pytest.raises(ValueError, match="0 gather slices"):
+        GatherLayout.from_slices(24, 24, slices)
+
+
+# TP1 pages as `(each run's width per head, heads)`, cut for every TP2 / TP4 rank.
+CUTS = {
+    "eight-equal-runs": ((128,) * 8, 4),
+    "two-named-runs": ((64, 16), 4),
+    "nvfp4": ((8192, 1024, 8192, 1024), 4),
+    "five-named-runs": ((8, 4, 8, 4, 4), 4),
+    "one-run": ((2048,), 4),
+    "nvfp4-two-heads": ((8192, 1024, 8192, 1024), 2),
+}
+
+
+def _cut_layouts(name):
+    widths, heads = CUTS[name]
+    for tp in (2, 4):
+        for rank in range(tp):
+            count = kv_heads_of_rank(rank, tp, heads)[1]
+            src, dst = heads * sum(widths), count * sum(widths)
+            cuts = consumer_head_slices(
+                src, dst, (heads, widths), (count, widths), rank, tp, name
+            )
+            yield GatherLayout.from_slices(src, dst, cuts)
+
+
+@pytest.mark.parametrize("name", CUTS)
+def test_piece_table_splits_each_segment_into_kernel_blocks(name):
+    for layout in _cut_layouts(name):
+        src, dst, words = _pieces(layout).astype(np.int64).T
+        assert words.min() > 0 and words.max() <= 256
+        assert (dst == words.cumsum() - words).all()  # the destination, in order
+        src, _, words = coalesce_contiguous(src, dst, words)
+        assert tuple(zip((4 * src).tolist(), (4 * words).tolist())) == layout.segments
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton gather kernel")
+@pytest.mark.parametrize("name", CUTS)
+def test_gather_kernel_matches_the_host_reference(name):
+    # Every TP2 and TP4 rank's cut, as equal runs or named widths, up to eight segments.
+    for layout in _cut_layouts(name):
+        generator = torch.Generator().manual_seed(layout.source_bytes)
+        source = torch.randint(
+            0, 256, (6 * layout.source_bytes,), dtype=torch.uint8, generator=generator
+        )
+        indices = torch.tensor([4, 0, 5, 2])
+        want = torch.empty(indices.numel() * layout.unit_bytes, dtype=torch.uint8)
+        reference_gather_units(source, indices, want, layout)
+        out = torch.full_like(want, 0xA5, device="cuda")
+        gather_units(source.cuda(), indices.cuda(), out, layout)
+        assert torch.equal(out.cpu(), want), layout
 
 
 def test_tp_replicated_units_can_also_be_partitioned_by_dcp():
