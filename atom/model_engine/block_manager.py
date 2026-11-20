@@ -1040,16 +1040,21 @@ class BlockManager:
         gated = self._draft_rows_gate(seq, hit, ids)
         if gated == hit:
             return hit
-        # `can_allocate`'s demand, at the cut hit: every block not claimed in use.
+        # `can_allocate`'s demand, at the cut hit.
         claimed = [self.kv.lookup(h) for h in chain[:gated]]
-        demand = (
-            self._n_hash_blocks(seq)
-            - self.kv.count_used(claimed, gated)
-            + self.draft_lookahead_blocks(len(seq))
-        )
+        demand = self._admission_demand(seq, claimed, gated)
         if not self._has_page_units(demand, chain[gated - 1] if gated else None):
             return -1
         return gated
+
+    def _admission_demand(self, seq: Sequence, block_ids, hit: int) -> int:
+        """Free-pool blocks admitting `seq` at a `hit`-block prefix takes, where
+        `block_ids[i]` holds block `i` (`_evaluate`)."""
+        return (
+            self._n_hash_blocks(seq)
+            - self.kv.count_used(block_ids, hit)
+            + self.draft_lookahead_blocks(len(seq))
+        )
 
     def mark_draft_rows_missing(
         self, seq: Sequence, start_token: int, end_token: int
@@ -1393,11 +1398,7 @@ class BlockManager:
         # (shared ref); blocks we drop from the hit become fresh → counted.
         # Plus the draft round's lookahead past the prompt, which the scheduler
         # allocates right after `allocate` (`may_append(..., lookahead=)`).
-        num_new_blocks = (
-            self._n_hash_blocks(seq)
-            - self.kv.count_used(walk.ids, num_cached_blocks)
-            + self.draft_lookahead_blocks(len(seq))
-        )
+        num_new_blocks = self._admission_demand(seq, walk.ids, num_cached_blocks)
         protected_hash = (
             block_hashes[num_cached_blocks - 1] if num_cached_blocks else None
         )
