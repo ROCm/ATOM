@@ -624,9 +624,10 @@ folded or unknown consumer rebuilds separate work buffers, preserving the templa
 for later native layers. Unqualified steps keep the existing rebuild path.
 
 Reuse is limited to 256 query rows and the exact geometry's workgroup capacity;
-the backing buffers cover both speculative and single-token geometry. Each plan
-publishes only its active work-indptr prefix, whose final GPU-written entry counts
-work items. This preserves the known
+the backing buffers cover the configured query-width range, including intermediate
+capture buckets. Every plan publishes only its active work-indptr prefix, whether
+it qualifies for reuse or not: AITER launches from that tensor's length, and its
+final GPU-written entry counts work items. This preserves the known
 [empty-item boundary](https://github.com/wuhuikx/LLM-Booster/issues/570) above
 256 rows. Rebuilding is not an unconditional numerical reference for empty rows.
 The template must fit the consumer's query rows, including an unpadded drafter;

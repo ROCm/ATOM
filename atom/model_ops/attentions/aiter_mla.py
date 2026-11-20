@@ -1086,19 +1086,34 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         allocated = sizes(max_q_len)
         if not self.sparse_dcp_metadata_rebuild or max_q_len == 1:
             return allocated
-        # Speculative and single-token decode can have different occupancy.
-        # Reserve every buffer for both, including the larger workgroup count.
-        return tuple(
-            (
+        # An intermediate capture width can have higher occupancy than either
+        # endpoint. Reserve every buffer for the configured query-width range.
+        for query_length in range(1, max_q_len):
+            allocated = tuple(
                 (
-                    tuple(max(a, b) for a, b in zip(shape, single, strict=True))
-                    if isinstance(shape, tuple)
-                    else max(shape, single)
-                ),
-                dtype,
+                    (
+                        tuple(max(a, b) for a, b in zip(shape, other, strict=True))
+                        if isinstance(shape, tuple)
+                        else max(shape, other)
+                    ),
+                    dtype,
+                )
+                for (shape, dtype), (other, _) in zip(
+                    allocated, sizes(query_length), strict=True
+                )
             )
-            for (shape, dtype), (single, _) in zip(allocated, sizes(1), strict=True)
+        return allocated
+
+    def _active_work_indptr(self, work_indptr, heads, max_q_len):
+        # AITER launches one worker per entry minus one, even without plan reuse.
+        groups = get_mla_decode_fwd_max_splits(
+            heads, max_q_len, self.dtype_q, self.dtype_kv
         )
+        if work_indptr.numel() < groups + 1:
+            raise RuntimeError(
+                "MLA work-indptr capacity is smaller than its active plan"
+            )
+        return work_indptr[: groups + 1]
 
     def _sparse_dcp_decode_plan(self, rows: int, heads: int, work_indptr):
         """Describe a native template with one whole query row per workgroup."""
@@ -1157,12 +1172,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         }
         work_meta_data = var["sparse_mtp_work_meta_data"]
         work_info_set = var["sparse_mtp_work_info_set"]
-        work_indptr = var["sparse_mtp_work_indptr"]
-        if plan is not None:
-            groups = get_mla_decode_fwd_max_splits(
-                heads, 1, self.dtype_q, self.dtype_kv
-            )
-            work_indptr = work_indptr[: groups + 1]
+        work_indptr = self._active_work_indptr(var["sparse_mtp_work_indptr"], heads, 1)
         reduce_indptr = var["sparse_mtp_reduce_indptr"]
         reduce_final_map = var["sparse_mtp_reduce_final_map"]
         reduce_partial_map = var["sparse_mtp_reduce_partial_map"]
@@ -1236,7 +1246,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         var = self.model_runner.forward_vars
         work_meta_data = var[f"{prefix}work_meta_data"]
         work_info_set = var[f"{prefix}work_info_set"]
-        work_indptr = var[f"{prefix}work_indptr"]
+        work_indptr = self._active_work_indptr(
+            var[f"{prefix}work_indptr"], self.persistent_num_heads, max_q_len
+        )
         reduce_indptr = var[f"{prefix}reduce_indptr"]
         reduce_final_map = var[f"{prefix}reduce_final_map"]
         reduce_partial_map = var[f"{prefix}reduce_partial_map"]
@@ -1262,12 +1274,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 kv_granularity=triton.next_power_of_2(self.index_topk_out),
                 max_split_per_batch=1,
             )
-            groups = get_mla_decode_fwd_max_splits(
-                self.persistent_num_heads, 1, self.dtype_q, self.dtype_kv
-            )
-            # The planner fills only this prefix; its last entry is the item
-            # count consumed by the patcher, not the allocation's unused tail.
-            work_indptr = work_indptr[: groups + 1]
         kv_indptr_for_metadata = (
             var[f"{prefix}sparse_kv_indptr"].gpu[: bs + 1]
             if use_sparse_meta

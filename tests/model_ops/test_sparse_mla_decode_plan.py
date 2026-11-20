@@ -21,6 +21,7 @@ WORK = (
 )
 BUILD = {
     "_persistent_work_buffer_sizes",
+    "_active_work_indptr",
     "_sparse_dcp_decode_plan",
     "set_mla_persistent_worker_buffers",
     "_set_mla_persistent_worker_buffers_sparse_mtp",
@@ -82,10 +83,10 @@ def runtime():
     def planner(qptr, kvptr, last, heads, _, causal, wmd, info, wi, ri, rfm, rpm, **kw):
         rows = qptr.numel() - 1
         groups = ns["get_mla_decode_fwd_max_splits"](
-            heads, 1, kw["dtype_q"], kw["dtype_kv"]
+            heads, kw["max_seqlen_qo"], kw["dtype_q"], kw["dtype_kv"]
         )
         assert wi.numel() >= groups + 1, "planner work-indptr allocation is too small"
-        calls.append((heads, kvptr.clone(), kw, info))
+        calls.append((heads, kvptr.clone(), kw, info, (wmd, wi, info, ri, rfm, rpm)))
         info.zero_()
         info[:rows, 0] = torch.arange(rows)
         info[:rows, 1] = -1
@@ -93,7 +94,7 @@ def runtime():
         info[:rows, 3] = torch.arange(1, rows + 1)
         info[:rows, 4] = kvptr[:-1] - kvptr[0]
         info[:rows, 5] = kvptr[1:] - kvptr[0]
-        wi.copy_(torch.arange(wi.numel()).clamp_max(rows))
+        wi[: groups + 1].copy_(torch.arange(groups + 1).clamp_max(rows))
         for tensor in (wmd, ri, rfm, rpm):
             tensor.fill_(len(calls))
 
@@ -365,6 +366,12 @@ def test_fallback_sizes_for_consumers_with_more_workgroups(runtime):
         "",
     )
     assert buffers[1].numel() == 513 and md.work_indptr.numel() == 257
+    expected = runtime["get_mla_metadata_info_v1"](
+        16, 1, 64, fp8, fp8, is_sparse=False, fast_mode=True
+    )
+    for buffer, (shape, dtype) in zip(buffers, expected, strict=True):
+        assert tuple(buffer.shape) == (shape if isinstance(shape, tuple) else (shape,))
+        assert buffer.dtype == dtype
     torch.testing.assert_close(md.work_info_set, original)
 
 
@@ -396,6 +403,65 @@ def test_spec_allocation_covers_both_occupancies_and_publishes_active_prefix(
         return_lse=True,
     )
     assert len(runtime["calls"]) == 2
+
+
+@pytest.mark.parametrize("heads,actual_q", [(64, 1), (64, 8), (16, 4), (16, 8)])
+def test_every_planner_publishes_active_workers(runtime, heads, actual_q):
+    runtime["get_mla_decode_fwd_max_splits"] = lambda h, q, *_: (
+        512 if h * q == 64 else 256
+    )
+    fp8 = torch.float8_e4m3fn
+    builder, _, _ = setup(runtime, heads=heads, allocation_q=8, dtype=fp8)
+    var = builder.model_runner.forward_vars
+    # Every configured width must fit all buffers, including an interior peak.
+    for q_len in range(1, 9):
+        sizes = runtime["get_mla_metadata_info_v1"](
+            16, q_len, heads, fp8, fp8, is_sparse=True, fast_mode=True
+        )
+        for name, (shape, dtype) in zip(WORK, sizes, strict=True):
+            dims = shape if isinstance(shape, tuple) else (shape,)
+            assert all(a >= b for a, b in zip(var[name].shape, dims, strict=True))
+            assert var[name].dtype == dtype
+    var["cu_seqlens_q"].gpu = torch.arange(17, dtype=torch.int32) * actual_q
+    backing = var["work_indptr"]
+    backing.fill_(-12345)
+    result = builder.set_mla_persistent_worker_buffers(16, actual_q)
+    groups = runtime["get_mla_decode_fwd_max_splits"](heads, actual_q)
+    assert (
+        result["work_indptr"].numel() == groups + 1
+    ), "unwritten capacity launches workers"
+    assert torch.all(backing[groups + 1 :] == -12345)
+    for name, buffer in zip(WORK, runtime["calls"][-1][4], strict=True):
+        assert buffer is result[name] and buffer.data_ptr() == var[name].data_ptr()
+    assert (result["sparse_dcp_decode_plan"] is not None) == (actual_q == 1)
+
+    def update(*args, **kwargs):
+        # The incremental updater reads the terminal entry of the original plan.
+        assert kwargs["max_seqlen_qo"] == actual_q
+        assert args[8].numel() == groups + 1 and int(args[8][-1]) == 16
+
+    runtime["decode_update_mla_metadata_v1"] = update
+    updated = builder.set_mla_persistent_worker_buffers(16, actual_q, only_update=True)
+    assert updated["work_indptr"].numel() == groups + 1
+
+
+@pytest.mark.parametrize(
+    "native,supported", [(False, True), (True, None), (True, False)]
+)
+def test_unqualified_mtp_still_publishes_active_workers(runtime, native, supported):
+    runtime["get_mla_decode_fwd_max_splits"] = lambda h, q, *_: (
+        512 if h * q == 64 else 256
+    )
+    runtime["get_mla_decode_shape_support"] = lambda *a, **kw: SimpleNamespace(
+        native=native, supported=supported
+    )
+    builder, _, _ = setup(runtime, heads=16, allocation_q=4, max_q=8)
+    backing = builder.model_runner.forward_vars["sparse_mtp_work_indptr"]
+    backing.fill_(-12345)
+    result = builder._set_mla_persistent_worker_buffers_sparse_mtp(16)
+    assert result["sparse_mtp_dcp_decode_plan"] is None
+    assert result["sparse_mtp_work_indptr"].numel() == 257
+    assert torch.all(backing[257:] == -12345)
 
 
 def test_decode_ubatch_publishes_the_plan(runtime):
