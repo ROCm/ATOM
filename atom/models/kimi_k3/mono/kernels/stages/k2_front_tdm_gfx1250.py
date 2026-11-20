@@ -150,8 +150,9 @@ def _front_tasks(
     the token slabs', which a cluster peer's multicast may still be filling).
     ``paired``: the projections walk K two slabs a step, the FP8 shared one
     ``fp8_depth`` ahead (None: ``TDM_FP8_PAIR_DEPTH``, unpaired
-    ``FP8_DEPTH``). ``pipe``: ``gemv_tdm.project``'s late, token_steps and
-    early_scales (None: its defaults)."""
+    ``FP8_DEPTH``). ``pipe``: ``front_pipe``'s, ``gemv_tdm.project``'s late,
+    token_steps, early_scales and unroll and the epilogue's hw_fp4 (None:
+    their defaults)."""
     if fp8_depth is None:
         fp8_depth = TDM_FP8_PAIR_DEPTH if paired else gemv_tdm.FP8_DEPTH
     pipe = pipe or {}
