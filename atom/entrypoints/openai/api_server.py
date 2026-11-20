@@ -758,12 +758,14 @@ def _validate_sequence_context_length(seq, sampling_params=None) -> None:
                 limit,
             )
         seq.max_tokens = min(seq.max_tokens, remaining)
+    # The pool first: a prompt it cannot hold is too long whatever max_tokens
+    # is, and only that refusal tells a client to shorten the prompt.
+    _validate_pool_capacity(seq.num_prompt_tokens, _get_engine_max_pool_tokens())
     _validate_context_length(
         seq.num_prompt_tokens,
         seq.max_tokens,
         _get_engine_max_model_len(),
     )
-    _validate_pool_capacity(seq.num_prompt_tokens, _get_engine_max_pool_tokens())
 
 
 def _has_multimodal_content(messages: list[Any]) -> bool:
@@ -1376,42 +1378,21 @@ def _engine_kv_transfer_params(
     return {k: v for k, v in kv_transfer_params.items() if k != "prompt_token_ids"}
 
 
-def _prompt_headroom(
-    max_tokens: int, max_ctx: int, kv_transfer_params: dict[str, Any] | None
-) -> int:
-    """Output tokens to reserve when an over-long prompt is truncated.
-
-    A PD router sends the prefill leg ``max_tokens=1`` and the decode leg the
-    client's value. With a KV handoff the reservation therefore cannot depend
-    on ``max_tokens``, or the two legs truncate to different prompts and the
-    transferred blocks no longer match the decode-side sequence.
-    """
-    headroom = max(1024, max_ctx // 8)
-    if kv_transfer_params is None:
-        headroom = min(max_tokens, headroom)
-    return headroom
-
-
 def _prepare_prompt(
     messages,
     template_kwargs: dict[str, Any],
     *,
     tools,
     preserve_tool_call_arguments: bool,
-    max_tokens: int,
-    kv_transfer_params: dict[str, Any] | None,
-    cut_to_context: bool,
 ) -> tuple[PrefixEncoding | list[int], str]:
     """Render and tokenize the engine's way, in one executor step for
     ``/v1/messages`` and ``/v1/responses``.
 
     Returns ``(engine_input, text)``: what preprocess takes in place of the
     prompt (no second tokenize), and the text the engine runs, which seeds the
-    reasoning channel. With ``cut_to_context`` (``/v1/responses``) a prompt
-    longer than the context minus the output headroom is cut from the end, and
-    a context with no room for any prompt is refused (ValueError, a 400).
-    Without it (``/v1/messages``) the prompt is returned whole and admission
-    refuses an over-long one (``ContextLengthError``)."""
+    reasoning channel. The prompt is never cut: cutting drops its end, the
+    latest turn and the generation prompt. Admission refuses an over-long one
+    (``ContextLengthError``)."""
     prompt = apply_chat_template(
         tokenizer,
         custom_message_encoder,
@@ -1420,25 +1401,7 @@ def _prepare_prompt(
         preserve_tool_call_arguments=preserve_tool_call_arguments,
         **template_kwargs,
     )
-    encoded = engine.io_processor.encode_prompt(prompt)
-    if not cut_to_context:
-        return encoded, prompt
-    max_ctx = int(_get_engine_max_model_len() or 30720)
-    cap = max_ctx - _prompt_headroom(max_tokens, max_ctx, kv_transfer_params)
-    if cap < 1:
-        raise ValueError(
-            f"max_tokens={max_tokens} leaves no room for a prompt in this "
-            f"model's {max_ctx}-token context"
-        )
-    token_ids = encoded.token_ids if isinstance(encoded, PrefixEncoding) else encoded
-    if len(token_ids) <= cap:
-        return encoded, prompt
-    logger.warning("Prompt too long (%d > %d), truncating", len(token_ids), cap)
-    token_ids = list(token_ids[:cap])
-    text = tokenizer.decode(token_ids, skip_special_tokens=False)
-    if not text:
-        raise ValueError("The prompt is empty after truncation to the context")
-    return token_ids, text
+    return engine.io_processor.encode_prompt(prompt), prompt
 
 
 def _renders_without_mid_system(
@@ -1460,7 +1423,7 @@ def _renders_without_mid_system(
             preserve_tool_call_arguments=preserve_tool_call_arguments,
             **template_kwargs,
         )
-    except TemplateError:
+    except Exception:  # noqa: BLE001 - the caller re-raises the original
         return False
     return True
 
@@ -1470,16 +1433,11 @@ async def _prepare_engine_input(
     template_kwargs: dict[str, Any],
     *,
     tools,
-    max_tokens: int,
     kv_transfer_params: dict[str, Any] | None,
-    cut_to_context: bool,
 ) -> tuple[PrefixEncoding | list[int], dict[str, Any] | None, bool]:
     """``(engine_input, multimodal_data, starts_in_reasoning)`` for
-    ``/v1/messages`` and ``/v1/responses``.
-
-    A request with images is prepared as on the chat path, and is not cut to
-    the context: a cut could end inside an image. One without goes through
-    ``_prepare_prompt``, which cuts it unless ``cut_to_context`` is False."""
+    ``/v1/messages`` and ``/v1/responses``: a request with images prepared as
+    on the chat path, one without through ``_prepare_prompt``."""
     if _has_multimodal_content(messages):
         if kv_transfer_params is not None:
             # A prefill leg cannot hand an image request off, so neither leg
@@ -1497,9 +1455,6 @@ async def _prepare_engine_input(
         template_kwargs,
         tools=tools,
         preserve_tool_call_arguments=preserve_tool_call_arguments,
-        max_tokens=max_tokens,
-        kv_transfer_params=kv_transfer_params,
-        cut_to_context=cut_to_context,
     )
     return engine_input, None, prompt_starts_in_reasoning(prompt)
 
@@ -2067,7 +2022,13 @@ async def value_error_handler(request: Request, exc: ValueError):
             "error": {
                 "message": str(exc),
                 "type": "invalid_request_error",
-                "code": 400,
+                # OpenAI's code for it, on which Codex compacts or reports an
+                # exhausted context instead of a generic 400.
+                "code": (
+                    "context_length_exceeded"
+                    if isinstance(exc, ContextLengthError)
+                    else 400
+                ),
             }
         },
     )
@@ -2943,12 +2904,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                     messages,
                     merged_kwargs,
                     tools=anthropic_to_openai_tools(request.tools),
-                    max_tokens=sampling_params.max_tokens,
                     kv_transfer_params=kv_transfer_params,
-                    # Cutting an over-long prompt drops its end -- the latest
-                    # turn and the generation prompt -- and answers 200 on
-                    # the rest; refused at admission instead.
-                    cut_to_context=False,
                 )
             )
         except TemplateError as exc:
@@ -3387,9 +3343,7 @@ async def responses_create(raw_request: Request):
                 messages,
                 merged_kwargs,
                 tools=openai_tools,
-                max_tokens=sampling_params.max_tokens,
                 kv_transfer_params=kv_transfer_params,
-                cut_to_context=True,
             )
         )
 
