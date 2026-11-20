@@ -6,7 +6,7 @@ This guide targets **AMD MI355 (gfx950) only**, `-tp 8`.
 
 | Variant | Quantization | Description |
 |---------|-------------|-------------|
-| **MXFP4** | MXFP4 (w4a4, e8m0 scales, group_size=32) | Routed MoE expert weights in microscale FP4. On gfx950 the SiTU experts run the FlyDSL **native SiTUv2** grouped-MoE path. Attention, shared experts, and dense MLP remain BF16. |
+| **MXFP4** | MXFP4 (w4a4, e8m0 scales, group_size=32) | Routed MoE expert weights in microscale FP4. On gfx950 the SiTU experts run the FlyDSL **native SiTUv2** grouped-MoE path. Attention, shared experts, and dense MLP are BF16 in the checkpoint; the launch below quantizes them online to per-token FP8 (`ptpc_fp8`). |
 
 **Validated (full 1319, GSM8K 5-shot, base completions, tp8, seed 42):**
 
@@ -97,7 +97,8 @@ Add these to the launch command:
 Seven draft tokens make one request exactly 8 rows. The buffers hold 64 rows
 (`atom/models/kimi_k3/mono/config.py:MAX_ROWS`; past 16, 16-row token groups),
 so `--max-num-seqs 8` keeps every verify step on the kernels; every number
-below was measured at 7.
+below was measured at 7, and with the five dense projections in BF16 (excluded
+from the quant), not the per-token FP8 the launch above gives them.
 
 The server log says which way it went -- `Kimi-K3 mono decode armed (TP8)`, or
 `Kimi-K3 mono decode off: <why>` naming the first condition that failed. Read

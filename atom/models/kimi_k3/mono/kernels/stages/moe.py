@@ -9,7 +9,7 @@ layer's output, every TP reduction inside the kernel.
 
 Stages ``layer.build`` places in K2's launch, up to ``MAX_ROWS``
 rows: the MFMA's B operand holds 16 token rows, so past 16 the GEMVs after
-lnorm and the final reduce run a token group at a time (``group_view``). The original path (vLLM ROCm, see MOE_SPEC.md) replicates the
+lnorm and the final reduce run a token group at a time (``group_view``). The original path (vLLM ROCm) replicates the
 router and the latent down projection on every rank; here each rank computes
 its eighth and the rows are all-gathered over the peer buffer.
 

@@ -9,9 +9,10 @@
 ``mfma_f32_16x16x32_bf16`` per 32 K.
 
 K is walked in 128-wide chunks, wave w taking chunks w, w + 8, ...; a lane reads
-64 contiguous bytes of its row a chunk (4 dwordx4 at q 32 + g 8 elements: lane
-group g = lane / 16), and the token rows are read at the same K. The K order
-inside a chunk is a permutation both operands share, so the dot is unchanged.
+8 elements of its row at each of a chunk's 4 q steps (from 32 q + 8 g: lane group
+g = lane / 16; a dwordx4 each, a dwordx2 with ``w8``), and the token rows are
+read at the same K. The K order inside a chunk is a permutation both operands
+share, so the dot is unchanged.
 
 ``w8``: the weight is ATOM's per-token FP8 linear as the production GEMM holds
 it -- E4M3 in AITER's (16, 16) preshuffle, ``[N/16][K/32][2][16 rows][16 B]``,
@@ -90,9 +91,10 @@ def chunks(k):
 
 
 def loads(lane, wave, w, row0, k, nt=True, ldk=None, k0=0, paired=False, w8=False):
-    """This wave's operands of weight rows ``row0`` .. + 16 (row-major, ``ldk``
-    bf16 a row at ``w``, K columns ``k0`` .. ``k0 + k``): a list a chunk
-    (clamped into K: ``mfmas`` zeroes the extra), ``chunk_operands``' each."""
+    """This wave's operands of weight rows ``row0`` .. + 16 (``ldk`` columns a
+    row at ``w``: row-major bf16, or with ``w8`` the preshuffled E4M3 plane; K
+    columns ``k0`` .. ``k0 + k``): a list a chunk (clamped into K: ``mfmas``
+    zeroes the extra), ``chunk_operands``' each."""
     per, n = chunks(k)
     ldk = k if ldk is None else ldk
     r_w = rsrc(w)

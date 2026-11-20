@@ -1069,9 +1069,9 @@ def fb_loads(c, k):
     """This wave's f_b rows (``kda_gates``' MFMA A operands) into ``k["fb"]``:
     with a task's other inputs on a plain decode, after ``kda_gates``' polls
     on a verify (its f_a poll is L tokens' worth, and in vmcnt order it would
-    wait for the 32 KB). ``w8``: each 16 B half of the lane's 32-column K
-    block holds two operands (``fb_w8_dword``), and the lane's four output
-    rows' scales go into ``k["fbs"]``."""
+    wait for the 32 KB, 16 KB with ``w8``). ``w8``: each 16 B half of the
+    lane's 32-column K block holds two operands (``fb_w8_dword``), and the
+    lane's four output rows' scales go into ``k["fbs"]``."""
     if const_expr(c["w8"]):
         halves = [
             fx.Vector(

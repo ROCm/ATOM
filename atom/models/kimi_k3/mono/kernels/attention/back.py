@@ -4,9 +4,9 @@
 # fork of ATOM's atom/mono (MIT, Copyright (C) 2026, Advanced Micro
 # Devices, Inc.). This port reads those primitives from atom.mono
 # directly and takes ATOM's mailbox discipline in place of the fork's.
-"""K2a: one Kimi-K3 KDA layer from the gated core output to the
-MoE's input row -- o_proj, its TP all-reduce inside the kernel, and the MLP
-AttnRes seam.
+"""K2a: one Kimi-K3 layer (KDA, or MLA past its attention) from o_proj's
+input to the MoE's input row -- o_proj, its TP all-reduce inside the kernel,
+and the MLP AttnRes seam.
 
 Stages ``layer.build`` places in K2's launch (its CTA map: ``layer``):
 
