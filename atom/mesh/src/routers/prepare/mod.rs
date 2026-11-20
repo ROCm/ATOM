@@ -127,6 +127,7 @@ pub fn prepare_chat(
         reasoning_parser_factory: components.reasoning_parser_factory.clone(),
         configured_tool_parser: components.configured_tool_parser.clone(),
         configured_reasoning_parser: components.configured_reasoning_parser.clone(),
+        prompt_opens_reasoning: false,
     };
 
     Ok((payload, ctx))
@@ -195,6 +196,7 @@ pub fn prepare_generate_with(
         reasoning_parser_factory: components.reasoning_parser_factory.clone(),
         configured_tool_parser: components.configured_tool_parser.clone(),
         configured_reasoning_parser: components.configured_reasoning_parser.clone(),
+        prompt_opens_reasoning: false,
     };
 
     Ok((payload, ctx))

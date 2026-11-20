@@ -1,7 +1,7 @@
 //! Aggregate a `TokenHandle<TokenChunk>` into a non-streaming
 //! `ChatCompletionResponse`.
 
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
@@ -13,12 +13,14 @@ use crate::{
         chat::{ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse},
         common::{FunctionCallResponse, ToolCall, ToolChoice, ToolChoiceValue, Usage},
     },
-    reasoning_parser::ParserFactory as ReasoningParserFactory,
+    reasoning_parser::{ParserFactory as ReasoningParserFactory, ParserResult},
     routers::{
         comm::error,
         prepare::{
-            parser_factory_lookup::{check_reasoning_parser_availability, get_reasoning_parser},
-            response_context::{ProtocolRequest, ResponseContext},
+            parser_factory_lookup::{
+                check_reasoning_parser_availability, create_reasoning_parser, get_reasoning_parser,
+            },
+            response_context::{ProtocolRequest, ResponseContext, THINK_OPEN},
             tool_constraints::{
                 generate_tool_call_id, get_history_tool_calls_count, parse_json_schema_response,
             },
@@ -117,6 +119,7 @@ pub async fn process_typed(
             ctx.reasoning_parser_factory.as_ref(),
             ctx.configured_tool_parser.as_deref(),
             ctx.configured_reasoning_parser.as_deref(),
+            ctx.prompt_opens_reasoning,
         )
         .await;
         match res {
@@ -175,6 +178,7 @@ async fn process_choice(
     reasoning_parser_factory: Option<&ReasoningParserFactory>,
     configured_tool_parser: Option<&str>,
     configured_reasoning_parser: Option<&str>,
+    prompt_opens_reasoning: bool,
 ) -> Result<ChatChoice, String> {
     let (token_ids, finish_reason, matched_stop, logprobs) = match complete {
         TokenChunk::Complete {
@@ -192,12 +196,13 @@ async fn process_choice(
         .process_tokens(token_ids)
         .map_err(|e| format!("Failed to process tokens: {}", e))?;
 
-    let mut final_text = String::new();
+    // The decoded pieces, as a streamed reply would carry them.
+    let mut pieces = Vec::new();
     for output in outputs {
         match output {
-            SequenceDecoderOutput::Text(t) => final_text.push_str(&t),
+            SequenceDecoderOutput::Text(t) => pieces.push(t),
             SequenceDecoderOutput::StoppedWithText(t) => {
-                final_text.push_str(&t);
+                pieces.push(t);
                 break;
             }
             SequenceDecoderOutput::Stopped => break,
@@ -205,26 +210,29 @@ async fn process_choice(
         }
     }
     if let SequenceDecoderOutput::Text(t) = stop_decoder.flush() {
-        final_text.push_str(&t);
+        pieces.push(t);
     }
+    let final_text = pieces.concat();
 
     let mut reasoning_text: Option<String> = None;
     let mut processed_text = final_text;
 
     if reasoning_available {
         if let Some(factory) = reasoning_parser_factory {
-            let pooled =
-                get_reasoning_parser(factory, configured_reasoning_parser, &chat_request.model);
-            let mut parser = pooled.lock().await;
-            match parser.detect_and_parse_reasoning(&processed_text) {
-                Ok(result) => {
-                    if !result.reasoning_text.is_empty() {
-                        reasoning_text = Some(result.reasoning_text);
-                    }
-                    processed_text = result.normal_text;
-                }
-                Err(e) => return Err(format!("Reasoning parsing error: {}", e)),
+            let result = split_reasoning(
+                factory,
+                configured_reasoning_parser,
+                &chat_request.model,
+                &pieces,
+                &processed_text,
+                prompt_opens_reasoning,
+            )
+            .await
+            .map_err(|e| format!("Reasoning parsing error: {}", e))?;
+            if !result.reasoning_text.is_empty() {
+                reasoning_text = Some(result.reasoning_text);
             }
+            processed_text = result.normal_text;
         }
     }
 
@@ -294,6 +302,65 @@ async fn process_choice(
         matched_stop: matched_stop_value,
         hidden_states: None,
     })
+}
+
+/// Every reasoning parser's `max_buffer_size`: `detect_and_parse_reasoning`
+/// refuses a longer text outright.
+const ONE_SHOT_MAX_BYTES: usize = 65536;
+
+/// A whole reply (`text`, decoded as `pieces`) split into content and
+/// reasoning; `prompt_opens_reasoning` puts the prompt's opener before it.
+///
+/// A reply the one-shot parse would refuse goes through a fresh parser's
+/// streaming path a piece at a time, as a streamed reply does, so its buffer
+/// holds only what one piece leaves pending; the result is trimmed as the
+/// one-shot parse trims it.
+async fn split_reasoning(
+    factory: &ReasoningParserFactory,
+    configured: Option<&str>,
+    model: &str,
+    pieces: &[String],
+    text: &str,
+    prompt_opens_reasoning: bool,
+) -> Result<ParserResult, String> {
+    let opener = prompt_opens_reasoning.then_some(THINK_OPEN);
+    let opened: Cow<str> = match opener {
+        Some(opener) => format!("{opener}{text}").into(),
+        None => text.into(),
+    };
+    if opened.len() <= ONE_SHOT_MAX_BYTES {
+        let pooled = get_reasoning_parser(factory, configured, model);
+        let mut parser = pooled.lock().await;
+        return parser
+            .detect_and_parse_reasoning(&opened)
+            .map_err(|e| e.to_string());
+    }
+    let Some(mut parser) = create_reasoning_parser(factory, configured, model) else {
+        return Ok(ParserResult::normal(text.to_string()));
+    };
+    let (mut normal, mut reasoning, mut entered) = (String::new(), String::new(), false);
+    for piece in opener.into_iter().chain(pieces.iter().map(String::as_str)) {
+        let result = parser
+            .parse_reasoning_streaming_incremental(piece)
+            .map_err(|e| e.to_string())?;
+        entered |= parser.is_in_reasoning() || !result.reasoning_text.is_empty();
+        normal.push_str(&result.normal_text);
+        reasoning.push_str(&result.reasoning_text);
+    }
+    if !entered {
+        // The one-shot parse hands back a reply without reasoning untouched.
+        return Ok(ParserResult::normal(text.to_string()));
+    }
+    // It trims the text after the opener, and then what follows the closer.
+    let reasoning = if parser.is_in_reasoning() {
+        reasoning.trim()
+    } else {
+        reasoning.trim_start()
+    };
+    Ok(ParserResult::new(
+        normal.trim().to_string(),
+        reasoning.to_string(),
+    ))
 }
 
 async fn parse_tool_calls(
