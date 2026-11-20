@@ -44,7 +44,7 @@ def normalize_qsa_cache_formats(atom_config) -> tuple[str, str]:
     """
     kv = atom_config.kv_cache_dtype or "bf16"
     kv = "bf16" if kv in ("auto", "bfloat16") else kv
-    index = getattr(atom_config, "index_cache_dtype", None) or kv
+    index = atom_config.index_cache_dtype or kv
     return kv, "bf16" if index in ("auto", "bfloat16") else index
 
 
@@ -83,7 +83,7 @@ def qsa_caches_rope_positions(config) -> bool:
     # and then a compressed key's group position cannot be recomputed
     # arithmetically. Cache the per-token axes only when the engine can
     # actually be handed an image: they take paged budget.
-    return getattr(config, "multimodal_config", None) is not None
+    return config.multimodal_config is not None
 
 
 def qsa_page_segments(config) -> dict:

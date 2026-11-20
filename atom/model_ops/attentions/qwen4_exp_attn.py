@@ -176,8 +176,7 @@ class Qwen4ExpBackend(GDNAttentionBackend):
         if config.kv_transfer_config and not paged_checkpoints_deployable(config):
             # Restoring QSA pages from fork slots would leave GDN and PLE stale.
             raise ValueError(
-                "Qwen3.8 offload needs PAGE checkpoints; pipeline parallelism "
-                "and RapidServe stay on fork slots"
+                "Qwen3.8 offload needs PAGE checkpoints; RapidServe stays on fork slots"
             )
         if len(set(config.hf_config.ple_layer_ids or [])) > 1:
             raise ValueError("Qwen backend currently allocates state for one PLE layer")

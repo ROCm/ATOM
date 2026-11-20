@@ -95,7 +95,7 @@ _NO_IMAGE = "kv_connector={!r} does not read"
 def test_kv_transfers_that_drop_the_state_are_refused(
     kv_transfer_config, backend, error
 ):
-    """A P/D peer would get the QSA pages and continue from a zero GDN/PLE state."""
+    """A P/D peer or page-only tier would move QSA pages without GDN/PLE state."""
     with pytest.raises(ValueError, match=error.format(backend)):
         _check(kv_transfer_config)
 
@@ -156,6 +156,7 @@ def test_the_draft_rows_and_the_page_namespace_read_one_rule(
     config = SimpleNamespace(
         kv_cache_dtype=kv_cache_dtype,
         index_cache_dtype=index_cache_dtype,
+        multimodal_config=None,
         speculative_config=spec,
     )
     assert qsa_page_segments(config)["draft_kv"] == ("bf16" if draft else "target")

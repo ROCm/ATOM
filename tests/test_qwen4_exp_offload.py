@@ -60,6 +60,7 @@ def _builder():
             pipeline_parallel_size=1,
             enable_rapidserve=False,
             kv_cache_dtype="bf16",
+            index_cache_dtype=None,
             kv_cache_block_size=64,
             enable_dp_attention=False,
             prefill_context_parallel_size=1,
@@ -383,7 +384,6 @@ def test_page_checkpoints_do_not_hang_on_the_model_type_spelling():
     assert cls._uses_paged_checkpoints(builder)
 
 
-@pytest.mark.parametrize("switch", ["pipeline_parallel_size", "enable_rapidserve"])
 @pytest.mark.parametrize(
     "kv_transfer_config, error",
     [
@@ -392,12 +392,10 @@ def test_page_checkpoints_do_not_hang_on_the_model_type_spelling():
         ({"kv_connector": "mooncake", "kv_role": "kv_producer"}, "disaggregated"),
     ],
 )
-def test_pipeline_parallel_and_rapidserve_refuse_offload(
-    switch, kv_transfer_config, error
-):
+def test_rapidserve_refuses_offload(kv_transfer_config, error):
     builder, _ = _builder()
     config = builder.model_runner.config
-    setattr(config, switch, 2 if switch == "pipeline_parallel_size" else True)
+    config.enable_rapidserve = True
     config.kv_transfer_config = kv_transfer_config
     with pytest.raises(ValueError, match=error):
         Qwen4ExpBackend.validate_config(config)
