@@ -20,6 +20,7 @@ import torch
 
 from atom.model_ops import sparse_indexer_fp4
 from atom.model_ops.attentions.mla_kv_pool import MlaKvPool
+from atom.model_ops.indexer.layout import fp4_scale_byte
 from atom.model_ops.sparse_indexer_chunk import qsplit_rows
 from atom.model_ops.sparse_indexer_fp4 import (
     FP4_KV_BLOCK_SIZE,
@@ -1235,9 +1236,13 @@ def test_dcp_prefill_preserves_opus_rows_and_all_four_exponents(monkeypatch):
         SimpleNamespace(
             dcp_indexer_fp4_read_page=src // 64,
             dcp_indexer_fp4_read_row=src % 64,
+            dcp_indexer_fp4_read_scale_at=fp4_scale_byte(src[:, None], torch.arange(4)),
             dcp_indexer_gather_index=gather,
             dcp_indexer_fp4_stage_page=dst // 64,
             dcp_indexer_fp4_stage_row=dst % 64,
+            dcp_indexer_fp4_stage_scale_at=fp4_scale_byte(
+                dst[:, None], torch.arange(4)
+            ),
             dcp_indexer_fp4_stage_pages=2,
         ),
         "mfma",
