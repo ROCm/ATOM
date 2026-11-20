@@ -1987,9 +1987,11 @@ class MLAAttention(nn.Module):
             prefill_q, kv_c_normed_new, k_rope_new
         )
         # Quantize Q once and reuse it across the new tokens and cached chunks.
-        q_fp8, new_kv_fp8, kv_out_scales = self._quantize_new_tokens(
-            prefill_q, k_new, v_new, quant_k_rope
-        )
+        q_fp8 = new_kv_fp8 = kv_out_scales = None
+        if self._flydsl_fp8_mha_ok:
+            q_fp8, new_kv_fp8, kv_out_scales = self._quantize_new_tokens(
+                prefill_q, k_new, v_new, quant_k_rope
+            )
         output = self._chunked_prefill_attention(
             prefill_q,
             k_new,
@@ -3050,9 +3052,9 @@ class MLAAttention(nn.Module):
         rotary-embedded.
 
         The per-op writer of whole k rows: the dense (`not use_prefill_mla`)
-        prefill (`_write_prefill_kv`), the PCP prefill materialising the full
-        sequence's KV after the fused MLA kernel produced q_out on 1/pcp
-        queries, and the per-op path of a drafter's context rows
+        prefill and its recorded split (`_prefill_attend`), the PCP prefill
+        materialising the full sequence's KV after the fused MLA kernel produced
+        q_out on 1/pcp queries, and the per-op path of a drafter's context rows
         (`write_context_kv_latent`). The fused kernels write their own rows,
         in the same layouts: the absorbed path's RoPE + cache write
         (`fused_qk_rope_concat_and_cache_mla[_seg]`,
@@ -3208,17 +3210,6 @@ class MLAAttention(nn.Module):
         self.rotary_emb(positions, prefill_q_pe, k_rope)
         return prefill_q
 
-    def _write_prefill_kv(
-        self,
-        kv_cache: torch.Tensor,
-        k_nope: torch.Tensor,
-        k_rope: torch.Tensor,
-        attn_metadata: AttentionMetaData,
-    ) -> None:
-        """A dense prefill's new tokens written to the paged KV cache."""
-        if kv_cache.numel() > 0:
-            self._write_kv(kv_cache, k_nope, k_rope, attn_metadata.slot_mapping)
-
     # ---- Dense prefill split for token graphs: the head (Q projection, the
     # new tokens' kv_b_proj and FP8 quantization) is sized by the rows alone,
     # so a token graph records it; only the KV write and the attention break.
@@ -3312,7 +3303,8 @@ class MLAAttention(nn.Module):
             return
         attn_metadata = fwd_ctx.attn_metadata
         kv_cache = fwd_ctx.kv_cache_data[f"layer_{self.layer_num}"].k_cache
-        self._write_prefill_kv(kv_cache, k_nope, k_rope, attn_metadata)
+        if kv_cache.numel() > 0:
+            self._write_kv(kv_cache, k_nope, k_rope, attn_metadata.slot_mapping)
         q_fp8 = new_kv_fp8 = kv_out_scales = None
         if fp8_scales is not None:
             q_descale, k_descale, v_descale, gather_k, gather_v = fp8_scales
@@ -3380,7 +3372,8 @@ class MLAAttention(nn.Module):
 
         if context.is_prefill and not use_prefill_mla:
             prefill_q = self._prefill_q(q, q_scale, k_rope, positions)
-            self._write_prefill_kv(kv_cache, k_nope, k_rope, attn_metadata)
+            if kv_cache.numel() > 0:
+                self._write_kv(kv_cache, k_nope, k_rope, attn_metadata.slot_mapping)
 
             if attn_metadata.has_cached:
                 # Shuffled KV takes either path too: the builder gives the chunked

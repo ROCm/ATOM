@@ -298,7 +298,7 @@ def padded_prefill_rows(rows: int) -> int | None:
     A region whose launches follow the requests attends those rows alone, as
     the eager step would (`on_scheduled_rows_into`): its metadata describes the
     scheduled rows, not the bucket."""
-    context = getattr(forward_context.get_forward_context(), "context", None)
+    context = forward_context.get_forward_context().context
     if context is None or not context.is_prefill:
         return None
     scheduled = context.scheduled_tokens

@@ -1017,8 +1017,8 @@ def kda_attention_with_output(
     its all-reduce are sized by the bucket alone, so they land in the graph.
     The capture's warmup forward runs the same split, as an MLA layer's does
     (`prefill_token_graph_capture`), so they first run at the bucket's shape
-    outside the capture. Any other forward a graph records runs the mixer as
-    one region (`_kda_mixer`); a forward none records calls it.
+    outside the capture. Otherwise the mixer is a plain call outside any graph
+    capture, and one region (`_kda_mixer`) inside one.
     """
     fwd_ctx = get_forward_context()
     if fwd_ctx.tr_graph is None and not fwd_ctx.in_hipgraph:
@@ -1347,27 +1347,74 @@ class KimiKDAAttention(nn.Module):
         hidden_states_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         fwd_ctx = get_forward_context()
-        kda_metadata = step_kda_metadata(fwd_ctx)
+        kda_metadata = getattr(fwd_ctx.attn_metadata, "kda_metadata", None)
+        if kda_metadata is None:
+            # Native ATOM/SGLang integrations still expose the shared legacy
+            # field. vLLM 0.26+ uses the dedicated KDA metadata adapter.
+            kda_metadata = getattr(fwd_ctx.attn_metadata, "gdn_metadata", None)
         if kda_metadata is None:
             # Output is bf16 even when the input activation is fp8 (fused quant).
             return torch.zeros(
                 hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
             )
 
-        cache, conv_state, ssm_state = self._state(fwd_ctx)
+        cache = fwd_ctx.kv_cache_data[f"layer_{self.layer_num}"]
+        conv_state = cache.k_cache
+        ssm_state = cache.v_cache
+        if conv_state.size(1) != self.local_proj_size * 3:
+            conv_state = conv_state.transpose(-1, -2)
 
         num_actual_tokens = kda_metadata.num_actual_tokens
         hidden_states = hidden_states[:num_actual_tokens]
         if hidden_states_scale is not None:
             hidden_states_scale = hidden_states_scale[:num_actual_tokens]
-        mixed_qkv, out_gate, beta, gate = self._project_in(
-            hidden_states, hidden_states_scale
-        )
-        gate, beta = self._recurrence_gate_beta(gate, beta)
+        # Single fused in-proj GEMM producing [q | k | v | g]; slice out each
+        # part. `out_gate` is the KDA output gate consumed at o_norm below
+        # (computed here so it rides the same GEMM instead of a separate one
+        # after the recurrence). in_proj's weight was grown in
+        # process_weights_after_loading to the fused [q | k | v | g | b | f_a],
+        # so this single unquantized call emits all six; f_b_proj stays a
+        # separate GEMM because it consumes f_a's output, not hidden_states.
+        lp = self.local_proj_size
+        nlh = self.num_local_heads
+        hd = self.head_dim
+        fused_in = self.in_proj(hidden_states, x_scale=hidden_states_scale)
+        # No .contiguous() needed: mixed_qkv is a column slice (feature stride 1,
+        # row stride N_fused). Both causal-conv consumers read the token stride
+        # from the tensor itself — causal_conv1d_fn uses x.stride(1) after
+        # transpose (channel-last: stride(0)==1), and causal_conv1d_update only
+        # requires x.stride(1)==1 (feature-contiguous, which the slice preserves).
+        mixed_qkv = fused_in[..., : 3 * lp]
+        out_gate = fused_in[..., 3 * lp : 4 * lp]
+        # beta is widened to fp32 inside _run_kda (see the note there): the KDA
+        # delta-rule write strength must stay fp32 for accuracy.
+        beta = fused_in[..., 4 * lp : 4 * lp + nlh].unsqueeze(0)
+        # f_a feeds a second GEMM (f_b_proj) and is a column slice of the fused
+        # output, so it needs a unit row stride rather than the fused N_fused one.
+        # Under a per-token FP8 f_b_proj that copy would be followed by a quant
+        # of the same [T, head_dim]; strided_per_token_quant does the gather AND the
+        # quant in one kernel, so only the quantized result is ever written.
+        # Otherwise the plain contiguous copy runs and f_b_proj quantizes (or
+        # not) exactly as before.
+        f_a_view = fused_in[..., 4 * lp + nlh : 4 * lp + nlh + hd]
+        if self.fuse_f_a_quant:
+            from atom.model_ops.kimi_k3 import strided_per_token_quant
+
+            f_a, f_a_scale = strided_per_token_quant(f_a_view, dtypes.fp8)
+            gate = self.f_b_proj(f_a, x_scale=f_a_scale)
+        else:
+            # Not .contiguous(): it returns a one-row view as is (size-1 dims
+            # ignore strides), handing the GEMM the fused row stride, which
+            # the gfx950 FlyDSL bf16 path rejects. A fresh buffer is aligned.
+            f_a = torch.empty(
+                f_a_view.shape, dtype=f_a_view.dtype, device=f_a_view.device
+            )
+            gate = self.f_b_proj(f_a.copy_(f_a_view))
+        gate = rearrange(gate, "t (h d) -> 1 t h d", d=self.head_dim)
         # Prefill returns its own contiguous output. Allocate this buffer only
         # for decode/spec-decode, where the recurrence writes into it directly.
         if kda_metadata.num_prefills <= 0:
-            out = mixed_qkv.new_empty(
+            out = fused_in.new_empty(
                 (num_actual_tokens, self.num_local_heads, self.head_dim)
             )
 
@@ -1389,9 +1436,53 @@ class KimiKDAAttention(nn.Module):
         query_start_loc = kda_metadata.non_spec_query_start_loc
 
         if kda_metadata.num_prefills > 0:
-            out = self._prefill_recurrence(
-                mixed_qkv, gate, beta, kda_metadata, conv_state, ssm_state
+            q, k, v = causal_conv1d_fn(
+                mixed_qkv.transpose(0, 1),
+                conv_weights,
+                None,
+                activation=self.activation,
+                conv_states=conv_state,
+                has_initial_state=kda_metadata.has_initial_state,
+                cache_indices=state_indices,
+                cache_indices_in=state_indices_in,
+                query_start_loc=query_start_loc,
+                k_dim_size=self.local_proj_size,
+                v_dim_size=self.local_proj_size,
+                metadata=kda_metadata,
             )
+            q = rearrange(q, "t (h d) -> 1 t h d", d=self.head_dim)
+            k = rearrange(k, "t (h d) -> 1 t h d", d=self.head_dim)
+            v = rearrange(v, "t (h d) -> 1 t h d", d=self.head_dim)
+            # Fused masked gather: ssm_state[state_indices] with fresh
+            # sequences (~has_initial_state) written as zeros in one pass,
+            # replacing the gather + separate zero-write.
+            from atom.model_ops.kimi_k3 import gather_kda_initial_state
+
+            initial = gather_kda_initial_state(
+                ssm_state, state_indices_in, kda_metadata.has_initial_state
+            )
+            kda_out, last_state = self._run_kda(
+                q,
+                k,
+                v,
+                gate,
+                beta,
+                initial,
+                query_start_loc,
+                True,
+            )
+            # last_state already has ssm_state's dtype (fla preserves the
+            # initial_state dtype; the gathered initial is allocated as such),
+            # so no .to() cast is needed.
+            ssm_state[state_indices] = last_state
+            # o_norm only reads this tensor, so keep the contiguous KDA output
+            # instead of materializing an identical copy into `out`.
+            assert kda_out.dtype == fused_in.dtype, (
+                "KDA output dtype must match the former fused_in-backed output "
+                f"buffer: got {kda_out.dtype} vs {fused_in.dtype}"
+            )
+            assert kda_out.is_contiguous(), "KDA output must be contiguous for o_norm"
+            out = kda_out.squeeze(0)
         elif kda_metadata.num_decodes > 0:
             # Slice the per-token cache-slot indices once (used for both the
             # conv update and the fused recurrence below).
@@ -1556,7 +1647,22 @@ class KimiKDAAttention(nn.Module):
         else:
             out.zero_()
 
-        return self._project_out(out, out_gate, kda_metadata.num_prefills > 0)
+        normed = self.o_norm(
+            out,
+            rearrange(out_gate, "t (h d) -> t h d", d=self.head_dim),
+            is_prefill=kda_metadata.num_prefills > 0,
+        )
+        # A fused per-token quant makes o_norm return (quantized, scale); feed it
+        # straight to o_proj's x_scale path. Otherwise it is a bf16 tensor.
+        if isinstance(normed, tuple):
+            o_fp8, o_scale = normed
+            return self.o_proj(o_fp8, x_scale=o_scale)
+        return self.o_proj(rearrange(normed, "t h d -> t (h d)"))
+
+    # ---- The prefill split's steps (`_forward_prefill_split`): those of
+    # `_forward_impl`'s prefill, apart so a token-graph recording can break
+    # around the recurrence. `_forward_impl` keeps them inline: the plugins call
+    # it directly, outside the op, and would pay for every call.
 
     def _state(self, fwd_ctx):
         """This layer's cache entry and its conv and SSM state, the conv state

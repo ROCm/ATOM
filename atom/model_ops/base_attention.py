@@ -1018,9 +1018,10 @@ def unified_attention_with_output_base(
     use_mla: bool,
     qkv: torch.Tensor,
 ) -> torch.Tensor:
-    """The attention: a plain call when no graph records this forward, an MLA
-    layer's prefill split on a prefill token-graph capture
-    (`MLAAttention.records_prefill_split`), one TR-graph break otherwise."""
+    """The attention: an MLA layer's prefill split on a prefill token-graph
+    recording and the warmup forward before it
+    (`MLAAttention.records_prefill_split`); otherwise a plain call outside any
+    graph capture, and one TR-graph break (`_attention_region`) inside one."""
     fwd_ctx = get_forward_context()
     if fwd_ctx.tr_graph is None and not fwd_ctx.in_hipgraph:
         return _attention(q, q_scale, k, v, positions, layer_name, use_mla, qkv)

@@ -23,6 +23,7 @@ from torch import nn
 # Imported for real, so every module the stand-ins load below, the Kimi model's
 # included, reads the forward context a test sets.
 from atom.utils import forward_context
+from atom.utils.region_graph import on_scheduled_rows_into, padded_prefill_rows
 
 # Without AITER (the CPU runner) attention_mla's AITER and Triton imports are
 # stand-ins; the kernels these tests reach are references here.
@@ -266,6 +267,44 @@ def test_kimi_records_its_prefill_buckets_apart_from_its_decode_ones(monkeypatch
     assert per_phase == [True]
 
 
+# ---- the split regions' row cut (`region_graph`), host-only ----------------
+
+
+def test_on_scheduled_rows_into_cuts_only_the_bucket_tall_tensors(monkeypatch):
+    seen = []
+
+    def fn(out, *args):
+        seen.append((out, *args))
+
+    ctx = SimpleNamespace(context=SimpleNamespace(is_prefill=True, scheduled_tokens=3))
+    monkeypatch.setattr(forward_context, "_forward_context", ctx)
+    out, tall, scale = torch.zeros(5, 2), torch.ones(5, 4), torch.ones(1)
+    assert on_scheduled_rows_into(fn, out, tall, scale, None, torch.tensor(7.0)) is out
+    cut_out, cut_tall, kept_scale, none, scalar = seen.pop()
+    assert cut_out.shape == (3, 2) and cut_out.data_ptr() == out.data_ptr()
+    assert cut_tall.shape == (3, 4)
+    assert kept_scale is scale and none is None and scalar.dim() == 0
+
+    ctx.context.scheduled_tokens = 5  # not padded: everything as handed
+    on_scheduled_rows_into(fn, out, tall)
+    whole_out, whole_tall = seen.pop()
+    assert whole_out is out and whole_tall is tall
+
+
+def test_padded_prefill_rows_only_for_a_prefill_taller_than_its_schedule(
+    monkeypatch,
+):
+    def rows(height, **step):
+        ctx = SimpleNamespace(context=SimpleNamespace(**step) if step else None)
+        monkeypatch.setattr(forward_context, "_forward_context", ctx)
+        return padded_prefill_rows(height)
+
+    assert rows(32, is_prefill=True, scheduled_tokens=20) == 20
+    assert rows(20, is_prefill=True, scheduled_tokens=20) is None
+    assert rows(32, is_prefill=False, scheduled_tokens=20) is None
+    assert rows(32) is None
+
+
 @pytest.mark.parametrize(
     "over",
     [
@@ -392,7 +431,6 @@ def _dense_impl(prefix_k, prefix_v):
         "forward_prefill_split",
         "_prefill_attend",
         "_prefill_q",
-        "_write_prefill_kv",
         "_write_kv",
         "_new_token_kv",
         "_quantize_new_tokens",
@@ -554,17 +592,18 @@ def _rearrange(x, pattern, **sizes):
 
 
 def _kda_layer(model, calls):
-    """A KDA layer of linear projections whose recurrence (the one kernel,
-    `_prefill_recurrence`) is a causal reference that logs its inputs."""
+    """A KDA layer of linear projections whose recurrence kernel (`_run_kda`)
+    is a causal reference that logs its inputs; `_kda_step` stands in for the
+    causal conv and the initial-state gather."""
     torch.manual_seed(3)
     width = KDA_HEADS * KDA_DIM
     w_in = torch.randn(4 * width + KDA_HEADS + KDA_DIM, HIDDEN)
     w_f, w_o = torch.randn(width, KDA_DIM), torch.randn(HIDDEN, width)
 
-    def recurrence(mixed_qkv, gate, beta, kda_metadata, conv_state, ssm_state):
-        calls.append((mixed_qkv.clone(), gate.clone(), beta.clone()))
-        x = mixed_qkv[:, :width].unflatten(-1, (KDA_HEADS, KDA_DIM))
-        return torch.cumsum(x * gate[0].sigmoid() * beta[0, ..., None], dim=0)
+    def run_kda(q, k, v, gate, beta, initial, cu_seqlens, final_state):
+        calls.append((v.clone(), gate.clone(), beta.clone()))
+        out = torch.cumsum(v * gate.sigmoid() * beta[..., None], dim=1)
+        return out, initial + 1
 
     layer = object.__new__(model.KimiKDAAttention)
     layer.__dict__.update(
@@ -579,9 +618,15 @@ def _kda_layer(model, calls):
         f_b_proj=lambda x: nn.functional.linear(x, w_f),
         o_norm=lambda out, gate, is_prefill: out * gate.sigmoid(),
         o_proj=lambda x: nn.functional.linear(x, w_o),
-        _prefill_recurrence=recurrence,
+        activation="silu",
+        _run_kda=run_kda,
     )
     return layer
+
+
+def _causal_conv(x, weight, bias, *, k_dim_size, **kw):
+    """The causal conv as the identity: q, k and v are the projection's."""
+    return x.transpose(0, 1).split(k_dim_size, dim=-1)
 
 
 def _kda_step(monkeypatch, model, layer, rows, metadata, dummy=False):
@@ -615,6 +660,13 @@ def _kda_step(monkeypatch, model, layer, rows, metadata, dummy=False):
     )
     if importlib.util.find_spec("einops") is None:
         monkeypatch.setattr(model, "rearrange", _rearrange)
+    monkeypatch.setattr(model, "causal_conv1d_fn", _causal_conv)
+    # Imported where it is called; the fresh requests' state reads as zeros.
+    kernels = ModuleType("atom.model_ops.kimi_k3")
+    kernels.gather_kda_initial_state = lambda state, slots, has_initial: (
+        state[slots] * has_initial[:, None, None, None]
+    )
+    monkeypatch.setitem(sys.modules, "atom.model_ops.kimi_k3", kernels)
 
 
 def _kda_metadata(rows):
