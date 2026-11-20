@@ -513,12 +513,13 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         """Every region of a PAGE unit (`unit_regions`: its main pages and its
         rows in each index plane), from `copies[i][0]` to `copies[i][1]`: one
         gather and one scatter per region."""
-        src = torch.tensor(
-            [s for s, _ in copies], dtype=torch.int64, device=self.device
-        )
-        dst = torch.tensor(
-            [d for _, d in copies], dtype=torch.int64, device=self.device
-        )
+        # Staged through pinned memory: a pageable host-to-device copy waits
+        # for the device, which here would stall the step's whole launch.
+        ids = torch.tensor(copies, dtype=torch.int64).t().contiguous()
+        if self.device != "cpu":
+            ids = ids.pin_memory()
+        ids = ids.to(self.device, non_blocking=True)
+        src, dst = ids[0], ids[1]
         cache = self.cache
         planes = [view for _, view in cache.page_regions] + [
             plane for owned in cache.index_planes.values() for plane in owned
