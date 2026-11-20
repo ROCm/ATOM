@@ -579,6 +579,8 @@ def _route_cta_place(c, token, survivors):
     lane = c["lane"]
     lds = c["route_lds"]
     width = TOPK + 1 if "herd" in c and c["herd"] else TOPK
+    # read here: a method called in a branch makes ``c`` its traced state
+    candidates_cm = c.get("candidates_cm", CM_DEV)
     # The top ``width`` to their ranks: a wave's LDS accesses are in order.
     for first in range(fx.Int32(0), survivors, fx.Int32(WAVE), unroll=1):
         entry = fx.min(first + lane, survivors - 1)
@@ -613,7 +615,7 @@ def _route_cta_place(c, token, survivors):
                     ),
                     rsrc(pairs),
                     (token * width + rank) * 2,
-                    cache_modifier=CM_DEV,
+                    cache_modifier=candidates_cm,
                 )
         elif const_expr("route_weights" in c):
             c["put"](c["route"], token * TOPK + rank, expert)
@@ -860,23 +862,6 @@ def stage_herd_token(c, rows, token):
         tdm_timeline.stamp(tdm_timeline.LITE_HERD_STORED)
 
 
-def _relaxed_word(base, index):
-    """Word ``index`` of the buffer at ``base`` (an Int64 address), a relaxed
-    (monotonic) atomic load at device scope."""
-    word = fx.inttoptr(
-        fx.PointerType.get(T.i32, fx.AddressSpace.Global, 4),
-        base + fx.Int64(index) * 4,
-    )
-    return fx.Int32(
-        fx.generic_load(
-            word,
-            volatile=False,
-            memory_order=fx.AtomicOrdering.Monotonic,
-            syncscope=fx.rocdl.SyncScope.AgentOneAs,
-        )
-    )
-
-
 @traced
 def _herd_prepare(own_id, own_value, lane, kp1, routed_scaling_factor):
     """``stage_herd_token_local``'s work before the candidates are in, on wave
@@ -929,13 +914,18 @@ def stage_herd_token_local(c, rows, token, survivors):
     def others(at):
         return (at < first_own) | (at >= first_own + kp1)
 
+    exchange_cm = c.get("exchange_cm", CM_DEV)
+
     def load_tags():
-        # A candidate's tag | expert word, a relaxed device-scope atomic: the
-        # polls are neither merged nor hoisted.
+        # A candidate's tag | expert word.
         return fx.Vector.from_elements(
             [
-                _relaxed_word(
-                    pairs, fx.min(poller + index * pollers, candidates - 1) * 2 + 1
+                bo.buffer_load(
+                    rsrc(pairs),
+                    fx.min(poller + index * pollers, candidates - 1) * 2 + 1,
+                    vec_width=1,
+                    dtype=T.i32,
+                    cache_modifier=exchange_cm,
                 )
                 for index in range_constexpr(rounds)
             ],

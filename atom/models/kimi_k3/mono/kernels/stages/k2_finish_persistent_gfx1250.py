@@ -35,6 +35,7 @@ from atom.models.kimi_k3.mono.kernels.stages import (
 )
 from atom.models.kimi_k3.mono.kernels.stages import (
     gemv_gfx1250,
+    gemv_tdm_gfx1250,
     moe_expert_gfx1250,
     moe_gfx1250,
     moe_tail_gfx1250,
@@ -50,6 +51,8 @@ from atom.utils import envs
 
 THREADS = 256
 WAVES = 8
+# gfx12 cache policy SCOPE field (bits 4:3): one shader engine, an XCD here
+SCOPE_SE = 1 << 3
 TP = SUPPORTED_TP[0]
 LOCAL_LATENT = LATENT // TP
 FINISH_REQUIRED_LDS_BYTES = 113_664
@@ -440,6 +443,16 @@ def build_packed_finish(
         and envs.ATOM_KIMI_MONO_HERD_OWN_LOCAL
     )
     poll_space = envs.ATOM_KIMI_MONO_HERD_POLL_SPACE
+    # Token k's routing CTA is CTA 8 (k % 32) + k // 32, on the first one or
+    # two XCDs (CTAs go round-robin over them), the others the shared down's
+    # in order: the routing CTAs start among the first dispatched, and up to
+    # 32 rows their own-candidates exchange stays in one XCD's L2 (SE scope).
+    route_xcd = routes_apart and envs.ATOM_KIMI_MONO_LITE_ROUTE_XCD
+    if route_xcd and rows > 2 * plan.blocks // gemv_tdm_gfx1250.XCDS:
+        raise ValueError(f"two XCDs' routing CTAs take at most 64 rows, got {rows}")
+    exchange_cm = (
+        SCOPE_SE if route_xcd and rows <= plan.blocks // gemv_tdm_gfx1250.XCDS else CM_DEV
+    )
     name = (
         f"k3_k2_gfx1250_persistent_finish_s{rows}_b{plan.blocks}"
         f"{'_rl' if rolled else ''}"
@@ -452,6 +465,7 @@ def build_packed_finish(
         f"{'_nohwd' if parallel_herd and not wave_drop else ''}"
         f"{'_norsb' if rolled and not split_bound else ''}"
         f"{f'_hol{poll_space}' if own_local else ''}"
+        f"{'_rx' if route_xcd else ''}"
         f"{f'_pl{herd_poll_limit}' if herd_poll_limit is not None else ''}"
         f"{'_profile' if profile else ''}"
         f"{tdm_timeline.suffix()}"
@@ -638,6 +652,20 @@ def build_packed_finish(
         # Without routed experts nothing below waits on a grid barrier, so
         # routing takes the CTAs with the fewest shared-down tasks.
         route_token = bid if include_routed else bid - (plan.blocks - rows)
+        shared_index = bid
+        if const_expr(route_xcd):
+            xcds = gemv_tdm_gfx1250.XCDS
+            per_xcd = plan.blocks // xcds
+            first_rows, second_rows = min(rows, per_xcd), max(rows - per_xcd, 0)
+            xcd, slot = bid % xcds, bid // xcds
+            route_token = (xcd < 2).select(xcd * per_xcd + slot, fx.Int32(rows))
+            # the shared-down CTAs in order: a CTA's index, the routing CTAs
+            # before it skipped
+            shared_index = (
+                bid
+                - fx.min((bid + xcds - 1) // xcds, fx.Int32(first_rows))
+                - fx.min((bid + xcds - 2) // xcds, fx.Int32(second_rows))
+            )
         launch_word = herd_at["launch"][0] // 4
         candidates = scratch + fx.Int64(herd_at["candidates"][0])
         launch = fx.Int32(
@@ -711,6 +739,7 @@ def build_packed_finish(
             if const_expr(rolled):
                 route_c = {
                     **context,
+                    "candidates_cm": exchange_cm,
                     "threads": THREADS,
                     "route_lds": {
                         name: getattr(route_role, name).ptr for name in route_lds_words
@@ -745,6 +774,7 @@ def build_packed_finish(
                             "route_c": route_c,
                             "popularity": route_role.keys.ptr,
                             "poll_space": poll_space,
+                            "exchange_cm": exchange_cm,
                         },
                         rows,
                         route_token,
@@ -867,6 +897,11 @@ def build_packed_finish(
             if const_expr(routes_apart):
                 does_shared = bid < shared_ctas
                 tasks = [bid + slot * shared_ctas for slot in range(shared_slots)]
+            if const_expr(route_xcd):
+                does_shared = route_token >= rows
+                tasks = [
+                    shared_index + slot * shared_ctas for slot in range(shared_slots)
+                ]
             if does_shared:
                 # Every task's weights are in flight before the rows are staged.
                 operands = [
