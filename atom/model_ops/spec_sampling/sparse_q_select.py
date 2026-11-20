@@ -11,7 +11,7 @@ The cut is by level, the gap below the row max in 1/8 nats, not by exact value:
 the boundary level's lowest ids fill n = min(K, top-k, ids within 19 nats).
 That only moves acceptance: the draft samples from what is stored.
 Launches: histogram (which first reduces the row max from stage 1's tile
-maxima; past 16 rows on the whole vocab a separate combine does, and a
+maxima; past 16 rows, whole vocab or TP, a separate combine does, and a
 separate cut launch makes the cut), compact (which first makes the row's cut from the histogram tables),
 finalize (normalize, the exponential race over the stored entries, and the
 row's raw argmax from stage 1's tile pairs). Each folded reduction reads the
@@ -42,8 +42,8 @@ _Q_LEVELS_PER_NAT = 8.0
 _Q_MAX_GAP = 19.0
 # Stored entries one finalize iteration covers.
 _Q_FINAL_BLOCK = 1024
-# Whole vocab: up to this many rows the combine and the cut fold into the
-# histogram, the compaction and finalize.
+# Up to this many rows (whole vocab or TP) the combine and the cut fold into
+# the histogram, the compaction and finalize.
 _FOLD_ROWS = 16
 
 
@@ -295,7 +295,8 @@ def _dspark_q_compact(
     weights ``exp(s - max)`` at its slot range, in id order.
 
     ``MAKE_CUT``: every tile of a row makes the row's `_row_cut` itself, and
-    tile 0 publishes n and every tile's first slot for finalize; otherwise the
+    tile 0 publishes n, and under TP every tile's first slot for finalize
+    (`_staged_slots`); otherwise the
     cut is `_dspark_q_cut`'s. ``s`` holds ``vocab_size`` ids from ``id_base``,
     which are the cut's tiles from ``tile_base`` (both 0 for the whole vocab;
     a TP shard's otherwise, `select_and_draw_q_tp`). ``DEST_BY_ROW`` writes
@@ -325,11 +326,13 @@ def _dspark_q_compact(
         offs_tile = tl.arange(0, BLOCK_TILE)
         if tile == 0:
             tl.store(row_n_ptr + row, n)
-            tl.store(
-                tile_off_ptr + row * num_tiles + offs_tile,
-                tile_off,
-                mask=offs_tile < num_tiles,
-            )
+            if DEST_BY_ROW:
+                # Only a TP finalize reads the slot ranges (`_staged_slots`).
+                tl.store(
+                    tile_off_ptr + row * num_tiles + offs_tile,
+                    tile_off,
+                    mask=offs_tile < num_tiles,
+                )
         quota = tl.sum(tl.where(offs_tile == my_tile, tile_quota, 0), axis=0)
         first = tl.sum(tl.where(offs_tile == my_tile, tile_off, 0), axis=0)
     else:
@@ -559,6 +562,34 @@ _LEVELS = {
 }
 
 
+def _combine_row_max_and_argmax(
+    part_max: torch.Tensor,
+    part_amax_val: torch.Tensor,
+    part_amax_idx: torch.Tensor,
+    row_max: torch.Tensor,
+    row_argmax: torch.Tensor,
+) -> None:
+    """Each row's max score and lowest-id raw argmax from stage 1's
+    `[tiles, B]` partials, in one launch: the unfolded path."""
+    num_rows = row_max.shape[0]
+    softmax_combine_kernel[(num_rows,)](
+        part_max,
+        None,
+        row_max,
+        None,
+        part_amax_val,
+        part_amax_idx,
+        row_argmax,
+        part_max.stride(0),
+        part_max.shape[0],
+        BLOCK_TILE=triton.next_power_of_2(part_max.shape[0]),
+        WITH_ARGMAX=True,
+        WITH_INV_Z=False,
+        num_warps=4,
+        num_stages=1,
+    )
+
+
 def select_and_draw_q(
     s_scratch: torch.Tensor,
     part_max: torch.Tensor,
@@ -599,21 +630,8 @@ def select_and_draw_q(
     # launches it saves (gfx950, B=32), so larger batches keep them.
     fold = num_rows <= _FOLD_ROWS
     if not fold:
-        softmax_combine_kernel[(num_rows,)](
-            part_max,
-            None,
-            row_max,
-            None,
-            part_amax_val,
-            part_amax_idx,
-            row_argmax,
-            part_max.stride(0),
-            num_parts,
-            BLOCK_TILE=block_parts,
-            WITH_ARGMAX=True,
-            WITH_INV_Z=False,
-            num_warps=4,
-            num_stages=1,
+        _combine_row_max_and_argmax(
+            part_max, part_amax_val, part_amax_idx, row_max, row_argmax
         )
     _dspark_q_histogram[(num_rows, q_tiles)](
         s_scratch,
@@ -740,8 +758,11 @@ class QSelectTPScratch(NamedTuple):
 
     hist: torch.Tensor  # [local tiles, B, bins], this rank's tables
     tile_off: torch.Tensor  # [B, every rank's tiles]
+    tile_quota: torch.Tensor  # [B, every rank's tiles], unfolded only
+    row_cut: torch.Tensor  # [B], unfolded only
     row_n: torch.Tensor  # [B]
     stage: torch.Tensor  # [2, B, K]: this rank's stored ids and weight bits
+    row_argmax: torch.Tensor  # [B], unfolded only
 
 
 def q_select_tp_scratch(
@@ -756,8 +777,11 @@ def q_select_tp_scratch(
     return QSelectTPScratch(
         Region((local_tiles, num_rows, _Q_BINS), i32),
         Region((num_rows, tiles), i32),
+        Region((num_rows, tiles), i32),
+        Region((num_rows,), i32),
         Region((num_rows,), i32),
         Region((2, num_rows, store_width), i32),
+        Region((num_rows,), i32),
     )
 
 
@@ -806,7 +830,15 @@ def select_and_draw_q_tp(
     num_tiles = world * local_tiles
     num_parts = part_max.shape[0]
     block_parts = triton.next_power_of_2(num_parts)
-    hist, tile_off, row_n, stage = scratch
+    hist, tile_off, tile_quota, row_cut, row_n, stage, row_argmax = scratch
+    # As on the whole vocab (`select_and_draw_q`): a folded cut is made by each
+    # of a row's local_tiles compaction programs over all ranks' tables, so
+    # past _FOLD_ROWS rows the combine and the cut run as their own launches.
+    fold = num_rows <= _FOLD_ROWS
+    if not fold:
+        _combine_row_max_and_argmax(
+            part_max, part_amax_val, part_amax_idx, row_max, row_argmax
+        )
     # Tile-major, so the gathered tables are `[world * local_tiles, B, bins]`:
     # the whole row's tiles in id order. A row that stores nothing leaves its
     # tables unwritten, and the compaction never reads them.
@@ -827,9 +859,31 @@ def select_and_draw_q_tp(
         BLOCK_PARTS=block_parts,
         BLOCK_V=_Q_BLOCK_V,
         **_LEVELS,
-        REDUCE_ROW_MAX=True,
+        REDUCE_ROW_MAX=fold,
         num_warps=4,
     )
+    tables = _gather_words(hist, tp_group, use_custom)
+    if not fold:
+        _dspark_q_cut[(num_rows,)](
+            tables,
+            q_row_base,
+            temperatures,
+            SAMPLER_EPS,
+            top_k,
+            top_p,
+            tile_off,
+            tile_quota,
+            row_cut,
+            row_n,
+            num_tiles,
+            1,
+            num_rows,
+            store_width,
+            BLOCK_TILE=triton.next_power_of_2(num_tiles),
+            NUM_BINS=_Q_BINS,
+            LEVELS_PER_NAT=_Q_LEVELS_PER_NAT,
+            num_warps=8,
+        )
     _dspark_q_compact[(num_rows, local_tiles)](
         s_scratch,
         row_max,
@@ -838,12 +892,12 @@ def select_and_draw_q_tp(
         SAMPLER_EPS,
         top_k,
         top_p,
-        _gather_words(hist, tp_group, use_custom),
+        tables,
         1,
         num_rows,
         tile_off,
-        None,
-        None,
+        tile_quota,
+        row_cut,
         row_n,
         stage[0],
         stage[1].view(torch.float32),
@@ -857,9 +911,9 @@ def select_and_draw_q_tp(
         BLOCK_TILE=triton.next_power_of_2(num_tiles),
         BLOCK_V=_Q_BLOCK_V,
         **_LEVELS,
-        MAKE_CUT=True,
+        MAKE_CUT=fold,
         DEST_BY_ROW=True,
-        num_warps=8,
+        num_warps=8 if fold else 4,
     )
     _dspark_q_finalize[(num_rows,)](
         q_ids,
@@ -874,7 +928,7 @@ def select_and_draw_q_tp(
         part_amax_idx,
         part_amax_val.stride(0),
         num_parts,
-        None,
+        row_argmax,
         row_n,
         seed,
         out,
@@ -887,7 +941,7 @@ def select_and_draw_q_tp(
         noise_offset,
         out.stride(0),
         FROM_STAGING=True,
-        ARGMAX_FROM_PARTS=True,
+        ARGMAX_FROM_PARTS=fold,
         WORLD=world,
         BLOCK_PARTS=block_parts,
         BLOCK=_Q_FINAL_BLOCK,

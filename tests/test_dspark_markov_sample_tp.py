@@ -22,6 +22,7 @@ if not torch.cuda.is_available():
     pytest.skip("ROCm GPU required", allow_module_level=True)
 
 from atom.model_ops.sampler import SAMPLER_EPS
+from atom.model_ops.spec_sampling import sparse_q_select
 from atom.model_ops.spec_sampling.dspark_markov_sample import (
     dspark_markov_sample,
     dspark_markov_sample_scratch,
@@ -114,10 +115,17 @@ def _inputs(rows, vocab, rank, seed, dtype):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=str)
 @pytest.mark.parametrize("world", [2, 4])
 @pytest.mark.parametrize("vocab", [4 * 5000, 4 * 8192, 129280])
-def test_every_rank_stores_and_draws_the_whole_vocab_ops_bits(world, vocab, dtype):
+@pytest.mark.parametrize("fold_rows", [0, 64], ids=["unfolded", "folded"])
+@pytest.mark.parametrize("rows", [8, 32])
+def test_every_rank_stores_and_draws_the_whole_vocab_ops_bits(
+    monkeypatch, rows, fold_rows, world, vocab, dtype
+):
     """Shards that end mid-tile (5000, 32320 ids) and on one; a greedy row,
-    a row without a destination, top-k and top-p rows among them."""
-    rows, rank, width, position = 8, 64, 256, 1
+    a row without a destination, top-k and top-p rows among them. The
+    reference folds at 8 rows and not at 32 (`_FOLD_ROWS`); the whole-vocab
+    op and the TP op are run again with the fold forced on or off, and every
+    run stores and draws the same bits."""
+    rank, width, position = 64, 256, 1
     noise_offset = position * rows * vocab
     base, prev, w1, w2, temps, top_k, top_p, row_base, seed = _inputs(
         rows, vocab, rank, world + vocab, dtype
@@ -130,24 +138,30 @@ def test_every_rank_stores_and_draws_the_whole_vocab_ops_bits(world, vocab, dtyp
             t.fill_(-7)
         return store
 
-    ref_store = fresh_store()
-    ref_out = torch.empty(rows, dtype=torch.int64, device=DEV)
-    dspark_markov_sample(
-        base,
-        prev,
-        w1,
-        w2,
-        ref_out,
-        *ref_store,
-        row_base,
-        position,
-        temps,
-        top_k,
-        top_p,
-        seed,
-        noise_offset,
-        dspark_markov_sample_scratch(rows, vocab, DEV),
-    )
+    def whole_vocab():
+        store = fresh_store()
+        out = torch.empty(rows, dtype=torch.int64, device=DEV)
+        dspark_markov_sample(
+            base,
+            prev,
+            w1,
+            w2,
+            out,
+            *store,
+            row_base,
+            position,
+            temps,
+            top_k,
+            top_p,
+            seed,
+            noise_offset,
+            dspark_markov_sample_scratch(rows, vocab, DEV),
+        )
+        return store, out
+
+    ref_store, ref_out = whole_vocab()
+    monkeypatch.setattr(sparse_q_select, "_FOLD_ROWS", fold_rows)
+    forced_store, forced_out = whole_vocab()
 
     shard = vocab // world
     group = ThreadGroup(world)
@@ -182,17 +196,19 @@ def test_every_rank_stores_and_draws_the_whole_vocab_ops_bits(world, vocab, dtyp
     torch.cuda.synchronize()
 
     written = row_base[row_base >= 0].long() + position
-    for r in range(world):
-        assert torch.equal(outs[r], ref_out), r
-        assert torch.equal(stores[r].meta[written], ref_store.meta[written]), r
+    # Every TP rank, then the whole-vocab op with the fold forced.
+    runs = list(zip(outs, stores)) + [(forced_out, forced_store)]
+    for r, (out, store) in enumerate(runs):
+        assert torch.equal(out, ref_out), r
+        assert torch.equal(store.meta[written], ref_store.meta[written]), r
         for row in written.tolist():
             n = ref_store.meta[row, 0].item()
-            assert torch.equal(stores[r].ids[row, :n], ref_store.ids[row, :n])
-            assert torch.equal(stores[r].probs[row, :n], ref_store.probs[row, :n])
+            assert torch.equal(store.ids[row, :n], ref_store.ids[row, :n])
+            assert torch.equal(store.probs[row, :n], ref_store.probs[row, :n])
         # Rows nobody drafts into stay untouched.
         untouched = torch.ones(store_rows, dtype=torch.bool, device=DEV)
         untouched[written] = False
-        assert (stores[r].meta[untouched] == -7).all()
+        assert (store.meta[untouched] == -7).all()
     # The filters still bite: the top-k row stores at most 20, the greedy row
     # its delta.
     assert ref_store.meta[row_base[4].long() + position, 0].item() <= 20

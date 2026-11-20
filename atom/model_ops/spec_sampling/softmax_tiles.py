@@ -2,8 +2,10 @@
 
 Every (row, V tile) program reduces its tile to ``(max, sum exp(x - max))``
 and one program per row combines them into the row's max and ``1/Z``. The
-ratio verify builds p this way; the sampled draft takes only the max
-(``WITH_INV_Z=False``), as its q is normalized over the stored entries.
+ratio verify builds p this way. The sampled draft combines only the max and
+the argmax (``WITH_INV_Z=False``, its q is normalized over the stored
+entries), and only past 16 rows: up to 16 its histogram and finalize reduce
+them from the tile partials (`sparse_q_select`).
 `race_key` and `argmax_lowest_id` (lowest id on a tie) are the one exponential
 race every draw goes through, so the draws cannot drift apart bit by bit;
 `argmax_lowest_id` (`tile_argmax`, outside this package: the default greedy
