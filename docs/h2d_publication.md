@@ -82,6 +82,18 @@ A deliberate second publication supplies a reason and acquires its source
 before rewriting it. Enqueue failures invalidate the owner and retain storage.
 
 The packed arena contains int64 offset/count pairs and byte payloads in one DMA.
+A producer may also hand a packed group a row plan for a two-dimensional `rows`
+member (`set_row_plan(buffer, RowPlan(rows, row_bytes))`, after `set_count`).
+That one publish then takes a separate path (`PackedCopy._submit_planned`):
+the same int64 (offset, count) pairs for every member, followed by an int64
+(row bytes, row map offset) pair per member; the planned member's payload holds
+only the leading ``row_bytes`` (a multiple of 16) of the listed rows and an
+int32 row map naming each row's destination row. Its scatter
+(`scatter_packed_rows`) runs `scatter_packed_words` for the other members and
+writes each planned row at its destination row's pitch; it is compiled when the
+group is created, if a member can take plans. Only members of whole 16-byte
+rows at a 16-byte-aligned destination take a plan, and the publish consumes
+it. Groups and steps without a plan run the plain path unchanged.
 The scatter preserves bit patterns and writes only the published ranges into
 the original GPU addresses. It reuses its compiled kernel and fixed destination
 table. No new synchronization event or GPU scalar read is added by packing.
@@ -106,10 +118,13 @@ kept beside the producers they protect:
 | `tests/test_h2d_v4_publication.py` | V4/V4.1 plans, state, step metadata and dummy isolation |
 | `tests/test_h2d_v4_indexer_publication.py` | V4 indexer, PCP, TBO and Opus |
 | `tests/test_h2d_draft_publication.py` | Draft and GDN consumers |
+| `tests/test_block_table_row_plan.py` | Block-table row plans through the real packed transport: the row scatter, scheduler churn, destination replacement and failed publishes |
 
 These suites check delayed source reuse, exact values, untouched tails, changing
 batch sizes, graph padding and first consumers. CPU page-table state transitions
-remain in `tests/test_shared_block_tables.py`, runnable without GPU opt-in.
+remain in `tests/test_shared_block_tables.py`, and the block-table row tracking
+(plans, the whole-prefix path, races, failed and partial publishes) in
+`tests/test_block_table_row_plan_cpu.py`; both run without GPU opt-in.
 
 Use the server's torch profiler endpoints for model traces. On ROCm, correlate
 copies with HIP runtime `kind=1`; displayed memcpy names can mislabel H2D as DtoD.
@@ -146,9 +161,29 @@ are validated and source ownership acquired before any host write.
 CPU preparation and successful GPU publication have separate revisions.
 Prefill can prepare CPU slots without uploading a table. Publication reuses the
 GPU table only when its destination, prepared revision and requested row count
-match. Changed tables still use one bulk publication; this does not add partial
-H2D transfers. A combined group omits an unchanged table but consumers retain
-its GPU view. Failed publication never marks the new revision as published.
+match. A table whose buffer is at most `WHOLE_PREFIX_BYTES` (4 MiB), or whose
+rows are not whole 16-byte words, is a plain `BlockTableState` and always goes
+up whole. A larger buffer gets a `TrackedBlockTableState`, which runs the same
+plain code while untracked: at a count whose prefix fits in 4 MiB, on a step
+whose prepare wrote nothing, on a busy step (its prepare changed more than half
+of the published rows) and for a group that is not packed. Above 4 MiB it
+counts the rows each prepare writes; any other step enters the tracking, from
+unknown, so that first stage sends every row at full width. Tracked, a step
+sends only the rows the destination does not hold, each only as wide as its
+pages and the destination's old nonzero bound need (`_row_plan`); a busy step,
+a step at a small count (a prefill staging the same buffer) or a plan covering
+more than half of the rows goes up whole instead, and the rows sent stay
+recorded either way, so the next step can plan. Eight busy steps in a row, or
+eight small stages in a row, leave the tracking; a whole copy because of a wide
+plan counts as neither. A stage into a group that is not packed, or a direct
+`publish()`, stops the tracking at once. The transport also copies whole a
+member that is the group's only active one. Provided the table is not prepared
+again between its stage and the publish, the destination ends byte-identical to
+a whole-prefix copy. Rows a failed or interrupted publish covered are unknown
+until a later publish succeeds and are sent again; a new destination gets every
+row at full width. A combined group omits an unchanged table but consumers
+retain its GPU view. Failed publication never marks the new revision as
+published.
 Padding, TBO slices and capture table preparation use the same state. Direct
 writes to the CPU/GPU table outside these entry points invalidate this contract.
 
