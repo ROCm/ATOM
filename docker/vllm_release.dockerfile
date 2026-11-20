@@ -27,15 +27,11 @@ ENV CMAKE_MAKE_PROGRAM=/usr/local/bin/ninja
 # install` below satisfies it by reinstalling the STOCK ROCm rccl into
 # /opt/rocm, which then shadows the custom build via ldconfig. That regresses
 # GLM-5.2 decode perf (memory-bound kernels run ~40% slower under the stock rccl
-# even though its collective kernels are never called in decode). Back it up here
-# and restore it right after `apt --fix-broken install` (mirrors the Triton
+# even though its collective kernels are never called in decode). Back it up at
+# the start of [OOT 1/7] and restore it right after `apt --fix-broken install`
+# in the same RUN, so the backup is never stored in a layer (mirrors the Triton
 # backup/restore below).
-RUN echo "========== [OOT 0/7] Back up base-image custom RCCL ==========" && \
-    mkdir -p /tmp/rccl-base-backup && \
-    (cp -a /usr/local/lib/librccl.so* /tmp/rccl-base-backup/ 2>/dev/null || true) && \
-    (cp -a /etc/ld.so.conf.d/rccl.conf /tmp/rccl-base-backup/ 2>/dev/null || true) && \
-    ls -l /tmp/rccl-base-backup/ || true
-
+#
 # Restore the base image's custom RCCL over the stock rccl that `apt --fix-broken
 # install` pulls into /opt/rocm, so the OOT image runs the SAME custom RCCL as the
 # native image. It runs in the same RUN as `--fix-broken`, so the stock library
@@ -51,6 +47,9 @@ RUN echo "========== [OOT 0/7] Back up base-image custom RCCL ==========" && \
 # and links against the same library the image runs. Without a custom RCCL
 # backup (BUILD_RCCL=0 base) the stock library stays and nothing is linked.
 RUN echo "========== [OOT 1/7] Prepare build tools ==========" && \
+    mkdir -p /tmp/rccl-base-backup && \
+    { cp -a /usr/local/lib/librccl.so* /tmp/rccl-base-backup/ 2>/dev/null || true; } && \
+    { cp -a /etc/ld.so.conf.d/rccl.conf /tmp/rccl-base-backup/ 2>/dev/null || true; } && \
     apt-get update && \
     apt --fix-broken install -y && \
     echo "========== [OOT] Restore base-image custom RCCL ==========" && \
