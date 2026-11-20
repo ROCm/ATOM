@@ -232,16 +232,14 @@ What changes with concurrency:
 | 16 | 32 | production | on | off | off |
 | 32 | 64 | production | on | on, `--max-num-batched-tokens 16384` | off |
 | 48 | 96 | production | on | off | 200 GiB / rank, chunk 256 |
-| 64 | 128 | production | on | off | 200 GiB / rank, chunk 128 |
 
 - **Mono decode.** `ATOM_MONO_ENABLE` defaults to 1, so it is not set. Mono builds 8- and 16-row kernels, so it covers decode steps of one or two requests at DSpark 7 (8 rows each); wider steps run the production path. It declines indexer CP over the NVFP4 caches, so from CONC 16 every step runs the production path.
 - **Indexer CP** (`ATOM_M3_INDEXER_CP=1`) from CONC 16. Each rank logs a traceback at startup ending in `candidate mailbox: hipIpc of cached memory needs ROCm 7.14 or later`. It is not an error: CP falls back to the collective candidate exchange.
 - **Prefill delayer** at CONC 32: `ATOM_PREFILL_DECODE_INTERVAL=8 ATOM_PREFILL_DELAYER_TARGET_FILL=0.05 ATOM_PREFILL_DELAYER_STALL_TICKS=2`. After a prefill step, the next 8 scheduler passes are decode only. After that, a waiting prefill runs once the queued prompt tokens reach 5% of `--max-num-batched-tokens`, or after 2 passes with no new work and no new arrival.
-- **LMCache chunk 128 at CONC 64.** LMCache loads a CPU prefix only from a chunk boundary. With 256-token chunks, a GPU prefix hit that ends on an odd 128-token block drops the CPU rest. On an earlier c64 run that cost 4.0% of prompt tokens (191 requests, 32.7M tokens). With 128-token chunks every GPU block boundary is also a chunk boundary.
 
 ```bash
 MODEL=/shared/data/amd_int/models/amd/MiniMax-M3.1-Flash-Quark-MXFP4   # draft at $MODEL/dspark
-CONC=1      # then 2, 4, 8, 16, 32, 48, 64
+CONC=1      # then 2, 4, 8, 16, 32, 48
 ```
 
 Capture every batch size up to 8, then in steps of 2 / 4 / 8 / 16 up to `--max-num-seqs`.
@@ -257,9 +255,8 @@ if [ "$CONC" -eq 32 ]; then
   BATCHED=16384
 fi
 if [ "$CONC" -ge 48 ]; then
-  CHUNK=$([ "$CONC" -ge 64 ] && echo 128 || echo 256)
   EXTRA_ENV+=" ATOM_KV_OFFLOAD=lmcache LMCACHE_LOCAL_CPU=True LMCACHE_NUMA_MODE=auto"
-  EXTRA_ENV+=" LMCACHE_MAX_LOCAL_CPU_SIZE=200 LMCACHE_CHUNK_SIZE=$CHUNK"
+  EXTRA_ENV+=" LMCACHE_MAX_LOCAL_CPU_SIZE=200 LMCACHE_CHUNK_SIZE=256"
 fi
 
 env -u AITER_QUICK_REDUCE_QUANTIZATION -u ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4 $EXTRA_ENV \
@@ -284,7 +281,7 @@ env -u AITER_QUICK_REDUCE_QUANTIZATION -u ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4 $EXT
   - `block_bytes=1986560`;
   - from CONC 16, `MiniMax-M3 mono decode off: indexer context parallelism with NVFP4 caches`;
   - at CONC 32, `PrefillDelayer initialized: ... max_num_batched_tokens=16384 target_fill=0.05 ... stall_ticks=2`;
-  - at CONC 48 / 64, `LMCache M3 PAGE offload worker rank=N: page_regions=130 bytes_per_block=1986560 chunk=256` (`chunk=128` at 64).
+  - at CONC 48, `LMCache M3 PAGE offload worker rank=N: page_regions=130 bytes_per_block=1986560 chunk=256`.
 
 Client: the InferenceX AgentX harness (`agentx-harness` 1.0.12, the version SGLang CI run 41277894342 used), which drives the same `semianalysis_cc_traces_weka_062126` replay as the aiperf command above:
 
