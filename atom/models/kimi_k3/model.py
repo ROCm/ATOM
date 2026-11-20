@@ -8,7 +8,9 @@ weights live under ``language_model.*`` in the checkpoint, so this module keeps
 the same object hierarchy and skips the vision tower/projector tensors.
 """
 
+import logging
 from collections.abc import Callable
+from itertools import pairwise
 from typing import ClassVar
 
 import torch
@@ -42,6 +44,10 @@ from atom.model_ops.fla_ops.fused_sigmoid_gating import (
 )
 from atom.model_ops.fla_ops.replayssm import (
     replayssm_sigmoid_gating_delta_rule,
+)
+from atom.model_ops.kimi_k3.attention_residual import (
+    ColumnTail,
+    materialize_column_output,
 )
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import (
@@ -544,6 +550,7 @@ class KimiSparseMoeBlock(nn.Module):
         self._defer_shared_add = self.shared_experts is not None and (
             self.use_latent_moe or self.tp_size == 1
         )
+        self.column_gather_name = ""
 
     def _apply_routed_norm_and_up_proj(
         self, routed_output: torch.Tensor
@@ -579,7 +586,7 @@ class KimiSparseMoeBlock(nn.Module):
 
     def forward(
         self, hidden_states: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor | ColumnTail, torch.Tensor | None]:
         """Returns ``(first, shared)``, where ``shared`` may be None.
 
         When ``shared`` is a tensor the two branches are left unsummed and
@@ -593,7 +600,14 @@ class KimiSparseMoeBlock(nn.Module):
         its single deferred all-reduce; see `split_moe_forward`). Callers must
         therefore treat ``first`` as the whole result and not as a routed
         partial that is still owed a shared add.
+
+        A native layer bound to the next residual site can instead return a
+        ``ColumnTail``. It owns real local columns, and a tensor reader must
+        gather them explicitly. This form stays outside the fixed-arity op.
         """
+        if self.column_gather_name and self._can_defer_column_tail(hidden_states):
+            local = torch.ops.aiter.kimi_k3_moe_columns(hidden_states, self.prefix)
+            return ColumnTail(local, self.column_gather_name, self.tp_size), None
         if self._use_dual_stream:
             if self._defer_shared_add:
                 # maybe_dual_stream_split_forward hands both branches back unsummed,
@@ -731,6 +745,7 @@ class KimiSparseMoeBlock(nn.Module):
         gate_up: torch.Tensor,
         router_logits: torch.Tensor,
         routed_input: torch.Tensor,
+        columns_only: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Reduce contiguous latent/shared blocks together, before routed norm."""
         latent_numel = routed_input.numel()
@@ -747,12 +762,13 @@ class KimiSparseMoeBlock(nn.Module):
         return self._finish_latent_tail(
             reduced[:latent_numel].view_as(routed_input),
             reduced[latent_numel:].view_as(hidden_states),
+            columns_only=columns_only,
         )
 
-    def _can_column_tail(self, latent: torch.Tensor, shared: torch.Tensor) -> bool:
+    def _column_tail_eligible(self, tokens, dtype, device) -> bool:
         from atom.plugin import is_plugin_mode
 
-        if self.tp_size != 8 or latent.shape[1] != 3584:
+        if self.tp_size != 8:
             return False
         ctx = get_forward_context().context
         if (
@@ -761,36 +777,70 @@ class KimiSparseMoeBlock(nn.Module):
             or ctx.is_prefill
             or get_current_atom_config().enable_tbo
             or get_pp_group().world_size != 1
-            or self.tp_size != 8
             or not envs.ATOM_USE_CUSTOM_ALL_GATHER
         ):
             return False
         comm = getattr(get_tp_group().device_communicator, "ca_comm", None)
         if comm is None or comm.disabled:
             return False
-        weight = self.routed_expert_up_proj.weight
-        norm = self.routed_expert_norm
+        weight, norm = self.routed_expert_up_proj.weight, self.routed_expert_norm
         return (
             norm is not None
             and not self.fuse_routed_norm_quant
             and not self.fuse_routed_triton_mxfp4_quant
-            and 1 <= latent.shape[0] <= 64
-            and latent.shape[1] == 3584
-            and shared.shape == (latent.shape[0], 7168)
+            and 1 <= tokens <= 64
+            and dtype == torch.bfloat16
             and weight.shape == (7168, 3584)
+            and norm.weight.shape == (3584,)
             and all(
-                tensor.dtype == torch.bfloat16
-                and tensor.device == latent.device
+                tensor.dtype == dtype
+                and tensor.device == device
                 and tensor.stride(-1) == 1
-                for tensor in (latent, shared, weight, norm.weight)
+                for tensor in (weight, norm.weight)
             )
         )
 
+    def _can_column_tail(self, latent: torch.Tensor, shared: torch.Tensor) -> bool:
+        return (
+            latent.ndim == 2
+            and latent.shape[1] == 3584
+            and shared.shape == (latent.shape[0], 7168)
+            and latent.stride(1) == shared.stride(1) == 1
+            and shared.dtype == latent.dtype
+            and shared.device == latent.device
+            and self._column_tail_eligible(latent.shape[0], latent.dtype, latent.device)
+        )
+
+    def _can_defer_column_tail(self, hidden_states: torch.Tensor) -> bool:
+        return (
+            self.front_proj is not None
+            and self.front_proj.merged_weight is not None
+            and self.shared_experts.down_proj.supports_out()
+            and hidden_states.ndim == 2
+            and hidden_states.shape[1] == 7168
+            and hidden_states.stride(1) == 1
+            and self._column_tail_eligible(
+                hidden_states.shape[0], hidden_states.dtype, hidden_states.device
+            )
+        )
+
+    def _column_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if not self._can_defer_column_tail(hidden_states):
+            raise RuntimeError("column MoE producer was called outside its capability")
+        gate_up, router_logits, routed_input = self.front_proj(hidden_states)
+        local, shared = self._one_reduce_split(
+            hidden_states, gate_up, router_logits, routed_input, columns_only=True
+        )
+        assert shared is None
+        return local
+
     def _finish_latent_tail(
-        self, latent: torch.Tensor, shared: torch.Tensor
+        self, latent: torch.Tensor, shared: torch.Tensor, columns_only: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Finish the reduced branches, projecting only this rank's columns."""
         if not self._can_column_tail(latent, shared):
+            if columns_only:
+                raise RuntimeError("column-only tail lost its capability")
             return self._apply_routed_norm_and_up_proj(latent), shared
         from atom.model_ops.kimi_k3.attention_residual import column_tail
 
@@ -803,6 +853,8 @@ class KimiSparseMoeBlock(nn.Module):
             self.routed_expert_up_proj.weight[columns],
             shared[:, columns],
         )
+        if columns_only:
+            return local, None
         return tensor_model_parallel_all_gather(local, use_custom=True, dim=-1), None
 
     def dual_stream_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1975,7 +2027,7 @@ class KimiDecoderLayer(nn.Module):
             return None
         for pending in pendings:
             if pending is not None:
-                prefix_sum = prefix_sum + pending
+                prefix_sum = prefix_sum + materialize_column_output(pending)
         return prefix_sum
 
     def check_aggregate_source(self, next_layer: "KimiDecoderLayer") -> None:
@@ -2015,6 +2067,8 @@ class KimiDecoderLayer(nn.Module):
         prefix_sum, pending_add, pending_add2, block_residual = output
         if prefix_sum is None:
             return None
+        pending_add = materialize_column_output(pending_add)
+        pending_add2 = materialize_column_output(pending_add2)
         own, res = self.self_attention_attn_res, next_layer.self_attention_attn_res
         num_blocks = own.layer_idx // own.block_size + 1
         if block_residual is None or block_residual.shape[1] < num_blocks:
@@ -2036,6 +2090,19 @@ class KimiDecoderLayer(nn.Module):
             pending_add2,
         )
         return mixed
+
+
+def _aux_from_next_residual(output: tuple, _site: nn.Module) -> torch.Tensor | None:
+    inputs, residual_output = output
+    prefix, bank = inputs[:2]
+    if prefix is None:
+        return None
+    first = inputs[2] if len(inputs) > 2 else None
+    second = inputs[3] if len(inputs) > 3 else None
+    if isinstance(first, ColumnTail):
+        return residual_output[1]
+    # The fallback's original BF16 additions keep their original rounding order.
+    return KimiDecoderLayer.aux_hidden_state((prefix, first, second, bank))
 
 
 @token_graph
@@ -2074,6 +2141,7 @@ class KimiLinearModel(nn.Module):
             prefix=f"{prefix}.layers",
             layer_num_offset=0,
         )
+        self._init_column_gather(atom_config, prefix)
         use_attn_residuals = getattr(config, "attn_res_block_size", None) is not None
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(
@@ -2106,6 +2174,82 @@ class KimiLinearModel(nn.Module):
 
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "block_residual"], config.hidden_size
+        )
+
+    def _init_column_gather(self, atom_config: Config, prefix: str) -> None:
+        from atom.model_ops.kimi_k3.attention_residual import PeerColumnGather
+        from atom.mono.runtime.consensus import MonoUnsupported
+        from atom.plugin import is_plugin_mode
+
+        self._column_gather = None
+        self._column_gather_blocks = []
+        if (
+            is_plugin_mode()
+            or atom_config.enable_tbo
+            or get_pp_group().world_size != 1
+            or get_tensor_model_parallel_world_size() != 8
+        ):
+            return
+        resident = self.layers[self.start_layer : self.end_layer]
+        for layer, following in pairwise(resident):
+            moe = getattr(layer, "block_sparse_moe", None)
+            if (
+                moe is not None
+                and moe.front_proj is not None
+                and moe.hidden_dim == 7168
+                and moe.moe_hidden_size == 3584
+                and moe.routed_expert_norm is not None
+                and following.self_attention_attn_res.enabled
+            ):
+                self._column_gather_blocks.append(moe)
+        if not self._column_gather_blocks:
+            return
+        comm = getattr(get_tp_group().device_communicator, "ca_comm", None)
+        if not envs.ATOM_USE_CUSTOM_ALL_GATHER or comm is None or comm.disabled:
+            return
+        try:
+            gather = PeerColumnGather(
+                7168, 64, get_tensor_model_parallel_rank(), 8, get_tp_group().cpu_group
+            )
+        except MonoUnsupported as error:
+            logging.getLogger("atom").warning(
+                "Kimi keeps immediate column gathers: %s", error
+            )
+            return
+        self._column_gather = gather
+        self._column_gather_name = f"{prefix}.column_gather"
+        self._column_gather_context = (
+            atom_config.compilation_config.static_forward_context
+        )
+        self._column_gather_context[self._column_gather_name] = gather
+        for moe in self._column_gather_blocks:
+            moe.column_gather_name = self._column_gather_name
+            self._column_gather_context[moe.prefix] = moe
+
+    def close_inference_resources(self) -> None:
+        """Release peer mappings while the TP process group still exists."""
+        if self._column_gather is not None:
+            self._column_gather.close()
+            self._column_gather_context.pop(self._column_gather_name, None)
+            for moe in self._column_gather_blocks:
+                moe.column_gather_name = ""
+            self._column_gather = None
+
+    def aux_tap_site(self, layer_id: int, spec):
+        """Move only plain post-layer taps to the next complete residual sum."""
+        from atom.plugin import is_plugin_mode
+        from atom.spec_decode.dspark_proposer import DSparkProposer
+
+        if (
+            is_plugin_mode()
+            or get_pp_group().world_size != 1
+            or spec.extract is not DSparkProposer._extract_layer_hidden
+            or not self.start_layer <= layer_id < self.end_layer - 1
+        ):
+            return None
+        return (
+            self.layers[layer_id + 1].self_attention_attn_res,
+            _aux_from_next_residual,
         )
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:

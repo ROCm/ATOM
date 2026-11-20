@@ -54,7 +54,7 @@ def block(modules, monkeypatch):
         pp=pp,
         comm=comm,
     )
-    for name in ("_can_column_tail", "_finish_latent_tail"):
+    for name in ("_column_tail_eligible", "_can_column_tail", "_finish_latent_tail"):
         setattr(block, name, MethodType(getattr(model.KimiSparseMoeBlock, name), block))
     return block
 

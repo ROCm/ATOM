@@ -34,6 +34,8 @@ Four deliberate divergences from that reference:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 
 from atom.utils.custom_register import direct_register_custom_op
@@ -112,6 +114,132 @@ def column_tail(
     )
 
 
+def _column_moe_op(hidden_states: torch.Tensor, layer_name: str) -> torch.Tensor:
+    from atom.config import get_current_atom_config
+
+    module = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    return module._column_moe_forward(hidden_states)
+
+
+def _column_moe_fake(hidden_states: torch.Tensor, layer_name: str) -> torch.Tensor:
+    return hidden_states.new_empty((hidden_states.shape[0], 896))
+
+
+direct_register_custom_op(
+    op_name="kimi_k3_moe_columns",
+    op_func=_column_moe_op,
+    mutates_args=[],
+    fake_impl=_column_moe_fake,
+)
+
+
+@dataclass(frozen=True)
+class ColumnTail:
+    """A rank's real columns; ordinary readers must gather them explicitly."""
+
+    columns: torch.Tensor
+    gather_name: str
+    world: int
+
+
+def _gather_columns_op(columns: torch.Tensor, world: int) -> torch.Tensor:
+    from aiter.dist.communication_op import tensor_model_parallel_all_gather
+
+    output = tensor_model_parallel_all_gather(columns, use_custom=True, dim=-1)
+    if output.shape != (columns.shape[0], columns.shape[1] * world):
+        raise RuntimeError("column gather returned the wrong TP geometry")
+    return output
+
+
+def _gather_columns_fake(columns: torch.Tensor, world: int) -> torch.Tensor:
+    return columns.new_empty((columns.shape[0], columns.shape[1] * world))
+
+
+direct_register_custom_op(
+    op_name="kimi_k3_gather_columns",
+    op_func=_gather_columns_op,
+    mutates_args=[],
+    fake_impl=_gather_columns_fake,
+)
+
+
+def materialize_column_output(value):
+    """Return a complete tensor for an ordinary reader of a pending addend."""
+    if isinstance(value, ColumnTail):
+        return torch.ops.aiter.kimi_k3_gather_columns(value.columns, value.world)
+    return value
+
+
+class PeerColumnGather:
+    """One model's two-parity exchange, consumed by its next residual mix.
+
+    Each int64 word carries two BF16 columns and their row's epoch. A rank
+    cannot reuse a parity until its peers have read the preceding parity.
+    Every rank calls this exchange in the same order on its compute stream.
+    """
+
+    def __init__(self, hidden: int, rows: int, rank: int, world: int, group):
+        from atom.mono.runtime.peer_memory import SymmetricPeerBuffer
+
+        if not self.fits(hidden, world) or not 0 < rows <= 64:
+            raise ValueError("column gather requires paired columns and 1..64 rows")
+        self.rank, self.world, self.rows = rank, world, rows
+        self.cols = hidden // world
+        words = 2 * world * rows * (self.cols // 2)
+        self.buffer = SymmetricPeerBuffer(8 * words, rank, world, group)
+        self.scratch = self.buffer.storage.view(torch.int64)
+        self.epochs = torch.zeros(rows, dtype=torch.int32, device=self.scratch.device)
+        self.scratch.zero_()
+        torch.cuda.synchronize(self.scratch.device)
+        if world > 1:
+            torch.distributed.barrier(group=group)
+        self.closed = False
+
+    @staticmethod
+    def fits(hidden: int, world: int) -> bool:
+        return (
+            hidden > 0
+            and world > 1
+            and world & (world - 1) == 0
+            and hidden % (2 * world) == 0
+        )
+
+    def close(self):
+        """Close mappings after every rank's work has finished, collectively."""
+        if not self.closed:
+            self.buffer.close()
+            self.closed = True
+
+    def kernel_args(self, share: torch.Tensor) -> dict:
+        if self.closed:
+            raise RuntimeError("column gather is closed")
+        if (
+            share.ndim != 2
+            or not 0 < share.shape[0] <= self.rows
+            or share.shape[1] != self.cols
+            or share.dtype != torch.bfloat16
+            or share.device != self.scratch.device
+            or share.stride(1) != 1
+            or share.stride(0) % 2
+        ):
+            raise ValueError("column share does not match its exchange")
+        return {
+            "share_ptr": share,
+            "scratch_ptr": self.scratch,
+            "peers_ptr": self.buffer.addresses,
+            "epochs_ptr": self.epochs,
+            "rank": self.rank,
+            "stride_share_t": share.stride(0),
+            "PEERS": self.world,
+            "COLS": self.cols,
+            "ROWS": self.rows,
+            "BW": triton.next_power_of_2(self.cols // 2),
+            "GATHER": True,
+        }
+
+
 try:
     import triton
     import triton.language as tl
@@ -157,6 +285,17 @@ if _HAS_TRITON:
         WRITE_PREF: tl.constexpr,  # write the (summed) prefix back to pref_ptr
         OUT_NORM: tl.constexpr,  # fold the caller's output rmsnorm into the store
         QUANT: tl.constexpr,  # fold the consumer's per-token quant into the store
+        share_ptr=None,
+        scratch_ptr=None,
+        peers_ptr=None,
+        epochs_ptr=None,
+        rank=0,
+        stride_share_t=0,
+        PEERS: tl.constexpr = 1,
+        COLS: tl.constexpr = 2,
+        ROWS: tl.constexpr = 1,
+        BW: tl.constexpr = 1,
+        GATHER: tl.constexpr = False,
     ):
         # One program per row t: rmsnorm each of the Bp = B+1 candidates, score =
         # <normed, score_weight>, softmax over Bp, then weighted sum -> y[t].
@@ -197,6 +336,26 @@ if _HAS_TRITON:
         t = tl.program_id(0)
         o_d = tl.arange(0, BD)
         m_d = o_d < H
+        if GATHER:
+            W: tl.constexpr = COLS // 2
+            flag = tl.load(epochs_ptr + t) + 1
+            o_w = tl.arange(0, BW)
+            o_p = tl.arange(0, PEERS)
+            data = tl.load(
+                share_ptr.to(tl.pointer_type(tl.int32))
+                + t * (stride_share_t // 2)
+                + o_w,
+                mask=o_w < W,
+                other=0,
+            )
+            word = (flag.to(tl.int64) << 32) | (data.to(tl.int64) & 0xFFFFFFFF)
+            slot = (((flag & 1) * PEERS + rank) * ROWS + t) * W + o_w
+            peers = tl.load(peers_ptr + o_p).to(tl.pointer_type(tl.int64))
+            tl.store(
+                peers[:, None] + slot[None, :],
+                word[None, :],
+                mask=(o_p < PEERS)[:, None] & (o_w < W)[None, :],
+            )
         sw = tl.load(sw_ptr + o_d, mask=m_d, other=0.0).to(tl.float32)
 
         # prefix (the last candidate) is loaded once and reused across tiles;
@@ -206,6 +365,26 @@ if _HAS_TRITON:
             ps += tl.load(hs_ptr + t * stride_hs_t + o_d, mask=m_d, other=0.0).to(
                 tl.float32
             )
+        if GATHER:
+            src, col = o_d // COLS, o_d % COLS
+            words = scratch_ptr + (((flag & 1) * PEERS + src) * ROWS + t) * W + col // 2
+            remote = m_d & (src != rank)
+            ready = flag.to(tl.int64) << 32
+            word = tl.load(
+                words, mask=remote, other=ready, volatile=True, cache_modifier=".cv"
+            )
+            while tl.min(((word >> 32).to(tl.int32) == flag).to(tl.int32), axis=0) == 0:
+                word = tl.load(
+                    words, mask=remote, other=ready, volatile=True, cache_modifier=".cv"
+                )
+            bits = ((word >> ((col % 2) * 16).to(tl.int64)) & 0xFFFF).to(tl.int32)
+            mine = tl.load(
+                share_ptr + t * stride_share_t + o_d - rank * COLS,
+                mask=m_d & (src == rank),
+                other=0.0,
+            ).to(tl.float32)
+            ps += tl.where(src == rank, mine, (bits << 16).to(tl.float32, bitcast=True))
+            tl.store(epochs_ptr + t, flag)
         if DO_ADD2:
             ps += tl.load(hs2_ptr + t * stride_hs2_t + o_d, mask=m_d, other=0.0).to(
                 tl.float32
@@ -300,6 +479,7 @@ def _apply_attn_res_impl(
     out_eps: float = 1e-6,
     add_hidden2: torch.Tensor | None = None,  # [T, H], folded the same way
     quant_dtype: torch.dtype | None = None,  # folded: y = per-token quant(y)
+    column_gather: str = "",
 ) -> (
     tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 ):
@@ -330,6 +510,18 @@ def _apply_attn_res_impl(
     Bp = B + 1
     do_add = add_hidden is not None
     do_add2 = add_hidden2 is not None
+    gather = None
+    if column_gather:
+        from atom.config import get_current_atom_config
+
+        gather = get_current_atom_config().compilation_config.static_forward_context[
+            column_gather
+        ]
+        if not isinstance(gather, PeerColumnGather) or H != gather.world * gather.cols:
+            raise ValueError("residual mix does not match its column exchange")
+        if not do_add:
+            raise ValueError("column exchange requires a local column input")
+    load_add = do_add and gather is None
     if do_add2 and not do_add:
         raise ValueError("add_hidden2 requires add_hidden")
     out_norm = out_norm_weight is not None
@@ -360,7 +552,7 @@ def _apply_attn_res_impl(
     # hs/hs2/pref pointers are always passed (triton needs a tensor); when not
     # adding they alias ps and are never dereferenced (DO_ADD / DO_ADD2 /
     # WRITE_PREF are False).
-    hs = add_hidden.contiguous() if do_add else ps
+    hs = add_hidden.contiguous() if load_add else ps
     hs2 = add_hidden2.contiguous() if do_add2 else ps
     pref = torch.empty_like(ps) if do_add else ps
 
@@ -397,11 +589,12 @@ def _apply_attn_res_impl(
         BD=triton.next_power_of_2(H),
         num_stages=ns,
         num_warps=nw,
-        DO_ADD=do_add,
+        DO_ADD=load_add,
         DO_ADD2=do_add2,
         WRITE_PREF=do_add,
         OUT_NORM=out_norm,
         QUANT=quant,
+        **(gather.kernel_args(add_hidden) if gather is not None else {}),
     )
     prefix_out = pref if do_add else prefix_sum
     if quant:
@@ -456,6 +649,7 @@ def _apply_attn_res_add_op(
     out_norm_weight: torch.Tensor | None = None,
     out_eps: float = 1e-6,
     add_hidden2: torch.Tensor | None = None,
+    column_gather: str = "",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return _apply_attn_res_impl(
         prefix_sum,
@@ -466,6 +660,7 @@ def _apply_attn_res_add_op(
         out_norm_weight=out_norm_weight,
         out_eps=out_eps,
         add_hidden2=add_hidden2,
+        column_gather=column_gather,
     )
 
 
@@ -478,6 +673,7 @@ def _apply_attn_res_add_op_fake(
     out_norm_weight: torch.Tensor | None = None,
     out_eps: float = 1e-6,
     add_hidden2: torch.Tensor | None = None,
+    column_gather: str = "",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return torch.empty_like(prefix_sum), torch.empty_like(prefix_sum)
 
@@ -551,6 +747,7 @@ def _apply_attn_res_add_quant_op(
     out_eps: float,
     quant_dtype: torch.dtype,
     add_hidden2: torch.Tensor | None = None,
+    column_gather: str = "",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return _apply_attn_res_impl(
         prefix_sum,
@@ -562,6 +759,7 @@ def _apply_attn_res_add_quant_op(
         out_eps=out_eps,
         add_hidden2=add_hidden2,
         quant_dtype=quant_dtype,
+        column_gather=column_gather,
     )
 
 
@@ -575,6 +773,7 @@ def _apply_attn_res_add_quant_op_fake(
     out_eps: float,
     quant_dtype: torch.dtype,
     add_hidden2: torch.Tensor | None = None,
+    column_gather: str = "",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return (
         torch.empty_like(prefix_sum, dtype=quant_dtype),
@@ -599,7 +798,7 @@ def apply_attn_res(
     block_residual: torch.Tensor,
     score_weight: torch.Tensor,
     eps: float,
-    add_hidden: torch.Tensor | None = None,
+    add_hidden: torch.Tensor | ColumnTail | None = None,
     out_norm_weight: torch.Tensor | None = None,
     out_eps: float = 1e-6,
     add_hidden2: torch.Tensor | None = None,
@@ -615,6 +814,11 @@ def apply_attn_res(
     making the first element of the returned pair a ``(quantized, scale)`` tuple
     rather than a tensor -- the same shape the fused-quant RMSNorm hands its
     consumers, so the call sites that already unpack one need no new branch."""
+    column_gather = ""
+    if isinstance(add_hidden, ColumnTail):
+        column_gather, add_hidden = add_hidden.gather_name, add_hidden.columns
+    if isinstance(add_hidden2, ColumnTail):
+        raise TypeError("the column tail must be the first pending addend")
     if quant_dtype is not None:
         if add_hidden is None:
             if add_hidden2 is not None:
@@ -639,6 +843,7 @@ def apply_attn_res(
             out_eps,
             quant_dtype,
             add_hidden2,
+            column_gather,
         )
         return (y, y_scale), prefix_out
     if add_hidden is None:
@@ -659,4 +864,5 @@ def apply_attn_res(
         out_norm_weight,
         out_eps,
         add_hidden2,
+        column_gather,
     )
