@@ -30,8 +30,9 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from conftest import with_min_load
+from conftest import atom_config_double, with_min_load
 
+from atom.config import Config, ParallelConfig
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
@@ -310,25 +311,43 @@ def _extra(**overrides):
     return extra
 
 
+class _EngineConfig(SimpleNamespace):
+    """The engine `Config`'s fields (`atom_config_double`, which refuses any
+    other name) with its TP placement properties, as the connector reads them
+    off the engine config."""
+
+    tp_world_size = Config.tp_world_size
+    tp_size_local = Config.tp_size_local
+    tp_rank_start = Config.tp_rank_start
+    is_multinode_tp = Config.is_multinode_tp
+    _tp_node_slice = Config._tp_node_slice
+
+
 def _config(role="offload", *, pp=1, tp=1, layers=4, extra=None, **fields):
-    config = SimpleNamespace(
-        kv_transfer_config={
+    values = {
+        "kv_transfer_config": {
             "kv_connector": "umbp_store",
             "kv_role": role,
             "kv_connector_extra_config": _extra() if extra is None else extra,
         },
-        kv_cache_block_size=BLOCK,
-        decode_context_parallel_size=1,
-        tensor_parallel_size=tp,
-        pipeline_parallel_size=pp,
-        hf_config=SimpleNamespace(num_hidden_layers=layers, model_type="glm_moe_dsa"),
-        model="test-model",
-        kv_cache_dtype="fp8",
-        speculative_config=None,
-    )
-    for name, value in fields.items():
-        setattr(config, name, value)
-    return with_min_load(config)
+        "kv_cache_block_size": BLOCK,
+        "decode_context_parallel_size": 1,
+        "tensor_parallel_size": tp,
+        "pipeline_parallel_size": pp,
+        "hf_config": SimpleNamespace(
+            num_hidden_layers=layers, model_type="glm_moe_dsa"
+        ),
+        "model": "test-model",
+        "kv_cache_dtype": "fp8",
+        "speculative_config": None,
+    }
+    double = atom_config_double(**{**values, **fields})
+    return with_min_load(_EngineConfig(**vars(double)))
+
+
+def _all_slots_free(pool, region):
+    """Whether every slot of ``region`` is back in the pool (none leased)."""
+    return len(pool._free[pool._region(region)]) == pool.capacity(region)
 
 
 def _seq(req_id, num_prompt_tokens, *, offset=0):
@@ -557,11 +576,31 @@ def test_loads_hits_from_the_mooncake_store_floor():
     assert _config().offload_min_load_tokens == 512
 
 
-def test_shared_prefix_routing_with_umbp_is_single_node_only():
-    single = _config(is_multinode_dp=False)
-    assert KVConnectorFactory.offload_tier(single).loads
+@pytest.mark.parametrize("dp_local", [2, 1])
+def test_shared_prefix_routing_with_umbp_is_single_node_only(dp_local):
+    # What `--dp-load-balance share_cache|prefix_spread` asks at startup, on
+    # the engine Config: the DP placement lives in its `parallel_config`.
+    config = _config(
+        parallel_config=ParallelConfig(
+            data_parallel_size=2, data_parallel_size_local=dp_local
+        )
+    )
+    if dp_local == 2:  # both DP ranks on this node
+        assert KVConnectorFactory.offload_tier(config).loads
+        return
     with pytest.raises(ValueError, match="single-node only"):
-        KVConnectorFactory.offload_tier(_config(is_multinode_dp=True))
+        KVConnectorFactory.offload_tier(config)
+
+
+def test_a_tp_group_over_several_nodes_is_refused():
+    cfg = parse_umbp_store_config(_extra())
+    check_engine_compatibility(cfg, _config(tp=4))
+    two_nodes = _config(
+        tp=4, parallel_config=ParallelConfig(tensor_parallel_size_local=2)
+    )
+    assert two_nodes.is_multinode_tp
+    with pytest.raises(ValueError, match="several nodes"):
+        check_engine_compatibility(cfg, two_nodes)
 
 
 def test_namespace_is_umbps_own():
@@ -698,6 +737,68 @@ def test_clients_bound_their_lookups(server):
     assert fake.lookup_timeout_ms == 250
 
 
+@pytest.mark.usefixtures("one_rank")
+def test_a_worker_client_takes_the_configured_lookup_deadline(server):
+    worker = UMBPStoreOffloadConnector(_registering_config(lookup_timeout_ms=250))
+    try:
+        worker.register_kv_caches(_kv_caches(), num_blocks=8)
+        [fake] = server.clients
+        assert fake.lookup_timeout_ms == 250
+    finally:
+        worker.close()
+
+
+class _FakeMoriProcessConfig:
+    """`UMBPStandaloneProcessConfig`: a fixed set of fields, as the binding's
+    `def_readwrite` attributes are; an unknown one raises."""
+
+    __slots__ = ("address", "auto_start", "lookup_timeout_ms", "startup_timeout_ms")
+
+
+class _FakeMoriOldProcessConfig:
+    """The same, from a Mori without ROCm/mori#949 (no lookup deadline)."""
+
+    __slots__ = ("address", "auto_start", "startup_timeout_ms")
+
+
+def _fake_mori(monkeypatch, process_config):
+    made = []
+
+    class UMBPConfig:
+        standalone_process = None
+
+    class UMBPClient:
+        def __init__(self, config):
+            made.append(config)
+
+    module = types.ModuleType("mori.umbp")
+    module.UMBPClient = UMBPClient
+    module.UMBPConfig = UMBPConfig
+    module.UMBPStandaloneProcessConfig = process_config
+    monkeypatch.setitem(sys.modules, "mori", types.ModuleType("mori"))
+    monkeypatch.setitem(sys.modules, "mori.umbp", module)
+    return made
+
+
+def test_the_mori_client_is_configured_for_a_standalone_server(monkeypatch):
+    made = _fake_mori(monkeypatch, _FakeMoriProcessConfig)
+    umbp_client.UMBPStoreClient(
+        address=ADDRESS, startup_timeout_ms=1234, lookup_timeout_ms=250
+    )
+    [config] = made
+    process = config.standalone_process
+    assert process.address == ADDRESS
+    assert process.auto_start is False  # the server is started outside ATOM
+    assert (process.startup_timeout_ms, process.lookup_timeout_ms) == (1234, 250)
+
+
+def test_a_mori_without_the_lookup_deadline_is_refused(monkeypatch):
+    made = _fake_mori(monkeypatch, _FakeMoriOldProcessConfig)
+    with pytest.raises(RuntimeError, match="lookup_timeout_ms"):
+        umbp_client.UMBPStoreClient(address=ADDRESS)
+    assert made == []
+
+
 # --- the worker --------------------------------------------------------------
 
 
@@ -723,6 +824,8 @@ def test_save_then_load_round_trips(server, make_worker):
     ]
     assert worker.get_finished().finished_loading == {load.load_operation}
     assert worker._pool.quarantined("save") == worker._pool.quarantined("load") == 0
+    assert _all_slots_free(worker._pool, "save")
+    assert _all_slots_free(worker._pool, "load")
 
 
 class FakeStridedCodec:
@@ -852,8 +955,10 @@ def test_a_put_answered_false_fails_its_save_and_frees_its_slots(server, make_wo
         _store(request.save_operation, False),
         _quiescent(request.save_operation),
     }
-    # The call returned: nothing quarantined, nothing marked, loads go on.
+    # The call returned: nothing quarantined, every slot back, nothing
+    # marked, loads go on.
     assert worker._pool.quarantined("save") == 0
+    assert _all_slots_free(worker._pool, "save")
     assert worker._store_distrusted is None and taint.reason(ADDRESS) is None
 
 
@@ -867,6 +972,7 @@ def test_a_load_miss_fails_all_or_nothing(server, make_worker):
     assert worker.get_finished().failed_loading == {request.load_operation}
     assert worker.take_load_error_blocks() == set(range(102, 110))
     assert worker._pool.quarantined("load") == 0
+    assert _all_slots_free(worker._pool, "load")
 
 
 def test_a_get_that_raises_quarantines_its_slots_only(server, make_worker):
@@ -1162,6 +1268,36 @@ def test_a_lookup_that_takes_its_deadline_answers_nothing_and_pauses(server):
     assert lookup.lookup(_seq(0, 16)) is None  # still paused
     lookup.paused_until = 0.0
     assert lookup.lookup(_seq(0, 16)) == 2 * CHUNK
+
+
+@pytest.mark.parametrize(("blocked_s", "answered"), [(0.999, True), (1.0, False)])
+def test_a_lookup_that_blocked_for_the_whole_deadline_is_no_answer(
+    server, monkeypatch, blocked_s, answered
+):
+    """The boundary: Mori gives up at the deadline, so a call that took all of
+    it was answered by the deadline, not by the server."""
+    from atom.kv_transfer.offload.umbp_store import scheduler as umbp_scheduler
+
+    clock = [100.0]
+    monkeypatch.setattr(
+        umbp_scheduler,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock[0], perf_counter=time.perf_counter),
+    )
+    original = FakeUMBPClient.batch_exists
+
+    def blocking_exists(self, keys):
+        clock[0] += blocked_s
+        return original(self, keys)
+
+    monkeypatch.setattr(FakeUMBPClient, "batch_exists", blocking_exists)
+    scheduler = UMBPStoreOffloadScheduler(_config(extra=_extra(lookup_timeout_ms=1000)))
+    hashes = _hashes(16)
+    namespace = store_namespace(_config(), CHUNK)
+    for index in range(2):
+        server.at()[_key(hashes, index, namespace=namespace)] = b""
+    answer = scheduler._lookup_client.lookup(_seq(0, 16))
+    assert answer == (2 * CHUNK if answered else None)
 
 
 def test_an_unreachable_server_answers_nothing(server):
