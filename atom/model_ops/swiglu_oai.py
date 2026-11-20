@@ -195,7 +195,7 @@ def _swiglu_oai_mxfp8_kernel(
 
 
 @functools.lru_cache(maxsize=1)
-def _swiglu_oai_mxfp8_arch_supported() -> bool:
+def swiglu_oai_mxfp8_arch_supported() -> bool:
     return get_gfx_runtime() == "gfx1250"
 
 
@@ -209,7 +209,7 @@ def swiglu_oai_mxfp8_supported(gate_up: torch.Tensor) -> bool:
         and gate_up.shape[0] > 0
         and gate_up.shape[1] > 0
         and gate_up.shape[1] % 64 == 0
-        and _swiglu_oai_mxfp8_arch_supported()
+        and swiglu_oai_mxfp8_arch_supported()
     )
 
 
