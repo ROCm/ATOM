@@ -251,8 +251,8 @@ def first_token(row, streamed):
     return dict(row, token=first_id, logprob=float(record[0]), top=top)
 
 
-def compare_tokens(left, right, threshold=0.01):
-    """Probability bounds over the union of the two reported top-20 sets only."""
+def compare_responses(left, right, threshold=0.01):
+    """Check complete continuations and first-position top-20 probability bounds."""
     values = [
         left["logprob"],
         right["logprob"],
@@ -281,10 +281,19 @@ def compare_tokens(left, right, threshold=0.01):
             lower.append(max(0.0, known - tail))
             upper.append(max(known, abs(known - tail)))
     lo, hi = max(lower), max(upper)
+    same = left["token_ids"] == right["token_ids"]
+    selected, delta = {}, 0.0
+    if same:
+        pairs = list(zip(left["logprobs"], right["logprobs"], strict=True))
+        delta = max(abs(math.exp(a) - math.exp(b)) for a, b in pairs)
+        selected = {
+            "max_selected_probability_delta": delta,
+            "max_selected_logprob_delta": max(abs(a - b) for a, b in pairs),
+        }
     status = "pass"
-    if lo > threshold:
+    if lo > threshold or delta > threshold:
         status = "fail"
-    elif hi > threshold or left["token"] != right["token"]:
+    elif hi > threshold or not same or left["token"] != right["token"]:
         status = "inconclusive"
     return {
         "status": status,
@@ -292,26 +301,9 @@ def compare_tokens(left, right, threshold=0.01):
         "max_top20_union_probability_delta_upper": hi,
         "same_token": left["token"] == right["token"],
         "top_overlap": len(a.keys() & b.keys()),
-        "chosen_logprob_delta": abs(left["logprob"] - right["logprob"]),
+        "same_completion": same,
+        **selected,
     }
-
-
-def compare_responses(left, right, threshold=0.01):
-    result = compare_tokens(left, right, threshold)
-    same = left["token_ids"] == right["token_ids"]
-    result["same_completion"] = same
-    if same:
-        pairs = list(zip(left["logprobs"], right["logprobs"], strict=True))
-        delta = max(abs(math.exp(a) - math.exp(b)) for a, b in pairs)
-        result.update(
-            max_selected_probability_delta=delta,
-            max_selected_logprob_delta=max(abs(a - b) for a, b in pairs),
-        )
-        if delta > threshold:
-            result["status"] = "fail"
-    elif result["status"] != "fail":
-        result["status"] = "inconclusive"
-    return result
 
 
 def check_trace(arm, stage):
@@ -523,7 +515,7 @@ def compare(base, candidate=None):
     pairs = []
     for result in (base,) if candidate is None else (base, candidate):
         check_capture(result)
-        pairs.append((*result["stages"], result["arm"] + "/resume", True))
+        pairs.append((*result["stages"], result["arm"] + "/resume"))
     if candidate is not None:
         if (base["arm"], candidate["arm"]) != ("baseline", "candidate"):
             raise CoverageError("wrong capture arm")
@@ -531,15 +523,15 @@ def compare(base, candidate=None):
             if base[key] != candidate[key]:
                 raise CoverageError(f"unmatched pair: {key}")
         pairs.extend(
-            (left, right, left["phase"], False)
+            (left, right, left["phase"])
             for left, right in zip(base["stages"], candidate["stages"])
         )
     rows = []
-    for left, right, phase, continuation in pairs:
+    for left, right, phase in pairs:
         if left["prompt_sha256"] != right["prompt_sha256"]:
             raise CoverageError("mismatched prompt identity")
-        comparator = compare_responses if continuation else compare_tokens
-        rows.append(dict(phase=phase, **comparator(left["first"], right["first"])))
+        comparison = compare_responses(left["first"], right["first"])
+        rows.append(dict(phase=phase, **comparison))
     status = (
         "fail"
         if any(row["status"] == "fail" for row in rows)

@@ -18,7 +18,7 @@ def token(probability=0.8, token_id=1, count=32):
     return {
         "token": token_id,
         "logprob": math.log(probability),
-        "top": {1: math.log(probability), 2: math.log(0.01)},
+        "top": {i: math.log(probability if i == 1 else 0.001) for i in range(1, 21)},
         "token_ids": [token_id] * count,
         "logprobs": [math.log(probability)] * count,
         "num_tokens_output": count,
@@ -130,21 +130,24 @@ class ProbeChecks(unittest.TestCase):
             )
 
     def test_numerical_decisions(self):
-        self.assertEqual(probe.compare_tokens(token(), token())["status"], "pass")
-        self.assertEqual(probe.compare_tokens(token(), token(0.75))["status"], "fail")
+        self.assertEqual(probe.compare_responses(token(), token())["status"], "pass")
         self.assertEqual(
-            probe.compare_tokens(token(), token(token_id=2))["status"], "inconclusive"
+            probe.compare_responses(token(), token(0.75))["status"], "fail"
+        )
+        self.assertEqual(
+            probe.compare_responses(token(), token(token_id=2))["status"],
+            "inconclusive",
         )
         bad = token()
         bad["top"][1] = math.nan
-        self.assertEqual(probe.compare_tokens(token(), bad)["status"], "fail")
+        self.assertEqual(probe.compare_responses(token(), bad)["status"], "fail")
 
     def test_unseen_top_token_uses_an_upper_bound(self):
         left = token()
         right = token()
         left["top"] = {1: math.log(0.8), 2: math.log(0.015)}
         right["top"] = {1: math.log(0.8), 3: math.log(0.01)}
-        result = probe.compare_tokens(left, right)
+        result = probe.compare_responses(left, right)
         self.assertLess(result["max_top20_union_probability_delta_lower"], 0.01)
         self.assertGreater(result["max_top20_union_probability_delta_upper"], 0.01)
         self.assertEqual(result["status"], "inconclusive")
@@ -193,13 +196,20 @@ class ProbeChecks(unittest.TestCase):
             probe.compare(base, candidate)
 
     def test_resume_checks_the_entire_continuation(self):
-        for index in (0, 17, 31):
-            base = capture("baseline")
-            base["stages"][1]["first"]["token_ids"][index] = 2
-            self.assertEqual(probe.compare(base)["status"], "inconclusive")
-            base = capture("baseline")
-            base["stages"][1]["first"]["logprobs"][index] = math.log(0.7)
-            self.assertEqual(probe.compare(base)["status"], "fail")
+        for arm, phases, probability in (
+            ("baseline", (1,), 0.7),
+            ("candidate", (0, 1), 0.1),
+        ):
+            for index in (0, 17, 31):
+                for field, value, expected in (
+                    ("token_ids", 2, "inconclusive"),
+                    ("logprobs", math.log(probability), "fail"),
+                ):
+                    base, candidate = capture("baseline"), capture("candidate")
+                    changed = base if arm == "baseline" else candidate
+                    for phase in phases:
+                        changed["stages"][phase]["first"][field][index] = value
+                    self.assertEqual(probe.compare(base, candidate)["status"], expected)
         base["stages"][1]["first"]["logprobs"][31] = math.nan
         with self.assertRaises(FloatingPointError):
             probe.compare(base)
