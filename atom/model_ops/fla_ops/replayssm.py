@@ -426,8 +426,11 @@ def _owns_kg_records(
     return owns
 
 
-#: Zeroed `_owns_kg_records` counts, one per checkpoint slot and head, keyed by
-#: device, checkpoint address and size. Kept alive for captured graphs.
+#: Process-lifetime counters: entries survive checkpoint-pool destruction.
+#: Successful launches reset used counters; a recycled address may be used only
+#: after prior GPU work at that address. Callers keep checkpoint storage alive
+#: while graphs can replay it and until queued work completes. Counters remain
+#: alive so that captured graphs retain valid counter addresses.
 _FLUSH_ARRIVALS: dict[tuple[torch.device, int, int], torch.Tensor] = {}
 
 
@@ -1987,10 +1990,7 @@ def replayssm_sigmoid_gating_delta_rule(
 # KDA decode / verify, fused from the in_proj output                           #
 # --------------------------------------------------------------------------- #
 #
-# The unfused KDA decode / verify chain is `causal_conv1d_update`, the
-# `f_b_proj` GEMM and the kernel above, each over a few dozen rows. The
-# kernel below does all three from the in_proj output's column views. One
-# program owns one head of one sequence: the head's q/k/v conv channels, its
+# One program owns one head of one sequence: the head's q/k/v conv channels, its
 # checkpoint and its records. The conv state may be updated in place and a
 # flush rewrites the records the replay reads, so every read of either has to
 # land before any write. Only a barrier inside one program can order that:
