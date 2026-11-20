@@ -1292,11 +1292,9 @@ class MooncakeConnector(KVConnectorBase):
         # producers are never cancelled, so a rank still running (or not yet
         # dispatched) may write the request's pages after the scheduler reuses
         # them. A rank that acknowledged but never answers is bounded by its
-        # write window (see _expire_pending_recvs).
-        self._pending_recv_failed: set[ReqId] = set()
-        # Of those, the ones a failed rank had started writing: only their
-        # pages wait out ATOM_PD_FAILED_WRITE_HOLD_S (see _complete_recv).
-        self._pending_recv_failed_after_write: set[ReqId] = set()
+        # write window (see _expire_pending_recvs). Each maps to whether a
+        # failed rank had started writing: only then is it held (_complete_recv).
+        self._pending_recv_failed: dict[ReqId, bool] = {}
         # Per-request nonce for write-done corruption detection.
         self._pending_recv_nonce: dict[ReqId, int] = {}
         # Producer ranks that acknowledged a request, and when each one's write
@@ -2123,6 +2121,7 @@ class MooncakeConnector(KVConnectorBase):
                     if meta.chunked_transfer:
                         self._pending_handoffs[req_id] = {
                             "failed": False,
+                            "failed_after_write": False,
                             "metadata": None,
                         }
             self._pending_recv.add(req_id)
@@ -4389,10 +4388,11 @@ class MooncakeConnector(KVConnectorBase):
                     write_nonce,
                 )
                 return False
-            if not success and started_writes:
-                self._pending_recv_failed_after_write.add(req_id)
             pending_handoff = self._pending_handoffs.get(req_id)
             if pending_handoff is not None:
+                if not success and started_writes:
+                    # Kept even if the per-stage dedup below drops this report.
+                    pending_handoff["failed_after_write"] = True
                 if success:
                     try:
                         PrefillHandoff.from_wire(req_id, handoff)
@@ -4418,7 +4418,11 @@ class MooncakeConnector(KVConnectorBase):
                     return False
                 success = not pending_handoff["failed"]
             if not success:
-                self._pending_recv_failed.add(req_id)
+                if pending_handoff is not None:
+                    started_writes = pending_handoff["failed_after_write"]
+                self._pending_recv_failed[req_id] = (
+                    started_writes or self._pending_recv_failed.get(req_id, False)
+                )
             stages = self._pending_recv_stages.setdefault(req_id, set())
             stages.add((pp_rank, tp_rank))
             if len(stages) < expected:
@@ -4437,12 +4441,10 @@ class MooncakeConnector(KVConnectorBase):
             self._pending_recv_nonce.pop(req_id, None)
             self._pending_recv_acks.pop(req_id, None)
             self._pending_recv_stall_watch.pop(req_id, None)
-            failed = req_id in self._pending_recv_failed
-            self._pending_recv_failed.discard(req_id)
-            failed_after_write = req_id in self._pending_recv_failed_after_write
-            self._pending_recv_failed_after_write.discard(req_id)
+            failed_after_write = self._pending_recv_failed.pop(req_id, None)
+            failed = failed_after_write is not None
 
-        self._complete_recv(req_id, failed, failed_after_write=failed_after_write)
+        self._complete_recv(req_id, failed, failed and failed_after_write)
         return True
 
     def _record_write_ack(self, data: dict) -> None:
@@ -4524,8 +4526,7 @@ class MooncakeConnector(KVConnectorBase):
                 self._pending_recv_expected.pop(req_id, None)
                 self._pending_recv_stages.pop(req_id, None)
                 self._pending_recv_nonce.pop(req_id, None)
-                self._pending_recv_failed.discard(req_id)
-                self._pending_recv_failed_after_write.discard(req_id)
+                self._pending_recv_failed.pop(req_id, None)
                 self._pending_recv_stall_watch.pop(req_id, None)
         for req_id, waited, reported, expected, unacked in stalled:
             (logger.error if unacked > 0 else logger.warning)(
@@ -4557,7 +4558,7 @@ class MooncakeConnector(KVConnectorBase):
                 logger.exception("[CONSUMER] reporting expired req %s failed", req_id)
 
     def _complete_recv(
-        self, req_id: str, failed: bool, *, failed_after_write: bool = True
+        self, req_id: str, failed: bool, failed_after_write: bool = True
     ) -> None:
         """Publish a finished receive and let stage-0 free its page table.
 

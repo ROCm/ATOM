@@ -97,8 +97,7 @@ def producer(pp_rank=0, pp_size=1, num_tokens=10):
     c._pending_recv_acks = {}
     c._pending_recv_stall_watch = {}
     c._held_failures = {}
-    c._pending_recv_failed = set()
-    c._pending_recv_failed_after_write = set()
+    c._pending_recv_failed = {}
     c.done_sending = set()
     c.done_recving = set()
     c.failed_recving = set()
@@ -292,8 +291,7 @@ def consumer(expected=2):
     c._pending_recv_acks = {}
     c._pending_recv_stall_watch = {}
     c._held_failures = {}
-    c._pending_recv_failed = set()
-    c._pending_recv_failed_after_write = set()
+    c._pending_recv_failed = {}
     c._fence_lock = threading.Lock()
     c._pending_recv_expected = {21: expected}
     c._pending_recv_stages = {}
@@ -302,7 +300,9 @@ def consumer(expected=2):
     c._pending_recv_blocks = {21: [2, 9, 4]}
     c._pending_recv_slots = {}
     c._swa_block_regions = []
-    c._pending_handoffs = {21: {"failed": False, "metadata": None}}
+    c._pending_handoffs = {
+        21: {"failed": False, "failed_after_write": False, "metadata": None}
+    }
     c._release_targets = {}
     c._blocks_pending_fence = []
     c.done_recving = set()
@@ -397,7 +397,7 @@ def test_failed_receive_is_held_only_if_a_failed_rank_started_writing(
         ) is (rank == 1)
     assert c.failed_recving == (set() if held else {21})
     assert bool(c._pending_recv_blocks) is held
-    assert not c._pending_recv_failed_after_write and not c.done_recving
+    assert not c._pending_recv_failed and not c.done_recving
     now[0] += 61
     c._report_held_failures()
     assert c.failed_recving == {21} and not c._pending_recv_blocks
@@ -410,6 +410,25 @@ def test_a_success_failed_by_its_handoff_is_not_held(monkeypatch):
     # Its writes finished; only the handoff it sent is unusable.
     assert c._record_write_done(21, 1, 0, 3, handoff={"first_token_id": "bad"})
     assert c.failed_recving == {21} and not c._held_failures
+
+
+@pytest.mark.parametrize("first", ["success", "failure before writing"])
+def test_a_dropped_duplicate_failure_counts_toward_the_hold_only(monkeypatch, first):
+    monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
+    c = consumer(2)
+    handoff = {"first_token_id": 42}
+    if first == "success":
+        assert not c._record_write_done(21, 0, 0, 3, handoff=handoff)
+    else:
+        assert not c._record_write_done(
+            21, 0, 0, 3, success=False, started_writes=False
+        )
+    # Stage 0 already reported: the dedup drops this, but keeps its write claim.
+    assert not c._record_write_done(21, 0, 0, 3, success=False)
+    assert c._record_write_done(21, 1, 0, 3, handoff=handoff)
+    assert c.done_recving == ({21} if first == "success" else set())
+    assert bool(c._held_failures) is (first != "success")
+    assert not c._pending_recv_failed and not c.failed_recving
 
 
 @pytest.mark.parametrize("started_writes", [False, True, None])

@@ -1309,8 +1309,7 @@ def test_landing_requests_settle_through_the_receiver(
     conn._pending_recv_expected = {}
     conn._pending_handoffs = {}
     conn._pending_recv_stages = {}
-    conn._pending_recv_failed = set()
-    conn._pending_recv_failed_after_write = set()
+    conn._pending_recv_failed = {}
     conn._pending_recv_nonce = {}
     conn._pending_recv_acks = {}
     conn._release_targets = {}
