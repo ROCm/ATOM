@@ -260,6 +260,7 @@ def test_fallback_preserves_native_template(runtime, change, max_q):
         kv = kv.float()
     layer._forward_decode(q, kv, md, return_lse=True)
     assert len(runtime["calls"]) == 2
+    assert runtime["calls"][-1][0] == q.shape[1]
     assert runtime["calls"][-1][3] is not getattr(md, prefix + "work_info_set")
     for name, value in zip(WORK, saved):
         torch.testing.assert_close(getattr(md, prefix + name), value)
@@ -307,22 +308,6 @@ def test_unqualified_builder_keeps_existing_geometry(runtime, native, supported)
     assert len(runtime["calls"]) == 4
 
 
-@pytest.mark.parametrize(
-    "sparse_decode,only_update", [(True, False), (True, True), (False, True)]
-)
-def test_draft_full_build_and_incremental_update(runtime, sparse_decode, only_update):
-    builder, _, _ = setup(runtime)
-    result = builder.set_mla_persistent_worker_buffers(
-        12, 1, sparse_decode=sparse_decode, only_update=only_update
-    )
-    plan = result["sparse_dcp_decode_plan"]
-    assert (plan is not None) == (not only_update)
-    assert runtime["calls"][-1][2]["kv_granularity"] == (16 if only_update else 8)
-    if not only_update:
-        assert plan[0] == 12
-        assert torch.equal(runtime["calls"][-1][1], torch.arange(13))
-
-
 def test_next_step_refreshes_rows_without_reusing_old_template(runtime):
     builder, _, _ = setup(runtime, 128, 8)
     next_step = builder._set_mla_persistent_worker_buffers_sparse_mtp(7)
@@ -330,6 +315,9 @@ def test_next_step_refreshes_rows_without_reusing_old_template(runtime):
     assert next_step["sparse_mtp_num_tokens"] == 7
     assert int(next_step["sparse_mtp_work_indptr"][-1]) == 7
     assert len(runtime["calls"]) == 2
+    updated = builder.set_mla_persistent_worker_buffers(7, 1, only_update=True)
+    assert updated["sparse_dcp_decode_plan"] is None
+    assert runtime["calls"][-1][2]["kv_granularity"] == 16
 
 
 @pytest.mark.skipif(
@@ -388,6 +376,13 @@ def test_native_decode_and_graph_against_direct_attention(
         md.sparse_kv_indices.copy_(next_md.sparse_kv_indices)
         graph.replay()
         expected, expected_lse = reference(q[:rows], kv, md, 512, layer.scale)
-        torch.testing.assert_close(out[:rows].float(), expected, atol=0.015, rtol=0.03)
-        torch.testing.assert_close(lse[:rows], expected_lse, atol=0.02, rtol=0.01)
+        # Raw empty-rank partials may be NaN; the DCP merge uses owned counts
+        # to drop them. Check every live row, including those following empties.
+        live = md.dcp_sparse_kv_indptr.diff() > 0
+        torch.testing.assert_close(
+            out[:rows][live].float(), expected[live], atol=0.015, rtol=0.03
+        )
+        torch.testing.assert_close(
+            lse[:rows][live], expected_lse[live], atol=0.02, rtol=0.01
+        )
     assert len(builds) == 1

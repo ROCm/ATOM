@@ -777,7 +777,6 @@ class AttentionMetaData:
         reduce_indptr: torch.Tensor | None = None,
         reduce_final_map: torch.Tensor | None = None,
         reduce_partial_map: torch.Tensor | None = None,
-        sparse_dcp_decode_plan: tuple[int, int, torch.dtype, torch.dtype] | None = None,
         sparse_cu_seqlens_q: torch.Tensor | None = None,
         batch_id_per_q_token: torch.Tensor | None = None,
         batch_id_per_k_token: torch.Tensor | None = None,
@@ -785,6 +784,7 @@ class AttentionMetaData:
         total_kv: int | None = None,
         num_cached_tokens: torch.Tensor | None = None,
         seq_starts: torch.Tensor | None = None,
+        sparse_dcp_decode_plan: tuple[int, int, torch.dtype, torch.dtype] | None = None,
     ):
         self.has_cached = has_cached
         self.total_kv = total_kv
