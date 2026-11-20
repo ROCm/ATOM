@@ -14,8 +14,11 @@ import pytest
 import torch
 
 from atom.config import DCPConfig, _check_fp4_kv, resolve_draft_kv_dtype
+from atom.kv_transfer.disaggregation.sharded_transfer import consumer_head_slices
 from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
 from atom.model_ops.minimax_m3.nvfp4_pages import (
+    HEAD_DATA_BYTES,
+    HEAD_SCALE_BYTES,
     INDEX_PAGE_BYTES,
     Nvfp4KvLayout,
     head_regions,
@@ -235,6 +238,33 @@ def test_transfer_pages_declare_the_four_runs_of_a_page(heads):
     # each run's heads tile the page in order: K data, K scales, V data, V scales
     assert sum(heads * w for w in NV_RUNS[1:]) == kv_page_bytes(heads)
     assert head_regions(1, 0, heads)[0] == heads * (8192 + 1024)
+
+
+def _kv_page(heads):
+    p = pool(layers=1, heads=heads)
+    p.allocate(1, "cpu")
+    return p.transfer_pages("mha", "mha.x", [10])[0]
+
+
+@pytest.mark.parametrize("rank", range(4))
+def test_a_tp4_rank_cuts_its_head_of_each_run_of_a_tp1_page(rank):
+    # each row is that head's K / V data or scales, where head_regions puts them
+    src, dst = _kv_page(4), _kv_page(1)
+    cuts = consumer_head_slices(
+        src.region.unit_bytes,
+        dst.region.unit_bytes,
+        src.head_major_runs,
+        dst.head_major_runs,
+        rank,
+        4,
+        "kv",
+    )
+    sizes = (HEAD_DATA_BYTES, HEAD_SCALE_BYTES)
+    assert cuts.tolist() == [
+        [head_regions(side, rank, 4)[k], head_regions(side, 0, 1)[k], sizes[k]]
+        for side in (0, 1)
+        for k in (0, 1)
+    ]
 
 
 MORIIO = {"kv_connector": "moriio", "kv_role": "kv_both"}
