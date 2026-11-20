@@ -604,7 +604,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             and dcp_persistent
             and self.block_size == 1
         )
-        self._sparse_prefill_work_rows = {}
+        self._sparse_prefill_work_view_cache = {}
         self._dcp_sparse_prefill_mode = self._resolve_dcp_sparse_prefill_mode(
             config.kv_cache_dtype
         )
@@ -2257,21 +2257,23 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         them. aiter sizes its reduce grid and fp32 partials by the buffers it
         is given, so a step must not see the max over both widths."""
         var = self.model_runner.forward_vars
+        first = var[f"{prefix}sparse_prefill_work_meta_data"]
+        cached = self._sparse_prefill_work_view_cache.get((prefix, heads))
+        if cached is not None and cached[0] is first:
+            return cached[1]
         work = {
             name: var[f"{prefix}sparse_prefill_{name}"]
             for name in PERSISTENT_WORK_BUFFERS
         }
-        if len(self._sparse_prefill_work_widths()) == 1:
-            return work
-        key = (prefix, heads)
-        rows = self._sparse_prefill_work_rows.get(key)
-        if rows is None:
+        if len(self._sparse_prefill_work_widths()) > 1:
             tokens = self._ubatch_tokens() if prefix else self.max_num_batched_tokens
-            rows = self._sparse_prefill_work_rows[key] = tuple(
-                size[0] if isinstance(size, (tuple, list)) else size
-                for size, _ in self._sparse_prefill_work_info(tokens, heads)
-            )
-        return {name: work[name][:n] for name, n in zip(PERSISTENT_WORK_BUFFERS, rows)}
+            sizes = self._sparse_prefill_work_info(tokens, heads)
+            for name, (size, _) in zip(PERSISTENT_WORK_BUFFERS, sizes):
+                rows = size[0] if isinstance(size, (tuple, list)) else size
+                if rows < work[name].shape[0]:
+                    work[name] = work[name][:rows]
+        self._sparse_prefill_work_view_cache[(prefix, heads)] = (first, work)
+        return work
 
     def _sparse_prefill_work_plan(
         self,

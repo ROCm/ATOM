@@ -328,9 +328,9 @@ def test_the_work_buffers_fit_a_kv_steps_plan(mode):
             assert _numel(g) >= _numel(w)
 
 
-def _viewer(prefix_tokens):
-    b = _work_sizer("auto", 48, 128)
-    b._sparse_prefill_work_rows = {}
+def _viewer(prefix_tokens, local=48, gathered=128):
+    b = _work_sizer("auto", local, gathered)
+    b._sparse_prefill_work_view_cache = {}
     b.max_num_batched_tokens = prefix_tokens[""]
     b._ubatch_tokens = lambda: prefix_tokens["ub0_"]
     var = {}
@@ -365,23 +365,70 @@ def test_a_step_plans_into_its_own_widths_buffers(prefix, heads):
         assert tuple(work[name].shape) == tuple(np.atleast_1d(size))
 
 
+def _sized_for(buffers, tokens, heads):
+    want = aiter_mla.get_mla_metadata_info_v1(
+        tokens,
+        1,
+        heads,
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fn,
+        is_sparse=True,
+        fast_mode=True,
+    )
+    return all(
+        tuple(buffers(name).shape) == tuple(np.atleast_1d(size))
+        for name, (size, _) in zip(aiter_mla.PERSISTENT_WORK_BUFFERS, want)
+    )
+
+
 @pytest.mark.parametrize("kv", [False, True])
-def test_a_kv_capable_step_passes_its_widths_buffers(kv):
+def test_a_step_publishes_its_widths_buffers(monkeypatch, kv):
+    """The attention reads the work buffers off the metadata, and sizes its
+    fp32 partials and reduce grid by them."""
     b = _viewer({"": 4096, "ub0_": 2048})
     b.dcp_world_size = 2
+    b.dcp_sparse_prefill_nonps = False
+    b.block_size = 1
     b._dcp_sparse_prefill_kv_plan = lambda batch: object() if kv else None
-    seen = {}
-    b._sparse_prefill_work_plan = lambda md, prefix, heads, lens, **k: seen.update(
-        heads=heads, work=k["work"]
+    monkeypatch.setattr(aiter_mla, "get_mla_metadata_v1", lambda *a, **k: None)
+    md = SimpleNamespace(
+        sparse_cu_seqlens_q=None, sparse_kv_indptr=None, sparse_kv_last_page_lens=None
     )
-    md = SimpleNamespace(sparse_kv_last_page_lens=None)
     b._dcp_sparse_prefill_step(None, md, "")
-    heads = 48 if kv else 128
-    assert seen["heads"] == heads
-    want = b._sparse_prefill_work_views("", heads)
-    assert {n: t.shape for n, t in seen["work"].items()} == {
-        n: t.shape for n, t in want.items()
-    }
+    assert _sized_for(
+        lambda name: getattr(md, f"sparse_prefill_{name}"), 4096, 48 if kv else 128
+    )
+
+
+def test_steps_alternating_widths_each_see_their_own():
+    tokens = {"": 4096, "ub0_": 2048}
+    b = _viewer(tokens)
+    for prefix, heads in [("", 48), ("", 128), ("ub0_", 48), ("", 48), ("ub0_", 128)]:
+        work = b._sparse_prefill_work_views(prefix, heads)
+        assert _sized_for(work.__getitem__, tokens[prefix], heads)
+
+
+def test_widths_of_one_size_see_the_whole_buffers():
+    """GLM-5.2's 16 heads a rank take the tiles its 64 gathered do."""
+    b = _viewer({"": 4096, "ub0_": 2048}, local=16, gathered=64)
+    var = b.model_runner.forward_vars
+    for heads in (16, 64):
+        work = b._sparse_prefill_work_views("", heads)
+        for name in aiter_mla.PERSISTENT_WORK_BUFFERS:
+            assert work[name] is var[f"sparse_prefill_{name}"]
+
+
+def test_views_follow_reallocated_buffers():
+    b = _viewer({"": 4096, "ub0_": 2048})
+    var = b.model_runner.forward_vars
+    b._sparse_prefill_work_views("", 48)
+    for name in aiter_mla.PERSISTENT_WORK_BUFFERS:
+        key = f"sparse_prefill_{name}"
+        var[key] = torch.empty_like(var[key])
+    work = b._sparse_prefill_work_views("", 48)
+    for name in aiter_mla.PERSISTENT_WORK_BUFFERS:
+        base = var[f"sparse_prefill_{name}"]
+        assert work[name].data_ptr() == base.data_ptr()
 
 
 def test_a_q_builder_sizes_the_work_buffers_as_before():
@@ -732,8 +779,8 @@ def test_a_dummy_prefill_under_auto_holds_less_than_the_cap(monkeypatch):
 
 
 def test_a_short_dummy_prefill_holds_the_rows_of_a_full_batch(monkeypatch):
-    """A dummy prefill shorter than the batch budget still holds the rows a
-    step at the budget can gather."""
+    """A dummy prefill shorter than the batch budget still holds what a step
+    at the budget adds: its gathered rows and its per-token scratch."""
     cap, budget = 1 << 20, 8192
     a = _dummy_attention(
         monkeypatch, "auto", "fp8", is_prefill=True, cap=cap, batch_tokens=budget
@@ -741,7 +788,9 @@ def test_a_short_dummy_prefill_holds_the_rows_of_a_full_batch(monkeypatch):
     rows = dcp_ops.dcp_sparse_prefill_kv_profile_rows(
         "auto", budget, 16, 256, 16, 4, cap
     )
-    held = dcp_ops.dcp_sparse_prefill_kv_scratch_bytes(5, 16, 16, 512, 64, 1, 4, rows)
+    held = dcp_ops.dcp_sparse_prefill_kv_scratch_bytes(
+        budget, 16, 16, 512, 64, 1, 4, rows
+    )
     assert _profiled_peak(a, 5) >= held
 
 
