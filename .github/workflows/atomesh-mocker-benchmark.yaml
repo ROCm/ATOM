@@ -113,14 +113,15 @@ jobs:
             --profile ci --lib --features atom-engine
 
       # The routing integration tests: ingress, the HTTP and PD routers and
-      # their placement, through mock workers.
+      # their placement, through mock workers. One at a time: they start
+      # servers on fixed ports, and the load tests time their requests.
       - name: Run atomesh routing tests
         run: |
           set -euo pipefail
           cargo test \
             --manifest-path atom/mesh/Cargo.toml \
             --target-dir atom/mesh/mocker/target/mesh \
-            --profile ci --test routing_tests
+            --profile ci --test routing_tests -- --test-threads=1
 
       # The vendored ext-proc protos must match the checksums pinned in
       # manifest.json; offline, so a drifted file or manifest fails here.
