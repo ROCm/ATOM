@@ -674,13 +674,15 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
             try:
                 held = [answer == 1 for answer in client.exists(keys)]
             except Exception as exc:  # noqa: BLE001  # the window is put whole
+                # Kinds apart, so neither lookup's failure hides the other's.
                 self._warn_rate_limited(
-                    "save:exists_failed",
-                    "%s: a save's lookup failed (%r), req=%s; its "
-                    "chunks are put without one",
+                    "save:draft_exists_failed" if draft else "save:exists_failed",
+                    "%s: a save's %s failed (%r), req=%s; its %s are put without one",
                     self.LABEL,
+                    "draft object lookup" if draft else "lookup",
                     exc,
                     req.req_id,
+                    "draft objects" if draft else "chunks",
                 )
                 held = [False] * len(window)
             lookup_ms = (time.perf_counter() - t0) * 1000

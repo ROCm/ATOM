@@ -5080,6 +5080,26 @@ def test_a_save_puts_only_the_draft_objects_the_store_lacks(cluster, make_draft_
     assert worker._save_counts["draft_lookups"] == 1
 
 
+def test_a_failed_draft_lookup_warns_apart_from_the_target_one(
+    cluster, make_draft_worker, caplog
+):
+    worker, _gpu, _codec, _stream = make_draft_worker()
+    worker._client._store.raise_on = "exists"
+    request = _draft_save_req(78)
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        worker._do_save_req(request)
+    worker._client._store.raise_on = None
+    # One warning per kind and interval: each lookup's failure is reported.
+    warned = [
+        r.getMessage() for r in caplog.records if "lookup failed" in r.getMessage()
+    ]
+    assert len(warned) == 2
+    assert "a save's draft object lookup failed" in warned[0]
+    assert "its draft objects are put without one" in warned[0]
+    assert "a save's lookup failed" in warned[1]
+    assert _store(request.save_operation) in worker.get_finished().connector_completions
+
+
 def test_a_failed_draft_put_is_counted_not_fatal(cluster, make_draft_worker):
     worker, _gpu, _codec, _stream = make_draft_worker()
     request = _draft_save_req(63)
