@@ -16,6 +16,7 @@ from aiter import (
     get_mla_metadata_v1,
 )
 
+from atom.config import kv_cache_torch_dtype
 from atom.distributed.dcp_utils import (
     NONPS_MAX_Q_ROWS,
     get_dcp_rank,
@@ -563,7 +564,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self._fp4_launches = Fp4LaunchStorages(
             self.device, self.max_num_batched_tokens, self.max_bs
         )
-        self.dtype_kv = dtypes.d_dtypes[config.kv_cache_dtype]
+        self.dtype_kv = kv_cache_torch_dtype(config.kv_cache_dtype)
         self.dtype_q = self.dtype_kv
 
         self.dcp_world_size = get_dcp_world_size()
@@ -1543,7 +1544,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             layers=self._kv_pool_layers(),
             block_size=runner.block_size,
             entry_dim=mla_kv_entry_dim(hf_config),
-            kv_dtype=dtypes.d_dtypes[runner.config.kv_cache_dtype],
+            kv_dtype=kv_cache_torch_dtype(runner.config.kv_cache_dtype),
             **indexer,
         )
 

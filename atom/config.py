@@ -2010,6 +2010,17 @@ def qrep_for_step(
 FP4_CACHE_DTYPES = ("fp4", "nvfp4")
 
 
+def kv_cache_torch_dtype(kv_cache_dtype: str) -> torch.dtype:
+    """The torch dtype a ``kv_cache_dtype`` cache is stored in: uint8 for the FP4
+    caches (packed bytes, which aiter's ``d_dtypes`` has no entry for), else aiter's
+    entry."""
+    if kv_cache_dtype in FP4_CACHE_DTYPES:
+        return torch.uint8
+    from aiter import dtypes
+
+    return dtypes.d_dtypes[kv_cache_dtype]
+
+
 def _check_fp4_kv(kv_cache_dtype: str, *, is_m3: bool, is_v41: bool) -> None:
     """``--kv-cache-dtype fp4`` (MXFP4) is MiniMax-M3.1's to ask for and DeepSeek-V4.1's
     own, and ``nvfp4`` is MiniMax-M3's alone; each is refused for every other model.
@@ -3388,20 +3399,40 @@ class Config:
                 own_pool=draft_owns_kv_pool(self),
                 requested=spec.kv_cache_dtype,
             )
-            if spec.draft_kv_dtype != self.kv_cache_dtype and self.kv_transfer_config:
-                # Not verified: no KV connector or offload path (save, restore,
-                # P/D transfer) has run with a draft whose dtype differs from the
-                # target's. The flag has no fp4 / nvfp4 to match an FP4 target with.
+            from atom.models.minimax_m3.config import (
+                DRAFT_DTYPE_CONNECTORS,
+                draft_dtype_moves,
+            )
+
+            # A MiniMax-M3 DSpark draft beside an NVFP4 KV moves with its pages:
+            # they follow the target's as bytes of their own, and the PAGE
+            # namespace hashes the draft KV dtype, so a store written with
+            # another draft dtype is never read back.
+            if (
+                spec.draft_kv_dtype != self.kv_cache_dtype
+                and self.kv_transfer_config
+                and not (is_m3 and draft_owns_kv_pool(self) and draft_dtype_moves(self))
+            ):
+                # Not verified: no other KV connector or offload path (save,
+                # restore, P/D transfer) has run with a draft whose dtype differs
+                # from the target's. The flag has no fp4 / nvfp4 to match an FP4
+                # target with.
                 hint = (
                     ""
                     if self.kv_cache_dtype in FP4_CACHE_DTYPES
                     else ". Pass --spec-decode-kv-cache-dtype "
                     f"{self.kv_cache_dtype} to match the target"
                 )
+                exception = (
+                    ", except a MiniMax-M3 DSpark draft beside an NVFP4 KV under "
+                    + ", ".join(sorted(DRAFT_DTYPE_CONNECTORS))
+                    if is_m3
+                    else ""
+                )
                 raise ValueError(
                     f"draft KV dtype {spec.draft_kv_dtype} differs from the "
                     f"target's {self.kv_cache_dtype}: not supported with KV "
-                    f"offload or --kv-transfer-config{hint}"
+                    f"offload or --kv-transfer-config{exception}{hint}"
                 )
         if is_m3:
             from atom.models.minimax_m3.config import validate_runtime_config
