@@ -46,6 +46,8 @@ class _VetoDelayer:
     """Stub cross-DP delayer that always refuses prefill this tick, forcing the
     decode loop to run while a partial prefill is still sitting in `running`."""
 
+    admit_policy = "interval"
+
     is_local = False
     max_queue_ms = None
 
