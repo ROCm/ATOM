@@ -2233,9 +2233,7 @@ class Scheduler:
         """
         # Prefixes other pools copied in since the last pass become hits now,
         # before any walk of this one.
-        poll_fetches = getattr(self.block_manager.kv, "poll_fetches", None)
-        if poll_fetches is not None:
-            poll_fetches()
+        self.block_manager.kv.poll_fetches()
         result = self._schedule()
         if self.pd_admission is not None and result is not None:
             batch, seqs = result
@@ -5458,9 +5456,7 @@ class Scheduler:
         # backend (and through it to other engine ranks) here.
         # Demoted blocks became readable on this batch's device; publish them
         # now that the forward carrying their copies was issued.
-        settle = getattr(self.block_manager.kv, "settle", None)
-        if settle is not None:
-            settle()
+        self.block_manager.kv.settle()
         self.block_manager.kv.flush()
         return finished_seqs
 

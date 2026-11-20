@@ -19,9 +19,12 @@ Two roles are defined:
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from atom.kv_transfer.disaggregation.types import ConnectorMetadata, KVConnectorOutput
+
+if TYPE_CHECKING:
+    from atom.model_engine.kv_block_pool import KVBlockPool, KVPoolMemory
 
 
 class KVConnectorBase(ABC):
@@ -92,7 +95,7 @@ class KVConnectorBase(ABC):
         """
         return []
 
-    def kv_pool_memory(self, config: Any, rank: int) -> Any | None:
+    def kv_pool_memory(self, config: Any, rank: int) -> KVPoolMemory | None:
         """Provide the paged KV pool's memory, or None to leave it to the runner.
 
         A connector that takes the pool over (`atom/kv_transfer/pool`) returns a
@@ -184,7 +187,7 @@ class KVConnectorSchedulerBase(ABC):
         cache_policy: str = "lru",
         protected_ratio: float = 0.5,
         reserve_null_block: bool = False,
-    ) -> Any | None:
+    ) -> KVBlockPool | None:
         """Provide the scheduler's block pool, or None for ATOM's own.
 
         The counterpart of `KVConnectorBase.kv_pool_memory`: a `KVBlockPool`

@@ -2532,3 +2532,15 @@ def test_prefix_spread_index_counters_are_exported_in_router_statistics():
     assert snapshot["prefix_index"]["tail_trim_total"] == 1
     # Without the prefix router the section is absent.
     assert "prefix_index" not in _make_mgr(2).get_dp_router_statistics()
+
+
+def test_a_pool_sharing_margin_lets_sessions_move():
+    """A connector whose ranks share their pools sets the margin; the session
+    policy then watches each rank's requests (`SessionPolicy.rank_reqs`)."""
+    plain = _make_mgr(4, session_affinity=True)
+    assert plain._get_dp_policy().rank_reqs is None
+    shared = _make_mgr(4, session_affinity=True)
+    shared._session_migrate_margin = 0.25
+    policy = shared._get_dp_policy()
+    assert policy.margin == 0.25
+    assert policy.rank_reqs() is shared._rank_reqs
