@@ -310,5 +310,5 @@ def consumer_head_slices(
             f"into {dst_runs} in {dst_bytes} B on consumer rank {rank}/{tp}"
         )
     w = np.asarray(widths, dtype=np.int64)
-    before = np.concatenate(([0], np.cumsum(w)[:-1]))
+    before = np.cumsum(w) - w
     return np.stack([before * heads + first * w, before * count, count * w], axis=1)

@@ -132,53 +132,46 @@ def gather_units(
             out=out.view(-1, plan.unit_bytes),
         )
         return
-    if plan.segments:
-        _gather_segments(source, indices, out, plan)
-        return
     # Imported here, so the whole-unit path runs without Triton.
-    from atom.kv_transfer.disaggregation.gather_kernels import gather_strided_units
+    from atom.kv_transfer.disaggregation import gather_kernels
 
+    if plan.segments:
+        kernel, constants = gather_kernels.gather_segment_units, _segment_bounds(plan)
+    else:
+        kernel = gather_kernels.gather_strided_units
+        constants = {
+            "FIRST": plan.first // 4,
+            "STRIDE": plan.src_stride // 4,
+            "WIDTH": plan.width // 4,
+        }
     words = plan.unit_bytes // 4
-    gather_strided_units[(indices.numel(), -(-words // 256))](
+    kernel[(indices.numel(), -(-words // 256))](
         source.view(torch.int32),
         indices,
         out.view(torch.int32),
         SRC_WORDS=plan.source_bytes // 4,
         DST_WORDS=words,
-        FIRST=plan.first // 4,
-        STRIDE=plan.src_stride // 4,
-        WIDTH=plan.width // 4,
         BLOCK=256,
         num_warps=1,
+        **constants,
     )
 
 
-def _gather_segments(
-    source: torch.Tensor, indices: torch.Tensor, out: torch.Tensor, plan: GatherLayout
-):
-    """``plan.segments`` of each indexed source unit, end to end in ``out``."""
-    from atom.kv_transfer.disaggregation.gather_kernels import gather_segment_units
-
+def _segment_bounds(plan: GatherLayout) -> dict[str, int]:
+    """``gather_segment_units``' word bounds: where each segment starts in the source
+    unit (``O0``-``O3``) and ends in the destination (``E0``-``E2``)."""
     starts = [offset // 4 for offset, _ in plan.segments]
     ends = list(itertools.accumulate(size // 4 for _, size in plan.segments))
     # Pad to four with empty segments, each ending where the last one does.
     pad = MAX_SEGMENTS - len(starts)
     starts += starts[-1:] * pad
     ends += ends[-1:] * pad
-    words = plan.unit_bytes // 4
-    gather_segment_units[(indices.numel(), -(-words // 256))](
-        source.view(torch.int32),
-        indices,
-        out.view(torch.int32),
-        SRC_WORDS=plan.source_bytes // 4,
-        DST_WORDS=words,
-        O0=starts[0],
-        O1=starts[1],
-        O2=starts[2],
-        O3=starts[3],
-        E0=ends[0],
-        E1=ends[1],
-        E2=ends[2],
-        BLOCK=256,
-        num_warps=1,
-    )
+    return {
+        "O0": starts[0],
+        "O1": starts[1],
+        "O2": starts[2],
+        "O3": starts[3],
+        "E0": ends[0],
+        "E1": ends[1],
+        "E2": ends[2],
+    }
