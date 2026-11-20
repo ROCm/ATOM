@@ -68,7 +68,10 @@ from atom.distributed.pcp_utils import (
 from atom.model_ops.attentions.sparse_mla_head_groups import (
     PERSISTENT_WORK_BUFFERS,
 )
-from atom.model_ops.dcp_ops import dcp_all_gather_prefill_query_heads
+from atom.model_ops.dcp_ops import (
+    dcp_all_gather_prefill_query_heads,
+    dcp_gather_sparse_prefill_kv,
+)
 from atom.model_ops.indexer.schedule import skips_index_topk
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import use_triton_gemm
@@ -1536,6 +1539,7 @@ class MLAAttention(nn.Module):
         the dummy run skips the attention itself."""
         from atom.model_ops.dcp_ops import (
             dcp_sparse_prefill_kv_blocker,
+            dcp_sparse_prefill_kv_max_tokens_env,
             dcp_sparse_prefill_kv_profile_rows,
             dcp_sparse_prefill_kv_scratch_bytes,
             dcp_sparse_prefill_mode_env,
@@ -1559,7 +1563,7 @@ class MLAAttention(nn.Module):
             config.max_num_seqs,
             config.kv_cache_block_size,
             self.dcp_world_size,
-            envs.ATOM_DCP_SPARSE_PREFILL_KV_MAX_TOKENS,
+            dcp_sparse_prefill_kv_max_tokens_env(),
         )
         nbytes = dcp_sparse_prefill_kv_scratch_bytes(
             num_tokens,
@@ -1579,8 +1583,6 @@ class MLAAttention(nn.Module):
         from the group and attend this rank's own heads over the whole top-k
         (the indexer wrote it as rows of the gathered KV). No LSE, no merge:
         the output is what the dcp=1 prefill computes for these heads."""
-        from atom.model_ops.dcp_ops import dcp_gather_sparse_prefill_kv
-
         kv = dcp_gather_sparse_prefill_kv(
             self.dcp_group, kv_cache, attn_metadata.dcp_sparse_prefill_kv
         )
@@ -3253,15 +3255,13 @@ class MLAAttention(nn.Module):
             # even when use_qrep is False (group=False slices back to per-rank heads
             # and the AG path runs as before); use_qrep only toggles the optimization.
             # Sparse prefill joins under ATOM_DCP_PREFILL_QREP (see qrep_for_step).
+            # A "kv" prefill attends only this rank's heads.
             use_qrep = qrep_for_step(
                 self.qrep_enabled,
                 self.use_seg_mla,
                 context.is_prefill,
-                envs.ATOM_DCP_PREFILL_QREP,
-            ) and not (
-                # A "kv" prefill attends only this rank's heads.
-                context.is_prefill
-                and attn_metadata.dcp_sparse_prefill_kv is not None
+                envs.ATOM_DCP_PREFILL_QREP
+                and attn_metadata.dcp_sparse_prefill_kv is None,
             )
             q_nope, q_rope = self._q_proj_and_k_up_proj(
                 q, x_scale=q_scale, group=use_qrep

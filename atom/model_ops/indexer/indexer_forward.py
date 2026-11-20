@@ -381,7 +381,7 @@ def sparse_attn_indexer(
                 NUM_TOPK_TOKENS=topk_tokens,
                 out=attn_metadata.sparse_kv_indices,
             )
-    elif get_dcp_world_size() > 1:
+    elif not single_rank_prefill:
         dcp_kv_plan = attn_metadata.dcp_sparse_prefill_kv
         if dcp_kv_plan is not None:
             # "kv" transport: every candidate, as a row of the gathered KV, at the

@@ -16,7 +16,9 @@ They are mathematically equivalent but not bitwise identical; see the A2A
 section below for why one collective can replace two.
 
 Also here: the sparse indexer's DCP support -- the decode candidate exchange
-(fused into one aiter op) and the sparse-prefill owned-slot filter.
+(fused into one aiter op) and the sparse-prefill owned-slot filter, which the
+"q" prefill transport merges like decode -- and the "kv" prefill transport,
+which all-gathers the step's KV rows instead and needs no merge.
 """
 
 import logging
@@ -1872,11 +1874,27 @@ def dcp_sparse_prefill_kv_context_per_new_token(local_heads: int) -> int:
     return 52 if local_heads >= 16 else 40
 
 
+def dcp_sparse_prefill_kv_context_bound(local_heads: int, num_tokens: int) -> int:
+    """The most context "auto" takes "kv" for, in a step of ``num_tokens``
+    new tokens."""
+    return (
+        DCP_SPARSE_PREFILL_KV_CONTEXT_BASE
+        + dcp_sparse_prefill_kv_context_per_new_token(local_heads) * num_tokens
+    )
+
+
 def dcp_sparse_prefill_mode_env() -> str:
     mode = envs.ATOM_DCP_SPARSE_PREFILL
     if mode not in ("auto", "q", "kv"):
         raise ValueError(f"ATOM_DCP_SPARSE_PREFILL={mode!r}: auto, q or kv")
     return mode
+
+
+def dcp_sparse_prefill_kv_max_tokens_env() -> int:
+    cap = envs.ATOM_DCP_SPARSE_PREFILL_KV_MAX_TOKENS
+    if cap < 0:
+        raise ValueError(f"ATOM_DCP_SPARSE_PREFILL_KV_MAX_TOKENS={cap}: must be >= 0")
+    return cap
 
 
 def dcp_sparse_prefill_kv_blocker(kv_cache_dtype: str, mla_page_size: int):
@@ -1915,8 +1933,7 @@ def dcp_sparse_prefill_kv_profile_rows(
     requests = min(num_tokens, max_num_seqs)
     return min(
         kv_max_rows,
-        DCP_SPARSE_PREFILL_KV_CONTEXT_BASE
-        + dcp_sparse_prefill_kv_context_per_new_token(local_heads) * num_tokens
+        dcp_sparse_prefill_kv_context_bound(local_heads, num_tokens)
         + requests * block_size * dcp_world_size,
     )
 
@@ -1957,13 +1974,20 @@ class DcpSparsePrefillKV:
     rows_pad: int
 
 
+def dcp_sparse_prefill_kv_local_rows(
+    context_lens, dcp_world_size: int, block_size: int
+) -> np.ndarray:
+    """Each request's rows on one rank in a "kv" step: its context padded to
+    whole local blocks, the same count on every rank."""
+    context_lens = np.asarray(context_lens, dtype=np.int64)
+    return -(-context_lens // (block_size * dcp_world_size)) * block_size
+
+
 def dcp_sparse_prefill_kv_rows(context_lens, dcp_world_size: int, block_size: int):
-    """Rows one rank contributes to a "kv" step: each request's context padded
-    to whole local blocks, the same count on every rank."""
-    padded = -(
-        -np.asarray(context_lens, dtype=np.int64) // (block_size * dcp_world_size)
+    """Rows one rank contributes to a "kv" step."""
+    return int(
+        dcp_sparse_prefill_kv_local_rows(context_lens, dcp_world_size, block_size).sum()
     )
-    return int(padded.sum()) * block_size
 
 
 def dcp_sparse_prefill_kv_plan(
@@ -1989,12 +2013,13 @@ def dcp_sparse_prefill_kv_plan(
         return None
     if context_lens.sum() > max_context:
         return None
-    padded = -(-context_lens // (block_size * dcp_world_size)) * block_size
+    padded = dcp_sparse_prefill_kv_local_rows(context_lens, dcp_world_size, block_size)
     rows_pad = int(padded.sum())
     if rows_pad == 0 or rows_pad * dcp_world_size > max_tokens:
         return None
-    # Upload each request's local blocks, not its slots (1/block_size the
-    # bytes, under the pageable-copy cliff even at the cap), and expand on GPU.
+    # Upload each request's local blocks, not its slots, and expand on GPU: 4 B
+    # a local block, so a plan at the default cap (2^20 rows) stays under the
+    # pageable-copy cliff (512 KiB) while dcp * block_size >= 8.
     blocks = []
     for i, n in enumerate(padded.tolist()):
         block_ids = np.asarray(block_tables[i], dtype=np.int32)

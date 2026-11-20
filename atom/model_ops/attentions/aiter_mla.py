@@ -2284,21 +2284,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         num_heads: int,
         last_page_lens: torch.Tensor,
         local_heads: bool = False,
-        work: dict | None = None,
     ) -> None:
         """The persistent sparse prefill's work plan over ``attn_metadata``'s
         query rows, into the ``prefix`` set's buffers; none for the
         non-persistent DCP sparse prefill, which reads no plan. ``local_heads``:
-        a DCP "kv" prefill, which runs the dcp=1 kernel. ``work``: views of
-        those buffers to plan into instead."""
+        a DCP "kv" prefill, which runs the dcp=1 kernel."""
         if self.dcp_sparse_prefill_nonps and not local_heads:
             return
-        if work is None:
-            var = self.model_runner.forward_vars
-            work = {
-                name: var[f"{prefix}sparse_prefill_{name}"]
-                for name in PERSISTENT_WORK_BUFFERS
-            }
+        work = self._sparse_prefill_work_views(prefix, num_heads)
         get_mla_metadata_v1(
             attn_metadata.sparse_cu_seqlens_q,
             attn_metadata.sparse_kv_indptr,
@@ -2329,6 +2322,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         transport's conditions are `dcp_sparse_prefill_kv_blocker`'s."""
         from atom.model_ops.dcp_ops import (
             dcp_sparse_prefill_kv_blocker,
+            dcp_sparse_prefill_kv_max_tokens_env,
             dcp_sparse_prefill_mode_env,
         )
 
@@ -2340,6 +2334,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             log = logger.warning if mode == "kv" else logger.info
             log("DCP sparse prefill: %s takes the q transport (%s)", mode, blocker)
             return "q"
+        if mode != "q":
+            dcp_sparse_prefill_kv_max_tokens_env()
         logger.info("DCP sparse prefill transport: %s", mode)
         return mode
 
@@ -2347,8 +2343,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         """This step's DCP sparse prefill transport: the "kv" layout, or None
         for "q". Reads only the batch, so every DCP rank chooses alike."""
         from atom.model_ops.dcp_ops import (
-            DCP_SPARSE_PREFILL_KV_CONTEXT_BASE,
-            dcp_sparse_prefill_kv_context_per_new_token,
+            dcp_sparse_prefill_kv_context_bound,
             dcp_sparse_prefill_kv_plan,
             dcp_sparse_prefill_kv_rows,
         )
@@ -2365,9 +2360,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             (
                 float("inf")
                 if mode == "kv"
-                else DCP_SPARSE_PREFILL_KV_CONTEXT_BASE
-                + dcp_sparse_prefill_kv_context_per_new_token(self.num_attention_heads)
-                * int(np.sum(batch.seqlens_q))
+                else dcp_sparse_prefill_kv_context_bound(
+                    self.num_attention_heads, int(np.sum(batch.seqlens_q))
+                )
             ),
             self.device,
         )
@@ -2406,7 +2401,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             heads,
             attn_metadata.sparse_kv_last_page_lens,
             local_heads=kv_plan is not None,
-            work=self._sparse_prefill_work_views(prefix, heads),
         )
 
     def _finish_prefill_batch(self, batch, attn_metadata, prefix=""):

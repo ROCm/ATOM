@@ -459,7 +459,7 @@ export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_USE_FLYDSL_MOE_SORTING=1
 export ATOM_MONO_ENABLE=0
 
-# DCP sparse prefill: local query heads (QREP); the non-persistent MLA kernel is on by default
+# DCP sparse prefill, q transport only: local query heads (QREP); the non-persistent MLA kernel is on by default
 export ATOM_DCP_PREFILL_QREP=1
 
 # LMCache-related settings

@@ -14,30 +14,60 @@ the index kernel emits must read back the KV of the position the top-k named.
 A wrong owner, local index or shard base reads another token's row.
 """
 
+import inspect
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
 import torch
-from conftest import gpu_stack_import
+from aiter_stub import atom_without_aiter
 
-# Before the imports: gpu_stack_import skips per test, not per module, so on the
-# CPU-only runner it would fail collection here.
-if not torch.cuda.is_available():
-    pytest.skip("Triton kernels need a GPU", allow_module_level=True)
-
-dcp_ops = gpu_stack_import("atom.model_ops.dcp_ops")
-aiter_mla = gpu_stack_import("atom.model_ops.attentions.aiter_mla")
-attention_mla = gpu_stack_import("atom.model_ops.attention_mla")
-
-from atom.distributed.dcp_utils import mla_dcp_sparse_prefill_kv_splits
-from atom.model_ops.attentions.sparse_mla_head_groups import (
-    PERSISTENT_WORK_BUFFERS,
+# The CPU job runs everything but the Triton kernels and the memory profile.
+gpu = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Triton kernels and memory stats need a GPU"
 )
 
-DEV = "cuda"
+dcp_ops = aiter_mla = attention_mla = indexer_forward = None
+mla_dcp_sparse_prefill_kv_splits = PERSISTENT_WORK_BUFFERS = None
+
+DEV = "cuda" if torch.cuda.is_available() else "cpu"
 TOPK = 256
 D = 576
+
+
+def _fake_mla_metadata_info_v1(tokens, max_seqlen_qo, heads, q_dtype, kv_dtype, **kw):
+    """The shape of aiter's sizes on a CPU runner, where aiter is a stub: 48
+    heads take more tiles a token than 16, 64 or 128 (3x, as on gfx950)."""
+    rows = tokens // 8 * (3 if heads == 48 else 1)
+    return [
+        (2, torch.int32),
+        (tokens + 1, torch.int32),
+        ((rows, 8), torch.int32),
+        (rows + 1, torch.int32),
+        ((rows, 2), torch.int32),
+        (rows, torch.int32),
+    ]
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _modules():
+    global dcp_ops, aiter_mla, attention_mla, indexer_forward
+    global mla_dcp_sparse_prefill_kv_splits, PERSISTENT_WORK_BUFFERS
+    with atom_without_aiter() as load:
+        dcp_ops = load("atom.model_ops.dcp_ops")
+        aiter_mla = load("atom.model_ops.attentions.aiter_mla")
+        attention_mla = load("atom.model_ops.attention_mla")
+        indexer_forward = load("atom.model_ops.indexer.indexer_forward")
+        mla_dcp_sparse_prefill_kv_splits = load(
+            "atom.distributed.dcp_utils"
+        ).mla_dcp_sparse_prefill_kv_splits
+        PERSISTENT_WORK_BUFFERS = load(
+            "atom.model_ops.attentions.sparse_mla_head_groups"
+        ).PERSISTENT_WORK_BUFFERS
+        if isinstance(aiter_mla.get_mla_metadata_info_v1, MagicMock):
+            aiter_mla.get_mla_metadata_info_v1 = _fake_mla_metadata_info_v1
+        yield
 
 
 def decode_writer_slot(block_table_row, pos, rank, world, page, interleave):
@@ -136,6 +166,7 @@ def _index(c, plan, world, interleave, topk=None):
     return out
 
 
+@gpu
 @pytest.mark.parametrize(
     "world,page,interleave",
     [(4, 16, 1), (8, 16, 1), (4, 16, 4), (2, 1, 1)],
@@ -161,6 +192,7 @@ def test_every_candidate_reads_the_kv_of_its_position(world, page, interleave):
         assert torch.equal(got[starts[t] : starts[t] + n], want), f"token {t}"
 
 
+@gpu
 def test_a_position_past_the_request_reads_row_zero():
     """A position past the request's padded rows would land in the next
     request's shard; it is written as the dcp=1 kernel writes an invalid one."""
@@ -644,6 +676,198 @@ def test_a_kv_step_runs_the_dcp1_kernel_arguments(monkeypatch):
     }
 
 
+class _Stop(Exception):
+    pass
+
+
+@pytest.mark.parametrize("kv", [True, False])
+def test_a_sparse_prefill_takes_the_transport_its_plan_names(monkeypatch, kv):
+    """A step with a "kv" plan gathers the KV and attends as dcp=1; one
+    without gathers the query heads and keeps the LSE for the merge."""
+    calls = []
+    monkeypatch.setattr(
+        attention_mla,
+        "dcp_all_gather_prefill_query_heads",
+        lambda group, q, heads: calls.append("gather q") or q,
+    )
+    gathered = torch.empty(1)
+    monkeypatch.setattr(
+        attention_mla,
+        "dcp_gather_sparse_prefill_kv",
+        lambda *args: calls.append(("gather kv", args)) or gathered,
+    )
+
+    def forward_prefill_mla(self, q, kv_cache, md, **kw):
+        calls.append((q, kv_cache, kw))
+        raise _Stop
+
+    monkeypatch.setattr(
+        attention_mla.MLAAttention, "_forward_prefill_mla", forward_prefill_mla
+    )
+    a = _kv_attention()
+    a.dcp_group = object()
+    a.dcp_sparse_prefill_num_heads = 64
+    md = SimpleNamespace(dcp_sparse_prefill_kv=object() if kv else None)
+    q, cache = torch.zeros(2, 16, D), torch.empty(1)
+    with pytest.raises(_Stop):
+        attention_mla.MLAAttention._dcp_sparse_prefill(a, q, cache, md)
+    if kv:
+        # The attention reads the gathered rows, which the indexer numbered.
+        assert calls[0] == ("gather kv", (a.dcp_group, cache, md.dcp_sparse_prefill_kv))
+        assert calls[1][0] is q and calls[1][1] is gathered
+        assert calls[1][2] == {"dcp_kv": True}
+    else:
+        assert calls[0] == "gather q"
+        assert calls[1][1] is cache
+        assert calls[1][2].get("return_lse") and "dcp_kv" not in calls[1][2]
+
+
+@pytest.mark.parametrize(
+    "kv,env,group", [(False, "1", True), (True, "1", False), (False, "0", False)]
+)
+def test_a_kv_prefill_projects_only_this_ranks_heads(monkeypatch, kv, env, group):
+    """ATOM_DCP_PREFILL_QREP projects the group's heads for a "q" step only."""
+    monkeypatch.setenv("ATOM_DCP_PREFILL_QREP", env)
+    monkeypatch.setattr(
+        attention_mla,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            attn_metadata=SimpleNamespace(
+                run_sparse=True, dcp_sparse_prefill_kv=object() if kv else None
+            ),
+            context=SimpleNamespace(is_dummy_run=False, is_prefill=True),
+            kv_cache_data={"layer_0": SimpleNamespace(k_cache=None)},
+        ),
+    )
+    seen = {}
+
+    def q_proj_and_k_up_proj(self, x, x_scale=None, group=False):
+        seen["group"] = group
+        raise _Stop
+
+    monkeypatch.setattr(
+        attention_mla.MLAAttention, "_q_proj_and_k_up_proj", q_proj_and_k_up_proj
+    )
+    a = _kv_attention()
+    a.layer_num = 0
+    a.qrep_enabled = True
+    with pytest.raises(_Stop):
+        attention_mla.MLAAttention.forward_impl(a, torch.zeros(2, 8), None, None)
+    assert seen == {"group": group}
+
+
+@pytest.mark.parametrize("kv", [True, False])
+def test_a_kv_prefill_indexes_rows_of_the_gathered_kv(monkeypatch, kv):
+    """A "kv" step's top-k goes to rows of the gathered KV, not through the
+    owned-slot filter."""
+    f = indexer_forward
+    called = []
+    for name in (
+        "triton_dcp_sparse_prefill_kv_index",
+        "triton_filter_and_convert_dcp_index_prefill",
+        "triton_convert_req_index_to_global_index_dsa_prefill",
+    ):
+        monkeypatch.setattr(
+            f, name, lambda *a, _n=name, **kw: called.append((_n, a, kw))
+        )
+    monkeypatch.setattr(f, "get_dcp_world_size", lambda: 4)
+    monkeypatch.setattr(f, "get_dcp_rank", lambda: 0)
+    monkeypatch.setattr(f, "pcp_is_enabled", lambda: False)
+    monkeypatch.setattr(f, "indexer_k_quant_and_cache", lambda *a, **kw: None)
+    monkeypatch.setattr(f, "_index_cache", lambda *a: None)
+    topk = object()
+    monkeypatch.setattr(f, "score_topk", lambda *a, out, **kw: topk)
+    indexer = SimpleNamespace(
+        _indexer_fp4=False, use_nope_cache_fusion=False, _index_cache_layout=None
+    )
+    monkeypatch.setattr(
+        f,
+        "get_current_atom_config",
+        lambda: SimpleNamespace(
+            kv_cache_block_size=16,
+            dcp_config=SimpleNamespace(interleave_size=2),
+            compilation_config=SimpleNamespace(static_forward_context={"idx": indexer}),
+        ),
+    )
+    md = SimpleNamespace(
+        slot_mapping=None,
+        run_sparse=True,
+        index_rows=SimpleNamespace(out_rows=2),
+        dcp_sparse_prefill_kv=object() if kv else None,
+        **{
+            n: object()
+            for n in (
+                "sparse_kv_indptr",
+                "batch_id_per_q_token",
+                "sparse_kv_indices",
+                "block_tables",
+                "dcp_sparse_kv_indptr",
+                "dcp_owned_counts",
+            )
+        },
+    )
+    monkeypatch.setattr(
+        f,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            attn_metadata=md,
+            context=SimpleNamespace(is_dummy_run=False, is_prefill=True),
+        ),
+    )
+    args = dict.fromkeys(inspect.signature(f.sparse_attn_indexer).parameters)
+    args.update(
+        hidden_states=torch.zeros(2, 8),
+        k_cache_prefix="idx.k_cache",
+        kv_cache=torch.zeros(1, 16, 4),
+        topk_tokens=TOPK,
+        use_qk_rope_cache_fusion=False,
+    )
+    f.sparse_attn_indexer(**args)
+    (name, a, kw), *rest = called
+    assert rest == []
+    if kv:
+        assert name == "triton_dcp_sparse_prefill_kv_index"
+        assert a == (
+            md.sparse_kv_indptr,
+            md.batch_id_per_q_token,
+            topk,
+            md.dcp_sparse_prefill_kv,
+            4,
+        )
+        assert kw == {
+            "out": md.sparse_kv_indices,
+            "NUM_TOPK_TOKENS": TOPK,
+            "cp_kv_cache_interleave_size": 2,
+        }
+    else:
+        assert name == "triton_filter_and_convert_dcp_index_prefill"
+        assert kw["out"] is md.sparse_kv_indices
+
+
+@pytest.mark.parametrize(
+    "env,kw,cap,ok",
+    [
+        ("auto", {}, "-1", False),
+        ("kv", {}, "-1", False),
+        ("kv", {}, "0", True),
+        ("auto", {}, "4096", True),
+        # Nothing reads the cap: a "q" builder starts.
+        ("q", {}, "-1", True),
+        ("auto", {"dcp": 1}, "-1", True),
+        ("auto", {"sparse": False}, "-1", True),
+        ("auto", {"page": 64}, "-1", True),
+    ],
+)
+def test_a_negative_kv_cap_is_refused_where_it_is_read(monkeypatch, env, kw, cap, ok):
+    monkeypatch.setenv("ATOM_DCP_SPARSE_PREFILL_KV_MAX_TOKENS", cap)
+    b = _resolver(monkeypatch, env, **kw)
+    if ok:
+        b._resolve_dcp_sparse_prefill_mode("fp8")
+    else:
+        with pytest.raises(ValueError, match=">= 0"):
+            b._resolve_dcp_sparse_prefill_mode("fp8")
+
+
 # ------------------------------------------------------------- memory profile
 def test_the_kv_scratch_grows_with_the_cap_and_the_tokens():
     args = {"local_heads": 16, "padded_heads": 16, "kv_lora_rank": 512, "rope_dim": 64}
@@ -750,6 +974,7 @@ def _profiled_peak(a, num_tokens):
     return torch.cuda.max_memory_allocated() - before
 
 
+@gpu
 @pytest.mark.parametrize(
     "env,dtype,held",
     [
@@ -768,6 +993,7 @@ def test_a_dummy_prefill_profiles_the_kv_scratch(monkeypatch, env, dtype, held):
     assert (_profiled_peak(a, 5) >= kv) == held
 
 
+@gpu
 def test_a_dummy_prefill_under_auto_holds_less_than_the_cap(monkeypatch):
     """A 5-token profile under "auto" can gather ~200K rows, not 2^20."""
     cap = 1 << 20
@@ -778,6 +1004,7 @@ def test_a_dummy_prefill_under_auto_holds_less_than_the_cap(monkeypatch):
     assert held <= _profiled_peak(a, 5) < at_cap
 
 
+@gpu
 def test_a_short_dummy_prefill_holds_the_rows_of_a_full_batch(monkeypatch):
     """A dummy prefill shorter than the batch budget still holds what a step
     at the budget adds: its gathered rows and its per-token scratch."""
@@ -794,6 +1021,7 @@ def test_a_short_dummy_prefill_holds_the_rows_of_a_full_batch(monkeypatch):
     assert _profiled_peak(a, 5) >= held
 
 
+@gpu
 def test_a_dummy_decode_profiles_no_kv_scratch(monkeypatch):
     cap = 1 << 16
     a = _dummy_attention(monkeypatch, "auto", "fp8", is_prefill=False, cap=cap)
