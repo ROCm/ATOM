@@ -151,6 +151,22 @@ def test_swiglu_mxfp8_supported_requested_row_range(rows: int) -> None:
     assert swiglu_oai_mxfp8_supported(_mxfp8_input(rows))
 
 
+def test_swiglu_mxfp8_support_does_not_probe_arch_while_compiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from atom.model_ops import swiglu_oai
+
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+
+    def fail_if_called() -> bool:
+        raise AssertionError(
+            "architecture probing must stay outside the compiled graph"
+        )
+
+    monkeypatch.setattr(swiglu_oai, "swiglu_oai_mxfp8_arch_supported", fail_if_called)
+    assert swiglu_oai.swiglu_oai_mxfp8_supported(_mxfp8_input(1))
+
+
 def test_swiglu_mxfp8_rejects_ineligible_layout_dtype_and_shape() -> None:
     from atom.model_ops.swiglu_oai import swiglu_oai_mxfp8_supported
 
