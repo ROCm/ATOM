@@ -195,13 +195,13 @@ def _swiglu_oai_mxfp8_kernel(
 
 
 @functools.lru_cache(maxsize=1)
-def _swiglu_oai_mxfp8_arch_supported() -> bool:
+def swiglu_oai_mxfp8_arch_supported() -> bool:
     return get_gfx_runtime() == "gfx1250"
 
 
 def swiglu_oai_mxfp8_supported(gate_up: torch.Tensor) -> bool:
     """Return whether ``gate_up`` is eligible for native group32 fusion."""
-    return (
+    layout_supported = (
         gate_up.is_cuda
         and gate_up.dtype == torch.bfloat16
         and gate_up.ndim == 2
@@ -209,7 +209,11 @@ def swiglu_oai_mxfp8_supported(gate_up: torch.Tensor) -> bool:
         and gate_up.shape[0] > 0
         and gate_up.shape[1] > 0
         and gate_up.shape[1] % 64 == 0
-        and _swiglu_oai_mxfp8_arch_supported()
+    )
+    # The model validates the arch once at initialization. Keep native probing
+    # out of a Dynamo full graph; it expands into os.stat/rocminfo calls.
+    return layout_supported and (
+        torch.compiler.is_compiling() or swiglu_oai_mxfp8_arch_supported()
     )
 
 

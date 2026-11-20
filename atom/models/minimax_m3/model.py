@@ -53,6 +53,7 @@ from atom.model_ops.minimax_m3.sparse_attn_nvfp4 import (
 )
 from atom.model_ops.moe import FusedMoE, Mxfp4MoEMethod
 from atom.model_ops.swiglu_oai import (
+    swiglu_oai_mxfp8_arch_supported,
     swiglu_oai_mxfp8_supported,
     swiglu_oai_quant_supported,
     swiglu_oai_split,
@@ -313,7 +314,7 @@ class MiniMaxM3MLP(nn.Module):
         self.swiglu_quant_supported = swiglu_oai_quant_supported(
             intermediate_size // get_tensor_model_parallel_world_size(), dtypes.fp8
         )
-        self.fuse_swiglu_mxfp8 = fuse_swiglu_mxfp8
+        self.fuse_swiglu_mxfp8 = fuse_swiglu_mxfp8 and swiglu_oai_mxfp8_arch_supported()
 
     def forward(
         self, x: torch.Tensor, x_scale: torch.Tensor | None = None
