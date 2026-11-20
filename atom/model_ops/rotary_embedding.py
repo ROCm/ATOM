@@ -24,6 +24,39 @@ def apply_rotary_emb(
     return torch.cat((y1, y2), dim=-1).to(x.dtype)
 
 
+def get_cos_sin_cache(rotary_emb: nn.Module, query: torch.Tensor) -> torch.Tensor:
+    """The [max_position, rotary_dim] cos|sin table of `rotary_emb` in the dtype and
+    on the device of `query`, as the fused q/k norm + RoPE kernels take it. Kept on
+    `rotary_emb` as the `_cos_sin_cache` buffer and rebuilt when the dtype, device
+    or shape changes; not stored while compiling."""
+    cache_name = "_cos_sin_cache"
+    cos_cache = rotary_emb.cos_cache.squeeze(-2).squeeze(-2)
+    cached = getattr(rotary_emb, cache_name, None)
+    expected_shape = (*cos_cache.shape[:-1], cos_cache.shape[-1] * 2)
+    if (
+        cached is not None
+        and cached.dtype == query.dtype
+        and cached.device == query.device
+        and tuple(cached.shape) == expected_shape
+    ):
+        return cached
+
+    sin_cache = rotary_emb.sin_cache.squeeze(-2).squeeze(-2)
+    if cos_cache.dtype != query.dtype or cos_cache.device != query.device:
+        cos_cache = cos_cache.to(device=query.device, dtype=query.dtype)
+        sin_cache = sin_cache.to(device=query.device, dtype=query.dtype)
+    cos_sin_cache = torch.cat([cos_cache, sin_cache], dim=-1).contiguous()
+
+    if torch.compiler.is_compiling():
+        return cos_sin_cache
+
+    if cache_name in rotary_emb._buffers:
+        rotary_emb._buffers[cache_name] = cos_sin_cache
+    else:
+        rotary_emb.register_buffer(cache_name, cos_sin_cache, persistent=False)
+    return cos_sin_cache
+
+
 class RotaryEmbedding(nn.Module):
 
     def __init__(

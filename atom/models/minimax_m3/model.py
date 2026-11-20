@@ -45,6 +45,7 @@ from atom.model_ops.minimax_m3.sparse_attn import (
     SPARSE_BLOCK_SIZE,
 )
 from atom.model_ops.moe import FusedMoE
+from atom.model_ops.rotary_embedding import get_cos_sin_cache
 from atom.model_ops.swiglu_oai import swiglu_oai_split
 from atom.model_ops.utils import atom_parameter
 from atom.models.minimax_m3.mono.dispatch import MonoDecode
@@ -158,38 +159,6 @@ def _linear_consumes_per_token_fp8(linear: nn.Module) -> bool:
         quant_type_value == QuantType.per_Token.value
         and getattr(linear, "params_dtype", None) == dtypes.fp8
     )
-
-
-def _minimax_m3_cos_sin_cache(
-    rotary_emb: nn.Module,
-    query: torch.Tensor,
-) -> torch.Tensor:
-    cache_name = "_minimax_m3_cos_sin_cache"
-    cos_cache = rotary_emb.cos_cache.squeeze(-2).squeeze(-2)
-    cached = getattr(rotary_emb, cache_name, None)
-    expected_shape = (*cos_cache.shape[:-1], cos_cache.shape[-1] * 2)
-    if (
-        cached is not None
-        and cached.dtype == query.dtype
-        and cached.device == query.device
-        and tuple(cached.shape) == expected_shape
-    ):
-        return cached
-
-    sin_cache = rotary_emb.sin_cache.squeeze(-2).squeeze(-2)
-    if cos_cache.dtype != query.dtype or cos_cache.device != query.device:
-        cos_cache = cos_cache.to(device=query.device, dtype=query.dtype)
-        sin_cache = sin_cache.to(device=query.device, dtype=query.dtype)
-    cos_sin_cache = torch.cat([cos_cache, sin_cache], dim=-1).contiguous()
-
-    if torch.compiler.is_compiling():
-        return cos_sin_cache
-
-    if cache_name in rotary_emb._buffers:
-        rotary_emb._buffers[cache_name] = cos_sin_cache
-    else:
-        rotary_emb.register_buffer(cache_name, cos_sin_cache, persistent=False)
-    return cos_sin_cache
 
 
 def make_minimax_m3_expert_params_mapping(
@@ -426,7 +395,7 @@ class MiniMaxM3Attention(nn.Module):
             base=_rope_theta(config),
             rope_scaling=getattr(config, "rope_scaling", None),
         )
-        _minimax_m3_cos_sin_cache(self.rotary_emb, self.q_norm.weight)
+        get_cos_sin_cache(self.rotary_emb, self.q_norm.weight)
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
@@ -557,7 +526,7 @@ class MiniMaxM3SparseAttention(nn.Module):
             base=_rope_theta(config),
             rope_scaling=getattr(config, "rope_scaling", None),
         )
-        _minimax_m3_cos_sin_cache(self.rotary_emb, self.q_norm.weight)
+        get_cos_sin_cache(self.rotary_emb, self.q_norm.weight)
         self.index_q_norm = GemmaRMSNorm(self.idx_head_dim, eps=config.rms_norm_eps)
         self.index_k_norm = GemmaRMSNorm(self.idx_head_dim, eps=config.rms_norm_eps)
         self.index_rotary_emb = self.rotary_emb

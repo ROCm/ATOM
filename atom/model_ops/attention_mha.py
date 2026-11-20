@@ -6,6 +6,7 @@ from functools import cache
 import aiter
 import torch
 from aiter import fused_qk_norm_rope_cache_quant_shuffle
+from aiter.jit.utils.build_targets import is_gfx1250_family
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.mha import _flash_attn_varlen_forward
 from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
@@ -24,6 +25,7 @@ from atom.model_ops.base_attention import (
     run_pa_fwd_asm,
 )
 from atom.model_ops.minimax_m3.geometry import SPARSE_BLOCK_SIZE
+from atom.model_ops.rotary_embedding import get_cos_sin_cache
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
 from atom.utils.forward_context import ForwardContext, get_forward_context
@@ -49,6 +51,9 @@ class PagedAttentionImpl(nn.Module):
     # Whether forward_impl takes ``quantized_output`` / ``output_scale`` and writes
     # its output there as OCP FP8 plus per-token FP32 descales.
     supports_output_quant = False
+    # Whether aiter's q/k norm + RoPE takes this layer's long prefills
+    # (_aiter_gemma_norm_rope): None until its first one, then kept.
+    _aiter_takes_norm_rope = None
 
     @staticmethod
     def qkv_fields(num_heads, num_kv_heads, head_dim, **kwargs):
@@ -318,6 +323,7 @@ class PagedAttentionImpl(nn.Module):
                     k_scale,
                     v_scale,
                     attn_metadata,
+                    qkv,
                 )
             elif isinstance(self.q_norm, GemmaRMSNorm):
                 # Reshape V cache to SHUFFLE layout for the Triton kernel
@@ -462,8 +468,60 @@ class PagedAttentionImpl(nn.Module):
         # sees q/k with matching token counts (sq == sk).
         return q, k, v, k_cache, v_cache, k_scale, v_scale
 
+    def _aiter_gemma_norm_rope(self, qkv, position):
+        """The Gemma q/k norm + NeoX RoPE of a long prefill's ``qkv`` in one aiter
+        fused_qknorm_idxrqknorm launch: q into a new tensor, k in place in
+        ``qkv``. None where it is not taken: off the gfx1250 family (where it was
+        measured), for a non-NeoX rotation, for q/k norms with different eps (the
+        op takes one), and for a call the op does not take (aiter's
+        fused_qknorm_idxrqknorm_supports, e.g. head_dim 256). Decided once per
+        layer, at its first long prefill: its shapes, dtypes and rotary do not
+        change."""
+        if self._aiter_takes_norm_rope is None and not (
+            is_gfx1250_family(get_gfx())
+            and self.rotary_emb.is_neox_style
+            and self.q_norm.variance_epsilon == self.k_norm.variance_epsilon
+        ):
+            self._aiter_takes_norm_rope = False
+        if self._aiter_takes_norm_rope is False:
+            return None
+        q = torch.empty(
+            (qkv.shape[0], self.num_heads * self.head_dim),
+            dtype=qkv.dtype,
+            device=qkv.device,
+        )
+        args = (
+            qkv,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            get_cos_sin_cache(self.rotary_emb, qkv),
+            position,
+            self.num_heads,
+            self.num_kv_heads,
+            self.rotary_emb.rotary_dim,
+            self.q_norm.variance_epsilon,
+        )
+        if self._aiter_takes_norm_rope is None:
+            self._aiter_takes_norm_rope = aiter.fused_qknorm_idxrqknorm_supports(
+                *args, q_out=q
+            )
+            if not self._aiter_takes_norm_rope:
+                return None
+        aiter.fused_qknorm_idxrqknorm(*args, q_out=q)
+        return q
+
     def _gemma_norm_rope_then_cache(
-        self, q, k, v, position, k_cache, v_cache, k_scale, v_scale, attn_metadata
+        self,
+        q,
+        k,
+        v,
+        position,
+        k_cache,
+        v_cache,
+        k_scale,
+        v_scale,
+        attn_metadata,
+        qkv,
     ):
         """Unfused twin of triton_fused_norm_rope_cache for long batches.
 
@@ -474,30 +532,40 @@ class PagedAttentionImpl(nn.Module):
         module's own rotary when that declines), then the cache write: per-token
         FP8 for an FP8 cache, unquantized otherwise. Same SHUFFLE layout and
         scales the fused kernel writes.
-        """
-        from atom.model_ops.layernorm import DualRMSNorm
-        from atom.model_ops.triton_mrope import try_mrope_qk_fused
 
-        if getattr(self, "_dual_qk_norm", None) is None:
-            self._dual_qk_norm = DualRMSNorm(
-                self.q_norm,
-                self.k_norm,
+        Where aiter takes it (``_aiter_gemma_norm_rope``), the norm and RoPE
+        are one aiter launch instead, k in place in ``qkv``.
+        """
+        q_aiter = self._aiter_gemma_norm_rope(qkv, position)
+        if q_aiter is not None:
+            # k is the caller's torch.split view of qkv, roped in place by aiter.
+            # Unlike DualRMSNorm's k it is strided, so the bf16 D128 gfx1250 ASM
+            # varlen prefill copies it contiguous; the op has no k output to avoid it.
+            q = q_aiter
+        else:
+            from atom.model_ops.layernorm import DualRMSNorm
+            from atom.model_ops.triton_mrope import try_mrope_qk_fused
+
+            if getattr(self, "_dual_qk_norm", None) is None:
+                self._dual_qk_norm = DualRMSNorm(
+                    self.q_norm,
+                    self.k_norm,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    prefix=f"layer_{self.layer_num}.qk_norm",
+                )
+            q, k = self._dual_qk_norm(q, k)
+            roped = try_mrope_qk_fused(
+                self.rotary_emb,
+                position,
+                q,
+                k,
                 self.num_heads,
                 self.num_kv_heads,
                 self.head_dim,
-                prefix=f"layer_{self.layer_num}.qk_norm",
             )
-        q, k = self._dual_qk_norm(q, k)
-        roped = try_mrope_qk_fused(
-            self.rotary_emb,
-            position,
-            q,
-            k,
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_dim,
-        )
-        q, k = roped if roped is not None else self.rotary_emb(position, q, k)
+            q, k = roped if roped is not None else self.rotary_emb(position, q, k)
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
@@ -1469,9 +1537,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
 
         qkv = qkv.contiguous()
         num_tokens = qkv.shape[0]
-        from atom.models.minimax_m3.model import _minimax_m3_cos_sin_cache
-
-        cos_sin_cache = _minimax_m3_cos_sin_cache(self.rotary_emb, qkv)
+        cos_sin_cache = get_cos_sin_cache(self.rotary_emb, qkv)
 
         is_fp8 = self.kv_cache_dtype == "fp8"
         kv_cache_dtype = _AITER_WRITER_DTYPE.get(self.kv_cache_dtype, "auto")
