@@ -10,7 +10,9 @@ bytes; each launch's resources and ``runner_gfx1250._resident_hazards``.
 
     python tools/kimi_k3_mono_front_check.py
     env: ROWS (1, the qlen-5 widths 5..40 and the qlen-8 ones 8..64),
-    SITES (late,t3: the variant's sites, "+"-separated variants), ITERS (2)
+    SITES (late,early: the variant's sites, "+"-separated variants), ITERS
+    (2), INF (1: one more input with infinities in some rows, so latent
+    groups take the E8M0 code 254 and row 0's outputs are NaN)
 """
 
 import json
@@ -32,9 +34,10 @@ DEFAULT_ROWS = sorted({1, *range(5, 41, 5), *range(8, 65, 8)})
 ROWS = [int(r) for r in os.environ.get("ROWS", ",".join(map(str, DEFAULT_ROWS))).split(",")]
 VARIANTS = [
     frozenset(s for s in v.split(",") if s)
-    for v in os.environ.get("SITES", "late,t3").split("+")
+    for v in os.environ.get("SITES", "late,early").split("+")
 ]
 ITERS = int(os.environ.get("ITERS", "2"))
+INF = os.environ.get("INF", "1") == "1"
 dev = torch.device("cuda", torch.cuda.current_device())
 gen = torch.Generator(device=dev).manual_seed(11)
 
@@ -101,8 +104,13 @@ for rows in ROWS:
     for sites in VARIANTS:
         variant = kf.build_replicated_front(plan, fp8_shared=True, pipe_sites=sites)
         mismatched = {}
-        for _ in range(ITERS):
+        for it in range(ITERS + INF):
             x = bf16(rows, HIDDEN)
+            if it == ITERS:
+                # one infinite column: every sum infinite, its latent groups
+                # code 254; row 0 a NaN-producing mix (code 0)
+                x[:, 5] = float("inf")
+                x[0, ::97] = float("-inf")
             want, got = outputs(rows), outputs(rows)
             launch(base, x, want)
             launch(variant, x, got)

@@ -710,6 +710,9 @@ _LATE_PLANS = (
     (False, 5, 6),
     (False, 4, 6),
 )
+# The narrowest width an unpaired late plan won whole sustained layers at
+# (40 and 48 rows did; 32 ran slower). The paired one (to 9 rows) won none.
+LATE_MIN_ROWS = 33
 
 
 def front_pipe(
@@ -717,20 +720,24 @@ def front_pipe(
 ):
     """The front's pipeline for ``ATOM_KIMI_MONO_FRONT_PIPE``'s ``sites``
     (None: the env's) at ``rows``. "late": ``{paired, depth, fp8_depth, late,
-    token_steps}`` from ``_LATE_PLANS`` (paired ones only if ``pairable``,
-    unpaired ones only where the default pipeline, ``paired_default``, is
-    unpaired; "up": no paired ones, "ua": unpaired ones at any width), none
-    where no plan fits ``lds_bytes`` beside the group rows. "early":
-    ``early_scales``; "epi": the fused epilogue (``fused``); "hw4": the
-    latent's FP4 by ``_fp4_word`` (``hw_fp4``); "u2" (with a late plan): the
-    step loop unrolled twice (``unroll``). All of them the same bits."""
+    token_steps, early_scales}`` from ``_LATE_PLANS``, unpaired ones from
+    ``LATE_MIN_ROWS`` rows where the default pipeline (``paired_default``) is
+    unpaired ("ua": at any width), paired ones with "lp" if ``pairable``;
+    none where no plan fits ``lds_bytes`` beside the group rows. "early":
+    ``early_scales`` at any width; "epi": the fused epilogue (``fused``);
+    "hw4": the latent's FP4 by ``_fp4_word`` (``hw_fp4``); "u2" (with a late
+    plan): the step loop unrolled twice (``unroll``). The same bits."""
     sites = envs.ATOM_KIMI_MONO_FRONT_PIPE if sites is None else sites
     pipe = {}
     if "late" in sites:
         for paired, depth, fp8_depth in _LATE_PLANS:
-            if paired and (not pairable or "up" in sites):
+            if paired and not (pairable and "lp" in sites):
                 continue
-            if not paired and paired_default and "ua" not in sites:
+            if (
+                not paired
+                and (paired_default or rows < LATE_MIN_ROWS)
+                and "ua" not in sites
+            ):
                 continue
             if _front_words(rows, depth, paired, 3) + rows * 16 <= lds_bytes // 4:
                 pipe = {
@@ -739,6 +746,7 @@ def front_pipe(
                     "fp8_depth": fp8_depth,
                     "late": True,
                     "token_steps": 3,
+                    "early_scales": True,
                 }
                 break
     if "early" in sites:

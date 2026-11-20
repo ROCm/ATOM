@@ -120,21 +120,24 @@ def _paired_by_default(rows):
 
 
 @pytest.mark.parametrize("rows", range(1, 65))
-def test_late_front_plans_only_where_they_won_and_fit(rows):
+@pytest.mark.parametrize("paired_too", (False, True))
+def test_late_front_plans_only_where_they_won_and_fit(rows, paired_too):
     lds = 320 * 1024
-    pipe = front.front_pipe(rows, True, lds, frozenset({"late"}), _paired_by_default(rows))
+    sites = frozenset({"late", "lp"} if paired_too else {"late"})
+    pipe = front.front_pipe(rows, True, lds, sites, _paired_by_default(rows))
     expected = (
-        (True, 6) if rows <= 9
-        else None if rows <= 30
+        (True, 6) if rows <= 9 and paired_too
+        else None if rows < front.LATE_MIN_ROWS
         else (False, 5) if rows <= 40
         else (False, 4) if rows <= 50
         else None
     )  # fmt: skip
+    assert front.LATE_MIN_ROWS > 30  # never where the default pipeline pairs
     if expected is None:
         assert pipe == {}
         return
     assert (pipe["paired"], pipe["depth"]) == expected
-    assert pipe["late"] and pipe["token_steps"] == 3
+    assert pipe["late"] and pipe["token_steps"] == 3 and pipe["early_scales"]
     assert pipe["fp8_depth"] == 6
     words = front._front_words(rows, pipe["depth"], pipe["paired"], 3)
     assert words + rows * 16 <= lds // 4
@@ -143,20 +146,24 @@ def test_late_front_plans_only_where_they_won_and_fit(rows):
 @pytest.mark.parametrize(
     ("rows", "name"),
     (
-        (8, "k3_k2_gfx1250_replicated_front_w_d6_ps_late_es_f6_s8_f8"),
-        (16, "k3_k2_gfx1250_replicated_front_w_d4_ps_es_s16_f8"),
+        (8, "k3_k2_gfx1250_replicated_front_w_d4_ps_s8_f8"),
+        (16, "k3_k2_gfx1250_replicated_front_w_d4_ps_s16_f8"),
+        (32, "k3_k2_gfx1250_replicated_front_w_d4_s32_f8"),
         (40, "k3_k2_gfx1250_replicated_front_w_d5_late_es_f6_s40_f8"),
         (48, "k3_k2_gfx1250_replicated_front_w_d4_late_es_f6_s48_f8"),
-        (64, "k3_k2_gfx1250_replicated_front_w_d4_es_s64_f8"),
+        (64, "k3_k2_gfx1250_replicated_front_w_d4_s64_f8"),
     ),
 )
-def test_front_pipe_switch_names_its_build(monkeypatch, rows, name):
-    default = front.build_replicated_front(_plan(rows), fp8_shared=True).name
-    assert "_late" not in default and "_es" not in default
-    monkeypatch.setenv("ATOM_KIMI_MONO_FRONT_PIPE", "late,early")
+def test_front_pipe_default_is_late_where_it_won(monkeypatch, rows, name):
+    monkeypatch.delenv("ATOM_KIMI_MONO_FRONT_PIPE", raising=False)
     kernel = front.build_replicated_front(_plan(rows), fp8_shared=True)
     assert kernel.name == name
     assert kernel.grid == (front.PAIRS,) and kernel.abi == front.REPLICATED_FRONT_ABI
+    monkeypatch.setenv("ATOM_KIMI_MONO_FRONT_PIPE", "0")
+    previous = front.build_replicated_front(_plan(rows), fp8_shared=True).name
+    assert previous == name.replace("_d5_late_es_f6", "_d4").replace(
+        "_d4_late_es_f6", "_d4"
+    )
 
 
 def test_front_pipe_sites_name_their_epilogues():
@@ -164,7 +171,7 @@ def test_front_pipe_sites_name_their_epilogues():
     assert pipe == {"fused": True, "hw_fp4": True}
     assert front._pipe_suffix(pipe) == "_fe_hw4"
     late = front.front_pipe(40, True, 320 * 1024, frozenset({"late", "u2"}))
-    assert late["unroll"] == 2 and front._pipe_suffix(late) == "_late_u2"
+    assert late["unroll"] == 2 and front._pipe_suffix(late) == "_late_es_u2"
 
 
 def test_herd_candidates_feed_only_the_grouped_moe_finish():

@@ -755,16 +755,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         if site not in ("", "0")
     ),
     # Kimi-K3 gfx1250 mono: the replicated K2 front's pipeline (the same
-    # bits), a comma list: "late" issues a step's copies past its one barrier
-    # with three steps of tokens resident (gemv_tdm.project(late)) at the
-    # widths where a plan deep enough fits LDS and won (to 9 rows paired, 31
-    # to 50 unpaired); "early" stages the shared FP8 scales behind the first
-    # copies; "epi" the fused epilogue (no second barrier); "hw4" the latent's
-    # FP4 by v_cvt_scalef32_pk8_fp4_bf16; "u2" the late step loop unrolled
-    # twice. Empty, the default, keeps the current pipeline.
+    # bits), a comma list. "late", the default: from 33 to 50 rows (where the
+    # default pipeline is unpaired and a plan deep enough fits LDS; whole
+    # sustained layers ran faster at 40 and 48) a step's copies are issued
+    # past its one barrier, three steps of tokens resident
+    # (gemv_tdm.project(late)), the shared FP8 scales staged behind the first
+    # copies; "lp" adds the paired late plan to 9 rows; "early" stages the FP8
+    # scales so at every width; "epi" the fused epilogue (no second barrier);
+    # "hw4" the latent's FP4 by v_cvt_scalef32_pk8_fp4_bf16; "u2" the late
+    # step loop unrolled twice. 0 keeps the previous pipeline at every width.
     "ATOM_KIMI_MONO_FRONT_PIPE": lambda: frozenset(
         site
-        for site in os.getenv("ATOM_KIMI_MONO_FRONT_PIPE", "").split(",")
+        for site in os.getenv("ATOM_KIMI_MONO_FRONT_PIPE", "late").split(",")
         if site not in ("", "0")
     ),
     # Kimi-K3 gfx1250 mono: K1's whole-head recurrence over a step's query
