@@ -16,6 +16,7 @@ from aiter import (
     flash_attn_varlen_func,
     fused_qk_rope_concat_and_cache_mla,
     get_hip_quant,
+    get_mla_metadata_info_v1,
     get_mla_metadata_v1,
 )
 from aiter import indexer_qk_rope_quant_and_cache as _indexer_qk_rope_quant_and_cache
@@ -2862,7 +2863,20 @@ class MLAAttention(nn.Module):
                 patch_work_kv_ranges(buffers[2], buffers[1], kvptr, rows)
             else:
                 # A fallback must not overwrite the next native layer's template.
-                buffers = tuple(torch.empty_like(value) for value in buffers)
+                # Its head fold/occupancy can require larger buffers than that plan.
+                sizes = get_mla_metadata_info_v1(
+                    q.shape[0],
+                    1,
+                    q.shape[1],
+                    q.dtype,
+                    kv_buffer.dtype,
+                    is_sparse=False,
+                    fast_mode=True,
+                )
+                buffers = tuple(
+                    torch.empty(shape, dtype=dtype, device=q.device)
+                    for shape, dtype in sizes
+                )
         if not reuse and (self.owns_sparse_indexer or plan is not None):
             self._rebuild_sparse_dcp_persistent_metadata(
                 attn_metadata,

@@ -64,8 +64,24 @@ def runtime():
     )
     calls = []
 
+    def sizes(rows, max_q, heads, dtype_q, dtype_kv, *, is_sparse, fast_mode):
+        assert max_q == 1 and is_sparse is False and fast_mode is True
+        groups = ns["get_mla_decode_fwd_max_splits"](heads, max_q, dtype_q, dtype_kv)
+        return [
+            (2, torch.int64),
+            (groups + 1, torch.int32),
+            ((rows + groups, 8), torch.int32),
+            (rows + 1, torch.int32),
+            ((rows, 2), torch.int32),
+            (rows + 2 * groups, torch.int32),
+        ]
+
     def planner(qptr, kvptr, last, heads, _, causal, wmd, info, wi, ri, rfm, rpm, **kw):
         rows = qptr.numel() - 1
+        groups = ns["get_mla_decode_fwd_max_splits"](
+            heads, 1, kw["dtype_q"], kw["dtype_kv"]
+        )
+        assert wi.numel() >= groups + 1, "planner work-indptr allocation is too small"
         calls.append((heads, kvptr.clone(), kw, info))
         info.zero_()
         info[:rows, 0] = torch.arange(rows)
@@ -100,6 +116,7 @@ def runtime():
 
     ns.update(
         get_mla_metadata_v1=planner,
+        get_mla_metadata_info_v1=sizes,
         decode_update_mla_metadata_v1=planner,
         patch_work_kv_ranges=patch,
         mla_decode_fwd=launch,
@@ -282,8 +299,8 @@ def test_fallback_preserves_native_template(runtime, change, max_q):
     [(0, 256, 257), (257, 304, 305), (65, 64, 65), (16, 256, 513)],
 )
 def test_unqualified_capacity_keeps_layer_rebuild(runtime, rows, groups, capacity):
-    runtime["get_mla_decode_fwd_max_splits"] = lambda *a: groups
     builder, _, _ = setup(runtime, max(1, rows))
+    runtime["get_mla_decode_fwd_max_splits"] = lambda *a: groups
     assert builder._sparse_dcp_decode_plan(rows, 64, torch.empty(capacity)) is None
 
 
@@ -318,6 +335,30 @@ def test_next_step_refreshes_rows_without_reusing_old_template(runtime):
     updated = builder.set_mla_persistent_worker_buffers(7, 1, only_update=True)
     assert updated["sparse_dcp_decode_plan"] is None
     assert runtime["calls"][-1][2]["kv_granularity"] == 16
+
+
+def test_fallback_sizes_for_consumers_with_more_workgroups(runtime):
+    builder, md, layer = setup(runtime)
+    fp8 = torch.float8_e4m3fn
+    runtime["get_mla_decode_fwd_max_splits"] = lambda heads, _, qdt, kdt: (
+        512 if heads == 64 and qdt == kdt == fp8 else 256
+    )
+    builder.persistent_num_heads = 96
+    builder.dtype_q = builder.dtype_kv = fp8
+    md.__dict__.update(builder.set_mla_persistent_worker_buffers(16, 1))
+    selection(md, 16, 2)
+    original = md.work_info_set.clone()
+    buffers = layer._sparse_dcp_decode_work_buffers(
+        md,
+        torch.empty(16, 64, 8, dtype=fp8),
+        torch.empty(97, 1, 8, dtype=fp8),
+        md.cu_seqlens_q,
+        md.dcp_sparse_kv_indptr,
+        md.sparse_kv_last_page_lens,
+        "",
+    )
+    assert buffers[1].numel() == 513 and md.work_indptr.numel() == 257
+    torch.testing.assert_close(md.work_info_set, original)
 
 
 @pytest.mark.skipif(
