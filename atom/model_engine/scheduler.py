@@ -2915,6 +2915,29 @@ class Scheduler:
                     " ".join(f"{k}={v}" for k, v in sorted(skips.items())),
                 )
 
+        # Admission has finished, so scratch cannot take a request's slot.
+        # Settle anchor cuts before totals, connector metadata and final flags.
+        for i, seq in enumerate(scheduled_seqs.values()):
+            start = seq.num_cached_tokens
+            end = start + int(num_scheduled_tokens[i])
+            planned_end = self.block_manager.plan_midstep(
+                seq,
+                start,
+                end,
+                cut_floor=(
+                    end
+                    if self._requires_atomic_prefill(seq)
+                    else _cut_floor(seq, start, start)
+                ),
+            )
+            num_scheduled_tokens[i] = planned_end - start
+            if (
+                self.advance_on_schedule
+                and seq.midstep_anchor_pos == planned_end
+                and not seq.midstep_reservations
+            ):
+                self.block_manager.checkpoint_when_scheduled(seq, planned_end)
+
         total_tokens_num_prefill = sum(num_scheduled_tokens)
         if self._tick_cost_limit < math.inf:
             self._log_prefill_balance(total_tokens_num_prefill)
@@ -2972,18 +2995,6 @@ class Scheduler:
                         -1 if end >= seq.num_tokens else int(seq.token_ids[end])
                     )
 
-            # Reserve midstep checkpoint destinations for the chunks just
-            # settled. Here rather than inside `_finalize_prefill_chunk`
-            # because a reservation takes a slot off the free list, and
-            # admission for this pass only finishes above — planning any
-            # earlier would let a checkpoint's destination compete with a
-            # request still to be let in. The batch below snapshots what this
-            # leaves on each seq.
-            for i, seq in enumerate(scheduled_seqs.values()):
-                start = num_cached_tokens_list[i]
-                self.block_manager.plan_midstep(
-                    seq, start, start + int(num_scheduled_tokens[i])
-                )
             self._check_draft_writes_allocated(scheduled_seqs.values())
 
             prefill_batch = ScheduledBatch(
@@ -3892,9 +3903,8 @@ class Scheduler:
         if target:
             chunk = target - start
         else:
-            # A readable class is never cut onto a rung; keep the next
-            # chunk's start on the block grid instead, or every snapshot
-            # position in it is off the grid too.
+            # Keep the next chunk on the block grid for interior snapshots.
+            # Post-admission planning handles PAGE anchors without scratch.
             chunk = bm.align_midstep_chunk(seq, start, chunk)
         on_rung = bool(target)
         # `cancel_state_fork` runs only when the first two hold, and returning

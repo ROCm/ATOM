@@ -100,8 +100,8 @@ class StateCache(Protocol):
         error — for a class that is not `readable_midstep`, so the call site
         needs no branch.
 
-        Best-effort and order-preserving: reservations stop at the first one
-        capacity cannot fill, so the earliest position survives a shortage.
+        Best-effort: each implementation chooses which positions survive a
+        shortage. Returned reservations are ordered by position.
         """
         ...
 
