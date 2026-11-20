@@ -227,6 +227,7 @@ loading. The following cases stay in the standard post-load pass:
 - A custom or fused loader cannot provide reliable write coverage.
 - Arrivals are incomplete or coverage tracking becomes invalid.
 - A module needs the loader to finish before its final storage is known.
+- The source is MXFP4: those weights are never streamed.
 
 Fallback preserves compatibility, but those modules do not receive the
 peak-memory benefit of streaming source release. A small, stable, and

@@ -2022,7 +2022,7 @@ def qsa_expand_block_indices(
     return out
 
 
-def _selection_widths(
+def qsa_selection_widths(
     compressed_k_cache: torch.Tensor,
     page_table: torch.Tensor,
     token_topk: int,
@@ -2079,7 +2079,7 @@ def qsa_select_paged_groups(
     may select a row range and assemble the rows elsewhere; the widths depend
     only on the batch-wide `page_table` and `max_seq_len`.
     """
-    columns, block_topk, output_width = _selection_widths(
+    columns, block_topk, output_width = qsa_selection_widths(
         compressed_k_cache, page_table, token_topk, compress_ratio, max_seq_len
     )
     rows = q.shape[0]
@@ -2138,9 +2138,9 @@ def qsa_select_paged_tokens(
     compressed_k_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Score, select and expand in one call: `[tokens, width]` token ids
-    (see `_selection_widths` for the width)."""
+    (see `qsa_selection_widths` for the width)."""
     rows = q.shape[0]
-    _, _, output_width = _selection_widths(
+    _, _, output_width = qsa_selection_widths(
         compressed_k_cache, page_table, token_topk, compress_ratio, max_seq_len
     )
     if out is None:

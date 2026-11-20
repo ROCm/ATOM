@@ -9,14 +9,14 @@ sparse block maps to exactly one page.
 
 The two phases score differently -- prefill over whole query tiles, decode over
 one request's rows at a time -- and then share a selector. A bf16 / fp8 index cache
-is scored by the Triton kernels here; an MXFP4 one (``--index-cache-dtype fp4``) by
-aiter's FlyDSL scorers, which write the same fp32 block scores (see
-:func:`minimax_m3_index_topk_decode` for their layout). The selector after either is
-this module's Triton one, or aiter's per-row one where it is cheaper.
+is scored by the Triton kernels here; an FP4 one (``--index-cache-dtype fp4`` for MXFP4,
+``nvfp4`` for NVFP4) by aiter's FlyDSL scorers, which write the same fp32 block scores
+(see :func:`minimax_m3_index_topk_decode` for their layout). The selector after either
+is this module's Triton one, or aiter's per-row one where it is cheaper.
 
 Index-K cache layout: ``(num_blocks, 128, idx_head_dim)`` for bf16 / fp8, uint8
-``(num_blocks, 8704)`` MXFP4 pages otherwise. The indexer is MQA: index_q carries
-num_idx_heads heads, index_k one, shared by all of them.
+``(num_blocks, 8704)`` MXFP4 pages or ``(num_blocks, 9216)`` NVFP4 pages otherwise. The
+indexer is MQA: index_q carries num_idx_heads heads, index_k one, shared by all of them.
 
 Only the paths MiniMax M3 uses are implemented: score_type="max", index value
 disabled (score-only indexer). The selected block ids feed the block-sparse
@@ -44,15 +44,33 @@ PREFILL_TOPK_NUM_WARPS = _prefill_policy.PREFILL_TOPK_NUM_WARPS
 
 from atom.model_ops.minimax_m3.geometry import SPARSE_BLOCK_SIZE
 from atom.model_ops.minimax_m3.mxfp4_pages import page_views
+from atom.model_ops.minimax_m3.nvfp4_pages import index_page_views as nvfp4_page_views
 
 
 @functools.cache
 def flydsl_ops():
-    """aiter's FlyDSL module (MXFP4 index scorers, work map), imported on first use:
+    """aiter's FlyDSL module (FP4 index scorers, work map), imported on first use:
     every bf16 / fp8 deployment imports this module and must not need FlyDSL."""
     from aiter.ops import flydsl
 
     return flydsl
+
+
+def _fp4_index_ops(index_scorer):
+    """The page views, prefill scorer and decode scorer of the FP4 index cache an
+    `IndexScoreBuffers` record is for: MXFP4, or NVFP4 when ``index_scorer.nvfp4``."""
+    ops = flydsl_ops()
+    if index_scorer.nvfp4:
+        return (
+            nvfp4_page_views,
+            ops.minimax_m3_index_score_prefill_nvfp4_flydsl,
+            ops.minimax_m3_index_score_nvfp4_flydsl,
+        )
+    return (
+        page_views,
+        ops.minimax_m3_index_score_prefill_fp4_flydsl,
+        ops.minimax_m3_index_score_fp4_flydsl,
+    )
 
 
 @functools.cache
@@ -101,6 +119,14 @@ DECODE_SCORE_MIN_BLOCKS = 3
 # (`SPARSE_BLOCK_SIZE // ASM_PAGE_SIZE`); `tests/test_minimax_m3_page_geometry.py`
 # asserts that rather than leaving it to a comment.
 PAGES_PER_SPARSE_BLOCK = 8
+
+# Packed candidate keys occupy bits 0..48: 16 block-id bits, 32 ordered-score
+# bits and one real-candidate bit. Mailbox users put their tag above this.
+SCORE_KEY_BITS = 49
+_SCORE_KEY_REAL_BIT = tl.constexpr(SCORE_KEY_BITS - 1)
+assert (
+    (1 << 48) | (0xFFFFFFFF << 16) | 0xFFFF
+) < 1 << SCORE_KEY_BITS, "packed score keys overlap the mailbox tag"
 
 
 # ---------------------------------------------------------------------------
@@ -647,7 +673,7 @@ def _pack_score_key(score, index, valid):
     # (exponent all ones, mantissa nonzero) rather than `x != x` keeps this in
     # the integer domain and leaves the infinities exactly where they belong.
     ordered = tl.where((bits & 0x7FFFFFFF) > 0x7F800000, 0, ordered)
-    key = (1 << 48) | (ordered.to(tl.int64) << 16) | index.to(tl.int64)
+    key = (1 << _SCORE_KEY_REAL_BIT) | (ordered.to(tl.int64) << 16) | index.to(tl.int64)
     return tl.where(valid, key, 0)
 
 
@@ -759,7 +785,8 @@ def _require_packable(max_block: int) -> None:
     if max_block >= 0xFFFF:
         raise ValueError(
             f"packed top-k addresses at most {0xFFFF - 1} blocks, got "
-            f"{max_block}; widen the tie-break field"
+            f"{max_block}; widening the tie-break field also requires updating "
+            "SCORE_KEY_BITS and the indexer-CP mailbox tag layout"
         )
 
 
@@ -1055,7 +1082,7 @@ def _select_with_aiter(
 
     Declines rather than raises: k past the wave width, or a survivor buffer
     past the LDS budget, are shapes the Triton selector still handles. `topk_idx`
-    and `score` are contiguous (every scorer writes one, the MXFP4 ones into the
+    and `score` are contiguous (every scorer writes one, the FP4 ones into the
     index workspace), so their flattenings are views.
     """
     heads, total_q, max_block = score.shape
@@ -1506,13 +1533,14 @@ def minimax_m3_index_topk(
 ):
     """Index block-score + top-k selection. block_size_q == 1 (per-token).
 
-    With an ``index_scorer`` (an `IndexScoreBuffers`, MXFP4 index cache only)
-    ``index_kv_cache`` is the uint8 ``[num_blocks, 8704]`` page cache and aiter's
-    FlyDSL prefill scorer writes the scores into ``index_scorer.scores`` (shared by
+    With an ``index_scorer`` (an `IndexScoreBuffers`, an FP4 index cache only)
+    ``index_kv_cache`` is the uint8 page cache (``[num_blocks, 8704]`` MXFP4,
+    ``[num_blocks, 9216]`` NVFP4 as ``index_scorer.nvfp4`` says) and aiter's FlyDSL
+    prefill scorer writes the scores into ``index_scorer.scores`` (shared by
     every layer, never filled: the selection reads a row only up to its valid
     blocks). Without one the Triton scorer runs. ``pages_per_block`` /
     ``block_page_stride`` describe the emitted block table: 8 / 8 page-16 SHUFFLE,
-    1 / 1 MXFP4 KV.
+    1 / 1 MXFP4 KV (the NVFP4 KV takes the logical block ids, no emitted table).
 
     Returns topk_idx [num_kv_heads, total_q, topk] of 0-indexed block ids
     (right-padded with -1). M3 has num_idx_heads == num_kv_heads, so the
@@ -1545,8 +1573,9 @@ def minimax_m3_index_topk(
     _require_packable(max_block)
 
     if index_scorer is not None:
-        k_data, k_scale = page_views(index_kv_cache)
-        score = flydsl_ops().minimax_m3_index_score_prefill_fp4_flydsl(
+        views, score_prefill, _ = _fp4_index_ops(index_scorer)
+        k_data, k_scale = views(index_kv_cache)
+        score = score_prefill(
             idx_q,
             k_data,
             k_scale,
@@ -1749,8 +1778,9 @@ def minimax_m3_index_topk_decode(
     """Decode index block-score + top-k, both split-K (cudagraph-safe).
 
     ``index_scorer`` (here with the step's work map) and ``pages_per_block`` as in
-    :func:`minimax_m3_index_topk`. The MXFP4 scorer takes an e4m3 query; the record's
-    ``max_block`` must not move between graph replays (the map's rows are its grid).
+    :func:`minimax_m3_index_topk`. The FP4 scorers take an e4m3 query (the NVFP4 one
+    widens it to bf16); the record's ``max_block`` must not move between graph replays
+    (the map's rows are its grid).
 
     Returns topk_idx [num_kv_heads, total_q, topk] (0-indexed block ids, -1 pad).
     For spec-decode (``max_query_len = num_spec+1``) each of the ``max_query_len``
@@ -1805,9 +1835,10 @@ def minimax_m3_index_topk_decode(
     )
 
     if index_scorer is not None:
+        views, _, score_decode = _fp4_index_ops(index_scorer)
         if index_scorer.work_map is None:
             raise ValueError(
-                "the MXFP4 index decode needs the step's index_scorer "
+                "the FP4 index decode needs the step's index_scorer "
                 "(a work map and the score workspace)"
             )
         score_max_block = index_scorer.max_block
@@ -1821,8 +1852,8 @@ def minimax_m3_index_topk_decode(
         score_out = index_scorer.scores.logits(
             num_idx_heads * total_q, score_max_block
         ).view(num_idx_heads, total_q, score_max_block)
-        k_data, k_scale = page_views(index_kv_cache)
-        score = flydsl_ops().minimax_m3_index_score_fp4_flydsl(
+        k_data, k_scale = views(index_kv_cache)
+        score = score_decode(
             idx_q,
             k_data,
             k_scale,
