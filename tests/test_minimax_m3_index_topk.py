@@ -694,3 +694,79 @@ def test_prefill_launch_policy_preserves_scores_and_selection(
     torch.cuda.synchronize()
     for old_output, new_output in zip(old_outputs, new_outputs):
         assert torch.equal(old_output, new_output)
+
+
+# ---------------------------------------------------------------------------
+# The split decode selector. It replaces the packed selector on few rows, and
+# its claim is the same indices, table and contexts -- so, as for the two
+# selectors above, agreement with the packed one is the property.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "rows,width,tile,max_q,want",
+    [
+        (8, 8192, 512, 8, True),  # one request, verify of 8, 1M launch bound
+        (32, 8192, 512, 8, True),
+        (33, 8192, 512, 8, False),  # past the row gate: the packed chain
+        (8, 2048, 512, 8, False),  # a 262K launch bound: four packed tiles
+        (8, 2049, 512, 8, True),
+        (8, 8192, 512, 0, False),  # prefill
+        (0, 8192, 512, 8, False),
+    ],
+)
+def test_split_decode_selector_gate(rows, width, tile, max_q, want):
+    got = m._split_decode_selector_wins(
+        rows=rows, width=width, tile=tile, decode_max_q=max_q
+    )
+    assert got is want
+
+
+@gpu
+@pytest.mark.parametrize("pages_per_block", [1, 8])
+@pytest.mark.parametrize("ties", [False, True])
+@pytest.mark.parametrize(
+    "batch,max_q,contexts",
+    [
+        (1, 8, [510_000]),  # eight packed tiles
+        (4, 8, [1_000_000, 300_000, 9, 2_000]),  # sixteen tiles .. under top-k blocks
+        (3, 1, [65_536, 65_537, 65_600]),  # on and just past a group edge
+        (2, 4, [70_000, 4]),
+    ],
+)
+def test_split_decode_selector_matches_packed(
+    monkeypatch, batch, max_q, contexts, ties, pages_per_block
+):
+    max_block = 8192  # a graph's launch bound, far past the requests
+    rows = batch * max_q
+    g = torch.Generator(device="cuda").manual_seed(batch * 31 + max_q)
+    score = torch.randn((1, rows, max_block), device="cuda", generator=g)
+    if ties:
+        # Coarse scores: equal keys but for the block id, at every group edge.
+        score = torch.round(score * 2) / 2
+    seq = torch.tensor(contexts, device="cuda", dtype=torch.int32)
+    table = torch.randint(
+        0, 1 << 20, (batch, max_block), device="cuda", dtype=torch.int32, generator=g
+    )
+
+    def select(split):
+        idx = torch.full((1, rows, TOPK), -7, dtype=torch.int32, device="cuda")
+        out, args = m._alloc_emit(rows, 1, TOPK, table, True, "cuda", pages_per_block)
+        out[0].fill_(-7)
+        out[1].fill_(-7)
+        with monkeypatch.context() as patch:
+            if not split:
+                patch.setattr(m, "DECODE_SPLIT_TOPK_MAX_ROWS", 0)
+            m._launch_select(
+                score, idx, seq, seq, batch, TOPK, INIT, LOCAL, table, args, 1,
+                max_q, max_q, m.DECODE_TOPK_BLOCK_SIZE_K, m.DECODE_TOPK_NUM_WARPS, True, pages_per_block,
+                pages_per_block=pages_per_block,
+            )  # fmt: skip
+        return idx, out[0], out[1]
+
+    assert m._split_decode_selector_wins(
+        rows=rows, width=max_block, tile=m.DECODE_TOPK_BLOCK_SIZE_K, decode_max_q=max_q
+    )
+    packed, split = select(False), select(True)
+    for a, b in zip(packed, split):
+        assert torch.equal(a, b)
+    # Not vacuous: something was selected.
+    assert (packed[0] >= 0).any()
