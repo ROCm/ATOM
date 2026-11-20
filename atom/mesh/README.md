@@ -239,9 +239,7 @@ Without the flag no route is added.
 
 Every `/v1/rl` request must carry `Authorization: Bearer <token>` matching
 `--rl-api-key`; any other request answers 401 `unauthorized`. `--enable-rl`
-without `--rl-api-key` fails at startup. Engine control calls carry each
-worker's API key to it, so only a caller holding the token gets Atomesh to act
-with those keys; keep it as secret as the worker keys.
+without `--rl-api-key` fails at startup.
 
 Capabilities come from a per-engine table (`sglang`, `vllm`) and can be
 overridden with `rl.*` worker labels (`rl.pause_modes`, `rl.update_from` as
@@ -250,12 +248,12 @@ comma lists; `rl.abort`, `rl.flush_cache`, `rl.sleep_wake`,
 any case; any other value keeps the table's). `--backend atom` has no table
 row yet: its workers list with empty capabilities. For `--backend atom`,
 discovery also reads `tp_size` and `dp_size` from each worker's
-`/server_info`, so a trainer can lay out ranks. A gRPC worker lists with no
-`control_url`: it cannot be controlled through `/v1/rl`, and a control call
-to it answers 422 `no_control_endpoint`.
+`/server_info`, so a trainer can lay out ranks. A gRPC worker lists with
+`control_url: null`.
 
 | Flag | Default | Description |
 |------|---------|-------------|
+| `--enable-rl` | off | Mount the `/v1/rl` routes |
 | `--rl-api-key` | none | Bearer token the `/v1/rl` routes require; required with `--enable-rl` |
 
 ## Architecture
