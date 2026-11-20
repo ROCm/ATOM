@@ -117,11 +117,14 @@ DP-state barrier drives shutdown.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
 from typing import NamedTuple
 
 import torch
+
+from atom.utils import envs
 
 logger = logging.getLogger(__name__)
 
@@ -261,6 +264,7 @@ class PrefillDelayer:
         "_adapt_thr_last",
         "_arrival_gap_s",
         "_clock",
+        "_cost_ceil",
         "_cost_gate",
         "_cost_slots",
         "_decode_interval_remaining",
@@ -300,8 +304,11 @@ class PrefillDelayer:
         "_stat_hold_decode_interval",
         "_stat_log_every",
         "admit_policy",
+        "busy_decode_interval",
+        "busy_decode_seqs",
         "cpu_group",
         "dp_size",
+        "group_running_decode",
         "kv_high_watermark",
         "max_num_batched_tokens",
         "max_queue_ms",
@@ -331,6 +338,8 @@ class PrefillDelayer:
         cost_gate: bool = False,
         clock=time.perf_counter,
         admit_policy: str = "interval",
+        busy_decode_interval: int = 0,
+        busy_decode_seqs: int = 48,
     ):
         if dp_size > 1 and cpu_group is None:
             raise ValueError("Cross-DP prefill coalescing requires a CPU group")
@@ -389,6 +398,19 @@ class PrefillDelayer:
             )
             prefill_decode_interval = 0
         self.prefill_decode_interval = prefill_decode_interval
+        # Load-adaptive interval (0 = off): the interval armed after a prefill
+        # that leaves at least `busy_decode_seqs` sequences decoding in the
+        # group. Both the trigger (the reduced decode count) and the value are
+        # the same on every rank, so the countdown stays in lockstep.
+        if busy_decode_interval < 0 or busy_decode_seqs < 1:
+            raise ValueError(
+                "busy_decode_interval must be non-negative and busy_decode_seqs "
+                f"positive; got {busy_decode_interval}, {busy_decode_seqs}"
+            )
+        self.busy_decode_interval = (
+            0 if admit_policy == "adaptive" else busy_decode_interval
+        )
+        self.busy_decode_seqs = busy_decode_seqs
 
         # `_FIXED_SLOTS`-slot SUM-reduce buffer (gloo-safe). Encoding:
         #   slot 0 = prefillable        (SUM → n_prefillable)
@@ -420,6 +442,14 @@ class PrefillDelayer:
         # time (n_unreachable): at 8k/1k c128 DPA its releases for stragglers
         # about to complete a decode fragmented prefills (2578 vs 2810 tok/s).
         self._cost_gate = cost_gate and exchange_prefill_costs
+        # ATOM_PREFILL_COST_CEIL=1 (upstream ROCm/ATOM #3196): this rank's cost
+        # rides the reduce rounded up instead of truncated. The step's cost
+        # target is set from the reduced costs, so a truncated cost puts it up
+        # to 0.5 below the costliest rank's own chunk: `Scheduler._prefill_room`
+        # then gives that rank one token less and the chunk grid cuts the rest
+        # of the block off, which waits for the next prefill step. Read once:
+        # every rank must round alike.
+        self._cost_ceil = envs.ATOM_PREFILL_COST_CEIL
         # The DP group is stateless (no default process group): ask it directly.
         self._rank = (
             cpu_group.rank() if self._cost_slots and cpu_group is not None else 0
@@ -459,6 +489,10 @@ class PrefillDelayer:
         self._arrival_gap_s = 0.0
         self._last_arrival_s = None
         self._prev_running_dec = 0
+        # sequences decoding in the whole group at the last decision (the
+        # reduced count: the same on every rank); the scheduler's busy-phase
+        # long-prefill cap reads it
+        self.group_running_decode = 0
         self._fired_cost = 0.0
         self._decode_tick_us = 0.0
         self._prefill_ps_per_cost = 0.0
@@ -507,6 +541,12 @@ class PrefillDelayer:
             f"prefill_decode_interval={prefill_decode_interval} "
             f"cost_gate={self._cost_gate} "
             f"admit_policy={admit_policy!r}"
+            + (
+                f" busy_decode_interval={self.busy_decode_interval} "
+                f"busy_decode_seqs={self.busy_decode_seqs}"
+                if self.busy_decode_interval
+                else ""
+            )
         )
 
     @staticmethod
@@ -642,7 +682,9 @@ class PrefillDelayer:
         self._reduce_np[10] = 1 if unreachable else 0
         if self._cost_slots:
             self._reduce_np[_FIXED_SLOTS : self._gate_at] = 0
-            self._reduce_np[_FIXED_SLOTS + self._rank] = int(prefill_cost)
+            self._reduce_np[_FIXED_SLOTS + self._rank] = (
+                math.ceil(prefill_cost) if self._cost_ceil else int(prefill_cost)
+            )
         # one scheduler step since the previous decision (0: none yet, or untimed)
         step_s = 0.0
         if self._cost_gate:
@@ -723,6 +765,7 @@ class PrefillDelayer:
             n_blocked,
             n_unreachable,
         ) = reduced[:_FIXED_SLOTS]
+        self.group_running_decode = g_running_dec
         if self._cost_gate:
             self._time_step(step_s, prefill_ran_n > 0)
             self._prev_running_dec = g_running_dec
@@ -741,7 +784,12 @@ class PrefillDelayer:
         # allocation, remote-KV handling, or queue changes may still produce a
         # decode/empty batch, which must not start a decode-protection window.
         if prefill_ran_n > 0:
-            self._decode_interval_remaining = self.prefill_decode_interval
+            self._decode_interval_remaining = (
+                self.busy_decode_interval
+                if self.busy_decode_interval > 0
+                and g_running_dec >= self.busy_decode_seqs
+                else self.prefill_decode_interval
+            )
 
         # First call fires unconditionally (one-time warmup seed).
         if self._first:
