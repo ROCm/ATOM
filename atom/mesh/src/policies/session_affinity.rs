@@ -4,6 +4,9 @@
 //! [`LeastSessionsPolicy`], which reads the live session counts the table
 //! passes in. Later requests stay on that worker until the idle TTL expires,
 //! the worker is unusable, or a request of the session fails on it.
+//!
+//! `hard` always returns the bound worker. `soft` does too, unless the inner
+//! policy opts in via [`LoadBalancingPolicy::overrides_session_affinity`].
 
 use std::{
     borrow::Cow,
@@ -17,7 +20,7 @@ use dashmap::{mapref::entry::Entry, DashMap};
 
 use super::{dp_sticky::LeastSessionsPolicy, LoadBalancingPolicy, RouteDecision, SelectWorkerInfo};
 use crate::{
-    config::{SessionAffinityConfig, SessionParentMode},
+    config::{SessionAffinityConfig, SessionAffinityMode, SessionAffinityPool, SessionParentMode},
     core::Worker,
     observability::metrics::{
         metrics_labels::{
@@ -46,6 +49,14 @@ pub(crate) enum SessionAffinityScope {
 }
 
 impl SessionAffinityScope {
+    pub(crate) fn pool(self) -> SessionAffinityPool {
+        match self {
+            Self::Regular => SessionAffinityPool::Regular,
+            Self::Prefill => SessionAffinityPool::Prefill,
+            Self::Decode => SessionAffinityPool::Decode,
+        }
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             Self::Regular => "regular",
@@ -300,6 +311,22 @@ impl std::fmt::Debug for SessionAffinityPolicy {
 }
 
 impl SessionAffinityPolicy {
+    #[cfg(test)]
+    pub(crate) fn around(
+        config: SessionAffinityConfig,
+        inner: Arc<dyn LoadBalancingPolicy>,
+    ) -> Self {
+        Self::around_scoped(config, inner, SessionAffinityScope::Regular)
+    }
+
+    pub(crate) fn around_scoped(
+        config: SessionAffinityConfig,
+        inner: Arc<dyn LoadBalancingPolicy>,
+        scope: SessionAffinityScope,
+    ) -> Self {
+        Self::new(config, inner, scope)
+    }
+
     /// `dp_sticky` with the default settings.
     pub(crate) fn dp_sticky() -> Self {
         Self::dp_sticky_scoped(
@@ -321,6 +348,13 @@ impl SessionAffinityPolicy {
         inner: Arc<dyn LoadBalancingPolicy>,
         scope: SessionAffinityScope,
     ) -> Self {
+        if config.mode == SessionAffinityMode::Soft && !inner.overrides_session_affinity() {
+            tracing::warn!(
+                policy = inner.name(),
+                scope = scope.as_str(),
+                "session-affinity mode is soft, but this policy keeps the bound worker; only cache_aware moves sessions"
+            );
+        }
         Self {
             ttl: Duration::from_secs(config.ttl_secs),
             config,
@@ -411,9 +445,14 @@ impl SessionAffinityPolicy {
         MeshMetrics::set_session_affinity_entries(self.scope.as_str(), self.table.len());
     }
 
+    fn allows_soft_move(&self) -> bool {
+        self.config.mode == SessionAffinityMode::Soft && self.inner.overrides_session_affinity()
+    }
+
     /// The bound worker at `index` serves the request.
     fn hit(&self, key: &str, index: usize, now: Instant) -> (Option<usize>, RouteDecision) {
         self.table.touch(key, now);
+        MeshMetrics::record_session_affinity(AFFINITY_HIT, self.scope.as_str());
         (Some(index), RouteDecision::branch(AFFINITY_HIT))
     }
 
@@ -435,6 +474,7 @@ impl SessionAffinityPolicy {
         if result == AFFINITY_NEW {
             self.enforce_capacity(now, key);
         }
+        MeshMetrics::record_session_affinity(result, self.scope.as_str());
     }
 
     /// Places `key` with the inner policy, away from the workers it failed on
@@ -478,6 +518,30 @@ impl SessionAffinityPolicy {
         };
         (Some(selected), decision)
     }
+
+    /// Soft mode: the inner policy sees the bound worker at `index` as
+    /// `preferred_worker` and may pick another, which rebinds the session.
+    async fn commit_soft_move(
+        &self,
+        key: &str,
+        index: usize,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+        now: Instant,
+    ) -> (Option<usize>, RouteDecision) {
+        let mut delegated = info.clone();
+        delegated.preferred_worker = Some(index);
+        let (chosen, decision) = self.inner.select_with_decision(workers, &delegated).await;
+        let Some(chosen) = chosen else {
+            return (None, decision);
+        };
+        let _assign_guard = self.assign_lock.lock().await;
+        if chosen != index {
+            self.record_placement(key, chosen, workers, now, AFFINITY_REBIND);
+            return (Some(chosen), decision);
+        }
+        self.hit(key, chosen, now)
+    }
 }
 
 /// `workers` without those in `avoid`, if one of the others is healthy.
@@ -512,6 +576,15 @@ fn healthy_index(workers: &[Arc<dyn Worker>], identity: &WorkerIdentity) -> Opti
         .map(|(index, _)| index)
 }
 
+/// Downcast through the session-affinity wrapper so cache-aware tree seeding
+/// still sees the inner policy.
+pub(crate) fn as_cache_aware(policy: &dyn LoadBalancingPolicy) -> Option<&super::CacheAwarePolicy> {
+    if let Some(wrapper) = policy.as_any().downcast_ref::<SessionAffinityPolicy>() {
+        return wrapper.inner.as_any().downcast_ref();
+    }
+    policy.as_any().downcast_ref()
+}
+
 #[async_trait]
 impl LoadBalancingPolicy for SessionAffinityPolicy {
     /// A hit reports `hit`. A placement reports the inner policy's decision, or
@@ -529,6 +602,10 @@ impl LoadBalancingPolicy for SessionAffinityPolicy {
         let now = Instant::now();
         self.maybe_sweep(now, Some(&*key));
         if let Some(index) = self.fresh_index(&key, workers, now) {
+            if self.allows_soft_move() {
+                return self.commit_soft_move(&key, index, workers, info, now).await;
+            }
+            self.inner.on_session_hit(workers, info, index);
             return self.hit(&key, index, now);
         }
 
@@ -605,7 +682,7 @@ mod tests {
     use super::*;
     use crate::policies::dp_sticky::NO_SESSION;
     use crate::{
-        config::SessionParentMode,
+        config::{SessionAffinityMode, SessionParentMode},
         core::{BasicWorkerBuilder, WorkerType},
     };
 
@@ -838,5 +915,232 @@ mod tests {
             rendered.contains(r#"mesh_session_affinity_entries{scope="regular"} 2"#),
             "{rendered}"
         );
+    }
+
+    /// The samples of `mesh_session_affinity_total` in `rendered`, sorted.
+    fn affinity_samples(rendered: &str) -> Vec<&str> {
+        let mut samples: Vec<_> = rendered
+            .lines()
+            .filter(|line| line.starts_with("mesh_session_affinity_total{"))
+            .collect();
+        samples.sort_unstable();
+        samples
+    }
+
+    #[derive(Debug)]
+    struct MoveOffPreferred;
+
+    #[async_trait]
+    impl LoadBalancingPolicy for MoveOffPreferred {
+        async fn select_with_decision(
+            &self,
+            workers: &[Arc<dyn Worker>],
+            info: &SelectWorkerInfo<'_>,
+        ) -> (Option<usize>, RouteDecision) {
+            let selected = match info.preferred_worker {
+                Some(preferred) if workers.len() > 1 => usize::from(preferred == 0),
+                Some(preferred) => preferred,
+                None => 0,
+            };
+            (Some(selected), RouteDecision::branch("move_off_preferred"))
+        }
+
+        fn overrides_session_affinity(&self) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "move_off_preferred"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn hard_mode_keeps_binding_when_inner_would_move() {
+        let policy = SessionAffinityPolicy::around(
+            SessionAffinityConfig::default(),
+            Arc::new(MoveOffPreferred),
+        );
+        let workers = workers();
+        let headers = header_map(&[("x-session-id", "session-1")]);
+        assert_eq!(route(&policy, &workers, &headers).await.0, Some(0));
+        assert_eq!(
+            route(&policy, &workers, &headers).await,
+            (Some(0), AFFINITY_HIT)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wrapped_policy_places_a_retry_away_from_the_worker_it_failed_on() {
+        let policy = SessionAffinityPolicy::around(
+            SessionAffinityConfig::default(),
+            Arc::new(MoveOffPreferred),
+        );
+        let workers = workers();
+        let headers = header_map(&[("x-session-id", "session-1")]);
+        assert_eq!(route(&policy, &workers, &headers).await.0, Some(0));
+        policy.on_dispatch_failed(Some(&headers), &workers[0]);
+        // The inner policy picks its first candidate, which is now worker 1.
+        assert_eq!(route(&policy, &workers, &headers).await.0, Some(1));
+    }
+
+    #[tokio::test]
+    async fn wrapped_policy_keeps_its_branch_on_placement_and_counts_worker_changes() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let policy = SessionAffinityPolicy::around(
+            SessionAffinityConfig::default(),
+            Arc::new(crate::policies::RandomPolicy::new()),
+        );
+        let workers = workers();
+        let headers = header_map(&[("x-session-id", "session-1")]);
+
+        workers[1].set_healthy(false);
+        assert_eq!(
+            route(&policy, &workers, &headers).await,
+            (Some(0), "random")
+        );
+        policy.on_dispatch("regular", Some(&headers), &workers[0]);
+
+        workers[1].set_healthy(true);
+        assert_eq!(
+            route(&policy, &workers, &headers).await,
+            (Some(0), AFFINITY_HIT)
+        );
+        policy.on_dispatch("regular", Some(&headers), &workers[0]);
+
+        workers[0].set_healthy(false);
+        assert_eq!(
+            route(&policy, &workers, &headers).await,
+            (Some(1), "random")
+        );
+        policy.on_dispatch("regular", Some(&headers), &workers[1]);
+
+        assert_eq!(
+            affinity_samples(&handle.render()),
+            [
+                r#"mesh_session_affinity_total{result="hit",scope="regular"} 1"#,
+                r#"mesh_session_affinity_total{result="new",scope="regular"} 1"#,
+                r#"mesh_session_affinity_total{result="rebind",scope="regular"} 1"#,
+            ]
+        );
+        let changes: Vec<_> = handle
+            .render()
+            .lines()
+            .filter(|line| line.starts_with("mesh_session_worker_change_total{"))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            changes,
+            [r#"mesh_session_worker_change_total{pool="regular",reason="rebind"} 1"#]
+        );
+    }
+
+    #[tokio::test]
+    async fn soft_mode_lets_cache_aware_move_an_overloaded_session() {
+        for mode in [SessionAffinityMode::Hard, SessionAffinityMode::Soft] {
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            let _recorder = metrics::set_default_local_recorder(&recorder);
+            let cache_aware = Arc::new(crate::policies::CacheAwarePolicy::with_config(
+                crate::policies::CacheAwareConfig {
+                    cache_threshold: 0.5,
+                    balance_abs_threshold: 2,
+                    balance_rel_threshold: 1.5,
+                    eviction_interval_secs: 0,
+                    max_tree_size: 1000,
+                },
+            ));
+            let workers = workers();
+            cache_aware.init_workers(&workers);
+            let config = SessionAffinityConfig {
+                mode,
+                ..SessionAffinityConfig::default()
+            };
+            let policy = SessionAffinityPolicy::around(config, cache_aware.clone());
+            let headers = header_map(&[("x-session-id", "session-1")]);
+            let turn = |text: &'static str| SelectWorkerInfo {
+                request_text: Some(text),
+                headers: Some(&headers),
+                ..Default::default()
+            };
+
+            // Worker 1 is busier, so the first turn goes to worker 0.
+            workers[1].increment_load();
+            assert_eq!(policy.select_worker(&workers, &turn("a")).await, Some(0));
+
+            // Balanced: both modes keep the session.
+            let (kept, decision) = policy
+                .select_with_decision(&workers, &turn("abcdefghij"))
+                .await;
+            assert_eq!((kept, decision.branch), (Some(0), AFFINITY_HIT), "{mode:?}");
+            // The kept turn reached the tree in both modes: a request without a
+            // session key matches its whole prompt on worker 0.
+            let probe = SelectWorkerInfo {
+                request_text: Some("abcdefghij"),
+                ..Default::default()
+            };
+            let (owner, decision) = cache_aware.select_with_decision(&workers, &probe).await;
+            assert_eq!((owner, decision.branch), (Some(0), "affinity"), "{mode:?}");
+
+            // Worker 0 is over both thresholds against worker 1.
+            for _ in 0..5 {
+                workers[0].increment_load();
+            }
+            let (selected, decision) = policy
+                .select_with_decision(&workers, &turn("abcdefghijk"))
+                .await;
+            let expected = match mode {
+                SessionAffinityMode::Hard => (Some(0), AFFINITY_HIT),
+                SessionAffinityMode::Soft => (Some(1), "imbalanced"),
+            };
+            assert_eq!((selected, decision.branch), expected);
+            let rebind = r#"mesh_session_affinity_total{result="rebind",scope="regular"} 1"#;
+            assert_eq!(
+                handle.render().contains(rebind),
+                mode == SessionAffinityMode::Soft,
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn soft_mode_commits_inner_rebind() {
+        let config = SessionAffinityConfig {
+            mode: SessionAffinityMode::Soft,
+            ..SessionAffinityConfig::default()
+        };
+        let policy = SessionAffinityPolicy::around(config, Arc::new(MoveOffPreferred));
+        let workers = workers();
+        let headers = header_map(&[("x-session-id", "session-1")]);
+        let info = info(&headers);
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(0));
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(1));
+        // The move was committed: worker 1 is now the preferred worker.
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(0));
+    }
+
+    #[tokio::test]
+    async fn wrapped_cache_aware_keeps_its_name_and_downcast() {
+        let policy = crate::policies::PolicyFactory::create_in(
+            &crate::config::PolicyConfig::CacheAware {
+                cache_threshold: 0.5,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+                eviction_interval_secs: 30,
+                max_tree_size: 1000,
+            },
+            &SessionAffinityConfig {
+                pools: vec![SessionAffinityPool::Regular],
+                ..SessionAffinityConfig::default()
+            },
+            SessionAffinityScope::Regular,
+        );
+        assert_eq!(policy.name(), "cache_aware");
+        assert!(as_cache_aware(policy.as_ref()).is_some());
     }
 }

@@ -10,7 +10,8 @@ use tracing::{debug, info, warn};
 /// All subsequent workers of the same model use the established policy.
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
 use super::{
-    session_affinity::SessionAffinityScope, CacheAwarePolicy, LoadBalancingPolicy, PolicyFactory,
+    session_affinity::{as_cache_aware, SessionAffinityScope},
+    LoadBalancingPolicy, PolicyFactory,
 };
 use crate::{
     config::{PolicyConfig, SessionAffinityConfig},
@@ -88,7 +89,7 @@ impl PolicyRegistry {
     }
 
     fn hand_kv_events(&self, policy: &Arc<dyn LoadBalancingPolicy>) {
-        let cache_aware = policy.as_any().downcast_ref::<CacheAwarePolicy>();
+        let cache_aware = as_cache_aware(policy.as_ref());
         if let (Some(provider), Some(cache_aware)) = (self.kv_events.get(), cache_aware) {
             cache_aware.set_kv_events(provider.clone());
         }
@@ -329,7 +330,7 @@ impl PolicyRegistry {
         // Get the policy for this model
         if let Some(policy) = self.get_policy(model_id) {
             if policy.name() == "cache_aware" {
-                if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+                if let Some(cache_aware) = as_cache_aware(policy.as_ref()) {
                     debug!(
                         "Initializing cache-aware policy with {} workers for model {}",
                         workers.len(),
@@ -347,7 +348,7 @@ impl PolicyRegistry {
         // Get the policy for this model
         if let Some(policy) = self.get_policy(model_id) {
             if policy.name() == "cache_aware" {
-                if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+                if let Some(cache_aware) = as_cache_aware(policy.as_ref()) {
                     cache_aware.remove_worker_by_url(worker_url);
                     debug!(
                         "Removed worker {} from cache-aware policy for model {}",
@@ -364,7 +365,7 @@ impl PolicyRegistry {
             .flatten()
         {
             if policy.name() == "cache_aware" {
-                if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+                if let Some(cache_aware) = as_cache_aware(policy.as_ref()) {
                     cache_aware.remove_worker_by_url(worker_url);
                 }
             }
@@ -392,9 +393,7 @@ impl PolicyRegistry {
         // Initialize prefill policy if it's cache-aware (lock-free via OnceLock::get)
         if let Some(prefill_policy) = self.prefill_policy.get() {
             if prefill_policy.name() == "cache_aware" {
-                if let Some(cache_aware) =
-                    prefill_policy.as_any().downcast_ref::<CacheAwarePolicy>()
-                {
+                if let Some(cache_aware) = as_cache_aware(prefill_policy.as_ref()) {
                     if !prefill_workers.is_empty() {
                         // info-level: a silently skipped seed leaves cache_aware
                         // treeless, which is invisible until throughput tanks.
@@ -411,8 +410,7 @@ impl PolicyRegistry {
         // Initialize decode policy if it's cache-aware (lock-free via OnceLock::get)
         if let Some(decode_policy) = self.decode_policy.get() {
             if decode_policy.name() == "cache_aware" {
-                if let Some(cache_aware) = decode_policy.as_any().downcast_ref::<CacheAwarePolicy>()
-                {
+                if let Some(cache_aware) = as_cache_aware(decode_policy.as_ref()) {
                     if !decode_workers.is_empty() {
                         debug!(
                             "Initializing decode cache-aware policy with {} workers",
@@ -633,7 +631,7 @@ mod tests {
         assert_eq!(policy.name(), "round_robin"); // Falls back to default
     }
 
-    use crate::policies::CacheAwareConfig;
+    use crate::policies::{CacheAwareConfig, CacheAwarePolicy};
 
     #[derive(Debug)]
     struct NoHits;
@@ -653,13 +651,19 @@ mod tests {
             };
             Arc::new(CacheAwarePolicy::with_config(config))
         };
-        let registry = PolicyRegistry::new(PolicyConfig::CacheAware {
-            cache_threshold: 0.5,
-            balance_abs_threshold: 32,
-            balance_rel_threshold: 1.1,
-            eviction_interval_secs: 0,
-            max_tree_size: 100,
-        });
+        let registry = PolicyRegistry::with_session_affinity(
+            PolicyConfig::CacheAware {
+                cache_threshold: 0.5,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+                eviction_interval_secs: 0,
+                max_tree_size: 100,
+            },
+            SessionAffinityConfig {
+                pools: vec![crate::config::SessionAffinityPool::Regular],
+                ..SessionAffinityConfig::default()
+            },
+        );
         registry.set_prefill_policy(cache_aware());
         registry.set_kv_events(Arc::new(NoHits));
         registry.set_decode_policy(cache_aware());
