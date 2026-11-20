@@ -102,7 +102,6 @@ from atom.kv_transfer.disaggregation.types import (
 )
 from atom.model_engine.sequence import Sequence, SequenceStatus
 from atom.models.utils import get_pp_indices
-from atom.spec_decode.draft_window_geometry import draft_read_window
 from atom.utils import envs, get_open_port, make_zmq_path, zmq_socket_ctx
 from atom.utils.network import get_ip
 
@@ -542,6 +541,14 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             return len(seq.block_table) * self.hash_block_size
         return self._block_manager.draft_rows_from(seq)
 
+    def _draft_read_from(self, seq: Sequence) -> int | None:
+        """The lowest draft row any decode of this receive reads; None when the
+        draft reads them all, so no block may arrive without draft rows."""
+        window = getattr(self._block_manager, "draft_read_window", None)
+        if window is None:
+            return None
+        return window.first_read_token(seq.num_prompt_tokens)
+
     def _receive_prefix(
         self, seq, num_cached_blocks: int, geometry: tuple[int, int] | None
     ) -> tuple[int, int]:
@@ -766,8 +773,10 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
                 )
             params["num_computed_blocks"] = num_computed_blocks
             params["src_block_skip_factor"] = src_block_skip_factor
-            # A split producer refuses to write over these (`_draft_row_fence`).
+            # A split producer refuses to write over these (`_draft_row_fence`)
+            # or to send draft rows it lacks at or past this (`_draft_boundary_fence`).
             params["local_hit_blocks"] = local_hit_blocks
+            params["draft_read_from"] = self._draft_read_from(seq)
             logger.debug(
                 "[SCHEDULER-CONSUMER] Queued req %s for remote KV recv "
                 "(%d blocks, %d locally cached, dst_slot=%d, src_slot=%d), "
@@ -882,10 +891,10 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             "prefix_cache_hit_tokens": getattr(seq, "prefix_cache_hit_tokens", 0),
         }
         if self.is_producer and self._draft_rows_split:
-            # The consumer echoes it back in its write request (`_draft_row_fence`).
-            seq.kv_transfer_params_output["draft_rows_from"] = self._draft_rows_from(
-                seq
-            )
+            # The consumer echoes it back in its write request; the save's own
+            # copy reaches the workers, which check the echo (`_draft_row_fence`).
+            params["draft_rows_from"] = self._draft_rows_from(seq)
+            seq.kv_transfer_params_output["draft_rows_from"] = params["draft_rows_from"]
         logger.debug(
             "[PD-STATE-SLOT] producer-finished transfer_id=%s final_src_slot=%d",
             seq.id,
@@ -1068,8 +1077,6 @@ class MooncakeConnector(KVConnectorBase):
     _rail_pool: RailEnginePool | None = None
     # Producer: tier loads may leave draft rows unwritten here (V in the handoff).
     _draft_rows_split = False
-    # Consumer: its prefix cache honours V (`BlockManager.draft_read_window`).
-    _draft_row_marks = False
 
     def __init__(self, config: Config) -> None:
         self.tp_rank = get_tp_group().rank_in_group
@@ -1104,7 +1111,6 @@ class MooncakeConnector(KVConnectorBase):
         self._draft_rows_split = (
             self.is_producer and envs.ATOM_MOONCAKE_STORE_DRAFT_WINDOW
         )
-        self._draft_row_marks = draft_read_window(config) is not None
 
         # Networking config
         self.http_port = kv_transfer_config.get("http_port", 8000)
@@ -1951,6 +1957,8 @@ class MooncakeConnector(KVConnectorBase):
                         "block_ids": meta.local_block_ids,
                         "swa_block_ids": meta.local_swa_block_ids,
                         "slot_index": meta.local_slot_index,
+                        # A split producer's V, which a consumer's echo must match.
+                        "draft_rows_from": meta.draft_rows_from,
                     }
                     self._completed_prefills_cv.notify_all()
                 logger.debug(
@@ -2051,9 +2059,9 @@ class MooncakeConnector(KVConnectorBase):
                 "consumer_dcp_size": self.dcp_size,
                 "consumer_dcp_rank": self.dcp_rank,
                 "consumer_dcp_interleave": self.dcp_interleave_size,
-                # It marks blocks below a split producer's V (echoed when not
-                # chunked), never its own cached ones (`_draft_row_fence`).
-                "draft_row_marks": self._draft_row_marks,
+                # For a split producer (`_draft_row_fence`): the decode's lowest
+                # draft row read, V echoed when not chunked, its cached blocks.
+                "consumer_draft_read_from": meta.draft_read_from,
                 "draft_rows_from": meta.draft_rows_from,
                 "consumer_hit_blocks": meta.local_hit_blocks,
             }
@@ -2602,6 +2610,13 @@ class MooncakeConnector(KVConnectorBase):
             )
 
             refusal = self._draft_row_fence(request_data)
+            if refusal is None and self._draft_rows_split:
+                # This producer's own V, which the PP branch below would not
+                # wait for; the consumer's echo must match it.
+                record = self._wait_for_prefill_data(transfer_id) or {}
+                refusal = self._draft_boundary_fence(
+                    request_data, record.get("draft_rows_from")
+                )
             if refusal is not None:
                 logger.error("[PRODUCER] req %s refused: %s", req_id, refusal)
                 self._notify_transfer_result(request_data, success=False)
@@ -2820,10 +2835,10 @@ class MooncakeConnector(KVConnectorBase):
 
     def _draft_row_fence(self, request_data: dict) -> str | None:
         """Why a producer whose blocks may lack draft rows must not write to
-        this consumer, which would read them unmarked; None when it may."""
+        this consumer at all; None when it may (V: `_draft_boundary_fence`)."""
         if not self._draft_rows_split:
             return None
-        if not request_data.get("draft_row_marks"):
+        if type(request_data.get("consumer_draft_read_from")) is not int:
             return (
                 "the consumer cannot mark blocks this producer sends without draft rows"
             )
@@ -2838,10 +2853,26 @@ class MooncakeConnector(KVConnectorBase):
                 f"a transfer from block {offset} writes over {hit_blocks - offset} "
                 "blocks the consumer's prefix cache holds"
             )
+        return None
+
+    def _draft_boundary_fence(self, request_data: dict, boundary: Any) -> str | None:
+        """Why this consumer must not take the blocks below this producer's V
+        (`boundary`): its decode reads their draft rows, or it marks another V."""
+        if not self._draft_rows_split:
+            return None
+        if type(boundary) is not int:
+            return "this producer holds no draft rows boundary for the request"
+        read_from = request_data.get("consumer_draft_read_from")
+        if type(read_from) is not int or boundary > read_from:
+            return (
+                f"the consumer's draft reads from token {read_from}, below this "
+                f"producer's draft rows boundary {boundary}"
+            )
+        echo = request_data.get("draft_rows_from")
         if not request_data.get("chunked_transfer") and (
-            type(request_data.get("draft_rows_from")) is not int
+            type(echo) is not int or echo != boundary
         ):
-            return "the consumer did not get this producer's draft rows boundary"
+            return f"the consumer marks below {echo!r}, not this producer's {boundary}"
         return None
 
     def _acquire_chunked_reader(
@@ -3037,6 +3068,13 @@ class MooncakeConnector(KVConnectorBase):
                 src_block_offset = src_block_end
                 dst_block_offset += num_chunk_dst_blocks
             handoff = state.wait_handoff()
+            # Instead of the handoff, a failure: the consumer neither decodes
+            # nor registers what it received.
+            refusal = self._draft_boundary_fence(
+                request_data, handoff.get("draft_rows_from")
+            )
+            if refusal is not None:
+                raise ValueError(refusal)
             if has_slots:
                 prefill_data = {
                     "slot_index": state.slot_index,

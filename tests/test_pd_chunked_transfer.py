@@ -81,6 +81,7 @@ def producer(pp_rank=0, pp_size=1, num_tokens=10):
     c._landing_spec = None
     c._completed_prefills_lock = threading.Lock()
     c._completed_prefills_cv = threading.Condition(c._completed_prefills_lock)
+    c._completed_prefills = {}
     c._chunked_prefills = {}
     c._admission_results = set()
     c._chunked_admissions = {}
@@ -2392,15 +2393,15 @@ def test_the_boundary_is_applied_before_the_received_prefix_is_registered(
 
 
 def test_split_producer_refuses_a_consumer_without_draft_marks():
-    for marks in (False, True):
+    # A decode that does not say where its draft reads from cannot mark.
+    for read_from in (None, 0):
         c, state, req, _, _ = producer()
         c._draft_rows_split = True
-        if marks:
-            req.update(draft_row_marks=True, consumer_hit_blocks=0)
+        req.update(consumer_draft_read_from=read_from, consumer_hit_blocks=0)
         publish(state, 10)
         state.finish({"first_token_id": 42, "draft_rows_from": 0})
         dispatch(c, req)
-        if marks:
+        if read_from is not None:
             c._notify_transfer_result.assert_called_once_with(req, success=True)
         else:
             assert c.transfer_engine.writes.empty()
@@ -2412,12 +2413,74 @@ def test_split_producer_refuses_a_consumer_without_draft_marks():
     c._execute_transfer(req)
     assert c.transfer_engine.writes.empty()
     c._notify_transfer_result.assert_called_once_with(req, success=False)
-    # A non-chunked consumer echoes V; one that did not get it is refused too.
-    marked = {"draft_row_marks": True, "consumer_hit_blocks": 0}
-    assert "did not get" in c._draft_row_fence(marked)
-    assert c._draft_row_fence({**marked, "draft_rows_from": 0}) is None
     c._draft_rows_split = False
     assert c._draft_row_fence({}) is None
+    assert c._draft_boundary_fence({}, None) is None
+
+
+@pytest.mark.parametrize("read_from", [4, 8])
+def test_split_producer_hands_off_only_to_a_decode_reading_from_v_on(read_from):
+    # V = 8: a decode whose window starts at 4 would read draft rows no one
+    # wrote. Its chunks land in its own fresh blocks; the handoff is a failure.
+    c, state, req, _, _ = producer()
+    c._draft_rows_split = True
+    req.update(consumer_draft_read_from=read_from, consumer_hit_blocks=0)
+    publish(state, 10)
+    state.finish({"first_token_id": 42, "draft_rows_from": 8})
+    dispatch(c, req)
+    assert not c.transfer_engine.writes.empty()
+    c._notify_transfer_result.assert_called_once_with(req, success=read_from >= 8)
+    assert ("prefill_handoff" in req) == (read_from >= 8)
+
+
+def test_a_non_chunked_echo_must_be_the_producers_own_boundary(
+    monkeypatch, seq_factory
+):
+    from conftest import MockConfig
+
+    from atom.model_engine.block_manager import BlockManager
+
+    monkeypatch.setenv("ATOM_MOONCAKE_STORE_DRAFT_WINDOW", "1")
+    sched = scheduler_connector(monkeypatch, True)
+    manager = BlockManager(MockConfig(num_kvcache_blocks=16, kv_cache_block_size=4))
+    sched.bind_block_manager(manager)
+    seq = seq_factory(list(range(24)), kv_transfer_params={"do_remote_decode": True})
+    manager.allocate(seq)
+    manager.mark_draft_rows_missing(seq, 0, 8)
+    sched.update_state_after_alloc(seq)
+    seq.append_token(42)
+    seq.prefill_completed = True
+    sched.request_finished(seq)
+    assert seq.kv_transfer_params_output["draft_rows_from"] == 8
+    # The save hands the workers the V the router relays to the decode.
+    c, _, req, _, _ = producer()
+    c._draft_rows_split = True
+    c.start_load_kv(sched.build_connector_meta())
+    assert c._completed_prefills[seq.id]["draft_rows_from"] == 8
+    req.update(
+        chunked_transfer=False,
+        transfer_id=seq.id,
+        consumer_draft_read_from=12,
+        consumer_hit_blocks=0,
+    )
+    # A decode marking below another V would publish unwritten draft rows.
+    for echo in (None, 0, 4, 12):
+        request = {**req, "draft_rows_from": echo}
+        c._notify_transfer_result.reset_mock()
+        c._execute_transfer(request)
+        assert c.transfer_engine.writes.empty()
+        c._notify_transfer_result.assert_called_once_with(request, success=False)
+    assert c._draft_boundary_fence({**req, "draft_rows_from": 8}, 8) is None
+    below = {**req, "draft_rows_from": 8, "consumer_draft_read_from": 4}
+    assert "reads from token 4" in c._draft_boundary_fence(below, 8)
+    # A producer worker that never got its own V refuses too.
+    monkeypatch.setattr(mc, "PREFILL_LOOKUP_TIMEOUT", 0)
+    del c._completed_prefills[seq.id]
+    request = {**req, "draft_rows_from": 8}
+    c._notify_transfer_result.reset_mock()
+    c._execute_transfer(request)
+    assert c.transfer_engine.writes.empty()
+    c._notify_transfer_result.assert_called_once_with(request, success=False)
 
 
 def test_split_producer_never_writes_over_the_consumers_cached_blocks():
@@ -2425,13 +2488,13 @@ def test_split_producer_never_writes_over_the_consumers_cached_blocks():
     # cover in time: a full transfer over them would hand them missing rows.
     c, state, req, _, _ = producer()
     c._draft_rows_split = True
-    req.update(draft_row_marks=True, consumer_hit_blocks=2, num_computed_blocks=0)
+    req.update(consumer_draft_read_from=0, consumer_hit_blocks=2, num_computed_blocks=0)
     publish(state, 10)
     state.finish({"first_token_id": 42, "draft_rows_from": 0})
     dispatch(c, req)
     assert c.transfer_engine.writes.empty()
     c._notify_transfer_result.assert_called_once_with(req, success=False)
-    marked = {"draft_row_marks": True, "chunked_transfer": True}
+    marked = {"consumer_draft_read_from": 0, "chunked_transfer": True}
     full = {**marked, "consumer_hit_blocks": 2, "num_computed_blocks": 0}
     assert "writes over 2 blocks" in c._draft_row_fence(full)
     # An incremental transfer starts at the hit, and a consumer that does not
@@ -2443,12 +2506,17 @@ def test_split_producer_never_writes_over_the_consumers_cached_blocks():
 
 
 @pytest.mark.parametrize("incremental", [True, False])
-def test_consumer_write_request_says_it_marks_draft_rows(
+def test_consumer_write_request_says_where_its_draft_reads_from(
     monkeypatch, seq_factory, incremental
 ):
     import msgpack
 
+    from atom.spec_decode.draft_window_geometry import DraftReadWindow
+
     sched = scheduler_connector(monkeypatch, False)
+    # A 10-token prompt's block passes read from token 6 on: floor2(10 + 1 - 4).
+    window = DraftReadWindow(window=4, read_page=2)
+    sched.bind_block_manager(SimpleNamespace(draft_read_window=window))
     seq = seq_factory(
         list(range(10)),
         kv_transfer_params={
@@ -2481,13 +2549,12 @@ def test_consumer_write_request_says_it_marks_draft_rows(
     c._block_region_roles = [None]
     c._unit_layout = None
     c.kv_caches_base_addr = [100]
-    c._draft_row_marks = True
     c._send_on_socket = MagicMock()
     c.start_load_kv(sched.build_connector_meta())
     post_write_requests(c, monkeypatch)
     [call] = c._send_on_socket.call_args_list
     request = msgpack.loads(call.args[1][1])
-    assert request["draft_row_marks"] is True
+    assert request["consumer_draft_read_from"] == 6
     assert request["draft_rows_from"] == 4
     assert request["consumer_hit_blocks"] == 1
     assert request["num_computed_blocks"] == (1 if incremental else 0)
@@ -2495,3 +2562,8 @@ def test_consumer_write_request_says_it_marks_draft_rows(
     producer_side._draft_rows_split = True
     refusal = producer_side._draft_row_fence(request)
     assert (refusal is None) == incremental
+    assert producer_side._draft_boundary_fence(request, 4) is None
+    assert "reads from token 6" in producer_side._draft_boundary_fence(request, 8)
+    # A decode whose draft reads every row cannot take a split producer's KV.
+    sched.bind_block_manager(SimpleNamespace(draft_read_window=None))
+    assert sched._draft_read_from(seq) is None
