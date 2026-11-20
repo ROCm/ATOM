@@ -58,6 +58,36 @@ def production(monkeypatch):
         ),
         "mla_dcp_sparse_prefill_kv_splits": lambda *_: 2,
     }
+    attention = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "MLAAttention"
+    )
+    constructor = next(
+        node
+        for node in attention.body
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+    )
+    dtype_assignments = [
+        node
+        for node in constructor.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Attribute)
+            and target.attr in ("kv_cache_dtype", "dtype")
+            for target in node.targets
+        )
+    ]
+
+    def initialize_dtypes(layer, cache_dtype, activation_dtype):
+        exec(  # noqa: S102 - actual constructor normalization, before configuring DCP
+            compile(
+                ast.Module(body=dtype_assignments, type_ignores=[]), str(path), "exec"
+            ),
+            {"self": layer, "kv_cache_dtype": cache_dtype, "dtype": activation_dtype},
+        )
+
+    namespace["initialize_dtypes"] = initialize_dtypes
     exec(  # noqa: S102 - checked-in production bodies; GPU boundaries below are stubs
         compile(
             ast.Module(body=constants + functions, type_ignores=[]), str(path), "exec"
@@ -257,17 +287,29 @@ def test_unqualified_width_keeps_conservative_padding(
         (True, True, True),
     ],
 )
+@pytest.mark.parametrize(
+    "cache_dtype,activation_dtype,query_dtype",
+    [
+        ("bf16", torch.bfloat16, torch.bfloat16),
+        ("bf16", torch.float16, torch.bfloat16),
+        ("fp8", torch.bfloat16, torch.float8_e4m3fn),
+    ],
+)
 def test_plan_support_is_bound_to_the_final_width_and_reset(
-    production, native, supported, nonps
+    production, native, supported, nonps, cache_dtype, activation_dtype, query_dtype
 ):
     queries = []
 
     def support(width, max_q, q_dtype, kv_dtype, **kwargs):
+        assert q_dtype is query_dtype and kv_dtype is query_dtype
         queries.append((width, max_q, q_dtype, kv_dtype))
         return SimpleNamespace(native=native, supported=supported)
 
     production.update(
-        dtypes=SimpleNamespace(d_dtypes={"bf16": torch.bfloat16}),
+        dtypes=SimpleNamespace(
+            fp8=torch.float8_e4m3fn,
+            d_dtypes={"bf16": torch.bfloat16, "fp8": torch.float8_e4m3fn},
+        ),
         get_mla_decode_shape_support=support,
         mla_dcp_persistent_width=lambda *a, **k: 64,
         mla_dcp_kernel_num_heads=lambda *a, **k: 64,
@@ -280,10 +322,12 @@ def test_plan_support_is_bound_to_the_final_width_and_reset(
     layer = SimpleNamespace(
         num_heads=8,
         min_query_heads=16,
-        kv_cache_dtype="bf16",
         is_sparse_mla=True,
         sparse_dcp_metadata_rebuild=True,
     )
+    production["initialize_dtypes"](layer, cache_dtype, activation_dtype)
+    assert layer.kv_cache_dtype == ("fp8" if cache_dtype == "fp8" else "auto")
+    assert layer.dtype is activation_dtype
     configure = production["_configure_dcp_decode_head_padding"]
     for dcp, width in ((8, 64), (4, 32)):
         configure(layer, dcp)
@@ -292,7 +336,7 @@ def test_plan_support_is_bound_to_the_final_width_and_reset(
             native and supported is True and not nonps
         )
         if not nonps:
-            assert queries[-1] == (width, 1, torch.bfloat16, torch.bfloat16)
+            assert queries[-1] == (width, 1, query_dtype, query_dtype)
     before = list(queries)
     configure(layer, 1)
     assert not layer.dcp_sparse_prefill_plan_native

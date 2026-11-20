@@ -1039,6 +1039,10 @@ class MLAAttention(nn.Module):
         self.dcp_sparse_prefill_nonps = False
         self.dcp_sparse_prefill_plan_native = False
         if dcp_world_size > 1 and self.is_sparse_mla:
+            # Native MLA query/KV tensors are BF16 or FP8; "auto" is an API selector.
+            dtype = (
+                dtypes.fp8 if self.kv_cache_dtype.startswith("fp8") else torch.bfloat16
+            )
             self.dcp_sparse_prefill_persistent = mla_dcp_sparse_prefill_is_persistent(
                 dcp_world_size,
                 self.dcp_persistent_supported,
@@ -1053,8 +1057,8 @@ class MLAAttention(nn.Module):
                 dcp_world_size,
                 self.min_query_heads,
                 persistent=self.dcp_sparse_prefill_persistent,
-                dtype_q=dtypes.d_dtypes[self.kv_cache_dtype],
-                dtype_kv=dtypes.d_dtypes[self.kv_cache_dtype],
+                dtype_q=dtype,
+                dtype_kv=dtype,
             )
             self.dcp_sparse_prefill_nonps = mla_dcp_sparse_prefill_uses_nonps(
                 dcp_world_size,
@@ -1071,7 +1075,6 @@ class MLAAttention(nn.Module):
                 self.dcp_sparse_prefill_num_heads,
             )
             if self.dcp_sparse_prefill_persistent:
-                dtype = dtypes.d_dtypes[self.kv_cache_dtype]
                 support = get_mla_decode_shape_support(
                     self.dcp_sparse_prefill_num_heads,
                     1,
