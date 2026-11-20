@@ -8,11 +8,19 @@ from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
+from aiter_stub import atom_without_aiter
 
-pytest.importorskip("triton")
-pytest.importorskip("aiter.ops.enum", exc_type=ImportError)
+qwen4_exp = qwen4_exp_mtp = None
 
-from atom.models import qwen4_exp, qwen4_exp_mtp
+
+@pytest.fixture(scope="module", autouse=True)
+def _qwen_models():
+    """Use real model code on the CPU lane, stubbing only AITER / Triton."""
+    global qwen4_exp, qwen4_exp_mtp
+    with atom_without_aiter() as load:
+        qwen4_exp = load("atom.models.qwen4_exp")
+        qwen4_exp_mtp = load("atom.models.qwen4_exp_mtp")
+        yield
 
 
 class _Collectives:

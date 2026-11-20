@@ -49,6 +49,7 @@ from atom.mono.device.ops import (  # noqa: F401 - re-exported: the blocks impor
     traced,
     uniform,
 )
+from atom.mono.polling import SPIN_PAUSE_ASM
 
 from ...plan import trace
 from ...target import MI355X
@@ -177,8 +178,9 @@ def fresh_s64(v):
 
 
 def spin_pause():
-    """An opaque, side-effecting op inside a poll loop: keeps its loads from being hoisted."""
-    llvm.InlineAsmOp(None, [], "s_nop 0", "", has_side_effects=True)
+    """An opaque, side-effecting op inside a poll loop: keeps its loads from being
+    hoisted, and sleeps ``POLL_SLEEP_UNITS`` between polls (``s_nop 0`` at 1)."""
+    llvm.InlineAsmOp(None, [], SPIN_PAUSE_ASM, "", has_side_effects=True)
 
 
 # ------------------------------------------------------------------ hardware math

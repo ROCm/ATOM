@@ -2,6 +2,10 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Dual-copy scratch on MI355X's home rule (``Program.dual``).
 
+The tagged-pair calibration retries use the same mailbox backoff as execution.
+SPIN_MAX bounds retry count, not elapsed time; changing backoff changes this
+calibration's timing samples as well as production polling.
+
 The rule: within a 2 MiB page, memory alternates its home I/O die every 8 KiB (home = address bit 13 XOR a bit of
 the page). A dual program lays both copies of its dual regions out arithmetically by it
 (``program._dual_layout``: copy 0 in the area's even runs, copy 1 in the odd ones, the area at the start of a

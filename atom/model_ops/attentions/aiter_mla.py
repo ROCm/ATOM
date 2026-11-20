@@ -16,9 +16,9 @@ from aiter import (
     get_mla_metadata_v1,
 )
 
+from atom.config import kv_cache_torch_dtype
 from atom.distributed.dcp_utils import (
     NONPS_MAX_Q_ROWS,
-    dcp_persistent_supported,
     get_dcp_rank,
     get_dcp_world_size,
     mla_dcp_decode_is_persistent,
@@ -49,6 +49,7 @@ from atom.model_ops.attention_mla import (
     _MLA_SPLIT_BUDGET_AUTO,
     MLAAttention,
     mla_dcp_kernel_num_heads,
+    mla_dcp_persistent_width,
     mla_dcp_sparse_prefill_num_heads,
     mla_kernel_num_heads,
 )
@@ -562,7 +563,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self._fp4_launches = Fp4LaunchStorages(
             self.device, self.max_num_batched_tokens, self.max_bs
         )
-        self.dtype_kv = dtypes.d_dtypes[config.kv_cache_dtype]
+        self.dtype_kv = kv_cache_torch_dtype(config.kv_cache_dtype)
         self.dtype_q = self.dtype_kv
 
         self.dcp_world_size = get_dcp_world_size()
@@ -585,10 +586,19 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # gathered width, not the per-rank one. Pad it the same way the module
         # does (mla_dcp_decode_is_persistent picks the width set), so these
         # descriptors always describe the kernel that will actually run.
-        # Only gfx950 runs DCP in persistent mode (gfx942 lacks the lse persistent
-        # kernel and stays non-persistent, where this metadata is unused); scale
-        # by dcp only there so gfx942 keeps the original per-rank head sizing.
-        dcp_persistent = dcp_persistent_supported()
+        # Only where aiter runs DCP decode persistent (gfx942 lacks the lse
+        # persistent kernel and stays non-persistent, where this metadata is
+        # unused) does it scale by dcp; elsewhere it keeps the per-rank sizing.
+        # Target layers only: min_query_heads is the DSpark draft's, and the
+        # draft plans its own descriptors (DSparkProposer).
+        dcp_persistent = (
+            mla_dcp_persistent_width(
+                self.num_attention_heads,
+                self.dcp_world_size,
+                kv_cache_dtype=config.kv_cache_dtype,
+            )
+            is not None
+        )
         self.sparse_dcp_metadata_rebuild = (
             self.is_sparse
             and self.dcp_world_size > 1
@@ -614,7 +624,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             self.dcp_world_size,
             self.num_attention_heads * self.dcp_world_size,
             self.dtype_q == dtypes.fp8 and self.dtype_kv == dtypes.fp8,
-            dcp_persistent,
         )
         self.dcp_sparse_prefill_nonps = self.is_sparse and (
             mla_dcp_sparse_prefill_uses_nonps(
@@ -1525,6 +1534,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 "index_dtype": dtypes.fp8,
                 "index_head_dim": hf_config.index_head_dim,
                 "index_fp4": self._indexer_fp4,
+                "index_layout": runner.config.index_cache_layout,
             }
             if runner.has_mla_indexer
             else {}
@@ -1533,7 +1543,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             layers=self._kv_pool_layers(),
             block_size=runner.block_size,
             entry_dim=mla_kv_entry_dim(hf_config),
-            kv_dtype=dtypes.d_dtypes[runner.config.kv_cache_dtype],
+            kv_dtype=kv_cache_torch_dtype(runner.config.kv_cache_dtype),
             **indexer,
         )
 
@@ -1907,11 +1917,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # MLA's latent projection is replicated across TP. Sparse MLA's
             # index-key projection/cache is replicated as well; only the query
             # heads and absorbed KV-B/output projections are TP-sharded.
-            # Consequently every PAGE byte published above is identical on
-            # every TP worker (DCP/PCP are separate axes and are rejected by
-            # the current LMCache MP connector).
-            tp_replication_factor=int(
-                getattr(runner.config, "tensor_parallel_size", 1) or 1
+            # DCP shards the token axis, so its PAGE bytes must stay per rank.
+            tp_replication_factor=(
+                1
+                if int(getattr(runner.config, "decode_context_parallel_size", 1) or 1)
+                > 1
+                else int(getattr(runner.config, "tensor_parallel_size", 1) or 1)
             ),
         )
 
@@ -2917,6 +2928,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             heads=self.index_n_heads,
             page_size=self.model_runner.block_size,
             storage=self._fp4_launches[ubatch],
+            layout=self.model_runner.config.index_cache_layout,
         )
 
     def _mtp_index_rows(
@@ -3069,6 +3081,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             heads=self.index_n_heads,
             page_size=self.model_runner.block_size,
             split=split,
+            layout=self.model_runner.config.index_cache_layout,
         )
 
     @staticmethod
@@ -3515,6 +3528,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             var["index_mtp_row_ends"].np[:tokens] = 0
             counts["index_mtp_row_ends"] = tokens
         return counts
+
+    def publish_capture_layout(self, bs: int, max_seqlen_q: int) -> None:
+        super().publish_capture_layout(bs, max_seqlen_q)
+        if self.is_sparse:
+            # The warmup MLA reads one selected key a row; an indexer writes
+            # only a row's context, which leaves a verify's early rows empty.
+            self._sparse_kv_indices_gpu[: bs * max_seqlen_q].zero_()
 
     def build_for_cudagraph_capture(
         self, bs: int, *, decode_ubatch_slices=None
