@@ -12,11 +12,15 @@ from typing import ClassVar
 
 import torch
 from aiter import ActivationType, QuantType, dtypes
-from aiter.dist.communication_op import tensor_model_parallel_all_reduce
+from aiter.dist.communication_op import (
+    tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
+)
 from aiter.dist.parallel_state import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
 )
 from einops import rearrange
 from torch import nn
@@ -578,21 +582,15 @@ class KimiSparseMoeBlock(nn.Module):
         deferral would silently stop above the threshold, where the [T, H] add
         it saves is largest.
         """
-        return self._assert_split(self.split_moe_forward(hidden_states))
+        return self._split_op_pair(self.split_moe_forward(hidden_states))
 
     @staticmethod
-    def _assert_split(
+    def _split_op_pair(
         pair: tuple[torch.Tensor, torch.Tensor | None],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Both returns of the split op must be real tensors (its schema has no
-        optional). `_defer_shared_add` gates every call, so a None here means
-        that flag and `split_moe_forward` have drifted apart."""
+        """Keep the split op's fixed arity when the tail already added shared."""
         routed, shared = pair
-        assert shared is not None, (
-            "maybe_dual_stream_split_forward requires an unsummed shared output, but "
-            "the MoE summed it; _defer_shared_add disagrees with split_moe_forward"
-        )
-        return routed, shared
+        return routed, torch.zeros_like(routed) if shared is None else shared
 
     def split_moe_forward(
         self, hidden_states: torch.Tensor
@@ -628,6 +626,60 @@ class KimiSparseMoeBlock(nn.Module):
             routed_output = tensor_model_parallel_all_reduce(routed_output)
         return routed_output, None
 
+    def _can_column_tail(self, latent: torch.Tensor, shared: torch.Tensor) -> bool:
+        from atom.plugin import is_plugin_mode
+
+        ctx = get_forward_context().context
+        if (
+            is_plugin_mode()
+            or ctx is None
+            or ctx.is_prefill
+            or get_current_atom_config().enable_tbo
+            or get_pp_group().world_size != 1
+            or self.tp_size != 8
+            or not envs.ATOM_USE_CUSTOM_ALL_GATHER
+        ):
+            return False
+        comm = getattr(get_tp_group().device_communicator, "ca_comm", None)
+        if comm is None or comm.disabled:
+            return False
+        weight = self.routed_expert_up_proj.weight
+        norm = self.routed_expert_norm
+        return (
+            norm is not None
+            and not self.fuse_routed_norm_quant
+            and not self.fuse_routed_triton_mxfp4_quant
+            and 1 <= latent.shape[0] <= 64
+            and latent.shape[1] == 3584
+            and shared.shape == (latent.shape[0], 7168)
+            and weight.shape == (7168, 3584)
+            and all(
+                tensor.dtype == torch.bfloat16
+                and tensor.device == latent.device
+                and tensor.stride(-1) == 1
+                for tensor in (latent, shared, weight, norm.weight)
+            )
+        )
+
+    def _finish_latent_tail(
+        self, latent: torch.Tensor, shared: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Finish the reduced branches, projecting only this rank's columns."""
+        if not self._can_column_tail(latent, shared):
+            return self._apply_routed_norm_and_up_proj(latent), shared
+        from atom.model_ops.kimi_k3.attention_residual import column_tail
+
+        rank = get_tensor_model_parallel_rank()
+        columns = slice(rank * 896, (rank + 1) * 896)
+        local = column_tail(
+            latent,
+            self.routed_expert_norm.weight,
+            self.routed_expert_norm.eps,
+            self.routed_expert_up_proj.weight[columns],
+            shared[:, columns],
+        )
+        return tensor_model_parallel_all_gather(local, use_custom=True, dim=-1), None
+
     def dual_stream_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Summed dual-stream dispatch target, for callers that cannot defer."""
         routed, shared = self._dual_stream_split(hidden_states)
@@ -637,7 +689,7 @@ class KimiSparseMoeBlock(nn.Module):
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Unsummed dual-stream dispatch target for `maybe_dual_stream_split_forward`."""
-        return self._assert_split(self._dual_stream_split(hidden_states))
+        return self._split_op_pair(self._dual_stream_split(hidden_states))
 
     def _dual_stream_split(
         self, hidden_states: torch.Tensor

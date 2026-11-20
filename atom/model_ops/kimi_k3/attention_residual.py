@@ -39,6 +39,79 @@ import torch
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace
 
+
+def _column_tail_op(
+    latent: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    up_proj_rows: torch.Tensor,
+    shared: torch.Tensor,
+) -> torch.Tensor:
+    """Normalize the latent, then project and add one rank's BF16 columns."""
+    from aiter.ops.triton.gemm.fused.fused_gemm_a16w16_mul_add import (
+        fused_gemm_a16w16_mul_add,
+    )
+
+    from atom.model_ops.layernorm import rmsnorm2d_fwd_
+
+    if latent.ndim != 2 or up_proj_rows.ndim != 2:
+        raise ValueError("column tail expects two-dimensional latent and weights")
+    tokens, width = latent.shape
+    columns, weight_width = up_proj_rows.shape
+    if not 1 <= tokens <= 64 or width != 3584 or columns != 896:
+        raise ValueError("column tail supports 1..64 rows and the TP8 Kimi geometry")
+    if weight_width != width or shared.shape != (tokens, columns):
+        raise ValueError("column tail weight and shared shapes must match the latent")
+    if norm_weight.shape != (width,):
+        raise ValueError("column tail norm weight must match the latent width")
+    for tensor in (latent, norm_weight, up_proj_rows, shared):
+        if tensor.dtype != torch.bfloat16 or tensor.device != latent.device:
+            raise ValueError("column tail operands must be BF16 on one device")
+        if tensor.stride(-1) != 1:
+            raise ValueError("column tail operands require a contiguous feature axis")
+    normalized = rmsnorm2d_fwd_(latent, norm_weight, eps, width)
+    return fused_gemm_a16w16_mul_add(
+        normalized, up_proj_rows, a=1.0, b=shared, dtype=torch.bfloat16
+    )
+
+
+def _column_tail_fake(
+    latent: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    up_proj_rows: torch.Tensor,
+    shared: torch.Tensor,
+) -> torch.Tensor:
+    return latent.new_empty((latent.shape[0], up_proj_rows.shape[0]))
+
+
+direct_register_custom_op(
+    op_name="kimi_k3_column_tail",
+    op_func=_column_tail_op,
+    mutates_args=[],
+    fake_impl=_column_tail_fake,
+)
+
+
+@mark_trace
+def column_tail(
+    latent: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    up_proj_rows: torch.Tensor,
+    shared: torch.Tensor,
+) -> torch.Tensor:
+    """Return the rank's [T, 896] columns, rounding projection plus add once.
+
+    The BF16 latent is [T, 3584], with 1..64 rows. Weight and shared views
+    can have padded row strides. Normalization keeps the model-sensitive
+    RMSNorm setting; the existing AITER GEMM/add owns the FP32 epilogue.
+    """
+    return torch.ops.aiter.kimi_k3_column_tail(
+        latent, norm_weight, eps, up_proj_rows, shared
+    )
+
+
 try:
     import triton
     import triton.language as tl
