@@ -18,9 +18,44 @@ FUSED_N = 4 * HV * D + HV + D
 
 
 class TestKdaStrides(unittest.TestCase):
+    def test_arrivals_are_owned_by_the_checkpoint_pool(self):
+        with atom_under_stubs() as load:
+            replay = load("atom.model_ops.fla_ops.replayssm")
+            replay._FLUSH_ARRIVALS = {}
+            with patch.object(
+                torch.cuda, "is_current_stream_capturing", return_value=False
+            ) as capture:
+                pool, other = (torch.empty(8, 12, 2, 2) for _ in range(2))
+                first, second = (replay._flush_arrivals(p) for p in (pool, other))
+                self.assertIsNot(first, second)
+                self.assertEqual([x.shape for x in (first, second)], [(96,), (96,)])
+                self.assertFalse(first.any() or second.any())
+                first[0] = 1
+                self.assertEqual(second[0], 0)
+                capture.return_value = True
+                self.assertIs(replay._flush_arrivals(pool.view_as(pool)), first)
+                with self.assertRaisesRegex(RuntimeError, "eagerly"):
+                    replay._flush_arrivals(torch.empty_like(pool))
+
+    def test_flush_wait_for_supported_targets(self):
+        with atom_under_stubs() as load:
+            replay = load("atom.model_ops.fla_ops.replayssm")
+            for arch, expected in (
+                ("gfx942", "s_waitcnt vmcnt(0)"),
+                ("gfx950", "s_waitcnt vmcnt(0)"),
+                ("gfx1200", "s_wait_loadcnt 0"),
+                ("gfx1250", "s_wait_loadcnt 0"),
+            ):
+                with (
+                    self.subTest(arch=arch),
+                    patch.object(replay, "get_gfx_runtime", return_value=arch),
+                ):
+                    self.assertEqual(replay._flush_wait(), expected)
+
     def test_wrapper_copies_only_non_dense_rows(self):
         with atom_under_stubs() as load:
             replay = load("atom.model_ops.fla_ops.replayssm")
+            replay._FLUSH_ARRIVALS = {}
             for tokens in (32, 128):
                 for layout in (
                     "dense_rows",
@@ -67,6 +102,8 @@ class TestKdaStrides(unittest.TestCase):
         with (
             patch.object(replay, "triton", triton),
             patch.object(replay, "_replayssm_kda_fwd_kernel", Kernel()),
+            patch.object(torch.cuda, "is_current_stream_capturing", return_value=False),
+            patch.object(replay, "get_gfx_runtime", return_value="gfx950"),
         ):
             out = replay.replayssm_sigmoid_gating_delta_rule(
                 q,
@@ -99,6 +136,7 @@ class TestKdaStrides(unittest.TestCase):
         self.assertEqual(captured["stride_a_token"], captured["a"].stride(-3))
         self.assertEqual(captured["stride_b_token"], captured["b"].stride(-2))
         self.assertEqual(captured["N"], tokens // 8)
+        self.assertEqual(captured["WAIT"], "s_waitcnt vmcnt(0)")
         self.assertEqual(out.shape, (1, tokens, HV, D))
         self.assertEqual(out.dtype, torch.bfloat16)
 
