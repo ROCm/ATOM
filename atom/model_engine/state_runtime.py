@@ -359,3 +359,45 @@ def midstep_checkpoint_targets(
                 )
             out.append((row, dst, pos - start, int(pos == end), runtime_slots[j]))
     return out
+
+
+def midstep_rerun_rows(
+    targets: list[tuple[int, int, int, int, int]],
+    num_scheduled_tokens,
+    conv_len: int,
+) -> dict[str, list]:
+    """Index lists for writing `targets` with a kernel that keeps no `h`.
+
+    The forward runs its rows and, after them, one more sequence per interior
+    target: the row's tokens before the target, from the row's initial state.
+    That sequence's final state is the checkpoint (`head_slots`). Gathering
+    the inputs by `kda_tokens` and `kda_rows` and cutting them by `kda_cu`
+    keeps it one call over one `cu_seqlens` a step. An end target copies the
+    runtime slot (`end_runtime` to `end_slots`). Every target's conv window is
+    the `conv_len` tokens before it (`conv_tokens` to `slots`). Token indices
+    count from this step's first token, as the forward's `cu_seqlens` does.
+    An empty group is left out.
+    """
+    cu = [0]
+    for n in num_scheduled_tokens:
+        cu.append(cu[-1] + int(n))
+    groups = ("slots", "conv_tokens", "head_slots", "end_slots", "end_runtime")
+    out = {k: [] for k in groups}
+    out["kda_tokens"] = list(range(cu[-1]))
+    out["kda_rows"] = list(range(len(cu) - 1))
+    out["kda_cu"] = list(cu)
+    for row, slot, off, is_end, runtime in targets:
+        at = cu[row] + off
+        out["slots"].append(slot)
+        out["conv_tokens"].append(list(range(at - conv_len, at)))
+        if is_end:
+            out["end_slots"].append(slot)
+            out["end_runtime"].append(runtime)
+        else:
+            out["head_slots"].append(slot)
+            out["kda_tokens"].extend(range(cu[row], at))
+            out["kda_rows"].append(row)
+            out["kda_cu"].append(out["kda_cu"][-1] + off)
+    if not out["head_slots"]:
+        del out["kda_tokens"], out["kda_rows"], out["kda_cu"]
+    return {k: v for k, v in out.items() if v}

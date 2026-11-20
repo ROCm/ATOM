@@ -1271,6 +1271,39 @@ class KimiKDAAttention(nn.Module):
             state_v_first=True,
         )
 
+    def _prefill_kda(self, q, k, v, gate, beta, initial, cu, ckpt):
+        """The prefill recurrence, plus each interior checkpoint's head.
+
+        A head rides the same call as one more sequence: the kernel keeps only
+        final states, and one `cu_seqlens` a step is what its host-side cache
+        holds. Returns the rows' output and final states, then the heads'.
+        """
+        num_rows, num_tokens = initial.shape[0], q.shape[1]
+        if ckpt is not None and "kda_tokens" in ckpt:
+            tokens, cu = ckpt["kda_tokens"], ckpt["kda_cu"]
+            q, k, v, gate, beta = (
+                x.index_select(1, tokens) for x in (q, k, v, gate, beta)
+            )
+            initial = initial.index_select(0, ckpt["kda_rows"])
+        out, state = self._run_kda(q, k, v, gate, beta, initial, cu, True)
+        return out[:, :num_tokens], state[:num_rows], state[num_rows:]
+
+    @staticmethod
+    def _write_state_checkpoints(ckpt, head_states, mixed_qkv, conv_state, ssm_state):
+        """Fill the scratch slots of this step's midstep checkpoints.
+
+        An interior target's state is its head's final state, an end target's
+        the runtime slot this forward just wrote. The conv half is the
+        `conv_kernel - 1` inputs before the target, oldest first, which is
+        where `causal_conv1d_fn` resumes a prefill from.
+        """
+        if "head_slots" in ckpt:
+            ssm_state[ckpt["head_slots"]] = head_states
+        if "end_slots" in ckpt:
+            ssm_state[ckpt["end_slots"]] = ssm_state[ckpt["end_runtime"]]
+        window = mixed_qkv[ckpt["conv_tokens"]].transpose(1, 2)
+        conv_state[ckpt["slots"], :, : window.shape[2]] = window.to(conv_state.dtype)
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # hidden_states is a (fp8, scale) tuple when input_layernorm fused the
         # per-token quant; carry the scale through the opaque splitting custom op
@@ -1405,20 +1438,18 @@ class KimiKDAAttention(nn.Module):
             initial = gather_kda_initial_state(
                 ssm_state, state_indices_in, kda_metadata.has_initial_state
             )
-            kda_out, last_state = self._run_kda(
-                q,
-                k,
-                v,
-                gate,
-                beta,
-                initial,
-                query_start_loc,
-                True,
+            ckpt = getattr(kda_metadata, "ssm_checkpoints", None)
+            kda_out, last_state, head_states = self._prefill_kda(
+                q, k, v, gate, beta, initial, query_start_loc, ckpt
             )
             # last_state already has ssm_state's dtype (fla preserves the
             # initial_state dtype; the gathered initial is allocated as such),
             # so no .to() cast is needed.
             ssm_state[state_indices] = last_state
+            if ckpt is not None:
+                self._write_state_checkpoints(
+                    ckpt, head_states, mixed_qkv, conv_state, ssm_state
+                )
             # o_norm only reads this tensor, so keep the contiguous KDA output
             # instead of materializing an identical copy into `out`.
             assert kda_out.dtype == fused_in.dtype, (

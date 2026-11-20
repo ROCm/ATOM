@@ -3139,10 +3139,10 @@ class BlockManager:
             return
         if seq.midstep_reservations:
             self.cancel_midstep(seq)
+        seq.midstep_anchor_pos = self.midstep_anchor(seq, start, end)
         seq.midstep_reservations = self._state_checkpoint_cache.reserve_midstep(
             seq, self.midstep_positions(seq, start, end)
         )
-        seq.midstep_anchor_pos = self.midstep_anchor(seq, start, end)
 
     def commit_midstep(self, seq: Sequence) -> None:
         """File this forward's reservations, now that its bytes exist.
