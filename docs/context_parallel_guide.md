@@ -624,11 +624,19 @@ folded or unknown consumer rebuilds separate work buffers, preserving the templa
 for later native layers. Unqualified steps keep the existing rebuild path.
 
 Reuse is limited to 256 query rows and the exact geometry's workgroup capacity;
-the allocated work-indptr must match that capacity. This preserves the known
+the backing buffers cover both speculative and single-token geometry. Each plan
+publishes only its active work-indptr prefix, whose final GPU-written entry counts
+work items. This preserves the known
 [empty-item boundary](https://github.com/wuhuikx/LLM-Booster/issues/570) above
 256 rows. Rebuilding is not an unconditional numerical reference for empty rows.
 The template must fit the consumer's query rows, including an unpadded drafter;
 otherwise that consumer rebuilds from its own row count.
+
+Separate temporary buffers are allocated only when a qualified template meets a
+mismatched consumer. Steps whose builder cannot qualify a template continue to
+rebuild in their preallocated buffers. Temporary fallback storage keeps each
+captured invocation independent; its allocation cost remains part of the required
+complete decode-step timing.
 
 Persistent **sparse prefill** builds a work plan at the selected prefill head
 width. An owning layer patches its KV ranges only when AITER confirms native,

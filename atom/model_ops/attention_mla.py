@@ -2835,9 +2835,10 @@ class MLAAttention(nn.Module):
             getattr(attn_metadata, f"{work_prefix}{name}")
             for name in PERSISTENT_WORK_BUFFERS
         )
-        plan = getattr(attn_metadata, f"{work_prefix}dcp_decode_plan", None)
-        if not work_prefix:
-            plan = getattr(attn_metadata, "sparse_dcp_decode_plan", None)
+        plan_name = (
+            "sparse_mtp_dcp_decode_plan" if work_prefix else "sparse_dcp_decode_plan"
+        )
+        plan = getattr(attn_metadata, plan_name, None)
         reuse = False
         if plan is not None:
             rows, heads, dtype_q, dtype_kv = plan

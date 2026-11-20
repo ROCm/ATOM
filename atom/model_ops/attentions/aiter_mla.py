@@ -671,16 +671,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             (reduce_indptr_size, reduce_indptr_type),
             (reduce_final_map_size, reduce_final_map_type),
             (reduce_partial_map_size, reduce_partial_map_type),
-        ) = get_mla_metadata_info_v1(
-            self.max_bs,
-            max_seqlen_qo,
-            self.persistent_num_heads,
-            self.dtype_q,
-            self.dtype_kv,
-            is_sparse=self.is_sparse,
-            fast_mode=True,
-            **_mla_seg_meta_kwargs(),
-        )
+        ) = self._persistent_work_buffer_sizes(max_seqlen_qo)
         i32_kwargs = {"dtype": torch.int32, "device": self.device}
 
         mla_metadata = {
@@ -1079,6 +1070,36 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # return self.model_runner.tokenID_processor.async_copy_stream
         return self.model_runner.async_execute_stream
 
+    def _persistent_work_buffer_sizes(self, max_q_len: int):
+        def sizes(query_length):
+            return get_mla_metadata_info_v1(
+                self.max_bs,
+                query_length,
+                self.persistent_num_heads,
+                self.dtype_q,
+                self.dtype_kv,
+                is_sparse=self.is_sparse,
+                fast_mode=True,
+                **_mla_seg_meta_kwargs(),
+            )
+
+        allocated = sizes(max_q_len)
+        if not self.sparse_dcp_metadata_rebuild or max_q_len == 1:
+            return allocated
+        # Speculative and single-token decode can have different occupancy.
+        # Reserve every buffer for both, including the larger workgroup count.
+        return tuple(
+            (
+                (
+                    tuple(max(a, b) for a, b in zip(shape, single, strict=True))
+                    if isinstance(shape, tuple)
+                    else max(shape, single)
+                ),
+                dtype,
+            )
+            for (shape, dtype), (single, _) in zip(allocated, sizes(1), strict=True)
+        )
+
     def _sparse_dcp_decode_plan(self, rows: int, heads: int, work_indptr):
         """Describe a native template with one whole query row per workgroup."""
         if not self.sparse_dcp_metadata_rebuild or self.block_size != 1:
@@ -1097,7 +1118,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # Empty first items can hide subsequent live work in an MLA workgroup.
         # Keep one item per group and retain the qualified 256-row boundary.
         groups = get_mla_decode_fwd_max_splits(heads, 1, self.dtype_q, self.dtype_kv)
-        if not 0 < rows <= min(256, groups) or work_indptr.numel() != groups + 1:
+        if not 0 < rows <= min(256, groups) or work_indptr.numel() < groups + 1:
             return None
         return (rows, heads, self.dtype_q, self.dtype_kv)
 
@@ -1137,6 +1158,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         work_meta_data = var["sparse_mtp_work_meta_data"]
         work_info_set = var["sparse_mtp_work_info_set"]
         work_indptr = var["sparse_mtp_work_indptr"]
+        if plan is not None:
+            groups = get_mla_decode_fwd_max_splits(
+                heads, 1, self.dtype_q, self.dtype_kv
+            )
+            work_indptr = work_indptr[: groups + 1]
         reduce_indptr = var["sparse_mtp_reduce_indptr"]
         reduce_final_map = var["sparse_mtp_reduce_final_map"]
         reduce_partial_map = var["sparse_mtp_reduce_partial_map"]
@@ -1236,6 +1262,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 kv_granularity=triton.next_power_of_2(self.index_topk_out),
                 max_split_per_batch=1,
             )
+            groups = get_mla_decode_fwd_max_splits(
+                self.persistent_num_heads, 1, self.dtype_q, self.dtype_kv
+            )
+            # The planner fills only this prefix; its last entry is the item
+            # count consumed by the patcher, not the allocation's unused tail.
+            work_indptr = work_indptr[: groups + 1]
         kv_indptr_for_metadata = (
             var[f"{prefix}sparse_kv_indptr"].gpu[: bs + 1]
             if use_sparse_meta
@@ -3752,9 +3784,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
     ) -> None:
         super().finish_ubatch(ubatch_idx, ub, ub_attn, max_seqlen_q)
         prefix = f"ub{ubatch_idx}_"
-        self.set_mla_persistent_worker_buffers(
+        work = self.set_mla_persistent_worker_buffers(
             ub.running_bs, max_seqlen_q, prefix=prefix
         )
+        for name, value in work.items():
+            setattr(ub_attn, name, value)
         ub_attn.index_rows = self._decode_index_rows(
             ub_attn,
             ub.running_bs,

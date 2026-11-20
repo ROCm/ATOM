@@ -20,6 +20,7 @@ WORK = (
     "reduce_partial_map",
 )
 BUILD = {
+    "_persistent_work_buffer_sizes",
     "_sparse_dcp_decode_plan",
     "set_mla_persistent_worker_buffers",
     "_set_mla_persistent_worker_buffers_sparse_mtp",
@@ -49,6 +50,7 @@ def runtime():
         "torch": torch,
         "PERSISTENT_WORK_BUFFERS": WORK,
         "_MLA_SPLIT_BUDGET_AUTO": -1,
+        "_mla_seg_meta_kwargs": dict,
         "envs": SimpleNamespace(ATOM_MLA_PAGE_SIZE=1),
         "triton": SimpleNamespace(next_power_of_2=lambda n: 1 << (n - 1).bit_length()),
     }
@@ -65,8 +67,9 @@ def runtime():
     calls = []
 
     def sizes(rows, max_q, heads, dtype_q, dtype_kv, *, is_sparse, fast_mode):
-        assert max_q == 1 and is_sparse is False and fast_mode is True
+        assert fast_mode is True and (is_sparse or max_q == 1)
         groups = ns["get_mla_decode_fwd_max_splits"](heads, max_q, dtype_q, dtype_kv)
+        rows *= max_q if is_sparse else 1
         return [
             (2, torch.int64),
             (groups + 1, torch.int32),
@@ -108,7 +111,7 @@ def runtime():
         for row, _, start, end, lo, hi, *_ in info[: int(wi[-1])].tolist():
             assert start == row and end == row + 1
             if hi > lo:
-                keys = kv.flatten(0, 2)[indices[lo:hi].long()].float()
+                keys = kv.float().flatten(0, 2)[indices[lo:hi].long()]
                 scores = q[row].float() @ keys.T * kw["sm_scale"]
                 out[row] = (scores.softmax(-1) @ keys[:, : out.shape[-1]]).to(out.dtype)
                 lse[row] = scores.logsumexp(-1)
@@ -125,13 +128,23 @@ def runtime():
     return ns
 
 
-def setup(ns, rows=16, max_q=1, dtype=torch.bfloat16, device="cpu", sizes=None):
+def setup(
+    ns,
+    rows=16,
+    max_q=1,
+    dtype=torch.bfloat16,
+    device="cpu",
+    sizes=None,
+    heads=64,
+    allocation_q=1,
+):
     builder = ns["Builder"].__new__(ns["Builder"])
     builder.__dict__.update(
         is_sparse=True,
         sparse_dcp_metadata_rebuild=True,
         block_size=1,
-        persistent_num_heads=64,
+        persistent_num_heads=heads,
+        max_bs=rows,
         padded_num_attention_heads=16,
         dtype_q=dtype,
         dtype_kv=dtype,
@@ -139,14 +152,7 @@ def setup(ns, rows=16, max_q=1, dtype=torch.bfloat16, device="cpu", sizes=None):
         kv_shuffled=False,
     )
     if sizes is None:
-        sizes = [
-            (2, torch.int64),
-            (257, torch.int32),
-            ((rows + 256, 8), torch.int32),
-            (rows + 1, torch.int32),
-            ((rows, 2), torch.int32),
-            (rows + 512, torch.int32),
-        ]
+        sizes = builder._persistent_work_buffer_sizes(allocation_q)
     var = {
         prefix + name: torch.empty(shape, dtype=dt, device=device)
         for prefix in ("", "sparse_mtp_")
@@ -183,7 +189,7 @@ def setup(ns, rows=16, max_q=1, dtype=torch.bfloat16, device="cpu", sizes=None):
     if isinstance(layer, torch.nn.Module):
         torch.nn.Module.__init__(layer)
     layer.__dict__.update(
-        num_heads=64,
+        num_heads=heads,
         kv_lora_rank=512 if device == "cuda" else 4,
         dtype=torch.bfloat16,
         use_seg_mla=False,
@@ -296,7 +302,7 @@ def test_fallback_preserves_native_template(runtime, change, max_q):
 
 @pytest.mark.parametrize(
     "rows,groups,capacity",
-    [(0, 256, 257), (257, 304, 305), (65, 64, 65), (16, 256, 513)],
+    [(0, 256, 257), (257, 304, 305), (65, 64, 65), (16, 512, 257)],
 )
 def test_unqualified_capacity_keeps_layer_rebuild(runtime, rows, groups, capacity):
     builder, _, _ = setup(runtime, max(1, rows))
@@ -323,6 +329,7 @@ def test_unqualified_builder_keeps_existing_geometry(runtime, native, supported)
             return_lse=True,
         )
     assert len(runtime["calls"]) == 4
+    assert all(call[3] is md.work_info_set for call in runtime["calls"])
 
 
 def test_next_step_refreshes_rows_without_reusing_old_template(runtime):
@@ -359,6 +366,73 @@ def test_fallback_sizes_for_consumers_with_more_workgroups(runtime):
     )
     assert buffers[1].numel() == 513 and md.work_indptr.numel() == 257
     torch.testing.assert_close(md.work_info_set, original)
+
+
+@pytest.mark.parametrize("heads,allocation_q", [(16, 4), (64, 8)])
+def test_spec_allocation_covers_both_occupancies_and_publishes_active_prefix(
+    runtime, heads, allocation_q
+):
+    runtime["get_mla_decode_fwd_max_splits"] = lambda h, q, *_: (
+        512 if h * q == 64 else 256
+    )
+    dtype = torch.float8_e4m3fn
+    builder, md, layer = setup(
+        runtime, heads=heads, allocation_q=allocation_q, dtype=dtype
+    )
+    backing = builder.model_runner.forward_vars["work_indptr"]
+    assert backing.numel() == 513
+    backing.fill_(-12345)
+    md.__dict__.update(builder.set_mla_persistent_worker_buffers(16, 1))
+    groups = runtime["get_mla_decode_fwd_max_splits"](heads, 1)
+    assert md.sparse_dcp_decode_plan is not None
+    assert md.work_indptr.numel() == groups + 1
+    assert int(md.work_indptr[-1]) == 16
+    assert torch.all(backing[groups + 1 :] == -12345)
+    selection(md, 16, 2)
+    layer._forward_decode(
+        torch.randn(16, heads, 8).to(dtype),
+        torch.randn(97, 1, 8).to(dtype),
+        md,
+        return_lse=True,
+    )
+    assert len(runtime["calls"]) == 2
+
+
+def test_decode_ubatch_publishes_the_plan(runtime):
+    builder, _, _ = setup(runtime)
+    var = builder.model_runner.forward_vars
+    var.update({"ub0_" + name: value for name, value in tuple(var.items())})
+    path = Path(__file__).parents[2] / "atom/model_ops/attentions/aiter_mla.py"
+    method = next(
+        n
+        for n in ast.walk(ast.parse(path.read_text()))
+        if isinstance(n, ast.FunctionDef) and n.name == "finish_ubatch"
+    )
+    cls = ast.ClassDef(
+        name="Child",
+        bases=[ast.Name(id="Parent", ctx=ast.Load())],
+        keywords=[],
+        body=[method],
+        decorator_list=[],
+    )
+    ns = {"Parent": type("Parent", (), {"finish_ubatch": lambda *a: None})}
+    exec(  # noqa: S102 -- actual caller, with only its parent boundary stubbed
+        compile(
+            ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[])),
+            str(path),
+            "exec",
+        ),
+        ns,
+    )
+    child = ns["Child"]()
+    child.model_runner = builder.model_runner
+    child.set_mla_persistent_worker_buffers = builder.set_mla_persistent_worker_buffers
+    child._decode_index_rows = lambda *a, **kw: None
+    child._mtp_index_rows = lambda *a: None
+    md = SimpleNamespace()
+    child.finish_ubatch(0, SimpleNamespace(running_bs=16, running_tokens=16), md, 1)
+    assert md.sparse_dcp_decode_plan is not None
+    assert md.work_indptr.data_ptr() == var["ub0_work_indptr"].data_ptr()
 
 
 @pytest.mark.skipif(
