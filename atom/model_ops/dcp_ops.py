@@ -1862,8 +1862,8 @@ def triton_filter_and_convert_dcp_index_prefill(
 # cached prefix + 64 / 1K / 16K new tokens, 32K-960K: k in [48.5, 57)
 # classifies all 18 tp4/dcp4 points (16 heads a rank), 40 all tp8/dcp8 ones
 # (8 heads a rank). k follows the heads a rank attends, which "kv" pays for:
-# fewer heads, less attention for the gather to save. Other head counts take
-# the nearer measured one. A forced "kv" skips it; both stay under the cap.
+# fewer heads, less attention for the gather to save. 16 or more heads a rank
+# take 52, fewer take 40. A forced "kv" skips it; both stay under the cap.
 DCP_SPARSE_PREFILL_KV_CONTEXT_BASE = 200 * 1024
 
 
@@ -1897,6 +1897,29 @@ def dcp_sparse_prefill_kv_blocker(kv_cache_dtype: str, mla_page_size: int):
     return None
 
 
+def dcp_sparse_prefill_kv_profile_rows(
+    mode: str,
+    num_tokens: int,
+    local_heads: int,
+    max_num_seqs: int,
+    block_size: int,
+    dcp_world_size: int,
+    kv_max_rows: int,
+) -> int:
+    """The most gathered rows a "kv" step of ``num_tokens`` new tokens can
+    take: the cap for a forced "kv"; for "auto", its context bound plus each
+    request's padding to whole local blocks."""
+    if mode == "kv":
+        return kv_max_rows
+    requests = min(num_tokens, max_num_seqs)
+    return min(
+        kv_max_rows,
+        DCP_SPARSE_PREFILL_KV_CONTEXT_BASE
+        + dcp_sparse_prefill_kv_context_per_new_token(local_heads) * num_tokens
+        + requests * block_size * dcp_world_size,
+    )
+
+
 def dcp_sparse_prefill_kv_scratch_bytes(
     num_tokens: int,
     local_heads: int,
@@ -1907,7 +1930,7 @@ def dcp_sparse_prefill_kv_scratch_bytes(
     dcp_world_size: int,
     kv_max_rows: int,
 ) -> int:
-    """What a "kv" sparse prefill adds in one layer at the token cap, for the
+    """What a "kv" sparse prefill adds in one layer at ``kv_max_rows``, for the
     memory profile, whose dummy run skips the attention: this rank's rows, the
     gathered KV, the query padded to the kernel's heads (a copy, when it pads)
     and the per-rank output. The "q" transport's own buffers are not profiled,
@@ -1974,9 +1997,8 @@ def dcp_sparse_prefill_kv_plan(
     blocks = []
     for i, n in enumerate(padded.tolist()):
         block_ids = np.asarray(block_tables[i], dtype=np.int32)
-        assert (
-            len(block_ids) * block_size >= n
-        ), f"request {i}: {len(block_ids)} blocks for {n} local rows"
+        if len(block_ids) * block_size < n:
+            raise ValueError(f"request {i}: {len(block_ids)} blocks for {n} local rows")
         blocks.append(block_ids[: n // block_size])
     shard_base = np.zeros(len(padded) + 1, dtype=np.int32)
     np.cumsum(padded, out=shard_base[1:])

@@ -1536,16 +1536,28 @@ class MLAAttention(nn.Module):
         the dummy run skips the attention itself."""
         from atom.model_ops.dcp_ops import (
             dcp_sparse_prefill_kv_blocker,
+            dcp_sparse_prefill_kv_profile_rows,
             dcp_sparse_prefill_kv_scratch_bytes,
             dcp_sparse_prefill_mode_env,
         )
 
         page = max(1, envs.ATOM_MLA_PAGE_SIZE)
+        mode = dcp_sparse_prefill_mode_env()
         if (
-            dcp_sparse_prefill_mode_env() == "q"
+            mode == "q"
             or dcp_sparse_prefill_kv_blocker(self.kv_cache_dtype, page) is not None
         ):
             return
+        config = get_current_atom_config()
+        kv_rows = dcp_sparse_prefill_kv_profile_rows(
+            mode,
+            num_tokens,
+            self.num_heads,
+            config.max_num_seqs,
+            config.kv_cache_block_size,
+            self.dcp_world_size,
+            envs.ATOM_DCP_SPARSE_PREFILL_KV_MAX_TOKENS,
+        )
         nbytes = dcp_sparse_prefill_kv_scratch_bytes(
             num_tokens,
             self.num_heads,
@@ -1554,7 +1566,7 @@ class MLAAttention(nn.Module):
             self.qk_rope_head_dim,
             1,  # fp8 KV, which the blocker requires
             self.dcp_world_size,
-            envs.ATOM_DCP_SPARSE_PREFILL_KV_MAX_TOKENS,
+            kv_rows,
         )
         torch.empty(nbytes, dtype=torch.uint8, device=device)
 

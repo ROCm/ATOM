@@ -203,7 +203,7 @@ def test_plan_takes_kv_within_its_bounds(context_lens, max_tokens, max_context, 
 
 
 def test_plan_refuses_a_block_table_too_short():
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError):
         _plan([200], [[0]], 4, 16)  # needs ceil(200 / 64) = 4 blocks
 
 
@@ -250,6 +250,94 @@ def test_a_q_step_keeps_its_plan(monkeypatch, nonps, planned):
     b._dcp_sparse_prefill_step(None, md, "")
     assert md.dcp_sparse_prefill_kv is None
     assert seen == ["plan"] + planned
+
+
+def _finisher(monkeypatch, mode):
+    """`_finish_prefill_batch` at DCP=1 with no cached prefix; records which
+    planner it calls and with what heads."""
+    seen = []
+    b = object.__new__(aiter_mla.AiterMLAMetadataBuilder)
+    b._dcp_sparse_prefill_mode = mode
+    b.dcp_world_size = 1
+    b.sparse_prefill_num_heads = 64
+    b.attn_prefill_chunk_size = 0
+    b.kv_shuffled = False
+    b.model_runner = SimpleNamespace(forward_vars={})
+    staged = SimpleNamespace(index_rows=SimpleNamespace(passes=None), pcp_split=False)
+    staged.total_kv = staged.sparse_counts = None
+    b._sparse_prefill_staged = {"": staged}
+    b._sparse_prefill_work_plan = lambda md, prefix, heads, *a, **k: seen.append(
+        ("work_plan", heads)
+    )
+    b._dcp_sparse_prefill_step = lambda *a: seen.append("kv_step")
+    b._finish_prefill_index_rows = lambda *a: None
+    b._prefill_reads_token_csr = lambda md: False
+    monkeypatch.setattr(
+        aiter_mla.CommonAttentionBuilder, "_finish_prefill_batch", lambda *a: None
+    )
+    md = SimpleNamespace(sparse_kv_last_page_lens=None, has_cached=False)
+    return b, md, seen
+
+
+@pytest.mark.parametrize(
+    "mode,want",
+    [("q", [("work_plan", 64)]), ("auto", ["kv_step"]), ("kv", ["kv_step"])],
+)
+def test_a_q_builder_skips_the_kv_step(monkeypatch, mode, want):
+    """The default transport (and DCP=1) plans as before the "kv" transport,
+    without its per-step host work."""
+    b, md, seen = _finisher(monkeypatch, mode)
+    b._finish_prefill_batch(SimpleNamespace(scheduled_bs=1), md)
+    assert seen == want
+
+
+def _work_sizer(mode, local, gathered):
+    b = object.__new__(aiter_mla.AiterMLAMetadataBuilder)
+    b._dcp_sparse_prefill_mode = mode
+    b.padded_num_attention_heads = local
+    b.sparse_prefill_num_heads = gathered
+    b.dtype_q = b.dtype_kv = torch.float8_e4m3fn
+    return b
+
+
+def _numel(size):
+    return int(np.prod(size))
+
+
+@pytest.mark.parametrize("mode", ["auto", "kv"])
+def test_the_work_buffers_fit_a_kv_steps_plan(mode):
+    """Kimi-K3 TP2/DCP2: 48 heads a rank, 128 gathered. A "kv" step plans the
+    48, which can take more tiles a token than the 128 the buffers were sized
+    for; they must fit both widths."""
+    tokens = 4096
+    got = _work_sizer(mode, 48, 128)._sparse_prefill_work_info(tokens)
+    for heads in (48, 128):
+        want = aiter_mla.get_mla_metadata_info_v1(
+            tokens,
+            1,
+            heads,
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fn,
+            is_sparse=True,
+            fast_mode=True,
+        )
+        for (g, _), (w, _) in zip(got, want):
+            assert _numel(g) >= _numel(w)
+
+
+def test_a_q_builder_sizes_the_work_buffers_as_before():
+    tokens = 4096
+    got = _work_sizer("q", 48, 128)._sparse_prefill_work_info(tokens)
+    want = aiter_mla.get_mla_metadata_info_v1(
+        tokens,
+        1,
+        128,
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fn,
+        is_sparse=True,
+        fast_mode=True,
+    )
+    assert got == want
 
 
 def _resolver(monkeypatch, env, *, sparse=True, dcp=4, page=1, plugin=False, pcp=False):
@@ -473,7 +561,26 @@ def test_the_kv_scratch_counts_the_padded_query_copy():
     }
     unpadded = f(4096, local_heads=16, padded_heads=16, **args)
     padded = f(4096, local_heads=8, padded_heads=16, **args)
-    assert padded - unpadded >= 4096 * 16 * 576
+    assert padded - unpadded == 4096 * 16 * 576
+
+
+@pytest.mark.parametrize(
+    "mode,tokens,heads,want",
+    [
+        ("kv", 2048, 16, 1 << 20),
+        # 200K + 52 * 2048 + min(2048, 256) requests * 16 * 4 padding
+        ("auto", 2048, 16, 200 * 1024 + 52 * 2048 + 256 * 16 * 4),
+        ("auto", 64, 8, 200 * 1024 + 40 * 64 + 64 * 16 * 4),
+        ("auto", 16384, 16, 1 << 20),
+    ],
+)
+def test_auto_profiles_the_rows_it_can_gather(mode, tokens, heads, want):
+    """A forced "kv" may gather the cap; "auto" no more than its context bound
+    plus each request's padding to whole local blocks."""
+    got = dcp_ops.dcp_sparse_prefill_kv_profile_rows(
+        mode, tokens, heads, 256, 16, 4, 1 << 20
+    )
+    assert got == want
 
 
 def _dummy_attention(monkeypatch, env, kv_cache_dtype, is_prefill, cap=1 << 14):
@@ -494,7 +601,10 @@ def _dummy_attention(monkeypatch, env, kv_cache_dtype, is_prefill, cap=1 << 14):
         attention_mla,
         "get_current_atom_config",
         lambda: SimpleNamespace(
-            hf_config=SimpleNamespace(hidden_size=8), torch_dtype=torch.bfloat16
+            hf_config=SimpleNamespace(hidden_size=8),
+            torch_dtype=torch.bfloat16,
+            max_num_seqs=256,
+            kv_cache_block_size=16,
         ),
     )
     a = _kv_attention()
@@ -531,6 +641,16 @@ def test_a_dummy_prefill_profiles_the_kv_scratch(monkeypatch, env, dtype, held):
     a = _dummy_attention(monkeypatch, env, dtype, is_prefill=True, cap=cap)
     kv = dcp_ops.dcp_sparse_prefill_kv_scratch_bytes(5, 16, 16, 512, 64, 1, 4, cap)
     assert (_profiled_peak(a, 5) >= kv) == held
+
+
+def test_a_dummy_prefill_under_auto_holds_less_than_the_cap(monkeypatch):
+    """A 5-token profile under "auto" can gather ~200K rows, not 2^20."""
+    cap = 1 << 20
+    a = _dummy_attention(monkeypatch, "auto", "fp8", is_prefill=True, cap=cap)
+    rows = dcp_ops.dcp_sparse_prefill_kv_profile_rows("auto", 5, 16, 256, 16, 4, cap)
+    held = dcp_ops.dcp_sparse_prefill_kv_scratch_bytes(5, 16, 16, 512, 64, 1, 4, rows)
+    at_cap = dcp_ops.dcp_sparse_prefill_kv_scratch_bytes(5, 16, 16, 512, 64, 1, 4, cap)
+    assert held <= _profiled_peak(a, 5) < at_cap
 
 
 def test_a_dummy_decode_profiles_no_kv_scratch(monkeypatch):
