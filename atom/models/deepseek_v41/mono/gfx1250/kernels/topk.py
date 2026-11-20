@@ -680,6 +680,7 @@ MA_X0 = 64                               # select_ma's row groups from CTA 64 (p
 MF_SLOTS = 4
 MF_LAYER = MC_ROWS * 256 * 4             # zeroed a step: the anchored histograms [MC_ROWS][256]
 MF_CAP = 256                             # keys the 512-th's bin may hold (ranked by its group's CTA 0); more -> select_mc
+MF_P1_U = 8                              # select_mf's first pass: keys a thread in flight (bin 0 by wave ballots)
 MF_KANC = 0                              # kept across steps (step.MF_KB, MF_KEEP bytes a FULL layer): the rows' anchors
 MF_KLIST = 64                            # then the 512-th's bin's (score, column) [MC_ROWS][MF_CAP] int2
 MF_KEEP = MF_KLIST + MC_ROWS * MF_CAP * 8
@@ -766,8 +767,14 @@ def select_ma(c, hb, ctr, G, ma, kp):
         ba = _ma_bin(xa, lo, inv)
         bb = _ma_bin(xb, lo, inv)
         junk = I32(O_MAL // 4 + 32) + lane
-        hx.latomic_add_i32(sm + va.select(I32(O_MCH // 4) + ba, junk) * 4, I32(1))
-        hx.latomic_add_i32(sm + vb.select(I32(O_MCH // 4) + bb, junk) * 4, I32(1))
+        # (as select_mf's first pass) bin 0 -- most keys -- by a wave ballot, one LDS add a wave; the others as before
+        za = va & (ba == I32(0))
+        zb = vb & (bb == I32(0))
+        nz = _popc(_ballot(za)) + _popc(_ballot(zb))
+        if (lane == 0) & (nz != 0):
+            hx.latomic_add_i32(sm + O_MCH, nz)
+        hx.latomic_add_i32(sm + (va & (za == (I32(0) != I32(0)))).select(I32(O_MCH // 4) + ba, junk) * 4, I32(1))
+        hx.latomic_add_i32(sm + (vb & (zb == (I32(0) != I32(0)))).select(I32(O_MCH // 4) + bb, junk) * 4, I32(1))
         gpu.barrier()
         v = hx.lload(sm + O_MCH + t * 4, I32)
         if v != 0:
@@ -898,8 +905,21 @@ def select_mf(c, ctr, G, mf, kp):
         lo = hx.gload(kp + i64(MF_KANC) + i64(r) * 4, F32) - F32(MA_S)
         inv = F32(254.0 / (2.0 * MA_S))
         if n > k:
-            for i in range(i0 + t, i1, 256):   # pass 1: this CTA's keys -> its LDS bins
-                hx.latomic_add_i32(sm + O_MCH + _ma_bin(hx.gload(rowp + i64(i) * 4, I32), lo, inv) * 4, I32(1))
+            # pass 1: this CTA's keys -> its LDS bins. Bin 0 (the keys below the anchor's window: nearly the whole row) is
+            # counted by a wave ballot, one LDS add a wave a key slot; the other bins one LDS add a key as before; MF_P1_U
+            # keys a thread in flight. The same counts: the histogram bitwise the same. (CT16 fixture c3kvc/mfstep.py, the
+            # rows' real 512-th as anchors, G 42, cold: n 200K 12.8 -> 2.6 us a CTA, n 66.6K 4.36 -> 1.12: every key's
+            # LDS add on bin 0 serialized the pass; more keys in flight alone: no change)
+            for i in range(i0 + t, i1, 256 * MF_P1_U):
+                xs = [hx.gload(rowp + i64(fx.min(i + 256 * u, i1 - 1)) * 4, I32) for u in range(MF_P1_U)]
+                for u in range_constexpr(MF_P1_U):
+                    okk = i + 256 * u < i1
+                    bn = _ma_bin(xs[u], lo, inv)
+                    bz = _ballot(okk & (bn == I32(0)))
+                    if (lane == 0) & (bz != 0):
+                        hx.latomic_add_i32(sm + O_MCH, _popc(bz))
+                    if okk & (bn != I32(0)):
+                        hx.latomic_add_i32(sm + O_MCH + bn * 4, I32(1))
             gpu.barrier()
             lad = mf + i64(r * 256) * 4
             hv = hx.lload(sm + O_MCH + t * 4, I32)   # (kept: this CTA's count of bin t)
@@ -955,10 +975,15 @@ def select_mf(c, ctr, G, mf, kp):
                 mb0 = (bs >> 16) & 0xFFFF
                 q = fx.max(hx.gload(c["ibat"] + i64(r) * 4, I32), I32(0))
                 lst = kp + i64(MF_KLIST) + i64(r * MF_CAP) * 8
-                for base in range(i0, i1, 256):   # pass 2: the winners' positions, the j-bin keys -> the row's list
+                # pass 2: the winners' positions, the j-bin keys -> the row's list; the next round's key loaded before this
+                # round's ballots / LDS atomics / stores (one load round trip a round was its chain; the same keys, the same
+                # per-round work)
+                xn = hx.gload(rowp + i64(fx.min(i0 + t, i1 - 1)) * 4, I32)
+                for base in range(i0, i1, 256):
                     i = base + t
                     ok = i < i1
-                    x = hx.gload(rowp + i64(fx.min(i, i1 - 1)) * 4, I32)
+                    x = xn
+                    xn = hx.gload(rowp + i64(fx.min(i + 256, i1 - 1)) * 4, I32)
                     bn = _ma_bin(x, lo, inv)
                     isw = ok & (bn > j)
                     ism = ok & (bn == j)
