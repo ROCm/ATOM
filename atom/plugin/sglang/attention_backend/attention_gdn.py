@@ -376,26 +376,22 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
         attn_backend = SGLangGDNForwardContext._resolve_attn_backend(forward_batch)
         if attn_backend is None:
             raise RuntimeError(
-                "ATOM Qwen3.5 TARGET_VERIFY requires an active SGLang "
-                "attention backend."
+                "ATOM GDN TARGET_VERIFY requires an active SGLang attention backend."
             )
         linear_backend = SGLangGDNForwardContext._linear_attn_backend(attn_backend)
         if getattr(linear_backend, "forward_metadata", None) is None:
             raise RuntimeError(
-                "ATOM Qwen3.5 TARGET_VERIFY requires initialized SGLang "
-                "GDN metadata."
+                "ATOM GDN TARGET_VERIFY requires initialized SGLang GDN metadata."
             )
         req_to_token_pool = getattr(linear_backend, "req_to_token_pool", None)
         if req_to_token_pool is None:
-            raise RuntimeError(
-                "ATOM Qwen3.5 TARGET_VERIFY requires the SGLang mamba pool."
-            )
+            raise RuntimeError("ATOM GDN TARGET_VERIFY requires the SGLang mamba pool.")
         layer_cache = req_to_token_pool.mamba2_layer_cache(self.layer_num)
         if not hasattr(layer_cache, "intermediate_ssm") or not hasattr(
             layer_cache, "intermediate_conv_window"
         ):
             raise RuntimeError(
-                "ATOM Qwen3.5 TARGET_VERIFY requires speculative GDN "
+                "ATOM GDN TARGET_VERIFY requires speculative GDN "
                 "intermediate-state buffers."
             )
 
@@ -422,7 +418,8 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
         cache_indices = linear_backend.forward_metadata.mamba_cache_indices[:bs]
         conv_states = layer_cache.conv[0]
         # Same view Native passes to GatedDeltaNet: FlyDSL decode keeps a
-        # logical KV view over physical VK storage. Verify reads that view.
+        # logical KV view over physical VK storage. The batched path reads
+        # that view; ReplaySSM addresses the raw pool.
         ssm_states = layer_cache.temporal
         policy = getattr(self, "gdn_flydsl_policy", None)
         if policy is not None and policy.decode:
@@ -655,10 +652,14 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
         The conv update is folded into one wide-window call over SGLang's
         deduplicated sliding-window `intermediate_conv_window`.
 
-        Equivalence with a per-step reference loop is checked bit-for-bit by
-        tests/plugin/test_gdn_target_verify_batched_equiv.py;
-        tests/plugin/test_sglang_gdn_verify_batched_ssm.py checks the plugin
-        contract (buffers, live state, one kernel call, pad rows).
+        tests/plugin/test_gdn_target_verify_batched_equiv.py checks this call
+        pattern bit-for-bit against a per-step loop, using its own stand-in
+        call rather than this method.
+        tests/plugin/test_sglang_gdn_verify_batched_ssm.py drives this method
+        through forward() and checks the plugin contract: both buffers have
+        nonzero contents for each live request at steps 1..draft-1 (SSM
+        step 0 is host-seeded), the live state is untouched, one conv and
+        one SSM kernel call, and pad rows give zero output.
         """
         query_all, key_all, value_all, g, beta = self._spec_conv_qkv(
             layer_cache=layer_cache,
@@ -790,8 +791,8 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
         physical row is exactly what ATOM's spec `causal_conv1d_update` writes,
         so recovering it lets one call write every step's window.
 
-        Raises when the view is not that dedup layout. DFLASH target verify on
-        ROCm requires the linear-chain deduplicated layout.
+        Raises when the view is not that dedup layout, which GDN target
+        verify on ROCm requires.
         """
         if window_view.ndim != 4:
             raise RuntimeError(

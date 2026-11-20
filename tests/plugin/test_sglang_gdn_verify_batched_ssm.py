@@ -1,19 +1,22 @@
-"""End-to-end coverage for the batched (non-ReplaySSM) DFLASH verify path.
+"""Forward-path coverage for the batched (non-ReplaySSM) GDN TARGET_VERIFY path.
 
 With speculative decoding (MTP, DFLASH, ...), TARGET_VERIFY goes through
 ReplaySSM by default; this path runs only with ``ATOM_ENABLE_REPLAYSSM=0``.
 Every test here forces ReplaySSM off.
 
-``test_gdn_target_verify_batched_equiv.py`` compares the two *kernel call
-patterns in isolation. This module drives the real
-``SGLangGatedDeltaNet.forward()`` TARGET_VERIFY path and asserts the plugin's
-observable contract:
+``test_gdn_target_verify_batched_equiv.py`` compares the batched call pattern
+with a per-step loop, using its own stand-in calls. This module drives the
+real ``SGLangGatedDeltaNet.forward()`` TARGET_VERIFY path and asserts the
+plugin's observable contract:
 
-* ``core_attn_out``
-* ``intermediate_ssm[req, step]`` -- what SGLang's
+* ``core_attn_out`` (pad rows zero)
+* nonzero ``intermediate_ssm[req, step]`` contents for each live request at
+  steps 1..draft-1 (step 0 is host-seeded) -- what SGLang's
   ``fused_mamba_state_scatter_with_mask`` commits from
-* ``intermediate_conv_window[0][req, step]``
+* nonzero ``intermediate_conv_window[0][req, step]`` contents for each live
+  request at steps 1..draft-1
 * the live ``conv`` / ``temporal`` state, which must come back untouched
+* one conv and one SSM kernel call
 
 Run on a GPU; the kernels have no CPU fallback.
 """
@@ -100,9 +103,8 @@ def _dedup_conv_window_view(num_slots: int, draft: int) -> torch.Tensor:
 
     One shared [slot, dim, D + K - 2] physical row exposed as an overlapping
     [slot, D, dim, K - 1] view; see MambaPool.__init__ in SGLang's
-    memory_pool.py. Production on ROCm always takes this layout for DFLASH
-    (linear draft chain), so the tests must exercise it rather than the dense
-    fallback.
+    memory_pool.py. GDN target verify on ROCm requires this layout (linear
+    draft chain), so the tests exercise it rather than the dense fallback.
     """
     shared_win = draft + STATE_LEN - 1
     phys = torch.zeros(
@@ -215,10 +217,15 @@ def _run_once(bs: int, draft: int, slots=None, flydsl_decode: bool = False):
 @pytest.mark.parametrize("draft", [4, 8, 16])
 @pytest.mark.parametrize("bs", [1, 3])
 def test_batched_path_populates_verify_buffers(bs: int, draft: int):
+    """Both buffers start at zero. Exclude step 0 because forward seeds the
+    SSM state there before the kernel; steps 1.. must be kernel writes."""
     result = _run_once(bs, draft)
     assert result["out"].shape[0] == bs * draft
-    assert result["intermediate_ssm"].shape[:2] == (bs, draft)
-    assert result["intermediate_conv"].shape[:2] == (bs, draft)
+    for name in ("intermediate_ssm", "intermediate_conv"):
+        buf = result[name]
+        assert buf.shape[:2] == (bs, draft)
+        written = buf[:, 1:].flatten(2).abs().amax(-1) > 0
+        assert written.all(), f"{name} has unwritten (req, step) entries"
 
 
 @pytest.mark.parametrize("draft", [4, 8, 16])
@@ -291,7 +298,7 @@ def test_pad_rows_zeroed_and_real_rows_unchanged(monkeypatch, draft, flydsl_deco
 
 
 # --------------------------------------------------------------------------
-# Batched conv (Step 2): recovering SGLang's physical wide-window buffer
+# Batched conv: recovering SGLang's physical wide-window buffer
 # --------------------------------------------------------------------------
 def _sglang_dedup_conv_window(num_slots: int, draft: int):
     """Replicate SGLang's deduplicated intermediate_conv_window allocation.
