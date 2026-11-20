@@ -93,6 +93,10 @@ wait_http() {
 
 role_url() { echo "http://$(role_var "$1" NODE):$2"; }
 
+# standalone: whether ATOM_ENV launches ATOM's server through ATOMesh's
+# standalone entrypoint (USE_ATOMESH_ENTRYPOINTS=1), which makes it ATOMesh too.
+standalone() { [[ " ${ATOM_ENV[*]} " == *" USE_ATOMESH_ENTRYPOINTS=1 "* ]]; }
+
 # launch_atom <role> <server_port> <engine_port> [extra server args...]:
 # ATOM's OpenAI server from the checkout, per the profile's ATOM_ENV/ATOM_ARGS.
 launch_atom() {
@@ -107,14 +111,36 @@ launch_atom() {
     log "atom resolves to $where, not $ROOT/atom"
     return 1
   fi
-  local env_opts=() e
+  local env_opts=() e port_args=(--port "$engine_port")
   for e in "${ATOM_ENV[@]}"; do env_opts+=(-e "$e"); done
+  # Under USE_ATOMESH_ENTRYPOINTS=1 the server imports ATOMesh's Python module,
+  # which the image does not carry, and reads --port as its HTTP port.
+  if standalone; then
+    build_mesh "$role"
+    in_role "$role" mkdir -p "$MESH_TARGET/pylib"
+    in_role "$role" ln -sf ../release/libmesh.so "$MESH_TARGET/pylib/atomesh_runner.so"
+    env_opts+=(-e "PYTHONPATH=$MESH_TARGET/pylib")
+    port_args=()
+  fi
   local cmd
   cmd=$(printf '%q ' python3 -m atom.entrypoints.openai_server "${ATOM_ARGS[@]}" \
-    --server-port "$port" --port "$engine_port" "$@")
+    --server-port "$port" "${port_args[@]}" "$@")
   in_role "$role" -d "${env_opts[@]}" -- bash -c "$cmd > $RUN_DIR/$role.log 2>&1"
   log "waiting for $role (log $RUN_DIR/$role.log)"
   wait_http "$role" "http://127.0.0.1:$port/health" 3600 atom.entrypoints.openai_server
+}
+
+# build_mesh <role>: build ATOMesh from the checkout in the role's container,
+# into MESH_TARGET (one per checkout).
+MESH_TARGET=$ACCEPT_DIR/cargo/$(echo -n "$ROOT" | md5sum | cut -c1-12)
+build_mesh() {
+  local role=$1
+  log "building atomesh into $MESH_TARGET (log $RUN_DIR/$role-build.log)"
+  if ! in_role "$role" -e "CARGO_TARGET_DIR=$MESH_TARGET" -- bash -c \
+    "cargo build --release --manifest-path $ROOT/atom/mesh/Cargo.toml > $RUN_DIR/$role-build.log 2>&1"; then
+    log "atomesh build failed"
+    return 1
+  fi
 }
 
 # launch_mesh <role> <port> [atomesh launch args...]: build ATOMesh from the
@@ -123,21 +149,14 @@ launch_mesh() {
   local role=$1 port=$2
   shift 2
   start_container "$role"
-  local target
-  target=$ACCEPT_DIR/cargo/$(echo -n "$ROOT" | md5sum | cut -c1-12)
-  log "building atomesh into $target (log $RUN_DIR/$role-build.log)"
-  if ! in_role "$role" -e "CARGO_TARGET_DIR=$target" -- bash -c \
-    "cargo build --release --manifest-path $ROOT/atom/mesh/Cargo.toml > $RUN_DIR/$role-build.log 2>&1"; then
-    log "atomesh build failed"
-    return 1
-  fi
+  build_mesh "$role"
   local cmd
-  cmd=$(printf '%q ' "$target/release/atomesh" launch --host 0.0.0.0 --port "$port" \
+  cmd=$(printf '%q ' "$MESH_TARGET/release/atomesh" launch --host 0.0.0.0 --port "$port" \
     --prometheus-port "$MESH_METRICS_PORT" --model-path "$MODEL_PATH" "$@")
   in_role "$role" -d -e "RUST_LOG=mesh=info,mesh::core::placement::policy_apply=debug" -- \
     bash -c "$cmd > $RUN_DIR/$role.log 2>&1"
   log "waiting for $role (log $RUN_DIR/$role.log)"
-  wait_http "$role" "http://127.0.0.1:$port/readiness" 600 "$target/release/atomesh"
+  wait_http "$role" "http://127.0.0.1:$port/readiness" 600 "$MESH_TARGET/release/atomesh"
 }
 
 # start_client: the container the checks run in, with lmms-eval installed
