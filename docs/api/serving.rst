@@ -73,7 +73,8 @@ Configuration for text generation.
 * **stop_strings** (*list[str] | None*) - Strings that stop generation. Default: None
 
 .. note::
-   ``presence_penalty`` and ``frequency_penalty`` are not currently supported.
+   ``frequency_penalty`` is not currently supported. ``presence_penalty`` is
+   supported (vLLM semantics; not with pipeline parallelism, RapidServe or P/D).
    ``top_p`` and ``top_k`` are supported (``top_k=-1`` disables it;
    ``top_p=1.0`` disables it).
 

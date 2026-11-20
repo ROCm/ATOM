@@ -2252,10 +2252,14 @@ class Scheduler:
         quiet, which is indistinguishable from an idle engine.
         """
         result = self._schedule()
+        # Only a forwarded batch reaches `prepare_sample`, which releases the
+        # rows: `EngineCore` skips a batch without requests, which a pass that
+        # preempts every decode seq it pops returns. Keep the ids until then.
         if (
             result is not None
             and self._presence_preempted
             and not result[0].is_dummy_run
+            and len(result[0].req_ids) > 0
         ):
             result[0].presence_preempted = self._presence_preempted
             self._presence_preempted = []

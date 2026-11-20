@@ -358,3 +358,39 @@ def test_a_batch_without_a_penalty_pickles_no_presence_fields(seq_factory):
     assert [n for n in vars(penalized) if n.startswith("presence")] == [
         "presence_penalties"
     ]
+
+
+def test_ids_preempted_in_a_pass_that_forwards_nothing_wait_for_a_forward(
+    monkeypatch,
+):
+    """Under KV pressure a decode pass can preempt its only seq and return a
+    batch without requests, which `EngineCore` does not forward. The id must
+    stay for the next forwarded batch, whose `prepare_sample` releases it."""
+    from conftest import MockConfig
+
+    from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
+    from atom.model_engine.sequence import Sequence
+
+    sched = Scheduler(MockConfig(num_kvcache_blocks=64))
+    seq = Sequence(
+        [10, 11, 12, 13],
+        4,
+        SamplingParams(max_tokens=40, ignore_eos=True, presence_penalty=1.0),
+    )
+    sched.add(seq)
+    batch, active = sched.schedule()
+    out = ScheduledBatchOutput([seq.id], [(20,)], None, None, None, False)
+    sched.postprocess(list(active.values()), out, batch=batch)
+
+    monkeypatch.setattr(sched.block_manager, "can_append", lambda *args: False)
+    result = sched.schedule()
+    monkeypatch.undo()
+    assert seq.id in sched._presence_preempted
+    if result is not None:
+        assert not result[0].req_ids
+        assert not result[0].presence_preempted
+
+    batch, _ = sched.schedule()
+    assert list(batch.req_ids) == [seq.id]
+    assert batch.presence_preempted == [seq.id]
+    assert not sched._presence_preempted

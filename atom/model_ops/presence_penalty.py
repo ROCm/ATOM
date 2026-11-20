@@ -17,8 +17,10 @@ preempts it; a resumed request marks its earlier output again on the step that
 claims its new row.
 
 The table has a fixed size, allocated before the memory profile: two rows per
-`max_num_seqs`. A finished request keeps its row until its release, which
-comes one step after it leaves the batch.
+`max_num_seqs`. A finished or aborted request releases its row right after the
+step's postprocess, before the next forward. A preempted request releases it in
+the next forwarded batch, before that batch claims rows. So only running
+requests hold rows when a step claims; the second half is headroom.
 
 `ModelRunner.prepare_sample` stages each logits row's table row, penalty and
 draft count with the other sampling parameters (`stage`). `TokenConstraints`
