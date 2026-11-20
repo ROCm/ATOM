@@ -443,15 +443,22 @@ def build_packed_finish(
         and envs.ATOM_KIMI_MONO_HERD_OWN_LOCAL
     )
     poll_space = envs.ATOM_KIMI_MONO_HERD_POLL_SPACE
-    # Token k's routing CTA is CTA 8 (k % 32) + k // 32, on the first one or
-    # two XCDs (CTAs go round-robin over them), the others the shared down's
-    # in order: the routing CTAs start among the first dispatched, and up to
-    # 32 rows their own-candidates exchange stays in one XCD's L2 (SE scope).
-    route_xcd = routes_apart and envs.ATOM_KIMI_MONO_LITE_ROUTE_XCD
-    if route_xcd and rows > 2 * plan.blocks // gemv_tdm_gfx1250.XCDS:
-        raise ValueError(f"two XCDs' routing CTAs take at most 64 rows, got {rows}")
-    exchange_cm = (
-        SCOPE_SE if route_xcd and rows <= plan.blocks // gemv_tdm_gfx1250.XCDS else CM_DEV
+    # Up to an XCD's CTAs of rows, token k's routing CTA is CTA 8 k, on the
+    # first XCD (CTAs go round-robin over them), the others the shared down's
+    # in order: the routing CTAs start among the first dispatched, and their
+    # own-candidates exchange stays in that XCD's L2 (SE scope).
+    xcds = gemv_tdm_gfx1250.XCDS
+    route_xcd = (
+        routes_apart
+        and rows <= plan.blocks // xcds
+        and envs.ATOM_KIMI_MONO_LITE_ROUTE_XCD
+    )
+    exchange_cm = SCOPE_SE if route_xcd else CM_DEV
+    wide_stores = (
+        rolled
+        and include_shared
+        and not include_routed
+        and envs.ATOM_KIMI_MONO_LITE_SD_WIDE
     )
     name = (
         f"k3_k2_gfx1250_persistent_finish_s{rows}_b{plan.blocks}"
@@ -466,6 +473,7 @@ def build_packed_finish(
         f"{'_norsb' if rolled and not split_bound else ''}"
         f"{f'_hol{poll_space}' if own_local else ''}"
         f"{'_rx' if route_xcd else ''}"
+        f"{'_sw' if wide_stores else ''}"
         f"{f'_pl{herd_poll_limit}' if herd_poll_limit is not None else ''}"
         f"{'_profile' if profile else ''}"
         f"{tdm_timeline.suffix()}"
@@ -654,18 +662,10 @@ def build_packed_finish(
         route_token = bid if include_routed else bid - (plan.blocks - rows)
         shared_index = bid
         if const_expr(route_xcd):
-            xcds = gemv_tdm_gfx1250.XCDS
-            per_xcd = plan.blocks // xcds
-            first_rows, second_rows = min(rows, per_xcd), max(rows - per_xcd, 0)
-            xcd, slot = bid % xcds, bid // xcds
-            route_token = (xcd < 2).select(xcd * per_xcd + slot, fx.Int32(rows))
+            route_token = (bid % xcds == 0).select(bid // xcds, fx.Int32(rows))
             # the shared-down CTAs in order: a CTA's index, the routing CTAs
             # before it skipped
-            shared_index = (
-                bid
-                - fx.min((bid + xcds - 1) // xcds, fx.Int32(first_rows))
-                - fx.min((bid + xcds - 2) // xcds, fx.Int32(second_rows))
-            )
+            shared_index = bid - fx.min((bid + xcds - 1) // xcds, fx.Int32(rows))
         launch_word = herd_at["launch"][0] // 4
         candidates = scratch + fx.Int64(herd_at["candidates"][0])
         launch = fx.Int32(
@@ -950,6 +950,7 @@ def build_packed_finish(
                         "tail": {"gemv_accumulator": shared_down.accumulator.ptr},
                         "shared_partial": shared_partial,
                         "store_cm": _out_cm(fused),
+                        "wide_stores": wide_stores,
                     },
                     tasks,
                     operands,

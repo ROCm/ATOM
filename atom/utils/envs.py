@@ -887,13 +887,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KIMI_MONO_HERD_POLL_SPACE": lambda: int(
         os.getenv("ATOM_KIMI_MONO_HERD_POLL_SPACE", "1")
     ),
-    # 1: the gfx1250 lite finish's routing CTAs (routing apart from the shared
-    # down) are token k's CTA 8 (k % 32) + k // 32 -- the first one or two
-    # XCDs', among the first dispatched -- and up to 32 rows the parallel-HERD
-    # own-candidates exchange (ATOM_KIMI_MONO_HERD_OWN_LOCAL=1) stays in that
-    # XCD's L2 (the same bits); 0, the default, keeps them the last CTAs.
+    # 1: up to 32 rows the gfx1250 lite finish's routing CTAs (routing apart
+    # from the shared down) are token k's CTA 8 k -- the first XCD's, among
+    # the first dispatched -- and the parallel-HERD own-candidates exchange
+    # (ATOM_KIMI_MONO_HERD_OWN_LOCAL=1) stays in that XCD's L2 (the same
+    # bits); 0, the default, keeps them the last CTAs.
     "ATOM_KIMI_MONO_LITE_ROUTE_XCD": lambda: (
         os.getenv("ATOM_KIMI_MONO_LITE_ROUTE_XCD", "0") == "1"
+    ),
+    # 1: the gfx1250 lite finish's shared down sums and stores eight outputs
+    # (16 B) a thread, not two (the same bits); 0, the default, keeps pairs.
+    "ATOM_KIMI_MONO_LITE_SD_WIDE": lambda: (
+        os.getenv("ATOM_KIMI_MONO_LITE_SD_WIDE", "0") == "1"
     ),
     # Kimi-K3 gfx1250 mono: the o_proj all-reduce in one fabric hop, every
     # rank's partials pushed to every rank and summed there in rank order (the

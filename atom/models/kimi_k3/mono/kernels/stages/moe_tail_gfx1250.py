@@ -135,11 +135,13 @@ def sdown_tasks(c, tasks, operands, waves, rows, rolled=False):
     holds, over all ``c["S"]`` rows staged at ``rows``: every WMMA tile first,
     then one cross-wave reduction, so the tiles share two barriers. Tasks past
     the last are skipped. ``rolled`` takes the token tiles and the reduction
-    as runtime loops."""
+    as runtime loops; with ``c["wide_stores"]`` (rolled) a thread sums and
+    stores eight outputs (16 B) of a token, not two."""
 
     tokens, tid, threads = c["S"], c["tid"], c["threads"]
     # read here: a method called in a branch makes ``c`` its traced state
     store_cm = c.get("store_cm", 0)
+    wide = rolled and c.get("wide_stores", False)
     tiles = (tokens + GEMV_ROWS - 1) // GEMV_ROWS
     accumulators = c["tail"]["gemv_accumulator"]
     rolled_tiles = rolled and tiles > 1
@@ -186,7 +188,40 @@ def sdown_tasks(c, tasks, operands, waves, rows, rolled=False):
     tdm_timeline.stamp(tdm_timeline.LITE_SD_MULTIPLIED)
     total = tokens * (GEMV_ROWS // 2)
     rounds = (total + threads - 1) // threads
-    if const_expr(rolled):
+    runs = GEMV_ROWS // 8
+    wide_total = tokens * runs
+    wide_rounds = (wide_total + threads - 1) // threads
+    if const_expr(wide):
+        # A token's run of eight outputs a thread, every task's as one loop.
+        for job in range(fx.Int32(0), fx.Int32(len(tasks) * wide_rounds), unroll=1):
+            job_index = job // wide_rounds
+            job_task = tasks[0]
+            for other in range_constexpr(1, len(tasks)):
+                job_task = (job_index == other).select(tasks[other], job_task)
+            job_work = tid + threads * (job % wide_rounds)
+            if (job_task < HIDDEN // GEMV_ROWS) & (job_work < wide_total):
+                job_token = job_work // runs
+                job_run = job_work % runs
+                job_slot = accumulators + (
+                    job_index * tiles + job_token // GEMV_ROWS
+                ) * _slot_words(waves)
+                job_sums = [
+                    bf16_round(
+                        gemv_device.row_sum(
+                            job_slot, 8 * job_run + row, job_token % GEMV_ROWS, waves
+                        )
+                    )
+                    for row in range_constexpr(8)
+                ]
+                bo.buffer_store(
+                    fx.Vector.from_elements(job_sums, fx.Float32)
+                    .to(fx.BFloat16)
+                    .bitcast(fx.Int32),
+                    rsrc(c["shared_partial"]),
+                    (job_token * HIDDEN + job_task * GEMV_ROWS + 8 * job_run) // 2,
+                    cache_modifier=store_cm,
+                )
+    elif const_expr(rolled):
         # Every task's rounds as one runtime loop: one body of the reduction.
         for job in range(fx.Int32(0), fx.Int32(len(tasks) * rounds), unroll=1):
             job_index = job // rounds
