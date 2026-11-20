@@ -1440,7 +1440,7 @@ def test_a_landed_state_slot_is_scattered_before_the_request_is_done(monkeypatch
         _scatter_slot=lambda *args: order.append(("scatter", *args)),
         _mla_landing=None,
         _cuda_device=3,
-        _recv_scatter_streams=threading.local(),
+        _thread_streams=threading.local(),
     )
     release = conn._staging_slots.release
     conn._staging_slots.release = lambda idx: (
@@ -1495,7 +1495,7 @@ def test_a_raised_scatter_returns_its_staging_row(monkeypatch, raiser):
         _scatter_slot=_boom,
         _mla_landing=None,
         _cuda_device=3,
-        _recv_scatter_streams=threading.local(),
+        _thread_streams=threading.local(),
     )
     release = conn._staging_slots.release
     conn._staging_slots.release = lambda idx: (
@@ -2403,7 +2403,7 @@ def test_dcp_index_staging_waits_for_request_ready_event(monkeypatch):
     )
     connector._gather_sharded_index = MagicMock()
     staging_stream = MagicMock()
-    connector._send_worker_stream = MagicMock(return_value=staging_stream)
+    connector._thread_stream = MagicMock(return_value=staging_stream)
     connector._execute_staged_index_layer_chunk = MagicMock(return_value=True)
     connector._rdma_write = MagicMock(return_value=True)
     ready_event = object()
@@ -2467,7 +2467,7 @@ def test_dcp_index_staging_rejects_missing_request_ready_event():
     connector._index_staging_chunk_pages = 256
     connector._prepare_sharded_index = MagicMock(return_value=object())
     connector._gather_sharded_index = MagicMock()
-    connector._send_worker_stream = MagicMock()
+    connector._thread_stream = MagicMock()
     connector._rdma_write = MagicMock(return_value=True)
     request_data = {
         "consumer_base_addrs": [3_000_000, 4_000_000],
@@ -2929,7 +2929,7 @@ def test_staged_index_write_preserves_selected_engine(monkeypatch):
     conn._index_staging_slots = MagicMock()
     conn._index_staging_slots.acquire.return_value = 3
     staging_stream = SimpleNamespace(synchronize=MagicMock())
-    conn._send_worker_stream = lambda: staging_stream
+    conn._thread_stream = lambda: staging_stream
     conn._gather_sharded_index = lambda *_args: (10000, 2)
     conn._rdma_write = MagicMock(return_value=True)
     monkeypatch.setattr(mc.torch.cuda, "stream", lambda _: nullcontext())

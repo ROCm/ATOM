@@ -843,7 +843,7 @@ def _producer(mc, regions, *, staging_rows=None):
         )
         conn._kv_staging_slots = mc.SlotPool(2)
         conn._stream = _Stream()
-        conn._send_worker_stream = lambda: conn._stream
+        conn._thread_stream = lambda: conn._stream
         conn._kv_source_views = {
             i: t.view(-1, TOKEN_BYTES) for i, t in enumerate(regions)
         }
