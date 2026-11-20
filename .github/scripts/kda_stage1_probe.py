@@ -9,6 +9,8 @@ import json
 import math
 import os
 import re
+import stat
+import time
 from pathlib import Path
 
 BASE = "fb1304722a9f79cd16e7383b8b504ccb29851d77"
@@ -23,6 +25,17 @@ REVISIONS = {
     TARGET: "d9e99b0792a5e93b78ea9bea62a68167e36ddd9e",
     DRAFT: "187f8f6f792d931af93f96c8d2271a084e00280d",
 }
+DRAFT_ALIASES = (DRAFT, "/models/Inferact/Kimi-K3.1-Pro-DSpark-preview")
+# Frozen 6a/187 manifests differ only in README, not runtime components.
+DRAFT_ORIGINS = (REVISIONS[DRAFT], "6a2ef20a05efe88aabbf9ecaa12d020c3b0edf94")
+DRAFT_COMPONENTS = {
+    "config.json": (1756, "a58816bae48c8a85f5fcb521a819f6970552638d"),
+    "model.safetensors": (
+        5373511978,
+        "610afd80871fbba917c7f3ae08a097721f42787ac931c24269b8497fcfc6b5c0",
+    ),
+}
+DRAFT_HASH_SECONDS = 90
 ARGS = {
     "model": TARGET,
     "draft_model": DRAFT,
@@ -167,9 +180,157 @@ if os.environ.get("STAGE1_EVENTS"):
     install_observers()
 
 
-def check_models():
+def _stamp(value):
+    return {
+        key: getattr(value, "st_" + key)
+        for key in ("dev", "ino", "mode", "size", "mtime_ns", "ctime_ns")
+    }
+
+
+def _identity(path):
+    return {"resolved": str(path.resolve(strict=True)), "stat": _stamp(path.stat())}
+
+
+def _opened_stat(stream, expected):
+    opened = _stamp(os.fstat(stream.fileno()))
+    # Windows path/descriptor ctime semantics differ; each is checked before/after.
+    if any(opened[k] != v for k, v in expected.items() if k != "ctime_ns"):
+        raise RuntimeError("draft file changed before opening")
+    return opened
+
+
+def _small_provenance(path):
+    before = _identity(path)
+    if not stat.S_ISREG(before["stat"]["mode"]) or before["stat"]["size"] > 4096:
+        raise RuntimeError(f"invalid draft provenance file: {path}")
+    with path.open("rb") as stream:
+        opened = _opened_stat(stream, before["stat"])
+        data = stream.read(4097)
+        stable = _stamp(os.fstat(stream.fileno())) == opened
+    if not stable or len(data) > 4096 or _identity(path) != before:
+        raise RuntimeError(f"draft provenance changed while reading: {path}")
+    return {"raw": data.decode("utf-8"), "identity": before}
+
+
+def _draft_snapshot():
+    alias = next(
+        (Path(p) for p in DRAFT_ALIASES if Path(p).exists() or Path(p).is_symlink()),
+        None,
+    )
+    if alias is None:
+        raise RuntimeError("no known draft cache path exists")
+    root = alias.resolve(strict=True)
+    if not root.is_dir():
+        raise RuntimeError("draft cache path is not a directory")
+    allowed = set(DRAFT_COMPONENTS) | {
+        ".cache",
+        ".hf-revision",
+        ".atom_download_complete",
+        ".download-complete",
+        ".gitattributes",
+        "LICENSE",
+        "README.md",
+    }
+    if any(p.name not in allowed for p in root.iterdir()):
+        raise RuntimeError("unexpected file in draft cache")
+    files = {name: _identity(root / name) for name in DRAFT_COMPONENTS}
+    for name, (size, _digest) in DRAFT_COMPONENTS.items():
+        value = files[name]["stat"]
+        if not stat.S_ISREG(value["mode"]) or value["size"] != size:
+            raise RuntimeError(f"wrong draft component type or size: {name}")
+    provenance = {}
+    for name in (".hf-revision", ".atom_download_complete", ".download-complete"):
+        path = root / name
+        if path.exists() or path.is_symlink():
+            provenance[name] = _small_provenance(path)
+    marker = provenance.get(".hf-revision")
+    if marker is not None and (
+        marker["raw"].strip() != REVISIONS[DRAFT]
+        or not any(
+            name in provenance
+            for name in (".atom_download_complete", ".download-complete")
+        )
+    ):
+        raise RuntimeError("wrong cached draft revision or incomplete marker route")
+    origins = {}
+    for name, (_size, digest) in DRAFT_COMPONENTS.items():
+        path = root / ".cache/huggingface/download" / (name + ".metadata")
+        if marker is not None and not path.exists() and not path.is_symlink():
+            continue
+        record = _small_provenance(path)
+        parts = record["raw"].splitlines()
+        if len(parts) != 3 or parts[0] not in DRAFT_ORIGINS or parts[1] != digest:
+            raise RuntimeError(f"wrong draft download provenance: {name}")
+        timestamp = float(parts[2])
+        if (
+            not math.isfinite(timestamp)
+            or files[name]["stat"]["mtime_ns"] / 1e9 > timestamp + 1
+        ):
+            raise RuntimeError(f"stale draft download provenance: {name}")
+        provenance[name + ".metadata"] = record
+        origins[name] = parts[0]
+    return {
+        "alias": str(alias),
+        "resolved_path": str(root),
+        "alias_stat": _stamp(alias.lstat()),
+        "root": _identity(root),
+        "expected_revision": REVISIONS[DRAFT],
+        "route": "pinned-marker" if marker is not None else "hf-runtime-components",
+        "origin_revisions": origins,
+        "provenance": provenance,
+        "files": files,
+    }
+
+
+def check_draft_cache(previous=None):
+    deadline = time.monotonic() + DRAFT_HASH_SECONDS
+    snapshot = _draft_snapshot()
+    if time.monotonic() >= deadline:
+        raise RuntimeError("draft content proof exceeded preflight time limit")
+    expected = {name: digest for name, (_size, digest) in DRAFT_COMPONENTS.items()}
+    if previous is not None:
+        if previous != dict(snapshot, digests=expected):
+            raise RuntimeError("draft cache identity changed after preflight")
+        return previous
+    digests = {}
+    for name, (size, digest) in DRAFT_COMPONENTS.items():
+        path = Path(snapshot["resolved_path"]) / name
+        hasher = hashlib.sha1() if name == "config.json" else hashlib.sha256()
+        if name == "config.json":
+            hasher.update(f"blob {size}\0".encode())
+        count = 0
+        with path.open("rb") as stream:
+            opened = _opened_stat(stream, snapshot["files"][name]["stat"])
+            while True:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        "draft content proof exceeded preflight time limit"
+                    )
+                chunk = stream.read(8 * 1024 * 1024)
+                if not chunk:
+                    break
+                count += len(chunk)
+                if count > size:
+                    raise RuntimeError("draft component grew while hashing")
+                hasher.update(chunk)
+            if _stamp(os.fstat(stream.fileno())) != opened:
+                raise RuntimeError("draft component changed while hashing")
+        if count != size or hasher.hexdigest() != digest:
+            raise RuntimeError(f"wrong draft content hash: {name}")
+        digests[name] = hasher.hexdigest()
+    if _draft_snapshot() != snapshot:
+        raise RuntimeError("draft cache changed during content proof")
+    if time.monotonic() >= deadline:
+        raise RuntimeError("draft content proof exceeded preflight time limit")
+    return dict(snapshot, digests=digests)
+
+
+def check_models(draft_proof=None):
     fingerprints = {}
     for folder, revision in REVISIONS.items():
+        if folder == DRAFT:
+            fingerprints[folder] = check_draft_cache(draft_proof)
+            continue
         root = Path(folder)
         if (root / ".hf-revision").read_text().strip() != revision:
             raise RuntimeError(f"missing or wrong cached revision: {folder}")
@@ -363,6 +524,14 @@ def check_capture(result):
         or result["source"] != {"baseline": BASE, "candidate": CANDIDATE}[arm]
     ):
         raise CoverageError("incomplete or wrong-source capture")
+    draft = result.get("draft_cache", {})
+    if (
+        draft.get("expected_revision") != REVISIONS[DRAFT]
+        or draft.get("alias") not in DRAFT_ALIASES
+        or draft.get("digests") != {n: h for n, (_size, h) in DRAFT_COMPONENTS.items()}
+        or result["args"] != dict(ARGS, draft_model=draft.get("resolved_path"))
+    ):
+        raise CoverageError("capture has an unbound draft identity")
     if [stage["phase"] for stage in result["stages"]] != list(PHASES):
         raise CoverageError("missing, duplicate or reordered probe requests")
     for stage in result["stages"]:
@@ -385,7 +554,24 @@ def make_sampling_params(params_type):
     )
 
 
+def capture_inputs(inputs):
+    data = json.loads(Path(inputs).read_text())
+    if not isinstance(data["model_files"].get(DRAFT), dict):
+        raise TypeError("missing preflight draft proof")
+    if data["revisions"] != REVISIONS or data["model_files"] != check_models(
+        data["model_files"][DRAFT]
+    ):
+        raise RuntimeError("model cache changed after preflight")
+    if (
+        len(data["tokens"]) != PROMPT_TOKENS
+        or token_hash(data["tokens"]) != data["sha256"]
+    ):
+        raise CoverageError("invalid prompt manifest")
+    return data, dict(ARGS, draft_model=data["model_files"][DRAFT]["resolved_path"])
+
+
 def capture(arm, inputs, output):
+    data, args = capture_inputs(inputs)
     import aiter
     import torch
     import triton
@@ -399,21 +585,14 @@ def capture(arm, inputs, output):
             raise RuntimeError(f"runtime setting differs: {key}")
     if "gd17ee8dfe" not in importlib.metadata.version("amd-aiter"):
         raise RuntimeError("wrong AITER wheel")
-    data = json.loads(Path(inputs).read_text())
-    if data["revisions"] != REVISIONS or data["model_files"] != check_models():
-        raise RuntimeError("model cache changed after preflight")
-    if (
-        len(data["tokens"]) != PROMPT_TOKENS
-        or token_hash(data["tokens"]) != data["sha256"]
-    ):
-        raise CoverageError("invalid prompt manifest")
     root = Path(os.environ["STAGE1_EVENTS"])
     result = {
         "arm": arm,
         "source": BASE if arm == "baseline" else CANDIDATE,
         "atom_tree": TREES[arm],
         "actual_atom_path": atom.__file__,
-        "args": ARGS,
+        "args": args,
+        "draft_cache": data["model_files"][DRAFT],
         "env": ENV,
         "inputs_sha256": hashlib.sha256(Path(inputs).read_bytes()).hexdigest(),
         "runtime": {
@@ -429,7 +608,7 @@ def capture(arm, inputs, output):
     save(output, result)
     engine = None
     try:
-        engine = EngineArgs(**ARGS).create_engine()
+        engine = EngineArgs(**args).create_engine()
         resolved = {
             key: getattr(engine.config, key)
             for key in (
@@ -449,7 +628,7 @@ def capture(arm, inputs, output):
         resolved["cudagraph_mode"] = (
             engine.config.compilation_config.cudagraph_mode.name
         )
-        if resolved != {key: ARGS[key] for key in resolved}:
+        if resolved != {key: args[key] for key in resolved}:
             raise RuntimeError(
                 "resolved engine configuration differs from the probe contract"
             )
@@ -504,7 +683,7 @@ def capture(arm, inputs, output):
         engine.close()
         engine = None
         result["complete"] = True
-        if data["model_files"] != check_models():
+        if data["model_files"] != check_models(data["model_files"][DRAFT]):
             raise RuntimeError("model cache changed during capture")
         result["within_arm"] = compare(result)
         save(output, result)
@@ -522,7 +701,14 @@ def compare(base, candidate=None):
     if candidate is not None:
         if (base["arm"], candidate["arm"]) != ("baseline", "candidate"):
             raise CoverageError("wrong capture arm")
-        for key in ("args", "env", "inputs_sha256", "runtime", "resolved"):
+        for key in (
+            "args",
+            "draft_cache",
+            "env",
+            "inputs_sha256",
+            "runtime",
+            "resolved",
+        ):
             if base[key] != candidate[key]:
                 raise CoverageError(f"unmatched pair: {key}")
         pairs.extend(

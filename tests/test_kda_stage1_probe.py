@@ -1,9 +1,16 @@
 """Behavior checks for the isolated #3501 diagnostic, without ATOM or a GPU."""
 
+import builtins
 import copy
+import hashlib
 import importlib.util
+import json
 import math
+import os
 import runpy
+import sys
+import time
+import types
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -68,7 +75,13 @@ def capture(arm):
         "arm": arm,
         "atom_tree": probe.TREES[arm],
         "source": probe.BASE if arm == "baseline" else probe.CANDIDATE,
-        "args": probe.ARGS,
+        "args": dict(probe.ARGS),
+        "draft_cache": {
+            "alias": probe.DRAFT,
+            "resolved_path": probe.DRAFT,
+            "expected_revision": probe.REVISIONS[probe.DRAFT],
+            "digests": {n: h for n, (_size, h) in probe.DRAFT_COMPONENTS.items()},
+        },
         "env": probe.ENV,
         "runtime": {"torch": "same"},
         "resolved": {"tensor_parallel_size": 8},
@@ -116,6 +129,22 @@ class ProbeChecks(unittest.TestCase):
             ),
             (0, probe.OUTPUT_TOKENS, True, True, 20),
         )
+
+    def test_draft_identity_and_effective_path_must_match_between_arms(self):
+        for mutate in (
+            lambda d: d["draft_cache"].update(expected_revision="wrong"),
+            lambda d: d["draft_cache"].update(alias="/unlisted"),
+            lambda d: d["draft_cache"]["digests"].update(
+                {"model.safetensors": "wrong"}
+            ),
+            lambda d: d["args"].update(draft_model="/unvalidated"),
+            lambda d: d["draft_cache"].update(provenance="different"),
+        ):
+            with self.subTest(mutate=mutate):
+                base, candidate = capture("baseline"), capture("candidate")
+                mutate(candidate)
+                with self.assertRaises(probe.CoverageError):
+                    probe.compare(base, candidate)
 
     def test_native_logprob_record_is_complete_and_finite(self):
         row = token(token_id=0)
@@ -238,6 +267,300 @@ class ProbeChecks(unittest.TestCase):
                 probe.require_stable_baseline("baseline", {"status": status})
         probe.require_stable_baseline("baseline", {"status": "pass"})
         probe.require_stable_baseline("candidate", {"status": "fail"})
+
+
+class DraftCacheChecks(unittest.TestCase):
+    def setUp(self):
+        temp = TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name).resolve()
+        self.legacy, self.canonical = self.root / "legacy", self.root / "canonical"
+        self.config, self.weight = b'{"draft":true}\n', b"verified draft weight"
+        self.components = {
+            "config.json": (
+                len(self.config),
+                hashlib.sha1(
+                    f"blob {len(self.config)}\0".encode() + self.config
+                ).hexdigest(),
+            ),
+            "model.safetensors": (
+                len(self.weight),
+                hashlib.sha256(self.weight).hexdigest(),
+            ),
+        }
+        for change in (
+            patch.object(
+                probe, "DRAFT_ALIASES", (str(self.legacy), str(self.canonical))
+            ),
+            patch.dict(probe.DRAFT_COMPONENTS, self.components, clear=True),
+            patch.dict(
+                probe.REVISIONS, {probe.DRAFT: probe.REVISIONS[probe.DRAFT]}, clear=True
+            ),
+        ):
+            change.start()
+            self.addCleanup(change.stop)
+
+    def cache(
+        self,
+        root=None,
+        origin=None,
+        marker=False,
+        metadata=True,
+        config=None,
+        weight=None,
+    ):
+        root = root or self.canonical
+        root.mkdir(exist_ok=True)
+        (root / "config.json").write_bytes(self.config if config is None else config)
+        (root / "model.safetensors").write_bytes(
+            self.weight if weight is None else weight
+        )
+        if metadata:
+            folder = root / ".cache/huggingface/download"
+            folder.mkdir(parents=True, exist_ok=True)
+            for name, (_size, digest) in self.components.items():
+                (folder / (name + ".metadata")).write_text(
+                    f"{origin or probe.REVISIONS[probe.DRAFT]}\n{digest}\n{time.time()}\n"
+                )
+        if marker:
+            (root / ".hf-revision").write_text(probe.REVISIONS[probe.DRAFT])
+            (root / ".atom_download_complete").write_text("existing marker\n")
+        return root
+
+    def manifest(self, proof):
+        tokens = list(range(probe.PROMPT_TOKENS))
+        data = {
+            "revisions": dict(probe.REVISIONS),
+            "model_files": {probe.DRAFT: proof},
+            "tokens": tokens,
+            "sha256": probe.token_hash(tokens),
+        }
+        path = self.root / "inputs.json"
+        path.write_text(json.dumps(data))
+        return path
+
+    def test_standard_paths_preserve_origin_and_do_not_write_markers(self):
+        for root, origin in (
+            (self.canonical, probe.DRAFT_ORIGINS[0]),
+            (self.canonical, probe.DRAFT_ORIGINS[1]),
+            (self.legacy, probe.DRAFT_ORIGINS[0]),
+        ):
+            with self.subTest(root=root, origin=origin):
+                self.cache(root, origin=origin)
+                before = {
+                    str(p): p.read_bytes() for p in root.rglob("*") if p.is_file()
+                }
+                proof = probe.check_draft_cache()
+                self.assertEqual(proof["alias"], str(root))
+                self.assertEqual(proof["resolved_path"], str(root.resolve()))
+                self.assertEqual(
+                    proof["expected_revision"], probe.REVISIONS[probe.DRAFT]
+                )
+                self.assertEqual(set(proof["origin_revisions"].values()), {origin})
+                self.assertEqual(proof["route"], "hf-runtime-components")
+                self.assertEqual(
+                    proof["digests"], {n: h for n, (_s, h) in self.components.items()}
+                )
+                self.assertEqual(probe.check_draft_cache(proof), proof)
+                self.assertEqual(
+                    before,
+                    {str(p): p.read_bytes() for p in root.rglob("*") if p.is_file()},
+                )
+                self.assertFalse((root / ".hf-revision").exists())
+
+    def test_marker_route_is_audited_and_cannot_bless_wrong_bytes(self):
+        self.cache(marker=True, metadata=False)
+        proof = probe.check_draft_cache()
+        self.assertEqual(proof["route"], "pinned-marker")
+        self.assertEqual(
+            proof["provenance"][".hf-revision"]["raw"], probe.REVISIONS[probe.DRAFT]
+        )
+        (self.canonical / "model.safetensors").write_bytes(b"x" * len(self.weight))
+        with self.assertRaisesRegex(RuntimeError, "content hash"):
+            probe.check_draft_cache()
+
+    def test_same_sized_wrong_config_or_weight_refuses(self):
+        for changes in (
+            {"config": b"x" * len(self.config)},
+            {"weight": b"x" * len(self.weight)},
+        ):
+            with self.subTest(changes=changes):
+                self.cache(**changes)
+                with self.assertRaisesRegex(RuntimeError, "content hash"):
+                    probe.check_draft_cache()
+
+    def test_wrong_size_missing_and_extra_payload_refuse(self):
+        self.cache(weight=b"short")
+        with self.assertRaisesRegex(RuntimeError, "size"):
+            probe.check_draft_cache()
+        (self.canonical / "model.safetensors").unlink()
+        with self.assertRaises(FileNotFoundError):
+            probe.check_draft_cache()
+        for name in ("other.safetensors", "model.safetensors.index.json", "config.py"):
+            self.cache()
+            extra = self.canonical / name
+            extra.write_text("unexpected")
+            with self.assertRaisesRegex(RuntimeError, "unexpected file"):
+                probe.check_draft_cache()
+            extra.unlink()
+
+    def test_wrong_revision_and_download_provenance_refuse(self):
+        self.cache(origin="f" * 40)
+        with self.assertRaisesRegex(RuntimeError, "download provenance"):
+            probe.check_draft_cache()
+        self.cache(marker=True)
+        (self.canonical / ".hf-revision").write_text(probe.DRAFT_ORIGINS[1])
+        with self.assertRaisesRegex(RuntimeError, "cached draft revision"):
+            probe.check_draft_cache()
+
+    def test_malformed_stale_and_wrong_etag_metadata_refuse(self):
+        self.cache()
+        path = self.canonical / ".cache/huggingface/download/model.safetensors.metadata"
+        original = path.read_text().splitlines()
+        for text in (
+            "missing fields\n",
+            "x" * 4097,
+            "\n".join([original[0], "wrong", original[2]]),
+            "\n".join([original[0], original[1], "0"]),
+            "\n".join([original[0], original[1], "nan"]),
+        ):
+            with self.subTest(text=text[:30]):
+                path.write_text(text)
+                with self.assertRaises(RuntimeError):
+                    probe.check_draft_cache()
+
+    def test_invalid_preferred_alias_does_not_fall_through(self):
+        self.cache()
+        self.cache(self.legacy, weight=b"x" * len(self.weight))
+        with self.assertRaisesRegex(RuntimeError, "content hash"):
+            probe.check_draft_cache()
+
+    def test_replacement_with_preserved_mtime_invalidates_preflight(self):
+        self.cache()
+        proof = probe.check_draft_cache()
+        weight = self.canonical / "model.safetensors"
+        stamp = weight.stat()
+        replacement = self.root / "replacement"
+        replacement.write_bytes(b"x" * len(self.weight))
+        os.utime(replacement, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+        os.replace(replacement, weight)
+        with self.assertRaisesRegex(RuntimeError, "identity changed"):
+            probe.check_draft_cache(proof)
+
+    def test_file_identity_change_during_hash_refuses(self):
+        self.cache()
+        weight = self.canonical / "model.safetensors"
+        make_digest = hashlib.sha256
+
+        class MutatingDigest:
+            def __init__(self):
+                self.inner = make_digest()
+
+            def update(self, chunk):
+                self.inner.update(chunk)
+                stamp = weight.stat()
+                os.utime(
+                    weight, ns=(stamp.st_atime_ns, stamp.st_mtime_ns + 2_000_000_000)
+                )
+
+            def hexdigest(self):
+                return self.inner.hexdigest()
+
+        with (
+            patch.object(probe.hashlib, "sha256", MutatingDigest),
+            self.assertRaisesRegex(RuntimeError, "changed while hashing"),
+        ):
+            probe.check_draft_cache()
+
+    def test_preflight_hash_time_is_bounded(self):
+        self.cache()
+        with (
+            patch.object(probe.time, "monotonic", side_effect=[0, 91]),
+            self.assertRaisesRegex(RuntimeError, "preflight time limit"),
+        ):
+            probe.check_draft_cache()
+
+    def test_capture_uses_the_validated_path_and_refuses_before_importing_model(self):
+        self.cache(origin=probe.DRAFT_ORIGINS[1])
+        proof = probe.check_draft_cache()
+        path = self.manifest(proof)
+        data, args = probe.capture_inputs(path)
+        self.assertEqual(
+            args, dict(probe.ARGS, draft_model=str(self.canonical.resolve()))
+        )
+        self.assertEqual(data["model_files"][probe.DRAFT], proof)
+        import_module = builtins.__import__
+
+        def refuse_model_import(name, *args, **kwargs):
+            if name in {"aiter", "torch", "triton", "atom"}:
+                self.fail("model import reached before draft proof refusal")
+            return import_module(name, *args, **kwargs)
+
+        for field in ("alias", "resolved_path", "digests"):
+            forged = copy.deepcopy(proof)
+            forged[field] = "/unvalidated" if field != "digests" else {}
+            path = self.manifest(forged)
+            with self.subTest(field=field):
+                with (
+                    patch.object(builtins, "__import__", refuse_model_import),
+                    self.assertRaisesRegex(RuntimeError, "identity changed"),
+                ):
+                    probe.capture("baseline", path, self.root / "never.json")
+                self.assertFalse((self.root / "never.json").exists())
+        self.manifest(proof)
+        self.cache(self.legacy)
+        with self.assertRaisesRegex(RuntimeError, "identity changed"):
+            probe.capture_inputs(path)
+
+    def test_capture_passes_only_validated_args_to_engine_admission(self):
+        self.cache()
+        proof = probe.check_draft_cache()
+        path = self.manifest(proof)
+        modules = {
+            name: types.ModuleType(name)
+            for name in (
+                "aiter",
+                "torch",
+                "triton",
+                "atom",
+                "atom.model_engine",
+                "atom.model_engine.arg_utils",
+            )
+        }
+        modules["aiter"].__file__ = "cpu-boundary/aiter"
+        modules["torch"].__version__ = "cpu-boundary"
+        modules["torch"].version = types.SimpleNamespace(hip=None)
+        modules["triton"].__version__ = "cpu-boundary"
+        modules["atom"].__file__ = "cpu-boundary/atom"
+        modules["atom"].SamplingParams = object
+
+        class AdmissionReached(Exception):
+            pass
+
+        class EngineArgs:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            def create_engine(self):
+                raise AdmissionReached(self.kwargs)
+
+        modules["atom.model_engine.arg_utils"].EngineArgs = EngineArgs
+        with (
+            patch.dict(sys.modules, modules),
+            patch.dict(os.environ, dict(probe.ENV, STAGE1_EVENTS=str(self.root))),
+            patch.object(
+                probe.importlib.metadata, "version", return_value="0.1.1+gd17ee8dfe"
+            ),
+            self.assertRaises(AdmissionReached) as reached,
+        ):
+            probe.capture("baseline", path, self.root / "capture.json")
+        self.assertEqual(
+            reached.exception.args[0],
+            dict(probe.ARGS, draft_model=str(self.canonical.resolve())),
+        )
+        recorded = json.loads((self.root / "capture.json").read_text())
+        self.assertEqual(recorded["draft_cache"], proof)
+        self.assertFalse(recorded["complete"])
 
 
 if __name__ == "__main__":
