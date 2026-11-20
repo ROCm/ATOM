@@ -679,21 +679,23 @@ class _SequenceParallel:
 
     Both collectives use the group's custom path when
     `ATOM_USE_CUSTOM_ALL_GATHER` is enabled and its custom communicator is
-    available; otherwise they use the group's NCCL path. A reduce-scatter
-    above aiter's size cutoff falls back to NCCL inside the group.
+    available and aiter's per-tensor eligibility query accepts the input.
+    The queries see contiguous tensors, including the padded rows for
+    reduce-scatter. Ineligible tensors use the group's direct NCCL path.
     """
 
     def __init__(self, num_tokens: int, tp_size: int, tp_rank: int) -> None:
         self.num_tokens = num_tokens
-        self.tp_size = tp_size
         self.chunk = -(-num_tokens // tp_size)
         self.pad = self.chunk * tp_size - num_tokens
         self.start = tp_rank * self.chunk
         self.group = get_tp_group()
         dc = self.group.device_communicator
-        ca = dc.ca_comm if dc is not None else None
+        self.ca = dc.ca_comm if dc is not None else None
         self.use_custom = (
-            envs.ATOM_USE_CUSTOM_ALL_GATHER and ca is not None and not ca.disabled
+            envs.ATOM_USE_CUSTOM_ALL_GATHER
+            and self.ca is not None
+            and not self.ca.disabled
         )
 
     def shard(self, x: torch.Tensor) -> torch.Tensor:
@@ -705,13 +707,18 @@ class _SequenceParallel:
 
     def gather(self, x: torch.Tensor) -> torch.Tensor:
         """This rank's rows -> all `[T, ...]` rows."""
-        out = self.group.all_gather(x.contiguous(), use_custom=self.use_custom, dim=0)
+        x = x.contiguous()
+        out = self.group.all_gather(
+            x, use_custom=self.use_custom and self.ca.should_custom_ag(x), dim=0
+        )
         return out[: self.num_tokens] if self.pad else out
 
     def scatter(self, x: torch.Tensor) -> torch.Tensor:
         """Per-rank partial sums over all `[T, ...]` rows -> summed local rows."""
         x = _pad_rows(x.contiguous(), self.pad)
-        return self.group.reduce_scatter_tensor(x, use_custom=self.use_custom, dim=0)
+        return self.group.reduce_scatter_tensor(
+            x, use_custom=self.use_custom and self.ca.should_custom_rs(x, 0), dim=0
+        )
 
     @classmethod
     def maybe(cls, num_tokens: int) -> "_SequenceParallel | None":
