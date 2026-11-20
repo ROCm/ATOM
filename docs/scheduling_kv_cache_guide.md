@@ -80,8 +80,9 @@ delayer whether this tick allows prefill. It then selects work in three phases:
    decode from `running` within the remaining token and request budgets. `can_append`
    checks extension capacity; pressure can preempt a running request back to
    `waiting`. `may_append` reserves the selected tokens, including speculative
-   tokens when enabled. Partial prefills skipped by the delayer return to the
-   tail of `running`.
+   tokens when enabled. With mixed disabled, partial prefills skipped by the
+   delayer return to the tail of `running`; mixed scheduling preserves their
+   previous positions, including on ticks with no admitted prefill.
 
 By default, prefill batches return without decode mixing. With
 `--enable-mixed-prefill-decode`, admitted decode rows follow the prefill rows in
@@ -834,7 +835,9 @@ The feature requires chunked prefill and supports DSpark.
 Other attention families, chunked prefill off, M-RoPE, TBO (including decode
 TBO), PCP, DCP, EPLB, TR_HYBRID graph modes, speculative methods other than
 DSpark, and speculative decoding with pipeline parallelism are rejected at
-startup. A lossless draft that would otherwise arm is also rejected with mixed
+startup. P/D producers and RapidServe also reject the flag because their
+separate prefill/decode roles do not form native mixed batches. Offload-only
+connector roles are not P/D roles and remain eligible. A lossless draft that would otherwise arm is also rejected with mixed
 scheduling. Merely setting `ATOM_SPEC_LOSSLESS_SAMPLING` does not reject a model
 that keeps greedy drafting or has no drafter; its existing fallback remains.
 Expert parallelism alone does not enable EPLB.
@@ -843,8 +846,9 @@ Expert parallelism alone does not enable EPLB.
 
 Prefill and decode share `max_num_batched_tokens`. A decode row costs
 `decode_spec_width + 1` tokens, including speculative verification. The
-scheduler reserves that demand for running decodes while retaining at least
-one eighth of the token budget for prefill progress. At high decode load,
+scheduler reserves that demand for running decodes. When their append pages
+fit, at least one eighth of the token budget remains for prefill progress;
+otherwise the prefill budget is zero. At high decode load,
 decode admission follows FCFS order. Tail requests may wait until earlier
 decodes finish or the long prefill ends; this policy does not rotate them.
 
@@ -903,8 +907,9 @@ budget; their drafts retain full width until their first decode proposal.
 V4 owns separate publication banks for prefill metadata and decode metadata.
 Each bank has its own host sources, device destinations, and H2D ownership.
 They are allocated before memory profiling and follow forward-slot reuse.
-The common attention builder retains whole-batch query-span semantics;
-only V4 publishes decode-local spans for its mixed dispatch.
+The common builder exposes query lengths and decode spans. On a mixed step,
+the runner publishes decode-local query metadata in the main bank; V4 publishes
+the prefill spans independently in its private bank.
 
 ### Startup memory profiling
 

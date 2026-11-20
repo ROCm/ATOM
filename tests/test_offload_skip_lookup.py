@@ -207,7 +207,9 @@ def _gate(monkeypatch, *, conn, state_offload=None, hit_blocks=10):
     if not s._lookup_detach_enabled(seq):
         return False, conn
     return (
-        s._can_detach_tier_lookup(seq, s._probe_hbm_prefix(seq).num_cached_blocks),
+        s._can_detach_tier_lookup(
+            seq, s._probe_hbm_prefix(seq, limits=s._prefill_limits()).num_cached_blocks
+        ),
         conn,
     )
 
@@ -568,7 +570,7 @@ def test_admission_walks_the_prefix_once_when_the_detach_is_probed(monkeypatch):
     s.max_num_batched_tokens = 64
     s._unreserved_prefill_limits = PrefillLimits(64)
     s.block_manager = SimpleNamespace(hash_block_size=4, can_allocate=can_allocate)
-    probe = s._probe_hbm_prefix(SimpleNamespace())
+    probe = s._probe_hbm_prefix(SimpleNamespace(), limits=s._prefill_limits())
     assert (probe.num_cached_blocks, probe.block_hashes) == (2, [11, 12])
     assert walks == [False]
     assert s._can_detach_tier_lookup(SimpleNamespace(), probe.num_cached_blocks)

@@ -277,7 +277,7 @@ def test_prepare_mixed_calls_both_halves_with_their_real_signatures(
     assert merged.state_slot_out.tolist() == [7, 8, 4, 5, 6]
 
 
-def test_mixed_prefill_banks_exist_before_the_first_mixed_step():
+def test_mixed_prefill_banks_exist_before_the_first_mixed_step(monkeypatch):
     """The banks are built up front, one per `forward_vars` ring slot, and a
     lookup never builds one: allocating on the first mixed step would take
     memory the KV cache was already sized against."""
@@ -288,14 +288,21 @@ def test_mixed_prefill_banks_exist_before_the_first_mixed_step():
     get_bank = DeepseekV4AttentionMetadataBuilder._get_mixed_prefill_bank
     build_banks = DeepseekV4AttentionMetadataBuilder.build_mixed_prefill_banks
     ring = [{"mtp_k": 0}, {"mtp_k": 1}]
+    publication_owner = object()
+    monkeypatch.setattr(torch.cuda, "Event", lambda: object())
     builder = SimpleNamespace(
         mixed_prefill_groups=DeepseekV4AttentionMetadataBuilder.mixed_prefill_groups,
-        model_runner=SimpleNamespace(_fv_ring=ring, _fv_idx=1, h2d_groups=None),
+        model_runner=SimpleNamespace(
+            _fv_ring=ring,
+            _fv_idx=1,
+            h2d_groups={},
+            build_h2d_slot=lambda *args, **kw: (publication_owner, {}),
+        ),
     )
     build_banks(builder)
     variables, owner, groups = get_bank(builder)
     assert variables == ring[1] and variables is not ring[1]
-    assert owner is None and groups is None
+    assert owner is publication_owner and groups == {}
     builder.model_runner._fv_idx = 0
     assert get_bank(builder)[0] == ring[0]
 
@@ -390,16 +397,22 @@ def test_runner_builds_the_banks_before_warmup(monkeypatch, mixed):
             self._fv_idx = 0
 
         def _init_h2d_publication(self):
-            self.h2d_groups = None
+            self.h2d_groups = {}
+            self.h2d_owner = object()
+
+        def build_h2d_slot(self, variables, event, *, partial=False):
+            assert partial
+            return object(), {}
 
         def _maybe_warmup(self):
-            assert self.h2d_groups is None
+            assert self.h2d_groups == {}
             if mixed:
                 bank, owner, groups = (
                     self.attn_metadata_builder._get_mixed_prefill_bank()
                 )
                 assert bank == self.forward_vars and bank is not self.forward_vars
-                assert owner is None and groups is None
+                assert owner is not None and owner is not self.h2d_owner
+                assert groups == {}
             else:
                 assert not hasattr(self.attn_metadata_builder, "_mixed_prefill_banks")
             raise WarmupReached

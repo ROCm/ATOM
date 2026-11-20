@@ -151,7 +151,7 @@ def test_early_load_starts_an_unaligned_hit_instead_of_skipping_it(
         lowered.append(a) or setattr(p, "num_cached_blocks", 0) or True
     )
 
-    sched._early_load_tier_prefixes()
+    sched._early_load_tier_prefixes(limits=sched._prefill_limits())
 
     assert lowered, "the lowering was asked for"
     assert "unaligned_hbm" not in sched._early_load.skips
@@ -166,7 +166,7 @@ def test_a_tier_that_does_not_declare_it_keeps_the_hand_off(monkeypatch, seq_fac
         num_cached_blocks = 1
 
     sched._probe_hbm_prefix = lambda s, **kw: _Hit()
-    sched._early_load_tier_prefixes()
+    sched._early_load_tier_prefixes(limits=sched._prefill_limits())
     assert seq.status == SequenceStatus.WAITING
     assert sched._early_load.skips["unaligned_hbm"] == 1
 

@@ -122,10 +122,14 @@ class _FakeConfig:
         eplb=False,
         tbo=False,
         tbo_decode=False,
+        rapidserve=False,
+        kv_transfer_config=None,
     ):
         self.eplb_enable = eplb
         self.enable_tbo = tbo
         self.enable_tbo_decode = tbo_decode
+        self.enable_rapidserve = rapidserve
+        self.kv_transfer_config = kv_transfer_config
         self.enable_mixed_prefill_decode = enabled
         self.hf_config = hf if hf is not None else _v4_hf()
         self.speculative_config = spec
@@ -211,6 +215,39 @@ def test_validator_allows_v4_dspark():
     """The one speculative combination the mixed split is wired for."""
     _bind()
     _FakeConfig(hf=_v4_hf(), spec=_spec())._validate_mixed_prefill_decode()
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_mixed_refuses_pd_producers_but_allows_offload_roles(nested):
+    _bind()
+    for name, blocked in [
+        ("moriio", True),
+        ("mooncake", True),
+        ("LMCacheMPConnector", False),
+    ]:
+        entry = {"kv_connector": name, "kv_role": "kv_producer"}
+        transfer = (
+            {"kv_connector": "MultiConnector", "connectors": [entry]}
+            if nested
+            else entry
+        )
+        cfg = _FakeConfig(kv_transfer_config=transfer)
+        if blocked:
+            with pytest.raises(ValueError, match="P/D kv_producer"):
+                cfg._validate_mixed_prefill_decode()
+        else:
+            cfg._validate_mixed_prefill_decode()
+        cfg.enable_mixed_prefill_decode = False
+        cfg._validate_mixed_prefill_decode()
+
+
+def test_mixed_refuses_rapidserve_before_model_loading():
+    _bind()
+    cfg = _FakeConfig(rapidserve=True)
+    with pytest.raises(ValueError, match="RapidServe"):
+        cfg._validate_mixed_prefill_decode()
+    cfg.enable_mixed_prefill_decode = False
+    cfg._validate_mixed_prefill_decode()
 
 
 @pytest.mark.parametrize("tbo,tbo_decode", [(True, False), (False, True), (True, True)])

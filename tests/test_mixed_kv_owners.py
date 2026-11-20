@@ -8,7 +8,7 @@ from conftest import MockConfig
 from test_mixed_chunk_decode_pressure import _finish_step
 from test_scheduler import _ConnectorNamespace, _OffloadMixinStub
 
-from atom.model_engine.scheduler import Scheduler
+from atom.model_engine.scheduler import PrefillLimits, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 
 
@@ -334,6 +334,25 @@ def test_receive_promotion_respects_running_capacity(width):
     assert list(sched.waiting) == [second]
     assert second.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
     assert second.token_ids.count(42) == 0
+
+
+@pytest.mark.parametrize("width,expected_budget", [(1, 1), (8, 4)])
+def test_receive_reservation_stops_at_mixed_decode_seats(width, expected_budget):
+    sched = scheduler(pages=10, width=width)
+    sched.max_num_batched_tokens = 4 * width
+    incoming = [receive(sched, token=30 + i) for i in range(7)]
+    assert sched._mixed_decode_seats() == 3
+    assert sched.block_manager.kv.num_free == 3
+
+    limits = sched._promote_mixed_remote_decodes(PrefillLimits(4 * width, 0, 0))
+
+    assert list(sched.running) == incoming
+    assert limits.num_decodes == 7
+    assert limits.reserved_decode_blocks == 3
+    assert (
+        sched._budget_for_decodes(limits.num_decodes, limits.reserved_decode_blocks)
+        == expected_budget
+    )
 
 
 def test_mixed_restore_keeps_receive_promoted_during_refused_reclaim(monkeypatch):

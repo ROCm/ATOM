@@ -78,7 +78,7 @@ def test_partial_prefill_probe_uses_the_scheduled_budget(seq_factory, monkeypatc
     assert first.is_mixed and prompt.is_partial_prefill
     preview = Mock(wraps=sched._preview_prefill_chunk)
     monkeypatch.setattr(sched, "_preview_prefill_chunk", preview)
-    assert sched._probe_local_prefill_work() == (True, 7)
+    assert sched._probe_local_prefill_work(limits=sched._prefill_limits()) == (True, 7)
     offered = preview.call_args.args[-1]
     batch, _ = sched.schedule()
     assert offered == batch.total_tokens_num_prefill == 7
