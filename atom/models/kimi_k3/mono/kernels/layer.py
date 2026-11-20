@@ -193,9 +193,9 @@ def stage_oproj(c, gi):
     once (one memory latency, not two), then the MFMAs, a token group's core
     rows at a time. A CTA with one task loads its own slab again for the
     round it skips (cache hits), not task 447's on 64 CTAs at once."""
-    # a bf16 weight two slabs of 8 rows a load (``gemv.chunk_ops`` paired), as
-    # K2's other GEMVs (the MoE's early / shared down / up); ``w8`` has no
-    # paired form
+    # ``paired``, as K2's other GEMVs (the MoE's early, shared down and up): each
+    # bf16 load takes two slabs of 8 rows, whole 128 B lines (``gemv.chunk_ops``).
+    # An FP8 (``w8``) load is already one 512 B piece a wave, so it ignores ``paired``
     ops = [
         k2a.o_loads(c, k2a.o_task_or(gi, gi + BLOCKS * j), paired=True)
         for j in range(O_ROUNDS)
