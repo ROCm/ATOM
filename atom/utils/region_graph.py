@@ -37,7 +37,7 @@ import threading
 import warnings
 import weakref
 from collections.abc import Callable
-from typing import Any, ClassVar
+from typing import Any, ClassVar, NamedTuple
 
 import torch
 
@@ -48,14 +48,23 @@ from atom.utils.graph_holders import register_graph_holder
 __all__ = [
     "ReqGraph",
     "TokenGraph",
+    "TokenGraphQueryLayout",
     "eager_region",
     "forks",
     "graph_pool",
     "join_stream",
+    "prefill_token_graph_capture",
     "token_graph",
 ]
 
 _local = threading.local()
+
+
+class TokenGraphQueryLayout(NamedTuple):
+    """An unscaled, row-sliceable query declared by its native model layer."""
+
+    layer_num: int
+    dtype: torch.dtype
 
 
 def _recorder() -> "_Recorder | None":
@@ -285,6 +294,21 @@ def eager_region(
         return wrapper
 
     return decorate
+
+
+def prefill_token_graph_capture() -> bool:
+    """Whether this forward records a prefill token-graph bucket, or is the
+    warmup forward before it: the capture's dummy prefill, run under
+    `in_hipgraph` but not recorded. A layer that records its prefill split
+    around a region (the MLA head, the KDA projections) takes the split on
+    both, so the warmup runs what the recording captures."""
+    fwd_ctx = forward_context.get_forward_context()
+    context = fwd_ctx.context
+    if context is None or not context.is_prefill:
+        return False
+    return fwd_ctx.tr_graph == "record" or (
+        fwd_ctx.in_hipgraph and context.is_dummy_run
+    )
 
 
 def forks(stream: torch.cuda.Stream | None) -> bool:

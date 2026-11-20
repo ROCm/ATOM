@@ -4,7 +4,7 @@
 
 The drafter taps target layers with forward hooks on ``layers[lid]``. A mono
 step calls that module on NEITHER path -- the kernels replace it, and the
-fallback reruns its forward from the submodules -- so no hook fires and the
+fallback calls forward directly -- so no hook fires and the
 drafter would draft from whatever the last production step left behind. K3 mono
 requires DSpark, so that is every armed deployment.
 """
@@ -91,8 +91,7 @@ def test_the_right_buffer_is_written():
 
 
 def test_a_block_write_layer_records_nothing():
-    """`_fallback` returns `prefix=None` where the layer banked its prefix into
-    a block slot. The drafter's hook treats a None reconstruction as nothing to
+    """The drafter's hook treats a None reconstruction as nothing to
     record, so mono must leave the buffer as it was rather than write zeros."""
     runner, _ = _runner([1], mono=False)
     runner.aux.buffers[0].fill_(7.0)

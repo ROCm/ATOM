@@ -18,7 +18,10 @@ from atom.model_ops.glm5_next.geometry import (
     pooled_path_enabled,
     speculative_kpool_history_size,
 )
+from atom.plugin import is_plugin_mode
 from atom.utils import CpuGpuBuffer, envs
+from atom.utils.forward_context import AttentionMetaData, Context
+from atom.utils.region_graph import TokenGraphQueryLayout
 
 from .aiter_mla import (
     MLA_ROWS,
@@ -641,6 +644,23 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             )
 
         if hasattr(module, "base_attention") and getattr(module, "use_mla", False):
+            impl = getattr(module, "impl", None)
+            if isinstance(impl, MLAAttention):
+                layout = getattr(impl, "prefill_query_layout", None)
+                target = getattr(runner, "model", None)
+                valid = (
+                    isinstance(layout, TokenGraphQueryLayout)
+                    and impl.is_sparse_mla
+                    and layout.dtype == torch.bfloat16
+                    and layout.layer_num == impl.layer_num == module.layer_num
+                    and 0 <= module.layer_num < runner.hf_text_config.num_hidden_layers
+                    and not is_plugin_mode()
+                    and runner.config.parallel_config.data_parallel_size == 1
+                    and runner.config.prefill_context_parallel_size == 1
+                    and isinstance(target, torch.nn.Module)
+                    and any(candidate is module for candidate in target.modules())
+                )
+                impl.token_graph_query_layout = layout if valid else None
             # This module's MLA row. K3's linear-attention layers are bound
             # above and take none, and a shared draft's layers simply continue
             # the numbering, which is what the pool was sized for.
@@ -720,6 +740,70 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         _, lengths, _ = self.decode_spans(batch)
         self._stage_draft_ctx_slots(batch, lengths, running_tokens, group)
         return built
+
+    @property
+    def supports_token_graph(self) -> bool:
+        """Record native Kimi's target layers when every MLA path is supported.
+
+        Dense MLA and KDA keep their whole-bucket split regions, whose
+        metadata bounds the kernel reads. Sparse MLA instead runs its bound
+        unscaled query's live rows, as its scheduled-row index metadata
+        requires; the indexer is also a live region. Unknown or quantized
+        sparse queries have no bound layout and keep eager execution.
+
+        DP cannot replay this prefill recording on decoding or idle ranks.
+        Draft layers are outside the target's layer range; plugin layers do
+        not opt in. Dense layers retain their existing split capability gate.
+        """
+        config = self.model_runner.config
+        if config.parallel_config.data_parallel_size != 1:
+            return False
+        target_layers = config.hf_config.num_hidden_layers
+        sfc = config.compilation_config.static_forward_context
+        target_mla = [
+            impl
+            for module in sfc.values()
+            if isinstance(impl := getattr(module, "impl", None), MLAAttention)
+            and impl.layer_num < target_layers
+        ]
+        return bool(target_mla) and all(
+            impl.split_prefill_recording
+            and (
+                impl.prefill_split_supported()
+                or (
+                    impl.is_sparse_mla
+                    and isinstance(
+                        layout := getattr(impl, "token_graph_query_layout", None),
+                        TokenGraphQueryLayout,
+                    )
+                    and layout.layer_num == impl.layer_num
+                    and layout.dtype == torch.bfloat16
+                )
+            )
+            for impl in target_mla
+        )
+
+    def build_for_token_graph_capture(self, tokens: int):
+        """A request-less prefill of ``tokens`` rows for recording that
+        token-graph bucket. A dummy step: its regions hand back zeros of their
+        output's shape and touch no KV or state -- a replay runs them on the
+        live step -- and the segments need only its shape."""
+        if not 0 < tokens <= self.model_runner.config.max_num_batched_tokens:
+            raise ValueError(
+                f"token-graph bucket {tokens} exceeds max_num_batched_tokens"
+            )
+        positions = self.model_runner.forward_vars["positions"].gpu[:tokens]
+        positions.zero_()
+        context = Context(
+            positions=positions,
+            is_prefill=True,
+            is_dummy_run=True,
+            scheduled_bs=1,
+            scheduled_tokens=tokens,
+            running_bs=1,
+            running_tokens=tokens,
+        )
+        return AttentionMetaData(max_seqlen_q=tokens, max_seqlen_k=tokens), context
 
     def _stage_draft_ctx_slots(
         self, batch, seqlens_q: np.ndarray, rows: int, group

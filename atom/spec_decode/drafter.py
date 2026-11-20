@@ -205,7 +205,9 @@ def install_aux_taps(
     must be strictly increasing and each in {-1} U [0, n_layers). Each id
     resolves to a (module, extract) tap: -1 taps the embedding output
     (hidden_states[0], taken verbatim); k taps decoder layer k through
-    ``spec.extract``.
+    ``spec.extract``. A target can move an output tap with
+    ``aux_tap_site(k, spec)``. That site's extractor receives
+    ``(site_inputs, site_output)`` so it can preserve immediate fallbacks.
     """
     layers = _resolve_decoder_layers(target_model)
     n_layers = len(layers)
@@ -221,14 +223,30 @@ def install_aux_taps(
                 f"{spec.layer_ids}."
             )
         prev = lid
+    tap_site = _descend_wrappers(
+        target_model, lambda model: getattr(model, "aux_tap_site", None)
+    )
     for lid in layer_ids:
-        module, extract = (
-            (_resolve_embedding(target_model), _identity_extract)
-            if lid == -1
-            else (layers[lid], spec.extract)
-        )
+        moved = False
+        if lid == -1:
+            module, extract = _resolve_embedding(target_model), _identity_extract
+        elif (
+            spec.capture == "output"
+            and tap_site is not None
+            and (site := tap_site(lid, spec)) is not None
+        ):
+            module, extract = site
+            moved = True
+        else:
+            module, extract = layers[lid], spec.extract
         hook = make_hook(lid, extract)
-        if lid != -1 and spec.capture == "input":
+        if moved:
+
+            def moved_hook(module, inputs, output, hook=hook):
+                hook(module, inputs, (inputs, output))
+
+            module.register_forward_hook(moved_hook)
+        elif lid != -1 and spec.capture == "input":
 
             def pre_hook(module, inputs, hook=hook):
                 hook(module, (), inputs)
