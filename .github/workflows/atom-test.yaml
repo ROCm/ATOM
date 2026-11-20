@@ -285,7 +285,7 @@ jobs:
       contents: read
 
     env:
-      CONTAINER_NAME: atom_test_${{ strategy.job-index }}
+      CONTAINER_NAME: atom_test_${{ github.run_id }}_${{ github.run_attempt }}_${{ strategy.job-index }}
 
     steps:
       - name: Record diagnostic start
@@ -432,8 +432,11 @@ jobs:
         run: rocm-smi --showpidgpus
 
       - name: Checkout ATOM repo
+        id: current_checkout
         timeout-minutes: 2
         uses: actions/checkout@v6
+        with:
+          clean: true
       
       - name: Docker Login
         timeout-minutes: 2
@@ -525,6 +528,7 @@ jobs:
         run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> "$GITHUB_ENV"
 
       - name: Start CI container
+        id: current_container
         timeout-minutes: 8
         uses: ./.github/actions/setup-gpu-container
         with:
@@ -661,25 +665,31 @@ jobs:
           timeout --signal=TERM --kill-after=5s 30s docker exec -i "$CONTAINER_NAME" python3 - <<'PY'
           import json, re, subprocess
           from pathlib import Path
-          import torch
-          count = torch.cuda.device_count()
-          devices = []
-          for index in range(count):
-              props = torch.cuda.get_device_properties(index)
-              devices.append({"index": index, "name": props.name,
-                              "arch": getattr(props, "gcnArchName", "").split(":")[0],
-                              "memory_bytes": props.total_memory,
-                              "memory_gib_rounded": round(props.total_memory / 2**30)})
-          result = subprocess.run(["rocm-smi", "--showdriverversion"],
-                                  capture_output=True, text=True, timeout=15)
-          match = re.search(r"^Driver version:\s*(\S+)", result.stdout, re.MULTILINE)
-          driver = match[1] if match else None
-          record = {"driver": driver, "devices": devices, "command_exit": result.returncode,
-                    "torch_version": torch.__version__, "torch_hip_version": torch.version.hip}
-          record["accepted"] = (result.returncode == 0 and driver == "6.19.14.31400000"
-                                and count == 8 and all(d["arch"] == "gfx950"
-                                and d["memory_gib_rounded"] == 288 for d in devices))
-          Path("/workspace/k31-reference-gpu.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
+          output = Path("/workspace/k31-reference-gpu.json")
+          record = {"accepted": False, "status": "checking", "devices": []}
+          output.write_text(json.dumps(record, indent=2), encoding="utf-8")
+          try:
+              import torch
+              count = torch.cuda.device_count()
+              record.update(device_count=count, torch_version=torch.__version__,
+                            torch_hip_version=torch.version.hip)
+              for index in range(count):
+                  props = torch.cuda.get_device_properties(index)
+                  record["devices"].append({"index": index, "name": props.name,
+                      "arch": getattr(props, "gcnArchName", "").split(":")[0],
+                      "memory_bytes": props.total_memory,
+                      "memory_gib_rounded": round(props.total_memory / 2**30)})
+              result = subprocess.run(["rocm-smi", "--showdriverversion"],
+                                      capture_output=True, text=True, timeout=15)
+              match = re.search(r"^Driver version:\s*(\S+)", result.stdout, re.MULTILINE)
+              record.update(driver=match[1] if match else None, command_exit=result.returncode)
+              record["accepted"] = (result.returncode == 0 and record["driver"] == "6.19.14.31400000"
+                                    and count == 8 and all(d["arch"] == "gfx950"
+                                    and d["memory_gib_rounded"] == 288 for d in record["devices"]))
+          except Exception as error:
+              record["error"] = f"{type(error).__name__}: {error}"
+          record["status"] = "accepted" if record["accepted"] else "rejected"
+          output.write_text(json.dumps(record, indent=2), encoding="utf-8")
           print(json.dumps(record, indent=2))
           if not record["accepted"]:
               raise SystemExit("REFERENCE GPU ENVIRONMENT REJECTED before model startup.")
@@ -796,13 +806,13 @@ jobs:
 
       - name: Dump server log
         timeout-minutes: 2
-        if: ${{ always() && steps.reference_host.outcome == 'success' }}
+        if: ${{ always() && steps.current_checkout.outcome == 'success' && (steps.current_container.outcome == 'success' || steps.current_container.outcome == 'failure') }}
         run: |
           docker exec "$CONTAINER_NAME" cat /tmp/atom_server.log 2>/dev/null || true
 
       - name: Dump client log
         timeout-minutes: 2
-        if: ${{ always() && steps.reference_host.outcome == 'success' }}
+        if: ${{ always() && steps.current_checkout.outcome == 'success' && (steps.current_container.outcome == 'success' || steps.current_container.outcome == 'failure') }}
         run: |
           docker exec "$CONTAINER_NAME" cat /tmp/atom_client.log 2>/dev/null || true
 
@@ -899,7 +909,7 @@ jobs:
 
       - name: Check main wave coverage and separate probe capture
         timeout-minutes: 1
-        if: ${{ always() && steps.reference_host.outcome == 'success' }}
+        if: ${{ always() && steps.current_checkout.outcome == 'success' }}
         run: |
           python3 - <<'PY'
           import hashlib
@@ -939,7 +949,7 @@ jobs:
 
       - name: Upload output
         timeout-minutes: 2
-        if: ${{ always() && steps.reference_host.outcome == 'success' }}
+        if: ${{ always() && steps.current_checkout.outcome == 'success' }}
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.model_name }}_atom_test_output.txt
@@ -952,7 +962,7 @@ jobs:
           set -euo pipefail
           summary="$RUNNER_TEMP/k31-wave-summary-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           mkdir -p "$summary"
-          if [ "${{ steps.reference_host.outcome }}" = "success" ]; then
+          if [ "${{ steps.current_checkout.outcome }}" = "success" ]; then
             for result in accuracy_test_results diagnostic-provenance.txt k31-reference-gpu.json; do
               if [ -e "$result" ]; then cp -a -- "$result" "$summary/"; fi
             done
@@ -975,7 +985,7 @@ jobs:
 
       - name: Upload accuracy results
         timeout-minutes: 3
-        if: ${{ always() && steps.reference_host.outcome == 'success' }}
+        if: ${{ always() && steps.current_checkout.outcome == 'success' }}
         uses: actions/upload-artifact@v7
         with:
           name: accuracy-${{ matrix.model_name }}
@@ -987,7 +997,7 @@ jobs:
 
       - name: Clean Up
         timeout-minutes: 3
-        if: ${{ always() && steps.reference_host.outcome == 'success' }}
+        if: ${{ always() && steps.current_checkout.outcome == 'success' }}
         run: |
           # TODO: run a separate container for cleanup of the workspace due to permission issue to remove some pyc files under __pycache__ whose owners are root.
           # We should use non-root user to run the test to avoid this issue.
