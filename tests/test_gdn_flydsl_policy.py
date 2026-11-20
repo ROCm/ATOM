@@ -135,7 +135,9 @@ AITER_OPS = {
 }
 
 
-@pytest.mark.parametrize("missing", list(AITER_OPS))
+@pytest.mark.parametrize(
+    "missing", [*AITER_OPS, *(s for symbols in AITER_OPS.values() for s in symbols)]
+)
 def test_ops_raises_on_hip_when_an_aiter_symbol_is_missing(fly, monkeypatch, missing):
     monkeypatch.setattr(fly.torch.version, "hip", "6.4")
     for name, symbols in AITER_OPS.items():
@@ -143,7 +145,8 @@ def test_ops_raises_on_hip_when_an_aiter_symbol_is_missing(fly, monkeypatch, mis
         if name != missing:
             stub = types.ModuleType(name)
             for symbol in symbols:
-                setattr(stub, symbol, object())
+                if symbol != missing:
+                    setattr(stub, symbol, object())
         monkeypatch.setitem(sys.modules, name, stub)
     with pytest.raises(ImportError):
         fly.ops()

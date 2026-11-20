@@ -316,8 +316,9 @@ def decode_supported(q, k, v, a, b, state, A_log, dt_bias, reads, writes):
 def decode(q, k, v, a, b, state, A_log, dt_bias, reads, writes, out=None):
     """Fused gating/normalization/recurrence, zero-copy logical KV state view.
 
-    `out`, a contiguous `[batch, hv, 128]` buffer, receives the result
-    directly.
+    `out` receives the result directly when it is contiguous, has shape
+    `[batch, hv, 128]`, and has the same dtype as `q`. Otherwise the result
+    is returned in a newly allocated buffer.
     """
     if not decode_supported(q, k, v, a, b, state, A_log, dt_bias, reads, writes):
         raise ValueError("Unsupported AITER FlyDSL decode inputs")
