@@ -3016,6 +3016,9 @@ def test_dsv41_dspark_still_owns_its_input_tap():
     assert spec.hidden_size == 7168
     assert spec.capture == "input"
     assert spec.extract is v41.DeepseekV41DSpark._target_layer_input
+    # The tap writes the capture rows itself; dropping the flag would quietly
+    # bring the hook's copy back.
+    assert spec.writes_into
 
     # The Engram guard still fires, i.e. the extra argument did not shift the
     # ones it reads.

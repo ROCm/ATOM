@@ -192,7 +192,9 @@ def test_last_stage_arms_only_its_own_taps():
         device="cpu",
         dtype=torch.float32,
     )
-    drafter._make_aux_hook = lambda i, e: Drafter._make_aux_hook(drafter, i, e)
+    drafter._make_aux_hook = lambda i, e, **kw: Drafter._make_aux_hook(
+        drafter, i, e, **kw
+    )
     Drafter.arm_aux_capture(drafter, target)
     assert [b.shape[0] for b in drafter._aux_buffers] == [0, 0, 4]
     assert not target.embed_tokens._forward_hooks
