@@ -5219,8 +5219,8 @@ class RapidServeModelRunner(ModelRunner):
         """Run a prefill forward pass on a dynamically selected CU-masked stream.
 
         Writes KV for all prompt tokens, samples the first generated token for
-        each sequence, then synchronizes before returning so decode's default
-        stream sees all KV writes.  Returns a list of sampled token IDs (one
+        each sequence, then synchronizes before returning so decode sees all KV
+        writes whatever stream it runs on.  Returns a list of sampled token IDs (one
         per sequence, in batch order) — these are included in PrefillDone so
         the decode process can append them before the first decode step,
         matching the num_tokens state that non-disagg postprocess would produce.
@@ -5255,7 +5255,8 @@ class RapidServeModelRunner(ModelRunner):
             sampled = self.sampler(logits, temperatures, top_ks, top_ps, all_greedy)
             sampled_cpu = sampled.view(-1).tolist()
             self._record_forward_vars_event()
-        # Synchronize so decode's default stream sees all KV writes.
+        # A host-side wait, so decode sees all KV writes whatever stream it
+        # runs on -- the default one, or the High-priority compute stream.
         stream.synchronize()
         self._record_kv_cache_ready(batch)
         reset_forward_context()

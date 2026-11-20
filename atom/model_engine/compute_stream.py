@@ -22,9 +22,9 @@ def high_priority_compute_stream_enabled(config) -> bool:
     """Whether `ATOM_HIGH_PRIORITY_COMPUTE_STREAM` applies to this config.
 
     TBO overrides the flag. UBatchWrapper computes on the runner's stream, and
-    a builder's tbo_comm_stream_priority (High on V4.1) puts comm ahead of the
-    other ubatch's compute. ROCm has a single level above Normal, so a High
-    compute stream would erase that ordering and share comm's queue pool.
+    a builder's tbo_comm_stream_priority (High on V4 and V4.1) puts comm ahead
+    of the other ubatch's compute. ROCm has a single level above Normal, so a
+    High compute stream would erase that ordering and share comm's queue pool.
     """
     if not envs.ATOM_HIGH_PRIORITY_COMPUTE_STREAM:
         return False
