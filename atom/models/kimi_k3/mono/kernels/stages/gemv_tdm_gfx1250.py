@@ -58,6 +58,8 @@ from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import (
     TDM_SPLIT_ROW_STRIDE,
     TDM_SPLIT_SLAB,
     TDM_SPLIT_TILE_WORDS,
+    tdm_late_token_ahead,
+    tdm_late_weight_ahead,
     tdm_lds_words,
     tdm_split_slabs,
     tdm_split_task_words,
@@ -111,12 +113,12 @@ def _prefetch_on(role, asm: str):
         llvm.inline_asm(None, [], asm, "", has_side_effects=True)
 
 
-def prefetch_code(wave, code_bytes: int) -> None:
-    """``ATOM_KIMI_MONO_TDM_COLD=prefetch``: at the kernel's entry, wave 0
-    prefetches the next ``code_bytes`` of instructions into the instruction
-    cache (31 lines of 128 B per request), on top of the descriptor's
-    INST_PREF_SIZE prefetch from the entry."""
-    if const_expr("prefetch" not in _COLD):
+def prefetch_code(wave, code_bytes: int, force: bool = False) -> None:
+    """``ATOM_KIMI_MONO_TDM_COLD=prefetch`` (or ``force``): at the kernel's
+    entry, wave 0 prefetches the next ``code_bytes`` of instructions into the
+    instruction cache (31 lines of 128 B per request), on top of the
+    descriptor's INST_PREF_SIZE prefetch from the entry."""
+    if const_expr("prefetch" not in _COLD and not force):
         return
     step = 31 * 128
     asm = "\n".join(
@@ -978,17 +980,18 @@ def _late_waits(role, s, steps, slabs, tasks, depth, group, token_steps):
     (the next ``token_steps - 2`` steps' may stay in flight), a weight wave
     for its slab of the step (its later ones issued so far may)."""
     if role == 0:
-        ahead = token_steps - 2
+        ahead = tdm_late_token_ahead(token_steps)
         rocdl.s_wait_tensorcnt(group * ahead)
         for count in range_constexpr(ahead - 1, -1, -1):
             if s + count + 1 >= steps:
                 rocdl.s_wait_tensorcnt(group * count)
     if (role > 0) & (role < 1 + 2 * tasks):
+        ahead = tdm_late_weight_ahead(depth, group)
         if const_expr(group == 2):
-            _late_tail(2 * s + ((role + 1) & 1), slabs, (depth - 2) // 2)
+            _late_tail(2 * s + ((role + 1) & 1), slabs, ahead)
         else:
             if ((role + s) & 1) == 1:
-                _late_tail(s, slabs, (depth - 1) // 2)
+                _late_tail(s, slabs, ahead)
 
 
 @traced

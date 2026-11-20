@@ -79,6 +79,23 @@ def tdm_lds_words(
     )
 
 
+def tdm_late_weight_ahead(depth: int, group: int) -> int:
+    """``gemv_tdm_gfx1250.project(late)``: the copies of a weight wave (every
+    other slab of a task, each issued past the barrier of the step ``depth``
+    slabs before its own) still in flight when it waits for its slab of a
+    step, but near the end of K, where fewer follow."""
+
+    return (depth - 2) // 2 if group == 2 else (depth - 1) // 2
+
+
+def tdm_late_token_ahead(token_steps: int) -> int:
+    """Its token wave's later steps in flight when it waits for a step's
+    tokens (``token_steps`` resident, each issued ``token_steps - 1`` steps
+    ahead, past a barrier), but near the end of K."""
+
+    return token_steps - 2
+
+
 def tdm_lds_bytes(
     rows: int,
     tasks: int,

@@ -112,6 +112,59 @@ def test_k2_gemvs_pair_their_slabs_where_four_token_slabs_fit(
     assert ["_ps" in name for name in names()] == [False, oproj_paired, False]
 
 
+def _paired_by_default(rows):
+    kernel = front.build_replicated_front(
+        _plan(rows), fp8_shared=True, pipe_sites=frozenset()
+    )
+    return "_ps" in kernel.name
+
+
+@pytest.mark.parametrize("rows", range(1, 65))
+def test_late_front_plans_only_where_they_won_and_fit(rows):
+    lds = 320 * 1024
+    pipe = front.front_pipe(rows, True, lds, frozenset({"late"}), _paired_by_default(rows))
+    expected = (
+        (True, 6) if rows <= 9
+        else None if rows <= 30
+        else (False, 5) if rows <= 40
+        else (False, 4) if rows <= 50
+        else None
+    )  # fmt: skip
+    if expected is None:
+        assert pipe == {}
+        return
+    assert (pipe["paired"], pipe["depth"]) == expected
+    assert pipe["late"] and pipe["token_steps"] == 3
+    assert pipe["fp8_depth"] == 6
+    words = front._front_words(rows, pipe["depth"], pipe["paired"], 3)
+    assert words + rows * 16 <= lds // 4
+
+
+@pytest.mark.parametrize(
+    ("rows", "name"),
+    (
+        (8, "k3_k2_gfx1250_replicated_front_w_d6_ps_late_es_f6_s8_f8"),
+        (16, "k3_k2_gfx1250_replicated_front_w_d4_ps_es_s16_f8"),
+        (40, "k3_k2_gfx1250_replicated_front_w_d5_late_es_f6_s40_f8"),
+        (48, "k3_k2_gfx1250_replicated_front_w_d4_late_es_f6_s48_f8"),
+        (64, "k3_k2_gfx1250_replicated_front_w_d4_es_s64_f8"),
+    ),
+)
+def test_front_pipe_switch_names_its_build(monkeypatch, rows, name):
+    default = front.build_replicated_front(_plan(rows), fp8_shared=True).name
+    assert "_late" not in default and "_es" not in default
+    monkeypatch.setenv("ATOM_KIMI_MONO_FRONT_PIPE", "late,early")
+    kernel = front.build_replicated_front(_plan(rows), fp8_shared=True)
+    assert kernel.name == name
+    assert kernel.grid == (front.PAIRS,) and kernel.abi == front.REPLICATED_FRONT_ABI
+
+
+def test_front_pipe_sites_parse_delays_and_epilogues():
+    pipe = front.front_pipe(8, True, 320 * 1024, frozenset({"epi", "hw4", "rd16"}))
+    assert pipe == {"fused": True, "diag": frozenset({"hw4"}), "delay": {"router": 16}}
+    assert front._pipe_suffix(pipe) == "_fe_rd16_hw4"
+
+
 def test_herd_candidates_feed_only_the_grouped_moe_finish():
     with pytest.raises(ValueError, match="HERD"):
         build_packed_finish(_plan(16), herd=True)

@@ -766,6 +766,8 @@ def front_pipe(
         pipe["early_scales"] = True
     if "epi" in sites:
         pipe["fused"] = True
+    if "pfc" in sites:
+        pipe["pfc"] = True
     if pipe.get("late") and "u2" in sites:
         pipe["unroll"] = 2
     delay = {
@@ -789,6 +791,7 @@ def _pipe_suffix(pipe) -> str:
         ("_late" if pipe.get("late") else "")
         + ("_es" if pipe.get("early_scales") else "")
         + ("_fe" if pipe.get("fused") else "")
+        + ("_pfc" if pipe.get("pfc") else "")
         + (f"_u{pipe['unroll']}" if pipe.get("unroll") else "")
         + "".join(f"_{r[0]}d{n}" for r, n in sorted(pipe.get("delay", {}).items()))
         + "".join(f"_{d}" for d in sorted(pipe.get("diag", ())))
@@ -870,6 +873,7 @@ def build_replicated_front(
 
     sources = SOURCES
     timeline = tdm_timeline.key()
+    pfc = bool(pipe.pop("pfc", False))
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def kernel(
@@ -888,7 +892,7 @@ def build_replicated_front(
         pair = fx.block_idx.x
         lane = tid % GFX1250.wave_size
         wave = tid // GFX1250.wave_size
-        gemv_tdm.prefetch_code(wave, 10 << 10)
+        gemv_tdm.prefetch_code(wave, 8 << 10 if pfc else 10 << 10, force=pfc)
         gemv_tdm.prefetch_tokens(x, rows, HIDDEN * 2, pair, tid, PAIRS)
         allocator = fx.SharedAllocator()
         lds = allocator.allocate(Lds).peek()
