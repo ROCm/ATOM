@@ -594,6 +594,8 @@ class WritePathTest(unittest.TestCase):
         conn._recving_transfers_callback_addr = {}
         conn._held_failures = {}
         conn._built_sessions = {}
+        conn._regions = None
+        conn._region_sessions = {}
         conn._retired_sessions = []
         conn.remote_moriio_metadata = {}
         conn.layer_name_to_remote_kv_cache_metadata = {}
@@ -747,6 +749,18 @@ class WritePathTest(unittest.TestCase):
                 (1, 0): ([10, 20], [20, 30], [10, 10]),
             },
         )
+
+    def test_a_region_session_refuses_our_own_descriptor(self):
+        import types
+
+        conn = self.make(producer=True)
+        conn._regions = [types.SimpleNamespace(name="page.0.kv")]
+        conn.layer_name_to_local_kv_cache_metadata = {"page.0.kv": [b"ours"]}
+        conn.layer_name_to_remote_kv_cache_metadata = {
+            "engine": {"page.0.kv": [b"ours"]}
+        }
+        with self.assertRaises(ValueError):
+            conn._region_session("engine", 0, 0, 0)
 
     def test_the_consumer_asks_its_producer_rank_for_a_push(self):
         import time
@@ -1649,6 +1663,111 @@ class MergeContiguousBlocksTest(unittest.TestCase):
 
     def test_empty_input(self):
         self.assertEqual(self.merge([], [], []), ([], [], []))
+
+
+class RegionPlanTest(unittest.TestCase):
+    """Pair local and remote regions on the CPU lane."""
+
+    @classmethod
+    def setUpClass(cls):
+        import dataclasses
+        import json
+
+        import numpy
+
+        from atom.kv_transfer.disaggregation.types import KVTransferRegion
+
+        tree = ast.parse(CONNECTOR.read_text())
+        classes = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
+        wanted = {"_remote_regions", "_region_plan", "merge_contiguous_blocks"}
+        methods = [
+            n
+            for n in classes["MoRIIOConnector"].body
+            if isinstance(n, ast.FunctionDef) and n.name in wanted
+        ]
+        scope = {
+            "Any": object,
+            "EngineId": str,
+            "KVTransferRegion": KVTransferRegion,
+            "MAX_RDMA_CHUNK_BYTES": 40,
+            "dataclass": dataclasses.dataclass,
+            "json": json,
+            "np": numpy,
+        }
+        module = ast.Module([classes["_Region"], *methods], [])
+        exec(compile(module, "<regions>", "exec"), scope)  # noqa: S102
+        cls.json = json
+        cls.Region = scope["_Region"]
+        cls.Planner = type("Planner", (), {name: scope[name] for name in wanted})
+        cls.local = [
+            cls.Region("page.0.kv", "page", 0, 80, 10, False, 40),
+            cls.Region("slot.0.swa", "slot", 0, 80, 10, True, 40),
+        ]
+
+    def make(self, remote_regions):
+        import types
+
+        conn = self.Planner()
+        conn._regions = self.local
+        layout = self.json.dumps([r.layout() for r in remote_regions])
+        conn.remote_moriio_metadata = {
+            "decode": types.SimpleNamespace(region_layout=layout)
+        }
+        conn._region_session = lambda _engine, ri, lc, rc: (ri, lc, rc)
+        return conn
+
+    def test_pairs_page_and_reverse_slot_regions(self):
+        request = {
+            "src_block_ids": [3, 4],
+            "dst_block_ids": [0, 5],
+            "src_slot_index": 0,
+            "dst_slot_index": 5,
+        }
+        fewer_slots = self.Region("slot.0.swa", "slot", 0, 60, 10, True, 40)
+        self.assertEqual(
+            self.make([self.local[0], fewer_slots])._region_plan(request, "decode"),
+            [
+                ((0, 0, 0), [30], [0], [10]),
+                ((0, 1, 1), [0], [10], [10]),
+                ((1, 1, 0), [30], [0], [10]),
+            ],
+        )
+
+    def test_rejects_a_different_region_unit(self):
+        other = self.Region("page.0.kv", "page", 0, 80, 20, False, 40)
+        with self.assertRaises(ValueError):
+            self.make([other, self.local[1]])._remote_regions("decode")
+
+    def test_of_keeps_each_unit_inside_one_chunk(self):
+        import types
+
+        region = types.SimpleNamespace(
+            unit_bytes=10, total_bytes=80, base_addr=1000, reverse_indexed=False
+        )
+        built = self.Region.of("page.0.kv", "page", region)
+        chunks = built.chunks()
+        self.assertEqual(sum(size for _, size in chunks), built.total)
+        for ptr, size in chunks:
+            self.assertEqual((ptr - built.base) % built.unit, 0)
+            self.assertEqual(size % built.unit, 0)
+
+    def test_of_rejects_a_unit_over_the_rdma_limit(self):
+        import types
+
+        region = types.SimpleNamespace(
+            unit_bytes=41, total_bytes=41, base_addr=0, reverse_indexed=False
+        )
+        with self.assertRaises(ValueError):
+            self.Region.of("page.0.kv", "page", region)
+
+    def test_of_rejects_a_partial_unit(self):
+        import types
+
+        region = types.SimpleNamespace(
+            unit_bytes=10, total_bytes=85, base_addr=0, reverse_indexed=True
+        )
+        with self.assertRaises(ValueError):
+            self.Region.of("slot.0.swa", "slot", region)
 
 
 if __name__ == "__main__":

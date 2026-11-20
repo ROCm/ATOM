@@ -4,8 +4,9 @@
 PP is the hard case: `PPEngineCoreProc` replaces `busy_loop` outright, so
 `bump_step` is never reached and the line would go silent after announcing a
 logging mode. RapidServe and P/D are a scope choice -- `PrefillEngineCore` and
-`DecodeEngineCore` inherit the base loop and override only
-`_process_engine_step`, so the counter would advance there. Either way
+`DecodeEngineCore` inherit the base loop and override only a step method,
+`_process_engine_step` and `_process_engine_step_inner` respectively, so the
+counter would advance there. Either way
 `Config.__post_init__` falls back to the clock and warns.
 
 The predicate has to tell a disaggregated role apart from an LMCache cache
