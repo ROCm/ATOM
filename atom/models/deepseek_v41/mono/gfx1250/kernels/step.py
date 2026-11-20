@@ -552,13 +552,8 @@ def target_layer(E, Ly):
                 # (engq-in-CTA) the kv quantizes its A rows from the bf16 embeddings itself: no stage_engq, no ATTN_A handoff
                 ES.stage_engkv(cwith(c, engemb=ltab(fp, Ly, "engemb")(), engw=ltab(fp, Ly, "engw")(),
                                      engws=ltab(fp, Ly, "engws")(), engkv=fptr(fp, "engkv"), **engtp(c["recv"])))
-            else:
-                if Ly != fx.Int32(S.ENG_ROWS[0]):   # (engentry) slot 1's kv (the entry's) -> engkv, read by this row's gate
-                    ekv = fptr(fp, "engkv")
-                    for zz in range_constexpr((TR * ES.EN * 2 // 16 + CTAS * 256 - 1) // (CTAS * 256)):
-                        u = b * 256 + t + zz * (CTAS * 256)
-                        if u < TR * ES.EN * 2 // 16:
-                            hx.stx_dev(ekv + i64(u) * 16, hx.gload(ekv + i64(ES.T * ES.EN * 2) + i64(u) * 16, fx.Int32, 4))
+            # (engentry) the entry ran this row's kv: slot s of engkv (s: the row's place in ENG_ROWS), read in place by the
+            # row's gate (ffn_post_owner's engkv) -- no copy of slot 1 to slot 0 and no KV_C handoff for it
 
     # ---- kv, C (on A2 flags) -> kvflag / cflag
     preC = AS.stage_C_pre(cwith(c, **v3a))   # (C's weights / RoPE in flight during the kv CTAs' kv rows too)
@@ -603,13 +598,13 @@ def target_layer(E, Ly):
                             hx.atomic_add(lc + i64(LY.KV_CG), 1)
         # (R4) indexer layers: iq / iw / the compressor GEMM's partials are counted (KV_C), waited for only by their readers
         # (the iquant CTAs, the compressor rows' CTAs); the Engram-next layers keep the KV_C handoff for the engkv their A
-        # stage writes (stage_engkv, or engentry's slot-1 copy) -- except the first engentry row (ENG_ROWS[0]): its kv is
-        # the entry's slot 0, written before the TARGET_FRONT handoff, and its A stage writes no engkv
+        # stage writes (stage_engkv) -- except the engentry rows: their kv is the entry's slot s, written before the
+        # TARGET_FRONT handoff, read in place, and their A stage writes no engkv
         IQW = IS.iq_waves(Lx["MT"])       # iquant's waves a CTA (6 at c1: waves 6 / 7 prefill the REINDEX scorer's pages)
         NIQC = (TR * IS.HEADS + IQW - 1) // IQW   # the iquant CTAs (a (token, head) row a wave)
         IQ_LCNT = 504                     # (c1 REINDEX) LDS: the CTA's iquant waves done (see below)
-        engent0 = (Ly == fx.Int32(S.ENG_ROWS[0])) & ((ltab(fp, Ly, "lflags")() & fx.Int64(S.ENG_ENTRY)) != fx.Int64(0))
-        if hx.unlikely(keepA & (isidx == (fx.Int32(0) != fx.Int32(0))) & (engent0 == (fx.Int32(0) != fx.Int32(0)))):
+        engent = (ltab(fp, Ly, "lflags")() & fx.Int64(S.ENG_ENTRY)) != fx.Int64(0)   # (every engentry row: its kv the entry's)
+        if hx.unlikely(keepA & (isidx == (fx.Int32(0) != fx.Int32(0))) & (engent == (fx.Int32(0) != fx.Int32(0)))):
             handoff(lc + i64(LY.KV_C), t, True)
         if hx.unlikely(isidx):
             if fx.const_expr(Lx["MT"] == 1 and not DRS):   # (the draft launch: no index layers -- the CTA count, as before)
@@ -1013,7 +1008,8 @@ def target_layer(E, Ly):
                                pre=fptr(fp, "npre"), post=fptr(fp, "npost"), comb=fptr(fp, "ncomb"),
                                part2=plog(P2A), cnt=lc + i64(S.LCB + ATT_POST), pflag=apnfl, ptag=apntg,
                                anw=ltab(fp, Ly, "anw")(), x8a=c["x8"], xsa=c["xs"],
-                               engkv=fptr(fp, "engkv"), enggw=ltab(fp, Ly, "enggw")(), eng=lfl(128),
+                               engkv=fptr(fp, "engkv") + (lfl(S.ENG_ENTRY) & (Ly != fx.Int32(S.ENG_ROWS[0]))).select(
+                                   fx.Int64(ES.T * ES.EN * 2), fx.Int64(0)), enggw=ltab(fp, Ly, "enggw")(), eng=lfl(128),
                                engp=plog(ENGP), engflag=engfl, engtag=engtg, **engtp(c["recv"], rank)), TR)
         if hx.unlikely(lastL & (b < 16)):   # (c1 code size: the last layer only, off the hot path)
             FS.xh_out(dict(t=tq5, b=b, w=tq5 // 32, l=tq5 % 32, sm=sm + FLO, x1g=plog(X1A), part2=plog(P2A),
