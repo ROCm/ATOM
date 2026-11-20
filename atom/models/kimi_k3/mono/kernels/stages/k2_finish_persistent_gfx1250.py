@@ -129,6 +129,20 @@ class K2FinishKernel:
     body: object = None
 
 
+def routing_ctas(rows: int, blocks: int, route_xcd: bool) -> tuple[list, list]:
+    """A routes-apart finish's CTA of each token, and the shared-down CTAs in
+    their task order: the last ``rows`` CTAs route, or with ``route_xcd``
+    CTA 8 k routes token k (``XCDS`` CTAs a round over the XCDs); CTA b
+    takes shared-down index ``b`` less the routing CTAs before it."""
+    if not route_xcd:
+        return list(range(blocks - rows, blocks)), list(range(blocks - rows))
+    xcds = gemv_tdm_gfx1250.XCDS
+    routing = [xcds * k for k in range(rows)]
+    shared = [b for b in range(blocks) if b % xcds or b // xcds >= rows]
+    assert all(b - min(-(-b // xcds), rows) == i for i, b in enumerate(shared))
+    return routing, shared
+
+
 def _direct_poll(requests):
     values = []
     for pointer, index, _tag in requests:
@@ -443,13 +457,13 @@ def build_packed_finish(
         and envs.ATOM_KIMI_MONO_HERD_OWN_LOCAL
     )
     poll_space = envs.ATOM_KIMI_MONO_HERD_POLL_SPACE
-    # Up to an XCD's CTAs of rows, token k's routing CTA is CTA 8 k, on the
-    # first XCD (CTAs go round-robin over them), the others the shared down's
-    # in order: the routing CTAs start among the first dispatched, and their
-    # own-candidates exchange stays in that XCD's L2 (SE scope).
+    # Up to an XCD's CTAs of rows, token k's own-candidates routing CTA is
+    # CTA 8 k, on the first XCD (CTAs go round-robin over them), the others
+    # the shared down's in order: the routing CTAs start among the first
+    # dispatched, and their exchange stays in that XCD's L2 (SE scope).
     xcds = gemv_tdm_gfx1250.XCDS
     route_xcd = (
-        routes_apart
+        own_local
         and rows <= plan.blocks // xcds
         and envs.ATOM_KIMI_MONO_LITE_ROUTE_XCD
     )
@@ -662,9 +676,8 @@ def build_packed_finish(
         route_token = bid if include_routed else bid - (plan.blocks - rows)
         shared_index = bid
         if const_expr(route_xcd):
+            # ``routing_ctas``' placement
             route_token = (bid % xcds == 0).select(bid // xcds, fx.Int32(rows))
-            # the shared-down CTAs in order: a CTA's index, the routing CTAs
-            # before it skipped
             shared_index = bid - fx.min((bid + xcds - 1) // xcds, fx.Int32(rows))
         launch_word = herd_at["launch"][0] // 4
         candidates = scratch + fx.Int64(herd_at["candidates"][0])

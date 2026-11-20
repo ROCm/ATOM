@@ -887,11 +887,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KIMI_MONO_HERD_POLL_SPACE": lambda: int(
         os.getenv("ATOM_KIMI_MONO_HERD_POLL_SPACE", "1")
     ),
-    # 1: up to 32 rows the gfx1250 lite finish's routing CTAs (routing apart
-    # from the shared down) are token k's CTA 8 k -- the first XCD's, among
-    # the first dispatched -- and the parallel-HERD own-candidates exchange
-    # (ATOM_KIMI_MONO_HERD_OWN_LOCAL=1) stays in that XCD's L2 (the same
-    # bits); 0, the default, keeps them the last CTAs.
+    # 1: up to 32 rows the gfx1250 lite finish's own-candidates routing CTAs
+    # (ATOM_KIMI_MONO_HERD_OWN_LOCAL=1) are token k's CTA 8 k -- the first
+    # XCD's, among the first dispatched -- and their candidates exchange
+    # stays in that XCD's L2 (the same bits); 0, the default, keeps them the
+    # last CTAs, exchanging at device scope.
     "ATOM_KIMI_MONO_LITE_ROUTE_XCD": lambda: (
         os.getenv("ATOM_KIMI_MONO_LITE_ROUTE_XCD", "0") == "1"
     ),
