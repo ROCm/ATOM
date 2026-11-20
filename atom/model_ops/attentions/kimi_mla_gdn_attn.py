@@ -729,8 +729,9 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         prefill may pad to a recorded token-graph bucket. The regions
         (`_kda_recurrence`, `attention_mla._mla_prefill_core`) run the whole
         bucket too. A pad row belongs to no request: its batch id and KV slot
-        are -1 and it lies past every request's `cu_seqlens`, and a padding
-        request is zero long on `PAD_SLOT_ID` state. Their kernels skip it.
+        are -1, it lies past every request's `cu_seqlens` (a padding request
+        there is zero long), and the KDA metadata names the requests' rows and
+        state slots alone. Their kernels skip it.
 
         Not under DP: a decoding or idle rank would replay the prefill
         recording (`ForwardMode._pad_to_token_graph`), whose regions serve a

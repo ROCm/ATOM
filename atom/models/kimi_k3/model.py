@@ -1017,11 +1017,12 @@ def kda_attention_with_output(
     its all-reduce are sized by the bucket alone, so they land in the graph.
     The capture's warmup forward runs the same split, as an MLA layer's does
     (`prefill_token_graph_capture`), so they first run at the bucket's shape
-    outside the capture. Otherwise the mixer is a plain call outside any graph
-    capture, and one region (`_kda_mixer`) inside one.
+    outside the capture. Otherwise the mixer is one region (`_kda_mixer`) on a
+    recording or inside a graph capture, and a plain call when nothing
+    records, a drafter's eager step under a replay included.
     """
     fwd_ctx = get_forward_context()
-    if fwd_ctx.tr_graph is None and not fwd_ctx.in_hipgraph:
+    if fwd_ctx.tr_graph != "record" and not fwd_ctx.in_hipgraph:
         return _kda(hidden_states, hidden_states_scale, layer_name)
     if prefill_token_graph_capture():
         self = get_current_atom_config().compilation_config.static_forward_context[
@@ -1055,10 +1056,9 @@ def _kda_recurrence(
 ) -> torch.Tensor:
     """A prefill's causal conv and KDA recurrence, ``[T, heads, head_dim]``:
     the TR-graph break of a split KDA layer, whose launches follow each
-    request's rows and state slots. It runs every row of the bucket. A pad row
-    belongs to no request (past every request's `query_start_loc`): the
-    kernels skip it and leave its output unwritten, as a decode leaves a
-    padding request's."""
+    request's rows and state slots. It runs every row of the bucket: the KDA
+    metadata names the requests' rows and slots alone, so the kernels skip the
+    pad rows past them, and the output rows there are don't-care."""
     self = get_current_atom_config().compilation_config.static_forward_context[
         layer_name
     ]
