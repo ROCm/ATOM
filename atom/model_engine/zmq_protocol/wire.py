@@ -7,13 +7,17 @@ buffer an envelope refers to: a large one becomes a frame of its own and is
 handed to ZMQ without a copy; small ones are packed, aligned, into one shared
 frame so a batch of short prompts is not hundreds of tiny frames. On the other
 end `FrameReader` hands out views of the received frames, so a decoded tensor
-aliases the ZMQ message rather than a copy of it.
+with a frame of its own aliases the ZMQ message rather than a copy of it; a
+small one is copied out of the shared frame.
 
 `encode_value` / `decode_value` carry the dict-shaped fields (multimodal data,
 KV-transfer params, metrics) as a typed tree. Types are matched exactly: a
 tuple stays a tuple, a numpy scalar stays a numpy scalar, and anything the
 tree cannot express -- a subclass included -- is pickled into a frame rather
-than silently converted.
+than silently converted. A list or tuple of plain ints (KV block ids) travels
+packed rather than as a Value per item. The tree nests at most
+`MAX_VALUE_DEPTH` containers deep, so a message carrying it still parses
+under protobuf's recursion limit.
 """
 
 import array
@@ -182,25 +186,20 @@ def _torch_tables():
     if _torch_dtypes is None:
         import torch
 
-        names = {
-            "bool": pb.BOOL,
-            "uint8": pb.UINT8,
-            "int8": pb.INT8,
-            "int16": pb.INT16,
-            "uint16": pb.UINT16,
-            "int32": pb.INT32,
-            "uint32": pb.UINT32,
-            "int64": pb.INT64,
-            "uint64": pb.UINT64,
-            "float16": pb.FLOAT16,
-            "bfloat16": pb.BFLOAT16,
-            "float32": pb.FLOAT32,
-            "float64": pb.FLOAT64,
-        }
         _torch_dtypes = {
-            getattr(torch, name): wire
-            for name, wire in names.items()
-            if hasattr(torch, name)
+            torch.bool: pb.BOOL,
+            torch.uint8: pb.UINT8,
+            torch.int8: pb.INT8,
+            torch.int16: pb.INT16,
+            torch.uint16: pb.UINT16,
+            torch.int32: pb.INT32,
+            torch.uint32: pb.UINT32,
+            torch.int64: pb.INT64,
+            torch.uint64: pb.UINT64,
+            torch.float16: pb.FLOAT16,
+            torch.bfloat16: pb.BFLOAT16,
+            torch.float32: pb.FLOAT32,
+            torch.float64: pb.FLOAT64,
         }
         _torch_from_wire = {wire: dtype for dtype, wire in _torch_dtypes.items()}
     return _torch_dtypes, _torch_from_wire
@@ -265,6 +264,10 @@ def _check_nbytes(view, shape, itemsize) -> None:
 
 def _decode_tensor(msg, reader: FrameReader):
     view = reader.view(msg.data)
+    if view.nbytes < OWN_FRAME_BYTES:
+        # Packed beside the message's other small buffers: copied, so a small
+        # tensor kept around does not pin the whole shared frame.
+        view = memoryview(bytearray(view))
     shape = tuple(msg.shape)
     if msg.kind == pb.TORCH:
         import torch
@@ -293,10 +296,20 @@ def _decode_tensor(msg, reader: FrameReader):
 # ---------------------------------------------------------------- values ---
 
 _INT64_MIN, _INT64_MAX = -(1 << 63), (1 << 63) - 1
+# Containers a value may nest. Each map level costs a parser three messages
+# (Value, ValueMap, MapEntry), and the deepest value sits about five more
+# below the Envelope, so 30 stays under the recursion limit of 100 that
+# protobuf (Python and C++) and prost all parse with.
+MAX_VALUE_DEPTH = 30
 
 
 def encode_value(value, msg: "pb.Value", writer: FrameWriter) -> None:
-    """Fill `msg` with `value`."""
+    """Fill `msg` with `value`; a `ProtocolError` if it nests deeper than
+    `MAX_VALUE_DEPTH` containers, which the receiver could not parse."""
+    _encode_value(value, msg, writer, 0)
+
+
+def _encode_value(value, msg: "pb.Value", writer: FrameWriter, depth: int) -> None:
     kind = type(value)
     if value is None:
         msg.null_value = True
@@ -310,22 +323,42 @@ def encode_value(value, msg: "pb.Value", writer: FrameWriter) -> None:
         msg.string_value = value
     elif kind is bytes:
         msg.bytes_value = value
-    elif kind is list or kind is tuple:
-        items = msg.list_value if kind is list else msg.tuple_value
-        items.SetInParent()
-        for item in value:
-            encode_value(item, items.items.add(), writer)
-    elif kind is dict:
-        entries = msg.map_value
-        entries.SetInParent()
-        for key, item in value.items():
-            entry = entries.entries.add()
-            encode_value(key, entry.key, writer)
-            encode_value(item, entry.value, writer)
+    elif kind is list or kind is tuple or kind is dict:
+        if depth >= MAX_VALUE_DEPTH:
+            raise ProtocolError(
+                f"a value nests more than {MAX_VALUE_DEPTH} containers deep"
+            )
+        if kind is dict:
+            entries = msg.map_value
+            entries.SetInParent()
+            for key, item in value.items():
+                entry = entries.entries.add()
+                _encode_value(key, entry.key, writer, depth + 1)
+                _encode_value(item, entry.value, writer, depth + 1)
+        elif _packable_ints(value):
+            ints = msg.int_list_value if kind is list else msg.int_tuple_value
+            ints.SetInParent()
+            ints.items.extend(value)
+        else:
+            items = msg.list_value if kind is list else msg.tuple_value
+            items.SetInParent()
+            for item in value:
+                _encode_value(item, items.items.add(), writer, depth + 1)
     elif not _encode_array(value, msg.tensor_value, writer):
         writer.add(
             pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL), msg.pickled_value
         )
+
+
+def _packable_ints(value) -> bool:
+    """Whether a list or tuple is plain ints within int64, which go packed.
+    Exactly `int`: a bool or a numpy integer keeps its own type as a Value."""
+    return (
+        bool(value)
+        and set(map(type, value)) == {int}
+        and _INT64_MIN <= min(value)
+        and max(value) <= _INT64_MAX
+    )
 
 
 def _encode_array(value, msg, writer: FrameWriter) -> bool:
@@ -358,6 +391,10 @@ def decode_value(msg: "pb.Value", reader: FrameReader):
         return [decode_value(item, reader) for item in msg.list_value.items]
     if which == "tuple_value":
         return tuple(decode_value(item, reader) for item in msg.tuple_value.items)
+    if which == "int_list_value":
+        return list(msg.int_list_value.items)
+    if which == "int_tuple_value":
+        return tuple(msg.int_tuple_value.items)
     if which == "map_value":
         return {
             decode_value(entry.key, reader): decode_value(entry.value, reader)
