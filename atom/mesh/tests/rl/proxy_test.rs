@@ -185,6 +185,10 @@ async fn rl_proxy_relays_an_engine_500_as_an_outcome() {
     assert_eq!(outcome["status"], 500);
     assert_eq!(outcome["worker_id"], id);
     assert_eq!(outcome["body"]["method"], "POST");
+    // A worker without a key gets no `authorization`: the caller's `/v1/rl`
+    // bearer never reaches the engine.
+    let headers = &outcome["body"]["headers"];
+    assert!(headers.get("authorization").is_none(), "{headers}");
 
     ctx.shutdown().await;
     worker.stop().await;
