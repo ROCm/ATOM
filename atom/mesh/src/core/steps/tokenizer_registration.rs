@@ -45,8 +45,9 @@ pub struct TokenizerConfigRequest {
     /// Optional path to chat template file
     pub chat_template_path: Option<String>,
     /// Optional cache configuration. If provided, wraps a tokenizer that encodes
-    /// with HuggingFace with CachedTokenizer; one that encodes with fastokens has
-    /// fastokens' segment cache instead.
+    /// with HuggingFace with CachedTokenizer; one that encodes with fastokens is
+    /// not wrapped, and has fastokens' segment cache only if
+    /// `--fastokens-segment-cache-mb` or `FASTOKENS_SEGMENT_CACHE` turns it on.
     #[serde(default)]
     pub cache_config: Option<TokenizerCacheConfig>,
     /// If true, the workflow fails when a tokenizer with the same name already exists.
@@ -135,7 +136,8 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
                         chat_template.as_deref(),
                     )
                     .await;
-                    // fastokens has a cache of its own, `--fastokens-segment-cache-mb`.
+                    // fastokens has a cache of its own, off by default:
+                    // `--fastokens-segment-cache-mb`.
                     if base_tokenizer.as_any().is::<FastTokenizer>() {
                         return Ok(base_tokenizer);
                     }
@@ -216,8 +218,9 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
     }
 
     fn is_retryable(&self, error: &WorkflowError) -> bool {
-        // Network/IO errors are retryable; a `--fastokens-strict` refusal is what
-        // the probe found, and a retry would only probe again.
+        // Network/IO errors are retryable, among them a `tokenizer.json` fastokens
+        // cannot download under `--fastokens-strict`; a `--fastokens-strict`
+        // refusal is what the probe found, and a retry would only probe again.
         !matches!(
             error,
             WorkflowError::StepFailed { message, .. } if message.starts_with(STRICT_REFUSAL)
@@ -329,16 +332,20 @@ pub fn create_tokenizer_workflow_data(
 
 #[cfg(test)]
 mod tests {
+    use serial_test::serial;
     use wfaas::WorkflowInstanceId;
 
     use super::*;
     use crate::{
-        config::RouterConfig,
+        config::{FastokensConfig, RouterConfig},
         routers::{
             comm::tokenize::remove_tokenizer,
             test_mocks::{
                 app_context::{app_context, app_context_with_router_config},
-                tokenizer::{byte_level_tokenizer_dir, hf_tokenizer_path, BYTE_LEVEL_MERGES},
+                tokenizer::{
+                    byte_level_tokenizer_dir, hf_tokenizer, hf_tokenizer_path, EnvVar,
+                    BYTE_LEVEL_MERGES,
+                },
             },
         },
         tokenizer::{registry::TokenizerRegistry, HuggingFaceTokenizer},
@@ -473,6 +480,37 @@ mod tests {
             .unwrap();
         assert!(LoadTokenizerStep.is_retryable(&error), "{error}");
         assert!(context.tokenizer_registry.list().is_empty());
+    }
+
+    /// A `tokenizer.json` fastokens cannot download is no refusal: under
+    /// `--fastokens-strict` the registration fails and is retried, and without
+    /// it the model keeps HuggingFace.
+    #[tokio::test]
+    #[serial]
+    async fn test_fastokens_download_failures_are_retried() {
+        let _endpoint = EnvVar::set("HF_ENDPOINT", "http://127.0.0.1:1");
+        let hf = hf_tokenizer();
+        let mut config = FastokensConfig {
+            models: vec!["*".to_string()],
+            strict: true,
+            ..Default::default()
+        };
+        let error = with_fastokens(hf.clone(), "model", "org/model", &config)
+            .await
+            .err()
+            .unwrap();
+        assert!(error.contains("cannot download"), "{error}");
+        let error = WorkflowError::StepFailed {
+            step_id: StepId::new("load_tokenizer"),
+            message: error,
+        };
+        assert!(LoadTokenizerStep.is_retryable(&error), "{error}");
+
+        config.strict = false;
+        let kept = with_fastokens(hf.clone(), "model", "org/model", &config)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&kept, &hf));
     }
 
     #[test]

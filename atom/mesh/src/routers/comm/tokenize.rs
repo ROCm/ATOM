@@ -129,7 +129,7 @@ pub async fn tokenize(context: &Arc<AppContext>, request: Request) -> Response {
         Err(error) => return ingress_error_response(error),
     };
     let registry = context.tokenizer_registry.clone();
-    let limits = TokenizeLimits::new(&context.router_config);
+    let limits = context.tokenize_limits;
     run_on_prepare_pool(context, move |_| {
         tokenize_body(&registry, limits, &body).unwrap_or_else(ingress_error_response)
     })

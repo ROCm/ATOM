@@ -155,7 +155,8 @@ pub struct PreparePoolConfig {
     )]
     pub prepare_timeout_ms: u64,
     /// Tokenization byte limit (default: 1 MiB); overrides --ext-proc-max-tokenize-bytes.
-    /// The models fastokens encodes have --fastokens-max-tokenize-bytes.
+    /// The models fastokens encodes have the larger of this limit and 64 MiB,
+    /// unless --fastokens-max-tokenize-bytes sets theirs.
     #[arg(id = "prepare_max_tokenize_bytes", long = "prepare-max-tokenize-bytes")]
     pub max_tokenize_bytes: Option<usize>,
 }
@@ -172,19 +173,21 @@ impl Default for PreparePoolConfig {
     }
 }
 
-/// Default `--fastokens-max-tokenize-bytes`, unless `--prepare-max-tokenize-bytes`
-/// is larger.
+/// Default `--fastokens-max-tokenize-bytes`, unless the other models' limit is
+/// larger.
 pub const DEFAULT_FASTOKENS_MAX_TOKENIZE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Encoding prompts with fastokens rather than HuggingFace `tokenizers`.
 #[derive(Debug, Clone, Default, clap::Args, Serialize, Deserialize, PartialEq, Eq)]
-#[command(next_help_heading = "Tokenization")]
+#[command(next_help_heading = "Tokenizer")]
 #[serde(default)]
 pub struct FastokensConfig {
     /// Models whose prompts encode with fastokens, by the name or source their
     /// tokenizer registers under, or `*` for every model. Decoding and chat
-    /// templates stay with HuggingFace, and so does a model whose prompts
-    /// fastokens does not encode as HuggingFace does.
+    /// templates stay with HuggingFace, except that fastokens decodes the ids
+    /// of the tokens only tokenizer_config.json declares, which HuggingFace
+    /// does not have. A model whose prompts fastokens does not encode, or
+    /// decode, as HuggingFace does stays with HuggingFace.
     #[arg(
         id = "fastokens_models",
         long = "fastokens-models",
@@ -195,8 +198,8 @@ pub struct FastokensConfig {
     /// Fail to register such a model's tokenizer instead of keeping HuggingFace.
     #[arg(id = "fastokens_strict", long = "fastokens-strict")]
     pub strict: bool,
-    /// Tokenization byte limit for those models (default: 64 MiB, or
-    /// --prepare-max-tokenize-bytes when larger).
+    /// Tokenization byte limit for those models (default: the larger of 64 MiB
+    /// and the other models' limit).
     #[arg(
         id = "fastokens_max_tokenize_bytes",
         long = "fastokens-max-tokenize-bytes"

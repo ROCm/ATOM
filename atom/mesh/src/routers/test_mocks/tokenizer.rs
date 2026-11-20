@@ -195,6 +195,30 @@ pub(crate) fn byte_level_tokenizer_dir(
     dir
 }
 
+/// Sets an environment variable until dropped, then restores it. The tests that
+/// set one, and those that read it, are `#[serial]`.
+pub(crate) struct EnvVar {
+    name: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvVar {
+    pub(crate) fn set(name: &'static str, value: &str) -> Self {
+        let previous = std::env::var_os(name);
+        std::env::set_var(name, value);
+        Self { name, previous }
+    }
+}
+
+impl Drop for EnvVar {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var(self.name, value),
+            None => std::env::remove_var(self.name),
+        }
+    }
+}
+
 pub(crate) fn tokenizer_registry_with_hf(name: &str) -> Arc<TokenizerRegistry> {
     let registry = Arc::new(TokenizerRegistry::new());
     let id = TokenizerRegistry::generate_id();

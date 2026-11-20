@@ -468,7 +468,7 @@ pub struct CliArgs {
     #[arg(long, help_heading = "Tokenizer")]
     pub chat_template: Option<String>,
 
-    /// Enable L0 (exact match) tokenizer cache
+    /// Enable L0 (exact match) tokenizer cache, for the models fastokens does not encode
     #[arg(long, default_value_t = false, help_heading = "Tokenizer")]
     pub tokenizer_cache_enable_l0: bool,
 
@@ -476,7 +476,7 @@ pub struct CliArgs {
     #[arg(long, default_value_t = 10000, help_heading = "Tokenizer")]
     pub tokenizer_cache_l0_max_entries: usize,
 
-    /// Enable L1 (prefix matching) tokenizer cache
+    /// Enable L1 (prefix matching) tokenizer cache, for the models fastokens does not encode
     #[arg(long, default_value_t = false, help_heading = "Tokenizer")]
     pub tokenizer_cache_enable_l1: bool,
 

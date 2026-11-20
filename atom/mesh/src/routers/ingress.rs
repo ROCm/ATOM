@@ -647,7 +647,7 @@ impl IngressRouting {
             tokenizer_registry: app.tokenizer_registry.clone(),
             chats_without_template: app.chats_without_template.clone(),
             pd: app.router_config.mode.is_pd_mode(),
-            tokenize_limits: TokenizeLimits::new(&app.router_config),
+            tokenize_limits: app.tokenize_limits,
         }
     }
 

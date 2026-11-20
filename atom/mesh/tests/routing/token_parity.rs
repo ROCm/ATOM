@@ -6,6 +6,7 @@ use std::{
 };
 
 use serde_json::{json, Value};
+use serial_test::serial;
 use wfaas::{StepExecutor, WorkflowContext, WorkflowInstanceId};
 
 use super::*;
@@ -39,7 +40,8 @@ const TOKENIZER_FILES: [(&str, bool); 4] = [
 
 /// `model`'s tokenizer files at `revision`, from HuggingFace or `$HF_ENDPOINT`,
 /// kept in the target directory for the next run. A file not every checkpoint
-/// has may be missing; failing to download any other fails the test.
+/// has may be missing; failing to download any other, each within 5 minutes,
+/// fails the test.
 async fn huggingface_files(model: &str, revision: &str) -> PathBuf {
     let exe = std::env::current_exe().unwrap();
     let dir = exe
@@ -52,13 +54,18 @@ async fn huggingface_files(model: &str, revision: &str) -> PathBuf {
     std::fs::create_dir_all(&dir).unwrap();
     let endpoint =
         std::env::var("HF_ENDPOINT").unwrap_or_else(|_| "https://huggingface.co".to_string());
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(300))
+        .build()
+        .unwrap();
     for (file, every_checkpoint_has) in TOKENIZER_FILES {
         let path = dir.join(file);
         if path.exists() {
             continue;
         }
         let url = format!("{endpoint}/{model}/resolve/{revision}/{file}");
-        let response = match reqwest::get(&url).await {
+        let response = match client.get(&url).send().await {
             Ok(response)
                 if !every_checkpoint_has && response.status() == reqwest::StatusCode::NOT_FOUND =>
             {
@@ -277,9 +284,10 @@ async fn tokenize(
 /// ATOM rejects it. The table lists how long encoding each prompt takes with
 /// either backend: once for the fixture, the median of 5 runs otherwise (build
 /// with `--release` for numbers worth reading). As it downloads, it runs only
-/// when asked for (`--ignored`).
+/// when asked for (`--ignored`), and not while a test sets `$HF_ENDPOINT`.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "downloads from HuggingFace: cargo test --lib test_requests_tokenize_as_on_atom -- --ignored"]
+#[serial]
 async fn test_requests_tokenize_as_on_atom() {
     let recorded = std::env::var("ATOM_TOKEN_PARITY").ok();
     let path = recorded.clone().unwrap_or_else(|| FIXTURE.to_string());

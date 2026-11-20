@@ -349,7 +349,9 @@ def digest(token_ids: list[int]) -> str:
 
 
 async def tokenize_on_atom(args, requests: list[dict]) -> dict:
-    report = {"model": args.model}
+    # The test reads the checkpoint from atom/mesh, so a path is stored absolute.
+    checkpoint = Path(args.model)
+    report = {"model": str(checkpoint.resolve()) if checkpoint.exists() else args.model}
     if args.huggingface:
         report["model"], report["revision"] = args.huggingface.split("@")
     if any("synthetic" in request for request in requests):
