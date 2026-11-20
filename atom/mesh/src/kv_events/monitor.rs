@@ -11,7 +11,10 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     fmt,
-    sync::{Arc, OnceLock},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, OnceLock,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -72,6 +75,8 @@ pub struct KvEventMonitor {
     partitions: DashMap<(String, &'static str, u32), Arc<Partition>>,
     stores: OnceLock<(Arc<StorageSources>, f64)>,
     share_weight: OnceLock<f64>,
+    /// The subscriptions of ranks in a share group; below two, no rank copies from another.
+    shared_ranks: AtomicUsize,
     threads: Handle,
     runtime: Option<Runtime>,
 }
@@ -169,6 +174,7 @@ impl KvEventMonitor {
             partitions: DashMap::new(),
             stores: OnceLock::new(),
             share_weight: OnceLock::new(),
+            shared_ranks: AtomicUsize::new(0),
             threads: runtime.handle().clone(),
             runtime: Some(runtime),
         })
@@ -207,6 +213,10 @@ impl KvEventMonitor {
         let task = self
             .threads
             .spawn(follow(source, dp_rank, status.clone(), holder.clone()));
+        // Counted before it is in the map, so that its detach cannot uncount it first.
+        if share.is_some() {
+            self.shared_ranks.fetch_add(1, Ordering::Relaxed);
+        }
         let subscription = Subscription {
             status,
             partition,
@@ -214,7 +224,10 @@ impl KvEventMonitor {
             task,
             share,
         };
-        self.subscriptions.insert(worker.into(), subscription);
+        let earlier = self.subscriptions.insert(worker.into(), subscription);
+        if earlier.is_some_and(|earlier| earlier.share.is_some()) {
+            self.shared_ranks.fetch_sub(1, Ordering::Relaxed);
+        }
         self.register(worker);
     }
 
@@ -226,7 +239,10 @@ impl KvEventMonitor {
     /// Stops following `worker`'s stream, if any, and predicting its cache.
     pub fn detach(&self, worker: &str) {
         self.predictors.remove(worker);
-        self.subscriptions.remove(worker);
+        let removed = self.subscriptions.remove(worker);
+        if removed.is_some_and(|(_, subscription)| subscription.share.is_some()) {
+            self.shared_ranks.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     /// Counts, in what a worker's engine will report cached, what it loads from the store
@@ -321,10 +337,9 @@ impl PrefixMatchProvider for KvEventMonitor {
         tokens: &[u32],
         workers: &[Arc<dyn Worker>],
         device: &[Option<u32>],
-    ) -> Vec<Option<u32>> {
-        let mut shared = device.to_vec();
-        if self.share_weight() == 0.0 {
-            return shared;
+    ) -> Option<Vec<Option<u32>>> {
+        if self.share_weight() == 0.0 || self.shared_ranks.load(Ordering::Relaxed) < 2 {
+            return None;
         }
         let ranks: Vec<(String, String, Lane)> = (self.subscriptions.iter())
             .filter_map(|s| {
@@ -367,14 +382,15 @@ impl PrefixMatchProvider for KvEventMonitor {
             }
         }
         if asked.is_empty() {
-            return shared;
+            return None;
         }
         let lanes: Vec<Vec<Lane>> = wanted.iter().map(|&g| groups[g].1.clone()).collect();
         let held = match_groups(tokens, &lanes);
+        let mut shared = device.to_vec();
         for (i, at) in asked {
             shared[i] = shared[i].map(|own| own.max(held[at]));
         }
-        shared
+        Some(shared)
     }
 
     fn share_weight(&self) -> f64 {
@@ -1169,17 +1185,20 @@ mod tests {
         let urls: Vec<String> = (0..4)
             .map(|rank| format!("http://127.0.0.1:8000@{rank}"))
             .collect();
+        // Its engine never binds, so only the test writes the rank's lane.
+        let source = |kv_pool| KvEventSource {
+            endpoint: "tcp://127.0.0.1:1".into(),
+            topic: "kv".into(),
+            block_size: 4,
+            kv_pool,
+            ..Default::default()
+        };
         for (rank, (url, kv_pool)) in urls.iter().zip(pools).enumerate() {
-            // Its engine never binds, so only the test writes the rank's lane.
-            let source = KvEventSource {
-                endpoint: "tcp://127.0.0.1:1".into(),
-                topic: "kv".into(),
-                block_size: 4,
-                kv_pool,
-                ..Default::default()
-            };
-            monitor.attach(url, "model", "regular", rank as u32, source);
+            monitor.attach(url, "model", "regular", rank as u32, source(kv_pool));
         }
+        // Following a rank again replaces its subscription.
+        monitor.attach(&urls[0], "model", "regular", 0, source(pool("unix:///a")));
+        assert_eq!(monitor.shared_ranks.load(Ordering::Relaxed), 3);
         let prompt: Vec<u32> = (1..=13).collect();
         let stored = |blocks: usize| KvEvent::Stored {
             parent: None,
@@ -1201,11 +1220,18 @@ mod tests {
             .collect();
         let device = [Some(8), Some(0), Some(12), Some(12)];
         matched(&monitor, &prompt, &workers, &device).await;
-        assert_eq!(monitor.shared_tokens(&prompt, &workers, &device), device);
+        assert_eq!(monitor.shared_tokens(&prompt, &workers, &device), None);
         monitor.share_pools(0.9);
         assert_eq!(monitor.share_weight(), 0.9);
-        let shared = [Some(8), Some(8), Some(12), Some(12)];
-        assert_eq!(monitor.shared_tokens(&prompt, &workers, &device), shared);
+        let shared = vec![Some(8), Some(8), Some(12), Some(12)];
+        assert_eq!(
+            monitor.shared_tokens(&prompt, &workers, &device),
+            Some(shared)
+        );
+        // Without another followed rank in its group, no rank copies anything in.
+        monitor.detach(&urls[1]);
+        assert_eq!(monitor.shared_ranks.load(Ordering::Relaxed), 2);
+        assert_eq!(monitor.shared_tokens(&prompt, &workers, &device), None);
     }
 
     /// A worker is predicted from its registration to its detach: in the partition of its

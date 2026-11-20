@@ -43,14 +43,15 @@ pub(crate) trait PrefixMatchProvider: Send + Sync + Debug {
 
     /// The tokens of `tokens` each worker's device cache will hold, in the order of
     /// `workers`, when it holds what `device` says: that, or more where its engine copies
-    /// the prefix in from the pools of the other ranks of its share group.
+    /// the prefix in from the pools of the other ranks of its share group. None where no
+    /// worker's can, and `device` stands.
     fn shared_tokens(
         &self,
         _tokens: &[u32],
         _workers: &[Arc<dyn Worker>],
-        device: &[Option<u32>],
-    ) -> Vec<Option<u32>> {
-        device.to_vec()
+        _device: &[Option<u32>],
+    ) -> Option<Vec<Option<u32>>> {
+        None
     }
 
     /// What a token an engine copies in from its share group counts for in a match rate,

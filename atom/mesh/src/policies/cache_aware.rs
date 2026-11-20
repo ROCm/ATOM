@@ -340,10 +340,11 @@ impl CacheAwarePolicy {
         let provider = self.kv_events.get()?;
         let hits = provider.match_workers(tokens, workers);
         let shared = provider.shared_tokens(tokens, workers, &hits);
-        let cached = provider.cached_tokens(tokens, workers, &shared).await;
+        let held = shared.as_deref().unwrap_or(&hits);
+        let cached = provider.cached_tokens(tokens, workers, held).await;
         let (share_weight, store_weight) = (provider.share_weight(), provider.store_weight());
         let copied = |idx: usize| {
-            shared[idx]
+            held[idx]
                 .zip(hits[idx])
                 .map_or(0, |(s, d)| s.saturating_sub(d))
         };
@@ -1064,9 +1065,9 @@ mod tests {
             _: &[u32],
             _: &[Arc<dyn Worker>],
             device: &[Option<u32>],
-        ) -> Vec<Option<u32>> {
+        ) -> Option<Vec<Option<u32>>> {
             assert_eq!(device, self.match_workers(&[], &[]));
-            self.0.iter().map(|&(_, shared)| Some(shared)).collect()
+            Some(self.0.iter().map(|&(_, shared)| Some(shared)).collect())
         }
 
         fn share_weight(&self) -> f64 {
