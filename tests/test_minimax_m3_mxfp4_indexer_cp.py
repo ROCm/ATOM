@@ -76,11 +76,11 @@ def test_a_shard_sizes_its_map_bound_and_workspace(monkeypatch, cp):
     assert (record.max_block, record.shard) == (local, shard)
     assert (record.cp_world, record.cp_rank) == cp
     assert record.work_map.shape == (100, 2)
-    prefill = max(MAX_BS * MAX_QLEN, PREFILL_ROWS) * BOUND
+    prefill = PREFILL_ROWS * BOUND  # one head: a chunk's rows over every block
     decode = world * MAX_BS * MAX_QLEN * local
     assert record.scores.capacity == max(prefill, decode)
     if world > 1:
-        # 4 heads x 128 rows x 16 blocks outgrow 1 head x 128 rows x 63 blocks
+        # 4 heads x 128 rows x 16 blocks outgrow 1 head x 40 rows x 63 blocks
         assert decode > prefill
 
 
