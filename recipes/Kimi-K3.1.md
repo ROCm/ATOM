@@ -121,11 +121,13 @@ on or off, and with the DSpark drafter and ReplaySSM above, plus the P/D
 topology in the next section.
 PCP is rejected while the model is built (the indexer's projections live in
 the fused q_a projection, and the PCP indexer projects k itself). At startup,
-P/D rejects a PP decode (a kv_consumer with PP > 1) and a PP prefill over
-MoRIIO. Online quantization of the other layers, other PP or KV-transfer
-topologies, expert parallelism, DP attention, other speculative methods,
-plugins and TBO are untested. The vision wrapper is registered, but image
-inference has not been validated.
+TBO is rejected, PP rejects any speculative method but DSpark, and P/D rejects
+a PP decode (a kv_consumer with PP > 1) and a PP prefill over MoRIIO. K3.1 P/D
+needs Mooncake: MoRIIO moves neither the DSA index cache nor a DCP decode's KV
+shard, so its output is wrong even when it starts. Online quantization of the
+other layers, other PP or Mooncake topologies, expert parallelism, DP
+attention, other speculative methods and plugins are untested. The vision wrapper is registered, but image inference has not
+been validated.
 
 ## P/D: PP prefill into a DCP decode
 
