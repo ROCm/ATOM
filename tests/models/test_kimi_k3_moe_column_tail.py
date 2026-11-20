@@ -154,23 +154,42 @@ def _gpu_operands(tokens, *, rank=3, padded=False):
     return latent, norm, weight[cols], shared[:, cols]
 
 
-@pytest.mark.parametrize("tokens", [1, 6, 8, 16, 17, 31, 32, 33, 63, 64])
-@pytest.mark.parametrize("rank,padded", [(0, False), (3, True), (7, False)])
-def test_tail_qualifies_normalized_bf16_input(gpu_tail, tokens, rank, padded):
+@pytest.mark.parametrize("seed", [0, 1])
+@pytest.mark.parametrize("padded", [False, True])
+def test_tail_qualifies_normalized_bf16_input(gpu_tail, seed, padded):
     from atom.model_ops.layernorm import rmsnorm2d_fwd_
 
-    torch.manual_seed(123 + rank)
-    latent, norm, weight, shared = _gpu_operands(tokens, rank=rank, padded=padded)
-    normalized = rmsnorm2d_fwd_(latent, norm, 1e-6, latent.shape[1])
-    projection = (normalized.double() @ weight.double().T).float()
-    want = projection + shared.float()
+    torch.manual_seed(seed)
+    width, hidden = 3584, 7168
+    latent = torch.randn(
+        (64, width + (16 if padded else 0)), dtype=torch.bfloat16, device="cuda"
+    )[:, :width]
+    weight = torch.randn(
+        (hidden, width + (32 if padded else 0)), dtype=torch.bfloat16, device="cuda"
+    )[:, :width]
+    weight.mul_(0.02)
+    norm = 1 + 0.1 * torch.randn((width,), dtype=torch.bfloat16, device="cuda")
+    shared = 0.5 * torch.randn((64, hidden), dtype=torch.bfloat16, device="cuda")
     before = [x.clone() for x in (latent, norm, weight, shared)]
-    out = gpu_tail.column_tail(latent, norm, 1e-6, weight, shared)
-    scale = torch.stack((projection.abs(), shared.float().abs(), want.abs())).amax(0)
-    ulp = torch.exp2(torch.floor(torch.log2(scale.clamp_min(1e-30))) - 7)
-    assert torch.max((out.float() - want).abs() / ulp) <= 1
-    assert out.shape == (tokens, 896) and out.dtype == torch.bfloat16
-    assert out.is_contiguous()
+    for tokens in range(1, 65):
+        normalized = rmsnorm2d_fwd_(latent[:tokens], norm, 1e-6, width)
+        projection = (normalized.double() @ weight.double().T).float()
+        want = projection + shared[:tokens].float()
+        shares = []
+        for rank in range(8):
+            cols = slice(rank * 896, (rank + 1) * 896)
+            out = gpu_tail.column_tail(
+                latent[:tokens], norm, 1e-6, weight[cols], shared[:tokens, cols]
+            )
+            assert out.shape == (tokens, 896) and out.dtype == torch.bfloat16
+            assert out.is_contiguous()
+            shares.append(out)
+        actual = torch.cat(shares, dim=1).float()
+        scale = torch.stack(
+            (projection.abs(), shared[:tokens].float().abs(), want.abs())
+        ).amax(0)
+        ulp = torch.exp2(torch.floor(torch.log2(scale.clamp_min(1e-30))) - 7)
+        assert torch.max((actual - want).abs() / ulp) <= 1, (seed, padded, tokens)
     for original, copy in zip((latent, norm, weight, shared), before):
         assert torch.equal(original, copy)
 
