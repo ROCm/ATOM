@@ -4,7 +4,8 @@
 import ast
 import functools
 import threading
-from contextlib import nullcontext
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -27,7 +28,20 @@ def _definitions(path, names, namespace):
 @pytest.fixture
 def indexer():
     slots = torch.tensor([7, 2, 9, 3, 11, -1, -1, -1])
-    ctx = SimpleNamespace(
+    context = {
+        "__name__": __name__,
+        "torch": torch,
+        "dataclass": dataclass,
+        "field": field,
+        "contextmanager": contextmanager,
+        "_forward_context_local": threading.local(),
+    }
+    _definitions(
+        "atom/utils/forward_context.py",
+        {"ForwardContext", "get_forward_context", "side_stream"},
+        context,
+    )
+    ctx = context["ForwardContext"](
         context=SimpleNamespace(
             is_prefill=True,
             is_dummy_run=False,
@@ -36,11 +50,12 @@ def indexer():
         ),
         attn_metadata=SimpleNamespace(slot_mapping=slots, run_sparse=False),
     )
+    context["_forward_context"] = ctx
     graph = {
         "torch": torch,
         "functools": functools,
         "_local": threading.local(),
-        "forward_context": SimpleNamespace(side_stream=lambda _: nullcontext()),
+        "forward_context": SimpleNamespace(side_stream=context["side_stream"]),
     }
     _definitions(
         "atom/utils/region_graph.py", {"_recorder", "eager_region", "_EagerStep"}, graph
@@ -67,7 +82,7 @@ def indexer():
     namespace = {
         "torch": torch,
         "eager_region": graph["eager_region"],
-        "get_forward_context": lambda: ctx,
+        "get_forward_context": context["get_forward_context"],
         "get_current_atom_config": lambda: config,
         "get_dcp_world_size": lambda: 1,
         "pcp_is_enabled": lambda: False,
@@ -165,6 +180,26 @@ def test_dummy_capture_touches_neither_cache_nor_slot_metadata(indexer):
     torch.testing.assert_close(indexer.args["kv_cache"], before)
 
 
+def test_dummy_warmup_uses_production_stream_context(indexer):
+    context = {
+        "contextmanager": contextmanager,
+        "_forward_context": indexer.ctx,
+        "_forward_context_local": threading.local(),
+    }
+    _definitions(
+        "atom/utils/forward_context.py", {"get_forward_context", "side_stream"}, context
+    )
+    indexer.graph["forward_context"] = SimpleNamespace(
+        side_stream=context["side_stream"]
+    )
+    indexer.ctx.in_hipgraph = True
+    indexer.ctx.context.is_dummy_run = True
+    before = indexer.args["kv_cache"].clone()
+    indexer.call(**indexer.args)
+    assert not indexer.writes
+    torch.testing.assert_close(indexer.args["kv_cache"], before)
+
+
 def test_recorded_indexer_reads_the_live_step_after_dummy_capture(indexer):
     steps = []
 
@@ -209,7 +244,16 @@ def test_real_capture_replays_indexer_cache_writes(indexer, monkeypatch):
     for name, value in indexer.namespace.items():
         if name not in {"sparse_attn_indexer", "eager_region", "__builtins__"}:
             monkeypatch.setattr(indexer_forward, name, value, raising=False)
+    indexer.ctx = forward_context.ForwardContext(
+        context=indexer.ctx.context, attn_metadata=indexer.ctx.attn_metadata
+    )
     monkeypatch.setattr(forward_context, "_forward_context", indexer.ctx)
+    monkeypatch.setattr(
+        forward_context._forward_context_local, "ctx", None, raising=False
+    )
+    monkeypatch.setattr(
+        indexer_forward, "get_forward_context", forward_context.get_forward_context
+    )
     indexer.args = {
         name: value.cuda() if isinstance(value, torch.Tensor) else value
         for name, value in indexer.args.items()
@@ -225,9 +269,15 @@ def test_real_capture_replays_indexer_cache_writes(indexer, monkeypatch):
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
+        indexer.ctx.main_stream = stream
+        indexer.ctx.in_hipgraph = True
+        indexer.ctx.tr_graph = "record"
         forward()
         segments, _ = region_graph._record_segments(forward)
     torch.cuda.current_stream().wait_stream(stream)
+    indexer.ctx.main_stream = torch.cuda.current_stream()
+    indexer.ctx.in_hipgraph = False
+    indexer.ctx.tr_graph = "replay"
     indexer.ctx.context.is_dummy_run = False
     for rows, live_slots in ((5, [1, 2, 3, 4, 5]), (2, [12, 13])):
         indexer.ctx.context.scheduled_tokens = rows
