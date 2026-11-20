@@ -764,15 +764,15 @@ digest-carrying requests, the `DenseOffloadConnector` worker plumbing, the
 chunk hash chain keys, the HBM transfer slot pool, the windowed put/get loop
 (held chunks skipped) and the dense or M3 PAGE codecs. What differs:
 
-- The copies run on side streams of the device's highest priority, not on
-  the forward's stream as `mooncake_store`'s do. A UMBP put or get is a
-  synchronous call on the save or load thread, and each window ends in host
-  waits on its copy stream; on the forward's stream those wait behind every
-  queued forward kernel.
 - One server per node over a unix socket; no master, NIC selection or RDMA
-  setup. The server reads and writes the registered staging pools through
+  setup. Shared-prefix DP routing is refused across nodes, since each node's
+  ranks reach only their own server. The server reads and writes the registered staging pools through
   HIP IPC, before it answers each call, so a call that returned settles its
   slots whatever it answered; only one that raised quarantines them.
+- Lookups run synchronously on the scheduler thread, each bounded by
+  `umbp_store.lookup_timeout_ms` (Mori's deadline, ROCm/mori#949); one that
+  raised or ran into the deadline answers nothing and pauses lookups to the
+  server. Put and get have no deadline in Mori.
 - The client uses UMBP's per-key `bool` results. There is no per-key remove
   (the startup probe's object stays until evicted), no read lease (nothing is
   renewed before a load) and no eviction groups; the taint mark after a put
@@ -784,7 +784,7 @@ chunk hash chain keys, the HBM transfer slot pool, the windowed put/get loop
 
 Select it with
 `{"kv_connector": "umbp_store", "kv_role": "offload", "kv_connector_extra_config": {"umbp_store.address": "unix:///tmp/umbp/server.sock"}}`.
-Offload only: beside a P/D producer under `multi` it is not supported yet.
+Offload only: `validate_multi_config` refuses it beside a P/D connector.
 How to install, start and check UMBP, with the settings table, is in
 [`recipes/UMBP-KV-Offload.md`](../../../recipes/UMBP-KV-Offload.md); the
 MiniMax-M3 aggregated TP4 walkthrough is

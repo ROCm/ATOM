@@ -11,7 +11,8 @@ Like the LMCache tier there, the CPU tier pays at **high concurrency** (40 and
 Below that, run without offload.
 
 For the UMBP side (requirements, server settings, checks, limitations) see
-[UMBP-KV-Offload.md](UMBP-KV-Offload.md). PD with UMBP is not supported yet.
+[UMBP-KV-Offload.md](UMBP-KV-Offload.md). PD with UMBP is not supported (a
+P/D connector beside `umbp_store` is refused at startup).
 
 ```bash
 MODEL=/shared_nfs/huggingface_models/amd/MiniMax-M3-MXFP4
@@ -22,7 +23,7 @@ export UMBP_ADDR=unix:///tmp/umbp/server.sock
 
 ## 0. Container
 
-Any ATOM container whose Mori includes UMBP and ROCm/mori#791 (see
+Any ATOM container whose Mori includes UMBP, ROCm/mori#791 and ROCm/mori#949 (see
 [requirements](UMBP-KV-Offload.md#1-requirements)). No `--privileged` is
 needed. Host memory must be lockable, and the IPC namespace shared so the
 server and the workers can map each other's memory:
