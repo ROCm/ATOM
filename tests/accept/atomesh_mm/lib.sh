@@ -5,6 +5,9 @@
 # $RUN_DIR.
 
 CONTAINERS=()
+# Extra docker run options for the next start_container; a topology sets it
+# as a local around the launch that needs it.
+DOCKER_ARGS=()
 
 log() { echo "[accept] $*" >&2; }
 
@@ -43,7 +46,7 @@ start_container() {
   name=$(cname "$role")
   [[ -n $node ]] || { log "no ${role^^}_NODE in the model profile"; return 1; }
   local args=(run -d --name "$name" --network host --ipc host --shm-size 64g
-    -e "HF_HOME=$HF_HOME" -e PYTHONUNBUFFERED=1 -w "$ROOT")
+    -e "HF_HOME=$HF_HOME" -e PYTHONUNBUFFERED=1 -w "$ROOT" "${DOCKER_ARGS[@]}")
   local m covered=0
   for m in "${MOUNTS[@]}"; do
     args+=(-v "$m:$m")
