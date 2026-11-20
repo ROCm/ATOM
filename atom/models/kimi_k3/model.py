@@ -18,7 +18,6 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from aiter.tuned_gemm import tgemm
 from einops import rearrange
 from torch import nn
 
@@ -173,7 +172,7 @@ _RMS_FUSABLE_QUANT_TYPES = (
 )
 
 
-# Measured crossover for native Kimi-K3.1 BF16 in_proj on gfx950 at TP8.
+# Legacy TP8 threshold; the current runtime crossover remains unqualified.
 _KDA_IN_PROJ_SPLIT_MIN_TOKENS = 8192
 
 
@@ -1170,6 +1169,7 @@ class KimiKDAAttention(nn.Module):
             f_b_type == QuantType.per_Token and f_b_dtype == dtypes.fp8
         )
         self._split_in_proj = False
+        self._in_proj_views = None
 
     def get_streaming_deferred_modules(self) -> tuple[nn.Module, ...]:
         """Children that must remain unquantized until KDA fuses their weights."""
@@ -1183,7 +1183,7 @@ class KimiKDAAttention(nn.Module):
         extend that fused weight in place with the two remaining projections that
         also consume ``hidden_states`` -- ``b_proj`` (beta) and ``f_a_proj`` --
         so ``forward`` can emit ``[q | k | v | g | b | f_a]`` in one launch.
-        Qualified large prefills split this weight into ``[q | k | v | g]``
+        Eligible large prefills split this weight into ``[q | k | v | g]``
         and ``[b | f_a]`` row views to use the tuned tile-aligned GEMM. The
         tail storage is then released (the modules stay as empty shells; their
         bf16 post-load hooks are no-ops and never re-run). Runs once; idempotent.
@@ -1236,11 +1236,20 @@ class KimiKDAAttention(nn.Module):
         ).contiguous()
         self._in_proj_fused = True
         self._split_in_proj = self._supports_in_proj_split()
+        if self._split_in_proj:
+            qkvg_rows = 4 * self.local_proj_size
+            # A plain tuple keeps the views out of the loader's post-load walk.
+            self._in_proj_views = (
+                self.in_proj.make_row_view(0, qkvg_rows),
+                self.in_proj.make_row_view(
+                    qkvg_rows, self.num_local_heads + self.head_dim
+                ),
+            )
 
     def _supports_in_proj_split(self) -> bool:
         from aiter.jit.utils.chip_info import get_gfx_runtime
 
-        # Wrappers/subclasses and other geometries have no measured crossover.
+        # Keep wrappers/subclasses outside the inherited native-only scope.
         return (
             type(self) is __class__
             # Child post-load hooks may quantize the fused BF16 weight later.
@@ -1338,7 +1347,7 @@ class KimiKDAAttention(nn.Module):
         hidden_states = hidden_states[:num_actual_tokens]
         if hidden_states_scale is not None:
             hidden_states_scale = hidden_states_scale[:num_actual_tokens]
-        # Split only the measured large-prefill case; f_b_proj still consumes
+        # Split only the eligible large-prefill case; f_b_proj still consumes
         # f_a's output and stays a separate GEMM in either path.
         lp = self.local_proj_size
         nlh = self.num_local_heads
@@ -1351,9 +1360,9 @@ class KimiKDAAttention(nn.Module):
             and hidden_states_scale is None
             and hidden_states.is_contiguous()
         ):
-            weight = self.in_proj.weight
-            qkvg = tgemm.mm(hidden_states, weight[: 4 * lp])
-            tail = tgemm.mm(hidden_states, weight[4 * lp :])
+            qkvg_proj, tail_proj = self._in_proj_views
+            qkvg = qkvg_proj(hidden_states)
+            tail = tail_proj(hidden_states)
         else:
             fused_in = self.in_proj(hidden_states, x_scale=hidden_states_scale)
             qkvg, tail = fused_in[..., : 4 * lp], fused_in[..., 4 * lp :]
