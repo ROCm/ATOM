@@ -48,12 +48,29 @@ PromptTokenIds = list[NonNegativeInt]
 _PROMPT_TOKEN_IDS_ADAPTER = TypeAdapter(PromptTokenIds)
 
 
-def check_media_handoff(kv_transfer_params: dict[str, Any] | None) -> None:
-    """Reject a media handoff key that is not an integer."""
-    handoff = kv_transfer_params or {}
-    for key in ("cache_seed", "mrope_position_delta"):
-        if key in handoff and type(handoff[key]) is not int:
-            raise ValueError(f"kv_transfer_params[{key!r}] must be an integer")
+def check_media_handoff(
+    kv_transfer_params: dict[str, Any], max_model_len: int | None
+) -> None:
+    """Reject an image handoff key out of range.
+
+    `cache_seed` roots a 64-bit prefix hash chain; `mrope_position_delta`
+    moves decode positions, which must stay within the context.
+    """
+    if "cache_seed" in kv_transfer_params:
+        seed = kv_transfer_params["cache_seed"]
+        if type(seed) is not int or not 0 <= seed < 2**64:
+            raise ValueError(
+                "kv_transfer_params['cache_seed'] must be an integer in [0, 2**64)"
+            )
+    if "mrope_position_delta" in kv_transfer_params:
+        delta = kv_transfer_params["mrope_position_delta"]
+        if type(delta) is not int or (
+            max_model_len is not None and abs(delta) > max_model_len
+        ):
+            raise ValueError(
+                "kv_transfer_params['mrope_position_delta'] must be an integer "
+                f"no larger in magnitude than max_model_len ({max_model_len})"
+            )
 
 
 def resolve_prompt_token_ids(
@@ -62,9 +79,10 @@ def resolve_prompt_token_ids(
 ) -> PromptTokenIds | None:
     """Resolve IDs from the top-level field or vLLM-compatible PD metadata.
 
-    Reject empty lists and conflicting IDs between the two locations.
+    On a chat decode leg whose prefill kept the image, these are the
+    prefill's ids, image placeholders expanded. Reject empty lists and
+    conflicting IDs between the two locations.
     """
-    check_media_handoff(kv_transfer_params)
     from_kv = (kv_transfer_params or {}).get("prompt_token_ids")
     if prompt_token_ids is None and from_kv is None:
         return None
@@ -309,7 +327,8 @@ class ChatCompletionRequest(BaseModel):
     # Optional KV-transfer metadata for P/D disaggregation.
     kv_transfer_params: dict[str, Any] | None = None
     data_parallel_rank: int | None = None
-    # Pre-tokenized text prompt; messages are still required and validated.
+    # Pre-tokenized prompt (an image decode leg's has its prefill's image
+    # placeholders expanded); messages are still required and validated.
     prompt_token_ids: PromptTokenIds | None = None
     # Echo prompt IDs in non-streaming responses, including n > 1.
     return_token_ids: bool | None = None

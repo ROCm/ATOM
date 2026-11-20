@@ -463,7 +463,9 @@ class EngineCore:
         """Get the KV pool ready to be zeroed, freed or recomputed, or raise.
 
         Waits until KV transfers in flight have reported back, then preempts
-        what is running so it recomputes on what follows. When the weights
+        what is running so it recomputes on what follows; an image decode leg
+        whose media its prefill kept cannot recompute, and is finished
+        instead (`Scheduler.preempt_running`). When the weights
         change, the KV connector must also drop what it keeps for later
         requests. Raises with the reason, changing nothing that was running.
         """

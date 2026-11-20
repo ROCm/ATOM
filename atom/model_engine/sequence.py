@@ -192,6 +192,17 @@ def resumes_offload_prefill(seq) -> bool:
     ) and len(seq.block_table) > 0
 
 
+def leaves_media_on_prefill(kv_transfer_params: dict | None) -> bool:
+    """True for a remote-prefill decode leg whose prefill kept the media.
+
+    Such a leg runs on its prefill's expanded prompt ids with the `cache_seed`
+    and `mrope_position_delta` the prefill returned, and cannot prefill
+    locally: it has no media to put in the placeholders.
+    """
+    handoff = kv_transfer_params or {}
+    return bool(handoff.get("do_remote_prefill")) and "cache_seed" in handoff
+
+
 @dataclass
 class OffloadJointRecord:
     """The KV-transfer offload/joint-load protocol state for one sequence.
@@ -309,12 +320,13 @@ class Sequence:
         self.multimodal_data = multimodal_data
         self.multimodal_cache_ready = False
         # Immutable content identity survives payload release and preemption.
-        # A decode leg has no media: it keeps what its prefill derived from it.
-        handoff = kv_transfer_params or {}
-        self.cache_seed = handoff.get("cache_seed", -1)
-        # A decode leg whose prefill kept the media: it cannot recompute.
+        # A decode leg whose prefill kept the media keeps what the prefill
+        # derived from it; the scheduler never prefills it locally.
         self.media_on_prefill_instance = (
-            multimodal_data is None and "cache_seed" in handoff
+            multimodal_data is None and leaves_media_on_prefill(kv_transfer_params)
+        )
+        self.cache_seed = (
+            kv_transfer_params["cache_seed"] if self.media_on_prefill_instance else -1
         )
         if multimodal_data is not None:
             from atom.model_engine.multimodal_runtime import multimodal_cache_seed
@@ -324,9 +336,9 @@ class Sequence:
                 self.cache_seed = multimodal_cache_seed(multimodal_data)
         self.mrope_positions = mrope_positions
         self.mrope_position_delta = (
-            mrope_position_delta
-            if multimodal_data is not None
-            else handoff.get("mrope_position_delta", mrope_position_delta)
+            kv_transfer_params.get("mrope_position_delta", 0)
+            if self.media_on_prefill_instance
+            else mrope_position_delta
         )
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
