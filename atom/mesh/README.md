@@ -285,13 +285,18 @@ HuggingFace tokenizer.
 
 A model encodes with fastokens only if fastokens encodes a set of probe texts
 exactly as its HuggingFace tokenizer does, with special tokens and without. The
-probe covers added tokens, digits, whitespace, several scripts, a chat and a
-1 MiB text. A model that fails the probe keeps HuggingFace, with a warning, or
-under `--fastokens-strict` its tokenizer fails to register. Tokens that only
-`tokenizer_config.json` declares are the exception. fastokens encodes them as
-the tokens they declare, as `transformers`, and so the engine, does, where
-HuggingFace `tokenizers` encodes them as text. `mesh_fastokens_tokenizers_total{outcome}`
-counts tokenizers as `loaded`, `fallback` or `refused`.
+probe covers added tokens, digits, whitespace, several scripts, a chat, a 1 MiB
+text and a 256 KiB one with no newline. A model that fails the probe keeps
+HuggingFace, with a warning, or under `--fastokens-strict` its tokenizer fails
+to register, with no retries. Tokens that only `tokenizer_config.json` declares
+are the exception, and the probe texts leave them out: `transformers`, and so
+the engine, encodes them as tokens, where HuggingFace `tokenizers` encodes them
+as text. `transformers` gives them the ids after the vocabulary's, in the order
+of the ids they declare, and fastokens the ids they declare, so a model whose
+tokens declare other ids fails the probe. With gRPC workers the router sends
+the ids it encodes as the prompt, so the model runs on fastokens' ids, not only
+routes by them. `mesh_fastokens_tokenizers_total{outcome}` counts tokenizers as
+`loaded`, `fallback` or `refused`.
 
 The prompts of these models tokenize up to `--fastokens-max-tokenize-bytes`
 (default: 64 MiB, or `--prepare-max-tokenize-bytes` if that is larger), and so
@@ -304,7 +309,9 @@ which does not apply to these models.
 on ATOM, with either backend, and times encoding. It tokenizes the
 DeepSeek-V4.1-Flash requests of `tests/fixtures/atom_tokens/deepseek_v41_flash.json`
 with the tokenizer files of the revision recorded there, which it downloads from
-HuggingFace, or `$HF_ENDPOINT`. `scripts/atom_token_parity.py` records the tokens
+HuggingFace, or `$HF_ENDPOINT`, so it runs only when asked for, as CI's mesh unit
+tests do: `cargo test --lib -- --ignored routers::ingress::token_parity`.
+`scripts/atom_token_parity.py` records the tokens
 ATOM's own chat and completion endpoints run a set of requests with: the fixture,
 or, for `$ATOM_TOKEN_PARITY`, another checkpoint's or recorded requests. The
 script's docstring shows how to run both.

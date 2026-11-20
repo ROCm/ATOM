@@ -28,16 +28,18 @@ const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/atom_tokens/deepseek_v41_flash.json"
 );
-/// The files of a checkpoint the router registers its tokenizer from.
-const TOKENIZER_FILES: [&str; 4] = [
-    "tokenizer.json",
-    "tokenizer_config.json",
-    "config.json",
-    "chat_template.jinja",
+/// The files of a checkpoint the router registers its tokenizer from, and
+/// whether every checkpoint has them.
+const TOKENIZER_FILES: [(&str, bool); 4] = [
+    ("tokenizer.json", true),
+    ("tokenizer_config.json", true),
+    ("config.json", false),
+    ("chat_template.jinja", false),
 ];
 
 /// `model`'s tokenizer files at `revision`, from HuggingFace or `$HF_ENDPOINT`,
-/// kept in the target directory for the next run.
+/// kept in the target directory for the next run. A file not every checkpoint
+/// has may be missing; failing to download any other fails the test.
 async fn huggingface_files(model: &str, revision: &str) -> PathBuf {
     let exe = std::env::current_exe().unwrap();
     let dir = exe
@@ -50,15 +52,20 @@ async fn huggingface_files(model: &str, revision: &str) -> PathBuf {
     std::fs::create_dir_all(&dir).unwrap();
     let endpoint =
         std::env::var("HF_ENDPOINT").unwrap_or_else(|_| "https://huggingface.co".to_string());
-    for file in TOKENIZER_FILES {
+    for (file, every_checkpoint_has) in TOKENIZER_FILES {
         let path = dir.join(file);
         if path.exists() {
             continue;
         }
         let url = format!("{endpoint}/{model}/resolve/{revision}/{file}");
-        let response = reqwest::get(&url)
-            .await
-            .and_then(reqwest::Response::error_for_status);
+        let response = match reqwest::get(&url).await {
+            Ok(response)
+                if !every_checkpoint_has && response.status() == reqwest::StatusCode::NOT_FOUND =>
+            {
+                continue
+            }
+            response => response.and_then(reqwest::Response::error_for_status),
+        };
         let bytes = match response {
             Ok(response) => response.bytes().await,
             Err(error) => Err(error),
@@ -269,8 +276,10 @@ async fn tokenize(
 /// checkpoint directory. Each request gets ATOM's tokens, or is rejected where
 /// ATOM rejects it. The table lists how long encoding each prompt takes with
 /// either backend: once for the fixture, the median of 5 runs otherwise (build
-/// with `--release` for numbers worth reading).
+/// with `--release` for numbers worth reading). As it downloads, it runs only
+/// when asked for (`--ignored`).
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "downloads from HuggingFace: cargo test --lib test_requests_tokenize_as_on_atom -- --ignored"]
 async fn test_requests_tokenize_as_on_atom() {
     let recorded = std::env::var("ATOM_TOKEN_PARITY").ok();
     let path = recorded.clone().unwrap_or_else(|| FIXTURE.to_string());

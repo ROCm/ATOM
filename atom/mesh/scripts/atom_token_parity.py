@@ -17,7 +17,8 @@ checkpoint, or recorded requests:
     python atom/mesh/scripts/atom_token_parity.py <checkpoint dir> \\
         [--requests recorded.jsonl] > atom.json
     cd atom/mesh && ATOM_TOKEN_PARITY=../../atom.json \\
-        cargo test --release --lib test_requests_tokenize_as_on_atom -- --nocapture
+        cargo test --release --lib test_requests_tokenize_as_on_atom -- \\
+        --ignored --nocapture
 
 To record the fixture again, from a checkpoint directory holding the files of
 the revision named:

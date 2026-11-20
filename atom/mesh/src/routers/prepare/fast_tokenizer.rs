@@ -5,8 +5,9 @@
 //! threads (one per logical core up to 32, or `FASTOKENS_BPE_THREADS`).
 //! Routing by token needs the ids the engine computes, so a model's prompts
 //! encode with fastokens only once fastokens encodes a set of probe texts exactly
-//! as its HuggingFace tokenizer does. Decoding, chat templates and vocabulary
-//! lookups stay with the HuggingFace tokenizer.
+//! as its HuggingFace tokenizer does, and gives the tokens only
+//! `tokenizer_config.json` declares the ids `transformers` gives them. Decoding,
+//! chat templates and vocabulary lookups stay with the HuggingFace tokenizer.
 
 use std::{
     any::Any,
@@ -32,6 +33,13 @@ use crate::{
 
 /// Long enough for fastokens to split the text across its threads.
 const LONG_PROBE_BYTES: usize = 1 << 20;
+/// Long enough for fastokens to look for added tokens across its threads; it
+/// splits a text across them only at newlines, so one without encodes whole.
+const FLAT_PROBE_BYTES: usize = 256 << 10;
+
+/// How the error refusing a model's tokenizer under `--fastokens-strict` begins.
+/// Registering it again would refuse it again.
+pub(crate) const STRICT_REFUSAL: &str = "fastokens cannot encode the prompts of";
 
 /// The most text the router tokenizes for one request, by tokenizer.
 #[derive(Debug, Clone, Copy)]
@@ -86,6 +94,13 @@ pub(crate) async fn with_fastokens(
     metrics::counter!("mesh_fastokens_tokenizers_total", "outcome" => outcome).increment(1);
     match loaded {
         Ok(fast) => {
+            if let Some(error) = &fast.unrendered_chat {
+                info!(
+                    tokenizer = %name,
+                    %error,
+                    "The chat template renders none of the probe's chats, so fastokens was not probed on one"
+                );
+            }
             info!(
                 tokenizer = %name,
                 config_only_tokens = fast.config_only_tokens,
@@ -93,9 +108,7 @@ pub(crate) async fn with_fastokens(
             );
             Ok(Arc::new(fast))
         }
-        Err(reason) if config.strict => Err(format!(
-            "fastokens cannot encode the prompts of {name}: {reason}"
-        )),
+        Err(reason) if config.strict => Err(format!("{STRICT_REFUSAL} {name}: {reason}")),
         Err(reason) => {
             warn!(
                 tokenizer = %name,
@@ -137,6 +150,8 @@ pub(crate) struct FastTokenizer {
     suffix: Vec<TokenIdType>,
     /// Added tokens that only `tokenizer_config.json` declares.
     config_only_tokens: usize,
+    /// Why the probe texts have no chat: the template renders none of them.
+    unrendered_chat: Option<String>,
 }
 
 impl FastTokenizer {
@@ -159,14 +174,16 @@ impl FastTokenizer {
             fast.enable_segment_cache(bytes);
         }
         let (prefix, suffix) = special_affixes(&*inner)?;
+        let chat = probe_chat(&*inner);
         let mut tokenizer = Self {
             inner,
             fast,
             prefix,
             suffix,
             config_only_tokens: 0,
+            unrendered_chat: chat.as_ref().err().cloned(),
         };
-        tokenizer.config_only_tokens = tokenizer.check()?;
+        tokenizer.config_only_tokens = tokenizer.check(chat.ok())?;
         Ok(tokenizer)
     }
 
@@ -187,26 +204,42 @@ impl FastTokenizer {
     }
 
     /// The number of added tokens only `tokenizer_config.json` declares, once
-    /// every probe text without them encodes as `inner` encodes it. `inner`
-    /// encodes those tokens as text, which is what the engine does not do.
-    fn check(&self) -> Result<usize, String> {
+    /// those have the ids `transformers` gives them and the probe texts, and
+    /// `chat`, encode without them as `inner` encodes them. `inner` encodes
+    /// those tokens as text, which is what the engine does not do.
+    fn check(&self, chat: Option<String>) -> Result<usize, String> {
+        // `transformers` gives a token it adds the id after the vocabulary's
+        // and the added tokens', as HuggingFace `tokenizers` does.
+        let mut next_id = self.inner.vocab_size() as TokenIdType;
         let mut config_only = Vec::new();
         for token in self.fast.added_token_configs() {
             match self.inner.token_to_id(&token.content) {
-                Some(id) if id == token.id => {}
+                Some(id) if id == token.id => next_id = next_id.max(id.saturating_add(1)),
                 Some(id) => {
                     return Err(format!(
                         "{:?} is token {id} to HuggingFace and {} to fastokens",
                         token.content, token.id
                     ))
                 }
-                None => config_only.push(token.content.as_str()),
+                None => config_only.push(token),
             }
         }
-        for text in probe_texts(&*self.inner, self.fast.added_token_configs()) {
-            if config_only.iter().any(|token| text.contains(token)) {
-                continue;
+        // It adds the tokens only `tokenizer_config.json` declares in the order
+        // of the ids they declare, which fastokens keeps.
+        config_only.sort_by_key(|token| token.id);
+        for (token, id) in config_only.iter().zip(next_id..) {
+            if token.id != id {
+                return Err(format!(
+                    "{:?} is token {} to fastokens and {id} to transformers",
+                    token.content, token.id
+                ));
             }
+        }
+        let config_only: Vec<_> = config_only
+            .iter()
+            .map(|token| token.content.as_str())
+            .collect();
+        for text in probe_texts(chat, self.fast.added_token_configs(), &config_only) {
             for add_special_tokens in [false, true] {
                 let want = encode(&*self.inner, &text, add_special_tokens)?;
                 let got = self.encode(&text, add_special_tokens).map_err(|error| {
@@ -273,39 +306,79 @@ const PROBES: &[&str] = &[
 ];
 
 /// Texts on which tokenizers that disagree tend to: special tokens, digits,
-/// whitespace and scripts, a chat, and a text long enough for fastokens to split.
-fn probe_texts(tokenizer: &dyn Tokenizer, added: &[fastokens::AddedTokenConfig]) -> Vec<String> {
-    let mut texts: Vec<String> = PROBES.iter().map(|text| text.to_string()).collect();
+/// whitespace and scripts, `chat`, a text long enough for fastokens to split
+/// and one with no newline, all without the tokens in `config_only`.
+fn probe_texts(
+    chat: Option<String>,
+    added: &[fastokens::AddedTokenConfig],
+    config_only: &[&str],
+) -> Vec<String> {
+    let without = |text: String| {
+        config_only
+            .iter()
+            .fold(text, |text, token| text.replace(token, ""))
+    };
+    let probes: Vec<_> = PROBES
+        .iter()
+        .map(|text| without(text.to_string()))
+        .collect();
+    let added: Vec<_> = added
+        .iter()
+        .map(|token| token.content.as_str())
+        .filter(|token| !config_only.contains(token))
+        .collect();
+    let mut texts = probes.clone();
     for run in ["a", " ", "\n", "1", "é", "中", "👍"] {
         texts.push(run.repeat(3000));
     }
     let mut long = String::with_capacity(LONG_PROBE_BYTES + 512);
     let mut line = 0;
     while long.len() < LONG_PROBE_BYTES {
-        long.push_str(&format!("{line}. {}\n", PROBES[line % PROBES.len()]));
+        long.push_str(&format!("{line}. {}\n", probes[line % probes.len()]));
         line += 1;
     }
     texts.push(long);
-    let chat = [
+    let words: Vec<_> = probes
+        .iter()
+        .map(|text| text.replace(['\n', '\r'], " "))
+        .chain(
+            added
+                .iter()
+                .filter(|token| !token.contains(['\n', '\r']))
+                .map(|token| token.to_string()),
+        )
+        .collect();
+    let words = words.join(" ");
+    texts.push(words.repeat(FLAT_PROBE_BYTES.div_ceil(words.len())));
+    texts.extend(chat);
+    for token in added {
+        texts.push(format!("a{token}b {token} c\n {token}\n\n{token}{token}d"));
+    }
+    texts.into_iter().map(without).collect()
+}
+
+/// A chat as the template renders it for a request: with a system message, or
+/// without one for a template that has no system role.
+fn probe_chat(tokenizer: &dyn Tokenizer) -> Result<String, String> {
+    let messages = [
         json!({"role": "system", "content": "You are a helpful assistant."}),
         json!({"role": "user", "content": "Hi! 你好 1234"}),
         json!({"role": "assistant", "content": "Hello there."}),
         json!({"role": "user", "content": "What is 2 + 2?"}),
     ];
-    if let Ok(text) = tokenizer.apply_chat_template(
-        &chat,
-        ChatTemplateParams {
-            add_generation_prompt: true,
-            special_tokens: Some(tokenizer.get_special_tokens()),
-            ..Default::default()
-        },
-    ) {
-        texts.push(text);
-    }
-    for token in added {
-        texts.push(format!("a{0}b {0} c\n {0}\n\n{0}{0}d", token.content));
-    }
-    texts
+    let render = |messages: &[Value]| {
+        tokenizer.apply_chat_template(
+            messages,
+            ChatTemplateParams {
+                add_generation_prompt: true,
+                special_tokens: Some(tokenizer.get_special_tokens()),
+                ..Default::default()
+            },
+        )
+    };
+    render(&messages)
+        .or_else(|_| render(&messages[1..]))
+        .map_err(|error| error.to_string())
 }
 
 /// The start of `text` for an error message, and its length when that is not
@@ -506,30 +579,102 @@ mod tests {
 
     /// The engine encodes the tokens only `tokenizer_config.json` declares as
     /// tokens, as fastokens does; HuggingFace `tokenizers` encodes them as text.
+    /// `transformers` gives them the ids after the vocabulary's, in the order of
+    /// the ids they declare, and fastokens the ids they declare, so those must
+    /// be the same.
     #[test]
     fn tokens_only_tokenizer_config_declares_encode_as_declared() {
         let id = byte_level_next_id(BYTE_LEVEL_MERGES);
-        let declare = |content: &str| {
-            json!({"added_tokens_decoder": {id.to_string(): {
-                "content": content, "lstrip": false, "normalized": false,
-                "rstrip": false, "single_word": false, "special": true
-            }}})
+        let declare = |tokens: &[(TokenIdType, &str)]| {
+            let decoder: serde_json::Map<_, _> = tokens
+                .iter()
+                .map(|(id, content)| {
+                    let token = json!({
+                        "content": content, "lstrip": false, "normalized": false,
+                        "rstrip": false, "single_word": false, "special": true
+                    });
+                    (id.to_string(), token)
+                })
+                .collect();
+            json!({"added_tokens_decoder": decoder})
         };
-        let dir = byte_level_tokenizer_dir(BYTE_LEVEL_MERGES, true, declare("<|config_only|>"));
+        let tokens = declare(&[(id + 1, "<|second|>"), (id, "<|config_only|>")]);
+        let dir = byte_level_tokenizer_dir(BYTE_LEVEL_MERGES, true, tokens);
         let (hf, fast) = load(dir.path());
         let fast = fast.unwrap();
-        assert_eq!(fast.config_only_tokens, 1);
-        assert_eq!(ids(&fast, "a<|config_only|>", false)[1..], [id]);
+        assert_eq!(fast.config_only_tokens, 2);
+        assert_eq!(
+            ids(&fast, "a<|config_only|><|second|>", false)[1..],
+            [id, id + 1]
+        );
         assert!(!ids(&*hf, "a<|config_only|>", false).contains(&id));
         assert_eq!(
             ids(&fast, "the weather", true),
             ids(&*hf, "the weather", true)
         );
 
+        // Past a gap, or over an id the vocabulary has, transformers would give
+        // the token another id.
+        for declared in [id + 1, 1] {
+            let dir = byte_level_tokenizer_dir(
+                BYTE_LEVEL_MERGES,
+                true,
+                declare(&[(declared, "<|config_only|>")]),
+            );
+            let error = load(dir.path()).1.err().unwrap();
+            assert!(
+                error.contains(&format!(
+                    "is token {declared} to fastokens and {id} to transformers"
+                )),
+                "{error}"
+            );
+        }
+
         // Declaring a token the vocabulary has under another id is refused.
-        let dir = byte_level_tokenizer_dir(BYTE_LEVEL_MERGES, true, declare("he"));
+        let dir = byte_level_tokenizer_dir(BYTE_LEVEL_MERGES, true, declare(&[(id, "he")]));
         let error = load(dir.path()).1.err().unwrap();
         assert!(error.contains("\"he\" is token"), "{error}");
+    }
+
+    /// A token only `tokenizer_config.json` declares is taken out of the probe
+    /// texts, which keep the long ones and the chat.
+    #[test]
+    fn probe_texts_leave_out_tokens_only_tokenizer_config_declares() {
+        let dir = byte_level_tokenizer_dir(
+            BYTE_LEVEL_MERGES,
+            true,
+            json!({"chat_template": CHAT_TEMPLATE}),
+        );
+        let (hf, _) = load(dir.path());
+        let chat = probe_chat(&*hf).unwrap();
+        let fast = fastokens::Tokenizer::from_file(&dir.path().join("tokenizer.json")).unwrap();
+        let texts = probe_texts(Some(chat.clone()), fast.added_token_configs(), &["</s>"]);
+        assert!(texts.iter().all(|text| !text.contains("</s>")));
+        assert!(texts.iter().any(|text| text.len() >= LONG_PROBE_BYTES));
+        let flat = texts
+            .iter()
+            .find(|text| text.len() >= FLAT_PROBE_BYTES && !text.contains('\n'))
+            .unwrap();
+        assert!(flat.contains("<|im_start|>"), "{}", excerpt(flat));
+        assert!(texts.contains(&chat));
+    }
+
+    /// The probe renders its chat without a system message for a template that
+    /// has no system role, and a template that renders neither has no chat probed.
+    #[test]
+    fn the_chat_probe_needs_no_system_role() {
+        let template = format!(
+            "{{% if messages[0].role == 'system' %}}{{{{ raise_exception('no system role') }}}}{{% endif %}}{CHAT_TEMPLATE}"
+        );
+        let dir =
+            byte_level_tokenizer_dir(BYTE_LEVEL_MERGES, true, json!({"chat_template": template}));
+        let (hf, fast) = load(dir.path());
+        assert!(probe_chat(&*hf).unwrap().starts_with("<|im_start|>user\n"));
+        assert_eq!(fast.unwrap().unrendered_chat, None);
+
+        let dir = byte_level_tokenizer_dir(BYTE_LEVEL_MERGES, true, json!({}));
+        let fast = load(dir.path()).1.unwrap();
+        assert!(fast.unrendered_chat.is_some());
     }
 
     #[test]
@@ -561,69 +706,44 @@ mod tests {
         assert!(error.contains("only HuggingFace"), "{error}");
     }
 
+    /// `--fastokens-models` names a model by the name or the source its tokenizer
+    /// registers under, or as `*`; `--fastokens-segment-cache-mb 0` turns
+    /// fastokens' segment cache off.
     #[tokio::test]
-    async fn only_listed_models_encode_with_fastokens() {
+    async fn listed_models_encode_with_fastokens() {
         let dir = byte_level_tokenizer_dir(BYTE_LEVEL_MERGES, true, json!({}));
         let source = dir.path().to_str().unwrap();
         let file = dir.path().join("tokenizer.json");
         let hf = factory::create_tokenizer(source).unwrap();
-        let config = |models: &[&str], strict| FastokensConfig {
+        let config = |models: &[&str], segment_cache_mb| FastokensConfig {
             models: models.iter().map(|model| model.to_string()).collect(),
-            strict,
-            segment_cache_mb: Some(1),
+            strict: true,
+            segment_cache_mb: Some(segment_cache_mb),
             ..Default::default()
         };
 
-        let kept = with_fastokens(hf.clone(), "model", source, &config(&["other"], true))
+        let kept = with_fastokens(hf.clone(), "model", source, &config(&["other"], 1))
             .await
             .unwrap();
         assert!(Arc::ptr_eq(&kept, &hf));
-        for (models, source) in [
-            (["model"], source),
-            ([source], source),
-            (["*"], file.to_str().unwrap()),
+        for (models, source, segment_cache_mb) in [
+            (["model"], source, 1),
+            ([source], source, 0),
+            (["*"], file.to_str().unwrap(), 1),
         ] {
-            let fast = with_fastokens(hf.clone(), "model", source, &config(&models, true))
-                .await
-                .unwrap();
+            let fast = with_fastokens(
+                hf.clone(),
+                "model",
+                source,
+                &config(&models, segment_cache_mb),
+            )
+            .await
+            .unwrap();
             let fast = fast.as_any().downcast_ref::<FastTokenizer>().unwrap();
-            assert!(fast.fast.segment_cache_stats().is_some());
+            assert_eq!(
+                fast.fast.segment_cache_stats().is_some(),
+                segment_cache_mb > 0
+            );
         }
-
-        let unsupported = hf_tokenizer();
-        let kept = with_fastokens(
-            unsupported.clone(),
-            "ws",
-            hf_tokenizer_path(),
-            &config(&["*"], false),
-        )
-        .await
-        .unwrap();
-        assert!(Arc::ptr_eq(&kept, &unsupported));
-        let error = with_fastokens(
-            unsupported,
-            "ws",
-            hf_tokenizer_path(),
-            &config(&["*"], true),
-        )
-        .await
-        .err()
-        .unwrap();
-        assert!(
-            error.contains("fastokens cannot encode the prompts of ws"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn tokenize_limits_follow_the_tokenizer() {
-        let mut config = RouterConfig::default();
-        config.prepare_pool.max_tokenize_bytes = Some(10);
-        config.fastokens.max_tokenize_bytes = Some(20);
-        let limits = TokenizeLimits::new(&config);
-        let dir = byte_level_tokenizer_dir(BYTE_LEVEL_MERGES, true, json!({}));
-        let fast = load(dir.path()).1.unwrap();
-        assert_eq!(limits.of(&fast), 20);
-        assert_eq!(limits.of(&*hf_tokenizer()), 10);
     }
 }

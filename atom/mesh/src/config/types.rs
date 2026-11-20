@@ -155,6 +155,7 @@ pub struct PreparePoolConfig {
     )]
     pub prepare_timeout_ms: u64,
     /// Tokenization byte limit (default: 1 MiB); overrides --ext-proc-max-tokenize-bytes.
+    /// The models fastokens encodes have --fastokens-max-tokenize-bytes.
     #[arg(id = "prepare_max_tokenize_bytes", long = "prepare-max-tokenize-bytes")]
     pub max_tokenize_bytes: Option<usize>,
 }

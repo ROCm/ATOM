@@ -23,7 +23,7 @@ use super::workflow_data::TokenizerWorkflowData;
 use crate::{
     app_context::AppContext,
     config::TokenizerCacheConfig,
-    routers::prepare::fast_tokenizer::{with_fastokens, FastTokenizer},
+    routers::prepare::fast_tokenizer::{with_fastokens, FastTokenizer, STRICT_REFUSAL},
     tokenizer::{
         cache::{CacheConfig, CachedTokenizer},
         chat_template::ChatTemplateParams,
@@ -44,7 +44,9 @@ pub struct TokenizerConfigRequest {
     pub source: String,
     /// Optional path to chat template file
     pub chat_template_path: Option<String>,
-    /// Optional cache configuration. If provided, wraps tokenizer with CachedTokenizer.
+    /// Optional cache configuration. If provided, wraps a tokenizer that encodes
+    /// with HuggingFace with CachedTokenizer; one that encodes with fastokens has
+    /// fastokens' segment cache instead.
     #[serde(default)]
     pub cache_config: Option<TokenizerCacheConfig>,
     /// If true, the workflow fails when a tokenizer with the same name already exists.
@@ -71,7 +73,8 @@ pub struct TokenizerRemovalRequest {
 /// - Input validation (via registry.load())
 /// - Deduplication (returns success if already exists)
 /// - Loading from local path or HuggingFace
-/// - Optional caching layer wrapping
+/// - Encoding with fastokens, for the models `--fastokens-models` lists
+/// - Optional caching layer wrapping, for the tokenizers that encode with HuggingFace
 pub struct LoadTokenizerStep;
 
 #[async_trait]
@@ -89,15 +92,8 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
             .clone();
 
         info!(
-            "Loading tokenizer '{}' (id: {}) from source: {}{}",
-            config.name,
-            config.id,
-            config.source,
-            if config.cache_config.is_some() {
-                " with caching"
-            } else {
-                ""
-            }
+            "Loading tokenizer '{}' (id: {}) from source: {}",
+            config.name, config.id, config.source
         );
 
         // Clone needed values before async move
@@ -167,17 +163,22 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
             Ok(outcome) => {
                 let loaded_id = outcome.id();
 
-                // Get vocab size for logging
-                let vocab_size = app_context
-                    .tokenizer_registry
-                    .get_by_id(loaded_id)
-                    .map(|e| e.tokenizer.vocab_size());
+                // Get vocab size, and how it encodes, for logging
+                let loaded = app_context.tokenizer_registry.get_by_id(loaded_id);
+                let vocab_size = loaded.as_ref().map(|e| e.tokenizer.vocab_size());
+                let encoding = match loaded.as_ref().map(|e| e.tokenizer.as_any()) {
+                    Some(tokenizer) if tokenizer.is::<FastTokenizer>() => {
+                        ", encoding with fastokens"
+                    }
+                    Some(tokenizer) if tokenizer.is::<CachedTokenizer>() => ", with caching",
+                    _ => "",
+                };
 
                 match &outcome {
                     LoadOutcome::Loaded { id } => {
                         info!(
-                            "Successfully loaded tokenizer '{}' (id: {}) with vocab_size: {:?}",
-                            name, id, vocab_size
+                            "Successfully loaded tokenizer '{}' (id: {}) with vocab_size: {:?}{}",
+                            name, id, vocab_size, encoding
                         );
                     }
                     LoadOutcome::AlreadyExists { id } => {
@@ -214,8 +215,13 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
         }
     }
 
-    fn is_retryable(&self, _error: &WorkflowError) -> bool {
-        true // Network/IO errors are retryable
+    fn is_retryable(&self, error: &WorkflowError) -> bool {
+        // Network/IO errors are retryable; a `--fastokens-strict` refusal is what
+        // the probe found, and a retry would only probe again.
+        !matches!(
+            error,
+            WorkflowError::StepFailed { message, .. } if message.starts_with(STRICT_REFUSAL)
+        )
     }
 }
 
@@ -286,10 +292,12 @@ fn renders_without_template(tokenizer: &mut dyn Tokenizer) -> bool {
 /// - Input validation (empty name/source)
 /// - Deduplication (returns success if already exists)
 /// - Loading from local path or HuggingFace
-/// - Optional caching layer wrapping
+/// - Encoding with fastokens, for the models `--fastokens-models` lists
+/// - Optional caching layer wrapping, for the tokenizers that encode with HuggingFace
 ///
 /// Configuration:
-/// - 3 retries with 2s backoff (for network issues)
+/// - 3 retries with 2s backoff (for network issues), none after a
+///   `--fastokens-strict` refusal
 /// - 5 minute timeout (HuggingFace downloads can be slow)
 pub fn create_tokenizer_registration_workflow() -> WorkflowDefinition<TokenizerWorkflowData> {
     WorkflowDefinition::new("tokenizer_registration", "Tokenizer Registration").add_step(
@@ -398,7 +406,7 @@ mod tests {
 
     /// A model `--fastokens-models` lists encodes with fastokens, which leaves the
     /// tokenizer cache out; one fastokens cannot load keeps HuggingFace, or fails
-    /// to register under `--fastokens-strict`.
+    /// to register under `--fastokens-strict`, with no retries.
     #[tokio::test]
     async fn test_registration_encodes_listed_models_with_fastokens() {
         async fn register(
@@ -455,6 +463,15 @@ mod tests {
             error.to_string().contains("fastokens cannot encode"),
             "{error}"
         );
+        assert!(!LoadTokenizerStep.is_retryable(&error));
+        let broken = tempfile::TempDir::new().unwrap();
+        let broken = broken.path().join("tokenizer.json");
+        std::fs::write(&broken, "{}").unwrap();
+        let error = register(&context, broken.to_str().unwrap())
+            .await
+            .err()
+            .unwrap();
+        assert!(LoadTokenizerStep.is_retryable(&error), "{error}");
         assert!(context.tokenizer_registry.list().is_empty());
     }
 

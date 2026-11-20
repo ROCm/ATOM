@@ -112,6 +112,17 @@ jobs:
             --target-dir atom/mesh/mocker/target/mesh \
             --profile ci --lib --features atom-engine
 
+      # The token parity test downloads the tokenizer files its fixture records
+      # from HuggingFace, so the unit tests leave it out and it runs here, once.
+      - name: Test token parity with ATOM
+        run: |
+          set -euo pipefail
+          cargo test \
+            --manifest-path atom/mesh/Cargo.toml \
+            --target-dir atom/mesh/mocker/target/mesh \
+            --profile ci --lib --features atom-engine -- \
+            --ignored routers::ingress::token_parity
+
       # The vendored ext-proc protos must match the checksums pinned in
       # manifest.json; offline, so a drifted file or manifest fails here.
       - name: Check vendored ext-proc protos

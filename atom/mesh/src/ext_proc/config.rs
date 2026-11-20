@@ -46,6 +46,7 @@ pub struct ExtProcConfig {
     )]
     pub parser_concurrency: Option<usize>,
     /// Legacy: tokenization byte limit when --prepare-max-tokenize-bytes is unset.
+    /// The models fastokens encodes have --fastokens-max-tokenize-bytes.
     #[arg(
         long = "ext-proc-max-tokenize-bytes",
         help_heading = "External Processing"
