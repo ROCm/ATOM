@@ -27,7 +27,8 @@ threads' eight consecutive elements squared and summed in order (a lane holds
 eight threads' runs, summed pairwise as the threads' butterfly does), the
 lanes' xor butterfly, the mean an IEEE division by the width, eps added in
 f32, ``v_rsq_f32``, then ``bf16((x * rstd) * w)`` rounded to f32 at each
-product. A q row is quantized for q_b_proj as AITER's
+product, an element pair a ``v_pk_mul_f32`` as AITER's epilogue. A q row is
+quantized for q_b_proj as AITER's
 per-1x128 E8M0 ``dynamic_per_group_scaled_quant`` does it
 (``per_1x128_e8m0_quant``): each 128-element group's amax over the BF16 values
 floored at ``kAmaxFloor``, the E8M0 code ``ceil_pow2(amax * f32(1 / 448))``
@@ -184,19 +185,29 @@ def _poll_row(qkv_c, at, live):
     return words
 
 
-def _scaled(x, rstd, weight):
-    """``(x * rstd) * weight``, each product rounded to f32, as AITER's
-    v_pk_mul_f32 pair: LLVM would fold the second product into the BF16
-    conversion (``v_fma_mixlo_bf16``), one rounding instead of two."""
-    return fx.Float32(
+def _scaled_word(word, rstd, gain):
+    """``(x * rstd) * gain`` of a BF16 pair word's two elements by a gain
+    pair word, as AITER's two ``v_pk_mul_f32``, each product rounded to f32
+    (LLVM would fold the second product into the BF16 conversion,
+    ``v_fma_mixlo_bf16``: one rounding instead of two), rounded to a BF16
+    pair."""
+    out = fx.Vector(
         llvm.inline_asm(
-            T.f32,
-            [fx.Float32(v).ir_value() for v in (x, rstd, weight)],
-            "v_mul_f32 $0, $1, $2\n v_mul_f32 $0, $0, $3",
+            T.vec(2, T.f32),
+            [
+                fx.Vector.from_elements(pair, fx.Float32).ir_value()
+                for pair in (
+                    [bf_lo(word), bf_hi(word)],
+                    [rstd, rstd],
+                    [bf_lo(gain), bf_hi(gain)],
+                )
+            ],
+            "v_pk_mul_f32 $0, $1, $2\n v_pk_mul_f32 $0, $0, $3",
             "=&v,v,v,v",
             has_side_effects=False,
         )
     )
+    return _pack(fx.Float32(out[0]), fx.Float32(out[1]))
 
 
 def _run_square_sum(words):
@@ -268,13 +279,7 @@ def _norm_row(c, job):
     eps = is_q.select(fx.Float32(c["q_eps"]), fx.Float32(c["kv_eps"]))
     rstd = hw_rsq(total / width + eps)
     tdm_timeline.stamp(tdm_timeline.NORM_REDUCED)
-    normed = [
-        _pack(
-            _scaled(bf_lo(word), rstd, bf_lo(gain)),
-            _scaled(bf_hi(word), rstd, bf_hi(gain)),
-        )
-        for word, gain in zip(words, gains)
-    ]
+    normed = [_scaled_word(word, rstd, gain) for word, gain in zip(words, gains)]
     if (job >= rows) & live:
         _store_runs(normed, c["kv"], token * (lay.KV_LORA // 2) + lane * LANE_WORDS)
     if is_q & live & (c["q"] != 0):
