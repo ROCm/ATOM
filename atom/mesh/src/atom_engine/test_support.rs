@@ -55,11 +55,6 @@ impl FakeCore {
         self.send_frames(wire::encode(body, data_frames));
     }
 
-    /// A message already encoded, frames as they go out.
-    pub fn send_frames(&self, frames: Vec<Vec<u8>>) {
-        self.output.send_multipart(frames, 0).unwrap();
-    }
-
     /// Frames sent as they are, encoded or not.
     pub fn send_frames(&self, frames: Vec<Vec<u8>>) {
         self.output.send_multipart(frames, 0).unwrap();

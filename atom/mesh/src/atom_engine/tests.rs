@@ -791,6 +791,27 @@ async fn python_core_messages_drive_the_client() {
         pb::envelope::Body::Stopped(_)
     ));
 
+    // KV block ids packed, beside a value nested as deep as Python may send
+    // one (`wire.MAX_VALUE_DEPTH`): still under prost's recursion limit.
+    let pb::envelope::Body::Completions(deep) = decode("core_deep_completions") else {
+        panic!("core_deep_completions is not a Completions");
+    };
+    let params = deep.items[0].kv_transfer_params_output.as_ref().unwrap();
+    let Some(pb::value::Kind::MapValue(top)) = &params.kind else {
+        panic!("kv_transfer_params_output is not a map");
+    };
+    assert_eq!(
+        top.entries[0].value.as_ref().unwrap().kind,
+        Some(pb::value::Kind::IntListValue(pb::IntList { items: vec![3, 1, 2] }))
+    );
+    let (mut value, mut maps) = (params, 0);
+    while let Some(pb::value::Kind::MapValue(map)) = &value.kind {
+        maps += 1;
+        value = map.entries.last().unwrap().value.as_ref().unwrap();
+    }
+    assert_eq!(maps, 30);
+    assert_eq!(value.kind, Some(pb::value::Kind::IntValue(5)));
+
     // Each harness's first sequence is 0, the one the fixtures name.
     let harness = Harness::start(&[None]);
     let mut handles = harness.submit(1, true, false);

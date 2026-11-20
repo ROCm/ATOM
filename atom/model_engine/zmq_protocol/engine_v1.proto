@@ -168,11 +168,19 @@ message ValueMap {
   repeated MapEntry entries = 1;  // insertion order is preserved
 }
 
+// A list of ints, packed: KV block ids run to thousands, too many for a
+// Value each.
+message IntList {
+  repeated sint64 items = 1;
+}
+
 // A typed value tree for the dict-shaped fields (multimodal data, KV-transfer
 // params, metrics, admin results). Keeps the distinctions a Python consumer
 // can observe -- tuple vs list, int vs float -- so a decoded value is the
 // value that was encoded. What keys a dict holds is up to the component that
-// owns it; the protocol only carries it.
+// owns it; the protocol only carries it. A sender nests at most 30 containers
+// (list, tuple, map) deep, so a message stays under a parser's recursion limit
+// of 100.
 message Value {
   oneof kind {
     bool null_value = 1;      // set to true; the value is None
@@ -185,6 +193,8 @@ message Value {
     ValueList tuple_value = 8;
     ValueMap map_value = 9;
     Tensor tensor_value = 10;
+    IntList int_list_value = 11;   // a list whose items are all ints
+    IntList int_tuple_value = 12;  // a tuple whose items are all ints
     // Python-only escape hatch: a pickled object the typed kinds cannot
     // express. Non-Python clients never send it.
     BufferRef pickled_value = 15;

@@ -23,7 +23,7 @@ import pytest
 
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.request import RequestOutput
-from atom.model_engine.zmq_protocol import codec
+from atom.model_engine.zmq_protocol import codec, wire
 from atom.model_engine.zmq_protocol.engine_v1_pb2 import Envelope
 from atom.sampling_params import RequiredChannel
 
@@ -46,6 +46,15 @@ def read_frames(path: Path) -> list[bytes]:
         frames.append(data[at + 4 : at + 4 + n])
         at += 4 + n
     return frames
+
+
+def deep_value() -> dict:
+    """KV block ids, packed, beside a dict nested as deep as a sender may:
+    the client still parses the message it is in."""
+    inner = 5
+    for _ in range(wire.MAX_VALUE_DEPTH - 1):
+        inner = {"k": inner}
+    return {"remote_block_ids": [3, 1, 2], "nest": inner}
 
 
 def core_messages() -> dict[str, list]:
@@ -73,7 +82,10 @@ def core_messages() -> dict[str, list]:
         finish_reason="eos",
         num_cached_tokens=3,
     )
+    deep = SimpleNamespace(**vars(completion))
+    deep.kv_transfer_params_output = deep_value()
     return {
+        "core_deep_completions": codec.encode_completions([deep]),
         "core_ready": codec.encode_ready({"max_pool_tokens": 4096}),
         "core_stream": codec.encode_stream([(0, stream)]),
         "core_completions": codec.encode_completions([completion]),
@@ -123,6 +135,10 @@ def test_the_core_fixtures_say_what_the_client_reads():
         read_frames(FIXTURES / "core_rejected.frames")
     )
     assert (rejected.id, rejected.leave_reason) == (0, f"{codec.REJECTED_REASON}: bad")
+    _, [deep] = codec.decode_core_message(
+        read_frames(FIXTURES / "core_deep_completions.frames")
+    )
+    assert deep.kv_transfer_params_output == deep_value()
 
 
 def test_the_rust_clients_submit_decodes_as_the_core_reads_it():

@@ -8,6 +8,7 @@ message fails the way the protocol says."""
 import array
 import math
 from dataclasses import replace
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -75,20 +76,78 @@ def test_requests_alike_but_for_max_tokens_share_one_decoded_params():
     assert (first.max_tokens, second.max_tokens) == (10, 20)
 
 
+def core_context(**config):
+    """A Core's `AdmissionContext` over a minimal config; `config` overrides."""
+    fields = {
+        "kv_cache_block_size": 16,
+        "speculative_config": None,
+        "enable_dp_attention": False,
+        "hf_config": SimpleNamespace(model_type="llama"),
+        "end_token_ids": (2,),
+        "kv_transfer_config": None,
+        "enable_rapidserve": False,
+        **config,
+    }
+    return codec.AdmissionContext(SimpleNamespace(**fields))
+
+
 def test_the_sequence_gets_its_own_max_tokens():
-    config = type(
-        "C",
-        (),
-        {
-            "kv_cache_block_size": 16,
-            "speculative_config": None,
-            "hf_config": type("H", (), {"model_type": "llama"})(),
-        },
-    )()
-    context = codec.AdmissionContext(config)
+    context = core_context()
     for cap in (10, 20):
         seq = codec.build_sequence(submitted(SamplingParams(max_tokens=cap)), context)
         assert seq.max_tokens == cap
+
+
+CHANNEL = RequiredChannel(after=(5, 6), opening=(7, 8), opens_at=1, end_ids=(9,))
+
+
+@pytest.mark.parametrize(
+    "params, ingress, config, refusal",
+    [
+        (
+            SamplingParams(logprobs=True),
+            {"kv_transfer_params": {"do_remote_decode": True}},
+            {},
+            "P/D transfer",
+        ),
+        (SamplingParams(logprobs=True), {}, {"enable_rapidserve": True}, "RapidServe"),
+        (
+            SamplingParams(json_schema="{}", required_channel=CHANNEL),
+            {},
+            {},
+            "both a structured-output grammar",
+        ),
+        (
+            SamplingParams(json_schema="{}", ignore_eos=True),
+            {},
+            {},
+            "ignore_eos",
+        ),
+    ],
+    ids=["logprobs-pd", "logprobs-rapidserve", "grammar-and-channel", "grammar-eos"],
+)
+def test_the_core_refuses_what_the_frontend_refuses(params, ingress, config, refusal):
+    """A client other than this repo's frontend is held to the same admission."""
+    spec = submitted(params, **ingress)
+    with pytest.raises(ValueError, match=refusal):
+        codec.build_sequence(spec, core_context(**config))
+
+
+def test_the_core_holds_every_required_request_to_its_one_channel():
+    context = core_context()
+    first = codec.build_sequence(
+        submitted(SamplingParams(required_channel=CHANNEL)), context
+    )
+    # Held back on the Core's own end ids too.
+    assert first.required_channel == replace(CHANNEL, end_ids=(2, 9))
+    # A client that held it back already sends the held one.
+    again = codec.build_sequence(
+        submitted(SamplingParams(required_channel=first.required_channel)), context
+    )
+    assert again.required_channel is first.required_channel
+    other = replace(CHANNEL, after=(4, 6))
+    with pytest.raises(ValueError, match="another channel"):
+        codec.build_sequence(submitted(SamplingParams(required_channel=other)), context)
 
 
 def test_absent_sampling_values_take_the_defaults_not_none():
@@ -143,7 +202,11 @@ def same(a, b):
     "value",
     [
         None,
-        1 << 64,  # past int64: carried as text
+        1 << 64,  # past int64: no wire type, pickled
+        [1, -(1 << 63), (1 << 63) - 1],  # packed
+        (4, 5),  # packed, still a tuple
+        [1, True, np.int64(2)],  # not plain ints: a Value each, types kept
+        [1, 1 << 64],  # one past int64: a Value each
         float("nan"),
         b"\x00\x01",
         [1, [2, (3, 4)], {"a": None}],
@@ -159,6 +222,65 @@ def same(a, b):
 )
 def test_values_cross_whole(value):
     assert same(value, value_round_trip(value))
+
+
+def test_an_int_list_goes_packed():
+    env = pb.Envelope()
+    wire.encode_value(
+        {"ids": list(range(8192))}, env.metrics.snapshot, wire.FrameWriter()
+    )
+    [entry] = env.metrics.snapshot.map_value.entries
+    assert entry.value.WhichOneof("kind") == "int_list_value"
+
+
+def nested(depth, inner=5):
+    """`inner` inside `depth` dicts."""
+    for _ in range(depth):
+        inner = {"k": inner}
+    return inner
+
+
+def test_the_deepest_value_allowed_still_parses():
+    """The deepest place a Value sits (a RequestSpec's) at the deepest nesting
+    allowed: the Core parses it under protobuf's recursion limit."""
+    value = nested(wire.MAX_VALUE_DEPTH)
+    spec = submitted(SamplingParams(), kv_transfer_params=value)
+    assert spec.kwargs["kv_transfer_params"] == value
+
+
+def test_a_value_nested_too_deep_is_refused_by_its_sender():
+    req = IngressRequest(id=7, prompt_token_ids=[1], sampling_params=SamplingParams())
+    req.kv_transfer_params = nested(wire.MAX_VALUE_DEPTH + 1)
+    with pytest.raises(wire.ProtocolError, match="containers deep"):
+        codec.encode_submit([req])
+
+
+def test_a_small_decoded_tensor_does_not_pin_the_shared_frame():
+    env = pb.Envelope()
+    writer = wire.FrameWriter()
+    wire.encode_value(np.arange(4, dtype=np.int32), env.metrics.snapshot, writer)
+    frames = writer.frames(env)
+    frames[0] = bytes(frames[0])
+    shared = bytearray(frames[1])
+    frames[1] = shared
+    out = wire.decode_value(env.metrics.snapshot, wire.FrameReader(frames))
+    shared[:] = b"\xff" * len(shared)
+    assert out.tolist() == [0, 1, 2, 3]
+
+
+def test_a_token_id_past_int32_is_refused_not_wrapped():
+    with pytest.raises(OverflowError):
+        IngressRequest(
+            id=1,
+            prompt_token_ids=np.array([1, 1 << 31], dtype=np.int64),
+            sampling_params=SamplingParams(),
+        )
+    req = IngressRequest(
+        id=1,
+        prompt_token_ids=np.array([1, 2], dtype=np.int64),
+        sampling_params=SamplingParams(),
+    )
+    assert list(req.prompt_token_ids) == [1, 2]
 
 
 def test_a_tensor_whose_buffer_does_not_match_its_shape_is_refused():
@@ -198,10 +320,6 @@ def test_a_stream_crosses_with_logprob_columns_of_every_width():
 
 
 def test_an_unencodable_kv_output_drops_only_its_own_entry():
-    class Unpicklable:
-        def __reduce__(self):
-            raise TypeError("nope")
-
     outputs = [
         (1, RequestOutput(1, [1], False)),
         (2, RequestOutput(2, [2], True, "eos", {"x": Unpicklable()})),
@@ -209,6 +327,43 @@ def test_an_unencodable_kv_output_drops_only_its_own_entry():
     _, decoded = codec.decode_core_message(on_the_wire(codec.encode_stream(outputs)))
     assert [list(out.output_tokens) for _, out in decoded] == [[1], [2]]
     assert decoded[1][1].kv_transfer_params_output is None
+
+
+class Unpicklable:
+    def __reduce__(self):
+        raise TypeError("nope")
+
+
+def finished_seq(seq_id, kv_output=None):
+    seq = Sequence([1, 2, 3], 16, SamplingParams(), id=seq_id)
+    seq.append_token(4)
+    seq.leave_reason = "eos"
+    seq.kv_transfer_params_output = kv_output
+    return seq
+
+
+def test_a_completion_that_does_not_encode_fails_alone():
+    seqs = [finished_seq(1), finished_seq(2, {"x": Unpicklable()}), finished_seq(3)]
+    _, done = codec.decode_core_message(on_the_wire(codec.encode_completions(seqs)))
+    assert [d.id for d in done] == [1, 2, 3]
+    assert [d.leave_reason for d in done] == ["eos", done[1].leave_reason, "eos"]
+    assert done[1].leave_reason.startswith(f"{codec.REJECTED_REASON}: ")
+    assert list(done[2].completion_token_ids) == [4]
+
+
+def test_a_completion_that_does_not_decode_fails_alone():
+    seqs = [finished_seq(1), finished_seq(2, {"x": {1, 2}}), finished_seq(3)]
+    frames = codec.encode_completions(seqs)
+    env = wire.decode_envelope(on_the_wire(frames))
+    # Its pickled params point at a frame the message does not have.
+    item = env.completions.items[1].kv_transfer_params_output
+    item.map_value.entries[0].value.pickled_value.frame = 9
+    frames[0] = env.SerializeToString()
+    _, done = codec.decode_core_message(on_the_wire(frames))
+    assert [d.id for d in done] == [1, 2, 3]
+    assert done[1].leave_reason.startswith(f"{codec.REJECTED_REASON}: ")
+    assert "missing frame 9" in done[1].leave_reason
+    assert [d.leave_reason for d in (done[0], done[2])] == ["eos", "eos"]
 
 
 def test_a_completion_carries_what_a_client_reads():

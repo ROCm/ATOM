@@ -129,6 +129,40 @@ class RequiredChannel:
         return replace(self, end_ids=tuple(sorted(end_ids)))
 
 
+class EngineChannel:
+    """The one channel an engine holds its ``tool_choice="required"``
+    requests to.
+
+    `hold` holds a request's channel's opening against every single id the
+    engine ends a sequence on (`Scheduler.postprocess` stops on EOS and on
+    `stop_token_ids`), not just the ones the tool-call format named. The third
+    way a sequence ends, the request's own `stop` strings, is left to end it:
+    the client asked for that stop, and a multi-token match is not one logits
+    row's mask.
+
+    Built once, from the first required request, and shared by every later
+    one. A request naming a different channel is refused at admission, where
+    it fails alone; the engine loop batches every request together and holds
+    one channel. A channel already held back the same way is the held one.
+    """
+
+    def __init__(self, config):
+        self._config = config
+        self._named: RequiredChannel | None = None  # as the format named it
+        self._held: RequiredChannel | None = None
+
+    def hold(self, channel: RequiredChannel) -> RequiredChannel:
+        if self._held is None:
+            self._named = channel
+            self._held = channel.ending_on(self._config.end_token_ids)
+        elif channel != self._named and channel != self._held:
+            raise ValueError(
+                'this engine already holds tool_choice="required" requests to '
+                "another channel; a server resolves one tool-call format"
+            )
+        return self._held
+
+
 @dataclass
 class SamplingParams:
     temperature: float = 1.0
