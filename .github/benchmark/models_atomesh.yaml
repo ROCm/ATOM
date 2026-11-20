@@ -2483,3 +2483,147 @@ models:
       # V3 is not a reasoning model, so gsm8k answers are short.
       max_gen_toks: 512
       apply_chat_template: true
+
+  # Validation of open PRs #3536, #3616 (#3472, #3471), #3602 (#3599-#3601) and #3427 together.
+  # One node: PP4 x TP1 prefill (GPUs 0-3) -> TP4 decode (GPUs 4-7), NVFP4 KV + index. Dispatch-only.
+  MiniMax-M3.1-Flash-NVFP4-PRVAL:
+    backend: atom
+    # Informational: pd_matrix.py takes the image from --image / ATOMESH_IMAGE only.
+    image: rocm/atom-dev:nightly_202611200431
+    model_path: amd/MiniMax-M3.1-Flash-Quark-MXFP4
+    precision: MXFP4
+    env:
+      common: &m31v_common_env
+        AITER_LOG_LEVEL: WARNING
+        PYTHONNOUSERSITE: "1"
+        PYTHONHASHSEED: "0"
+        MC_DISABLE_HIP: "1"
+        MC_NUM_QP_PER_EP: "1"
+        ATOM_PD_MINIMAX_LANDING: "1"
+        HF_HUB_CACHE: "${ATOMESH_MODEL_ROOT}/.huggingface/hub"
+        HF_HUB_DOWNLOAD_TIMEOUT: "120"
+        ATOMESH_TORCH_PROFILE_DURATION: "0"
+      prefill: {}
+      decode: {}
+    server:
+      common_args:
+        trust_remote_code: true
+        kv_cache_dtype: nvfp4
+        block_size: 128
+        enable_prefix_caching: true
+        gpu_memory_utilization: 0.9
+        max_model_len: 1048576
+        max_num_seqs: 64
+        method: dspark
+        draft_model: amd/MiniMax-M3.1-Flash-Quark-MXFP4/dspark
+        num_speculative_tokens: 7
+        extra_args: "--index-cache-dtype nvfp4 --spec-decode-kv-cache-dtype fp8"
+    service:
+      prefill:
+        cudagraph: "[1]"
+      decode:
+        cudagraph: "[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64]"
+    suites:
+      # The Store's suite: its owners fit pit2-p03 (TW MI355X) nodes only.
+      mooncake_store:
+        # GSM8K 20-shot chat on the P/D path, fp8 draft KV, Store draft-window layout.
+        - &m31v_gsm8k
+          name: m31v-nvfp4-1p1d-pp4-tp4-dspark7-fp8draft-mcstore-gsm8k20
+          topology: 1p1d
+          display_topology: 1P1D-PP4-TP4-DSPARK7-NVFP4-FP8DRAFT-MCSTORE-DRAFTWIN-PRVAL
+          pd_worker_layout: single_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [4096]
+          osl: 1024
+          concurrency: [32]
+          prefill: &m31v_pp4_prefill
+            workers: 1
+            tp: 1
+            extra_args: "--pipeline-parallel-size 4 --enforce-eager --max-num-batched-tokens 8192"
+          decode:
+            workers: 1
+            tp: 4
+          env:
+            common: *m31v_common_env
+            prefill: &m31v_prefill_env
+              HIP_VISIBLE_DEVICES: "0,1,2,3"
+              VLLM_PP_LAYER_PARTITION: "16,16,16,12"
+              ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4: "1"
+              ATOM_PP_MAX_INFLIGHT: "8"
+              MOONCAKE_STORE: "1"
+              # Both NUMA nodes' DRAM, one single-NIC owner per NUMA1 NIC (an ionic NIC
+              # registers at most 832 GiB); NUMA1 sized to what compacts on g27.
+              MOONCAKE_STORE_OWNERS: "0:576:rdma4;0:576:rdma5;1:384:rdma6;1:384:rdma7"
+              MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: "${ATOMESH_MODEL_ROOT}"
+              MOONCAKE_STORE_COMPACT_TIMEOUT: "1800"
+              OFFLOAD_PROFILE: "1"
+              OFFLOAD_MIN_LOAD_TOKENS: "0"
+              ATOM_MOONCAKE_STORE_DRAFT_WINDOW: "1"
+              # P/D only; the launcher adds mooncake_store through ATOM_KV_OFFLOAD.
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":true}
+            # Decode MRs on rdma4-7 only (no alternate HCA), off the prefill stages' NICs.
+            decode: &m31v_decode_env
+              HIP_VISIBLE_DEVICES: "4,5,6,7"
+              ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4: "0"
+              ATOM_M3_INDEXER_CP: "1"
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_device":"rdma4,rdma5,rdma6,rdma7","pd_admission":{"enabled":true,"max_pending_kv_fraction":0.15,"num_reserved_decode_tokens":512}}
+          benchmark:
+            wait_server_timeout: 7200
+            wait_router_timeout: 600
+          run_eval: true
+          eval_only: true
+          eval_concurrency: [32]
+          accuracy:
+            task: gsm8k
+            fewshot: 20
+            limit: null
+            model_type: local-chat-completions
+            endpoint: chat/completions
+            max_gen_toks: 16384
+            apply_chat_template: true
+            fewshot_as_multiturn: true
+            threshold: 0.94
+
+        # The same with the default bf16 draft KV. No draft window: its draft objects (1,310,720 B a
+        # block) outgrow stage 3's NVFP4 target objects (995,328 B), and the split refuses that at startup.
+        - <<: *m31v_gsm8k
+          name: m31v-nvfp4-1p1d-pp4-tp4-dspark7-bf16draft-mcstore-gsm8k20
+          display_topology: 1P1D-PP4-TP4-DSPARK7-NVFP4-BF16DRAFT-MCSTORE-PRVAL
+          server:
+            common_args:
+              extra_args: "--index-cache-dtype nvfp4"
+          env:
+            common: *m31v_common_env
+            prefill:
+              <<: *m31v_prefill_env
+              ATOM_MOONCAKE_STORE_DRAFT_WINDOW: "0"
+            decode: *m31v_decode_env
+
+        # AgentX, InferenceX golden AL for DSpark7 (4.04, performance only).
+        - name: m31v-nvfp4-1p1d-pp4-tp4-dspark7-mcstore-agentx-c120
+          topology: 1p1d
+          display_topology: 1P1D-PP4-TP4-DSPARK7-NVFP4-MCSTORE-DRAFTWIN-PRVAL
+          pd_worker_layout: single_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [1048576]
+          osl: 1024
+          concurrency: [120]
+          prefill: *m31v_pp4_prefill
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: "[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160,176,192,208,224,240]"
+          server:
+            common_args:
+              max_num_seqs: 240
+              spec_decode_acceptance_length: 4.04
+          env:
+            common: *m31v_common_env
+            prefill: *m31v_prefill_env
+            decode: *m31v_decode_env
+          benchmark:
+            <<: *agentic_1m_aiperf
+            wait_server_timeout: 7200
+          run_eval: false
