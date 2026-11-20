@@ -60,7 +60,6 @@ from atom.kv_transfer.pool.umbp.settings import UmbpPoolSettings
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.kv_block import Block
 from atom.model_engine.kv_block_pool import KVBlockPool, KVPoolMemory
-from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -136,9 +135,17 @@ def _hash(key: bytes) -> int:
 
 
 class UmbpL1Pool(KVBlockPool):
-    """`KVBlockPool` over the blocks UMBP manages (the `[P, N)` part)."""
+    """`KVBlockPool` over the blocks UMBP manages (the `[P, N)` part).
+
+    `client` is MORI's `mori_umbp_l1.L1Client`, which needs `Fetch` with
+    `dst_slots` / `probe_only` and `Attach` with an external handle (ROCm/mori
+    #1045). Its calls may come from several threads at once -- the scheduler's
+    and the background fetches' -- which the client allows: each call is one
+    gRPC request on a shared channel, with the GIL released.
+    """
 
     shares_content = True
+    async_fetch = True
 
     def __init__(
         self,
@@ -191,7 +198,9 @@ class UmbpL1Pool(KVBlockPool):
         # into held blocks (`fetch_async`).
         self._fetches: dict = {}
         self._executor = None
-        self.async_fetch = self._probe_fetch_into()
+        # Bumped by `clear_index`: a copy started before a clear (a weight
+        # update, a cache reset) must not be indexed after it.
+        self._clear_generation = 0
 
     # ------------------------------- counts -------------------------------- #
     @property
@@ -274,6 +283,7 @@ class UmbpL1Pool(KVBlockPool):
         self._client.clear(self.pool_id)
         self._hash_to_block_id.clear()
         self.index_version += 1
+        self._clear_generation += 1
         for block in self.blocks:
             if block.ref_count == 0:
                 block.hash = -1
@@ -475,14 +485,6 @@ class UmbpL1Pool(KVBlockPool):
     # the blocks are granted here, filled by UMBP, then published and released
     # here like any block a forward filled.
 
-    def _probe_fetch_into(self) -> bool:
-        """Whether the server copies into held slots (`dst_slots`)."""
-        try:
-            self._client.fetch(self.pool_id, [], dst_slots=[], probe_only=True)
-        except TypeError:
-            return False
-        return True
-
     def fetch_async(
         self,
         owner: Hashable,
@@ -496,7 +498,7 @@ class UmbpL1Pool(KVBlockPool):
         """
         if owner in self._fetches:
             return True
-        if not hashes or not self.async_fetch:
+        if not hashes:
             return False
         keys = [_key(h) for h in hashes]
         *_, available = self._client.fetch(self.pool_id, keys, probe_only=True)
@@ -521,6 +523,7 @@ class UmbpL1Pool(KVBlockPool):
             list(hashes[:n]),
             tokens_of,
             time.perf_counter(),
+            self._clear_generation,
         )
         return True
 
@@ -533,13 +536,16 @@ class UmbpL1Pool(KVBlockPool):
             return
         done = [o for o, entry in self._fetches.items() if entry[0].done()]
         for owner in done:
-            future, ids, hashes, tokens_of, started = self._fetches.pop(owner)
+            future, ids, hashes, tokens_of, started, generation = self._fetches.pop(
+                owner
+            )
             try:
                 slots, _, copied, copied_bytes, *_ = future.result()
             except Exception:  # a failed copy is a miss
                 logger.exception("UMBP pool %s: background fetch failed", self.pool_id)
                 slots, copied, copied_bytes = [], 0, 0
-            landed = len(slots)
+            # Content from before a clear is not indexed again.
+            landed = len(slots) if generation == self._clear_generation else 0
             index = self._hash_to_block_id
             published = 0
             for i, block_id in enumerate(ids):
@@ -609,6 +615,7 @@ class UmbpPoolMemory(KVPoolMemory):
         self._issued: deque = deque()
         self._wake = threading.Event()
         self._watcher: threading.Thread | None = None
+        self._closed = False
 
     def writes_issued(self) -> None:
         if self._mapped_base is None:
@@ -635,10 +642,10 @@ class UmbpPoolMemory(KVPoolMemory):
         """Tell UMBP each time the device finishes another forward's writes."""
         issued = self._issued
         failed = False
-        while True:
+        while not self._closed:
             if not issued:
                 self._wake.clear()
-                if not issued:
+                if not issued and not self._closed:
                     self._wake.wait()
                 continue
             stamp, event = issued[0]
@@ -661,6 +668,20 @@ class UmbpPoolMemory(KVPoolMemory):
                         self.pool_id,
                     )
                 failed = True
+
+    def close(self) -> None:
+        """Stop reporting progress and let UMBP unmap its part; the memory
+        itself is this process's and goes with it."""
+        self._closed = True
+        self._wake.set()
+        if self._watcher is not None:
+            self._watcher.join(timeout=1.0)
+        if self._mapped_base is not None:
+            try:
+                self._client.detach(self.pool_id)
+            except Exception:  # noqa: BLE001 - the server may already be gone
+                logger.debug("UMBP pool %s: detach on close failed", self.pool_id)
+            self._mapped_base = None
 
     def allocate(self, nbytes: int, device) -> Any:
         import torch
@@ -804,13 +825,15 @@ class UmbpBlockPool(KVBlockPool):
         self._copies: list[tuple[int, int]] = []
         # Demoted UMBP slots whose copy is not yet in a taken batch, and
         # those whose batch was taken and awaits its postprocess.
-        self._unissued: list[tuple[int, int, array.array]] = []
-        self._issued: list[tuple[int, int, array.array]] = []
+        self._unissued: list[tuple[int, int, array.array, int]] = []
+        self._issued: list[tuple[int, int, array.array, int]] = []
         # The same for UMBP blocks kept in private blocks (shared first).
-        self._kept_unissued: list[tuple[int, int, array.array]] = []
-        self._kept_issued: list[tuple[int, int, array.array]] = []
+        self._kept_unissued: list[tuple[int, int, array.array, int]] = []
+        self._kept_issued: list[tuple[int, int, array.array, int]] = []
         self.blocks_kept = 0
         self._version = 0
+        # Bumped by `clear_index`; a move recorded before it publishes nothing.
+        self._clear_generation = 0
         self.blocks_demoted = 0
         self.demotions_dropped = 0
         self._logged_demoted = 0
@@ -841,7 +864,7 @@ class UmbpBlockPool(KVBlockPool):
 
     @property
     def async_fetch(self) -> bool:
-        return getattr(self.umbp, "async_fetch", False)
+        return self.umbp.async_fetch
 
     # ------------------------------- counts -------------------------------- #
     @property
@@ -957,13 +980,16 @@ class UmbpBlockPool(KVBlockPool):
             return
         self.umbp.allocate(slot)
         self._copies.append((block_id, slot + self.offset))
-        self._unissued.append((slot, h, array.array("i", token_ids)))
+        self._unissued.append(
+            (slot, h, array.array("i", token_ids), self._clear_generation)
+        )
         self.blocks_written_through += 1
 
     def clear_index(self) -> None:
         self.private.clear_index()
         self.umbp.clear_index()
         self._version += 1
+        self._clear_generation += 1
 
     # ---------------------------- allocation ------------------------------- #
     def prepare(self, count: int) -> None:
@@ -1009,7 +1035,9 @@ class UmbpBlockPool(KVBlockPool):
         slot = self.umbp.pop()
         self.umbp.allocate(slot)
         self._copies.append((block_id, slot + self.offset))
-        self._unissued.append((slot, h, array.array("i", token_ids)))
+        self._unissued.append(
+            (slot, h, array.array("i", token_ids), self._clear_generation)
+        )
         self.blocks_demoted += 1
 
     def _keep(self, slot: int, h: int, token_ids: array.array) -> None:
@@ -1020,7 +1048,9 @@ class UmbpBlockPool(KVBlockPool):
         block_id = self.private.pop()
         self.private.allocate(block_id)
         self._copies.append((slot + self.offset, block_id))
-        self._kept_unissued.append((block_id, h, array.array("i", token_ids)))
+        self._kept_unissued.append(
+            (block_id, h, array.array("i", token_ids), self._clear_generation)
+        )
         self.blocks_kept += 1
 
     def take_block_copies(self) -> tuple[tuple[int, int], ...]:
@@ -1037,18 +1067,23 @@ class UmbpBlockPool(KVBlockPool):
         """Publish moved blocks whose copy has been issued (postprocess)."""
         if not self._issued and not self._kept_issued:
             return
-        for slot, h, token_ids in self._issued:
+        # A move recorded before a clear carries content from before it.
+        for slot, h, token_ids, generation in self._issued:
+            current = generation == self._clear_generation
             # A demoted block: unless it was computed again meanwhile. A
             # written-through one: its private copy stays, so only UMBP's
             # part decides.
-            if self.umbp.lookup(h) == -1 and (
-                self.write_through or self.private.lookup(h) == -1
+            if (
+                current
+                and self.umbp.lookup(h) == -1
+                and (self.write_through or self.private.lookup(h) == -1)
             ):
                 self.umbp.publish(slot, h, token_ids)
             self.umbp.free(slot)
         self._issued.clear()
-        for block_id, h, token_ids in self._kept_issued:
-            if self.lookup(h) == -1:
+        for block_id, h, token_ids, generation in self._kept_issued:
+            current = generation == self._clear_generation
+            if current and self.lookup(h) == -1:
                 self.private.publish(block_id, h, token_ids)
             self.private.free(block_id)
         self._kept_issued.clear()
@@ -1133,15 +1168,21 @@ def make_umbp_block_pool(
     on_remap: Callable[[int], None] | None = None,
     cache_policy: str = "lru",
     protected_ratio: float = 0.5,
+    reserve_null_block: bool = False,
 ) -> UmbpBlockPool:
     ratio = settings.share_ratio
-    if envs.ATOM_PREFIX_CACHE_POLICY.strip().lower() != "lru":
+    if cache_policy.strip().lower() != "lru":
         logger.warning(
-            "ATOM_PREFIX_CACHE_POLICY=%s applies to the private blocks only: "
+            "prefix cache policy %s applies to the private blocks only: "
             "UMBP evicts its part least recently released first",
-            envs.ATOM_PREFIX_CACHE_POLICY,
+            cache_policy,
         )
     offset = split_point(num_blocks, ratio)
+    if reserve_null_block and offset == 0:
+        raise ValueError(
+            "paged state checkpoints reserve block 0, which a share ratio of 1 "
+            "gives to UMBP: use a share ratio below 1 or turn the checkpoints off"
+        )
     pool: UmbpBlockPool | None = None
 
     # A hash leaves the pool only when neither part still holds it: a
@@ -1156,6 +1197,7 @@ def make_umbp_block_pool(
         cache_policy=cache_policy,
         protected_ratio=protected_ratio,
         on_remap=on_remap,
+        reserve_null_block=reserve_null_block,
     )
     umbp = make_umbp_l1_pool(
         config,

@@ -61,6 +61,10 @@ class KVBlockPool(ABC):
     #: (`fetch`). `BlockManager` skips the work of asking when it cannot.
     shares_content: bool = False
 
+    #: Whether `fetch_async` copies in the background (the scheduler then holds
+    #: a sequence back while `fetch_pending`), rather than `fetch` in line.
+    async_fetch: bool = False
+
     # ------------------------------- counts -------------------------------- #
     @property
     @abstractmethod
@@ -177,6 +181,33 @@ class KVBlockPool(ABC):
         for. Returns how many leading hashes are now resident.
         """
         return 0
+
+    def fetch_async(
+        self,
+        owner: Hashable,
+        hashes: Sequence[int],
+        tokens_of: Callable[[int], array.array],
+    ) -> bool:
+        """Start making the leading run of `hashes` resident in the background,
+        for `owner`. True while that copy is in flight (`fetch_pending`); its
+        blocks are indexed by `poll_fetches` once it lands."""
+        return False
+
+    def fetch_pending(self, owner: Hashable) -> bool:
+        """Whether a background copy for `owner` is still in flight."""
+        return False
+
+    def poll_fetches(self) -> None:
+        """Index what finished background copies brought in. Once per
+        scheduling pass, before any prefix walk."""
+
+    def take_block_copies(self) -> tuple[tuple[int, int], ...]:
+        """Whole-block copies (source id, destination id) the batch being
+        built must run before its forward, taken once."""
+        return ()
+
+    def settle(self) -> None:
+        """After the postprocess of a batch: what its copies moved is in place."""
 
     def flush(self) -> None:
         """Push any deferred bookkeeping to the backend. Cheap when idle."""

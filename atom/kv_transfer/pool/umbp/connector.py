@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from atom.kv_transfer.disaggregation.base import (
     KVConnectorBase,
@@ -28,13 +28,41 @@ from atom.kv_transfer.disaggregation.base import (
 from atom.kv_transfer.disaggregation.types import ConnectorMetadata
 from atom.kv_transfer.pool.umbp.settings import UmbpPoolSettings
 
+if TYPE_CHECKING:
+    from atom.model_engine.kv_block_pool import KVBlockPool, KVPoolMemory
+
 logger = logging.getLogger("atom")
 
 
+# The models whose attention backend lays its pool out for UMBP (PAGE regions
+# for `bind_layout`, whole-block copies for a split pool).
+_SUPPORTED_ARCHITECTURES = ("DeepseekV41ForCausalLM",)
+
+
 def _settings(config: Any) -> UmbpPoolSettings:
-    return UmbpPoolSettings.from_transfer_config(
+    settings = UmbpPoolSettings.from_transfer_config(
         getattr(config, "kv_transfer_config", None)
     )
+    _check_supported(config)
+    return settings
+
+
+def _check_supported(config: Any) -> None:
+    """Refuse at startup what would otherwise fail mid-serving."""
+    hf_config = getattr(config, "hf_config", None)
+    architectures = list(getattr(hf_config, "architectures", None) or ())
+    if hf_config is not None and not set(architectures) & set(_SUPPORTED_ARCHITECTURES):
+        raise ValueError(
+            f"the umbp_pool connector supports {', '.join(_SUPPORTED_ARCHITECTURES)}, "
+            f"not {architectures}"
+        )
+    # Under DP attention `tensor_parallel_size` is the attention TP of a rank.
+    if int(getattr(config, "tensor_parallel_size", 1) or 1) > 1:
+        raise ValueError(
+            "the umbp_pool connector backs one runner per engine rank: use "
+            "data-parallel attention (--enable-dp-attention), not tensor-"
+            "parallel attention"
+        )
 
 
 def pool_sharing(kv_transfer_config) -> dict[str, Any]:
@@ -59,11 +87,17 @@ class UmbpPoolConnector(KVConnectorBase):
     def __init__(self, config: Any) -> None:
         self.config = config
         self.settings = _settings(config)
+        self.memory = None
 
-    def kv_pool_memory(self, config: Any, rank: int):
+    def kv_pool_memory(self, config: Any, rank: int) -> KVPoolMemory:
         from atom.kv_transfer.pool.umbp.pool import make_umbp_pool_memory
 
-        return make_umbp_pool_memory(config, self.settings, rank)
+        self.memory = make_umbp_pool_memory(config, self.settings, rank)
+        return self.memory
+
+    def close(self) -> None:
+        if self.memory is not None:
+            self.memory.close()
 
     def register_kv_caches(self, kv_caches, transfer_tensors=None, num_blocks=None):
         pass  # UMBP adopted its part of the pool in `bind_layout`
@@ -94,7 +128,8 @@ class UmbpPoolConnectorScheduler(KVConnectorSchedulerBase):
         on_remap: Callable[[int], None] | None = None,
         cache_policy: str = "lru",
         protected_ratio: float = 0.5,
-    ):
+        reserve_null_block: bool = False,
+    ) -> KVBlockPool:
         from atom.kv_transfer.pool.umbp.pool import make_umbp_block_pool
 
         # One pool for every share ratio: at 1 its private part is empty.
@@ -106,8 +141,13 @@ class UmbpPoolConnectorScheduler(KVConnectorSchedulerBase):
             on_remap=on_remap,
             cache_policy=cache_policy,
             protected_ratio=protected_ratio,
+            reserve_null_block=reserve_null_block,
         )
         return self.pool
+
+    def close(self) -> None:
+        if self.pool is not None:
+            self.pool.close()
 
     # --------------------- transfer hooks: nothing to move -------------------- #
     def get_num_new_matched_tokens(self, seq: Any) -> tuple[int, bool]:

@@ -235,3 +235,23 @@ def test_write_through_copies_each_published_private_block_into_umbp(l1):
     a.allocate(a.pop())  # private part full: evicts 11 (LRU) without a copy
     assert a.take_block_copies() == ()
     assert evicted == [] and a.lookup(11) >= 2
+
+
+def test_a_move_issued_before_a_clear_publishes_nothing(l1):
+    pool = make_split(l1, "a", 1, 2)
+    fill(pool, 11)
+    pool.allocate(pool.pop())  # demotes 11
+    assert len(pool.take_block_copies()) == 1
+    pool.clear_index()  # a weight update while the batch runs
+    pool.settle()
+    assert pool.lookup(11) == -1 and pool.umbp.lookup(11) == -1
+
+
+def test_a_reserved_null_block_needs_a_private_part():
+    settings = UmbpPoolSettings(address="unix:///unused", share_ratio=1.0)
+    try:
+        make_umbp_block_pool(None, settings, 8, reserve_null_block=True)
+    except ValueError as e:
+        assert "block 0" in str(e)
+    else:
+        raise AssertionError("a share ratio of 1 must refuse a reserved block 0")
