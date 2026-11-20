@@ -21,7 +21,11 @@ from atom.model_engine.dynamic_chunking import (
     ChunkSizePredictor,
 )
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
-from atom.model_engine.engine_utility import EngineUtilityHandler
+from atom.model_engine.engine_utility import (
+    EngineUtilityHandler,
+    ask_what_runners_cannot_take,
+)
+from atom.model_engine.prefill_backlog import prefill_backlog
 from atom.model_engine.prefix_hash import attach_shipped_chains
 from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
 from atom.model_engine.sequence import (
@@ -65,6 +69,17 @@ HELD_POLL_S = 0.01
 KV_SHUTDOWN_DRAIN_TIMEOUT_S = 2.0
 
 
+def flush_dp_reuse(scheduler, output_queue) -> None:
+    """Queue the scheduler's `share_cache` reuse reports (`Scheduler.
+    dp_reuse_reports`) for the CoreManager. Called before a step's outputs are
+    queued: a request's report then reaches the router before its first or
+    last output, which complete or release its placement."""
+    reports = scheduler.dp_reuse_reports
+    if reports:
+        scheduler.dp_reuse_reports = []
+        output_queue.put_nowait(("DP_REUSE", reports))
+
+
 def publish_idle_state_work(scheduler) -> None:
     """Publish the state loads and stores `scheduler` holds while no batch runs."""
     scheduler._publish_state_loads()
@@ -76,9 +91,17 @@ class EngineCore:
     # attribute because it is per-process state and each engine is spawned into
     # its own interpreter; `_setup_engine_process` is the only writer.
     _process_name = "EngineCore"
+    # Whether the engine reports its prefill backlog to the CoreManager
+    # (`share_cache` routing); the data-parallel engine turns it on.
+    _report_backlog = False
 
     def __init__(self, config: Config, input_address: str, output_address: str):
         self.label = "Engine Core"
+        # Requests taken from the input queue, and the last (ingested, prefill
+        # left) pair reported to the CoreManager (`_report_prefill_backlog`).
+        self._ingested_seqs = 0
+        self._last_backlog_report: tuple[int, int] | None = None
+        self._next_backlog_report = 0.0
         self._kv_progress_event = threading.Event()
         self.input_queue = queue.Queue[Sequence]()
         self.output_queue = queue.Queue[list[Sequence]]()
@@ -145,6 +168,7 @@ class EngineCore:
                 config.tp_world_size * config.pcp_group_size,
                 config.runner_qualname,
                 config,
+                local_proc_num=config.tp_size_local if config.is_multinode_tp else None,
                 on_worker_failure=self._send_engine_dead,
                 kv_progress_event=self._kv_progress_event,
             )
@@ -200,6 +224,12 @@ class EngineCore:
                     f"{self.label}: cudagraph capture{decode_sizes} cost: {cap_cost:.2f} "
                     f"seconds, pool: {pool_bytes / (1 << 30):.2f}GB"
                 )
+            # Fixed once the model is loaded, so asked once.
+            unavailable = (
+                ask_what_runners_cannot_take(self.runner_mgr, self.label)
+                if config.weight_sync_runner
+                else {}
+            )
             good = True
         finally:
             logger.info(
@@ -245,7 +275,9 @@ class EngineCore:
             self.output_queue,
             label=self.label,
             scheduler=self.scheduler,
+            unavailable=unavailable,
         )
+        self._weight_syncs_unavailable = unavailable
 
         # KV cache allocated, graphs captured, BlockPool built: everything this
         # process holds for its lifetime exists, and the next thing is traffic.
@@ -315,7 +347,7 @@ class EngineCore:
     def _send_ready_signal(self):
         self.output_queue.put_nowait(("READY", self._ready_payload()))
 
-    def _ready_payload(self) -> dict[str, int] | None:
+    def _ready_payload(self) -> dict[str, object] | None:
         """Startup facts the frontend cannot read off its own Config.
 
         `num_kvcache_blocks` is measured in this subprocess, so the API server's
@@ -323,10 +355,18 @@ class EngineCore:
         ceiling rather than the raw block count leaves the dcp arithmetic with
         its owner, `BlockManager`, and gives the frontend a single number to
         compare a prompt against.
+
+        `weight_syncs_unavailable` maps each weight-sync feature this engine's
+        runners cannot take to the reason. CoreManager merges every engine's
+        and refuses such a sync before any engine runs it: under PP, one
+        stage's runners alone may be the ones that cannot.
         """
-        if self.scheduler is None:
-            return None
-        return {"max_pool_tokens": self.scheduler.block_manager.max_pool_tokens}
+        payload = {}
+        if self.scheduler is not None:
+            payload["max_pool_tokens"] = self.scheduler.block_manager.max_pool_tokens
+        if self._weight_syncs_unavailable:
+            payload["weight_syncs_unavailable"] = self._weight_syncs_unavailable
+        return payload or None
 
     def _post_model_load_hook(self):
         """Called after ModelRunner is initialized (model loaded) but before
@@ -544,24 +584,28 @@ class EngineCore:
                 except Exception:
                     logger.exception("KV event publish during shutdown failed")
                 self.scheduler.shutdown_kv_events()
+                self.scheduler.close_kv_connector()
             finally:
                 tracing.shutdown()
 
     def _process_engine_step(self):
+        return self._run_then_publish_kv_events(self._process_engine_step_inner)
+
+    def _run_then_publish_kv_events(self, step):
         try:
-            return self._process_engine_step_inner()
+            return step()
         finally:
             # Swallow publisher errors so they cannot mask an exception from
-            # the engine step itself.
+            # the step itself.
             try:
                 self.scheduler.publish_kv_events()
             except Exception:
-                logger.exception("KV event publish in engine-step finally failed")
+                logger.exception("KV event publish after engine step failed")
 
     def _release_request_resources(self, sequences):
         structured_ids = [seq.id for seq in sequences if is_structured(seq)]
         if structured_ids:
-            self.runner_mgr.call_func("release_structured_requests", structured_ids)
+            self.runner_mgr.call_func("release_constraints", structured_ids)
         request_ids = [
             seq.id for seq in sequences if getattr(seq, "cache_seed", -1) != -1
         ]
@@ -643,6 +687,9 @@ class EngineCore:
         self._kv_progress_event.wait(KV_IDLE_DRAIN_INTERVAL_S)
 
     def _postprocess(self, seqs, fwd_out, batch):
+        if self._report_backlog:
+            # Ahead of this step's outputs, which complete or release placements.
+            flush_dp_reuse(self.scheduler, self.output_queue)
         # Pass stream_output_queue to postprocess for streaming callbacks
         finished_seqs = self.scheduler.postprocess(
             seqs,
@@ -800,11 +847,7 @@ class EngineCore:
             return
         connector = getattr(self.scheduler, "kv_connector", None)
         if connector is None or not (
-            getattr(connector, "is_offload", False)
-            or (
-                getattr(connector, "is_producer", False)
-                and getattr(connector, "enable_chunked_transfer", False)
-            )
+            connector.is_offload or getattr(connector, "is_producer", False)
         ):
             return
         # `dispatch_new=False` on the shutdown drain: publishing new state
@@ -822,8 +865,15 @@ class EngineCore:
 
     def pull_and_process_input_queue(self):
         recv_reqs = []
+        credit_updates = []
         while not self.input_queue.empty():
             seqs = self.input_queue.get_nowait()
+            if (
+                isinstance(seqs, tuple)
+                and seqs[0] == EngineCoreRequestType.DP_PREFIX_CREDIT
+            ):
+                credit_updates.extend(seqs[1])
+                continue
             for seq in seqs:
                 if seq.status == SequenceStatus.EXIT_ENGINE:
                     logger.debug(f"{self.label}: input_queue get exit engine")
@@ -832,7 +882,40 @@ class EngineCore:
         if len(recv_reqs) > 0:
             logger.debug(f"{self.label}: put {len(recv_reqs)} reqs to scheduler")
             self.scheduler.extend(recv_reqs)
+            self._ingested_seqs += len(recv_reqs)
+        self._apply_prefix_credit_updates(credit_updates)
         return False
+
+    def _apply_prefix_credit_updates(self, credit_updates):
+        """Apply credits and publish the same authoritative backlog snapshot."""
+        if credit_updates:
+            self.scheduler.correct_prefix_estimates(credit_updates)
+            report = (self._ingested_seqs, prefill_backlog(self.scheduler))
+            self.output_queue.put_nowait(("PREFILL_BACKLOG", (*report, credit_updates)))
+            self._last_backlog_report = report
+
+    # How often the backlog is recomputed: the walk runs on the engine thread
+    # every DP rank waits for, and between two reports the CoreManager adds the
+    # charges of the requests it sent since.
+    BACKLOG_REPORT_INTERVAL_S = 0.01
+
+    def _report_prefill_backlog(self, now: float) -> None:
+        """Push (seqs ingested, prefill tokens still to compute) when it changed,
+        at most every `BACKLOG_REPORT_INTERVAL_S`.
+
+        For `share_cache` DP routing, which balances on what each rank really
+        has left to prefill (`Scheduler.pending_prefill_tokens`). A running seq
+        that has produced tokens is decoding and counts nothing; a preempted one
+        waits to prefill again and counts what it must recompute.
+        """
+        if now < self._next_backlog_report:
+            return
+        self._next_backlog_report = now + self.BACKLOG_REPORT_INTERVAL_S
+        backlog = prefill_backlog(self.scheduler)
+        report = (self._ingested_seqs, backlog)
+        if report != self._last_backlog_report:
+            self._last_backlog_report = report
+            self.output_queue.put_nowait(("PREFILL_BACKLOG", (*report, ())))
 
     def _offer_tier_lookups(self, reqs) -> None:
         """Let an offload connector start tier lookups for arrived requests.
@@ -910,6 +993,9 @@ class EngineCore:
                         self.input_queue.put_nowait(reqs)
                         self._kv_progress_event.set()
                         self._offer_tier_lookups(reqs)
+                    elif request_type == EngineCoreRequestType.DP_PREFIX_CREDIT:
+                        self.input_queue.put_nowait((request_type, reqs))
+                        self._kv_progress_event.set()
                     elif request_type == EngineCoreRequestType.UTILITY:
                         cmd = reqs.get("cmd") if isinstance(reqs, dict) else None
                         logger.debug(f"{self.label}: input get UTILITY command: {cmd}")
@@ -953,6 +1039,16 @@ class EngineCore:
                     socket.send(obj)
                     continue
 
+                if isinstance(item, tuple) and item[0] == "PREFILL_BACKLOG":
+                    obj = pickle.dumps((EngineCoreRequestType.PREFILL_BACKLOG, item[1]))
+                    socket.send(obj)
+                    continue
+
+                if isinstance(item, tuple) and item[0] == "DP_REUSE":
+                    obj = pickle.dumps((EngineCoreRequestType.DP_REUSE, item[1]))
+                    socket.send(obj)
+                    continue
+
                 if isinstance(item, tuple) and item[0] == "UTILITY_RESPONSE":
                     # Send utility command response back to CoreManager
                     response_data = item[1]
@@ -989,6 +1085,8 @@ class DPEngineCoreProc(EngineCore):
         self._shutting_down = False
 
         self._init_prefill_delayer(config, self.dp_group)
+        # `share_cache` routing reads each rank's own prefill backlog.
+        self._report_backlog = config.dp_load_balance == "share_cache"
 
     def _init_data_parallel(self, config: Config):
         dp_rank = config.parallel_config.data_parallel_rank
@@ -1031,6 +1129,8 @@ class DPEngineCoreProc(EngineCore):
                     self.utility_handler.push_metrics()
                 self.scheduler.heartbeat_throughput(now)
                 shutdown = shutdown or self.pull_and_process_input_queue()
+                if self._report_backlog:
+                    self._report_prefill_backlog(time.monotonic())
                 local_held = (
                     self._is_rl_weights_offloaded
                     or self._weight_sync_fenced
@@ -1087,6 +1187,7 @@ class DPEngineCoreProc(EngineCore):
                 except Exception:
                     logger.exception("KV event publish during DP shutdown failed")
                 self.scheduler.shutdown_kv_events()
+                self.scheduler.close_kv_connector()
             finally:
                 tracing.shutdown()
 
@@ -1577,7 +1678,7 @@ class DecodeEngineCore(EngineCore):
             self._send_block_assignment(seq)
         return False
 
-    def _process_engine_step(self):
+    def _process_engine_step_inner(self):
         """Override: handle None from DecodeScheduler when prefill_waiting is
         non-empty but running is empty (sequences are still being prefilled)."""
         if not self.scheduler.has_requests():

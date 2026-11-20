@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """DeepSeek-V4.1's high-interactivity (hi) monokernels inside ATOM's V4.1 mono decode
-(``ATOM_DSV41_MONO_HI``, MI355X / gfx950, TP4).
+(``ATOM_DSV41_MONO_HI``, MI355X / gfx950, TP2, TP4 or TP8).
 
 On a step this hook serves, every one of V4.1's 40 decoder layers runs its
 hi layer program (the ``mono/hi`` package: ``layer.window_layer_blocks``, one
@@ -1077,8 +1077,8 @@ def install(model, atom_config, engram_mapping, draft) -> HiLayers | None:
     torch.set_default_dtype(torch.float32)
     torch.set_default_device("cpu")
     try:
-        # the builds from FlyDSL's disk cache where it holds them (a restart loads them untraced), their trace checks
-        # left to the CPU checks of the served programs (``hi.emit.compile.serving``)
+        # the builds from FlyDSL's disk cache where it holds them (a restart traces them but compiles none), their
+        # trace checks left to the CPU checks of the served programs (``hi.emit.compile.serving``)
         with serving():
             hook = HiLayers(model, atom_config, widths, max_ctx, engram_mapping, draft)
     finally:

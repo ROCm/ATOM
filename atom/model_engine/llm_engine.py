@@ -425,6 +425,7 @@ class LLMEngine:
                 "checkpoints_orphaned",
                 "demands_recorded",
                 "demands_declined_no_room",
+                "demands_dropped_at_grid_hit",
                 "chunks_cut_for_demand",
                 # Both cut counters or neither: their ratio is what separates a
                 # placement that converges from one that pays per request, and
@@ -544,6 +545,7 @@ class LLMEngine:
             "checkpoints_orphaned",
             "demands_recorded",
             "demands_declined_no_room",
+            "demands_dropped_at_grid_hit",
             "chunks_cut_for_demand",
             "chunks_cut_for_end",
         )
@@ -595,6 +597,8 @@ class LLMEngine:
             "prompt_tokens": summed("prompt_tokens"),
             "generation_tokens": summed("generation_tokens"),
             "preemptions": summed("preemptions"),
+            "requests_deferred_free": summed("requests_deferred_free"),
+            "kv_blocks_deferred_free": summed("kv_blocks_deferred_free"),
             "kv_blocks_used": kv_used,
             "kv_blocks_free": summed("kv_blocks_free"),
             "kv_blocks_total": kv_total,
@@ -844,6 +848,11 @@ class InputOutputProcessor:
             multimodal=multimodal_data is not None,
         )
         if is_structured(sampling_params):
+            if sampling_params.required_channel is not None:
+                raise ValueError(
+                    "A request cannot carry both a structured-output grammar "
+                    "(json_schema or structured_tool_format) and a required_channel"
+                )
             if self.structured_admission is None:
                 raise ValueError("Structured output requires engine admission")
             self.structured_admission(

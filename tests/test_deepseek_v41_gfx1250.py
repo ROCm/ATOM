@@ -43,6 +43,7 @@ def atom_config(**overrides):
         "pipeline_parallel_size": 1,
         "decode_context_parallel_size": 1,
         "prefill_context_parallel_size": 1,
+        "is_multinode_tp": False,
         "enable_tbo": False,
         "enable_tbo_decode": False,
         "compilation_config": NS(level=0),
@@ -170,6 +171,15 @@ def test_a_refused_deployment_keeps_the_model(monkeypatch):
         inner, atom_config(kv_cache_dtype="fp8"), drafter=None
     )
     assert out is inner
+
+
+def test_lossless_sampling_keeps_the_model(monkeypatch):
+    """The single launch drafts and verifies inside the kernel and publishes
+    no q, so an armed lossless drafter keeps the production model."""
+    monkeypatch.setattr(dispatch, "refusal", lambda cfg: None)
+    inner = nn.Linear(1, 1)
+    drafter = NS(lossless=object())
+    assert dispatch.install_single_step(inner, atom_config(), drafter) is inner
 
 
 @needs_aiter
@@ -325,6 +335,21 @@ def test_a_production_step_drafts_from_the_drafter(served):
     assert runner.forgot == [
         "a"
     ]  # this batch's requests: their kept q no longer match their drafts
+
+
+def test_a_constrained_replay_declines_previous_served_drafts(served):
+    m, drafter = served
+    runner = m._single.runner
+    assert m.step_override(torch.zeros(48), 8, _batch()) is runner
+    batch = _batch(
+        structured_requests=[1], total_seqs_num=1, req_ids=["current", "other"]
+    )
+    assert m.step_override(torch.zeros(48), 8, batch) is None
+    drafter.compute_draft_kv()
+    assert drafter.kv == 1
+    assert drafter.propose(next_token_ids=torch.zeros(1)) == "production"
+    assert runner.steps == 1
+    assert runner.forgot == ["current"]
 
 
 def test_a_prefill_keeps_the_running_requests_kernel_q(served):
@@ -593,9 +618,6 @@ def test_the_step_kernel_traces_on_several_threads_at_once(monkeypatch):
     """
     pytest.importorskip("flydsl")
     monkeypatch.setenv("ARCH", "gfx1250")
-    monkeypatch.setenv(
-        "FLYDSL_RUNTIME_ENABLE_CACHE", "0"
-    )  # a cached build is not traced
     from atom.models.deepseek_v41.mono.gfx1250.kernels import device as hx
     from atom.models.deepseek_v41.mono.gfx1250.kernels import step
     from atom.mono.runtime.compile import compile_only

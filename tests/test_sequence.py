@@ -36,6 +36,12 @@ class TestSequenceCreation:
         seq = seq_factory([1, 2], id=42)
         assert seq.id == 42
 
+    def test_explicit_id_zero_is_kept(self, seq_factory):
+        # engine_v1 clients may assign 0; only None takes the counter's id.
+        seq_factory([1])  # the counter is past 0, so it cannot hand out 0
+        seq = seq_factory([1, 2], id=0)
+        assert seq.id == 0
+
     def test_sampling_params_propagated(self):
         sp = SamplingParams(temperature=0.5, max_tokens=100, ignore_eos=True)
         seq = Sequence([1], 4, sampling_params=sp)

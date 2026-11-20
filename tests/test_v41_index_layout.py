@@ -96,6 +96,10 @@ def test_startup_snapshots_runtime_layout_for_scheduler_and_worker(
     assert worker.index_cache_layout == expected
     assert offcfg.build_page_namespace(worker, cfg, 4) == scheduler_namespace
     assert worker.compute_hash() == compile_hash
+    # FP4PTPC traces other GEMMs than the native checkpoint.
+    worker.hf_config.fp4ptpc = True
+    assert worker.compute_hash() != compile_hash
+    worker.hf_config.fp4ptpc = False
     worker.index_cache_layout = "natural" if expected != "natural" else "mfma"
     assert offcfg.build_page_namespace(worker, cfg, 4) != scheduler_namespace
     assert worker.compute_hash() != compile_hash
@@ -118,6 +122,57 @@ def test_equal_size_fp4_layouts_have_distinct_checkpoint_identities(kv_dtype):
     assert _geometry(None, fp4=False, kv_dtype=kv_dtype).layout_id not in {
         geo.layout_id for geo in layouts
     }
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["glm", "k3"])
+def test_dsa_fp4_layout_separates_mp_namespaces(monkeypatch, nested):
+    hf = SimpleNamespace(
+        model_type="kimi_linear" if nested else "glm_moe_dsa",
+        index_topk=2048,
+        num_attention_heads=64,
+        architectures=[],
+    )
+    config = SimpleNamespace(
+        hf_config=(
+            SimpleNamespace(model_type="kimi_k3", text_config=hf) if nested else hf
+        ),
+        index_cache_dtype="fp4",
+        kv_cache_dtype="fp8",
+        model="dsa-test",
+        kv_cache_block_size=64,
+    )
+    cfg = SimpleNamespace(chunk_size=256)
+    namespaces = []
+    for requested, expected in ((None, "preshuffle"), ("mfma", "mfma")):
+        config.index_cache_layout = requested
+        Config._resolve_index_cache_layout(config)
+        assert config.index_cache_layout == expected
+        worker = pickle.loads(pickle.dumps(config))
+        namespace = offcfg.build_page_namespace(config, cfg, 8)
+        monkeypatch.setenv("ATOM_V4_UNIFIED_MQA", "flydsl")
+        config.index_cache_layout = "natural"
+        assert worker.index_cache_layout == expected
+        assert offcfg.build_page_namespace(worker, cfg, 8) == namespace
+        namespaces.append(namespace)
+    assert namespaces[0] != namespaces[1]
+
+
+@pytest.mark.parametrize(
+    "dtype,layout,index_topk,error",
+    [
+        ("fp8", "mfma", 2048, "requires --index-cache-dtype fp4"),
+        ("fp4", "natural", 2048, "preshuffle or mfma"),
+        ("fp4", "mfma", None, "requires a supported indexer"),
+    ],
+)
+def test_dsa_rejects_incompatible_explicit_layout(dtype, layout, index_topk, error):
+    config = SimpleNamespace(
+        hf_config=SimpleNamespace(model_type="glm_moe_dsa", index_topk=index_topk),
+        index_cache_dtype=dtype,
+        index_cache_layout=layout,
+    )
+    with pytest.raises(ValueError, match=error):
+        Config._resolve_index_cache_layout(config)
 
 
 @pytest.fixture
@@ -237,6 +292,9 @@ def test_pd_checks_physical_layout_before_writing(
         _block_regions=[(r.base_addr, r.unit_bytes) for r in src],
         _block_region_roles=[r.semantic_role for r in src],
         _block_region_consumer_indices=None,
+        _slot_region_consumer_indices=None,
+        _slot_region_tp_segments=None,
+        _slot_region_tp_replicated=None,
         _fp4_index_layout=False,
         pp_size=1,
         _consumer_region_map=lambda n, m, *args: list(range(n)),
@@ -269,3 +327,26 @@ def test_pd_checks_physical_layout_before_writing(
         writes.assert_not_called()
         for page, saved in zip(consumer.pages, before):
             torch.testing.assert_close(page.view, saved)
+
+
+@pytest.mark.parametrize("fp4", [False, True])
+def test_reference_score_weight_contract(fp4):
+    pytest.importorskip("aiter")
+    from atom.models.deepseek_v41.mono.check import check_index_score
+
+    original = torch.tensor([[0.125, -2.5, 0.0, 17.0]], dtype=torch.bfloat16)
+    scale = 1.0 / 64
+    folded = original.float() * scale
+    query, cache, step = object(), object(), object()
+    runner = SimpleNamespace(index_fp4=fp4, iw=folded, index_query=lambda: query)
+    indexer = SimpleNamespace(weights_scale=scale, score_quantized=Mock())
+    check_index_score(runner, indexer, cache, step)
+    args, kwargs = indexer.score_quantized.call_args
+    assert args[0] is query and args[2] is cache and args[3] is step
+    if fp4:
+        assert args[1].dtype == torch.bfloat16
+        torch.testing.assert_close(args[1], original, rtol=0, atol=0)
+        assert kwargs == {"weight_scale": scale}
+    else:
+        assert args[1] is folded
+        assert kwargs == {"weight_scale": 1.0}

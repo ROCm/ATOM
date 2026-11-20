@@ -886,7 +886,7 @@ def test_dp_moe_original_schedule_preserves_outputs(
         quant_method=SimpleNamespace(
             select_experts=select_experts, routed_rows_wire=None
         ),
-        _run_experts=lambda hidden, weights, ids, x_scale, gathered: (
+        _run_experts=lambda hidden, weights, ids, x_scale, gathered, **kw: (
             experts(x=hidden, topk_weights=weights, topk_ids=ids)
         ),
         reduce_results=False,

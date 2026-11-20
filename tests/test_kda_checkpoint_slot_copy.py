@@ -492,7 +492,10 @@ class TestAnIndexerSharesThePageUnit:
                 index=(
                     None
                     if index_cache is None
-                    else SimpleNamespace(view=lambda _name: runner.index_cache)
+                    else SimpleNamespace(
+                        view=lambda _name: runner.index_cache,
+                        fields=[SimpleNamespace(name="index")],
+                    )
                 ),
             ),
             _page_unit_region_cache=None,

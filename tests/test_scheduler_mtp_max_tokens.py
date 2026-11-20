@@ -8,6 +8,7 @@ import pytest
 from conftest import MockConfig
 
 from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
+from atom.model_engine.sequence import SequenceType
 from atom.sampling_params import SamplingParams
 from tests.logprob_helpers import token_logprob
 
@@ -332,3 +333,72 @@ def test_bad_logprobs_do_not_terminate_sibling_requests(seq_factory, injected):
     outputs = dict(queue.put_nowait.call_args.args[0])
     assert outputs[bad.id].finish_reason == "logprob_error"
     assert outputs[good.id].output_tokens == [11]
+
+
+class TestDecodeBoundaryFiling:
+    """A deferred seq that ran files step 0 of that forward; otherwise its slot
+    still holds the window that sampled, so it files that window's last token."""
+
+    def _filed(self, seq_factory, ran, deferred=True, accepted=4):
+        mtp = TestMTPMaxTokens()
+        sched = mtp._scheduler()
+        seq = mtp._prefill(
+            sched,
+            seq_factory(
+                [1, 2, 3, 4],
+                sampling_params=SamplingParams(max_tokens=64, ignore_eos=True),
+            ),
+        )
+        seq.type = SequenceType.DECODE
+        filed = []
+
+        def record(s, committed, next_forward_tokens=0, *, snapshot_step):
+            filed.append((committed, snapshot_step))
+
+        sched.block_manager.hash_decode_blocks = record
+        seq.num_placeholder_tokens = sched.mtp_k
+        for token in (87, 88, 89, 90, 91, 92, 93):
+            seq.append_token(token)
+        # No `batch`, as RapidServe's decode engine calls it: `seqs` alone
+        # names the batch just run.
+        sched.postprocess(
+            [seq] if ran else [],
+            ScheduledBatchOutput(
+                req_ids=[seq.id],
+                token_ids=[tuple(range(5, 5 + accepted))],
+                num_rejected=np.asarray([sched.mtp_k + 1 - accepted]),
+                num_bonus=np.asarray([0]),
+                draft_token_ids=np.asarray([[20, 21, 22]]),
+                is_deferred_out=deferred,
+            ),
+        )
+        return filed, seq.num_finalized_tokens
+
+    def test_a_scheduled_batch_counts_its_forward(self, seq_factory):
+        """What a filed checkpoint is checked against at the drain."""
+        mtp = TestMTPMaxTokens()
+        seq = mtp._prefill(mtp._scheduler(), seq_factory([1, 2, 3, 4]))
+        assert seq.num_forwards == 1
+        Scheduler._consume_first_decode({seq.id: seq})  # RapidServe's decode build
+        assert seq.num_forwards == 2
+
+    @pytest.mark.parametrize("accepted", [1, 4])
+    def test_a_seq_that_ran_names_step_0_of_that_forward(self, seq_factory, accepted):
+        (filed,), n = self._filed(seq_factory, ran=True, accepted=accepted)
+        assert filed == (n, 0) == (4 + accepted, 0)
+
+    @pytest.mark.parametrize("accepted", [1, 4])
+    def test_a_seq_that_did_not_run_names_its_last_accepted_token(
+        self, seq_factory, accepted
+    ):
+        (filed,), n = self._filed(seq_factory, ran=False, accepted=accepted)
+        assert filed == (n - 1, accepted - 1) == (3 + accepted, accepted - 1)
+
+    @pytest.mark.parametrize("accepted", [1, 4])
+    def test_undeferred_output_names_its_last_accepted_token(
+        self, seq_factory, accepted
+    ):
+        (filed,), n = self._filed(
+            seq_factory, ran=True, deferred=False, accepted=accepted
+        )
+        assert filed == (n - 1, accepted - 1) == (6 + accepted, accepted - 1)

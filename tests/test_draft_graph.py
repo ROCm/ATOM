@@ -26,16 +26,17 @@ def _graph(**kw):
 
 
 def test_an_unwidened_empty_batch_stages_nothing():
+    """A zero-row source is valid when no widening is requested."""
     g = _graph()
     assert g.stage(0, {"row": torch.zeros(0, dtype=torch.int32)})["row"].shape[0] == 0
 
 
-def test_a_source_narrower_than_running_bs_is_refused():
-    """The proposer drafts every running row, padding included; a source of
-    fewer rows is not this step's."""
+@pytest.mark.parametrize(("rows", "running_bs"), [(0, 4), (5, 4)])
+def test_a_batch_that_cannot_be_widened_names_the_input_and_pass(rows, running_bs):
+    """No last row to repeat, or more rows than the batch: refused by name."""
     g = _graph()
-    with pytest.raises(AssertionError, match="fixed storage expects"):
-        g.stage(4, {"row": torch.zeros(2, dtype=torch.int32)})
+    with pytest.raises(AssertionError, match=rf"'row' of {g.name}.*{rows} rows"):
+        g.stage(running_bs, {"row": torch.zeros(rows, dtype=torch.int32)})
 
 
 def test_owning_a_recording_says_nothing_about_a_batch_it_is_not_at(
@@ -92,13 +93,14 @@ def test_a_pass_that_stages_nothing_is_refused():
         _graph(inputs={})
 
 
-def test_staging_copies_into_fixed_storage():
+def test_staged_tail_repeats_a_real_row_rather_than_zero_filling():
+    """Padding repeats one coherent real row instead of fabricating zeros."""
     g = _graph()
-    first = g._stage_one("row", 3, torch.arange(3, dtype=torch.int32) + 100)
-    assert first.tolist() == [100, 101, 102]
+    first = g._stage_one("row", 8, torch.arange(3, dtype=torch.int32) + 100)
+    assert first.tolist() == [100, 101, 102, 102, 102, 102, 102, 102]
     ptr = g._buffers["row"].data_ptr()
-    second = g._stage_one("row", 2, torch.arange(2, dtype=torch.int32) + 5)
-    assert second.tolist() == [5, 6]
+    second = g._stage_one("row", 4, torch.arange(2, dtype=torch.int32) + 5)
+    assert second.tolist() == [5, 6, 6, 6]
     # Fixed storage: a per-step allocation would hand out a new address every
     # step, which a capture cannot follow.
     assert g._buffers["row"].data_ptr() == ptr
@@ -116,6 +118,17 @@ def test_a_producer_can_fill_fixed_storage_without_a_self_copy():
     assert staged.data_ptr() == produced.data_ptr()
     assert staged.tolist() == [7, 8, 9]
     assert g._buffers["row"]._version == version_after_produce
+
+
+def test_direct_fixed_storage_still_gets_a_repeated_pad_tail():
+    """Only real rows are producer-owned; stage still fabricates coherent pads."""
+    g = _graph()
+    produced = g.buffer("row", 2)
+    produced.copy_(torch.tensor([7, 8], dtype=torch.int32))
+
+    staged = g.stage(5, {"row": produced})["row"]
+
+    assert staged.tolist() == [7, 8, 8, 8, 8]
 
 
 def test_fixed_input_and_exported_snapshot_have_separate_lifetimes():
@@ -184,31 +197,30 @@ def _mrope_graph():
     )
 
 
-def test_a_batch_dim_1_input_stages_columns():
+def test_a_batch_dim_1_input_stages_columns_and_tail_repeats_the_last_one():
     """MRoPE positions stage as the first `bs` columns of one `[3, max_num_seqs]`
     buffer, beside a leading-batch input a producer filled in place
     (`hidden_states`)."""
     g = _mrope_graph()
     src = torch.arange(6, dtype=torch.int64).view(3, 2) * 10
     g.buffer("row", 2).copy_(torch.tensor([1, 2], dtype=torch.int32))
-    staged = g.stage(2, {"pos": src, "row": g.buffer("row", 2)})
+    staged = g.stage(4, {"pos": src, "row": g.buffer("row", 2)})
     pos = staged["pos"]
-    assert pos.shape == (3, 2)
+    assert pos.shape == (3, 4)
     assert pos.stride() == (g._buffers["pos"].shape[1], 1)
-    assert pos.tolist() == [[0, 10], [20, 30], [40, 50]]
-    assert staged["row"].tolist() == [1, 2]
+    assert pos.tolist() == [[0, 10, 10, 10], [20, 30, 30, 30], [40, 50, 50, 50]]
+    assert staged["row"].tolist() == [1, 2, 2, 2]
     assert pos.data_ptr() == g._buffers["pos"].data_ptr()
 
 
-def test_a_batch_dim_1_producer_view_is_the_staged_one():
-    """`buffer(role, running_bs)` is the staged view at the same stride, so
-    staging a fill of it copies nothing."""
+def test_a_batch_dim_1_producer_view_is_the_front_of_the_staged_one():
+    """A producer-owned prefix is preserved while stage pads its tail."""
     g = _mrope_graph()
     fill = g.buffer("pos", 2)
     fill.copy_(torch.tensor([[1, 2], [3, 4], [5, 6]]))
-    pos = g.stage(2, {"pos": fill})["pos"]
+    pos = g.stage(4, {"pos": fill})["pos"]
     assert pos.data_ptr() == fill.data_ptr() and pos.stride() == fill.stride()
-    assert pos.tolist() == [[1, 2], [3, 4], [5, 6]]
+    assert pos.tolist() == [[1, 2, 2, 2], [3, 4, 4, 4], [5, 6, 6, 6]]
 
 
 def test_sources_that_disagree_on_the_batch_are_refused():

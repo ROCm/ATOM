@@ -412,7 +412,7 @@ closes (`<|close|>response<|sep|>`) the next tokens are forced to
 `<|open|>tools<|sep|><|open|>call tool="`. The tool name and arguments stay the
 model's. A model that writes `<|open|>tools<|sep|>` itself, by any other way,
 has opened it too: nothing is held back from then on. Every other format, every other `tool_choice`, and `/v1/messages` and
-`/v1/responses` sample as before; see `atom/model_ops/required_channel.py`.
+`/v1/responses` sample as before; see `atom/model_ops/triton_required_channel.py`.
 A required request's own `stop` strings can still end it before a call.
 
 Forwarding it to the chat template is a separate step, and one that used to be
@@ -839,8 +839,9 @@ Script-specific arguments:
 | `--bs` | `1` | Batch size (number of parallel requests) |
 | `--random-input` | `False` | Use random token input instead of predefined text |
 
-If `--torch-profiler-dir` is not specified, the script defaults to
-`./profiler_traces`.
+If `--torch-profiler-dir` is not specified, the script writes to
+`ATOM_TORCH_PROFILER_DIR` when that is set (and not empty), and otherwise
+defaults to `./profiler_traces`.
 
 ### Profiling during benchmarks
 
