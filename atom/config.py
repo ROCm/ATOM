@@ -2010,6 +2010,17 @@ def qrep_for_step(
 FP4_CACHE_DTYPES = ("fp4", "nvfp4")
 
 
+def kv_cache_torch_dtype(kv_cache_dtype: str) -> torch.dtype:
+    """The torch dtype a ``kv_cache_dtype`` cache is stored in: uint8 for the FP4
+    caches (packed bytes, which aiter's ``d_dtypes`` has no entry for), else aiter's
+    entry."""
+    if kv_cache_dtype in FP4_CACHE_DTYPES:
+        return torch.uint8
+    from aiter import dtypes
+
+    return dtypes.d_dtypes[kv_cache_dtype]
+
+
 def _check_fp4_kv(kv_cache_dtype: str, *, is_m3: bool, is_v41: bool) -> None:
     """``--kv-cache-dtype fp4`` (MXFP4) is MiniMax-M3.1's to ask for and DeepSeek-V4.1's
     own, and ``nvfp4`` is MiniMax-M3's alone; each is refused for every other model.
