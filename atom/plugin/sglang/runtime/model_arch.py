@@ -101,11 +101,13 @@ def _prepare_deepseek_v41_config(atom_config: Any, model_arch: str) -> None:
         ATOM_DEEPSEEK_V41_SGLANG_BLOCK_SIZE,
         align_atom_config_with_sglang,
         refuse_fp4ptpc_without_online_quant,
+        refuse_fp8_kv_without_backend,
         refuse_unsupported_sglang_features,
     )
 
     refuse_unsupported_sglang_features()
     refuse_fp4ptpc_without_online_quant(atom_config)
+    refuse_fp8_kv_without_backend(atom_config)
     align_atom_config_with_sglang(atom_config)
     # One V4.1 PAGE per SGLang page; Config picked native's 128.
     atom_config.kv_cache_block_size = ATOM_DEEPSEEK_V41_SGLANG_BLOCK_SIZE

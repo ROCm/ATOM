@@ -56,7 +56,10 @@ The plugin refuses, before loading weights:
 Two-batch overlap (`--enable-two-batch-overlap`) is refused by SGLang itself, in its DeepSeek-V4.1 feature check
 (`validate_deepseek_v41_features`).
 
-`--kv-cache-dtype` takes `auto` / `bfloat16` (BF16 pool) or `fp8_e4m3` (FP8 pool).
+`--kv-cache-dtype` takes `auto` / `bfloat16` (BF16 pool) or `fp8_e4m3` (FP8 pool). `fp8_e4m3` is refused before
+the weights load when aiter's `get_mla_sparse_prefill_v41_backend` reports no FP8 backend for this model's attention
+on the device; with aiter a53213dc4 that covers gfx950 / gfx1250 only, so on MI308X (gfx942) launch with `bfloat16`
+or `auto`. The indexer's FP8 index plane is separate and is not affected.
 
 ## Environment variables
 
