@@ -683,7 +683,7 @@ def staged_slot_state(c, req, dst, monkeypatch):
     c._staging_slots = mc.SlotPool(1)
     req["consumer_staging_addr"] = ctypes.addressof(consumer_staging)
     stream = Stream()
-    c._send_worker_stream = lambda: stream
+    c._thread_stream = lambda: stream
     monkeypatch.setattr(mc.torch.cuda, "stream", stream.as_current)
     return slot_src, slot_dst, staging, consumer_staging, stream
 

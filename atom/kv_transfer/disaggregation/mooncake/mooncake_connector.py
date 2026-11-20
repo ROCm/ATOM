@@ -1241,8 +1241,7 @@ class MooncakeConnector(KVConnectorBase):
         self._kv_staging_slots = SlotPool()
         self._kv_source_views = {}
         self._kv_staging_reserve = staging_reserve_bytes(config)
-        self._send_worker_streams = threading.local()
-        self._recv_scatter_streams = threading.local()
+        self._thread_streams = threading.local()
         self._landing: LandingReceiver | None = None
         self._landing_spec = landing_spec(config)
         self._landing_credits = LandingCredits() if self.is_producer else None
@@ -2272,28 +2271,18 @@ class MooncakeConnector(KVConnectorBase):
     # Send worker streams
     # -----------------------------------------------------------------
 
-    def _send_worker_stream(self) -> torch.cuda.Stream:
-        """The calling send worker's staging stream, created on first use.
+    def _thread_stream(self) -> torch.cuda.Stream:
+        """The calling thread's staging stream, created on first use.
 
-        A private stream per worker lets ``synchronize`` wait for this
-        worker's gathers and ready event only, not every other worker's.
+        A private stream per thread lets ``synchronize`` wait for that
+        thread's own copies and ready event only, not every other thread's.
+        A connector is either a producer or a consumer, so this serves a send
+        worker's gathers and the notify listener's scatter alike: neither can
+        use this thread's current stream, which is the null stream the decode
+        forward also runs on unless `ATOM_HIGH_PRIORITY_COMPUTE_STREAM` moved
+        the runner off it.
         """
-        streams = self._send_worker_streams
-        stream = getattr(streams, "stream", None)
-        if stream is None:
-            stream = streams.stream = torch.cuda.Stream(device=self._cuda_device)
-        return stream
-
-    def _recv_scatter_stream(self) -> torch.cuda.Stream:
-        """The calling thread's scatter stream, created on first use.
-
-        The landed state scatter has to be waited on before the slot goes back
-        to the pool, and the notify listener's own current stream is the null
-        stream unless the runner moved off it. Synchronizing that would park
-        every notification behind the in-flight decode step, so the scatter
-        gets a private stream like the send side's gathers do.
-        """
-        streams = self._recv_scatter_streams
+        streams = self._thread_streams
         stream = getattr(streams, "stream", None)
         if stream is None:
             stream = streams.stream = torch.cuda.Stream(device=self._cuda_device)
@@ -3387,7 +3376,7 @@ class MooncakeConnector(KVConnectorBase):
                 )
             # Wait only for this request's prefill writes; unrelated GPU work
             # can continue on other streams while the staging stream is blocked.
-            stream = self._send_worker_stream()
+            stream = self._thread_stream()
             stream.wait_event(kv_cache_ready_event)
             for dst_start in range(
                 0, len(dst_block_ids), self._index_staging_chunk_pages
@@ -3484,7 +3473,7 @@ class MooncakeConnector(KVConnectorBase):
                 raise ValueError("KV landing wire layout mismatch")
             slot_bytes = min(slot_bytes, int(landing["slot_bytes"]))
         slots = plan.pack(slot_bytes)
-        stream = self._send_worker_stream()
+        stream = self._thread_stream()
         stream.wait_event(ready_event)
         device = self._kv_staging.device
         host = torch.from_numpy(plan.source_units)
@@ -3661,7 +3650,7 @@ class MooncakeConnector(KVConnectorBase):
 
         pool_idx = self._index_staging_slots.acquire()
         try:
-            stream = self._send_worker_stream()
+            stream = self._thread_stream()
             try:
                 with torch.cuda.stream(stream):
                     staging_base, staged_pages = self._gather_sharded_index(
@@ -4033,7 +4022,7 @@ class MooncakeConnector(KVConnectorBase):
                 # The forward may run on a different stream than this thread's
                 # current one, so the gather waits on this request's prefill
                 # event before reading what the prefill wrote.
-                stream = self._send_worker_stream()
+                stream = self._thread_stream()
                 stream.wait_event(kv_cache_ready_event)
                 try:
                     with torch.cuda.stream(stream):
@@ -4043,7 +4032,7 @@ class MooncakeConnector(KVConnectorBase):
                     # reading the staging buffer. Without this, the RDMA can
                     # race the still-in-flight gather kernel on TBO prefill
                     # (page fault under high concurrency). As in
-                    # _gather_mla_rows, this also covers a gather that raised
+                    # _write_staging_slot, this also covers a gather that raised
                     # partway: it copies arena by arena, and the slot goes back
                     # to the pool below whatever happens here.
                     stream.synchronize()
@@ -4590,10 +4579,12 @@ class MooncakeConnector(KVConnectorBase):
                 # reading a state slot that is still being written -- and keeps
                 # the next RDMA write off a staging row the scatter is still
                 # reading. It runs on a private stream so the wait covers the
-                # copy alone: this thread's current stream is the null stream
-                # unless the runner moved off it, and synchronizing that would
-                # hold every notification behind the in-flight decode step.
-                stream = self._recv_scatter_stream()
+                # copy alone: this thread's current stream is the null stream,
+                # which is also the forward's stream unless
+                # ATOM_HIGH_PRIORITY_COMPUTE_STREAM moved the runner off it, so
+                # synchronizing it would hold every notification behind the
+                # in-flight decode step.
+                stream = self._thread_stream()
                 try:
                     try:
                         with torch.cuda.stream(stream):
