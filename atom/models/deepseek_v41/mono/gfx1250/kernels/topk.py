@@ -405,6 +405,32 @@ def mc_g_long(TR):
 
 O_MC = LDS_BYTES2                 # LDS: (prefix, mask, need, n) i32, then the CTA's 256-bin histogram
 O_MCH = O_MC + 16
+RC_NCP, RC_U = 8, 4               # _radix_count: the histogram's LDS copies (lane % 8), keys a thread in flight
+O_RCH = O_OUT                     # its copies [RC_NCP][256] i32: lds_topk's staged outputs' LDS (not live in select_mc / ord)
+
+
+@ASTRewriter.transform
+def _radix_count(sm, t, rowp, i0, i1, pre, msk, shift):
+    """select_mc / select_ord's radix round: this CTA's keys [i0, i1) of the row matching the resolved prefix (key & msk ==
+    pre) -> thread t's count of bin t (order_key byte at shift). The round's first byte (sign / exponent) holds nearly every
+    key in a few bins: one LDS add a key serialized on those words; RC_NCP copies of the histogram (lane % RC_NCP, as
+    lds_topk's) and RC_U keys a thread in flight. The same adds: the counts bitwise the same. (CT16 fixture c3kvc/rxstep.py,
+    layer 20's block selection, G 10, n 16.6K / 50K block maxima, cold: the 4 rounds 7.84 -> 5.34 / 15.66 -> 7.94 us)"""
+    lane = t % 32
+    for z in range_constexpr(RC_NCP):
+        hx.lstore(sm + O_RCH + (z * 256 + t) * 4, I32(0))
+    gpu.barrier()
+    hc = sm + O_RCH + (lane % RC_NCP) * 1024
+    for i in range(i0 + t, i1, 256 * RC_U):
+        ks = [order_key(hx.gload(rowp + i64(fx.min(i + 256 * u, i1 - 1)) * 4, I32)) for u in range(RC_U)]
+        for u in range_constexpr(RC_U):
+            if ((ks[u] & msk) == pre) & (i + 256 * u < i1):
+                hx.latomic_add_i32(hc + ((ks[u] >> shift) & 255) * 4, I32(1))
+    gpu.barrier()
+    v = I32(0)
+    for z in range_constexpr(RC_NCP):
+        v = v + hx.lload(sm + O_RCH + (z * 256 + t) * 4, I32)
+    return v
 
 
 @ASTRewriter.transform
@@ -444,15 +470,8 @@ def select_mc(c, hb, ctr, isrx, G, anc=None, x0=None):
                 if hx.lload(sm + O_MC + 12, I32) >= 0:   # (bit 31: an earlier round's bin held exactly the keys
                     # still needed: every key of its prefix is in, the selection is final)
                     shift = 24 - 8 * p
-                    hx.lstore(sm + O_MCH + t * 4, I32(0))
-                    gpu.barrier()
                     st4 = hx.lload(sm + O_MC, I32, 4)
-                    for i in range(i0 + t, i1, 256):
-                        key = order_key(hx.gload(rowp + i64(i) * 4, I32))
-                        if (key & st4[1]) == st4[0]:
-                            hx.latomic_add_i32(sm + O_MCH + ((key >> shift) & 255) * 4, I32(1))
-                    gpu.barrier()
-                    v = hx.lload(sm + O_MCH + t * 4, I32)
+                    v = _radix_count(sm, t, rowp, i0, i1, st4[0], st4[1], shift)
                     if v != 0:
                         hx.atomic_add(hb + i64(((p * MC_ROWS + r) * 256 + t) * 4), v)
                     hx.wait_storecnt0()   # (every wave its bin atomics done: the count needs no release fence)
@@ -511,6 +530,7 @@ def select_mc(c, hb, ctr, isrx, G, anc=None, x0=None):
 # ---- (l20) a row's top-k by G CTAs, positions in index order (a replaceable selection primitive) --------------------
 OC_ROW = 64 * 8                   # select_ord's per-CTA (above, ties) counts: [rows][64 CTAs] int2, then [rows] group counters
 OC_BYTES = MC_ROWS * OC_ROW + MC_ROWS * 4
+ORD_U = 8                         # select_ord's ordered passes: keys a thread in flight
 
 
 @ASTRewriter.transform
@@ -536,15 +556,8 @@ def select_ord(c, hb, ctr, oc, r, g, G, n, k, vals, vstride, mode, q, ordered=Tr
         for p in range(4):
             if hx.lload(sm + O_MC + 12, I32) >= 0:
                 shift = 24 - 8 * p
-                hx.lstore(sm + O_MCH + t * 4, I32(0))
-                gpu.barrier()
                 st4 = hx.lload(sm + O_MC, I32, 4)
-                for i in range(i0 + t, i1, 256):
-                    key = order_key(hx.gload(rowp + i64(i) * 4, I32))
-                    if (key & st4[1]) == st4[0]:
-                        hx.latomic_add_i32(sm + O_MCH + ((key >> shift) & 255) * 4, I32(1))
-                gpu.barrier()
-                v = hx.lload(sm + O_MCH + t * 4, I32)
+                v = _radix_count(sm, t, rowp, i0, i1, st4[0], st4[1], shift)
                 if v != 0:
                     hx.atomic_add(hb + i64(((p * MC_ROWS + r) * 256 + t) * 4), v)
                 hx.wait_storecnt0()
@@ -602,9 +615,12 @@ def select_ord(c, hb, ctr, oc, r, g, G, n, k, vals, vstride, mode, q, ordered=Tr
         s0 = fx.min(i0 + t * SL, i1)
         s1 = fx.min(s0 + SL, i1)
         pk = I32(0)
-        for i in range(s0, s1):
-            key = order_key(hx.gload(rowp + i64(i) * 4, I32)) & st4[1]
-            pk = pk + ult(st4[0], key).select(I32(1 << 16), I32(0)) + (key == st4[0]).select(I32(1), I32(0))
+        for i in range(s0, s1, ORD_U):   # (ORD_U keys a thread in flight: one load round trip a key was the pass's chain)
+            ks = [hx.gload(rowp + i64(fx.min(i + u, s1 - 1)) * 4, I32) for u in range(ORD_U)]
+            for u in range_constexpr(ORD_U):
+                key = order_key(ks[u]) & st4[1]
+                ok = i + u < s1
+                pk = pk + (ok & ult(st4[0], key)).select(I32(1 << 16), I32(0)) + (ok & (key == st4[0])).select(I32(1), I32(0))
         ob = sm + O_MCH
         ex = block_excl_scan(pk, lane, wv, ob)
         if t == 255:
@@ -631,17 +647,20 @@ def select_ord(c, hb, ctr, oc, r, g, G, n, k, vals, vstride, mode, q, ordered=Tr
         base = hx.lload(ob + 136, I32, 2)
         cA = base[0] + (ex >> 16)
         cT = base[1] + (ex & 0xFFFF)
-        for i in range(s0, s1):
-            pos = i
-            if big:
-                key = order_key(hx.gload(rowp + i64(i) * 4, I32)) & st4[1]
-                fa = ult(st4[0], key)
-                ft = key == st4[0]
-                pos = (fa | (ft & (cT < need))).select(cA + fx.min(cT, need), I32(-1))
-                cA = cA + fa.select(I32(1), I32(0))
-                cT = cT + ft.select(I32(1), I32(0))
-            if pos >= 0:
-                _emit_any(c, I32(mode), I32(0), I32(1) > I32(0), r, I32(0), q, I32(k), I32(0), c["lvl"], c["lvl"], pos, I32(0), i)
+        for i0u in range(s0, s1, ORD_U):   # (the same walk in index order, ORD_U keys a thread loaded ahead)
+            ks = [hx.gload(rowp + i64(fx.min(i0u + u, s1 - 1)) * 4, I32) for u in range(ORD_U)]
+            for u in range_constexpr(ORD_U):
+                i = i0u + u
+                pos = i
+                if big:
+                    key = order_key(ks[u]) & st4[1]
+                    fa = ult(st4[0], key)
+                    ft = key == st4[0]
+                    pos = (fa | (ft & (cT < need))).select(cA + fx.min(cT, need), I32(-1))
+                    cA = cA + fa.select(I32(1), I32(0))
+                    cT = cT + ft.select(I32(1), I32(0))
+                if (pos >= 0) & (i < s1):
+                    _emit_any(c, I32(mode), I32(0), I32(1) > I32(0), r, I32(0), q, I32(k), I32(0), c["lvl"], c["lvl"], pos, I32(0), i)
     if g == 0:   # padding past min(n, k)
         for pp in range(fx.min(n, I32(k)) + t, I32(k), 256):
             _emit_any(c, I32(mode), I32(0), I32(1) > I32(0), r, I32(0), q, I32(k), I32(0), c["lvl"], c["lvl"], pp, I32(0), I32(-1))
