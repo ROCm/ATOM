@@ -14,7 +14,11 @@ from atom.kv_transfer.disaggregation.pd_producer import (
     staging_pool_bytes,
     staging_slot_count,
 )
-from atom.kv_transfer.disaggregation.staging_config import mla_staging_reserve_bytes
+from atom.kv_transfer.disaggregation.staging_config import (
+    kimi_state_landing_reserve_bytes,
+    kimi_state_staging_reserve_bytes,
+    mla_staging_reserve_bytes,
+)
 
 
 @pytest.mark.parametrize(
@@ -163,6 +167,51 @@ def _mla_producer_config(workers, **overrides):
     }
     config.update(overrides)
     return SimpleNamespace(**config)
+
+
+def _kimi_config(workers, *, role="kv_producer", dcp=1):
+    return SimpleNamespace(
+        kv_transfer_config={
+            "kv_connector": "mooncake",
+            "kv_role": role,
+            "num_worker_threads": workers,
+        },
+        hf_config=SimpleNamespace(model_type="kimi_linear", kv_lora_rank=512),
+        decode_context_parallel_size=dcp,
+    )
+
+
+def test_kimi_state_reserve_is_a_separate_12mib_pool(monkeypatch):
+    monkeypatch.delenv("ATOM_PD_MLA_STAGING", raising=False)
+    monkeypatch.delenv("ATOM_PD_MLA_LANDING", raising=False)
+    # 16 send workers fit in the 256 MiB cap; 128 do not.
+    assert kimi_state_staging_reserve_bytes(_kimi_config(16)) == 16 * (12 << 20)
+    assert kimi_state_staging_reserve_bytes(_kimi_config(128)) == 256 << 20
+    # The MLA row pool stays closed: Kimi is not a plain MLA model.
+    assert mla_staging_reserve_bytes(_kimi_config(16)) == 0
+    assert (
+        kimi_state_staging_reserve_bytes(
+            SimpleNamespace(
+                kv_transfer_config={
+                    "kv_connector": "mooncake",
+                    "kv_role": "kv_producer",
+                    "num_worker_threads": 16,
+                },
+                hf_config=SimpleNamespace(model_type="glm5_next_text"),
+                decode_context_parallel_size=1,
+            )
+        )
+        == 0
+    )
+    decode = _kimi_config(1, role="kv_consumer", dcp=8)
+    reserved = kimi_state_landing_reserve_bytes(decode)
+    assert reserved > 256 << 20
+    assert (
+        kimi_state_landing_reserve_bytes(_kimi_config(1, role="kv_consumer", dcp=1))
+        == 0
+    )
+    monkeypatch.setenv("ATOM_PD_MLA_LANDING", "0")
+    assert kimi_state_landing_reserve_bytes(decode) == 0
 
 
 def test_kv_staging_reserve_covers_the_connector_pool(monkeypatch):

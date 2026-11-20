@@ -452,6 +452,10 @@ class KVTransferTensors:
     # Per slot region, whether every TP rank holds the same unit (ReplaySSM's
     # cursor), so a peer at any TP size takes it whole instead of a shard.
     slot_region_tp_replicated: list[bool] | None = None
+    # ``uint8 [num_slots, unit_bytes]`` view of each slot region, in the same
+    # order as ``slot_regions``. A producer gathers a decode rank's shard out
+    # of these. Empty when the backend published addresses only.
+    slot_region_views: list[Any] | None = None
     # Scheduler blocks the PAGE regions are addressed in. `init=False` because
     # a backend cannot answer it: `req.block_ids` is the scheduler's id space,
     # and a backend counts in its own page -- a different unit even where it is
@@ -480,6 +484,7 @@ class KVTransferTensors:
         pages = copy(self)
         pages.num_slots = 0
         pages.slot_regions = []
+        pages.slot_region_views = None
         return pages
 
     def merge_pages(self, other: KVTransferTensors) -> None:

@@ -20,6 +20,10 @@ from atom.kv_transfer.disaggregation.pd_producer import (
     send_worker_count,
     staging_pool_bytes,
 )
+from atom.kv_transfer.disaggregation.state_gather import (
+    STATE_POOL_BYTES,
+    STATE_SLOT_BYTES,
+)
 from atom.kv_transfer.disaggregation.transfer_plan import PAGE_UNITS, TOKEN_UNITS
 from atom.utils import envs, get_hf_text_config
 from atom.utils.selector import Family, attn_family
@@ -167,8 +171,66 @@ def landing_spec(config):
     return None
 
 
+def kimi_state_model(config) -> bool:
+    """Whether ``config`` is Kimi-K3, the model whose KDA slots are staged."""
+
+    hf_config = getattr(config, "hf_config", None)
+    if hf_config is None:
+        return False
+    return getattr(get_hf_text_config(hf_config), "model_type", None) == "kimi_linear"
+
+
+def _state_pool_bytes(num_send_workers: int) -> int:
+    return min(num_send_workers * STATE_SLOT_BYTES, STATE_POOL_BYTES)
+
+
+def kimi_state_staging_reserve_bytes(config) -> int:
+    """HBM a Kimi producer holds back for its KDA state staging pool.
+
+    One 12 MiB slot per send worker, capped at 256 MiB. The pool is what a
+    PP stage gathers a decode rank's TP shard into.
+    """
+
+    if (
+        not envs.ATOM_PD_MLA_STAGING
+        or getattr(config, "decode_context_parallel_size", 1) > 1
+        or not kimi_state_model(config)
+    ):
+        return 0
+    return sum(
+        _state_pool_bytes(send_worker_count(connector))
+        for connector in mooncake_producer_connectors(config)
+    )
+
+
+def kimi_state_landing_configured(config) -> bool:
+    """Whether a Kimi DCP decode gets a landing pool for KDA state."""
+
+    return bool(
+        envs.ATOM_PD_MLA_LANDING
+        and getattr(config, "decode_context_parallel_size", 1) > 1
+        and config.kv_transfer_config.get("kv_role") == "kv_consumer"
+        and kimi_state_model(config)
+    )
+
+
+def kimi_state_landing_reserve_bytes(config) -> int:
+    """The state landing pool plus its scatter table, held back from KV."""
+
+    if not kimi_state_landing_configured(config):
+        return 0
+    # One segment per slot region, plus the same 64-item slack MLA uses.
+    # Kimi-K3.1 publishes a few hundred regions; 1024 covers a stage.
+    table_bytes = 3 * 8 * segment_table_capacity(1024)
+    return STATE_POOL_BYTES + table_bytes
+
+
 def staging_reserve_bytes(config):
-    return mla_staging_reserve_bytes(config) + minimax_staging_reserve_bytes(config)
+    return (
+        mla_staging_reserve_bytes(config)
+        + minimax_staging_reserve_bytes(config)
+        + kimi_state_staging_reserve_bytes(config)
+    )
 
 
 def landing_reserve_bytes(config):
@@ -179,7 +241,8 @@ def landing_reserve_bytes(config):
     """
 
     spec = landing_spec(config)
-    if spec is None:
-        return 0
-    table_bytes = 3 * 8 * spec.table_segments
-    return LANDING_POOL_SLOTS * LANDING_SLOT_BYTES + table_bytes
+    mla = 0
+    if spec is not None:
+        table_bytes = 3 * 8 * spec.table_segments
+        mla = LANDING_POOL_SLOTS * LANDING_SLOT_BYTES + table_bytes
+    return mla + kimi_state_landing_reserve_bytes(config)
