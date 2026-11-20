@@ -44,7 +44,6 @@ def fp8_linear(rows=PADDED, k=SHAPE[1], weight=None, **overrides):
         "weight": weight,
         "params_dtype": weight.dtype,
         "quant_type": PER_TOKEN,
-        "native_a8_group_rows": None,
         "bias": None,
         "weight_scale": torch.ones(weight.shape[0], 1, dtype=torch.float32),
     }
@@ -54,7 +53,7 @@ def fp8_linear(rows=PADDED, k=SHAPE[1], weight=None, **overrides):
 
 def test_bf16_binds_without_a_scale():
     weight = torch.nn.Parameter(torch.zeros(SHAPE, dtype=torch.bfloat16))
-    w, scale = W._dense(SimpleNamespace(weight=weight), "proj", SHAPE)
+    w, scale = W._dense(SimpleNamespace(weight=weight, bias=None), "proj", SHAPE)
     assert scale is None
     assert w.data_ptr() == weight.data_ptr()
 
@@ -76,7 +75,6 @@ def test_per_token_fp8_binds_in_place(padded):
     [
         (fp8_linear(is_shuffled=False), SHAPE, "preshuffle"),
         (fp8_linear(quant_type=PER_1X128), SHAPE, "per-token"),
-        (fp8_linear(native_a8_group_rows=128), SHAPE, "native-a8"),
         (fp8_linear(rows=SHAPE[0]), SHAPE, "padded to 16"),
         (fp8_linear(rows=192), SHAPE, "weight shape"),
         (fp8_linear(k=192), (SHAPE[0], 192), "multiple of 128"),

@@ -119,7 +119,7 @@ def _dense(module, name: str, shape: tuple[int, ...]):
     shuffle at that default only."""
     w = _param(module, name)
     # the kernels add no bias, in either layout
-    _need(getattr(module, "bias", None) is None, f"{name} has a bias")
+    _need(module.bias is None, f"{name} has a bias")
     if w.dtype == BF16:
         return _plain_bf16(module, name, shape), None
     n, k = shape
@@ -127,13 +127,9 @@ def _dense(module, name: str, shape: tuple[int, ...]):
         w.dtype == FP8,
         f"{name} is {w.dtype}: the kernels read bf16 or preshuffled {FP8}",
     )
-    sc = getattr(module, "weight_scale", None)
+    sc = module.weight_scale
     _need(sc is None or sc.is_contiguous(), f"{name}: weight_scale not contiguous")
     w, sc = linear_ptpc_fp8(module, name=name, logical_rows=n, logical_cols=k)
-    _need(
-        getattr(module, "native_a8_group_rows", None) is None,
-        f"{name}: a native-a8 grouped plane",
-    )
     _need(w.shape[0] % 16 == 0, f"{name} is {tuple(w.shape)}: rows not padded to 16")
     # the binders' constant K: the GEMVs walk it in 128-wide chunks
     _need(k % 128 == 0, f"{name}: K {k} not a multiple of 128")
