@@ -1,6 +1,6 @@
 //! Wire types of `/v1/rl/*`, as SMG's RL protocol defines them.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -89,4 +89,31 @@ pub struct RlCallOutcome {
     /// holds the bytes read before the failure, as text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body_error: Option<String>,
+}
+
+/// One fan-out target that did not succeed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RlFailedCall {
+    pub worker_id: String,
+    pub url: String,
+    /// `upstream_error`, `upstream_unreachable`, `upstream_timeout` or
+    /// `no_control_endpoint`.
+    pub error: String,
+    pub message: String,
+    /// The engine's HTTP status, for `upstream_error`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    /// The worker's connection mode, for `no_control_endpoint`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_mode: Option<String>,
+}
+
+/// Body of a fan-out: HTTP 200 when `failed` is empty, 207 otherwise.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RlFanoutResponse {
+    /// Every completed call by worker id, whatever its status.
+    pub results: BTreeMap<String, RlCallOutcome>,
+    pub failed: Vec<RlFailedCall>,
+    pub total: usize,
+    pub succeeded: usize,
 }

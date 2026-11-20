@@ -5,9 +5,11 @@ pub mod capability;
 pub mod config;
 pub mod discovery;
 pub mod error;
+pub mod fanout;
 pub mod path;
 pub mod protocol;
 pub mod proxy;
+pub mod selector;
 
 use std::sync::Arc;
 
@@ -34,6 +36,10 @@ pub fn router(config: &RlConfig) -> Router<Arc<AppState>> {
         .route(
             "/v1/rl/workers/{id}/engine/{*path}",
             get(proxy::proxy_handler).post(proxy::proxy_handler),
+        )
+        .route(
+            "/v1/rl/engine/{*path}",
+            get(fanout::fanout_handler).post(fanout::fanout_handler),
         )
         .route_layer(from_fn_with_state(token, require_bearer))
 }

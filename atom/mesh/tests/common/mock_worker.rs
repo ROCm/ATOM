@@ -4,7 +4,10 @@
 use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, OnceLock,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -54,6 +57,7 @@ pub struct MockWorker {
     kv_event_sources: Arc<RwLock<serde_json::Value>>,
     dp_size: Arc<RwLock<Option<usize>>>,
     tp_size: Arc<RwLock<Option<usize>>>,
+    rl_echo_calls: Arc<AtomicUsize>,
     shutdown_handle: Option<tokio::task::JoinHandle<()>>,
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
@@ -65,6 +69,7 @@ impl MockWorker {
             kv_event_sources: Arc::new(RwLock::new(json!({}))),
             dp_size: Arc::new(RwLock::new(None)),
             tp_size: Arc::new(RwLock::new(None)),
+            rl_echo_calls: Arc::new(AtomicUsize::new(0)),
             shutdown_handle: None,
             shutdown_tx: None,
         }
@@ -85,6 +90,11 @@ impl MockWorker {
         *self.tp_size.write().await = Some(tp_size);
     }
 
+    /// Requests `/rl_echo` has answered.
+    pub fn rl_echo_calls(&self) -> usize {
+        self.rl_echo_calls.load(Ordering::SeqCst)
+    }
+
     /// Start the mock worker server
     pub async fn start(&mut self) -> Result<String, Box<dyn std::error::Error>> {
         let config = self.config.clone();
@@ -96,6 +106,11 @@ impl MockWorker {
         let kv_event_sources = self.kv_event_sources.clone();
         let dp_size = self.dp_size.clone();
         let tp_size = self.tp_size.clone();
+        let rl_echo_calls = self.rl_echo_calls.clone();
+        let rl_echo = move |method: Method, query: RawQuery, headers: HeaderMap, body: Bytes| {
+            rl_echo_calls.fetch_add(1, Ordering::SeqCst);
+            rl_echo_handler(method, query, headers, body)
+        };
         let app = Router::new()
             .route(
                 "/kv_event_sources",
@@ -138,7 +153,7 @@ impl MockWorker {
                 post(responses_cancel_handler),
             )
             .route("/flush_cache", post(flush_cache_handler))
-            .route("/rl_echo", get(rl_echo_handler).post(rl_echo_handler))
+            .route("/rl_echo", get(rl_echo.clone()).post(rl_echo))
             .route("/rl_slow", post(rl_slow_handler))
             .route("/v1/models", get(v1_models_handler))
             .with_state(config);

@@ -21,6 +21,13 @@ pub struct RlConfig {
         default_value_t = 600
     )]
     pub control_timeout_secs: u64,
+    /// Engine control calls in flight at once during a fan-out.
+    #[arg(
+        id = "rl_fanout_concurrency",
+        long = "rl-fanout-concurrency",
+        default_value_t = 32
+    )]
+    pub fanout_concurrency: usize,
 }
 
 impl Default for RlConfig {
@@ -29,6 +36,7 @@ impl Default for RlConfig {
             enabled: false,
             api_key: None,
             control_timeout_secs: 600,
+            fanout_concurrency: 32,
         }
     }
 }

@@ -268,6 +268,7 @@ async fn rl_routes_require_the_bearer_token() {
         "/v1/rl/workers",
         "/v1/rl/workers/nope",
         "/v1/rl/workers/nope/engine/flush_cache",
+        "/v1/rl/engine/flush_cache?selector=engine%3Datom",
     ] {
         for authorization in refused {
             let (status, body) = call_as(&app, "GET", uri, None, authorization).await;
@@ -308,6 +309,7 @@ fn rl_flags_parse_to_defaults_and_require_the_key() {
             enabled: false,
             api_key: None,
             control_timeout_secs: 600,
+            fanout_concurrency: 32,
         }
     );
     assert_eq!(config.rl, RlConfig::default());
@@ -318,21 +320,33 @@ fn rl_flags_parse_to_defaults_and_require_the_key() {
             .unwrap()
             .to_router_config(Vec::new())
     };
-    let config = args(&["--rl-api-key", "k", "--rl-control-timeout-secs", "7"]).unwrap();
+    let config = args(&[
+        "--rl-api-key",
+        "k",
+        "--rl-control-timeout-secs",
+        "7",
+        "--rl-fanout-concurrency",
+        "3",
+    ])
+    .unwrap();
     assert_eq!(
         config.rl,
         RlConfig {
             enabled: true,
             api_key: Some("k".to_string()),
             control_timeout_secs: 7,
+            fanout_concurrency: 3,
         }
     );
     for missing in [&[][..], &["--rl-api-key", ""], &["--rl-api-key", " "]] {
         let error = args(missing).unwrap_err().to_string();
         assert!(error.contains("--rl-api-key"), "{missing:?}: {error}");
     }
-    let error = args(&["--rl-control-timeout-secs", "0", "--rl-api-key", "k"])
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("rl.control_timeout_secs"), "{error}");
+    for field in ["control_timeout_secs", "fanout_concurrency"] {
+        let flag = format!("--rl-{}", field.replace('_', "-"));
+        let error = args(&[&flag, "0", "--rl-api-key", "k"])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&format!("rl.{field}")), "{error}");
+    }
 }
