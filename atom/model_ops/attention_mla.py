@@ -32,7 +32,6 @@ except ImportError:
     concat_and_cache_mla_seg = None
     fused_qk_rope_concat_and_cache_mla_seg = None
 from aiter.dist.parallel_state import get_dp_group, get_tensor_model_parallel_rank
-from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 from aiter.ops.attention import get_mla_decode_shape_support
 from aiter.ops.triton.attention.mla import mla_decode_fwd as triton_mla_decode_fwd
@@ -51,11 +50,13 @@ from atom.config import (
 )
 from atom.distributed.dcp_utils import (
     NONPS_MAX_Q_ROWS,
+    _runs_on_gfx950,
     dcp_persistent_supported,
     dcp_prefill_merge_bf16_ok,
     get_dcp_group,
     get_dcp_rank,
     get_dcp_world_size,
+    mla_cache_dtype,
     mla_dcp_decode_is_persistent,
     mla_dcp_sparse_prefill_is_persistent,
     mla_dcp_sparse_prefill_kv_splits,
@@ -304,8 +305,8 @@ def mla_kernel_num_heads(num_heads: int) -> int:
 # Widest gathered query aiter has any MLA decode dispatch for; past it
 # mla_decode_fwd asserts rather than falling back to anything.
 #
-# A persistent decode reaches every multiple of 16 up to that: the fp8 widths
-# without a dedicated kernel (48, 80, 112) fold onto the 16-head one, which
+# On gfx950, persistent decode reaches every multiple of 16 up to that: fp8
+# widths without a dedicated kernel (48, 80, 112) fold onto the 16-head one, which
 # reinterprets head groups as extra sequence rows and rebuilds qo_indptr and the
 # kv indptrs to match, so the round-robin mask survives it. A NON-persistent one
 # does not -- aiter's fold is guarded on persistent mode -- so it stays on the
@@ -399,8 +400,8 @@ def mla_dcp_sparse_prefill_num_heads(
     persistent: bool = False,
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
-) -> int:
-    """Width to pad the GATHERED query heads to for a DCP sparse prefill.
+) -> tuple[int, bool]:
+    """Return the gathered prefill width and whether its plan is known native.
 
     Sparse prefill uses the group-wide query heads, gathered or already
     replicated: ``num_heads * dcp_world_size``, not the per-rank count. It needs
@@ -433,7 +434,7 @@ def mla_dcp_sparse_prefill_num_heads(
                 page_size=1,
             )
             if support.supported is True and support.native:
-                return candidate
+                return candidate, True
     widths = (
         _MLA_DCP_SPARSE_PREFILL_WIDTHS_PERSISTENT
         if persistent
@@ -441,7 +442,7 @@ def mla_dcp_sparse_prefill_num_heads(
     )
     for width in widths:
         if width >= gathered:
-            return width
+            return width, False
     global _dcp_sparse_prefill_width_warned
     if not _dcp_sparse_prefill_width_warned:
         _dcp_sparse_prefill_width_warned = True
@@ -453,7 +454,7 @@ def mla_dcp_sparse_prefill_num_heads(
             "results at other widths. Lower decode_context_parallel_size or "
             "raise tp."
         )
-    return mla_kernel_num_heads(gathered)
+    return mla_kernel_num_heads(gathered), False
 
 
 # The fused seg MLA kernels (fused_qk_rope_concat_and_cache_mla_seg +
@@ -1039,10 +1040,7 @@ class MLAAttention(nn.Module):
         self.dcp_sparse_prefill_nonps = False
         self.dcp_sparse_prefill_plan_native = False
         if dcp_world_size > 1 and self.is_sparse_mla:
-            # Native MLA query/KV tensors are BF16 or FP8; "auto" is an API selector.
-            dtype = (
-                dtypes.fp8 if self.kv_cache_dtype.startswith("fp8") else torch.bfloat16
-            )
+            dtype = mla_cache_dtype(self.kv_cache_dtype)
             self.dcp_sparse_prefill_persistent = mla_dcp_sparse_prefill_is_persistent(
                 dcp_world_size,
                 self.dcp_persistent_supported,
@@ -1052,13 +1050,15 @@ class MLAAttention(nn.Module):
                     self, "sparse_dcp_metadata_rebuild", False
                 ),
             )
-            self.dcp_sparse_prefill_num_heads = mla_dcp_sparse_prefill_num_heads(
-                self.num_heads,
-                dcp_world_size,
-                self.min_query_heads,
-                persistent=self.dcp_sparse_prefill_persistent,
-                dtype_q=dtype,
-                dtype_kv=dtype,
+            self.dcp_sparse_prefill_num_heads, native = (
+                mla_dcp_sparse_prefill_num_heads(
+                    self.num_heads,
+                    dcp_world_size,
+                    self.min_query_heads,
+                    persistent=self.dcp_sparse_prefill_persistent,
+                    dtype_q=dtype,
+                    dtype_kv=dtype,
+                )
             )
             self.dcp_sparse_prefill_nonps = mla_dcp_sparse_prefill_uses_nonps(
                 dcp_world_size,
@@ -1074,19 +1074,9 @@ class MLAAttention(nn.Module):
                 self.dcp_sparse_prefill_persistent,
                 self.dcp_sparse_prefill_num_heads,
             )
-            if self.dcp_sparse_prefill_persistent:
-                support = get_mla_decode_shape_support(
-                    self.dcp_sparse_prefill_num_heads,
-                    1,
-                    dtype,
-                    dtype,
-                    persistent=True,
-                    return_lse=True,
-                    page_size=1,
-                )
-                self.dcp_sparse_prefill_plan_native = (
-                    support.supported is True and support.native
-                )
+            self.dcp_sparse_prefill_plan_native = (
+                self.dcp_sparse_prefill_persistent and native
+            )
 
     def _pad_sparse_prefill_query_heads(self, q: torch.Tensor) -> torch.Tensor:
         """Head padding for a DCP sparse prefill.
@@ -1409,6 +1399,60 @@ class MLAAttention(nn.Module):
                     self.W_V_dcp, self.W_V_dcp_scale = dynamic_per_batched_tensor_quant(
                         W_V_dcp, dtype=dtypes.fp8
                     )
+        self._configure_dcp_prefill_routes()
+
+    def _configure_dcp_prefill_routes(self):
+        """Bind fixed projection/absorb choices after weights and scales exist."""
+        self._absorb_q_pack_enabled = (
+            not is_rocm_aiter_fp4bmm_enabled()
+            and self.qrep_enabled
+            and self.W_K_qrep_scale is None
+            and not self.kv_shuffled
+            and _runs_on_gfx950()
+            and mla_absorb_q_pack_supports(self.qk_nope_head_dim, self.kv_lora_rank)
+        )
+        head_major = (
+            self.pbm_enabled
+            and self.W_V_dcp_scale is None
+            and self.dcp_comm_backend in ("a2a", "mailbox")
+            and (
+                not self.dcp_prefill_merge_bf16_ok
+                or self._dcp_fused_quant_dtype() is None
+            )
+        )
+        self._dcp_prefill_merge_out = (
+            self._dcp_project_merge_out_head_major
+            if head_major
+            else self._dcp_project_merge_out
+        )
+
+    @mark_trace(prefix="dcp_project_merge_out_head_major", torch_compile=False)
+    def _dcp_project_merge_out_head_major(
+        self,
+        o,
+        lse,
+        merge_in_fp32=False,
+        owned_counts=None,
+    ):
+        """BF16 PBM prefill: project directly into each destination's head storage."""
+        from atom.model_ops.dcp_ops import cp_lse_a2a_head_major
+
+        x = o.reshape(-1, o.shape[1], self.kv_lora_rank).transpose(0, 1)
+        projected = torch.empty(
+            (x.shape[0], x.shape[1], self.W_V_dcp.shape[1]),
+            dtype=torch.bfloat16,
+            device=x.device,
+        )
+        _aiter_triton_bf16_bmm(x, self.W_V_dcp, YQ=projected)
+        merged = cp_lse_a2a_head_major(
+            projected.float() if merge_in_fp32 else projected,
+            lse,
+            self.dcp_group,
+            owned_counts=owned_counts,
+        )
+        if merge_in_fp32:
+            merged = merged.to(projected.dtype)
+        return self.o_proj(merged.reshape(-1, self.num_heads * self.v_head_dim))
 
     def _local_q_proj(self):
         """This rank's rows of the QREP-widened q_proj, built on first use.
@@ -1443,14 +1487,7 @@ class MLAAttention(nn.Module):
             self.dcp_comm_backend = "a2a"
 
     def _dcp_merge(
-        self,
-        o,
-        lse,
-        ctx=None,
-        owned_counts=None,
-        quant_dtype=None,
-        decode=False,
-        head_major=False,
+        self, o, lse, ctx=None, owned_counts=None, quant_dtype=None, decode=False
     ):
         """Bind this layer's DCP group and backend to ``dcp_ops.dcp_lse_merge``.
         The mailbox backend serves decode only; prefill merges with a2a."""
@@ -1459,17 +1496,6 @@ class MLAAttention(nn.Module):
         backend = self.dcp_comm_backend
         if backend == "mailbox" and not decode:
             backend = "a2a"
-        if head_major:
-            return dcp_lse_merge(
-                o,
-                lse,
-                self.dcp_group,
-                backend,
-                ctx=ctx,
-                owned_counts=owned_counts,
-                quant_dtype=quant_dtype,
-                head_major=True,
-            )
         return dcp_lse_merge(
             o,
             lse,
@@ -1515,76 +1541,27 @@ class MLAAttention(nn.Module):
 
     @mark_trace(prefix="dcp_project_merge_out", torch_compile=False)
     def _dcp_project_merge_out(
-        self,
-        o,
-        lse,
-        ctx=None,
-        merge_in_fp32=False,
-        owned_counts=None,
-        decode=False,
-        head_major=False,
+        self, o, lse, ctx=None, merge_in_fp32=False, owned_counts=None, decode=False
     ):
         """Shared tail of both DCP paths: PBM projection, merge, o_proj.
 
         With PBM the V up-projection runs on the whole group's head set BEFORE
         the merge, so o_proj then takes an already-projected tensor. Without it
         the merge carries the latent and ``_v_up_proj_and_o_proj`` does both.
-        ``head_major`` hands the merge the projection's ``[H, B, V]`` storage
-        rather than its ``[B, H, V]`` view, when the projection stores that.
         """
-        fused_quant = None if merge_in_fp32 else self._dcp_fused_quant_dtype()
-        # Keep main's token-major output unless the prefill A2A can send heads
-        # directly; mailbox decode and fused output quantization keep that layout.
-        head_major = (
-            head_major
-            and not decode
-            and self.pbm_enabled
-            and self.W_V_dcp_scale is None
-            and not is_rocm_aiter_fp4bmm_enabled()
-            and self.dcp_comm_backend in ("a2a", "mailbox")
-            and fused_quant is None
-        )
         if self.pbm_enabled:
-            if head_major:
-                o = self._v_up_proj(
-                    o,
-                    self.W_V_dcp,
-                    self.W_V_dcp_scale,
-                    num_heads=o.shape[1],
-                    head_major=True,
-                )
-            else:
-                o = self._v_up_proj(
-                    o,
-                    self.W_V_dcp,
-                    self.W_V_dcp_scale,
-                    num_heads=o.shape[1],
-                )
+            o = self._v_up_proj(
+                o, self.W_V_dcp, self.W_V_dcp_scale, num_heads=o.shape[1]
+            )
         # Only PBM hands the merge output straight to o_proj, so it is the only
         # path whose activation quant the combine can absorb. The fp32 merge is
         # a prefill-accuracy path and keeps its bf16 store.
-        if head_major:
-            o = o.transpose(0, 1)
+        fused_quant = None if merge_in_fp32 else self._dcp_fused_quant_dtype()
+        if merge_in_fp32:
             dtype = o.dtype
-            o = self._dcp_merge(
-                o.float() if merge_in_fp32 else o,
-                lse,
-                ctx=ctx,
-                owned_counts=owned_counts,
-                decode=decode,
-                head_major=True,
+            o = self._dcp_merge(o.float(), lse, ctx=ctx, owned_counts=owned_counts).to(
+                dtype
             )
-            if merge_in_fp32:
-                o = o.to(dtype)
-        elif merge_in_fp32:
-            dtype = o.dtype
-            o = self._dcp_merge(
-                o.float(),
-                lse,
-                ctx=ctx,
-                owned_counts=owned_counts,
-                decode=decode,
-            ).to(dtype)
         else:
             o = self._dcp_merge(
                 o,
@@ -1637,12 +1614,11 @@ class MLAAttention(nn.Module):
             return_lse=True,
             q_prepadded=not use_qrep,
         )
-        return self._dcp_project_merge_out(
+        return self._dcp_prefill_merge_out(
             o,
             lse,
             merge_in_fp32=not self.dcp_prefill_merge_bf16_ok,
             owned_counts=attn_metadata.dcp_owned_counts[: q_out.shape[0]],
-            head_major=True,
         )
 
     @mark_trace(prefix="dcp_decode", torch_compile=False)
@@ -1672,14 +1648,12 @@ class MLAAttention(nn.Module):
             decode=True,
         )
 
-    def _v_up_proj(self, x, W_V=None, W_V_scale=None, num_heads=None, head_major=False):
+    def _v_up_proj(self, x, W_V=None, W_V_scale=None, num_heads=None):
         """V up-projection only: ``[B, N, kv_lora_rank] -> [B, N, v_head_dim]``.
 
         Split out so DCP decode can run it BEFORE the merge (project-before-
         merge). Weight and head count are arguments because that path projects
         the whole group with ``W_V_dcp``; every other caller uses ``self.W_V``.
-        ``head_major`` changes only the BF16 branch's storage order for prefill
-        A2A. The logical return stays ``[B, N, V]``; other branches stay contiguous.
         """
         W_V = self.W_V if W_V is None else W_V
         W_V_scale = self.W_V_scale if W_V_scale is None else W_V_scale
@@ -1688,26 +1662,15 @@ class MLAAttention(nn.Module):
         # passes the raw decode output, which is not guaranteed contiguous the
         # way the post-ReduceScatter tensor is.
         x = x.reshape(-1, num_heads, self.kv_lora_rank).transpose(0, 1)
-        use_fp4 = is_rocm_aiter_fp4bmm_enabled()
-        # The logical result is always (B, N, V). Only the BF16 prefill A2A
-        # caller requests (N, B, V) storage; other callers retain a flat o_proj view.
-        if head_major and W_V_scale is None and not use_fp4:
-            output = torch.empty(
-                x.shape[0],
-                x.shape[1],
-                W_V.shape[1],
-                device=x.device,
-                dtype=torch.bfloat16,
-            ).transpose(0, 1)
-        else:
-            output = torch.empty(
-                x.shape[1],
-                x.shape[0],
-                W_V.shape[1],
-                device=x.device,
-                dtype=torch.bfloat16,
-            )
-        if use_fp4:
+        # All V-up GEMMs write into the same contiguous (B, N, V) output.
+        output = torch.empty(
+            x.shape[1],
+            x.shape[0],
+            W_V.shape[1],
+            device=x.device,
+            dtype=torch.bfloat16,
+        )
+        if is_rocm_aiter_fp4bmm_enabled():
             batched_gemm_a16wfp4(
                 x,
                 W_V,
@@ -1721,8 +1684,8 @@ class MLAAttention(nn.Module):
             # BF16 absorb via Triton batched GEMM (gfx1250-safe; torch.bmm's
             # hipBLASLt bf16 batched path memory-faults). batched_gemm_bf16 does
             # X @ W^T with W (B,N,K): x (N,B,L) @ W_V (N,V,L)^T -> (N,B,V),
-            # stored through the requested output strides. The default (B,N,V)
-            # buffer gives o_proj a flat view; prefill A2A instead owns heads.
+            # stored through output strides into a contiguous (B,N,V) buffer so
+            # the (B, N*V) view o_proj takes needs no transpose copy.
             _aiter_triton_bf16_bmm(x, W_V, YQ=output.transpose(0, 1))
         else:
             _aiter_triton_fp8_bmm(
@@ -1736,20 +1699,11 @@ class MLAAttention(nn.Module):
         # Convert from (B, N, V) to (B, N * V)
         return self.o_proj(x.reshape(-1, self.num_heads * self.v_head_dim))
 
-    def _absorb_into_q_out(self, use_qrep, is_prefill, kv_cache, dtype_q):
-        # Prefill BF16 absorb at the replicated heads stores FP8 into q_out
-        # itself (mla_absorb_q_pack), so no bf16 [N, T, L] is written. gfx950
-        # only: the kernel has not run on gfx942, where FP8 is e4m3fnuz.
+    def _absorb_into_q_out(self, kv_cache, dtype_q):
         return (
-            use_qrep
-            and is_prefill
-            and not is_rocm_aiter_fp4bmm_enabled()
-            and self.W_K_qrep_scale is None
-            and not self.kv_shuffled
-            and kv_cache.numel() > 0
+            self._absorb_q_pack_enabled
             and dtype_q == dtypes.fp8
-            and get_gfx_runtime() == "gfx950"
-            and mla_absorb_q_pack_supports(self.qk_nope_head_dim, self.kv_lora_rank)
+            and kv_cache.numel() > 0
         )
 
     @mark_trace(prefix="q_proj_and_k_up_proj", torch_compile=False)
@@ -3346,8 +3300,10 @@ class MLAAttention(nn.Module):
                 context.is_prefill,
                 envs.ATOM_DCP_PREFILL_QREP,
             )
-            absorb_into_q_out = use_qrep and self._absorb_into_q_out(
-                use_qrep, context.is_prefill, kv_cache, attn_metadata.dtype_q
+            absorb_into_q_out = (
+                use_qrep
+                and context.is_prefill
+                and self._absorb_into_q_out(kv_cache, attn_metadata.dtype_q)
             )
             if absorb_into_q_out:
                 q_nope, q_rope = self._q_proj_and_k_up_proj(

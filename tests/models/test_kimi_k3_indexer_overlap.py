@@ -34,7 +34,7 @@ def dcp_prefill(monkeypatch, modules):
     current = torch.cuda.current_stream
 
     def score_topk(*args, out, **kwargs):
-        calls.append(("score", current(), kwargs.get("gather", True)))
+        calls.append(("score", current(), args[3].split.world > 1))
         return out
 
     monkeypatch.setattr(indexer_forward, "score_topk", score_topk)
@@ -74,8 +74,10 @@ def dcp_prefill(monkeypatch, modules):
         )
         md = AttentionMetaData()
         md.run_sparse = True
-        md.index_rows = SimpleNamespace(
-            out_rows=8, concat=None, split=None, passes=passes
+        from atom.model_ops.indexer.rows import IndexRows, RowSplit
+
+        md.index_rows = IndexRows(
+            torch.zeros(7, device="cuda"), 16, (), RowSplit.of(7, 0, 2), passes=passes
         )
         monkeypatch.setattr(
             indexer_forward,
@@ -145,7 +147,7 @@ def test_sparse_prefill_joins_the_exchange_before_its_query_gather(
         dcp_sparse_prefill_num_heads=8,
         dcp_prefill_merge_bf16_ok=True,
         _forward_prefill_mla=lambda *a, **k: calls.append("mla") or (None, None),
-        _dcp_project_merge_out=lambda *a, **k: calls.append("merge"),
+        _dcp_prefill_merge_out=lambda *a, **k: calls.append("merge"),
     )
     prefill = MethodType(attention_mla.MLAAttention._dcp_sparse_prefill, layer)
     md = AttentionMetaData()

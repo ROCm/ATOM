@@ -512,28 +512,40 @@ def _dcp_a2a_pack_kernel(
 
 
 @triton.jit
-def _dcp_a2a_combine(
-    base,
-    lse_ptr,
-    out_ptr,  # [B, H_LOCAL, D]
-    out_lse_ptr,  # [B, H_LOCAL] fp32, or unused
-    b,
-    h,
-    valid,
+def _dcp_a2a_combine_kernel(
+    recv_ptr,
+    recv_lse_ptr,
+    out_ptr,
+    out_lse_ptr,
+    recv_stride_n,
+    recv_stride_b,
+    recv_stride_h,
+    recv_lse_stride_n,
+    recv_lse_stride_b,
+    recv_lse_stride_h,
     out_stride_b,
     out_stride_h,
     lse_stride_b,
     lse_stride_h,
+    N_RANKS,
     HEAD_DIM: tl.constexpr,
     LSE_PACK: tl.constexpr,
+    N_ROUNDED: tl.constexpr,
     WRITE_LSE: tl.constexpr,
 ):
-    """LSE-weighted combine along the KV-shard axis. One program per (token, head).
-
-    The reduce axis is N (the KV shards), never the head axis -- heads are only
-    ever relocated, never summed across. That is what makes the head split above
-    free to be any partition.
-    """
+    """Combine KV shards for one (token, head), with packed or separate LSE."""
+    b = tl.program_id(0).to(tl.int64)
+    h = tl.program_id(1).to(tl.int64)
+    n = tl.arange(0, N_ROUNDED)
+    valid = n < N_RANKS
+    n_safe = tl.where(valid, n, 0).to(tl.int64)
+    base = recv_ptr + n_safe * recv_stride_n + b * recv_stride_b + h * recv_stride_h
+    lse_ptr = (
+        recv_lse_ptr
+        + n_safe * recv_lse_stride_n
+        + b * recv_lse_stride_b
+        + h * recv_lse_stride_h
+    )
     if LSE_PACK == 1:
         lse = tl.load(lse_ptr, mask=valid, other=float("-inf"))
         lse = lse.to(tl.float32)
@@ -567,8 +579,7 @@ def _dcp_a2a_combine(
     factor = tl.where((factor != factor) | (~valid), 0.0, factor)  # noqa: PLR0124
 
     d = tl.arange(0, HEAD_DIM)
-    # Masked for the same reason as the fused kernel: the padding lanes of a
-    # non-power-of-two group address memory past `recv`.
+    # Padding lanes point at rank zero but must contribute no values.
     vals = tl.load(base[:, None] + d[None, :], mask=valid[:, None], other=0.0).to(
         tl.float32
     )
@@ -602,78 +613,25 @@ def _dcp_a2a_unpack_combine_kernel(
     N_ROUNDED: tl.constexpr,
     WRITE_LSE: tl.constexpr,
 ):
-    b = tl.program_id(axis=0).to(tl.int64)
-    h = tl.program_id(axis=1).to(tl.int64)
-    n = tl.arange(0, N_ROUNDED)
-    valid = n < N_RANKS
-    # Masked lanes still form addresses inside the allocation.
-    n_safe = tl.where(valid, n, 0).to(tl.int64)
-    base = recv_ptr + n_safe * recv_stride_n + b * recv_stride_b + h * recv_stride_h
-    _dcp_a2a_combine(
-        base,
-        base + HEAD_DIM,
+    _dcp_a2a_combine_kernel(
+        recv_ptr,
+        recv_ptr + HEAD_DIM,
         out_ptr,
         out_lse_ptr,
-        b,
-        h,
-        valid,
+        recv_stride_n,
+        recv_stride_b,
+        recv_stride_h,
+        recv_stride_n,
+        recv_stride_b,
+        recv_stride_h,
         out_stride_b,
         out_stride_h,
         lse_stride_b,
         lse_stride_h,
+        N_RANKS,
         HEAD_DIM,
         LSE_PACK,
-        WRITE_LSE,
-    )
-
-
-@triton.jit
-def _dcp_a2a_head_major_combine_kernel(
-    recv_ptr,
-    out_ptr,
-    out_lse_ptr,
-    recv_stride_n,
-    recv_stride_b,
-    recv_stride_h,
-    out_stride_b,
-    out_stride_h,
-    lse_stride_b,
-    lse_stride_h,
-    N_RANKS,
-    HEAD_DIM: tl.constexpr,
-    N_ROUNDED: tl.constexpr,
-    WRITE_LSE: tl.constexpr,
-    recv_lse_ptr,
-    recv_lse_stride_n,
-    recv_lse_stride_b,
-    recv_lse_stride_h,
-):
-    b = tl.program_id(axis=0).to(tl.int64)
-    h = tl.program_id(axis=1).to(tl.int64)
-    n = tl.arange(0, N_ROUNDED)
-    valid = n < N_RANKS
-    n_safe = tl.where(valid, n, 0).to(tl.int64)
-    base = recv_ptr + n_safe * recv_stride_n + b * recv_stride_b + h * recv_stride_h
-    lse_ptr = (
-        recv_lse_ptr
-        + n_safe * recv_lse_stride_n
-        + b * recv_lse_stride_b
-        + h * recv_lse_stride_h
-    )
-    _dcp_a2a_combine(
-        base,
-        lse_ptr,
-        out_ptr,
-        out_lse_ptr,
-        b,
-        h,
-        valid,
-        out_stride_b,
-        out_stride_h,
-        lse_stride_b,
-        lse_stride_h,
-        HEAD_DIM,
-        1,
+        N_ROUNDED,
         WRITE_LSE,
     )
 
@@ -804,6 +762,60 @@ def _dcp_a2a_unpack_combine_quant_kernel(
     )
 
 
+def cp_lse_a2a_head_major(
+    cp_attn_out,
+    cp_attn_lse,
+    cp_group,
+    return_lse=False,
+    owned_counts=None,
+):
+    """Exchange contiguous [H, B, D] output and FP32 LSE in two collectives."""
+    n_ranks = cp_group.world_size
+    assert n_ranks > 1, "head-major prefill requires DCP"
+    h_total, b, head_dim = cp_attn_out.shape
+    assert h_total % n_ranks == 0
+    h_local = h_total // n_ranks
+    dtype, dev = cp_attn_out.dtype, cp_attn_out.device
+    cp_attn_lse = cp_attn_lse.contiguous().to(torch.float32)
+    if owned_counts is not None:
+        cp_attn_lse = mask_empty_dcp_lse(cp_attn_lse, owned_counts[:b])
+    send, send_lse = cp_attn_out.contiguous(), cp_attn_lse.t().contiguous()
+    recv, recv_lse = torch.empty_like(send), torch.empty_like(send_lse)
+    group = cp_group.device_group
+    torch.distributed.all_to_all_single(recv, send, group=group)
+    torch.distributed.all_to_all_single(recv_lse, send_lse, group=group)
+    recv = recv.view(n_ranks, h_local, b, head_dim).transpose(1, 2)
+    recv_lse = recv_lse.view(n_ranks, h_local, b).transpose(1, 2)
+    out = torch.empty((b, h_local, head_dim), dtype=dtype, device=dev)
+    out_lse = (
+        torch.empty((b, h_local), dtype=torch.float32, device=dev)
+        if return_lse
+        else None
+    )
+    _dcp_a2a_combine_kernel[(b, h_local)](
+        recv,
+        recv_lse,
+        out,
+        out_lse,
+        recv.stride(0),
+        recv.stride(1),
+        recv.stride(2),
+        recv_lse.stride(0),
+        recv_lse.stride(1),
+        recv_lse.stride(2),
+        out.stride(0),
+        out.stride(1),
+        out_lse.stride(0) if return_lse else 0,
+        out_lse.stride(1) if return_lse else 0,
+        n_ranks,
+        HEAD_DIM=head_dim,
+        LSE_PACK=1,
+        N_ROUNDED=triton.next_power_of_2(n_ranks),
+        WRITE_LSE=return_lse,
+    )
+    return (out, out_lse) if return_lse else out
+
+
 def cp_lse_a2a(
     cp_attn_out,
     cp_attn_lse,
@@ -811,26 +823,19 @@ def cp_lse_a2a(
     return_lse: bool = False,
     owned_counts=None,
     quant_dtype=None,
-    head_major=False,
 ):
-    """A2A backend: exchange partial outputs and LSE, then combine locally.
+    """A2A backend: pack -> one all-to-all -> local LSE combine.
 
-    Packed output and LSE share one all-to-all; head-major output uses a
-    separate all-to-all for its fp32 LSE.
-
-    The combined output is ``[B, H_local, D]`` with the same head ownership
-    as ``cp_lse_ag_out_rs``. Input layout and optional outputs follow the args below.
+    Drop-in for ``cp_lse_ag_out_rs``: same inputs, same ``[B, H_local, D]``
+    output, same head ownership.
 
     Args:
-        cp_attn_out: ``[B, H, D]`` this rank's partial output over its KV shard,
-            or ``[H, B, D]`` with ``head_major``: then each destination's heads
-            are contiguous already, so nothing is packed and the LSE takes a
-            second all-to-all.
+        cp_attn_out: ``[B, H, D]`` this rank's partial output over its KV shard.
         cp_attn_lse: ``[B, H]`` matching log-sum-exp, fp32.
         cp_group: DCP GroupCoordinator.
         return_lse: also return the merged ``[B, H_local]`` global LSE.
         owned_counts: optional true rank-local sparse-KV count per row. Empty
-            rows are masked inside the A2A pack kernel, or in the head-major LSE.
+            rows are masked inside the existing A2A pack kernel.
         quant_dtype: when given (per-token FP8), the combine also quantizes and
             the call returns ``(out_fp8, scale)`` instead of ``out``. This
             deletes the standalone per-token quant launch that o_proj would
@@ -847,16 +852,13 @@ def cp_lse_a2a(
     ), "cp_lse_a2a: the fused-quant combine does not emit LSE"
 
     n_ranks = cp_group.world_size
-    assert not head_major or (n_ranks > 1 and quant_dtype is None)
     if n_ranks == 1:
         if quant_dtype is not None:
             # Nothing to combine, so there is no kernel to fold the quant into.
             return cp_attn_out, None
         return (cp_attn_out, cp_attn_lse) if return_lse else cp_attn_out
 
-    b, h_total, head_dim = (
-        cp_attn_out.transpose(0, 1) if head_major else cp_attn_out
-    ).shape
+    b, h_total, head_dim = cp_attn_out.shape
     assert h_total % n_ranks == 0, (
         f"a2a merge needs the head count divisible by the DCP size; "
         f"got H={h_total}, N={n_ranks}"
@@ -870,45 +872,6 @@ def cp_lse_a2a(
 
     cp_attn_out = cp_attn_out.contiguous()
     cp_attn_lse = cp_attn_lse.contiguous().to(torch.float32)
-    if head_major:
-        if owned_counts is not None:
-            cp_attn_lse = mask_empty_dcp_lse(cp_attn_lse, owned_counts[:b])
-        send, send_lse = cp_attn_out, cp_attn_lse.t().contiguous()
-        recv = torch.empty_like(send)
-        recv_lse = torch.empty_like(send_lse)
-        group = cp_group.device_group
-        torch.distributed.all_to_all_single(recv, send, group=group)
-        torch.distributed.all_to_all_single(recv_lse, send_lse, group=group)
-        # [N, B, H_local] views of what arrived as [N, H_local, B].
-        recv = recv.view(n_ranks, h_local, b, head_dim).transpose(1, 2)
-        recv_lse = recv_lse.view(n_ranks, h_local, b).transpose(1, 2)
-        out = torch.empty((b, h_local, head_dim), dtype=dtype, device=dev)
-        out_lse = (
-            torch.empty((b, h_local), dtype=torch.float32, device=dev)
-            if return_lse
-            else None
-        )
-        _dcp_a2a_head_major_combine_kernel[(b, h_local)](
-            recv,
-            out,
-            out_lse,
-            recv.stride(0),
-            recv.stride(1),
-            recv.stride(2),
-            out.stride(0),
-            out.stride(1),
-            out_lse.stride(0) if return_lse else 0,
-            out_lse.stride(1) if return_lse else 0,
-            n_ranks,
-            HEAD_DIM=head_dim,
-            N_ROUNDED=triton.next_power_of_2(n_ranks),
-            WRITE_LSE=return_lse,
-            recv_lse_ptr=recv_lse,
-            recv_lse_stride_n=recv_lse.stride(0),
-            recv_lse_stride_b=recv_lse.stride(1),
-            recv_lse_stride_h=recv_lse.stride(2),
-        )
-        return (out, out_lse) if return_lse else out
     has_owned_counts = owned_counts is not None
     if has_owned_counts:
         owned_counts = owned_counts.contiguous()
@@ -1157,14 +1120,14 @@ def dcp_lse_merge(
     ctx=None,
     owned_counts=None,
     quant_dtype=None,
-    head_major=False,
 ):
     """Reconstruct the global softmax from the per-rank partials.
 
-    Dispatches to one of the backends above, preserving this rank's head slice.
-    The backends use the same LSE-weighted sum with floating-point differences.
-    Packed A2A uses one collective; head-major A2A exchanges output and fp32
-    LSE separately, as described in ``cp_lse_a2a``.
+    Dispatches to one of the backends above. All compute the same weighted
+    sum over KV shards and leave this rank owning the same head slice; they
+    differ only in how many collectives it takes (see the A2A section above for
+    why one all-to-all can replace AllGather-LSE + ReduceScatter). Equivalent
+    math, not bitwise identical.
 
     ``owned_counts`` is the optional rank-local sparse-KV count per row. Empty
     prefill rows contain a dummy cache slot to keep persistent metadata valid;
@@ -1174,14 +1137,11 @@ def dcp_lse_merge(
     ``ctx`` is the Triton context the AG+RS backend caches its launches in; the
     a2a backend does not use one.
 
-    ``head_major`` says ``cp_attn_out`` is ``[H, B, D]``; see ``cp_lse_a2a``.
-
     ``backend="mailbox"`` takes aiter's mailbox combine in a graph capture
     when its workspace was prepared (``prepare_dcp_mailbox``) and the call
-    fits it, else all-to-all. Head-major input requires all-to-all. Every
-    input to that choice is the same on every rank of the group.
+    fits it, else all-to-all. Every input to that choice is the same on every
+    rank of the group.
     """
-    assert not head_major or backend == "a2a"
     if backend == "mailbox":
         merged = _dcp_mailbox_merge(
             cp_attn_out, cp_attn_lse, cp_group, owned_counts, quant_dtype
@@ -1190,15 +1150,6 @@ def dcp_lse_merge(
             return merged
         backend = "a2a"
     if backend == "a2a":
-        if head_major:
-            return cp_lse_a2a(
-                cp_attn_out,
-                cp_attn_lse,
-                cp_group,
-                owned_counts=owned_counts,
-                quant_dtype=quant_dtype,
-                head_major=True,
-            )
         return cp_lse_a2a(
             cp_attn_out,
             cp_attn_lse,
@@ -1210,8 +1161,8 @@ def dcp_lse_merge(
         quant_dtype is None
     ), "dcp_lse_merge: fused-quant combine is only implemented for backend=a2a"
     if owned_counts is not None:
-        # AG+RS needs an explicit LSE mask before its AllGather.
-        # Packed A2A folds the mask into its pack; head-major A2A masks its LSE.
+        # AG+RS has no existing kernel before its LSE AllGather. The default
+        # A2A path above fuses this mask and remains launch-free.
         cp_attn_lse = mask_empty_dcp_lse(cp_attn_lse, owned_counts)
     return cp_lse_ag_out_rs(cp_attn_out, cp_attn_lse, cp_group, ctx=ctx)
 

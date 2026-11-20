@@ -88,6 +88,19 @@ def production(monkeypatch):
         )
 
     namespace["initialize_dtypes"] = initialize_dtypes
+    dtype_path = path.parents[1] / "distributed/dcp_utils.py"
+    dtype_fn = next(
+        n
+        for n in ast.parse(dtype_path.read_text()).body
+        if isinstance(n, ast.FunctionDef) and n.name == "mla_cache_dtype"
+    )
+    aiter = ModuleType("aiter")
+    aiter.dtypes = SimpleNamespace(fp8=torch.float8_e4m3fn)
+    monkeypatch.setitem(sys.modules, "aiter", aiter)
+    exec(  # noqa: S102 - shared production dtype resolver
+        compile(ast.Module(body=[dtype_fn], type_ignores=[]), str(dtype_path), "exec"),
+        namespace,
+    )
     exec(  # noqa: S102 - checked-in production bodies; GPU boundaries below are stubs
         compile(
             ast.Module(body=constants + functions, type_ignores=[]), str(path), "exec"
@@ -239,16 +252,13 @@ def test_width_uses_actual_support_and_preserves_bf16_head_groups(
         )
 
     production["get_mla_decode_shape_support"] = support
-    assert (
-        production["mla_dcp_sparse_prefill_num_heads"](
-            12,
-            dcp,
-            persistent=True,
-            dtype_q=dtype,
-            dtype_kv=dtype,
-        )
-        == expected
-    )
+    assert production["mla_dcp_sparse_prefill_num_heads"](
+        12,
+        dcp,
+        persistent=True,
+        dtype_q=dtype,
+        dtype_kv=dtype,
+    ) == (expected, True)
     assert expected in calls
 
 
@@ -265,16 +275,13 @@ def test_unqualified_width_keeps_conservative_padding(
     production["get_mla_decode_shape_support"] = lambda *a, **k: SimpleNamespace(
         native=native, supported=supported
     )
-    assert (
-        production["mla_dcp_sparse_prefill_num_heads"](
-            heads,
-            dcp,
-            persistent=True,
-            dtype_q=torch.bfloat16,
-            dtype_kv=torch.bfloat16,
-        )
-        == expected
-    )
+    assert production["mla_dcp_sparse_prefill_num_heads"](
+        heads,
+        dcp,
+        persistent=True,
+        dtype_q=torch.bfloat16,
+        dtype_kv=torch.bfloat16,
+    ) == (expected, False)
 
 
 @pytest.mark.parametrize(
@@ -330,13 +337,15 @@ def test_plan_support_is_bound_to_the_final_width_and_reset(
     assert layer.dtype is activation_dtype
     configure = production["_configure_dcp_decode_head_padding"]
     for dcp, width in ((8, 64), (4, 32)):
+        first_query = len(queries)
         configure(layer, dcp)
         assert layer.dcp_sparse_prefill_num_heads == (64 if nonps else width)
         assert layer.dcp_sparse_prefill_plan_native == (
             native and supported is True and not nonps
         )
-        if not nonps:
-            assert queries[-1] == (width, 1, query_dtype, query_dtype)
+        queried = queries[first_query:]
+        assert len({q[0] for q in queried}) == len(queried), "same width queried twice"
+        assert queried[0] == (width, 1, query_dtype, query_dtype)
     before = list(queries)
     configure(layer, 1)
     assert not layer.dcp_sparse_prefill_plan_native

@@ -651,7 +651,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # separate, so size each for its own consumer.
         self.sparse_prefill_num_heads = self.padded_num_attention_heads
         if self.sparse_dcp_metadata_rebuild:
-            self.sparse_prefill_num_heads = mla_dcp_sparse_prefill_num_heads(
+            self.sparse_prefill_num_heads, _ = mla_dcp_sparse_prefill_num_heads(
                 self.num_attention_heads,
                 self.dcp_world_size,
                 dtype_q=self.dtype_q,

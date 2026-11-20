@@ -346,49 +346,42 @@ def sparse_attn_indexer(
         )
         return
     rows = attn_metadata.index_rows
+    if (
+        indexer_module.exchange_stream is not None
+        and context.is_prefill
+        and get_dcp_world_size() > 1
+        and rows.passes is None
+        and (exchange := _exchange_stream(indexer_module.exchange_stream)) is not None
+    ):
+        return _dcp_prefill_exchange(
+            exchange,
+            indexer_module,
+            q_quant,
+            q_fp4_scale,
+            weights_mqa,
+            kv_cache,
+            attn_metadata,
+            topk_indices,
+            topk_tokens,
+            weights_scale,
+            stable_topk,
+            runner_block_size,
+            cp_kv_cache_interleave_size,
+        )
     # A single-rank prefill's slot conversion subtracts concat rows' request
     # base itself; decode and the DCP filter read request-local ids.
     single_rank_prefill = context.is_prefill and get_dcp_world_size() == 1
-    # Packed passes gather into separate padded slots inside score_topk; they
-    # cannot be gathered again using the whole step's row split.
-    exchange = None
-    if context.is_prefill and not single_rank_prefill and rows.passes is None:
-        stream = indexer_module.exchange_stream
-        if stream is not None:
-            exchange = _exchange_stream(stream)
-    if exchange is None:
-        topk_indices = score_topk(
-            (
-                (q_quant.unsqueeze(1), q_fp4_scale.unsqueeze(1))
-                if indexer_fp4
-                else q_quant
-            ),
-            weights_mqa,
-            _index_cache(indexer_module, kv_cache, attn_metadata, context.is_prefill),
-            rows,
-            topk=topk_tokens,
-            weight_scale=weights_scale,
-            stable=stable_topk,
-            out=topk_indices[: rows.out_rows],
-            request_local=not single_rank_prefill,
-        )
-    else:
-        topk_indices = score_topk(
-            (
-                (q_quant.unsqueeze(1), q_fp4_scale.unsqueeze(1))
-                if indexer_fp4
-                else q_quant
-            ),
-            weights_mqa,
-            _index_cache(indexer_module, kv_cache, attn_metadata, context.is_prefill),
-            rows,
-            topk=topk_tokens,
-            weight_scale=weights_scale,
-            stable=stable_topk,
-            out=topk_indices[: rows.out_rows],
-            request_local=not single_rank_prefill,
-            gather=False,
-        )
+    topk_indices = score_topk(
+        ((q_quant.unsqueeze(1), q_fp4_scale.unsqueeze(1)) if indexer_fp4 else q_quant),
+        weights_mqa,
+        _index_cache(indexer_module, kv_cache, attn_metadata, context.is_prefill),
+        rows,
+        topk=topk_tokens,
+        weight_scale=weights_scale,
+        stable=stable_topk,
+        out=topk_indices[: rows.out_rows],
+        request_local=not single_rank_prefill,
+    )
     if not context.is_prefill:
         if attn_metadata.max_seqlen_q > 1:
             triton_gather_kv_indices_sparse(
@@ -417,42 +410,20 @@ def sparse_attn_indexer(
         # WHOLE selection: the filter `.contiguous()`s what it gets, so a row
         # slice would copy what the in-place gather avoided moving, and its
         # grid follows `sparse_kv_indptr`, so the gather's tail is never read.
-        if exchange is None:
-            triton_filter_and_convert_dcp_index_prefill(
-                attn_metadata.sparse_kv_indptr,
-                attn_metadata.batch_id_per_q_token,
-                topk_indices,
-                attn_metadata.block_tables,
-                get_dcp_rank(),
-                get_dcp_world_size(),
-                runner_block_size,
-                out_kv_indptr=attn_metadata.dcp_sparse_kv_indptr,
-                owned_counts=attn_metadata.dcp_owned_counts,
-                NUM_TOPK_TOKENS=topk_tokens,
-                out=attn_metadata.sparse_kv_indices,
-                cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
-            )
-        else:
-            exchange.wait_stream(torch.cuda.current_stream())
-            # The op drops its last reference while the exchange still runs.
-            topk_indices.record_stream(exchange)
-            with torch.cuda.stream(exchange):
-                _gather_split(topk_indices, rows.split)
-                triton_filter_and_convert_dcp_index_prefill(
-                    attn_metadata.sparse_kv_indptr,
-                    attn_metadata.batch_id_per_q_token,
-                    topk_indices,
-                    attn_metadata.block_tables,
-                    get_dcp_rank(),
-                    get_dcp_world_size(),
-                    runner_block_size,
-                    out_kv_indptr=attn_metadata.dcp_sparse_kv_indptr,
-                    owned_counts=attn_metadata.dcp_owned_counts,
-                    NUM_TOPK_TOKENS=topk_tokens,
-                    out=attn_metadata.sparse_kv_indices,
-                    cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
-                )
-            attn_metadata.index_exchange_done = exchange.record_event()
+        triton_filter_and_convert_dcp_index_prefill(
+            attn_metadata.sparse_kv_indptr,
+            attn_metadata.batch_id_per_q_token,
+            topk_indices,
+            attn_metadata.block_tables,
+            get_dcp_rank(),
+            get_dcp_world_size(),
+            runner_block_size,
+            out_kv_indptr=attn_metadata.dcp_sparse_kv_indptr,
+            owned_counts=attn_metadata.dcp_owned_counts,
+            NUM_TOPK_TOKENS=topk_tokens,
+            out=attn_metadata.sparse_kv_indices,
+            cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+        )
     else:
         triton_convert_req_index_to_global_index_dsa_prefill(
             attn_metadata.sparse_cu_seqlens_q,
@@ -466,6 +437,61 @@ def sparse_attn_indexer(
             out=attn_metadata.sparse_kv_indices,
             row_starts=None if rows.concat is None else rows.concat.row_starts,
         )
+
+
+def _dcp_prefill_exchange(
+    exchange,
+    indexer,
+    query,
+    query_scale,
+    weights,
+    kv_cache,
+    metadata,
+    topk_indices,
+    topk,
+    weight_scale,
+    stable,
+    block_size,
+    interleave_size,
+):
+    """Score the local rows, then gather and filter on the assigned side stream."""
+    rows = metadata.index_rows
+    # Native DCP prefill uses contiguous row shares, not rank-major stripes.
+    assert not rows.split.stripe
+    local_rows = rows._replace(split=rows.split._replace(world=1))
+    topk_indices = score_topk(
+        (
+            (query.unsqueeze(1), query_scale.unsqueeze(1))
+            if indexer._indexer_fp4
+            else query
+        ),
+        weights,
+        _index_cache(indexer, kv_cache, metadata, True),
+        local_rows,
+        topk=topk,
+        weight_scale=weight_scale,
+        stable=stable,
+        out=topk_indices[: rows.out_rows],
+    )
+    exchange.wait_stream(torch.cuda.current_stream())
+    topk_indices.record_stream(exchange)
+    with torch.cuda.stream(exchange):
+        _gather_split(topk_indices, rows.split)
+        triton_filter_and_convert_dcp_index_prefill(
+            metadata.sparse_kv_indptr,
+            metadata.batch_id_per_q_token,
+            topk_indices,
+            metadata.block_tables,
+            get_dcp_rank(),
+            get_dcp_world_size(),
+            block_size,
+            out_kv_indptr=metadata.dcp_sparse_kv_indptr,
+            owned_counts=metadata.dcp_owned_counts,
+            NUM_TOPK_TOKENS=topk,
+            out=metadata.sparse_kv_indices,
+            cp_kv_cache_interleave_size=interleave_size,
+        )
+    metadata.index_exchange_done = exchange.record_event()
 
 
 def _exchange_stream(stream):

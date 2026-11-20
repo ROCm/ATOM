@@ -430,9 +430,10 @@ The backends implement the same LSE-weighted sum, with floating-point
 differences from accumulation order. Packed `a2a`
 bit-preserves fp32 LSE in two 16-bit slots when its buffer is bf16/fp16.
 Head-major prefill instead sends LSE as plain fp32 in a separate all-to-all.
-It requires `ATOM_MLA_ABSORB_BF16=1`: the default FP8 `W_V_dcp` keeps the
-packed layout and its single collective. FP4 and fused output quantization
-also keep the packed layout.
+It requires PBM, `ATOM_MLA_ABSORB_BF16=1`, and an `a2a` or `mailbox` backend
+(mailbox uses A2A for prefill). The default FP8 `W_V_dcp` keeps the packed
+layout and its single collective. FP4 and fused output quantization also
+keep the packed layout.
 
 | Value | Pattern | Collectives |
 |-------|---------|-------------|
@@ -598,8 +599,9 @@ Non-persistent decode uses its dtype-specific table (16/32/128 for bf16,
 
 Sparse prefill selects its width separately. The eligible persistent path
 queries AITER for native support at candidate multiples of 16. BF16 keeps the
-established 16/32/64/128 buckets, so 48 pads to 64 and 96 pads to 128 for the
-small-prefill head-group path. Folded or unknown persistent support uses those
+established 16/32/64/128 buckets, so 48 pads to 64 and 96 pads to 128.
+Only the 128-head BF16 width binds the small-prefill head-group path.
+Folded or unknown persistent support uses those
 same buckets and rebuilds each layer's plan; non-persistent prefill keeps its
 16/128 table unless the eligible FP8 gqa64 route applies. Beyond 128,
 DCP decode warns and passes the rounded width to aiter; sparse prefill also
