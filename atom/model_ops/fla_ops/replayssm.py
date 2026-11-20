@@ -404,7 +404,9 @@ def _replay_dot(
 
 
 @triton.jit
-def _owns_kg_records(flush_arrivals, slot, i_hv, HV: tl.constexpr, do_flush):
+def _owns_kg_records(
+    flush_arrivals, slot, i_hv, HV: tl.constexpr, do_flush, WAIT: tl.constexpr
+):
     """Whether this program stores the step's k / g records.
 
     k and g do not depend on the V split, so one program of the head stores
@@ -420,7 +422,7 @@ def _owns_kg_records(flush_arrivals, slot, i_hv, HV: tl.constexpr, do_flush):
     owns = tl.program_id(0) == 0
     if do_flush:
         tl.inline_asm_elementwise(
-            "s_waitcnt vmcnt(0)", "=v,v", [i_hv], dtype=tl.int32, is_pure=False, pack=1
+            WAIT, "=v,v", [i_hv], dtype=tl.int32, is_pure=False, pack=1
         )
         tl.debug_barrier()
         p_count = flush_arrivals + slot * HV + i_hv
@@ -433,6 +435,14 @@ def _owns_kg_records(flush_arrivals, slot, i_hv, HV: tl.constexpr, do_flush):
 #: Zeroed `_owns_kg_records` counts, one per checkpoint slot and head, keyed by
 #: device and size. Never freed: a captured graph keeps the address.
 _FLUSH_ARRIVALS: dict[tuple[torch.device, int], torch.Tensor] = {}
+
+
+def _flush_wait() -> str:
+    return (
+        "s_wait_loadcnt 0"
+        if get_gfx_runtime().startswith("gfx12")
+        else "s_waitcnt vmcnt(0)"
+    )
 
 
 def _flush_arrivals(ckpt: torch.Tensor) -> torch.Tensor:
@@ -742,6 +752,7 @@ def _replayssm_fwd_kernel(
     buf_u,
     buf_g,
     flush_arrivals,
+    WAIT: tl.constexpr,
     write_pos,
     slot_idx,
     cu_seqlens,
@@ -911,7 +922,7 @@ def _replayssm_fwd_kernel(
         )
         b_ck += tl.sum(b_kwt * b_xk[:, None], 0)
         b_cq += tl.sum(b_kwt * b_xq[:, None], 0)
-        owns_kg = _owns_kg_records(flush_arrivals, slot, i_hv, HV, do_flush)
+        owns_kg = _owns_kg_records(flush_arrivals, slot, i_hv, HV, do_flush, WAIT)
 
         if do_flush:
             tl.store(
@@ -993,7 +1004,7 @@ def _replayssm_fwd_kernel(
         BH,
         IS_KDA,
     )
-    owns_kg = _owns_kg_records(flush_arrivals, slot, i_hv, HV, do_flush)
+    owns_kg = _owns_kg_records(flush_arrivals, slot, i_hv, HV, do_flush, WAIT)
     if T1_FAST:
         # T == 1: nothing chains from token to token, so S_h is never needed as
         # a value -- only its two contractions, S_h^T k and S_h^T q, and both
@@ -1597,6 +1608,7 @@ def replayssm_gated_delta_rule(
         buf_u=buf_u,
         buf_g=buf_g,
         flush_arrivals=_flush_arrivals(ckpt),
+        WAIT=_flush_wait(),
         write_pos=write_pos,
         slot_idx=slot_idx,
         cu_seqlens=cu_seqlens,
@@ -1691,6 +1703,7 @@ def _replayssm_kda_fwd_kernel(
     buf_u,
     buf_g,
     flush_arrivals,
+    WAIT: tl.constexpr,
     write_pos,
     slot_idx,
     cu_seqlens,
@@ -1784,7 +1797,7 @@ def _replayssm_kda_fwd_kernel(
         BH,
         True,
     )
-    owns_kg = _owns_kg_records(flush_arrivals, slot, i_hv, HV, do_flush)
+    owns_kg = _owns_kg_records(flush_arrivals, slot, i_hv, HV, do_flush, WAIT)
     # KDA keeps the state transposed as [BV, BK], so the contraction is u^T @ k~.
     b_h = b_h * b_decay[None, :]
     b_h += _replay_dot(tl.trans(b_ru), b_kw, False, DOT_MODE)
@@ -1937,6 +1950,7 @@ def replayssm_sigmoid_gating_delta_rule(
         buf_u=buf_u,
         buf_g=buf_g,
         flush_arrivals=_flush_arrivals(ckpt),
+        WAIT=_flush_wait(),
         write_pos=write_pos,
         slot_idx=slot_idx,
         cu_seqlens=cu_seqlens,

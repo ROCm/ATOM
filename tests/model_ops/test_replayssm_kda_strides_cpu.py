@@ -55,6 +55,19 @@ def production_function(name, namespace):
 
 
 class TestKdaStrides(unittest.TestCase):
+    def test_flush_wait_for_supported_targets(self):
+        for arch, expected in (
+            ("gfx942", "s_waitcnt vmcnt(0)"),
+            ("gfx950", "s_waitcnt vmcnt(0)"),
+            ("gfx1200", "s_wait_loadcnt 0"),
+            ("gfx1250", "s_wait_loadcnt 0"),
+        ):
+            with self.subTest(arch=arch):
+                run = production_function(
+                    "_flush_wait", {"get_gfx_runtime": lambda arch=arch: arch}
+                )
+                self.assertEqual(run(), expected)
+
     def test_wrapper_copies_only_non_dense_rows(self):
         for tokens in (32, 128):
             for layout in ("dense_rows", "gate_heads", "gate_channels", "beta_heads"):
@@ -74,6 +87,7 @@ class TestKdaStrides(unittest.TestCase):
                         "flush_threshold_ok": lambda cap, length: cap >= 2 * length,
                         "_replay_dot_mode": lambda dtype: "ieee",
                         "_flush_arrivals": lambda ckpt: object(),
+                        "_flush_wait": lambda: "s_waitcnt vmcnt(0)",
                         "_replayssm_kda_fwd_kernel": Kernel(),
                     }
                     run = production_function(
@@ -121,6 +135,7 @@ class TestKdaStrides(unittest.TestCase):
                         captured["stride_b_token"], captured["b"].stride(-2)
                     )
                     self.assertEqual(captured["N"], tokens // 8)
+                    self.assertEqual(captured["WAIT"], "s_waitcnt vmcnt(0)")
 
     def test_sequence_starts_address_the_original_views(self):
         tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
