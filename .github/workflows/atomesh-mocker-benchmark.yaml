@@ -114,17 +114,13 @@ jobs:
 
       # The routing integration tests: ingress, the HTTP and PD routers and
       # their placement, through mock workers.
-      # test_power_of_two_prefers_less_loaded fails on this runner alone (30
-      # concurrent requests against a 200 ms worker), serial or not; it passes
-      # on MI355X hosts, so it is skipped here until its cause is known.
       - name: Run atomesh routing tests
         run: |
           set -euo pipefail
           cargo test \
             --manifest-path atom/mesh/Cargo.toml \
             --target-dir atom/mesh/mocker/target/mesh \
-            --profile ci --test routing_tests -- \
-            --skip test_power_of_two_prefers_less_loaded
+            --profile ci --test routing_tests
 
       # The vendored ext-proc protos must match the checksums pinned in
       # manifest.json; offline, so a drifted file or manifest fails here.
