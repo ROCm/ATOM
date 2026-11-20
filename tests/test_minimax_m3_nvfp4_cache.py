@@ -387,7 +387,22 @@ def test_moving_nvfp4_pages_does_not_imply_moving_a_draft_dtype(monkeypatch):
             _m3(monkeypatch, kv_transfer_config=kvt, speculative_config=spec, **nvfp4)
 
 
-def test_a_pd_connector_still_refuses_a_draft_dtype_beside_nvfp4(monkeypatch):
+LMCACHE_MP = {"kv_connector": "lmcache_mp", "kv_role": "offload"}
+
+
+@pytest.mark.parametrize(
+    "kvt",
+    [
+        MORIIO,
+        # every leaf, not any: declaring transports beside one that does not declare
+        {"kv_connector": "multi", "connectors": [PD, LMCACHE_MP]},
+        {
+            "kv_connector": "multi",
+            "connectors": [{**MORIIO, "kv_role": "kv_producer"}, STORE],
+        },
+    ],
+)
+def test_one_transport_that_moves_no_own_dtype_draft_refuses_it(monkeypatch, kvt):
     spec = _dspark_spec()
     spec.kv_cache_dtype = "fp8"
     with pytest.raises(
@@ -399,6 +414,6 @@ def test_a_pd_connector_still_refuses_a_draft_dtype_beside_nvfp4(monkeypatch):
             kv_cache_dtype="nvfp4",
             index_cache_dtype="nvfp4",
             hf=sparse_hf(),
-            kv_transfer_config=MORIIO,
+            kv_transfer_config=kvt,
             speculative_config=spec,
         )
