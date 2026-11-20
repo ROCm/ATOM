@@ -4,6 +4,7 @@
 
 import flydsl.expr as fx
 
+from atom.models.deepseek_v41.mono import index_plan as ip
 from atom.models.deepseek_v41.mono import index_tp_plan as tp
 from atom.mono.device.ops import (
     ld_i32,
@@ -13,6 +14,7 @@ from atom.mono.device.ops import (
     wave_max,
     wave_sum,
 )
+from atom.mono.dsa_indexer.selection_plan import SHORT_VERIFY_CTX
 
 
 @traced
@@ -47,7 +49,9 @@ def initialize(c):
     first_bound = ld_i32(bound, fx.max(first, 0))
     c["ix_total"] = uniform(wave_sum(start.select(request_bound, fx.Int32(0))))
     c["ix_requests"] = uniform(ld_i32(meta, 3)) & 0xFFFF
-    c["ix_local"] = uniform(wave_max((start & (first_bound > 8192)).select(1, 0))) == 0
+    c["ix_local"] = (
+        uniform(wave_max((start & (first_bound > SHORT_VERIFY_CTX)).select(1, 0))) == 0
+    )
 
 
 @traced
@@ -62,7 +66,7 @@ def initialize_scores(c):
         live
         & ((mode != tp.OWNED) | (owner == c["rank"]))
         & (count > 0)
-        & (ld_i32(bound, row) > 512)
+        & (ld_i32(bound, row) > ip.TOPK)
     )
     c["ix_active_rows"] = uniform(wave_sum(active.select(1, 0)))
     c["ix_active_prefix"] = wave_incl_scan(active.select(1, 0), lane) - 1

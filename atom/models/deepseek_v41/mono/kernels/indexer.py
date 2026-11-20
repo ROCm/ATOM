@@ -27,13 +27,9 @@ from atom.models.deepseek_v41.mono.indexer_build import (
 )
 from atom.models.deepseek_v41.mono.kernels import index_select_plan as isp
 from atom.models.deepseek_v41.mono.kernels.attn_pre import (
-    HIDDEN,
     Q_RANK,
     QX8_WORDS,
-    gemv_fp8_loads,
-    iq_rope,
     lds_row,
-    stage_iq,
     tile_rows,
     token_tiles,
 )
@@ -42,17 +38,10 @@ from atom.models.deepseek_v41.mono.kernels.index_project_group import (
     head_weight,
     project_group,
 )
-from atom.models.deepseek_v41.mono.kernels.index_query import (
-    IW_TASKS,
-    stage_iquant,
-    stage_iw,
-)
 from atom.models.deepseek_v41.mono.kernels.index_score import (
-    run_indexer,
     stage_ilist,
 )
 from atom.models.deepseek_v41.mono.kernels.index_score_fp4 import run_scores4
-from atom.models.deepseek_v41.mono.kernels.index_select_plan import SelectionPlan
 from atom.models.deepseek_v41.mono.kernels.index_tp_radix import (
     run_splits,
 )
@@ -71,17 +60,15 @@ from atom.mono.device.ops import (
     kernel_symbol,
     launcher,
     ld_i32,
-    memrealtime,
     read_lane_i32,
     rsrc,
-    st_dev,
     traced,
     uniform,
     wave_incl_scan,
     wave_max,
 )
 from atom.mono.device.ranks import peer_bases
-from atom.mono.device.sync import publish, shift, sreg
+from atom.mono.device.sync import publish, sreg
 from atom.mono.plan.arith import pick
 from atom.mono.plan.build_key import key_tuple
 from atom.mono.plan.execution import BLOCKS, THREADS, WAVES, first_task
@@ -99,11 +86,11 @@ def _tree(c, s, bid, kind, bound_max, base=0):
 @traced
 def _tree_local(c, s, bid, kind, bound_max, base=0):
     """Dispatch against this step's largest bound; keep mailbox strides fixed."""
-    plan = SelectionPlan(isp.segment_for(c["select_seg"], kind))
+    segment = isp.segment_for(c["select_seg"], kind)
     raw_max = uniform(wave_max(ld_i32(c["args"]["ibound"], fx.min(c["lane"], s - 1))))
-    for level in range_constexpr(plan.top_level(kind, bound_max) + 1):
-        slots = isp.list_count(
-            plan.SEG, ip.kind_bound(kind, raw_max), level, ip.KINDS[kind]
+    for level in range_constexpr(ip.top_level(kind, bound_max, seg=segment) + 1):
+        slots = ip.list_count(
+            ip.kind_bound(kind, raw_max), level, ip.KINDS[kind], seg=segment
         )
         for task in range(first_task(bid, base), s * slots, BLOCKS):
             # Distribute each segment across the rows before its successor;
@@ -118,7 +105,6 @@ def _tree_local(c, s, bid, kind, bound_max, base=0):
 @traced
 def _tree_tp(c, s, bid, kind, bound_max, base=0):
     segment = c["block_select_seg"] if kind == "blk" else c["select_seg"]
-    plan = SelectionPlan(segment)
     lane = c["lane"]
     mode, owner, _first, raw = row_work(c, fx.min(lane, s - 1))
     bound = ip.kind_bound(kind, raw)
@@ -127,9 +113,9 @@ def _tree_tp(c, s, bid, kind, bound_max, base=0):
         eligible = eligible & (
             (mode == tp.SPLIT) if c["select_split"] else (mode != tp.SPLIT)
         )
-    for level in range_constexpr(plan.top_level(kind, bound_max) + 1):
+    for level in range_constexpr(ip.top_level(kind, bound_max, seg=segment) + 1):
         count = eligible.select(
-            isp.list_count(segment, bound, level, ip.KINDS[kind]), fx.Int32(0)
+            ip.list_count(bound, level, ip.KINDS[kind], seg=segment), fx.Int32(0)
         )
         end = wave_incl_scan(count, lane)
         start = end - count
@@ -154,26 +140,11 @@ def _tree_tp(c, s, bid, kind, bound_max, base=0):
 
 @traced
 def _run_fp4_local(c, s, bid, bound_max):
-    _stamp(c, 3)
     run_scores4(c, 0, s, bid, ip.chunks(bound_max))
-    _stamp(c, 4)
     next_base = _tree(c, s, bid, "sel", bound_max)
-    _stamp(c, 5)
     if const_expr(not c.get("full_only", False)):  # noqa: SIM102
         if c["args"]["iprod"] != 0:
             _tree(c, s, bid, "blk", bound_max, next_base)
-    _stamp(c, 6)
-
-
-@traced
-def _stamp(c, phase):
-    if const_expr("timing" in c):  # noqa: SIM102
-        if c["tid"] == 0:
-            st_dev(
-                fx.Int32(memrealtime() & 0x7FFFFFFF),
-                c["timing"].value,
-                c["bid"] * 16 + phase,
-            )
 
 
 @traced
@@ -181,9 +152,7 @@ def _run_fp4_tp(c, key, peers, rank, ix_meta, step_fence):
     s = key.tokens
     if step_fence != 0:
         c["poll"]([(c["ix_fenced"], 0, 1)])
-    _stamp(c, 3)
     _run_tp_scores(c, key.world, rank, ix_meta)
-    _stamp(c, 4)
     bases = peer_bases(peers, key.world)
     co = {
         **c,
@@ -215,7 +184,7 @@ def _run_fp4_tp(c, key, peers, rank, ix_meta, step_fence):
     # two levels at the common TP2/TP4 160K sizes; owners keep 4K leaves
     # to distribute many independent rows across the whole CTA grid.
     next_base = _tree(
-        {**co, "select_seg": key.split_segment, "select_split": True},
+        {**co, "select_seg": 8192, "select_split": True},
         s,
         co["bid"],
         "sel",
@@ -224,30 +193,23 @@ def _run_fp4_tp(c, key, peers, rank, ix_meta, step_fence):
     next_base = _tree(
         {**co, "select_split": False}, s, co["bid"], "sel", key.bound_max, next_base
     )
-    _stamp(co, 5)
     if const_expr(not key.full_only):  # noqa: SIM102
         if co["args"]["iprod"] != 0:
-            if const_expr(key.radix_blocks):
-                next_base = run_splits(co, "blk", next_base)
-                _tree(
-                    {**co, "select_split": False},
-                    s,
-                    co["bid"],
-                    "blk",
-                    key.bound_max,
-                    next_base,
-                )
-            else:
-                _tree(co, s, co["bid"], "blk", key.bound_max, next_base)
-    _stamp(co, 6)
+            next_base = run_splits(co, "blk", next_base)
+            _tree(
+                {**co, "select_split": False},
+                s,
+                co["bid"],
+                "blk",
+                key.bound_max,
+                next_base,
+            )
     for t in range(co["bid"], s, BLOCKS):
         mode, owner, _first, _count = row_work(co, t)
         finish_row(co, t, "sel", mode, owner)
-        _stamp(co, 7)
         if const_expr(not key.full_only):  # noqa: SIM102
             if co["args"]["iprod"] != 0:
-                finish_row({**co, "tp_direct": key.radix_blocks}, t, "blk", mode, owner)
-        _stamp(co, 8)
+                finish_row({**co, "tp_direct": True}, t, "blk", mode, owner)
 
 
 @traced
@@ -290,43 +252,22 @@ def _load_latent(tid, qr, qr_scale, qxl, qxsl, t0, n):
     gpu.barrier()
 
 
-@traced
-def _iw_tile(c, tid, bid, hidden, nbl, first, n):
-    co = {**c, "S": n, "iw": shift(c["iw"], fx.Int64(first * ip.HEADS) * 8)}
-
-    def load_group(g, rows):
-        for u in range(tid, rows * HIDDEN // 2, THREADS):
-            v = bo.buffer_load(
-                rsrc(hidden),
-                (first + g) * (HIDDEN // 2) + u,
-                vec_width=1,
-                dtype=T.i32,
-                cache_modifier=CM_DEV,
-            )
-            fx.ptr_store(v, nbl + u)
-        gpu.barrier()
-
-    stage_iw(co, bid % IW_TASKS, HIDDEN, nbl, load_group)
-
-
 def build_indexer(key: IndexerBuild):
     s = key.tokens
     if not 1 <= s <= MAX_ROWS or key.bound_max <= 0:
         raise ValueError(f"unsupported V4.1 indexer build: {key}")
-    if key.mfma and not key.fp4:
-        raise ValueError("MFMA layout is an FP4 index plane")
-    if key.world not in (1, 2, 4, 8) or (key.world > 1 and not key.fp4):
+    if not key.fp4:
+        raise ValueError("standalone V4.1 indexer requires FP4")
+    if key.world not in (1, 2, 4, 8):
         raise ValueError("cross-TP V4.1 indexer requires FP4 and TP1/2/4/8")
-    if key.full_only and not key.fp4:
-        raise ValueError("FULL specialization requires FP4")
     layout = scratch_layout(key)
     keyed = key_tuple(key, SOURCES)
     rows = tile_rows(s)
     tiles = token_tiles(s)
     parts = 2 if s > 32 else 4
     split_weights = _split_weights(key)
-    plan = SelectionPlan(_select_segment(key))
-    sel = lds_words(plan.SEG // THREADS, fast_hist=True)
+    select_segment = _select_segment(key)
+    sel = lds_words(select_segment // THREADS, fast_hist=True)
     sel_hist, sel_buf = sel["hist"], sel["buf"]
     peer_topk = ip.TOPK if key.full_only else ip.TOPK_BLOCKS
     sel_keys = selection_keys(key)
@@ -336,7 +277,7 @@ def build_indexer(key: IndexerBuild):
         red: fx.Array[fx.Float32, WAVES * 2 * 64 * 4, 16]
         qxl: fx.Array[fx.Int32, rows * lds_row(QX8_WORDS), 16]
         qxsl: fx.Array[fx.Int32, rows * lds_row(Q_RANK // 32), 16]
-        nbl: fx.Array[fx.Int32, 1 if key.fp4 else min(s, WAVES) * HIDDEN // 2, 16]
+        nbl: fx.Array[fx.Int32, 1, 16]
         qbf: fx.Array[fx.BFloat16, rows * ip.DIM, 16]
 
     @fx.struct
@@ -349,11 +290,7 @@ def build_indexer(key: IndexerBuild):
         rc: fx.Array[fx.Int32, WAVES * 2, 16]
         rb: fx.Array[
             fx.Int32,
-            (
-                BLOCKS * 2
-                if key.world > 1 and key.radix_blocks and not key.full_only
-                else 1
-            ),
+            (BLOCKS * 2 if key.world > 1 and not key.full_only else 1),
             16,
         ]
 
@@ -372,9 +309,6 @@ def build_indexer(key: IndexerBuild):
         tp=key.world,
         po=key.peer_offset,
         pp=key.peer_plain,
-        timing=int(key.timing),
-        splitseg=key.split_segment,
-        radixblocks=int(key.radix_blocks),
         full=int(key.full_only),
     )
 
@@ -416,12 +350,12 @@ def build_indexer(key: IndexerBuild):
             "list_ready": True,
             "full_only": key.full_only,
             "tight_select_width": key.full_only,
-            "select_seg": plan.SEG,
-            "query_ready": key.fp4,
+            "select_seg": select_segment,
+            "query_ready": True,
             "query_parts": parts,
             "split_weights": split_weights,
             "single_row_full": True,
-            "index_fp4": key.fp4, "index_mfma": key.mfma,
+            "index_fp4": True, "index_mfma": key.mfma,
             "args": {
                 "iact": 1, "iq_w": iq_w, "iq_ws": iq_ws, "iw_w": iw_w,
                 "pos": pos, "cos": cos, "sin": sin,
@@ -438,7 +372,6 @@ def build_indexer(key: IndexerBuild):
         }  # fmt: skip
         for region, (off, _) in layout.items():
             c[region] = sreg(scratch, off, region)
-        _stamp(c, 0)
         short_step = fx.Boolean(True)
         if const_expr(key.world > 1):
             short_step = (ld_i32(ix_meta, 3) & 65536) != 0
@@ -455,94 +388,51 @@ def build_indexer(key: IndexerBuild):
                         False,
                     )
                 publish(c["put"], c["ix_fenced"], 0, 1, tid == 0)
-        _stamp(c, 1)
-        if const_expr(key.fp4):
-            for rep in range_constexpr(-(-(len(tiles) * ip.HEADS * parts) // BLOCKS)):
-                task = bid + rep * BLOCKS
-                for i, (t0, n) in enumerate(tiles):
-                    if (task >= i * ip.HEADS * parts) & (
-                        task < (i + 1) * ip.HEADS * parts
-                    ):
-                        _load_latent(tid, qr, qr_scale, pr.qxl.ptr, pr.qxsl.ptr, t0, n)
-                        project_group(
-                            c,
-                            hidden,
-                            t0,
-                            n,
-                            (task % (ip.HEADS * parts)) // parts,
-                            task % parts,
-                            parts,
-                            with_weight=not split_weights,
-                        )
-            if const_expr(split_weights):
-                first = (s + 1) // 2
-                for i, (t0, n) in enumerate(((0, first), (first, s - first))):
-                    start = len(tiles) * ip.HEADS * parts + i * ip.HEADS
-                    if (bid >= start) & (bid < start + ip.HEADS):
-                        head = bid - start
-                        head_weight(c, hidden, t0, n, head)
-                        publish(
-                            c["put"],
-                            c["iwready"],
-                            (t0 + tid) * ip.HEADS + head,
-                            1,
-                            tid < n,
-                        )
-        else:
-            task = first_task(bid, 0)
-            ops = gemv_fp8_loads(c, iq_w, iq_ws, Q_RANK, task)
-            for t0, n in tiles:
-                rope = iq_rope(c, task, t0, n)
-                _load_latent(tid, qr, qr_scale, pr.qxl.ptr, pr.qxsl.ptr, t0, n)
-                stage_iq(c, task, ops, t0, n, rope)
-
-            if const_expr(s >= WAVES):  # noqa: SIM102
-                if bid < (s // WAVES) * IW_TASKS:
-                    _iw_tile(
+        for rep in range_constexpr(-(-(len(tiles) * ip.HEADS * parts) // BLOCKS)):
+            task = bid + rep * BLOCKS
+            for i, (t0, n) in enumerate(tiles):
+                if (task >= i * ip.HEADS * parts) & (task < (i + 1) * ip.HEADS * parts):
+                    _load_latent(tid, qr, qr_scale, pr.qxl.ptr, pr.qxsl.ptr, t0, n)
+                    project_group(
                         c,
-                        tid,
-                        bid,
                         hidden,
-                        pr.nbl.ptr,
-                        (bid // IW_TASKS) * WAVES,
-                        WAVES,
+                        t0,
+                        n,
+                        (task % (ip.HEADS * parts)) // parts,
+                        task % parts,
+                        parts,
+                        with_weight=not split_weights,
                     )
-            if const_expr(s % WAVES):  # noqa: SIM102
-                if (bid >= (s // WAVES) * IW_TASKS) & (
-                    bid < ((s // WAVES) + 1) * IW_TASKS
-                ):
-                    _iw_tile(
-                        c, tid, bid, hidden, pr.nbl.ptr, (s // WAVES) * WAVES, s % WAVES
+        if const_expr(split_weights):
+            first = (s + 1) // 2
+            for i, (t0, n) in enumerate(((0, first), (first, s - first))):
+                start = len(tiles) * ip.HEADS * parts + i * ip.HEADS
+                if (bid >= start) & (bid < start + ip.HEADS):
+                    head = bid - start
+                    head_weight(c, hidden, t0, n, head)
+                    publish(
+                        c["put"],
+                        c["iwready"],
+                        (t0 + tid) * ip.HEADS + head,
+                        1,
+                        tid < n,
                     )
-            for task in range(first_task(bid, IW_TASKS), s * ip.HEADS, BLOCKS):
-                stage_iquant(c, task)
-        # Quantized Q and IW are plain buffers. Drain them before announcing
-        # this CTA; all resident CTAs finish projection before any scores read Q.
-        if const_expr(not key.fp4):
-            publish(c["put"], c["qdone"], bid, 1, tid == 0)
-            if tid < BLOCKS:
-                c["poll"]([(c["qdone"], tid, 1)])
-            gpu.barrier()
         c["sel_lds"] = {
             "keys": se.sk.ptr,
             "hist": se.sh.ptr,
             "buf": se.sb.ptr,
             "identities": se.si.ptr,
         }
-        _stamp(c, 2)
-        if const_expr(key.fp4):
-            if const_expr(key.world > 1):
-                # REINDEX has at most 2048 eight-row candidate blocks.
-                # Its compressed key set is cheaper to select locally than
-                # to split, merge and publish over the peer interconnect.
-                if short_step | (ilift != 0):
-                    _run_fp4_local(c, s, bid, key.bound_max)
-                else:
-                    _run_fp4_tp(c, key, peers, rank, ix_meta, step_fence)
-            else:
+        if const_expr(key.world > 1):
+            # REINDEX has at most 2048 eight-row candidate blocks.
+            # Its compressed key set is cheaper to select locally than
+            # to split, merge and publish over the peer interconnect.
+            if short_step | (ilift != 0):
                 _run_fp4_local(c, s, bid, key.bound_max)
+            else:
+                _run_fp4_tp(c, key, peers, rank, ix_meta, step_fence)
         else:
-            run_indexer(c, s, bid, key.bound_max)
+            _run_fp4_local(c, s, bid, key.bound_max)
         _ = keyed
 
     @launcher(name)

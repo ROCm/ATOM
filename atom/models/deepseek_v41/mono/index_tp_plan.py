@@ -15,6 +15,7 @@ from atom.mono.dsa_indexer.selection_plan import (
     DEFAULT_RADIX,
     ROW_COPIES,
     SHORT_VERIFY_CTX,
+    SPLIT_MIN,
     split_request_keys,
 )
 from atom.mono.plan.arith import sel
@@ -31,7 +32,7 @@ def kernel_world(world, rows, capacity):
     replicated local scorer. Wider buckets and longer deployments retain TP
     ownership/K splitting. The decision uses TP-uniform build parameters.
     """
-    return 1 if world > 1 and rows <= 8 and capacity <= 262144 else world
+    return 1 if world > 1 and rows <= 8 and capacity <= SPLIT_MIN else world
 
 
 def work_kind(request_bound, total, requests, world, local_step):

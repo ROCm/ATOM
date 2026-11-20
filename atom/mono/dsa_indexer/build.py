@@ -250,8 +250,7 @@ def dual_score_resources_fit(resources: list[dict]) -> bool:
 
 def short_decode_enabled(shape, rows, world, max_ctx, replicated, qlen):
     return (
-        envs.ATOM_MONO_K3_SHORT_DECODE
-        and replicated
+        replicated
         and world == 8
         and qlen == 1
         and 0 < rows <= MAX_LEGACY_TOKENS
@@ -259,4 +258,5 @@ def short_decode_enabled(shape, rows, world, max_ctx, replicated, qlen):
         and shape.fp4
         and shape.q_lora == 1536
         and not shape.rope_dim
+        and envs.ATOM_MONO_K3_SHORT_DECODE
     )

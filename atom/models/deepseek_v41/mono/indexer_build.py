@@ -7,7 +7,6 @@ from dataclasses import dataclass, replace
 from atom.models.deepseek_v41.mono import index_plan as ip
 from atom.models.deepseek_v41.mono import index_tp_plan as tp
 from atom.models.deepseek_v41.mono.kernels import index_select_plan as isp
-from atom.models.deepseek_v41.mono.kernels.index_select_plan import SelectionPlan
 from atom.mono.plan.execution import BLOCKS
 from atom.mono.plan.layout import pair_layout
 from atom.mono.runtime.abi import KernelAbi
@@ -25,9 +24,6 @@ class IndexerBuild:
     world: int = 1
     peer_offset: int = 0
     peer_plain: int = 0
-    timing: bool = False
-    radix_blocks: bool = True
-    split_segment: int = 8192
     full_only: bool = False
 
 
@@ -51,24 +47,22 @@ def _select_segment(key):
 def scratch_layout(key: IndexerBuild):
     segment = _select_segment(key)
     lists = {"isf": key.tokens * ip.chunks(key.bound_max), "irdy": key.tokens}
-    if key.timing:
-        lists["timing"] = BLOCKS * 16 // 2
     if key.world > 1:
         lists["ix_root_ready"] = key.tokens * (1 if key.full_only else len(tp.KINDS))
         lists["ix_fenced"] = 1
-        if key.radix_blocks and not key.full_only:
+        if not key.full_only:
             lists["ix_rowhist"] = tp.row_hist_words(key.tokens) // 2
             lists["ix_segment_ready"] = key.tokens * len(tp.KINDS) * BLOCKS * 2
             lists["ix_emitted_ready"] = key.tokens * len(tp.KINDS) * BLOCKS
             lists["ix_phase_ready"] = key.tokens * len(tp.KINDS) * 4 * 3
     for kind in (("sel",) if key.full_only else ip.KINDS):
-        plan = (
-            SelectionPlan(8192 if kind == "blk" else 4096)
+        tree_segment = (
+            (8192 if kind == "blk" else 4096)
             if key.world > 1
-            else SelectionPlan(isp.segment_for(segment, kind))
+            else isp.segment_for(segment, kind)
         )
-        for level in range(plan.top_level(kind, key.bound_max)):
-            slots = plan.list_slots(kind, level, key.bound_max)
+        for level in range(ip.top_level(kind, key.bound_max, seg=tree_segment)):
+            slots = ip.list_slots(kind, level, key.bound_max, seg=tree_segment)
             lists[f"i{kind}{level}"] = key.tokens * slots * ip.KINDS[kind] * 2
             lists[f"i{kind}ready{level}"] = key.tokens * slots
     return pair_layout(

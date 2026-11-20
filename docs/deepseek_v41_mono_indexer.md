@@ -82,21 +82,23 @@ at most 64 query rows; ordinary layer Mono retains its 48-row cap. Builds
 with private scratch are refused collectively. Prefill, incompatible inputs,
 unsupported widths and refused builds use the existing path.
 
-FP8 index caches and attention DP retain their existing indexers.
+FP8 index caches retain their existing indexers. Attention DP2/4 is explicit opt-in as described below.
 A successfully installed DSpark HI hook retains its embedded indexer;
 install-time refusals under auto follow the ordinary route described below.
-At TP2 without attention DP, FP4 widths of 40 rows or more use native layers
+At TP2 without attention DP, FP4 widths 40–64 use native layers
 with the standalone indexer: the ordinary layer route was slower there in
 the earlier measurements. No aiter source or query-interface change is needed.
 
 ## DP attention and HI routing
 
-The standalone indexer is disabled under DP attention, including when
-`ATOM_DSV41_MONO_INDEXER=1` is explicitly set. Each attention-DP rank owns
-different requests and cache rows, so the replicated-cache TP ownership and
-K-splitting protocol cannot merge these ranks' selections. Supported DP
-layer Mono keeps its existing embedded indexer; unsupported layer steps use
-native attention. Non-DP standalone-indexer timings do not qualify DP gains.
+Attention DP2/4 can opt in with `ATOM_DSV41_MONO_INDEXER=1`; the default
+retains the existing embedded/native indexer. Each attention rank owns different
+requests and cache rows. Its standalone indexer uses a world-1 binary and its
+own cache: it never exchanges keys or selections with the other DP ranks.
+DP2 can retain ordinary layer Mono with its indexer apart; DP4 uses native
+layers plus the standalone indexer. DP8, HI combinations and FP8 index caches
+keep their existing paths. Non-DP TP timings do not establish DP gains.
+
 
 Successful HI installation keeps its own indexer on both HI-served steps and
 its per-step fallback. An install-time refusal with `ATOM_DSV41_MONO_HI=auto`
@@ -126,11 +128,11 @@ partial final six-query group. Differential tests qualify those tails against
 its one-query scorer using the same pages. This test workaround does not
 modify aiter or establish that the native partial-group bug is fixed.
 
-Manual qualification from the ATOM repository root:
+Manual qualification from the ATOM repository root (set the checkpoint path for your deployment):
 
 ```bash
 export PYTHONPATH=.
-export ATOM_DSV41_CHECKPOINT=/data/models/deepseek-ai/DeepSeek-V4.1-Flash
+export ATOM_DSV41_CHECKPOINT=/path/to/DeepSeek-V4.1-Flash
 export ATOM_MONO_ENABLE=1 ATOM_DSV41_MONO_INDEXER=1
 pytest -q tests/models/deepseek_v41/test_mono_indexer.py
 
@@ -145,7 +147,7 @@ HIP_VISIBLE_DEVICES=1,3,2,0 TP_POINTS=1:8192:1,1:163840:1,12:163840:6 \
 
 # Actual short and ~25.6K prompt generation, supported level3/FULL graphs.
 HIP_VISIBLE_DEVICES=1,3,2,0 ATOM_DSV41_MONO_HI=0 \
-  torchrun --standalone --nproc-per-node=4 "$V/validate_tp4_cross_level3.py"
+  ATOM_DSV41_INTEGRATION=1 pytest -q tests/models/deepseek_v41/test_mono_indexer_integration.py
 ```
 
 The HIP order above is specific to the validation machine. Select devices
@@ -354,12 +356,35 @@ before KV allocation rather than added afterward.
 - HI install-refusal tests cover unset and explicit-off indexer flags. A
   successfully installed HI hook retains its embedded indexer on per-step
   fallback; an auto install refusal follows the ordinary indexer flag.
-- DP attention still disables the standalone hook, even with flag 1. Its
-  existing embedded/native indexers remain; these non-DP results establish no
-  DP performance gain. TP2/TP4 ordinary FP4 defaults stay on, TP8 is explicit
+- The results in this historical round did not cover DP support. Current
+  attention DP2/4 support is explicit opt-in and is qualified separately below. TP2/TP4 ordinary FP4 defaults stay on, TP8 is explicit
   opt-in, and the K3 short-decode switch stays default-off.
 
 The earlier complete TP2 5-shot GSM8K and TP4 frozen long-context regression
 on 4ec57 are retained in the PR. Earlier performance and larger long-context
 datasets keep their original source attribution; they were not rerun here.
 aiter remains clean at `b5b4bf978160b2d495e59b163e932fadc584675d`.
+
+## Attention DP qualification and draft lifecycle correction
+
+The opt-in DP implementation was tested at source `6591a1ccfa96d05c9d335551c17079509dbd1ce9`.
+DP4 qlen1 full GSM8K (1,319, three-shot) scored 1,167 strict answers with flag 0
+and 1,173 with flag 1 (+0.455 percentage points). This is an observed paired
+result, not an equivalence guarantee. DP2/qlen6 covered only a 128-question subset.
+DP2/qlen6 long-context UUID checks had one real answer failure out of eleven:
+at 163,456 prompt tokens the expected `d14e72d7-a502-4d36-9454-537bc9acc2ec`
+was returned with a changed prefix. Long-context DP accuracy remains open.
+
+Thirty-eight follow-up serving runs on that source found DP4/qlen6 8K text
+requests faster (TPOT 3.093 to 2.442 ms), while two tokenized workloads were
+3.7% and 5.2% slower. The indexer itself used 8 launches rather than 47 and
+234 rather than 291 microseconds. Whole-model performance includes DP sync,
+mixed prefill, speculative verification and scheduling; indexer savings do
+not guarantee a gain for each workload. DP remains explicit opt-in.
+
+Review found that the DSpark draft runner bypasses the target constructor and
+lacked `indexer_workspace`, so inherited allocation could refuse the draft
+Mono route. A class default fixes that lifecycle. Earlier DSpark results,
+including the CI-configuration round above, were recorded with this draft
+refusal and do not qualify the restored draft execution path. Current-source
+DSpark route and accuracy checks must be reported separately.

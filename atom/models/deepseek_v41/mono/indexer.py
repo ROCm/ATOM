@@ -23,7 +23,6 @@ from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
 from atom.mono.runtime.lifecycle import owned_peer_buffer
 from atom.mono.runtime.mailboxes import StepMailboxes
 from atom.mono.runtime.step_begin import FENCE_BYTES
-from atom.mono.runtime.uncached import uncached_bytes
 from atom.mono.runtime.widths import WidthBuilds
 
 logger = logging.getLogger("atom")
@@ -41,11 +40,13 @@ class MonoIndexer:
         group=None,
         *,
         replicated=True,
-        workspace=None,
+        workspace,
     ):
+        if not fp4:
+            raise MonoUnsupported("standalone V4.1 indexer requires FP4")
         self.workspace = workspace
         self.model, self.fp4 = model, fp4
-        self.layout = layout if fp4 else "fp8"
+        self.layout = layout
         self.bound_max = ip.cdiv(max_model_len, ip.CHUNK) * ip.CHUNK
         self.world = (
             torch.distributed.get_world_size(group)
@@ -111,10 +112,7 @@ class MonoIndexer:
 
     def _bind(self):
         props = torch.cuda.get_device_properties(torch.cuda.current_device())
-        if (
-            "gfx950" not in getattr(props, "gcnArchName", "")
-            or props.multi_processor_count != BLOCKS
-        ):
+        if "gfx950" not in props.gcnArchName or props.multi_processor_count != BLOCKS:
             raise MonoUnsupported("V4.1 indexer requires 256 gfx950 CUs")
         self.weights = {}
         for block in self.model.layers:
@@ -156,7 +154,7 @@ class MonoIndexer:
                 for t in (rope.cos_cache, rope.sin_cache)
             ):
                 raise MonoUnsupported("V4.1 indexer RoPE table")
-        if self.layout not in ("fp8", "mfma", "preshuffle"):
+        if self.layout not in ("mfma", "preshuffle"):
             raise MonoUnsupported(f"V4.1 index layout {self.layout}")
         dev = torch.device("cuda", torch.cuda.current_device())
         if any(t.device != dev for values in self.weights.values() for t in values):
@@ -167,95 +165,46 @@ class MonoIndexer:
             for t in (rope.cos_cache, rope.sin_cache)
         ):
             raise MonoUnsupported("V4.1 indexer RoPE must be on this rank's GPU")
-        s, width = self.max_rows, self.bound_max
+        s = self.max_rows
         workspace = self.workspace
-        if workspace is not None:
-            self.scratch = workspace.scratch
-            self.local_scratch = workspace.local_scratch
-        else:
-            self.scratch = uncached_bytes(build.scratch_bytes(self._key(s)), dev)
-            if self.fp4 and any(
-                block.attn.indexer is not None
-                and block.attn.indexer.spec.candidate_source is not None
-                for block in self.model.layers
-            ):
-                self.local_scratch = uncached_bytes(
-                    build.scratch_bytes(build.reindex_build(self._key(s))), dev
-                )
-        self.full_ratio = (
-            min(
-                (
-                    block.attn.indexer.spec.ratio
-                    for block in self.model.layers
-                    if block.attn.indexer is not None
-                    and block.attn.indexer.spec.candidate_source is None
-                    and not block.attn.indexer.spec.produces_candidates
-                ),
-                default=None,
-            )
-            if self.fp4
-            else None
+        self.scratch, self.local_scratch, self.full_scratch = (
+            workspace.scratch,
+            workspace.local_scratch,
+            workspace.full_scratch,
         )
-        if workspace is not None:
-            self.full_scratch = workspace.full_scratch
-        elif self.full_ratio is not None:
-            self.full_scratch = uncached_bytes(
-                build.scratch_bytes(self._full_key(s)), dev
-            )
-        # Projection and scoring exchange these plain rows within one launch
-        # across XCDs. As with the tagged scratch, keep them uncached: draining
-        # the producer's stores alone does not invalidate a consumer's cache.
-        if workspace is not None:
-            self.iq, self.iqs, self.iw = workspace.iq, workspace.iqs, workspace.iw
-            self.ilog, self.ibmax, self.selected = (
-                workspace.ilog,
-                workspace.ibmax,
-                workspace.selected,
-            )
-        else:
-            self.iq = (
-                uncached_bytes(s * ip.HEADS * ip.DIM // (2 if self.fp4 else 1), dev)
-                .view(torch.uint8 if self.fp4 else torch.float8_e4m3fn)
-                .view(s, ip.HEADS, ip.DIM // (2 if self.fp4 else 1))
-            )
-            self.iqs = (
-                uncached_bytes(s * (ip.QS_BYTES if self.fp4 else ip.HEADS * 4), dev)
-                .view(torch.uint8 if self.fp4 else torch.float32)
-                .view(s, ip.QS_BYTES if self.fp4 else ip.HEADS)
-            )
-            self.iw = (
-                uncached_bytes(s * ip.HEADS * 4, dev)
-                .view(torch.float32)
-                .view(s, ip.HEADS)
-            )
-            self.ilog = torch.empty(s, width, device=dev, dtype=torch.float32)
-            self.ibmax = torch.empty(
-                s, ip.blocks(width), device=dev, dtype=torch.float32
-            )
-            self.selected = {
-                i: torch.empty(s, ip.TOPK, device=dev, dtype=torch.int32)
-                for i in self.weights
-            }
+        self.full_ratio = min(
+            (
+                block.attn.indexer.spec.ratio
+                for block in self.model.layers
+                if block.attn.indexer is not None
+                and block.attn.indexer.spec.candidate_source is None
+                and not block.attn.indexer.spec.produces_candidates
+            ),
+            default=None,
+        )
+        # All paths share the uncached producer/consumer projection rows.
+        self.iq, self.iqs, self.iw = workspace.iq, workspace.iqs, workspace.iw
+        self.ilog, self.ibmax, self.selected = (
+            workspace.ilog,
+            workspace.ibmax,
+            workspace.selected,
+        )
         self.irow = torch.empty(s, ip.TOPK, device=dev, dtype=torch.int32)
         self.candidates = torch.empty(s, ip.TOPK_BLOCKS, device=dev, dtype=torch.int32)
         self.ring_rel = torch.empty(s, device=dev, dtype=torch.int32)
         self.kmeta = torch.empty(s, KMETA, device=dev, dtype=torch.int32)
         self.ix_meta = torch.empty(s, 4, device=dev, dtype=torch.int32)
-        self.walk_plans = (
-            {
-                r: torch.empty(BLOCKS, 4, device=dev, dtype=torch.int32)
-                for r in sorted(
-                    {
-                        b.attn.spec.ratio
-                        for b in self.model.layers
-                        if b.attn.indexer is not None
-                        and b.attn.spec.candidate_source is None
-                    }
-                )
-            }
-            if self.fp4
-            else {}
-        )
+        self.walk_plans = {
+            r: torch.empty(BLOCKS, 4, device=dev, dtype=torch.int32)
+            for r in sorted(
+                {
+                    b.attn.spec.ratio
+                    for b in self.model.layers
+                    if b.attn.indexer is not None
+                    and b.attn.spec.candidate_source is None
+                }
+            )
+        }
 
     def _key(self, rows):
         world = tp.kernel_world(self.world, rows, self.bound_max)
@@ -385,15 +334,12 @@ class MonoIndexer:
                 step, spec.candidate_source, spec.ratio
             )
             table, bound = bound_candidates.table, bound_candidates.context
-        elif self.fp4:
+        else:
             per_page = geometry.index_blocks_per_page(spec.ratio)
             if per_page & (per_page - 1):
                 return False
             shift = per_page.bit_length() - 1
             table, bound = step.block_tables, step.visible[spec.ratio]
-            candidates = self.candidates[:rows]
-        else:
-            table, bound = cache.unit_tiles(step, spec.ratio), step.visible[spec.ratio]
             candidates = self.candidates[:rows]
         positions = cache.rope_positions(step)
         inputs = (
@@ -444,10 +390,8 @@ class MonoIndexer:
                 "iqs": p(self.iqs),
                 "iw": p(self.iw),
                 "plane": p(units.values),
-                "pscale": p(units.scales) if self.fp4 else 0,
-                "iplan": (
-                    p(self.walk_plans[spec.ratio]) if self.fp4 and not reindex else 0
-                ),
+                "pscale": p(units.scales),
+                "iplan": (p(self.walk_plans[spec.ratio]) if not reindex else 0),
                 "itab": p(table),
                 "itab_stride": table.stride(0),
                 "itab_len": table.shape[1],

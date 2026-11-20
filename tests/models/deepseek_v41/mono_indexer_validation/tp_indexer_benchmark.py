@@ -4,7 +4,6 @@ import json
 import os
 import statistics
 import subprocess
-from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -16,17 +15,11 @@ from aiter.dist.parallel_state import (
 
 from atom.models.deepseek_v41.mono.index_tp_plan import reference_work
 from atom.models.deepseek_v41.mono.indexer import MonoIndexer
+from atom.models.deepseek_v41.mono.indexer_workspace import IndexerWorkspace
 from atom.mono.runtime.compile import launcher_resources
 from tests.models.deepseek_v41.test_mono_indexer import make_case
 
-
-class BenchIndexer(MonoIndexer):
-    def _key(self, rows):
-        return replace(
-            super()._key(rows),
-            split_segment=int(os.environ.get("TP_SPLIT_SEG", "8192")),
-            radix_blocks=os.environ.get("TP_DIRECT", "1") == "1",
-        )
+BenchIndexer = MonoIndexer
 
 
 assert os.environ.get("ATOM_DSV41_CHECKPOINT"), "Real checkpoint weights required"
@@ -45,9 +38,10 @@ reports = []
 out = Path(
     os.environ.get(
         "TP_OUTPUT",
-        f"/app/dsv41-mono-indexer/validation/tp{world}-cross-first-performance.json",
+        f"validation/tp{world}-cross-first-performance.json",
     )
 )
+out.parent.mkdir(parents=True, exist_ok=True)
 
 
 def capture(fn):
@@ -115,7 +109,14 @@ for point in points:
             pad=False,
         )
         local = case.runner
-        coop = BenchIndexer(local.model, context + 128, True, "mfma", group)
+        coop = BenchIndexer(
+            local.model,
+            context + 128,
+            True,
+            "mfma",
+            group,
+            workspace=IndexerWorkspace(local.model, context + 128, world),
+        )
         for r in (local, coop):
             assert r.prepare(rows)
             r.active = True
@@ -163,7 +164,7 @@ for point in points:
         )
         item = {
             "checkpoint": os.environ["ATOM_DSV41_CHECKPOINT"],
-            "split_segment": int(os.environ.get("TP_SPLIT_SEG", "8192")),
+            "split_segment": 8192,
             "tp": world,
             "kernel_tp": selected_world,
             "execution": "+".join(modes),

@@ -13,17 +13,14 @@ from aiter.dist.parallel_state import (
 )
 
 from atom.models.deepseek_v41.mono.indexer import MonoIndexer
+from atom.models.deepseek_v41.mono.indexer_workspace import IndexerWorkspace
 from atom.models.deepseek_v41.mono.runner import V41MonoDecodeRunner
 from tests.models.deepseek_v41.test_mono_indexer import make_case
 
 
 class SwitchIndexer(MonoIndexer):
     def _key(self, rows):
-        key = replace(
-            super()._key(rows),
-            radix_blocks=os.environ.get("TP_DIRECT", "1") == "1",
-            split_segment=int(os.environ.get("TP_SPLIT_SEG", "8192")),
-        )
+        key = super()._key(rows)
         return (
             replace(key, world=self.world, peer_plain=self.peer_plain)
             if os.environ.get("TP_FORCE_COOP") == "1"
@@ -41,7 +38,14 @@ tested = 0
 
 for candidate, reindex in ((False, False), (True, False), (False, True)):
     case = make_case(8, 163840, 1, "mfma", candidate=candidate, reindex=reindex)
-    runner = SwitchIndexer(case.runner.model, 163968, True, "mfma", group)
+    runner = SwitchIndexer(
+        case.runner.model,
+        163968,
+        True,
+        "mfma",
+        group,
+        workspace=IndexerWorkspace(case.runner.model, 163968, world),
+    )
     assert runner.prepare(8)
     runner.active = True
 

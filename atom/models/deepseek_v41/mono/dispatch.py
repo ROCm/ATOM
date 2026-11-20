@@ -11,6 +11,8 @@ The configuration is checked once (``config.config_refusal``). A target step
 is then routed only when it is a decode (a DSpark verify of any length a
 request, or a token a request) of up to ``MAX_ROWS`` rows (a graph's padding
 rows included), however many requests they are and however they split them.
+At TP2 FP4 without DP, widths 40–48 instead use native layers with the
+standalone indexer when enabled; native indexer hooks support up to 64 rows.
 The DSpark draft model is wrapped the same way (``MonoDraftModel``): its block backbone of
 up to ``MAX_REQUESTS`` requests runs on ``draft_runner``, after a prefill as
 after a decode. Every per-step input read is TP-uniform: the kernels wait on
@@ -211,7 +213,7 @@ def _install_layer_decode(
     dp_ranks = dp_attention_ranks(atom_config)
     # The decoder layers on the high-interactivity monokernels where they serve
     # this deployment (``hi_gate``: ATOM_DSV41_MONO_HI, "auto" by default); any
-    # other takes ATOM's mono decode below, unchanged.
+    # other takes ordinary decode below and follows its indexer flag.
     # A mismatch only the loaded model shows (``MonoUnsupported``, agreed over
     # the TP group before anything is built: ``install_hi``) falls back as the
     # gate's refusals do, on every rank.

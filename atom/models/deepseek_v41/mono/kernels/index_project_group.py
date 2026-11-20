@@ -5,7 +5,6 @@
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr
-from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
 from atom.models.deepseek_v41.mono import index_plan as ip
@@ -16,18 +15,14 @@ from atom.models.deepseek_v41.mono.kernels.attn_pre import (
     _fp8_step_mfma,
 )
 from atom.models.deepseek_v41.mono.kernels.index_query import (
-    FP4_MIN_AMAX,
     IDX_WEIGHTS_SCALE,
-    _e2m1,
-    _wv_reduce,
+    head_weight_sum,
+    quantize_fp4_pair,
 )
 from atom.mono.device.ops import (
     CM_DEV,
     CM_NT,
     bf16_round,
-    bf_hi,
-    bf_lo,
-    butterfly,
     ld_i32,
     rsrc,
     traced,
@@ -73,22 +68,9 @@ def head_weight(c, hidden, t0, n, h):
                 )
                 for k0 in ks
             ]
-            total = fx.Float32(0.0)
-            for i in range_constexpr(len(ks)):
-                ax, ay = [bf_lo(xv[i][j]) for j in range(4)], [
-                    bf_hi(xv[i][j]) for j in range(4)
-                ]
-                bx, by = [bf_lo(wv[i][j]) for j in range(4)], [
-                    bf_hi(wv[i][j]) for j in range(4)
-                ]
-                accx, accy = ax[0] * bx[0], ay[0] * by[0]
-                for j in range_constexpr(1, 4):
-                    accx = fx.Float32(fmath.fma(ax[j], bx[j], accx))
-                    accy = fx.Float32(fmath.fma(ay[j], by[j], accy))
-                total = fx.Float32(
-                    (ks[i] + lane * 8 < HIDDEN).select(total + (accx + accy), total)
-                )
-            weight = bf16_round(_wv_reduce(total, lane)) * fx.Float32(IDX_WEIGHTS_SCALE)
+            weight = bf16_round(head_weight_sum(xv, wv, ks, HIDDEN, lane)) * fx.Float32(
+                IDX_WEIGHTS_SCALE
+            )
             if lane == 0:
                 bo.buffer_store(weight, rsrc(a["iw_out"]), tok * ip.HEADS + h)
 
@@ -148,13 +130,7 @@ def project_group(c, hidden, t0, n, h, group, parts, with_weight=True):
         x1 = bf16_round(
             (group * (width // 32) + rp // 16 >= 2).select(v0 * sn + v1 * cs, v1)
         )
-        amax = butterfly(fx.max(abs(x0), abs(x1)), (1, 2, 4, 8), fx.max)
-        bits = (fx.max(amax, fx.Float32(FP4_MIN_AMAX)) * fx.Float32(1 / 6)).bitcast(
-            fx.Int32
-        )
-        code = (bits >> 23) + ((bits & 0x7FFFFF) != 0).select(fx.Int32(1), fx.Int32(0))
-        inv = ((fx.Int32(254) - code) << 23).bitcast(fx.Float32)
-        byte = _e2m1(x0 * inv) | (_e2m1(x1 * inv) << 4)
+        byte, code = quantize_fp4_pair(x0, x1)
         bo.buffer_store(
             fx.Int8(byte),
             rsrc(a["iq_out"]),

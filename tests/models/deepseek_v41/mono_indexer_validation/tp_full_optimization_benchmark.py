@@ -4,7 +4,6 @@ import json
 import os
 import statistics
 import subprocess
-from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,6 +16,7 @@ from aiter.dist.parallel_state import (
 
 from atom.models.deepseek_v41.mono.index_tp_plan import reference_work
 from atom.models.deepseek_v41.mono.indexer import MonoIndexer
+from atom.models.deepseek_v41.mono.indexer_workspace import IndexerWorkspace
 from atom.models.deepseek_v41.mono.runner import V41MonoDecodeRunner
 from atom.mono.runtime.compile import launcher_resources
 from tests.models.deepseek_v41.test_mono_indexer import make_case
@@ -27,19 +27,11 @@ class BaselineIndexer(MonoIndexer):
         super()._bind()
         self.full_scratch = None
 
-    def _key(self, rows):
-        return replace(
-            super()._key(rows),
-            split_segment=int(os.environ.get("TP_SPLIT_SEG", "8192")),
-            radix_blocks=os.environ.get("TP_DIRECT", "1") == "1",
-        )
-
 
 assert os.environ.get("ATOM_DSV41_CHECKPOINT"), "Real checkpoint weights required"
 rank = int(os.environ["RANK"])
 world = int(os.environ["WORLD_SIZE"])
 assert world in (2, 4)
-assert os.environ["HIP_VISIBLE_DEVICES"] == ("1,3,2,0" if world == 4 else "1,3")
 torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 init_distributed_environment(world_size=world, rank=rank, local_rank=rank)
 initialize_model_parallel(tensor_model_parallel_size=world)
@@ -53,9 +45,10 @@ reports = []
 out = Path(
     os.environ.get(
         "TP_OUTPUT",
-        f"/app/dsv41-mono-indexer/validation/tp{world}-full-final-performance.json",
+        f"validation/tp{world}-full-final-performance.json",
     )
 )
+out.parent.mkdir(parents=True, exist_ok=True)
 
 
 def capture(fn):
@@ -122,8 +115,22 @@ for point in points:
             reindex=reindex,
             pad=False,
         )
-        local = BaselineIndexer(case.runner.model, context + 128, True, "mfma", group)
-        coop = MonoIndexer(local.model, context + 128, True, "mfma", group)
+        local = BaselineIndexer(
+            case.runner.model,
+            context + 128,
+            True,
+            "mfma",
+            group,
+            workspace=IndexerWorkspace(case.runner.model, context + 128, world),
+        )
+        coop = MonoIndexer(
+            local.model,
+            context + 128,
+            True,
+            "mfma",
+            group,
+            workspace=IndexerWorkspace(local.model, context + 128, world),
+        )
         for r in (local, coop):
             assert r.prepare(rows)
             r.active = True
@@ -203,7 +210,7 @@ for point in points:
         )
         item = {
             "checkpoint": os.environ["ATOM_DSV41_CHECKPOINT"],
-            "split_segment": int(os.environ.get("TP_SPLIT_SEG", "8192")),
+            "split_segment": 8192,
             "tp": world,
             "kernel_tp": selected_world,
             "execution": "+".join(modes),

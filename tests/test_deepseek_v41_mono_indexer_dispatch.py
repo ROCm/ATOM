@@ -123,6 +123,121 @@ def test_native_staging_is_joined_once_before_persistent_launch(gpu_module):
     staged.join.assert_called_once()
 
 
+def test_draft_constructor_reaches_parent_allocation_on_cpu(monkeypatch, gpu_module):
+    from atom.models.deepseek_v41.mono import draft_runner as draft_module
+    from atom.models.deepseek_v41.mono import runner as target_module
+
+    cls = draft_module.DraftMonoRunner
+    cfg = SimpleNamespace(
+        dspark_n_routed_experts=8,
+        dspark_num_experts_per_tok=2,
+        hc_mult=4,
+        hidden_size=8,
+        index_n_heads=32,
+        index_head_dim=128,
+    )
+    draft = SimpleNamespace(
+        config=cfg,
+        block_size=2,
+        mtp=[],
+        rope=SimpleNamespace(
+            cos_cache=torch.empty(1, 32, dtype=torch.bfloat16),
+            sin_cache=torch.empty(1, 32, dtype=torch.bfloat16),
+        ),
+    )
+    monkeypatch.setattr(cls, "_bind_agreed", lambda self, bind: bind())
+
+    def rank(self):
+        self.dp, self.tp, self.moe_tp = 1, 4, 4
+        self.dims = SimpleNamespace(heads=1)
+
+    monkeypatch.setattr(cls, "_bind_rank", rank)
+    monkeypatch.setattr(
+        cls,
+        "_post_key",
+        lambda self, rows: SimpleNamespace(halves=lambda: (None, None)),
+    )
+    for kernel in (
+        target_module.k1,
+        target_module.k2a,
+        target_module.k2b,
+        target_module.k2,
+    ):
+        monkeypatch.setattr(kernel, "scratch_bytes", lambda *args: 16)
+    monkeypatch.setattr(
+        target_module,
+        "uncached_bytes",
+        lambda size, dev: torch.empty(size, dtype=torch.uint8),
+    )
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    for name in ("empty", "zeros"):
+        original = getattr(torch, name)
+        monkeypatch.setattr(
+            torch,
+            name,
+            lambda *args, _fn=original, **kw: _fn(*args, **dict(kw, device="cpu")),
+        )
+    allocated = cls(draft)
+    assert allocated.positions.device.type == "cpu"
+    assert allocated.ilog.shape == (16, 0)
+    assert allocated.isel == {} and allocated.indexer_workspace is None
+    assert allocated.index_scratch is None
+
+
+@pytest.mark.parametrize("apart", [False, True])
+def test_forward_plans_indexer_only_when_apart(monkeypatch, gpu_module, apart):
+    from atom.models.deepseek_v41.mono import runner as rm
+
+    r = rm.V41MonoDecodeRunner.__new__(rm.V41MonoDecodeRunner)
+    r.indexer_apart, r.rank = apart, 1
+    key = SimpleNamespace(world=4)
+    r._indexer_key = Mock(return_value=key)
+    r._index_reset_buffers = Mock(return_value=((), ()))
+    r._use_rows = Mock()
+    r._own_rows = lambda rows: (0, rows)
+    r._tok_par = lambda rows: False
+    r._raise_on_given_up_waits = Mock()
+    r.mailboxes = SimpleNamespace(begin_step=Mock())
+    r.model = SimpleNamespace(
+        embed=lambda ids: torch.zeros(ids.numel(), 4),
+        config=SimpleNamespace(hc_mult=1),
+        begin_forward=Mock(),
+        end_forward=Mock(),
+        topology=[],
+        layers=[],
+    )
+    r.layers, r.build, r.timelines = [], SimpleNamespace(keys=[]), {}
+    r.ring_rel, r.key_meta, r.ix_meta, r.walk_plans = object(), object(), object(), {}
+    hidden = torch.zeros(1, 8, 4)
+    monkeypatch.setattr(
+        rm,
+        "SinglePassHCState",
+        SimpleNamespace(
+            from_embeddings=lambda *args: SimpleNamespace(collapse=lambda: hidden)
+        ),
+    )
+    geometry = SimpleNamespace(window=lambda *args: object())
+    metadata = SimpleNamespace(
+        cache=SimpleNamespace(packed=False, geometry=geometry, num_pages=1),
+        step=object(),
+        engram_embeddings=None,
+    )
+    monkeypatch.setattr(
+        rm, "get_forward_context", lambda: SimpleNamespace(attn_metadata=metadata)
+    )
+    meta = Mock()
+    monkeypatch.setattr(rm, "write_step_meta", meta)
+    ids = torch.arange(8)
+    assert r.forward(ids, ids).shape == (8, 4)
+    if apart:
+        r._indexer_key.assert_called_once_with(8)
+        r._index_reset_buffers.assert_called_once_with(key)
+    else:
+        r._indexer_key.assert_not_called()
+        r._index_reset_buffers.assert_not_called()
+    assert meta.call_args.kwargs["tp_world"] == (4 if apart else 1)
+
+
 def test_hi_fallback_does_not_enable_standalone_indexer(monkeypatch, dispatch_module):
     dispatch = dispatch_module
 
@@ -149,7 +264,9 @@ def test_dp_attention_keeps_rank_local_indexer_work(monkeypatch, gpu_module):
     monkeypatch.setattr(gpu_module, "WidthBuilds", lambda *args: object())
     peers = Mock()
     monkeypatch.setattr(gpu_module, "owned_peer_buffer", peers)
-    r = gpu_module.MonoIndexer(None, 163840, True, "mfma", object(), replicated=False)
+    r = gpu_module.MonoIndexer(
+        None, 163840, True, "mfma", object(), replicated=False, workspace=object()
+    )
     assert r.world == 1 and r.rank == 0 and r._key(8).world == 1
     peers.assert_not_called()
 
@@ -217,7 +334,7 @@ def test_layer_reset_preserves_candidate_data_and_separates_split_histograms(
     r.full_index_scratch = torch.full(
         (ib.scratch_bytes(full_key),), 7, dtype=torch.uint8
     )
-    resets, split_resets = r._index_reset_buffers(8)
+    resets, split_resets = r._index_reset_buffers(key)
     assert resets and len(split_resets) == 1
     assert (
         sum(x.numel() * x.element_size() for x in resets) < r.index_scratch.numel() // 2

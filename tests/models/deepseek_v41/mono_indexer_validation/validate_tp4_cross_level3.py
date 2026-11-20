@@ -12,12 +12,18 @@ from atom.config import CompilationConfig, Config, CUDAGraphMode
 from atom.model_engine.model_runner import ModelRunner
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence
-from atom.models.deepseek_v41.mono.indexer_dispatch import MonoIndexerModel
+from atom.models.deepseek_v41.mono.indexer_dispatch import (
+    MonoIndexerModel,
+    NativeDecodeModel,
+)
+from atom.models.deepseek_v41.mono.indexer_workspace import IndexerWorkspace
 from atom.sampling_params import SamplingParams
 
 rank = int(os.environ["RANK"])
 port = int(os.environ["MASTER_PORT"])
-model_path = "/data/models/deepseek-ai/DeepSeek-V4.1-Flash"
+model_path = os.environ["ATOM_DSV41_CHECKPOINT"]
+output_dir = Path(os.environ.get("TP_OUTPUT_DIR", "validation"))
+output_dir.mkdir(parents=True, exist_ok=True)
 test_sizes = (1, 8)
 result_file = os.environ.get(
     "TP4_TEST_OUTPUT", "tp4-cross-graph-level3-acceptance.json"
@@ -64,7 +70,12 @@ runner.allocate_kv_cache(2048)
 wrapped = runner.model
 installed = wrapped
 raw = installed.model.model
-native_indexer = MonoIndexerModel(raw, raw, cfg)
+native_indexer = MonoIndexerModel(
+    NativeDecodeModel(raw),
+    raw,
+    cfg,
+    workspace=IndexerWorkspace(raw, cfg.max_model_len, cfg.tensor_parallel_size),
+)
 # DSV4.1 supports runtime levels 0/3 and explicitly rejects torch.compile.
 compiled_native = raw
 compiled_native_indexer = native_indexer
@@ -277,9 +288,7 @@ try:
             reports[f"{tag}_{name}_bs{bs}"] = result
             if rank == 0:
                 print("TP4_GRAPH_CASE", tag, name, bs, json.dumps(result), flush=True)
-                Path("/app/dsv41-mono-indexer/validation", result_file).write_text(
-                    json.dumps(reports, indent=2)
-                )
+                (output_dir / result_file).write_text(json.dumps(reports, indent=2))
             if name == "native_mono_indexer":
                 assert native_indexer._mono.runner.widths._built
                 assert not native_indexer._mono.runner.widths._refused
@@ -312,9 +321,7 @@ try:
                     )
                 }
         reports["token_comparison"] = comparisons
-        Path("/app/dsv41-mono-indexer/validation", result_file).write_text(
-            json.dumps(reports, indent=2)
-        )
+        (output_dir / result_file).write_text(json.dumps(reports, indent=2))
         print("TOKEN_COMPARISON", json.dumps(comparisons), flush=True)
         print(
             "HEAD_CHECK_FINAL_RECORDS",

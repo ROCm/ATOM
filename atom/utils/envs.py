@@ -673,7 +673,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # K3 short qlen1 scheduling is opt-in pending separate GPU qualification.
     "ATOM_MONO_K3_SHORT_DECODE": lambda: os.getenv("ATOM_MONO_K3_SHORT_DECODE", "0")
     == "1",
-    # Ordinary gfx950 FP4 decode without DP: TP2/4 default on, TP8 explicit 1.
+    # Ordinary gfx950 FP4: TP2/4 default on; TP8 and attention DP2/4
+    # require explicit 1. DP selections stay local to each attention rank.
     # Installed HI and its per-step fallback keep their indexer. An auto HI
     # install refusal follows this ordinary route. Set 0 for embedded/native.
     "ATOM_DSV41_MONO_INDEXER": lambda: os.getenv("ATOM_DSV41_MONO_INDEXER", "1") == "1",

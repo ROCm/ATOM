@@ -21,9 +21,6 @@ OTHER = {
     "world": 2,
     "peer_offset": 4096,
     "peer_plain": 1 << 24,
-    "timing": True,
-    "radix_blocks": False,
-    "split_segment": 16384,
     "full_only": True,
 }
 
@@ -60,6 +57,11 @@ def test_one_indexer_field_changed_is_a_new_binary(tmp_path, monkeypatch, name):
     before = set(tmp_path.rglob("*.pkl"))
     _compile(BASE)
     assert set(tmp_path.rglob("*.pkl")) == before
+    if name == "fp4":
+        with pytest.raises(ValueError, match="requires FP4"):
+            _compile(dataclasses.replace(BASE, fp4=False))
+        assert set(tmp_path.rglob("*.pkl")) == before
+        return
     _compile(dataclasses.replace(BASE, **{name: OTHER[name]}))
     assert len(set(tmp_path.rglob("*.pkl"))) == len(before) + 1
 

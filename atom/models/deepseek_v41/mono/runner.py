@@ -6,11 +6,13 @@ forward that runs them.
 The forward is the model's own layer loop with each layer in two mono
 kernels: K1 (``kernels.attn_pre``) from the attention seam to the rotated query
 and the window row; K2 (``kernels.layer_post``) K2a (``kernels.attn_post``: a
-selecting layer's indexer, the sparse decode attention, the output projections,
+the embedded indexer when enabled, the sparse decode attention, the output projections,
 their all-reduce (in-kernel, over this runner's peer buffer), the FFN seam and
 ffn_norm) and K2b (``kernels.moe``: the MoE and its all-reduce) in one launch.
 ``ATOM_MONO_CHECK`` launches K2a and K2b apart, to compare each. Between the
-kernels the original modules still run the compressor and Engram.
+kernels the original modules still run the compressor and Engram. With
+``indexer_apart``, K1 exports normalized hidden/query latents and a separate
+Mono indexer selects keys before K2a; K2a then performs no index scoring.
 ``draft_runner`` runs the DSpark draft's layers on the same kernels.
 """
 
@@ -151,11 +153,13 @@ class V41MonoDecodeRunner:
     # small step's tasks end closer together. The outputs are the same to the
     # bit either way
     fine_ug_below = 7
-    # the index plane is FP4: K1 quantizes the indexer query for, and K2a
-    # scores with, ``index_score_fp4``
+    # Embedded FP4: K1 quantizes the indexer query and K2a scores it.
+    # With indexer_apart, the standalone kernel projects, quantizes and scores.
     index_fp4 = False
     index_layout = "fp8"
     indexer_apart = False
+    # DraftMonoRunner binds without the target constructor and has no indexer.
+    indexer_workspace = None
 
     def __init__(
         self,
@@ -179,6 +183,8 @@ class V41MonoDecodeRunner:
             config.tensor_parallel_size,
             dp_ranks=dp_attention_ranks(config) if config.enable_dp_attention else 0,
         )
+        if self.indexer_apart and indexer_workspace is None:
+            raise MonoUnsupported("standalone indexer requires its installed workspace")
         self.index_layout = (
             get_current_atom_config().index_cache_layout if index_fp4 else "fp8"
         )
@@ -616,17 +622,12 @@ class V41MonoDecodeRunner:
         # a scale a head, or E2M1 and E8M0s in the FP4 scorer's packed order
         # (its padding never written: zero, as ``pack_q_scales`` pads)
         heads, dim = config.index_n_heads, config.index_head_dim
-        if self.indexer_apart and workspace is not None:
+        if self.indexer_apart:
             self.iq, self.iq_scale, self.iw = (
                 workspace.iq[:s],
                 workspace.iqs[:s],
                 workspace.iw[:s],
             )
-        elif self.indexer_apart:
-            # These rows are handed across XCDs before the launch completes.
-            self.iq = uncached_bytes(s * heads * dim // 2, dev).view(s, heads, dim // 2)
-            self.iq_scale = uncached_bytes(s * ip.QS_BYTES, dev).view(s, ip.QS_BYTES)
-            self.iw = uncached_bytes(s * heads * 4, dev).view(f32).view(s, heads)
         else:
             if self.index_fp4:
                 self.iq = torch.empty(s, heads, dim // 2, device=dev, dtype=torch.uint8)
@@ -659,35 +660,14 @@ class V41MonoDecodeRunner:
             self.local_index_scratch = workspace.local_scratch
             self.full_index_scratch = workspace.full_scratch
         else:
-            self.index_scratch = (
-                uncached_bytes(ib.scratch_bytes(self._indexer_key(s)), dev)
-                if self.indexer_apart and self.index_bound_max
-                else None
-            )
-            self.local_index_scratch = (
-                uncached_bytes(
-                    ib.scratch_bytes(ib.reindex_build(self._indexer_key(s))), dev
-                )
-                if self.index_scratch is not None and self.indexer_has_reindex
-                else None
-            )
-            self.full_index_scratch = (
-                uncached_bytes(
-                    ib.scratch_bytes(
-                        ib.full_build(self._indexer_key(s), self.indexer_full_ratio)
-                    ),
-                    dev,
-                )
-                if self.index_scratch is not None
-                and self.indexer_full_ratio is not None
-                else None
-            )
+            self.index_scratch = None
+            self.local_index_scratch = None
+            self.full_index_scratch = None
         self.ix_meta = torch.empty(s, 4, device=dev, dtype=torch.int32)
 
-    def _index_reset_buffers(self, rows):
+    def _index_reset_buffers(self, key):
         """Only synchronization flags need clearing between indexer steps."""
         resets, split_resets = [], []
-        key = self._indexer_key(rows)
         builds = [
             (key, self.index_scratch),
             (ib.reindex_build(key), self.local_index_scratch),
@@ -718,7 +698,11 @@ class V41MonoDecodeRunner:
         rows = input_ids.numel()
         self._use_rows(rows)
         self.mailboxes.begin_step()
-        index_resets, split_index_resets = self._index_reset_buffers(rows)
+        index_key = self._indexer_key(rows) if self.indexer_apart else None
+        index_world = index_key.world if index_key is not None else 1
+        index_resets, split_index_resets = (
+            self._index_reset_buffers(index_key) if index_key is not None else ((), ())
+        )
         hidden = model.embed(input_ids).view(1, rows, -1)
         model.begin_forward(hidden, None)
         # Engram staging's side-stream all-gather spins on CUs until every
@@ -738,9 +722,9 @@ class V41MonoDecodeRunner:
             # embedded token-parallel scorer owns only this rank's rows.
             (0, rows) if self.indexer_apart else self._own_rows(rows),
             index_resets,
-            ix_meta=self.ix_meta if self._indexer_key(rows).world > 1 else None,
-            tp_world=self._indexer_key(rows).world,
-            tp_rank=self.rank if self._indexer_key(rows).world > 1 else 0,
+            ix_meta=self.ix_meta if index_world > 1 else None,
+            tp_world=index_world,
+            tp_rank=self.rank if index_world > 1 else 0,
             split_reset_buffers=split_index_resets,
         )
         state = SinglePassHCState.from_embeddings(hidden, model.config.hc_mult)

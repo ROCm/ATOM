@@ -91,10 +91,6 @@ LOCAL_SELECT_MAX = 8192
 CPS_LG_MAX = 8
 # the waves holding a step's segments, a thread each (``_sum_before``)
 BEFORE_WAVES = BLOCKS // 64
-# a row histogram word (``_row_add``): its count in the low COUNT_BITS (a
-# row's keys at most, ``kernel.unfit``), the segments added in above
-# a row histogram's copies: segment g adds into copy g % ROW_COPIES (a word
-# takes fewer atomics), its readers sum them
 
 # LDS ``rows`` words a row: context, keys here, long | split << 1 |
 # short-verify-step << 2. The last flag is uniform over rows and ranks.

@@ -79,6 +79,25 @@ def _wv_reduce(v, lane):
 
 
 @traced
+def head_weight_sum(xvs, wvs, ks, hidden, lane):
+    """wv_splitk's per-lane FMA order and cross-lane reduction, shared by K1
+    and the standalone projection; callers choose LDS or global loads."""
+    total = fx.Float32(0.0)
+    for i in range_constexpr(len(ks)):
+        xv, wv = xvs[i], wvs[i]
+        ax, ay = [bf_lo(xv[j]) for j in range(4)], [bf_hi(xv[j]) for j in range(4)]
+        bx, by = [bf_lo(wv[j]) for j in range(4)], [bf_hi(wv[j]) for j in range(4)]
+        accx, accy = ax[0] * bx[0], ay[0] * by[0]
+        for j in range_constexpr(1, 4):
+            accx = fx.Float32(fmath.fma(ax[j], bx[j], accx))
+            accy = fx.Float32(fmath.fma(ay[j], by[j], accy))
+        total = fx.Float32(
+            (ks[i] + lane * 8 < hidden).select(total + (accx + accy), total)
+        )
+    return _wv_reduce(total, lane)
+
+
+@traced
 def stage_iw(c, task, hidden, nbl, load_group):
     """Row ``task`` of weights_proj; wave w its tokens w, w + WAVES, ..., a group
     of WAVES tokens' normed rows at a time in LDS ``nbl`` (bf16 pairs,
@@ -113,29 +132,16 @@ def stage_iw(c, task, hidden, nbl, load_group):
         load_group(g, n)
         tl = fx.min(wave, n - 1)
         t = tl if g == 0 else tl + g
-        total = fx.Float32(0.0)
-        for i in range_constexpr(len(ks)):
-            k = ks[i] + lane * 8
-            live = k < hidden
-            kk = fx.min(k, hidden - 8)
-            xv = fx.Vector(
+        xvs = [
+            fx.Vector(
                 fx.ptr_load(
-                    nbl + ((tl * hidden + kk) // 2),
+                    nbl + (tl * hidden + fx.min(k0 + lane * 8, hidden - 8)) // 2,
                     result_type=fx.Vector.make_type(4, fx.Int32),
                 )
             )
-            wv = wvs[i]
-            ax = [bf_lo(xv[j]) for j in range(4)]
-            ay = [bf_hi(xv[j]) for j in range(4)]
-            bx = [bf_lo(wv[j]) for j in range(4)]
-            by = [bf_hi(wv[j]) for j in range(4)]
-            accx = ax[0] * bx[0]
-            accy = ay[0] * by[0]
-            for j in range_constexpr(1, 4):
-                accx = fx.Float32(fmath.fma(ax[j], bx[j], accx))
-                accy = fx.Float32(fmath.fma(ay[j], by[j], accy))
-            total = fx.Float32(live.select(total + (accx + accy), total))
-        w = _wv_reduce(total, lane)
+            for k0 in ks
+        ]
+        w = head_weight_sum(xvs, wvs, ks, hidden, lane)
         if (lane == 0) & (wave < n):
             if const_expr(c["tok_par"]):
                 # token parallel: to every rank, at the token's row of the step
@@ -205,6 +211,19 @@ def _e2m1(x):
     return code | (sign << 3)
 
 
+def quantize_fp4_pair(x0, x1):
+    """Group-32 E8M0 scale and two E2M1 nibbles in the reader's lane order."""
+    amax = butterfly(fx.max(abs(x0), abs(x1)), (1, 2, 4, 8), fx.max)
+    bits = (fx.max(amax, fx.Float32(FP4_MIN_AMAX)) * fx.Float32(1.0 / 6.0)).bitcast(
+        fx.Int32
+    )
+    code = (bits >> 23) + fx.Int32(
+        ((bits & 0x7FFFFF) != 0).select(fx.Int32(1), fx.Int32(0))
+    )
+    inv = ((fx.Int32(254) - code) << 23).bitcast(fx.Float32)
+    return _e2m1(x0 * inv) | (_e2m1(x1 * inv) << 4), code
+
+
 @traced
 def stage_iquant_fp4(c, task):
     """``stage_iquant`` on the FP4 plane: token task // 32, head task % 32, a
@@ -219,16 +238,8 @@ def stage_iquant_fp4(c, task):
     if wave == 0:
         got = poll_query(c, t, h, lane)
         x0, x1 = bf2_f32(got[0][0])
-        amax = butterfly(fx.max(abs(x0), abs(x1)), (1, 2, 4, 8), fx.max)
-        bits = (fx.max(amax, fx.Float32(FP4_MIN_AMAX)) * fx.Float32(1.0 / 6.0)).bitcast(
-            fx.Int32
-        )
-        code = (bits >> 23) + fx.Int32(
-            ((bits & 0x7FFFFF) != 0).select(fx.Int32(1), fx.Int32(0))
-        )
-        inv = ((fx.Int32(254) - code) << 23).bitcast(fx.Float32)
+        byte, code = quantize_fp4_pair(x0, x1)
         row = t * ip.HEADS + h
-        byte = _e2m1(x0 * inv) | (_e2m1(x1 * inv) << 4)
         bo.buffer_store(fx.Int8(byte), rsrc(a["iq_out"]), row * (ip.DIM // 2) + lane)
         if lane % 16 == 0:
             bo.buffer_store(

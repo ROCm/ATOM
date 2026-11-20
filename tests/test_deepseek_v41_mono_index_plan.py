@@ -26,57 +26,66 @@ def written_chunks(bound, chunks_fn=ip.chunks):
     return {ch for ch in range(chunks_fn(bound) + 1) if ip.chunk_written(bound, ch)}
 
 
-def polled_chunks(bound, seg_chunks=ip.seg_chunks):
+def polled_chunks(bound, seg_chunks=ip.seg_chunks, seg=ip.SEG):
     return {
-        ip.CHUNKS_PER_SEG * s + c
-        for s in range(ip.segments(bound))
-        for c in range(seg_chunks(bound, s))
+        (seg // ip.CHUNK) * s + c
+        for s in range(ip.segments(bound, seg=seg))
+        for c in range(seg_chunks(bound, s, seg=seg))
     }
 
 
 @pytest.mark.parametrize("k", [ip.TOPK, ip.TOPK_BLOCKS])
-def test_every_polled_cell_is_written(k):
+@pytest.mark.parametrize("seg", [4096, 8192, 10240, 18432])
+def test_every_polled_cell_is_written(k, seg):
     for bound in bounds():
-        assert polled_chunks(bound) == written_chunks(bound), bound
-        for level in range(1, ip.levels(bound, k) + 1):
-            below = ip.lists(bound, level - 1, k)
-            for j in range(ip.lists(bound, level, k)):
+        assert polled_chunks(bound, seg=seg) == written_chunks(bound), bound
+        for level in range(1, ip.levels(bound, k, seg=seg) + 1):
+            below = ip.lists(bound, level - 1, k, seg=seg)
+            for j in range(ip.lists(bound, level, k, seg=seg)):
                 # list j reads its children end to end: entry i is child
                 # fan j + i // k, slot i % k; each child must hold every slot
                 # read from it as a valid, written entry
-                n = ip.list_inputs(bound, level, j, k)
-                for c in range(ip.fan(k)):
+                n = ip.list_inputs(bound, level, j, k, seg=seg)
+                for c in range(ip.fan(k, seg=seg)):
                     read = min(k, max(n - c * k, 0))
-                    child = j * ip.fan(k) + c
+                    child = j * ip.fan(k, seg=seg) + c
                     if read:
                         assert child < below, (bound, level, j, c)
-                        assert read <= ip.list_valid(bound, level - 1, child, k)
+                        assert read <= ip.list_valid(
+                            bound, level - 1, child, k, seg=seg
+                        )
 
 
 @pytest.mark.parametrize("k", [ip.TOPK, ip.TOPK_BLOCKS])
-def test_every_list_but_a_levels_last_is_full(k):
+@pytest.mark.parametrize("seg", [4096, 8192, 10240, 18432])
+def test_every_list_but_a_levels_last_is_full(k, seg):
     for bound in bounds():
-        for level in range(ip.levels(bound, k) + 1):
-            n = ip.lists(bound, level, k)
+        for level in range(ip.levels(bound, k, seg=seg) + 1):
+            n = ip.lists(bound, level, k, seg=seg)
             for j in range(n - 1):
-                assert ip.list_valid(bound, level, j, k) == k, (bound, level, j)
+                assert ip.list_valid(bound, level, j, k, seg=seg) == k, (
+                    bound,
+                    level,
+                    j,
+                )
 
 
 @pytest.mark.parametrize("k", [ip.TOPK, ip.TOPK_BLOCKS])
-def test_the_final_list_holds_the_selection(k):
-    depth_max = ip.levels(max(bounds()), k)
+@pytest.mark.parametrize("seg", [4096, 8192, 10240, 18432])
+def test_the_final_list_holds_the_selection(k, seg):
+    depth_max = ip.levels(max(bounds()), k, seg=seg)
     for bound in bounds():
-        top = ip.final_level(bound, depth_max, k)
-        assert ip.lists(bound, top, k) <= 1, bound
-        assert ip.list_valid(bound, top, 0, k) == ip.selected(bound, k), bound
+        top = ip.final_level(bound, depth_max, k, seg=seg)
+        assert ip.lists(bound, top, k, seg=seg) <= 1, bound
+        assert ip.list_valid(bound, top, 0, k, seg=seg) == ip.selected(bound, k), bound
 
 
 def test_positive_control_floor_chunks_leave_logits_unpolled():
     """A segment that polls floor(len / CHUNK) chunks misses a partial chunk: the
     property must report it (so the tests above can fail)."""
 
-    def floor_seg_chunks(bound, s):
-        return ip.seg_len(bound, s) // ip.CHUNK
+    def floor_seg_chunks(bound, s, seg=ip.SEG):
+        return ip.seg_len(bound, s, seg=seg) // ip.CHUNK
 
     missed = [
         b for b in bounds() if polled_chunks(b, floor_seg_chunks) != written_chunks(b)

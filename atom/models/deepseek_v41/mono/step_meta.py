@@ -11,6 +11,7 @@ import triton
 import triton.language as tl
 
 from atom.models.deepseek_v41.mono import index_plan as ip
+from atom.mono.dsa_indexer.selection_plan import SHORT_VERIFY_CTX, SPLIT_MIN
 from atom.mono.plan.execution import BLOCKS
 
 # a token's window key metadata words: first window position, window count,
@@ -51,11 +52,14 @@ def _rank_chunks(
     hi,
     top,
     lead,
+    TOPK: tl.constexpr,
     RATIO: tl.constexpr,
     CHUNK: tl.constexpr,
     BLOCK: tl.constexpr,
     WORLD: tl.constexpr,
     RANK: tl.constexpr,
+    SHORT_CTX: tl.constexpr,
+    SPLIT_CTX: tl.constexpr,
 ):
     _t, live, start, first, end, request, requests = _request_groups(
         batch_ids, lo, hi, BLOCK
@@ -64,10 +68,10 @@ def _rank_chunks(
     request_bound = ((last_pos + 1) // RATIO).to(tl.int32)
     first_pos = tl.load(positions + first, mask=start, other=-1)
     first_bound = ((first_pos + 1) // RATIO).to(tl.int32)
-    local = tl.sum((start & (first_bound > 8192)).to(tl.int32), 0) == 0
+    local = tl.sum((start & (first_bound > SHORT_CTX)).to(tl.int32), 0) == 0
     total = tl.sum(tl.where(start, request_bound, 0), 0)
-    split = ((requests < WORLD) & (request_bound > 8192)) | (
-        (request_bound > 262144) & (2 * WORLD * request_bound > total)
+    split = ((requests < WORLD) & (request_bound > SHORT_CTX)) | (
+        (request_bound > SPLIT_CTX) & (2 * WORLD * request_bound > total)
     )
     span = ((request_bound + CHUNK - 1) // CHUNK + WORLD - 1) // WORLD
     offset = tl.where(~local & split, RANK * span, 0)
@@ -78,7 +82,7 @@ def _rank_chunks(
         (top + CHUNK - 1) // CHUNK,
         tl.where(split, need, tl.where(owns, (top + CHUNK - 1) // CHUNK, 0)),
     )
-    need = tl.where(lead & live & (top > 512), need, 0)
+    need = tl.where(lead & live & (top > TOPK), need, 0)
     return offset, need
 
 
@@ -88,100 +92,26 @@ def _running_max(a, b):
 
 
 @triton.jit
-def _walk_plan(
-    plan,
-    batch_ids,
-    positions,
-    lo,
-    hi,
-    RATIO: tl.constexpr,
-    CTAS: tl.constexpr,
-    WALK_ROWS: tl.constexpr,
-    TOPK: tl.constexpr,
-    CHUNK: tl.constexpr,
-    BLOCK: tl.constexpr,
-    WORLD: tl.constexpr = 1,
-    RANK: tl.constexpr = 0,
-):
-    """``index_plan.fill_walk_plan`` over ``index_plan.walk_pieces`` of rows lo
-    .. hi, each row's bound its visible columns at ``RATIO``: ``plan`` [CTAS, 4]
-    gets a (lead, span, ch0, ch1) a task, piece after piece, and zeros past the
-    last."""
-    t = lo + tl.arange(0, BLOCK)
-    m = t < hi
-    owner = tl.load(batch_ids + t, mask=m, other=0)
-    prev = tl.load(batch_ids + t - 1, mask=m & (t > lo), other=0)
-    run_start = m & ((t == lo) | (owner != prev))
-    run_first = tl.associative_scan(tl.where(run_start, t, 0), 0, _running_max)
-    lead = m & (run_start | ((t - run_first) % WALK_ROWS == 0))
-    # a lead's piece runs to the next lead
-    after = t[None, :] > t[:, None]
-    end = tl.min(tl.where(lead[None, :] & after, t[None, :], hi), 1)
-    pos = tl.load(positions + t, mask=m, other=0)
-    bound = ((pos + 1) // RATIO).to(tl.int32)
-    inside = (t[None, :] >= t[:, None]) & (t[None, :] < end[:, None])
-    top = tl.max(tl.where(inside, bound[None, :], 0), 1)
-    need = tl.where(lead & (top > TOPK), (top + CHUNK - 1) // CHUNK, 0)
-    offset = tl.full((BLOCK,), 0, tl.int32)
-    if WORLD > 1:  # noqa: SIM102
-        if tl.max(tl.where(run_start & (owner >= 0), bound, 0), 0) > 8192:
-            offset, need = _rank_chunks(
-                batch_ids,
-                positions,
-                lo,
-                hi,
-                top,
-                lead,
-                RATIO,
-                CHUNK,
-                BLOCK,
-                WORLD,
-                RANK,
-            )
-    # the narrowest width a chunk run that leaves every piece a task fits in CTAS
-    total = tl.sum(need, 0)
-    width = tl.maximum((total + CTAS - 1) // CTAS, 1)
-    while tl.sum((need + width - 1) // width, 0) > CTAS:
-        width += 1
-    k = (need + width - 1) // width
-    first = tl.cumsum(k, 0) - k
-    s = tl.arange(0, CTAS)[:, None]
-    hit = (s >= first[None, :]) & (s < (first + k)[None, :])
-    task_lead = tl.sum(tl.where(hit, t[None, :], 0), 1)
-    task_span = tl.sum(tl.where(hit, (end - t)[None, :], 0), 1)
-    task_need = tl.sum(tl.where(hit, need[None, :], 0), 1)
-    task_k = tl.maximum(tl.sum(tl.where(hit, k[None, :], 0), 1), 1)
-    i = tl.arange(0, CTAS) - tl.sum(tl.where(hit, first[None, :], 0), 1)
-    live = tl.sum(hit.to(tl.int32), 1) > 0
-    row = plan + tl.arange(0, CTAS) * 4
-    tl.store(row, tl.where(live, task_lead, 0))
-    tl.store(row + 1, tl.where(live, task_span, 0))
-    task_offset = tl.sum(tl.where(hit, offset[None, :], 0), 1)
-    tl.store(row + 2, tl.where(live, task_offset + i * task_need // task_k, 0))
-    tl.store(row + 3, tl.where(live, task_offset + (i + 1) * task_need // task_k, 0))
-
-
-@triton.jit
 def _running_min(a, b):
     return tl.minimum(a, b)
 
 
 @triton.jit
-def _walk_plan_one(
-    plan,
+def _walk_tasks(
     batch_ids,
     positions,
     lo,
     hi,
-    task,
     RATIO: tl.constexpr,
     CTAS: tl.constexpr,
     WALK_ROWS: tl.constexpr,
     TOPK: tl.constexpr,
     CHUNK: tl.constexpr,
     BLOCK: tl.constexpr,
-    WORLD: tl.constexpr = 1,
-    RANK: tl.constexpr = 0,
+    WORLD: tl.constexpr,
+    RANK: tl.constexpr,
+    SHORT_CTX: tl.constexpr,
+    SPLIT_CTX: tl.constexpr,
 ):
     t = lo + tl.arange(0, BLOCK)
     m = t < hi
@@ -204,7 +134,7 @@ def _walk_plan_one(
     offset = tl.full((BLOCK,), 0, tl.int32)
     if WORLD > 1:
         first_pos = tl.load(positions + t, mask=start & (owner >= 0), other=-1)
-        if tl.max((first_pos + 1) // RATIO, 0) > 8192:
+        if tl.max((first_pos + 1) // RATIO, 0) > SHORT_CTX:
             offset, need = _rank_chunks(
                 batch_ids,
                 positions,
@@ -212,11 +142,14 @@ def _walk_plan_one(
                 hi,
                 top,
                 lead,
+                TOPK,
                 RATIO,
                 CHUNK,
                 BLOCK,
                 WORLD,
                 RANK,
+                SHORT_CTX,
+                SPLIT_CTX,
             )
     total = tl.sum(need, 0)
     width = tl.maximum((total + CTAS - 1) // CTAS, 1)
@@ -224,6 +157,94 @@ def _walk_plan_one(
         width += 1
     counts = (need + width - 1) // width
     first = tl.cumsum(counts, 0) - counts
+    return t, end, need, offset, counts, first
+
+
+@triton.jit
+def _walk_plan(
+    plan,
+    batch_ids,
+    positions,
+    lo,
+    hi,
+    RATIO: tl.constexpr,
+    CTAS: tl.constexpr,
+    WALK_ROWS: tl.constexpr,
+    TOPK: tl.constexpr,
+    CHUNK: tl.constexpr,
+    BLOCK: tl.constexpr,
+    WORLD: tl.constexpr = 1,
+    RANK: tl.constexpr = 0,
+    SHORT_CTX: tl.constexpr = SHORT_VERIFY_CTX,
+    SPLIT_CTX: tl.constexpr = SPLIT_MIN,
+):
+    t, end, need, offset, counts, first = _walk_tasks(
+        batch_ids,
+        positions,
+        lo,
+        hi,
+        RATIO,
+        CTAS,
+        WALK_ROWS,
+        TOPK,
+        CHUNK,
+        BLOCK,
+        WORLD,
+        RANK,
+        SHORT_CTX,
+        SPLIT_CTX,
+    )
+    s = tl.arange(0, CTAS)[:, None]
+    hit = (s >= first[None, :]) & (s < (first + counts)[None, :])
+    task_lead = tl.sum(tl.where(hit, t[None, :], 0), 1)
+    task_span = tl.sum(tl.where(hit, (end - t)[None, :], 0), 1)
+    task_need = tl.sum(tl.where(hit, need[None, :], 0), 1)
+    task_k = tl.maximum(tl.sum(tl.where(hit, counts[None, :], 0), 1), 1)
+    i = tl.arange(0, CTAS) - tl.sum(tl.where(hit, first[None, :], 0), 1)
+    live = tl.sum(hit.to(tl.int32), 1) > 0
+    row = plan + tl.arange(0, CTAS) * 4
+    tl.store(row, tl.where(live, task_lead, 0))
+    tl.store(row + 1, tl.where(live, task_span, 0))
+    task_offset = tl.sum(tl.where(hit, offset[None, :], 0), 1)
+    tl.store(row + 2, tl.where(live, task_offset + i * task_need // task_k, 0))
+    tl.store(row + 3, tl.where(live, task_offset + (i + 1) * task_need // task_k, 0))
+
+
+@triton.jit
+def _walk_plan_one(
+    plan,
+    batch_ids,
+    positions,
+    lo,
+    hi,
+    task,
+    RATIO: tl.constexpr,
+    CTAS: tl.constexpr,
+    WALK_ROWS: tl.constexpr,
+    TOPK: tl.constexpr,
+    CHUNK: tl.constexpr,
+    BLOCK: tl.constexpr,
+    WORLD: tl.constexpr = 1,
+    RANK: tl.constexpr = 0,
+    SHORT_CTX: tl.constexpr = SHORT_VERIFY_CTX,
+    SPLIT_CTX: tl.constexpr = SPLIT_MIN,
+):
+    t, end, need, offset, counts, first = _walk_tasks(
+        batch_ids,
+        positions,
+        lo,
+        hi,
+        RATIO,
+        CTAS,
+        WALK_ROWS,
+        TOPK,
+        CHUNK,
+        BLOCK,
+        WORLD,
+        RANK,
+        SHORT_CTX,
+        SPLIT_CTX,
+    )
     hit = (task >= first) & (task < first + counts)
     tok = tl.sum(tl.where(hit, t, 0), 0)
     span = tl.sum(tl.where(hit, end - t, 0), 0)
@@ -273,6 +294,8 @@ def _step_meta_kernel(
     PARALLEL_PLANS: tl.constexpr,
     WORLD: tl.constexpr,
     RANK: tl.constexpr,
+    SHORT_CTX: tl.constexpr,
+    SPLIT_CTX: tl.constexpr,
 ):
     meta_ctas = 1 + len(RATIOS) * (CTAS if PARALLEL_PLANS else 1)
     if tl.program_id(0) >= meta_ctas:
@@ -286,12 +309,12 @@ def _step_meta_kernel(
             prev = tl.load(batch_ids + t - 1, mask=live & (t > 0), other=-1)
             start = live & (ids >= 0) & ((t == 0) | (ids != prev))
             p = tl.load(positions + t, mask=live & (ids >= 0), other=-1)
-            long_step = tl.max(tl.where(start, p + 1, 0), 0) > 8192
+            long_step = tl.max(tl.where(start, p + 1, 0), 0) > SHORT_CTX
             # Conservative over all compression ratios: only low-request
             # steps or a possible dominant >256K request can split keys.
             # Owners never read radix histograms, including after a split.
             split_step = long_step & (
-                (tl.sum(start.to(tl.int32), 0) < WORLD) | (tl.max(p + 1, 0) > 262144)
+                (tl.sum(start.to(tl.int32), 0) < WORLD) | (tl.max(p + 1, 0) > SPLIT_CTX)
             )
         for r in tl.static_range(len(reset_sizes)):
             if not reset_split_only[r] or split_step:
@@ -326,6 +349,8 @@ def _step_meta_kernel(
                     BLOCK,
                     WORLD,
                     RANK,
+                    SHORT_CTX,
+                    SPLIT_CTX,
                 )
         elif tl.program_id(0) == r + 1:
             _walk_plan(
@@ -342,6 +367,8 @@ def _step_meta_kernel(
                 BLOCK,
                 WORLD,
                 RANK,
+                SHORT_CTX,
+                SPLIT_CTX,
             )
     if tl.program_id(0) != 0:
         return
@@ -353,7 +380,7 @@ def _step_meta_kernel(
         tl.store(ix_meta + t * 4 + 1, first, mask=t < n)
         tl.store(ix_meta + t * 4 + 2, end - 1, mask=t < n)
         first_pos = tl.load(positions + t, mask=start, other=-1)
-        short = tl.sum((start & (first_pos + 1 > 8192)).to(tl.int32), 0) == 0
+        short = tl.sum((start & (first_pos + 1 > SHORT_CTX)).to(tl.int32), 0) == 0
         tl.store(ix_meta + t * 4 + 3, requests | tl.where(short, 65536, 0), mask=t < n)
     i = tl.arange(0, BLOCK)
     m = i < n
@@ -450,6 +477,8 @@ def write_step_meta(
         PARALLEL_PLANS=parallel_plans,
         WORLD=tp_world,
         RANK=tp_rank,
+        SHORT_CTX=SHORT_VERIFY_CTX,
+        SPLIT_CTX=SPLIT_MIN,
     )
 
 

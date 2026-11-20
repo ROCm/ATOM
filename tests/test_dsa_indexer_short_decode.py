@@ -35,3 +35,16 @@ def test_production_short_decode_requires_explicit_switch(monkeypatch):
     assert not short_decode_enabled(shape, 8, 8, 163840, False, 1)
     monkeypatch.setenv("ATOM_MONO_K3_SHORT_DECODE", "0")
     assert not short_decode_enabled(*args)
+
+
+def test_ineligible_shape_does_not_read_short_decode_environment(monkeypatch):
+    from atom.mono.dsa_indexer import build
+
+    class UnreadEnvironment:
+        @property
+        def ATOM_MONO_K3_SHORT_DECODE(self):
+            raise AssertionError("ineligible hot path read the environment")
+
+    monkeypatch.setattr(build, "envs", UnreadEnvironment())
+    shape = IndexerShape(32, 128, 2048, 1536, "bf16", "fp8", 64, 0)
+    assert not build.short_decode_enabled(shape, 8, 8, 163840, True, 1)

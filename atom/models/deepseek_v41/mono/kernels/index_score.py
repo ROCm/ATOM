@@ -251,20 +251,18 @@ def stage_ilist(c, t, j, raw, kind, level, bound_max, max_chunks):
     per_thread = segment // THREADS
     a = c["args"]
     k = ip.KINDS[kind]
-    slots = isp.list_slots(segment, kind, level, bound_max)
     bound = ip.kind_bound(kind, raw)
     fast_hist = c.get("fast_select", False)
     if fast_hist:
         segment = isp.segment_for(segment, kind)
         per_thread = segment // THREADS
-        slots = isp.list_slots(segment, kind, level, bound_max)
     storage_segment = c.get("list_storage_segment", segment)
     if const_expr(kind == "blk"):
         storage_segment = c.get("block_list_storage_segment", segment)
-    slots = isp.list_slots(storage_segment, kind, level, bound_max)
+    slots = ip.list_slots(kind, level, bound_max, seg=storage_segment)
     if fast_hist and level > 0:
-        max_inputs = isp.list_inputs(
-            segment, ip.kind_bound(kind, bound_max), level, 0, k
+        max_inputs = ip.list_inputs(
+            ip.kind_bound(kind, bound_max), level, 0, k, seg=segment
         )
         if c.get("tight_select_width", False):
             per_thread = ip.cdiv(max_inputs, THREADS * 4) * 4
@@ -280,26 +278,26 @@ def stage_ilist(c, t, j, raw, kind, level, bound_max, max_chunks):
         mode, _owner, key_first, raw = row_work(c, t)
     bound = ip.kind_bound(kind, raw)
     value_first = key_first if kind == "sel" else key_first // ip.BLOCK_ROWS
-    if j < isp.list_count(segment, bound, level, k):
-        n = isp.list_inputs(segment, bound, level, j, k)
-        final = isp.is_final(segment, bound, level, k)
+    if j < ip.list_count(bound, level, k, seg=segment):
+        n = ip.list_inputs(bound, level, j, k, seg=segment)
+        final = ip.is_final(bound, level, k, seg=segment)
         # the top level has one list, a token's last: it has no region above it
-        to_final = True if level == isp.top_level(segment, kind, bound_max) else final
+        to_final = (
+            True if level == ip.top_level(kind, bound_max, seg=segment) else final
+        )
         got = []
         if const_expr(level == 0):
             if const_expr(kind == "sel"):
-                first, count = (segment // ip.CHUNK) * j, isp.seg_chunks(
-                    segment, bound, j
+                first, count = (segment // ip.CHUNK) * j, ip.seg_chunks(
+                    bound, j, seg=segment
                 )
             else:
-                first, count = isp.block_chunks(segment, raw, j)
+                first, count = ip.block_chunks(raw, j, seg=segment)
             if const_expr(distributed):
                 # A split tail <=512 still has scored keys when its global
                 # row needs Top512. Poll those global chunk flags as usual.
                 if const_expr(kind == "sel"):
-                    count = ip.cdiv(
-                        isp.SelectionPlan(segment).seg_len(raw, j), ip.CHUNK
-                    )
+                    count = ip.cdiv(ip.seg_len(raw, j, seg=segment), ip.CHUNK)
                 else:
                     count = ip.cdiv(
                         ip.imax(
@@ -317,7 +315,7 @@ def stage_ilist(c, t, j, raw, kind, level, bound_max, max_chunks):
             )
             _wait_chunks(c, t, max_chunks, first, count, flag_groups)
         else:
-            below = isp.list_slots(storage_segment, kind, level - 1, bound_max)
+            below = ip.list_slots(kind, level - 1, bound_max, seg=storage_segment)
             base = tid * per_thread
             if const_expr(list_ready):
                 if tid < ip.cdiv(n, k):
@@ -325,7 +323,7 @@ def stage_ilist(c, t, j, raw, kind, level, bound_max, max_chunks):
                         [
                             (
                                 c[f"i{kind}ready{level-1}"],
-                                t * below + j * isp.fan(segment, k) + tid,
+                                t * below + j * ip.fan(k, seg=segment) + tid,
                                 1,
                             )
                         ]
@@ -339,7 +337,7 @@ def stage_ilist(c, t, j, raw, kind, level, bound_max, max_chunks):
                             (
                                 (
                                     t * below
-                                    + j * isp.fan(segment, k)
+                                    + j * ip.fan(k, seg=segment)
                                     + fx.min(base + d, n - 1) // k
                                 )
                                 * k
@@ -367,7 +365,7 @@ def stage_ilist(c, t, j, raw, kind, level, bound_max, max_chunks):
                     fx.Int32(
                         ld_dev(
                             c[f"i{kind}{level-1}"].value,
-                            ((t * below + j * isp.fan(segment, k)) * k + i + e) * 4,
+                            ((t * below + j * ip.fan(k, seg=segment)) * k + i + e) * 4,
                         )
                     )
                     for e in range(4)
@@ -384,7 +382,7 @@ def stage_ilist(c, t, j, raw, kind, level, bound_max, max_chunks):
                 return fx.Int32(
                     ld_dev(
                         c[f"i{kind}{level-1}"].value,
-                        ((t * below + j * isp.fan(segment, k)) * k + i) * 4 + 2,
+                        ((t * below + j * ip.fan(k, seg=segment)) * k + i) * 4 + 2,
                     )
                 )
             return got[d][1]
@@ -504,7 +502,9 @@ def stage_ilist(c, t, j, raw, kind, level, bound_max, max_chunks):
                         _compact_final(c, kind, t, k, ident_of)
                 else:
                     _compact_final(c, kind, t, k, ident_of)
-        has_list_output = list_ready and level < isp.top_level(segment, kind, bound_max)
+        has_list_output = list_ready and level < ip.top_level(
+            kind, bound_max, seg=segment
+        )
         if const_expr(has_list_output):  # noqa: SIM102
             if ~final:
                 if const_expr(fast_hist):

@@ -12,17 +12,14 @@ from aiter.dist.parallel_state import (
 )
 
 from atom.models.deepseek_v41.mono.indexer import MonoIndexer
+from atom.models.deepseek_v41.mono.indexer_workspace import IndexerWorkspace
 from atom.mono.runtime.compile import launcher_resources
 from tests.models.deepseek_v41.test_mono_indexer import make_case
 
 
 class ProbeIndexer(MonoIndexer):
     def _key(self, rows):
-        key = replace(
-            super()._key(rows),
-            radix_blocks=os.environ.get("TP_DIRECT", "1") == "1",
-            split_segment=int(os.environ.get("TP_SPLIT_SEG", "8192")),
-        )
+        key = super()._key(rows)
         return (
             replace(key, world=self.world, peer_plain=self.peer_plain)
             if os.environ.get("TP_FORCE_COOP") == "1"
@@ -62,7 +59,14 @@ for rows, context, ratio, qlen, candidate, reindex, pad in points:
         reindex=reindex,
         pad=pad,
     )
-    r = ProbeIndexer(case.runner.model, context + 128, True, "mfma", group)
+    r = ProbeIndexer(
+        case.runner.model,
+        context + 128,
+        True,
+        "mfma",
+        group,
+        workspace=IndexerWorkspace(case.runner.model, context + 128, world),
+    )
     assert r.world == world and r.prepare(rows)
     r.active = True
 

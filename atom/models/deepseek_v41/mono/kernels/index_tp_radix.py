@@ -123,7 +123,7 @@ def _emit(c, row, first, lo, gt, eq, at, run, ties, kind):
 def stage_segment(c, row, g, segment, kind):
     code = tp.KINDS.index(kind)
     radix_row = code * c["S"] + row
-    _mode, _owner, key_first, raw = c.get("radix_work", row_work)(c, row)
+    _mode, _owner, key_first, raw = row_work(c, row)
     first = key_first if kind == "sel" else key_first // ip.BLOCK_ROWS
     n = ip.kind_bound(kind, raw)
     global_n = ip.kind_bound(kind, c["load_bound"](row))

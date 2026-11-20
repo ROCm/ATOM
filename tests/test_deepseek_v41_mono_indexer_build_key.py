@@ -17,9 +17,6 @@ OTHER = {
     "world": 2,
     "peer_offset": 4096,
     "peer_plain": 1 << 24,
-    "timing": True,
-    "radix_blocks": False,
-    "split_segment": 16384,
     "full_only": True,
 }
 
@@ -48,7 +45,6 @@ def test_reindex_build_keeps_projection_and_bounds_the_compressed_domain(bound):
         world=4,
         peer_offset=4096,
         peer_plain=1 << 24,
-        timing=True,
     )
     expected = dataclasses.replace(
         key, bound_max=min(bound, 18432), world=1, peer_offset=0, peer_plain=0

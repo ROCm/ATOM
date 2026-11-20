@@ -117,7 +117,15 @@ def make_case(
         global_rope=rope,
         window_rope=rope,
     )
-    runner = MonoIndexer(model, context + 128, True, layout)
+    from atom.models.deepseek_v41.mono.indexer_workspace import IndexerWorkspace
+
+    runner = MonoIndexer(
+        model,
+        context + 128,
+        True,
+        layout,
+        workspace=IndexerWorkspace(model, context + 128, 1),
+    )
     geo = V41PoolGeometry(
         40,
         ((2, 2), (8, 2), (14, 2), (20, 1)),
