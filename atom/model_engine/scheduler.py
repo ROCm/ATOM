@@ -2114,9 +2114,12 @@ class Scheduler:
             `max_model_len // block_size` cols and would crash with a
             broadcast error at prepare-time. (Checked first since it's the
             usual actionable cause.)
-          - prompt longer than `max_num_batched_tokens` AND chunked prefill
-            disabled → no single prefill forward can ever fit it (with chunked
-            prefill enabled, the prompt is split across steps and this is fine)
+          - prompt longer than `max_num_batched_tokens` AND it cannot be
+            chunked → no single prefill forward can ever fit it. That is the
+            case with chunked prefill disabled, and also with it enabled for
+            a prompt that needs atomic prefill (`_requires_atomic_prefill`,
+            e.g. every Qwen3.5 image prompt); any other prompt is split
+            across steps and is fine
           - prompt's KV blocks exceed the total pool size → never fits even on
             a fully empty pool. Counted per-rank (dcp-local, via
             `BlockManager.num_pool_blocks`) to match how the pool is sized and

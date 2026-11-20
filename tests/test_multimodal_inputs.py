@@ -549,7 +549,8 @@ P = 9  # a placeholder id for the shared span scan
     [
         # MiniMax-M3: each run wrapped in start / end-of-image tokens.
         ([1, 5, P, P, P, 6, 2, 5, P, P, 6], [3, 2], ((2, 3), (8, 2))),
-        # Qwen3.5: adjacent runs with no separator, split by their counts.
+        # Adjacent runs with no separator (e.g. a raw prompt), split by their
+        # counts. Real Qwen3.5 prompts wrap each image in vision start / end.
         ([1, P, P, P, P, P, 2], [3, 2], ((1, 3), (4, 2))),
         ([1, 2, 3], [], ()),
     ],
