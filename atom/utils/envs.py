@@ -1461,6 +1461,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC": lambda: _finite_float_env(
         "ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC", 0.15, allow_zero=True
     ),
+    # A pool the DP ranks share (`umbp_pool`): start a waiting request's copy
+    # from another rank's pool on any scheduler tick, and keep a request whose
+    # copy is in flight out of the prefillable count. 0 starts the copy when
+    # admission or the prefillable probe first reaches the request.
+    "ATOM_POOL_EARLY_COPY": lambda: os.getenv("ATOM_POOL_EARLY_COPY", "1") == "1",
+    # With the early copy: a rank whose waiting requests are all mid-copy has
+    # the group hold its prefill for it (within the delayer's bounds). 0 counts
+    # that rank as blocked, so the group fires and it runs a dummy prefill.
+    "ATOM_POOL_COPY_HOLDS_PREFILL": lambda: (
+        os.getenv("ATOM_POOL_COPY_HOLDS_PREFILL", "1") == "1"
+    ),
     # Minimum external-tier hit worth loading, in tokens. None when unset: each
     # tier then uses its own default (`KVConnectorFactory.resolve_min_load_tokens`).
     "OFFLOAD_MIN_LOAD_TOKENS": lambda: _non_negative_or_none(

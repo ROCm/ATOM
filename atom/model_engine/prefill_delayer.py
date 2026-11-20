@@ -549,6 +549,7 @@ class PrefillDelayer:
         arrived_requests: int = 0,
         next_completion_steps: int | None = None,
         admittable_requests: int | None = None,
+        prefill_arriving: bool = False,
     ) -> PrefillDecision:
         """Whether this rank may admit new prefills this tick (FIRE), and how
         many ranks have prefill to admit.
@@ -596,6 +597,11 @@ class PrefillDelayer:
                 FIRE could put into this rank's decode batch now: resumable
                 partials plus waiting heads that fit the free seq slots.
                 None falls back to `waiting_requests`.
+            prefill_arriving: this rank has no admittable prefill only because
+                what waits is about to become admittable on its own (its prefix
+                is being copied in from another rank's pool, about a decode
+                step). Neither blocked nor unreachable: the group holds for it,
+                within the same bounds as any hold.
         """
         # KV + queue-age bounds are gated on this rank actually having prefill to
         # push (firing when this rank can't admit anything would be a no-op).
@@ -604,7 +610,12 @@ class PrefillDelayer:
         # Waiting work this rank cannot admit (no KV for its head, or the
         # head's remote KV still loading): its own decode completions or the
         # load change that, not its peers waiting, so holding cannot align it.
-        blocked = not prefillable and (waiting_requests > 0 or has_partial)
+        prefill_arriving = prefill_arriving and not prefillable and not has_partial
+        blocked = (
+            not prefillable
+            and not prefill_arriving
+            and (waiting_requests > 0 or has_partial)
+        )
         # A rank with neither aligns once a decode completes and its slot takes
         # the next request. If that cannot happen before the TTFT bound
         # releases this hold anyway, waiting for it only delays its peers.
@@ -613,6 +624,7 @@ class PrefillDelayer:
         unreachable = (
             not prefillable
             and not blocked
+            and not prefill_arriving
             and (
                 next_completion_steps is None
                 or next_completion_steps > self.ttft_max_ticks - self._hold_ticks

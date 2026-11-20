@@ -1487,6 +1487,29 @@ class BlockManager:
         self._fetch_shared_prefix(seq)
         return self.kv.fetch_pending(seq.id)
 
+    @property
+    def copies_shared_prefixes(self) -> bool:
+        """Whether prefixes other pools hold are copied in in the background."""
+        return bool(
+            self.kv.shares_content
+            and self.enable_prefix_caching
+            and getattr(self.kv, "async_fetch", False)
+        )
+
+    def start_shared_prefix_copy(self, seq: Sequence) -> bool:
+        """Ask for `seq`'s prefix now unless it was asked for already
+        (`_fetch_shared_prefix`). True when this call asked. Only with
+        `copies_shared_prefixes`."""
+        if self._shared_prefix_asked.get(seq) == seq.cache_seed:
+            return False
+        self._fetch_shared_prefix(seq)
+        return True
+
+    def shared_prefix_in_flight(self, seq: Sequence) -> bool:
+        """Whether a copy of `seq`'s prefix is in flight. A probe: it starts
+        none (`shared_prefix_pending` does). Only with `copies_shared_prefixes`."""
+        return self.kv.fetch_pending(seq.id)
+
     def _admission_walk(self, seq: Sequence) -> _PrefixWalk:
         """The exact probe's walk, kept on the fast walk for `seq`'s `allocate`
         (`_take_admission_walk`)."""
