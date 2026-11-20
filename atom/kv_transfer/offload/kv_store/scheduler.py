@@ -33,7 +33,7 @@ from atom.kv_transfer.offload.kv_store.keys import (
     chain_seed,
     chunk_digest,
     chunk_hash_chain,
-    draft_key_prefix,
+    draft_namespace,
     rank_key_prefix,
 )
 from atom.kv_transfer.offload.lookup_client import LookupClient
@@ -150,6 +150,13 @@ class StoreLookupBase(LookupClient):
         # The read window draft objects are kept for, and the ranks they belong
         # to; None keeps the draft rows in the target objects.
         self.draft_window = draft_window
+        if draft_window is not None and not (
+            draft_ranks and set(draft_ranks) <= set(range(self._world))
+        ):
+            raise ValueError(
+                f"a draft window needs draft ranks among the {self._world} ranks, "
+                f"got {draft_ranks!r}"
+            )
         self.draft_ranks = draft_ranks if draft_window is not None else range(0)
         # Draft keys asked; chunks whose draft object some rank lacks inside a
         # hit's read window; lookups that window cut at d0 or at a hole past it.
@@ -173,14 +180,21 @@ class StoreLookupBase(LookupClient):
         self._next_stats_at = time.monotonic() + _LOOKUP_STATS_INTERVAL_S
 
     def _rank_keys(self, hashes: bytes, first: int, last: int) -> list[str]:
-        """Every rank's keys of chunks ``[first, last)``, rank by rank.
+        """Every rank's keys of chunks ``[first, last)``, rank by rank."""
+        chunks = range(first, last)
+        return self._keys_by_rank(self._namespace, range(self._world), hashes, chunks)
 
-        Every rank's keys share the chunks' digests: each is hex-encoded once.
-        """
-        digests = [chunk_digest(hashes, index).hex() for index in range(first, last)]
+    def _keys_by_rank(
+        self, namespace: str, ranks: range, hashes: bytes, chunks: range
+    ) -> list[str]:
+        """`ranks`' keys of `chunks` under `namespace`, rank by rank. The ranks
+        share the chunks' digests: each is hex-encoded once, and none for no rank."""
+        if not ranks:
+            return []
+        digests = [chunk_digest(hashes, index).hex() for index in chunks]
         keys = []
-        for rank in range(self._world):
-            prefix = rank_key_prefix(self._namespace, rank, self._world)
+        for rank in ranks:
+            prefix = rank_key_prefix(namespace, rank, self._world)
             keys += [prefix + digest for digest in digests]
         return keys
 
@@ -211,13 +225,10 @@ class StoreLookupBase(LookupClient):
         return range(first, min(chunks, (num_prompt - 1) // self._chunk_tokens))
 
     def _draft_keys(self, hashes: bytes, chunks: range) -> list[str]:
-        """Every draft rank's keys of `chunks`, rank by rank."""
-        digests = [chunk_digest(hashes, index).hex() for index in chunks]
-        keys = []
-        for rank in self.draft_ranks:
-            prefix = draft_key_prefix(self._namespace, rank, self._world)
-            keys += [prefix + digest for digest in digests]
-        return keys
+        """Every draft rank's keys of `chunks`, rank by rank; none, and no
+        digest encoded, without a draft window."""
+        namespace = draft_namespace(self._namespace)
+        return self._keys_by_rank(namespace, self.draft_ranks, hashes, chunks)
 
     def _draft_cut(self, draft: range, hit_chunks: int, codes: list[Any]) -> int | None:
         """`hit_chunks` cut at the first chunk of `[d0, hit)` whose draft object

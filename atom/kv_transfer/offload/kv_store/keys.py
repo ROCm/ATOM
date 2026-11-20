@@ -232,17 +232,17 @@ def chunk_keys(
     return [prefix + chunk_digest(hashes, index).hex() for index in range(start, end)]
 
 
-def draft_key_prefix(namespace: str, rank: int, world: int) -> str:
-    """The part of a draft object key every chunk of one rank shares."""
-    return f"{namespace}/draft/w{int(rank)}of{int(world)}/"
+def draft_namespace(namespace: str) -> str:
+    """Where a draft window's draft objects live: their keys are chunk keys
+    under it, ``{namespace}/draft/w{rank}of{world}/{digest}``."""
+    return f"{namespace}/draft"
 
 
 def draft_chunk_keys(
     namespace: str, rank: int, world: int, hashes: bytes, start: int, end: int
 ) -> list[str]:
     """Keys of one rank's draft objects of chunks ``[start, end)``."""
-    prefix = draft_key_prefix(namespace, rank, world)
-    return [prefix + chunk_digest(hashes, index).hex() for index in range(start, end)]
+    return chunk_keys(draft_namespace(namespace), rank, world, hashes, start, end)
 
 
 def draft_ranks(config: Any) -> range:

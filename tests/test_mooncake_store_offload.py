@@ -4649,6 +4649,33 @@ def test_renew_renews_the_draft_keys_the_load_reads(cluster, draft_window):
     assert held == 2 * 6 + 4
 
 
+def test_a_draft_window_without_draft_ranks_is_refused(cluster, draft_window):
+    lookup = MooncakeStoreOffloadScheduler(_draft_config(pp=2))._lookup_client.backend
+
+    def build(ranks):
+        return type(lookup)(
+            lookup._cfg,
+            namespace=NAMESPACE,
+            world=2,
+            chunk_tokens=CHUNK,
+            draft_window=lookup.draft_window,
+            draft_ranks=ranks,
+        )
+
+    # With no rank to ask, the gate would cut no hit at a missing draft object.
+    for ranks in (range(0), range(1, 3)):
+        with pytest.raises(ValueError, match="draft ranks among the 2 ranks"):
+            build(ranks)
+    assert build(range(1, 2)).draft_ranks == range(1, 2)
+
+
+def test_no_draft_key_is_built_without_a_draft_window(cluster):
+    lookup = MooncakeStoreOffloadScheduler(_draft_config(pp=2))._lookup_client.backend
+    assert lookup.draft_window is None and lookup.draft_ranks == range(0)
+    # Nor is a digest encoded: these hashes would fail to.
+    assert lookup._draft_keys(None, range(8)) == []
+
+
 def test_save_request_carries_only_unmarked_window_chunks(cluster, draft_window):
     scheduler = MooncakeStoreOffloadScheduler(_draft_config(pp=2))
     manager = BlockManager(

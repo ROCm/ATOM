@@ -116,12 +116,13 @@ def split_draft_pages(transfer_tensors: Any) -> tuple[Any, Any | None]:
 
 
 def _build_m3_target(
-    _kv_caches: Any,
+    kv_caches: Any,
     transfer_tensors: Any,
     num_blocks: int | None,
-    _permit_per_request_state: bool,
+    permit_per_request_state: bool,
 ) -> Any:
-    return pure_page_codec(split_draft_pages(transfer_tensors)[0], num_blocks)
+    target = split_draft_pages(transfer_tensors)[0]
+    return _build_m3(kv_caches, target, num_blocks, permit_per_request_state)
 
 
 def build_draft_codec(transfer_tensors: Any, num_blocks: int | None) -> Any | None:
