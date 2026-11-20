@@ -18,6 +18,8 @@ UMBP facts this wrapper is shaped by:
   between its pool and the registered GPU memory itself (HIP IPC) before it
   answers. Once a call has returned, whatever it answered, no copy of it can
   still touch a caller buffer. A call that raised gives no such promise.
+* A lookup waits at most ``lookup_timeout_ms`` (ROCm/mori#949) and then
+  answers every key absent; a put or get has no deadline.
 * There is no remove by key and no pinned or metadata-only object.
 * ``deregister_memory`` of a standalone client drops every region that client
   registered, so a region is only deregistered once it is the last one.
@@ -44,7 +46,9 @@ _LOOKUP_BATCH_KEYS = 8192
 _RETAINED_CLIENTS: list[Any] = []
 
 
-def _new_umbp_client(address: str, startup_timeout_ms: int) -> Any:
+def _new_umbp_client(
+    address: str, startup_timeout_ms: int, lookup_timeout_ms: int
+) -> Any:
     """A ``UMBPClient`` connected to the standalone server at ``address``.
 
     Imported here, never at load time: the scheduler and the CPU tests load
@@ -57,6 +61,9 @@ def _new_umbp_client(address: str, startup_timeout_ms: int) -> Any:
     # One server per node, started outside ATOM: every rank connects to it.
     process.auto_start = False
     process.startup_timeout_ms = int(startup_timeout_ms)
+    # A lookup runs on the scheduler thread: a server that does not answer
+    # must not stop it. Mori's default, 0, waits for ever.
+    process.lookup_timeout_ms = int(lookup_timeout_ms)
     config = UMBPConfig()
     config.standalone_process = process
     return UMBPClient(config)
@@ -65,15 +72,24 @@ def _new_umbp_client(address: str, startup_timeout_ms: int) -> Any:
 class UMBPStoreClient:
     """One ``UMBPClient`` of a standalone server."""
 
-    def __init__(self, *, address: str, startup_timeout_ms: int = 10000) -> None:
+    def __init__(
+        self,
+        *,
+        address: str,
+        startup_timeout_ms: int = 10000,
+        lookup_timeout_ms: int = 1000,
+    ) -> None:
         self.address = address
+        self.lookup_timeout_ms = int(lookup_timeout_ms)
         self._stats_lock = threading.Lock()
         self._counts: Counter[str] = Counter()
         self._failures: Counter[str] = Counter()
         # Registered regions, base -> size.
         self._regions: dict[int, int] = {}
         try:
-            self._client = _new_umbp_client(address, startup_timeout_ms)
+            self._client = _new_umbp_client(
+                address, startup_timeout_ms, lookup_timeout_ms
+            )
         except Exception as exc:
             raise RuntimeError(
                 f"UMBP client could not connect to the standalone server at "
@@ -102,7 +118,10 @@ class UMBPStoreClient:
     def unregister(self, ptr: int) -> None:
         """Forget a region; deregister once no other region is left.
 
-        A standalone client deregisters all of its regions at once.
+        A standalone client deregisters all of its regions at once. Never
+        raises: a server that is gone fails the deregister RPC, and teardown
+        must go on (the caller closes the client and the rest of the engine
+        after this).
         """
         if self._regions.pop(int(ptr), None) is None:
             logger.warning("UMBP: the buffer at %#x is not registered", int(ptr))
@@ -116,15 +135,25 @@ class UMBPStoreClient:
             )
             return
         client = self.__dict__.get("_client")
-        if client is not None:
+        if client is None:
+            return
+        try:
             client.deregister_memory(int(ptr))
+        except Exception:  # teardown goes on without the server
+            logger.warning(
+                "UMBP: deregistering the buffer at %#x from the server at %s failed",
+                int(ptr),
+                self.address,
+                exc_info=True,
+            )
 
     # -- data plane ------------------------------------------------------
     def exists(self, keys: list[str]) -> list[bool]:
         """Per key, whether the server holds it; order kept.
 
         Split into calls of at most ``_LOOKUP_BATCH_KEYS`` keys. UMBP answers a
-        failed RPC as every key absent: a False is a miss or no answer.
+        failed RPC, and a call past ``lookup_timeout_ms``, as every key absent:
+        a False is a miss or no answer.
         """
         client = self._live()
         results: list[bool] = []

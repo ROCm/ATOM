@@ -30,6 +30,7 @@ to and from it through HIP IPC before it answers each call. What is UMBP's own:
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 from typing import Any
 
@@ -47,6 +48,7 @@ from atom.kv_transfer.offload.metadata import LMCacheReqMeta
 from atom.kv_transfer.offload.umbp_store import taint
 from atom.kv_transfer.offload.umbp_store.client import UMBPStoreClient
 from atom.kv_transfer.offload.umbp_store.config import (
+    KEY_PREFIX,
     UMBP_LAYOUTS,
     check_engine_compatibility,
     parse_umbp_store_config,
@@ -55,6 +57,9 @@ from atom.kv_transfer.offload.umbp_store.config import (
 from atom.kv_transfer.offload.umbp_store.scheduler import require_monotonic_clock_id
 
 logger = logging.getLogger("atom")
+
+# Seconds between two startup probe puts while the server answers False.
+_PROBE_RETRY_INTERVAL_S = 0.5
 
 
 class TransferSlotPool(_store_pool.TransferSlotPool):
@@ -73,16 +78,11 @@ class UMBPStoreOffloadConnector(KVStoreOffloadConnector):
 
     LABEL = "UMBP offload"
     POOL_CLASS = TransferSlotPool
-    # Side streams of the highest priority (`_copy_stream_priority`), not the
-    # forward's stream. A UMBP put or get is a synchronous RPC on the save or
-    # load thread, after which the server has copied the slots; a window's
-    # copy then ends in host waits on its stream (the block-id upload, the
-    # final fence). On the forward's stream each of those waits for every
-    # forward kernel queued ahead of it, so during long prefills a save took
-    # about a forward per window and the save queue fell past the source read
-    # deadline. UMBP runs (dense and M3 layouts; V4.1 is refused) have shown
-    # no hang on these side streams, and a much shorter warm-up.
-    STAGES_ON_FORWARD_STREAM = False
+    # Copies stage on the forward's stream, the shared layer's default
+    # (`STAGES_ON_FORWARD_STREAM`). Not overridden: a model UMBP accepts may
+    # run kernels that need every CU co-resident (M3's mono decode does), and
+    # a side stream's device-side wait on the producer event can hold a CU
+    # such a kernel waits for.
 
     # -- the backend ------------------------------------------------------
     @classmethod
@@ -122,23 +122,10 @@ class UMBPStoreOffloadConnector(KVStoreOffloadConnector):
 
     def _open_client(self, endpoint: str) -> UMBPStoreClient:
         return UMBPStoreClient(
-            address=endpoint, startup_timeout_ms=self._store_cfg.startup_timeout_ms
+            address=endpoint,
+            startup_timeout_ms=self._store_cfg.startup_timeout_ms,
+            lookup_timeout_ms=self._store_cfg.lookup_timeout_ms,
         )
-
-    def _copy_stream_priority(self, device: torch.device) -> int:
-        """The highest the device offers.
-
-        A GPU has few hardware queues and the runtime spreads streams over
-        them by priority; a copy stream of the default priority may land on
-        the queue of a forward stream and then runs only behind every kernel
-        queued ahead of it there. Streams of the highest priority take queues
-        of their own, still ordered after the forward that wrote the KV by the
-        producer event. The default off the GPU: a CPU-only torch has no
-        range to ask.
-        """
-        if device.type != "cuda":
-            return 0
-        return int(torch.cuda.Stream.priority_range()[1])
 
     def _store_marked(self, client: UMBPStoreClient, endpoint: str) -> bool:
         return taint.reason(endpoint) is not None
@@ -156,17 +143,22 @@ class UMBPStoreOffloadConnector(KVStoreOffloadConnector):
         """Send one chunk of random bytes through the server and compare it back.
 
         An unregistered pool or an unreachable server otherwise shows up only
-        as every lookup missing. A slot whose call raised stays quarantined
-        when startup gives up. UMBP cannot remove by key, so the probe's object
-        stays on the server until it is evicted: one chunk per worker start.
+        as every lookup missing. A put answered False is asked again until
+        ``umbp_store.startup_timeout_ms`` has passed: a server still
+        registering its memory answers False to early puts. A slot whose call
+        raised stays quarantined when startup gives up. UMBP cannot remove by
+        key, so the probe's object stays on the server until it is evicted:
+        one chunk per worker start.
         """
         key = probe_key(namespace, rank, uuid.uuid4().hex)
         nbytes = pool.chunk_bytes
-        [source] = pool.acquire("save", 1)
-        [target] = pool.acquire("load", 1)
         # The probe's slots no copy may still reach.
-        leased = [source, target]
+        leased: list[Slot] = []
         try:
+            [source] = pool.acquire("save", 1)
+            leased.append(source)
+            [target] = pool.acquire("load", 1)
+            leased.append(target)
             source.tensor.copy_(
                 torch.randint(
                     0, 256, (nbytes,), dtype=torch.uint8, device=source.tensor.device
@@ -174,19 +166,26 @@ class UMBPStoreOffloadConnector(KVStoreOffloadConnector):
             )
             target.tensor.zero_()
             _synchronize(pool.device)
-            [stored] = self._probe_call(
-                pool,
-                leased,
-                source,
-                lambda: client.put([key], [source.ptr], [nbytes]),
-                # A put that raised may still be read by the server.
-                on_raise=self._distrust_store,
-            )
+            deadline = time.monotonic() + self._store_cfg.startup_timeout_ms / 1000.0
+            while True:
+                [stored] = self._probe_call(
+                    pool,
+                    leased,
+                    source,
+                    lambda: client.put([key], [source.ptr], [nbytes]),
+                    # A put that raised may still be read by the server.
+                    on_raise=self._distrust_store,
+                )
+                if stored or time.monotonic() >= deadline:
+                    break
+                time.sleep(_PROBE_RETRY_INTERVAL_S)
             if not stored:
                 raise RuntimeError(
                     f"UMBP startup probe: the server at {client.address} did not "
-                    f"store a {nbytes}-byte chunk (full, or the pool is not "
-                    "registered?)"
+                    f"store a {nbytes}-byte chunk within "
+                    f"{KEY_PREFIX}startup_timeout_ms="
+                    f"{self._store_cfg.startup_timeout_ms} (full, still "
+                    "starting, or the pool is not registered?)"
                 )
             [present] = client.exists([key])
             if not present:
