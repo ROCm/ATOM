@@ -5,7 +5,7 @@ import ast
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -295,9 +295,12 @@ def _torch_attn_res(
     out_eps=1e-6,
     add_hidden2=None,
     quant_dtype=None,
+    num_blocks=None,
 ):
     """Attention residual and output RMS norm in FP32 torch."""
     assert quant_dtype is None
+    if num_blocks is not None:
+        block_residual = block_residual[:, :num_blocks]
     ps = prefix.float()
     for add in (add_hidden, add_hidden2):
         if add is not None:
@@ -576,14 +579,19 @@ def test_mono_fallback_uses_post_attention_reduction():
         torch.full((2, 4), 2.0),
         torch.zeros(2, 1, 4),
     )
+    site = _Stub()
+    site.fn = lambda *args: (normed, prefix)
+    site.maybe_close_block = lambda prefix, blocks: (blocks, prefix)
     layer = SimpleNamespace(
+        self_attention_attn_res=site,
         is_linear_attn=True,
         self_attn=lambda x: x + 1,
         _post_attention=lambda *args: args,
     )
-    runner = SimpleNamespace(_seam=lambda *a: (layer, normed, prefix, 1, -1))
+    layer.forward = MethodType(kimi.KimiDecoderLayer.forward, layer)
+    runner = SimpleNamespace(inner=SimpleNamespace(layers=[layer]))
     partial, residual, blocks = namespace["_fallback"](
-        runner, None, None, prefix, bank, None, None
+        runner, SimpleNamespace(layer_id=0), None, prefix, bank, None, None
     )
     assert torch.equal(partial, normed + 1) and residual is prefix
     assert torch.equal(blocks, bank)
