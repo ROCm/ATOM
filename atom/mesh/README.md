@@ -250,7 +250,9 @@ read sets `body_error`, with `body` holding the text read before the failure.
 
 Every `/v1/rl` request must carry `Authorization: Bearer <token>` matching
 `--rl-api-key`; any other request answers 401 `unauthorized`. `--enable-rl`
-without `--rl-api-key` fails at startup.
+without `--rl-api-key` fails at startup. Engine control calls carry each
+worker's API key to it, so only a caller holding the token gets Atomesh to act
+with those keys; keep it as secret as the worker keys.
 
 Capabilities come from a per-engine table (`sglang`, `vllm`) and can be
 overridden with `rl.*` worker labels (`rl.pause_modes`, `rl.update_from` as
@@ -260,7 +262,8 @@ any case; any other value keeps the table's). `--backend atom` has no table
 row yet: its workers list with empty capabilities. For `--backend atom`,
 discovery also reads `tp_size` and `dp_size` from each worker's
 `/server_info`, so a trainer can lay out ranks. A gRPC worker lists with
-`control_url: null`.
+`control_url: null`: it cannot be controlled through `/v1/rl`, and a control
+call to it answers 422 `no_control_endpoint`.
 
 | Flag | Default | Description |
 |------|---------|-------------|
