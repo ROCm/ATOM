@@ -6,6 +6,8 @@ use std::{collections::BTreeMap, time::Duration};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+use crate::kv_storage::OffloadReport;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct KvEventSource {
     /// The ZMQ PUB endpoint; a wildcard host stands for the worker's own.
@@ -14,6 +16,12 @@ pub struct KvEventSource {
     pub topic: String,
     /// Tokens per hashed block.
     pub block_size: u32,
+    /// The ZMQ ROUTER endpoint that replays recent batches, if the engine keeps them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_endpoint: Option<String>,
+    /// The store the engine offloads KV to, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offload: Option<OffloadReport>,
 }
 
 impl KvEventSource {
@@ -22,15 +30,20 @@ impl KvEventSource {
         let host = Url::parse(worker_url)
             .ok()
             .and_then(|url| url.host_str().map(str::to_string));
-        let bound = self.endpoint.strip_prefix("tcp://");
-        if let (Some(host), Some((bound_host, port))) =
-            (host, bound.and_then(|b| b.rsplit_once(':')))
-        {
-            if matches!(bound_host, "*" | "0.0.0.0" | "[::]") {
-                self.endpoint = format!("tcp://{host}:{port}");
-            }
+        if let Some(host) = host {
+            self.endpoint = reach(self.endpoint, &host);
+            self.replay_endpoint = self.replay_endpoint.map(|e| reach(e, &host));
         }
         self
+    }
+}
+
+/// `endpoint` with a wildcard host replaced by `host`.
+fn reach(endpoint: String, host: &str) -> String {
+    let bound = endpoint.strip_prefix("tcp://");
+    match bound.and_then(|b| b.rsplit_once(':')) {
+        Some(("*" | "0.0.0.0" | "[::]", port)) => format!("tcp://{host}:{port}"),
+        _ => endpoint,
     }
 }
 
@@ -103,10 +116,12 @@ mod tests {
         ] {
             let source = KvEventSource {
                 endpoint: endpoint.into(),
-                topic: String::new(),
-                block_size: 16,
+                replay_endpoint: Some(endpoint.into()),
+                ..Default::default()
             };
-            assert_eq!(source.resolve(worker).endpoint, want, "{endpoint}");
+            let source = source.resolve(worker);
+            assert_eq!(source.endpoint, want, "{endpoint}");
+            assert_eq!(source.replay_endpoint.as_deref(), Some(want), "{endpoint}");
         }
     }
 
@@ -114,14 +129,42 @@ mod tests {
     fn ranks_are_numbers_and_blocks_hold_tokens() {
         let sources = |body| parse(serde_json::from_value(body).unwrap(), "http://h:8000");
         let two = sources(json!({
-            "2": {"endpoint": "tcp://*:5559", "topic": "kv", "block_size": 16},
+            "2": {"endpoint": "tcp://*:5559", "topic": "kv", "block_size": 16, "replay_endpoint": "tcp://*:5602"},
             "3": {"endpoint": "tcp://*:5560", "block_size": 16},
         }))
         .unwrap();
         assert_eq!(two.keys().copied().collect::<Vec<_>>(), [2, 3]);
         assert_eq!(two[&2].endpoint, "tcp://h:5559");
         assert_eq!((two[&2].topic.as_str(), two[&3].topic.as_str()), ("kv", ""));
+        let replay = |rank| two[&rank].replay_endpoint.as_deref();
+        assert_eq!((replay(2), replay(3)), (Some("tcp://h:5602"), None));
         assert!(sources(json!({})).unwrap().is_empty());
+        // As ATOM reports a Mooncake Store; another backend's report lacks fields.
+        let offload = |offload| {
+            let source =
+                json!({"0": {"endpoint": "tcp://*:1", "block_size": 16, "offload": offload}});
+            sources(source)
+                .unwrap()
+                .remove(&0)
+                .unwrap()
+                .offload
+                .unwrap()
+        };
+        let store = offload(
+            json!({"backend": "mooncake_store", "masters": ["10.0.0.9:26051"],
+            "namespace": "atomkv1-5f0e3c9a2b7d41e6a8c3f1d2", "chunk_tokens": 256, "world": 8,
+            "min_load_tokens": 8192, "chain_check": "368bbb8bdb74a66c980c2a9762fef7fa"}),
+        );
+        assert_eq!(
+            (store.masters.len(), store.chunk_tokens, store.world),
+            (1, 256, 8)
+        );
+        let lmcache =
+            offload(json!({"backend": "lmcache", "chunk_tokens": 256, "min_load_tokens": 8192}));
+        assert_eq!(
+            (lmcache.backend.as_str(), lmcache.masters.len()),
+            ("lmcache", 0)
+        );
         let one = |rank: &str, block_size| json!({rank: {"endpoint": "tcp://*:1", "block_size": block_size}});
         assert!(sources(one("rank0", 16)).is_err());
         assert!(sources(one("0", 0)).is_err());

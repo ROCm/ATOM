@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Run atomesh-benchmark.yaml's own steps and expressions without GitHub."""
+"""Evaluate workflow expressions and run atomesh-benchmark.yaml's steps offline."""
 
 import json
 import os
@@ -61,6 +61,16 @@ def run_matrix_step(script: str, env: dict[str, str]) -> tuple[list[dict], str]:
         return cells, output.read_text()
 
 
+class _JobOutputs:
+    """A `needs.<job>.outputs` context: an unset output reads as ''."""
+
+    def __init__(self, outputs: dict[str, str]):
+        self._outputs = outputs
+
+    def __getattr__(self, name: str) -> str:
+        return self._outputs.get(name, "")
+
+
 def github_expressions(
     source: str,
     event: str,
@@ -70,11 +80,22 @@ def github_expressions(
     review_state: str = "",
     ref: str = "refs/heads/main",
     run_id: str = "1",
+    action: str = "",
+    label_name: str = "",
+    label_names: tuple[str, ...] = (),
+    needs_outputs: dict[str, str] | None = None,
 ) -> str:
-    """Evaluate the ${{ }} segments of a workflow value for a run with no inputs."""
+    """Evaluate the ${{ }} segments of a workflow value for a run with no inputs.
+
+    `needs_outputs` are the outputs every `needs.<job>.outputs` reads.
+    """
     event_context = SimpleNamespace(
         schedule=schedule,
-        pull_request=SimpleNamespace(number=pull_request_number),
+        action=action,
+        label=SimpleNamespace(name=label_name),
+        pull_request=SimpleNamespace(
+            number=pull_request_number, label_names=list(label_names)
+        ),
         review=SimpleNamespace(state=review_state),
     )
     context = {
@@ -84,19 +105,24 @@ def github_expressions(
         "workflow": workflow,
         "ref": ref,
         "run_id": run_id,
+        "job_outputs": _JobOutputs(needs_outputs or {}),
     }
 
     def evaluate(match: re.Match) -> str:
         expression = re.sub(r"\binputs\.\w+", "''", match.group(1))
+        expression = re.sub(r"\bneeds\.[\w-]+\.outputs\.", "job_outputs.", expression)
         expression = re.sub(r"\bgithub\.event\.schedule\b", "schedule", expression)
         expression = re.sub(r"\bgithub\.(\w+)\b", r"\1", expression)
+        expression = expression.replace(".labels.*.name", ".label_names")
         expression = expression.replace("&&", " and ").replace("||", " or ")
+        expression = re.sub(r"!(?!=)", " not ", expression)
         return str(
             eval(
                 expression,
                 {
                     "__builtins__": {},
                     "format": lambda template, *args: template.format(*args),
+                    "contains": lambda items, item: item in items,
                 },
                 context,
             )

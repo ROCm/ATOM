@@ -39,7 +39,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 
 from .op import exp
 
@@ -524,8 +524,10 @@ def _replayssm_materialize_kernel(
     stride_bufg_pos: tl.constexpr,
     stride_bufg_hv: tl.constexpr,
     DOT_MODE: tl.constexpr,
+    IS_KDA: tl.constexpr,
 ):
-    i_v, i_nh = tl.program_id(0), tl.program_id(1)
+    # Rows on axis 0: layers x sequences x heads outgrows axis 1's limit.
+    i_nh, i_v = tl.program_id(0), tl.program_id(1)
     i_n, i_hv = i_nh // HV, i_nh % HV
     if i_n >= N:
         return
@@ -549,10 +551,14 @@ def _replayssm_materialize_kernel(
     o_v = i_v * BV + tl.arange(0, BV)
     mask_k = o_k < K
     mask_v = o_v < V
-    mask_h = mask_k[:, None] & mask_v[None, :]
 
-    p_src = ckpt + src * stride_ckpt_slot + i_hv * K * V
-    b_s0 = tl.load(p_src + o_k[:, None] * V + o_v[None, :], mask=mask_h, other=0.0).to(
+    mask_h = mask_k[:, None] & mask_v[None, :]
+    # A [K, V] tile either way; KDA keeps the state transposed as [V, K].
+    if IS_KDA:
+        off = i_hv * K * V + o_k[:, None] + o_v[None, :] * K
+    else:
+        off = i_hv * K * V + o_k[:, None] * V + o_v[None, :]
+    b_s0 = tl.load(ckpt + src * stride_ckpt_slot + off, mask=mask_h, other=0.0).to(
         tl.float32
     )
     b_kw, b_ru, b_decay = _replay_tiles_kmajor(
@@ -579,15 +585,11 @@ def _replayssm_materialize_kernel(
         V,
         BK,
         BH,
-        False,
+        IS_KDA,
     )
     b_h = b_s0 * b_decay[:, None] + _replay_dot(b_kw, b_ru, True, DOT_MODE)
-    p_dst = ckpt + dst * stride_ckpt_slot + i_hv * K * V
-    tl.store(
-        p_dst + o_k[:, None] * V + o_v[None, :],
-        b_h.to(p_dst.dtype.element_ty),
-        mask=mask_h,
-    )
+    p_dst = ckpt + dst * stride_ckpt_slot + off
+    tl.store(p_dst, b_h.to(p_dst.dtype.element_ty), mask=mask_h)
 
 
 def replayssm_materialize(
@@ -602,7 +604,8 @@ def replayssm_materialize(
     max_query_len: int,
 ) -> None:
     """Write the state after verify step ``step_idx[i]`` of ``slot_idx[i]``
-    into checkpoint slot ``dst_idx[i]`` (GDN, scalar gate).
+    into checkpoint slot ``dst_idx[i]``. GDN (scalar gate, ``[HV, K, V]``) or
+    KDA (per-channel gate, a 4-D ``buf_g``, transposed ``[HV, V, K]``).
 
     Call after the verify forward and before :func:`replayssm_commit` for that
     step: the rebuild re-derives the forward's append offset from the cursor
@@ -611,7 +614,8 @@ def replayssm_materialize(
     round-trip.  The source slot's checkpoint and records are only read.
 
     Args:
-        ckpt: ``[num_slots, HV, K, V]`` contiguous checkpoint pool
+        ckpt: ``[num_slots, HV, K, V]`` (KDA ``[num_slots, HV, V, K]``)
+            contiguous checkpoint pool
         buf_k / buf_u / buf_g: this layer's record buffers
         write_pos: ``[num_slots]`` int32 cursor, not yet advanced for this step
         slot_idx: ``[N]`` live slot of each sequence
@@ -624,9 +628,10 @@ def replayssm_materialize(
         return
     if not ckpt.is_contiguous():
         raise ValueError("replayssm_materialize requires a contiguous checkpoint")
-    if buf_g.ndim != 3:
-        raise ValueError("replayssm_materialize supports the scalar-gate GDN ring")
-    _, HV, K, V = ckpt.shape
+    is_kda = buf_g.ndim == 4
+    # The records name the head dims; the checkpoint's axis order is layout.
+    HV, K, V = ckpt.shape[1], buf_k.shape[-1], buf_u.shape[-1]
+    assert ckpt[0, 0].numel() == K * V, "checkpoint and records disagree on K, V"
     cap = buf_k.shape[2]
     assert flush_threshold_ok(cap, max_query_len)
     BK = triton.next_power_of_2(K)
@@ -636,7 +641,7 @@ def replayssm_materialize(
     # The forward's replay tile: `base + step + 1` never exceeds
     # `cap - max_query_len` (see the flush policy above).
     BH = max(16, triton.next_power_of_2(cap - max_query_len))
-    _replayssm_materialize_kernel[(NV, n * HV)](
+    _replayssm_materialize_kernel[(n * HV, NV)](
         ckpt=ckpt,
         buf_k=buf_k,
         buf_u=buf_u,
@@ -665,6 +670,7 @@ def replayssm_materialize(
         stride_bufg_pos=buf_g.stride(2),
         stride_bufg_hv=buf_g.stride(1),
         DOT_MODE=_replay_dot_mode(buf_u.dtype),
+        IS_KDA=is_kda,
         num_warps=1,
         num_stages=3,
     )
@@ -1354,11 +1360,30 @@ def _serial_launch_config(
     where BV=64 stays best; num_stages is flat either way.
 
     The small-batch rule is gated to gfx950, the only architecture it was
-    measured on. Other targets (gfx942, gfx1250) keep the large-batch config
-    until tests/bench_replayssm_decode.py shows BV=16 winning there too.
+    measured on. The gfx1250 ladder below is gated to the one shape it was
+    measured on; other shapes and gfx942 keep the large-batch config.
     """
     if not is_kda and max_query_len > 1 and N * HV <= 768 and get_gfx() == "gfx950":
         return min(triton.next_power_of_2(V), 16), 1, 3
+    if (
+        not is_kda
+        and HV == 48
+        and V == 128
+        and max_query_len == 4
+        and get_gfx_runtime() == "gfx1250"
+    ):
+        # gfx1250, Qwen3.8 H=16 HV=48 K=V=128 T=4, cold state, CUDA graph,
+        # us at BV=64 -> chosen BV: bs1 9.3 -> 6.6 (BV16), bs4 9.5 -> 8.3
+        # (BV16), bs8 10.5 -> 10.5 (BV64), bs16 20.6 -> 18.7 (BV32), bs48
+        # 49.3 -> 43.7 (BV32), bs128 128.7 -> 113.1 (BV32). num_warps=2 is
+        # slower at every size.
+        if N * HV <= 192:
+            bv = 16
+        elif N * HV <= 384:
+            bv = 64
+        else:
+            bv = 32
+        return min(triton.next_power_of_2(V), bv), 1, 3
     return min(triton.next_power_of_2(V), 64), 1, 3
 
 
