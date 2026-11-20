@@ -21,6 +21,11 @@ NONE = "none"
 REPLAY = "replay"
 
 
+def snapped_checkpoint_interval(interval: int, hash_block_size: int) -> int:
+    """Keep sentinels; positive intervals round down to a reachable hash boundary."""
+    return interval // hash_block_size * hash_block_size if interval > 0 else interval
+
+
 @dataclass(frozen=True)
 class StateTransfer:
     """How a backend transfers one request's state to another slot."""
@@ -33,20 +38,20 @@ class StateTransfer:
     #:
     #: A separate axis from `kind`, and it must stay one. `kind` answers how a
     #: slot is handed to *another request*; this answers where within one
-    #: forward a snapshot can be taken at all. GDN is `fork(1)` and — because
-    #: its chunk kernel's per-chunk intermediates are copied out —
-    #: midstep-readable; DeepSeek-V4 is `copy()` and is not, because its
-    #: compressor ring is not materialized at interior boundaries the way a
-    #: chunk kernel's `h` is. Deriving either from the other would silently
-    #: turn the prefill chunk cut off for a backend that still needs it.
+    #: forward a snapshot can be taken. GDN can copy chunk intermediates;
+    #: Kimi KDA can re-run a head ending at the target. Both can checkpoint
+    #: midstep with PAGE copies, while GDN also supports fork transfer.
+    #: DeepSeek-V4's compressor ring has no interior snapshot path. Deriving
+    #: readability from transfer kind would remove cuts it still needs.
     #:
     #: Default False, so every backend keeps today's behavior until it has
-    #: actually ported the copy-out.
+    #: implemented and enabled an interior snapshot path.
     readable_midstep: bool = False
     #: Token spacing of the interior states a readable backend exposes, counted
     #: from the *start of the forward*, not from position 0. GDN's chunk kernel
     #: materializes `h` every 64 tokens of the step, so a forward over
-    #: `(start, end]` can be read at `start + 64k` and nowhere else inside it.
+    #: `(start, end]` can be read at `start + 64k` inside it. Kimi's head
+    #: re-runs use grid 1 because the head can end at any token.
     #: 0 when not readable.
     midstep_grid: int = 0
     #: Tokens of this forward a snapshot needs behind it: GDN's conv window
@@ -362,42 +367,30 @@ def midstep_checkpoint_targets(
 
 
 def midstep_rerun_rows(
-    targets: list[tuple[int, int, int, int, int]],
-    num_scheduled_tokens,
-    conv_len: int,
+    targets: list[tuple[int, int, int, int, int]], num_scheduled_tokens
 ) -> dict[str, list]:
-    """Index lists for writing `targets` with a kernel that keeps no `h`.
-
-    The forward runs its rows and, after them, one more sequence per interior
-    target: the row's tokens before the target, from the row's initial state.
-    That sequence's final state is the checkpoint (`head_slots`). Gathering
-    the inputs by `kda_tokens` and `kda_rows` and cutting them by `kda_cu`
-    keeps it one call over one `cu_seqlens` a step. An end target copies the
-    runtime slot (`end_runtime` to `end_slots`). Every target's conv window is
-    the `conv_len` tokens before it (`conv_tokens` to `slots`). Token indices
-    count from this step's first token, as the forward's `cu_seqlens` does.
-    An empty group is left out.
-    """
+    """Small checkpoint descriptors and ranges for re-running interior heads."""
+    if not targets:
+        return {}
     cu = [0]
     for n in num_scheduled_tokens:
         cu.append(cu[-1] + int(n))
-    groups = ("slots", "conv_tokens", "head_slots", "end_slots", "end_runtime")
-    out = {k: [] for k in groups}
-    out["kda_tokens"] = list(range(cu[-1]))
-    out["kda_rows"] = list(range(len(cu) - 1))
-    out["kda_cu"] = list(cu)
-    for row, slot, off, is_end, runtime in targets:
-        at = cu[row] + off
-        out["slots"].append(slot)
-        out["conv_tokens"].append(list(range(at - conv_len, at)))
-        if is_end:
-            out["end_slots"].append(slot)
-            out["end_runtime"].append(runtime)
-        else:
-            out["head_slots"].append(slot)
-            out["kda_tokens"].extend(range(cu[row], at))
-            out["kda_rows"].append(row)
-            out["kda_cu"].append(out["kda_cu"][-1] + off)
-    if not out["head_slots"]:
-        del out["kda_tokens"], out["kda_rows"], out["kda_cu"]
-    return {k: v for k, v in out.items() if v}
+    rows, slots, offs, is_end, runtime = map(list, zip(*targets))
+    out = {
+        "rows": rows,
+        "slots": slots,
+        "offs": offs,
+        "is_end": is_end,
+        "runtime": runtime,
+        "h_rows": [0] * len(targets),
+    }
+    head_ranges, kda_rows, kda_cu = [], list(range(len(cu) - 1)), list(cu)
+    for i, (row, _slot, off, end, _runtime) in enumerate(targets):
+        if not end:
+            out["h_rows"][i] = len(head_ranges)
+            head_ranges.append((cu[row], off))
+            kda_rows.append(row)
+            kda_cu.append(kda_cu[-1] + off)
+    if head_ranges:
+        out.update(head_ranges=head_ranges, kda_rows=kda_rows, kda_cu=kda_cu)
+    return out

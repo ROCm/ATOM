@@ -44,6 +44,8 @@ def builder(
     kpool_tail=None,
     prefix_caching=True,
     interval=-1,
+    block_size=4,
+    dcp=1,
 ):
     """`kpool` is the model's (GLM-5.3 pools indexer keys); `kpool_tail` says
     whether this PP stage holds indexer layers, and with them the tail plane."""
@@ -53,6 +55,8 @@ def builder(
         hf_config=SimpleNamespace(linear_conv_kernel_dim=4),
         enable_prefix_caching=prefix_caching,
         state_checkpoint_interval_tokens=interval,
+        kv_cache_block_size=block_size,
+        decode_context_parallel_size=dcp,
     )
     if kpool_tail is None:
         kpool_tail = kpool > 1

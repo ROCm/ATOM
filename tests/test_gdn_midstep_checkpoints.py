@@ -23,10 +23,11 @@ from test_state_checkpoint import (
     PROMPT,
     demand_config,
     make_block_manager,
+    make_scheduler,
     stateful_seq,
 )
 
-from atom.model_engine.scheduler import ScheduledBatch
+from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.model_engine.state_runtime import (
     StateRuntime,
     StateTransfer,
@@ -465,3 +466,100 @@ class TestPagedMidstep:
         )
         backends.AttentionMetadataBuilder._checkpoint_staging(builder)
         assert sized == [7 * 3 * 2]  # budget x spans per copy
+
+
+class TestPagedAnchorFallback:
+    @pytest.mark.parametrize("advance", [False, True])
+    def test_shared_pool_exhaustion_keeps_all_anchors(self, advance):
+        runtime = StateRuntime(
+            transfer=StateTransfer.copy(
+                PAGED_COPY_SPEC.layout_id,
+                readable_midstep=True,
+                midstep_grid=1,
+                midstep_min_offset=3,
+            ),
+            checkpoint_spec=PAGED_COPY_SPEC,
+        )
+        sched = make_scheduler(
+            demand_config(
+                max_num_seqs=6,
+                max_num_batched_tokens=512,
+                pool_entries={"state": 10},
+                state_checkpoint_interval_tokens=-1,
+            ),
+            state_runtime=runtime,
+        )
+        sched.advance_on_schedule = advance
+        sched.drafter_needs_next_token = True
+        seqs = [stateful_seq([t + 1000 * i for t in PROMPT]) for i in range(6)]
+        for seq in seqs:
+            sched.add(seq)
+        bm = sched.block_manager
+        coord = bm.paged_state_checkpoints
+        first, active1 = sched.schedule()
+        assert list(active1.values()) == seqs  # Admission owns the first six slots.
+        assert first.num_scheduled_tokens.tolist() == [44] * 4 + [40] * 2
+        assert first.total_tokens_num == first.total_tokens_num_prefill == 256
+        assert first.is_final_chunk == [True] * 4 + [False] * 2
+        assert first.next_token_ids == [-1] * 4 + [4040, 5040]
+        assert first.state_maintenance_ops.checkpoint_stores == ()
+        runtime_slots = [seq.state_slot for seq in seqs]
+        scratch_slots = [s for seq in seqs for s, _p, _h in seq.midstep_reservations]
+        assert len(scratch_slots) == 4
+        assert set(scratch_slots).isdisjoint(runtime_slots)
+        assert bm.state.num_free() == 0
+        assert [seq.midstep_reservations for seq in seqs[4:]] == [[], []]
+        sched.mark_pp_inflight(first)
+
+        def retire(batch, active):
+            sched.postprocess(
+                list(active.values()),
+                ScheduledBatchOutput([], [], None, None, None, is_deferred_out=True),
+                batch=batch,
+            )
+
+        if not advance:
+            retire(first, active1)
+        # With schedule-time advancement this suffix is issued before the
+        # anchor batch retires. Its boundary copy must already be staged.
+        second, active2 = sched.schedule()
+        assert set(active2) == {seq.id for seq in seqs[4:]}
+        assert second.num_cached_tokens == [40, 40]
+        assert second.num_scheduled_tokens.tolist() == [4, 4]
+        assert second.total_tokens_num == 8
+        assert second.is_final_chunk == [True, True]
+        assert second.next_token_ids == [-1, -1]
+        stores = list(second.state_maintenance_ops.checkpoint_stores)
+        fallback_stores = [op for op in stores if op.src_slot in runtime_slots]
+        assert {op.src_slot for op in fallback_stores} == set(runtime_slots[4:])
+        assert all(op.scratch_slot == -1 for op in fallback_stores)
+        if advance:
+            retire(first, active1)
+        retire(second, active2)
+        bm.complete_previous_state_batch()
+        stores.extend(bm.take_state_maintenance_ops().checkpoint_stores)
+        bm.complete_previous_state_batch()
+        assert len(stores) == 6
+        assert coord.checkpoints_dropped == 0
+        assert bm.chunks_cut_for_end == 2
+        assert bm.state.num_free() == 4  # Only borrowed scratch was released.
+        assert [seq.state_slot for seq in seqs] == runtime_slots
+        for seq in seqs:
+            h = seq.block_hashes[40 // BLOCK - 1]
+            assert coord.store.contains(h)
+            assert bm.can_allocate(stateful_seq(list(seq.token_ids))) == 40 // BLOCK
+
+    def test_an_existing_anchor_does_not_force_another_cut(self):
+        bm = TestPagedMidstep().bm(pool_entries={"state": 2})
+        seq = admitted(bm)
+        bm.plan_midstep(seq, 0, 44)
+        bm.hash_blocks(seq, 44)
+        assert bm.state.num_free() == 0
+        assert bm.plan_midstep(seq, 0, 44) == 44
+
+    def test_a_forbidden_cut_keeps_an_atomic_forward_whole(self):
+        bm = TestPagedMidstep().bm(pool_entries={"state": 1})
+        seq = admitted(bm)
+        assert bm.plan_midstep(seq, 0, 44, cut_floor=44) == 44
+        assert seq.midstep_reservations == []
+        assert bm.chunks_cut_for_end == 0

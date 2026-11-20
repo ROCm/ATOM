@@ -136,8 +136,8 @@ def write_state_checkpoints(
     only one of them would pair a state at P with a window from elsewhere,
     which is silently wrong — hence the single entry point.
 
-    ``is_end`` picks the SSM source per target: 0 reads the chunk kernel's
-    intermediates (an interior position), 1 reads ``runtime_slots[i]`` (a
+    ``is_end`` picks the SSM source per target: 0 reads an interior snapshot
+    from ``h``, 1 reads ``runtime_slots[i]`` (a
     position at the end of the row's tokens, which is only ever in the runtime
     slot). The conv half is the same window slice either way.
 
@@ -160,7 +160,8 @@ def write_state_checkpoints(
     When snapshots are needed, ``interior_state_snapshots`` plans those rows
     and the chunk kernel fills the ``h_snap`` buffer allocated by
     ``GatedDeltaNet``; pass that buffer as ``h`` with the planned ``h_rows``.
-    Without it the row is the chunk boundary,
+    Kimi KDA instead supplies head re-runs' final states with explicit rows.
+    Without ``h_rows`` the row is the chunk boundary,
     ``chunk_offsets[row] + off // chunk``.
     """
     n = rows.numel()

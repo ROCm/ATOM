@@ -1288,22 +1288,6 @@ class KimiKDAAttention(nn.Module):
         out, state = self._run_kda(q, k, v, gate, beta, initial, cu, True)
         return out[:, :num_tokens], state[:num_rows], state[num_rows:]
 
-    @staticmethod
-    def _write_state_checkpoints(ckpt, head_states, mixed_qkv, conv_state, ssm_state):
-        """Fill the scratch slots of this step's midstep checkpoints.
-
-        An interior target's state is its head's final state, an end target's
-        the runtime slot this forward just wrote. The conv half is the
-        `conv_kernel - 1` inputs before the target, oldest first, which is
-        where `causal_conv1d_fn` resumes a prefill from.
-        """
-        if "head_slots" in ckpt:
-            ssm_state[ckpt["head_slots"]] = head_states
-        if "end_slots" in ckpt:
-            ssm_state[ckpt["end_slots"]] = ssm_state[ckpt["end_runtime"]]
-        window = mixed_qkv[ckpt["conv_tokens"]].transpose(1, 2)
-        conv_state[ckpt["slots"], :, : window.shape[2]] = window.to(conv_state.dtype)
-
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # hidden_states is a (fp8, scale) tuple when input_layernorm fused the
         # per-token quant; carry the scale through the opaque splitting custom op
@@ -1439,16 +1423,39 @@ class KimiKDAAttention(nn.Module):
                 ssm_state, state_indices_in, kda_metadata.has_initial_state
             )
             ckpt = getattr(kda_metadata, "ssm_checkpoints", None)
-            kda_out, last_state, head_states = self._prefill_kda(
-                q, k, v, gate, beta, initial, query_start_loc, ckpt
-            )
+            if ckpt is not None and "kda_tokens" in ckpt:
+                kda_out, last_state, head_states = self._prefill_kda(
+                    q, k, v, gate, beta, initial, query_start_loc, ckpt
+                )
+            else:
+                kda_out, last_state = self._run_kda(
+                    q, k, v, gate, beta, initial, query_start_loc, True
+                )
+                head_states = last_state
             # last_state already has ssm_state's dtype (fla preserves the
             # initial_state dtype; the gathered initial is allocated as such),
             # so no .to() cast is needed.
             ssm_state[state_indices] = last_state
             if ckpt is not None:
-                self._write_state_checkpoints(
-                    ckpt, head_states, mixed_qkv, conv_state, ssm_state
+                from atom.model_ops.fla_ops.state_checkpoint import (
+                    write_state_checkpoints,
+                )
+
+                write_state_checkpoints(
+                    head_states,
+                    ssm_state,
+                    mixed_qkv,
+                    conv_state,
+                    ckpt["rows"],
+                    ckpt["slots"],
+                    ckpt["offs"],
+                    ckpt["is_end"],
+                    ckpt["runtime"],
+                    query_start_loc,
+                    query_start_loc,
+                    chunk_size=1,
+                    conv_state_len=kda_metadata.ssm_conv_state_len,
+                    h_rows=ckpt["h_rows"],
                 )
             # o_norm only reads this tensor, so keep the contiguous KDA output
             # instead of materializing an identical copy into `out`.
