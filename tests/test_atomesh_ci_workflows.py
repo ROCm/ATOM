@@ -6,12 +6,12 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-import pytest
 import yaml
 from atomesh_workflow_helpers import github_expressions
 
@@ -114,9 +114,17 @@ def test_a_pull_request_checks_one_model_standalone_and_1p1d(tmp_path):
         "Accuracy (${{ matrix.model_name }}"
         "${{ matrix.serving == '1p1d' && ', 1P1D' || '' }})"
     )
-    accuracy = _steps(jobs["atomesh-test"])["Run ATOM accuracy test"]
+    steps = _steps(jobs["atomesh-test"])
+    accuracy = steps["Run ATOM accuracy test"]
     assert accuracy["env"]["SERVING"] == "${{ matrix.serving }}"
-    assert 'launch="bash .github/scripts/atomesh_pd_accuracy.sh"' in accuracy["run"]
+    assert (
+        'if [ "$SERVING" = "1p1d" ]; then\n'
+        '  launch="bash .github/scripts/atomesh_pd_accuracy.sh"\n'
+        "fi\n"
+    ) in accuracy["run"]
+    # The gate holds a 1P1D case to its model's threshold.
+    check = steps["Check accuracy test results"]
+    assert check["env"]["MODEL_NAME"] == "${{ matrix.model_name }}"
 
 
 def test_the_accuracy_scope_matches_the_push_paths():
@@ -137,8 +145,17 @@ def test_every_accuracy_case_reaches_the_dashboard_with_its_models_threshold(
     root = WORKFLOWS.parents[1]
     catalog = root / ".github" / "benchmark" / "models_accuracy.json"
     cases = _accuracy_cases(tmp_path, "schedule")
+    accuracy_name = _jobs("atomesh-accuracy-validation.yaml")["atomesh-test"]["env"][
+        "ACCURACY_NAME"
+    ]
+    # The names the workflow gives each case's artifacts and dashboard row.
     names = {
-        c["model_name"] + ("-1p1d" if c["serving"] == "1p1d" else ""): c["model_name"]
+        github_expressions(
+            accuracy_name.replace("matrix.model_name", repr(c["model_name"])).replace(
+                "matrix.serving", repr(c["serving"])
+            ),
+            "schedule",
+        ): c["model_name"]
         for c in cases
     }
     assert "gpt-oss-120b-1p1d" in names
@@ -188,19 +205,27 @@ def _read_when_written(path, timeout=10):
     return path.read_text()
 
 
-def _run_launcher(tmp_path, curl_exit=0, **env):
-    """Run the 1P1D launcher with the servers, the router and curl stubbed."""
+def _run_launcher(tmp_path, curl_fails="", server_stays_up=False, **env):
+    """Run the 1P1D launcher with the servers, the router, curl and sleep stubbed.
+
+    curl fails for the URLs matching the shell pattern `curl_fails`.
+    """
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     # The servers and the router print how they were started into their logs,
     # and curl logs the URLs it was given.
-    stubs = {
-        "python3": 'echo "GPUS=$HIP_VISIBLE_DEVICES ENTRY=$USE_ATOMESH_ENTRYPOINTS'
-        ' HOME=$HOME $*"',
-        "atomesh": 'echo "$*"',
-        "curl": 'for a in "$@"; do case "$a" in http*) echo "$a" >> "$CURL_LOG";;'
-        f" esac; done\nexit {curl_exit}",
-    }
+    server = (
+        'echo "GPUS=$HIP_VISIBLE_DEVICES ENTRY=$USE_ATOMESH_ENTRYPOINTS HOME=$HOME $*"'
+    )
+    if server_stays_up:
+        server += f"\nexec {shutil.which('sleep')} 10"
+    curl = (
+        'for a in "$@"; do case "$a" in http*) url="$a"; echo "$a" >> "$CURL_LOG";;'
+        " esac; done"
+    )
+    if curl_fails:
+        curl += f'\ncase "$url" in {curl_fails}) exit 7;; esac'
+    stubs = {"python3": server, "atomesh": 'echo "$*"', "curl": curl, "sleep": ""}
     for name, body in stubs.items():
         (bin_dir / name).write_text(f"#!/bin/sh\n{body}\n")
         (bin_dir / name).chmod(0o755)
@@ -225,16 +250,7 @@ def _run_launcher(tmp_path, curl_exit=0, **env):
     )
 
 
-@pytest.mark.parametrize(
-    "env, prefill_gpus, decode_gpus, decode_handshake_port",
-    [
-        ({}, "0", "1", "6302"),
-        ({"PREFILL_GPUS": "0,1", "DECODE_GPUS": "2"}, "0,1", "2", "6303"),
-    ],
-)
-def test_the_1p1d_launcher_puts_the_router_in_front_of_both_servers(
-    tmp_path, env, prefill_gpus, decode_gpus, decode_handshake_port
-):
+def _check_the_launch(tmp_path, env, prefill_gpus, decode_gpus, decode_handshake_port):
     result = _run_launcher(tmp_path, **env)
     assert result.returncode == 0, result.stdout + result.stderr
 
@@ -279,13 +295,45 @@ def test_the_1p1d_launcher_puts_the_router_in_front_of_both_servers(
     ]
 
 
-def test_the_1p1d_launcher_fails_when_a_server_never_answers(tmp_path):
-    result = _run_launcher(tmp_path, curl_exit=7, WAIT_SECONDS="0")
+def test_the_1p1d_launcher_puts_the_router_in_front_of_both_servers(tmp_path):
+    _check_the_launch(tmp_path, {}, "0", "1", "6302")
+
+
+def test_the_1p1d_launcher_gives_each_prefill_rank_a_handshake_port(tmp_path):
+    _check_the_launch(
+        tmp_path, {"PREFILL_GPUS": "0,1", "DECODE_GPUS": "2"}, "0,1", "2", "6303"
+    )
+
+
+def test_the_1p1d_launcher_fails_when_a_server_exits_before_answering(tmp_path):
+    result = _run_launcher(tmp_path, curl_fails="*")
     assert result.returncode == 1
-    assert "atom_prefill.log" in result.stdout
+    assert "Exited before http://10.0.0.5:8010/health answered" in result.stdout
+    assert set((tmp_path / "curl.log").read_text().split()) == {
+        "http://10.0.0.5:8010/health"
+    }
+
+
+def test_the_1p1d_launcher_fails_when_a_server_never_answers(tmp_path):
+    result = _run_launcher(
+        tmp_path, curl_fails="*", server_stays_up=True, WAIT_SECONDS="0"
+    )
+    assert result.returncode == 1
+    assert "No answer from http://10.0.0.5:8010/health in 0s" in result.stdout
     assert (tmp_path / "curl.log").read_text().split() == [
         "http://10.0.0.5:8010/health"
     ]
+
+
+def test_the_1p1d_launcher_fails_when_no_completion_gets_through(tmp_path):
+    result = _run_launcher(tmp_path, curl_fails="*/v1/completions")
+    assert result.returncode == 1
+    assert "No completion through the router" in result.stdout
+    assert (tmp_path / "curl.log").read_text().split() == [
+        "http://10.0.0.5:8010/health",
+        "http://10.0.0.5:8020/health",
+        "http://127.0.0.1:8000/v1/models",
+    ] + ["http://127.0.0.1:8000/v1/completions"] * 10
 
 
 def test_atomesh_benchmark_uses_required_heavy_ci_gate():
