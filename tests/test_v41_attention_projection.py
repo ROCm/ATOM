@@ -57,6 +57,7 @@ def test_attention_output_projection(fused_attention, fused_woa, leading_shape):
         o_rank=rank,
         _fuse_woa_quant=fused_woa,
         wo_a=SimpleNamespace(
+            runs_bf16=False,
             weight=torch.empty(groups * rank, 8 * head_dim),
             weight_scale=torch.empty(groups * rank // 32, 8 * head_dim // 32),
         ),
