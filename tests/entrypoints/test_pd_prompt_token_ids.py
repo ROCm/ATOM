@@ -11,6 +11,7 @@ import fastapi.routing
 import httpx
 import numpy as np
 import pytest
+from conftest import gpu_stack_import
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 
