@@ -165,7 +165,9 @@ def _front_tasks(
         fp8_depth = TDM_FP8_PAIR_DEPTH if paired else gemv_tdm.FP8_DEPTH
     pipe = pipe or {}
     gemv_pipe = {
-        k: v for k, v in pipe.items() if k in ("late", "token_steps", "early_scales")
+        k: v
+        for k, v in pipe.items()
+        if k in ("late", "token_steps", "early_scales", "unroll")
     }
     red = (
         lds.gemv.ptr
@@ -460,17 +462,14 @@ def _front_epilogue_fused(
         for low, high in sums
     ]
     if router:
-        logits = rsrc(router_logits, rows * EXPERTS * 4)
         for tile in range_constexpr(tiles):
-            bo.buffer_store(
-                fx.Vector.from_elements(list(sums[tile]), fx.Float32),
-                logits,
-                tokens[tile] * EXPERTS + row0 + task * ROWS + 2 * row_pair,
-                mask=live[tile],
-            )
+            if live[tile]:
+                bo.buffer_store(
+                    fx.Vector.from_elements(list(sums[tile]), fx.Float32),
+                    rsrc(router_logits),
+                    tokens[tile] * EXPERTS + row0 + task * ROWS + 2 * row_pair,
+                )
     if latent:
-        fp4 = rsrc(latent_fp4, rows * LATENT // 2)
-        scales = rsrc(latent_scales, rows * LATENT // 32)
         bits = [fx.max(p & 0x7FFF, (p >> 16) & 0x7FFF) for p in packed]
         for off in (1, 2):
             bits = [xred(b, off, fx.max, GFX1250) for b in bits]
@@ -498,43 +497,46 @@ def _front_epilogue_fused(
         for off in (1, 2):
             words = [xred(w, off, _or, GFX1250) for w in words]
         for tile in range_constexpr(tiles):
-            bo.buffer_store(
-                fx.Int8(codes[tile]),
-                scales,
-                (
-                    group * rows + tokens[tile]
-                    if const_expr("st" in diag)
-                    else tokens[tile] * (LATENT // 32) + group
-                ),
-                mask=live[tile] & (column_pair == 0),
-                cache_modifier=_diag_cm(diag),
-            )
-            bo.buffer_store(
-                words[tile],
-                fp4,
-                tokens[tile] * (LATENT // 8) + group * 4 + column_pair // 4,
-                mask=live[tile] & (column_pair % 4 == 0),
-                cache_modifier=_diag_cm(diag),
-            )
-    if shared:
-        hidden = rsrc(shared_hidden, rows * SHARED_COLUMNS * 2)
-        ups = [xshfl(p, 8, GFX1250) for p in packed]
-        for tile in range_constexpr(tiles):
-            p, up = packed[tile], ups[tile]
-            bo.buffer_store(
-                fx.Vector.from_elements(
-                    [
-                        moe_expert_gfx1250._situ(bf_lo(p), bf_lo(up)),
-                        moe_expert_gfx1250._situ(bf_hi(p), bf_hi(up)),
-                    ],
-                    fx.Float32,
+            if live[tile] & (column_pair == 0):
+                bo.buffer_store(
+                    fx.Int8(codes[tile]),
+                    rsrc(latent_scales),
+                    (
+                        group * rows + tokens[tile]
+                        if const_expr("st" in diag)
+                        else tokens[tile] * (LATENT // 32) + group
+                    ),
+                    cache_modifier=_diag_cm(diag),
                 )
-                .to(fx.BFloat16)
-                .bitcast(fx.Int32)[0],
-                hidden,
-                (tokens[tile] * SHARED_COLUMNS + shared_column0) // 2 + row_pair,
-                mask=live[tile] & (task == 0),
+        for tile in range_constexpr(tiles):
+            if live[tile] & (column_pair % 4 == 0):
+                bo.buffer_store(
+                    words[tile],
+                    rsrc(latent_fp4),
+                    tokens[tile] * (LATENT // 8) + group * 4 + column_pair // 4,
+                    cache_modifier=_diag_cm(diag),
+                )
+    if shared:
+        ups = [xshfl(p, 8, GFX1250) for p in packed]
+        hidden = [
+            fx.Vector.from_elements(
+                [
+                    moe_expert_gfx1250._situ(bf_lo(p), bf_lo(up)),
+                    moe_expert_gfx1250._situ(bf_hi(p), bf_hi(up)),
+                ],
+                fx.Float32,
             )
+            .to(fx.BFloat16)
+            .bitcast(fx.Int32)[0]
+            for p, up in zip(packed, ups)
+        ]
+        for tile in range_constexpr(tiles):
+            if live[tile] & (task == 0):
+                bo.buffer_store(
+                    hidden[tile],
+                    rsrc(shared_hidden),
+                    (tokens[tile] * SHARED_COLUMNS + shared_column0) // 2 + row_pair,
+                )
 
 
 def front_split_plan(rows, fp8_shared, fp4_latent, lds_words, resident=False):
@@ -688,8 +690,9 @@ def _front_words(rows: int, depth: int, paired: bool, token_steps: int = 2) -> i
 # BF16 depth, FP8 depth), the first whose LDS fits the width. A late weight
 # copy is issued a barrier later, so it runs a slab (unpaired) or two
 # (paired) deeper for the same copies in flight; a wave still keeps three.
-# Shallower plans starve their copies (paired four ahead at 16 rows, three
-# or two ahead past 50 rows ran slower than the default pipeline).
+# Shallower plans starve their copies: paired four ahead (10-20 rows), and
+# unpaired where the default pipeline pairs (16-30), or three or two ahead
+# (past 50 rows), ran whole layers slower than the default pipeline.
 _LATE_PLANS = (
     (True, 6, 6),
     (False, 5, 6),
@@ -697,17 +700,23 @@ _LATE_PLANS = (
 )
 
 
-def front_pipe(rows: int, pairable: bool, lds_bytes: int, sites=None):
+def front_pipe(
+    rows: int, pairable: bool, lds_bytes: int, sites=None, paired_default=False
+):
     """The late pipeline's plan for ``ATOM_KIMI_MONO_FRONT_PIPE``'s
     ``sites`` (None: the env's) at ``rows``: ``{paired, depth, fp8_depth,
     late, token_steps}`` from ``_LATE_PLANS`` (paired ones only if
-    ``pairable``; "up": none), or {} without "late" or a plan that fits
-    ``lds_bytes`` beside the group rows; "early" adds ``early_scales``."""
+    ``pairable``, unpaired ones only where the default pipeline,
+    ``paired_default``, is unpaired; "up": no paired ones, "ua": unpaired
+    ones at any width), or {} without "late" or a plan that fits ``lds_bytes``
+    beside the group rows; "early" adds ``early_scales``."""
     sites = envs.ATOM_KIMI_MONO_FRONT_PIPE if sites is None else sites
     pipe = {}
     if "late" in sites:
         for paired, depth, fp8_depth in _LATE_PLANS:
             if paired and (not pairable or "up" in sites):
+                continue
+            if not paired and paired_default and "ua" not in sites:
                 continue
             if _front_words(rows, depth, paired, 3) + rows * 16 <= lds_bytes // 4:
                 pipe = {
@@ -722,6 +731,8 @@ def front_pipe(rows: int, pairable: bool, lds_bytes: int, sites=None):
         pipe["early_scales"] = True
     if "epi" in sites:
         pipe["fused"] = True
+    if pipe.get("late") and "u2" in sites:
+        pipe["unroll"] = 2
     diag = frozenset(
         s for s in sites if s in ("xs", "xf", "st") or s.startswith("cm")
     )
@@ -735,6 +746,7 @@ def _pipe_suffix(pipe) -> str:
         ("_late" if pipe.get("late") else "")
         + ("_es" if pipe.get("early_scales") else "")
         + ("_fe" if pipe.get("fused") else "")
+        + (f"_u{pipe['unroll']}" if pipe.get("unroll") else "")
         + "".join(f"_{d}" for d in sorted(pipe.get("diag", ())))
     )
 
@@ -775,7 +787,7 @@ def build_replicated_front(
     # Unpaired where four slabs ahead do not fit: two ahead is slower (32-40).
     if paired and _front_words(rows, depth, True) + rows * 16 > plan.lds_bytes // 4:
         paired = False
-    pipe = front_pipe(rows, pairable, plan.lds_bytes, pipe_sites)
+    pipe = front_pipe(rows, pairable, plan.lds_bytes, pipe_sites, paired)
     paired = pipe.pop("paired", paired)
     depth = pipe.pop("depth", depth)
     fp8_depth = pipe.pop(

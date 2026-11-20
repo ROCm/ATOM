@@ -373,6 +373,7 @@ def project(
     late: bool = False,
     token_steps: int = 2,
     early_scales: bool | None = None,
+    unroll: int | None = None,
 ):
     """``x[rows, k] @ w[task_rows[i]:+16, k]^T`` for each task, as v8 f32 WMMA
     accumulators ``[task][16-token tile]``. ``w`` has ``w_rows`` rows of ``k``
@@ -405,7 +406,9 @@ def project(
     ``token_steps`` steps of tokens resident (``tdm_lds_words``), so a token
     copy is issued that many steps less one ahead. ``early_scales``: the FP8
     scales staged behind the first copies (None: ``ATOM_KIMI_MONO_TDM_COLD``
-    "early"). The same WMMAs in the same order: the same sums."""
+    "early"). ``unroll`` (late): the step loop's unroll hint (None:
+    ``ATOM_KIMI_MONO_TDM_ROLLED``'s). The same WMMAs in the same order: the
+    same sums."""
 
     if k % SLAB:
         raise ValueError(f"TDM GEMV needs K divisible by {SLAB}, got {k}")
@@ -441,6 +444,7 @@ def project(
             group,
             token_steps,
             "early" in _COLD if early_scales is None else early_scales,
+            _ROLLED_UNROLL if unroll is None else unroll,
         )
     if token_steps != 2:
         raise ValueError("only the late TDM GEMV keeps more token steps")
@@ -1026,6 +1030,7 @@ def _project_late(
     group,
     token_steps,
     early_scales,
+    unroll,
 ):
     """``_project_rolled`` with one barrier a step: a step waits for its
     copies, passes the (cluster) barrier, which also frees the buffers the
@@ -1178,7 +1183,7 @@ def _project_late(
                 accs[tk * tiles + tl] = acc
         return accs
 
-    for s in range(fx.Int32(0), fx.Int32(steps), unroll=_ROLLED_UNROLL):
+    for s in range(fx.Int32(0), fx.Int32(steps), unroll=unroll):
         if s > 0:
             tdm_timeline.slab(s - 1, tdm_timeline.C)
         _late_waits(role, s, steps, slabs, tasks, depth, group, token_steps)
