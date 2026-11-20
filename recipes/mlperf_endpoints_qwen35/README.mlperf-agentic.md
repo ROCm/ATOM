@@ -1,7 +1,46 @@
-# Qwen3.5-35B-A3B MXFP4 on 4 x MI455X (gfx1250): MLPerf Endpoints agentic, the 2026-11-01 to 11-07 points
+# Qwen3.5-35B-A3B MXFP4 on 4 x MI455X (gfx1250): MLPerf Endpoints agentic, the 2026-11-01 to 11-19 points
 
 How to reproduce the numbers below: the exact code, the settings, the run, and how each number is computed.
 They are 10-minute measurement points, not official results (see [What these numbers are](#what-these-numbers-are)).
+
+## 2026-11-19: decode folds, early spec-decode metadata, fp4pt V from c64
+
+`agentic_20261119.env` on top of `agentic_20261101.env` and `agentic_20261107.env`. Code: `alizaidy/gfx1250-qwen-support`
+with ROCm/ATOM#3537 and #3606 and ROCm/aiter#8248, #8249, #8250, #8330 (post-norm fold) and #8331 (unified-attention
+runtime page count). Image: `rocm/fw-bringup-mlperf:gfx1250-atom-qwen-20261117`, DP4 with every
+expert on every GPU, MTP-3. Client: the submission settings (`STOP_FIRST=0 ACC_INLINE=1`, `CAP_MIN=10`), 10-minute
+points on warm caches; "e2e" is the report's E2E average interactivity.
+
+Per concurrency (decode interval and extras as in the 11-17 image's `points.tsv`):
+
+| concurrency | KV | decode interval | extras | fp4pt-only flags |
+|---|---|---:|---|---|
+| 32 | `fp8_k4v8` | 24 | `ATOM_PREFILL_DELAYER_STALL_TICKS=1 ATOM_GDN_PREFILL_IN_GRAPH=1` | |
+| 64 | `fp8_k4v4pt` | 8 | same | `ATOM_FOLD_QKNORM_QKV_FP4PT=1 ATOM_FOLD_QKNORM_QKV_MAX_M=48 AITER_GFX12_TOKEN_SPLIT_MIN_TILES_FP4PT=8 AITER_GFX12_TOKEN_SPLIT_PROGRAMS=512` |
+| 128 | `fp8_k4v4pt` | 8 | same | same |
+
+`BLOCK_SIZE=128` everywhere. c32 stays on k4v8: fp4pt was 1.4% slower there (MTP acceptance 73.2-73.6% vs 74.0%,
+prefill ~5% slower, and no bandwidth win at bs 1-2).
+
+| concurrency | stock (with a559cd926) | + #3537 and aiter #8248-#8250 | + this date's flags (final) | final vs stock | final accuracy |
+|---|---:|---:|---:|---:|---|
+| 32 | 1078.2 | 1175.7 | 1222.1 (mean of 1244.5 / 1199.7) | +13.3% | 0.5614 / 0.5558 / 0.5550 / 0.5640 |
+| 64 | 957.6 | 1034.0 | 1095.4 (mean of 1098.0 / 1091.1 / 1097.0) | +14.4% | 0.5676 / 0.5593 / 0.5612 |
+| 128 | 711.4 | 776.1 | 798.5 | +12.2% | 0.5627 / 0.5646 |
+
+Notes:
+- At c64 each step stacks: the 11-18 PRs +8.0%, the post-norm fold + early metadata +3.4%, the fp4pt split +2.7%.
+  The early metadata (`ATOM_HOSTNEXT_EARLY_META`) removed the host cap: the GPU now waits only 33-35 us a step for
+  the next verify, and draft-pass savings reach the step at 75-100% (about 0 before).
+- 10-minute c32 accuracy sits around the 55.86% gate on every configuration, stock included (stock: 0.5587 / 0.5576
+  / 0.5542; run-to-run about +-0.003). The post-norm fold is the only non-bitwise change; its c32 mean (0.5591) is
+  the same as without it (0.5594). Full-length runs should confirm c32 accuracy.
+- c32 e2e varies about +-2% between runs of the same config (rank idle share 26-32% with the closed-loop client).
+- Without `AITER_UA_FP4PT_NO_SPECIALIZE=1`, any change in the KV pool size (a new server, other flags, another rank)
+  recompiles the unified-attention prefill kernels on first use: ~7 s stalls, TTFT p99.9 7-9 s, 15-20% lower e2e.
+  On a brand-new Triton cache the first server still compiles each kernel configuration once: warm up first.
+- The post-norm fold applies up to 16 verify rows (bs 4); at c128 most passes have 20-48 rows, so the 11-19 flags
+  add only +0.3% to +2.9% there.
 
 ## 2026-11-07: Qwen3.6, GDN mid-step checkpoints, 1x32 MXFP8 projections, ~2x decode intervals
 
