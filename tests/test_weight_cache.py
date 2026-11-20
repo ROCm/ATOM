@@ -24,6 +24,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from aiter_stub import atom_without_aiter
 from conftest import gpu_stack_import
 from torch import nn
 
@@ -56,6 +57,21 @@ def test_checkpoint_rewritten_in_place_changes_the_key(tmp_path):
     assert key._checkpoint_digest(str(tmp_path)) == a
     time.sleep(0.01)
     shard(b"\1" * 8 + b"x" * (2 << 20))  # same names, shapes and size: new weights
+    assert key._checkpoint_digest(str(tmp_path)) != a
+
+
+def test_only_the_files_loading_reads_are_in_the_key(tmp_path):
+    (tmp_path / "config.json").write_text("{}")
+    (tmp_path / "model.safetensors").write_bytes(b"\0" * 16)
+    a = key._checkpoint_digest(str(tmp_path))
+    # What a load writes there (online quantization's info), and what it
+    # does not read.
+    (tmp_path / "online_quant_info_20261120_000000.json").write_text("{}")
+    (tmp_path / "tokenizer.json").write_text("{}")
+    (tmp_path / "original").mkdir()
+    (tmp_path / "original" / "model.safetensors").write_bytes(b"\1" * 16)
+    assert key._checkpoint_digest(str(tmp_path)) == a
+    (tmp_path / "model.safetensors.index.json").write_text("{}")
     assert key._checkpoint_digest(str(tmp_path)) != a
 
 
@@ -524,29 +540,67 @@ def test_an_object_held_where_no_path_leads_is_not_copied(toy_packages):
 def test_a_process_that_only_loads_leaves_moe_communication_setup(
     monkeypatch, tmp_path, serves
 ):
-    loader = gpu_stack_import("atom.model_loader.loader")
-    FusedMoEMethodBase = gpu_stack_import("atom.model_ops.moe").FusedMoEMethodBase
-    ran = []
+    with atom_without_aiter() as load:
+        loader = load("atom.model_loader.loader")
+        FusedMoEMethodBase = load("atom.model_ops.moe").FusedMoEMethodBase
+        ran = []
 
-    class Method(FusedMoEMethodBase):
-        def __init__(self):
-            pass
+        class Method(FusedMoEMethodBase):
+            def __init__(self):
+                pass
 
-        def process_weights_after_loading(self, layer):
-            pass
+            def process_weights_after_loading(self, layer):
+                pass
 
-        apply = create_weights = get_fused_moe_quant_config = None
+            apply = create_weights = get_fused_moe_quant_config = None
 
-        def init_prepare_finalize(self, layer):
-            ran.append(layer)
+            def init_prepare_finalize(self, layer):
+                ran.append(layer)
 
-    model = nn.Module()
-    model.experts = nn.Module()
-    model.experts.quant_method = Method()
-    monkeypatch.setattr(loader, "MOE_PREPARE_FINALIZE", serves)  # a daemon: off
-    hf_config = SimpleNamespace(num_hidden_layers=1)
-    loader.load_model(model, str(tmp_path), hf_config, load_dummy="empty")
+        model = nn.Module()
+        model.experts = nn.Module()
+        model.experts.quant_method = Method()
+        monkeypatch.setattr(loader, "MOE_PREPARE_FINALIZE", serves)  # a daemon: off
+        hf_config = SimpleNamespace(num_hidden_layers=1)
+        loader.load_model(model, str(tmp_path), hf_config, load_dummy="empty")
     assert ran == ([model.experts] if serves else [])
+
+
+def test_a_daemon_rank_loads_without_communicators_or_moe_setup(monkeypatch):
+    class Stop(Exception):
+        pass
+
+    asked = []
+
+    def init_model_env(config, rank, **options):
+        asked.append(options)
+        raise Stop  # what follows needs a GPU
+
+    with atom_without_aiter() as load:
+        daemon = load("atom.model_loader.weight_cache.daemon")
+        # What a rank process does to itself first, not to this test's.
+        for module, name, fake in (
+            ("atom.utils", "enable_orphan_reaping", lambda: None),
+            ("atom.utils", "set_process_title", lambda title: None),
+            ("atom.utils.gc_utils", "tune_gc", lambda: None),
+            ("atom.utils.numa_utils", "numa_bind_to_node", lambda *a: None),
+            ("atom.config", "local_device_index", lambda config, rank: 0),
+        ):
+            monkeypatch.setattr(load(module), name, fake)
+        for name, fake in (
+            ("worker_process_name", lambda config, rank: "TP0"),
+            ("socket_path", lambda gpu: "/nonexistent/gpu.sock"),
+            ("gpu_identity", lambda gpu: "gpu"),
+            ("_DaemonLock", lambda *a, **k: None),
+            ("init_model_env", init_model_env),
+        ):
+            monkeypatch.setattr(daemon, name, fake)
+        monkeypatch.setattr(daemon.loader, "MOE_PREPARE_FINALIZE", True)
+        with pytest.raises(Stop):
+            daemon._serve_rank(0, SimpleNamespace(model="m"), None, 0, None)
+        # Servers set up MoE communication themselves, on their own groups.
+        assert asked == [{"device_communicators": False}]
+        assert daemon.loader.MOE_PREPARE_FINALIZE is False
 
 
 class Tied(nn.Module):
@@ -1547,35 +1601,38 @@ def test_rank_0_draws_the_daemons_bar_while_it_waits(client, monkeypatch, capsys
 
 
 def test_a_markov_head_built_ahead_of_its_weights_arms_lossless_sampling(monkeypatch):
-    lossless = gpu_stack_import("atom.spec_decode.dspark_lossless")
-    asked = []
+    with atom_without_aiter() as load:
+        lossless = load("atom.spec_decode.dspark_lossless")
+        asked = []
 
-    def supported(w1, w2):
-        asked.extend([w1, w2])
+        def supported(w1, w2):
+            asked.extend([w1, w2])
 
-    monkeypatch.setattr(lossless, "markov_weights_unsupported", supported)
-    monkeypatch.setattr(lossless, "AITER_TOPK_TOPP_AVAILABLE", True)
-    monkeypatch.setattr(lossless, "get_pcp_world_size", lambda: 1)
-    meta = [torch.empty(8, 4, dtype=torch.bfloat16, device="meta") for _ in range(2)]
-    head = SimpleNamespace(
-        markov_w1=SimpleNamespace(weight=meta[0]),
-        markov_w2=SimpleNamespace(weight=meta[1]),
-    )
-    drafter = SimpleNamespace(
-        config=SimpleNamespace(
-            kv_transfer_config={},
-            enable_rapidserve=False,
-            disagg_is_decode=False,
-            pipeline_parallel_size=1,
-        ),
-        draft_tokens_per_seq=5,
-        mtp_k=5,
-        device=torch.device("cpu"),
-        model=SimpleNamespace(markov_head=head),
-    )
-    assert lossless.lossless_unsupported_reason(drafter) is None
-    # A server builds its drafter on meta and maps the weights onto its
-    # device: the question is put for weights like them there.
-    assert [(w.device, w.dtype, w.shape[1:]) for w in asked] == [
-        (drafter.device, torch.bfloat16, torch.Size([4]))
-    ] * 2
+        monkeypatch.setattr(lossless, "markov_weights_unsupported", supported)
+        monkeypatch.setattr(lossless, "AITER_TOPK_TOPP_AVAILABLE", True)
+        monkeypatch.setattr(lossless, "get_pcp_world_size", lambda: 1)
+        meta = [
+            torch.empty(8, 4, dtype=torch.bfloat16, device="meta") for _ in range(2)
+        ]
+        head = SimpleNamespace(
+            markov_w1=SimpleNamespace(weight=meta[0]),
+            markov_w2=SimpleNamespace(weight=meta[1]),
+        )
+        drafter = SimpleNamespace(
+            config=SimpleNamespace(
+                kv_transfer_config={},
+                enable_rapidserve=False,
+                disagg_is_decode=False,
+                pipeline_parallel_size=1,
+            ),
+            draft_tokens_per_seq=5,
+            mtp_k=5,
+            device=torch.device("cpu"),
+            model=SimpleNamespace(markov_head=head),
+        )
+        assert lossless.lossless_unsupported_reason(drafter) is None
+        # A server builds its drafter on meta and maps the weights onto its
+        # device: the question is put for weights like them there.
+        assert [(w.device, w.dtype, w.shape[1:]) for w in asked] == [
+            (drafter.device, torch.bfloat16, torch.Size([4]))
+        ] * 2

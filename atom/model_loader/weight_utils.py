@@ -76,9 +76,10 @@ def local_model_dir(model: str) -> str:
     `deepseek-ai/DeepSeek-V4.1-Flash/model.safetensors.index.json` reached a
     `FileNotFoundError` in CI.
 
-    Resolution only, never a download: every caller runs after the weights have
-    loaded, so the snapshot is already in the hub cache and `allow_patterns=[]`
-    asks for no files.
+    Resolution only, never a download: `allow_patterns=[]` asks for no files.
+    Most callers run after the weights have loaded, when the snapshot is in the
+    hub cache; the weight cache's key is taken before, from what is there so
+    far.
 
     A name that resolves to nothing comes back unchanged, because every caller
     already has an answer for "there is no such directory" and none of them is

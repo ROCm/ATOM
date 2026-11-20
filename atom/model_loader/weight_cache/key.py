@@ -10,6 +10,7 @@ not listed, stop the daemon by hand
 from __future__ import annotations
 
 import contextlib
+import fnmatch
 import hashlib
 import os
 
@@ -94,22 +95,27 @@ def file_identity(path: str) -> str:
         return f"<unreadable {type(e).__name__}>"
 
 
+# The files loading reads from a checkpoint directory (its top level, as the
+# weight iterator does). Others, such as what a load writes there, do not count.
+_LOADED_FILES = ("*.safetensors", "*.safetensors.index.json", "config.json")
+
+
 def _checkpoint_digest(model_path: str) -> str:
-    """Every file in the checkpoint directory by name and file_identity, with
-    the safetensors headers (as bytes: parsing them takes ~1 s on V4-Pro)."""
+    """The files loading reads by name and file_identity, with the
+    safetensors headers (as bytes: parsing them takes ~1 s on V4-Pro)."""
     root = os.path.realpath(model_path)
     if not os.path.isdir(root):
         return f"path:{root}"
     h = hashlib.sha256()
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
-        for name in sorted(filenames):
-            path = os.path.join(dirpath, name)
-            h.update(f"{os.path.relpath(path, root)}\0{file_identity(path)}\n".encode())
-            if name.endswith(".safetensors"):
-                with contextlib.suppress(OSError), open(path, "rb") as f:
-                    n = int.from_bytes(f.read(8), "little")
-                    h.update(f.read(min(n, _MAX_SAFETENSORS_HEADER_BYTES)))
+    for name in sorted(os.listdir(root)):
+        if not any(fnmatch.fnmatch(name, p) for p in _LOADED_FILES):
+            continue
+        path = os.path.join(root, name)
+        h.update(f"{name}\0{file_identity(path)}\n".encode())
+        if name.endswith(".safetensors"):
+            with contextlib.suppress(OSError), open(path, "rb") as f:
+                n = int.from_bytes(f.read(8), "little")
+                h.update(f.read(min(n, _MAX_SAFETENSORS_HEADER_BYTES)))
     return h.hexdigest()
 
 
@@ -123,8 +129,8 @@ def compute_key(config, rank: int) -> dict:
     """Which checkpoint, drafter and shard, and the listed settings. Taken
     before a load, by the daemon and by a server alike: files that change
     under the daemon's load leave it a key no server's files give. (So does
-    the first load of a hub id, which downloads them: that launch loads from
-    disk, the next one finds the daemon it starts.)"""
+    the first load of a hub id, which downloads them: that launch or the next
+    one loads from disk or replaces the daemon once, depending on timing.)"""
     hf = config.hf_config
     try:
         hf_dict = hf.to_dict()

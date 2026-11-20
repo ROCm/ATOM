@@ -63,7 +63,10 @@ def _preload_mode() -> str:
         return "off"
     if raw in ("1", "true", "yes", "on"):
         return "server"
-    raise ValueError(f"ATOM_PRELOAD must be 1, 0 or daemon, not {raw!r}")
+    raise ValueError(
+        "ATOM_PRELOAD must be on (1/true/yes/on), off (0/false/no/off) or "
+        f"daemon, not {raw!r}"
+    )
 
 
 def _profiler_detail_env(name: str) -> bool:
