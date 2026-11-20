@@ -2,7 +2,7 @@
 
 The model keeps the following caches per request:
 
-  * paged K/V for the 12 full-attention (QSA) layers -- the ordinary pool;
+  * paged K/V for the 12 full-attention (QSA) layers in the QSA arena;
   * a paged RAW index-key cache per QSA layer, so the indexer can mean-pool
     groups of `compress_ratio` keys across chunk boundaries;
   * a paged COMPRESSED index-key cache per QSA layer, one row per complete
@@ -36,7 +36,7 @@ from atom.kv_transfer.disaggregation.page_region import page_region
 from atom.kv_transfer.disaggregation.types import KVTransferTensors
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.state_runtime import StateTransfer
-from atom.model_ops.fla_ops.gdn_flydsl import select_policy_for_slot
+from atom.model_ops.fla_ops.gdn_flydsl import select_policy
 from atom.model_ops.qwen4_exp.ops.qsa import (
     qsa_cache_row_layout,
     qsa_compressed_slots,
@@ -219,12 +219,11 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         _, shape_v = self._state_shape_for_runner()
         _, dtype_v = self._state_dtypes()
         return {
-            module: select_policy_for_slot(
+            module: select_policy(
                 allowed=module.impl.allow_aiter_flydsl,
                 replayssm=self.replayssm,
                 lossy_decode=envs.ATOM_ENABLE_GDN_DECODE_LOSSY_FAST,
-                slot_shape=tuple(shape_v),
-                dtype=dtype_v,
+                state=torch.empty((0, *shape_v), dtype=dtype_v, device="meta"),
                 activation_dtype=module.impl.dt_bias.dtype,
             )
             for module in self.pool_rows.get(LINEAR_STATE_ROWS, {})
@@ -592,7 +591,7 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             torch._foreach_copy_(destinations, sources)
 
     def build_kv_cache_tensor(self, module):
-        """Bind the three caches a QSA layer owns; defer everything else."""
+        """Bind a QSA layer's arena views, including its optional side planes."""
         if not getattr(module, "is_qsa_attention", False):
             return self._build_gdn_cache_tensor(module)
 

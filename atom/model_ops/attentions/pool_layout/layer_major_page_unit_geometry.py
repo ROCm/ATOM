@@ -7,9 +7,9 @@ The layer-major counterpart of ``page_unit_geometry``. That module is a mixin
 over an MLA cache ``(rows, blocks, block_size, entry)`` and only
 ``_KimiMLAGDNCommon`` mixes it in. A layer-major pool -- ``MhaKvPool`` or a
 ``LayerMajorArena`` -- publishes one contiguous region per field per layer, with
-alignment padding between fields that is not a region, so these are free
-functions over the pool's ``region_tensors`` rather than methods on
-``self.model_runner``.
+alignment padding that is not a region. The geometry functions read
+``region_tensors``; sizing reads the pools' ``field_groups`` before allocation.
+These are free functions rather than methods on ``self.model_runner``.
 
 ``GDNAttentionMetadataBuilder`` is the caller, the same role
 ``kimi_mla_gdn_attn`` plays for the MLA mixin: ``_page_unit_regions``,

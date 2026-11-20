@@ -260,7 +260,7 @@ def entry_bytes_for(fields: list[EntryField]) -> int:
 
 def published_bytes_for(fields: list[EntryField]) -> int:
     """Bytes one entry publishes as transfer regions: `entry_bytes_for`
-    without the alignment gaps between fields."""
+    without any alignment padding, including the tail."""
     return sum(field.bytes_per_entry for field in fields)
 
 

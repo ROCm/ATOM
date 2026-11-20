@@ -75,9 +75,9 @@ class KVCacheTensor:
     # doing it. Whatever moves one must move the other.
     index_scale: torch.Tensor | None = None
     # Per-block planes a layer's pages carry beyond the fields above, as
-    # ``(role, plane)`` in stored byte order. Named because which of them a
-    # layer has depends on its cache formats, so a position does not say which
-    # plane it is.
+    # ``(role, plane)`` in stored byte order. A layer's configuration and
+    # cache formats determine its optional planes, so a position alone does
+    # not identify a plane.
     extra_planes: tuple[tuple[str, torch.Tensor], ...] = ()
     # ReplaySSM record buffers for linear-attention layers: this layer's slice
     # of the (k, u, g) pools.  None for every other attention type.  Carried

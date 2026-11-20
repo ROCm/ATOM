@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class GDNFlyDSLPolicy:
-    """Resolved at cache binding; decode and physical VK layout are inseparable."""
+    """Decode policy and physical VK layout are inseparable."""
 
     prefill: bool = False
     decode: bool = False
@@ -37,21 +37,6 @@ def _validated_on_gfx942():
 
 
 def select_policy(*, allowed, replayssm, lossy_decode, state, activation_dtype):
-    return select_policy_for_slot(
-        allowed=allowed,
-        replayssm=replayssm,
-        lossy_decode=lossy_decode,
-        slot_shape=tuple(state.shape[1:]),
-        dtype=state.dtype,
-        activation_dtype=activation_dtype,
-    )
-
-
-def select_policy_for_slot(
-    *, allowed, replayssm, lossy_decode, slot_shape, dtype, activation_dtype
-):
-    """`select_policy` for a state pool described by one slot's shape and its
-    dtype, which is all of it the choice reads."""
     if not allowed:
         return GDNFlyDSLPolicy()
     # The ReplaySSM pool does not rule prefill out (prefill reads and writes the
@@ -65,9 +50,9 @@ def select_policy_for_slot(
         not replayssm
         and backend("decode") != "triton"
         and not lossy_decode
-        and len(slot_shape) == 3
-        and slot_shape[-2:] == (128, 128)
-        and dtype in (torch.bfloat16, torch.float32)
+        and state.ndim == 4
+        and state.shape[-2:] == (128, 128)
+        and state.dtype in (torch.bfloat16, torch.float32)
         and activation_dtype == torch.bfloat16
         and _validated_on_gfx942()
     )

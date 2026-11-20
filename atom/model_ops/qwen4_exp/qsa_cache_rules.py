@@ -25,9 +25,10 @@ QSA_ROWS = "qsa"
 # MTP draft QSA layers that keep BF16 caches while the target's are quantized
 # (`ATOM_QSA_DRAFT_KV_BF16=1`): their own rows, their own `*_draft` fields.
 QSA_DRAFT_ROWS = "qsa_draft"
-# A QSA layer's side caches besides K/V, each present only under the formats
-# that use it, in the order `KVCacheTensor.extra_planes` carries them. The
-# vLLM MP publisher names its PAGE regions after these.
+# Side caches in `KVCacheTensor.extra_planes` order. The two index caches
+# are always present; rope positions follow the multimodal config, and only
+# the compressed-index scale depends on the index format. The vLLM MP
+# publisher names its PAGE regions after these.
 QSA_SIDE_PLANES = (
     "index_raw",
     "index_compressed",
