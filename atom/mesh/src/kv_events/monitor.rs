@@ -4,15 +4,18 @@
 //! Batches the stream missed are replayed from the engine, if it serves a replay.
 //! Admitted batches go to the writer of the rank's index partition, which has a thread of
 //! its own. What each stream carried is what `/kv_events/sources` shows. A registered
-//! worker without exact events is also predicted to hold the prompts routed to it.
+//! worker without exact events is also predicted to hold the prompts routed to it. What a
+//! worker's engine will report cached also counts what it loads from the store it reads,
+//! if any.
 
 use std::{
     collections::{BTreeMap, VecDeque},
     fmt,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::StreamExt;
@@ -34,8 +37,9 @@ use super::{
     wire::{self, DecodedBatch},
 };
 use crate::{
-    core::Worker,
+    core::{Worker, WorkerType},
     kv_index::{match_lanes, Holder, Lane, Partition, Predictor, PrefixMatchProvider},
+    kv_storage::StorageSources,
     observability::metrics::schema::names,
 };
 
@@ -64,6 +68,7 @@ pub struct KvEventMonitor {
     /// while its partition has no lane left.
     predictors: DashMap<String, Option<Predictor>>,
     partitions: DashMap<(String, &'static str, u32), Arc<Partition>>,
+    stores: OnceLock<(Arc<StorageSources>, f64)>,
     threads: Handle,
     runtime: Option<Runtime>,
 }
@@ -152,6 +157,7 @@ impl KvEventMonitor {
             subscriptions: DashMap::new(),
             predictors: DashMap::new(),
             partitions: DashMap::new(),
+            stores: OnceLock::new(),
             threads: runtime.handle().clone(),
             runtime: Some(runtime),
         })
@@ -210,6 +216,12 @@ impl KvEventMonitor {
         self.subscriptions.remove(worker);
     }
 
+    /// Counts, in what a worker's engine will report cached, what it loads from the store
+    /// it reads among `stores`, and in its match rate `weight` of each of those tokens.
+    pub fn read_stores(&self, stores: Arc<StorageSources>, weight: f64) {
+        let _ = self.stores.set((stores, weight));
+    }
+
     fn partition(&self, model_id: &str, pool: &'static str, block_size: u32) -> Arc<Partition> {
         self.partitions
             .entry((model_id.into(), pool, block_size))
@@ -228,6 +240,7 @@ impl KvEventMonitor {
     }
 }
 
+#[async_trait]
 impl PrefixMatchProvider for KvEventMonitor {
     fn match_workers(&self, tokens: &[u32], workers: &[Arc<dyn Worker>]) -> Vec<Option<u32>> {
         let (events, predicted): (Vec<_>, Vec<_>) = workers
@@ -282,6 +295,35 @@ impl PrefixMatchProvider for KvEventMonitor {
         if let Some(predictor) = entry.as_ref() {
             predict(predictor, tokens, worker);
         }
+    }
+
+    async fn cached_tokens(
+        &self,
+        tokens: &[u32],
+        workers: &[Arc<dyn Worker>],
+        device: &[Option<u32>],
+    ) -> Vec<Option<u32>> {
+        let mut cached = device.to_vec();
+        let Some((stores, _)) = self.stores.get() else {
+            return cached;
+        };
+        // A decode worker takes the prompt's KV from its prefill worker.
+        let (readers, asked): (Vec<usize>, Vec<(&str, u32)>) = (workers.iter().zip(device))
+            .enumerate()
+            .filter(|(_, (worker, _))| !matches!(worker.worker_type(), WorkerType::Decode))
+            .filter_map(|(i, (worker, device))| Some((i, (worker.url(), (*device)?))))
+            .unzip();
+        for (i, found) in readers
+            .into_iter()
+            .zip(stores.cached_tokens(tokens, &asked).await)
+        {
+            cached[i] = found;
+        }
+        cached
+    }
+
+    fn store_weight(&self) -> f64 {
+        self.stores.get().map_or(0.0, |(_, weight)| *weight)
     }
 }
 
