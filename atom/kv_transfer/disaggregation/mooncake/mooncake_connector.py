@@ -3442,19 +3442,27 @@ class MooncakeConnector(KVConnectorBase):
             and INDEX_CACHE_ROLE in self._block_region_roles
         ):
             return False
+        if self._prepare_sharded_index is None or self._gather_sharded_index is None:
+            regions = [
+                i
+                for i, r in enumerate(self._block_region_roles)
+                if r == INDEX_CACHE_ROLE
+            ]
+            raise RuntimeError(
+                f"DSA index regions {regions} cannot reach a DCP consumer: this "
+                "backend builds no index staging (`_supports_dcp_index_staging` "
+                "is False, e.g. for a pooled index)."
+            )
         if (
             interleave != 1
             or self.block_size % 16
-            or self._prepare_sharded_index is None
-            or self._gather_sharded_index is None
             or self._index_staging_chunk_pages <= 0
         ):
             raise RuntimeError(
-                "Sharded preshuffled DSA index transfer requires "
-                "interleave=1, a block size divisible by 16, and producer "
-                "index staging; got "
+                "Sharded preshuffled DSA index transfer requires interleave=1, a "
+                "block size divisible by 16 and staging chunk pages; got "
                 f"{interleave=}, block_size={self.block_size}, "
-                f"has_staging={self._gather_sharded_index is not None and self._prepare_sharded_index is not None}."
+                f"chunk_pages={self._index_staging_chunk_pages}."
             )
         return True
 

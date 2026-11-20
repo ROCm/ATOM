@@ -24,6 +24,7 @@ from atom.kv_transfer.disaggregation.mooncake.mooncake_connector import (
     MooncakeConnector,
 )
 from atom.kv_transfer.disaggregation.types import (
+    INDEX_CACHE_ROLE,
     KVTransferRegion,
     KVTransferTensors,
     PageRegion,
@@ -495,7 +496,7 @@ def test_a_pp_stage_keeps_the_base_placement_of_its_index_regions():
     layer numbering, so only the tail past the MLA rows is kept."""
     builder = kimi_builder({"kv_connector": "mooncake"}, pp_size=2)
 
-    block, slots = builder._pp_consumer_region_indices([9, 4], 2, 6)
+    block, slots = builder._pp_consumer_region_indices([9, 4], 2, 1, 6)
 
     assert block == [1, 4]
     assert slots == [3, 4, 5, 9, 10, 11]
@@ -509,7 +510,11 @@ def test_an_unpooled_sparse_pp_stage_is_placed_end_to_end(monkeypatch):
         tensors = KVTransferTensors(
             pages=[
                 PageRegion(KVTransferRegion(0x1000, 64 * self.BLOCKS, 64)),
-                PageRegion(KVTransferRegion(0x9000, 16 * self.BLOCKS, 16)),
+                PageRegion(
+                    KVTransferRegion(
+                        0x9000, 16 * self.BLOCKS, 16, semantic_role=INDEX_CACHE_ROLE
+                    )
+                ),
             ],
             slot_regions=[],
         )
@@ -528,11 +533,20 @@ def test_an_unpooled_sparse_pp_stage_is_placed_end_to_end(monkeypatch):
     assert tensors.slot_region_consumer_indices == [3, 4, 5, 9, 10, 11]
 
 
-def test_a_sparse_pp_stage_refuses_a_region_count_it_did_not_place():
+@pytest.mark.parametrize(
+    ("base", "num_block", "num_index"),
+    [([9, 8, 4], 3, 1), ([4, 5], 2, 2)],
+    ids=["one_mla_row_short", "one_mla_row_over"],
+)
+def test_a_sparse_pp_stage_refuses_an_mla_count_it_did_not_place(
+    base, num_block, num_index
+):
+    """The stage places one MLA row. A splice at the wrong point would keep the
+    base's placement for an MLA row, or drop an index row, at the same length."""
     builder = kimi_builder({"kv_connector": "mooncake"}, pp_size=2)
 
-    with pytest.raises(RuntimeError, match="MLA and index rows"):
-        builder._pp_consumer_region_indices([9, 4], 1, 6)
+    with pytest.raises(RuntimeError, match="MLA PAGE regions published"):
+        builder._pp_consumer_region_indices(base, num_block, num_index, 6)
 
 
 def test_a_pooled_indexer_keeps_refusing_pp(monkeypatch):
@@ -589,7 +603,7 @@ def test_the_last_stage_places_the_drafters_mla_row_after_the_targets():
         K3.MLA_ROWS: {_Layer(7): 0, _Layer(NUM_HIDDEN_LAYERS): 1},
     }
 
-    mla, slots = builder._pp_consumer_region_indices(None, 2, 6)
+    mla, slots = builder._pp_consumer_region_indices(None, 2, 0, 6)
 
     assert mla == [1, 2]
     assert slots == [3, 4, 5, 9, 10, 11]

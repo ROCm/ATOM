@@ -7,6 +7,7 @@ import numpy as np
 import torch
 from aiter.dist.parallel_state import get_tp_group
 
+from atom.kv_transfer.disaggregation.types import INDEX_CACHE_ROLE
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attention_mla import MLAAttention
@@ -230,6 +231,7 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             block, slots = self._pp_consumer_region_indices(
                 tensors.block_region_consumer_indices,
                 len(tensors.block_regions),
+                sum(r.semantic_role == INDEX_CACHE_ROLE for r in tensors.block_regions),
                 len(tensors.slot_regions),
             )
             tensors.block_region_consumer_indices = block
@@ -281,6 +283,7 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         self,
         base_block: list[int] | None,
         num_block_regions: int,
+        num_index_regions: int,
         num_slot_regions: int,
     ) -> tuple[list[int], list[int]]:
         """This stage's MLA, index and KDA regions, placed in a PP=1 peer's lists.
@@ -328,6 +331,13 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             return placed
 
         mla = place(MLA_ROWS, mla_pos, len(full))
+        # The splice point is the base's MLA-region count; a miscount would
+        # send one layer's KV to another's region or drop an index region.
+        if len(mla) != num_block_regions - num_index_regions:
+            raise RuntimeError(
+                f"{num_block_regions - num_index_regions} MLA PAGE regions published "
+                f"for {len(mla)} MLA rows; PP disaggregation places one region per row"
+            )
         block = mla + (list(base_block[len(mla) :]) if base_block is not None else [])
         if len(block) != num_block_regions:
             raise RuntimeError(

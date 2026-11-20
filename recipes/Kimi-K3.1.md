@@ -174,3 +174,8 @@ What was checked, on each of the eight decode ranks:
   regions and was not byte-checked.
 - 8 of 8 prompts of 3.6K to 72K tokens retrieved the code hidden in them, so
   the decode's indexer picked its keys from the transferred index cache.
+
+Transfer cost: the DSA index pages are gathered onto each decode rank's shard
+before they are written, but the MLA rows still cross per token (one RDMA
+write per token, MLA region and decode rank), so P->D transfer time grows
+linearly with the prompt. Staging the MLA rows on this path is future work.
