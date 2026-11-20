@@ -15,7 +15,7 @@ import queue
 import threading
 import time
 import uuid
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
@@ -86,6 +86,9 @@ logger = logging.getLogger("atom")
 
 # State name of ReplaySSM's record cursor, one tensor shared by every layer.
 REPLAY_CURSOR = "replayssm.write_pos"
+# PP producer, stage 0: released transfer ids remembered against a late repeat.
+# Ids are request ids, never reused, and a repeat comes within seconds.
+_RELEASED_TRANSFERS_KEPT = 65536
 
 
 # ===================================================================
@@ -164,6 +167,11 @@ class MoRIIOConnector(KVConnectorBase):
             raise ValueError(
                 "MoRIIO write mode needs ATOM_PD_FAILED_WRITE_HOLD_S > 0: a push "
                 "started just before its deadline could land in freed blocks"
+            )
+        if self.pp_size > 1 and self.transfer_mode != "write":
+            raise ValueError(
+                "A PP instance moves its KV in MoRIIO write mode only (moriio_mode "
+                "'write'): each stage pushes its own layers"
             )
         self.http_port = kv_transfer_config.get("http_port", 8000)
         self.request_address = f"{self.local_ip}:{self.http_port}"
@@ -365,9 +373,10 @@ class MoRIIOConnector(KVConnectorBase):
         self._write_reports: dict[ReqId, bool] = {}
         self._write_reports_lock = threading.Lock()
         # A receive from a PP producer is one push per stage: how many reports
-        # it waits for, and (reports so far, all succeeded) until it has them.
+        # it waits for, and (stages reported so far, all succeeded) until it
+        # has them.
         self._write_reports_expected: dict[ReqId, int] = {}
-        self._write_report_counts: dict[ReqId, tuple[int, bool]] = {}
+        self._write_report_counts: dict[ReqId, tuple[frozenset[int], bool]] = {}
         self._write_timeout_s = envs.ATOM_MORIIO_WRITE_TIMEOUT_S
 
         # Failed receives, held until the given time before they are reported.
@@ -377,6 +386,11 @@ class MoRIIOConnector(KVConnectorBase):
         # _finish_write, so swapped out under the lock.
         self.done_sending: set[int] = set()
         self._done_sending_lock = threading.Lock()
+        # PP producer, stage 0: the consumer ranks that released each transfer
+        # so far (`_record_release`), and the transfers already released, so a
+        # late repeat cannot free blocks the scheduler has handed on.
+        self._release_ranks: dict[TransferId, set[int]] = {}
+        self._released_transfers: OrderedDict[TransferId, None] = OrderedDict()
 
         # Transfer ID mapping (worker side)
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
@@ -891,6 +905,17 @@ class MoRIIOConnector(KVConnectorBase):
             return
 
         for req_id, meta in metadata.reqs_to_recv.items():
+            if int(getattr(meta, "remote_pp_size", 1) or 1) > 1:
+                # One read covers one producer's layers; a PP producer pushes
+                # each stage's in write mode.
+                logger.error(
+                    "req %s: the producer runs PP %s, which MoRIIO moves in write "
+                    "mode only (moriio_mode 'write')",
+                    req_id,
+                    meta.remote_pp_size,
+                )
+                self._fail_before_transfer(req_id, meta)
+                continue
             remote_engine_id = f"{meta.remote_host}:{meta.remote_handshake_port}"
             meta.remote_engine_id = remote_engine_id
             # _remote_agents is keyed by the dp-suffixed id.
@@ -1023,17 +1048,34 @@ class MoRIIOConnector(KVConnectorBase):
 
     def _notify_producer(self, req_id: ReqId, meta: ReqMeta) -> None:
         """Best-effort done-notify; the producer holds the source blocks until
-        it hears back. Repeats are harmless."""
+        it hears back. Repeats are harmless.
+
+        A PP producer hears it at stage 0, whose scheduler owns the block table
+        every stage reads, as a RELEASE counted per consumer rank: only after
+        every rank reading the request can stage 0 tell that no stage still
+        reads its blocks (`_record_release`).
+        """
+        remote_tp_size = int(meta.tp_size or 0) or self.tp_size
         try:
-            port = int(meta.remote_handshake_port) + get_port_offset(
-                meta.remote_dp_rank,
-                self.tp_rank,
-                int(meta.tp_size or 0) or self.tp_size,
+            peer = self._peer_tp_rank(remote_tp_size)
+        except ValueError:
+            peer = self.tp_rank
+        transfer_id = self.request_id_to_transfer_id.get(req_id, meta.transfer_id)
+        stages = max(1, int(getattr(meta, "remote_pp_size", 1) or 1))
+        try:
+            host, port = self._producer_stage_address(
+                meta, 0, stages, peer, remote_tp_size
             )
-            self.moriio_wrapper.send_notify(
-                self.request_id_to_transfer_id.get(req_id, meta.transfer_id),
-                self._producer_host(meta),
-                port,
+            if stages == 1:
+                self.moriio_wrapper.send_notify(transfer_id, host, port)
+                return
+            release = {
+                "transfer_id": int(transfer_id),
+                "consumers": max(1, self.tp_size // remote_tp_size),
+                "decode_tp_rank": self.tp_rank,
+            }
+            self.moriio_wrapper.send_message(
+                [MoRIIOConstants.RELEASE, msgpack.dumps(release)], host, port
             )
         except Exception:
             logger.warning(
@@ -1041,6 +1083,28 @@ class MoRIIOConnector(KVConnectorBase):
                 req_id,
                 exc_info=True,
             )
+
+    def _producer_stage_address(
+        self,
+        meta: ReqMeta,
+        stage: int,
+        stages: int,
+        remote_tp_rank: int,
+        remote_tp_size: int,
+    ) -> tuple[str, int]:
+        """Host and side channel port of a producer rank: PP stage ``stage``
+        of ``stages``, TP rank ``remote_tp_rank`` of ``remote_tp_size``."""
+        port = int(meta.remote_handshake_port) + side_channel_port_offset(
+            int(meta.remote_dp_rank or 0),
+            remote_tp_rank,
+            remote_tp_size,
+            stage,
+            stages,
+        )
+        hosts = list(getattr(meta, "remote_pp_hosts", None) or ())
+        if stages > 1 and hosts:
+            return hosts[stage], port
+        return self._producer_host(meta), port
 
     def _producer_host(self, meta: ReqMeta) -> str:
         """The host of the producer rank this rank exchanges with."""
@@ -1115,20 +1179,30 @@ class MoRIIOConnector(KVConnectorBase):
         ok: bool,
         state_digest: Any = None,
         page_digest: Any = None,
+        stage: int = 0,
     ) -> None:
-        """Count one producer's report on a push into this rank.
+        """Count one producer stage's report on a push into this rank.
 
         A receive from a PP producer is one push per stage: it is reported
-        once every stage has reported, and succeeds only if all did. The
-        ATOM_MORIIO_VERIFY digests cover one producer's regions, so they are
-        kept for a receive from a single one.
+        once every stage has reported, and succeeds only if all did. A stage
+        counts once, so a repeated report cannot complete a receive another
+        stage is still writing. The ATOM_MORIIO_VERIFY digests cover one
+        producer's regions, so they are kept for a receive from a single one.
         """
         with self._write_reports_lock:
             expected = self._write_reports_expected.get(req_id, 1)
-            count, all_ok = self._write_report_counts.pop(req_id, (0, True))
-            count, all_ok = count + 1, all_ok and ok
-            if count < expected:
-                self._write_report_counts[req_id] = (count, all_ok)
+            stages, all_ok = self._write_report_counts.pop(req_id, (frozenset(), True))
+            if stage in stages:
+                logger.warning(
+                    "req %s: a second report from producer stage %d, ignored",
+                    req_id,
+                    stage,
+                )
+                self._write_report_counts[req_id] = (stages, all_ok)
+                return
+            stages, all_ok = stages | {stage}, all_ok and ok
+            if len(stages) < expected:
+                self._write_report_counts[req_id] = (stages, all_ok)
                 return
             self._write_reports_expected.pop(req_id, None)
             self._write_reports[req_id] = all_ok
@@ -1447,21 +1521,15 @@ class MoRIIOConnector(KVConnectorBase):
         if stages > 1:
             with self._write_reports_lock:
                 self._write_reports_expected[req_id] = stages
-        sent = 0
+        unasked = []
         for stage in range(stages):
-            port = int(meta.remote_handshake_port) + side_channel_port_offset(
-                int(meta.remote_dp_rank or 0),
-                remote_tp_rank,
-                remote_tp_size,
-                stage,
-                stages,
+            host, port = self._producer_stage_address(
+                meta, stage, stages, remote_tp_rank, remote_tp_size
             )
-            host = stage_hosts[stage] if stage_hosts else self._producer_host(meta)
             try:
                 self.moriio_wrapper.send_message(
                     [MoRIIOConstants.WRITE_REQ, msgpack.dumps(request)], host, port
                 )
-                sent += 1
             except Exception:
                 logger.exception(
                     "req %s: could not ask producer stage %d at %s:%d to push KV",
@@ -1470,11 +1538,14 @@ class MoRIIOConnector(KVConnectorBase):
                     host,
                     port,
                 )
-                if sent:
-                    # The stages already asked will push into our blocks, so
-                    # wait for them; this stage's report counts as a failure.
-                    self._record_write_report(req_id, False)
-        if not sent:
+                unasked.append(stage)
+        sent = stages - len(unasked)
+        if sent:
+            # The stages asked will push into our blocks, so wait for them; a
+            # stage not asked counts as a failed report.
+            for stage in unasked:
+                self._record_write_report(req_id, False, stage=stage)
+        else:
             # Same reasoning as the read path: this runs on the busy_loop.
             with self._write_reports_lock:
                 self._write_reports_expected.pop(req_id, None)
@@ -1675,9 +1746,11 @@ class MoRIIOConnector(KVConnectorBase):
         if engine_id not in self._built_state_sessions:
             remote = self.remote_moriio_metadata[engine_id]
             ours = {
-                name: slot_bytes
-                if parts == 1 or self._state_tp_split.get(name) == ()
-                else slot_bytes // parts
+                name: (
+                    slot_bytes
+                    if parts == 1 or self._state_tp_split.get(name) == ()
+                    else slot_bytes // parts
+                )
                 for name, (_, slot_bytes, _) in self._state_tensors.items()
             }
             theirs = remote.state_slot_bytes or {}
@@ -2443,7 +2516,9 @@ class MoRIIOConnector(KVConnectorBase):
         for name, session, slot_bytes in sessions:
             runs = self._state_tp_split.get(name)
             if parts == 1 or runs == ():
-                writes.append((session, [slot_bytes], [src * slot_bytes], [dst * slot_bytes]))
+                writes.append(
+                    (session, [slot_bytes], [src * slot_bytes], [dst * slot_bytes])
+                )
                 continue
             if runs is None or any(run % parts for run in runs):
                 raise ValueError(
@@ -2724,21 +2799,28 @@ class MoRIIOConnector(KVConnectorBase):
         # Released whatever happened: a consumer told the push failed has no
         # reason to come back for these blocks. Every consumer rank reading this
         # rank reads the same source blocks and staged state slot, so they go
-        # with the last of its pushes.
+        # with the last of its pushes. Under PP the blocks are the block table
+        # every stage indexes, so they wait for the consumers' releases
+        # (`_record_release`), which come once every stage has pushed.
         done = self._pushes_done.get(transfer_id, 0) + 1
         if done < self._consumers_per_push(request):
             self._pushes_done[transfer_id] = done
         else:
             self._pushes_done.pop(transfer_id, None)
             self._staged_sources.pop(transfer_id, None)
-            with self._done_sending_lock:
-                self.done_sending.add(transfer_id)
+            if self.pp_size == 1:
+                with self._done_sending_lock:
+                    self.done_sending.add(transfer_id)
         port = int(request["decode_handshake_port"]) + get_port_offset(
             int(request.get("decode_dp_rank", 0)),
             self._consumer_tp_rank(request),
             int(request.get("decode_tp_size") or self.tp_size),
         )
-        report = {"decode_req_id": request["decode_req_id"], "ok": ok}
+        report = {
+            "decode_req_id": request["decode_req_id"],
+            "ok": ok,
+            "pp_rank": self.pp_rank,
+        }
         if ok and "state_digest" in request:
             report["state_digest"] = request["state_digest"]
         if ok and "page_digest" in request:
@@ -2754,6 +2836,31 @@ class MoRIIOConnector(KVConnectorBase):
                 "transfer %s: could not report the push to the consumer", transfer_id
             )
 
+    def _record_release(
+        self, transfer_id: TransferId, consumers: int, rank: int
+    ) -> None:
+        """Count a consumer rank's release of a PP prefill's transfer.
+
+        Stage 0's scheduler owns the block table and state slots every stage
+        indexes, and stage 0 finishing its own pushes says nothing of the other
+        stages': a consumer rank releases a request once it has every stage's
+        report on it, so the transfer is done -- its blocks and transfer slot
+        free for the next request -- once each of the ``consumers`` ranks that
+        read it has. A rank is counted once, and a transfer released once.
+        """
+        with self._done_sending_lock:
+            if transfer_id in self._released_transfers:
+                return
+            ranks = self._release_ranks.setdefault(transfer_id, set())
+            ranks.add(rank)
+            if len(ranks) < max(1, consumers):
+                return
+            del self._release_ranks[transfer_id]
+            self._released_transfers[transfer_id] = None
+            while len(self._released_transfers) > _RELEASED_TRANSFERS_KEPT:
+                self._released_transfers.popitem(last=False)
+            self.done_sending.add(transfer_id)
+
     def _collect_write_reports(
         self, done_recving: set[ReqId], failed_recving: set[ReqId]
     ) -> None:
@@ -2765,13 +2872,18 @@ class MoRIIOConnector(KVConnectorBase):
         with self._write_reports_lock:
             reports, self._write_reports = self._write_reports, {}
         for req_id, ok in reports.items():
-            if self._awaiting_write.pop(req_id, None) is None:
+            awaited = self._awaiting_write.pop(req_id, None)
+            if awaited is None:
                 logger.warning("Write report for req %s, which is not waiting", req_id)
                 continue
             if ok:
                 done_recving.add(req_id)
             else:
                 self._hold_failure(req_id)
+            _, meta = awaited
+            if int(getattr(meta, "remote_pp_size", 1) or 1) > 1:
+                # Every stage has reported, so none reads the request's blocks.
+                self._notify_producer(req_id, meta)
 
         hold_s = envs.ATOM_PD_FAILED_WRITE_HOLD_S
         now = time.time()
@@ -2828,11 +2940,13 @@ class MoRIIOConnector(KVConnectorBase):
     ) -> None:
         """Background thread that serves metadata to incoming handshake requests.
 
-        Handles four message types:
+        Handles five message types:
         - ``GET_META_MSG``: Responds with engine + per-layer KV cache metadata.
         - ``POP_DONE_RECV``: Records that the consumer finished reading the request.
         - ``WRITE_REQ`` (producer): queues a consumer's request for a push.
         - ``WRITE_DONE`` (consumer): records the producer's report on a push.
+        - ``RELEASE`` (PP producer, stage 0): a consumer rank has every stage's
+          report on a request.
         """
         encoder = msgspec.msgpack.Encoder()
         encoded_data = encoder.encode(metadata)
@@ -2881,10 +2995,24 @@ class MoRIIOConnector(KVConnectorBase):
                         req_id, ok = report["decode_req_id"], bool(report["ok"])
                         state_digest = report.get("state_digest")
                         page_digest_ = report.get("page_digest")
+                        stage = int(report.get("pp_rank", 0))
                     except Exception:
                         logger.exception("Dropping undecodable WRITE_DONE")
                         continue
-                    self._record_write_report(req_id, ok, state_digest, page_digest_)
+                    self._record_write_report(
+                        req_id, ok, state_digest, page_digest_, stage=stage
+                    )
+
+                elif msg == MoRIIOConstants.RELEASE:
+                    try:
+                        release = msgpack.loads(parts[2])
+                        transfer_id = int(release["transfer_id"])
+                        consumers = int(release["consumers"])
+                        rank = int(release["decode_tp_rank"])
+                    except Exception:
+                        logger.exception("Dropping undecodable RELEASE")
+                        continue
+                    self._record_release(transfer_id, consumers, rank)
 
                 else:
                     logger.error("Unexpected handshake message type: %s", msg)

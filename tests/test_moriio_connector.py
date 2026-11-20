@@ -92,12 +92,13 @@ class ConnectorSourceTest(unittest.TestCase):
                 and node.func.id == name
             ]
 
-        # Read notify, early-failure notify, handshake, write report.
+        # Read notify, handshake, write report.
         calls = calls_to("get_port_offset")
-        self.assertEqual(len(calls), 4)
+        self.assertEqual(len(calls), 3)
         for call in calls:
             self.assertEqual(len(call.args), 3, ast.unparse(call))
-        # Side channel and write request, which also place a PP stage: the TP
+        # Side channel, and a producer rank's address (write requests and the
+        # early-failure notify or release), which also place a PP stage: the TP
         # size strides the DP ranks, and the stage count strides the stages.
         staged = calls_to("side_channel_port_offset")
         self.assertEqual(len(staged), 2)
@@ -420,7 +421,7 @@ class ConnectorBehaviourTest(unittest.TestCase):
             lock=threading.Lock(),
             send_notify=lambda transfer_id, host, port: notified.append(transfer_id),
         )
-        conn.tp_rank = 0
+        conn.tp_rank, conn.tp_size = 0, 8
         meta = types.SimpleNamespace(
             num_computed_blocks=0,
             src_block_skip_factor=1,
@@ -661,6 +662,8 @@ class WritePathTest(unittest.TestCase):
         conn.dcp_rank = 0
         conn.dcp_interleave = 1
         conn._pushes_done = {}
+        conn._release_ranks = {}
+        conn._released_transfers = collections.OrderedDict()
         conn._write_reports_expected = {}
         conn._write_report_counts = {}
         conn._page_consumer_indices = None
@@ -1293,7 +1296,8 @@ class WritePathTest(unittest.TestCase):
         ((frames, host, port),) = conn.sent
         self.assertEqual(frames[0], self.constants.WRITE_DONE)
         self.assertEqual(
-            self.msgpack.loads(frames[1]), {"decode_req_id": "d1", "ok": True}
+            self.msgpack.loads(frames[1]),
+            {"decode_req_id": "d1", "ok": True, "pp_rank": 0},
         )
         # Back to rank 1 of the consumer, the rank that asked.
         self.assertEqual((host, port), ("10.0.0.2", 7401))
@@ -1437,16 +1441,155 @@ class WritePathTest(unittest.TestCase):
     def test_a_receive_from_every_stage_completes_once_all_report(self):
         conn = self.make(producer=False)
         conn._write_reports_expected = {"d1": 3, "d2": 2}
-        conn._record_write_report("d1", True)
-        conn._record_write_report("d1", True)
-        conn._record_write_report("d2", True)
-        conn._record_write_report("d2", False)
+        conn._record_write_report("d1", True, stage=0)
+        conn._record_write_report("d1", True, stage=2)
+        conn._record_write_report("d2", True, stage=1)
+        conn._record_write_report("d2", False, stage=0)
         # d2 failed in one stage, so the whole receive fails.
         self.assertEqual(conn._write_reports, {"d2": False})
-        conn._record_write_report("d1", True)
+        # A stage reporting twice is counted once: stage 1 is still writing.
+        with self.assertLogs("atom", "WARNING"):
+            conn._record_write_report("d1", True, stage=2)
+        self.assertEqual(conn._write_reports, {"d2": False})
+        conn._record_write_report("d1", True, stage=1)
         self.assertEqual(conn._write_reports, {"d2": False, "d1": True})
         self.assertEqual(conn._write_reports_expected, {})
         self.assertEqual(conn._write_report_counts, {})
+
+    def test_a_pp_consumer_releases_the_request_at_stage_0_once_every_stage_reported(
+        self,
+    ):
+        """Rank 1 of a TP8 consumer reading a PP8 x TP1 producer tells stage 0
+        (the first host, base port) once all eight stages reported, whether the
+        receive succeeded or not; stage 0 waits for all 8 ranks."""
+        conn = self.make(producer=False)
+        conn.request_id_to_transfer_id = {"d1": 77, "d2": 78}
+        hosts = ["10.0.0.1"] * 4 + ["10.0.0.9"] * 4
+        metas = {}
+        for req_id, local in (("d1", [4, 5]), ("d2", [6])):
+            meta = self.recv_meta(local, [10, 11, 12])
+            meta.tp_size, meta.remote_pp_size, meta.remote_pp_hosts = 1, 8, hosts
+            conn._request_write(req_id, meta)
+            metas[req_id] = meta
+        conn.sent.clear()
+        for stage in range(8):
+            conn._record_write_report("d1", True, stage=stage)
+            conn._record_write_report("d2", stage != 5, stage=stage)
+        done, failed = set(), set()
+        with self.assertLogs("atom", "WARNING"):
+            conn._collect_write_reports(done, failed)
+        self.assertEqual(done, {"d1"})
+        self.assertIn("d2", conn._held_failures)
+        self.assertEqual(
+            [(frames[0], host, port) for frames, host, port in conn.sent],
+            [(self.constants.RELEASE, "10.0.0.1", 7301)] * 2,
+        )
+        releases = [self.msgpack.loads(frames[1]) for frames, _, _ in conn.sent]
+        self.assertEqual(
+            releases,
+            [
+                {"transfer_id": 77, "consumers": 8, "decode_tp_rank": 1},
+                {"transfer_id": 78, "consumers": 8, "decode_tp_rank": 1},
+            ],
+        )
+        self.assertEqual(conn.notified, [])
+
+    def test_a_pp_consumer_that_cannot_ask_one_stage_waits_for_the_others(self):
+        conn = self.make(producer=False)
+        meta = self.recv_meta([4, 5], [10, 11, 12])
+        meta.tp_size, meta.remote_pp_size, meta.remote_pp_hosts = 1, 4, ["10.0.0.1"] * 4
+
+        def send(frames, host, port):
+            if port == 7301:
+                raise OSError("unreachable")
+            conn.sent.append((frames, host, port))
+
+        conn.moriio_wrapper.send_message = send
+        with self.assertLogs("atom", "ERROR"):
+            conn._request_write("d1", meta)
+        self.assertEqual([port for _, _, port in conn.sent], [7302, 7303, 7304])
+        self.assertIn("d1", conn._awaiting_write)
+        for stage in (1, 2, 3):
+            conn._record_write_report("d1", True, stage=stage)
+        # Stage 0 was never asked, so the receive fails once the rest report.
+        self.assertEqual(conn._write_reports, {"d1": False})
+
+    def test_a_pp_consumer_past_its_deadline_releases_at_stage_0(self):
+        conn = self.make(producer=False)
+        conn.request_id_to_transfer_id = {"d1": 77}
+        meta = self.recv_meta([4, 5], [10, 11, 12])
+        meta.tp_size, meta.remote_pp_size, meta.remote_pp_hosts = (
+            1,
+            8,
+            ["h0"] + ["h1"] * 7,
+        )
+        conn._awaiting_write = {"d1": (0.0, meta)}
+        done, failed = set(), set()
+        with self.assertLogs("atom", "ERROR"):
+            conn._collect_write_reports(done, failed)
+        self.assertEqual(failed, {"d1"})
+        ((frames, host, port),) = conn.sent
+        self.assertEqual((frames[0], host, port), (self.constants.RELEASE, "h0", 7301))
+        self.assertEqual(conn.notified, [])
+
+    def test_a_read_mode_consumer_refuses_a_pp_producer(self):
+        conn = self.make(producer=False)
+        conn.transfer_mode = "read"
+        conn.request_id_to_transfer_id = {"d1": 77}
+        meta = self.recv_meta([4, 5], [10, 11, 12])
+        meta.tp_size, meta.remote_pp_size, meta.remote_pp_hosts = 1, 2, []
+        metadata = self.types.SimpleNamespace(
+            reqs_to_recv={"d1": meta}, request_id_to_transfer_id={"d1": 77}
+        )
+        with self.assertLogs("atom", "ERROR"):
+            conn.start_load_kv(metadata)
+        self.assertEqual(conn._failed_before_read, {"d1"})
+        ((frames, host, port),) = conn.sent
+        self.assertEqual(
+            (frames[0], host, port), (self.constants.RELEASE, "10.0.0.1", 7301)
+        )
+
+    def test_a_pp_stage_0_frees_a_transfer_once_every_consumer_rank_released_it(self):
+        """Stage 0's own pushes to all 8 ranks do not free the shared blocks;
+        the 8 ranks' releases do, each rank counted once, and only once."""
+        conn = self.make(producer=True)
+        conn.tp_rank, conn.tp_size = 0, 1
+        conn.pp_rank, conn.pp_size = 0, 8
+        conn._write_target_ready = lambda request: True
+        conn._write_blocks = lambda request, engine_id: [FakeStatus("ok")]
+        for rank in range(8):
+            conn._write_requests.put(self.push_request(decode_tp_rank=rank))
+        conn._service_write_requests()
+        self.assertEqual(conn.done_sending, set())
+        self.assertEqual(conn._pushes_done, {})
+        reports = [self.msgpack.loads(frames[1]) for frames, _, _ in conn.sent]
+        self.assertEqual({r["pp_rank"] for r in reports}, {0})
+        for rank in range(7):
+            conn._record_release(9, 8, rank)
+        conn._record_release(9, 8, 3)
+        self.assertEqual(conn.done_sending, set())
+        conn._record_release(9, 8, 7)
+        self.assertEqual(conn.done_sending, {9})
+        self.assertEqual(conn._release_ranks, {})
+        conn.done_sending.clear()
+        conn._record_release(9, 8, 7)
+        self.assertEqual(conn.done_sending, set())
+
+    def test_a_later_pp_stage_never_frees_the_shared_blocks(self):
+        conn = self.make(producer=True)
+        conn.tp_rank, conn.tp_size = 0, 1
+        conn.pp_rank, conn.pp_size = 5, 8
+        conn._staged_sources = {9: (3, None)}
+        conn._write_target_ready = lambda request: True
+        conn._write_blocks = lambda request, engine_id: [FakeStatus("ok")]
+        for rank in range(8):
+            conn._write_requests.put(self.push_request(decode_tp_rank=rank))
+        conn._service_write_requests()
+        self.assertEqual(conn.done_sending, set())
+        # Its staged state slot is no longer read once every rank has its push.
+        self.assertEqual(conn._staged_sources, {})
+        reports = [self.msgpack.loads(frames[1]) for frames, _, _ in conn.sent]
+        self.assertEqual({r["pp_rank"] for r in reports}, {5})
 
     def test_a_dcp_consumer_takes_whole_blocks_from_a_producer_without_dcp(self):
         """Producer block j is rank j % 8's local block j // 8 when the
@@ -1495,7 +1638,9 @@ class WritePathTest(unittest.TestCase):
             conn._write_requests.put(self.push_request(decode_tp_rank=rank))
         conn._service_write_requests()
         self.assertEqual(conn.done_sending, set())
-        self.assertEqual(sorted(port for _, _, port in conn.sent), [7400 + r for r in range(7)])
+        self.assertEqual(
+            sorted(port for _, _, port in conn.sent), [7400 + r for r in range(7)]
+        )
         conn._write_requests.put(self.push_request(decode_tp_rank=7))
         conn._service_write_requests()
         self.assertEqual(conn.done_sending, {9})
@@ -1530,7 +1675,12 @@ class WritePathTest(unittest.TestCase):
         conn.remote_moriio_metadata = {
             "engine": types.SimpleNamespace(
                 page_desc=b"theirs",
-                page_regions=[[0, 8, "mla"], [50, 8, "mla"], [90, 8, "mla"], [130, 8, "mla"]],
+                page_regions=[
+                    [0, 8, "mla"],
+                    [50, 8, "mla"],
+                    [90, 8, "mla"],
+                    [130, 8, "mla"],
+                ],
             )
         }
         conn.moriio_wrapper.build_session = lambda ours, theirs: "S"
@@ -1727,8 +1877,8 @@ class WritePathTest(unittest.TestCase):
         self.assertEqual(
             reports,
             [
-                {"decode_req_id": "d1", "ok": True},
-                {"decode_req_id": "d3", "ok": False},
+                {"decode_req_id": "d1", "ok": True, "pp_rank": 0},
+                {"decode_req_id": "d3", "ok": False, "pp_rank": 0},
             ],
         )
 
