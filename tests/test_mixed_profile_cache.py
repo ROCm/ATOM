@@ -19,6 +19,60 @@ def builder_cls():
 
 
 @pytest.mark.parametrize("fail_forward", [False, True])
+def test_profile_drops_region_layout_when_serving_reuses_addresses(
+    monkeypatch, builder_cls, fail_forward
+):
+    storage = torch.zeros(128, dtype=torch.uint8)
+    plane = torch.zeros(64, dtype=torch.uint8)
+    serving = storage.view(2, 4, 16)
+    plan = SimpleNamespace(entries={})
+    plan.with_paged_entries = lambda blocks: plan
+    runner = SimpleNamespace(
+        model=torch.nn.Module(),
+        pool_plan=plan,
+        config=SimpleNamespace(speculative_config=None),
+        index_pool=serving,
+    )
+    builder = SimpleNamespace(
+        model_runner=runner,
+        pool_geometry=SimpleNamespace(envelope_rows=4),
+        num_blocks=4,
+        csa_layers=[0, 1],
+        _page_unit_region_owners=(),
+        _kv_planes=lambda: [plane],
+        _plane_row_widths=lambda: [8],
+        _indexer_page_pools=lambda: [(runner.index_pool, None)],
+        allocate_kv_cache_tensors=lambda **_: {
+            "index_pool": storage[:64].view(2, 2, 16)
+        },
+        allocate_per_req_cache=lambda _: {},
+        build_kv_cache_tensor=lambda _: None,
+    )
+    runner.attn_metadata_builder = builder
+    builder._invalidate_pool_caches = lambda: builder_cls._invalidate_pool_caches(
+        builder
+    )
+    builder.warmup_per_req_cache = lambda: builder_cls._page_unit_regions(builder)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+
+    def profile():
+        with builder_cls.temporary_profile_cache(builder, 2):
+            bases, _ = builder_cls._page_unit_regions(builder)
+            assert bases[-1] == storage.data_ptr() + 32
+            if fail_forward:
+                raise RuntimeError("profile failed")
+
+    if fail_forward:
+        with pytest.raises(RuntimeError, match="profile failed"):
+            profile()
+    else:
+        profile()
+    assert runner.index_pool is serving
+    bases, _ = builder_cls._page_unit_regions(builder)
+    assert bases[-1] == serving.data_ptr() + serving.stride(0)
+
+
+@pytest.mark.parametrize("fail_forward", [False, True])
 @pytest.mark.parametrize("independent_draft", [False, True])
 def test_temporary_pool_restores_registered_buffers(
     monkeypatch, fail_forward, independent_draft, builder_cls

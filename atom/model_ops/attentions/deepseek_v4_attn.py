@@ -1665,6 +1665,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 module._buffers.clear()
                 module._buffers.update(buffers)
             self._invalidate_pool_caches()
+            # Serving allocations may reuse scratch addresses with new strides.
+            self._page_unit_region_owners = ()
             for name, value in saved_runner.items():
                 if value is missing:
                     delattr(runner, name)

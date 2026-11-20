@@ -157,15 +157,46 @@ def _bind():
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_lossless_sampling_is_refused_only_with_mixed(monkeypatch, enabled):
+@pytest.mark.parametrize("spec", [None, _spec()])
+def test_inactive_lossless_flag_does_not_refuse_mixed(monkeypatch, enabled, spec):
     _bind()
     monkeypatch.setenv("ATOM_SPEC_LOSSLESS_SAMPLING", "1")
-    config = _FakeConfig(enabled=enabled, spec=_spec())
-    if enabled:
-        with pytest.raises(ValueError, match="ATOM_SPEC_LOSSLESS_SAMPLING"):
-            config._validate_mixed_prefill_decode()
-    else:
-        config._validate_mixed_prefill_decode()
+    _FakeConfig(enabled=enabled, spec=spec)._validate_mixed_prefill_decode()
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize("supported", [False, True])
+def test_mixed_refuses_only_a_lossless_draft_that_would_arm(
+    monkeypatch, mixed, supported
+):
+    from aiter_stub import atom_without_aiter
+
+    with atom_without_aiter() as load:
+        module = load("atom.spec_decode.dspark_lossless")
+        monkeypatch.setenv("ATOM_SPEC_LOSSLESS_SAMPLING", "1")
+        monkeypatch.setenv("ATOM_ENABLE_RELAXED_MTP", "0")
+        monkeypatch.setattr(module, "lossless_unsupported_reason", lambda _: None)
+        monkeypatch.setattr(module, "require_ell_from_older_drafts", lambda: None)
+        allocations = []
+        monkeypatch.setattr(
+            module.DSparkLossless,
+            "__init__",
+            lambda self, drafter: allocations.append(drafter),
+        )
+        drafter = SimpleNamespace(
+            model=SimpleNamespace(supports_lossless_draft=supported),
+            config=SimpleNamespace(enable_mixed_prefill_decode=mixed),
+            speculative_config=SimpleNamespace(synthetic_acceptance_rates=None),
+            runner=SimpleNamespace(rank=1),
+        )
+        if mixed and supported:
+            with pytest.raises(ValueError, match="lossless.*mixed"):
+                module.DSparkLossless.arm(drafter)
+            assert not allocations
+        else:
+            result = module.DSparkLossless.arm(drafter)
+            assert (result is not None) == supported
+            assert allocations == ([drafter] if supported else [])
 
 
 def test_validator_runs_against_a_real_config_surface():
