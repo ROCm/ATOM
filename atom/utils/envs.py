@@ -1406,7 +1406,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PP_SEND_ALLGATHER": lambda: os.getenv("ATOM_PP_SEND_ALLGATHER", "1") == "1",
     # Batches the PP head keeps in flight; unset or 0 means one per stage, which
     # idles every stage while a completion travels back to the head.
-    "ATOM_PP_MAX_IN_FLIGHT": lambda: _int_env("ATOM_PP_MAX_IN_FLIGHT", 0),
+    "ATOM_PP_MAX_INFLIGHT": lambda: _int_env("ATOM_PP_MAX_INFLIGHT", 0),
     # Experiment: Mooncake Store loads unpack on their worker's own stream, not
     # behind the forward's queued kernels (saves stay on the forward's stream).
     "ATOM_MOONCAKE_STORE_LOAD_SIDE_STREAM": lambda: os.getenv(

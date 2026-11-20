@@ -63,7 +63,7 @@ class PPEngineCoreProc(EngineCore):
         self.scheduler.on_save_abandoned = self._forget_pp_save_quorum
         logger.info(
             f"{self.label}: PP stage {self.pp_rank}/{self.pp_size} "
-            f"(head={self.is_head}, last={self.is_last}, max_in_flight={envs.ATOM_PP_MAX_IN_FLIGHT or self.pp_size}) ready"
+            f"(head={self.is_head}, last={self.is_last}, max_in_flight={envs.ATOM_PP_MAX_INFLIGHT or self.pp_size}) ready"
         )
 
     def busy_loop(self):
@@ -166,7 +166,7 @@ class PPEngineCoreProc(EngineCore):
         launched = 0
         # Each stage's input-buffer ring gates its own reuse on GPU events, so a
         # deeper pipeline adds host lead only, never a buffer race.
-        max_in_flight = max(1, envs.ATOM_PP_MAX_IN_FLIGHT or self.pp_size)
+        max_in_flight = max(1, envs.ATOM_PP_MAX_INFLIGHT or self.pp_size)
         while len(self._in_flight) < max_in_flight:
             result = self.scheduler.schedule()
 
