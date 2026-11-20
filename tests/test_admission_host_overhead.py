@@ -31,6 +31,7 @@ from atom.model_engine.prefix_hash import chained_block_hashes, ship_prompt_hash
 from atom.model_engine.sequence import Sequence
 from atom.model_engine.zmq_protocol import engine_v1_pb2 as pb
 from atom.model_engine.zmq_protocol.codec import (
+    AdmissionContext,
     _decode_chain,
     _encode_chain,
     decode_client_message,
@@ -569,12 +570,13 @@ def test_the_chain_rides_beside_the_seqs(monkeypatch, manager):
     engine._kv_progress_event = threading.Event()
     engine.label, engine.input_queue = "test", queue.Queue()
     engine.output_queue = queue.Queue()
-    engine._admission = SimpleNamespace(
-        block_size=BLOCK,
-        num_draft_tokens=0,
-        has_per_req_cache=False,
-        validate_request=None,
-        enable_dp_attention=False,
+    engine._admission = AdmissionContext(
+        SimpleNamespace(
+            kv_cache_block_size=BLOCK,
+            speculative_config=None,
+            enable_dp_attention=False,
+            hf_config=SimpleNamespace(model_type="llama"),
+        )
     )
     engine.process_input_sockets("input", "control")
     want = reference_chain(tokens, BLOCK, -1, 10)

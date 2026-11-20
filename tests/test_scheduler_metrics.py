@@ -174,6 +174,7 @@ def test_engine_receipt_includes_time_buffered_before_scheduler_admission(
         SimpleNamespace(
             kv_cache_block_size=4,
             speculative_config=None,
+            enable_dp_attention=False,
             hf_config=SimpleNamespace(model_type="llama"),
         )
     )
