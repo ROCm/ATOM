@@ -874,31 +874,37 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KIMI_MONO_HERD_WAVE_DROP": lambda: (
         os.getenv("ATOM_KIMI_MONO_HERD_WAVE_DROP", "1") == "1"
     ),
-    # 1: a parallel-HERD routing CTA of the gfx1250 lite finish takes its own
-    # token's candidates from its routing's registers and polls only the
-    # others', so it polls right after its routing, its own stores still in
-    # flight (the same bits); 0, the default, drains its stores and polls
-    # every token's.
+    # 1, the default: a parallel-HERD routing CTA of the gfx1250 lite finish
+    # keeps its own token's candidates in registers (stage_herd_token_local,
+    # the same bits): its wave 0 places and stores them while the other waves
+    # poll the other tokens', no barrier waits for a store, and the drop is
+    # prepared during the polls; 0 drains its stores and polls every token's.
     "ATOM_KIMI_MONO_HERD_OWN_LOCAL": lambda: (
-        os.getenv("ATOM_KIMI_MONO_HERD_OWN_LOCAL", "0") == "1"
+        os.getenv("ATOM_KIMI_MONO_HERD_OWN_LOCAL", "1") == "1"
     ),
     # With ATOM_KIMI_MONO_HERD_OWN_LOCAL=1: the s_sleep units between a
     # routing CTA's polls of the other tokens' candidates.
     "ATOM_KIMI_MONO_HERD_POLL_SPACE": lambda: int(
         os.getenv("ATOM_KIMI_MONO_HERD_POLL_SPACE", "1")
     ),
-    # 1: up to 32 rows the gfx1250 lite finish's own-candidates routing CTAs
-    # (ATOM_KIMI_MONO_HERD_OWN_LOCAL=1) are token k's CTA 8 k -- the first
-    # XCD's, among the first dispatched -- and their candidates exchange
-    # stays in that XCD's L2 (the same bits); 0, the default, keeps them the
-    # last CTAs, exchanging at device scope.
+    # 1, the default: up to 32 rows the gfx1250 lite finish's own-candidates
+    # routing CTAs (ATOM_KIMI_MONO_HERD_OWN_LOCAL=1) are token k's CTA 8 k --
+    # the first XCD's, among the first dispatched -- and their candidates
+    # exchange stays in that XCD's L2 (the same bits); 0 keeps them the last
+    # CTAs, exchanging at device scope.
     "ATOM_KIMI_MONO_LITE_ROUTE_XCD": lambda: (
-        os.getenv("ATOM_KIMI_MONO_LITE_ROUTE_XCD", "0") == "1"
+        os.getenv("ATOM_KIMI_MONO_LITE_ROUTE_XCD", "1") == "1"
     ),
-    # 1: the gfx1250 lite finish's shared down sums and stores eight outputs
-    # (16 B) a thread, not two (the same bits); 0, the default, keeps pairs.
+    # 1, the default: the gfx1250 lite finish's shared down sums and stores
+    # eight outputs (16 B) a thread, not two (the same bits); 0 keeps pairs.
     "ATOM_KIMI_MONO_LITE_SD_WIDE": lambda: (
-        os.getenv("ATOM_KIMI_MONO_LITE_SD_WIDE", "0") == "1"
+        os.getenv("ATOM_KIMI_MONO_LITE_SD_WIDE", "1") == "1"
+    ),
+    # 1: the gfx1250 lite finish's shared down issues its rows' loads before
+    # its weights', so staging the rows waits for no weight from HBM (the
+    # same bits); 0, the default, issues the weights first.
+    "ATOM_KIMI_MONO_LITE_SD_ROWS_FIRST": lambda: (
+        os.getenv("ATOM_KIMI_MONO_LITE_SD_ROWS_FIRST", "0") == "1"
     ),
     # Kimi-K3 gfx1250 mono: the o_proj all-reduce in one fabric hop, every
     # rank's partials pushed to every rank and summed there in rank order (the

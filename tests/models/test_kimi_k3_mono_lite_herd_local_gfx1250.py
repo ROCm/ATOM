@@ -47,29 +47,31 @@ def switches(monkeypatch):
 
 @pytest.mark.parametrize("rows", (16, 24, 32, 40, 64))
 def test_an_own_local_finish_is_a_build_of_its_own(switches, rows):
-    switches()
-    base = _finish(rows)
-    switches("OWN_LOCAL")
+    switches("OWN_LOCAL", "ROUTE_XCD", "SD_WIDE")
     local = _finish(rows)
-    assert local.name == base.name + "_hol1"
+    switches("ROUTE_XCD", "SD_WIDE")
+    base = _finish(rows)
+    assert base.name == local.name + "_nohol"
     assert local.abi == base.abi
     assert local.grid == base.grid
     assert local.scratch_bytes == base.scratch_bytes
 
 
 def test_only_a_parallel_herd_finish_without_a_poll_limit_keeps_its_own(switches):
-    switches("OWN_LOCAL")
-    assert "_hol" not in _finish(40, parallel_herd=False).name
-    assert "_hol" not in _finish(40, herd_poll_limit=1024).name
-    assert "_hol" not in _finish(8).name
+    switches("SD_WIDE")
+    assert "hol" not in _finish(40, parallel_herd=False).name
+    assert "hol" not in _finish(40, herd_poll_limit=1024).name
+    assert "hol" not in _finish(8).name
 
 
 @pytest.mark.parametrize("rows", (16, 24, 32, 40, 64))
 def test_the_routing_ctas_take_the_first_xcd_only_up_to_32_rows(switches, rows):
-    switches("OWN_LOCAL", "ROUTE_XCD")
-    assert ("_rx" in _finish(rows).name) == (rows <= 32)
-    switches("ROUTE_XCD")
-    assert "_rx" not in _finish(rows).name
+    switches("OWN_LOCAL", "ROUTE_XCD", "SD_WIDE")
+    on = _finish(rows).name
+    switches("OWN_LOCAL", "SD_WIDE")
+    assert _finish(rows).name == on + ("_norx" if rows <= 32 else "")
+    switches("SD_WIDE")
+    assert "rx" not in _finish(rows).name
 
 
 @pytest.mark.parametrize("rows", range(1, 33))
@@ -85,13 +87,29 @@ def test_the_first_xcd_routing_ctas_leave_the_shared_down_its_order(rows):
 
 
 @pytest.mark.parametrize("rows", (8, 16, 40, 64))
+def test_a_rows_first_finish_is_a_build_of_its_own(monkeypatch, switches, rows):
+    switches(*SWITCHES)
+    base = _finish(rows)
+    monkeypatch.setenv("ATOM_KIMI_MONO_LITE_SD_ROWS_FIRST", "1")
+    assert _finish(rows).name == base.name + "_srf"
+
+
+@pytest.mark.parametrize("rows", (8, 16, 40, 64))
 def test_a_wide_store_finish_is_a_build_of_its_own(switches, rows):
     switches()
-    base = _finish(rows)
+    pairs = _finish(rows)
     switches("SD_WIDE")
     wide = _finish(rows)
-    assert wide.name == base.name + "_sw"
-    assert wide.scratch_bytes == base.scratch_bytes
+    assert pairs.name == wide.name + "_nosw"
+    assert wide.scratch_bytes == pairs.scratch_bytes
+
+
+@pytest.mark.parametrize("rows", (8, 16, 24, 32, 40, 64))
+def test_the_default_finish_names_no_lite_switch(monkeypatch, rows):
+    for name in SWITCHES + ("ATOM_KIMI_MONO_LITE_SD_ROWS_FIRST",):
+        monkeypatch.delenv(name, raising=False)
+    name = _finish(rows).name
+    assert not any(s in name for s in ("hol", "rx", "sw", "srf"))
 
 
 def _herd_reference(ids, values, pops, rsf):
@@ -146,6 +164,23 @@ def test_the_local_herd_drop_is_the_wave_drop(seed):
         j: w.tobytes() for j, w in local[2].items()
     }
     assert sorted(local[1].values()) == list(range(KP1 - 1))
+
+
+@pytest.mark.parametrize("name", SWITCHES)
+def test_the_lite_switches_default_on(monkeypatch, name):
+    from atom.utils import envs
+
+    monkeypatch.delenv(name, raising=False)
+    assert getattr(envs, name) is True
+    monkeypatch.setenv(name, "0")
+    assert getattr(envs, name) is False
+
+
+def test_the_shared_rows_first_switch_defaults_off(monkeypatch):
+    from atom.utils import envs
+
+    monkeypatch.delenv("ATOM_KIMI_MONO_LITE_SD_ROWS_FIRST", raising=False)
+    assert envs.ATOM_KIMI_MONO_LITE_SD_ROWS_FIRST is False
 
 
 def test_the_popularity_key_holds_a_batch_of_64_rows():

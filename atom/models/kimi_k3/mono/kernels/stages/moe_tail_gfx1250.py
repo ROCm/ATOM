@@ -111,6 +111,39 @@ def stage_hidden_rows(c, hidden):
     _rows_to_lds(c, hidden, SHARED_INTERMEDIATE, SHARED_ROW_STRIDE)
 
 
+def hidden_rows_issue(c, hidden):
+    """``stage_hidden_rows`` in two steps: this one issues its loads (in
+    flight ahead of the caller's next loads), and ``hidden_rows_land`` of
+    what it returns stores them once they land."""
+    tokens, tid, threads = c["S"], c["tid"], c["threads"]
+    packs = tokens * SHARED_INTERMEDIATE // PACK
+    return [
+        bo.buffer_load(
+            rsrc(hidden),
+            fx.min(tid + threads * index, packs - 1) * (PACK // 2),
+            vec_width=PACK // 2,
+            dtype=T.i32,
+        )
+        for index in range_constexpr((packs + threads - 1) // threads)
+    ]
+
+
+@traced
+def hidden_rows_land(c, words):
+    tokens, tid, threads = c["S"], c["tid"], c["threads"]
+    columns = SHARED_INTERMEDIATE
+    packs = tokens * columns // PACK
+    for index in range_constexpr(len(words)):
+        pack = tid + threads * index
+        if pack < packs:
+            token, column = pack // (columns // PACK), pack % (columns // PACK) * PACK
+            fx.ptr_store(
+                words[index],
+                c["tail"]["gemv_rows"] + (token * SHARED_ROW_STRIDE + column) // 2,
+            )
+    gpu.barrier()
+
+
 @traced
 def stage_sdown(c, task, operands, waves):
     """Shared-down GEMV into the rank-local final contribution."""

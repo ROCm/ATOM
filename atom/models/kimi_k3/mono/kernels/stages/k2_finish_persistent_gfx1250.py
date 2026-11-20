@@ -450,29 +450,25 @@ def build_packed_finish(
     wave_drop = parallel_herd and envs.ATOM_KIMI_MONO_HERD_WAVE_DROP
     split_bound = rolled and envs.ATOM_KIMI_MONO_ROUTE_SPLIT_BOUND
     # A routing CTA keeps its own candidates (stage_route_cta's) for its HERD.
-    own_local = (
-        rolled
-        and parallel_herd
-        and herd_poll_limit is None
-        and envs.ATOM_KIMI_MONO_HERD_OWN_LOCAL
-    )
+    may_own = rolled and parallel_herd and herd_poll_limit is None
+    own_local = may_own and envs.ATOM_KIMI_MONO_HERD_OWN_LOCAL
     poll_space = envs.ATOM_KIMI_MONO_HERD_POLL_SPACE
     # Up to an XCD's CTAs of rows, token k's own-candidates routing CTA is
     # CTA 8 k, on the first XCD (CTAs go round-robin over them), the others
     # the shared down's in order: the routing CTAs start among the first
     # dispatched, and their exchange stays in that XCD's L2 (SE scope).
     xcds = gemv_tdm_gfx1250.XCDS
-    route_xcd = (
-        own_local
-        and rows <= plan.blocks // xcds
-        and envs.ATOM_KIMI_MONO_LITE_ROUTE_XCD
-    )
+    may_route_xcd = own_local and rows <= plan.blocks // xcds
+    route_xcd = may_route_xcd and envs.ATOM_KIMI_MONO_LITE_ROUTE_XCD
     exchange_cm = SCOPE_SE if route_xcd else CM_DEV
-    wide_stores = (
-        rolled
-        and include_shared
+    may_widen = rolled and include_shared and not include_routed
+    wide_stores = may_widen and envs.ATOM_KIMI_MONO_LITE_SD_WIDE
+    # The shared down's rows loaded ahead of its weights.
+    rows_first = (
+        include_shared
         and not include_routed
-        and envs.ATOM_KIMI_MONO_LITE_SD_WIDE
+        and replicated_front
+        and envs.ATOM_KIMI_MONO_LITE_SD_ROWS_FIRST
     )
     name = (
         f"k3_k2_gfx1250_persistent_finish_s{rows}_b{plan.blocks}"
@@ -485,9 +481,11 @@ def build_packed_finish(
         f"{'_ra' if routes_apart and not parallel_herd else ''}"
         f"{'_nohwd' if parallel_herd and not wave_drop else ''}"
         f"{'_norsb' if rolled and not split_bound else ''}"
-        f"{f'_hol{poll_space}' if own_local else ''}"
-        f"{'_rx' if route_xcd else ''}"
-        f"{'_sw' if wide_stores else ''}"
+        f"{'_nohol' if may_own and not own_local else ''}"
+        f"{f'_ps{poll_space}' if own_local and poll_space != 1 else ''}"
+        f"{'_norx' if may_route_xcd and not route_xcd else ''}"
+        f"{'_nosw' if may_widen and not wide_stores else ''}"
+        f"{'_srf' if rows_first else ''}"
         f"{f'_pl{herd_poll_limit}' if herd_poll_limit is not None else ''}"
         f"{'_profile' if profile else ''}"
         f"{tdm_timeline.suffix()}"
@@ -916,6 +914,18 @@ def build_packed_finish(
                     shared_index + slot * shared_ctas for slot in range(shared_slots)
                 ]
             if does_shared:
+                staging = {
+                    "S": rows,
+                    "tid": tid,
+                    "threads": THREADS,
+                    "tail": {"gemv_rows": shared_down.rows.ptr},
+                }
+                if const_expr(rows_first):
+                    # The rows' loads first: in order, they land, and are
+                    # stored, before the weights from HBM.
+                    hidden_words = moe_tail_gfx1250.hidden_rows_issue(
+                        staging, shared_hidden
+                    )
                 # Every task's weights are in flight before the rows are staged.
                 operands = [
                     (
@@ -941,13 +951,9 @@ def build_packed_finish(
                     for task in tasks
                 ]
                 tdm_timeline.stamp(tdm_timeline.LITE_SD_ISSUED)
-                staging = {
-                    "S": rows,
-                    "tid": tid,
-                    "threads": THREADS,
-                    "tail": {"gemv_rows": shared_down.rows.ptr},
-                }
-                if const_expr(replicated_front):
+                if const_expr(rows_first):
+                    moe_tail_gfx1250.hidden_rows_land(staging, hidden_words)
+                elif const_expr(replicated_front):
                     # The replicated front already activated the shared columns.
                     moe_tail_gfx1250.stage_hidden_rows(staging, shared_hidden)
                 else:
