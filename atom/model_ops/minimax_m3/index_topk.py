@@ -1412,6 +1412,30 @@ def _launch_select(
         )
         return
 
+    if _split_decode_selector_wins(
+        rows=batch * rows_per_req * num_idx_heads,
+        width=score.shape[2],
+        tile=block_size_k,
+        decode_max_q=decode_max_q,
+    ):
+        _launch_split_decode_selector(
+            score,
+            topk_idx,
+            row_prefix,
+            batch,
+            topk,
+            init_blocks,
+            local_blocks,
+            block_table,
+            emit_args,
+            num_idx_heads,
+            decode_max_q,
+            emit,
+            block_page_stride,
+            pages_per_block,
+        )
+        return
+
     sbt, sctx, bt_stride0, sbt_stride0 = emit_args
     _topk_index_packed_kernel[(rows_per_req, batch, num_idx_heads)](
         score,
@@ -1437,6 +1461,232 @@ def _launch_select(
         block_page_stride=block_page_stride,
         EMIT_SPARSE_BT=emit,
         num_warps=num_warps,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Split decode selector: the packed selector's row, cut into groups that are
+# selected in parallel.
+#
+# The packed kernel folds tl.topk over a row's tiles one after another, so a
+# row past one tile is a serial chain: 8.7us at 510K tokens (two 2048 tiles),
+# 15.4us at 1M (four), whatever the batch. Here one program a (group, row)
+# keeps its group's top-BLOCK_SIZE_T keys and a second launch merges the groups
+# a row reaches and emits, so the chain is one group plus one merge at any
+# length. A group past a row's valid blocks returns without writing and the
+# merge masks it by the same bound, so the workspace is never cleared. Same
+# keys, same tl.topk, same emit: bit-identical to the packed selector.
+#
+# It is the latency case's selector, not the throughput one's: its two
+# launches and (groups x rows) grid cost more than the chain once the machine
+# is full. MI455X, 1M launch bound, verify of 8, us (packed -> split):
+#
+#     tokens a request    batch 1       batch 4       batch 8       batch 16
+#     167K (one tile)     5.4 -> 5.4    5.5 -> 5.7    5.6 -> 6.3    5.8 -> 8.2
+#     510K (two tiles)    8.8 -> 5.4    8.9 -> 5.7    9.0 -> 6.9    9.5 -> 8.6
+#     1M   (four tiles)   15.4 -> 5.4   15.4 -> 5.8
+#
+# A captured graph cannot see the context, so the gate is the row count alone:
+# up to DECODE_SPLIT_TOPK_MAX_ROWS rows it is level at one tile and 1.5-2.8x
+# past it. Wider packed tiles are not an alternative: 4096 x 16 warps gains
+# 1.1x at 510K and loses 1.45x at 167K.
+# ---------------------------------------------------------------------------
+DECODE_SPLIT_TOPK_GROUP = 512
+DECODE_SPLIT_TOPK_NUM_WARPS = 4
+DECODE_SPLIT_TOPK_MAX_ROWS = 32
+
+
+def _split_decode_selector_wins(*, rows: int, width: int, tile: int, decode_max_q: int):
+    """Decode only, few rows, and a launch bound the packed selector would chain
+    tiles over. Pure function of launch-time bounds: a cuda graph replays it."""
+    return decode_max_q > 0 and 0 < rows <= DECODE_SPLIT_TOPK_MAX_ROWS and width > tile
+
+
+@triton.jit
+def _decode_partial_topk_kernel(
+    score_ptr,
+    partial_key_ptr,  # [heads, total_q, groups * BLOCK_SIZE_T] int64
+    seq_lens,
+    stride_s_h,
+    stride_s_n,
+    stride_s_k,
+    stride_p_h,
+    stride_p_n,
+    init_blocks: tl.constexpr,
+    local_blocks: tl.constexpr,
+    DECODE_MAX_Q: tl.constexpr,
+    SPARSE_BLOCK: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_T: tl.constexpr,
+):
+    pid_g = tl.program_id(0)
+    pid_r = tl.program_id(1)  # request-major row, as the packed selector's
+    pid_h = tl.program_id(2)
+    pid_b = pid_r // DECODE_MAX_Q
+    pid_q = pid_r - pid_b * DECODE_MAX_Q
+    prefix_len = tl.load(seq_lens + pid_b) - DECODE_MAX_Q
+    valid_blocks = (prefix_len + pid_q + SPARSE_BLOCK) // SPARSE_BLOCK
+    offset = pid_g * BLOCK_SIZE_K
+    if offset >= valid_blocks:
+        return
+    local_start = tl.maximum(0, valid_blocks - local_blocks)
+    s_row = score_ptr + pid_r * stride_s_n + pid_h * stride_s_h
+    winners = tl.topk(
+        _score_tile_keys(
+            s_row,
+            offset,
+            valid_blocks,
+            local_start,
+            stride_s_k,
+            init_blocks,
+            BLOCK_SIZE_K,
+        ),
+        BLOCK_SIZE_T,
+    )
+    tl.store(
+        partial_key_ptr
+        + pid_h * stride_p_h
+        + pid_r * stride_p_n
+        + pid_g * BLOCK_SIZE_T
+        + tl.arange(0, BLOCK_SIZE_T),
+        winners,
+    )
+
+
+@triton.jit
+def _decode_merge_topk_kernel(
+    partial_key_ptr,
+    ti_ptr,
+    seq_lens,
+    topk,
+    stride_p_h,
+    stride_p_n,
+    stride_ti_h,
+    stride_ti_n,
+    stride_ti_t,
+    block_table_ptr,
+    sparse_bt_ptr,
+    sparse_ctx_ptr,
+    stride_bt_b,
+    stride_sbt_n,
+    DECODE_MAX_Q: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    SPARSE_BLOCK: tl.constexpr,
+    GROUP_K: tl.constexpr,
+    BLOCK_SIZE_T: tl.constexpr,
+    MERGE_SIZE: tl.constexpr,
+    pages_per_block: tl.constexpr,
+    block_page_stride: tl.constexpr,
+    EMIT_SPARSE_BT: tl.constexpr,
+):
+    pid_r = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    pid_b = pid_r // DECODE_MAX_Q
+    pid_q = pid_r - pid_b * DECODE_MAX_Q
+    prefix_len = tl.load(seq_lens + pid_b) - DECODE_MAX_Q
+    valid_blocks = (prefix_len + pid_q + SPARSE_BLOCK) // SPARSE_BLOCK
+    # The groups the partial pass wrote for this row; the rest of the
+    # workspace is stale.
+    written = (valid_blocks + GROUP_K - 1) // GROUP_K * BLOCK_SIZE_T
+    cols = tl.arange(0, MERGE_SIZE)
+    keys = tl.load(
+        partial_key_ptr + pid_h * stride_p_h + pid_r * stride_p_n + cols,
+        mask=cols < written,
+        other=0,
+    )
+    winners = tl.topk(keys, BLOCK_SIZE_T)
+    off_t = tl.arange(0, BLOCK_SIZE_T)
+    topk_idx = (winners & 0xFFFF).to(tl.int32) - 1
+    topk_idx = tl.where(off_t < tl.minimum(topk, valid_blocks), topk_idx, -1)
+    tl.store(
+        ti_ptr + pid_h * stride_ti_h + pid_r * stride_ti_n + off_t * stride_ti_t,
+        topk_idx,
+        mask=off_t < topk,
+    )
+    if EMIT_SPARSE_BT:
+        emit_row = pid_r * NUM_KV_HEADS + pid_h
+        _emit_sparse_block_table_row(
+            topk_idx,
+            block_table_ptr + pid_b * stride_bt_b,
+            sparse_bt_ptr + emit_row * stride_sbt_n,
+            sparse_ctx_ptr + emit_row,
+            prefix_len + pid_q + 1,
+            topk,
+            pid_h,
+            SPARSE_BLOCK,
+            pages_per_block,
+            block_page_stride=block_page_stride,
+            NUM_KV_HEADS=NUM_KV_HEADS,
+            BLOCK_SIZE_T=BLOCK_SIZE_T,
+        )
+
+
+def _launch_split_decode_selector(
+    score,
+    topk_idx,
+    seq_lens,
+    batch,
+    topk,
+    init_blocks,
+    local_blocks,
+    block_table,
+    emit_args,
+    num_idx_heads,
+    decode_max_q,
+    emit,
+    block_page_stride,
+    pages_per_block,
+):
+    """The packed selector's result (indices, and the emitted table and
+    contexts when ``emit``) through the split passes above."""
+    max_block = score.shape[2]
+    rows = batch * decode_max_q
+    groups = triton.cdiv(max_block, DECODE_SPLIT_TOPK_GROUP)
+    block_size_t = triton.next_power_of_2(topk)
+    partial_keys = torch.empty(
+        (num_idx_heads, rows, groups * block_size_t),
+        dtype=torch.int64,
+        device=score.device,
+    )
+    _decode_partial_topk_kernel[(groups, rows, num_idx_heads)](
+        score,
+        partial_keys,
+        seq_lens,
+        *score.stride(),
+        partial_keys.stride(0),
+        partial_keys.stride(1),
+        init_blocks=init_blocks,
+        local_blocks=local_blocks,
+        DECODE_MAX_Q=decode_max_q,
+        SPARSE_BLOCK=SPARSE_BLOCK_SIZE,
+        BLOCK_SIZE_K=DECODE_SPLIT_TOPK_GROUP,
+        BLOCK_SIZE_T=block_size_t,
+        num_warps=DECODE_SPLIT_TOPK_NUM_WARPS,
+    )
+    sbt, sctx, bt_stride0, sbt_stride0 = emit_args
+    _decode_merge_topk_kernel[(rows, num_idx_heads)](
+        partial_keys,
+        topk_idx,
+        seq_lens,
+        topk,
+        partial_keys.stride(0),
+        partial_keys.stride(1),
+        *topk_idx.stride(),
+        block_table,
+        sbt,
+        sctx,
+        bt_stride0,
+        sbt_stride0,
+        DECODE_MAX_Q=decode_max_q,
+        NUM_KV_HEADS=num_idx_heads,
+        SPARSE_BLOCK=SPARSE_BLOCK_SIZE,
+        GROUP_K=DECODE_SPLIT_TOPK_GROUP,
+        BLOCK_SIZE_T=block_size_t,
+        MERGE_SIZE=triton.next_power_of_2(groups * block_size_t),
+        pages_per_block=pages_per_block,
+        block_page_stride=block_page_stride,
+        EMIT_SPARSE_BT=emit,
+        num_warps=DECODE_SPLIT_TOPK_NUM_WARPS,
     )
 
 
