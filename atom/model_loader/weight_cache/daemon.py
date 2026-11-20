@@ -168,7 +168,8 @@ def _serve_rank(rank: int, config, ready, index: int, all_serving) -> None:
         log=_log_file(),
         idle_timeout_s=_IDLE_TIMEOUT_S,
     )
-    device = init_model_env(config, rank, dist_env=_groups_without_communicators)
+    # Loading does without device communicators (several GiB per GPU).
+    device = init_model_env(config, rank, device_communicators=False)
     server, pool = _load_and_serve(config, rank, device, path, lock, t0)
     # Flags: a handler that takes a lock could land inside its holder.
     signaled, idle = [], []
@@ -200,46 +201,6 @@ def _log_file() -> str | None:
         if os.path.isfile(out):
             return out
     return None
-
-
-def _groups_without_communicators(
-    tp_size: int,
-    *,
-    rankID,
-    backend,
-    distributed_init_method,
-    local_rank,
-    data_parallel_size,
-    data_parallel_rank,
-    prefill_context_model_parallel_size,
-    decode_context_parallel_size,
-) -> None:
-    """aiter's init_dist_env without device communicators: loading does
-    without them, and RCCL with the custom and quick all-reduce buffers
-    takes about 9 GiB per GPU."""
-    from aiter.dist.parallel_state import (
-        ensure_model_parallel_initialized,
-        init_distributed_environment,
-    )
-
-    init_distributed_environment(
-        world_size=tp_size * prefill_context_model_parallel_size,
-        rank=rankID,
-        distributed_init_method=distributed_init_method,
-        backend=backend,
-        local_rank=local_rank,
-        data_parallel_size=data_parallel_size,
-        data_parallel_rank=data_parallel_rank,
-    )
-    # No custom groups ({}): the standard ones get no device communicator.
-    ensure_model_parallel_initialized(
-        tp_size,
-        1,
-        decode_context_model_parallel_size=decode_context_parallel_size,
-        data_parallel_size=data_parallel_size,
-        prefill_context_model_parallel_size=prefill_context_model_parallel_size,
-        custom_group_config={},
-    )
 
 
 def _stop_launch(lock, idle: list) -> None:

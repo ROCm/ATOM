@@ -123,10 +123,20 @@ def test_the_daemons_key_names_the_checkpoint_as_loading_left_it(tmp_path, monke
 
 @pytest.mark.parametrize(
     "name",
-    ["ATOM_USE_TRITON_MOE_DECODE", "ATOM_USE_UNIFIED_ATTN", "ATOM_FORCE_ATTN_TRITON"],
+    [
+        # They decide the layout experts are kept in, and the dtype of a sink.
+        "ATOM_USE_TRITON_MOE_DECODE",
+        "ATOM_USE_UNIFIED_ATTN",
+        "ATOM_FORCE_ATTN_TRITON",
+        # Read by the MoE method online quantization creates while loading,
+        # which a server gets as the daemon built it.
+        "AITER_FLYDSL_USE_HERD",
+        "ATOM_MORI_FP4_DISPATCH",
+        "ATOM_MORI_V2",
+        "ATOM_USE_TRITON_MOE_A4W4",
+    ],
 )
 def test_a_backend_switch_loading_goes_by_is_in_the_key(tmp_path, monkeypatch, name):
-    # They decide the layout experts are kept in, and the dtype of a sink.
     monkeypatch.setenv(name, "1")
     on = _key(tmp_path, monkeypatch)
     monkeypatch.setenv(name, "0")
