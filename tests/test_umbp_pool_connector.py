@@ -130,7 +130,9 @@ class TestProvidesThePool:
         cfg = MockConfig(
             num_kvcache_blocks=16, kv_cache_block_size=4, enable_prefix_caching=True
         )
-        assert isinstance(BlockManager(cfg, kv_connector=object()).kv, BlockPool)
+        # A connector that moves KV but provides no pool (the base class's answer).
+        mover = types.SimpleNamespace(make_block_pool=lambda *a, **k: None)
+        assert isinstance(BlockManager(cfg, kv_connector=mover).kv, BlockPool)
         assert isinstance(BlockManager(cfg).kv, BlockPool)
 
     def test_runner_memory_falls_back_to_its_own(self):
@@ -141,3 +143,23 @@ class TestProvidesThePool:
                 return "theirs"
 
         assert make_pool_memory(None, 0, kv_connector=Provider()) == "theirs"
+
+
+class TestRefusedAtStartup:
+    def config(self, architectures, tp=1):
+        return types.SimpleNamespace(
+            kv_transfer_config=transfer(),
+            hf_config=types.SimpleNamespace(architectures=architectures),
+            tensor_parallel_size=tp,
+        )
+
+    def test_a_model_without_the_pool_layout(self):
+        with pytest.raises(ValueError, match="supports"):
+            UmbpPoolConnectorScheduler(self.config(["LlamaForCausalLM"]))
+
+    def test_tensor_parallel_attention(self):
+        with pytest.raises(ValueError, match="data-parallel attention"):
+            UmbpPoolConnectorScheduler(self.config(["DeepseekV41ForCausalLM"], tp=2))
+
+    def test_deepseek_v41_under_dp_attention(self):
+        UmbpPoolConnectorScheduler(self.config(["DeepseekV41ForCausalLM"]))

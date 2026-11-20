@@ -603,12 +603,11 @@ class BlockManager:
         stores = restores = ()
         if self.paged_state_checkpoints is not None:
             stores, restores = self.paged_state_checkpoints.take_checkpoint_ops()
-        take_copies = getattr(self.kv, "take_block_copies", None)
         return StateMaintenanceOps(
             relocations=relocations,
             checkpoint_stores=stores,
             checkpoint_restores=restores,
-            block_copies=take_copies() if take_copies is not None else (),
+            block_copies=self.kv.take_block_copies(),
         )
 
     def state_checkpoint_fates(self) -> dict[str, int]:
@@ -1466,7 +1465,7 @@ class BlockManager:
         if local == n:
             return
         tokens_of = lambda i: self._hash_block_tokens(seq, local + i)
-        if getattr(self.kv, "async_fetch", False):
+        if self.kv.async_fetch:
             # Copied in the background; the scheduler holds the sequence back
             # while it is in flight (`shared_prefix_pending`).
             self.kv.fetch_async(seq.id, chain[local:], tokens_of)
@@ -1482,7 +1481,7 @@ class BlockManager:
         if not (
             self.kv.shares_content
             and self.enable_prefix_caching
-            and getattr(self.kv, "async_fetch", False)
+            and self.kv.async_fetch
         ):
             return False
         self._fetch_shared_prefix(seq)

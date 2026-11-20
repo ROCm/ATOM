@@ -269,6 +269,8 @@ class CoreManager:
     # No prefix router, and so no backlog ledger, unless __init__ builds one.
     _prefix_router = None
     _backlog = None
+    # No session moves unless a pool-sharing connector sets a margin.
+    _session_migrate_margin = None
     _bp_offline_batch = False
     _bp_dispatch_paused = False
     _input_send_lock = Lock()
@@ -1739,7 +1741,7 @@ class CoreManager:
             if not isinstance(policy, SessionPolicy):
                 # Moving a session is worth it only where its history moves
                 # along: the ranks share their pools, and a margin was set.
-                margin = getattr(self, "_session_migrate_margin", None)
+                margin = self._session_migrate_margin
                 migrate = margin is not None
                 policy = SessionPolicy(
                     self._select_dp_rank_locked,

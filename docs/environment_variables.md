@@ -440,8 +440,13 @@ provides it (`KVConnectorBase.kv_pool_memory`,
 a MORI-UMBP standalone server so DP ranks share cached prefixes; it is set up
 through `--kv-transfer-config` like any connector, e.g.
 `{"kv_connector": "umbp_pool", "kv_connector_extra_config": {"address":
-"unix:///tmp/umbp-l1/server.sock", "share_ratio": 0.5}}`. Its settings are
-documented in `atom/kv_transfer/pool/umbp/settings.py`.
+"unix:///tmp/umbp-l1/server.sock", "share_ratio": 0.5}}`. Below a share ratio
+of 1, `placement` (`private`, `shared` or `write_through`) says where fresh
+content goes and what moves between the private part and UMBP's. Its settings
+are documented in `atom/kv_transfer/pool/umbp/settings.py`. It serves
+DeepSeek-V4.1 under data-parallel attention (one runner per engine rank) and
+needs a MORI build whose UMBP L1 client copies into held slots (`Fetch` with
+`dst_slots`); startup refuses other models and tensor-parallel attention.
 
 ## State checkpoints
 

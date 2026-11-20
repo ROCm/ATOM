@@ -57,7 +57,7 @@ from __future__ import annotations
 
 import copy
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from atom.kv_transfer.disaggregation.base import (
     KVConnectorBase,
@@ -69,6 +69,9 @@ from atom.kv_transfer.disaggregation.types import (
     KVConnectorOutput,
     connector_metadata_has_work,
 )
+
+if TYPE_CHECKING:
+    from atom.model_engine.kv_block_pool import KVBlockPool, KVPoolMemory
 
 logger = logging.getLogger("atom")
 
@@ -285,7 +288,7 @@ class MultiConnector(KVConnectorBase):
         # resolve, not raise `AttributeError`.
         self._state_tier = None
 
-    def kv_pool_memory(self, config: Any, rank: int) -> Any | None:
+    def kv_pool_memory(self, config: Any, rank: int) -> KVPoolMemory | None:
         """The pool memory of whichever sub provides the pool (at most one)."""
         provided = [
             memory
@@ -454,7 +457,9 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         tier = self._prefetch_tier()
         return 0 if tier is None else int(tier.held_tier_hit(seq))
 
-    def make_block_pool(self, config: Any, num_blocks: int, **kwargs: Any) -> Any:
+    def make_block_pool(
+        self, config: Any, num_blocks: int, **kwargs: Any
+    ) -> KVBlockPool | None:
         """The block pool of whichever sub provides the pool (at most one)."""
         provided = [
             pool

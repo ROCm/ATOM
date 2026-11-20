@@ -52,6 +52,8 @@ class FakeL1:
     def __init__(self):
         # Set to n to make fetch stop after n slots, as a failed copy does.
         self.fetch_keeps = None
+        # Set to make every copy into held slots raise.
+        self.fail_fetch_into = False
         self.pools = {}
         self.holders = {}  # (group, key) -> [(pool_id, slot)]
         self.copies = []  # (src pool, src slot, dst pool, dst slot)
@@ -178,8 +180,33 @@ class FakeL1:
                     (pool_id, slot)
                 )
 
-    def fetch(self, pool_id, keys):
+    def _source(self, pool_id, key):
         pool = self.pools[pool_id]
+        for h in self.holders.get((pool["group"], key), []):
+            if h[0] != pool_id and self._readable(*h):
+                return h
+        return None
+
+    def fetch(self, pool_id, keys, dst_slots=(), probe_only=False):
+        pool = self.pools[pool_id]
+        if probe_only:
+            available = 0
+            for key in keys:
+                if key not in pool["index"] and self._source(pool_id, key) is None:
+                    break
+                available += 1
+            return [], [], 0, 0, 0, available
+        if dst_slots:
+            if self.fail_fetch_into:
+                raise RuntimeError("copy failed")
+            slots = []
+            for key, dst in zip(keys, dst_slots):
+                source = self._source(pool_id, key)
+                if source is None or pool["state"][dst] != "H":
+                    break
+                self.copies.append((*source, pool_id, dst))
+                slots.append(dst)
+            return slots, [], len(slots), len(slots) * UNIT, 0, 0
         slots, evicted, copied = [], [], 0
         pinned = set()
         for key in keys:
@@ -223,7 +250,7 @@ class FakeL1:
                 pool["state"][dst] = "V"
             copied = min(copied, self.fetch_keeps)
             slots = slots[: self.fetch_keeps]
-        return slots, evicted, copied, copied * UNIT, 0
+        return slots, evicted, copied, copied * UNIT, 0, 0
 
     def clear(self, pool_id):
         pool = self.pools[pool_id]
@@ -286,7 +313,7 @@ def settle(pool: UmbpL1Pool) -> None:
 
 def land(bm: BlockManager, seq) -> None:
     """Wait out a background copy `seq`'s first probe started, then index it."""
-    if not getattr(bm.kv, "async_fetch", False):
+    if not bm.kv.async_fetch:
         return
     deadline = time.monotonic() + 10
     while bm.kv.fetch_pending(seq.id):
@@ -297,7 +324,7 @@ def land(bm: BlockManager, seq) -> None:
 
 def count_fetches(bm: BlockManager, calls: list) -> None:
     """Record how many hashes each ask for other pools' content covers."""
-    if getattr(bm.kv, "async_fetch", False):
+    if bm.kv.async_fetch:
         start = bm.kv.fetch_async
         bm.kv.fetch_async = lambda owner, hashes, tokens_of: (
             calls.append(len(hashes)) or start(owner, hashes, tokens_of)
@@ -682,11 +709,7 @@ class TestBackgroundFetch:
 
     @pytest.fixture
     def pools(self, l1):
-        a = make_pool(l1, "a", 8)
-        b = make_pool(l1, "b", 8)
-        if not b.async_fetch:
-            pytest.skip("this UMBP copies only into slots it picks")
-        return a, b
+        return make_pool(l1, "a", 8), make_pool(l1, "b", 8)
 
     def wait(self, pool, owner):
         deadline = time.monotonic() + 10
@@ -735,3 +758,23 @@ class TestBackgroundFetch:
             b.allocate(block_id)
         self.wait(b, "s")
         assert b.lookup(1) not in others and b.lookup(2) not in others
+
+    def test_a_failed_copy_is_a_miss_and_frees_its_blocks(self, pools):
+        a, b = pools
+        if not isinstance(b._client, FakeL1):
+            pytest.skip("the model is what fails a copy on demand")
+        cache(a, [1, 2])
+        b._client.fail_fetch_into = True
+        assert b.fetch_async("s", [1, 2], lambda i: toks(i))
+        self.wait(b, "s")
+        assert b.lookup(1) == -1 and b.lookup(2) == -1
+        assert b.num_used == 0 and b.blocks_fetched == 0
+
+    def test_a_copy_started_before_a_clear_is_not_indexed(self, pools):
+        a, b = pools
+        cache(a, [1, 2])
+        assert b.fetch_async("s", [1, 2], lambda i: toks(i))
+        b.clear_index()
+        self.wait(b, "s")
+        assert b.lookup(1) == -1 and b.lookup(2) == -1
+        assert b.num_used == 0 and b.num_indexed == 0

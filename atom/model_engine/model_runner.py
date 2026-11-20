@@ -2437,6 +2437,16 @@ class ModelRunner:
             # counts in its own page, and the transfer protocol addresses
             # ``req.block_ids``, which are the scheduler's.
             transfer_tensors.set_block_count(num_kvcache_blocks)
+        if (
+            self._kv_pool_memory().shares_blocks
+            and not self.attn_metadata_builder.state_transfer().replays
+        ):
+            # Another rank's block carries PAGE only; without bounded replay a
+            # hit would need a STATE checkpoint it lacks.
+            raise NotImplementedError(
+                "a pool shared across ranks needs encoder SWA bounded "
+                "replay (--enable-encoder-swa-bounded-replay)"
+            )
         if pool.numel():
             # A backend that moves blocks itself has to know where a block's
             # bytes are; the PAGE regions are that, in the scheduler's ids.
@@ -2453,14 +2463,6 @@ class ModelRunner:
             owned = getattr(self.attn_metadata_builder, "owned_pool_layout", None)
             layout = owned() if callable(owned) else None
             if layout is not None:
-                replays = self.attn_metadata_builder.state_transfer().replays
-                if not replays and self._kv_pool_memory().shares_blocks:
-                    # Another rank's block carries PAGE only; without bounded
-                    # replay a hit would need a STATE checkpoint it lacks.
-                    raise NotImplementedError(
-                        "a pool shared across ranks needs encoder SWA bounded "
-                        "replay (--enable-encoder-swa-bounded-replay)"
-                    )
                 self._kv_pool_memory().bind_layout(*layout, num_kvcache_blocks)
         # The same count reaches the codecs, which likewise index by scheduler
         # block: MLA's cache is allocated in page-size-1 rows, so its own count
