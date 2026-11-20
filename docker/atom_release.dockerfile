@@ -277,11 +277,11 @@ RUN if [ "${ATOM_BASE_IMAGE}" = "rocm10-base" ]; then \
         fi; \
     fi
 
-# Pin Triton to the perf-good ROCm build. The base rocm/pytorch image ships a
-# newer Triton (3.8.0) that regressed benchmark throughput; install the
-# AMD-published 3.7.0 wheel plus its matching triton_kernels from AMD's index,
-# here in the shared base so every downstream stage (the aiter build included)
-# links the same Triton. Empty TRITON_PIN_VERSION keeps the base image's Triton.
+# Pin Triton to the perf-good ROCm build. The base rocm/pytorch image ships
+# Triton 3.6.0 (+rocm7.2.4); install the AMD-published 3.8.0 wheel plus its
+# matching triton_kernels from AMD's index, here in the shared base so every
+# downstream stage (the aiter build included) links the same Triton. Empty
+# TRITON_PIN_VERSION keeps the base image's Triton.
 # The pin is for the rocm/pytorch (ROCm 7.x) line only: the ROCm 10 flavor
 # installs Triton from the ROCm 10 SDK channel (ROCM_TRITON_VERSION) and
 # force-reinstalling a rocm7.2.0 wheel there would break the stack, so the
@@ -893,7 +893,7 @@ print('component imports ok: mori, atom (aiter needs a GPU: runtime-only; amdsmi
 
 # Guarantee the perf-good Triton survived every install above: re-pin if
 # something pulled a different one, then assert the exact version or fail the
-# build -- the image must never silently ship the base image's newer Triton.
+# build -- the image must never silently ship the base image's Triton.
 # The pin is for the rocm/pytorch (ROCm 7.x) line only: the ROCm 10 flavor
 # installs Triton from the ROCm 10 SDK channel (ROCM_TRITON_VERSION) and
 # force-reinstalling a rocm7.2.0 wheel there would break the stack, so the
