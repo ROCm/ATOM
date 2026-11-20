@@ -215,12 +215,23 @@ class PagedAttentionImpl(nn.Module):
         position: torch.Tensor = None,
         q_scale: torch.Tensor = None,
         qkv: torch.Tensor = None,
+        quantized_output: torch.Tensor | None = None,
+        output_scale: torch.Tensor | None = None,
     ):
+        """Attention over ``q``'s rows; with ``quantized_output`` /
+        ``output_scale`` (an impl with ``supports_output_quant``) the result is
+        written there, quantized, instead of returned in BF16."""
 
         fwd_ctx: ForwardContext = get_forward_context()
 
         # dummy run will skip attention in cuda graph capture phase
         if fwd_ctx.context.is_dummy_run:
+            if quantized_output is not None:
+                from atom.model_ops.base_attention import fill_unit_scale
+
+                quantized_output.zero_()
+                fill_unit_scale(output_scale)
+                return quantized_output
             o = torch.empty_like(q)
             return o
 
@@ -235,7 +246,21 @@ class PagedAttentionImpl(nn.Module):
         )
 
         attn_impl = self.dispatch_backend(fwd_ctx, q, k, v)
-        o = attn_impl(q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx)
+        if quantized_output is None:
+            o = attn_impl(q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx)
+        else:
+            o = attn_impl(
+                q,
+                k,
+                v,
+                k_cache,
+                v_cache,
+                k_scale,
+                v_scale,
+                fwd_ctx,
+                quantized_output=quantized_output,
+                output_scale=output_scale,
+            )
 
         o = o.view(-1, self.num_heads * self.head_dim)
 
@@ -1181,6 +1206,8 @@ class PagedAttentionImpl(nn.Module):
         q_scale: torch.Tensor | None = None,
         qkv: torch.Tensor = None,
         output: torch.Tensor = None,
+        quantized_output: torch.Tensor | None = None,
+        output_scale: torch.Tensor | None = None,
         **kwargs,
     ):
         return self.forward_impl(
@@ -1190,6 +1217,8 @@ class PagedAttentionImpl(nn.Module):
             position=position,
             q_scale=q_scale,
             qkv=qkv,
+            quantized_output=quantized_output,
+            output_scale=output_scale,
         )
 
 
@@ -1222,6 +1251,8 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
     """
 
     is_indexed_sparse_attention = True
+    # The NVFP4 K/V attention (gfx1250) writes o_proj's MXFP8 input.
+    supports_output_quant = True
 
     def __init__(
         self,
@@ -1570,6 +1601,8 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         page_table,
         plan_step_owner=None,
         plan_cache_owner=None,
+        quantized_output=None,
+        output_scale=None,
     ):
         from atom.model_ops.minimax_m3.sparse_attn_nvfp4 import (
             check_nvfp4_sparse_attention,
@@ -1595,6 +1628,8 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             page_table=page_table,
             plan_step_owner=plan_step_owner,
             plan_cache_owner=plan_cache_owner,
+            quantized_output=quantized_output,
+            output_scale=output_scale,
         )
 
     def _nvfp4_emit_kwargs(self) -> dict:
@@ -1727,7 +1762,17 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
 
     @mark_trace(prefix="sparse_attention_prefill", torch_compile=False)
     def _sparse_prefill(
-        self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
+        self,
+        q,
+        k,
+        v,
+        k_cache,
+        v_cache,
+        k_scale,
+        v_scale,
+        fwd_ctx: ForwardContext,
+        quantized_output=None,
+        output_scale=None,
     ):
         from atom.model_ops.minimax_m3.index_topk import minimax_m3_index_topk
         from atom.model_ops.minimax_m3.sparse_attn import (
@@ -1824,8 +1869,14 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 # block is forced; the plan and scratch live with the step.
                 plan_step_owner=prefill_md if self.local_blocks >= 1 else None,
                 plan_cache_owner=prefill_md,
+                quantized_output=quantized_output,
+                output_scale=output_scale,
             )
+            if quantized_output is not None:
+                output = quantized_output
         else:
+            if quantized_output is not None:
+                raise NotImplementedError("quantized output needs NVFP4 K/V")
             output = torch.empty_like(q)
             minimax_m3_sparse_attn_prefill_asm(
                 q,
@@ -1932,7 +1983,17 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
 
     @mark_trace(prefix="sparse_attention_decode", torch_compile=False)
     def _sparse_decode(
-        self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
+        self,
+        q,
+        k,
+        v,
+        k_cache,
+        v_cache,
+        k_scale,
+        v_scale,
+        fwd_ctx: ForwardContext,
+        quantized_output=None,
+        output_scale=None,
     ):
         from atom.model_ops.minimax_m3.index_topk import minimax_m3_index_topk_decode
         from atom.model_ops.minimax_m3.sparse_attn import (
@@ -2066,8 +2127,14 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 (sparse_bt, sparse_ctx),
                 # Once per step only when the tail block is forced (see sparse_attn).
                 plan_step_owner=decode_md if self.local_blocks >= 1 else None,
+                quantized_output=quantized_output,
+                output_scale=output_scale,
             )
+            if quantized_output is not None:
+                output = quantized_output
         else:
+            if quantized_output is not None:
+                raise NotImplementedError("quantized output needs NVFP4 K/V")
             output = torch.empty_like(q)
             minimax_m3_sparse_attn_decode_asm(
                 q,
