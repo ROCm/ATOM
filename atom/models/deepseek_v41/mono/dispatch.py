@@ -156,6 +156,31 @@ class MonoDraftModel(nn.Module):
 def install_mono_decode(
     model: nn.Module, atom_config, drafter, *, metadata_builder=None
 ) -> nn.Module:
+    dp_ranks = dp_attention_ranks(atom_config) if atom_config.enable_dp_attention else 0
+    standalone = indexer_enabled(
+        atom_config.index_cache_dtype == "fp4",
+        atom_config.tensor_parallel_size,
+        dp_ranks=dp_ranks,
+    )
+    # Native indexer math does not contain the layer runner's MoE. DP4 can
+    # use a local hook without expanding ordinary layer Mono's DP2 admission.
+    if (
+        dp_ranks
+        and standalone
+        and hi_gate.mode() != "1"
+        and config_refusal(atom_config) is not None
+        and config_refusal(atom_config, supported_dpa=(2, 4)) is None
+    ):
+        from atom.models.deepseek_v41.mono.indexer_dispatch import (
+            MonoIndexerModel,
+            NativeDecodeModel,
+        )
+        from atom.models.deepseek_v41.mono.indexer_workspace import IndexerWorkspace
+
+        workspace = IndexerWorkspace(model, atom_config.max_model_len, 1)
+        return MonoIndexerModel(
+            NativeDecodeModel(model), model, atom_config, workspace=workspace
+        )
     return _install_layer_decode(
         model, atom_config, drafter, metadata_builder=metadata_builder
     )
@@ -201,11 +226,10 @@ def _install_layer_decode(
             hi_gate.log_once(logging.INFO, "V4.1 mono hi off: %s", why)
     if drafter is not None and hasattr(drafter.model, "block_backbone"):
         drafter.model = MonoDraftModel(drafter.model, dp_ranks)
-    standalone = (
-        indexer_enabled(
-            atom_config.index_cache_dtype == "fp4", atom_config.tensor_parallel_size
-        )
-        and not dp_ranks
+    standalone = indexer_enabled(
+        atom_config.index_cache_dtype == "fp4",
+        atom_config.tensor_parallel_size,
+        dp_ranks=dp_ranks,
     )
     workspace = None
     if standalone:

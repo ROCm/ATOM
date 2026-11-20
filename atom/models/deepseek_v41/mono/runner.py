@@ -64,6 +64,7 @@ from atom.mono.plan.execution import BLOCKS
 from atom.mono.runtime.aux_taps import AuxTaps, bind_aux_taps
 from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
 from atom.mono.runtime.debug import DIAG_BYTES, given_up_waits, raise_if_given_up
+from atom.mono.runtime.deployment import dp_attention_ranks
 from atom.mono.runtime.lifecycle import owned_peer_buffer
 from atom.mono.runtime.mailboxes import StepMailboxes
 from atom.mono.runtime.step_begin import FENCE_BYTES
@@ -172,12 +173,11 @@ class V41MonoDecodeRunner:
         self.index_bound_max = ip.cdiv(max_model_len, ip.CHUNK) * ip.CHUNK
         self.index_fp4 = index_fp4
         self.indexer_workspace = indexer_workspace
-        self.indexer_apart = (
-            standalone_indexer
-            and indexer_enabled(
-                index_fp4, get_current_atom_config().tensor_parallel_size
-            )
-            and not get_current_atom_config().enable_dp_attention
+        config = get_current_atom_config()
+        self.indexer_apart = standalone_indexer and indexer_enabled(
+            index_fp4,
+            config.tensor_parallel_size,
+            dp_ranks=dp_attention_ranks(config) if config.enable_dp_attention else 0,
         )
         self.index_layout = (
             get_current_atom_config().index_cache_layout if index_fp4 else "fp8"

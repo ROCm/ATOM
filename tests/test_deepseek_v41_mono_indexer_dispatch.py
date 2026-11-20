@@ -91,6 +91,27 @@ def test_default_on_with_explicit_opt_out_and_fp8_fallback(monkeypatch):
     assert not indexer_enabled(True, 4)
 
 
+@pytest.mark.parametrize("dp_ranks", [2, 4])
+def test_dp_local_indexer_is_explicit_opt_in(monkeypatch, dp_ranks):
+    monkeypatch.delenv("ATOM_DSV41_MONO_INDEXER", raising=False)
+    assert not indexer_enabled(True, 1, dp_ranks=dp_ranks)
+    monkeypatch.setenv("ATOM_DSV41_MONO_INDEXER", "1")
+    assert indexer_enabled(True, 1, dp_ranks=dp_ranks)
+    assert not indexer_enabled(True, 1, dp_ranks=8)
+    assert not indexer_enabled(False, 1, dp_ranks=dp_ranks)
+    monkeypatch.setenv("ATOM_DSV41_MONO_INDEXER", "0")
+    assert not indexer_enabled(True, 1, dp_ranks=dp_ranks)
+
+
+def test_native_wrapper_does_not_route_layers_to_mono(monkeypatch):
+    raw, _, lazy, _ = setup(monkeypatch)
+    wrapper = module.NativeDecodeModel(raw)
+    ids = torch.arange(8)
+    assert not wrapper.uses_layer_mono(ids)
+    assert torch.equal(wrapper(ids, ids), ids + 1)
+    lazy.ready.assert_not_called()
+
+
 def test_native_staging_is_joined_once_before_persistent_launch(gpu_module):
     runner = gpu_module.MonoIndexer.__new__(gpu_module.MonoIndexer)
     staged = SimpleNamespace(stage=Mock(), join=Mock())
@@ -323,7 +344,10 @@ def test_tp_default_and_explicit_override(monkeypatch, tp):
     assert not indexer_enabled(True, tp)
 
 
-def test_workspace_is_shared_at_install_before_any_decode(monkeypatch, dispatch_module):
+@pytest.mark.parametrize("tp,dp", [(4, 0), (1, 2)])
+def test_workspace_is_shared_at_install_before_any_decode(
+    monkeypatch, dispatch_module, tp, dp
+):
     import sys
     import types
 
@@ -338,7 +362,7 @@ def test_workspace_is_shared_at_install_before_any_decode(monkeypatch, dispatch_
     hook = Mock()
     monkeypatch.setenv("ATOM_DSV41_MONO_INDEXER", "1")
     monkeypatch.setattr(dispatch, "config_refusal", lambda cfg: None)
-    monkeypatch.setattr(dispatch, "dp_attention_ranks", lambda cfg: 0)
+    monkeypatch.setattr(dispatch, "dp_attention_ranks", lambda cfg: dp)
     monkeypatch.setattr(dispatch.hi_gate, "decide", lambda *args, **kwargs: False)
     monkeypatch.setattr(dispatch, "MonoDecodeModel", layer)
     monkeypatch.setattr(module, "MonoIndexerModel", hook)
@@ -347,9 +371,76 @@ def test_workspace_is_shared_at_install_before_any_decode(monkeypatch, dispatch_
 
     monkeypatch.setattr(fresh, "MonoIndexerModel", hook)
     cfg = SimpleNamespace(
-        max_model_len=163840, index_cache_dtype="fp4", tensor_parallel_size=4
+        max_model_len=163840,
+        index_cache_dtype="fp4",
+        tensor_parallel_size=tp,
+        enable_dp_attention=bool(dp),
     )
     dispatch.install_mono_decode(raw, cfg, None)
-    create.assert_called_once_with(raw, 163840, 4)
+    create.assert_called_once_with(raw, 163840, tp)
     assert layer.call_args.kwargs["indexer_workspace"] is workspace
     assert hook.call_args.kwargs["workspace"] is workspace
+
+
+@pytest.mark.parametrize(
+    "flag,dp,refusal,hi,installed",
+    [
+        ("1", 4, None, "0", True),
+        (None, 4, None, "0", False),
+        ("0", 4, None, "0", False),
+        ("1", 4, "unsupported geometry", "0", False),
+        ("1", 4, None, "1", False),
+        ("1", 8, None, "0", False),
+    ],
+)
+def test_dp_native_install_is_local_and_explicit(
+    monkeypatch, dispatch_module, flag, dp, refusal, hi, installed
+):
+    import sys
+    import types
+
+    import atom.models.deepseek_v41.mono.indexer_dispatch as fresh
+
+    dispatch = dispatch_module
+    raw = Model()
+    workspace = object()
+    create = Mock(return_value=workspace)
+    stub = types.ModuleType("atom.models.deepseek_v41.mono.indexer_workspace")
+    stub.IndexerWorkspace = create
+    monkeypatch.setitem(sys.modules, stub.__name__, stub)
+    hook = Mock(return_value="local indexer")
+    monkeypatch.setattr(fresh, "MonoIndexerModel", hook)
+    old = Mock(return_value="existing layer route")
+    monkeypatch.setattr(dispatch, "_install_layer_decode", old)
+    monkeypatch.setattr(dispatch, "dp_attention_ranks", lambda cfg: dp)
+    monkeypatch.setattr(dispatch.hi_gate, "mode", lambda: hi)
+    monkeypatch.setattr(
+        dispatch,
+        "config_refusal",
+        lambda cfg, supported_dpa=(2,): refusal if dp in supported_dpa else "DP ranks",
+    )
+    if flag is None:
+        monkeypatch.delenv("ATOM_DSV41_MONO_INDEXER", raising=False)
+    else:
+        monkeypatch.setenv("ATOM_DSV41_MONO_INDEXER", flag)
+    cfg = SimpleNamespace(
+        max_model_len=163840,
+        index_cache_dtype="fp4",
+        tensor_parallel_size=1,
+        enable_dp_attention=True,
+    )
+    got = dispatch.install_mono_decode(raw, cfg, None)
+    if installed:
+        assert got == "local indexer"
+        create.assert_called_once_with(raw, 163840, 1)
+        wrapped, actual_model, actual_config = hook.call_args.args
+        assert isinstance(wrapped, fresh.NativeDecodeModel)
+        assert actual_model is raw and actual_config is cfg
+        assert not wrapped.uses_layer_mono(None, None)
+        assert hook.call_args.kwargs["workspace"] is workspace
+        old.assert_not_called()
+    else:
+        assert got == "existing layer route"
+        old.assert_called_once()
+        create.assert_not_called()
+        hook.assert_not_called()

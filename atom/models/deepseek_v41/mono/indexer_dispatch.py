@@ -10,6 +10,28 @@ from atom.mono.runtime.route import LazyRunner
 from atom.utils.forward_context import get_forward_context
 
 
+class NativeDecodeModel(nn.Module):
+    """Keep every layer native while exposing indexer ownership."""
+
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def uses_layer_mono(self, input_ids, inputs_embeds=None):
+        return False
+
+    def forward(self, input_ids, positions, inputs_embeds=None):
+        if inputs_embeds is None:
+            return self.model(input_ids, positions)
+        return self.model(input_ids, positions, inputs_embeds=inputs_embeds)
+
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.model, name)
+
+
 class MonoIndexerModel(nn.Module):
     """Activate the native layer hook for one supported decode forward."""
 

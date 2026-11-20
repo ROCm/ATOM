@@ -707,6 +707,7 @@ def test_a_refusal_on_another_rank_keeps_atoms_mono_path_here(
         dispatch, "MonoDraftModel", lambda m, dp: ("atom mono draft", m)
     )
     model, cfg, drafter, builder, _ = args
+    cfg.enable_dp_attention = False
     with caplog.at_level(logging.INFO, logger="atom"):
         got = dispatch.install_mono_decode(
             model, cfg, drafter, metadata_builder=builder
