@@ -1006,6 +1006,7 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           path: ${{ env.STAGE1_ROOT }}/wheels
       - name: Prepare immutable source snapshots
+        id: admission_budget
         timeout-minutes: 1
         run: |
           set -euo pipefail
@@ -1016,8 +1017,11 @@ jobs:
           test "${#wheels[@]}" = 1
           echo "8813b5f9b81d5e499b728d59dfffbfb736109b052986ea87c10b9f7bbaa420ef  ${wheels[0]}" | sha256sum -c -
           git show -s --format='%H %P' cbf1617468110a81e720a00021c5d3c5e14ce232 53439e155826090189ee83275ece09d1fcb4d1f8 > "$STAGE1_ROOT/results/source.txt"
+          container_minutes=$(( (STAGE1_STARTED + 600 - $(date +%s)) / 60 - 3 ))
+          test "$container_minutes" -ge 1
+          echo "container_minutes=$container_minutes" >> "$GITHUB_OUTPUT"
       - uses: ./.github/actions/setup-gpu-container
-        timeout-minutes: 3
+        timeout-minutes: ${{ fromJSON(steps.admission_budget.outputs.container_minutes) }}
         with:
           container-name: ${{ env.CONTAINER_NAME }}
           base-image: rocm/atom-dev@sha256:f3c2fcd6f2213401d275207dd6a7815ef00a9e6ff7bc610dd5e7e266cd55705e
