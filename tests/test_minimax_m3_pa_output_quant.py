@@ -9,14 +9,21 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from aiter_stub import atom_without_aiter
 
-pytest.importorskip("triton", reason="base_attention defines @triton.jit kernels")
-pytest.importorskip("aiter", reason="base_attention imports the AITER runtime")
 
-from aiter import dtypes
-
-from atom.model_ops import attention_mha, base_attention
-from atom.model_ops.minimax_m3 import sparse_attn
+@pytest.fixture(scope="module")
+def m():
+    """The modules under test; on a host without a usable AITER (the CPU job)
+    against its stand-ins, kept for the module's tests."""
+    with atom_without_aiter() as load:
+        base_attention = load("atom.model_ops.base_attention")
+        yield SimpleNamespace(
+            dtypes=base_attention.dtypes,  # the aiter it was imported against
+            attention_mha=load("atom.model_ops.attention_mha"),
+            base_attention=base_attention,
+            sparse_attn=load("atom.model_ops.minimax_m3.sparse_attn"),
+        )
 
 
 @pytest.mark.parametrize(
@@ -30,8 +37,9 @@ from atom.model_ops.minimax_m3 import sparse_attn
     ],
 )
 def test_the_sparse_impl_writes_fp8_only_where_it_was_measured(
-    monkeypatch, kv, kv_heads, gluon, want
+    monkeypatch, m, kv, kv_heads, gluon, want
 ):
+    attention_mha = m.attention_mha
     impl_cls = attention_mha.SparseMHAPagedAttentionImpl
 
     def base_init(self, **kw):
@@ -50,9 +58,10 @@ def test_the_sparse_impl_writes_fp8_only_where_it_was_measured(
 
 
 @pytest.mark.parametrize("dummy", [True, False])
-def test_the_fp8_op_returns_what_the_impl_wrote(monkeypatch, dummy):
+def test_the_fp8_op_returns_what_the_impl_wrote(monkeypatch, m, dummy):
     """`unified_attention_fp8` -> impl.forward_impl: a dummy run writes inert rows;
     otherwise the backend gets the FP8 output and its descales."""
+    attention_mha, base_attention, dtypes = m.attention_mha, m.base_attention, m.dtypes
     seen = {}
 
     def backend(q, k, v, k_cache, v_cache, k_scale, v_scale, ctx, **kw):
@@ -77,6 +86,9 @@ def test_the_fp8_op_returns_what_the_impl_wrote(monkeypatch, dummy):
     monkeypatch.setattr(attention_mha, "get_forward_context", lambda: ctx)
     q, kv = torch.randn(3, 8), torch.randn(3, 4)
     scale = torch.full((3, 1), float("nan"))
+    # the op's FP8 buffer starts as a sentinel, so its zeros are the impl's writes
+    empty = torch.empty
+    monkeypatch.setattr(torch, "empty", lambda *a, **kw: empty(*a, **kw).fill_(3))
     out = base_attention.unified_attention_fp8(q, kv, kv, None, "L", None, scale)
     assert out.dtype == dtypes.fp8 and out.shape == q.shape
     want = 0.0 if dummy else 1.0
@@ -88,8 +100,10 @@ def test_the_fp8_op_returns_what_the_impl_wrote(monkeypatch, dummy):
 
 
 @pytest.mark.parametrize("sp", [False, True])
-def test_attention_hands_o_proj_the_fp8_pair(monkeypatch, sp):
+def test_attention_hands_o_proj_the_fp8_pair(monkeypatch, m, sp):
     from atom.model_ops.paged_attention import Attention
+
+    dtypes = m.dtypes
 
     calls = []
 
@@ -123,7 +137,9 @@ def test_attention_hands_o_proj_the_fp8_pair(monkeypatch, sp):
         (True, True, True, False),
     ],
 )
-def test_attention_turns_the_fp8_output_on(monkeypatch, sp, asked, impl_writes, want):
+def test_attention_turns_the_fp8_output_on(
+    monkeypatch, m, sp, asked, impl_writes, want
+):
     from atom.model_ops import paged_attention as pa
 
     class Impl(torch.nn.Module):
@@ -159,14 +175,15 @@ def test_attention_turns_the_fp8_output_on(monkeypatch, sp, asked, impl_writes, 
     assert attn.per_token_fp8_out is want
 
 
-def test_the_fp8_sparse_pa_hands_flydsl_the_fp8_output_alone(monkeypatch):
-    """One FlyDSL launch on the plan with the FP8 budget: no BF16 store, and the
-    rows past q's (a padded batch) written inert by the same launch."""
+def test_the_fp8_sparse_pa_hands_flydsl_the_fp8_output_alone(monkeypatch, m):
+    """FlyDSL's PA gets the FP8 output, its pad-row count and the BF16 store off,
+    on a plan with the FP8 budget. aiter quantizes and writes the pad rows in
+    the PA launch where the plan allows it, else in launches after it."""
     import aiter.ops.flydsl.pa_decode as fly
     import aiter.ops.triton.gluon.pa_decode_gluon as gluon
 
     plans, seen = [], {}
-    ba = base_attention
+    ba, sparse_attn = m.base_attention, m.sparse_attn
     monkeypatch.setattr(
         ba, "_flydsl_prepare_explicit_plan", lambda **kw: plans.append(kw)
     )
@@ -199,7 +216,7 @@ def test_the_fp8_sparse_pa_hands_flydsl_the_fp8_output_alone(monkeypatch):
     "decode, rows",
     [(True, 4), (True, 16), (True, 72), (True, 128), (True, 320)] + [(False, 300)],
 )
-def test_fp8_output_is_bf16_pa_then_the_per_token_quant(monkeypatch, decode, rows):
+def test_fp8_output_is_bf16_pa_then_the_per_token_quant(monkeypatch, m, decode, rows):
     """Bit for bit, on the plan the FP8 output runs; two pad rows past q's (filled
     with a sentinel) come back zero with a unit descale, for decode and prefill."""
     from aiter.jit.utils.chip_info import get_gfx_runtime
@@ -207,6 +224,7 @@ def test_fp8_output_is_bf16_pa_then_the_per_token_quant(monkeypatch, decode, row
 
     if get_gfx_runtime() != "gfx1250":
         pytest.skip("aiter's FlyDSL PA writes FP8 on gfx1250 only")
+    base_attention, sparse_attn, dtypes = m.base_attention, m.sparse_attn, m.dtypes
     monkeypatch.setattr(base_attention.envs, "ATOM_PA_FLYDSL", True)
     torch.manual_seed(0)
     dev, pages, window, pad = "cuda", 4096, 2048, 2

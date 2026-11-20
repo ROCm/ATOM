@@ -1564,8 +1564,13 @@ def sparse_pa_fp8_per_row(
     plan_cache_owner=None,
 ) -> None:
     """``sparse_pa_per_row`` writing o_proj's per-token FP8 input instead, in
-    FlyDSL's paged decode (aiter #7401): no BF16 store, and the pad rows past
-    q's written as FP8 zeros with a unit descale by the same launch.
+    FlyDSL's paged decode (aiter #7401), with the pad rows past q's written as
+    FP8 zeros with a unit descale. On a plan whose epilogue aiter quantizes
+    (one partition, or a cluster merge with one sequence per cluster) the PA
+    launch does both and stores no BF16. On any other plan, e.g. clusters
+    shared by several sequences (more than 15 rows per 16 CUs: past 240 decode
+    rows on 256 CUs, as at 320), aiter stores BF16 to a buffer of its own, then
+    quantizes it and fills the pad rows in separate launches.
 
     Only for ``SparseMHAPagedAttentionImpl.supports_output_quant``: an FP8 KV,
     one KV head (a token's row is then one PA sequence, which its one descale

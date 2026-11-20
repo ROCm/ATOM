@@ -457,7 +457,7 @@ def _flydsl_prepare_explicit_plan(
 
     ``plan_partition_cap``: None takes ``flydsl_plan_shape``, i.e. aiter's
     defaults except at head_dim 256; a caller's cap is kept, with aiter's
-    default budget. ``plan_workgroup_budget``, when given, is the budget.
+    default budget, or ``plan_workgroup_budget`` when given.
     ``plan_step_owner``: a per-step object whose calls all share the same
     lengths; the plan is then refreshed once per step instead of every call.
     ``plan_segment``: which slice of one call's rows this is, for a caller that
@@ -479,14 +479,12 @@ def _flydsl_prepare_explicit_plan(
         max_partitions = int(plan_partition_cap)
     else:
         max_partitions = shape.get("max_partitions")
-    workgroup_budget = shape.get("workgroup_budget")
-    if plan_workgroup_budget is not None:
-        workgroup_budget = plan_workgroup_budget
 
     if existing_plan is not None and flydsl_plan_matches(
         existing_plan, num_seqs, num_kv_heads
     ):
         return existing_plan
+    workgroup_budget = shape.get("workgroup_budget", plan_workgroup_budget)
 
     from atom.utils.tbo.ubatching import tbo_current_ubatch_id
 
