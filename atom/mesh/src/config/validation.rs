@@ -45,6 +45,13 @@ impl ConfigValidator {
                 field: "rl.api_key (--rl-api-key, required with --enable-rl)".to_string(),
             });
         }
+        if rl.control_timeout_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "rl.control_timeout_secs".to_string(),
+                value: "0".to_string(),
+                reason: "Must be greater than zero".to_string(),
+            });
+        }
         Ok(())
     }
 

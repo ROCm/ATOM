@@ -9,8 +9,9 @@ use std::{
 };
 
 use axum::{
-    extract::{Json, Path, State},
-    http::StatusCode,
+    body::Bytes,
+    extract::{Json, Path, RawQuery, State},
+    http::{HeaderMap, Method, StatusCode},
     response::{
         sse::{Event, KeepAlive},
         IntoResponse, Response, Sse,
@@ -137,6 +138,8 @@ impl MockWorker {
                 post(responses_cancel_handler),
             )
             .route("/flush_cache", post(flush_cache_handler))
+            .route("/rl_echo", get(rl_echo_handler).post(rl_echo_handler))
+            .route("/rl_slow", post(rl_slow_handler))
             .route("/v1/models", get(v1_models_handler))
             .with_state(config);
 
@@ -1145,6 +1148,44 @@ async fn flush_cache_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>
         "message": "Cache flushed successfully"
     }))
     .into_response()
+}
+
+/// The request as received: method, query, every header and the body as
+/// text, answered with the status in the query's `status`, else 200.
+async fn rl_echo_handler(
+    method: Method,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let status = query
+        .as_deref()
+        .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("status=")))
+        .and_then(|code| code.parse().ok())
+        .and_then(|code| StatusCode::from_u16(code).ok())
+        .unwrap_or(StatusCode::OK);
+    let headers: HashMap<String, String> = headers
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.to_string(),
+                String::from_utf8_lossy(value.as_bytes()).into_owned(),
+            )
+        })
+        .collect();
+    let echo = json!({
+        "method": method.as_str(),
+        "query": query,
+        "headers": headers,
+        "body": String::from_utf8_lossy(&body),
+    });
+    (status, Json(echo)).into_response()
+}
+
+/// Answers `{}` after 1.5 s, past a 1 s control timeout.
+async fn rl_slow_handler() -> Response {
+    tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+    Json(json!({})).into_response()
 }
 
 async fn v1_models_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) -> Response {

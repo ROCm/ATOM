@@ -264,7 +264,11 @@ async fn rl_routes_require_the_bearer_token() {
         Some(RL_KEY),
         Some("Basic rl-test-key"),
     ];
-    for uri in ["/v1/rl/workers", "/v1/rl/workers/nope"] {
+    for uri in [
+        "/v1/rl/workers",
+        "/v1/rl/workers/nope",
+        "/v1/rl/workers/nope/engine/flush_cache",
+    ] {
         for authorization in refused {
             let (status, body) = call_as(&app, "GET", uri, None, authorization).await;
             assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri} {authorization:?}");
@@ -298,6 +302,14 @@ fn rl_flags_parse_to_defaults_and_require_the_key() {
         .unwrap()
         .to_router_config(Vec::new())
         .unwrap();
+    assert_eq!(
+        config.rl,
+        RlConfig {
+            enabled: false,
+            api_key: None,
+            control_timeout_secs: 600,
+        }
+    );
     assert_eq!(config.rl, RlConfig::default());
 
     let args = |extra: &[&str]| {
@@ -306,16 +318,21 @@ fn rl_flags_parse_to_defaults_and_require_the_key() {
             .unwrap()
             .to_router_config(Vec::new())
     };
-    let config = args(&["--rl-api-key", "k"]).unwrap();
+    let config = args(&["--rl-api-key", "k", "--rl-control-timeout-secs", "7"]).unwrap();
     assert_eq!(
         config.rl,
         RlConfig {
             enabled: true,
             api_key: Some("k".to_string()),
+            control_timeout_secs: 7,
         }
     );
     for missing in [&[][..], &["--rl-api-key", ""], &["--rl-api-key", " "]] {
         let error = args(missing).unwrap_err().to_string();
         assert!(error.contains("--rl-api-key"), "{missing:?}: {error}");
     }
+    let error = args(&["--rl-control-timeout-secs", "0", "--rl-api-key", "k"])
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("rl.control_timeout_secs"), "{error}");
 }

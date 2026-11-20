@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// Version of the `/v1/rl` wire contract, reported by `GET /v1/rl/workers`.
 pub const RL_PROTOCOL_VERSION: u32 = 1;
@@ -69,4 +70,23 @@ pub struct RlWorkersResponse {
     pub protocol_version: u32,
     pub workers: Vec<RlWorkerEntry>,
     pub total: usize,
+}
+
+/// One completed engine call, whatever its HTTP status.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RlCallOutcome {
+    pub worker_id: String,
+    pub url: String,
+    /// The engine's HTTP status.
+    pub status: u16,
+    pub latency_ms: u64,
+    /// The engine's body: parsed JSON when it was JSON, otherwise text.
+    pub body: Value,
+    /// Set when the body was cut at the size cap.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub body_truncated: bool,
+    /// Set when reading the body failed after the status arrived; `body` then
+    /// holds the bytes read before the failure, as text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_error: Option<String>,
 }
