@@ -1049,18 +1049,18 @@ def _kda_recurrence(
     mixed_qkv: torch.Tensor,
     gate: torch.Tensor,
     beta: torch.Tensor,
-    out: torch.Tensor,
     layer_name: str,
 ) -> torch.Tensor:
-    """A prefill's causal conv and KDA recurrence, written into ``out``
-    (``[T, heads, head_dim]``): the TR-graph break of a split KDA layer, whose
-    launches follow each request's rows and state slots. ``gate`` and ``beta``
-    are ``[T, ...]`` so a padded bucket's rows slice like ``mixed_qkv``'s."""
+    """A prefill's causal conv and KDA recurrence, ``[T, heads, head_dim]``:
+    the TR-graph break of a split KDA layer, whose launches follow each
+    request's rows and state slots. It runs every row of the bucket. A pad row
+    belongs to no request (past every request's `query_start_loc`): the
+    kernels skip it and leave its output unwritten, as a decode leaves a
+    padding request's."""
     self = get_current_atom_config().compilation_config.static_forward_context[
         layer_name
     ]
-    self._prefill_recurrence_rows(out, mixed_qkv, gate, beta)
-    return out
+    return self._live_prefill_recurrence(mixed_qkv, gate, beta)
 
 
 class KimiKDAAttention(nn.Module):
@@ -1663,13 +1663,13 @@ class KimiKDAAttention(nn.Module):
     # it directly, outside the op, and would pay for every call.
 
     def _state(self, fwd_ctx):
-        """This layer's cache entry and its conv and SSM state, the conv state
-        channel-major as the causal conv reads it."""
+        """This layer's conv and SSM state, the conv state channel-major as the
+        causal conv reads it."""
         cache = fwd_ctx.kv_cache_data[f"layer_{self.layer_num}"]
         conv_state = cache.k_cache
         if conv_state.size(1) != self.local_proj_size * 3:
             conv_state = conv_state.transpose(-1, -2)
-        return cache, conv_state, cache.v_cache
+        return conv_state, cache.v_cache
 
     def _recurrence_gate_beta(self, gate: torch.Tensor, beta: torch.Tensor):
         """``gate`` [T, heads * head_dim] and ``beta`` [T, heads] as the
@@ -1687,9 +1687,9 @@ class KimiKDAAttention(nn.Module):
         """The mixer's input projections, ``[T, ...]`` each and sized by the
         rows alone: ``(mixed_qkv, out_gate, beta, gate)``."""
         # Single fused in-proj GEMM producing [q | k | v | g]; slice out each
-        # part. `out_gate` is the KDA output gate consumed at o_norm below
-        # (computed here so it rides the same GEMM instead of a separate one
-        # after the recurrence). in_proj's weight was grown in
+        # part. `out_gate` is the KDA output gate `_project_out`'s o_norm
+        # consumes (computed here so it rides the same GEMM instead of a
+        # separate one after the recurrence). in_proj's weight was grown in
         # process_weights_after_loading to the fused [q | k | v | g | b | f_a],
         # so this single unquantized call emits all six; f_b_proj stays a
         # separate GEMM because it consumes f_a's output, not hidden_states.
@@ -1781,8 +1781,8 @@ class KimiKDAAttention(nn.Module):
         # initial_state dtype; the gathered initial is allocated as such),
         # so no .to() cast is needed.
         ssm_state[state_indices] = last_state
-        # o_norm only reads this tensor, so keep the contiguous KDA output
-        # instead of materializing an identical copy into `out`.
+        # `_kda_recurrence` returns this tensor itself, and `_project_out`'s
+        # o_norm reads it (on a replay, the copy the region's step makes).
         assert kda_out.dtype == mixed_qkv.dtype, (
             "o_norm reads the KDA output in the projections' dtype: got "
             f"{kda_out.dtype} vs {mixed_qkv.dtype}"
@@ -1790,14 +1790,13 @@ class KimiKDAAttention(nn.Module):
         assert kda_out.is_contiguous(), "KDA output must be contiguous for o_norm"
         return kda_out.squeeze(0)
 
-    def _project_out(
-        self, out: torch.Tensor, out_gate: torch.Tensor, is_prefill: bool
-    ) -> torch.Tensor:
-        """The gated output norm and ``o_proj`` (its all-reduce included)."""
+    def _project_out(self, out: torch.Tensor, out_gate: torch.Tensor) -> torch.Tensor:
+        """A prefill's gated output norm and ``o_proj`` (its all-reduce
+        included)."""
         normed = self.o_norm(
             out,
             rearrange(out_gate, "t (h d) -> t h d", d=self.head_dim),
-            is_prefill=is_prefill,
+            is_prefill=True,
         )
         # A fused per-token quant makes o_norm return (quantized, scale); feed it
         # straight to o_proj's x_scale path. Otherwise it is a bf16 tensor.
@@ -1816,40 +1815,33 @@ class KimiKDAAttention(nn.Module):
         mixed_qkv, out_gate, beta, gate = self._project_in(
             hidden_states, hidden_states_scale
         )
-        # Zeroed in the graph: the region writes the scheduled rows in place.
-        out = mixed_qkv.new_zeros(
-            (mixed_qkv.shape[0], self.num_local_heads, self.head_dim)
-        )
-        out = _kda_recurrence(mixed_qkv, gate, beta, out, self.layer_name)
-        return self._project_out(out, out_gate, True)
+        out = _kda_recurrence(mixed_qkv, gate, beta, self.layer_name)
+        return self._project_out(out, out_gate)
 
-    def _prefill_recurrence_rows(
+    def _live_prefill_recurrence(
         self,
-        out: torch.Tensor,
         mixed_qkv: torch.Tensor,
         gate: torch.Tensor,
         beta: torch.Tensor,
-    ) -> None:
-        """`_prefill_recurrence` for `_kda_recurrence`, on the first
-        ``num_actual_tokens`` rows of ``[T, ...]`` inputs -- the rows its
-        metadata describes, as `_forward_impl` cuts them -- and the live step's
-        state, into those rows of ``out``. The recording's dummy prefill leaves
-        it alone, as `MLAAttention._prefill_attend` does; a live step without
-        KDA metadata is a bug, not a step to skip."""
+    ) -> torch.Tensor:
+        """`_prefill_recurrence` for `_kda_recurrence`, on the live step's
+        metadata and state: ``[T, heads, head_dim]``. The recording's dummy
+        prefill touches no state and hands back zeros, as
+        `MLAAttention._prefill_attend` does; a live step without KDA metadata
+        is a bug, not a step to skip."""
         fwd_ctx = get_forward_context()
         if fwd_ctx.context.is_dummy_run:
-            return
+            return mixed_qkv.new_zeros(
+                (mixed_qkv.shape[0], self.num_local_heads, self.head_dim)
+            )
         kda_metadata = step_kda_metadata(fwd_ctx)
         assert (
             kda_metadata is not None
         ), f"{self.layer_name}: a live KDA prefill replay has no KDA metadata"
-        _, conv_state, ssm_state = self._state(fwd_ctx)
-        n = kda_metadata.num_actual_tokens
-        gate, beta = self._recurrence_gate_beta(gate[:n], beta[:n])
-        out[:n].copy_(
-            self._prefill_recurrence(
-                mixed_qkv[:n], gate, beta, kda_metadata, conv_state, ssm_state
-            )
+        conv_state, ssm_state = self._state(fwd_ctx)
+        gate, beta = self._recurrence_gate_beta(gate, beta)
+        return self._prefill_recurrence(
+            mixed_qkv, gate, beta, kda_metadata, conv_state, ssm_state
         )
 
 

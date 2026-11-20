@@ -20,7 +20,6 @@ from atom.utils.region_graph import (
     _weak,
     eager_region,
     join_stream,
-    on_scheduled_rows_into,
     token_graph,
 )
 
@@ -426,68 +425,3 @@ def test_a_region_argument_keeps_its_named_tuple_type():
     assert type(weak) is Pair and weak.width == 64
     assert weak.values.data_ptr() == value.values.data_ptr()
     assert type(_weak((value.values, 1))) is tuple
-
-
-class PaddedPrefillIntoUnit(torch.nn.Module):
-    """A unit whose region attends a prefill's scheduled rows alone -- its
-    launch follows the step (a cumulative sum over the rows), as attention's
-    and a recurrence's do -- writing them into an output its recorded segment
-    zeroes, and hands that output back (`on_scheduled_rows_into`)."""
-
-    def __init__(self, dim=64):
-        super().__init__()
-        self.a = torch.nn.Linear(dim, dim, device="cuda")
-        self.b = torch.nn.Linear(dim, dim, device="cuda")
-
-    @eager_region()
-    def attend(self, x: torch.Tensor, out: torch.Tensor):
-        def cumsum(o, h):
-            o.copy_(h.cumsum(0))
-
-        return on_scheduled_rows_into(cumsum, out, x)
-
-    def forward(self, x):
-        h = torch.relu(self.a(x))
-        return self.b(self.attend(h, torch.zeros_like(h)))
-
-
-PaddedPrefillIntoGraph = token_graph(PaddedPrefillIntoUnit)
-
-
-@torch.inference_mode()
-def test_a_padded_prefill_region_writes_its_rows_in_place(context):
-    torch.manual_seed(6)
-    unit = PaddedPrefillIntoGraph()
-    bucket, scheduled = 32, 20
-    context.context = SimpleNamespace(is_prefill=True, scheduled_tokens=bucket)
-    unit(torch.randn(bucket, 64, device="cuda"))  # warmup
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        context.main_stream = stream
-        context.in_hipgraph, context.tr_graph = True, "record"
-        unit(torch.randn(bucket, 64, device="cuda"))
-        context.in_hipgraph, context.tr_graph = False, None
-    torch.cuda.current_stream().wait_stream(stream)
-    context.main_stream = torch.cuda.current_stream()
-
-    # The region handed back its own input: the next segment reads it where
-    # the region wrote, so a replay copies nothing after the region.
-    graph = unit.__dict__["_token_graph"]
-    ((segments, _, _),) = graph._buckets.values()
-    (step,) = [s for s in segments._steps if isinstance(s, region_graph._EagerStep)]
-    assert step._target.data_ptr() == step._arguments["out"].data_ptr()
-
-    x = torch.randn(scheduled, 64, device="cuda")
-    padded = torch.cat([x, torch.randn(bucket - scheduled, 64, device="cuda")])
-    context.context = SimpleNamespace(is_prefill=True, scheduled_tokens=scheduled)
-    context.tr_graph = "replay"
-    got = unit(padded).clone()
-    context.tr_graph = None
-
-    # The scheduled rows are the eager step's; the rows past them keep the
-    # zeros the segment wrote, whatever the padding held.
-    torch.testing.assert_close(got[:scheduled], unit(x), rtol=1e-5, atol=1e-5)
-    bias = unit.b.bias.expand(bucket - scheduled, -1)
-    torch.testing.assert_close(got[scheduled:], bias, rtol=0, atol=0)
-    graph.release_graphs()

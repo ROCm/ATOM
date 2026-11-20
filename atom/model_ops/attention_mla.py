@@ -90,11 +90,7 @@ from atom.utils.forward_context import (
     get_forward_context,
     pass_scheduled_tokens_gpu,
 )
-from atom.utils.region_graph import (
-    eager_region,
-    on_scheduled_rows_into,
-    prefill_token_graph_capture,
-)
+from atom.utils.region_graph import eager_region, prefill_token_graph_capture
 
 # Cap on the KV-split budget: aiter cuts the KV walk into
 # `min(num_clusters, cap * batch_size)` parts, and a negative cap means uncapped
@@ -599,7 +595,6 @@ def _mla_output_width(impl: _MLAOutputShape, hidden_size: int) -> int:
 
 @eager_region()
 def _mla_prefill_core(
-    out: torch.Tensor,
     prefill_q: torch.Tensor,
     k_new: torch.Tensor,
     v_new: torch.Tensor,
@@ -612,24 +607,17 @@ def _mla_prefill_core(
     layer_name: str,
 ) -> torch.Tensor:
     """The eager break of `MLAAttention.forward_prefill_split`: the KV-cache
-    write and the attention, written into the scheduled rows of ``out``."""
+    write and the attention, on every row of the bucket. A pad row belongs to
+    no request (KV slot and batch id -1, past every request's `cu_seqlens`):
+    the kernels skip it and leave its output unwritten, as a decode leaves a
+    padding request's."""
     impl = (
         get_current_atom_config()
         .compilation_config.static_forward_context[layer_name]
         .impl
     )
-    return on_scheduled_rows_into(
-        impl._prefill_attend,
-        out,
-        prefill_q,
-        k_new,
-        v_new,
-        k_nope,
-        k_rope,
-        q8,
-        k8,
-        v8,
-        fp8_scales,
+    return impl._prefill_attend(
+        prefill_q, k_new, v_new, k_nope, k_rope, q8, k8, v8, fp8_scales
     )
 
 
@@ -3253,8 +3241,9 @@ class MLAAttention(nn.Module):
         prefill_q, k_new, v_new, quant_k_rope = self._new_token_kv(
             prefill_q, k_nope, k_rope
         )
-        # A bucket's pad rows are stale, not zeros: the FP8 descales must see
-        # the live row count, which every replay reads in place.
+        # A bucket's pad rows hold whatever the last step left there, not
+        # zeros: the FP8 descales must see the live row count, which every
+        # replay reads in place.
         num_rows = pass_scheduled_tokens_gpu(prefill_q.shape[0])
         assert (
             num_rows is not None or not self._flydsl_fp8_mha_ok
@@ -3266,26 +3255,13 @@ class MLAAttention(nn.Module):
         if q_fp8 is not None:
             (q8, q_descale), (k8, v8, k_descale, v_descale) = q_fp8, new_kv_fp8
             fp8_scales = (q_descale, k_descale, v_descale, *kv_out_scales)
-        # Zeroed in the graph: the core writes the scheduled rows in place.
-        out = prefill_q.new_zeros((prefill_q.shape[0], self.num_heads, self.v_head_dim))
         out = _mla_prefill_core(
-            out,
-            prefill_q,
-            k_new,
-            v_new,
-            k_nope,
-            k_rope,
-            q8,
-            k8,
-            v8,
-            fp8_scales,
-            layer_name,
+            prefill_q, k_new, v_new, k_nope, k_rope, q8, k8, v8, fp8_scales, layer_name
         )
         return out.flatten(start_dim=-2)
 
     def _prefill_attend(
         self,
-        out: torch.Tensor,
         prefill_q: torch.Tensor,
         k_new: torch.Tensor,
         v_new: torch.Tensor,
@@ -3295,12 +3271,16 @@ class MLAAttention(nn.Module):
         k8: torch.Tensor | None,
         v8: torch.Tensor | None,
         fp8_scales: tuple[torch.Tensor, ...] | None,
-    ) -> None:
-        """The KV write and `forward_impl`'s attention on the live step, into
-        ``out``; the recording's dummy step leaves it alone."""
+    ) -> torch.Tensor:
+        """The KV write and `forward_impl`'s attention on the live step:
+        ``[T, heads, v_head_dim]``. The recording's dummy step touches no KV
+        and hands back zeros, so its warmup forward runs the rest of the layer
+        on finite rows."""
         fwd_ctx = get_forward_context()
         if fwd_ctx.context.is_dummy_run:
-            return
+            return prefill_q.new_zeros(
+                (prefill_q.shape[0], self.num_heads, self.v_head_dim)
+            )
         attn_metadata = fwd_ctx.attn_metadata
         kv_cache = fwd_ctx.kv_cache_data[f"layer_{self.layer_num}"].k_cache
         if kv_cache.numel() > 0:
@@ -3343,7 +3323,8 @@ class MLAAttention(nn.Module):
                 q_fp8=q_fp8,
                 kv_fp8=new_kv_fp8,
             )
-        out.view(output.shape).copy_(output)
+        # The single pass returns its rows with the heads flattened.
+        return output.view(-1, self.num_heads, self.v_head_dim)
 
     def forward_impl(
         self,

@@ -721,8 +721,11 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
     def supports_token_graph(self) -> bool:
         """Every launch outside the model's eager regions -- the KDA recurrence
         and the MLA prefill core -- is sized by the token count alone, so a
-        prefill may pad to a recorded token-graph bucket; those regions run the
-        step's own rows (`_kda_recurrence`, `attention_mla._mla_prefill_core`).
+        prefill may pad to a recorded token-graph bucket. The regions
+        (`_kda_recurrence`, `attention_mla._mla_prefill_core`) run the whole
+        bucket too. A pad row belongs to no request: its batch id and KV slot
+        are -1 and it lies past every request's `cu_seqlens`, and a padding
+        request is zero long on `PAD_SLOT_ID` state. Their kernels skip it.
 
         Not under DP: a decoding or idle rank would replay the prefill
         recording (`ForwardMode._pad_to_token_graph`), whose regions serve a
@@ -731,9 +734,9 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         Kimi-K3 sets) and each can take it
         (`MLAAttention.prefill_split_supported`: no sparse layer, PCP or
         ``ATOM_USE_TRITON_GEMM``). Any other layer would run as one region,
-        which cannot serve a padded bucket: its metadata describes the step's
-        rows, and cutting its inputs to them would cut an FP8 q scale whose
-        bytes are column-major. A sparse layer's DSA indexer is besides no
+        which cannot serve a padded bucket: `forward_impl` takes no live row
+        count, so its FP8 prefill attention would quantize the bucket's pad
+        rows with the step's. A sparse layer's DSA indexer is besides no
         eager region and returns on the recording's dummy step, so a replay
         would attend with a stale top-k. So no model on this builder with a
         sparse MLA layer records: Kimi-K3.1, whose layers opt in but all carry
@@ -758,9 +761,9 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
 
     def build_for_token_graph_capture(self, tokens: int):
         """A request-less prefill of ``tokens`` rows for recording that
-        token-graph bucket. A dummy step: its regions hand back their output
-        shape and touch no KV or state -- a replay runs them on the live step
-        -- and the segments need only its shape."""
+        token-graph bucket. A dummy step: its regions hand back zeros of their
+        output's shape and touch no KV or state -- a replay runs them on the
+        live step -- and the segments need only its shape."""
         if not 0 < tokens <= self.model_runner.config.max_num_batched_tokens:
             raise ValueError(
                 f"token-graph bucket {tokens} exceeds max_num_batched_tokens"

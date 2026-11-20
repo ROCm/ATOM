@@ -52,8 +52,6 @@ __all__ = [
     "forks",
     "graph_pool",
     "join_stream",
-    "on_scheduled_rows_into",
-    "padded_prefill_rows",
     "prefill_token_graph_capture",
     "token_graph",
 ]
@@ -290,21 +288,6 @@ def eager_region(
     return decorate
 
 
-def padded_prefill_rows(rows: int) -> int | None:
-    """The scheduled rows of a prefill padded to a token-graph bucket
-    (`ForwardMode.prefill_token_graph`) whose region is handed ``rows`` -- the
-    bucket -- or None when nothing past the scheduled rows was padded.
-
-    A region whose launches follow the requests attends those rows alone, as
-    the eager step would (`on_scheduled_rows_into`): its metadata describes the
-    scheduled rows, not the bucket."""
-    context = forward_context.get_forward_context().context
-    if context is None or not context.is_prefill:
-        return None
-    scheduled = context.scheduled_tokens
-    return scheduled if 0 < scheduled < rows else None
-
-
 def prefill_token_graph_capture() -> bool:
     """Whether this forward records a prefill token-graph bucket, or is the
     warmup forward before it: the capture's dummy prefill, run under
@@ -318,30 +301,6 @@ def prefill_token_graph_capture() -> bool:
     return fwd_ctx.tr_graph == "record" or (
         fwd_ctx.in_hipgraph and context.is_dummy_run
     )
-
-
-def on_scheduled_rows_into(fn: Callable[..., Any], out: torch.Tensor, *args):
-    """``fn(out, *args)``, which writes its rows of ``out`` in place, then
-    ``out``. On a padded prefill (`padded_prefill_rows`) ``out`` and the
-    tensor arguments of its height are cut to the scheduled rows; nothing is
-    allocated, copied or zero-filled."""
-    height = out.shape[0]
-    rows = padded_prefill_rows(height)
-    if rows is None:
-        fn(out, *args)
-        return out
-    fn(
-        out[:rows],
-        *(
-            (
-                a[:rows]
-                if isinstance(a, torch.Tensor) and a.dim() and a.shape[0] == height
-                else a
-            )
-            for a in args
-        ),
-    )
-    return out
 
 
 def forks(stream: torch.cuda.Stream | None) -> bool:
