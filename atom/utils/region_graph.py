@@ -453,6 +453,11 @@ class TokenGraph:
     def keys(self):
         return list(dict.fromkeys(key for _, key in self._buckets))
 
+    def num_recordings(self) -> int:
+        """Recordings held, each phase of a bucket counted (`keys` merges
+        them)."""
+        return len(self._buckets)
+
     def inputs(self, key, phase: str | None = None) -> tuple:
         """The tensors the recording of ``key`` reads its positional arguments
         from. A caller that writes them in place and hands them to `replay`

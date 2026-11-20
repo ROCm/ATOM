@@ -657,7 +657,9 @@ class Context:
         self.running_tokens_are_unified = running_tokens_are_unified
         self.running_tokens_across_dp = running_tokens_across_dp
         self.forward_mode = forward_mode
-        self.dp_all_greedy = dp_all_greedy
+        self.dp_all_greedy = dp_all_greedy or (
+            forward_mode is not None and forward_mode.dp_all_greedy
+        )
         self.input_ids = input_ids
         self.ubatch_token_offset = ubatch_token_offset
         self.ubatch_token_order = ubatch_token_order

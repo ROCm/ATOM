@@ -1073,13 +1073,16 @@ class ModelRunner:
     def _init_dp_argmax_head(self):
         """The model's one LM head where its logits are its head output
         (`compute_head` is None), no decode verifies drafts, and it shards
-        the vocab over the DP group."""
+        the vocab over the DP group under `ATOM_DP_LM_HEAD_MODE=allgather`.
+        Each decode bucket is then recorded twice; under `all2all` the greedy
+        ids gave no measurable gain, so it records once."""
         from atom.model_ops.embed_head import ParallelLMHead
 
         heads = [m for m in self.model.modules() if isinstance(m, ParallelLMHead)]
         self.dp_argmax_head = None
         if (
-            self.compute_head is None
+            envs.ATOM_DP_LM_HEAD_MODE == "allgather"
+            and self.compute_head is None
             and not self.config.speculative_config
             and self.config.parallel_config.data_parallel_size > 1
             and len(heads) == 1
@@ -1087,9 +1090,31 @@ class ModelRunner:
         ):
             self.dp_argmax_head = heads[0]
         logger.info(
-            "DP greedy argmax head: %s (needs no compute_head, no speculative "
-            "decoding and one DP-sharded ParallelLMHead)",
+            "DP greedy argmax head: %s (needs ATOM_DP_LM_HEAD_MODE=allgather, "
+            "no compute_head, no speculative decoding and one DP-sharded "
+            "ParallelLMHead)",
             self.dp_argmax_head is not None,
+        )
+
+    def _record_decode_bucket(self, forward, key, rows: torch.Tensor, context):
+        """Record a decode bucket, and with `dp_argmax_head` again under
+        `DP_GREEDY_PHASE` with the head exchanging greedy ids (after one
+        eager head run on ``rows``, the bucket's hidden states)."""
+        self.req_graph.record(forward, key=key)
+        if self.dp_argmax_head is None:
+            return
+        context.dp_all_greedy = True
+        try:
+            self._head_output(rows)
+            self.req_graph.record(forward, key=key, phase=DP_GREEDY_PHASE)
+        finally:
+            context.dp_all_greedy = False
+
+    def _replay_decode_bucket(self, key, context):
+        """The head output a decode bucket's recording gives (`_head_output`),
+        or None; greedy ids on a DP greedy step."""
+        return self.req_graph.replay(
+            key=key, phase=DP_GREEDY_PHASE if context.dp_all_greedy else None
         )
 
     def _dp_greedy_vote(self, batch) -> bool | None:
@@ -2734,7 +2759,6 @@ class ModelRunner:
             running_tokens=running_tokens,
             running_tokens_are_unified=running_tokens_are_unified,
             forward_mode=forward_mode,
-            dp_all_greedy=forward_mode.dp_all_greedy,
             scheduled_tokens_gpu=self.forward_vars["batch_info"].gpu[1:2],
         )
 
@@ -3355,12 +3379,7 @@ class ModelRunner:
                 graph_key = request_bucket(
                     running_bs, forward_context.attn_metadata.max_seqlen_q
                 )
-                # The head output the capture recorded (`_head_output`), or
-                # None; greedy ids on a DP greedy step.
-                head = self.req_graph.replay(
-                    key=graph_key,
-                    phase=DP_GREEDY_PHASE if context.dp_all_greedy else None,
-                )
+                head = self._replay_decode_bucket(graph_key, context)
                 hidden_states = self.forward_vars["outputs"][:running_tokens]
                 # Drafter aux buffers (if any) refresh on replay: their in-place
                 # copy ops were captured into the graph.
@@ -3504,8 +3523,11 @@ class ModelRunner:
                 self.dp_argmax_head is not None
                 and get_forward_context().context.dp_all_greedy
             ):
-                # The head exchanged the group's greedy ids, not logits.
-                sampled_tokens = logits
+                # The head exchanged the group's greedy ids, not logits. A
+                # replay's are a view into the graph pool, which the next
+                # replay overwrites: the async copy and `prev_token_ids` need
+                # a fresh tensor, as the sampler gives.
+                sampled_tokens = logits.clone()
             else:
                 sampled_tokens = self.sampler(
                     logits,
@@ -4502,20 +4524,12 @@ class ModelRunner:
                             outputs[:n] = self.model(input_ids[:n], pos)
                             return self._head_output(outputs[:n], logits_in_graph)
 
-                        self.req_graph.record(
-                            full_forward, key=request_bucket(bs, max_q_len)
+                        self._record_decode_bucket(
+                            full_forward,
+                            request_bucket(bs, max_q_len),
+                            outputs[:running_tokens],
+                            context,
                         )
-                        if self.dp_argmax_head is not None:
-                            # The bucket again with the head exchanging greedy
-                            # ids, which a DP greedy step replays.
-                            context.dp_all_greedy = True
-                            self._head_output(outputs[:running_tokens])
-                            self.req_graph.record(
-                                full_forward,
-                                key=request_bucket(bs, max_q_len),
-                                phase=DP_GREEDY_PHASE,
-                            )
-                            context.dp_all_greedy = False
                     torch.cuda.synchronize()
                     # After the sync: the warmup forward's kernels must have
                     # completed before the window closes, or they spill into the
@@ -4577,7 +4591,7 @@ class ModelRunner:
             logger.info(
                 "CUDA graph capture memory: %d graphs | pool(reserved)=%.2fGB "
                 "allocated=%.2fGB",
-                len(self.req_graph.keys()) + len(TokenGraph.captured_sizes()),
+                self.req_graph.num_recordings() + len(TokenGraph.captured_sizes()),
                 _pool_bytes / (1 << 30),
                 _alloc_bytes / (1 << 30),
             )

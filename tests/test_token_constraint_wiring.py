@@ -217,7 +217,10 @@ def test_a_dp_greedy_step_takes_the_heads_ids_without_the_sampler(
     monkeypatch.setattr(mod, "get_forward_context", lambda: fc)
     out = runner.postprocess(_batch(), head, torch.zeros(2), None, None, True, None)
     assert runner.sampler.called is not dp_all_greedy
-    assert prepare.call_args.args[1].tolist() == [3, 1]
+    ids = prepare.call_args.args[1]
+    assert ids.tolist() == [3, 1]
+    # A replay's ids live in the graph pool: postprocess keeps its own copy.
+    assert ids.data_ptr() != head.data_ptr()
     assert out.token_ids == [(3,), (1,)]
 
 

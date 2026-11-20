@@ -396,8 +396,10 @@ class ParallelLMHead(VocabParallelEmbedding):
         """Whether this step may run the DP-sharded LM head (pure-DP decode only).
 
         Every DP rank must reach the SAME verdict from globally-synced state, or
-        the fixed-size collective in `_dp_sharded_logits` deadlocks. The strategy
-        (all-gather vs all2all) is read from ATOM_DP_LM_HEAD_MODE there.
+        the fixed-size collective in `_dp_sharded_logits` deadlocks. `forward`
+        picks the exchange: argmax ids on a DP greedy step
+        (`Context.dp_all_greedy`, `allgather` only), else the logits of
+        ATOM_DP_LM_HEAD_MODE (all-gather vs all2all).
 
         `is_prefill` below is per-rank, which is safe only because
         `running_tokens_are_unified` is the DP-reduced form of the same

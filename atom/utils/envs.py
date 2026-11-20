@@ -1078,7 +1078,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #                  single all-to-all delivers each rank its own rows x full
     #                  vocab (config ③, minimal comm). DEFAULT.
     #   "allgather" -> same shard/gather, but vocab all-gather + scatter rows
-    #                  (config ②); kept for A/B and as a fallback.
+    #                  (config ②). A decode where every DP rank is greedy (no
+    #                  speculative decoding) exchanges argmax ids instead of
+    #                  logits; each decode bucket is recorded twice for it.
     #   "default"   -> replicated full-vocab GEMM per DP rank (big GEMM, no comm);
     #                  explicit opt-out.
     "ATOM_DP_LM_HEAD_MODE": lambda: os.getenv(
