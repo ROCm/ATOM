@@ -52,7 +52,9 @@ pub struct ResponseContext {
 pub const THINK_OPEN: &str = "<think>";
 
 /// The Python server's `prompt_starts_in_reasoning` for the `<think>`
-/// dialect: the prompt, trailing whitespace aside, ends with the opener.
+/// dialect: the prompt, trailing whitespace aside, ends with the opener. A
+/// template whose generation prompt opens `<think>` (GLM-5.x, Qwen3.5)
+/// leaves the reply inside reasoning.
 pub fn prompt_opens_reasoning(prompt: &str) -> bool {
     prompt.trim_end().ends_with(THINK_OPEN)
 }

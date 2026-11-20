@@ -40,11 +40,8 @@ use crate::{
         grpc::completion_adapter::completion_to_generate,
         ingress::InferenceEnvelope,
         prepare::{
-            self,
-            generation_payload::GenerationPayload,
-            inference::ParsedInference,
-            response_context::{self, ResponseContext},
-            thread_tokenizer,
+            self, generation_payload::GenerationPayload, inference::ParsedInference,
+            response_context::ResponseContext, thread_tokenizer,
         },
         render::{self, completion::CompletionRender},
         RouterTrait,
@@ -117,15 +114,9 @@ impl AtomEngineRouter {
         };
         let request = Arc::new(chat.request);
         let (headers, model_id, app) = (headers.cloned(), self.model_id(), self.ctx.clone());
-        let (payload, mut ctx) = self
+        let (payload, ctx) = self
             .on_prepare_worker(move || prepare::prepare_chat(request, headers, model_id, &app))
             .await?;
-        // A template whose generation prompt opens `<think>` (GLM-5.x,
-        // Qwen3.5) leaves the reply inside reasoning, as api_server reads it.
-        ctx.prompt_opens_reasoning = ctx
-            .original_text
-            .as_deref()
-            .is_some_and(response_context::prompt_opens_reasoning);
         let stream = self.submit(&payload, &ctx, admission)?;
         Ok(if payload.stream {
             render::chat_streaming::process(stream, ctx, BACKEND_LABEL)
@@ -350,37 +341,6 @@ impl RouterTrait for AtomEngineRouter {
 
     async fn get_model_info(&self, _req: Request<Body>) -> Response {
         Json(self.model_card()).into_response()
-    }
-
-    async fn route_generate(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &GenerateRequest,
-        _model_id: Option<&str>,
-    ) -> Response {
-        self.generate(headers, body).await.unwrap_or_else(|e| e)
-    }
-
-    async fn route_chat(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &ChatCompletionRequest,
-        _model_id: Option<&str>,
-    ) -> Response {
-        self.chat(headers, body, &RawExtras::default())
-            .await
-            .unwrap_or_else(|e| e)
-    }
-
-    async fn route_completion(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &CompletionRequest,
-        _model_id: Option<&str>,
-    ) -> Response {
-        self.completion(headers, body, &RawExtras::default())
-            .await
-            .unwrap_or_else(|e| e)
     }
 
     fn router_type(&self) -> &'static str {
