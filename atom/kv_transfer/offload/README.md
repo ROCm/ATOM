@@ -571,14 +571,18 @@ layer's; `mooncake_store` turns it on):
   block in its own read window, in `can_allocate` and again in `allocate`,
   whose claims stop at the cut. An unmarked loaded, received or recomputed
   block takes a marked block's index entry. A Mooncake P/D producer with the
-  variable set sends `draft_rows_from` (the end of its highest marked block) in
-  the prefill handoff, or in the output parameters of a non-chunked transfer,
-  and the consumer marks the received blocks below it. A consumer says in its
-  write requests that it can (`draft_row_marks`) and which blocks its own
-  prefix cache holds (`consumer_hit_blocks`); a split producer refuses one that
-  cannot mark, a non-chunked one that did not echo the boundary, and a full
-  transfer that would write over those cached blocks, which other requests on
-  the decode read before any mark could land.
+  variable set sends `draft_rows_from` (V, the end of its highest marked block)
+  in the prefill handoff, or in the output parameters of a non-chunked
+  transfer, and the consumer marks the received blocks below it. A consumer
+  says in its write requests where its draft reads from for the prompt
+  (`consumer_draft_read_from`) and which blocks its own prefix cache holds
+  (`consumer_hit_blocks`). A split producer refuses, before any write, one
+  that cannot mark and a full transfer that would write over those cached
+  blocks, which other requests on the decode read before any mark could land.
+  It also refuses V above where the consumer's draft reads from, whose first
+  decode would read the missing rows, and a non-chunked echo of V other than
+  the V its own workers got with the save; on the chunked path that check
+  takes the place of the handoff.
 
 Refused without such a draft, with another offload connector or another P/D
 connector (MoRIIO hands on no boundary), and for layouts other than M3.
