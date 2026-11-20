@@ -503,6 +503,39 @@ def get_max_tokens_across_dispatchers(input: torch.Tensor) -> int:
     return input.item()
 
 
+_STATIC_PLACEMENT_FILES: dict = {}
+
+
+def _load_static_placement(layer_id, num_routed, expert_layout, eplb_enabled):
+    """ATOM_MOE_EXPERT_PLACEMENT=<json>: {layer_id: perm}, perm[checkpoint expert]
+    = the id it is served under. A static relabeling of one layer's routed
+    experts (load order + router rows) that spreads the experts a workload
+    routes to most over the EP ranks. None when unset, when the layer has no
+    entry of this expert count, with fused shared experts or with EPLB."""
+    import json
+    import os
+
+    path = os.environ.get("ATOM_MOE_EXPERT_PLACEMENT", "")
+    if not path or layer_id is None or eplb_enabled:
+        return None
+    if expert_layout.num_fused_shared_experts or expert_layout.num_redundant:
+        return None
+    table = _STATIC_PLACEMENT_FILES.get(path)
+    if table is None:
+        with open(path) as f:
+            table = _STATIC_PLACEMENT_FILES[path] = json.load(f)
+    perm = table.get(str(layer_id))
+    if perm is None or len(perm) != num_routed:
+        return None
+    perm = [int(p) for p in perm]
+    if sorted(perm) != list(range(num_routed)):
+        raise ValueError(
+            f"ATOM_MOE_EXPERT_PLACEMENT: layer {layer_id} is not a permutation "
+            f"of {num_routed} experts"
+        )
+    return perm
+
+
 def _select_logical(
     layer: torch.nn.Module,
     x: torch.Tensor,
@@ -3753,6 +3786,10 @@ class FusedMoE(torch.nn.Module):
             use_all2all=self.moe_parallel_config.use_all2all_kernels,
             eplb_enabled=eplb_enabled,
         )
+        # Static expert placement: checkpoint expert id -> served id (or None).
+        self._static_placement = _load_static_placement(
+            layer_id, num_experts, self.expert_layout, eplb_enabled
+        )
         # Dispatch space: the id bound the kernels see, not the routed width.
         self.global_num_experts = self.expert_layout.num_physical
         self.num_redundant_experts = self.expert_layout.num_redundant
@@ -4904,6 +4941,9 @@ class FusedMoE(torch.nn.Module):
     def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
         if self.expert_map is None:
             return expert_id
+        placement = getattr(self, "_static_placement", None)
+        if placement is not None and 0 <= expert_id < len(placement):
+            expert_id = placement[expert_id]
         return self.expert_map[
             physical_expert_id(
                 expert_id,

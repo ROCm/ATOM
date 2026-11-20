@@ -147,6 +147,18 @@ def _finite_float_env(name: str, default: float, *, allow_zero: bool) -> float:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    "ATOM_DSV41_FFN_SEAM_QUANT": lambda: (
+        os.getenv("ATOM_DSV41_FFN_SEAM_QUANT", "0") == "1"
+    ),
+    "ATOM_DSV41_SHARED_ACT_QUANT": lambda: (
+        os.getenv("ATOM_DSV41_SHARED_ACT_QUANT", "0") == "1"
+    ),
+    "ATOM_DSV41_FUSED_ATTN": lambda: os.getenv("ATOM_DSV41_FUSED_ATTN", "0") == "1",
+    "ATOM_DSV41_FUSED_ATTN_MIN_ROWS": lambda: int(
+        os.getenv("ATOM_DSV41_FUSED_ATTN_MIN_ROWS", "0")
+    ),
+    "ATOM_DSPARK_LEAN_HEAD": lambda: _flag_env("ATOM_DSPARK_LEAN_HEAD"),
+    "ATOM_SPEC_VERIFY_ARGMAX_ONCE": lambda: _flag_env("ATOM_SPEC_VERIFY_ARGMAX_ONCE"),
     # Optional standalone OpenTelemetry tracing (read once per process).
     "ATOM_ENABLE_OTEL_TRACE": lambda: os.getenv("ATOM_ENABLE_OTEL_TRACE", "0").lower()
     in {"1", "true"},

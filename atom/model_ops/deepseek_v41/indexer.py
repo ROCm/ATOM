@@ -10,6 +10,7 @@ int32.
 """
 
 import functools
+import os
 
 import torch
 import triton
@@ -127,6 +128,17 @@ def _gfx1250():
     return get_gfx_runtime() == "gfx1250"
 
 
+# ATOM_DSV41_MAXIMA_GRID=N (default 0: off): programs in the block-maxima grid
+# of a decode step, lanes a row = N // rows, at most 256. The 2048 below was
+# fitted where a row's context is the batch's; in a served decode step the
+# contexts differ by 100x, the launch lasts as long as its longest row, and
+# that row has 2048 // rows lanes: 26 at 78 rows. DeepSeek-V4.1 DEP8, contexts
+# as an SA run's, 66 / 78 / 90 rows: 16.5 / 22.9 / 23.1 us at 2048, 12.2 / 14.2
+# / 15.1 at 128 lanes a row (N = 10240). The maxima do not depend on the lanes.
+_MAXIMA_GRID = int(os.environ.get("ATOM_DSV41_MAXIMA_GRID", "0"))
+_MAXIMA_GRID_MAX_ROWS = 128
+
+
 def _maxima_lanes(rows):
     """Programs per row for `_block_maxima_kernel`, about 2048 in the grid
     (16384 on gfx1250).
@@ -138,6 +150,8 @@ def _maxima_lanes(rows):
     its loads coming, so its grid is wider.
     """
     target = 16384 if _gfx1250() else 2048
+    if _MAXIMA_GRID > 0 and rows <= _MAXIMA_GRID_MAX_ROWS:
+        target = _MAXIMA_GRID
     return min(256, max(1, target // max(rows, 1)))
 
 

@@ -26,6 +26,7 @@ import torch
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.kernels import buffer_ops as bo
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int64, T
 
@@ -183,10 +184,14 @@ def _router_logits_fake(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 def router_logits(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """[T, 384] bf16 logits of ``x`` (``router_supported``)."""
     out = torch.empty((x.shape[0], EXPERTS), dtype=torch.bfloat16, device=x.device)
-    _build(x.shape[0])(
+    # ROCm/ATOM#3527: through the cached CompiledFunction: calling the flyc.jit launcher itself
+    # re-traces it on every call, which eager steps of <= 16 rows (a DP rank's
+    # dummy or idle forward beside a peer's prefill) would hit once per layer
+    _run_compiled(
+        _build(x.shape[0]),
         x.data_ptr(),
         weight.data_ptr(),
         out.data_ptr(),
-        stream=torch.cuda.current_stream(),
+        torch.cuda.current_stream(),
     )
     return out
