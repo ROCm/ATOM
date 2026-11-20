@@ -1072,7 +1072,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                 f"layer {plan.layer_id} returned rows {sorted(widths)} for "
                 f"an {rows}-row step"
             )
-        self._write_aux(plan.layer_id, out)
+        self._write_aux(plan.layer_id, out, blocks)
         return out
 
     def _production_k2(self, plan, attn_out, prefix, blocks):
