@@ -705,8 +705,8 @@ class Scheduler:
     # on to keep what was running (see `preempt_running`).
     can_recompute_prompts = True
     pd_admission: PdAdmissionController | None = None
-    # Routed-expert replay off; `__init__` sets it on the instance only when
-    # the flag is on.
+    # R3-off default. `__init__` assigns from config; the class value covers
+    # `__new__`-built test doubles that never hit `__init__`.
     _return_routed_experts = False
 
     def __init__(
@@ -723,6 +723,7 @@ class Scheduler:
         self.prefill_token_graphs = prefill_token_graphs
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
+        self._return_routed_experts = bool(config.enable_return_routed_experts)
         # DP prefill cost balancing, on whenever DP attention runs more than
         # one rank: every rank estimates the cost of its chunk at the whole
         # batch budget; the ranks then aim at one cost target, a costlier rank
@@ -758,8 +759,6 @@ class Scheduler:
         # tokens a replaying forward carries from before it (`Replay.history_ids`)
         self.replay_history_tokens = getattr(config, "replay_history_tokens", 0)
 
-        if config.enable_return_routed_experts:
-            self._return_routed_experts = True
         pc = getattr(config, "parallel_config", None)
         self.metrics = SchedulerMetrics(
             getattr(pc, "data_parallel_rank", 0)
@@ -4747,8 +4746,11 @@ class Scheduler:
             # Every position is asked for again on resume: a prefix hit reads
             # its rows from the blocks the request now uses (after a weight
             # sync, a newer forward's KV), and the recompute overwrites the
-            # rest. The rows held stay until then.
+            # rest. Drop the rows held too: an early finish before the
+            # recompute ends would otherwise return old-weight routes past
+            # what the new forward has rewritten.
             seq.routed_forwarded_end = 0
+            seq.truncate_routed_experts(0)
             # The in-flight and held patches are dropped, even ones that
             # arrive after it resumes; the resumed forward owes these
             # positions afresh.
@@ -5437,14 +5439,6 @@ class Scheduler:
                 # output. Aborts without sampled output use the same helper.
                 self._mark_finished(seq, leave_reason, num_tokens)
 
-            # Drop rejected drafts' rows each step: the held count must stay the
-            # live length, or `apply_routed_expert_patch`'s gap check misses a
-            # lost patch under speculative decoding.
-            if return_routes and leave_reason is None and not seq.is_partial_prefill:
-                keep = max(int(num_tokens) - 1, 0)
-                if keep < seq.routed_expert_rows:
-                    seq.truncate_routed_experts(keep)
-
             # Prepare stream output
             # A terminal event is required even when truncation leaves no
             # tokens (for example max_tokens <= 0). Async consumers wait for
@@ -5483,6 +5477,24 @@ class Scheduler:
                 #     f"Sequence {seq.id} finished with reason: {leave_reason}, {seq.token_ids[-8:]=}"
                 # )
                 finished_seqs.append(seq)
+
+        if return_routes:
+            # Drop rejected drafts' rows after the step's tokens are settled:
+            # the held count must stay the live length, or
+            # `apply_routed_expert_patch`'s gap check misses a lost patch under
+            # speculative decoding. Done here, not in the loop above, so with
+            # R3 off that loop pays no per-sequence route check. Only seqs
+            # that had an output row this step were settled
+            # (`num_finalized_tokens`); a deferred prefill with empty
+            # `req_ids` must not trim from the prompt length.
+            by_id = {seq.id: seq for seq in self.running}
+            for req_id in fwd_output.req_ids:
+                seq = by_id.get(req_id)
+                if seq is None or seq.is_finished or seq.is_partial_prefill:
+                    continue
+                keep = max(int(seq.num_finalized_tokens) - 1, 0)
+                if keep < seq.routed_expert_rows:
+                    seq.truncate_routed_experts(keep)
 
         if stream_output_queue is not None and stream_outputs:
             stream_output_queue.put_nowait(stream_outputs)

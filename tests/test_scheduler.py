@@ -4222,7 +4222,9 @@ class TestRoutedExpertPatches:
         assert finished[0].leave_reason == "eos"
         assert seq.routed_experts.shape[0] == seq.num_tokens - 1
 
-    def test_preempt_keeps_accumulated_routes(self, scheduler, seq_factory):
+    def test_preempt_drops_accumulated_routes(self, scheduler, seq_factory):
+        """Preemption clears held rows so an early finish after a weight sync
+        cannot return old-weight routes past what the resume has rewritten."""
         sp = SamplingParams(ignore_eos=True, max_tokens=100)
         seq = seq_factory([1, 2, 3, 4], sampling_params=sp)
         scheduler.add(seq)
@@ -4233,8 +4235,8 @@ class TestRoutedExpertPatches:
             self._output(seq.id, [10], self._patch((seq.id, 0, rows))),
         )
         assert scheduler.preempt(seq)
-        np.testing.assert_array_equal(seq.routed_experts, rows)
-        assert seq.routed_expert_rows == 4
+        assert seq.routed_expert_rows == 0
+        assert seq.routed_experts is None or seq.routed_experts.shape[0] == 0
 
     @staticmethod
     def _chunked_r3_scheduler():

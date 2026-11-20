@@ -188,7 +188,12 @@ def test_release_kv_cache_unbinds_the_routed_experts_capture(monkeypatch):
 
 def test_wake_rebinds_a_new_routed_experts_capture(monkeypatch):
     """Wake's `allocate_kv_cache` binds a fresh capturer at the slept block
-    count, and the MoE layer captures into it rather than the freed one."""
+    count, and the MoE layer captures into it rather than the freed one.
+
+    The stub mirrors ``ModelRunner._bind_routed_experts_layers`` with plain
+    torch so this lifecycle check runs in CI without aiter. The real bind is
+    covered by ``test_only_tp_rank0_binds_the_capture_buffer``.
+    """
     from atom.model_ops.fused_moe.routed_experts_capturer import (
         ROUTES_VIEW_ATTR,
         RoutedExpertsCapturer,
@@ -208,8 +213,8 @@ def test_wake_rebinds_a_new_routed_experts_capture(monkeypatch):
     allocated = []
 
     def allocate_kv_cache(num_blocks):
-        # The part of `allocate_kv_cache` that binds the capture
-        # (`ModelRunner._bind_routed_experts_layers`).
+        # Same steps as ``ModelRunner._bind_routed_experts_layers``; kept
+        # local so this file does not import ``model_runner`` (aiter).
         allocated.append(num_blocks)
         capturer = RoutedExpertsCapturer(
             num_slots=num_blocks * runner.block_size,

@@ -184,6 +184,7 @@ class ScheduledBatch:
 | `num_spec_step` | `int` | Number of speculative decode steps (`mtp_k`) |
 | `scheduled_spec_decode_tokens` | `np.ndarray[int32]` | Draft tokens from the prior speculative step, densified to `[bs, num_spec_step]` in batch order (the constructor takes them keyed by request ID) |
 | `routed_prefix_ranges` | `list[tuple[int, int, int]] \| None` | `enable_return_routed_experts` only: `(batch index, lo, hi)` for each prefix-cache hit whose positions `[lo, hi)` no earlier step returned routes for; the runner reads them from the cached blocks once. See [Routed-expert replay](#routed-expert-replay) |
+| `routed_epochs` | `list[int] \| None` | `enable_return_routed_experts` only: each request's `Sequence.routed_epoch` in batch order, set only after some request in the batch has been preempted; the runner tags each patch segment so a stale pre-preemption patch is dropped on apply |
 
 ### ScheduledBatchOutput
 

@@ -250,8 +250,8 @@ class TokenLocations(NamedTuple):
 
 
 class tokenIDProcessor:
-    # Routed-expert replay off; `__init__` sets it on the instance only when
-    # the runner's flag is on. The route copies and receives run only when set.
+    # R3-off default. `__init__` assigns from the runner; the class value
+    # covers `__new__`-built doubles that never hit `__init__`.
     return_routed_experts = False
 
     def __init__(
@@ -270,8 +270,7 @@ class tokenIDProcessor:
         # keeps its drafter loaded: every decode it runs is q=1.
         self.is_pd_producer = _kv_config_has_producer(kv_cfg)
         self.is_deferred_out = defers_output(runner.config, runner.attn_family)
-        if runner._return_routed_experts:
-            self.return_routed_experts = True
+        self.return_routed_experts = bool(runner._return_routed_experts)
 
         self.runner = runner
         device = runner.device
@@ -883,8 +882,8 @@ class ModelRunner:
     # the target's launch (`prepare_model`).
     compute_head: Callable | None = None
     spec_status_deferred = False
-    # Routed-expert replay off; `__init__` sets it on the instance only when
-    # the flag is on. Read every step: the route hooks run only when set.
+    # R3-off defaults. `__init__` assigns from config; the class values cover
+    # `__new__`-built test doubles that never hit `__init__`.
     _return_routed_experts = False
     # Bound by `allocate_kv_cache` on TP rank 0 with replay on.
     _routed_experts_capturer: RoutedExpertsCapturer | None = None
@@ -894,8 +893,7 @@ class ModelRunner:
         self.structured_output = None
         self.structured_compile_executor = None
         self.structured_compilations = OrderedDict()
-        if config.enable_return_routed_experts:
-            self._return_routed_experts = True
+        self._return_routed_experts = bool(config.enable_return_routed_experts)
         from atom.model_engine.multimodal_runtime import VisionEmbeddingCache
 
         self.vision_embeddings = VisionEmbeddingCache()

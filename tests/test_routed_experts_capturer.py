@@ -150,7 +150,6 @@ def test_only_tp_rank0_binds_the_capture_buffer(rank, monkeypatch):
     runner.model = object()
     runner._return_routed_experts = True
     runner._routed_experts_geo = (3, 2)
-    runner._routed_experts_capturer = None
     runner.rank = rank
     runner.block_size = 4
     runner.device = "cpu"
@@ -179,7 +178,6 @@ def test_kv_cross_check_expects_only_the_rows_a_rank_allocates(rank, monkeypatch
     runner.model = object()
     runner._return_routed_experts = True
     runner._routed_experts_geo = (3, 2)
-    runner._routed_experts_capturer = None
     runner.rank = rank
     runner.block_size = 4
     runner.device = "cpu"

@@ -353,7 +353,6 @@ def test_route_capture_off_runs_none_of_its_step_hooks(monkeypatch, deferred):
 
     monkeypatch.setattr(mod, "current_slot_mapping", _forbidden)
     runner = _runner({})
-    runner._routed_experts_capturer = None
     runner.tokenID_processor.is_deferred_out = deferred
     runner.tokenID_processor.prev_batch = _batch(2) if deferred else None
     routes = []

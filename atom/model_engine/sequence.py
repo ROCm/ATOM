@@ -655,7 +655,8 @@ class Sequence:
           never reaches it;
         - one finished from ``waiting`` (``_finish_rejected_waiting``): it
           keeps the rows it had, unchecked -- short if it was preempted before
-          they arrived, ``None`` if it was never scheduled.
+          they arrived (preemption clears the buffer, so that is 0 rows),
+          ``None`` if it was never scheduled.
         """
         buf = self._routed_expert_buf
         # Zero rows is still [0, layers, top_k]; only a request no patch ever
