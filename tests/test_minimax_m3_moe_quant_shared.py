@@ -58,6 +58,7 @@ def _m3_moe(enabled):
     moe.fuse_shared_experts = False
     moe.routed_scaling_factor = 1.0
     moe.shared_input_from_moe_quant = enabled
+    moe._use_dual_stream = False
     return moe
 
 

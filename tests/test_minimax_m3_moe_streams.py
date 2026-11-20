@@ -87,7 +87,9 @@ def test_serial_forward_preserves_routed_then_shared_order() -> None:
     routed.__add__.return_value = summed
     summed.view.return_value = result
 
-    moe = SimpleNamespace()
+    # The stack's serial path can also take the shared input from the routed
+    # quant (ATOM_MINIMAX_M3_MOE_QUANT_SHARED); off here.
+    moe = SimpleNamespace(shared_input_from_moe_quant=False)
     moe.routed_expert_forward = MagicMock(
         side_effect=lambda _: (log.append("routed"), routed)[1]
     )
@@ -191,7 +193,8 @@ def test_model_creates_one_shared_stream_for_all_layers(
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "Stream", lambda: stream)
     monkeypatch.setattr(m3_model, "_validate_sparse_flydsl_config", lambda *_: None)
-    monkeypatch.setattr(m3_model, "pp_holds_embedding", lambda _: True)
+    # main-only helper; this stack reads get_pp_group() directly.
+    monkeypatch.setattr(m3_model, "pp_holds_embedding", lambda _: True, raising=False)
     monkeypatch.setattr(
         m3_model,
         "get_pp_group",
