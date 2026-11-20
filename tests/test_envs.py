@@ -2,6 +2,7 @@
 # Tests for atom/utils/envs.py — lazy env var evaluation
 
 import logging
+from pathlib import Path
 
 import pytest
 
@@ -41,6 +42,7 @@ _ATOM_ENV_VARS = [
     "ATOM_LOG_MORE",
     "ATOM_DISABLE_MMAP",
     "ATOM_ONLINE_QUANT_STREAMING",
+    "ATOM_MINIMAX_M3_SHARED_SWIGLU_MXFP8",
     "ATOM_DISABLE_VLLM_PLUGIN",
     "ATOM_USE_CUSTOM_ALL_GATHER",
     "ATOM_ENABLE_RELAXED_MTP",
@@ -144,6 +146,9 @@ class TestEnvsDefaults:
 
     def test_online_quant_streaming_default_disabled(self):
         assert _get_envs().ATOM_ONLINE_QUANT_STREAMING is False
+
+    def test_minimax_m3_shared_swiglu_mxfp8_default_disabled(self):
+        assert _get_envs().ATOM_MINIMAX_M3_SHARED_SWIGLU_MXFP8 is False
 
     def test_disable_vllm_plugin_default(self):
         assert _get_envs().ATOM_DISABLE_VLLM_PLUGIN is False
@@ -291,6 +296,15 @@ class TestEnvsOverrides:
     def test_online_quant_streaming_enabled(self, monkeypatch):
         monkeypatch.setenv("ATOM_ONLINE_QUANT_STREAMING", "1")
         assert _get_envs().ATOM_ONLINE_QUANT_STREAMING is True
+
+    @pytest.mark.parametrize(
+        "value,expected", [("1", True), ("true", True), ("0", False)]
+    )
+    def test_minimax_m3_shared_swiglu_mxfp8_override(
+        self, monkeypatch, value, expected
+    ):
+        monkeypatch.setenv("ATOM_MINIMAX_M3_SHARED_SWIGLU_MXFP8", value)
+        assert _get_envs().ATOM_MINIMAX_M3_SHARED_SWIGLU_MXFP8 is expected
 
     def test_disable_vllm_plugin_enabled(self, monkeypatch):
         monkeypatch.setenv("ATOM_DISABLE_VLLM_PLUGIN", "1")

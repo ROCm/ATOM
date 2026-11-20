@@ -50,8 +50,10 @@ from atom.model_ops.minimax_m3.sparse_attn import (
 )
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.swiglu_oai import (
+    swiglu_oai_mxfp8_supported,
     swiglu_oai_quant_supported,
     swiglu_oai_split,
+    swiglu_oai_split_mxfp8,
     swiglu_oai_split_quant,
     swiglu_oai_split_reducing,
     swiglu_oai_split_reducing_quant,
@@ -164,6 +166,20 @@ def _linear_consumes_mxfp8(linear: nn.Module) -> bool:
     )
 
 
+def _linear_consumes_native_mxfp8(linear: nn.Module) -> bool:
+    """Return whether ``linear`` accepts row-major native MXFP8 activations."""
+    quant_type = getattr(linear, "quant_type", None)
+    quant_type_value = getattr(quant_type, "value", quant_type)
+    return (
+        quant_type_value == QuantType.per_1x32.value
+        and getattr(linear, "params_dtype", None) == dtypes.fp8
+        # The saved downstream validation covers MiniMax-M3's native 1x32
+        # shared down projection. Do not broaden this to 32x32 implicitly.
+        and getattr(linear, "native_a8_group_rows", None) == 1
+        and not getattr(linear, "runs_bf16", False)
+    )
+
+
 def _minimax_m3_cos_sin_cache(
     rotary_emb: nn.Module,
     query: torch.Tensor,
@@ -244,6 +260,7 @@ class MiniMaxM3MLP(nn.Module):
         reduce_results: bool = True,
         prefix: str = "",
         hidden_act: str | None = None,
+        fuse_shared_swiglu_mxfp8: bool = False,
     ) -> None:
         super().__init__()
         # An MXFP4 down_proj cannot take an unaligned K (its per-rank
@@ -284,6 +301,7 @@ class MiniMaxM3MLP(nn.Module):
         self.swiglu_quant_supported = swiglu_oai_quant_supported(
             intermediate_size // get_tensor_model_parallel_world_size(), dtypes.fp8
         )
+        self.fuse_shared_swiglu_mxfp8 = fuse_shared_swiglu_mxfp8
 
     def forward(
         self, x: torch.Tensor, x_scale: torch.Tensor | None = None
@@ -292,6 +310,19 @@ class MiniMaxM3MLP(nn.Module):
         reduces_partials = self.gate_up_proj.splitk_consumer_max_m > 0 and (
             _linear_consumes_per_token_fp8(self.gate_up_proj)
         )
+        if (
+            self.fuse_shared_swiglu_mxfp8
+            and not reduces_partials
+            and _linear_consumes_native_mxfp8(self.down_proj)
+            and swiglu_oai_mxfp8_supported(gate_up)
+        ):
+            activated, activated_scale = swiglu_oai_split_mxfp8(
+                gate_up,
+                alpha=self.swiglu_alpha,
+                beta=self.swiglu_beta,
+                limit=self.swiglu_limit,
+            )
+            return self.down_proj(activated, x_scale=activated_scale)
         if self.swiglu_quant_supported and _linear_consumes_per_token_fp8(
             self.down_proj
         ):
@@ -389,6 +420,7 @@ class MiniMaxM3MoE(nn.Module):
                 quant_config=quant_config,
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
+                fuse_shared_swiglu_mxfp8=(envs.ATOM_MINIMAX_M3_SHARED_SWIGLU_MXFP8),
             )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
