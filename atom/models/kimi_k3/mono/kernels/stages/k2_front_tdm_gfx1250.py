@@ -16,7 +16,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.typing import Int64
+from flydsl.expr.typing import Int64, T, as_ir_value
 
 from atom.models.kimi_k3.mono.config import EXPERTS, HIDDEN, LATENT, SUPPORTED_TP
 from atom.models.kimi_k3.mono.kernels.execution_plan import Gfx1250KimiBuildPlan
@@ -178,6 +178,12 @@ def _front_tasks(
     router_weight, latent_weight, shared_weight, shared_scale = weights
     router = pair < LATENT_PAIR0
     latent = (pair >= LATENT_PAIR0) & (pair < SHARED_PAIR0)
+    for role, units in pipe.get("delay", {}).items():
+        sleeps = [127] * (units // 127) + [units % 127] * (units % 127 > 0)
+        member = router if role == "router" else pair >= SHARED_PAIR0
+        if member:
+            for index in range_constexpr(len(sleeps)):
+                rocdl.s_sleep(sleeps[index])
     weight = router.select(router_weight, latent.select(latent_weight, shared_weight))
     weight_rows = router.select(
         fx.Int32(EXPERTS),
@@ -392,7 +398,11 @@ def _front_epilogue(
         group = row0 // 32
         if const_expr("xf" not in diag):
             bo.buffer_store(
-                moe_gfx1250._pack_bf16_words(words, reciprocal_scale),
+                (
+                    _fp4_word(words, code, reciprocal_scale)
+                    if const_expr("hw4" in diag)
+                    else moe_gfx1250._pack_bf16_words(words, reciprocal_scale)
+                ),
                 rsrc(latent_fp4),
                 token * (LATENT // 8) + group * 4 + packed_word,
                 cache_modifier=cm,
@@ -409,6 +419,27 @@ def _front_epilogue(
 
 def _or(a, b):
     return a | b
+
+
+@traced
+def _fp4_word(words, code, reciprocal_scale):
+    """``moe_gfx1250._pack_bf16_words(words, reciprocal_scale)`` of up to four
+    BF16 pair words (absent ones zero) with E8M0 ``code``, as one
+    ``v_cvt_scalef32_pk8_fp4_bf16`` by ``2^(code - 127)``: the same nibbles at
+    every code but 254, an infinite amax's
+    (``tools/kimi_k3_mono_fp4_quant_probe.py``), where the software
+    conversion stays."""
+    words = list(words) + [fx.Int32(0)] * (4 - len(words))
+    packed = fx.Int32(
+        rocdl.cvt_scalef32_pk8_fp4_bf16(
+            T.i32,
+            as_ir_value(fx.Vector.from_elements(words, fx.Int32).bitcast(fx.BFloat16)),
+            as_ir_value((code << 23).bitcast(fx.Float32)),
+        )
+    )
+    if code == 254:
+        packed = moe_gfx1250._pack_bf16_words(words, reciprocal_scale)
+    return packed
 
 
 def _diag_cm(diag):
@@ -482,18 +513,22 @@ def _front_epilogue_fused(
             reciprocal_scale = ((fx.Int32(254) - codes[tile]) << 23).bitcast(
                 fx.Float32
             )
-            pair = fx.Vector.from_elements([packed[tile]], fx.Int32).bitcast(
-                fx.BFloat16
-            )
-            nibbles = [
-                fx.Int32(
-                    moe_gfx1250._emit_f32_to_e2m1(
-                        fx.Float32(pair[half]) * reciprocal_scale
-                    )
+            if const_expr("hw4" in diag):
+                byte = _fp4_word([packed[tile]], codes[tile], reciprocal_scale)
+            else:
+                pair = fx.Vector.from_elements([packed[tile]], fx.Int32).bitcast(
+                    fx.BFloat16
                 )
-                for half in range_constexpr(2)
-            ]
-            words.append((nibbles[0] | (nibbles[1] << 4)) << (column_pair % 4 * 8))
+                nibbles = [
+                    fx.Int32(
+                        moe_gfx1250._emit_f32_to_e2m1(
+                            fx.Float32(pair[half]) * reciprocal_scale
+                        )
+                    )
+                    for half in range_constexpr(2)
+                ]
+                byte = nibbles[0] | (nibbles[1] << 4)
+            words.append(byte << (column_pair % 4 * 8))
         for off in (1, 2):
             words = [xred(w, off, _or, GFX1250) for w in words]
         for tile in range_constexpr(tiles):
@@ -733,8 +768,16 @@ def front_pipe(
         pipe["fused"] = True
     if pipe.get("late") and "u2" in sites:
         pipe["unroll"] = 2
+    delay = {
+        role: int(site[2:])
+        for site in sites
+        for prefix, role in (("rd", "router"), ("sd", "shared"))
+        if site.startswith(prefix) and site[2:].isdigit()
+    }
+    if delay:
+        pipe["delay"] = delay
     diag = frozenset(
-        s for s in sites if s in ("xs", "xf", "st") or s.startswith("cm")
+        s for s in sites if s in ("xs", "xf", "st", "hw4") or s.startswith("cm")
     )
     if diag:
         pipe["diag"] = diag
@@ -747,6 +790,7 @@ def _pipe_suffix(pipe) -> str:
         + ("_es" if pipe.get("early_scales") else "")
         + ("_fe" if pipe.get("fused") else "")
         + (f"_u{pipe['unroll']}" if pipe.get("unroll") else "")
+        + "".join(f"_{r[0]}d{n}" for r, n in sorted(pipe.get("delay", {}).items()))
         + "".join(f"_{d}" for d in sorted(pipe.get("diag", ())))
     )
 

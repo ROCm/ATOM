@@ -5,14 +5,16 @@ BF16 value times every E8M0 code 0..254, eight values a thread. The software
 RNE E2M1 conversion (``moe_gfx1250._emit_f32_to_e2m1`` of the value times
 ``2^(127 - code)``, the front's today) against one gfx1250
 ``v_cvt_scalef32_pk8_fp4_bf16`` of the eight by the code's scale
-``2^(code - 127)``. Prints the mismatched nibbles, those with a finite value
-and a code a group holding it can get (its own amax's or larger, below 254)
-apart.
+``2^(code - 127)``, the software one kept where the code is 254 (only an
+infinite amax rounds there; FIXED=0: the instruction's there too). Prints the
+mismatched nibbles, those with a finite value and a code a group holding it
+can get (its own amax's or larger, below 254) apart.
 
     python tools/kimi_k3_mono_fp4_quant_probe.py
 """
 
 import json
+import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -24,18 +26,10 @@ from flydsl.expr.typing import Int64, T, as_ir_value
 from atom.models.kimi_k3.mono.kernels.stages import moe_gfx1250
 from atom.mono.device.ops import rsrc
 
+FIXED = os.environ.get("FIXED", "1") == "1"
 THREADS = 256
 VALUES = 1 << 16
 CODES = 255
-
-
-def fp4_scale(code):
-    """The scale ``v_cvt_scalef32_pk8_fp4_bf16`` divides by for E8M0 ``code``:
-    ``2^(code - 127)``, but infinity at 254 (an infinite amax's), where the
-    software conversion multiplies by ``2^(127 - 254)``, which is +0."""
-    return ((code + (code == 254).select(fx.Int32(1), fx.Int32(0))) << 23).bitcast(
-        fx.Float32
-    )
 
 
 def build():
@@ -55,9 +49,12 @@ def build():
             soft = soft | (nibble << (4 * k))
         hard = fx.Int32(
             rocdl_dialect.cvt_scalef32_pk8_fp4_bf16(
-                T.i32, as_ir_value(values), as_ir_value(fp4_scale(code))
+                T.i32, as_ir_value(values), as_ir_value((code << 23).bitcast(fx.Float32))
             )
         )
+        if FIXED:
+            # the front's rule: the software conversion where the code is 254
+            hard = (code == 254).select(soft, hard)
         bo.buffer_store(
             fx.Vector.from_elements([soft, hard], fx.Int32), rsrc(out), item * 2
         )
