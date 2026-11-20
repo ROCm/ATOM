@@ -65,6 +65,8 @@ _SGLANG_MODULE_NAMES = (
 _SGLANG_MODULES = {name: sys.modules[name] for name in _SGLANG_MODULE_NAMES}
 
 PAGE = ATOM_DEEPSEEK_V41_SGLANG_BLOCK_SIZE
+# Engram history width the scheduled batch carries (a fused radix replay).
+HISTORY = 3
 
 
 @pytest.fixture
@@ -199,6 +201,12 @@ def _supported_bags(**overrides):
             disable_radix_cache=True,
             enable_hierarchical_cache=False,
             enable_hisparse=False,
+            enable_session_radix_cache=False,
+            radix_cache_backend=None,
+            enable_unified_memory=False,
+            enable_lmcache=False,
+            enable_flexkv=False,
+            enable_unified_cache_external_linker=False,
         ),
         "exec": SimpleNamespace(
             features=SimpleNamespace(
@@ -225,6 +233,8 @@ def _supported_bags(**overrides):
             max_prefill_tokens=16384,
             max_running_requests=256,
             mem_fraction_static=0.83,
+            enable_mixed_chunk=False,
+            disable_overlap_schedule=False,
         ),
     }
     bags.update(overrides)
@@ -251,7 +261,6 @@ class TestLaunchContract:
     @pytest.mark.parametrize(
         ("bag", "field", "value", "match"),
         [
-            ("memory", "disable_radix_cache", False, "radix cache"),
             ("memory", "enable_hierarchical_cache", True, "hierarchical cache"),
             ("memory", "enable_hisparse", True, "HiSparse"),
             ("spec", "speculative_algorithm", "EAGLE", "speculative decoding"),
@@ -316,6 +325,21 @@ class TestLaunchContract:
         with pytest.raises(ValueError, match="prefill CUDA graphs"):
             refuse_unsupported_sglang_features()
 
+    def test_radix_cache_needs_the_opt_in(self, sglang_launch, monkeypatch):
+        monkeypatch.delenv("ATOM_V41_RADIX", raising=False)
+        sglang_launch.bags["memory"].disable_radix_cache = False
+        with pytest.raises(ValueError, match="without ATOM_V41_RADIX=1"):
+            refuse_unsupported_sglang_features()
+        # Opted in, radix cache itself is not refused; what it cannot run
+        # beside is (`test_sglang_deepseek_v41_radix.py`). Overlap scheduling
+        # runs beside it (the radix seam drops a slot's host rows on every
+        # checkpoint).
+        monkeypatch.setenv("ATOM_V41_RADIX", "1")
+        refuse_unsupported_sglang_features()
+        sglang_launch.bags["schedule"].enable_mixed_chunk = True
+        with pytest.raises(ValueError, match="mixed chunk with radix cache"):
+            refuse_unsupported_sglang_features()
+
     def test_unpublished_bags_raise(self, real_sglang):
         # Outside a scheduler process SGLang has published no bags; the
         # bridge does not fall back to the raw ServerArgs.
@@ -328,9 +352,11 @@ class TestLaunchContract:
             align_atom_config_with_sglang(SimpleNamespace(max_num_batched_tokens=1))
 
     def test_every_refusal_is_reported_at_once(self, sglang_launch):
-        sglang_launch.bags["memory"].disable_radix_cache = False
+        sglang_launch.bags["memory"].enable_hierarchical_cache = True
         sglang_launch.bags["parallel"].pp_size = 2
-        with pytest.raises(ValueError, match="radix cache.*pipeline parallelism"):
+        with pytest.raises(
+            ValueError, match="hierarchical cache.*pipeline parallelism"
+        ):
             refuse_unsupported_sglang_features()
 
     def test_atom_config_takes_sglang_resolved_schedule(self, sglang_launch):
@@ -599,6 +625,7 @@ class TestScheduledBatch:
                 extend_prefix_lens=[0, 0],
             ),
             PAGE,
+            HISTORY,
         )
         assert batch.req_ids == ["r0", "r1"]
         assert batch.num_scheduled_tokens.tolist() == [600, 10]
@@ -626,6 +653,7 @@ class TestScheduledBatch:
                 extend_prefix_lens=[2 * PAGE, 0],
             ),
             PAGE,
+            HISTORY,
         )
         assert batch.num_scheduled_tokens.tolist() == [PAGE + 1, 40]
         assert batch.context_lens.tolist() == [3 * PAGE + 1, 40]
@@ -643,6 +671,7 @@ class TestScheduledBatch:
                 extend_prefix_lens=[PAGE],
             ),
             PAGE,
+            HISTORY,
         )
         assert _tables(batch) == [[7, 3]]
 
@@ -657,6 +686,7 @@ class TestScheduledBatch:
                 cpu_lengths=False,
             ),
             PAGE,
+            HISTORY,
         )
         assert batch.num_scheduled_tokens.tolist() == [20, 5]
         assert batch.context_lens.tolist() == [30, PAGE + 5]
@@ -671,6 +701,7 @@ class TestScheduledBatch:
                 seq_lens=[4 * PAGE, 2 * PAGE + 1, 1],
             ),
             PAGE,
+            HISTORY,
         )
         assert batch.num_scheduled_tokens.tolist() == [1, 1, 1]
         assert batch.context_lens.tolist() == [4 * PAGE, 2 * PAGE + 1, 1]
@@ -689,6 +720,7 @@ class TestScheduledBatch:
                 extend_prefix_lens=[PAGE, 0],
             ),
             PAGE,
+            HISTORY,
         )
         assert batch.num_scheduled_tokens.tolist() == [1, 64]
         assert _tables(batch) == [[7, 3], [5]]
@@ -699,7 +731,7 @@ class TestScheduledBatch:
             ForwardMode.DECODE, req_pool_indices=[1, 2, 0], seq_lens=[5, 6, 1]
         )
         fb.batch_size = 2
-        batch = build_v41_scheduled_batch(fb, PAGE)
+        batch = build_v41_scheduled_batch(fb, PAGE, HISTORY)
         assert batch.state_slots_committed == [1, 2]
         assert batch.total_seqs_num == 2
 
@@ -714,14 +746,14 @@ class TestScheduledBatch:
     def test_unsupported_modes_are_refused(self, req_to_token, mode):
         fb = _forward_batch(mode, req_pool_indices=[1], seq_lens=[5])
         with pytest.raises(NotImplementedError, match="does not translate"):
-            build_v41_scheduled_batch(fb, PAGE)
+            build_v41_scheduled_batch(fb, PAGE, HISTORY)
 
     def test_dummy_batches_are_refused(self, req_to_token):
         fb = _forward_batch(
             ForwardMode.DECODE, req_pool_indices=[0, 0], seq_lens=[1, 1], rids=None
         )
         with pytest.raises(NotImplementedError, match="dummy"):
-            build_v41_scheduled_batch(fb, PAGE)
+            build_v41_scheduled_batch(fb, PAGE, HISTORY)
 
     def test_length_mismatch_is_refused(self, req_to_token):
         fb = _forward_batch(
@@ -732,12 +764,12 @@ class TestScheduledBatch:
             extend_prefix_lens=[40],
         )
         with pytest.raises(ValueError, match="lengths disagree"):
-            build_v41_scheduled_batch(fb, PAGE)
+            build_v41_scheduled_batch(fb, PAGE, HISTORY)
 
     def test_missing_length_field_is_refused(self, req_to_token):
         fb = _forward_batch(ForwardMode.EXTEND, req_pool_indices=[1], seq_lens=[5])
         with pytest.raises(ValueError, match="missing a length field"):
-            build_v41_scheduled_batch(fb, PAGE)
+            build_v41_scheduled_batch(fb, PAGE, HISTORY)
 
     @pytest.mark.parametrize("mode", [ForwardMode.DECODE, ForwardMode.EXTEND])
     def test_unwritten_page_is_refused(self, req_to_token, mode):
@@ -751,13 +783,13 @@ class TestScheduledBatch:
             mode, req_pool_indices=[1, 2], seq_lens=[5, PAGE + 1], **lengths
         )
         with pytest.raises(ValueError, match="padding page 0"):
-            build_v41_scheduled_batch(fb, PAGE)
+            build_v41_scheduled_batch(fb, PAGE, HISTORY)
 
     @pytest.mark.parametrize("slots", [[1, 1], [0, 2]])
     def test_slots_must_be_live_and_unique(self, req_to_token, slots):
         fb = _forward_batch(ForwardMode.DECODE, req_pool_indices=slots, seq_lens=[3, 4])
         with pytest.raises(ValueError, match="req_pool_idx"):
-            build_v41_scheduled_batch(fb, PAGE)
+            build_v41_scheduled_batch(fb, PAGE, HISTORY)
 
 
 class _FakeAttnBackend:
@@ -806,6 +838,7 @@ class _RecordingBuilder:
         self.max_bs = max_bs
         self.max_num_batched_tokens = max_num_batched_tokens
         self.cache = object()
+        self.geometry = SimpleNamespace(window_size=128, history_size=HISTORY)
         self.calls = []
         self.positions = positions
         self.rows = _staged_rows(self.calls)
@@ -899,7 +932,7 @@ class TestForwardMetadata:
     def test_extend_carries_the_replay_verdict(self, monkeypatch, req_to_token):
         builder = _RecordingBuilder(positions=torch.arange(5))
         builder._decoder_replays = True
-        builder.geometry = SimpleNamespace(window_size=128)
+        builder.geometry = SimpleNamespace(window_size=128, history_size=HISTORY)
         fb = _forward_batch(
             ForwardMode.EXTEND,
             req_pool_indices=[1, 2],
@@ -1063,7 +1096,7 @@ class TestProxyPool:
         assert pool.store_dtype == torch.uint8
         assert pool.dtype == torch.bfloat16
         assert pool.get_state_buf_infos() == ([], [], [])
-        with pytest.raises(NotImplementedError, match="radix-cache"):
+        with pytest.raises(NotImplementedError, match="relocation"):
             pool.move_kv_cache(torch.zeros(1), torch.zeros(1))
         with pytest.raises(NotImplementedError):
             pool.get_kv_buffer(0)
@@ -1787,6 +1820,7 @@ class TestHostPageRows:
                 rids=["x", "y"],
             ),
             PAGE,
+            HISTORY,
         )
         batch = self._replay(
             monkeypatch,
@@ -2122,6 +2156,7 @@ def _replays(lengths, prefix, window=128, **fields):
     batch = SimpleNamespace(
         num_scheduled_tokens=np.asarray(lengths, np.int32),
         context_lens=np.asarray(prefix, np.int64) + np.asarray(lengths, np.int64),
+        replay_rows=np.zeros(len(lengths), np.int64),
     )
     return bridge.v41_extend_replays(fb, batch, window)
 
