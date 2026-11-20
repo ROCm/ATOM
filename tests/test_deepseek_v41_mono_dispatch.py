@@ -35,6 +35,7 @@ _HF = {
     "candidate_block_size": 8,
     "index_n_heads": 32,
     "index_head_dim": 128,
+    "fp4ptpc": False,
 }
 
 
@@ -163,6 +164,10 @@ def test_per_request_verify_lengths_are_served(native, schedule, ragged):
             {"hf_config": SimpleNamespace(**{**_HF, "index_n_heads": 64})},
             "indexer shape",
         ),
+        (
+            {"hf_config": SimpleNamespace(**{**_HF, "fp4ptpc": True})},
+            "FP4PTPC checkpoint's per-channel FP8 linears",
+        ),
     ],
 )
 def test_unsupported_deployment_is_refused(native, overrides, reason):
@@ -177,6 +182,25 @@ def test_dp_attention_with_moe_tp_is_served(native):
     # the MoE TP over the DP ranks (no expert parallel)
     overrides = {**_DPA, "enable_expert_parallel": False}
     assert mono_config.config_refusal(_atom_config(**overrides)) is None
+
+
+@pytest.mark.parametrize("dp", [2, 4])
+@pytest.mark.parametrize("fp4ptpc", [False, True])
+def test_local_dp_admission_keeps_checkpoint_refusal(native, dp, fp4ptpc):
+    config = _atom_config(
+        **{
+            **_DPA,
+            "enable_expert_parallel": False,
+            "parallel_config": SimpleNamespace(data_parallel_size=dp),
+            "index_cache_dtype": "fp4",
+            "hf_config": SimpleNamespace(**{**_HF, "fp4ptpc": fp4ptpc}),
+        }
+    )
+    refusal = mono_config.config_refusal(config, supported_dpa=(2, 4))
+    if fp4ptpc:
+        assert "FP4PTPC checkpoint's per-channel FP8 linears" in refusal
+    else:
+        assert refusal is None
 
 
 def test_moe_tp_weight_table_is_every_expert_at_a_share():

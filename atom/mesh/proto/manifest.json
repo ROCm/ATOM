@@ -1,0 +1,33 @@
+{
+  "files": {
+    "envoy/annotations/deprecation.proto": "bc72a2deefc60cacdb0f49380e1c92028078e219b02993d6772e2854a8929b36",
+    "envoy/config/core/v3/address.proto": "18c06947c3a04b8825cbbd0ead7e4acf50d17e7c97e48695128366a35b2ca7ea",
+    "envoy/config/core/v3/backoff.proto": "f347a6a36616ea6735ff031b546d10cc79aaae17da3a60e8174479c7f75ac53e",
+    "envoy/config/core/v3/base.proto": "531b3c33b6f14fa76b16040df61975aa37bf07a34852d3dd12e80a159821e06f",
+    "envoy/config/core/v3/extension.proto": "860106c686cab11106159f462243ce4009cbc405f197df7df8ab423af71a82a7",
+    "envoy/config/core/v3/http_uri.proto": "ef5c59234f0be07a23327d695afc65435ef5052941a63184795b0d300fccf1e6",
+    "envoy/config/core/v3/socket_option.proto": "91333eab21e091b64e46f66ed7bb5b9b92c912c48c5113d46098dd31458fa3c2",
+    "envoy/extensions/filters/http/ext_proc/v3/processing_mode.proto": "0d4aa037e1bdfb2a4632df24a8adb7e34bb5ae00b3ac184668473db527ff14aa",
+    "envoy/service/ext_proc/v3/external_processor.proto": "6cd0de6492d1f236ef437054e4049a426bb4af496c0d29fbace4c59bc67eda4b",
+    "envoy/type/v3/http_status.proto": "d46c670810e539fabf6c8204d9a33dd135f092ef5896d6c37193999e38a3952c",
+    "envoy/type/v3/percent.proto": "b5b5ea7f6264f465ce4b398601e855b62395e3c83e4bb7e0d9d4ebae788210ca",
+    "envoy/type/v3/semantic_version.proto": "71cc18d6cbbccd0e3a027d3499bbdbe0a7e74cdf125565f36843736027cc8cc5",
+    "grpc/health/v1/health.proto": "8d44f54645557c1e10ba0da377883fd4d24ad994aff4f2139d61b7e9f0ece511",
+    "licenses/envoy.txt": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "licenses/grpc.txt": "590198e3f305f2c347fde64d637c65492bbef554db6c8364e149cd375e3797ee",
+    "licenses/pgv.txt": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "licenses/xds.txt": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+    "udpa/annotations/migrate.proto": "4fb5c329d0ac560e0c127b2f2d3368fb2038d093961202dba8700fd4f1308a86",
+    "udpa/annotations/status.proto": "038771f31b67fc4d5be4b41eb08e5846bd4e972d3aa73674097706a8aac9e697",
+    "udpa/annotations/versioning.proto": "d53f268b4a2b69a6067ff06a43486fb2a2a0d65a3405d3cf43e82192818e2d27",
+    "validate/validate.proto": "68c9625ebe0668605a37670db1759ceb03864bc07c52eee919b049347cbc018c",
+    "xds/annotations/v3/status.proto": "0145b2d9437ace6c1201453cd57d44c96e2e89894e502c2d869e8ee2b59b8c19",
+    "xds/core/v3/context_params.proto": "912801a580c04553d75a0099d16206a668dd609277c860b6d05d86f8cbddc11c"
+  },
+  "revisions": {
+    "envoy": "6d9bb7d9a85d616b220d1f8fe67b61f82bbdb8d3",
+    "grpc": "5e6ba94242b92e363220bc2163d55ce3554d4ecc",
+    "pgv": "4eb9011f3e6d551d067d87c89f082261164fac31",
+    "xds": "8bfbf64dc13ee1a570be4fbdcfccbdd8532463f0"
+  }
+}

@@ -78,15 +78,21 @@ def _same_bytes(a, b):
 
 
 def _updater(**kwargs):
+    from conftest import atom_config_double
+
     from atom.rollout.weight_updater import WeightUpdaterMixin
+    from atom.utils.selector import Family
 
     class _Updater(WeightUpdaterMixin):
         label = "test"
         device = torch.device("cpu")
         rank = 0
         world_size = 1
+        config = atom_config_double()
+        attn_family = Family.MHA
 
     updater = _Updater()
+    updater._init_weight_updater()
     for name, value in kwargs.items():
         setattr(updater, name, value)
     return updater
