@@ -1,0 +1,11 @@
+# CPU ingress dependencies tested with the prepared ATOM environment.
+# Install ATOM itself from this checkout first; this does not supply engine/GPU dependencies.
+fastokens==0.3.6
+httpx==0.28.1
+fastapi==0.136.3
+starlette==1.10.0
+uvicorn==0.54.0
+pydantic==2.14.2
+transformers==5.16.1
+tokenizers==0.23.3
+jsonschema==4.25.1

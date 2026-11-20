@@ -29,7 +29,7 @@ P source is `/tmp/lirzhang-wide-ep8p16d-c1228-20261119/source-putretry-81ba44e7`
 D source is the same root's `source-no3550`. Parent identity is
 `19d4aa9615631cc817ca673edc8696dc88b26b05`, with runtime ABI overlays.
 The measured frontend is the fastokens Python facade and Rust P/D router;
-this file does not bundle those private overlays or claim main/latest E2E
+this file bundles the CPU ingress, but does not bundle the engine overlays or claim main/latest E2E
 reproduction. Per-role actual PLANs remain the source/runtime authority.
 
 
@@ -204,27 +204,38 @@ omitted here. The current command explicitly enables discovery. These
 differences require runtime validation and prevent claiming byte-for-byte
 reproduction of the historical router.
 
-AgentX sends chat requests through an encoding ingress before atomesh. The
-ingress must use the exact V4.1 tokenizer/chat encoding, preserve streaming,
-tool payloads, request IDs and cancellation, and forward token IDs to the
-router. Historical capacity was four encoder processes, sixteen workers,
-1280 queued requests, 2048 connections, 512 keepalive connections and 600 s
-keepalive. Segment cache was disabled (0 MiB). Its frozen candidate script is
-not a public dependency supplied by this branch; a substitute requires
-encoding equivalence and cancellation validation. Sending chat directly to
-an incompatible token-only endpoint is not an equivalent reproduction.
+AgentX sends chat requests through the supplied exact-tokenization ingress before
+atomesh. It uses ATOM's custom V4.1 encoder for thinking/tool rendering, then
+replaces only the final text encode with fastokens 0.3.6. It forwards the original
+payload plus `prompt_token_ids`; scheduling and KV transfer stay in atomesh.
+Images are rejected. The checkpoint must contain its custom message encoder;
+the ingress refuses a generic chat-template fallback.
 
-The frozen ingress argv template was:
+Install ATOM and its CPU serving dependencies from this checkout in the prepared
+environment, then install the supplied CPU ingress requirements. The tested versions are
+FastAPI 0.136.3, Starlette 1.10.0, Uvicorn 0.54.0, HTTPX 0.28.1, Pydantic 2.14.2,
+transformers 5.16.1, tokenizers 0.23.3, jsonschema 4.25.1 and fastokens 0.3.6. These commands deliver the frontend,
+not the historical engine/image overlays.
 
 ```bash
+python3 -m pip install -r examples/pd_tokenizer_ingress/requirements.txt
+python3 examples/pd_tokenizer_ingress/verify_encoding.py --model "$MODEL_PATH"
+export ENCODER_SCRIPT="$PWD/examples/pd_tokenizer_ingress/launch.py"
 python3 "$ENCODER_SCRIPT" --model "$MODEL_PATH" \
   --backend "$ROUTER_URL" --host "$ENCODER_IP" --port "$ENCODER_PORT" \
   --processes 4 --workers 16 --queued 1280 --max-connections 2048 \
   --max-keepalive-connections 512 --timeout-keep-alive 600 --segment-cache-mib 0
 ```
 
-`ENCODER_SCRIPT` must name the frozen implementation or an independently
-validated equivalent. It is not a script supplied by public ATOM main.
+Budgets are totals: each independent process receives four encoder threads,
+320 native encoding slots, 512 upstream connections and 128 idle connections.
+Slots remain held until native encoding completes even after client cancellation.
+Streaming forwards raw upstream bytes/status/headers; disconnect closes the
+upstream response. Process shutdown closes HTTP clients and drains native work.
+Fastokens input and segment caches are disabled; `--segment-cache-mib` accepts
+only zero. `--encode-backend huggingface` omits the optional fastokens adapter
+while retaining the same ATOM chat encoder, but is a different performance
+configuration. Validate exact token equality on your checkpoint before measuring.
 
 ## AgentX command
 
