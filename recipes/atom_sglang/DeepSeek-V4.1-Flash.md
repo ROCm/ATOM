@@ -1,8 +1,8 @@
 # DeepSeek-V4.1-Flash with ATOM SGLang Plugin
 
 This recipe serves DeepSeek-V4.1-Flash (FP4 PTPC checkpoint) through the ATOM SGLang plugin, without speculative
-decoding and with SGLang's radix cache off, eagerly (no CUDA graphs yet). The configuration below is TP4 on MI308X
-with SGLang 0.5.22.
+decoding and with SGLang's radix cache off, with decode CUDA graphs and the overlap scheduler. The configuration below
+is TP4 on MI308X with SGLang 0.5.22.
 
 SGLang keeps the server, scheduler, page allocation and sampling. ATOM owns the model, its weights, the CSA2 KV pool
 (which replaces SGLang's DeepSeek-V4 pool) and the attention kernels; the plugin translates each SGLang batch into
@@ -30,7 +30,8 @@ python3 -m sglang.launch_server \
     --tp-size 4 --host 0.0.0.0 --port "${PORT}" \
     --language-model-only --kv-cache-dtype bfloat16 --page-size 256 \
     --disable-radix-cache \
-    --disable-decode-cuda-graph --disable-prefill-cuda-graph \
+    --cuda-graph-backend-decode full --cuda-graph-backend-prefill disabled \
+    --cuda-graph-max-bs-decode 64 --cuda-graph-bs-decode 1 2 4 8 16 32 48 64 \
     --context-length 65536 \
     --chunked-prefill-size 8192 --max-prefill-tokens 16384 \
     --mem-fraction-static 0.85 --max-running-requests 64 \
@@ -42,11 +43,11 @@ The plugin refuses, before loading weights:
 - the FP4PTPC checkpoint without the `--model-loader-extra-config` above;
 - `--chunked-prefill-size -1` (unchunked prefill): SGLang would admit a first prompt whole, past the step size the
   plugin's metadata buffers hold;
-- CUDA graphs (launch with `--disable-decode-cuda-graph --disable-prefill-cuda-graph`, as above, or
-  `--disable-cuda-graph`);
-- `--kv-cache-dtype` other than `bfloat16`: the pool is BF16. That includes the default `auto`, which SGLang resolves
-  to `fp8_e4m3` for DeepSeek-V4.1, so the launch passes `--kv-cache-dtype bfloat16` (above);
-- `--enable-decoder-swa-bounded-replay`: every prefill row runs every layer (no decoder SWA bounded replay yet);
+- prefill CUDA graphs (launch with `--cuda-graph-backend-prefill disabled`);
+- `--kv-cache-dtype` other than `bfloat16` or `fp8_e4m3`. That includes the default `auto`, which SGLang resolves to
+  `fp8_e4m3` for DeepSeek-V4.1, so the launch names the format (`--kv-cache-dtype bfloat16` above);
+- `--enable-decoder-swa-bounded-replay` with `ATOM_SGLANG_V41_DECODER_REPLAY` off (below): decoder SWA bounded replay
+  is on by default, so the flag restates the default and contradicts the variable;
 - `--enable-encoder-swa-bounded-replay` (SGLang itself refuses it on hardware other than CUDA and gfx950, MI308X
   included);
 - `--disable-hybrid-swa-memory`: the pool is sized by SGLang's hybrid-SWA full token count;
@@ -58,4 +59,14 @@ The plugin refuses, before loading weights:
 
 SGLang itself refuses, in its DeepSeek-V4.1 feature check (`validate_deepseek_v41_features`), before the plugin is
 asked: two-batch overlap (`--enable-two-batch-overlap`), HiSparse, pipeline parallelism, and speculative decoding other
-than DSpark. The plugin adds no environment knobs of its own.
+than DSpark.
+
+`--kv-cache-dtype` takes `bfloat16` (BF16 pool) or `fp8_e4m3` (FP8 pool).
+
+## Environment variables
+
+Read by the plugin (`atom/plugin/sglang/deepseek_v41_envs.py`):
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_SGLANG_V41_DECODER_REPLAY** | bool | 1 (true) | Decoder SWA bounded replay: a prefill runs V4.1's decoder layers on each request's last 128 rows only, as native ATOM does. `0` / `false` / `no` / `off` turn it off (every prefill row runs every layer), as native's `--no-decoder-swa-bounded-replay` does. Unlike native, which backs a short resumed chunk off to a full window, a chunk SGLang resumes with fewer rows than the window computes every row, and so does a step in which SGLang reads more than each request's last row (input logprobs, a full hidden-state capture, a prefill-only batch); the plugin's prefill output therefore depends on where SGLang cuts a prompt. |
