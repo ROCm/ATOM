@@ -818,8 +818,8 @@ def cp_lse_a2a(
     Packed output and LSE share one all-to-all; head-major output uses a
     separate all-to-all for its fp32 LSE.
 
-    Drop-in for ``cp_lse_ag_out_rs``: same inputs, same ``[B, H_local, D]``
-    output, same head ownership.
+    The combined output is ``[B, H_local, D]`` with the same head ownership
+    as ``cp_lse_ag_out_rs``. Input layout and optional outputs follow the args below.
 
     Args:
         cp_attn_out: ``[B, H, D]`` this rank's partial output over its KV shard,

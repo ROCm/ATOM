@@ -878,7 +878,7 @@ def _cp_lse_a2a_on_every_rank(monkeypatch, o, lse, owned_counts, **kwargs):
 def test_head_major_a2a_matches_the_packed_one_bitwise(monkeypatch, dtype, quant):
     """Sending the head-major output with its LSE apart feeds the combine the
     same values the pack did, so every rank's result is the same bits, the
-    dummy-backed empty row included. The fused quant keeps the packed path."""
+    dummy-backed empty row included. Head-major fused quant is rejected."""
     b, h, d, n_ranks = 5, 16, 32, 4
     g = torch.Generator(device=DEV).manual_seed(3)
     o = [
@@ -891,6 +891,13 @@ def test_head_major_a2a_matches_the_packed_one_bitwise(monkeypatch, dtype, quant
     ]
     owned_counts[0][1] = 0
     kwargs = {"quant_dtype": dtypes.fp8} if quant else {"return_lse": True}
+
+    if quant:
+        with pytest.raises(AssertionError):
+            _cp_lse_a2a_on_every_rank(
+                monkeypatch, o, lse, owned_counts, head_major=True, **kwargs
+            )
+        return
 
     packed = _cp_lse_a2a_on_every_rank(monkeypatch, o, lse, owned_counts, **kwargs)
     head_major = _cp_lse_a2a_on_every_rank(
@@ -985,15 +992,15 @@ def test_cp_lse_a2a_is_a_no_op_without_a_dcp_group():
 
 @needs_dcp_ops
 @pytest.mark.parametrize("backend", ["a2a", "ag_rs"])
-def test_head_major_merge_without_a_dcp_group_returns_b_h_d(backend):
-    """dcp==1: a head-major input comes back as the ``[B, H, D]`` o_proj reads."""
+def test_head_major_merge_requires_a_dcp_group(backend):
+    """Only the multi-rank prefill route accepts head-major transport."""
     from atom.model_ops.dcp_ops import dcp_lse_merge
 
     o = torch.randn(2, 4, 8)
     group = SimpleNamespace(world_size=1)
     head_major = o.transpose(0, 1).contiguous()
-    got = dcp_lse_merge(head_major, torch.randn(2, 4), group, backend, head_major=True)
-    assert torch.equal(got, o)
+    with pytest.raises(AssertionError):
+        dcp_lse_merge(head_major, torch.randn(2, 4), group, backend, head_major=True)
 
 
 # ─────────────────────────────────────────────────────────── DCPConfig parsing ──

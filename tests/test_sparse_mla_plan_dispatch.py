@@ -29,7 +29,7 @@ def production(monkeypatch):
         "mla_dcp_sparse_prefill_num_heads",
         "_forward_prefill_mla",
         "_rebuild_sparse_dcp_persistent_metadata",
-        "_absorb_into_q_out",
+        "_configure_dcp_decode_head_padding",
     }
     functions = [
         node
@@ -71,15 +71,14 @@ def production(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "native,supported",
-    [(False, True), (True, None), (True, False), (True, True), (None, None)],
+    "native,supported", [(False, True), (True, None), (True, False), (True, True)]
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 def test_each_owner_rebuilds_folded_or_unknown_plans(
     production, native, supported, dtype
 ):
     ns = production
-    queries, rebuilds, patches, launches = [], [], [], []
+    rebuilds, patches, launches = [], [], []
     q = torch.empty(2, 64, 12, dtype=dtype)
     kv = torch.empty(16, 1, 12, dtype=dtype)
     ptr = torch.tensor([0, 4, 9], dtype=torch.int32)
@@ -99,10 +98,8 @@ def test_each_owner_rebuilds_folded_or_unknown_plans(
     for name, value in buffers.items():
         setattr(md, f"sparse_prefill_{name}", value)
 
-    def support(width, max_q, q_dtype, kv_dtype, **kwargs):
-        queries.append((width, max_q, q_dtype, kv_dtype))
-        assert kwargs == {"persistent": True, "return_lse": True, "page_size": 1}
-        return SimpleNamespace(native=native, supported=supported)
+    def support(*args, **kwargs):
+        raise AssertionError("a prefill layer queried fixed AITER shape support")
 
     def rebuild(*args, **kwargs):
         assert args[0] is md.sparse_cu_seqlens_q
@@ -140,7 +137,7 @@ def test_each_owner_rebuilds_folded_or_unknown_plans(
         return out, torch.zeros(query.shape[:2])
 
     ns.update(
-        get_mla_decode_shape_support=support if native is not None else None,
+        get_mla_decode_shape_support=support,
         get_mla_metadata_v1=rebuild,
         patch_work_kv_ranges=patch,
         mla_decode_fwd=launch,
@@ -165,6 +162,7 @@ def test_each_owner_rebuilds_folded_or_unknown_plans(
         "sparse_dcp_metadata_rebuild": True,
         "dcp_persistent_supported": True,
         "dcp_sparse_prefill_nonps": False,
+        "dcp_sparse_prefill_plan_native": native and supported is True,
         "owns_sparse_indexer": True,
         "sparse_prefill_head_groups": None,
         "_sparse_prefill_kv_granularity": 2048,
@@ -178,7 +176,6 @@ def test_each_owner_rebuilds_folded_or_unknown_plans(
     # IndexShare consumers keep the preceding owner's descriptors.
     attn.owns_sparse_indexer = False
     attn._forward_prefill_mla(q, kv, md, return_lse=True, q_prepadded=True)
-    assert queries == ([(64, 1, dtype, dtype)] * 2 if native is not None else [])
     assert len(launches) == 3
     if native and supported is True:
         assert len(patches) == 2 and not rebuilds
@@ -189,10 +186,16 @@ def test_each_owner_rebuilds_folded_or_unknown_plans(
 
 
 @pytest.mark.parametrize(
-    "dtype,expected", [(torch.bfloat16, 128), (torch.float8_e4m3fn, 96)]
+    "dtype,dcp,expected",
+    [
+        (torch.bfloat16, 2, 32),
+        (torch.bfloat16, 4, 64),
+        (torch.bfloat16, 8, 128),
+        (torch.float8_e4m3fn, 8, 96),
+    ],
 )
 def test_width_uses_actual_support_and_preserves_bf16_head_groups(
-    production, dtype, expected
+    production, dtype, dcp, expected
 ):
     calls = []
 
@@ -200,13 +203,16 @@ def test_width_uses_actual_support_and_preserves_bf16_head_groups(
         assert (max_q, q_dtype, kv_dtype) == (1, dtype, dtype)
         assert kwargs == {"persistent": True, "return_lse": True, "page_size": 1}
         calls.append(width)
-        return SimpleNamespace(native=width in (96, 128), supported=True)
+        # gfx950 advertises intermediate BF16 widths as native too.
+        return SimpleNamespace(
+            native=dtype == torch.bfloat16 or width in (96, 128), supported=True
+        )
 
     production["get_mla_decode_shape_support"] = support
     assert (
         production["mla_dcp_sparse_prefill_num_heads"](
             12,
-            8,
+            dcp,
             persistent=True,
             dtype_q=dtype,
             dtype_kv=dtype,
@@ -219,80 +225,158 @@ def test_width_uses_actual_support_and_preserves_bf16_head_groups(
 @pytest.mark.parametrize(
     "native,supported", [(False, True), (True, None), (True, False)]
 )
-def test_unqualified_width_keeps_conservative_padding(production, native, supported):
+@pytest.mark.parametrize(
+    "heads,dcp,expected",
+    [(16, 2, 32), (16, 4, 64), (8, 4, 32), (8, 8, 64), (12, 2, 32), (12, 4, 64)],
+)
+def test_unqualified_width_keeps_conservative_padding(
+    production, native, supported, heads, dcp, expected
+):
     production["get_mla_decode_shape_support"] = lambda *a, **k: SimpleNamespace(
         native=native, supported=supported
     )
     assert (
         production["mla_dcp_sparse_prefill_num_heads"](
-            8,
-            8,
+            heads,
+            dcp,
             persistent=True,
             dtype_q=torch.bfloat16,
             dtype_kv=torch.bfloat16,
         )
-        == 128
+        == expected
     )
 
 
 @pytest.mark.parametrize(
-    "shape_query,arch_query",
-    [(True, True), (False, True), (True, False), (False, False)],
+    "native,supported,nonps",
+    [
+        (True, True, False),
+        (False, True, False),
+        (True, None, False),
+        (True, False, False),
+        (True, True, True),
+    ],
 )
-def test_optional_aiter_imports_keep_unrelated_mla_importable(
-    monkeypatch, shape_query, arch_query
+def test_plan_support_is_bound_to_the_final_width_and_reset(
+    production, native, supported, nonps
 ):
-    modules = {
-        "aiter.ops.attention": ("get_mla_decode_shape_support", shape_query),
-        "aiter.jit.utils.chip_info": ("get_gfx_runtime", arch_query),
-    }
-    for name in ("aiter", "aiter.ops", "aiter.jit", "aiter.jit.utils", *modules):
-        module = ModuleType(name)
-        module.__path__ = []
-        monkeypatch.setitem(sys.modules, name, module)
-    expected = {}
-    for name, (symbol, present) in modules.items():
-        expected[symbol] = object() if present else None
-        if present:
-            setattr(sys.modules[name], symbol, expected[symbol])
+    queries = []
 
-    path = Path(__file__).resolve().parents[1] / "atom/model_ops/attention_mla.py"
-    nodes = [
-        node
-        for node in ast.parse(path.read_text(encoding="utf-8")).body
-        if any(
-            isinstance(child, ast.ImportFrom) and child.module in modules
-            for child in ast.walk(node)
+    def support(width, max_q, q_dtype, kv_dtype, **kwargs):
+        queries.append((width, max_q, q_dtype, kv_dtype))
+        return SimpleNamespace(native=native, supported=supported)
+
+    production.update(
+        dtypes=SimpleNamespace(d_dtypes={"bf16": torch.bfloat16}),
+        get_mla_decode_shape_support=support,
+        mla_dcp_persistent_width=lambda *a, **k: 64,
+        mla_dcp_kernel_num_heads=lambda *a, **k: 64,
+        mla_dcp_decode_is_persistent=lambda *a, **k: True,
+        mla_dcp_sparse_prefill_is_persistent=lambda *a, **k: True,
+        mla_dcp_sparse_prefill_uses_nonps=lambda *a: nonps,
+        mla_dcp_sparse_prefill_mode=lambda n, p, h: (False, 64) if n else (p, h),
+        get_current_atom_config=lambda: SimpleNamespace(max_num_batched_tokens=16384),
+    )
+    layer = SimpleNamespace(
+        num_heads=8,
+        min_query_heads=16,
+        kv_cache_dtype="bf16",
+        is_sparse_mla=True,
+        sparse_dcp_metadata_rebuild=True,
+    )
+    configure = production["_configure_dcp_decode_head_padding"]
+    for dcp, width in ((8, 64), (4, 32)):
+        configure(layer, dcp)
+        assert layer.dcp_sparse_prefill_num_heads == (64 if nonps else width)
+        assert layer.dcp_sparse_prefill_plan_native == (
+            native and supported is True and not nonps
+        )
+        if not nonps:
+            assert queries[-1] == (width, 1, torch.bfloat16, torch.bfloat16)
+    before = list(queries)
+    configure(layer, 1)
+    assert not layer.dcp_sparse_prefill_plan_native
+    assert queries == before
+
+
+@pytest.mark.parametrize(
+    "dcp,block,topk,expected",
+    [(1, 128, 2048, 128), (8, 1, 2048, 2048), (8, 1, 2176, 4096)],
+)
+def test_work_plan_reuses_its_initialized_granularity(dcp, block, topk, expected):
+    path = (
+        Path(__file__).resolve().parents[1] / "atom/model_ops/attentions/aiter_mla.py"
+    )
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    builder = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.ClassDef) and n.name == "AiterMLAMetadataBuilder"
+    )
+    init = next(
+        n
+        for n in builder.body
+        if isinstance(n, ast.FunctionDef) and n.name == "__init__"
+    )
+    init_granularity = [
+        n
+        for n in ast.walk(init)
+        if isinstance(n, ast.Assign)
+        and any(
+            isinstance(t, ast.Attribute) and t.attr == "_sparse_prefill_kv_granularity"
+            for t in n.targets
         )
     ]
-    namespace = {}
-    exec(  # noqa: S102 - execute the production import blocks with older AITER modules
-        compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace
+    plan = next(
+        n
+        for n in builder.body
+        if isinstance(n, ast.FunctionDef) and n.name == "_sparse_prefill_work_plan"
     )
-    assert {name: namespace[name] for name in expected} == expected
+    counts, plans = [], []
 
+    def power(value):
+        counts.append("power")
+        return 1 << (value - 1).bit_length()
 
-def test_missing_shape_query_keeps_conservative_width(production):
-    production["get_mla_decode_shape_support"] = None
-    assert (
-        production["mla_dcp_sparse_prefill_num_heads"](
-            12,
-            8,
-            persistent=True,
-            dtype_q=torch.float8_e4m3fn,
-            dtype_kv=torch.float8_e4m3fn,
-        )
-        == 128
+    def maximum(*values):
+        counts.append("max")
+        return max(values)
+
+    work = {name: object() for name in WORK}
+    instance = SimpleNamespace(
+        is_sparse=True,
+        dcp_world_size=dcp,
+        block_size=block,
+        index_topk_out=topk,
+        dcp_sparse_prefill_nonps=False,
+        dtype_q=torch.bfloat16,
+        dtype_kv=torch.bfloat16,
+        model_runner=SimpleNamespace(
+            forward_vars={f"sparse_prefill_{k}": v for k, v in work.items()}
+        ),
     )
-
-
-def test_missing_arch_query_disables_absorb(production):
-    production.update(
-        get_gfx_runtime=None,
-        is_rocm_aiter_fp4bmm_enabled=lambda: False,
-        dtypes=SimpleNamespace(fp8=torch.float8_e4m3fn),
+    ns = {
+        "self": instance,
+        "triton": SimpleNamespace(next_power_of_2=power),
+        "max": maximum,
+        "AttentionMetaData": SimpleNamespace,
+        "torch": torch,
+        "PERSISTENT_WORK_BUFFERS": WORK,
+        "_MLA_SPLIT_BUDGET_AUTO": -1,
+        "get_mla_metadata_v1": lambda *a, **k: plans.append(k["kv_granularity"]),
+    }
+    exec(  # noqa: S102 - execute the production initializer field and plan builder
+        compile(
+            ast.Module(body=init_granularity + [plan], type_ignores=[]),
+            str(path),
+            "exec",
+        ),
+        ns,
     )
-    layer = SimpleNamespace(W_K_qrep_scale=None, kv_shuffled=False)
-    assert not production["_absorb_into_q_out"](
-        layer, True, True, torch.empty(1), torch.float8_e4m3fn
-    )
+    initialized = list(counts)
+    metadata = SimpleNamespace(sparse_cu_seqlens_q=None, sparse_kv_indptr=None)
+    for _ in range(2):
+        ns["_sparse_prefill_work_plan"](instance, metadata, "", 64, None)
+    assert plans == [expected, expected]
+    assert counts == initialized, "prefill recomputed static granularity"
+    assert initialized == ["power" if dcp > 1 else "max"]

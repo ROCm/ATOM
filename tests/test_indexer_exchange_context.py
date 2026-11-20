@@ -2,7 +2,7 @@
 """A serial DCP prefill filter must not enter CUDA's default-stream context."""
 
 import ast
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -70,7 +70,9 @@ def test_dcp_filter_enters_a_cuda_context_only_for_a_real_exchange(has_exchange)
         "torch": SimpleNamespace(
             cuda=SimpleNamespace(stream=stream_context, current_stream=lambda: current)
         ),
-        "nullcontext": nullcontext,
+        "nullcontext": lambda: pytest.fail(
+            "streamless filters must not create a context"
+        ),
         "exchange": exchange,
         "attn_metadata": metadata,
         "topk_indices": SimpleNamespace(record_stream=record_stream),
@@ -95,3 +97,87 @@ def test_dcp_filter_enters_a_cuda_context_only_for_a_real_exchange(has_exchange)
     else:
         assert calls == ["filter"]
         assert metadata.index_exchange_done is None
+
+
+@pytest.mark.parametrize(
+    "prefill,dcp,stream,packed",
+    [
+        (True, 1, True, False),
+        (False, 1, True, False),
+        (True, 2, False, False),
+        (True, 2, True, False),
+        (True, 2, True, True),
+    ],
+)
+def test_only_dcp_prefill_reads_the_exchange_stream(prefill, dcp, stream, packed):
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "atom/model_ops/indexer/indexer_forward.py"
+    )
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    function = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "sparse_attn_indexer"
+    )
+    start = next(
+        i
+        for i, n in enumerate(function.body)
+        if isinstance(n, ast.Assign)
+        and any(
+            isinstance(t, ast.Name) and t.id == "single_rank_prefill" for t in n.targets
+        )
+    )
+    stop = start + next(
+        i
+        for i, n in enumerate(function.body[start:])
+        if isinstance(n, ast.If) and ast.unparse(n.test) == "not context.is_prefill"
+    )
+    calls, scores = [], []
+    side = object() if stream else None
+    eligible = prefill and dcp > 1 and not packed
+
+    class Indexer:
+        @property
+        def exchange_stream(self):
+            assert eligible, "unrelated indexer path read the exchange stream"
+            calls.append("stream")
+            return side
+
+    def exchange(*args):
+        calls.append("exchange")
+        return side
+
+    ns = {
+        "context": SimpleNamespace(is_prefill=prefill),
+        "get_dcp_world_size": lambda: dcp,
+        "indexer_module": Indexer(),
+        "rows": SimpleNamespace(passes=(object(),) if packed else None, out_rows=1),
+        "_exchange_stream": exchange,
+        "score_topk": lambda *a, **k: scores.append(k),
+        "indexer_fp4": False,
+        "q_quant": None,
+        "weights_mqa": None,
+        "kv_cache": None,
+        "attn_metadata": None,
+        "_index_cache": lambda *a: None,
+        "topk_tokens": 1,
+        "weights_scale": None,
+        "stable_topk": False,
+        "topk_indices": [0],
+    }
+    exec(  # noqa: S102 - execute the production dispatch with stream-access guards
+        compile(
+            ast.Module(body=function.body[start:stop], type_ignores=[]),
+            str(path),
+            "exec",
+        ),
+        ns,
+    )
+    assert len(scores) == 1
+    assert scores[0].get("gather", True) == (not eligible or not stream)
+    assert calls == (
+        ["stream", "exchange"]
+        if eligible and stream
+        else ["stream"] if eligible else []
+    )

@@ -32,18 +32,9 @@ except ImportError:
     concat_and_cache_mla_seg = None
     fused_qk_rope_concat_and_cache_mla_seg = None
 from aiter.dist.parallel_state import get_dp_group, get_tensor_model_parallel_rank
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
-
-try:
-    from aiter.jit.utils.chip_info import get_gfx_runtime
-except ImportError:
-    get_gfx_runtime = None
-
-try:
-    from aiter.ops.attention import get_mla_decode_shape_support
-except ImportError:
-    get_mla_decode_shape_support = None
-
+from aiter.ops.attention import get_mla_decode_shape_support
 from aiter.ops.triton.attention.mla import mla_decode_fwd as triton_mla_decode_fwd
 from aiter.ops.triton.fusions.fused_kv_cache import (
     fused_qk_rope_cat_and_cache_mla as triton_fused_qk_rope_cat_and_cache_mla,
@@ -324,6 +315,7 @@ _MLA_DCP_MAX_KERNEL_HEADS = 128
 _MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT = (16, 32, 128)
 _MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT_FP8 = (16, 128)
 _MLA_DCP_SPARSE_PREFILL_WIDTHS = (16, 128)
+_MLA_DCP_SPARSE_PREFILL_WIDTHS_PERSISTENT = (16, 32, 64, 128)
 
 _dcp_kernel_width_warned = False
 _dcp_sparse_prefill_width_warned = False
@@ -419,14 +411,17 @@ def mla_dcp_sparse_prefill_num_heads(
     padding; the layer rebuilds folded work metadata after selecting its keys.
     """
     gathered = max(num_heads * dcp_world_size, min_kernel_heads)
-    if persistent and get_mla_decode_shape_support is not None:
+    if persistent:
         for candidate in range(
             mla_kernel_num_heads(gathered),
             _MLA_DCP_MAX_KERNEL_HEADS + 1,
             _MLA_MIN_HEADS,
         ):
-            # Keep BF16's 128-head small-prefill grouping until 96 is measured there.
-            if candidate == 96 and dtype_kv == torch.bfloat16:
+            # Keep the established BF16 buckets, including the 128-head groups.
+            if (
+                dtype_kv == torch.bfloat16
+                and candidate not in _MLA_DCP_SPARSE_PREFILL_WIDTHS_PERSISTENT
+            ):
                 continue
             support = get_mla_decode_shape_support(
                 candidate,
@@ -439,7 +434,11 @@ def mla_dcp_sparse_prefill_num_heads(
             )
             if support.supported is True and support.native:
                 return candidate
-    widths = _MLA_DCP_SPARSE_PREFILL_WIDTHS
+    widths = (
+        _MLA_DCP_SPARSE_PREFILL_WIDTHS_PERSISTENT
+        if persistent
+        else _MLA_DCP_SPARSE_PREFILL_WIDTHS
+    )
     for width in widths:
         if width >= gathered:
             return width
@@ -751,7 +750,7 @@ class MLAAttention(nn.Module):
             if mla_modules.indexer is not None
             else mla_modules.topk_tokens
         )
-        # Reusable native plans cover every BF16 or FP8 candidate in one row.
+        # Bound one sparse row for BF16 rebuilds and small-prefill head groups.
         # Pooled indexers publish their wider physical row capacity, including
         # the incomplete pool tail; ordinary indexers are bounded by top-k.
         self._sparse_prefill_kv_granularity = (
@@ -1038,6 +1037,7 @@ class MLAAttention(nn.Module):
         self.dcp_sparse_prefill_persistent = False
         self.dcp_sparse_prefill_num_heads = self.num_heads
         self.dcp_sparse_prefill_nonps = False
+        self.dcp_sparse_prefill_plan_native = False
         if dcp_world_size > 1 and self.is_sparse_mla:
             self.dcp_sparse_prefill_persistent = mla_dcp_sparse_prefill_is_persistent(
                 dcp_world_size,
@@ -1070,6 +1070,20 @@ class MLAAttention(nn.Module):
                 self.dcp_sparse_prefill_persistent,
                 self.dcp_sparse_prefill_num_heads,
             )
+            if self.dcp_sparse_prefill_persistent:
+                dtype = dtypes.d_dtypes[self.kv_cache_dtype]
+                support = get_mla_decode_shape_support(
+                    self.dcp_sparse_prefill_num_heads,
+                    1,
+                    dtype,
+                    dtype,
+                    persistent=True,
+                    return_lse=True,
+                    page_size=1,
+                )
+                self.dcp_sparse_prefill_plan_native = (
+                    support.supported is True and support.native
+                )
 
     def _pad_sparse_prefill_query_heads(self, q: torch.Tensor) -> torch.Tensor:
         """Head padding for a DCP sparse prefill.
@@ -1661,8 +1675,8 @@ class MLAAttention(nn.Module):
         Split out so DCP decode can run it BEFORE the merge (project-before-
         merge). Weight and head count are arguments because that path projects
         the whole group with ``W_V_dcp``; every other caller uses ``self.W_V``.
-        ``head_major`` requests BF16 storage for the prefill A2A; the logical
-        return shape stays ``[B, N, V]`` and other branches stay contiguous.
+        ``head_major`` changes only the BF16 branch's storage order for prefill
+        A2A. The logical return stays ``[B, N, V]``; other branches stay contiguous.
         """
         W_V = self.W_V if W_V is None else W_V
         W_V_scale = self.W_V_scale if W_V_scale is None else W_V_scale
@@ -1731,7 +1745,6 @@ class MLAAttention(nn.Module):
             and not self.kv_shuffled
             and kv_cache.numel() > 0
             and dtype_q == dtypes.fp8
-            and get_gfx_runtime is not None
             and get_gfx_runtime() == "gfx950"
             and mla_absorb_q_pack_supports(self.qk_nope_head_dim, self.kv_lora_rank)
         )
@@ -2564,10 +2577,9 @@ class MLAAttention(nn.Module):
             use_decode_kernel = self.kv_cache_dtype.startswith("fp8") or return_lse
             if use_decode_kernel:
                 is_fp8 = self.kv_cache_dtype.startswith("fp8")
-                # A full indexer layer rewrites the rank-local compact indptr,
-                # so the forward's whole-row work plan (built once from the
-                # GLOBAL sparse_kv_indptr) is pointed at this layer's regions
-                # here -- or the layer runs non-persistent.
+                # A full indexer layer selects its own rank-local regions.
+                # Native whole-row plans patch those ranges; folded plans and
+                # small BF16 head groups rebuild. Non-persistent calls use no plan.
                 #
                 # Read from the same predicate the gathered pad width came from
                 # rather than re-deriving the gate: on the persistent kernel set
@@ -2620,24 +2632,7 @@ class MLAAttention(nn.Module):
                         kv_last_page_lens,
                     ) = head_groups.prepare(q, o, paged_kv_indptr, paged_kv_indices)
                 elif sparse_dcp_persistent and self.owns_sparse_indexer:
-                    support = (
-                        get_mla_decode_shape_support(
-                            q.shape[1],
-                            1,
-                            q.dtype,
-                            kv_c_and_k_pe_cache.dtype,
-                            persistent=True,
-                            return_lse=True,
-                            page_size=1,
-                        )
-                        if get_mla_decode_shape_support is not None
-                        else None
-                    )
-                    if (
-                        support is not None
-                        and support.supported is True
-                        and support.native
-                    ):
+                    if self.dcp_sparse_prefill_plan_native:
                         patch_work_kv_ranges(
                             attn_metadata.sparse_prefill_work_info_set,
                             attn_metadata.sparse_prefill_work_indptr,
@@ -2797,8 +2792,8 @@ class MLAAttention(nn.Module):
         sparse indptr. Shared IndexShare layers reuse the preceding full layer's
         indices, compact indptr, and work plan and therefore skip this call.
 
-        ``gathered_num_heads`` is the caller's own gathered/padded width
-        not assumed here. Sparse prefill patches a native whole-row plan;
+        ``gathered_num_heads`` is the caller's gathered/padded width; it is not
+        inferred here. Sparse prefill patches a native whole-row plan;
         folded or unknown plans rebuild from the current layer's keys.
         """
         if not work_prefix:

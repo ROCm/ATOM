@@ -567,6 +567,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         self.dcp_world_size = get_dcp_world_size()
         self.dcp_rank = get_dcp_rank()
+        self._sparse_prefill_kv_granularity = (
+            triton.next_power_of_2(self.index_topk_out)
+            if self.is_sparse and self.dcp_world_size > 1
+            else max(self.block_size, 16)
+        )
         self._publishes_dcp_local_lens = self.is_sparse and self.dcp_world_size > 1
         self.indexes_by_token_table = indexes_by_token_table(
             self.is_sparse, self.dcp_world_size, self.index_kpool
@@ -2261,11 +2266,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             dtype_q=self.dtype_q,
             dtype_kv=self.dtype_kv,
             # No row selects more than index_topk_out keys.
-            kv_granularity=(
-                triton.next_power_of_2(self.index_topk_out)
-                if self.dcp_world_size > 1
-                else max(self.block_size, 16)
-            ),
+            kv_granularity=self._sparse_prefill_kv_granularity,
             max_seqlen_qo=1,
             uni_seqlen_qo=1,
             fast_mode=1,

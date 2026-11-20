@@ -597,9 +597,11 @@ Non-persistent decode uses its dtype-specific table (16/32/128 for bf16,
 16/128 for fp8), so its gathered 96 is padded to 128.
 
 Sparse prefill selects its width separately. The eligible persistent path
-queries AITER for native support at candidate multiples of 16, retaining
-conservative 16/128 padding if support is folded or unknown. BF16 96-head
-prefill keeps 128-head padding for its small-prefill head-group path. Beyond 128,
+queries AITER for native support at candidate multiples of 16. BF16 keeps the
+established 16/32/64/128 buckets, so 48 pads to 64 and 96 pads to 128 for the
+small-prefill head-group path. Folded or unknown persistent support uses those
+same buckets and rebuilds each layer's plan; non-persistent prefill keeps its
+16/128 table unless the eligible FP8 gqa64 route applies. Beyond 128,
 DCP decode warns and passes the rounded width to aiter; sparse prefill also
 warns and returns a rounded, unverified width. These widths are outside the
 range validated for these ATOM DCP paths. Subsequent dispatch depends on the
@@ -640,13 +642,14 @@ requirement above (which is specifically about decode's gqa=64 kernel), sparse
 per-layer metadata rebuild, and page size. Width selection additionally queries
 AITER with the query/KV dtypes: gfx942 BF16 can run persistently while folding
 its heads into 16-head pseudo-batches. Those plans require per-layer rebuilds.
-The native-plan check uses the actual tensors' width and dtypes before
-patching; small-prefill head groups instead rebuild their own descriptors.
+The native-plan decision is cached with the layer's configured width and dtypes
+at initialization; small-prefill head groups rebuild their own descriptors.
 
 GLM-5.2 has 64 query heads: `-tp 8 -dcp 8` and `-tp 4 -dcp 4` both gather
-64 and avoid padding to 128. Decode uses the persistent gqa64 path. Eligible
-FP8 sparse prefill uses the native non-persistent gqa64 kernel by default;
-other eligible sparse-prefill calls use the persistent path.
+64. On gfx950, decode uses the persistent gqa64 path and eligible FP8 sparse
+prefill uses the native non-persistent gqa64 kernel by default. On gfx942,
+BF16 persistent prefill retains 64 heads and rebuilds folded plans per owner;
+FP8 may select a wider native width. This does not claim gfx942 model qualification.
 
 **Validated** (native ATOM, MI355 gfx950, GLM-5.2-MXFP4, fp8 KV, no
 speculative decode): both `-tp 8 -dcp 8` and `-tp 4 -dcp 4` complete CUDA graph
@@ -763,8 +766,8 @@ MLA rows; see the [recipe](../recipes/DSpark.md)).
 | fp8 KV cache | Supported, **per-tensor scale only** (per-token / per-group not supported) |
 | prefix caching / chunked prefill | Supported (dense and sparse / DSA). On **Kimi-K3** the validated configuration has prefix caching **off**, per its recipe |
 | Kimi-K3 KDA layers | Not sharded — the KDA recurrent state is per-request, not paged, so DCP frees only the MLA share of attention memory |
-| Kimi-K3 gathered head width | Eligible persistent decode and sparse prefill use native 96 at TP8/DCP8. Other routes use their own width tables. Above 128, ATOM warns because the width is unverified; aiter dispatch depends on its version and configuration, with no support guarantee. |
-| gathered head width 64 | Eligible decode rebuilds persistent metadata per full IndexShare layer. Persistent sparse prefill plans once per forward and patches per owner; eligible FP8 non-persistent prefill needs no plan. See [Sparse DCP persistent attention and gqa=64](#sparse-dcp-persistent-attention-and-gqa64). |
+| Kimi-K3 gathered head width | TP8/DCP8 gathers 96 real heads. Native FP8 prefill may retain 96; BF16 prefill pads to 128. Decode and folded routes follow their own tables and AITER support. Widths above 128 are unverified. |
+| gathered head width 64 | Eligible decode rebuilds persistent metadata per full IndexShare layer. Native persistent prefill patches whole-row plans; folded plans and small BF16 head groups rebuild. Eligible FP8 non-persistent prefill needs no plan. See [Sparse DCP persistent attention and gqa=64](#sparse-dcp-persistent-attention-and-gqa64). |
 | speculative decode (MTP), dense MLA | Supported on **gfx950 only** (bf16/fp8, `num_speculative_tokens` 1–3); raises at startup on gfx942 |
 | speculative decode (DSpark), Kimi-K3 | Supported on gfx950; validated at `tp8 -dcp 8` with `num_speculative_tokens 2` (Inferact MLA draft) and 5 (RadixArk DSpark GQA draft, which runs outside the DCP group) |
 | speculative decode (MTP), sparse / DSA | Supported on **gfx950 only**; validated on GLM-5.2-FP8 at fp8 KV, `num_speculative_tokens=3`, dcp8 |

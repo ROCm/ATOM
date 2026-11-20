@@ -10,8 +10,6 @@ conversion otherwise. The `Indexer` module (models/deepseek_v2.py) owns the
 projections and calls this op.
 """
 
-from contextlib import nullcontext
-
 import torch
 from aiter import dtypes, indexer_k_quant_and_cache
 
@@ -353,11 +351,11 @@ def sparse_attn_indexer(
     single_rank_prefill = context.is_prefill and get_dcp_world_size() == 1
     # Packed passes gather into separate padded slots inside score_topk; they
     # cannot be gathered again using the whole step's row split.
-    exchange = (
-        _exchange_stream(indexer_module, context.is_prefill)
-        if indexer_module.exchange_stream is not None and rows.passes is None
-        else None
-    )
+    exchange = None
+    if context.is_prefill and not single_rank_prefill and rows.passes is None:
+        stream = indexer_module.exchange_stream
+        if stream is not None:
+            exchange = _exchange_stream(stream)
     if exchange is None:
         topk_indices = score_topk(
             (
@@ -419,13 +417,7 @@ def sparse_attn_indexer(
         # WHOLE selection: the filter `.contiguous()`s what it gets, so a row
         # slice would copy what the in-place gather avoided moving, and its
         # grid follows `sparse_kv_indptr`, so the gather's tail is never read.
-        if exchange is not None:
-            exchange.wait_stream(torch.cuda.current_stream())
-            # The op drops its last reference while the exchange still runs.
-            topk_indices.record_stream(exchange)
-        with torch.cuda.stream(exchange) if exchange is not None else nullcontext():
-            if exchange is not None:
-                _gather_split(topk_indices, rows.split)
+        if exchange is None:
             triton_filter_and_convert_dcp_index_prefill(
                 attn_metadata.sparse_kv_indptr,
                 attn_metadata.batch_id_per_q_token,
@@ -440,7 +432,26 @@ def sparse_attn_indexer(
                 out=attn_metadata.sparse_kv_indices,
                 cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
             )
-        if exchange is not None:
+        else:
+            exchange.wait_stream(torch.cuda.current_stream())
+            # The op drops its last reference while the exchange still runs.
+            topk_indices.record_stream(exchange)
+            with torch.cuda.stream(exchange):
+                _gather_split(topk_indices, rows.split)
+                triton_filter_and_convert_dcp_index_prefill(
+                    attn_metadata.sparse_kv_indptr,
+                    attn_metadata.batch_id_per_q_token,
+                    topk_indices,
+                    attn_metadata.block_tables,
+                    get_dcp_rank(),
+                    get_dcp_world_size(),
+                    runner_block_size,
+                    out_kv_indptr=attn_metadata.dcp_sparse_kv_indptr,
+                    owned_counts=attn_metadata.dcp_owned_counts,
+                    NUM_TOPK_TOKENS=topk_tokens,
+                    out=attn_metadata.sparse_kv_indices,
+                    cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+                )
             attn_metadata.index_exchange_done = exchange.record_event()
     else:
         triton_convert_req_index_to_global_index_dsa_prefill(
@@ -457,18 +468,10 @@ def sparse_attn_indexer(
         )
 
 
-def _exchange_stream(indexer, is_prefill):
-    """The stream a DCP prefill's top-k exchange (the all-gather and the owner
-    filter) runs on, beside the q path, or None to run it in order: an indexer
-    the model gave no stream, decode, graph capture and TBO."""
-    stream = indexer.exchange_stream
-    if (
-        stream is None
-        or not is_prefill
-        or get_dcp_world_size() == 1
-        or torch.cuda.is_current_stream_capturing()
-        or tbo_active()
-    ):
+def _exchange_stream(stream):
+    """Use an eligible DCP prefill's side stream outside graph capture and TBO.
+    The caller excludes decode, DCP=1, packed passes and absent streams."""
+    if torch.cuda.is_current_stream_capturing() or tbo_active():
         return None
     return stream
 

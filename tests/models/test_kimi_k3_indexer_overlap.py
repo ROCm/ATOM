@@ -9,21 +9,28 @@ from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
-
-pytest.importorskip("aiter", reason="the indexer op and MLA import aiter")
-
-from atom.model_ops import attention_mla
-from atom.model_ops.indexer import indexer_forward
-from atom.utils.forward_context import AttentionMetaData
+from aiter_stub import atom_under_stubs
 
 PREFIX = "layers.0.self_attn.indexer"
 
 
 @pytest.fixture
-def dcp_prefill(monkeypatch):
+def modules():
+    with atom_under_stubs() as load:
+        yield SimpleNamespace(
+            attention_mla=load("atom.model_ops.attention_mla"),
+            indexer_forward=load("atom.model_ops.indexer.indexer_forward"),
+            AttentionMetaData=load("atom.utils.forward_context").AttentionMetaData,
+        )
+
+
+@pytest.fixture
+def dcp_prefill(monkeypatch, modules):
     """`run(stream)` runs the indexer op on a DCP prefill step and returns the
     (step, stream) of each exchange call and the step's metadata."""
     calls = []
+    indexer_forward = modules.indexer_forward
+    AttentionMetaData = modules.AttentionMetaData
     current = torch.cuda.current_stream
 
     def score_topk(*args, out, **kwargs):
@@ -100,8 +107,9 @@ def test_exchange_runs_on_the_side_stream_and_hands_its_event_to_mla(dcp_prefill
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA streams")
 @pytest.mark.parametrize("serial", ["no stream", "graph capture", "tbo"])
 def test_capture_tbo_and_a_streamless_indexer_keep_the_serial_order(
-    dcp_prefill, monkeypatch, serial
+    dcp_prefill, monkeypatch, serial, modules
 ):
+    indexer_forward = modules.indexer_forward
     if serial == "graph capture":
         monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     if serial == "tbo":
@@ -122,9 +130,11 @@ def test_packed_prefill_keeps_its_per_pass_gathers_in_the_scorer(dcp_prefill):
 
 @pytest.mark.parametrize("use_qrep", [False, True])
 def test_sparse_prefill_joins_the_exchange_before_its_query_gather(
-    monkeypatch, use_qrep
+    monkeypatch, use_qrep, modules
 ):
     calls = []
+    attention_mla = modules.attention_mla
+    AttentionMetaData = modules.AttentionMetaData
     monkeypatch.setattr(
         attention_mla,
         "dcp_all_gather_prefill_query_heads",
