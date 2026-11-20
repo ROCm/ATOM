@@ -276,11 +276,6 @@ class Attention(nn.Module):
             config.num_attention_heads // tp_size,
             config.o_groups // tp_size,
         )
-        # ATOM consumes eight-head output groups; AITER owns kernel support.
-        # `_use_fused_attention` checks wq_b's BF16 Q and the forward's RoPE.
-        self.fused_attn = self.groups * 8 == self.heads and fused_attention_available(
-            self.heads, self.head_dim
-        )
         self.softmax_scale = self.head_dim**-0.5
         self.attn_sink = atom_parameter(torch.empty(self.heads, dtype=torch.float32))
         # Fused [wq_a; wkv], as V4 declares it: one GEMM, and one
@@ -334,6 +329,16 @@ class Attention(nn.Module):
             quant_config=native_quant_config(),
         )
         self.wo_a.needs_preshuffled_weight = True
+        # Fusion produces MXFP8 Q latents and eight-head output groups.
+        # Per-token and BF16 projections need their original norm/output path.
+        # AITER owns kernel support; the forward checks device/RoPE metadata.
+        self.fused_attn = (
+            self.groups * 8 == self.heads
+            and isinstance(self.qk_norm, DualRMSNormMXFP8)
+            and not self.wo_a.runs_bf16
+            and fused_attention_available(self.heads, self.head_dim)
+        )
+        self._fused_attention_support = None
         self.wo_b = RowParallelLinear(
             config.o_groups * self.o_rank,
             config.hidden_size,
@@ -490,11 +495,21 @@ class Attention(nn.Module):
         wq_b's BF16 output and the RoPE metadata. The normed layer input
         `activation` supplies the device. Other cases keep the unfused path.
         """
-        return (
-            self.fused_attn
-            and cache.kv_fp8
-            and not cache.packed
-            and fused_attention_available(
+        if not (self.fused_attn and cache.kv_fp8 and not cache.packed):
+            return False
+        key = (
+            activation.device,
+            rope.cos_cache.dtype,
+            rope.sin_cache.dtype,
+            rope.rope_dim,
+        )
+        # Cache both answers per layer. Device/RoPE changes require a new
+        # query, while cache layout and the layer switch are checked each call.
+        if (
+            self._fused_attention_support is None
+            or self._fused_attention_support[0] != key
+        ):
+            supported = fused_attention_available(
                 self.heads,
                 self.head_dim,
                 q_dtype=torch.bfloat16,
@@ -503,7 +518,8 @@ class Attention(nn.Module):
                 rope_dim=rope.rope_dim,
                 device=activation.device,
             )
-        )
+            self._fused_attention_support = (key, supported)
+        return self._fused_attention_support[1]
 
     def _use_a8w4_attention(self, query, cache):
         """The choice precedes RoPE: Q8 production does not rotate BF16 Q."""

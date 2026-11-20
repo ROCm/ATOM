@@ -5,8 +5,9 @@ The metadata builder, the CSA2 cache, attention and the Engram staging each
 need one thing here that ATOM's own engine does not, and each gets it the same
 way: an override on a subclass, or an attribute set on the class before any
 model is built. Nothing in this file changes what native computes -- core
-allocates its own pool, frees its own scratch, forks its own stream and hands
-attention's rows back by return value, exactly as it did before any of this.
+allocates its own pool, frees its own scratch and forks its own stream. Native
+unfused attention returns BF16 rows; fused attention writes caller-owned MXFP8
+data/scale planes and returns None. This frontend keeps those arithmetic paths.
 
 They are collected here because they are the same kind of thing and have the
 same reason to exist, which in every case is a property of vLLM rather than of
@@ -559,7 +560,10 @@ def _attend_block(
     one on it. `_step` is the fallback for the window before a pool is bound.
 
     `hidden_scale_dtype` is set when `_forward` passed the scale as a uint8
-    view; the scale is viewed back to it here.
+    view; the scale is viewed back to it here. `fused` explicitly selects
+    MXFP8 output and requires both `attn_out` and `attn_out_scale`; the latter
+    crosses the capture break as uint8. A fused step with no requests zeros
+    the data, writes unit scales and returns before launching attention.
     """
     if hidden_scale_dtype is not None:
         hidden_scale = hidden_scale.view(hidden_scale_dtype)
@@ -588,10 +592,10 @@ def _attend_block(
     if queries is not None:
         qr, qr_scale = queries.take(qr, qr_scale)
     query = self.wq_b(qr, x_scale=qr_scale).unflatten(-1, (self.heads, self.head_dim))
-    # One launch for both rotations, the KV row's FP8 bytes and, where a
+    # On the unfused path, one launch for both rotations, KV FP8 bytes and, where a
     # decode allows it, the window write. `window_kv` is what is left for
     # `write_window` below, which is nothing when that fold happened. The
-    # FP8 pool's attention reads the query as MXFP8 (`query_fp8`).
+    # unfused FP8 attention reads MXFP8 Q (`query_fp8`); fused attention takes BF16 Q.
     a8w4, query_fp8 = False, None
     if not fused:
         a8w4 = self._use_a8w4_attention(query, cache)

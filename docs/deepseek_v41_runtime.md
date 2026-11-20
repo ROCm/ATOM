@@ -97,11 +97,20 @@ selected layout. V4.1 Mono reads either gfx950 cache layout with its own
 
 The main pool is independent of it and takes
 `kv_cache_dtype="fp8"` (the deployed configuration), `"bf16"` or `"fp4"`.
-Under FP8, main and SWA rows are MXFP8 (E4M3, one E8M0 per 32 dims) and
-attention runs on them through AITER's `mla_sparse_prefill_v41`; under FP4,
-main rows use their own format and SWA uses FP8. BF16 and FP4 use the original
-V4 BF16 attention kernels and inverse RoPE; no V4 file is modified to serve
-V4.1.
+Under FP8, main and SWA rows are MXFP8 (E4M3, one E8M0 per 32 dims).
+Eligible native and vLLM plugin layers use
+AITER's `fused_norm_rope_attn_rope_cast` by default: Q RoPE/quantization and
+the inverse-RoPE/output quantization are part of attention. ATOM requires
+MXFP8 Q latents, eight-head output groups and a quantized `wo_a`; AITER's
+public `is_fused_norm_rope_attn_rope_cast_supported` query owns kernel
+eligibility. Its result is cached per layer for the device and RoPE metadata,
+while cache layout is checked each forward. Other FP8 layers use
+`mla_sparse_prefill_v41` with separate preparation and output quantization.
+Under FP4, main rows use their own format and SWA uses FP8; supported
+configurations use A8W4 as described in the
+[performance guide](deepseek_v41_performance.md#cache-format-and-attention-boundary).
+The BF16 pool and FP4 adapter retain V4's BF16 attention and inverse RoPE;
+no V4 file is modified to serve V4.1.
 
 Each plane format has one scorer, for every shape. It reads the plane in place and
 gives each query row its own bound and its own tile list, so a prefill token, a

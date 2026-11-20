@@ -67,6 +67,7 @@ def fused_factory(single_rank):
     ):
         torch.manual_seed(6821 + heads + ratio)
         config = SimpleNamespace(
+            fp4ptpc=False,
             head_dim=512,
             hidden_size=hidden_size,
             q_lora_rank=q_lora_rank,
@@ -220,9 +221,11 @@ def error_metrics(actual, expected):
     actual, expected = actual.float(), expected.float()
     assert actual.shape == expected.shape and torch.isfinite(actual).all()
     delta = actual - expected
+    row_relative = delta.norm(dim=-1) / expected.norm(dim=-1).clamp_min(1e-20)
     return {
         "relative": (delta.norm() / expected.norm().clamp_min(1e-20)).item(),
         "max_abs": delta.abs().max().item(),
+        "max_row_relative": row_relative.max().item(),
         "cosine": torch.nn.functional.cosine_similarity(
             actual.flatten(), expected.flatten(), dim=0
         ).item(),
@@ -234,6 +237,7 @@ def assert_output(actual, expected):
     assert actual.dtype == expected.dtype == torch.bfloat16
     assert metrics["relative"] < 0.03, metrics
     assert metrics["cosine"] > 0.999, metrics
+    assert metrics["max_row_relative"] < 0.05, metrics
     return metrics
 
 
@@ -249,6 +253,7 @@ def test_fused_support_query_is_owned_by_aiter(single_rank, monkeypatch, support
 
     monkeypatch.setattr(attention, "fused_attention_available", supports)
     config = SimpleNamespace(
+        fp4ptpc=False,
         head_dim=512,
         hidden_size=256,
         q_lora_rank=1280,
@@ -284,11 +289,100 @@ def test_fused_support_query_is_owned_by_aiter(single_rank, monkeypatch, support
             "device": activation.device,
         },
     )
+    count = len(calls)
+    for _ in range(40):
+        assert model._use_fused_attention(activation, cache, rope) is supported
+    assert len(calls) == count, "Both supported and unsupported answers are cached"
+    # Each input to the public capability query invalidates the cached answer.
+    for field, value in (
+        ("cos_cache", torch.empty(16, 48, dtype=torch.float16, device="meta")),
+        ("sin_cache", torch.empty(16, 48, dtype=torch.bfloat16, device="meta")),
+        ("rope_dim", 64),
+    ):
+        setattr(rope, field, value)
+        assert model._use_fused_attention(activation, cache, rope) is supported
+        count += 1
+        assert len(calls) == count
+    activation = torch.empty(1, 2, 256, dtype=torch.float16)
+    assert model._use_fused_attention(activation, cache, rope) is supported
+    count += 1
+    assert len(calls) == count
     for kv_fp8, packed in ((False, False), (True, True)):
         cache.kv_fp8, cache.packed = kv_fp8, packed
         count = len(calls)
         assert not model._use_fused_attention(activation, cache, rope)
         assert len(calls) == count
+    cache.kv_fp8, cache.packed = True, False
+    model.fused_attn = False
+    assert not model._use_fused_attention(activation, cache, rope)
+    assert len(calls) == count
+
+
+@pytest.mark.parametrize("corruption", ["zero", "sign", "nan"])
+def test_output_check_rejects_one_bad_row(corruption):
+    expected = torch.ones(1, 4096, 256, dtype=torch.bfloat16)
+    actual = expected.clone()
+    actual[:, 37] = {"zero": 0, "sign": -1, "nan": float("nan")}[corruption]
+    if corruption != "nan":
+        metrics = error_metrics(actual, expected)
+        assert metrics["cosine"] > 0.999
+        if corruption == "zero":
+            assert metrics["relative"] < 0.03
+    with pytest.raises(AssertionError):
+        assert_output(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "fp4ptpc,wq_b_bf16,wo_a_bf16,eligible",
+    [
+        (False, False, False, True),
+        (True, False, False, False),
+        (False, True, False, False),
+        (False, False, True, False),
+    ],
+)
+def test_fused_attention_requires_mxfp8_projections(
+    single_rank, monkeypatch, fp4ptpc, wq_b_bf16, wo_a_bf16, eligible
+):
+    from atom.model_ops import linear
+    from atom.models.deepseek_v41 import attention
+
+    # Exercise the real constructors and their quantization selection. These
+    # are the native linears in construction order: wqkv_a, wq_b, wo_a, wo_b.
+    bf16_answers = iter((False, wq_b_bf16, wo_a_bf16, False))
+    monkeypatch.setattr(
+        linear,
+        "native_group32_runs_bf16",
+        (lambda: wo_a_bf16) if fp4ptpc else (lambda: next(bf16_answers)),
+    )
+    supports = []
+    monkeypatch.setattr(
+        attention,
+        "fused_attention_available",
+        lambda *args: supports.append(args) or True,
+    )
+    config = SimpleNamespace(
+        fp4ptpc=fp4ptpc,
+        head_dim=512,
+        hidden_size=256,
+        q_lora_rank=1280,
+        num_attention_heads=64,
+        o_groups=8,
+        o_lora_rank=128,
+        rms_norm_eps=1e-6,
+    )
+    spec = LayerAttentionSpec(1, 0, AttentionMode.WINDOW, None, None)
+    with torch.device("meta"):
+        model = Attention(config, spec)
+    assert model.fused_attn is eligible
+    assert model.wo_a.runs_bf16 is wo_a_bf16
+    norm_type = (
+        attention.DualRMSNormPerToken
+        if fp4ptpc
+        else attention.DualRMSNormBF16 if wq_b_bf16 else attention.DualRMSNormMXFP8
+    )
+    assert isinstance(model.qk_norm, norm_type)
+    assert supports == ([(64, 512)] if eligible else [])
 
 
 @torch.inference_mode()
