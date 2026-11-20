@@ -5,8 +5,8 @@
 
 What is UMBP's own: its settings, the client's bool-per-key answers, settling
 a call by its answer, the process-local taint mark, no remove or groups, and
-lookups against one server, and side copy streams of the highest priority
-instead of the forward's stream. The windowed put/get loop, the completion
+lookups against one server, and copies staged on the forward's stream as
+the shared layer stages them. The windowed put/get loop, the completion
 protocol and held-chunk skipping are the shared ``kv_store`` layer's and are
 tested through ``mooncake_store`` (``test_mooncake_store_offload.py``); the
 round trips here run that loop over UMBP's answers.
@@ -23,6 +23,7 @@ import array
 import ctypes
 import logging
 import sys
+import time
 import types
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -50,6 +51,7 @@ from atom.kv_transfer.offload.kv_store import worker as store_worker_mod
 from atom.kv_transfer.offload.metadata import LMCacheReqMeta, LoadSpec, SaveSpec
 from atom.kv_transfer.offload.umbp_store import client as umbp_client
 from atom.kv_transfer.offload.umbp_store import taint
+from atom.kv_transfer.offload.umbp_store import worker as umbp_worker_mod
 from atom.kv_transfer.offload.umbp_store.config import (
     UMBPStoreOffloadConfig,
     check_engine_compatibility,
@@ -87,14 +89,25 @@ class FakeServer:
         # A call every client raises from.
         self.raise_on: str | None = None
         self.connect_error: Exception | None = None
+        # A call every client answers only after this many seconds.
+        self.slow_on: tuple[str, float] | None = None
+        # Puts answered False before any is answered as usual.
+        self.refuse_first_puts = 0
+        # Results every client answers short of: (call, how many fewer).
+        self.short_on: tuple[str, int] | None = None
+        self.refuse_registration = False
+        self.deregister_error: Exception | None = None
 
     def at(self, address: str = ADDRESS) -> dict[str, bytes]:
         return self.objects.setdefault(address, {})
 
-    def connect(self, address: str, startup_timeout_ms: int) -> FakeUMBPClient:
+    def connect(
+        self, address: str, startup_timeout_ms: int, lookup_timeout_ms: int
+    ) -> FakeUMBPClient:
         if self.connect_error is not None:
             raise self.connect_error
         client = FakeUMBPClient(self, address, startup_timeout_ms)
+        client.lookup_timeout_ms = lookup_timeout_ms
         self.clients.append(client)
         return client
 
@@ -116,6 +129,13 @@ class FakeUMBPClient:
     def _maybe_raise(self, call):
         if call == self.server.raise_on:
             raise RuntimeError(f"{call} blew up")
+        if self.server.slow_on is not None and self.server.slow_on[0] == call:
+            time.sleep(self.server.slow_on[1])
+
+    def _shorten(self, call, answers):
+        if self.server.short_on is not None and self.server.short_on[0] == call:
+            return answers[: len(answers) - self.server.short_on[1]]
+        return answers
 
     def _is_registered(self, ptr, size):
         return any(
@@ -124,22 +144,29 @@ class FakeUMBPClient:
 
     def register_memory(self, ptr, size):
         self.calls.append(("register", ptr, size))
+        if self.server.refuse_registration:
+            return False
         self.regions[ptr] = size
         return True
 
     def deregister_memory(self, ptr):
         # Standalone: one call drops every region of the client.
         self.calls.append(("deregister", ptr))
+        if self.server.deregister_error is not None:
+            raise self.server.deregister_error
         self.regions.clear()
 
     def batch_exists(self, keys):
         self.calls.append(("exists", list(keys)))
         self._maybe_raise("exists")
-        return [key in self.objects for key in keys]
+        return self._shorten("exists", [key in self.objects for key in keys])
 
     def batch_put_from_ptr(self, keys, ptrs, sizes):
         self.calls.append(("put", list(keys)))
         self._maybe_raise("put")
+        if self.server.refuse_first_puts:
+            self.server.refuse_first_puts -= 1
+            return [False] * len(keys)
         answers = []
         for key, ptr, size in zip(keys, ptrs, sizes, strict=True):
             if key in self.server.fail_puts or not self._is_registered(ptr, size):
@@ -148,7 +175,7 @@ class FakeUMBPClient:
             # Immutable keys: an existing one keeps its bytes and succeeds.
             self.objects.setdefault(key, ctypes.string_at(ptr, size))
             answers.append(True)
-        return answers
+        return self._shorten("put", answers)
 
     def batch_get_into_ptr(self, keys, ptrs, sizes):
         self.calls.append(("get", list(keys)))
@@ -413,6 +440,7 @@ def test_config_defaults():
     assert cfg == UMBPStoreOffloadConfig(
         address=ADDRESS,
         startup_timeout_ms=10000,
+        lookup_timeout_ms=1000,
         chunk_tokens=CHUNK,
         load_pool_mib=1024,
         save_pool_mib=256,
@@ -433,6 +461,8 @@ def test_config_defaults():
         ({**_extra(), "umbp_store.protocol": "rdma"}, "unknown UMBP offload setting"),
         (_extra(chunk_tokens=0), "chunk_tokens"),
         (_extra(startup_timeout_ms="5"), "startup_timeout_ms"),
+        # 0 is Mori's "wait for ever", which would stop the scheduler thread.
+        (_extra(lookup_timeout_ms=0), "lookup_timeout_ms"),
         (_extra(save_abandon_timeout_s=0), "save_abandon_timeout_s"),
         (_extra(address=" "), "non-empty string"),
     ],
@@ -499,30 +529,39 @@ def test_m3_reads_the_page_regions_and_dense_does_not():
     assert not KVConnectorFactory.topology_reads_block_regions(topology("llama"))
 
 
-@pytest.mark.parametrize("model_type", ["minimax_m3", "llama"])
-def test_multi_mooncake_producer_with_umbp_offload(model_type):
-    """The P side of a P/D deployment: Mooncake transfer plus UMBP offload.
-
-    Reads the region map as the same topology with the Mooncake Store
-    offload does; M3 needs it for its PAGE codec either way.
-    """
+@pytest.mark.parametrize("producer", ["mooncake", "moriio"])
+def test_multi_refuses_a_pd_producer_beside_umbp_offload(producer):
+    """PD with UMBP is not supported: the prefill side is refused in `Config`,
+    where `validate_multi_config` runs before the model loads."""
+    from atom.kv_transfer.disaggregation.multi.multi_connector import (
+        validate_multi_config,
+    )
 
     def multi(offload):
-        return SimpleNamespace(
-            kv_transfer_config={
-                "kv_connector": "multi",
-                "connectors": [
-                    {"kv_connector": "mooncake", "kv_role": "kv_producer"},
-                    {"kv_connector": offload, "kv_role": "offload"},
-                ],
-            },
-            hf_config=SimpleNamespace(model_type=model_type, architectures=[]),
-        )
+        return {
+            "kv_connector": "multi",
+            "connectors": [
+                {"kv_connector": producer, "kv_role": "kv_producer"},
+                {"kv_connector": offload, "kv_role": "offload"},
+            ],
+        }
 
-    reads = KVConnectorFactory.topology_reads_block_regions
-    assert reads(multi("umbp_store")) == reads(multi("mooncake_store"))
-    if model_type == "minimax_m3":
-        assert reads(multi("umbp_store"))
+    with pytest.raises(ValueError, match="umbp_store beside a P/D connector"):
+        validate_multi_config(multi("umbp_store"))
+    # The Mooncake Store offload keeps running beside a producer.
+    assert len(validate_multi_config(multi("mooncake_store"))) == 2
+
+
+def test_loads_hits_from_the_mooncake_store_floor():
+    # The same 256-token chunks as mooncake_store, so the same smallest load.
+    assert _config().offload_min_load_tokens == 512
+
+
+def test_shared_prefix_routing_with_umbp_is_single_node_only():
+    single = _config(is_multinode_dp=False)
+    assert KVConnectorFactory.offload_tier(single).loads
+    with pytest.raises(ValueError, match="single-node only"):
+        KVConnectorFactory.offload_tier(_config(is_multinode_dp=True))
 
 
 def test_namespace_is_umbps_own():
@@ -621,6 +660,42 @@ def test_deregister_waits_for_the_last_region_and_close_drops_the_client(server)
     with pytest.raises(umbp_client.CallRefused, match="closed"):
         client.exists(["a"])
     client.close()  # idempotent
+
+
+def test_a_deregister_the_server_fails_is_logged_and_teardown_goes_on(server, caplog):
+    # The server was stopped first: the RPC fails, the close must not.
+    client = umbp_client.UMBPStoreClient(address=ADDRESS)
+    buffer = _host_buffer(16)
+    client.register(buffer.data_ptr(), 16)
+    server.deregister_error = RuntimeError("standalone DeregisterMemory RPC failed")
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        client.unregister(buffer.data_ptr())
+    assert "deregistering the buffer" in caplog.text
+    client.close()
+    assert umbp_client._RETAINED_CLIENTS == []
+
+
+@pytest.mark.parametrize("call", ["exists", "put"])
+def test_an_answer_of_the_wrong_length_raises(server, call):
+    client = umbp_client.UMBPStoreClient(address=ADDRESS)
+    buffer = _host_buffer(2 * CHUNK_BYTES)
+    client.register(buffer.data_ptr(), 2 * CHUNK_BYTES)
+    server.short_on = (call, 1)
+    with pytest.raises(RuntimeError, match="returned 1 results for 2 keys"):
+        if call == "exists":
+            client.exists(["a", "b"])
+        else:
+            client.put(
+                ["a", "b"],
+                [buffer.data_ptr(), buffer.data_ptr() + CHUNK_BYTES],
+                [CHUNK_BYTES] * 2,
+            )
+
+
+def test_clients_bound_their_lookups(server):
+    umbp_client.UMBPStoreClient(address=ADDRESS, lookup_timeout_ms=250)
+    [fake] = server.clients
+    assert fake.lookup_timeout_ms == 250
 
 
 # --- the worker --------------------------------------------------------------
@@ -873,15 +948,93 @@ def test_registration_probes_without_removing_and_close_deregisters_last(
     assert worker._client is None and probe in server.at()
 
 
-@pytest.mark.usefixtures("one_rank")
+@pytest.fixture
+def fast_probe_retries(monkeypatch):
+    monkeypatch.setattr(umbp_worker_mod, "_PROBE_RETRY_INTERVAL_S", 0.001)
+
+
+@pytest.mark.usefixtures("one_rank", "fast_probe_retries")
 def test_a_probe_put_answered_false_stops_startup_and_releases_everything(server):
     server.fail_puts = _AnyKey()
-    worker = UMBPStoreOffloadConnector(_registering_config())
-    with pytest.raises(RuntimeError, match="did not store"):
+    worker = UMBPStoreOffloadConnector(_registering_config(startup_timeout_ms=30))
+    with pytest.raises(RuntimeError, match="did not store .*startup_timeout_ms=30"):
         worker.register_kv_caches(_kv_caches(), num_blocks=8)
     [fake] = server.clients
+    # Asked again until the startup timeout, then given up.
+    assert [call[0] for call in fake.calls].count("put") > 1
     assert fake.calls[-1][0] == "deregister" and fake.regions == {}
     assert worker._client is None and taint.reason(ADDRESS) is None
+
+
+@pytest.mark.usefixtures("one_rank", "fast_probe_retries")
+def test_a_probe_put_refused_while_the_server_starts_is_asked_again(server):
+    # A server still registering its memory answers False to early puts.
+    server.refuse_first_puts = 3
+    worker = UMBPStoreOffloadConnector(_registering_config())
+    try:
+        worker.register_kv_caches(_kv_caches(), num_blocks=8)
+        [fake] = server.clients
+        assert [call[0] for call in fake.calls] == [
+            "register",
+            *["put"] * 4,
+            "exists",
+            "get",
+        ]
+        assert worker._store_distrusted is None
+        pool = worker._pool
+        assert pool.quarantined("save") == pool.quarantined("load") == 0
+        # Every slot is back: all of them can be taken again.
+        pool.release(pool.acquire("save", pool.capacity("save")))
+    finally:
+        worker.close()
+
+
+def _probe_not_listed(fake, keys):
+    return [False] * len(keys)
+
+
+def _probe_reads_zeros(fake, keys, ptrs, sizes):
+    for ptr, size in zip(ptrs, sizes, strict=True):
+        ctypes.memset(ptr, 0, size)
+    return [True] * len(keys)
+
+
+@pytest.mark.parametrize(
+    ("call", "answer", "match"),
+    [
+        ("batch_exists", _probe_not_listed, "not on the server"),
+        ("batch_get_into_ptr", None, "did not return"),
+        ("batch_get_into_ptr", _probe_reads_zeros, "differs from the one written"),
+    ],
+)
+@pytest.mark.usefixtures("one_rank")
+def test_a_probe_that_cannot_read_its_chunk_back_stops_startup(
+    server, monkeypatch, call, answer, match
+):
+    if answer is None:
+        server.fail_gets = _AnyKey()
+    else:
+        monkeypatch.setattr(FakeUMBPClient, call, answer)
+    worker = UMBPStoreOffloadConnector(_registering_config())
+    with pytest.raises(RuntimeError, match=match):
+        worker.register_kv_caches(_kv_caches(), num_blocks=8)
+    [fake] = server.clients
+    # Nothing raised inside UMBP: every slot was released, the pool and the
+    # client closed, and the server is not marked.
+    assert fake.calls[-1][0] == "deregister" and fake.regions == {}
+    assert umbp_client._RETAINED_CLIENTS == []
+    assert worker._client is None and taint.reason(ADDRESS) is None
+
+
+@pytest.mark.usefixtures("one_rank")
+def test_a_pool_the_server_will_not_register_stops_startup(server):
+    server.refuse_registration = True
+    worker = UMBPStoreOffloadConnector(_registering_config())
+    with pytest.raises(RuntimeError, match="could not register"):
+        worker.register_kv_caches(_kv_caches(), num_blocks=8)
+    [fake] = server.clients
+    assert "put" not in [call[0] for call in fake.calls]
+    assert worker._client is None
 
 
 @pytest.mark.usefixtures("one_rank")
@@ -991,6 +1144,26 @@ def test_a_lookup_that_raises_answers_nothing_and_pauses(server):
     assert lookup.lookup(_seq(0, 16)) == 0
 
 
+def test_a_lookup_that_takes_its_deadline_answers_nothing_and_pauses(server):
+    # Past the deadline Mori answers every key absent; that is not a miss.
+    scheduler = UMBPStoreOffloadScheduler(_config(extra=_extra(lookup_timeout_ms=5)))
+    lookup = scheduler._lookup_client
+    hashes = _hashes(16)
+    namespace = store_namespace(_config(), CHUNK)
+    for index in range(2):
+        server.at()[_key(hashes, index, namespace=namespace)] = b""
+    server.slow_on = ("exists", 0.02)
+    lookup._client_to_ask()
+    [fake] = server.clients
+    assert fake.lookup_timeout_ms == 5
+    assert lookup.lookup(_seq(0, 16)) is None
+    assert lookup.paused_until > time.monotonic()
+    server.slow_on = None
+    assert lookup.lookup(_seq(0, 16)) is None  # still paused
+    lookup.paused_until = 0.0
+    assert lookup.lookup(_seq(0, 16)) == 2 * CHUNK
+
+
 def test_an_unreachable_server_answers_nothing(server):
     scheduler = UMBPStoreOffloadScheduler(_config())
     server.connect_error = RuntimeError("no server")
@@ -1031,63 +1204,19 @@ class _AnyKey:
 # --- copy streams --------------------------------------------------------------
 
 
-def test_copy_streams_take_the_highest_priority_on_the_gpu_only(monkeypatch):
-    # (least, greatest): HIP and CUDA both count priority downwards. The
-    # CPU-only torch of the unit tests has no priority range to ask.
-    monkeypatch.setattr(
-        torch.cuda.Stream,
-        "priority_range",
-        staticmethod(lambda: (0, -1)),
-        raising=False,
-    )
-    worker = UMBPStoreOffloadConnector(_config())
-    try:
-        assert worker._copy_stream_priority(torch.device("cuda", 0)) == -1
-        assert worker._copy_stream_priority(torch.device("cpu")) == 0
-    finally:
-        worker.close()
-
-
 @pytest.mark.usefixtures("one_rank")
-def test_registration_stages_on_side_streams_of_the_copy_priority(server, monkeypatch):
-    seen = []
-    monkeypatch.setattr(
-        UMBPStoreOffloadConnector,
-        "_copy_stream_priority",
-        lambda self, device: seen.append(device) or -7,
-    )
+def test_registration_stages_on_the_forward_stream(server):
+    """No side streams: the copies follow the stream the runner reports, in
+    place ones too, as the shared layer stages them by default."""
+    assert UMBPStoreOffloadConnector.STAGES_ON_FORWARD_STREAM
     worker = UMBPStoreOffloadConnector(_registering_config())
     try:
         worker.register_kv_caches(_kv_caches(), num_blocks=8)
-        assert seen == [torch.device(worker._codec.device)]
-        assert worker._gpu_connector._stream_priority == -7
-        # Not the forward's stream, whatever the runner reports.
-        assert worker._gpu_connector._compute_stream_provider is None
+        gpu = worker._gpu_connector
+        assert gpu._compute_stream_provider is not None
         worker.set_forward_stream("forward-stream")
-        assert worker._forward_stream is None
-    finally:
-        worker.close()
-
-
-def test_the_in_place_stream_is_a_side_stream_of_the_copy_priority(server, monkeypatch):
-    made = []
-
-    class PriorityStream:
-        def __init__(self, device=None, priority=0):
-            made.append((device, priority))
-
-    monkeypatch.setattr(store_worker_mod.torch.cuda, "Stream", PriorityStream)
-    monkeypatch.setattr(
-        UMBPStoreOffloadConnector, "_copy_stream_priority", lambda self, d: -3
-    )
-    worker = UMBPStoreOffloadConnector(_config())
-    try:
-        worker._codec = SimpleNamespace(device="cuda:0")
-        worker.set_forward_stream("forward-stream")
+        assert gpu._compute_stream_provider() == "forward-stream"
         worker._pin_in_place_stream()
-        first = worker._in_place_stream()
-        assert isinstance(first, PriorityStream)
-        assert worker._in_place_stream() is first  # one per copy thread
-        assert made == [(torch.device("cuda:0"), -3)]
+        assert worker._in_place_stream() == "forward-stream"
     finally:
         worker.close()

@@ -3539,23 +3539,6 @@ def test_registration_builds_the_pool_and_probes_the_store(cluster, one_rank):
     assert store.closed and store.registered == {}
 
 
-def test_registration_stages_on_the_forward_stream(cluster, one_rank):
-    worker = MooncakeStoreOffloadConnector(_registering_config())
-    try:
-        worker.register_kv_caches(_kv_caches(), num_blocks=8)
-        gpu = worker._gpu_connector
-        # The copies follow the stream the runner reports, in-place ones too;
-        # no side stream of another priority is asked for.
-        assert gpu._compute_stream_provider is not None
-        assert gpu._stream_priority == 0
-        worker.set_forward_stream("forward-stream")
-        assert gpu._compute_stream_provider() == "forward-stream"
-        worker._pin_in_place_stream()
-        assert worker._in_place_stream() == "forward-stream"
-    finally:
-        worker.close()
-
-
 def test_the_kv_budget_holds_back_the_transfer_pool_it_allocates(
     cluster, one_rank, monkeypatch
 ):

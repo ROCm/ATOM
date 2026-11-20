@@ -28,7 +28,8 @@ Defines four backends registered by the shared KV connector factory:
   "kv_connector_extra_config":{"umbp_store.address":"unix:///..."}}``. Built,
   like ``mooncake_store``, on the store-agnostic ``kv_store`` layer; dense
   and MiniMax-M3/M3.1 PAGE layouts, stateful layouts and DCP greater than 1
-  refused.
+  refused; aggregated instances only (no P/D connector beside it), and
+  shared-prefix DP routing on one node only.
 """
 
 
@@ -108,7 +109,10 @@ def register_backends(factory) -> None:
         scheduler_class="UMBPStoreOffloadScheduler",
         requires_pd_staging=False,
         offload=True,
-        # One UMBP standalone server per node, shared by every DP rank there.
+        # The same 256-token chunks as mooncake_store, so the same floor.
+        min_load_tokens=512,
+        # One UMBP standalone server per node, shared by every DP rank there
+        # (single-node DP only; `KVConnectorFactory.offload_tier`).
         shared_tier=True,
         chunk_tokens="atom.kv_transfer.offload.umbp_store.config:store_chunk_tokens",
         # Dense ignores the region map, the M3 PAGE layout reads it (its NSA

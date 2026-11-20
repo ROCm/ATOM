@@ -55,8 +55,13 @@ class UMBPStoreOffloadConfig:
     # The standalone server's gRPC address, e.g. ``unix:///tmp/umbp/server.sock``.
     # Started outside ATOM; every worker and the scheduler connect to it.
     address: str
-    # How long a client waits for the server to answer when it connects.
+    # How long a client waits for the server to answer when it connects, and
+    # how long the startup probe asks again while its put is answered False.
     startup_timeout_ms: int
+    # How long a lookup waits for the server; past it every key is absent and
+    # the scheduler stops asking for a while. Lookups block the scheduler
+    # thread, so 0 (Mori's "wait for ever") is refused.
+    lookup_timeout_ms: int
     chunk_tokens: int
     load_pool_mib: int
     save_pool_mib: int
@@ -117,6 +122,11 @@ def parse_umbp_store_config(
         startup_timeout_ms=offcfg._strict_integer(
             f"{KEY_PREFIX}startup_timeout_ms",
             values.get("startup_timeout_ms", 10000),
+            minimum=1,
+        ),
+        lookup_timeout_ms=offcfg._strict_integer(
+            f"{KEY_PREFIX}lookup_timeout_ms",
+            values.get("lookup_timeout_ms", 1000),
             minimum=1,
         ),
         chunk_tokens=offcfg.connector_integer(extra, f"{KEY_PREFIX}chunk_tokens", 256),

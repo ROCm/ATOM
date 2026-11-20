@@ -41,7 +41,7 @@ logger = logging.getLogger("atom")
 # Connecting blocks the scheduler thread for up to the startup timeout, so a
 # missing server must not cost that on every step.
 _RECONNECT_INTERVAL_S = 30.0
-# The same for a server whose lookup raised.
+# The same for a server whose lookup raised or ran into its deadline.
 _LOOKUP_BACKOFF_S = 10.0
 # Either pause lasts at least this many times as long as the failed call
 # blocked the scheduler thread (`_ServerLookup._pause`).
@@ -64,10 +64,12 @@ class _ServerLookup(StoreLookupBase):
 
     UMBP answers a failed RPC as every key absent, so a lookup cannot tell a
     server that did not answer from one that holds nothing: that costs a miss,
-    never a wrong hit. A lookup answers None, which the scheduler retries
-    later, only when it could not ask: the call raised, or the server is not
-    asked for a while (``_client_to_ask``) because it could not be reached or
-    its last lookup raised.
+    never a wrong hit. Each call waits at most ``umbp_store.lookup_timeout_ms``
+    and then answers every key absent too. A lookup answers None, which the
+    scheduler retries later, when it got no answer it can use: the call
+    raised, it took the whole deadline, or the server is not asked for a
+    while (``_client_to_ask``) because it could not be reached or its last
+    lookup raised or was slow.
 
     A server this process has marked (:mod:`.taint`) holds nothing for the
     lookups. The mark is this process's only; the workers, which place it,
@@ -76,8 +78,8 @@ class _ServerLookup(StoreLookupBase):
     The client is opened on the first lookup, not at construction: every PP
     stage builds a scheduler, and only the head ever schedules. A lookup
     blocks the scheduler thread, so a server the scheduler cannot reach, or
-    whose lookup raised, is not asked for a while (``_RECONNECT_INTERVAL_S``,
-    ``_LOOKUP_BACKOFF_S``).
+    whose lookup raised or was slow, is not asked for a while
+    (``_RECONNECT_INTERVAL_S``, ``_LOOKUP_BACKOFF_S``).
     """
 
     def __init__(
@@ -124,6 +126,19 @@ class _ServerLookup(StoreLookupBase):
                 exc_info=exc,
             )
             return None
+        waited_ms = (time.monotonic() - asked_at) * 1000
+        if waited_ms >= self._cfg.lookup_timeout_ms:
+            # Past the deadline Mori answers every key absent: not an answer.
+            self._warn(
+                "the UMBP server at %s took %.0f ms to answer a lookup of %d "
+                "keys (umbp_store.lookup_timeout_ms=%d); it is not asked for %.0fs",
+                self._cfg.address,
+                waited_ms,
+                len(keys),
+                self._cfg.lookup_timeout_ms,
+                self._pause(_LOOKUP_BACKOFF_S, asked_at),
+            )
+            return None
         # Per rank, the run of chunks from chunk 0 the server holds. Every key
         # is answered, so `held` is the whole answer.
         held, _ = self._rank_prefixes(present, chunks)
@@ -156,6 +171,7 @@ class _ServerLookup(StoreLookupBase):
             self.client = UMBPStoreClient(
                 address=self._cfg.address,
                 startup_timeout_ms=self._cfg.startup_timeout_ms,
+                lookup_timeout_ms=self._cfg.lookup_timeout_ms,
             )
         except Exception:
             pause = self._pause(_RECONNECT_INTERVAL_S, started)

@@ -66,13 +66,7 @@ class _ThreadTransferState:
         device: torch.device,
         use_cuda: bool,
         compute_stream_provider: Callable[[], Any] | None = None,
-        priority: int | None = None,
     ) -> None:
-        """One copy thread's pack and copy streams, and its staging buffer.
-
-        ``priority`` is the side streams' priority (``torch.cuda.Stream``);
-        None keeps the default. A state on the forward's stream has none.
-        """
         self.device = device
         self._pack_stream = None
         self._copy_stream = None
@@ -85,10 +79,9 @@ class _ThreadTransferState:
             compute_stream_provider() if use_cuda and compute_stream_provider else None
         )
         if use_cuda and self._pinned_stream is None:
-            kwargs = {} if priority is None else {"priority": int(priority)}
             with torch.cuda.device(device):
-                self._pack_stream = torch.cuda.Stream(**kwargs)
-                self._copy_stream = torch.cuda.Stream(**kwargs)
+                self._pack_stream = torch.cuda.Stream()
+                self._copy_stream = torch.cuda.Stream()
         self.staging_buffer = _StagingBuffer(use_cuda)
 
     def begin_transfer(self) -> None:

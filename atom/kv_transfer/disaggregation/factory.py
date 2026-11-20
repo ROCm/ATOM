@@ -275,6 +275,14 @@ class KVConnectorFactory:
                                 "Mooncake Store pool; mooncake_store.pools addresses "
                                 "distinct master/metadata pairs"
                             )
+                if name == "umbp_store" and config.is_multinode_dp:
+                    # Each node's ranks reach only that node's UMBP server: a
+                    # prefix held on another node would be credited and miss.
+                    raise ValueError(
+                        "Shared-prefix DP routing with umbp_store is single-node "
+                        "only: each node's DP ranks reach only that node's UMBP "
+                        "standalone server"
+                    )
                 tier = True
                 shared |= cls._shared_tier.get(name, False)
                 lowers_hbm_hit_to_chunk |= cls._lowers_hbm_hit_to_chunk.get(name, False)
