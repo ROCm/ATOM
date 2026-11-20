@@ -143,14 +143,18 @@ them (MI308X, 12k-token prefill: TP2 -12% step time, TP4/EP4 -7%). The
 transport is bf16 (no quantization).
 
 ```bash
+# mori ships in the ATOM images; elsewhere add it from the ATOM checkout
+# (amd-mori-nightly >= 1.2.6.dev20261116, CCO SDMA with MI308X engine balancing):
+pip install -e ".[qwen38-tp-sdma]"
 export ATOM_QWEN4_EXP_SP_SDMA=1
 # Only when torch loads ROCm's private libdrm (rocm_sysdeps), as TheRock wheels do:
 export LD_PRELOAD=/opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_drm.so.2:/opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_drm_amdgpu.so.1
 ```
 
-It is enabled on gfx942 only (validated on MI308X) and needs mori with CCO SDMA
-(`amd-mori-nightly` in the ATOM images) and FlyDSL. If any TP rank cannot use it (missing either, preload missing, TP
-across nodes), every rank logs one warning and keeps RCCL.
+It applies to TP serving on gfx942 only (validated on MI308X) and needs mori
+(above) and FlyDSL (an aiter dependency). If any TP rank cannot use it (missing
+either, preload missing, TP across nodes), every rank logs one warning and keeps
+RCCL.
 
 ## Optional: bursty prefill on an idle server
 
