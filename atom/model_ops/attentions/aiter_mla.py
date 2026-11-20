@@ -77,6 +77,7 @@ from atom.model_ops.indexer import (
     fp8_rows,
     packed_concat_rows,
 )
+from atom.model_ops.indexer.layout import MFMA, PRESHUFFLE, fp4_scale_byte
 from atom.model_ops.indexer.schedule import any_layer_skips_index_topk
 from atom.model_ops.indexer.workspace import (
     ConcatKeyWorkspace,
@@ -1970,10 +1971,19 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 g_cu,
                 g_lens,
                 var[f"{prefix}block_tables"].np[:bs],
+                self.model_runner.config.index_cache_layout,
             )
 
     def _build_dcp_indexer_fp4_prefill_meta(
-        self, attn_metadata, bs: int, lpad, cu_pad, g_cu, g_lens, block_tables
+        self,
+        attn_metadata,
+        bs: int,
+        lpad,
+        cu_pad,
+        g_cu,
+        g_lens,
+        block_tables,
+        layout=PRESHUFFLE,
     ):
         """Where FP4 staging reads this rank's shard and where it lays the
         gathered keys out: each request's from a page of its own, so a
@@ -2008,11 +2018,21 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # Torch fallback (CPU / test builders); also the kernel's reference.
             page, row = slots // block, slots % block
             parts = (page, row, fp4_index_scale_rows(row, block))
+        names = ("page", "row", "scale_row")
+        if layout == MFMA:
+            # Publish full-plane byte offsets and int64 indices once per forward.
+            chunk = torch.arange(4, device=slots.device)
+            parts = (
+                parts[0].long(),
+                parts[1].long(),
+                fp4_scale_byte(slots.long()[:, None], chunk),
+            )
+            names = ("page", "row", "scale_at")
         for side, cut in (
             ("read", slice(0, len(read))),
             ("stage", slice(len(read), None)),
         ):
-            for part, tensor in zip(("page", "row", "scale_row"), parts):
+            for part, tensor in zip(names, parts):
                 setattr(attn_metadata, f"dcp_indexer_fp4_{side}_{part}", tensor[cut])
         attn_metadata.dcp_indexer_fp4_stage_pages = int(first_page[bs])
 
