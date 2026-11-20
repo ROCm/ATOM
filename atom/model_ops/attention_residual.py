@@ -225,14 +225,6 @@ class AttnRes(nn.Module):
         if self.layer_idx % self.block_size != 0:
             return block_residual, prefix_sum
         assert block_residual is not None
-        if not torch.compiler.is_compiling():
-            assert (
-                block_residual.storage_offset() == 0
-            ), "block bank must start its storage"
-        # as_strided, not select: Inductor reinplaces a slot in a bank allocated
-        # in this graph. Compiled producers allocate or receive an offset-zero
-        # bank; querying a graph-created tensor's storage_offset breaks Dynamo.
-        row, slot, col = block_residual.stride()
-        start = self.layer_idx // self.block_size * slot
-        block_residual.as_strided(prefix_sum.shape, (row, col), start).copy_(prefix_sum)
+        # Keep the write relative to the bank view's own storage offset.
+        block_residual.select(1, self.layer_idx // self.block_size).copy_(prefix_sum)
         return block_residual, None

@@ -225,13 +225,34 @@ def test_pp_placeholders_have_a_full_zeroed_bank(
         assert torch.count_nonzero(value).item() == 0
 
 
-def test_eager_close_rejects_offset_bank_before_writing(modules):
-    site = modules.AttnRes(nn.Identity(), nn.Identity(), block_size=BLOCK, layer_idx=0)
-    storage = torch.arange((TOKENS + 1) * 3 * HIDDEN).reshape(TOKENS + 1, 3, HIDDEN)
-    before = storage.clone()
-    with pytest.raises(AssertionError, match="block bank must start its storage"):
-        site.maybe_close_block(torch.ones(TOKENS, HIDDEN), storage[1:])
-    assert torch.equal(storage, before)
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("offset", [0, 1])
+@pytest.mark.parametrize("slot", [0, 1, 2])
+def test_close_writes_only_the_slot_in_the_bank_view(modules, compiled, offset, slot):
+    site = modules.AttnRes(
+        nn.Identity(), nn.Identity(), block_size=BLOCK, layer_idx=slot * BLOCK
+    )
+
+    def close(prefix, bank):
+        return site.maybe_close_block(prefix, bank)
+
+    if compiled:
+        close = torch.compile(close, backend="eager", fullgraph=True, dynamic=True)
+    for tokens in (2, TOKENS):
+        storage = torch.arange((tokens + 2) * 3 * HIDDEN, dtype=torch.float32)
+        storage = storage.reshape(tokens + 2, 3, HIDDEN).bfloat16()
+        bank = storage[offset : offset + tokens]
+        prefix = -(torch.arange(tokens * HIDDEN).reshape(tokens, HIDDEN) + 1)
+        prefix = prefix.bfloat16()
+        expected = storage.clone()
+        expected[offset : offset + tokens, slot] = prefix
+
+        out_bank, remainder = close(prefix, bank)
+
+        assert out_bank is bank
+        assert remainder is None
+        # Whole backing storage catches writes to neighboring rows or slots.
+        torch.testing.assert_close(storage, expected, rtol=0, atol=0)
 
 
 def test_new_bank_slot_copy_stays_in_one_dynamo_graph(modules):
