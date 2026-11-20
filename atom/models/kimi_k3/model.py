@@ -752,6 +752,8 @@ class KimiSparseMoeBlock(nn.Module):
     def _can_column_tail(self, latent: torch.Tensor, shared: torch.Tensor) -> bool:
         from atom.plugin import is_plugin_mode
 
+        if self.tp_size != 8 or latent.shape[1] != 3584:
+            return False
         ctx = get_forward_context().context
         if (
             is_plugin_mode()
