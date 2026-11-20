@@ -94,9 +94,9 @@ Defaults are the CLI defaults.
 
 | Policy | Branch | Selected worker | Samples |
 | --- | --- | --- | --- |
-| `random` | `random` | A random healthy worker. | |
-| `round_robin` | `round_robin` | The next healthy worker. | |
-| `power_of_two` | `single_worker` | The only healthy worker. | |
+| `random` | `random` | A random healthy candidate. | |
+| `round_robin` | `round_robin` | The next healthy candidate. | |
+| `power_of_two` | `single_worker` | The only healthy candidate. | |
 | | `token_load` | The lower of two random workers by the token load the load monitor last reported. | |
 | | `request_load` | The same by active requests, when either worker has no token load. | |
 | `cache_aware` | `affinity` | The longest match a healthy candidate holds has a ratio above `--cache-threshold` (0.3): that candidate. | ratio |
@@ -174,8 +174,11 @@ on its rank, and those it does not move (no DP size, or one the decode's rank
 is outside). A session pinned to another rank is re-pinned and counts as
 `rebind`. Only when idx2idx would move every healthy prefill are all of them
 offered, and then the remap leaves the selected one in place, as its target on
-the decode's rank is unavailable; `rank_mapping` therefore takes a health
-change between planning and reservation. A session that moves leaves its KV
+the decode's rank is unavailable; a remap therefore takes a health or
+membership change between planning and reservation. Two in-flight requests of
+one session whose decodes land on different ranks also record `rank_mapping`
+without a remap: both rebind the pin, and the one dispatched second finds the
+reassignment taken. A session that moves leaves its KV
 cache on the old worker. The HTTP routers and the external-processing PD
 executor record it; gRPC routers do not.
 
@@ -209,8 +212,8 @@ event index, short of the block of the prompt's last token, which the engine
 always computes. The
 router drops the estimate when it sends the prompt to a different worker than
 the policy chose, because DP ranks keep separate KV caches; under
-`--atom-pd-rank-mapping-policy idx2idx` that takes a health change between
-planning and reservation.
+`--atom-pd-rank-mapping-policy idx2idx` that takes a health or membership change
+between planning and reservation.
 `kind="actual"` repeats the engine count for exactly those requests, so
 `estimated` and `actual` compare like for like.
 

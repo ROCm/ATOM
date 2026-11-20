@@ -132,7 +132,10 @@ impl LoadBalancingPolicy for RoundRobinPolicy {
             return (None, RouteDecision::branch(NO_HEALTHY_WORKERS));
         }
 
-        let selected_idx = self.next_position(workers) % healthy_indices.len();
+        let selected_idx = match healthy_indices.len() {
+            1 => 0,
+            healthy => self.next_position(workers) % healthy,
+        };
 
         (
             Some(healthy_indices[selected_idx]),
@@ -235,12 +238,7 @@ mod tests {
         let kept = pair("kept");
         let mut from_kept = picks(&policy, &kept, 1).await;
         for i in 0..100 {
-            picks(
-                &policy,
-                &regular_workers([format!("http://once{i}:8000")]),
-                1,
-            )
-            .await;
+            picks(&policy, &pair(&format!("once{i}-")), 1).await;
             from_kept.extend(picks(&policy, &kept, 1).await);
             // The kept set, and the last two sets used once: each lasts one more sweep.
             assert!(policy.positions.len() <= 3, "{}", policy.positions.len());
@@ -331,6 +329,10 @@ mod tests {
         for _ in 0..5 {
             assert_eq!(policy.select_worker(&workers, &info).await, Some(0));
         }
+        assert!(
+            policy.positions.is_empty(),
+            "one candidate needs no position"
+        );
     }
 
     #[tokio::test]

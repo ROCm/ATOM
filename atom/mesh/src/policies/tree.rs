@@ -23,6 +23,9 @@ type NodeRef = Arc<Node>;
 const ROOT_SHARD_COUNT: usize = 32;
 const NODE_SHARD_COUNT: usize = 8;
 
+/// Holders of a node above which crediting looks each candidate up instead of scanning.
+const FEW_HOLDERS: usize = 8;
+
 /// Create a children DashMap for non-root nodes
 #[inline]
 fn new_children_map() -> DashMap<char, NodeRef, CharHasherBuilder> {
@@ -549,19 +552,33 @@ impl Tree {
 
     /// The one of `tenants` holding `node` with the newest recorded timestamp, the first
     /// on a tie.
-    fn credit<'t>(node: &Node, tenants: impl Iterator<Item = &'t str>) -> Option<TenantId> {
-        let mut credited: Option<(u64, TenantId)> = None;
-        for tenant in tenants {
-            if let Some(entry) = node.tenant_last_access_time.get(tenant) {
-                if credited
-                    .as_ref()
-                    .is_none_or(|(newest, _)| entry.value() > newest)
-                {
-                    credited = Some((*entry.value(), Arc::clone(entry.key())));
+    fn credit(node: &Node, tenants: &[&str]) -> Option<TenantId> {
+        let mut credited: Option<(u64, usize, TenantId)> = None;
+        let mut consider = |accessed: u64, index: usize, tenant: &TenantId| {
+            let newer = credited.as_ref().is_none_or(|(newest, first, _)| {
+                accessed > *newest || (accessed == *newest && index < *first)
+            });
+            if newer {
+                credited = Some((accessed, index, Arc::clone(tenant)));
+            }
+        };
+        let holders = &node.tenant_last_access_time;
+        // A node few tenants hold is cheaper to scan than to look every candidate up in.
+        if holders.len() <= FEW_HOLDERS {
+            for entry in holders.iter() {
+                let name = entry.key().as_ref();
+                if let Some(index) = tenants.iter().position(|tenant| *tenant == name) {
+                    consider(*entry.value(), index, entry.key());
+                }
+            }
+        } else {
+            for (index, tenant) in tenants.iter().enumerate() {
+                if let Some(entry) = holders.get(*tenant) {
+                    consider(*entry.value(), index, entry.key());
                 }
             }
         }
-        let (_, tenant) = credited?;
+        let (_, _, tenant) = credited?;
         // Refresh 1 in 8 matches to reduce DashMap contention; LRU eviction only needs
         // approximate timestamps.
         let epoch = get_epoch();
@@ -577,14 +594,20 @@ impl Tree {
     /// tie ("empty" if none holds the root). `insert` records a timestamp only where a text
     /// ends or a node is created, so on a shared node this is usually its creator.
     pub fn prefix_match_among(&self, text: &str, tenants: &[&str]) -> PrefixMatchResult {
-        let (node, matched_chars) = self.deepest_match(text, |node| {
-            tenants
-                .iter()
-                .any(|tenant| node.tenant_last_access_time.contains_key(*tenant))
-        });
+        // Walk freely first: a tenant of the deepest node holds the whole path, and one of
+        // them is usually a candidate. Walk only through candidates' nodes when none is.
+        let (mut node, mut matched_chars) = self.deepest_match(text, |_| true);
+        let mut tenant = Self::credit(&node, tenants);
+        if tenant.is_none() {
+            (node, matched_chars) = self.deepest_match(text, |node| {
+                tenants
+                    .iter()
+                    .any(|tenant| node.tenant_last_access_time.contains_key(*tenant))
+            });
+            tenant = Self::credit(&node, tenants);
+        }
         PrefixMatchResult {
-            tenant: Self::credit(&node, tenants.iter().copied())
-                .unwrap_or_else(|| Arc::from("empty")),
+            tenant: tenant.unwrap_or_else(|| Arc::from("empty")),
             matched_char_count: matched_chars,
             input_char_count: text.chars().count(),
         }
@@ -896,8 +919,11 @@ impl Tree {
             .map(|entry| Arc::clone(entry.key()))
             .collect();
         PrefixMatchResult {
-            tenant: Self::credit(&node, tenants.iter().map(|tenant| tenant.as_ref()))
-                .unwrap_or_else(|| Arc::from("empty")),
+            tenant: Self::credit(
+                &node,
+                &tenants.iter().map(AsRef::as_ref).collect::<Vec<_>>(),
+            )
+            .unwrap_or_else(|| Arc::from("empty")),
             matched_char_count: matched_chars,
             input_char_count: text.chars().count(),
         }
@@ -1710,7 +1736,8 @@ mod tests {
     fn test_empty_string_input() {
         let tree = Tree::new();
 
-        // Insert empty string
+        // Insert empty string, twice so its timestamp is above 0 even from the first epoch
+        tree.insert("", "tenant1");
         tree.insert("", "tenant1");
 
         // Match empty string
@@ -2018,7 +2045,9 @@ mod tests {
     fn test_emoji_handling() {
         let tree = Tree::new();
 
-        // Emoji are multi-byte UTF-8
+        // Emoji are multi-byte UTF-8. Twice, so the timestamp is above 0 even from the
+        // first epoch.
+        tree.insert("hello 👋", "tenant1");
         tree.insert("hello 👋", "tenant1");
         tree.insert("hello 👋🌍", "tenant2");
 
