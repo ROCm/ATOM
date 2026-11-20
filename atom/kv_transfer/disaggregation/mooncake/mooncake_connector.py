@@ -2700,7 +2700,10 @@ class MooncakeConnector(KVConnectorBase):
                 )
             if refusal is not None:
                 logger.error("[PRODUCER] req %s refused: %s", req_id, refusal)
-                self._notify_transfer_result(request_data, success=False)
+                # Refused before any write: nothing this rank posted may still land.
+                self._notify_transfer_result(
+                    request_data, success=False, started_writes=False
+                )
                 return
             request_src_block_ids = request_data.get("src_block_ids")
             final_src_slot = -1

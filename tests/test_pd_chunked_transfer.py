@@ -2628,14 +2628,18 @@ def test_split_producer_refuses_a_consumer_without_draft_marks():
             c._notify_transfer_result.assert_called_once_with(req, success=True)
         else:
             assert c.transfer_engine.writes.empty()
-            c._notify_transfer_result.assert_called_once_with(req, success=False)
+            c._notify_transfer_result.assert_called_once_with(
+                req, success=False, started_writes=False
+            )
     # Unchunked, the refusal comes before any write too.
     c, _, req, _, _ = producer()
     c._draft_rows_split = True
     req["chunked_transfer"] = False
     c._execute_transfer(req)
     assert c.transfer_engine.writes.empty()
-    c._notify_transfer_result.assert_called_once_with(req, success=False)
+    c._notify_transfer_result.assert_called_once_with(
+        req, success=False, started_writes=False
+    )
     c._draft_rows_split = False
     assert c._draft_row_fence({}) is None
     assert c._draft_boundary_fence({}, None) is None
@@ -2652,7 +2656,13 @@ def test_split_producer_hands_off_only_to_a_decode_reading_from_v_on(read_from):
     state.finish({"first_token_id": 42, "draft_rows_from": 8})
     dispatch(c, req)
     assert not c.transfer_engine.writes.empty()
-    c._notify_transfer_result.assert_called_once_with(req, success=read_from >= 8)
+    if read_from >= 8:
+        c._notify_transfer_result.assert_called_once_with(req, success=True)
+    else:
+        # Its chunks were written, so the decode holds the failure.
+        c._notify_transfer_result.assert_called_once_with(
+            req, success=False, started_writes=True
+        )
     assert ("prefill_handoff" in req) == (read_from >= 8)
 
 
@@ -2692,7 +2702,9 @@ def test_a_non_chunked_echo_must_be_the_producers_own_boundary(
         c._notify_transfer_result.reset_mock()
         c._execute_transfer(request)
         assert c.transfer_engine.writes.empty()
-        c._notify_transfer_result.assert_called_once_with(request, success=False)
+        c._notify_transfer_result.assert_called_once_with(
+            request, success=False, started_writes=False
+        )
     assert c._draft_boundary_fence({**req, "draft_rows_from": 8}, 8) is None
     below = {**req, "draft_rows_from": 8, "consumer_draft_read_from": 4}
     assert "reads from token 4" in c._draft_boundary_fence(below, 8)
@@ -2703,7 +2715,9 @@ def test_a_non_chunked_echo_must_be_the_producers_own_boundary(
     c._notify_transfer_result.reset_mock()
     c._execute_transfer(request)
     assert c.transfer_engine.writes.empty()
-    c._notify_transfer_result.assert_called_once_with(request, success=False)
+    c._notify_transfer_result.assert_called_once_with(
+        request, success=False, started_writes=False
+    )
 
 
 def test_split_producer_never_writes_over_the_consumers_cached_blocks():
@@ -2716,7 +2730,9 @@ def test_split_producer_never_writes_over_the_consumers_cached_blocks():
     state.finish({"first_token_id": 42, "draft_rows_from": 0})
     dispatch(c, req)
     assert c.transfer_engine.writes.empty()
-    c._notify_transfer_result.assert_called_once_with(req, success=False)
+    c._notify_transfer_result.assert_called_once_with(
+        req, success=False, started_writes=False
+    )
     marked = {"consumer_draft_read_from": 0, "chunked_transfer": True}
     full = {**marked, "consumer_hit_blocks": 2, "num_computed_blocks": 0}
     assert "writes over 2 blocks" in c._draft_row_fence(full)
