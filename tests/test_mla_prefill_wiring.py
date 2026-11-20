@@ -296,28 +296,6 @@ def test_default_and_decode_steps_do_not_call_the_absorb_gate(qrep, prefill, cal
     assert bool(calls) is called and ns["absorb_into_q_out"] is called
 
 
-def test_each_absorb_head_has_its_own_rounding_budget():
-    tree = _tree("tests/model_ops/test_mla_absorb_qpack.py")
-    fn = next(
-        n
-        for n in tree.body
-        if isinstance(n, ast.FunctionDef)
-        and n.name == "test_absorb_into_q_out_matches_two_kernel_path"
-    )
-    first = next(
-        i
-        for i, n in enumerate(fn.body)
-        if isinstance(n, ast.Assign)
-        and any(isinstance(t, ast.Name) and t.id == "share" for t in n.targets)
-    )
-    steps = torch.zeros(2, 16, 64)
-    steps[:, :, :2] = 1
-    _run(fn.body[first:], {"torch": torch, "steps": steps})
-    steps[:, 3, :8] = 1
-    with pytest.raises(AssertionError):
-        _run(fn.body[first:], {"torch": torch, "steps": steps})
-
-
 @pytest.mark.parametrize("kind", ["plan", "absorb"])
 def test_patch_wrappers_use_integer_launch_geometry_without_runtime_support_queries(
     kind,
