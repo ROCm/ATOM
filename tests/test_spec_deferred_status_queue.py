@@ -1,22 +1,24 @@
+from __future__ import annotations
+
 from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
 import pytest
+from aiter_stub import atom_without_aiter
 
-# On the module, not on "aiter" -- see tests/test_dspark.py for why a name-only
-# guard passes on the non-GPU runner and then aborts collection.
-pytest.importorskip(
-    "atom.model_engine.model_runner",
-    reason="requires AITER to import model_runner",
-    exc_type=ImportError,
-)
 
-from atom.model_engine.model_runner import (
-    ModelRunner,
-    _kv_config_has_producer,
-    tokenIDProcessor,
-)
+@pytest.fixture(scope="module", autouse=True)
+def load_runner():
+    global ModelRunner, _kv_config_has_producer, tokenIDProcessor
+    with atom_without_aiter() as load:
+        module = load("atom.model_engine.model_runner")
+        ModelRunner = module.ModelRunner
+        _kv_config_has_producer = module._kv_config_has_producer
+        tokenIDProcessor = module.tokenIDProcessor
+        yield
+
+
 from atom.model_engine.scheduler import ScheduledBatch, defers_output
 from atom.spec_decode.status import SpecStatusQueue
 from atom.utils.selector import Family

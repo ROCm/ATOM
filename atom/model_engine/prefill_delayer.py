@@ -12,7 +12,7 @@ forward carrying 500 of a 16384-token budget wastes ~97% of that forward.
 The delayer has two related jobs: **hold back prefill admission until the
 accumulated prefill is worth a forward, then release** — Nagle's algorithm for
 prefill — and optionally protect a fixed number of decode passes after every
-prefill. While it holds, decode keeps running. Coalescing hold episodes are
+prefill-only forward. While it holds, decode keeps running. Coalescing hold episodes are
 bounded; the decode interval, backlog, and execution add to observed TTFT.
 
 Single-rank / TP-only mode
@@ -283,6 +283,7 @@ class PrefillDelayer:
         # buffer / episode state
         "_rank",
         "_reduce_buf",
+        "_reduce_np",
         "_stall_count",
         "_stat_adapt_cycles",
         "_stat_adapt_hold_ticks",
@@ -444,6 +445,7 @@ class PrefillDelayer:
             dtype=torch.int64,
             device="cpu",
         )
+        self._reduce_np = self._reduce_buf.numpy()
         # adaptive admission state (see the module-level comment)
         self._adapt_dec_fit = _EwFit(_DEC_HALF_LIFE)
         self._adapt_pf_fit = _EwFit(_PF_HALF_LIFE)
@@ -610,9 +612,9 @@ class PrefillDelayer:
                 partials plus waiting heads that fit the free seq slots.
                 None falls back to `waiting_requests`.
             prefill_budget: the prefill tokens one step can admit on this rank
-                (`Scheduler._prefill_limits().tokens`): ``max_num_batched_tokens`` less
-                the decode-first reserve under mixed batching. None means the
-                whole batch budget.
+                after reserving decode work. Mixed scheduling leaves a 1/8 token
+                floor when decode pages fit, or zero under page pressure.
+                None means the whole batch budget.
         """
         # KV + queue-age bounds are gated on this rank actually having prefill to
         # push (firing when this rank can't admit anything would be a no-op).
@@ -642,26 +644,26 @@ class PrefillDelayer:
             and oldest_waiting_age_ms >= self.max_queue_ms
         )
 
-        self._reduce_buf[0] = 1 if prefillable else 0
+        self._reduce_np[0] = 1 if prefillable else 0
         # A blocked rank counts toward alignment but can admit none of its
         # pending tokens, so they must not fill the forward.
-        self._reduce_buf[1] = int(pending_tokens) if prefillable else 0
-        self._reduce_buf[2] = int(running_decode_batch)
-        self._reduce_buf[3] = 1 if kv_high else 0
-        self._reduce_buf[4] = 1 if kv_low else 0
-        self._reduce_buf[5] = 1 if has_partial else 0
-        self._reduce_buf[6] = 1 if queue_hot else 0
-        self._reduce_buf[7] = 1 if self._prefill_executed_since_last_decision else 0
-        self._reduce_buf[8] = int(arrived_requests)
-        self._reduce_buf[9] = 1 if blocked else 0
-        self._reduce_buf[10] = 1 if unreachable else 0
-        self._reduce_buf[11] = 1 if self._prefill_only_since_last_decision else 0
+        self._reduce_np[1] = int(pending_tokens) if prefillable else 0
+        self._reduce_np[2] = int(running_decode_batch)
+        self._reduce_np[3] = 1 if kv_high else 0
+        self._reduce_np[4] = 1 if kv_low else 0
+        self._reduce_np[5] = 1 if has_partial else 0
+        self._reduce_np[6] = 1 if queue_hot else 0
+        self._reduce_np[7] = 1 if self._prefill_executed_since_last_decision else 0
+        self._reduce_np[8] = int(arrived_requests)
+        self._reduce_np[9] = 1 if blocked else 0
+        self._reduce_np[10] = 1 if unreachable else 0
+        self._reduce_np[11] = 1 if self._prefill_only_since_last_decision else 0
         if prefill_budget is None:
             prefill_budget = self.max_num_batched_tokens
-        self._reduce_buf[12] = int(prefill_budget) if prefillable else 0
+        self._reduce_np[12] = int(prefill_budget) if prefillable else 0
         if self._cost_slots:
-            self._reduce_buf[_FIXED_SLOTS : self._gate_at] = 0
-            self._reduce_buf[_FIXED_SLOTS + self._rank] = int(prefill_cost)
+            self._reduce_np[_FIXED_SLOTS : self._gate_at] = 0
+            self._reduce_np[_FIXED_SLOTS + self._rank] = int(prefill_cost)
         # one scheduler step since the previous decision (0: none yet, or untimed)
         step_s = 0.0
         if self._cost_gate:

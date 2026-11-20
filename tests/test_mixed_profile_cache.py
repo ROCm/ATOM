@@ -19,8 +19,9 @@ def builder_cls():
 
 
 @pytest.mark.parametrize("fail_forward", [False, True])
+@pytest.mark.parametrize("independent_draft", [False, True])
 def test_temporary_pool_restores_registered_buffers(
-    monkeypatch, fail_forward, builder_cls
+    monkeypatch, fail_forward, independent_draft, builder_cls
 ):
     module = torch.nn.Module()
     placeholder = torch.ones(1)
@@ -29,7 +30,11 @@ def test_temporary_pool_restores_registered_buffers(
     old_plan = SimpleNamespace()
     plan = SimpleNamespace(entries={})
     old_plan.with_paged_entries = lambda blocks: plan
-    runner = SimpleNamespace(model=module, pool_plan=old_plan)
+    runner = SimpleNamespace(
+        model=module,
+        pool_plan=old_plan,
+        config=SimpleNamespace(speculative_config=None),
+    )
     weak_pools = []
 
     def allocate(**kwargs):
@@ -52,12 +57,27 @@ def test_temporary_pool_restores_registered_buffers(
         build_kv_cache_tensor=bind,
         _invalidate_pool_caches=lambda: None,
     )
+    runner.attn_metadata_builder = builder
+    draft = torch.nn.Module()
+    draft.register_buffer("kv_cache", placeholder)
+    if independent_draft:
+        runner.config.speculative_config = object()
+        runner.drafter = SimpleNamespace(model=draft)
+
+        def bind_draft(layer):
+            layer.kv_cache = runner.test_pool[24:32]
+            return layer.kv_cache
+
+        runner.draft_kv_builder = SimpleNamespace(build_kv_cache_tensor=bind_draft)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
 
     def profile():
         with builder_cls.temporary_profile_cache(builder, 64):
             assert module.kv_cache.numel() == 8
             assert module.scale.numel() == 8
+            if independent_draft:
+                assert draft.kv_cache.numel() == 8
+                assert draft.kv_cache.data_ptr() == runner.test_pool[24:].data_ptr()
             if fail_forward:
                 raise RuntimeError("forward failed")
 
@@ -69,7 +89,38 @@ def test_temporary_pool_restores_registered_buffers(
     gc.collect()
     assert module.kv_cache is placeholder
     assert module.scale is placeholder
+    assert draft.kv_cache is placeholder
     assert not hasattr(module, "new_view")
     assert not hasattr(runner, "test_pool")
     assert runner.pool_plan is old_plan
     assert all(ref() is None for ref in weak_pools)
+
+
+def test_binding_falls_back_only_for_unrecognized_draft_modules():
+    from atom.model_engine.kv_cache_binding import kv_cache_bindings
+
+    target, draft, shared = object(), object(), object()
+    target_calls, draft_calls = [], []
+
+    def target_bind(module):
+        target_calls.append(module)
+        return "target" if module is target else "shared"
+
+    def draft_bind(module):
+        draft_calls.append(module)
+        return "draft" if module is draft else None
+
+    runner = SimpleNamespace(
+        model=SimpleNamespace(modules=lambda: [target]),
+        drafter=SimpleNamespace(model=SimpleNamespace(modules=lambda: [draft, shared])),
+        config=SimpleNamespace(speculative_config=object()),
+        attn_metadata_builder=SimpleNamespace(build_kv_cache_tensor=target_bind),
+        draft_kv_builder=SimpleNamespace(build_kv_cache_tensor=draft_bind),
+    )
+    assert list(kv_cache_bindings(runner)) == [
+        (target, "target"),
+        (draft, "draft"),
+        (shared, "shared"),
+    ]
+    assert target_calls == [target, shared]
+    assert draft_calls == [draft, shared]
