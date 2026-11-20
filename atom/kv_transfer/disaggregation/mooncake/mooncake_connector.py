@@ -501,9 +501,12 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         self._pending_chunked_admissions: dict[ReqId, TransferId] = {}
         self.host_ip = get_ip()
 
-        # Pending requests: req_id -> (Sequence, block_table)
-        self._reqs_need_recv: dict[ReqId, tuple[Any, list[int]]] = {}
-        self._reqs_need_save: dict[ReqId, tuple[Any, list[int]]] = {}
+        # Pending requests: req_id -> (Sequence, block ids, state slot).
+        # Recv and chunked save entries hold the full block table; build_connector_meta
+        # trims chunked saves to the prompt's pages (_prompt_block_ids). A non-chunked
+        # save is queued already trimmed.
+        self._reqs_need_recv: dict[ReqId, tuple[Any, list[int], int]] = {}
+        self._reqs_need_save: dict[ReqId, tuple[Any, list[int], int]] = {}
 
         # Source-block ownership: the scheduler frees a finished request's HBM
         # only once every connector stops claiming it. Claimed in
