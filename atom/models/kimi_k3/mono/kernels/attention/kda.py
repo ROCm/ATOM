@@ -1026,7 +1026,8 @@ def kda_stage(c, req, h, ch):
 def state_late(s: int) -> bool:
     """Whether a KDA task issues its initial state rows after its last poll
     (``kda_gates``) rather than with its other inputs: vmcnt counts loads in
-    issue order, so polls issued behind 64 KB of state wait for all of it.
+    issue order, so polls issued behind a head's state (64 KB at fp32, 32 KB
+    on an fp16 pool) wait for all of it.
     Below 8 rows the gates are too short to cover the state's latency: it
     goes with the other inputs."""
     return s >= 8

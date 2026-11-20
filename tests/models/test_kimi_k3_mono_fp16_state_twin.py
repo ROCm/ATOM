@@ -11,10 +11,10 @@ but the pool must be bit-equal -- the core rows, the prefix, the conv window,
 ReplaySSM's records -- and the fp16 pool must be the twin's rounded to nearest.
 
 The cases reach every store: each token's state (a plain decode, a spec
-verify) and, under ReplaySSM, the checkpoint a step resumes from and the one a
-flush folds the records into, on the chunk tasks and on the head tasks
-(``head_tasks``). Which slots changed is checked too, so a build that stored
-nothing would not pass as one that stored the right thing.
+verify) and, under ReplaySSM, the checkpoint a flush folds the records into,
+on the chunk tasks and on the head tasks (``head_tasks``). Which slots changed
+is checked too, so a build that stored nothing would not pass as one that
+stored the right thing.
 """
 
 from dataclasses import dataclass, replace
