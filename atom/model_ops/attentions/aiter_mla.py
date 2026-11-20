@@ -1990,6 +1990,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         request's row of `dcp_indexer_fp4_block_tables` pages its keys as its
         own block table does and the scorer's columns are the request's own.
 
+        `layout` selects PRESHUFFLE page/row/scale-row indices or MFMA int64
+        page/row indices and full-plane offsets for each row's four scale bytes.
+        Both read and stage metadata are shared by all indexer layers.
+
         The read formula must track `cp_gather_indexer_k_quant_cache`, the FP8
         plane's gather, which the FP4 planes have no equivalent of. Its padded
         indices stay inside the sequence's own blocks, so the staging read
@@ -2006,8 +2010,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         stage = np.repeat(first_page[:bs] * block - g_cu[:bs], g_lens) + np.arange(
             int(g_cu[bs]), dtype=np.int64
         )
-        # Page / row / e8m0 row of both slot lists, built once per forward, not
-        # per layer: one upload, one launch.
+        # Upload both slot lists together; derive the layout-specific metadata
+        # once per forward, rather than rebuilding it in every layer.
         slots = upload_numpy(
             np.concatenate([read, stage]).astype(np.int32), self.device
         )

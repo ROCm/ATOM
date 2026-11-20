@@ -2,7 +2,6 @@
 """CPU byte contracts for the production DCP FP4 metadata and staging path."""
 
 import ast
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -228,16 +227,14 @@ def test_prefill_builder_passes_the_active_layout(staging, layout):
 
 
 @pytest.mark.parametrize("backend", ["aiter_mla", "kimi_mla_gdn_attn"])
-def test_native_bindings_keep_mfma_allocator_byte_types(monkeypatch, backend):
+def test_native_bindings_keep_mfma_allocator_byte_types(backend):
+    from atom.config import KVCacheTensor
+
     path = Path(__file__).parents[1] / "atom/model_ops/attentions" / f"{backend}.py"
     bind = next(
         node
         for node in ast.walk(ast.parse(path.read_text()))
         if isinstance(node, ast.FunctionDef) and node.name == "build_kv_cache_tensor"
-    )
-    # Only the return record is stubbed; allocator and binding bodies are real.
-    monkeypatch.setitem(
-        sys.modules, "atom.config", SimpleNamespace(KVCacheTensor=SimpleNamespace)
     )
     namespace = {"MLA_ROWS": "mla"}
     exec(  # noqa: S102 -- runs production binding without GPU backend imports
@@ -262,6 +259,7 @@ def test_native_bindings_keep_mfma_allocator_byte_types(monkeypatch, backend):
         kv_pool=pool,
     )
     record = namespace["build_kv_cache_tensor"](builder, module)
+    assert isinstance(record, KVCacheTensor)
     cache = module.indexer.k_cache
     for field, bound, published in (
         ("index", cache.kv_cache[0], record.index_cache),
