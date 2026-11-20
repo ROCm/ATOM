@@ -728,6 +728,7 @@ def test_an_expired_request_settles_after_its_queued_scatter():
     dest.pump()
     assert torch.equal(dest.regions[0], before)  # the failed request is skipped
     assert dest.finished == [("r", True)]
+    assert dest.held == {"r": True}  # its silent stage may still write
     assert dest.credits() == [("stage0", [s0[0]])]
 
 

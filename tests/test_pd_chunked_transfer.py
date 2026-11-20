@@ -271,6 +271,31 @@ def test_bad_prompt_or_block_geometry_fails_before_writing():
         )
 
 
+def test_a_failed_final_state_send_counts_as_written():
+    c, state, req, _, _ = producer()
+    # D has every block cached: the reader's only write is the final state.
+    req.update(has_slot_regions=True, num_computed_blocks=3, dst_block_ids=[])
+    c._execute_block_slot_transfer = MagicMock(return_value=False)
+    publish(state, 10)
+    state.finish({"first_token_id": 42})
+    dispatch(c, req)
+    c._execute_block_slot_transfer.assert_called_once()
+    c._notify_transfer_result.assert_called_once_with(
+        req, success=False, started_writes=True
+    )
+    assert state.started_writes
+
+
+def test_a_refused_claim_reports_that_it_started_no_writes():
+    c, state, req, _, _ = producer()
+    state.cancel()  # Not retired yet: get_finished() has not run.
+    dispatch(c, req)
+    assert c.transfer_engine.writes.empty()
+    c._notify_transfer_result.assert_called_once_with(
+        req, success=False, started_writes=False
+    )
+
+
 def consumer(expected=2):
     c = mc.MooncakeConnector.__new__(mc.MooncakeConnector)
     c.is_producer = False

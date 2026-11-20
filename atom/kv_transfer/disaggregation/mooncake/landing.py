@@ -763,7 +763,7 @@ class LandingReceiver:
                     expired.append((req_id, list(silent)))
                     outcome = self._settle_locked(req_id, request)
                     if outcome is not None:
-                        outcomes.append((req_id, outcome, True))
+                        outcomes.append((req_id, outcome, request.failed_after_write))
                 elif (
                     not request.stall_logged and now - request.started_at > _STALL_LOG_S
                 ):

@@ -4569,13 +4569,8 @@ class MooncakeConnector(KVConnectorBase):
     ) -> None:
         """Publish a finished receive and let stage-0 free its page table.
 
-        A failure is reported only ``ATOM_PD_FAILED_WRITE_HOLD_S`` later
-        (``_report_held_failures``): Mooncake gives up on a sync write without
-        cancelling the work it posted, so a failed write may still land in
-        the request's pages, which the scheduler frees once it hears of the
-        failure (it aborts the request). The staging row and stage-0's page
-        table stay held as long. A failure no failed rank had started writing
-        (``failed_after_write=False``) is reported at once.
+        A failure is reported at once, or ``ATOM_PD_FAILED_WRITE_HOLD_S`` later,
+        its pages held, if a failed write may still land (``failed_after_write``).
         """
         with self._completion_lock:
             pending_handoff = self._pending_handoffs.pop(req_id, None)
