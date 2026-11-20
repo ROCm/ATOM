@@ -212,8 +212,9 @@ def native_quant_linear(
 ):
     """FP8 32x32/1x32 or W4A8 1x32 GEMM; inputs and weights stay native.
 
-    Weight scales remain compact. FP8 prefers AITER's configured GEMM interface
-    and falls back to local kernels on older AITER builds. An opt-in native
+    Weight scales remain compact. FP8 uses AITER's configured GEMM interface;
+    the local FP8 kernels are for a build without it, which no linear reaches
+    (`native_group32_runs_bf16` needs AITER's group32 query). An opt-in native
     MXFP8 1x32 preshuffle weight is sent through AITER's configured preshuffled
     group32 GEMM, whose mxscale table selects the gfx950 MXFP8 backend.
     Otherwise a ``weight_preshuffled`` (16, 16) FP8 weight is read by AITER's
