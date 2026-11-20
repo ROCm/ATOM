@@ -501,6 +501,20 @@ def test_lmcache_metadata_rejects_duplicate_lookup_scope(monkeypatch):
         offcfg.build_lmcache_metadata(_config(), cfg, 4, 0)
 
 
+@pytest.mark.parametrize("kv_dtype", ["fp4", "nvfp4"])
+def test_lmcache_metadata_reports_fp4_pages_as_uint8(monkeypatch, kv_dtype):
+    import torch
+
+    _install_metadata_modules(monkeypatch)  # its d_dtypes has no FP4 entry
+    config = _config()
+    config.kv_cache_dtype = kv_dtype
+    config.index_cache_dtype = kv_dtype
+
+    metadata = offcfg.build_lmcache_metadata(config, _lmcache_config(), 4, 0)
+
+    assert metadata.kv_dtype is torch.uint8
+
+
 def test_lmcache_metadata_accepts_tuple_lookup_scope(monkeypatch):
     metadata_type = _install_metadata_modules(monkeypatch)
     cfg = _lmcache_config()
