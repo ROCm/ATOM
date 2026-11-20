@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
-"""Which requests the sparse decode runs under the MXFP4 index cache, and that
-scorer's buffers (CPU, aiter importable; the scorer itself is in
+"""Which requests the sparse decode runs, under the MXFP4 index cache and the others,
+and that scorer's buffers (CPU, aiter importable; the scorer itself is in
 test_minimax_m3_mxfp4_index.py)."""
 
 import types
@@ -66,21 +66,24 @@ def test_the_scorer_buffers_are_one_workspace_and_a_map_per_decode_ubatch(
     )
 
 
-@pytest.mark.parametrize("phase", ["decode", "prefill"])
+@pytest.mark.parametrize(
+    "phase,indexer_cp", [("decode", False), ("decode", True), ("prefill", False)]
+)
 @pytest.mark.parametrize("kv,index", [("fp4", "fp4"), ("fp8", "fp4"), ("fp8", "fp8")])
 @pytest.mark.parametrize("q_rows", [6, 12])  # exactly the metadata's rows / a DP pad
 def test_the_sparse_attention_runs_only_the_rows_the_metadata_covers(
-    monkeypatch, phase, kv, index, q_rows
+    monkeypatch, phase, indexer_cp, kv, index, q_rows
 ):
-    """One row rule for decode and prefill. With the MXFP4 index the scorer, selector
-    and attention get the rows the metadata covers; the pad rows past them are never
-    read and the output is zero there. Another index cache keeps every row."""
+    """A decode, under indexer CP too, runs the rows its metadata covers with every
+    index cache, a prefill with the MXFP4 index: the scorer, selector and attention
+    get those rows, the pad rows past them are never read and the output is zero
+    there. Another index cache's prefill keeps every row."""
     pytest.importorskip("aiter")
     from atom.model_ops import attention_mha
     from atom.model_ops.minimax_m3 import index_topk, sparse_attn
 
     batch, mq, heads = 3, 2, 1
-    rows = batch * mq if index == "fp4" else q_rows
+    rows = batch * mq if index == "fp4" or phase == "decode" else q_rows
     seen = {}
 
     def topk(idx_q, cache, block_table, *a, **kw):
@@ -110,7 +113,8 @@ def test_the_sparse_attention_runs_only_the_rows_the_metadata_covers(
     layer.kv_cache_dtype, layer.index_cache_dtype = kv, index
     layer._sparse_pa_mxfp4, layer._select_page_kwargs = attend_fp4, {}
     layer.skip_index_topk, layer.index_topk_cache_state = False, {}
-    layer.indexer_cp_group = None
+    layer.indexer_cp_group = object() if indexer_cp else None
+    layer._cp_index_topk_decode = lambda idx_q, bt, sl, *a, **kw: topk(idx_q, 0, bt, sl)
     layer.topk, layer.init_blocks, layer.local_blocks = 2, 1, 0
     layer.num_kv_heads, layer.scale = 1, 1.0
     layer.index_cache, layer.layer_num, layer.sparse_layer_ordinal = None, 0, 0
@@ -144,12 +148,13 @@ def test_the_sparse_attention_runs_only_the_rows_the_metadata_covers(
     "mxfp4, scheduled, rows, q, ubatches, want",
     [
         (True, 3, 24, 8, None, 3),  # a DP step padded past its requests: rows decide
-        (False, 3, 24, 8, None, 8),  # the other index caches keep the padded batch
+        (False, 3, 6, 2, None, 3),  # any index: 3 live of 8 beside a prefilling peer
+        (False, 8, 16, 2, None, 8),  # a unified step keeps the whole batch
         (True, 9, 24, 8, None, ValueError),  # fewer rows than scheduled: refused
         (True, 8, 8, 1, [1, 2], "split"),  # a split decode builds no whole-batch scorer
     ],
 )
-def test_the_decode_row_rule_and_the_split_step_are_the_mxfp4_indexs(
+def test_the_decode_row_rule_and_the_mxfp4_split_step(
     mod, monkeypatch, mxfp4, scheduled, rows, q, ubatches, want
 ):
     running_bs = 8
@@ -191,6 +196,7 @@ def test_the_decode_row_rule_and_the_split_step_are_the_mxfp4_indexs(
         assert seen[0]["index_scorer"] is None
     else:
         assert seen[0]["seq_lens"].shape[0] == want
+        assert seen[0]["block_table"].shape[0] == want
 
 
 @pytest.mark.parametrize("planned", [True, False])
