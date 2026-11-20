@@ -56,7 +56,7 @@ def _fused_quant_dtype(norm: RMSNorm | None) -> torch.dtype | None:
 class AttnRes(nn.Module):
     """One attention-residual mixing site.
 
-    Mixes the B candidates of ``block_residual`` with a running ``prefix_sum``:
+    Mixes the active B candidates of a block bank with a running ``prefix_sum``:
     rmsnorm each of the B+1, score = <normed, score_weight>, softmax over B+1,
     weighted sum. ``proj`` and ``norm`` define that scoring; their product is a
     load-time constant folded into a single [H] vector (see ``score_weight``).
@@ -68,7 +68,7 @@ class AttnRes(nn.Module):
       False there is no mixing and no block state; forward degenerates to
       ``out_norm(prefix_sum + addends)``, i.e. the ordinary pre-norm residual
       step. ``proj``/``norm`` are then unused and may be None.
-    * ``block_residual`` empty vs populated -- with no candidates yet the
+    * the active bank prefix empty vs populated -- with no candidates yet the
       softmax is a no-op, so the same degenerate path applies.
     * ``out_norm`` -- the caller's rmsnorm OF THE RESULT. Passing one is what
       decides the fusion: it is folded into the kernel's store and the returned
@@ -112,10 +112,11 @@ class AttnRes(nn.Module):
         self.eps = 1e-6 if norm is None else _rms_eps(norm)
         self.out_eps = 1e-6 if out_norm is None else _rms_eps(out_norm)
         self.score_weight: torch.Tensor | None = None
-        # Set on a site handed the whole bank: it mixes the slots closed before
-        # layer `layer_idx`, which `maybe_close_block` writes.
+        # Decoder sites read the slots closed before their logical layer index;
+        # an unbounded site (the output mix) reads every supplied candidate.
         self.block_size = block_size
         self.layer_idx = layer_idx
+        self.num_blocks = None if block_size is None else -(-layer_idx // block_size)
 
     @property
     def out_quant_dtype(self) -> torch.dtype | None:
@@ -171,9 +172,16 @@ class AttnRes(nn.Module):
         if prefix_sum is None:
             prefix_sum, add_hidden, add_hidden2 = add_hidden, add_hidden2, None
         assert prefix_sum is not None
-        block_residual = self.window(block_residual)
-
-        if self.enabled and block_residual is not None and block_residual.shape[1] > 0:
+        if (
+            self.enabled
+            and block_residual is not None
+            and (
+                self.num_blocks
+                if self.num_blocks is not None
+                else block_residual.shape[1]
+            )
+            > 0
+        ):
             score_weight = self.score_weight
             if score_weight is None:  # loader hook did not run (plugin hosts)
                 self.process_weights_after_loading()
@@ -190,6 +198,7 @@ class AttnRes(nn.Module):
                 self.out_eps,
                 add_hidden2,
                 self.out_quant_dtype,
+                self.num_blocks,
             )
 
         # Nothing to mix (residuals off, or no candidates yet). Apply by hand
@@ -202,11 +211,15 @@ class AttnRes(nn.Module):
         return mixed, prefix_sum
 
     def window(self, block_residual: torch.Tensor | None) -> torch.Tensor | None:
-        """The bank's slots this site mixes. Sliced here, not by the caller: in
-        a compiled forward a view must not cross a graph split."""
-        if self.block_size is None or block_residual is None:
+        """Materialize the candidate view for auxiliary extraction.
+
+        Normal forwards pass the bound to the opaque op without creating a view.
+        """
+        if self.num_blocks is None or block_residual is None:
             return block_residual
-        return block_residual[:, : -(-self.layer_idx // self.block_size)]
+        if block_residual.shape[1] < self.num_blocks:
+            raise RuntimeError(f"expected a bank of >= {self.num_blocks} blocks")
+        return block_residual[:, : self.num_blocks]
 
     def maybe_close_block(
         self,

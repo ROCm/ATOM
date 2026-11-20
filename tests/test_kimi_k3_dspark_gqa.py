@@ -561,19 +561,22 @@ def _k3_target_stub(hidden=16, n_layers=16, block_size=4, enabled=True):
     import torch
 
     layer_cls = gpu_stack_import("atom.models.kimi_k3.model").KimiDecoderLayer
+    site_cls = gpu_stack_import("atom.model_ops.attention_residual").AttnRes
     torch.manual_seed(0)
     layers = []
     for i in range(n_layers):
+        site = site_cls(
+            torch.nn.Identity(),
+            torch.nn.Identity(),
+            enabled=enabled,
+            block_size=block_size,
+            layer_idx=i,
+        )
+        site.eps, site.out_eps = 1e-6, 1e-5
+        site.score_weight = torch.randn(hidden) * 0.1
         layer = types.SimpleNamespace(
             layer_idx=i,
-            self_attention_attn_res=types.SimpleNamespace(
-                enabled=enabled,
-                block_size=block_size,
-                layer_idx=i,
-                eps=1e-6,
-                out_eps=1e-5,
-                score_weight=torch.randn(hidden) * 0.1,
-            ),
+            self_attention_attn_res=site,
         )
         for name in ("check_aggregate_source", "aggregate_hidden_state"):
             setattr(layer, name, types.MethodType(getattr(layer_cls, name), layer))

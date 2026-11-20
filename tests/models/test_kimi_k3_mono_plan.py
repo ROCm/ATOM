@@ -23,7 +23,6 @@ from atom.models.kimi_k3.mono.config import (
     SUPPORTED_TP,
     Dims,
     layer_block,
-    num_blocks,
 )
 from atom.mono.plan.shard import shard_refusal
 
@@ -70,11 +69,10 @@ def test_attn_res_block_bookkeeping():
     assert layer_block(ATTN_RES_BLOCK) == (1, 1)
     assert layer_block(ATTN_RES_BLOCK + 1) == (2, -1)
     assert layer_block(LAYERS - 1) == (8, -1)
-    assert num_blocks(LAYERS) == 8
     # every write lands in a distinct slot inside the buffer
     writes = [w for _, w in map(layer_block, range(LAYERS)) if w >= 0]
     assert writes == sorted(set(writes))
-    assert max(writes) < num_blocks(LAYERS)
+    assert max(writes) == 7
 
 
 def _metadata(**over):

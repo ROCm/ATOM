@@ -227,14 +227,15 @@ def _apply_attn_res_impl(
     out_eps: float = 1e-6,
     add_hidden2: torch.Tensor | None = None,  # [T, H], folded the same way
     quant_dtype: torch.dtype | None = None,  # folded: y = per-token quant(y)
+    num_blocks: int | None = None,
 ) -> (
     tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 ):
     """Block-residual soft-attention mix: rmsnorm each of the B+1 candidates,
     score = <normed, score_weight>, softmax over B+1, weighted sum.
 
-    Candidates are the B rows of ``block_residual`` plus ``prefix_sum``, so
-    ``score_weight`` must already fold the rmsnorm gain into the scoring
+    Candidates are its first ``num_blocks`` rows (all rows when omitted) plus
+    ``prefix_sum``. ``score_weight`` must fold the rmsnorm gain into the scoring
     projection (see ``_attn_res_score_weight`` on the model side).
 
     Returns ``(mixed_output, prefix_out)``. When ``add_hidden`` (and optionally
@@ -254,6 +255,10 @@ def _apply_attn_res_impl(
     mix would hand the consumer an activation on the wrong scale entirely.
     """
     T, B, H = block_residual.shape
+    if num_blocks is not None:
+        if not 0 <= num_blocks <= B:
+            raise ValueError("num_blocks must fit the supplied block bank")
+        B = num_blocks
     Bp = B + 1
     do_add = add_hidden is not None
     do_add2 = add_hidden2 is not None
@@ -264,12 +269,12 @@ def _apply_attn_res_impl(
     if quant and not out_norm:
         raise ValueError("quant_dtype requires out_norm_weight")
     fp8_max = float(torch.finfo(quant_dtype).max) if quant else 1.0
-    # the kernel reads T and B by stride (i32 offsets) and H unit-stride, so a
-    # slice of a wider block bank needs no copy
+    # The active prefix is read by stride (i32 offsets); a wider bank needs no
+    # slice or copy when H is unit-stride.
     br = (
         block_residual
         if block_residual.stride(-1) == 1
-        else block_residual.contiguous()
+        else block_residual[:, :B].contiguous()
     )
     ps = prefix_sum.contiguous()
     sw = score_weight.contiguous()
@@ -343,6 +348,7 @@ def _apply_attn_res_op(
     eps: float,
     out_norm_weight: torch.Tensor | None = None,
     out_eps: float = 1e-6,
+    num_blocks: int | None = None,
 ) -> torch.Tensor:
     mixed_output, _ = _apply_attn_res_impl(
         prefix_sum,
@@ -351,6 +357,7 @@ def _apply_attn_res_op(
         eps,
         out_norm_weight=out_norm_weight,
         out_eps=out_eps,
+        num_blocks=num_blocks,
     )
     return mixed_output
 
@@ -362,6 +369,7 @@ def _apply_attn_res_op_fake(
     eps: float,
     out_norm_weight: torch.Tensor | None = None,
     out_eps: float = 1e-6,
+    num_blocks: int | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(prefix_sum)
 
@@ -383,6 +391,7 @@ def _apply_attn_res_add_op(
     out_norm_weight: torch.Tensor | None = None,
     out_eps: float = 1e-6,
     add_hidden2: torch.Tensor | None = None,
+    num_blocks: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return _apply_attn_res_impl(
         prefix_sum,
@@ -393,6 +402,7 @@ def _apply_attn_res_add_op(
         out_norm_weight=out_norm_weight,
         out_eps=out_eps,
         add_hidden2=add_hidden2,
+        num_blocks=num_blocks,
     )
 
 
@@ -405,6 +415,7 @@ def _apply_attn_res_add_op_fake(
     out_norm_weight: torch.Tensor | None = None,
     out_eps: float = 1e-6,
     add_hidden2: torch.Tensor | None = None,
+    num_blocks: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return torch.empty_like(prefix_sum), torch.empty_like(prefix_sum)
 
@@ -430,6 +441,7 @@ def _apply_attn_res_quant_op(
     out_norm_weight: torch.Tensor,
     out_eps: float,
     quant_dtype: torch.dtype,
+    num_blocks: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     y, y_scale, _ = _apply_attn_res_impl(
         prefix_sum,
@@ -439,6 +451,7 @@ def _apply_attn_res_quant_op(
         out_norm_weight=out_norm_weight,
         out_eps=out_eps,
         quant_dtype=quant_dtype,
+        num_blocks=num_blocks,
     )
     return y, y_scale
 
@@ -451,6 +464,7 @@ def _apply_attn_res_quant_op_fake(
     out_norm_weight: torch.Tensor,
     out_eps: float,
     quant_dtype: torch.dtype,
+    num_blocks: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return (
         torch.empty_like(prefix_sum, dtype=quant_dtype),
@@ -478,6 +492,7 @@ def _apply_attn_res_add_quant_op(
     out_eps: float,
     quant_dtype: torch.dtype,
     add_hidden2: torch.Tensor | None = None,
+    num_blocks: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return _apply_attn_res_impl(
         prefix_sum,
@@ -489,6 +504,7 @@ def _apply_attn_res_add_quant_op(
         out_eps=out_eps,
         add_hidden2=add_hidden2,
         quant_dtype=quant_dtype,
+        num_blocks=num_blocks,
     )
 
 
@@ -502,6 +518,7 @@ def _apply_attn_res_add_quant_op_fake(
     out_eps: float,
     quant_dtype: torch.dtype,
     add_hidden2: torch.Tensor | None = None,
+    num_blocks: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return (
         torch.empty_like(prefix_sum, dtype=quant_dtype),
@@ -531,12 +548,14 @@ def apply_attn_res(
     out_eps: float = 1e-6,
     add_hidden2: torch.Tensor | None = None,
     quant_dtype: torch.dtype | None = None,
+    num_blocks: int | None = None,
 ) -> tuple[torch.Tensor | tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
     """Dispatch an opaque custom op whose CUDA implementation selects by concrete T.
 
     ``out_norm_weight`` folds the caller's rmsnorm of the result into the kernel;
     the returned mixed output is then already normed and scaled by it.
     ``add_hidden2`` folds a second addend into the prefix (see the impl).
+    ``num_blocks`` bounds the active bank prefix without constructing a view.
 
     ``quant_dtype`` additionally folds the consuming GEMM's per-token quant in,
     making the first element of the returned pair a ``(quantized, scale)`` tuple
@@ -554,6 +573,7 @@ def apply_attn_res(
                 out_norm_weight,
                 out_eps,
                 quant_dtype,
+                num_blocks,
             )
             return (y, y_scale), prefix_sum
         y, y_scale, prefix_out = torch.ops.aiter.kimi_k3_apply_attn_res_add_quant(
@@ -566,6 +586,7 @@ def apply_attn_res(
             out_eps,
             quant_dtype,
             add_hidden2,
+            num_blocks,
         )
         return (y, y_scale), prefix_out
     if add_hidden is None:
@@ -573,7 +594,13 @@ def apply_attn_res(
             raise ValueError("add_hidden2 requires add_hidden")
         return (
             torch.ops.aiter.kimi_k3_apply_attn_res(
-                prefix_sum, block_residual, score_weight, eps, out_norm_weight, out_eps
+                prefix_sum,
+                block_residual,
+                score_weight,
+                eps,
+                out_norm_weight,
+                out_eps,
+                num_blocks,
             ),
             prefix_sum,
         )
@@ -586,4 +613,5 @@ def apply_attn_res(
         out_norm_weight,
         out_eps,
         add_hidden2,
+        num_blocks,
     )
