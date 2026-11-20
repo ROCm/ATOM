@@ -1317,7 +1317,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Initial ramp, armed only with a positive ATOM_PREFILL_DECODE_INTERVAL or the
     # adaptive admit policy (on there by default, "0" disables): while every DP
     # rank has a free seq slot, a waiting request, and work that fills
-    # target_fill of a prefill chunk by admission's own probe, prefill is
+    # target_fill of a prefill chunk by admission's own probe (or more than the
+    # batch budget can take), prefill is
     # released at once, ahead of the interval and the adaptive rule. It ends when
     # a rank cannot (or KV runs high) and re-arms once the group has no decode.
     "ATOM_PREFILL_INITIAL_RAMP": lambda: (

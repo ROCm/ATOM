@@ -891,6 +891,9 @@ class Scheduler:
         # hash. Keyed on advance_on_schedule, which only PP sets. Only a class
         # that must file at retire lands here; see `_finalize_prefill_chunk`.
         self._checkpoint_holds: dict[int, int] = {}
+        # Whether the last `_probe_local_prefill_work` stopped because the batch
+        # budget could not take the next request (the initial ramp's fill).
+        self._probe_filled_budget = False
 
         from atom.utils.forward_context import get_kvconnector
 
@@ -1149,6 +1152,7 @@ class Scheduler:
     def _probe_local_prefill_work(self) -> tuple[bool, int]:
         budget = self.max_num_batched_tokens
         pending = 0
+        self._probe_filled_budget = False
         if self._partial_prefill_count:
             for seq in self.running:
                 if not seq.is_partial_prefill:
@@ -1173,6 +1177,7 @@ class Scheduler:
                     break
         prefillable = pending > 0
         if pending >= budget or len(self.running) >= self.max_num_seqs:
+            self._probe_filled_budget = pending >= budget
             return prefillable, min(pending, budget)
         # A chunk counts the rows its forward computes, not the reused prefix.
         slots = self.max_num_seqs - len(self.running)
@@ -1214,11 +1219,11 @@ class Scheduler:
             chunk = self._prefill_chunk_for_budget(
                 remaining, budget - pending, pending, history_len=cached, kind=kind
             )
-            if (
-                chunk is None
-                or (atomic and chunk < remaining)
-                or self._waits_below_resume(seq, cached, chunk, resume)
-            ):
+            if chunk is None or (atomic and chunk < remaining):
+                # What the batch budget has left cannot take this request.
+                self._probe_filled_budget = True
+                break
+            if self._waits_below_resume(seq, cached, chunk, resume):
                 break
             chunk = self._preview_prefill_chunk(seq, cached, resume, chunk)
             prefillable = True
@@ -1229,6 +1234,7 @@ class Scheduler:
             if offload_resume and getattr(seq, "_counted_as_inflight_load", False):
                 parked -= 1
             if pending >= budget:
+                self._probe_filled_budget = True
                 return True, budget
             if slots == 0:
                 break
@@ -1357,10 +1363,13 @@ class Scheduler:
         """The initial ramp's signal for this rank: a fresh request waits for a
         free seq slot, and admission's own probe (`_probe_local_prefill_work`:
         checkpoint holds, atomic heads, in-flight prefixes and parking included)
-        fills target_fill of a prefill chunk. A resumable partial alone does
-        not: that is one long prompt, not empty slots. ``probed_tokens`` is the
-        probe's count where this tick already ran it. A local delayer with no
-        decode fires anyway, so it skips the probe."""
+        fills target_fill of a prefill chunk, or stops because what is left of
+        the batch budget cannot take the next request (without chunked prefill
+        whole prompts rarely pack to target_fill, yet the rank has more work
+        than one batch). A resumable partial alone does not: that is one long
+        prompt, not empty slots. ``probed_tokens`` is the probe's count where
+        this tick already ran it. A local delayer with no decode fires anyway,
+        so it skips the probe."""
         delayer = self.prefill_delayer
         if (
             not prefillable
@@ -1372,7 +1381,10 @@ class Scheduler:
             return False
         if probed_tokens is None:
             probed_tokens = self._local_prefill_pending_work()[1]
-        return probed_tokens >= delayer.target_fill * self.max_num_batched_tokens
+        return (
+            self._probe_filled_budget
+            or probed_tokens >= delayer.target_fill * self.max_num_batched_tokens
+        )
 
     def _estimate_prefill_chunk_cost(self) -> float:
         """Cost of the chunk this rank would prefill with the whole batch

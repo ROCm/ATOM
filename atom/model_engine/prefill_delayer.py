@@ -109,7 +109,7 @@ interval or the adaptive policy, the only rules that hold prefill back, the ramp
 starts armed and fires on every decision while every rank fills
 ``target_fill`` of a prefill chunk (``full_chunk``: a free seq slot, a waiting
 request, and admission's own probe of resumable partials plus slot-fitting
-waiting requests) and KV is below the high watermark: the same as a decode
+waiting requests reaching ``target_fill`` or the batch budget) and KV is below the high watermark: the same as a decode
 interval of 0 (and no adaptive wait) until the seq slots or the KV fill. One
 rank that cannot, e.g. a drained rank or a saturated one with no free seq slot,
 ends the ramp for the whole group once the group has decode. It stays off until the group has no decode

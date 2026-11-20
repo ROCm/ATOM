@@ -1925,6 +1925,37 @@ class TestInitialRampFullChunk:
         assert report["full_chunk"] is True  # 16 + 20 >= 32
         assert report["admittable_requests"] == 2
 
+    def test_a_budget_that_cannot_take_the_next_prompt_is_full(self, seq_factory):
+        """Without chunked prefill whole prompts rarely pack to target_fill:
+        40 tokens fit, the next 40 do not (24 left of 64). The rank still has
+        more work than one batch, so it counts as full (40 < 0.9 * 64)."""
+        sched = Scheduler(
+            MockConfig(
+                num_kvcache_blocks=100,
+                max_model_len=128,
+                max_num_seqs=4,
+                enable_chunked_prefill=False,
+            )
+        )
+        sched.add(seq_factory(list(range(10, 50))))
+        sched.add(seq_factory(list(range(50, 90))))
+        delayer = _RampDelayer()
+        delayer.target_fill = 0.9
+        assert self._report(sched, delayer)["full_chunk"] is True
+        # One 40-token prompt alone fits and leaves the budget unfilled.
+        sched = Scheduler(
+            MockConfig(
+                num_kvcache_blocks=100,
+                max_model_len=128,
+                max_num_seqs=4,
+                enable_chunked_prefill=False,
+            )
+        )
+        sched.add(seq_factory(list(range(10, 50))))
+        delayer = _RampDelayer()
+        delayer.target_fill = 0.9
+        assert self._report(sched, delayer)["full_chunk"] is False
+
     def test_a_partial_alone_is_not_a_full_chunk(self, seq_factory):
         """One long prompt's remaining chunks fill a chunk every tick, but no
         request waits for a slot: the ramp is for empty slots, not for it."""
