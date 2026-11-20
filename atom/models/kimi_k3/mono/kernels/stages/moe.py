@@ -13,7 +13,7 @@ lnorm and the final reduce run a token group at a time (``group_view``). The ori
 router and the latent down projection on every rank; here each rank computes
 its eighth and the rows are all-gathered over the peer buffer.
 
-    early (one task each, x from the input row; weights first):
+    early (one task each, x the row K2a's AttnRes stage publishes; weights first):
       router  (7 x 16 rows of this rank's 112 experts): fp32 logits -> every
               rank's RLOG
       latent  (28 x 16 rows of this rank's 448): bf16, quantized once a
@@ -520,8 +520,8 @@ def early_loads(c, kind, i, q):
 
 @traced
 def early_compute(c, kind, i, q, ops):
-    """Early task (i, q): x's K slice (the input row, or -- ``xflags`` -- the
-    row this launch's AttnRes stage publishes) against ``ops`` -> ``early_out``.
+    """Early task (i, q): x's K slice (the row this launch's AttnRes stage
+    publishes, once its ``xflags`` flags are up) against ``ops`` -> ``early_out``.
 
     The slice is staged a slab at a time (``gemv.slabs``). At every row count up
     to 8 that is one slab and the whole slice, as it always was; a wider step
@@ -535,10 +535,9 @@ def early_compute(c, kind, i, q, ops):
     scales = None
     if const_expr(early_w8(c, kind)):
         scales = gemv.pair_scales(c["args"]["w_sgu_s"], i * ROWS, tid)
-    if const_expr(c.get("xflags") is not None):
-        if tid < c["xflags"]:
-            c["poll"]([(c["xrdy"], tid, 1)])
-        gpu.barrier()
+    if tid < c["xflags"]:
+        c["poll"]([(c["xrdy"], tid, 1)])
+    gpu.barrier()
     if const_expr(groups(s) > 1):
         acc = early_units(
             c, q, klen, [op for sl_ops in ops for op in sl_ops], early_w8(c, kind)
@@ -552,8 +551,6 @@ def early_compute(c, kind, i, q, ops):
     # weights. ``range_constexpr`` + indexing, not ``enumerate``: this body is
     # AST-rewritten (``@traced``), and a ``for`` over an arbitrary Python
     # iterable with tuple unpacking is not a form the rewriter is meant to see.
-    src = c["xbuf"] if const_expr(c.get("xflags") is not None) else c["args"]["x"]
-    cm = CM_DEV if const_expr(c.get("xflags") is not None) else 0
     acc = None
     for sl in range_constexpr(len(plan)):
         k0 = plan[sl][0]
@@ -562,7 +559,7 @@ def early_compute(c, kind, i, q, ops):
             # the previous slab's readers before its LDS is overwritten
             gpu.barrier()
         gemv.rows_to_lds(
-            tid, src, n, sg, c["xl"], xrow, cm, ldk=HIDDEN, k0=q * klen + k0
+            tid, c["xbuf"], n, sg, c["xl"], xrow, CM_DEV, ldk=HIDDEN, k0=q * klen + k0
         )
         acc = gemv.mfmas(
             lane, wave, c["xl"], xrow, n, sg, ops[sl], acc, early_w8(c, kind)
@@ -581,8 +578,6 @@ def early_units(c, q, klen, ops, w8=False):
     tid, lane, wave, G = c["tid"], c["lane"], c["wave"], groups(c["S"])
     xrow = gemv.KGROUP + gemv.LDS_PAD
     bufs = [c["xl"], c["xl"] + TG * xrow // 2]
-    src = c["xbuf"] if const_expr(c.get("xflags") is not None) else c["args"]["x"]
-    cm = CM_DEV if const_expr(c.get("xflags") is not None) else 0
 
     def width(i):
         return min(gemv.KGROUP, klen - i * gemv.KGROUP)
@@ -593,12 +588,12 @@ def early_units(c, q, klen, ops, w8=False):
     def unit_loads(i, g):
         return gemv.rows_loads(
             tid,
-            src + fx.Int64(TG * g * HIDDEN * 2),
+            c["xbuf"] + fx.Int64(TG * g * HIDDEN * 2),
             rows(g),
             width(i),
             HIDDEN,
             k0=q * klen + i * gemv.KGROUP,
-            cm=cm,
+            cm=CM_DEV,
         )
 
     units = [(i, g) for i in range(len(ops)) for g in range(G)]
