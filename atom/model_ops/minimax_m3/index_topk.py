@@ -1090,8 +1090,8 @@ def _select_with_aiter(
     flat_score = score.view(rows, max_block)
     flat_idx = topk_idx.view(rows, topk)
     # The bounds length is in the key, not assumed equal to `rows`: a caller
-    # whose decode tokens are not `max_query_len` per request hands a shorter
-    # one, and that has to keep declining rather than hit a cached yes.
+    # whose decode tokens are not `max_query_len` per request hands one of
+    # another length, and that has to keep declining rather than hit a cached yes.
     topk_per_row_small_k, topk_per_row_small_k_supported = _small_k_selector()
     key = (rows, max_block, topk, n_valid_column_per_row.shape[0], score.device)
     served = _AITER_SERVES.get(key)
