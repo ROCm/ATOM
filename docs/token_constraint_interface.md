@@ -14,9 +14,10 @@ require torch. The Triton kernels are imported when the channel runs.
 ## Sampling boundary
 
 A request carries at most one rule, a grammar (JSON Schema or strict tool
-arguments) or a required channel. Request admission
-(`InputOutputProcessor.preprocess_fanout`, which `LLMEngine.add_request`, the
-API server and atomesh call) rejects a request with both. The OpenAI server
+arguments) or a required channel. Request admission rejects a request with
+both: `InputOutputProcessor.preprocess_fanout` for the API server and
+`LLMEngine.add_request`, and `codec.build_sequence` on the EngineCore for any
+other engine_v1 client, such as the atomesh standalone frontend. The OpenAI server
 already clears `required_channel` whenever it configures a grammar.
 
 `TokenConstraints` in `atom/model_engine/token_constraints.py` is the one

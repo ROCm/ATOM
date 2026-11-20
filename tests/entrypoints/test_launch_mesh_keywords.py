@@ -6,11 +6,16 @@ which no Rust test sees. The runner here is a fake that holds the entrypoint
 to the keywords the Rust signature declares.
 """
 
+import json
 import re
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
+
+from atom.entrypoints.atomesh import engine_spec
 from atom.entrypoints.atomesh import server as atomesh_server
 
 _PYTHON_RS = Path(__file__).resolve().parents[2] / "atom/mesh/src/python.rs"
@@ -44,6 +49,9 @@ class _Runner:
             "decode_urls": [],
         }
 
+    def tool_parser_names(self):
+        return []
+
     def launch_mesh(self, **kwargs):
         unknown = set(kwargs) - _launch_mesh_keywords()
         if unknown:
@@ -51,9 +59,18 @@ class _Runner:
         self.launches.append(kwargs)
 
 
+def main(argv, runner):
+    """`server.main()` over `argv`, with `runner` as the Rust runtime."""
+    with (
+        mock.patch.object(sys, "argv", ["atomesh", *argv]),
+        mock.patch.object(atomesh_server, "import_atomesh_runner", return_value=runner),
+    ):
+        atomesh_server.main()
+
+
 def test_mesh_only_launches_with_keywords_launch_mesh_takes():
     runner = _Runner()
-    atomesh_server.launch_atomesh(runner, ["mesh-only", "--port", "8000"])
+    main(["mesh-only", "--port", "8000"], runner)
     assert len(runner.launches) == 1
 
 
@@ -61,22 +78,46 @@ def test_standalone_launches_with_keywords_launch_mesh_takes():
     """The engine spec reaches `launch_mesh`, and the Cores are reaped after."""
     runner = _Runner()
     engine = mock.Mock()
-    args = atomesh_server.StandaloneArgs(
-        engine_args=SimpleNamespace(model="m", served_model_name=None),
-        mesh_args=[],
-        default_chat_template_kwargs={},
-    )
 
     def initialize_engine(_args):
         atomesh_server.engine = engine
 
+    tool_format = SimpleNamespace(parser=None, mesh_name=None)
     with (
+        mock.patch.object(atomesh_server, "check_standalone_model"),
+        mock.patch.object(atomesh_server, "load_tokenizer"),
+        mock.patch.object(atomesh_server, "apply_chat_template", return_value=None),
+        mock.patch.object(
+            atomesh_server, "default_reasoning_parser", return_value="qwen3"
+        ),
+        mock.patch.object(atomesh_server, "tool_call_format", return_value=tool_format),
         mock.patch.object(atomesh_server, "initialize_engine", initialize_engine),
         mock.patch.object(atomesh_server, "build_engine_spec", return_value="spec"),
         mock.patch.object(atomesh_server, "freeze_gc_heap"),
     ):
-        atomesh_server.serve_standalone(runner, args, None, [], None, None)
-    assert runner.launches == [
-        {"server_config": runner.launches[0]["server_config"], "engine_spec": "spec"}
-    ]
+        main(["--model", "/m"], runner)
+    [launch] = runner.launches
+    assert set(launch) == {"server_config", "engine_spec"}
+    assert launch["engine_spec"] == "spec"
     engine.close.assert_called_once_with()
+
+
+def test_standalone_refuses_before_it_imports_the_rust_runtime():
+    """A model standalone cannot serve is refused even where libmesh is not
+    installed, instead of failing on the import first."""
+    pd = json.dumps({"kv_role": "kv_producer"})
+    with (
+        mock.patch.object(
+            engine_spec, "load_custom_message_encoder", return_value=None
+        ),
+        mock.patch.object(
+            sys, "argv", ["atomesh", "--model", "/m", "--kv-transfer-config", pd]
+        ),
+        mock.patch.object(
+            atomesh_server,
+            "import_atomesh_runner",
+            side_effect=ModuleNotFoundError("atomesh_runner"),
+        ),
+        pytest.raises(ValueError, match="P/D"),
+    ):
+        atomesh_server.main()

@@ -247,8 +247,9 @@ def test_the_template_rust_renders_is_the_one_probed(tmp_path):
 
 
 def test_launch_decides_everything_before_weights_and_reaps_after(monkeypatch):
-    """The refusals and the template, reasoning and tool decisions run before
-    the engine (and its weights) load; the Cores are reaped whatever happens."""
+    """The refusals run before the Rust runtime is imported, and they and the
+    template, reasoning and tool decisions before the engine (and its weights)
+    load; the Cores are reaped whatever happens."""
     calls = []
     monkeypatch.setattr(
         atomesh_server, "check_standalone_model", lambda a: calls.append("check")
@@ -289,13 +290,19 @@ def test_launch_decides_everything_before_weights_and_reaps_after(monkeypatch):
         or {"cli_args": {"host": "h", "port": 1}, "server_config": None},
         launch_mesh=lambda **kw: (_ for _ in ()).throw(RuntimeError("core lost")),
     )
+    monkeypatch.setattr(
+        atomesh_server,
+        "import_atomesh_runner",
+        lambda: calls.append("runtime") or runner,
+    )
     with pytest.raises(RuntimeError, match="core lost"):
         atomesh_server.launch_atom_standalone(
-            runner, ["--model", "/m", "--tool-call-parser", "qwen", "--port", "9"]
+            ["--model", "/m", "--tool-call-parser", "qwen", "--port", "9"]
         )
     order = [c for c in calls if isinstance(c, str)]
     assert order == [
         "check",
+        "runtime",
         "tokenizer",
         "template",
         "reasoning",
