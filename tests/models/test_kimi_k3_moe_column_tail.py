@@ -16,6 +16,7 @@ def modules():
             model=load("atom.models.kimi_k3.model"),
             tail=load("atom.model_ops.kimi_k3.attention_residual"),
             plugin=load("atom.plugin"),
+            simulated_tp=load("atom.distributed.simulated_tp"),
         )
 
 
@@ -26,6 +27,12 @@ def block(modules, monkeypatch):
     config = SimpleNamespace(enable_tbo=False)
     pp = SimpleNamespace(world_size=1)
     comm = SimpleNamespace(disabled=False)
+    group = SimpleNamespace(
+        device_group=object(),
+        rank_in_group=0,
+        world_size=8,
+        device_communicator=SimpleNamespace(ca_comm=comm),
+    )
     monkeypatch.setattr(
         model, "get_forward_context", lambda: SimpleNamespace(context=ctx)
     )
@@ -34,7 +41,7 @@ def block(modules, monkeypatch):
     monkeypatch.setattr(
         model,
         "get_tp_group",
-        lambda: SimpleNamespace(device_communicator=SimpleNamespace(ca_comm=comm)),
+        lambda: group,
     )
     monkeypatch.setattr(modules.plugin, "is_plugin_mode", lambda: False)
     monkeypatch.setenv("ATOM_USE_CUSTOM_ALL_GATHER", "1")
@@ -53,6 +60,7 @@ def block(modules, monkeypatch):
         config=config,
         pp=pp,
         comm=comm,
+        tp_group=group,
     )
     for name in ("_column_tail_eligible", "_can_column_tail", "_finish_latent_tail"):
         setattr(block, name, MethodType(getattr(model.KimiSparseMoeBlock, name), block))
@@ -68,7 +76,9 @@ def test_tail_capability_bounds(block, tokens, eligible):
     assert block._can_column_tail(latent, shared) is eligible
 
 
-@pytest.mark.parametrize("reason", ["prefill", "pp", "tbo", "plugin", "comm", "quant"])
+@pytest.mark.parametrize(
+    "reason", ["prefill", "pp", "tbo", "plugin", "comm", "quant", "simulated_tp"]
+)
 def test_tail_keeps_safe_fallbacks(block, modules, monkeypatch, reason):
     if reason == "prefill":
         block.context.is_prefill = True
@@ -80,6 +90,9 @@ def test_tail_keeps_safe_fallbacks(block, modules, monkeypatch, reason):
         monkeypatch.setattr(modules.plugin, "is_plugin_mode", lambda: True)
     elif reason == "comm":
         block.comm.disabled = True
+    elif reason == "simulated_tp":
+        block.tp_group.world_size = 4
+        modules.simulated_tp._patch_group(block.tp_group, logical=8, physical=4)
     else:
         block.fuse_routed_norm_quant = True
     latent = torch.zeros((4, 3584), dtype=torch.bfloat16)

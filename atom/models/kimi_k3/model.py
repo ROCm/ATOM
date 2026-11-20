@@ -780,7 +780,10 @@ class KimiSparseMoeBlock(nn.Module):
             or not envs.ATOM_USE_CUSTOM_ALL_GATHER
         ):
             return False
-        comm = getattr(get_tp_group().device_communicator, "ca_comm", None)
+        tp_group = get_tp_group()
+        if getattr(tp_group, "simulated_tp_physical_world_size", None) is not None:
+            return False
+        comm = getattr(tp_group.device_communicator, "ca_comm", None)
         if comm is None or comm.disabled:
             return False
         weight, norm = self.routed_expert_up_proj.weight, self.routed_expert_norm
@@ -2190,6 +2193,10 @@ class KimiLinearModel(nn.Module):
             or get_tensor_model_parallel_world_size() != 8
         ):
             return
+        tp_group = get_tp_group()
+        # Simulated TP advertises absent peers; keep its collective wrappers.
+        if getattr(tp_group, "simulated_tp_physical_world_size", None) is not None:
+            return
         resident = self.layers[self.start_layer : self.end_layer]
         for layer, following in pairwise(resident):
             moe = getattr(layer, "block_sparse_moe", None)
@@ -2204,12 +2211,12 @@ class KimiLinearModel(nn.Module):
                 self._column_gather_blocks.append(moe)
         if not self._column_gather_blocks:
             return
-        comm = getattr(get_tp_group().device_communicator, "ca_comm", None)
+        comm = getattr(tp_group.device_communicator, "ca_comm", None)
         if not envs.ATOM_USE_CUSTOM_ALL_GATHER or comm is None or comm.disabled:
             return
         try:
             gather = PeerColumnGather(
-                7168, 64, get_tensor_model_parallel_rank(), 8, get_tp_group().cpu_group
+                7168, 64, get_tensor_model_parallel_rank(), 8, tp_group.cpu_group
             )
         except MonoUnsupported as error:
             logging.getLogger("atom").warning(

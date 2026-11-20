@@ -28,6 +28,7 @@ def modules():
             plugin=load("atom.plugin"),
             runner=load("atom.model_engine.model_runner"),
             peer_memory=load("atom.mono.runtime.peer_memory"),
+            simulated_tp=load("atom.distributed.simulated_tp"),
         )
 
 
@@ -413,7 +414,7 @@ def test_fused_consumer_receives_columns_without_materializing(modules, monkeypa
 
 
 @pytest.mark.parametrize(
-    "fallback", [None, "pp", "plugin", "tbo", "comm", "next_disabled"]
+    "fallback", [None, "pp", "plugin", "tbo", "comm", "next_disabled", "simulated_tp"]
 )
 def test_exchange_binds_only_safe_local_consumers(modules, monkeypatch, fallback):
     blocks = [
@@ -444,10 +445,15 @@ def test_exchange_binds_only_safe_local_consumers(modules, monkeypatch, fallback
     pp = SimpleNamespace(world_size=2 if fallback == "pp" else 1)
     group = SimpleNamespace(
         cpu_group=object(),
+        device_group=object(),
+        rank_in_group=0,
+        world_size=4 if fallback == "simulated_tp" else 8,
         device_communicator=SimpleNamespace(
             ca_comm=SimpleNamespace(disabled=fallback == "comm")
         ),
     )
+    if fallback == "simulated_tp":
+        modules.simulated_tp._patch_group(group, logical=8, physical=4)
     monkeypatch.setattr(modules.model, "get_pp_group", lambda: pp)
     monkeypatch.setattr(modules.model, "get_tp_group", lambda: group)
     monkeypatch.setattr(
