@@ -32,6 +32,7 @@ from typing import Any
 
 from atom import SamplingParams
 from atom.entrypoints.openai.api_server import (
+    _coerce_n,
     _validate_context_length,
     _validate_pool_capacity,
 )
@@ -165,8 +166,9 @@ class TokenBridge:
     # Rust -> Python
     # ------------------------------------------------------------------
 
-    def submit(self, key: int, token_ids: list[int], params: dict[str, Any]) -> None:
-        """Hand one tokenized request to the engine.
+    def submit(self, key: int, token_ids: list[int], params: dict[str, Any]) -> int:
+        """Hand one tokenized request to the engine; how many sequences it
+        made of it (``n``, or 1 where greedy sampling collapsed ``n``).
 
         A ``ValueError`` is the request's fault and reaches the client as 400;
         anything else is the server's.
@@ -175,7 +177,7 @@ class TokenBridge:
         seqs = self.engine.io_processor.preprocess_fanout(
             token_ids,
             sampling,
-            stream_callback=self._callback(key),
+            stream_callbacks=[self._callback(key, i) for i in range(sampling.n)],
             parent_request_id=params.get("request_id"),
             data_parallel_rank=params.get("data_parallel_rank"),
             dp_session_id=params.get("dp_session_id"),
@@ -192,6 +194,7 @@ class TokenBridge:
                 self._seq_ids.pop(key, None)
             self._forget([seq.id for seq in seqs])
             raise
+        return len(seqs)
 
     def render_chat(self, request_json: str) -> tuple[str, list[int], str | None]:
         """A chat request's prompt, its token ids as the engine would encode
@@ -226,7 +229,7 @@ class TokenBridge:
     # Engine -> Rust
     # ------------------------------------------------------------------
 
-    def _callback(self, key: int):
+    def _callback(self, key: int, index: int):
         local = self._local
 
         def record(request_output: Any) -> None:
@@ -236,6 +239,7 @@ class TokenBridge:
             pending.append(
                 (
                     key,
+                    index,
                     list(request_output.output_tokens or ()),
                     bool(request_output.finished),
                     request_output.finish_reason,
@@ -279,8 +283,10 @@ class TokenBridge:
                     f"max_tokens must be <= {self._output_limit} for this deployment"
                 )
             max_tokens = self._output_limit
+        temperature = _or(params.get("temperature"), DEFAULT_TEMPERATURE)
         return SamplingParams(
-            temperature=_or(params.get("temperature"), DEFAULT_TEMPERATURE),
+            temperature=temperature,
+            n=_coerce_n(params.get("n"), temperature),
             top_k=_or(params.get("top_k"), DEFAULT_TOP_K),
             top_p=_or(params.get("top_p"), DEFAULT_TOP_P),
             max_tokens=max_tokens,

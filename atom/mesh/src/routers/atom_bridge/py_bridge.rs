@@ -33,9 +33,10 @@ use crate::{
     },
 };
 
-/// One request's share of an engine step, as `TokenBridge` pushes it:
-/// `(key, new_token_ids, finished, finish_reason, num_cached_tokens)`.
-type StepOutput = (u64, Vec<u32>, bool, Option<String>, u32);
+/// One sequence's share of an engine step, as `TokenBridge` pushes it:
+/// `(key, sibling_index, new_token_ids, finished, finish_reason,
+/// num_cached_tokens)`.
+type StepOutput = (u64, u32, Vec<u32>, bool, Option<String>, u32);
 
 /// Where the engine's steps arrive. Python builds one, gives it to its
 /// `TokenBridge`, and Rust finds it there (`AtomBridgeRuntime`).
@@ -55,13 +56,19 @@ impl StepSink {
 
     /// One engine step: a `StepOutput` per request that moved.
     fn push(&self, outputs: Vec<StepOutput>) {
-        for (key, token_ids, finished, reason, cached_tokens) in outputs {
+        for (key, index, token_ids, finished, reason, cached_tokens) in outputs {
             let finish = finished.then_some(SeqFinish {
                 reason,
                 cached_tokens,
             });
-            self.registry
-                .deliver(key, SeqEvent::Step { token_ids, finish });
+            self.registry.deliver(
+                key,
+                SeqEvent::Step {
+                    index,
+                    token_ids,
+                    finish,
+                },
+            );
         }
     }
 
@@ -81,6 +88,7 @@ pub(crate) struct BridgeRequest {
     pub temperature: f32,
     pub top_p: f32,
     pub top_k: i32,
+    pub n: i32,
     pub max_tokens: Option<i32>,
     pub stop: Vec<String>,
     pub ignore_eos: bool,
@@ -95,8 +103,10 @@ impl BridgeRequest {
         if payload.token_ids.is_empty() {
             return Err("the prompt is empty".to_string());
         }
-        if payload.sampling.n > 1 {
-            return Err("n > 1 is not supported by the ATOM Rust frontend yet".to_string());
+        if payload.stream && payload.sampling.n > 1 {
+            return Err(
+                "streaming with n > 1 is not supported by the ATOM Rust frontend yet".to_string(),
+            );
         }
         if payload.logprob.return_logprob || payload.logprob.logprob_start_len >= 0 {
             return Err("logprobs are not supported by the ATOM Rust frontend yet".to_string());
@@ -130,6 +140,7 @@ impl BridgeRequest {
             temperature: payload.sampling.temperature,
             top_p: payload.sampling.top_p,
             top_k: payload.sampling.top_k,
+            n: payload.sampling.n,
             max_tokens: payload.sampling.max_new_tokens,
             stop,
             ignore_eos: payload.sampling.ignore_eos,
@@ -143,6 +154,7 @@ impl BridgeRequest {
         params.set_item("temperature", self.temperature)?;
         params.set_item("top_p", self.top_p)?;
         params.set_item("top_k", self.top_k)?;
+        params.set_item("n", self.n)?;
         params.set_item("max_tokens", self.max_tokens)?;
         params.set_item("stop", PyList::new(py, &self.stop)?)?;
         params.set_item("ignore_eos", self.ignore_eos)?;
@@ -212,41 +224,44 @@ impl Dispatcher for BridgeDispatcher {
         let request_id = request.request_id.clone();
         let prompt_tokens = request.token_ids.len() as u32;
 
-        tokio::task::spawn_blocking(move || submit(&bridge, key, &request, &stage))
+        let siblings = tokio::task::spawn_blocking(move || submit(&bridge, key, &request, &stage))
             .await
             .map_err(|e| {
                 EngineError::Transport(tonic::Status::internal(format!("submit task: {e}")))
             })??;
 
-        debug!(key, %request_id, prompt_tokens, "Submitted to the token bridge");
+        debug!(key, %request_id, prompt_tokens, siblings, "Submitted to the token bridge");
         Ok(TokenHandle::new(SeqEventSource::new(
             events,
             admission,
             request_id,
             prompt_tokens,
+            siblings,
         )))
     }
 }
 
+/// Hand the request to Python; how many sequences it made of it (`n`, or 1
+/// where greedy sampling collapsed `n`).
 fn submit(
     bridge: &Py<PyAny>,
     key: u64,
     request: &BridgeRequest,
     stage: &Mutex<Stage>,
-) -> Result<(), EngineError> {
-    Python::attach(|py| -> PyResult<()> {
+) -> Result<usize, EngineError> {
+    let siblings = Python::attach(|py| -> PyResult<usize> {
         let params = request.params(py)?;
         bridge
             .bind(py)
-            .call_method1("submit", (key, request.token_ids.as_slice(), params))?;
-        Ok(())
+            .call_method1("submit", (key, request.token_ids.as_slice(), params))?
+            .extract()
     })
     .map_err(|e| py_err_to_engine(&e))?;
     if submitted(stage) {
         // The client left while Python was admitting it.
         call_abort(bridge, key);
     }
-    Ok(())
+    Ok(siblings)
 }
 
 /// The chat prompt rendered by `TokenBridge.render_chat`, for a model whose

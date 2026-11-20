@@ -6,6 +6,7 @@
 //! of the EngineCores would be another.
 
 use std::{
+    collections::VecDeque,
     pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -25,10 +26,13 @@ use crate::routers::token_handle::{
     token_handle::TokenSource,
 };
 
-/// One engine step of one request, or the end of its stream.
+/// One engine step of one of a request's sequences, or the end of its
+/// stream.
 #[derive(Debug)]
 pub(crate) enum SeqEvent {
     Step {
+        /// The sibling's index, under `n > 1`; 0 otherwise.
+        index: u32,
         token_ids: Vec<u32>,
         finish: Option<SeqFinish>,
     },
@@ -60,16 +64,10 @@ impl EventRegistry {
         (key, rx)
     }
 
+    /// A sibling's finish leaves the key open for the others: the request's
+    /// `Admission` forgets it when the request is done. A failure ends it.
     pub(crate) fn deliver(&self, key: u64, event: SeqEvent) {
-        let last = matches!(
-            event,
-            SeqEvent::Failed(_)
-                | SeqEvent::Step {
-                    finish: Some(_),
-                    ..
-                }
-        );
-        if last {
+        if matches!(event, SeqEvent::Failed(_)) {
             if let Some((_, tx)) = self.streams.remove(&key) {
                 let _ = tx.send(event);
             }
@@ -174,46 +172,93 @@ impl Drop for Admission {
     }
 }
 
-/// One request's events as a `TokenSource`: a `Partial` per step with
-/// tokens, then a `Complete` carrying all of them, as the gRPC engines send.
+/// One request's events as a `TokenSource`, as the gRPC engines send them:
+/// a `Partial` per step with tokens, then a `Complete` carrying all of them.
+/// Under `n > 1` (never streamed) only the siblings' `Complete`s, in index
+/// order.
 pub(crate) struct SeqEventSource {
     events: mpsc::UnboundedReceiver<SeqEvent>,
     admission: Admission,
     request_id: String,
     prompt_tokens: u32,
-    output: Vec<u32>,
-    pending_complete: Option<TokenChunk>,
+    /// Each sibling's tokens so far, and its finish once it has one.
+    siblings: Vec<(Vec<u32>, Option<SeqFinish>)>,
+    /// The next sibling whose `Complete` is due.
+    next_complete: usize,
+    ready: VecDeque<TokenChunk>,
     done: bool,
 }
 
 impl SeqEventSource {
+    /// `siblings` is how many sequences the backend made of the request.
     pub(crate) fn new(
         events: mpsc::UnboundedReceiver<SeqEvent>,
         admission: Admission,
         request_id: String,
         prompt_tokens: u32,
+        siblings: usize,
     ) -> Self {
         Self {
             events,
             admission,
             request_id,
             prompt_tokens,
-            output: Vec::new(),
-            pending_complete: None,
+            siblings: (0..siblings.max(1)).map(|_| (Vec::new(), None)).collect(),
+            next_complete: 0,
+            ready: VecDeque::new(),
             done: false,
         }
     }
 
-    fn complete(&mut self, finish: SeqFinish) -> TokenChunk {
-        let completion_tokens = self.output.len() as u32;
+    /// Take in one step; queue what it makes ready.
+    fn step(&mut self, index: u32, token_ids: Vec<u32>, finish: Option<SeqFinish>) {
+        let streamed = self.siblings.len() == 1;
+        let Some(sibling) = self.siblings.get_mut(index as usize) else {
+            return;
+        };
+        sibling.0.extend_from_slice(&token_ids);
+        if streamed && !token_ids.is_empty() {
+            self.ready.push_back(TokenChunk::Partial {
+                token_ids,
+                logprobs: None,
+            });
+        }
+        if finish.is_some() {
+            sibling.1 = finish;
+        }
+        while let Some((_, Some(_))) = self.siblings.get(self.next_complete) {
+            let (output, finish) = std::mem::take(&mut self.siblings[self.next_complete]);
+            // The siblings share one prompt and the renders sum what each
+            // reports, so only the first reports it.
+            let prompt_tokens = if self.next_complete == 0 {
+                self.prompt_tokens
+            } else {
+                0
+            };
+            let finish = finish.unwrap_or(SeqFinish {
+                reason: None,
+                cached_tokens: 0,
+            });
+            let complete = self.complete(output, finish, prompt_tokens);
+            self.ready.push_back(complete);
+            self.next_complete += 1;
+        }
+        if self.next_complete == self.siblings.len() {
+            self.done = true;
+            self.admission.finish();
+        }
+    }
+
+    fn complete(&self, output: Vec<u32>, finish: SeqFinish, prompt_tokens: u32) -> TokenChunk {
+        let completion_tokens = output.len() as u32;
         TokenChunk::Complete {
-            token_ids: std::mem::take(&mut self.output),
+            token_ids: output,
             finish_reason: finish_reason(finish.reason.as_deref()),
             matched_stop: None,
             usage: Usage {
-                prompt_tokens: self.prompt_tokens,
+                prompt_tokens,
                 completion_tokens,
-                total_tokens: self.prompt_tokens + completion_tokens,
+                total_tokens: prompt_tokens + completion_tokens,
             },
             logprobs: None,
             input_logprobs: None,
@@ -240,13 +285,13 @@ impl Stream for SeqEventSource {
     type Item = Result<TokenChunk, EngineError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if let Some(complete) = self.pending_complete.take() {
-            return Poll::Ready(Some(Ok(complete)));
-        }
-        if self.done {
-            return Poll::Ready(None);
-        }
         loop {
+            if let Some(chunk) = self.ready.pop_front() {
+                return Poll::Ready(Some(Ok(chunk)));
+            }
+            if self.done {
+                return Poll::Ready(None);
+            }
             let event = match self.events.poll_recv(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(event) => event,
@@ -260,29 +305,11 @@ impl Stream for SeqEventSource {
                     self.done = true;
                     return Poll::Ready(Some(Err(EngineError::DecodeError(message))));
                 }
-                Some(SeqEvent::Step { token_ids, finish }) => {
-                    self.output.extend_from_slice(&token_ids);
-                    let Some(finish) = finish else {
-                        if token_ids.is_empty() {
-                            continue;
-                        }
-                        return Poll::Ready(Some(Ok(TokenChunk::Partial {
-                            token_ids,
-                            logprobs: None,
-                        })));
-                    };
-                    self.done = true;
-                    self.admission.finish();
-                    let complete = self.complete(finish);
-                    if token_ids.is_empty() {
-                        return Poll::Ready(Some(Ok(complete)));
-                    }
-                    self.pending_complete = Some(complete);
-                    return Poll::Ready(Some(Ok(TokenChunk::Partial {
-                        token_ids,
-                        logprobs: None,
-                    })));
-                }
+                Some(SeqEvent::Step {
+                    index,
+                    token_ids,
+                    finish,
+                }) => self.step(index, token_ids, finish),
             }
         }
     }
@@ -318,11 +345,12 @@ mod tests {
         let (key, events) = registry.register();
         let admission = Admission::new(key, Arc::clone(&registry), aborter.clone());
         assert!(!submitted(&admission.stage()));
-        let mut source = SeqEventSource::new(events, admission, "req-1".into(), 4);
+        let mut source = SeqEventSource::new(events, admission, "req-1".into(), 4, 1);
 
         registry.deliver(
             key,
             SeqEvent::Step {
+                index: 0,
                 token_ids: vec![1, 2],
                 finish: None,
             },
@@ -330,6 +358,7 @@ mod tests {
         registry.deliver(
             key,
             SeqEvent::Step {
+                index: 0,
                 token_ids: vec![3],
                 finish: Some(SeqFinish {
                     reason: Some("eos".into()),
@@ -350,6 +379,47 @@ mod tests {
         // It finished on its own: nothing to stop.
         assert_eq!(aborter.0.load(Ordering::SeqCst), 0);
         assert_eq!(registry.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn siblings_complete_in_index_order_without_partials() {
+        let registry = Arc::new(EventRegistry::default());
+        let aborter = Arc::new(CountingAborter::default());
+        let (key, events) = registry.register();
+        let admission = Admission::new(key, Arc::clone(&registry), aborter.clone());
+        assert!(!submitted(&admission.stage()));
+        let mut source = SeqEventSource::new(events, admission, "req-n".into(), 4, 2);
+
+        let finish = || {
+            Some(SeqFinish {
+                reason: None,
+                cached_tokens: 0,
+            })
+        };
+        for (index, token_ids, finish) in [
+            (1, vec![7], finish()),
+            (0, vec![5], None),
+            (0, vec![6], finish()),
+        ] {
+            registry.deliver(
+                key,
+                SeqEvent::Step {
+                    index,
+                    token_ids,
+                    finish,
+                },
+            );
+        }
+        let mut outputs = Vec::new();
+        while let Some(item) = source.next().await {
+            match item.unwrap() {
+                TokenChunk::Complete { token_ids, .. } => outputs.push(token_ids),
+                partial => panic!("unexpected {partial:?}"),
+            }
+        }
+        assert_eq!(outputs, vec![vec![5, 6], vec![7]]);
+        drop(source);
+        assert_eq!(aborter.0.load(Ordering::SeqCst), 0);
     }
 
     #[test]
