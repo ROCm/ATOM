@@ -41,7 +41,7 @@ def test_greedy_correction_preserves_sampled_rows(
     assert (sampled == -1).all()  # Caller-owned sampled results are not mutated.
 
 
-def _noise_picks_the_high_tie(logits, temperatures, needs_independent_noise=False):
+def _noise_picks_the_high_tie(logits, temperatures):
     """Stand-in for the Gumbel draw: on an exact tie it may land on either id."""
     return torch.full((logits.shape[0],), 5, dtype=torch.int)
 

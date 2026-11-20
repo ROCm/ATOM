@@ -197,7 +197,8 @@ match ratio only when it picked the worker holding the best match, which covers
 every `affinity` decision and any `relocate` that happened to pick it. With
 `--kv-events`, its `kv_affinity` decisions estimate the selection from the KV
 event index, short of the block of the prompt's last token, which the engine
-always computes. The
+always computes. With `--kv-storage-weight`, they add what the engine will load
+from the Mooncake Store the worker reads, by ATOM's load rule. The
 router drops the estimate when it sends the prompt to a different worker than
 the policy chose, such as another DP rank under
 `--atom-pd-rank-mapping-policy idx2idx`, because ranks keep separate KV caches.

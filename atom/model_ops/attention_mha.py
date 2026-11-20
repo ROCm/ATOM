@@ -1870,12 +1870,12 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         )
         from atom.model_ops.minimax_m3.indexer_context_parallel import (
             indexer_context_scores,
-            indexer_context_scores_mxfp4,
+            indexer_context_scores_fp4,
         )
 
         global_blocks = block_table.shape[1]
         if index_scorer is not None:
-            scores = indexer_context_scores_mxfp4(
+            scores = indexer_context_scores_fp4(
                 index_q,
                 self.index_cache,
                 block_table,
@@ -1913,6 +1913,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 self.init_blocks,
                 self.local_blocks,
                 mailbox,
+                emit_sparse_block_table=self.kv_cache_dtype != "nvfp4",
                 **self._select_page_kwargs,
             )
         # Forced blocks are pinned in BOTH passes on purpose: one that lost its
@@ -1936,6 +1937,8 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             self.init_blocks,
             self.local_blocks,
             max_query_len,
+            # the NVFP4 attention reads the logical block ids, no page-16 table
+            emit_sparse_block_table=self.kv_cache_dtype != "nvfp4",
             **self._select_page_kwargs,
         )
 
@@ -1970,7 +1973,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 raise RuntimeError("MiniMax-M3 index cache miss on a skip-index layer")
             index_q = index_q[:rows]
             if self.indexer_cp_group is not None:
-                topk_idx, sparse_bt, sparse_ctx = self._cp_index_topk_decode(
+                selected = self._cp_index_topk_decode(
                     index_q,
                     decode_md.block_table,
                     decode_md.seq_lens,
@@ -1997,7 +2000,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                     index_scorer=self._index_scorer(sparse_metadata),
                     **self._select_page_kwargs,
                 )
-                topk_idx, sparse_bt, sparse_ctx = self._selection_triple(selected)
+            topk_idx, sparse_bt, sparse_ctx = self._selection_triple(selected)
             self._store_cached_topk(
                 sparse_metadata, topk_key, (topk_idx, sparse_bt, sparse_ctx)
             )

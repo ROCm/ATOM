@@ -346,9 +346,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gfx95x when ATOM_USE_TRITON_GEMM is set.
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
     # Qwen3.8-Flash-Next eager prefill on SGLang-ATOM: run QSA sparse attention
-    # with aiter's FlyDSL kernel (gfx942, BF16 D256, one KV head per rank)
-    # instead of qsa_sparse_paged_gqa. Other steps keep the native kernel. On by
-    # default; 0 / false / off disables. Needs aiter with ROCm/aiter#6576.
+    # with aiter's FlyDSL kernel (BF16 D256, one KV head per rank) instead of
+    # qsa_sparse_paged_gqa, where aiter reports it runs
+    # (aiter.ops.qsa.qsa_sparse_prefill_widths()). Other steps keep the native
+    # kernel. On by default; 0 / false / off disables. qsa_attention imports
+    # aiter's queries at module level, so aiter with ROCm/aiter#8083 is needed
+    # whether the flag is on or off.
     "ATOM_QSA_FLYDSL_ATTN": lambda: _flag_env("ATOM_QSA_FLYDSL_ATTN", "1"),
     # Split the routed experts by phase: FlyDSL fused_moe on prefill, the Triton
     # /gluon GUGU kernel on decode. Needs ATOM_USE_TRITON_MOE=1 (it narrows that
@@ -434,7 +437,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Pack mHC fn weights once after loading and use BF16 hi/lo computation.
     # Set to 0 before model loading to retain FP32 fn and FP32 mHC computation.
     "ATOM_MHC_USE_BF16": lambda: os.getenv("ATOM_MHC_USE_BF16", "1") == "1",
-    # V4.1 delayed mHC: HIP Mega-MHC on supported gfx950/gfx1250 shapes, else Triton.
+    # V4.1 delayed mHC: HIP Mega-MHC on supported gfx950/gfx1250 shapes, mega_mhc's gfx942
+    # ASM seam for seams with a post where AITER supports it, else Triton.
     "ATOM_DSV41_MHC_BACKEND": lambda: os.getenv(
         "ATOM_DSV41_MHC_BACKEND", "auto"
     ).lower(),
@@ -1527,8 +1531,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # "lmcache.mp.mp_transfer_mode" takes precedence.
     "LMCACHE_MP_TRANSFER_MODE": lambda: os.getenv("LMCACHE_MP_TRANSFER_MODE", "auto"),
     # LMCache's own chunk size, as the connector configures LMCache with it.
-    # Read on the ATOM side only by `prefix_spread`, which predicts loads with
-    # it and checks it against an LMCache MP server's chunk at registration.
+    # Read on the ATOM side only by `prefix_spread` and `share_cache`, which
+    # predict loads with it and check it against an LMCache MP server's chunk
+    # at registration.
     "LMCACHE_CHUNK_SIZE": lambda: _int_env("LMCACHE_CHUNK_SIZE", 256),
 }
 
