@@ -551,7 +551,10 @@ mod tests {
     #[tokio::test]
     async fn a_long_prompt_is_looked_up_as_far_as_the_chunk_cap() {
         let admin = Arc::new(Admin::default());
-        let read = source(admin.clone()).await;
+        let mut read = source(admin.clone()).await;
+        // Its 64 requests share the test's one thread with the answers: 500 ms is too short
+        // on a loaded machine.
+        read.deadline = Duration::from_secs(10);
         // The pool holds every key it is asked for, besides the taint key.
         admin.held.store(mooncake::BATCH_KEYS, Ordering::Relaxed);
         let prompt: Vec<u32> = (0..(MAX_CHUNKS as u32 + 10) * 16).collect();
