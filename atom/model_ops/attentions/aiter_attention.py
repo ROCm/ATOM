@@ -1385,6 +1385,48 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
 
         ctx["kv_indices"] = var["kv_indices"].gpu
         max_seqlen_k = int(context_lens.max())
+        # ATOM_HOSTNEXT_EARLY_META: the lengths above leave the carried-over
+        # rows' rejections out (the status is not on the host yet); subtract
+        # them on the device before anything reads the metadata. max_seqlen_k
+        # stays the upper bound: it only sizes grids.
+        early = getattr(self.model_runner.tokenID_processor, "early_fix", None)
+        early_mrope = None
+        if early is not None and not batch.is_dummy_run and max_seqlen_q > 1:
+            from atom.model_ops.attentions.early_meta import early_meta_fix
+
+            if (
+                self.block_size in (256, 1024)
+                or self._has_sparse_attention
+                or (self.model_runner.config.enable_tbo_decode and running_bs >= 2)
+                or early.bs != scheduled_bs
+            ):
+                raise RuntimeError("ATOM_HOSTNEXT_EARLY_META: unsupported decode")
+            use_mrope = self.model_runner.use_mrope
+            if use_mrope:
+                # Built (and published) before the fix, which shifts it.
+                early_mrope = self._build_mrope_decode_positions(
+                    batch, context_lens, max_seqlen_q, running_tokens=running_tokens
+                )
+            early_meta_fix(
+                early,
+                context_lens=var["context_lens"].gpu,
+                positions=None if use_mrope else var["positions"].gpu,
+                slot_mapping=var["slot_mapping"].gpu,
+                block_tables=var["block_tables"].gpu,
+                kv_indptr=var["kv_indptr"].gpu,
+                tiles=(
+                    var["decode_token_split_tiles"].gpu
+                    if token_split is not None
+                    else None
+                ),
+                split_constants=token_split,
+                mrope=var["mrope_positions"].gpu if use_mrope else None,
+                mrope_width=running_tokens,
+                running_bs=running_bs,
+                max_seqlen_q=max_seqlen_q,
+                block_size=self.model_runner.block_size,
+                indptr_block=self.block_size,
+            )
         kv_indices_generate_triton(
             ctx["block_tables"],
             ctx["kv_indices"],
@@ -1436,9 +1478,12 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 num_idx_heads=self._num_idx_heads,
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(),
             )
-        mrope_positions = self._build_mrope_decode_positions(
-            batch, context_lens, max_seqlen_q, running_tokens=running_tokens
-        )
+        if early_mrope is not None:
+            mrope_positions = early_mrope
+        else:
+            mrope_positions = self._build_mrope_decode_positions(
+                batch, context_lens, max_seqlen_q, running_tokens=running_tokens
+            )
         if mrope_positions is not None:
             positions = mrope_positions
         else:

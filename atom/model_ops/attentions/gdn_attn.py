@@ -1448,6 +1448,13 @@ class GDNStateMixin(PoolRowsMixin):
         host = np.ones(self.num_accepted_tokens.shape, dtype=np.int32)
         host[: num_bonus.shape[0]] = num_bonus + 1
         self.num_accepted_tokens.copy_(torch.from_numpy(host), non_blocking=True)
+        early = getattr(self.model_runner.tokenID_processor, "early_fix", None)
+        if early is not None:
+            # ATOM_HOSTNEXT_EARLY_META: the carried-over rows' bonus counts
+            # come from the previous verify on the device.
+            from atom.model_ops.attentions.early_meta import early_gdn_accepted
+
+            early_gdn_accepted(early, self.num_accepted_tokens)
 
     def prepare_gdn_metadata(
         self,

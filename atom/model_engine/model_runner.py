@@ -130,6 +130,12 @@ from atom.utils.tbo import (
 
 logger = logging.getLogger("atom")
 
+# ATOM_HOSTNEXT_EARLY_META=1: build a carried-over speculative decode's
+# attention metadata before the previous verify status reaches the host, with
+# the rejections applied on the device (`attentions.early_meta`); the status is
+# then taken after the verify launch.
+_EARLY_META = os.environ.get("ATOM_HOSTNEXT_EARLY_META", "0") == "1"
+
 support_model_arch_dict = {
     "Qwen3ForCausalLM": "atom.models.qwen3.Qwen3ForCausalLM",
     "Qwen3MoeForCausalLM": "atom.models.qwen3_moe.Qwen3MoeForCausalLM",
@@ -446,6 +452,11 @@ class tokenIDProcessor:
         )
         self.num_rejected: np.ndarray | None = None
         self.num_bonus: np.ndarray | None = None
+        # ATOM_HOSTNEXT_EARLY_META: the last postprocess's verdict rows on the
+        # device (bonus, rejected, rows) and this step's pending fix.
+        self._prev_status_gpu = None
+        self.early_fix = None
+        self._early_ok = False
 
     @staticmethod
     def _batch_process_token_ids(token_ids: list) -> list[tuple[int, ...]]:
@@ -621,6 +632,39 @@ class tokenIDProcessor:
         # it is a middle chunk), and the status it popped belongs to the batch
         # whose deferred tokens the NEXT output-producing step will surface.
         # Draining it here would hand that step `num_rejected=None`.
+        early = None
+        if (
+            _EARLY_META
+            and locs is not None
+            and batch.produces_output()
+            and max_seqlen_q > 1
+            and not batch.is_dummy_run
+            and self._early_ok
+            and self._prev_status_gpu is not None
+            and self.prev_batch is not None
+            and self._prev_status_gpu[2] == len(self.prev_batch.req_ids)
+        ):
+            from atom.model_ops.attentions.early_meta import EarlyFix
+
+            bonus_gpu, rejected_gpu, _ = self._prev_status_gpu
+            early = EarlyFix(
+                src=self.decode_src.gpu[: batch.total_seqs_num],
+                prev_bonus=bonus_gpu,
+                prev_rejected=rejected_gpu,
+                bs=batch.total_seqs_num,
+            )
+        self.early_fix = early
+        if early is not None:
+            # The host builds the metadata with nothing rejected on the
+            # carried-over rows; `early_meta_fix` subtracts the real counts on
+            # the device. The status itself is taken after the verify launch.
+            self._spec_status_deferred = True
+            self.num_rejected = batch.num_rejected
+            self.num_bonus = batch.num_bonus
+            if len(locs.deferred_curr) > 0:
+                self.num_rejected[locs.deferred_curr] = 0
+                self.num_bonus[locs.deferred_curr] = 0
+            return input_ids
         if batch.produces_output():
             if locs is None and envs.ATOM_EARLY_PREFILL_SCHEDULE:
                 # ATOM_EARLY_PREFILL_SCHEDULE: a pure prefill reads no carried
@@ -899,6 +943,12 @@ class ModelRunner:
 
         self.attn_backend = get_attn_backend(self.attn_family)
         self._setup_device_and_distributed(rank, config)
+        if os.environ.get("ATOM_HOSTFAST_TRITON", "0") == "1":
+            # Cached launchers for the decode step's hot Triton kernels
+            # (after the device is set: the wrapped modules are imported here).
+            from atom.utils import triton_fast_launch
+
+            triton_fast_launch.install_from_env()
 
         self.capture_sizes = [0]  # for eager fallback
         # The same ladder as an ASCENDING int32 array, which is what
@@ -2868,6 +2918,9 @@ class ModelRunner:
         total_tokens_num = batch.total_tokens_num
         assert total_tokens_num > 0
 
+        # ATOM_HOSTNEXT_EARLY_META: only a replayed decode graph (an eager step
+        # may read host-side lengths) builds before the status arrives.
+        self.tokenID_processor._early_ok = bool(forward_mode.use_cudagraph)
         # Before the step's GPU wait (in prepare_input_ids): needs no status.
         self._presence_step = self._begin_presence_step(batch, None)
         token_group = self.h2d_groups.get("token_inputs")
@@ -4131,6 +4184,12 @@ class ModelRunner:
                     self.tokenID_processor.spec_status_queue.send(
                         spec_counts, ready=self.forward_done_event
                     )
+                if _EARLY_META:
+                    self.tokenID_processor._prev_status_gpu = (
+                        spec_counts[0],
+                        spec_counts[1],
+                        bs,
+                    )
                 if glue_next is not None:
                     next_token_ids = glue_next
                 else:
@@ -4247,6 +4306,16 @@ class ModelRunner:
             all_greedy,
             needs_independent_noise,
         ) = self.prepare_model(batch)
+        if _EARLY_META:
+            fix = self.tokenID_processor.early_fix
+            if fix is not None:
+                self.tokenID_processor.early_fix = None
+                if not (fix.applied_attn and fix.applied_gdn):
+                    raise RuntimeError(
+                        "ATOM_HOSTNEXT_EARLY_META: the metadata builder did not "
+                        f"apply the early fix (attn={fix.applied_attn}, "
+                        f"gdn={fix.applied_gdn})"
+                    )
         self._mark_staging_h2d_enqueued()
         if step_key is not None:
             timeline.mark(step_key, "prepared")

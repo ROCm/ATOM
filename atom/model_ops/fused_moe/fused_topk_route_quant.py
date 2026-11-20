@@ -32,11 +32,19 @@ _MAX_ROWS = 512
 _PREPARED: list = []
 
 
-def set_prepared_routing(logits, geometry, routed, num_valid_rows) -> None:
+def set_prepared_routing(
+    logits, geometry, routed, num_valid_rows, required=False
+) -> None:
     """Hand the next `try_defer_topk_route_quant` on `logits` the top-k, routing
-    and activation quant the folded router kernel already computed."""
+    and activation quant the folded router kernel already computed. `required`
+    (ATOM_FOLD_POSTNORM: the MoE input rows are not the experts' input): raise
+    where that call would not consume it."""
     _PREPARED.clear()
     _PREPARED.append((logits, geometry, routed, num_valid_rows))
+    _REQUIRED[0] = routed if required else None
+
+
+_REQUIRED: list = [None]
 
 
 def _take_prepared(logits):
@@ -51,6 +59,16 @@ def _take_prepared(logits):
 def try_defer_topk_route_quant(method, layer, x, logits):
     """`(topk_weights, topk_ids)` left for aiter's grouped MoE to fill, or None
     to route as usual."""
+    required, _REQUIRED[0] = _REQUIRED[0], None
+    out = _try_defer_topk_route_quant(method, layer, x, logits)
+    if required is not None and (out is None or out[0] is not required[0]):
+        raise RuntimeError(
+            "ATOM_FOLD_POSTNORM: the folded router's prepared routing was not consumed"
+        )
+    return out
+
+
+def _try_defer_topk_route_quant(method, layer, x, logits):
     # ATOM_FOLD_TOPK_ROUTER: a routing prepared for these logits is consumed here
     # either way, so it never outlives this call.
     prepared = _take_prepared(logits)
