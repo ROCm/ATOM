@@ -2088,8 +2088,13 @@ class Scheduler:
 
     @staticmethod
     def _requires_atomic_prefill(seq):
+        """Whether `seq`'s prompt must be prefilled in one forward: media
+        without `embedding_spans`, or with spans whose builder still asks for
+        `atomic_prefill` (the spans then only place a prefix hit's remainder)."""
         data = getattr(seq, "multimodal_data", None)
-        return data is not None and "embedding_spans" not in data
+        return data is not None and (
+            "embedding_spans" not in data or bool(data.get("atomic_prefill"))
+        )
 
     def _unschedulable_reason(self, seq: Sequence) -> str | None:
         """Return a human-readable reason if `seq` is permanently unschedulable.
@@ -2128,14 +2133,15 @@ class Scheduler:
                 f"input tokens={num_tokens} > max_model_len={self.max_model_len}. "
                 f"Increase --max-model-len or shorten the prompt."
             )
-        # Only processors with explicit spans and request leases can chunk.
+        # Only processors with explicit spans, request leases and no
+        # `atomic_prefill` request can chunk.
         is_multimodal = self._requires_atomic_prefill(seq)
         if (
             not self.enable_chunked_prefill or is_multimodal
         ) and num_tokens > self.max_num_batched_tokens:
             remedy = (
                 "Increase --max-num-batched-tokens or shorten the prompt "
-                "(multimodal prompts without embedding spans are never chunked)."
+                "(this prompt's media is never chunked)."
                 if is_multimodal
                 else "Increase --max-num-batched-tokens, enable chunked "
                 "prefill, or shorten the prompt."
