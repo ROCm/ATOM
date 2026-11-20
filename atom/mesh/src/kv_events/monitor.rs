@@ -1276,6 +1276,59 @@ mod tests {
         assert!(recorder.handle().render().contains(dropped));
     }
 
+    /// A decode worker takes the prompt's KV from its prefill worker, and a worker whose
+    /// device cache the index knows nothing of is not asked for: of three readers of a
+    /// store, it answers for the third alone.
+    #[tokio::test]
+    async fn a_store_answers_for_its_readers_the_index_knows_but_decode_workers() {
+        use std::collections::HashMap;
+
+        use axum::{extract::Query, routing::get, Json, Router};
+        use serde_json::{json, Map, Value};
+
+        use crate::kv_storage::{keys, OffloadReport};
+
+        // A master's admin service that holds every key but the taint key.
+        let answer = |Query(query): Query<HashMap<String, String>>| async move {
+            let state = |key: &str| json!({"ok": key != keys::TAINT_KEY, "values": [{}]});
+            let data: Map<String, Value> = (query["keys"].split(','))
+                .map(|key| (key.to_string(), state(key)))
+                .collect();
+            Json(json!({"success": true, "data": data}))
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let service = Router::new().route("/batch_query_keys", get(answer));
+        tokio::spawn(async move { axum::serve(listener, service).await });
+        let stores = StorageSources::new(port, Duration::from_millis(500), reqwest::Client::new());
+        let report = OffloadReport {
+            backend: "mooncake_store".into(),
+            masters: vec!["127.0.0.1:50051".into()],
+            namespace: "atomkv1-0123456789abcdef01234567".into(),
+            chunk_tokens: 2,
+            world: 1,
+            min_load_tokens: 2,
+            chain_check: keys::chain_check(2),
+        };
+        let urls = ["http://d:8000", "http://n:8000", "http://r:8000"];
+        for url in urls {
+            stores.add(url, "model", &report);
+        }
+        let monitor = KvEventMonitor::start().unwrap();
+        monitor.read_stores(Arc::new(stores), 1.0);
+        let decode = BasicWorkerBuilder::new(urls[0]).worker_type(WorkerType::Decode);
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(decode.build()),
+            Arc::new(BasicWorkerBuilder::new(urls[1]).build()),
+            Arc::new(BasicWorkerBuilder::new(urls[2]).build()),
+        ];
+        // The store holds the 6 chunks of 12 tokens: the engine loads all but the last.
+        let prompt: Vec<u32> = (0..12).collect();
+        let device = [Some(0), None, Some(0)];
+        let cached = monitor.cached_tokens(&prompt, &workers, &device).await;
+        assert_eq!(cached, [Some(0), None, Some(10)]);
+    }
+
     #[test]
     fn a_message_is_a_batch_of_the_rank_or_dropped() {
         let payload = Bytes::from(encode(&format!("[1.0, {CLEAR}, 1]")));

@@ -341,8 +341,13 @@ impl CacheAwarePolicy {
         let hits = provider.match_workers(tokens, workers);
         let shared = provider.shared_tokens(tokens, workers, &hits);
         let held = shared.as_deref().unwrap_or(&hits);
-        let cached = provider.cached_tokens(tokens, workers, held).await;
         let (share_weight, store_weight) = (provider.share_weight(), provider.store_weight());
+        let stored = if store_weight > 0.0 {
+            Some(provider.cached_tokens(tokens, workers, held).await)
+        } else {
+            None
+        };
+        let cached = |idx: usize| stored.as_ref().map_or(held[idx], |stored| stored[idx]);
         let copied = |idx: usize| {
             held[idx]
                 .zip(hits[idx])
@@ -351,7 +356,7 @@ impl CacheAwarePolicy {
         let score = |idx: usize| {
             let device = hits[idx]?;
             let copied = copied(idx);
-            let loaded = cached[idx].map_or(0, |cached| cached.saturating_sub(device + copied));
+            let loaded = cached(idx).map_or(0, |cached| cached.saturating_sub(device + copied));
             Some(
                 f64::from(device)
                     + share_weight * f64::from(copied)
@@ -377,7 +382,7 @@ impl CacheAwarePolicy {
         }
         self.routed(info, workers[idx].as_ref());
         workers[idx].increment_processed();
-        let estimate = cached[idx].map(|cached| f64::from(cached) / tokens.len() as f64);
+        let estimate = cached(idx).map(|cached| f64::from(cached) / tokens.len() as f64);
         let branch = if copied(idx) > 0 {
             "kv_shared"
         } else {
@@ -995,6 +1000,7 @@ mod tests {
             _: &[Arc<dyn Worker>],
             device: &[Option<u32>],
         ) -> Vec<Option<u32>> {
+            assert!(self.1 > 0.0, "a store asked at weight 0");
             assert_eq!(device, self.match_workers(&[], &[]));
             self.0.iter().map(|&(_, cached)| cached).collect()
         }
@@ -1018,11 +1024,8 @@ mod tests {
         // w1's device cache holds 60 of the 100 tokens; w2's none, but its store 90.
         let stored = |weight| Stored(vec![(60, Some(60)), (0, Some(90))], weight);
         for (stored, want) in [
-            // Stores not asked: the device caches alone.
-            (
-                Stored(vec![(60, Some(60)), (0, Some(0))], 0.0),
-                Some((0, 0.6, Some(0.6))),
-            ),
+            // At weight 0 the store is not asked: the device caches alone.
+            (stored(0.0), Some((0, 0.6, Some(0.6)))),
             // A loaded token weighing 1 is worth one on the device, and 0.5 half of it.
             (stored(1.0), Some((1, 0.9, Some(0.9)))),
             (stored(0.5), Some((0, 0.6, Some(0.6)))),
