@@ -159,10 +159,12 @@ def test_front_pipe_switch_names_its_build(monkeypatch, rows, name):
     assert kernel.grid == (front.PAIRS,) and kernel.abi == front.REPLICATED_FRONT_ABI
 
 
-def test_front_pipe_sites_parse_delays_and_epilogues():
-    pipe = front.front_pipe(8, True, 320 * 1024, frozenset({"epi", "hw4", "rd16"}))
-    assert pipe == {"fused": True, "diag": frozenset({"hw4"}), "delay": {"router": 16}}
-    assert front._pipe_suffix(pipe) == "_fe_rd16_hw4"
+def test_front_pipe_sites_name_their_epilogues():
+    pipe = front.front_pipe(8, True, 320 * 1024, frozenset({"epi", "hw4", "u2"}))
+    assert pipe == {"fused": True, "hw_fp4": True}
+    assert front._pipe_suffix(pipe) == "_fe_hw4"
+    late = front.front_pipe(40, True, 320 * 1024, frozenset({"late", "u2"}))
+    assert late["unroll"] == 2 and front._pipe_suffix(late) == "_late_u2"
 
 
 def test_herd_candidates_feed_only_the_grouped_moe_finish():

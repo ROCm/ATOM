@@ -178,12 +178,6 @@ def _front_tasks(
     router_weight, latent_weight, shared_weight, shared_scale = weights
     router = pair < LATENT_PAIR0
     latent = (pair >= LATENT_PAIR0) & (pair < SHARED_PAIR0)
-    for role, units in pipe.get("delay", {}).items():
-        sleeps = [127] * (units // 127) + [units % 127] * (units % 127 > 0)
-        member = router if role == "router" else pair >= SHARED_PAIR0
-        if member:
-            for index in range_constexpr(len(sleeps)):
-                rocdl.s_sleep(sleeps[index])
     weight = router.select(router_weight, latent.select(latent_weight, shared_weight))
     weight_rows = router.select(
         fx.Int32(EXPERTS),
@@ -288,7 +282,7 @@ def _front_tasks(
             tid,
             rows,
             tiles,
-            pipe.get("diag", frozenset()),
+            pipe.get("hw_fp4", False),
         )
     else:
         _front_epilogue(
@@ -305,7 +299,7 @@ def _front_tasks(
             tid,
             rows,
             tiles,
-            pipe.get("diag", frozenset()),
+            pipe.get("hw_fp4", False),
         )
     tdm_timeline.stamp(tdm_timeline.STORES_ISSUED)
     tdm_timeline.stores_done()
@@ -326,12 +320,13 @@ def _front_epilogue(
     tid,
     rows,
     tiles,
-    diag=frozenset(),
+    hw_fp4=False,
 ):
     """The two projected tasks' epilogue: router logits, the latent's FP4
     group or the shared gate/up's activation. ``slot_of(task, tile)``: the
     tile's accumulators of ``waves`` waves; ``owned``: how many of the two
-    tasks the CTA projected (both if None)."""
+    tasks the CTA projected (both if None); ``hw_fp4``: the latent's FP4 by
+    ``_fp4_word``."""
     router_logits, latent_fp4, latent_scales, shared_hidden = outputs
     # A round reduces one tile: threads [0, 128) the first task, the
     # rest the second.
@@ -362,7 +357,6 @@ def _front_epilogue(
     tdm_timeline.stamp(tdm_timeline.EPI_SUMS)
     gpu.barrier()
     tdm_timeline.stamp(tdm_timeline.EPI_BARRIER)
-    cm = _diag_cm(diag)
     if shared:
         for round_index in range_constexpr((rows * 8 + THREADS - 1) // THREADS):
             work = tid + THREADS * round_index
@@ -396,25 +390,21 @@ def _front_epilogue(
         code = moe_gfx1250._e8m0_roundup(maximum)
         reciprocal_scale = ((fx.Int32(254) - code) << 23).bitcast(fx.Float32)
         group = row0 // 32
-        if const_expr("xf" not in diag):
+        bo.buffer_store(
+            (
+                _fp4_word(words, code, reciprocal_scale)
+                if const_expr(hw_fp4)
+                else moe_gfx1250._pack_bf16_words(words, reciprocal_scale)
+            ),
+            rsrc(latent_fp4),
+            token * (LATENT // 8) + group * 4 + packed_word,
+        )
+        if packed_word == 0:
             bo.buffer_store(
-                (
-                    _fp4_word(words, code, reciprocal_scale)
-                    if const_expr("hw4" in diag)
-                    else moe_gfx1250._pack_bf16_words(words, reciprocal_scale)
-                ),
-                rsrc(latent_fp4),
-                token * (LATENT // 8) + group * 4 + packed_word,
-                cache_modifier=cm,
+                fx.Int8(code),
+                rsrc(latent_scales),
+                token * (LATENT // 32) + group,
             )
-        if const_expr("xs" not in diag):
-            if packed_word == 0:
-                bo.buffer_store(
-                    fx.Int8(code),
-                    rsrc(latent_scales),
-                    token * (LATENT // 32) + group,
-                    cache_modifier=cm,
-                )
 
 
 def _or(a, b):
@@ -442,13 +432,6 @@ def _fp4_word(words, code, reciprocal_scale):
     return packed
 
 
-def _diag_cm(diag):
-    for d in diag:
-        if d.startswith("cm"):
-            return int(d[2:])
-    return 0
-
-
 @traced
 def _front_epilogue_fused(
     outputs,
@@ -461,7 +444,7 @@ def _front_epilogue_fused(
     tid,
     rows,
     tiles,
-    diag=frozenset(),
+    hw_fp4=False,
 ):
     """``_front_epilogue`` without its second barrier: a round reduces one
     tile, a token's 16 BF16 pairs (the first task's eight, then the
@@ -513,7 +496,7 @@ def _front_epilogue_fused(
             reciprocal_scale = ((fx.Int32(254) - codes[tile]) << 23).bitcast(
                 fx.Float32
             )
-            if const_expr("hw4" in diag):
+            if const_expr(hw_fp4):
                 byte = _fp4_word([packed[tile]], codes[tile], reciprocal_scale)
             else:
                 pair = fx.Vector.from_elements([packed[tile]], fx.Int32).bitcast(
@@ -536,12 +519,7 @@ def _front_epilogue_fused(
                 bo.buffer_store(
                     fx.Int8(codes[tile]),
                     rsrc(latent_scales),
-                    (
-                        group * rows + tokens[tile]
-                        if const_expr("st" in diag)
-                        else tokens[tile] * (LATENT // 32) + group
-                    ),
-                    cache_modifier=_diag_cm(diag),
+                    tokens[tile] * (LATENT // 32) + group,
                 )
         for tile in range_constexpr(tiles):
             if live[tile] & (column_pair % 4 == 0):
@@ -549,7 +527,6 @@ def _front_epilogue_fused(
                     words[tile],
                     rsrc(latent_fp4),
                     tokens[tile] * (LATENT // 8) + group * 4 + column_pair // 4,
-                    cache_modifier=_diag_cm(diag),
                 )
     if shared:
         ups = [xshfl(p, 8, GFX1250) for p in packed]
@@ -738,13 +715,15 @@ _LATE_PLANS = (
 def front_pipe(
     rows: int, pairable: bool, lds_bytes: int, sites=None, paired_default=False
 ):
-    """The late pipeline's plan for ``ATOM_KIMI_MONO_FRONT_PIPE``'s
-    ``sites`` (None: the env's) at ``rows``: ``{paired, depth, fp8_depth,
-    late, token_steps}`` from ``_LATE_PLANS`` (paired ones only if
-    ``pairable``, unpaired ones only where the default pipeline,
-    ``paired_default``, is unpaired; "up": no paired ones, "ua": unpaired
-    ones at any width), or {} without "late" or a plan that fits ``lds_bytes``
-    beside the group rows; "early" adds ``early_scales``."""
+    """The front's pipeline for ``ATOM_KIMI_MONO_FRONT_PIPE``'s ``sites``
+    (None: the env's) at ``rows``. "late": ``{paired, depth, fp8_depth, late,
+    token_steps}`` from ``_LATE_PLANS`` (paired ones only if ``pairable``,
+    unpaired ones only where the default pipeline, ``paired_default``, is
+    unpaired; "up": no paired ones, "ua": unpaired ones at any width), none
+    where no plan fits ``lds_bytes`` beside the group rows. "early":
+    ``early_scales``; "epi": the fused epilogue (``fused``); "hw4": the
+    latent's FP4 by ``_fp4_word`` (``hw_fp4``); "u2" (with a late plan): the
+    step loop unrolled twice (``unroll``). All of them the same bits."""
     sites = envs.ATOM_KIMI_MONO_FRONT_PIPE if sites is None else sites
     pipe = {}
     if "late" in sites:
@@ -766,23 +745,10 @@ def front_pipe(
         pipe["early_scales"] = True
     if "epi" in sites:
         pipe["fused"] = True
-    if "pfc" in sites:
-        pipe["pfc"] = True
+    if "hw4" in sites:
+        pipe["hw_fp4"] = True
     if pipe.get("late") and "u2" in sites:
         pipe["unroll"] = 2
-    delay = {
-        role: int(site[2:])
-        for site in sites
-        for prefix, role in (("rd", "router"), ("sd", "shared"))
-        if site.startswith(prefix) and site[2:].isdigit()
-    }
-    if delay:
-        pipe["delay"] = delay
-    diag = frozenset(
-        s for s in sites if s in ("xs", "xf", "st", "hw4") or s.startswith("cm")
-    )
-    if diag:
-        pipe["diag"] = diag
     return pipe
 
 
@@ -791,10 +757,8 @@ def _pipe_suffix(pipe) -> str:
         ("_late" if pipe.get("late") else "")
         + ("_es" if pipe.get("early_scales") else "")
         + ("_fe" if pipe.get("fused") else "")
-        + ("_pfc" if pipe.get("pfc") else "")
+        + ("_hw4" if pipe.get("hw_fp4") else "")
         + (f"_u{pipe['unroll']}" if pipe.get("unroll") else "")
-        + "".join(f"_{r[0]}d{n}" for r, n in sorted(pipe.get("delay", {}).items()))
-        + "".join(f"_{d}" for d in sorted(pipe.get("diag", ())))
     )
 
 
@@ -873,7 +837,6 @@ def build_replicated_front(
 
     sources = SOURCES
     timeline = tdm_timeline.key()
-    pfc = bool(pipe.pop("pfc", False))
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def kernel(
@@ -892,7 +855,7 @@ def build_replicated_front(
         pair = fx.block_idx.x
         lane = tid % GFX1250.wave_size
         wave = tid // GFX1250.wave_size
-        gemv_tdm.prefetch_code(wave, 8 << 10 if pfc else 10 << 10, force=pfc)
+        gemv_tdm.prefetch_code(wave, 10 << 10)
         gemv_tdm.prefetch_tokens(x, rows, HIDDEN * 2, pair, tid, PAIRS)
         allocator = fx.SharedAllocator()
         lds = allocator.allocate(Lds).peek()
