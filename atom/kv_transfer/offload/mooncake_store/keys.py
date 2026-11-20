@@ -13,7 +13,9 @@ adds what is the Mooncake Store's own:
 * the groups: every rank's object of a chunk is put in one Mooncake group,
   ``{namespace}/group/{digest}``. The master evicts a group whole, so the ranks
   of a chunk do not outlive each other: a chunk any rank lacks is a miss, and
-  the others' objects would only hold memory;
+  the others' objects would only hold memory. The draft objects of
+  ``ATOM_MOONCAKE_STORE_DRAFT_WINDOW`` are in no group: each lives by its own
+  lease, which only the lookups and puts that ask for it renew;
 * the Store's taint marker key (see ``taint``).
 """
 
@@ -28,6 +30,9 @@ from atom.kv_transfer.offload.kv_store.keys import (
     chunk_digest,
     chunk_hash_chain,
     chunk_keys,
+    draft_chunk_keys,
+    draft_namespace,
+    draft_ranks,
     kv_layout_selectors,
     kv_storage_formats,
     pp_stage_layer_spans,
@@ -79,6 +84,9 @@ __all__ = [
     "chunk_group_ids",
     "chunk_hash_chain",
     "chunk_keys",
+    "draft_chunk_keys",
+    "draft_namespace",
+    "draft_ranks",
     "kv_layout_selectors",
     "kv_storage_formats",
     "pp_stage_layer_spans",

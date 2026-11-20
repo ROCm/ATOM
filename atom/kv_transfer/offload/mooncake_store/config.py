@@ -20,6 +20,8 @@ from typing import Any, NamedTuple
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload.mooncake_store.layouts import require_mooncake_layout
 from atom.kv_transfer.offload.mooncake_store.nic import parse_device_list
+from atom.spec_decode.draft_window_geometry import DraftReadWindow, draft_read_window
+from atom.utils import envs
 
 KEY_PREFIX = "mooncake_store."
 _MIB = 1 << 20
@@ -183,6 +185,26 @@ def parse_mooncake_store_config(
     )
 
 
+def store_draft_window(config: Any) -> DraftReadWindow | None:
+    """The draft read window the split layout keeps draft rows for; None when
+    ATOM_MOONCAKE_STORE_DRAFT_WINDOW is off. Raises ValueError where it cannot run."""
+    if not envs.ATOM_MOONCAKE_STORE_DRAFT_WINDOW:
+        return None
+    layout = offcfg.select_offload_layout(config)
+    if layout != "m3":
+        raise ValueError(
+            "ATOM_MOONCAKE_STORE_DRAFT_WINDOW splits the M3 PAGE layout only; "
+            f"this model resolves to {layout!r}"
+        )
+    window = draft_read_window(config)
+    if window is None:
+        raise ValueError(
+            "ATOM_MOONCAKE_STORE_DRAFT_WINDOW needs a DSpark draft that reads a "
+            "sliding window through a known page and rides the target's KV blocks"
+        )
+    return window
+
+
 def check_engine_compatibility(cfg: MooncakeStoreOffloadConfig, config: Any) -> None:
     """Accept dense, M3 PAGE, and V4.1 replay PAGEs; refuse other layouts and DCP.
 
@@ -194,10 +216,12 @@ def check_engine_compatibility(cfg: MooncakeStoreOffloadConfig, config: Any) -> 
     virtual block that the chunk keys do not name.
 
     Raises:
-        ValueError: The model is neither dense, M3, nor V4.1, DCP > 1, or the
-            chunk is not a whole number of KV blocks.
+        ValueError: The model is neither dense, M3, nor V4.1, DCP > 1, the
+            chunk is not a whole number of KV blocks, or `store_draft_window`
+            refuses the split layout.
     """
     require_mooncake_layout(offcfg.select_offload_layout(config))
+    store_draft_window(config)
     dcp = int(getattr(config, "decode_context_parallel_size", 1) or 1)
     if dcp > 1:
         raise ValueError(
