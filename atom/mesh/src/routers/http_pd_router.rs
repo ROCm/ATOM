@@ -440,7 +440,7 @@ impl PDRouter {
             ));
         };
         // Under idx2idx the planner already selects a prefill idx2idx keeps for the decode;
-        // the remap moves one only if health changed between planning and this reservation.
+        // the remap moves one only if health or membership changed since planning.
         let prefill = if matches!(self.backend, BackendType::Atom) {
             self.apply_atom_pd_rank_mapping_policy(prefill, &decode)
         } else {
