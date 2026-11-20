@@ -17,7 +17,7 @@ from aiter.rotary_embedding import get_rope
 from torch import nn
 from transformers import PretrainedConfig
 
-from atom.config import Config, QuantizationConfig
+from atom.config import Config, QuantizationConfig, get_current_atom_config
 from atom.distributed.indexer_cp import indexer_cp_enabled
 from atom.distributed.ulysses_sp import local_num_kv_heads
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
@@ -295,6 +295,7 @@ class MiniMaxM3MoE(nn.Module):
         quant_config: QuantizationConfig | None = None,
         params_dtype: torch.dtype | None = None,
         prefix: str = "",
+        alt_stream: torch.cuda.Stream | None = None,
     ) -> None:
         super().__init__()
         del layer_id
@@ -367,32 +368,72 @@ class MiniMaxM3MoE(nn.Module):
             and isinstance(self.experts.quant_method, Mxfp4MoEMethod)
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        self.alt_stream = alt_stream
+        self.prefix = prefix
+        self._use_dual_stream = False
+        if self.shared_experts is not None and self.alt_stream is not None:
+            atom_config = get_current_atom_config()
+            if (
+                envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0
+                and not atom_config.enable_tbo
+            ):
+                self._use_dual_stream = True
+                atom_config.compilation_config.static_forward_context[prefix] = self
+
+    def _scale_routed(self, routed_output: torch.Tensor) -> torch.Tensor:
+        if not self.fuse_shared_experts and self.routed_scaling_factor != 1.0:
+            routed_output = routed_output * self.routed_scaling_factor
+        return routed_output
+
+    def routed_expert_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Run the routed E128/top-4 branch and keep its TP-partial output."""
+        router_logits = self.gate(hidden_states)
+        routed_output = self.experts(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+        )
+        return self._scale_routed(routed_output)
+
+    def single_stream_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, orig_shape[-1])
-        router_logits = self.gate(hidden_states)
-
-        shared_x = shared_x_scale = None
         if self.shared_input_from_moe_quant:
+            # Serial only: the shared expert reads the routed quant's output
+            # here, so the two branches are not independent. The dual-stream
+            # path below keeps the shared expert's own quant.
+            router_logits = self.gate(hidden_states)
             routed_output, shared_x, shared_x_scale = (
                 self.experts.forward_with_mxfp8_copy(hidden_states, router_logits)
             )
-        else:
-            routed_output = self.experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-            )
-        if not self.fuse_shared_experts and self.routed_scaling_factor != 1.0:
-            routed_output = routed_output * self.routed_scaling_factor
-
-        if shared_x is not None:
-            routed_output = routed_output + self.shared_experts(
+            routed_output = self._scale_routed(routed_output) + self.shared_experts(
                 shared_x, x_scale=shared_x_scale
             )
-        elif self.shared_experts is not None:
+            return routed_output.view(orig_shape)
+        routed_output = self.routed_expert_forward(hidden_states)
+        if self.shared_experts is not None:
             routed_output = routed_output + self.shared_experts(hidden_states)
-
         return routed_output.view(orig_shape)
+
+    def dual_stream_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Overlap the independent shared MLP with the routed MoE branch."""
+        orig_shape = hidden_states.shape
+        hidden_states = hidden_states.view(-1, orig_shape[-1])
+        current_stream = torch.cuda.current_stream()
+        alt_stream = self.alt_stream
+
+        alt_stream.wait_stream(current_stream)
+        with torch.cuda.stream(alt_stream):
+            shared_output = self.shared_experts(hidden_states)
+
+        routed_output = self.routed_expert_forward(hidden_states)
+        current_stream.wait_stream(alt_stream)
+        shared_output.record_stream(current_stream)
+        return (routed_output + shared_output).view(orig_shape)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self._use_dual_stream:
+            return torch.ops.aiter.maybe_dual_stream_forward(hidden_states, self.prefix)
+        return self.single_stream_moe_forward(hidden_states)
 
 
 class MiniMaxM3Attention(nn.Module):
@@ -650,6 +691,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         quant_config: QuantizationConfig | None = None,
         params_dtype: torch.dtype | None = None,
         layer_num: int = 0,
+        alt_stream: torch.cuda.Stream | None = None,
     ) -> None:
         super().__init__()
         attn_cls = (
@@ -674,6 +716,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 quant_config=quant_config,
                 params_dtype=params_dtype,
                 prefix=f"{prefix}.block_sparse_moe",
+                alt_stream=alt_stream,
             )
         else:
             self.mlp = MiniMaxM3MLP(
@@ -790,6 +833,12 @@ class MiniMaxM3Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
+        self.alt_stream = (
+            torch.cuda.Stream()
+            if torch.cuda.is_available() and getattr(config, "n_shared_experts", 0)
+            else None
+        )
+        alt_stream = self.alt_stream
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix, layer_num=None: layer_type(
@@ -800,6 +849,7 @@ class MiniMaxM3Model(nn.Module):
                 quant_config=quant_config,
                 layer_num=layer_num,
                 params_dtype=atom_config.torch_dtype,
+                alt_stream=alt_stream,
             ),
             prefix=f"{prefix}.layers",
             layer_num_offset=0,
