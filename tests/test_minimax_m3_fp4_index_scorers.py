@@ -159,9 +159,15 @@ def test_decode_scorers_match_reference_and_each_other(max_q, warps):
     from atom.model_ops.minimax_m3 import index_topk as m
 
     torch.manual_seed(max_q)
-    pages, batch = 64, 4
+    pages, batch = 64, 5
     payload, scale = fp4_cache(pages, 2)
-    seq = torch.tensor([20 * PAGE + 9, max_q, 7 * PAGE, 32 * PAGE], dtype=torch.int32)
+    # The causal mask runs only on blocks reaching past the first row's cutoff
+    # (`nvfp4_block_max`): 10 * PAGE + 3 puts a verify's rows on both sides of a
+    # block boundary (its block 9 whole for the late rows, cut for the early
+    # ones, block 10 hidden from the early ones), 7 * PAGE ends on one.
+    seq = torch.tensor(
+        [20 * PAGE + 9, max_q, 7 * PAGE, 32 * PAGE, 10 * PAGE + 3], dtype=torch.int32
+    )
     bt = torch.stack([torch.randperm(pages)[:32] for _ in range(batch)]).to(torch.int32)
     q = torch.randn(batch * max_q, 1, D, dtype=torch.bfloat16)
     seq, bt, q = seq.to(DEV), bt.to(DEV), q.to(DEV)

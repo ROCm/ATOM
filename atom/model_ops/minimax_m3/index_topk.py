@@ -1841,6 +1841,8 @@ def _decode_index_score_transposed_kernel(
                 blk * BLOCK_SIZE_K,
                 off_k,
                 causal_len,
+                # The first query row's cutoff, the smallest.
+                seq_len - MAX_Q + 1,
                 sm_scale_log2e,
             )
         else:

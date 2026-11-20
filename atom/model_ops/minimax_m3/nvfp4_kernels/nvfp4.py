@@ -274,11 +274,20 @@ def nvfp4_scaled_dot(q_hi, q_lo, q_lo_scale, payload, scale):
 
 
 @triton.jit
-def nvfp4_block_max(dot, block_start, offs, cutoff, scale):
+def nvfp4_block_max(dot, block_start, offs, cutoff, min_cutoff, scale):
     """``[N]`` max over one block's key positions ``block_start + offs`` of
     ``dot`` ``[N, len(offs)]``, causal (position < the row's ``cutoff``), times
     ``scale`` > 0 -- after the max: rounding is monotone, so max(x) * s rounds to
     max(x * s), the same bits as scaling every product, one multiply a row
-    instead of one an element."""
-    dot = tl.where((block_start + offs)[None, :] < cutoff[:, None], dot, float("-inf"))
+    instead of one an element.
+
+    ``min_cutoff``: a scalar no greater than any row's ``cutoff``. A block that
+    ends at or before it is visible to every row, so its mask is all-true and is
+    skipped: on gfx1250 the mask is ~330 of the 32-row scorer's ~700
+    instructions a block, and only a request's last block or two need it."""
+    BLOCK: tl.constexpr = offs.shape[0]
+    if block_start + BLOCK > min_cutoff:
+        dot = tl.where(
+            (block_start + offs)[None, :] < cutoff[:, None], dot, float("-inf")
+        )
     return tl.max(dot, axis=1) * scale
