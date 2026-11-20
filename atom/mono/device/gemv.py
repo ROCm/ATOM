@@ -16,7 +16,7 @@ inside a chunk is a permutation both operands share, so the dot is unchanged.
 ``w8``: the weight is ATOM's per-token FP8 linear as the production GEMM holds
 it -- E4M3 in AITER's (16, 16) preshuffle, ``[N/16][K/32][2][16 rows][16 B]``,
 with an fp32 scale a row. A lane's 8 elements of a q step are then 8 contiguous
-bytes (``w8_offset``), widened to the same bf16 operand exactly
+bytes (``preshuffle.w8_offset``), widened to the same bf16 operand exactly
 (``fp8x8_bf16_pk``): the MFMAs and the K order are the bf16 path's, and the
 row's scale multiplies the reduced sum (``row_value``), loaded before the MFMAs
 so that it lands under them (``pair_scales``).
@@ -40,6 +40,7 @@ from atom.mono.device.ops import (
     xshfl,
 )
 from atom.mono.plan.execution import THREADS, WAVES
+from atom.mono.plan.preshuffle import w8_lane_dwords
 
 ROWS = 16
 KCH = 128
@@ -160,31 +161,6 @@ def _select4(cond, a, b):
     return fx.Vector.from_elements(
         [cond.select(a[e], b[e]) for e in range(4)], fx.Int32
     )
-
-
-# dwords from a lane's 8 fp8 of one q step to the next's: 32 K columns, a K
-# block (``w8_offset``)
-W8_QSTEP = 128
-
-
-def w8_offset(row0, r, col, ldk):
-    """The byte of element (row0 + r, col) of an ``[N, ldk]`` E4M3 plane in
-    AITER's (16, 16) preshuffle, ``[N/16][K/32][2][16 rows][16 B]`` (``row0`` a
-    multiple of 16, r < 16). The 8 elements from a ``col`` multiple of 8 are
-    contiguous: a lane's operand of a q step."""
-    return (
-        ((row0 // ROWS * (ldk // 32) + col // 32) * 2 + col % 32 // 16) * 256
-        + r * 16
-        + col % 16
-    )
-
-
-def w8_lane_dwords(row0, lane, kcol, ldk):
-    """The dwords of a lane's four q-step operands of chunk ``kcol`` in a
-    preshuffled E4M3 plane (``w8_offset``): row row0 + lane % 16, 8 elements
-    from kcol + 32 q + 8 (lane / 16), as ``chunk_ops`` takes them."""
-    base = w8_offset(row0, lane % ROWS, kcol + 8 * (lane // ROWS), ldk) // 4
-    return [base + W8_QSTEP * q for q in range(4)]
 
 
 def w8_chunk_ops(r_w, row0, ldk, kcol, lane, cm=CM_NT):

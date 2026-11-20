@@ -45,6 +45,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int32, Int64, T
 
 from atom.models.kimi_k3.mono.config import TOKEN_GROUP, group_rows, groups
+from atom.models.kimi_k3.mono.kda_plan import fb_w8_dword, fb_w8_offset
 from atom.models.kimi_k3.mono.kernels import token_groups
 from atom.models.kimi_k3.mono.sources import SOURCES
 from atom.mono.device import gemv
@@ -262,7 +263,7 @@ class KdaPreBuild:
     # a block-write layer's block: the updated prefix stored there
     write_idx: int = field(default=-1, metadata={"sym": "wi"})
     # in_proj and f_b as the production per-token FP8 GEMMs hold them
-    # (``gemv.w8_offset``, a row scale each) rather than plain bf16
+    # (``preshuffle.w8_offset``, a row scale each) rather than plain bf16
     w8: bool = field(default=False, metadata={"sym": "q"})
     # ReplaySSM (``fla_ops.replayssm``): the record buffer's length (its
     # ``cache_len``), 0 without. A request's state is its checkpoint plus the
@@ -1102,19 +1103,12 @@ def fb_loads(c, k):
 def fb_offset(c, h):
     """The dword of the lane's first f_b operand: wave w's rows 16 w .. of head
     h, a lane 64 B of its row (K columns 32 g .., g = lane / 16). ``w8``: the
-    same columns' in the preshuffled E4M3 plane (``gemv.w8_offset``)."""
+    same columns' in the preshuffled E4M3 plane (``kda_plan.fb_w8_offset``)."""
     lane, wave = c["lane"], c["wave"]
     if const_expr(c["w8"]):
-        return gemv.w8_offset(h * HD + wave * 16, lane % 16, lane // 16 * 32, HD) // 4
+        return fb_w8_offset(h, wave, lane)
     fr = h * HD + wave * 16 + lane % 16
     return (fr * HD + (lane // 16) * 32) // 2
-
-
-def fb_w8_dword(at, q):
-    """The dword of f_b operand q (K columns 32 g + 8 q of the lane's row) in
-    the preshuffled E4M3 plane, ``at`` the lane's first (``fb_offset``): 16 B
-    half q / 2 of its 32-column K block, 8 B q % 2 into it."""
-    return at + gemv.w8_offset(0, 0, 16 * (q // 2), HD) // 4 + q % 2 * 2
 
 
 def kda_task_inputs(c, req, h, m0, channels, rows):

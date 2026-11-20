@@ -113,7 +113,7 @@ def _dense(module, name: str, shape: tuple[int, ...]):
     place -- E4M3 preshuffled by AITER's ``shuffle_weight`` at its default
     (16, 16) layout (``shuffle_weights``), rows padded past ``shape[0]`` to the
     GEMM's tile, an fp32 scale a padded row. ``linear_ptpc_fp8`` checks that
-    much; the kernels index the layout (``gemv.w8_offset``) and need the rest
+    much; the kernels index the layout (``preshuffle.w8_offset``) and need the rest
     checked here, so any other plane those records describe is refused. The
     shuffle's layout itself is not recorded on the tensor: ATOM's linears
     shuffle at that default only."""

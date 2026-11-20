@@ -8,10 +8,11 @@ per-token FP8 plane in place (E4M3 in AITER's (16, 16) preshuffle, rows padded
 to 16, an fp32 scale a padded row). Anything else the weight's records describe
 would be indexed as one of those and read wrong, with no error, so ``_dense``
 has to refuse it at bind.
-The binder compares quant types by name, so these run without AITER; the last
-four check the kernels against AITER's own shuffle where it imports: their
-indexing, then (on a GPU) the shared GEMV pieces against the dequantized
-product and on every finite E4M3 byte.
+The binder compares quant types by name, so these run without AITER. So do the
+checks of the kernels' FP8 addresses (``preshuffle``, ``kda_plan``) against the
+preshuffle written out, which is itself checked against K3's unshuffle, and
+against AITER's own shuffle where it imports. On a GPU, the shared GEMV pieces
+are checked against the dequantized product and on every finite E4M3 byte.
 """
 
 from types import SimpleNamespace
@@ -19,8 +20,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from atom.models.kimi_k3.mono import kda_plan, layouts
 from atom.models.kimi_k3.mono import weights as W
 from atom.models.kimi_k3.mono.config import EXPERTS, HEAD_DIM, HIDDEN, Dims
+from atom.mono.plan import preshuffle
 from atom.mono.runtime.consensus import MonoUnsupported
 
 FP8 = torch.float8_e4m3fn
@@ -168,50 +171,76 @@ def test_a_moe_layer_with_mixed_projections_is_refused(monkeypatch, bf16):
         W.bind_moe(layer, 1, Dims(8), 0)
 
 
-def shuffled(rows, k):
+def preshuffled(rows, k):
+    """Random E4M3 bytes and their (16, 16) preshuffle, written out as AITER's
+    ``shuffle_weight`` permutes 1-byte elements: [N/16][K/32][2][16 rows][16 B]."""
     plain = torch.randint(
         0, 256, (rows, k), dtype=torch.uint8, generator=torch.Generator().manual_seed(0)
     )
+    flat = plain.view(-1, rows // 16, 16, k // 32, 2, 16).permute(0, 1, 3, 4, 2, 5)
+    return plain, flat.reshape(-1)
+
+
+def test_the_written_out_preshuffle_is_aiters():
+    # the reference below, against the shuffle ATOM's FP8 linears apply
     shuffle = pytest.importorskip("aiter.ops.shuffle")
-    flat = shuffle.shuffle_weight(plain.view(FP8), layout=(16, 16))
-    return plain, flat.view(torch.uint8).reshape(-1)
+    for rows, k in ((48, 384), (2 * HEAD_DIM, HEAD_DIM)):
+        plain, flat = preshuffled(rows, k)
+        aiter = shuffle.shuffle_weight(plain.view(FP8), layout=(16, 16))
+        assert torch.equal(aiter.view(torch.uint8).reshape(-1), flat)
 
 
-def test_w8_offset_indexes_the_production_preshuffle():
-    # the kernels read the plane ATOM's FP8 linear holds: shuffle_weight at
-    # (16, 16). Every 8-element run, then a GEMV chunk's operands as
-    # gemv.w8_chunk_ops loads them: lane group g's 8 at kcol + 32 q + 8 g
-    gemv = pytest.importorskip("atom.mono.device.gemv", exc_type=ImportError)
-    rows, k = 48, 384
-    plain, flat = shuffled(rows, k)
+def test_k3s_unshuffle_inverts_the_written_out_preshuffle():
+    # the same reference without AITER: K3's host-side layouts invert it
+    for rows, k in ((48, 384), (2 * HEAD_DIM, HEAD_DIM)):
+        plain, flat = preshuffled(rows, k)
+        assert torch.equal(layouts.unshuffle_weight(flat.view(rows, k)), plain)
+
+
+@pytest.mark.parametrize("rows, k", [(48, 384), (32, 128), (16, HIDDEN)])
+def test_w8_offset_indexes_the_production_preshuffle(rows, k):
+    # every 8-element run, then a GEMV chunk's operands as gemv.w8_chunk_ops
+    # loads them: lane group g's 8 at kcol + 32 q + 8 g
+    plain, flat = preshuffled(rows, k)
     for row in range(rows):
         for col in range(0, k, 8):
-            at = gemv.w8_offset(row - row % 16, row % 16, col, k)
+            at = preshuffle.w8_offset(row - row % 16, row % 16, col, k)
             assert torch.equal(flat[at : at + 8], plain[row, col : col + 8])
     for row0 in range(0, rows, 16):
         for lane in range(64):
             for kcol in range(0, k, 128):
-                dwords = gemv.w8_lane_dwords(row0, lane, kcol, k)
+                dwords = preshuffle.w8_lane_dwords(row0, lane, kcol, k)
                 for q, at in enumerate(dwords):
                     col = kcol + 32 * q + 8 * (lane // 16)
                     want = plain[row0 + lane % 16, col : col + 8]
                     assert torch.equal(flat[4 * at : 4 * at + 8], want)
 
 
-def test_fb_offset_indexes_the_production_preshuffle():
-    # kda_gates' f_b operands (fb_offset, fb_w8_dword): wave w's rows 16 w ..
-    # of head h, lane group g's K columns 32 g + 8 q
+def test_the_kernels_index_through_these():
+    # what the two tests around this one check is what the kernels call
+    gemv = pytest.importorskip("atom.mono.device.gemv", exc_type=ImportError)
     kda = pytest.importorskip(
         "atom.models.kimi_k3.mono.kernels.attention.kda", exc_type=ImportError
     )
-    hd = kda.HD
-    plain, flat = shuffled(2 * hd, hd)
+    assert gemv.w8_lane_dwords is preshuffle.w8_lane_dwords
+    assert kda.fb_w8_dword is kda_plan.fb_w8_dword
+    assert kda.HD == HEAD_DIM
+    for h, wave, lane in ((0, 0, 0), (1, 7, 63), (3, 2, 17)):
+        c = {"lane": lane, "wave": wave, "w8": True}
+        assert kda.fb_offset(c, h) == kda_plan.fb_w8_offset(h, wave, lane)
+
+
+def test_fb_offset_indexes_the_production_preshuffle():
+    # kda_gates' f_b operands (fb_offset's FP8 branch, fb_w8_dword): wave w's
+    # rows 16 w .. of head h, lane group g's K columns 32 g + 8 q
+    hd = HEAD_DIM
+    plain, flat = preshuffled(2 * hd, hd)
     for h in range(2):
         for wave in range(hd // 16):
             for lane in range(64):
-                base = kda.fb_offset({"lane": lane, "wave": wave, "w8": True}, h)
+                base = kda_plan.fb_w8_offset(h, wave, lane)
                 for q in range(4):
-                    at = 4 * kda.fb_w8_dword(base, q)
+                    at = 4 * kda_plan.fb_w8_dword(base, q)
                     row = h * hd + 16 * wave + lane % 16
                     col = 32 * (lane // 16) + 8 * q
                     assert torch.equal(flat[at : at + 8], plain[row, col : col + 8])
