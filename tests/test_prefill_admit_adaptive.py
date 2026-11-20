@@ -11,6 +11,9 @@ import random
 import pytest
 
 from atom.model_engine.prefill_delayer import (
+    _COLD_MAX_TICKS,
+    _DEC_HALF_LIFE,
+    _DEC_MIN_N,
     _FIXED_SLOTS,
     PrefillDelayer,
     _EwFit,
@@ -167,3 +170,48 @@ def test_cycle_matches_eoq_with_fitted_costs(a_us, lam):
     k_eoq = math.sqrt(2 * a * 300 / (lam * t0))
     assert 4 < k_eoq < d._adapt_max_ticks(t0, True)
     assert 0.7 * k_eoq < cyc < 1.4 * k_eoq, (cyc, k_eoq)
+
+
+def _adaptive():
+    return PrefillDelayer(
+        dp_size=1, cpu_group=None, max_num_batched_tokens=16384, admit_policy="adaptive"
+    )
+
+
+def _decode_steps(d, n, step_s, running=100):
+    zeros = [0] * d._reduce_buf.numel()
+    for _ in range(n):
+        d._adapt_observe(zeros, step_s, False, running)
+
+
+def test_cap_not_below_cold_start_cap():
+    # a slow decode mean must not shorten the TTFT cap below the cold-start
+    # cap: a shorter cap admits prefill more often, which slows decode more
+    d = _adaptive()
+    slow_t0 = 0.75 * 4 * (600_000 / _COLD_MAX_TICKS)
+    assert d._adapt_max_ticks(slow_t0, True) == _COLD_MAX_TICKS
+    fast_t0 = 0.75 * (600_000 / (2 * _COLD_MAX_TICKS))
+    assert d._adapt_max_ticks(fast_t0, True) == 2 * _COLD_MAX_TICKS
+
+
+def test_decode_step_after_prefill_not_in_t0():
+    d = _adaptive()
+    zeros = [0] * d._reduce_buf.numel()
+    _decode_steps(d, _DEC_MIN_N + 1, 0.020)
+    n = d._adapt_dec_fit.n
+    d._adapt_observe(zeros, 0.090, True, 100)  # a prefill step
+    _decode_steps(d, 1, 0.060)  # the decode step right after it
+    assert d._adapt_dec_fit.n == n
+    _decode_steps(d, 1, 0.020)  # the next decode step counts
+    assert d._adapt_dec_fit.n == n + 1
+    assert abs(d._adapt_dec_fit.mean_y() - 20000.0) < 1e-6
+
+
+def test_decode_spike_clipped_at_twice_mean():
+    clipped, ref = _adaptive(), _EwFit(_DEC_HALF_LIFE)
+    _decode_steps(clipped, _DEC_MIN_N + 1, 0.020)
+    for _ in range(_DEC_MIN_N):
+        ref.add(100.0, 20000.0)
+    _decode_steps(clipped, 1, 2.0)  # a stall
+    ref.add(100.0, 40000.0)
+    assert abs(clipped._adapt_dec_fit.mean_y() - ref.mean_y()) < 1e-6
