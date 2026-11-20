@@ -60,7 +60,14 @@ from atom.models.kimi_k3.mono.kernels.attention.kda import (
     TG,
 )
 from atom.mono.device import gemv, queue, route
-from atom.mono.device.mx import FP4, UNIT_SCALE, fp4_tile_load, mfma_scaled, scale_index
+from atom.mono.device.mx import (
+    FP4,
+    UNIT_SCALE,
+    fp4_pack2,
+    fp4_tile_load,
+    mfma_scaled,
+    scale_index,
+)
 from atom.mono.device.ops import (
     CM_DEV,
     bf2_f32,
@@ -399,20 +406,6 @@ def e8m0_roundup(amax):
     wi = (amax * fx.Float32(1.0 / 6.0)).bitcast(fx.Int32)
     b = fx.Int32(fx.Uint32(wi + fx.Int32(0x7FFFFF)) >> fx.Uint32(23)) & 0xFF
     return fx.min(b, fx.Int32(254))
-
-
-def pk_fp4_f32(old, a, b, scale, j):
-    """Two f32 / scale -> E2M1 nibbles into byte j of ``old`` (RNE, saturating)."""
-    return fx.Int32(
-        rocdl.cvt_scalef32_pk_fp4_f32(
-            T.i32,
-            as_ir_value(fx.Int32(old)),
-            as_ir_value(fx.Float32(a)),
-            as_ir_value(fx.Float32(b)),
-            as_ir_value(fx.Float32(scale)),
-            j,
-        )
-    )
 
 
 def pk_fp4_bf16(old, word, scale, j):
@@ -1091,7 +1084,7 @@ def ug_tile(c, task, ops, first, count):
         for j in range_constexpr(4):
             x0 = fx.ptr_load(c["av"] + (tt * 32 + col * 8 + 2 * j))
             x1 = fx.ptr_load(c["av"] + (tt * 32 + col * 8 + 2 * j + 1))
-            pk = pk_fp4_f32(pk, x0, x1, scale, j)
+            pk = fp4_pack2(pk, x0, x1, scale, j)
         row = first + tt
         st_dev(pk, c["inter"], row * INTER_WORDS + g * 4 + col)
         if col == 0:
