@@ -432,6 +432,14 @@ def build_packed_finish(
 
     wave_drop = parallel_herd and envs.ATOM_KIMI_MONO_HERD_WAVE_DROP
     split_bound = rolled and envs.ATOM_KIMI_MONO_ROUTE_SPLIT_BOUND
+    # A routing CTA keeps its own candidates (stage_route_cta's) for its HERD.
+    own_local = (
+        rolled
+        and parallel_herd
+        and herd_poll_limit is None
+        and envs.ATOM_KIMI_MONO_HERD_OWN_LOCAL
+    )
+    poll_space = envs.ATOM_KIMI_MONO_HERD_POLL_SPACE
     name = (
         f"k3_k2_gfx1250_persistent_finish_s{rows}_b{plan.blocks}"
         f"{'_rl' if rolled else ''}"
@@ -443,6 +451,7 @@ def build_packed_finish(
         f"{'_ra' if routes_apart and not parallel_herd else ''}"
         f"{'_nohwd' if parallel_herd and not wave_drop else ''}"
         f"{'_norsb' if rolled and not split_bound else ''}"
+        f"{f'_hol{poll_space}' if own_local else ''}"
         f"{f'_pl{herd_poll_limit}' if herd_poll_limit is not None else ''}"
         f"{'_profile' if profile else ''}"
         f"{tdm_timeline.suffix()}"
@@ -700,17 +709,17 @@ def build_packed_finish(
             # One CTA owns one token.  The old candidate serialized all rows
             # through CTA 0 even though routing has no cross-token reduction.
             if const_expr(rolled):
-                moe_gfx1250.stage_route_cta(
-                    {
-                        **context,
-                        "threads": THREADS,
-                        "route_lds": {
-                            name: getattr(route_role, name).ptr for name in route_lds_words
-                        },
-                        "split_bound": split_bound,
+                route_c = {
+                    **context,
+                    "threads": THREADS,
+                    "route_lds": {
+                        name: getattr(route_role, name).ptr for name in route_lds_words
                     },
-                    route_token,
-                    payload.local_bytes // 4,
+                    "split_bound": split_bound,
+                    "own_candidates": own_local,
+                }
+                survivors = moe_gfx1250.stage_route_cta(
+                    route_c, route_token, payload.local_bytes // 4
                 )
             else:
                 moe_gfx1250.stage_route(
@@ -727,15 +736,30 @@ def build_packed_finish(
                 # The token's own HERD, past every token's candidates; the
                 # first token's CTA moves the launch counter on (every routing
                 # CTA has read it: its candidates carry its tag).
-                moe_gfx1250.stage_herd_token(
-                    {
-                        **herd_context(moe_gfx1250.herd_tag(launch)),
-                        "poll_limit": herd_poll_limit,
-                        "wave_drop": wave_drop,
-                    },
-                    rows,
-                    route_token,
-                )
+                if const_expr(own_local):
+                    # The batch popularity in the routing's score keys, which
+                    # its placement leaves alone.
+                    moe_gfx1250.stage_herd_token_local(
+                        {
+                            **herd_context(moe_gfx1250.herd_tag(launch)),
+                            "route_c": route_c,
+                            "popularity": route_role.keys.ptr,
+                            "poll_space": poll_space,
+                        },
+                        rows,
+                        route_token,
+                        survivors,
+                    )
+                else:
+                    moe_gfx1250.stage_herd_token(
+                        {
+                            **herd_context(moe_gfx1250.herd_tag(launch)),
+                            "poll_limit": herd_poll_limit,
+                            "wave_drop": wave_drop,
+                        },
+                        rows,
+                        route_token,
+                    )
                 stamp("herd_done")
                 if (route_token == 0) & (tid == 0):
                     bo.buffer_store(launch + 1, rsrc(scratch), launch_word)
