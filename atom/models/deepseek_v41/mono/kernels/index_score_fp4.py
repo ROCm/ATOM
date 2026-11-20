@@ -40,6 +40,7 @@ from flydsl.expr import math as fmath
 from flydsl.expr.typing import Int32, T, as_ir_value
 
 from atom.models.deepseek_v41.mono import index_plan as ip
+from atom.models.deepseek_v41.mono.kernels.index_tp_work import row_work
 from atom.mono.device.mx import FP4, mfma_scaled
 from atom.mono.device.ops import (
     CM_DEV,
@@ -49,6 +50,8 @@ from atom.mono.device.ops import (
     permlane_swap,
     rsrc,
     traced,
+    uniform,
+    wave_max,
 )
 from atom.mono.plan.execution import BLOCKS, THREADS, WAVES
 from atom.mono.plan.trace import enter_stage
@@ -72,6 +75,14 @@ N_KV = 5  # a step's key buffer: four tiles and their scales
 REINDEX_TASK_CHUNKS = WAVES * ip.STEP // ip.CHUNK
 NEG = float("-inf")
 FLT_MAX = 3.4028234663852886e38
+
+
+def _depth(c):
+    return c.get("score_depth", DEPTH)
+
+
+def _single_row_full(c):
+    return c.get("single_row_full", False)
 
 
 def _vop(asm, *args):
@@ -135,7 +146,7 @@ def _lds_barrier():
 
 
 @traced
-def _stage_rows(c, lead, span, first_keys=None):
+def _stage_rows(c, lead, span, first_keys=None, rows_n=ip.WALK_ROWS):
     """The piece's rows into LDS, read once a CTA (every wave reading its own
     copy put the CTA's waves on the same lines at once): thread u <
     ROW_WORDS / 4 of the waves that hold one reads 16 B of each row's query,
@@ -146,15 +157,25 @@ def _stage_rows(c, lead, span, first_keys=None):
     its read. Reads, keys and stores in one branch (a store behind it let LLVM
     sink the reads past the keys)."""
     a, tid = _stage_args(c), c["tid"]
+    query_ready = c.get("query_ready", False)
+    query_parts = c.get("query_parts", 1)
+    if const_expr(query_ready):
+        for u in range(tid, span * ip.HEADS * query_parts, THREADS):
+            c["poll"]([(c["qready"], lead * ip.HEADS * query_parts + u, 1)])
+        if const_expr(c.get("split_weights", False)):
+            for u in range(tid, span * ip.HEADS, THREADS):
+                c["poll"]([(c["iwready"], lead * ip.HEADS + u, 1)])
+        gpu.barrier()
+    depth = _depth(c)
     lds = c["sel_lds"]["keys"]
     q_units, qs_units = ip.HEADS * ip.DIM // 32, ip.HEADS * 2 // 4
     # (the branches' result: a value of its type first)
     zero4 = fx.Vector.filled(4, 0, fx.Int32)
-    init = ([zero4] * 4 + [fx.Int32(0)]) * DEPTH + [fx.Int32(0)] * DEPTH
+    init = ([zero4] * 4 + [fx.Int32(0)]) * depth + [fx.Int32(0)] * depth
     if tid < ROW_WAVES * 64:
         u = fx.min(tid, ROW_WORDS // 4 - 1)
         got = []
-        for r in range_constexpr(ip.WALK_ROWS):
+        for r in range_constexpr(rows_n):
             tok = lead + fx.min(fx.Int32(r), span - 1)
             byte = (u < q_units).select(
                 a["iq"] + fx.Int64(tok * (q_units * 16) + u * 16),
@@ -176,13 +197,13 @@ def _stage_rows(c, lead, span, first_keys=None):
             (fx.Int32(r) < span).select(
                 ld_i32(a["ibound"], lead + fx.min(fx.Int32(r), span - 1)), fx.Int32(0)
             )
-            for r in range(ip.WALK_ROWS)
+            for r in range(rows_n)
         ]
         if const_expr(first_keys is not None):
             init = first_keys()
-        for r in range_constexpr(ip.WALK_ROWS):
+        for r in range_constexpr(rows_n):
             fx.ptr_store(got[r], lds + (r * ROW_WORDS + u * 4))
-        for r in range_constexpr(ip.WALK_ROWS):
+        for r in range_constexpr(rows_n):
             fx.ptr_store(bounds[r], lds + (BOUNDS_AT + r))
     elif const_expr(first_keys is not None):
         init = first_keys()
@@ -193,6 +214,10 @@ def _rows(c, rows):
     """The piece's first ``rows`` rows as a wave holds them, from LDS:
     (bound, query operands [mi], scale dword, half-weights [mi][e]) a row;
     rows past the span repeat its last and write nothing (bound 0)."""
+    if c.get("wide_score", False):
+        from atom.models.deepseek_v41.mono.kernels.index_score_fp4_32 import rows32
+
+        return rows32(c)
     lane, lds = c["lane"], c["sel_lds"]["keys"]
     l, g = lane % 16, lane // 16
     v4 = fx.Vector.make_type(4, fx.Int32)
@@ -221,6 +246,10 @@ def _page(c, trow, st):
     """This lane's page of step st: keys 4 l .. 4 l + 3, off table row
     ``trow``, whose entries name 2 ** ishift pages each (a request's PAGE
     table; a REINDEX token's candidates, ishift 0)."""
+    if c.get("wide_score", False):
+        from atom.models.deepseek_v41.mono.kernels.index_score_fp4_32 import page32
+
+        return page32(c, trow, st)
     a, l = _stage_args(c), c["lane"] % 16
     shift = a["ishift"]
     blk = fx.min(st * (ip.STEP // PAGE) + l // 2, (a["itab_len"] << shift) - 1)
@@ -233,6 +262,10 @@ def _keys(c, page, nt):
     ``nt``: nontemporal, for keys no other wave reads (a piece's rows all on
     one wave) -- not a REINDEX row's candidate pages, its request's other
     rows' too."""
+    if c.get("wide_score", False):
+        from atom.models.deepseek_v41.mono.kernels.index_score_fp4_32 import keys32
+
+        return keys32(c, page, nt)
     a, lane = _stage_args(c), c["lane"]
     l, g = lane % 16, lane // 16
     # 64-bit addresses: a pool past 4 GiB is out of a buffer offset's reach
@@ -266,16 +299,22 @@ def _first_keys(c, pages, nt):
     """The first DEPTH steps' keys, then the next DEPTH's pages: a walk's
     ``init``."""
     init = []
-    for first in range_constexpr(DEPTH):
+    depth = _depth(c)
+    for first in range_constexpr(depth):
         first_kv, first_kvs = _keys(c, pages[first], nt)
         init += first_kv + [first_kvs]
-    return init + pages[DEPTH:]
+    return init + pages[depth:]
 
 
 @traced
 def _step(c, lead, rows, outs, kv, kvs, st, after_mfmas):
     """Step st's logits of every row (and block maxima on a candidate
     producer); ``after_mfmas`` once its keys are read."""
+    if const_expr(c.get("wide_score", False)):
+        from atom.models.deepseek_v41.mono.kernels.index_score_fp4_32 import step32
+
+        step32(c, lead, rows, outs, kv, kvs, st, after_mfmas)
+        return
     a, lane = _stage_args(c), c["lane"]
     l, g = lane % 16, lane // 16
     zero = fx.Vector.filled(4, 0.0, fx.Float32)
@@ -384,6 +423,7 @@ def _walk(c, lead, trow, count, step_of, init, rows_n):
     pages a trip further ahead."""
     a = _stage_args(c)
     rows = _rows(c, rows_n)
+    depth = _depth(c)
     # a row's window: its bound, so columns past it are dropped
     outs = [
         rsrc(
@@ -394,19 +434,19 @@ def _walk(c, lead, trow, count, step_of, init, rows_n):
     ]
     # (names bound out here must not be rebound in the loop body, or the
     # rewriter carries them as loop state)
-    trips = count // DEPTH
+    trips = count // depth
     for j, state in range(0, fx.Int64(trips), 1, init=init):
-        k0 = fx.Int32(j) * DEPTH
-        pages_in = [state[DEPTH * N_KV + i] for i in range(DEPTH)]
+        k0 = fx.Int32(j) * depth
+        pages_in = [state[depth * N_KV + i] for i in range(depth)]
         bufs, pages = [], []
-        for i in range_constexpr(DEPTH):
+        for i in range_constexpr(depth):
             k = k0 + i
 
             def refill(i=i, k=k, pages_in=pages_in, bufs=bufs, pages=pages):
-                page = (k + DEPTH < count).select(pages_in[i], fx.Int32(0))
+                page = (k + depth < count).select(pages_in[i], fx.Int32(0))
                 kv, kvs = _keys(c, page, rows_n > 1)
                 bufs.append(kv + [kvs])
-                pages.append(_page(c, trow, step_of(k + 2 * DEPTH)))
+                pages.append(_page(c, trow, step_of(k + 2 * depth)))
 
             mine = [state[i * N_KV + e] for e in range(N_KV)]
             _step(c, lead, rows, outs, mine[:4], mine[4], step_of(k), refill)
@@ -415,12 +455,12 @@ def _walk(c, lead, trow, count, step_of, init, rows_n):
             out += b
         carried = yield out + pages
 
-    tail = count - trips * DEPTH
-    for i in range_constexpr(DEPTH - 1):
+    tail = count - trips * depth
+    for i in range_constexpr(depth - 1):
         if fx.Int32(i) < tail:
             mine = [carried[i * N_KV + e] for e in range(N_KV)]
             _step(
-                c, lead, rows, outs, mine[:4], mine[4], step_of(trips * DEPTH + i),
+                c, lead, rows, outs, mine[:4], mine[4], step_of(trips * depth + i),
                 lambda: None,
             )  # fmt: skip
 
@@ -435,6 +475,7 @@ def stage_iscore4(c, lead, span, ch0, ch1, max_chunks, rows):
     it, the younger wave of each SIMD pair waited 1.8 us to issue its own
     behind the older one's); a REINDEX token's go out before it."""
     tid, wave = c["tid"], c["wave"]
+    depth = _depth(c)
     s_lo = ch0 * (ip.CHUNK // ip.STEP)
     nt = rows > 1
 
@@ -451,24 +492,29 @@ def stage_iscore4(c, lead, span, ch0, ch1, max_chunks, rows):
         return s_lo + pair + (first + k) * (WAVES // 2)
 
     # the table row: a REINDEX token's own, a FULL piece's request's
-    if const_expr(rows > 1):
+    trow = lead
+    if const_expr(rows > 1):  # noqa: SIM114
+        trow = fx.max(ld_i32(_stage_args(c)["ibatch"], lead), 0)
+    elif _stage_args(c)["ilift"] == 0:
         trow = fx.max(ld_i32(_stage_args(c)["ibatch"], lead), 0)
     else:
         trow = lead
-    pages = [_page(c, trow, step_of(fx.Int32(k))) for k in range(2 * DEPTH)]
+    pages = [_page(c, trow, step_of(fx.Int32(k))) for k in range(2 * depth)]
     if const_expr(rows > 1):
-        _stage_rows(c, lead, span)
+        _stage_rows(c, lead, span, rows_n=rows)
         _lds_barrier()
         init = _first_keys(c, pages, nt)
     else:
-        init = _stage_rows(c, lead, span, lambda: _first_keys(c, pages, nt))
+        init = _stage_rows(
+            c, lead, span, lambda: _first_keys(c, pages, nt), rows_n=rows
+        )
         _lds_barrier()
     lds = c["sel_lds"]["keys"]
-    bounds = [fx.Int32(fx.ptr_load(lds + (BOUNDS_AT + r))) for r in range(ip.WALK_ROWS)]
+    bounds = [fx.Int32(fx.ptr_load(lds + (BOUNDS_AT + r))) for r in range(rows)]
     # steps up to the rows' last scored chunk, from the bounds in LDS: the
     # first reads went out before them, on the chunks alone
     top = ip.score_chunks(bounds[0])
-    for r in range_constexpr(1, ip.WALK_ROWS):
+    for r in range_constexpr(1, rows):
         top = fx.max(top, ip.score_chunks(bounds[r]))
     rem = fx.min(ch1, top) * (ip.CHUNK // ip.STEP) - s_lo - pair
     steps = (rem > 0).select((rem + WAVES // 2 - 1) // (WAVES // 2), fx.Int32(0))
@@ -478,7 +524,7 @@ def stage_iscore4(c, lead, span, ch0, ch1, max_chunks, rows):
     rocdl.s_waitcnt(vmcnt=0)
     gpu.barrier()
     n = ch1 - ch0
-    for r in range_constexpr(ip.WALK_ROWS):
+    for r in range_constexpr(rows):
         for m in range(tid, n, THREADS):
             # (a row past the span has bound 0: nothing written)
             if ip.chunk_written(bounds[r], ch0 + m):
@@ -493,16 +539,72 @@ def run_scores4(c, t0, n, bid, max_chunks):
     from the CTA index alone (``index_plan.reindex_split``): the walk stops at
     a token's bound, read with the first keys."""
     a = _stage_args(c)
+    one_row = {
+        **c,
+        "score_depth": c.get("single_row_depth", _depth(c)),
+        "wide_score": c.get("wide_single_row_score", False),
+    }
     _read_all(a.values())
     enter_stage("k2a.iscore")
+    if const_expr(c.get("world", 1) > 1):
+        _scores_tp(c, one_row, bid, max_chunks)
+    else:
+        _scores_local(c, one_row, t0, n, bid, max_chunks)
+
+
+@traced
+def _scores_local(c, one_row, t0, n, bid, max_chunks):
+    a = _stage_args(c)
     if a["ilift"] != 0:
         per = ip.reindex_split(n, BLOCKS, REINDEX_TASK_CHUNKS)
         if bid < n * per:
             ch0, ch1 = ip.reindex_chunks(bid % per, per)
-            stage_iscore4(c, t0 + bid // per, fx.Int32(1), ch0, ch1, max_chunks, 1)
+            stage_iscore4(
+                one_row, t0 + bid // per, fx.Int32(1), ch0, ch1, max_chunks, 1
+            )
     else:
-        task = _sload4(a["iplan"] + fx.Int64(bid) * 16)
-        if task[1] > 0:
+        _scores_full(c, one_row, bid, max_chunks)
+
+
+@traced
+def _scores_tp(c, one_row, bid, max_chunks):
+    if c["args"]["ilift"] != 0:
+        _run_tp_reindex(one_row, bid, max_chunks)
+    else:
+        _scores_full(c, one_row, bid, max_chunks)
+
+
+@traced
+def _scores_full(c, one_row, bid, max_chunks):
+    a = _stage_args(c)
+    task = _sload4(a["iplan"] + fx.Int64(bid) * 16)
+    if task[1] > 0:
+        if const_expr(_single_row_full(c)):
+            # qlen=1 pieces need one query's MFMAs, not five repeated
+            # padding rows. Keep the multi-row walk for speculative rows.
+            if task[1] == 1:
+                stage_iscore4(
+                    one_row, task[0], task[1], task[2], task[3], max_chunks, 1
+                )
+            else:
+                stage_iscore4(
+                    c, task[0], task[1], task[2], task[3], max_chunks, ip.WALK_ROWS
+                )
+        else:
             stage_iscore4(
                 c, task[0], task[1], task[2], task[3], max_chunks, ip.WALK_ROWS
             )
+
+
+@traced
+def _run_tp_reindex(c, bid, max_chunks):
+    per = fx.max(BLOCKS // fx.max(c["ix_active_rows"], 1), 1)
+    hit = c["ix_active"] & (c["ix_active_prefix"] == bid // per)
+    row = uniform(wave_max(hit.select(c["lane"], fx.Int32(-1))))
+    if (row >= 0) & (bid < c["ix_active_rows"] * per):
+        _mode, _owner, first, count = row_work(c, row)
+        chunks = ip.chunks(count)
+        ch0 = first // ip.CHUNK + (bid % per) * chunks // per
+        ch1 = first // ip.CHUNK + (bid % per + 1) * chunks // per
+        if ch1 > ch0:
+            stage_iscore4(c, row, fx.Int32(1), ch0, ch1, max_chunks, 1)

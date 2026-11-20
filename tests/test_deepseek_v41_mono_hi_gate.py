@@ -402,8 +402,73 @@ def dispatch_module(monkeypatch):
 
 
 @pytest.mark.parametrize("mode", ["auto", "1"])
+def test_hi_result_is_never_wrapped_by_the_standalone_indexer(
+    mi355x, served, monkeypatch, dispatch_module, mode
+):
+    import types
+
+    dispatch = dispatch_module
+
+    class HiResult(dispatch.MonoDecodeModel):
+        pass
+
+    result = object.__new__(HiResult)
+    stub = types.ModuleType("atom.models.deepseek_v41.mono.hi_dispatch")
+    stub.install_hi = lambda *a, **k: result
+    monkeypatch.setitem(sys.modules, stub.__name__, stub)
+    # A CPU-only deployment cannot import this GPU module. This also catches
+    # accidentally wrapping HiDecodeModel, which subclasses MonoDecodeModel.
+    monkeypatch.setitem(
+        sys.modules, "atom.models.deepseek_v41.mono.indexer_dispatch", None
+    )
+    monkeypatch.setenv("ATOM_DSV41_MONO_INDEXER", "1")
+    monkeypatch.setenv("ATOM_DSV41_MONO_HI", mode)
+    monkeypatch.setattr(dispatch, "config_refusal", lambda cfg: None)
+    monkeypatch.setattr(dispatch, "dp_attention_ranks", lambda cfg: 0)
+    monkeypatch.setattr(dispatch.hi_gate, "decide", lambda *a: True)
+    assert dispatch.install_mono_decode("model", served, None) is result
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_ordinary_route_defaults_on_and_accepts_opt_out(
+    mi355x, served, monkeypatch, dispatch_module, enabled
+):
+    import types
+
+    dispatch = dispatch_module
+    calls = []
+    if enabled:
+        stub = types.ModuleType("atom.models.deepseek_v41.mono.indexer_dispatch")
+
+        def wrap(*args, **kwargs):
+            calls.append(args)
+            return "independent indexer"
+
+        stub.MonoIndexerModel = wrap
+        monkeypatch.setitem(sys.modules, stub.__name__, stub)
+        workspace = types.ModuleType("atom.models.deepseek_v41.mono.indexer_workspace")
+        workspace.IndexerWorkspace = lambda *args: "shared workspace"
+        monkeypatch.setitem(sys.modules, workspace.__name__, workspace)
+        monkeypatch.delenv("ATOM_DSV41_MONO_INDEXER", raising=False)
+    else:
+        monkeypatch.setitem(
+            sys.modules, "atom.models.deepseek_v41.mono.indexer_dispatch", None
+        )
+        monkeypatch.setenv("ATOM_DSV41_MONO_INDEXER", "0")
+    monkeypatch.setattr(dispatch, "config_refusal", lambda cfg: None)
+    monkeypatch.setattr(dispatch, "dp_attention_ranks", lambda cfg: 0)
+    monkeypatch.setattr(dispatch.hi_gate, "decide", lambda *a: False)
+    # Installation must not use isinstance with the replaceable constructor.
+    monkeypatch.setattr(dispatch, "MonoDecodeModel", lambda *a, **k: "atom mono")
+    got = dispatch.install_mono_decode("model", served, None)
+    assert got == ("independent indexer" if enabled else "atom mono")
+    assert calls == ([("atom mono", "model", served)] if enabled else [])
+
+
+@pytest.mark.parametrize("mode", ["auto", "1"])
+@pytest.mark.parametrize("indexer_flag", ["0", None])
 def test_a_model_the_hi_path_does_not_serve_falls_back(
-    mi355x, served, monkeypatch, caplog, dispatch_module, mode
+    mi355x, served, monkeypatch, caplog, dispatch_module, mode, indexer_flag
 ):
     """A mismatch only the loaded model shows (``MonoUnsupported`` from ``install_hi``, e.g. the routed experts outside
     the gfx950 FlyDSL layout): under "auto" ``install_mono_decode`` logs one line and keeps ATOM's mono decode; under
@@ -413,6 +478,16 @@ def test_a_model_the_hi_path_does_not_serve_falls_back(
     from atom.mono.runtime.consensus import MonoUnsupported
 
     dispatch = dispatch_module
+    if indexer_flag is None:
+        monkeypatch.delenv("ATOM_DSV41_MONO_INDEXER", raising=False)
+        wrapper = types.ModuleType("atom.models.deepseek_v41.mono.indexer_dispatch")
+        wrapper.MonoIndexerModel = lambda *a, **k: "independent indexer"
+        monkeypatch.setitem(sys.modules, wrapper.__name__, wrapper)
+        workspace = types.ModuleType("atom.models.deepseek_v41.mono.indexer_workspace")
+        workspace.IndexerWorkspace = lambda *a: "shared workspace"
+        monkeypatch.setitem(sys.modules, workspace.__name__, workspace)
+    else:
+        monkeypatch.setenv("ATOM_DSV41_MONO_INDEXER", indexer_flag)
 
     def install_hi(*a, **k):
         raise MonoUnsupported("routed experts not in the gfx950 FlyDSL layout")
@@ -424,14 +499,14 @@ def test_a_model_the_hi_path_does_not_serve_falls_back(
     monkeypatch.setattr(dispatch, "config_refusal", lambda cfg: None)
     monkeypatch.setattr(dispatch, "dp_attention_ranks", lambda cfg: 0)
     monkeypatch.setattr(dispatch.hi_gate, "decide", lambda *a: True)
-    monkeypatch.setattr(dispatch, "MonoDecodeModel", lambda *a: "atom mono")
+    monkeypatch.setattr(dispatch, "MonoDecodeModel", lambda *a, **k: "atom mono")
     if mode == "1":
         with pytest.raises(MonoUnsupported, match="FlyDSL layout"):
             dispatch.install_mono_decode("model", served, None, metadata_builder=None)
         return
     with caplog.at_level(logging.INFO, logger="atom"):
         got = dispatch.install_mono_decode("model", served, None, metadata_builder=None)
-    assert got == "atom mono"
+    assert got == ("independent indexer" if indexer_flag is None else "atom mono")
     assert [r.getMessage() for r in caplog.records] == [
         "V4.1 mono hi off: routed experts not in the gfx950 FlyDSL layout"
     ]
@@ -526,7 +601,9 @@ def _install_world(hi_dispatch, monkeypatch, *, local=None, others=(None, None, 
         model_runner=None,
         use_decode_round=lambda rnd: log.append("use round"),
     )
-    cfg = SimpleNamespace(max_model_len=4096, index_cache_dtype="fp4")
+    cfg = SimpleNamespace(
+        max_model_len=4096, index_cache_dtype="fp4", tensor_parallel_size=4
+    )
     return log, (object(), cfg, drafter, builder, 0), draft
 
 
@@ -630,17 +707,19 @@ def test_a_refusal_on_another_rank_keeps_atoms_mono_path_here(
     rank on ATOM's mono decode, as every other rank, with one line naming the rank and its reason.
     """
     dispatch = sys.modules["atom.models.deepseek_v41.mono.dispatch"]
+    monkeypatch.setenv("ATOM_DSV41_MONO_INDEXER", "0")
     _, args, draft = _install_world(
         hi_dispatch_module, monkeypatch, others=("MonoUnsupported: shard", None, None)
     )
     monkeypatch.setattr(dispatch, "config_refusal", lambda cfg: None)
     monkeypatch.setattr(dispatch, "dp_attention_ranks", lambda cfg: 0)
     monkeypatch.setattr(dispatch.hi_gate, "decide", lambda *a: True)
-    monkeypatch.setattr(dispatch, "MonoDecodeModel", lambda *a: "atom mono")
+    monkeypatch.setattr(dispatch, "MonoDecodeModel", lambda *a, **k: "atom mono")
     monkeypatch.setattr(
         dispatch, "MonoDraftModel", lambda m, dp: ("atom mono draft", m)
     )
     model, cfg, drafter, builder, _ = args
+    cfg.enable_dp_attention = False
     with caplog.at_level(logging.INFO, logger="atom"):
         got = dispatch.install_mono_decode(
             model, cfg, drafter, metadata_builder=builder
@@ -650,3 +729,22 @@ def test_a_refusal_on_another_rank_keeps_atoms_mono_path_here(
     assert [r.getMessage() for r in caplog.records] == [
         "V4.1 mono hi off: refused at install: rank 0: MonoUnsupported: shard"
     ]
+
+
+def test_hi_fallback_constructor_keeps_embedded_indexer(
+    monkeypatch, hi_dispatch_module
+):
+    from unittest.mock import Mock
+
+    from torch import nn
+
+    dispatch = sys.modules["atom.models.deepseek_v41.mono.dispatch"]
+    create = Mock()
+    monkeypatch.setattr(dispatch, "V41MonoDecodeRunner", create)
+    monkeypatch.setenv("ATOM_DSV41_MONO_INDEXER", "1")
+    raw = nn.Module()
+    wrapped = hi_dispatch_module.HiDecodeModel(raw, None, 8192, True, 0, object())
+    wrapped._mono._create()
+    create.assert_called_once_with(
+        raw, None, 8192, True, standalone_indexer=False, indexer_workspace=None
+    )

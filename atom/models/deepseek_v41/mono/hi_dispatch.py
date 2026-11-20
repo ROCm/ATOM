@@ -5,7 +5,7 @@
 ``install_hi`` is ``dispatch.install_mono_decode``'s hi branch: it builds the hook (``hi_runner``) and
 returns the model wrapped as ``HiDecodeModel`` (and the DSpark draft model as ``HiDraftModel``), the
 classes of ``dispatch`` with the hook's routing on top; a loaded model it does not serve raises
-``MonoUnsupported``, and under "auto" the deployment takes ATOM's mono decode unchanged. Nothing here is imported
+``MonoUnsupported``, and under "auto" the deployment takes ordinary ATOM mono decode, including its standalone-indexer flag. Nothing here is imported
 unless ``hi_gate.decide`` says yes.
 
 - ``HiDecodeModel``: the forwards the builder's routing decision gives the hook (``AttentionMetaData.served_by_round``,
@@ -52,7 +52,14 @@ class HiDecodeModel(MonoDecodeModel):
     def __init__(
         self, model, drafter, max_model_len, index_fp4, dp_ranks, hook
     ) -> None:
-        super().__init__(model, drafter, max_model_len, index_fp4, dp_ranks)
+        super().__init__(
+            model,
+            drafter,
+            max_model_len,
+            index_fp4,
+            dp_ranks,
+            standalone_indexer=False,
+        )
         self._hi = hook
 
     def forward(self, input_ids, positions, inputs_embeds=None):

@@ -41,7 +41,7 @@ _STREAM = fx.Stream(None)
 
 @cache
 def build(rows, qlen, world, compact, debug=False):
-    assert rows <= (256 if qlen == 6 else 64) and rows % qlen == 0 and qlen in (6, 8)
+    assert rows <= (256 if qlen == 6 else 64) and rows % qlen == 0 and qlen in (1, 6, 8)
     prefix, flag_stride, suffix, total = compact
     name = local_step_symbol(rows, qlen, world, compact, debug)
     keyed = (name, source_digest("mono"))

@@ -204,9 +204,18 @@ def check_front(runner, layer_id, block, state, rope, cache, step, res_out, gate
     if attn.indexer is not None:
         parts.append(_diff("normed", runner.normed, normed))
         parts.append(_diff("qr", runner.qr.view(torch.uint8), qr.view(torch.uint8)))
-        parts += _index_projections(runner, attn, rope, cache, step)
+        if not runner.indexer_apart:
+            parts += _index_projections(runner, attn, rope, cache, step)
     if runner.rank == 0:
         logger.info("V4.1 mono check layer %d: %s", layer_id, "; ".join(parts))
+
+
+def check_index_projections(runner, attn, rope, cache, step):
+    parts = _index_projections(runner, attn, rope, cache, step)
+    if runner.rank == 0:
+        logger.info(
+            "V4.1 mono indexer check layer %d: %s", attn.spec.layer_id, "; ".join(parts)
+        )
 
 
 def decode_keys(cache, spec, step):

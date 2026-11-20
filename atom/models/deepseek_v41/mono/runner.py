@@ -6,11 +6,13 @@ forward that runs them.
 The forward is the model's own layer loop with each layer in two mono
 kernels: K1 (``kernels.attn_pre``) from the attention seam to the rotated query
 and the window row; K2 (``kernels.layer_post``) K2a (``kernels.attn_post``: a
-selecting layer's indexer, the sparse decode attention, the output projections,
+the embedded indexer when enabled, the sparse decode attention, the output projections,
 their all-reduce (in-kernel, over this runner's peer buffer), the FFN seam and
 ffn_norm) and K2b (``kernels.moe``: the MoE and its all-reduce) in one launch.
 ``ATOM_MONO_CHECK`` launches K2a and K2b apart, to compare each. Between the
-kernels the original modules still run the compressor and Engram.
+kernels the original modules still run the compressor and Engram. With
+``indexer_apart``, K1 exports normalized hidden/query latents and a separate
+Mono indexer selects keys before K2a; K2a then performs no index scoring.
 ``draft_runner`` runs the DSpark draft's layers on the same kernels.
 """
 
@@ -35,25 +37,25 @@ from atom.model_ops.v4_kernels.paged_decode import LOG2E
 from atom.models.deepseek_v41.config import AttentionMode
 from atom.models.deepseek_v41.dspark import DeepseekV41DSpark
 from atom.models.deepseek_v41.mono import index_plan as ip
+from atom.models.deepseek_v41.mono import index_tp_plan as itp
+from atom.models.deepseek_v41.mono import indexer_build as ib
 from atom.models.deepseek_v41.mono.check import (
     check_front,
+    check_index_projections,
     check_index_score,
     check_moe,
     check_post,
     check_selection,
     decode_keys,
 )
-from atom.models.deepseek_v41.mono.config import MAX_MOE_ROWS, MAX_ROWS
+from atom.models.deepseek_v41.mono.config import MAX_MOE_ROWS, MAX_ROWS, indexer_enabled
 from atom.models.deepseek_v41.mono.kernels import attn_post as k2a
 from atom.models.deepseek_v41.mono.kernels import attn_pre as k1
 from atom.models.deepseek_v41.mono.kernels import debug as kernel_debug
+from atom.models.deepseek_v41.mono.kernels import indexer as ki
 from atom.models.deepseek_v41.mono.kernels import layer_post as k2
 from atom.models.deepseek_v41.mono.kernels import moe as k2b
 from atom.models.deepseek_v41.mono.kernels.dims import Dims
-from atom.models.deepseek_v41.mono.kernels.index_query import (
-    QS_BYTES,
-    QS_M_TILES,
-)
 from atom.models.deepseek_v41.mono.kernels.moe_shape import EXPERTS, TOPK
 from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_bytes, plain_layout
 from atom.models.deepseek_v41.mono.kernels.token_par import own_rows
@@ -64,8 +66,10 @@ from atom.mono.plan.execution import BLOCKS
 from atom.mono.runtime.aux_taps import AuxTaps, bind_aux_taps
 from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
 from atom.mono.runtime.debug import DIAG_BYTES, given_up_waits, raise_if_given_up
+from atom.mono.runtime.deployment import dp_attention_ranks
 from atom.mono.runtime.lifecycle import owned_peer_buffer
 from atom.mono.runtime.mailboxes import StepMailboxes
+from atom.mono.runtime.step_begin import FENCE_BYTES
 from atom.mono.runtime.timeline import LayerTimeline
 from atom.mono.runtime.uncached import uncached_bytes
 from atom.mono.runtime.widths import WidthBuilds
@@ -93,6 +97,7 @@ _ROW_BUFFERS = (
     ("qr_scale", 1), ("ring_rel", 0), ("key_meta", 0), ("ilog", 0), ("ibmax", 0),
     ("isel", 0), ("irow", 0), ("icand", 0), ("no_bound", 0), ("iq", 0),
     ("iq_scale", 0), ("iw", 0),
+    ("ix_meta",0),
 )  # fmt: skip
 # the MoE's input: every rank's rows under DP attention (``LayerPostBuild.ep``)
 _MOE_ROW_BUFFERS = ("ffn_normed",)
@@ -117,6 +122,9 @@ class RowsBuild:
     layer_post: object = None
     attn_post: object = None
     moe: object = None
+    indexer: object = None
+    indexer_local: object = None
+    indexer_full: object = None
 
 
 # the layers whose attention norm has other readers (the compressor, the indexer)
@@ -145,17 +153,38 @@ class V41MonoDecodeRunner:
     # small step's tasks end closer together. The outputs are the same to the
     # bit either way
     fine_ug_below = 7
-    # the index plane is FP4: K1 quantizes the indexer query for, and K2a
-    # scores with, ``index_score_fp4``
+    # Embedded FP4: K1 quantizes the indexer query and K2a scores it.
+    # With indexer_apart, the standalone kernel projects, quantizes and scores.
     index_fp4 = False
     index_layout = "fp8"
+    indexer_apart = False
+    # DraftMonoRunner binds without the target constructor and has no indexer.
+    indexer_workspace = None
 
-    def __init__(self, model, drafter, max_model_len: int, index_fp4: bool) -> None:
+    def __init__(
+        self,
+        model,
+        drafter,
+        max_model_len: int,
+        index_fp4: bool,
+        *,
+        standalone_indexer: bool = True,
+        indexer_workspace=None,
+    ) -> None:
         # the indexer's widest bound: a ratio-1 layer sees every position. No
         # token's bound may exceed it (positions stay below max_model_len): its
         # selection would never reach a final level nor publish IRDY
         self.index_bound_max = ip.cdiv(max_model_len, ip.CHUNK) * ip.CHUNK
         self.index_fp4 = index_fp4
+        self.indexer_workspace = indexer_workspace
+        config = get_current_atom_config()
+        self.indexer_apart = standalone_indexer and indexer_enabled(
+            index_fp4,
+            config.tensor_parallel_size,
+            dp_ranks=dp_attention_ranks(config) if config.enable_dp_attention else 0,
+        )
+        if self.indexer_apart and indexer_workspace is None:
+            raise MonoUnsupported("standalone indexer requires its installed workspace")
         self.index_layout = (
             get_current_atom_config().index_cache_layout if index_fp4 else "fp8"
         )
@@ -168,14 +197,23 @@ class V41MonoDecodeRunner:
         group = self._group().cpu_group
         bind_agreed(bind, group)
         plain = plain_layout(self.max_rows, len(self.selecting))
+        ix_world = self._indexer_key(self.max_rows).world
+        ix_peer_bytes = (
+            itp.layout_bytes(itp.peer_layout(self.max_rows, ix_world))
+            if ix_world > 1
+            else 0
+        )
+        ix_plain_bytes = (
+            itp.layout_bytes(itp.plain_layout(self.max_rows)) if ix_world > 1 else 0
+        )
         self.peers, self._finalizer = owned_peer_buffer(
             self,
-            peer_bytes(self.max_rows * self.dp, self.moe_dims),
+            peer_bytes(self.max_rows * self.dp, self.moe_dims) + ix_peer_bytes,
             group,
             self.rank,
             self.moe_dims.ranks,
             self.scratch.device,
-            plain_bytes=sum(n for _, n in plain.values()),
+            plain_bytes=sum(n for _, n in plain.values()) + ix_plain_bytes,
         )
         self._place_index_outputs(plain)
         self._full = {name: getattr(self, name) for name, _ in _ROW_BUFFERS}
@@ -264,6 +302,24 @@ class V41MonoDecodeRunner:
             for spec, block in zip(model.topology, model.layers)
             if block.attn.indexer is not None
         ]
+        self.indexer_has_reindex = any(
+            block.attn.indexer is not None and spec.candidate_source is not None
+            for spec, block in zip(model.topology, model.layers)
+        )
+        self.indexer_full_ratio = (
+            min(
+                (
+                    spec.ratio
+                    for spec, block in zip(model.topology, model.layers)
+                    if block.attn.indexer is not None
+                    and spec.candidate_source is None
+                    and not spec.produces_candidates
+                ),
+                default=None,
+            )
+            if self.index_fp4
+            else None
+        )
         self._allocate(model.config)
 
     def index_query(self):
@@ -272,7 +328,7 @@ class V41MonoDecodeRunner:
         if not self.index_fp4:
             return self.iq
         rows = self.iq.shape[0]
-        scales = self.iq_scale.view(rows, 1, 1, ip.DIM // 32, 16, QS_M_TILES)
+        scales = self.iq_scale.view(rows, 1, 1, ip.DIM // 32, 16, ip.QS_M_TILES)
         if self.index_layout == FP4_MFMA:
             # Debug/reference scorer only: K1 and K2 keep their query ABI.
             natural = scales[:, 0, 0, :, :, : ip.HEADS // 16].permute(0, 3, 2, 1)
@@ -365,6 +421,7 @@ class V41MonoDecodeRunner:
                 tokens=s,
                 fold=spec.layer_id != 0 and block.engram is None,
                 feeds_index=spec.mode in _FEEDS_INDEX,
+                indexer_apart=self.indexer_apart and bool(self.index_bound_max),
                 index_fp4=self.index_fp4,
                 aux=spec.layer_id in self.aux.layer_ids,
                 tp=self.tp,
@@ -379,7 +436,7 @@ class V41MonoDecodeRunner:
     def _post_key(self, s: int) -> k2.LayerPostBuild:
         return k2.LayerPostBuild(
             tokens=s,
-            index_bound_max=self.index_bound_max,
+            index_bound_max=0 if self.indexer_apart else self.index_bound_max,
             index_fp4=self.index_fp4,
             index_mfma=self.index_layout == FP4_MFMA,
             experts=self.experts,
@@ -400,6 +457,23 @@ class V41MonoDecodeRunner:
         keys = self._layer_keys(s)
         launchers = {key: k1.build_attn_pre(key) for key in set(keys)}
         post_key = self._post_key(s)
+        indexer = (
+            ki.build_indexer(self._indexer_key(s))
+            if self.indexer_apart and self.index_bound_max
+            else None
+        )
+        indexer_local = (
+            ki.build_indexer(ib.reindex_build(self._indexer_key(s)))
+            if indexer is not None and self.indexer_has_reindex
+            else None
+        )
+        indexer_full = (
+            ki.build_indexer(
+                ib.full_build(self._indexer_key(s), self.indexer_full_ratio)
+            )
+            if indexer is not None and self.indexer_full_ratio is not None
+            else None
+        )
         if self.split_k2:
             key_a, key_b = post_key.halves()
             return RowsBuild(
@@ -407,13 +481,60 @@ class V41MonoDecodeRunner:
                 launchers,
                 attn_post=k2a.build_attn_post(key_a),
                 moe=k2b.build_moe(key_b),
+                indexer=indexer,
+                indexer_local=indexer_local,
+                indexer_full=indexer_full,
             )
-        return RowsBuild(keys, launchers, layer_post=k2.build_layer_post(post_key))
+        return RowsBuild(
+            keys,
+            launchers,
+            layer_post=k2.build_layer_post(post_key),
+            indexer=indexer,
+            indexer_local=indexer_local,
+            indexer_full=indexer_full,
+        )
+
+    def _indexer_key(self, rows):
+        world = self.tp if self.indexer_apart and self.index_fp4 and self.dp == 1 else 1
+        world = itp.kernel_world(world, rows, self.index_bound_max)
+        peer_offset = (
+            peer_bytes(self.max_rows * self.dp, self.moe_dims) if world > 1 else 0
+        )
+        peer_plain = (
+            (
+                peer_offset
+                + itp.layout_bytes(itp.peer_layout(self.max_rows, world))
+                + FENCE_BYTES
+                + sum(
+                    n
+                    for _, n in plain_layout(
+                        self.max_rows, len(self.selecting)
+                    ).values()
+                )
+            )
+            if world > 1
+            else 0
+        )
+        return ib.IndexerBuild(
+            rows,
+            self.index_bound_max,
+            self.index_fp4,
+            self.index_layout == FP4_MFMA,
+            world=world,
+            peer_offset=peer_offset,
+            peer_plain=peer_plain,
+        )
 
     @staticmethod
     def _row_kernels(build: RowsBuild) -> list:
         """Every kernel of ``build``, each with its ABI."""
         kernels = [(launcher, k1.ABI) for launcher in build.launchers.values()]
+        if build.indexer is not None:
+            kernels.append((build.indexer, ib.ABI))
+        if build.indexer_local is not None:
+            kernels.append((build.indexer_local, ib.ABI))
+        if build.indexer_full is not None:
+            kernels.append((build.indexer_full, ib.ABI))
         if build.layer_post is not None:
             return kernels + [(build.layer_post, k2.ABI)]
         return kernels + [(build.attn_post, k2a.ABI), (build.moe, k2b.ABI)]
@@ -464,12 +585,19 @@ class V41MonoDecodeRunner:
         # and each selection's bound this step (its pool rows and the candidate
         # blocks live in the peer buffer: ``_place_index_outputs``)
         width = self.index_bound_max
-        self.ilog = torch.empty(s, width, device=dev, dtype=f32)
-        self.ibmax = torch.empty(s, ip.blocks(width), device=dev, dtype=f32)
-        self.isel = {
-            layer: torch.empty(s, ip.TOPK, device=dev, dtype=torch.int32)
-            for layer in self.selecting
-        }
+        workspace = self.indexer_workspace
+        if workspace is None:
+            self.ilog = torch.empty(s, width, device=dev, dtype=f32)
+            self.ibmax = torch.empty(s, ip.blocks(width), device=dev, dtype=f32)
+            self.isel = {
+                layer: torch.empty(s, ip.TOPK, device=dev, dtype=torch.int32)
+                for layer in self.selecting
+            }
+        else:
+            self.ilog, self.ibmax = workspace.ilog[:s], workspace.ibmax[:s]
+            self.isel = {
+                layer: workspace.selected[layer][:s] for layer in self.selecting
+            }
         self.no_bound = torch.zeros(s, device=dev, dtype=torch.int32)
         # the FP4 score stage's FULL-layer tasks a ratio, each step's written
         # by ``write_step_meta``
@@ -494,13 +622,24 @@ class V41MonoDecodeRunner:
         # a scale a head, or E2M1 and E8M0s in the FP4 scorer's packed order
         # (its padding never written: zero, as ``pack_q_scales`` pads)
         heads, dim = config.index_n_heads, config.index_head_dim
-        if self.index_fp4:
-            self.iq = torch.empty(s, heads, dim // 2, device=dev, dtype=torch.uint8)
-            self.iq_scale = torch.zeros(s, QS_BYTES, device=dev, dtype=torch.uint8)
+        if self.indexer_apart:
+            self.iq, self.iq_scale, self.iw = (
+                workspace.iq[:s],
+                workspace.iqs[:s],
+                workspace.iw[:s],
+            )
         else:
-            self.iq = torch.empty(s, heads, dim, device=dev, dtype=torch.float8_e4m3fn)
-            self.iq_scale = torch.empty(s, heads, device=dev, dtype=f32)
-        self.iw = torch.empty(s, heads, device=dev, dtype=f32)
+            if self.index_fp4:
+                self.iq = torch.empty(s, heads, dim // 2, device=dev, dtype=torch.uint8)
+                self.iq_scale = torch.zeros(
+                    s, ip.QS_BYTES, device=dev, dtype=torch.uint8
+                )
+            else:
+                self.iq = torch.empty(
+                    s, heads, dim, device=dev, dtype=torch.float8_e4m3fn
+                )
+                self.iq_scale = torch.empty(s, heads, device=dev, dtype=f32)
+            self.iw = torch.empty(s, heads, device=dev, dtype=f32)
         self.diag_off = -1
         post_key = self._post_key(s)
         key_a, key_b = post_key.halves()
@@ -516,6 +655,39 @@ class V41MonoDecodeRunner:
             self.diag_off = nbytes
             nbytes += DIAG_BYTES
         self.scratch = uncached_bytes(nbytes, dev)
+        if workspace is not None:
+            self.index_scratch = workspace.scratch
+            self.local_index_scratch = workspace.local_scratch
+            self.full_index_scratch = workspace.full_scratch
+        else:
+            self.index_scratch = None
+            self.local_index_scratch = None
+            self.full_index_scratch = None
+        self.ix_meta = torch.empty(s, 4, device=dev, dtype=torch.int32)
+
+    def _index_reset_buffers(self, key):
+        """Only synchronization flags need clearing between indexer steps."""
+        resets, split_resets = [], []
+        builds = [
+            (key, self.index_scratch),
+            (ib.reindex_build(key), self.local_index_scratch),
+        ]
+        if self.full_index_scratch is not None:
+            builds.append(
+                (ib.full_build(key, self.indexer_full_ratio), self.full_index_scratch)
+            )
+        for build, scratch in builds:
+            if scratch is None:
+                continue
+            for name, (off, size) in ib.scratch_layout(build).items():
+                if name == "ix_rowhist":
+                    split_resets.append(scratch[off : off + size].view(torch.int32))
+                elif (
+                    name in ("qdone", "qready", "isf", "irdy", "ix_fenced")
+                    or "ready" in name
+                ):
+                    resets.append(scratch[off : off + size].view(torch.int32))
+        return tuple(resets), tuple(split_resets)
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         model = self.model
@@ -526,6 +698,11 @@ class V41MonoDecodeRunner:
         rows = input_ids.numel()
         self._use_rows(rows)
         self.mailboxes.begin_step()
+        index_key = self._indexer_key(rows) if self.indexer_apart else None
+        index_world = index_key.world if index_key is not None else 1
+        index_resets, split_index_resets = (
+            self._index_reset_buffers(index_key) if index_key is not None else ((), ())
+        )
         hidden = model.embed(input_ids).view(1, rows, -1)
         model.begin_forward(hidden, None)
         # Engram staging's side-stream all-gather spins on CUs until every
@@ -541,8 +718,14 @@ class V41MonoDecodeRunner:
             self.ring_rel,
             self.key_meta,
             self.walk_plans,
-            # a token-parallel step's indexer scores this rank's rows alone
-            self._own_rows(rows),
+            # The standalone indexer scores every row on this rank. The
+            # embedded token-parallel scorer owns only this rank's rows.
+            (0, rows) if self.indexer_apart else self._own_rows(rows),
+            index_resets,
+            ix_meta=self.ix_meta if index_world > 1 else None,
+            tp_world=index_world,
+            tp_rank=self.rank if index_world > 1 else 0,
+            split_reset_buffers=split_index_resets,
         )
         state = SinglePassHCState.from_embeddings(hidden, model.config.hc_mult)
         for spec, block, weights, key in zip(
@@ -571,7 +754,11 @@ class V41MonoDecodeRunner:
                 )
             if block.attn.indexer is not None:
                 block.attn._compress_batch(self.normed, cache, step, rope)
+                if self.build.indexer is not None:
+                    self._indexer(spec, block.attn, weights, cache, step, rope)
                 if self.check:
+                    if self.build.indexer is not None:
+                        check_index_projections(self, block.attn, rope, cache, step)
                     # the original scorer, the reference the selection is held to
                     check_index_score(self, block.attn.indexer, cache, step)
             post = (spec, block, weights, residual, gates, step, cache, rope)
@@ -808,6 +995,62 @@ class V41MonoDecodeRunner:
     def _timeline_ptr(self, kernel, layer_id) -> int:
         timeline = self.timelines.get(kernel)
         return timeline.ptr(layer_id) if timeline is not None else 0
+
+    def _indexer(self, spec, attn, weights, cache, step, rope):
+        """The standalone indexer writes the selection before K2 consumes it."""
+        p = torch.Tensor.data_ptr
+        selection = self._selection_args(spec, attn, cache, step)
+        selection.pop("iact")
+        geometry = cache.geometry
+        local = (
+            spec.candidate_source is not None and self.build.indexer_local is not None
+        )
+        full = (
+            spec.candidate_source is None
+            and not spec.produces_candidates
+            and self.build.indexer_full is not None
+        )
+        scratch = (
+            self.local_index_scratch
+            if local
+            else self.full_index_scratch if full else self.index_scratch
+        )
+        args = ib.ABI.pack(
+            {
+                **selection,
+                "hidden": p(self.normed),
+                "qr": p(self.qr),
+                "qr_scale": p(self.qr_scale),
+                "iq_w": p(weights["attn.indexer.wq_b.weight"]),
+                "iq_ws": p(weights["attn.indexer.wq_b.weight_scale"]),
+                "iw_w": p(weights["attn.indexer.weights_proj.weight"]),
+                "pos": p(self._rope_positions(cache, step)),
+                "cos": p(rope.cos_cache),
+                "sin": p(rope.sin_cache),
+                "kmeta": p(self.key_meta),
+                "table": p(step.block_tables),
+                "rows_per_page": geometry.rows_per_page(spec.ratio),
+                "page_rows": (
+                    geometry.rows_per_page(spec.ratio)
+                    if cache.kv_fp8
+                    else geometry.page_bytes // geometry.row_bytes
+                ),
+                "main_off": geometry.main_offset(spec.kv_owner),
+                "scratch": p(scratch),
+                "layer": spec.layer_id,
+                "peers": self.peers.addresses.data_ptr(),
+                "rank": self.rank,
+                "ix_meta": p(self.ix_meta),
+                "step_state": 0,
+                "step_fence": 0,
+            }
+        )
+        launcher = (
+            self.build.indexer_local
+            if local
+            else self.build.indexer_full if full else self.build.indexer
+        )
+        _run_compiled(launcher, *args, torch.cuda.current_stream())
 
     def _selection_args(self, spec, attn, cache, step) -> dict:
         """K2a's indexer arguments: a selecting layer's scorer inputs, its bound

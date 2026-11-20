@@ -8,6 +8,8 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from atom.models.deepseek_v41.mono import decode_step
+
 pytest.importorskip("aiter")
 
 from atom.models.deepseek_v41.config import AttentionMode
@@ -182,6 +184,25 @@ def test_dp_attention_with_moe_tp_is_served(native):
     assert mono_config.config_refusal(_atom_config(**overrides)) is None
 
 
+@pytest.mark.parametrize("dp", [2, 4])
+@pytest.mark.parametrize("fp4ptpc", [False, True])
+def test_local_dp_admission_keeps_checkpoint_refusal(native, dp, fp4ptpc):
+    config = _atom_config(
+        **{
+            **_DPA,
+            "enable_expert_parallel": False,
+            "parallel_config": SimpleNamespace(data_parallel_size=dp),
+            "index_cache_dtype": "fp4",
+            "hf_config": SimpleNamespace(**{**_HF, "fp4ptpc": fp4ptpc}),
+        }
+    )
+    refusal = mono_config.config_refusal(config, supported_dpa=(2, 4))
+    if fp4ptpc:
+        assert "FP4PTPC checkpoint's per-channel FP8 linears" in refusal
+    else:
+        assert refusal is None
+
+
 def test_moe_tp_weight_table_is_every_expert_at_a_share():
     table = mono_weights.expected(_v41_config(), AttentionMode.FULL, Dims(1), moe_tp=2)
     # every routed expert at half its width, the shared expert whole
@@ -242,7 +263,7 @@ def _context(monkeypatch, *, prefill=False, ubatch=None, **step_fields):
         ubatch_slices=ubatch,
         attn_metadata=SimpleNamespace(step=step, image_mask=None),
     )
-    monkeypatch.setattr(dispatch, "get_forward_context", lambda: fwd)
+    monkeypatch.setattr(decode_step, "get_forward_context", lambda: fwd)
     return fwd
 
 
@@ -285,10 +306,9 @@ def test_other_steps_keep_the_original_model(monkeypatch, tokens, kwargs):
 def test_the_target_is_routed_by_its_rows_alone(monkeypatch, tokens, routed):
     # a padded graph width: neither the scheduled request count nor how the rows
     # split into requests is read
-    monkeypatch.setattr(dispatch, "MAX_ROWS", 12)
     _context(monkeypatch, running_tokens=tokens, requests=[object()])
     ids = torch.zeros(tokens, dtype=torch.int64)
-    assert dispatch.step_supported(ids, None) is routed
+    assert dispatch.step_supported(ids, None, max_rows=12) is routed
 
 
 class _DraftRunner:

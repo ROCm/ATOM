@@ -2,7 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """A CTA's exact top-k of up to ``LDS_KEYS`` fp32 values, the answer of aiter's
 ``top_k_per_row_decode(stable=True)``: ranked by the fp32 bits' u32 order key
-(-0 below +0, NaN above +inf), ties to the lowest index, emitted ascending by
+(-0 below +0, negative NaN below -inf, positive NaN above +inf), ties to the lowest index, emitted ascending by
 index, -1 padded. P0.7 pinned the key and the tie rule against aiter;
 ``lds_topk_timing.py CHECK=1`` (skill mono-indexer) pins this routine against
 that rule on ties, +-0, NaN and +-inf at every edge n.
@@ -40,9 +40,13 @@ def key_bits(key):
 HIST_WORDS = 256 + 64
 
 
-def lds_words(per_thread: int = PER_THREAD) -> dict[str, int]:
+def lds_words(per_thread: int = PER_THREAD, fast_hist=False) -> dict[str, int]:
     """The LDS the routine needs, in 32-bit words."""
-    return {"keys": THREADS * per_thread, "hist": 3 * HIST_WORDS, "buf": WAVES}
+    return {
+        "keys": THREADS * per_thread,
+        "hist": 4096 if fast_hist else 3 * HIST_WORDS,
+        "buf": WAVES + 3 if fast_hist else WAVES,
+    }
 
 
 def _no_extra():
@@ -50,7 +54,9 @@ def _no_extra():
 
 
 @traced
-def lds_topk(n, k, load, emit, lds, tid, per_thread=PER_THREAD, after_keys=None):
+def _legacy_lds_topk(
+    n, k, load, emit, lds, tid, per_thread=PER_THREAD, after_keys=None
+):
     """Top ``k`` of ``n`` <= THREADS x per_thread values, given a quad at a
     time: ``load(q, i)`` -> the 4 values (fp32 bits as Int32) at indices i ..
     i + 3, for i = per_thread tid + 4 q clamped to the quad holding index n - 1
@@ -158,3 +164,24 @@ def lds_topk(n, k, load, emit, lds, tid, per_thread=PER_THREAD, after_keys=None)
         if (pos >= n_out) & (pos < k):
             emit(pos, None, Int32(-1), extra)
     gpu.barrier()
+
+
+def lds_topk(
+    n,
+    k,
+    load,
+    emit,
+    lds,
+    tid,
+    per_thread=PER_THREAD,
+    after_keys=None,
+    fast_hist=False,
+    emit_key=False,
+):
+    if fast_hist:
+        from atom.models.deepseek_v41.mono.kernels.topk_fast import lds_topk_fast
+
+        return lds_topk_fast(
+            n, k, load, emit, lds, tid, per_thread, after_keys, emit_key
+        )
+    return _legacy_lds_topk(n, k, load, emit, lds, tid, per_thread, after_keys)

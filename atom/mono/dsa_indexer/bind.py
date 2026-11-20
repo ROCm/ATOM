@@ -32,6 +32,7 @@ from atom.model_ops.indexer.layout import MFMA
 from atom.model_ops.sparse_indexer_fp4 import fp4_index_block_shapes
 from atom.model_ops.utils import shuffle_weights
 from atom.mono.dsa_indexer import kernel as kix
+from atom.mono.dsa_indexer.build import short_decode_enabled
 from atom.mono.dsa_indexer.plan import (
     IndexerShape,
     unsupported,
@@ -79,6 +80,9 @@ class IndexerBinding:
             qlen=qlen,
             score_blocks=2 * BLOCKS if dual else BLOCKS,
             short_gemm=self.short_gemm,
+            short_decode=short_decode_enabled(
+                self.shape, rows, self.world, self.max_ctx, self.replicated, qlen
+            ),
         )
 
     def serves(self, rows: int, qlen: int, ilog) -> bool:

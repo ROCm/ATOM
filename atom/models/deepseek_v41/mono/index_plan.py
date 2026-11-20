@@ -25,6 +25,10 @@ STEP = 64  # keys an FP4 walk step: a wave's 4 MFMA tiles, 8 pages
 WALK_ROWS = 6  # query rows an FP4 walk scores off each key load
 HEADS = 32  # the indexer's heads (``index_n_heads``)
 DIM = 128  # an index head's dims (``index_head_dim``)
+# Packed E8M0 query scales: [32-dim chunk][head % 16][head // 16],
+# with the M tile count padded to a dword for the row-group FP4 scorer.
+QS_M_TILES = -(-(HEADS // 16) // 4) * 4
+QS_BYTES = DIM // 32 * 16 * QS_M_TILES
 # the two selections: a token's top rows, and on a candidate-producing layer its
 # top blocks -- each a tree over its own bound (``kind_bound``)
 KINDS = {"sel": TOPK, "blk": TOPK_BLOCKS}
@@ -72,19 +76,19 @@ def chunk_written(bound, ch):
     return scored(bound) & (ch * CHUNK < bound)
 
 
-def segments(bound):
-    """Select segments of a token: segment s covers columns [SEG s, SEG (s + 1))."""
-    return cdiv(imax(bound, 0), SEG)
+def segments(bound, seg=SEG):
+    """Select segments of a token: segment s covers columns [seg s, seg (s + 1))."""
+    return cdiv(imax(bound, 0), seg)
 
 
-def seg_len(bound, s):
+def seg_len(bound, s, seg=SEG):
     """Columns in segment s."""
-    return imax(imin(bound - s * SEG, SEG), 0)
+    return imax(imin(bound - s * seg, seg), 0)
 
 
-def seg_chunks(bound, s):
+def seg_chunks(bound, s, seg=SEG):
     """The chunk flags segment s polls: [CHUNKS_PER_SEG s, + this)."""
-    return sel(scored(bound), cdiv(seg_len(bound, s), CHUNK), 0)
+    return sel(scored(bound), cdiv(seg_len(bound, s, seg=seg), CHUNK), 0)
 
 
 def winners(n, k):
@@ -100,57 +104,57 @@ def winners(n, k):
 # there), so each level keeps every winner. The tree ends at a level of one list.
 
 
-def fan(k):
-    return SEG // k
+def fan(k, seg=SEG):
+    return seg // k
 
 
-def lists(bound, level, k):
+def lists(bound, level, k, seg=SEG):
     """Lists at ``level`` (static unroll: callers loop over levels in Python)."""
-    n = segments(bound)
+    n = segments(bound, seg=seg)
     for _ in range(level):
-        n = cdiv(n, fan(k))
+        n = cdiv(n, fan(k, seg=seg))
     return n
 
 
-def list_inputs(bound, level, j, k):
+def list_inputs(bound, level, j, k, seg=SEG):
     """Values list j of ``level`` ranks: a segment's columns at level 0, else the
     valid entries of the lists it merges."""
     if level == 0:
-        return seg_len(bound, j)
-    below = lists(bound, level - 1, k)
-    first = j * fan(k)
-    count = imin(below - first, fan(k))
+        return seg_len(bound, j, seg=seg)
+    below = lists(bound, level - 1, k, seg=seg)
+    first = j * fan(k, seg=seg)
+    count = imin(below - first, fan(k, seg=seg))
     last = first + count - 1
-    return i32(imax(count - 1, 0) * k + list_valid(bound, level - 1, last, k))
+    return i32(imax(count - 1, 0) * k + list_valid(bound, level - 1, last, k, seg=seg))
 
 
-def list_valid(bound, level, j, k):
+def list_valid(bound, level, j, k, seg=SEG):
     """Valid entries of list j at ``level``."""
-    return winners(list_inputs(bound, level, j, k), k)
+    return winners(list_inputs(bound, level, j, k, seg=seg), k)
 
 
-def levels(bound_max, k):
+def levels(bound_max, k, seg=SEG):
     """Merge levels a build needs for bounds up to ``bound_max`` (Python ints):
     the depth at which one list remains."""
-    level, n = 0, segments(bound_max)
+    level, n = 0, segments(bound_max, seg=seg)
     while n > 1:
-        n = cdiv(n, fan(k))
+        n = cdiv(n, fan(k, seg=seg))
         level += 1
     return level
 
 
-def is_final(bound, level, k):
+def is_final(bound, level, k, seg=SEG):
     """Is ``level``'s list the token's answer (one list or none): the selection
     publishes IRDY from it."""
-    return lists(bound, level, k) <= 1
+    return lists(bound, level, k, seg=seg) <= 1
 
 
-def final_level(bound, depth, k):
+def final_level(bound, depth, k, seg=SEG):
     """The level whose single list is the token's answer: the first that
     ``is_final`` (a token below the build's maximum ends early)."""
     at = depth
     for level in range(depth, -1, -1):
-        at = sel(is_final(bound, level, k), level, at)
+        at = sel(is_final(bound, level, k, seg=seg), level, at)
     return at
 
 
@@ -178,10 +182,10 @@ def blocks(bound):
     return cdiv(imax(bound, 0), BLOCK_ROWS)
 
 
-def block_chunks(bound, j):
+def block_chunks(bound, j, seg=SEG):
     """(first chunk, chunk count) whose logits hold the rows of block segment j
-    (blocks [SEG j, SEG (j + 1))): the flags that segment's task polls."""
-    rows = SEG * BLOCK_ROWS
+    (blocks [seg j, seg (j + 1))): the flags that segment's task polls."""
+    rows = seg * BLOCK_ROWS
     first = j * (rows // CHUNK)
     count = cdiv(imax(imin(bound, (j + 1) * rows) - j * rows, 0), CHUNK)
     return first, sel(scored(bound), count, 0)
@@ -309,13 +313,15 @@ def task_writes(bound, ch0, width, m):
     return (m < width) & chunk_written(bound, ch0 + m)
 
 
-def list_count(bound, level, k):
+def list_count(bound, level, k, seg=SEG):
     """Lists a token runs at ``level``: level 0 always one (so a token that sees
     nothing still emits its -1s), a higher level only while the one below had
     more than one."""
     if level == 0:
-        return imax(lists(bound, 0, k), 1)
-    return sel(lists(bound, level - 1, k) > 1, lists(bound, level, k), 0)
+        return imax(lists(bound, 0, k, seg=seg), 1)
+    return sel(
+        lists(bound, level - 1, k, seg=seg) > 1, lists(bound, level, k, seg=seg), 0
+    )
 
 
 def kind_bound(kind, bound):
@@ -324,11 +330,11 @@ def kind_bound(kind, bound):
     return bound if kind == "sel" else blocks(bound)
 
 
-def top_level(kind, bound_max):
+def top_level(kind, bound_max, seg=SEG):
     """A ``kind`` selection tree's last level for bounds up to ``bound_max``."""
-    return levels(kind_bound(kind, bound_max), KINDS[kind])
+    return levels(kind_bound(kind, bound_max), KINDS[kind], seg=seg)
 
 
-def list_slots(kind, level, bound_max):
+def list_slots(kind, level, bound_max, seg=SEG):
     """Lists a token can have at ``level`` (a region's per-token size)."""
-    return lists(kind_bound(kind, bound_max), level, KINDS[kind])
+    return lists(kind_bound(kind, bound_max), level, KINDS[kind], seg=seg)
