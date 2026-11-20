@@ -2,6 +2,8 @@
 //! `POST /workers` in the real registry: SMG's rows with `--enable-rl`, nothing
 //! without it.
 
+use std::collections::HashMap;
+
 use axum::{
     body::Body,
     extract::Request,
@@ -246,6 +248,39 @@ async fn rl_workers_collapses_dp_ranks_into_one_row() {
     worker.stop().await;
 }
 
+/// The labels discovery gave the one registered worker.
+fn registered_labels(ctx: &AppTestContext) -> HashMap<String, String> {
+    let workers = ctx.app_context.worker_registry.get_all();
+    assert_eq!(workers.len(), 1);
+    workers[0].metadata().labels.clone()
+}
+
+#[tokio::test]
+async fn rl_off_discovery_adds_no_rl_labels() {
+    let mut worker = mock_worker();
+    let url = worker.start().await.unwrap();
+    worker.set_tp_size(4).await;
+    worker.set_dp_size(2).await;
+    for backend in [BackendType::Atom, BackendType::Sglang] {
+        let mut config = rl_config(backend, false);
+        config.rl.enabled = false;
+        let ctx = AppTestContext::new_with_config(config, vec![]).await;
+        let app = ctx.create_app().await;
+        register(&ctx, &app, &url, json!({}), 1).await;
+
+        let labels = registered_labels(&ctx);
+        assert!(!labels.contains_key("version"), "{backend:?}: {labels:?}");
+        if backend == BackendType::Atom {
+            assert!(!labels.contains_key("tp_size"), "{labels:?}");
+            assert!(!labels.contains_key("dp_size"), "{labels:?}");
+        } else {
+            assert_eq!(labels["tp_size"], "4", "sglang reads sizes as before");
+        }
+        ctx.shutdown().await;
+    }
+    worker.stop().await;
+}
+
 #[tokio::test]
 async fn rl_worker_unknown_id_is_404_worker_not_found() {
     let ctx = AppTestContext::new_with_config(rl_config(BackendType::Atom, false), vec![]).await;
@@ -277,6 +312,7 @@ async fn rl_routes_require_the_bearer_token() {
         Some("Bearer "),
         Some("Bearer wrong"),
         Some("Bearer rl-test-ke"),
+        Some("Bearer rl-test-kez"),
         Some(RL_KEY),
         Some("Basic rl-test-key"),
     ];
@@ -333,5 +369,13 @@ fn rl_flags_parse_to_defaults_and_require_the_key() {
     for missing in [&[][..], &["--rl-api-key", ""], &["--rl-api-key", " "]] {
         let error = args(missing).unwrap_err().to_string();
         assert!(error.contains("--rl-api-key"), "{missing:?}: {error}");
+    }
+    for key in ["secret-key ", " secret-key", "secret-key\t"] {
+        let error = args(&["--rl-api-key", key]).unwrap_err().to_string();
+        assert!(error.contains("--rl-api-key"), "{key:?}: {error}");
+        assert!(
+            !error.contains("secret-key"),
+            "the key is not echoed: {error}"
+        );
     }
 }
