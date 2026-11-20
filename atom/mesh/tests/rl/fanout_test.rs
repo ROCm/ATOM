@@ -14,53 +14,26 @@ use std::{
 use axum::{
     body::Body,
     extract::Request,
-    http::{header::AUTHORIZATION, HeaderValue, StatusCode, Uri},
+    http::{StatusCode, Uri},
     Json, Router,
 };
 use mesh::{
     config::{BackendType, RouterConfig},
-    core::{BasicWorkerBuilder, ConnectionMode, Worker},
+    core::{BasicWorkerBuilder, ConnectionMode},
 };
 use serde_json::{json, Value};
-use tower::ServiceExt;
 
+use super::proxy_test::{cut_engine, insert, send, RL_KEY};
 use crate::common::{
     mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType},
     AppTestContext, TestRouterConfig,
 };
 
-const RL_KEY: &str = "rl-fanout-key";
-
-/// Sends `request` with the `/v1/rl` bearer.
-async fn send(app: &Router, mut request: Request<Body>) -> (StatusCode, Value) {
-    request.headers_mut().insert(
-        AUTHORIZATION,
-        HeaderValue::from_str(&format!("Bearer {RL_KEY}")).unwrap(),
-    );
-    let response = app.clone().oneshot(request).await.unwrap();
-    let status = response.status();
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    (status, serde_json::from_slice(&body).unwrap())
-}
-
 /// `POST /v1/rl/engine/{path}` with `selector` and an empty body.
 async fn fan_out(app: &Router, path: &str, selector: &str) -> (StatusCode, Value) {
-    let uri = format!("/v1/rl/engine/{path}?selector={}", encode(selector));
+    let selector: String = url::form_urlencoded::byte_serialize(selector.as_bytes()).collect();
+    let uri = format!("/v1/rl/engine/{path}?selector={selector}");
     send(app, Request::post(uri).body(Body::empty()).unwrap()).await
-}
-
-/// Percent-encodes everything but URL-safe characters.
-fn encode(s: &str) -> String {
-    s.bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                (b as char).to_string()
-            }
-            _ => format!("%{b:02X}"),
-        })
-        .collect()
 }
 
 async fn mock_worker(dp_size: usize) -> (MockWorker, String) {
@@ -103,17 +76,6 @@ async fn register(ctx: &AppTestContext, app: &Router, worker: Value, registered:
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("{worker} was not registered");
-}
-
-/// Puts `worker` straight into the registry, for workers `POST /workers`
-/// cannot add (a gRPC worker, a dead address, many workers on one engine).
-fn insert(ctx: &AppTestContext, worker: BasicWorkerBuilder) -> String {
-    let worker: Arc<dyn Worker> = Arc::new(worker.build());
-    ctx.app_context
-        .worker_registry
-        .register(worker)
-        .as_str()
-        .to_string()
 }
 
 fn id_of(ctx: &AppTestContext, url: &str) -> String {
@@ -370,7 +332,7 @@ async fn rl_fanout_never_exceeds_the_concurrency_flag() {
 
 #[tokio::test]
 async fn rl_fanout_keeps_the_status_when_a_body_read_fails() {
-    let url = super::proxy_test::cut_engine().await;
+    let url = cut_engine().await;
     let ctx = AppTestContext::new_with_config(rl_config(4), vec![]).await;
     let app = ctx.create_app().await;
     let id = insert(&ctx, BasicWorkerBuilder::new(&url));

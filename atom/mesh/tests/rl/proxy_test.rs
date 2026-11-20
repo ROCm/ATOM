@@ -25,10 +25,10 @@ use crate::common::{
     AppTestContext, TestRouterConfig,
 };
 
-const RL_KEY: &str = "rl-proxy-key";
+pub(super) const RL_KEY: &str = "rl-proxy-key";
 
 /// Sends `request` with the `/v1/rl` bearer.
-async fn send(app: &Router, mut request: Request<Body>) -> (StatusCode, Value) {
+pub(super) async fn send(app: &Router, mut request: Request<Body>) -> (StatusCode, Value) {
     request.headers_mut().insert(
         AUTHORIZATION,
         HeaderValue::from_str(&format!("Bearer {RL_KEY}")).unwrap(),
@@ -90,7 +90,7 @@ async fn register(ctx: &AppTestContext, app: &Router, worker: Value) -> String {
 
 /// Puts `worker` straight into the registry, for workers `POST /workers`
 /// cannot add (a gRPC worker, a dead address).
-fn insert(ctx: &AppTestContext, worker: BasicWorkerBuilder) -> String {
+pub(super) fn insert(ctx: &AppTestContext, worker: BasicWorkerBuilder) -> String {
     let worker: Arc<dyn Worker> = Arc::new(worker.build());
     ctx.app_context
         .worker_registry
