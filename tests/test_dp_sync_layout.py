@@ -230,30 +230,3 @@ def test_final_requests_are_max_reduced_from_their_own_row(monkeypatch):
     assert [max(row) for row in r.ub_tokens_across_dp] == [4, 7]
     alone = _sync(monkeypatch, peers=[], **_base(final_requests=3))
     assert alone.max_final_requests_across_dp == 3
-
-
-def _peer(**rows):
-    def make(local):
-        peer = local.clone()
-        for idx, value in rows.items():
-            peer[int(idx[1:])] = value
-        return peer
-
-    return make
-
-
-def test_the_greedy_vote_is_the_last_row_and_and_reduced(monkeypatch):
-    """After DSpark's row in both widths; one peer voting no turns it off for
-    the group, and a peer with no request votes yes."""
-    for tbo_on in (False, True):
-        last = (9 if tbo_on else 5) + 1
-        kw = _base(tbo_on=tbo_on, max_seqlen_q=3, greedy=True)
-        assert _sync(monkeypatch, peers=[_peer()], **kw).all_greedy_across_dp
-        no = _sync(monkeypatch, peers=[_peer(**{f"r{last}": 0})], **kw)
-        assert not no.all_greedy_across_dp, f"tbo_on={tbo_on}"
-        assert no.max_seqlen_q_across_dp == 3
-        idle = _sync(monkeypatch, peers=[_peer(r0=0, r1=0, **{f"r{last}": 0})], **kw)
-        assert idle.all_greedy_across_dp, f"tbo_on={tbo_on}"
-    ours = _base(greedy=False)
-    assert not _sync(monkeypatch, peers=[_peer()], **ours).all_greedy_across_dp
-    assert not _sync(monkeypatch, peers=[_peer()], **_base()).all_greedy_across_dp

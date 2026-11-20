@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
-"""Which runners take the DP greedy argmax head (`_init_dp_argmax_head`)."""
+"""`ATOM_DP_LM_HEAD_MODE=argmax`: which runners take the head
+(`_init_dp_argmax_head`) and which requests are admitted."""
 
 from types import SimpleNamespace
 from unittest import mock
@@ -8,16 +9,13 @@ import pytest
 import torch
 from aiter_stub import atom_without_aiter
 
+from atom.sampling_params import SamplingParams
+
 
 @pytest.fixture(scope="module")
 def modules():
     with atom_without_aiter() as load:
         yield load("atom.model_engine.model_runner"), load("atom.model_ops.embed_head")
-
-
-@pytest.fixture(autouse=True)
-def _allgather(monkeypatch):
-    monkeypatch.setenv("ATOM_DP_LM_HEAD_MODE", "allgather")
 
 
 def _head(head_type, shards=True):
@@ -27,110 +25,76 @@ def _head(head_type, shards=True):
     return head
 
 
-def _runner(mr, heads, dp=4, spec=None):
+def _runner(mr, heads, spec=None):
     runner = object.__new__(mr.ModelRunner)
     runner.compute_head = None
-    runner.config = SimpleNamespace(
-        speculative_config=spec,
-        parallel_config=SimpleNamespace(data_parallel_size=dp),
-    )
+    runner.config = SimpleNamespace(speculative_config=spec)
     runner.model = SimpleNamespace(modules=lambda: iter(heads))
     return runner
 
 
-def test_one_dp_sharded_head_is_taken(modules):
+@pytest.mark.parametrize("subclass", [False, True])
+def test_argmax_mode_takes_the_one_dp_sharded_head(monkeypatch, modules, subclass):
+    """A subclass such as DeepSeek-V4's `ParallelHead` is taken too: the
+    exchange is chosen inside `ParallelLMHead.forward`."""
     mr, eh = modules
-    head = _head(eh.ParallelLMHead)
+    monkeypatch.setenv("ATOM_DP_LM_HEAD_MODE", "argmax")
+    head_type = eh.ParallelLMHead
+    if subclass:
+        head_type = type("ParallelHead", (eh.ParallelLMHead,), {})
+    head = _head(head_type)
     runner = _runner(mr, [head])
     runner._init_dp_argmax_head()
     assert runner.dp_argmax_head is head
 
 
 @pytest.mark.parametrize(
-    "case",
-    ["all2all", "compute_head", "speculative", "dp1", "unsharded", "two_heads"],
+    "case", ["compute_head", "speculative", "unsharded", "two_heads", "no_head"]
 )
-def test_no_head_is_taken(monkeypatch, modules, case):
+def test_argmax_mode_fails_at_startup(monkeypatch, modules, case):
     mr, eh = modules
-    if case == "all2all":
-        monkeypatch.setenv("ATOM_DP_LM_HEAD_MODE", "all2all")
-    heads = [_head(eh.ParallelLMHead, shards=case != "unsharded")]
-    if case == "two_heads":
-        heads.append(_head(eh.ParallelLMHead))
-    runner = _runner(
-        mr,
-        heads,
-        dp=1 if case == "dp1" else 4,
-        spec=object() if case == "speculative" else None,
-    )
+    monkeypatch.setenv("ATOM_DP_LM_HEAD_MODE", "argmax")
+    heads = {
+        "unsharded": [_head(eh.ParallelLMHead, shards=False)],
+        "two_heads": [_head(eh.ParallelLMHead), _head(eh.ParallelLMHead)],
+        "no_head": [],
+    }.get(case, [_head(eh.ParallelLMHead)])
+    runner = _runner(mr, heads, spec=object() if case == "speculative" else None)
     if case == "compute_head":
         runner.compute_head = mock.Mock()
+    with pytest.raises(ValueError, match="ATOM_DP_LM_HEAD_MODE=argmax"):
+        runner._init_dp_argmax_head()
+
+
+@pytest.mark.parametrize("mode", ["all2all", "allgather", "default"])
+def test_other_modes_take_no_head(monkeypatch, modules, mode):
+    """Off, nothing is checked or taken, even where argmax would fail."""
+    mr, _ = modules
+    monkeypatch.setenv("ATOM_DP_LM_HEAD_MODE", mode)
+    runner = _runner(mr, [], spec=object())
     runner._init_dp_argmax_head()
     assert runner.dp_argmax_head is None
 
 
-def test_a_head_subclass_is_taken(modules):
-    """A subclass such as DeepSeek-V4's `ParallelHead` is taken: the exchange
-    is chosen inside `ParallelLMHead.forward`."""
-    mr, eh = modules
-
-    class ParallelHead(eh.ParallelLMHead):
-        pass
-
-    head = _head(ParallelHead)
-    runner = _runner(mr, [head])
-    runner._init_dp_argmax_head()
-    assert runner.dp_argmax_head is head
-
-
-class _FakeReqGraph:
-    def __init__(self):
-        self.calls = []
-
-    def record(self, forward, key=None, phase=None):
-        self.calls.append(("record", key, phase, self.context.dp_all_greedy))
-
-    def replay(self, key=None, phase=None):
-        self.calls.append(("replay", key, phase))
-        return phase
+@pytest.mark.parametrize(
+    "params",
+    [
+        dict(temperature=0.6),
+        dict(temperature=0.0, logprobs=True),
+        dict(temperature=0.0, json_schema="{}"),
+        dict(temperature=0.0, structured_tool_format="kimi"),
+        dict(temperature=0.0, required_channel=object()),
+    ],
+)
+def test_argmax_mode_rejects_a_request_it_cannot_serve(monkeypatch, params):
+    sp = SamplingParams(**params)
+    monkeypatch.setenv("ATOM_DP_LM_HEAD_MODE", "argmax")
+    with pytest.raises(ValueError, match="greedy requests only"):
+        sp.validate_greedy_head()
+    monkeypatch.setenv("ATOM_DP_LM_HEAD_MODE", "allgather")
+    sp.validate_greedy_head()
 
 
-@pytest.mark.parametrize("taken", [True, False])
-def test_a_decode_bucket_records_the_greedy_phase_with_the_flag(modules, taken):
-    """With the head taken, a bucket is recorded again under
-    `DP_GREEDY_PHASE`, the context saying greedy only for that recording."""
-    mr, _ = modules
-    runner = object.__new__(mr.ModelRunner)
-    runner.dp_argmax_head = object() if taken else None
-    runner.req_graph = graph = _FakeReqGraph()
-    graph.context = context = SimpleNamespace(dp_all_greedy=False)
-    seen = []
-    runner._head_output = lambda rows: seen.append(context.dp_all_greedy)
-    runner._record_decode_bucket(lambda: None, "key", torch.zeros(2, 4), context)
-    expect = [("record", "key", None, False)]
-    if taken:
-        expect.append(("record", "key", mr.DP_GREEDY_PHASE, True))
-    assert graph.calls == expect
-    assert seen == ([True] if taken else [])
-    assert context.dp_all_greedy is False
-
-
-@pytest.mark.parametrize("greedy", [True, False])
-def test_a_greedy_step_replays_the_greedy_phase(modules, greedy):
-    mr, _ = modules
-    runner = object.__new__(mr.ModelRunner)
-    runner.req_graph = graph = _FakeReqGraph()
-    phase = mr.DP_GREEDY_PHASE if greedy else None
-    head = runner._replay_decode_bucket("key", SimpleNamespace(dp_all_greedy=greedy))
-    assert head == phase
-    assert graph.calls == [("replay", "key", phase)]
-
-
-@pytest.mark.parametrize("greedy", [True, False])
-def test_the_context_takes_the_groups_greedy_verdict(modules, greedy):
-    """A step's `Context` reads `dp_all_greedy` from its `ForwardMode`."""
-    mr, _ = modules
-    mode = SimpleNamespace(dp_all_greedy=greedy)
-    context = mr.Context(positions=torch.zeros(1), forward_mode=mode)
-    assert context.dp_all_greedy is greedy
-    assert mr.Context(positions=torch.zeros(1)).dp_all_greedy is False
+def test_argmax_mode_admits_a_greedy_request(monkeypatch):
+    monkeypatch.setenv("ATOM_DP_LM_HEAD_MODE", "argmax")
+    SamplingParams(temperature=0.0, top_k=1).validate_greedy_head()

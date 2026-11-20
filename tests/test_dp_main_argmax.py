@@ -2,14 +2,13 @@
 
 The real head exchange and runner methods run without AITER or a GPU. The
 exchange's pack boundary uses a CPU reference; test_lm_head_argmax.py covers
-the actual Triton kernel separately. The group's verdict is in
-test_dp_sync_layout.py and test_forward_mode.py, the sampler bypass in
+the actual Triton kernel separately. Startup and request admission are in
+test_dp_main_argmax_init.py, the sampler bypass in
 test_token_constraint_wiring.py.
 """
 
 import types
 
-import numpy as np
 import pytest
 import torch
 from aiter_stub import atom_without_aiter
@@ -118,43 +117,42 @@ def test_dp_argmax_matches_lowest_id_of_full_row(monkeypatch, local_rows):
 
 # ----------------------------------------------------------- head choice ---
 @pytest.mark.parametrize(
-    "mode, ctx, dp_meta, greedy, expect",
+    "mode, ctx, dp_meta, expect",
     [
-        ("all2all", {}, True, True, "argmax"),
-        ("allgather", {}, True, True, "argmax"),
-        ("all2all", {}, True, False, "all2all"),
-        ("allgather", {}, True, False, "allgather"),
-        ("default", {}, True, True, None),
-        ("all2all", {"is_draft": True}, True, True, None),
-        ("all2all", {"running_tokens_are_unified": False}, True, True, None),
-        ("all2all", {}, False, True, None),
+        ("argmax", {}, True, "argmax"),
+        ("all2all", {}, True, "all2all"),
+        ("allgather", {}, True, "allgather"),
+        ("default", {}, True, None),
+        ("argmax", {"is_draft": True}, True, None),
+        ("argmax", {"is_prefill": True}, True, None),
+        ("argmax", {"running_tokens_are_unified": False}, True, None),
+        ("argmax", {}, False, None),
     ],
 )
-def test_forward_takes_the_groups_exchange(
-    monkeypatch, mode, ctx, dp_meta, greedy, expect
-):
-    """The head exchanges ids on a step the group runs greedily
-    (`Context.dp_all_greedy`), logits on any other sharded step, and runs
-    the replicated GEMM where the step does not shard."""
+def test_forward_takes_the_modes_exchange(monkeypatch, mode, ctx, dp_meta, expect):
+    """A sharded decode exchanges what `ATOM_DP_LM_HEAD_MODE` names (greedy
+    ids under `argmax`); any other step runs the replicated GEMM."""
     c = types.SimpleNamespace(
         is_prefill=False,
         is_draft=False,
         running_tokens_are_unified=True,
-        dp_all_greedy=greedy,
+        scheduled_bs=2,
     )
     for k, v in ctx.items():
         setattr(c, k, v)
     monkeypatch.setattr(eh, "is_plugin_mode", lambda: False)
     monkeypatch.setattr(eh, "sp_is_enabled", lambda: False)
+    monkeypatch.setattr(eh, "sp_gather_rows", lambda x, idx: x)
     monkeypatch.setattr(eh, "envs", types.SimpleNamespace(ATOM_DP_LM_HEAD_MODE=mode))
     monkeypatch.setattr(
         eh, "get_dp_group", lambda: types.SimpleNamespace(world_size=DP)
     )
+    meta = types.SimpleNamespace(cu_seqlens_q=torch.tensor([0, 1, 2]))
     monkeypatch.setattr(
         eh,
         "get_forward_context",
         lambda: types.SimpleNamespace(
-            context=c, attn_metadata=None, dp_metadata=object() if dp_meta else None
+            context=c, attn_metadata=meta, dp_metadata=object() if dp_meta else None
         ),
     )
     replicated = torch.zeros(2, 8)
@@ -166,44 +164,16 @@ def test_forward_takes_the_groups_exchange(
     head.tp_size, head.num_embeddings = 1, DP * VSHARD
     head.weight, head.bias = None, None
     calls = []
+    ids = torch.tensor([5.0, 7.0])
 
     def sharded(x, m):
         calls.append(m)
-        return torch.tensor([5.0, 7.0]) if m == "argmax" else torch.ones(2, 8)
+        return ids if m == "argmax" else torch.ones(2, 8)
 
     head._dp_sharded_logits = sharded
     out = head(torch.zeros(2, 4))
     assert calls == ([expect] if expect else [])
     if expect == "argmax":
-        assert out.dtype == torch.int32 and out.tolist() == [5, 7]
+        assert out is ids
     elif expect is None:
         assert out is replicated
-
-
-# --------------------------------------------------------------- voting ---
-def _batch(temperatures=(0.0, 0.0), logprobs=False, structured=None, channel=None):
-    return types.SimpleNamespace(
-        temperatures=np.asarray(temperatures, np.float32),
-        any_logprobs=logprobs,
-        structured_requests=structured or {},
-        required_channel=channel,
-    )
-
-
-@pytest.mark.parametrize(
-    "batch, vote",
-    [
-        (_batch(), True),
-        (_batch(temperatures=()), True),  # an idle rank's empty batch
-        (_batch(temperatures=(0.0, 0.7)), False),
-        (_batch(logprobs=True), False),
-        (_batch(structured={10: object()}), False),
-        (_batch(channel=object()), False),
-    ],
-)
-def test_a_rank_votes_greedy_only_for_plain_greedy_rows(batch, vote):
-    runner = object.__new__(mr.ModelRunner)
-    runner.dp_argmax_head = object()
-    assert runner._dp_greedy_vote(batch) is vote
-    runner.dp_argmax_head = None
-    assert runner._dp_greedy_vote(batch) is None

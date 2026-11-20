@@ -92,9 +92,6 @@ class DPSyncResult:
     max_seqlen_q_across_dp: int | None = None
     # DP-MAX of the requests whose prompt a rank's prefill finishes this step.
     max_final_requests_across_dp: int = 0
-    # AND of the ranks' greedy votes -- only set when ``greedy`` was passed in
-    # (`ForwardMode.dp_all_greedy`); a rank with no request votes yes.
-    all_greedy_across_dp: bool = False
 
     @property
     def any_rank_has_prefill(self) -> bool:
@@ -116,7 +113,6 @@ def sync_dp_metadata(
     local_can_split: bool = False,
     local_ub_tokens: tuple[int, int] = (0, 0),
     max_seqlen_q: int | None = None,
-    greedy: bool | None = None,
 ) -> DPSyncResult:
     """Single packed DP all_gather over all per-rank scalars a decode/prefill
     step needs synchronized: DP token padding, the prefill fan-out, whether the
@@ -141,7 +137,6 @@ def sync_dp_metadata(
       row 7 : ub0_tokens               -> ub_tokens_across_dp[0]  [TBO prefill only]
       row 8 : ub1_tokens               -> ub_tokens_across_dp[1]  [TBO prefill only]
       row k+0 : max_seqlen_q           -> max_seqlen_q_across_dp (MAX)  [DSpark only]
-      last    : greedy (0/1)           -> all_greedy_across_dp (AND)    [greedy vote only]
 
     ``final_requests``: the requests whose prompt this rank's prefill
     finishes, for a model whose prefill runs some layers on those requests'
@@ -156,8 +151,7 @@ def sync_dp_metadata(
 
     ``max_seqlen_q`` folds a block drafter's per-step graph-shape sync into this
     same packed all_gather. It is global-config gated (DSpark on + DP), so every
-    rank appends the same field and the payload stays symmetric. So is
-    ``greedy``: a runner with a DP argmax head votes on every step.
+    rank appends the same field and the payload stays symmetric.
 
     Neither the batch nor the token total needs a row of its own here: rows 1 and
     0 already carry them, and a step that reaches the reduction with every rank
@@ -174,8 +168,7 @@ def sync_dp_metadata(
     """
     tbo_fields = 9 if tbo_on else 5
     dspark_on = max_seqlen_q is not None
-    greedy_on = greedy is not None
-    n_fields = tbo_fields + (1 if dspark_on else 0) + (1 if greedy_on else 0)
+    n_fields = tbo_fields + (1 if dspark_on else 0)
     local = torch.zeros(n_fields, dtype=torch.int32, device="cpu")
     local[0] = scheduled_tokens
     local[1] = scheduled_bs
@@ -189,8 +182,6 @@ def sync_dp_metadata(
         local[8] = local_ub_tokens[1]
     if dspark_on:
         local[tbo_fields + 0] = max_seqlen_q
-    if greedy_on:
-        local[-1] = 1 if greedy else 0
 
     # A group of one is its own row, with nothing to exchange.
     gathered = [local]
@@ -216,8 +207,6 @@ def sync_dp_metadata(
         running_tokens_per_dp_rank[idle] = running_tokens
         prefill = sync[2].any()
         sync[2][idle] = prefill
-        if greedy_on:
-            sync[-1][idle] = 1
         if tbo_on:
             sync[5][idle] = 0
             if prefill:
@@ -252,7 +241,6 @@ def sync_dp_metadata(
         ub_tokens_across_dp=ub_tokens_across_dp,
         max_seqlen_q_across_dp=max_seqlen_q_across_dp,
         max_final_requests_across_dp=int(sync[4].max()),
-        all_greedy_across_dp=greedy_on and bool(sync[-1].all()),
     )
 
 

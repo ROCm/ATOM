@@ -267,10 +267,6 @@ class ParallelLMHead(VocabParallelEmbedding):
                 # Under Ulysses SP, x is this rank's token shard.
                 x = sp_gather_rows(x, last_indices)
             if self._can_use_dp_sharded_head(context):
-                if context.dp_all_greedy:
-                    # The group's greedy ids, int32 [rows], from the same GEMM.
-                    ids = self._dp_sharded_logits(x, "argmax")
-                    return ids.to(torch.int32)
                 return self._dp_sharded_logits(x, envs.ATOM_DP_LM_HEAD_MODE)
             if sp_is_enabled() and not self.num_embeddings % get_pcp_group().world_size:
                 return self._sp_sharded_logits(x)
@@ -386,7 +382,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         over a >1 DP group."""
         dp_group = get_dp_group()
         return (
-            envs.ATOM_DP_LM_HEAD_MODE in ("allgather", "all2all")
+            envs.ATOM_DP_LM_HEAD_MODE in ("allgather", "all2all", "argmax")
             and self.tp_size == 1
             and dp_group.world_size > 1
             and self.num_embeddings % dp_group.world_size == 0
@@ -396,10 +392,8 @@ class ParallelLMHead(VocabParallelEmbedding):
         """Whether this step may run the DP-sharded LM head (pure-DP decode only).
 
         Every DP rank must reach the SAME verdict from globally-synced state, or
-        the fixed-size collective in `_dp_sharded_logits` deadlocks. `forward`
-        picks the exchange: argmax ids on a DP greedy step
-        (`Context.dp_all_greedy`, `allgather` only), else the logits of
-        ATOM_DP_LM_HEAD_MODE (all-gather vs all2all).
+        the fixed-size collective in `_dp_sharded_logits` deadlocks. The exchange
+        (all-gather, all2all or greedy ids) is ATOM_DP_LM_HEAD_MODE's there.
 
         `is_prefill` below is per-rank, which is safe only because
         `running_tokens_are_unified` is the DP-reduced form of the same
@@ -430,10 +424,10 @@ class ParallelLMHead(VocabParallelEmbedding):
 
         - ``"argmax"``: reduce each shard to a packed ``(max, global_id)`` and
           all-gather only ``[Σrows, 2]``, then pick the winner -> ``[local_rows]``
-          ids, still packed as fp32 (drafting, or a decode the DP group runs
-          greedily; the caller narrows into its own).
+          ids, still packed as fp32 (drafting, or the decode head under
+          ``ATOM_DP_LM_HEAD_MODE=argmax``; the caller narrows into its own).
         - ``"all2all"`` / ``"allgather"``: exchange full-vocab logits ->
-          ``[local_rows, vocab]`` (any other decode).
+          ``[local_rows, vocab]`` (the decode head).
         """
         dp_group = get_dp_group()
         dp_size = dp_group.world_size
