@@ -43,14 +43,23 @@ RUN echo "========== [OOT 0/7] Back up base-image custom RCCL ==========" && \
 # librccl so ldconfig unambiguously resolves the custom build in /usr/local/lib
 # (leaving the stock rccl dpkg metadata in place keeps rocm-hip's dep satisfied —
 # only the .so is swapped, exactly the runtime state the native image ships).
+# The stock rccl-dev still ships rccl-targets.cmake, whose roc::rccl target
+# points at the stock library's real file (librccl.so.1.0.<rocm version>); the
+# vLLM build reaches it through torch's LoadHIP.cmake (find_package(rccl)), and
+# CMake fails if that file is missing. So when the stock library is replaced,
+# its real path becomes a symlink to the custom RCCL, and the build configures
+# and links against the same library the image runs. Without a custom RCCL
+# backup (BUILD_RCCL=0 base) the stock library stays and nothing is linked.
 RUN echo "========== [OOT 1/7] Prepare build tools ==========" && \
     apt-get update && \
     apt --fix-broken install -y && \
     echo "========== [OOT] Restore base-image custom RCCL ==========" && \
     if ls /tmp/rccl-base-backup/librccl.so* >/dev/null 2>&1; then \
       echo "Removing stock rccl from /opt/rocm and restoring custom build to /usr/local/lib" && \
+      STOCK_RCCL="$(readlink -e /opt/rocm/lib/librccl.so.1 2>/dev/null || true)" && \
       rm -f /opt/rocm*/lib/librccl.so* && \
       cp -a /tmp/rccl-base-backup/librccl.so* /usr/local/lib/ && \
+      if [ -n "${STOCK_RCCL}" ]; then ln -s /usr/local/lib/librccl.so.1.0 "${STOCK_RCCL}"; fi && \
       if [ -f /tmp/rccl-base-backup/rccl.conf ]; then \
         cp -a /tmp/rccl-base-backup/rccl.conf /etc/ld.so.conf.d/rccl.conf ; \
       else \
@@ -72,16 +81,6 @@ RUN echo "========== [OOT 1/7] Prepare build tools ==========" && \
     TORCH_LIB=$("${VENV_PYTHON}" -c "import os,torch; print(os.path.join(os.path.dirname(torch.__file__),'lib'))") && \
     echo "${TORCH_LIB}" > /etc/ld.so.conf.d/torch.conf && \
     ldconfig
-
-# The stock rccl-dev left by `--fix-broken` ships rccl-targets.cmake, whose
-# roc::rccl target points at /opt/rocm-7.2.4/lib/librccl.so.1.0.70204. The vLLM
-# build reaches it through torch's LoadHIP.cmake (find_package(rccl)), and CMake
-# fails if that file is missing, which it is once the restore above removed the
-# stock library. Point that path at the custom RCCL so the build configures and
-# links against the same library the image runs. The file name follows the stock
-# rccl version of the ROCm 7.2.4 base (the OOT image is built only on the ROCm 7
-# line); update it when the base image's ROCm version changes.
-RUN ln -s /usr/local/lib/librccl.so.1.0 /opt/rocm-7.2.4/lib/librccl.so.1.0.70204
 
 COPY docker/patches/vllm-torch210-compat.patch /tmp/vllm-torch210-compat.patch
 
