@@ -254,7 +254,9 @@ def test_batched_ssm_path_uses_one_kernel_call(monkeypatch):
     assert calls["n"] == 1, f"batched SSM should run once, got {calls['n']} calls"
 
 
-@pytest.mark.parametrize("flydsl_decode", [False, True], ids=["vk", "logical_kv"])
+@pytest.mark.parametrize(
+    "flydsl_decode", [False, True], ids=["plain_kv", "flydsl_logical_kv"]
+)
 @pytest.mark.parametrize("draft", [4, 16])
 def test_pad_rows_zeroed_and_real_rows_unchanged(monkeypatch, draft, flydsl_decode):
     """CUDA-graph pad rows (cache index -1) skip the conv, so their q/k/v are

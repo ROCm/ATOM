@@ -862,9 +862,9 @@ def _causal_conv1d_update_kernel(
     query_start_loc_ptr,  # (batch + 1)
     block_idx_last_scheduled_token,  # (batch,)
     initial_state_idx,  # (batch,)
-    query_ptr,  # (num_tokens, k_dim_size, 1); key/value likewise
-    key_ptr,
-    value_ptr,
+    query_ptr,  # (num_tokens, k_dim_size, 1)
+    key_ptr,  # (num_tokens, k_dim_size, 1)
+    value_ptr,  # (num_tokens, v_dim_size, 1)
     # Matrix dimensions
     batch: int,
     dim: tl.constexpr,
