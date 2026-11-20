@@ -3,6 +3,7 @@
 import copy
 import importlib.util
 import math
+import runpy
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -101,6 +102,20 @@ class ProbeChecks(unittest.TestCase):
             )
             with self.assertRaisesRegex(RuntimeError, "incomplete model shards"):
                 probe.check_models()
+
+    def test_sampling_construction_matches_the_native_api(self):
+        native = runpy.run_path(str(PATH.parents[2] / "atom/sampling_params.py"))
+        params = probe.make_sampling_params(native["SamplingParams"])
+        self.assertEqual(
+            (
+                params.temperature,
+                params.max_tokens,
+                params.ignore_eos,
+                params.logprobs,
+                params.top_logprobs,
+            ),
+            (0, probe.OUTPUT_TOKENS, True, True, 20),
+        )
 
     def test_native_logprob_record_is_complete_and_finite(self):
         row = token(token_id=0)

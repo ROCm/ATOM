@@ -375,6 +375,16 @@ def require_stable_baseline(arm, comparison):
         raise error("baseline cold/warm numerical control was not stable")
 
 
+def make_sampling_params(params_type):
+    return params_type(
+        temperature=0,
+        max_tokens=OUTPUT_TOKENS,
+        ignore_eos=True,
+        logprobs=True,
+        top_logprobs=20,
+    )
+
+
 def capture(arm, inputs, output):
     import aiter
     import torch
@@ -463,14 +473,7 @@ def capture(arm, inputs, output):
                         (int(sample.output_tokens[0]), tuple(sample.logprobs[0]))
                     )
 
-            params = SamplingParams(
-                temperature=0,
-                seed=0,
-                max_tokens=OUTPUT_TOKENS,
-                ignore_eos=True,
-                logprobs=True,
-                top_logprobs=20,
-            )
+            params = make_sampling_params(SamplingParams)
             engine.core_mgr.reset_dp_router()
             with engine.core_mgr.offline_backpressure_batch():
                 engine.add_request([data["tokens"]], params, stream_callback=[receive])

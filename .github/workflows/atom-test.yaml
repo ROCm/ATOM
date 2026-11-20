@@ -945,7 +945,7 @@ jobs:
       - name: Verify immutable source and job scope
         run: |
           python - <<'PY'
-          import ast, pathlib, subprocess, sys, yaml
+          import ast, pathlib, subprocess, sys, types, yaml
           sys.path.insert(0, '.github/scripts')
           import kda_stage1_probe as p
           def git(*args):
@@ -962,6 +962,11 @@ jobs:
               patch = subprocess.check_output(['git', 'diff', a, b, '--', 'atom'])
               return subprocess.check_output(['git', 'patch-id', '--stable'], input=patch).split()[0]
           assert patch_id(common, pr) == patch_id(p.BASE, p.CANDIDATE)
+          for ref in (p.BASE, p.CANDIDATE):
+              native = types.ModuleType('stage1_native_sampling')
+              sys.modules[native.__name__] = native
+              exec(git('show', ref + ':atom/sampling_params.py'), native.__dict__)
+              p.make_sampling_params(native.SamplingParams)
           cfg = yaml.load(pathlib.Path('.github/workflows/atom-test.yaml').read_text(), Loader=yaml.BaseLoader)
           assert 'workflow_dispatch' in cfg['on']
           disabled = '$' + '{{ false }}'
