@@ -3348,10 +3348,8 @@ class Config:
             from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
             from atom.models.minimax_m3.config import draft_dtype_moves
 
-            # A MiniMax-M3 DSpark draft beside an NVFP4 KV moves with its pages:
-            # they follow the target's as bytes of their own, and the PAGE
-            # namespace hashes the draft KV dtype, so a store written with
-            # another draft dtype is never read back.
+            # An M3 DSpark draft beside an NVFP4 KV moves as bytes of its own: Mooncake
+            # P/D's pair_units refuses other draft units; the PAGE namespace hashes its dtype.
             if (
                 spec.draft_kv_dtype != self.kv_cache_dtype
                 and self.kv_transfer_config
