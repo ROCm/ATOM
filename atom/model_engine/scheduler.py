@@ -891,6 +891,9 @@ class Scheduler:
         # hash. Keyed on advance_on_schedule, which only PP sets. Only a class
         # that must file at retire lands here; see `_finalize_prefill_chunk`.
         self._checkpoint_holds: dict[int, int] = {}
+        # Whether the last `_probe_local_prefill_work` stopped because the batch
+        # budget could not take the next request (the initial ramp's fill).
+        self._probe_filled_budget = False
 
         from atom.utils.forward_context import get_kvconnector
 
@@ -1149,6 +1152,7 @@ class Scheduler:
     def _probe_local_prefill_work(self) -> tuple[bool, int]:
         budget = self.max_num_batched_tokens
         pending = 0
+        self._probe_filled_budget = False
         if self._partial_prefill_count:
             for seq in self.running:
                 if not seq.is_partial_prefill:
@@ -1173,6 +1177,7 @@ class Scheduler:
                     break
         prefillable = pending > 0
         if pending >= budget or len(self.running) >= self.max_num_seqs:
+            self._probe_filled_budget = pending >= budget
             return prefillable, min(pending, budget)
         # A chunk counts the rows its forward computes, not the reused prefix.
         slots = self.max_num_seqs - len(self.running)
@@ -1214,11 +1219,11 @@ class Scheduler:
             chunk = self._prefill_chunk_for_budget(
                 remaining, budget - pending, pending, history_len=cached, kind=kind
             )
-            if (
-                chunk is None
-                or (atomic and chunk < remaining)
-                or self._waits_below_resume(seq, cached, chunk, resume)
-            ):
+            if chunk is None or (atomic and chunk < remaining):
+                # What the batch budget has left cannot take this request.
+                self._probe_filled_budget = True
+                break
+            if self._waits_below_resume(seq, cached, chunk, resume):
                 break
             chunk = self._preview_prefill_chunk(seq, cached, resume, chunk)
             prefillable = True
@@ -1229,6 +1234,7 @@ class Scheduler:
             if offload_resume and getattr(seq, "_counted_as_inflight_load", False):
                 parked -= 1
             if pending >= budget:
+                self._probe_filled_budget = True
                 return True, budget
             if slots == 0:
                 break
@@ -1346,6 +1352,39 @@ class Scheduler:
             room = int(math.sqrt(a * a + 2.0 * left) - a)
         room = max(room, self._balance_min_tokens - batched_tokens)
         return max(min(room, cap_room), 0)
+
+    def _ramp_full_chunk(
+        self,
+        prefillable: bool,
+        running_decode_batch: int,
+        free_slots: int,
+        probed_tokens: int | None,
+    ) -> bool:
+        """The initial ramp's signal for this rank: a fresh request waits for a
+        free seq slot, and admission's own probe (`_probe_local_prefill_work`:
+        checkpoint holds, atomic heads, in-flight prefixes and parking included)
+        fills target_fill of a prefill chunk, or stops because what is left of
+        the batch budget cannot take the next request (without chunked prefill
+        whole prompts rarely pack to target_fill, yet the rank has more work
+        than one batch). A resumable partial alone does not: that is one long
+        prompt, not empty slots. ``probed_tokens`` is the probe's count where
+        this tick already ran it. A local delayer with no decode fires anyway,
+        so it skips the probe."""
+        delayer = self.prefill_delayer
+        if (
+            not prefillable
+            or not delayer.ramp_active
+            or free_slots == 0
+            or (delayer.is_local and not running_decode_batch)
+            or next(self._waiting_prefills(), None) is None
+        ):
+            return False
+        if probed_tokens is None:
+            probed_tokens = self._local_prefill_pending_work()[1]
+        return (
+            self._probe_filled_budget
+            or probed_tokens >= delayer.target_fill * self.max_num_batched_tokens
+        )
 
     def _estimate_prefill_chunk_cost(self) -> float:
         """Cost of the chunk this rank would prefill with the whole batch
@@ -2290,6 +2329,8 @@ class Scheduler:
             running_decode_batch = max(
                 0, len(self.running) - self._partial_prefill_count
             )
+            # The tokens admission's probe counts this tick, where it ran.
+            probed_tokens = None
             protects_decode = self.prefill_delayer.protects_decode(running_decode_batch)
             if protects_decode or (
                 self._local_prefill_coalescing and not running_decode_batch
@@ -2304,6 +2345,7 @@ class Scheduler:
                 pending_tokens = 0
             elif self._local_prefill_coalescing:
                 prefillable, pending_tokens = self._local_prefill_pending_work()
+                probed_tokens = pending_tokens
             else:
                 prefillable = self._can_admit_head_prefill()
                 pending_tokens = min(
@@ -2322,6 +2364,7 @@ class Scheduler:
                 else 0.0
             )
             waiting_requests = len(self.waiting) + self._partial_prefill_count
+            free_slots = max(0, self.max_num_seqs - len(self.running))
             decision = self.prefill_delayer.should_allow_prefill(
                 prefillable=prefillable,
                 pending_tokens=pending_tokens,
@@ -2329,7 +2372,12 @@ class Scheduler:
                 # which are NOT decode load — counting them would defeat the
                 # coalescer's "no decode → fire" fast path.
                 running_decode_batch=running_decode_batch,
-                kv_usage=0.0 if protects_decode else self._kv_usage(),
+                # The ramp ends on high KV, protection window or not.
+                kv_usage=(
+                    0.0
+                    if protects_decode and not self.prefill_delayer.ramp_active
+                    else self._kv_usage()
+                ),
                 has_partial=self._partial_prefill_count > 0,
                 oldest_waiting_age_ms=(
                     self._oldest_waiting_prefill_age_ms()
@@ -2349,9 +2397,9 @@ class Scheduler:
                 # prefill_admit_policy adaptive: what a FIRE could add to the
                 # decode batch -- partials plus waiting heads up to free slots
                 admittable_requests=self._partial_prefill_count
-                + min(
-                    len(self.waiting),
-                    max(0, self.max_num_seqs - len(self.running)),
+                + min(len(self.waiting), free_slots),
+                full_chunk=self._ramp_full_chunk(
+                    prefillable, running_decode_batch, free_slots, probed_tokens
                 ),
             )
         else:

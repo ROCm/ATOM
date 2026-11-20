@@ -25,6 +25,8 @@ ARRIVED = 8
 BLOCKED = 9
 # reduce-buffer slot of the ranks without prefill that cannot align in time
 UNREACHABLE = 10
+# reduce-buffer slot of the ranks whose free seq slots fill a prefill chunk
+FULL_CHUNK = 11
 
 
 def _noop_all_reduce(tensor, op=None, group=None):
@@ -642,6 +644,81 @@ class TestPrefillDecodeInterval:
         assert call(d, prefillable=False, pending_tokens=0) is True
         assert call(d, prefillable=False, pending_tokens=0) is True
         assert d._decode_interval_remaining == 0
+
+    def test_ramp_skips_interval_once_while_chunks_fill(self):
+        d = make_delayer(prefill_decode_interval=3, prefill_ramp=True)
+        full = {"pending_tokens": MAX_BATCHED, "full_chunk": True}
+        assert call(d, running_decode_batch=10, **full) is True
+        d.notify_prefill_executed()
+        # target_fill of a chunk fits the free slots: back-to-back prefill, no
+        # protection.
+        assert call(d, running_decode_batch=50, **full) is True
+        assert d._stat_fire_ramp == 1
+        # The interval it armed protects decode; the ramp still decides first.
+        assert d.ramp_active and d.protects_decode(50)
+        d.notify_prefill_executed()
+        # The free slots no longer fill a chunk: the ramp ends, the interval holds.
+        for _ in range(3):
+            assert call(d, pending_tokens=MAX_BATCHED, running_decode_batch=90) is False
+        assert d._stat_hold_decode_interval == 3 and not d.ramp_active
+        assert call(d, pending_tokens=MAX_BATCHED, running_decode_batch=90) is True
+        d.notify_prefill_executed()
+        # Steady state: a full chunk again does not reopen the ramp.
+        assert call(d, running_decode_batch=50, **full) is False
+        assert d._stat_fire_ramp == 1
+        assert d.protects_decode(50)
+
+    def test_ramp_off_keeps_interval(self):
+        d = make_delayer(prefill_decode_interval=3)
+        assert call(d, pending_tokens=MAX_BATCHED, full_chunk=True) is True
+        d.notify_prefill_executed()
+        assert call(d, pending_tokens=MAX_BATCHED, full_chunk=True) is False
+        assert d._stat_fire_ramp == 0 and not d.ramp_active
+
+    def test_ramp_ends_on_kv_high_and_rearms_without_decode(self):
+        d = make_delayer(prefill_decode_interval=3, prefill_ramp=True)
+        full = {"pending_tokens": MAX_BATCHED, "full_chunk": True}
+        assert call(d, running_decode_batch=10, **full) is True
+        d.notify_prefill_executed()
+        # KV runs high before the batch fills: the ramp ends, the interval holds.
+        assert call(d, running_decode_batch=50, kv_usage=0.95, **full) is False
+        assert d._stat_fire_ramp == 0
+        # A group with no decode re-arms the ramp for the next burst.
+        assert call(d, running_decode_batch=0, **full) is True
+        assert d._stat_fire_ramp == 1 and d.ramp_active
+        d.notify_prefill_executed()
+        assert call(d, running_decode_batch=50, **full) is True
+        assert d._stat_fire_ramp == 2
+
+    @pytest.mark.parametrize(
+        "kw, armed",
+        [
+            ({}, False),
+            ({"prefill_decode_interval": 3}, True),
+            ({"admit_policy": "adaptive"}, True),
+        ],
+    )
+    def test_ramp_arms_only_with_an_interval_or_adaptive(self, kw, armed):
+        # Interval 0 with the interval policy holds nothing back: no ramp, and
+        # its reduce slot stays 0.
+        d = make_delayer(prefill_ramp=True, **kw)
+        assert d.prefill_ramp is armed and d.ramp_active is armed
+        call(d, pending_tokens=MAX_BATCHED, full_chunk=True)
+        assert d._reduce_buf[FULL_CHUNK] == int(armed)
+
+    def test_ramp_needs_every_rank_full(self):
+        d = make_delayer(dp_size=2, prefill_decode_interval=3, prefill_ramp=True)
+        sib_full = _add_rank({0: 1, 1: MAX_BATCHED, 2: 50, FULL_CHUNK: 1})
+        sib_short = _add_rank({0: 1, 1: MAX_BATCHED, 2: 50})
+        full = {"pending_tokens": MAX_BATCHED, "full_chunk": True}
+        assert call(d, running_decode_batch=50, reduce=sib_full, **full) is True
+        d.notify_prefill_executed()
+        assert call(d, running_decode_batch=50, reduce=sib_full, **full) is True
+        assert d._stat_fire_ramp == 1
+        d.notify_prefill_executed()
+        # The sibling can no longer fill a chunk: the ramp ends for the group.
+        assert call(d, running_decode_batch=50, reduce=sib_short, **full) is False
+        assert not d.ramp_active
 
     def test_no_decode_does_not_block_prefill_progress(self):
         d = make_delayer(prefill_decode_interval=10)
