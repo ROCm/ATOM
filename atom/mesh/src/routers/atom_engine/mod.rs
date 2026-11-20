@@ -446,7 +446,7 @@ impl RawExtras {
             ),
         ];
         match unserved.iter().find(|(_, set)| *set) {
-            Some((name, _)) => Err(request::not_yet(name)),
+            Some((name, _)) => Err(not_yet(name)),
             None => Ok(()),
         }
     }
