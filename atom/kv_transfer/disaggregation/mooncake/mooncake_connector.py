@@ -4448,10 +4448,10 @@ class MooncakeConnector(KVConnectorBase):
             self._pending_recv_nonce.pop(req_id, None)
             self._pending_recv_acks.pop(req_id, None)
             self._pending_recv_stall_watch.pop(req_id, None)
-            failed_after_write = self._pending_recv_failed.pop(req_id, None)
-            failed = failed_after_write is not None
+            failed = req_id in self._pending_recv_failed
+            failed_after_write = failed and self._pending_recv_failed.pop(req_id)
 
-        self._complete_recv(req_id, failed, failed and failed_after_write)
+        self._complete_recv(req_id, failed, failed_after_write)
         return True
 
     def _record_write_ack(self, data: dict) -> None:
