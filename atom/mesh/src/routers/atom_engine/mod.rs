@@ -40,8 +40,11 @@ use crate::{
         grpc::completion_adapter::completion_to_generate,
         ingress::InferenceEnvelope,
         prepare::{
-            self, generation_payload::GenerationPayload, inference::ParsedInference,
-            response_context::ResponseContext, thread_tokenizer,
+            self,
+            generation_payload::GenerationPayload,
+            inference::ParsedInference,
+            response_context::{self, ResponseContext},
+            thread_tokenizer,
         },
         render::{self, completion::CompletionRender},
         RouterTrait,
@@ -113,9 +116,15 @@ impl AtomEngineRouter {
         };
         let request = Arc::new(chat.request);
         let (headers, model_id, app) = (headers.cloned(), self.model_id(), self.ctx.clone());
-        let (payload, ctx) = self
+        let (payload, mut ctx) = self
             .on_prepare_worker(move || prepare::prepare_chat(request, headers, model_id, &app))
             .await?;
+        // A template whose generation prompt opens `<think>` (GLM-5.x,
+        // Qwen3.5) leaves the reply inside reasoning, as api_server reads it.
+        ctx.prompt_opens_reasoning = ctx
+            .original_text
+            .as_deref()
+            .is_some_and(response_context::prompt_opens_reasoning);
         let stream = self.submit(&payload, &ctx, admission)?;
         Ok(if payload.stream {
             render::chat_streaming::process(stream, ctx, BACKEND_LABEL)
@@ -414,6 +423,19 @@ fn dp_rank(rank: Option<i64>) -> Result<Option<usize>, Response> {
             format!("data_parallel_rank must be >= 0, got {r}"),
         )),
     }
+}
+
+/// A request this server refuses as invalid.
+fn bad_request(message: String) -> Response {
+    error::bad_request("invalid_request", message)
+}
+
+/// A request the Python server serves and this one does not yet.
+fn not_yet(what: &str) -> Response {
+    error::bad_request(
+        "not_supported",
+        format!("{what} is not supported by the ATOM standalone server yet"),
+    )
 }
 
 #[cfg(test)]

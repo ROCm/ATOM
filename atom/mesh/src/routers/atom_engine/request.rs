@@ -7,12 +7,11 @@
 use axum::response::Response;
 use http::HeaderMap;
 
-use super::{token_source::SeqTokenSource, AtomEngineRouter};
+use super::{bad_request, not_yet, token_source::SeqTokenSource, AtomEngineRouter};
 use crate::{
     atom_engine::{wire::pb, ModelSpec, Submission},
     protocols::common::StringOrArray,
     routers::{
-        comm::error,
         prepare::{generation_payload::GenerationPayload, response_context::ResponseContext},
         token_handle::{engine_error::EngineError, token_handle::TokenHandle},
     },
@@ -262,17 +261,6 @@ fn session_id(headers: Option<&HeaderMap>) -> Option<&str> {
     SESSION_HEADERS
         .iter()
         .find_map(|name| headers.get(*name)?.to_str().ok().filter(|v| !v.is_empty()))
-}
-
-fn bad_request(message: String) -> Response {
-    error::bad_request("invalid_request", message)
-}
-
-fn not_yet(what: &str) -> Response {
-    error::bad_request(
-        "not_supported",
-        format!("{what} is not supported by the ATOM standalone server yet"),
-    )
 }
 
 #[cfg(test)]
