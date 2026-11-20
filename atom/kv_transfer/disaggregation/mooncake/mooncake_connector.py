@@ -593,9 +593,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
     def get_num_new_matched_tokens(self, seq: Sequence) -> tuple[int, bool]:
         params = seq.kv_transfer_params or {}
 
-        if params.get("do_remote_prefill") and not getattr(
-            seq, "kv_async_tagged", False
-        ):
+        if params.get("do_remote_prefill"):
             return len(seq.prompt_token_ids), True
 
         return 0, False
