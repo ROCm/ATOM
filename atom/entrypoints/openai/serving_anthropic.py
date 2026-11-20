@@ -116,6 +116,38 @@ def _image_part(block: dict) -> dict:
     return {"type": "image_url", "image_url": {"url": url}}
 
 
+def _system_text(content: Any, where: str) -> str:
+    """A system prompt, string or text blocks, as the string a template takes."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    if _has_image(content):
+        raise ValueError(_IMAGES_NOT_HERE + where)
+    text_parts = []
+    for b in content:
+        if isinstance(b, dict) and b.get("type") == "text":
+            text = _block_field(b, "text")
+            if text.startswith("x-anthropic-billing-header"):
+                continue
+            text_parts.append(text)
+    return "\n".join(text_parts)
+
+
+def anthropic_context_length_message(
+    prompt_tokens: int, max_tokens: int, limit: int
+) -> str:
+    """An over-long request in the Anthropic API's wording, which Claude Code
+    reads: the first form makes it compact the conversation, the second retry
+    with a smaller ``max_tokens``."""
+    if prompt_tokens >= limit:
+        return f"prompt is too long: {prompt_tokens} tokens > {limit - 1} maximum"
+    return (
+        f"input length and `max_tokens` exceed context limit: {prompt_tokens} + "
+        f"{max_tokens} > {limit}, decrease input length or `max_tokens` and try again"
+    )
+
+
 def anthropic_to_openai_messages(
     messages: list[AnthropicMessage],
     system: Any | None = None,
@@ -125,20 +157,9 @@ def anthropic_to_openai_messages(
 
     # System message
     if system:
-        if isinstance(system, str):
-            result.append({"role": "system", "content": system})
-        elif isinstance(system, list):
-            if _has_image(system):
-                raise ValueError(_IMAGES_NOT_HERE + "the system prompt")
-            text_parts = []
-            for b in system:
-                if b.get("type") == "text":
-                    text = _block_field(b, "text")
-                    if text.startswith("x-anthropic-billing-header"):
-                        continue
-                    text_parts.append(text)
-            if text_parts:
-                result.append({"role": "system", "content": "\n".join(text_parts)})
+        text = _system_text(system, "the system prompt")
+        if text:
+            result.append({"role": "system", "content": text})
 
     for msg in messages:
         role = msg.role
@@ -217,10 +238,17 @@ def anthropic_to_openai_messages(
                 elif text_parts:
                     result.append({"role": "user", "content": "\n".join(text_parts)})
                 result.extend(tool_results)
+        elif role == "system":
+            # Mid-conversation system messages (Claude Code sends reminders
+            # this way). str() of a block list put its Python repr in the prompt.
+            text = _system_text(content, "system messages")
+            if text:
+                result.append({"role": "system", "content": text})
         else:
-            if _has_image(content):
-                raise ValueError(_IMAGES_NOT_HERE + f"{role} messages")
-            result.append({"role": role, "content": str(content) if content else ""})
+            raise ValueError(
+                f'Unexpected role "{role}": messages take "user", "assistant" '
+                f'and "system"'
+            )
 
     return result
 
