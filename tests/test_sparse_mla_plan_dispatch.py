@@ -29,6 +29,7 @@ def production(monkeypatch):
         "mla_dcp_sparse_prefill_num_heads",
         "_forward_prefill_mla",
         "_rebuild_sparse_dcp_persistent_metadata",
+        "_absorb_into_q_out",
     }
     functions = [
         node
@@ -70,7 +71,8 @@ def production(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "native,supported", [(False, True), (True, None), (True, False), (True, True)]
+    "native,supported",
+    [(False, True), (True, None), (True, False), (True, True), (None, None)],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 def test_each_owner_rebuilds_folded_or_unknown_plans(
@@ -138,7 +140,7 @@ def test_each_owner_rebuilds_folded_or_unknown_plans(
         return out, torch.zeros(query.shape[:2])
 
     ns.update(
-        get_mla_decode_shape_support=support,
+        get_mla_decode_shape_support=support if native is not None else None,
         get_mla_metadata_v1=rebuild,
         patch_work_kv_ranges=patch,
         mla_decode_fwd=launch,
@@ -176,7 +178,7 @@ def test_each_owner_rebuilds_folded_or_unknown_plans(
     # IndexShare consumers keep the preceding owner's descriptors.
     attn.owns_sparse_indexer = False
     attn._forward_prefill_mla(q, kv, md, return_lse=True, q_prepadded=True)
-    assert queries == [(64, 1, dtype, dtype)] * 2
+    assert queries == ([(64, 1, dtype, dtype)] * 2 if native is not None else [])
     assert len(launches) == 3
     if native and supported is True:
         assert len(patches) == 2 and not rebuilds
@@ -230,4 +232,67 @@ def test_unqualified_width_keeps_conservative_padding(production, native, suppor
             dtype_kv=torch.bfloat16,
         )
         == 128
+    )
+
+
+@pytest.mark.parametrize(
+    "shape_query,arch_query",
+    [(True, True), (False, True), (True, False), (False, False)],
+)
+def test_optional_aiter_imports_keep_unrelated_mla_importable(
+    monkeypatch, shape_query, arch_query
+):
+    modules = {
+        "aiter.ops.attention": ("get_mla_decode_shape_support", shape_query),
+        "aiter.jit.utils.chip_info": ("get_gfx_runtime", arch_query),
+    }
+    for name in ("aiter", "aiter.ops", "aiter.jit", "aiter.jit.utils", *modules):
+        module = ModuleType(name)
+        module.__path__ = []
+        monkeypatch.setitem(sys.modules, name, module)
+    expected = {}
+    for name, (symbol, present) in modules.items():
+        expected[symbol] = object() if present else None
+        if present:
+            setattr(sys.modules[name], symbol, expected[symbol])
+
+    path = Path(__file__).resolve().parents[1] / "atom/model_ops/attention_mla.py"
+    nodes = [
+        node
+        for node in ast.parse(path.read_text(encoding="utf-8")).body
+        if any(
+            isinstance(child, ast.ImportFrom) and child.module in modules
+            for child in ast.walk(node)
+        )
+    ]
+    namespace = {}
+    exec(  # noqa: S102 - execute the production import blocks with older AITER modules
+        compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace
+    )
+    assert {name: namespace[name] for name in expected} == expected
+
+
+def test_missing_shape_query_keeps_conservative_width(production):
+    production["get_mla_decode_shape_support"] = None
+    assert (
+        production["mla_dcp_sparse_prefill_num_heads"](
+            12,
+            8,
+            persistent=True,
+            dtype_q=torch.float8_e4m3fn,
+            dtype_kv=torch.float8_e4m3fn,
+        )
+        == 128
+    )
+
+
+def test_missing_arch_query_disables_absorb(production):
+    production.update(
+        get_gfx_runtime=None,
+        is_rocm_aiter_fp4bmm_enabled=lambda: False,
+        dtypes=SimpleNamespace(fp8=torch.float8_e4m3fn),
+    )
+    layer = SimpleNamespace(W_K_qrep_scale=None, kv_shuffled=False)
+    assert not production["_absorb_into_q_out"](
+        layer, True, True, torch.empty(1), torch.float8_e4m3fn
     )

@@ -32,9 +32,18 @@ except ImportError:
     concat_and_cache_mla_seg = None
     fused_qk_rope_concat_and_cache_mla_seg = None
 from aiter.dist.parallel_state import get_dp_group, get_tensor_model_parallel_rank
-from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
-from aiter.ops.attention import get_mla_decode_shape_support
+
+try:
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+except ImportError:
+    get_gfx_runtime = None
+
+try:
+    from aiter.ops.attention import get_mla_decode_shape_support
+except ImportError:
+    get_mla_decode_shape_support = None
+
 from aiter.ops.triton.attention.mla import mla_decode_fwd as triton_mla_decode_fwd
 from aiter.ops.triton.fusions.fused_kv_cache import (
     fused_qk_rope_cat_and_cache_mla as triton_fused_qk_rope_cat_and_cache_mla,
@@ -410,7 +419,7 @@ def mla_dcp_sparse_prefill_num_heads(
     padding; the layer rebuilds folded work metadata after selecting its keys.
     """
     gathered = max(num_heads * dcp_world_size, min_kernel_heads)
-    if persistent:
+    if persistent and get_mla_decode_shape_support is not None:
         for candidate in range(
             mla_kernel_num_heads(gathered),
             _MLA_DCP_MAX_KERNEL_HEADS + 1,
@@ -1722,6 +1731,7 @@ class MLAAttention(nn.Module):
             and not self.kv_shuffled
             and kv_cache.numel() > 0
             and dtype_q == dtypes.fp8
+            and get_gfx_runtime is not None
             and get_gfx_runtime() == "gfx950"
             and mla_absorb_q_pack_supports(self.qk_nope_head_dim, self.kv_lora_rank)
         )
@@ -2610,16 +2620,24 @@ class MLAAttention(nn.Module):
                         kv_last_page_lens,
                     ) = head_groups.prepare(q, o, paged_kv_indptr, paged_kv_indices)
                 elif sparse_dcp_persistent and self.owns_sparse_indexer:
-                    support = get_mla_decode_shape_support(
-                        q.shape[1],
-                        1,
-                        q.dtype,
-                        kv_c_and_k_pe_cache.dtype,
-                        persistent=True,
-                        return_lse=True,
-                        page_size=1,
+                    support = (
+                        get_mla_decode_shape_support(
+                            q.shape[1],
+                            1,
+                            q.dtype,
+                            kv_c_and_k_pe_cache.dtype,
+                            persistent=True,
+                            return_lse=True,
+                            page_size=1,
+                        )
+                        if get_mla_decode_shape_support is not None
+                        else None
                     )
-                    if support.supported is True and support.native:
+                    if (
+                        support is not None
+                        and support.supported is True
+                        and support.native
+                    ):
                         patch_work_kv_ranges(
                             attn_metadata.sparse_prefill_work_info_set,
                             attn_metadata.sparse_prefill_work_indptr,
