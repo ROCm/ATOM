@@ -95,6 +95,8 @@ def _context_score(
                     block * 128,
                     pos,
                     cutoff,
+                    # The first query row's cutoff, the smallest.
+                    length - QUERY_LEN + 1,
                     SCALE,
                 )
             else:
