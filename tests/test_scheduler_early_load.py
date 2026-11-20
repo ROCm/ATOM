@@ -104,6 +104,7 @@ class _Connector(OffloadSchedulerMixin, KVConnectorSchedulerBase):
 
 
 class _Delayer:
+    admit_policy = "interval"
     is_local = False
     max_queue_ms = None
     kv_high_watermark = 0.9

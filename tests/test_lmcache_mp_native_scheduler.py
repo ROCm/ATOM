@@ -1180,6 +1180,8 @@ def test_engine_unaligned_hbm_hit_replays_without_a_load(monkeypatch):
 class _EarlyDelayer:
     """A prefill delayer that holds until `allow` is set."""
 
+    admit_policy = "interval"
+
     is_local = False
     max_queue_ms = None
     kv_high_watermark = 0.9

@@ -24,6 +24,8 @@ class _Delayer:
     """Delayer stub that releases prefill every tick and answers the cost
     exchange with this rank's cost followed by `others`."""
 
+    admit_policy = "interval"
+
     max_queue_ms = None
 
     def __init__(self, others=(), is_local=False):
