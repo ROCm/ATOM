@@ -14,7 +14,8 @@ The reference revision is `dba1be0a40aa45a94ad051997016db3960a90277`, AITER is
 pinned to `a53213dc474521a52ace1cecc079b70e3a0afafb` (it was
 `2039d2b96cd547ebc52f8d55f5f29ec1b8290796` until the
 [gfx942 (MI308X)](#gfx942-mi308x) section; the other sections' numbers predate
-the change), and Engram builds on
+the change; gfx1250 needs a newer AITER, see
+[gfx1250 (MI455X)](#gfx1250-mi455x)), and Engram builds on
 ROCm/ATOM PR #2185. The primary deployment scope is TP4 with whole-expert EP
 on MI355X GPUs. For measured TP2/TP4 no-EP, level-3 FULL AgentX performance,
 see the [AgentX benchmark recipe](DeepSeek-V4.1-Flash-Agentic.md), using
@@ -134,6 +135,15 @@ python -m atom.entrypoints.openai_server --model <V4.1 checkpoint> \
   `share_cache` accepts that composite on the prefill side.
 
 ## gfx1250 (MI455X)
+
+**AITER for gfx1250:** an AITER that contains ROCm/aiter
+[#7667](https://github.com/ROCm/aiter/pull/7667),
+[#7668](https://github.com/ROCm/aiter/pull/7668) and
+[#8057](https://github.com/ROCm/aiter/pull/8057), i.e. aiter main after #8057
+(the exact commit is recorded here once they land). The AITER pin above
+predates them: with it, building V4.1 on gfx1250 fails with an ImportError,
+because the shared expert imports #8057's fused gate_up names when it is
+constructed.
 
 V4.1 runs on gfx1250 at TP4 (`--level 0`, BF16 KV, FP8 index), with or without
 DSpark, and at DEP4 (EP + DP attention). On gfx1250 its FP8 linears, the grouped
