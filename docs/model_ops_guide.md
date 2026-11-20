@@ -505,10 +505,12 @@ def forward(self, logits, temperatures) -> sampled_tokens:
 pre-sampling boundary for K3 required channels and JSON Schema: K3 keeps its GPU
 state machine, llguidance keeps its packed vocabulary masks.
 
-A request carries at most one of the two: request admission
-(`InputOutputProcessor.preprocess_fanout`, which `LLMEngine.add_request`, the
-API server and atomesh call) rejects a JSON Schema or strict tool grammar
-together with a required channel. Accepted tokens advance channel and grammar
+A request carries at most one of the two: request admission rejects a JSON
+Schema or strict tool grammar together with a required channel. The API server
+and `LLMEngine.add_request` admit through
+`InputOutputProcessor.preprocess_fanout`; a request that reaches the EngineCore
+over engine_v1 from another client (the atomesh standalone frontend) is held to
+the same refusals by `codec.build_sequence`. Accepted tokens advance channel and grammar
 state after verification and broadcasts. Grammar input copies still overlap
 target forward, and channel state uses the existing GPU carry when deferred
 output means the host is one step behind. No constraints means no

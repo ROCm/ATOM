@@ -197,10 +197,12 @@ def take_flag(args: list[str], flag: str) -> tuple[list[str], str | None]:
     return rest, value
 
 
-def launch_atom_standalone(atomesh_runner: Any, raw_args: list[str]) -> None:
+def launch_atom_standalone(raw_args: list[str]) -> None:
     standalone_args = parse_standalone_args(raw_args)
     engine_args = standalone_args.engine_args
+    # Refused before the Rust runtime is even imported, as before any weights.
     check_standalone_model(engine_args)
+    atomesh_runner = import_atomesh_runner()
     tokenizer = load_tokenizer(engine_args)
     # The template, reasoning parser and tool-call format are decided here,
     # against ATOM's own resolvers, and handed to the router decided.
@@ -300,16 +302,11 @@ def main() -> None:
         if arg == "--version-verbose":
             print_version(verbose=True)
             return
-    # `python xxx mesh-only ...` starts mesh routing;
-    # other invocations default to ATOM standalone.
-    use_atom_standalone = "mesh-only" not in raw_args
-    # Import the mesh_python module.
-    atomesh_runner = import_atomesh_runner()
-
-    if use_atom_standalone:
-        launch_atom_standalone(atomesh_runner, raw_args)
+    # `mesh-only` starts a plain mesh router; anything else, ATOM standalone.
+    if "mesh-only" in raw_args:
+        launch_atomesh(import_atomesh_runner(), raw_args)
     else:
-        launch_atomesh(atomesh_runner, raw_args)
+        launch_atom_standalone(raw_args)
 
 
 if __name__ == "__main__":
