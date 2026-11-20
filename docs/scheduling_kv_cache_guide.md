@@ -490,7 +490,14 @@ when the shipped chain is adopted (`publish_loaded_prefix`,
 `register_received_prefix` and `acquire_offload_prefix` still hash the blocks
 they handle). The evaluation applies the SWA and state
 gates, the bounded replay, the checkpoint demand/end, the count of hit blocks
-already in use, and the fit. `allocate` claims the block ids the seq's last
+already in use, and the fit. A P/D receive whose load owner moves only the
+blocks past the local hit and the per-request state whole skips the state gate
+and the replay: the hash-matched prefix is its hit, and it resumes no state
+(`seq.state_from_peer`). The scheduler asks before allocation, per request
+(`receives_suffix_and_state(seq)`); MoRIIO says yes when the producer advertises
+the consumer's `block_size` / `dcp_size`, and otherwise receives every block.
+Mooncake says yes on the same condition for one TP producer, and keeps the full
+transfer from a PP producer and for a chunked transfer. `allocate` claims the block ids the seq's last
 walk found, unless the index changed under them.
 
 The probes that run every tick (the delayer's head check and probe, the DP

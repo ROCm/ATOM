@@ -1289,10 +1289,15 @@ class BlockManager:
         # so a boundary is only resumable where somebody checkpointed the state.
         # `_gated_hit` settles the two gates jointly; neither can be applied to
         # the other's answer.
-        resumable = self._gated_hit(seq, compressed_hit, block_hashes)
-        # A checkpoint far below the compressed hit loses to a bounded replay,
-        # which keeps the whole hit and rebuilds the state at its end.
-        num_cached_blocks = self._replay_hit(seq, compressed_hit, resumable)
+        if seq.state_from_peer and seq.has_per_req_cache:
+            # Nothing resumes from the prefix: the producer pushes the state.
+            resumable = num_cached_blocks = compressed_hit
+            seq.replays_hit = seq.replay_kv_load = False
+        else:
+            resumable = self._gated_hit(seq, compressed_hit, block_hashes)
+            # A checkpoint far below the compressed hit loses to a bounded
+            # replay, which keeps the whole hit and rebuilds the state at its end.
+            num_cached_blocks = self._replay_hit(seq, compressed_hit, resumable)
         # Instrumentation: the pre-gate hit, so EngineStats can separate reuse
         # the gates declined (compressed_hit - num_cached_blocks) from reuse
         # lost to compressed eviction (everything above compressed_hit).
@@ -1645,8 +1650,11 @@ class BlockManager:
 
         The joint boundary when there is one (above the HBM hit by
         construction), else the HBM hit's last block. A replay rebuilds the
-        state instead of restoring it, so it resumes from none.
+        state instead of restoring it, and a P/D producer pushes it whole, so
+        either resumes from none.
         """
+        if seq.state_from_peer:
+            return -1
         if joint_hash != -1:
             return joint_hash
         return -1 if self.tier_resume_replays(seq) else hit_hash

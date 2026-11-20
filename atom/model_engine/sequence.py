@@ -533,6 +533,9 @@ class Sequence:
         # kv_transfer params
         self.kv_transfer_params = kv_transfer_params
         self.kv_transfer_params_output = None
+        # Asked before allocation on each admission pass: a P/D producer sends
+        # the blocks past the local hit and the state whole (BlockManager).
+        self.state_from_peer = False
         if kv_transfer_params:
             self.prefix_cache_hit_tokens = kv_transfer_params.get(
                 "prefix_cache_hit_tokens", 0

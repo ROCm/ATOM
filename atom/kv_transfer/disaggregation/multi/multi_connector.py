@@ -632,6 +632,12 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             and all(c.is_offload for c in self._connectors[1:])
         )
 
+    def receives_suffix_and_state(self, seq) -> bool:
+        # The leg that won this request's lookup moves it; an offload leg never
+        # brings the state.
+        winner = self._load_winner.get(seq.id)
+        return winner is not None and winner.receives_suffix_and_state(seq)
+
     def pd_receive_block_offset(self, seq, num_blocks, num_cached_blocks):
         winner = self._load_winner.get(seq.id)
         if winner is None:

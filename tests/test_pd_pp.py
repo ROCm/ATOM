@@ -287,6 +287,7 @@ def _remote_prefill_seq(remote_hash_block_size):
         block_table=[1, 2, 3],
         per_req_cache_group=-1,
         has_per_req_cache=False,
+        state_from_peer=False,
         num_cached_tokens=128,
         state_slot=-1,
     )
