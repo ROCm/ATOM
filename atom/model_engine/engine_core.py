@@ -15,6 +15,7 @@ from atom.config import Config
 from atom.kv_transfer.disaggregation import KVOutputAggregator
 from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
 from atom.metrics.scheduler import SchedulerMetrics
+from atom.model_engine.admission import AdmissionContext, build_sequence
 from atom.model_engine.async_proc import AsyncIOProcManager
 from atom.model_engine.dynamic_chunking import (
     DYNAMIC_CHUNKING_POLL_STEPS,
@@ -36,8 +37,6 @@ from atom.model_engine.sequence import (
 from atom.model_engine.state_runtime import StateRuntime
 from atom.model_engine.zmq_protocol.codec import (
     REJECT_INTERNAL,
-    AdmissionContext,
-    build_sequence,
     decode_client_message,
     encode_completions,
     encode_dp_reuse,

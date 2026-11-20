@@ -87,23 +87,23 @@ def ship_prompt_hash_chain(seq, hash_block_size: int, *, block_hashes=None) -> N
     """
     if not envs.ATOM_FRONTEND_PREFIX_HASH or hash_block_size <= 0:
         return
-    # An `IngressRequest` leaves a text prompt's seed None; its `Sequence`'s is -1.
-    seed = -1 if seq.cache_seed is None else seq.cache_seed
     n = full_prompt_blocks(seq, hash_block_size)
     if (
         block_hashes is not None
-        and (block_hashes.block_size, block_hashes.seed) == (hash_block_size, seed)
+        and (block_hashes.block_size, block_hashes.seed)
+        == (hash_block_size, seq.cache_seed)
         and block_hashes.num_tokens == seq.num_prompt_tokens
         and block_hashes.num_blocks == n
     ):
         hashes = block_hashes.as_array()
     else:
         hashes = array.array(
-            "Q", chained_block_hashes(seq.token_ids, hash_block_size, 0, n, seed)
+            "Q",
+            chained_block_hashes(seq.token_ids, hash_block_size, 0, n, seq.cache_seed),
         )
     seq.prompt_hash_chain = ShippedChain(
         hash_block_size,
-        seed,
+        seq.cache_seed,
         seq.num_prompt_tokens,
         prompt_fingerprint(seq),
         hashes,

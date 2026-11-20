@@ -26,12 +26,12 @@ from test_state_checkpoint import (
     stateful_seq,
 )
 
+from atom.model_engine.admission import AdmissionContext
 from atom.model_engine.block_manager import AdmissionProbe, BlockManager
 from atom.model_engine.prefix_hash import chained_block_hashes, ship_prompt_hash_chain
 from atom.model_engine.sequence import Sequence
 from atom.model_engine.zmq_protocol import engine_v1_pb2 as pb
 from atom.model_engine.zmq_protocol.codec import (
-    AdmissionContext,
     _decode_chain,
     _encode_chain,
     decode_client_message,

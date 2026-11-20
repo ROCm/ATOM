@@ -51,7 +51,7 @@ class IngressRequest:
         stream_callback=None,
         kv_transfer_params: dict | None = None,
         multimodal_data: dict | None = None,
-        cache_seed: int | None = None,
+        cache_seed: int = -1,
         mrope_positions=None,
         mrope_position_delta: int = 0,
         needs_independent_noise: bool = False,
@@ -142,6 +142,7 @@ class CompletionResult:
         parent_request_id: str | None = None,
         sibling_index: int = 0,
         prefill_completed: bool = False,
+        rejected: bool = False,
     ):
         self.id = id
         self.completion_token_ids = (
@@ -162,6 +163,9 @@ class CompletionResult:
         # The prompt's forward ran to its end (`Sequence.prefill_completed`),
         # which DP routing's release reads.
         self.prefill_completed = prefill_completed
+        # Refused before its Core built a sequence: nothing above but `id` and
+        # `leave_reason` is the Core's.
+        self.rejected = rejected
 
     @property
     def num_completion_tokens(self) -> int:

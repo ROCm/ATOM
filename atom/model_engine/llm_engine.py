@@ -11,11 +11,11 @@ from typing import Any
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from atom.config import Config
+from atom.model_engine.admission import check_sampling
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
 from atom.model_engine.prefix_hash import hash_block_size_for, ship_prompt_hash_chain
 from atom.model_engine.segment_tokenizer import PrefixEncoding, SegmentTokenizer
 from atom.model_engine.sequence import Sequence
-from atom.model_engine.zmq_protocol.codec import REJECTED_REASON
 from atom.model_engine.zmq_protocol.requests import (
     CompletionResult,
     IngressRequest,
@@ -791,17 +791,13 @@ class InputOutputProcessor:
           deltas to independent queues (one per choice index). Falls back to
           the scalar ``stream_callback`` for every sibling.
         """
-        sampling_params.validate_logprob_options(
+        check_sampling(
             self.config,
+            sampling_params,
             kv_transfer=kv_transfer_params,
             multimodal=multimodal_data is not None,
         )
         if is_structured(sampling_params):
-            if sampling_params.required_channel is not None:
-                raise ValueError(
-                    "A request cannot carry both a structured-output grammar "
-                    "(json_schema or structured_tool_format) and a required_channel"
-                )
             if self.structured_admission is None:
                 raise ValueError("Structured output requires engine admission")
             self.structured_admission(
@@ -866,7 +862,7 @@ class InputOutputProcessor:
             raise IndexError("array index out of range")
         # The media's content hash, which `Sequence` would otherwise compute in
         # the engine's input thread: once here, for every sibling.
-        cache_seed = None
+        cache_seed = -1  # a text prompt's, as on `Sequence`
         if multimodal_data is not None:
             cache_seed = multimodal_data.get("cache_seed")
             if cache_seed is None:
@@ -943,7 +939,7 @@ class InputOutputProcessor:
         outputs = {}
         for req in reqs:
             ingress = self.requests.pop(req.id)
-            if req.leave_reason.startswith(REJECTED_REASON):
+            if req.rejected:
                 # Rejected at admission: the Core never built the sequence,
                 # so the result carries no arrival or prompt of its own.
                 req.arrive_time = ingress.arrive_time

@@ -15,7 +15,7 @@ from atom.sampling_params import UNCONSTRAINED, SamplingParams
 # The model_types whose sequences need a per-request stateful buffer outside
 # the paged KV pool (`Sequence.has_per_req_cache`): BlockManager reserves them
 # a per-req cache slot. Read wherever a `Sequence` is built (the frontend's
-# `InputOutputProcessor`, the Core's `zmq_protocol.codec.AdmissionContext`)
+# `InputOutputProcessor`, the Core's `admission.AdmissionContext`)
 # and by ModelRunner's startup check that a builder declaring a per-request
 # state sub-pool is listed here. A new stateful-attention model adds its
 # model_type.

@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 import torch
 
+from atom.model_engine import admission
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
 from atom.model_engine.zmq_protocol import codec, wire
@@ -88,22 +89,24 @@ def core_context(**config):
         "enable_rapidserve": False,
         **config,
     }
-    return codec.AdmissionContext(SimpleNamespace(**fields))
+    return admission.AdmissionContext(SimpleNamespace(**fields))
 
 
 def test_the_sequence_gets_its_own_max_tokens():
     context = core_context()
     for cap in (10, 20):
-        seq = codec.build_sequence(submitted(SamplingParams(max_tokens=cap)), context)
+        seq = admission.build_sequence(
+            submitted(SamplingParams(max_tokens=cap)), context
+        )
         assert seq.max_tokens == cap
 
 
 def test_the_share_cache_estimate_reaches_the_sequence():
     spec = submitted(SamplingParams(), dp_est_cached_tokens=48)
-    seq = codec.build_sequence(spec, core_context())
+    seq = admission.build_sequence(spec, core_context())
     assert seq.dp_est_cached_tokens == 48
     # Absent, as from a client that does not route by prefix: none.
-    seq = codec.build_sequence(submitted(SamplingParams()), core_context())
+    seq = admission.build_sequence(submitted(SamplingParams()), core_context())
     assert seq.dp_est_cached_tokens == 0
 
 
@@ -139,24 +142,26 @@ def test_the_core_refuses_what_the_frontend_refuses(params, ingress, config, ref
     """A client other than this repo's frontend is held to the same admission."""
     spec = submitted(params, **ingress)
     with pytest.raises(ValueError, match=refusal):
-        codec.build_sequence(spec, core_context(**config))
+        admission.build_sequence(spec, core_context(**config))
 
 
 def test_the_core_holds_every_required_request_to_its_one_channel():
     context = core_context()
-    first = codec.build_sequence(
+    first = admission.build_sequence(
         submitted(SamplingParams(required_channel=CHANNEL)), context
     )
     # Held back on the Core's own end ids too.
     assert first.required_channel == replace(CHANNEL, end_ids=(2, 9))
     # A client that held it back already sends the held one.
-    again = codec.build_sequence(
+    again = admission.build_sequence(
         submitted(SamplingParams(required_channel=first.required_channel)), context
     )
     assert again.required_channel is first.required_channel
     other = replace(CHANNEL, after=(4, 6))
     with pytest.raises(ValueError, match="another channel"):
-        codec.build_sequence(submitted(SamplingParams(required_channel=other)), context)
+        admission.build_sequence(
+            submitted(SamplingParams(required_channel=other)), context
+        )
 
 
 def test_absent_sampling_values_take_the_defaults_not_none():
@@ -357,6 +362,7 @@ def test_a_completion_that_does_not_encode_fails_alone():
     assert [d.id for d in done] == [1, 2, 3]
     assert [d.leave_reason for d in done] == ["eos", done[1].leave_reason, "eos"]
     assert done[1].leave_reason.startswith(f"{codec.REJECTED_REASON}: ")
+    assert [d.rejected for d in done] == [False, True, False]
     assert list(done[2].completion_token_ids) == [4]
 
 
@@ -371,6 +377,7 @@ def test_a_completion_that_does_not_decode_fails_alone():
     _, done = codec.decode_core_message(on_the_wire(frames))
     assert [d.id for d in done] == [1, 2, 3]
     assert done[1].leave_reason.startswith(f"{codec.REJECTED_REASON}: ")
+    assert [d.rejected for d in done] == [False, True, False]
     assert "missing frame 9" in done[1].leave_reason
     assert [d.leave_reason for d in (done[0], done[2])] == ["eos", "eos"]
 

@@ -136,6 +136,7 @@ def test_the_core_fixtures_say_what_the_client_reads():
         read_frames(FIXTURES / "core_rejected.frames")
     )
     assert (rejected.id, rejected.leave_reason) == (0, f"{codec.REJECTED_REASON}: bad")
+    assert rejected.rejected
     _, [deep] = codec.decode_core_message(
         read_frames(FIXTURES / "core_deep_completions.frames")
     )
