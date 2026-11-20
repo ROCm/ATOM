@@ -1099,6 +1099,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_DRAFT_ARGMAX_MAX_ROWS": lambda: int(
         os.getenv("ATOM_DP_DRAFT_ARGMAX_MAX_ROWS", "256")
     ),
+    # Backend of the per-step packed DP metadata all_gather (ForwardMode.decide):
+    # "gloo" (CPU group) or "rccl" (the DP device group; RCCL selects the
+    # transport for the machine topology). Set identically on every DP rank.
+    "ATOM_DP_SYNC_BACKEND": lambda: os.getenv("ATOM_DP_SYNC_BACKEND", "gloo").lower(),
+    # Debug: every N device-backend syncs also run the gloo all_gather and raise
+    # on any mismatch (0 = off). Set identically on every DP rank.
+    "ATOM_DP_SYNC_VERIFY": lambda: int(os.getenv("ATOM_DP_SYNC_VERIFY", "0")),
     "ATOM_USE_FLYDSL_GDR": lambda: os.getenv("ATOM_USE_FLYDSL_GDR", "0").lower() == "1",
     # Capture each declared draft pass into a per-captured-size CUDAGraph as it is
     # warmed, so the draft replays instead of relaunching every kernel. 0 drafts

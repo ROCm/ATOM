@@ -98,6 +98,63 @@ class DPSyncResult:
         return any(self.prefill_across_dp)
 
 
+def _gloo_all_gather(local: torch.Tensor, dp_size: int, dp_group) -> list:
+    gathered = [torch.empty_like(local) for _ in range(dp_size)]
+    torch.distributed.all_gather(gathered, local, group=dp_group)
+    return gathered
+
+
+# (n_fields, dp_size, device) -> (device group, side stream, src, dst, host)
+# Called by the worker's scheduling thread; each call finishes before reuse.
+_DEVICE_SYNC_STATE: dict = {}
+_DEVICE_SYNC_CALLS = [0]
+
+
+def _device_all_gather(local: torch.Tensor, dp_size: int, dp_group) -> torch.Tensor:
+    """`local` from every DP rank as a [dp_size, n] CPU tensor, over the DP
+    device group on a side stream, so it does not queue behind compute."""
+    from aiter.dist.parallel_state import get_dp_group
+
+    dp = get_dp_group()
+    if dp.cpu_group is not dp_group or dp.world_size != dp_size:
+        raise RuntimeError("DP sync CPU and device groups must describe the same ranks")
+    device_group = dp.device_group
+    n = local.numel()
+    dev = torch.device("cuda", torch.cuda.current_device())
+    key = (n, dp_size, dev.index)
+    state = _DEVICE_SYNC_STATE.get(key)
+    if state is None or state[0] is not device_group:
+        stream = torch.cuda.Stream(device=dev)
+        # Even empty buffers can reuse allocator memory with pending work on
+        # their allocation stream. Allocate on the stream that uses them so
+        # no compute-stream wait is needed for this CPU-produced metadata.
+        with torch.cuda.stream(stream):
+            src = torch.empty(n, dtype=torch.int32, device=dev)
+            dst = torch.empty(dp_size * n, dtype=torch.int32, device=dev)
+            host = torch.empty(
+                dp_size * n, dtype=torch.int32, device="cpu", pin_memory=True
+            )
+        state = (device_group, stream, src, dst, host)
+        _DEVICE_SYNC_STATE[key] = state
+    _, stream, src, dst, host = state
+    with torch.cuda.stream(stream):
+        src.copy_(local)
+        torch.distributed.all_gather_into_tensor(dst, src, group=device_group)
+        host.copy_(dst, non_blocking=True)
+    stream.synchronize()
+    out = host.view(dp_size, n).clone()
+    verify = envs.ATOM_DP_SYNC_VERIFY
+    if verify > 0:
+        _DEVICE_SYNC_CALLS[0] += 1
+        if _DEVICE_SYNC_CALLS[0] % verify == 0:
+            ref = torch.stack(_gloo_all_gather(local, dp_size, dp_group))
+            if not torch.equal(ref, out):
+                raise RuntimeError(
+                    f"DP sync mismatch: device {out.tolist()} vs gloo {ref.tolist()}"
+                )
+    return out
+
+
 def sync_dp_metadata(
     *,
     dp_group,
@@ -186,11 +243,13 @@ def sync_dp_metadata(
     # A group of one is its own row, with nothing to exchange.
     gathered = [local]
     if dp_size > 1:
-        gathered = [
-            torch.empty(n_fields, dtype=torch.int32, device="cpu")
-            for _ in range(dp_size)
-        ]
-        torch.distributed.all_gather(gathered, local, group=dp_group)
+        if (
+            envs.ATOM_DP_SYNC_BACKEND == "rccl"
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            gathered = list(_device_all_gather(local, dp_size, dp_group).unbind(0))
+        else:
+            gathered = _gloo_all_gather(local, dp_size, dp_group)
     sync = torch.stack(gathered, dim=1).numpy()  # [n_fields, dp_size]
 
     scheduled_tokens_per_dp_rank = sync[0]
