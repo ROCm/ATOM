@@ -93,6 +93,7 @@ pub(crate) struct BridgeRequest {
     pub stop: Vec<String>,
     pub ignore_eos: bool,
     pub data_parallel_rank: Option<i64>,
+    pub tool_choice_required: bool,
 }
 
 impl BridgeRequest {
@@ -145,6 +146,7 @@ impl BridgeRequest {
             stop,
             ignore_eos: payload.sampling.ignore_eos,
             data_parallel_rank: extras.data_parallel_rank,
+            tool_choice_required: extras.tool_choice_required,
         })
     }
 
@@ -159,6 +161,7 @@ impl BridgeRequest {
         params.set_item("stop", PyList::new(py, &self.stop)?)?;
         params.set_item("ignore_eos", self.ignore_eos)?;
         params.set_item("data_parallel_rank", self.data_parallel_rank)?;
+        params.set_item("tool_choice_required", self.tool_choice_required)?;
         Ok(params)
     }
 }

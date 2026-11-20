@@ -38,7 +38,9 @@ use crate::{
     },
     observability::metrics::metrics_labels,
     protocols::{
-        chat::ChatCompletionRequest, common::ResponseFormat, completion::CompletionRequest,
+        chat::ChatCompletionRequest,
+        common::{ResponseFormat, ToolChoice, ToolChoiceValue},
+        completion::CompletionRequest,
         generate::GenerateRequest,
     },
     routers::{
@@ -110,6 +112,9 @@ tokio::task_local! {
 pub(crate) struct RequestExtras {
     /// The DP rank a router pinned the request to; CoreManager checks it.
     pub data_parallel_rank: Option<i64>,
+    /// A chat's `tool_choice: "required"` with tools: the engine holds its
+    /// output to the tool-call channel where the format defines one.
+    pub tool_choice_required: bool,
 }
 
 impl RequestExtras {
@@ -122,6 +127,7 @@ impl RequestExtras {
             ParsedInference::Generate(body) => {
                 return Ok(Self {
                     data_parallel_rank: body.data_parallel_rank.map(i64::from),
+                    ..Self::default()
                 });
             }
             _ if memchr::memmem::find(&request.body, b"\"data_parallel_rank\"").is_none() => {
@@ -140,7 +146,10 @@ impl RequestExtras {
                 ))
             }
         };
-        Ok(Self { data_parallel_rank })
+        Ok(Self {
+            data_parallel_rank,
+            ..Self::default()
+        })
     }
 }
 
@@ -339,6 +348,26 @@ impl RouterTrait for AtomBridgeRouter {
                 kwargs.entry(key.clone()).or_insert_with(|| value.clone());
             }
         }
+        // The engine does not hold a reply to a JSON schema of the tool, so
+        // a tool_choice that asks for one is read as the model writes calls,
+        // with the format's own parser, as the Python standalone service
+        // reads it; "required" holds the output to the tool-call channel
+        // instead, where the format has one.
+        let mut extras = RequestExtras::current();
+        extras.tool_choice_required = matches!(
+            body.tool_choice,
+            Some(ToolChoice::Value(ToolChoiceValue::Required))
+        ) && body.tools.as_ref().is_some_and(|t| !t.is_empty());
+        if matches!(
+            body.tool_choice,
+            Some(
+                ToolChoice::Value(ToolChoiceValue::Required)
+                    | ToolChoice::Function { .. }
+                    | ToolChoice::AllowedTools { .. }
+            )
+        ) {
+            body.tool_choice = Some(ToolChoice::Value(ToolChoiceValue::Auto));
+        }
         let rendered = if self.runtime.renders_chat {
             match py_bridge::render_chat(&self.runtime.bridge, &body).await {
                 Ok(rendered) => Some(rendered),
@@ -347,15 +376,14 @@ impl RouterTrait for AtomBridgeRouter {
         } else {
             None
         };
-        self.pipeline
-            .execute_chat_with(
-                Arc::new(body),
-                headers.cloned(),
-                self.model_id(),
-                Arc::clone(&self.app_context),
-                rendered,
-            )
-            .await
+        let pipeline = self.pipeline.execute_chat_with(
+            Arc::new(body),
+            headers.cloned(),
+            self.model_id(),
+            Arc::clone(&self.app_context),
+            rendered,
+        );
+        REQUEST_EXTRAS.scope(extras, pipeline).await
     }
 
     async fn route_generate(

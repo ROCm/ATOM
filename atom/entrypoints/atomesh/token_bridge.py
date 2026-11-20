@@ -55,6 +55,10 @@ from atom.entrypoints.openai.reasoning import (
     thinking_switched_off,
 )
 from atom.entrypoints.openai.reasoning_dialects import resolve_dialect
+from atom.entrypoints.openai.tool_parser.registry import (
+    required_call_channel,
+    resolve_tool_call_parser,
+)
 
 logger = logging.getLogger("atom")
 
@@ -138,13 +142,29 @@ def _template_message(message: dict[str, Any]) -> dict[str, Any]:
 class TokenBridge:
     """The Python half of ``AtomBridgeRouter``; see the module docstring."""
 
-    def __init__(self, engine: Any, sink: Any, tokenizer: Any, model: str) -> None:
+    def __init__(
+        self,
+        engine: Any,
+        sink: Any,
+        tokenizer: Any,
+        model: str,
+        tool_call_parser: str | None = None,
+    ) -> None:
         self.engine = engine
         # Read by Rust (`AtomBridgeRuntime::from_bridge`) to find its sink.
         self.sink = sink
         self._renderer = ChatRenderer(tokenizer, model)
         # Read by Rust: render every chat prompt through `render_chat`.
         self.renders_chat = self._renderer.needed
+        # What `tool_choice: "required"` holds a chat's output to, as the
+        # Python standalone service derives it: the tool-call channel of the
+        # model's format, where the format defines one (Kimi-K3's).
+        self._required_channel = required_call_channel(
+            resolve_tool_call_parser(
+                tool_call_parser, tokenizer, self._renderer.encoder, model=model
+            ),
+            tokenizer,
+        )
         config = getattr(engine, "config", None)
         self._max_model_len = getattr(config, "max_model_len", None)
         self._output_limit = deployment_metadata(config, None).get("max_output_tokens")
@@ -293,6 +313,9 @@ class TokenBridge:
             max_tokens_is_default=max_tokens_is_default,
             stop_strings=params.get("stop") or None,
             ignore_eos=bool(params.get("ignore_eos", False)),
+            required_channel=(
+                self._required_channel if params.get("tool_choice_required") else None
+            ),
         )
 
     def _fit_context(self, seq: Any, sampling: SamplingParams) -> None:

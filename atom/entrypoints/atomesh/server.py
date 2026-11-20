@@ -131,6 +131,7 @@ def initialize_token_bridge(atomesh_runner: Any, args: argparse.Namespace) -> An
         sink=atomesh_runner.StepSink(),
         tokenizer=tokenizer,
         model=args.model,
+        tool_call_parser=getattr(args, "tool_call_parser", None),
     )
 
 
