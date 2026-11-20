@@ -23,9 +23,16 @@ CASES = (
 )
 
 
+# Called once at boot, before any capture (ATOM captures the installed model afterwards):
+# there is no graph contract to exercise.
+BOOT_ONLY = "v41.mono.install"
+
+
 def test_capture_contract_catalog_is_complete():
-    assert set(host.SEAMS) == set(CASES) | {WINDOW}
-    assert all(s.graph in {"capture_safe", "opaque_op"} for s in host.SEAMS.values())
+    captured = {n: s for n, s in host.SEAMS.items() if n != BOOT_ONLY}
+    assert set(captured) == set(CASES) | {WINDOW}
+    assert host.SEAMS[BOOT_ONLY].graph == "eager"
+    assert all(s.graph in {"capture_safe", "opaque_op"} for s in captured.values())
 
 
 def _args(seam, x, scratch_i, scratch_f):

@@ -1197,7 +1197,7 @@ def test_model_runner_configures_the_host_before_building():
         encoding="utf-8"
     )
     configure = source.index("plugin_host.configure(")
-    build = source.index("self._build_and_load_model(model_class)", configure)
+    build = source.index("self.model = get_model(", configure)
     assert source.index("config.plugin_source", configure) < build
     assert source.index("arm=config.plugin_arm", configure) < build
     hotplug = 'hotplug=getattr(config, "plugin_hotplug", False)'
@@ -1295,6 +1295,7 @@ def _project_out(module, fused, groups=2, rank=64, k=128, rows=3, heads=4):
         o_rank=rank,
         _fuse_woa_quant=fused,
         wo_a=types.SimpleNamespace(
+            runs_bf16=False,
             weight=torch.zeros(groups * rank, k),
             weight_scale=torch.zeros(groups * rank // 32, k // 32),
         ),
@@ -1363,6 +1364,8 @@ def _shared_expert(name, fused=False):
     class W2:
         native_a8_group_rows = 32
         output_size = DIM
+        runs_bf16 = False
+        quant_type = types.SimpleNamespace(value="per_1x32")
 
         def __call__(self, x, x_scale=None):
             w2.append((x, x_scale))

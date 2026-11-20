@@ -908,7 +908,7 @@ def test_the_runner_configures_dev_mode_and_prepares_the_boot_plan():
     assert "plugin_host.prepare_plan(self.device)" in flat
     # Prepare runs after the model is built and before warmup/capture.
     source = TEXT["atom/model_engine/model_runner.py"]
-    assert source.index("self._build_and_load_model(model_class)") < source.index(
+    assert source.index("self.model = get_model(") < source.index(
         "plugin_host.prepare_plan(self.device)"
     )
     assert source.index("plugin_host.prepare_plan(self.device)") < source.index(
