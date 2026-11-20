@@ -282,20 +282,12 @@ async fn rl_routes_without_a_configured_key_refuse_every_request() {
 }
 
 #[test]
-fn rl_flags_parse_to_defaults_and_reject_zero() {
+fn rl_flags_parse_to_defaults_and_require_the_key() {
     let config = CliArgs::try_parse_from(["atomesh"])
         .unwrap()
         .to_router_config(Vec::new())
         .unwrap();
-    assert_eq!(
-        config.rl,
-        RlConfig {
-            enabled: false,
-            api_key: None,
-            control_timeout_secs: 600,
-            fanout_concurrency: 32,
-        }
-    );
+    assert_eq!(config.rl, RlConfig::default());
 
     let args = |extra: &[&str]| {
         let argv = ["atomesh", "--enable-rl"].iter().chain(extra);
@@ -303,32 +295,16 @@ fn rl_flags_parse_to_defaults_and_reject_zero() {
             .unwrap()
             .to_router_config(Vec::new())
     };
-    let config = args(&[
-        "--rl-api-key",
-        "k",
-        "--rl-control-timeout-secs",
-        "7",
-        "--rl-fanout-concurrency",
-        "3",
-    ])
-    .unwrap();
+    let config = args(&["--rl-api-key", "k"]).unwrap();
     assert_eq!(
         config.rl,
         RlConfig {
             enabled: true,
             api_key: Some("k".to_string()),
-            control_timeout_secs: 7,
-            fanout_concurrency: 3,
         }
     );
     for missing in [&[][..], &["--rl-api-key", ""], &["--rl-api-key", " "]] {
         let error = args(missing).unwrap_err().to_string();
         assert!(error.contains("--rl-api-key"), "{missing:?}: {error}");
-    }
-    for flag in ["--rl-control-timeout-secs", "--rl-fanout-concurrency"] {
-        let error = args(&[flag, "0", "--rl-api-key", "k"])
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("rl."), "{flag}: {error}");
     }
 }

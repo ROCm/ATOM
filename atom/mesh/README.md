@@ -257,8 +257,6 @@ to it answers 422 `no_control_endpoint`.
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--rl-api-key` | none | Bearer token the `/v1/rl` routes require; required with `--enable-rl` |
-| `--rl-control-timeout-secs` | 600 | Total timeout of one engine control call; a refit can take minutes |
-| `--rl-fanout-concurrency` | 32 | Engine calls in flight at once during a fan-out |
 
 ## Architecture
 
