@@ -2227,6 +2227,18 @@ def test_slot_transfer_gathers_index_pages_onto_the_dcp_plan(_no_cuda_stream):
     assert not any(index_src <= src < 2 * index_src for src, _, _ in writes)
 
 
+def test_index_regions_without_staging_name_the_backend_opt_out():
+    """A pooled index opts out of staging; the refusal says so, not misconfig."""
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    connector, _, _ = _sparse_pp_stage(mc)
+    connector._prepare_sharded_index = connector._gather_sharded_index = None
+
+    with pytest.raises(RuntimeError, match=r"index regions \[1\].*no index staging"):
+        connector._stages_sharded_index(1)
+
+
 def test_slot_transfer_refuses_index_staging_without_a_ready_event(_no_cuda_stream):
     mc = pytest.importorskip(
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
