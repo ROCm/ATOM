@@ -3,166 +3,142 @@
 """Exercise the production KDA wrapper and pointer expressions without a GPU."""
 
 import ast
-import math
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
+import torch
+from aiter_stub import atom_under_stubs
 
 SOURCE = Path(__file__).resolve().parents[2] / "atom/model_ops/fla_ops/replayssm.py"
 HV, D = 12, 128
 FUSED_N = 4 * HV * D + HV + D
 
 
-class Tensor:
-    def __init__(self, shape, strides=None):
-        self.shape = shape
-        self.dense = tuple(math.prod(shape[i + 1 :]) for i in range(len(shape)))
-        self.strides = self.dense if strides is None else strides
-        self.dtype = "bf16"
-        self.contiguous_calls = 0
-
-    def stride(self, axis):
-        return self.strides[axis]
-
-    def contiguous(self):
-        self.contiguous_calls += 1
-        return self if self.strides == self.dense else Tensor(self.shape)
-
-    def new_empty(self, *shape):
-        return Tensor(shape)
-
-    def numel(self):
-        return math.prod(self.shape)
-
-
-def production_function(name, namespace):
-    tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
-    definition = next(
-        n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name
-    )
-    definition.decorator_list = []
-    future = ast.ImportFrom(
-        module="__future__", names=[ast.alias(name="annotations")], level=0
-    )
-    module = ast.fix_missing_locations(
-        ast.Module(body=[future, definition], type_ignores=[])
-    )
-    # Execute only the checked-in production definition.
-    exec(compile(module, str(SOURCE), "exec"), namespace)  # noqa: S102
-    return namespace[name]
-
-
 class TestKdaStrides(unittest.TestCase):
     def test_arrivals_are_owned_by_the_checkpoint_pool(self):
-        capturing = False
-        torch = SimpleNamespace(
-            int32=np.int32,
-            zeros=lambda size, **kw: np.zeros(size, dtype=kw["dtype"]),
-            cuda=SimpleNamespace(is_current_stream_capturing=lambda: capturing),
-        )
-        run = production_function(
-            "_flush_arrivals", {"torch": torch, "_FLUSH_ARRIVALS": {}}
-        )
-
-        def pool(ptr):
-            return SimpleNamespace(
-                device="cuda:0", shape=(8, 12, 128, 128), data_ptr=lambda: ptr
-            )
-
-        first, second = run(pool(100)), run(pool(200))
-        self.assertIsNot(first, second)
-        self.assertEqual([x.shape for x in (first, second)], [(96,), (96,)])
-        self.assertFalse(first.any() or second.any())
-        first[0] = 1
-        self.assertEqual(second[0], 0)
-        capturing = True
-        self.assertIs(run(pool(100)), first)
-        with self.assertRaisesRegex(RuntimeError, "eagerly"):
-            run(pool(300))
+        with atom_under_stubs() as load:
+            replay = load("atom.model_ops.fla_ops.replayssm")
+            replay._FLUSH_ARRIVALS = {}
+            with patch.object(
+                torch.cuda, "is_current_stream_capturing", return_value=False
+            ) as capture:
+                pool, other = (torch.empty(8, 12, 2, 2) for _ in range(2))
+                first, second = (replay._flush_arrivals(p) for p in (pool, other))
+                self.assertIsNot(first, second)
+                self.assertEqual([x.shape for x in (first, second)], [(96,), (96,)])
+                self.assertFalse(first.any() or second.any())
+                first[0] = 1
+                self.assertEqual(second[0], 0)
+                capture.return_value = True
+                self.assertIs(replay._flush_arrivals(pool.view_as(pool)), first)
+                with self.assertRaisesRegex(RuntimeError, "eagerly"):
+                    replay._flush_arrivals(torch.empty_like(pool))
 
     def test_flush_wait_for_supported_targets(self):
-        for arch, expected in (
-            ("gfx942", "s_waitcnt vmcnt(0)"),
-            ("gfx950", "s_waitcnt vmcnt(0)"),
-            ("gfx1200", "s_wait_loadcnt 0"),
-            ("gfx1250", "s_wait_loadcnt 0"),
-        ):
-            with self.subTest(arch=arch):
-                run = production_function(
-                    "_flush_wait", {"get_gfx_runtime": lambda arch=arch: arch}
-                )
-                self.assertEqual(run(), expected)
+        with atom_under_stubs() as load:
+            replay = load("atom.model_ops.fla_ops.replayssm")
+            for arch, expected in (
+                ("gfx942", "s_waitcnt vmcnt(0)"),
+                ("gfx950", "s_waitcnt vmcnt(0)"),
+                ("gfx1200", "s_wait_loadcnt 0"),
+                ("gfx1250", "s_wait_loadcnt 0"),
+            ):
+                with (
+                    self.subTest(arch=arch),
+                    patch.object(replay, "get_gfx_runtime", return_value=arch),
+                ):
+                    self.assertEqual(replay._flush_wait(), expected)
 
     def test_wrapper_copies_only_non_dense_rows(self):
-        for tokens in (32, 128):
-            for layout in ("dense_rows", "gate_heads", "gate_channels", "beta_heads"):
-                with self.subTest(tokens=tokens, layout=layout):
-                    captured = {}
+        with atom_under_stubs() as load:
+            replay = load("atom.model_ops.fla_ops.replayssm")
+            replay._FLUSH_ARRIVALS = {}
+            for tokens in (32, 128):
+                for layout in (
+                    "dense_rows",
+                    "gate_heads",
+                    "gate_channels",
+                    "beta_heads",
+                ):
+                    with self.subTest(tokens=tokens, layout=layout):
+                        self._check_wrapper_layout(replay, tokens, layout)
 
-                    class Kernel:
-                        def __getitem__(self, grid, target=captured):
-                            return target.update
+    def _check_wrapper_layout(self, replay, tokens, layout):
+        captured = {}
 
-                    namespace = {
-                        "triton": SimpleNamespace(
-                            next_power_of_2=lambda n: 1 << (n - 1).bit_length(),
-                            cdiv=lambda a, b: -(-a // b),
-                        ),
-                        "seed_forked_slots": lambda *args: None,
-                        "flush_threshold_ok": lambda cap, length: cap >= 2 * length,
-                        "_replay_dot_mode": lambda dtype: "ieee",
-                        "_flush_arrivals": lambda ckpt: object(),
-                        "_flush_wait": lambda: "s_waitcnt vmcnt(0)",
-                        "_replayssm_kda_fwd_kernel": Kernel(),
-                    }
-                    run = production_function(
-                        "replayssm_sigmoid_gating_delta_rule", namespace
-                    )
-                    q, k, v = (Tensor((1, tokens, HV, D)) for _ in range(3))
-                    a = Tensor(
-                        (1, tokens, HV, D),
-                        (
-                            tokens * FUSED_N,
-                            FUSED_N,
-                            2 * D if layout == "gate_heads" else D,
-                            2 if layout == "gate_channels" else 1,
-                        ),
-                    )
-                    b = Tensor(
-                        (1, tokens, HV),
-                        (tokens * FUSED_N, FUSED_N, 2 if layout == "beta_heads" else 1),
-                    )
-                    run(
-                        q,
-                        k,
-                        v,
-                        a,
-                        b,
-                        Tensor((HV,)),
-                        Tensor((HV * D,)),
-                        Tensor((16, HV, D, D)),
-                        *(Tensor((16, HV, 24, D)) for _ in range(3)),
-                        Tensor((16,)),
-                        Tensor((tokens // 8,)),
-                        Tensor((tokens // 8 + 1,)),
-                        8,
-                    )
-                    self.assertEqual([x.contiguous_calls for x in (q, k, v)], [1, 1, 1])
-                    self.assertEqual(
-                        captured["a"] is a,
-                        layout not in ("gate_heads", "gate_channels"),
-                    )
-                    self.assertEqual(captured["b"] is b, layout != "beta_heads")
-                    self.assertEqual(
-                        captured["stride_a_token"], captured["a"].stride(-3)
-                    )
-                    self.assertEqual(
-                        captured["stride_b_token"], captured["b"].stride(-2)
-                    )
-                    self.assertEqual(captured["N"], tokens // 8)
-                    self.assertEqual(captured["WAIT"], "s_waitcnt vmcnt(0)")
+        class Kernel:
+            def __getitem__(self, grid, target=captured):
+                return target.update
+
+        triton = SimpleNamespace(
+            next_power_of_2=lambda n: 1 << (n - 1).bit_length(),
+            cdiv=lambda a, b: -(-a // b),
+        )
+        fused = torch.arange(tokens * FUSED_N, dtype=torch.bfloat16).view(
+            tokens, FUSED_N
+        )
+        q, k, v = (
+            fused[:, start * HV * D : (start + 1) * HV * D].view(1, tokens, HV, D)
+            for start in range(3)
+        )
+        a = fused.as_strided(
+            (1, tokens, HV, D),
+            (
+                tokens * FUSED_N,
+                FUSED_N,
+                2 * D if layout == "gate_heads" else D,
+                2 if layout == "gate_channels" else 1,
+            ),
+            storage_offset=(2 if layout == "gate_heads" else 3) * HV * D,
+        )
+        b = fused.as_strided(
+            (1, tokens, HV),
+            (tokens * FUSED_N, FUSED_N, 2 if layout == "beta_heads" else 1),
+            storage_offset=4 * HV * D,
+        )
+        with (
+            patch.object(replay, "triton", triton),
+            patch.object(replay, "_replayssm_kda_fwd_kernel", Kernel()),
+            patch.object(torch.cuda, "is_current_stream_capturing", return_value=False),
+            patch.object(replay, "get_gfx_runtime", return_value="gfx950"),
+        ):
+            out = replay.replayssm_sigmoid_gating_delta_rule(
+                q,
+                k,
+                v,
+                a,
+                b,
+                torch.empty(HV),
+                torch.empty(HV * D),
+                torch.empty(16, HV, D, D),
+                *(torch.empty(16, HV, 24, D, dtype=torch.bfloat16) for _ in range(3)),
+                torch.zeros(16, dtype=torch.int32),
+                torch.arange(tokens // 8, dtype=torch.int32),
+                torch.arange(0, tokens + 1, 8, dtype=torch.int32),
+                8,
+            )
+        for name, original in (("q", q), ("k", k), ("v", v), ("a", a), ("b", b)):
+            self.assertTrue(torch.equal(captured[name], original), name)
+        for name in ("q", "k", "v"):
+            self.assertTrue(captured[name].is_contiguous(), name)
+        self.assertEqual(
+            captured["a"] is a,
+            layout not in ("gate_heads", "gate_channels"),
+        )
+        self.assertEqual(captured["b"] is b, layout != "beta_heads")
+        if layout in ("gate_heads", "gate_channels"):
+            self.assertTrue(captured["a"].is_contiguous())
+        if layout == "beta_heads":
+            self.assertTrue(captured["b"].is_contiguous())
+        self.assertEqual(captured["stride_a_token"], captured["a"].stride(-3))
+        self.assertEqual(captured["stride_b_token"], captured["b"].stride(-2))
+        self.assertEqual(captured["N"], tokens // 8)
+        self.assertEqual(captured["WAIT"], "s_waitcnt vmcnt(0)")
+        self.assertEqual(out.shape, (1, tokens, HV, D))
+        self.assertEqual(out.dtype, torch.bfloat16)
 
     def test_sequence_starts_address_the_original_views(self):
         tree = ast.parse(SOURCE.read_text(encoding="utf-8"))

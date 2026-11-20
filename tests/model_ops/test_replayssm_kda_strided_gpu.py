@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""KDA column views and their contiguous copies produce identical replay state."""
+"""KDA column views and copies agree across append and flush."""
 
 import pytest
 import torch
