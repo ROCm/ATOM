@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use axum::response::Response;
 use serde_json::Value;
 
-use super::AtomEngineRouter;
+use super::{bad_request, not_yet, AtomEngineRouter};
 use crate::{
     atom_engine::ReasoningToggle,
     protocols::{
@@ -46,10 +46,7 @@ impl AtomEngineRouter {
         if body.logprobs {
             // api_server splits them between reasoning and the answer and
             // leaves out special tokens; until this one does, it refuses them.
-            return Err(error::bad_request(
-                "not_supported",
-                "chat logprobs is not supported by the ATOM standalone server yet",
-            ));
+            return Err(not_yet("chat logprobs"));
         }
         let mut request = body.clone();
         for message in &mut request.messages {
@@ -309,10 +306,6 @@ fn join_text_parts(content: &mut MessageContent) -> Result<(), Response> {
 
 fn bad_effort() -> Response {
     bad_request("reasoning effort must be an integer in [1, 100]".into())
-}
-
-fn bad_request(message: String) -> Response {
-    error::bad_request("invalid_request", message)
 }
 
 #[cfg(test)]

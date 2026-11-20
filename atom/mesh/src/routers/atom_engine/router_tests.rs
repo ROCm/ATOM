@@ -25,29 +25,38 @@ use crate::{
 const MODEL: &str = "tiny";
 const HELLO: i32 = 1;
 const WORLD: i32 = 2;
+const THINK_END: i32 = 7;
 
-/// A word-level tokenizer and a chat template that renders `role: content`
-/// lines and ends on `assistant:`.
-fn write_tokenizer(dir: &std::path::Path) -> String {
+/// The chat template: `role: content` lines, ending on `assistant:`.
+const TEMPLATE: &str = "{% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}\
+                        {% if add_generation_prompt %}assistant:{% endif %}";
+
+/// A word-level tokenizer with `chat_template`.
+fn write_tokenizer(dir: &std::path::Path, chat_template: &str) -> String {
     let tokenizer = json!({
         "version": "1.0",
         "truncation": null,
         "padding": null,
-        "added_tokens": [],
+        "added_tokens": [
+            {"id": 6, "content": "<think>", "single_word": false, "lstrip": false,
+             "rstrip": false, "normalized": false, "special": false},
+            {"id": THINK_END, "content": "</think>", "single_word": false, "lstrip": false,
+             "rstrip": false, "normalized": false, "special": false},
+        ],
         "normalizer": null,
         "pre_tokenizer": {"type": "Whitespace"},
         "post_processor": null,
         "decoder": null,
         "model": {
             "type": "WordLevel",
-            "vocab": {"<unk>": 0, "hello": HELLO, "world": WORLD, "user": 3, "assistant": 4, ":": 5},
+            "vocab": {
+                "<unk>": 0, "hello": HELLO, "world": WORLD, "user": 3, "assistant": 4, ":": 5,
+                "<think>": 6, "</think>": THINK_END,
+            },
             "unk_token": "<unk>",
         },
     });
-    let config = json!({
-        "chat_template": "{% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}\
-                          {% if add_generation_prompt %}assistant:{% endif %}",
-    });
+    let config = json!({ "chat_template": chat_template });
     let path = dir.join("tokenizer.json");
     std::fs::write(&path, tokenizer.to_string()).unwrap();
     std::fs::write(dir.join("tokenizer_config.json"), config.to_string()).unwrap();
@@ -64,8 +73,24 @@ struct Served {
 
 impl Served {
     async fn start(ranks: usize) -> Self {
+        Self::serve(ranks, TEMPLATE, RouterConfig::default()).await
+    }
+
+    /// One Core behind a template whose generation prompt opens `<think>`,
+    /// as GLM-5.x and Qwen3.5 do, read by the qwen3 reasoning parser.
+    async fn thinking() -> Self {
+        let template = "{% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}\
+                        {% if add_generation_prompt %}assistant: <think>\n{% endif %}";
+        let config = RouterConfig {
+            reasoning_parser: Some("qwen3".into()),
+            ..Default::default()
+        };
+        Self::serve(1, template, config).await
+    }
+
+    async fn serve(ranks: usize, chat_template: &str, config: RouterConfig) -> Self {
         let dir = TempDir::new().unwrap();
-        let tokenizer = write_tokenizer(dir.path());
+        let tokenizer = write_tokenizer(dir.path(), chat_template);
         let spec = test_support::engine_spec(
             dir.path(),
             ranks,
@@ -76,7 +101,6 @@ impl Served {
             model: spec.model,
             client,
         });
-        let config = RouterConfig::default();
         let pool = PreparePoolRuntime::new(config.resolved_prepare_pool().unwrap()).unwrap();
         let ctx = Arc::new(
             AppContextBuilder::from_config(config, 5)
@@ -410,4 +434,80 @@ async fn requests_the_python_server_refuses_are_refused() {
         std::time::Duration::from_millis(200)
     )
     .is_none());
+}
+
+/// The reply of a prompt that opened `<think>` starts inside reasoning: what
+/// precedes `</think>` is reasoning, streamed or not.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_prompt_that_opens_reasoning_leaves_the_reply_inside_it() {
+    fn think_then_answer(core: &FakeCore, spec: &pb::RequestSpec) {
+        core.stream(&[(spec.seq_id, &[HELLO, THINK_END, WORLD], Some("eos"))]);
+    }
+
+    let mut served = Served::thinking().await;
+    let core = answer_each(std::mem::take(&mut served.cores), think_then_answer);
+    let response = served
+        .router
+        .route_chat(None, &chat(user_hello(json!({}))), None)
+        .await;
+    drop(core.into_iter().next().unwrap().join().unwrap());
+    let (status, body) = json_body(response).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let message = &body["choices"][0]["message"];
+    assert_eq!(
+        message["reasoning_content"].as_str().map(str::trim),
+        Some("hello")
+    );
+    assert_eq!(message["content"], "world");
+
+    let mut served = Served::thinking().await;
+    let core = answer_each(std::mem::take(&mut served.cores), think_then_answer);
+    let response = served
+        .router
+        .route_chat(None, &chat(user_hello(json!({"stream": true}))), None)
+        .await;
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    drop(core.into_iter().next().unwrap().join().unwrap());
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    let deltas: Vec<Value> = text
+        .split("\n\n")
+        .filter_map(|e| e.strip_prefix("data: "))
+        .filter(|e| *e != "[DONE]")
+        .map(|e| serde_json::from_str::<Value>(e).unwrap()["choices"][0]["delta"].clone())
+        .collect();
+    let joined =
+        |field: &str| -> String { deltas.iter().filter_map(|d| d[field].as_str()).collect() };
+    assert_eq!(joined("reasoning_content").trim(), "hello", "{text}");
+    assert_eq!(joined("content").trim(), "world", "{text}");
+}
+
+/// A non-streamed reply longer than the reasoning parser's 64 KiB buffer is
+/// split, not refused with a 500.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_long_non_streamed_reply_is_split_into_reasoning_and_content() {
+    const WORDS: usize = 20_000;
+    fn think_long(core: &FakeCore, spec: &pb::RequestSpec) {
+        let mut ids = vec![HELLO; WORDS];
+        ids.extend([THINK_END, WORLD]);
+        core.stream(&[(spec.seq_id, &ids, Some("eos"))]);
+    }
+
+    let mut served = Served::thinking().await;
+    let core = answer_each(std::mem::take(&mut served.cores), think_long);
+    let response = served
+        .router
+        .route_chat(
+            None,
+            &chat(user_hello(json!({"max_tokens": WORDS + 2}))),
+            None,
+        )
+        .await;
+    drop(core.into_iter().next().unwrap().join().unwrap());
+    let (status, body) = json_body(response).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let message = &body["choices"][0]["message"];
+    let reasoning = message["reasoning_content"].as_str().unwrap();
+    assert!(reasoning.len() > 65536, "{}", reasoning.len());
+    assert_eq!(reasoning.split_whitespace().count(), WORDS);
+    assert_eq!(message["content"], "world");
 }
