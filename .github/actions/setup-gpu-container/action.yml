@@ -50,6 +50,9 @@ inputs:
     description: Extra docker run flags injected verbatim before --env-file.
     required: false
     default: ""
+  model-read-only:
+    description: Mount the discovered model cache read-only.
+    default: "false"
   disable-mmap:
     description: >-
       When 'true' inject `-e ATOM_DISABLE_MMAP=true`. Off by default: with the
@@ -75,6 +78,7 @@ runs:
         PULL_POLICY: ${{ inputs.pull-policy }}
         NETWORK_HOST: ${{ inputs.network-host }}
         EXTRA_RUN_FLAGS: ${{ inputs.extra-run-flags }}
+        MODEL_READ_ONLY: ${{ inputs.model-read-only }}
         DISABLE_MMAP: ${{ inputs.disable-mmap }}
       run: |
         echo "Clean up containers..."
@@ -114,6 +118,7 @@ runs:
         MODEL_MOUNT=""
         if [ -n "$MODEL_HOST_ROOT" ]; then
           MODEL_MOUNT="-v ${MODEL_HOST_ROOT}:/models"
+          [ "${MODEL_READ_ONLY}" = "true" ] && MODEL_MOUNT="${MODEL_MOUNT}:ro"
           echo "Using model cache root: ${MODEL_HOST_ROOT}"
           echo "MODEL_HOST_ROOT=${MODEL_HOST_ROOT}" >> "$GITHUB_ENV"
         else

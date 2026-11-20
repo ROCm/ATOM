@@ -1,4 +1,4 @@
-name: ATOM Test
+name: KDA checkpoint minimal stage1
 
 on:
   push:
@@ -28,16 +28,8 @@ on:
         type: string
 
 concurrency:
-  # Keep scheduled main runs from blocking push-triggered validation.
-  # Approval runs queue behind existing work. Other reviews get their own
-  # group so they cannot replace a pending approval run in GitHub's queue.
-  # Likewise every label event except the one that opens the gate -- adding
-  # ci:atom, or ci:full to a PR without ci:atom (check_label_event in the gate
-  # script) -- so an unrelated label can never cancel running heavy CI. The
-  # ci-gate and gate jobs' names repeat this test; keep all three in sync with
-  # CI_GATE_LABELS.
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.pull_request.number && 'pr' || github.event_name }}${{ github.event_name == 'pull_request_review' && github.event.review.state != 'approved' && format('-review-{0}', github.run_id) || '' }}${{ github.event_name == 'pull_request' && github.event.action == 'labeled' && !(github.event.label.name == 'ci:atom' || (github.event.label.name == 'ci:full' && !contains(github.event.pull_request.labels.*.name, 'ci:atom'))) && format('-noop-{0}', github.run_id) || '' }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event_name != 'pull_request_review' }}
+  group: kda-3501-minimal-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   ATOM_BASE_IMAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.atom_base_image || 'rocm/atom-dev:latest' }}
@@ -49,6 +41,7 @@ env:
 
 jobs:
   ci-gate:
+    if: ${{ false }} # Disabled on this private diagnostic ref.
     # A no-op label run (the -noop- concurrency group above) is named apart from
     # its first job on, so an approval can tell it from the PR group's runs
     # when it looks for a pending run it replaced (CI_GATE_NOOP_JOB).
@@ -98,7 +91,7 @@ jobs:
         run: bash ./.github/scripts/check_heavy_ci_gate.sh
 
   check-signal:
-    if: ${{ needs.ci-gate.outputs.should_run == 'true' }}
+    if: ${{ false }} # Disabled on this private diagnostic ref.
     needs: [ci-gate]
     name: Check Pre Checkin Signal
     runs-on: ubuntu-latest
@@ -121,7 +114,7 @@ jobs:
           CHECK_SIGNAL_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
 
   download_aiter_wheel:
-    if: ${{ needs.ci-gate.outputs.should_run == 'true' && needs.check-signal.result == 'success' }}
+    if: ${{ false }} # Disabled on this private diagnostic ref.
     needs: [ci-gate, check-signal]
     name: Download aiter wheel
     runs-on: ubuntu-latest
@@ -142,7 +135,7 @@ jobs:
           retention-days: 7
 
   load-test-models:
-    if: ${{ needs.ci-gate.outputs.should_run == 'true' }}
+    if: ${{ false }} # Disabled on this private diagnostic ref.
     needs: [ci-gate]
     name: Load test model configs
     runs-on: ubuntu-latest
@@ -175,7 +168,7 @@ jobs:
 
   offline-smoke-test:
     needs: [ci-gate]
-    if: ${{ !cancelled() }}
+    if: ${{ false }} # Disabled on this private diagnostic ref.
     # Not behind the approval/label gate: this runs on every PR, unlike the
     # accuracy matrix, which only opens on an approval or a ci:* label. It
     # needs `ci-gate` only so an approval run can take over the check from a
@@ -284,7 +277,7 @@ jobs:
       fail-fast: false
       matrix:
         include: ${{ fromJson(needs.load-test-models.outputs.models_json || '[{"runner":"ubuntu-latest","model_name":"skip"}]') }}
-    if: ${{ needs.ci-gate.outputs.should_run == 'true' && needs.download_aiter_wheel.result == 'success' && needs.load-test-models.result == 'success' }}
+    if: ${{ false }} # Disabled on this private diagnostic ref.
     runs-on: ${{ matrix.runner }}
     permissions:
       actions: read
@@ -833,7 +826,7 @@ jobs:
 
   atom-test-gate:
     name: ${{ ((github.event_name != 'pull_request_review' && !(github.event.action == 'labeled' && !(github.event.label.name == 'ci:atom' || (github.event.label.name == 'ci:full' && !contains(github.event.pull_request.labels.*.name, 'ci:atom'))))) || needs.ci-gate.outputs.should_run == 'true' || needs.ci-gate.outputs.pr_check_takeover == 'true') && 'ATOM Test Gate' || 'ATOM Test Gate not requested' }}
-    if: always()
+    if: ${{ false }} # Disabled on this private diagnostic ref.
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -869,7 +862,7 @@ jobs:
   accuracy-dashboard:
     name: Update accuracy dashboard
     needs: [atom-test]
-    if: always() && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'schedule')
+    if: ${{ false }} # Disabled on this private diagnostic ref.
     # Serialize with every other gh-pages push so the auto-push below does not
     # race concurrent deploys (docs / benchmark dashboards) on the gh-pages branch.
     concurrency:
@@ -933,3 +926,159 @@ jobs:
       - name: Push dashboard data
         if: hashFiles('accuracy-benchmark-input.json') != ''
         run: git push origin gh-pages
+
+  stage1-unit:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    name: Check stage1 harness and source composition
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: python -m pip install PyYAML==6.0.3
+      - run: python -m unittest discover -s tests -p test_kda_stage1_probe.py -v
+      - name: Verify immutable source and job scope
+        run: |
+          python - <<'PY'
+          import ast, pathlib, subprocess, sys, yaml
+          sys.path.insert(0, '.github/scripts')
+          import kda_stage1_probe as p
+          def git(*args):
+              return subprocess.check_output(['git', *args]).decode().strip()
+          pr = '4265d0e495ae8898593463a1543caf70333a8e6d'
+          common = '5effb67d4164961c1a33b7946c2a4b5bad8d225a'
+          assert git('merge-base', p.BASE, pr) == common
+          assert git('rev-parse', p.CANDIDATE + '^1') == p.BASE
+          assert git('rev-parse', p.CANDIDATE + '^2') == pr
+          assert git('rev-parse', p.BASE + ':atom') == p.TREES['baseline']
+          assert git('rev-parse', p.CANDIDATE + ':atom') == p.TREES['candidate']
+          subprocess.run(['git', 'diff', '--exit-code', p.BASE, 'HEAD', '--', 'atom'], check=True)
+          def patch_id(a, b):
+              patch = subprocess.check_output(['git', 'diff', a, b, '--', 'atom'])
+              return subprocess.check_output(['git', 'patch-id', '--stable'], input=patch).split()[0]
+          assert patch_id(common, pr) == patch_id(p.BASE, p.CANDIDATE)
+          cfg = yaml.load(pathlib.Path('.github/workflows/atom-test.yaml').read_text(), Loader=yaml.BaseLoader)
+          assert 'workflow_dispatch' in cfg['on']
+          disabled = '$' + '{{ false }}'
+          enabled = {name for name, job in cfg['jobs'].items() if job.get('if') != disabled}
+          assert enabled == {'stage1-unit', 'stage1-probe'}, enabled
+          manual = '$' + "{{ github.event_name == 'workflow_dispatch' }}"
+          assert all(cfg['jobs'][name].get('if') == manual for name in enabled)
+          tree = ast.parse(pathlib.Path('.github/scripts/kda_stage1_probe.py').read_text())
+          for node in ast.walk(tree):
+              if isinstance(node, ast.ImportFrom) and node.module in ('atom.model_engine.page_unit_checkpoint', 'atom.model_ops.attentions.gdn_attn'):
+                  provider = ast.parse(git('show', p.BASE + ':' + node.module.replace('.', '/') + '.py'))
+                  assert {alias.name for alias in node.names} <= {getattr(item, 'name', None) for item in provider.body}
+          PY
+
+  stage1-probe:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    name: Native Kimi checkpoint stage1 only
+    needs: stage1-unit
+    runs-on: linux-atom-do-mi350x-8
+    timeout-minutes: 90
+    permissions:
+      actions: read
+      contents: read
+    env:
+      CONTAINER_NAME: kda3501-${{ github.run_id }}-${{ github.run_attempt }}
+      STAGE1_ROOT: stage1-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Mark admission budget
+        timeout-minutes: 1
+        run: echo "STAGE1_STARTED=$(date +%s)" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v6
+        timeout-minutes: 1
+        with:
+          fetch-depth: 0
+      - name: Download the already-qualified AITER wheel
+        timeout-minutes: 1
+        uses: actions/download-artifact@v7
+        with:
+          repository: ROCm/ATOM
+          run-id: 44525316445
+          artifact-ids: 14531107405
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: ${{ env.STAGE1_ROOT }}/wheels
+      - name: Prepare immutable source snapshots
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          mkdir -p "$STAGE1_ROOT/src/baseline" "$STAGE1_ROOT/src/candidate" "$STAGE1_ROOT/results"
+          git archive cbf1617468110a81e720a00021c5d3c5e14ce232 | tar -x -C "$STAGE1_ROOT/src/baseline"
+          git archive 53439e155826090189ee83275ece09d1fcb4d1f8 | tar -x -C "$STAGE1_ROOT/src/candidate"
+          mapfile -t wheels < <(find "$STAGE1_ROOT/wheels" -name '*.whl')
+          test "${#wheels[@]}" = 1
+          echo "8813b5f9b81d5e499b728d59dfffbfb736109b052986ea87c10b9f7bbaa420ef  ${wheels[0]}" | sha256sum -c -
+          git show -s --format='%H %P' cbf1617468110a81e720a00021c5d3c5e14ce232 53439e155826090189ee83275ece09d1fcb4d1f8 > "$STAGE1_ROOT/results/source.txt"
+      - uses: ./.github/actions/setup-gpu-container
+        timeout-minutes: 3
+        with:
+          container-name: ${{ env.CONTAINER_NAME }}
+          base-image: rocm/atom-dev@sha256:f3c2fcd6f2213401d275207dd6a7815ef00a9e6ff7bc610dd5e7e266cd55705e
+          runner: linux-atom-do-mi350x-8
+          pull-policy: missing
+          model-read-only: 'true'
+          env-vars: |
+            PYTHONUNBUFFERED=1
+            PYTHONNOUSERSITE=1
+            HF_HUB_OFFLINE=1
+            TRANSFORMERS_OFFLINE=1
+            AITER_LOG_LEVEL=WARNING
+            ATOM_ENABLE_REPLAYSSM=1
+            ATOM_MONO_ENABLE=0
+            ATOM_GDN_SSM_DTYPE=fp32
+            ATOM_STATE_CHECKPOINT_DEMAND=0
+            ATOM_STATE_CHECKPOINT_END_MARGIN=0
+      - name: Preflight pinned cached models and runtime
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          docker inspect "$CONTAINER_NAME" > "$STAGE1_ROOT/results/container.json"
+          test "$(docker inspect --format='{{range .Mounts}}{{if eq .Destination "/models"}}{{.RW}}{{end}}{{end}}' "$CONTAINER_NAME")" = false
+          mapfile -t wheels < <(find "$STAGE1_ROOT/wheels" -name '*.whl')
+          docker exec "$CONTAINER_NAME" /opt/venv/bin/python -m pip install --no-deps --force-reinstall "/workspace/${wheels[0]}"
+          docker exec "$CONTAINER_NAME" /opt/venv/bin/python /workspace/.github/scripts/kda_stage1_probe.py assets \
+            --output "/workspace/$STAGE1_ROOT/results/inputs.json"
+          test "$(( $(date +%s) - STAGE1_STARTED ))" -le 600
+      - name: Capture baseline then candidate and compare
+        timeout-minutes: 72
+        run: |
+          set -euo pipefail
+          trap 'docker stop --time 20 "$CONTAINER_NAME" >/dev/null 2>&1 || true' ERR
+          for arm in baseline candidate; do
+            source="/workspace/$STAGE1_ROOT/src/$arm"
+            events="/workspace/$STAGE1_ROOT/results/$arm-events"
+            mkdir -p "$STAGE1_ROOT/results/$arm-events"
+            docker exec -e SETUPTOOLS_SCM_PRETEND_VERSION_FOR_ATOM="0.0.0+stage1.$arm" "$CONTAINER_NAME" \
+              /opt/venv/bin/python -m pip install --no-deps --no-build-isolation -e "$source"
+            docker exec -e PYTHONPATH="$source" -e STAGE1_SOURCE="$source" -e STAGE1_EVENTS="$events" \
+              -e TORCHINDUCTOR_CACHE_DIR="/workspace/$STAGE1_ROOT/compile-$arm" "$CONTAINER_NAME" \
+              timeout --signal=TERM --kill-after=30s 2100s /opt/venv/bin/python \
+              /workspace/.github/scripts/kda_stage1_probe.py capture --arm "$arm" \
+              --inputs "/workspace/$STAGE1_ROOT/results/inputs.json" \
+              --output "/workspace/$STAGE1_ROOT/results/$arm.json" \
+              > "$STAGE1_ROOT/results/$arm.log" 2>&1
+            if [ "$arm" = baseline ]; then
+              docker restart --time 20 "$CONTAINER_NAME" > /dev/null
+            fi
+          done
+          docker exec "$CONTAINER_NAME" /opt/venv/bin/python /workspace/.github/scripts/kda_stage1_probe.py compare \
+            --baseline "/workspace/$STAGE1_ROOT/results/baseline.json" \
+            --candidate "/workspace/$STAGE1_ROOT/results/candidate.json" \
+            --output "/workspace/$STAGE1_ROOT/results/comparison.json"
+      - name: Stop only this diagnostic container
+        if: ${{ always() }}
+        timeout-minutes: 1
+        run: docker rm -f "$CONTAINER_NAME" || true
+      - uses: actions/upload-artifact@v7
+        if: ${{ always() }}
+        timeout-minutes: 3
+        with:
+          name: kda3501-stage1-${{ github.run_id }}
+          path: ${{ env.STAGE1_ROOT }}/results/
