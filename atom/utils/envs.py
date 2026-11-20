@@ -586,6 +586,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_V4_INDEXER_QSPLIT_MIN_LOGITS": lambda: int(
         os.getenv("ATOM_V4_INDEXER_QSPLIT_MIN_LOGITS", str(1 << 26))
     ),
+    # gfx1250 FP4 indexer: fold the per-layer weights_proj GEMM into the query
+    # RoPE/MXFP4-quant launch for a step of at most _MAX_FUSED_PROJECT_ROWS (128)
+    # rows -- decode and short-prefill chunks alike. A larger step keeps the
+    # standalone GEMM, which is not launch-bound there. Off always runs the
+    # standalone GEMM.
+    "ATOM_DSV41_FUSE_WEIGHTS_PROJ": lambda: _flag_env(
+        "ATOM_DSV41_FUSE_WEIGHTS_PROJ", "1"
+    ),
     # DCP sparse (DSA) prefill: when QREP is active, produce the whole DCP
     # group's query heads locally, as decode does, instead of AllGather Q. The
     # pynccl gather lands rank-major, so the dim=1 reshape after it also copies

@@ -2,8 +2,9 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """The index query as the scorer reads it: RoPE and quantization in one
-launch (aiter `rope_rotate_activation`), the rotated values never written
-back in bf16.
+launch (aiter `rope_rotate_activation`, or `q_rope_mxfp4_quant` on the gfx1250
+FP4 NATURAL plane, where the launch also projects the head weights), the
+rotated values never written back in bf16.
 
 FP8 quantizes each `(token, head)` row with one fp32 scale, which the scorer
 can only dequantize by folding it into that head's weight (`fold_query_scale`).
@@ -105,3 +106,32 @@ def fold_query_scale(
     return scale_indexer_weights(
         weights.contiguous(), scales, weights_scale, prefix=prefix
     )
+
+
+def project_query_fp4(query, rope, positions, hidden, weights_proj_weight):
+    """`((values, scales), weights)` for the FP4 NATURAL plane with the head
+    weights projected inside the quant launch, folding the per-layer
+    `weights_proj` GEMM into it. `query` is [rows, heads, dim], `hidden` [rows,
+    hidden], `weights_proj_weight` [heads, hidden]. `(values, scales)` match
+    `quantize_query_fp4`'s NATURAL output, which rounds the rotated values to
+    the query dtype (`round_rope=True`); `weights` [rows, heads] is the raw
+    bf16 projection `Indexer.project` returns, which `score_quantized` then
+    folds `weights_scale` into (so no scale is applied here).
+
+    `Indexer.project` decides whether to call this. `rope.cos_sin_cache` is
+    the `[max_pos, rope_dim]` cos|sin table `DeepseekV41ForCausalLM.__init__`
+    builds for `global_rope` only, the rope an indexer layer receives."""
+    from aiter.ops.triton.rope.q_rope_mxfp4_quant import q_rope_mxfp4_quant
+
+    q_fp4, q_scale, weights = q_rope_mxfp4_quant(
+        query,
+        positions,
+        rope.cos_sin_cache,
+        weights_scale=1.0,
+        hidden=hidden.contiguous(),
+        weights_proj=weights_proj_weight,
+    )
+    # The OPUS FP4 MQA scorer reads BF16 head weights, as the baseline
+    # `weights_proj` GEMM emits; the aiter op returns them f32, so round back
+    # (lossless -- the kernel already rounded the projection through bf16).
+    return (q_fp4.unsqueeze(1), q_scale.unsqueeze(1)), weights.to(torch.bfloat16)
