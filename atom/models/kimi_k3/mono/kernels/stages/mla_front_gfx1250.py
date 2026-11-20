@@ -395,6 +395,7 @@ def _project_task(lds, x, weights, outputs, partials, p, tid, bid):
     column = rope.select(row0 - lay.Q_LORA - lay.KV_LORA, row0)
     _store_task(lds, tid, rows, tiles, dest, stride, column)
     tdm_timeline.stamp(tdm_timeline.STORES_ISSUED)
+    tdm_timeline.stores_done()
 
 
 def build_mla_front(
