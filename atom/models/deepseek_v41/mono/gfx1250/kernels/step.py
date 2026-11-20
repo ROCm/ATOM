@@ -596,6 +596,11 @@ def target_layer(E, Ly):
             r1 = (lfl1 & fx.Int64(4)) != fx.Int64(0)
             if hascomp:
                 CS.stage_cgemm(cwith(c, cwkv=ltab(fp, Ly, "cwkv")(), axn=fptr(fp, "axn"), cpart=fptr(fp, "cpart")), r1)
+                if fx.const_expr(Lx["MT"] == 1):   # (c1) the GEMM's wave counts itself (KV_CG): only the compressor rows wait
+                    if w == CS.CG_WAVE:
+                        hx.wait_storecnt0()
+                        if l == 0:
+                            hx.atomic_add(lc + i64(LY.KV_CG), 1)
         # (R4) indexer layers: iq / iw / the compressor GEMM's partials are counted (KV_C), waited for only by their readers
         # (the iquant CTAs, the compressor rows' CTAs); the Engram-next layers keep the KV_C handoff for the engkv their A
         # stage writes (stage_engkv, or engentry's slot-1 copy) -- except the first engentry row (ENG_ROWS[0]): its kv is
@@ -608,22 +613,18 @@ def target_layer(E, Ly):
             handoff(lc + i64(LY.KV_C), t, True)
         if hx.unlikely(isidx):
             if fx.const_expr(Lx["MT"] == 1 and not DRS):   # (the draft launch: no index layers -- the CTA count, as before)
-                # c1 REINDEX (no compressor GEMM): KV_C counts the waves that wrote iq / iw (wave 0 of every CTA, waves 1 / 2
+                # c1 REINDEX (and, C3, FULL): KV_C counts the waves that wrote iq / iw (wave 0 of every CTA, waves 1 / 2
                 # of the iw CTAs: CTAS + 2 x IW_SLICES), each past its own s_wait_storecnt 0 -- no CTA barrier, which waited
                 # for waves 6 / 7's rx_prefill (2.0-2.6 us past the stores' drain, ktrace L24); other layers as before
                 # (compile-time: c1's one M tile -> stage_iq on wave 0 of all CTAS CTAs, stage_iw on waves 1 / 2 of the IW_SLICES
                 # iw CTAs, whatever the context length)
+                # (C3) the FULL layers (compressor GEMM) count the same waves: the GEMM (wave CS.CG_WAVE, not an iquant wave)
+                # counts KV_CG for the compressor rows alone -- before, every CTA counted KV_C past a CTA barrier behind its
+                # GEMM (wave 3, ~10 us at ratio 2, ktrace L2 / L8 / L14), and the iquant CTAs waited for all 256
                 KVC_WAVES = CTAS + 2 * IS.IW_SLICES
-                isrxk = (ltab(fp, Ly, "lflags")() & fx.Int64(64)) != fx.Int64(0)
-                if isrxk:
-                    if (w == 0) | ((b < IS.IW_SLICES) & ((w == 1) | (w == 2))):
-                        hx.wait_storecnt0()   # (this wave's iq / iw stores: device-scope exchange stores, complete before its count)
-                        if l == 0:
-                            hx.atomic_add(lc + i64(LY.KV_C), 1)
-                else:
-                    hx.wait_storecnt0()
-                    gpu.barrier()
-                    if t == 0:
+                if (w == 0) | ((b < IS.IW_SLICES) & ((w == 1) | (w == 2))):
+                    hx.wait_storecnt0()   # (this wave's iq / iw stores: device-scope exchange stores, complete before its count)
+                    if l == 0:
                         hx.atomic_add(lc + i64(LY.KV_C), 1)
                 # c1 REINDEX: no CTA barrier around iquant (it waited for waves 6 / 7's page prefill, ktrace L24). Wave 3 (idle
                 # through iq / iw) polls KV_C for the CTA, acquires (the CTA's one acquire, as before its barrier), zeroes the
@@ -631,24 +632,18 @@ def target_layer(E, Ly):
                 # 512 B, past the TP payload); each iquant wave waits for the tag, and past its stores counts itself in LDS:
                 # the CTA's last one counts the CTA (IQ_DONE). One device poller and one IQ_DONE atomic a CTA: a KV_C poller a
                 # wave (192) starved the iq / iw waves' memory requests (~0.8 s, ktrace L24); 192 IQ_DONE atomics and an
-                # acquire a wave were +0.8 / +0.7 us at the scorer (ktrace L24-36). FULL: as before
-                if isrxk:
-                    if b < NIQC:
-                        IQ_LFLAG = 508
-                        assert TR * 20 * 4 <= IQ_LCNT
-                        iqtag = hx.epoch32(tep, Ly, 2)
-                        if (w == 3) & (l == 0):
-                            hx.wait_count(lc + i64(LY.KV_C), fx.Int32(KVC_WAVES), 4)
-                            hx.lstore(sm + IQ_LCNT, fx.Int32(0), scope="workgroup")
-                            hx.lstore(sm + IQ_LFLAG, iqtag, scope="workgroup")
-                        if (w < IQW) & (b * IQW + w < TR * IS.HEADS):
-                            if l == 0:
-                                hx.wait_lds_tag(sm + IQ_LFLAG, iqtag)
-                else:
-                    if b < NIQC:
-                        if t == 0:
-                            hx.wait_count(lc + i64(LY.KV_C), fx.Int32(CTAS), 4)
-                        gpu.barrier()
+                # acquire a wave were +0.8 / +0.7 us at the scorer (ktrace L24-36). (C3) FULL the same
+                if b < NIQC:
+                    IQ_LFLAG = 508
+                    assert TR * 20 * 4 <= IQ_LCNT
+                    iqtag = hx.epoch32(tep, Ly, 2)
+                    if (w == 3) & (l == 0):
+                        hx.wait_count(lc + i64(LY.KV_C), fx.Int32(KVC_WAVES), 4)
+                        hx.lstore(sm + IQ_LCNT, fx.Int32(0), scope="workgroup")
+                        hx.lstore(sm + IQ_LFLAG, iqtag, scope="workgroup")
+                    if (w < IQW) & (b * IQW + w < TR * IS.HEADS):
+                        if l == 0:
+                            hx.wait_lds_tag(sm + IQ_LFLAG, iqtag)
             else:
                 hx.wait_storecnt0()
                 gpu.barrier()
@@ -660,18 +655,11 @@ def target_layer(E, Ly):
                     gpu.barrier()
             IS.stage_iquant(cwith(c, iq=fptr(fp, "iq"), iwp=fptr(fp, "iwp"), iq_out=fptr(fp, "iq_out"),
                                   iqs_out=fptr(fp, "iqs_out"), iw_out=fptr(fp, "iw_out")))
-            if fx.const_expr(Lx["MT"] == 1 and not DRS):
-                if isrxk:   # (c1 REINDEX) the CTA's last iquant wave counts the CTA
-                    if (w < IQW) & (b * IQW + w < TR * IS.HEADS):
-                        hx.wait_storecnt0()
-                        if l == 0:
-                            if hx.latomic_add_i32_rtn(sm + IQ_LCNT, 1) == fx.min(fx.Int32(IQW), fx.Int32(TR * IS.HEADS) - b * IQW) - 1:
-                                hx.atomic_add(lc + i64(LY.IQ_DONE), 1)
-                else:
-                    if b < NIQC:
-                        hx.wait_storecnt0()
-                        gpu.barrier()
-                        if t == 0:
+            if fx.const_expr(Lx["MT"] == 1 and not DRS):   # (c1) the CTA's last iquant wave counts the CTA
+                if (w < IQW) & (b * IQW + w < TR * IS.HEADS):
+                    hx.wait_storecnt0()
+                    if l == 0:
+                        if hx.latomic_add_i32_rtn(sm + IQ_LCNT, 1) == fx.min(fx.Int32(IQW), fx.Int32(TR * IS.HEADS) - b * IQW) - 1:
                             hx.atomic_add(lc + i64(LY.IQ_DONE), 1)
             else:
                 if b < NIQC:   # (R4) this CTA's query rows out: counted (IQ_DONE)
@@ -698,8 +686,8 @@ def target_layer(E, Ly):
             if ((lfl2 & fx.Int64(2)) != fx.Int64(0)) & (b >= CS.CROW0):   # (the compressor rows read the GEMM's partials)
                 CS.crow_wk_prefetch(dict(t=t, b=b, cwk=ltab(fp, Ly, "cwk")(), cplan=ltab(fp, Ly, "cplan")(),
                                          ccap=fx.Int32(ltab(fp, Ly, "ccap")())))   # (wk -> L2 over the wait)
-                if t == 0:
-                    hx.wait_count(lc + i64(LY.KV_C), CTAS, 4)
+                if t == 0:   # (c1, C3) the GEMM's own count, not the iq / iw waves'
+                    hx.wait_count(lc + i64(LY.KV_CG if (Lx["MT"] == 1 and not DRS) else LY.KV_C), CTAS, 4)
                 gpu.barrier()
             if (lfl2 & fx.Int64(2)) != fx.Int64(0):
                 r1b = (lfl2 & fx.Int64(4)) != fx.Int64(0)

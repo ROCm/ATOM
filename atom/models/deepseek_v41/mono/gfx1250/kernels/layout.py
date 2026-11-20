@@ -20,6 +20,7 @@ MOE_DONE = 20  # MoE (down) done -> combine + TP2
 FRONT = 24  # FFN front done -> MoE
 LAYER_END = 28  # the attention front of the next layer done
 IQ_DONE = 32  # indexer layers: the iquant CTAs' query rows out (the scorer waits for them alone, R4)
+KV_CG = 36  # (c1) compressor layers: the compressor GEMM's waves done (its readers, the compressor rows, wait for it alone)
 MOE_UG = 40  # MoE: UG done -> down (moe.moe)
 SHARED_DOWN = 44  # MoE: the dedicated CTAs' shared-expert units (narrow batches)
 SCORE = 48  # indexer score done
@@ -73,6 +74,7 @@ def layer_slots() -> dict:
         "FRONT": (FRONT, 4),
         "LAYER_END": (LAYER_END, 4),
         "IQ_DONE": (IQ_DONE, 4),
+        "KV_CG": (KV_CG, 4),
         "MOE_UG": (MOE_UG, 4),
         "SHARED_DOWN": (SHARED_DOWN, 4),
         "SCORE": (SCORE, 4),

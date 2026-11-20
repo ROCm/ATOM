@@ -63,27 +63,65 @@ def cgemm_prefetch(c, r1):
             hx.prefetch(c["cwkv"] + i64((nt * 16 + j // lpr) * HID + ks * kper) * 2 + i64((j % lpr) * 128))
 
 
+CG_WAVE = 7    # (c1) stage_cgemm's wave: idle on the FULL layers through iq / iw / iquant (rx_prefill is REINDEX's)
+CG_RING = 4    # (c1) its K loop's load ring depth (divides kper / 32 = 40 / 20)
+
+
+def _sbar():
+    hx.intrin(None, "llvm.amdgcn.sched.barrier", [I32(0)])
+
+
 @ASTRewriter.transform
 def stage_cgemm(c, r1):
-    """r1: the layer is ratio 1 (runtime bool)."""
+    """r1: the layer is ratio 1 (runtime bool).
+    c1 (MT 1): wave CG_WAVE, not wave 3 -- wave 3 is an iquant wave (and the iquant CTAs' KV_C poller): there the GEMM's
+    ~10 us (ktrace L2 / L8 / L14) held the CTA's iquant row, and its CTA-barrier count held every iquant CTA; the K loop a
+    CG_RING-deep load ring (each step's loads waited alone: s_wait_loadcnt 0 a WMMA, ~40 L2 round trips a K slice). The same
+    WMMA sequence: bitwise the same partials (CT16 fixture c3kvc/cgstep.py: 5.5 -> 3.5 us a CTA at ratio 2, cold)."""
     t, b, w, l, MT = c["t"], c["b"], c["w"], c["l"], c["MT"]
     cw = r1.select(I32(LAT), I32(2 * LAT))
     ks_n = r1.select(I32(8), I32(4))           # K slices: 256 CTAs / (CW / 16) N tiles
     nt = b // ks_n
     ks = b % ks_n
     kper = HID // ks_n                          # 640 or 1280
-    if (w >= 3) & (w < 6) & (w - 3 < MT):
-        mi = w - 3
-        k0 = ks * kper
-        acc = fx.Vector.filled(8, 0.0, F32)
-        for st in range(kper // 32):
-            kk = k0 + st * 32 + (l // 16) * 16
-            av = hx.gload(c["axn"] + i64((mi * 16 + l % 16) * HID + kk) * 2, BF16, 16)
-            bv = hx.gload(c["cwkv"] + i64((nt * 16 + l % 16) * HID + kk) * 2, BF16, 16)
-            acc = hx.wmma_bf16(av, bv, acc)
-        for i in range_constexpr(8):
-            tok = mi * 16 + (l // 16) * 8 + i
-            c["stx"](c["cpart"] + i64((ks * T + tok) * (2 * LAT) + nt * 16 + l % 16) * 4, acc[i])
+    if fx.const_expr(MT == 1):
+        if w == CG_WAVE:
+            k0 = ks * kper
+            acc = fx.Vector.filled(8, 0.0, F32)
+            abase = c["axn"] + i64((l % 16) * HID + k0 + (l // 16) * 16) * 2
+            bbase = c["cwkv"] + i64((nt * 16 + l % 16) * HID + k0 + (l // 16) * 16) * 2
+            A = [hx.gload(abase + i64(i * 64), BF16, 16) for i in range(CG_RING)]
+            B = [hx.gload(bbase + i64(i * 64), BF16, 16) for i in range(CG_RING)]
+            _sbar()
+            for g in range(kper // (32 * CG_RING) - 1):
+                s0 = (g + 1) * CG_RING
+                na = []
+                nb = []
+                for i in range_constexpr(CG_RING):
+                    acc = hx.wmma_bf16(A[i], B[i], acc)
+                    na.append(hx.gload(abase + i64((s0 + i) * 64), BF16, 16))
+                    nb.append(hx.gload(bbase + i64((s0 + i) * 64), BF16, 16))
+                    _sbar()
+                A = na
+                B = nb
+            for i in range_constexpr(CG_RING):
+                acc = hx.wmma_bf16(A[i], B[i], acc)
+            for i in range_constexpr(8):
+                tok = (l // 16) * 8 + i
+                c["stx"](c["cpart"] + i64((ks * T + tok) * (2 * LAT) + nt * 16 + l % 16) * 4, acc[i])
+    else:
+        if (w >= 3) & (w < 6) & (w - 3 < MT):
+            mi = w - 3
+            k0 = ks * kper
+            acc = fx.Vector.filled(8, 0.0, F32)
+            for st in range(kper // 32):
+                kk = k0 + st * 32 + (l // 16) * 16
+                av = hx.gload(c["axn"] + i64((mi * 16 + l % 16) * HID + kk) * 2, BF16, 16)
+                bv = hx.gload(c["cwkv"] + i64((nt * 16 + l % 16) * HID + kk) * 2, BF16, 16)
+                acc = hx.wmma_bf16(av, bv, acc)
+            for i in range_constexpr(8):
+                tok = mi * 16 + (l // 16) * 8 + i
+                c["stx"](c["cpart"] + i64((ks * T + tok) * (2 * LAT) + nt * 16 + l % 16) * 4, acc[i])
 
 
 @ASTRewriter.transform
