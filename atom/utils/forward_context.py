@@ -723,6 +723,8 @@ class AttentionMetaData:
     reduce_indptr: torch.Tensor | None = None
     reduce_final_map: torch.Tensor | None = None
     reduce_partial_map: torch.Tensor | None = None
+    # Builder geometry for a native whole-row sparse DCP decode template.
+    sparse_dcp_decode_plan: tuple[int, int, torch.dtype, torch.dtype] | None = None
 
     # The model's decode round's share of this step (`RoundService`): set once
     # by the attention builder; the builder, its cache, Engram staging, the
@@ -775,6 +777,7 @@ class AttentionMetaData:
         reduce_indptr: torch.Tensor | None = None,
         reduce_final_map: torch.Tensor | None = None,
         reduce_partial_map: torch.Tensor | None = None,
+        sparse_dcp_decode_plan: tuple[int, int, torch.dtype, torch.dtype] | None = None,
         sparse_cu_seqlens_q: torch.Tensor | None = None,
         batch_id_per_q_token: torch.Tensor | None = None,
         batch_id_per_k_token: torch.Tensor | None = None,
@@ -813,6 +816,7 @@ class AttentionMetaData:
         self.reduce_indptr = reduce_indptr
         self.reduce_final_map = reduce_final_map
         self.reduce_partial_map = reduce_partial_map
+        self.sparse_dcp_decode_plan = sparse_dcp_decode_plan
         self.sparse_cu_seqlens_q = sparse_cu_seqlens_q
         self.batch_id_per_q_token = batch_id_per_q_token
         # [total_kv] int32 — the KV-axis twin, over the gathered cached+new KV.

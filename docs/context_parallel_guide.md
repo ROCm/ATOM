@@ -615,11 +615,20 @@ With an **fp8 Q and an fp8 KV cache**, aiter serves gqa=64 only from the
 **persistent** decode kernel and aborts the process otherwise (`asm_mla.cu`:
 *"fp8/fp8 with gqa_ratio=64 only supports persistent mode"*).
 
-Native sparse MLA / DSA **decode** under DCP handles this, where aiter runs DCP
-decode persistent (`dcp_persistent_supported`; validated on gfx950), by rebuilding
-the persistent work/reduce metadata after each full IndexShare layer compacts its
-rank-local top-k. Following shared layers reuse its indices, compact indptr and
-work plan.
+Native sparse MLA / DSA **decode** and sparse MTP verify under DCP build one
+whole-row template per step when AITER confirms native support for the builder's
+Q/KV dtypes and gathered head width. The template uses nonempty placeholders and
+one item per workgroup, then each layer patches its current rank-local KV ranges.
+Shared IndexShare layers read the preceding owner's selection. A mismatched,
+folded or unknown consumer rebuilds separate work buffers, preserving the template
+for later native layers. Unqualified steps keep the existing rebuild path.
+
+Reuse is limited to 256 query rows and the exact geometry's workgroup capacity;
+the allocated work-indptr must match that capacity. This preserves the known
+[empty-item boundary](https://github.com/wuhuikx/LLM-Booster/issues/570) above
+256 rows. Rebuilding is not an unconditional numerical reference for empty rows.
+The template must fit the consumer's query rows, including an unpadded drafter;
+otherwise that consumer rebuilds from its own row count.
 
 Persistent **sparse prefill** builds a work plan at the selected prefill head
 width. An owning layer patches its KV ranges only when AITER confirms native,
@@ -764,7 +773,7 @@ MLA rows; see the [recipe](../recipes/DSpark.md)).
 | prefix caching / chunked prefill | Supported (dense and sparse / DSA). On **Kimi-K3** the validated configuration has prefix caching **off**, per its recipe |
 | Kimi-K3 KDA layers | Not sharded — the KDA recurrent state is per-request, not paged, so DCP frees only the MLA share of attention memory |
 | Kimi-K3 gathered head width | Eligible persistent decode and sparse prefill use native 96 at TP8/DCP8. Other routes use their own width tables. Above 128, ATOM warns because the width is unverified; aiter dispatch depends on its version and configuration, with no support guarantee. |
-| gathered head width 64 | Eligible decode rebuilds persistent metadata per full IndexShare layer. Persistent sparse prefill plans once per forward and patches per owner; eligible FP8 non-persistent prefill needs no plan. See [Sparse DCP persistent attention and gqa=64](#sparse-dcp-persistent-attention-and-gqa64). |
+| gathered head width 64 | Qualified decode and sparse verify reuse a step's native whole-row plan; other decode shapes rebuild. Persistent sparse prefill plans once per forward and patches per owner; eligible FP8 non-persistent prefill needs no plan. See [Sparse DCP persistent attention and gqa=64](#sparse-dcp-persistent-attention-and-gqa64). |
 | speculative decode (MTP), dense MLA | Supported on **gfx950 only** (bf16/fp8, `num_speculative_tokens` 1–3); raises at startup on gfx942 |
 | speculative decode (DSpark), Kimi-K3 | Supported on gfx950; validated at `tp8 -dcp 8` with `num_speculative_tokens 2` (Inferact MLA draft) and 5 (RadixArk DSpark GQA draft, which runs outside the DCP group) |
 | speculative decode (MTP), sparse / DSA | Supported on **gfx950 only**; validated on GLM-5.2-FP8 at fp8 KV, `num_speculative_tokens=3`, dcp8 |
