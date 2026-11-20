@@ -9,7 +9,8 @@ This page is the model-independent how-to. Model walkthroughs:
 
 - [MiniMax-M3-UMBP.md](MiniMax-M3-UMBP.md): MiniMax-M3, aggregated TP4
 
-PD (UMBP next to a P/D producer) is not supported yet.
+PD is not supported: a `multi` connector with a P/D connector beside
+`umbp_store` is refused at startup.
 
 Design notes are in
 [`atom/kv_transfer/offload/README.md`](../atom/kv_transfer/offload/README.md#mori-umbp-offload-umbp_store).
@@ -45,13 +46,19 @@ ATOM server (TP N)
 Supported layouts: dense KV and MiniMax-M3/M3.1 PAGE (K, V, scales and the NSA
 index cache). Stateful layouts and DCP > 1 are refused at startup.
 
+Copies between the KV cache and the staging pool are staged on the forward's
+stream, as `mooncake_store`'s are; no side copy stream waits on the device for
+the forward.
+
 ## 1. Requirements
 
-**Mori with UMBP, including ROCm/mori#791.** In the ATOM container:
+**Mori with UMBP, including ROCm/mori#791 and ROCm/mori#949.** In the ATOM
+container:
 
 ```bash
 python3 -c "import mori.umbp; print('umbp ok')"
-pip show amd_mori_nightly 2>/dev/null | grep Version     # want 1.2.6.dev20261109 or later
+python3 -c "import mori.umbp as u; u.UMBPStandaloneProcessConfig().lookup_timeout_ms = 1; print('#949 ok')"
+pip show amd_mori_nightly 2>/dev/null | grep Version     # want 1.2.6.dev20261112 or later
 UMBP_BIN=$(python3 -c 'import mori.umbp,pathlib;print(pathlib.Path(mori.umbp.__file__).resolve().parents[1]/"umbp_standalone_server")')
 ls -l "$UMBP_BIN"
 ```
@@ -59,9 +66,12 @@ ls -l "$UMBP_BIN"
 ROCm/mori#791 ("a lookup renews the keys it finds") makes `exists` refresh
 the LRU. Without it, a prefix that keeps hitting in HBM is never read from
 UMBP, so it ages out first. A conversation's shared head chunk is hit
-hardest, and a lookup that misses chunk 0 misses the whole prefix. Nightly
-wheels name only a date; the nightly build of a given date is cut from Mori
-main at 20:00 UTC that day.
+hardest, and a lookup that misses chunk 0 misses the whole prefix.
+ROCm/mori#949 adds the lookup deadline (`lookup_timeout_ms`) that
+`umbp_store.lookup_timeout_ms` sets; with an older Mori the connector does not
+start. Nightly wheels name only a date; the nightly build of a given date is
+cut from Mori main at 20:00 UTC that day. The ATOM image installs the newest
+Mori nightly when it is built, so check the version in the image you run.
 
 **Building Mori from source** (when the container's Mori is older):
 
@@ -125,10 +135,14 @@ PY
 do sleep 5; done; echo "umbp ready"
 ```
 
-The server may accept clients while it is still registering the rest of its
-host memory in the background; puts that arrive before that finishes fail and
-are retried by later saves. Wait for the log to go quiet (or give it a minute
-after `umbp ready`) before sending load.
+Start ATOM only after this loop succeeds. The server may accept clients while
+it is still registering the rest of its host memory in the background, and
+answers puts that arrive before that finishes with False. Each worker's first
+put is its startup probe: it is asked again until
+`umbp_store.startup_timeout_ms` has passed, and if the server still does not
+store it the engine does not start. Saves that fail later are retried by the
+scheduler. Wait for the server log to go quiet (or give it a minute after
+`umbp ready`) before sending load.
 
 Restart the server whenever you restart ATOM for a new measurement, so each run
 starts from an empty pool.
@@ -140,8 +154,8 @@ starts from an empty pool.
     "kv_connector_extra_config":{"umbp_store.address":"unix:///tmp/umbp/server.sock"}}'
 ```
 
-Offload only: next to a P/D producer (the prefill node of a PD deployment)
-it is not supported yet.
+Offload only, on an aggregated instance: a `multi` connector with a P/D
+connector beside `umbp_store` is refused at startup.
 
 Keep the HBM prefix cache on (`--enable-prefix-caching`); UMBP sits behind it.
 No `PYTHONHASHSEED` is needed: the object keys are blake2b chain hashes of the
@@ -150,13 +164,22 @@ prompt's tokens, and the HBM prefix cache hashes with xxhash.
 | Key | Default | Meaning |
 |-----|:-------:|---------|
 | `umbp_store.address` | required | The server's address, e.g. `unix:///tmp/umbp/server.sock`. |
-| `umbp_store.startup_timeout_ms` | 10000 | How long a client waits for the server when it connects. |
+| `umbp_store.startup_timeout_ms` | 10000 | How long a client waits for the server when it connects, and how long a worker's startup probe asks again while the server answers its put with False. |
+| `umbp_store.lookup_timeout_ms` | 1000 | Deadline of one lookup RPC. Past it every key counts as absent, the request prefills, and the scheduler stops asking the server for a while (at least 10 s). Must be > 0: lookups run on the scheduler thread. |
 | `umbp_store.chunk_tokens` | 256 | Tokens per object; a multiple of the KV block size. Also the routing granularity. |
 | `umbp_store.load_pool_mib` | 1024 | HBM load staging per worker, MiB. |
 | `umbp_store.save_pool_mib` | 256 | HBM save staging per worker, MiB. |
 | `umbp_store.save_abandon_timeout_s` | 300 | Seconds before the engine reclaims the source blocks of a save that never reported. |
 
 An unknown `umbp_store.*` key is an error.
+
+Like `mooncake_store`, `umbp_store` loads only hits of at least 512 tokens
+(two chunks); the global default for other tiers is 8192. The existing
+`OFFLOAD_MIN_LOAD_TOKENS` setting overrides it.
+
+One server serves one node. With DP over several nodes each node's ranks reach
+only their own server, so shared-prefix DP routing (`--dp-load-balance
+share_cache` / `prefix_spread`) is refused across nodes.
 
 ## 4. Check that it works
 
@@ -191,10 +214,11 @@ An unknown `umbp_store.*` key is an error.
 | Symptom | Cause | Fix |
 |---|---|---|
 | `umbp_store` refuses to start, "server is not ready" | Wrong address, or the server is still prefaulting | Check `umbp_store.address`; wait for the readiness loop |
-| `put_failed` right after startup | The server is still registering host memory with the GPUs | Wait for the server to finish; later saves store the chunks |
+| `UMBP startup probe: ... did not store` | The server was still registering host memory past `umbp_store.startup_timeout_ms`, or its pool is full | Start ATOM after the readiness loop and a quiet server log; raise `umbp_store.startup_timeout_ms` |
+| `put_failed` right after startup | The server is still registering host memory with the GPUs | Wait for the server to finish; the scheduler retries failed saves |
+| `took ... ms to answer a lookup` warnings | The server is overloaded or stalled | Lookups to it pause and those requests prefill; check the server |
 | Hits fall off over a long run although the pool is large | Mori without #791: hot prefixes age out | Use a Mori build that includes ROCm/mori#791 |
 | Server cannot open a worker's buffer | GPU ordinals differ between the server and ATOM | Same `ROCR_VISIBLE_DEVICES` for both |
-| Saves lag far behind during heavy prefill | Copy streams sharing a hardware queue with the forward | Already handled: the copy threads run on the device's highest-priority streams. Do not raise `GPU_MAX_HW_QUEUES` for this, because it slows the forward |
 
 ## Limitations
 
@@ -212,6 +236,13 @@ These are open with the Mori team; the connector works around each of them:
   registers one staging region per worker and deregisters it only at close.
 - **Server restarts lose the pool.** There is no reconnect; restart ATOM with
   the server.
+- **No deadline on put and get.** Lookups are bounded by
+  `umbp_store.lookup_timeout_ms`, but Mori has no deadline for
+  `batch_put_from_ptr` / `batch_get_into_ptr`: a server that stops answering
+  stalls the worker's save and load threads, and with them a preemption that
+  waits for its saves and the engine's shutdown. A deadline could not free the
+  staging slots anyway, since the server may still be copying into them.
+  Stop ATOM before the server.
 
 ## Stop
 
