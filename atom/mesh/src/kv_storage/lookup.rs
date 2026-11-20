@@ -108,7 +108,8 @@ pub(super) struct Read {
     pub admins: Vec<String>,
     pub readable: bool,
     pub lookups: Arc<Lookups>,
-    /// From the first request to the last answer; later answers are dropped.
+    /// From the first request to the last answer. Past it the lookup has no answer at all,
+    /// not even from the pools that answered in time.
     pub deadline: Duration,
 }
 

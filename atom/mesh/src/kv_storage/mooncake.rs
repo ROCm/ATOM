@@ -40,9 +40,10 @@ impl KeyState {
 }
 
 /// The state of each of `keys` in the pools whose admin services are `admins`, asked
-/// concurrently in batches, for as long as the caller waits: unknown only where no pool
-/// answered. A pool that holds the taint key holds nothing, as the engine loads nothing
-/// from it, and an answer that leaves the taint key out says nothing.
+/// concurrently in batches, once every request has been answered or has failed: unknown
+/// only where no pool answered. A caller that stops waiting earlier gets no state at all.
+/// A pool that holds the taint key holds nothing, as the engine loads nothing from it,
+/// and an answer that leaves the taint key out says nothing.
 pub async fn query_pools(
     client: &reqwest::Client,
     admins: &[String],
