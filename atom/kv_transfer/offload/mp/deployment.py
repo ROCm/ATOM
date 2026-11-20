@@ -218,9 +218,10 @@ def _config_has_fully_replicated_tp_pages(config: Any) -> bool:
     if int(config.decode_context_parallel_size) > 1:
         return False
     if draft_owns_kv_pool(config):
-        # A DSpark draft whose backend owns a KV pool appends per-rank-sharded
-        # PAGE regions (`draft_kv.py` declares factor 1), so the complete PAGE
-        # object is not replicated even when the target's is.
+        # A draft with its own KV pool (an MHA DSpark/EAGLE3 draft,
+        # `draft_owns_kv_pool`) appends per-rank-sharded PAGE regions
+        # (`draft_kv.py` declares factor 1), so the complete PAGE object is not
+        # replicated even when the target's is.
         return False
     hf_config = getattr(config, "hf_config", None)
     # MiniMax-M3 is GQA. Some TP ranks can happen to own the same KV head when
