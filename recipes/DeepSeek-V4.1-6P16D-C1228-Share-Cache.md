@@ -1,5 +1,11 @@
 # DeepSeek V4.1 6P16D / C1228 with shared Store
 
+2026-11-20 update: new performance runs explicitly use FP8 KV and FP8 index.
+Historical BF16 measurements retain their original dtype labels. The latest
+measured 8P16D deployment and the completed NoEP128 capacity experiment are documented in
+[8P16D FP8 recipe](DeepSeek-V4.1-8P16D-C1228-FP8-Share-Cache.md).
+This document retains its six-P topology and original public-source validation boundary.
+
 This recipe records the 22-GPU AgentX topology used for V4.1-Flash-1017:
 three P instances with two GPUs each, and four D instances with four GPUs
 each. P uses `share_cache`; engine session affinity is disabled. The shared
@@ -46,8 +52,8 @@ actual ranks. Do not map session IDs to a fixed rank or freeze P-to-D pairs.
 
 | Role | Instances | GPUs per instance | KV / index dtype | HBM fraction | Sequences | Batched tokens | Prefill chunk |
 |---|---:|---:|---|---:|---:|---:|---:|
-| P | 3 | 2 | bf16 / fp8 | 0.85 | 64 | 32768 | 65536 |
-| D | 4 | 4 | bf16 / fp8 | 0.75 | 24 | 1024 | 16384 |
+| P | 3 | 2 | fp8 / fp8 | 0.85 | 64 | 32768 | 65536 |
+| D | 4 | 4 | fp8 / fp8 | 0.75 | 24 | 1024 | 16384 |
 
 All instances use prefix caching, block size 128, state checkpoint interval
 8192, level 3, FULL cudagraphs, dspark with five speculative tokens,
@@ -138,7 +144,7 @@ python3 -m atom.entrypoints.openai_server --model "$MODEL_PATH" \
   --data-parallel-master-port "$DP_MASTER_PORT" \
   --data-parallel-base-port "$DP_BASE_PORT" --server-port "$HTTP_PORT" \
   --moe-backend standard --all2all-backend none --dp-load-balance "$POLICY" \
-  --kv_cache_dtype bf16 --index-cache-dtype fp8 \
+  --kv_cache_dtype fp8 --index-cache-dtype fp8 \
   --gpu-memory-utilization "$HBM" --max-num-seqs "$SEQS" \
   --max-num-batched-tokens "$BATCH" --attn-prefill-chunk-size "$CHUNK" \
   --enable_prefix_caching --block-size 128 --state-checkpoint-interval-tokens 8192 \
@@ -256,3 +262,6 @@ ITL 8.485 ms and output throughput 31726.10 tokens/s (1442.10 per GPU). A
 historical different-source/node baseline had 11.395 s, 37.847 s, 7.500 ms and
 32577.68 tokens/s respectively. This is not evidence of overall improvement
 or a fair same-source performance guarantee.
+These historical measurements used BF16 KV with FP8 index; the updated FP8 KV
+command template does not change their recorded precision or constitute a
+rerun of those measurements.
