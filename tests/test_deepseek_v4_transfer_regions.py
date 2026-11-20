@@ -927,6 +927,7 @@ def test_fp4_pd_copies_data_scales_and_swa_without_touching_other_blocks(
         dst_ids,
         {"slot_index": -1, "swa_block_ids": [1]},
         "fp4",
+        None,
         engine=selected_engine,
     )
     assert calls == ["block"]
@@ -987,7 +988,7 @@ def test_fp4_pd_layout_mismatch_fails_before_any_write(
         match="mismatch|out of range|disagree|requires the consumer|Cannot layer-map|one-to-one",
     ):
         conn._execute_block_slot_transfer(
-            req, "test", [0], [1], {"slot_index": -1, "swa_block_ids": [1]}, "fp4"
+            req, "test", [0], [1], {"slot_index": -1, "swa_block_ids": [1]}, "fp4", None
         )
     assert not calls
 
