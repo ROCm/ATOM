@@ -2,7 +2,7 @@
 """The V4 shared expert's gate_up GEMM with the SwiGLU and the MXFP8 quant
 for w2 in its epilogue.
 
-Whether an expert may take it (`Expert._gate_up_silu`) is decided once at
+Whether an expert may take it (`Expert._gate_up_silu_applies`) is decided once at
 construction, from the configuration and the gate_up weight shape; only such
 an expert gets `_forward_gate_up_silu` as its forward, every other one keeps
 the plain forward unchanged. The fused forward branches on nothing that
@@ -82,12 +82,11 @@ def _expert(
     expert.w2 = _W2() if w2_group == 32 else MagicMock(native_a8_group_rows=None)
     expert.swiglu_limit = limit
     expert.use_fused_clamp_act_mul = fused_act
-    expert.prefix = prefix
     monkeypatch.setattr(
         v4, "weight_is_stored_preshuffled", lambda *a, **k: stored_preshuffled
     )
-    expert._gate_up_silu = expert._gate_up_silu_applies()
-    if expert._gate_up_silu:  # as Expert.__init__ registers it
+    if expert._gate_up_silu_applies():  # as Expert.__init__ sets it up
+        expert.prefix = prefix
         config = importlib.import_module("atom.config").get_current_atom_config()
         config.compilation_config.static_forward_context[prefix] = expert
         expert.forward = expert._forward_gate_up_silu
@@ -108,7 +107,7 @@ def flydsl(monkeypatch, atom_modules):
 
     def kernel_for(m, n2, k):
         calls["shapes"].append((m, n2, k))
-        return None if m > 4096 else f"tile{min(m, 4096)}"
+        return f"tile{m}" if 1 <= m <= 4096 else None
 
     def gate_up_silu_mxfp8_32(xq, wq, xs, ws, limit):
         m, inter = xq.shape[0], wq.shape[0] // 2
@@ -179,7 +178,8 @@ def test_fused_rows_feed_w2_the_epilogue_quant(
     monkeypatch, atom_modules, flydsl, atom_config
 ):
     expert = _expert(monkeypatch, atom_modules)
-    assert expert._gate_up_silu and flydsl["supported_shape"] == (2 * INTER, DIM)
+    assert "forward" in vars(expert)
+    assert flydsl["supported_shape"] == (2 * INTER, DIM)
     x = torch.zeros(3, DIM, dtype=torch.bfloat16)
     act, act_scale = expert.gate_up_silu_quant(x)
     xq, wq, xs, ws, limit, out, out_scale = flydsl["runs"][-1]
@@ -199,19 +199,20 @@ def test_fused_rows_feed_w2_the_epilogue_quant(
     assert flydsl["shapes"][-1] == (3, 2 * INTER, DIM)
 
 
+@pytest.mark.parametrize("m", [0, 5000])  # an idle DEP rank, a prefill chunk
 def test_other_rows_run_the_unfused_chain(
-    monkeypatch, atom_modules, flydsl, unfused, atom_config
+    monkeypatch, atom_modules, flydsl, unfused, atom_config, m
 ):
     expert = _expert(monkeypatch, atom_modules)
     expert.gate_up_proj.fn = unfused["gate_up_fn"]
-    x = torch.zeros(5000, DIM, dtype=torch.bfloat16)
+    x = torch.zeros(m, DIM, dtype=torch.bfloat16)
     act, act_scale = expert.gate_up_silu_quant(x)
     assert not flydsl["runs"]
-    assert unfused["gate_up"] == [5000] and unfused["silu"] == [(5000, 10.0)]
+    assert unfused["gate_up"] == [m] and unfused["silu"] == [(m, 10.0)]
     # quantize_fp8 of the bf16 activation: what w2 would compute itself.
     (activation,) = flydsl["quantized"]
-    assert activation.shape == (5000, INTER) and activation.dtype == torch.bfloat16
-    assert act.shape == (5000, INTER) and act_scale.shape == (5000, INTER // 32)
+    assert activation.shape == (m, INTER) and activation.dtype == torch.bfloat16
+    assert act.shape == (m, INTER) and act_scale.shape == (m, INTER // 32)
 
 
 def test_traced_forward_picks_per_runtime_rows(
@@ -256,7 +257,7 @@ def test_gated_forward_keeps_the_unfused_path(
     """`forward(x, weights=...)` (a gated expert) never takes the fused path:
     the epilogue has no per-row gate."""
     expert = _expert(monkeypatch, atom_modules)
-    assert expert._gate_up_silu
+    assert "forward" in vars(expert)
     expert.gate_up_proj = MagicMock(return_value=torch.zeros(3, 2 * INTER))
     monkeypatch.setattr(
         atom_modules.deepseek_v4, "aiter_silu_and_mul", lambda out, x, limit: None
@@ -275,6 +276,7 @@ def test_gated_forward_keeps_the_unfused_path(
         {"limit": 0.0},
         {"stored_preshuffled": False},
         {"group": None},
+        {"group": 1},  # native 1x32 FP8: not shuffled at load
         {"fused_act": True},
         {"w2_group": None},
         {"unsupported_shape": True},
@@ -286,8 +288,8 @@ def test_ineligible_experts_keep_the_unfused_path(
     if change.pop("unsupported_shape", False):
         flydsl["supported"] = False  # e.g. a sharded TP4 shared expert
     expert = _expert(monkeypatch, atom_modules, **change)
-    assert not expert._gate_up_silu
-    assert expert.prefix not in atom_config.compilation_config.static_forward_context
+    assert "prefix" not in vars(expert)
+    assert not atom_config.compilation_config.static_forward_context
     # It runs the plain forward (main's body), with no per-call check.
     assert "forward" not in vars(expert)
 
@@ -297,14 +299,14 @@ def test_other_inputs_keep_the_unfused_path(
 ):
     v4 = atom_modules.deepseek_v4
     expert = _expert(monkeypatch, atom_modules)
-    assert expert._gate_up_silu
+    assert "forward" in vars(expert)
     expert.gate_up_proj = MagicMock(return_value=torch.zeros(3, 2 * INTER))
     monkeypatch.setattr(v4, "aiter_silu_and_mul", lambda out, x, limit: None)
     expert.w2 = MagicMock(return_value="out", native_a8_group_rows=32)
     assert expert.forward(torch.zeros(3, DIM)) == "out"  # fp32 rows
     assert not flydsl["runs"] and not flydsl["shapes"]
     monkeypatch.setattr(v4, "get_gfx_runtime", lambda: "gfx950")
-    assert not _expert(monkeypatch, atom_modules)._gate_up_silu
+    assert "forward" not in vars(_expert(monkeypatch, atom_modules))
 
 
 @pytest.mark.parametrize("arch", ["gfx950", "gfx1250"])
@@ -338,7 +340,7 @@ def test_init_decides_and_registers(
     expert = v4.Expert(DIM, INTER, swiglu_limit=10.0, prefix="m.shared_experts")
     assert queries == [arch]
     fused = arch == "gfx1250"
-    assert expert._gate_up_silu == fused
+    assert ("prefix" in vars(expert)) == fused
     registry = atom_config.compilation_config.static_forward_context
     assert (registry.get("m.shared_experts") is expert) == fused
     assert ("supported_shape" in flydsl) == fused

@@ -2812,11 +2812,10 @@ class Expert(nn.Module):
         # the architecture query, and a compiled forward may be replayed for
         # other row counts without re-checking guards, so neither forward
         # branches on the row count (the op below does, at run time).
-        self.prefix = prefix
-        self._gate_up_silu = self._gate_up_silu_applies()
-        if self._gate_up_silu:
+        if self._gate_up_silu_applies():
             # torch.ops.aiter.v4_shared_gate_up_silu_quant looks the expert
-            # up by `prefix`.
+            # up by `prefix`; nothing else is stored on other experts.
+            self.prefix = prefix
             get_current_atom_config().compilation_config.static_forward_context[
                 prefix
             ] = self
