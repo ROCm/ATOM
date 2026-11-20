@@ -62,6 +62,41 @@ def test_wide_launch_matches_real_length(batch, context, rank):
 
 
 @needs_gpu
+@pytest.mark.parametrize("batch,context", [(1, 1000), (3, 9000), (16, 40000)])
+@pytest.mark.parametrize("rank", [0, 3])
+def test_unfilled_dead_slots_do_not_reach_the_selection(
+    monkeypatch, batch, context, rank
+):
+    """``fill_dead_slots=False`` leaves the slots past a request's live blocks
+    unwritten. They are poisoned here with a score above every real one (the
+    scorer's buffer comes back pre-filled), so a reader that stepped past the
+    live blocks would select them: the shard's keys must equal the filled
+    run's, bit for bit."""
+    q, cache, table, lengths = _inputs(batch, context, seed=batch * 11 + rank)
+    blocks = WIDE // 128
+    filled = _scores(q, cache, table, lengths, WIDE, rank)
+
+    def poisoned(shape, **kw):
+        return torch.full(shape, 1e37, **kw)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(cp.torch, "empty", poisoned)
+        unfilled = cp.indexer_context_scores(
+            q, cache, table[:, :blocks], lengths, WIDE, rank, WORLD, QLEN,
+            128**-0.5, fill_dead_slots=False,
+        )  # fmt: skip
+    # The poison is really there, past the longest request's blocks.
+    live = triton.cdiv(triton.cdiv(int(lengths.max()), 128), WORLD)
+    assert torch.all(unfilled[..., live:] == 1e37)
+    assert torch.all(filled[..., live:] == float("-inf"))
+    keys = [
+        ex.local_candidate_keys(s, lengths, TOPK, rank, WORLD, QLEN, blocks, 0, 1)
+        for s in (filled, unfilled)
+    ]
+    assert torch.equal(keys[0], keys[1])
+
+
+@needs_gpu
 @pytest.mark.parametrize("programs", [1, 7, 64])
 def test_scores_do_not_depend_on_the_split(monkeypatch, programs):
     q, cache, table, lengths = _inputs(8, 30000, seed=11)

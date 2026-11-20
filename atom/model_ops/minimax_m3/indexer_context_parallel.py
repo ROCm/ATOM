@@ -98,6 +98,9 @@ def _context_score(
     # Query-row split (FP4): grid axis 2 has ROW_SPLIT programs, each scoring
     # rows [N * split, N * split + N) of the request's HEADS * QUERY_LEN.
     ROW_SPLIT: tl.constexpr = 1,
+    # Whether the slots past a request's live blocks are written (-inf). Off for
+    # a reader that stops at them itself (`_shard_winners`).
+    FILL_DEAD_SLOTS: tl.constexpr = True,
 ):
     tl.static_assert(not IS_FP4 or (NVFP4_SCALED_DOT and TRANSPOSED))
     request = tl.program_id(0)
@@ -168,17 +171,19 @@ def _context_score(
                     in_ctx = block * 128 + pos[:, None] < cutoff[None, :]
                     score = tl.max(tl.where(in_ctx, dot, float("-inf")), 0)
             tl.store(s_row + local, score, mask=live)
-    # Every output slot is overwritten, including empty shards and replay padding.
-    pad_span = (LOCAL_BLOCKS - live_end + programs - 1) // programs
-    lo = live_end + program * pad_span
-    hi = tl.minimum(lo + pad_span, LOCAL_BLOCKS)
-    for t in range(lo, hi, PAD_TILE):
-        off = t + tl.arange(0, PAD_TILE)
-        tl.store(
-            s_row[:, None] + off[None, :],
-            tl.full((N, PAD_TILE), float("-inf"), tl.float32),
-            mask=live[:, None] & (off[None, :] < hi),
-        )
+    if FILL_DEAD_SLOTS:
+        # Every output slot is overwritten, including empty shards and replay
+        # padding.
+        pad_span = (LOCAL_BLOCKS - live_end + programs - 1) // programs
+        lo = live_end + program * pad_span
+        hi = tl.minimum(lo + pad_span, LOCAL_BLOCKS)
+        for t in range(lo, hi, PAD_TILE):
+            off = t + tl.arange(0, PAD_TILE)
+            tl.store(
+                s_row[:, None] + off[None, :],
+                tl.full((N, PAD_TILE), float("-inf"), tl.float32),
+                mask=live[:, None] & (off[None, :] < hi),
+            )
 
 
 def indexer_context_scores(
@@ -192,8 +197,17 @@ def indexer_context_scores(
     max_query_len,
     sm_scale,
     index_scale=None,
+    fill_dead_slots=True,
 ):
     """Return [heads,tokens,ceil(blocks/world)] with round-robin logical blocks.
+
+    ``fill_dead_slots``: write -inf to the slots past each request's live
+    blocks. A decode graph is captured for max_model_len, so those are most of
+    the row (at a 1M bound and 167K-token requests, 84%), and filling them costs
+    the 32-row FP4 scorer 40% on top of its scoring (MI455X, batch 24, verify of
+    8: 17.7us against 12.7us at the batch's own length). False for a reader that
+    bounds its reads by the same live count, as `_shard_winners` does: the dead
+    slots are then left unwritten.
 
     Index cache remains replicated. Caller supplies valid live lengths no greater
     than max_seq_len and in-bounds physical pages; no host reads of live metadata.
@@ -309,6 +323,7 @@ def indexer_context_scores(
             N=row_tile,
             SCALE=sm_scale * 1.4426950409,
             TRANSPOSED=_transposed_score(),
+            FILL_DEAD_SLOTS=fill_dead_slots,
             **(
                 {
                     "Scales": index_scale,

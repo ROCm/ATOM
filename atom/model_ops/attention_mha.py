@@ -2274,6 +2274,8 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             max_query_len,
             self.scale,
             index_scale=self.index_scale,
+            # Both readers below stop at each row's live blocks (`_shard_winners`).
+            fill_dead_slots=False,
         )
         # The shape decides the path, so every rank takes the same one.
         mailbox = candidate_mailbox()
