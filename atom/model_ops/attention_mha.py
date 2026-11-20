@@ -5,7 +5,7 @@ from functools import cache
 
 import aiter
 import torch
-from aiter import fused_qk_norm_rope_cache_quant_shuffle
+from aiter import fused_qk_norm_rope_cache_quant_shuffle, reduce_splitk_partials
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.mha import _flash_attn_varlen_forward
 from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
@@ -29,6 +29,7 @@ from atom.utils.decorators import mark_trace
 from atom.utils.forward_context import ForwardContext, get_forward_context
 
 from .attention_mla import MLAModules
+from .linear import claim_splitk_partials
 
 
 @cache
@@ -51,6 +52,15 @@ class PagedAttentionImpl(nn.Module):
     def qkv_fields(num_heads, num_kv_heads, head_dim, **kwargs):
         """(heads, head dim) of each column range of the fused qkv, in order."""
         return [(num_heads, head_dim)] + [(num_kv_heads, head_dim)] * 2
+
+    # This class's rope_cache claims the split-K partials of a deferred QKV GEMM
+    # (`claim_splitk_partials`). Opt-in per class: a subclass, which may override
+    # rope_cache, claims them only if it sets this itself.
+    claims_splitk_partials = True
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        cls.claims_splitk_partials = vars(cls).get("claims_splitk_partials", False)
 
     def __init__(
         self,
@@ -235,6 +245,8 @@ class PagedAttentionImpl(nn.Module):
 
         # dummy run will skip attention in cuda graph capture phase
         if fwd_ctx.context.is_dummy_run:
+            # Release qkv's unreduced split-K partials: nothing reads this output.
+            claim_splitk_partials(qkv)
             o = torch.empty_like(q)
             return o
 
@@ -267,13 +279,31 @@ class PagedAttentionImpl(nn.Module):
 
         use_triton_attn = self.use_triton_attn
 
+        from atom.model_ops.layernorm import GemmaRMSNorm
+
+        # Gemma q/k norm, RoPE and the cache write as separate kernels.
+        gemma_unfused = isinstance(self.q_norm, GemmaRMSNorm) and (
+            q.shape[0] > envs.ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS
+            and self._use_asm_cache_layout(
+                k_cache, v_cache, use_triton_attn=use_triton_attn
+            )
+        )
+        # Only the fused Gemma kernel reduces a deferred split-K QKV itself.
+        qkv_partials = claim_splitk_partials(qkv)
+        if qkv_partials is not None and not (
+            self.rotary_emb is not None
+            and self.k_norm is not None
+            and isinstance(self.q_norm, GemmaRMSNorm)
+            and not gemma_unfused
+        ):
+            reduce_splitk_partials(qkv, qkv_partials)
+            qkv_partials = None
+
         if (
             self.rotary_emb is not None
             and self.q_norm is not None
             and self.k_norm is not None
         ):
-            from atom.model_ops.layernorm import GemmaRMSNorm
-
             if isinstance(self.q_norm, GemmaRMSNorm):
                 # GemmaRMSNorm (1+w) path — use the Triton fused kernel
                 from atom.model_ops.triton_fused_qkv_norm_rope_cache import (
@@ -286,12 +316,7 @@ class PagedAttentionImpl(nn.Module):
                 q_raw, k_raw, v_raw = torch.split(
                     qkv, [q_size, kv_size, kv_size], dim=-1
                 )
-            if isinstance(self.q_norm, GemmaRMSNorm) and (
-                q_raw.shape[0] > envs.ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS
-                and self._use_asm_cache_layout(
-                    k_cache, v_cache, use_triton_attn=use_triton_attn
-                )
-            ):
+            if gemma_unfused:
                 q, k, v = self._gemma_norm_rope_then_cache(
                     q_raw,
                     k_raw,
@@ -328,6 +353,7 @@ class PagedAttentionImpl(nn.Module):
                     v_scale=v_scale,
                     slot_mapping=attn_metadata.slot_mapping,
                     kv_cache_dtype=self.kv_cache_dtype,
+                    qkv_partials=qkv_partials,
                 )
                 q = q.view(-1, self.num_heads, self.head_dim)
                 k = k.view(-1, self.num_kv_heads, self.head_dim)
@@ -1244,6 +1270,8 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
     """
 
     is_indexed_sparse_attention = True
+    # rope_cache passes qkv's split-K partials to aiter.fused_qknorm_idxrqknorm.
+    claims_splitk_partials = True
 
     @staticmethod
     def qkv_fields(
@@ -1440,6 +1468,8 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             sparse_metadata = attn_metadata
         slot_mapping = sparse_metadata.slot_mapping
 
+        # A deferred split-K QKV is contiguous; claim its partials before any copy.
+        qkv_partials = claim_splitk_partials(qkv)
         qkv = qkv.contiguous()
         num_tokens = qkv.shape[0]
         from atom.models.minimax_m3.model import _minimax_m3_cos_sin_cache
@@ -1478,6 +1508,10 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             from atom.model_ops.triton_fused_qkv_norm_rope_cache import (
                 triton_fused_norm_rope_cache,
             )
+
+            # This kernel reads a reduced qkv (the index columns it skips too).
+            if qkv_partials is not None:
+                reduce_splitk_partials(qkv, qkv_partials)
 
             q_size = self.num_heads * self.head_dim
             kv_size = self.num_kv_heads * self.head_dim
@@ -1551,6 +1585,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             v_scale=fused_v_scale,
             asm_layout=self.kv_cache_dtype not in FP4_CACHE_DTYPES,
             skip_index_branch=self.skip_index_topk,
+            qkv_partials=qkv_partials,
         )
 
         q = q_out.view(-1, self.num_heads, self.head_dim)
