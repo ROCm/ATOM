@@ -1483,7 +1483,7 @@ def test_draft_read_window_follows_the_m3_draft_config(seq_factory):
     draft.sliding_window = 4096
     window = draft_read_window(SimpleNamespace(speculative_config=spec))
     assert (window.window, window.read_page) == (4096, 16)
-    # A row at 8192 reads from the page holding 4097: R(8191) is 4096.
+    # The lowest row of 8191 tokens sits at 8191 and reads from 4096: R(8191).
     assert window.first_read_token(8191) == 4096
     assert window.first_read_token(4095) == 0
     draft.sliding_window = 0
@@ -1498,6 +1498,11 @@ def test_loaded_prefix_marks_blocks_below_the_draft_start(seq_factory):
     assert bm.publish_loaded_prefix(seq, 0, 16, draft_start=8) == 16
     assert _marked(bm, seq) == [True, True, False, False, False, False]
     assert bm.draft_marked_blocks == 2
+    # Marks stop at the loaded end: the forward writes the blocks past it.
+    short = seq_factory(list(range(50, 74)))
+    bm.allocate(short)
+    bm.publish_loaded_prefix(short, 0, 8, draft_start=16)
+    assert _marked(bm, short) == [True, True, False, False, False, False]
     # No draft start: the load wrote every draft row.
     other = seq_factory(list(range(100, 124)))
     bm.allocate(other)
@@ -1532,6 +1537,11 @@ def test_hbm_hit_is_cut_at_a_marked_block_in_the_window(seq_factory):
     assert marked not in fork.block_table and bm.kv.block(marked).ref_count == 0
     assert (bm.hbm_draft_gate_cuts, bm.hbm_draft_gate_cut_tokens) == (1, 8)
     bm.deallocate(fork)
+    # A caller taking less than the probe's hit takes none of its cut.
+    assert bm.can_allocate(fork) == 1
+    assert bm.allocate(fork, 0)
+    assert bm.hbm_draft_gate_cuts == 1
+    bm.deallocate(fork)
 
     # `allocate` gates again: a hash re-pointed to a marked copy after the probe.
     probe = seq_factory(list(range(12)) + [70, 71, 72, 73])
@@ -1542,8 +1552,10 @@ def test_hbm_hit_is_cut_at_a_marked_block_in_the_window(seq_factory):
     bm.publish_loaded_prefix(stale, 0, 12, draft_start=12)
     copy = bm.kv.block(stale.block_table[2])
     bm.kv.publish(stale.block_table[2], copy.hash, copy.token_ids)
+    probe.offload_joint.claim_tokens = 12  # a joint claim past the cut
     assert bm.allocate(probe, hit)
     # Claims stop at the cut, so the forward writes no shared block.
+    assert probe.offload_joint.claim_tokens == 8
     assert probe.num_cached_tokens == 8
     assert probe.block_table[2] != stale.block_table[2]
     assert bm.kv.block(probe.block_table[2]).hash == -1
@@ -1562,6 +1574,37 @@ def test_a_marked_block_below_the_window_is_kept(seq_factory):
     assert bm.allocate(later, 10)
     assert later.num_cached_tokens == 40
     assert bm.hbm_draft_gate_cuts == 0
+
+
+def test_the_gates_wait_for_a_marked_block(seq_factory, monkeypatch):
+    def gate_ran(*args):
+        raise AssertionError("a draft gate ran with no block marked")
+
+    bm = _draft_bm()
+    monkeypatch.setattr(bm, "_draft_rows_gate", gate_ran)
+    monkeypatch.setattr(bm, "_regate_draft_rows", gate_ran)
+    seq = _computed(bm, seq_factory(list(range(17))))
+    bm.deallocate(seq)
+    again = seq_factory(list(range(17)))
+    assert bm.allocate(again, bm.can_allocate(again))
+    assert again.num_cached_tokens == 16 and again.draft_rows_cut is None
+
+
+def test_allocate_refuses_a_cut_the_pool_cannot_back(seq_factory):
+    bm = _draft_bm(blocks=9)
+    base = _computed(bm, seq_factory(list(range(12)) + [60]))
+    stale = seq_factory(list(range(12)) + [61])
+    bm.allocate(stale)
+    bm.publish_loaded_prefix(stale, 0, 12, draft_start=12)
+    # One free block backs the probe's hit of 3; the cut at 2 needs two.
+    probe = seq_factory(list(range(12)) + [70, 71, 72, 73])
+    hit = bm.can_allocate(probe)
+    assert hit == 3 and bm.kv.num_free == 1
+    copy = bm.kv.block(stale.block_table[2])
+    bm.kv.publish(stale.block_table[2], copy.hash, copy.token_ids)
+    assert not bm.allocate(probe, hit)
+    bm.deallocate(probe)
+    assert base.block_table and bm.kv.num_free == 1
 
 
 def test_recomputed_or_loaded_unmarked_block_replaces_a_marked_canonical(

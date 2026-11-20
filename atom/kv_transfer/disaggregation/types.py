@@ -627,8 +627,8 @@ class ReqMeta:
     prefill_handoff: dict | None = None
     prefill_aborted: bool = False
     prompt_digest: str | None = None
-    # A non-chunked producer's V (`PrefillHandoff.draft_rows_from`): its own
-    # copy on the producer, the one a consumer echoes back.
+    # A split producer's V (`PrefillHandoff.draft_rows_from`): its own copy on
+    # the producer; on a non-chunked consumer, the one it echoes back.
     draft_rows_from: int | None = None
     # Leading blocks of the destination that the consumer's own prefix cache
     # holds; a full transfer (offset 0) writes over them.

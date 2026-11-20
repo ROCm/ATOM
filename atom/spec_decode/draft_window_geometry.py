@@ -3,7 +3,7 @@
 
 """Which draft rows a sliding-window DSpark draft riding the target's blocks reads.
 
-Pure arithmetic: the prefix caches and the Mooncake Store's split layout use it.
+Pure arithmetic: the prefix-cache gates and the P/D draft rows boundary use it.
 """
 
 from __future__ import annotations
@@ -11,10 +11,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-# The page the MiniMax-M3 draft's per-row decode starts a row on (ASM_PAGE_SIZE).
-M3_DRAFT_READ_PAGE = 16
-# Draft architectures whose block pass reads through a known page.
-_DRAFT_READ_PAGES = {"DSparkMiniMaxDraftModel": M3_DRAFT_READ_PAGE}
+from atom.model_ops.minimax_m3.geometry import ASM_PAGE_SIZE
+
+# Draft architectures whose block pass reads through a known page: the M3 draft
+# starts a row's keys on an ASM page.
+_DRAFT_READ_PAGES = {"DSparkMiniMaxDraftModel": ASM_PAGE_SIZE}
 
 
 @dataclass(frozen=True)
@@ -33,8 +34,8 @@ class DraftReadWindow:
             )
 
     def first_read_token(self, num_tokens: int) -> int:
-        """Lowest key any block pass of a `num_tokens`-token sequence reads:
-        its rows sit at `num_tokens` or later, past an anchor that never retreats."""
+        """Lowest key a block pass whose drafts are used reads for a
+        `num_tokens`-token sequence: its rows start at `num_tokens`."""
         start = max(0, int(num_tokens) + 1 - self.window)
         return start - start % self.read_page
 
@@ -59,4 +60,4 @@ def draft_read_window(config: Any) -> DraftReadWindow | None:
     return DraftReadWindow(window=window, read_page=page)
 
 
-__all__ = ["M3_DRAFT_READ_PAGE", "DraftReadWindow", "draft_read_window"]
+__all__ = ["DraftReadWindow", "draft_read_window"]

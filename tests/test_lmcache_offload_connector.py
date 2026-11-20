@@ -3948,6 +3948,7 @@ def test_abort_cleans_load_whose_terminal_was_already_consumed(
         num_tokens=8,
         offload_loaded_tokens=4,
         offload_load_start_tokens=4,
+        offload_draft_start_tokens=None,
         offload_joint=OffloadJointRecord(),
     )
 

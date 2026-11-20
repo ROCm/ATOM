@@ -82,18 +82,10 @@ from atom.models.dspark_draft import (
     linear_out,
 )
 from atom.models.minimax_m3.model import MiniMaxM3MLP
-from atom.spec_decode.draft_window_geometry import M3_DRAFT_READ_PAGE
 from atom.utils.forward_context import get_forward_context
 
 if TYPE_CHECKING:
     from atom.config import Config
-
-# The prefix caches and the Store split the draft rows a row reads by this page.
-if ASM_PAGE_SIZE != M3_DRAFT_READ_PAGE:
-    raise ImportError(
-        f"the MiniMax-M3 draft reads {ASM_PAGE_SIZE}-token pages, but "
-        f"draft_window_geometry assumes {M3_DRAFT_READ_PAGE}"
-    )
 
 
 def _draft_rope_theta(config) -> float:

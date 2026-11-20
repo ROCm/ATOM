@@ -108,7 +108,7 @@ def _make_block_removed(hashes: list[int]) -> BlockRemoved:
 def _received_draft_rows_from(seq: Sequence) -> int | None:
     """The producer's V: received blocks below it lack draft rows. None from a
     producer that writes them all; a malformed V marks every received block."""
-    value = (getattr(seq, "kv_transfer_params", None) or {}).get("draft_rows_from")
+    value = (seq.kv_transfer_params or {}).get("draft_rows_from")
     if value is None:
         return None
     return value if type(value) is int and value >= 0 else len(seq)
@@ -269,7 +269,8 @@ class BlockManager:
         # The draft rows a sliding-window draft reads; None reads them all, and
         # then no hit is cut for `Block.draft_rows_missing`.
         self.draft_read_window = draft_read_window(config)
-        # Blocks marked, and admissions (and their tokens) the mark cut.
+        # Blocks ever marked (the gates run only once one is), and the
+        # admissions (and their tokens) a mark cut.
         self.draft_marked_blocks = 0
         self.hbm_draft_gate_cuts = 0
         self.hbm_draft_gate_cut_tokens = 0
@@ -1073,10 +1074,6 @@ class BlockManager:
         self.draft_marked_blocks += marked
         return marked
 
-    def draft_rows_missing(self, block_id: int) -> bool:
-        """Whether a tier load left `block_id`'s draft rows unwritten."""
-        return block_id < 0 or self.kv.block(block_id).draft_rows_missing
-
     def draft_rows_from(self, seq: Sequence) -> int:
         """Tokens up to the end of `seq`'s highest block whose draft rows are
         missing (V, sent to a P/D consumer); 0 when every block has them."""
@@ -1385,11 +1382,15 @@ class BlockManager:
         # A checkpoint far below the compressed hit loses to a bounded replay,
         # which keeps the whole hit and rebuilds the state at its end.
         num_cached_blocks = self._replay_hit(seq, compressed_hit, resumable)
-        # Step 4: the draft's read window holds no block a tier load left
-        # without draft rows; the cut is counted when `allocate` takes it.
-        gated = self._draft_rows_gate(seq, num_cached_blocks, walk.ids)
-        seq.draft_rows_cut_tokens = (num_cached_blocks - gated) * self.hash_block_size
-        num_cached_blocks = gated
+        # Step 4: the draft's read window holds no block a tier load or a P/D
+        # receive left without draft rows; `allocate` counts a cut it takes.
+        if self.draft_marked_blocks:
+            gated = self._draft_rows_gate(seq, num_cached_blocks, walk.ids)
+            seq.draft_rows_cut = (
+                gated,
+                (num_cached_blocks - gated) * self.hash_block_size,
+            )
+            num_cached_blocks = gated
         # Instrumentation: the pre-gate hit, so EngineStats can separate reuse
         # the gates declined (compressed_hit - num_cached_blocks) from reuse
         # lost to compressed eviction (everything above compressed_hit).
@@ -1910,10 +1911,12 @@ class BlockManager:
         scheduling: a block spanning multiple steps must not be published as
         a hash until fully filled.
 
-        Returns ``True`` on success. Returns ``False`` only when a state-less
-        joint boundary had to be disowned (finding #2) and the pool could not
-        back the private prefix copies; the caller must then deallocate and
-        requeue the seq rather than run a forward over shared blocks.
+        Returns ``True`` on success. Returns ``False`` when a state-less joint
+        boundary had to be disowned (finding #2) and the pool could not back
+        the private prefix copies, or when the draft gate cut the hit and the
+        pool could not back the blocks the cut turns fresh; the caller must
+        then deallocate and requeue the seq rather than run a forward over
+        shared blocks.
         """
         assert not seq.block_table
         # Admitted: the delayer no longer probes this seq.
@@ -1930,26 +1933,28 @@ class BlockManager:
         # `num_cached_blocks` this request will ever treat as computed, and
         # claiming further would pin blocks the forward is about to overwrite.
         hbs = self._hash_block_size()
-        # Again, as another admission this pass may have re-pointed a hash to a
-        # marked block; claims stop at the cut, or a forward writes a shared block.
-        cut_tokens = getattr(seq, "draft_rows_cut_tokens", 0)
-        seq.draft_rows_cut_tokens = 0
-        gated = self._regate_draft_rows(seq, num_cached_blocks)
-        if gated < 0:
-            return False
-        if gated < num_cached_blocks:
-            cut_tokens += (num_cached_blocks - gated) * hbs
-            num_cached_blocks = gated
-            if int(seq.offload_joint.boundary_tokens or 0) > gated * hbs:
-                seq.offload_joint.boundary_tokens = 0
-                seq.offload_joint.boundary_hash = -1
-                seq.offload_joint.kv_tokens = 0
-            seq.offload_joint.claim_tokens = min(
-                int(seq.offload_joint.claim_tokens or 0), gated * hbs
-            )
-        if cut_tokens:
-            self.hbm_draft_gate_cuts += 1
-            self.hbm_draft_gate_cut_tokens += cut_tokens
+        if self.draft_marked_blocks:
+            # The probe's cut counts only if this takes the probe's hit.
+            probe, seq.draft_rows_cut = seq.draft_rows_cut, None
+            cut_tokens = probe[1] if probe and probe[0] == num_cached_blocks else 0
+            # Again, as another admission this pass may have re-pointed a hash to
+            # a marked block; claims stop at the cut, or a forward writes a shared block.
+            gated = self._regate_draft_rows(seq, num_cached_blocks)
+            if gated < 0:
+                return False
+            if gated < num_cached_blocks:
+                cut_tokens += (num_cached_blocks - gated) * hbs
+                num_cached_blocks = gated
+                if int(seq.offload_joint.boundary_tokens or 0) > gated * hbs:
+                    seq.offload_joint.boundary_tokens = 0
+                    seq.offload_joint.boundary_hash = -1
+                    seq.offload_joint.kv_tokens = 0
+                seq.offload_joint.claim_tokens = min(
+                    int(seq.offload_joint.claim_tokens or 0), gated * hbs
+                )
+            if cut_tokens:
+                self.hbm_draft_gate_cuts += 1
+                self.hbm_draft_gate_cut_tokens += cut_tokens
         hbm_tokens = num_cached_blocks * hbs
         claim_tokens = int(seq.offload_joint.claim_tokens or 0)
         # Unaligned HBM hit whose private tail already cleared `_fit_joint`.

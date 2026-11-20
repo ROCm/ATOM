@@ -467,8 +467,8 @@ class Sequence:
         # Where the planned load's draft rows start: blocks below it get
         # `draft_rows_missing`. None when the load writes every draft row.
         self.offload_draft_start_tokens = None
-        # Hit tokens the last admission probe cut for marked draft rows.
-        self.draft_rows_cut_tokens = 0
+        # (hit blocks kept, tokens cut) by the last admission probe's draft gate.
+        self.draft_rows_cut: tuple[int, int] | None = None
         # Prefix tokens `share_cache` routing credited this request when it
         # placed it, until its rank reports what it really reused.
         self.dp_est_cached_tokens = 0

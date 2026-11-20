@@ -207,8 +207,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KV_OFFLOAD_EXTRA_CONFIG": lambda: os.getenv(
         "ATOM_KV_OFFLOAD_EXTRA_CONFIG", ""
     ),
-    # Prefill: the mooncake_store keeps a sliding-window DSpark draft's rows only
-    # for each prompt's read window, as objects of their own. Opt-in.
+    # Prefill with a sliding-window DSpark draft: the mooncake P/D producer
+    # tells its decode where blocks without draft rows end. Opt-in.
     "ATOM_MOONCAKE_STORE_DRAFT_WINDOW": lambda: _flag_env(
         "ATOM_MOONCAKE_STORE_DRAFT_WINDOW"
     ),

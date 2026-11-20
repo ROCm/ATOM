@@ -97,6 +97,9 @@ class ChunkedPrefill:
         self.num_ready_blocks = 0  # Published prefix blocks; reads must wait on event.
         self.event: Any = None
         self.handoff: dict | None = None
+        # A split producer's V (`PrefillHandoff.draft_rows_from`), sent with the
+        # prefill's first forward.
+        self.draft_rows_from: int | None = None
         self.cancelled = False
         self.expected_readers = 0  # Total consumers served by this P rank.
         self.completed_readers = 0  # Exited send tasks, including failures.
@@ -139,6 +142,23 @@ class ChunkedPrefill:
                 self.handoff = dict(handoff)
                 self.updated = time.monotonic()
             self.cv.notify_all()
+
+    def set_draft_rows_from(self, draft_rows_from):
+        """Publish V; blocks below it may lack draft rows."""
+        with self.cv:
+            self.draft_rows_from = draft_rows_from
+            self.cv.notify_all()
+
+    def wait_draft_rows_from(self):
+        """Wait for V, raising on cancellation or timeout."""
+        with self.cv:
+            ready = self.cv.wait_for(
+                lambda: self.cancelled or self.draft_rows_from is not None,
+                timeout=self.timeout,
+            )
+            if not ready or self.cancelled:
+                raise RuntimeError("prefill draft rows boundary cancelled or timed out")
+            return self.draft_rows_from
 
     def cancel(self):
         """Cancel waits and new claims; in-flight RDMA must still drain."""

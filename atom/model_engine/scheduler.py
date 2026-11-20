@@ -2714,7 +2714,8 @@ class Scheduler:
                 continue
             if not allocated:
                 # A state-less joint boundary could not be privatised without
-                # risking a shared decoding sequence's blocks (finding #2).
+                # risking a shared decoding sequence's blocks (finding #2), or
+                # the pool cannot back the blocks a draft-gate cut turns fresh.
                 # Return the seq to waiting for a clean recompute once the pool
                 # has room, and stop admitting this pass.
                 self.waiting.appendleft(seq)
@@ -3410,7 +3411,7 @@ class Scheduler:
             seq.num_cached_tokens,
             seq.num_tokens,
         )
-        draft_start = getattr(seq, "offload_draft_start_tokens", None)
+        draft_start = seq.offload_draft_start_tokens
         if loaded > seq.num_cached_tokens:
             promoted = 0
             if load_start is not None and load_start < loaded:
@@ -6349,8 +6350,9 @@ class DecodeScheduler(Scheduler):
                     logger.warning("Cannot allocate prefill")
                     break
                 if not self.block_manager.allocate(seq):
-                    # Disown could not be backed (finding #2); leave the seq at
-                    # the front of waiting to retry once the pool has room.
+                    # Disown (finding #2) or a draft-gate cut could not be
+                    # backed; leave the seq at the front of waiting to retry
+                    # once the pool has room.
                     self.block_manager.deallocate(seq)
                     break
                 # The prefill process drafts into this allocation too.

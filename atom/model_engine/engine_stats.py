@@ -591,7 +591,7 @@ class EngineStats:
                 f"adopted {bm.shipped_chains_adopted}, "
                 f"rejected {bm.shipped_chains_rejected}"
             )
-            if getattr(bm, "draft_marked_blocks", 0):
+            if bm.draft_marked_blocks:
                 # Only once a tier load or a split producer left a block without
                 # draft rows. On a P/D consumer the cut tokens are re-sent.
                 logger.info(
