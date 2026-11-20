@@ -14,6 +14,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from atom.models.kimi_k3.mono.config import MAX_ROWS
+from atom.models.kimi_k3.mono.kernels.stages import tdm_timeline
 from atom.models.kimi_k3.mono.kernels.stages.moe_layout import (
     EXPERTS,
     LATENT,
@@ -475,6 +476,7 @@ def stage_route_cta(c, token, front_payload_words=0):
         if tid < WAVE:
             fx.ptr_store(fx.Int32(0), lds["top_experts"] + tid)
     gpu.barrier()
+    tdm_timeline.stamp(tdm_timeline.LITE_SCORED)
     # Every wave takes the bound itself: ``stage_route``'s lane maxima, sorted.
     lane_max = fx.Uint32(fx.ptr_load(lds["maxima"] + lane))
     for other_wave in range_constexpr(1, waves):
@@ -495,6 +497,7 @@ def stage_route_cta(c, token, front_payload_words=0):
         at_bound = _ballot32(max_rank == width - 1)
         bound_lane = _popcount32((at_bound & (~at_bound + fx.Uint32(1))) - fx.Uint32(1))
         bound = fx.Uint32(readlane(fx.Int32(lane_max), bound_lane))
+    tdm_timeline.stamp(tdm_timeline.LITE_BOUND)
     # A wave's survivors take consecutive slots from one LDS atomic.
     kept = _count_tree([score >= bound for score in scores])
     inclusive = _wave_inclusive_scan32(kept, lane)
@@ -511,6 +514,7 @@ def stage_route_cta(c, token, front_payload_words=0):
             fx.ptr_store(fx.Int32(0), lds["ahead"] + slot)
         slot = slot + (scores[index] >= bound).select(fx.Int32(1), fx.Int32(0))
     gpu.barrier()
+    tdm_timeline.stamp(tdm_timeline.LITE_SLOTTED)
     survivors = uniform(fx.ptr_load(lds["count"]))
     # A survivor's rank, the count of survivors before it, summed over the
     # waves: each compares every survivor with every waves-th one.
@@ -535,6 +539,7 @@ def stage_route_cta(c, token, front_payload_words=0):
         if (first + lane < survivors) & (ahead > 0):
             fx.atomic_add(lds["ahead"] + entry, ahead, syncscope="workgroup")
     gpu.barrier()
+    tdm_timeline.stamp(tdm_timeline.LITE_RANKED)
     if wave == 0:
         # The top ``width`` to their ranks: a wave's LDS accesses are in order.
         for first in range(fx.Int32(0), survivors, fx.Int32(WAVE), unroll=1):
@@ -581,7 +586,9 @@ def stage_route_cta(c, token, front_payload_words=0):
                     token * 2 * TOPK + TOPK + rank,
                     my_sigmoid * inverse,
                 )
+    tdm_timeline.stamp(tdm_timeline.LITE_ROUTES_ISSUED)
     gpu.barrier()
+    tdm_timeline.stamp(tdm_timeline.LITE_ROUTED)
 
 
 # A HERD candidate's tag word: the launch's tag over the expert id's bits.
@@ -751,7 +758,14 @@ def stage_herd_token(c, rows, token):
 
     limit = c.get("poll_limit")
     words = load_pairs()
-    if const_expr(limit is None):
+    if const_expr(limit is None and tdm_timeline.active()):
+        polls = fx.Int32(0)
+        while stale(words):
+            rocdl.s_sleep(1)
+            polls = polls + 1
+            words = load_pairs()
+        tdm_timeline.record(tdm_timeline.LITE_HERD_POLLS, uniform(polls))
+    elif const_expr(limit is None):
         while stale(words):
             rocdl.s_sleep(1)
             words = load_pairs()
@@ -763,7 +777,9 @@ def stage_herd_token(c, rows, token):
             words = load_pairs()
     if const_expr("stamp" in c):
         c["stamp"]("herd_in")
+    tdm_timeline.stamp(tdm_timeline.LITE_HERD_POLLED)
     gpu.barrier()
+    tdm_timeline.stamp(tdm_timeline.LITE_HERD_SEEN)
     if const_expr("stamp" in c):
         c["stamp"]("herd_seen")
     for index in range_constexpr(rounds):
@@ -774,6 +790,7 @@ def stage_herd_token(c, rows, token):
             fx.ptr_store(fx.Int32(words[2 * index]).bitcast(fx.Float32), values_s + at)
             fx.atomic_add(popularity + expert, fx.Int32(1), syncscope="workgroup")
     gpu.barrier()
+    tdm_timeline.stamp(tdm_timeline.LITE_HERD_COUNTED)
     if const_expr("stamp" in c):
         c["stamp"]("herd_counted")
     store_cm = c.get("store_cm", 0)
@@ -792,6 +809,7 @@ def stage_herd_token(c, rows, token):
         live = lane < kp1
         kept_sum, place, kept = drop_order(c, my_id, my_value, my_pop, lane, live, kp1)
         scale = c["routed_scaling_factor"] / fx.max(kept_sum, fx.Float32(1e-20))
+        tdm_timeline.stamp(tdm_timeline.LITE_HERD_DROPPED)
         if kept:
             bo.buffer_store(
                 my_id, rsrc(c["topk_ids"]), token * TOPK + place, cache_modifier=store_cm
@@ -802,6 +820,7 @@ def stage_herd_token(c, rows, token):
                 token * TOPK + place,
                 cache_modifier=store_cm,
             )
+        tdm_timeline.stamp(tdm_timeline.LITE_HERD_STORED)
 
 
 @traced

@@ -16,7 +16,11 @@ from atom.models.kimi_k3.mono.config import (
 from atom.models.kimi_k3.mono.kernels.stages import (
     gemv_gfx1250 as gemv_device,
 )
-from atom.models.kimi_k3.mono.kernels.stages import gemv_layout, moe_expert_gfx1250
+from atom.models.kimi_k3.mono.kernels.stages import (
+    gemv_layout,
+    moe_expert_gfx1250,
+    tdm_timeline,
+)
 from atom.mono.device.ops import bf16_round, bf_hi, bf_lo, rsrc, traced
 from atom.mono.plan.architecture import GFX1250
 
@@ -179,6 +183,7 @@ def sdown_tasks(c, tasks, operands, waves, rows, rolled=False):
                 c["lane"],
             )
     gpu.barrier()
+    tdm_timeline.stamp(tdm_timeline.LITE_SD_MULTIPLIED)
     total = tokens * (GEMV_ROWS // 2)
     rounds = (total + threads - 1) // threads
     if const_expr(rolled):
@@ -234,6 +239,7 @@ def sdown_tasks(c, tasks, operands, waves, rows, rolled=False):
                         sums[1],
                         store_cm,
                     )
+    tdm_timeline.stamp(tdm_timeline.LITE_SD_STORED)
     gpu.barrier()
 
 

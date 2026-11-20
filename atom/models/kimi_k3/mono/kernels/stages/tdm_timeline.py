@@ -52,6 +52,19 @@ MIX_NORM_DRAINED, MIX_NORM_PASSED, MIX_STORED = 110, 111, 112
 # stamp B), the K loop done and the cluster exchange's barrier passed.
 NORM_POLLED, NORM_REDUCED, NORM_STORED = 113, 114, 115
 SPLIT_LOOPED, SPLIT_EXCHANGED = 116, 117
+# The lite finish (``k2_finish_persistent_gfx1250``: no slabs, its points in
+# the slab words). A routing CTA: its scores' lane maxima in LDS, its bound,
+# its survivors in their slots, ranked, its routes' stores issued, every
+# wave past them; a parallel-HERD one's candidates seen fresh (wave 0), by
+# every wave, the batch popularity counted, its drop found, its HERD routes'
+# stores issued, and wave 0's candidate polls (a count, not a stamp). A
+# shared-down CTA: its weights' loads issued, its rows staged, its WMMAs'
+# accumulators in LDS, its sums' stores issued.
+LITE_SCORED, LITE_BOUND, LITE_SLOTTED, LITE_RANKED = 8, 9, 10, 11
+LITE_ROUTES_ISSUED, LITE_ROUTED = 12, 13
+LITE_HERD_POLLED, LITE_HERD_SEEN, LITE_HERD_COUNTED = 14, 15, 16
+LITE_HERD_DROPPED, LITE_HERD_STORED, LITE_HERD_POLLS = 17, 18, 19
+LITE_SD_ISSUED, LITE_SD_STAGED, LITE_SD_MULTIPLIED, LITE_SD_STORED = 20, 21, 22, 23
 POINTS = {
     "hw_id": HW_ID,
     "entry": ENTRY,
@@ -85,6 +98,24 @@ POINTS = {
     "norm_stored": NORM_STORED,
     "split_looped": SPLIT_LOOPED,
     "split_exchanged": SPLIT_EXCHANGED,
+}
+LITE_POINTS = {
+    "scored": LITE_SCORED,
+    "bound": LITE_BOUND,
+    "slotted": LITE_SLOTTED,
+    "ranked": LITE_RANKED,
+    "routes_issued": LITE_ROUTES_ISSUED,
+    "routed": LITE_ROUTED,
+    "herd_polled": LITE_HERD_POLLED,
+    "herd_seen": LITE_HERD_SEEN,
+    "herd_counted": LITE_HERD_COUNTED,
+    "herd_dropped": LITE_HERD_DROPPED,
+    "herd_stored": LITE_HERD_STORED,
+    "sd_issued": LITE_SD_ISSUED,
+    "sd_staged": LITE_SD_STAGED,
+    "sd_multiplied": LITE_SD_MULTIPLIED,
+    "sd_stored": LITE_SD_STORED,
+    "stores_done": STORES_DONE,
 }
 
 _config: tuple[int, int] | None = None
@@ -240,6 +271,19 @@ def stamp(point, wave_role=0) -> None:
     if _context is None:
         return
     _stamp_on(_context["role"], wave_role, _context["record"], point)
+
+
+@traced
+def _record_on(role, wave_role, record, index, value):
+    if role == wave_role:
+        fx.ptr_store(fx.Int32(value), record + index)
+
+
+def record(point, value, wave_role=0) -> None:
+    """``value`` (wave-uniform) in point ``point``'s word, not a stamp."""
+    if _context is None:
+        return
+    _record_on(_context["role"], wave_role, _context["record"], point, value)
 
 
 def slab(s, which, wave_role=0) -> None:

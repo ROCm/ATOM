@@ -38,6 +38,7 @@ from atom.models.kimi_k3.mono.kernels.stages import (
     moe_expert_gfx1250,
     moe_gfx1250,
     moe_tail_gfx1250,
+    tdm_timeline,
 )
 from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import LDS_PAD
 from atom.models.kimi_k3.mono.kernels.token_tiling import WMMA_TOKEN_ROWS
@@ -444,7 +445,9 @@ def build_packed_finish(
         f"{'_norsb' if rolled and not split_bound else ''}"
         f"{f'_pl{herd_poll_limit}' if herd_poll_limit is not None else ''}"
         f"{'_profile' if profile else ''}"
+        f"{tdm_timeline.suffix()}"
     )
+    timeline = tdm_timeline.key()
     # After a replicated front there is no gathered latent to unpack.
     unpack = not (rolled and replicated_front)
     if replicated_front:
@@ -865,6 +868,7 @@ def build_packed_finish(
                     )
                     for task in tasks
                 ]
+                tdm_timeline.stamp(tdm_timeline.LITE_SD_ISSUED)
                 staging = {
                     "S": rows,
                     "tid": tid,
@@ -876,6 +880,7 @@ def build_packed_finish(
                     moe_tail_gfx1250.stage_hidden_rows(staging, shared_hidden)
                 else:
                     moe_tail_gfx1250.stage_activated_rows(staging, shared_gate_up)
+                tdm_timeline.stamp(tdm_timeline.LITE_SD_STAGED)
                 moe_tail_gfx1250.sdown_tasks(
                     {
                         "S": rows,
@@ -1199,9 +1204,17 @@ def build_packed_finish(
         shared_partial: Int64,
         scratch: Int64,
     ):
-        _ = sources
+        _ = sources, timeline
+        allocator = fx.SharedAllocator()
+        role = allocator.allocate(RoleLds)
+        tdm_timeline.open_cta(
+            fx.Int32(fx.block_idx.x),
+            fx.Int32(fx.thread_idx.x) // GFX1250.wave_size,
+            timeline,
+            allocator,
+        )
         body(
-            fx.SharedAllocator().allocate(RoleLds),
+            role,
             front_gathered,
             router_bias,
             shared_gate_up,
@@ -1226,6 +1239,8 @@ def build_packed_finish(
             shared_partial,
             scratch,
         )
+        tdm_timeline.stores_done()
+        tdm_timeline.close_cta()
 
     @flyc.jit
     def launch(
