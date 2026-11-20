@@ -166,10 +166,10 @@ def test_front_pipe_default_is_late_where_it_won(monkeypatch, rows, name):
     )
 
 
-def test_front_pipe_sites_name_their_epilogues():
-    pipe = front.front_pipe(8, True, 320 * 1024, frozenset({"epi", "hw4", "u2"}))
-    assert pipe == {"fused": True, "hw_fp4": True}
-    assert front._pipe_suffix(pipe) == "_fe_hw4"
+def test_front_pipe_sites_name_their_options():
+    pipe = front.front_pipe(8, True, 320 * 1024, frozenset({"hw4", "u2"}))
+    assert pipe == {"hw_fp4": True}
+    assert front._pipe_suffix(pipe) == "_hw4"
     late = front.front_pipe(40, True, 320 * 1024, frozenset({"late", "u2"}))
     assert late["unroll"] == 2 and front._pipe_suffix(late) == "_late_es_u2"
 

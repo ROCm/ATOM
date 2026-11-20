@@ -761,9 +761,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # past its one barrier, three steps of tokens resident
     # (gemv_tdm.project(late)), the shared FP8 scales staged behind the first
     # copies; "lp" adds the paired late plan to 9 rows; "early" stages the FP8
-    # scales so at every width; "epi" the fused epilogue (no second barrier);
-    # "hw4" the latent's FP4 by v_cvt_scalef32_pk8_fp4_bf16; "u2" the late
-    # step loop unrolled twice. 0 keeps the previous pipeline at every width.
+    # scales so at every width; "hw4" the latent's FP4 by
+    # v_cvt_scalef32_pk8_fp4_bf16; "u2" the late step loop unrolled twice.
+    # 0 keeps the previous pipeline at every width.
     "ATOM_KIMI_MONO_FRONT_PIPE": lambda: frozenset(
         site
         for site in os.getenv("ATOM_KIMI_MONO_FRONT_PIPE", "late").split(",")

@@ -39,16 +39,7 @@ from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import (
     tdm_split_stages,
 )
 from atom.models.kimi_k3.mono.sources import SOURCES
-from atom.mono.device.ops import (
-    bf_hi,
-    bf_lo,
-    butterfly,
-    lds_bytes,
-    rsrc,
-    traced,
-    xred,
-    xshfl,
-)
+from atom.mono.device.ops import bf_hi, bf_lo, butterfly, lds_bytes, rsrc, traced
 from atom.mono.plan.architecture import GFX1250
 from atom.mono.runtime.abi import KernelAbi
 from atom.utils import envs
@@ -270,37 +261,22 @@ def _front_tasks(
         )
     gpu.barrier()
     tdm_timeline.stamp(tdm_timeline.STAGED)
-    if const_expr(pipe.get("fused")):
-        _front_epilogue_fused(
-            outputs,
-            router,
-            latent,
-            pair >= SHARED_PAIR0,
-            row0,
-            shared_column0,
-            lambda task, tile: red + (2 * tile + task) * ACCUMULATOR_WORDS,
-            tid,
-            rows,
-            tiles,
-            pipe.get("hw_fp4", False),
-        )
-    else:
-        _front_epilogue(
-            lds,
-            outputs,
-            router,
-            latent,
-            pair >= SHARED_PAIR0,
-            row0,
-            shared_column0,
-            lambda task, tile: red + (2 * tile + task) * ACCUMULATOR_WORDS,
-            WAVES,
-            None,
-            tid,
-            rows,
-            tiles,
-            pipe.get("hw_fp4", False),
-        )
+    _front_epilogue(
+        lds,
+        outputs,
+        router,
+        latent,
+        pair >= SHARED_PAIR0,
+        row0,
+        shared_column0,
+        lambda task, tile: red + (2 * tile + task) * ACCUMULATOR_WORDS,
+        WAVES,
+        None,
+        tid,
+        rows,
+        tiles,
+        pipe.get("hw_fp4", False),
+    )
     tdm_timeline.stamp(tdm_timeline.STORES_ISSUED)
     tdm_timeline.stores_done()
 
@@ -407,10 +383,6 @@ def _front_epilogue(
             )
 
 
-def _or(a, b):
-    return a | b
-
-
 @traced
 def _fp4_word(words, code, reciprocal_scale):
     """``moe_gfx1250._pack_bf16_words(words, reciprocal_scale)`` of up to four
@@ -430,125 +402,6 @@ def _fp4_word(words, code, reciprocal_scale):
     if code == 254:
         packed = moe_gfx1250._pack_bf16_words(words, reciprocal_scale)
     return packed
-
-
-@traced
-def _front_epilogue_fused(
-    outputs,
-    router,
-    latent,
-    shared,
-    row0,
-    shared_column0,
-    slot_of,
-    tid,
-    rows,
-    tiles,
-    hw_fp4=False,
-):
-    """``_front_epilogue`` without its second barrier: a round reduces one
-    tile, a token's 16 BF16 pairs (the first task's eight, then the
-    second's) in 16 lanes of one wave, so the latent group's maximum, its
-    FP4 dwords and the shared gate/up pairs cross lanes, not LDS. The same
-    sums, maxima (the integer one over a packed word's four lanes, then the
-    float one over the group's words, in ``_front_epilogue``'s lane order),
-    codes and activations: the same bits."""
-    router_logits, latent_fp4, latent_scales, shared_hidden = outputs
-    local_token = tid // ROWS
-    column_pair = tid % ROWS
-    task = column_pair // 8
-    row_pair = tid % 8
-    group = row0 // 32
-    # every tile's sums first, so their LDS reads are in flight together
-    sums = [
-        (
-            _row_sum(slot_of(task, tile), 2 * row_pair, local_token),
-            _row_sum(slot_of(task, tile), 2 * row_pair + 1, local_token),
-        )
-        for tile in range(tiles)
-    ]
-    tokens = [tile * ROWS + local_token for tile in range(tiles)]
-    live = [local_token < min(ROWS, rows - tile * ROWS) for tile in range(tiles)]
-    packed = [
-        fx.Vector.from_elements([low, high], fx.Float32)
-        .to(fx.BFloat16)
-        .bitcast(fx.Int32)[0]
-        for low, high in sums
-    ]
-    if router:
-        for tile in range_constexpr(tiles):
-            if live[tile]:
-                bo.buffer_store(
-                    fx.Vector.from_elements(list(sums[tile]), fx.Float32),
-                    rsrc(router_logits),
-                    tokens[tile] * EXPERTS + row0 + task * ROWS + 2 * row_pair,
-                )
-    if latent:
-        bits = [fx.max(p & 0x7FFF, (p >> 16) & 0x7FFF) for p in packed]
-        for off in (1, 2):
-            bits = [xred(b, off, fx.max, GFX1250) for b in bits]
-        maxima = [(b << 16).bitcast(fx.Float32) for b in bits]
-        for off in (8, 4):
-            maxima = [xred(m, off, fx.max, GFX1250) for m in maxima]
-        codes = [moe_gfx1250._e8m0_roundup(m) for m in maxima]
-        words = []
-        for tile in range_constexpr(tiles):
-            reciprocal_scale = ((fx.Int32(254) - codes[tile]) << 23).bitcast(
-                fx.Float32
-            )
-            if const_expr(hw_fp4):
-                byte = _fp4_word([packed[tile]], codes[tile], reciprocal_scale)
-            else:
-                pair = fx.Vector.from_elements([packed[tile]], fx.Int32).bitcast(
-                    fx.BFloat16
-                )
-                nibbles = [
-                    fx.Int32(
-                        moe_gfx1250._emit_f32_to_e2m1(
-                            fx.Float32(pair[half]) * reciprocal_scale
-                        )
-                    )
-                    for half in range_constexpr(2)
-                ]
-                byte = nibbles[0] | (nibbles[1] << 4)
-            words.append(byte << (column_pair % 4 * 8))
-        for off in (1, 2):
-            words = [xred(w, off, _or, GFX1250) for w in words]
-        for tile in range_constexpr(tiles):
-            if live[tile] & (column_pair == 0):
-                bo.buffer_store(
-                    fx.Int8(codes[tile]),
-                    rsrc(latent_scales),
-                    tokens[tile] * (LATENT // 32) + group,
-                )
-        for tile in range_constexpr(tiles):
-            if live[tile] & (column_pair % 4 == 0):
-                bo.buffer_store(
-                    words[tile],
-                    rsrc(latent_fp4),
-                    tokens[tile] * (LATENT // 8) + group * 4 + column_pair // 4,
-                )
-    if shared:
-        ups = [xshfl(p, 8, GFX1250) for p in packed]
-        hidden = [
-            fx.Vector.from_elements(
-                [
-                    moe_expert_gfx1250._situ(bf_lo(p), bf_lo(up)),
-                    moe_expert_gfx1250._situ(bf_hi(p), bf_hi(up)),
-                ],
-                fx.Float32,
-            )
-            .to(fx.BFloat16)
-            .bitcast(fx.Int32)[0]
-            for p, up in zip(packed, ups)
-        ]
-        for tile in range_constexpr(tiles):
-            if live[tile] & (task == 0):
-                bo.buffer_store(
-                    hidden[tile],
-                    rsrc(shared_hidden),
-                    (tokens[tile] * SHARED_COLUMNS + shared_column0) // 2 + row_pair,
-                )
 
 
 def front_split_plan(rows, fp8_shared, fp4_latent, lds_words, resident=False):
@@ -724,9 +577,9 @@ def front_pipe(
     ``LATE_MIN_ROWS`` rows where the default pipeline (``paired_default``) is
     unpaired ("ua": at any width), paired ones with "lp" if ``pairable``;
     none where no plan fits ``lds_bytes`` beside the group rows. "early":
-    ``early_scales`` at any width; "epi": the fused epilogue (``fused``);
-    "hw4": the latent's FP4 by ``_fp4_word`` (``hw_fp4``); "u2" (with a late
-    plan): the step loop unrolled twice (``unroll``). The same bits."""
+    ``early_scales`` at any width; "hw4": the latent's FP4 by ``_fp4_word``
+    (``hw_fp4``); "u2" (with a late plan): the step loop unrolled twice
+    (``unroll``). The same bits."""
     sites = envs.ATOM_KIMI_MONO_FRONT_PIPE if sites is None else sites
     pipe = {}
     if "late" in sites:
@@ -751,8 +604,6 @@ def front_pipe(
                 break
     if "early" in sites:
         pipe["early_scales"] = True
-    if "epi" in sites:
-        pipe["fused"] = True
     if "hw4" in sites:
         pipe["hw_fp4"] = True
     if pipe.get("late") and "u2" in sites:
@@ -764,7 +615,6 @@ def _pipe_suffix(pipe) -> str:
     return (
         ("_late" if pipe.get("late") else "")
         + ("_es" if pipe.get("early_scales") else "")
-        + ("_fe" if pipe.get("fused") else "")
         + ("_hw4" if pipe.get("hw_fp4") else "")
         + (f"_u{pipe['unroll']}" if pipe.get("unroll") else "")
     )
