@@ -86,6 +86,8 @@ logger = logging.getLogger("atom")
 K2_TAG0 = 128
 # the DSA layers' indexer launches, past every K2's
 IX_TAG0 = 2 * K2_TAG0
+# the recurrent state pools K1 has a build for (``KdaPreBuild.state16``)
+STATE_DTYPES = (torch.float32, torch.float16)
 
 
 def inner_model(model):
@@ -269,7 +271,8 @@ class K3MonoDecodeRunner:
                 "mono layers disagree on the recurrent state dtype: "
                 f"{sorted(map(str, dtypes))}"
             )
-        return lens.pop(), dtypes.pop() == torch.float16
+        self.state_dtypes = (dtypes.pop(),)  # the one dtype a step admits
+        return lens.pop(), self.state_dtypes[0] == torch.float16
 
     def _replay_cap(self) -> int:
         """ReplaySSM's record buffer length (its ``cache_len``), 0 without:
@@ -303,21 +306,23 @@ class K3MonoDecodeRunner:
             raise MonoUnsupported(f"mono layers disagree on ReplaySSM: {sorted(caps)}")
         return caps.pop()
 
-    def _recurrent_state(self, layer_id: int) -> torch.Tensor:
+    def _recurrent_state(self, layer_id: int, dtypes=STATE_DTYPES) -> torch.Tensor:
         """The layer's KDA recurrent state, checked.
 
         `config_refusal` checks `ATOM_GDN_SSM_DTYPE`, which is the *request*;
         this is the pool that was actually allocated. The recurrence reads and
         writes it in place as fp32, or as fp16 under ``state16`` (widened to
         fp32 on load, rounded to nearest on every store), so any other dtype is
-        reinterpreted rather than converted -- wrong numbers, no error.
+        reinterpreted rather than converted -- wrong numbers, no error. A step
+        admits only ``state_dtypes``: K1 reads the pool at the element size its
+        build was made for.
         """
         cache = get_forward_context().kv_cache_data[f"layer_{layer_id}"]
         state = cache.v_cache
-        if state.dtype not in (torch.float32, torch.float16):
+        if state.dtype not in dtypes:
             raise MonoUnsupported(
-                f"layer {layer_id}: recurrent state {state.dtype}, the "
-                "recurrence reads it in place as float32 or float16"
+                f"layer {layer_id}: recurrent state {state.dtype}, K1 is built "
+                f"for {' or '.join(map(str, dtypes))}"
             )
         return state
 
@@ -623,12 +628,7 @@ class K3MonoDecodeRunner:
                 f"layer {plan.layer_id}: conv window {state.size(-1)} != the "
                 f"built {key.state_len}"
             )
-        rstate = self._recurrent_state(plan.layer_id)
-        if (rstate.dtype == torch.float16) != key.state16:
-            raise MonoUnsupported(
-                f"layer {plan.layer_id}: recurrent state {rstate.dtype} != the "
-                f"built {torch.float16 if key.state16 else torch.float32}"
-            )
+        rstate = self._recurrent_state(plan.layer_id, self.state_dtypes)
         slots, accepted = state_slots(metadata, self.ones)
         core = prefix.new_empty(prefix.size(0), self.dims.proj)
         p = torch.Tensor.data_ptr

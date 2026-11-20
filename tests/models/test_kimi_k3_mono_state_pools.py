@@ -131,21 +131,23 @@ def _past_the_checks(*_):
     raise _PastTheChecks
 
 
-@pytest.mark.parametrize("state16", [False, True])
+@pytest.mark.parametrize("built", [torch.float32, torch.float16])
 @pytest.mark.parametrize("rec", [torch.float32, torch.float16])
-def test_a_step_takes_only_the_pool_its_build_was_made_for(monkeypatch, rec, state16):
-    # K1 reads the pool at the element size its key was built for, so `_k1`
-    # checks the dtype against the key, as it checks the window; `state_slots`
-    # is the first thing it does past the checks
-    runner = _runner(monkeypatch, {lid: _pools(rec=rec) for lid in range(4)})
+def test_a_step_takes_only_the_pool_its_build_was_made_for(monkeypatch, rec, built):
+    # K1 reads the pool at the element size bind built it for, so `_k1` admits
+    # only bind's dtype; `state_slots` is the first thing it does past the checks
+    caches = {lid: _pools(rec=built) for lid in range(4)}
+    runner = _runner(monkeypatch, caches)
+    runner._state_constants()
+    caches.update({lid: _pools(rec=rec) for lid in range(4)})
     runner.ones = None
     monkeypatch.setattr(runner_mod, "state_slots", _past_the_checks)
-    key = namedtuple("Key", "state_len state16")(WINDOW, state16)
+    key = namedtuple("Key", "state_len")(WINDOW)
     build = SimpleNamespace(k1_keys={1: key}, k1_launchers={key: None})
     plan = SimpleNamespace(layer_id=1, kda=None)
-    if (rec == torch.float16) == state16:
+    if rec == built:
         with pytest.raises(_PastTheChecks):
             runner._k1(build, plan, None, None, None, None)
     else:
-        with pytest.raises(MonoUnsupported, match="recurrent state .* != the built"):
+        with pytest.raises(MonoUnsupported, match=f"{rec}, K1 is built for {built}$"):
             runner._k1(build, plan, None, None, None, None)
