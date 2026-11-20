@@ -42,7 +42,6 @@ pub(crate) struct Pipeline {
     backend_label: &'static str,
 }
 
-#[cfg(test)]
 impl Pipeline {
     pub(crate) fn with_injected(
         planner: Arc<dyn PdPlanner>,

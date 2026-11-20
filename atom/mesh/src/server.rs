@@ -41,6 +41,7 @@ use crate::{
         worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
     },
     routers::{
+        atom_bridge::AtomBridgeRuntime,
         atom_standalone::AtomStandaloneRuntime,
         comm::{conversations, parse, tokenize},
         ingress::EndpointSpec,
@@ -364,6 +365,7 @@ pub struct ServerConfig {
     pub shutdown_grace_period_secs: u64,
     pub tls: Option<ServerTlsConfig>,
     pub atom_standalone_runtime: Option<Arc<AtomStandaloneRuntime>>,
+    pub atom_bridge_runtime: Option<Arc<AtomBridgeRuntime>>,
 }
 
 pub fn build_app(
@@ -561,6 +563,7 @@ async fn serve_with_prepare_pool(
         .await?
         .prepare_pool(prepare_pool)
         .atom_standalone_runtime(config.atom_standalone_runtime.clone())
+        .atom_bridge_runtime(config.atom_bridge_runtime.clone())
         .build()
         .map_err(|e| e.to_string())?,
     );
@@ -606,9 +609,15 @@ async fn serve_with_prepare_pool(
             .get()
             .expect("JobQueue should be initialized");
 
+        // The Rust frontend prepares every request for the one served model,
+        // by that name.
+        let name = config
+            .atom_bridge_runtime
+            .as_ref()
+            .map_or_else(|| tokenizer_source.clone(), |r| r.served_model_name.clone());
         let tokenizer_config = TokenizerConfigRequest {
             id: TokenizerRegistry::generate_id(),
-            name: tokenizer_source.clone(),
+            name,
             source: tokenizer_source.clone(),
             chat_template_path: config.router_config.chat_template.clone(),
             cache_config: config.router_config.tokenizer_cache.to_option(),

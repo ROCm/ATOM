@@ -40,6 +40,9 @@ class StandaloneArgs:
     engine_args: argparse.Namespace
     mesh_args: list[str]
     default_chat_template_kwargs: dict[str, Any]
+    # "python": the OpenAI API in Python (AtomStandaloneService).
+    # "rust": the OpenAI API in Rust, down to LLMEngine (TokenBridge).
+    frontend: str = "python"
 
 
 def import_atomesh_runner() -> Any:
@@ -118,6 +121,29 @@ def initialize_standalone_service(
         default_chat_template_kwargs=default_chat_template_kwargs,
         tool_call_parser=getattr(args, "tool_call_parser", None),
     )
+
+
+def initialize_token_bridge(atomesh_runner: Any) -> Any:
+    from atom.entrypoints.atomesh.token_bridge import TokenBridge
+
+    return TokenBridge(engine=engine, sink=atomesh_runner.StepSink())
+
+
+def served_model_name(args: argparse.Namespace) -> str:
+    return getattr(args, "served_model_name", None) or args.model
+
+
+def rust_frontend_mesh_args(
+    args: argparse.Namespace, mesh_args: list[str]
+) -> list[str]:
+    """The Rust frontend tokenizes, so the router loads the model's tokenizer
+    unless it was told where one is."""
+    if any(
+        arg.split("=", 1)[0] in ("--model-path", "--tokenizer-path")
+        for arg in mesh_args
+    ):
+        return mesh_args
+    return [*mesh_args, "--model-path", args.model]
 
 
 def split_standalone_mesh_args(raw_args: list[str]) -> tuple[list[str], list[str]]:
@@ -204,6 +230,17 @@ def parse_standalone_args(raw_args: list[str]) -> StandaloneArgs:
         help=TOOL_CALL_PARSER_HELP,
     )
     parser.add_argument(
+        "--frontend",
+        choices=("python", "rust"),
+        default="python",
+        help=(
+            "Who serves the OpenAI API. python: ATOM's own service, as the "
+            "OpenAI server does. rust: the mesh router renders, tokenizes and "
+            "detokenizes, and hands token ids to LLMEngine "
+            "(docs/atomesh_rust_frontend.md)."
+        ),
+    )
+    parser.add_argument(
         "--default-chat-template-kwargs",
         type=json_object_arg,
         default=None,
@@ -239,12 +276,14 @@ def parse_standalone_args(raw_args: list[str]) -> StandaloneArgs:
         )
         engine_args.tool_call_parser = None
 
+    mesh_args = mesh_args + mesh_network_args + _forward_tool_call_parser(forwarded)
+    if engine_args.frontend == "rust":
+        mesh_args = rust_frontend_mesh_args(engine_args, mesh_args)
     return StandaloneArgs(
         engine_args=engine_args,
-        mesh_args=(
-            mesh_args + mesh_network_args + _forward_tool_call_parser(forwarded)
-        ),
+        mesh_args=mesh_args,
         default_chat_template_kwargs=engine_args.default_chat_template_kwargs or {},
+        frontend=engine_args.frontend,
     )
 
 
@@ -253,10 +292,18 @@ def launch_atom_standalone(atomesh_runner: Any, raw_args: list[str]) -> None:
     parsed_args = atomesh_runner.parse_from(standalone_args.mesh_args)
     cli_args = parsed_args["cli_args"]
     initialize_engine(standalone_args.engine_args)
-    standalone_service = initialize_standalone_service(
-        standalone_args.engine_args,
-        standalone_args.default_chat_template_kwargs,
-    )
+    if standalone_args.frontend == "rust":
+        frontend = {
+            "token_bridge": initialize_token_bridge(atomesh_runner),
+            "served_model_name": served_model_name(standalone_args.engine_args),
+        }
+    else:
+        frontend = {
+            "standalone_service": initialize_standalone_service(
+                standalone_args.engine_args,
+                standalone_args.default_chat_template_kwargs,
+            )
+        }
 
     # This frontend is the api_server's counterpart -- same tokenizer, same
     # per-request accumulators -- but it builds its engine itself and never
@@ -267,10 +314,7 @@ def launch_atom_standalone(atomesh_runner: Any, raw_args: list[str]) -> None:
 
     print("\033[32mATOM starting...\033[0m")
     print(f"\033[32mHost: {cli_args['host']}:{cli_args['port']}\033[0m")
-    atomesh_runner.launch_mesh(
-        server_config=parsed_args["server_config"],
-        standalone_service=standalone_service,
-    )
+    atomesh_runner.launch_mesh(server_config=parsed_args["server_config"], **frontend)
 
 
 def launch_atomesh(atomesh_runner: Any, raw_args: list[str]) -> None:

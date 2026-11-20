@@ -13,7 +13,7 @@ use crate::{
     config::{PolicyConfig, RoutingMode},
     core::ConnectionMode,
     policies::PolicyFactory,
-    routers::atom_standalone::AtomStandaloneRouter,
+    routers::{atom_bridge::AtomBridgeRouter, atom_standalone::AtomStandaloneRouter},
 };
 
 /// Factory for creating router instances based on configuration
@@ -75,6 +75,9 @@ impl RouterFactory {
     pub async fn create_atom_standalone_router(
         ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
+        if let Some(runtime) = &ctx.atom_bridge_runtime {
+            return Ok(Box::new(AtomBridgeRouter::new(ctx, Arc::clone(runtime))?));
+        }
         let runtime = ctx
             .atom_standalone_runtime
             .as_ref()

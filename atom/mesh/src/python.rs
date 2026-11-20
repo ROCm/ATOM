@@ -10,7 +10,10 @@ use crate::{
     },
     config::RoutingMode,
     core::runtime::build_runtime,
-    routers::atom_standalone::AtomStandaloneRuntime,
+    routers::{
+        atom_bridge::{py_bridge::StepSink, AtomBridgeRuntime},
+        atom_standalone::AtomStandaloneRuntime,
+    },
     server::{self, ServerConfig},
     version,
 };
@@ -55,23 +58,42 @@ impl PyServerConfig {
 #[pyo3(signature = (
     *,
     server_config,
-    standalone_service = None
+    standalone_service = None,
+    token_bridge = None,
+    served_model_name = None
 ))]
 pub fn launch_mesh(
     py: Python<'_>,
     mut server_config: PyRefMut<'_, PyServerConfig>,
     standalone_service: Option<Py<PyAny>>,
+    token_bridge: Option<Bound<'_, PyAny>>,
+    served_model_name: Option<String>,
 ) -> PyResult<()> {
+    if standalone_service.is_some() && token_bridge.is_some() {
+        return Err(PyRuntimeError::new_err(
+            "pass standalone_service or token_bridge, not both",
+        ));
+    }
     let runtime = standalone_service.map(|service| {
         Arc::new(AtomStandaloneRuntime {
             service,
             close_service_on_shutdown: false,
         })
     });
+    let bridge_runtime = match token_bridge {
+        Some(bridge) => {
+            let name = served_model_name.ok_or_else(|| {
+                PyRuntimeError::new_err("token_bridge requires served_model_name")
+            })?;
+            Some(Arc::new(AtomBridgeRuntime::from_bridge(bridge, name)?))
+        }
+        None => None,
+    };
 
     let mut server_config = server_config.inner.take().unwrap();
-    server_config.router_config.atom_standalone = runtime.is_some();
+    server_config.router_config.atom_standalone = runtime.is_some() || bridge_runtime.is_some();
     server_config.atom_standalone_runtime = runtime;
+    server_config.atom_bridge_runtime = bridge_runtime;
 
     py.detach(move || startup_runtime(server_config))
 }
@@ -259,6 +281,7 @@ pub fn version_verbose_string() -> String {
 #[pymodule]
 pub fn atomesh_runner(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyServerConfig>()?;
+    m.add_class::<StepSink>()?;
     m.add_function(wrap_pyfunction!(launch_mesh, m)?)?;
     m.add_function(wrap_pyfunction!(parse_from, m)?)?;
     m.add_function(wrap_pyfunction!(cliargs_backend_name, m)?)?;
