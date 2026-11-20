@@ -92,25 +92,44 @@ def test_offset_slices_match_their_copies(tokens):
         _assert_bitwise(_call(inputs, view, 2, True, True), want)
 
 
+@pytest.mark.parametrize("backend", ["triton", "tdm"])
 @torch.inference_mode()
-def test_the_kernel_reads_the_bank_in_place(monkeypatch):
+def test_the_kernel_reads_the_bank_in_place(monkeypatch, backend):
     # what the guard is for: the launch gets the slice itself, not a copy of it
-    kernel = attention_residual._attn_res_fused_kernel
-    launched = []
+    monkeypatch.setitem(
+        attention_residual.envs.environment_variables,
+        "ATOM_KIMI_K3_ATTN_RES_GLUON_TDM",
+        lambda: backend == "tdm",
+    )
+    attention_residual._attn_res_tdm_module.cache_clear()
+    try:
+        tdm = attention_residual._attn_res_tdm_module()
+        if backend == "tdm" and tdm is None:
+            pytest.skip("Gluon TDM attn-res needs gfx1250 and the CDNA5 TDM API")
+        launched = []
 
-    class Recorder:
-        def __getitem__(self, grid):
+        def record(name, launcher):
             def launch(br, *args, **kwargs):
-                launched.append((br.data_ptr(), br.stride()))
-                return kernel[grid](br, *args, **kwargs)
+                launched.append((name, br.data_ptr(), br.stride()))
+                return launcher(br, *args, **kwargs)
 
             return launch
 
-    monkeypatch.setattr(attention_residual, "_attn_res_fused_kernel", Recorder())
-    x = _inputs(16, 20261032)
-    view = x["bank"][:, :3]
-    _call(x, view, 2, True, False)
-    assert launched == [(view.data_ptr(), view.stride())]
+        monkeypatch.setattr(
+            attention_residual,
+            "_launch_attn_res_triton",
+            record("triton", attention_residual._launch_attn_res_triton),
+        )
+        if tdm is not None:
+            monkeypatch.setattr(
+                tdm, "launch_attn_res_tdm", record("tdm", tdm.launch_attn_res_tdm)
+            )
+        x = _inputs(16, 20261032)
+        view = x["bank"][:, :3]
+        _call(x, view, 2, True, False)
+        assert launched == [(backend, view.data_ptr(), view.stride())]
+    finally:
+        attention_residual._attn_res_tdm_module.cache_clear()
 
 
 @torch.inference_mode()
