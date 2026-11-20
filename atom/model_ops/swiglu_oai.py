@@ -423,9 +423,9 @@ def swiglu_oai_split_mxfp8(
         (rows, groups), dtype=torch.float8_e8m0fnu, device=gate_up.device
     )
 
-    # Two 512-value tiles per row at I=768 retained the eager gain while
-    # avoiding any >1% regression across the eligible captured shapes.
-    block_groups = 16
+    # Dense I=3072 benefits from wider 1024-value tiles; the shared I=768 path
+    # retains its tuned 512-value tiles.
+    block_groups = 32 if groups >= 96 else 16
     _swiglu_oai_mxfp8_kernel[(rows, triton.cdiv(groups, block_groups))](
         gate_up,
         out,
