@@ -1011,6 +1011,8 @@ class Scheduler:
         # Set by `_can_admit_head_prefill`: it found nothing to admit, and only
         # because the requests it reached are mid-copy.
         self._prefill_arriving = False
+        # Consecutive ticks this rank reported that to the delayer.
+        self._arriving_ticks = 0
         # (seq id, prompt tokens reused) of requests `share_cache` routing placed
         # on an estimated prefix, for the CoreManager (`_note_dp_reuse`).
         self.dp_reuse_reports: list[tuple] = []
@@ -2345,6 +2347,13 @@ class Scheduler:
                 prefill_arriving = (
                     self._pool_copy_holds_prefill and self._prefill_arriving
                 )
+                # A copy lands within a step or two. One that does not is not
+                # worth the group's wait: the rank is blocked, as before.
+                self._arriving_ticks = (
+                    self._arriving_ticks + 1 if prefill_arriving else 0
+                )
+                if self._arriving_ticks > self._ARRIVING_MAX_TICKS:
+                    prefill_arriving = False
                 pending_tokens = min(
                     self._waiting_new_token_count()
                     + self._partial_prefill_remaining_tokens(),
@@ -4383,6 +4392,9 @@ class Scheduler:
     # How many copies from other ranks' pools one tick may start (each asks the
     # pool's server what it holds and for destination blocks).
     _EARLY_COPY_PER_TICK = 8
+    # How many ticks in a row the group holds its prefill for this rank's
+    # copies in flight.
+    _ARRIVING_MAX_TICKS = 8
 
     def _early_copy_shared_prefixes(self) -> int:
         """Start copying in the prefixes other ranks' pools hold for waiting

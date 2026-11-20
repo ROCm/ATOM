@@ -131,6 +131,18 @@ def test_one_tick_starts_a_bounded_number_of_copies(monkeypatch, seq_factory):
     assert pool.asked == [seq.id for seq in seqs]
 
 
+def test_group_stops_holding_for_a_copy_that_does_not_land(monkeypatch, seq_factory):
+    monkeypatch.setattr(Scheduler, "_ARRIVING_MAX_TICKS", 2)
+    sched, delayer, _, _ = _make(monkeypatch, seq_factory)
+
+    held = []
+    for _ in range(4):
+        sched.schedule()
+        held.append(delayer.seen[-1]["prefill_arriving"])
+
+    assert held == [True, True, False, False]
+
+
 def test_hold_can_be_switched_off_and_the_rank_then_counts_as_blocked(
     monkeypatch, seq_factory
 ):
