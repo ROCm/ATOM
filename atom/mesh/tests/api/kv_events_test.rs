@@ -427,14 +427,15 @@ fn stored(hashes: &[u64], tokens: &[u32]) -> Bytes {
 /// worker, whatever the tree learned: its `input_ids`, or its prompt or chat encoded with
 /// the special tokens, as ATOM stores the blocks. One with media is placed by its text.
 /// What the engine will load of the request from the store the worker reads, which counts
-/// with `--kv-storage-weight`, is asked of the store by ATOM's keys.
+/// with `--kv-storage-weight`, is asked of the store by ATOM's keys. The store is tainted,
+/// so it holds nothing and only the device cache can place a request.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cache_aware_places_requests_by_the_kv_event_index() {
     let mut publisher = PubSocket::new();
     let bound = publisher.bind("tcp://127.0.0.1:0").await.unwrap();
     let port = bound.to_string().rsplit_once(':').unwrap().1.to_string();
     let asked = Arc::new(Mutex::new(Vec::new()));
-    let admin_port = mooncake_admin(Arc::default(), asked.clone()).await;
+    let admin_port = mooncake_admin(Arc::new(AtomicBool::new(true)), asked.clone()).await;
     // ATOM's chain_check of chunks of 2 tokens.
     let offload = json!({"backend": "mooncake_store", "masters": ["127.0.0.1:50051"],
         "namespace": "atomkv1-0123456789abcdef01234567", "chunk_tokens": 2, "world": 1,
@@ -506,8 +507,8 @@ async fn cache_aware_places_requests_by_the_kv_event_index() {
     for _ in 0..4 {
         assert_eq!(served_by(&app, "/generate", &request).await, workers[0].2);
     }
-    // The store may hold the rest, but for the last token: ATOM's keys of the request's
-    // 6 chunks at rank 0, from its keys.py, and the taint key.
+    // The store is asked for the rest, but for the last token: ATOM's keys of the
+    // request's 6 chunks at rank 0, from its keys.py, and the taint key.
     let keys = [
         "27fbf4f34f6a83d0823cd5a524cc26b6",
         "860ba8237adce06b477e78dfcfbe4447",

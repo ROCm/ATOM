@@ -280,7 +280,8 @@ pub struct CliArgs {
     pub mooncake_admin_port: u16,
 
     /// With --kv-storage-weight, how long a request waits for the stores its workers load
-    /// from to say what they hold of the prompt, in milliseconds; later answers are dropped
+    /// from to say what they hold of the prompt, in milliseconds. Past it a store's lookup
+    /// has no answer at all, and counts toward the store's breaker
     #[arg(long, default_value_t = 3, help_heading = "Routing Policy")]
     pub kv_storage_deadline_ms: u64,
 
