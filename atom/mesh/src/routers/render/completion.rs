@@ -19,6 +19,7 @@ use serde::Serialize;
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
@@ -241,10 +242,12 @@ impl DeltaFrame {
 fn decode(decoder: &mut StopSequenceDecoder, tokens: &[u32]) -> (String, bool) {
     let mut text = String::new();
     for &token in tokens {
-        match decoder
-            .process_token(token)
-            .unwrap_or(SequenceDecoderOutput::Held)
-        {
+        let output = decoder.process_token(token).unwrap_or_else(|e| {
+            // Dropped, as a held token is; said, not swallowed.
+            warn!("completion token {token} does not decode: {e}");
+            SequenceDecoderOutput::Held
+        });
+        match output {
             SequenceDecoderOutput::Text(t) => text.push_str(&t),
             SequenceDecoderOutput::StoppedWithText(t) => {
                 text.push_str(&t);
@@ -261,7 +264,6 @@ fn decode(decoder: &mut StopSequenceDecoder, tokens: &[u32]) -> (String, bool) {
 fn openai_finish_reason(reason: &FinishReason) -> &'static str {
     match reason {
         FinishReason::Length => "length",
-        FinishReason::Abort => "abort",
         _ => "stop",
     }
 }

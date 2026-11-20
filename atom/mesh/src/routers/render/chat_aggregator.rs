@@ -13,7 +13,9 @@ use crate::{
         chat::{ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse},
         common::{FunctionCallResponse, ToolCall, ToolChoice, ToolChoiceValue, Usage},
     },
-    reasoning_parser::{ParserFactory as ReasoningParserFactory, ParserResult},
+    reasoning_parser::{
+        ParseError, ParserFactory as ReasoningParserFactory, ParserResult, ReasoningParser,
+    },
     routers::{
         comm::error,
         prepare::{
@@ -211,13 +213,12 @@ async fn process_choice(
         .process_tokens(token_ids)
         .map_err(|e| format!("Failed to process tokens: {}", e))?;
 
-    // The decoded pieces, as a streamed reply would carry them.
-    let mut pieces = Vec::new();
+    let mut final_text = String::new();
     for output in outputs {
         match output {
-            SequenceDecoderOutput::Text(t) => pieces.push(t),
+            SequenceDecoderOutput::Text(t) => final_text.push_str(&t),
             SequenceDecoderOutput::StoppedWithText(t) => {
-                pieces.push(t);
+                final_text.push_str(&t);
                 break;
             }
             SequenceDecoderOutput::Stopped => break,
@@ -225,9 +226,8 @@ async fn process_choice(
         }
     }
     if let SequenceDecoderOutput::Text(t) = stop_decoder.flush() {
-        pieces.push(t);
+        final_text.push_str(&t);
     }
-    let final_text = pieces.concat();
 
     let mut reasoning_text: Option<String> = None;
     let mut processed_text = final_text;
@@ -238,7 +238,6 @@ async fn process_choice(
                 factory,
                 configured_reasoning_parser,
                 &chat_request.model,
-                &pieces,
                 &processed_text,
                 prompt_opens_reasoning,
             )
@@ -319,22 +318,16 @@ async fn process_choice(
     })
 }
 
-/// Every reasoning parser's `max_buffer_size`: `detect_and_parse_reasoning`
-/// refuses a longer text outright.
-const ONE_SHOT_MAX_BYTES: usize = 65536;
-
-/// A whole reply (`text`, decoded as `pieces`) split into content and
-/// reasoning; `prompt_opens_reasoning` puts the prompt's opener before it.
+/// A whole reply split into content and reasoning; `prompt_opens_reasoning`
+/// puts the prompt's opener before it.
 ///
-/// A reply the one-shot parse would refuse goes through a fresh parser's
-/// streaming path a piece at a time, as a streamed reply does, so its buffer
-/// holds only what one piece leaves pending; the result is trimmed as the
-/// one-shot parse trims it.
+/// `detect_and_parse_reasoning` refuses a text over the parser's
+/// `max_buffer_size` (64 KiB, counting an opener the parser adds itself, as
+/// MiniMax's does); such a reply is split by [`split_in_pieces`] instead.
 async fn split_reasoning(
     factory: &ReasoningParserFactory,
     configured: Option<&str>,
     model: &str,
-    pieces: &[String],
     text: &str,
     prompt_opens_reasoning: bool,
 ) -> Result<ParserResult, String> {
@@ -343,18 +336,41 @@ async fn split_reasoning(
         Some(opener) => format!("{opener}{text}").into(),
         None => text.into(),
     };
-    if opened.len() <= ONE_SHOT_MAX_BYTES {
+    {
         let pooled = get_reasoning_parser(factory, configured, model);
         let mut parser = pooled.lock().await;
-        return parser
-            .detect_and_parse_reasoning(&opened)
-            .map_err(|e| e.to_string());
+        match parser.detect_and_parse_reasoning(&opened) {
+            Err(ParseError::BufferOverflow(_)) => {}
+            result => return result.map_err(|e| e.to_string()),
+        }
     }
-    let Some(mut parser) = create_reasoning_parser(factory, configured, model) else {
-        return Ok(ParserResult::normal(text.to_string()));
-    };
+    match create_reasoning_parser(factory, configured, model) {
+        Some(mut parser) => split_in_pieces(parser.as_mut(), &opened),
+        None => Ok(ParserResult::normal(text.to_string())),
+    }
+}
+
+/// The most a piece of [`split_in_pieces`] holds, well under any parser's
+/// `max_buffer_size`.
+const PIECE_MAX_BYTES: usize = 32 * 1024;
+
+/// A `<` this close to the end with no `>` after it may be a tag cut short:
+/// it stays on the piece before it.
+const TAG_TAIL_BYTES: usize = 16;
+
+/// `detect_and_parse_reasoning` for a text of any length, through a fresh
+/// `parser`'s streaming path a piece at a time.
+///
+/// Each `<` starts a piece, so the parser reads every tag whole and at the
+/// head of its piece: the streaming path trims the reasoning before a closer
+/// in the same piece, which here is none. A `<` in the last
+/// [`TAG_TAIL_BYTES`] with no `>` after it stays on the piece before, or the
+/// parser would hold it back as a tag's prefix and drop it. The result is
+/// then trimmed as the one-shot parse trims: reasoning after the opener, to
+/// the end if no closer follows, and the content after the closer.
+fn split_in_pieces(parser: &mut dyn ReasoningParser, text: &str) -> Result<ParserResult, String> {
     let (mut normal, mut reasoning, mut entered) = (String::new(), String::new(), false);
-    for piece in opener.into_iter().chain(pieces.iter().map(String::as_str)) {
+    for piece in reasoning_pieces(text) {
         let result = parser
             .parse_reasoning_streaming_incremental(piece)
             .map_err(|e| e.to_string())?;
@@ -366,7 +382,6 @@ async fn split_reasoning(
         // The one-shot parse hands back a reply without reasoning untouched.
         return Ok(ParserResult::normal(text.to_string()));
     }
-    // It trims the text after the opener, and then what follows the closer.
     let reasoning = if parser.is_in_reasoning() {
         reasoning.trim()
     } else {
@@ -376,6 +391,35 @@ async fn split_reasoning(
         normal.trim().to_string(),
         reasoning.to_string(),
     ))
+}
+
+/// `text` cut before each `<` (but one in a short unclosed tail), and every
+/// piece longer than [`PIECE_MAX_BYTES`] cut again at a char boundary.
+fn reasoning_pieces(text: &str) -> Vec<&str> {
+    let tail_start = text.len().saturating_sub(TAG_TAIL_BYTES);
+    let mut cuts: Vec<usize> = text
+        .match_indices('<')
+        .map(|(at, _)| at)
+        .filter(|&at| at > 0 && (at < tail_start || text[at..].contains('>')))
+        .collect();
+    cuts.push(text.len());
+    let mut pieces = Vec::with_capacity(cuts.len());
+    let mut start = 0;
+    for cut in cuts {
+        while cut - start > PIECE_MAX_BYTES {
+            let mut end = start + PIECE_MAX_BYTES;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            pieces.push(&text[start..end]);
+            start = end;
+        }
+        if cut > start {
+            pieces.push(&text[start..cut]);
+        }
+        start = cut;
+    }
+    pieces
 }
 
 async fn parse_tool_calls(
@@ -448,5 +492,70 @@ fn finish_reason_to_str(r: &FinishReason) -> &'static str {
         FinishReason::ToolCalls => "tool_calls",
         FinishReason::Abort => "abort",
         FinishReason::Other(_) => "stop",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parser(name: &str) -> Box<dyn ReasoningParser> {
+        ReasoningParserFactory::new()
+            .registry()
+            .create_parser(name)
+            .unwrap()
+    }
+
+    /// Under 64 KiB both parses run: the piecewise one says what the
+    /// one-shot one says, tags, whitespace, a dangling `<` and pieces cut
+    /// inside multi-byte text alike.
+    #[test]
+    fn the_piecewise_split_matches_the_one_shot_parse() {
+        let long_reasoning = format!(
+            "<think>{}</think>\n\n{}",
+            "héllo wörld, 1 < 2 ".repeat(2000),
+            "answer ".repeat(10)
+        );
+        let many_tags = format!("<think>{}</think>c <", "a<b> c</b ".repeat(3000));
+        let texts = [
+            "plain answer",
+            "x < y and z > w",
+            "<think>a b</think> answer",
+            "<think>\n  reasoning with spaces \n</think>\n\n answer  ",
+            "<think>unclosed reasoning  ",
+            "<think>r</think>answer with <b>html</b> and a < b",
+            "<think>r</think>ends with <",
+            "<think>r</think>ends with </",
+            "<think>r <maybe a tag> more</think> x",
+            "<think>word</think>",
+            "reasoning only, the opener in the prompt</think>answer",
+            &long_reasoning,
+            &many_tags,
+        ];
+        for name in ["qwen3", "glm45", "deepseek_r1", "minimax"] {
+            for text in texts {
+                assert!(text.len() < 60_000, "{}", text.len());
+                let one_shot = parser(name).detect_and_parse_reasoning(text).unwrap();
+                let pieces = split_in_pieces(parser(name).as_mut(), text).unwrap();
+                let short = &text[..text.len().min(60)];
+                assert_eq!(
+                    (pieces.normal_text, pieces.reasoning_text),
+                    (one_shot.normal_text, one_shot.reasoning_text),
+                    "{name}: {short:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pieces_start_at_tags_and_stay_under_the_cap() {
+        let text = format!("a<think>b</think>{}<x", "é".repeat(PIECE_MAX_BYTES));
+        let pieces = reasoning_pieces(&text);
+        assert_eq!(pieces.concat(), text);
+        assert_eq!(&pieces[..2], ["a", "<think>b"]);
+        assert!(pieces[2].starts_with("</think>é"));
+        assert!(pieces.iter().all(|p| p.len() <= PIECE_MAX_BYTES));
+        // The unclosed `<x` at the end stays on the piece before it.
+        assert!(pieces.last().unwrap().ends_with("é<x"));
     }
 }

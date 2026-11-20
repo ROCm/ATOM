@@ -26,6 +26,7 @@ const MODEL: &str = "tiny";
 const HELLO: i32 = 1;
 const WORLD: i32 = 2;
 const THINK_END: i32 = 7;
+const LT: i32 = 8;
 
 /// The chat template: `role: content` lines, ending on `assistant:`.
 const TEMPLATE: &str = "{% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}\
@@ -51,7 +52,7 @@ fn write_tokenizer(dir: &std::path::Path, chat_template: &str) -> String {
             "type": "WordLevel",
             "vocab": {
                 "<unk>": 0, "hello": HELLO, "world": WORLD, "user": 3, "assistant": 4, ":": 5,
-                "<think>": 6, "</think>": THINK_END,
+                "<think>": 6, "</think>": THINK_END, "<": LT,
             },
             "unk_token": "<unk>",
         },
@@ -78,6 +79,15 @@ impl Served {
 
     /// One Core behind a template whose generation prompt opens `<think>`,
     /// as GLM-5.x and Qwen3.5 do, read by the qwen3 reasoning parser.
+    /// One Core behind the plain template, its replies read by `parser`.
+    async fn reasoning_with(parser: &str) -> Self {
+        let config = RouterConfig {
+            reasoning_parser: Some(parser.into()),
+            ..Default::default()
+        };
+        Self::serve(1, TEMPLATE, config).await
+    }
+
     async fn thinking() -> Self {
         let template = "{% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}\
                         {% if add_generation_prompt %}assistant: <think>\n{% endif %}";
@@ -130,15 +140,18 @@ impl Served {
             http::header::CONTENT_TYPE,
             http::HeaderValue::from_static("application/json"),
         );
-        let request = crate::routers::ingress::InferenceEnvelope::parse(
+        match crate::routers::ingress::InferenceEnvelope::parse(
             path.parse().unwrap(),
             headers,
             body.to_string().into(),
             &self.router.ctx,
         )
         .await
-        .unwrap_or_else(|e| panic!("{path}: {e:?}"));
-        self.router.route_inference(request, &self.router.ctx).await
+        {
+            Ok(request) => self.router.route_inference(request, &self.router.ctx).await,
+            // Refused on the way in, as the server answers it.
+            Err(e) => e.response(path),
+        }
     }
 }
 
@@ -180,10 +193,6 @@ async fn json_body(response: Response) -> (StatusCode, Value) {
     (status, body)
 }
 
-fn chat(body: Value) -> crate::protocols::chat::ChatCompletionRequest {
-    serde_json::from_value(body).unwrap()
-}
-
 fn user_hello(extra: Value) -> Value {
     let mut body = json!({"model": MODEL, "messages": [{"role": "user", "content": "hello"}]});
     body.as_object_mut()
@@ -197,8 +206,7 @@ async fn a_chat_is_prepared_submitted_and_rendered() {
     let mut served = Served::start(1).await;
     let core = answer_each(std::mem::take(&mut served.cores), hello_world);
     let response = served
-        .router
-        .route_chat(None, &chat(user_hello(json!({}))), None)
+        .post("/v1/chat/completions", user_hello(json!({})))
         .await;
     let (_, specs, data) = core.into_iter().next().unwrap().join().unwrap();
 
@@ -227,8 +235,7 @@ async fn a_streamed_chat_ends_on_done() {
     let mut served = Served::start(1).await;
     let core = answer_each(std::mem::take(&mut served.cores), hello_world);
     let response = served
-        .router
-        .route_chat(None, &chat(user_hello(json!({"stream": true}))), None)
+        .post("/v1/chat/completions", user_hello(json!({"stream": true})))
         .await;
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
@@ -262,8 +269,12 @@ async fn a_streamed_chat_ends_on_done() {
 async fn siblings_run_on_both_ranks_and_count_the_prompt_once() {
     let mut served = Served::start(2).await;
     let cores = answer_each(std::mem::take(&mut served.cores), hello_world);
-    let request = chat(user_hello(json!({"n": 2, "temperature": 1.0})));
-    let response = served.router.route_chat(None, &request, None).await;
+    let response = served
+        .post(
+            "/v1/chat/completions",
+            user_hello(json!({"n": 2, "temperature": 1.0})),
+        )
+        .await;
     for core in cores {
         let (_, specs, _) = core.join().unwrap();
         assert_eq!(specs.len(), 1, "one sibling a rank");
@@ -307,8 +318,7 @@ async fn a_rejection_answers_with_its_codes_status() {
             }
         });
         let response = served
-            .router
-            .route_chat(None, &chat(user_hello(json!({}))), None)
+            .post("/v1/chat/completions", user_hello(json!({})))
             .await;
         drop(core.join().unwrap());
         let (got, body) = json_body(response).await;
@@ -320,18 +330,17 @@ async fn a_rejection_answers_with_its_codes_status() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_data_parallel_rank_is_where_the_request_runs() {
     let mut served = Served::start(2).await;
-    let generate = |rank: i64| -> crate::protocols::generate::GenerateRequest {
-        serde_json::from_value(json!({
+    let generate = |rank: i64| {
+        json!({
             "model": MODEL,
             "input_ids": [HELLO],
             "data_parallel_rank": rank,
-        }))
-        .unwrap()
+        })
     };
     let rank1 = served.cores.pop().unwrap();
     let rank0 = served.cores.pop().unwrap();
     let serving = answer_each(vec![rank1], hello_world);
-    let response = served.router.route_generate(None, &generate(1), None).await;
+    let response = served.post("/generate", generate(1)).await;
     let (status, body) = json_body(response).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     // One entry per sequence, as SGLang's `/generate` answers.
@@ -344,10 +353,7 @@ async fn a_data_parallel_rank_is_where_the_request_runs() {
 
     // Past the last rank, or negative: refused before any Core sees it.
     for rank in [2, -1] {
-        let response = served
-            .router
-            .route_generate(None, &generate(rank), None)
-            .await;
+        let response = served.post("/generate", generate(rank)).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "rank {rank}");
     }
 }
@@ -358,10 +364,12 @@ async fn a_completion_gets_its_text_back() {
     let core = answer_each(std::mem::take(&mut served.cores), |core, spec| {
         core.stream(&[(spec.seq_id, &[WORLD], Some("max_tokens"))]);
     });
-    let request =
-        serde_json::from_value(json!({"model": MODEL, "prompt": "hello", "max_tokens": 1}))
-            .unwrap();
-    let response = served.router.route_completion(None, &request, None).await;
+    let response = served
+        .post(
+            "/v1/completions",
+            json!({"model": MODEL, "prompt": "hello", "max_tokens": 1}),
+        )
+        .await;
     drop(core.into_iter().next().unwrap().join().unwrap());
 
     let (status, body) = json_body(response).await;
@@ -374,11 +382,11 @@ async fn a_completion_gets_its_text_back() {
 #[tokio::test(flavor = "multi_thread")]
 async fn another_models_name_is_refused() {
     let served = Served::start(1).await;
-    let request = chat(json!({
+    let request = json!({
         "model": "other",
         "messages": [{"role": "user", "content": "hello"}],
-    }));
-    let (status, body) = json_body(served.router.route_chat(None, &request, None).await).await;
+    });
+    let (status, body) = json_body(served.post("/v1/chat/completions", request).await).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(body.to_string().contains("model_not_found"), "{body}");
     assert!(FakeCore::recv_on(
@@ -567,7 +575,7 @@ async fn requests_the_python_server_refuses_are_refused() {
     let chats = [
         (
             json!({"stream_options": {"include_usage": true}}),
-            "stream_options requires stream=true",
+            "stream_options",
         ),
         (
             json!({"tools": [tool("get"), tool("put"), tool("get")]}),
@@ -579,8 +587,8 @@ async fn requests_the_python_server_refuses_are_refused() {
         ),
     ];
     for (extra, refusal) in chats {
-        let request = chat(user_hello(extra));
-        let (status, body) = json_body(served.router.route_chat(None, &request, None).await).await;
+        let response = served.post("/v1/chat/completions", user_hello(extra)).await;
+        let (status, body) = json_body(response).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert!(body.to_string().contains(refusal), "{body}");
     }
@@ -602,8 +610,7 @@ async fn a_prompt_that_opens_reasoning_leaves_the_reply_inside_it() {
     let mut served = Served::thinking().await;
     let core = answer_each(std::mem::take(&mut served.cores), think_then_answer);
     let response = served
-        .router
-        .route_chat(None, &chat(user_hello(json!({}))), None)
+        .post("/v1/chat/completions", user_hello(json!({})))
         .await;
     drop(core.into_iter().next().unwrap().join().unwrap());
     let (status, body) = json_body(response).await;
@@ -618,8 +625,7 @@ async fn a_prompt_that_opens_reasoning_leaves_the_reply_inside_it() {
     let mut served = Served::thinking().await;
     let core = answer_each(std::mem::take(&mut served.cores), think_then_answer);
     let response = served
-        .router
-        .route_chat(None, &chat(user_hello(json!({"stream": true}))), None)
+        .post("/v1/chat/completions", user_hello(json!({"stream": true})))
         .await;
     let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     drop(core.into_iter().next().unwrap().join().unwrap());
@@ -650,11 +656,9 @@ async fn a_long_non_streamed_reply_is_split_into_reasoning_and_content() {
     let mut served = Served::thinking().await;
     let core = answer_each(std::mem::take(&mut served.cores), think_long);
     let response = served
-        .router
-        .route_chat(
-            None,
-            &chat(user_hello(json!({"max_tokens": WORDS + 2}))),
-            None,
+        .post(
+            "/v1/chat/completions",
+            user_hello(json!({"max_tokens": WORDS + 2})),
         )
         .await;
     drop(core.into_iter().next().unwrap().join().unwrap());
@@ -665,4 +669,97 @@ async fn a_long_non_streamed_reply_is_split_into_reasoning_and_content() {
     assert!(reasoning.len() > 65536, "{}", reasoning.len());
     assert_eq!(reasoning.split_whitespace().count(), WORDS);
     assert_eq!(message["content"], "world");
+}
+
+/// `count` words, `</think>`, then `tail`: a reply past 64 KiB of text.
+fn long_reasoning_then(
+    count: usize,
+    tail: &'static [i32],
+) -> impl Fn(&FakeCore, &pb::RequestSpec) + Send + Sync + Copy + 'static {
+    move |core, spec| {
+        let mut ids = vec![HELLO; count];
+        ids.push(THINK_END);
+        ids.extend(tail);
+        core.stream(&[(spec.seq_id, &ids, Some("eos"))]);
+    }
+}
+
+/// The non-streamed chat `served` answers for `body`, after `answer`.
+async fn answered_chat(
+    mut served: Served,
+    body: Value,
+    answer: impl Fn(&FakeCore, &pb::RequestSpec) + Send + Sync + Copy + 'static,
+) -> Value {
+    let core = answer_each(std::mem::take(&mut served.cores), answer);
+    let response = served.post("/v1/chat/completions", body).await;
+    drop(core.into_iter().next().unwrap().join().unwrap());
+    let (status, body) = json_body(response).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body["choices"][0]["message"].clone()
+}
+
+/// A string stop makes the stop decoder release text in windows that can
+/// cut `</think>` in two; the long reply is still split at it, and a `<`
+/// ending the reply is kept.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_long_reply_is_split_at_its_closer_whatever_the_stop_decoder_releases() {
+    const WORDS: usize = 20_000;
+    let body = user_hello(json!({"max_tokens": WORDS + 3, "stop": ["Question:"]}));
+    let answer = long_reasoning_then(WORDS, &[WORLD, LT]);
+    let message = answered_chat(Served::thinking().await, body, answer).await;
+    assert_eq!(message["content"], "world <");
+    let reasoning = message["reasoning_content"].as_str().unwrap();
+    assert_eq!(reasoning.split_whitespace().count(), WORDS);
+}
+
+/// MiniMax's parser puts its own `<think>` before the reply: a reply just
+/// under 64 KiB overflows the one-shot parse by those 7 bytes and is split
+/// in pieces instead of answering 500.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_minimax_reply_its_opener_pushes_past_64_kib_is_split() {
+    // 10920 words and their spaces, then ` </think> world`: 65534 bytes.
+    const WORDS: usize = 10_920;
+    let body = user_hello(json!({"max_tokens": WORDS + 2}));
+    let answer = long_reasoning_then(WORDS, &[WORLD]);
+    let message = answered_chat(Served::reasoning_with("minimax").await, body, answer).await;
+    assert_eq!(message["content"], "world");
+    let reasoning = message["reasoning_content"].as_str().unwrap();
+    let reply = reasoning.len() + " </think> world".len();
+    assert!((65_530..=65_536).contains(&reply), "{reply}");
+}
+
+/// What only the raw body says, read off it on the way in: `thinking` is
+/// checked, and `data_parallel_rank` picks the Core of a chat.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chats_thinking_and_rank_are_read_off_its_body() {
+    let served = Served::start(1).await;
+    let response = served
+        .post(
+            "/v1/chat/completions",
+            user_hello(json!({"thinking": "on"})),
+        )
+        .await;
+    let (status, body) = json_body(response).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body.to_string().contains("thinking must be an object"),
+        "{body}"
+    );
+
+    let mut served = Served::start(2).await;
+    let rank1 = served.cores.pop().unwrap();
+    let rank0 = served.cores.pop().unwrap();
+    let serving = answer_each(vec![rank1], hello_world);
+    let body = user_hello(json!({
+        "data_parallel_rank": 1,
+        "thinking": {"type": "enabled"},
+    }));
+    let (status, body) = json_body(served.post("/v1/chat/completions", body).await).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["choices"][0]["message"]["content"], "hello world");
+    serving.into_iter().for_each(|c| drop(c.join().unwrap()));
+    assert!(
+        FakeCore::recv_on(&rank0.input, std::time::Duration::from_millis(200)).is_none(),
+        "rank 0 got nothing"
+    );
 }

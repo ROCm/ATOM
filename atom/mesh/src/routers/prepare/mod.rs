@@ -113,6 +113,7 @@ pub fn prepare_chat(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    let prompt_opens_reasoning = response_context::prompt_opens_reasoning(&processed.text);
     let ctx = ResponseContext {
         original: ProtocolRequest::Chat(Arc::clone(&req)),
         model_id,
@@ -127,7 +128,7 @@ pub fn prepare_chat(
         reasoning_parser_factory: components.reasoning_parser_factory.clone(),
         configured_tool_parser: components.configured_tool_parser.clone(),
         configured_reasoning_parser: components.configured_reasoning_parser.clone(),
-        prompt_opens_reasoning: false,
+        prompt_opens_reasoning,
     };
 
     Ok((payload, ctx))
