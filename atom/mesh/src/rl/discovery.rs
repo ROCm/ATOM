@@ -47,24 +47,16 @@ pub struct RlWorkerInfo {
     pub control_url: Option<String>,
 }
 
-fn backend_name(backend: BackendType) -> &'static str {
-    match backend {
-        BackendType::Sglang => "sglang",
-        BackendType::Vllm => "vllm",
-        BackendType::Atom => "atom",
-    }
-}
-
 impl RlWorkerInfo {
     pub fn new(id: &WorkerId, worker: &dyn Worker, backend: BackendType) -> Self {
         let metadata = worker.metadata();
-        let (engine, connection_mode, control_url) = match worker.connection_mode() {
+        let connection_mode = worker.connection_mode();
+        let (engine, control_url) = match connection_mode {
             ConnectionMode::Http => (
-                backend_name(backend).to_string(),
-                "http",
+                backend.as_str().to_string(),
                 Some(worker.base_url().to_string()),
             ),
-            ConnectionMode::Grpc { .. } => (metadata.runtime_type.to_string(), "grpc", None),
+            ConnectionMode::Grpc { .. } => (metadata.runtime_type.to_string(), None),
         };
         Self {
             id: id.as_str().to_string(),
@@ -73,7 +65,7 @@ impl RlWorkerInfo {
             engine,
             model_id: worker.model_id().to_string(),
             worker_type: worker.worker_type().as_metric_label().to_string(),
-            connection_mode: connection_mode.to_string(),
+            connection_mode: connection_mode.as_metric_label().to_string(),
             health: if worker.is_healthy() {
                 "ready"
             } else {
