@@ -734,6 +734,18 @@ def _generate_atom_config_from_sglang_config(config: Any):
     atom_kv_cache_dtype = server_args.kv_cache_dtype
     if str(atom_kv_cache_dtype).startswith("fp8"):
         atom_kv_cache_dtype = "fp8"
+    atom_index_cache_dtype = atom_kv_cache_dtype
+
+    from atom.plugin.sglang.deepseek_v41_bridge import (
+        is_deepseek_v41_config,
+        sglang_v41_kv_cache_dtype,
+    )
+
+    if is_deepseek_v41_config(sgl_model_config.hf_config):
+        # ATOM owns the pool: the operator's choice, never "auto"; the index
+        # plane is not the main pool's format (None: Config's FP8 default).
+        atom_kv_cache_dtype = sglang_v41_kv_cache_dtype(server_args.kv_cache_dtype)
+        atom_index_cache_dtype = None
 
     atom_speculative_config = _build_atom_speculative_config_from_sglang(
         server_args, sgl_model_config.hf_config
@@ -757,7 +769,7 @@ def _generate_atom_config_from_sglang_config(config: Any):
         enforce_eager=True,
         parallel_config=sgl_parallel_config,
         kv_cache_dtype=atom_kv_cache_dtype,
-        index_cache_dtype=atom_kv_cache_dtype,
+        index_cache_dtype=atom_index_cache_dtype,
         enable_prefix_caching=False,
         port=None,
         torch_profiler_dir=None,
