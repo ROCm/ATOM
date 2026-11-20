@@ -495,7 +495,26 @@ def _assert_mix_bytes(actual, expected):
             assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
 
 
-@pytest.mark.parametrize("tokens,banks", [(1, 1), (7, 2), (32, 3), (32, 4), (64, 11)])
+@pytest.mark.parametrize("banks", range(1, 13))
+@pytest.mark.parametrize("mean", [2, 3])
+def test_gpu_bank_tiles_preserve_uniform_score_mean(modules, banks, mean):
+    """Zero scores give an independent exact mean over every bank and prefix."""
+    if not torch.cuda.is_available():
+        pytest.skip("GPU bank/prefix ordering qualification")
+    tokens, hidden = 3, 7168
+    bank = torch.empty((tokens, banks, hidden), dtype=torch.bfloat16, device="cuda")
+    values = torch.arange(1, banks + 1, dtype=torch.float32, device="cuda")
+    bank.copy_(values[None, :, None])
+    prefix = torch.zeros((tokens, hidden), dtype=torch.bfloat16, device="cuda")
+    add = torch.full_like(prefix, mean * (banks + 1) - banks * (banks + 1) // 2)
+    score = torch.zeros((hidden,), dtype=torch.float32, device="cuda")
+    output, settled = modules.ops.apply_attn_res(prefix, bank, score, 1e-6, add)
+    assert torch.equal(output, torch.full_like(prefix, mean))
+    assert torch.equal(settled, add)
+
+
+@pytest.mark.parametrize("tokens", [1, 4, 7, 16, 32, 64])
+@pytest.mark.parametrize("banks", range(1, 13))
 @pytest.mark.parametrize("quant", [False, True])
 def test_gpu_peer_word_layout_and_replay(modules, monkeypatch, tokens, banks, quant):
     """One GPU emulates remote publishers; this does not qualify peer concurrency."""
@@ -584,7 +603,10 @@ def test_distributed_column_gather_stress(modules, monkeypatch):
             compilation_config=SimpleNamespace(static_forward_context={"stress": owner})
         )
         monkeypatch.setattr(modules.config, "get_current_atom_config", lambda: config)
-        for tokens, banks in ((1, 1), (7, 2), (32, 3), (32, 4), (64, 11)):
+        shapes = [(1, 1), (32, 4), (64, 11)] + [
+            (tokens, banks) for tokens in (1, 4, 7, 16, 32, 64) for banks in (2, 3)
+        ]
+        for tokens, banks in shapes:
             torch.manual_seed(2718 + tokens + banks)
             prefix, full, bank, score, norm = _gpu_mix_inputs(tokens, banks)
             local = full[:, rank * 896 : (rank + 1) * 896].contiguous()
@@ -597,9 +619,12 @@ def test_distributed_column_gather_stress(modules, monkeypatch):
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 captured = mix(pending)
+            pattern = (
+                torch.arange(7168, dtype=torch.float32, device="cuda")[None, :] / 1024
+            )
             for iteration in range(50):
                 # Each rank constructs the same full oracle without a reference collective.
-                full.fill_((iteration - 17) / 32)
+                full.copy_(pattern + (iteration - 17) / 32)
                 local.copy_(full[:, rank * 896 : (rank + 1) * 896])
                 expected = mix(full)
                 graph.replay()
