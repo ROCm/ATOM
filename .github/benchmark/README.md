@@ -11,10 +11,15 @@ manual test, and [`models_agentic_nightly.json`](./models_agentic_nightly.json)
 for the daily 08:17 UTC run. Both use `rocm/atom-dev:latest` and checked-out branch
 code. The manual default remains DeepSeek V4.1 Flash + DSpark5, TP4 with FULL
 graphs, concurrency 2/4 and 900 seconds per point. Nightly is based on InferenceX
-PR #3387 with a custom grid: TP2 c=1/2/4/8/16/32/64/128 and TP4 c=1/4/8,
-3600 seconds per point, 5 warmup requests per lane and fixed AL 3.51.
+PR #3387 with a custom grid: TP2 c=1/2/4/8/16/32/64/128, TP4 c=1/4/8, DTP2 and
+DEP2 c=128, and DEP8 c=256, 3600 seconds per point, 5 warmup requests per lane
+and fixed AL 3.51.
 Both profiles set GPU memory utilization to 0.95, omit the max-num-seqs override,
-and use capture sizes 1–32 plus 48/64/96/128/160/192/224/256 for every point.
+and use capture sizes 1–32 plus 48/64/96/128/160/192/224/256. The DP-attention
+variants override part of that and set their own prefill delayer interval:
+DTP2/DEP2 use 0.9, capture sizes up to 128 and interval 10; DEP8 uses an
+8192-token step budget, capture sizes 1–32 plus 40/48/56/64 and interval 96
+(see [`DeepSeek-V4.1-Flash-Agentic.md`](../../recipes/DeepSeek-V4.1-Flash-Agentic.md#dep8-at-concurrency-256)).
 Agentic variants declare `concurrency` directly; random `scenarios`, ISL/OSL,
 length ratios and concurrency bands are not part of these catalogs.
 Select **ATOM Agentic Benchmark**
