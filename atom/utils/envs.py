@@ -835,6 +835,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KIMI_MONO_MLA_ABSORB": lambda: (
         os.getenv("ATOM_KIMI_MONO_MLA_ABSORB", "0") == "1"
     ),
+    # 1: the Kimi-K3 DSpark draft's MLA layers (K3DSparkMLAAttention) run their
+    # decode path from the input norm's FP8 row to the attention's q_out on
+    # gfx1250 as two resident launches -- mla_draft_front_gfx1250
+    # (fused_qkv_a_proj and fused_qk_rmsnorm_group_quant) and
+    # mla_absorb_draft_gfx1250 (q_b_proj with fp32 activation scales, W_UK,
+    # rope + cache) -- production's bits, and the attention decodes from that
+    # q_out. 0, the default, keeps the production kernels.
+    "ATOM_KIMI_MONO_MLA_DRAFT": lambda: (
+        os.getenv("ATOM_KIMI_MONO_MLA_DRAFT", "0") == "1"
+    ),
     # The K2 tail's remote pushes on waves of their own, so the store drain
     # before its flag waits for no fabric ack (k2_tail_gfx1250, the same
     # bits); 0 keeps every wave pushing and reducing its own line.

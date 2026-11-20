@@ -93,12 +93,15 @@ def test_the_decode_from_q_out_is_forward_impls_tail(monkeypatch, dcp):
         qrep_enabled=True,
         use_seg_mla=False,
         _fused_q_head_pad=True,
-        _dcp_decode=lambda *a: calls.append(("dcp", a)) or "dcp_out",
+        _dcp_decode=lambda *a, **k: calls.append(("dcp", a, k)) or "dcp_out",
         _forward_decode=lambda *a, **k: calls.append(("local", a, k)) or "out",
     )
     got = mla.MLAAttention.forward_decode_q_out(fake, "q_out")
     if dcp > 1:
-        assert got == "dcp_out" and calls == [("dcp", ("q_out", cache, metadata, True))]
+        assert got == "dcp_out"
+        assert calls == [
+            ("dcp", ("q_out", cache, metadata, True), {"q_prepadded": False})
+        ]
     else:
         assert got == "out"
         assert calls == [("local", ("q_out", cache, metadata), {"q_prepadded": True})]

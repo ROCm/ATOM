@@ -90,6 +90,7 @@ from atom.models.dspark_draft import (
 from atom.models.kimi_k3 import _RMS_FUSABLE_QUANT_TYPES
 from atom.models.utils import is_neox_rope_style
 from atom.quant_spec import effective_layer_quant
+from atom.utils import envs
 
 if TYPE_CHECKING:
     from atom.config import Config
@@ -297,6 +298,12 @@ class K3DSparkMLAAttention(nn.Module):
             in _RMS_FUSABLE_QUANT_TYPES
         )
         self.input_quant_prefix = f"{prefix}.fused_qkv_a_proj"
+        # ATOM_KIMI_MONO_MLA_DRAFT: the block pass's decode path from the input
+        # norm's FP8 row to q_out on the gfx1250 draft kernels
+        # (atom.models.kimi_k3.mono.draft_mla), bound on the first decode step
+        # past the weights' load; a layer they cannot read turns this off.
+        self._try_mla_draft = envs.ATOM_KIMI_MONO_MLA_DRAFT
+        self.mla_draft = None
 
     # ---- context rows (target-derived) -------------------------------------
 
@@ -340,6 +347,12 @@ class K3DSparkMLAAttention(nn.Module):
         # `hidden_states` is a (fp8, scale) tuple when the decoder's
         # input_layernorm fused its activation quant; fused_qkv_a_proj is its
         # only consumer and takes the scale directly.
+        if self._try_mla_draft:
+            from atom.models.kimi_k3.mono import draft_mla
+
+            out = draft_mla.forward(self, positions, hidden_states)
+            if out is not None:
+                return out
         hidden_states_scale = None
         if isinstance(hidden_states, tuple):
             hidden_states, hidden_states_scale = hidden_states
@@ -467,6 +480,10 @@ class K3DSparkDecoderLayer(nn.Module):
             ),
             prefix=self.self_attn.input_quant_prefix,
         )
+        if self.self_attn._try_mla_draft:
+            # the draft kernels read this norm's quant layout; a plain
+            # attribute, not a submodule (it is the layer's own)
+            object.__setattr__(self.self_attn, "_input_norm", self.input_layernorm)
         self.fuse_ffn_norm_quant = (
             effective_layer_quant(quant_config, f"{prefix}.mlp.gate_up_proj")[0]
             in _RMS_FUSABLE_QUANT_TYPES
