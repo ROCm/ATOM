@@ -1078,7 +1078,7 @@ def _make_connector(**overrides):
     conn._chunked_local_ids = {}
     conn._received_handoffs = {}
     conn._pending_recv_stages = {}
-    conn._pending_recv_failed = set()
+    conn._pending_recv_failed = {}
     conn._pending_recv_nonce = {}
     conn._pending_recv_acks = {}
     conn._pending_recv_stall_watch = {}

@@ -157,6 +157,7 @@ class Harness:
         if self.device.type == "cuda":
             self.event.record()
         self.finished = []
+        self.held = {}
         self.ready = []
         self.writes = []
         self.recv = LandingReceiver(
@@ -171,7 +172,7 @@ class Harness:
             send=lambda addr, parts: c._landing_credits.release(
                 "cpu:1", self.recv.epoch, msgpack.loads(parts[-1])["slots"]
             ),
-            finish=lambda req, failed: self.finished.append((req, failed)),
+            finish=self._finish,
             table_segments=16,
         )
         if self.device.type == "cpu":
@@ -212,6 +213,10 @@ class Harness:
             return 0
 
         c.transfer_engine = SimpleNamespace(batch_transfer_sync_write=write)
+
+    def _finish(self, req, failed, failed_after_write=True):
+        self.finished.append((req, failed))
+        self.held[req] = failed_after_write
 
     def pump(self):
         tasks = []
@@ -349,6 +354,51 @@ def test_chunk_handoff_is_checked_before_landing_completion(bad):
     assert not c._pending_handoffs[21].failed
     c._record_write_done(21, 1, write_nonce=3, handoff=bad, landed_slots=[])
     assert h.finished == [(21, True)]
+    assert h.held == {21: False}  # both stages reported success
+
+
+def begin_chunked_landing(h):
+    """Track request 21 as a chunked landing from two PP stages; ``h.c``, a handoff."""
+    c = h.c
+    c._landing = h.recv
+    c._landing_spec = LandingSpec(1, MINIMAX_SCATTER_SEGMENTS, PAGE_UNITS, True)
+    c._pending_handoffs = {21: mc._PendingHandoff(landing_nonce=3, expected=2)}
+    h.recv.advertise("s1", 2)
+    h.recv.begin(21, 3, [2, 0, 3], {0: "s0", 1: "s1"})
+    return c, {"first_token_id": 42, "draft_token_ids": []}
+
+
+@pytest.mark.parametrize("failure_first", [True, False])
+@pytest.mark.parametrize("wrote", [False, True])
+def test_a_chunked_landing_failure_is_held_only_if_it_started_writing(
+    wrote, failure_first
+):
+    # The fold fails the success as well; its stage had finished writing.
+    h = Harness(LAST, 0)
+    c, good = begin_chunked_landing(h)
+    reports = [
+        {"success": False, "started_writes": wrote, "handoff": None},
+        {"success": True, "handoff": good},
+    ]
+    for pp, report in enumerate(reports if failure_first else reports[::-1]):
+        c._record_write_done(21, pp, write_nonce=3, landed_slots=[], **report)
+    assert h.finished == [(21, True)]
+    assert h.held == {21: wrote}
+
+
+def test_a_dropped_chunk_report_keeps_its_write_claim(monkeypatch):
+    # The connector drops a stage's second report before the receiver sees it.
+    monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
+    h = Harness(LAST, 0)
+    c, good = begin_chunked_landing(h)
+    c._pending_recv_slots, c._pending_recv_blocks = {}, {}
+    c._pending_recv, c._release_targets = {21}, {}
+    h.recv._finish = c._complete_recv
+    unwritten = {"success": False, "started_writes": False}
+    c._record_write_done(21, 0, write_nonce=3, landed_slots=[], **unwritten)
+    c._record_write_done(21, 0, write_nonce=3, landed_slots=[], success=False)
+    c._record_write_done(21, 1, write_nonce=3, landed_slots=[], handoff=good)
+    assert set(c._held_failures) == {21} and not c.failed_recving
 
 
 @pytest.mark.parametrize("workers", [1, 8, 64])

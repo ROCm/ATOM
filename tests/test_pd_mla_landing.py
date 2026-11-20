@@ -20,6 +20,7 @@ import msgpack
 import numpy as np
 import pytest
 import torch
+from aiter_stub import stubbed_aiter
 
 from atom.kv_transfer.disaggregation.landing_scatter import (
     landing_segments,
@@ -43,6 +44,12 @@ from atom.kv_transfer.disaggregation.staging_config import (
     mla_landing_table_segments,
 )
 from atom.kv_transfer.disaggregation.types import MLA_KV_ROLE
+
+with stubbed_aiter():
+    # Runs without AITER (the CPU CI), where _mooncake() skips.
+    from atom.kv_transfer.disaggregation.mooncake import (
+        mooncake_connector as stubbed_mc,
+    )
 
 BLOCK_SIZE = 16
 TOKEN_BYTES = 576
@@ -224,6 +231,7 @@ class _Dest:
         ]
         self.sent = []
         self.finished = []
+        self.held = {}
         self.recv = LandingReceiver(
             device=None,
             pool_slots=pool_slots,
@@ -234,7 +242,7 @@ class _Dest:
             region_block_bytes=[PAGE_BYTES] * num_regions,
             region_indices=list(range(num_regions)),
             send=lambda addr, parts: self.sent.append((addr, parts)),
-            finish=lambda req, failed: self.finished.append((req, failed)),
+            finish=self._finish,
             table_segments=segment_table_capacity(pool_slots * 64),
         )
         pool = self.recv.pool
@@ -248,6 +256,10 @@ class _Dest:
                 )
 
         self.recv._copy_segments = copy
+
+    def _finish(self, req, failed, failed_after_write=True):
+        self.finished.append((req, failed))
+        self.held[req] = failed_after_write
 
     def credits(self):
         out = []
@@ -477,6 +489,7 @@ def test_a_failed_stage_waits_for_the_others_and_late_slots_are_dropped():
     assert dest.credits() == [("stage0", [s0[0]])]
     dest.recv.stage_done("r", 0, 5, True, [s0[0]])
     assert dest.finished == [("r", True)]
+    assert dest.held == {"r": True}  # stage 1 failed after it had written
     # A READY arriving after the request retired returns no credit: its
     # stage's write-done already returned every slot it listed.
     dest.recv.on_ready(_ready("r", s1[0], 0, [[0, 0, 1, 0]], pp=1))
@@ -631,6 +644,44 @@ def test_stages_silent_past_their_window_fail_the_request(first):
         assert dest.recv.stage_done("r", 1, 5, True, [])
     assert "r" not in dest.recv._requests
     assert dest.finished == [("r", True)]  # reported once
+    assert dest.held == {"r": True}  # a silent stage may still have written
+
+
+@pytest.mark.parametrize(
+    "reports,held",
+    [
+        # (success, started_writes) of stage 0, then stage 1.
+        (((False, False), (False, False)), False),
+        (((True, True), (False, False)), False),
+        (((False, False), (False, True)), True),
+    ],
+)
+def test_a_failure_is_held_only_if_a_failed_stage_started_writing(reports, held):
+    dest = _Dest()
+    dest.recv.advertise("stage0", 2)
+    dest.recv.advertise("stage1", 2)
+    dest.recv.begin("r", 5, [1], {0: "stage0", 1: "stage1"})
+    for pp, (success, started_writes) in enumerate(reports):
+        assert dest.recv.stage_done(
+            "r", pp, 5, success, [], started_writes=started_writes
+        )
+    assert dest.finished == [("r", True)]
+    assert dest.held == {"r": held}
+
+
+@pytest.mark.parametrize("first_success", [True, False])
+def test_a_dropped_duplicate_failure_counts_toward_the_hold_only(first_success):
+    dest = _Dest()
+    dest.recv.advertise("stage0", 2)
+    dest.recv.advertise("stage1", 2)
+    dest.recv.begin("r", 5, [1], {0: "stage0", 1: "stage1"})
+    assert dest.recv.stage_done("r", 0, 5, first_success, [], started_writes=False)
+    # Stage 0 already reported: dropped, but its write claim is kept.
+    assert dest.recv.stage_done("r", 0, 5, False, [])
+    assert dest.recv.stage_done("r", 1, 5, True, [])
+    assert dest.finished == [("r", not first_success)]
+    if not first_success:
+        assert dest.held == {"r": True}
 
 
 def test_an_expired_request_is_dropped_once_its_silent_stage_is_given_up():
@@ -692,6 +743,7 @@ def test_an_expired_request_settles_after_its_queued_scatter():
     dest.pump()
     assert torch.equal(dest.regions[0], before)  # the failed request is skipped
     assert dest.finished == [("r", True)]
+    assert dest.held == {"r": True}  # its silent stage may still write
     assert dest.credits() == [("stage0", [s0[0]])]
 
 
@@ -702,7 +754,7 @@ def test_a_failed_report_does_not_stop_the_sweep():
         dest.recv.begin(req_id, 5, [1], {0: "stage0"})
         assert dest.recv.stage_acked(req_id, 0, 5, time.monotonic() - 1)
 
-    def finish(req_id, failed):
+    def finish(req_id, failed, **_):
         if req_id == "a":
             raise RuntimeError("notify socket gone")
         dest.finished.append((req_id, failed))
@@ -1244,10 +1296,24 @@ def test_a_stage_that_cannot_land_gives_its_partition_back():
     assert sorted(dest.recv.advertise("other", 1)["slots"]) == sorted(s0)
 
 
-def test_landing_requests_complete_through_the_receiver():
-    mc = _mooncake()
+@pytest.mark.parametrize(
+    "outcome,report,held",
+    [
+        ("success", {"success": True}, None),
+        ("failed before writing", {"success": False, "started_writes": False}, False),
+        ("failed after writing", {"success": False, "started_writes": True}, True),
+        # Successes the receiver fails: the stage had finished writing.
+        ("lost READY", {"success": True}, False),
+        ("scatter error", {"success": True}, False),
+    ],
+)
+def test_landing_requests_settle_through_the_receiver(
+    monkeypatch, outcome, report, held
+):
+    # The receiver reports to _complete_recv, as _build_landing wires it.
+    monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
     dest = _Dest()
-    conn = object.__new__(mc.MooncakeConnector)
+    conn = object.__new__(stubbed_mc.MooncakeConnector)
     conn._landing = dest.recv
     conn._completion_lock = threading.Lock()
     conn._fence_lock = threading.Lock()
@@ -1259,22 +1325,32 @@ def test_landing_requests_complete_through_the_receiver():
     conn._pending_recv_expected = {}
     conn._pending_handoffs = {}
     conn._pending_recv_stages = {}
-    conn._pending_recv_failed = set()
+    conn._pending_recv_failed = {}
     conn._pending_recv_nonce = {}
     conn._pending_recv_acks = {}
     conn._release_targets = {}
+    conn._held_failures = {}
     conn.done_recving = set()
     conn.failed_recving = set()
     dest.recv._finish = conn._complete_recv
     s0 = dest.recv.advertise("stage0", 1)["slots"]
     dest.recv.begin("r", 5, [1], {0: "stage0"})
-    rows = torch.zeros((4, TOKEN_BYTES), dtype=torch.uint8)
-    dest.recv.on_ready(_ready("r", s0[0], 0, _land(dest, s0[0], 0, 0, rows)))
-    conn._record_write_done("r", 0, 0, 5, success=True, landed_slots=[s0[0]])
-    assert conn.done_recving == set()  # scatter still queued
+    landed = []
+    if outcome != "failed before writing":
+        rows = torch.zeros((4, TOKEN_BYTES), dtype=torch.uint8)
+        dest.recv.on_ready(_ready("r", s0[0], 0, _land(dest, s0[0], 0, 0, rows)))
+        landed = [s0[0], s0[1]] if outcome == "lost READY" else [s0[0]]
+    if outcome == "scatter error":
+        dest.recv._copy_segments = Mock(side_effect=RuntimeError("gpu fault"))
+    conn._record_write_done("r", 0, 0, 5, landed_slots=landed, **report)
+    if landed:
+        # A queued scatter writes the pages: nothing is reported before it ends.
+        assert not (conn.done_recving or conn.failed_recving or conn._held_failures)
     dest.pump()
-    assert conn.done_recving == {"r"}
-    assert conn._pending_recv == set()
+    assert conn.done_recving == ({"r"} if held is None else set())
+    assert conn.failed_recving == ({"r"} if held is False else set())
+    assert set(conn._held_failures) == ({"r"} if held else set())
+    assert conn._pending_recv == ({"r"} if held else set())
     assert conn._pending_recv_stages == {}
 
 
