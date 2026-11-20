@@ -194,6 +194,14 @@ class TestPagedCheckpointsAreRefusedWhereSizingWouldRaise:
             glm = builder(Builder, model_type="glm5_next_text")
             assert not Builder.state_transfer(glm).readable_midstep
 
+    @pytest.mark.parametrize("kpool_tail", [False, True])
+    def test_midstep_refuses_a_model_with_an_unwritten_kpool_plane(self, kpool_tail):
+        with tp_world(TP) as Builder:
+            transfer = Builder.state_transfer(
+                builder(Builder, kpool=4, kpool_tail=kpool_tail)
+            )
+        assert transfer.copies and not transfer.readable_midstep
+
     @pytest.mark.parametrize(
         "replayssm, num_spec, kpool, keep",
         [

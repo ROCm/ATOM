@@ -94,6 +94,18 @@ class TestAnchorInsideAPrefill:
         bm.plan_midstep(seq, 0, 44)
         assert [p for _s, p, _h in seq.midstep_reservations] == [10 * BLOCK]
 
+    def test_scarce_page_scratch_keeps_the_anchor_before_the_ladder(self):
+        config = ckpt_config(
+            state_checkpoint_interval_tokens=32, pool_entries={"state": 2}
+        )
+        bm = make_block_manager(config, state_runtime=runtime(True))
+        seq = admitted(bm, PROMPT)
+        assert [p for p, _h in bm.midstep_positions(seq, 0, 44)] == [32, 40]
+        bm.plan_midstep(seq, 0, 44)
+        assert [p for _s, p, _h in seq.midstep_reservations] == [40]
+        bm.cancel_midstep(seq)
+        assert bm.state.num_free() == 1
+
     def test_the_head_rides_behind_every_row(self):
         bm = anchor_only_bm()
         other = admitted(bm, range(100, 112))
@@ -167,9 +179,10 @@ def test_the_state_pool_lends_scratch_only_where_it_is_borrowed(k3_modules):
     )
     assert extra(replayssm=True, interval=32, pp=2) == DECODE_SNAPSHOT_SCRATCH_SLOTS
     assert extra(replayssm=True, interval=-1) == K3.MIDSTEP_SCRATCH_SLOTS
-    assert extra(replayssm=True, interval=32, prefix_caching=False) == (
-        K3.MIDSTEP_SCRATCH_SLOTS
-    )
+    assert extra(replayssm=True, interval=32, prefix_caching=False) == 0
+    assert extra(interval=-1, prefix_caching=False) == 0
+    assert extra(replayssm=True, interval=0) == 0
+    assert extra(kpool=4) == 0
 
 
 def test_the_builder_hands_the_forward_its_rows(k3_modules):

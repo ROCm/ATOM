@@ -1076,8 +1076,8 @@ class PagedStateCheckpointCoordinator:
     def reserve_midstep(self, seq, positions: list[tuple[int, int]]) -> list[tuple]:
         """Borrow a scratch slot for each `(position, hash)` this forward covers.
 
-        Best-effort and order-preserving, like the slot pool's: stops at the
-        first position no slot is free for. A hash already stored, or already
+        Best-effort, with the prompt-end anchor taking scratch before guesses.
+        Returned reservations keep position order. A hash already stored, or already
         on its way, is skipped -- writing it again would be refused by
         `begin_store` after spending the slot and the copy.
         """
@@ -1087,14 +1087,16 @@ class PagedStateCheckpointCoordinator:
             return []
         queued = {h for h, _slot in self._scratch_queued}
         out = []
-        for pos, h in positions:
+        for pos, h in sorted(
+            positions, key=lambda item: item[0] != seq.midstep_anchor_pos
+        ):
             if h in queued or self.store.contains_or_pending(h):
                 continue
             if not self._scratch.has_free():
                 self.checkpoints_dropped += 1
                 break
             out.append((self._scratch.pop(), pos, h))
-        return out
+        return sorted(out, key=lambda reservation: reservation[1])
 
     def publish_midstep(self, reservations: list[tuple], seq=None) -> None:
         """Queue each written scratch slot for storing under its hash.

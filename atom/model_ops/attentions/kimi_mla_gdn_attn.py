@@ -383,6 +383,7 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         return (
             self._uses_paged_checkpoints()
             and runner.hf_text_config.model_type == "kimi_linear"
+            and self._decode_image_is_conv_and_ssm()
             and int(getattr(runner.config, "pipeline_parallel_size", 1) or 1) == 1
         )
 
@@ -588,7 +589,14 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         with every request in, there would be none to borrow.
         """
         base = super().state_spec()
-        scratch = MIDSTEP_SCRATCH_SLOTS if self._reads_midstep() else 0
+        cfg = self.model_runner.config
+        scratch = (
+            MIDSTEP_SCRATCH_SLOTS
+            if self._reads_midstep()
+            and cfg.enable_prefix_caching
+            and cfg.state_checkpoint_interval_tokens != 0
+            else 0
+        )
         return state_pool(
             base.name,
             base.entry_bytes + self._kpool_tail_bytes(),
