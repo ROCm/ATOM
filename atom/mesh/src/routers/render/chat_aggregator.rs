@@ -20,7 +20,7 @@ use crate::{
             parser_factory_lookup::{
                 check_reasoning_parser_availability, create_reasoning_parser, get_reasoning_parser,
             },
-            response_context::{ProtocolRequest, ResponseContext, THINK_OPEN},
+            response_context::{ProtocolRequest, ResponseContext},
             tool_constraints::{
                 generate_tool_call_id, get_history_tool_calls_count, parse_json_schema_response,
             },
@@ -120,7 +120,7 @@ pub async fn process_typed(
             ctx.reasoning_parser_factory.as_ref(),
             ctx.configured_tool_parser.as_deref(),
             ctx.configured_reasoning_parser.as_deref(),
-            ctx.prompt_opens_reasoning,
+            ctx.prompt_opener.as_deref(),
         )
         .await;
         match res {
@@ -179,7 +179,7 @@ async fn process_choice(
     reasoning_parser_factory: Option<&ReasoningParserFactory>,
     configured_tool_parser: Option<&str>,
     configured_reasoning_parser: Option<&str>,
-    prompt_opens_reasoning: bool,
+    prompt_opener: Option<&str>,
 ) -> Result<ChatChoice, String> {
     let (token_ids, finish_reason, matched_stop, logprobs) = match complete {
         TokenChunk::Complete {
@@ -226,7 +226,7 @@ async fn process_choice(
                 &chat_request.model,
                 &pieces,
                 &processed_text,
-                prompt_opens_reasoning,
+                prompt_opener,
             )
             .await
             .map_err(|e| format!("Reasoning parsing error: {}", e))?;
@@ -310,7 +310,7 @@ async fn process_choice(
 const ONE_SHOT_MAX_BYTES: usize = 65536;
 
 /// A whole reply (`text`, decoded as `pieces`) split into content and
-/// reasoning; `prompt_opens_reasoning` puts the prompt's opener before it.
+/// reasoning; `opener`, the prompt's own, is read before it.
 ///
 /// A reply the one-shot parse would refuse goes through a fresh parser's
 /// streaming path a piece at a time, as a streamed reply does, so its buffer
@@ -322,9 +322,8 @@ async fn split_reasoning(
     model: &str,
     pieces: &[String],
     text: &str,
-    prompt_opens_reasoning: bool,
+    opener: Option<&str>,
 ) -> Result<ParserResult, String> {
-    let opener = prompt_opens_reasoning.then_some(THINK_OPEN);
     let opened: Cow<str> = match opener {
         Some(opener) => format!("{opener}{text}").into(),
         None => text.into(),

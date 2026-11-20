@@ -98,6 +98,20 @@ impl Pipeline {
         model_id: Option<String>,
         components: Arc<AppContext>,
     ) -> Response {
+        self.execute_chat_with(req, headers, model_id, components, None)
+            .await
+    }
+
+    /// `execute_chat`, with the prompt `rendered` outside the router when it
+    /// is given (`prepare::prepare_chat_with`).
+    pub async fn execute_chat_with(
+        &self,
+        req: Arc<ChatCompletionRequest>,
+        headers: Option<HeaderMap>,
+        model_id: Option<String>,
+        components: Arc<AppContext>,
+        rendered: Option<prepare::RenderedChat>,
+    ) -> Response {
         let start = Instant::now();
         let model = req.model.clone();
         let streaming = req.stream;
@@ -111,7 +125,7 @@ impl Pipeline {
         );
 
         let (mut payload, resp_ctx) =
-            match prepare::prepare_chat(req, headers, model_id, &components) {
+            match prepare::prepare_chat_with(req, headers, model_id, &components, rendered) {
                 Ok(t) => t,
                 Err(e) => return self.record_chat_err(&model, start, e),
             };

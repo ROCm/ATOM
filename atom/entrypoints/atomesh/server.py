@@ -123,10 +123,15 @@ def initialize_standalone_service(
     )
 
 
-def initialize_token_bridge(atomesh_runner: Any) -> Any:
+def initialize_token_bridge(atomesh_runner: Any, args: argparse.Namespace) -> Any:
     from atom.entrypoints.atomesh.token_bridge import TokenBridge
 
-    return TokenBridge(engine=engine, sink=atomesh_runner.StepSink())
+    return TokenBridge(
+        engine=engine,
+        sink=atomesh_runner.StepSink(),
+        tokenizer=tokenizer,
+        model=args.model,
+    )
 
 
 def served_model_name(args: argparse.Namespace) -> str:
@@ -369,7 +374,9 @@ def launch_atom_standalone(atomesh_runner: Any, raw_args: list[str]) -> None:
                 standalone_args.mesh_args + parser_args
             )
         frontend = {
-            "token_bridge": initialize_token_bridge(atomesh_runner),
+            "token_bridge": initialize_token_bridge(
+                atomesh_runner, standalone_args.engine_args
+            ),
             "served_model_name": served_model_name(standalone_args.engine_args),
             "default_chat_template_kwargs": json.dumps(
                 standalone_args.default_chat_template_kwargs

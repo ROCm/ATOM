@@ -14,6 +14,9 @@ from Python is this, and only this:
 * Each engine step's tokens go back to Rust in one ``StepSink.push`` from
   CoreManager's output thread, the way the frontend workers' hub flushes a
   step per worker (``frontend_workers.py``).
+* ``render_chat`` renders the chat prompt of a model whose template Rust
+  cannot render: a Python message encoder (DeepSeek-V4), or a tokenizer
+  whose template is code rather than Jinja (Kimi-K3).
 
 A request is known by the key Rust gives it, not by sequence id: Rust has
 registered the key before ``submit`` is called, so no output can arrive for a
@@ -22,6 +25,7 @@ request Rust does not know yet.
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 from typing import Any
@@ -31,6 +35,13 @@ from atom.entrypoints.openai.api_server import (
     _validate_context_length,
     _validate_pool_capacity,
 )
+from atom.entrypoints.openai.chat_encoders import (
+    apply_chat_template,
+    chat_template_source,
+    load_custom_message_encoder,
+    render_probe_prompt,
+    resolve_reasoning_toggle,
+)
 from atom.entrypoints.openai.model_capabilities import deployment_metadata
 from atom.entrypoints.openai.protocol import (
     DEFAULT_MAX_TOKENS,
@@ -38,17 +49,101 @@ from atom.entrypoints.openai.protocol import (
     DEFAULT_TOP_K,
     DEFAULT_TOP_P,
 )
+from atom.entrypoints.openai.reasoning import (
+    template_opens_reasoning_implicitly,
+    thinking_switched_off,
+)
+from atom.entrypoints.openai.reasoning_dialects import resolve_dialect
 
 logger = logging.getLogger("atom")
+
+
+class ChatRenderer:
+    """A chat prompt as ATOM's own server renders it, for a model whose
+    template the router cannot render (``needed``): one with a Python message
+    encoder, or a tokenizer whose ``chat_template`` is code, not Jinja."""
+
+    def __init__(self, tokenizer: Any, model: str) -> None:
+        self.tokenizer = tokenizer
+        self.encoder = load_custom_message_encoder(model)
+        template = getattr(tokenizer, "chat_template", None)
+        self.needed = self.encoder is not None or not isinstance(template, (str, dict))
+        if not self.needed:
+            return
+        source = chat_template_source(tokenizer, self.encoder)
+        self.dialect, _ = resolve_dialect(
+            source, render_probe_prompt(tokenizer, self.encoder, tools=False) or ""
+        )
+        self.model_starts_in_reasoning = template_opens_reasoning_implicitly(source)
+        self.reasoning_toggle = resolve_reasoning_toggle(tokenizer, self.encoder)
+
+    def render(self, request: dict[str, Any]) -> tuple[str, str | None]:
+        """The prompt, and the channel opener it ends on (or ``None``).
+
+        The opener is what the reply starts inside, with none of its own: the
+        dialect's reasoning opener when the prompt opens reasoning, or its
+        answer opener (Kimi-K3's response channel with thinking off).
+        """
+        messages = request.get("messages")
+        if not messages:
+            raise ValueError("messages is required")
+        kwargs = dict(request.get("chat_template_kwargs") or {})
+        prompt = apply_chat_template(
+            self.tokenizer,
+            self.encoder,
+            [_template_message(message) for message in messages],
+            tools=request.get("tools"),
+            **kwargs,
+        )
+        return prompt, self._opener(prompt, kwargs)
+
+    def _opener(self, prompt: str, kwargs: dict[str, Any]) -> str | None:
+        tail = prompt.rstrip()
+        for marker in (
+            self.dialect.prompt_open_marker,
+            self.dialect.answer_open_marker,
+        ):
+            if marker and tail.endswith(marker):
+                return marker
+        # As the OpenAI server's `_reasoning_channel`: a template that opens
+        # reasoning without writing the opener, unless the render switched
+        # reasoning off.
+        if self.model_starts_in_reasoning and not thinking_switched_off(
+            kwargs, self.reasoning_toggle
+        ):
+            return self.dialect.prompt_open_marker
+        return None
+
+
+def _template_message(message: dict[str, Any]) -> dict[str, Any]:
+    """A chat message as the template takes it: text parts joined, as the
+    Python standalone service sends them."""
+    content = message.get("content")
+    if isinstance(content, list):
+        content = "\n".join(
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+    elif content is None:
+        content = ""
+    template_message = {"role": message.get("role"), "content": content}
+    for key in ("tool_calls", "tool_call_id", "name", "reasoning_content"):
+        if message.get(key) is not None:
+            template_message[key] = message[key]
+    return template_message
 
 
 class TokenBridge:
     """The Python half of ``AtomBridgeRouter``; see the module docstring."""
 
-    def __init__(self, engine: Any, sink: Any) -> None:
+    def __init__(self, engine: Any, sink: Any, tokenizer: Any, model: str) -> None:
         self.engine = engine
         # Read by Rust (`AtomBridgeRuntime::from_bridge`) to find its sink.
         self.sink = sink
+        self._renderer = ChatRenderer(tokenizer, model)
+        # Read by Rust: render every chat prompt through `render_chat`.
+        self.renders_chat = self._renderer.needed
         config = getattr(engine, "config", None)
         self._max_model_len = getattr(config, "max_model_len", None)
         self._output_limit = deployment_metadata(config, None).get("max_output_tokens")
@@ -97,6 +192,14 @@ class TokenBridge:
                 self._seq_ids.pop(key, None)
             self._forget([seq.id for seq in seqs])
             raise
+
+    def render_chat(self, request_json: str) -> tuple[str, list[int], str | None]:
+        """A chat request's prompt, its token ids as the engine would encode
+        the text, and the channel opener it ends on (``ChatRenderer.render``)."""
+        prompt, opener = self._renderer.render(json.loads(request_json))
+        encoded = self.engine.io_processor.encode_prompt(prompt)
+        token_ids = getattr(encoded, "token_ids", encoded)
+        return prompt, list(token_ids), opener
 
     def abort(self, keys: list[int]) -> None:
         """Stop the requests behind ``keys``; a finished or unknown key is a no-op."""

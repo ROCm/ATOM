@@ -65,6 +65,8 @@ pub struct AtomBridgeRuntime {
     pub served_model_name: String,
     /// `--default-chat-template-kwargs`: under every chat request's own.
     pub(crate) default_chat_template_kwargs: Map<String, Value>,
+    /// The model's chat template is Python's to render (`TokenBridge.renders_chat`).
+    pub(crate) renders_chat: bool,
 }
 
 impl AtomBridgeRuntime {
@@ -78,6 +80,7 @@ impl AtomBridgeRuntime {
         let sink = bridge.getattr("sink")?;
         let sink: PyRef<'_, py_bridge::StepSink> = sink.extract()?;
         let registry = Arc::clone(&sink.registry);
+        let renders_chat = bridge.getattr("renders_chat")?.extract::<bool>()?;
         let default_chat_template_kwargs = match default_chat_template_kwargs {
             None | Some("") => Map::new(),
             Some(raw) => serde_json::from_str(raw).map_err(|e| {
@@ -91,6 +94,7 @@ impl AtomBridgeRuntime {
             registry,
             served_model_name,
             default_chat_template_kwargs,
+            renders_chat,
         })
     }
 }
@@ -335,12 +339,21 @@ impl RouterTrait for AtomBridgeRouter {
                 kwargs.entry(key.clone()).or_insert_with(|| value.clone());
             }
         }
+        let rendered = if self.runtime.renders_chat {
+            match py_bridge::render_chat(&self.runtime.bridge, &body).await {
+                Ok(rendered) => Some(rendered),
+                Err(response) => return response,
+            }
+        } else {
+            None
+        };
         self.pipeline
-            .execute_chat(
+            .execute_chat_with(
                 Arc::new(body),
                 headers.cloned(),
                 self.model_id(),
                 Arc::clone(&self.app_context),
+                rendered,
             )
             .await
     }

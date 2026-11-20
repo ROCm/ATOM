@@ -27,7 +27,7 @@ mod test_support {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
-            prompt_opens_reasoning: false,
+            prompt_opener: None,
         }
     }
 
@@ -52,7 +52,7 @@ mod test_support {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
-            prompt_opens_reasoning: false,
+            prompt_opener: None,
         }
     }
 }
@@ -214,7 +214,7 @@ mod b2_chat_aggregator_branches {
             reasoning_parser_factory: Some(test_mocks::reasoning_parser_factory()),
             configured_tool_parser: None,
             configured_reasoning_parser: None,
-            prompt_opens_reasoning: false,
+            prompt_opener: None,
         }
     }
 
@@ -552,7 +552,7 @@ mod b3_chat_aggregator_typed {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
-            prompt_opens_reasoning: false,
+            prompt_opener: None,
         }
     }
 
@@ -961,7 +961,7 @@ mod c2_chat_streaming_branches {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
-            prompt_opens_reasoning: false,
+            prompt_opener: None,
         }
     }
 
@@ -1326,7 +1326,7 @@ mod c3_chat_streaming_parsers {
             reasoning_parser_factory: Some(test_mocks::reasoning_parser_factory()),
             configured_tool_parser: configured_tool.map(|s| s.to_string()),
             configured_reasoning_parser: configured_reasoning.map(|s| s.to_string()),
-            prompt_opens_reasoning: false,
+            prompt_opener: None,
         }
     }
 
@@ -1533,7 +1533,7 @@ mod c4_chat_streaming_coverage {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
-            prompt_opens_reasoning: false,
+            prompt_opener: None,
         }
     }
 
@@ -1555,7 +1555,7 @@ mod c4_chat_streaming_coverage {
             reasoning_parser_factory: Some(test_mocks::reasoning_parser_factory()),
             configured_tool_parser: None,
             configured_reasoning_parser: None,
-            prompt_opens_reasoning: false,
+            prompt_opener: None,
         }
     }
 
@@ -1576,7 +1576,7 @@ mod c4_chat_streaming_coverage {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
-            prompt_opens_reasoning: false,
+            prompt_opener: None,
         }
     }
 
@@ -2200,7 +2200,7 @@ mod c4_chat_streaming_coverage {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
-            prompt_opens_reasoning: false,
+            prompt_opener: None,
         };
         let stream = synthetic_single_stream(vec![
             Ok(TokenChunk::Partial {
@@ -2977,7 +2977,7 @@ mod d2_generate_aggregator_branches {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
-            prompt_opens_reasoning: false,
+            prompt_opener: None,
         };
         let stream = synthetic_single_stream(vec![Ok(TokenChunk::Complete {
             token_ids: vec![1, 2, 3],
@@ -3024,7 +3024,7 @@ mod d2_generate_aggregator_branches {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
-            prompt_opens_reasoning: false,
+            prompt_opener: None,
         };
         let lp = TokenLogprobs {
             items: vec![TokenLogprob {
@@ -3432,7 +3432,7 @@ mod e2_generate_streaming_branches {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
-            prompt_opens_reasoning: false,
+            prompt_opener: None,
         }
     }
 

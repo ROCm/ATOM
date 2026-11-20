@@ -22,7 +22,7 @@ use crate::{
     routers::{
         prepare::{
             parser_factory_lookup::{check_reasoning_parser_availability, create_reasoning_parser},
-            response_context::{ProtocolRequest, ResponseContext, THINK_OPEN},
+            response_context::{ProtocolRequest, ResponseContext},
             tool_constraints::{generate_tool_call_id, get_history_tool_calls_count},
         },
         render::logprob_conversion::token_logprobs_to_chat,
@@ -177,7 +177,7 @@ async fn run_chat_stream(
                         &mut reasoning_parser,
                         ctx.reasoning_parser_factory.as_ref(),
                         ctx.configured_reasoning_parser.as_deref(),
-                        ctx.prompt_opens_reasoning,
+                        ctx.prompt_opener.as_deref(),
                         request_id,
                         model,
                         created,
@@ -396,7 +396,7 @@ async fn process_reasoning_stream(
     reasoning_parser: &mut Option<Arc<tokio::sync::Mutex<Box<dyn ReasoningParser>>>>,
     factory: Option<&ReasoningParserFactory>,
     configured: Option<&str>,
-    prompt_opens_reasoning: bool,
+    prompt_opener: Option<&str>,
     request_id: &str,
     model: &str,
     created: u64,
@@ -409,10 +409,10 @@ async fn process_reasoning_stream(
         };
         match create_reasoning_parser(factory, configured, model) {
             Some(mut p) => {
-                if prompt_opens_reasoning {
+                if let Some(opener) = prompt_opener {
                     // The prompt opened the block: the parser reads its
                     // opener before the reply, which has none.
-                    let _ = p.parse_reasoning_streaming_incremental(THINK_OPEN);
+                    let _ = p.parse_reasoning_streaming_incremental(opener);
                 }
                 *reasoning_parser = Some(Arc::new(tokio::sync::Mutex::new(p)));
             }

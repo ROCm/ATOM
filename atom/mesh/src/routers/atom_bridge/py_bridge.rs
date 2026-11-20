@@ -20,12 +20,15 @@ use super::{
     },
     RequestExtras,
 };
+use axum::response::Response;
+
 use crate::{
     core::placement::types::PlacementPlan,
-    protocols::common::StringOrArray,
+    protocols::{chat::ChatCompletionRequest, common::StringOrArray},
     routers::{
+        comm::error,
         grpc::engine::Dispatcher,
-        prepare::generation_payload::GenerationPayload,
+        prepare::{generation_payload::GenerationPayload, RenderedChat},
         token_handle::{engine_error::EngineError, token_handle::TokenHandle},
     },
 };
@@ -244,6 +247,41 @@ fn submit(
         call_abort(bridge, key);
     }
     Ok(())
+}
+
+/// The chat prompt rendered by `TokenBridge.render_chat`, for a model whose
+/// template the router cannot render (a Python message encoder, or a
+/// tokenizer with no Jinja template). A `ValueError` is the request's fault.
+pub(crate) async fn render_chat(
+    bridge: &Arc<Py<PyAny>>,
+    request: &ChatCompletionRequest,
+) -> Result<RenderedChat, Response> {
+    let body = serde_json::to_string(request)
+        .map_err(|e| error::internal_error("serialize_failed", e.to_string()))?;
+    let bridge = Arc::clone(bridge);
+    let rendered = tokio::task::spawn_blocking(move || {
+        Python::attach(|py| {
+            bridge
+                .bind(py)
+                .call_method1("render_chat", (body,))?
+                .extract::<(String, Vec<u32>, Option<String>)>()
+        })
+    })
+    .await
+    .map_err(|e| error::internal_error("render_task_failed", e.to_string()))?;
+    match rendered {
+        Ok((text, token_ids, prompt_opener)) => Ok(RenderedChat {
+            text,
+            token_ids,
+            prompt_opener,
+        }),
+        Err(e) => Err(match py_err_to_engine(&e) {
+            EngineError::RequestBuildFailed(message) => {
+                error::bad_request("process_messages_failed", message)
+            }
+            other => error::internal_error("render_failed", format!("{other:?}")),
+        }),
+    }
 }
 
 /// A `ValueError` is the request's fault (400); anything else, the server's.

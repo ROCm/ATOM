@@ -1061,7 +1061,7 @@ mod f_response_context {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
-            prompt_opens_reasoning: false,
+            prompt_opener: None,
         }
     }
 
@@ -1109,7 +1109,7 @@ mod f_response_context {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
-            prompt_opens_reasoning: false,
+            prompt_opener: None,
         };
         assert_eq!(ctx.headers.as_ref().unwrap().get("x-trace").unwrap(), "abc");
     }
@@ -1132,7 +1132,7 @@ mod f_response_context {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
-            prompt_opens_reasoning: false,
+            prompt_opener: None,
         };
         assert!(ctx.processed_messages.is_none());
     }
