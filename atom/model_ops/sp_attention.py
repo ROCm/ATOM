@@ -287,7 +287,8 @@ def attention_fp8_fake(
 # which is valid only while a token bucket is one (bs, q=1) request bucket.
 # Config refuses spec decoding under SP, and prefill token graphs are recorded
 # only for a builder with `supports_token_graph`: DeepSeek-V4.1's and
-# Kimi-K3's, whose models Config refuses under SP (MHA models only).
+# Kimi-K3's, whose models Config refuses under SP (MHA models only), and
+# MiniMax-M3's, whose builder turns them off under SP.
 @mark_spliting_op(is_custom=True, gen_fake=attention_fp8_fake, mutates_args=["scale"])
 def sp_attention_fp8(
     q: torch.Tensor,
