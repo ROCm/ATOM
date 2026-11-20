@@ -142,13 +142,15 @@ Rust, which is their only client. Enable it through
 `USE_ATOMESH_ENTRYPOINTS=1`:
 
 ```bash
-# Exits with "ATOM standalone is unavailable ..."
-USE_ATOMESH_ENTRYPOINTS=1 python -m atom.entrypoints.openai_server --model /path/to/model
+USE_ATOMESH_ENTRYPOINTS=1 python -m atom.entrypoints.openai_server \
+  --model /path/to/model \
+  --host 0.0.0.0 \
+  --port 30000
 ```
 
-Meanwhile, serve a model with the classic entrypoint
-(`python -m atom.entrypoints.openai_server` without `USE_ATOMESH_ENTRYPOINTS`),
-or use `mesh-only` below to route across such servers.
+Do not pass `mesh-only` for standalone mode. The `mesh-only` subcommand is only
+used when the Python entrypoint should run Atomesh as a router for external
+workers.
 
 `--tool-call-parser` takes ATOM's format names (`qwen`, `glm`, `kimi`,
 `kimi_k3`, `minimax`, `dsml`, `dsml_v41`) or any of the router's own; unset, the
@@ -185,8 +187,8 @@ with 503) so that an orchestrator restarts it; use the Python api_server
 ### Regular HTTP routing
 
 Routing mode can be started through either the Rust binary or the Python
-entrypoint. For the Python entrypoint, pass `mesh-only`; without it the
-entrypoint asks for ATOM standalone, which is not available yet.
+entrypoint. For the Python entrypoint, `mesh-only` selects Atomesh routing;
+without `mesh-only`, it defaults to ATOM standalone mode.
 
 ```bash
 ./target/release/atomesh launch \

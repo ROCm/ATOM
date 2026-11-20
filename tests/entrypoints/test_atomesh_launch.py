@@ -8,9 +8,8 @@ to the keywords the Rust signature declares.
 
 import re
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
-
-import pytest
 
 from atom.entrypoints.atomesh import server as atomesh_server
 
@@ -58,14 +57,26 @@ def test_mesh_only_launches_with_keywords_launch_mesh_takes():
     assert len(runner.launches) == 1
 
 
-def test_standalone_is_refused_before_it_loads_a_model():
+def test_standalone_launches_with_keywords_launch_mesh_takes():
+    """The engine spec reaches `launch_mesh`, and the Cores are reaped after."""
     runner = _Runner()
+    engine = mock.Mock()
+    args = atomesh_server.StandaloneArgs(
+        engine_args=SimpleNamespace(model="m", served_model_name=None),
+        mesh_args=[],
+        default_chat_template_kwargs={},
+    )
+
+    def initialize_engine(_args):
+        atomesh_server.engine = engine
+
     with (
-        mock.patch(
-            "atom.model_engine.arg_utils.EngineArgs.create_engine"
-        ) as create_engine,
-        pytest.raises(SystemExit, match="mesh-only"),
+        mock.patch.object(atomesh_server, "initialize_engine", initialize_engine),
+        mock.patch.object(atomesh_server, "build_engine_spec", return_value="spec"),
+        mock.patch.object(atomesh_server, "freeze_gc_heap"),
     ):
-        atomesh_server.launch_atom_standalone(runner, ["--model", "m"])
-    create_engine.assert_not_called()
-    assert runner.launches == []
+        atomesh_server.serve_standalone(runner, args, None, [], None, None)
+    assert runner.launches == [
+        {"server_config": runner.launches[0]["server_config"], "engine_spec": "spec"}
+    ]
+    engine.close.assert_called_once_with()

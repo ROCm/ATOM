@@ -271,17 +271,6 @@ fn session_id(headers: Option<&HeaderMap>) -> Option<&str> {
         .find_map(|name| headers.get(*name)?.to_str().ok().filter(|v| !v.is_empty()))
 }
 
-fn bad_request(message: String) -> Response {
-    error::bad_request("invalid_request", message)
-}
-
-pub(super) fn not_yet(what: &str) -> Response {
-    error::bad_request(
-        "not_supported",
-        format!("{what} is not supported by the ATOM standalone server yet"),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
