@@ -213,8 +213,27 @@ def test_constructed_layer_routes_views_and_slots_to_real_api(
 
 @pytest.mark.parametrize(
     "reason",
-    "off wave arch classic plugin mixed head conv window state_len records layout "
-    "input conv_dtype weight_dtype quant weight_stride bias activation".split(),
+    [
+        "off",
+        "wave",
+        "arch",
+        "classic",
+        "plugin",
+        "mixed",
+        "head",
+        "conv",
+        "window",
+        "state_len",
+        "records",
+        "layout",
+        "input",
+        "conv_dtype",
+        "weight_dtype",
+        "quant",
+        "weight_stride",
+        "bias",
+        "activation",
+    ],
 )
 def test_unsupported_steps_execute_existing_path(modules, monkeypatch, reason):
     c = layer_case(
