@@ -414,7 +414,7 @@ class TestPagedMidstep:
         bm = self.bm(pool_entries={"state": 2})
         seq = admitted(bm)
         bm.plan_midstep(seq, 0, 40)
-        assert [p for _s, p, _h in seq.midstep_reservations] == [32]
+        assert [p for _s, p, _h in seq.midstep_reservations] == [40]
         assert bm.paged_state_checkpoints.checkpoints_dropped == 1
 
     def test_stores_beyond_the_copy_budget_wait_for_the_next_batch(self):
