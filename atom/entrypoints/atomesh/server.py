@@ -146,6 +146,71 @@ def rust_frontend_mesh_args(
     return [*mesh_args, "--model-path", args.model]
 
 
+# ATOM's tool-call formats by the mesh router's name for the same syntax.
+# ATOM's `qwen` is the XML format (Qwen3.5, Qwen3-Coder), which the router
+# calls `qwen_xml`; its `qwen` is Qwen3's JSON-in-tag. GLM is left to the
+# router's model-name mapping: its 4.5 and 4.7 dialects are one ATOM parser.
+MESH_TOOL_CALL_PARSERS = {
+    "dsml": "dsml",
+    "dsml_v41": "dsml_v41",
+    "kimi": "kimik2",
+    "kimi_k3": "kimi_k3",
+    "minimax": "minimax",
+    "qwen": "qwen_xml",
+}
+
+
+def _mesh_reasoning_parser(dialect: Any) -> str | None:
+    """The router's parser for ATOM's reasoning dialect, or None to leave it
+    to the router. The `<think>` one starts outside reasoning: whether a
+    request's prompt opened the block is decided per request."""
+    from atom.entrypoints.openai import kimi_k3_tokens
+    from atom.entrypoints.openai.reasoning_dialects import THINK_END_MARKER
+
+    return {
+        kimi_k3_tokens.THINK_END: "kimi_k3",
+        THINK_END_MARKER: "qwen3",
+    }.get(dialect.think_end_marker)
+
+
+def rust_frontend_parser_args(
+    args: argparse.Namespace, mesh_args: list[str]
+) -> list[str]:
+    """`--tool-call-parser` / `--reasoning-parser` for the router, read off the
+    model the way ATOM's own server reads them, unless the launch named one.
+
+    The router's own choice goes by the served name, which misses a model
+    served under a path or a name of its own."""
+    from atom.entrypoints.openai.chat_encoders import (
+        chat_template_source,
+        load_custom_message_encoder,
+        render_probe_prompt,
+    )
+    from atom.entrypoints.openai.reasoning_dialects import resolve_dialect
+    from atom.entrypoints.openai.tool_parser.registry import (
+        resolve_tool_call_parser,
+    )
+
+    named = {arg.split("=", 1)[0] for arg in mesh_args}
+    encoder = load_custom_message_encoder(args.model)
+    parser_args = []
+    if "--tool-call-parser" not in named:
+        parser = resolve_tool_call_parser(None, tokenizer, encoder, model=args.model)
+        name = MESH_TOOL_CALL_PARSERS.get(parser.NAME) if parser else None
+        if name:
+            parser_args += ["--tool-call-parser", name]
+    if "--reasoning-parser" not in named:
+        dialect, _ = resolve_dialect(
+            chat_template_source(tokenizer, encoder),
+            render_probe_prompt(tokenizer, encoder, tools=False) or "",
+        )
+        name = _mesh_reasoning_parser(dialect)
+        if name:
+            parser_args += ["--reasoning-parser", name]
+    logger.info("Rust frontend parsers: %s", parser_args or "the router's own")
+    return parser_args
+
+
 def split_standalone_mesh_args(raw_args: list[str]) -> tuple[list[str], list[str]]:
     """Keep mesh-owned network args from being consumed by Python parsers.
 
@@ -276,6 +341,9 @@ def parse_standalone_args(raw_args: list[str]) -> StandaloneArgs:
         )
         engine_args.tool_call_parser = None
 
+    if engine_args.frontend == "rust":
+        # The router parses here, so an ATOM format name becomes its own.
+        forwarded = MESH_TOOL_CALL_PARSERS.get(forwarded, forwarded)
     mesh_args = mesh_args + mesh_network_args + _forward_tool_call_parser(forwarded)
     if engine_args.frontend == "rust":
         mesh_args = rust_frontend_mesh_args(engine_args, mesh_args)
@@ -293,6 +361,13 @@ def launch_atom_standalone(atomesh_runner: Any, raw_args: list[str]) -> None:
     cli_args = parsed_args["cli_args"]
     initialize_engine(standalone_args.engine_args)
     if standalone_args.frontend == "rust":
+        parser_args = rust_frontend_parser_args(
+            standalone_args.engine_args, standalone_args.mesh_args
+        )
+        if parser_args:
+            parsed_args = atomesh_runner.parse_from(
+                standalone_args.mesh_args + parser_args
+            )
         frontend = {
             "token_bridge": initialize_token_bridge(atomesh_runner),
             "served_model_name": served_model_name(standalone_args.engine_args),
