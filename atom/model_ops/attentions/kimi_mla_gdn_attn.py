@@ -18,7 +18,9 @@ from atom.model_ops.glm5_next.geometry import (
     pooled_path_enabled,
     speculative_kpool_history_size,
 )
+from atom.plugin import is_plugin_mode
 from atom.utils import CpuGpuBuffer, envs
+from atom.utils.region_graph import TokenGraphQueryLayout
 
 from .aiter_mla import (
     MLA_ROWS,
@@ -641,6 +643,23 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             )
 
         if hasattr(module, "base_attention") and getattr(module, "use_mla", False):
+            impl = getattr(module, "impl", None)
+            if isinstance(impl, MLAAttention):
+                layout = getattr(impl, "prefill_query_layout", None)
+                target = getattr(runner, "model", None)
+                valid = (
+                    isinstance(layout, TokenGraphQueryLayout)
+                    and impl.is_sparse_mla
+                    and layout.dtype == torch.bfloat16
+                    and layout.layer_num == impl.layer_num == module.layer_num
+                    and 0 <= module.layer_num < runner.hf_text_config.num_hidden_layers
+                    and not is_plugin_mode()
+                    and runner.config.parallel_config.data_parallel_size == 1
+                    and runner.config.prefill_context_parallel_size == 1
+                    and isinstance(target, torch.nn.Module)
+                    and any(candidate is module for candidate in target.modules())
+                )
+                impl.token_graph_query_layout = layout if valid else None
             # This module's MLA row. K3's linear-attention layers are bound
             # above and take none, and a shared draft's layers simply continue
             # the numbering, which is what the pool was sized for.

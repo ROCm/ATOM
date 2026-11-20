@@ -16,11 +16,13 @@ from aiter.ops.triton.gluon.pa_decode_gluon import (
 from torch import nn
 
 from atom.config import get_current_atom_config
+from atom.plugin import is_plugin_mode
 from atom.utils import envs, mark_spliting_op
-from atom.utils.region_graph import eager_region
+from atom.utils.forward_context import get_forward_context
+from atom.utils.region_graph import TokenGraphQueryLayout, eager_region
 from atom.utils.selector import Family, get_attn_backend
 
-from .attention_mla import MLAModules, _mla_output_width
+from .attention_mla import MLAAttention, MLAModules, _mla_output_width
 from .sp_attention import gather_heads, ulysses_attention
 
 logger = logging.getLogger("atom")
@@ -1001,6 +1003,49 @@ def fake_(
     return output
 
 
+def _mla_token_graph_forward(impl, q, q_scale, k, v, positions):
+    layout = getattr(impl, "token_graph_query_layout", None)
+    fwd_ctx = get_forward_context()
+    context = fwd_ctx.context
+    mode = getattr(context, "forward_mode", None)
+    if (
+        isinstance(impl, MLAAttention)
+        and isinstance(layout, TokenGraphQueryLayout)
+        and impl.is_sparse_mla
+        and not is_plugin_mode()
+        and layout.layer_num == impl.layer_num
+        and q.dtype == layout.dtype == torch.bfloat16
+        and q_scale is None
+        and context is not None
+        and context.is_prefill
+        and not context.is_dummy_run
+        and mode is not None
+        and mode.prefill_token_graph
+        and 0 < context.scheduled_tokens < q.shape[0]
+    ):
+        rows = context.scheduled_tokens
+        metadata = fwd_ctx.attn_metadata
+        slots = metadata.slot_mapping
+        # The cache writer sees only live slots; later draft readers keep the bucket.
+        metadata.slot_mapping = slots[:rows]
+        try:
+            result = impl.forward(
+                query=q[:rows],
+                k_nope=k[:rows],
+                k_rope=v[:rows],
+                positions=None if positions is None else positions[..., :rows],
+                q_scale=None,
+            )
+        finally:
+            metadata.slot_mapping = slots
+        padded = result.new_zeros((q.shape[0], *result.shape[1:]))
+        padded[:rows].copy_(result)
+        return padded
+    return impl.forward(
+        query=q, k_nope=k, k_rope=v, positions=positions, q_scale=q_scale
+    )
+
+
 # Dynamo will not try to inspect any of the internal operations for prefill or decode
 # This way, although attention operation is complicated,
 # we can still capture the model's computation graph as a full-graph
@@ -1019,6 +1064,8 @@ def unified_attention_with_output_base(
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
     if use_mla:
+        if getattr(self.impl, "token_graph_query_layout", None) is not None:
+            return _mla_token_graph_forward(self.impl, q, q_scale, k, v, positions)
         return self.impl.forward(
             query=q,
             k_nope=k,

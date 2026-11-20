@@ -27,7 +27,7 @@ from atom.config import Config, QuantizationConfig, get_current_atom_config
 # Dynamo-opaque custom op that dispatches the MoE between single- and dual-stream
 # forwards (shared with deepseek_v2/v4). Imported for the registration only.
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
-from atom.model_ops.attention_mla import MLAModules, qrep_tp_override
+from atom.model_ops.attention_mla import MLAAttention, MLAModules, qrep_tp_override
 from atom.model_ops.attention_residual import AttnRes
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
@@ -70,11 +70,12 @@ from atom.models.utils import (
     maybe_prefix,
     pp_holds_embedding,
 )
+from atom.plugin import is_plugin_mode
 from atom.quant_spec import effective_layer_quant
 from atom.utils import envs, mark_spliting_op
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
-from atom.utils.region_graph import eager_region, token_graph
+from atom.utils.region_graph import TokenGraphQueryLayout, eager_region, token_graph
 
 
 def _text_config(config):
@@ -860,6 +861,16 @@ class KimiFullAttention(nn.Module):
         )
         if self.indexer is not None:
             self.indexer.quantized_q = self.fuse_qknorm_quant
+        if not is_plugin_mode() and isinstance(self.attn.impl, MLAAttention):
+            # Only this owner knows whether q carries column/shuffled scales.
+            self.attn.impl.prefill_query_layout = (
+                TokenGraphQueryLayout(self.layer_num, self.qknorm_dtype)
+                if self.indexer is not None
+                and not self.fuse_qknorm_quant
+                and self.qknorm_dtype == torch.bfloat16
+                and 0 <= self.layer_num < getattr(config, "num_hidden_layers", 0)
+                else None
+            )
         # input_layernorm fuses its activation quant only when BOTH consumers of
         # the normed hidden state -- fused_qkv_a_proj and g_proj -- run with the
         # same fusable RMSNorm quant scheme (else a mismatched consumer mis-GEMMs).
