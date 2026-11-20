@@ -2627,3 +2627,60 @@ models:
             <<: *agentic_1m_aiperf
             wait_server_timeout: 7200
           run_eval: false
+
+        # Hosts the Store restore check (bin/evict_needle_pd.py) at light load: fp8 draft, draft window.
+        - name: m31v-nvfp4-1p1d-pp4-tp4-dspark7-fp8draft-mcstore-needlehost-c4
+          topology: 1p1d
+          display_topology: 1P1D-PP4-TP4-DSPARK7-NVFP4-MCSTORE-DRAFTWIN-PRVAL
+          pd_worker_layout: single_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [1048576]
+          osl: 1024
+          concurrency: [4]
+          prefill: *m31v_pp4_prefill
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: "[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160,176,192,208,224,240]"
+          server:
+            common_args:
+              max_num_seqs: 240
+              spec_decode_acceptance_length: 4.04
+          env:
+            common: *m31v_common_env
+            prefill: *m31v_prefill_env
+            decode: *m31v_decode_env
+          benchmark:
+            <<: *agentic_1m_aiperf
+            wait_server_timeout: 7200
+          run_eval: false
+
+        # The same with the default bf16 draft, Store on, draft window off.
+        - name: m31v-nvfp4-1p1d-pp4-tp4-dspark7-bf16draft-mcstore-needlehost-c4
+          topology: 1p1d
+          display_topology: 1P1D-PP4-TP4-DSPARK7-NVFP4-BF16DRAFT-MCSTORE-PRVAL
+          pd_worker_layout: single_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [1048576]
+          osl: 1024
+          concurrency: [4]
+          prefill: *m31v_pp4_prefill
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: "[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160,176,192,208,224,240]"
+          server:
+            common_args:
+              max_num_seqs: 240
+              spec_decode_acceptance_length: 4.04
+              extra_args: "--index-cache-dtype nvfp4"
+          env:
+            common: *m31v_common_env
+            prefill:
+              <<: *m31v_prefill_env
+              ATOM_MOONCAKE_STORE_DRAFT_WINDOW: "0"
+            decode: *m31v_decode_env
+          benchmark:
+            <<: *agentic_1m_aiperf
+            wait_server_timeout: 7200
+          run_eval: false
