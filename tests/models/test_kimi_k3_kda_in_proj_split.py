@@ -18,6 +18,7 @@ def modules():
             ops=load("atom.model_ops.kimi_k3"),
             glm=load("atom.models.glm5_next"),
             chip=load("aiter.jit.utils.chip_info"),
+            linear=load("atom.model_ops.linear"),
         )
 
 
@@ -37,6 +38,7 @@ def modules():
         ({"shape": (6285, 7168)}, "gfx950", False),
         ({"shape": (6284, 4096)}, "gfx950", False),
         ({"glm": True}, "gfx950", False),
+        ({"subclass": True}, "gfx950", False),
         ({"online_type": "No"}, "gfx950", True),
         ({"online_type": "per_Tensor"}, "gfx950", False),
         ({"online_type": "per_Token"}, "gfx950", False),
@@ -44,7 +46,7 @@ def modules():
         ({"online_type": "per_1x32"}, "gfx950", False),
     ],
 )
-def test_only_measured_native_geometry_is_supported(
+def test_only_supported_native_geometry_is_enabled(
     modules, monkeypatch, override, arch, accepted
 ):
     cls = (
@@ -52,6 +54,12 @@ def test_only_measured_native_geometry_is_supported(
         if override.get("glm")
         else modules.kimi.KimiKDAAttention
     )
+    if override.get("subclass"):
+
+        class Wrapper(cls):
+            pass
+
+        cls = Wrapper
     attn = object.__new__(cls)
     nn.Module.__init__(attn)
     for name, value in {
@@ -105,27 +113,55 @@ LP = HEADS * HEAD_DIM
 
 
 class _Projection(nn.Module):
-    def __init__(self, in_features, out_features, quant_type):
+    def __init__(self, in_features, out_features, quant_type, prefix):
         super().__init__()
         self.weight = nn.Parameter(
             (torch.randn(out_features, in_features) / 8).bfloat16(),
             requires_grad=False,
         )
         self.quant_type = quant_type
+        self.quant_config = None
+        self.prefix = prefix
+        self.bias = self.weight_scale = None
+        self.params_dtype = torch.bfloat16
+        self.native_a8_group_rows = None
+        self.is_output_padded = False
+        self.tp_dim = None
+        self.output_size = out_features
         self.calls = []
 
     def forward(self, x, x_scale=None):
         self.calls.append((x, x_scale))
-        return F.linear(x, self.weight)
+        return self._linear_forward(self, x, x_scale)
 
 
 def _attention(modules, monkeypatch, tokens):
     kimi = modules.kimi
     torch.manual_seed(0)
+    row_views = []
+
+    def row_view(self, start, length):
+        view = modules.linear.LinearBase.make_row_view(self, start, length)
+        view.calls = []
+        row_views.append(view)
+        return view
+
+    monkeypatch.setattr(_Projection, "make_row_view", row_view, raising=False)
+    monkeypatch.setattr(
+        _Projection,
+        "_linear_forward",
+        staticmethod(modules.linear.LinearBase.forward),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        modules.linear,
+        "tgemm",
+        SimpleNamespace(mm=lambda x, w, bias=None, **kwargs: F.linear(x, w, bias)),
+    )
 
     def linear(inputs, outputs, **kwargs):
         outputs = sum(outputs) if isinstance(outputs, list) else outputs
-        return _Projection(inputs, outputs, kimi.QuantType.No)
+        return _Projection(inputs, outputs, kimi.QuantType.No, kwargs["prefix"])
 
     for name in (
         "MergedColumnParallelLinear",
@@ -164,9 +200,14 @@ def _attention(modules, monkeypatch, tokens):
         return True
 
     monkeypatch.setattr(attn, "_supports_in_proj_split", qualify)
+    loaded_modules = set(dict(attn.named_modules()))
     attn.process_weights_after_loading()
     attn.process_weights_after_loading()
     assert qualifications == [True] and attn._split_in_proj
+    assert len(row_views) == 2
+    assert attn._in_proj_views == tuple(row_views)
+    # Views must not be reprocessed by the loader under their suffixed prefixes.
+    assert set(dict(attn.named_modules())) == loaded_modules
     assert attn.b_proj.weight.numel() == attn.f_a_proj.weight.numel() == 0
     monkeypatch.setattr(kimi, "causal_conv1d_fn", lambda x, *a, **k: x.T.split(LP, -1))
     monkeypatch.setattr(
@@ -197,23 +238,16 @@ def _attention(modules, monkeypatch, tokens):
         kv_cache_data={"layer_0": cache},
     )
     monkeypatch.setattr(kimi, "get_forward_context", lambda: ctx)
-    gemms = []
-
-    def mm(x, weight):
-        gemms.append(weight)
-        return F.linear(x, weight)
-
-    monkeypatch.setattr(kimi, "tgemm", SimpleNamespace(mm=mm))
-    return attn, meta, gemms, qualifications
+    return attn, meta, row_views, qualifications
 
 
 @pytest.mark.parametrize("tokens,padded", [(1, 1), (8191, 8192), (8192, 8192)])
 @torch.inference_mode()
 def test_real_prefill_matches_fused_projection(modules, monkeypatch, tokens, padded):
-    attn, _, gemms, qualifications = _attention(modules, monkeypatch, tokens)
+    attn, _, views, qualifications = _attention(modules, monkeypatch, tokens)
     x = torch.randn(padded, HIDDEN).bfloat16()
     got = attn._forward_impl(x)
-    weights = list(gemms)
+    weights = [view.weight for view in views if view.calls]
     assert len(attn.in_proj.calls) == (tokens < 8192)
     assert len(weights) == (2 if tokens >= 8192 else 0)
     if weights:
@@ -242,13 +276,27 @@ def test_real_prefill_matches_fused_projection(modules, monkeypatch, tokens, pad
     assert qualifications == [True]  # No qualification/probing during forward.
 
 
+@torch.inference_mode()
+def test_cached_row_views_follow_inplace_weight_updates(modules, monkeypatch):
+    attn, _, views, _ = _attention(modules, monkeypatch, 8192)
+    x = torch.randn(8192, HIDDEN).bfloat16()
+    before = attn._forward_impl(x)
+    cached = attn._in_proj_views
+    attn.in_proj.weight.add_(0.125)
+    got = attn._forward_impl(x)
+    assert attn._in_proj_views is cached and len(views) == 2
+    attn._split_in_proj = False
+    torch.testing.assert_close(got, attn._forward_impl(x))
+    assert not torch.equal(got, before)
+
+
 @pytest.mark.parametrize(
     "fallback", ["disabled", "decode", "scale", "dtype", "strided"]
 )
 def test_unsupported_inputs_call_the_original_projection(
     modules, monkeypatch, fallback
 ):
-    attn, meta, gemms, _ = _attention(modules, monkeypatch, 8192)
+    attn, meta, views, _ = _attention(modules, monkeypatch, 8192)
     x = torch.zeros(8193, HIDDEN, dtype=torch.bfloat16)
     scale = None
     if fallback == "disabled":
@@ -273,7 +321,7 @@ def test_unsupported_inputs_call_the_original_projection(
     monkeypatch.setattr(attn.in_proj, "forward", fused)
     with pytest.raises(ProjectionReached):
         attn._forward_impl(x, scale)
-    assert len(calls) == 1 and gemms == []
+    assert len(calls) == 1 and not any(view.calls for view in views)
     assert torch.equal(calls[0][0], x[:8192])
     assert calls[0][0].stride() == x.stride()
     if scale is not None:
