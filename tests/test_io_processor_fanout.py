@@ -46,6 +46,7 @@ def _engine_seqs(reqs) -> list[Sequence]:
     config = SimpleNamespace(
         kv_cache_block_size=4,
         speculative_config=None,
+        enable_dp_attention=False,
         hf_config=SimpleNamespace(model_type="llama"),
     )
     _, specs, _ = decode_client_message(encode_submit(reqs))
