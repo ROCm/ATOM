@@ -601,8 +601,9 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
 
         P can hold more: MTP lookahead pages, and with deferred output the page
         a finished prefill's one extra step takes when the prompt fills its
-        last page. D computes the first token's KV itself, and the send aborts
-        when it has more source pages than D has destinations.
+        last page. D computes the first token's KV itself, and the producer
+        aborts the send unless D's destination page count equals
+        ceil(source pages / src_block_skip_factor).
         """
         page_tokens = self.block_size * self.dcp_size
         return block_ids[: -(-seq.num_prompt_tokens // page_tokens)]

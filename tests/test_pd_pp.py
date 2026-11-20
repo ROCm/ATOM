@@ -221,10 +221,18 @@ def test_producer_advertises_remote_pp_size():
 
 
 @pytest.mark.parametrize("dcp_size", [1, 2])
-def test_producer_publishes_only_the_prompt_blocks(dcp_size):
+@pytest.mark.parametrize(
+    "extra_tokens, prompt_blocks",
+    [(0, [1, 2]), (1, [1, 2, 3])],
+    ids=["fills-last-block", "one-token-into-a-block"],
+)
+def test_producer_publishes_only_the_prompt_blocks(
+    dcp_size, extra_tokens, prompt_blocks
+):
     """With deferred output a finished prefill is scheduled for one more step,
     and a prompt that fills its last block gets a block for the first token
-    there. The consumer allocates the prompt's blocks only."""
+    there; MTP lookahead adds blocks too. The consumer allocates the prompt's
+    blocks only."""
     mc = pytest.importorskip(
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
     )
@@ -247,16 +255,16 @@ def test_producer_publishes_only_the_prompt_blocks(dcp_size):
         kv_transfer_params={"do_remote_decode": True},
         output_tokens=[7],
         spec_token_ids=None,
-        num_prompt_tokens=2 * 16 * dcp_size,
-        block_table=[1, 2, 3],
+        num_prompt_tokens=2 * 16 * dcp_size + extra_tokens,
+        block_table=[1, 2, 3, 4],
         id=99,
         state_slot=-1,
         state_slots=[],
         kv_transfer_params_output=None,
     )
     mc.MooncakeConnectorScheduler.request_finished(sched, seq)
-    assert seq.kv_transfer_params_output["remote_block_ids"] == [1, 2]
-    assert sched._reqs_need_save[seq.id][1] == [1, 2]
+    assert seq.kv_transfer_params_output["remote_block_ids"] == prompt_blocks
+    assert sched._reqs_need_save[seq.id][1] == prompt_blocks
 
 
 @pytest.mark.parametrize(
