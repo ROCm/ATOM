@@ -1067,8 +1067,38 @@ def _attention(
         )
 
 
-# The attention as one break in a recorded forward.
-_attention_region = eager_region()(_attention)
+@eager_region()
+def _attention_region(
+    q: torch.Tensor,
+    q_scale: torch.Tensor | None,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+    use_mla: bool,
+    qkv: torch.Tensor,
+) -> torch.Tensor:
+    """The attention as one break in a recorded forward. On a prefill padded
+    to a token-graph bucket (MiniMax-M3) it attends the scheduled rows alone,
+    as the eager step does, and hands the bucket back with zeros past them.
+    Unlike a split MLA layer's regions, which run the whole bucket, it serves
+    kernels not all known to skip a pad row: M3's FP8 index top-k runs every
+    row of ``q``."""
+    height = q.shape[0]
+    context = get_forward_context().context
+    rows = context.scheduled_tokens if context is not None and context.is_prefill else 0
+    if not 0 < rows < height:
+        return _attention(q, q_scale, k, v, positions, layer_name, use_mla, qkv)
+    q, q_scale, k, v, qkv = (
+        t[:rows] if t is not None and t.dim() and t.shape[0] == height else t
+        for t in (q, q_scale, k, v, qkv)
+    )
+    # Rows are positions' last dim (an mrope table leads with its axes).
+    out = _attention(q, q_scale, k, v, positions[..., :rows], layer_name, use_mla, qkv)
+    padded = out.new_empty((height, *out.shape[1:]))
+    padded[:rows].copy_(out)
+    padded[rows:].zero_()
+    return padded
 
 
 def linear_attention_with_output_base_fake(
