@@ -1407,8 +1407,8 @@ def _prepare_prompt(
 def _renders_without_mid_system(
     messages, template_kwargs: dict[str, Any], tools
 ) -> bool:
-    """Whether the template takes ``messages`` once the system messages after
-    the first one are dropped: run only after it refused them, to tell a
+    """Whether the template takes ``messages`` once every system message other
+    than ``messages[0]`` is dropped: run only after it refused them, to tell a
     template that wants its system message first from one that failed for
     another reason."""
     kept = [m for i, m in enumerate(messages) if i == 0 or m.role != "system"]
@@ -2497,6 +2497,11 @@ async def _chat_completions(
     except _ClientDisconnected:
         # Client hung up; seq already aborted + popped. Nothing to return.
         return JSONResponse(status_code=499, content={"detail": "client disconnected"})
+    except ContextLengthError as e:
+        logger.error(f"Validation error in {route}: {e}")
+        # The same 400 body as any other, but with OpenAI's
+        # context_length_exceeded code, which Codex reads.
+        return await value_error_handler(raw_request, e)
     except ValueError as e:
         logger.error(f"Validation error in {route}: {e}")
         raise HTTPException(status_code=400, detail=str(e))
@@ -2790,6 +2795,11 @@ async def _completions(
     except _ClientDisconnected:
         # Client hung up; seq already aborted + popped. Nothing to return.
         return JSONResponse(status_code=499, content={"detail": "client disconnected"})
+    except ContextLengthError as e:
+        logger.error(f"Validation error in {route}: {e}")
+        # The same 400 body as any other, but with OpenAI's
+        # context_length_exceeded code, which Codex reads.
+        return await value_error_handler(raw_request, e)
     except ValueError as e:
         logger.error(f"Validation error in {route}: {e}")
         raise HTTPException(status_code=400, detail=str(e))
