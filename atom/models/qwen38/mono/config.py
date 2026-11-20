@@ -32,7 +32,8 @@ HEAD_ROWS = (2, 4)
 KV_BLOCK = 64
 SUPPORTED_TP = (1,)
 # KV connectors served beside the programs: LMCache CPU offload's transfers are bounded gather / scatter kernels and
-# host copies on its own streams, fenced by events, that never wait on the model
+# host copies on its own streams, fenced by events, that never wait on the model. They can still contend with the
+# resident programs (ROCm/ATOM#3369); the polling backoff only mitigates that.
 OFFLOAD_CONNECTORS = ("lmcache_offload",)
 
 LAYERS = 48

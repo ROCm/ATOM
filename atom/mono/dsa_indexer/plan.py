@@ -16,6 +16,7 @@ by 128-key runs (``REPLICA_INTERLEAVE``: a score unit's keys stay one run).
 
 from dataclasses import dataclass
 
+from atom.model_ops.indexer.layout import MFMA, PRESHUFFLE
 from atom.mono.plan.arith import sel
 from atom.mono.plan.execution import BLOCKS, WAVES
 
@@ -47,6 +48,9 @@ class IndexerShape:
     # else the fused RoPE writer's (``indexer_qk_rope_quant_and_cache``)
     rope_dim: int
     rope_neox: bool = False  # the rotation's pairs: (d, d + half), else (2i, 2i + 1)
+    # FP4 must explicitly name OPUS's layout; the old FlyDSL plane has the
+    # same byte count but a different permutation.
+    cache_layout: str = PRESHUFFLE
 
     @property
     def qrows(self) -> int:
@@ -54,14 +58,25 @@ class IndexerShape:
         return self.heads * self.head_dim
 
     @property
+    def fp4(self) -> bool:
+        return self.kv_dtype == "fp4"
+
+    @property
     def row_bytes(self) -> int:
-        """A cache row: head_dim fp8 and an fp32 scale, padded to 16 B
-        (``aiter_mla.aligned_index_cache_dim``)."""
+        """Data plane bytes per row. FP8 includes an inline FP32 scale and
+        16 B padding; FP4 has a separate E8M0 plane."""
+        if self.kv_dtype == "fp4":
+            return self.head_dim // 2
         return -(-(self.head_dim + SCALE_BYTES) // 16) * 16
 
     @property
     def block_bytes(self) -> int:
         return self.block_rows * self.row_bytes
+
+    @property
+    def scale_block_bytes(self) -> int:
+        """An FP4 block's E8M0 plane, or zero when the cache has no scale plane."""
+        return self.block_rows * (self.head_dim // 32) if self.fp4 else 0
 
     @property
     def weights_scale(self) -> float:
@@ -74,6 +89,7 @@ class IndexerShape:
             f"h{self.heads}_d{self.head_dim}_topk{self.topk}_ql{self.q_lora}"
             f"_wq{self.wq_dtype}_kv{self.kv_dtype}_blk{self.block_rows}"
             f"_rope{self.rope_dim}{'n' if self.rope_neox else ''}"
+            + (f"_{self.cache_layout}" if self.kv_dtype == "fp4" else "")
         )
 
 
@@ -107,8 +123,12 @@ def unsupported(shape: IndexerShape) -> str:
     piece of the kernel written for one value, not a measured limit."""
     if shape.wq_dtype != "bf16":
         return f"wq_b {shape.wq_dtype}: the q GEMV reads bf16"
-    if shape.kv_dtype != "fp8":
-        return f"{shape.kv_dtype} index cache: the scorer reads FP8 keys"
+    if shape.kv_dtype not in ("fp8", "fp4"):
+        return f"{shape.kv_dtype} index cache: expected FP8 or MXFP4"
+    if shape.kv_dtype == "fp4" and (
+        shape.cache_layout != MFMA or shape.block_rows % 64
+    ):
+        return "FP4 requires OPUS gfx950 mfma layout and complete 64-row groups"
     if shape.rope_dim not in (0, ROPE_DIM):
         return f"index RoPE {shape.rope_dim}: the rotation is written for {ROPE_DIM}"
     if shape.head_dim != 128:

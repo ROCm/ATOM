@@ -69,6 +69,7 @@ def test_runtime_setting_reaches_draft_constructor(monkeypatch, dtype):
         max_position_embeddings=512,
         qk_rope_head_dim=64,
         rope_theta=10000,
+        fp4ptpc=False,
     )
     config = SimpleNamespace(
         hf_config=args, dspark=DSparkConfig(draft_kv_dtype=dtype), max_num_seqs=4

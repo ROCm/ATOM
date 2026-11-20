@@ -98,8 +98,10 @@ def _config(served, **over):
     return cfg
 
 
-def _drafter():
-    return SimpleNamespace(model=SimpleNamespace(block_backbone=None))
+def _drafter(lossless=None):
+    return SimpleNamespace(
+        model=SimpleNamespace(block_backbone=None), lossless=lossless
+    )
 
 
 def _builder(uva=True, overlap=True, engram=True):
@@ -292,6 +294,16 @@ def test_auto_leaves_other_gpus_on_atoms_path(mi355x, served, monkeypatch, devic
 def test_auto_without_flydsl(mi355x, served, monkeypatch):
     monkeypatch.setattr(hi_gate.importlib.util, "find_spec", lambda name: None)
     assert "FlyDSL" in hi_gate.refusal(served, _drafter(), _builder(), 0)
+
+
+def test_lossless_sampling_keeps_atoms_path(mi355x, served):
+    """The hi block draft is greedy and publishes no q, so a step it served
+    would leave the q slots lossless sampling claimed holding another draft's
+    q: an armed lossless drafter keeps the deployment on ATOM's path."""
+    assert hi_gate.refusal(served, _drafter(), _builder(), 0) == ""
+    why = hi_gate.refusal(served, _drafter(lossless=object()), _builder(), 0)
+    assert "lossless speculative sampling" in why
+    assert not hi_gate.decide(served, _drafter(lossless=object()), _builder(), 0)
 
 
 @pytest.mark.parametrize("tp", [2, 4, 8])
