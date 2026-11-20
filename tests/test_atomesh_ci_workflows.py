@@ -5,11 +5,13 @@
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
 from pathlib import Path
 
+import pytest
 import yaml
 from atomesh_workflow_helpers import github_expressions
 
@@ -81,25 +83,37 @@ def test_atomesh_accuracy_uses_required_heavy_ci_gate():
     assert "optional-results" not in evaluate_inputs
 
 
-def test_a_pull_request_checks_one_model_standalone_and_1p1d(tmp_path):
+def _accuracy_cases(tmp_path, event):
+    """The cases the accuracy workflow's load step writes for an event."""
     jobs = _jobs("atomesh-accuracy-validation.yaml")
-    assert jobs["atomesh-test"]["env"]["USE_ATOMESH_ENTRYPOINTS"] == 1
     load = next(s for s in jobs["load-test-models"]["steps"] if s.get("id") == "load")
     script = load["run"].split("python3 << 'PY'\n", 1)[1].split("\nPY\n", 1)[0]
-    output = tmp_path / "output"
+    output = tmp_path / f"output-{event}"
     subprocess.run(
         [sys.executable, "-c", script],
         cwd=WORKFLOWS.parents[1],
-        env=dict(os.environ, EVENT_NAME="pull_request", GITHUB_OUTPUT=str(output)),
+        env=dict(os.environ, EVENT_NAME=event, GITHUB_OUTPUT=str(output)),
         check=True,
         capture_output=True,
         timeout=30,
     )
-    models = json.loads(output.read_text().split("models_json=", 1)[1])
-    assert [(m["model_name"], m["serving"]) for m in models] == [
+    return json.loads(output.read_text().split("models_json=", 1)[1])
+
+
+def test_a_pull_request_checks_one_model_standalone_and_1p1d(tmp_path):
+    jobs = _jobs("atomesh-accuracy-validation.yaml")
+    assert jobs["atomesh-test"]["env"]["USE_ATOMESH_ENTRYPOINTS"] == 1
+    cases = _accuracy_cases(tmp_path, "pull_request")
+    assert [(c["model_name"], c["serving"]) for c in cases] == [
         ("gpt-oss-120b", "standalone"),
         ("gpt-oss-120b", "1p1d"),
     ]
+    assert "accuracy_timeout_minutes" not in cases[0]
+    assert cases[1]["accuracy_timeout_minutes"] == 45
+    assert jobs["atomesh-test"]["name"] == (
+        "Accuracy (${{ matrix.model_name }}"
+        "${{ matrix.serving == '1p1d' && ', 1P1D' || '' }})"
+    )
     accuracy = _steps(jobs["atomesh-test"])["Run ATOM accuracy test"]
     assert accuracy["env"]["SERVING"] == "${{ matrix.serving }}"
     assert 'launch="bash .github/scripts/atomesh_pd_accuracy.sh"' in accuracy["run"]
@@ -117,6 +131,55 @@ def test_the_accuracy_scope_matches_the_push_paths():
     assert ".github/scripts/atomesh_pd_accuracy.sh" in events["push"]["paths"]
 
 
+def test_every_accuracy_case_reaches_the_dashboard_with_its_models_threshold(
+    tmp_path,
+):
+    root = WORKFLOWS.parents[1]
+    catalog = root / ".github" / "benchmark" / "models_accuracy.json"
+    cases = _accuracy_cases(tmp_path, "schedule")
+    names = {
+        c["model_name"] + ("-1p1d" if c["serving"] == "1p1d" else ""): c["model_name"]
+        for c in cases
+    }
+    assert "gpt-oss-120b-1p1d" in names
+    results = tmp_path / "results"
+    for name in {*names, *names.values()}:
+        (results / f"accuracy-{name}").mkdir(parents=True)
+        (results / f"accuracy-{name}" / "result.json").write_text(
+            json.dumps({"results": {"gsm8k": {"exact_match,flexible-extract": 0.9}}})
+        )
+    output = tmp_path / "entries.json"
+    subprocess.run(
+        [
+            sys.executable,
+            str(root / ".github" / "scripts" / "accuracy_to_dashboard.py"),
+            str(results),
+            f"--output={output}",
+            f"--models={catalog}",
+            "--backend=ATOMesh",
+        ],
+        check=True,
+        capture_output=True,
+        timeout=30,
+    )
+    extra = {
+        e["name"]: e.get("extra", "")
+        for e in json.loads(output.read_text())
+        if e["name"].endswith(" accuracy (GSM8K)")
+    }
+    dashboard = (
+        root / ".github" / "dashboard" / "atomesh_mocker_index.html"
+    ).read_text()
+    shown = re.search(r"const atomeshModels=new Set\(\[(.*?)\]\)", dashboard).group(1)
+    for name, model in names.items():
+        assert f"'{name}'" in shown, name
+        assert "Threshold: " in extra[f"ATOMesh::{name} accuracy (GSM8K)"], name
+        assert (
+            extra[f"ATOMesh::{name} accuracy (GSM8K)"]
+            == extra[f"ATOMesh::{model} accuracy (GSM8K)"]
+        )
+
+
 def _read_when_written(path, timeout=10):
     deadline = time.monotonic() + timeout
     while not (path.exists() and path.read_text()):
@@ -125,43 +188,62 @@ def _read_when_written(path, timeout=10):
     return path.read_text()
 
 
-def test_the_1p1d_launcher_puts_the_router_in_front_of_both_servers(tmp_path):
+def _run_launcher(tmp_path, curl_exit=0, **env):
+    """Run the 1P1D launcher with the servers, the router and curl stubbed."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    # The servers and the router print how they were started into their logs.
+    # The servers and the router print how they were started into their logs,
+    # and curl logs the URLs it was given.
     stubs = {
         "python3": 'echo "GPUS=$HIP_VISIBLE_DEVICES ENTRY=$USE_ATOMESH_ENTRYPOINTS'
         ' HOME=$HOME $*"',
         "atomesh": 'echo "$*"',
-        "curl": "exit 0",
+        "curl": 'for a in "$@"; do case "$a" in http*) echo "$a" >> "$CURL_LOG";;'
+        f" esac; done\nexit {curl_exit}",
     }
     for name, body in stubs.items():
         (bin_dir / name).write_text(f"#!/bin/sh\n{body}\n")
         (bin_dir / name).chmod(0o755)
-    env = dict(
-        os.environ,
-        PATH=f"{bin_dir}:{os.environ['PATH']}",
-        TMPDIR=str(tmp_path),
-        ATOMESH_BINARY=str(bin_dir / "atomesh"),
-        ATOM_HOST_IP="10.0.0.5",
-        ATOM_SERVER_PORT="8000",
-        ATOM_SERVER_LOG=str(tmp_path / "atom_server.log"),
-    )
     script = WORKFLOWS.parent / "scripts" / "atomesh_pd_accuracy.sh"
-    subprocess.run(
+    return subprocess.run(
         ["bash", str(script), "/models/m", "--kv_cache_dtype", "fp8"],
-        env=env,
-        check=True,
+        env=dict(
+            os.environ,
+            PATH=f"{bin_dir}:{os.environ['PATH']}",
+            TMPDIR=str(tmp_path),
+            ATOMESH_BINARY=str(bin_dir / "atomesh"),
+            ATOM_HOST_IP="10.0.0.5",
+            ATOM_SERVER_PORT="8000",
+            ATOM_SERVER_LOG=str(tmp_path / "atom_server.log"),
+            CURL_LOG=str(tmp_path / "curl.log"),
+            **env,
+        ),
         capture_output=True,
+        text=True,
         timeout=60,
+        check=False,
     )
+
+
+@pytest.mark.parametrize(
+    "env, prefill_gpus, decode_gpus, decode_handshake_port",
+    [
+        ({}, "0", "1", "6302"),
+        ({"PREFILL_GPUS": "0,1", "DECODE_GPUS": "2"}, "0,1", "2", "6303"),
+    ],
+)
+def test_the_1p1d_launcher_puts_the_router_in_front_of_both_servers(
+    tmp_path, env, prefill_gpus, decode_gpus, decode_handshake_port
+):
+    result = _run_launcher(tmp_path, **env)
+    assert result.returncode == 0, result.stdout + result.stderr
 
     prefill = _read_when_written(tmp_path / "atom_prefill.log")
     decode = _read_when_written(tmp_path / "atom_decode.log")
     router = _read_when_written(tmp_path / "atom_server.log")
     for log, gpus, port, role, handshake_port in (
-        (prefill, "0", "8010", "kv_producer", "6301"),
-        (decode, "1", "8020", "kv_consumer", "6302"),
+        (prefill, prefill_gpus, "8010", "kv_producer", "6301"),
+        (decode, decode_gpus, "8020", "kv_consumer", decode_handshake_port),
     ):
         assert log.startswith(f"GPUS={gpus} ENTRY=0 "), log
         assert f"--model /models/m --server-port {port} --kv_cache_dtype fp8" in log
@@ -188,6 +270,21 @@ def test_the_1p1d_launcher_puts_the_router_in_front_of_both_servers(tmp_path):
         "--log-level",
         "info",
         "--disable-circuit-breaker",
+    ]
+    assert (tmp_path / "curl.log").read_text().split() == [
+        "http://10.0.0.5:8010/health",
+        "http://10.0.0.5:8020/health",
+        "http://127.0.0.1:8000/v1/models",
+        "http://127.0.0.1:8000/v1/completions",
+    ]
+
+
+def test_the_1p1d_launcher_fails_when_a_server_never_answers(tmp_path):
+    result = _run_launcher(tmp_path, curl_exit=7, WAIT_SECONDS="0")
+    assert result.returncode == 1
+    assert "atom_prefill.log" in result.stdout
+    assert (tmp_path / "curl.log").read_text().split() == [
+        "http://10.0.0.5:8010/health"
     ]
 
 

@@ -158,6 +158,11 @@ jobs:
               for serving, levels in (("standalone", atomesh_levels), ("1p1d", atomesh_pd_levels))
               if levels.get(m["model_name"], "skip") in allowed
           ]
+          # A 1P1D case starts two servers and the router within the accuracy
+          # step's time limit.
+          for case in cases:
+              if case["serving"] == "1p1d":
+                  case["accuracy_timeout_minutes"] = case.get("accuracy_timeout_minutes", 30) + 15
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"models_json={json.dumps(cases)}\n")
           print(f"Event={event} level={current}: {len(cases)} cases from {len(models)} models")
@@ -175,7 +180,7 @@ jobs:
 
   atomesh-test:
     needs: [ci-gate, download_aiter_wheel, load-test-models]
-    name: Accuracy
+    name: Accuracy (${{ matrix.model_name }}${{ matrix.serving == '1p1d' && ', 1P1D' || '' }})
     strategy:
       fail-fast: false
       matrix:
@@ -190,7 +195,8 @@ jobs:
       CONTAINER_NAME: atomesh_test_${{ strategy.job-index }}
       USE_ATOMESH_ENTRYPOINTS: 1
       ATOM_SERVER_PORT: 8000
-      # Names this case's artifacts; its threshold is still the model's.
+      # Names this case's artifacts and dashboard row. The gate and the dashboard
+      # hold a 1P1D case to its model's threshold and baseline.
       ACCURACY_NAME: ${{ matrix.model_name }}${{ matrix.serving == '1p1d' && '-1p1d' || '' }}
 
     steps:

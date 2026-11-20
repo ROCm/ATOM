@@ -14,8 +14,9 @@ on:
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review, labeled, closed]
-    # Do not use paths here. The required gate must be published for every PR;
-    # ci-gate below keeps the old path filter behavior for expensive jobs.
+    # Do not use paths here. The required gate must be published for every PR.
+    # No GPU or Slurm job runs on a PR, so there ci-gate only decides whether
+    # load-config runs.
   pull_request_review:
     types: [submitted]
   schedule:
