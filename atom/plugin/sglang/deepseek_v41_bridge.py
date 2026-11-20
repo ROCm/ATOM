@@ -84,6 +84,46 @@ def refuse_fp4ptpc_without_online_quant(atom_config: Any) -> None:
         raise ValueError(FP4PTPC_SGLANG_RECIPE)
 
 
+def fp8_kv_attention_backend(atom_config: Any) -> str | None:
+    """AITER's backend for the FP8 pool's sparse attention on this device, or
+    None: the query native makes for FP8 drafting
+    (``draft_kv.validate_fp8_draft_support``), on this rank's heads."""
+    from aiter.ops.mla_sparse_prefill import get_mla_sparse_prefill_v41_backend
+
+    from atom.model_ops.blockscale_kernels.quantization import FP8_DTYPE
+
+    model = atom_config.hf_config
+    return get_mla_sparse_prefill_v41_backend(
+        torch.device("cuda"),
+        (
+            1,
+            model.num_attention_heads // atom_config.tensor_parallel_size,
+            model.head_dim,
+        ),
+        unified_kv_dtype=FP8_DTYPE,
+        softmax_scale=model.head_dim**-0.5,
+        q_dtype=FP8_DTYPE,
+        q_scale_dtype=torch.float8_e8m0fnu,
+        unified_kv_scale_dtype=torch.float8_e8m0fnu,
+        kv_dtype=FP8_DTYPE,
+        kv_scale_dtype=torch.float8_e8m0fnu,
+        layout="contiguous",
+    )
+
+
+def refuse_fp8_kv_without_backend(atom_config: Any) -> None:
+    """Refuse the FP8 pool where AITER cannot attend over it; the forward
+    would only fail at the first decode-graph capture."""
+    if atom_config.kv_cache_dtype != "fp8" or fp8_kv_attention_backend(atom_config):
+        return
+    arch = torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName
+    raise ValueError(
+        "FP8 KV needs aiter's FP8 mla_sparse_prefill_v41 backend, which this "
+        f"device ({arch.split(':', 1)[0]}) lacks; launch with --kv-cache-dtype "
+        "bfloat16"
+    )
+
+
 # --- Launch contract ---
 
 
