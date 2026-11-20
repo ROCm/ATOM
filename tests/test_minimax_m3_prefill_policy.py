@@ -171,7 +171,9 @@ def test_prefill_score_config_cache_is_bounded():
     [
         (2517, 823, 1, 1),  # Q64 grouped
         (8193, 640, 1, 4),  # multi-plane
-        (131072, 2048, 1, 1),  # Q256
+        (131072, 2048, 1, 1),  # Q256, grouped stores from 2048 blocks
+        (8192, 1024, 1, 1),  # Q256 on a short row: one store a block
+        (5979, 4015, 1, 1),  # Q256, the c4 AgentX prefill (514K context)
         (1024, 640, 1, 1),  # default
         (96, 640, 1, 4),  # default
     ],
@@ -179,9 +181,14 @@ def test_prefill_score_config_cache_is_bounded():
 def test_fp4_takes_the_fp8_buckets_at_one_stage(q_len, blocks, batch, heads):
     """The FP4 index cache: the FP8 bucket for the shape, every tuned
     specialization at FP4_PREFILL_SCORE_NUM_STAGES (its rows are dequantized in
-    registers) and the multi-plane tile at four warps, the default left to the
-    generic launch policy."""
-    from atom.model_ops.minimax_m3.prefill_policy import FP4_PREFILL_SCORE_NUM_STAGES
+    registers), the multi-plane tile at four warps, the wide tile's stores
+    grouped on a long row, and the default left to the generic launch policy."""
+    from atom.model_ops.minimax_m3.prefill_policy import (
+        FP4_PREFILL_SCORE_NUM_STAGES,
+        FP4_WIDE_SCORE_BLOCK_SIZE_Q,
+        FP4_WIDE_STORE_GROUP,
+        FP4_WIDE_STORE_GROUP_MIN_BLOCKS,
+    )
 
     fp8 = prefill_score_config("gfx1250", True, q_len, blocks, batch, heads, 256)
     fp4 = prefill_score_config(
@@ -193,7 +200,14 @@ def test_fp4_takes_the_fp8_buckets_at_one_stage(q_len, blocks, batch, heads):
         want = fp8._replace(num_stages=FP4_PREFILL_SCORE_NUM_STAGES)
         if fp8 == MULTI_PLANE:
             want = want._replace(num_warps=4)  # two warps: 694 VGPRs on FP4
+        if (
+            fp8.block_size_q == FP4_WIDE_SCORE_BLOCK_SIZE_Q
+            and blocks >= FP4_WIDE_STORE_GROUP_MIN_BLOCKS
+        ):
+            want = want._replace(store_group=FP4_WIDE_STORE_GROUP)
         assert fp4 == want
+        # The FP8 buckets themselves do not move.
+        assert fp8.store_group == (4 if fp8.block_size_q == 64 else 1)
     # Off gfx1250 the FP4 cache keeps the default, as FP8 does.
     assert (
         prefill_score_config(
@@ -201,3 +215,15 @@ def test_fp4_takes_the_fp8_buckets_at_one_stage(q_len, blocks, batch, heads):
         )
         is DEFAULT_PREFILL_SCORE_CONFIG
     )
+
+
+@pytest.mark.parametrize(
+    "q_len, blocks, want_group",
+    [(5979, 4015, 4), (16384, 2344, 4), (8192, 1024, 1), (131072, 2047, 1)],
+)
+def test_fp4_wide_tile_groups_its_stores_on_a_long_row(q_len, blocks, want_group):
+    config = prefill_score_config("gfx1250", False, q_len, blocks, 1, 1, 256, fp4=True)
+    assert config.block_size_q == 256
+    assert config.store_group == want_group
+    # The grouped loop reads its pages one at a time, as the tile was tuned.
+    assert not config.prefetch_pages

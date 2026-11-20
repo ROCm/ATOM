@@ -126,11 +126,28 @@ def prefill_score_config(
             # The multi-plane Q128 tile: at two warps the FP4 build needs 694
             # VGPRs and spills SGPRs, at four 338.
             config = config._replace(num_warps=4)
+        if (
+            config.block_size_q == FP4_WIDE_SCORE_BLOCK_SIZE_Q
+            and max_block >= FP4_WIDE_STORE_GROUP_MIN_BLOCKS
+        ):
+            # The wide tile's stores, not its WMMAs, are what it waits on: one
+            # 4-byte store a (row, block), 256 rows apart. With no store at all
+            # the same loop runs 1.55x faster (MI455X, 5979 query tokens against
+            # 514K: 328us -> 212us a layer). Writing four blocks a row at once
+            # recovers part of that -- 328 -> 264us for the scorer, 414 -> 371us
+            # with the top-k, same scores -- on a long row; at 1024 blocks it
+            # loses 5%, so the short contexts keep one store a block.
+            config = config._replace(store_group=FP4_WIDE_STORE_GROUP)
     return config
 
 
 # Stages of every tuned FP4 prefill specialization (see `prefill_score_config`).
 FP4_PREFILL_SCORE_NUM_STAGES = 1
+# The FP4 wide (Q256) tile's grouped store: blocks a store, and the launch
+# bound from which it pays (see `prefill_score_config`).
+FP4_WIDE_SCORE_BLOCK_SIZE_Q = 256
+FP4_WIDE_STORE_GROUP = 4
+FP4_WIDE_STORE_GROUP_MIN_BLOCKS = 2048
 
 
 def _gfx1250_prefill_score_config(
