@@ -79,11 +79,11 @@ def test_other_modes_take_no_head(monkeypatch, modules, mode):
 @pytest.mark.parametrize(
     "params",
     [
-        dict(temperature=0.6),
-        dict(temperature=0.0, logprobs=True),
-        dict(temperature=0.0, json_schema="{}"),
-        dict(temperature=0.0, structured_tool_format="kimi"),
-        dict(temperature=0.0, required_channel=object()),
+        {"temperature": 0.6},
+        {"temperature": 0.0, "logprobs": True},
+        {"temperature": 0.0, "json_schema": "{}"},
+        {"temperature": 0.0, "structured_tool_format": "kimi"},
+        {"temperature": 0.0, "required_channel": object()},
     ],
 )
 def test_argmax_mode_rejects_a_request_it_cannot_serve(monkeypatch, params):
