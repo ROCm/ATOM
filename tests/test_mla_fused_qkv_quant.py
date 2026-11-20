@@ -203,6 +203,91 @@ def test_split_k_graph_replay_updates_rope_scale(tokens):
     torch.cuda.current_stream().wait_stream(stream)
 
 
+def _padded_qkv(bucket, rows, heads=12, nope=128, rope=64, v_dim=128):
+    """Q/K/V and K's RoPE part for a bucket whose rows past ``rows`` are far
+    louder than the real ones, so any that leaks into a descale shows."""
+    q = torch.randn(
+        (bucket, heads, 2 * (nope + rope)), device="cuda", dtype=torch.bfloat16
+    )[..., : nope + rope]
+    kv = torch.randn((bucket, heads, nope + v_dim), device="cuda", dtype=q.dtype)
+    k, v = kv.split([nope, v_dim], dim=-1)
+    k_rope = torch.randn((bucket, 1, rope), device="cuda", dtype=q.dtype)
+    for x in (q, k, v, k_rope):
+        x[rows:] = 1000
+    return q, k, v, k_rope
+
+
+@pytest.mark.parametrize(
+    "bucket, rows, heads",
+    # The first is small enough for the single-pass kernel.
+    [(16, 3, 1), (8, 5, 12), (512, 129, 12), (8192, 1001, 12), (512, 512, 12)],
+)
+def test_num_rows_quantizes_the_real_rows_alone(bucket, rows, heads):
+    """A token-graph bucket padded past the step's rows quantizes them as an
+    eager forward over them alone does, bit for bit, and its padding to zero."""
+    torch.manual_seed(bucket + rows)
+    nope, rope, v_dim = (16, 8, 16) if bucket == 16 else (128, 64, 128)
+    q, k, v, k_rope = _padded_qkv(bucket, rows, heads, nope, rope, v_dim)
+    num_rows = torch.tensor([rows], device="cuda", dtype=torch.int32)
+    actual = fused_qkv_per_tensor_quant(q, k, v, k_rope=k_rope, num_rows=num_rows)
+    expected = fused_qkv_per_tensor_quant(
+        q[:rows], k[:rows], v[:rows], k_rope=k_rope[:rows]
+    )
+    for a, e in zip(actual[:3], expected[:3]):
+        torch.testing.assert_close(a[:rows].float(), e.float(), rtol=0, atol=0)
+        assert torch.count_nonzero(a[rows:].float()).item() == 0
+    for a, e in zip(actual[3:], expected[3:]):
+        torch.testing.assert_close(a, e, rtol=0, atol=0)
+
+
+def test_num_rows_is_read_at_replay():
+    """A recording reads the row count in place, as a replayed token graph
+    reads its step's: each replay quantizes that step's real rows."""
+    bucket = 512
+    torch.manual_seed(bucket)
+    q, k, v, k_rope = _padded_qkv(bucket, bucket)
+    num_rows = torch.tensor([bucket], device="cuda", dtype=torch.int32)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            fused_qkv_per_tensor_quant(q, k, v, k_rope=k_rope, num_rows=num_rows)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            actual = fused_qkv_per_tensor_quant(
+                q, k, v, k_rope=k_rope, num_rows=num_rows
+            )
+        for rows in (bucket, 300, 1, 77):
+            for x in (q, k, v, k_rope):
+                x.copy_(torch.randn_like(x) * (rows % 7 + 1))
+                x[rows:] = 1000
+            num_rows.fill_(rows)
+            graph.replay()
+            expected = fused_qkv_per_tensor_quant(
+                q[:rows], k[:rows], v[:rows], k_rope=k_rope[:rows]
+            )
+            stream.synchronize()
+            for a, e in zip(actual[:3], expected[:3]):
+                torch.testing.assert_close(a[:rows].float(), e.float(), rtol=0, atol=0)
+            for a, e in zip(actual[3:], expected[3:]):
+                torch.testing.assert_close(a, e, rtol=0, atol=0)
+    torch.cuda.current_stream().wait_stream(stream)
+
+
+@pytest.mark.parametrize(
+    "num_rows",
+    [
+        lambda: torch.tensor([4], device="cuda"),  # int64
+        lambda: torch.tensor([4, 4], device="cuda", dtype=torch.int32),
+        lambda: torch.tensor([4], dtype=torch.int32),  # on the host
+    ],
+)
+def test_num_rows_must_be_one_int32_on_the_device(num_rows):
+    q = torch.zeros((4, 2, 16), device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="num_rows"):
+        fused_qkv_per_tensor_quant(q, q, q, num_rows=num_rows())
+
+
 @pytest.mark.parametrize("tokens", [0, 1, 17, 1001, 1024, 8192, 16384])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_kv_matches_dynamic_hip(tokens, dtype):
