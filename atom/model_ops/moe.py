@@ -3648,7 +3648,10 @@ def moe_forward_mxfp8_copy(
     self = atom_config.compilation_config.static_forward_context[layer_name]
     copy = _mxfp8_copy_buffers(hidden_states)
     out = self.forward_impl(hidden_states, router_logits, mxfp8_copy_out=copy)
-    return out, copy[0], copy[1]
+    # The scale leaves as bytes: this op mutates hidden_states, and Inductor
+    # does not decompose an auto_functionalized_v2 that returns E8M0
+    # ("auto_functionalized_v2 was not removed"). The caller views it back.
+    return out, copy[0], copy[1].view(torch.uint8)
 
 
 def moe_forward_mxfp8_copy_fake(
@@ -3656,7 +3659,8 @@ def moe_forward_mxfp8_copy_fake(
     router_logits: torch.Tensor,
     layer_name: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return (torch.empty_like(hidden_states), *_mxfp8_copy_buffers(hidden_states))
+    payload, scale = _mxfp8_copy_buffers(hidden_states)
+    return torch.empty_like(hidden_states), payload, scale.view(torch.uint8)
 
 
 moe_forward_mxfp8_copy_op = direct_register_custom_op(
@@ -5623,11 +5627,12 @@ class FusedMoE(torch.nn.Module):
         (E4M3, E8M0 per 32) for a shared expert run beside this layer. The
         routed quant writes them in its own pass where aiter's fused_moe takes
         the copy; any other path quantizes them separately."""
-        return moe_forward_mxfp8_copy_op(
+        out, payload, scale = moe_forward_mxfp8_copy_op(
             hidden_states,
             self._routing_logits(hidden_states, router_logits),
             self.layer_name,
         )
+        return out, payload, scale.view(torch.float8_e8m0fnu)
 
     def forward_maybe_comm_fused(
         self,
