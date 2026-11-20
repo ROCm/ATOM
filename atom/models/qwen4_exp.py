@@ -677,10 +677,10 @@ class _SequenceParallel:
     replace. Rows are padded to a multiple of the TP size; padded rows are
     zero streams and are dropped on gather.
 
-    Both collectives are the group's custom all-gather / reduce-scatter
-    (`use_custom=True`). A reduce-scatter above aiter's size cutoff falls back
-    to NCCL inside the group; SP all-gather inputs (at most 40 MiB) always fit
-    the custom pool.
+    Both collectives use the group's custom path when
+    `ATOM_USE_CUSTOM_ALL_GATHER` is enabled and its custom communicator is
+    available; otherwise they use the group's NCCL path. A reduce-scatter
+    above aiter's size cutoff falls back to NCCL inside the group.
     """
 
     def __init__(self, num_tokens: int, tp_size: int, tp_rank: int) -> None:
@@ -690,6 +690,11 @@ class _SequenceParallel:
         self.pad = self.chunk * tp_size - num_tokens
         self.start = tp_rank * self.chunk
         self.group = get_tp_group()
+        dc = self.group.device_communicator
+        ca = dc.ca_comm if dc is not None else None
+        self.use_custom = (
+            envs.ATOM_USE_CUSTOM_ALL_GATHER and ca is not None and not ca.disabled
+        )
 
     def shard(self, x: torch.Tensor) -> torch.Tensor:
         """Replicated `[T, ...]` -> this rank's rows (a view unless padded).
@@ -700,13 +705,13 @@ class _SequenceParallel:
 
     def gather(self, x: torch.Tensor) -> torch.Tensor:
         """This rank's rows -> all `[T, ...]` rows."""
-        out = self.group.all_gather(x.contiguous(), use_custom=True, dim=0)
+        out = self.group.all_gather(x.contiguous(), use_custom=self.use_custom, dim=0)
         return out[: self.num_tokens] if self.pad else out
 
     def scatter(self, x: torch.Tensor) -> torch.Tensor:
         """Per-rank partial sums over all `[T, ...]` rows -> summed local rows."""
         x = _pad_rows(x.contiguous(), self.pad)
-        return self.group.reduce_scatter_tensor(x, use_custom=True, dim=0)
+        return self.group.reduce_scatter_tensor(x, use_custom=self.use_custom, dim=0)
 
     @classmethod
     def maybe(cls, num_tokens: int) -> "_SequenceParallel | None":

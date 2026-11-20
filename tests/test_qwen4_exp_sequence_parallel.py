@@ -44,7 +44,11 @@ class _Collectives:
             return total.chunk(self.world)[rank].clone()
 
         return SimpleNamespace(
-            all_gather=all_gather, reduce_scatter_tensor=reduce_scatter_tensor
+            all_gather=all_gather,
+            reduce_scatter_tensor=reduce_scatter_tensor,
+            device_communicator=SimpleNamespace(
+                ca_comm=SimpleNamespace(disabled=False)
+            ),
         )
 
 
@@ -52,6 +56,7 @@ class _Collectives:
 def ranks(monkeypatch):
     """`ranks(world, fn)` runs `fn(rank)` on `world` simulated TP ranks; outside
     `ranks` the TP world size is 1."""
+    monkeypatch.setenv("ATOM_USE_CUSTOM_ALL_GATHER", "1")
     local = threading.local()
     monkeypatch.setattr(qwen4_exp, "get_tp_group", lambda: local.group)
     monkeypatch.setattr(qwen4_exp, "get_tensor_model_parallel_rank", lambda: local.rank)
@@ -124,6 +129,9 @@ class _RecordingGroup:
 
     def __init__(self):
         self.calls = []
+        self.device_communicator = SimpleNamespace(
+            ca_comm=SimpleNamespace(disabled=False)
+        )
 
     def all_gather(self, x, use_custom=False, dim=0):
         self.calls.append(("all_gather", x.dtype, use_custom, dim))
@@ -134,12 +142,33 @@ class _RecordingGroup:
         return 2 * x[: x.shape[0] // 2]
 
 
-def test_collectives_take_the_groups_custom_path(monkeypatch):
-    """SP gathers BF16 streams and int32 QSA groups and scatters BF16 sums,
-    all through the group's custom collectives on dim 0."""
+@pytest.mark.parametrize(
+    "enabled,communicator,use_custom",
+    [
+        (True, "enabled", True),
+        (False, "enabled", False),
+        (True, "no_device", False),
+        (True, "no_custom", False),
+        (True, "disabled", False),
+    ],
+)
+def test_collectives_honor_custom_availability(
+    monkeypatch, enabled, communicator, use_custom
+):
+    """BF16 streams, int32 QSA groups and BF16 partial sums share one gate,
+    including the operator's opt-out and unavailable custom communicators."""
     group = _RecordingGroup()
+    if communicator == "no_device":
+        group.device_communicator = None
+    elif communicator == "no_custom":
+        group.device_communicator.ca_comm = None
+    elif communicator == "disabled":
+        group.device_communicator.ca_comm.disabled = True
+    monkeypatch.setenv("ATOM_USE_CUSTOM_ALL_GATHER", str(int(enabled)))
     monkeypatch.setattr(qwen4_exp, "get_tp_group", lambda: group)
     sp = qwen4_exp._SequenceParallel(7, 2, 0)
+    # The per-forward object binds the choice once, for both collectives.
+    monkeypatch.setenv("ATOM_USE_CUSTOM_ALL_GATHER", str(int(not enabled)))
     mixed = torch.randn(4, 3, dtype=torch.bfloat16)
     assert torch.equal(sp.gather(mixed), torch.cat([mixed, mixed])[:7])
     groups = torch.arange(4, dtype=torch.int32)
@@ -147,10 +176,31 @@ def test_collectives_take_the_groups_custom_path(monkeypatch):
     partial = torch.ones(7, 2, dtype=torch.bfloat16)
     assert torch.equal(sp.scatter(partial), torch.full_like(partial[:4], 2.0))
     assert group.calls == [
-        ("all_gather", torch.bfloat16, True, 0),
-        ("all_gather", torch.int32, True, 0),
-        ("reduce_scatter", torch.bfloat16, True, 0),
+        ("all_gather", torch.bfloat16, use_custom, 0),
+        ("all_gather", torch.int32, use_custom, 0),
+        ("reduce_scatter", torch.bfloat16, use_custom, 0),
     ]
+
+
+def test_collectives_keep_simulated_tp_shims(monkeypatch):
+    """A single physical rank has no communicator; the real simulated-TP
+    methods must still zero-fill absent ranks and return the local sum."""
+    from atom.distributed.simulated_tp import _patch_group
+
+    group = _RecordingGroup()
+    group.device_communicator = None
+    group.device_group = None
+    group.rank_in_group = 0
+    _patch_group(group, logical=4, physical=1)
+    monkeypatch.setenv("ATOM_USE_CUSTOM_ALL_GATHER", "1")
+    monkeypatch.setattr(qwen4_exp, "get_tp_group", lambda: group)
+    sp = qwen4_exp._SequenceParallel(7, 4, 0)
+    local = torch.arange(6, dtype=torch.int32).view(2, 3)
+    expected = torch.cat([local, torch.zeros(5, 3, dtype=torch.int32)])
+    assert torch.equal(sp.gather(local), expected)
+    partial = torch.arange(21, dtype=torch.float32).view(7, 3)
+    assert torch.equal(sp.scatter(partial), partial[:2])
+    assert group.calls == []
 
 
 class _Layer:
