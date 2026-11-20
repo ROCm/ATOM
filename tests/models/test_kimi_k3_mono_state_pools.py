@@ -74,7 +74,7 @@ def test_matching_pools_give_the_build_constant(monkeypatch):
     [
         ({"channels": QKV + 1}, "no axis of"),
         ({"conv": torch.float16}, "conv state"),
-        ({"rec": torch.bfloat16}, "recurrent state"),
+        ({"rec": torch.bfloat16}, r"layer 2: recurrent state torch\.bfloat16"),
     ],
 )
 def test_a_later_mono_layers_bad_pool_is_refused_at_bind(monkeypatch, broken, match):
