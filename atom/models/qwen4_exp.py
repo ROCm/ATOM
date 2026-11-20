@@ -665,21 +665,6 @@ def _pad_rows(x: torch.Tensor, missing: int) -> torch.Tensor:
     return nn.functional.pad(x, (0, 0) * (x.dim() - 1) + (0, missing))
 
 
-def _pynccl(group, tp_size: int):
-    """The TP group's PyNccl communicator, or None to use the group's own
-    collectives.
-
-    None under simulated TP (`atom/distributed/simulated_tp.py`): its group
-    reports more ranks than it has devices and pads the absent ones in the
-    collectives it patches, which a direct PyNccl call would skip."""
-    if torch.distributed.get_world_size(group.device_group) != tp_size:
-        return None
-    comm = group.device_communicator.pynccl_comm
-    if comm is None or comm.disabled:
-        return None
-    return comm
-
-
 class _SequenceParallel:
     """Token sharding of the HC residual streams across the TP ranks.
 
@@ -692,9 +677,10 @@ class _SequenceParallel:
     replace. Rows are padded to a multiple of the TP size; padded rows are
     zero streams and are dropped on gather.
 
-    Both collectives use the group's PyNccl communicator when it has one: the
-    same NCCL collective on the current stream, with less host time than the
-    torch.distributed call `GroupCoordinator` makes for `use_custom=False`.
+    Both collectives are the group's custom all-gather / reduce-scatter
+    (`use_custom=True`). A reduce-scatter above aiter's size cutoff falls back
+    to NCCL inside the group; SP all-gather inputs (at most 40 MiB) always fit
+    the custom pool.
     """
 
     def __init__(self, num_tokens: int, tp_size: int, tp_rank: int) -> None:
@@ -704,7 +690,6 @@ class _SequenceParallel:
         self.pad = self.chunk * tp_size - num_tokens
         self.start = tp_rank * self.chunk
         self.group = get_tp_group()
-        self.pynccl = _pynccl(self.group, tp_size)
 
     def shard(self, x: torch.Tensor) -> torch.Tensor:
         """Replicated `[T, ...]` -> this rank's rows (a view unless padded).
@@ -715,23 +700,13 @@ class _SequenceParallel:
 
     def gather(self, x: torch.Tensor) -> torch.Tensor:
         """This rank's rows -> all `[T, ...]` rows."""
-        x = x.contiguous()
-        if self.pynccl is None:
-            out = self.group.all_gather(x, use_custom=False, dim=0)
-        else:
-            out = x.new_empty((x.shape[0] * self.tp_size, *x.shape[1:]))
-            self.pynccl.all_gather(out, x)
+        out = self.group.all_gather(x.contiguous(), use_custom=True, dim=0)
         return out[: self.num_tokens] if self.pad else out
 
     def scatter(self, x: torch.Tensor) -> torch.Tensor:
         """Per-rank partial sums over all `[T, ...]` rows -> summed local rows."""
         x = _pad_rows(x.contiguous(), self.pad)
-        if self.pynccl is None:
-            return self.group.reduce_scatter_tensor(x, use_custom=False, dim=0)
-        assert x.shape[0] == self.chunk * self.tp_size, (x.shape, self.chunk)
-        out = x.new_empty((self.chunk, *x.shape[1:]))
-        self.pynccl.reduce_scatter(out, x)
-        return out
+        return self.group.reduce_scatter_tensor(x, use_custom=True, dim=0)
 
     @classmethod
     def maybe(cls, num_tokens: int) -> "_SequenceParallel | None":
