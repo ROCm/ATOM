@@ -14,9 +14,9 @@ from atom.config import Config
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
 from atom.model_engine.prefix_hash import hash_block_size_for, ship_prompt_hash_chain
 from atom.model_engine.segment_tokenizer import PrefixEncoding, SegmentTokenizer
-from atom.model_engine.sequence import Sequence
+from atom.model_engine.sequence import PER_REQ_CACHE_MODEL_TYPES, Sequence
 from atom.multimodal.registry import get_mrope_input_positions
-from atom.sampling_params import RequiredChannel, SamplingParams
+from atom.sampling_params import EngineChannel, SamplingParams
 from atom.structured_output import is_structured
 from atom.structured_output.validation import (
     WorkerGrammarPreflight,
@@ -672,11 +672,7 @@ class InputOutputProcessor:
         self.block_size = block_size
         self.structured_admission = None
         self.requests = {}
-        # The one channel `tool_choice="required"` holds this engine's requests
-        # to (`_engine_channel`): as the server's format named it, and as built
-        # from that once with every id this engine stops on held back.
-        self._format_channel: RequiredChannel | None = None
-        self._required_channel: RequiredChannel | None = None
+        self.engine_channel = EngineChannel(config)
         self.segment_tokenizer = SegmentTokenizer.maybe_create(
             tokenizer, envs.ATOM_TOKENIZE_CACHE_MB << 20
         )
@@ -696,7 +692,7 @@ class InputOutputProcessor:
             self.num_speculative_tokens = (
                 self.config.speculative_config.num_speculative_tokens
             )
-        if self.config.hf_config.model_type in self._per_req_cache_model_types():
+        if self.config.hf_config.model_type in PER_REQ_CACHE_MODEL_TYPES:
             self.has_per_req_cache = True
         # `BlockManager.hash_block_size`, for shipping the prompt hash chain;
         # 0 = no prefix cache. The engine rehashes on a mismatch.
@@ -706,29 +702,6 @@ class InputOutputProcessor:
             self.prefix_hash_block_size = hash_block_size_for(
                 block_size, config.decode_context_parallel_size
             )
-
-    @staticmethod
-    def _per_req_cache_model_types() -> frozenset[str]:
-        """Single source of truth for which model_types use per-req cache.
-
-        Read by Sequence-construction (here) AND by ModelRunner's startup
-        sanity check, which asserts that any model whose attention builder
-        declares a per-request state sub-pool has its model_type
-        registered here. Adding a new stateful-attention model means
-        adding its model_type to this set.
-        """
-        return frozenset(
-            {
-                "qwen3_next",
-                "qwen3_5_text",
-                "qwen3_5_moe_text",
-                "kimi_linear",
-                "glm5_next_text",
-                "deepseek_v4",
-                "deepseek_v41_text",
-                "qwen4_exp_text",
-            }
-        )
 
     def preprocess(
         self,
@@ -767,31 +740,6 @@ class InputOutputProcessor:
             dp_parent_session_id=dp_parent_session_id,
         )
         return seqs[0]
-
-    def _engine_channel(self, channel: RequiredChannel) -> RequiredChannel:
-        """The channel a required request is held to on this engine.
-
-        Hold its opening against every single id this engine ends a sequence
-        on (`Scheduler.postprocess` stops on EOS and on `stop_token_ids`), not
-        just the ones the tool-call format named. The third way a sequence
-        ends, the request's own `stop` strings, is left to end it: the client
-        asked for that stop, and a multi-token match is not one logits row's
-        mask.
-
-        Built once, from the first required request, and shared by every
-        later one. A request naming a different channel is refused here, at
-        admission, where it fails alone; the engine loop batches every
-        request together and holds one channel.
-        """
-        if self._required_channel is None:
-            held = channel.ending_on(self.config.end_token_ids)
-            self._format_channel, self._required_channel = channel, held
-        elif channel != self._format_channel and channel != self._required_channel:
-            raise ValueError(
-                'this engine already holds tool_choice="required" requests to '
-                "another channel; a server resolves one tool-call format"
-            )
-        return self._required_channel
 
     def encode_prompt(
         self, prompt: str, *, multimodal: bool = False
@@ -901,7 +849,9 @@ class InputOutputProcessor:
         if sampling_params.required_channel is not None:
             sampling_params = replace(
                 sampling_params,
-                required_channel=self._engine_channel(sampling_params.required_channel),
+                required_channel=self.engine_channel.hold(
+                    sampling_params.required_channel
+                ),
             )
 
         if stream_callbacks is not None and len(stream_callbacks) != n:

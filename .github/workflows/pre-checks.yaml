@@ -94,6 +94,9 @@ jobs:
           python-version: "3.12"
       - name: Install dependencies
         run: |
+          # protoc checks the checked-in engine_v1_pb2.py against the .proto
+          # (tests/test_engine_v1_pb2_sync.py), which fails under CI without it.
+          sudo apt-get update && sudo apt-get install -y protobuf-compiler
           pip3 install torch --index-url https://download.pytorch.org/whl/cpu
           # Isolate CPU test installation from unrelated repository tags (e.g.
           # lmcache-*). Release and GPU benchmark versions are resolved separately.
