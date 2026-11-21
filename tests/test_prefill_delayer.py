@@ -107,6 +107,29 @@ def skip_first(d):
     assert call(d, pending_tokens=0) is True
 
 
+def test_nonprefillable_rank_does_not_dilute_peer_fill_budget():
+    d = make_delayer(dp_size=2)
+    skip_first(d)
+    # The peer can admit 100 tokens and already has 80 pending. This rank
+    # cannot admit anything; its nominal 16K budget must not turn FIRE to HOLD.
+    seen = []
+
+    def reduce(tensor, **kwargs):
+        seen.append(int(tensor[PREFILL_BUDGET]))
+        return _add_rank({0: 1, 1: 80, 2: 1, PREFILL_BUDGET: 100})(tensor)
+
+    assert call(
+        d,
+        prefillable=False,
+        pending_tokens=0,
+        running_decode_batch=1,
+        waiting_requests=1,
+        prefill_budget=MAX_BATCHED,
+        reduce=reduce,
+    )
+    assert seen == [0]
+
+
 class TestSkipFirst:
     def test_first_call_fires(self):
         d = make_delayer()

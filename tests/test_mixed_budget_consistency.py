@@ -31,6 +31,56 @@ def _decode(sched, seed):
     return seq
 
 
+@pytest.mark.parametrize(
+    "probe",
+    [
+        "_local_prefill_pending_work",
+        "_can_admit_head_prefill",
+        "_estimate_prefill_chunk_cost",
+        "_admission_probe",
+    ],
+)
+def test_schedule_passes_reserved_limits_to_every_prefill_probe(monkeypatch, probe):
+    from atom.model_engine.prefill_delayer import PrefillDecision
+
+    sched = Scheduler(
+        MockConfig(
+            num_kvcache_blocks=20,
+            max_num_seqs=4,
+            max_num_batched_tokens=16,
+            enable_mixed_prefill_decode=True,
+        )
+    )
+    old = _decode(sched, 3)
+    new = Sequence([20] * 8, block_size=4)
+    sched.add(new)
+    expected = sched._prefill_limits()
+    assert expected.reserved_decode_blocks == 1 and expected.tokens == 15
+    original = getattr(sched, probe)
+    seen = []
+
+    def checked(*args, **kwargs):
+        limits = kwargs.get("limits", args[0] if args else None)
+        seen.append(limits)
+        assert limits == expected
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(sched, probe, checked)
+    if probe != "_admission_probe":
+        sched._local_prefill_coalescing = probe == "_local_prefill_pending_work"
+        sched.cost_balance = probe == "_estimate_prefill_chunk_cost"
+        sched.prefill_delayer = SimpleNamespace(
+            protects_decode=lambda count: False,
+            max_queue_ms=None,
+            should_allow_prefill=lambda **kw: PrefillDecision(
+                allow=False, prefillable_ranks=1
+            ),
+        )
+    batch, _ = sched._schedule()
+    assert seen
+    assert old.id in batch.req_ids and sched.total_preemptions == 0
+
+
 @pytest.mark.parametrize("prefix", [False, True])
 def test_all_prefill_probes_protect_decode_pages(prefix):
     sched = Scheduler(

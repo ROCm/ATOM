@@ -3650,7 +3650,11 @@ class Config:
         if not self.enable_mixed_prefill_decode:
             return
 
-        from atom.kv_transfer.disaggregation.pd_producer import disaggregated_kv_role
+        from atom.kv_transfer.disaggregation.factory import (
+            PD_TRANSFER_BACKENDS,
+            KVConnectorFactory,
+        )
+        from atom.kv_transfer.disaggregation.types import kv_config_has_producer
         from atom.utils import get_hf_text_config
         from atom.utils.selector import Family, attn_family
 
@@ -3660,6 +3664,14 @@ class Config:
         spec_method = None if spec is None else spec.method
         cg_mode = self.compilation_config.cudagraph_mode
         rope_parameters = getattr(hf, "rope_parameters", None) or {}
+        # Offload uses kv_producer for save-only operation on the ordinary
+        # engine. Only a P/D transport makes the engine prefill-only. Resolve
+        # aliases and nested composites through the same factory as startup.
+        pd_producer = any(
+            name in PD_TRANSFER_BACKENDS
+            and leaf.kv_transfer_config.get("kv_role", "kv_producer") == "kv_producer"
+            for name, leaf in (KVConnectorFactory.leaf_connectors(self) or ())
+        )
         # (is this config affected, what it is, why it cannot run mixed)
         refusals = [
             (
@@ -3668,9 +3680,14 @@ class Config:
                 "its separate prefill/decode schedulers do not form mixed batches",
             ),
             (
-                disaggregated_kv_role(self) == "kv_producer",
+                pd_producer,
                 "P/D kv_producer",
                 "a prefill-only producer cannot use mixed scheduling or its memory profile",
+            ),
+            (
+                spec is not None and kv_config_has_producer(self.kv_transfer_config),
+                "speculative decoding with kv_producer",
+                "producer scheduling disables verification but mixed profiling uses the configured draft width",
             ),
             (
                 self.enable_tbo or self.enable_tbo_decode,
@@ -3701,7 +3718,7 @@ class Config:
                 f"--cudagraph-mode {getattr(cg_mode, 'name', cg_mode)} on DeepSeek-V4",
                 (
                     "a TR_HYBRID V4 layer runs its narrow split order on every "
-                    "forward, which has no mixed form; use FULL (the default), "
+                    "forward, which has no mixed form; use FULL (the CLI default), "
                     "FULL_DECODE_ONLY or NONE"
                 ),
             ),
@@ -3710,7 +3727,7 @@ class Config:
             # spec-shaped `prepare_decode` with decode-local rejection counts. See
             # docs/scheduling_kv_cache_guide.md#mixed-prefill-and-decode-on-deepseek-v4.
             (
-                spec is not None and spec_method != "dspark",
+                spec is not None and not spec.use_dspark(),
                 f"speculative decoding via {spec_method!r}",
                 (
                     "only DSpark is wired through the mixed split so far; MTP "

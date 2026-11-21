@@ -399,29 +399,19 @@ class tokenIDProcessor:
         # `take_deferred_spec_status`.
         self.spec_status_owed = False
 
-    def verify_ctx_lens(
-        self, context_lens: np.ndarray, *, num_rejected: np.ndarray | None = None
-    ) -> np.ndarray:
+    def verify_ctx_lens(self, context_lens: np.ndarray) -> np.ndarray:
         """`batch.context_lens` moved back to the start of this verify window.
 
         Deferred output: the last step's `num_rejected` slots are still in
         `context_lens`. Undeferred (PP): postprocess already left one run of
         `mtp_k + 1` placeholders, so the shift is 1. Before any sampler output
         there is nothing to shift. Only a verify step has a window, so every
-        caller sits behind `max_seqlen_q > 1`, or supplies mixed segment counts.
+        caller sits behind `max_seqlen_q > 1`.
         """
-        # Idle DP steps run only padding, while the previous step's status
-        # may still be present. There are no request contexts to correct.
-        num_contexts = len(context_lens)
-        if not num_contexts:
+        if self.num_rejected is None:
             return context_lens
-        rejected = self.num_rejected if num_rejected is None else num_rejected
-        if rejected is None:
-            return context_lens
-        if len(rejected) != num_contexts:
-            raise ValueError("num_rejected is not aligned with decode rows")
-        shift = rejected if self.is_deferred_out else 1
-        return np.subtract(context_lens, shift, dtype=context_lens.dtype)
+        shift = self.num_rejected if self.is_deferred_out else 1
+        return context_lens - np.asarray(shift, dtype=context_lens.dtype)
 
     @staticmethod
     def _batch_process_token_ids(token_ids: list) -> list[tuple[int, ...]]:
@@ -2367,6 +2357,7 @@ class ModelRunner:
         # models with only one type of attention, but not support multi-type of attention models.
         # We need to support it by kv_cache_group in the future.
 
+        # Use the global layer number, not the local PP stage's walk index.
         kv_cache_data = {
             f"layer_{module.layer_num}": tensor
             for module, tensor in kv_cache_bindings(self)
@@ -3484,8 +3475,6 @@ class ModelRunner:
           its chunk's last TOKEN row, not its logit row.
         * a decode row's logit row `n_p + j` is token row `n_p_tokens + j`.
         """
-        if not batch.is_mixed:
-            return
         n_p = batch.total_seqs_num_prefill
         num_reject_tokens[:n_p] = 0
         rows = get_forward_context().attn_metadata.sampled_token_indices

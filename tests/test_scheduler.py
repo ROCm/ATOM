@@ -2428,6 +2428,7 @@ class TestNextDecodeCompletionSteps:
         assert scheduler._next_decode_completion_steps() == 2
         # not speculating: a token a step
         scheduler.use_spec = False
+        scheduler.mtp_k = 0  # __init__ clears the effective width with use_spec
         assert scheduler._next_decode_completion_steps() == 7
 
 
@@ -4350,7 +4351,7 @@ class TestMixedBatch:
 
 
 class TestMixedSpecDecodeReserve:
-    """Decode-first reserves what the decode loop spends, `decode_spec_width+1`.
+    """Decode-first reserves what the decode loop spends, `mtp_k+1`.
 
     The reserve used to be written against `mtp_k + 1` while the loop spent
     `spec_width + 1`; they only agree when this engine verifies locally.
@@ -4372,13 +4373,13 @@ class TestMixedSpecDecodeReserve:
         )
 
     def test_spend_and_reserve_share_one_width(self):
-        assert self._sched(3).decode_spec_width == 3
+        assert self._sched(3).mtp_k == 3
         # PP now verifies drafts locally. Mixed + PP speculation is gated
         # separately; the ordinary PP scheduler must retain the draft width.
         assert (
             self._sched(
                 3, pipeline_parallel_size=2, enable_mixed_prefill_decode=False
-            ).decode_spec_width
+            ).mtp_k
             == 3
         )
 

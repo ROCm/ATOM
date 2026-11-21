@@ -2343,27 +2343,22 @@ class DeepseekV4Attention(nn.Module):
         if fc.context.is_dummy_run or os.environ.get("ATOM_V4_BYPASS_ATTN") == "1":
             return torch.zeros_like(x)
 
-        # A mixed batch has no whole-batch compressor plan: its carrier holds
-        # compress_plans=None and each half's plans live on its own
-        # sub-metadata, so `_attn_mixed` launches them per segment.
-        attn_md = cast("AttentionMetaData_DSV4", fc.attn_metadata)
-        is_mixed = fc.context.is_prefill and attn_md.is_mixed
-        if not is_mixed:
-            self._launch_compressors(x)
+        if fc.context.is_prefill and fc.attn_metadata.is_mixed:
+            # Each half owns its compressor plan; the carrier has none.
+            q, kv_pre, qr, qr_scale, *_ = self._attn_pre(
+                x, positions, run_indexer_proj=False
+            )
+            o = self._attn_mixed(
+                fc.attn_metadata, q, kv_pre, qr, qr_scale, x, positions
+            )
+            return self._attn_post(o, positions)
+
+        self._launch_compressors(x)
         q, kv_pre, qr, qr_scale, *_ = self._attn_pre(
             x, positions, run_indexer_proj=False
         )
-        if is_mixed:
-            o = self._attn_mixed(attn_md, q, kv_pre, qr, qr_scale, x, positions)
-        else:
-            qkn = self._qk_norm_rope(q, kv_pre, positions)
-            o = self._sparse_attention(
-                qkn,
-                positions,
-                x=x,
-                qr=qr,
-                qr_scale=qr_scale,
-            )
+        qkn = self._qk_norm_rope(q, kv_pre, positions)
+        o = self._sparse_attention(qkn, positions, x=x, qr=qr, qr_scale=qr_scale)
         return self._attn_post(o, positions)
 
     def _attn_mixed(
@@ -2391,7 +2386,7 @@ class DeepseekV4Attention(nn.Module):
             idx_q_quant, idx_weights, idx_q_scale = self.indexer.forward_pre(
                 x, qr, positions, qr_scale
             )
-        qkn = self._qk_norm_rope(q, kv_pre, positions)
+        qkn = self._qk_norm_rope(q, kv_pre, positions, mixed=True)
 
         # Each segment writes only its own rows, preserving the other query slice.
         out = qkn.q_sa
@@ -2438,6 +2433,8 @@ class DeepseekV4Attention(nn.Module):
         q: torch.Tensor,
         kv_pre: torch.Tensor,
         positions: torch.Tensor,
+        *,
+        mixed: bool = False,
     ) -> "QKNormRopeOut":
         """The fused QK-norm/RoPE (+ decode SWA write). Single source.
 
@@ -2456,10 +2453,10 @@ class DeepseekV4Attention(nn.Module):
         # `_attn_pre` this sits UPSTREAM of that guard and needs its own.
         if fc.context.is_dummy_run or os.environ.get("ATOM_V4_BYPASS_ATTN") == "1":
             return _qkn_placeholder(self, q, q.shape[0], zeros=True)
-        attn_md = cast("AttentionMetaData_DSV4", fc.attn_metadata)
+        attn_md = fc.attn_metadata
         rd = self.rope_head_dim
         ratio = self.compress_ratio
-        is_decode = attn_md.state is AttnState.DECODE or attn_md.is_mixed
+        is_decode = attn_md.state is AttnState.DECODE or mixed
         swa_dest_rows = (
             attn_md.swa_dest_rows[ratio]
             if (is_decode and attn_md.swa_dest_rows is not None)

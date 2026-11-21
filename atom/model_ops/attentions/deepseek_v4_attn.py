@@ -426,20 +426,19 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     kv_indptr_extend: torch.Tensor | None = None
     """[total_tokens + 1] int32 GPU — packed cumsum of `extend_count`."""
 
-    # Mixed target layout, with independent prefill and decode metadata.
+
+@dataclass
+class MixedAttentionMetaData_DSV4(AttentionMetaData_DSV4):
+    """Whole-batch carrier for independently published attention segments."""
+
+    is_mixed = True
+
     prefill_attn_metadata: "AttentionMetaData_DSV4 | None" = None
     decode_attn_metadata: "AttentionMetaData_DSV4 | None" = None
     num_prefill_tokens: int = 0
     num_prefill_seqs: int = 0
     num_decode_tokens: int = 0
     sampled_token_indices: torch.Tensor | None = None
-
-    @property
-    def is_mixed(self) -> bool:
-        return (
-            self.prefill_attn_metadata is not None
-            and self.decode_attn_metadata is not None
-        )
 
 
 def _mixed_carrier_spans(
@@ -506,7 +505,7 @@ def _mixed_carrier(
     cu_seqlens_q, state_slot_out = _mixed_carrier_spans(
         prefill_meta, decode_meta, n_p_seqs, n_d_seqs, n_p_tokens, running_bs
     )
-    merged = AttentionMetaData_DSV4(
+    merged = MixedAttentionMetaData_DSV4(
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=None,
         max_seqlen_q=max(prefill_meta.max_seqlen_q, decode_meta.max_seqlen_q),
@@ -2874,9 +2873,20 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # full_q`, below), and every compress count is now `visible_*(pos)`, so
         # a rejected slot's KV falls out of range on its own — `block_tables`
         # needs no truncation here.
-        if max_seqlen_q > 1 or num_rejected is not None:
+        if num_rejected is not None:
+            # Only mixed supplies segment-local counts; prepare_mixed checked
+            # their alignment before slicing away the prefill rows.
+            shift = (
+                num_rejected
+                if self.model_runner.tokenID_processor.is_deferred_out
+                else 1
+            )
+            context_lens_np = context_lens_np - np.asarray(
+                shift, dtype=context_lens_np.dtype
+            )
+        elif max_seqlen_q > 1:
             context_lens_np = self.model_runner.tokenID_processor.verify_ctx_lens(
-                context_lens_np, num_rejected=num_rejected
+                context_lens_np
             )
         # DSpark q-shrink: anchor the forwarded q tokens to the draft span HEAD
         # (ctx-full_q), not the tail, so they stay in [ctx-full_q .. ctx-1] (never

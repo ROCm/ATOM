@@ -48,6 +48,7 @@ def _prefill_batch(is_final_chunk: list[bool]) -> ScheduledBatch:
     batch.total_seqs_num_prefill = len(is_final_chunk)
     batch.total_seqs_num_decode = 0
     batch.has_prefill = True
+    batch.is_mixed = False
     batch.is_final_chunk = is_final_chunk
     return batch
 
@@ -246,6 +247,7 @@ def _decode_batch(*, num_spec_step: int) -> ScheduledBatch:
     batch.total_seqs_num_prefill = 0
     batch.total_seqs_num_decode = 3
     batch.has_prefill = False
+    batch.is_mixed = False
     batch.num_spec_step = num_spec_step
     return batch
 
@@ -288,6 +290,7 @@ def test_the_non_deferred_branch_refuses_a_batch_carrying_drafts(is_mixed):
         batch.total_seqs_num = 2
         batch.total_seqs_num_prefill = 1
         batch.total_seqs_num_decode = 1
+        batch.is_mixed = True
         batch.num_rejected = None
         batch.num_bonus = None
 

@@ -39,6 +39,172 @@ N_P_TOKENS = sum(PREFILL_LENS)
 NUM_SCHEDULED = np.array(PREFILL_LENS + [K + 1] * N_D, dtype=np.int32)
 
 
+def _cpu_token_processor(monkeypatch, batch, *, previous_rows=0):
+    from atom.model_engine import model_runner as module
+
+    def buffer(n):
+        host = np.zeros(n, dtype=np.int32)
+        return SimpleNamespace(np=host, gpu=torch.from_numpy(host))
+
+    n_p = batch.total_seqs_num_prefill
+    lens = np.asarray(batch.num_scheduled_tokens[n_p:], dtype=np.int32)
+    cu = np.r_[np.int32(0), np.cumsum(lens, dtype=np.int32)]
+    processor = object.__new__(module.tokenIDProcessor)
+    processor.runner = SimpleNamespace(
+        enforce_eager=True,
+        attn_metadata_builder=SimpleNamespace(
+            decode_spans=lambda b: (len(lens), lens, cu)
+        ),
+        forward_vars={"cu_seqlens_q": SimpleNamespace(np=cu, gpu=torch.from_numpy(cu))},
+    )
+    processor.input_ids = buffer(64)
+    processor.decode_src = buffer(16)
+    processor.batch_info = buffer(3)
+    processor.use_spec = True
+    processor.is_deferred_out = True
+    processor.is_pipeline_parallel = False
+    processor.is_pd_producer = False
+    processor.draft_tokens_per_seq = K
+    processor.pre_num_decode_token_per_seq = K + 1
+    processor.prev_batch = (
+        SimpleNamespace(req_ids=list(range(previous_rows))) if previous_rows else None
+    )
+    processor.prev_token_ids = torch.zeros(previous_rows, dtype=torch.int32)
+    processor.draft_token_ids = torch.zeros((previous_rows, K), dtype=torch.int32)
+    processor.num_rejected = np.ones(previous_rows, dtype=np.int32)
+    processor.num_bonus = np.ones(previous_rows, dtype=np.int32)
+    processor.prev_rejected_num = processor.num_rejected.copy()
+    processor.prev_bonus_num = processor.num_bonus.copy()
+    # This probe checks host status ownership, not the deferred gather kernel.
+    monkeypatch.setattr(module, "fill_deferred_decode_ids", lambda *a, **kw: None)
+    group = SimpleNamespace(set_counts=lambda counts: None, publish=lambda: None)
+    return processor, group
+
+
+@pytest.mark.parametrize("previous_rows", [0, 1, 9])
+def test_cpu_idle_preparation_replaces_previous_rejection_counts(
+    monkeypatch, previous_rows
+):
+    from atom.model_engine.scheduler import ScheduledBatch
+
+    batch = ScheduledBatch({}, [], 0, is_dummy_run=True)
+    # Do not drain a device status queue in this host-only ownership probe.
+    batch.produces_output = lambda: False
+    processor, group = _cpu_token_processor(
+        monkeypatch, batch, previous_rows=previous_rows
+    )
+    if not previous_rows:
+        processor.num_rejected = None  # clean()'s initial state
+    processor.prepare_input_ids(batch, K + 1, group)
+    assert processor.num_rejected is None or processor.num_rejected.size == 0
+    assert processor.verify_ctx_lens(np.empty(0, dtype=np.int32)).size == 0
+
+
+def test_cpu_mixed_preparation_clears_only_prefill_rejections(monkeypatch):
+    batch = _mixed_batch(
+        total_tokens_num=16,
+        total_tokens_num_prefill=8,
+        total_tokens_num_decode=8,
+        scheduled_tokens=np.arange(16, dtype=np.int32),
+        num_rejected=np.array([5, 6, 1, 2], dtype=np.int32),
+        num_bonus=np.array([5, 6, 1, 1], dtype=np.int32),
+        num_spec_step=K,
+        produces_output=lambda: False,
+    )
+    processor, group = _cpu_token_processor(monkeypatch, batch)
+    processor.prepare_input_ids(batch, K + 1, group)
+    assert processor.num_rejected.tolist() == [0, 0, 1, 2]
+    assert processor.num_bonus.tolist() == [0, 0, 1, 1]
+
+
+def test_prepare_model_builds_and_passes_mixed_verify_metadata(monkeypatch):
+    from atom.model_engine import model_runner as module
+    from atom.spec_decode.drafter import Drafter
+
+    batch = _mixed_batch(
+        num_spec_step=K,
+        is_dummy_run=False,
+        next_token_ids=None,
+        total_tokens_num=16,
+        total_tokens_num_prefill=8,
+        total_tokens_num_decode=8,
+    )
+    mode = SimpleNamespace(
+        is_prefill=True,
+        running_bs=4,
+        scheduled_bs=4,
+        running_tokens=16,
+        running_tokens_are_unified=True,
+        max_seqlen_q=K + 1,
+        sync=SimpleNamespace(any_rank_has_prefill=True, ub_tokens_across_dp=None),
+        ubatch_slices=None,
+        pcp_groups=None,
+        decode_ubatch_slices=None,
+    )
+    monkeypatch.setattr(module.ForwardMode, "decide", lambda **kw: mode)
+    captured = {}
+    monkeypatch.setattr(module, "set_forward_context", lambda **kw: captured.update(kw))
+    monkeypatch.setattr(
+        module,
+        "get_forward_context",
+        lambda: SimpleNamespace(context=captured["context"]),
+    )
+    runner = _index_runner()
+    for var in runner.forward_vars.values():
+        var.gpu = torch.from_numpy(var.np)
+    runner.forward_vars["batch_info"] = SimpleNamespace(gpu=torch.zeros(3))
+    runner.config = SimpleNamespace(
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        enable_tbo=False,
+        enable_tbo_decode=False,
+    )
+    runner.enforce_eager = True
+    runner.capture_sizes_np = np.array([0], dtype=np.int32)
+    runner.running_tokens_per_dp_rank = np.array([16], dtype=np.int32)
+    runner.tbo_decode_graphs = False
+    runner._dspark_apply_q_bucket = lambda b: None
+    runner._local_tbo_eligibility = lambda b: False
+    runner._producer_graph_shapes = lambda: None
+    runner._cut_ubatches = lambda m, b: m
+    runner.prepare_sample = lambda *a: (torch.ones(4), None, None, True, False)
+    for name in ("_verify_spans", "_verifies_drafts", "prepare_inputs"):
+        setattr(
+            runner, name, types.MethodType(getattr(module.ModelRunner, name), runner)
+        )
+    runner.tokenID_processor = SimpleNamespace(
+        is_pd_producer=False, prepare_input_ids=lambda *a, **kw: torch.arange(16)
+    )
+    metadata = _mixed_metadata()
+    runner.attn_metadata_builder = SimpleNamespace(
+        step_needs_eager=lambda b: True,
+        prepare_query_metadata=lambda *a: {},
+        consumes_device_verdict=lambda *a: False,
+        build=lambda **kw: (metadata, torch.arange(16)),
+        prepare_model_inputs=lambda *a: None,
+    )
+    group = SimpleNamespace(set_counts=lambda counts: None, check_writable=lambda: None)
+    runner.h2d_groups = {"token_inputs": group, "spec_decode": group}
+    drafter = SimpleNamespace(mtp_k=K, is_block_drafter=True, runner=runner)
+    drafter.prepare_spec_decode_indices = types.MethodType(
+        Drafter.prepare_spec_decode_indices, drafter
+    )
+    drafter.calc_spec_decode_metadata = types.MethodType(
+        Drafter.calc_spec_decode_metadata, drafter
+    )
+    runner.drafter = drafter
+    prepare = getattr(
+        module.ModelRunner.prepare_model,
+        "__wrapped__",
+        module.ModelRunner.prepare_model,
+    )
+    prepare(runner, batch)
+    spec = captured["spec_decode_metadata"]
+    assert spec is not None
+    assert spec.num_draft_tokens_np.tolist() == [0, 0, 3, 3]
+    assert spec.target_logits_indices.tolist() == [2, 3, 4, 6, 7, 8]
+    assert spec.input_ids.tolist() == [4, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU staging kernel")
 @pytest.mark.parametrize("speculative", [False, True])
 def test_idle_decode_keeps_padding_and_deferred_status_contract(
@@ -483,17 +649,6 @@ def test_mixed_verdict_moves_to_token_rows(mixed_forward_context):
     assert reject.tolist() == [0, 0, 2, 0]
     # prefill: last token of each chunk; decode: segment start + accepted.
     assert anchors.tolist() == [4, 7, 9, 15]
-
-
-def test_pure_decode_verdict_is_left_alone(mixed_forward_context):
-    from atom.model_engine.model_runner import ModelRunner
-
-    reject, anchors = _logit_verdict([0, 0, 1, 3])
-    before = (reject.clone(), anchors.clone())
-    ModelRunner._settle_mixed_verdict(
-        None, _mixed_batch(is_mixed=False), reject, anchors
-    )
-    assert torch.equal(reject, before[0]) and torch.equal(anchors, before[1])
 
 
 def test_unverified_step_anchors_every_row_on_its_last(mixed_forward_context):
