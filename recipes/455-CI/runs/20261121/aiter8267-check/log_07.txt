@@ -1,0 +1,2 @@
+2026-11-21 20:10:51 [pr8267-07] start q35-pr8267
+2026-11-21 20:22:26 [manual] verified: 174 responses 200 OK, 0 errors; stopping (bench-only check, no full c4/c64)

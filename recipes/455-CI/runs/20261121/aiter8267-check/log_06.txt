@@ -1,0 +1,6 @@
+2026-11-21 20:20:12 [pr8267-06] start v41-tp4-pr8267
+2026-11-21 20:32:56 [manual] tp4_pr8267: verified: c4 warmup 464/464 successful, 0 fatal; mtp draft 326885 accepted 184086 rate 0.563; ending the bench
+2026-11-21 20:33:00 [pr8267-06] end v41-tp4-pr8267 rc=0 kfd=0
+2026-11-21 20:33:00 [pr8267-06] start v41-dep4-pr8267
+2026-11-21 20:43:40 [verify] dep4_pr8267: verified: warmup running, 0 fatal; mtp draft 96215 accepted 42262 rate 0.439; ending the bench
+2026-11-21 20:43:42 [pr8267-06] end v41-dep4-pr8267 rc=0 kfd=0
