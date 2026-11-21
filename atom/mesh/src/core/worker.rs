@@ -176,6 +176,16 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Reset the load counter to 0 (for sync/recovery)
     fn reset_load(&self) {}
 
+    /// Prompt tokens placed on this worker whose prefill has not finished.
+    fn prefill_tokens(&self) -> usize;
+
+    /// Charge prefill tokens; pair with `release_prefill_tokens` through a
+    /// [`WorkerLoadGuard`] so every charge is released once.
+    fn charge_prefill_tokens(&self, tokens: usize);
+
+    /// Release tokens taken by `charge_prefill_tokens`.
+    fn release_prefill_tokens(&self, tokens: usize);
+
     /// Get the worker routing key load tracker
     fn worker_routing_key_load(&self) -> &WorkerRoutingKeyLoad;
 
@@ -487,6 +497,7 @@ pub struct WorkerMetadata {
 pub struct BasicWorker {
     pub metadata: WorkerMetadata,
     pub load_counter: Arc<AtomicUsize>,
+    pub prefill_token_counter: Arc<AtomicUsize>,
     pub worker_routing_key_load: Arc<WorkerRoutingKeyLoad>,
     pub processed_counter: Arc<AtomicUsize>,
     pub healthy: Arc<AtomicBool>,
@@ -637,6 +648,35 @@ impl Worker for BasicWorker {
             );
         }
         self.update_running_requests_metrics();
+    }
+
+    fn prefill_tokens(&self) -> usize {
+        self.prefill_token_counter.load(Ordering::Relaxed)
+    }
+
+    fn charge_prefill_tokens(&self, tokens: usize) {
+        let previous = self
+            .prefill_token_counter
+            .fetch_add(tokens, Ordering::Relaxed);
+        MeshMetrics::set_worker_prefill_tokens(self.url(), previous + tokens);
+    }
+
+    fn release_prefill_tokens(&self, tokens: usize) {
+        let previous = self
+            .prefill_token_counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(tokens))
+            })
+            .unwrap_or_else(|current| current);
+        if previous < tokens {
+            tracing::warn!(
+                worker_url = %self.metadata.url,
+                tokens,
+                previous,
+                "Released more prefill tokens than were charged"
+            );
+        }
+        MeshMetrics::set_worker_prefill_tokens(self.url(), previous.saturating_sub(tokens));
     }
 
     fn reset_load(&self) {
@@ -858,6 +898,18 @@ impl Worker for DPAwareWorker {
         self.base_worker.reset_load();
     }
 
+    fn prefill_tokens(&self) -> usize {
+        self.base_worker.prefill_tokens()
+    }
+
+    fn charge_prefill_tokens(&self, tokens: usize) {
+        self.base_worker.charge_prefill_tokens(tokens);
+    }
+
+    fn release_prefill_tokens(&self, tokens: usize) {
+        self.base_worker.release_prefill_tokens(tokens);
+    }
+
     fn worker_routing_key_load(&self) -> &WorkerRoutingKeyLoad {
         self.base_worker.worker_routing_key_load()
     }
@@ -937,17 +989,41 @@ impl Worker for DPAwareWorker {
 /// immediately but the stream continues in the background.
 pub struct WorkerLoadGuard {
     worker: Arc<dyn Worker>,
+    prefill_tokens: usize,
 }
 
 impl WorkerLoadGuard {
     pub fn new(worker: Arc<dyn Worker>, _headers: Option<&http::HeaderMap>) -> Self {
         worker.increment_load();
-        Self { worker }
+        Self {
+            worker,
+            prefill_tokens: 0,
+        }
+    }
+
+    /// Also charge `tokens` of prefill to the worker until the guard drops or
+    /// [`Self::release_prefill`] runs. Call once, on a new guard.
+    pub fn with_prefill_tokens(mut self, tokens: usize) -> Self {
+        debug_assert_eq!(self.prefill_tokens, 0, "prefill already charged");
+        if tokens > 0 {
+            self.worker.charge_prefill_tokens(tokens);
+            self.prefill_tokens = tokens;
+        }
+        self
+    }
+
+    /// Release the prefill charge while the request keeps counting as load.
+    pub fn release_prefill(&mut self) {
+        if self.prefill_tokens > 0 {
+            self.worker.release_prefill_tokens(self.prefill_tokens);
+            self.prefill_tokens = 0;
+        }
     }
 }
 
 impl Drop for WorkerLoadGuard {
     fn drop(&mut self) {
+        self.release_prefill();
         self.worker.decrement_load();
     }
 }

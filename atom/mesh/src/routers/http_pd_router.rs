@@ -432,6 +432,7 @@ impl PDRouter {
             decode,
             prefill_policy,
             decode_policy,
+            prefill_tokens,
         } = plan
         else {
             return Err(error::internal_error(
@@ -459,7 +460,7 @@ impl PDRouter {
         }
         Ok(Arc::new(ReservedPair {
             load: parking_lot::Mutex::new(Some([
-                WorkerLoadGuard::new(prefill.clone(), headers),
+                WorkerLoadGuard::new(prefill.clone(), headers).with_prefill_tokens(prefill_tokens),
                 WorkerLoadGuard::new(decode.clone(), headers),
             ])),
             canceled: tokio::sync::watch::channel(false).0,
@@ -2324,6 +2325,7 @@ mod tests {
                         decode: decode.clone(),
                         prefill_policy: "round_robin",
                         decode_policy: "round_robin",
+                        prefill_tokens: 0,
                     },
                     None,
                 )
@@ -2464,6 +2466,7 @@ mod tests {
                     decode: decode.clone(),
                     prefill_policy: "round_robin",
                     decode_policy: "round_robin",
+                    prefill_tokens: 0,
                 },
                 None,
             )
@@ -2704,19 +2707,26 @@ mod tests {
                     decode: decode_rank_5.clone(),
                     prefill_policy: "round_robin",
                     decode_policy: "round_robin",
+                    prefill_tokens: 7,
                 },
                 None,
             )
             .unwrap();
         assert_eq!(pair.prefill.url(), "http://prefill@5");
         assert_eq!(pair.prefill.dp_rank(), Some(5));
-        assert_eq!(prefill_rank_2.load(), 0);
+        assert_eq!(
+            (prefill_rank_2.load(), prefill_rank_2.prefill_tokens()),
+            (0, 0)
+        );
         assert_eq!((prefill_rank_5.load(), decode_rank_5.load()), (1, 1));
+        // The prefill charge lands on the rank the request runs on.
+        assert_eq!(prefill_rank_5.prefill_tokens(), 7);
         let execution = pair.clone();
         drop(pair);
         assert_eq!((prefill_rank_5.load(), decode_rank_5.load()), (1, 1));
         drop(execution);
         assert_eq!((prefill_rank_5.load(), decode_rank_5.load()), (0, 0));
+        assert_eq!(prefill_rank_5.prefill_tokens(), 0);
     }
 
     #[tokio::test]
@@ -2783,6 +2793,7 @@ mod tests {
                         decode,
                         prefill_policy: "dp_sticky",
                         decode_policy: "round_robin",
+                        prefill_tokens: 0,
                     },
                     Some(&headers),
                 )
