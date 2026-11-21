@@ -10,6 +10,8 @@
       "kimi_k3_runtime": "--trust-remote-code --tensor-parallel-size 8 --attention-backend aiter --kv-cache-dtype fp8_e4m3 --page-size 128 --context-length 16384 --mem-fraction-static 0.93 --disable-radix-cache",
       "glm52_mtp3_runtime": "--enable-return-hidden-states --max-running-requests 256 --cuda-graph-backend-decode full --cuda-graph-backend-prefill disabled --cuda-graph-max-bs-decode 256 --speculative-algorithm EAGLE --speculative-draft-attention-backend aiter --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4",
       "minimax_m3_eagle3_runtime": "--trust-remote-code --random-seed 0 --tensor-parallel-size 4 --attention-backend aiter --mem-fraction-static 0.75 --page-size 128 --context-length 32768 --max-running-requests 128 --model-loader-extra-config '{\"online_quant_config\":{\"global_quant_config\":\"ptpc_fp8\",\"exclude_layer\":[\"lm_head\",\"model.embed_tokens\",\"vision_tower\",\"multi_modal_projector\",\"patch_merge_mlp\",\"*block_sparse_moe\"]}}' --json-model-override-args '{\"use_index_cache\":true,\"index_topk_freq\":4}' --speculative-algorithm EAGLE3 --speculative-draft-model-path Inferact/MiniMax-M3-EAGLE3 --speculative-num-steps 3 --speculative-eagle-topk 1 --kv-cache-dtype fp8_e4m3 --disable-radix-cache --decode-log-interval 1",
+      "qwen38_flash_next_ptpc_runtime": "--trust-remote-code --tensor-parallel-size 2 --ep-size 2 --attention-backend aiter --kv-cache-dtype bf16 --page-size 64 --mem-fraction-static 0.95 --max-running-requests 32 --chunked-prefill-size 16384 --mamba-ssm-dtype float32 --watchdog-timeout 1200 --disable-radix-cache --cuda-graph-backend-decode full --cuda-graph-max-bs-decode 32",
+      "qwen38_flash_next_mtp3_runtime": "--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4",
       "qwen38_flash_next_runtime": "--trust-remote-code --tensor-parallel-size 2 --ep-size 2 --attention-backend aiter --kv-cache-dtype bf16 --page-size 64 --mem-fraction-static 0.95 --context-length 16384 --max-running-requests 32 --disable-radix-cache --reasoning-parser qwen3 --cuda-graph-backend-decode full --cuda-graph-max-bs-decode 32"
     },
     "env_vars": {
@@ -294,6 +296,42 @@
       "supported_concurrency_values_by_pair": {
         "1024x1024": [4, 8, 16, 32],
         "8192x1024": [4, 8, 16, 32]
+      },
+      "env_vars": "qwen38_flash_next_common"
+    },
+    {
+      "display": "Qwen3.8-Flash-Next-PTPC-FP8 TP2 MI308",
+      "dashboard_model": "Qwen3.8-Flash-Next-PTPC-FP8 MI308",
+      "workload_label": "SGLang-OOB",
+      "source_path": "sammysun0711/Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16",
+      "path": "sammysun0711/Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16",
+      "prefix": "qwen3-8-flash-next-ptpc-fp8-tp2-mi308",
+      "extra_args": "qwen38_flash_next_ptpc_runtime",
+      "bench_args": "--num-prompts=128 --num-warmups=10",
+      "nightly_param_lists": "12000,350,1,1.0",
+      "runner": "atom-mi308-8gpu-plugins-benchmark",
+      "nightly_group": "B",
+      "supported_input_output_pairs": ["12000x350"],
+      "supported_concurrency_values_by_pair": {
+        "12000x350": [1]
+      },
+      "env_vars": "qwen38_flash_next_common"
+    },
+    {
+      "display": "Qwen3.8-Flash-Next-PTPC-FP8 TP2 MTP3 MI308",
+      "dashboard_model": "Qwen3.8-Flash-Next-PTPC-FP8-MTP3 MI308",
+      "workload_label": "SGLang-OOB",
+      "source_path": "sammysun0711/Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16",
+      "path": "sammysun0711/Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16",
+      "prefix": "qwen3-8-flash-next-ptpc-fp8-tp2-mtp3-mi308",
+      "extra_args": ["qwen38_flash_next_ptpc_runtime", "qwen38_flash_next_mtp3_runtime"],
+      "bench_args": "--num-prompts=128 --num-warmups=10",
+      "nightly_param_lists": "12000,350,1,1.0",
+      "runner": "atom-mi308-8gpu-plugins-benchmark",
+      "nightly_group": "B",
+      "supported_input_output_pairs": ["12000x350"],
+      "supported_concurrency_values_by_pair": {
+        "12000x350": [1]
       },
       "env_vars": "qwen38_flash_next_common"
     }
