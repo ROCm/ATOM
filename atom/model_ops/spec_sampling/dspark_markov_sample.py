@@ -6,9 +6,11 @@
 The greedy op's stage-1 GEMV (`dspark_markov_stage1`), then ``x_k`` drawn from the
 top K of ``softmax(logits_k / T)``, stored as q (`sparse_q_store`). q is 0 off
 the stored set, so truncation costs acceptance, never exactness (`Q_WIDTH`).
-Six launches per position: GEMV + 1/T into the fp32 ``s`` scratch with tile
-partials; `softmax_combine_kernel` (row max only: finalize normalizes over the
-stored set); then histogram, cut, compact and finalize (`sparse_q_select`).
+Four launches per position: GEMV + 1/T into the fp32 ``s`` scratch with tile
+partials; then histogram, compact and finalize (`sparse_q_select`), which
+reduce the row max, the cut and the raw argmax from those partials and tables
+themselves (finalize normalizes over the stored set). Past 16 rows, whole vocab
+or TP, the softmax combine and the cut run as their own launches (six).
 Fixed-order reductions, no atomics: TP ranks must store and draw alike.
 CUDA-graph safe: seed, row bases and filters are device tensors; position and
 noise offset are static host ints; no data-dependent grid.
@@ -44,7 +46,6 @@ from atom.model_ops.spec_sampling.sampling_scratch import (
     scratch_buffer,
     scratch_bytes,
 )
-from atom.model_ops.spec_sampling.softmax_tiles import softmax_combine_kernel
 from atom.model_ops.spec_sampling.sparse_q_select import (
     QSelectScratch,
     QSelectTPScratch,
@@ -186,8 +187,8 @@ class SampleScratch(NamedTuple):
     part_max: torch.Tensor  # [gemv tiles, B] fp32, each tile's max of s
     part_amax_val: torch.Tensor  # [gemv tiles, B] fp32, raw max
     part_amax_idx: torch.Tensor  # [gemv tiles, B] int32, its lowest id
-    row_max: torch.Tensor  # [B] fp32
-    row_argmax: torch.Tensor  # [B] int32
+    # [B] fp32, from the histogram up to 16 rows, the combine past that
+    row_max: torch.Tensor
     select: QSelectScratch
 
 
@@ -201,7 +202,6 @@ def _sample_scratch(num_rows: int, vocab_size: int) -> SampleScratch:
         Region((gemv_tiles, num_rows), f32),
         Region((gemv_tiles, num_rows), i32),
         Region((num_rows,), f32),
-        Region((num_rows,), i32),
         q_select_scratch(num_rows, vocab_size),
     )
 
@@ -366,26 +366,12 @@ def dspark_markov_sample(
         num_warps=geometry.num_warps,
         num_stages=2,
     )
-    softmax_combine_kernel[(num_rows,)](
-        work.part_max,
-        None,
-        work.row_max,
-        None,
-        work.part_amax_val,
-        work.part_amax_idx,
-        work.row_argmax,
-        num_rows,
-        gemv_tiles,
-        BLOCK_TILE=triton.next_power_of_2(gemv_tiles),
-        WITH_ARGMAX=True,
-        WITH_INV_Z=False,
-        num_warps=4,
-        num_stages=1,
-    )
     select_and_draw_q(
         work.s,
+        work.part_max,
+        work.part_amax_val,
+        work.part_amax_idx,
         work.row_max,
-        work.row_argmax,
         q_row_base,
         temperatures,
         top_k,
@@ -408,8 +394,8 @@ class SampleTPScratch(NamedTuple):
     # [gemv tiles, 3, B] fp32: each tile's max of s, raw max and lowest id
     # (int32 bits), tile-major so that one gather is the whole row's tiles.
     parts: torch.Tensor
-    row_max: torch.Tensor  # [B] fp32
-    row_argmax: torch.Tensor  # [B] int32
+    # [B] fp32, from the histogram up to 16 rows, the combine past that
+    row_max: torch.Tensor
     select: QSelectTPScratch
 
 
@@ -425,7 +411,6 @@ def _sample_tp_scratch(
         Region((num_rows, local_vocab), torch.float32),
         Region((gemv_tiles, 3, num_rows), torch.float32),
         Region((num_rows,), torch.float32),
-        Region((num_rows,), torch.int32),
         q_select_tp_scratch(num_rows, local_vocab, world, width),
     )
 
@@ -533,27 +518,12 @@ def dspark_markov_sample_tp(
     # Rank-major is id order, so the gathered partials are the whole row's
     # tiles, still `stride_part` apart.
     gathered = tp_group.all_gather(parts, use_custom=use_custom, dim=0)
-    softmax_combine_kernel[(num_rows,)](
-        gathered[:, 0],
-        None,
-        work.row_max,
-        None,
-        gathered[:, 1],
-        gathered[:, 2].view(torch.int32),
-        work.row_argmax,
-        # Its row count is only the tiles' stride, which is the interleaved one.
-        parts.stride(0),
-        world * gemv_tiles,
-        BLOCK_TILE=triton.next_power_of_2(world * gemv_tiles),
-        WITH_ARGMAX=True,
-        WITH_INV_Z=False,
-        num_warps=4,
-        num_stages=1,
-    )
     select_and_draw_q_tp(
         work.s,
+        gathered[:, 0],
+        gathered[:, 1],
+        gathered[:, 2].view(torch.int32),
         work.row_max,
-        work.row_argmax,
         q_row_base,
         temperatures,
         top_k,
