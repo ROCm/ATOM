@@ -7,6 +7,7 @@ The host builds one only after it has registered that shard, which is why
 nothing here re-decides whether UVA is on.
 """
 
+import logging
 from contextlib import ExitStack
 from dataclasses import dataclass
 
@@ -15,9 +16,15 @@ import torch
 
 from atom.model_ops.engram.device.hashing import EngramHashTables, engram_row_indices
 from atom.model_ops.engram.device.staging import EngramStaging
-from atom.model_ops.engram.device.uva import uva_gather_into
+from atom.model_ops.engram.device.uva import (
+    UvaMissStaging,
+    UvaRowCache,
+    uva_gather_into,
+)
 from atom.model_ops.engram.host import EngramHost, EngramPrefetcher, EngramRequest
 from atom.utils import CpuGpuBuffer, envs
+
+logger = logging.getLogger(__name__)
 
 
 class EngramUva:
@@ -43,7 +50,37 @@ class EngramUva:
             host.max_num_tokens, num_hash_heads, dtype=torch.int64, device=host.device
         )
         self._ids_staging = None
+        self.row_cache = self._row_caches(host)
         self.overlap = EngramStaging(self) if envs.ATOM_ENGRAM_OVERLAP else None
+
+    @staticmethod
+    def _row_caches(host):
+        """A device row cache per quantized table (`UvaRowCache`), sharing one
+        miss scratch: the gathers run one after another on one stream."""
+        tables = {
+            layer: table
+            for layer, table in host.prefetcher._tables.items()
+            if UvaRowCache.fits(table)
+        }
+        if not tables:
+            return {}
+        shapes = {(t.head_dim, t.block_size) for t in tables.values()}
+        if len(shapes) != 1:
+            return {}
+        head_dim, quant_block = shapes.pop()
+        staging = UvaMissStaging(
+            host.max_num_tokens * host.local_heads, head_dim, quant_block, host.device
+        )
+        caches = {
+            layer: UvaRowCache(head_dim, quant_block, staging, host.device)
+            for layer in tables
+        }
+        logger.info(
+            "engram: device row cache for layers %s, %.2f GiB",
+            sorted(caches),
+            (staging.nbytes() + sum(c.nbytes() for c in caches.values())) / 1024**3,
+        )
+        return caches
 
     def _rows_from_host(self, requests, rows):
         """Hash on the host and stage the indices through pinned memory.
@@ -119,6 +156,7 @@ class EngramUva:
                 head_start=host.head_start,
                 local_heads=host.local_heads,
                 total_heads=host.total_heads,
+                cache=self.row_cache.get(layer),
             )
             out = flat
             if host._tp_group is not None:
