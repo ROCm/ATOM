@@ -468,6 +468,7 @@ mod tests {
         };
         let v41 = checkpoint("deepseek_v41");
         let v41_file = v41.path().join("tokenizer.json");
+        let glm = checkpoint("glm_moe_dsa");
         let llama = checkpoint("llama");
         let bare = tempfile::TempDir::new().unwrap();
         std::fs::copy(hf_tokenizer_path(), bare.path().join("tokenizer.json")).unwrap();
@@ -476,6 +477,7 @@ mod tests {
         for (source, controls) in [
             (v41.path(), Some(ChatControls::DeepseekV41)),
             (v41_file.as_path(), Some(ChatControls::DeepseekV41)),
+            (glm.path(), Some(ChatControls::Glm5)),
             (llama.path(), None),
             (bare.path(), None),
         ] {

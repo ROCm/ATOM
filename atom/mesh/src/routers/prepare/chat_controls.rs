@@ -1,20 +1,23 @@
-//! The reasoning controls ATOM renders a model's chats under, for the models
-//! whose chat encoder it adapts, so that the router renders their chats to the
-//! prompts ATOM encodes. ATOM picks them by the `model_type` in the
-//! checkpoint's `config.json` (`chat_encoder_adapters._MODEL_ENCODERS`); the
-//! rules are its `reasoning_controls` and the model's encoder hooks, and
-//! llm-tokenizer's port of the encoder reads the kwargs they give.
-//! `test_requests_tokenize_as_on_atom` checks the router's tokens for
-//! DeepSeek-V4.1-Flash chats against ATOM's.
+//! The reasoning controls ATOM renders a model's chats under, so that the
+//! router renders their chats to the prompts ATOM encodes: for the models
+//! whose chat encoder it adapts, which ATOM picks by the `model_type` in the
+//! checkpoint's `config.json` (`chat_encoder_adapters._MODEL_ENCODERS`), and
+//! for GLM-5, whose template reads the controls ATOM gives every other model.
+//! The rules are ATOM's `reasoning_controls`, with the model's encoder hooks
+//! where it has an encoder. `test_requests_tokenize_as_on_atom` checks the
+//! router's tokens for DeepSeek-V4.1-Flash and GLM-5.2 chats against ATOM's.
 
-use std::collections::HashMap;
+use std::{borrow::Cow, collections::HashMap};
 
 use http::StatusCode;
 use serde_json::{json, Value};
 
 use super::{chat_template::render_chat_messages, inference::SentControls};
 use crate::{
-    protocols::chat::ChatCompletionRequest,
+    protocols::{
+        chat::{ChatCompletionRequest, ChatMessage, MessageContent},
+        common::ContentPart,
+    },
     routers::comm::error::IngressError,
     tokenizer::{chat_template::ChatTemplateContentFormat, traits::Tokenizer},
 };
@@ -25,6 +28,9 @@ pub(crate) enum ChatControls {
     /// DeepSeek-V4.1 (`deepseek_v41_encoder`): ATOM encodes its chats with the
     /// checkpoint's `encoding/encoding.py`, which llm-tokenizer ports.
     DeepseekV41,
+    /// GLM-5 (`glm_moe_dsa`): ATOM renders its chats with the checkpoint's
+    /// template, under the controls of a model without an encoder.
+    Glm5,
 }
 
 impl ChatControls {
@@ -32,6 +38,7 @@ impl ChatControls {
     pub(crate) fn of_model_type(model_type: &str) -> Option<Self> {
         match model_type {
             "deepseek_v41" => Some(Self::DeepseekV41),
+            "glm_moe_dsa" => Some(Self::Glm5),
             _ => None,
         }
     }
@@ -47,7 +54,140 @@ impl ChatControls {
     ) -> Result<String, IngressError> {
         match self {
             Self::DeepseekV41 => deepseek_v41::render(request, sent, tokenizer),
+            Self::Glm5 => glm5::render(request, sent, tokenizer),
         }
+    }
+}
+
+mod glm5 {
+    use super::*;
+
+    /// The kwarg ATOM's startup probe finds that GLM-5's reasoning switches on,
+    /// `true` on and `false` off (`chat_encoders.REASONING_TOGGLES`).
+    const TOGGLE: &str = "enable_thinking";
+
+    /// The efforts ATOM gives a template (`reasoning.VALID_TEMPLATE_EFFORTS`).
+    const EFFORTS: [&str; 3] = ["low", "high", "max"];
+
+    pub(super) fn render(
+        request: &ChatCompletionRequest,
+        sent: &SentControls,
+        tokenizer: &dyn Tokenizer,
+    ) -> Result<String, IngressError> {
+        let kwargs = template_kwargs(request, sent).map_err(IngressError::invalid)?;
+        let format = Some(ChatTemplateContentFormat::String);
+        Ok(
+            render_chat_messages(&text_content(request), tokenizer, &kwargs, format)
+                .map_err(IngressError::invalid)?
+                .text,
+        )
+    }
+
+    /// The template kwargs ATOM renders `request` with (`api_server._check_chat`),
+    /// or why ATOM rejects the request. The top-level `reasoning_effort` is not
+    /// one of them.
+    pub(super) fn template_kwargs(
+        request: &ChatCompletionRequest,
+        sent: &SentControls,
+    ) -> Result<HashMap<String, Value>, String> {
+        let mut kwargs = request.chat_template_kwargs.clone().unwrap_or_default();
+        let (enabled, effort) = resolve_reasoning_controls(
+            sent.thinking.as_ref(),
+            request.reasoning_effort.as_deref(),
+        )?;
+        if let Some(enabled) = enabled {
+            kwargs.insert(TOGGLE.to_string(), json!(enabled));
+        }
+        if let Some(effort) = effort {
+            kwargs.insert("thinking_effort".to_string(), effort);
+        }
+        Ok(kwargs)
+    }
+
+    /// `resolve_reasoning_controls` under ATOM's chat rules: a `thinking.type`
+    /// other than `"disabled"` switches reasoning on, and a `"none"` effort
+    /// off; `thinking.effort` takes the place of `reasoning_effort`, and an
+    /// effort alone switches nothing.
+    fn resolve_reasoning_controls(
+        thinking: Option<&Value>,
+        reasoning_effort: Option<&str>,
+    ) -> Result<(Option<bool>, Option<Value>), String> {
+        let thinking = match thinking {
+            None => None,
+            Some(Value::Object(thinking)) => Some(thinking),
+            Some(_) => return Err("thinking must be an object".to_string()),
+        };
+        let field = |key| {
+            thinking
+                .and_then(|thinking| thinking.get(key))
+                .filter(|value| !value.is_null())
+        };
+        let mut enabled = field("type").map(|kind| *kind != "disabled");
+        if reasoning_effort == Some("none") {
+            enabled = Some(false);
+        }
+        let effort = field("effort")
+            .cloned()
+            .or_else(|| reasoning_effort.map(Value::from));
+        Ok((enabled, legacy_chat_effort(effort)?))
+    }
+
+    /// `reasoning_controls._legacy_chat_effort`: an integer budget in [1, 100],
+    /// or an effort a template ATOM knows reads; any other name is dropped.
+    fn legacy_chat_effort(effort: Option<Value>) -> Result<Option<Value>, String> {
+        match effort {
+            Some(Value::Number(budget))
+                if budget
+                    .as_u64()
+                    .is_some_and(|budget| (1..=100).contains(&budget)) =>
+            {
+                Ok(Some(Value::Number(budget)))
+            }
+            Some(Value::Number(_) | Value::Bool(_)) => {
+                Err("reasoning effort must be an integer in [1, 100]".to_string())
+            }
+            Some(Value::String(name)) if EFFORTS.contains(&name.as_str()) => {
+                Ok(Some(Value::String(name)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// `request` with each message's content as ATOM gives it the template
+    /// (`ChatMessage.get_content_text`): a list's text parts, a line apart.
+    fn text_content(request: &ChatCompletionRequest) -> Cow<'_, ChatCompletionRequest> {
+        let mut request = Cow::Borrowed(request);
+        for n in 0..request.messages.len() {
+            let parts = match &request.messages[n] {
+                ChatMessage::System { content, .. }
+                | ChatMessage::User { content, .. }
+                | ChatMessage::Tool { content, .. }
+                | ChatMessage::Developer { content, .. } => Some(content),
+                ChatMessage::Assistant { content, .. } => content.as_ref(),
+                ChatMessage::Function { .. } => None,
+            };
+            let Some(MessageContent::Parts(parts)) = parts else {
+                continue;
+            };
+            let text = parts
+                .iter()
+                .filter_map(|part| match part {
+                    ContentPart::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let text = MessageContent::Text(text);
+            match &mut request.to_mut().messages[n] {
+                ChatMessage::System { content, .. }
+                | ChatMessage::User { content, .. }
+                | ChatMessage::Tool { content, .. }
+                | ChatMessage::Developer { content, .. } => *content = text,
+                ChatMessage::Assistant { content, .. } => *content = Some(text),
+                ChatMessage::Function { .. } => {}
+            }
+        }
+        request
     }
 }
 
@@ -461,6 +601,108 @@ mod tests {
             ),
             (
                 json!({"chat_template_kwargs": {"thinking_mode": "disabled"}}),
+                Err((StatusCode::BAD_REQUEST, "invalid_request")),
+            ),
+        ];
+        for (fields, want) in cases {
+            assert_eq!(render(fields.clone()), want.map(str::to_string), "{fields}");
+        }
+    }
+
+    fn glm5_template_kwargs(fields: &Value) -> Result<Value, String> {
+        let parsed = chat(fields.clone());
+        let (request, sent) = parsed.chat_as_sent().unwrap();
+        glm5::template_kwargs(request, sent).map(|kwargs| json!(kwargs))
+    }
+
+    /// The kwargs ATOM renders GLM-5 chats with, or its error, as its
+    /// `_check_chat` gives them for the same controls.
+    #[test]
+    fn glm5_template_kwargs_are_atoms() {
+        let thinking = |enabled: bool| json!({"enable_thinking": enabled});
+        let budget = "reasoning effort must be an integer in [1, 100]";
+        let cases = [
+            (json!({}), Ok(json!({}))),
+            (
+                json!({"thinking": {"type": "disabled"}}),
+                Ok(thinking(false)),
+            ),
+            (json!({"thinking": {"type": "enabled"}}), Ok(thinking(true))),
+            (json!({"reasoning_effort": "none"}), Ok(thinking(false))),
+            (
+                json!({"reasoning_effort": "high"}),
+                Ok(json!({"thinking_effort": "high"})),
+            ),
+            (json!({"reasoning_effort": "medium"}), Ok(json!({}))),
+            (
+                json!({"thinking": {"type": "enabled", "effort": 30}}),
+                Ok(json!({"enable_thinking": true, "thinking_effort": 30})),
+            ),
+            (
+                json!({"thinking": {"type": "enabled"}, "reasoning_effort": "none"}),
+                Ok(thinking(false)),
+            ),
+            (json!({"thinking": {"effort": 0}}), Err(budget)),
+            (json!({"thinking": {"effort": 30.0}}), Err(budget)),
+            (json!({"thinking": {"effort": true}}), Err(budget)),
+            (
+                json!({"chat_template_kwargs": {"reasoning_effort": "high"}}),
+                Ok(json!({"reasoning_effort": "high"})),
+            ),
+            (
+                json!({"chat_template_kwargs": {"enable_thinking": false}, "thinking": {"type": "enabled"}}),
+                Ok(thinking(true)),
+            ),
+        ];
+        for (fields, want) in cases {
+            assert_eq!(
+                glm5_template_kwargs(&fields),
+                want.map_err(str::to_string),
+                "{fields}"
+            );
+        }
+        // ATOM's request model takes only an object.
+        assert!(glm5_template_kwargs(&json!({"thinking": "on"})).is_err());
+    }
+
+    /// GLM-5 chats render with the template under those kwargs, and a
+    /// message's text parts a line apart, as ATOM gives them.
+    #[test]
+    fn glm5_chats_render_as_atom_renders_them() {
+        let template = concat!(
+            "{%- for m in messages -%}{{ m.role }}:{{ m.content }};{%- endfor -%}",
+            "{{ enable_thinking | default('-') }}/{{ reasoning_effort | default('-') }}",
+        );
+        let dir =
+            byte_level_tokenizer_dir(BYTE_LEVEL_MERGES, false, json!({"chat_template": template}));
+        let tokenizer =
+            create_tokenizer(dir.path().join("tokenizer.json").to_str().unwrap()).unwrap();
+        let render = |fields: Value| {
+            let parsed = chat(fields);
+            let (request, sent) = parsed.chat_as_sent().unwrap();
+            ChatControls::Glm5
+                .render(request, sent, &*tokenizer)
+                .map_err(|error| (error.status, error.code))
+        };
+        let parts =
+            json!([{"type": "text", "text": "Read"}, {"type": "text", "text": "README.md."}]);
+        let cases = [
+            (json!({}), Ok("user:hi;-/-")),
+            (json!({"reasoning_effort": "high"}), Ok("user:hi;-/-")),
+            (
+                json!({"thinking": {"type": "disabled"}}),
+                Ok("user:hi;False/-"),
+            ),
+            (
+                json!({"chat_template_kwargs": {"reasoning_effort": "high"}}),
+                Ok("user:hi;-/high"),
+            ),
+            (
+                json!({"messages": [{"role": "user", "content": parts}]}),
+                Ok("user:Read\nREADME.md.;-/-"),
+            ),
+            (
+                json!({"thinking": {"effort": 0}}),
                 Err((StatusCode::BAD_REQUEST, "invalid_request")),
             ),
         ];
