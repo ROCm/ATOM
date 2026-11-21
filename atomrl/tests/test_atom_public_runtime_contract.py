@@ -125,7 +125,7 @@ def test_rdma_docs_describe_configured_custom_all_reduce():
 
 def test_atomrl_imports_the_public_atom_rdma_wire_contract():
     text = RDMA_TRANSFER.read_text(encoding="utf-8")
-    assert "from atom.rollout.rdma_protocol import" in text
+    assert "from atom.rollout import rdma_protocol" in text
     assert "_CMD_END = 0" not in text
     assert "_CMD_BUCKET = 1" not in text
     assert "_HEADER_WORDS = 4" not in text
