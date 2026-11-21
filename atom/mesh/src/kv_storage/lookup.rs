@@ -24,7 +24,9 @@ use super::{
 /// prompts neither runs the router out of connections nor floods the admin services.
 const MAX_REQUESTS: usize = 256;
 /// Chunks from the prompt's start a lookup asks after at most: 1M tokens of 256-token
-/// chunks, whose keys take about 5 ms. A longer prompt is looked up that far.
+/// chunks, whose keys take about 5 ms. A longer prompt is looked up that far. Fewer when
+/// `MAX_REQUESTS` batches cannot hold the keys of every rank asked at every pool:
+/// ⌊256 / pools⌋ × 64 / ranks, 256 of 8 pools at 8 ranks.
 const MAX_CHUNKS: usize = 4096;
 /// Failures in a row that open a source's breaker, which a lookup probes again after
 /// `BREAKER_OPEN`.
@@ -118,8 +120,8 @@ impl Read {
     /// The tokens from the start of `tokens` the store holds, for readers whose device
     /// caches hold at least `device` of them: 0, unasked, when the engine would load
     /// nothing past that even if the store held the whole prompt; None when the store does
-    /// not answer. A lookup costs the request the keys of at most `MAX_CHUNKS` chunks,
-    /// about 1.2 µs each, and at most `deadline` of waiting.
+    /// not answer. A lookup costs the request the keys of at most `MAX_CHUNKS` chunks at
+    /// each rank asked, about 1.2 µs each, and at most `deadline` of waiting.
     pub async fn held(&self, client: &reqwest::Client, tokens: &[u32], device: u32) -> Option<u32> {
         let prompt = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
         if self.cached(prompt, prompt, device) == device {
@@ -160,7 +162,8 @@ impl Read {
         }
         let chunk = self.report.chunk_tokens;
         let pools = self.admins.len().max(1);
-        // Of one pool, rank 0's keys tell what every rank holds; see `keys::rank_keys`.
+        // A store of one pool is asked for rank 0's keys alone; `keys::rank_keys` says
+        // where they and ATOM's lookup disagree.
         let ranks = if pools > 1 {
             self.report.world.max(1)
         } else {
@@ -256,7 +259,8 @@ mod tests {
     #[test]
     fn the_engine_loads_a_hit_that_adds_enough_past_its_device_cache() {
         // A dense model's prompt of 20000 tokens in chunks of 256 with 3000 on the device,
-        // loading no fewer than 8192: ATOM loads 16384 from a chunk boundary, not 10240.
+        // loading no fewer than 8192: of a hit of 16384, ATOM loads the 13568 past the chunk
+        // boundary at 2816 and reports 16384; of 10240, the 7424 past it are too few.
         let cached = |device, hit| {
             let hit = loadable_hit(hit, 20_000, 256);
             if load_tokens(device, hit, 256, 8192) > 0 {
@@ -381,8 +385,9 @@ mod tests {
         let prompt: Vec<u32> = (0..64).collect();
         let cached = |device| estimate(&read, &client, &prompt, device);
 
-        // All 4 chunks held: the engine loads 3 of them, from the chunk boundary at or
-        // below what its device holds.
+        // All 4 chunks held: the engine reports 48 tokens of them, all but the last chunk.
+        // It loads from the chunk boundary at or below what its device holds: 3 chunks
+        // from 0, and one from 40.
         admin.held.store(4, Ordering::Relaxed);
         assert_eq!((cached(0).await, cached(40).await), (Some(48), Some(48)));
         assert!(read.lookups.last_lookup_us().is_some());

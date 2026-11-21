@@ -62,7 +62,8 @@ pub(crate) trait PrefixMatchProvider: Send + Sync + Debug {
 
     /// The tokens of `tokens` each worker's engine will report cached, in the order of
     /// `workers`, when its device cache holds what `device` says: that, with what it then
-    /// loads from a store `store_weight` counts; None where that store does not answer.
+    /// loads from a store `store_weight` counts; None where `device` is, or where that
+    /// store does not answer.
     async fn cached_tokens(
         &self,
         _tokens: &[u32],

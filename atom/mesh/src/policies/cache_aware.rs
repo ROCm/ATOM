@@ -323,10 +323,10 @@ impl CacheAwarePolicy {
 
     /// The tree's affinity branch, with the match rate of the KV event index: the share of
     /// the request's tokens a worker's device cache holds, each token its engine will then
-    /// copy in from its share group or load from a store counted at that one's weight; the
-    /// highest first, then the lower load. `kv_shared` where the worker counts copies. None
-    /// leaves the request to the tree: it has no tokens or has media, or no candidate's
-    /// match rate is above `cache_threshold`.
+    /// copy in from its share group counted at `--kv-share-weight`, and each it will load
+    /// from its store at `--kv-storage-weight`; the highest first, then the lower load.
+    /// `kv_shared` where the worker counts copies. None leaves the request to the tree: it
+    /// has no tokens or has media, or no candidate's match rate is above `cache_threshold`.
     async fn select_by_kv_events(
         &self,
         workers: &[Arc<dyn Worker>],

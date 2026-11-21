@@ -151,7 +151,8 @@ impl StorageSources {
 
     /// The tokens of `tokens` each worker's engine reports cached, given the tokens its
     /// device cache holds, after it loads what it will from the store it reads, if any;
-    /// None where that store does not answer. Every store is asked once, all at once.
+    /// None where that store does not answer. Every store is asked once a call, all at
+    /// once: a request routed again, as on a retry, asks again.
     pub async fn cached_tokens(&self, tokens: &[u32], workers: &[(&str, u32)]) -> Vec<Option<u32>> {
         let reads: Vec<(Read, Vec<usize>)> = (self.sources.lock().iter())
             .filter_map(|source| {
