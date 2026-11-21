@@ -1,4 +1,5 @@
 import base64
+import getpass
 import hashlib
 import importlib.util
 import io
@@ -695,6 +696,17 @@ def test_containers_use_only_the_bound_cpu_set(tmp_path, monkeypatch, kind):
     assert {arg for arg in calls[0] if arg.startswith("--group-add=")} == (
         set() if kind == "dataset" else {"--group-add=110", "--group-add=993"}
     )
+    tmpfs = [calls[0][i + 1] for i, value in enumerate(calls[0]) if value == "--tmpfs"]
+    access = "rw,exec,nosuid,nodev" if kind == "model" else "rw,nosuid,nodev"
+    owner = (tmp_path / "output").stat()
+    assert tmpfs == [
+        f"/root:{access},size=16g,mode=0700,uid={owner.st_uid},gid={owner.st_gid}",
+        f"/tmp:{access},size=16g,mode=1777",
+    ]
+    assert calls[0][calls[0].index("--user") + 1] == f"{owner.st_uid}:{owner.st_gid}"
+    assert (
+        "--cap-drop=ALL" in calls[0] and "--security-opt=no-new-privileges" in calls[0]
+    )
 
 
 @pytest.mark.parametrize(
@@ -787,10 +799,134 @@ def test_missing_client_fails_before_stock_install_path(tmp_path, monkeypatch):
     assets = importlib.util.module_from_spec(current)
     current.loader.exec_module(assets)
     monkeypatch.setitem(sys.modules, "k31_phase0_assets", assets)
-    monkeypatch.setattr(ci.os, "environ", {"PATH": "empty"})
+    monkeypatch.setattr(
+        ci.os,
+        "environ",
+        {
+            "PATH": "empty",
+            "LOGNAME": "host",
+            "USER": "host",
+            "AITER_JIT_DIR": "/shared",
+        },
+    )
     monkeypatch.setattr(ci.shutil, "which", lambda name: None)
     with pytest.raises(ValueError, match="refuse install"):
         ci.entry(tmp_path)
+    assert ci.os.environ == {
+        "PATH": "empty",
+        "HOME": "/root",
+        "TMPDIR": "/tmp",
+        "LOGNAME": "k31-b-accuracy",
+        "USER": "k31-b-accuracy",
+        "XDG_CACHE_HOME": "/root/.cache",
+        "TORCHINDUCTOR_CACHE_DIR": "/root/.cache/torchinductor",
+        "TRITON_CACHE_DIR": "/root/.cache/triton",
+        "TORCH_EXTENSIONS_DIR": "/root/.cache/torch_extensions",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONUNBUFFERED": "1",
+        "HF_HOME": "/root/.cache/huggingface",
+        "HF_HUB_OFFLINE": "1",
+        "HF_DATASETS_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "safe.directory",
+        "GIT_CONFIG_VALUE_0": "/app/aiter-test",
+        "LEG": "B-accuracy",
+        "TRACE_COMPILED": "0",
+        "AITER_LOG_LEVEL": "WARNING",
+        "NCCL_SOCKET_IFNAME": "lo",
+        "MORI_SOCKET_IFNAME": "lo",
+        "OMP_NUM_THREADS": "1",
+        "MKL_NUM_THREADS": "1",
+        "OPENBLAS_NUM_THREADS": "1",
+        "NUMEXPR_NUM_THREADS": "1",
+        "MAX_JOBS": "1",
+        "GPU_PREFLIGHT_KILL_DOCKER": "0",
+        "GPU_PREFLIGHT_KILL_KFD": "0",
+    }
+
+
+def test_real_getpass_labels_do_not_require_a_passwd_entry(monkeypatch):
+    calls = []
+
+    def missing_uid(uid):
+        calls.append(uid)
+        raise KeyError(f"getpwuid(): uid not found: {uid}")
+
+    monkeypatch.setitem(sys.modules, "pwd", SimpleNamespace(getpwuid=missing_uid))
+    monkeypatch.setattr(ci.os, "getuid", lambda: 1001, raising=False)
+    monkeypatch.setattr(ci.os, "environ", {})
+    with pytest.raises(KeyError, match="uid not found: 1001"):
+        getpass.getuser()
+    # Real stdlib priority: each new name supersedes the names below it.
+    for name in ("USERNAME", "LNAME", "USER", "LOGNAME"):
+        ci.os.environ[name] = name.lower() + "-label"
+        assert getpass.getuser() == ci.os.environ[name]
+    ci.os.environ.update(ci.CACHE_ENV)
+    assert getpass.getuser() == "k31-b-accuracy"
+    assert calls == [1001] and ci.os.getuid() == 1001
+
+
+@pytest.fixture
+def runtime_cache(tmp_path, monkeypatch):
+    home, temporary = tmp_path / "home", tmp_path / "tmp"
+    env = {
+        key: str(home) + value[5:] if value.startswith("/root") else value
+        for key, value in ci.CACHE_ENV.items()
+    }
+    env["TMPDIR"] = str(temporary)
+    monkeypatch.setattr(ci, "CACHE_ENV", env)
+    monkeypatch.setattr(ci.os, "environ", dict(env))
+    monkeypatch.setattr(ci.Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setattr(ci.os, "ST_RDONLY", 1, raising=False)
+    monkeypatch.setattr(ci.os, "ST_NOEXEC", 8, raising=False)
+    monkeypatch.setattr(
+        ci.os, "statvfs", lambda path: SimpleNamespace(f_flag=0), raising=False
+    )
+    return tmp_path, env
+
+
+def test_private_runtime_caches_are_writable_without_retained_probes(runtime_cache):
+    root, env = runtime_cache
+    assert ci.verify_runtime_cache() == env
+    assert all(
+        Path(value).is_dir()
+        for key, value in env.items()
+        if key not in {"LOGNAME", "USER"}
+    )
+    assert not [path for path in root.rglob("*") if path.is_file()]
+
+
+@pytest.mark.parametrize("key", [*ci.CACHE_ENV, "AITER_JIT_DIR"])
+def test_runtime_cache_environment_must_match(runtime_cache, key):
+    root, _ = runtime_cache
+    ci.os.environ[key] = "/shared"
+    with pytest.raises(ValueError, match="runtime cache environment differs"):
+        ci.verify_runtime_cache()
+    assert not list(root.iterdir())
+
+
+@pytest.mark.parametrize("flags", [1, 8])
+def test_readonly_or_noexec_cache_refuses(runtime_cache, monkeypatch, flags):
+    monkeypatch.setattr(ci.os, "statvfs", lambda path: SimpleNamespace(f_flag=flags))
+    with pytest.raises(ValueError, match="not writable/executable"):
+        ci.verify_runtime_cache()
+
+
+def test_cache_escape_and_write_denial_refuse(runtime_cache, monkeypatch):
+    root, env = runtime_cache
+    original = env["TRITON_CACHE_DIR"]
+    env["TRITON_CACHE_DIR"] = ci.os.environ["TRITON_CACHE_DIR"] = str(root / "outside")
+    with pytest.raises(ValueError, match="escapes private storage"):
+        ci.verify_runtime_cache()
+    env["TRITON_CACHE_DIR"] = ci.os.environ["TRITON_CACHE_DIR"] = original
+
+    def denied(**kwargs):
+        raise PermissionError("fixture: workload cannot create cache file")
+
+    monkeypatch.setattr(ci.tempfile, "TemporaryFile", denied)
+    with pytest.raises(PermissionError, match="cannot create cache file"):
+        ci.verify_runtime_cache()
 
 
 def test_real_checker_patch_preserves_full_evaluation(tmp_path):

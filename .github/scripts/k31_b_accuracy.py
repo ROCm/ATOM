@@ -12,6 +12,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -21,6 +22,17 @@ from k31_phase0_inputs import digest, require, verify
 CONTROL = Path(__file__).resolve().parents[2]
 POLICY = CONTROL / ".github/validation/k31-b-accuracy.json"
 EVIDENCE = Path("/app/atom-3577/evidence/B-accuracy")
+CACHE_ENV = {
+    "HOME": "/root",
+    "TMPDIR": "/tmp",
+    # Library cache labels only; the workload's numeric UID/GID remain authoritative.
+    "LOGNAME": "k31-b-accuracy",
+    "USER": "k31-b-accuracy",
+    "XDG_CACHE_HOME": "/root/.cache",
+    "TORCHINDUCTOR_CACHE_DIR": "/root/.cache/torchinductor",
+    "TRITON_CACHE_DIR": "/root/.cache/triton",
+    "TORCH_EXTENSIONS_DIR": "/root/.cache/torch_extensions",
+}
 
 
 def read(path):
@@ -553,6 +565,33 @@ def isolated_device_access(root, admission):
         telemetry(EVIDENCE / f"post-access-{parent}.json")
 
 
+def verify_runtime_cache():
+    require(
+        all(os.environ.get(key) == value for key, value in CACHE_ENV.items())
+        and "AITER_JIT_DIR" not in os.environ,
+        "runtime cache environment differs",
+    )
+    for key in CACHE_ENV:
+        if key in {"LOGNAME", "USER"}:
+            continue
+        path = Path(os.environ[key])
+        require(
+            path.resolve() == path
+            and (key == "TMPDIR" or path.is_relative_to(Path.home())),
+            "runtime cache escapes private storage",
+        )
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        require(
+            not os.statvfs(path).f_flag & (os.ST_RDONLY | os.ST_NOEXEC),
+            "runtime cache filesystem is not writable/executable",
+        )
+        with tempfile.TemporaryFile(dir=path) as probe:
+            probe.write(b"k31")
+            probe.seek(0)
+            require(probe.read(4) == b"k31", "runtime cache write/read failed")
+    return {key: os.environ[key] for key in CACHE_ENV}
+
+
 def verify_admission(root):
     admission, policy = read(root / "admission.json"), read(POLICY)
     require(
@@ -618,15 +657,17 @@ def verify_admission(root):
         Path("/models"),
     ):
         require(os.statvfs(path).f_flag & os.ST_RDONLY, f"writable input: {path}")
-    mount = next(
-        line
-        for line in Path("/proc/self/mountinfo").read_text().splitlines()
-        if line.split()[4] == "/root"
-    )
-    require(
-        " - tmpfs " in mount and "rw" in mount.split()[5].split(","),
-        "HOME is not private tmpfs",
-    )
+    for destination in ("/root", "/tmp"):
+        mount = next(
+            line
+            for line in Path("/proc/self/mountinfo").read_text().splitlines()
+            if line.split()[4] == destination
+        )
+        options = mount.split()[5].split(",")
+        require(
+            " - tmpfs " in mount and "rw" in options and "noexec" not in options,
+            f"{destination} is not writable/executable private tmpfs",
+        )
     require(
         not any(
             line.split()[4].startswith("/root/")
@@ -645,6 +686,7 @@ def verify_admission(root):
     )
     for name, wanted in read(manifest).items():
         require(checksum(root / "input" / name) == wanted, "prepared input differs")
+    cache_environment = verify_runtime_cache()
     access = isolated_device_access(root, admission)
     admission["observation"] = {
         "namespaces": {
@@ -656,6 +698,7 @@ def verify_admission(root):
         "uid": os.geteuid(),
         "gid": os.getegid(),
         "groups": os.getgroups(),
+        "cache_environment": cache_environment,
         "device_access": access,
     }
     return admission
@@ -678,8 +721,7 @@ def entry(work):
     os.environ.clear()
     os.environ.update(
         inherited,
-        HOME="/root",
-        TMPDIR="/tmp",
+        **CACHE_ENV,
         PYTHONDONTWRITEBYTECODE="1",
         PYTHONUNBUFFERED="1",
         HF_HOME="/root/.cache/huggingface",
@@ -778,6 +820,7 @@ def container(kind, work):
         f"k31-b-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}-{kind}"
     )
     cid_path = output / f"{kind}.cid"
+    tmpfs_access = "rw,exec,nosuid,nodev" if kind == "model" else "rw,nosuid,nodev"
     flags = [
         "--name",
         name,
@@ -794,9 +837,9 @@ def container(kind, work):
         "--cap-drop=ALL",
         "--security-opt=no-new-privileges",
         "--tmpfs",
-        f"/root:rw,nosuid,nodev,size=16g,mode=0700,uid={output.stat().st_uid},gid={output.stat().st_gid}",
+        f"/root:{tmpfs_access},size=16g,mode=0700,uid={output.stat().st_uid},gid={output.stat().st_gid}",
         "--tmpfs",
-        "/tmp:rw,nosuid,nodev,size=16g,mode=1777",
+        f"/tmp:{tmpfs_access},size=16g,mode=1777",
         "--shm-size=16g",
         "--mount",
         f"type=bind,src={CONTROL},dst=/control,readonly",
