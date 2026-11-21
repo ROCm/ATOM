@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""GDN warmup preserves the shared self-copy with or without ReplaySSM."""
+"""Warmup preserves the self-copy while compiling the decode-image fold."""
 
 from types import SimpleNamespace
 
@@ -47,9 +47,24 @@ def test_gdn_checkpoint_warmup_preserves_self_copy(monkeypatch, replayssm, image
             np.testing.assert_array_equal(descriptor[:, 1], descriptor[:, 0])
             np.testing.assert_array_equal(descriptor[:, 2], [6, 2, 8])
 
+        def materialize(src, dst, steps):
+            calls.append("fold")
+            assert src.dtype == dst.dtype == steps.dtype == torch.int64
+            assert (
+                src.device
+                == dst.device
+                == steps.device
+                == b.model_runner.mamba_v_cache.device
+            )
+            assert src.tolist() == dst.tolist() == [0]
+            assert steps.tolist() == [-1]
+
         monkeypatch.setattr(base, "launch_copy_descriptor", launch)
         monkeypatch.setattr(mod, "launch_copy_descriptor", launch)
+        b._materialize = materialize
         b.warmup_per_req_cache()
 
         expected = ["copy"] if image_bytes else []
+        if image_bytes and replayssm:
+            expected.append("fold")
         assert calls == expected

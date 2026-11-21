@@ -3,9 +3,10 @@
 
 """Map P/D rank ownership to physical gather units and destination PAGEs.
 
-Topology selects token ownership. Region metadata selects byte addressing.
-The transport consumes TransferPlan without knowing whether the model uses
-MLA or another attention family.
+Topology selects token ownership; a PAGE plan takes the head cuts its caller
+already validated. Region metadata selects byte addressing. The transport
+consumes TransferPlan without knowing whether the model uses MLA, MHA, or
+another attention family.
 """
 
 from __future__ import annotations
@@ -25,14 +26,11 @@ from atom.kv_transfer.disaggregation.sharded_transfer import (
 )
 
 TOKEN_UNITS = "token_rows_v1"
+PAGE_UNITS = "page_units_v1"
 
 
 @dataclass(frozen=True)
 class TransferTopology:
-    source_tp: int = 1
-    source_dcp: int = 1
-    target_tp: int = 1
-    target_tp_rank: int = 0
     target_dcp: int = 1
     target_dcp_rank: int = 0
     interleave: int = 1
@@ -72,10 +70,15 @@ class TransferPlan:
         )
 
     def ready_items(
-        self, items: Sequence[tuple[int, int, int, int]]
+        self, items: Sequence[tuple[int, int, int, int]], page_offset: int
     ) -> list[list[int]]:
         return [
-            [self.regions[pos].target_region, start, stop - start, offset]
+            [
+                self.regions[pos].target_region,
+                page_offset * self.units_per_page + start,
+                stop - start,
+                offset,
+            ]
             for pos, start, stop, offset in items
         ]
 
@@ -106,6 +109,26 @@ class TransferPlan:
         return tuple(np.concatenate(part).tolist() for part in zip(*runs))
 
 
+def page_transfer_plan(
+    regions: Sequence[PlannedRegion],
+    source_pages: Sequence[int],
+    destination_pages: Sequence[int],
+) -> TransferPlan:
+    """Plan one destination PAGE per source PAGE.
+
+    Each region's gather already holds the consumer rank's cut of a source
+    PAGE (``GatherLayout.from_slices`` over the connector's validated head
+    cuts), so the plan only pairs the two block lists.
+    """
+    return TransferPlan(
+        tuple(regions),
+        np.asarray(source_pages, dtype=np.int64),
+        np.asarray(destination_pages, dtype=np.int64),
+        1,
+        PAGE_UNITS,
+    )
+
+
 def build_transfer_plan(
     topology: TransferTopology,
     layouts: Sequence[RegionLayout],
@@ -115,30 +138,17 @@ def build_transfer_plan(
     *,
     token_ownership: DCPShardPlan | None = None,
 ) -> TransferPlan:
-    """Plan supported topology/layout combinations.
+    """Plan a non-DCP producer's PAGEs onto one DCP consumer rank.
 
     PP layer ownership is already expressed by each region's source/target map.
     DCP ownership is calculated before addressing bytes; a TP-replicated plane
-    is owned by token alone, whatever the two TP sizes. token_ownership may
-    reuse the same topology's plan from the direct/index path, so a
-    mixed-region transfer does not calculate DCP ownership twice.
+    is owned by token alone, whatever the two TP sizes. Each region's source
+    and target PAGEs must be equally wide and hold whole token rows.
+    token_ownership may reuse the same topology's plan from the direct/index
+    path, so a mixed-region transfer does not calculate DCP ownership twice.
     """
     t = topology
-    if min(t.source_tp, t.source_dcp, t.target_tp, t.target_dcp, block_size) <= 0:
-        raise ValueError("Parallel sizes and block size must be positive")
-    if (
-        not 0 <= t.target_tp_rank < t.target_tp
-        or not 0 <= t.target_dcp_rank < t.target_dcp
-    ):
-        raise ValueError("Target rank is outside its parallel group")
-    if t.source_dcp != 1:
-        raise ValueError("Staging requires a non-DCP producer")
-    if t.target_dcp == 1:
-        raise ValueError("Staging without DCP token ownership needs a PAGE adapter")
-    source_pages = np.asarray(source_pages, dtype=np.int64)
     destination_pages = np.asarray(destination_pages, dtype=np.int64)
-    if (source_pages < 0).any() or (destination_pages < 0).any():
-        raise ValueError("Negative physical PAGE index")
     ownership = (
         token_ownership
         if token_ownership is not None
@@ -154,12 +164,7 @@ def build_transfer_plan(
     indices = ownership.source_token_per_dst_token()[: ownership.landing_row_count()]
     regions = []
     for layout in layouts:
-        src, dst = layout.source_page_bytes, layout.target_page_bytes
-        if src != dst:
-            raise ValueError("Token ownership needs equal source and target PAGEs")
-        if src % block_size:
-            raise ValueError("PAGE width is not divisible by token count")
-        width = src // block_size
+        width = layout.source_page_bytes // block_size
         regions.append(
             PlannedRegion(
                 layout.source_region,
