@@ -100,6 +100,12 @@ def publish_idle_state_work(scheduler) -> None:
     scheduler._publish_state_stores()
 
 
+# The input-queue item `(INGEST_REJECTED, n)`: n requests of one batch were
+# rejected at admission, in queue order with the batch's admitted ones, so
+# the reported ingest count covers every request the CoreManager sent.
+INGEST_REJECTED = "INGEST_REJECTED"
+
+
 class EngineCore:
     # This process's name, for the title and every GC log line. A class
     # attribute because it is per-process state and each engine is spawned into
@@ -882,13 +888,14 @@ class EngineCore:
     def pull_and_process_input_queue(self):
         recv_reqs = []
         credit_updates = []
+        rejected = 0
         while not self.input_queue.empty():
             seqs = self.input_queue.get_nowait()
-            if (
-                isinstance(seqs, tuple)
-                and seqs[0] == EngineCoreRequestType.DP_PREFIX_CREDIT
-            ):
-                credit_updates.extend(seqs[1])
+            if isinstance(seqs, tuple):
+                if seqs[0] == EngineCoreRequestType.DP_PREFIX_CREDIT:
+                    credit_updates.extend(seqs[1])
+                elif seqs[0] == INGEST_REJECTED:
+                    rejected += seqs[1]
                 continue
             for seq in seqs:
                 if seq.status == SequenceStatus.EXIT_ENGINE:
@@ -898,7 +905,7 @@ class EngineCore:
         if len(recv_reqs) > 0:
             logger.debug(f"{self.label}: put {len(recv_reqs)} reqs to scheduler")
             self.scheduler.extend(recv_reqs)
-            self._ingested_seqs += len(recv_reqs)
+        self._ingested_seqs += len(recv_reqs) + rejected
         self._apply_prefix_credit_updates(credit_updates)
         return False
 
@@ -982,6 +989,9 @@ class EngineCore:
             self._kv_progress_event.set()
             self._offer_tier_lookups(seqs)
         if rejected:
+            if self._report_backlog:
+                # Counted on the engine thread, in order with the batch.
+                self.input_queue.put_nowait((INGEST_REJECTED, len(rejected)))
             self.output_queue.put_nowait(("REJECTED", rejected))
 
     def process_input_sockets(self, input_address: str, control_address: str):
