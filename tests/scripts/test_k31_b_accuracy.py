@@ -125,6 +125,12 @@ def test_typed_admission_refuses_legacy_before_native_checks(tmp_path):
 
 
 def test_missing_client_fails_before_stock_install_path(tmp_path, monkeypatch):
+    current = importlib.util.spec_from_file_location(
+        "k31_phase0_assets", ROOT / ".github/scripts/k31_phase0_assets.py"
+    )
+    assets = importlib.util.module_from_spec(current)
+    current.loader.exec_module(assets)
+    monkeypatch.setitem(sys.modules, "k31_phase0_assets", assets)
     monkeypatch.setattr(ci.os, "environ", {"PATH": "empty"})
     monkeypatch.setattr(ci.shutil, "which", lambda name: None)
     with pytest.raises(ValueError, match="refuse install"):
