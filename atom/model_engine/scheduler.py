@@ -26,7 +26,7 @@ import math
 import struct
 import threading
 import time
-from collections import Counter, deque
+from collections import Counter, OrderedDict, deque
 from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
@@ -1000,7 +1000,8 @@ class Scheduler:
         # Abort can be handled before the Submit it follows (utilities run
         # before inputs each tick, and the two ride different sockets), so it
         # is held for `UNMATCHED_ABORT_TTL_S` and applied on admission.
-        self._unmatched_aborts: dict[int, float] = {}
+        # Oldest first, so the expired ones are always at the front.
+        self._unmatched_aborts: OrderedDict[int, float] = OrderedDict()
         self._local_prefill_coalescing = False
         self._inflight_prefix_wait: dict[int, int] = {}
         # Tier loads started early, and the skip reasons of those not started.
@@ -3360,11 +3361,13 @@ class Scheduler:
         already finished expires unused."""
         now = time.monotonic()
         aborts = self._unmatched_aborts
-        if aborts:
-            expired = [i for i, t in aborts.items() if now - t > UNMATCHED_ABORT_TTL_S]
-            for i in expired:
-                del aborts[i]
+        # Held in arrival order, so expiring stops at the first live one:
+        # O(1) amortized, where a scan of every hold costs O(held) per miss,
+        # and every rank but the request's own misses each abort.
+        while aborts and now - aborts[next(iter(aborts))] > UNMATCHED_ABORT_TTL_S:
+            aborts.popitem(last=False)
         aborts[req_id] = now
+        aborts.move_to_end(req_id)
 
     def _abort_failed_remote_receive(self, req_id) -> None:
         """End a request whose P/D KV receive failed, as aborted.
@@ -6288,6 +6291,9 @@ class DecodeScheduler(Scheduler):
                 if seq.id == req_id:
                     seq.status = SequenceStatus.ABORTED
                     return True
+            # Held for `extend` as the base scheduler holds it: the abort may
+            # have overtaken its Submit.
+            self._remember_unmatched_abort(req_id)
         return False
 
     def get_request_counts(self) -> tuple[int, int]:
