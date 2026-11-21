@@ -22,6 +22,7 @@ import contextlib
 import json
 import logging
 import os
+import sys
 import time
 import uuid
 from asyncio import AbstractEventLoop
@@ -2090,6 +2091,46 @@ async def _configure_structured_output(
         raise ValueError(f"strict function tools: {exc}") from exc
 
 
+async def _configure_chat_structured_output(
+    sampling_params,
+    schema,
+    channel,
+    *,
+    tools,
+    all_tools,
+    tool_choice,
+    strict_schemas=None,
+    kv_transfer=None,
+    multimodal=False,
+):
+    """A chat's grammar: its response format or strict tools, else its tool calls
+    held to `all_tools`, the top-level tools and those its messages declare."""
+    await _configure_structured_output(
+        sampling_params,
+        schema,
+        channel,
+        tools=tools,
+        tool_choice=tool_choice,
+        strict_schemas=strict_schemas,
+        kv_transfer=kv_transfer,
+        multimodal=multimodal,
+    )
+    if schema is None and not strict_schemas and tool_call_parser_cls is not None:
+        await configure_tool_call_grammar(
+            engine,
+            _get_engine_config(),
+            sampling_params,
+            channel,
+            parser_cls=tool_call_parser_cls,
+            tools=all_tools,
+            tool_choice=tool_choice,
+            kv_transfer=kv_transfer,
+            multimodal=multimodal,
+            relaxed_mtp=envs.ATOM_ENABLE_RELAXED_MTP,
+            synthetic=synthetic_token_text is not None,
+        )
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest, raw_request: Request):
     """Handle chat completion requests (OpenAI-compatible)."""
@@ -2270,30 +2311,17 @@ async def _chat_completions(
                 prompt_or_tokens, assistant_prefix, _reasoning
             )
 
-        await _configure_structured_output(
+        await _configure_chat_structured_output(
             sampling_params,
             schema,
             _reasoning,
             tools=request.tools,
+            all_tools=request_tools(request),
             tool_choice=request.tool_choice,
             strict_schemas=strict_schemas,
             kv_transfer=request.kv_transfer_params,
             multimodal=_has_multimodal_content(messages),
         )
-        if schema is None and not strict_schemas and tool_call_parser_cls is not None:
-            await configure_tool_call_grammar(
-                engine,
-                _get_engine_config(),
-                sampling_params,
-                _reasoning,
-                parser_cls=tool_call_parser_cls,
-                tools=request_tools(request),
-                tool_choice=request.tool_choice,
-                kv_transfer=request.kv_transfer_params,
-                multimodal=_has_multimodal_content(messages),
-                relaxed_mtp=envs.ATOM_ENABLE_RELAXED_MTP,
-                synthetic=synthetic_token_text is not None,
-            )
 
         _reasoning = structured_response_channel(
             _reasoning, schema, bool(strict_schemas)
@@ -3522,14 +3550,21 @@ async def list_models():
     ).model_dump(exclude_none=True)
 
 
+def health_problem() -> str | None:
+    """/health's 503 detail, or None while it answers 200; HealthCheck reads it too."""
+    if engine is None or not engine.core_mgr.is_healthy():
+        return "Engine workers unavailable"
+    dead = _frontend_hub.dead_workers() if _frontend_hub is not None else []
+    if dead:
+        return f"Front-end workers {dead} exited"
+    return None
+
+
 @_engine_route("/health")
 async def health():
     """Report readiness of all engine workers, not just the HTTP process."""
-    if engine is None or not engine.core_mgr.is_healthy():
-        raise HTTPException(status_code=503, detail="Engine workers unavailable")
-    dead = _frontend_hub.dead_workers() if _frontend_hub is not None else []
-    if dead:
-        raise HTTPException(status_code=503, detail=f"Front-end workers {dead} exited")
+    if (problem := health_problem()) is not None:
+        raise HTTPException(status_code=503, detail=problem)
     return {"status": "ok"}
 
 
@@ -3620,6 +3655,11 @@ def _resolve_kv_transfer_role(kv_cfg: dict) -> tuple[str | None, int]:
 
 @_engine_route("/kv_transfer_info")
 async def kv_transfer_info():
+    return kv_transfer_info_body()
+
+
+def kv_transfer_info_body() -> dict:
+    """/kv_transfer_info's body, which gRPC's GetServerInfo also carries."""
     cfg = engine.config
     kv_cfg = cfg.kv_transfer_config or {}
     kv_role, handshake_port = _resolve_kv_transfer_role(kv_cfg)
@@ -3664,6 +3704,11 @@ async def server_info():
     per-DP-rank worker set and enable cache-aware routing to the rank that
     holds a request's prefix.
     """
+    return server_info_body()
+
+
+def server_info_body() -> dict:
+    """/server_info's body, which gRPC's GetServerInfo also carries."""
     cfg = engine.config
     return {
         "model_id": model_name,
@@ -3779,6 +3824,16 @@ def main():
         ),
     )
     parser.add_argument(
+        "--grpc-port",
+        type=int,
+        default=None,
+        help=(
+            "Also serve ATOM's gRPC service, atom.grpc.v1.AtomEngine (token ids "
+            "in, token ids out), on this port, from the process that owns the "
+            "engine. Needs --api-server-count 1."
+        ),
+    )
+    parser.add_argument(
         "--request-log",
         type=str,
         default=None,
@@ -3787,6 +3842,8 @@ def main():
     args = parser.parse_args()
     if args.api_server_count < 1:
         parser.error("--api-server-count must be at least 1")
+    if args.grpc_port is not None and args.api_server_count > 1:
+        parser.error("--grpc-port needs --api-server-count 1")
 
     _setup_frontend(args)
 
@@ -3823,6 +3880,14 @@ def main():
     engine.core_mgr._flush_stream_batch_fn = flush_stream_batch
     if args.api_server_count > 1:
         _start_frontend_workers(args)
+    if args.grpc_port is not None:
+        from atom.entrypoints.grpc.server import start_grpc_server
+
+        try:  # the module main() runs in: `__main__` under `python -m` on this file
+            start_grpc_server(sys.modules[__name__], args)
+        except Exception:
+            engine.close()  # its processes would keep the failed launch alive
+            raise
     _serve(args)
 
 

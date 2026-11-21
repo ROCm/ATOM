@@ -751,6 +751,7 @@ class InputOutputProcessor:
         data_parallel_rank: int | None = None,
         dp_session_id: str | None = None,
         dp_parent_session_id: str | None = None,
+        stop_token_sequences: list[list[int]] | None = None,
     ):
         """responsible for:
         1) Tokenize
@@ -775,6 +776,7 @@ class InputOutputProcessor:
             data_parallel_rank=data_parallel_rank,
             dp_session_id=dp_session_id,
             dp_parent_session_id=dp_parent_session_id,
+            stop_token_sequences=stop_token_sequences,
         )
         return seqs[0]
 
@@ -835,6 +837,7 @@ class InputOutputProcessor:
         data_parallel_rank: int | None = None,
         dp_session_id: str | None = None,
         dp_parent_session_id: str | None = None,
+        stop_token_sequences: list[list[int]] | None = None,
     ) -> list[Sequence]:
         """Tokenize once and materialize ``sampling_params.n`` Sequences.
 
@@ -899,17 +902,14 @@ class InputOutputProcessor:
                 multimodal_data,
             )
 
-        stop_token_sequences = []
-        if sampling_params.stop_strings:
-            stops = (
-                [sampling_params.stop_strings]
-                if isinstance(sampling_params.stop_strings, str)
-                else sampling_params.stop_strings
-            )
-            for stop_str in stops:
-                stop_tokens = self.tokenizer.encode(stop_str, add_special_tokens=False)
-                if stop_tokens:
-                    stop_token_sequences.append(stop_tokens)
+        if stop_token_sequences is None:  # not given as ids: encode the stop strings
+            stops = sampling_params.stop_strings or []
+            stops = [stops] if isinstance(stops, str) else stops
+            stop_token_sequences = [
+                self.tokenizer.encode(stop, add_special_tokens=False) for stop in stops
+            ]
+        # An empty sequence would match at once, ending the request at its first token.
+        stop_token_sequences = [s for s in stop_token_sequences if len(s)]
 
         if sampling_params.required_channel is not None:
             sampling_params = replace(
