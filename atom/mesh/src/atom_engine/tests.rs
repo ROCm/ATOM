@@ -4,20 +4,15 @@
 //! Core on real ipc sockets and routes input and control to it, and gives up
 //! on a Core that stops before it is ready or exits, or when interrupted.
 
-use std::thread;
-
 use prost::Message as _;
-use serde_json::json;
-use tempfile::TempDir;
 
 use super::{
-    link::{self, CoreLink},
-    spec::{CoreSpec, EngineSpec},
+    grpc,
     wire::{self, pb, Inbound, PROTOCOL_VERSION},
 };
 
-fn inbound(frames: Vec<Vec<u8>>) -> Result<Inbound, String> {
-    Inbound::decode(frames.into_iter().map(zmq::Message::from).collect())
+fn inbound(frames: Vec<Vec<u8>>) -> Result<Inbound<Vec<u8>>, String> {
+    Inbound::decode(frames)
 }
 
 fn buffer(frame: u32, offset: u64, nbytes: u64) -> Option<pb::BufferRef> {
@@ -95,157 +90,202 @@ fn a_malformed_message_or_an_out_of_bounds_ref_is_refused() {
     assert!(message.tokens(buffer(1, 0, 6).as_ref()).is_err());
 }
 
-fn spec_json() -> serde_json::Value {
-    json!({
-        "engines": [
-            {"dp_rank": 0, "pid": 10, "input": "ipc:///i0", "control": "ipc:///c0", "output": "ipc:///o0"},
-            {"dp_rank": 1, "pid": 11, "input": "ipc:///i1", "control": "ipc:///c1", "output": "ipc:///o1"},
-        ],
-    })
-}
-
 #[test]
-fn a_spec_lists_its_cores_and_refuses_cores_it_cannot_place() {
-    let spec = EngineSpec::from_json(&spec_json().to_string()).unwrap();
-    assert_eq!(spec.engines[1].pid, 11);
-
-    let mut no_cores = spec_json();
-    no_cores["engines"] = json!([]);
-    assert!(EngineSpec::from_json(&no_cores.to_string()).is_err());
-    let mut swapped = spec_json();
-    swapped["engines"].as_array_mut().unwrap().reverse();
-    assert!(EngineSpec::from_json(&swapped.to_string()).is_err());
-}
-
-fn core_spec(dir: &TempDir, pid: u32) -> CoreSpec {
-    let address = |name: &str| format!("ipc://{}", dir.path().join(name).display());
-    CoreSpec {
-        dp_rank: 0,
-        pid,
-        input: address("input"),
-        control: address("control"),
-        output: address("output"),
-    }
-}
-
-/// Connect as EngineCore does (a DEALER on input and control, each announcing
-/// itself with an empty frame; a PUSH on output), send `first`, then hand
-/// back the next message on input and on control, or none if either does not
-/// come within the receive timeout.
-fn fake_core(
-    spec: CoreSpec,
-    first: pb::envelope::Body,
-) -> thread::JoinHandle<Option<[Inbound; 2]>> {
-    thread::spawn(move || {
-        let ctx = zmq::Context::new();
-        let dealer = |address: &str| {
-            let socket = ctx.socket(zmq::DEALER).unwrap();
-            // A message the link sent elsewhere fails the test, not hangs it;
-            // short, since a test the link sends nothing to waits it out.
-            socket.set_rcvtimeo(1000).unwrap();
-            socket.connect(address).unwrap();
-            socket.send(Vec::<u8>::new(), 0).unwrap();
-            socket
-        };
-        let input = dealer(&spec.input);
-        let control = dealer(&spec.control);
-        let output = ctx.socket(zmq::PUSH).unwrap();
-        output.connect(&spec.output).unwrap();
-        output
-            .send_multipart(wire::encode(first, vec![]), 0)
-            .unwrap();
-        let receive = |socket: &zmq::Socket| Inbound::decode(link::recv_frames(socket).ok()?).ok();
-        Some([receive(&input)?, receive(&control)?])
-    })
-}
-
-fn never_interrupted() -> bool {
-    false
-}
-
-#[test]
-fn a_link_handshakes_and_routes_input_and_control_to_their_core() {
-    let dir = TempDir::new().unwrap();
-    let spec = core_spec(&dir, std::process::id());
-    let ready = pb::envelope::Body::Ready(pb::Ready {
-        max_pool_tokens: Some(4096),
+fn a_session_frames_message_carries_one_engine_message() {
+    // As ATOM sends a Completions over a Session: the message and its token buffer in one Frames.
+    let completion = pb::Completion {
+        seq_id: 3,
+        completion_token_ids: buffer(1, 0, 8),
+        ..Default::default()
+    };
+    let body = pb::envelope::Body::Completions(pb::Completions {
+        items: vec![completion],
     });
-    let core = fake_core(spec.clone(), ready);
-
-    let ctx = zmq::Context::new();
-    let (link, _output, max_pool_tokens) =
-        CoreLink::connect(&ctx, spec, &never_interrupted).unwrap();
-    assert_eq!(max_pool_tokens, Some(4096));
-
-    let tokens = wire::token_frame(&[1, 2, 3]);
-    let submit = pb::SubmitBatch {
-        requests: vec![pb::RequestSpec {
-            prompt_token_ids: buffer(1, 0, tokens.len() as u64),
-            ..Default::default()
-        }],
+    let sent = grpc::Frames {
+        frames: wire::encode(body, vec![wire::token_frame(&[11, 12])]),
     };
-    link.send_input(wire::encode(
-        pb::envelope::Body::Submit(submit),
-        vec![tokens],
-    ))
-    .unwrap();
-    let abort = pb::Abort { seq_ids: vec![7] };
-    link.send_control(wire::encode(pb::envelope::Body::Abort(abort), vec![]))
-        .unwrap();
+    let received = grpc::Frames::decode(&sent.encode_to_vec()[..]).unwrap();
 
-    let [input, control] = core
-        .join()
-        .unwrap()
-        .expect("the core received both messages");
-    let pb::envelope::Body::Submit(batch) = &input.body else {
-        panic!("input carried {:?}", input.body);
+    let message = Inbound::decode(received.frames).unwrap();
+    let pb::envelope::Body::Completions(batch) = &message.body else {
+        panic!("decoded {:?}", message.body);
     };
+    assert_eq!(batch.items[0].seq_id, 3);
     assert_eq!(
-        input
-            .tokens(batch.requests[0].prompt_token_ids.as_ref())
+        message
+            .tokens(batch.items[0].completion_token_ids.as_ref())
             .unwrap(),
-        vec![1, 2, 3]
+        vec![11, 12]
     );
-    assert!(matches!(
-        &control.body,
-        pb::envelope::Body::Abort(a) if a.seq_ids == [7]
-    ));
 }
 
-#[test]
-fn a_link_gives_up_on_a_core_that_exits() {
-    // No process has pid 0 in /proc, so the Core counts as exited.
-    let dir = TempDir::new().unwrap();
-    let ctx = zmq::Context::new();
-    let err = CoreLink::connect(&ctx, core_spec(&dir, 0), &never_interrupted)
-        .err()
-        .unwrap();
-    assert!(err.contains("exited"), "{err}");
-}
+/// `EngineSpec` and `CoreLink`, which need the `atom-engine` feature.
+#[cfg(feature = "atom-engine")]
+mod runtime {
+    use std::thread;
 
-#[test]
-fn a_link_refuses_a_core_that_stops_before_it_is_ready() {
-    let dir = TempDir::new().unwrap();
-    let spec = core_spec(&dir, std::process::id());
-    let core = fake_core(spec.clone(), pb::envelope::Body::Stopped(pb::Stopped {}));
+    use serde_json::json;
+    use tempfile::TempDir;
 
-    let ctx = zmq::Context::new();
-    let err = CoreLink::connect(&ctx, spec, &never_interrupted)
-        .err()
-        .unwrap();
-    assert!(err.contains("stopped before it was ready"), "{err}");
-    // The link sent the Core nothing.
-    assert!(core.join().unwrap().is_none());
-}
+    use super::{buffer, pb, wire, Inbound};
+    use crate::atom_engine::{
+        link::{self, CoreLink},
+        spec::{CoreSpec, EngineSpec},
+    };
 
-#[test]
-fn a_link_gives_up_when_interrupted() {
-    // The Core is this process, so it never counts as exited, and nothing
-    // connects: only the interruption ends the wait.
-    let dir = TempDir::new().unwrap();
-    let ctx = zmq::Context::new();
-    let err = CoreLink::connect(&ctx, core_spec(&dir, std::process::id()), &|| true)
-        .err()
+    fn spec_json() -> serde_json::Value {
+        json!({
+            "engines": [
+                {"dp_rank": 0, "pid": 10, "input": "ipc:///i0", "control": "ipc:///c0", "output": "ipc:///o0"},
+                {"dp_rank": 1, "pid": 11, "input": "ipc:///i1", "control": "ipc:///c1", "output": "ipc:///o1"},
+            ],
+        })
+    }
+
+    #[test]
+    fn a_spec_lists_its_cores_and_refuses_cores_it_cannot_place() {
+        let spec = EngineSpec::from_json(&spec_json().to_string()).unwrap();
+        assert_eq!(spec.engines[1].pid, 11);
+
+        let mut no_cores = spec_json();
+        no_cores["engines"] = json!([]);
+        assert!(EngineSpec::from_json(&no_cores.to_string()).is_err());
+        let mut swapped = spec_json();
+        swapped["engines"].as_array_mut().unwrap().reverse();
+        assert!(EngineSpec::from_json(&swapped.to_string()).is_err());
+    }
+
+    fn core_spec(dir: &TempDir, pid: u32) -> CoreSpec {
+        let address = |name: &str| format!("ipc://{}", dir.path().join(name).display());
+        CoreSpec {
+            dp_rank: 0,
+            pid,
+            input: address("input"),
+            control: address("control"),
+            output: address("output"),
+        }
+    }
+
+    /// Connect as EngineCore does (a DEALER on input and control, each announcing
+    /// itself with an empty frame; a PUSH on output), send `first`, then hand
+    /// back the next message on input and on control, or none if either does not
+    /// come within the receive timeout.
+    fn fake_core(
+        spec: CoreSpec,
+        first: pb::envelope::Body,
+    ) -> thread::JoinHandle<Option<[Inbound<zmq::Message>; 2]>> {
+        thread::spawn(move || {
+            let ctx = zmq::Context::new();
+            let dealer = |address: &str| {
+                let socket = ctx.socket(zmq::DEALER).unwrap();
+                // A message the link sent elsewhere fails the test, not hangs it;
+                // short, since a test the link sends nothing to waits it out.
+                socket.set_rcvtimeo(1000).unwrap();
+                socket.connect(address).unwrap();
+                socket.send(Vec::<u8>::new(), 0).unwrap();
+                socket
+            };
+            let input = dealer(&spec.input);
+            let control = dealer(&spec.control);
+            let output = ctx.socket(zmq::PUSH).unwrap();
+            output.connect(&spec.output).unwrap();
+            output
+                .send_multipart(wire::encode(first, vec![]), 0)
+                .unwrap();
+            let receive =
+                |socket: &zmq::Socket| Inbound::decode(link::recv_frames(socket).ok()?).ok();
+            Some([receive(&input)?, receive(&control)?])
+        })
+    }
+
+    fn never_interrupted() -> bool {
+        false
+    }
+
+    #[test]
+    fn a_link_handshakes_and_routes_input_and_control_to_their_core() {
+        let dir = TempDir::new().unwrap();
+        let spec = core_spec(&dir, std::process::id());
+        let ready = pb::envelope::Body::Ready(pb::Ready {
+            max_pool_tokens: Some(4096),
+        });
+        let core = fake_core(spec.clone(), ready);
+
+        let ctx = zmq::Context::new();
+        let (link, _output, max_pool_tokens) =
+            CoreLink::connect(&ctx, spec, &never_interrupted).unwrap();
+        assert_eq!(max_pool_tokens, Some(4096));
+
+        let tokens = wire::token_frame(&[1, 2, 3]);
+        let submit = pb::SubmitBatch {
+            requests: vec![pb::RequestSpec {
+                prompt_token_ids: buffer(1, 0, tokens.len() as u64),
+                ..Default::default()
+            }],
+        };
+        link.send_input(wire::encode(
+            pb::envelope::Body::Submit(submit),
+            vec![tokens],
+        ))
         .unwrap();
-    assert!(err.contains("interrupted"), "{err}");
+        let abort = pb::Abort { seq_ids: vec![7] };
+        link.send_control(wire::encode(pb::envelope::Body::Abort(abort), vec![]))
+            .unwrap();
+
+        let [input, control] = core
+            .join()
+            .unwrap()
+            .expect("the core received both messages");
+        let pb::envelope::Body::Submit(batch) = &input.body else {
+            panic!("input carried {:?}", input.body);
+        };
+        assert_eq!(
+            input
+                .tokens(batch.requests[0].prompt_token_ids.as_ref())
+                .unwrap(),
+            vec![1, 2, 3]
+        );
+        assert!(matches!(
+            &control.body,
+            pb::envelope::Body::Abort(a) if a.seq_ids == [7]
+        ));
+    }
+
+    #[test]
+    fn a_link_gives_up_on_a_core_that_exits() {
+        // No process has pid 0 in /proc, so the Core counts as exited.
+        let dir = TempDir::new().unwrap();
+        let ctx = zmq::Context::new();
+        let err = CoreLink::connect(&ctx, core_spec(&dir, 0), &never_interrupted)
+            .err()
+            .unwrap();
+        assert!(err.contains("exited"), "{err}");
+    }
+
+    #[test]
+    fn a_link_refuses_a_core_that_stops_before_it_is_ready() {
+        let dir = TempDir::new().unwrap();
+        let spec = core_spec(&dir, std::process::id());
+        let core = fake_core(spec.clone(), pb::envelope::Body::Stopped(pb::Stopped {}));
+
+        let ctx = zmq::Context::new();
+        let err = CoreLink::connect(&ctx, spec, &never_interrupted)
+            .err()
+            .unwrap();
+        assert!(err.contains("stopped before it was ready"), "{err}");
+        // The link sent the Core nothing.
+        assert!(core.join().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_link_gives_up_when_interrupted() {
+        // The Core is this process, so it never counts as exited, and nothing
+        // connects: only the interruption ends the wait.
+        let dir = TempDir::new().unwrap();
+        let ctx = zmq::Context::new();
+        let err = CoreLink::connect(&ctx, core_spec(&dir, std::process::id()), &|| true)
+            .err()
+            .unwrap();
+        assert!(err.contains("interrupted"), "{err}");
+    }
 }

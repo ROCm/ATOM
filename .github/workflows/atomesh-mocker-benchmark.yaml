@@ -5,7 +5,8 @@ on:
     branches: [main]
     paths:
       - 'atom/mesh/**'
-      - 'atom/model_engine/zmq_protocol/**'  # engine_v1.proto, built by --features atom-engine
+      - 'atom/model_engine/zmq_protocol/**'  # engine_v1.proto, compiled by atom/mesh/build.rs
+      - 'atom/entrypoints/grpc/atom_grpc.proto'  # compiled by atom/mesh/build.rs too
       - '.github/scripts/atomesh/atomesh_mocker_benchmark.sh'
       - '.github/scripts/atomesh/atomesh_mocker_benchmark_summary.py'
       - '.github/workflows/atomesh-mocker-benchmark.yaml'
@@ -16,7 +17,8 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - 'atom/mesh/**'
-      - 'atom/model_engine/zmq_protocol/**'  # engine_v1.proto, built by --features atom-engine
+      - 'atom/model_engine/zmq_protocol/**'  # engine_v1.proto, compiled by atom/mesh/build.rs
+      - 'atom/entrypoints/grpc/atom_grpc.proto'  # compiled by atom/mesh/build.rs too
       - '.github/scripts/atomesh/atomesh_mocker_benchmark.sh'
       - '.github/scripts/atomesh/atomesh_mocker_benchmark_summary.py'
       - '.github/workflows/atomesh-mocker-benchmark.yaml'

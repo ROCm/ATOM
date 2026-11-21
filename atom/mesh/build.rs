@@ -13,16 +13,25 @@ macro_rules! set_env {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // This crate's .protos are compiled by protox, but the smg-grpc-client
     // dependency's build script still runs protoc, so builds need it.
-    #[cfg(feature = "atom-engine")]
+    #[cfg(feature = "grpc-client")]
     {
-        // The EngineCore's wire protocol, kept beside the EngineCore.
-        const ENGINE_PROTO_DIR: &str = "../model_engine/zmq_protocol";
-        let engine_proto = protox::compile(["engine_v1.proto"], [ENGINE_PROTO_DIR])?;
+        // ATOM's protos at their repository paths, by which atom_grpc.proto imports
+        // engine_v1.proto; its engine_v1 fields take atom_engine::wire::pb's types.
+        const REPO_ROOT: &str = "../..";
+        const ENGINE_PROTO: &str = "atom/model_engine/zmq_protocol/engine_v1.proto";
+        const GRPC_PROTO: &str = "atom/entrypoints/grpc/atom_grpc.proto";
+        let engine_proto = protox::compile([ENGINE_PROTO], [REPO_ROOT])?;
         tonic_prost_build::configure()
             .build_client(false)
             .build_server(false)
             .compile_fds(engine_proto)?;
-        println!("cargo:rerun-if-changed={ENGINE_PROTO_DIR}");
+        let grpc_proto = protox::compile([GRPC_PROTO], [REPO_ROOT])?;
+        tonic_prost_build::configure()
+            .extern_path(".atom.engine.v1", "crate::atom_engine::wire::pb")
+            .compile_fds(grpc_proto)?;
+        for proto in [ENGINE_PROTO, GRPC_PROTO] {
+            println!("cargo:rerun-if-changed={REPO_ROOT}/{proto}");
+        }
     }
     #[cfg(feature = "ext-proc")]
     {

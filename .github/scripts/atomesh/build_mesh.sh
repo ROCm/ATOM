@@ -14,11 +14,19 @@ esac
 source_commit="${ATOMESH_MESH_SOURCE_COMMIT:-$(git -C "${source_dir}" rev-parse HEAD)}"
 
 # The checkout is mounted read-only. Cargo may need to create a lockfile.
-python3 - "${source_dir}" "${build_dir}/source" <<'PY'
+# build.rs reads ATOM's protos at their paths from the repository root, two levels up.
+mesh_copy="${build_dir}/source/atom/mesh"
+python3 - "${source_dir}" "${mesh_copy}" <<'PY'
 import shutil
 import sys
+from pathlib import Path
 
-shutil.copytree(sys.argv[1], sys.argv[2], ignore=shutil.ignore_patterns("target", ".git"))
+mesh, copy = Path(sys.argv[1]).resolve(), Path(sys.argv[2])
+shutil.copytree(mesh, copy, ignore=shutil.ignore_patterns("target", ".git"))
+for proto in ("atom/model_engine/zmq_protocol/engine_v1.proto", "atom/entrypoints/grpc/atom_grpc.proto"):
+    if (mesh.parents[1] / proto).is_file():
+        (copy.parents[1] / proto).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(mesh.parents[1] / proto, copy.parents[1] / proto)
 PY
 
 target_dir="${ATOMESH_MESH_TARGET_DIR:-${TMPDIR:-/tmp}/atomesh-mesh-cache-$(id -u)}"
@@ -48,13 +56,13 @@ if ! cargo --version >/dev/null 2>&1; then
   fi
 fi
 lock_args=()
-if [[ -f "${build_dir}/source/Cargo.lock" ]]; then
+if [[ -f "${mesh_copy}/Cargo.lock" ]]; then
   lock_args+=(--locked)
 fi
 run_cargo_build() {
   cargo build --profile "${profile}" --bin atomesh \
     "${lock_args[@]}" \
-    --manifest-path "${build_dir}/source/Cargo.toml" \
+    --manifest-path "${mesh_copy}/Cargo.toml" \
     --target-dir "${target_dir}" > "${log_dir}/mesh-build.log" 2>&1
 }
 echo "[build] Mesh commit=${source_commit} profile=${profile}" >&2
@@ -75,7 +83,7 @@ if ! run_cargo_build; then
     exit 1
   fi
 fi
-cp "${build_dir}/source/Cargo.lock" "${log_dir}/mesh-Cargo.lock"
+cp "${mesh_copy}/Cargo.lock" "${log_dir}/mesh-Cargo.lock"
 cp "${target_dir}/${profile}/atomesh" "${log_dir}/atomesh"
 python3 - "${log_dir}" "${source_commit}" "${profile}" <<'PY'
 import hashlib
