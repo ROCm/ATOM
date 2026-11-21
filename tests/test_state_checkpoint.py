@@ -35,7 +35,12 @@ from atom.model_engine.page_unit_checkpoint import (
 from atom.model_engine.prefix_hash import full_prompt_blocks
 from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceType
-from atom.model_engine.state_cache import StateCache
+from atom.model_engine.state_cache import (
+    KEEP_NONE,
+    KEEP_SETTLED,
+    KEEP_SNAPSHOT,
+    StateCache,
+)
 from atom.model_engine.state_offload import StateOffloadIndex
 from atom.model_engine.state_pool import StateSlotPool
 from atom.model_engine.state_runtime import (
@@ -2282,6 +2287,100 @@ class TestPagedCopyCheckpoint:
 # ── Checkpoints past the prompt ────────────────────────────────────────────
 
 
+class TestDecodeBoundaryStep:
+    """A decode boundary carries the verify step its slot holds to the store."""
+
+    def _decode_to(self, bm, end, step):
+        seq = stateful_seq(list(range(10)))
+        run_prompt(bm, seq)  # ends off the grid: keeps nothing
+        while seq.num_tokens < end:
+            seq.append_token(500 + seq.num_tokens)
+            bm.may_append(seq)
+        bm.hash_decode_blocks(seq, end, next_forward_tokens=1, snapshot_step=step)
+        return seq
+
+    def _bm(self, keep):
+        runtime = StateRuntime(
+            transfer=StateTransfer.copy(PAGED_COPY_SPEC.layout_id, decode_keep=keep),
+            checkpoint_spec=PAGED_COPY_SPEC,
+        )
+        return make_block_manager(ckpt_config(), state_runtime=runtime)
+
+    def test_a_snapshot_backend_builds_the_step_in_scratch(self):
+        bm = self._bm(KEEP_SNAPSHOT)
+        seq = self._decode_to(bm, 3 * BLOCK, step=2)
+        (op,) = bm.take_state_maintenance_ops().checkpoint_stores
+        assert (op.src_slot, op.step) == (seq.state_slot, 2)
+        assert op.scratch_slot not in (-1, seq.state_slot)
+        assert not bm.state.is_free(op.scratch_slot)
+        bm.complete_previous_state_batch()
+        assert bm.state.is_free(op.scratch_slot), "the scratch is lent one batch"
+
+    def test_a_settled_slot_is_copied_as_it_stands(self):
+        bm = self._bm(KEEP_SETTLED)
+        seq = self._decode_to(bm, 3 * BLOCK, step=2)
+        (op,) = bm.take_state_maintenance_ops().checkpoint_stores
+        assert (op.src_slot, op.step, op.scratch_slot) == (seq.state_slot, -1, -1)
+
+    @staticmethod
+    def _serving(seq):
+        sched = make_scheduler(paged_copy_config(), state_runtime=PAGED_COPY_RUNTIME)
+        sched.add(seq)
+        return sched, sched.schedule()[0]
+
+    @staticmethod
+    def _postprocess(sched, seq, token, batch):
+        sched.postprocess(
+            list(sched.running),
+            ScheduledBatchOutput(
+                req_ids=[seq.id],
+                token_ids=[(token,)],
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+            ),
+            batch=batch,
+        )
+
+    def test_the_real_loop_stores_the_boundaries_it_files(self):
+        """`schedule` counts a forward before `postprocess` files its boundary,
+        so the next `schedule` stores it rather than dropping it as stale."""
+        seq = stateful_seq(list(range(BLOCK)))
+        sched, batch = self._serving(seq)
+        stores = 0
+        for token in range(500, 510):
+            self._postprocess(sched, seq, token, batch)
+            batch, _ = sched.schedule()
+            stores += len(batch.state_maintenance_ops.checkpoint_stores)
+        assert stores >= 2
+        assert sched.block_manager.paged_state_checkpoints.checkpoints_dropped == 0
+
+    def test_a_boundary_overtaken_before_the_drain_is_dropped(self):
+        """A forward scheduled between the filing and the drain has moved the
+        slot past the boundary, so the drain drops it rather than store it."""
+        seq = stateful_seq(list(range(BLOCK)))
+        sched, batch = self._serving(seq)
+        ckpts = sched.block_manager.paged_state_checkpoints
+        for token in range(500, 510):
+            self._postprocess(sched, seq, token, batch)
+            if ckpts._pending:
+                break
+            batch, _ = sched.schedule()
+        assert ckpts._pending, "no boundary was filed"
+        Scheduler._consume_state_forks({seq.id: seq})  # a forward the drain missed
+        batch, _ = sched.schedule()
+        assert batch.state_maintenance_ops.checkpoint_stores == ()
+        assert ckpts.checkpoints_dropped == 1
+
+    @pytest.mark.parametrize("step", [0, 2])
+    def test_a_class_keeping_nothing_files_no_step(self, step):
+        """Nor does it spend the spacing on one it cannot keep."""
+        bm = self._bm(KEEP_NONE)
+        seq = self._decode_to(bm, 3 * BLOCK, step=step)
+        assert bm.take_state_maintenance_ops().checkpoint_stores == ()
+        assert seq.last_checkpoint_pos == 0
+
+
 class TestDecodePointPublishing:
     """The same ladder, walked by generation instead of by prompt.
 
@@ -2297,7 +2396,9 @@ class TestDecodePointPublishing:
         while seq.num_tokens < end:
             seq.append_token(500 + seq.num_tokens)
             bm.may_append(seq)
-            bm.hash_decode_blocks(seq, seq.num_tokens, next_forward_tokens=room)
+            bm.hash_decode_blocks(
+                seq, seq.num_tokens, next_forward_tokens=room, snapshot_step=0
+            )
 
     def _prompt_of_10(self, bm):
         """A prompt that ends between rungs, so prefill publishes nothing."""
@@ -2477,6 +2578,7 @@ class StubStateCache:
         self.successor_room = successor_room
         self.enabled = enabled
         self.readable_midstep = readable_midstep
+        self.decode_keep = KEEP_SETTLED
         self._cap = cap
 
     def applies(self, seq):
@@ -2485,7 +2587,7 @@ class StubStateCache:
     def resumable_hit(self, seq, P, block_hashes, assume_checkpointed=False):
         return P if self._cap is None else min(P, self._cap)
 
-    def checkpoint(self, seq, boundary_blocks, h):
+    def checkpoint(self, seq, boundary_blocks, h, step=-1):
         pass
 
     def reserve_midstep(self, seq, positions):
@@ -4077,6 +4179,14 @@ class TestGenerationIsHeldToSpacingNotTheGrid:
         # between two of them has nothing to file it under.
         assert not self.keepers(bm, seq, INTERVAL + 1, aimed=False)
 
+    def test_a_copy_keeps_nothing_with_no_forward_after(self):
+        """A copy needs no successor room, so 0 has to refuse on its own: the
+        stopping request's slot is freed before anything reads it."""
+        bm = make_block_manager(demand_config(), state_runtime=PAGED_COPY_RUNTIME)
+        seq = stateful_seq(PROMPT)
+        assert bm.checkpointers_at(seq, INTERVAL + BLOCK, 1, aimed=False)
+        assert not bm.checkpointers_at(seq, INTERVAL + BLOCK, 0, aimed=False)
+
     def test_spacing_is_measured_from_the_last_one_kept(self):
         bm = make_block_manager(demand_config())
         seq = stateful_seq(PROMPT)
@@ -4121,7 +4231,7 @@ class TestTheCacheCannotStarveLiveKv:
         cache can put the pool in.
         """
         bm = make_block_manager(
-            paged_copy_config(num_kvcache_blocks=3, state_checkpoint_interval_tokens=0),
+            paged_copy_config(num_kvcache_blocks=4, state_checkpoint_interval_tokens=0),
             state_runtime=PAGED_COPY_RUNTIME,
         )
         checkpoints = bm.paged_state_checkpoints
@@ -4185,7 +4295,7 @@ class TestTheCacheCannotStarveLiveKv:
         possible once the pinned image becomes spendable again.
         """
         scheduler = make_scheduler(
-            paged_copy_config(num_kvcache_blocks=3, state_checkpoint_interval_tokens=0),
+            paged_copy_config(num_kvcache_blocks=4, state_checkpoint_interval_tokens=0),
             state_runtime=PAGED_COPY_RUNTIME,
         )
         # The same pinned pool as the tests above, built inside a scheduler,
@@ -4634,6 +4744,7 @@ def test_checkpoint_funnel_includes_second_state_class():
         """Minimal StateCache with checkpoint_fates — mimics a second real class."""
 
         successor_room = 0
+        decode_keep = KEEP_SETTLED
 
         def applies(self, seq):
             return False
@@ -4641,7 +4752,7 @@ def test_checkpoint_funnel_includes_second_state_class():
         def resumable_hit(self, seq, P, block_hashes, assume_checkpointed=False):
             return 0
 
-        def checkpoint(self, seq, boundary_blocks, h):
+        def checkpoint(self, seq, boundary_blocks, h, step=-1):
             pass
 
         def checkpoint_fates(self) -> dict:

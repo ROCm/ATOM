@@ -77,6 +77,7 @@ class _FusedMoEDouble(nn.Module):
     _map_global_expert_id_to_local_expert_id = (
         FusedMoE._map_global_expert_id_to_local_expert_id
     )
+    shared_expert_staging = None
 
     def __init__(self, *, dtype=torch.bfloat16, expert_map=None):
         super().__init__()
