@@ -389,7 +389,7 @@ def _fold_moe(log: list[str], fold: _Fold, monkeypatch: pytest.MonkeyPatch):
         moe, h
     )
     hidden = MagicMock()
-    hidden.shape = (8, 64)
+    hidden.shape = (96, 64)  # past the T<=64 floor that keeps the separate MLP
     hidden.view.return_value = hidden
     return moe, hidden, routed, shared
 
@@ -399,7 +399,7 @@ def test_shared_fold_runs_the_shared_expert_inside_the_routed_call(
 ) -> None:
     log: list[str] = []
     fold = _Fold(log, take=True)
-    moe, hidden, routed, _ = _fold_moe(log, fold, monkeypatch)
+    moe, hidden, _, _ = _fold_moe(log, fold, monkeypatch)
 
     m3_model.MiniMaxM3MoE.dual_stream_moe_forward(moe, hidden)
 
@@ -420,8 +420,26 @@ def test_declined_shared_fold_adds_the_shared_mlp_then_skips_the_fold(
 
     assert log == ["fold enter", "gate", "routed", "fold exit", "shared"]
     routed.__add__.assert_called_once_with(shared)
-    assert moe._shared_fold_declined == {8}
+    assert moe._shared_fold_declined == {96}
     # The same token count later goes to the stream path (here: no alt stream).
     m3_model.MiniMaxM3MoE.dual_stream_moe_forward(moe, hidden)
     assert len(fold.calls) == 1
     moe.single_stream_moe_forward.assert_called_once_with(hidden)
+
+
+@pytest.mark.parametrize("rows", [1, 33, 64])
+def test_shared_fold_keeps_the_separate_mlp_at_small_batches(
+    monkeypatch: pytest.MonkeyPatch, rows: int
+) -> None:
+    """Batches of <= 64 tokens never enter the fold (its T<=64 launch is
+    nondeterministic); they take the stream path as a declined count would."""
+    log: list[str] = []
+    fold = _Fold(log, take=True)
+    moe, hidden, _, _ = _fold_moe(log, fold, monkeypatch)
+    hidden.shape = (rows, 64)
+
+    m3_model.MiniMaxM3MoE.dual_stream_moe_forward(moe, hidden)
+
+    assert fold.calls == []
+    moe.single_stream_moe_forward.assert_called_once_with(hidden)
+    assert moe._shared_fold_declined == set()

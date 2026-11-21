@@ -3,6 +3,7 @@
 
 """Inference-only MiniMax-M3 model support for ATOM."""
 
+import logging
 from typing import ClassVar
 
 import torch
@@ -76,6 +77,14 @@ from atom.quant_spec import effective_layer_quant
 from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
 from atom.utils.region_graph import token_graph
+
+# ATOM_MINIMAX_M3_SHARED_FOLD: batches of at most this many tokens keep the
+# separate shared MLP. aiter's T<=64 fold launch (routed GEMM2 16x128 with the
+# 64x64 shared tiles) was measured nondeterministic under hot-expert routing
+# (16% of launches wrote garbage 16-B pieces into routed rows, MI455X); larger
+# buckets measured 0/300. Remove once that launch is fixed.
+_SHARED_FOLD_MAX_DECLINED_TOKENS = 64
+_shared_fold_floor_logged = False
 
 
 def _get_text_config(config: PretrainedConfig) -> PretrainedConfig:
@@ -445,6 +454,14 @@ class MiniMaxM3MoE(nn.Module):
             and isinstance(self.experts.quant_method, Mxfp4MoEMethod)
         )
         self._shared_fold_weights = None
+        global _shared_fold_floor_logged
+        if self._shared_fold and not _shared_fold_floor_logged:
+            _shared_fold_floor_logged = True
+            logging.getLogger("atom").info(
+                "MiniMax-M3 shared fold: batches of <= %d tokens keep the separate "
+                "shared MLP (the T<=64 fold launch is nondeterministic)",
+                _SHARED_FOLD_MAX_DECLINED_TOKENS,
+            )
         # Token counts aiter did not fold (e.g. routed tiles it has no shared
         # tile for): their first call ran the shared MLP after the routed one;
         # later calls take the dual-stream path. Decided in warm-up, before
@@ -571,6 +588,7 @@ class MiniMaxM3MoE(nn.Module):
         hidden_states = hidden_states.view(-1, orig_shape[-1])
         if (
             getattr(self, "_shared_fold_weights", None) is not None
+            and hidden_states.shape[0] > _SHARED_FOLD_MAX_DECLINED_TOKENS
             and hidden_states.shape[0] not in self._shared_fold_declined
         ):
             return self._shared_fold_forward(hidden_states).view(orig_shape)
