@@ -432,6 +432,64 @@ class TestGroupPrefillTick:
         assert sched._group_prefill_tick(decision) is recorded
 
 
+class _SyncDelayer:
+    """DP prefill-sync delayer stub: releases every tick. `last_fire_aligned`
+    toggles whether this tick was a full-group align (which arms the
+    one-sequence cap) or a quorum/escape (which keeps the normal budget)."""
+
+    is_local = False
+    max_queue_ms = None
+    ttft_max_ticks = 5
+    rank_prefill_costs = ()
+    sync_prefill = True
+    dp_size = 4
+
+    def __init__(self, last_fire_aligned):
+        self.last_fire_aligned = last_fire_aligned
+
+    def protects_decode(self, running_decode_batch):
+        return False
+
+    def should_allow_prefill(self, prefillable, pending_tokens, **kwargs):
+        return PrefillDecision(allow=True, prefillable_ranks=4)
+
+
+def _sync_cap_sched():
+    return Scheduler(
+        MockConfig(
+            enable_prefix_caching=False,
+            enable_chunked_prefill=True,
+            kv_cache_block_size=4,
+            num_kvcache_blocks=200,
+            max_num_seqs=8,
+            max_num_batched_tokens=64,
+            max_model_len=128,
+        )
+    )
+
+
+class TestSyncPrefillSeqCap:
+    """#2600 one-sequence cap: the scheduler admits a single prefill per rank
+    only on the delayer's aligned fire, and keeps the normal token budget
+    otherwise."""
+
+    def test_aligned_release_admits_one_prefill(self, seq_factory):
+        sched = _sync_cap_sched()
+        sched.set_prefill_delayer(_SyncDelayer(last_fire_aligned=True))
+        for i in range(4):  # four 4-token prompts all fit the 64-token budget
+            sched.add(seq_factory([10 * i + j for j in range(4)]))
+        batch, _ = sched.schedule()
+        assert batch.total_seqs_num_prefill == 1
+
+    def test_unaligned_release_keeps_the_token_budget(self, seq_factory):
+        sched = _sync_cap_sched()
+        sched.set_prefill_delayer(_SyncDelayer(last_fire_aligned=False))
+        for i in range(4):
+            sched.add(seq_factory([10 * i + j for j in range(4)]))
+        batch, _ = sched.schedule()
+        assert batch.total_seqs_num_prefill == 4
+
+
 # ── add / extend / query ───────────────────────────────────────────────────
 
 
@@ -1795,6 +1853,7 @@ class _LocalDelayer:
     max_queue_ms = None
     ttft_max_ticks = 5
     rank_prefill_costs = ()
+    sync_prefill = False
 
     def protects_decode(self, running_decode_batch):
         return False
@@ -1837,6 +1896,88 @@ def test_probe_stops_at_a_seq_waiting_for_an_inflight_prefix():
     assert behind in sched.running
     assert consumer not in sched.running
     assert consumer.id in sched._inflight_prefix_wait
+
+
+class _LockstepDelayer:
+    """Cross-DP delayer stub that releases prefill every tick and reports the
+    group's prefillable-rank count (`could` prefill)."""
+
+    is_local = False
+    max_queue_ms = None
+    ttft_max_ticks = 5
+    rank_prefill_costs = ()
+    sync_prefill = False
+    dp_size = 4
+    last_fire_aligned = False
+
+    def __init__(self, prefillable_ranks=1):
+        self.prefillable_ranks = prefillable_ranks
+
+    def protects_decode(self, running_decode_batch):
+        return False
+
+    def should_allow_prefill(self, prefillable, pending_tokens, **kwargs):
+        return PrefillDecision(allow=True, prefillable_ranks=self.prefillable_ranks)
+
+
+class TestPhaseLockstepIdle:
+    """#2605 idle gate: with token graphs off, a rank idles beside a peer's
+    prefill instead of decoding. `_phase_lockstep_idle_needed` reads
+    `decision.prefillable_ranks` (not a delayer side channel)."""
+
+    def _gate_sched(self, *, graphs=False, lockstep=True, dp_size=4):
+        sched = Scheduler(MockConfig(), prefill_token_graphs=graphs)
+        sched.dp_phase_lockstep = lockstep
+        sched.set_prefill_delayer(SimpleNamespace(is_local=False, dp_size=dp_size))
+        return sched
+
+    @staticmethod
+    def _decision(allow=True, ranks=1):
+        return PrefillDecision(allow=allow, prefillable_ranks=ranks)
+
+    def test_idles_when_a_peer_can_prefill(self):
+        sched = self._gate_sched()
+        assert sched._phase_lockstep_idle_needed(self._decision()) is True
+
+    def test_flag_off_decodes(self):
+        sched = self._gate_sched(lockstep=False)
+        assert sched._phase_lockstep_idle_needed(self._decision()) is False
+
+    def test_token_graphs_make_it_a_noop(self):
+        # With graphs, group_prefill_tick already idles the rank.
+        sched = self._gate_sched(graphs=True)
+        assert sched._phase_lockstep_idle_needed(self._decision()) is False
+
+    def test_no_prefillable_rank_decodes(self):
+        sched = self._gate_sched()
+        assert sched._phase_lockstep_idle_needed(self._decision(ranks=0)) is False
+
+    def test_delayer_veto_decodes(self):
+        sched = self._gate_sched()
+        assert sched._phase_lockstep_idle_needed(self._decision(allow=False)) is False
+
+    def test_dp1_never_idles(self):
+        sched = self._gate_sched(dp_size=1)
+        assert sched._phase_lockstep_idle_needed(self._decision()) is False
+
+    def test_idle_tick_schedules_nothing_so_the_engine_dummies(self, seq_factory):
+        # A decoding rank with a prefillable peer and lockstep on returns no
+        # batch (the engine then runs dummy_execution), rather than decoding.
+        sched = _probe_sched()
+        sched.dp_phase_lockstep = True
+        _cache_prefix(sched, seq_factory)  # one seq now running and decoding
+        sched.set_prefill_delayer(_LockstepDelayer(prefillable_ranks=1))
+        assert sched.schedule() is None
+        assert sched._phase_lockstep_idles == 1
+
+    def test_without_the_flag_the_same_state_decodes(self, seq_factory):
+        sched = _probe_sched()
+        _cache_prefix(sched, seq_factory)
+        sched.set_prefill_delayer(_LockstepDelayer(prefillable_ranks=1))
+        batch, _ = sched.schedule()
+        assert batch is not None
+        assert batch.total_seqs_num_prefill == 0  # a decode step, not a prefill
+        assert sched._phase_lockstep_idles == 0
 
 
 class TestOldestWaitingPrefillAge:
