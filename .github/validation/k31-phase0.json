@@ -1,0 +1,56 @@
+{
+  "schema": 1,
+  "image": {
+    "manifest": "docker.io/rocm/atom-dev@sha256:ea74fa0b05d8c7a062ae235b901cb2b1bc0c169b0a5edd7ca07bfa3b967ca462",
+    "config": "sha256:67f3f06c5b90e86eeb6d25ff9075826d4e97c439ecaf7e8d7ecc41ade75b99d6"
+  },
+  "files": {
+    "common/common-supervisor-f280.py": "f280e865fc6667ecf53669e5e24a5b7f34a773efe61992f7d2d2f18fd9660d81",
+    "common/check_linux_ownership.py": "ca15d0642700970e3a9dc9cb215e1162f247f83048ca9dea73f21330d03b7ab3",
+    "3577/run_3577_readonly.sh": "7aa4d3f0ff95c3efd1375233eedd4f7fde6d0adf4ad6e6dbee25c8f755eae98d",
+    "3577/A-validation.patch": "47a8ee0ff12d1c2c0b8bfb3813acd64468a6291f8cb7c8b7c17a27cc48af188e",
+    "3577/B-validation.patch": "47a8ee0ff12d1c2c0b8bfb3813acd64468a6291f8cb7c8b7c17a27cc48af188e",
+    "3577/check_results.py": "cac8cc840a9515a7ffaca214cb9d44cd0f3375ad65a447c2f0d8cf9d4f828d90",
+    "3577/exact_trace.sh": "8f7dffcac00d1129646efa71a63cbfc9531335eac0f1d0c05003a781f2ebeb9e",
+    "3577/executor-contract.json": "c739b874eb6180c9ca80cf4e2f2d98348d97e171eaf784fe019f12ff463cbe60",
+    "3577/lm_eval_receipt.sh": "eee3c09fc661c729e476913948e43c5febe86b51353959156288d9decb88893d",
+    "3577/pp3577_observer.py": "12b9546e69794fd6e2e59c2fb4926d85cec998dc93651bcb6a26fe651a0ba13a",
+    "3577/prepare_overlays.py": "4322031cf9e1e5158adf2c543fd388d97d5548aca741978c86ee8fee35badbdb",
+    "3577/runtime-pins.json": "6d476cfbbeaaf39739324587673d36034ea85530bec2d4aa89d75de7a43431dc",
+    "3577/source-overlay-manifest.json": "7551f74c5e07e7f686137833ec5d74270faa429655d9f8619b252f0131749bfc",
+    "3577/verify_inputs.py": "d13287c22dcc67609ae87b9db6465e7a32d2b59b0b67bb7ef83817a75e379d10",
+    "C/payload/payload-manifest.json": "8f778ad9916fa238c29bcc80466f9a1e0e3be69d40aa17d58a738f9c5145f987",
+    "C/payload/run_case.py": "56f20ad5294fbb82e38d8dfd5b3a85659a0fadd42720944d6902405a6f3af6b0",
+    "C/payload/evidence.py": "b13add8ec1324d682d6edd9f2fb81439997136c8d1cbac115c846259a05f4680",
+    "C/payload/prepare_inputs.py": "6e852485b077870060d316068d1b0655b89302d8cd46430eb4584034a6f18095",
+    "C/payload/lm_eval_receipt.sh": "eee3c09fc661c729e476913948e43c5febe86b51353959156288d9decb88893d",
+    "C/payload/pins.json": "34e85e38fd8289d7787f084632d525c6a1c5f347b9989b801c0dfefcf5f7e153",
+    "C/payload/composition-manifest.json": "22b0f58a0e84f2d064710a5b61e8f770e8c9f72fe98939e7169c4bd74272054a",
+    "C/payload/tasks/gsm8k.yaml": "90601f3c3f82e35e8878cc76b3ac33b03bfd6a1bfa0a211e0eab6884fffd48af",
+    "C/payload/contract.json": "fbff356a42aa837228f9e9476cbf41fba3836b182498e707210759d4a28015d1",
+    "C/requests/300-1.json": "00f5623d57fea9a92379046589aec2a3fb7041f198ee48e94c257420e5d76486",
+    "C/requests/300-32.json": "d97ba6469399abb4862c94a815a67c7efa1fb6fb5ed5e80cc34b3dab97f7fb4b",
+    "C/requests/512-1.json": "3d4dd8d50df8cd1c560c589c76a11b0d8d493cee6291dc8766b5d237ddd63022",
+    "C/requests/512-32.json": "cd0b93d113da0932afb2b8767adca7fde9ffc88490b82d23e1162afe7091e0ed",
+    "C/requests/513-1.json": "f8f224e2e6ee52c0056f9f9cf1a62b4ae5dfc45cbf999dd2a4b292e6e814413c",
+    "C/requests/513-32.json": "d1b8b951fc3f3f90e1ce0812f34f28dbae75e23d0d296ff81373137b77d82cf0",
+    "C/requests/8192-1.json": "1786506fabb1798011e302690efd223d7f45a039441a42415685ac0f8cb05b6b",
+    "C/requests/8193-1.json": "52f62b29693fd564ecb050735d67b9601a7bdfc9f9547f32f8fa55a4929b2457",
+    "C/requests/manifest.json": "9f40147888cf3ee9c10eec979f2088db4197b9115c9289df75971210ad5fc8b5",
+    "C/requests/population.json": "b60339375bdf539ae763f0fcba69a3748b0713b07358fc4b575ab02ea8021755",
+    "C/provenance/prepared-input-receipt.json": "09f893e2cb74744df35a30cf418d60a97e12d45f140107ccbcd5b29f81d557c2",
+    "C/provenance/prepared-input-review.md": "199c325d9b20ab253ee0cb6d92e7c9dc844808985fb2ece58701a7be29e58305"
+  },
+  "native_files": {
+    "/app/aiter-test/aiter/jit/module_aiter_core.so": "96d4a943df6820ccee8f7b72c56c636ba6ea2d1d371395d9ba7d0e2b895c103f",
+    "/app/aiter-test/aiter/jit/module_custom_all_reduce.so": "ac4b2ef1f531c37c9e2a0efa8e7075d23d70f7910b09e4a83758aec944663915",
+    "/app/aiter-test/aiter/jit/module_cache.so": "b59fb5b6ed13780972a95929564d34d5ec355043a5f99e1af5bc2e92e413bb61",
+    "/app/aiter-test/aiter/jit/module_top_k_per_row.so": "7046c96c76acd93cc34832ddb7f8e623e365787de69468760636c1af8c2f4a14"
+  },
+  "readonly_entry_source_review": {
+    "card_sha256": "506484bc5fa9473632fe73131ee5bf31a9038e042cc6b11837c0aadbc7810520",
+    "clearance_sha256": "c3207bc1a840903236d4bda7cd7085b7c19e0216481e965a6433386da60f0ecc",
+    "blind_sha256": "1e9e1268259dfb2ab6b5ee58b42823c7cf64f560d54bf8438ec3ef8251692c94",
+    "scope": "Prior bounded 7aa4d3f0 entry/helper source review only; Phase0 never executes it"
+  }
+}
