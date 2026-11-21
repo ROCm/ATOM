@@ -1798,6 +1798,8 @@ class EPLBConfig:
     #   "naive"  -> greedy replicate + balanced_packing (spread thinly)
     #   "biased" -> fully replicate top-K hottest experts to all GPUs
     #               (K = num_redundant // num_gpus, per-node in multi-node)
+    #   "deepinfer" -> choose replicas using per-step bottleneck load,
+    #                  then place them with balanced_packing
     placement_policy: str = "naive"
 
     def __post_init__(self):
@@ -1830,7 +1832,8 @@ class EPLBConfig:
         assert self.placement_policy in {
             "naive",
             "biased",
-        }, "eplb.placement_policy must be one of {'naive','biased'}"
+            "deepinfer",
+        }, "eplb.placement_policy must be one of {'naive','biased','deepinfer'}"
 
     @classmethod
     def from_dict(cls, cfg: dict | None) -> "EPLBConfig":

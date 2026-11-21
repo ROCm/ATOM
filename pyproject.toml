@@ -1,11 +1,12 @@
 [build-system]
-requires = ["setuptools>=61", "wheel", "setuptools_scm[toml]>=6.2"]
+requires = ["setuptools>=77", "wheel", "setuptools_scm[toml]>=6.2"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "atom"
 authors = [{ name = "ValarLip" }]
-license = "MIT"
+license = "MIT AND Apache-2.0"
+license-files = ["LICENSE", "third_party/licenses/DeepInfer.txt"]
 readme = "README.md"
 description = "a lightweight vLLM implementation built from scratch"
 requires-python = ">=3.10"
