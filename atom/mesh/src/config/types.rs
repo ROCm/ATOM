@@ -177,6 +177,11 @@ impl Default for PreparePoolConfig {
 /// larger.
 pub const DEFAULT_FASTOKENS_MAX_TOKENIZE_BYTES: usize = 64 * 1024 * 1024;
 
+/// Default `--fastokens-segment-cache-mb`. A segment costing more than 1/64 of
+/// the budget is never cached, so this one caches tool outputs of up to about
+/// 8 MB of text.
+pub const DEFAULT_FASTOKENS_SEGMENT_CACHE_MB: usize = 1024;
+
 /// Encoding prompts with fastokens rather than HuggingFace `tokenizers`.
 #[derive(Debug, Clone, Default, clap::Args, Serialize, Deserialize, PartialEq, Eq)]
 #[command(next_help_heading = "Tokenizer")]
@@ -205,8 +210,9 @@ pub struct FastokensConfig {
         long = "fastokens-max-tokenize-bytes"
     )]
     pub max_tokenize_bytes: Option<usize>,
-    /// fastokens' segment cache per tokenizer, in MiB; 0 turns it off (default:
-    /// FASTOKENS_SEGMENT_CACHE, unset by default).
+    /// fastokens' segment cache per tokenizer, in MiB; 0 turns it off
+    /// (default: 1024). It holds the ids of the text between special tokens,
+    /// which an agent's requests re-send with its history.
     #[arg(id = "fastokens_segment_cache_mb", long = "fastokens-segment-cache-mb")]
     pub segment_cache_mb: Option<usize>,
 }
@@ -219,9 +225,10 @@ impl FastokensConfig {
             .any(|model| model == "*" || model == name || model == source)
     }
 
-    pub fn segment_cache_bytes(&self) -> Option<usize> {
+    pub fn segment_cache_bytes(&self) -> usize {
         self.segment_cache_mb
-            .map(|mb| mb.saturating_mul(1024 * 1024))
+            .unwrap_or(DEFAULT_FASTOKENS_SEGMENT_CACHE_MB)
+            .saturating_mul(1024 * 1024)
     }
 }
 

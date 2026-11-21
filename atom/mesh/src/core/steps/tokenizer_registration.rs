@@ -49,8 +49,8 @@ pub struct TokenizerConfigRequest {
     pub chat_template_path: Option<String>,
     /// Optional cache configuration. If provided, wraps a tokenizer that encodes
     /// with HuggingFace with CachedTokenizer; one that encodes with fastokens is
-    /// not wrapped, and has fastokens' segment cache only if
-    /// `--fastokens-segment-cache-mb` or `FASTOKENS_SEGMENT_CACHE` turns it on.
+    /// not wrapped, and has fastokens' segment cache instead, sized by
+    /// `--fastokens-segment-cache-mb`.
     #[serde(default)]
     pub cache_config: Option<TokenizerCacheConfig>,
     /// If true, the workflow fails when a tokenizer with the same name already exists.

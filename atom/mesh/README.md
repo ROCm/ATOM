@@ -292,9 +292,9 @@ The router tokenizes requests with their model's HuggingFace tokenizer, or with
 [fastokens](https://github.com/crusoecloud/fastokens) for the models listed in
 `--fastokens-models`, by the name or source their tokenizer registers under, or
 `*` for every model. fastokens encodes a `tokenizer.json` BPE faster than
-HuggingFace `tokenizers`, and splits a long prompt across a pool of its own
-threads (one per logical core up to 32; `FASTOKENS_BPE_THREADS` sets the
-number). Decoding, chat templates and vocabulary lookups stay with the
+HuggingFace `tokenizers`, and splits a long text between special tokens across
+a pool of its own threads (one per logical core up to 32;
+`FASTOKENS_BPE_THREADS` sets the number). Decoding, chat templates and vocabulary lookups stay with the
 HuggingFace tokenizer, except for the tokens only `tokenizer_config.json`
 declares (below).
 
@@ -326,9 +326,10 @@ routes by them. `mesh_fastokens_tokenizers_total{outcome}` counts tokenizers as
 The prompts of these models tokenize up to `--fastokens-max-tokenize-bytes`
 (default: the larger of 64 MiB and the other models' limit), and so do their
 `/v1/tokenize` batches. `--fastokens-segment-cache-mb` sizes
-fastokens' cache of the text between special tokens, per tokenizer (default:
-`FASTOKENS_SEGMENT_CACHE`, off when unset). It replaces `--tokenizer-cache-*`,
-which does not apply to these models.
+fastokens' cache of the ids of the text between special tokens, per tokenizer
+(default: 1024; 0 turns it off). An agent re-sends its history with each
+request, and the cache keeps the router from encoding it again. It replaces
+`--tokenizer-cache-*`, which does not apply to these models.
 
 `test_requests_tokenize_as_on_atom` checks that requests tokenize for routing as
 on ATOM, with either backend, and times encoding. `scripts/atom_token_parity.py`

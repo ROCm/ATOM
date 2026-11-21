@@ -183,7 +183,7 @@ fn huggingface_and_fastokens(
     let dir = byte_level_tokenizer_dir(BYTE_LEVEL_MERGES, false, config);
     let path = dir.path().join("tokenizer.json");
     let hf = crate::tokenizer::factory::create_tokenizer(path.to_str().unwrap()).unwrap();
-    let fast = crate::routers::prepare::fast_tokenizer::FastTokenizer::new(hf.clone(), &path, None);
+    let fast = crate::routers::prepare::fast_tokenizer::FastTokenizer::new(hf.clone(), &path, 0);
     (dir, hf, Arc::new(fast.unwrap()))
 }
 
@@ -1127,7 +1127,7 @@ async fn tokens_only_tokenizer_config_declares_detokenize() {
     let dir = byte_level_tokenizer_dir(BYTE_LEVEL_MERGES, false, config);
     let path = dir.path().join("tokenizer.json");
     let hf = crate::tokenizer::factory::create_tokenizer(path.to_str().unwrap()).unwrap();
-    let fast = crate::routers::prepare::fast_tokenizer::FastTokenizer::new(hf, &path, None);
+    let fast = crate::routers::prepare::fast_tokenizer::FastTokenizer::new(hf, &path, 0);
     let fast: Arc<dyn crate::tokenizer::traits::Tokenizer> = Arc::new(fast.unwrap());
     context
         .tokenizer_registry
