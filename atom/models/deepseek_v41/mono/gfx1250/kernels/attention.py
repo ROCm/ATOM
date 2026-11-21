@@ -818,14 +818,18 @@ def stage_D(c):
             for rr in range_constexpr(RPC):
                 _kg_fetch(c, t, sm, o, rr)
         else:
+            # a thread's keys consecutive (its 16 B chunk cc of NIT key rows): their pool rows are NIT LDS words loaded
+            # together, then NIT gathers back to back -- the runtime loop waited for each key's LDS load (s_wait_dscnt 0)
+            # before its gather, NIT serial LDS round trips on D's entry (the same bytes to the same LDS slots)
+            NIT = KC * HD // 8 // THREADS
+            assert NIT * THREADS == KC * HD // 8
+            kg0 = (t // (HD // 8)) * NIT
+            cc = t % (HD // 8)
             for rr in range_constexpr(RPC):
-                for it in range(KC * HD // 8 // THREADS):   # runtime loops in D: smaller code (I-cache, see icache-probe)
-                    i = t + it * THREADS
-                    key = i // (HD // 8)
-                    cc = i % (HD // 8)
-                    idv = hx.lload(sm + o["ids"] + (rr * KC + key) * 4, I32)   # absolute pool row
-                    hx.async_to_lds_b128(c["kv"] + (i64(idv) * KG_ROW + i64(cc * 8)) * 2,
-                                         sm + o["k"] + ((rr * 48 + key) * HP + cc * 8) * 2, 0)
+                idl = [hx.lload(sm + o["ids"] + (rr * KC + kg0 + j) * 4, I32) for j in range(NIT)]   # absolute pool rows
+                for j in range_constexpr(NIT):
+                    hx.async_to_lds_b128(c["kv"] + (i64(idl[j]) * KG_ROW + i64(cc * 8)) * 2,
+                                         sm + o["k"] + ((rr * 48 + kg0 + j) * HP + cc * 8) * 2, 0)
         NZ = RPC * (48 - KC) * HD // 8
         for it in range(hx.opaque_s(I32((NZ + THREADS - 1) // THREADS))):
             i = t + it * THREADS
