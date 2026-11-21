@@ -34,6 +34,23 @@ _DEFAULT_BACKEND = "moriio"
 PD_TRANSFER_BACKENDS = frozenset({"moriio", "mooncake"})
 
 
+def parse_kv_transfer_config(raw: str | dict | None) -> dict:
+    """``--kv-transfer-config`` as a dict: JSON, or the Python literal some
+    recipes write (single quotes, ``True``)."""
+    if isinstance(raw, dict):
+        return raw
+    if not raw:
+        return {}
+    import json
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        import ast
+
+        return ast.literal_eval(raw)
+
+
 def resolve_pd_backend(kv_transfer_config: dict | None) -> str | None:
     """Name of the backend that will do P/D transfer, or ``None`` if none will.
 

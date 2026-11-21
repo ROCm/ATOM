@@ -31,6 +31,8 @@ from atom.entrypoints.openai.tool_parser.registry import (
     required_call_channel,
     resolve_tool_call_parser,
 )
+from atom.kv_transfer.disaggregation.factory import parse_kv_transfer_config
+from atom.kv_transfer.disaggregation.pd_producer import pd_transfer_entries
 from atom.utils import envs
 
 # Each ATOM tool-call format (`PARSERS_BY_NAME`) by mesh's name for the same
@@ -45,9 +47,6 @@ MESH_TOOL_PARSERS = {
     "dsml": "dsml",
     "dsml_v41": "dsml_v41",
 }
-
-# kv_transfer roles that make a P/D worker, which standalone cannot serve yet.
-_PD_ROLES = frozenset({"kv_producer", "kv_consumer", "kv_both"})
 
 # The DP placements the Rust runtime has (`atom_engine::balance`); the prefix
 # routers (`share_cache`, `prefix_spread`) are CoreManager's alone.
@@ -64,14 +63,17 @@ def check_standalone_model(engine_args: Any) -> None:
             "which the atomesh standalone server does not support yet; serve it "
             "with USE_ATOMESH_ENTRYPOINTS=0."
         )
-    transfer = json.loads(getattr(engine_args, "kv_transfer_config", None) or "{}")
-    if transfer.get("kv_role") in _PD_ROLES:
+    transfer = parse_kv_transfer_config(engine_args.kv_transfer_config)
+    pd = pd_transfer_entries(transfer)
+    if pd:
+        connector = pd[0].get("kv_connector", "moriio")
+        role = pd[0].get("kv_role", "kv_producer")
         raise ValueError(
-            f"kv_role {transfer['kv_role']!r} makes a P/D worker, which the "
-            "atomesh standalone server does not support yet; serve it with "
-            "USE_ATOMESH_ENTRYPOINTS=0."
+            f"kv_connector {connector!r} (kv_role {role!r}) makes a P/D worker, "
+            "which the atomesh standalone server does not support yet; serve it "
+            "with USE_ATOMESH_ENTRYPOINTS=0."
         )
-    strategy = getattr(engine_args, "dp_load_balance", "least_requests")
+    strategy = engine_args.dp_load_balance
     if strategy not in _RUST_DP_STRATEGIES:
         raise ValueError(
             f"--dp-load-balance {strategy!r} is not one the atomesh standalone "
@@ -195,7 +197,7 @@ def build_engine_spec(
 ) -> str:
     config = engine.config
     toggle = resolve_reasoning_toggle(tokenizer)
-    speculative = getattr(config, "speculative_config", None)
+    speculative = config.speculative_config
     metadata = deployment_metadata(config, None)
     return json.dumps(
         {
@@ -210,10 +212,8 @@ def build_engine_spec(
                 "model_card": metadata,
                 # Forced acceptance has no real logprobs to return
                 # (`SamplingParams.validate_logprob_options`).
-                "synthetic_acceptance": getattr(
-                    speculative, "synthetic_acceptance_rates", None
-                )
-                is not None,
+                "synthetic_acceptance": speculative is not None
+                and speculative.synthetic_acceptance_rates is not None,
                 "required_channel": required_channel(tool_parser, tokenizer, config),
                 "reasoning_toggle": (
                     None

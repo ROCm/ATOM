@@ -16,7 +16,10 @@ from atom.config import (
     ParallelConfig,
     SpeculativeConfig,
 )
-from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+from atom.kv_transfer.disaggregation.factory import (
+    KVConnectorFactory,
+    parse_kv_transfer_config,
+)
 from atom.model_engine.engine_core_mgr import DP_LB_DEFAULT, DP_LB_STRATEGIES
 from atom.model_engine.prefill_delayer import PREFILL_ADMIT_POLICIES
 from atom.model_ops.indexer.layout import MFMA, NATURAL, PRESHUFFLE
@@ -79,7 +82,7 @@ def compose_kv_offload_config(kv_transfer_config: str, offload: dict | None) -> 
     """
     if offload is None:
         return kv_transfer_config
-    transfer = json.loads(kv_transfer_config or "{}")
+    transfer = parse_kv_transfer_config(kv_transfer_config)
     if not transfer:
         return json.dumps(offload)
     is_multi = _connector_name(transfer) == "multi"

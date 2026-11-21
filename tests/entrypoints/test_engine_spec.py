@@ -203,28 +203,70 @@ def test_unset_reads_the_template_and_falls_back_to_mesh(monkeypatch):
     assert tool_format(monkeypatch, None) == (None, None)
 
 
-@pytest.mark.parametrize("role", ["kv_producer", "kv_consumer", "kv_both"])
-def test_a_pd_worker_is_refused(monkeypatch, role):
+def standalone_args(kv_transfer_config="{}", dp_load_balance="least_requests"):
+    """The EngineArgs fields check_standalone_model reads, as the CLI sets them."""
+    return SimpleNamespace(
+        model="/m",
+        kv_transfer_config=kv_transfer_config,
+        dp_load_balance=dp_load_balance,
+    )
+
+
+@pytest.mark.parametrize(
+    "transfer",
+    [
+        {"kv_role": "kv_producer"},
+        {"kv_role": "kv_consumer"},
+        {"kv_role": "kv_both"},
+        # moriio is the connector a config that names none builds, as a
+        # producer when it names no role either.
+        {"kv_connector": "moriio"},
+        {"proxy_ip": "10.0.0.1"},
+        {"kv_connector": "Mooncake", "kv_role": "kv_consumer"},
+        # The Agentic-GLM-5.2 recipe's prefill node: the role is the leaf's.
+        {
+            "kv_connector": "multi",
+            "connectors": [
+                {"kv_connector": "mooncake", "kv_role": "kv_producer"},
+                {"kv_connector": "lmcache_offload", "kv_role": "offload"},
+            ],
+        },
+    ],
+)
+def test_a_pd_worker_is_refused(monkeypatch, transfer):
     monkeypatch.setattr(engine_spec, "load_custom_message_encoder", lambda m: None)
-    args = SimpleNamespace(model="/m", kv_transfer_config=json.dumps({"kv_role": role}))
     with pytest.raises(ValueError, match="P/D"):
-        engine_spec.check_standalone_model(args)
+        engine_spec.check_standalone_model(standalone_args(json.dumps(transfer)))
+
+
+def test_a_python_literal_transfer_config_is_read_as_the_engine_reads_it(
+    monkeypatch,
+):
+    monkeypatch.setattr(engine_spec, "load_custom_message_encoder", lambda m: None)
+    literal = "{'kv_connector': 'mooncake', 'kv_role': 'kv_producer', 'x': True}"
+    with pytest.raises(ValueError, match="P/D"):
+        engine_spec.check_standalone_model(standalone_args(literal))
+    offload = "{'kv_connector': 'lmcache_offload', 'kv_role': 'kv_both'}"
+    engine_spec.check_standalone_model(standalone_args(offload))
 
 
 @pytest.mark.parametrize("strategy", ["share_cache", "prefix_spread"])
 def test_a_dp_placement_rust_does_not_have_is_refused(monkeypatch, strategy):
     monkeypatch.setattr(engine_spec, "load_custom_message_encoder", lambda m: None)
-    args = SimpleNamespace(
-        model="/m", kv_transfer_config=None, dp_load_balance=strategy
-    )
     with pytest.raises(ValueError, match="dp-load-balance"):
-        engine_spec.check_standalone_model(args)
+        engine_spec.check_standalone_model(standalone_args(dp_load_balance=strategy))
 
 
-def test_kv_offload_is_not_a_pd_worker(monkeypatch):
+@pytest.mark.parametrize("role", ["offload", "kv_both", "kv_producer", "kv_consumer"])
+def test_kv_offload_is_not_a_pd_worker(monkeypatch, role):
     monkeypatch.setattr(engine_spec, "load_custom_message_encoder", lambda m: None)
-    args = SimpleNamespace(model="/m", kv_transfer_config='{"kv_role": "offload"}')
-    engine_spec.check_standalone_model(args)
+    transfer = {"kv_connector": "lmcache_offload", "kv_role": role}
+    engine_spec.check_standalone_model(standalone_args(json.dumps(transfer)))
+
+
+def test_no_kv_transfer_is_not_a_pd_worker(monkeypatch):
+    monkeypatch.setattr(engine_spec, "load_custom_message_encoder", lambda m: None)
+    engine_spec.check_standalone_model(standalone_args())
 
 
 def test_the_template_rust_renders_is_the_one_probed(tmp_path):

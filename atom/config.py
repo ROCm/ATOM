@@ -2964,14 +2964,11 @@ class Config:
         if hasattr(self, "kv_transfer_config") and isinstance(
             self.kv_transfer_config, str
         ):
-            import json
+            from atom.kv_transfer.disaggregation.factory import (
+                parse_kv_transfer_config,
+            )
 
-            try:
-                self.kv_transfer_config = json.loads(self.kv_transfer_config)
-            except json.JSONDecodeError:
-                import ast
-
-                self.kv_transfer_config = ast.literal_eval(self.kv_transfer_config)
+            self.kv_transfer_config = parse_kv_transfer_config(self.kv_transfer_config)
         if (
             isinstance(self.kv_transfer_config, dict)
             and str(self.kv_transfer_config.get("kv_connector", "")).strip().casefold()
