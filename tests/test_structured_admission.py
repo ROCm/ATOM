@@ -15,6 +15,9 @@ from atom.structured_output.validation import (
     WorkerGrammarPreflight,
 )
 
+# The engine fields structured-output admission reads.
+ENGINE = {"pipeline_parallel_size": 1, "enable_rapidserve": False}
+
 
 @pytest.fixture
 def worker(monkeypatch):
@@ -202,7 +205,7 @@ def test_worker_failure_is_value_error_before_schema_is_attached(monkeypatch):
     monkeypatch.setattr(api_server, "engine", preflight.engine)
     monkeypatch.setattr(api_server, "tokenizer", preflight.tokenizer)
     monkeypatch.setattr(
-        api_server, "_get_engine_config", lambda: NS(speculative_config=None)
+        api_server, "_get_engine_config", lambda: NS(**ENGINE, speculative_config=None)
     )
     monkeypatch.setattr(api_server, "synthetic_token_text", None)
     monkeypatch.setattr(api_server, "tool_call_parser_cls", None)
@@ -244,7 +247,7 @@ def test_admission_uses_actual_channel_state(monkeypatch, opened):
     monkeypatch.setattr(api_server, "engine", preflight.engine)
     monkeypatch.setattr(api_server, "tokenizer", preflight.tokenizer)
     monkeypatch.setattr(
-        api_server, "_get_engine_config", lambda: NS(speculative_config=None)
+        api_server, "_get_engine_config", lambda: NS(**ENGINE, speculative_config=None)
     )
     monkeypatch.setattr(api_server, "synthetic_token_text", None)
     monkeypatch.setattr(api_server, "tool_call_parser_cls", None)
@@ -269,7 +272,7 @@ def test_framed_channel_rejected_before_worker_rpc(monkeypatch):
     rpc = Mock(side_effect=AssertionError("unsupported channel must fail before RPC"))
     monkeypatch.setattr(api_server, "engine", NS(core_mgr=NS(collective_rpc=rpc)))
     monkeypatch.setattr(
-        api_server, "_get_engine_config", lambda: NS(speculative_config=None)
+        api_server, "_get_engine_config", lambda: NS(**ENGINE, speculative_config=None)
     )
     monkeypatch.setattr(api_server, "synthetic_token_text", None)
     dialect, _ = resolve_dialect("<|open|>think<|sep|>")
@@ -365,7 +368,10 @@ def test_speculative_schema_logprobs_refused_instead_of_wrong_distribution():
 
     params = SamplingParams(json_schema="{}", logprobs=True)
     config = NS(
-        speculative_config=NS(num_speculative_tokens=5, synthetic_acceptance_rates=None)
+        **ENGINE,
+        speculative_config=NS(
+            num_speculative_tokens=5, synthetic_acceptance_rates=None
+        ),
     )
     with pytest.raises(
         ValueError, match="JSON Schema, speculative decoding and logprobs"

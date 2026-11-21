@@ -129,6 +129,23 @@ class RequiredChannel:
         return replace(self, end_ids=tuple(sorted(end_ids)))
 
 
+def require_local_sampling(config, feature, *, kv_transfer=None):
+    """Refuse an engine where a request's tokens are not all sampled by this
+    engine's `postprocess`, which `feature` needs: pipeline parallelism,
+    RapidServe prefill and P/D (the first token comes from another engine). A
+    KV offload tier (LMCache CPU) is not P/D: the request still decodes here."""
+    from atom.kv_transfer.disaggregation.pd_producer import disaggregated_kv_role
+
+    if config.pipeline_parallel_size > 1:
+        raise ValueError(f"{feature} does not support pipeline parallelism")
+    if (
+        kv_transfer
+        or config.enable_rapidserve
+        or disaggregated_kv_role(config) is not None
+    ):
+        raise ValueError(f"{feature} is unavailable with RapidServe or P/D")
+
+
 @dataclass
 class SamplingParams:
     temperature: float = 1.0
@@ -154,6 +171,9 @@ class SamplingParams:
     structured_reasoning_end: str = ""
     # Frontend default may shrink after tokenization; explicit client caps may not.
     max_tokens_is_default: bool = False
+    # OpenAI `presence_penalty`: subtracted from the logit of every token the
+    # request has generated so far (not its prompt). 0 turns it off.
+    presence_penalty: float = 0.0
 
     def __post_init__(self):
         if type(self.top_logprobs) is not int or not 0 <= self.top_logprobs <= 20:
@@ -169,6 +189,13 @@ class SamplingParams:
             raise ValueError("top_p must be in range (0.0, 1.0]")
         if self.n < 1:
             raise ValueError("n must be >= 1")
+        if not -2.0 <= self.presence_penalty <= 2.0:
+            raise ValueError("presence_penalty must be in range [-2.0, 2.0]")
+
+    def validate_presence_penalty(self, config, *, kv_transfer=None):
+        """Execution admission shared by HTTP and direct engine callers."""
+        if self.presence_penalty:
+            require_local_sampling(config, "presence_penalty", kv_transfer=kv_transfer)
 
     def validate_logprob_options(
         self, config, *, kv_transfer=None, multimodal=False, synthetic=False

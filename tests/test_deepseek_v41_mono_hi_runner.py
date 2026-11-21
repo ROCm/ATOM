@@ -61,6 +61,7 @@ def _batch(temps=(0.0,), **over):
         "num_scheduled_tokens": np.full(n, 6, dtype=np.int32),
         "any_logprobs": False,
         "structured_requests": {},
+        "presence_penalties": None,
         "required_channel": None,
         "needs_independent_noise": np.zeros(n, dtype=bool),
     }
@@ -304,6 +305,7 @@ def test_postprocess_takes_the_heads_verdict_and_the_broadcast_ids(
         num_spec_step=5,
         any_logprobs=False,
         structured_requests={},
+        presence_penalties=None,
         required_channel=None,
     )
     with pytest.raises(Stop):
