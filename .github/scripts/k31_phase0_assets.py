@@ -9,9 +9,15 @@ import stat
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from k31_phase0_inputs import checked_files, require
+
+MODEL_DIRS = {
+    "target": "moonshotai/Kimi-K3.1-Pro",
+    "draft": "Inferact/Kimi-K3.1-DSpark",
+}
 
 
 def identity(path, value=None):
@@ -26,30 +32,64 @@ def identity(path, value=None):
     }
 
 
-def measured_hash(path, seconds=90):
-    before, started = identity(path), time.monotonic()
-    value, count = hashlib.sha256(), 0
+@contextmanager
+def checked_stream(path, expected=None, blocked=()):
+    before = identity(path)
+    require(expected is None or before == expected, "file identity differs before open")
+    require((before["device"], before["inode"]) not in blocked, "payload alias refused")
     with path.open("rb") as stream:
         require(
             identity(path, os.fstat(stream.fileno())) == before,
             "opened file identity differs",
         )
+        yield stream, before
+        require(
+            identity(path, os.fstat(stream.fileno())) == before, "opened file changed"
+        )
+    require(identity(path) == before, "file changed during read")
+
+
+def measured_hash(path, seconds=90, expected=None, blocked=()):
+    started = time.monotonic()
+    value, count = hashlib.sha256(), 0
+    with checked_stream(path, expected, blocked) as (stream, before):
         for block in iter(lambda: stream.read(4 * 1024**2), b""):
             require(time.monotonic() - started < seconds, "checksum deadline")
             value.update(block)
             count += len(block)
-        require(
-            identity(path, os.fstat(stream.fileno())) == before, "opened file changed"
-        )
+    require(count == before["bytes"], "file size changed during checksum")
     require(time.monotonic() - started < seconds, "checksum deadline")
-    require(
-        identity(path) == before and count == before["bytes"],
-        "file changed during checksum",
-    )
     return {"sha256": value.hexdigest(), "bytes_read": count, "identity": before}
 
 
-def check_runtime(pins, spec, result):
+def readable(path, cache, limit):
+    require(
+        path.resolve().is_relative_to(cache.resolve()), "backing escapes readonly cache"
+    )
+    before = identity(path)
+    require(before["bytes"] <= limit, "oversize model metadata/nonweight")
+    return before
+
+
+def bounded_read(path, cache, limit, blocked):
+    before = readable(path, cache, limit)
+    with checked_stream(path, before, blocked) as (stream, _):
+        data = stream.read(limit + 1)
+        require(len(data) <= limit, "model metadata grew during read")
+    return data
+
+
+def payload_backings(view, cache):
+    root = cache / MODEL_DIRS[view["role"]]
+    values = [
+        readable(root / item["name"], cache, item["source"]["bytes"])
+        for item in view["files"]
+        if item.get("expected_lfs_sha256")
+    ]
+    return {(value["device"], value["inode"]) for value in values}
+
+
+def check_runtime(pins, spec, result, blocked=()):
     rows = result.setdefault("files", {})
     paths = {item["path"]: item["sha256"] for item in pins["package_files"]}
     paths.update(spec["native_files"])
@@ -64,7 +104,7 @@ def check_runtime(pins, spec, result):
         }
     )
     for name, wanted in paths.items():
-        rows[name] = measured_hash(Path(name))
+        rows[name] = measured_hash(Path(name), blocked=blocked)
         require(rows[name]["sha256"] == wanted, f"runtime hash differs: {name}")
     expected = {**pins["package_versions"], "flydsl": "0.5.0"}
     versions = {name: importlib.metadata.version(name) for name in expected}
@@ -81,15 +121,16 @@ def check_runtime(pins, spec, result):
     result["aiter"] = head
 
 
-def check_model(view, cache, result=None):
+def check_model(view, cache, result=None, blocked=()):
     result = {} if result is None else result
-    root = cache / view["repo"]
+    root = cache / MODEL_DIRS[view["role"]]
+    protected = set(blocked) | payload_backings(view, cache)
     require(
         root.resolve().is_relative_to(cache.resolve()),
         "model root escapes readonly cache",
     )
     require(
-        (root / ".hf-revision").read_text().strip()
+        bounded_read(root / ".hf-revision", cache, 128, protected).decode().strip()
         == view["expected_component_revision"],
         "model revision differs",
     )
@@ -112,7 +153,8 @@ def check_model(view, cache, result=None):
         }
         rows.append(row)
         if item.get("actual_sha256"):
-            row["measured"] = measured_hash(path)
+            before = readable(path, cache, item["source"]["bytes"])
+            row["measured"] = measured_hash(path, expected=before, blocked=protected)
             require(
                 row["measured"]["sha256"] == item["actual_sha256"],
                 "model nonweight hash differs",
@@ -125,14 +167,7 @@ def check_model(view, cache, result=None):
             metadata = (
                 root / ".cache/huggingface/download" / (item["name"] + ".metadata")
             )
-            require(
-                metadata.resolve().is_relative_to(cache.resolve()),
-                "metadata escapes readonly cache",
-            )
-            meta_id = identity(metadata)
-            require(meta_id["bytes"] <= 4096, "oversize acquisition metadata")
-            raw = metadata.read_bytes()
-            require(identity(metadata) == meta_id, "acquisition metadata changed")
+            raw = bounded_read(metadata, cache, 4096, protected)
             lines = raw.decode().splitlines()
             require(
                 len(lines) == 3 and 0 < float(lines[2]) < float("inf"),
@@ -154,8 +189,10 @@ def check_model(view, cache, result=None):
                 metadata_sha256=hashlib.sha256(raw).hexdigest(),
                 measured_payload_sha256=None,
             )
-            if view["repo"].startswith("Inferact/"):
-                row["measured"] = measured_hash(path)
+            if view["role"] == "draft":
+                row["measured"] = measured_hash(
+                    path, expected=row["identity"], blocked=blocked
+                )
                 require(
                     row["measured"]["sha256"] == wanted, "draft payload hash differs"
                 )
@@ -196,16 +233,18 @@ def inspect(seed, spec_path, image_config, output):
             image_manifest=spec["image"]["manifest"],
             legacy_recorded_image_label=pins["image"],
         )
-        report["runtime"] = {}
-        check_runtime(pins, spec, report["runtime"])
         composition = json.loads(
             (seed / "C/payload/composition-manifest.json").read_text()
         )
+        target = next(view for view in composition["views"] if view["role"] == "target")
+        protected = payload_backings(target, Path("/models"))
+        report["runtime"] = {}
+        check_runtime(pins, spec, report["runtime"], protected)
         report["models"] = []
         for view in composition["views"]:
             result = {}
             report["models"].append(result)
-            check_model(view, Path("/models"), result)
+            check_model(view, Path("/models"), result, protected)
         report["status"] = (
             "passed scoped Phase0 inspection; model execution remains unauthorized"
         )
