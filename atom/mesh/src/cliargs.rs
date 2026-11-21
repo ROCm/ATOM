@@ -492,7 +492,14 @@ pub struct CliArgs {
     pub tool_call_parser: Option<String>,
 
     // ==================== Backend ====================
-    /// Backend runtime to use
+    /// Backend runtime of the workers; ATOM workers need `atom`
+    ///
+    /// ATOM workers need `atom` in regular mode as in PD mode: it keys an
+    /// image chat by all its media, as ATOM's prefix cache does. It also
+    /// discovers an HTTP worker's model through `/v1/models`, whose model id
+    /// (an alias under `--served-model-name`) names the worker's model;
+    /// `--tokenizer-path` and `--model-path` take precedence over it for the
+    /// worker's tokenizer.
     #[arg(long, value_enum, default_value_t = Backend::Sglang, alias = "runtime", help_heading = "Backend")]
     pub backend: Backend,
 

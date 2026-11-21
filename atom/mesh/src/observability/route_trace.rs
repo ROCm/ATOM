@@ -9,7 +9,11 @@
 //! [`carry`]. The HTTP routers run each request's attempts in [`estimated`],
 //! whatever the sample rate.
 
-use std::{cell::RefCell, future::Future, sync::Arc};
+use std::{
+    cell::{Cell, RefCell},
+    future::Future,
+    sync::Arc,
+};
 
 use axum::{
     extract::{Request, State},
@@ -44,6 +48,8 @@ struct Estimate {
 #[derive(Default)]
 struct RouteTrace {
     selections: RefCell<Vec<Selection>>,
+    /// The request's media items, as the planner received them.
+    media_count: Cell<usize>,
 }
 
 #[derive(Clone)]
@@ -73,14 +79,15 @@ pub(crate) async fn scope(State(rate): State<f64>, request: Request, next: Next)
 /// Runs `future` in the current request span and, for a sampled request, with a
 /// copy of its decisions, wherever the future is spawned.
 pub(crate) fn carry<F: Future>(future: F) -> impl Future<Output = F::Output> {
-    let selections = TRACE
-        .try_with(|trace| trace.selections.borrow().clone())
+    let trace = TRACE
+        .try_with(|trace| (trace.selections.borrow().clone(), trace.media_count.get()))
         .ok();
     async move {
-        match selections {
-            Some(selections) => {
+        match trace {
+            Some((selections, media_count)) => {
                 let trace = RouteTrace {
                     selections: RefCell::new(selections),
+                    media_count: Cell::new(media_count),
                 };
                 TRACE.scope(trace, future).await
             }
@@ -88,6 +95,11 @@ pub(crate) fn carry<F: Future>(future: F) -> impl Future<Output = F::Output> {
         }
     }
     .instrument(tracing::Span::current())
+}
+
+/// Keeps the request's media count for the selections the planner logs.
+pub(crate) fn record_media_count(media_count: usize) {
+    let _ = TRACE.try_with(|trace| trace.media_count.set(media_count));
 }
 
 /// Keeps the decision of a policy selection until the router dispatches it.
@@ -100,7 +112,8 @@ pub(crate) fn record_selection(
 ) {
     let _ = TRACE.try_with(|trace| {
         let Some(worker) = worker else {
-            info!(target: "mesh::route", pool, policy, branch, "No worker selected");
+            let media_count = trace.media_count.get();
+            info!(target: "mesh::route", pool, policy, branch, media_count, "No worker selected");
             return;
         };
         let mut selections = trace.selections.borrow_mut();
@@ -184,6 +197,7 @@ pub(crate) fn record_dispatch(pool: &'static str, worker: &Arc<dyn Worker>) {
                 .map(|selection| selection.url.as_str()),
             match_ratio = selection.and_then(|selection| selection.match_ratio),
             active_requests = selection.map(|selection| selection.active_requests),
+            media_count = trace.media_count.get(),
             "Selected worker"
         );
     });
@@ -493,5 +507,62 @@ mod tests {
                 assert!(sampled.contains(field), "missing {field} in\n{sampled}");
             }
         }
+    }
+
+    /// The planner gives the trace the request's media count, which both the
+    /// selected and the unplaced request log.
+    #[tokio::test]
+    async fn a_round_robin_selection_logs_the_requests_media_count() {
+        use crate::core::placement::{
+            planner::DefaultPlanner, test_support::*, PdPlanner, PlacementPlan, RequestDescriptor,
+        };
+        use crate::routers::prepare::inference::{InferenceRequest, ParsedInference};
+
+        let image = |url: &str| serde_json::json!({"type": "image_url", "image_url": {"url": url}});
+        let body = serde_json::json!({"model": "m", "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "Which colors are these?"},
+            image("https://example.com/red.png"),
+            image("https://example.com/blue.png"),
+        ]}]});
+        let parsed =
+            ParsedInference::parse("/v1/chat/completions", body.to_string().as_bytes()).unwrap();
+        let metadata = parsed.metadata();
+        let descriptor = RequestDescriptor {
+            media_count: metadata.media_count,
+            ..make_descriptor(Some("m"), Some(&metadata.text), None, None)
+        };
+        let planner = |worker: Arc<dyn Worker>| {
+            DefaultPlanner::new(
+                Arc::new(MockWorkerSource::new().add_worker(worker)),
+                Arc::new(MockPolicySource::new()),
+            )
+        };
+        let sampled = logs(true, async {
+            let plan = planner(make_regular_http("http://w:8000", "m"))
+                .plan(&descriptor)
+                .await
+                .unwrap();
+            let PlacementPlan::Single { worker, .. } = plan else {
+                panic!("a regular worker gets a single placement");
+            };
+            record_dispatch("regular", &worker);
+        })
+        .await;
+        assert_eq!(sampled.matches("Selected worker").count(), 1, "{sampled}");
+        for field in [r#"policy="round_robin""#, "media_count=2"] {
+            assert!(sampled.contains(field), "missing {field} in\n{sampled}");
+        }
+
+        let unplaced = logs(true, async {
+            let decode = planner(make_decode_http("http://d:8000", "m"));
+            assert!(decode.plan(&descriptor).await.is_err());
+        })
+        .await;
+        assert_eq!(
+            unplaced.matches("No worker selected").count(),
+            1,
+            "{unplaced}"
+        );
+        assert!(unplaced.contains("media_count=2"), "{unplaced}");
     }
 }
