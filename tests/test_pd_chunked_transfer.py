@@ -353,19 +353,25 @@ def test_pp_receive_waits_for_every_stage_including_failure(failure):
         "draft_token_ids": [43],
         "prefix_cache_hit_tokens": 4,
     }
-    assert not c._record_write_done(21, 0, 0, 999, handoff=handoff)
-    assert not c._record_write_done(21, 0, 0, 3, success=not failure, handoff=handoff)
-    assert not c._record_write_done(21, 0, 0, 3, success=not failure, handoff=handoff)
-    assert not c._record_write_done(21, 0, 1, 3, handoff=handoff)
-    assert not c._record_write_done(21, 99, 0, 3, handoff=handoff)
+    assert not c._record_write_done(
+        21, 0, 0, 999, handoff=handoff, started_writes=False
+    )
+    assert not c._record_write_done(
+        21, 0, 0, 3, success=not failure, started_writes=failure, handoff=handoff
+    )
+    assert not c._record_write_done(
+        21, 0, 0, 3, success=not failure, started_writes=failure, handoff=handoff
+    )
+    assert not c._record_write_done(21, 0, 1, 3, handoff=handoff, started_writes=False)
+    assert not c._record_write_done(21, 99, 0, 3, handoff=handoff, started_writes=False)
     assert not c.done_recving and not c.failed_recving
     assert c._pending_recv_blocks
-    assert c._record_write_done(21, 1, 0, 3, handoff=handoff)
+    assert c._record_write_done(21, 1, 0, 3, handoff=handoff, started_writes=False)
     assert c.failed_recving == ({21} if failure else set())
     assert c.done_recving == (set() if failure else {21})
     assert c._blocks_pending_fence == ([] if failure else [2, 9, 4])
     assert bool(c._received_handoffs) is not failure
-    assert not c._record_write_done(21, 1, 0, 3, handoff=handoff)
+    assert not c._record_write_done(21, 1, 0, 3, handoff=handoff, started_writes=False)
 
 
 def test_chunked_failure_preserves_main_receive_hold(monkeypatch):
@@ -374,8 +380,8 @@ def test_chunked_failure_preserves_main_receive_hold(monkeypatch):
     monkeypatch.setattr(mc.time, "monotonic", lambda: now[0])
     c = consumer(2)
     handoff = {"first_token_id": 42}
-    assert not c._record_write_done(21, 0, 0, 3, success=False)
-    assert c._record_write_done(21, 1, 0, 3, handoff=handoff)
+    assert not c._record_write_done(21, 0, 0, 3, success=False, started_writes=True)
+    assert c._record_write_done(21, 1, 0, 3, handoff=handoff, started_writes=False)
     assert c._pending_recv_blocks == {21: [2, 9, 4]}
     assert not c.failed_recving and not c.done_recving
     assert not c._pending_handoffs and not c._received_handoffs
@@ -431,7 +437,9 @@ def test_a_success_failed_by_its_handoff_is_not_held(monkeypatch):
     c = consumer(2)
     assert not c._record_write_done(21, 0, 0, 3, success=False, started_writes=False)
     # Its writes finished; only the handoff it sent is unusable.
-    assert c._record_write_done(21, 1, 0, 3, handoff={"first_token_id": "bad"})
+    assert c._record_write_done(
+        21, 1, 0, 3, handoff={"first_token_id": "bad"}, started_writes=False
+    )
     assert c.failed_recving == {21} and not c._held_failures
 
 
@@ -441,14 +449,16 @@ def test_a_dropped_duplicate_failure_counts_toward_the_hold_only(monkeypatch, fi
     c = consumer(2)
     handoff = {"first_token_id": 42}
     if first == "success":
-        assert not c._record_write_done(21, 0, 0, 3, handoff=handoff)
+        assert not c._record_write_done(
+            21, 0, 0, 3, handoff=handoff, started_writes=False
+        )
     else:
         assert not c._record_write_done(
             21, 0, 0, 3, success=False, started_writes=False
         )
     # Stage 0 already reported: the dedup drops this, but keeps its write claim.
-    assert not c._record_write_done(21, 0, 0, 3, success=False)
-    assert c._record_write_done(21, 1, 0, 3, handoff=handoff)
+    assert not c._record_write_done(21, 0, 0, 3, success=False, started_writes=True)
+    assert c._record_write_done(21, 1, 0, 3, handoff=handoff, started_writes=False)
     assert c.done_recving == ({21} if first == "success" else set())
     assert bool(c._held_failures) is (first != "success")
     assert not c._pending_recv_failed and not c.failed_recving
@@ -1064,7 +1074,7 @@ def test_dcp_chunked_descriptors_relayout_each_destination_page_once():
 )
 def test_malformed_handoff_fails_receive_without_killing_notification_loop(handoff):
     c = consumer(1)
-    assert c._record_write_done(21, 0, 0, 3, handoff=handoff)
+    assert c._record_write_done(21, 0, 0, 3, handoff=handoff, started_writes=False)
     assert c.failed_recving == {21}
     assert not c.done_recving and not c._received_handoffs
 
@@ -1648,6 +1658,7 @@ def test_opposite_admission_order_progresses_without_recompute(
             0,
             data["write_nonce"],
             handoff=data["prefill_handoff"],
+            started_writes=False,
         )
 
     dw._send_on_socket.side_effect = receive
@@ -1937,7 +1948,12 @@ def test_d_transfer_failure_waits_for_write_hold_before_abort(
     if cancelled:
         assert d.abort_request(seq.id)
     worker._record_write_done(
-        seq.id, 0, 0, worker._pending_recv_nonce[seq.id], success=False
+        seq.id,
+        0,
+        0,
+        worker._pending_recv_nonce[seq.id],
+        success=False,
+        started_writes=True,
     )
     now[0] += 29
     d._update_from_kv_xfer_finished(worker.get_finished())

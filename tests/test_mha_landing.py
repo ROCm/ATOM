@@ -273,7 +273,9 @@ def test_full_transfer_matches_the_consumers_head(stage, rank, offer):
         assert h.ready
         assert all(len(src) == 1 for src, _, _ in h.writes)
         assert [x["seq"] for x in h.ready] == list(range(len(h.ready)))
-        h.recv.stage_done(21, h.pp_rank, 3, True, h.req["_landed_slots"])
+        h.recv.stage_done(
+            21, h.pp_rank, 3, True, h.req["_landed_slots"], started_writes=False
+        )
         assert h.finished == [(21, False)]
 
 
@@ -291,7 +293,9 @@ def test_chunks_use_receive_global_page_offsets_and_sequences(rank, cached, devi
     assert [x["seq"] for x in h.ready] == list(range(len(h.ready)))
     assert {row[1] for x in h.ready for row in x["items"]} == set(range(len(ids)))
     assert len(h.ready) > h.recv._pool_slots  # NIC rewrites the same slots.
-    h.recv.stage_done(21, h.pp_rank, 3, True, h.req["_landed_slots"])
+    h.recv.stage_done(
+        21, h.pp_rank, 3, True, h.req["_landed_slots"], started_writes=False
+    )
     assert h.finished == [(21, False)]
 
 
@@ -321,7 +325,9 @@ def test_a_slot_one_destination_page_wide_stages_every_page(rank, chunks, device
     ]
     assert staged_sources and all(staged_sources)
     assert h.c._kv_staging_slots.free == [0]
-    h.recv.stage_done(21, h.pp_rank, 3, True, h.req.get("_landed_slots", []))
+    h.recv.stage_done(
+        21, h.pp_rank, 3, True, h.req.get("_landed_slots", []), started_writes=False
+    )
     assert h.finished == [(21, False)]
 
 
@@ -346,13 +352,21 @@ def test_chunk_handoff_is_checked_before_landing_completion(bad):
     h.recv.advertise("s1", 2)
     h.recv.begin(21, 3, [2, 0, 3], {0: "s0", 1: "s1"})
     good = {"first_token_id": 42, "draft_token_ids": []}
-    c._record_write_done(21, 0, write_nonce=3, handoff=good, landed_slots=[])
+    c._record_write_done(
+        21, 0, write_nonce=3, handoff=good, landed_slots=[], started_writes=False
+    )
     assert h.finished == []
     # Wrong nonce and duplicate must not poison metadata or finish another stage.
-    c._record_write_done(21, 1, write_nonce=9, handoff=bad, landed_slots=[])
-    c._record_write_done(21, 0, write_nonce=3, handoff=bad, landed_slots=[])
+    c._record_write_done(
+        21, 1, write_nonce=9, handoff=bad, landed_slots=[], started_writes=False
+    )
+    c._record_write_done(
+        21, 0, write_nonce=3, handoff=bad, landed_slots=[], started_writes=False
+    )
     assert not c._pending_handoffs[21].failed
-    c._record_write_done(21, 1, write_nonce=3, handoff=bad, landed_slots=[])
+    c._record_write_done(
+        21, 1, write_nonce=3, handoff=bad, landed_slots=[], started_writes=False
+    )
     assert h.finished == [(21, True)]
     assert h.held == {21: False}  # both stages reported success
 
@@ -378,7 +392,7 @@ def test_a_chunked_landing_failure_is_held_only_if_it_started_writing(
     c, good = begin_chunked_landing(h)
     reports = [
         {"success": False, "started_writes": wrote, "handoff": None},
-        {"success": True, "handoff": good},
+        {"success": True, "started_writes": False, "handoff": good},
     ]
     for pp, report in enumerate(reports if failure_first else reports[::-1]):
         c._record_write_done(21, pp, write_nonce=3, landed_slots=[], **report)
@@ -396,8 +410,12 @@ def test_a_dropped_chunk_report_keeps_its_write_claim(monkeypatch):
     h.recv._finish = c._complete_recv
     unwritten = {"success": False, "started_writes": False}
     c._record_write_done(21, 0, write_nonce=3, landed_slots=[], **unwritten)
-    c._record_write_done(21, 0, write_nonce=3, landed_slots=[], success=False)
-    c._record_write_done(21, 1, write_nonce=3, landed_slots=[], handoff=good)
+    c._record_write_done(
+        21, 0, write_nonce=3, landed_slots=[], success=False, started_writes=True
+    )
+    c._record_write_done(
+        21, 1, write_nonce=3, landed_slots=[], handoff=good, started_writes=False
+    )
     assert set(c._held_failures) == {21} and not c.failed_recving
 
 
@@ -521,6 +539,7 @@ def test_real_consumer_offers_page_landing_and_waits_for_scatter(monkeypatch, ch
         write_nonce=request["write_nonce"],
         handoff=handoff,
         landed_slots=h.req["_landed_slots"],
+        started_writes=False,
     )
     assert 21 not in d.done_recving
     h.pump()

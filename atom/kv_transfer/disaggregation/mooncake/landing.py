@@ -618,7 +618,7 @@ class LandingReceiver:
         nonce: int,
         success: bool,
         landed_slots: list[int] | None,
-        started_writes: bool = True,
+        started_writes: bool,
     ) -> bool:
         """Record a stage's write-done; False if this request is not tracked.
 

@@ -4338,7 +4338,7 @@ class MooncakeConnector(KVConnectorBase):
         write_nonce: int = 0,
         *,
         success: bool = True,
-        started_writes: bool = True,
+        started_writes: bool,
         landed_slots: list[int] | None = None,
         handoff: dict | None = None,
     ) -> None:
@@ -4456,7 +4456,7 @@ class MooncakeConnector(KVConnectorBase):
         write_nonce: int = 0,
         *,
         success: bool = True,
-        started_writes: bool = True,
+        started_writes: bool,
         landed_slots: list[int] | None = None,
         handoff: dict | None = None,
     ) -> bool:
@@ -4543,9 +4543,9 @@ class MooncakeConnector(KVConnectorBase):
             if not success:
                 if pending_handoff is not None:
                     started_writes = pending_handoff.failed_after_write
-                self._pending_recv_failed[req_id] = (
-                    started_writes or self._pending_recv_failed.get(req_id, False)
-                )
+                # Non-chunked ranks always claim a write, and a chunked receive
+                # gets here only on its last report, with every claim folded in.
+                self._pending_recv_failed[req_id] = started_writes
             stages = self._pending_recv_stages.setdefault(req_id, set())
             stages.add((pp_rank, tp_rank))
             if len(stages) < expected:
