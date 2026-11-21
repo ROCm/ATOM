@@ -55,7 +55,7 @@ pub trait RouterTrait: Send + Sync + Debug {
         let headers = Some(&headers);
         let model = metadata.model.as_deref();
         match parsed {
-            ParsedInference::Chat(body) => self.route_chat(headers, &body, model).await,
+            ParsedInference::Chat(body, _) => self.route_chat(headers, &body, model).await,
             ParsedInference::Completion(body) => self.route_completion(headers, &body, model).await,
             ParsedInference::Generate(body) => self.route_generate(headers, &body, model).await,
             ParsedInference::Responses(body) => {

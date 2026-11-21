@@ -272,6 +272,20 @@ chat template, such as DeepSeek V3.2 and V4
 ([#3377](https://github.com/ROCm/ATOM/issues/3377)). Use a policy that does not
 need tokens, such as `cache_aware` or `round_robin`, for these models and APIs.
 
+The router renders a chat it tokenizes with the model's chat template and the
+request's `chat_template_kwargs` and `reasoning_effort`. For a checkpoint whose
+`config.json` has a `model_type` with reasoning controls of its own in ATOM,
+DeepSeek-V4.1's `deepseek_v41`, it renders the chat as ATOM does instead. Under
+V4.1's rules, the request's `thinking`, `reasoning_effort` and
+`chat_template_kwargs` set the template's `thinking_mode` and
+`reasoning_effort`: a `minimal` effort is `low`, `medium` and `xhigh` are
+`high`, a `none` effort or a disabled `thinking` is chat mode, and
+`thinking.effort` may be a budget from 1 to 100. Only the kwargs V4.1's encoder
+takes reach the template. Controls ATOM refuses get `400`, and a chat after a
+`context` kwarg, which the template does not render, gets
+`501 token_routing_unsupported`. The router does not know a worker's
+`--default-chat-template-kwargs`.
+
 ## Tokenization
 
 The router tokenizes requests with their model's HuggingFace tokenizer, or with

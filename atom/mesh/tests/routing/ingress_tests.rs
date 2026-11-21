@@ -44,7 +44,7 @@ fn response_state_never_fails_over_to_a_different_owner() {
     let shared = [1, 2].map(|port| {
         Arc::new(
             BasicWorkerBuilder::new(format!("http://127.0.0.1:{port}"))
-                .labels(std::collections::HashMap::from([(
+                .labels(HashMap::from([(
                     "mesh.responses_state".into(),
                     "shared".into(),
                 )]))
@@ -63,7 +63,7 @@ fn response_state_never_fails_over_to_a_different_owner() {
 #[tokio::test]
 async fn capabilities_and_exact_token_routing_are_explicit() {
     let worker = BasicWorkerBuilder::new("http://127.0.0.1:1")
-        .labels(std::collections::HashMap::from([(
+        .labels(HashMap::from([(
             "mesh.apis".into(),
             "/v1/messages, /v1/chat/completions".into(),
         )]))
@@ -258,6 +258,78 @@ async fn fastokens_models_tokenize_up_to_their_own_limit() {
                 }
             }
         }
+    }
+}
+
+/// The chats of a model ATOM keeps reasoning controls for tokenize as ATOM
+/// renders them, and those ATOM rejects fail as on ATOM.
+#[tokio::test]
+async fn chats_tokenize_under_their_models_reasoning_controls() {
+    let config = crate::config::RouterConfig {
+        policy: prefix_hash(),
+        ..Default::default()
+    };
+    let _pool = PreparePoolRuntime::new(default_pool()).unwrap();
+    let app = AppContext::from_config(config, 5, _pool.handle())
+        .await
+        .unwrap();
+    let template = "{{ messages[0].content }}/{{ thinking_mode | default('-') }}/{{ reasoning_effort | default('-') }}";
+    let (_dir, hf, _) = huggingface_and_fastokens(template);
+    let id = TokenizerRegistry::generate_id();
+    let tokenizer = hf.clone();
+    app.tokenizer_registry
+        .load(&id, "m", "m", || async { Ok(tokenizer) })
+        .await
+        .unwrap();
+    for (controls, fields, want) in [
+        (
+            None,
+            json!({"reasoning_effort": "medium"}),
+            Ok("hi/-/medium"),
+        ),
+        (
+            Some(ChatControls::DeepseekV41),
+            json!({"reasoning_effort": "medium"}),
+            Ok("hi/thinking/high"),
+        ),
+        (
+            Some(ChatControls::DeepseekV41),
+            json!({"thinking": {"type": "disabled"}}),
+            Ok("hi/chat/-"),
+        ),
+        (
+            Some(ChatControls::DeepseekV41),
+            json!({"reasoning_effort": "ultra"}),
+            Err("invalid_request"),
+        ),
+    ] {
+        match controls {
+            Some(controls) => app.chat_controls.write().insert(id.clone(), controls),
+            None => app.chat_controls.write().remove(&id),
+        };
+        let mut body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+        body.as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        let parsed =
+            ParsedInference::parse("/v1/chat/completions", &serde_json::to_vec(&body).unwrap())
+                .unwrap();
+        let routing = IngressRouting::new(&app);
+        let result = app
+            .prepare_pool
+            .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
+                routing.prepare(&parsed, ctx)
+            })
+            .await
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        let tokens = result
+            .map(|(_, tokens)| tokens.unwrap())
+            .map_err(|error| error.code);
+        let want = want.map(|prompt| hf.encode(prompt, false).unwrap().token_ids().to_vec());
+        assert_eq!(tokens, want, "{body}");
     }
 }
 fn json_headers() -> HeaderMap {
@@ -661,7 +733,7 @@ impl crate::routers::RouterTrait for NativeIngressRouter {
     async fn route_chat(
         &self,
         _: Option<&HeaderMap>,
-        _: &crate::protocols::chat::ChatCompletionRequest,
+        _: &ChatCompletionRequest,
         _: Option<&str>,
     ) -> Response {
         Response::new(axum::body::Body::empty())

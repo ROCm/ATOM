@@ -133,7 +133,7 @@ pub(crate) async fn with_fastokens(
 
 /// The `tokenizer.json` the factory loads `source` from: the file itself, the one
 /// in a directory, or the one a HuggingFace model ID downloads.
-async fn tokenizer_json(source: &str) -> Result<PathBuf, String> {
+pub(crate) async fn tokenizer_json(source: &str) -> Result<PathBuf, String> {
     let path = Path::new(source);
     let file = if path.is_file() {
         path.to_path_buf()

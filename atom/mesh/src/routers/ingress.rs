@@ -1,6 +1,6 @@
 //! Shared HTTP proxy contract. The routing view never replaces the original payload.
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{Arc, LazyLock},
     time::Instant,
 };
@@ -28,15 +28,18 @@ use crate::{
         ConnectionMode, Worker, WorkerRegistry, WorkerType,
     },
     policies::{LoadBalancingPolicy, PolicyRegistry},
+    protocols::chat::ChatCompletionRequest,
     routers::{
         comm::error::{IngressError, MeshLocalError},
         prepare::{
+            chat_controls::ChatControls,
+            chat_template::process_chat_messages,
             fast_tokenizer::TokenizeLimits,
-            inference::{InferenceMetadata, InferenceRequest, ParsedInference},
+            inference::{InferenceMetadata, InferenceRequest, ParsedInference, SentControls},
         },
     },
     server::AppState,
-    tokenizer::TokenizerRegistry,
+    tokenizer::{registry::TokenizerEntry, TokenizerRegistry},
 };
 
 /// What a request's policies do with its tokens.
@@ -635,6 +638,7 @@ pub struct IngressRouting {
     worker_registry: Arc<WorkerRegistry>,
     tokenizer_registry: Arc<TokenizerRegistry>,
     chats_without_template: Arc<RwLock<HashSet<String>>>,
+    chat_controls: Arc<RwLock<HashMap<String, ChatControls>>>,
     pd: bool,
     tokenize_limits: TokenizeLimits,
 }
@@ -646,6 +650,7 @@ impl IngressRouting {
             worker_registry: app.worker_registry.clone(),
             tokenizer_registry: app.tokenizer_registry.clone(),
             chats_without_template: app.chats_without_template.clone(),
+            chat_controls: app.chat_controls.clone(),
             pd: app.router_config.mode.is_pd_mode(),
             tokenize_limits: app.tokenize_limits,
         }
@@ -876,13 +881,11 @@ impl IngressRouting {
         }
         ctx.check()?;
         let template_started = Instant::now();
-        let prompt = if let Some(chat) = parsed.chat() {
+        let prompt = if let Some((chat, sent)) = parsed.chat_as_sent() {
             if self.chats_without_template.read().contains(&entry.id) {
                 return Err(IngressError::new(http::StatusCode::NOT_IMPLEMENTED, "token_routing_unsupported", "this model's chats render with a built-in encoder whose defaults are not the engine's; use a policy that does not require exact tokens"));
             }
-            super::prepare::chat_template::process_chat_messages(chat, &*entry.tokenizer)
-                .map_err(IngressError::invalid)?
-                .text
+            self.render_chat(&entry, chat, sent)?
         } else {
             metadata.text.clone()
         };
@@ -902,6 +905,24 @@ impl IngressRouting {
         metrics::histogram!("mesh_prepare_stage_seconds", "stage" => "encode")
             .record(encode_started.elapsed().as_secs_f64());
         Ok(tokens)
+    }
+
+    /// The prompt the router renders `chat` to with `entry`'s template: as ATOM
+    /// does for a model with reasoning controls of its own, else with the
+    /// chat's template kwargs.
+    fn render_chat(
+        &self,
+        entry: &TokenizerEntry,
+        chat: &ChatCompletionRequest,
+        sent: &SentControls,
+    ) -> Result<String, IngressError> {
+        let controls = self.chat_controls.read().get(&entry.id).copied();
+        match controls {
+            Some(controls) => controls.render(chat, sent, &*entry.tokenizer),
+            None => Ok(process_chat_messages(chat, &*entry.tokenizer)
+                .map_err(IngressError::invalid)?
+                .text),
+        }
     }
 }
 

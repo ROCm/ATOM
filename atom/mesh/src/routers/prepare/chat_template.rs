@@ -26,7 +26,9 @@ pub struct ProcessedMessages {
     pub stop_sequences: Option<StringOrArray>,
 }
 
-/// Process chat messages and apply the HuggingFace chat template.
+/// Process chat messages and apply the HuggingFace chat template, with the
+/// request's `reasoning_effort` and then its `chat_template_kwargs` as the
+/// template kwargs.
 ///
 /// Requires a HuggingFace tokenizer (directly or via `CachedTokenizer` or
 /// `FastTokenizer`); other tokenizer kinds return an error because the gRPC path
@@ -35,38 +37,6 @@ pub fn process_chat_messages(
     request: &ChatCompletionRequest,
     tokenizer: &dyn Tokenizer,
 ) -> Result<ProcessedMessages, String> {
-    let any = tokenizer.as_any();
-    let hf_tokenizer = any.downcast_ref::<HuggingFaceTokenizer>().or_else(|| {
-        let inner = match any.downcast_ref::<CachedTokenizer>() {
-            Some(cached) => cached.inner().as_any(),
-            None => any.downcast_ref::<FastTokenizer>()?.inner().as_any(),
-        };
-        inner.downcast_ref::<HuggingFaceTokenizer>()
-    });
-
-    let Some(hf_tokenizer) = hf_tokenizer else {
-        return Err(
-            "gRPC router requires HuggingFace tokenizer with chat template support".to_string(),
-        );
-    };
-
-    let content_format = hf_tokenizer.chat_template_content_format();
-    let mut transformed_messages = process_content_format(&request.messages, content_format)?;
-
-    process_tool_call_arguments(&mut transformed_messages)?;
-
-    let tools_json: Option<Vec<Value>> = request
-        .tools
-        .as_ref()
-        .map(|tools| {
-            tools
-                .iter()
-                .map(serde_json::to_value)
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .transpose()
-        .map_err(|e| format!("Failed to serialize tools: {}", e))?;
-
     let kwargs_capacity = 1 + request.chat_template_kwargs.as_ref().map_or(0, |k| k.len());
     let mut combined_template_kwargs = HashMap::with_capacity(kwargs_capacity);
 
@@ -83,16 +53,55 @@ pub fn process_chat_messages(
         }
     }
 
-    let final_template_kwargs = if combined_template_kwargs.is_empty() {
-        None
-    } else {
-        Some(&combined_template_kwargs)
+    render_chat_messages(request, tokenizer, &combined_template_kwargs, None)
+}
+
+/// `process_chat_messages` with `template_kwargs` as the template kwargs, and
+/// message content in `content_format` where given rather than in the form the
+/// template reads.
+pub(crate) fn render_chat_messages(
+    request: &ChatCompletionRequest,
+    tokenizer: &dyn Tokenizer,
+    template_kwargs: &HashMap<String, Value>,
+    content_format: Option<ChatTemplateContentFormat>,
+) -> Result<ProcessedMessages, String> {
+    let any = tokenizer.as_any();
+    let hf_tokenizer = any.downcast_ref::<HuggingFaceTokenizer>().or_else(|| {
+        let inner = match any.downcast_ref::<CachedTokenizer>() {
+            Some(cached) => cached.inner().as_any(),
+            None => any.downcast_ref::<FastTokenizer>()?.inner().as_any(),
+        };
+        inner.downcast_ref::<HuggingFaceTokenizer>()
+    });
+
+    let Some(hf_tokenizer) = hf_tokenizer else {
+        return Err(
+            "gRPC router requires HuggingFace tokenizer with chat template support".to_string(),
+        );
     };
+
+    let content_format =
+        content_format.unwrap_or_else(|| hf_tokenizer.chat_template_content_format());
+    let mut transformed_messages = process_content_format(&request.messages, content_format)?;
+
+    process_tool_call_arguments(&mut transformed_messages)?;
+
+    let tools_json: Option<Vec<Value>> = request
+        .tools
+        .as_ref()
+        .map(|tools| {
+            tools
+                .iter()
+                .map(serde_json::to_value)
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()
+        .map_err(|e| format!("Failed to serialize tools: {}", e))?;
 
     let params = ChatTemplateParams {
         add_generation_prompt: true,
         tools: tools_json.as_deref(),
-        template_kwargs: final_template_kwargs,
+        template_kwargs: (!template_kwargs.is_empty()).then_some(template_kwargs),
         ..Default::default()
     };
 
