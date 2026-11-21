@@ -39,6 +39,7 @@ from atom.model_loader.weight_cache.preload import (
     _started_by_launch,
     launch_recorded,
     stop_daemon,
+    uncacheable,
 )
 from atom.model_loader.weight_cache.transport import (
     _recv,
@@ -57,6 +58,15 @@ _NONE, _USABLE, _UNUSABLE = range(3)
 # [the drafter part] of the payload this process took its model from, for
 # load_drafter_from_cache, which runs after the model's.
 _draft: list | None = None
+# What that daemon's load left on the GPU beside the weights it maps here.
+_load_extra = 0
+
+
+def daemon_load_extra() -> int:
+    """Device memory, in bytes, the daemon this process took its model from
+    holds beyond those weights: the KV budget leaves it out, as a disk load
+    would not hold it (0: the model is not from a daemon)."""
+    return _load_extra
 
 
 class _Rank(NamedTuple):
@@ -324,29 +334,42 @@ def _stop_together(me: _Rank, why, held: bool, pid=None, started=None) -> None:
         _close(hold)
 
 
-def _replace_daemon(me: _Rank, reasons, held, pid, started, present) -> dict | None:
+def _replace_daemon(
+    me: _Rank, reasons, held, pid, started, present, key
+) -> dict | None:
     """The launch cannot use what is on its GPUs (``reasons``; ``present``:
     a daemon is on some): stop it and start a daemon of this launch's own.
     Returns the daemon started; None: load from disk, as the one this launch
-    started cannot be used either, or none can be started."""
+    started cannot be used either, none can be started, or a daemon found
+    that loading ``key`` leaves state it cannot share."""
+    marked = uncacheable(key)  # written by that daemon
+    skip = group_max(int(marked is not None), me.group)  # on any rank
     if started is not None:
         _stop_together(me, reasons, held, started=started)
         logger.warning(
             f"{_TAG} {me.label}: the weight cache daemon this launch started cannot "
             f"be used, so it was stopped and this server loads from disk (daemon "
             f"log {started['log']}). If every launch of this configuration ends "
-            f"here, launch it without ATOM_PRELOAD:\n  {_detail(reasons)}"
+            f"here, launch it without ATOM_PRELOAD:\n  {_detail(marked or reasons)}"
         )
         return None
     if present:
         logger.warning(
-            f"{_TAG} {me.label}: restarting the weight cache daemon"
-            f"{f' (pid {pid})' if pid else ''}, it cannot be used here:"
+            f"{_TAG} {me.label}: {'stopping' if skip else 'restarting'} the weight "
+            f"cache daemon{f' (pid {pid})' if pid else ''}, it cannot be used here:"
             f"\n  {_detail(reasons)}"
         )
         why = ["it would need a restart, since it cannot be used here:"] + reasons
         _stop_together(me, why, held, pid)
-    else:
+    if skip:
+        logger.warning(
+            f"{_TAG} {me.label}: a daemon found that this load leaves state the "
+            "cache cannot share, so no daemon is started and this server loads from "
+            "disk (python -m atom.model_loader.weight_cache stop forgets this):"
+            f"\n  {_detail(marked or [])}"
+        )
+        return None
+    if not present:
         logger.info(f"{_TAG} {me.label}: no weight cache daemon here; starting one")
     err = None
     try:
@@ -411,7 +434,7 @@ def load_from_cache(config, model_class, device, *, rank: int) -> nn.Module | No
     stops it and starts a new one (once). If the daemon this launch started
     cannot be used either, or none can be started, the server loads from
     disk. Every rank of the launch takes the same decisions."""
-    global _draft
+    global _draft, _load_extra
     if not launch_recorded():
         logger.warning(
             f"{_TAG} {worker_process_name(config, rank)}: ATOM_PRELOAD needs the "
@@ -452,7 +475,7 @@ def load_from_cache(config, model_class, device, *, rank: int) -> nn.Module | No
                 )
             ]
         _close(sock)
-        started = _replace_daemon(me, reasons, held, pid, started, hi > _NONE)
+        started = _replace_daemon(me, reasons, held, pid, started, hi > _NONE, key)
         if started is None:
             return None
 
@@ -466,6 +489,7 @@ def load_from_cache(config, model_class, device, *, rank: int) -> nn.Module | No
     # Collective on EP setups; a failure here must not be swallowed.
     n_moe = _run_prepare_finalize(model)
     _draft = [payload["draft"]]
+    _load_extra = payload["load_extra"]
     # Holds the connection open for this process's lifetime: the daemon
     # counts it as a server using its weights.
     threading.Thread(target=_watch_daemon, args=(sock, me), daemon=True).start()

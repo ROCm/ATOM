@@ -1184,6 +1184,7 @@ def loop(client, monkeypatch):
             "process": {"changes": [], "env": {}, "storages": {}},
             "loaded": ["mtp.0.w"],
         },
+        "load_extra": 7 << 20,
     }
 
     def probe(me, started, held, key):
@@ -1217,6 +1218,7 @@ def loop(client, monkeypatch):
         ),
         "build_model": lambda config, model_class, device: model_class(config),
         "compute_key": lambda config, rank: {"rank": rank},
+        "uncacheable": lambda key: None,
         "exported_structure": lambda built, export: calls.built,
         "apply_export": lambda model, export, device: 0,
         "apply_process": lambda export, device: 0,
@@ -1226,6 +1228,7 @@ def loop(client, monkeypatch):
         monkeypatch.setattr(client, name, fn)
     monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda *a, **k: None)
     monkeypatch.setattr(client, "_draft", None)
+    monkeypatch.setattr(client, "_load_extra", 0)
     return calls
 
 
@@ -1636,3 +1639,55 @@ def test_a_markov_head_built_ahead_of_its_weights_arms_lossless_sampling(monkeyp
         assert [(w.device, w.dtype, w.shape[1:]) for w in asked] == [
             (drafter.device, torch.bfloat16, torch.Size([4]))
         ] * 2
+
+
+def test_uncacheable_loads_are_remembered_until_stop(cache_dir, capsys):
+    key_a, key_b = {"rank": 0, "quant": "a"}, {"rank": 0, "quant": "b"}
+    why = ["layers.0.workspace: a dataclass with __slots__"]
+    assert preload.uncacheable(key_a) is None
+    preload.mark_uncacheable(key_a, why)
+    assert preload.uncacheable(key_a) == why and preload.uncacheable(key_b) is None
+    assert cli.main(["stop"]) == 0
+    assert "forgot" in capsys.readouterr().out
+    assert preload.uncacheable(key_a) is None
+
+
+def test_a_daemon_whose_load_cannot_be_shared_records_it_and_exits(
+    cache_dir, monkeypatch
+):
+    key = {"rank": 0, "checkpoint": "c"}
+    why = ["layers.0.workspace: a dataclass with __slots__"]
+
+    def get_model(config, device, load):
+        load.key = key
+        load.rec = SimpleNamespace(export={"unshippable": why}, process={})
+
+    with atom_without_aiter() as load:
+        daemon = load("atom.model_loader.weight_cache.daemon")
+        monkeypatch.setattr(daemon, "get_model", get_model)
+        monkeypatch.setattr(daemon, "worker_process_name", lambda config, rank: "TP0")
+        with pytest.raises(SystemExit):
+            daemon._load_and_serve(
+                SimpleNamespace(), 0, torch.device("cpu"), "/x.sock", None, 0.0, 0
+            )
+    assert preload.uncacheable(key) == why
+
+
+def test_a_load_a_daemon_found_uncacheable_starts_no_daemon(loop, client, monkeypatch):
+    why = ["layers.0.workspace: a dataclass with __slots__"]
+    monkeypatch.setattr(client, "uncacheable", lambda key: why)
+    loop.probes = [(False, [])]
+    assert _from_cache(client) is None  # a disk load, at once
+    assert loop.spawned == loop.stopped == 0
+    # A daemon of another launch on these GPUs is stopped for the disk load.
+    loop.probes = [(True, ["options.moe_backend: daemon=standard client=mega"])]
+    assert _from_cache(client) is None
+    assert loop.spawned == 0 and loop.stopped == 1
+
+
+def test_a_server_learns_what_its_daemon_holds_beside_the_weights(loop, client):
+    # For the KV budget, which counts only the weights, as a disk load would.
+    assert client.daemon_load_extra() == 0
+    loop.probes = [(True, [])]
+    assert isinstance(_from_cache(client), _Model)
+    assert client.daemon_load_extra() == 7 << 20

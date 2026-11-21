@@ -43,7 +43,7 @@ from atom.model_loader.weight_cache.key import (
     exported_structure,
     structure,
 )
-from atom.model_loader.weight_cache.preload import unsupported
+from atom.model_loader.weight_cache.preload import mark_uncacheable, unsupported
 from atom.model_loader.weight_cache.transport import (
     _DaemonLock,
     _Server,
@@ -177,7 +177,9 @@ def _serve_rank(rank: int, config, ready, index: int, all_serving) -> None:
     # leaves MoE communication setup to the servers that take the weights.
     loader.MOE_PREPARE_FINALIZE = False
     device = init_model_env(config, rank, device_communicators=False)
-    server, pool = _load_and_serve(config, rank, device, path, lock, t0)
+    server, pool = _load_and_serve(
+        config, rank, device, path, lock, t0, used_before=_device_used(device)
+    )
     # Flags: a handler that takes a lock could land inside its holder.
     signaled, idle = [], []
 
@@ -330,12 +332,29 @@ def _leave_out_shared(d, target) -> list[str]:
     ]
 
 
-def _load_and_serve(config, rank, device, path, lock, t0):
+def _device_used(device) -> int:
+    free, total = torch.cuda.mem_get_info(device)
+    return total - free
+
+
+def _load_and_serve(config, rank, device, path, lock, t0, used_before: int):
+    """``used_before``: the device memory in use before this rank loaded
+    (other processes' and this one's context)."""
     label = worker_process_name(config, rank)
     load = _DaemonLoad(rank)
     get_model(config, device, load)
     rec = load.rec
     export, process = rec.export, rec.process
+    if export["unshippable"]:
+        # The same load leaves the same state: no daemon is started for it again.
+        mark_uncacheable(load.key, export["unshippable"])
+        logger.warning(
+            f"{_TAG} {label}: loading created state that cannot be shared, so this "
+            "daemon exits, and launches with these settings load from disk until "
+            "python -m atom.model_loader.weight_cache stop: "
+            f"{export['unshippable'][:10]}"
+        )
+        raise SystemExit(0)
     draft = _draft_payload(load.draft, rec.model, label)
     parts = [export, process] + ([draft["export"], draft["process"]] if draft else [])
     keys = [list(p["views"]) for p in parts]
@@ -345,12 +364,16 @@ def _load_and_serve(config, rank, device, path, lock, t0):
     for p, ks in zip(parts, keys):
         p["storages"] = {k: handles[k] for k in ks}
     total = sum(v.numel() for v in views.values())
+    # What the load left beside the weights (kernels it loaded, gaps between
+    # the weights); a server's KV budget leaves it out.
+    load_extra = max(_device_used(device) - used_before - total, 0)
     payload = {
         "key": load.key,
         "structure": exported_structure(rec.built, export),
         "export": export,
         "process": process,
         "draft": draft,
+        "load_extra": load_extra,
     }
     server = _Server(path, payload, views, label)
     lock.set_state("serving", bytes=total)
@@ -360,15 +383,11 @@ def _load_and_serve(config, rank, device, path, lock, t0):
     )
     logger.info(
         f"{_TAG} {label}: serving {entries} entries "
-        f"{'and the drafter ' if draft else ''}({total / (1 << 30):.2f} GiB; loading "
-        f"changed {len(process['changes'])} globals and {len(process['env'])} env vars) "
+        f"{'and the drafter ' if draft else ''}({total / (1 << 30):.2f} GiB, and "
+        f"{load_extra / (1 << 30):.2f} GiB beside them; loading changed "
+        f"{len(process['changes'])} globals and {len(process['env'])} env vars) "
         f"at {path} after {time.perf_counter() - t0:.1f}s"
     )
-    if export["unshippable"]:
-        logger.warning(
-            f"{_TAG} {label}: loading created state that cannot be shared, so clients will "
-            f"refuse this cache: {export['unshippable'][:10]}"
-        )
     return server, pool
 
 

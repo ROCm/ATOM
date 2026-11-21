@@ -7,6 +7,7 @@ from __future__ import annotations
 import atexit
 import contextlib
 import glob
+import hashlib
 import json
 import os
 import signal
@@ -303,6 +304,34 @@ def stop_daemon(path: str, timeout_s: float = 180) -> int | None:
             )
         time.sleep(0.5)
     return main
+
+
+def _uncacheable_file(key: dict) -> str:
+    digest = hashlib.sha256(json.dumps(key, sort_keys=True, default=str).encode())
+    return os.path.join(socket_dir(), f"uncacheable_{digest.hexdigest()[:16]}")
+
+
+def mark_uncacheable(key: dict, why: list[str]) -> None:
+    """A daemon's load with this key left state the cache cannot share, and
+    would again: launches with it load from disk, until `stop` (after a
+    change to loading code, as for everything the key does not see)."""
+    with contextlib.suppress(OSError), open(_uncacheable_file(key), "w") as f:
+        json.dump(why[:10], f)
+
+
+def uncacheable(key: dict) -> list[str] | None:
+    """Why (mark_uncacheable); None: not marked."""
+    try:
+        with open(_uncacheable_file(key)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def forget_uncacheable() -> int:
+    marks = glob.glob(os.path.join(socket_dir(), "uncacheable_*"))
+    _remove(*marks)
+    return len(marks)
 
 
 def _hold_unused(path: str, wait_s: float = 5):
