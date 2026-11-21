@@ -1,0 +1,17 @@
+== Kimi-K3 attempt 1, 2026-11-21 12:25-12:43 BJ: node0 rank 1 fails in CUDA graph capture (decode bs=16); ranks 0, 2, 3 and node1 ranks 4-7 pass the same capture. The second start passed.
+[aiter] shape is M:16, N:3584, K:7168 dtype='torch.bfloat16' otype='torch.bfloat16' bias=False, scaleAB=False, bpreshuffle=False, not found tuned config in /tmp/aiter_configs/bf16_tuned_gemm.csv, will use default config!
+  File "/app/ATOM/atom/model_engine/model_runner.py", line 4412, in capture_cudagraph
+  File "/app/ATOM/atom/models/kimi_k3/model.py", line 661, in _dual_stream_split
+  File "/app/ATOM/atom/model_ops/linear.py", line 1741, in forward
+  File "/app/aiter/aiter/tuned_gemm.py", line 926, in mm
+  File "/app/aiter/aiter/tuned_gemm.py", line 404, in gemm_a16w16
+  File "/app/aiter/aiter/tuned_gemm.py", line 527, in _gemm_a16w16
+  File "/app/aiter/aiter/tuned_gemm.py", line 875, in triton_gemm
+  File "/app/aiter/aiter/ops/triton/gemm/basic/gemm_a16w16.py", line 732, in gemm_a16w16
+  File "/app/aiter/aiter/ops/triton/gemm/basic/gemm_a16w16.py", line 118, in gemm_a16w16_
+  File "/app/aiter/aiter/ops/triton/gemm/basic/gemm_a16w16.py", line 188, in _gemm_a16w16_routed
+  File "/app/aiter/aiter/ops/triton/gemm/basic/gemm_a16w16.py", line 585, in _gemm_a16w16_native
+  File "/app/triton-mi450/python/triton/compiler/compiler.py", line 503, in launch_metadata
+  File "/app/triton-mi450/python/triton/compiler/compiler.py", line 485, in _init_handles
+RuntimeError: Triton Error [HIP]:  Code: 200, Message: device kernel image is invalid
+[atom 04:42:35] AsyncIOProcManager(ModelRunner): [ModelRunner1/8] proc died unexpectedly (exitcode=1), shutting down.
