@@ -4,13 +4,17 @@
 use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, OnceLock,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
-    extract::{Json, Path, State},
-    http::StatusCode,
+    body::Bytes,
+    extract::{Json, Path, RawQuery, State},
+    http::{HeaderMap, Method, StatusCode},
     response::{
         sse::{Event, KeepAlive},
         IntoResponse, Response, Sse,
@@ -52,6 +56,8 @@ pub struct MockWorker {
     config: Arc<RwLock<MockWorkerConfig>>,
     kv_event_sources: Arc<RwLock<serde_json::Value>>,
     dp_size: Arc<RwLock<Option<usize>>>,
+    tp_size: Arc<RwLock<Option<usize>>>,
+    rl_echo_calls: Arc<AtomicUsize>,
     shutdown_handle: Option<tokio::task::JoinHandle<()>>,
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
@@ -62,6 +68,8 @@ impl MockWorker {
             config: Arc::new(RwLock::new(config)),
             kv_event_sources: Arc::new(RwLock::new(json!({}))),
             dp_size: Arc::new(RwLock::new(None)),
+            tp_size: Arc::new(RwLock::new(None)),
+            rl_echo_calls: Arc::new(AtomicUsize::new(0)),
             shutdown_handle: None,
             shutdown_tx: None,
         }
@@ -77,6 +85,16 @@ impl MockWorker {
         *self.dp_size.write().await = Some(dp_size);
     }
 
+    /// The TP size served at `/server_info`, as ATOM serves it, not served until set.
+    pub async fn set_tp_size(&self, tp_size: usize) {
+        *self.tp_size.write().await = Some(tp_size);
+    }
+
+    /// Requests `/rl_echo` has answered.
+    pub fn rl_echo_calls(&self) -> usize {
+        self.rl_echo_calls.load(Ordering::SeqCst)
+    }
+
     /// Start the mock worker server
     pub async fn start(&mut self) -> Result<String, Box<dyn std::error::Error>> {
         let config = self.config.clone();
@@ -87,6 +105,12 @@ impl MockWorker {
 
         let kv_event_sources = self.kv_event_sources.clone();
         let dp_size = self.dp_size.clone();
+        let tp_size = self.tp_size.clone();
+        let rl_echo_calls = self.rl_echo_calls.clone();
+        let rl_echo = move |method: Method, query: RawQuery, headers: HeaderMap, body: Bytes| {
+            rl_echo_calls.fetch_add(1, Ordering::SeqCst);
+            rl_echo_handler(method, query, headers, body)
+        };
         let app = Router::new()
             .route(
                 "/kv_event_sources",
@@ -98,11 +122,19 @@ impl MockWorker {
             .route(
                 "/server_info",
                 get(move || {
-                    let dp_size = dp_size.clone();
+                    let (dp_size, tp_size) = (dp_size.clone(), tp_size.clone());
                     async move {
-                        match *dp_size.read().await {
-                            Some(dp_size) => Json(json!({"dp_size": dp_size})).into_response(),
-                            None => StatusCode::NOT_FOUND.into_response(),
+                        let mut info = serde_json::Map::new();
+                        if let Some(dp_size) = *dp_size.read().await {
+                            info.insert("dp_size".to_string(), json!(dp_size));
+                        }
+                        if let Some(tp_size) = *tp_size.read().await {
+                            info.insert("tp_size".to_string(), json!(tp_size));
+                        }
+                        if info.is_empty() {
+                            StatusCode::NOT_FOUND.into_response()
+                        } else {
+                            Json(info).into_response()
                         }
                     }
                 }),
@@ -121,6 +153,8 @@ impl MockWorker {
                 post(responses_cancel_handler),
             )
             .route("/flush_cache", post(flush_cache_handler))
+            .route("/rl_echo", get(rl_echo.clone()).post(rl_echo))
+            .route("/rl_slow", post(rl_slow_handler))
             .route("/v1/models", get(v1_models_handler))
             .with_state(config);
 
@@ -1129,6 +1163,44 @@ async fn flush_cache_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>
         "message": "Cache flushed successfully"
     }))
     .into_response()
+}
+
+/// The request as received: method, query, every header and the body as
+/// text, answered with the status in the query's `status`, else 200.
+async fn rl_echo_handler(
+    method: Method,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let status = query
+        .as_deref()
+        .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("status=")))
+        .and_then(|code| code.parse().ok())
+        .and_then(|code| StatusCode::from_u16(code).ok())
+        .unwrap_or(StatusCode::OK);
+    let headers: HashMap<String, String> = headers
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.to_string(),
+                String::from_utf8_lossy(value.as_bytes()).into_owned(),
+            )
+        })
+        .collect();
+    let echo = json!({
+        "method": method.as_str(),
+        "query": query,
+        "headers": headers,
+        "body": String::from_utf8_lossy(&body),
+    });
+    (status, Json(echo)).into_response()
+}
+
+/// Answers `{}` after 1.5 s, past a 1 s control timeout.
+async fn rl_slow_handler() -> Response {
+    tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+    Json(json!({})).into_response()
 }
 
 async fn v1_models_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) -> Response {
