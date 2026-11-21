@@ -7,7 +7,7 @@ use axum::{http::HeaderMap, response::Response};
 use tracing::debug;
 
 #[cfg(feature = "grpc-client")]
-use super::engine::atom::pair::AtomPairs;
+use super::engine::{atom::pair::AtomPairs, GrpcEngine};
 use super::{
     completion_adapter::{
         completion_to_generate, wrap_generate_response_as_completion,
@@ -50,13 +50,13 @@ impl GrpcPDRouter {
         let worker_registry = ctx.worker_registry.clone();
         let pipeline = Pipeline::new_pd(worker_registry.clone(), ctx.policy_registry.clone());
         #[cfg(feature = "grpc-client")]
-        let pipeline = pipeline.with_atom_pairs(
-            AtomPairs::new(
-                worker_registry.clone(),
-                ctx.router_config.atom_pd_rank_mapping_policy,
-            )
-            .await?,
-        );
+        let pipeline = {
+            let config = &ctx.router_config;
+            let pairs =
+                AtomPairs::new(worker_registry.clone(), config.atom_pd_rank_mapping_policy).await?;
+            let engine = GrpcEngine::with_atom_pairs(pairs);
+            pipeline.with_engine(engine.with_atom_session(config.atom_grpc_session))
+        };
 
         Ok(GrpcPDRouter {
             worker_registry,

@@ -6,6 +6,8 @@ use async_trait::async_trait;
 use axum::{http::HeaderMap, response::Response};
 use tracing::debug;
 
+#[cfg(feature = "grpc-client")]
+use super::engine::GrpcEngine;
 use super::{
     completion_adapter::{
         completion_to_generate, wrap_generate_response_as_completion,
@@ -54,6 +56,9 @@ impl GrpcRouter {
 
         let pipeline =
             Pipeline::new_regular(ctx.worker_registry.clone(), ctx.policy_registry.clone());
+        #[cfg(feature = "grpc-client")]
+        let pipeline = pipeline
+            .with_engine(GrpcEngine::new().with_atom_session(ctx.router_config.atom_grpc_session));
         Ok(Self::with_pipeline(ctx, pipeline))
     }
 

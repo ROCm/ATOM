@@ -6,11 +6,11 @@ use std::task::{ready, Context, Poll};
 
 use futures::{Stream, StreamExt};
 use http::StatusCode;
-use tonic::{Status, Streaming};
+use tonic::Status;
 
-use super::AtomClient;
+use super::Responses;
 use crate::atom_engine::grpc::{
-    generate_response::Response, GenerateComplete, GenerateError, GenerateRequest, GenerateResponse,
+    generate_response::Response, GenerateComplete, GenerateError, GenerateResponse,
 };
 use crate::routers::token_handle::engine_error::EngineError;
 use crate::routers::token_handle::token_chunk::{
@@ -18,25 +18,11 @@ use crate::routers::token_handle::token_chunk::{
 };
 use crate::routers::token_handle::token_handle::TokenSource;
 
-pub(crate) struct AtomStream<S = Streaming<GenerateResponse>> {
+pub(crate) struct AtomStream<S = Responses> {
     inner: S,
     /// The first message, read by `start`.
     first: Option<TokenChunk>,
     finished: bool,
-}
-
-impl AtomStream {
-    /// Starts the call and reads its first message, as `start` does.
-    pub(crate) async fn open(
-        client: &AtomClient,
-        request: GenerateRequest,
-    ) -> Result<Self, EngineError> {
-        let inner = client
-            .generate(request)
-            .await
-            .map_err(EngineError::Transport)?;
-        Self::start(inner).await
-    }
 }
 
 impl<S: Stream<Item = Result<GenerateResponse, Status>> + Unpin> AtomStream<S> {
