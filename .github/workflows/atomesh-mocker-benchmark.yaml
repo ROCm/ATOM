@@ -115,6 +115,11 @@ jobs:
             --target-dir atom/mesh/mocker/target/mesh \
             --profile ci --lib
 
+      # The vendored ext-proc protos must match the checksums pinned in
+      # manifest.json; offline, so a drifted file or manifest fails here.
+      - name: Check vendored ext-proc protos
+        run: python3 atom/mesh/proto/vendor_ext_proc.py --check
+
       # Nothing else builds the optional ext-proc feature or its protox
       # codegen; checking it, its tests included, keeps that path compiling.
       - name: Check atomesh with ext-proc
@@ -125,8 +130,8 @@ jobs:
             --target-dir atom/mesh/mocker/target/mesh \
             --profile ci --features ext-proc --tests
 
-      # KV events: following the engines' streams, the prefix index, and the routing and
-      # observability code it feeds.
+      # KV events: following the engines' streams, the prefix index, the shared store, and
+      # the routing and observability code they feed.
       - name: Test KV events
         run: |
           set -euo pipefail
@@ -134,7 +139,7 @@ jobs:
             --manifest-path atom/mesh/Cargo.toml \
             --target-dir atom/mesh/mocker/target/mesh \
             --profile ci --lib -- \
-            kv_events:: kv_index:: policies::cache_aware policies::registry \
+            kv_events:: kv_index:: kv_storage:: policies::cache_aware policies::registry \
             observability:: routers::prepare routers::ingress
           cargo test \
             --manifest-path atom/mesh/Cargo.toml \
