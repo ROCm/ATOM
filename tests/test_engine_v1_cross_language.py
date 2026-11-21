@@ -92,10 +92,10 @@ def core_messages() -> dict[str, list]:
     deep = SimpleNamespace(**vars(completion))
     deep.kv_transfer_params_output = deep_value()
     return {
-        "core_deep_completions": codec.encode_completions([deep]),
+        "core_deep_completions": codec.encode_completions([deep])[0],
         "core_ready": codec.encode_ready({"max_pool_tokens": 4096}),
         "core_stream": codec.encode_stream([(0, stream)]),
-        "core_completions": codec.encode_completions([completion]),
+        "core_completions": codec.encode_completions([completion])[0],
         "core_rejected": codec.encode_rejected([(0, "bad", codec.REJECT_INVALID)]),
         "core_stopped": codec.encode_stopped(),
     }

@@ -155,7 +155,7 @@ class OutputThreadStateTest(unittest.TestCase):
             thread.start()
             try:
                 seq = Sequence([1, 2], block_size=16, id=7)
-                sender.send_multipart(encode_completions([seq]))
+                sender.send_multipart(encode_completions([seq])[0])
                 sender.send_multipart(encode_stopped())
                 thread.join(timeout=3)
                 self.assertFalse(thread.is_alive())

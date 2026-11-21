@@ -698,21 +698,25 @@ def _encode_completion(seq, msg, writer: FrameWriter) -> None:
     msg.prefill_completed = seq.prefill_completed
 
 
-def encode_completions(seqs) -> list:
+def encode_completions(seqs) -> tuple[list | None, list]:
+    """`(frames, rejections)`: the Completions of `seqs` (None if none
+    encodes), and `encode_rejected`'s items for those that do not -- one item
+    must not drop the whole batch, and its client still hears why it ended."""
     writer = FrameWriter()
     envelope = pb.Envelope()
-    envelope.completions.SetInParent()
+    items = envelope.completions.items
+    rejections = []
     for seq in seqs:
-        msg = envelope.completions.items.add()
+        msg = items.add()
         try:
             _encode_completion(seq, msg, writer)
-        except Exception as exc:  # one item must not drop the whole batch
-            # Its tokens and params go; the sequence still ends, rejected.
+        except Exception as exc:
             logger.exception("seq %s's completion does not encode", seq.id)
-            msg.Clear()
-            msg.seq_id = seq.id
-            msg.leave_reason = f"{REJECTED_REASON}: {type(exc).__name__}: {exc}"
-    return writer.frames(envelope)
+            # What it wrote to the writer stays as unreferenced bytes.
+            del items[-1]
+            reason = f"completion not encodable: {type(exc).__name__}: {exc}"
+            rejections.append((seq.id, reason, REJECT_INTERNAL))
+    return (writer.frames(envelope) if items else None), rejections
 
 
 def encode_stream(outputs) -> list:

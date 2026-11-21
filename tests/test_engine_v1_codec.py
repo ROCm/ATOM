@@ -357,19 +357,42 @@ def finished_seq(seq_id, kv_output=None):
     return seq
 
 
+def completed(seqs):
+    """The Completions of `seqs`, as their client decodes them."""
+    frames, rejections = codec.encode_completions(seqs)
+    assert rejections == []
+    _, done = codec.decode_core_message(on_the_wire(frames))
+    return done
+
+
 def test_a_completion_that_does_not_encode_fails_alone():
     seqs = [finished_seq(1), finished_seq(2, {"x": Unpicklable()}), finished_seq(3)]
-    _, done = codec.decode_core_message(on_the_wire(codec.encode_completions(seqs)))
-    assert [d.id for d in done] == [1, 2, 3]
-    assert [d.leave_reason for d in done] == ["eos", done[1].leave_reason, "eos"]
-    assert done[1].leave_reason.startswith(f"{codec.REJECTED_REASON}: ")
-    assert [d.rejected for d in done] == [False, True, False]
-    assert list(done[2].completion_token_ids) == [4]
+    frames, rejections = codec.encode_completions(seqs)
+    _, done = codec.decode_core_message(on_the_wire(frames))
+    assert [d.id for d in done] == [1, 3]
+    assert [d.leave_reason for d in done] == ["eos", "eos"]
+    assert list(done[1].completion_token_ids) == [4]
+    # The other is a Rejected, with the reason it did not encode.
+    _, [rejected] = codec.decode_core_message(
+        on_the_wire(codec.encode_rejected(rejections))
+    )
+    assert rejected.id == 2 and rejected.rejected
+    assert rejected.leave_reason.startswith(f"{codec.REJECTED_REASON}: ")
+    assert "nope" in rejected.leave_reason
+    assert "frame" not in rejected.leave_reason
+    assert [code for *_, code in rejections] == [codec.REJECT_INTERNAL]
+
+
+def test_no_completion_encoding_leaves_no_completions_message():
+    frames, rejections = codec.encode_completions(
+        [finished_seq(2, {"x": Unpicklable()})]
+    )
+    assert frames is None and [r[0] for r in rejections] == [2]
 
 
 def test_a_completion_that_does_not_decode_fails_alone():
     seqs = [finished_seq(1), finished_seq(2, {"x": {1, 2}}), finished_seq(3)]
-    frames = codec.encode_completions(seqs)
+    frames, _ = codec.encode_completions(seqs)
     env = wire.decode_envelope(on_the_wire(frames))
     # Its pickled params point at a frame the message does not have.
     item = env.completions.items[1].kv_transfer_params_output
@@ -399,7 +422,7 @@ def test_a_completion_carries_what_a_client_reads():
     seq.arrive_time, seq.first_token_time, seq.leave_time = 1.0, 1.5, 2.0
     seq.kv_transfer_params_output = {"blocks": [1, 2]}
     seq.prefill_completed = True
-    _, [done] = codec.decode_core_message(on_the_wire(codec.encode_completions([seq])))
+    [done] = completed([seq])
     for name in (
         "return_logprobs",
         "num_prompt_tokens",

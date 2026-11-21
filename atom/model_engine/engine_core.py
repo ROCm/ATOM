@@ -1105,24 +1105,21 @@ class EngineCore:
                 num_valid = len(valid_seqs)
                 if num_valid > 0:
                     try:
-                        frames = encode_completions(valid_seqs)
+                        frames, rejections = encode_completions(valid_seqs)
                     except Exception as exc:
                         # Still end each request, or its client waits forever.
                         logger.exception(
                             f"{self.label}: cannot encode {num_valid} finished "
                             f"sequences; rejecting them"
                         )
-                        frames = encode_rejected(
-                            [
-                                (
-                                    seq.id,
-                                    f"output encoding failed: {exc}",
-                                    REJECT_INTERNAL,
-                                )
-                                for seq in valid_seqs
-                            ]
-                        )
-                    socket.send_multipart(frames, copy=False)
+                        frames, rejections = None, [
+                            (seq.id, f"output encoding failed: {exc}", REJECT_INTERNAL)
+                            for seq in valid_seqs
+                        ]
+                    if frames is not None:
+                        socket.send_multipart(frames, copy=False)
+                    if rejections:
+                        socket.send_multipart(encode_rejected(rejections), copy=False)
                     logger.info(f"{self.label}: output send {num_valid} reqs")
                 if len(valid_seqs) != len(seqs):
                     socket.send_multipart(encode_stopped(), copy=False)
