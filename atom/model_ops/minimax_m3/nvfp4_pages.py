@@ -126,3 +126,10 @@ class Nvfp4KvLayout:
             "kv", layer, torch.uint8, (-1, kv_page_bytes(pool.num_kv_heads))
         )
         return pages, pages
+
+    def head_runs(self, field: str, num_kv_heads: int) -> tuple[int, tuple[int, ...]]:
+        """The page's head-major runs for a P/D head cut: K data, K scales, V data,
+        V scales, each `num_kv_heads` heads of one width."""
+        if field != "kv":
+            raise ValueError(f"an NVFP4 KV pool has no field {field!r}")
+        return (num_kv_heads, (HEAD_DATA_BYTES, HEAD_SCALE_BYTES) * 2)
