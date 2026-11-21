@@ -486,6 +486,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_DS_QKNORM_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_DS_QKNORM_FUSION", "1") == "1"
     ),
+    # DeepSeek MLA: q_a + kv_a RMSNorm and q_b_proj's MXFP4 input quant in one aiter
+    # HIP launch (qkv_a_rmsnorm_fp4). Only on the unfused q/kv norm path with an
+    # MXFP4 32x4-scale q_b_proj and standard (not model-sensitive) RMSNorm.
+    "ATOM_DS_QKV_A_NORM_FP4": lambda: (os.getenv("ATOM_DS_QKV_A_NORM_FP4", "0") == "1"),
     # DeepSeek-V4/V4.1 shared expert: clamp + silu(gate)*up + FP8 quant in one
     # aiter triton kernel feeding w2. Ranks whose intermediate width is not a
     # multiple of 128 keep the unfused path.
