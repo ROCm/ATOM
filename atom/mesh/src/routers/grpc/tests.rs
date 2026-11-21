@@ -1753,3 +1753,77 @@ mod i_atom_refusals {
         }
     }
 }
+
+mod j_atom_stops {
+    use std::sync::Arc;
+
+    use axum::body::to_bytes;
+    use serde_json::{json, Value};
+
+    use crate::core::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType};
+    use crate::observability::metrics::metrics_labels;
+    use crate::routers::grpc::pipeline::Pipeline;
+    use crate::routers::test_mocks::{self, MockDispatcher, MockPdPlanner};
+    use crate::routers::token_handle::test_support::synthetic_single_stream;
+    use crate::routers::token_handle::token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta};
+
+    /// The text `/generate` answers when a `runtime` worker returns "test test test"
+    /// for a request whose stop string is "test".
+    async fn text(runtime: RuntimeType) -> String {
+        let worker = BasicWorkerBuilder::new("grpc://w:1")
+            .worker_type(WorkerType::Regular)
+            .connection_mode(ConnectionMode::Grpc { port: None })
+            .runtime_type(runtime)
+            .model_id("m")
+            .build();
+        let output = || {
+            Ok(synthetic_single_stream(vec![Ok(TokenChunk::Complete {
+                token_ids: vec![0, 0, 0],
+                finish_reason: FinishReason::Stop,
+                matched_stop: None,
+                usage: Usage {
+                    prompt_tokens: 1,
+                    completion_tokens: 3,
+                    total_tokens: 4,
+                },
+                logprobs: None,
+                input_logprobs: None,
+                meta: WorkerMeta {
+                    request_id: "req".to_string(),
+                    weight_version: None,
+                    cached_tokens: 0,
+                },
+            })]))
+        };
+        let pipeline = Pipeline::with_injected(
+            Arc::new(MockPdPlanner::repeat_single(Arc::new(worker), "random")),
+            Arc::new(MockDispatcher::repeat_with_stream(output)),
+            metrics_labels::BACKEND_REGULAR,
+        );
+        let body = json!({"model": "m", "text": "test", "sampling_params": {"stop": ["test"]}});
+        let request = Arc::new(serde_json::from_value(body).unwrap());
+        let ctx = test_mocks::app_context_with_hf_tokenizer("m");
+        let response = pipeline
+            .execute_generate(request, None, Some("m".to_string()), ctx)
+            .await;
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let answer: Value = serde_json::from_slice(&body).unwrap();
+        let answer = if answer.is_array() {
+            &answer[0]
+        } else {
+            &answer
+        };
+        answer["text"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn test_an_atom_output_keeps_what_atom_returned_past_a_stop_string() {
+        assert_eq!(text(RuntimeType::Atom).await, "test test test");
+    }
+
+    #[tokio::test]
+    async fn test_an_sglang_output_is_still_cut_at_its_stop_string() {
+        let sglang = text(RuntimeType::Sglang).await;
+        assert!(!sglang.contains("test"), "{sglang:?}");
+    }
+}
