@@ -877,6 +877,10 @@ class InputOutputProcessor:
         else:
             prefix_encoding = None
             tokens = prompt_or_tokens
+        # Checked on the tokens, not the text: "" encodes to [BOS] on Llama-3,
+        # which runs, and to nothing on Qwen3 or gpt-oss.
+        if len(tokens) == 0:
+            raise ValueError("The decoder prompt cannot be empty")
         mrope_positions = None
         mrope_position_delta = 0
         if multimodal_data is not None:
