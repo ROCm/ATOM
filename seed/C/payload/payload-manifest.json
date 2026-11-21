@@ -1,0 +1,45 @@
+{
+  "kind": "closed immutable C runtime payload",
+  "files": [
+    {
+      "file": "run_case.py",
+      "bytes": 23795,
+      "sha256": "56f20ad5294fbb82e38d8dfd5b3a85659a0fadd42720944d6902405a6f3af6b0"
+    },
+    {
+      "file": "evidence.py",
+      "bytes": 14655,
+      "sha256": "b13add8ec1324d682d6edd9f2fb81439997136c8d1cbac115c846259a05f4680"
+    },
+    {
+      "file": "prepare_inputs.py",
+      "bytes": 3846,
+      "sha256": "6e852485b077870060d316068d1b0655b89302d8cd46430eb4584034a6f18095"
+    },
+    {
+      "file": "lm_eval_receipt.sh",
+      "bytes": 226,
+      "sha256": "eee3c09fc661c729e476913948e43c5febe86b51353959156288d9decb88893d"
+    },
+    {
+      "file": "pins.json",
+      "bytes": 6596,
+      "sha256": "34e85e38fd8289d7787f084632d525c6a1c5f347b9989b801c0dfefcf5f7e153"
+    },
+    {
+      "file": "composition-manifest.json",
+      "bytes": 181058,
+      "sha256": "22b0f58a0e84f2d064710a5b61e8f770e8c9f72fe98939e7169c4bd74272054a"
+    },
+    {
+      "file": "tasks/gsm8k.yaml",
+      "bytes": 1111,
+      "sha256": "90601f3c3f82e35e8878cc76b3ac33b03bfd6a1bfa0a211e0eab6884fffd48af"
+    },
+    {
+      "file": "contract.json",
+      "bytes": 8471,
+      "sha256": "fbff356a42aa837228f9e9476cbf41fba3836b182498e707210759d4a28015d1"
+    }
+  ]
+}

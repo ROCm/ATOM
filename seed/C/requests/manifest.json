@@ -1,0 +1,21 @@
+{
+  "asset_manifest_sha256": "22b0f58a0e84f2d064710a5b61e8f770e8c9f72fe98939e7169c4bd74272054a",
+  "files": {
+    "300-1.json": "00f5623d57fea9a92379046589aec2a3fb7041f198ee48e94c257420e5d76486",
+    "300-32.json": "d97ba6469399abb4862c94a815a67c7efa1fb6fb5ed5e80cc34b3dab97f7fb4b",
+    "512-1.json": "3d4dd8d50df8cd1c560c589c76a11b0d8d493cee6291dc8766b5d237ddd63022",
+    "512-32.json": "cd0b93d113da0932afb2b8767adca7fde9ffc88490b82d23e1162afe7091e0ed",
+    "513-1.json": "f8f224e2e6ee52c0056f9f9cf1a62b4ae5dfc45cbf999dd2a4b292e6e814413c",
+    "513-32.json": "d1b8b951fc3f3f90e1ce0812f34f28dbae75e23d0d296ff81373137b77d82cf0",
+    "8192-1.json": "1786506fabb1798011e302690efd223d7f45a039441a42415685ac0f8cb05b6b",
+    "8193-1.json": "52f62b29693fd564ecb050735d67b9601a7bdfc9f9547f32f8fa55a4929b2457",
+    "population.json": "b60339375bdf539ae763f0fcba69a3748b0713b07358fc4b575ab02ea8021755"
+  },
+  "generator_sha256": "6e852485b077870060d316068d1b0655b89302d8cd46430eb4584034a6f18095",
+  "population": {
+    "test": 1319,
+    "train": 7473
+  },
+  "scope": "exact input IDs and dataset rows; generated-token IDs are not exposed by the native completion response",
+  "task_data_revision": "740312add88f781978c0658806c59bc2815b9866"
+}

@@ -1,0 +1,3072 @@
+{
+  "kind": "explicit private component composition; not a claimed HF download",
+  "created_epoch": 1795201990.0105922,
+  "root": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121",
+  "spec_sha256": "eeede2ed80b2075b99ea9413af88c6a7618a9017aa7cca03ac2fbec931cf7ef5",
+  "creator_sha256": "f1d8f033cc6484ed66eccd10229294853031594326b138c969c0620387a91988",
+  "views": [
+    {
+      "role": "target",
+      "path": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9",
+      "repo": "moonshotai/Kimi-K3.1-Pro",
+      "expected_component_revision": "d9e99b0792a5e93b78ea9bea62a68167e36ddd9e",
+      "original_local_revision": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+      "original_local_path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro",
+      "files": [
+        {
+          "name": ".gitattributes",
+          "kind": "copied nonweight",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.gitattributes",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.gitattributes",
+            "bytes": 1584,
+            "device": 49,
+            "inode": 10450512861332285256,
+            "mtime_ns": 1793816017835863043,
+            "ctime_ns": 1793815995439526639,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/.gitattributes",
+          "origin": {
+            "kind": "unchanged nonweight copied from original local revision",
+            "revision": "6d0a0202956796543364d666ab19c6ad1a494ee1"
+          },
+          "expected_git_blob": "495a7175bb7b0b48bd0ac67d86f3e0c900127a71",
+          "expected_lfs": null,
+          "actual_sha256": "c96667522371c060c119874628058a5d62f0277ab322a30f717a42b20c92204b",
+          "verification": "actual copied Git blob SHA1"
+        },
+        {
+          "name": "LICENSE",
+          "kind": "copied nonweight",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/LICENSE",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/LICENSE",
+            "bytes": 3077,
+            "device": 49,
+            "inode": 15300232747876597054,
+            "mtime_ns": 1793815973428042016,
+            "ctime_ns": 1793815995333224461,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/LICENSE",
+          "origin": {
+            "kind": "unchanged nonweight copied from original local revision",
+            "revision": "6d0a0202956796543364d666ab19c6ad1a494ee1"
+          },
+          "expected_git_blob": "5c475cf292f954769b0eb124d8610245c461fbb3",
+          "expected_lfs": null,
+          "actual_sha256": "da05c356f773d22a0e1c6de390f280304d7cee6eb56fa161aa789d30dedba63b",
+          "verification": "actual copied Git blob SHA1"
+        },
+        {
+          "name": "README.md",
+          "kind": "copied nonweight",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/README.md",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/README.md",
+            "bytes": 47653,
+            "device": 49,
+            "inode": 4030313254402622463,
+            "mtime_ns": 1793815993070935477,
+            "ctime_ns": 1793815996026073081,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/README.md",
+          "origin": {
+            "kind": "unchanged nonweight copied from original local revision",
+            "revision": "6d0a0202956796543364d666ab19c6ad1a494ee1"
+          },
+          "expected_git_blob": "b3fafebfedc31e08b85fabb3fb4bc310e350dae8",
+          "expected_lfs": null,
+          "actual_sha256": "5daa13793292c65cf198b2f4997c69a21378a1688c40c8b3dbdf48a27dd15085",
+          "verification": "actual copied Git blob SHA1"
+        },
+        {
+          "name": "assets/kimi-logo.png",
+          "kind": "copied nonweight",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/assets/kimi-logo.png",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/assets/kimi-logo.png",
+            "bytes": 87988,
+            "device": 49,
+            "inode": 2268766797541879262,
+            "mtime_ns": 1793815970017718777,
+            "ctime_ns": 1793815996104935671,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/assets/kimi-logo.png",
+          "origin": {
+            "kind": "unchanged nonweight copied from original local revision",
+            "revision": "6d0a0202956796543364d666ab19c6ad1a494ee1"
+          },
+          "expected_git_blob": "870b8be6e07cc2c46f7173e800fbaff8af0af5d1",
+          "expected_lfs": null,
+          "actual_sha256": "4a80f64242bf907940765adc7bcf340c28dd83334b07c5503792a26495d1933b",
+          "verification": "actual copied Git blob SHA1"
+        },
+        {
+          "name": "config.json",
+          "kind": "copied nonweight",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/config.json",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/config.json",
+            "bytes": 7303,
+            "device": 49,
+            "inode": 15761050434534817566,
+            "mtime_ns": 1793816017587341812,
+            "ctime_ns": 1793815995327969011,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/config.json",
+          "origin": {
+            "kind": "unchanged nonweight copied from original local revision",
+            "revision": "6d0a0202956796543364d666ab19c6ad1a494ee1"
+          },
+          "expected_git_blob": "f0fead8a6a9b5408e9df4479e67dcb2acd0a7bb8",
+          "expected_lfs": null,
+          "actual_sha256": "d95037631e3f23bf527a9f476f25209b231b46853a84877b9c56d5672b8d1202",
+          "verification": "actual copied Git blob SHA1"
+        },
+        {
+          "name": "configuration_kimi_k3.py",
+          "kind": "copied nonweight",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/configuration_kimi_k3.py",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/configuration_kimi_k3.py",
+            "bytes": 11414,
+            "device": 49,
+            "inode": 7286541351858675173,
+            "mtime_ns": 1793815995992033748,
+            "ctime_ns": 1793815996006158500,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/configuration_kimi_k3.py",
+          "origin": {
+            "kind": "unchanged nonweight copied from original local revision",
+            "revision": "6d0a0202956796543364d666ab19c6ad1a494ee1"
+          },
+          "expected_git_blob": "03c69116f0a839286af100df529969b4a9dca90d",
+          "expected_lfs": null,
+          "actual_sha256": "7156d9489ee9bf14ac4c5e9410bfa0f9679f5831a26bf6d007296f14e90ab329",
+          "verification": "actual copied Git blob SHA1"
+        },
+        {
+          "name": "encoding_k3.py",
+          "kind": "copied nonweight",
+          "source": {
+            "path": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/input/encoding_k3-d9.py",
+            "resolved": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/input/encoding_k3-d9.py",
+            "bytes": 26301,
+            "device": 58,
+            "inode": 42246835969,
+            "mtime_ns": 1795201986288193148,
+            "ctime_ns": 1795201986288193148,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/encoding_k3.py",
+          "origin": {
+            "kind": "verified small-file override",
+            "source": "C:\\Users\\hexwang\\Documents\\Codex\\2026-11-18\\host-tw-355-jump-x20-hostname\\work\\3501-owner-local-model-comparison\\encoding-source\\encoding_k3-d9.py"
+          },
+          "expected_git_blob": "e476b04e74f9305741aa16395371f98165e4ac44",
+          "expected_lfs": null,
+          "actual_sha256": "367f0a7ab8800f78f7e09dc31e58544ee7fc46eea992ea05b32d53506a921cc5",
+          "verification": "actual copied Git blob SHA1"
+        },
+        {
+          "name": "generation_config.json",
+          "kind": "copied nonweight",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/generation_config.json",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/generation_config.json",
+            "bytes": 53,
+            "device": 49,
+            "inode": 15871615942600682060,
+            "mtime_ns": 1793815996000958269,
+            "ctime_ns": 1793815996020579275,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/generation_config.json",
+          "origin": {
+            "kind": "unchanged nonweight copied from original local revision",
+            "revision": "6d0a0202956796543364d666ab19c6ad1a494ee1"
+          },
+          "expected_git_blob": "3908a4a5477122aa4b09386acab760fb7887c0fc",
+          "expected_lfs": null,
+          "actual_sha256": "c6648c25e9705af7fba8847e243840d21b5cc63ddeb6297f750a7ddbb6a02836",
+          "verification": "actual copied Git blob SHA1"
+        },
+        {
+          "name": "kimi_k3_processor.py",
+          "kind": "copied nonweight",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/kimi_k3_processor.py",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/kimi_k3_processor.py",
+            "bytes": 7660,
+            "device": 49,
+            "inode": 15552444149651642435,
+            "mtime_ns": 1793815995335003238,
+            "ctime_ns": 1793815995357849263,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/kimi_k3_processor.py",
+          "origin": {
+            "kind": "unchanged nonweight copied from original local revision",
+            "revision": "6d0a0202956796543364d666ab19c6ad1a494ee1"
+          },
+          "expected_git_blob": "033a5773885c144509788e89a445217b76d6c046",
+          "expected_lfs": null,
+          "actual_sha256": "ec9f7e86d2ab0eee07a8e7e7c037046e77ac3c25a710ad1298ec13be3b585b54",
+          "verification": "actual copied Git blob SHA1"
+        },
+        {
+          "name": "kimi_k3_vision_processing.py",
+          "kind": "copied nonweight",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/kimi_k3_vision_processing.py",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/kimi_k3_vision_processing.py",
+            "bytes": 6686,
+            "device": 49,
+            "inode": 13291522022933293123,
+            "mtime_ns": 1793815983390949513,
+            "ctime_ns": 1793815995344384629,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/kimi_k3_vision_processing.py",
+          "origin": {
+            "kind": "unchanged nonweight copied from original local revision",
+            "revision": "6d0a0202956796543364d666ab19c6ad1a494ee1"
+          },
+          "expected_git_blob": "58154424ff951289570c8fb5578e7372bfbfaa8b",
+          "expected_lfs": null,
+          "actual_sha256": "d122b30bfd3a51a6f05d4bfcfda1e657827322b1353f7caefeebc2835d7736b5",
+          "verification": "actual copied Git blob SHA1"
+        },
+        {
+          "name": "media_utils.py",
+          "kind": "copied nonweight",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/media_utils.py",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/media_utils.py",
+            "bytes": 13844,
+            "device": 49,
+            "inode": 8247559808884417181,
+            "mtime_ns": 1793816008173687554,
+            "ctime_ns": 1793815995417116025,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/media_utils.py",
+          "origin": {
+            "kind": "unchanged nonweight copied from original local revision",
+            "revision": "6d0a0202956796543364d666ab19c6ad1a494ee1"
+          },
+          "expected_git_blob": "e8b2ae127e254e364e6b568b1093a7e12ac576e0",
+          "expected_lfs": null,
+          "actual_sha256": "78403540328f9847d6b7ebc5c44eb2e6a752863de0afb7d0710728bb161dc60d",
+          "verification": "actual copied Git blob SHA1"
+        },
+        {
+          "name": "model-00001-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00001-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00001-of-000096.safetensors",
+            "bytes": 2341216112,
+            "device": 49,
+            "inode": 12707106949675451991,
+            "mtime_ns": 1793816010217308146,
+            "ctime_ns": 1793816028116157577,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00001-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00001-of-000096.safetensors",
+          "expected_git_pointer_blob": "915195d127790b770b422d378aacd7a169efc1c8",
+          "expected_lfs_sha256": "7f60e41909fb16712100c311ca4402cc4e66ecc9dff9dad4ebc06f05106c58a1",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00001-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "7f60e41909fb16712100c311ca4402cc4e66ecc9dff9dad4ebc06f05106c58a1",
+            "metadata_sha256": "50810b05abbd9e970ee50d1d2b28571c14d21ce2af2ad221d621882ced3701c4"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00002-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00002-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00002-of-000096.safetensors",
+            "bytes": 16990911504,
+            "device": 49,
+            "inode": 13358117221312901170,
+            "mtime_ns": 1793816076661119866,
+            "ctime_ns": 1793816094596229647,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00002-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00002-of-000096.safetensors",
+          "expected_git_pointer_blob": "caa0d8c8d58f4885fceffad1525d519654045cdc",
+          "expected_lfs_sha256": "3896d0f0d987abeb75f90ff0c047b9fb7faf3ff39a6e31cbd49a1358f48b7ffa",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00002-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "3896d0f0d987abeb75f90ff0c047b9fb7faf3ff39a6e31cbd49a1358f48b7ffa",
+            "metadata_sha256": "4ead03f87be42d75b910806ef60d23fd9b73f01af5134a80b784809d208992f6"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00003-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00003-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00003-of-000096.safetensors",
+            "bytes": 16990911504,
+            "device": 49,
+            "inode": 2704744865244983125,
+            "mtime_ns": 1793816059314726822,
+            "ctime_ns": 1793816071363222186,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00003-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00003-of-000096.safetensors",
+          "expected_git_pointer_blob": "5923adb6829cbb211981bc9f4bebbc9f697c9041",
+          "expected_lfs_sha256": "8db356979d0b5e4fdf16f13d56edee900261cc59d81395e498a52847518abf4c",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00003-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "8db356979d0b5e4fdf16f13d56edee900261cc59d81395e498a52847518abf4c",
+            "metadata_sha256": "55eb463ee6e198eee4fb081d5b88cd1d831706841b0d0b2247f7eaf7bddb3b3f"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00004-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00004-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00004-of-000096.safetensors",
+            "bytes": 16582379656,
+            "device": 49,
+            "inode": 11115195966563700029,
+            "mtime_ns": 1793816051778382931,
+            "ctime_ns": 1793816073718880153,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00004-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00004-of-000096.safetensors",
+          "expected_git_pointer_blob": "a41d13831d06bcd178f2a7f1d9722ef9617bea24",
+          "expected_lfs_sha256": "01ca3a36220afc36a9f2891045c8c9d0e64fc2cd08fffe1b3851e24bd2a93a40",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00004-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "01ca3a36220afc36a9f2891045c8c9d0e64fc2cd08fffe1b3851e24bd2a93a40",
+            "metadata_sha256": "38c0105199dbe2f9de1592033f8f3535cfb757217e14c35fea565aaa42777304"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00005-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00005-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00005-of-000096.safetensors",
+            "bytes": 16990911504,
+            "device": 49,
+            "inode": 13589081938812112547,
+            "mtime_ns": 1793816068937406216,
+            "ctime_ns": 1793816099251101784,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00005-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00005-of-000096.safetensors",
+          "expected_git_pointer_blob": "c60b14427e24bc2fd55039958f5e40af20339a9c",
+          "expected_lfs_sha256": "596fc235fe92c9656cbbd63eb719cd46f68b19e22d792224ef307c156f699682",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00005-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "596fc235fe92c9656cbbd63eb719cd46f68b19e22d792224ef307c156f699682",
+            "metadata_sha256": "d88fd7ae696ae06eb9d756c33b8566ce9b76836b5bb43fd1226167f2ec080473"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00006-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00006-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00006-of-000096.safetensors",
+            "bytes": 16990911504,
+            "device": 49,
+            "inode": 12155069962395760369,
+            "mtime_ns": 1793816071502200357,
+            "ctime_ns": 1793816089434541012,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00006-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00006-of-000096.safetensors",
+          "expected_git_pointer_blob": "dc351ad3768d64ea5469a18c09aef85ce96c2ad9",
+          "expected_lfs_sha256": "a9f6a9d6682b2f5177553b9986bdc0774fe84a2181b76a6b7d7482de0ecf049b",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00006-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "a9f6a9d6682b2f5177553b9986bdc0774fe84a2181b76a6b7d7482de0ecf049b",
+            "metadata_sha256": "f137a9bf7cd4caba6783593b3d6d94a85529d32344d98c36c3f4ddd6f6d2525c"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00007-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00007-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00007-of-000096.safetensors",
+            "bytes": 16990911504,
+            "device": 49,
+            "inode": 103854581451908738,
+            "mtime_ns": 1793816077350743856,
+            "ctime_ns": 1793816099313545086,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00007-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00007-of-000096.safetensors",
+          "expected_git_pointer_blob": "2c5ce848549d840763a2496b6d7054beec612b91",
+          "expected_lfs_sha256": "ea268a3cb5978f50079ffd111d78d785bdd313fb9c7dafda8df0d841daeba4ab",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00007-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "ea268a3cb5978f50079ffd111d78d785bdd313fb9c7dafda8df0d841daeba4ab",
+            "metadata_sha256": "5b2cfbd55f911029343bfa55da10b04e28dae403353fafcd5b76a7485003da81"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00008-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00008-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00008-of-000096.safetensors",
+            "bytes": 16582379656,
+            "device": 49,
+            "inode": 5477026130094529342,
+            "mtime_ns": 1793816071518338398,
+            "ctime_ns": 1793816097629748389,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00008-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00008-of-000096.safetensors",
+          "expected_git_pointer_blob": "9443003eb1f601c00fd7dfc421b52fd85048b21f",
+          "expected_lfs_sha256": "e514e45c4a17a187657fbcd1d4f9eb6a0c33bcdbbe54049da391ed54ce57f60f",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00008-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "e514e45c4a17a187657fbcd1d4f9eb6a0c33bcdbbe54049da391ed54ce57f60f",
+            "metadata_sha256": "672c7471451e7a936c7017cd07245cab93f45712d07814faeab92bdba64f10e9"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00009-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00009-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00009-of-000096.safetensors",
+            "bytes": 16990911504,
+            "device": 49,
+            "inode": 13423266053759807811,
+            "mtime_ns": 1793818340523555035,
+            "ctime_ns": 1793816092586289694,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00009-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00009-of-000096.safetensors",
+          "expected_git_pointer_blob": "1184a9828cec3602a3ede39983324ba7c4f03c03",
+          "expected_lfs_sha256": "c5f9adff3d853bcf1e14c27bca0f1a74de985e7afb3149acd00eb2de3732ca12",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00009-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "c5f9adff3d853bcf1e14c27bca0f1a74de985e7afb3149acd00eb2de3732ca12",
+            "metadata_sha256": "bd9b9e13fdd5bb6708e9b29d81a7b0fb3b763fc128c1949bdc62ba55752bca95"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00010-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00010-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00010-of-000096.safetensors",
+            "bytes": 16990911504,
+            "device": 49,
+            "inode": 14705035449535303497,
+            "mtime_ns": 1793816123052516753,
+            "ctime_ns": 1793816123086559165,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00010-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00010-of-000096.safetensors",
+          "expected_git_pointer_blob": "115714b3ac00457c1ea49a7b66ef0f50dfa3586b",
+          "expected_lfs_sha256": "ee9b1762da09dad17d6f8a22732645b070149266c40c3ae1e8ee90f48fec6742",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00010-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "ee9b1762da09dad17d6f8a22732645b070149266c40c3ae1e8ee90f48fec6742",
+            "metadata_sha256": "33ac105a3cbc16fa74248ea9cdc88b7ec09b76bde1b14e2706b9071ad80f14e1"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00011-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00011-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00011-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 608408426267234829,
+            "mtime_ns": 1793816152632208374,
+            "ctime_ns": 1793816130256680423,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00011-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00011-of-000096.safetensors",
+          "expected_git_pointer_blob": "070ecd98ebd8909658becb909eca90e074c6c770",
+          "expected_lfs_sha256": "0bb52ff6b774c289888854203726e0cd955fc650dda2f5cf9e4f825037f4af72",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00011-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "0bb52ff6b774c289888854203726e0cd955fc650dda2f5cf9e4f825037f4af72",
+            "metadata_sha256": "1d419f71a1aeff04432e7ece646412d066e6283d07b2895ec6341549bd1c240a"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00012-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00012-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00012-of-000096.safetensors",
+            "bytes": 16582385056,
+            "device": 49,
+            "inode": 5493639105501506945,
+            "mtime_ns": 1793816151287892888,
+            "ctime_ns": 1793816163298246719,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00012-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00012-of-000096.safetensors",
+          "expected_git_pointer_blob": "cfe4508ee88689cb10b81b87b9e636919b9085c5",
+          "expected_lfs_sha256": "2c2c9be2d6b722d75bec065e545826a88a8839b8100766442e7f476143e7ba44",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00012-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "2c2c9be2d6b722d75bec065e545826a88a8839b8100766442e7f476143e7ba44",
+            "metadata_sha256": "688ac6cb3f5c87b8028117422d0ab5a9c896d58a8df6fb69a0b94c7a7c476ebc"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00013-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00013-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00013-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 1271197355972289363,
+            "mtime_ns": 1793816172788514077,
+            "ctime_ns": 1793816175792914323,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00013-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00013-of-000096.safetensors",
+          "expected_git_pointer_blob": "8d38532f7b4c026408c3e0897cd5a8102da6efeb",
+          "expected_lfs_sha256": "bbf5db5833f4607cd201156229aa7f05183f70f2ffd2cf0ca8a6d781ee7f139c",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00013-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "bbf5db5833f4607cd201156229aa7f05183f70f2ffd2cf0ca8a6d781ee7f139c",
+            "metadata_sha256": "81b828170d5d3088525d47d352d7774d75385be6fd279d4688c3fa250e8f2c83"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00014-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00014-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00014-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 1449085145022978880,
+            "mtime_ns": 1793816160286538207,
+            "ctime_ns": 1793816172301811647,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00014-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00014-of-000096.safetensors",
+          "expected_git_pointer_blob": "30178ca8d49cf142c5b01c28de50c1ac50775dd0",
+          "expected_lfs_sha256": "5f412b94c799903bc4b3694e662e6ef342bcc3712a3108a63b157bef16ec59df",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00014-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "5f412b94c799903bc4b3694e662e6ef342bcc3712a3108a63b157bef16ec59df",
+            "metadata_sha256": "d96af5ded486cf192bcfaa28b77d55987ab8758a57f5216bf1dd89561407b8d9"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00015-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00015-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00015-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 8012451829117541284,
+            "mtime_ns": 1793816163188618285,
+            "ctime_ns": 1793816185148651002,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00015-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00015-of-000096.safetensors",
+          "expected_git_pointer_blob": "c92dde5fbfb37d079a90230c9d6d9219771310fe",
+          "expected_lfs_sha256": "28e678ecfc2286eb86aa6dfe20df03bd7c8873b34d96f0b230d1aab64365a889",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00015-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "28e678ecfc2286eb86aa6dfe20df03bd7c8873b34d96f0b230d1aab64365a889",
+            "metadata_sha256": "18e312f31a1217d8efa422ef8e88a1b3c2f577cc55f79791cc8090e645820e4d"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00016-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00016-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00016-of-000096.safetensors",
+            "bytes": 16582385056,
+            "device": 49,
+            "inode": 8752800163146387413,
+            "mtime_ns": 1793816173379802397,
+            "ctime_ns": 1793816176382006247,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00016-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00016-of-000096.safetensors",
+          "expected_git_pointer_blob": "1bb42c54a307e652c1e0780379ef1e0f65ae3d4a",
+          "expected_lfs_sha256": "896fd658f4cddad15eaca16ed54471ad265ad73d48d291bb4bb792767dc4d617",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00016-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "896fd658f4cddad15eaca16ed54471ad265ad73d48d291bb4bb792767dc4d617",
+            "metadata_sha256": "c26756941203e034fd077ad0604390671a7b9f4529a30263e7c113e2827d46b0"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00017-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00017-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00017-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 16604722533667945814,
+            "mtime_ns": 1793818427699710536,
+            "ctime_ns": 1793816179716144739,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00017-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00017-of-000096.safetensors",
+          "expected_git_pointer_blob": "4a64c300f9188ae18c508d92a45ee04d0f39e402",
+          "expected_lfs_sha256": "4b82b33835679910ad9f87ec4662e38f8dc111421fb2a56f538cec5be6c55b74",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00017-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "4b82b33835679910ad9f87ec4662e38f8dc111421fb2a56f538cec5be6c55b74",
+            "metadata_sha256": "6b7dc378f7a2142a1be4d312b4fb541e1bc4d36d8ced2cd7ff44d4246434c964"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00018-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00018-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00018-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 14610727850517378723,
+            "mtime_ns": 1793816158647569806,
+            "ctime_ns": 1793816187873000525,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00018-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00018-of-000096.safetensors",
+          "expected_git_pointer_blob": "085264e1b06aae235e67623f5102f928f73be736",
+          "expected_lfs_sha256": "db91d8251d9bc0f47e31fc18955e8428a6a1fa25460a5e54578e4b261660e3ef",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00018-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "db91d8251d9bc0f47e31fc18955e8428a6a1fa25460a5e54578e4b261660e3ef",
+            "metadata_sha256": "f6217646954a726717c2d28dcf584178ace430d4e046a710187087ab792cbc6f"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00019-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00019-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00019-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 4951956748734745204,
+            "mtime_ns": 1793816212963893470,
+            "ctime_ns": 1793816190585030132,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00019-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00019-of-000096.safetensors",
+          "expected_git_pointer_blob": "86b85b296e3ffde3537e487d9b0cd1777606cf0a",
+          "expected_lfs_sha256": "281ef055e54eff0c8ffacdf886e983ff27de43d002abf9aa97b663e9a3ae9ee7",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00019-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "281ef055e54eff0c8ffacdf886e983ff27de43d002abf9aa97b663e9a3ae9ee7",
+            "metadata_sha256": "200af9cba98746bcd2e241c0d8921ff6713f6c969cdc7b495bb1bb5028be9efc"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00020-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00020-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00020-of-000096.safetensors",
+            "bytes": 16582385056,
+            "device": 49,
+            "inode": 16556025229538189133,
+            "mtime_ns": 1793816237664181043,
+            "ctime_ns": 1793816215425794388,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00020-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00020-of-000096.safetensors",
+          "expected_git_pointer_blob": "042e36606bf80943365de095ec2d7378dc34fb91",
+          "expected_lfs_sha256": "783cbb7d6056c0ad3f32b8f1c10c20e6b2d7e5356e0cfd6ce6123f43d3648e60",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00020-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "783cbb7d6056c0ad3f32b8f1c10c20e6b2d7e5356e0cfd6ce6123f43d3648e60",
+            "metadata_sha256": "503e2add9d2658f99d19f2fa8c88da7b953fb3f797038547537d497eb184e4c2"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00021-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00021-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00021-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 13901587624530160172,
+            "mtime_ns": 1793816234056051458,
+            "ctime_ns": 1793816243971399734,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00021-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00021-of-000096.safetensors",
+          "expected_git_pointer_blob": "d766e547f49fa209dce1d22ff00f424329d2952a",
+          "expected_lfs_sha256": "9774e732cae20192427c8777f79bd9a9fb7c9ef3bc71c2784a2f72e891e1b51e",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00021-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "9774e732cae20192427c8777f79bd9a9fb7c9ef3bc71c2784a2f72e891e1b51e",
+            "metadata_sha256": "72215949a81f6a062feb7293124584b859e62203f081a0b8c3490438ac8fe379"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00022-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00022-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00022-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 11325608921855482110,
+            "mtime_ns": 1793816229691614534,
+            "ctime_ns": 1793816252652744682,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00022-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00022-of-000096.safetensors",
+          "expected_git_pointer_blob": "3b7bc10aeb41c46fbb50fc9485f0978d39729697",
+          "expected_lfs_sha256": "5e3f0905780d988b0fcb974479731e751f8bed319e22224f5f9d0ec76b1b755e",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00022-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "5e3f0905780d988b0fcb974479731e751f8bed319e22224f5f9d0ec76b1b755e",
+            "metadata_sha256": "a4e2a6672b76b102439729313c2f97a59f7f54e4b9fd9eb9fd454292855bbe26"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00023-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00023-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00023-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 9732275827755333144,
+            "mtime_ns": 1793818506861403629,
+            "ctime_ns": 1793816258864133188,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00023-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00023-of-000096.safetensors",
+          "expected_git_pointer_blob": "ddbad2bbc43a2b3cd0584d75087da6c389e95e30",
+          "expected_lfs_sha256": "69940e5bde762834f2731401194a8fb2c2784274890bd6d23e0c0aca91383451",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00023-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "69940e5bde762834f2731401194a8fb2c2784274890bd6d23e0c0aca91383451",
+            "metadata_sha256": "01d3a9ee4786db49f614a15a28be55fdb2b5206e4b54913e1a3844d9d73fd096"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00024-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00024-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00024-of-000096.safetensors",
+            "bytes": 16582385056,
+            "device": 49,
+            "inode": 8267142809687930199,
+            "mtime_ns": 1793818510479628015,
+            "ctime_ns": 1793816262470906594,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00024-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00024-of-000096.safetensors",
+          "expected_git_pointer_blob": "16b53ad8349b30543a3a26653538d290495e725c",
+          "expected_lfs_sha256": "f48efe6ad27d75b51564a3de48ab312ee7c06969db35d7b2b764d9515c00b0a7",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00024-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "f48efe6ad27d75b51564a3de48ab312ee7c06969db35d7b2b764d9515c00b0a7",
+            "metadata_sha256": "39ade586610065b428fdc972adda1273713d96f7d0466050dd6b79b47359a6ee"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00025-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00025-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00025-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 1691268946184608630,
+            "mtime_ns": 1793816243897190532,
+            "ctime_ns": 1793816261830682993,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00025-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00025-of-000096.safetensors",
+          "expected_git_pointer_blob": "9311d479c792aea2706e8c989cdf04878fa95f61",
+          "expected_lfs_sha256": "833a0f761b2944cde386def5bdb7dabbfdf30f2927dd26304d0f7723b4ff018c",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00025-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "833a0f761b2944cde386def5bdb7dabbfdf30f2927dd26304d0f7723b4ff018c",
+            "metadata_sha256": "225faf0f0f6ce330d7594dedf29270adfc2f9202d071845a35e0a110427939e6"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00026-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00026-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00026-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 15773641580461610993,
+            "mtime_ns": 1793816252648513698,
+            "ctime_ns": 1793816265162226235,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00026-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00026-of-000096.safetensors",
+          "expected_git_pointer_blob": "78a74dafba3936aa6eb975507f88bbdb3d74f1b9",
+          "expected_lfs_sha256": "02bff688e36ec90942dcb3ece1bfc7f102fd3c78bffdabba79fd4ec4bedb9230",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00026-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "02bff688e36ec90942dcb3ece1bfc7f102fd3c78bffdabba79fd4ec4bedb9230",
+            "metadata_sha256": "ffcd3f5c2de21b94fd5e908e83395ee4691e4fa8cfb367b109f005c465e870e1"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00027-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00027-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00027-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 12789793734612848439,
+            "mtime_ns": 1793816243261666602,
+            "ctime_ns": 1793816265225416283,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00027-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00027-of-000096.safetensors",
+          "expected_git_pointer_blob": "36d5494da4144c9ed69fa381dad3415972755630",
+          "expected_lfs_sha256": "4fe3e6f06b9c341d06eee45c0add2c7f8aff48a4c48bdcd97130c48c91b93202",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00027-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "4fe3e6f06b9c341d06eee45c0add2c7f8aff48a4c48bdcd97130c48c91b93202",
+            "metadata_sha256": "5b30ed2f2a8b5b66c2a2d435210cd7d597d7218c88d84194848e5d3caed6cafc"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00028-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00028-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00028-of-000096.safetensors",
+            "bytes": 16582385056,
+            "device": 49,
+            "inode": 7504766241087385191,
+            "mtime_ns": 1793816244605818346,
+            "ctime_ns": 1793816273795299302,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00028-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00028-of-000096.safetensors",
+          "expected_git_pointer_blob": "0b121db6f8353eb22b63996de8bb0da0c542b7d8",
+          "expected_lfs_sha256": "832b28d66ea0c9bca4b42c8b206463b3f8fa8cafd13d4118911604351c27dc22",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00028-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "832b28d66ea0c9bca4b42c8b206463b3f8fa8cafd13d4118911604351c27dc22",
+            "metadata_sha256": "1ecd7a047a8b6b372ce1fea8d068a3817b3f8948fcfa2c0cb0284999d7b84f12"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00029-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00029-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00029-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 8835118996056015873,
+            "mtime_ns": 1793816303057546005,
+            "ctime_ns": 1793816303094684538,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00029-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00029-of-000096.safetensors",
+          "expected_git_pointer_blob": "e99a3394f229e3b5f99a53a30d554ddf5182838b",
+          "expected_lfs_sha256": "bf8f4f4f10a3cbf72d95851232c17d20c58d44f024a8c4e421b344cb0f871659",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00029-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "bf8f4f4f10a3cbf72d95851232c17d20c58d44f024a8c4e421b344cb0f871659",
+            "metadata_sha256": "f9059b36839bdfe7524646d58e700ce34404014d9c1c8549415a959909c882ce"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00030-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00030-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00030-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 13046521095065954381,
+            "mtime_ns": 1793816336482931326,
+            "ctime_ns": 1793816314157014401,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00030-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00030-of-000096.safetensors",
+          "expected_git_pointer_blob": "4a0ecad424cd669f89cd38e5670850c86f604316",
+          "expected_lfs_sha256": "a974612d9f6300e9a86eb882e2c6dbad2446d491e15289b576acd015f1f69928",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00030-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "a974612d9f6300e9a86eb882e2c6dbad2446d491e15289b576acd015f1f69928",
+            "metadata_sha256": "05a72a01af7f5fb12e495279a7d7420dadd64a83f3c617864ba0360651c7dcbd"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00031-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00031-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00031-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 5707993027291278579,
+            "mtime_ns": 1793816303521588574,
+            "ctime_ns": 1793816332750369186,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00031-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00031-of-000096.safetensors",
+          "expected_git_pointer_blob": "a1f2bbeac6d11e85052e359e4a23252ee8c45ea0",
+          "expected_lfs_sha256": "aa227f8eddaf25975915e8a161446fb042e1db7bb176aafd29d4953f01a4e2dd",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00031-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "aa227f8eddaf25975915e8a161446fb042e1db7bb176aafd29d4953f01a4e2dd",
+            "metadata_sha256": "31df51fd046e6a85af38c507439a5efd07c100d68c68467fb8dc4e7f2bf3af15"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00032-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00032-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00032-of-000096.safetensors",
+            "bytes": 16582385056,
+            "device": 49,
+            "inode": 12866288145884648288,
+            "mtime_ns": 1793816313702422403,
+            "ctime_ns": 1793816336666020876,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00032-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00032-of-000096.safetensors",
+          "expected_git_pointer_blob": "6805b7592bcbb3cd4c96700305171d796b0ab0d0",
+          "expected_lfs_sha256": "4520a3321b8fd7e3f7da7c29afc084802af2f1498f8c96e5103fe4476b204957",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00032-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "4520a3321b8fd7e3f7da7c29afc084802af2f1498f8c96e5103fe4476b204957",
+            "metadata_sha256": "b958e6fe822f5d0fe3fd8ca1c4e6228779083e9fc49c1aeabad373997ff71965"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00033-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00033-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00033-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 17927847156768890107,
+            "mtime_ns": 1793816323199705260,
+            "ctime_ns": 1793816341135064578,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00033-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00033-of-000096.safetensors",
+          "expected_git_pointer_blob": "7fcd4b2b93051b993f7e3c42896cf71040f0e23d",
+          "expected_lfs_sha256": "32a8f004afb58539f28fe5333fef3e1604c60f2113bbe2e173c99502a0f0cd89",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00033-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "32a8f004afb58539f28fe5333fef3e1604c60f2113bbe2e173c99502a0f0cd89",
+            "metadata_sha256": "abb0963bb18ba34a997105b5cb7d6fa7e523b9689570916b8f8737f2dc9836d9"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00034-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00034-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00034-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 8573301966799220526,
+            "mtime_ns": 1793816313590483510,
+            "ctime_ns": 1793816335555163619,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00034-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00034-of-000096.safetensors",
+          "expected_git_pointer_blob": "bc129bad74be639939d9c870031d5cf1d027ceb9",
+          "expected_lfs_sha256": "4310c7808e7bf72506168fc1e521852ee95da94c6ee2f6ee6b8fa6b800c559c8",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00034-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "4310c7808e7bf72506168fc1e521852ee95da94c6ee2f6ee6b8fa6b800c559c8",
+            "metadata_sha256": "a6edc5dcaa799e409597e7e027fd7af2df9a4198880fc8f567e5076c71d3c3cb"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00035-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00035-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00035-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 3888016741220057419,
+            "mtime_ns": 1793816333820919259,
+            "ctime_ns": 1793816336822685445,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00035-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00035-of-000096.safetensors",
+          "expected_git_pointer_blob": "0f1bf76673d52da95a941ad1f3c92accb5718228",
+          "expected_lfs_sha256": "5ba50bc47a6b48c057208b7e2ea5aaccb6e8ce27041402e469cbb18661858ce2",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00035-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "5ba50bc47a6b48c057208b7e2ea5aaccb6e8ce27041402e469cbb18661858ce2",
+            "metadata_sha256": "027080393cc1f82778a6cebfc5938942aab8489ba475cc2e4460fb2f1920cdee"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00036-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00036-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00036-of-000096.safetensors",
+            "bytes": 16582385056,
+            "device": 49,
+            "inode": 10019692679408953383,
+            "mtime_ns": 1793816360482477670,
+            "ctime_ns": 1793816341077495053,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00036-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00036-of-000096.safetensors",
+          "expected_git_pointer_blob": "29809a6aa3e9d8cccd825931d67ed87aab7f4304",
+          "expected_lfs_sha256": "5a64e3f0e0988dda1e568fcbf37d4f0a03493e536daff572a8d8378442ef26ec",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00036-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "5a64e3f0e0988dda1e568fcbf37d4f0a03493e536daff572a8d8378442ef26ec",
+            "metadata_sha256": "3ee430fc6d20e91bffcca3557abab8a8bff3bb91c641017c878706a981efa1fc"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00037-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00037-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00037-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 6942408472807414576,
+            "mtime_ns": 1793816330126679950,
+            "ctime_ns": 1793816348022870606,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00037-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00037-of-000096.safetensors",
+          "expected_git_pointer_blob": "54ae643e07c436b92e12ab48abc242a5aa92168d",
+          "expected_lfs_sha256": "43ab18d28759e45ba316e03423b2c0d447ebc7f8ffea7972c4634a7630349262",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00037-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "43ab18d28759e45ba316e03423b2c0d447ebc7f8ffea7972c4634a7630349262",
+            "metadata_sha256": "9119858c0d12d36d8cd6765e7a878eb285cf392c62f33fa874e2d0e72b04406c"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00038-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00038-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00038-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 5860215986262249040,
+            "mtime_ns": 1793818600029010216,
+            "ctime_ns": 1793816351954859445,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00038-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00038-of-000096.safetensors",
+          "expected_git_pointer_blob": "2f7d2974f295133fe852453fe8c940acba59c7ef",
+          "expected_lfs_sha256": "a518377eff993b5b0b0337296072bb32a3ed249776b0c1459aaef20f9749fcf1",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00038-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "a518377eff993b5b0b0337296072bb32a3ed249776b0c1459aaef20f9749fcf1",
+            "metadata_sha256": "463f0c6724452bde8e24f5ec75adcdc7aa725590ac3f9d0b2a5b345f63c267bf"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00039-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00039-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00039-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 17700814758885312963,
+            "mtime_ns": 1793818639138179774,
+            "ctime_ns": 1793816391072642928,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00039-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00039-of-000096.safetensors",
+          "expected_git_pointer_blob": "14d87edc2c5da1e32f9d603413d1d3adb35dbab2",
+          "expected_lfs_sha256": "0c693043cdf7910af15e649039a7bfd8e924b923f7224cc1222e0d56edd36358",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00039-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "0c693043cdf7910af15e649039a7bfd8e924b923f7224cc1222e0d56edd36358",
+            "metadata_sha256": "5fb55514d5e52658f2e905af96ae119aa4c94f0bd688b054e2a64f729cec77da"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00040-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00040-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00040-of-000096.safetensors",
+            "bytes": 16582385056,
+            "device": 49,
+            "inode": 7175807239791595149,
+            "mtime_ns": 1793816398923644083,
+            "ctime_ns": 1793816398996079045,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00040-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00040-of-000096.safetensors",
+          "expected_git_pointer_blob": "cb8280c441b7c8a8333b3e3456231f7192340be2",
+          "expected_lfs_sha256": "c5e62f355ede896136b7c425fc1c81e6ac0047ed61c50f121f360ed9959e74bb",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00040-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "c5e62f355ede896136b7c425fc1c81e6ac0047ed61c50f121f360ed9959e74bb",
+            "metadata_sha256": "025af998c2bbfdf449243407e289fee8298f62e89884040e3169903ae7dbf8fa"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00041-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00041-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00041-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 1665449291646057647,
+            "mtime_ns": 1793816376927614452,
+            "ctime_ns": 1793816403083289091,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00041-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00041-of-000096.safetensors",
+          "expected_git_pointer_blob": "c53616c758a78d6f55cba1c9b2263190a930dd4c",
+          "expected_lfs_sha256": "5467de4bf7800406a595c87836ffedf5035f1246ec7ec09baeea481135221e6e",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00041-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "5467de4bf7800406a595c87836ffedf5035f1246ec7ec09baeea481135221e6e",
+            "metadata_sha256": "c116b36c5d53abb33b78fe118744990440c4f9faf103f8463368d598553f4df2"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00042-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00042-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00042-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 14016917808766653837,
+            "mtime_ns": 1793816384274929472,
+            "ctime_ns": 1793816402565454712,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00042-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00042-of-000096.safetensors",
+          "expected_git_pointer_blob": "cdb22828214d903f0f4561c681144efdb70a192c",
+          "expected_lfs_sha256": "f96acc33583215194c99f25af1bcbeef8256b5ad99eb825c049030812917a5a7",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00042-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "f96acc33583215194c99f25af1bcbeef8256b5ad99eb825c049030812917a5a7",
+            "metadata_sha256": "ceee40bfb32c6c5a69266751e179dd9b9c7a615c4e3256515699df1bd3a14ade"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00043-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00043-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00043-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 15262329446499216808,
+            "mtime_ns": 1793818652394635072,
+            "ctime_ns": 1793816404337814665,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00043-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00043-of-000096.safetensors",
+          "expected_git_pointer_blob": "7e4ac14652488fe973b76ba88baceaaf2fe12a52",
+          "expected_lfs_sha256": "c6b75c7c909f2cf34ebb1c094052ebc771575b79a2a6f2c3e1cf064c387603d5",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00043-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "c6b75c7c909f2cf34ebb1c094052ebc771575b79a2a6f2c3e1cf064c387603d5",
+            "metadata_sha256": "9f11e303e21af6a24d75f9e2335010b42627c2bb85a06edab70091463573227d"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00044-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00044-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00044-of-000096.safetensors",
+            "bytes": 16582385056,
+            "device": 49,
+            "inode": 10728159695272072241,
+            "mtime_ns": 1793816390976793716,
+            "ctime_ns": 1793816402985647519,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00044-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00044-of-000096.safetensors",
+          "expected_git_pointer_blob": "6d4f5d9753e36b0ed5e9b920ff7e72835ce681a6",
+          "expected_lfs_sha256": "f403f8bcca8b30839407515134c16b0e6d0605ad5a1b45cb586206f36271c14c",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00044-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "f403f8bcca8b30839407515134c16b0e6d0605ad5a1b45cb586206f36271c14c",
+            "metadata_sha256": "125737912c10a5e2a7d30f9c11a4d443069d65bf75225880490a2ff61168c53b"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00045-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00045-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00045-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 6325682897041262841,
+            "mtime_ns": 1793816382927037775,
+            "ctime_ns": 1793816409036808273,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00045-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00045-of-000096.safetensors",
+          "expected_git_pointer_blob": "9d5c6b5f81021f1b9867fd8c671096650be7f107",
+          "expected_lfs_sha256": "f9be878defe6cd66660d7299a98aece70f224b17444dd513475a9d438d4db452",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00045-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "f9be878defe6cd66660d7299a98aece70f224b17444dd513475a9d438d4db452",
+            "metadata_sha256": "7fe78e81f48e747b7d9a4d30838d2902e7021be701be94520891b794108919ac"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00046-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00046-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00046-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 4430786068329278316,
+            "mtime_ns": 1793816394416585146,
+            "ctime_ns": 1793816412649218751,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00046-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00046-of-000096.safetensors",
+          "expected_git_pointer_blob": "12fad3a260d5ea8338de8f579ca0d0684a195fec",
+          "expected_lfs_sha256": "a242c8b90256e28453138e1693f5f8aca76303ca2416a7370d3314ffbb010069",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00046-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "a242c8b90256e28453138e1693f5f8aca76303ca2416a7370d3314ffbb010069",
+            "metadata_sha256": "1c9aacaed2b2045ad48d4d15191f2b7ca1aecb227524fccaf2f213358283d36f"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00047-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00047-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00047-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 11074057847326822732,
+            "mtime_ns": 1793816418156886682,
+            "ctime_ns": 1793816444269386148,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00047-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00047-of-000096.safetensors",
+          "expected_git_pointer_blob": "d534feafd028e087ab39c81693f9dd29456a0abc",
+          "expected_lfs_sha256": "6efb69aea07a4d81f4c7173051b0dfe65f6b936e905787663d4234329594b54c",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00047-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "6efb69aea07a4d81f4c7173051b0dfe65f6b936e905787663d4234329594b54c",
+            "metadata_sha256": "4cf5720108651759318e8f5853defbf5174bbc7e71944bec7512ef71e29fac1f"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00048-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00048-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00048-of-000096.safetensors",
+            "bytes": 16582385056,
+            "device": 49,
+            "inode": 1279866685163292015,
+            "mtime_ns": 1793816454709194963,
+            "ctime_ns": 1793816454741637046,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00048-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00048-of-000096.safetensors",
+          "expected_git_pointer_blob": "b9301091db028eda67269cb9a93e69a511d4b03e",
+          "expected_lfs_sha256": "a70396c45aa464926b8cc99a415fee1c5fb07b0df070541e9d9eca994a4922ea",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00048-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "a70396c45aa464926b8cc99a415fee1c5fb07b0df070541e9d9eca994a4922ea",
+            "metadata_sha256": "397e6da4f0ff5817d92a17f3793ed48cfcb31a67910a5d64efba00c1e5c222a7"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00049-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00049-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00049-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 15087439599571287428,
+            "mtime_ns": 1793816470365666039,
+            "ctime_ns": 1793816470436682198,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00049-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00049-of-000096.safetensors",
+          "expected_git_pointer_blob": "32b8059b1ea0e93e5b1870af9a56b1d7c3efdbd7",
+          "expected_lfs_sha256": "0fff54860869ed29793a7c7398e914f70babdddf5c9994c1b57012245169d896",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00049-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "0fff54860869ed29793a7c7398e914f70babdddf5c9994c1b57012245169d896",
+            "metadata_sha256": "4262921f522cd1234b11e13d2dd73580d275db5860cca678415dfd1cac6e2294"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00050-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00050-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00050-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 17173251867958433934,
+            "mtime_ns": 1793816452596995502,
+            "ctime_ns": 1793816470535916170,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00050-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00050-of-000096.safetensors",
+          "expected_git_pointer_blob": "f6d17de1952d2346d5bee4e0df21745baa646b43",
+          "expected_lfs_sha256": "19181ab15f63e6debe603b5bb7b40cc7cbe7367ccfc0adecc13cdb9837b3784f",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00050-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "19181ab15f63e6debe603b5bb7b40cc7cbe7367ccfc0adecc13cdb9837b3784f",
+            "metadata_sha256": "8326266fa56c638b4e591d4828d319eec10b30afb3cb3d69481163aad795bb9f"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00051-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00051-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00051-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 1009483693533113723,
+            "mtime_ns": 1793816492232502069,
+            "ctime_ns": 1793816469916869717,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00051-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00051-of-000096.safetensors",
+          "expected_git_pointer_blob": "e1d66dc6d6faed241f1659b69d9c1607c0dcbcad",
+          "expected_lfs_sha256": "e2ec567c0ae313944b0cd4058f8139630600138013cc109c61c9739b856ed7e3",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00051-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "e2ec567c0ae313944b0cd4058f8139630600138013cc109c61c9739b856ed7e3",
+            "metadata_sha256": "0e9735078b785428d7e36ad42da8d50b3f7768302d3730218055afb8c05b04de"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00052-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00052-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00052-of-000096.safetensors",
+            "bytes": 16582385056,
+            "device": 49,
+            "inode": 13830152959684031181,
+            "mtime_ns": 1793816471647801488,
+            "ctime_ns": 1793816471721060454,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00052-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00052-of-000096.safetensors",
+          "expected_git_pointer_blob": "3380f786ca5c3ab46bfb58a1fd127be743d112d3",
+          "expected_lfs_sha256": "82fc278ee0ecb69f0a5954121f1446509d403f4c172e6346c4e16449893fb001",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00052-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "82fc278ee0ecb69f0a5954121f1446509d403f4c172e6346c4e16449893fb001",
+            "metadata_sha256": "7206721756f95ae60c7a68cac48c82a760d5d2bbb57f6b0e4dbaab38efce0671"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00053-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00053-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00053-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 15981075944805475762,
+            "mtime_ns": 1793816442500277538,
+            "ctime_ns": 1793816471693665405,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00053-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00053-of-000096.safetensors",
+          "expected_git_pointer_blob": "f71a3c1c7f4820aa0f8053f21013243bc4aea369",
+          "expected_lfs_sha256": "7c0d0e9c42b7533504908ee4d5d2f3cd7bfa4b692872413ebca1196376fd49cb",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00053-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "7c0d0e9c42b7533504908ee4d5d2f3cd7bfa4b692872413ebca1196376fd49cb",
+            "metadata_sha256": "7429c29185432dfb26e958a2c781e4bd31b6c00fc9419cead48fb2f2feece355"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00054-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00054-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00054-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 18096611003643557581,
+            "mtime_ns": 1793816445612059813,
+            "ctime_ns": 1793816471739171610,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00054-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00054-of-000096.safetensors",
+          "expected_git_pointer_blob": "d20b48d834c8e00e308915ef0a41e2d2fd464df9",
+          "expected_lfs_sha256": "19891780a0207b6697ea10a093a36ccc488b1ed409975c69c9a0f06c155d2841",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00054-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "19891780a0207b6697ea10a093a36ccc488b1ed409975c69c9a0f06c155d2841",
+            "metadata_sha256": "462af43df01831fde3723d04b4a04145aab529e6e5afb7735fd3ddf1fdebc830"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00055-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00055-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00055-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 3140997361315330526,
+            "mtime_ns": 1793816482547837720,
+            "ctime_ns": 1793816494524095864,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00055-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00055-of-000096.safetensors",
+          "expected_git_pointer_blob": "504adb88b60b680d1c82ec4426da80aac96e4bc6",
+          "expected_lfs_sha256": "6bf65a7ee82eb936ccda65e3ba5615b02ad821ad49123195443a8fab99cc395a",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00055-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "6bf65a7ee82eb936ccda65e3ba5615b02ad821ad49123195443a8fab99cc395a",
+            "metadata_sha256": "aa48998db5f82b40cb30e14cdfb6796be75527a01cdc90506629c44593ea3993"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00056-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00056-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00056-of-000096.safetensors",
+            "bytes": 16582385056,
+            "device": 49,
+            "inode": 12879315691222283570,
+            "mtime_ns": 1793816470259987228,
+            "ctime_ns": 1793816496372436472,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00056-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00056-of-000096.safetensors",
+          "expected_git_pointer_blob": "1b0d3ef65c746da5336c42859176e19c50f26c14",
+          "expected_lfs_sha256": "64b4d82603dc6d65dc3cbed3189edf0b78e3470092dde3f600c3f23694c4a775",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00056-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "64b4d82603dc6d65dc3cbed3189edf0b78e3470092dde3f600c3f23694c4a775",
+            "metadata_sha256": "fd4eb8d515dac50e2b7ec86fe7da46da54d192fed673862c22cb273aa48a5fd6"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00057-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00057-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00057-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 11640943188338869277,
+            "mtime_ns": 1793816507568110561,
+            "ctime_ns": 1793816533743768670,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00057-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00057-of-000096.safetensors",
+          "expected_git_pointer_blob": "625f11c281d889631071f3eff4f48c986912c55b",
+          "expected_lfs_sha256": "9e41e4f36fa0008bca9b73f1d3b6411347a3dd69cc4e0a51f7f808f132dfc8bb",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00057-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "9e41e4f36fa0008bca9b73f1d3b6411347a3dd69cc4e0a51f7f808f132dfc8bb",
+            "metadata_sha256": "b809db763233e9991d1d72db253030157520d57f69a33ebab9d5aa0468ddf454"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00058-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00058-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00058-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 8772920142292776647,
+            "mtime_ns": 1793816542254281968,
+            "ctime_ns": 1793816545255616331,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00058-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00058-of-000096.safetensors",
+          "expected_git_pointer_blob": "5150961b026abcf54e8b7b1fb4f383320dfcdfe0",
+          "expected_lfs_sha256": "e202865cdb609ab0c5ab61d49daaca7c3f5c70f278bbf9fb589d878fa6e5ffca",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00058-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "e202865cdb609ab0c5ab61d49daaca7c3f5c70f278bbf9fb589d878fa6e5ffca",
+            "metadata_sha256": "bee13770451599a99541f9bf8a1010099b948f287aff226051d92fb7408b4d6e"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00059-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00059-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00059-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 14192428636836439439,
+            "mtime_ns": 1793816567940428261,
+            "ctime_ns": 1793816545738434166,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00059-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00059-of-000096.safetensors",
+          "expected_git_pointer_blob": "d66401859aeceffb68f5c328400ca1abeed72f36",
+          "expected_lfs_sha256": "66d4329257b993f12bb42d16239c147821d21c02a9e0025811310c05bc78ee69",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00059-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "66d4329257b993f12bb42d16239c147821d21c02a9e0025811310c05bc78ee69",
+            "metadata_sha256": "3e4924156931b391c55c2ee26989a72b4018f92c60a01fc71a9d8317f6236751"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00060-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00060-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00060-of-000096.safetensors",
+            "bytes": 16582385056,
+            "device": 49,
+            "inode": 2376556526719569884,
+            "mtime_ns": 1793816587191856367,
+            "ctime_ns": 1793816564853744381,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00060-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00060-of-000096.safetensors",
+          "expected_git_pointer_blob": "e7167e94dffaa990262931c5e9ccf8c18bc40626",
+          "expected_lfs_sha256": "72705dacad50ab2cd28298bf4272087f5c828d32a1ce6d87989fdb98dfb2cdbd",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00060-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "72705dacad50ab2cd28298bf4272087f5c828d32a1ce6d87989fdb98dfb2cdbd",
+            "metadata_sha256": "487268fa1b58f434cb45c8c2dd0ea1926d37cd8017b15ccaf8eeb27f1975fdb5"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00061-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00061-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00061-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 3360260245833403631,
+            "mtime_ns": 1793816533030550357,
+            "ctime_ns": 1793816542948383493,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00061-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00061-of-000096.safetensors",
+          "expected_git_pointer_blob": "f51092297600011fa72f546eac54824f170905be",
+          "expected_lfs_sha256": "a3f6edaeed6f49019b2942c5caec31700f663e25d1de024b15e65849caa68242",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00061-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "a3f6edaeed6f49019b2942c5caec31700f663e25d1de024b15e65849caa68242",
+            "metadata_sha256": "67542d4c3e5497b62c8cf63cf3bf5be467bef94e5e4fc2313f9c9f98bc323c70"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00062-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00062-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00062-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 17844663230908062351,
+            "mtime_ns": 1793816514277584167,
+            "ctime_ns": 1793816543508899260,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00062-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00062-of-000096.safetensors",
+          "expected_git_pointer_blob": "ef0c7068cb89e76699c188b43043b7c671c02163",
+          "expected_lfs_sha256": "5eae04b19e582871edcba0a8cb9f2a50a443e1e85132c009b7c61f1d3d6f464c",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00062-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "5eae04b19e582871edcba0a8cb9f2a50a443e1e85132c009b7c61f1d3d6f464c",
+            "metadata_sha256": "cc186b0582357193018e8783e4d90cd111c6bd6dd61fc1378a2795fe9a578f87"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00063-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00063-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00063-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 12220319031231822462,
+            "mtime_ns": 1793816532317947288,
+            "ctime_ns": 1793816554244448350,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00063-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00063-of-000096.safetensors",
+          "expected_git_pointer_blob": "dfb6f16d35b5b6bce45a25e47a38125d3dcf7bc1",
+          "expected_lfs_sha256": "7c51d0b570a95c0e4287f80d0d6592e887c24fc3b6f3382e8071176e5322d735",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00063-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "7c51d0b570a95c0e4287f80d0d6592e887c24fc3b6f3382e8071176e5322d735",
+            "metadata_sha256": "e3a5d0c1f53675012550272bfcce61e9c5780c5e3d0403c36d15fa5678301da5"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00064-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00064-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00064-of-000096.safetensors",
+            "bytes": 16582385056,
+            "device": 49,
+            "inode": 9505027347508375253,
+            "mtime_ns": 1793816542200691683,
+            "ctime_ns": 1793816552078796758,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00064-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00064-of-000096.safetensors",
+          "expected_git_pointer_blob": "b2727bf07e72b280dd72f60def289ab5d65a43aa",
+          "expected_lfs_sha256": "63df5a5ae8e5b3317b8e7d0c52775409728713873b8007ae2b11587e44a23528",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00064-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "63df5a5ae8e5b3317b8e7d0c52775409728713873b8007ae2b11587e44a23528",
+            "metadata_sha256": "bc10018f2b17c0871ddd3634d54a335a57ec97ae2f7f39c21aac5833af12fb0f"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00065-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00065-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00065-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 16257625357712686407,
+            "mtime_ns": 1793816545031107963,
+            "ctime_ns": 1793816567956271990,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00065-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00065-of-000096.safetensors",
+          "expected_git_pointer_blob": "97ea6efa8413f67f9eb4eaedf13d1de89d4700d1",
+          "expected_lfs_sha256": "8d29eb4cca4358b93880b397c8a1494134132c28cb6c3a827faa35e58cc7e08c",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00065-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "8d29eb4cca4358b93880b397c8a1494134132c28cb6c3a827faa35e58cc7e08c",
+            "metadata_sha256": "00acac3a88388189c924886f0aef8e400c38b740c4de3114c2481556199c74e4"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00066-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00066-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00066-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 11426821168721941286,
+            "mtime_ns": 1793816602526276869,
+            "ctime_ns": 1793816602560133605,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00066-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00066-of-000096.safetensors",
+          "expected_git_pointer_blob": "ff7042c2850599b2644f44d0dd7aad1700e35fd3",
+          "expected_lfs_sha256": "629020d4d37304b6fdd5a136fc4c5115bc456fa41f1b78e6c6d90cce0eb23fe9",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00066-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "629020d4d37304b6fdd5a136fc4c5115bc456fa41f1b78e6c6d90cce0eb23fe9",
+            "metadata_sha256": "f7d6d81b98203c01e170e7d5aad5001d7a3d0ee2dc97275d94c3b19f15b83f39"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00067-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00067-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00067-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 15422800065873666609,
+            "mtime_ns": 1793816603973784712,
+            "ctime_ns": 1793816606974649824,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00067-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00067-of-000096.safetensors",
+          "expected_git_pointer_blob": "ba6e547cd74a39e6ef6f0d908b2719fe5941fc6d",
+          "expected_lfs_sha256": "ae2677403c72c3f652f3d19e14c11bb30bb746fbb41a366f60bceb609e73f25e",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00067-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "ae2677403c72c3f652f3d19e14c11bb30bb746fbb41a366f60bceb609e73f25e",
+            "metadata_sha256": "f540b13aaa21c3ac4ec2688c4c7869e270740a21823183c1d3c5d4a13753374e"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00068-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00068-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00068-of-000096.safetensors",
+            "bytes": 16582385056,
+            "device": 49,
+            "inode": 6528865069194579294,
+            "mtime_ns": 1793816580304640248,
+            "ctime_ns": 1793816609533181781,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00068-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00068-of-000096.safetensors",
+          "expected_git_pointer_blob": "8d3e10635e648c7a3f770bccf377a0446a32a933",
+          "expected_lfs_sha256": "9ec02c5185a53562df29cf834664969e18f87dd7967b627f95b44580d3e489a1",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00068-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "9ec02c5185a53562df29cf834664969e18f87dd7967b627f95b44580d3e489a1",
+            "metadata_sha256": "adc9306abb4e95c8ed86ac116f9e9c96d777340adcfdb7dae50e905a233de039"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00069-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00069-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00069-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 4239152652316389023,
+            "mtime_ns": 1793816620761725337,
+            "ctime_ns": 1793816606142407116,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00069-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00069-of-000096.safetensors",
+          "expected_git_pointer_blob": "ccf4c39c94d5589ab09af95bc6baf45d86f126ff",
+          "expected_lfs_sha256": "7cdce5d9fc6dfd773eb1c29194a3c4c1948361a225a9c2f35f35d1bb9504ff8b",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00069-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "7cdce5d9fc6dfd773eb1c29194a3c4c1948361a225a9c2f35f35d1bb9504ff8b",
+            "metadata_sha256": "d723ae13cd45fab324e3832e89c4f22d5718fee164e8464817e9e2d2f6797bb5"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00070-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00070-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00070-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 16078642226136038990,
+            "mtime_ns": 1793816598644127131,
+            "ctime_ns": 1793816616584359531,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00070-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00070-of-000096.safetensors",
+          "expected_git_pointer_blob": "21ad4c1035059768d9f72b95b711456c68fc0e2e",
+          "expected_lfs_sha256": "7dd0afce2993bdfaeebe951b416e2994e413da054e7706850a800eef3d61aedf",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00070-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "7dd0afce2993bdfaeebe951b416e2994e413da054e7706850a800eef3d61aedf",
+            "metadata_sha256": "5ada533e234c8cad8039cf270d9830a3eeb2ba4c99c534638e4b2585d4a2244d"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00071-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00071-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00071-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 15607151082932455718,
+            "mtime_ns": 1793816631497716365,
+            "ctime_ns": 1793816616915841545,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00071-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00071-of-000096.safetensors",
+          "expected_git_pointer_blob": "f5d91c5bc448b479b700ea4aa4ecc2fe2685d2bf",
+          "expected_lfs_sha256": "3a6f30324f53f3644233dd6a43f3e96b9facdab22c84af0a5ebf76c6a4e62adc",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00071-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "3a6f30324f53f3644233dd6a43f3e96b9facdab22c84af0a5ebf76c6a4e62adc",
+            "metadata_sha256": "d24af0fa03d776ea98da08aad026d0e8bab6964cbd60f82face77c60ee8bd8d7"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00072-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00072-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00072-of-000096.safetensors",
+            "bytes": 16582385056,
+            "device": 49,
+            "inode": 4913190614392186012,
+            "mtime_ns": 1793816623243090828,
+            "ctime_ns": 1793816623280790330,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00072-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00072-of-000096.safetensors",
+          "expected_git_pointer_blob": "5131d1019f2b2d84ed5ef8b52f78b27f8d71ff8d",
+          "expected_lfs_sha256": "0289cad8c61fb91965a29292b1391de5c663a262e59a5716d1e207af57c26fe4",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00072-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "0289cad8c61fb91965a29292b1391de5c663a262e59a5716d1e207af57c26fe4",
+            "metadata_sha256": "95b44cf886a16df550ab058000c5d55174573556fa3a7079b5b49efe0437c863"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00073-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00073-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00073-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 5641093100447383968,
+            "mtime_ns": 1793818869998968413,
+            "ctime_ns": 1793816621834720210,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00073-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00073-of-000096.safetensors",
+          "expected_git_pointer_blob": "acc702479988bc4fd0951c53c02bb9679a9f4bdc",
+          "expected_lfs_sha256": "562795ffd08c35c9a7e1e1da1457b933f5e52a9934cc0238a3ce47a5df81a0a1",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00073-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "562795ffd08c35c9a7e1e1da1457b933f5e52a9934cc0238a3ce47a5df81a0a1",
+            "metadata_sha256": "1fb207c650a8def1f9bab95d1fb777d66a3fd0e50c7a2710a887073bb4806bba"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00074-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00074-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00074-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 1806044704266775213,
+            "mtime_ns": 1793816646306120383,
+            "ctime_ns": 1793816658281757491,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00074-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00074-of-000096.safetensors",
+          "expected_git_pointer_blob": "399255a915893f5a8c40c277983ef796175143e7",
+          "expected_lfs_sha256": "da51f95cad8edd2321b799ff4f0e888211ea86eb32b4c8ef12a8501af3223687",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00074-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "da51f95cad8edd2321b799ff4f0e888211ea86eb32b4c8ef12a8501af3223687",
+            "metadata_sha256": "f828539c40f97fd6f62d81e0439a8324c62a61992b38205f481a3f76186540e6"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00075-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00075-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00075-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 13444148139744004596,
+            "mtime_ns": 1793816645808144731,
+            "ctime_ns": 1793816675068130012,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00075-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00075-of-000096.safetensors",
+          "expected_git_pointer_blob": "59a529b8875e249dc8b363d161d102ca7085f5d4",
+          "expected_lfs_sha256": "5cb481011c961484cdff4b0847ea4969ee6692f714d83c0ec8fb1e8eff64069b",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00075-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "5cb481011c961484cdff4b0847ea4969ee6692f714d83c0ec8fb1e8eff64069b",
+            "metadata_sha256": "dcd366634f5ea723ee31415b94a91f2ffe8a037b72fcddf39ce81a4199ea3008"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00076-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00076-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00076-of-000096.safetensors",
+            "bytes": 16582385056,
+            "device": 49,
+            "inode": 3121595290430504664,
+            "mtime_ns": 1793816680647797385,
+            "ctime_ns": 1793816680725931129,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00076-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00076-of-000096.safetensors",
+          "expected_git_pointer_blob": "591cf7b19879027f63f90fe28034fbb630cb1716",
+          "expected_lfs_sha256": "5c3c1fa5945498c4e7a6c95ccc88a0e40286d020faae8d9dfe1f8aebf14bdcc7",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00076-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "5c3c1fa5945498c4e7a6c95ccc88a0e40286d020faae8d9dfe1f8aebf14bdcc7",
+            "metadata_sha256": "8da7817e3242e9c70f1bf37798107ba545fcd0cb441861170f79f0e423b4f68e"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00077-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00077-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00077-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 7732371237905993326,
+            "mtime_ns": 1793816675964170986,
+            "ctime_ns": 1793816693902100189,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00077-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00077-of-000096.safetensors",
+          "expected_git_pointer_blob": "cb836035d27b9a10270cb5d4157c80a5e4bb5142",
+          "expected_lfs_sha256": "31c1560d0dbd53f551e54895789bac84203990ce5d6e390385b85c63debd159a",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00077-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "31c1560d0dbd53f551e54895789bac84203990ce5d6e390385b85c63debd159a",
+            "metadata_sha256": "3cd5cb11aeba9c6cec3ac7506c31739f159e6d2bc5f7e8e7861e24c7843730cc"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00078-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00078-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00078-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 11428594493481870907,
+            "mtime_ns": 1793816692643149119,
+            "ctime_ns": 1793816692713384133,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00078-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00078-of-000096.safetensors",
+          "expected_git_pointer_blob": "493d896abd1d46e9ab1c4d545cbfbe47b4243102",
+          "expected_lfs_sha256": "30d527befe028d04c27c437818fb234977a9fac39475b710291bb0cb35e0fb58",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00078-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "30d527befe028d04c27c437818fb234977a9fac39475b710291bb0cb35e0fb58",
+            "metadata_sha256": "3f8e4e458193c8cb40ef214b985a14566e596b84a67bc14b89e82d2532d2e683"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00079-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00079-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00079-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 4140121007398408286,
+            "mtime_ns": 1793816663392639890,
+            "ctime_ns": 1793816689539552661,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00079-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00079-of-000096.safetensors",
+          "expected_git_pointer_blob": "0f40a8a954a8cac9d8f8eaf7f1c4d0fcc0fec0aa",
+          "expected_lfs_sha256": "7362738c78d986de925b876e4d3090168102a58c287e50f917e427609d9b910f",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00079-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "7362738c78d986de925b876e4d3090168102a58c287e50f917e427609d9b910f",
+            "metadata_sha256": "e1fc795976dd2e9fdbbd0f99d700cd3660da32317f0febf8a18fcaf2fbd33b4e"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00080-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00080-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00080-of-000096.safetensors",
+            "bytes": 16582385056,
+            "device": 49,
+            "inode": 13583780744027675233,
+            "mtime_ns": 1793818944591845251,
+            "ctime_ns": 1793816696440019048,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00080-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00080-of-000096.safetensors",
+          "expected_git_pointer_blob": "1790a4f5b6a6bfb99bcdc5370b3f3bfd4983a661",
+          "expected_lfs_sha256": "5e72acc23724a2d1a053cda24c20e31c583a5ae5ae895d5ff615097184abf417",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00080-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "5e72acc23724a2d1a053cda24c20e31c583a5ae5ae895d5ff615097184abf417",
+            "metadata_sha256": "935fcc9e0d898fa23856b336f25c1df6d8b0be8839fdd70a0d4a60eff3f3f483"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00081-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00081-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00081-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 863299705556520114,
+            "mtime_ns": 1793816719945431112,
+            "ctime_ns": 1793816697605961528,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00081-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00081-of-000096.safetensors",
+          "expected_git_pointer_blob": "022e8fa3c31f78742ba502625aac83353dd5439b",
+          "expected_lfs_sha256": "7e6db01ab5c5df86d40ab57c5283d744b8223b1ba4d936d7743addd072cae23d",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00081-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "7e6db01ab5c5df86d40ab57c5283d744b8223b1ba4d936d7743addd072cae23d",
+            "metadata_sha256": "40da0fd1f441937aa48cf67cf24b1f88255a9ccaec066421301c2775e68b357e"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00082-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00082-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00082-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 18174470894614978011,
+            "mtime_ns": 1793816805004553109,
+            "ctime_ns": 1793816792326943571,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00082-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00082-of-000096.safetensors",
+          "expected_git_pointer_blob": "e237fd93b591fc1d6ab01200d5cec9579894e476",
+          "expected_lfs_sha256": "cd92e1e29b094b9e763813d7afc34bafe1246619098c23823b6dff448f239211",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00082-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "cd92e1e29b094b9e763813d7afc34bafe1246619098c23823b6dff448f239211",
+            "metadata_sha256": "205b83ecfcfd5e37b05df9ccd4e31bd18d1083c5a861e933f0545fa781c2dbce"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00083-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00083-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00083-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 8809297660197632393,
+            "mtime_ns": 1793816706257224869,
+            "ctime_ns": 1793816728200363708,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00083-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00083-of-000096.safetensors",
+          "expected_git_pointer_blob": "24001fbdf5176e71fba22be8ed090de8578ea60d",
+          "expected_lfs_sha256": "837cd4a41384987924a17b7afe3033cb38073f14ed9e22cc90d17e2be5950fb3",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00083-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "837cd4a41384987924a17b7afe3033cb38073f14ed9e22cc90d17e2be5950fb3",
+            "metadata_sha256": "0b61d2f9d8d191b5536687a01621cef9a68038ec4c7327f55bd73c0a79370519"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00084-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00084-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00084-of-000096.safetensors",
+            "bytes": 16582385056,
+            "device": 49,
+            "inode": 7856322132123045530,
+            "mtime_ns": 1793816737870600204,
+            "ctime_ns": 1793816737904020908,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00084-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00084-of-000096.safetensors",
+          "expected_git_pointer_blob": "cc5c81b929cd297af2a61acf25ffa09c6540db90",
+          "expected_lfs_sha256": "b023f4665c819bc1af02222a5fcd1a825d096e25c26d34f47a20a33e9299e205",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00084-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "b023f4665c819bc1af02222a5fcd1a825d096e25c26d34f47a20a33e9299e205",
+            "metadata_sha256": "da7fec89c670e4600792e793b40a34163ae5a8b29cd9f7c6e6aca2f65e02d84f"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00085-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00085-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00085-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 7884669116439460332,
+            "mtime_ns": 1793816781519012773,
+            "ctime_ns": 1793816766965355873,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00085-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00085-of-000096.safetensors",
+          "expected_git_pointer_blob": "a576ff354b9c6a3c0ebd18273433dd3753d938b6",
+          "expected_lfs_sha256": "1ddd479ac40f7e78a2c118d9c456c8e3f22e716f483b294ae45071f6a19f0a74",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00085-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "1ddd479ac40f7e78a2c118d9c456c8e3f22e716f483b294ae45071f6a19f0a74",
+            "metadata_sha256": "1c61fac2fd1ba799f917d3d75dfde52d2d9250f02bd2c8155fb1c64b13e69f57"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00086-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00086-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00086-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 11172970798378242768,
+            "mtime_ns": 1793819020649941512,
+            "ctime_ns": 1793816772469231308,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00086-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00086-of-000096.safetensors",
+          "expected_git_pointer_blob": "0ff923a00a1eef1c02513314e4288d8effec7f5c",
+          "expected_lfs_sha256": "e39c007056d09ffbd7040df96981831254bac17f7120a7bb28ce1e5cb0350b7b",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00086-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "e39c007056d09ffbd7040df96981831254bac17f7120a7bb28ce1e5cb0350b7b",
+            "metadata_sha256": "8ca1f2d3fe6997454ad6b75e7423c0913f3f123a7a8c1b13745be8326c069c5b"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00087-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00087-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00087-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 1186519630701235595,
+            "mtime_ns": 1793816776731419347,
+            "ctime_ns": 1793816798694870639,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00087-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00087-of-000096.safetensors",
+          "expected_git_pointer_blob": "6ac531d79b0d74d85c1060511d07ed9c4efcf733",
+          "expected_lfs_sha256": "64b8ea577c64d7686f054b7286901df6874c5eb73d2157980c3f50b0408a86fc",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00087-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "64b8ea577c64d7686f054b7286901df6874c5eb73d2157980c3f50b0408a86fc",
+            "metadata_sha256": "13773c6fe51e79816d18ad65839d0888335fbed791090fe1ee1f2ac0805b6224"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00088-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00088-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00088-of-000096.safetensors",
+            "bytes": 16582385056,
+            "device": 49,
+            "inode": 16144454154625500517,
+            "mtime_ns": 1793816776477247281,
+            "ctime_ns": 1793816776576392865,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00088-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00088-of-000096.safetensors",
+          "expected_git_pointer_blob": "c094dc6735be79789b31e00d820700f1718e6db8",
+          "expected_lfs_sha256": "c460a0083000f4239934d744a8c8cfb7ba77c2fc557fa73ae711ec72a0be7293",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00088-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "c460a0083000f4239934d744a8c8cfb7ba77c2fc557fa73ae711ec72a0be7293",
+            "metadata_sha256": "d1422066eed1c649c8cbdcaa6e2ed6d60cc6e2905f6bab7d4634356c93fb9662"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00089-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00089-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00089-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 8540584851590822038,
+            "mtime_ns": 1793816808935901365,
+            "ctime_ns": 1793816795436563004,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00089-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00089-of-000096.safetensors",
+          "expected_git_pointer_blob": "7e5233eeebea135b58fbf11f98585ac194ea33a4",
+          "expected_lfs_sha256": "e8978e7faf4137773f58ccd25b4f8f8f72e316984f9a297bb34a25d6a413bd0b",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00089-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "e8978e7faf4137773f58ccd25b4f8f8f72e316984f9a297bb34a25d6a413bd0b",
+            "metadata_sha256": "1ff3853263ebe61ba6234fd208194a5788b70a8ee43aa8a045543832fd649a28"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00090-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00090-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00090-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 1819775736471590487,
+            "mtime_ns": 1793816785577082021,
+            "ctime_ns": 1793816795493473021,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00090-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00090-of-000096.safetensors",
+          "expected_git_pointer_blob": "0cc33003d77562c4abb814df14af7db56640a1dd",
+          "expected_lfs_sha256": "cec0b73dcd7921ad1a1274757df6da0cca06f62307533ab1189992475925ca87",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00090-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "cec0b73dcd7921ad1a1274757df6da0cca06f62307533ab1189992475925ca87",
+            "metadata_sha256": "f5a062940f9bf7599e89859402d7479475e8ad3d25678096934df1c310f2aab9"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00091-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00091-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00091-of-000096.safetensors",
+            "bytes": 16990916912,
+            "device": 49,
+            "inode": 10588074622300357825,
+            "mtime_ns": 1793816798146090619,
+            "ctime_ns": 1793816798181436316,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00091-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00091-of-000096.safetensors",
+          "expected_git_pointer_blob": "ea775ccb3e4693f8076a6bcfb38824046a8ef74e",
+          "expected_lfs_sha256": "ac71f812fcf256077f457f12b1f92aabdc8dfd1e6be46fa42ffb6140d79cf019",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00091-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "ac71f812fcf256077f457f12b1f92aabdc8dfd1e6be46fa42ffb6140d79cf019",
+            "metadata_sha256": "984c5e66aa75303abf22372f6f4ff1a492578b1233017a9f98134018a750d2d0"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00092-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00092-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00092-of-000096.safetensors",
+            "bytes": 16582385056,
+            "device": 49,
+            "inode": 8597577979592454418,
+            "mtime_ns": 1793816803207089276,
+            "ctime_ns": 1793816822068045993,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00092-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00092-of-000096.safetensors",
+          "expected_git_pointer_blob": "e37c2635bfc32b559ac8d2249a001017089b12fd",
+          "expected_lfs_sha256": "c526679aff4000da35704ebdc5e5356e8035520bf0b4ef7a5f0b543aed9a2481",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00092-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "c526679aff4000da35704ebdc5e5356e8035520bf0b4ef7a5f0b543aed9a2481",
+            "metadata_sha256": "76bb3ccf098848a151dd14dd9992de3f4af8075a13b0f426e6a0f9036cf12819"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00093-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00093-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00093-of-000096.safetensors",
+            "bytes": 16582385056,
+            "device": 49,
+            "inode": 16023021291591211678,
+            "mtime_ns": 1793819072158683364,
+            "ctime_ns": 1793816823925690784,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00093-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00093-of-000096.safetensors",
+          "expected_git_pointer_blob": "dedd5522452eacf2ce60c6bcc4400821c450211a",
+          "expected_lfs_sha256": "84e7d061fe22d29110c72d8f892681d4dbcc8a4fa4295844c98543f5707233a6",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00093-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "84e7d061fe22d29110c72d8f892681d4dbcc8a4fa4295844c98543f5707233a6",
+            "metadata_sha256": "09d1117ae609145b176c80e82373e4e96321b58665c713ec458e48d370f4354a"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00094-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00094-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00094-of-000096.safetensors",
+            "bytes": 4697664072,
+            "device": 49,
+            "inode": 11601512256668712378,
+            "mtime_ns": 1793819047847647892,
+            "ctime_ns": 1793816799621263795,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00094-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00094-of-000096.safetensors",
+          "expected_git_pointer_blob": "a67302cad5858f6c341271e06f8c4f91336344e9",
+          "expected_lfs_sha256": "f60884ddcd7dc3d2c95640cf14626ae17702fa489d2612849433d7290c4358ff",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00094-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "f60884ddcd7dc3d2c95640cf14626ae17702fa489d2612849433d7290c4358ff",
+            "metadata_sha256": "e7fae188892a76feaca65656a29154f2e32404a5f1f182924864ac12eb238f52"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00095-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00095-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00095-of-000096.safetensors",
+            "bytes": 92289328,
+            "device": 49,
+            "inode": 14549838497183699418,
+            "mtime_ns": 1793816796847511262,
+            "ctime_ns": 1793816808821180659,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00095-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00095-of-000096.safetensors",
+          "expected_git_pointer_blob": "b94638ece80201bd6df7fc116a1093867ba3ecfb",
+          "expected_lfs_sha256": "db95f23534af1cb3b09d321d632b87f2103865fda2e96734c83379d80c114cfe",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00095-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "db95f23534af1cb3b09d321d632b87f2103865fda2e96734c83379d80c114cfe",
+            "metadata_sha256": "7048842ffa614b4131bab33ad0c460717c622595d0dc8aeb752d3b0cb136d8aa"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model-00096-of-000096.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00096-of-000096.safetensors",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00096-of-000096.safetensors",
+            "bytes": 802448352,
+            "device": 49,
+            "inode": 515697261028347607,
+            "mtime_ns": 1793819061518493349,
+            "ctime_ns": 1793816813290971246,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model-00096-of-000096.safetensors",
+          "link": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model-00096-of-000096.safetensors",
+          "expected_git_pointer_blob": "1efdad31fc1a0dac902585d53b0254be0356a32d",
+          "expected_lfs_sha256": "1912e9c59d01fe3962cab478be9c7546482b35ce2c19bea63dc990ee0fdcd4c2",
+          "cached_source_metadata": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/.cache/huggingface/download/model-00096-of-000096.safetensors.metadata",
+            "commit": "6d0a0202956796543364d666ab19c6ad1a494ee1",
+            "blob_or_lfs_id": "1912e9c59d01fe3962cab478be9c7546482b35ce2c19bea63dc990ee0fdcd4c2",
+            "metadata_sha256": "03d5d40a88fb0882acf8e42175286f06bd4a71b648e22a191ec7498009a913d2"
+          },
+          "actual_payload_sha256": null,
+          "hash_depth": "existing HF LFS identity plus file stat only; no payload read"
+        },
+        {
+          "name": "model.safetensors.index.json",
+          "kind": "copied nonweight",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model.safetensors.index.json",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/model.safetensors.index.json",
+            "bytes": 59776878,
+            "device": 49,
+            "inode": 16153193853907540905,
+            "mtime_ns": 1793816819982772036,
+            "ctime_ns": 1793816807245896156,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/model.safetensors.index.json",
+          "origin": {
+            "kind": "unchanged nonweight copied from original local revision",
+            "revision": "6d0a0202956796543364d666ab19c6ad1a494ee1"
+          },
+          "expected_git_blob": "b37dae58fa94b20d484867b00e5035d8693bad1e",
+          "expected_lfs": {
+            "sha256": "6500b553254ae3955e19bbf93d8cf3eee17101df4430493b33ce44d8ea1e2925",
+            "size": 59776878,
+            "pointerSize": 133
+          },
+          "actual_sha256": "6500b553254ae3955e19bbf93d8cf3eee17101df4430493b33ce44d8ea1e2925",
+          "verification": "materialized LFS payload SHA256 plus canonical pointer Git blob"
+        },
+        {
+          "name": "preprocessor_config.json",
+          "kind": "copied nonweight",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/preprocessor_config.json",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/preprocessor_config.json",
+            "bytes": 1011,
+            "device": 49,
+            "inode": 12276549635230854600,
+            "mtime_ns": 1793816725738423251,
+            "ctime_ns": 1793816728697762555,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/preprocessor_config.json",
+          "origin": {
+            "kind": "unchanged nonweight copied from original local revision",
+            "revision": "6d0a0202956796543364d666ab19c6ad1a494ee1"
+          },
+          "expected_git_blob": "8be28c13c93fb8982f81928d3f4fe80568102286",
+          "expected_lfs": null,
+          "actual_sha256": "4be333605990c53a816e586dee9d5dd545afb7a59947c17f8f7ef26b4782668e",
+          "verification": "actual copied Git blob SHA1"
+        },
+        {
+          "name": "tiktoken.model",
+          "kind": "copied nonweight",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/tiktoken.model",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/tiktoken.model",
+            "bytes": 2795286,
+            "device": 49,
+            "inode": 15687946500131733154,
+            "mtime_ns": 1793816829642045163,
+            "ctime_ns": 1793816807262739506,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/tiktoken.model",
+          "origin": {
+            "kind": "unchanged nonweight copied from original local revision",
+            "revision": "6d0a0202956796543364d666ab19c6ad1a494ee1"
+          },
+          "expected_git_blob": "b4149a6e17a01b6442187f39890f89bc2fe8d309",
+          "expected_lfs": {
+            "sha256": "b6c497a7469b33ced9c38afb1ad6e47f03f5e5dc05f15930799210ec050c5103",
+            "size": 2795286,
+            "pointerSize": 132
+          },
+          "actual_sha256": "b6c497a7469b33ced9c38afb1ad6e47f03f5e5dc05f15930799210ec050c5103",
+          "verification": "materialized LFS payload SHA256 plus canonical pointer Git blob"
+        },
+        {
+          "name": "tokenization_kimi.py",
+          "kind": "copied nonweight",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/tokenization_kimi.py",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/tokenization_kimi.py",
+            "bytes": 16199,
+            "device": 49,
+            "inode": 8105854672974582936,
+            "mtime_ns": 1793816750843352760,
+            "ctime_ns": 1793816738082762237,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/tokenization_kimi.py",
+          "origin": {
+            "kind": "unchanged nonweight copied from original local revision",
+            "revision": "6d0a0202956796543364d666ab19c6ad1a494ee1"
+          },
+          "expected_git_blob": "7ae891c2e0ef050bbeb2da55e9bc0401c4c508db",
+          "expected_lfs": null,
+          "actual_sha256": "204ee39fbf13a6d6608b0d3ca1b4b04a14ac5f0a062a7fdee02e61f5d936f9c6",
+          "verification": "actual copied Git blob SHA1"
+        },
+        {
+          "name": "tokenizer_config.json",
+          "kind": "copied nonweight",
+          "source": {
+            "path": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/tokenizer_config.json",
+            "resolved": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro/tokenizer_config.json",
+            "bytes": 3448,
+            "device": 49,
+            "inode": 4441628704852074056,
+            "mtime_ns": 1793816720003822657,
+            "ctime_ns": 1793816738218010914,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/target-d9/tokenizer_config.json",
+          "origin": {
+            "kind": "unchanged nonweight copied from original local revision",
+            "revision": "6d0a0202956796543364d666ab19c6ad1a494ee1"
+          },
+          "expected_git_blob": "8b4d8c452d716709fe22591bb3fd19c3f5d5f269",
+          "expected_lfs": null,
+          "actual_sha256": "9fc322181b8ec44236e148916aea4b6c2467b66ded7bfaff0efe623ad750b852",
+          "verification": "actual copied Git blob SHA1"
+        }
+      ]
+    },
+    {
+      "role": "draft",
+      "path": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/draft-preview-187-components",
+      "repo": "Inferact/Kimi-K3.1-Pro-DSpark-preview",
+      "expected_component_revision": "187f8f6f792d931af93f96c8d2271a084e00280d",
+      "original_local_revision": "6a2ef20a05efe88aabbf9ecaa12d020c3b0edf94",
+      "original_local_path": "/app/agent-team-scratch/models/Kimi-K3.1-Pro-DSpark-preview-6a2ef20a05efe88aabbf9ecaa12d020c3b0edf94",
+      "files": [
+        {
+          "name": ".gitattributes",
+          "kind": "copied nonweight",
+          "source": {
+            "path": "/app/agent-team-scratch/models/Kimi-K3.1-Pro-DSpark-preview-6a2ef20a05efe88aabbf9ecaa12d020c3b0edf94/.gitattributes",
+            "resolved": "/app/agent-team-scratch/models/Kimi-K3.1-Pro-DSpark-preview-6a2ef20a05efe88aabbf9ecaa12d020c3b0edf94/.gitattributes",
+            "bytes": 1519,
+            "device": 58,
+            "inode": 29553349548,
+            "mtime_ns": 1795002592748043797,
+            "ctime_ns": 1795002592748043797,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/draft-preview-187-components/.gitattributes",
+          "origin": {
+            "kind": "unchanged nonweight copied from original local revision",
+            "revision": "6a2ef20a05efe88aabbf9ecaa12d020c3b0edf94"
+          },
+          "expected_git_blob": "a6344aac8c09253b3b630fb776ae94478aa0275b",
+          "expected_lfs": null,
+          "actual_sha256": "11ad7efa24975ee4b0c3c3a38ed18737f0658a5f75a0a96787b576a78a023361",
+          "verification": "actual copied Git blob SHA1"
+        },
+        {
+          "name": "LICENSE",
+          "kind": "copied nonweight",
+          "source": {
+            "path": "/app/agent-team-scratch/models/Kimi-K3.1-Pro-DSpark-preview-6a2ef20a05efe88aabbf9ecaa12d020c3b0edf94/LICENSE",
+            "resolved": "/app/agent-team-scratch/models/Kimi-K3.1-Pro-DSpark-preview-6a2ef20a05efe88aabbf9ecaa12d020c3b0edf94/LICENSE",
+            "bytes": 3077,
+            "device": 58,
+            "inode": 29553349547,
+            "mtime_ns": 1795002592796043198,
+            "ctime_ns": 1795002592796043198,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/draft-preview-187-components/LICENSE",
+          "origin": {
+            "kind": "unchanged nonweight copied from original local revision",
+            "revision": "6a2ef20a05efe88aabbf9ecaa12d020c3b0edf94"
+          },
+          "expected_git_blob": "5c475cf292f954769b0eb124d8610245c461fbb3",
+          "expected_lfs": null,
+          "actual_sha256": "da05c356f773d22a0e1c6de390f280304d7cee6eb56fa161aa789d30dedba63b",
+          "verification": "actual copied Git blob SHA1"
+        },
+        {
+          "name": "README.md",
+          "kind": "copied nonweight",
+          "source": {
+            "path": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/input/draft187-README.md",
+            "resolved": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/input/draft187-README.md",
+            "bytes": 2400,
+            "device": 58,
+            "inode": 42246835970,
+            "mtime_ns": 1795201986288193148,
+            "ctime_ns": 1795201986288193148,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/draft-preview-187-components/README.md",
+          "origin": {
+            "kind": "verified small-file override",
+            "source": "https://huggingface.co/Inferact/Kimi-K3.1-Pro-DSpark-preview/resolve/187f8f6f792d931af93f96c8d2271a084e00280d/README.md"
+          },
+          "expected_git_blob": "1afed69ce7e04aeee12680baca1ab64d46142a1f",
+          "expected_lfs": null,
+          "actual_sha256": "3a31de9ae868f21e61f7acb426f6298ea5769514d559553926895cd085ba8305",
+          "verification": "actual copied Git blob SHA1"
+        },
+        {
+          "name": "config.json",
+          "kind": "copied nonweight",
+          "source": {
+            "path": "/app/agent-team-scratch/models/Kimi-K3.1-Pro-DSpark-preview-6a2ef20a05efe88aabbf9ecaa12d020c3b0edf94/config.json",
+            "resolved": "/app/agent-team-scratch/models/Kimi-K3.1-Pro-DSpark-preview-6a2ef20a05efe88aabbf9ecaa12d020c3b0edf94/config.json",
+            "bytes": 1756,
+            "device": 58,
+            "inode": 29553349546,
+            "mtime_ns": 1795002592741043884,
+            "ctime_ns": 1795002592741043884,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/draft-preview-187-components/config.json",
+          "origin": {
+            "kind": "unchanged nonweight copied from original local revision",
+            "revision": "6a2ef20a05efe88aabbf9ecaa12d020c3b0edf94"
+          },
+          "expected_git_blob": "a58816bae48c8a85f5fcb521a819f6970552638d",
+          "expected_lfs": null,
+          "actual_sha256": "5b4b99b3f8c1b447e2c335b1aa448096ebe0a980fe987bc97c0fdb47f0d50824",
+          "verification": "actual copied Git blob SHA1"
+        },
+        {
+          "name": "model.safetensors",
+          "kind": "external weight symlink for read-only use",
+          "source": {
+            "path": "/app/agent-team-scratch/models/Kimi-K3.1-Pro-DSpark-preview-6a2ef20a05efe88aabbf9ecaa12d020c3b0edf94/model.safetensors",
+            "resolved": "/app/agent-team-scratch/models/Kimi-K3.1-Pro-DSpark-preview-6a2ef20a05efe88aabbf9ecaa12d020c3b0edf94/model.safetensors",
+            "bytes": 5373511978,
+            "device": 58,
+            "inode": 29553349539,
+            "mtime_ns": 1795002597262987487,
+            "ctime_ns": 1795002597321986752,
+            "mode": "0o644"
+          },
+          "destination": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/draft-preview-187-components/model.safetensors",
+          "link": "/app/agent-team-scratch/models/Kimi-K3.1-Pro-DSpark-preview-6a2ef20a05efe88aabbf9ecaa12d020c3b0edf94/model.safetensors",
+          "expected_git_pointer_blob": "485073f37d150195c790f42bd166ca915d4cf3e2",
+          "expected_lfs_sha256": "610afd80871fbba917c7f3ae08a097721f42787ac931c24269b8497fcfc6b5c0",
+          "cached_source_metadata": {
+            "path": "/app/agent-team-scratch/models/Kimi-K3.1-Pro-DSpark-preview-6a2ef20a05efe88aabbf9ecaa12d020c3b0edf94/.cache/huggingface/download/model.safetensors.metadata",
+            "commit": "6a2ef20a05efe88aabbf9ecaa12d020c3b0edf94",
+            "blob_or_lfs_id": "610afd80871fbba917c7f3ae08a097721f42787ac931c24269b8497fcfc6b5c0",
+            "metadata_sha256": "545d855e5a565be5a298a9134c561353bb1c0d814143916575b5191100c64d41"
+          },
+          "actual_payload_sha256": "610afd80871fbba917c7f3ae08a097721f42787ac931c24269b8497fcfc6b5c0",
+          "hash_depth": "one complete payload SHA256 pass"
+        }
+      ]
+    }
+  ],
+  "draft_payload_verification": {
+    "sha256": "610afd80871fbba917c7f3ae08a097721f42787ac931c24269b8497fcfc6b5c0",
+    "bytes": 5373511978,
+    "passes": 1,
+    "started_epoch": 1795201986.940017,
+    "completed_epoch": 1795201989.3433554,
+    "before": {
+      "path": "/app/agent-team-scratch/models/Kimi-K3.1-Pro-DSpark-preview-6a2ef20a05efe88aabbf9ecaa12d020c3b0edf94/model.safetensors",
+      "resolved": "/app/agent-team-scratch/models/Kimi-K3.1-Pro-DSpark-preview-6a2ef20a05efe88aabbf9ecaa12d020c3b0edf94/model.safetensors",
+      "bytes": 5373511978,
+      "device": 58,
+      "inode": 29553349539,
+      "mtime_ns": 1795002597262987487,
+      "ctime_ns": 1795002597321986752,
+      "mode": "0o644"
+    },
+    "after": {
+      "path": "/app/agent-team-scratch/models/Kimi-K3.1-Pro-DSpark-preview-6a2ef20a05efe88aabbf9ecaa12d020c3b0edf94/model.safetensors",
+      "resolved": "/app/agent-team-scratch/models/Kimi-K3.1-Pro-DSpark-preview-6a2ef20a05efe88aabbf9ecaa12d020c3b0edf94/model.safetensors",
+      "bytes": 5373511978,
+      "device": 58,
+      "inode": 29553349539,
+      "mtime_ns": 1795002597262987487,
+      "ctime_ns": 1795002597321986752,
+      "mode": "0o644"
+    },
+    "metadata": {
+      "path": "/app/agent-team-scratch/models/Kimi-K3.1-Pro-DSpark-preview-6a2ef20a05efe88aabbf9ecaa12d020c3b0edf94/.cache/huggingface/download/model.safetensors.metadata",
+      "commit": "6a2ef20a05efe88aabbf9ecaa12d020c3b0edf94",
+      "blob_or_lfs_id": "610afd80871fbba917c7f3ae08a097721f42787ac931c24269b8497fcfc6b5c0",
+      "metadata_sha256": "545d855e5a565be5a298a9134c561353bb1c0d814143916575b5191100c64d41"
+    }
+  },
+  "target_weight_payloads_read": false,
+  "weight_payloads_copied": 0,
+  "weight_symlinks": 97,
+  "nonweight_files_copied": 20,
+  "cache_roots": {
+    "hf-home": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/cache/hf-home",
+    "hf-hub": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/cache/hf-hub",
+    "hf-modules": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/cache/hf-modules",
+    "python": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/cache/python",
+    "triton": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/cache/triton",
+    "torch-extensions": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121/cache/torch-extensions"
+  },
+  "model_use_authorized": false,
+  "read_only_mount_enforced": false,
+  "limitations": [
+    "Target weight identities rely on existing HF metadata/stat; no1.56TB payload rehash.",
+    "Symlinks do not enforce read-only access: later executor must mount views and resolved weight sources read-only.",
+    "Original6d/6a source provenance is retained; no .hf-revision/download metadata markers were created.",
+    "No model, tokenizer, GPU, compiler, installation or qualification run occurred."
+  ]
+}

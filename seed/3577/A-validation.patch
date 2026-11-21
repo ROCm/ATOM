@@ -1,0 +1,140 @@
+--- a/.github/scripts/atom_test.sh
++++ b/.github/scripts/atom_test.sh
+@@ -100,7 +100,7 @@
+           tail -50 "$ATOM_SERVER_LOG" 2>/dev/null || true
+           exit 1
+       fi
+-      if curl -sf "http://localhost:${ATOM_SERVER_PORT}/health" -o /dev/null; then
++      if curl -sf --connect-timeout 2 --max-time 5 "http://localhost:${ATOM_SERVER_PORT}/health" -o /dev/null; then
+           echo "ATOM server HTTP endpoint is up."
+           server_up=true
+           break
+--- a/atom/model_engine/model_runner.py
++++ b/atom/model_engine/model_runner.py
+@@ -1258,6 +1258,7 @@
+                     for p in (tmp_json_path, output_path):
+                         if os.path.exists(p):
+                             os.remove(p)
++                    raise
+ 
+             self.profiler = torch_profiler.profile(
+                 activities=[
+@@ -1270,6 +1271,9 @@
+                 on_trace_ready=_on_trace_ready,
+             )
+             self.profiler.__enter__()
++            if os.environ.get("ATOM_3577_OBSERVER_DIR"):
++                from pp3577_observer import begin
++                begin(self)
+             logger.info(
+                 "Rank %d: profiler started "
+                 "(record_shapes=%s, with_stack=%s, profile_memory=%s, dir=%s)",
+@@ -1289,12 +1293,16 @@
+         """
+         if self.profiler is None:
+             return {"trace_dir": self.profiler_dir, "elapsed": 0.0}
++        if os.environ.get("ATOM_3577_OBSERVER_DIR"):
++            from pp3577_observer import end
++            end(self)
+         t0 = time.monotonic()
+         logger.info("Rank %d: stopping profiler...", self.rank)
+         try:
+             self.profiler.__exit__(None, None, None)
+         except Exception:
+             logger.exception("Rank %d: profiler stop failed", self.rank)
++            raise
+         finally:
+             self.profiler = None
+         elapsed = round(time.monotonic() - t0, 1)
+--- a/atom/benchmarks/benchmark_serving.py
++++ b/atom/benchmarks/benchmark_serving.py
+@@ -707,6 +707,7 @@
+         "accept_length": accept_length,
+         "acceptance_rate": acceptance_rate,
+         "input_lens": [output.prompt_len for output in outputs],
++        "p3577_cached_tokens": [output.cached_tokens for output in outputs],
+         "output_lens": actual_output_lens,
+         "ttfts": [output.ttft for output in outputs],
+         "itls": [output.itl for output in outputs],
+@@ -896,6 +897,18 @@
+     else:
+         raise ValueError(f"Unknown dataset: {args.dataset_name}")
+ 
++    # Validation receipts are written before benchmark timing starts.
++    import hashlib
++    from pathlib import Path
++    receipt = Path(os.environ["ATOM_3577_PROMPTS"])
++    with receipt.open("x") as stream:
++        for index, (prompt, length, output_length, media) in enumerate(input_requests):
++            assert media is None
++            ids = tokenizer.encode(prompt, add_special_tokens=False)
++            assert len(ids) == length
++            stream.write(json.dumps(dict(index=index, prompt=prompt, token_ids=ids,
++                prompt_sha256=hashlib.sha256(prompt.encode()).hexdigest(),
++                input_tokens=length, output_tokens=output_length)) + "\n")
+     goodput_config_dict = check_goodput_args(args)
+ 
+     # Avoid GC processing "static" data - reduce pause times.
+--- a/atom/benchmarks/backend_request_func.py
++++ b/atom/benchmarks/backend_request_func.py
+@@ -46,6 +46,7 @@
+     request_start_ns: int = 0
+     request_end_ns: int = 0
+     full_response_duration_s: float | None = None
++    cached_tokens: int | None = None
+     first_content_ns: int | None = None
+     content_ttft_s: float | None = None
+ 
+@@ -317,6 +318,8 @@
+                                 generated_text += text or ""
+                             if usage := data.get("usage"):
+                                 output.output_tokens = usage.get("completion_tokens")
++                                output.prompt_len = usage["prompt_tokens"]
++                                output.cached_tokens = usage["prompt_tokens_details"]["cached_tokens"]
+                     if first_chunk_received:
+                         output.success = True
+                     else:
+@@ -328,7 +331,7 @@
+                     output.generated_text = generated_text
+                     output.latency = most_recent_timestamp - st
+                 else:
+-                    output.error = response.reason or ""
++                    output.error = f"HTTP {response.status}: {await response.text()}"
+                     output.success = False
+             output.request_end_ns = time.time_ns()
+             output.full_response_duration_s = time.perf_counter() - st
+--- a/atom/entrypoints/openai/serving_completion.py
++++ b/atom/entrypoints/openai/serving_completion.py
+@@ -90,6 +90,7 @@
+     """
+     num_tokens_input = num_prompt_tokens
+     num_tokens_output = 0
++    num_cached_tokens = None
+     null_usage = usage_on_finish and include_usage
+ 
+     # Assume abort until the engine's finished chunk arrives. On client
+@@ -103,6 +104,8 @@
+     try:
+         while True:
+             chunk_data = await stream_collector.get()
++            if "num_cached_tokens" in chunk_data:
++                num_cached_tokens = max(num_cached_tokens or 0, chunk_data["num_cached_tokens"])
+             # The echo leads the first chunk rather than going out on its
+             # own: every stream waits on its collector before the first
+             # frame, which keeps queueing and prefill out of the silence
+@@ -131,6 +134,7 @@
+                 # + [DONE]) into a single send. At a wave boundary many requests
+                 # finish simultaneously; collapsing 4 sends/req to 1 cuts the
+                 # per-request socket-write syscalls that saturate the API loop.
++                assert num_cached_tokens is not None, "missing cache receipt"
+                 usage_chunk = {
+                     "id": request_id,
+                     "object": TEXT_COMPLETION_OBJECT,
+@@ -139,6 +143,7 @@
+                     "choices": [],
+                     "usage": {
+                         "prompt_tokens": num_tokens_input,
++                        "prompt_tokens_details": {"cached_tokens": num_cached_tokens},
+                         "completion_tokens": num_tokens_output,
+                         "total_tokens": num_tokens_input + num_tokens_output,
+                     },

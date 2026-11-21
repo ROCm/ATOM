@@ -1,0 +1,64 @@
+{
+  "A": {
+    "source": "fb1304722a9f79cd16e7383b8b504ccb29851d77",
+    "patch_sha256": "47a8ee0ff12d1c2c0b8bfb3813acd64468a6291f8cb7c8b7c17a27cc48af188e",
+    "files": [
+      {
+        "path": ".github/scripts/atom_test.sh",
+        "base_sha256": "7b622475921d8412079a7199828ce221823cdab1fe84be4c57cd8e03be6fea20",
+        "overlay_sha256": "982866c61cfc6017a1be4f258ef57a98a131e6985e2f69a6bc9c7f92caf92a11"
+      },
+      {
+        "path": "atom/model_engine/model_runner.py",
+        "base_sha256": "8c63ff80ffbc054680c485dd50efed6ba35534212c059a28a26b9af1afb8fc49",
+        "overlay_sha256": "59aacb80e904a86162d25a0a6523ae0051683fa3ff71d7e71a816497056e68f9"
+      },
+      {
+        "path": "atom/benchmarks/benchmark_serving.py",
+        "base_sha256": "ca5f95ed9c42636ac97643cc7d54a49153752977f578266f2e357c3d5cb6ba58",
+        "overlay_sha256": "14a944c7bd57e558643918d7df42c921f57e8bf01142a2a30992863a7ccbe538"
+      },
+      {
+        "path": "atom/benchmarks/backend_request_func.py",
+        "base_sha256": "053af3ba00992cb5c87c3007cd6d41b2da5aeba953417a69b14d4d86917514f6",
+        "overlay_sha256": "44cfab449b3d105429a99193ec6267efde9a3a9be297acf9cde9c8700dd4918a"
+      },
+      {
+        "path": "atom/entrypoints/openai/serving_completion.py",
+        "base_sha256": "829d5bf9afebf6b852d4b9942f022d3b582acb8b8f4d3d3a295f833fa488542f",
+        "overlay_sha256": "f3667ea24d5a3ffa1ec4cf8395191305a6520e9c978cfacfb2b2a8126d49eb3e"
+      }
+    ]
+  },
+  "B": {
+    "source": "8e354a56986bb6342139b657bb9e45e460171385",
+    "patch_sha256": "47a8ee0ff12d1c2c0b8bfb3813acd64468a6291f8cb7c8b7c17a27cc48af188e",
+    "files": [
+      {
+        "path": ".github/scripts/atom_test.sh",
+        "base_sha256": "7b622475921d8412079a7199828ce221823cdab1fe84be4c57cd8e03be6fea20",
+        "overlay_sha256": "982866c61cfc6017a1be4f258ef57a98a131e6985e2f69a6bc9c7f92caf92a11"
+      },
+      {
+        "path": "atom/model_engine/model_runner.py",
+        "base_sha256": "8c63ff80ffbc054680c485dd50efed6ba35534212c059a28a26b9af1afb8fc49",
+        "overlay_sha256": "59aacb80e904a86162d25a0a6523ae0051683fa3ff71d7e71a816497056e68f9"
+      },
+      {
+        "path": "atom/benchmarks/benchmark_serving.py",
+        "base_sha256": "ca5f95ed9c42636ac97643cc7d54a49153752977f578266f2e357c3d5cb6ba58",
+        "overlay_sha256": "14a944c7bd57e558643918d7df42c921f57e8bf01142a2a30992863a7ccbe538"
+      },
+      {
+        "path": "atom/benchmarks/backend_request_func.py",
+        "base_sha256": "053af3ba00992cb5c87c3007cd6d41b2da5aeba953417a69b14d4d86917514f6",
+        "overlay_sha256": "44cfab449b3d105429a99193ec6267efde9a3a9be297acf9cde9c8700dd4918a"
+      },
+      {
+        "path": "atom/entrypoints/openai/serving_completion.py",
+        "base_sha256": "829d5bf9afebf6b852d4b9942f022d3b582acb8b8f4d3d3a295f833fa488542f",
+        "overlay_sha256": "f3667ea24d5a3ffa1ec4cf8395191305a6520e9c978cfacfb2b2a8126d49eb3e"
+      }
+    ]
+  }
+}

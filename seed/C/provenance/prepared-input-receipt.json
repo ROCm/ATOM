@@ -1,0 +1,120 @@
+{
+  "schema": 1,
+  "kind": "actual CPU-prepared C requests and population",
+  "status": "completed",
+  "result_acceptance": "pending independent prepared-input review",
+  "helper_attempt_count": 1,
+  "returncode": 0,
+  "started_epoch": 1795212102.224649,
+  "ended_epoch": 1795212105.8971522,
+  "elapsed_seconds": 3.6725040059536695,
+  "preuse_age_at_start_seconds": 0.00641632080078125,
+  "generator_sha256": "6e852485b077870060d316068d1b0655b89302d8cd46430eb4584034a6f18095",
+  "asset_manifest_sha256": "22b0f58a0e84f2d064710a5b61e8f770e8c9f72fe98939e7169c4bd74272054a",
+  "task_data_revision": "740312add88f781978c0658806c59bc2815b9866",
+  "source_sha": "1eed1d260d28efa871f1ae44a8eff7df361ac0fa",
+  "source_protocol_sha256": "99f572bbffeeedead09ebe1a198dce5f02f45d7687c25d576ec2a5186f582be1",
+  "image": "sha256:ea74fa0b05d8c7a062ae235b901cb2b1bc0c169b0a5edd7ca07bfa3b967ca462",
+  "cpu_scope": "image-owned tokenizer/data dependencies only; no full model runtime equivalence",
+  "cpu_affinity": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "runtime_inventory_freeze_sha256": "e6aa8f0e4b0efc5ec5e642013a5d4f66dc819dfa6da619e2277b4313407ca0d3",
+  "keeper_spec_sha256": "73bfba67ecc7e8085462647a232e61225564f56d80d1a1f640bfc88f3fb8b5ca",
+  "inspector_sha256": "cf6165bde0400a6df8b4ba92c5027b821e8bb14828369a14389b22f21c2cff67",
+  "owned_keeper_binding_sha256": "8c5048cc4b5cde5f9205a3671b42c002107ddfd362ffbae4b9765992ec96e499",
+  "keeper_id": "7a0f79ddb5f0dcb31df0a16391b29928eb701317e0dd2e71b886253ae5a8d33a",
+  "requests_manifest_sha256": "9f40147888cf3ee9c10eec979f2088db4197b9115c9289df75971210ad5fc8b5",
+  "request_files": [
+    {
+      "file": "300-1.json",
+      "bytes": 3192,
+      "sha256": "00f5623d57fea9a92379046589aec2a3fb7041f198ee48e94c257420e5d76486"
+    },
+    {
+      "file": "300-32.json",
+      "bytes": 3193,
+      "sha256": "d97ba6469399abb4862c94a815a67c7efa1fb6fb5ed5e80cc34b3dab97f7fb4b"
+    },
+    {
+      "file": "512-1.json",
+      "bytes": 5337,
+      "sha256": "3d4dd8d50df8cd1c560c589c76a11b0d8d493cee6291dc8766b5d237ddd63022"
+    },
+    {
+      "file": "512-32.json",
+      "bytes": 5338,
+      "sha256": "cd0b93d113da0932afb2b8767adca7fde9ffc88490b82d23e1162afe7091e0ed"
+    },
+    {
+      "file": "513-1.json",
+      "bytes": 5349,
+      "sha256": "f8f224e2e6ee52c0056f9f9cf1a62b4ae5dfc45cbf999dd2a4b292e6e814413c"
+    },
+    {
+      "file": "513-32.json",
+      "bytes": 5350,
+      "sha256": "d1b8b951fc3f3f90e1ce0812f34f28dbae75e23d0d296ff81373137b77d82cf0"
+    },
+    {
+      "file": "8192-1.json",
+      "bytes": 83097,
+      "sha256": "1786506fabb1798011e302690efd223d7f45a039441a42415685ac0f8cb05b6b"
+    },
+    {
+      "file": "8193-1.json",
+      "bytes": 83109,
+      "sha256": "52f62b29693fd564ecb050735d67b9601a7bdfc9f9547f32f8fa55a4929b2457"
+    },
+    {
+      "file": "manifest.json",
+      "bytes": 1234,
+      "sha256": "9f40147888cf3ee9c10eec979f2088db4197b9115c9289df75971210ad5fc8b5"
+    },
+    {
+      "file": "population.json",
+      "bytes": 825133,
+      "sha256": "b60339375bdf539ae763f0fcba69a3748b0713b07358fc4b575ab02ea8021755"
+    }
+  ],
+  "request_file_count": 10,
+  "manifest_data_file_count": 9,
+  "request_count": 8,
+  "population_rows": 1319,
+  "request_bytes": 1020332,
+  "regular_output_bytes": 1020390,
+  "output_bound_bytes": 16777216,
+  "output_archive": {
+    "file": "output-own-tmpfs.tar",
+    "bytes": 1034240,
+    "sha256": "7480649fc75291f2bd7a95e9737e07f39f820b8f4a7a2d31254a55797331325a"
+  },
+  "remote_output_archive": "/tmp/codex-c-inputs-6e852485-v2/output-own-tmpfs.tar",
+  "local_requests": "C:\\Users\\hexwang\\Documents\\Codex\\2026-11-18\\host-tw-355-jump-x20-hostname\\work\\gpu-executor\\c-input-preparation-run-v3\\output\\requests",
+  "log": {
+    "file": "output/preparation.log",
+    "bytes": 58,
+    "sha256": "a33173905bcf5929ddbb06246cc98533e9853b9b1b9be6e4ce336041faa40903"
+  },
+  "evidence": {
+    "preuse.json": "6e16987e6e47c96c77010c4b6594c99ec53d2c8e0b0a50a18173e7a3318b67d6",
+    "retrieve-tmpfs.json": "dc51ebdde453ef6109a4ebc5031e6155946d3bb2fe9abcbcae00b94b1fd0e6ac",
+    "output-verification.json": "9cc13ce7d692ca517e6b5f71166cf9cb4bd8e2912c4cd510702b8d3d3b75f14f",
+    "cleanup.json": "c59fdb2e3759d5accca7fb46af20459708ab3ccbd8a3933076fd71135071e2dc",
+    "retrieve-transport.json": "8c913263f1760b1e7e2878cb62de02e4ac20b81965f0d9012963958f9d579d87",
+    "output-copy-diagnosis.json": "3a5267a456e4c21eb28822244ef5aafdff50057a7eab94336bf1f3f2d67d2cc6",
+    "docker-cp-empty-output.tar": "75294b73033c7ed2f1150b826baf4899e192edccf1564403f23a63f10553cc84"
+  },
+  "same_init_sleep_identities_preserved": true,
+  "container_removed_and_absence_verified": true,
+  "cleanup_completed_epoch": 1795212407.1932395,
+  "external_namespace_ids_used_for_admission": false,
+  "original_failed_copy_preserved": true,
+  "helper_rerun": false,
+  "gpu_lease_acquired": false,
+  "model_gpu_executed": false,
+  "model_admission_materialized": false
+}

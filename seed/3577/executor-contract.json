@@ -1,0 +1,84 @@
+{
+  "status": "revision3 prepared; common core source cleared and kernel CPU check passed; case/model/caller-policy bindings pending; unexecuted",
+  "common_owner": "/root/gpu_executor",
+  "common_core_source": "work/gpu-executor/3618-preparation/supervise.py",
+  "reviewed_candidate_core_sha256": "f280e865fc6667ecf53669e5e24a5b7f34a773efe61992f7d2d2f18fd9660d81",
+  "linux_api_check_sha256": "ca15d0642700970e3a9dc9cb215e1162f247f83048ca9dea73f21330d03b7ab3",
+  "core_clearance": "Final f280 core passed7/7+blind source review and actual common kernel CPU self-check. Earlier8a70 superseded by original-exit latch repair. Fresh same-namespace check and exact3577 case adapter remain pre-use gates.",
+  "case_adapter": "Only common owner may bind the ultimately cleared core to these fixed paths, commands, image and caps. No copied process-ownership framework.",
+  "root": "/app/atom-3577",
+  "entry": [
+    "bash",
+    "/app/atom-3577/input/run_leg.sh"
+  ],
+  "allowed_legs": [
+    "A-pp2",
+    "B-pp2",
+    "B-accuracy"
+  ],
+  "whole_leg_seconds": {
+    "A-pp2": 2700,
+    "B-pp2": 2700,
+    "B-accuracy": 5100
+  },
+  "phase_seconds": {
+    "server_launch_including_health_and_warmup": 1500,
+    "health_connect": 2,
+    "health_total": 5,
+    "short_benchmark_including_bundle": 360,
+    "accuracy_including_driver_drain": 2760,
+    "single_exact_trace_including_profile_flush": 660,
+    "timeout_term_to_kill": 10,
+    "common_cleanup_before_quarantine": 10
+  },
+  "cleanup": {
+    "always": "Run the common cleanup after entry success, failure, timeout, signal or failed receipt; a background server is expected even on successful entry exit.",
+    "authority": "Retained pidfds proved as kernel direct children with waitid(P_PIDFD, WNOWAIT); subreaper adoption drained until ECHILD.",
+    "release": "Release lease only after proved child-free cleanup. Preserve failures and quarantine/retain lease on unresolved ownership or unkillable descendants; no next job.",
+    "forbidden": [
+      "stock atom_test.sh stop",
+      "host PID scanning as ownership",
+      "broad pkill",
+      "process group membership as ownership"
+    ]
+  },
+  "isolation": {
+    "container": "One new root-approved disposable executor per leg; never run stock launch in shared devil_atom_1118.",
+    "namespaces": "Private PID, IPC and mount namespaces; save actual host/container namespace identities and container ID. Never use --pid=host or --ipc=host.",
+    "cache": "Natural process HOME and its .cache/atom live in the fresh private writable container layer, with no symlink or shared bind at/above that cache. Save Docker inspect plus mountinfo proving this before stock launch clears the cache.",
+    "other_state": "Private /tmp, /dev/shm, compiler/cache roots and HF processed-data cache. No shared source/runtime/cache mutation. No inherited ATOM/MoRI/connector/graph override outside the explicit launch environment allowlist.",
+    "mounts": {
+      "/app/atom-3577/input": "read-only flat prepared input bundle",
+      "/app/atom-3577/data": "read-only pinned GSM8K parquet input files",
+      "/app/atom-3577/source": "task-owned persistent writable exact-source checkout with only the frozen validation patch",
+      "/app/atom-3577/evidence": "task-owned persistent writable fresh output",
+      "/models": "read-only completed pinned target and draft snapshots",
+      "/app/agent-team-scratch/g24-gpu.lock": "same shared lease file/inode used by root coordinator"
+    },
+    "hardware": "Only the admitted eight GPUs; record physical UUID/PCI/local-index/rank mapping, driver/runtime and no competing process/lease. Preserve global device nodes and other workloads."
+  },
+  "input_pins": {
+    "image": "rocm/atom-dev@sha256:ea74fa0b05d8c7a062ae235b901cb2b1bc0c169b0a5edd7ca07bfa3b967ca462",
+    "lm_eval": "0.4.13",
+    "datasets": "5.2.0",
+    "transformers": "5.16.1",
+    "gsm8k_repository": "openai/gsm8k",
+    "gsm8k_revision": "740312add88f781978c0658806c59bc2815b9866",
+    "gsm8k_train_sha256": "ea82612ea9582142387730c793eb67d3b12849002bc0b7fa6f8efafa7351419d",
+    "gsm8k_test_sha256": "ee7b8da9e381df27b9e3f7758a159ab2bdaa4dbaa910546cbbc47e0cb44e4f59",
+    "aiter_git": "b9e08daca8c45dd758f4fa1fbb7d0da027f399c9",
+    "python": "3.12.3",
+    "torch": "2.10.0+rocm7.2.4.lw.git3d3aa833",
+    "triton": "3.8.0+amd.rocm7.2.0.git7cb7b059"
+  },
+  "required_admission": "Approval binds exact case-adapter/input manifest/image/mounts/admission digests. Fresh successful same-Python/same-PID-namespace Linux ownership receipt must be no older than120s before lease. verify_inputs.py independently checks source/runtime/model/cached dataset/namespace values; no self-attested manifest replaces host-side mount/device checks.",
+  "postflight": "Save unmodified common gpu-exit.json as evidence/LEG/supervisor-exit.json, including lease_held false, lease_released_utc, kernel_children_empty and owned_remaining. Retain complete source/accuracy_test_results even when driver exits before copying it. Preserve all partial traces, response bodies, client logs and failure receipts.",
+  "pending_bindings": "preuse-bindings.json contains null model_view_receipt/case_adapter/caller_policy until actual executor receipts are frozen and reviewed; no .hf-revision marker is required or created.",
+  "local_model_composition": "Sole executor is preparing a private d9 target component view from96existing6d-origin weight blobs plus15unchanged small files and verified d9 encoding; private187draft components use6a-origin scratch weight only after one full5.37GB SHA256 and exact187small files. Actual manifests must retain source origin and hash depth; no folder revision relabeling.",
+  "candidate_model_view_receipt": {
+    "sha256": "22b0f58a0e84f2d064710a5b61e8f770e8c9f72fe98939e7169c4bd74272054a",
+    "local_receipt": "work/gpu-executor/asset-views-d9-187/composition-manifest.json",
+    "view_root": "/app/agent-team-scratch/model-views-3577-c-d9-187-20261121",
+    "status": "received for independent review; model use and read-only mounts not authorized/bound; preuse model binding remains null"
+  }
+}

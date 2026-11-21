@@ -1,0 +1,70 @@
+{
+  "qualification": "local-g24-ea74-B9; separate from historical CI f3c2/d17",
+  "image_digest": "sha256:ea74fa0b05d8c7a062ae235b901cb2b1bc0c169b0a5edd7ca07bfa3b967ca462",
+  "common_core_sha256": "f280e865fc6667ecf53669e5e24a5b7f34a773efe61992f7d2d2f18fd9660d81",
+  "python": {
+    "version": "3.12.3",
+    "executable": "/opt/venv/bin/python",
+    "binary_sha256": "e1efa562c2cc2e35521a5c9c9b9939921001ff8ca9708a13ef15ace68cc2ccd7"
+  },
+  "aiter_git": "b9e08daca8c45dd758f4fa1fbb7d0da027f399c9",
+  "aiter_parallel_state_sha256": "b08c50e4195bcfdbd862fd5b7844fab8a76779c0c155dd026e082062ece8bce5",
+  "aiter_transport_identity": "B9 source is byte-identical to the previously inspected d17 transport blob; independent reviewer verified.",
+  "packages": {
+    "lm_eval": {
+      "version": "0.4.13",
+      "metadata_sha256": {
+        "METADATA": "b7f42a16aee1d26fb18a25b2eecfa0cd0e9b06f082a1990cddec8285f191ce93",
+        "RECORD": "4cb91ed6b8aa61ae7b471ac25f2cc5a55c6be311a0bcca5c22a9d3f42059d99c"
+      }
+    },
+    "datasets": {
+      "version": "5.2.0",
+      "metadata_sha256": {
+        "METADATA": "6be9da154c94549f9c130e1e5a74deafcf5d6a32d0f66d95cf0bd68eb1085d4f",
+        "RECORD": "6d0f802b0075fb64ee810c3b95f7c765dade49dacc06774b804f63919b36ce0e"
+      }
+    },
+    "transformers": {
+      "version": "5.16.1",
+      "metadata_sha256": {
+        "METADATA": "a552b99768921327581cb0e1389718d39cb25f09d4f49b80aa9fc27a843d09e4",
+        "RECORD": "deb95183886b6bed19ba7dce4f2864081b985bc21f08dc680bb4464a5d309f10"
+      }
+    },
+    "huggingface_hub": {
+      "version": "1.33.0",
+      "metadata_sha256": {
+        "METADATA": "bee565776d66f486d224f74024b656a69ed42e2639d80b18811fca4365adc42e",
+        "RECORD": "4e1e9739edac2451e9126a4be18dafd4930beba0b32c3ebcf46dc8bd2083ff32"
+      }
+    },
+    "tokenizers": {
+      "version": "0.23.3",
+      "metadata_sha256": {
+        "METADATA": "87032ea29ec14be956ce0f15d164a8f436d6f1adbe19b261d6c179d9184f5cba",
+        "RECORD": "892a4fa0fdcdb2417cf758bda562871c733c1454942c38c2236748ef1cd42ebf"
+      }
+    },
+    "torch": {
+      "version": "2.10.0+rocm7.2.4.lw.git3d3aa833",
+      "metadata_sha256": {
+        "METADATA": "0aedfe3076196a2e36d1c79c46071641f52f5dd5cdabdd9214a743826fa8e26f",
+        "RECORD": "c908ec61e73172360b0617676e42fcc8d5d278b039a0a01a7b725ddaafc3db74"
+      }
+    },
+    "triton": {
+      "version": "3.8.0+amd.rocm7.2.0.git7cb7b059",
+      "metadata_sha256": {
+        "METADATA": "e5ffe82f1be41d80cc5849ad6faa77387da56846ceba45e6070b941964077ec7",
+        "RECORD": "9c9a56216461ad91ef1816e4b486517a063d6f190d76b5d3cb0569ef553c0640"
+      }
+    }
+  },
+  "gsm8k_revision": "740312add88f781978c0658806c59bc2815b9866",
+  "gsm8k_task_yaml_sha256": "82eb1780b263bc040729032b3e076990c7933f42163c91e359f38820dd1d8833",
+  "provenance_receipt": "work/gpu-executor/model-inventory/client-package-metadata.json",
+  "provenance_receipt_sha256": "2e0d3210d6d7daccbfdb1070d19ba9878b207eee5d3f692031ed85974e3d45b7",
+  "accelerate": "Not installed and not required by the inspected local-completions path; no install/admission requirement.",
+  "verification_scope": "Actual relevant distribution version/METADATA/RECORD provenance, Python binary, imported AITER Git/source and task/driver hashes. No full-environment byte audit."
+}

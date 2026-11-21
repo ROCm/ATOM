@@ -1,0 +1,122 @@
+{
+  "image": "sha256:ea74fa0b05d8c7a062ae235b901cb2b1bc0c169b0a5edd7ca07bfa3b967ca462",
+  "aiter": "b9e08daca8c45dd758f4fa1fbb7d0da027f399c9",
+  "supervisor": "f280e865fc6667ecf53669e5e24a5b7f34a773efe61992f7d2d2f18fd9660d81",
+  "model_manifest": "22b0f58a0e84f2d064710a5b61e8f770e8c9f72fe98939e7169c4bd74272054a",
+  "python_sha256": "e1efa562c2cc2e35521a5c9c9b9939921001ff8ca9708a13ef15ace68cc2ccd7",
+  "package_versions": {
+    "lm_eval": "0.4.13",
+    "datasets": "5.2.0",
+    "transformers": "5.16.1",
+    "huggingface_hub": "1.33.0",
+    "tokenizers": "0.23.3",
+    "torch": "2.10.0+rocm7.2.4.lw.git3d3aa833",
+    "triton": "3.8.0+amd.rocm7.2.0.git7cb7b059"
+  },
+  "package_files": [
+    {
+      "path": "/opt/venv/lib/python3.12/site-packages/lm_eval-0.4.13.dist-info/METADATA",
+      "sha256": "b7f42a16aee1d26fb18a25b2eecfa0cd0e9b06f082a1990cddec8285f191ce93"
+    },
+    {
+      "path": "/opt/venv/lib/python3.12/site-packages/lm_eval-0.4.13.dist-info/RECORD",
+      "sha256": "4cb91ed6b8aa61ae7b471ac25f2cc5a55c6be311a0bcca5c22a9d3f42059d99c"
+    },
+    {
+      "path": "/opt/venv/lib/python3.12/site-packages/datasets-5.2.0.dist-info/METADATA",
+      "sha256": "6be9da154c94549f9c130e1e5a74deafcf5d6a32d0f66d95cf0bd68eb1085d4f"
+    },
+    {
+      "path": "/opt/venv/lib/python3.12/site-packages/datasets-5.2.0.dist-info/RECORD",
+      "sha256": "6d0f802b0075fb64ee810c3b95f7c765dade49dacc06774b804f63919b36ce0e"
+    },
+    {
+      "path": "/opt/venv/lib/python3.12/site-packages/transformers-5.16.1.dist-info/METADATA",
+      "sha256": "a552b99768921327581cb0e1389718d39cb25f09d4f49b80aa9fc27a843d09e4"
+    },
+    {
+      "path": "/opt/venv/lib/python3.12/site-packages/transformers-5.16.1.dist-info/RECORD",
+      "sha256": "deb95183886b6bed19ba7dce4f2864081b985bc21f08dc680bb4464a5d309f10"
+    },
+    {
+      "path": "/opt/venv/lib/python3.12/site-packages/huggingface_hub-1.33.0.dist-info/METADATA",
+      "sha256": "bee565776d66f486d224f74024b656a69ed42e2639d80b18811fca4365adc42e"
+    },
+    {
+      "path": "/opt/venv/lib/python3.12/site-packages/huggingface_hub-1.33.0.dist-info/RECORD",
+      "sha256": "4e1e9739edac2451e9126a4be18dafd4930beba0b32c3ebcf46dc8bd2083ff32"
+    },
+    {
+      "path": "/opt/venv/lib/python3.12/site-packages/tokenizers-0.23.3.dist-info/METADATA",
+      "sha256": "87032ea29ec14be956ce0f15d164a8f436d6f1adbe19b261d6c179d9184f5cba"
+    },
+    {
+      "path": "/opt/venv/lib/python3.12/site-packages/tokenizers-0.23.3.dist-info/RECORD",
+      "sha256": "892a4fa0fdcdb2417cf758bda562871c733c1454942c38c2236748ef1cd42ebf"
+    },
+    {
+      "path": "/opt/venv/lib/python3.12/site-packages/torch-2.10.0+rocm7.2.4.lw.git3d3aa833.dist-info/METADATA",
+      "sha256": "0aedfe3076196a2e36d1c79c46071641f52f5dd5cdabdd9214a743826fa8e26f"
+    },
+    {
+      "path": "/opt/venv/lib/python3.12/site-packages/torch-2.10.0+rocm7.2.4.lw.git3d3aa833.dist-info/RECORD",
+      "sha256": "c908ec61e73172360b0617676e42fcc8d5d278b039a0a01a7b725ddaafc3db74"
+    },
+    {
+      "path": "/opt/venv/lib/python3.12/site-packages/triton-3.8.0+amd.rocm7.2.0.git7cb7b059.dist-info/METADATA",
+      "sha256": "e5ffe82f1be41d80cc5849ad6faa77387da56846ceba45e6070b941964077ec7"
+    },
+    {
+      "path": "/opt/venv/lib/python3.12/site-packages/triton-3.8.0+amd.rocm7.2.0.git7cb7b059.dist-info/RECORD",
+      "sha256": "9c9a56216461ad91ef1816e4b486517a063d6f190d76b5d3cb0569ef553c0640"
+    }
+  ],
+  "task_sha256": "82eb1780b263bc040729032b3e076990c7933f42163c91e359f38820dd1d8833",
+  "data": {
+    "revision": "740312add88f781978c0658806c59bc2815b9866",
+    "train": {
+      "file": "train.parquet",
+      "sha256": "ea82612ea9582142387730c793eb67d3b12849002bc0b7fa6f8efafa7351419d",
+      "rows": 7473
+    },
+    "test": {
+      "file": "test.parquet",
+      "sha256": "ee7b8da9e381df27b9e3f7758a159ab2bdaa4dbaa910546cbbc47e0cb44e4f59",
+      "rows": 1319
+    }
+  },
+  "source": {
+    "candidate": "1eed1d260d28efa871f1ae44a8eff7df361ac0fa",
+    "main": "fb1304722a9f79cd16e7383b8b504ccb29851d77"
+  },
+  "source_files": {
+    "candidate": {
+      "atom/model_engine/arg_utils.py": "31620e606557865e560074481a2b9cd2bb57bc55f18136251e84c1fbf9bd2742",
+      "atom/entrypoints/openai/protocol.py": "99f572bbffeeedead09ebe1a198dce5f02f45d7687c25d576ec2a5186f582be1",
+      "atom/entrypoints/openai/api_server.py": "62100fc5b16340e8275494d58e8040027d27d9aa40b0526316ebbec7759944cc",
+      "atom/entrypoints/openai/serving_completion.py": "829d5bf9afebf6b852d4b9942f022d3b582acb8b8f4d3d3a295f833fa488542f",
+      "atom/utils/arg_parser.py": "3ce3719eba5610c3a6c0994000061b8ffe99be7c19fa174b5c25894890617d8e",
+      "scripts/wait_infer_drain.sh": "d4f41fa25a810dd706048fa215534f0cdbc13e93ed2af0fc9b6ac9816fbb7641",
+      "tools/analyze_trace_summary.py": "48314e9f833f77b810df39f25b5bf5b1fbdf976a8b86f7a15ee3997a19db4fab"
+    },
+    "main": {
+      "atom/model_engine/arg_utils.py": "31620e606557865e560074481a2b9cd2bb57bc55f18136251e84c1fbf9bd2742",
+      "atom/entrypoints/openai/protocol.py": "99f572bbffeeedead09ebe1a198dce5f02f45d7687c25d576ec2a5186f582be1",
+      "atom/entrypoints/openai/api_server.py": "62100fc5b16340e8275494d58e8040027d27d9aa40b0526316ebbec7759944cc",
+      "atom/entrypoints/openai/serving_completion.py": "829d5bf9afebf6b852d4b9942f022d3b582acb8b8f4d3d3a295f833fa488542f",
+      "atom/utils/arg_parser.py": "3ce3719eba5610c3a6c0994000061b8ffe99be7c19fa174b5c25894890617d8e",
+      "scripts/wait_infer_drain.sh": "d4f41fa25a810dd706048fa215534f0cdbc13e93ed2af0fc9b6ac9816fbb7641",
+      "tools/analyze_trace_summary.py": "48314e9f833f77b810df39f25b5bf5b1fbdf976a8b86f7a15ee3997a19db4fab"
+    }
+  },
+  "client_source_files": {
+    "lm_eval/__main__.py": "d35b8a2be8e89912e557a9833cd17ff087369071c6163fb65c7b0ce5b0c4f97f",
+    "lm_eval/_cli/run.py": "3d2d970783035f7110ce024b087051fc37d5c7c5537a76cbfb9b88736acd547f",
+    "lm_eval/evaluator.py": "628120153cf24471ead0789106e5c18b02855a7cc77a9aa5da8069fdeab57ed5",
+    "lm_eval/api/task.py": "4c25a4f1949488483b833ce4fcf91cfd3e066084a9ea00079c6879ae3ba95657",
+    "lm_eval/models/api_models.py": "8da25fde90c9a14ee7c603177a08814a3ac57aed7f18f6a00e040771335212cf",
+    "lm_eval/models/openai_completions.py": "0afb2771209f9261a2ec0146cbd01928f22747e994a25225c24fd046c5c138ff",
+    "lm_eval/tasks/manager.py": "60bb2c502dba0d9292b7b299b47b65ec56efd50b803c895f06055645d72b006c",
+    "lm_eval/loggers/evaluation_tracker.py": "642d5a9b02a72a68d4ec614aab796635b0eb5684c0c6a433eb31b9ac056c80a2"
+  }
+}
