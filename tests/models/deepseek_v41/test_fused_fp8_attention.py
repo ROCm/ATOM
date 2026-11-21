@@ -252,6 +252,9 @@ def test_fused_support_query_is_owned_by_aiter(single_rank, monkeypatch, support
         return supported
 
     monkeypatch.setattr(attention, "fused_attention_available", supports)
+    monkeypatch.setattr(
+        "atom.model_ops.linear.native_group32_runs_bf16", lambda: False
+    )
     config = SimpleNamespace(
         fp4ptpc=False,
         head_dim=512,
