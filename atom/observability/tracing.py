@@ -160,10 +160,9 @@ def bind_sequences(seqs, *, unsupported=None):
                 )
                 _unbind(seq)
                 continue
-            seq._atom_trace_carrier = dict(request["carrier"])
-            seq._atom_trace_model = request["model"]
-            seq._atom_trace_request_id = request.get("request_id")
-            seq._atom_trace_timing = None
+            adopt_context(
+                seq, request["carrier"], request["model"], request.get("request_id")
+            )
         except Exception:  # noqa: BLE001 - an untraced request still runs
             _unbind(seq)
             _warn_once()

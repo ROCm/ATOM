@@ -280,6 +280,22 @@ class OffloadJointRecord:
         self.hbm_hit_tokens = 0
 
 
+def media_cache_seed(multimodal_data: dict | None, known: int | None = None) -> int:
+    """The content identity of a prompt's media: -1 for a text prompt, else
+    the seed `multimodal_data` carries, else `known` (a client's hash of the
+    same media), else its hash."""
+    if multimodal_data is None:
+        return -1
+    seed = multimodal_data.get("cache_seed")
+    if seed is None:
+        seed = known
+    if seed is None:
+        from atom.model_engine.multimodal_runtime import multimodal_cache_seed
+
+        seed = multimodal_cache_seed(multimodal_data)
+    return seed
+
+
 class Sequence:
     counter = count()
 
@@ -304,6 +320,7 @@ class Sequence:
         data_parallel_rank: int | None = None,
         dp_session_id: str | None = None,
         dp_parent_session_id: str | None = None,
+        cache_seed: int | None = None,
     ):
         # Built here rather than as a default argument: one instance shared by
         # every defaulting Sequence would be a mutable default in all but name.
@@ -327,13 +344,7 @@ class Sequence:
         self.multimodal_data = multimodal_data
         self.multimodal_cache_ready = False
         # Immutable content identity survives payload release and preemption.
-        self.cache_seed = -1
-        if multimodal_data is not None:
-            from atom.model_engine.multimodal_runtime import multimodal_cache_seed
-
-            self.cache_seed = multimodal_data.get("cache_seed")
-            if self.cache_seed is None:
-                self.cache_seed = multimodal_cache_seed(multimodal_data)
+        self.cache_seed = media_cache_seed(multimodal_data, cache_seed)
         self.mrope_positions = mrope_positions
         self.mrope_position_delta = mrope_position_delta
         self.num_tokens = len(self.token_ids)

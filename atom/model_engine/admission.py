@@ -10,7 +10,8 @@ frontend's checks.
 
 `build_sequence` is the Core's half: it turns a decoded request
 (`zmq_protocol.codec.AdmissionSpec`) into the `Sequence` the scheduler has
-always taken.
+always taken. `validate_for_model` and `mrope_for` are what the frontend's
+`InputOutputProcessor` runs for the same request.
 """
 
 from dataclasses import replace
@@ -37,6 +38,33 @@ def check_sampling(config, params: SamplingParams, *, kv_transfer, multimodal) -
         )
 
 
+def num_draft_tokens(config) -> int:
+    """The draft width a sequence carries under `config`'s speculation."""
+    speculative = config.speculative_config
+    return speculative.num_speculative_tokens if speculative is not None else 0
+
+
+def validate_for_model(config, *, num_draft_tokens, multimodal_data) -> None:
+    """The model's own refusals (`hf_config.validate_request`), if it has any."""
+    validate_request = getattr(config.hf_config, "validate_request", None)
+    if validate_request is not None:
+        validate_request(
+            num_draft_tokens=num_draft_tokens,
+            multimodal_data=multimodal_data,
+            enable_dp_attention=config.enable_dp_attention,
+        )
+
+
+def mrope_for(config, token_ids, multimodal_data):
+    """`(mrope_positions, mrope_position_delta)` of a prompt: `(None, 0)` for
+    a text one."""
+    if multimodal_data is None:
+        return None, 0
+    from atom.multimodal.registry import get_mrope_input_positions
+
+    return get_mrope_input_positions(config, token_ids, multimodal_data)
+
+
 class AdmissionContext:
     """How a Core turns a decoded request into its `Sequence`.
 
@@ -47,12 +75,9 @@ class AdmissionContext:
     """
 
     def __init__(self, config):
-        speculative = config.speculative_config
         self.config = config
         self.block_size = config.kv_cache_block_size
-        self.num_draft_tokens = (
-            speculative.num_speculative_tokens if speculative is not None else 0
-        )
+        self.num_draft_tokens = num_draft_tokens(config)
         self.has_per_req_cache = (
             config.hf_config.model_type in PER_REQ_CACHE_MODEL_TYPES
         )
@@ -88,13 +113,11 @@ def build_sequence(spec, context: AdmissionContext) -> Sequence:
             multimodal=multimodal_data is not None,
             relaxed_mtp=envs.ATOM_ENABLE_RELAXED_MTP,
         )
-    validate_request = getattr(context.config.hf_config, "validate_request", None)
-    if validate_request is not None:
-        validate_request(
-            num_draft_tokens=context.num_draft_tokens,
-            multimodal_data=multimodal_data,
-            enable_dp_attention=context.config.enable_dp_attention,
-        )
+    validate_for_model(
+        context.config,
+        num_draft_tokens=context.num_draft_tokens,
+        multimodal_data=multimodal_data,
+    )
     if params.required_channel is not None:
         kwargs["sampling_params"] = replace(
             params,
@@ -102,35 +125,18 @@ def build_sequence(spec, context: AdmissionContext) -> Sequence:
         )
     if multimodal_data is not None and kwargs["mrope_positions"] is None:
         # A client that cannot run the model's MRoPE code leaves them out.
-        from atom.multimodal.registry import get_mrope_input_positions
-
-        (
-            kwargs["mrope_positions"],
-            kwargs["mrope_position_delta"],
-        ) = get_mrope_input_positions(
+        kwargs["mrope_positions"], kwargs["mrope_position_delta"] = mrope_for(
             context.config, list(kwargs["token_ids"]), multimodal_data
         )
-    # The client hashed the media already; hand the seed to the constructor
-    # the way it reads one, then take it back out, so the sequence's
-    # multimodal_data is the dict the client sent.
-    lend_seed = (
-        spec.cache_seed is not None
-        and multimodal_data is not None
-        and "cache_seed" not in multimodal_data
+    seq = Sequence(
+        block_size=context.block_size,
+        num_draft_tokens=context.num_draft_tokens,
+        has_per_req_cache=context.has_per_req_cache,
+        id=spec.seq_id,
+        # The client hashed the media already.
+        cache_seed=spec.cache_seed,
+        **kwargs,
     )
-    if lend_seed:
-        multimodal_data["cache_seed"] = spec.cache_seed
-    try:
-        seq = Sequence(
-            block_size=context.block_size,
-            num_draft_tokens=context.num_draft_tokens,
-            has_per_req_cache=context.has_per_req_cache,
-            id=spec.seq_id,
-            **kwargs,
-        )
-    finally:
-        if lend_seed:
-            del multimodal_data["cache_seed"]
     seq.max_tokens = spec.max_tokens
     seq.arrive_time = spec.arrive_time
     seq.dp_est_cached_tokens = spec.dp_est_cached_tokens

@@ -11,17 +11,21 @@ from typing import Any
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from atom.config import Config
-from atom.model_engine.admission import check_sampling
+from atom.model_engine.admission import (
+    check_sampling,
+    mrope_for,
+    num_draft_tokens,
+    validate_for_model,
+)
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
 from atom.model_engine.prefix_hash import hash_block_size_for, ship_prompt_hash_chain
 from atom.model_engine.segment_tokenizer import PrefixEncoding, SegmentTokenizer
-from atom.model_engine.sequence import Sequence
+from atom.model_engine.sequence import Sequence, media_cache_seed
 from atom.model_engine.zmq_protocol.requests import (
     CompletionResult,
     IngressRequest,
     prompt_token_array,
 )
-from atom.multimodal.registry import get_mrope_input_positions
 from atom.sampling_params import EngineChannel, SamplingParams
 from atom.structured_output import is_structured
 from atom.structured_output.validation import (
@@ -686,14 +690,7 @@ class InputOutputProcessor:
         self._internal_to_external: dict[int, str] = {}
         # Only for the model's own request validation up front; the engine
         # derives the sequence's draft width from its own config.
-        self.num_speculative_tokens = 0
-        if (
-            hasattr(self.config, "speculative_config")
-            and self.config.speculative_config is not None
-        ):
-            self.num_speculative_tokens = (
-                self.config.speculative_config.num_speculative_tokens
-            )
+        self.num_speculative_tokens = num_draft_tokens(config)
         # `BlockManager.hash_block_size`, for shipping the prompt hash chain;
         # 0 = no prefix cache. The engine rehashes on a mismatch.
         self.prefix_hash_block_size = 0
@@ -803,13 +800,11 @@ class InputOutputProcessor:
             self.structured_admission(
                 sampling_params, kv_transfer_params, multimodal_data is not None
             )
-        request_validator = getattr(self.config.hf_config, "validate_request", None)
-        if request_validator is not None:
-            request_validator(
-                num_draft_tokens=self.num_speculative_tokens,
-                multimodal_data=multimodal_data,
-                enable_dp_attention=self.config.enable_dp_attention,
-            )
+        validate_for_model(
+            self.config,
+            num_draft_tokens=self.num_speculative_tokens,
+            multimodal_data=multimodal_data,
+        )
         n = max(1, int(getattr(sampling_params, "n", 1)))
 
         if isinstance(prompt_or_tokens, str):
@@ -822,14 +817,9 @@ class InputOutputProcessor:
         else:
             prefix_encoding = None
             tokens = prompt_or_tokens
-        mrope_positions = None
-        mrope_position_delta = 0
-        if multimodal_data is not None:
-            mrope_positions, mrope_position_delta = get_mrope_input_positions(
-                self.config,
-                tokens,
-                multimodal_data,
-            )
+        mrope_positions, mrope_position_delta = mrope_for(
+            self.config, tokens, multimodal_data
+        )
 
         stop_token_sequences = []
         if sampling_params.stop_strings:
@@ -862,15 +852,7 @@ class InputOutputProcessor:
             raise IndexError("array index out of range")
         # The media's content hash, which `Sequence` would otherwise compute in
         # the engine's input thread: once here, for every sibling.
-        cache_seed = -1  # a text prompt's, as on `Sequence`
-        if multimodal_data is not None:
-            cache_seed = multimodal_data.get("cache_seed")
-            if cache_seed is None:
-                from atom.model_engine.multimodal_runtime import (
-                    multimodal_cache_seed,
-                )
-
-                cache_seed = multimodal_cache_seed(multimodal_data)
+        cache_seed = media_cache_seed(multimodal_data)
 
         seqs: list[IngressRequest] = []
         for i in range(n):

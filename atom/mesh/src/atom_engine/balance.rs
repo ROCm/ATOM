@@ -8,11 +8,6 @@
 
 use std::collections::HashMap;
 
-use blake2::{
-    digest::{Update, VariableOutput},
-    Blake2bVar,
-};
-
 use super::spec::{BalanceSpec, BalanceStrategy};
 
 pub(super) struct Balancer {
@@ -143,14 +138,13 @@ impl Balancer {
 }
 
 fn session_hash(session: &str, rank: usize) -> u64 {
-    let mut hasher = Blake2bVar::new(8).expect("8 is a valid blake2b size");
-    hasher.update(session.as_bytes());
-    hasher.update(&(rank as u32).to_le_bytes());
-    let mut digest = [0u8; 8];
-    hasher
-        .finalize_variable(&mut digest)
-        .expect("the buffer is the digest size");
-    u64::from_le_bytes(digest)
+    let digest = blake2b_simd::Params::new()
+        .hash_length(8)
+        .to_state()
+        .update(session.as_bytes())
+        .update(&(rank as u32).to_le_bytes())
+        .finalize();
+    u64::from_le_bytes(digest.as_bytes().try_into().expect("an 8-byte digest"))
 }
 
 #[cfg(test)]
