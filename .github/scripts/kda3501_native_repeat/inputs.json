@@ -1,6 +1,6 @@
 {
-  "source": "07bb9254bfe20609fbeab8fdf1e3af7c4f255892",
-  "atom_tree": "dc8177f671c84eaeb678f45d3942a81573603300",
+  "source": "6f29442b6834a898386e50ce5f9c7f1c2ebb7e14",
+  "atom_tree": "f1792d5a5b659439a990cb5fa3264e58e8facfbe",
   "engine_args": {
     "model": "/models/moonshotai/Kimi-K3.1-Pro",
     "draft_model": "/models/Inferact/Kimi-K3.1-DSpark",
