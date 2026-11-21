@@ -9,6 +9,7 @@ import torch
 from aiter import ActivationType, QuantType, dtypes
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import (
+    get_dp_group,
     get_pp_group,
     get_tensor_model_parallel_world_size,
 )
@@ -17,7 +18,7 @@ from aiter.rotary_embedding import get_rope
 from torch import nn
 from transformers import PretrainedConfig
 
-from atom.config import Config, QuantizationConfig
+from atom.config import Config, QuantizationConfig, get_current_atom_config
 from atom.distributed.indexer_cp import indexer_cp_enabled
 from atom.distributed.ulysses_sp import local_num_kv_heads
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
@@ -31,6 +32,7 @@ from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import (
     GemmaRMSNorm,
     fused_allreduce_gemma_rms_norm,
+    fused_allreduce_gemma_rms_norm_mxfp8,
     fused_allreduce_gemma_rms_norm_quant,
 )
 from atom.model_ops.linear import (
@@ -41,11 +43,21 @@ from atom.model_ops.linear import (
     RowParallelLinear,
     mxfp4_k_pad_align,
 )
+from atom.model_ops.minimax_m3.router import (
+    fused_router_enabled,
+    fused_router_supported,
+    m31_route,
+    register_presorted_moe,
+)
+from atom.model_ops.minimax_m3.router.router_swiglu import (
+    m31_route_swiglu,
+    router_swiglu_supported,
+)
 from atom.model_ops.minimax_m3.sparse_attn import (
     SPARSE_BLOCK_SIZE,
 )
 from atom.model_ops.moe import FusedMoE
-from atom.model_ops.swiglu_oai import swiglu_oai_split
+from atom.model_ops.swiglu_oai import swiglu_oai_split, swiglu_oai_split_mxfp8
 from atom.model_ops.utils import atom_parameter
 from atom.models.minimax_m3.mono.dispatch import MonoDecode
 from atom.models.utils import (
@@ -58,7 +70,9 @@ from atom.models.utils import (
 )
 from atom.quant_spec import effective_layer_quant
 from atom.utils import envs
+from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import support_torch_compile
+from atom.utils.forward_context import pass_scheduled_tokens_gpu
 from atom.utils.region_graph import token_graph
 
 
@@ -157,6 +171,18 @@ def _linear_consumes_per_token_fp8(linear: nn.Module) -> bool:
     return (
         quant_type_value == QuantType.per_Token.value
         and getattr(linear, "params_dtype", None) == dtypes.fp8
+    )
+
+
+def _linear_consumes_mxfp8(linear: nn.Module | None) -> bool:
+    """Whether ``linear`` reads E4M3 activations with E8M0 group32 scales --
+    a native group32 A8 linear (MXFP8 or W4A8), which otherwise runs
+    ``quantize_fp8`` on its bf16 input -- and the op before it may write them."""
+    return (
+        linear is not None
+        and envs.ATOM_M3_FUSE_MXFP8_QUANT
+        and getattr(linear, "native_a8_group_rows", None) is not None
+        and not getattr(linear, "_k_padded", False)
     )
 
 
@@ -276,6 +302,16 @@ class MiniMaxM3MLP(nn.Module):
         self, x: torch.Tensor, x_scale: torch.Tensor | None = None
     ) -> torch.Tensor:
         gate_up = self.gate_up_proj(x, x_scale=x_scale)
+        # Read per call, not at __init__: quant_type and the native-A8 marking
+        # are settled after construction (online quant rewrites them).
+        if _linear_consumes_mxfp8(self.down_proj):
+            x, x_scale = swiglu_oai_split_mxfp8(
+                gate_up,
+                alpha=self.swiglu_alpha,
+                beta=self.swiglu_beta,
+                limit=self.swiglu_limit,
+            )
+            return self.down_proj(x, x_scale=x_scale)
         x = swiglu_oai_split(
             gate_up,
             alpha=self.swiglu_alpha,
@@ -348,6 +384,15 @@ class MiniMaxM3MoE(nn.Module):
             getattr(self.experts, "num_fused_shared_experts", 0) > 0
         )
 
+        # The routed experts run inside one custom op (`minimax_m3_routed_moe`)
+        # that may route with the fused decode router; it finds this module here.
+        compilation_config = get_current_atom_config().compilation_config
+        self.routed_layer_name = f"{prefix}.routed"
+        if self.routed_layer_name in compilation_config.static_forward_context:
+            raise ValueError(f"Duplicate layer name: {self.routed_layer_name}")
+        compilation_config.static_forward_context[self.routed_layer_name] = self
+        self.fused_router_op = self._may_fuse_router()
+
         self.shared_experts: MiniMaxM3MLP | None = None
         if getattr(config, "n_shared_experts", 0) and not self.fuse_shared_experts:
             self.shared_experts = MiniMaxM3MLP(
@@ -358,22 +403,218 @@ class MiniMaxM3MoE(nn.Module):
                 prefix=f"{prefix}.shared_experts",
             )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _may_fuse_router(self) -> bool:
+        """Static half of the fused-router choice, made once at construction: a
+        plain TP MoE whose routing is the router's sigmoid top-k alone. Row
+        count and operands are checked per call inside the op."""
+        experts = self.experts
+        return (
+            fused_router_enabled()
+            and self.e_score_correction_bias is not None
+            and not self.fuse_shared_experts
+            and getattr(experts, "balance_router_logits", None) is None
+            and getattr(experts, "sp_mega_moe", None) is None
+            and get_dp_group().world_size == 1
+            and not experts.moe_parallel_config.pcp_merge
+            and experts.moe_parallel_config.dp_logical_ratio == 1
+            and not experts.reduce_results
+        )
+
+    def routed_moe(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """The routed experts' output before routed scaling, routed by the
+        fused decode router where it serves the step, else by the gate and
+        FusedMoE's own top-k and sort."""
+        experts = self.experts
+        bias = self.e_score_correction_bias
+        if fused_router_supported(hidden_states, self.gate.weight, bias):
+            routed = m31_route(
+                hidden_states,
+                self.gate.weight,
+                bias,
+                routed_scaling_factor=1.0,
+                n_local=pass_scheduled_tokens_gpu(hidden_states.shape[0]),
+            )
+            if routed is not None:
+                return self._presorted_experts(hidden_states, *routed)
+        router_logits = self.gate(hidden_states)
+        return experts.forward_impl(hidden_states, router_logits)
+
+    def _presorted_experts(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        presort: dict,
+    ) -> torch.Tensor:
+        """The routed experts on a fused router's routes and sort."""
+        experts = self.experts
+        topk_weights, topk_ids = experts.quant_method.place_experts(
+            experts, topk_weights, topk_ids
+        )
+        # Consumed by the fused_moe right below. Padding rows carry no
+        # routes, so the call runs without a token count (a presort is
+        # only taken without one).
+        register_presorted_moe(presort)
+        return experts.quant_method.apply(
+            layer=experts,
+            x=hidden_states,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            global_num_experts=experts.global_num_experts,
+            expert_map=experts.expert_map,
+            activation=experts.activation,
+            apply_router_weight_on_input=experts.apply_router_weight_on_input,
+            prefix=f"{experts.prefix}.fused_moe",
+            x_scale=None,
+            scheduled_tokens_gpu=None,
+        )
+
+    def routed_moe_shared_swiglu(
+        self, hidden_states: torch.Tensor, gate_up: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``routed_moe(hidden_states)`` and the shared expert's
+        ``swiglu_oai_split_mxfp8(gate_up)``. For 1..128 rows the router GEMV
+        shares its launch with the SwiGLU and the gate and sort run in one
+        more (``m31_route_swiglu``); otherwise the two run apart."""
+        mlp = self.shared_experts
+        swiglu = (mlp.swiglu_alpha, mlp.swiglu_beta, mlp.swiglu_limit)
+        bias = self.e_score_correction_bias
+        if envs.ATOM_M3_ROUTER_SWIGLU and router_swiglu_supported(
+            hidden_states, self.gate.weight, bias, gate_up
+        ):
+            routed = m31_route_swiglu(
+                hidden_states,
+                self.gate.weight,
+                bias,
+                gate_up,
+                *swiglu,
+                routed_scaling_factor=1.0,
+                n_local=pass_scheduled_tokens_gpu(hidden_states.shape[0]),
+            )
+            if routed is not None:
+                *routes, (x, x_scale) = routed
+                return self._presorted_experts(hidden_states, *routes), x, x_scale
+        x, x_scale = swiglu_oai_split_mxfp8(gate_up, *swiglu)
+        return self.routed_moe(hidden_states), x, x_scale
+
+    def shared_takes_mxfp8_input(self) -> bool:
+        """Whether the separate shared expert's gate_up reads MXFP8, so the
+        norm ahead of the MoE can also hand it E4M3 + E8M0 rows."""
+        return self.shared_experts is not None and _linear_consumes_mxfp8(
+            self.shared_experts.gate_up_proj
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        shared_x: torch.Tensor | None = None,
+        shared_x_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """``shared_x`` / ``shared_x_scale``: the same normed rows as
+        ``hidden_states`` already quantized for the shared expert's gate_up
+        (``shared_takes_mxfp8_input``); without them it reads ``hidden_states``."""
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, orig_shape[-1])
-        router_logits = self.gate(hidden_states)
-
-        routed_output = self.experts(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-        )
+        mlp = self.shared_experts
+        if (
+            self.fused_router_op
+            and mlp is not None
+            and _linear_consumes_mxfp8(mlp.down_proj)
+        ):
+            # the shared gate_up first: its SwiGLU can then share a launch with
+            # the router GEMV inside the routed op
+            if shared_x is not None:
+                gate_up = mlp.gate_up_proj(shared_x, x_scale=shared_x_scale)
+            else:
+                gate_up = mlp.gate_up_proj(hidden_states)
+            routed_output, x, x_scale = (
+                torch.ops.aiter.minimax_m3_routed_moe_shared_swiglu(
+                    hidden_states, gate_up, self.routed_layer_name
+                )
+            )
+            shared_output = mlp.down_proj(x, x_scale=x_scale)
+            if self.routed_scaling_factor != 1.0:
+                routed_output = routed_output * self.routed_scaling_factor
+            return (routed_output + shared_output).view(orig_shape)
+        if self.fused_router_op:
+            routed_output = torch.ops.aiter.minimax_m3_routed_moe(
+                hidden_states, self.routed_layer_name
+            )
+        else:
+            router_logits = self.gate(hidden_states)
+            routed_output = self.experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+            )
         if not self.fuse_shared_experts and self.routed_scaling_factor != 1.0:
             routed_output = routed_output * self.routed_scaling_factor
 
         if self.shared_experts is not None:
-            routed_output = routed_output + self.shared_experts(hidden_states)
+            if shared_x is not None:
+                shared_output = self.shared_experts(shared_x, x_scale=shared_x_scale)
+            else:
+                shared_output = self.shared_experts(hidden_states)
+            routed_output = routed_output + shared_output
 
         return routed_output.view(orig_shape)
+
+
+def _minimax_m3_routed_moe(
+    hidden_states: torch.Tensor, layer_name: str
+) -> torch.Tensor:
+    moe = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    return moe.routed_moe(hidden_states)
+
+
+def _minimax_m3_routed_moe_fake(
+    hidden_states: torch.Tensor, layer_name: str
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
+# Declared like FusedMoE's moe_forward, whose experts path it may run.
+direct_register_custom_op(
+    op_name="minimax_m3_routed_moe",
+    op_func=_minimax_m3_routed_moe,
+    mutates_args=["hidden_states"],
+    fake_impl=_minimax_m3_routed_moe_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+def _minimax_m3_routed_moe_shared_swiglu(
+    hidden_states: torch.Tensor, gate_up: torch.Tensor, layer_name: str
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    moe = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    return moe.routed_moe_shared_swiglu(hidden_states, gate_up)
+
+
+def _minimax_m3_routed_moe_shared_swiglu_fake(
+    hidden_states: torch.Tensor, gate_up: torch.Tensor, layer_name: str
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    rows, n_inter = gate_up.shape[0], gate_up.shape[1] // 2
+    return (
+        torch.empty_like(hidden_states),
+        torch.empty(rows, n_inter, dtype=dtypes.fp8, device=gate_up.device),
+        torch.empty(
+            rows, n_inter // 32, dtype=torch.float8_e8m0fnu, device=gate_up.device
+        ),
+    )
+
+
+# Writes only its outputs (the experts path runs with inplace=False); declaring
+# no mutation also keeps Inductor from functionalizing a multi-output op.
+direct_register_custom_op(
+    op_name="minimax_m3_routed_moe_shared_swiglu",
+    op_func=_minimax_m3_routed_moe_shared_swiglu,
+    mutates_args=[],
+    fake_impl=_minimax_m3_routed_moe_shared_swiglu_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
 
 
 class MiniMaxM3Attention(nn.Module):
@@ -688,12 +929,30 @@ class MiniMaxM3DecoderLayer(nn.Module):
             not self.is_moe_layer
             and _linear_consumes_per_token_fp8(self.mlp.gate_up_proj)
         )
+        # MXFP8 consumers: qkv_proj, the dense MLP's gate_up, or the MoE's
+        # shared expert (which also needs the bf16 rows for the router and the
+        # routed experts).
+        fuse_input_ar_rmsnorm_mxfp8 = _linear_consumes_mxfp8(self.self_attn.qkv_proj)
+        if self.is_moe_layer:
+            fuse_post_attention_ar_rmsnorm_mxfp8 = (
+                self.block_sparse_moe.shared_takes_mxfp8_input()
+            )
+        else:
+            fuse_post_attention_ar_rmsnorm_mxfp8 = _linear_consumes_mxfp8(
+                self.mlp.gate_up_proj
+            )
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         elif fuse_input_ar_rmsnorm_quant:
             hidden_states, hidden_states_scale, residual = (
                 fused_allreduce_gemma_rms_norm_quant(
+                    hidden_states, residual, self.input_layernorm
+                )
+            )
+        elif fuse_input_ar_rmsnorm_mxfp8:
+            hidden_states, hidden_states_scale, residual = (
+                fused_allreduce_gemma_rms_norm_mxfp8(
                     hidden_states, residual, self.input_layernorm
                 )
             )
@@ -717,6 +976,25 @@ class MiniMaxM3DecoderLayer(nn.Module):
         if fuse_post_attention_ar_rmsnorm_quant:
             hidden_states, hidden_states_scale, residual = (
                 fused_allreduce_gemma_rms_norm_quant(
+                    hidden_states, residual, self.post_attention_layernorm
+                )
+            )
+            hidden_states = ffn(hidden_states, x_scale=hidden_states_scale)
+        elif fuse_post_attention_ar_rmsnorm_mxfp8 and self.is_moe_layer:
+            shared_x, shared_x_scale, residual, hidden_states = (
+                fused_allreduce_gemma_rms_norm_mxfp8(
+                    hidden_states,
+                    residual,
+                    self.post_attention_layernorm,
+                    emit_bf16=True,
+                )
+            )
+            hidden_states = ffn(
+                hidden_states, shared_x=shared_x, shared_x_scale=shared_x_scale
+            )
+        elif fuse_post_attention_ar_rmsnorm_mxfp8:
+            hidden_states, hidden_states_scale, residual = (
+                fused_allreduce_gemma_rms_norm_mxfp8(
                     hidden_states, residual, self.post_attention_layernorm
                 )
             )
