@@ -11,12 +11,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from atom.rollout.rdma_protocol import (
-    CMD_BUCKET as _CMD_BUCKET,
-)
-from atom.rollout.rdma_protocol import (
-    CMD_END as _CMD_END,
-)
+from atom.rollout import rdma_protocol
 
 STAGING_MODES = ("none", "cpu", "gpu")
 
@@ -147,7 +142,7 @@ def send_weight_stream(
         _broadcast_header(
             group,
             device=device,
-            command=_CMD_BUCKET,
+            command=rdma_protocol.CMD_BUCKET,
             metadata_bytes=metadata.numel(),
             payload_bytes=payload.numel(),
             version=version,
@@ -179,7 +174,9 @@ def send_weight_stream(
         if bucket_bytes >= bucket_size_bytes:
             flush()
     flush()
-    _broadcast_header(group, device=device, command=_CMD_END, version=version)
+    _broadcast_header(
+        group, device=device, command=rdma_protocol.CMD_END, version=version
+    )
     t0 = time.perf_counter()
     torch.cuda.synchronize(device)
     final_sync_s = time.perf_counter() - t0
@@ -274,9 +271,13 @@ def receive_weight_stream(
                 raise RuntimeError(
                     f"RDMA weight version mismatch: expected {expected_version}, got {version}"
                 )
-            if command == _CMD_END:
+            if command == rdma_protocol.CMD_END:
                 return
-            if command != _CMD_BUCKET or metadata_bytes <= 0 or payload_bytes <= 0:
+            if (
+                command != rdma_protocol.CMD_BUCKET
+                or metadata_bytes <= 0
+                or payload_bytes <= 0
+            ):
                 raise RuntimeError(f"invalid RDMA weight header: {header.tolist()}")
 
             t0 = time.perf_counter()

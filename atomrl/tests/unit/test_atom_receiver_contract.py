@@ -68,8 +68,8 @@ def _function(src: str, name: str) -> str:
 def test_the_commands_and_header_width_agree():
     sender, receiver = _SENDER.read_text(), _atom(_RECEIVER)
     protocol = _atom(_PROTOCOL)
-    assert "from atom.rollout.rdma_protocol import" in sender
-    assert "from atom.rollout.rdma_protocol import" in receiver
+    assert "from atom.rollout import rdma_protocol" in sender
+    assert "from atom.rollout import rdma_protocol" in receiver
     assert _constant(protocol, "CMD_END") == 0
     assert _constant(protocol, "CMD_BUCKET") == 1
     assert _constant(protocol, "HEADER_WORDS") == 4
