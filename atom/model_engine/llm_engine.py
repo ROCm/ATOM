@@ -742,6 +742,7 @@ class InputOutputProcessor:
         dp_session_id: str | None = None,
         dp_parent_session_id: str | None = None,
         stop_token_sequences: list[list[int]] | None = None,
+        seq_id: int | None = None,
     ):
         """responsible for:
         1) Tokenize
@@ -750,6 +751,7 @@ class InputOutputProcessor:
         Single-sequence entry point. Rejects ``sampling_params.n > 1`` so that
         callers which expect exactly one ``Sequence`` back cannot silently
         drop the other siblings. Use :meth:`preprocess_fanout` for n > 1.
+        ``seq_id`` is the sequence's id when the caller assigns it.
         """
         if getattr(sampling_params, "n", 1) > 1:
             raise ValueError(
@@ -767,6 +769,7 @@ class InputOutputProcessor:
             dp_session_id=dp_session_id,
             dp_parent_session_id=dp_parent_session_id,
             stop_token_sequences=stop_token_sequences,
+            seq_ids=None if seq_id is None else [seq_id],
         )
         return seqs[0]
 
@@ -828,6 +831,7 @@ class InputOutputProcessor:
         dp_session_id: str | None = None,
         dp_parent_session_id: str | None = None,
         stop_token_sequences: list[list[int]] | None = None,
+        seq_ids: list[int] | None = None,
     ) -> list[Sequence]:
         """Tokenize once and materialize ``sampling_params.n`` Sequences.
 
@@ -844,6 +848,7 @@ class InputOutputProcessor:
         * Per-sibling ``stream_callbacks`` can be supplied to route streaming
           deltas to independent queues (one per choice index). Falls back to
           the scalar ``stream_callback`` for every sibling.
+        * ``seq_ids``, when given, are the siblings' ids, one each.
         """
         sampling_params.validate_logprob_options(
             self.config,
@@ -858,8 +863,12 @@ class InputOutputProcessor:
                 )
             if self.structured_admission is None:
                 raise ValueError("Structured output requires engine admission")
+            checked = sampling_params  # stop ids, given for stop strings, count as them
+            if any(stop_token_sequences or ()):
+                stops = [str(ids) for ids in stop_token_sequences]
+                checked = replace(sampling_params, stop_strings=stops)
             self.structured_admission(
-                sampling_params, kv_transfer_params, multimodal_data is not None
+                checked, kv_transfer_params, multimodal_data is not None
             )
         request_validator = getattr(self.config.hf_config, "validate_request", None)
         if request_validator is not None:
@@ -908,6 +917,8 @@ class InputOutputProcessor:
             raise ValueError(
                 f"stream_callbacks length {len(stream_callbacks)} does not match n={n}"
             )
+        if seq_ids is not None and len(seq_ids) != n:
+            raise ValueError(f"seq_ids length {len(seq_ids)} does not match n={n}")
 
         seqs: list[Sequence] = []
         for i in range(n):
@@ -920,6 +931,7 @@ class InputOutputProcessor:
                 sampling_params,
                 stop_token_sequences,
                 stream_callback=cb,
+                id=None if seq_ids is None else seq_ids[i],
                 num_draft_tokens=self.num_speculative_tokens,
                 has_per_req_cache=self.has_per_req_cache,
                 kv_transfer_params=kv_transfer_params,
