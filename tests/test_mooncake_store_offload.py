@@ -4740,6 +4740,34 @@ def test_load_request_names_the_draft_start(cluster, draft_window):
     assert load(0, end=3 * CHUNK) == (None, 3 * CHUNK)
 
 
+def test_an_unaligned_handoff_marks_its_load_before_the_partial_prefill(
+    cluster, draft_window
+):
+    # A P/D producer sends V with that prefill's first forward: it must already
+    # cover the blocks the load run after it leaves without draft rows.
+    scheduler = MooncakeStoreOffloadScheduler(_draft_config(pp=2))
+    scheduler._min_load_tokens = 0
+    manager = BlockManager(MockConfig(num_kvcache_blocks=64, kv_cache_block_size=BLOCK))
+    scheduler.bind_block_manager(manager)
+    for hbm, v in ((BLOCK, 4 * CHUNK), (5 * CHUNK + BLOCK, 0)):
+        seq = Sequence(
+            list(range(DRAFT_PROMPT)), BLOCK, sampling_params=SamplingParams()
+        )
+        manager.allocate(seq)
+        spec = LoadSpec(hbm_cached_tokens=hbm, lmcache_cached_tokens=8 * CHUNK)
+        assert scheduler._maybe_start_unaligned_handoff(
+            seq, spec, hbm, 8 * CHUNK, CHUNK
+        )
+        assert manager.draft_rows_from(seq) == v
+        operation = LoadOperationId(seq.id, 0)
+        scheduler._build_load_request(seq, spec, operation, 8 * CHUNK)
+        draft_start = seq.offload_draft_start_tokens
+        manager.publish_loaded_prefix(
+            seq, spec.hbm_cached_tokens, 8 * CHUNK, draft_start
+        )
+        assert manager.draft_rows_from(seq) == v
+
+
 def test_a_cut_counts_only_what_its_request_then_prefills(cluster, draft_window):
     scheduler = MooncakeStoreOffloadScheduler(_draft_config(pp=2))
     lookups = scheduler._store_lookup

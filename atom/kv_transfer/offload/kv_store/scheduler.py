@@ -549,20 +549,38 @@ class KVStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
             chunk_hashes=hashes[: (transfer_end // self.chunk_size) * DIGEST_BYTES],
         )
         if self._draft_window is not None:
-            chunk = self.chunk_size
-            first = max(
-                int(load_spec.hbm_cached_tokens) // chunk,
-                first_draft_chunk(self._draft_window, seq.num_prompt_tokens, chunk),
+            first = self._load_draft_start(
+                seq, load_spec.hbm_cached_tokens, transfer_end
             )
-            end = int(transfer_end) // chunk
+            end = int(transfer_end) // self.chunk_size
             if first < end:
                 request.draft_chunks = (first, end)
             # The blocks below get no draft rows: `publish_loaded_prefix` marks them.
-            seq.offload_draft_start_tokens = min(first, end) * chunk
+            seq.offload_draft_start_tokens = first * self.chunk_size
             self._count_draft_cut_cost(
                 seq, load_spec.hbm_cached_tokens, load_spec.lmcache_cached_tokens
             )
         return request
+
+    def _load_draft_start(self, seq: Any, hbm: int, end: int) -> int:
+        """The first draft object a load of `[hbm, end)` reads, in chunks:
+        `max(hbm, d0)`, at most `end`."""
+        chunk = self.chunk_size
+        d0 = first_draft_chunk(self._draft_window, seq.num_prompt_tokens, chunk)
+        return min(max(int(hbm) // chunk, d0), int(end) // chunk)
+
+    def _maybe_start_unaligned_handoff(self, seq, load_spec, hbm, lmc, chunk) -> bool:
+        started = super()._maybe_start_unaligned_handoff(
+            seq, load_spec, hbm, lmc, chunk
+        )
+        manager = self._block_manager
+        if started and self._draft_window is not None and manager is not None:
+            # Marked before the partial prefill: a P/D producer sends V with its
+            # first forward, and this load runs only after it.
+            boundary = int(load_spec.hbm_cached_tokens)
+            first = self._load_draft_start(seq, boundary, lmc)
+            manager.mark_draft_rows_missing(seq, boundary, first * self.chunk_size)
+        return started
 
     def update_state_after_alloc(self, seq: Any) -> None:
         super().update_state_after_alloc(seq)
