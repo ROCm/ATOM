@@ -2029,8 +2029,10 @@ class MoRIIOConnector(KVConnectorBase):
 
             # Read again once the device is idle: a match then means the push
             # landed but was not yet visible here, not that it moved the
-            # wrong bytes.
-            torch.cuda.synchronize()
+            # wrong bytes. (Views on the CPU, as in the unit tests, have
+            # nothing in flight.)
+            if self._page_views[0].is_cuda:
+                torch.cuda.synchronize(self._page_views[0].device)
             time.sleep(0.05)
             again = self._page_digests(dst)[0]
             logger.error(
@@ -2074,7 +2076,8 @@ class MoRIIOConnector(KVConnectorBase):
             import torch
 
             # Once more with the device idle, as `_verify_page_landed` does
-            torch.cuda.synchronize()
+            if self._page_views[0].is_cuda:
+                torch.cuda.synchronize(self._page_views[0].device)
             time.sleep(0.05)
             landed = page_region_digests(self._page_views, dst)
             still = [
