@@ -331,9 +331,7 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
                 api.engine.io_processor.preprocess,
                 prompt,
                 params,
-                stream_callback=self.steps.callback(
-                    session.put(request.seq_id), session.flush
-                ),
+                stream_callback=self.steps.callback(session.put, session.flush),
                 kv_transfer_params=api._engine_kv_transfer_params(kv_transfer_params),
                 data_parallel_rank=request.data_parallel_rank,
                 dp_session_id=request.dp_session_id,

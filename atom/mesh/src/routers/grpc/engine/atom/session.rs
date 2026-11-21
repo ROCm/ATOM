@@ -5,16 +5,18 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::thread;
 
 use futures::{stream, Stream, StreamExt};
 use http::StatusCode;
 use parking_lot::Mutex;
 use serde_json::Value as Json;
-use tokio::sync::mpsc;
+use tokio::runtime;
+use tokio::sync::{mpsc, oneshot};
 use tonic::{Status, Streaming};
 use tracing::warn;
 
-use super::{pair::atom_client, AtomClient};
+use super::AtomClient;
 use crate::atom_engine::grpc::{
     generate_response::Response, Frames, GenerateComplete, GenerateError, GenerateResponse,
     GenerateStreamChunk,
@@ -64,10 +66,7 @@ impl AtomSessions {
         if let Some(session) = slot.as_ref().filter(|session| session.is_open()) {
             return Ok(session.clone());
         }
-        let client = atom_client(worker)
-            .await
-            .ok_or_else(|| EngineError::ConnectionAcquireFailed(worker.url().to_string()))?;
-        Ok(slot.insert(Session::open(&client, url).await?).clone())
+        Ok(slot.insert(Session::open(url).await?).clone())
     }
 }
 
@@ -85,21 +84,19 @@ enum Command {
 }
 
 impl Session {
-    /// Opens the call and waits for ATOM's Ready, refusing one of another protocol version.
-    async fn open(client: &AtomClient, url: &str) -> Result<Self, EngineError> {
+    /// Opens the call on a connection and thread of its own, off the router's runtime;
+    /// waits for ATOM's Ready, refusing one of another protocol version.
+    async fn open(url: &str) -> Result<Self, EngineError> {
         let (commands, queued) = mpsc::unbounded_channel();
-        let mut inbound = client
-            .session(writer(queued))
-            .await
-            .map_err(EngineError::Transport)?;
-        let first = inbound.message().await.map_err(EngineError::Transport)?;
-        match first.map(|message| Inbound::decode(message.frames).map(|m| m.body)) {
-            Some(Ok(Body::Ready(_))) => {}
-            Some(Err(e)) => return Err(refused(&e)),
-            _ => return Err(refused("the call did not start with Ready")),
-        }
         let routes = Arc::new(Mutex::new(Routes::default()));
-        tokio::spawn(read(inbound, routes.clone(), url.to_string()));
+        let (opened, ready) = oneshot::channel();
+        let (url, read_into) = (url.to_string(), routes.clone());
+        thread::Builder::new()
+            .name("atom-session".into())
+            .spawn(move || run(url, queued, read_into, opened))
+            .map_err(|e| EngineError::Transport(Status::internal(e.to_string())))?;
+        let gone = |_| EngineError::Transport(Status::internal("the Session thread ended"));
+        ready.await.map_err(gone)??;
         Ok(Self { routes, commands })
     }
 
@@ -126,6 +123,7 @@ impl Session {
             prompt_tokens: prompt.len() as u32,
             completion_tokens: 0,
             cached_tokens: 0,
+            ids: Vec::new(),
         };
         let command = Command::Submit(Box::new(spec), prompt);
         if routes.closed || self.commands.send(command).is_err() {
@@ -139,6 +137,55 @@ impl Session {
             rx,
             session: self.clone(),
         })
+    }
+}
+
+/// The Session's thread: a runtime of its own, which connects, opens the call and reads
+/// it until it ends; `opened` gets how the opening went.
+fn run(
+    url: String,
+    queued: mpsc::UnboundedReceiver<Command>,
+    routes: Arc<Mutex<Routes>>,
+    opened: oneshot::Sender<Result<(), EngineError>>,
+) {
+    let runtime = match runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            let _ = opened.send(Err(EngineError::Transport(Status::internal(e.to_string()))));
+            return;
+        }
+    };
+    runtime.block_on(async move {
+        match start(&url, queued).await {
+            Ok((_client, inbound)) => {
+                let _ = opened.send(Ok(()));
+                read(inbound, routes, url).await;
+            }
+            Err(e) => {
+                let _ = opened.send(Err(e));
+            }
+        }
+    });
+}
+
+/// Connects to `url`, opens the call and reads ATOM's Ready; the client keeps the
+/// connection the call runs on.
+async fn start(
+    url: &str,
+    queued: mpsc::UnboundedReceiver<Command>,
+) -> Result<(AtomClient, Streaming<Frames>), EngineError> {
+    let client = AtomClient::connect(url)
+        .await
+        .map_err(|_| EngineError::ConnectionAcquireFailed(url.to_string()))?;
+    let mut inbound = client
+        .session(writer(queued))
+        .await
+        .map_err(EngineError::Transport)?;
+    let first = inbound.message().await.map_err(EngineError::Transport)?;
+    match first.map(|message| Inbound::decode(message.frames).map(|m| m.body)) {
+        Some(Ok(Body::Ready(_))) => Ok((client, inbound)),
+        Some(Err(e)) => Err(refused(&e)),
+        _ => Err(refused("the call did not start with Ready")),
     }
 }
 
@@ -229,6 +276,8 @@ struct Route {
     completion_tokens: u32,
     /// The last nonzero prefix-cache hit, as ATOM's HTTP routes keep it.
     cached_tokens: u32,
+    /// A request that does not stream: its ids so far, which its Complete carries.
+    ids: Vec<u32>,
 }
 
 impl Route {
@@ -256,20 +305,21 @@ impl Routes {
         match &message.body {
             Body::Stream(batch) => self.step(batch),
             Body::Completions(completions) => {
-                // Every item is read before any request ends.
+                // Every item is read before any request ends. An item carries no ids:
+                // its request's StreamBatch entries did.
                 let mut read = Vec::with_capacity(completions.items.len());
                 for item in &completions.items {
-                    let ids = message.tokens(item.completion_token_ids.as_ref())?;
                     let kv = item.kv_transfer_params_output.as_ref();
-                    read.push((item, ids, kv.map(json).transpose()?));
+                    read.push((item, kv.map(json).transpose()?));
                 }
-                for (item, ids, kv) in read {
-                    let Some(route) = self.open.remove(&item.seq_id) else {
+                for (item, kv) in read {
+                    let Some(mut route) = self.open.remove(&item.seq_id) else {
                         continue;
                     };
+                    let output_ids = std::mem::take(&mut route.ids);
                     route.send(Response::Complete(GenerateComplete {
-                        completion_tokens: ids.len() as u32,
-                        output_ids: if route.stream { Vec::new() } else { ids },
+                        completion_tokens: route.completion_tokens,
+                        output_ids,
                         finish_reason: item.leave_reason.clone(),
                         prompt_tokens: item.num_prompt_tokens,
                         cached_tokens: route.cached_tokens,
@@ -293,7 +343,8 @@ impl Routes {
         }
     }
 
-    /// One engine step's entries: each request's ids, as one chunk when it streams.
+    /// One engine step's entries: each request's ids, as one chunk when it streams,
+    /// else kept for its Complete.
     fn step(&mut self, batch: &pb::StreamBatch) -> Result<(), String> {
         let entries = batch.seq_ids.len();
         let counted: usize = batch.token_counts.iter().map(|&n| n as usize).sum();
@@ -303,10 +354,11 @@ impl Routes {
         {
             return Err("StreamBatch columns disagree in length".into());
         }
-        let mut tokens = batch.tokens.iter().map(|&id| id as u32);
+        let mut start = 0;
         let columns = batch.token_counts.iter().zip(&batch.num_cached_tokens);
         for (seq_id, (&count, &cached)) in batch.seq_ids.iter().zip(columns) {
-            let token_ids: Vec<u32> = tokens.by_ref().take(count as usize).collect();
+            let tokens = &batch.tokens[start..start + count as usize];
+            start += count as usize;
             let Some(route) = self.open.get_mut(seq_id) else {
                 continue;
             };
@@ -314,13 +366,16 @@ impl Routes {
             if cached > 0 {
                 route.cached_tokens = cached as u32;
             }
+            let token_ids = tokens.iter().map(|&id| id as u32);
             if route.stream {
                 route.send(Response::Chunk(GenerateStreamChunk {
-                    token_ids,
+                    token_ids: token_ids.collect(),
                     prompt_tokens: route.prompt_tokens,
                     completion_tokens: route.completion_tokens,
                     cached_tokens: route.cached_tokens,
                 }));
+            } else {
+                route.ids.extend(token_ids);
             }
         }
         Ok(())

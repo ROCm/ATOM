@@ -380,6 +380,40 @@ async fn one_session_serves_both_ranks_and_each_request_gets_only_its_outputs_in
 }
 
 #[tokio::test]
+async fn a_request_that_does_not_stream_completes_with_the_ids_its_entries_carried() {
+    let (ranks, mut calls) = instance().await;
+    let sessions = AtomSessions::default();
+    let first = sessions.submit(&ranks[0], spec("whole"), vec![1, 2, 3], false);
+    let (mut call, whole) = opening(&mut calls, PROTOCOL_VERSION, first).await;
+    let id = submitted(&mut call, 1).await["whole"].0.seq_id;
+    for message in [
+        step(&[(id, vec![31], 4)]),
+        step(&[(id, vec![32, 33], 0)]),
+        // As ATOM sends it: the item carries none of the ids the entries did.
+        done(vec![(completion(id, "max_tokens"), Vec::new())]),
+    ] {
+        call.outbound.send(message).unwrap();
+    }
+
+    let whole: Vec<_> = timeout(HANG, whole.unwrap().collect()).await.unwrap();
+    let complete = GenerateComplete {
+        output_ids: vec![31, 32, 33],
+        finish_reason: "max_tokens".to_string(),
+        prompt_tokens: 3,
+        completion_tokens: 3,
+        cached_tokens: 4,
+        kv_transfer_params_json: None,
+    };
+    let expected = GenerateResponse {
+        response: Some(Response::Complete(complete)),
+    };
+    assert!(
+        matches!(&whole[..], [Ok(response)] if *response == expected),
+        "{whole:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_rejected_request_fails_with_the_http_status_its_code_reads_back_to() {
     let (ranks, mut calls) = instance().await;
     let sessions = AtomSessions::default();
@@ -507,7 +541,10 @@ async fn a_broken_session_fails_its_requests_and_the_next_request_reopens_it() {
     let last = sessions.submit(&ranks[0], spec("after"), vec![3], false);
     let (mut call, after) = opening(&mut calls, PROTOCOL_VERSION, last).await;
     let after_id = submitted(&mut call, 1).await["after"].0.seq_id;
-    let ended = done(vec![(completion(after_id, "eos"), vec![41])]);
+    call.outbound
+        .send(step(&[(after_id, vec![41], 0)]))
+        .unwrap();
+    let ended = done(vec![(completion(after_id, "eos"), Vec::new())]);
     call.outbound.send(ended).unwrap();
     let after = chunks(after.unwrap()).await;
     assert!(
@@ -552,6 +589,7 @@ fn seq_ids_stay_below_2_24_and_skip_those_open_requests_hold() {
             prompt_tokens: 0,
             completion_tokens: 0,
             cached_tokens: 0,
+            ids: Vec::new(),
         };
         routes.open.insert(held, route);
     }
@@ -773,7 +811,9 @@ mod routed {
         assert_eq!(max_tokens(&d_spec), Some(8));
 
         // D completes first; the answer waits for P, whose load is still held.
-        let d_done = done(vec![(completion(d_spec.seq_id, "stop_22"), vec![21, 22])]);
+        let d_step = step(&[(d_spec.seq_id, vec![21, 22], 0)]);
+        d_call.outbound.send(d_step).unwrap();
+        let d_done = done(vec![(completion(d_spec.seq_id, "stop_22"), Vec::new())]);
         d_call.outbound.send(d_done).unwrap();
         assert_eq!((pw.load(), dw.load()), (1, 1));
         let p_done = done(vec![(completion(p_spec.seq_id, "max_tokens"), vec![5])]);

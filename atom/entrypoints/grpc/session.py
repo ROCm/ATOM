@@ -1,14 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """The Session RPC's state: each Session's seq ids in a window of their own, and per
-engine step one StreamBatch per Session, then one item per request the step ended."""
+engine step one StreamBatch per Session, then an id-free item per request it ended."""
 
 import asyncio
 import logging
 import time
 from collections import deque
-from dataclasses import dataclass, field, replace
-from functools import partial
+from dataclasses import dataclass, replace
 
 from atom.entrypoints.grpc import frames
 from atom.entrypoints.openai.frontend_workers import worker_seq_id_base
@@ -25,7 +24,6 @@ WINDOWS = 127  # window k holds worker_seq_id_base(k) | seq_id; 127 stay inside 
 class _Request:
     seq: object  # its Sequence, under the engine's id for it
     external_request_id: str | None
-    ids: list[int] = field(default_factory=list)  # its output ids so far
     first_token_time: float = 0.0
 
 
@@ -49,7 +47,8 @@ class Session:
         self.sessions, self.api = sessions, sessions.api
         self.window, self.base = window, worker_seq_id_base(window)
         self.requests: dict[int, _Request] = {}
-        self.pending: list[tuple[int, RequestOutput]] = []  # the step being delivered
+        self.pending: list[RequestOutput] = []  # the step being delivered
+        self.put = self.pending.append  # where each output goes as a step is delivered
         self.outbox: asyncio.Queue = asyncio.Queue()  # message frames; None ends them
         self.open = True
 
@@ -60,13 +59,6 @@ class Session:
         if client_id in self.requests:
             raise ValueError(f"seq_id {client_id} is already in flight")
         return self.base | client_id
-
-    def put(self, client_id: int):
-        """Where `client_id`'s outputs go as a step is delivered; `flush` sends them."""
-        return partial(self._put, client_id)
-
-    def _put(self, client_id: int, output: RequestOutput) -> None:
-        self.pending.append((client_id, output))
 
     def add(self, client_id: int, seq, external_request_id: str | None) -> None:
         self.requests[client_id] = _Request(seq, external_request_id)
@@ -98,16 +90,22 @@ class Session:
     def flush(self) -> None:
         """The step's outputs: one StreamBatch of those carrying ids, then a Completions
         item, or a Rejected one, for each request the step ended."""
-        pending, self.pending = self.pending, []
-        entries, done, now = [], [], time.time()
-        for client_id, output in pending:
-            request = self.requests.get(client_id)
+        pending = self.pending[:]
+        self.pending.clear()  # the list `put` appends to
+        requests, base, now = self.requests, self.base, time.time()
+        entries, done = [], []
+        for output in pending:
+            client_id = output.request_id - base  # the engine's id is base | client id
+            request = requests.get(client_id)
             if request is None:  # dropped when its submission failed
                 continue
             if output.output_tokens:
-                request.ids += output.output_tokens
-                request.first_token_time = request.first_token_time or now
-                entries.append((client_id, _streamed(output)))
+                if not request.first_token_time:
+                    request.first_token_time = now
+                streamed = output
+                if output.kv_transfer_params_output is not None:
+                    streamed = _streamed(output)
+                entries.append((client_id, streamed))
             if output.finished:
                 done.append(_completion(client_id, request, output, now))
         if self.open and entries:
@@ -131,19 +129,18 @@ class Session:
 
 def _streamed(output: RequestOutput) -> RequestOutput:
     """`output` for a StreamBatch: its kv_transfer_params go in its Completions item."""
-    if output.kv_transfer_params_output is None:
-        return output
     return replace(output, kv_transfer_params_output=None)
 
 
 def _completion(client_id, request, output, now: float) -> frames.Completion:
+    """Its Completions item: no ids, which its StreamBatch entries carried."""
     seq = request.seq
     return frames.Completion(
         seq_id=client_id,
-        completion_token_ids=request.ids,
+        completion_token_ids=[],
         leave_reason=output.finish_reason or "",
         num_prompt_tokens=seq.num_prompt_tokens,
-        num_cached_tokens=seq.num_prompt_tokens if request.ids else 0,
+        num_cached_tokens=seq.num_prompt_tokens if request.first_token_time else 0,
         arrive_time=seq.arrive_time,
         first_token_time=request.first_token_time,
         leave_time=now,
