@@ -927,8 +927,8 @@ class InputOutputProcessor:
         for req in reqs:
             ingress = self.requests.pop(req.id)
             if req.rejected:
-                # Rejected at admission: the Core never built the sequence,
-                # so the result carries no arrival or prompt of its own.
+                # Rejected (at admission, or its result did not arrive whole):
+                # it carries no arrival or prompt of its own.
                 req.arrive_time = ingress.arrive_time
                 req.num_prompt_tokens = ingress.num_prompt_tokens
             external_request_id = self._internal_to_external.pop(req.id, None)

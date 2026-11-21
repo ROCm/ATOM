@@ -2,9 +2,15 @@
 
 Its shape is `atom/mesh/src/atom_engine/spec.rs`. Python launches the
 EngineCores and hands this over once; Rust is their only client from then on.
-What needs ATOM's own machinery -- the chat template, the reasoning dialect
-and switch, the tool-call format -- is decided here, once, the way the Python
-API server decides it.
+What needs ATOM's own machinery is decided once, the way the Python API server
+decides it, by the helpers here as `server.launch_atom_standalone` drives them:
+the refusals (`check_standalone_model` before the runtime is imported,
+`check_standalone_checkpoint` once the tokenizer is in), the chat template,
+the reasoning parser, the tool-call format, and what `build_engine_spec`
+reads off them -- the reasoning switch, the required channel, the model card,
+how history tool-call arguments and forced-acceptance text are rendered.
+CoreManager refuses the deployments it cannot hand an external client
+(pipeline parallelism, multi-node, RapidServe) as the engine starts.
 """
 
 from __future__ import annotations
@@ -60,9 +66,11 @@ _RUST_DP_STRATEGIES = ("round_robin", "least_requests", "least_tokens")
 
 
 def check_standalone_model(engine_args: Any) -> None:
-    """Refuse, before any weights load, what the Rust frontend cannot serve:
-    a model with a custom message encoder instead of a chat template, a P/D
-    (prefill/decode) worker, and a DP placement it does not have."""
+    """Refuse, before the Rust runtime is even imported, what the Rust frontend
+    cannot serve and the args alone show: a model with a custom message
+    encoder instead of a chat template, a P/D (prefill/decode) worker, and a
+    DP placement it does not have. The checkpoint's own refusals follow in
+    `check_standalone_checkpoint`."""
     if load_custom_message_encoder(engine_args.model) is not None:
         raise ValueError(
             f"{engine_args.model} renders prompts with a custom message encoder, "

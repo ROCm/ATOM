@@ -163,8 +163,9 @@ class CompletionResult:
         # The prompt's forward ran to its end (`Sequence.prefill_completed`),
         # which DP routing's release reads.
         self.prefill_completed = prefill_completed
-        # Refused before its Core built a sequence: nothing above but `id` and
-        # `leave_reason` is the Core's.
+        # Did not reach its client whole: refused before or at admission, or
+        # its result did not encode or decode. Only `id` and `leave_reason`
+        # are meaningful.
         self.rejected = rejected
 
     @property

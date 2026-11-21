@@ -789,7 +789,8 @@ def encode_stream(outputs) -> list:
                 )
             except Exception:  # one entry must not drop the whole step
                 # Every other sequence keeps this step's tokens; this one
-                # still ends on its Completion, which carries the params too.
+                # loses its params (its Completion cannot encode them either)
+                # and still ends on its finished flag.
                 del msg.kv_transfer_params_outputs[i]
                 logger.exception(
                     "dropping seq %s's unencodable kv_transfer_params_output",

@@ -155,29 +155,33 @@ workers.
 `--tool-call-parser` takes ATOM's format names (`qwen`, `glm`, `kimi`,
 `kimi_k3`, `minimax`, `dsml`, `dsml_v41`) or any of the router's own; unset, the
 format is read off the chat template as the Python server reads it.
-`--chat-template` and `--served-model-name` behave as in the Python server.
+`--chat-template`, `--reasoning-parser` and `--served-model-name` behave as in
+the Python server, in either spelling (`--tool_call_parser` too).
 
 #### Limitations
 
-What the standalone server does not serve yet is refused, never silently
-served differently:
+A feature the standalone server does not serve yet is refused, at startup or
+per request, rather than silently served differently:
 
-- At startup: models with a custom message encoder, reasoning dialects other
-  than `<think>...</think>` (unless `--reasoning-parser` is given), P/D
-  (prefill/decode) workers, pipeline parallelism, multi-node data or tensor
-  parallelism, RapidServe, and the `share_cache` / `prefix_spread` DP
-  placements.
+- At startup: models with a custom message encoder, gpt-oss (harmony),
+  tokenizers shipped only as tiktoken files, reasoning dialects other than
+  `<think>...</think>` (unless `--reasoning-parser` is given), P/D
+  (prefill/decode) workers (any moriio or mooncake connector), pipeline
+  parallelism, multi-node data or tensor parallelism, RapidServe, and the
+  `share_cache` / `prefix_spread` DP placements.
 - Per request: `response_format` json_object / json_schema, `top_logprobs`,
   streamed logprobs, chat logprobs, `/generate`'s input logprobs and
   `token_ids_logprob`, streaming with `n > 1`, `kv_transfer_params`,
   `prompt_token_ids`, `return_token_ids`, multimodal input, `/v1/messages`
   and `/v1/responses` (501).
 
-`/v1/completions` ignores, as the Python server's does, the fields its request
-does not declare: `echo`, `suffix`, `best_of`, `logit_bias` and
-`stream_options`.
-- Not exposed yet: ATOM's `/metrics`, `/server_info` tp/dp, `/kv_transfer_info`,
-  profiling and debug routes.
+Two things are not refused:
+
+- `/v1/completions` ignores, as the Python server's does, the fields its
+  request does not declare: `echo`, `suffix`, `best_of`, `logit_bias` and
+  `stream_options`.
+- Some routes do not exist yet: ATOM's `/metrics`, `/server_info` tp/dp,
+  `/kv_transfer_info`, profiling and debug routes.
 
 Losing an EngineCore shuts the whole server down (in-flight requests on it end
 with 503) so that an orchestrator restarts it; use the Python api_server
