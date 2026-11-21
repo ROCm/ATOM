@@ -4416,8 +4416,8 @@ def test_only_admission_starts_a_requests_lookup_defer_window(cluster, monkeypat
     seq = Sequence(list(range(64)), BLOCK, sampling_params=SamplingParams())
     engine.add(seq)
     for _ in range(5):
-        engine._early_load_tier_prefixes()
-        engine._head_waits_on_tier_lookup(seq)
+        engine._early_load_tier_prefixes(limits=engine._prefill_limits())
+        engine._head_waits_on_tier_lookup(seq, limits=engine._prefill_limits())
     assert not offload._lookup_defer_since
     assert offload.lookup_pending(seq)  # admission's call opens the window
     assert str(seq.id) in offload._lookup_defer_since

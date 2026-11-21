@@ -962,6 +962,7 @@ def _decode_batch(width, num_spec_step):
     return SimpleNamespace(
         has_prefill=False,
         total_tokens_num_prefill=0,
+        total_seqs_num_prefill=0,
         total_seqs_num_decode=1,
         total_tokens_num_decode=width,
         total_tokens_num=width,
@@ -1084,3 +1085,25 @@ def test_verify_length_is_independent_of_the_block_being_verified(monkeypatch):
     assert a[verifies_block_n] == dict(zip(req_ids, ell_n_minus_1))
     # positive control: block N's confidence does size a later verification
     assert a[verifies_block_n + 1] != b[verifies_block_n + 1]
+
+
+def test_q_bucket_preserves_prefill_and_uses_decode_rows_bonus_counts():
+    runner = _q_bucket_runner()
+    runner.drafter.verify_scheduler.ell_by_req = {7: 1, 8: 0}
+    batch = _decode_batch(width=4, num_spec_step=3)
+    batch.req_ids = [90, 7, 8]
+    batch.total_seqs_num_prefill = 1
+    batch.total_seqs_num_decode = 2
+    batch.total_tokens_num_prefill = 3
+    batch.total_tokens_num_decode = 8
+    batch.total_tokens_num = 11
+    batch.num_scheduled_tokens = np.array([3, 4, 4], dtype=np.int32)
+    batch.scheduled_tokens = np.arange(11, dtype=np.int32)
+    batch.num_bonus = np.array([99, 0, 1])
+    batch.scheduled_spec_decode_tokens = np.arange(9).reshape(3, 3)
+    assert apply_q_bucket(batch, runner.drafter, runner.config.dspark) == 2
+    assert batch.num_scheduled_tokens.tolist() == [3, 2, 2]
+    assert batch.scheduled_tokens.tolist() == [0, 1, 2, 3, 4, 7, 8]
+    assert (batch.total_tokens_num_prefill, batch.total_tokens_num_decode) == (3, 4)
+    assert batch.total_tokens_num == 7
+    assert batch.scheduled_spec_decode_tokens.tolist() == [[0], [3], [6]]

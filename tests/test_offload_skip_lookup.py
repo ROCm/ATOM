@@ -188,12 +188,15 @@ class _Conn:
 
 def _gate(monkeypatch, *, conn, state_offload=None, hit_blocks=10):
     from atom.model_engine import scheduler as sched_mod
-    from atom.model_engine.scheduler import Scheduler
+    from atom.model_engine.scheduler import PrefillLimits, Scheduler
 
     monkeypatch.setattr(sched_mod.envs, "OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT", True)
     s = Scheduler.__new__(Scheduler)
     s.kv_connector = conn
     s._local_prefill_coalescing = False
+    s.enable_mixed_prefill_decode = False
+    s.max_num_batched_tokens = 64
+    s._unreserved_prefill_limits = PrefillLimits(64)
     s._connector_flag = lambda name: getattr(conn, name, False)
     s.block_manager = SimpleNamespace(
         state_offload=state_offload,
@@ -204,7 +207,9 @@ def _gate(monkeypatch, *, conn, state_offload=None, hit_blocks=10):
     if not s._lookup_detach_enabled(seq):
         return False, conn
     return (
-        s._can_detach_tier_lookup(seq, s._probe_hbm_prefix(seq).num_cached_blocks),
+        s._can_detach_tier_lookup(
+            seq, s._probe_hbm_prefix(seq, limits=s._prefill_limits()).num_cached_blocks
+        ),
         conn,
     )
 
@@ -548,12 +553,12 @@ def test_a_declined_detach_turns_the_request_back_to_the_ordinary_path(monkeypat
 def test_admission_walks_the_prefix_once_when_the_detach_is_probed(monkeypatch):
     """The detach decision and the admission share one `can_allocate` walk."""
     from atom.model_engine import scheduler as sched_mod
-    from atom.model_engine.scheduler import Scheduler
+    from atom.model_engine.scheduler import PrefillLimits, Scheduler
 
     monkeypatch.setattr(sched_mod.envs, "OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT", True)
     walks = []
 
-    def can_allocate(seq, *, record, probe):
+    def can_allocate(seq, *, record, probe, reserved_decode_blocks=0):
         walks.append(record)
         probe.block_hashes.extend([11, 12])
         return 2
@@ -561,8 +566,11 @@ def test_admission_walks_the_prefix_once_when_the_detach_is_probed(monkeypatch):
     s = Scheduler.__new__(Scheduler)
     s.kv_connector = _Conn()
     s._local_prefill_coalescing = False
+    s.enable_mixed_prefill_decode = False
+    s.max_num_batched_tokens = 64
+    s._unreserved_prefill_limits = PrefillLimits(64)
     s.block_manager = SimpleNamespace(hash_block_size=4, can_allocate=can_allocate)
-    probe = s._probe_hbm_prefix(SimpleNamespace())
+    probe = s._probe_hbm_prefix(SimpleNamespace(), limits=s._prefill_limits())
     assert (probe.num_cached_blocks, probe.block_hashes) == (2, [11, 12])
     assert walks == [False]
     assert s._can_detach_tier_lookup(SimpleNamespace(), probe.num_cached_blocks)

@@ -254,7 +254,11 @@ class StructuredOutput:
         starts = lengths.cumsum() - lengths
         plan, pieces, offset = {}, [], 0
         for i in requests:
-            if batch.is_final_chunk is not None and not batch.is_final_chunk[i]:
+            if (
+                i < batch.total_seqs_num_prefill
+                and batch.is_final_chunk is not None
+                and not batch.is_final_chunk[i]
+            ):
                 continue
             start, count = int(starts[i]), int(lengths[i])
             rows = target[start : start + count].tolist()
@@ -333,7 +337,11 @@ class StructuredOutput:
         rows = []
         for i, update in batch.structured_requests.items():
             req_id = batch.req_ids[i]
-            final = batch.is_final_chunk is None or batch.is_final_chunk[i]
+            final = (
+                i >= batch.total_seqs_num_prefill
+                or batch.is_final_chunk is None
+                or batch.is_final_chunk[i]
+            )
             branch_rows, start, size = (
                 plan.get(i, ([], 0, 0)) if metadata else ([i], 0, 0)
             )

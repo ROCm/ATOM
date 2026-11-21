@@ -28,8 +28,14 @@ def clock(monkeypatch):
 
 
 def batch(seqs, decode=0, dummy=False):
+    prefill = list(seqs.values())[: len(seqs) - decode]
     return SimpleNamespace(
-        req_ids=list(seqs), total_seqs_num_decode=decode, is_dummy_run=dummy
+        req_ids=list(seqs),
+        total_seqs_num_prefill=len(seqs) - decode,
+        total_tokens_num_prefill=sum(seq.num_prompt_tokens for seq in prefill),
+        num_cached_tokens=[0] * len(seqs),
+        total_seqs_num_decode=decode,
+        is_dummy_run=dummy,
     )
 
 
@@ -185,7 +191,9 @@ def test_engine_receipt_includes_time_buffered_before_scheduler_admission(
 )
 def test_transfer_ignores_failed_and_offload_loads(clock, is_pd, succeeded, expected):
     metrics = SchedulerMetrics()
-    seq = SimpleNamespace(id=3, kv_transfer_params={"do_remote_prefill": is_pd})
+    seq = SimpleNamespace(
+        id=3, kv_transfer_params={"do_remote_prefill": is_pd}, num_prompt_tokens=4
+    )
     metrics.enqueue(seq)
     metrics.start_kv_wait(seq)
     clock[0] += 0.25
@@ -202,7 +210,7 @@ def test_transfer_ignores_failed_and_offload_loads(clock, is_pd, succeeded, expe
 
 def test_batch_counts_request_rows_and_ignores_dummy_prefill_and_empty(clock):
     metrics = SchedulerMetrics()
-    seqs = {i: SimpleNamespace(id=i) for i in range(5)}
+    seqs = {i: SimpleNamespace(id=i, num_prompt_tokens=4) for i in range(5)}
     for seq in seqs.values():
         metrics.enqueue(seq)
     metrics.record_forward(batch(seqs, decode=5, dummy=True), seqs)
@@ -539,13 +547,14 @@ def test_prefill_context_records_full_prompt_once_and_chunk_batch_totals(monkeyp
     second = Sequence(list(range(20)), block_size=4, request_id="second")
     first.type = second.type = SequenceType.PREFILL
     first.num_cached_tokens, second.num_cached_tokens = 4, 8
-    seqs = {seq.id: seq for seq in (decode, first, second)}
+    # A mixed batch is `[prefill | decode]`, as the scheduler builds it.
+    seqs = {seq.id: seq for seq in (first, second, decode)}
     for seq in seqs.values():
         metrics.enqueue(seq)
     monkeypatch.setattr("atom.metrics.scheduler.time.time", lambda: 100.25)
     scheduled = ScheduledBatch(
         seqs,
-        [1, 3, 4],
+        [3, 4, 1],
         8,
         total_tokens_num_decode=1,
         total_tokens_num_prefill=7,
@@ -652,13 +661,14 @@ def test_decode_request_context_gauge_records_first_dispatch_once(monkeypatch):
     for i in (1, 2):
         metrics.enqueue(seqs[i])
     monkeypatch.setattr("atom.metrics.scheduler.time.time", lambda: 100.25)
+    # `[prefill | decode]`: request 3's prefill row, then 1 and 2 decoding.
     mixed = SimpleNamespace(
-        req_ids=[1, 2, 3],
+        req_ids=[3, 1, 2],
         is_dummy_run=False,
         total_seqs_num_decode=2,
         total_seqs_num_prefill=1,
         total_tokens_num_prefill=50,
-        context_lens=[1000, 9000, 300, 999999],
+        context_lens=[300, 1000, 9000, 999999],
     )
     metrics.record_forward(mixed, seqs)
     first = metrics.decode_request_context_tokens.collect()[0].samples
