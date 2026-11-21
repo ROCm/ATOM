@@ -152,9 +152,14 @@ so passing them through would answer unconstrained without saying so.
 
 Checked: GSM8K (3-shot, `local-completions`) on Qwen3-30B-A3B, TP 1, against
 the Python standalone service on the same build: 0.6876 / 0.8901
-(flexible / strict) against 0.6808 / 0.8825. DeepSeek-V4 and Kimi-K3 are
-checked on CPU only so far (the rendered prompt and its opener, the K3
-reasoning and tool parsers on synthetic replies); they still need a GPU run.
+(flexible / strict) against 0.6808 / 0.8825. Models whose prompt ATOM
+renders are checked token for token against the OpenAI server's chat render
+(`_chat_completions`'s steps), on the body as the router serializes it: 13
+requests (thinking on and off through `thinking`, `reasoning_effort` and
+`chat_template_kwargs`, content lists, tools with `tool_choice` auto and
+required, multi-turn tool calls with `reasoning_content`) match on
+DeepSeek-V4.1-Flash, DeepSeek-V4-Flash and Kimi-K3. These models still need
+a GPU run: V4.1 on gfx942 needs the FP4PTPC checkpoint.
 
 Tests: `events.rs` checks a request's steps becoming its `TokenChunk`
 stream, siblings in index order, and the abort on either side of the

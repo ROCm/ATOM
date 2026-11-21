@@ -42,6 +42,7 @@ from atom.entrypoints.openai.chat_encoders import (
     load_custom_message_encoder,
     render_probe_prompt,
     resolve_reasoning_toggle,
+    template_needs_tool_call_argument_strings,
 )
 from atom.entrypoints.openai.model_capabilities import deployment_metadata
 from atom.entrypoints.openai.protocol import (
@@ -49,6 +50,7 @@ from atom.entrypoints.openai.protocol import (
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_K,
     DEFAULT_TOP_P,
+    ChatCompletionRequest,
 )
 from atom.entrypoints.openai.reasoning import (
     template_opens_reasoning_implicitly,
@@ -60,9 +62,14 @@ from atom.entrypoints.openai.reasoning_controls import (
     resolve_reasoning_controls,
 )
 from atom.entrypoints.openai.reasoning_dialects import resolve_dialect
+from atom.entrypoints.openai.serving_chat import (
+    normalize_chat_tools,
+    validate_chat_request,
+)
 from atom.entrypoints.openai.tool_parser.registry import (
     required_call_channel,
     resolve_tool_call_parser,
+    template_keeps_tool_call_arguments,
 )
 
 logger = logging.getLogger("atom")
@@ -76,9 +83,6 @@ class ChatRenderer:
     def __init__(self, tokenizer: Any, model: str) -> None:
         self.tokenizer = tokenizer
         self.encoder = load_custom_message_encoder(model)
-        # An encoder that joins a content list itself (DeepSeek-V4.1's) takes
-        # it as sent, as the OpenAI server hands it over.
-        self._preserve_content = bool(getattr(self.encoder, "preserve_content", False))
         # A Jinja template (one string, or named variants) is the router's
         # to render; an encoder, or a template that is code, is not.
         self.needed = self.encoder is not None or not chat_template_source(tokenizer)
@@ -90,26 +94,51 @@ class ChatRenderer:
         )
         self.model_starts_in_reasoning = template_opens_reasoning_implicitly(source)
         self.reasoning_toggle = resolve_reasoning_toggle(tokenizer, self.encoder)
+        # As the OpenAI server decides it at startup: history tool-call
+        # arguments go to the template as sent when it keeps or needs them so.
+        keeps = template_keeps_tool_call_arguments(
+            render_probe_prompt(tokenizer, self.encoder, tools=True)
+        )
+        self.preserve_tool_call_arguments = (
+            keeps or template_needs_tool_call_argument_strings(tokenizer, self.encoder)
+        )
 
     def render(self, request: dict[str, Any]) -> tuple[str, str | None]:
         """The prompt, and the channel opener it ends on (or ``None``).
+
+        Rendered as the OpenAI server's `_chat_completions` renders it: the
+        request read into its `ChatCompletionRequest`, tools normalized and
+        checked, messages as `ChatMessage`s (`to_template_dict` keeps a
+        content list for an encoder that joins it, DeepSeek-V4.1's).
 
         The opener is what the reply starts inside, with none of its own: the
         dialect's reasoning opener when the prompt opens reasoning, or its
         answer opener (Kimi-K3's response channel with thinking off).
         """
-        messages = request.get("messages")
-        if not messages:
+        chat = ChatCompletionRequest(
+            **{
+                key: request[key]
+                for key in (
+                    "messages",
+                    "tools",
+                    "tool_choice",
+                    "thinking",
+                    "reasoning_effort",
+                )
+                if request.get(key) is not None
+            }
+        )
+        if not chat.messages:
             raise ValueError("messages is required")
+        chat.tools = normalize_chat_tools(chat.tools)
+        validate_chat_request(chat)
         kwargs = self._template_kwargs(request)
         prompt = apply_chat_template(
             self.tokenizer,
             self.encoder,
-            [
-                _template_message(message, self._preserve_content)
-                for message in messages
-            ],
-            tools=request.get("tools"),
+            chat.get_messages(),
+            tools=chat.tools,
+            preserve_tool_call_arguments=self.preserve_tool_call_arguments,
             **kwargs,
         )
         return prompt, self._opener(prompt, kwargs)
@@ -149,27 +178,6 @@ class ChatRenderer:
         ):
             return self.dialect.prompt_open_marker
         return None
-
-
-def _template_message(
-    message: dict[str, Any], preserve_content: bool
-) -> dict[str, Any]:
-    """A chat message as the template takes it: text parts joined, as the
-    Python standalone service sends them, unless the encoder joins them."""
-    content = message.get("content")
-    if isinstance(content, list) and not preserve_content:
-        content = "\n".join(
-            part.get("text", "")
-            for part in content
-            if isinstance(part, dict) and part.get("type") == "text"
-        )
-    elif content is None:
-        content = ""
-    template_message = {"role": message.get("role"), "content": content}
-    for key in ("tool_calls", "tool_call_id", "name", "reasoning_content"):
-        if message.get(key) is not None:
-            template_message[key] = message[key]
-    return template_message
 
 
 class TokenBridge:
