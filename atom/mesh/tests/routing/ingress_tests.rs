@@ -1034,51 +1034,6 @@ async fn tokenize_endpoint_limits_the_total_prompt_bytes() {
     }
 }
 
-/// The ids of the tokens only `tokenizer_config.json` declares, which a model
-/// fastokens encodes has and HuggingFace does not, detokenize back to them.
-#[tokio::test]
-async fn tokens_only_tokenizer_config_declares_detokenize() {
-    use crate::routers::test_mocks::tokenizer::{
-        byte_level_next_id, byte_level_tokenizer_dir, BYTE_LEVEL_MERGES,
-    };
-    let pool = PreparePoolRuntime::new(default_pool()).unwrap();
-    let context = Arc::new(
-        AppContext::from_config(Default::default(), 5, pool.handle())
-            .await
-            .unwrap(),
-    );
-    let id = byte_level_next_id(BYTE_LEVEL_MERGES);
-    let config = json!({"added_tokens_decoder": {
-        id.to_string(): {"content": "<|config_only|>", "normalized": false, "special": true},
-        (id + 1).to_string(): {"content": "<|plain|>", "normalized": false, "special": false},
-    }});
-    let dir = byte_level_tokenizer_dir(BYTE_LEVEL_MERGES, false, config);
-    let path = dir.path().join("tokenizer.json");
-    let hf = crate::tokenizer::factory::create_tokenizer(path.to_str().unwrap()).unwrap();
-    let fast = crate::routers::prepare::fast_tokenizer::FastTokenizer::new(hf, &path, 0);
-    let fast: Arc<dyn crate::tokenizer::traits::Tokenizer> = Arc::new(fast.unwrap());
-    context
-        .tokenizer_registry
-        .load("fast", "fast", "fast", || async { Ok(fast) })
-        .await
-        .unwrap();
-
-    let text = "the<|config_only|> weather<|plain|>";
-    let request = json_request("/v1/tokenize", json!({"model": "fast", "prompt": text}));
-    let response = crate::routers::comm::tokenize::tokenize(&context, request).await;
-    let tokens = body_json(response).await["tokens"].clone();
-    for id in [id, id + 1] {
-        assert!(tokens.as_array().unwrap().contains(&json!(id)), "{tokens}");
-    }
-    for (skip_special_tokens, want) in [(false, text), (true, "the weather<|plain|>")] {
-        let body =
-            json!({"model": "fast", "tokens": tokens, "skip_special_tokens": skip_special_tokens});
-        let request = json_request("/v1/detokenize", body);
-        let response = crate::routers::comm::tokenize::detokenize(&context, request).await;
-        assert_eq!(body_json(response).await["text"], want);
-    }
-}
-
 fn json_request(path: &str, body: serde_json::Value) -> Request {
     Request::builder()
         .uri(path)

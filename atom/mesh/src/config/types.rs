@@ -189,10 +189,8 @@ pub const DEFAULT_FASTOKENS_SEGMENT_CACHE_MB: usize = 1024;
 pub struct FastokensConfig {
     /// Models whose prompts encode with fastokens, by the name or source their
     /// tokenizer registers under, or `*` for every model. Decoding and chat
-    /// templates stay with HuggingFace, except that fastokens decodes the ids
-    /// of the tokens only tokenizer_config.json declares, which HuggingFace
-    /// does not have. A model whose prompts fastokens does not encode, or
-    /// decode, as HuggingFace does stays with HuggingFace.
+    /// templates stay with HuggingFace. A model whose prompts fastokens does
+    /// not encode as HuggingFace does stays with HuggingFace.
     #[arg(
         id = "fastokens_models",
         long = "fastokens-models",
