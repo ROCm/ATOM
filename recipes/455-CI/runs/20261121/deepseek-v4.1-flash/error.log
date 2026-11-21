@@ -1,0 +1,23 @@
+== TP4 server, c4 MLPerf endpoint bench (temperature 1.0), 2026-11-21 11:47 BJ: model runners die at the first MTP verification sample
+    raw = load_config_json(f"{cfg_dir}/DEFAULT.json", required=True)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: Required config file doesn't exist: /app/aiter/aiter/ops/triton/configs/gfx1250/triton/fusions/fused_mixed_sample/DEFAULT.json
+[atom 03:47:32] AsyncIOProcManager(ModelRunner): [ModelRunner3/4] proc died unexpectedly (exitcode=1), shutting down.
+    target_token_ids = self.sampler.sample_verification_tokens(
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/model_engine/model_runner.py", line 3796, in forward
+    fwd_output = self.postprocess(
+                 ^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/model_engine/model_runner.py", line 3504, in postprocess
+    target_token_ids = self.sampler.sample_verification_tokens(
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/model_engine/model_runner.py", line 787, in wrapped
+    return method(self, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/model_engine/model_runner.py", line 787, in wrapped
+    return method(self, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+== DEP4 server, 2026-11-21 11:48 BJ: exits 20 s after launch
+RuntimeError: Found 12 duplicate shape entries during merge of 'bf16_tuned_gemm' (dedup key: ['M', 'N', 'K', 'bias', 'dtype', 'outdtype', 'scaleAB', 'bpreshuffle', 'cu_num', 'gfx']).
+[atom 03:48:54] AsyncIOProcManager(ModelRunner): [ModelRunner0/1] proc died unexpectedly (exitcode=1), shutting down.
