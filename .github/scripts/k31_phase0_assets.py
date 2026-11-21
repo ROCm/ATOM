@@ -41,6 +41,7 @@ def measured_hash(path, seconds=90):
         require(
             identity(path, os.fstat(stream.fileno())) == before, "opened file changed"
         )
+    require(time.monotonic() - started < seconds, "checksum deadline")
     require(
         identity(path) == before and count == before["bytes"],
         "file changed during checksum",
@@ -77,9 +78,7 @@ def check_runtime(pins, spec, result):
     subprocess.run(
         command + ["diff", "--exit-code", "--quiet", "HEAD"], check=True, timeout=10
     )
-    result.update(
-        aiter=head, scope="pinned metadata/client files and four native modules only"
-    )
+    result["aiter"] = head
 
 
 def check_model(view, cache, result=None):
@@ -136,7 +135,8 @@ def check_model(view, cache, result=None):
             require(identity(metadata) == meta_id, "acquisition metadata changed")
             lines = raw.decode().splitlines()
             require(
-                len(lines) == 3 and float(lines[2]) > 0, "invalid acquisition metadata"
+                len(lines) == 3 and 0 < float(lines[2]) < float("inf"),
+                "invalid acquisition metadata",
             )
             require(
                 lines[0]
