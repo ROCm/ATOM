@@ -160,6 +160,17 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
 - **Pipeline parallel:** pp2 x tp4 runs with or without the DSpark drafter (`--enforce-eager`: PP decode has no CUDA graphs yet). The drafter sits on the last stage; `PPAuxRelay` (`atom/spec_decode/pp_aux_relay.py`) brings it the aux hidden states captured on earlier stages.
 - **Speculation:** Two DSpark drafts, both `--method dspark`: the Inferact MLA draft (`atom/models/kimi_k3_dspark.py`, `KimiK3DSpark`), which writes extra rows in the target's MLA pool, and the RadixArk GQA draft (`atom/models/kimi_k3_dspark_gqa.py`, `KimiK3DSparkGQA`, a SpecForge DFlash checkpoint renamed to `K3DSparkGQAModel`), which keeps its own KV pool and is refused under PP. See [the DSpark recipe](../recipes/DSpark.md) and [the Kimi-K3 recipe](../recipes/Kimi-K3.md).
 
+- **Video:** `video_url` parts need PyAV (`pip install -e ".[vision]"`). `MediaLoader.load_video` reads the encoded bytes; the K3 input builder probes the container (demuxing, no decode), samples at most `sample_fps`, sizes every frame so the clip's frames share `in_patch_limit_video` (at most `in_patch_limit_each_frame` each), refuses a clip whose tokens exceed `--max-model-len` before decoding, and resizes each sampled frame as it is decoded. Every `temporal_merge_kernel_size` frames form one grid, labelled with its first frame's timestamp and rendered as one embedding span. Images and videos in one request take a single path: each image goes through the checkpoint processor's public `preprocess_medias` / `media_processor.preprocess`, and one `apply_chat_template(image_prompts=...)` renders the prompt.
+- **Bounded vision passes:** the model sets `vision_pass_patches` from `preprocessor_config.json` (the larger of `in_patch_limit` and `temporal_merge_kernel_size x in_patch_limit_each_frame`), and the shared runtime (`encode_grids_in_passes` in `atom/model_engine/multimodal_runtime.py`) encodes a request's grids in passes of at most that many patches. A grid is never split; one that padding takes past the budget is encoded alone. Models that do not set it encode a request's grids at once.
+- **Media memory, worst case per media item** (released config; 7168-wide bf16 embeddings; fp32 pixels at 588 values per 14x14x3 patch):
+
+  | Item | Patches | Tokens | Cached embeddings per TP rank | Host pixels |
+  |---|---|---|---|---|
+  | Image (`in_patch_limit`, before padding) | 65,536 | 16,384 | 224 MiB | 147 MiB |
+  | Video (`in_patch_limit_video`, padding included) | 655,360 | 43,659 | 597 MiB | 1.44 GiB |
+
+  A video's token count is its grid count times the tokens of one frame, so a partial last grid costs a full one: 41 frames of 15,876 patches is the maximum. Embeddings stay cached for the request's prefill; pixels stay in engine-core host RAM until every rank holds the embeddings. Neither is part of the KV budget, and the per-video cap does not bound the number of videos in one request.
+
 ### Kimi-K3.1 (`KimiK31ForConditionalGeneration`)
 
 - **Architecture:** Reuses the K3 backbone and multimodal wrapper, with a separate NoPE DSA indexer on each of the 24 MLA layers. Queries come from normalized q-lora activations; keys and head weights come from the layer's hidden states.

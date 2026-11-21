@@ -307,6 +307,42 @@ curl -X POST "http://localhost:8000/v1/chat/completions" \
 
 Content parts are rendered in the order the client sent them, so text before/after an image lands where you put it.
 
+### Video request
+
+Video input needs PyAV in the serving environment (`pip install av`, or install ATOM with `.[vision]`); without it a `video_url` request is answered with a 400 that says so. Send the clip as a `video_url` part, alone or mixed with images and text:
+
+```bash
+VIDEO_BASE64=$(base64 -w 0 /app/clip.mp4)
+
+curl -X POST "http://localhost:8000/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Kimi-K3",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {"type": "video_url",
+           "video_url": {"url": "data:video/mp4;base64,'"$VIDEO_BASE64"'"}},
+          {"type": "text", "text": "What happens in this video?"}
+        ]
+      }
+    ],
+    "max_tokens": 512,
+    "temperature": 0
+  }' | python3 -m json.tool
+```
+
+How a clip becomes tokens, all from `media_proc_cfg` in `preprocessor_config.json`:
+
+- at most `sample_fps` (8) frames per second are sampled, uniformly over the clip;
+- every frame gets at most `in_patch_limit_each_frame` (16,384) patches, and all of a clip's frames share `in_patch_limit_video` (655,360), so a long clip is fed at a lower resolution. Padding included, one video never exceeds 655,360 patches, which is at most 43,659 tokens (a partial last grid costs as many tokens as a full one);
+- every `temporal_merge_kernel_size` (4) frames form one grid, prefixed with its first frame's timestamp, which the tower pools into `(h // 2) * (w // 2)` tokens.
+
+The clip is probed before it is decoded, so one that would not fit `--max-model-len` is refused without decoding it, and frames are resized as they are decoded. Each grid is one embedding span, so a video prefill is chunked like an image one.
+
+A video's grids are encoded in passes of at most 65,536 patches (one full-size image; the larger of `in_patch_limit` and `temporal_merge_kernel_size x in_patch_limit_each_frame`), so the tower's activations do not grow with the clip. The per-request vision cache and the host pixels do: a maximal video holds 597 MiB of embeddings per GPU and 1.44 GiB of fp32 pixels in engine-core host RAM, about 2.5x and 10x a maximal image, outside the KV budget like the image copies above. Size `--gpu-memory-utilization` and `--max-num-seqs` for the number of concurrent video requests you expect.
+
 ### Offline inference
 
 Export the same environment as the server launch script above, then:

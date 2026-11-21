@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 
 from atom.multimodal import (
     AudioData,
@@ -36,6 +37,31 @@ def config(architecture="Qwen3_5ForConditionalGeneration"):
             vision_config=SimpleNamespace(merge_kernel_size=2),
         ),
     )
+
+
+class KimiProcessor:
+    """The public processor surface the Kimi-K3 input builder uses."""
+
+    def __init__(self, input_ids, grids):
+        self.input_ids, self.grids = input_ids, grids
+        self.medias, self.messages, self.prompts = [], None, None
+        self.media_processor = SimpleNamespace(preprocess=self._preprocess)
+        self.tokenizer = SimpleNamespace(apply_chat_template=self._render)
+
+    def preprocess_medias(self, medias):
+        self.medias += medias
+        return medias, ["<image>"] * len(medias)
+
+    def _preprocess(self, medias, return_tensors=None):
+        (media,) = medias
+        return {
+            "pixel_values": torch.from_numpy(np.asarray(media["image"])).reshape(-1, 3),
+            "grid_thws": torch.tensor([self.grids[media["image"].size]]),
+        }
+
+    def _render(self, messages, image_prompts, **kwargs):
+        self.messages, self.prompts = messages, image_prompts
+        return {"input_ids": torch.tensor([self.input_ids])}
 
 
 @pytest.mark.parametrize("modality", ["image", "video", "audio"])
@@ -306,18 +332,7 @@ def test_qwen_preparation_preserves_template_options_and_hf_tokens_and_tensors(
 
 
 def test_kimi_preparation_expands_each_image_and_keeps_interleaving(image_module):
-    seen = {}
-    pixel_values = np.ones((3, 4))
-    grid = np.array([[1, 4, 4], [3, 4, 8]])
-
-    def processor(**kwargs):
-        seen.update(kwargs)
-        return {
-            "input_ids": np.array([[9, 42, 7, 42, 8]]),
-            "pixel_values": pixel_values,
-            "grid_thws": grid,
-        }
-
+    processor = KimiProcessor([9, 42, 7, 42, 8], {(2, 2): [1, 4, 4], (4, 2): [3, 4, 8]})
     messages = chat(
         {"type": "image"},
         {"type": "text", "text": "between"},
@@ -330,17 +345,18 @@ def test_kimi_preparation_expands_each_image_and_keeps_interleaving(image_module
         {"image": [image_module.new("RGB", (2, 2)), image_module.new("RGB", (4, 2))]},
     )
     assert token_ids == [9] + [42] * 4 + [7] + [42] * 8 + [8]
-    assert model_inputs["image_grid_thw"] is grid
-    assert model_inputs["pixel_values"] is pixel_values
+    assert model_inputs["image_grid_thw"].tolist() == [[1, 4, 4], [3, 4, 8]]
+    assert model_inputs["pixel_values"].shape == (4 + 8, 3)
     # One span per expanded run, in image order, so the prefill can chunk.
     assert model_inputs["embedding_spans"] == ((1, 4), (6, 8))
     assert isinstance(model_inputs["cache_seed"], int)
-    assert [part["type"] for part in seen["messages"][0]["content"]] == [
+    assert [part["type"] for part in processor.messages[0]["content"]] == [
         "image",
         "text",
         "image",
     ]
-    assert [entry["image"].size for entry in seen["medias"]] == [(2, 2), (4, 2)]
+    assert processor.prompts == ["<image>", "<image>"]
+    assert [entry["image"].size for entry in processor.medias] == [(2, 2), (4, 2)]
 
 
 @pytest.mark.parametrize(
@@ -356,17 +372,18 @@ def test_separate_images_bind_in_order_across_chat_turns(image_module, architect
             return "<|image_pad|> first turn <|image_pad|> second turn"
 
         def __call__(self, **kwargs):
-            if "messages" in kwargs:
-                seen["messages"] = kwargs["messages"]
-            images = kwargs.get("images")
-            if images is None:
-                images = [item["image"] for item in kwargs["medias"]]
+            images = kwargs["images"]
             return {
                 "input_ids": np.array([[42, 7, 42]]),
                 "pixel_values": np.stack([np.asarray(image) for image in images]),
                 "image_grid_thw": np.array([[1, 2, 2], [1, 2, 2]]),
-                "grid_thws": np.array([[1, 2, 2], [1, 2, 2]]),
             }
+
+    if architecture == "KimiK3ForConditionalGeneration":
+        kimi = KimiProcessor([42, 7, 42], {(2, 2): [1, 2, 2]})
+        kimi.tokenizer.apply_chat_template = lambda messages, **kwargs: (
+            seen.update(messages=messages) or kimi._render(messages, **kwargs)
+        )
 
     conversation = [
         {"role": "user", "content": [{"type": "image", "detail": "high"}]},
@@ -375,9 +392,13 @@ def test_separate_images_bind_in_order_across_chat_turns(image_module, architect
     ]
     images = [image_module.new("RGB", (2, 2), color) for color in ["red", "blue"]]
     _, media = prepare_multimodal_inputs(
-        config(architecture), Processor(), conversation, {"image": images}
+        config(architecture),
+        kimi if architecture == "KimiK3ForConditionalGeneration" else Processor(),
+        conversation,
+        {"image": images},
     )
-    assert media["pixel_values"][:, 0, 0].tolist() == [[255, 0, 0], [0, 0, 255]]
+    pixels = media["pixel_values"].reshape(2, -1, 3)
+    assert pixels[:, 0].tolist() == [[255, 0, 0], [0, 0, 255]]
     assert seen["messages"][0]["content"][0]["image"].getpixel((0, 0)) == (255, 0, 0)
     assert seen["messages"][2]["content"][0]["image"].getpixel((0, 0)) == (0, 0, 255)
     assert seen["messages"][0]["content"][0]["detail"] == "high"

@@ -39,6 +39,11 @@ _MULTIMODAL_ARCH_TO_INPUT_BUILDER: dict[str, str] = {
     ),
 }
 
+# Modalities beyond images, per architecture; every builder takes images.
+_MULTIMODAL_ARCH_TO_EXTRA_MODALITIES: dict[str, frozenset[str]] = {
+    "KimiK3ForConditionalGeneration": frozenset({"video"}),
+}
+
 # Architectures whose checkpoint ships its own processor rather than one
 # `AutoProcessor` can build. Selected before that fallback, so a model listed
 # here never reaches it.
@@ -85,6 +90,18 @@ def get_multimodal_input_builder(
             "This model's multimodal processor requires a chat conversation"
         )
     return _resolve(builder or "atom.models.qwen3_5_vl.build_qwen_vl_inputs")
+
+
+def get_multimodal_modalities(atom_config: Config) -> frozenset[str]:
+    """Modalities the architecture's input builder accepts."""
+    hf_config = getattr(atom_config, "hf_config", None)
+    architectures = getattr(hf_config, "architectures", None) or []
+    extra = (
+        _MULTIMODAL_ARCH_TO_EXTRA_MODALITIES.get(architectures[0], frozenset())
+        if architectures
+        else frozenset()
+    )
+    return frozenset({"image"}) | extra
 
 
 def get_mrope_input_positions(
