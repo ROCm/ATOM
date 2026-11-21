@@ -992,6 +992,55 @@ models:
           name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-mcstore-2n-1m-c112
           concurrency: [112]
 
+      # The single-node mooncake_store and nightly lmcache-1m cells with the
+      # router following the prefill's KV events and routing by them
+      # (router.kv_events: pd_server_atom.sh passes --kv-events and turns the
+      # workers' publishers on). Dispatch-only (suite=kv_events); the Store
+      # cells keep the mooncake_store cells' pit2-p03 (TW MI355X) limit.
+      # No lmcache c96: its prefill's staged-index RDMA to the decode passed
+      # the 120 s deadline from the 80th request on (run 43698617209).
+      kv_events:
+        - &glm52_agentic_mcstore_kvev_cpp4_dcp4
+          <<: *glm52_agentic_mcstore_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-mcstore-kvev-1m-c72
+          display_topology: 1P1D-CPP4-DCP4-TP1-TP4-MCSTORE-KVEV
+          concurrency: [72]
+          env:
+            common: *glm52_agentic_lmcache_cpp4_dcp4_env_common
+            prefill:
+              <<: *glm52_agentic_mcstore_cpp4_dcp4_env_prefill
+              # NUMA1 of pit2-p03 nodes has kept ~0.8-1.1 TiB of page cache the
+              # drop cannot reach, and compacting it for 768 GiB timed out
+              # (owner registration then fails), so NUMA0 takes more.
+              MOONCAKE_STORE_OWNERS: "0:832:rdma4,rdma5;1:448:rdma6,rdma7"
+              # The owners pin before the workers start; dropping the
+              # checkpoint's cache while they load left the TP4 decode faulting
+              # it from NFS at under 100 MB/s, past the 5000 s start limit.
+              MOONCAKE_STORE_PAGE_CACHE_DROP_FOR: "0"
+            decode: *glm52_cpp4_dcp4_decode_env
+          router: &kv_events_router
+            policy: cache_aware
+            kv_events: true
+
+        - <<: *glm52_agentic_mcstore_kvev_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-mcstore-kvev-1m-c96
+          concurrency: [96]
+
+        - <<: *glm52_agentic_mcstore_kvev_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-mcstore-kvev-1m-c56
+          concurrency: [56]
+
+        - &glm52_agentic_lmcache_kvev_cpp4_dcp4
+          <<: *glm52_agentic_lmcache_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-kvev-1m-c72
+          display_topology: 1P1D-CPP4-DCP4-TP1-TP4-LMCACHE-KVEV
+          concurrency: [72]
+          router: *kv_events_router
+
+        - <<: *glm52_agentic_lmcache_kvev_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-kvev-1m-c56
+          concurrency: [56]
+
     accuracy:
       task: gsm8k
       fewshot: 20
