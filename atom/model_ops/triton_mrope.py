@@ -10,10 +10,17 @@ the generic rotary embedding implementation.
 
 from __future__ import annotations
 
+import functools
+from typing import TYPE_CHECKING
+
 import torch
 import triton
 import triton.language as tl
+from aiter.jit.utils.chip_info import get_gfx
 from torch import nn
+
+if TYPE_CHECKING:
+    from atom.model_ops.layernorm import DualRMSNorm
 
 
 @triton.jit(do_not_specialize=["pos_stride_row"])
@@ -199,6 +206,90 @@ def _mrope_qk_tiled_kernel(
     tl.store(k_out_ptr + out_offsets_k, out, mask=mask & ~is_q)
 
 
+def _mrope_qk_supported(
+    rotary_emb: nn.Module,
+    positions: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    num_q_heads: int,
+    num_k_heads: int,
+    head_size: int,
+) -> bool:
+    """Whether q, k and the rotary embedding have the Qwen3.5 MRoPE shapes these kernels take."""
+    mrope_section = getattr(rotary_emb, "mrope_section", None)
+    return not (
+        positions.ndim != 2
+        or positions.shape[0] != 3
+        or positions.stride(1) != 1
+        or mrope_section is None
+        or len(mrope_section) < 3
+        or not getattr(rotary_emb, "mrope_interleaved", False)
+        or head_size != 256
+        or getattr(rotary_emb, "rotary_dim", None) != 64
+        or not getattr(rotary_emb, "is_neox_style", False)
+        or q.ndim != 2
+        or k.ndim != 2
+        or q.shape[0] != positions.shape[1]
+        or k.shape[0] != positions.shape[1]
+        or q.stride(1) != 1
+        or k.stride(1) != 1
+        or q.shape[1] != num_q_heads * head_size
+        or k.shape[1] != num_k_heads * head_size
+    )
+
+
+@functools.cache
+def _gfx1250_fused_qk_norm_mrope():
+    """aiter's fused Q/K norm + MRoPE on gfx1250, or None (other arch, or an aiter without it)."""
+    if get_gfx() != "gfx1250":
+        return None
+    try:
+        from aiter.ops.triton.fusions.fused_qk_norm_mrope import fused_qk_norm_mrope
+    except ImportError:
+        return None
+    return fused_qk_norm_mrope
+
+
+def try_fused_qk_norm_mrope(
+    qk_norm: DualRMSNorm,
+    rotary_emb: nn.Module,
+    positions: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    num_q_heads: int,
+    num_k_heads: int,
+    head_size: int,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """The Q/K Gemma RMSNorm and the Qwen3.5 MRoPE in one aiter Gluon kernel on gfx1250.
+
+    Returns ``None`` where the kernel does not apply (under ``torch.compile`` as
+    ``try_mrope_qk_fused``), so callers keep ``qk_norm`` and ``try_mrope_qk_fused``.
+    """
+    if torch.compiler.is_compiling():
+        return None
+    fused_qk_norm_mrope = _gfx1250_fused_qk_norm_mrope()
+    if (
+        fused_qk_norm_mrope is None
+        or not qk_norm.add_unit_offset
+        or not _mrope_qk_supported(
+            rotary_emb, positions, q, k, num_q_heads, num_k_heads, head_size
+        )
+    ):
+        return None
+    half = rotary_emb.rotary_dim // 2
+    return fused_qk_norm_mrope(
+        q,
+        k,
+        qk_norm.q_norm.weight,
+        qk_norm.k_norm.weight,
+        qk_norm._eps,
+        positions,
+        rotary_emb.cos_cache.view(-1, half),
+        rotary_emb.sin_cache.view(-1, half),
+        rotary_emb.mrope_section,
+    )
+
+
 def try_mrope_qk_fused(
     rotary_emb: nn.Module,
     positions: torch.Tensor,
@@ -225,31 +316,12 @@ def try_mrope_qk_fused(
     the safe option: SGLang eager mode keeps the perf gain, compile mode
     behaves identically to ``main``.
     """
-    if torch.compiler.is_compiling():
-        return None
-
-    mrope_section = getattr(rotary_emb, "mrope_section", None)
-    if (
-        positions.ndim != 2
-        or positions.shape[0] != 3
-        or positions.stride(1) != 1
-        or mrope_section is None
-        or len(mrope_section) < 3
-        or not getattr(rotary_emb, "mrope_interleaved", False)
-        or head_size != 256
-        or getattr(rotary_emb, "rotary_dim", None) != 64
-        or not getattr(rotary_emb, "is_neox_style", False)
-        or q.ndim != 2
-        or k.ndim != 2
-        or q.shape[0] != positions.shape[1]
-        or k.shape[0] != positions.shape[1]
-        or q.stride(1) != 1
-        or k.stride(1) != 1
-        or q.shape[1] != num_q_heads * head_size
-        or k.shape[1] != num_k_heads * head_size
+    if torch.compiler.is_compiling() or not _mrope_qk_supported(
+        rotary_emb, positions, q, k, num_q_heads, num_k_heads, head_size
     ):
         return None
 
+    mrope_section = rotary_emb.mrope_section
     q_out = torch.empty_like(q)
     k_out = torch.empty_like(k)
     num_tokens = positions.shape[1]
