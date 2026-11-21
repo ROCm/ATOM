@@ -867,3 +867,83 @@ async fn forced_acceptance_text_stands_in_for_every_token() {
     );
     assert_eq!(body["usage"]["completion_tokens"], 2);
 }
+
+/// A chat's stop strings become the token sequences the Core matches, in
+/// order, then its stop token ids, one each; a string with no tokens is
+/// dropped.
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_strings_and_ids_reach_the_core_as_token_sequences() {
+    let mut served = Served::start(1).await;
+    let core = answer_each(std::mem::take(&mut served.cores), hello_world);
+    let body = user_hello(json!({
+        "stop": ["world", "hello world", " "],
+        "stop_token_ids": [THINK_END, LT],
+    }));
+    let (status, body) = json_body(served.post("/v1/chat/completions", body).await).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, specs, _) = core.into_iter().next().unwrap().join().unwrap();
+    let ids = |ids: &[i32]| pb::TokenIds { ids: ids.to_vec() };
+    assert_eq!(
+        specs[0].stop_token_sequences,
+        [
+            ids(&[WORLD]),
+            ids(&[HELLO, WORLD]),
+            ids(&[THINK_END]),
+            ids(&[LT])
+        ]
+    );
+}
+
+/// The kwargs a chat is rendered with, as api_server merges them: the
+/// request's over the deployment's defaults, the reasoning switch over both,
+/// and `response_format: text` passed on.
+#[tokio::test(flavor = "multi_thread")]
+async fn template_kwargs_merge_as_the_python_server_merges_them() {
+    // `{{ mode }}`, then `hello` if reasoning is on, `user` if a text
+    // response format reached the template.
+    let template = "{{ mode }} {% if enable_thinking %}hello {% endif %}\
+                    {% if response_format is defined %}user {% endif %}assistant:";
+    let cases = [
+        (json!({}), vec![WORLD, 4, 5]),
+        (
+            json!({"chat_template_kwargs": {"mode": "hello"}}),
+            vec![HELLO, 4, 5],
+        ),
+        (
+            json!({"thinking": {"type": "enabled"}}),
+            vec![WORLD, HELLO, 4, 5],
+        ),
+        (
+            json!({"chat_template_kwargs": {"enable_thinking": true},
+                   "thinking": {"type": "disabled"}}),
+            vec![WORLD, 4, 5],
+        ),
+        (
+            json!({"chat_template_kwargs": {"enable_thinking": true},
+                   "reasoning_effort": "none"}),
+            vec![WORLD, 4, 5],
+        ),
+        (
+            json!({"response_format": {"type": "text"}}),
+            vec![WORLD, 3, 4, 5],
+        ),
+    ];
+    for (extra, prompt) in cases {
+        let mut served = Served::serve_model(1, template, RouterConfig::default(), |model| {
+            model.default_chat_template_kwargs =
+                json!({"mode": "world"}).as_object().unwrap().clone();
+            model.reasoning_toggle = Some(crate::atom_engine::spec::ReasoningToggle {
+                name: "enable_thinking".into(),
+                off: json!(false),
+                on: json!(true),
+            });
+        })
+        .await;
+        let core = answer_each(std::mem::take(&mut served.cores), hello_world);
+        let body = user_hello(extra.clone());
+        let (status, body) = json_body(served.post("/v1/chat/completions", body).await).await;
+        assert_eq!(status, StatusCode::OK, "{extra}: {body}");
+        let (_, _, data) = core.into_iter().next().unwrap().join().unwrap();
+        assert_eq!(data[0], test_support::token_frame(&prompt), "{extra}");
+    }
+}

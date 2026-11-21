@@ -15,6 +15,7 @@ import pytest
 import torch
 
 from atom.model_engine import admission
+from atom.model_engine.prefix_hash import ShippedChain
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
 from atom.model_engine.zmq_protocol import codec, wire
@@ -109,6 +110,139 @@ def test_the_share_cache_estimate_reaches_the_sequence():
     # Absent, as from a client that does not route by prefix: none.
     seq = admission.build_sequence(submitted(SamplingParams()), core_context())
     assert seq.dp_est_cached_tokens == 0
+
+
+def test_a_submit_carries_every_request_field():
+    """Every field a client sets reaches the Core's spec (`_decode_spec`)."""
+    chain = ShippedChain(16, 5, 3, 99, array.array("Q", [11, 12]))
+    spec = submitted(
+        SamplingParams(),
+        external_request_id="ext",
+        parent_request_id="parent",
+        sibling_index=2,
+        needs_independent_noise=True,
+        stop_token_sequences=[[5, 6], [7]],
+        kv_transfer_params={"do_remote_decode": True},
+        multimodal_data={"pixel_values": [1]},
+        cache_seed=1234,
+        mrope_positions=np.arange(6, dtype=np.int64).reshape(2, 3),
+        mrope_position_delta=-3,
+        data_parallel_rank=1,
+        dp_session_id="session",
+        dp_parent_session_id="parent-session",
+        arrive_time=12.5,
+        prompt_hash_chain=chain,
+        dp_est_cached_tokens=32,
+        _atom_trace_carrier={"traceparent": "00-ab-cd-01"},
+        _atom_trace_model="m",
+        _atom_trace_request_id="r",
+    )
+    kw = spec.kwargs
+    assert (kw["request_id"], kw["parent_request_id"]) == ("ext", "parent")
+    assert (kw["sibling_index"], kw["needs_independent_noise"]) == (2, True)
+    assert kw["stop_token_sequences"] == [[5, 6], [7]]
+    assert kw["kv_transfer_params"] == {"do_remote_decode": True}
+    assert kw["multimodal_data"] == {"pixel_values": [1]}
+    assert np.asarray(kw["mrope_positions"]).tolist() == [[0, 1, 2], [3, 4, 5]]
+    assert kw["mrope_position_delta"] == -3
+    assert kw["data_parallel_rank"] == 1
+    assert (kw["dp_session_id"], kw["dp_parent_session_id"]) == (
+        "session",
+        "parent-session",
+    )
+    assert (spec.cache_seed, spec.arrive_time, spec.dp_est_cached_tokens) == (
+        1234,
+        12.5,
+        32,
+    )
+    assert spec.prompt_hash_chain[:4] == chain[:4]
+    assert list(spec.prompt_hash_chain.hashes) == [11, 12]
+    assert spec.trace == ({"traceparent": "00-ab-cd-01"}, "m", "r")
+
+
+def test_a_submit_leaves_unset_fields_unset():
+    spec = submitted(SamplingParams())
+    kw = spec.kwargs
+    for name in (
+        "request_id",
+        "parent_request_id",
+        "kv_transfer_params",
+        "multimodal_data",
+        "mrope_positions",
+        "data_parallel_rank",
+        "dp_session_id",
+        "dp_parent_session_id",
+    ):
+        assert kw[name] is None, name
+    assert (kw["sibling_index"], kw["needs_independent_noise"]) == (0, False)
+    # A text prompt's -1 stays off the wire.
+    assert (spec.cache_seed, spec.trace, spec.prompt_hash_chain) == (None, None, None)
+
+
+def test_the_core_builds_the_sequence_the_client_described(monkeypatch):
+    """What `build_sequence` sets on the sequence after building it, and the
+    seed it takes from the client rather than hashing the media again."""
+    from atom.model_engine import multimodal_runtime
+
+    def no_rehash(data):
+        raise AssertionError("the client's seed is taken, not recomputed")
+
+    monkeypatch.setattr(multimodal_runtime, "multimodal_cache_seed", no_rehash)
+    media = {"pixel_values": [1]}
+    spec = submitted(
+        SamplingParams(),
+        multimodal_data=media,
+        cache_seed=1234,
+        mrope_positions=np.zeros((3, 3), dtype=np.int64),
+        arrive_time=12.5,
+        _atom_trace_carrier={"traceparent": "00-ab-cd-01"},
+        _atom_trace_model="m",
+        _atom_trace_request_id=None,
+    )
+    seq = admission.build_sequence(spec, core_context())
+    assert seq.arrive_time == 12.5
+    assert seq.cache_seed == 1234
+    assert seq.multimodal_data == media and "cache_seed" not in seq.multimodal_data
+    assert seq._atom_trace_carrier == {"traceparent": "00-ab-cd-01"}
+    assert (seq._atom_trace_model, seq._atom_trace_request_id) == ("m", None)
+    assert seq._atom_trace_timing is None
+    # A seed the media itself carries is the one a sequence keeps.
+    media = {"pixel_values": [1], "cache_seed": 7}
+    spec = submitted(
+        SamplingParams(),
+        multimodal_data=media,
+        cache_seed=1234,
+        mrope_positions=np.zeros((3, 3), dtype=np.int64),
+    )
+    assert admission.build_sequence(spec, core_context()).cache_seed == 7
+
+
+def test_the_core_runs_the_models_own_validation():
+    seen = []
+
+    def validate_request(**kwargs):
+        seen.append(kwargs)
+        if kwargs["multimodal_data"] is not None:
+            raise ValueError("this model takes no media")
+
+    context = core_context(
+        hf_config=SimpleNamespace(
+            model_type="llama", validate_request=validate_request
+        ),
+        speculative_config=SimpleNamespace(num_speculative_tokens=3),
+        enable_dp_attention=True,
+    )
+    admission.build_sequence(submitted(SamplingParams()), context)
+    assert seen == [
+        {"num_draft_tokens": 3, "multimodal_data": None, "enable_dp_attention": True}
+    ]
+    spec = submitted(
+        SamplingParams(),
+        multimodal_data={"pixel_values": [1]},
+        mrope_positions=np.zeros((3, 3), dtype=np.int64),
+    )
+    with pytest.raises(ValueError, match="no media"):
+        admission.build_sequence(spec, context)
 
 
 CHANNEL = RequiredChannel(after=(5, 6), opening=(7, 8), opens_at=1, end_ids=(9,))
