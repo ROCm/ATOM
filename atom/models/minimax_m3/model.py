@@ -440,6 +440,13 @@ class MiniMaxM3MoE(nn.Module):
             and isinstance(self.experts.quant_method, Mxfp4MoEMethod)
         )
 
+        # Router GEMM + biased top-k in one aiter launch (bitwise the same
+        # routing); FusedMoE says whether its routing and experts take it.
+        self._front_fusion = bool(
+            hasattr(self.experts, "supports_fused_router")
+            and self.experts.supports_fused_router(self.gate.weight)
+        )
+
         self.alt_stream = alt_stream
         self.prefix = prefix
         self._use_dual_stream = False
@@ -503,10 +510,7 @@ class MiniMaxM3MoE(nn.Module):
         with _moe_shared_expert_fold(
             self._shared_fold_weights, self._routed_scale()
         ) as fold:
-            router_logits = self.gate(hidden_states)
-            routed_output = self.experts(
-                hidden_states=hidden_states, router_logits=router_logits
-            )
+            routed_output = self._route_and_experts(hidden_states)
         if fold.consumed:
             return routed_output
         self._shared_fold_declined.add(hidden_states.shape[0])
@@ -523,6 +527,13 @@ class MiniMaxM3MoE(nn.Module):
             routed_output = routed_output * scale
         return routed_output
 
+    def _route_and_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """The routed experts' TP-partial output, before the routed scale."""
+        if self._front_fusion:
+            return self.experts.forward_fused_router(hidden_states, self.gate.weight)
+        router_logits = self.gate(hidden_states)
+        return self.experts(hidden_states=hidden_states, router_logits=router_logits)
+
     def _routed_plus_shared(
         self,
         hidden_states: torch.Tensor,
@@ -536,10 +547,7 @@ class MiniMaxM3MoE(nn.Module):
         with self._glue_epilogue(
             shared_output, self._routed_scale(), before=before_add
         ) as epilogue:
-            router_logits = self.gate(hidden_states)
-            routed_output = self.experts(
-                hidden_states=hidden_states, router_logits=router_logits
-            )
+            routed_output = self._route_and_experts(hidden_states)
         if epilogue.consumed:
             return routed_output
         if before_add is not None:
@@ -548,12 +556,7 @@ class MiniMaxM3MoE(nn.Module):
 
     def routed_expert_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Run the routed E128/top-4 branch and keep its TP-partial output."""
-        router_logits = self.gate(hidden_states)
-        routed_output = self.experts(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-        )
-        return self._scale_routed(routed_output)
+        return self._scale_routed(self._route_and_experts(hidden_states))
 
     def single_stream_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
@@ -562,10 +565,17 @@ class MiniMaxM3MoE(nn.Module):
             # Serial only: the shared expert reads the routed quant's output
             # here, so the two branches are not independent. The dual-stream
             # path below keeps the shared expert's own quant.
-            router_logits = self.gate(hidden_states)
-            routed_output, shared_x, shared_x_scale = (
-                self.experts.forward_with_mxfp8_copy(hidden_states, router_logits)
-            )
+            if self._front_fusion:
+                routed_output, shared_x, shared_x_scale = (
+                    self.experts.forward_fused_router_with_mxfp8_copy(
+                        hidden_states, self.gate.weight
+                    )
+                )
+            else:
+                router_logits = self.gate(hidden_states)
+                routed_output, shared_x, shared_x_scale = (
+                    self.experts.forward_with_mxfp8_copy(hidden_states, router_logits)
+                )
             routed_output = self._scale_routed(routed_output) + self.shared_experts(
                 shared_x, x_scale=shared_x_scale
             )
