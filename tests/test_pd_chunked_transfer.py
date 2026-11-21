@@ -496,6 +496,19 @@ def test_write_done_tells_the_listener_whether_a_failed_rank_wrote(
     assert bool(d._held_failures) is started_writes
 
 
+@pytest.mark.parametrize("success", [True, False])
+def test_only_a_failed_write_done_carries_started_writes(success):
+    # A failure without the keyword is non-chunked _execute_transfer's: held.
+    import msgpack
+
+    p, _, request, _, _ = producer()
+    sent = []
+    p._send_on_socket = lambda _addr, parts, repeat=1: sent.append(parts)
+    mc.MooncakeConnector._notify_transfer_result(p, request, success=success)
+    ((_, payload),) = sent
+    assert msgpack.loads(payload).get("started_writes") is (None if success else True)
+
+
 def test_source_release_requires_every_tp_rank_of_every_pp_stage():
     tp = [KVOutputAggregator(2) for _ in range(3)]
     pp = PPKVAggregator(3)

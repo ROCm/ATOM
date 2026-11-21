@@ -4348,23 +4348,25 @@ class MooncakeConnector(KVConnectorBase):
         echoed from the write request. The consumer dedups by distinct
         producer rank and validates the nonce, so duplicates are harmless
         (see _record_write_done). ``success=False`` unblocks the consumer
-        without treating the KV as ready; with ``started_writes=False`` this
-        rank wrote nothing the consumer must wait out.
+        without treating the KV as ready; only a failure carries
+        ``started_writes``, and with False this rank wrote nothing the consumer
+        must wait out.
         """
         path = make_zmq_path("tcp", host, port)
-        notification = msgpack.dumps(
-            {
-                "request_id": req_id,
-                "pp_rank": pp_rank,
-                "tp_rank": self.tp_rank,
-                "write_nonce": write_nonce,
-                "success": success,
-                "started_writes": started_writes,
-                "landed_slots": landed_slots,
-                "prefill_handoff": handoff,
-            }
+        notification = {
+            "request_id": req_id,
+            "pp_rank": pp_rank,
+            "tp_rank": self.tp_rank,
+            "write_nonce": write_nonce,
+            "success": success,
+            "landed_slots": landed_slots,
+            "prefill_handoff": handoff,
+        }
+        if not success:
+            notification["started_writes"] = started_writes
+        self._send_on_socket(
+            path, [MSG_WRITE_DONE, msgpack.dumps(notification)], repeat=3
         )
-        self._send_on_socket(path, [MSG_WRITE_DONE, notification], repeat=3)
         logger.debug(
             "[PRODUCER] write-done sent for req %s success=%s", req_id, success
         )
@@ -4394,13 +4396,15 @@ class MooncakeConnector(KVConnectorBase):
                     if msg_type == MSG_WRITE_DONE:
                         try:
                             data = msgpack.loads(parts[2])
+                            success = data.get("success", True)
                             self._record_write_done(
                                 data["request_id"],
                                 data.get("pp_rank", 0),
                                 data.get("tp_rank", 0),
                                 data.get("write_nonce", 0),
-                                success=data.get("success", True),
-                                started_writes=data["started_writes"],
+                                success=success,
+                                # Only a failure carries it; one without it is dropped.
+                                started_writes=not success and data["started_writes"],
                                 landed_slots=data.get("landed_slots"),
                                 handoff=data.get("prefill_handoff"),
                             )

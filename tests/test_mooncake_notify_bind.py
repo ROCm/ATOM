@@ -70,10 +70,7 @@ def test_published_port_is_held_and_reaches_the_listener():
         producer = ctx.socket(zmq.DEALER)
         producer.connect(f"tcp://127.0.0.1:{port}")
         producer.send_multipart(
-            [
-                mc.MSG_WRITE_DONE,
-                msgpack.dumps({"request_id": "req-0", "started_writes": True}),
-            ]
+            [mc.MSG_WRITE_DONE, msgpack.dumps({"request_id": "req-0"})]
         )
         thread.join(timeout=10)
     finally:
