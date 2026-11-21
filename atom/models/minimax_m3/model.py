@@ -45,7 +45,7 @@ from atom.model_ops.minimax_m3.sparse_attn import (
     SPARSE_BLOCK_SIZE,
 )
 from atom.model_ops.moe import FusedMoE
-from atom.model_ops.swiglu_oai import swiglu_oai_split
+from atom.model_ops.swiglu_oai import swiglu_oai_split, swiglu_oai_split_mxfp8
 from atom.model_ops.utils import atom_parameter
 from atom.models.minimax_m3.mono.dispatch import MonoDecode
 from atom.models.utils import (
@@ -157,6 +157,18 @@ def _linear_consumes_per_token_fp8(linear: nn.Module) -> bool:
     return (
         quant_type_value == QuantType.per_Token.value
         and getattr(linear, "params_dtype", None) == dtypes.fp8
+    )
+
+
+def _linear_consumes_mxfp8(linear: nn.Module | None) -> bool:
+    """Whether ``linear`` reads E4M3 activations with E8M0 group32 scales --
+    a native group32 A8 linear (MXFP8 or W4A8), which otherwise runs
+    ``quantize_fp8`` on its bf16 input -- and the op before it may write them."""
+    return (
+        linear is not None
+        and envs.ATOM_M3_FUSE_MXFP8_QUANT
+        and getattr(linear, "native_a8_group_rows", None) is not None
+        and not getattr(linear, "_k_padded", False)
     )
 
 
@@ -276,6 +288,16 @@ class MiniMaxM3MLP(nn.Module):
         self, x: torch.Tensor, x_scale: torch.Tensor | None = None
     ) -> torch.Tensor:
         gate_up = self.gate_up_proj(x, x_scale=x_scale)
+        # Read per call, not at __init__: quant_type and the native-A8 marking
+        # are settled after construction (online quant rewrites them).
+        if _linear_consumes_mxfp8(self.down_proj):
+            x, x_scale = swiglu_oai_split_mxfp8(
+                gate_up,
+                alpha=self.swiglu_alpha,
+                beta=self.swiglu_beta,
+                limit=self.swiglu_limit,
+            )
+            return self.down_proj(x, x_scale=x_scale)
         x = swiglu_oai_split(
             gate_up,
             alpha=self.swiglu_alpha,
