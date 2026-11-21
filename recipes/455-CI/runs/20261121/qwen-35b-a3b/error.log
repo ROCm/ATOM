@@ -1,0 +1,5 @@
+== c4 MLPerf endpoint bench (temperature 1.0), 2026-11-21 12:07 BJ: model runner dies at the first MTP verification sample
+  File "/app/aiter/aiter/ops/triton/utils/config_utils.py", line 51, in load_config_json
+    raise FileNotFoundError(
+FileNotFoundError: Required config file doesn't exist: /app/aiter/aiter/ops/triton/configs/gfx1250/triton/fusions/fused_mixed_sample/DEFAULT.json
+[atom 04:07:40] AsyncIOProcManager(ModelRunner): [ModelRunner0/1] proc died unexpectedly (exitcode=1), shutting down.
