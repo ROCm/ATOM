@@ -295,8 +295,7 @@ The router tokenizes requests with their model's HuggingFace tokenizer, or with
 HuggingFace `tokenizers`, and splits a long text between special tokens across
 a pool of its own threads (one per logical core up to 32;
 `FASTOKENS_BPE_THREADS` sets the number). Decoding, chat templates and vocabulary lookups stay with the
-HuggingFace tokenizer, except for the tokens only `tokenizer_config.json`
-declares (below).
+HuggingFace tokenizer.
 
 A model encodes with fastokens only if fastokens encodes a set of probe texts
 exactly as its HuggingFace tokenizer does, with special tokens and without. The
@@ -307,18 +306,10 @@ to register, with no retries. A `tokenizer.json` that fastokens cannot find or
 download fails no probe: the model keeps HuggingFace, with a warning, or under
 `--fastokens-strict` its registration fails and is retried.
 
-Tokens that only `tokenizer_config.json` declares are the exception, and the
-probe texts leave them out: `transformers`, and so the engine, encodes them as
-tokens, where HuggingFace `tokenizers` encodes them as text. `transformers`
-gives them the ids after the vocabulary's and the added tokens', in the order
-of the ids they declare, and fastokens the ids they declare, so a model whose
-tokens declare other ids fails the probe. So does a model with a normalizer and
-such a token that is not special and does not say whether it is normalized,
-which `transformers` takes as normalized and fastokens as not. HuggingFace
-`tokenizers` cannot decode these tokens either, so fastokens looks them up and
-decodes the ids that include them, and a model with them fails the probe
-unless fastokens also decodes the probe texts as HuggingFace does, keeping
-special tokens and skipping them. With gRPC workers the router sends
+fastokens loads `tokenizer.json` alone, as HuggingFace `tokenizers` does, so
+both encode the tokens only `tokenizer_config.json` declares (Qwen3.5's audio
+tokens, for one) as text, where `transformers`, and so the engine, encodes them
+as tokens. With gRPC workers the router sends
 the ids it encodes as the prompt, so the model runs on fastokens' ids, not only
 routes by them. `mesh_fastokens_tokenizers_total{outcome}` counts tokenizers as
 `loaded`, `fallback` or `refused`.
