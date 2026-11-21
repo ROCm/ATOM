@@ -1353,6 +1353,28 @@ def test_silent_producer_ranks_fail_the_receive_after_their_window():
     assert conn.done_recving == set()
 
 
+def test_a_silent_rank_holds_a_failure_no_failed_rank_wrote(monkeypatch):
+    """A write the silent rank posted may still land."""
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
+    conn = _make_connector(_landing=None)
+    conn._pending_recv_expected["r1"] = 2
+    conn._pending_recv.add("r1")
+    conn._pending_handoffs["r1"] = mc._PendingHandoff()  # chunked
+    assert not conn._record_write_done(
+        "r1", 0, 0, 0, success=False, started_writes=False
+    )
+    conn._record_write_ack(
+        {"request_id": "r1", "pp_rank": 1, "tp_rank": 0, "write_window_s": 60}
+    )
+    conn._pending_recv_acks["r1"][(1, 0)] = time.monotonic() - 1
+    conn._expire_pending_recvs()
+    assert set(conn._held_failures) == {"r1"} and conn.failed_recving == set()
+    assert "r1" in conn._pending_recv and not conn._pending_handoffs
+
+
 def test_a_rank_that_never_acknowledged_keeps_the_receive_open():
     """It may still get the request and write, however long that takes."""
     pytest.importorskip("atom.kv_transfer.disaggregation.mooncake.mooncake_connector")

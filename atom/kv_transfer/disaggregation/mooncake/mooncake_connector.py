@@ -1326,7 +1326,8 @@ class MooncakeConnector(KVConnectorBase):
         # dispatched) may write the request's pages after the scheduler reuses
         # them. A rank that acknowledged but never answers is bounded by its
         # write window (see _expire_pending_recvs). Each maps to whether a
-        # failed rank had started writing: only then is it held (_complete_recv).
+        # failed rank had started writing: only then, or if a rank went silent
+        # past its window, is the failure held (_complete_recv).
         self._pending_recv_failed: dict[ReqId, bool] = {}
         # Per-request nonce for write-done corruption detection.
         self._pending_recv_nonce: dict[ReqId, int] = {}
@@ -4473,13 +4474,14 @@ class MooncakeConnector(KVConnectorBase):
         any rank reported a failure: an earlier failure would let the
         scheduler reuse pages a rank still running then writes. Returns True
         when this was that final message. A failure is held (``_complete_recv``)
-        only if a failed rank reported ``started_writes``.
+        only if a failed rank reported ``started_writes``, or a rank went silent
+        (below).
 
         A request with MLA landing slots settles in ``LandingReceiver``
         instead: it completes only once its landed slots are scattered too,
         and fails only once every stage ended (``_complete_recv``). Either
         way, ranks that acknowledged and then stay silent past their write
-        window fail it (``_expire_pending_recvs``).
+        window fail it, and that failure is held (``_expire_pending_recvs``).
         """
         landing = self._landing
         if landing is not None:
@@ -4673,7 +4675,8 @@ class MooncakeConnector(KVConnectorBase):
                 reported,
             )
             try:
-                self._complete_recv(req_id, failed=True)
+                # A write the silent rank posted may still land.
+                self._complete_recv(req_id, failed=True, failed_after_write=True)
             except Exception:
                 # The other expired requests still have to be reported.
                 logger.exception("[CONSUMER] reporting expired req %s failed", req_id)
