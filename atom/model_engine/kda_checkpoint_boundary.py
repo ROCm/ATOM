@@ -20,6 +20,7 @@ def pack_bytes(chunks, size):
             raise ValueError("checkpoint views exceed the image")
         packed[offset:end] = chunk
         offset = end
+        del chunk
     if offset != size:
         raise ValueError("checkpoint views do not fill the image")
     return bytes(packed)
