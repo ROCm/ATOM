@@ -185,7 +185,37 @@ class Qwen4ExpHyperConnection(nn.Module):
             quant_dtype = None
         return self._mix_fused(hyper_input, pending, quant_dtype)
 
-    def _mix_fused(self, hyper_input, pending, quant_dtype):
+    def mix_fused_rows(
+        self,
+        hyper_input: torch.Tensor,
+        pending: tuple[torch.Tensor, torch.Tensor] | None,
+        rows: slice,
+        *,
+        mixed_out: torch.Tensor,
+        h_out: torch.Tensor,
+        raw_out: torch.Tensor | None,
+    ) -> None:
+        """`mix_fused` of `hyper_input[rows]` only (every op is per row), with
+        `pending = (block_output[rows], inject_logits)`. Writes the mixed rows to
+        `mixed_out` and that range of the streams and of the logits to `h_out`
+        and `raw_out` (full-size); without `pending` the streams are
+        `hyper_input` and `h_out` is not written."""
+        if pending is not None:
+            pending = (pending[0], pending[1][rows])
+            h_out = h_out[rows]
+        else:
+            h_out = None
+        mixed, _, (h, raw) = self._mix_fused(
+            hyper_input[rows], pending, None, h_out=h_out, mixed_out=mixed_out
+        )
+        if mixed.data_ptr() != mixed_out.data_ptr():
+            mixed_out.copy_(mixed)
+        if h_out is not None and h.data_ptr() != h_out.data_ptr():
+            h_out.copy_(h)
+        if raw_out is not None:
+            raw_out[rows].copy_(raw)
+
+    def _mix_fused(self, hyper_input, pending, quant_dtype, h_out=None, mixed_out=None):
         block_out, raw_prev = pending if pending is not None else (None, None)
         has_inject = self.block_inject_weight is not None
         w_up = self.input_mix_weight_up.weight
@@ -204,7 +234,13 @@ class Qwen4ExpHyperConnection(nn.Module):
             )
             return mixed, None, (h, raw)
         h, normed = hc_combine_norm(
-            hyper_input, self.hc_norm.weight, eps, self.hc_count, block_out, raw_prev
+            hyper_input,
+            self.hc_norm.weight,
+            eps,
+            self.hc_count,
+            block_out,
+            raw_prev,
+            h_out=h_out,
         )
         rank = self.fused_rank
         d = tgemm.mm(normed, self.fused_w_cat, otype=normed.dtype)
@@ -212,7 +248,7 @@ class Qwen4ExpHyperConnection(nn.Module):
         up = tgemm.mm(gate, w_up, otype=gate.dtype)
         quantized = None
         if quant_dtype is None:
-            mixed = hc_gated_mean(normed, up, self.hc_count)
+            mixed = hc_gated_mean(normed, up, self.hc_count, out=mixed_out)
         else:
             mixed, mixed_q, mixed_scale = hc_gated_mean_quant(
                 normed, up, self.hc_count, quant_dtype

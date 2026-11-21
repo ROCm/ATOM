@@ -16,6 +16,10 @@ from collections.abc import Iterable
 from typing import Any
 
 import torch
+from aiter.dist.parallel_state import (
+    get_tensor_model_parallel_world_size,
+    get_tp_group,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig as SGLangQuantizationConfig,
@@ -28,6 +32,7 @@ from sglang.srt.runtime_context import get_parallel
 from torch import nn
 
 from atom.model_loader.loader import WeightsMapper, load_model_in_plugin_mode
+from atom.model_ops.qwen4_exp.sp_sdma import get_sdma_collectives
 from atom.plugin.sglang.attention_backend.attention_gdn import SGLangGDNForwardContext
 from atom.plugin.sglang.qwen4_exp_bridge import (
     qwen4_exp_metadata_from_forward_batch,
@@ -37,6 +42,7 @@ from atom.plugin.sglang.runtime import (
     SGLangPluginRuntime,
     plugin_runtime_scope,
 )
+from atom.utils import envs
 
 try:
     from atom.models.qwen4_exp import (
@@ -257,6 +263,19 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
         self.quant_config = quant_config or atom_lm.atom_config.quant_config
         self.model = atom_lm.model
         self.lm_head = atom_lm.lm_head
+        # Opt-in: the sequence-parallel reduce-scatter / all-gathers over SDMA.
+        # Set up here, before SGLang sizes the KV cache (collective over TP).
+        if (
+            envs.ATOM_QWEN4_EXP_SP_SDMA
+            and get_tensor_model_parallel_world_size() > 1
+            and self.model.sp_start_layer < self.model.end_layer
+        ):
+            self.model.sp_sdma = get_sdma_collectives(
+                self.atom_config.max_num_batched_tokens,
+                self.model.config.hidden_size,
+                self.atom_config.torch_dtype,
+                get_tp_group().cpu_group,
+            )
         self.make_empty_intermediate_tensors = atom_lm.make_empty_intermediate_tensors
         # Register Native vision so ``visual.*`` parameters exist after the
         # plugin mapper rewrites ``model.visual.`` → ``visual.``.
