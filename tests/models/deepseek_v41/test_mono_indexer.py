@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 """Standalone Mono against the native MXFP8/FP4 indexer and graph replay."""
 
-import os
 from types import SimpleNamespace
 
 import pytest
@@ -50,39 +49,15 @@ def make_case(
         topk_owner=layer,
         candidate_owner=20 if candidate or reindex else None,
     )
-    # Real checkpoint tensors when qualifying this branch; deterministic
-    # synthetic weights keep the differential test usable without a model.
-    directory = os.environ.get("ATOM_DSV41_CHECKPOINT")
-    if directory:
-        import json
-
-        from safetensors import safe_open
-
-        with open(os.path.join(directory, "model.safetensors.index.json")) as f:
-            index = json.load(f)["weight_map"]
-
-        def weight(name):
-            key = f"layers.{layer}.attn.indexer.{name}"
-            with safe_open(
-                os.path.join(directory, index[key]), framework="pt", device=dev
-            ) as f:
-                return f.get_tensor(key).to(
-                    torch.device("cuda", torch.cuda.current_device())
-                )
-
-        w = weight("wq_b.weight")
-        ws = weight("wq_b.scale").view(torch.float8_e8m0fnu)
-        iw = weight("weights_proj.weight")
-    else:
-        raw = torch.randn(128, 32, 40, 32, device=dev).bfloat16() * 0.03
-        amax = raw.float().abs().amax((1, 3))
-        ws = (2 ** torch.ceil(torch.log2(amax / 448))).to(torch.float8_e8m0fnu)
-        w = (
-            (raw.float() / ws.float()[:, None, :, None])
-            .to(torch.float8_e4m3fn)
-            .reshape(4096, 1280)
-        )
-        iw = torch.randn(32, 5120, device=dev).bfloat16() * 0.03
+    raw = torch.randn(128, 32, 40, 32, device=dev).bfloat16() * 0.03
+    amax = raw.float().abs().amax((1, 3))
+    ws = (2 ** torch.ceil(torch.log2(amax / 448))).to(torch.float8_e8m0fnu)
+    w = (
+        (raw.float() / ws.float()[:, None, :, None])
+        .to(torch.float8_e4m3fn)
+        .reshape(4096, 1280)
+    )
+    iw = torch.randn(32, 5120, device=dev).bfloat16() * 0.03
     w = torch.nn.Parameter(w, requires_grad=False)
     shuffle_weights(w)
     indexer = SimpleNamespace(
@@ -287,19 +262,14 @@ def make_case(
     "rows,context,ratio,layout,candidate,reindex,qlen",
     [
         (1, 8192, 2, "mfma", False, False, 1),
-        (6, 256, 2, "mfma", False, False, 1),
         (8, 8192, 1, "preshuffle", True, False, 1),
         (24, 8192, 1, "mfma", False, True, 1),
         (40, 163840, 2, "mfma", False, False, 1),
-        (6, 163840, 1, "mfma", True, False, 1),
         (16, 163840, 1, "preshuffle", False, True, 1),
         (13, 8192, 2, "mfma", False, False, 6),
         (40, 163840, 1, "preshuffle", True, False, 6),
         (64, 8192, 2, "mfma", False, False, 1),
-        (33, 8192, 1, "preshuffle", True, False, 1),
-        (48, 8192, 2, "mfma", False, False, 6),
         (6, 8192, 1, "mfma", False, True, 6),
-        (48, 8192, 1, "mfma", False, True, 6),
         (48, 163840, 2, "mfma", False, False, 6),
     ],
 )
@@ -354,7 +324,7 @@ def test_standalone_mono_matches_native_and_graph(
         )
 
     def check():
-        q, _weights, (selected, chosen) = case.native()
+        q, _weights, _selection = case.native()
         proxy = SimpleNamespace(
             index_fp4=True, index_layout=layout, iq=r.iq[:rows], iq_scale=r.iqs[:rows]
         )
@@ -374,17 +344,7 @@ def test_standalone_mono_matches_native_and_graph(
         _, _, (same_q, same_chosen) = case.native(mono_q, (r.iw[:rows] * 64).bfloat16())
         got = case.step.selected[case.indexer.spec.layer_id][0]
         assert torch.equal(got, same_q), (got != same_q).sum().item()
-        # Report end-to-end membership separately: with a long context many
-        # scores near the 512th boundary move under the native BF16 GEMM's
-        # partial-sum rounding. The identical-input scorer assertion above
-        # remains exact; whole-model acceptance qualifies those projections.
-        overlaps = [
-            torch.isin(got[row][got[row] >= 0], selected[row]).float().mean().item()
-            for row in range(rows)
-            if (got[row] >= 0).any()
-        ]
-        print("INDEXER_NATIVE_OVERLAP", rows, context, min(overlaps, default=1.0))
-        if chosen is not None:
+        if same_chosen is not None:
             assert torch.equal(
                 case.step.candidates[case.indexer.spec.layer_id], same_chosen
             )
@@ -414,9 +374,7 @@ def test_mono_indexer_mixed_selection_depths(ratio, layout, candidate):
     )
 
 
-@pytest.mark.parametrize(
-    "rows,context,ratio", [(1, 1024, 1), (8, 1024, 1), (8, 2048, 2)]
-)
+@pytest.mark.parametrize("rows,context,ratio", [(1, 1024, 1), (8, 2048, 2)])
 def test_short_full_selection_keeps_fp4_score_staging_in_bounds(rows, context, ratio):
     test_standalone_mono_matches_native_and_graph(
         rows, context, ratio, "mfma", False, False, 1

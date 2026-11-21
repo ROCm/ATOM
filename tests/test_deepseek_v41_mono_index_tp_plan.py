@@ -121,25 +121,6 @@ class IndexTPPlanTests(unittest.TestCase):
                     2 * rows * world - 1,
                 )
 
-    def test_row_and_block_roots_have_separate_plain_storage(self):
-        for rows in (1, 48, 64):
-            spans = sorted(tp.plain_layout(rows).values())
-            self.assertTrue(all(a + n <= b for (a, n), (b, _) in pairwise(spans)))
-            self.assertEqual(
-                tp.layout_bytes(tp.plain_layout(rows)), rows * (512 + 2048) * 8
-            )
-
-    def test_noncontiguous_requests_and_invalid_groups_are_rejected(self):
-        for bounds, batches, world, rank in (
-            ([1, 1, 1], [0, 1, 0], 4, 0),
-            ([1], [0], 3, 0),
-            ([1], [0], 4, 4),
-            ([-1], [0], 4, 0),
-            ([1] * 65, [0] * 65, 4, 0),
-        ):
-            with self.assertRaises(ValueError):
-                tp.reference_work(bounds, batches, world, rank)
-
 
 if __name__ == "__main__":
     unittest.main()

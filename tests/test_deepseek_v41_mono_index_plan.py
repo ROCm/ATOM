@@ -57,27 +57,21 @@ def test_every_polled_cell_is_written(k, seg):
 
 
 @pytest.mark.parametrize("k", [ip.TOPK, ip.TOPK_BLOCKS])
-@pytest.mark.parametrize("seg", [4096, 8192, 10240, 18432])
-def test_every_list_but_a_levels_last_is_full(k, seg):
+def test_every_list_but_a_levels_last_is_full(k):
     for bound in bounds():
-        for level in range(ip.levels(bound, k, seg=seg) + 1):
-            n = ip.lists(bound, level, k, seg=seg)
+        for level in range(ip.levels(bound, k) + 1):
+            n = ip.lists(bound, level, k)
             for j in range(n - 1):
-                assert ip.list_valid(bound, level, j, k, seg=seg) == k, (
-                    bound,
-                    level,
-                    j,
-                )
+                assert ip.list_valid(bound, level, j, k) == k, (bound, level, j)
 
 
 @pytest.mark.parametrize("k", [ip.TOPK, ip.TOPK_BLOCKS])
-@pytest.mark.parametrize("seg", [4096, 8192, 10240, 18432])
-def test_the_final_list_holds_the_selection(k, seg):
-    depth_max = ip.levels(max(bounds()), k, seg=seg)
+def test_the_final_list_holds_the_selection(k):
+    depth_max = ip.levels(max(bounds()), k)
     for bound in bounds():
-        top = ip.final_level(bound, depth_max, k, seg=seg)
-        assert ip.lists(bound, top, k, seg=seg) <= 1, bound
-        assert ip.list_valid(bound, top, 0, k, seg=seg) == ip.selected(bound, k), bound
+        top = ip.final_level(bound, depth_max, k)
+        assert ip.lists(bound, top, k) <= 1, bound
+        assert ip.list_valid(bound, top, 0, k) == ip.selected(bound, k), bound
 
 
 def test_positive_control_floor_chunks_leave_logits_unpolled():

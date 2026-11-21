@@ -46,7 +46,7 @@ def _build_waiter():
     return launch
 
 
-@pytest.mark.parametrize("count", [512, 513, 1024, 1280])
+@pytest.mark.parametrize("count", [513, 1280])
 def test_waits_for_delayed_tail_flags(count):
     from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 

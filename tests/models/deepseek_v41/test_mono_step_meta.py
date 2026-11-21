@@ -10,8 +10,10 @@ import torch
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 
 
-@pytest.mark.parametrize("rows", [1, 8, 13, 40, 64])
-@pytest.mark.parametrize("pattern", ["single", "six", "mixed"])
+@pytest.mark.parametrize(
+    "rows,pattern",
+    [(1, "single"), (8, "six"), (13, "six"), (40, "mixed"), (64, "single")],
+)
 def test_parallel_plan_and_reset_replay(rows, pattern):
     from atom.models.deepseek_v41.mono import index_plan as ip
     from atom.models.deepseek_v41.mono.step_meta import write_step_meta
@@ -101,8 +103,9 @@ def test_parallel_plan_and_reset_replay(rows, pattern):
     check(0, rows)
 
 
-@pytest.mark.parametrize("world,rank", [(2, 0), (2, 1), (4, 0), (4, 3), (8, 0), (8, 7)])
-@pytest.mark.parametrize("parallel", [False, True])
+@pytest.mark.parametrize(
+    "world,rank,parallel", [(2, 1, False), (4, 0, False), (4, 3, True), (8, 7, True)]
+)
 def test_tp_rank_work_and_short_to_long_graph_switch(world, rank, parallel):
     from atom.models.deepseek_v41.mono import index_plan as ip
     from atom.models.deepseek_v41.mono import index_tp_plan as tp

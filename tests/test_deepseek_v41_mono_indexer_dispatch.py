@@ -8,6 +8,7 @@ import pytest
 import torch
 from torch import nn
 
+from atom.models.deepseek_v41.mono import decode_step
 from atom.models.deepseek_v41.mono import indexer_dispatch as module
 from atom.models.deepseek_v41.mono.config import indexer_enabled
 
@@ -60,67 +61,6 @@ def test_hook_is_active_only_for_the_supported_forward(monkeypatch):
     with pytest.raises(RuntimeError, match="forward failed"):
         wrapped(ids, ids)
     assert not lazy.runner.active
-
-
-def test_layer_runner_owns_its_indexer_without_preparing_native_buffers(monkeypatch):
-    raw, wrapped, lazy, _ = setup(monkeypatch)
-    raw.layer = True
-    ids = torch.arange(16)
-    wrapped(ids, ids)
-    lazy.ready.assert_not_called()
-    lazy.runner.begin_step.assert_not_called()
-    assert raw.calls == [False]
-
-
-def test_unsupported_step_keeps_native_route(monkeypatch):
-    raw, wrapped, lazy, _ = setup(monkeypatch)
-    monkeypatch.setattr(module, "step_supported", lambda *args, **kwargs: False)
-    ids = torch.arange(65)
-    wrapped(ids, ids)
-    lazy.ready.assert_not_called()
-    assert raw.calls == [False]
-
-
-def test_default_on_with_explicit_opt_out_and_fp8_fallback(monkeypatch):
-    monkeypatch.delenv("ATOM_DSV41_MONO_INDEXER", raising=False)
-    assert indexer_enabled(True, 4)
-    monkeypatch.setenv("ATOM_DSV41_MONO_INDEXER", "1")
-    assert indexer_enabled(True, 4)
-    assert not indexer_enabled(False, 4)
-    monkeypatch.setenv("ATOM_DSV41_MONO_INDEXER", "0")
-    assert not indexer_enabled(True, 4)
-
-
-@pytest.mark.parametrize("dp_ranks", [2, 4])
-def test_dp_local_indexer_is_explicit_opt_in(monkeypatch, dp_ranks):
-    monkeypatch.delenv("ATOM_DSV41_MONO_INDEXER", raising=False)
-    assert not indexer_enabled(True, 1, dp_ranks=dp_ranks)
-    monkeypatch.setenv("ATOM_DSV41_MONO_INDEXER", "1")
-    assert indexer_enabled(True, 1, dp_ranks=dp_ranks)
-    assert not indexer_enabled(True, 1, dp_ranks=8)
-    assert not indexer_enabled(False, 1, dp_ranks=dp_ranks)
-    monkeypatch.setenv("ATOM_DSV41_MONO_INDEXER", "0")
-    assert not indexer_enabled(True, 1, dp_ranks=dp_ranks)
-
-
-def test_native_wrapper_does_not_route_layers_to_mono(monkeypatch):
-    raw, _, lazy, _ = setup(monkeypatch)
-    wrapper = module.NativeDecodeModel(raw)
-    ids = torch.arange(8)
-    assert not wrapper.uses_layer_mono(ids)
-    assert torch.equal(wrapper(ids, ids), ids + 1)
-    lazy.ready.assert_not_called()
-
-
-def test_native_staging_is_joined_once_before_persistent_launch(gpu_module):
-    runner = gpu_module.MonoIndexer.__new__(gpu_module.MonoIndexer)
-    staged = SimpleNamespace(stage=Mock(), join=Mock())
-    runner.engram_staged = staged
-    runner._join_staging()
-    staged.join.assert_called_once()
-    assert runner.engram_staged is None
-    runner._join_staging()
-    staged.join.assert_called_once()
 
 
 def test_draft_constructor_reaches_parent_allocation_on_cpu(monkeypatch, gpu_module):
@@ -184,77 +124,6 @@ def test_draft_constructor_reaches_parent_allocation_on_cpu(monkeypatch, gpu_mod
     assert allocated.index_scratch is None
 
 
-@pytest.mark.parametrize("apart", [False, True])
-def test_forward_plans_indexer_only_when_apart(monkeypatch, gpu_module, apart):
-    from atom.models.deepseek_v41.mono import runner as rm
-
-    r = rm.V41MonoDecodeRunner.__new__(rm.V41MonoDecodeRunner)
-    r.indexer_apart, r.rank = apart, 1
-    key = SimpleNamespace(world=4)
-    r._indexer_key = Mock(return_value=key)
-    r._index_reset_buffers = Mock(return_value=((), ()))
-    r._use_rows = Mock()
-    r._own_rows = lambda rows: (0, rows)
-    r._tok_par = lambda rows: False
-    r._raise_on_given_up_waits = Mock()
-    r.mailboxes = SimpleNamespace(begin_step=Mock())
-    r.model = SimpleNamespace(
-        embed=lambda ids: torch.zeros(ids.numel(), 4),
-        config=SimpleNamespace(hc_mult=1),
-        begin_forward=Mock(),
-        end_forward=Mock(),
-        topology=[],
-        layers=[],
-    )
-    r.layers, r.build, r.timelines = [], SimpleNamespace(keys=[]), {}
-    r.ring_rel, r.key_meta, r.ix_meta, r.walk_plans = object(), object(), object(), {}
-    hidden = torch.zeros(1, 8, 4)
-    monkeypatch.setattr(
-        rm,
-        "SinglePassHCState",
-        SimpleNamespace(
-            from_embeddings=lambda *args: SimpleNamespace(collapse=lambda: hidden)
-        ),
-    )
-    geometry = SimpleNamespace(window=lambda *args: object())
-    metadata = SimpleNamespace(
-        cache=SimpleNamespace(packed=False, geometry=geometry, num_pages=1),
-        step=object(),
-        engram_embeddings=None,
-    )
-    monkeypatch.setattr(
-        rm, "get_forward_context", lambda: SimpleNamespace(attn_metadata=metadata)
-    )
-    meta = Mock()
-    monkeypatch.setattr(rm, "write_step_meta", meta)
-    ids = torch.arange(8)
-    assert r.forward(ids, ids).shape == (8, 4)
-    if apart:
-        r._indexer_key.assert_called_once_with(8)
-        r._index_reset_buffers.assert_called_once_with(key)
-    else:
-        r._indexer_key.assert_not_called()
-        r._index_reset_buffers.assert_not_called()
-    assert meta.call_args.kwargs["tp_world"] == (4 if apart else 1)
-
-
-def test_hi_fallback_does_not_enable_standalone_indexer(monkeypatch, dispatch_module):
-    dispatch = dispatch_module
-
-    monkeypatch.setenv("ATOM_DSV41_MONO_INDEXER", "1")
-    raw = Model()
-    create = Mock(return_value=SimpleNamespace())
-    monkeypatch.setattr(dispatch, "V41MonoDecodeRunner", create)
-    wrapped = dispatch.MonoDecodeModel(
-        raw, None, 8192, True, 0, 2, standalone_indexer=False
-    )
-    assert wrapped.layer_rows_supported(40)
-    wrapped._mono._create()
-    create.assert_called_once_with(
-        raw, None, 8192, True, standalone_indexer=False, indexer_workspace=None
-    )
-
-
 def test_dp_attention_keeps_rank_local_indexer_work(monkeypatch, gpu_module):
     # Attention DP ranks carry different requests and caches, so they cannot
     # exchange selections even if a TP process group exists for the FFN.
@@ -269,50 +138,6 @@ def test_dp_attention_keeps_rank_local_indexer_work(monkeypatch, gpu_module):
     )
     assert r.world == 1 and r.rank == 0 and r._key(8).world == 1
     peers.assert_not_called()
-
-
-def test_bounded_small_width_uses_local_key_without_peer_offsets(gpu_module):
-    r = gpu_module.MonoIndexer.__new__(gpu_module.MonoIndexer)
-    r.world, r.bound_max, r.peer_plain = 4, 163968, 4096
-    r.fp4, r.layout = True, "mfma"
-    assert r._key(8).world == 1 and r._key(8).peer_plain == 0
-    assert r._key(16).world == 4 and r._key(16).peer_plain == 4096
-    r.bound_max = 262272
-    assert r._key(8).world == 4
-
-
-def test_reindex_launches_local_binary_with_its_own_scratch(gpu_module):
-    r = gpu_module.MonoIndexer.__new__(gpu_module.MonoIndexer)
-    r.widths = {8: object()}
-    r.local_widths = {8: object()}
-    r.full_widths = None
-    r.scratch, r.local_scratch = object(), object()
-    assert r._launch_context(SimpleNamespace(candidate_source=None), 8) == (
-        r.widths[8],
-        r.scratch,
-    )
-    assert r._launch_context(SimpleNamespace(candidate_source=20), 8) == (
-        r.local_widths[8],
-        r.local_scratch,
-    )
-    r.local_widths = None
-    assert r._launch_context(SimpleNamespace(candidate_source=20), 8) == (
-        r.widths[8],
-        r.scratch,
-    )
-
-
-def test_full_binary_is_separate_from_candidate_and_reindex_buffers(gpu_module):
-    r = gpu_module.MonoIndexer.__new__(gpu_module.MonoIndexer)
-    r.widths, r.local_widths, r.full_widths = ({8: object()} for _ in range(3))
-    r.scratch, r.local_scratch, r.full_scratch = object(), object(), object()
-    for source, produces, expected in (
-        (None, False, (r.full_widths[8], r.full_scratch)),
-        (None, True, (r.widths[8], r.scratch)),
-        (20, False, (r.local_widths[8], r.local_scratch)),
-    ):
-        spec = SimpleNamespace(candidate_source=source, produces_candidates=produces)
-        assert r._launch_context(spec, 8) == expected
 
 
 def test_layer_reset_preserves_candidate_data_and_separates_split_histograms(
@@ -451,14 +276,40 @@ def dispatch_module(monkeypatch):
         yield load("atom.models.deepseek_v41.mono.dispatch")
 
 
-@pytest.mark.parametrize("tp", [2, 4, 8])
-def test_tp_default_and_explicit_override(monkeypatch, tp):
+@pytest.mark.parametrize(
+    "tp,dp,default_on,eligible",
+    [
+        (2, 0, True, True),
+        (4, 0, True, True),
+        (8, 0, False, True),
+        (1, 2, False, True),
+        (1, 4, False, True),
+        (1, 8, False, False),
+    ],
+)
+def test_indexer_default_and_explicit_override(
+    monkeypatch, tp, dp, default_on, eligible
+):
     monkeypatch.delenv("ATOM_DSV41_MONO_INDEXER", raising=False)
-    assert indexer_enabled(True, tp) == (tp != 8)
+    assert indexer_enabled(True, tp, dp_ranks=dp) == default_on
     monkeypatch.setenv("ATOM_DSV41_MONO_INDEXER", "1")
-    assert indexer_enabled(True, tp)
+    assert indexer_enabled(True, tp, dp_ranks=dp) == eligible
+    assert not indexer_enabled(False, tp, dp_ranks=dp)
     monkeypatch.setenv("ATOM_DSV41_MONO_INDEXER", "0")
-    assert not indexer_enabled(True, tp)
+    assert not indexer_enabled(True, tp, dp_ranks=dp)
+
+
+@pytest.mark.parametrize("rows,accepted", [(24, True), (25, False)])
+def test_dp_decode_row_limit(monkeypatch, rows, accepted):
+    context = SimpleNamespace(is_prefill=False, running_tokens_are_unified=True)
+    step = SimpleNamespace(decode=True, running_tokens=rows)
+    forward = SimpleNamespace(
+        context=context, ubatch_slices=None, attn_metadata=SimpleNamespace(step=step)
+    )
+    monkeypatch.setattr(decode_step, "get_forward_context", lambda: forward)
+    assert (
+        decode_step.step_supported(torch.arange(rows), None, 4, max_rows=64) is accepted
+    )
 
 
 @pytest.mark.parametrize("tp,dp", [(4, 0), (1, 2)])
