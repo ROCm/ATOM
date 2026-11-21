@@ -101,7 +101,7 @@ def test_pp_init_applies_custom_all_reduce_policy_before_dist_init(
     monkeypatch.setattr(
         pp_comm,
         "init_distributed_environment",
-        lambda **_kwargs: events.append(("dist", None)),
+        lambda **kwargs: events.append(("dist", kwargs["local_rank"])),
     )
     monkeypatch.setattr(
         pp_comm,
@@ -115,12 +115,13 @@ def test_pp_init_applies_custom_all_reduce_policy_before_dist_init(
         global_rank=0,
         world_size=2,
         distributed_init_method="tcp://127.0.0.1:12345",
+        local_rank=3,
         disable_custom_all_reduce=disabled,
     )
 
     assert events == [
         ("custom_ar", expected_enabled),
-        ("dist", None),
+        ("dist", 3),
         ("model_parallel", None),
     ]
 

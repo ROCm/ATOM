@@ -4,6 +4,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 ATOM_CONFIG = REPO_ROOT / "atom" / "config.py"
 ATOM_SETUP = REPO_ROOT / "atom" / "model_engine" / "model_setup.py"
 ATOM_PP_COMM = REPO_ROOT / "atom" / "distributed" / "pp_comm.py"
+ATOM_RLHF_RUNNER = REPO_ROOT / "atom" / "rollout" / "model_runner_ext.py"
 ATOMRL_SERVER = (
     REPO_ROOT / "atomrl" / "atomrl" / "engine" / "inference" / "atom_ray_server.py"
 )
@@ -51,6 +52,29 @@ def test_atom_exposes_custom_all_reduce_as_a_configured_public_option():
     assert pp_text.index("set_custom_all_reduce(") < pp_text.index(
         "init_distributed_environment("
     )
+
+
+def test_atom_owned_init_uses_the_physical_tp_width():
+    setup_text = ATOM_SETUP.read_text(encoding="utf-8")
+
+    assert "tensor_model_parallel_size=config.tp_world_size" in setup_text
+
+
+def test_atom_owned_init_preserves_the_local_device_rank():
+    setup_text = ATOM_SETUP.read_text(encoding="utf-8")
+    pp_text = ATOM_PP_COMM.read_text(encoding="utf-8")
+
+    assert "local_rank=local_device_rank" in setup_text
+    assert "local_rank: int" in pp_text
+    assert "local_rank=local_rank" in pp_text
+
+
+def test_rlhf_uses_atom_owned_distributed_initialization():
+    runner_text = ATOM_RLHF_RUNNER.read_text(encoding="utf-8")
+
+    assert "from aiter import init_dist_env" not in runner_text
+    assert "from atom.distributed.pp_comm import init_pp_aware_dist_env" in runner_text
+    assert "disable_custom_all_reduce=config.disable_custom_all_reduce" in runner_text
 
 
 def test_atomrl_passes_the_public_option_instead_of_a_runner_monkey_patch():

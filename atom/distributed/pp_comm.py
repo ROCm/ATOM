@@ -61,6 +61,7 @@ def init_pp_aware_dist_env(
     world_size: int,
     distributed_init_method: str,
     backend: str = "nccl",
+    local_rank: int = -1,
     data_parallel_size: int = 1,
     prefill_context_model_parallel_size: int = 1,
     decode_context_parallel_size: int = 1,
@@ -73,6 +74,7 @@ def init_pp_aware_dist_env(
         rank=global_rank,
         distributed_init_method=distributed_init_method,
         backend=backend,
+        local_rank=local_rank,
         data_parallel_size=1,
     )
     ensure_model_parallel_initialized(

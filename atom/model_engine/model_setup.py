@@ -100,12 +100,13 @@ def init_model_env(config: Config, rank: int) -> torch.device:
     # Own the initialization sequence so AITER cannot reset the configured
     # custom-all-reduce policy inside init_dist_env before creating groups.
     init_pp_aware_dist_env(
-        tensor_model_parallel_size=config.tensor_parallel_size,
+        tensor_model_parallel_size=config.tp_world_size,
         pipeline_model_parallel_size=pp_size,
         global_rank=global_rank,
         world_size=world_size,
         distributed_init_method=distributed_init_method,
         backend="nccl",
+        local_rank=local_device_rank,
         data_parallel_size=dp_size,
         prefill_context_model_parallel_size=config.pcp_group_size,
         decode_context_parallel_size=getattr(config, "decode_context_parallel_size", 1),
