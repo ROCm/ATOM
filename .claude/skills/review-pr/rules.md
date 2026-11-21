@@ -69,14 +69,14 @@ Fix changes address calc, bounds check, or data layout: scan same file for varia
 Real example (aiter#3841): strided q_nope fix on decode kernel; `_prefill_opt` in same file had same bug.
 Real example (ATOM#1091, `atom/model_ops/moe.py`, fixed `5663a664`): `expert_data` narrowed to actual shard size with remainder zeroed — a trailing partial rank (e.g. `tp=4, D=10`) no longer hits a `copy_()` shape mismatch; the same PR also removed a redundant `all_reduce` in `Mxfp4MoEMethod.apply` ("other `apply()` methods don't reduce internally... reduction now happens once") — a second, distinct defect (duplicate collective → silently wrong numeric result), single occurrence so far, worth checking for alongside the shard-remainder bug.
 Real example (ATOM#2607, valarLip, `COMMENTED`): "Incomplete fix (same allocation pattern remains): `atom/models/glm5_next.py:748` — `Glm5NextIndexer.forward` (non-kpool branch) still calls `sparse_attn_indexer_impl` without `indexer_logits_ws`... `atom/plugin/vllm/attention/layer_sparse_mla.py:466` and the SGLang plugin... still allocate a `[num_decode_tokens, max_model_len]` fp32 plane per layer — the same unbounded pattern this PR chunks natively." Here the "sibling" is a cross-plugin-backend copy, not a same-file variant — confirms the backend-directory scan above.
-→ `⚠️ A1: same bug may exist in [variant] — check function family in this file`
+→ `⚠️ same bug may exist in [variant] — check function family in this file`
 
 **A2 — Change covers one model/GPU, shared path affects others** ⚠️
 PR labeled "[MI308]" or "DSv4-only" but touches a backbone file shared with Kimi/DSv3/gfx950:
 - Special: `deepseek_v2.py` is the base class for DSv2, DSv3, DSv3-0324, and Kimi — a "Kimi-only fix" here affects all four.
 - If benchmark only shows one GPU arch, ask about the other.
 Real example (ATOM#1498): "[MI308]" backbone change still affects gfx950 (MI355X).
-→ `⚠️ A2: [change] labeled [scope] but shared backbone [file] also affects [other models/archs]`
+→ `⚠️ [change] labeled [scope] but shared backbone [file] also affects [other models/archs]`
 
 **A3 — Activation condition broader than validated scope** ⚠️
 New dispatch enables kernel for model family X, tested only on subcase Y.
@@ -88,7 +88,7 @@ kernel is built specifically for gfx950's LDS budget and the runner always asks 
 FP4 MFMA — the activation condition was broader than the validated scope, and an unsupported
 arch reached compile/launch instead of being refused. Same shape as the vLLM citation above;
 flagged here as real but unmerged evidence, not a landed/live-on-`main` instance.
-→ `⚠️ A3: activation condition enables [X] but only [Y] was tested`
+→ `⚠️ activation condition enables [X] but only [Y] was tested`
 
 **A4 — Distributed handshake or coordination invariant changes on one side only** ⚠️/🔴
 A new per-connection config field (parallelism degree, block size, dtype, layout) is read on one side of a cross-process relationship — a P/D handshake, a KV-connector aggregator, a producer/consumer coordination predicate — without the matching update on the other side: the exchanged metadata, the merge/aggregation logic, or the assumption the other side's predicate relies on. The mismatch is never caught; a downstream index or control-flow decision silently goes wrong.
@@ -96,14 +96,14 @@ Trigger: diff adds/reads a new `self.<field>` on a connector/engine/producer sid
 Real example (ATOM#1994): yitingw1: "The handshake exchanges `tp_size`/`remote_pp_size` but never `hash_block_size`, so nothing catches a P/D pair with mismatched `decode_context_parallel_size`; since `num_computed_blocks` is computed on one side and used as a block-table index on the other, a mismatch here silently misaligns the slice." Author (Phi-C): "we can add this warning and fallback path here as you suggested." — caught in review.
 Real example (ATOM#2000, yhl-amd, `COMMENTED`): "`MultiConnector.get_finished()` drops `connector_completions`. DSV4 reports SLOT/sidecar save success or failure through `KVConnectorOutput.connector_completions`, but the `MultiConnector` merge only collects recv/send/load/save fields. A sidecar completion entering a sub-connector therefore produces an empty `MultiConnector` output." Same shape, at the aggregator layer instead of the wire layer — also caught in review.
 Real example (Revert ATOM#2315, `Revert "feat(kimi-k3): support P/D disaggregation (#2154)"`): "The producer now disables deferred output, but the DPA draft lockstep predicate still uses deferred output to exclude pipeline parallelism. Output-less producer prefill chunks skip draft collectives while idle DP peers enter them, hanging V4 DPA P/D requests." This one was **not** caught in review and needed a full revert — a reminder that this defect class is genuinely hard to catch from a single-file diff.
-→ `⚠️/🔴 A4: [field/invariant] changed on [side] but not matched on [other side] — a mismatch silently [misaligns index / hangs / drops output]`
+→ `⚠️/🔴 [field/invariant] changed on [side] but not matched on [other side] — a mismatch silently [misaligns index / hangs / drops output]`
 
 **A5 — Routing/dispatch accounting state not threaded through every request path** 🔴
 A value computed once at request dispatch — a load-tracking guard, a sticky affinity rank, any state a later scheduling decision reads — is applied on the non-streaming/happy-path branch but silently skipped or not re-derived on the streaming, error, or retry branch of the same dispatch function. The scheduler or router keeps making decisions off state that only half of its callers kept honest; nothing raises, the request completes, and load/affinity just drifts.
 Trigger: a diff in `atom/mesh/src/` changes how a per-request guard, counter, or rank is constructed/propagated, and the construction is conditional on `is_stream` (or a similar streaming/error branch) rather than applying uniformly to every branch that can reach the same dispatch path.
 Real example (ATOM#2351, `atom/mesh/src/routers/http_pd_router.rs`): the prefill/decode `WorkerLoadGuard`s were built only `(!context.is_stream).then(...)` — "Load tracking: streaming uses guards inside create_streaming_response" — but the streaming path's own guard construction had drifted, so a streaming request's worker load was never reserved/released the same way a non-streaming request's was; fixed by constructing both guards unconditionally and moving the drop point to the actual completion of each half (P drops its guard when its body is drained, not when D finishes).
 Real example (ATOM#1886): "Preserve mesh-selected DP ranks across streaming and non-streaming request paths to maintain sticky affinity" — the DP rank chosen at routing time was forwarded through non-streaming chat paths but not the streaming ones, so `EngineCore` could not honor the sticky affinity the router had already decided on for a streaming request; same PR also found "deferred-output placeholders" missing before scheduler token replacement — same shape, a different piece of per-request state.
-→ `🔴 A5: [guard/rank/state] computed for [non-streaming/happy path] but not applied on [streaming/error path] in the same dispatch function — scheduling decisions elsewhere will silently read stale [load/affinity] state`
+→ `🔴 [guard/rank/state] computed for [non-streaming/happy path] but not applied on [streaming/error path] in the same dispatch function — scheduling decisions elsewhere will silently read stale [load/affinity] state`
 
 ---
 
@@ -118,7 +118,7 @@ No ATOM-native instance found despite search — carried from aiter and labeled 
 same way H1/G2 mark their uncited rules; kept because the trigger (new dispatch gate on one
 of five named params) matches B2/B6's well-evidenced siblings in the same `dispatch-change`
 family closely enough to be a sound preventive check, not because an ATOM PR proves it.
-→ `🔴 B1: [param] silently ignored in [branch] — assert or forward`
+→ `🔴 [param] silently ignored in [branch] — assert or forward`
 
 **B2 — Decode/prefill phase classified by size proxy** ⚠️
 Code checks `max_q`, `q.shape[0] == 1`, or `seq_len <= 1` to decide decode vs. prefill:
@@ -126,20 +126,20 @@ short prefill / chunked prefill with small `max_q` → misclassified as decode �
 Use explicit phase flag from batch metadata (`is_prefill`, `attn_metadata.is_prefill`).
 Real example (ATOM#1372): vLLM plugin used `max_q` heuristic; zejunchen: "short prefill wrongly treated as DECODE."
 Real example (ATOM#2320, `atom/model_ops/fused_moe/mori_prepare_finalize.py`, fixed `7acd75755`): same shape outside attention — the MoRI all2all path picked its kernel/transport off `internode` inferred from `world_size <= 8` (a GPUs-per-node assumption, not a measurement); a 2-nodes×4-GPUs job reads as intra-node and selects kernels that assume P2P mappings across a boundary that has none. Fixed by routing `internode` through `all2all_manager.internode`, a real topology probe, instead of the size proxy — the removed comment says it plainly: "`internode` must come from a real topology probe. It used to be inferred from `world_size <= 8`." Confirms B2's defect shape (semantic state classified by a numeric threshold instead of an explicit flag/probe) is not attention-specific.
-→ `⚠️ B2: phase classified by [proxy] — chunked/short prefill may be misclassified`
+→ `⚠️ phase classified by [proxy] — chunked/short prefill may be misclassified`
 
 **B3 — cudagraph capture compatibility** 🔴
 New Python `if`/`else`/loop, dynamic shape computation (`tensor.item()`, `.tolist()`), or tensor allocation (`torch.empty`, `torch.zeros`) inside a cudagraph-captured region breaks capture — graph replays the original trace, any branching or dynamic allocation at replay time raises or silently corrupts.
 Static changes are safe: constant arithmetic, dtype cast on an existing tensor, forwarding kwargs without branching.
 Trigger: new control flow or allocation inside `model_runner.py` forward path, a model's `forward()` method, or any function decorated with cudagraph context. NOT a trigger: new fixed-shape kernel call with no branching.
 Real example (ATOM#1321): root cause of cudagraph fix unclear — reviewer asked for explanation.
-→ `🔴 B3: [new if/allocation] inside cudagraph-captured region — explain why capture remains valid`
+→ `🔴 [new if/allocation] inside cudagraph-captured region — explain why capture remains valid`
 
 **B4 — Triton `tl.constexpr` safety check disabled without invariant proof** ⚠️
 A `tl.constexpr` bool that gates a validity check (e.g., `CHECK_NEG_ONE_SENTINEL`, `CHECK_BOUNDS`) can be set `False` by a caller to skip the check. If the invariant the check enforces is not independently guaranteed on that path, illegal memory access or silent wrong values result.
 Trigger: new `tl.constexpr` bool in a Triton kernel that disables a bounds/sentinel/validity check; PR comment says "X path can disable this" without documenting what guarantees the invariant holds on that path.
 Real example (ATOM#1498): `CHECK_NEG_ONE_SENTINEL=False` disables -1 slot filter in paged prefill kernel; illegal access if any -1 slot appears without the check.
-→ `⚠️ B4: [constexpr] disables [check] — document which caller invariant guarantees no [invalid value] on that path`
+→ `⚠️ [constexpr] disables [check] — document which caller invariant guarantees no [invalid value] on that path`
 
 **B5 — API propagation incompleteness** 🔴/⚠️
 When an API surface changes in dimension X, all downstream receivers (Y) must be updated. Unhandled propagation silently falls through to wrong behavior (Z).
@@ -158,7 +158,7 @@ Exception: method override where base class forces the signature but subclass le
 FP self-check (rename / param-removed): before firing, confirm the old symbol is NOT preserved by a compatibility shim added in the same PR — a same-named wrapper, an alias, or a backward-compat re-export. A rename/removal behind such a shim is backward-compatible — do not fire. (cf. aiter#4227: `get_mla_metadata_v1` renamed but a same-named wrapper preserved the symbol → not a break.)
 Real examples (param-discard): `expert_mask` accepted but `# return None` commented out → TP expert-parallel callers silently routed wrong; `needs_independent_noise` dropped in `prefill_forward` — first token uses wrong sampling mode (ATOM#860).
 Real example (attr-missing): `getattr(self.args,'n_shared_experts',0)` silent zero fallback — shared expert slots silently dropped from mapping with no warning if attribute absent (ATOM#1548).
-→ `🔴/⚠️ B5-[sub-type]: [what changed] — [downstream not updated] — [failure]`
+→ `🔴/⚠️ [sub-type]: [what changed] — [downstream not updated] — [failure]`
 
 **B6 — New dispatch value not handled by all paths, no warning** ⚠️/🔴
 When a PR introduces a new routing value to a multi-way dispatch — a new dtype, a new arch string, a new layout flag, a new `getattr` attribute key — every reachable dispatch branch must either (a) handle it explicitly, (b) fall through to a documented safe default, or (c) assert/warn before the wrong branch is reached. Silent fallback to an incorrect behavior is a bug.
@@ -166,14 +166,14 @@ Severity: 🔴 if the wrong path produces incorrect output (wrong expert mapping
 Exception: an upstream assert/raise/isinstance check that prevents the bad value from reaching the branch → not B6. A runtime assert that fires for the dangerous combo → not B6.
 FP self-check: Is the uncovered branch actually reachable with the new value? Is there a caller contract preventing the bad combo?
 Real examples: `getattr(self.args,'n_shared_experts',0)` silent zero fallback — shared expert slots silently dropped from mapping with no warning if attribute absent (ATOM#1548); `x_pad_to_multiple=256` kwarg added to fused AR+RMSNorm call before aiter PR merged — TypeError at dispatch for all callers (ATOM#841).
-→ `🔴/⚠️ B6: [new value/attribute] reaches [branch] which assumes [old behavior] — [what wrong thing happens] — add assert or explicit handling`
+→ `🔴/⚠️ [new value/attribute] reaches [branch] which assumes [old behavior] — [what wrong thing happens] — add assert or explicit handling`
 
 **B7 — Parallel linear layer constructed without `prefix=` takes the wrong quant path** 🔴
 A `ColumnParallelLinear` / `RowParallelLinear` / `ReplicatedLinear` / `MergedColumnParallelLinear` / `QKVParallelLinear` built without a `prefix=` argument queries `get_layer_quant_config` with the empty string, which cannot match any entry in the checkpoint's `quantization_config.modules_to_not_convert` (or any per-layer override list keyed the same way). A layer the checkpoint ships in BF16 silently falls through to the global quant spec instead, builds with an uninitialized `weight_scale`, and the weight loader casts the BF16 tensor into the quant dtype slot. No crash — wrong numerics only, and only on the layers that needed the exclusion.
 Trigger: a new/changed parallel-linear constructor call in model code with no `prefix=` kwarg in the call — most often a new or newly-wired auxiliary head (MTP/draft/entry-proj) where the main model's layers already pass `prefix` and the new one was copy-pasted without it.
 ATOM's own `.claude/commands/add-model.md` states the mechanism directly: "For the exclusion to work, `ColumnParallelLinear` must receive the correct `prefix` argument so `get_layer_quant_config(prefix)` can match" — `prefix=""` → `get_layer_quant_config("")` → global FP8 config → BF16 weight cast to FP8 → zeros; `prefix` matching a `modules_to_not_convert` entry → BF16 preserved.
 Real example (ATOM#755, fixed `954a66f8c`): Qwen3-Next MTP's `fc` was constructed via `ColumnParallelLinear` with no `prefix=`. `LinearBase` queried the empty string against `exclude_layers`, missed, fell back to the global FP8 spec, and built the layer with an uninitialized `weight_scale` — "the dtype-cast path... silently turned the bf16 weight into garbage FP8." Fixed by mirroring `qwen3_5_mtp.py:50`, which already passed `prefix` correctly. This was one of three independent root causes an ablation table in the same commit proves were all required: with it, MTP accept rate on Qwen3-Next-80B-A3B-Instruct-FP8/TP=4 went from 0.00% (0/11000) to 60.14% (4210/7000).
-→ `🔴 B7: [layer] constructed without prefix= — get_layer_quant_config("") cannot match modules_to_not_convert, [layer] silently takes the wrong quant path`
+→ `🔴 [layer] constructed without prefix= — get_layer_quant_config("") cannot match modules_to_not_convert, [layer] silently takes the wrong quant path`
 
 ---
 
@@ -184,7 +184,7 @@ _"The constant is correct for gfx942/bf16; it silently breaks on gfx950 or fp8."
 Fixed `bf16`, `fp8_e8m0`, or similar in an attention backend, norm, or scale path that handles multiple configs.
 FP self-check first: search the unchanged lines of this file for the same hardcoded dtype — if it already appears pre-existing on the same path, this is not a new violation (do not fire as new). Fire only when the hardcode is newly introduced, or the path newly handles more than one dtype/config.
 Real examples: ATOM#1423 valarLip: "not always bf16"; ATOM#1458 valarLip: "hard code to fp8_e8m0?"
-→ `⚠️ C1: dtype hardcoded to [type] — should derive from actual tensor/config dtype`
+→ `⚠️ dtype hardcoded to [type] — should derive from actual tensor/config dtype`
 
 **C2 — FP8 fnuz check uses arch name** ⚠️
 `if "gfx942" in arch: treat_as_fnuz()` — wrong. Same arch can have both fn and fnuz tensors in flight (fnuz KV, fn Q).
@@ -196,14 +196,14 @@ match: it fixes a dtype-literal check missing one fnuz dialect, not an arch-stri
 for a dtype check — cited here only as evidence that fn/fnuz dialect confusion is a real,
 recurring defect class on ATOM, not as a direct instance of C2's specific anti-pattern. Carried
 from aiter and labeled as such, same convention as H1/G2.
-→ `⚠️ C2: fnuz check uses arch name — use tensor.dtype comparison`
+→ `⚠️ fnuz check uses arch name — use tensor.dtype comparison`
 
 **C3 — New GPU arch string or arch-specific constant hardcoded in dispatch** ⚠️
 **FP self-check first (do this before deciding to fire):** Search the unchanged lines of this file for the same arch string or constant value (e.g., `'gfx942'`, `576`). If it already appears on an unchanged line → **do not fire** (pre-existing style). Only proceed if it is genuinely new to this file.
 Trigger (only after self-check passes): a new `+` line introduces an arch string literal in a dispatch condition (`if arch == 'gfx942':`, `'gfx950' in arch_str`), or a magic constant tied to a specific arch/model config (`576` for MLA kv_lora_rank+qk_rope_head_dim), rather than deriving from config or a named constant.
 Also exempt: strings in comments, docstrings, or directory names; values imported from a central registry; arch strings used as **capability guards inside a model-specific or kernel-specific function** (not in the centralized dispatch layer) — e.g., `gfx_name.startswith("gfx1201")` inside `activation.py`'s `_detect_gfx1201()` function determines backend availability; that check belongs at the detection layer and does not trigger C3.
 Real examples: hardcoded `576` in `_bind_kv_cache_to_modules()` instead of `kv_lora_rank + qk_rope_head_dim` — breaks any MLA variant where the sum ≠ 576 (ATOM#860 → fire C3); `'gfx942'` already in `attention_mla.py` and new `+` line extends same pattern (→ skip, pre-existing style); `gcnArchName.startswith("gfx1201")` in a dedicated `_detect_gfx1201()` helper (ATOM#749 → skip, capability guard).
-→ `⚠️ C3: new arch-specific [string/constant] hardcoded in dispatch — derive from config or named constant`
+→ `⚠️ new arch-specific [string/constant] hardcoded in dispatch — derive from config or named constant`
 
 ---
 
@@ -218,7 +218,7 @@ Trigger: ATOM code passes a freshly-allocated `torch.empty()` tensor to an aiter
 Severity: 🔴 for atomic accumulation (atomic_fmax, atomicAdd) — garbage propagates into every output element. ⚠️ for partial-sum buffers where a zero-weight coefficient mathematically cancels the contribution (e.g., online softmax with empty batch: `exp(-inf) × garbage = 0`); still flag because `0.0 × NaN = NaN` on IEEE hardware if the allocator returns dirty pages.
 Real example (aiter#4015): yzhou103: "AiterTensor::empty does not zero-initialize... garbage in v_amax silently corrupts descale."
 Real example (ATOM, commit `1e0e51644`, **open PR#2357, not yet merged**): `init_aiter_topK_meta_data` allocates one process-wide buffer and initializes only the shared-expert columns; the `top_k` routed columns — which hold expert *ids* that `moe_sorting` and the scatter/reduce kernel use to index expert-sized storage — were left on `torch.empty`, so a row the routing kernel doesn't write in a given step reads whatever the allocator last left there: an out-of-range index, not just a wrong number. Fixed by zeroing the buffer. Same shape as the aiter citation, on ATOM's own MoE routing path.
-→ `🔴 D1: [buffer] passed to atomic kernel not zero-initialized — use torch.zeros not torch.empty`
+→ `🔴 [buffer] passed to atomic kernel not zero-initialized — use torch.zeros not torch.empty`
 
 **D2 ("new default path without rollback env-var") was landed here, then removed.** It had
 no ATOM citation from the start — inherited from a pre-pipeline checklist with no PR or
@@ -235,7 +235,7 @@ A variable is assigned inside an `if/elif` branch but referenced unconditionally
 Trigger: new `if/elif` gate assigns a variable (`result = ...`) on some branches; a later line references it without a pre-block default. Check: is there a `var = None` or `var = default_val` before the if-block?
 Exception: if there is a definitive `else` branch that also assigns the variable, or if the variable is only ever used inside the branch that assigns it.
 Real example (ATOM#860): `needs_independent_noise` returned from `prepare_model()` tuple but assigned only in one branch of `prefill_forward` — other branch paths raised `NameError` when the sampler tried to use it.
-→ `🔴 D1b: [var] assigned only inside [branch] but referenced unconditionally — add [var = default] before the if-block`
+→ `🔴 [var] assigned only inside [branch] but referenced unconditionally — add [var = default] before the if-block`
 
 **D4 — Invariant reversal without citation** 🔴
 A documented safety invariant is reversed: old comment says "must X because Y" → new code removes X claiming "X not needed" but no spec/asm/test is cited to prove Y no longer holds.
@@ -245,13 +245,13 @@ No ATOM-native instance found despite search — carried from aiter and labeled 
 preventively: the trigger (a removed/reversed safety comment with no replacement citation) is
 the same class D1's own ATOM evidence shows actually happens on ATOM (an uninitialized-buffer
 invariant silently dropped), just not yet caught in this exact "comment reversal" shape.
-→ `🔴 D4: [operation] reverses a documented safety invariant — cite the spec/asm/test proving new assumption is safe`
+→ `🔴 [operation] reverses a documented safety invariant — cite the spec/asm/test proving new assumption is safe`
 
 **D5 — Verbatim duplication across backbone files** ⚠️
 The same fix is copy-pasted into 2+ Tier 1/2 backbone files with trivial name substitution (different variable names, identical algorithm and comments). AI code signature: changes look symmetric but each file's invariants may differ and were not independently verified.
 Trigger: nearly identical `+` blocks appearing in two backbone files in the same PR diff; same formula / same comment structure / same magic constants, only variable names differ.
 Real example (ATOM#1493): chunked indexer loop copy-pasted verbatim between `deepseek_v2.py` (num_rows, total_kv) and `deepseek_v4.py` (total_tokens, total_committed) — same `(budget_rows // 128) * 128` formula and same `bit_length() - 1` fallback, same block of comments.
-→ `⚠️ D5: identical algorithm in [file_a] and [file_b] — was correctness verified independently in each context, or copy-pasted?`
+→ `⚠️ identical algorithm in [file_a] and [file_b] — was correctness verified independently in each context, or copy-pasted?`
 
 **D6 — Fake / meta function dtype or shape mismatch** 🔴
 When a `gen_fake` / `_fake` / `abstract_impl` function is added or modified, its return tensor dtypes and shapes must match the real op exactly. torch.compile uses the fake to infer output types; a wrong dtype compiles cleanly but fails at runtime with a dtype mismatch or silently produces wrong values.
@@ -282,7 +282,7 @@ GPU with logically identical index values — making only `src_token` non-contig
 produced 1,056 mismatched output bytes, with no exception raised. D8's first ATOM-native
 citation; until this, the rule had evidence from elsewhere (vendored prose) but no ATOM
 instance of its own.
-→ `⚠️ D8: [tensor] passed to [kernel] without contiguous check — add .contiguous() or assert .is_contiguous()`
+→ `⚠️ [tensor] passed to [kernel] without contiguous check — add .contiguous() or assert .is_contiguous()`
 
 **D9 — INT32 overflow in GPU pointer arithmetic** 🔴 *(scanner-backed — read the scan output, not this prose)*
 
@@ -317,7 +317,7 @@ Real example (ATOM#2211, fixed `1580bf1af6a`): `address` wraps at `vocab*hidden 
 shipped NaN at gqa=16 before the int64 widening landed. Scanned clean post-fix.
 Real example (ATOM#1460, fixed `7986573b10c`, `v4_kernels/inverse_rope.py`): same shape,
 same fix. Scanned clean post-fix.
-→ `🔴 D9: [expr] in int32 — widen [token_id / total_tokens / seq_start] to int64 before multiplying by [stride]`
+→ `🔴 [expr] in int32 — widen [token_id / total_tokens / seq_start] to int64 before multiplying by [stride]`
 
 **D10 — Sentinel value collides with valid data** 🔴
 A numeric sentinel (`-1`, `0`, `None`-as-0) is reused to mean "no limit / unset / unavailable" in a field that elsewhere holds a real count, offset, or limit. The collision is silent: the receiving code cannot tell "legitimately zero" from "not set."
@@ -326,7 +326,7 @@ Real example (ATOM#2012): yitingw1 reproduced the hang independently — `max_to
 Real example (ATOM#2046, `atom/model_ops/fused_moe_triton.py`): JiaoliangYu: "`limit=0` means the opposite here than it did on the old path, and it makes the whole MoE layer output exactly zero... `0.0` is taken as a real bound... No error, no assert."
 Real example (ATOM#2305, `atom/kv_transfer/offload/chunked_scheduler.py`): yhl-amd: "`_MPLookupClient.lookup()` returns `0`, not `None`, when its poll deadline expires... this branch memoizes an MP timeout as a real tier miss." Confirmed + fixed `da8c39ea3`.
 Real example (ATOM#1316, `atom/distributed/kv_events.py`): yitingw1: sequence numbers wrap into the reserved `REPLAY_DONE` sentinel value. Fixed `918f7dcf`.
-→ `🔴 D10: [field] reuses [sentinel] to mean "unset" but also holds real data on [path] — disambiguate with Optional or a distinct sentinel`
+→ `🔴 [field] reuses [sentinel] to mean "unset" but also holds real data on [path] — disambiguate with Optional or a distinct sentinel`
 
 **D11 — Unbounded FlyDSL descriptor over a ragged/row-addressed extent** 🔴 *(`flydsl_bounds` scanner-backed — read `flydsl_bounds.txt`, not this prose)*
 
@@ -358,7 +358,7 @@ comment: "clamp the speculative address, not the selected row" — adding `slot 
 imin(imax(ident, 0) // BLOCK_ROWS, TOPK_BLOCKS - 1)`. Either fix shape clears D11: bound
 the descriptor with an explicit `nbytes`, or clamp the computed row offset so it cannot
 leave the row the descriptor covers.
-→ `🔴 D11: rsrc([tensor]) omits nbytes over a ragged/row-addressed extent — [computed offset] can land outside its row with nothing to catch it; bound the descriptor or clamp the offset`
+→ `🔴 rsrc([tensor]) omits nbytes over a ragged/row-addressed extent — [computed offset] can land outside its row with nothing to catch it; bound the descriptor or clamp the offset`
 
 *Gluon is a clean negative, not a rule.* `atom/model_ops/v4_kernels/paged_decode_gluon.py`
 (218 lines, two `@gluon.jit` kernels) landed whole in `5f98bafd1` (PR#2377) as a perf
@@ -374,12 +374,12 @@ _"The change is incomplete without a matching update in another repo or file."_
 New `from aiter import X`, new kwargs on aiter calls: PR links an aiter PR?
 New kwargs may require an aiter version not yet released.
 Real example (ATOM#1494): `emit_bf16=True` kwarg added → needed aiter PR first.
-→ `⚠️ E1: new aiter usage — corresponding aiter PR not mentioned`
+→ `⚠️ new aiter usage — corresponding aiter PR not mentioned`
 
 **E2 — Plugin bridge not updated** ⚠️
 PR changes KV layout, function signature, or data structure that `deepseek_v4_bridge.py` / `sglang_bridge.py` read directly.
 Real example (ATOM#1423): paged-SWA layout changed; bridge still used old layout.
-→ `⚠️ E2: [structure] changed — plugin bridge sync needed`
+→ `⚠️ [structure] changed — plugin bridge sync needed`
 
 **E3 — New param with backward-compatible default is dead code** 📝
 New aiter param added with default that preserves old behavior: fix only activates when consumer passes non-default. Who updates the consumer?
@@ -388,7 +388,7 @@ No ATOM-native instance found despite search — carried from aiter and labeled 
 preventively in the same `plugin-bridge` family as E2, whose own ATOM evidence (#1423) shows
 the general "consumer doesn't pick up an upstream change" failure mode is real on this
 boundary; E3 covers the narrower default-param variant of it.
-→ `📝 E3: new API param needs consumer-side update to activate — follow-up tracked?`
+→ `📝 new API param needs consumer-side update to activate — follow-up tracked?`
 
 **E4 — A production kernel or dispatch belongs in aiter, not ATOM** ⚠️
 Found via the closed-unmerged-PR channel (ROCm/ATOM PRs closed, not merged, with a
@@ -418,7 +418,7 @@ resident kernel is not the thing these closures are about. The trigger is a
 (no call into `aiter.<fn>`/`from aiter import`) and implements a kernel primitive,
 OR a new `ATOM_*` env-var that switches between ATOM-side kernel variants for a
 choice aiter itself could make.
-→ `⚠️ E4: new [file] implements a production kernel/dispatch with no aiter counterpart linked — confirm this doesn't duplicate (or belong in) aiter, per #2465/#1104/#2510/#1593`
+→ `⚠️ new [file] implements a production kernel/dispatch with no aiter counterpart linked — confirm this doesn't duplicate (or belong in) aiter, per #2465/#1104/#2510/#1593`
 
 ---
 
@@ -430,7 +430,7 @@ New `w13_weight_preshuffled` / `w_quantized` stored alongside `w13_weight`: both
 For large MoE models (w13 = 7B+), OOM only at peak load — silent until prod.
 Real example (ATOM#1469): valarLip: "this will make us pin double weight."
 Check: is the original freed after the new variant is created?
-→ `⚠️ F1: [new_attr] alongside [original] — doubles HBM; is original freed?`
+→ `⚠️ [new_attr] alongside [original] — doubles HBM; is original freed?`
 
 **F2 — Unbounded per-request/per-shape cache never evicted on the no-op path** ⚠️
 A dict/set keyed by request id, sequence id, or tensor shape gets an entry on every call (or every success), but the matching cleanup only fires on a narrower event some calls never reach — short requests, error paths, or shapes that stop recurring leave the entry forever.
@@ -438,7 +438,7 @@ Trigger: a new `+` line adds to a dict/set (`.add(`, `.append(`, `.setdefault(`,
 Real example (ATOM#2146): yhl-amd: "Do not retain finished IDs for requests that never issued a save — this adds every completed request to `_finished_awaiting_save`, but an ID is removed only if it later appears in `finished_saving`. Short requests with no aligned chunk... remain in this set for the lifetime of the worker."
 Real example (ATOM#1316, `atom/distributed/kv_events.py`): yitingw1: replay ring buffer reuses `buffer_steps`, "adding a long-lived, count-based memory retention... retaining up to 10000 encoded payloads (including potentially large token_ids) for the lifetime of the publisher." Fixed with a dedicated, decoupled knob in `75792547`.
 Real example (ATOM#1881, `atom/plugin/sglang/attention_backend/attention_gdn.py`): zovonoir: per-shape caches "can grow unbounded over time as `bs` varies" — same defect class.
-→ `⚠️ F2: [tracking_structure] grows on every call but is only cleared on [narrower path] — bound it or evict unconditionally`
+→ `⚠️ [tracking_structure] grows on every call but is only cleared on [narrower path] — bound it or evict unconditionally`
 
 ---
 
@@ -464,21 +464,21 @@ Trigger: diff introduces a non-default `torch.cuda.Stream`, passes an explicit `
 Real example (ATOM#1369, `atom/model_ops/moe.py:3515`): jpy794: "This fixes the use-after-free race for the tensor allocated in stream A and used in stream B. Without this fix the intermediate tensor could be reused by pytorch in the allocating stream before its real use by kernels in the other stream." (H2D/compute-side: allocated on one stream, consumed on another.)
 Real example (ATOM#2654, `fix(mtp): keep side-stream D2H sources alive until the copy runs`): the same rule in the opposite direction — a D2H race. Commit body: "tokenIDProcessor copies the sampled ids... to the host on `async_copy_stream`. The sources are fresh default-stream allocations that the caller drops right after queuing the copy, so the caching allocator can hand their block to the next default-stream allocation before the side-stream copy has run... Under MTP the stale `num_bonus` becomes `num_accepted_tokens`, which the GDN conv update kernel adds to the conv-state offset unchecked: an illegal memory access." The same PR fixed the identical pattern a second and third time in the same commit (dspark ell D2H, output D2H) — three instances of the same mechanism before it was generalized.
 A new `.record_stream(...)` call (a non-deterministic cross-stream handoff — correct only while the allocator's own polling is guaranteed to run before the tensor is freed) should be held to the same bar as a missing sync: prefer deterministic `wait_stream`/event-based sync whenever the free point is actually controllable, and expect the diff to say why `record_stream` was chosen instead. `atom/models/kimi_k3/model.py:681,689` already relies on `record_stream` for the TBO shared-expert output handoff between `alt` and `current` streams, and `atom/utils/tbo/ubatch_wrapper.py`'s `comm_stream`/`compute_stream` pair does the same — a new `record_stream` call elsewhere should explain why `wait_stream` could not be used. (pytorch `.agents/skills/cuda-streams/SKILL.md`, borrowed for this sharper criterion — no independent ATOM citation for the `record_stream`-vs-`wait_stream` choice specifically.)
-→ `🔴 G1: [tensor] written on [stream A] consumed on [stream B] without sync — add stream.wait_stream() or hipStreamWaitEvent`
+→ `🔴 [tensor] written on [stream A] consumed on [stream B] without sync — add stream.wait_stream() or hipStreamWaitEvent`
 
 **G1b — Blocking queue.get() without timeout in production serving code** ⚠️
 `queue.get()` without `timeout=` in a worker or service thread that depends on an external producer (decode loop, stream consumer, request handler). If the producer exits abnormally, the worker blocks forever — no crash, no log, hung process.
 Trigger: `queue.get()` or `asyncio.Queue.get()` inside a `while True:` worker loop in production serving paths (entrypoints, engine loop, scheduler) without `timeout=` and without a corresponding `except queue.Empty` / `asyncio.TimeoutError` handler or a `done` flag.
 Exception: test code, CLI tools, or one-shot scripts where a hang is detectable (CI timeout, interactive TTY).
 Real example (ATOM#789): `loop.call_soon_threadsafe` routes incremental detokenizer state mutations to the event-loop thread — this is correct and is NOT a G1b violation.
-→ `⚠️ G1b: [worker] blocks on queue.get() without timeout — add timeout= and handle Empty/TimeoutError to survive producer failure`
+→ `⚠️ [worker] blocks on queue.get() without timeout — add timeout= and handle Empty/TimeoutError to survive producer failure`
 
 **G2 — Blocking CPU/GPU synchronization added to the decode loop** ⚠️
 A new `.item()`, `.tolist()`, boolean-tensor indexing, or blocking `.to("cpu")` (no `non_blocking=True`) inside the model runner's forward path or a model's `forward()` forces the CPU to wait for the GPU queue to drain at that point, on every call. ATOM has no `VLLM_GPU_SYNC_CHECK`-equivalent env var (verified: no such flag in `atom/utils/envs.py`), so there is no automated gate for it; the runnable check is `torch.cuda.set_sync_debug_mode('error')` around the suspect region, which raises instead of silently stalling.
 Trigger: a new `.item()`, `.tolist()`, or `.to("cpu")` without `non_blocking=True` added inside `atom/model_engine/model_runner.py` or a model's `forward()`.
 Grounded in: `model_runner.py`'s `tokenIDProcessor` class (`send_to_cpu_async`/`recv_async_output`, ~line 206-298) already hand-manages `non_blocking=True` transfers for logprobs and rejected/bonus-token counts specifically to avoid forcing a sync — the hazard is real and already worked around ad hoc for existing code; a new unguarded `.item()`/`.tolist()` elsewhere in the same hot path defeats that work.
 Source: vLLM `.agents/skills/pr-checklist/SKILL.md` §1.5 (sync-check); detection method from TensorRT-LLM `.claude/skills/perf-torch-sync-free/SKILL.md` (`torch.cuda.set_sync_debug_mode`). Borrowed, not ATOM-native — no ATOM PR citation yet for this specific rule.
-→ `⚠️ G2: [call] forces a CPU/GPU sync in [function] — confirm with torch.cuda.set_sync_debug_mode('error'), or move it off the hot path`
+→ `⚠️ [call] forces a CPU/GPU sync in [function] — confirm with torch.cuda.set_sync_debug_mode('error'), or move it off the hot path`
 
 ---
 
@@ -503,13 +503,13 @@ anyway). Left wired (body + trigger + `ALL_RULES`) rather than dropped or parked
 `UNREACHABLE_BY_DESIGN` — the trigger is reachable by design, just unexercised by any real
 diff found so far — but do not read H1 appearing in a `rules=` line as proof the mechanism
 has ever actually caught anything.
-→ `🔴 H1: [field] mutated in place on [batch/prev_batch] — rebind to a new value instead of mutating the captured snapshot`
+→ `🔴 [field] mutated in place on [batch/prev_batch] — rebind to a new value instead of mutating the captured snapshot`
 
 **H2 — Batch-consuming entry points must treat ScheduledBatch as read-only** ⚠️
 Pairs with H1: entry points that consume a `ScheduledBatch` (`prepare_model`, `get_token_locations`, and similar methods in `atom/model_engine/model_runner.py`) are expected to read from `batch` and return/thread a new value, not write back into the `batch` object they were handed — the same "init must stay pure" discipline sglang's `forward-batch-init-new-purity` rule encodes for its own forward-batch construction.
 Trigger: a diff inside a batch-consuming method of `atom/model_engine/model_runner.py` (signature takes a `batch: ScheduledBatch` parameter) writes to a `batch.<field> = ...` field instead of returning a new value.
 Source: sglang `.claude/rules/forward-batch-init-new-purity.md`, adapted to ATOM's `prepare_model`/`get_token_locations`. Borrowed, not ATOM-native — no ATOM PR citation yet.
-→ `⚠️ H2: [method] writes back into batch.[field] instead of returning a new value — keep batch-consuming entry points read-only`
+→ `⚠️ [method] writes back into batch.[field] instead of returning a new value — keep batch-consuming entry points read-only`
 
 ---
 
@@ -523,7 +523,7 @@ Real example (ATOM issue #1417, "[Bug] DeepSeek-V4: prefix caching corrupts outp
 Real example (fix PR #1423, "content-addressed paged SWA fixes prefix-cache corruption (#1417)", merged `081045f6a`): made SWA content-addressed via `block_tables`, the same way the compressed KV already was — either sharing the compressed physical pool (correctness fix, but shrinks `num_kvcache_blocks`) or a separate windowed SWA pool with its own free-list, content hash, and sliding-window freeing (kept: restores KV capacity while fixing correctness). Validated eager + CUDAGraph + MTP/spec paths, 0/3 repro collapses, dual-pool unit tests 40/40, no gsm8k regression.
 Real example (follow-up PR #1573, "fix sglang/vllm plugin SWA after paged-SWA migration (#1417/#1423)", merged): the sglang/vllm plugin bridges had drifted from the new paged-SWA layout and needed a separate fix — the same invariant, a second consumer that had not yet caught up.
 Independent confirmation: `docs/scheduling_kv_cache_guide.md` (~line 320) states the invariant on its own terms, with no reference to this bug: "Neither the GDN recurrent state nor the V4 compressor ring can be rebuilt from cached KV blocks — the cache holds the compressor's *output*, the state is its rolling *input* window. So for a stateful model a prefix-cache hit is only resumable at a boundary where some earlier request saved its state" — the `StateCache`/`resumable_hit`/`checkpoint` protocol the guide documents is the generalization ATOM built after #1417/#1423.
-→ `🔴 I1: [per-request state] lives outside the content-addressed cache — a cross-request prefix-cache hit reuses the shared KV but still reads stale [state] from [slot]; fold the state into the cache or pair the hit with an explicit state copy`
+→ `🔴 [per-request state] lives outside the content-addressed cache — a cross-request prefix-cache hit reuses the shared KV but still reads stale [state] from [slot]; fold the state into the cache or pair the hit with an explicit state copy`
 
 ---
 
@@ -564,7 +564,7 @@ defaults. The switches were named `MONO_*`, not `ATOM_MONO_*` — the review thr
 (registry bypass, undiscoverable default) is exactly P1's, but this rule's trigger, scoped to
 the `ATOM_` prefix because that is the only prefix `envs.py` itself claims, is narrower than
 what was actually flagged here.
-→ `⚠️ N1: [NAME] read via os.getenv/os.environ in [file] — move the definition into atom/utils/envs.py so it is discoverable`
+→ `⚠️ [NAME] read via os.getenv/os.environ in [file] — move the definition into atom/utils/envs.py so it is discoverable`
 
 **N2 — a new env switch leaves the new behaviour off by default** 📝
 A flag that ships off by default ships code nobody runs until someone separately flips it and
@@ -578,7 +578,7 @@ value had shipped a feature nobody ran by default — "aligning ATOM with every 
 serving runtime" — and had to add an explicit auto-disable fallback for the two MTP variants
 that cannot support it. The PR itself was closed, not merged, but its own title and stated
 motivation are exactly the question P2 asks a new off-by-default switch to answer up front.
-→ `📝 N2: [NAME] defaults off — why not on by default, or what's the plan to flip it?`
+→ `📝 [NAME] defaults off — why not on by default, or what's the plan to flip it?`
 
 **N3 — model-specific logic added to a shared path** ⚠️
 `atom/model_ops/`, `atom/model_engine/`, and `atom/spec_decode/` are common path: every model
@@ -600,7 +600,7 @@ DSv4-specific step-0 graph declaration, full-q staging, and decode-only eligibil
 a new, dedicated `DeepseekV4Proposer`, routed to it only from the factory for
 `DeepseekV4MTPModel`, and left `EagleProposer` holding only the model-agnostic step-0 hooks and
 the shared loop.
-→ `⚠️ N3: [model]-specific [logic] added to [shared file] — this file is common path for every model that dispatches through it; move this into the model's own file`
+→ `⚠️ [model]-specific [logic] added to [shared file] — this file is common path for every model that dispatches through it; move this into the model's own file`
 
 **N4 — the same change repeated once per model instead of once at the top** 📝
 When a fix or feature needs the identical change copied into three or more model files, the
@@ -629,7 +629,7 @@ Real example (ATOM#401, "[plugin][oot] Add Kimi-K2.5 support", MERGED,
 plugin tree: "we have to do this for every new model?" zejunchen-zejun, independently on the
 same PR: "Can we have a dict or set to store which model should be excluded for processing
 config here? So that the new OOT multi-model will not frequently introduce code change here."
-→ `📝 N4: [change] repeated across [N] files under atom/models/ — does a shared hook (base class, loader, factory) belong here instead of one copy per model?`
+→ `📝 [change] repeated across [N] files under atom/models/ — does a shared hook (base class, loader, factory) belong here instead of one copy per model?`
 
 **N5 — a vLLM or SGLang symbol introduced outside `atom/plugin/`** ⚠️
 `atom-patterns/SKILL.md` assigns `atom/plugin/` to "vLLM/SGLang plugin adapters" specifically
@@ -659,7 +659,7 @@ layout to fix a performance regression, it does not place a vLLM/SGLang symbol o
 is a vLLM-plugin-specific *kwarg* name (`slot_mapping`), not a literal `vllm`/`sglang` token —
 the trigger above, which looks for the literal token, is narrower than the review comment that
 motivates it.
-→ `⚠️ N5: [vllm/sglang reference] introduced in [file] under atom/models or atom/model_ops — framework-specific logic belongs in atom/plugin/, not the native path`
+→ `⚠️ [vllm/sglang reference] introduced in [file] under atom/models or atom/model_ops — framework-specific logic belongs in atom/plugin/, not the native path`
 
 ---
 
@@ -679,7 +679,7 @@ was closed over exactly this, which is the strongest form the objection takes �
 request, a refusal of the approach.
 This rule does not say the workaround is wrong. It says the card must carry the root cause and
 the reason it is not being fixed here, so the reviewer decides that rather than inheriting it.
-→ `⚠️ N6: [FILE]:[LINE] describes itself as [WORD] — name the underlying defect and say why it
+→ `⚠️ [FILE]:[LINE] describes itself as [WORD] — name the underlying defect and say why it
 is handled here rather than at its source, or drop the wording if it is not actually temporary`
 
 ### T — Triton Kernel Review
@@ -718,7 +718,7 @@ no tile dimension to run past. The rule exists so a future edit that turns one o
 scalar loads into a tiled one doesn't lose the mask silently.
 Trigger: `tl.load(`/`tl.store(` on a `+` line with no `mask=` kwarg, or a `tl.load(` with
 `mask=` but no `other=`.
-→ `⚠️ T1: [call] has no bounds mask ([or: no other= fallback]) — confirm the index range cannot exceed the tensor, or add mask=/other=`
+→ `⚠️ [call] has no bounds mask ([or: no other= fallback]) — confirm the index range cannot exceed the tensor, or add mask=/other=`
 
 **T3 — Launch config (`num_warps`/`num_stages`) carried over unretuned** ⚠️
 ATOM evidence: `atom/model_ops/v4_kernels/paged_decode.py`'s `_kernel_config()` (lines
@@ -730,7 +730,7 @@ shape family and carried forward, with no autotune sweep re-deriving it as new s
 (block sizes, head counts) are added.
 Trigger: `num_warps=`/`num_stages=`/`num_ctas=` set in added lines, inside a file that
 also defines or calls a Triton kernel.
-→ `⚠️ T3: num_warps/num_stages set from [heuristic/literal] — confirm this was re-tuned for the new shape, not carried over from the shape it was picked for`
+→ `⚠️ num_warps/num_stages set from [heuristic/literal] — confirm this was re-tuned for the new shape, not carried over from the shape it was picked for`
 
 **T8 — Launch knob hardcoded in kernel source instead of the config system** ⚠️
 ATOM evidence, same file: `paged_decode.py:896` hardcodes `num_warps=4` directly at a
@@ -741,7 +741,7 @@ stops applying to this one call.
 Trigger: `hardcoded_launch_knob()` — a `waves_per_eu=`/`matrix_instr_nonkdim=`/`kpack=`/
 `num_stages=`/`num_warps=`/`num_ctas=` literal (not sourced from `config`/`cfg`/`tune`/
 `kwargs`/an uppercase constant) on an added line outside `configs/`, `op_tests/`, `tests/`.
-→ `⚠️ T8: [knob]=[value] hardcoded at [location] instead of read from config — move it to the tuned config, or justify why this call site is exempt`
+→ `⚠️ [knob]=[value] hardcoded at [location] instead of read from config — move it to the tuned config, or justify why this call site is exempt`
 
 **T6 — Grid / `program_id` axis disagreement** ⚠️
 Carried from aiter **without an ATOM citation** — labeled as such, same as aiter marks
@@ -751,7 +751,7 @@ defect commit was found for this specific failure (a launch grid's axis order di
 with the `tl.program_id(axis)` the kernel reads it back with — including a swizzled grid
 where the swizzle axis and the `program_id` axis it's applied to don't agree).
 Trigger: `grid = lambda` or `tl.program_id` on an added line.
-→ `⚠️ T6: program_id(axis=[n]) — confirm this matches the grid's own axis order (and the swizzle axis, if the grid is swizzled) — no ATOM instance found for this specific rule, carried from aiter`
+→ `⚠️ program_id(axis=[n]) — confirm this matches the grid's own axis order (and the swizzle axis, if the grid is swizzled) — no ATOM instance found for this specific rule, carried from aiter`
 
 ---
 
@@ -780,13 +780,13 @@ later, re-add the specific one with that citation — not the whole family uncit
 
 | Check | Trigger | Flag |
 |---|---|---|
-| Temp script | `runperf-*.sh`, `test_local_*.py` in diff | `⚠️ HK1: [file] looks temporary — remove before merge` |
-| Unrelated files | Files with no connection to PR purpose | `⚠️ HK2: [file] appears unrelated` |
-| Bug fix without test | No regression test or repro script | `📝 HK3: bug fix without test — how to prevent regression?` |
-| TODO/stub in new path | `# TODO`, `# FIXME`, `raise NotImplementedError`, lone `pass` on a `+` line inside a new branch | `⚠️ HK4: [location] — incomplete implementation in new code path, will silently not execute on default path` |
-| Undocumented new env var | `os.environ.get("ATOM_...` or `os.environ.get("AITER_...` on a `+` line | `📝 HK5: new env var [NAME] — register in atom/envs.py AND document in README` |
-| Test reference dtype promotion | New test reference impl uses Python float literal (`1.0 + weight`, `0.5 * x.float()`) or explicit upcast (`.to(torch.float32)`, `.double()`) promoting to fp32 while kernel runs in bf16/fp8 — comparison calibrated against wrong-precision baseline | `⚠️ HK6: reference [fn] promotes to fp32 — cast back to [kernel dtype] before comparison` |
-| New third-party dependency | New package in `requirements*.txt`, `setup.py`, `pyproject.toml`; or new top-level `import [pkg]` not already a project dep. Exception: ROCm system packages (`amdsmi`, `hip`, `rccl`) are intentionally not on PyPI — flag only if there is no `try/except ImportError` guard AND no comment explaining the ROCm-only dependency | `📝 HK7: new dependency [pkg] — add to requirements, or add try/except ImportError with a comment for ROCm system packages` |
+| HK1 Temp script | `runperf-*.sh`, `test_local_*.py` in diff | `⚠️ [file] looks temporary — remove before merge` |
+| HK2 Unrelated files | Files with no connection to PR purpose | `⚠️ [file] appears unrelated` |
+| HK3 Bug fix without test | No regression test or repro script | `📝 bug fix without test — how to prevent regression?` |
+| HK4 TODO/stub in new path | `# TODO`, `# FIXME`, `raise NotImplementedError`, lone `pass` on a `+` line inside a new branch | `⚠️ [location] — incomplete implementation in new code path, will silently not execute on default path` |
+| HK5 Undocumented new env var | `os.environ.get("ATOM_...` or `os.environ.get("AITER_...` on a `+` line | `📝 new env var [NAME] — register in atom/envs.py AND document in README` |
+| HK6 Test reference dtype promotion | New test reference impl uses Python float literal (`1.0 + weight`, `0.5 * x.float()`) or explicit upcast (`.to(torch.float32)`, `.double()`) promoting to fp32 while kernel runs in bf16/fp8 — comparison calibrated against wrong-precision baseline | `⚠️ reference [fn] promotes to fp32 — cast back to [kernel dtype] before comparison` |
+| HK7 New third-party dependency | New package in `requirements*.txt`, `setup.py`, `pyproject.toml`; or new top-level `import [pkg]` not already a project dep. Exception: ROCm system packages (`amdsmi`, `hip`, `rccl`) are intentionally not on PyPI — flag only if there is no `try/except ImportError` guard AND no comment explaining the ROCm-only dependency | `📝 new dependency [pkg] — add to requirements, or add try/except ImportError with a comment for ROCm system packages` |
 
 
 ## Refutation
