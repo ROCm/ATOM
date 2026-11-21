@@ -425,7 +425,11 @@ class GDNStateMixin(PoolRowsMixin):
         # `stage_prefill` has already marshalled them, and the early return
         # above is the only case where it would not have.
         gdn_metadata = self.prepare_gdn_metadata(
-            batch, attn_metadata, is_prefill=True, prepare_block_tables=False
+            batch,
+            attn_metadata,
+            is_prefill=True,
+            prepare_block_tables=False,
+            running_tokens=running_tokens,
         )
 
         gdn_metadata.ssm_checkpoints = ckpt = self._checkpoint_targets(batch)
@@ -1511,6 +1515,7 @@ class GDNStateMixin(PoolRowsMixin):
         is_prefill: bool = False,
         *,
         prepare_block_tables: bool = True,
+        running_tokens: int = 0,
     ) -> GDNAttentionMetadata:
 
         num_decodes = batch.total_seqs_num_decode
@@ -1604,9 +1609,13 @@ class GDNStateMixin(PoolRowsMixin):
                 if cached is not None
                 else torch.zeros(num_prefills, dtype=torch.bool, device=self.device)
             )
+            # Sized for every row the conv is handed: a split KDA layer hands
+            # it a token-graph bucket's (`_kda_recurrence`), and `causal_conv1d_fn`
+            # rebuilds a map sized for fewer rows in every layer.
             nums_dict, batch_ptr, token_chunk_offset_ptr = (
                 compute_causal_conv1d_metadata(
-                    non_spec_query_start_loc, batch.total_tokens_num
+                    non_spec_query_start_loc,
+                    max(batch.total_tokens_num, running_tokens),
                 )
             )
         else:

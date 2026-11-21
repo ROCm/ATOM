@@ -18,10 +18,11 @@ from torch import nn
 
 from atom.config import get_current_atom_config
 from atom.utils import envs, mark_spliting_op
+from atom.utils.forward_context import get_forward_context
 from atom.utils.region_graph import eager_region
 from atom.utils.selector import Family, get_attn_backend
 
-from .attention_mla import MLAModules, _mla_output_width
+from .attention_mla import MLAAttention, MLAModules, _mla_output_width
 from .sp_attention import attention_fp8_fake, gather_heads, ulysses_attention
 
 logger = logging.getLogger("atom")
@@ -1007,8 +1008,34 @@ def fake_(
 # This way, although attention operation is complicated,
 # we can still capture the model's computation graph as a full-graph
 @mark_spliting_op(is_custom=True, gen_fake=fake_, mutates_args=[])
-@eager_region()
 def unified_attention_with_output_base(
+    q: torch.Tensor,
+    q_scale: torch.Tensor | None,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+    use_mla: bool,
+    qkv: torch.Tensor,
+) -> torch.Tensor:
+    """The attention: an MLA layer's prefill split on a prefill token-graph
+    recording and the warmup forward before it
+    (`MLAAttention.records_prefill_split`); otherwise one TR-graph break
+    (`_attention_region`) on a recording or inside a graph capture, and a
+    plain call when nothing records -- a drafter's eager step under a replay
+    included, where no recorder exists and the region would run it the same."""
+    fwd_ctx = get_forward_context()
+    if fwd_ctx.tr_graph != "record" and not fwd_ctx.in_hipgraph:
+        return _attention(q, q_scale, k, v, positions, layer_name, use_mla, qkv)
+    if use_mla:
+        atom_config = get_current_atom_config()
+        impl = atom_config.compilation_config.static_forward_context[layer_name].impl
+        if isinstance(impl, MLAAttention) and impl.records_prefill_split():
+            return impl.forward_prefill_split(q, q_scale, k, v, positions, layer_name)
+    return _attention_region(q, q_scale, k, v, positions, layer_name, use_mla, qkv)
+
+
+def _attention(
     q: torch.Tensor,
     q_scale: torch.Tensor | None,
     k: torch.Tensor,
@@ -1042,6 +1069,10 @@ def unified_attention_with_output_base(
             q_scale=q_scale,
             qkv=qkv,
         )
+
+
+# The attention as one break in a recorded forward.
+_attention_region = eager_region()(_attention)
 
 
 @mark_spliting_op(is_custom=True, gen_fake=attention_fp8_fake, mutates_args=["scale"])

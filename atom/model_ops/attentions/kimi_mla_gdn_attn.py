@@ -19,6 +19,7 @@ from atom.model_ops.glm5_next.geometry import (
     speculative_kpool_history_size,
 )
 from atom.utils import CpuGpuBuffer, envs
+from atom.utils.forward_context import AttentionMetaData, Context
 
 from .aiter_mla import (
     MLA_ROWS,
@@ -720,6 +721,71 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         _, lengths, _ = self.decode_spans(batch)
         self._stage_draft_ctx_slots(batch, lengths, running_tokens, group)
         return built
+
+    @property
+    def supports_token_graph(self) -> bool:
+        """Every launch outside the model's eager regions -- the KDA recurrence
+        and the MLA prefill core -- is sized by the token count alone, so a
+        prefill may pad to a recorded token-graph bucket. The regions
+        (`_kda_recurrence`, `attention_mla._mla_prefill_core`) run the whole
+        bucket too. A pad row belongs to no request: its batch id and KV slot
+        are -1, it lies past every request's `cu_seqlens` (a padding request
+        there is zero long), and the KDA metadata names the requests' rows and
+        state slots alone. Their kernels skip it.
+
+        Not under DP: a decoding or idle rank would replay the prefill
+        recording (`ForwardMode._pad_to_token_graph`), whose regions serve a
+        prefill alone. Only while the model opted every MLA layer of its own
+        into the prefill split (`MLAAttention.split_prefill_recording`, which
+        Kimi-K3 sets) and each can take it
+        (`MLAAttention.prefill_split_supported`: no sparse layer, PCP or
+        ``ATOM_USE_TRITON_GEMM``). Any other layer would run as one region,
+        which cannot serve a padded bucket: `forward_impl` takes no live row
+        count, so its FP8 prefill attention would quantize the bucket's pad
+        rows with the step's. A sparse layer's DSA indexer is besides no
+        eager region and returns on the recording's dummy step, so a replay
+        would attend with a stale top-k. So no model on this builder with a
+        sparse MLA layer records: Kimi-K3.1, whose layers opt in but all carry
+        a DSA indexer, and GLM-5.3-Flash, whose layers are all sparse and opt
+        nothing in. A drafter's layers, numbered past the target's
+        (`layer_offset`), do not count: the recording runs the target alone."""
+        config = self.model_runner.config
+        if config.parallel_config.data_parallel_size != 1:
+            return False
+        target_layers = config.hf_config.num_hidden_layers
+        sfc = config.compilation_config.static_forward_context
+        target_mla = [
+            impl
+            for module in sfc.values()
+            if isinstance(impl := getattr(module, "impl", None), MLAAttention)
+            and impl.layer_num < target_layers
+        ]
+        return bool(target_mla) and all(
+            impl.split_prefill_recording and impl.prefill_split_supported()
+            for impl in target_mla
+        )
+
+    def build_for_token_graph_capture(self, tokens: int):
+        """A request-less prefill of ``tokens`` rows for recording that
+        token-graph bucket. A dummy step: its regions hand back zeros of their
+        output's shape and touch no KV or state -- a replay runs them on the
+        live step -- and the segments need only its shape."""
+        if not 0 < tokens <= self.model_runner.config.max_num_batched_tokens:
+            raise ValueError(
+                f"token-graph bucket {tokens} exceeds max_num_batched_tokens"
+            )
+        positions = self.model_runner.forward_vars["positions"].gpu[:tokens]
+        positions.zero_()
+        context = Context(
+            positions=positions,
+            is_prefill=True,
+            is_dummy_run=True,
+            scheduled_bs=1,
+            scheduled_tokens=tokens,
+            running_bs=1,
+            running_tokens=tokens,
+        )
+        return AttentionMetaData(max_seqlen_q=tokens, max_seqlen_k=tokens), context
 
     def _stage_draft_ctx_slots(
         self, batch, seqlens_q: np.ndarray, rows: int, group
